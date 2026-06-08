@@ -1,0 +1,263 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E📈%3C/text%3E%3C/svg%3E">
+<title>new-api 上游监控</title>
+<script>
+fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
+  if(!d||!d.name)return;
+  document.title=document.title.replace('new-api',d.name);
+  var set=function(){document.querySelectorAll('[data-brand]').forEach(function(el){el.textContent=d.name})};
+  if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',set);else set();
+}).catch(function(){});
+</script>
+<style>
+  *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+  :root{--bg:#0f1117;--surface:#1a1d27;--border:#2a2d3e;--accent:#6366f1;--text:#e2e8f0;--text-muted:#94a3b8;
+    --green:#10b981;--yellow:#f59e0b;--red:#ef4444;--font:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif}
+  body{background:var(--bg);color:var(--text);font-family:var(--font);min-height:100vh;padding:28px 32px;max-width:1280px;margin:0 auto}
+  h1{font-size:21px;font-weight:600;margin-bottom:4px}
+  h1 small{font-size:13px;color:var(--text-muted);font-weight:400;margin-left:8px}
+  .num{font-variant-numeric:tabular-nums}.muted{color:var(--text-muted)}
+  td.right,th.right{text-align:right}
+
+  .toolbar{display:flex;align-items:center;gap:14px;flex-wrap:wrap;margin:18px 0}
+  .seg{display:inline-flex;border:1px solid var(--border);border-radius:8px;overflow:hidden}
+  .seg a{padding:7px 14px;font-size:13px;color:var(--text-muted);text-decoration:none;border-right:1px solid var(--border)}
+  .seg a:last-child{border-right:none}.seg a.active{background:var(--accent);color:#fff}
+  .btn{padding:7px 14px;border-radius:8px;border:1px solid var(--border);background:transparent;color:var(--text);cursor:pointer;font-size:13px}
+  .btn:hover{border-color:var(--accent);color:var(--accent)}
+  .meta{font-size:12px;color:var(--text-muted);margin-left:auto}
+
+  .banner{display:flex;align-items:center;gap:24px;flex-wrap:wrap;background:var(--surface);border:1px solid var(--border);
+    border-left-width:4px;border-radius:12px;padding:16px 20px;margin-bottom:18px}
+  .banner.ok{border-left-color:var(--green)}.banner.warn{border-left-color:var(--yellow)}.banner.bad{border-left-color:var(--red)}
+  .banner-main{font-size:18px;font-weight:700;display:flex;align-items:center;gap:10px}
+  .banner-side{font-size:13px;color:var(--text-muted);display:flex;flex-direction:column;gap:2px}
+  .banner-side b{color:var(--text);font-weight:600}
+  .dot{display:inline-block;width:9px;height:9px;border-radius:50%;vertical-align:middle}
+  .dot-g{background:var(--green)}.dot-y{background:var(--yellow)}.dot-r{background:var(--red)}.dot-x{background:var(--text-muted)}
+  .dot-live{animation:pulse 1.6s infinite}@keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
+
+  .attn{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:14px 18px;margin-bottom:18px}
+  .attn h3{font-size:12px;color:var(--text-muted);text-transform:uppercase;letter-spacing:.04em;margin-bottom:10px;font-weight:600}
+  .attn-list{display:flex;flex-direction:column;gap:8px}
+  .attn-item{display:flex;align-items:center;gap:10px;font-size:14px;padding:8px 12px;border-radius:8px;background:var(--bg)}
+  .attn-item .who{font-weight:600}.attn-item .why{color:var(--text-muted);font-size:13px;margin-left:auto}
+  .attn-empty{color:var(--green);font-size:14px}
+
+  .stats-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:14px;margin-bottom:18px}
+  .stat-card{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:18px}
+  .stat-label{font-size:12px;color:var(--text-muted);text-transform:uppercase;letter-spacing:.05em}
+  .stat-value{font-size:26px;font-weight:700;margin-top:6px}
+
+  #trendWrap{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:16px 20px;margin-bottom:18px}
+  #trend{width:100%;height:150px;display:block}
+  .legend{font-size:12px;color:var(--text-muted);display:flex;gap:16px;margin-top:8px}
+
+  .card{background:var(--surface);border:1px solid var(--border);border-radius:12px;overflow:hidden;margin-bottom:18px}
+  .card-header{padding:14px 18px;border-bottom:1px solid var(--border);font-weight:600}
+  table{width:100%;border-collapse:collapse}
+  th{padding:11px 14px;text-align:left;font-size:12px;text-transform:uppercase;color:var(--text-muted);background:rgba(255,255,255,.03);font-weight:500}
+  td{padding:11px 14px;font-size:14px;border-top:1px solid var(--border)}
+  tr:hover td{background:rgba(255,255,255,.02)}
+  .badge{display:inline-block;padding:2px 8px;border-radius:6px;font-size:12px;font-weight:500}
+  .badge-green{background:rgba(16,185,129,.15);color:var(--green)}
+  .badge-yellow{background:rgba(245,158,11,.15);color:var(--yellow)}
+  .badge-red{background:rgba(239,68,68,.15);color:var(--red)}
+  .badge-gray{background:rgba(148,163,184,.1);color:var(--text-muted)}
+  .emix span{font-size:11px;padding:1px 5px;border-radius:4px;margin-right:3px;white-space:nowrap}
+  .e4{background:rgba(245,158,11,.15);color:var(--yellow)}.e5{background:rgba(239,68,68,.15);color:var(--red)}
+  .eto{background:rgba(99,102,241,.15);color:var(--accent)}.eo{background:rgba(148,163,184,.12);color:var(--text-muted)}
+  .lat-warn{color:var(--yellow)}.lat-bad{color:var(--red)}
+  .alert{padding:12px 16px;border-radius:8px;margin-bottom:16px;font-size:14px;background:rgba(239,68,68,.1);border:1px solid rgba(239,68,68,.3);color:var(--red)}
+  code{background:rgba(255,255,255,.06);padding:1px 5px;border-radius:4px;font-size:12px}
+</style>
+</head>
+<body>
+<h1>📈 <span data-brand>new-api</span> 上游监控 <small>分组 / 渠道 / 模型 · 稳定性 · 响应耗时</small></h1>
+
+<div class="toolbar">
+  <div class="seg" id="windowSeg">
+    <a data-w="15">15分钟</a><a data-w="30">30分钟</a><a data-w="60">1小时</a><a data-w="180">3小时</a><a data-w="360">6小时</a><a data-w="720">12小时</a><a data-w="1440">24小时</a>
+  </div>
+  <label class="muted" style="font-size:13px"><input type="checkbox" id="autoRefresh" checked> 自动刷新(30s)</label>
+  <button class="btn" id="refreshNow">立即刷新</button>
+  <a class="btn" href="/alert" id="alertLink" style="text-decoration:none;display:none">🔔 报警设置</a>
+  <div class="meta" id="genAt">加载中…</div>
+  <div class="meta" id="userBox" style="margin-left:auto"></div>
+</div>
+
+<div id="errBox"></div>
+
+<div class="banner" id="banner">
+  <div class="banner-main" id="bannerMain">—</div>
+  <div class="banner-side">
+    <span>数据新鲜度:<b id="freshness">—</b></span>
+    <span>采样器:<b id="heartbeat">—</b></span>
+  </div>
+</div>
+
+<div class="attn">
+  <h3>⚠️ 需要关注(异常 / 波动)</h3>
+  <div class="attn-list" id="attnList"></div>
+</div>
+
+<div class="stats-grid" id="summary"></div>
+
+<div id="trendWrap">
+  <div style="font-weight:600;margin-bottom:8px">流量趋势(成功 / 失败)</div>
+  <canvas id="trend"></canvas>
+  <div class="legend"><span><span class="dot dot-g"></span>成功</span><span><span class="dot dot-r"></span>失败</span></div>
+</div>
+
+<div class="card"><div class="card-header">按分组</div><table><thead id="thGroup"></thead><tbody id="tbGroup"></tbody></table></div>
+<div class="card"><div class="card-header">按渠道</div><table><thead id="thChannel"></thead><tbody id="tbChannel"></tbody></table></div>
+<div class="card"><div class="card-header">按模型</div><table><thead id="thModel"></thead><tbody id="tbModel"></tbody></table></div>
+
+<script>
+const params=new URLSearchParams(location.search);
+let WINDOW=parseInt(params.get('window')||'60',10);
+if(![15,30,60,180,360,720,1440].includes(WINDOW)) WINDOW=60;
+let timer=null,lastTrend=[];
+
+const fmtNum=n=>(n||0).toLocaleString('en-US');
+const fmtRate=r=>(r||0).toFixed(1)+'%';
+const fmtUSD=v=>'$'+(v||0).toFixed(2);
+const fmtQPS=v=>(v||0).toFixed(3);
+const esc=s=>String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const fmtAge=s=>s<0?'无数据':(s<90?Math.round(s)+' 秒前':(s<5400?Math.round(s/60)+' 分钟前':(s/3600).toFixed(1)+' 小时前'));
+const latClass=s=>s>=60?'lat-bad':(s>=20?'lat-warn':'');
+const dotClass=h=>h==='good'?'dot-g':(h==='warn'?'dot-y':(h==='bad'?'dot-r':'dot-x'));
+function healthBadge(h,r){const m={good:['badge-green','正常'],warn:['badge-yellow','波动'],bad:['badge-red','异常'],nosample:['badge-gray','样本不足']};const[c,t]=m[h]||m.nosample;return `<span class="badge ${c}">${h==='nosample'?t:fmtRate(r)}</span>`}
+function errMix(r){let h='';if(r.anomaly>0)h+=`<span class="${r.anomaly_burst?'e5':'eo'}">异常·${r.anomaly}${r.anomaly_burst?'⚠成簇':''}</span>`;if(r.err_5xx)h+=`<span class="e5">5xx·${r.err_5xx}</span>`;if(r.err_timeout)h+=`<span class="eto">超时·${r.err_timeout}</span>`;if(r.err_4xx)h+=`<span class="e4">4xx·${r.err_4xx}</span>`;if(r.err_other)h+=`<span class="eo">其它·${r.err_other}</span>`;return h||'<span class="muted">—</span>'}
+function errText(r){const p=[];if(r.err_5xx)p.push('5xx '+r.err_5xx);if(r.err_timeout)p.push('超时 '+r.err_timeout);if(r.err_4xx)p.push('4xx '+r.err_4xx);if(r.err_other)p.push('其它 '+r.err_other);return p.join(' / ')}
+const fmtLat=v=>v>=10?Math.round(v)+'s':(v||0).toFixed(1)+'s';
+function sparkSVG(pts){
+  const W=92,H=22,pad=2;
+  if(!pts||!pts.length) return `<svg width="${W}" height="${H}"></svg>`;
+  let max=1; pts.forEach(p=>max=Math.max(max,p.success+p.failed));
+  const n=pts.length, x=i=>pad+(n===1?(W-2*pad)/2:(W-2*pad)*i/(n-1)), y=v=>H-pad-(H-2*pad)*v/max;
+  let line='', dots='';
+  pts.forEach((p,i)=>{ line+=(i?'L':'M')+x(i).toFixed(1)+' '+y(p.success+p.failed).toFixed(1)+' ';
+    if(p.failed>0) dots+=`<circle cx="${x(i).toFixed(1)}" cy="${y(p.success+p.failed).toFixed(1)}" r="1.6" fill="#ef4444"/>`; });
+  return `<svg width="${W}" height="${H}"><path d="${line}" fill="none" stroke="#10b981" stroke-width="1.3"/>${dots}</svg>`;
+}
+
+function setSeg(){document.querySelectorAll('#windowSeg a').forEach(a=>{const w=+a.dataset.w;a.href='?window='+w;a.classList.toggle('active',w===WINDOW)})}
+
+function renderBanner(s){
+  const probs=[...s.by_channel.map(r=>({...r,kind:'渠道'})),...s.by_model.map(r=>({...r,kind:'模型'}))];
+  const bad=probs.filter(r=>r.health==='bad'),warn=probs.filter(r=>r.health==='warn');
+  const b=document.getElementById('banner'),m=document.getElementById('bannerMain');
+  let cls,txt;
+  if(bad.length){cls='bad';txt=`<span class="dot dot-r"></span> ${bad.length} 项异常`}
+  else if(warn.length){cls='warn';txt=`<span class="dot dot-y"></span> ${warn.length} 项波动`}
+  else{cls='ok';txt='<span class="dot dot-g"></span> 运行正常'}
+  b.className='banner '+cls;m.innerHTML=txt;
+  document.getElementById('freshness').textContent=fmtAge(s.data_age_sec);
+  document.getElementById('heartbeat').innerHTML=s.sampling_active?'<span class="dot dot-g dot-live"></span> 正常':'<span class="dot dot-r"></span> 异常(采样可能已停)';
+  // 一切错误都算、都要关注;错误构成(errText)只用于诊断/跟上游沟通,不用来过滤。
+  const list=document.getElementById('attnList');
+  const items=[...bad,...warn];
+  if(!items.length){list.innerHTML='<div class="attn-empty">✓ 当前窗口内无异常 / 波动的渠道或模型</div>';return}
+  const row=r=>{
+    const w=[];
+    if(r.failed>0) w.push(`<b style="color:var(--red)">错误 ${r.failed}/${r.total}</b>${errText(r)?'('+errText(r)+')':''}`);
+    if(r.anomaly_burst) w.push(`⚠ 异常成簇 ${r.anomaly}次`);
+    else if(r.anomaly>0) w.push(`异常 ${r.anomaly}`);
+    w.push(`p95 ${fmtLat(r.p95)}`);
+    if(failWindow(r.spark)) w.push(failWindow(r.spark));
+    return `<div class="attn-item"><span class="dot ${r.health==='bad'?'dot-r':'dot-y'}"></span>
+      <span class="who">${r.kind} ${esc(r.label)}</span>
+      <span class="badge ${r.health==='bad'?'badge-red':'badge-yellow'}">成功 ${fmtRate(r.success_rate)}</span>
+      <span class="why">${w.join(' · ')}</span></div>`;
+  };
+  list.innerHTML=items.map(row).join('');
+}
+const fmtTok=v=>v>=1?Math.round(v)+' tok/s':(v?v.toFixed(1)+' tok/s':'—');
+const fmtTtft=v=>v>0?fmtLat(v):'—';
+const clock=ts=>{const d=new Date(ts*1000);return String(d.getHours()).padStart(2,'0')+':'+String(d.getMinutes()).padStart(2,'0');};
+// 从该行的分钟桶序列里,算出"有失败的时间段 + 最近一次距今"
+function failWindow(spark){
+  if(!spark||!spark.length) return '';
+  const f=spark.filter(p=>p.failed>0);
+  if(!f.length) return '';
+  const last=f[f.length-1].ts;            // 序列按时间升序,末尾即最近一次失败
+  const ago=Math.max(0,Math.floor(Date.now()/1000)-(last+60));
+  const agoStr=ago<90?'刚刚':(ago<5400?Math.round(ago/60)+'分钟前':(ago/3600).toFixed(1)+'小时前');
+  const span=f.length>1?` ·共${f.length}个时段`:'';
+  return `最近失败 ${clock(last)}(${agoStr})${span}`;
+}
+function renderSummary(s){
+  const c=[['总请求',fmtNum(s.total),'#6366f1'],
+    ['成功率',fmtRate(s.success_rate),s.success_rate>=99?'#10b981':(s.success_rate>=95?'#f59e0b':'#ef4444')],
+    ['异常(断开)',fmtNum(s.anomaly)+(s.total?` (${(s.anomaly_rate||0).toFixed(1)}%)`:''),s.anomaly>0?'#f59e0b':'#10b981'],
+    ['错误',fmtNum(s.failed)+(s.total?` (${(s.error_rate||0).toFixed(1)}%)`:''),s.failed>0?'#ef4444':'#10b981'],
+    ['首字 TTFT p95',fmtTtft(s.ttft_p95),s.ttft_p95>=5?'#ef4444':(s.ttft_p95>=2?'#f59e0b':'#94a3b8')],
+    ['出字速度',fmtTok(s.tok_per_sec),'#6366f1'],
+    ['消费',fmtUSD(s.cost_usd),'#f59e0b']];
+  document.getElementById('summary').innerHTML=c.map(([l,v,col])=>`<div class="stat-card"><div class="stat-label">${l}</div><div class="stat-value num" style="color:${col}">${v}</div></div>`).join('');
+}
+const HEAD=`<tr><th>名称</th><th>趋势</th><th class="right">请求</th><th>稳定性</th><th class="right">首字p95</th><th class="right">出字</th><th class="right">延迟 p95/max</th><th>异常/错误</th><th class="right">消费</th></tr>`;
+function renderTable(th,tb,rows){
+  document.getElementById(th).innerHTML=HEAD;
+  const e=document.getElementById(tb);
+  if(!rows||!rows.length){e.innerHTML=`<tr><td colspan="9" class="muted" style="text-align:center;padding:24px">窗口内暂无数据</td></tr>`;return}
+  e.innerHTML=rows.map(r=>`<tr>
+    <td><span class="dot ${dotClass(r.health)}"></span> ${esc(r.label)}</td>
+    <td>${sparkSVG(r.spark)}</td>
+    <td class="right num">${fmtNum(r.total)}</td>
+    <td>${healthBadge(r.health,r.success_rate)}</td>
+    <td class="right num ${latClass(r.ttft_p95)}">${fmtTtft(r.ttft_p95)}</td>
+    <td class="right num">${fmtTok(r.tok_per_sec)}</td>
+    <td class="right num"><span class="${latClass(r.p95)}">${fmtLat(r.p95)}</span> / <span class="${latClass(r.max_latency)}">${r.max_latency||0}s</span></td>
+    <td class="emix">${(r.failed||r.anomaly)?errMix(r):'<span class="muted">—</span>'}</td>
+    <td class="right num">${fmtUSD(r.cost_usd)}</td></tr>`).join('');
+}
+function drawTrend(points){
+  const cv=document.getElementById('trend'),dpr=window.devicePixelRatio||1,w=cv.clientWidth,h=150;
+  cv.width=w*dpr;cv.height=h*dpr;const x2=cv.getContext('2d');x2.scale(dpr,dpr);x2.clearRect(0,0,w,h);
+  if(!points||!points.length){x2.fillStyle='#94a3b8';x2.font='13px sans-serif';x2.fillText('窗口内暂无数据',8,24);return}
+  const pad={l:36,r:8,t:8,b:18},cw=w-pad.l-pad.r,ch=h-pad.t-pad.b;
+  let max=1;points.forEach(p=>max=Math.max(max,p.success+p.failed));
+  x2.strokeStyle='#2a2d3e';x2.fillStyle='#94a3b8';x2.font='11px sans-serif';x2.lineWidth=1;
+  for(let i=0;i<=2;i++){const y=pad.t+ch*i/2;x2.beginPath();x2.moveTo(pad.l,y);x2.lineTo(w-pad.r,y);x2.stroke();x2.fillText(Math.round(max*(1-i/2)),4,y+3)}
+  const n=points.length,X=i=>pad.l+(n===1?cw/2:cw*i/(n-1)),Y=v=>pad.t+ch*(1-v/max);
+  const line=(k,col)=>{x2.strokeStyle=col;x2.lineWidth=2;x2.beginPath();points.forEach((p,i)=>{const v=k==='s'?p.success:p.success+p.failed;i?x2.lineTo(X(i),Y(v)):x2.moveTo(X(i),Y(v))});x2.stroke()};
+  line('t','#ef4444');line('s','#10b981');
+}
+function apply(s){
+  document.getElementById('genAt').textContent='更新于 '+s.generated_at+' · 窗口 '+s.window_minutes+' 分钟';
+  renderBanner(s);renderSummary(s.summary);lastTrend=s.trend||[];drawTrend(lastTrend);
+  renderTable('thGroup','tbGroup',s.by_group);renderTable('thChannel','tbChannel',s.by_channel);renderTable('thModel','tbModel',s.by_model);
+}
+async function load(){
+  try{
+    const res=await fetch('/data?window='+WINDOW,{headers:{'Accept':'application/json'}});
+    if(res.status===401){location.href='/login';return}
+    const d=await res.json();const eb=document.getElementById('errBox');
+    if(d.enabled===false){eb.innerHTML='<div class="alert">⚠️ 未配置 <code>NEWAPI_LOG_DSN</code>(只读日志库),监控无数据来源。</div>';return}
+    if(d.error){eb.innerHTML='<div class="alert">查询出错:'+esc(d.error)+'</div>';return}
+    eb.innerHTML='';if(d.snapshot)apply(d.snapshot);
+  }catch(e){document.getElementById('errBox').innerHTML='<div class="alert">加载失败:'+esc(e.message)+'</div>'}
+}
+async function loadMe(){
+  try{
+    const res=await fetch('/me',{headers:{'Accept':'application/json'}});
+    if(res.status===401){location.href='/login';return}
+    const d=await res.json();
+    document.getElementById('userBox').innerHTML='👤 '+esc(d.name||'')+(d.is_root?' · 超级管理员':' · 管理员')+' · <a href="/logout" style="color:var(--accent)">退出</a>';
+    if(d.is_root)document.getElementById('alertLink').style.display='';
+  }catch(e){}
+}
+function schedule(){if(timer)clearInterval(timer);if(document.getElementById('autoRefresh').checked)timer=setInterval(load,30000)}
+document.getElementById('refreshNow').addEventListener('click',load);
+document.getElementById('autoRefresh').addEventListener('change',schedule);
+window.addEventListener('resize',()=>drawTrend(lastTrend));
+setSeg();loadMe();load();schedule();
+</script>
+</body>
+</html>

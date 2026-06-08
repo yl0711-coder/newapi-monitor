@@ -1,0 +1,77 @@
+English | [简体中文](README.md)
+
+# newapi-monitor
+
+> **Upstream monitor for new-api** — a zero-intrusion, read-only sampling sidecar for stability monitoring and email alerts.
+
+[![CI](https://github.com/yl0711-coder/newapi-monitor/actions/workflows/ci.yml/badge.svg)](https://github.com/yl0711-coder/newapi-monitor/actions/workflows/ci.yml)
+[![Go Report Card](https://goreportcard.com/badge/github.com/yl0711-coder/newapi-monitor)](https://goreportcard.com/report/github.com/yl0711-coder/newapi-monitor)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
+A standalone "upstream stability" dashboard for the [new-api](https://github.com/Calcium-Ion/new-api) gateway. It uses a **read-only account** to run one small aggregate query per minute against new-api's log database, stores the result in a local SQLite, and shows success rate, anomalies and latency (TTFB/TTFT) broken down by **group / channel / model**, with email alerts on anomalies. **It never modifies new-api and never writes to its database.**
+
+## Features
+- **Zero intrusion**: read-only sampling, one small aggregate query per cycle, no load on your production DB.
+- **Three-state stability**: success / anomaly (`client_gone` and other client aborts) / failure (upstream errors), aggregated by group × channel × model.
+- **Latency**: P50/P95 total latency, TTFB/TTFT first-token distribution, output speed (tok/s).
+- **Auth via new-api**: reuses new-api user identity (calls its `/api/user/login`), role-gated, no separate account system.
+- **Email alerts**: error rate / error burst / anomaly cluster / sampler-down rules with configurable thresholds.
+- **Lightweight & self-contained**: pure Go + embedded SQLite (`CGO_ENABLED=0`), single container, no external dependencies.
+
+## How it works
+```
+new-api log DB (MySQL) ──one read-only aggregate query / 60s──► newapi-monitor ──► local SQLite ──► dashboard / email alerts
+```
+The sampler is the **only** component that touches new-api's DB; the dashboard reads from the local SQLite, fully isolated from production.
+
+## Quick start (Docker)
+```bash
+docker run -d --name newapi-monitor \
+  -p 8090:8090 \
+  -e NEWAPI_LOG_DSN='ro_user:pass@tcp(db-host:3306)/newapi?charset=utf8mb4&timeout=5s&readTimeout=10s' \
+  -e MONITOR_NEWAPI_BASE_URL='https://your-newapi.example.com' \
+  -e MONITOR_SESSION_SECRET="$(openssl rand -hex 32)" \
+  -v newapi_monitor_data:/data \
+  ghcr.io/yl0711-coder/newapi-monitor:latest
+```
+
+Open `http://<host>:8090` and log in with a new-api admin account. See [`docker-compose.example.yml`](docker-compose.example.yml) for a full compose file. In production, put a reverse proxy (nginx / Caddy) in front for HTTPS.
+
+## Configuration (environment variables)
+| Variable | Description | Default |
+|---|---|---|
+| `NEWAPI_LOG_DSN` | **Read-only** DSN to new-api's DB (MySQL) | required |
+| `MONITOR_NEWAPI_BASE_URL` | new-api base URL, used for login auth | required |
+| `MONITOR_SESSION_SECRET` | Session signing key (`openssl rand -hex 32`) | random if empty |
+| `MONITOR_ADDR` | Listen address | `:8090` |
+| `MONITOR_STORE_PATH` | Local sampling DB path | `/data/monitor.db` |
+| `MONITOR_SAMPLE_SECONDS` | Sampling interval (seconds) | `60` |
+| `MONITOR_RETENTION_DAYS` | Local retention (days) | `7` |
+| `MONITOR_BACKFILL_HOURS` | Hours of history to backfill on start | `24` |
+
+## Permissions
+Login reuses new-api identity (only calls its `/api/user/login`):
+- `role >= 10` (admin): can log in and view;
+- `role = 100` (super admin): can edit alert settings.
+
+## Read-only account
+Create a dedicated read-only account for new-api's DB, granting only `SELECT` on `logs` and `channels`, for `NEWAPI_LOG_DSN`:
+```sql
+CREATE USER 'ro_user'@'%' IDENTIFIED BY '<strong-password>';
+GRANT SELECT ON newapi.logs     TO 'ro_user'@'%';
+GRANT SELECT ON newapi.channels TO 'ro_user'@'%';
+```
+
+## Security
+- The image contains **no secrets**; DSN, session key and SMTP credentials are injected via environment variables.
+- SMTP credentials are never echoed back to the frontend.
+
+## Build
+```bash
+CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o newapi-monitor .   # binary
+docker build -t newapi-monitor .                                        # image
+```
+On push to `main` or a `v*` tag, GitHub Actions runs `go vet` + `go test`, then builds and publishes the image to GHCR (see [`.github/workflows/ci.yml`](.github/workflows/ci.yml)).
+
+## License
+[MIT](LICENSE)

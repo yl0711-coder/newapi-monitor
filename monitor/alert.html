@@ -1,0 +1,176 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E📈%3C/text%3E%3C/svg%3E">
+<title>报警设置 · new-api 监控</title>
+<script>
+fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
+  if(d&&d.name)document.title=document.title.replace('new-api',d.name);
+}).catch(function(){});
+</script>
+<style>
+  *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+  :root{--bg:#0f1117;--surface:#1a1d27;--border:#2a2d3e;--accent:#6366f1;--text:#e2e8f0;--text-muted:#94a3b8;
+    --green:#10b981;--yellow:#f59e0b;--red:#ef4444;--font:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif}
+  body{background:var(--bg);color:var(--text);font-family:var(--font);min-height:100vh;padding:28px 32px;max-width:860px;margin:0 auto}
+  h1{font-size:21px;font-weight:600;margin-bottom:4px}
+  a{color:var(--accent);text-decoration:none}
+  .muted{color:var(--text-muted);font-size:13px}
+  .card{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:20px 22px;margin:16px 0}
+  .card h2{font-size:14px;color:var(--text-muted);text-transform:uppercase;letter-spacing:.04em;margin-bottom:14px;font-weight:600}
+  .row{display:flex;gap:14px;flex-wrap:wrap;align-items:flex-end;margin-bottom:14px}
+  .field{display:flex;flex-direction:column;gap:5px;min-width:140px}
+  .field label{font-size:12px;color:var(--text-muted)}
+  .field .hint{font-size:11px;color:var(--accent)}
+  .smtp-grid{display:grid;grid-template-columns:1fr 1fr;gap:14px 18px;align-items:start}
+  .smtp-grid .field{min-width:0}
+  .smtp-grid input[type=text],.smtp-grid input[type=number],.smtp-grid input[type=password],.smtp-grid textarea{width:100%}
+  .port-line{display:flex;gap:14px;align-items:center}
+  .port-line input{width:96px;flex:none}
+  .port-line .ck{font-size:13px;white-space:nowrap;color:var(--text)}
+  input[type=text],input[type=number],input[type=password],textarea,select{
+    background:var(--bg);border:1px solid var(--border);color:var(--text);padding:8px 10px;border-radius:8px;font-size:14px;outline:none;font-family:var(--font)}
+  input:focus,textarea:focus,select:focus{border-color:var(--accent)}
+  textarea{width:100%;min-height:64px;resize:vertical}
+  .ck{display:flex;align-items:center;gap:8px;font-size:14px}
+  .btn{padding:9px 18px;border-radius:8px;border:none;cursor:pointer;font-size:14px;font-weight:500}
+  .btn-primary{background:var(--accent);color:#fff}
+  .btn-outline{background:transparent;border:1px solid var(--border);color:var(--text)}
+  .bar{display:flex;gap:12px;align-items:center;margin-top:8px}
+  #msg{font-size:14px;margin-left:8px}
+  .ok{color:var(--green)} .err{color:var(--red)}
+  table.thr{width:100%;border-collapse:collapse}
+  table.thr td{padding:6px 8px;font-size:13px;border-top:1px solid var(--border);vertical-align:middle}
+  table.thr td:first-child{color:var(--text-muted);width:42%}
+  table.thr input{width:90px}
+</style>
+</head>
+<body>
+<h1>🔔 报警设置 <span class="muted">· <a href="/">← 返回监控看板</a></span></h1>
+<p class="muted">配置后,监控会按下面的规则评估,命中且过冷却就给所有收件人发邮件。阈值都是建议值,可自行调整;上线跑一两周后按真实基线再调更准。</p>
+
+<div id="errBox"></div>
+
+<div class="card">
+  <h2>总开关</h2>
+  <label class="ck"><input type="checkbox" id="enabled"> 启用报警(关闭时只看看板、不发邮件)</label>
+</div>
+
+<div class="card">
+  <h2>站点名称</h2>
+  <p class="muted" style="margin:-6px 0 12px">显示在页面标题与看板上,默认取自 new-api 的系统名称;留空保存则恢复自动获取。</p>
+  <div class="field"><label>名称</label><input type="text" id="site_name" placeholder="(默认取 new-api 系统名称)"></div>
+</div>
+
+<div class="card">
+  <h2 style="display:flex;align-items:center;gap:12px">发件邮箱(SMTP)
+    <button class="btn btn-outline" id="syncSmtp" type="button" style="padding:4px 12px;font-size:12px;font-weight:400">使用主站配置</button>
+  </h2>
+  <p class="muted" style="margin:-6px 0 12px">默认复用主站(new-api)的发件配置;如手动改过想还原,点「使用主站配置」即可重新同步。</p>
+  <div class="smtp-grid">
+    <div class="field"><label>SMTP 服务器</label><input type="text" id="smtp_host" placeholder="smtp.example.com"></div>
+    <div class="field"><label>端口</label>
+      <div class="port-line">
+        <input type="number" id="smtp_port" style="width:96px;flex:none">
+        <label class="ck"><input type="checkbox" id="smtp_ssl"> SSL(465 勾选)</label>
+      </div>
+      <span class="hint">465=SSL / 587=STARTTLS</span>
+    </div>
+    <div class="field"><label>登录账号</label><input type="text" id="smtp_user" placeholder="noreply@example.com"></div>
+    <div class="field"><label>SMTP 访问凭证</label><input type="password" id="smtp_password" placeholder="敏感信息不会发送到前端显示"><span class="hint" id="pwhint"></span></div>
+    <div class="field"><label>发件人(From,可与账号不同)</label><input type="text" id="smtp_from" placeholder="noreply@example.com"></div>
+    <div class="field" style="grid-column:1/-1"><label>收件人(多个,逗号或换行分隔)</label><textarea id="recipients" placeholder="a@x.com, b@y.com"></textarea></div>
+  </div>
+</div>
+
+<div class="card">
+  <h2>触发规则(阈值可调,括号内为建议值)</h2>
+  <table class="thr">
+    <tr><td>评估窗口(分钟)<br><span class="muted">每次按最近这段时间评估</span></td><td><input type="number" id="eval_window_min"> <span class="muted">建议 15</span></td></tr>
+    <tr><td><b>错误率告警</b>:错误率 ≥ ? %</td><td><input type="number" id="err_rate_pct" step="1"> <span class="muted">建议 20</span></td></tr>
+    <tr><td>　且 错误数 ≥ ? 条(防低量误报)</td><td><input type="number" id="err_min_count"> <span class="muted">建议 5</span></td></tr>
+    <tr><td><b>错误突发</b>:窗口内错误 ≥ ? 条(不论率)</td><td><input type="number" id="err_burst_count"> <span class="muted">建议 10</span></td></tr>
+    <tr><td><b>异常成簇</b>:client_gone 连续 ≥ ? 个采样桶</td><td><input type="number" id="anomaly_burst_buckets"> <span class="muted">建议 3</span></td></tr>
+    <tr><td>　且 异常数 ≥ ? 条</td><td><input type="number" id="anomaly_min_count"> <span class="muted">建议 8</span></td></tr>
+    <tr><td><b>采样器掉线</b>报警</td><td><label class="ck"><input type="checkbox" id="sampler_down_enabled"> 启用 <span class="muted">建议开</span></label></td></tr>
+    <tr><td><b>冷却</b>:同一(渠道+类型)? 分钟内不重发</td><td><input type="number" id="cooldown_min"> <span class="muted">建议 30</span></td></tr>
+  </table>
+</div>
+
+<div class="bar">
+  <button class="btn btn-primary" id="saveBtn">保存</button>
+  <button class="btn btn-outline" id="testBtn">发送测试邮件</button>
+  <span id="msg"></span>
+</div>
+
+<script>
+const $=id=>document.getElementById(id);
+const numFields=['smtp_port','eval_window_min','err_rate_pct','err_min_count','err_burst_count','anomaly_burst_buckets','anomaly_min_count','cooldown_min'];
+const ckFields=['enabled','smtp_ssl','sampler_down_enabled'];
+const txtFields=['site_name','smtp_host','smtp_user','smtp_password','smtp_from','recipients'];
+
+function fill(cfg, pwSet){
+  ckFields.forEach(k=>$(k).checked=!!cfg[k]);
+  numFields.forEach(k=>$(k).value=cfg[k]??'');
+  txtFields.forEach(k=>{ if(k!=='smtp_password') $(k).value=cfg[k]??''; });
+  $('pwhint').textContent = pwSet ? '已设置,留空=不修改' : '尚未设置';
+}
+function gather(){
+  const o={};
+  ckFields.forEach(k=>o[k]=$(k).checked);
+  numFields.forEach(k=>o[k]=parseFloat($(k).value)||0);
+  txtFields.forEach(k=>o[k]=$(k).value);
+  return o;
+}
+function msg(t,ok){ const m=$('msg'); m.textContent=t; m.className=ok?'ok':'err'; }
+
+// 统一请求:带 Accept json;401→跳登录
+async function api(url, opt){
+  opt=opt||{}; opt.headers=Object.assign({'Accept':'application/json'}, opt.headers||{});
+  const r=await fetch(url, opt);
+  if(r.status===401){ location.href='/login'; throw new Error('未登录'); }
+  return r;
+}
+function fillSmtp(cfg, pwSet){
+  ['smtp_host','smtp_user','smtp_from'].forEach(k=>$(k).value=cfg[k]??'');
+  $('smtp_port').value=cfg['smtp_port']??''; $('smtp_ssl').checked=!!cfg['smtp_ssl'];
+  $('smtp_password').value=''; $('pwhint').textContent = pwSet ? '已设置,留空=不修改' : '尚未设置';
+}
+
+async function load(){
+  try{
+    const r=await api('/alert/config'); const d=await r.json();
+    fill(d.config, d.smtp_password_set);
+  }catch(e){ $('errBox').innerHTML='<div class="err">加载配置失败:'+e.message+'</div>'; }
+}
+$('saveBtn').onclick=async()=>{
+  msg('保存中…',true);
+  try{
+    const r=await api('/alert/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(gather())});
+    const d=await r.json();
+    if(d.ok){ msg('✓ 已保存',true); load(); } else { msg('✗ '+(d.error||'保存失败'),false); }
+  }catch(e){ msg('✗ '+e.message,false); }
+};
+$('testBtn').onclick=async()=>{
+  msg('发送中…(需先保存)',true);
+  try{
+    const r=await api('/alert/test',{method:'POST'});
+    const d=await r.json();
+    if(d.ok){ msg('✓ 测试邮件已发送,去收件箱看看',true); } else { msg('✗ '+(d.error||'发送失败'),false); }
+  }catch(e){ msg('✗ '+e.message,false); }
+};
+$('syncSmtp').onclick=async()=>{
+  msg('从主站同步中…',true);
+  try{
+    const r=await api('/alert/smtp/sync',{method:'POST'});
+    const d=await r.json();
+    if(d.ok){ fillSmtp(d.config, d.smtp_password_set); msg('✓ 已同步主站发件配置(凭证已同步到后端,不显示)',true); }
+    else { msg('✗ '+(d.error||'同步失败'),false); }
+  }catch(e){ msg('✗ '+e.message,false); }
+};
+load();
+</script>
+</body>
+</html>

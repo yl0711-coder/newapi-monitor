@@ -1,0 +1,12 @@
+# 构建上下文排除:本地开发产物、密钥、本地数据库,绝不进镜像/构建层
+*.env
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+**/.run
+
+# 不需要进镜像的
+.git
+.gitignore
+**/*_test.go

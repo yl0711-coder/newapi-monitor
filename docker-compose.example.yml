@@ -1,0 +1,35 @@
+# newapi-monitor 部署示例。复制为 docker-compose.yml 并按需调整。
+# 敏感值放 .env(已 gitignore),不要写死在本文件。生产建议前面放反代(nginx/Caddy)做 HTTPS。
+services:
+  monitor:
+    image: ghcr.io/yl0711-coder/newapi-monitor:latest
+    container_name: newapi-monitor
+    restart: always
+    ports:
+      - "8090:8090"
+    environment:
+      - NEWAPI_LOG_DSN=${NEWAPI_LOG_DSN:?set in .env}
+      - MONITOR_NEWAPI_BASE_URL=${MONITOR_NEWAPI_BASE_URL:?set in .env}
+      - MONITOR_SESSION_SECRET=${MONITOR_SESSION_SECRET:-}
+      - MONITOR_STORE_PATH=/data/monitor.db
+      - MONITOR_SAMPLE_SECONDS=60
+      - MONITOR_RETENTION_DAYS=7
+      - MONITOR_BACKFILL_HOURS=24
+      - TZ=Asia/Shanghai
+    volumes:
+      - monitor_data:/data
+    mem_limit: 256m
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8090/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  monitor_data:

@@ -1,0 +1,26 @@
+# —— 密钥 / 本地配置(切勿提交)——
+.env
+.env.*
+!.env.example
+*.env
+monitor.env
+secrets/
+
+# —— 运行时数据 ——
+/data/
+*.db
+*.db-wal
+*.db-shm
+.run/
+
+# —— 构建产物 ——
+/dist/
+/newapi-monitor
+monitor-bin
+*.exe
+
+# —— OS / 编辑器 ——
+.DS_Store
+*.swp
+.idea/
+.vscode/

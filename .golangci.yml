@@ -1,0 +1,7 @@
+# golangci-lint 配置。默认 linters(errcheck/govet/ineffassign/staticcheck/unused/gosimple)+ gofmt。
+run:
+  timeout: 5m
+
+linters:
+  enable:
+    - gofmt
