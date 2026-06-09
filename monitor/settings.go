@@ -17,6 +17,10 @@ type Settings struct {
 	// 登录鉴权:复用 new-api 用户身份(不改 new-api,只调其 API 验证)
 	NewAPIBaseURL string // MONITOR_NEWAPI_BASE_URL,如 http://new-api:3000
 	SessionSecret string // MONITOR_SESSION_SECRET,签发监控自己的会话;留空则启动时随机生成(重启需重新登录)
+
+	// dead-man 心跳:每周期成功采样后向外部服务(如 healthchecks.io)打一次;留空=不启用。
+	// 监控/采样若停了,外部服务收不到心跳即告警——"谁来监控监控"。
+	HeartbeatURL string // MONITOR_HEARTBEAT_URL
 }
 
 // LoadSettings 从环境变量装载配置(可配合 .env)。
@@ -30,6 +34,7 @@ func LoadSettings() Settings {
 		BackfillHours: envInt("MONITOR_BACKFILL_HOURS", 24),
 		NewAPIBaseURL: env("MONITOR_NEWAPI_BASE_URL", ""),
 		SessionSecret: env("MONITOR_SESSION_SECRET", ""),
+		HeartbeatURL:  env("MONITOR_HEARTBEAT_URL", ""),
 	}
 }
 

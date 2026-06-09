@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"log"
+	"net/http"
 	"strconv"
 	"strings"
 	"time"
@@ -45,6 +46,7 @@ func (m *Monitor) startSampler(ctx context.Context) {
 		interval = 10 * time.Second
 	}
 	m.lastRun.Store(time.Now().Unix()) // 初始化心跳,避免启动初期误报"采样异常"
+	m.heartbeat()                      // 启动即对外打一次心跳,让 dead-man 立刻知道"活着"
 	go m.loop(ctx, interval)
 	log.Printf("[Monitor] 采样器已启动,间隔 %s(生产库仅每周期一条小查询)", interval)
 }
@@ -66,6 +68,7 @@ func (m *Monitor) loop(ctx context.Context, interval time.Duration) {
 				continue
 			}
 			m.lastRun.Store(time.Now().Unix())
+			m.heartbeat() // 成功采样后向外部 dead-man 服务打心跳
 			m.evaluateAlerts(time.Now().Unix())
 			ticks++
 			if ticks%(int(600/interval.Seconds())+1) == 0 {
@@ -190,4 +193,18 @@ func (m *Monitor) refreshChannelNames() {
 		m.chNames = names
 		m.chMu.Unlock()
 	}
+}
+
+// heartbeat 向外部 dead-man 服务(如 healthchecks.io)打一次心跳。
+// fire-and-forget:5 秒超时、失败忽略,绝不影响采样。未配置 MONITOR_HEARTBEAT_URL 则空操作。
+func (m *Monitor) heartbeat() {
+	if m.cfg.HeartbeatURL == "" {
+		return
+	}
+	cl := &http.Client{Timeout: 5 * time.Second}
+	resp, err := cl.Get(m.cfg.HeartbeatURL)
+	if err != nil {
+		return // 失败忽略,绝不影响监控主流程
+	}
+	resp.Body.Close()
 }
