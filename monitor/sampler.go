@@ -3,7 +3,7 @@ package monitor
 import (
 	"context"
 	"database/sql"
-	"log"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
@@ -35,12 +35,12 @@ func (m *Monitor) startSampler(ctx context.Context) {
 
 	if h := m.cfg.BackfillHours; h > 0 {
 		if n, err := m.sampleWindow(ctx, int64(h)*3600); err != nil {
-			log.Printf("[Monitor] 历史回填失败(忽略): %v", err)
+			slog.Warn("历史回填失败(忽略)", "err", err)
 		} else {
-			log.Printf("[Monitor] 历史回填完成:近 %dh,写入 %d 行采样", h, n)
+			slog.Info("历史回填完成", "hours", h, "rows", n)
 		}
 		if err := m.sampleTokens(ctx, int64(h)*3600); err != nil {
-			log.Printf("[Monitor] token 维度回填失败(忽略,不影响主监控): %v", err)
+			slog.Warn("token 维度回填失败(忽略,不影响主监控)", "err", err)
 		}
 	}
 
@@ -51,7 +51,7 @@ func (m *Monitor) startSampler(ctx context.Context) {
 	m.lastRun.Store(time.Now().Unix()) // 初始化心跳,避免启动初期误报"采样异常"
 	m.heartbeat()                      // 启动即对外打一次心跳,让 dead-man 立刻知道"活着"
 	go m.loop(ctx, interval)
-	log.Printf("[Monitor] 采样器已启动,间隔 %s(生产库仅每周期一条小查询)", interval)
+	slog.Info("采样器已启动", "interval", interval.String(), "note", "生产库仅每周期一条小查询")
 }
 
 func (m *Monitor) loop(ctx context.Context, interval time.Duration) {
@@ -65,7 +65,7 @@ func (m *Monitor) loop(ctx context.Context, interval time.Duration) {
 			return
 		case <-ticker.C:
 			if _, err := m.sampleWindow(ctx, lookback); err != nil {
-				log.Printf("[Monitor] 采样失败(下周期重试): %v", err)
+				slog.Error("采样失败(下周期重试)", "err", err)
 				// 采样失败也评估报警:lastRun 不更新 → 超过 3 周期会触发"采样掉线"
 				m.evaluateAlerts(time.Now().Unix())
 				continue
@@ -73,7 +73,7 @@ func (m *Monitor) loop(ctx context.Context, interval time.Duration) {
 			m.lastRun.Store(time.Now().Unix())
 			m.heartbeat() // 成功采样后向外部 dead-man 服务打心跳
 			if err := m.sampleTokens(ctx, lookback); err != nil {
-				log.Printf("[Monitor] token 维度采样失败(忽略,不影响主监控): %v", err)
+				slog.Warn("token 维度采样失败(忽略,不影响主监控)", "err", err)
 			}
 			m.evaluateAlerts(time.Now().Unix())
 			ticks++
@@ -82,7 +82,7 @@ func (m *Monitor) loop(ctx context.Context, interval time.Duration) {
 				if d := m.cfg.RetentionDays; d > 0 {
 					cutoff := time.Now().Unix() - int64(d)*86400
 					if n, err := m.pruneOlderThan(cutoff); err == nil && n > 0 {
-						log.Printf("[Monitor] 清理过期采样 %d 行", n)
+						slog.Info("清理过期采样", "rows", n)
 					}
 				}
 			}

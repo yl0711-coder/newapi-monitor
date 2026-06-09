@@ -2,7 +2,7 @@ package monitor
 
 import (
 	"fmt"
-	"log"
+	"log/slog"
 
 	"github.com/glebarez/sqlite"
 	"gorm.io/gorm"
@@ -88,7 +88,7 @@ func (m *Monitor) openStore(path string) error {
 		return fmt.Errorf("表迁移失败: %w", err)
 	}
 	m.storeDB = db
-	log.Printf("[Monitor] 本地采样库就绪: %s", path)
+	slog.Info("本地采样库就绪", "path", path)
 	return nil
 }
 

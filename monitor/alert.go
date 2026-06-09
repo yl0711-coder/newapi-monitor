@@ -1,13 +1,12 @@
 package monitor
 
 import (
-	"crypto/tls"
 	"fmt"
-	"mime"
-	"net/smtp"
+	"html"
 	"strings"
 	"time"
 
+	"github.com/wneessen/go-mail"
 	"gorm.io/gorm/clause"
 )
 
@@ -130,7 +129,7 @@ func recipientList(s string) []string {
 	return out
 }
 
-// sendMail 发送一封邮件(支持 465 隐式 TLS 与 587/25 STARTTLS)。
+// sendMail 用 go-mail 发送一封 HTML 报警邮件(465 隐式 TLS 或 587 STARTTLS)。
 func sendMail(c AlertConfig, subject, body string) error {
 	to := recipientList(c.Recipients)
 	if len(to) == 0 {
@@ -140,58 +139,45 @@ func sendMail(c AlertConfig, subject, body string) error {
 	if from == "" {
 		from = c.SMTPUser
 	}
-	addr := fmt.Sprintf("%s:%d", c.SMTPHost, c.SMTPPort)
-	msg := buildMessage(from, to, subject, body)
-	auth := smtp.PlainAuth("", c.SMTPUser, c.SMTPPassword, c.SMTPHost)
-
-	if c.SMTPSSL { // 隐式 TLS(465)
-		conn, err := tls.Dial("tcp", addr, &tls.Config{ServerName: c.SMTPHost})
-		if err != nil {
-			return fmt.Errorf("TLS 连接失败: %w", err)
-		}
-		cl, err := smtp.NewClient(conn, c.SMTPHost)
-		if err != nil {
-			return err
-		}
-		defer cl.Close()
-		if err := cl.Auth(auth); err != nil {
-			return fmt.Errorf("认证失败: %w", err)
-		}
-		if err := cl.Mail(from); err != nil {
-			return err
-		}
-		for _, t := range to {
-			if err := cl.Rcpt(t); err != nil {
-				return err
-			}
-		}
-		w, err := cl.Data()
-		if err != nil {
-			return err
-		}
-		if _, err := w.Write(msg); err != nil {
-			return err
-		}
-		if err := w.Close(); err != nil {
-			return err
-		}
-		return cl.Quit()
+	msg := mail.NewMsg()
+	if err := msg.From(from); err != nil {
+		return fmt.Errorf("发件人无效: %w", err)
 	}
-	// 587 STARTTLS / 25:smtp.SendMail 会自动尝试 STARTTLS
-	return smtp.SendMail(addr, auth, from, to, msg)
+	if err := msg.To(to...); err != nil {
+		return fmt.Errorf("收件人无效: %w", err)
+	}
+	msg.Subject(subject)
+	msg.SetBodyString(mail.TypeTextHTML, htmlWrap(subject, body))
+
+	opts := []mail.Option{
+		mail.WithPort(c.SMTPPort),
+		mail.WithSMTPAuth(mail.SMTPAuthPlain),
+		mail.WithUsername(c.SMTPUser),
+		mail.WithPassword(c.SMTPPassword),
+		mail.WithTimeout(15 * time.Second),
+	}
+	if c.SMTPSSL {
+		opts = append(opts, mail.WithSSL()) // 465 隐式 TLS
+	} else {
+		opts = append(opts, mail.WithTLSPolicy(mail.TLSMandatory)) // 587 STARTTLS
+	}
+	cl, err := mail.NewClient(c.SMTPHost, opts...)
+	if err != nil {
+		return fmt.Errorf("创建邮件客户端失败: %w", err)
+	}
+	return cl.DialAndSend(msg)
 }
 
-func buildMessage(from string, to []string, subject, body string) []byte {
-	var b strings.Builder
-	b.WriteString("From: " + from + "\r\n")
-	b.WriteString("To: " + strings.Join(to, ", ") + "\r\n")
-	// UTF-8 主题用标准库做 MIME encoded-word(=?UTF-8?B?...?=)
-	b.WriteString("Subject: " + mime.BEncoding.Encode("UTF-8", subject) + "\r\n")
-	b.WriteString("MIME-Version: 1.0\r\n")
-	b.WriteString("Content-Type: text/plain; charset=UTF-8\r\n")
-	b.WriteString("\r\n")
-	b.WriteString(body)
-	return []byte(b.String())
+// htmlWrap 把纯文本报警内容包成一封简洁好看的 HTML 邮件(深色卡片 + 红色顶边)。
+func htmlWrap(subject, body string) string {
+	b := strings.ReplaceAll(html.EscapeString(body), "\n", "<br>")
+	return fmt.Sprintf(`<div style="margin:0;padding:24px;background:#0f1117;font-family:-apple-system,'Segoe UI',Roboto,sans-serif">
+  <div style="max-width:560px;margin:0 auto;background:#1a1d27;border:1px solid #2a2d3e;border-top:4px solid #ef4444;border-radius:12px;overflow:hidden">
+    <div style="padding:18px 22px;font-size:17px;font-weight:700;color:#e2e8f0">%s</div>
+    <div style="padding:4px 22px 18px;font-size:14px;line-height:1.7;color:#cbd5e1">%s</div>
+    <div style="padding:12px 22px;border-top:1px solid #2a2d3e;font-size:12px;color:#94a3b8">new-api 上游监控 · 自动报警(阈值可在「报警设置」页调整)</div>
+  </div>
+</div>`, html.EscapeString(subject), b)
 }
 
 // evaluateAlerts 每个采样周期调用:按配置评估规则,命中且过冷却则发邮件。

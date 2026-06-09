@@ -13,6 +13,7 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
   if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',set);else set();
 }).catch(function(){});
 </script>
+<script src="/echarts.js"></script>
 <style>
   *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
   :root{--bg:#0f1117;--surface:#1a1d27;--border:#2a2d3e;--accent:#6366f1;--text:#e2e8f0;--text-muted:#94a3b8;
@@ -63,8 +64,7 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
   .stat-value{font-size:26px;font-weight:700;margin-top:6px}
 
   #trendWrap{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:16px 20px;margin-bottom:18px}
-  #trend{width:100%;height:150px;display:block}
-  .legend{font-size:12px;color:var(--text-muted);display:flex;gap:16px;margin-top:8px}
+  #trend{width:100%;height:240px}
 
   .card{background:var(--surface);border:1px solid var(--border);border-radius:12px;overflow:hidden;margin-bottom:18px}
   .card-header{padding:14px 18px;border-bottom:1px solid var(--border);font-weight:600}
@@ -120,8 +120,7 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
 
 <div id="trendWrap">
   <div style="font-weight:600;margin-bottom:8px">流量趋势(成功 / 失败)</div>
-  <canvas id="trend"></canvas>
-  <div class="legend"><span><span class="dot dot-g"></span>成功</span><span><span class="dot dot-r"></span>失败</span></div>
+  <div id="trend"></div>
 </div>
 
 <div class="card"><div class="card-header">按分组</div><table><thead id="thGroup"></thead><tbody id="tbGroup"></tbody></table></div>
@@ -258,30 +257,48 @@ function renderTokens(rows){
 }
 const winLabel=min=>min>=60?('近'+(min/60)+'h'):('近'+min+'min');
 const burnCol=v=>v>=14?'#ef4444':(v>=3?'#f59e0b':'#94a3b8');
+let sloGauge=null;
 function renderSLO(s){
   const card=document.getElementById('sloCard');
   if(!s||!s.enabled){card.style.display='none';return}
   card.style.display='';
-  const ok=s.compliant,left=s.budget_left_pct||0;
-  const curCol=ok?'#10b981':'#ef4444',leftCol=left<20?'#ef4444':(left<50?'#f59e0b':'#10b981');
-  document.getElementById('sloBody').innerHTML=`<div style="display:flex;gap:28px;flex-wrap:wrap;align-items:baseline;font-size:14px">
-    <div><span class="muted">目标</span> <b class="num">${(s.target_pct||0).toFixed(2)}%</b> <span class="muted">· 近${s.window_days}天</span></div>
-    <div><span class="muted">当前</span> <b class="num" style="color:${curCol}">${(s.current_pct||0).toFixed(3)}%</b> ${ok?'<span class="badge badge-green">达标</span>':'<span class="badge badge-red">未达标</span>'}</div>
-    <div><span class="muted">剩余错误预算</span> <b class="num" style="color:${leftCol}">${left.toFixed(0)}%</b></div>
-    <div><span class="muted">燃烧速度</span> ${winLabel(s.fast_window_min)} <b class="num" style="color:${burnCol(s.burn_fast)}">${(s.burn_fast||0).toFixed(1)}×</b> · ${winLabel(s.slow_window_min)} <b class="num" style="color:${burnCol(s.burn_slow)}">${(s.burn_slow||0).toFixed(1)}×</b></div>
-  </div>`;
+  if(!document.getElementById('sloGauge')){
+    document.getElementById('sloBody').innerHTML='<div style="display:flex;gap:8px 28px;align-items:center;flex-wrap:wrap"><div id="sloGauge" style="width:200px;height:140px;flex:none"></div><div id="sloText" style="font-size:14px;line-height:2.1"></div></div>';
+  }
+  const ok=s.compliant,cur=s.current_pct||0,target=s.target_pct||0;
+  const left=Math.max(0,Math.min(100,s.budget_left_pct||0));
+  const col=left<20?'#ef4444':(left<50?'#f59e0b':'#10b981');
+  if(!sloGauge) sloGauge=echarts.init(document.getElementById('sloGauge'));
+  sloGauge.setOption({series:[{
+    type:'gauge',min:0,max:100,radius:'100%',center:['50%','64%'],startAngle:200,endAngle:-20,
+    progress:{show:true,width:13,itemStyle:{color:col}},
+    axisLine:{lineStyle:{width:13,color:[[1,'#2a2d3e']]}},
+    axisTick:{show:false},splitLine:{show:false},axisLabel:{show:false},pointer:{show:false},anchor:{show:false},
+    detail:{valueAnimation:true,formatter:'{value}%',color:col,fontSize:26,offsetCenter:[0,'-8%']},
+    title:{offsetCenter:[0,'26%'],color:'#94a3b8',fontSize:12},
+    data:[{value:Math.round(left),name:'剩余错误预算'}]
+  }]});
+  document.getElementById('sloText').innerHTML=`
+    <div><span class="muted">目标</span> <b class="num">${target.toFixed(2)}%</b> <span class="muted">· 近${s.window_days}天</span></div>
+    <div><span class="muted">当前</span> <b class="num" style="color:${ok?'#10b981':'#ef4444'}">${cur.toFixed(3)}%</b> ${ok?'<span class="badge badge-green">达标</span>':'<span class="badge badge-red">未达标</span>'}</div>
+    <div><span class="muted">燃烧速度</span> ${winLabel(s.fast_window_min)} <b class="num" style="color:${burnCol(s.burn_fast)}">${(s.burn_fast||0).toFixed(1)}×</b> · ${winLabel(s.slow_window_min)} <b class="num" style="color:${burnCol(s.burn_slow)}">${(s.burn_slow||0).toFixed(1)}×</b></div>`;
 }
+let trendChart=null;
 function drawTrend(points){
-  const cv=document.getElementById('trend'),dpr=window.devicePixelRatio||1,w=cv.clientWidth,h=150;
-  cv.width=w*dpr;cv.height=h*dpr;const x2=cv.getContext('2d');x2.scale(dpr,dpr);x2.clearRect(0,0,w,h);
-  if(!points||!points.length){x2.fillStyle='#94a3b8';x2.font='13px sans-serif';x2.fillText('窗口内暂无数据',8,24);return}
-  const pad={l:36,r:8,t:8,b:18},cw=w-pad.l-pad.r,ch=h-pad.t-pad.b;
-  let max=1;points.forEach(p=>max=Math.max(max,p.success+p.failed));
-  x2.strokeStyle='#2a2d3e';x2.fillStyle='#94a3b8';x2.font='11px sans-serif';x2.lineWidth=1;
-  for(let i=0;i<=2;i++){const y=pad.t+ch*i/2;x2.beginPath();x2.moveTo(pad.l,y);x2.lineTo(w-pad.r,y);x2.stroke();x2.fillText(Math.round(max*(1-i/2)),4,y+3)}
-  const n=points.length,X=i=>pad.l+(n===1?cw/2:cw*i/(n-1)),Y=v=>pad.t+ch*(1-v/max);
-  const line=(k,col)=>{x2.strokeStyle=col;x2.lineWidth=2;x2.beginPath();points.forEach((p,i)=>{const v=k==='s'?p.success:p.success+p.failed;i?x2.lineTo(X(i),Y(v)):x2.moveTo(X(i),Y(v))});x2.stroke()};
-  line('t','#ef4444');line('s','#10b981');
+  const el=document.getElementById('trend');
+  if(!trendChart) trendChart=echarts.init(el);
+  if(!points||!points.length){trendChart.clear();return}
+  trendChart.setOption({
+    grid:{left:46,right:14,top:32,bottom:24},
+    tooltip:{trigger:'axis',backgroundColor:'#1a1d27',borderColor:'#2a2d3e',textStyle:{color:'#e2e8f0'}},
+    legend:{data:['成功','失败'],textStyle:{color:'#94a3b8'},right:8,top:2},
+    xAxis:{type:'category',data:points.map(p=>clock(p.ts)),boundaryGap:false,axisLabel:{color:'#94a3b8',fontSize:11},axisLine:{lineStyle:{color:'#2a2d3e'}}},
+    yAxis:{type:'value',minInterval:1,axisLabel:{color:'#94a3b8',fontSize:11},splitLine:{lineStyle:{color:'#2a2d3e'}}},
+    series:[
+      {name:'成功',type:'line',smooth:true,symbol:'none',data:points.map(p=>p.success),lineStyle:{color:'#10b981',width:2},areaStyle:{color:'rgba(16,185,129,.10)'}},
+      {name:'失败',type:'line',smooth:true,symbol:'none',data:points.map(p=>p.failed),lineStyle:{color:'#ef4444',width:2},areaStyle:{color:'rgba(239,68,68,.12)'}}
+    ]
+  });
 }
 function apply(s){
   document.getElementById('genAt').textContent='更新于 '+s.generated_at+' · 窗口 '+s.window_minutes+' 分钟';
@@ -311,7 +328,7 @@ async function loadMe(){
 function schedule(){if(timer)clearInterval(timer);if(document.getElementById('autoRefresh').checked)timer=setInterval(load,30000)}
 document.getElementById('refreshNow').addEventListener('click',load);
 document.getElementById('autoRefresh').addEventListener('change',schedule);
-window.addEventListener('resize',()=>drawTrend(lastTrend));
+window.addEventListener('resize',()=>{trendChart&&trendChart.resize();sloGauge&&sloGauge.resize();});
 setSeg();loadMe();load();schedule();
 </script>
 </body>

@@ -20,6 +20,9 @@ var alertPageHTML string
 //go:embed login.html
 var loginHTML string
 
+//go:embed echarts.min.js
+var echartsJS []byte // 内嵌 ECharts(Apache 2.0),自服务、不走 CDN,保持自包含
+
 var allowedWindows = map[int]bool{15: true, 30: true, 60: true, 180: true, 360: true, 720: true, 1440: true}
 
 func parseWindow(c *gin.Context) int {
@@ -35,6 +38,10 @@ func parseWindow(c *gin.Context) int {
 func (m *Monitor) RegisterRoutes(r *gin.Engine) {
 	// 公开:登录/登出/健康检查/站点名
 	r.GET("/health", func(c *gin.Context) { c.JSON(http.StatusOK, gin.H{"status": "ok"}) })
+	r.GET("/echarts.js", func(c *gin.Context) { // 公开:内嵌 ECharts,自服务、版本固定可长期缓存
+		c.Header("Cache-Control", "public, max-age=31536000, immutable")
+		c.Data(http.StatusOK, "application/javascript; charset=utf-8", echartsJS)
+	})
 	r.GET("/api/brand", m.brandHandler) // 公开:站点名,供前端设置页面标题
 	r.GET("/login", m.loginPage)
 	r.POST("/login", m.loginSubmit)

@@ -14,7 +14,7 @@ package main
 import (
 	"context"
 	"errors"
-	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -28,12 +28,14 @@ import (
 )
 
 func main() {
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo})))
 	_ = godotenv.Load() // 可选 .env
 
 	s := monitor.LoadSettings()
 	m, err := monitor.New(s)
 	if err != nil {
-		log.Fatalf("[Monitor] 启动失败: %v", err)
+		slog.Error("启动失败", "err", err)
+		os.Exit(1)
 	}
 
 	// 收到 SIGINT/SIGTERM 时取消 ctx:采样器退出 + HTTP 优雅关停。
@@ -48,18 +50,19 @@ func main() {
 
 	srv := &http.Server{Addr: s.Addr, Handler: r}
 	go func() {
-		log.Printf("[Monitor] 上游监控已启动: http://localhost%s", s.Addr)
+		slog.Info("上游监控已启动", "addr", "http://localhost"+s.Addr)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Fatalf("[Monitor] 监听失败: %v", err)
+			slog.Error("监听失败", "err", err)
+			os.Exit(1)
 		}
 	}()
 
 	<-ctx.Done() // 等待退出信号
 	stop()
-	log.Printf("[Monitor] 收到退出信号,优雅关停…")
+	slog.Info("收到退出信号,优雅关停…")
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := srv.Shutdown(shutdownCtx); err != nil {
-		log.Printf("[Monitor] 关停超时: %v", err)
+		slog.Warn("关停超时", "err", err)
 	}
 }

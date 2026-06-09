@@ -73,5 +73,10 @@ docker build -t newapi-monitor .                                        # 镜像
 ```
 推 `main` 或打 `v*` tag 时,GitHub Actions 先跑 `go vet` + `go test`,通过后自动构建并发布镜像到 GHCR(见 [`.github/workflows/ci.yml`](.github/workflows/ci.yml))。
 
+## 第三方组件
+- [Apache ECharts](https://echarts.apache.org/)(Apache-2.0)——看板图表,已内嵌、自服务、不走 CDN。
+- [go-mail](https://github.com/wneessen/go-mail)(MIT)——报警邮件发送。
+- [gin](https://github.com/gin-gonic/gin) / [GORM](https://gorm.io) / [glebarez/sqlite](https://github.com/glebarez/sqlite) / [go-sql-driver/mysql](https://github.com/go-sql-driver/mysql) / [godotenv](https://github.com/joho/godotenv)。
+
 ## License
 [MIT](LICENSE)

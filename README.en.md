@@ -73,5 +73,10 @@ docker build -t newapi-monitor .                                        # image
 ```
 On push to `main` or a `v*` tag, GitHub Actions runs `go vet` + `go test`, then builds and publishes the image to GHCR (see [`.github/workflows/ci.yml`](.github/workflows/ci.yml)).
 
+## Third-party
+- [Apache ECharts](https://echarts.apache.org/) (Apache-2.0) — dashboard charts, vendored & self-served (no CDN).
+- [go-mail](https://github.com/wneessen/go-mail) (MIT) — alert email delivery.
+- [gin](https://github.com/gin-gonic/gin) / [GORM](https://gorm.io) / [glebarez/sqlite](https://github.com/glebarez/sqlite) / [go-sql-driver/mysql](https://github.com/go-sql-driver/mysql) / [godotenv](https://github.com/joho/godotenv).
+
 ## License
 [MIT](LICENSE)

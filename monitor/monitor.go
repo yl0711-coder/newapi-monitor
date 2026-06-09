@@ -18,7 +18,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"log"
+	"log/slog"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -50,10 +50,10 @@ type Monitor struct {
 func New(s Settings) (*Monitor, error) {
 	if s.SessionSecret == "" {
 		s.SessionSecret = randomSecret() // 未配置则随机生成,重启后需重新登录
-		log.Printf("[Monitor] 未设置 MONITOR_SESSION_SECRET,已临时随机生成(重启后所有登录失效;生产建议固定配置一个长随机串)")
+		slog.Warn("未设置 MONITOR_SESSION_SECRET,已临时随机生成;重启后所有登录失效,生产建议固定配置一个长随机串")
 	}
 	if s.NewAPIBaseURL == "" {
-		log.Printf("[Monitor] ⚠️ 未设置 MONITOR_NEWAPI_BASE_URL,登录将无法验证身份(谁都登不进);生产必须配成 new-api 地址,如 http://new-api:3000")
+		slog.Warn("未设置 MONITOR_NEWAPI_BASE_URL,登录将无法验证身份;生产必须配成 new-api 地址,如 http://new-api:3000")
 	}
 
 	m := &Monitor{cfg: s, chNames: map[string]string{}}
