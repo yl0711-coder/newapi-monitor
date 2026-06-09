@@ -10,14 +10,16 @@ WORKDIR /build
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-# glebarez/modernc 纯 Go sqlite,无需 CGO,静态编译;main 在模块根
-RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /build/monitor .
+# glebarez/modernc 纯 Go sqlite,无需 CGO,静态编译;main 在模块根。
+# 产物输出到 /app —— 不能用 /build/monitor:源码里有 monitor/ 目录,COPY . . 后 /build/monitor 已是目录,
+# go build -o 到已存在目录会把二进制塞进去,导致产物变成目录、容器 ENTRYPOINT 报 "is a directory"。
+RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /app .
 
 # ---- 运行阶段(最小镜像)----
 FROM alpine:3.19
 RUN apk add --no-cache ca-certificates tzdata
 WORKDIR /app
-COPY --from=builder /build/monitor /app/monitor
+COPY --from=builder /app /app/monitor
 RUN adduser -D -u 1000 app && mkdir -p /data && chown -R app /app /data
 USER app
 ENV MONITOR_ADDR=:8090 \
