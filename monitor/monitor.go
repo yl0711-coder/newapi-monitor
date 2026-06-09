@@ -181,6 +181,7 @@ type Snapshot struct {
 	ByModel        []Row       `json:"by_model"`
 	ByToken        []TokenRow  `json:"by_token"`
 	Trend          []TimePoint `json:"trend"`
+	SLO            SLOStatus   `json:"slo"`
 }
 
 // attachSpark 给每行挂上对应维度取值的分钟桶时序(失败则静默跳过)。
@@ -287,6 +288,7 @@ func (m *Monitor) GetSnapshot(windowMinutes int, nowUnix int64) (*Snapshot, erro
 	if terr != nil {
 		tokens = nil // token 维度失败不影响主看板
 	}
+	slo := m.computeSLO(m.loadAlertConfig(), nowUnix)
 
 	lastBucket := m.storeFreshness()
 	age := int64(-1)
@@ -308,5 +310,6 @@ func (m *Monitor) GetSnapshot(windowMinutes int, nowUnix int64) (*Snapshot, erro
 		ByModel:        md,
 		ByToken:        tokens,
 		Trend:          trend,
+		SLO:            slo,
 	}, nil
 }

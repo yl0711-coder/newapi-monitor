@@ -39,6 +39,17 @@ type AlertConfig struct {
 	SamplerDownEnabled  bool    `json:"sampler_down_enabled"`
 	CooldownMin         int     `json:"cooldown_min"`
 
+	// SLO / 错误预算 / 燃烧告警(SLI = 非错误率,全部可配)
+	SLOEnabled        bool    `json:"slo_enabled"`
+	SLOTargetPct      float64 `json:"slo_target_pct"`  // 目标成功率,如 99
+	SLOWindowDays     int     `json:"slo_window_days"` // SLO 窗口(天,≤ 留存天数)
+	BurnFastEnabled   bool    `json:"burn_fast_enabled"`
+	BurnFastRate      float64 `json:"burn_fast_rate"`       // 快烧倍数阈值,如 14
+	BurnFastWindowMin int     `json:"burn_fast_window_min"` // 快烧观察窗(分钟),如 60
+	BurnSlowEnabled   bool    `json:"burn_slow_enabled"`
+	BurnSlowRate      float64 `json:"burn_slow_rate"`       // 慢烧倍数阈值,如 3
+	BurnSlowWindowMin int     `json:"burn_slow_window_min"` // 慢烧观察窗(分钟),如 360
+
 	UpdatedAt int64 `json:"-"`
 }
 
@@ -57,6 +68,15 @@ func defaultAlertConfig() AlertConfig {
 		AnomalyMinCount:     8,
 		SamplerDownEnabled:  true,
 		CooldownMin:         30,
+		SLOEnabled:          false, // 配好目标后再开
+		SLOTargetPct:        99,
+		SLOWindowDays:       7,
+		BurnFastEnabled:     true,
+		BurnFastRate:        14,
+		BurnFastWindowMin:   60,
+		BurnSlowEnabled:     true,
+		BurnSlowRate:        3,
+		BurnSlowWindowMin:   360,
 	}
 }
 
@@ -180,6 +200,8 @@ func (m *Monitor) evaluateAlerts(nowUnix int64) {
 	if !c.Enabled || c.SMTPHost == "" || c.Recipients == "" {
 		return
 	}
+
+	m.evaluateBurn(c, nowUnix) // SLO 错误预算燃烧告警(快烧/慢烧)
 
 	// 采样器掉线
 	if c.SamplerDownEnabled {

@@ -116,6 +116,8 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
 
 <div class="stats-grid" id="summary"></div>
 
+<div id="sloCard" class="attn" style="display:none"><h3>🎯 SLO / 错误预算</h3><div id="sloBody"></div></div>
+
 <div id="trendWrap">
   <div style="font-weight:600;margin-bottom:8px">流量趋势(成功 / 失败)</div>
   <canvas id="trend"></canvas>
@@ -254,6 +256,21 @@ function renderTokens(rows){
     <td class="right num">${fmtNum(r.tokens)}</td>
     <td class="right num">${fmtUSD(r.cost_usd)}</td></tr>`).join('');
 }
+const winLabel=min=>min>=60?('近'+(min/60)+'h'):('近'+min+'min');
+const burnCol=v=>v>=14?'#ef4444':(v>=3?'#f59e0b':'#94a3b8');
+function renderSLO(s){
+  const card=document.getElementById('sloCard');
+  if(!s||!s.enabled){card.style.display='none';return}
+  card.style.display='';
+  const ok=s.compliant,left=s.budget_left_pct||0;
+  const curCol=ok?'#10b981':'#ef4444',leftCol=left<20?'#ef4444':(left<50?'#f59e0b':'#10b981');
+  document.getElementById('sloBody').innerHTML=`<div style="display:flex;gap:28px;flex-wrap:wrap;align-items:baseline;font-size:14px">
+    <div><span class="muted">目标</span> <b class="num">${(s.target_pct||0).toFixed(2)}%</b> <span class="muted">· 近${s.window_days}天</span></div>
+    <div><span class="muted">当前</span> <b class="num" style="color:${curCol}">${(s.current_pct||0).toFixed(3)}%</b> ${ok?'<span class="badge badge-green">达标</span>':'<span class="badge badge-red">未达标</span>'}</div>
+    <div><span class="muted">剩余错误预算</span> <b class="num" style="color:${leftCol}">${left.toFixed(0)}%</b></div>
+    <div><span class="muted">燃烧速度</span> ${winLabel(s.fast_window_min)} <b class="num" style="color:${burnCol(s.burn_fast)}">${(s.burn_fast||0).toFixed(1)}×</b> · ${winLabel(s.slow_window_min)} <b class="num" style="color:${burnCol(s.burn_slow)}">${(s.burn_slow||0).toFixed(1)}×</b></div>
+  </div>`;
+}
 function drawTrend(points){
   const cv=document.getElementById('trend'),dpr=window.devicePixelRatio||1,w=cv.clientWidth,h=150;
   cv.width=w*dpr;cv.height=h*dpr;const x2=cv.getContext('2d');x2.scale(dpr,dpr);x2.clearRect(0,0,w,h);
@@ -268,7 +285,7 @@ function drawTrend(points){
 }
 function apply(s){
   document.getElementById('genAt').textContent='更新于 '+s.generated_at+' · 窗口 '+s.window_minutes+' 分钟';
-  renderBanner(s);renderSummary(s.summary);lastTrend=s.trend||[];drawTrend(lastTrend);
+  renderBanner(s);renderSummary(s.summary);renderSLO(s.slo);lastTrend=s.trend||[];drawTrend(lastTrend);
   renderTable('thGroup','tbGroup',s.by_group);renderTable('thChannel','tbChannel',s.by_channel);renderTable('thModel','tbModel',s.by_model);
   renderTokens(s.by_token);
 }

@@ -99,6 +99,18 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
   </table>
 </div>
 
+<div class="card">
+  <h2>SLO / 错误预算(燃烧告警)</h2>
+  <p class="muted" style="margin:-6px 0 12px">SLI = 非错误率(成功+异常)/ 总。开启后看板显示达标率 / 剩余预算,并按"燃烧速度"分快(紧急)/慢(记单)两档告警。全部可配。</p>
+  <label class="ck"><input type="checkbox" id="slo_enabled"> 启用 SLO 与燃烧告警</label>
+  <table class="thr" style="margin-top:10px">
+    <tr><td>目标成功率(%)</td><td><input type="number" id="slo_target_pct" step="0.1"> <span class="muted">建议 99</span></td></tr>
+    <tr><td>SLO 窗口(天,≤ 留存天数)</td><td><input type="number" id="slo_window_days"> <span class="muted">建议 7</span></td></tr>
+    <tr><td><b>🔴 快烧</b>(紧急):窗口内燃烧 ≥ ? 倍</td><td><label class="ck"><input type="checkbox" id="burn_fast_enabled"> 启用</label>　窗口(分)<input type="number" id="burn_fast_window_min" style="width:72px">　倍数<input type="number" id="burn_fast_rate" style="width:72px"> <span class="muted">建议 60 / 14×</span></td></tr>
+    <tr><td><b>🟡 慢烧</b>(记单):窗口内燃烧 ≥ ? 倍</td><td><label class="ck"><input type="checkbox" id="burn_slow_enabled"> 启用</label>　窗口(分)<input type="number" id="burn_slow_window_min" style="width:72px">　倍数<input type="number" id="burn_slow_rate" style="width:72px"> <span class="muted">建议 360 / 3×</span></td></tr>
+  </table>
+</div>
+
 <div class="bar">
   <button class="btn btn-primary" id="saveBtn">保存</button>
   <button class="btn btn-outline" id="testBtn">发送测试邮件</button>
@@ -107,8 +119,8 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
 
 <script>
 const $=id=>document.getElementById(id);
-const numFields=['smtp_port','eval_window_min','err_rate_pct','err_min_count','err_burst_count','anomaly_burst_buckets','anomaly_min_count','cooldown_min'];
-const ckFields=['enabled','smtp_ssl','sampler_down_enabled'];
+const numFields=['smtp_port','eval_window_min','err_rate_pct','err_min_count','err_burst_count','anomaly_burst_buckets','anomaly_min_count','cooldown_min','slo_target_pct','slo_window_days','burn_fast_rate','burn_fast_window_min','burn_slow_rate','burn_slow_window_min'];
+const ckFields=['enabled','smtp_ssl','sampler_down_enabled','slo_enabled','burn_fast_enabled','burn_slow_enabled'];
 const txtFields=['site_name','smtp_host','smtp_user','smtp_password','smtp_from','recipients'];
 
 function fill(cfg, pwSet){
