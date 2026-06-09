@@ -39,6 +39,9 @@ func (m *Monitor) startSampler(ctx context.Context) {
 		} else {
 			log.Printf("[Monitor] 历史回填完成:近 %dh,写入 %d 行采样", h, n)
 		}
+		if err := m.sampleTokens(ctx, int64(h)*3600); err != nil {
+			log.Printf("[Monitor] token 维度回填失败(忽略,不影响主监控): %v", err)
+		}
 	}
 
 	interval := time.Duration(m.cfg.SampleSeconds) * time.Second
@@ -69,6 +72,9 @@ func (m *Monitor) loop(ctx context.Context, interval time.Duration) {
 			}
 			m.lastRun.Store(time.Now().Unix())
 			m.heartbeat() // 成功采样后向外部 dead-man 服务打心跳
+			if err := m.sampleTokens(ctx, lookback); err != nil {
+				log.Printf("[Monitor] token 维度采样失败(忽略,不影响主监控): %v", err)
+			}
 			m.evaluateAlerts(time.Now().Unix())
 			ticks++
 			if ticks%(int(600/interval.Seconds())+1) == 0 {
@@ -165,6 +171,42 @@ GROUP BY bucket, channel_id, model_name, grp`
 		return 0, err
 	}
 	return len(batch), nil
+}
+
+// sampleTokens 按【分钟桶 × 令牌】聚合最近 lookbackSec 秒日志,写本地 token_samples。
+// 与主采样隔离:它失败由调用方记日志后继续,绝不影响主监控。
+func (m *Monitor) sampleTokens(ctx context.Context, lookbackSec int64) error {
+	cctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+	q := `
+SELECT (created_at DIV 60)*60 AS bucket, token_name,
+  CAST(COALESCE(SUM(type=2 AND COALESCE(other,'') NOT REGEXP 'client_gone|scanner_error|panic|ping_fail'),0) AS SIGNED) AS success,
+  CAST(COALESCE(SUM(type=2 AND COALESCE(other,'')     REGEXP 'client_gone|scanner_error|panic|ping_fail'),0) AS SIGNED) AS anomaly,
+  CAST(COALESCE(SUM(type=5),0) AS SIGNED) AS failed,
+  CAST(COALESCE(SUM(CASE WHEN type=2 THEN prompt_tokens+completion_tokens END),0) AS SIGNED) AS tokens,
+  CAST(COALESCE(SUM(quota),0) AS SIGNED) AS quota
+FROM logs
+WHERE created_at >= UNIX_TIMESTAMP() - ? AND type IN (2,5)
+GROUP BY bucket, token_name`
+	rows, err := m.prodDB.QueryContext(cctx, q, lookbackSec)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	var batch []TokenSample
+	for rows.Next() {
+		var s TokenSample
+		var tn sql.NullString
+		if err := rows.Scan(&s.BucketTs, &tn, &s.Success, &s.Anomaly, &s.Failed, &s.Tokens, &s.Quota); err != nil {
+			return err
+		}
+		s.TokenName = tn.String
+		batch = append(batch, s)
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	return m.upsertTokenSamples(batch)
 }
 
 // refreshChannelNames 刷新渠道 id->name 映射(低频,失败则保留旧值)。

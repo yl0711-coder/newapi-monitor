@@ -125,6 +125,7 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
 <div class="card"><div class="card-header">按分组</div><table><thead id="thGroup"></thead><tbody id="tbGroup"></tbody></table></div>
 <div class="card"><div class="card-header">按渠道</div><table><thead id="thChannel"></thead><tbody id="tbChannel"></tbody></table></div>
 <div class="card"><div class="card-header">按模型</div><table><thead id="thModel"></thead><tbody id="tbModel"></tbody></table></div>
+<div class="card"><div class="card-header">按 Key / 用户 <span class="muted" style="font-weight:400">· 谁在制造错误 / 烧配额(Top 100)</span></div><table><thead id="thToken"></thead><tbody id="tbToken"></tbody></table></div>
 
 <script>
 const params=new URLSearchParams(location.search);
@@ -239,6 +240,20 @@ function renderTable(th,tb,rows){
     <td class="emix">${(r.failed||r.anomaly)?errMix(r):'<span class="muted">—</span>'}</td>
     <td class="right num">${fmtUSD(r.cost_usd)}</td></tr>`).join('');
 }
+const TOKHEAD=`<tr><th>Key / 用户</th><th class="right">请求</th><th>稳定性</th><th class="right">异常</th><th class="right">错误</th><th class="right">Tokens</th><th class="right">消费</th></tr>`;
+function renderTokens(rows){
+  document.getElementById('thToken').innerHTML=TOKHEAD;
+  const e=document.getElementById('tbToken');
+  if(!rows||!rows.length){e.innerHTML=`<tr><td colspan="7" class="muted" style="text-align:center;padding:24px">窗口内暂无数据</td></tr>`;return}
+  e.innerHTML=rows.map(r=>`<tr>
+    <td><span class="dot ${dotClass(r.health)}"></span> ${esc(r.key)}</td>
+    <td class="right num">${fmtNum(r.total)}</td>
+    <td>${healthBadge(r.health,r.success_rate)}</td>
+    <td class="right num">${r.anomaly?`<span class="lat-warn">${fmtNum(r.anomaly)}</span>`:'0'}</td>
+    <td class="right num">${r.failed?`<span class="lat-bad">${fmtNum(r.failed)}</span>`:'0'}</td>
+    <td class="right num">${fmtNum(r.tokens)}</td>
+    <td class="right num">${fmtUSD(r.cost_usd)}</td></tr>`).join('');
+}
 function drawTrend(points){
   const cv=document.getElementById('trend'),dpr=window.devicePixelRatio||1,w=cv.clientWidth,h=150;
   cv.width=w*dpr;cv.height=h*dpr;const x2=cv.getContext('2d');x2.scale(dpr,dpr);x2.clearRect(0,0,w,h);
@@ -255,6 +270,7 @@ function apply(s){
   document.getElementById('genAt').textContent='更新于 '+s.generated_at+' · 窗口 '+s.window_minutes+' 分钟';
   renderBanner(s);renderSummary(s.summary);lastTrend=s.trend||[];drawTrend(lastTrend);
   renderTable('thGroup','tbGroup',s.by_group);renderTable('thChannel','tbChannel',s.by_channel);renderTable('thModel','tbModel',s.by_model);
+  renderTokens(s.by_token);
 }
 async function load(){
   try{

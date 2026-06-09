@@ -56,6 +56,18 @@ type MetricSample struct {
 	TtftMaxMs int   `gorm:"column:ttft_max_ms"` // 最大 frt(ms),用于分位末档收尾
 }
 
+// TokenSample 按【分钟桶 × 令牌(API Key)】聚合,用于"谁在制造错误 / 烧配额"维度。
+// 故意比 MetricSample 轻(不交叉渠道/模型)以控制基数。
+type TokenSample struct {
+	BucketTs  int64  `gorm:"primaryKey;autoIncrement:false;index"`
+	TokenName string `gorm:"primaryKey;size:128;column:token_name"`
+	Success   int64
+	Anomaly   int64
+	Failed    int64
+	Tokens    int64
+	Quota     int64
+}
+
 // 直方图档位上界。lat 单位秒,ttft 单位毫秒。
 var (
 	latEdges  = []int{1, 2, 5, 10, 30, 60}
@@ -72,7 +84,7 @@ func (m *Monitor) openStore(path string) error {
 	if err != nil {
 		return fmt.Errorf("打开本地采样库失败: %w", err)
 	}
-	if err := db.AutoMigrate(&MetricSample{}, &AlertConfig{}, &AlertLog{}); err != nil {
+	if err := db.AutoMigrate(&MetricSample{}, &TokenSample{}, &AlertConfig{}, &AlertLog{}); err != nil {
 		return fmt.Errorf("表迁移失败: %w", err)
 	}
 	m.storeDB = db
@@ -92,8 +104,19 @@ func (m *Monitor) upsertSamples(rows []MetricSample) error {
 	}).CreateInBatches(rows, 200).Error
 }
 
+func (m *Monitor) upsertTokenSamples(rows []TokenSample) error {
+	if len(rows) == 0 {
+		return nil
+	}
+	return m.storeDB.Clauses(clause.OnConflict{
+		Columns:   []clause.Column{{Name: "bucket_ts"}, {Name: "token_name"}},
+		UpdateAll: true,
+	}).CreateInBatches(rows, 200).Error
+}
+
 func (m *Monitor) pruneOlderThan(cutoffTs int64) (int64, error) {
 	r := m.storeDB.Where("bucket_ts < ?", cutoffTs).Delete(&MetricSample{})
+	m.storeDB.Where("bucket_ts < ?", cutoffTs).Delete(&TokenSample{}) // token 维度一并清理
 	return r.RowsAffected, r.Error
 }
 
@@ -331,6 +354,41 @@ func (m *Monitor) storeTrend(since int64, windowMinutes int) ([]TimePoint, error
 	out := make([]TimePoint, 0, len(order))
 	for _, b := range order {
 		out = append(out, *agg[b])
+	}
+	return out, nil
+}
+
+// storeTokens 按令牌(API Key)聚合窗口内的成功/异常/失败/用量/成本,按 错误数→请求数 降序取 Top 100。
+func (m *Monitor) storeTokens(since int64, windowSec float64) ([]TokenRow, error) {
+	type tr struct {
+		K       string
+		Success int64
+		Anomaly int64
+		Failed  int64
+		Tokens  int64
+		Quota   int64
+	}
+	var rows []tr
+	if err := m.storeDB.Raw(`SELECT token_name AS k,
+		COALESCE(SUM(success),0) AS success, COALESCE(SUM(anomaly),0) AS anomaly,
+		COALESCE(SUM(failed),0) AS failed, COALESCE(SUM(tokens),0) AS tokens, COALESCE(SUM(quota),0) AS quota
+		FROM token_samples WHERE bucket_ts >= ? GROUP BY token_name
+		ORDER BY failed DESC, (success+failed) DESC LIMIT 100`, since).Scan(&rows).Error; err != nil {
+		return nil, fmt.Errorf("本地 token 聚合失败: %w", err)
+	}
+	out := make([]TokenRow, 0, len(rows))
+	for _, a := range rows {
+		key := a.K
+		if key == "" {
+			key = "(无令牌名)"
+		}
+		total := a.Success + a.Anomaly + a.Failed
+		out = append(out, TokenRow{
+			Key: key, Total: total, Success: a.Success, Anomaly: a.Anomaly, Failed: a.Failed,
+			SuccessRate: rate(a.Success, total), AnomalyRate: rate(a.Anomaly, total), ErrorRate: rate(a.Failed, total),
+			QPS: float64(total) / windowSec, Tokens: a.Tokens, CostUSD: float64(a.Quota) / quotaPerUSD,
+			Health: health(total, rate(a.Success+a.Anomaly, total)),
+		})
 	}
 	return out, nil
 }

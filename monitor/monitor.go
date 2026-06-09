@@ -153,7 +153,23 @@ type TimePoint struct {
 	Failed  int64 `json:"failed"`
 }
 
-// Snapshot 是一次完整看板快照:总览 + 分组 / 渠道 / 模型明细 + 趋势。
+// TokenRow 是某令牌(API Key)在窗口内的指标行,回答"谁在制造错误 / 烧配额"。
+type TokenRow struct {
+	Key         string  `json:"key"`
+	Total       int64   `json:"total"`
+	Success     int64   `json:"success"`
+	Anomaly     int64   `json:"anomaly"`
+	Failed      int64   `json:"failed"`
+	SuccessRate float64 `json:"success_rate"`
+	AnomalyRate float64 `json:"anomaly_rate"`
+	ErrorRate   float64 `json:"error_rate"`
+	QPS         float64 `json:"qps"`
+	Tokens      int64   `json:"tokens"`
+	CostUSD     float64 `json:"cost_usd"`
+	Health      string  `json:"health"`
+}
+
+// Snapshot 是一次完整看板快照:总览 + 分组 / 渠道 / 模型 / 令牌明细 + 趋势。
 type Snapshot struct {
 	WindowMinutes  int         `json:"window_minutes"`
 	GeneratedAt    string      `json:"generated_at"`
@@ -163,6 +179,7 @@ type Snapshot struct {
 	ByGroup        []Row       `json:"by_group"`
 	ByChannel      []Row       `json:"by_channel"`
 	ByModel        []Row       `json:"by_model"`
+	ByToken        []TokenRow  `json:"by_token"`
 	Trend          []TimePoint `json:"trend"`
 }
 
@@ -266,6 +283,11 @@ func (m *Monitor) GetSnapshot(windowMinutes int, nowUnix int64) (*Snapshot, erro
 	m.attachSpark(ch, "channel_id", since, windowMinutes)
 	m.attachSpark(md, "model_name", since, windowMinutes)
 
+	tokens, terr := m.storeTokens(since, windowSec)
+	if terr != nil {
+		tokens = nil // token 维度失败不影响主看板
+	}
+
 	lastBucket := m.storeFreshness()
 	age := int64(-1)
 	if lastBucket > 0 {
@@ -284,6 +306,7 @@ func (m *Monitor) GetSnapshot(windowMinutes int, nowUnix int64) (*Snapshot, erro
 		ByGroup:        grp,
 		ByChannel:      ch,
 		ByModel:        md,
+		ByToken:        tokens,
 		Trend:          trend,
 	}, nil
 }
