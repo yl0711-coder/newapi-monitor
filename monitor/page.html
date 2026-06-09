@@ -50,7 +50,7 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
   details.attn-item{display:block;padding:0;background:var(--bg);border-radius:8px}
   details.attn-item>summary{display:flex;align-items:center;gap:10px;font-size:14px;padding:8px 12px;cursor:pointer;list-style:none}
   details.attn-item>summary::-webkit-details-marker{display:none}
-  details.attn-item>summary::before{content:'▸';color:var(--text-muted);font-size:11px;flex:none;width:10px}
+  details.attn-item>summary::before{content:'▶';color:var(--accent);font-size:13px;flex:none;width:16px;text-align:center}
   details.attn-item[open]>summary::before{content:'▼'}
   details.attn-item>summary:hover{background:rgba(255,255,255,.02)}
   .attn-detail{padding:2px 12px 10px 32px;display:flex;flex-wrap:wrap;gap:5px 14px;font-size:12px;color:var(--text-muted)}
