@@ -47,6 +47,15 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
   .attn-item{display:flex;align-items:center;gap:10px;font-size:14px;padding:8px 12px;border-radius:8px;background:var(--bg)}
   .attn-item .who{font-weight:600}.attn-item .why{color:var(--text-muted);font-size:13px;margin-left:auto}
   .attn-empty{color:var(--green);font-size:14px}
+  details.attn-item{display:block;padding:0;background:var(--bg);border-radius:8px}
+  details.attn-item>summary{display:flex;align-items:center;gap:10px;font-size:14px;padding:8px 12px;cursor:pointer;list-style:none}
+  details.attn-item>summary::-webkit-details-marker{display:none}
+  details.attn-item>summary::before{content:'▸';color:var(--text-muted);font-size:11px;flex:none;width:10px}
+  details.attn-item[open]>summary::before{content:'▼'}
+  details.attn-item>summary:hover{background:rgba(255,255,255,.02)}
+  .attn-detail{padding:2px 12px 10px 32px;display:flex;flex-wrap:wrap;gap:5px 14px;font-size:12px;color:var(--text-muted)}
+  .attn-detail .tb b{color:var(--text);font-variant-numeric:tabular-nums;margin-right:3px}
+  .attn-detail .a{color:var(--yellow)}.attn-detail .e{color:var(--red)}
 
   .stats-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:14px;margin-bottom:18px}
   .stat-card{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:18px}
@@ -122,6 +131,7 @@ const params=new URLSearchParams(location.search);
 let WINDOW=parseInt(params.get('window')||'60',10);
 if(![15,30,60,180,360,720,1440].includes(WINDOW)) WINDOW=60;
 let timer=null,lastTrend=[];
+const expanded=new Set(); // 记住"需要关注"里哪些项被展开,30s 刷新不收起
 
 const fmtNum=n=>(n||0).toLocaleString('en-US');
 const fmtRate=r=>(r||0).toFixed(1)+'%';
@@ -169,27 +179,39 @@ function renderBanner(s){
     if(r.anomaly_burst) w.push(`⚠ 异常成簇 ${r.anomaly}次`);
     else if(r.anomaly>0) w.push(`异常 ${r.anomaly}`);
     w.push(`p95 ${fmtLat(r.p95)}`);
-    if(failWindow(r.spark)) w.push(failWindow(r.spark));
-    return `<div class="attn-item"><span class="dot ${r.health==='bad'?'dot-r':'dot-y'}"></span>
+    const span=problemSpan(r.spark); if(span) w.push(span);
+    const dotc=r.health==='bad'?'dot-r':'dot-y', bc=r.health==='bad'?'badge-red':'badge-yellow';
+    const summary=`<span class="dot ${dotc}"></span>
       <span class="who">${r.kind} ${esc(r.label)}</span>
-      <span class="badge ${r.health==='bad'?'badge-red':'badge-yellow'}">成功 ${fmtRate(r.success_rate)}</span>
-      <span class="why">${w.join(' · ')}</span></div>`;
+      <span class="badge ${bc}">成功 ${fmtRate(r.success_rate)}</span>
+      <span class="why">${w.join(' · ')}</span>`;
+    const detail=problemDetail(r.spark);
+    if(!detail) return `<div class="attn-item">${summary}</div>`;
+    return `<details class="attn-item" data-k="${esc(r.label)}"${expanded.has(r.label)?' open':''}><summary>${summary}</summary><div class="attn-detail">${detail}</div></details>`;
   };
   list.innerHTML=items.map(row).join('');
+  list.querySelectorAll('details.attn-item').forEach(d=>d.addEventListener('toggle',()=>{d.open?expanded.add(d.dataset.k):expanded.delete(d.dataset.k);}));
 }
 const fmtTok=v=>v>=1?Math.round(v)+' tok/s':(v?v.toFixed(1)+' tok/s':'—');
 const fmtTtft=v=>v>0?fmtLat(v):'—';
 const clock=ts=>{const d=new Date(ts*1000);return String(d.getHours()).padStart(2,'0')+':'+String(d.getMinutes()).padStart(2,'0');};
-// 从该行的分钟桶序列里,算出"有失败的时间段 + 最近一次距今"
-function failWindow(spark){
-  if(!spark||!spark.length) return '';
-  const f=spark.filter(p=>p.failed>0);
-  if(!f.length) return '';
-  const last=f[f.length-1].ts;            // 序列按时间升序,末尾即最近一次失败
-  const ago=Math.max(0,Math.floor(Date.now()/1000)-(last+60));
-  const agoStr=ago<90?'刚刚':(ago<5400?Math.round(ago/60)+'分钟前':(ago/3600).toFixed(1)+'小时前');
-  const span=f.length>1?` ·共${f.length}个时段`:'';
-  return `最近失败 ${clock(last)}(${agoStr})${span}`;
+// 从该行的分钟桶序列里,挑出"有异常或错误"的桶——用于行内时间跨度 + 展开逐分钟明细。
+function problemBuckets(spark){ return (spark||[]).filter(p=>p.anomaly>0||p.failed>0); }
+function problemSpan(spark){    // 行内:出问题的时间跨度,如 11:23–11:26(单点则只显示一个时间)
+  const b=problemBuckets(spark);
+  if(!b.length) return '';
+  const a=clock(b[0].ts), z=clock(b[b.length-1].ts); // 桶按时间升序,首尾即跨度
+  return a===z?a:a+'–'+z;
+}
+function problemDetail(spark){   // 展开:逐分钟桶 + 各自异常/错误次数
+  const b=problemBuckets(spark);
+  if(!b.length) return '';
+  return b.map(p=>{
+    let s='';
+    if(p.anomaly>0) s+=`<span class="a">异常×${p.anomaly}</span> `;
+    if(p.failed>0)  s+=`<span class="e">错误×${p.failed}</span>`;
+    return `<span class="tb"><b>${clock(p.ts)}</b>${s}</span>`;
+  }).join('');
 }
 function renderSummary(s){
   const c=[['总请求',fmtNum(s.total),'#6366f1'],
