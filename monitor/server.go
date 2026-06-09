@@ -55,6 +55,7 @@ func (m *Monitor) RegisterRoutes(r *gin.Engine) {
 		view.GET("/monitor", m.servePage)
 		view.GET("/data", m.serveData)
 		view.GET("/monitor/data", m.serveData)
+		view.GET("/trend/long", m.serveLongTrend)
 		view.GET("/me", me)
 	}
 
@@ -120,6 +121,16 @@ func (m *Monitor) testAlertHandler(c *gin.Context) {
 
 func (m *Monitor) servePage(c *gin.Context) {
 	c.Data(http.StatusOK, "text/html; charset=utf-8", []byte(pageHTML))
+}
+
+// serveLongTrend 返回小时级长期序列(默认近 30 天),供长期趋势图按需拉取(不进 30s 轮询)。
+func (m *Monitor) serveLongTrend(c *gin.Context) {
+	days, _ := strconv.Atoi(c.DefaultQuery("days", "30"))
+	if days < 1 || days > 365 {
+		days = 30
+	}
+	since := time.Now().Unix() - int64(days)*86400
+	c.JSON(http.StatusOK, gin.H{"series": m.storeHourSeries(since)})
 }
 
 func (m *Monitor) serveData(c *gin.Context) {

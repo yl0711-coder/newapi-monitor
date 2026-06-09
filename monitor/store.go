@@ -68,6 +68,18 @@ type TokenSample struct {
 	Quota     int64
 }
 
+// HourSample 小时级汇总(rollup):每小时一行总览,长期留存(默认 90 天),支撑长期趋势 + 同比环比。
+// 由分钟级 metric_samples 周期性汇总而来;存储只随时间增长(每小时 1 行),与请求量无关。
+type HourSample struct {
+	HourTs     int64 `gorm:"primaryKey;autoIncrement:false"`
+	Success    int64
+	Anomaly    int64
+	Failed     int64
+	Tokens     int64
+	Quota      int64
+	SumUseTime int64
+}
+
 // 直方图档位上界。lat 单位秒,ttft 单位毫秒。
 var (
 	latEdges  = []int{1, 2, 5, 10, 30, 60}
@@ -84,7 +96,7 @@ func (m *Monitor) openStore(path string) error {
 	if err != nil {
 		return fmt.Errorf("打开本地采样库失败: %w", err)
 	}
-	if err := db.AutoMigrate(&MetricSample{}, &TokenSample{}, &AlertConfig{}, &AlertLog{}); err != nil {
+	if err := db.AutoMigrate(&MetricSample{}, &TokenSample{}, &HourSample{}, &AlertConfig{}, &AlertLog{}); err != nil {
 		return fmt.Errorf("表迁移失败: %w", err)
 	}
 	m.storeDB = db
@@ -391,6 +403,51 @@ func (m *Monitor) storeTokens(since int64, windowSec float64) ([]TokenRow, error
 		})
 	}
 	return out, nil
+}
+
+// rollupHours 把【还有分钟数据的近段时间】按小时汇总进 hour_samples(幂等 UPSERT)。
+// 关键:在分钟数据被清理前就已滚动写入小时表,故长期数据不丢失。
+func (m *Monitor) rollupHours(sinceTs int64) error {
+	return m.storeDB.Exec(`INSERT INTO hour_samples (hour_ts, success, anomaly, failed, tokens, quota, sum_use_time)
+		SELECT (bucket_ts/3600)*3600 AS hour_ts,
+		  SUM(success), SUM(anomaly), SUM(failed), SUM(tokens), SUM(quota), SUM(sum_use_time)
+		FROM metric_samples WHERE bucket_ts >= ?
+		GROUP BY hour_ts
+		ON CONFLICT(hour_ts) DO UPDATE SET
+		  success=excluded.success, anomaly=excluded.anomaly, failed=excluded.failed,
+		  tokens=excluded.tokens, quota=excluded.quota, sum_use_time=excluded.sum_use_time`, sinceTs).Error
+}
+
+func (m *Monitor) pruneHoursOlderThan(cutoffTs int64) (int64, error) {
+	r := m.storeDB.Where("hour_ts < ?", cutoffTs).Delete(&HourSample{})
+	return r.RowsAffected, r.Error
+}
+
+// storeHourSeries 取小时级序列(长期趋势图用),按时间升序。
+func (m *Monitor) storeHourSeries(sinceTs int64) []HourPoint {
+	var pts []HourPoint
+	m.storeDB.Raw(`SELECT hour_ts AS ts, success, anomaly, failed FROM hour_samples WHERE hour_ts >= ? ORDER BY hour_ts`, sinceTs).Scan(&pts)
+	return pts
+}
+
+// periodStat 取 [fromTs,toTs) 的小时级汇总统计(同比环比用)。
+func (m *Monitor) periodStat(fromTs, toTs int64) PeriodStat {
+	var r struct{ S, A, F, Q int64 }
+	m.storeDB.Raw(`SELECT COALESCE(SUM(success),0) s, COALESCE(SUM(anomaly),0) a, COALESCE(SUM(failed),0) f, COALESCE(SUM(quota),0) q
+		FROM hour_samples WHERE hour_ts >= ? AND hour_ts < ?`, fromTs, toTs).Scan(&r)
+	total := r.S + r.A + r.F
+	return PeriodStat{Total: total, Failed: r.F, SuccessRate: rate(r.S, total), CostUSD: float64(r.Q) / quotaPerUSD}
+}
+
+// storeCompare 同比环比:近 24h vs 前 24h(环比) vs 上周同期(同比),取小时表(7 天前也有数据)。
+func (m *Monitor) storeCompare(nowUnix int64) CompareStat {
+	const h = int64(3600)
+	end := nowUnix / h * h // 对齐整点;小时表只含已完成的小时
+	return CompareStat{
+		Now:      m.periodStat(end-24*h, end),
+		Prev:     m.periodStat(end-48*h, end-24*h),
+		LastWeek: m.periodStat(end-192*h, end-168*h),
+	}
 }
 
 func (m *Monitor) storeFreshness() (lastBucket int64) {

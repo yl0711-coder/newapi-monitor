@@ -46,8 +46,10 @@ docker run -d --name newapi-monitor \
 | `MONITOR_ADDR` | 监听地址 | `:8090` |
 | `MONITOR_STORE_PATH` | 本地采样库路径 | `/data/monitor.db` |
 | `MONITOR_SAMPLE_SECONDS` | 采样间隔(秒) | `60` |
-| `MONITOR_RETENTION_DAYS` | 本地留存天数 | `7` |
+| `MONITOR_RETENTION_DAYS` | 分钟级本地留存天数 | `7` |
+| `MONITOR_HOUR_RETENTION_DAYS` | 小时级汇总留存天数(长期趋势 + 同比环比) | `90` |
 | `MONITOR_BACKFILL_HOURS` | 启动时回填的历史小时数 | `24` |
+| `MONITOR_HEARTBEAT_URL` | dead-man 心跳 URL(如 healthchecks.io);留空=不启用 | 留空 |
 
 ## 权限
 登录复用 new-api 用户身份(仅调用其 `/api/user/login` 验证):

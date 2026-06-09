@@ -169,7 +169,30 @@ type TokenRow struct {
 	Health      string  `json:"health"`
 }
 
-// Snapshot 是一次完整看板快照:总览 + 分组 / 渠道 / 模型 / 令牌明细 + 趋势。
+// HourPoint 小时级序列点(长期趋势图)。
+type HourPoint struct {
+	Ts      int64 `json:"ts"`
+	Success int64 `json:"success"`
+	Anomaly int64 `json:"anomaly"`
+	Failed  int64 `json:"failed"`
+}
+
+// PeriodStat 一个时间段的总览统计(同比环比用)。
+type PeriodStat struct {
+	Total       int64   `json:"total"`
+	Failed      int64   `json:"failed"`
+	SuccessRate float64 `json:"success_rate"`
+	CostUSD     float64 `json:"cost_usd"`
+}
+
+// CompareStat 同比环比:近 24h vs 前 24h(环比) vs 上周同期(同比)。
+type CompareStat struct {
+	Now      PeriodStat `json:"now"`       // 近 24h
+	Prev     PeriodStat `json:"prev"`      // 前 24h(环比基)
+	LastWeek PeriodStat `json:"last_week"` // 上周同期(同比基)
+}
+
+// Snapshot 是一次完整看板快照:总览 + 分组 / 渠道 / 模型 / 令牌明细 + 趋势 + SLO + 同比环比。
 type Snapshot struct {
 	WindowMinutes  int         `json:"window_minutes"`
 	GeneratedAt    string      `json:"generated_at"`
@@ -182,6 +205,7 @@ type Snapshot struct {
 	ByToken        []TokenRow  `json:"by_token"`
 	Trend          []TimePoint `json:"trend"`
 	SLO            SLOStatus   `json:"slo"`
+	Compare        CompareStat `json:"compare"`
 }
 
 // attachSpark 给每行挂上对应维度取值的分钟桶时序(失败则静默跳过)。
@@ -289,6 +313,7 @@ func (m *Monitor) GetSnapshot(windowMinutes int, nowUnix int64) (*Snapshot, erro
 		tokens = nil // token 维度失败不影响主看板
 	}
 	slo := m.computeSLO(m.loadAlertConfig(), nowUnix)
+	compare := m.storeCompare(nowUnix)
 
 	lastBucket := m.storeFreshness()
 	age := int64(-1)
@@ -311,5 +336,6 @@ func (m *Monitor) GetSnapshot(windowMinutes int, nowUnix int64) (*Snapshot, erro
 		ByToken:        tokens,
 		Trend:          trend,
 		SLO:            slo,
+		Compare:        compare,
 	}, nil
 }

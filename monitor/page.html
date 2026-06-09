@@ -118,9 +118,16 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
 
 <div id="sloCard" class="attn" style="display:none"><h3>🎯 SLO / 错误预算</h3><div id="sloBody"></div></div>
 
+<div id="cmpCard" class="attn" style="display:none"><h3>📊 同比环比(近 24 小时 · 数据来自小时级长期留存)</h3><div id="cmpBody"></div></div>
+
 <div id="trendWrap">
   <div style="font-weight:600;margin-bottom:8px">流量趋势(成功 / 失败)</div>
   <div id="trend"></div>
+</div>
+
+<div id="longCard" class="card" style="display:none">
+  <div class="card-header">📈 长期趋势 <span class="seg" id="longSeg" style="margin-left:12px;font-weight:400;vertical-align:middle"><a data-d="7">7天</a><a data-d="30">30天</a><a data-d="90">90天</a></span></div>
+  <div style="padding:16px 20px"><div id="longTrend" style="width:100%;height:240px"></div></div>
 </div>
 
 <div class="card"><div class="card-header">按分组</div><table><thead id="thGroup"></thead><tbody id="tbGroup"></tbody></table></div>
@@ -283,6 +290,55 @@ function renderSLO(s){
     <div><span class="muted">当前</span> <b class="num" style="color:${ok?'#10b981':'#ef4444'}">${cur.toFixed(3)}%</b> ${ok?'<span class="badge badge-green">达标</span>':'<span class="badge badge-red">未达标</span>'}</div>
     <div><span class="muted">燃烧速度</span> ${winLabel(s.fast_window_min)} <b class="num" style="color:${burnCol(s.burn_fast)}">${(s.burn_fast||0).toFixed(1)}×</b> · ${winLabel(s.slow_window_min)} <b class="num" style="color:${burnCol(s.burn_slow)}">${(s.burn_slow||0).toFixed(1)}×</b></div>`;
 }
+function relDelta(cur,base,higherBad){
+  if(!base) return '<span class="muted">—</span>';
+  const p=(cur-base)/base*100,up=p>=0,bad=higherBad?up:!up;
+  const col=Math.abs(p)<1?'#94a3b8':(bad?'#ef4444':'#10b981');
+  return `<span style="color:${col}">${up?'▲':'▼'}${Math.abs(p).toFixed(0)}%</span>`;
+}
+function ptDelta(cur,base){ // 百分点差(成功率用)
+  const d=cur-base,up=d>=0,col=Math.abs(d)<0.05?'#94a3b8':(up?'#10b981':'#ef4444');
+  return `<span style="color:${col}">${up?'▲':'▼'}${Math.abs(d).toFixed(2)}pt</span>`;
+}
+function renderCompare(c){
+  const card=document.getElementById('cmpCard');
+  if(!c||!c.now||(!c.now.total&&!c.prev.total&&!c.last_week.total)){card.style.display='none';return}
+  card.style.display='';
+  const n=c.now,p=c.prev,w=c.last_week;
+  const rows=[
+    ['请求量',fmtNum(n.total),relDelta(n.total,p.total,false),relDelta(n.total,w.total,false)],
+    ['成功率',fmtRate(n.success_rate),ptDelta(n.success_rate,p.success_rate),ptDelta(n.success_rate,w.success_rate)],
+    ['错误',fmtNum(n.failed),relDelta(n.failed,p.failed,true),relDelta(n.failed,w.failed,true)],
+    ['成本',fmtUSD(n.cost_usd),relDelta(n.cost_usd,p.cost_usd,false),relDelta(n.cost_usd,w.cost_usd,false)]
+  ];
+  document.getElementById('cmpBody').innerHTML=`<table style="width:auto;min-width:400px">
+    <tr><th></th><th class="right">近24h</th><th class="right">环比·前24h</th><th class="right">同比·上周</th></tr>
+    ${rows.map(r=>`<tr><td>${r[0]}</td><td class="right num">${r[1]}</td><td class="right">${r[2]}</td><td class="right">${r[3]}</td></tr>`).join('')}</table>`;
+}
+let longChart=null,longDays=30;
+async function loadLongTrend(){
+  try{
+    const res=await fetch('/trend/long?days='+longDays,{headers:{'Accept':'application/json'}});
+    if(!res.ok)return;
+    const arr=(await res.json()).series||[];
+    const card=document.getElementById('longCard');
+    if(!arr.length){card.style.display='none';return}
+    card.style.display='';
+    if(!longChart)longChart=echarts.init(document.getElementById('longTrend'));
+    const fmtDay=ts=>{const d=new Date(ts*1000);return (d.getMonth()+1)+'/'+d.getDate()+' '+String(d.getHours()).padStart(2,'0')+':00'};
+    longChart.setOption({
+      grid:{left:46,right:14,top:32,bottom:24},
+      tooltip:{trigger:'axis',backgroundColor:'#1a1d27',borderColor:'#2a2d3e',textStyle:{color:'#e2e8f0'}},
+      legend:{data:['成功','失败'],textStyle:{color:'#94a3b8'},right:8,top:2},
+      xAxis:{type:'category',data:arr.map(p=>fmtDay(p.ts)),boundaryGap:false,axisLabel:{color:'#94a3b8',fontSize:11},axisLine:{lineStyle:{color:'#2a2d3e'}}},
+      yAxis:{type:'value',minInterval:1,axisLabel:{color:'#94a3b8',fontSize:11},splitLine:{lineStyle:{color:'#2a2d3e'}}},
+      series:[
+        {name:'成功',type:'line',smooth:true,symbol:'none',data:arr.map(p=>p.success),lineStyle:{color:'#10b981',width:1.5},areaStyle:{color:'rgba(16,185,129,.08)'}},
+        {name:'失败',type:'line',smooth:true,symbol:'none',data:arr.map(p=>p.failed),lineStyle:{color:'#ef4444',width:1.5},areaStyle:{color:'rgba(239,68,68,.10)'}}
+      ]
+    });
+  }catch(e){}
+}
 let trendChart=null;
 function drawTrend(points){
   const el=document.getElementById('trend');
@@ -302,7 +358,7 @@ function drawTrend(points){
 }
 function apply(s){
   document.getElementById('genAt').textContent='更新于 '+s.generated_at+' · 窗口 '+s.window_minutes+' 分钟';
-  renderBanner(s);renderSummary(s.summary);renderSLO(s.slo);lastTrend=s.trend||[];drawTrend(lastTrend);
+  renderBanner(s);renderSummary(s.summary);renderSLO(s.slo);renderCompare(s.compare);lastTrend=s.trend||[];drawTrend(lastTrend);
   renderTable('thGroup','tbGroup',s.by_group);renderTable('thChannel','tbChannel',s.by_channel);renderTable('thModel','tbModel',s.by_model);
   renderTokens(s.by_token);
 }
@@ -328,8 +384,10 @@ async function loadMe(){
 function schedule(){if(timer)clearInterval(timer);if(document.getElementById('autoRefresh').checked)timer=setInterval(load,30000)}
 document.getElementById('refreshNow').addEventListener('click',load);
 document.getElementById('autoRefresh').addEventListener('change',schedule);
-window.addEventListener('resize',()=>{trendChart&&trendChart.resize();sloGauge&&sloGauge.resize();});
+window.addEventListener('resize',()=>{trendChart&&trendChart.resize();sloGauge&&sloGauge.resize();longChart&&longChart.resize();});
 setSeg();loadMe();load();schedule();
+document.querySelectorAll('#longSeg a').forEach(a=>{a.href='javascript:void 0';a.classList.toggle('active',+a.dataset.d===longDays);a.addEventListener('click',e=>{e.preventDefault();longDays=+a.dataset.d;document.querySelectorAll('#longSeg a').forEach(x=>x.classList.toggle('active',x===a));loadLongTrend();});});
+loadLongTrend();
 </script>
 </body>
 </html>

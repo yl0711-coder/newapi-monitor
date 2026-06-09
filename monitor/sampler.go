@@ -42,6 +42,9 @@ func (m *Monitor) startSampler(ctx context.Context) {
 		if err := m.sampleTokens(ctx, int64(h)*3600); err != nil {
 			slog.Warn("token 维度回填失败(忽略,不影响主监控)", "err", err)
 		}
+		if err := m.rollupHours(time.Now().Unix() - int64(m.cfg.RetentionDays)*86400); err != nil {
+			slog.Warn("启动小时汇总失败(忽略)", "err", err)
+		}
 	}
 
 	interval := time.Duration(m.cfg.SampleSeconds) * time.Second
@@ -83,6 +86,14 @@ func (m *Monitor) loop(ctx context.Context, interval time.Duration) {
 					cutoff := time.Now().Unix() - int64(d)*86400
 					if n, err := m.pruneOlderThan(cutoff); err == nil && n > 0 {
 						slog.Info("清理过期采样", "rows", n)
+					}
+					if err := m.rollupHours(cutoff); err != nil { // 分钟数据被清前,先滚动汇总进小时表
+						slog.Warn("小时汇总失败(忽略)", "err", err)
+					}
+				}
+				if hd := m.cfg.HourRetentionDays; hd > 0 {
+					if n, err := m.pruneHoursOlderThan(time.Now().Unix() - int64(hd)*86400); err == nil && n > 0 {
+						slog.Info("清理过期小时汇总", "rows", n)
 					}
 				}
 			}
