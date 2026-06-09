@@ -81,6 +81,8 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
   .e4{background:rgba(245,158,11,.15);color:var(--yellow)}.e5{background:rgba(239,68,68,.15);color:var(--red)}
   .eto{background:rgba(99,102,241,.15);color:var(--accent)}.eo{background:rgba(148,163,184,.12);color:var(--text-muted)}
   .lat-warn{color:var(--yellow)}.lat-bad{color:var(--red)}
+  .drill-arrow{color:var(--accent);font-size:11px;display:inline-block;width:12px}
+  tr.drillable{cursor:pointer}tr.drillable:hover td{background:rgba(255,255,255,.03)}
   .alert{padding:12px 16px;border-radius:8px;margin-bottom:16px;font-size:14px;background:rgba(239,68,68,.1);border:1px solid rgba(239,68,68,.3);color:var(--red)}
   code{background:rgba(255,255,255,.06);padding:1px 5px;border-radius:4px;font-size:12px}
 </style>
@@ -128,6 +130,14 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
 <div id="longCard" class="card" style="display:none">
   <div class="card-header">📈 长期趋势 <span class="seg" id="longSeg" style="margin-left:12px;font-weight:400;vertical-align:middle"><a data-d="7">7天</a><a data-d="30">30天</a><a data-d="90">90天</a></span></div>
   <div style="padding:16px 20px"><div id="longTrend" style="width:100%;height:240px"></div></div>
+</div>
+
+<div id="latCard" class="card" style="display:none">
+  <div class="card-header">⏱ 延迟分布</div>
+  <div style="padding:16px 20px;display:flex;gap:24px;flex-wrap:wrap">
+    <div style="flex:1;min-width:300px"><div class="muted" style="font-size:12px;margin-bottom:6px">总延迟(秒)</div><div id="latHist" style="width:100%;height:180px"></div></div>
+    <div style="flex:1;min-width:300px"><div class="muted" style="font-size:12px;margin-bottom:6px">首字 TTFT(秒)</div><div id="ttftHist" style="width:100%;height:180px"></div></div>
+  </div>
 </div>
 
 <div class="card"><div class="card-header">按分组</div><table><thead id="thGroup"></thead><tbody id="tbGroup"></tbody></table></div>
@@ -237,8 +247,10 @@ function renderTable(th,tb,rows){
   document.getElementById(th).innerHTML=HEAD;
   const e=document.getElementById(tb);
   if(!rows||!rows.length){e.innerHTML=`<tr><td colspan="9" class="muted" style="text-align:center;padding:24px">窗口内暂无数据</td></tr>`;return}
-  e.innerHTML=rows.map(r=>`<tr>
-    <td><span class="dot ${dotClass(r.health)}"></span> ${esc(r.label)}</td>
+  e.innerHTML=rows.map(r=>{
+    const k=tb+'|'+r.label,open=drillOpen.has(k);
+    return `<tr class="drillable" data-k="${esc(k)}" onclick="toggleDrill(this)">
+    <td><span class="drill-arrow">${open?'▼':'▶'}</span> <span class="dot ${dotClass(r.health)}"></span> ${esc(r.label)}</td>
     <td>${sparkSVG(r.spark)}</td>
     <td class="right num">${fmtNum(r.total)}</td>
     <td>${healthBadge(r.health,r.success_rate)}</td>
@@ -246,7 +258,9 @@ function renderTable(th,tb,rows){
     <td class="right num">${fmtTok(r.tok_per_sec)}</td>
     <td class="right num"><span class="${latClass(r.p95)}">${fmtLat(r.p95)}</span> / <span class="${latClass(r.max_latency)}">${r.max_latency||0}s</span></td>
     <td class="emix">${(r.failed||r.anomaly)?errMix(r):'<span class="muted">—</span>'}</td>
-    <td class="right num">${fmtUSD(r.cost_usd)}</td></tr>`).join('');
+    <td class="right num">${fmtUSD(r.cost_usd)}</td></tr>
+    <tr class="drill" style="display:${open?'':'none'}"><td colspan="9" style="background:var(--bg);padding:0">${drillDetail(r)}</td></tr>`;
+  }).join('');
 }
 const TOKHEAD=`<tr><th>Key / 用户</th><th class="right">请求</th><th>稳定性</th><th class="right">异常</th><th class="right">错误</th><th class="right">Tokens</th><th class="right">消费</th></tr>`;
 function renderTokens(rows){
@@ -339,6 +353,41 @@ async function loadLongTrend(){
     });
   }catch(e){}
 }
+let latChart=null,ttftChart=null;
+const LAT_LABELS=['≤1s','≤2s','≤5s','≤10s','≤30s','≤60s','>60s'],LAT_COL=['#10b981','#10b981','#22c55e','#f59e0b','#f59e0b','#ef4444','#ef4444'];
+const TTFT_LABELS=['≤.5s','≤1s','≤2s','≤5s','≤10s','>10s'],TTFT_COL=['#10b981','#10b981','#22c55e','#f59e0b','#ef4444','#ef4444'];
+function barOption(labels,data,colors){
+  return {grid:{left:42,right:12,top:10,bottom:24},
+    tooltip:{trigger:'axis',axisPointer:{type:'shadow'},backgroundColor:'#1a1d27',borderColor:'#2a2d3e',textStyle:{color:'#e2e8f0'}},
+    xAxis:{type:'category',data:labels,axisLabel:{color:'#94a3b8',fontSize:11},axisLine:{lineStyle:{color:'#2a2d3e'}}},
+    yAxis:{type:'value',minInterval:1,axisLabel:{color:'#94a3b8',fontSize:11},splitLine:{lineStyle:{color:'#2a2d3e'}}},
+    series:[{type:'bar',barWidth:'62%',data:data.map((v,i)=>({value:v,itemStyle:{color:colors[i],borderRadius:[3,3,0,0]}}))}]};
+}
+function renderLatHist(sum){
+  const lat=sum.lat_hist||[],ttft=sum.ttft_hist||[];
+  const card=document.getElementById('latCard');
+  if(lat.reduce((a,b)=>a+b,0)+ttft.reduce((a,b)=>a+b,0)===0){card.style.display='none';return}
+  card.style.display='';
+  if(!latChart)latChart=echarts.init(document.getElementById('latHist'));
+  if(!ttftChart)ttftChart=echarts.init(document.getElementById('ttftHist'));
+  latChart.setOption(barOption(LAT_LABELS,lat,LAT_COL));
+  ttftChart.setOption(barOption(TTFT_LABELS,ttft,TTFT_COL));
+}
+const drillOpen=new Set(); // 记住展开的行(按 表+名称),30s 刷新不收起
+function toggleDrill(el){
+  const k=el.getAttribute('data-k'),open=!drillOpen.has(k);
+  if(open)drillOpen.add(k);else drillOpen.delete(k);
+  const drill=el.nextElementSibling;
+  if(drill&&drill.classList.contains('drill'))drill.style.display=open?'':'none';
+  const arrow=el.querySelector('.drill-arrow');if(arrow)arrow.textContent=open?'▼':'▶';
+}
+function drillDetail(r){
+  const et=errText(r),det=problemDetail(r.spark);
+  return `<div class="attn-detail" style="padding:8px 14px 10px 32px;flex-direction:column;gap:6px">
+    <div><span class="muted">延迟</span> p50 ${fmtLat(r.p50)} · p95 ${fmtLat(r.p95)} · p99 ${fmtLat(r.p99)} · max ${r.max_latency||0}s · 首字p95 ${fmtTtft(r.ttft_p95)}</div>
+    ${et?`<div><span class="muted">错误构成</span> ${et}</div>`:''}
+    <div><span class="muted">异常/错误时间</span> ${det||'<span style="color:var(--green)">窗口内无异常分钟</span>'}</div></div>`;
+}
 let trendChart=null;
 function drawTrend(points){
   const el=document.getElementById('trend');
@@ -358,7 +407,7 @@ function drawTrend(points){
 }
 function apply(s){
   document.getElementById('genAt').textContent='更新于 '+s.generated_at+' · 窗口 '+s.window_minutes+' 分钟';
-  renderBanner(s);renderSummary(s.summary);renderSLO(s.slo);renderCompare(s.compare);lastTrend=s.trend||[];drawTrend(lastTrend);
+  renderBanner(s);renderSummary(s.summary);renderSLO(s.slo);renderCompare(s.compare);renderLatHist(s.summary);lastTrend=s.trend||[];drawTrend(lastTrend);
   renderTable('thGroup','tbGroup',s.by_group);renderTable('thChannel','tbChannel',s.by_channel);renderTable('thModel','tbModel',s.by_model);
   renderTokens(s.by_token);
 }
@@ -384,7 +433,7 @@ async function loadMe(){
 function schedule(){if(timer)clearInterval(timer);if(document.getElementById('autoRefresh').checked)timer=setInterval(load,30000)}
 document.getElementById('refreshNow').addEventListener('click',load);
 document.getElementById('autoRefresh').addEventListener('change',schedule);
-window.addEventListener('resize',()=>{trendChart&&trendChart.resize();sloGauge&&sloGauge.resize();longChart&&longChart.resize();});
+window.addEventListener('resize',()=>{trendChart&&trendChart.resize();sloGauge&&sloGauge.resize();longChart&&longChart.resize();latChart&&latChart.resize();ttftChart&&ttftChart.resize();});
 setSeg();loadMe();load();schedule();
 document.querySelectorAll('#longSeg a').forEach(a=>{a.href='javascript:void 0';a.classList.toggle('active',+a.dataset.d===longDays);a.addEventListener('click',e=>{e.preventDefault();longDays=+a.dataset.d;document.querySelectorAll('#longSeg a').forEach(x=>x.classList.toggle('active',x===a));loadLongTrend();});});
 loadLongTrend();

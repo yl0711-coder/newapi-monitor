@@ -43,7 +43,19 @@ type Monitor struct {
 
 	chMu    sync.RWMutex
 	chNames map[string]string // 渠道 id->name 映射缓存
+
+	snapMu    sync.Mutex
+	snapCache map[int]cachedSnap // 按窗口缓存快照(短 TTL),去重并发请求、给 slave 减负
 }
+
+// cachedSnap 是一次快照的缓存项。
+type cachedSnap struct {
+	snap *Snapshot
+	at   int64 // 计算时刻(unix 秒)
+}
+
+// snapCacheTTL 快照缓存有效期(秒)。小于采样间隔,既减负又不显著影响新鲜度。
+const snapCacheTTL = 15
 
 // New 创建监控实例:打开本地采样库;若配置了生产 DSN,则连库并校验连通。
 // 不自动启动采样器——需调用 Start 才开始后台采样。
@@ -56,7 +68,7 @@ func New(s Settings) (*Monitor, error) {
 		slog.Warn("未设置 MONITOR_NEWAPI_BASE_URL,登录将无法验证身份;生产必须配成 new-api 地址,如 http://new-api:3000")
 	}
 
-	m := &Monitor{cfg: s, chNames: map[string]string{}}
+	m := &Monitor{cfg: s, chNames: map[string]string{}, snapCache: map[int]cachedSnap{}}
 	if err := m.openStore(s.StorePath); err != nil {
 		return nil, err
 	}
@@ -112,6 +124,8 @@ type Summary struct {
 	Err5xx        int64   `json:"err_5xx"`
 	ErrTimeout    int64   `json:"err_timeout"`
 	ErrOther      int64   `json:"err_other"`
+	LatHist       []int64 `json:"lat_hist"`  // 总延迟分布:≤1/≤2/≤5/≤10/≤30/≤60/>60 秒
+	TtftHist      []int64 `json:"ttft_hist"` // 首字延迟分布:≤.5/≤1/≤2/≤5/≤10/>10 秒
 }
 
 // Row 是某维度取值(分组 / 渠道 / 模型)在窗口内的指标行,含迷你趋势与健康色标。
@@ -268,7 +282,28 @@ func rate(success, total int64) float64 {
 }
 
 // GetSnapshot 从本地库聚合一次完整看板数据(零生产负担)。
+// GetSnapshot 返回看板快照;带短 TTL 缓存(按窗口),去重并发请求、减少重复重算,给 slave 减负。
 func (m *Monitor) GetSnapshot(windowMinutes int, nowUnix int64) (*Snapshot, error) {
+	if windowMinutes <= 0 {
+		windowMinutes = 60
+	}
+	m.snapMu.Lock()
+	defer m.snapMu.Unlock()
+	if m.snapCache == nil {
+		m.snapCache = map[int]cachedSnap{}
+	}
+	if c, ok := m.snapCache[windowMinutes]; ok && nowUnix-c.at < snapCacheTTL {
+		return c.snap, nil
+	}
+	snap, err := m.computeSnapshot(windowMinutes, nowUnix)
+	if err != nil {
+		return nil, err
+	}
+	m.snapCache[windowMinutes] = cachedSnap{snap: snap, at: nowUnix}
+	return snap, nil
+}
+
+func (m *Monitor) computeSnapshot(windowMinutes int, nowUnix int64) (*Snapshot, error) {
 	if windowMinutes <= 0 {
 		windowMinutes = 60
 	}

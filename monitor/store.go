@@ -266,6 +266,8 @@ func (m *Monitor) storeSummary(since int64, windowSec float64) (*Summary, error)
 		TtftP50: r.TtftP50, TtftP95: r.TtftP95, TokPerSec: r.TokPerSec,
 		Tokens: r.Tokens, CostUSD: r.CostUSD,
 		Err4xx: r.Err4xx, Err5xx: r.Err5xx, ErrTimeout: r.ErrTimeout, ErrOther: r.ErrOther,
+		LatHist:  []int64{a.Lat1, a.Lat2, a.Lat5, a.Lat10, a.Lat30, a.Lat60, a.LatInf},
+		TtftHist: []int64{a.Ttft500, a.Ttft1k, a.Ttft2k, a.Ttft5k, a.Ttft10k, a.TtftInf},
 	}, nil
 }
 
