@@ -27,12 +27,14 @@ import (
 var statusHTML []byte
 
 const (
-	windowDays = 7 // 可用率/状态条窗口
-	windowSec  = int64(windowDays * 86400)
-	beatCount  = 50  // 心跳条桶数
-	minSample  = 20  // 窗口内请求数低于此 → 不据流量判故障
-	snapTTL    = 30  // 看板快照缓存(秒)
-	groupsTTL  = 300 // 可见分组缓存(秒)
+	windowDays      = 7 // 可用率/状态条窗口
+	windowSec       = int64(windowDays * 86400)
+	beatCount       = 50            // 心跳条桶数
+	minSample       = 20            // 窗口内请求数低于此 → 不据流量判故障
+	recentWindowSec = int64(86400)  // 判定【当下】状态的近期窗口(24h):状态看当下,不被旧数据钉死
+	staleAfterSec   = int64(172800) // 最新流量早于此(48h)→ 可用率/延迟视为陈旧,显 — 不展示
+	snapTTL         = 30            // 看板快照缓存(秒)
+	groupsTTL       = 300           // 可见分组缓存(秒)
 )
 
 // 状态枚举(对齐 Uptime Kuma 习惯):1 正常 / 2 降级 / 0 不可用 / 3 维护 / -1 数据不足。
@@ -186,13 +188,13 @@ func (h *handler) compute(now int64) *Snapshot {
 func (h *handler) buildModel(grp, mdl string, enabled map[string]map[string]int, totals map[string]agg, series map[string][]seriesPt, now, since int64) Model {
 	key := grp + "\x00" + mdl
 	a := totals[key]
-	total := a.Success + a.Anomaly + a.Failed
+	pts := series[key]
 	en := 0
 	if mm := enabled[grp]; mm != nil {
 		en = mm[mdl]
 	}
 
-	pm := Model{Provider: provider(mdl), Name: pretty(mdl), Beats: buildBeats(series[key], now, since)}
+	pm := Model{Provider: provider(mdl), Name: pretty(mdl), Beats: buildBeats(pts, now, since)}
 
 	// 拓扑优先:配置在册但 0 健康渠道 → 无可用渠道(不可用),不靠流量猜。
 	if en == 0 {
@@ -202,21 +204,39 @@ func (h *handler) buildModel(grp, mdl string, enabled map[string]map[string]int,
 		}
 		return pm
 	}
-	// 有健康渠道:据流量定状态。
-	if total < minSample {
-		pm.Status = stUp // 路径健康、流量太少,视为正常(不报数据不足以免吓用户)
-		return pm
+
+	// 从分桶序列取「最新流量时间」与「近期窗口」流量,用于判定【当下】状态(不被一周前的旧数据钉死)。
+	var latest, recUp, recFail int64
+	for _, p := range pts {
+		if p.Ts > latest {
+			latest = p.Ts
+		}
+		if p.Ts >= now-recentWindowSec {
+			recUp += p.Up
+			recFail += p.Fail
+		}
 	}
-	denom := total - a.Err4xx // 排除用户侧 4xx
-	up := a.Success + a.Anomaly
-	upRate := 1.0
-	if denom > 0 {
-		upRate = float64(up) / float64(denom)
+
+	// 状态(颜色)= 当下:近期流量太少 → 有健康渠道即视为正常,不拿陈旧数据判死;否则按近期可用率定档。
+	if recUp+recFail < minSample {
+		pm.Status = stUp
+	} else {
+		pm.Status = band(float64(recUp) / float64(recUp+recFail))
 	}
-	pm.Status = band(upRate)
-	pm.Uptime = &upRate
-	if lat := p50ms(a); lat > 0 {
-		pm.LatencyMs = &lat
+
+	// 可用率%/延迟 = 近7天,但仅当数据【足够且不陈旧】才展示,否则显 —(避免拿几天前的旧值误导)。
+	total := a.Success + a.Anomaly + a.Failed
+	fresh := latest >= now-staleAfterSec
+	if fresh && total >= minSample {
+		if denom := total - a.Err4xx; denom > 0 { // 排除用户侧 4xx
+			r := float64(a.Success+a.Anomaly) / float64(denom)
+			pm.Uptime = &r
+		}
+	}
+	if fresh {
+		if lat := p50ms(a); lat > 0 {
+			pm.LatencyMs = &lat
+		}
 	}
 	return pm
 }
@@ -434,7 +454,7 @@ func band(rate float64) int {
 	switch {
 	case rate >= 0.99:
 		return stUp
-	case rate >= 0.95:
+	case rate >= 0.85:
 		return stWarn
 	default:
 		return stDown

@@ -159,7 +159,7 @@ const I18N = {
     no_match:"没有匹配「{q}」的模型", no_data:"暂无数据", err:"暂时无法获取服务状态,请稍后刷新",
     modal_sub:"线路 = 创建令牌时所选分组「{name}」· 共 {n} 个模型",
     leg_ok:"正常", leg_warn:"性能下降", leg_bad:"不可用", leg_maint:"维护中", leg_na:"数据不足",
-    rule:"线路 = 创建令牌时所选「分组」;同一模型在不同线路可能状态不同,可搜索某模型对比各线路稳定性后自行选择。状态按近 7 天「可用率」判定:≥99% 正常 · 95–99% 性能下降 · <95% 不可用。可用率 = 成功请求 /(总请求 − 用户侧错误);某线路下若某模型暂无可用上游,即显示「不可用」。",
+    rule:"线路 = 创建令牌时所选「分组」;同一模型在不同线路可能状态不同,可搜索对比后自行选择。状态反映「当下」可用性(近期流量 + 是否有可用上游):正常 · 性能下降(近期可用率 85–99%)· 不可用(近期可用率 <85% 或无可用上游)。可用率 = 成功请求 /(总请求 − 用户侧错误),为近 7 天统计;数据过旧时显「—」。",
     foot:"由 NexusAPI 提供",
   },
   en: {
@@ -175,7 +175,7 @@ const I18N = {
     no_match:'No models matching "{q}"', no_data:"No data yet", err:"Service status temporarily unavailable, please refresh later.",
     modal_sub:'Line = the group selected when creating a token ("{name}") · {n} models',
     leg_ok:"Operational", leg_warn:"Degraded", leg_bad:"Outage", leg_maint:"Maintenance", leg_na:"No data",
-    rule:"A line = the group selected when creating a token; the same model may differ across lines — search a model to compare and pick the most stable line. Status is based on 7-day uptime: ≥99% Operational · 95–99% Degraded · <95% Outage. Uptime = successful / (total − user-side errors); if a model has no usable upstream on a line, it shows Outage.",
+    rule:"A line = the group selected when creating a token; the same model may differ across lines — search to compare and choose. Status reflects current availability (recent traffic + whether any usable upstream exists): Operational · Degraded (recent uptime 85–99%) · Outage (recent uptime <85% or no usable upstream). Uptime = successful / (total − user-side errors), over the last 7 days; shown as \"—\" when data is stale.",
     foot:"Powered by NexusAPI",
   },
 };

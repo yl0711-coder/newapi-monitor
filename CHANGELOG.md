@@ -4,6 +4,13 @@
 
 ## [Unreleased]
 
+## [1.1.1] - 2026-06-10
+
+### Changed
+- 看板状态判定改为**反映「当下」**:状态由「近期窗口(24h)流量 + 渠道健康」决定,不再被一周前的旧数据钉死。
+  - 有健康渠道但近期无流量 → 正常(不拿陈旧数据判死);可用率/延迟在数据陈旧(最新 >48h)时显「—」不展示。
+- 档位阈值调整:**正常 ≥99% · 性能下降 85–99% · 不可用 <85%**(原 <95% 一刀切过狠,会把"严重降级"误判为"不可用")。
+
 ## [1.1.0] - 2026-06-10
 
 ### Added
@@ -42,6 +49,7 @@
 - 纯 Go + 内嵌 SQLite(`CGO_ENABLED=0` 静态编译),单容器、零外部依赖。
 - Docker 镜像;GitHub Actions 自动 `go vet` + `go test` + `golangci-lint`,通过后发布镜像到 GHCR。
 
-[Unreleased]: https://github.com/yl0711-coder/newapi-monitor/compare/v1.1.0...HEAD
+[Unreleased]: https://github.com/yl0711-coder/newapi-monitor/compare/v1.1.1...HEAD
+[1.1.1]: https://github.com/yl0711-coder/newapi-monitor/compare/v1.1.0...v1.1.1
 [1.1.0]: https://github.com/yl0711-coder/newapi-monitor/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/yl0711-coder/newapi-monitor/releases/tag/v1.0.0

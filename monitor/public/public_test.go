@@ -170,11 +170,40 @@ func TestPretty(t *testing.T) {
 }
 
 func TestBandAndWorse(t *testing.T) {
-	if band(0.999) != stUp || band(0.97) != stWarn || band(0.5) != stDown {
+	// 阈值:≥99 正常 / 85–99 降级 / <85 不可用
+	if band(0.999) != stUp || band(0.97) != stWarn || band(0.88) != stWarn || band(0.80) != stDown {
 		t.Error("band 阈值错")
 	}
 	if worse(stUp, stDown) != stDown || worse(stWarn, stUp) != stWarn || worse(stDown, stWarn) != stDown {
 		t.Error("worse 严重度比较错")
+	}
+}
+
+// 陈旧数据不应判死:有健康渠道、但只有几天前的失败流量 → 当下应正常、可用率显空。
+func TestStaleNotMarkedDown(t *testing.T) {
+	db := testDB(t)
+	now := int64(1_900_000_000)
+	old := now - 4*86400 // 4 天前(>48h 陈旧,且不在 24h 近期窗口)
+	db.Create(&channelSnap{ID: 1, Status: 1, Groups: "g1", Models: "m_stale", UpdatedAt: now})
+	// 旧流量:26 次里 25 失败(若按 7 天窗口判定会是"不可用")
+	db.Create(&metricSample{BucketTs: old, ChannelID: 1, ModelName: "m_stale", Grp: "g1", Success: 1, Failed: 25})
+
+	h := &handler{db: db, cfg: Config{}}
+	snap := h.compute(now)
+	var got *Model
+	for i := range snap.Groups[0].Models {
+		if snap.Groups[0].Models[i].Name == "m_stale" {
+			got = &snap.Groups[0].Models[i]
+		}
+	}
+	if got == nil {
+		t.Fatal("没找到 m_stale")
+	}
+	if got.Status != stUp {
+		t.Errorf("陈旧+健康渠道应为 stUp(正常),得 %d", got.Status)
+	}
+	if got.Uptime != nil {
+		t.Errorf("陈旧数据不应展示可用率,得 %v", *got.Uptime)
 	}
 }
 
