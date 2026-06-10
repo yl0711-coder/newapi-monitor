@@ -144,6 +144,7 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
 <div class="card"><div class="card-header">按渠道</div><table><thead id="thChannel"></thead><tbody id="tbChannel"></tbody></table></div>
 <div class="card"><div class="card-header">按模型</div><table><thead id="thModel"></thead><tbody id="tbModel"></tbody></table></div>
 <div class="card"><div class="card-header">按 Key / 用户 <span class="muted" style="font-weight:400">· 谁在制造错误 / 烧配额(Top 100)</span></div><table><thead id="thToken"></thead><tbody id="tbToken"></tbody></table></div>
+<div class="card" id="rejCard" style="display:none"><div class="card-header">🚫 被拒请求 <span class="muted" style="font-weight:400">· 前置拒绝(无可用渠道等,不进 logs 表;来自各节点旁路采集器)</span></div><table><thead id="thRej"></thead><tbody id="tbRej"></tbody></table></div>
 
 <script>
 const params=new URLSearchParams(location.search);
@@ -275,6 +276,19 @@ function renderTokens(rows){
     <td class="right num">${r.failed?`<span class="lat-bad">${fmtNum(r.failed)}</span>`:'0'}</td>
     <td class="right num">${fmtNum(r.tokens)}</td>
     <td class="right num">${fmtUSD(r.cost_usd)}</td></tr>`).join('');
+}
+const REJHEAD=`<tr><th>模型</th><th>分组</th><th>原因</th><th class="right">被拒次数</th></tr>`;
+const REJREASON={no_available_channel:'无可用渠道'};
+function renderRejections(rows){
+  const card=document.getElementById('rejCard');
+  if(!rows||!rows.length){card.style.display='none';return} // 没采集器/无拒绝则隐藏整卡
+  card.style.display='';
+  document.getElementById('thRej').innerHTML=REJHEAD;
+  document.getElementById('tbRej').innerHTML=rows.map(r=>`<tr>
+    <td>${esc(r.model)}</td>
+    <td>${esc(r.group)}</td>
+    <td>${esc(REJREASON[r.reason]||r.reason)}</td>
+    <td class="right num"><span class="lat-bad">${fmtNum(r.count)}</span></td></tr>`).join('');
 }
 const winLabel=min=>min>=60?('近'+(min/60)+'h'):('近'+min+'min');
 const burnCol=v=>v>=14?'#ef4444':(v>=3?'#f59e0b':'#94a3b8');
@@ -410,6 +424,7 @@ function apply(s){
   renderBanner(s);renderSummary(s.summary);renderSLO(s.slo);renderCompare(s.compare);renderLatHist(s.summary);lastTrend=s.trend||[];drawTrend(lastTrend);
   renderTable('thGroup','tbGroup',s.by_group);renderTable('thChannel','tbChannel',s.by_channel);renderTable('thModel','tbModel',s.by_model);
   renderTokens(s.by_token);
+  renderRejections(s.rejections);
 }
 async function load(){
   try{

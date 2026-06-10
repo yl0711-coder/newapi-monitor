@@ -90,6 +90,18 @@ type ChannelSnap struct {
 	UpdatedAt int64  `gorm:"index"`
 }
 
+// RejectionSample 是「前置拒绝」按分钟聚合的计数,由各节点的旁路采集器
+// (newapi-reject-collector)POST 推来。这类拒绝(如"无可用渠道")不进 new-api 的 logs 表,
+// 是 logs 维度监控的盲区,这里单列。复合主键使重复推送幂等(同键累加)。
+type RejectionSample struct {
+	BucketTs int64  `gorm:"primaryKey;autoIncrement:false;index"`
+	Node     string `gorm:"primaryKey;size:64"`  // 来源节点(master/slave)
+	Reason   string `gorm:"primaryKey;size:64"`  // no_available_channel 等
+	Model    string `gorm:"primaryKey;size:128"` // 被拒模型
+	Grp      string `gorm:"primaryKey;size:64;column:grp"`
+	Count    int64
+}
+
 // 直方图档位上界。lat 单位秒,ttft 单位毫秒。
 var (
 	latEdges  = []int{1, 2, 5, 10, 30, 60}
@@ -106,7 +118,7 @@ func (m *Monitor) openStore(path string) error {
 	if err != nil {
 		return fmt.Errorf("打开本地采样库失败: %w", err)
 	}
-	if err := db.AutoMigrate(&MetricSample{}, &TokenSample{}, &HourSample{}, &ChannelSnap{}, &AlertConfig{}, &AlertLog{}); err != nil {
+	if err := db.AutoMigrate(&MetricSample{}, &TokenSample{}, &HourSample{}, &ChannelSnap{}, &RejectionSample{}, &AlertConfig{}, &AlertLog{}); err != nil {
 		return fmt.Errorf("表迁移失败: %w", err)
 	}
 	m.storeDB = db
@@ -153,6 +165,35 @@ func (m *Monitor) replaceChannelSnaps(rows []ChannelSnap, now int64) error {
 func (m *Monitor) pruneOlderThan(cutoffTs int64) (int64, error) {
 	r := m.storeDB.Where("bucket_ts < ?", cutoffTs).Delete(&MetricSample{})
 	m.storeDB.Where("bucket_ts < ?", cutoffTs).Delete(&TokenSample{}) // token 维度一并清理
+	return r.RowsAffected, r.Error
+}
+
+// upsertRejections 累加写入采集器推来的拒绝计数(同键累加,重复/分批推送幂等)。
+func (m *Monitor) upsertRejections(rows []RejectionSample) error {
+	if len(rows) == 0 {
+		return nil
+	}
+	return m.storeDB.Clauses(clause.OnConflict{
+		Columns: []clause.Column{
+			{Name: "bucket_ts"}, {Name: "node"}, {Name: "reason"}, {Name: "model"}, {Name: "grp"},
+		},
+		DoUpdates: clause.Assignments(map[string]interface{}{
+			"count": gorm.Expr("rejection_samples.count + excluded.count"),
+		}),
+	}).CreateInBatches(rows, 200).Error
+}
+
+// storeRejections 取窗口内按 (原因 × 模型 × 分组) 聚合的拒绝计数,按次数降序(Top 100)。
+func (m *Monitor) storeRejections(since int64) []RejectionRow {
+	var rows []RejectionRow
+	m.storeDB.Raw(`SELECT reason, model, grp AS `+"`group`"+`, COALESCE(SUM(count),0) AS count
+		FROM rejection_samples WHERE bucket_ts >= ?
+		GROUP BY reason, model, grp ORDER BY count DESC LIMIT 100`, since).Scan(&rows)
+	return rows
+}
+
+func (m *Monitor) pruneRejectionsOlderThan(cutoffTs int64) (int64, error) {
+	r := m.storeDB.Where("bucket_ts < ?", cutoffTs).Delete(&RejectionSample{})
 	return r.RowsAffected, r.Error
 }
 

@@ -26,6 +26,10 @@ type Settings struct {
 	// 对外看板:站点名【兜底】。默认空——优先从主站 new-api 的 system_name 同步;
 	// 仅当主站不可达时用此环境变量兜底;再为空则前端显通用名。
 	SiteName string // MONITOR_SITE_NAME
+
+	// 被拒请求采集:接收各节点 newapi-reject-collector 推送的鉴权 token。
+	// 留空 = 关闭接收接口(POST /internal/rejections 返回 503),不接受任何推送。
+	IngestToken string // MONITOR_INGEST_TOKEN
 }
 
 // LoadSettings 从环境变量装载配置(可配合 .env)。
@@ -42,6 +46,7 @@ func LoadSettings() Settings {
 		SessionSecret:     env("MONITOR_SESSION_SECRET", ""),
 		HeartbeatURL:      env("MONITOR_HEARTBEAT_URL", ""),
 		SiteName:          env("MONITOR_SITE_NAME", ""),
+		IngestToken:       env("MONITOR_INGEST_TOKEN", ""),
 	}
 }
 

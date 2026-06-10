@@ -183,6 +183,15 @@ type TokenRow struct {
 	Health      string  `json:"health"`
 }
 
+// RejectionRow 是「前置拒绝」按 (原因 × 模型 × 分组) 聚合的一行,供「被拒请求」面板展示。
+// 数据来自旁路采集器推送的 rejection_samples(new-api logs 表的盲区,如"无可用渠道")。
+type RejectionRow struct {
+	Reason string `json:"reason" gorm:"column:reason"`
+	Model  string `json:"model" gorm:"column:model"`
+	Group  string `json:"group" gorm:"column:group"`
+	Count  int64  `json:"count" gorm:"column:count"`
+}
+
 // HourPoint 小时级序列点(长期趋势图)。
 type HourPoint struct {
 	Ts      int64 `json:"ts"`
@@ -208,18 +217,19 @@ type CompareStat struct {
 
 // Snapshot 是一次完整看板快照:总览 + 分组 / 渠道 / 模型 / 令牌明细 + 趋势 + SLO + 同比环比。
 type Snapshot struct {
-	WindowMinutes  int         `json:"window_minutes"`
-	GeneratedAt    string      `json:"generated_at"`
-	SamplingActive bool        `json:"sampling_active"`
-	DataAgeSec     int64       `json:"data_age_sec"`
-	Summary        Summary     `json:"summary"`
-	ByGroup        []Row       `json:"by_group"`
-	ByChannel      []Row       `json:"by_channel"`
-	ByModel        []Row       `json:"by_model"`
-	ByToken        []TokenRow  `json:"by_token"`
-	Trend          []TimePoint `json:"trend"`
-	SLO            SLOStatus   `json:"slo"`
-	Compare        CompareStat `json:"compare"`
+	WindowMinutes  int            `json:"window_minutes"`
+	GeneratedAt    string         `json:"generated_at"`
+	SamplingActive bool           `json:"sampling_active"`
+	DataAgeSec     int64          `json:"data_age_sec"`
+	Summary        Summary        `json:"summary"`
+	ByGroup        []Row          `json:"by_group"`
+	ByChannel      []Row          `json:"by_channel"`
+	ByModel        []Row          `json:"by_model"`
+	ByToken        []TokenRow     `json:"by_token"`
+	Trend          []TimePoint    `json:"trend"`
+	SLO            SLOStatus      `json:"slo"`
+	Compare        CompareStat    `json:"compare"`
+	Rejections     []RejectionRow `json:"rejections"` // 前置拒绝(采集器旁路采集,logs 盲区)
 }
 
 // attachSpark 给每行挂上对应维度取值的分钟桶时序(失败则静默跳过)。
@@ -349,6 +359,7 @@ func (m *Monitor) computeSnapshot(windowMinutes int, nowUnix int64) (*Snapshot, 
 	}
 	slo := m.computeSLO(m.loadAlertConfig(), nowUnix)
 	compare := m.storeCompare(nowUnix)
+	rejections := m.storeRejections(nowUnix - int64(windowMinutes)*60)
 
 	lastBucket := m.storeFreshness()
 	age := int64(-1)
@@ -372,5 +383,6 @@ func (m *Monitor) computeSnapshot(windowMinutes int, nowUnix int64) (*Snapshot, 
 		Trend:          trend,
 		SLO:            slo,
 		Compare:        compare,
+		Rejections:     rejections,
 	}, nil
 }

@@ -90,6 +90,9 @@ func (m *Monitor) loop(ctx context.Context, interval time.Duration) {
 					if err := m.rollupHours(cutoff); err != nil { // 分钟数据被清前,先滚动汇总进小时表
 						slog.Warn("小时汇总失败(忽略)", "err", err)
 					}
+					if n, err := m.pruneRejectionsOlderThan(cutoff); err == nil && n > 0 {
+						slog.Info("清理过期被拒采样", "rows", n)
+					}
 				}
 				if hd := m.cfg.HourRetentionDays; hd > 0 {
 					if n, err := m.pruneHoursOlderThan(time.Now().Unix() - int64(hd)*86400); err == nil && n > 0 {

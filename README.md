@@ -51,6 +51,11 @@ docker run -d --name newapi-monitor \
 | `MONITOR_BACKFILL_HOURS` | 启动时回填的历史小时数 | `24` |
 | `MONITOR_HEARTBEAT_URL` | dead-man 心跳 URL(如 healthchecks.io);留空=不启用 | 留空 |
 | `MONITOR_SITE_NAME` | 对外看板站点名**兜底值**;站点名/favicon 默认部署时从主站 new-api 的 `system_name`/`logo` 同步,此项仅主站不可达时兜底 | 留空 |
+| `MONITOR_INGEST_TOKEN` | 「被拒请求」接收口 `POST /internal/rejections` 的鉴权 token,供各节点 [newapi-reject-collector](https://github.com/yl0711-coder/newapi-reject-collector) 推送前置拒绝;**留空=关闭该接口** | 留空 |
+
+## 被拒请求(前置拒绝 · logs 盲区)
+
+new-api 的「无可用渠道」等**前置拒绝**不写 `logs` 表,读 logs 的监控天然看不到。配套的旁路采集器 [newapi-reject-collector](https://github.com/yl0711-coder/newapi-reject-collector) 在每个节点 tail new-api 日志、抽出这类拒绝,`POST /internal/rejections`(带 `MONITOR_INGEST_TOKEN` 鉴权)推来,监控落 `rejection_samples` 表并在「被拒请求」面板按 模型 × 分组 展示。未配置 token 时该接口关闭、面板隐藏,不影响其它功能。
 
 ## 对外状态看板(公开、无登录)
 除内部监控外,同一进程还提供一个**面向客户的公开状态页**(脱敏、无需登录),适合放在独立子域名(如 `status.example.com`):

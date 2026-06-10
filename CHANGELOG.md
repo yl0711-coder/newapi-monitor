@@ -4,6 +4,14 @@
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-06-10
+
+### Added
+- **被拒请求(前置拒绝)监控**:接收旁路采集器 [newapi-reject-collector](https://github.com/yl0711-coder/newapi-reject-collector) 推送的「无可用渠道」等前置拒绝(这类拒绝不进 new-api `logs` 表,是 logs 维度监控的盲区)。
+  - 新增接收接口 `POST /internal/rejections`(token 鉴权,`MONITOR_INGEST_TOKEN` 配置;留空则关闭)。
+  - 新增 `rejection_samples` 表(按 节点×分钟桶×原因×模型×分组 累加,重复推送幂等)+ 随留存定期清理。
+  - 内部监控新增「被拒请求」面板(按 模型×分组 计数,Top 100;无数据则隐藏)。
+
 ## [1.1.5] - 2026-06-10
 
 ### Changed
@@ -73,7 +81,8 @@
 - 纯 Go + 内嵌 SQLite(`CGO_ENABLED=0` 静态编译),单容器、零外部依赖。
 - Docker 镜像;GitHub Actions 自动 `go vet` + `go test` + `golangci-lint`,通过后发布镜像到 GHCR。
 
-[Unreleased]: https://github.com/yl0711-coder/newapi-monitor/compare/v1.1.5...HEAD
+[Unreleased]: https://github.com/yl0711-coder/newapi-monitor/compare/v1.2.0...HEAD
+[1.2.0]: https://github.com/yl0711-coder/newapi-monitor/compare/v1.1.5...v1.2.0
 [1.1.5]: https://github.com/yl0711-coder/newapi-monitor/compare/v1.1.4...v1.1.5
 [1.1.4]: https://github.com/yl0711-coder/newapi-monitor/compare/v1.1.3...v1.1.4
 [1.1.3]: https://github.com/yl0711-coder/newapi-monitor/compare/v1.1.2...v1.1.3

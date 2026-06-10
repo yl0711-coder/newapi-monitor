@@ -1,7 +1,9 @@
 package monitor
 
 import (
+	"crypto/subtle"
 	_ "embed"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"time"
@@ -44,7 +46,8 @@ func (m *Monitor) RegisterRoutes(r *gin.Engine) {
 		c.Header("Cache-Control", "public, max-age=31536000, immutable")
 		c.Data(http.StatusOK, "application/javascript; charset=utf-8", echartsJS)
 	})
-	r.GET("/api/brand", m.brandHandler) // 公开:站点名,供前端设置页面标题
+	r.GET("/api/brand", m.brandHandler)                // 公开:站点名,供前端设置页面标题
+	r.POST("/internal/rejections", m.ingestRejections) // 机器对机器:接收采集器推送的前置拒绝(token 鉴权)
 	r.GET("/login", m.loginPage)
 	r.POST("/login", m.loginSubmit)
 	r.GET("/logout", logout)
@@ -70,6 +73,67 @@ func (m *Monitor) RegisterRoutes(r *gin.Engine) {
 		root.POST("/test", m.testAlertHandler)
 		root.POST("/smtp/sync", m.syncSMTPHandler) // 「使用主站配置」:从 new-api 同步 SMTP
 	}
+}
+
+// ingestRejections 接收各节点 newapi-reject-collector 推来的前置拒绝计数(token 鉴权)。
+// 未配置 MONITOR_INGEST_TOKEN 则接口关闭(503),不接受任何推送。
+func (m *Monitor) ingestRejections(c *gin.Context) {
+	want := m.cfg.IngestToken
+	if want == "" {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "ingest disabled"})
+		return
+	}
+	if subtle.ConstantTimeCompare([]byte(c.GetHeader("Authorization")), []byte("Bearer "+want)) != 1 {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
+		return
+	}
+	var in struct {
+		Node    string `json:"node"`
+		Samples []struct {
+			BucketTs int64  `json:"bucket_ts"`
+			Reason   string `json:"reason"`
+			Model    string `json:"model"`
+			Group    string `json:"group"`
+			Count    int64  `json:"count"`
+		} `json:"samples"`
+	}
+	if err := c.ShouldBindJSON(&in); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if len(in.Samples) > 5000 { // 防异常大包
+		c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "too many samples"})
+		return
+	}
+	node := clip(in.Node, 64)
+	rows := make([]RejectionSample, 0, len(in.Samples))
+	for _, s := range in.Samples {
+		if s.Model == "" || s.Reason == "" || s.Count <= 0 || s.BucketTs <= 0 {
+			continue // 丢弃残缺项
+		}
+		rows = append(rows, RejectionSample{
+			BucketTs: s.BucketTs / 60 * 60,
+			Node:     node,
+			Reason:   clip(s.Reason, 64),
+			Model:    clip(s.Model, 128),
+			Grp:      clip(s.Group, 64),
+			Count:    s.Count,
+		})
+	}
+	if err := m.upsertRejections(rows); err != nil {
+		slog.Warn("被拒请求入库失败", "err", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "store failed"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"ok": true, "stored": len(rows)})
+}
+
+// clip 截断字符串到 n 字节,防御异常长输入。
+func clip(s string, n int) string {
+	if len(s) > n {
+		return s[:n]
+	}
+	return s
 }
 
 // syncSMTPHandler 从主站 options 表同步 SMTP 配置(凭证存库,不回显)。
