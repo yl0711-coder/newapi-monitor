@@ -17,7 +17,7 @@ import (
 // 复合主键使采样可幂等 UPSERT,自愈小的采集间隙。
 type MetricSample struct {
 	BucketTs  int64  `gorm:"primaryKey;autoIncrement:false;index:idx_metric_bucket"`
-	ChannelId int    `gorm:"primaryKey;autoIncrement:false"`
+	ChannelID int    `gorm:"primaryKey;autoIncrement:false"`
 	ModelName string `gorm:"primaryKey;size:128"`
 	Grp       string `gorm:"primaryKey;size:64;column:grp"`
 
@@ -83,7 +83,7 @@ type HourSample struct {
 // ChannelSnap 渠道健康快照:采样器周期性从生产 channels 表读入(id/状态/分组/模型),
 // 供对外看板(public 包)派生"某线路×模型有无可用渠道"。仅存路由与状态,【无任何密钥】。
 type ChannelSnap struct {
-	Id        int    `gorm:"primaryKey;autoIncrement:false"`
+	ID        int    `gorm:"primaryKey;autoIncrement:false"`
 	Status    int    // new-api: 1启用 / 2手动禁用 / 3自动禁用
 	Groups    string `gorm:"size:512"`  // 逗号分隔分组
 	Models    string `gorm:"type:text"` // 逗号分隔模型

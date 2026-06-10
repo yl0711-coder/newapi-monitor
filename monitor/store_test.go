@@ -18,10 +18,10 @@ func TestStoreAggregation(t *testing.T) {
 	m := newTestMonitor(t)
 	const bucket = 1_700_000_000 / 60 * 60 // 任意分钟桶
 	rows := []MetricSample{
-		{BucketTs: bucket, ChannelId: 1, ModelName: "gpt", Grp: "g1",
+		{BucketTs: bucket, ChannelID: 1, ModelName: "gpt", Grp: "g1",
 			Success: 8, Anomaly: 1, Failed: 1, SumUseTime: 10, MaxUseTime: 5,
 			Tokens: 100, Quota: 500000, Err5xx: 1, Lat1: 8, CompletionTokens: 80},
-		{BucketTs: bucket, ChannelId: 2, ModelName: "gpt-4o", Grp: "g1",
+		{BucketTs: bucket, ChannelID: 2, ModelName: "gpt-4o", Grp: "g1",
 			Success: 18, Anomaly: 0, Failed: 2, SumUseTime: 36, MaxUseTime: 4,
 			Tokens: 200, Quota: 1000000, Err4xx: 2, Lat2: 18, CompletionTokens: 180},
 	}
@@ -96,7 +96,7 @@ func TestStoreAggregation(t *testing.T) {
 func TestUpsertIdempotent(t *testing.T) {
 	m := newTestMonitor(t)
 	const bucket = 1_700_000_000 / 60 * 60
-	row := MetricSample{BucketTs: bucket, ChannelId: 1, ModelName: "gpt", Grp: "g1", Success: 5, Failed: 1}
+	row := MetricSample{BucketTs: bucket, ChannelID: 1, ModelName: "gpt", Grp: "g1", Success: 5, Failed: 1}
 	for i := 0; i < 3; i++ { // 写 3 次
 		if err := m.upsertSamples([]MetricSample{row}); err != nil {
 			t.Fatal(err)
@@ -117,8 +117,8 @@ func TestPruneOlderThan(t *testing.T) {
 	old := int64(1_700_000_000)
 	recent := old + 86400
 	if err := m.upsertSamples([]MetricSample{
-		{BucketTs: old, ChannelId: 1, ModelName: "a", Grp: "g", Success: 1},
-		{BucketTs: recent, ChannelId: 1, ModelName: "a", Grp: "g", Success: 1},
+		{BucketTs: old, ChannelID: 1, ModelName: "a", Grp: "g", Success: 1},
+		{BucketTs: recent, ChannelID: 1, ModelName: "a", Grp: "g", Success: 1},
 	}); err != nil {
 		t.Fatal(err)
 	}

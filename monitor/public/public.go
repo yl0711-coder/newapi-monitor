@@ -51,7 +51,8 @@ type Config struct {
 
 // ---- 对外脱敏数据结构(独立,绝不复用内部结构)----
 
-type PublicModel struct {
+// Model 是某线路下某模型对外可见的状态:仅状态/可用率/延迟/心跳条,无任何内部明细。
+type Model struct {
 	Provider  string   `json:"provider"`   // anthropic/openai/google/deepseek/other
 	Name      string   `json:"name"`       // 模型友好名(去日期后缀)
 	Status    int      `json:"status"`     // 见状态枚举
@@ -60,16 +61,18 @@ type PublicModel struct {
 	Beats     []int    `json:"beats"`      // 近7天逐桶状态(老→新),仅状态枚举,无任何明细
 }
 
-type PublicGroup struct {
-	Name   string        `json:"name"` // 线路显示名(= 主站 usable_group 描述名)
-	Status int           `json:"status"`
-	Models []PublicModel `json:"models"`
+// Group 是一条线路(= 用户建令牌所选分组)及其下模型的对外状态。
+type Group struct {
+	Name   string  `json:"name"` // 线路显示名(= 分组 key)
+	Status int     `json:"status"`
+	Models []Model `json:"models"`
 }
 
-type PublicSnapshot struct {
-	UpdatedAt string        `json:"updated_at"`
-	Overall   int           `json:"overall"`
-	Groups    []PublicGroup `json:"groups"`
+// Snapshot 是一次完整的对外看板快照:整体状态 + 各线路 × 模型。
+type Snapshot struct {
+	UpdatedAt string  `json:"updated_at"`
+	Overall   int     `json:"overall"`
+	Groups    []Group `json:"groups"`
 }
 
 // ---- handler ----
@@ -79,7 +82,7 @@ type handler struct {
 	cfg Config
 
 	snapMu sync.Mutex
-	snap   *PublicSnapshot
+	snap   *Snapshot
 	snapAt int64
 
 	grpMu  sync.Mutex
@@ -133,7 +136,7 @@ type agg struct {
 	Max                              int64
 }
 
-func (h *handler) compute(now int64) *PublicSnapshot {
+func (h *handler) compute(now int64) *Snapshot {
 	since := now - windowSec
 
 	// 1) 渠道健康快照 → 每(分组,模型)的"在售"与"健康渠道数"
@@ -148,14 +151,14 @@ func (h *handler) compute(now int64) *PublicSnapshot {
 	// 4) 可见分组(令牌可选的)
 	vgs := h.visibleGroups(now, totals)
 
-	var groups []PublicGroup
+	var groups []Group
 	overall := stUp
 	for _, vg := range vgs {
 		models := mergedModels(offered[vg.Key], totals, vg.Key)
 		if len(models) == 0 {
 			continue
 		}
-		var pms []PublicModel
+		var pms []Model
 		gStatus := stUp
 		for _, mdl := range models {
 			pm := h.buildModel(vg.Key, mdl, enabled, totals, series, now, since)
@@ -168,18 +171,18 @@ func (h *handler) compute(now int64) *PublicSnapshot {
 			}
 			return pms[i].Name < pms[j].Name
 		})
-		groups = append(groups, PublicGroup{Name: vg.Name, Status: gStatus, Models: pms})
+		groups = append(groups, Group{Name: vg.Name, Status: gStatus, Models: pms})
 		overall = worse(overall, gStatus)
 	}
 
-	return &PublicSnapshot{
+	return &Snapshot{
 		UpdatedAt: time.Unix(now, 0).UTC().Format(time.RFC3339),
 		Overall:   overall,
 		Groups:    groups,
 	}
 }
 
-func (h *handler) buildModel(grp, mdl string, enabled map[string]map[string]int, totals map[string]agg, series map[string][]seriesPt, now, since int64) PublicModel {
+func (h *handler) buildModel(grp, mdl string, enabled map[string]map[string]int, totals map[string]agg, series map[string][]seriesPt, now, since int64) Model {
 	key := grp + "\x00" + mdl
 	a := totals[key]
 	total := a.Success + a.Anomaly + a.Failed
@@ -188,7 +191,7 @@ func (h *handler) buildModel(grp, mdl string, enabled map[string]map[string]int,
 		en = mm[mdl]
 	}
 
-	pm := PublicModel{Provider: provider(mdl), Name: pretty(mdl), Beats: buildBeats(series[key], now, since)}
+	pm := Model{Provider: provider(mdl), Name: pretty(mdl), Beats: buildBeats(series[key], now, since)}
 
 	// 拓扑优先:配置在册但 0 健康渠道 → 无可用渠道(不可用),不靠流量猜。
 	if en == 0 {
@@ -357,15 +360,13 @@ func (h *handler) fetchUsableGroups() []vgroup {
 		return nil
 	}
 	var vgs []vgroup
-	for k, desc := range body.UsableGroup {
+	for k := range body.UsableGroup {
 		if k == "" {
 			continue
 		}
-		name := desc
-		if name == "" {
-			name = k
-		}
-		vgs = append(vgs, vgroup{Key: k, Name: name})
+		// 显示名直接用分组 key(= 用户建令牌所选,如 codex-1.2x);
+		// usable_group 的描述(desc)可能含"逆向/openclaw/折扣"等敏感字样,不对外。
+		vgs = append(vgs, vgroup{Key: k, Name: k})
 	}
 	return vgs
 }

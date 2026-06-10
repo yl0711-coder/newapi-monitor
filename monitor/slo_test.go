@@ -9,7 +9,7 @@ func TestComputeSLO(t *testing.T) {
 	bucket := now / 60 * 60
 	// 窗口内 990 成功 + 10 失败 = 1000,非错误率 99%
 	if err := m.upsertSamples([]MetricSample{
-		{BucketTs: bucket, ChannelId: 1, ModelName: "m", Grp: "g", Success: 990, Failed: 10},
+		{BucketTs: bucket, ChannelID: 1, ModelName: "m", Grp: "g", Success: 990, Failed: 10},
 	}); err != nil {
 		t.Fatal(err)
 	}

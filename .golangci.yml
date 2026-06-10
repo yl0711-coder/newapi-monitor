@@ -1,7 +1,31 @@
-# golangci-lint 配置。默认 linters(errcheck/govet/ineffassign/staticcheck/unused/gosimple)+ gofmt。
+# golangci-lint 配置。
+# 默认 linters(errcheck/govet/ineffassign/staticcheck/unused/gosimple)
+# 之外另启:gofmt(格式)、misspell(拼写)、errorlint(错误包装)、unconvert(冗余转换)、
+# bodyclose(HTTP body 关闭)、revive(导出注释/命名风格)、gocritic(常见误用)。
 run:
   timeout: 5m
 
 linters:
   enable:
     - gofmt
+    - misspell
+    - errorlint
+    - unconvert
+    - bodyclose
+    - revive
+    - gocritic
+
+linters-settings:
+  revive:
+    rules:
+      - name: exported
+      - name: var-naming
+      - name: blank-imports
+      - name: context-as-argument
+      - name: indent-error-flow
+      - name: receiver-naming
+      - name: unexported-return
+  gocritic:
+    disabled-checks:
+      - ifElseChain
+      - singleCaseSwitch

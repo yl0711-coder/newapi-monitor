@@ -48,6 +48,27 @@ Open `http://<host>:8090` and log in with a new-api admin account. See [`docker-
 | `MONITOR_SAMPLE_SECONDS` | Sampling interval (seconds) | `60` |
 | `MONITOR_RETENTION_DAYS` | Local retention (days) | `7` |
 | `MONITOR_BACKFILL_HOURS` | Hours of history to backfill on start | `24` |
+| `MONITOR_HOUR_RETENTION_DAYS` | Hourly-rollup retention (long-term trend + WoW/DoD) | `90` |
+| `MONITOR_HEARTBEAT_URL` | Dead-man heartbeat URL (e.g. healthchecks.io); empty = off | empty |
+| `MONITOR_SITE_NAME` | Site name shown on the public status board | `NexusAPI` |
+
+## Public status board (public, no login)
+Besides the internal monitor, the same process serves a **customer-facing public status page** (sanitized, no login), ideal for a dedicated subdomain (e.g. `status.example.com`):
+
+- `GET /status` — light card-style status page (embedded, self-contained).
+- `GET /public/status` — sanitized JSON polled by the page.
+
+Dimensions are **group (line) × model**: channels are transparent to users. Visible groups come from new-api's `/api/pricing` (`usable_group`, i.e. the groups selectable when creating a token); display names match the main site. Status is synthesized from **topology health (whether a group×model has any usable channel)** + **last-7-day traffic**: a configured group×model with no usable channel shows "outage".
+
+**Hard isolation**: the board is the standalone `monitor/public` package, reads only the local sampling DB, and never references internal structs; the public surface **never emits** channel names/IDs/IPs, cost/quota, tokens/users, request volume/QPS, or error details.
+
+Reverse-proxy example (Caddy, by subdomain):
+```
+status.example.com {
+    reverse_proxy monitor:8090
+    rewrite / /status
+}
+```
 
 ## Permissions
 Login reuses new-api identity (only calls its `/api/user/login`):

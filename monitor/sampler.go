@@ -160,7 +160,7 @@ GROUP BY bucket, channel_id, model_name, grp`
 			grp         sql.NullString
 			e4, e5, eto int64
 		)
-		if err := rows.Scan(&s.BucketTs, &s.ChannelId, &s.ModelName, &grp,
+		if err := rows.Scan(&s.BucketTs, &s.ChannelID, &s.ModelName, &grp,
 			&s.Success, &s.Anomaly, &s.Failed, &s.SumUseTime, &s.MaxUseTime, &s.Tokens, &s.Quota,
 			&e4, &e5, &eto,
 			&s.Lat1, &s.Lat2, &s.Lat5, &s.Lat10, &s.Lat30, &s.Lat60, &s.LatInf,
@@ -243,7 +243,7 @@ func (m *Monitor) refreshChannels() {
 			return
 		}
 		names[strconv.Itoa(id)] = name.String
-		snaps = append(snaps, ChannelSnap{Id: id, Status: status, Groups: grp.String, Models: models.String, UpdatedAt: now})
+		snaps = append(snaps, ChannelSnap{ID: id, Status: status, Groups: grp.String, Models: models.String, UpdatedAt: now})
 	}
 	if err := rows.Err(); err != nil {
 		return

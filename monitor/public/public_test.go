@@ -16,7 +16,7 @@ import (
 // 测试用的表结构(列名与生产一致),避免 import monitor 造成循环。
 type metricSample struct {
 	BucketTs   int64  `gorm:"primaryKey;autoIncrement:false"`
-	ChannelId  int    `gorm:"primaryKey;autoIncrement:false"`
+	ChannelID  int    `gorm:"primaryKey;autoIncrement:false"`
 	ModelName  string `gorm:"primaryKey;size:128"`
 	Grp        string `gorm:"primaryKey;size:64;column:grp"`
 	Success    int64
@@ -36,7 +36,7 @@ type metricSample struct {
 func (metricSample) TableName() string { return "metric_samples" }
 
 type channelSnap struct {
-	Id        int `gorm:"primaryKey;autoIncrement:false"`
+	ID        int `gorm:"primaryKey;autoIncrement:false"`
 	Status    int
 	Groups    string
 	Models    string
@@ -64,13 +64,13 @@ func TestComputeTopologyAndTraffic(t *testing.T) {
 
 	// 渠道:m_ok 有 1 条启用;m_warn 有 1 条启用;m_down 只有 1 条自动禁用(→ 无可用渠道)
 	db.Create(&[]channelSnap{
-		{Id: 1, Status: 1, Groups: "g1", Models: "m_ok,m_warn", UpdatedAt: now},
-		{Id: 2, Status: 3, Groups: "g1", Models: "m_down", UpdatedAt: now}, // 自动禁用
+		{ID: 1, Status: 1, Groups: "g1", Models: "m_ok,m_warn", UpdatedAt: now},
+		{ID: 2, Status: 3, Groups: "g1", Models: "m_down", UpdatedAt: now}, // 自动禁用
 	})
 	// 流量:m_ok 全成功;m_warn 96%(降级);m_down 无流量(纯靠拓扑判故障)
 	db.Create(&[]metricSample{
-		{BucketTs: bt, ChannelId: 1, ModelName: "m_ok", Grp: "g1", Success: 30, Lat2: 30, MaxUseTime: 2},
-		{BucketTs: bt, ChannelId: 1, ModelName: "m_warn", Grp: "g1", Success: 24, Failed: 1, Lat5: 24, MaxUseTime: 5},
+		{BucketTs: bt, ChannelID: 1, ModelName: "m_ok", Grp: "g1", Success: 30, Lat2: 30, MaxUseTime: 2},
+		{BucketTs: bt, ChannelID: 1, ModelName: "m_warn", Grp: "g1", Success: 24, Failed: 1, Lat5: 24, MaxUseTime: 5},
 	})
 
 	h := &handler{db: db, cfg: Config{}} // 无 NewAPIBaseURL → 可见分组退回"有流量分组"
@@ -107,8 +107,8 @@ func TestComputeTopologyAndTraffic(t *testing.T) {
 func TestPublicSnapshotSanitized(t *testing.T) {
 	db := testDB(t)
 	now := int64(1_900_000_000)
-	db.Create(&channelSnap{Id: 1, Status: 1, Groups: "g1", Models: "claude-opus-4-8", UpdatedAt: now})
-	db.Create(&metricSample{BucketTs: now - 3600, ChannelId: 7, ModelName: "claude-opus-4-8", Grp: "g1", Success: 50, Lat2: 50, MaxUseTime: 2})
+	db.Create(&channelSnap{ID: 1, Status: 1, Groups: "g1", Models: "claude-opus-4-8", UpdatedAt: now})
+	db.Create(&metricSample{BucketTs: now - 3600, ChannelID: 7, ModelName: "claude-opus-4-8", Grp: "g1", Success: 50, Lat2: 50, MaxUseTime: 2})
 
 	h := &handler{db: db, cfg: Config{}}
 	b, _ := json.Marshal(h.compute(now))
@@ -125,7 +125,7 @@ func TestPublicSnapshotSanitized(t *testing.T) {
 
 func TestEndpoints(t *testing.T) {
 	db := testDB(t)
-	db.Create(&channelSnap{Id: 1, Status: 1, Groups: "g1", Models: "gpt-5.5", UpdatedAt: 1})
+	db.Create(&channelSnap{ID: 1, Status: 1, Groups: "g1", Models: "gpt-5.5", UpdatedAt: 1})
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
 	Register(r, db, Config{})
@@ -142,7 +142,7 @@ func TestEndpoints(t *testing.T) {
 	if w.Code != 200 {
 		t.Fatalf("/public/status code=%d", w.Code)
 	}
-	var snap PublicSnapshot
+	var snap Snapshot
 	if err := json.Unmarshal(w.Body.Bytes(), &snap); err != nil {
 		t.Fatalf("JSON 解析失败: %v", err)
 	}

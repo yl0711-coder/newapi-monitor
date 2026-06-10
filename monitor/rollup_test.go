@@ -9,7 +9,7 @@ func TestRollupAndCompare(t *testing.T) {
 	now := int64(1_700_000_000)
 	nowH := now / h * h
 	mk := func(bucket, succ, fail, quota int64) MetricSample {
-		return MetricSample{BucketTs: bucket, ChannelId: 1, ModelName: "m", Grp: "g", Success: succ, Failed: fail, Quota: quota}
+		return MetricSample{BucketTs: bucket, ChannelID: 1, ModelName: "m", Grp: "g", Success: succ, Failed: fail, Quota: quota}
 	}
 	if err := m.upsertSamples([]MetricSample{
 		mk(nowH-2*h, 90, 10, 500000), // 近 24h 内(成功率 90%、成本 $1)
