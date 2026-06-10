@@ -47,6 +47,7 @@ func main() {
 	r := gin.New()
 	r.Use(gin.Logger(), gin.Recovery())
 	m.RegisterRoutes(r)
+	m.RegisterPublicBoard(r) // 对外公开看板:/status + /public/status(无鉴权、脱敏)
 
 	srv := &http.Server{Addr: s.Addr, Handler: r}
 	go func() {

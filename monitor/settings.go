@@ -22,6 +22,9 @@ type Settings struct {
 	// dead-man 心跳:每周期成功采样后向外部服务(如 healthchecks.io)打一次;留空=不启用。
 	// 监控/采样若停了,外部服务收不到心跳即告警——"谁来监控监控"。
 	HeartbeatURL string // MONITOR_HEARTBEAT_URL
+
+	// 对外看板:页面标题,默认 NexusAPI。
+	SiteName string // MONITOR_SITE_NAME
 }
 
 // LoadSettings 从环境变量装载配置(可配合 .env)。
@@ -37,6 +40,7 @@ func LoadSettings() Settings {
 		NewAPIBaseURL:     env("MONITOR_NEWAPI_BASE_URL", ""),
 		SessionSecret:     env("MONITOR_SESSION_SECRET", ""),
 		HeartbeatURL:      env("MONITOR_HEARTBEAT_URL", ""),
+		SiteName:          env("MONITOR_SITE_NAME", "NexusAPI"),
 	}
 }
 

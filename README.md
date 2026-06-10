@@ -50,6 +50,25 @@ docker run -d --name newapi-monitor \
 | `MONITOR_HOUR_RETENTION_DAYS` | 小时级汇总留存天数(长期趋势 + 同比环比) | `90` |
 | `MONITOR_BACKFILL_HOURS` | 启动时回填的历史小时数 | `24` |
 | `MONITOR_HEARTBEAT_URL` | dead-man 心跳 URL(如 healthchecks.io);留空=不启用 | 留空 |
+| `MONITOR_SITE_NAME` | 对外状态看板的站点名 | `NexusAPI` |
+
+## 对外状态看板(公开、无登录)
+除内部监控外,同一进程还提供一个**面向客户的公开状态页**(脱敏、无需登录),适合放在独立子域名(如 `status.example.com`):
+
+- `GET /status` —— 浅色卡片状态页(内嵌、自包含)。
+- `GET /public/status` —— 脱敏 JSON,供页面轮询。
+
+维度是**分组(线路)× 模型**:渠道对用户透明。可见分组取自 new-api 的 `/api/pricing`(`usable_group`,即令牌创建页能选到的分组),显示名与主站一致。状态由「拓扑健康(某分组×模型有无可用渠道)」+「近 7 天流量」合成:配置在册但无可用渠道直接显示「不可用」。
+
+**强隔离**:看板是独立的 `monitor/public` 包,只读本地采样库,绝不引用内部结构;**公开面绝不输出**渠道名/ID/IP、成本/配额、令牌/用户、请求量/QPS、错误详情。
+
+反代示例(Caddy,按子域名分流):
+```
+status.example.com {
+    reverse_proxy monitor:8090
+    rewrite / /status
+}
+```
 
 ## 权限
 登录复用 new-api 用户身份(仅调用其 `/api/user/login` 验证):

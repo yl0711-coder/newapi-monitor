@@ -1,0 +1,526 @@
+// Package public 是对外公开的「服务状态看板」,与内部监控同进程、同本地库,但【强隔离】:
+//   - 独立包,绝不 import 内部 monitor 的任何结构(Snapshot/Row/TokenRow…),
+//     输出全部用本包自己的脱敏结构体从零拼,编译层杜绝内部数据外泄;
+//   - 只读本地采样库(metric_samples 流量 + channel_snaps 渠道健康),不碰生产库;
+//   - 维度 = 线路(分组)× 模型,渠道对用户透明;可见分组取自 new-api /api/pricing 的 usable_group。
+//
+// 公开面【绝不输出】:渠道名/ID/IP、成本/配额、令牌/用户、请求量/QPS、错误详情。
+package public
+
+import (
+	"encoding/json"
+	"net/http"
+	"regexp"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+
+	_ "embed"
+
+	"github.com/gin-gonic/gin"
+	"gorm.io/gorm"
+)
+
+//go:embed status.html
+var statusHTML []byte
+
+const (
+	windowDays = 7 // 可用率/状态条窗口
+	windowSec  = int64(windowDays * 86400)
+	beatCount  = 50  // 心跳条桶数
+	minSample  = 20  // 窗口内请求数低于此 → 不据流量判故障
+	snapTTL    = 30  // 看板快照缓存(秒)
+	groupsTTL  = 300 // 可见分组缓存(秒)
+)
+
+// 状态枚举(对齐 Uptime Kuma 习惯):1 正常 / 2 降级 / 0 不可用 / 3 维护 / -1 数据不足。
+const (
+	stDown   = 0
+	stUp     = 1
+	stWarn   = 2
+	stMaint  = 3
+	stNoData = -1
+)
+
+// Config 是看板所需的最小配置(由 monitor 注入)。
+type Config struct {
+	NewAPIBaseURL string // 用于匿名拉取 /api/pricing 的可见分组;为空则退回"有流量的分组"
+	SiteName      string // 页面标题,默认 NexusAPI
+}
+
+// ---- 对外脱敏数据结构(独立,绝不复用内部结构)----
+
+type PublicModel struct {
+	Provider  string   `json:"provider"`   // anthropic/openai/google/deepseek/other
+	Name      string   `json:"name"`       // 模型友好名(去日期后缀)
+	Status    int      `json:"status"`     // 见状态枚举
+	Uptime    *float64 `json:"uptime"`     // 近7天可用率 0-1;数据不足为 null
+	LatencyMs *int     `json:"latency_ms"` // P50 延迟(ms);无则 null
+	Beats     []int    `json:"beats"`      // 近7天逐桶状态(老→新),仅状态枚举,无任何明细
+}
+
+type PublicGroup struct {
+	Name   string        `json:"name"` // 线路显示名(= 主站 usable_group 描述名)
+	Status int           `json:"status"`
+	Models []PublicModel `json:"models"`
+}
+
+type PublicSnapshot struct {
+	UpdatedAt string        `json:"updated_at"`
+	Overall   int           `json:"overall"`
+	Groups    []PublicGroup `json:"groups"`
+}
+
+// ---- handler ----
+
+type handler struct {
+	db  *gorm.DB
+	cfg Config
+
+	snapMu sync.Mutex
+	snap   *PublicSnapshot
+	snapAt int64
+
+	grpMu  sync.Mutex
+	groups []vgroup
+	grpAt  int64
+}
+
+type vgroup struct{ Key, Name string }
+
+// Register 把看板挂到给定引擎:GET /status(页面) + GET /public/status(脱敏 JSON)。均【无鉴权】。
+func Register(r *gin.Engine, db *gorm.DB, cfg Config) {
+	if cfg.SiteName == "" {
+		cfg.SiteName = "NexusAPI"
+	}
+	h := &handler{db: db, cfg: cfg}
+	r.GET("/status", h.page)
+	r.GET("/public/status", h.data)
+}
+
+func (h *handler) page(c *gin.Context) {
+	c.Header("Cache-Control", "public, max-age=300")
+	c.Data(http.StatusOK, "text/html; charset=utf-8", statusHTML)
+}
+
+func (h *handler) data(c *gin.Context) {
+	now := time.Now().Unix()
+	h.snapMu.Lock()
+	if h.snap != nil && now-h.snapAt < snapTTL {
+		snap := h.snap
+		h.snapMu.Unlock()
+		c.Header("Cache-Control", "no-store")
+		c.JSON(http.StatusOK, snap)
+		return
+	}
+	h.snapMu.Unlock()
+
+	snap := h.compute(now)
+
+	h.snapMu.Lock()
+	h.snap, h.snapAt = snap, now
+	h.snapMu.Unlock()
+	c.Header("Cache-Control", "no-store")
+	c.JSON(http.StatusOK, snap)
+}
+
+// ---- 聚合 ----
+
+type agg struct {
+	Success, Anomaly, Failed, Err4xx int64
+	Lat                              [7]int64
+	Max                              int64
+}
+
+func (h *handler) compute(now int64) *PublicSnapshot {
+	since := now - windowSec
+
+	// 1) 渠道健康快照 → 每(分组,模型)的"在售"与"健康渠道数"
+	offered, enabled := h.channelMaps()
+
+	// 2) 近7天每(分组×模型)汇总
+	totals := h.totals(since)
+
+	// 3) 近7天每(分组×模型)分桶序列 → 心跳条
+	series := h.series(since)
+
+	// 4) 可见分组(令牌可选的)
+	vgs := h.visibleGroups(now, totals)
+
+	var groups []PublicGroup
+	overall := stUp
+	for _, vg := range vgs {
+		models := mergedModels(offered[vg.Key], totals, vg.Key)
+		if len(models) == 0 {
+			continue
+		}
+		var pms []PublicModel
+		gStatus := stUp
+		for _, mdl := range models {
+			pm := h.buildModel(vg.Key, mdl, enabled, totals, series, now, since)
+			pms = append(pms, pm)
+			gStatus = worse(gStatus, pm.Status)
+		}
+		sort.Slice(pms, func(i, j int) bool {
+			if pms[i].Provider != pms[j].Provider {
+				return pms[i].Provider < pms[j].Provider
+			}
+			return pms[i].Name < pms[j].Name
+		})
+		groups = append(groups, PublicGroup{Name: vg.Name, Status: gStatus, Models: pms})
+		overall = worse(overall, gStatus)
+	}
+
+	return &PublicSnapshot{
+		UpdatedAt: time.Unix(now, 0).UTC().Format(time.RFC3339),
+		Overall:   overall,
+		Groups:    groups,
+	}
+}
+
+func (h *handler) buildModel(grp, mdl string, enabled map[string]map[string]int, totals map[string]agg, series map[string][]seriesPt, now, since int64) PublicModel {
+	key := grp + "\x00" + mdl
+	a := totals[key]
+	total := a.Success + a.Anomaly + a.Failed
+	en := 0
+	if mm := enabled[grp]; mm != nil {
+		en = mm[mdl]
+	}
+
+	pm := PublicModel{Provider: provider(mdl), Name: pretty(mdl), Beats: buildBeats(series[key], now, since)}
+
+	// 拓扑优先:配置在册但 0 健康渠道 → 无可用渠道(不可用),不靠流量猜。
+	if en == 0 {
+		pm.Status = stDown
+		if n := len(pm.Beats); n > 0 {
+			pm.Beats[n-1] = stDown // 当下不可用,末桶标红
+		}
+		return pm
+	}
+	// 有健康渠道:据流量定状态。
+	if total < minSample {
+		pm.Status = stUp // 路径健康、流量太少,视为正常(不报数据不足以免吓用户)
+		return pm
+	}
+	denom := total - a.Err4xx // 排除用户侧 4xx
+	up := a.Success + a.Anomaly
+	upRate := 1.0
+	if denom > 0 {
+		upRate = float64(up) / float64(denom)
+	}
+	pm.Status = band(upRate)
+	pm.Uptime = &upRate
+	if lat := p50ms(a); lat > 0 {
+		pm.LatencyMs = &lat
+	}
+	return pm
+}
+
+// ---- 本地库查询 ----
+
+func (h *handler) channelMaps() (offered map[string]map[string]bool, enabled map[string]map[string]int) {
+	offered = map[string]map[string]bool{}
+	enabled = map[string]map[string]int{}
+	var rows []struct {
+		Status int    `gorm:"column:status"`
+		Groups string `gorm:"column:groups"`
+		Models string `gorm:"column:models"`
+	}
+	h.db.Raw("SELECT status, groups, models FROM channel_snaps").Scan(&rows)
+	for _, r := range rows {
+		gs := splitList(r.Groups)
+		ms := splitList(r.Models)
+		for _, g := range gs {
+			for _, m := range ms {
+				if offered[g] == nil {
+					offered[g] = map[string]bool{}
+				}
+				offered[g][m] = true
+				if r.Status == 1 {
+					if enabled[g] == nil {
+						enabled[g] = map[string]int{}
+					}
+					enabled[g][m]++
+				}
+			}
+		}
+	}
+	return
+}
+
+func (h *handler) totals(since int64) map[string]agg {
+	var rows []struct {
+		Grp     string `gorm:"column:grp"`
+		Model   string `gorm:"column:model"`
+		Success int64  `gorm:"column:success"`
+		Anomaly int64  `gorm:"column:anomaly"`
+		Failed  int64  `gorm:"column:failed"`
+		Err4xx  int64  `gorm:"column:err4xx"`
+		L1      int64  `gorm:"column:l1"`
+		L2      int64  `gorm:"column:l2"`
+		L5      int64  `gorm:"column:l5"`
+		L10     int64  `gorm:"column:l10"`
+		L30     int64  `gorm:"column:l30"`
+		L60     int64  `gorm:"column:l60"`
+		LInf    int64  `gorm:"column:linf"`
+		Mx      int64  `gorm:"column:mx"`
+	}
+	h.db.Raw(`SELECT grp, model_name AS model,
+		COALESCE(SUM(success),0) success, COALESCE(SUM(anomaly),0) anomaly, COALESCE(SUM(failed),0) failed,
+		COALESCE(SUM(err_4xx),0) err4xx,
+		COALESCE(SUM(lat_1),0) l1, COALESCE(SUM(lat_2),0) l2, COALESCE(SUM(lat_5),0) l5, COALESCE(SUM(lat_10),0) l10,
+		COALESCE(SUM(lat_30),0) l30, COALESCE(SUM(lat_60),0) l60, COALESCE(SUM(lat_inf),0) linf,
+		COALESCE(MAX(max_use_time),0) mx
+		FROM metric_samples WHERE bucket_ts >= ? GROUP BY grp, model_name`, since).Scan(&rows)
+	out := make(map[string]agg, len(rows))
+	for _, r := range rows {
+		out[r.Grp+"\x00"+r.Model] = agg{
+			Success: r.Success, Anomaly: r.Anomaly, Failed: r.Failed, Err4xx: r.Err4xx,
+			Lat: [7]int64{r.L1, r.L2, r.L5, r.L10, r.L30, r.L60, r.LInf}, Max: r.Mx,
+		}
+	}
+	return out
+}
+
+type seriesPt struct {
+	Ts   int64
+	Up   int64
+	Fail int64
+}
+
+func (h *handler) series(since int64) map[string][]seriesPt {
+	var rows []struct {
+		Grp      string `gorm:"column:grp"`
+		Model    string `gorm:"column:model"`
+		BucketTs int64  `gorm:"column:bucket_ts"`
+		Up       int64  `gorm:"column:up"`
+		Fail     int64  `gorm:"column:fail"`
+	}
+	h.db.Raw(`SELECT grp, model_name AS model, bucket_ts,
+		COALESCE(SUM(success+anomaly),0) up, COALESCE(SUM(failed),0) fail
+		FROM metric_samples WHERE bucket_ts >= ? GROUP BY grp, model_name, bucket_ts ORDER BY bucket_ts`, since).Scan(&rows)
+	out := map[string][]seriesPt{}
+	for _, r := range rows {
+		k := r.Grp + "\x00" + r.Model
+		out[k] = append(out[k], seriesPt{Ts: r.BucketTs, Up: r.Up, Fail: r.Fail})
+	}
+	return out
+}
+
+// visibleGroups 拉取 new-api 可见分组(令牌可选);失败则退回"近窗有流量的分组"。带缓存。
+func (h *handler) visibleGroups(now int64, totals map[string]agg) []vgroup {
+	h.grpMu.Lock()
+	if h.groups != nil && now-h.grpAt < groupsTTL {
+		g := h.groups
+		h.grpMu.Unlock()
+		return g
+	}
+	h.grpMu.Unlock()
+
+	vgs := h.fetchUsableGroups()
+	if len(vgs) == 0 { // 兜底:有流量的分组
+		seen := map[string]bool{}
+		for k := range totals {
+			g := strings.SplitN(k, "\x00", 2)[0]
+			if g != "" && !seen[g] {
+				seen[g] = true
+				vgs = append(vgs, vgroup{Key: g, Name: g})
+			}
+		}
+	}
+	sort.Slice(vgs, func(i, j int) bool { return vgs[i].Key < vgs[j].Key })
+
+	h.grpMu.Lock()
+	h.groups, h.grpAt = vgs, now
+	h.grpMu.Unlock()
+	return vgs
+}
+
+func (h *handler) fetchUsableGroups() []vgroup {
+	if h.cfg.NewAPIBaseURL == "" {
+		return nil
+	}
+	cl := &http.Client{Timeout: 5 * time.Second}
+	resp, err := cl.Get(strings.TrimRight(h.cfg.NewAPIBaseURL, "/") + "/api/pricing")
+	if err != nil {
+		return nil
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return nil
+	}
+	var body struct {
+		UsableGroup map[string]string `json:"usable_group"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		return nil
+	}
+	var vgs []vgroup
+	for k, desc := range body.UsableGroup {
+		if k == "" {
+			continue
+		}
+		name := desc
+		if name == "" {
+			name = k
+		}
+		vgs = append(vgs, vgroup{Key: k, Name: name})
+	}
+	return vgs
+}
+
+// ---- 纯函数辅助 ----
+
+// mergedModels 合并"配置在售"与"近窗有流量"的模型集合,得到该线路完整服务面。
+func mergedModels(offeredG map[string]bool, totals map[string]agg, grp string) []string {
+	set := map[string]bool{}
+	for m := range offeredG {
+		if m != "" && m != "*" {
+			set[m] = true
+		}
+	}
+	prefix := grp + "\x00"
+	for k := range totals {
+		if strings.HasPrefix(k, prefix) {
+			if m := strings.TrimPrefix(k, prefix); m != "" {
+				set[m] = true
+			}
+		}
+	}
+	out := make([]string, 0, len(set))
+	for m := range set {
+		out = append(out, m)
+	}
+	return out
+}
+
+// buildBeats 把 7 天序列压成 beatCount 个状态桶(老→新)。无流量桶视为正常。
+func buildBeats(pts []seriesPt, now, since int64) []int {
+	beats := make([]int, beatCount)
+	sums := make([]struct{ up, fail int64 }, beatCount)
+	slice := float64(now-since) / float64(beatCount)
+	for _, p := range pts {
+		idx := int(float64(p.Ts-since) / slice)
+		if idx < 0 {
+			idx = 0
+		}
+		if idx >= beatCount {
+			idx = beatCount - 1
+		}
+		sums[idx].up += p.Up
+		sums[idx].fail += p.Fail
+	}
+	for i := range beats {
+		t := sums[i].up + sums[i].fail
+		if t == 0 {
+			beats[i] = stUp
+			continue
+		}
+		beats[i] = band(float64(sums[i].up) / float64(t))
+	}
+	return beats
+}
+
+func band(rate float64) int {
+	switch {
+	case rate >= 0.99:
+		return stUp
+	case rate >= 0.95:
+		return stWarn
+	default:
+		return stDown
+	}
+}
+
+// worse 返回两个状态里"更严重"的。严重度:不可用 > 降级 > 数据不足 > 维护 > 正常。
+func worse(a, b int) int {
+	if sev(b) > sev(a) {
+		return b
+	}
+	return a
+}
+
+func sev(s int) int {
+	switch s {
+	case stDown:
+		return 4
+	case stWarn:
+		return 3
+	case stNoData:
+		return 2
+	case stMaint:
+		return 1
+	default: // stUp
+		return 0
+	}
+}
+
+func provider(model string) string {
+	m := strings.ToLower(model)
+	switch {
+	case strings.HasPrefix(m, "claude"):
+		return "anthropic"
+	case strings.HasPrefix(m, "gemini"):
+		return "google"
+	case strings.HasPrefix(m, "deepseek"):
+		return "deepseek"
+	case strings.HasPrefix(m, "gpt"), strings.HasPrefix(m, "o1"), strings.HasPrefix(m, "o3"),
+		strings.HasPrefix(m, "o4"), strings.HasPrefix(m, "chatgpt"), strings.HasPrefix(m, "dall"),
+		strings.Contains(m, "codex"):
+		return "openai"
+	default:
+		return "other"
+	}
+}
+
+var dateSuffix = regexp.MustCompile(`-\d{8}$`)
+
+func pretty(model string) string { return dateSuffix.ReplaceAllString(model, "") }
+
+func splitList(s string) []string {
+	if s == "" {
+		return nil
+	}
+	parts := strings.Split(s, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+var latEdges = []int64{1, 2, 5, 10, 30, 60}
+
+// p50ms 由总延迟直方图近似 P50(秒),返回毫秒。
+func p50ms(a agg) int {
+	var total int64
+	for _, c := range a.Lat {
+		total += c
+	}
+	if total == 0 {
+		return 0
+	}
+	target := float64(total) * 0.5
+	var cum, lower float64
+	for i, c := range a.Lat {
+		upper := float64(a.Max)
+		if i < len(latEdges) {
+			upper = float64(latEdges[i])
+		}
+		if upper < lower {
+			upper = lower
+		}
+		if cum+float64(c) >= target {
+			if c == 0 {
+				return int(upper * 1000)
+			}
+			return int((lower + (target-cum)/float64(c)*(upper-lower)) * 1000)
+		}
+		cum += float64(c)
+		lower = upper
+	}
+	return int(lower * 1000)
+}

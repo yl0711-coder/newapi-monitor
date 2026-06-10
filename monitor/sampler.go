@@ -31,7 +31,7 @@ func (m *Monitor) startSampler(ctx context.Context) {
 	if m.prodDB == nil {
 		return
 	}
-	m.refreshChannelNames()
+	m.refreshChannels()
 
 	if h := m.cfg.BackfillHours; h > 0 {
 		if n, err := m.sampleWindow(ctx, int64(h)*3600); err != nil {
@@ -81,7 +81,7 @@ func (m *Monitor) loop(ctx context.Context, interval time.Duration) {
 			m.evaluateAlerts(time.Now().Unix())
 			ticks++
 			if ticks%(int(600/interval.Seconds())+1) == 0 {
-				m.refreshChannelNames()
+				m.refreshChannels()
 				if d := m.cfg.RetentionDays; d > 0 {
 					cutoff := time.Now().Unix() - int64(d)*86400
 					if n, err := m.pruneOlderThan(cutoff); err == nil && n > 0 {
@@ -220,31 +220,43 @@ GROUP BY bucket, token_name`
 	return m.upsertTokenSamples(batch)
 }
 
-// refreshChannelNames 刷新渠道 id->name 映射(低频,失败则保留旧值)。
-func (m *Monitor) refreshChannelNames() {
+// refreshChannels 刷新渠道 id->name 映射,并把渠道健康快照(状态/分组/模型)写入本地库,
+// 供对外看板派生"无可用渠道"。低频、失败保留旧值。仅读非密字段(无 key/凭证)。
+func (m *Monitor) refreshChannels() {
 	if m.prodDB == nil {
 		return
 	}
 	cctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	rows, err := m.prodDB.QueryContext(cctx, "SELECT id, name FROM channels")
+	rows, err := m.prodDB.QueryContext(cctx, "SELECT id, name, status, `group`, models FROM channels")
 	if err != nil {
 		return
 	}
 	defer rows.Close()
 	names := map[string]string{}
+	var snaps []ChannelSnap
+	now := time.Now().Unix()
 	for rows.Next() {
-		var id int
-		var name sql.NullString
-		if err := rows.Scan(&id, &name); err != nil {
+		var id, status int
+		var name, grp, models sql.NullString
+		if err := rows.Scan(&id, &name, &status, &grp, &models); err != nil {
 			return
 		}
 		names[strconv.Itoa(id)] = name.String
+		snaps = append(snaps, ChannelSnap{Id: id, Status: status, Groups: grp.String, Models: models.String, UpdatedAt: now})
+	}
+	if err := rows.Err(); err != nil {
+		return
 	}
 	if len(names) > 0 {
 		m.chMu.Lock()
 		m.chNames = names
 		m.chMu.Unlock()
+	}
+	if len(snaps) > 0 {
+		if err := m.replaceChannelSnaps(snaps, now); err != nil {
+			slog.Warn("渠道健康快照写入失败(忽略,不影响监控)", "err", err)
+		}
 	}
 }
 

@@ -7,6 +7,8 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+
+	"github.com/yl0711-coder/newapi-monitor/monitor/public"
 )
 
 // server.go:监控自带的 HTTP 层。页面是自包含的静态 HTML(内嵌),数据走 /data JSON。
@@ -121,6 +123,15 @@ func (m *Monitor) testAlertHandler(c *gin.Context) {
 
 func (m *Monitor) servePage(c *gin.Context) {
 	c.Data(http.StatusOK, "text/html; charset=utf-8", []byte(pageHTML))
+}
+
+// RegisterPublicBoard 挂载对外公开看板(无鉴权:/status 页面 + /public/status JSON)。
+// 看板是独立 public 包,只拿到本地采样库与少量配置,绝不触及内部结构与生产库。
+func (m *Monitor) RegisterPublicBoard(r *gin.Engine) {
+	public.Register(r, m.storeDB, public.Config{
+		NewAPIBaseURL: m.cfg.NewAPIBaseURL,
+		SiteName:      m.cfg.SiteName,
+	})
 }
 
 // serveLongTrend 返回小时级长期序列(默认近 30 天),供长期趋势图按需拉取(不进 30s 轮询)。

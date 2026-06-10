@@ -80,6 +80,16 @@ type HourSample struct {
 	SumUseTime int64
 }
 
+// ChannelSnap 渠道健康快照:采样器周期性从生产 channels 表读入(id/状态/分组/模型),
+// 供对外看板(public 包)派生"某线路×模型有无可用渠道"。仅存路由与状态,【无任何密钥】。
+type ChannelSnap struct {
+	Id        int    `gorm:"primaryKey;autoIncrement:false"`
+	Status    int    // new-api: 1启用 / 2手动禁用 / 3自动禁用
+	Groups    string `gorm:"size:512"`  // 逗号分隔分组
+	Models    string `gorm:"type:text"` // 逗号分隔模型
+	UpdatedAt int64  `gorm:"index"`
+}
+
 // 直方图档位上界。lat 单位秒,ttft 单位毫秒。
 var (
 	latEdges  = []int{1, 2, 5, 10, 30, 60}
@@ -96,7 +106,7 @@ func (m *Monitor) openStore(path string) error {
 	if err != nil {
 		return fmt.Errorf("打开本地采样库失败: %w", err)
 	}
-	if err := db.AutoMigrate(&MetricSample{}, &TokenSample{}, &HourSample{}, &AlertConfig{}, &AlertLog{}); err != nil {
+	if err := db.AutoMigrate(&MetricSample{}, &TokenSample{}, &HourSample{}, &ChannelSnap{}, &AlertConfig{}, &AlertLog{}); err != nil {
 		return fmt.Errorf("表迁移失败: %w", err)
 	}
 	m.storeDB = db
@@ -124,6 +134,20 @@ func (m *Monitor) upsertTokenSamples(rows []TokenSample) error {
 		Columns:   []clause.Column{{Name: "bucket_ts"}, {Name: "token_name"}},
 		UpdateAll: true,
 	}).CreateInBatches(rows, 200).Error
+}
+
+// replaceChannelSnaps 用本轮读到的渠道快照覆盖本地表:幂等 UPSERT + 删除本轮未出现的(已删渠道)。
+func (m *Monitor) replaceChannelSnaps(rows []ChannelSnap, now int64) error {
+	if len(rows) == 0 {
+		return nil
+	}
+	if err := m.storeDB.Clauses(clause.OnConflict{
+		Columns:   []clause.Column{{Name: "id"}},
+		UpdateAll: true,
+	}).CreateInBatches(rows, 200).Error; err != nil {
+		return err
+	}
+	return m.storeDB.Where("updated_at < ?", now).Delete(&ChannelSnap{}).Error
 }
 
 func (m *Monitor) pruneOlderThan(cutoffTs int64) (int64, error) {
