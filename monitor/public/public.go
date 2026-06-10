@@ -9,6 +9,7 @@ package public
 
 import (
 	"encoding/json"
+	"log/slog"
 	"net/http"
 	"regexp"
 	"sort"
@@ -230,7 +231,9 @@ func (h *handler) channelMaps() (offered map[string]map[string]bool, enabled map
 		Groups string `gorm:"column:groups"`
 		Models string `gorm:"column:models"`
 	}
-	h.db.Raw("SELECT status, groups, models FROM channel_snaps").Scan(&rows)
+	if err := h.db.Raw("SELECT status, groups, models FROM channel_snaps").Scan(&rows).Error; err != nil {
+		slog.Warn("看板:渠道快照查询失败(降级为空)", "err", err)
+	}
 	for _, r := range rows {
 		gs := splitList(r.Groups)
 		ms := splitList(r.Models)
@@ -269,13 +272,15 @@ func (h *handler) totals(since int64) map[string]agg {
 		LInf    int64  `gorm:"column:linf"`
 		Mx      int64  `gorm:"column:mx"`
 	}
-	h.db.Raw(`SELECT grp, model_name AS model,
+	if err := h.db.Raw(`SELECT grp, model_name AS model,
 		COALESCE(SUM(success),0) success, COALESCE(SUM(anomaly),0) anomaly, COALESCE(SUM(failed),0) failed,
 		COALESCE(SUM(err_4xx),0) err4xx,
 		COALESCE(SUM(lat_1),0) l1, COALESCE(SUM(lat_2),0) l2, COALESCE(SUM(lat_5),0) l5, COALESCE(SUM(lat_10),0) l10,
 		COALESCE(SUM(lat_30),0) l30, COALESCE(SUM(lat_60),0) l60, COALESCE(SUM(lat_inf),0) linf,
 		COALESCE(MAX(max_use_time),0) mx
-		FROM metric_samples WHERE bucket_ts >= ? GROUP BY grp, model_name`, since).Scan(&rows)
+		FROM metric_samples WHERE bucket_ts >= ? GROUP BY grp, model_name`, since).Scan(&rows).Error; err != nil {
+		slog.Warn("看板:分组×模型汇总查询失败(降级为空)", "err", err)
+	}
 	out := make(map[string]agg, len(rows))
 	for _, r := range rows {
 		out[r.Grp+"\x00"+r.Model] = agg{
@@ -300,9 +305,11 @@ func (h *handler) series(since int64) map[string][]seriesPt {
 		Up       int64  `gorm:"column:up"`
 		Fail     int64  `gorm:"column:fail"`
 	}
-	h.db.Raw(`SELECT grp, model_name AS model, bucket_ts,
+	if err := h.db.Raw(`SELECT grp, model_name AS model, bucket_ts,
 		COALESCE(SUM(success+anomaly),0) up, COALESCE(SUM(failed),0) fail
-		FROM metric_samples WHERE bucket_ts >= ? GROUP BY grp, model_name, bucket_ts ORDER BY bucket_ts`, since).Scan(&rows)
+		FROM metric_samples WHERE bucket_ts >= ? GROUP BY grp, model_name, bucket_ts ORDER BY bucket_ts`, since).Scan(&rows).Error; err != nil {
+		slog.Warn("看板:分桶序列查询失败(降级为空)", "err", err)
+	}
 	out := map[string][]seriesPt{}
 	for _, r := range rows {
 		k := r.Grp + "\x00" + r.Model

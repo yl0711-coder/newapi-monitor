@@ -25,6 +25,10 @@
   .brand .logo{width:34px;height:34px;border-radius:9px;background:linear-gradient(135deg,var(--brand1),var(--brand2));display:grid;place-items:center;color:#fff;font-size:18px;font-weight:800}
   .brand .t1{font-size:20px;font-weight:750;line-height:1.1}
   .brand .t2{font-size:12px;color:var(--muted)}
+  .headright{display:flex;align-items:center;gap:12px}
+  .langtog{display:inline-flex;background:#eef1f5;border-radius:9px;padding:2px}
+  .langtog button{border:0;background:transparent;color:var(--muted);font-size:12px;font-weight:600;padding:4px 9px;border-radius:7px;cursor:pointer}
+  .langtog button.on{background:#fff;color:var(--ink);box-shadow:0 1px 2px rgba(0,0,0,.08)}
   .updated{font-size:12px;color:var(--faint);text-align:right}
   .updated b{color:var(--muted);font-weight:600}
   .banner{display:flex;align-items:center;gap:13px;border-radius:14px;padding:15px 20px;box-shadow:var(--shadow);font-weight:650;font-size:17px;margin-bottom:14px}
@@ -45,7 +49,6 @@
   .search{display:flex;align-items:center;gap:8px;background:#fff;border:1px solid var(--line);border-radius:11px;padding:10px 13px;box-shadow:var(--shadow)}
   .search input{border:0;outline:0;width:100%;font-size:14px;background:transparent;color:var(--ink)}
   .search svg{width:16px;height:16px;color:var(--faint);flex:none}
-  /* 分组卡片 */
   .gcards{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:13px}
   .gcard{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:15px 16px;box-shadow:var(--shadow);cursor:pointer;transition:transform .1s,box-shadow .1s;display:flex;flex-direction:column;gap:11px}
   .gcard:hover{transform:translateY(-2px);box-shadow:0 7px 20px rgba(16,24,40,.1)}
@@ -57,7 +60,6 @@
   .rec-up{margin-left:auto;font-variant-numeric:tabular-nums;color:var(--ok-ink);font-weight:700}
   .gcard-foot{display:flex;justify-content:space-between;align-items:center;font-size:12px;color:var(--muted);padding-top:2px;border-top:1px solid var(--line)}
   .gcard-foot .arrow{color:var(--brand2);font-weight:600}
-  /* 通用卡片/胶囊 */
   .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:13px}
   .card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:15px 16px 13px;box-shadow:var(--shadow);display:flex;flex-direction:column;gap:11px}
   .card.bad{border-color:#f3c9cd} .card.warn{border-color:#f3e2c0}
@@ -83,7 +85,6 @@
   .beat:hover{transform:scale(1.5);opacity:.85}
   .beat.ok{background:var(--beat-ok)} .beat.warn{background:var(--beat-warn)} .beat.bad{background:var(--beat-bad)} .beat.maint{background:var(--beat-maint)} .beat.na{background:var(--beat-na)}
   .hbcap{display:flex;justify-content:space-between;font-size:10.5px;color:var(--faint);margin-top:5px}
-  /* 搜索结果(跨线路对比)*/
   .sgroup{margin-bottom:18px}
   .sgroup-h{font-size:14px;font-weight:700;margin:0 2px 9px;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
   .sgroup-h .cnt{color:var(--faint);font-weight:500;font-size:12.5px}
@@ -93,13 +94,11 @@
   .srow .tag{font-size:10.5px;font-weight:700;color:var(--ok-ink);background:var(--ok-bg);padding:1px 7px;border-radius:999px}
   .srow .sm{margin-left:auto;display:flex;gap:16px;align-items:center;font-size:12.5px;color:var(--muted)}
   .msg{text-align:center;color:var(--faint);font-size:13px;padding:40px 0}
-  /* 弹层 */
   .modal-bg{position:fixed;inset:0;background:rgba(17,24,39,.45);display:none;z-index:40;overflow:auto;padding:20px}
   .modal-bg.on{display:block}
   .modal{max-width:1000px;margin:24px auto;background:var(--bg);border-radius:16px;padding:20px 20px 24px;box-shadow:0 24px 70px rgba(0,0,0,.35)}
   .modal-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:6px}
   .modal-head .mt{font-size:18px;font-weight:750;word-break:break-all}
-  .modal-head .mc{font-size:12px;color:var(--muted)}
   .xbtn{border:1px solid var(--line);background:#fff;width:34px;height:34px;border-radius:9px;cursor:pointer;font-size:19px;line-height:1;color:var(--muted);flex:none}
   .modal-sub{font-size:12px;color:var(--faint);margin-bottom:14px}
   .legend{display:flex;gap:18px;flex-wrap:wrap;justify-content:center;margin-top:32px;font-size:12.5px;color:var(--muted)}
@@ -115,32 +114,25 @@
 <div class="wrap">
   <div class="head">
     <div class="brand"><span class="logo">N</span>
-      <div><div class="t1" id="title">NexusAPI 服务状态</div><div class="t2">上游模型实时可用性</div></div></div>
-    <div class="updated">最近更新 <b id="upd">--:--:--</b><br><span id="cd">自动刷新</span></div>
+      <div><div class="t1" id="title"></div><div class="t2" id="subtitle"></div></div></div>
+    <div class="headright">
+      <div class="langtog" id="langtog"><button data-l="zh">中</button><button data-l="en">EN</button></div>
+      <div class="updated"><span id="updLabel"></span> <b id="upd">--:--:--</b><br><span id="cd"></span></div>
+    </div>
   </div>
   <div id="banner" class="banner ok"></div>
   <div id="events" class="events"></div>
   <div id="summary" class="summary"></div>
   <div class="tools">
     <div class="search"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg>
-      <input id="q" placeholder="搜索模型,跨线路对比稳定性(如 gpt-5.5 / claude-opus)…" autocomplete="off"></div>
+      <input id="q" autocomplete="off"></div>
   </div>
   <div id="groups"></div>
-  <div class="legend">
-    <span class="li"><span class="sw" style="background:var(--beat-ok)"></span>正常</span>
-    <span class="li"><span class="sw" style="background:var(--beat-warn)"></span>性能下降</span>
-    <span class="li"><span class="sw" style="background:var(--beat-bad)"></span>不可用</span>
-    <span class="li"><span class="sw" style="background:var(--beat-maint)"></span>维护中</span>
-    <span class="li"><span class="sw" style="background:var(--beat-na)"></span>数据不足</span>
-  </div>
-  <div class="rule">
-    线路 = 创建令牌时所选「分组」;同一模型在不同线路可能状态不同,可搜索某模型对比各线路稳定性后自行选择。状态按近 7 天「可用率」判定:≥99% 正常 · 95–99% 性能下降 · &lt;95% 不可用。
-    可用率 = 成功请求 /(总请求 − 用户侧错误);某线路下若某模型暂无可用上游,即显示「不可用」。
-  </div>
-  <div class="foot">由 NexusAPI 提供</div>
+  <div class="legend" id="legend"></div>
+  <div class="rule" id="rule"></div>
+  <div class="foot" id="foot"></div>
 </div>
 
-<!-- 分组详情弹层 -->
 <div id="modal" class="modal-bg" onclick="closeModal(event)">
   <div class="modal">
     <div class="modal-head"><div><span class="mt" id="mTitle"></span></div>
@@ -152,7 +144,49 @@
 <div id="tip"></div>
 
 <script>
-const ST = { 1:{c:"ok",t:"正常"}, 2:{c:"warn",t:"性能下降"}, 0:{c:"bad",t:"不可用"}, 3:{c:"maint",t:"维护中"}, "-1":{c:"na",t:"数据不足"} };
+/* ===== 国际化 ===== */
+const I18N = {
+  zh: {
+    title:"NexusAPI 服务状态", subtitle:"上游模型实时可用性",
+    updated:"最近更新", autorefresh:"自动刷新", refresh_in:"{n} 秒后自动刷新",
+    st_ok:"正常", st_warn:"性能下降", st_bad:"不可用", st_maint:"维护中", st_na:"数据不足",
+    banner_ok:"所有服务运行正常", banner_warn:"部分服务性能下降", banner_bad:"部分服务当前不可用", banner_maint:"部分服务维护中",
+    sum_uptime:"整体可用率 · 近7天", sum_lines:"线路", sum_warn:"性能下降", sum_bad:"不可用",
+    search_ph:"搜索模型,跨线路对比稳定性(如 gpt-5.5 / claude-opus)…",
+    rec_label:"推荐 · 最稳定模型", n_models:"{n} 个模型", view_all:"查看全部 →",
+    m_avail:"可用性 · 近7天", m_latency:"响应延迟", cap_ago:"7 天前", cap_now:"现在",
+    on_n_lines:"· 在 {n} 条线路提供", best:"最稳",
+    no_match:"没有匹配「{q}」的模型", no_data:"暂无数据", err:"暂时无法获取服务状态,请稍后刷新",
+    modal_sub:"线路 = 创建令牌时所选分组「{name}」· 共 {n} 个模型",
+    leg_ok:"正常", leg_warn:"性能下降", leg_bad:"不可用", leg_maint:"维护中", leg_na:"数据不足",
+    rule:"线路 = 创建令牌时所选「分组」;同一模型在不同线路可能状态不同,可搜索某模型对比各线路稳定性后自行选择。状态按近 7 天「可用率」判定:≥99% 正常 · 95–99% 性能下降 · <95% 不可用。可用率 = 成功请求 /(总请求 − 用户侧错误);某线路下若某模型暂无可用上游,即显示「不可用」。",
+    foot:"由 NexusAPI 提供",
+  },
+  en: {
+    title:"NexusAPI Service Status", subtitle:"Real-time upstream model availability",
+    updated:"Last updated", autorefresh:"Auto-refresh", refresh_in:"Refreshing in {n}s",
+    st_ok:"Operational", st_warn:"Degraded", st_bad:"Outage", st_maint:"Maintenance", st_na:"No data",
+    banner_ok:"All systems operational", banner_warn:"Partial performance degradation", banner_bad:"Partial service outage", banner_maint:"Maintenance in progress",
+    sum_uptime:"Overall uptime · 7d", sum_lines:"Lines", sum_warn:"Degraded", sum_bad:"Outage",
+    search_ph:"Search a model to compare stability across lines (e.g. gpt-5.5 / claude-opus)…",
+    rec_label:"Recommended · most stable", n_models:"{n} models", view_all:"View all →",
+    m_avail:"Uptime · 7d", m_latency:"Latency", cap_ago:"7 days ago", cap_now:"now",
+    on_n_lines:"· on {n} lines", best:"Best",
+    no_match:'No models matching "{q}"', no_data:"No data yet", err:"Service status temporarily unavailable, please refresh later.",
+    modal_sub:'Line = the group selected when creating a token ("{name}") · {n} models',
+    leg_ok:"Operational", leg_warn:"Degraded", leg_bad:"Outage", leg_maint:"Maintenance", leg_na:"No data",
+    rule:"A line = the group selected when creating a token; the same model may differ across lines — search a model to compare and pick the most stable line. Status is based on 7-day uptime: ≥99% Operational · 95–99% Degraded · <95% Outage. Uptime = successful / (total − user-side errors); if a model has no usable upstream on a line, it shows Outage.",
+    foot:"Powered by NexusAPI",
+  },
+};
+let lang = localStorage.getItem("lang") || ((navigator.language||"").toLowerCase().startsWith("zh") ? "zh" : "en");
+function t(k){ return (I18N[lang] && I18N[lang][k] != null) ? I18N[lang][k] : (I18N.zh[k] != null ? I18N.zh[k] : k); }
+function fmt(k, vars){ return t(k).replace(/\{(\w+)\}/g, (_,n)=> (vars && vars[n]!=null) ? vars[n] : "{"+n+"}"); }
+
+/* ===== 状态/常量 ===== */
+const STC = { 1:"ok", 2:"warn", 0:"bad", 3:"maint", "-1":"na" };       // 状态码 → CSS 类(与语言无关)
+const stClass = s => STC[s] || "na";
+const stLabel = s => t("st_"+stClass(s));
 const SEV = { 0:4, 2:3, "-1":2, 3:1, 1:0 };
 const ICON = {
   ok:'<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>',
@@ -160,17 +194,18 @@ const ICON = {
   bad:'<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="m15 9-6 6M9 9l6 6"/></svg>',
   maint:'<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M14.7 6.3a4 4 0 0 0-5.4 5.3L4 17l3 3 5.4-5.3a4 4 0 0 0 5.3-5.4l-2.6 2.6-2-2 2.6-2.6Z"/></svg>',
 };
-const PVN = { anthropic:"Anthropic", openai:"OpenAI", google:"Google", deepseek:"DeepSeek", other:"模型" };
+const PVN = { anthropic:"Anthropic", openai:"OpenAI", google:"Google", deepseek:"DeepSeek", other:"" };
 const WIN_DAYS = 7, PER = 7;
 const state = { snap:null, q:"" };
 
 const worst = arr => arr.reduce((w,s)=> SEV[s]>SEV[w]?s:w, 1);
 function clock(){ const n=new Date(); return [n.getHours(),n.getMinutes(),n.getSeconds()].map(x=>String(x).padStart(2,"0")).join(":"); }
 function esc(s){ return String(s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
-function beatTime(i,n){ const slice=WIN_DAYS*86400000/n; const t=new Date(Date.now()-WIN_DAYS*86400000+i*slice);
-  return `${t.getMonth()+1}/${t.getDate()} ${String(t.getHours()).padStart(2,"0")}:00`; }
+function beatTime(i,n){ const slice=WIN_DAYS*86400000/n; const d=new Date(Date.now()-WIN_DAYS*86400000+i*slice);
+  return `${d.getMonth()+1}/${d.getDate()} ${String(d.getHours()).padStart(2,"0")}:00`; }
 function upStr(m){ return m.uptime==null?"—":(m.uptime*100).toFixed(2)+"%"; }
 function latStr(m){ return m.latency_ms==null?"—":(m.latency_ms/1000).toFixed(1)+"s"; }
+function pvLabel(p){ return PVN[p] || (lang==="zh"?"其他":"Other"); }
 
 function fitBeats(beats,width){
   const max=Math.max(8,Math.floor((width+2)/PER)); const n=Math.min(max,beats.length||1);
@@ -182,10 +217,9 @@ function fitBeats(beats,width){
 function paintBars(){
   document.querySelectorAll(".hbbar").forEach(bar=>{
     const beats=JSON.parse(bar.dataset.beats||"[]"); const bs=fitBeats(beats,bar.clientWidth||280);
-    bar.innerHTML=bs.map((s,i)=>`<span class="beat ${ST[s].c}" data-i="${i}" data-n="${bs.length}" data-s="${s}"></span>`).join("");
+    bar.innerHTML=bs.map((s,i)=>`<span class="beat ${stClass(s)}" data-i="${i}" data-n="${bs.length}" data-s="${s}"></span>`).join("");
   });
 }
-// 该分组最稳定的推荐模型:优先"正常且可用率最高",其次任一正常,再次最不严重的
 function recommend(models){
   const ops=models.filter(m=>m.status===1);
   const rated=ops.filter(m=>m.uptime!=null).sort((a,b)=>b.uptime-a.uptime);
@@ -194,57 +228,69 @@ function recommend(models){
   return models.slice().sort((a,b)=>SEV[a.status]-SEV[b.status])[0];
 }
 function modelCard(m){
-  return `<div class="card ${ST[m.status].c}">
-    <div class="card-top"><div><span class="pvbadge pv-${m.provider}">${PVN[m.provider]||"模型"}</span><div class="mname">${esc(m.name)}</div></div>
-      <span class="pill ${ST[m.status].c}"><span class="dot"></span>${ST[m.status].t}</span></div>
+  return `<div class="card ${stClass(m.status)}">
+    <div class="card-top"><div><span class="pvbadge pv-${m.provider}">${pvLabel(m.provider)}</span><div class="mname">${esc(m.name)}</div></div>
+      <span class="pill ${stClass(m.status)}"><span class="dot"></span>${stLabel(m.status)}</span></div>
     <div class="metrics">
-      <div class="metric"><div class="k">可用性 · 近7天</div><div class="v ${m.uptime==null?"muted":""}">${upStr(m)}</div></div>
-      <div class="metric"><div class="k">响应延迟</div><div class="v ${m.latency_ms==null?"muted":""}">${latStr(m)}</div></div></div>
+      <div class="metric"><div class="k">${t("m_avail")}</div><div class="v ${m.uptime==null?"muted":""}">${upStr(m)}</div></div>
+      <div class="metric"><div class="k">${t("m_latency")}</div><div class="v ${m.latency_ms==null?"muted":""}">${latStr(m)}</div></div></div>
     <div class="hbwrap"><div class="hbbar" data-beats='${JSON.stringify(m.beats||[])}'></div>
-      <div class="hbcap"><span>7 天前</span><span>现在</span></div></div>
+      <div class="hbcap"><span>${t("cap_ago")}</span><span>${t("cap_now")}</span></div></div>
   </div>`;
 }
 
+function applyStatic(){
+  document.documentElement.lang = lang==="zh" ? "zh-CN" : "en";
+  document.title = t("title");
+  document.getElementById("title").textContent = t("title");
+  document.getElementById("subtitle").textContent = t("subtitle");
+  document.getElementById("updLabel").textContent = t("updated");
+  document.getElementById("q").placeholder = t("search_ph");
+  document.getElementById("rule").textContent = t("rule");
+  document.getElementById("foot").textContent = t("foot");
+  document.getElementById("legend").innerHTML =
+    [["ok","leg_ok"],["warn","leg_warn"],["bad","leg_bad"],["maint","leg_maint"],["na","leg_na"]]
+    .map(([c,k])=>`<span class="li"><span class="sw" style="background:var(--beat-${c})"></span>${t(k)}</span>`).join("");
+  [...document.getElementById("langtog").children].forEach(b=>b.classList.toggle("on",b.dataset.l===lang));
+}
+
 function renderTop(){
-  const snap=state.snap;
-  const all=snap.groups.flatMap(g=>g.models);
-  const ov=snap.overall;
-  const txt={1:"所有服务运行正常",2:"部分服务性能下降",0:"部分服务当前不可用",3:"部分服务维护中"};
-  const b=document.getElementById("banner"); b.className="banner "+ST[ov].c;
-  b.innerHTML=`${ICON[ST[ov].c]||""}<span>${txt[ov]||"服务状态"}</span>`;
+  const snap=state.snap, all=snap.groups.flatMap(g=>g.models), ov=snap.overall;
+  const bk={1:"banner_ok",2:"banner_warn",0:"banner_bad",3:"banner_maint"};
+  const b=document.getElementById("banner"); b.className="banner "+stClass(ov);
+  b.innerHTML=`${ICON[stClass(ov)]||""}<span>${t(bk[ov]||"banner_ok")}</span>`;
 
   const evs=[];
   snap.groups.forEach(g=>g.models.forEach(m=>{ if(m.status===0||m.status===2||m.status===3) evs.push({line:g.name,model:m.name,status:m.status}); }));
   evs.sort((a,b)=>SEV[b.status]-SEV[a.status]);
   document.getElementById("events").innerHTML=evs.slice(0,8).map(e=>`
-    <div class="event ${ST[e.status].c}"><span class="etag">${ST[e.status].t}</span>
-      <span><b>${esc(e.line)}</b> · ${esc(e.model)}</span></div>`).join("")
-    + (evs.length>8?`<div class="event"><span>…另有 ${evs.length-8} 项,见各线路详情</span></div>`:"");
+    <div class="event ${stClass(e.status)}"><span class="etag">${stLabel(e.status)}</span>
+      <span><b>${esc(e.line)}</b> · ${esc(e.model)}</span></div>`).join("");
 
-  const cnt={ok:0,warn:0,bad:0}; all.forEach(m=>{ const c=ST[m.status].c; if(c==="ok"||c==="maint"||c==="na")cnt.ok++; else cnt[c]++; });
+  const cnt={ok:0,warn:0,bad:0}; all.forEach(m=>{ const c=stClass(m.status); if(c==="ok"||c==="maint"||c==="na")cnt.ok++; else cnt[c]++; });
   const rated=all.filter(m=>m.uptime!=null); const avg=rated.length?rated.reduce((s,m)=>s+m.uptime,0)/rated.length:1;
   document.getElementById("summary").innerHTML=`
-    <div class="stat"><div class="k">整体可用率 · 近7天</div><div class="v">${(avg*100).toFixed(2)}<small>%</small></div></div>
-    <div class="stat"><div class="k">线路</div><div class="v">${snap.groups.length}</div></div>
-    <div class="stat warn"><div class="k">性能下降</div><div class="v">${cnt.warn}</div></div>
-    <div class="stat bad"><div class="k">不可用</div><div class="v">${cnt.bad}</div></div>`;
+    <div class="stat"><div class="k">${t("sum_uptime")}</div><div class="v">${(avg*100).toFixed(2)}<small>%</small></div></div>
+    <div class="stat"><div class="k">${t("sum_lines")}</div><div class="v">${snap.groups.length}</div></div>
+    <div class="stat warn"><div class="k">${t("sum_warn")}</div><div class="v">${cnt.warn}</div></div>
+    <div class="stat bad"><div class="k">${t("sum_bad")}</div><div class="v">${cnt.bad}</div></div>`;
 }
 
 function renderGroups(host){
   host.innerHTML=`<div class="gcards">`+state.snap.groups.map((g,gi)=>{
     const gs=worst(g.models.map(m=>m.status));
     const rec=recommend(g.models);
-    const recUp = rec.uptime==null ? ST[rec.status].t : (rec.uptime*100).toFixed(2)+"%";
-    return `<div class="gcard ${ST[gs].c}" onclick="openModal(${gi})">
+    const recUp = rec.uptime==null ? stLabel(rec.status) : (rec.uptime*100).toFixed(2)+"%";
+    return `<div class="gcard ${stClass(gs)}" onclick="openModal(${gi})">
       <div class="gcard-top"><span class="gtitle">${esc(g.name)}</span>
-        <span class="pill sm ${ST[gs].c}"><span class="dot"></span>${ST[gs].t}</span></div>
+        <span class="pill sm ${stClass(gs)}"><span class="dot"></span>${stLabel(gs)}</span></div>
       <div>
-        <div class="rec-label">推荐 · 最稳定模型</div>
-        <div class="rec-model"><span class="pvbadge pv-${rec.provider}">${PVN[rec.provider]||"模型"}</span>
+        <div class="rec-label">${t("rec_label")}</div>
+        <div class="rec-model"><span class="pvbadge pv-${rec.provider}">${pvLabel(rec.provider)}</span>
           <span style="word-break:break-all">${esc(rec.name)}</span><span class="rec-up">${recUp}</span></div>
       </div>
       <div class="hbbar" data-beats='${JSON.stringify(rec.beats||[])}'></div>
-      <div class="gcard-foot"><span>${g.models.length} 个模型</span><span class="arrow">查看全部 →</span></div>
+      <div class="gcard-foot"><span>${fmt("n_models",{n:g.models.length})}</span><span class="arrow">${t("view_all")}</span></div>
     </div>`;
   }).join("")+`</div>`;
   paintBars();
@@ -258,18 +304,18 @@ function renderSearch(host,q){
     }
   }));
   const names=Object.keys(byModel).sort();
-  if(!names.length){ host.innerHTML=`<div class="msg">没有匹配「${esc(q)}」的模型</div>`; return; }
+  if(!names.length){ host.innerHTML=`<div class="msg">${fmt("no_match",{q:esc(q)})}</div>`; return; }
   host.innerHTML=names.map(n=>{
     const info=byModel[n];
     const rows=info.rows.slice().sort((a,b)=>{ if(SEV[a.status]!==SEV[b.status])return SEV[a.status]-SEV[b.status]; return (b.uptime||0)-(a.uptime||0); });
     return `<div class="sgroup">
-      <div class="sgroup-h"><span class="pvbadge pv-${info.provider}">${PVN[info.provider]||"模型"}</span>${esc(n)}<span class="cnt">· 在 ${rows.length} 条线路提供</span></div>
+      <div class="sgroup-h"><span class="pvbadge pv-${info.provider}">${pvLabel(info.provider)}</span>${esc(n)}<span class="cnt">${fmt("on_n_lines",{n:rows.length})}</span></div>
       ${rows.map((r,i)=>`<div class="srow ${i===0&&r.status===1?"best":""}">
-        <span class="sline">${esc(r.line)}</span>${i===0&&r.status===1?`<span class="tag">最稳</span>`:""}
+        <span class="sline">${esc(r.line)}</span>${i===0&&r.status===1?`<span class="tag">${t("best")}</span>`:""}
         <span class="sm">
-          <span class="pill sm ${ST[r.status].c}"><span class="dot"></span>${ST[r.status].t}</span>
-          <span>可用率 ${r.uptime==null?"—":(r.uptime*100).toFixed(2)+"%"}</span>
-          <span>延迟 ${r.latency_ms==null?"—":(r.latency_ms/1000).toFixed(1)+"s"}</span>
+          <span class="pill sm ${stClass(r.status)}"><span class="dot"></span>${stLabel(r.status)}</span>
+          <span>${t("m_avail").split("·")[0].trim()} ${r.uptime==null?"—":(r.uptime*100).toFixed(2)+"%"}</span>
+          <span>${t("m_latency")} ${r.latency_ms==null?"—":(r.latency_ms/1000).toFixed(1)+"s"}</span>
         </span></div>`).join("")}
     </div>`;
   }).join("");
@@ -286,8 +332,8 @@ function render(){
 function openModal(gi){
   const g=state.snap.groups[gi]; if(!g)return;
   const gs=worst(g.models.map(m=>m.status));
-  document.getElementById("mTitle").innerHTML=`${esc(g.name)} <span class="pill sm ${ST[gs].c}" style="vertical-align:middle"><span class="dot"></span>${ST[gs].t}</span>`;
-  document.getElementById("mSub").textContent=`线路 = 创建令牌时所选分组「${g.name}」· 共 ${g.models.length} 个模型`;
+  document.getElementById("mTitle").innerHTML=`${esc(g.name)} <span class="pill sm ${stClass(gs)}" style="vertical-align:middle"><span class="dot"></span>${stLabel(gs)}</span>`;
+  document.getElementById("mSub").textContent=fmt("modal_sub",{name:g.name,n:g.models.length});
   document.getElementById("mBody").innerHTML=g.models.map(modelCard).join("");
   document.getElementById("modal").classList.add("on");
   document.body.style.overflow="hidden";
@@ -300,6 +346,9 @@ function closeModal(e){
 }
 document.addEventListener("keydown",e=>{ if(e.key==="Escape") closeModal(); });
 
+function setLang(l){ lang=l; localStorage.setItem("lang",l); applyStatic(); render(); }
+document.getElementById("langtog").addEventListener("click",e=>{ const b=e.target.closest("button"); if(b) setLang(b.dataset.l); });
+
 async function load(){
   try{
     const r=await fetch("/public/status",{cache:"no-store"}); if(!r.ok) throw 0;
@@ -307,20 +356,21 @@ async function load(){
     render();
     document.getElementById("upd").textContent=clock();
   }catch(e){
-    if(!state.snap) document.getElementById("groups").innerHTML=`<div class="msg">暂时无法获取服务状态,请稍后刷新</div>`;
+    if(!state.snap) document.getElementById("groups").innerHTML=`<div class="msg">${t("err")}</div>`;
   }
 }
 document.getElementById("q").addEventListener("input",e=>{ state.q=e.target.value; render(); });
 const tip=document.getElementById("tip");
 document.addEventListener("mousemove",e=>{ const el=e.target.closest(".beat");
   if(!el){ tip.style.opacity=0; return; }
-  tip.innerHTML=`<b>${beatTime(+el.dataset.i,+el.dataset.n)}</b> · ${ST[el.dataset.s].t}`;
+  tip.innerHTML=`<b>${beatTime(+el.dataset.i,+el.dataset.n)}</b> · ${stLabel(+el.dataset.s)}`;
   tip.style.left=e.clientX+"px"; tip.style.top=e.clientY+"px"; tip.style.opacity=1; });
 let rz; addEventListener("resize",()=>{ clearTimeout(rz); rz=setTimeout(paintBars,120); });
 
+applyStatic();
 load();
 let left=60;
-setInterval(()=>{ left--; if(left<=0){ left=60; load(); } document.getElementById("cd").textContent=`${left} 秒后自动刷新`; },1000);
+setInterval(()=>{ left--; if(left<=0){ left=60; load(); } document.getElementById("cd").textContent=fmt("refresh_in",{n:left}); },1000);
 </script>
 </body>
 </html>

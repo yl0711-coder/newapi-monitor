@@ -15,6 +15,10 @@ services:
       - MONITOR_SAMPLE_SECONDS=60
       - MONITOR_RETENTION_DAYS=7
       - MONITOR_BACKFILL_HOURS=24
+      # 可选:
+      # - MONITOR_HOUR_RETENTION_DAYS=90   # 小时级汇总留存(长期趋势/同比环比)
+      # - MONITOR_HEARTBEAT_URL=           # dead-man 心跳(如 healthchecks.io)
+      - MONITOR_SITE_NAME=NexusAPI         # 对外状态看板站点名
       - TZ=Asia/Shanghai
     volumes:
       - monitor_data:/data
