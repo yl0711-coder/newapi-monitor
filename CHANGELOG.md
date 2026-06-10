@@ -4,6 +4,11 @@
 
 ## [Unreleased]
 
+## [1.1.4] - 2026-06-10
+
+### Changed
+- 看板副标题文案改为「服务可用性看板」(原"上游模型实时可用性")。
+
 ## [1.1.3] - 2026-06-10
 
 ### Changed
@@ -60,7 +65,8 @@
 - 纯 Go + 内嵌 SQLite(`CGO_ENABLED=0` 静态编译),单容器、零外部依赖。
 - Docker 镜像;GitHub Actions 自动 `go vet` + `go test` + `golangci-lint`,通过后发布镜像到 GHCR。
 
-[Unreleased]: https://github.com/yl0711-coder/newapi-monitor/compare/v1.1.3...HEAD
+[Unreleased]: https://github.com/yl0711-coder/newapi-monitor/compare/v1.1.4...HEAD
+[1.1.4]: https://github.com/yl0711-coder/newapi-monitor/compare/v1.1.3...v1.1.4
 [1.1.3]: https://github.com/yl0711-coder/newapi-monitor/compare/v1.1.2...v1.1.3
 [1.1.2]: https://github.com/yl0711-coder/newapi-monitor/compare/v1.1.1...v1.1.2
 [1.1.1]: https://github.com/yl0711-coder/newapi-monitor/compare/v1.1.0...v1.1.1
