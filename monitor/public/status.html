@@ -122,7 +122,6 @@
       <div class="updated"><span id="updLabel"></span> <b id="upd">--:--:--</b><br><span id="cd"></span></div>
     </div>
   </div>
-  <div id="banner" class="banner ok"></div>
   <div id="events" class="events"></div>
   <div id="summary" class="summary"></div>
   <div class="tools">
@@ -247,8 +246,15 @@ function applyStatic(){
   const fullTitle = (state.site ? state.site+" " : "") + t("title_suffix");
   document.title = fullTitle;
   document.getElementById("title").textContent = fullTitle;
-  document.getElementById("logo").textContent = state.site ? state.site.trim().charAt(0).toUpperCase() : "·";
-  if(state.logo) document.getElementById("favicon").href = state.logo;
+  const logoEl = document.getElementById("logo");
+  if(state.logo){               // 头部 logo 用主站同步的 logo 图,与 favicon 一致
+    logoEl.textContent = "";
+    logoEl.style.background = `#fff center/cover no-repeat url("${state.logo}")`;
+    document.getElementById("favicon").href = state.logo;
+  } else {                      // 无 logo 时回退:渐变底 + 站点名首字母
+    logoEl.style.background = "";
+    logoEl.textContent = state.site ? state.site.trim().charAt(0).toUpperCase() : "·";
+  }
   document.getElementById("subtitle").textContent = t("subtitle");
   document.getElementById("updLabel").textContent = t("updated");
   document.getElementById("q").placeholder = t("search_ph");
@@ -261,10 +267,8 @@ function applyStatic(){
 }
 
 function renderTop(){
-  const snap=state.snap, all=snap.groups.flatMap(g=>g.models), ov=snap.overall;
-  const bk={1:"banner_ok",2:"banner_warn",0:"banner_bad",3:"banner_maint"};
-  const b=document.getElementById("banner"); b.className="banner "+stClass(ov);
-  b.innerHTML=`${ICON[stClass(ov)]||""}<span>${t(bk[ov]||"banner_ok")}</span>`;
+  const snap=state.snap, all=snap.groups.flatMap(g=>g.models);
+  // 顶部整体横幅已去掉:不向客户广播"部分服务不好"的总览;明细仍在各卡片如实呈现。
 
   const evs=[];
   snap.groups.forEach(g=>g.models.forEach(m=>{ if(m.status===0||m.status===2||m.status===3) evs.push({line:g.name,model:m.name,status:m.status}); }));

@@ -4,6 +4,12 @@
 
 ## [Unreleased]
 
+## [1.1.3] - 2026-06-10
+
+### Changed
+- 看板**去掉顶部整体状态横幅**:不向客户广播"部分服务降级"这类总览;各模型明细仍在卡片如实呈现。
+- 头部 logo 改用**主站同步的 logo 图**(与 favicon 一致),无 logo 时回退站点名首字母。
+
 ## [1.1.2] - 2026-06-10
 
 ### Changed
@@ -54,7 +60,8 @@
 - 纯 Go + 内嵌 SQLite(`CGO_ENABLED=0` 静态编译),单容器、零外部依赖。
 - Docker 镜像;GitHub Actions 自动 `go vet` + `go test` + `golangci-lint`,通过后发布镜像到 GHCR。
 
-[Unreleased]: https://github.com/yl0711-coder/newapi-monitor/compare/v1.1.2...HEAD
+[Unreleased]: https://github.com/yl0711-coder/newapi-monitor/compare/v1.1.3...HEAD
+[1.1.3]: https://github.com/yl0711-coder/newapi-monitor/compare/v1.1.2...v1.1.3
 [1.1.2]: https://github.com/yl0711-coder/newapi-monitor/compare/v1.1.1...v1.1.2
 [1.1.1]: https://github.com/yl0711-coder/newapi-monitor/compare/v1.1.0...v1.1.1
 [1.1.0]: https://github.com/yl0711-coder/newapi-monitor/compare/v1.0.0...v1.1.0
