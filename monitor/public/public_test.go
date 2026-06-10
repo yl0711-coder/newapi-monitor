@@ -151,7 +151,7 @@ func TestEndpoints(t *testing.T) {
 func TestProvider(t *testing.T) {
 	cases := map[string]string{
 		"claude-opus-4-8": "anthropic", "gpt-5.5": "openai", "gpt-5.3-codex": "openai",
-		"gemini-2.5-pro": "google", "deepseek-v3": "deepseek", "o3": "openai", "weird-model": "other",
+		"gemini-2.5-pro": "google", "deepseek-v3": "deepseek", "glm-5": "zhipu", "o3": "openai", "weird-model": "other",
 	}
 	for in, want := range cases {
 		if got := provider(in); got != want {

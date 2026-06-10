@@ -68,7 +68,8 @@
   .card-top{display:flex;align-items:flex-start;justify-content:space-between;gap:10px}
   .pvbadge{display:inline-block;font-size:11px;font-weight:600;padding:2px 8px;border-radius:999px}
   .pv-anthropic{background:#faf0ec;color:#b5491f} .pv-openai{background:#e9f5f1;color:#0a7a5c}
-  .pv-google{background:#eaf1fd;color:#1a62d6} .pv-deepseek{background:#eef0ff;color:#4f46e5} .pv-other{background:#f1f3f5;color:#5b6472}
+  .pv-google{background:#eaf1fd;color:#1a62d6} .pv-deepseek{background:#eef0ff;color:#4f46e5}
+  .pv-zhipu{background:#f3eefb;color:#7c3aed} .pv-other{background:#f1f3f5;color:#5b6472}
   .mname{font-size:15.5px;font-weight:650;word-break:break-all;margin-top:5px}
   .pill{display:inline-flex;align-items:center;gap:6px;font-size:12.5px;font-weight:600;padding:4px 10px;border-radius:999px;white-space:nowrap}
   .pill .dot{width:7px;height:7px;border-radius:50%}
@@ -151,7 +152,6 @@ const I18N = {
     title_suffix:"服务状态", subtitle:"服务可用性看板",
     updated:"最近更新", autorefresh:"自动刷新", refresh_in:"{n} 秒后自动刷新",
     st_ok:"正常", st_warn:"性能下降", st_bad:"不可用", st_maint:"维护中", st_na:"数据不足",
-    banner_ok:"所有服务运行正常", banner_warn:"部分服务性能下降", banner_bad:"部分服务当前不可用", banner_maint:"部分服务维护中",
     sum_uptime:"整体可用率 · 近7天", sum_lines:"线路", sum_warn:"性能下降", sum_bad:"不可用",
     search_ph:"搜索模型,跨线路对比稳定性(如 gpt-5.5 / claude-opus)…",
     rec_label:"推荐 · 最稳定模型", n_models:"{n} 个模型", view_all:"查看全部 →",
@@ -167,7 +167,6 @@ const I18N = {
     title_suffix:"Service Status", subtitle:"Service availability dashboard",
     updated:"Last updated", autorefresh:"Auto-refresh", refresh_in:"Refreshing in {n}s",
     st_ok:"Operational", st_warn:"Degraded", st_bad:"Outage", st_maint:"Maintenance", st_na:"No data",
-    banner_ok:"All systems operational", banner_warn:"Partial performance degradation", banner_bad:"Partial service outage", banner_maint:"Maintenance in progress",
     sum_uptime:"Overall uptime · 7d", sum_lines:"Lines", sum_warn:"Degraded", sum_bad:"Outage",
     search_ph:"Search a model to compare stability across lines (e.g. gpt-5.5 / claude-opus)…",
     rec_label:"Recommended · most stable", n_models:"{n} models", view_all:"View all →",
@@ -189,13 +188,7 @@ const STC = { 1:"ok", 2:"warn", 0:"bad", 3:"maint", "-1":"na" };       // 状态
 const stClass = s => STC[s] || "na";
 const stLabel = s => t("st_"+stClass(s));
 const SEV = { 0:4, 2:3, "-1":2, 3:1, 1:0 };
-const ICON = {
-  ok:'<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>',
-  warn:'<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 9v4M12 17h.01M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0Z"/></svg>',
-  bad:'<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="m15 9-6 6M9 9l6 6"/></svg>',
-  maint:'<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M14.7 6.3a4 4 0 0 0-5.4 5.3L4 17l3 3 5.4-5.3a4 4 0 0 0 5.3-5.4l-2.6 2.6-2-2 2.6-2.6Z"/></svg>',
-};
-const PVN = { anthropic:"Anthropic", openai:"OpenAI", google:"Google", deepseek:"DeepSeek", other:"" };
+const PVN = { anthropic:"Anthropic", openai:"OpenAI", google:"Google", deepseek:"DeepSeek", zhipu:"Zhipu", other:"" };
 const WIN_DAYS = 7, PER = 7;
 const state = { snap:null, q:"", site:"", logo:"" };
 

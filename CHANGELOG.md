@@ -4,6 +4,14 @@
 
 ## [Unreleased]
 
+## [1.1.5] - 2026-06-10
+
+### Changed
+- 看板:GLM 模型识别为智谱(Zhipu)徽章(原归为"其他")。
+
+### Removed
+- 清理去横幅后遗留的死代码(JS 中 ICON 图标常量 + banner_* 文案,均已无引用)。
+
 ## [1.1.4] - 2026-06-10
 
 ### Changed
@@ -65,7 +73,8 @@
 - 纯 Go + 内嵌 SQLite(`CGO_ENABLED=0` 静态编译),单容器、零外部依赖。
 - Docker 镜像;GitHub Actions 自动 `go vet` + `go test` + `golangci-lint`,通过后发布镜像到 GHCR。
 
-[Unreleased]: https://github.com/yl0711-coder/newapi-monitor/compare/v1.1.4...HEAD
+[Unreleased]: https://github.com/yl0711-coder/newapi-monitor/compare/v1.1.5...HEAD
+[1.1.5]: https://github.com/yl0711-coder/newapi-monitor/compare/v1.1.4...v1.1.5
 [1.1.4]: https://github.com/yl0711-coder/newapi-monitor/compare/v1.1.3...v1.1.4
 [1.1.3]: https://github.com/yl0711-coder/newapi-monitor/compare/v1.1.2...v1.1.3
 [1.1.2]: https://github.com/yl0711-coder/newapi-monitor/compare/v1.1.1...v1.1.2

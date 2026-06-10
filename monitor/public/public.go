@@ -495,6 +495,8 @@ func provider(model string) string {
 		return "google"
 	case strings.HasPrefix(m, "deepseek"):
 		return "deepseek"
+	case strings.HasPrefix(m, "glm"):
+		return "zhipu"
 	case strings.HasPrefix(m, "gpt"), strings.HasPrefix(m, "o1"), strings.HasPrefix(m, "o3"),
 		strings.HasPrefix(m, "o4"), strings.HasPrefix(m, "chatgpt"), strings.HasPrefix(m, "dall"),
 		strings.Contains(m, "codex"):
