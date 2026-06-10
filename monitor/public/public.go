@@ -49,7 +49,8 @@ const (
 // Config 是看板所需的最小配置(由 monitor 注入)。
 type Config struct {
 	NewAPIBaseURL string // 用于匿名拉取 /api/pricing 的可见分组;为空则退回"有流量的分组"
-	SiteName      string // 页面标题,默认 NexusAPI
+	SiteName      string // 站点名:部署时从主站 system_name 同步;为空则前端显通用名(不硬编码)
+	Logo          string // 站点 logo 绝对 URL:从主站同步,供前端做 favicon;可空
 }
 
 // ---- 对外脱敏数据结构(独立,绝不复用内部结构)----
@@ -71,8 +72,10 @@ type Group struct {
 	Models []Model `json:"models"`
 }
 
-// Snapshot 是一次完整的对外看板快照:整体状态 + 各线路 × 模型。
+// Snapshot 是一次完整的对外看板快照:站点品牌 + 整体状态 + 各线路 × 模型。
 type Snapshot struct {
+	Site      string  `json:"site"`           // 站点名(从主站同步;空=前端用通用名)
+	Logo      string  `json:"logo,omitempty"` // 站点 logo URL(favicon)
 	UpdatedAt string  `json:"updated_at"`
 	Overall   int     `json:"overall"`
 	Groups    []Group `json:"groups"`
@@ -97,10 +100,7 @@ type vgroup struct{ Key, Name string }
 
 // Register 把看板挂到给定引擎:GET /status(页面) + GET /public/status(脱敏 JSON)。均【无鉴权】。
 func Register(r *gin.Engine, db *gorm.DB, cfg Config) {
-	if cfg.SiteName == "" {
-		cfg.SiteName = "NexusAPI"
-	}
-	h := &handler{db: db, cfg: cfg}
+	h := &handler{db: db, cfg: cfg} // SiteName 可空——前端回退到通用名,不硬编码品牌
 	r.GET("/status", h.page)
 	r.GET("/public/status", h.data)
 }
@@ -179,6 +179,8 @@ func (h *handler) compute(now int64) *Snapshot {
 	}
 
 	return &Snapshot{
+		Site:      h.cfg.SiteName,
+		Logo:      h.cfg.Logo,
 		UpdatedAt: time.Unix(now, 0).UTC().Format(time.RFC3339),
 		Overall:   overall,
 		Groups:    groups,

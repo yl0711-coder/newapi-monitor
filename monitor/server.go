@@ -127,10 +127,16 @@ func (m *Monitor) servePage(c *gin.Context) {
 
 // RegisterPublicBoard 挂载对外公开看板(无鉴权:/status 页面 + /public/status JSON)。
 // 看板是独立 public 包,只拿到本地采样库与少量配置,绝不触及内部结构与生产库。
+// 站点名与 logo 在此【部署时同步一次】:从主站 new-api 取 system_name + logo;取不到则用 env 兜底。
 func (m *Monitor) RegisterPublicBoard(r *gin.Engine) {
+	name, logo := m.fetchBrand()
+	if name == "" {
+		name = m.cfg.SiteName // 主站不可达时用 MONITOR_SITE_NAME 兜底;再空则前端显通用名
+	}
 	public.Register(r, m.storeDB, public.Config{
 		NewAPIBaseURL: m.cfg.NewAPIBaseURL,
-		SiteName:      m.cfg.SiteName,
+		SiteName:      name,
+		Logo:          logo,
 	})
 }
 

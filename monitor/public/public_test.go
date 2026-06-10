@@ -133,7 +133,7 @@ func TestEndpoints(t *testing.T) {
 	// /status 出 HTML
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/status", nil))
-	if w.Code != 200 || !strings.Contains(w.Body.String(), "NexusAPI") {
+	if w.Code != 200 || !strings.Contains(w.Body.String(), "服务状态") {
 		t.Fatalf("/status code=%d 未含页面", w.Code)
 	}
 	// /public/status 出 JSON

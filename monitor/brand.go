@@ -27,27 +27,37 @@ func (m *Monitor) brandName() string {
 	return name
 }
 
-// fetchSystemName 从 new-api 的 /api/status 读取 system_name(公开接口,无需鉴权)。
-func (m *Monitor) fetchSystemName() string {
+// fetchSystemName 从 new-api 读取 system_name(公开接口)。
+func (m *Monitor) fetchSystemName() string { n, _ := m.fetchBrand(); return n }
+
+// fetchBrand 从 new-api 的 /api/status 读取站点名(system_name)与 logo(公开接口,无需鉴权)。
+// logo 若为相对路径,补全为基于 new-api 地址的绝对 URL,供跨域看板做 favicon。
+func (m *Monitor) fetchBrand() (name, logo string) {
 	base := strings.TrimRight(m.cfg.NewAPIBaseURL, "/")
 	if base == "" {
-		return ""
+		return "", ""
 	}
 	cl := &http.Client{Timeout: 5 * time.Second}
 	resp, err := cl.Get(base + "/api/status")
 	if err != nil {
-		return ""
+		return "", ""
 	}
 	defer resp.Body.Close()
 	var sr struct {
 		Data struct {
 			SystemName string `json:"system_name"`
+			Logo       string `json:"logo"`
 		} `json:"data"`
 	}
 	if json.NewDecoder(resp.Body).Decode(&sr) != nil {
-		return ""
+		return "", ""
 	}
-	return strings.TrimSpace(sr.Data.SystemName)
+	name = strings.TrimSpace(sr.Data.SystemName)
+	logo = strings.TrimSpace(sr.Data.Logo)
+	if logo != "" && !strings.HasPrefix(logo, "http") && !strings.HasPrefix(logo, "data:") {
+		logo = base + "/" + strings.TrimLeft(logo, "/")
+	}
+	return name, logo
 }
 
 // brandHandler 公开返回站点名,供前端设置页面标题与品牌文字。

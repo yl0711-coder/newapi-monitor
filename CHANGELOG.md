@@ -4,6 +4,11 @@
 
 ## [Unreleased]
 
+## [1.1.2] - 2026-06-10
+
+### Changed
+- 对外看板**站点名与 favicon 改为部署时从主站 new-api 同步**(`system_name` + `logo`),不再硬编码任何品牌名;主站不可达时用 `MONITOR_SITE_NAME` 兜底,再空则显通用名。保持开源通用——各部署自动显示各自的站点名/图标。
+
 ## [1.1.1] - 2026-06-10
 
 ### Changed
@@ -49,7 +54,8 @@
 - 纯 Go + 内嵌 SQLite(`CGO_ENABLED=0` 静态编译),单容器、零外部依赖。
 - Docker 镜像;GitHub Actions 自动 `go vet` + `go test` + `golangci-lint`,通过后发布镜像到 GHCR。
 
-[Unreleased]: https://github.com/yl0711-coder/newapi-monitor/compare/v1.1.1...HEAD
+[Unreleased]: https://github.com/yl0711-coder/newapi-monitor/compare/v1.1.2...HEAD
+[1.1.2]: https://github.com/yl0711-coder/newapi-monitor/compare/v1.1.1...v1.1.2
 [1.1.1]: https://github.com/yl0711-coder/newapi-monitor/compare/v1.1.0...v1.1.1
 [1.1.0]: https://github.com/yl0711-coder/newapi-monitor/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/yl0711-coder/newapi-monitor/releases/tag/v1.0.0

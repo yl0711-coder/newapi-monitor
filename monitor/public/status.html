@@ -3,7 +3,9 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>NexusAPI 服务状态</title>
+<title>服务状态</title>
+<link rel="icon" id="favicon" href="data:,">
+
 <style>
   :root{
     --bg:#f5f7fa; --card:#fff; --line:#e7ebf0; --ink:#1f2937; --muted:#6b7280; --faint:#9aa3af;
@@ -113,7 +115,7 @@
 <body>
 <div class="wrap">
   <div class="head">
-    <div class="brand"><span class="logo">N</span>
+    <div class="brand"><span class="logo" id="logo"></span>
       <div><div class="t1" id="title"></div><div class="t2" id="subtitle"></div></div></div>
     <div class="headright">
       <div class="langtog" id="langtog"><button data-l="zh">中</button><button data-l="en">EN</button></div>
@@ -147,7 +149,7 @@
 /* ===== 国际化 ===== */
 const I18N = {
   zh: {
-    title:"NexusAPI 服务状态", subtitle:"上游模型实时可用性",
+    title_suffix:"服务状态", subtitle:"上游模型实时可用性",
     updated:"最近更新", autorefresh:"自动刷新", refresh_in:"{n} 秒后自动刷新",
     st_ok:"正常", st_warn:"性能下降", st_bad:"不可用", st_maint:"维护中", st_na:"数据不足",
     banner_ok:"所有服务运行正常", banner_warn:"部分服务性能下降", banner_bad:"部分服务当前不可用", banner_maint:"部分服务维护中",
@@ -163,7 +165,7 @@ const I18N = {
     foot:"由 NexusAPI 提供",
   },
   en: {
-    title:"NexusAPI Service Status", subtitle:"Real-time upstream model availability",
+    title_suffix:"Service Status", subtitle:"Real-time upstream model availability",
     updated:"Last updated", autorefresh:"Auto-refresh", refresh_in:"Refreshing in {n}s",
     st_ok:"Operational", st_warn:"Degraded", st_bad:"Outage", st_maint:"Maintenance", st_na:"No data",
     banner_ok:"All systems operational", banner_warn:"Partial performance degradation", banner_bad:"Partial service outage", banner_maint:"Maintenance in progress",
@@ -196,7 +198,7 @@ const ICON = {
 };
 const PVN = { anthropic:"Anthropic", openai:"OpenAI", google:"Google", deepseek:"DeepSeek", other:"" };
 const WIN_DAYS = 7, PER = 7;
-const state = { snap:null, q:"" };
+const state = { snap:null, q:"", site:"", logo:"" };
 
 const worst = arr => arr.reduce((w,s)=> SEV[s]>SEV[w]?s:w, 1);
 function clock(){ const n=new Date(); return [n.getHours(),n.getMinutes(),n.getSeconds()].map(x=>String(x).padStart(2,"0")).join(":"); }
@@ -241,8 +243,12 @@ function modelCard(m){
 
 function applyStatic(){
   document.documentElement.lang = lang==="zh" ? "zh-CN" : "en";
-  document.title = t("title");
-  document.getElementById("title").textContent = t("title");
+  // 标题/品牌 = 主站同步来的站点名 + 本地化后缀;站点名为空则只显通用后缀(不硬编码品牌)
+  const fullTitle = (state.site ? state.site+" " : "") + t("title_suffix");
+  document.title = fullTitle;
+  document.getElementById("title").textContent = fullTitle;
+  document.getElementById("logo").textContent = state.site ? state.site.trim().charAt(0).toUpperCase() : "·";
+  if(state.logo) document.getElementById("favicon").href = state.logo;
   document.getElementById("subtitle").textContent = t("subtitle");
   document.getElementById("updLabel").textContent = t("updated");
   document.getElementById("q").placeholder = t("search_ph");
@@ -353,6 +359,9 @@ async function load(){
   try{
     const r=await fetch("/public/status",{cache:"no-store"}); if(!r.ok) throw 0;
     state.snap=await r.json();
+    if(state.snap.site!==state.site || state.snap.logo!==state.logo){
+      state.site=state.snap.site||""; state.logo=state.snap.logo||""; applyStatic(); // 站点名/logo 来自主站同步
+    }
     render();
     document.getElementById("upd").textContent=clock();
   }catch(e){

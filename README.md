@@ -50,7 +50,7 @@ docker run -d --name newapi-monitor \
 | `MONITOR_HOUR_RETENTION_DAYS` | 小时级汇总留存天数(长期趋势 + 同比环比) | `90` |
 | `MONITOR_BACKFILL_HOURS` | 启动时回填的历史小时数 | `24` |
 | `MONITOR_HEARTBEAT_URL` | dead-man 心跳 URL(如 healthchecks.io);留空=不启用 | 留空 |
-| `MONITOR_SITE_NAME` | 对外状态看板的站点名 | `NexusAPI` |
+| `MONITOR_SITE_NAME` | 对外看板站点名**兜底值**;站点名/favicon 默认部署时从主站 new-api 的 `system_name`/`logo` 同步,此项仅主站不可达时兜底 | 留空 |
 
 ## 对外状态看板(公开、无登录)
 除内部监控外,同一进程还提供一个**面向客户的公开状态页**(脱敏、无需登录),适合放在独立子域名(如 `status.example.com`):

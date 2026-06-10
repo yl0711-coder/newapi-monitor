@@ -50,7 +50,7 @@ Open `http://<host>:8090` and log in with a new-api admin account. See [`docker-
 | `MONITOR_BACKFILL_HOURS` | Hours of history to backfill on start | `24` |
 | `MONITOR_HOUR_RETENTION_DAYS` | Hourly-rollup retention (long-term trend + WoW/DoD) | `90` |
 | `MONITOR_HEARTBEAT_URL` | Dead-man heartbeat URL (e.g. healthchecks.io); empty = off | empty |
-| `MONITOR_SITE_NAME` | Site name shown on the public status board | `NexusAPI` |
+| `MONITOR_SITE_NAME` | Fallback site name for the public board; name/favicon are synced from new-api `system_name`/`logo` at deploy, this is only used when the main site is unreachable | empty |
 
 ## Public status board (public, no login)
 Besides the internal monitor, the same process serves a **customer-facing public status page** (sanitized, no login), ideal for a dedicated subdomain (e.g. `status.example.com`):

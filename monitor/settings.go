@@ -23,7 +23,8 @@ type Settings struct {
 	// 监控/采样若停了,外部服务收不到心跳即告警——"谁来监控监控"。
 	HeartbeatURL string // MONITOR_HEARTBEAT_URL
 
-	// 对外看板:页面标题,默认 NexusAPI。
+	// 对外看板:站点名【兜底】。默认空——优先从主站 new-api 的 system_name 同步;
+	// 仅当主站不可达时用此环境变量兜底;再为空则前端显通用名。
 	SiteName string // MONITOR_SITE_NAME
 }
 
@@ -40,7 +41,7 @@ func LoadSettings() Settings {
 		NewAPIBaseURL:     env("MONITOR_NEWAPI_BASE_URL", ""),
 		SessionSecret:     env("MONITOR_SESSION_SECRET", ""),
 		HeartbeatURL:      env("MONITOR_HEARTBEAT_URL", ""),
-		SiteName:          env("MONITOR_SITE_NAME", "NexusAPI"),
+		SiteName:          env("MONITOR_SITE_NAME", ""),
 	}
 }
 
