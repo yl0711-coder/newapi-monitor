@@ -528,6 +528,7 @@ var dateSuffix = regexp.MustCompile(`-\d{8}$`)
 
 func pretty(model string) string { return dateSuffix.ReplaceAllString(model, "") }
 
+// splitList 拆逗号分隔串(去空白、去空项),解析渠道的 groups/models 字段。
 func splitList(s string) []string {
 	if s == "" {
 		return nil
