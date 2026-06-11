@@ -63,12 +63,12 @@ func TestComputeTopologyAndTraffic(t *testing.T) {
 	now := int64(1_900_000_000)
 	bt := now - 3600 // 窗口内
 
-	// 渠道:m_ok 有 1 条启用;m_warn 有 1 条启用;m_down 只有 1 条自动禁用(→ 无可用渠道)
+	// 渠道:m_ok、m_warn 各有 1 条启用;m_down 只在 1 条禁用渠道上(→ 不可选,应隐藏)
 	db.Create(&[]channelSnap{
 		{ID: 1, Status: 1, Groups: "g1", Models: "m_ok,m_warn", UpdatedAt: now},
-		{ID: 2, Status: 3, Groups: "g1", Models: "m_down", UpdatedAt: now}, // 自动禁用
+		{ID: 2, Status: 3, Groups: "g1", Models: "m_down", UpdatedAt: now}, // 自动禁用 → m_down 不可选
 	})
-	// 流量:m_ok 全成功;m_warn 96%(降级);m_down 无流量(纯靠拓扑判故障)
+	// 流量:m_ok 全成功;m_warn 96%(降级)
 	db.Create(&[]metricSample{
 		{BucketTs: bt, ChannelID: 1, ModelName: "m_ok", Grp: "g1", Success: 30, Lat2: 30, MaxUseTime: 2},
 		{BucketTs: bt, ChannelID: 1, ModelName: "m_warn", Grp: "g1", Success: 24, Failed: 1, Lat5: 24, MaxUseTime: 5},
@@ -78,23 +78,27 @@ func TestComputeTopologyAndTraffic(t *testing.T) {
 	snap := h.compute(now)
 
 	if snap.Overall != stWarn {
-		t.Fatalf("overall = %d, want stWarn(有正常模型 m_ok,部分降级/不可用 → 线路降级而非整体不可用)", snap.Overall)
+		t.Fatalf("overall = %d, want stWarn(有正常模型 m_ok + 部分降级 → 线路降级)", snap.Overall)
 	}
 	if len(snap.Groups) != 1 || snap.Groups[0].Name != "g1" {
 		t.Fatalf("groups = %+v, want 单个 g1", snap.Groups)
 	}
+	// 只显示可选模型:m_down 只在禁用渠道上 → 隐藏,只剩 m_ok、m_warn
+	if len(snap.Groups[0].Models) != 2 {
+		t.Fatalf("应只显示 2 个可选模型(m_down 不可选,隐藏),得 %d", len(snap.Groups[0].Models))
+	}
 	got := map[string]int{}
 	for _, m := range snap.Groups[0].Models {
 		got[m.Name] = m.Status
+	}
+	if _, ok := got["m_down"]; ok {
+		t.Error("m_down 只在禁用渠道上(不可选),不该出现在看板")
 	}
 	if got["m_ok"] != stUp {
 		t.Errorf("m_ok = %d, want stUp", got["m_ok"])
 	}
 	if got["m_warn"] != stWarn {
 		t.Errorf("m_warn = %d, want stWarn(96%%)", got["m_warn"])
-	}
-	if got["m_down"] != stDown {
-		t.Errorf("m_down = %d, want stDown(无可用渠道,即便零流量)", got["m_down"])
 	}
 	// 心跳条长度
 	for _, m := range snap.Groups[0].Models {

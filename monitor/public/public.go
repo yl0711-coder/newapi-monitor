@@ -144,7 +144,7 @@ func (h *handler) compute(now int64) *Snapshot {
 	since := now - windowSec
 
 	// 1) 渠道健康快照 → 每(分组,模型)的"在售"与"健康渠道数"
-	offered, enabled := h.channelMaps()
+	enabled := h.channelMaps()
 
 	// 2) 近7天每(分组×模型)汇总
 	totals := h.totals(since)
@@ -158,7 +158,7 @@ func (h *handler) compute(now int64) *Snapshot {
 	var groups []Group
 	overall := stUp
 	for _, vg := range vgs {
-		models := mergedModels(offered[vg.Key], totals, vg.Key)
+		models := selectableModels(enabled[vg.Key])
 		if len(models) == 0 {
 			continue
 		}
@@ -244,9 +244,11 @@ func (h *handler) buildModel(grp, mdl string, enabled map[string]map[string]int,
 
 // ---- 本地库查询 ----
 
-func (h *handler) channelMaps() (offered map[string]map[string]bool, enabled map[string]map[string]int) {
-	offered = map[string]map[string]bool{}
-	enabled = map[string]map[string]int{}
+// channelMaps 统计每个分组×模型有多少个【启用】渠道(enabled[group][model])。
+// 只看启用渠道(status=1):据此判该分组×模型用户是否真能选到——无启用渠道即"不可选",
+// 不应出现在看板/监控(全禁用、或渠道只在不可选分组,都会让其在可见分组的 enabled 里为 0)。
+func (h *handler) channelMaps() map[string]map[string]int {
+	enabled := map[string]map[string]int{}
 	var rows []struct {
 		Status int    `gorm:"column:status"`
 		Groups string `gorm:"column:groups"`
@@ -256,24 +258,19 @@ func (h *handler) channelMaps() (offered map[string]map[string]bool, enabled map
 		slog.Warn("看板:渠道快照查询失败(降级为空)", "err", err)
 	}
 	for _, r := range rows {
-		gs := splitList(r.Groups)
-		ms := splitList(r.Models)
-		for _, g := range gs {
-			for _, m := range ms {
-				if offered[g] == nil {
-					offered[g] = map[string]bool{}
+		if r.Status != 1 { // 禁用/熔断渠道不计入"可选"
+			continue
+		}
+		for _, g := range splitList(r.Groups) {
+			for _, m := range splitList(r.Models) {
+				if enabled[g] == nil {
+					enabled[g] = map[string]int{}
 				}
-				offered[g][m] = true
-				if r.Status == 1 {
-					if enabled[g] == nil {
-						enabled[g] = map[string]int{}
-					}
-					enabled[g][m]++
-				}
+				enabled[g][m]++
 			}
 		}
 	}
-	return
+	return enabled
 }
 
 func (h *handler) totals(since int64) map[string]agg {
@@ -408,24 +405,15 @@ func (h *handler) fetchUsableGroups() []vgroup {
 // ---- 纯函数辅助 ----
 
 // mergedModels 合并"配置在售"与"近窗有流量"的模型集合,得到该线路完整服务面。
-func mergedModels(offeredG map[string]bool, totals map[string]agg, grp string) []string {
-	set := map[string]bool{}
-	for m := range offeredG {
-		if m != "" && m != "*" {
-			set[m] = true
+// selectableModels 返回该(可见)分组下用户【真能选到】的模型 = 至少有一个启用渠道。
+// 自动排除"不可选"模型:所有含它的渠道都被禁用(enabled 里没有/为 0),
+// 或这些渠道只关联不可选分组(则不会出现在某可见分组的 enabled 里)。
+func selectableModels(enabledG map[string]int) []string {
+	out := make([]string, 0, len(enabledG))
+	for m, n := range enabledG {
+		if n > 0 && m != "" && m != "*" {
+			out = append(out, m)
 		}
-	}
-	prefix := grp + "\x00"
-	for k := range totals {
-		if strings.HasPrefix(k, prefix) {
-			if m := strings.TrimPrefix(k, prefix); m != "" {
-				set[m] = true
-			}
-		}
-	}
-	out := make([]string, 0, len(set))
-	for m := range set {
-		out = append(out, m)
 	}
 	return out
 }
@@ -540,6 +528,7 @@ var dateSuffix = regexp.MustCompile(`-\d{8}$`)
 
 func pretty(model string) string { return dateSuffix.ReplaceAllString(model, "") }
 
+// splitList 拆逗号分隔串(去空白、去空项),解析渠道的 groups/models 字段。
 func splitList(s string) []string {
 	if s == "" {
 		return nil

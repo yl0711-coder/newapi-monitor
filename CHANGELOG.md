@@ -5,6 +5,12 @@
 ## [Unreleased]
 
 ### Changed
+- **监控也只统计用户可选的模型**(报警同理——"都不能选了报什么警"):新增 `selectable_pairs` 表,采样器每分钟据 `/api/pricing` 可见分组 ∩ 启用渠道配置 重算;监控的稳定性聚合(总览/分组/模型/趋势 + 报警 summary)只算可选 (分组,模型),排除误路由 / 全禁用 / 只在不可选分组的流量(表为空 fail-open 不过滤,避免空窗)。「按渠道」明细不过滤,排障仍能看误路由等异常。
+- 看板**只显示用户真能选到的模型**:某分组×模型在该(可见)分组下至少有一个【启用】渠道才显示;改用 channel_snaps 的启用渠道配置判定,不再因历史/偶发流量带出"不可选"模型。自动隐藏:所有含它的渠道都被禁用、只配置在不可选分组、或仅因误路由产生流量(例:gpt-image-1 只配在内部分组 internal_test,却因 1 次误路由出现在 codex-1.2x 显示"不可用",现已隐藏)。
+
+## [1.3.1] - 2026-06-11
+
+### Changed
 - 看板状态语义重新平衡(诚实但不夸大、体现可用一面):**模型**——"不可用"只留给真·故障(无可用上游 或近期可用率 <50%),在服务但有失败(50–99%)→「性能下降」(原 <85% 即判不可用过狠);**分组**——按"线路还能不能用"判,有正常模型即最多「性能下降」、无任一正常才「不可用」(原取最差模型,个别降级就把整条线标不可用,对外夸大);「当前事件」只列真·outage 不广播降级;分组卡改用后端分组状态(前端不再重算 worst)。
 - 渠道开关状态改为**每个采样周期(1 分钟)同步**(原约 10 分钟):"禁用渠道不计入 / 重启用从启用时刻起算"近乎实时生效;代价可忽略(小查询,远轻于每分钟的日志聚合)。
 
@@ -97,7 +103,8 @@
 - 纯 Go + 内嵌 SQLite(`CGO_ENABLED=0` 静态编译),单容器、零外部依赖。
 - Docker 镜像;GitHub Actions 自动 `go vet` + `go test` + `golangci-lint`,通过后发布镜像到 GHCR。
 
-[Unreleased]: https://github.com/yl0711-coder/newapi-monitor/compare/v1.3.0...HEAD
+[Unreleased]: https://github.com/yl0711-coder/newapi-monitor/compare/v1.3.1...HEAD
+[1.3.1]: https://github.com/yl0711-coder/newapi-monitor/compare/v1.3.0...v1.3.1
 [1.3.0]: https://github.com/yl0711-coder/newapi-monitor/compare/v1.2.0...v1.3.0
 [1.2.0]: https://github.com/yl0711-coder/newapi-monitor/compare/v1.1.5...v1.2.0
 [1.1.5]: https://github.com/yl0711-coder/newapi-monitor/compare/v1.1.4...v1.1.5

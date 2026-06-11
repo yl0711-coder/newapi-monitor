@@ -3,6 +3,7 @@ package monitor
 import (
 	"fmt"
 	"log/slog"
+	"strings"
 
 	"github.com/glebarez/sqlite"
 	"gorm.io/gorm"
@@ -99,8 +100,34 @@ type ChannelSnap struct {
 const enabledChanFilter = ` AND NOT EXISTS (SELECT 1 FROM channel_snaps c ` +
 	`WHERE c.id = metric_samples.channel_id AND (c.status <> 1 OR metric_samples.bucket_ts < c.enabled_since))`
 
-// channelDim 是"按渠道"维度的列名;该维度不施加 enabledChanFilter。
+// channelDim 是"按渠道"维度的列名;该维度不施加 enabledChanFilter / selectableFilter。
 const channelDim = "channel_id"
+
+// SelectablePair 是"用户真能选到"的 (分组, 模型) 对:该分组在 /api/pricing 可见,且有启用渠道配置了它。
+// 采样器每周期重算(可见分组 ∩ 启用渠道配置)。监控的稳定性聚合只统计在此表里的对——
+// 不可选的(误路由 / 全禁用 / 只在不可选分组)不计入监控与报警("都不能选了报什么警")。
+type SelectablePair struct {
+	Grp   string `gorm:"primaryKey;size:64;column:grp"`
+	Model string `gorm:"primaryKey;size:128"`
+}
+
+// selectableFilter 把"不可选的 (分组,模型)"排除出监控聚合;
+// 表为空(未拉到 /api/pricing / 新部署首刷前)时 fail-open 不过滤,避免空窗。
+// 仅用于跨(分组/模型)聚合(总览/分组/模型/趋势);按渠道明细不加,排障仍能看误路由等异常。
+const selectableFilter = ` AND (NOT EXISTS (SELECT 1 FROM selectable_pairs) OR ` +
+	`EXISTS (SELECT 1 FROM selectable_pairs sp WHERE sp.grp = metric_samples.grp AND sp.model = metric_samples.model_name))`
+
+// splitList 拆逗号分隔串(去空白、去空项),解析渠道的 groups/models 字段。
+func splitList(s string) []string {
+	parts := strings.Split(s, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
 
 // RejectionSample 是「前置拒绝」按分钟聚合的计数,由各节点的旁路采集器
 // (newapi-reject-collector)POST 推来。这类拒绝(如"无可用渠道")不进 new-api 的 logs 表,
@@ -130,7 +157,7 @@ func (m *Monitor) openStore(path string) error {
 	if err != nil {
 		return fmt.Errorf("打开本地采样库失败: %w", err)
 	}
-	if err := db.AutoMigrate(&MetricSample{}, &TokenSample{}, &HourSample{}, &ChannelSnap{}, &RejectionSample{}, &AlertConfig{}, &AlertLog{}); err != nil {
+	if err := db.AutoMigrate(&MetricSample{}, &TokenSample{}, &HourSample{}, &ChannelSnap{}, &RejectionSample{}, &SelectablePair{}, &AlertConfig{}, &AlertLog{}); err != nil {
 		return fmt.Errorf("表迁移失败: %w", err)
 	}
 	m.storeDB = db
@@ -208,6 +235,17 @@ func (m *Monitor) replaceChannelSnaps(rows []ChannelSnap, now int64) error {
 		return err
 	}
 	return m.storeDB.Where("updated_at < ?", now).Delete(&ChannelSnap{}).Error
+}
+
+// replaceSelectablePairs 全量替换可选 (分组,模型) 对表(数量不大,清空+批量插简单可靠)。
+func (m *Monitor) replaceSelectablePairs(pairs []SelectablePair) error {
+	if err := m.storeDB.Where("1 = 1").Delete(&SelectablePair{}).Error; err != nil {
+		return err
+	}
+	if len(pairs) == 0 {
+		return nil
+	}
+	return m.storeDB.Clauses(clause.OnConflict{DoNothing: true}).CreateInBatches(pairs, 300).Error
 }
 
 func (m *Monitor) pruneOlderThan(cutoffTs int64) (int64, error) {
@@ -365,7 +403,7 @@ func percentile(hist []int64, edges []int, maxVal int, p float64) float64 {
 
 func (m *Monitor) storeSummary(since int64, windowSec float64) (*Summary, error) {
 	var a aggRow
-	if err := m.storeDB.Raw(`SELECT '' AS k, `+aggCols+` FROM metric_samples WHERE bucket_ts >= ?`+enabledChanFilter, since).
+	if err := m.storeDB.Raw(`SELECT '' AS k, `+aggCols+` FROM metric_samples WHERE bucket_ts >= ?`+enabledChanFilter+selectableFilter, since).
 		Scan(&a).Error; err != nil {
 		return nil, fmt.Errorf("本地汇总失败: %w", err)
 	}
@@ -394,8 +432,8 @@ func (m *Monitor) storeDimSeries(dimCol string, since int64, windowMinutes int) 
 		Anomaly  int64
 		Failed   int64
 	}
-	f := enabledChanFilter
-	if dimCol == channelDim { // 按渠道明细不过滤,排障仍能看禁用渠道
+	f := enabledChanFilter + selectableFilter
+	if dimCol == channelDim { // 按渠道明细不过滤,排障仍能看禁用渠道/误路由
 		f = ""
 	}
 	q := fmt.Sprintf(`SELECT %s AS k, bucket_ts, COALESCE(SUM(success),0) AS success,
@@ -433,8 +471,8 @@ func (m *Monitor) storeDimSeries(dimCol string, since int64, windowMinutes int) 
 }
 
 func (m *Monitor) storeDim(dimCol string, since int64, windowSec float64) ([]Row, error) {
-	f := enabledChanFilter
-	if dimCol == channelDim { // 按渠道明细不过滤,排障仍能看禁用渠道
+	f := enabledChanFilter + selectableFilter
+	if dimCol == channelDim { // 按渠道明细不过滤,排障仍能看禁用渠道/误路由
 		f = ""
 	}
 	q := fmt.Sprintf(`SELECT %s AS k, %s FROM metric_samples
@@ -465,7 +503,7 @@ func (m *Monitor) storeTrend(since int64, windowMinutes int) ([]TimePoint, error
 	}
 	var rows []minRow
 	if err := m.storeDB.Raw(`SELECT bucket_ts, COALESCE(SUM(success),0) AS success, COALESCE(SUM(failed),0) AS failed
-		FROM metric_samples WHERE bucket_ts >= ?`+enabledChanFilter+` GROUP BY bucket_ts ORDER BY bucket_ts`, since).
+		FROM metric_samples WHERE bucket_ts >= ?`+enabledChanFilter+selectableFilter+` GROUP BY bucket_ts ORDER BY bucket_ts`, since).
 		Scan(&rows).Error; err != nil {
 		return nil, fmt.Errorf("本地趋势失败: %w", err)
 	}

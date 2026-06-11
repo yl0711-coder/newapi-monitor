@@ -65,9 +65,11 @@ Besides the internal monitor, the same process serves a **customer-facing public
 - `GET /status` — light card-style status page (embedded, self-contained).
 - `GET /public/status` — sanitized JSON polled by the page.
 
-Dimensions are **group (line) × model**: channels are transparent to users. Visible groups come from new-api's `/api/pricing` (`usable_group`, i.e. the groups selectable when creating a token); display names match the main site. Status is synthesized from **topology health (whether a group×model has any usable channel)** + **last-7-day traffic**: a configured group×model with no usable channel shows "outage".
+Dimensions are **group (line) × model**: channels are transparent to users. Visible groups come from new-api's `/api/pricing` (`usable_group`, i.e. the groups selectable when creating a token); display names match the main site. Status is synthesized from **recent uptime + whether any usable upstream exists**: Operational (≥99%) · Degraded (50–99%, still serving) · Outage (<50% or no usable upstream). A line is at most Degraded as long as any model is Operational; Outage only when no model is Operational (it does not take the worst model, so one degraded model won't mark the whole line as down).
 
 > **Disabled channels are excluded from stability** (board + internal monitor): stability aggregates (overview / group / model / trend) only count traffic from channels that are **currently enabled and after their enable time**. Failures from manually-disabled / auto-disabled channels no longer drag a model down; a re-enabled channel (including a fresh deploy) is counted from its enable time (`channel_snaps.enabled_since`). The internal "by channel" table still lists disabled channels for diagnosis.
+
+> **Only user-selectable models are shown / counted**: the board only displays — and the internal monitor only aggregates — (group, model) pairs that are both in a visible group (`/api/pricing`) and configured on an enabled channel. Non-selectable ones (all-disabled / only in non-selectable groups / merely mis-routed to a channel that doesn't list them) are excluded everywhere — board, monitor and alerts (alerting on something nobody can select is pointless). The internal "by channel" table is not filtered, so mis-routes stay visible for diagnosis.
 
 **Hard isolation**: the board is the standalone `monitor/public` package, reads only the local sampling DB, and never references internal structs; the public surface **never emits** channel names/IDs/IPs, cost/quota, tokens/users, request volume/QPS, or error details.
 
