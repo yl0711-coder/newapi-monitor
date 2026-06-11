@@ -36,11 +36,12 @@ type metricSample struct {
 func (metricSample) TableName() string { return "metric_samples" }
 
 type channelSnap struct {
-	ID        int `gorm:"primaryKey;autoIncrement:false"`
-	Status    int
-	Groups    string
-	Models    string
-	UpdatedAt int64
+	ID           int `gorm:"primaryKey;autoIncrement:false"`
+	Status       int
+	Groups       string
+	Models       string
+	EnabledSince int64
+	UpdatedAt    int64
 }
 
 func (channelSnap) TableName() string { return "channel_snaps" }
@@ -215,5 +216,32 @@ func TestP50ms(t *testing.T) {
 	}
 	if p50ms(agg{}) != 0 {
 		t.Error("空直方图应返回 0")
+	}
+}
+
+// 禁用渠道的失败不该拖低模型:同模型 m1 由 1 个启用渠道(全成功)+ 1 个手动禁用渠道(全挂)提供,
+// 看板应判 m1 正常(stUp),而不是被禁用渠道的失败拖到不可用。这正是线上报的那个 bug。
+func TestDisabledChannelExcludedFromBoard(t *testing.T) {
+	db := testDB(t)
+	now := int64(1_900_000_000)
+	bt := now - 1800 // 近窗口内
+	db.Create(&[]channelSnap{
+		{ID: 1, Status: 1, Groups: "g1", Models: "m1", EnabledSince: now - 86400, UpdatedAt: now}, // 启用
+		{ID: 2, Status: 2, Groups: "g1", Models: "m1", EnabledSince: 0, UpdatedAt: now},           // 手动禁用
+	})
+	db.Create(&[]metricSample{
+		{BucketTs: bt, ChannelID: 1, ModelName: "m1", Grp: "g1", Success: 50, Lat2: 50, MaxUseTime: 2}, // 启用渠道:全成功
+		{BucketTs: bt, ChannelID: 2, ModelName: "m1", Grp: "g1", Failed: 80},                           // 禁用渠道:全挂 → 应排除
+	})
+	st := -99
+	for _, g := range (&handler{db: db, cfg: Config{}}).compute(now).Groups {
+		for _, m := range g.Models {
+			if m.Name == "m1" {
+				st = m.Status
+			}
+		}
+	}
+	if st != stUp {
+		t.Fatalf("m1 应为 stUp(禁用渠道的80失败被排除、启用渠道全成功),得 %d", st)
 	}
 }

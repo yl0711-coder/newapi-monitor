@@ -300,7 +300,7 @@ func (h *handler) totals(since int64) map[string]agg {
 		COALESCE(SUM(lat_1),0) l1, COALESCE(SUM(lat_2),0) l2, COALESCE(SUM(lat_5),0) l5, COALESCE(SUM(lat_10),0) l10,
 		COALESCE(SUM(lat_30),0) l30, COALESCE(SUM(lat_60),0) l60, COALESCE(SUM(lat_inf),0) linf,
 		COALESCE(MAX(max_use_time),0) mx
-		FROM metric_samples WHERE bucket_ts >= ? GROUP BY grp, model_name`, since).Scan(&rows).Error; err != nil {
+		FROM metric_samples WHERE bucket_ts >= ?`+enabledChanFilter+` GROUP BY grp, model_name`, since).Scan(&rows).Error; err != nil {
 		slog.Warn("看板:分组×模型汇总查询失败(降级为空)", "err", err)
 	}
 	out := make(map[string]agg, len(rows))
@@ -312,6 +312,12 @@ func (h *handler) totals(since int64) map[string]agg {
 	}
 	return out
 }
+
+// enabledChanFilter:看板稳定性排除"已知被禁用 / 在其启用时刻之前"的渠道流量,与内部监控一致。
+// 用 NOT EXISTS(反向):没有渠道快照的流量默认保留(fail-open),避免新部署空窗全空。
+// 详见 monitor 包 store.go 同名常量说明。
+const enabledChanFilter = ` AND NOT EXISTS (SELECT 1 FROM channel_snaps c ` +
+	`WHERE c.id = metric_samples.channel_id AND (c.status <> 1 OR metric_samples.bucket_ts < c.enabled_since))`
 
 type seriesPt struct {
 	Ts   int64
@@ -329,7 +335,7 @@ func (h *handler) series(since int64) map[string][]seriesPt {
 	}
 	if err := h.db.Raw(`SELECT grp, model_name AS model, bucket_ts,
 		COALESCE(SUM(success+anomaly),0) up, COALESCE(SUM(failed),0) fail
-		FROM metric_samples WHERE bucket_ts >= ? GROUP BY grp, model_name, bucket_ts ORDER BY bucket_ts`, since).Scan(&rows).Error; err != nil {
+		FROM metric_samples WHERE bucket_ts >= ?`+enabledChanFilter+` GROUP BY grp, model_name, bucket_ts ORDER BY bucket_ts`, since).Scan(&rows).Error; err != nil {
 		slog.Warn("看板:分桶序列查询失败(降级为空)", "err", err)
 	}
 	out := map[string][]seriesPt{}
