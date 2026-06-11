@@ -111,6 +111,12 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
   </table>
 </div>
 
+<div class="card">
+  <h2>被拒请求(前置拒绝统计)</h2>
+  <p class="muted" style="margin:-6px 0 12px">开启后,内部监控页显示「被拒请求」面板,统计"无可用渠道"等<b>没进 logs 表</b>的前置拒绝(按 模型 × 分组)。<b>需在每个 new-api 节点安装采集器 <code>newapi-reject-collector</code> 才有数据</b>;未安装则面板提示"暂无数据"。</p>
+  <label class="ck"><input type="checkbox" id="reject_panel_enabled"> 启用「被拒请求」面板</label>
+</div>
+
 <div class="bar">
   <button class="btn btn-primary" id="saveBtn">保存</button>
   <button class="btn btn-outline" id="testBtn">发送测试邮件</button>
@@ -120,7 +126,7 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
 <script>
 const $=id=>document.getElementById(id);
 const numFields=['smtp_port','eval_window_min','err_rate_pct','err_min_count','err_burst_count','anomaly_burst_buckets','anomaly_min_count','cooldown_min','slo_target_pct','slo_window_days','burn_fast_rate','burn_fast_window_min','burn_slow_rate','burn_slow_window_min'];
-const ckFields=['enabled','smtp_ssl','sampler_down_enabled','slo_enabled','burn_fast_enabled','burn_slow_enabled'];
+const ckFields=['enabled','smtp_ssl','sampler_down_enabled','slo_enabled','burn_fast_enabled','burn_slow_enabled','reject_panel_enabled'];
 const txtFields=['site_name','smtp_host','smtp_user','smtp_password','smtp_from','recipients'];
 
 function fill(cfg, pwSet){

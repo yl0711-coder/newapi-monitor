@@ -83,12 +83,24 @@ type HourSample struct {
 // ChannelSnap 渠道健康快照:采样器周期性从生产 channels 表读入(id/状态/分组/模型),
 // 供对外看板(public 包)派生"某线路×模型有无可用渠道"。仅存路由与状态,【无任何密钥】。
 type ChannelSnap struct {
-	ID        int    `gorm:"primaryKey;autoIncrement:false"`
-	Status    int    // new-api: 1启用 / 2手动禁用 / 3自动禁用
-	Groups    string `gorm:"size:512"`  // 逗号分隔分组
-	Models    string `gorm:"type:text"` // 逗号分隔模型
-	UpdatedAt int64  `gorm:"index"`
+	ID           int    `gorm:"primaryKey;autoIncrement:false"`
+	Status       int    // new-api: 1启用 / 2手动禁用 / 3自动禁用
+	Groups       string `gorm:"size:512"`  // 逗号分隔分组
+	Models       string `gorm:"type:text"` // 逗号分隔模型
+	EnabledSince int64  // 当前这段"启用"的起始 Unix 秒;禁用=0;0 也表示"自始启用"(算全量历史);重启用刷新为重启用时刻
+	UpdatedAt    int64  `gorm:"index"`
 }
+
+// enabledChanFilter 把"已知被禁用 / 在其启用时刻之前"的渠道流量排除出稳定性聚合:
+// 禁用渠道(手动/熔断)的旧账不计入;重新启用的渠道从 enabled_since 重新计。
+// 用 NOT EXISTS(反向)而非 EXISTS(正向):**没有渠道快照的流量默认保留**(fail-open)——
+// 避免"新部署首刷前 channel_snaps 为空 → 全被排除"的空窗;只排除明确已知该排除的。
+// 仅用于"跨渠道聚合"(总览/分组/模型/趋势 + 看板);按渠道明细(channel_id)不加,排障仍能看到禁用渠道。
+const enabledChanFilter = ` AND NOT EXISTS (SELECT 1 FROM channel_snaps c ` +
+	`WHERE c.id = metric_samples.channel_id AND (c.status <> 1 OR metric_samples.bucket_ts < c.enabled_since))`
+
+// channelDim 是"按渠道"维度的列名;该维度不施加 enabledChanFilter。
+const channelDim = "channel_id"
 
 // RejectionSample 是「前置拒绝」按分钟聚合的计数,由各节点的旁路采集器
 // (newapi-reject-collector)POST 推来。这类拒绝(如"无可用渠道")不进 new-api 的 logs 表,
@@ -146,6 +158,42 @@ func (m *Monitor) upsertTokenSamples(rows []TokenSample) error {
 		Columns:   []clause.Column{{Name: "bucket_ts"}, {Name: "token_name"}},
 		UpdateAll: true,
 	}).CreateInBatches(rows, 200).Error
+}
+
+// nextEnabledSince 计算渠道本轮的 enabled_since:
+//   - 禁用 → 0;
+//   - 上轮也启用 → 保持原值(含 0:0 表示"自始启用、算全量历史"——升级首刷时既有启用渠道保持 0,
+//     不因一次监控部署把所有渠道的稳定性历史清掉);
+//   - 新建 / 从禁用重新启用 → 记为 now(从启用时刻起算)。
+func nextEnabledSince(status, prevStatus int, prevSince, now int64) int64 {
+	if status != 1 {
+		return 0
+	}
+	if prevStatus == 1 {
+		return prevSince
+	}
+	return now
+}
+
+// chanPrev 是某渠道上一轮的状态与启用起始时刻,供刷新时判断"禁用→启用"跳变。
+type chanPrev struct {
+	status int
+	since  int64
+}
+
+// channelEnabledState 返回当前 channel_snaps 里每个渠道的上一轮状态,
+// 供刷新时正确维护 enabled_since(渠道不存在时取零值,即按"新建"处理)。
+func (m *Monitor) channelEnabledState() map[int]chanPrev {
+	var rows []struct {
+		ID, Status   int
+		EnabledSince int64
+	}
+	m.storeDB.Raw("SELECT id, status, enabled_since FROM channel_snaps").Scan(&rows)
+	out := make(map[int]chanPrev, len(rows))
+	for _, r := range rows {
+		out[r.ID] = chanPrev{status: r.Status, since: r.EnabledSince}
+	}
+	return out
 }
 
 // replaceChannelSnaps 用本轮读到的渠道快照覆盖本地表:幂等 UPSERT + 删除本轮未出现的(已删渠道)。
@@ -317,7 +365,7 @@ func percentile(hist []int64, edges []int, maxVal int, p float64) float64 {
 
 func (m *Monitor) storeSummary(since int64, windowSec float64) (*Summary, error) {
 	var a aggRow
-	if err := m.storeDB.Raw(`SELECT '' AS k, `+aggCols+` FROM metric_samples WHERE bucket_ts >= ?`, since).
+	if err := m.storeDB.Raw(`SELECT '' AS k, `+aggCols+` FROM metric_samples WHERE bucket_ts >= ?`+enabledChanFilter, since).
 		Scan(&a).Error; err != nil {
 		return nil, fmt.Errorf("本地汇总失败: %w", err)
 	}
@@ -346,9 +394,13 @@ func (m *Monitor) storeDimSeries(dimCol string, since int64, windowMinutes int) 
 		Anomaly  int64
 		Failed   int64
 	}
+	f := enabledChanFilter
+	if dimCol == channelDim { // 按渠道明细不过滤,排障仍能看禁用渠道
+		f = ""
+	}
 	q := fmt.Sprintf(`SELECT %s AS k, bucket_ts, COALESCE(SUM(success),0) AS success,
 		COALESCE(SUM(anomaly),0) AS anomaly, COALESCE(SUM(failed),0) AS failed
-		FROM metric_samples WHERE bucket_ts >= ? GROUP BY k, bucket_ts ORDER BY k, bucket_ts`, dimCol)
+		FROM metric_samples WHERE bucket_ts >= ?%s GROUP BY k, bucket_ts ORDER BY k, bucket_ts`, dimCol, f)
 	var rows []row
 	if err := m.storeDB.Raw(q, since).Scan(&rows).Error; err != nil {
 		return nil, fmt.Errorf("本地维度时序失败(%s): %w", dimCol, err)
@@ -381,9 +433,13 @@ func (m *Monitor) storeDimSeries(dimCol string, since int64, windowMinutes int) 
 }
 
 func (m *Monitor) storeDim(dimCol string, since int64, windowSec float64) ([]Row, error) {
+	f := enabledChanFilter
+	if dimCol == channelDim { // 按渠道明细不过滤,排障仍能看禁用渠道
+		f = ""
+	}
 	q := fmt.Sprintf(`SELECT %s AS k, %s FROM metric_samples
-		WHERE bucket_ts >= ? GROUP BY %s
-		ORDER BY failed DESC, (success+failed) DESC LIMIT 200`, dimCol, aggCols, dimCol)
+		WHERE bucket_ts >= ?%s GROUP BY %s
+		ORDER BY failed DESC, (success+failed) DESC LIMIT 200`, dimCol, aggCols, f, dimCol)
 	var rows []aggRow
 	if err := m.storeDB.Raw(q, since).Scan(&rows).Error; err != nil {
 		return nil, fmt.Errorf("本地维度聚合失败(%s): %w", dimCol, err)
@@ -409,7 +465,7 @@ func (m *Monitor) storeTrend(since int64, windowMinutes int) ([]TimePoint, error
 	}
 	var rows []minRow
 	if err := m.storeDB.Raw(`SELECT bucket_ts, COALESCE(SUM(success),0) AS success, COALESCE(SUM(failed),0) AS failed
-		FROM metric_samples WHERE bucket_ts >= ? GROUP BY bucket_ts ORDER BY bucket_ts`, since).
+		FROM metric_samples WHERE bucket_ts >= ?`+enabledChanFilter+` GROUP BY bucket_ts ORDER BY bucket_ts`, since).
 		Scan(&rows).Error; err != nil {
 		return nil, fmt.Errorf("本地趋势失败: %w", err)
 	}

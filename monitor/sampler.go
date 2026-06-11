@@ -239,6 +239,7 @@ func (m *Monitor) refreshChannels() {
 	names := map[string]string{}
 	var snaps []ChannelSnap
 	now := time.Now().Unix()
+	prev := m.channelEnabledState() // 上一轮各渠道 (status, enabled_since)
 	for rows.Next() {
 		var id, status int
 		var name, grp, models sql.NullString
@@ -246,7 +247,9 @@ func (m *Monitor) refreshChannels() {
 			return
 		}
 		names[strconv.Itoa(id)] = name.String
-		snaps = append(snaps, ChannelSnap{ID: id, Status: status, Groups: grp.String, Models: models.String, UpdatedAt: now})
+		p := prev[id] // 不存在则零值(status 0 / since 0),nextEnabledSince 按"新建即启用"处理
+		enabledSince := nextEnabledSince(status, p.status, p.since, now)
+		snaps = append(snaps, ChannelSnap{ID: id, Status: status, Groups: grp.String, Models: models.String, EnabledSince: enabledSince, UpdatedAt: now})
 	}
 	if err := rows.Err(); err != nil {
 		return

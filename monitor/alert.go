@@ -49,6 +49,10 @@ type AlertConfig struct {
 	BurnSlowRate      float64 `json:"burn_slow_rate"`       // 慢烧倍数阈值,如 3
 	BurnSlowWindowMin int     `json:"burn_slow_window_min"` // 慢烧观察窗(分钟),如 360
 
+	// 被拒请求面板(前置拒绝统计):开启后内部监控页显示「被拒请求」面板。
+	// 数据需在各 new-api 节点安装采集器 newapi-reject-collector 才有;默认关。
+	RejectPanelEnabled bool `json:"reject_panel_enabled"`
+
 	UpdatedAt int64 `json:"-"`
 }
 
