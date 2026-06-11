@@ -4,6 +4,8 @@
 
 ## [Unreleased]
 
+## [1.3.2] - 2026-06-12
+
 ### Changed
 - **监控也只统计用户可选的模型**(报警同理——"都不能选了报什么警"):新增 `selectable_pairs` 表,采样器每分钟据 `/api/pricing` 可见分组 ∩ 启用渠道配置 重算;监控的稳定性聚合(总览/分组/模型/趋势 + 报警 summary)只算可选 (分组,模型),排除误路由 / 全禁用 / 只在不可选分组的流量(表为空 fail-open 不过滤,避免空窗)。「按渠道」明细不过滤,排障仍能看误路由等异常。
 - 看板**只显示用户真能选到的模型**:某分组×模型在该(可见)分组下至少有一个【启用】渠道才显示;改用 channel_snaps 的启用渠道配置判定,不再因历史/偶发流量带出"不可选"模型。自动隐藏:所有含它的渠道都被禁用、只配置在不可选分组、或仅因误路由产生流量(例:gpt-image-1 只配在内部分组 internal_test,却因 1 次误路由出现在 codex-1.2x 显示"不可用",现已隐藏)。
@@ -103,7 +105,8 @@
 - 纯 Go + 内嵌 SQLite(`CGO_ENABLED=0` 静态编译),单容器、零外部依赖。
 - Docker 镜像;GitHub Actions 自动 `go vet` + `go test` + `golangci-lint`,通过后发布镜像到 GHCR。
 
-[Unreleased]: https://github.com/yl0711-coder/newapi-monitor/compare/v1.3.1...HEAD
+[Unreleased]: https://github.com/yl0711-coder/newapi-monitor/compare/v1.3.2...HEAD
+[1.3.2]: https://github.com/yl0711-coder/newapi-monitor/compare/v1.3.1...v1.3.2
 [1.3.1]: https://github.com/yl0711-coder/newapi-monitor/compare/v1.3.0...v1.3.1
 [1.3.0]: https://github.com/yl0711-coder/newapi-monitor/compare/v1.2.0...v1.3.0
 [1.2.0]: https://github.com/yl0711-coder/newapi-monitor/compare/v1.1.5...v1.2.0
