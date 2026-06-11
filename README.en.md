@@ -51,6 +51,13 @@ Open `http://<host>:8090` and log in with a new-api admin account. See [`docker-
 | `MONITOR_HOUR_RETENTION_DAYS` | Hourly-rollup retention (long-term trend + WoW/DoD) | `90` |
 | `MONITOR_HEARTBEAT_URL` | Dead-man heartbeat URL (e.g. healthchecks.io); empty = off | empty |
 | `MONITOR_SITE_NAME` | Fallback site name for the public board; name/favicon are synced from new-api `system_name`/`logo` at deploy, this is only used when the main site is unreachable | empty |
+| `MONITOR_INGEST_TOKEN` | Auth token for the "Rejected requests" ingest endpoint `POST /internal/rejections`, used by per-node [newapi-reject-collector](https://github.com/yl0711-coder/newapi-reject-collector) to push pre-routing rejections; **empty = endpoint disabled** | empty |
+
+## Rejected requests (pre-routing · logs blind spot)
+
+new-api's "No available channel" and other **pre-routing rejections** are not written to the `logs` table, so any logs-based monitor is blind to them. The companion sidecar collector [newapi-reject-collector](https://github.com/yl0711-coder/newapi-reject-collector) tails new-api logs on each node, extracts these rejections, and `POST`s them to `/internal/rejections` (authenticated by `MONITOR_INGEST_TOKEN`); the monitor stores them in `rejection_samples` and shows a "Rejected requests" panel by model × group.
+
+The panel is gated by a **super-admin toggle** (Alert settings, **off by default**): it only shows when enabled, with a note that the collector must be installed on each node; when enabled but no data has arrived yet, it shows an empty state. The ingest endpoint returns 503 when `MONITOR_INGEST_TOKEN` is unset. Toggle off / no token / no data — none of these affects other monitor features.
 
 ## Public status board (public, no login)
 Besides the internal monitor, the same process serves a **customer-facing public status page** (sanitized, no login), ideal for a dedicated subdomain (e.g. `status.example.com`):
