@@ -172,18 +172,23 @@ func nextEnabledSince(status, prevStatus int, prevSince, now int64) int64 {
 	return now
 }
 
-// channelEnabledState 返回当前 channel_snaps 里每个渠道的 (status, enabled_since),
-// 供刷新时判断"禁用→启用"跳变以正确维护 enabled_since。
-func (m *Monitor) channelEnabledState() map[int][2]int64 {
+// chanPrev 是某渠道上一轮的状态与启用起始时刻,供刷新时判断"禁用→启用"跳变。
+type chanPrev struct {
+	status int
+	since  int64
+}
+
+// channelEnabledState 返回当前 channel_snaps 里每个渠道的上一轮状态,
+// 供刷新时正确维护 enabled_since(渠道不存在时取零值,即按"新建"处理)。
+func (m *Monitor) channelEnabledState() map[int]chanPrev {
 	var rows []struct {
-		ID           int
-		Status       int
+		ID, Status   int
 		EnabledSince int64
 	}
 	m.storeDB.Raw("SELECT id, status, enabled_since FROM channel_snaps").Scan(&rows)
-	out := make(map[int][2]int64, len(rows))
+	out := make(map[int]chanPrev, len(rows))
 	for _, r := range rows {
-		out[r.ID] = [2]int64{int64(r.Status), r.EnabledSince}
+		out[r.ID] = chanPrev{status: r.Status, since: r.EnabledSince}
 	}
 	return out
 }
