@@ -78,10 +78,10 @@ func (m *Monitor) loop(ctx context.Context, interval time.Duration) {
 			if err := m.sampleTokens(ctx, lookback); err != nil {
 				slog.Warn("token 维度采样失败(忽略,不影响主监控)", "err", err)
 			}
+			m.refreshChannels() // 每周期同步渠道开关(小查询),禁用/重启用近乎实时反映到稳定性
 			m.evaluateAlerts(time.Now().Unix())
 			ticks++
 			if ticks%(int(600/interval.Seconds())+1) == 0 {
-				m.refreshChannels()
 				if d := m.cfg.RetentionDays; d > 0 {
 					cutoff := time.Now().Unix() - int64(d)*86400
 					if n, err := m.pruneOlderThan(cutoff); err == nil && n > 0 {

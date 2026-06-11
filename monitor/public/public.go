@@ -30,6 +30,7 @@ const (
 	windowDays      = 7 // 可用率/状态条窗口
 	windowSec       = int64(windowDays * 86400)
 	beatCount       = 50            // 心跳条桶数
+	beatMinSample   = 5             // 单个心跳桶请求数低于此 → 不画红/黄(几条里挂1个不代表服务差,公开页避免被噪声误导)
 	minSample       = 20            // 窗口内请求数低于此 → 不据流量判故障
 	recentWindowSec = int64(86400)  // 判定【当下】状态的近期窗口(24h):状态看当下,不被旧数据钉死
 	staleAfterSec   = int64(172800) // 最新流量早于此(48h)→ 可用率/延迟视为陈旧,显 — 不展示
@@ -449,7 +450,7 @@ func buildBeats(pts []seriesPt, now, since int64) []int {
 	}
 	for i := range beats {
 		t := sums[i].up + sums[i].fail
-		if t == 0 {
+		if t < beatMinSample { // 样本太少(含空桶)不画红/黄:避免少量请求里的偶发失败在公开页呈现为"差"
 			beats[i] = stUp
 			continue
 		}

@@ -195,8 +195,10 @@ const state = { snap:null, q:"", site:"", logo:"" };
 const worst = arr => arr.reduce((w,s)=> SEV[s]>SEV[w]?s:w, 1);
 function clock(){ const n=new Date(); return [n.getHours(),n.getMinutes(),n.getSeconds()].map(x=>String(x).padStart(2,"0")).join(":"); }
 function esc(s){ return String(s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
-function beatTime(i,n){ const slice=WIN_DAYS*86400000/n; const d=new Date(Date.now()-WIN_DAYS*86400000+i*slice);
-  return `${d.getMonth()+1}/${d.getDate()} ${String(d.getHours()).padStart(2,"0")}:00`; }
+// 每个桶覆盖一段时间(7天/桶数),tooltip 显示其【区间】;末桶结束即"现在",避免误读为"数据只到某点"。
+function beatTime(i,n){ const span=WIN_DAYS*86400000/n, base=Date.now()-WIN_DAYS*86400000;
+  const f=t=>{const d=new Date(t);return `${d.getMonth()+1}/${d.getDate()} ${String(d.getHours()).padStart(2,"0")}:${String(d.getMinutes()).padStart(2,"0")}`;};
+  return `${f(base+i*span)} – ${i>=n-1?t("cap_now"):f(base+(i+1)*span)}`; }
 function upStr(m){ return m.uptime==null?"—":(m.uptime*100).toFixed(2)+"%"; }
 function latStr(m){ return m.latency_ms==null?"—":(m.latency_ms/1000).toFixed(1)+"s"; }
 function pvLabel(p){ return PVN[p] || (lang==="zh"?"其他":"Other"); }

@@ -4,6 +4,15 @@
 
 ## [Unreleased]
 
+### Changed
+- 渠道开关状态改为**每个采样周期(1 分钟)同步**(原约 10 分钟):"禁用渠道不计入 / 重启用从启用时刻起算"近乎实时生效;代价可忽略(小查询,远轻于每分钟的日志聚合)。
+
+### Fixed
+- 看板心跳条 tooltip 改为显示该桶的**时间区间**(末桶结束 = 现在),消除"误以为数据只到某点"的歧义(每桶约 7天÷桶数 ≈ 3.4 小时)。
+- 看板心跳条:**单桶请求数过少(<5)不再画红/黄**,避免少量请求里的偶发失败在对外页面被呈现为"服务差"。
+
+## [1.3.0] - 2026-06-11
+
 ### Added
 - 「被拒请求」面板增加**超管开关**(报警设置页「被拒请求」):默认关,开启后内部监控才显示该面板;开关旁说明需在各 new-api 节点安装采集器 `newapi-reject-collector` 才有数据。开启但尚无采集器数据时,面板显示"暂无数据,请部署采集器"空状态(而非隐藏)。
 
@@ -87,7 +96,8 @@
 - 纯 Go + 内嵌 SQLite(`CGO_ENABLED=0` 静态编译),单容器、零外部依赖。
 - Docker 镜像;GitHub Actions 自动 `go vet` + `go test` + `golangci-lint`,通过后发布镜像到 GHCR。
 
-[Unreleased]: https://github.com/yl0711-coder/newapi-monitor/compare/v1.2.0...HEAD
+[Unreleased]: https://github.com/yl0711-coder/newapi-monitor/compare/v1.3.0...HEAD
+[1.3.0]: https://github.com/yl0711-coder/newapi-monitor/compare/v1.2.0...v1.3.0
 [1.2.0]: https://github.com/yl0711-coder/newapi-monitor/compare/v1.1.5...v1.2.0
 [1.1.5]: https://github.com/yl0711-coder/newapi-monitor/compare/v1.1.4...v1.1.5
 [1.1.4]: https://github.com/yl0711-coder/newapi-monitor/compare/v1.1.3...v1.1.4
