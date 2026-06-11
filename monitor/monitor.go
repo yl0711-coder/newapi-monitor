@@ -229,7 +229,8 @@ type Snapshot struct {
 	Trend          []TimePoint    `json:"trend"`
 	SLO            SLOStatus      `json:"slo"`
 	Compare        CompareStat    `json:"compare"`
-	Rejections     []RejectionRow `json:"rejections"` // 前置拒绝(采集器旁路采集,logs 盲区)
+	Rejections     []RejectionRow `json:"rejections"`     // 前置拒绝(采集器旁路采集,logs 盲区)
+	RejectEnabled  bool           `json:"reject_enabled"` // 超管是否开启「被拒请求」面板
 }
 
 // attachSpark 给每行挂上对应维度取值的分钟桶时序(失败则静默跳过)。
@@ -357,9 +358,13 @@ func (m *Monitor) computeSnapshot(windowMinutes int, nowUnix int64) (*Snapshot, 
 	if terr != nil {
 		tokens = nil // token 维度失败不影响主看板
 	}
-	slo := m.computeSLO(m.loadAlertConfig(), nowUnix)
+	ac := m.loadAlertConfig()
+	slo := m.computeSLO(ac, nowUnix)
 	compare := m.storeCompare(nowUnix)
-	rejections := m.storeRejections(nowUnix - int64(windowMinutes)*60)
+	var rejections []RejectionRow
+	if ac.RejectPanelEnabled { // 关闭时不查、不下发,面板隐藏
+		rejections = m.storeRejections(nowUnix - int64(windowMinutes)*60)
+	}
 
 	lastBucket := m.storeFreshness()
 	age := int64(-1)
@@ -384,5 +389,6 @@ func (m *Monitor) computeSnapshot(windowMinutes int, nowUnix int64) (*Snapshot, 
 		SLO:            slo,
 		Compare:        compare,
 		Rejections:     rejections,
+		RejectEnabled:  ac.RejectPanelEnabled,
 	}, nil
 }
