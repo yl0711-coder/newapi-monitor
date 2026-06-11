@@ -3,6 +3,7 @@ package monitor
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -78,7 +79,8 @@ func (m *Monitor) loop(ctx context.Context, interval time.Duration) {
 			if err := m.sampleTokens(ctx, lookback); err != nil {
 				slog.Warn("token 维度采样失败(忽略,不影响主监控)", "err", err)
 			}
-			m.refreshChannels() // 每周期同步渠道开关(小查询),禁用/重启用近乎实时反映到稳定性
+			m.refreshChannels()   // 每周期同步渠道开关(小查询),禁用/重启用近乎实时反映到稳定性
+			m.refreshSelectable() // 每周期重算"可选(分组,模型)对",监控只统计用户能选到的模型
 			m.evaluateAlerts(time.Now().Unix())
 			ticks++
 			if ticks%(int(600/interval.Seconds())+1) == 0 {
@@ -263,6 +265,71 @@ func (m *Monitor) refreshChannels() {
 		if err := m.replaceChannelSnaps(snaps, now); err != nil {
 			slog.Warn("渠道健康快照写入失败(忽略,不影响监控)", "err", err)
 		}
+	}
+}
+
+// fetchUsableGroups 从 new-api 的 /api/pricing(匿名可读)取可见分组(用户创建令牌时能选的分组)。
+func (m *Monitor) fetchUsableGroups() []string {
+	base := strings.TrimRight(m.cfg.NewAPIBaseURL, "/")
+	if base == "" {
+		return nil
+	}
+	cl := &http.Client{Timeout: 5 * time.Second}
+	resp, err := cl.Get(base + "/api/pricing")
+	if err != nil {
+		return nil
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return nil
+	}
+	var body struct {
+		UsableGroup map[string]string `json:"usable_group"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		return nil
+	}
+	out := make([]string, 0, len(body.UsableGroup))
+	for k := range body.UsableGroup {
+		if k != "" {
+			out = append(out, k)
+		}
+	}
+	return out
+}
+
+// refreshSelectable 重算"可选 (分组,模型) 对" = 可见分组(/api/pricing) ∩ 启用渠道配置(channel_snaps),
+// 写入 selectable_pairs。拉不到可见分组则不动旧表(避免误清空导致监控全过滤为空)。
+func (m *Monitor) refreshSelectable() {
+	groups := m.fetchUsableGroups()
+	if len(groups) == 0 {
+		return
+	}
+	visible := make(map[string]bool, len(groups))
+	for _, g := range groups {
+		visible[g] = true
+	}
+	var rows []struct{ Groups, Models string }
+	m.storeDB.Raw("SELECT groups, models FROM channel_snaps WHERE status = 1").Scan(&rows)
+	set := map[[2]string]bool{}
+	for _, r := range rows {
+		for _, g := range splitList(r.Groups) {
+			if !visible[g] {
+				continue
+			}
+			for _, md := range splitList(r.Models) {
+				if md != "" && md != "*" {
+					set[[2]string{g, md}] = true
+				}
+			}
+		}
+	}
+	pairs := make([]SelectablePair, 0, len(set))
+	for k := range set {
+		pairs = append(pairs, SelectablePair{Grp: k[0], Model: k[1]})
+	}
+	if err := m.replaceSelectablePairs(pairs); err != nil {
+		slog.Warn("可选模型对刷新失败(忽略,沿用上次)", "err", err)
 	}
 }
 
