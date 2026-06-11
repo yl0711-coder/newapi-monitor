@@ -279,11 +279,15 @@ function renderTokens(rows){
 }
 const REJHEAD=`<tr><th>模型</th><th>分组</th><th>原因</th><th class="right">被拒次数</th></tr>`;
 const REJREASON={no_available_channel:'无可用渠道'};
-function renderRejections(rows){
+function renderRejections(rows, enabled){
   const card=document.getElementById('rejCard');
-  if(!rows||!rows.length){card.style.display='none';return} // 没采集器/无拒绝则隐藏整卡
+  if(!enabled){card.style.display='none';return} // 超管未开启「被拒请求」→ 隐藏整卡
   card.style.display='';
   document.getElementById('thRej').innerHTML=REJHEAD;
+  if(!rows||!rows.length){ // 开了但没数据 → 空状态,提示装采集器
+    document.getElementById('tbRej').innerHTML=`<tr><td colspan="4" class="muted" style="text-align:center;padding:24px">尚未收到采集器数据，请在各 new-api 节点部署采集器 <code>newapi-reject-collector</code></td></tr>`;
+    return;
+  }
   document.getElementById('tbRej').innerHTML=rows.map(r=>`<tr>
     <td>${esc(r.model)}</td>
     <td>${esc(r.group)}</td>
@@ -424,7 +428,7 @@ function apply(s){
   renderBanner(s);renderSummary(s.summary);renderSLO(s.slo);renderCompare(s.compare);renderLatHist(s.summary);lastTrend=s.trend||[];drawTrend(lastTrend);
   renderTable('thGroup','tbGroup',s.by_group);renderTable('thChannel','tbChannel',s.by_channel);renderTable('thModel','tbModel',s.by_model);
   renderTokens(s.by_token);
-  renderRejections(s.rejections);
+  renderRejections(s.rejections, s.reject_enabled);
 }
 async function load(){
   try{
