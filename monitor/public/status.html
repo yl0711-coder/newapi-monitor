@@ -160,7 +160,7 @@ const I18N = {
     no_match:"没有匹配「{q}」的模型", no_data:"暂无数据", err:"暂时无法获取服务状态,请稍后刷新",
     modal_sub:"线路 = 创建令牌时所选分组「{name}」· 共 {n} 个模型",
     leg_ok:"正常", leg_warn:"性能下降", leg_bad:"不可用", leg_maint:"维护中", leg_na:"数据不足",
-    rule:"线路 = 创建令牌时所选「分组」;同一模型在不同线路可能状态不同,可搜索对比后自行选择。状态反映「当下」可用性(近期流量 + 是否有可用上游):正常 · 性能下降(近期可用率 85–99%)· 不可用(近期可用率 <85% 或无可用上游)。可用率 = 成功请求 /(总请求 − 用户侧错误),为近 7 天统计;数据过旧时显「—」。",
+    rule:"线路 = 创建令牌时所选「分组」;同一模型在不同线路可能状态不同,可搜索对比后自行选择。状态反映「当下」可用性(近期流量 + 是否有可用上游):正常 · 性能下降(近期可用率 50–99%,仍在服务)· 不可用(近期可用率 <50% 或无可用上游)。分组状态:有正常模型即最多「性能下降」,无任一正常模型才「不可用」。可用率 = 成功请求 /(总请求 − 用户侧错误),为近 7 天统计;数据过旧时显「—」。",
     foot:"由 NexusAPI 提供",
   },
   en: {
@@ -175,7 +175,7 @@ const I18N = {
     no_match:'No models matching "{q}"', no_data:"No data yet", err:"Service status temporarily unavailable, please refresh later.",
     modal_sub:'Line = the group selected when creating a token ("{name}") · {n} models',
     leg_ok:"Operational", leg_warn:"Degraded", leg_bad:"Outage", leg_maint:"Maintenance", leg_na:"No data",
-    rule:"A line = the group selected when creating a token; the same model may differ across lines — search to compare and choose. Status reflects current availability (recent traffic + whether any usable upstream exists): Operational · Degraded (recent uptime 85–99%) · Outage (recent uptime <85% or no usable upstream). Uptime = successful / (total − user-side errors), over the last 7 days; shown as \"—\" when data is stale.",
+    rule:"A line = the group selected when creating a token; the same model may differ across lines — search to compare and choose. Status reflects current availability (recent traffic + whether any usable upstream exists): Operational · Degraded (recent uptime 50–99%, still serving) · Outage (recent uptime <50% or no usable upstream). A line is at most Degraded as long as any model is Operational; Outage only when no model is Operational. Uptime = successful / (total − user-side errors), over the last 7 days; shown as \"—\" when data is stale.",
     foot:"Powered by NexusAPI",
   },
 };
@@ -191,12 +191,12 @@ const SEV = { 0:4, 2:3, "-1":2, 3:1, 1:0 };
 const PVN = { anthropic:"Anthropic", openai:"OpenAI", google:"Google", deepseek:"DeepSeek", zhipu:"Zhipu", other:"" };
 const WIN_DAYS = 7, PER = 7;
 const state = { snap:null, q:"", site:"", logo:"" };
-
-const worst = arr => arr.reduce((w,s)=> SEV[s]>SEV[w]?s:w, 1);
 function clock(){ const n=new Date(); return [n.getHours(),n.getMinutes(),n.getSeconds()].map(x=>String(x).padStart(2,"0")).join(":"); }
 function esc(s){ return String(s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
-function beatTime(i,n){ const slice=WIN_DAYS*86400000/n; const d=new Date(Date.now()-WIN_DAYS*86400000+i*slice);
-  return `${d.getMonth()+1}/${d.getDate()} ${String(d.getHours()).padStart(2,"0")}:00`; }
+// 每个桶覆盖一段时间(7天/桶数),tooltip 显示其【区间】;末桶结束即"现在",避免误读为"数据只到某点"。
+function beatTime(i,n){ const span=WIN_DAYS*86400000/n, base=Date.now()-WIN_DAYS*86400000;
+  const f=t=>{const d=new Date(t);return `${d.getMonth()+1}/${d.getDate()} ${String(d.getHours()).padStart(2,"0")}:${String(d.getMinutes()).padStart(2,"0")}`;};
+  return `${f(base+i*span)} – ${i>=n-1?t("cap_now"):f(base+(i+1)*span)}`; }
 function upStr(m){ return m.uptime==null?"—":(m.uptime*100).toFixed(2)+"%"; }
 function latStr(m){ return m.latency_ms==null?"—":(m.latency_ms/1000).toFixed(1)+"s"; }
 function pvLabel(p){ return PVN[p] || (lang==="zh"?"其他":"Other"); }
@@ -263,8 +263,8 @@ function renderTop(){
   const snap=state.snap, all=snap.groups.flatMap(g=>g.models);
   // 顶部整体横幅已去掉:不向客户广播"部分服务不好"的总览;明细仍在各卡片如实呈现。
 
-  const evs=[];
-  snap.groups.forEach(g=>g.models.forEach(m=>{ if(m.status===0||m.status===2||m.status===3) evs.push({line:g.name,model:m.name,status:m.status}); }));
+  const evs=[]; // 只把真·不可用(无可用上游/近乎全挂)列为"当前事件";降级在卡片如实呈现但不广播,避免过度暴露
+  snap.groups.forEach(g=>g.models.forEach(m=>{ if(m.status===0) evs.push({line:g.name,model:m.name,status:m.status}); }));
   evs.sort((a,b)=>SEV[b.status]-SEV[a.status]);
   document.getElementById("events").innerHTML=evs.slice(0,8).map(e=>`
     <div class="event ${stClass(e.status)}"><span class="etag">${stLabel(e.status)}</span>
@@ -281,7 +281,7 @@ function renderTop(){
 
 function renderGroups(host){
   host.innerHTML=`<div class="gcards">`+state.snap.groups.map((g,gi)=>{
-    const gs=worst(g.models.map(m=>m.status));
+    const gs=g.status; // 用后端 groupStatus(有正常模型就最多降级,不取最差),前端不再重算
     const rec=recommend(g.models);
     const recUp = rec.uptime==null ? stLabel(rec.status) : (rec.uptime*100).toFixed(2)+"%";
     return `<div class="gcard ${stClass(gs)}" onclick="openModal(${gi})">
@@ -334,7 +334,7 @@ function render(){
 
 function openModal(gi){
   const g=state.snap.groups[gi]; if(!g)return;
-  const gs=worst(g.models.map(m=>m.status));
+  const gs=g.status; // 后端 groupStatus,与卡片一致
   document.getElementById("mTitle").innerHTML=`${esc(g.name)} <span class="pill sm ${stClass(gs)}" style="vertical-align:middle"><span class="dot"></span>${stLabel(gs)}</span>`;
   document.getElementById("mSub").textContent=fmt("modal_sub",{name:g.name,n:g.models.length});
   document.getElementById("mBody").innerHTML=g.models.map(modelCard).join("");

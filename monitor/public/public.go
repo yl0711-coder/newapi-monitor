@@ -30,6 +30,7 @@ const (
 	windowDays      = 7 // 可用率/状态条窗口
 	windowSec       = int64(windowDays * 86400)
 	beatCount       = 50            // 心跳条桶数
+	beatMinSample   = 5             // 单个心跳桶请求数低于此 → 不画红/黄(几条里挂1个不代表服务差,公开页避免被噪声误导)
 	minSample       = 20            // 窗口内请求数低于此 → 不据流量判故障
 	recentWindowSec = int64(86400)  // 判定【当下】状态的近期窗口(24h):状态看当下,不被旧数据钉死
 	staleAfterSec   = int64(172800) // 最新流量早于此(48h)→ 可用率/延迟视为陈旧,显 — 不展示
@@ -162,11 +163,8 @@ func (h *handler) compute(now int64) *Snapshot {
 			continue
 		}
 		var pms []Model
-		gStatus := stUp
 		for _, mdl := range models {
-			pm := h.buildModel(vg.Key, mdl, enabled, totals, series, now, since)
-			pms = append(pms, pm)
-			gStatus = worse(gStatus, pm.Status)
+			pms = append(pms, h.buildModel(vg.Key, mdl, enabled, totals, series, now, since))
 		}
 		sort.Slice(pms, func(i, j int) bool {
 			if pms[i].Provider != pms[j].Provider {
@@ -174,6 +172,7 @@ func (h *handler) compute(now int64) *Snapshot {
 			}
 			return pms[i].Name < pms[j].Name
 		})
+		gStatus := groupStatus(pms)
 		groups = append(groups, Group{Name: vg.Name, Status: gStatus, Models: pms})
 		overall = worse(overall, gStatus)
 	}
@@ -449,7 +448,7 @@ func buildBeats(pts []seriesPt, now, since int64) []int {
 	}
 	for i := range beats {
 		t := sums[i].up + sums[i].fail
-		if t == 0 {
+		if t < beatMinSample { // 样本太少(含空桶)不画红/黄:避免少量请求里的偶发失败在公开页呈现为"差"
 			beats[i] = stUp
 			continue
 		}
@@ -458,14 +457,39 @@ func buildBeats(pts []seriesPt, now, since int64) []int {
 	return beats
 }
 
+// band 把成功率映射成状态:"不可用"只留给真·调不通(<50%,基本全挂);
+// 在服务但有失败(50–99%)算"降级",如实标但不夸大成不可用;≥99% 正常。
 func band(rate float64) int {
 	switch {
 	case rate >= 0.99:
 		return stUp
-	case rate >= 0.85:
+	case rate >= 0.50:
 		return stWarn
 	default:
 		return stDown
+	}
+}
+
+// groupStatus 按"线路还能不能用"判分组状态,不取最差模型——避免个别模型降级
+// 就把整条线标成"不可用"(对外夸大)。有正常模型就最多算"降级";
+// 没有任何正常模型才"不可用";没有任何问题则"正常"(忽略维护/数据不足)。
+func groupStatus(models []Model) int {
+	up, problem := 0, 0
+	for _, m := range models {
+		switch m.Status {
+		case stUp:
+			up++
+		case stWarn, stDown:
+			problem++
+		}
+	}
+	switch {
+	case problem == 0:
+		return stUp
+	case up == 0:
+		return stDown
+	default:
+		return stWarn
 	}
 }
 
