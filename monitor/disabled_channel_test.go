@@ -16,7 +16,7 @@ func TestNextEnabledSince(t *testing.T) {
 		{"一直启用→保持原值", 1, 1, 500, 500},
 		{"重启用(上轮禁用)→now", 1, 2, 0, now},
 		{"新建即启用→now", 1, 0, 0, now},
-		{"启用但上轮 since 为0→now", 1, 1, 0, now},
+		{"上轮启用且 since=0→保持0(自始启用,升级不重置)", 1, 1, 0, 0},
 	}
 	for _, c := range cases {
 		if got := nextEnabledSince(c.status, c.prevStatus, c.prevSince, now); got != c.want {
