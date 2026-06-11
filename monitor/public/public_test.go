@@ -77,8 +77,8 @@ func TestComputeTopologyAndTraffic(t *testing.T) {
 	h := &handler{db: db, cfg: Config{}} // 无 NewAPIBaseURL → 可见分组退回"有流量分组"
 	snap := h.compute(now)
 
-	if snap.Overall != stDown {
-		t.Fatalf("overall = %d, want stDown(因 m_down 无可用渠道)", snap.Overall)
+	if snap.Overall != stWarn {
+		t.Fatalf("overall = %d, want stWarn(有正常模型 m_ok,部分降级/不可用 → 线路降级而非整体不可用)", snap.Overall)
 	}
 	if len(snap.Groups) != 1 || snap.Groups[0].Name != "g1" {
 		t.Fatalf("groups = %+v, want 单个 g1", snap.Groups)
@@ -171,8 +171,8 @@ func TestPretty(t *testing.T) {
 }
 
 func TestBandAndWorse(t *testing.T) {
-	// 阈值:≥99 正常 / 85–99 降级 / <85 不可用
-	if band(0.999) != stUp || band(0.97) != stWarn || band(0.88) != stWarn || band(0.80) != stDown {
+	// 阈值:≥99 正常 / 50–99 降级 / <50 不可用
+	if band(0.999) != stUp || band(0.97) != stWarn || band(0.60) != stWarn || band(0.40) != stDown {
 		t.Error("band 阈值错")
 	}
 	if worse(stUp, stDown) != stDown || worse(stWarn, stUp) != stWarn || worse(stDown, stWarn) != stDown {
@@ -243,5 +243,28 @@ func TestDisabledChannelExcludedFromBoard(t *testing.T) {
 	}
 	if st != stUp {
 		t.Fatalf("m1 应为 stUp(禁用渠道的80失败被排除、启用渠道全成功),得 %d", st)
+	}
+}
+
+// 分组状态:不取最差模型,体现"线路还能不能用"(诚实但不夸大)。
+func TestGroupStatus(t *testing.T) {
+	cases := []struct {
+		name string
+		in   []int
+		want int
+	}{
+		{"全正常 → 正常", []int{stUp, stUp}, stUp},
+		{"有正常+部分降级/不可用 → 降级(codex-1.2x 场景)", []int{stUp, stUp, stWarn, stDown}, stWarn},
+		{"无任何正常模型 → 不可用", []int{stDown, stWarn}, stDown},
+		{"全数据不足 → 正常(忽略)", []int{stNoData, stNoData}, stUp},
+	}
+	for _, c := range cases {
+		var models []Model
+		for _, s := range c.in {
+			models = append(models, Model{Status: s})
+		}
+		if got := groupStatus(models); got != c.want {
+			t.Errorf("%s: got %d want %d", c.name, got, c.want)
+		}
 	}
 }
