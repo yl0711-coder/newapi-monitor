@@ -60,6 +60,8 @@ Besides the internal monitor, the same process serves a **customer-facing public
 
 Dimensions are **group (line) × model**: channels are transparent to users. Visible groups come from new-api's `/api/pricing` (`usable_group`, i.e. the groups selectable when creating a token); display names match the main site. Status is synthesized from **topology health (whether a group×model has any usable channel)** + **last-7-day traffic**: a configured group×model with no usable channel shows "outage".
 
+> **Disabled channels are excluded from stability** (board + internal monitor): stability aggregates (overview / group / model / trend) only count traffic from channels that are **currently enabled and after their enable time**. Failures from manually-disabled / auto-disabled channels no longer drag a model down; a re-enabled channel (including a fresh deploy) is counted from its enable time (`channel_snaps.enabled_since`). The internal "by channel" table still lists disabled channels for diagnosis.
+
 **Hard isolation**: the board is the standalone `monitor/public` package, reads only the local sampling DB, and never references internal structs; the public surface **never emits** channel names/IDs/IPs, cost/quota, tokens/users, request volume/QPS, or error details.
 
 Reverse-proxy example (Caddy, by subdomain):

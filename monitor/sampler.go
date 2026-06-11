@@ -247,11 +247,8 @@ func (m *Monitor) refreshChannels() {
 			return
 		}
 		names[strconv.Itoa(id)] = name.String
-		var ps, psince int64
-		if p, ok := prev[id]; ok {
-			ps, psince = p[0], p[1]
-		}
-		enabledSince := nextEnabledSince(status, int(ps), psince, now)
+		p := prev[id] // 不存在则零值(status 0 / since 0),nextEnabledSince 按"新建即启用"处理
+		enabledSince := nextEnabledSince(status, p.status, p.since, now)
 		snaps = append(snaps, ChannelSnap{ID: id, Status: status, Groups: grp.String, Models: models.String, EnabledSince: enabledSince, UpdatedAt: now})
 	}
 	if err := rows.Err(); err != nil {
