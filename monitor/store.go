@@ -87,7 +87,7 @@ type ChannelSnap struct {
 	Status       int    // new-api: 1启用 / 2手动禁用 / 3自动禁用
 	Groups       string `gorm:"size:512"`  // 逗号分隔分组
 	Models       string `gorm:"type:text"` // 逗号分隔模型
-	EnabledSince int64  // 当前这段"启用"的起始 Unix 秒;禁用时为 0。重启用则刷新为重启用时刻
+	EnabledSince int64  // 当前这段"启用"的起始 Unix 秒;禁用=0;0 也表示"自始启用"(算全量历史);重启用刷新为重启用时刻
 	UpdatedAt    int64  `gorm:"index"`
 }
 
@@ -161,12 +161,15 @@ func (m *Monitor) upsertTokenSamples(rows []TokenSample) error {
 }
 
 // nextEnabledSince 计算渠道本轮的 enabled_since:
-// 禁用 → 0;启用中且上轮也启用(已有起始时刻)→ 保持原值;新建 / 重启用 → 记为 now。
+//   - 禁用 → 0;
+//   - 上轮也启用 → 保持原值(含 0:0 表示"自始启用、算全量历史"——升级首刷时既有启用渠道保持 0,
+//     不因一次监控部署把所有渠道的稳定性历史清掉);
+//   - 新建 / 从禁用重新启用 → 记为 now(从启用时刻起算)。
 func nextEnabledSince(status, prevStatus int, prevSince, now int64) int64 {
 	if status != 1 {
 		return 0
 	}
-	if prevStatus == 1 && prevSince > 0 {
+	if prevStatus == 1 {
 		return prevSince
 	}
 	return now
