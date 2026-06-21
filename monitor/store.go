@@ -141,6 +141,19 @@ type RejectionSample struct {
 	Count    int64
 }
 
+// InfraSample 是「服务端健康」长格式时序采样:一行 = 某资源某指标在某分钟桶的取值。
+// 长格式(resource × metric)适配实例/数据库/负载均衡/主机的不同指标集,新增指标无需改表。
+// 来源两类:AWS Lightsail 指标接口(rtype=instance/database/lb,采样器拉)、各节点主机 agent
+// 推送(rtype=host,POST /internal/host)。复合主键使重复写入幂等(同键覆盖)。
+// 存储单位已归一(见 infra.go 注释):内存/swap=MB、存储=GB、网络=KB/s、CPU/突发=%、其余原值。
+type InfraSample struct {
+	BucketTs int64   `gorm:"primaryKey;autoIncrement:false;index:idx_infra_bucket"`
+	Resource string  `gorm:"primaryKey;size:128"` // 资源名,如 Database-NexusAPI
+	RType    string  `gorm:"primaryKey;size:16;column:rtype"`
+	Metric   string  `gorm:"primaryKey;size:48"`
+	Value    float64
+}
+
 // 直方图档位上界。lat 单位秒,ttft 单位毫秒。
 var (
 	latEdges  = []int{1, 2, 5, 10, 30, 60}
@@ -157,7 +170,7 @@ func (m *Monitor) openStore(path string) error {
 	if err != nil {
 		return fmt.Errorf("打开本地采样库失败: %w", err)
 	}
-	if err := db.AutoMigrate(&MetricSample{}, &TokenSample{}, &HourSample{}, &ChannelSnap{}, &RejectionSample{}, &SelectablePair{}, &AlertConfig{}, &AlertLog{}); err != nil {
+	if err := db.AutoMigrate(&MetricSample{}, &TokenSample{}, &HourSample{}, &ChannelSnap{}, &RejectionSample{}, &SelectablePair{}, &InfraSample{}, &AlertConfig{}, &AlertLog{}); err != nil {
 		return fmt.Errorf("表迁移失败: %w", err)
 	}
 	m.storeDB = db
@@ -615,4 +628,56 @@ func (m *Monitor) storeFreshness() (lastBucket int64) {
 	var v struct{ M int64 }
 	m.storeDB.Raw(`SELECT COALESCE(MAX(bucket_ts),0) AS m FROM metric_samples`).Scan(&v)
 	return v.M
+}
+
+// ---- 服务端健康(infra)存储 ----
+
+// upsertInfra 幂等写入一批 infra 采样(同键覆盖)。
+func (m *Monitor) upsertInfra(rows []InfraSample) error {
+	if len(rows) == 0 {
+		return nil
+	}
+	return m.storeDB.Clauses(clause.OnConflict{
+		Columns:   []clause.Column{{Name: "bucket_ts"}, {Name: "resource"}, {Name: "rtype"}, {Name: "metric"}},
+		UpdateAll: true,
+	}).CreateInBatches(rows, 200).Error
+}
+
+// infraLatestRow 是某资源某指标的最新取值(含其桶时刻,用于算数据新鲜度)。
+type infraLatestRow struct {
+	Resource string
+	RType    string `gorm:"column:rtype"`
+	Metric   string
+	Value    float64
+	BucketTs int64
+}
+
+// storeInfraLatest 返回每个 (资源,指标) 的最新一条取值。
+func (m *Monitor) storeInfraLatest() []infraLatestRow {
+	var rows []infraLatestRow
+	// 取每个 (resource,metric) 的最大 bucket_ts 对应行。
+	m.storeDB.Raw(`SELECT s.resource, s.rtype, s.metric, s.value, s.bucket_ts
+		FROM infra_samples s
+		JOIN (SELECT resource, metric, MAX(bucket_ts) AS mx FROM infra_samples GROUP BY resource, metric) t
+		  ON s.resource=t.resource AND s.metric=t.metric AND s.bucket_ts=t.mx`).Scan(&rows)
+	return rows
+}
+
+// InfraPoint 是 infra 指标的一个时间点(供趋势小图)。
+type InfraPoint struct {
+	Ts    int64   `json:"ts"`
+	Value float64 `json:"value"`
+}
+
+// storeInfraSeries 返回某资源某指标自 since 起的时序(升序),供趋势小图(如 DB 内存/swap)。
+func (m *Monitor) storeInfraSeries(resource, metric string, since int64) []InfraPoint {
+	var pts []InfraPoint
+	m.storeDB.Raw(`SELECT bucket_ts AS ts, value FROM infra_samples
+		WHERE resource=? AND metric=? AND bucket_ts >= ? ORDER BY bucket_ts`, resource, metric, since).Scan(&pts)
+	return pts
+}
+
+func (m *Monitor) pruneInfraOlderThan(cutoffTs int64) (int64, error) {
+	r := m.storeDB.Where("bucket_ts < ?", cutoffTs).Delete(&InfraSample{})
+	return r.RowsAffected, r.Error
 }

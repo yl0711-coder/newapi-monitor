@@ -29,7 +29,18 @@ type Settings struct {
 
 	// 被拒请求采集:接收各节点 newapi-reject-collector 推送的鉴权 token。
 	// 留空 = 关闭接收接口(POST /internal/rejections 返回 503),不接受任何推送。
+	// 同一 token 也用于 POST /internal/host(各节点主机 agent 推送 OS 内存/磁盘)。
 	IngestToken string // MONITOR_INGEST_TOKEN
+
+	// 服务端健康监控(实例/数据库/负载均衡):基于 AWS Lightsail 指标接口拉取。
+	// 默认【关】——关时完全不调 AWS、不影响模型监控与现网行为。
+	InfraEnabled       bool   // MONITOR_INFRA_ENABLED(=true 才启用)
+	AWSRegion          string // AWS_REGION,如 us-west-2;AWS 凭证用 SDK 默认链(AWS_ACCESS_KEY_ID/_SECRET)
+	InfraSampleSeconds int    // MONITOR_INFRA_SAMPLE_SECONDS,默认 300(AWS 指标本就 5min 分辨率)
+	InfraRetentionDays int    // MONITOR_INFRA_RETENTION_DAYS,默认 7
+	// MONITOR_INFRA_RESOURCES:逗号分隔,显式指定要监控的资源,留空=自动发现。
+	// 格式 type:name,type∈ instance/database/lb,如 "instance:Master,database:DB-X,lb:LB-X"。
+	InfraResources string
 }
 
 // LoadSettings 从环境变量装载配置(可配合 .env)。
@@ -47,6 +58,12 @@ func LoadSettings() Settings {
 		HeartbeatURL:      env("MONITOR_HEARTBEAT_URL", ""),
 		SiteName:          env("MONITOR_SITE_NAME", ""),
 		IngestToken:       env("MONITOR_INGEST_TOKEN", ""),
+
+		InfraEnabled:       env("MONITOR_INFRA_ENABLED", "") == "true",
+		AWSRegion:          env("AWS_REGION", "us-west-2"),
+		InfraSampleSeconds: envInt("MONITOR_INFRA_SAMPLE_SECONDS", 300),
+		InfraRetentionDays: envInt("MONITOR_INFRA_RETENTION_DAYS", 7),
+		InfraResources:     env("MONITOR_INFRA_RESOURCES", ""),
 	}
 }
 

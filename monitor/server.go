@@ -48,6 +48,7 @@ func (m *Monitor) RegisterRoutes(r *gin.Engine) {
 	})
 	r.GET("/api/brand", m.brandHandler)                // 公开:站点名,供前端设置页面标题
 	r.POST("/internal/rejections", m.ingestRejections) // 机器对机器:接收采集器推送的前置拒绝(token 鉴权)
+	r.POST("/internal/host", m.ingestHost)             // 机器对机器:接收各节点主机 agent 推送的 OS 内存/磁盘(token 鉴权)
 	r.GET("/login", m.loginPage)
 	r.POST("/login", m.loginSubmit)
 	r.GET("/logout", logout)
@@ -61,6 +62,7 @@ func (m *Monitor) RegisterRoutes(r *gin.Engine) {
 		view.GET("/data", m.serveData)
 		view.GET("/monitor/data", m.serveData)
 		view.GET("/trend/long", m.serveLongTrend)
+		view.GET("/infra", m.serveInfra) // 服务端健康监控(实例/DB/LB)快照
 		view.GET("/me", me)
 	}
 
@@ -122,6 +124,70 @@ func (m *Monitor) ingestRejections(c *gin.Context) {
 	}
 	if err := m.upsertRejections(rows); err != nil {
 		slog.Warn("被拒请求入库失败", "err", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "store failed"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"ok": true, "stored": len(rows)})
+}
+
+// serveInfra 返回服务端健康监控(实例/DB/LB)快照;未启用则 enabled:false。
+func (m *Monitor) serveInfra(c *gin.Context) {
+	if !m.InfraEnabled() {
+		c.JSON(http.StatusOK, gin.H{"enabled": false})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"enabled": true, "snapshot": m.computeInfraSnapshot(time.Now().Unix())})
+}
+
+// ingestHost 接收各节点主机 agent 推来的 OS 指标(内存/磁盘/load),写 infra_samples(rtype=host)。
+// 复用 MONITOR_INGEST_TOKEN 鉴权;未配置则接口关闭(503)。只接非敏感数值,不含任何密钥/业务数据。
+func (m *Monitor) ingestHost(c *gin.Context) {
+	want := m.cfg.IngestToken
+	if want == "" {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "ingest disabled"})
+		return
+	}
+	if subtle.ConstantTimeCompare([]byte(c.GetHeader("Authorization")), []byte("Bearer "+want)) != 1 {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
+		return
+	}
+	var in struct {
+		Node        string  `json:"node"`
+		MemTotalMB  float64 `json:"mem_total_mb"`
+		MemAvailMB  float64 `json:"mem_avail_mb"`
+		SwapUsedMB  float64 `json:"swap_used_mb"`
+		DiskUsedPct float64 `json:"disk_used_pct"`
+		Load1       float64 `json:"load1"`
+		Ts          int64   `json:"ts"`
+	}
+	if err := c.ShouldBindJSON(&in); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	node := clip(in.Node, 128)
+	if node == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "node required"})
+		return
+	}
+	ts := in.Ts
+	if ts <= 0 {
+		ts = time.Now().Unix()
+	}
+	bucket := ts / 60 * 60
+	add := func(metric string, v float64) InfraSample {
+		return InfraSample{BucketTs: bucket, Resource: node, RType: "host", Metric: metric, Value: v}
+	}
+	rows := []InfraSample{
+		add("mem_avail_mb", in.MemAvailMB),
+		add("swap_used_mb", in.SwapUsedMB),
+		add("disk_used_pct", in.DiskUsedPct),
+		add("load1", in.Load1),
+	}
+	if in.MemTotalMB > 0 {
+		rows = append(rows, add("mem_total_mb", in.MemTotalMB))
+	}
+	if err := m.upsertInfra(rows); err != nil {
+		slog.Warn("主机指标入库失败", "err", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "store failed"})
 		return
 	}
