@@ -85,11 +85,22 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
   tr.drillable{cursor:pointer}tr.drillable:hover td{background:rgba(255,255,255,.03)}
   .alert{padding:12px 16px;border-radius:8px;margin-bottom:16px;font-size:14px;background:rgba(239,68,68,.1);border:1px solid rgba(239,68,68,.3);color:var(--red)}
   code{background:rgba(255,255,255,.06);padding:1px 5px;border-radius:4px;font-size:12px}
+  .tabs{display:flex;gap:4px;margin:16px 0 0;border-bottom:1px solid var(--border)}
+  .tabs .tab{padding:10px 20px;font-size:14px;color:var(--text-muted);cursor:pointer;border-bottom:2px solid transparent;user-select:none}
+  .tabs .tab:hover{color:var(--text)}
+  .tabs .tab.active{color:var(--text);border-bottom-color:var(--accent);font-weight:600}
+  .tabpane[hidden]{display:none}
 </style>
 </head>
 <body>
 <h1>📈 <span data-brand>new-api</span> 上游监控 <small>分组 / 渠道 / 模型 · 稳定性 · 响应耗时</small></h1>
 
+<div class="tabs">
+  <div class="tab active" data-tab="model">模型监控</div>
+  <div class="tab" data-tab="server">服务端监控</div>
+</div>
+
+<div class="tabpane" id="tab-model">
 <div class="toolbar">
   <div class="seg" id="windowSeg">
     <a data-w="15">15分钟</a><a data-w="30">30分钟</a><a data-w="60">1小时</a><a data-w="180">3小时</a><a data-w="360">6小时</a><a data-w="720">12小时</a><a data-w="1440">24小时</a>
@@ -145,6 +156,26 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
 <div class="card"><div class="card-header">按模型</div><table><thead id="thModel"></thead><tbody id="tbModel"></tbody></table></div>
 <div class="card"><div class="card-header">按 Key / 用户 <span class="muted" style="font-weight:400">· 谁在制造错误 / 烧配额(Top 100)</span></div><table><thead id="thToken"></thead><tbody id="tbToken"></tbody></table></div>
 <div class="card" id="rejCard" style="display:none"><div class="card-header">🚫 被拒请求 <span class="muted" style="font-weight:400">· 前置拒绝(无可用渠道等,不进 logs 表;来自各节点旁路采集器)</span></div><table><thead id="thRej"></thead><tbody id="tbRej"></tbody></table></div>
+</div><!-- /tab-model -->
+
+<div class="tabpane" id="tab-server" hidden>
+  <div class="toolbar">
+    <label class="muted" style="font-size:13px"><input type="checkbox" id="infraAuto" checked> 自动刷新(60s)</label>
+    <button class="btn" id="infraRefresh">立即刷新</button>
+    <div class="meta" id="infraGenAt">—</div>
+  </div>
+  <div id="infraErr"></div>
+  <div class="card">
+    <div class="card-header">🗄 数据库 <span class="muted" style="font-weight:400">· 含 AWS 控制台看不到的「可用内存 / Swap」</span></div>
+    <div id="dbBody" style="padding:16px 20px"><span class="muted">加载中…</span></div>
+    <div id="dbTrendWrap" style="padding:0 20px 16px;display:none;gap:24px;flex-wrap:wrap">
+      <div style="flex:1;min-width:300px"><div class="muted" style="font-size:12px;margin-bottom:6px">可用内存(MB,近6h)</div><div id="dbMemTrend" style="width:100%;height:180px"></div></div>
+      <div style="flex:1;min-width:300px"><div class="muted" style="font-size:12px;margin-bottom:6px">Swap(MB,近6h)</div><div id="dbSwapTrend" style="width:100%;height:180px"></div></div>
+    </div>
+  </div>
+  <div class="card"><div class="card-header">🖥 实例</div><table><thead id="thInst"></thead><tbody id="tbInst"></tbody></table></div>
+  <div class="card"><div class="card-header">⚖️ 负载均衡</div><div id="lbBody" style="padding:16px 20px"><span class="muted">加载中…</span></div></div>
+</div>
 
 <script>
 const params=new URLSearchParams(location.search);
@@ -453,6 +484,77 @@ function schedule(){if(timer)clearInterval(timer);if(document.getElementById('au
 document.getElementById('refreshNow').addEventListener('click',load);
 document.getElementById('autoRefresh').addEventListener('change',schedule);
 window.addEventListener('resize',()=>{trendChart&&trendChart.resize();sloGauge&&sloGauge.resize();longChart&&longChart.resize();latChart&&latChart.resize();ttftChart&&ttftChart.resize();});
+// ===== 服务端监控(实例 / DB / LB)=====
+let infraTimer=null, dbMemChart=null, dbSwapChart=null, _dbMem=[], _dbSwap=[];
+const infraBadge=st=>{const m={ok:['badge-green','正常'],warn:['badge-yellow','注意'],bad:['badge-red','告警'],nosample:['badge-gray','无数据']};const[c,t]=m[st]||m.nosample;return `<span class="badge ${c}">${t}</span>`};
+const fx=(v,n=0)=>v==null?'—':(+v).toFixed(n);
+const kv=(label,val)=>`<span style="display:inline-block;min-width:160px;margin:2px 16px 2px 0"><span class="muted">${label}:</span> <b>${val}</b></span>`;
+
+function lineOpt(pts,color){
+  const x=(pts||[]).map(p=>{const d=new Date(p.ts*1000);return ('0'+d.getHours()).slice(-2)+':'+('0'+d.getMinutes()).slice(-2)});
+  const y=(pts||[]).map(p=>+(+p.value).toFixed(1));
+  return{grid:{left:48,right:12,top:12,bottom:24},xAxis:{type:'category',data:x,axisLabel:{color:'#888',fontSize:10}},yAxis:{type:'value',axisLabel:{color:'#888',fontSize:10}},series:[{type:'line',data:y,showSymbol:false,lineStyle:{color:color,width:2},areaStyle:{color:color,opacity:0.08}}],tooltip:{trigger:'axis'}};
+}
+function drawInfraTrend(){
+  if(typeof echarts==='undefined')return;
+  if(!dbMemChart)dbMemChart=echarts.init(document.getElementById('dbMemTrend'));
+  if(!dbSwapChart)dbSwapChart=echarts.init(document.getElementById('dbSwapTrend'));
+  dbMemChart.setOption(lineOpt(_dbMem,'#2f7ed8'));
+  dbSwapChart.setOption(lineOpt(_dbSwap,'#e8453c'));
+}
+function renderInfra(s){
+  document.getElementById('infraGenAt').textContent='更新于 '+(s.generated_at||'')+' · 新鲜度 '+fmtAge(s.data_age_sec);
+  const db=s.database, dbBody=document.getElementById('dbBody'), trendWrap=document.getElementById('dbTrendWrap');
+  if(!db){dbBody.innerHTML='<span class="muted">无数据库数据</span>';trendWrap.style.display='none';}
+  else{
+    const me=db.metrics||{}, mem=me.free_mem_mb;
+    const memCls=mem!=null&&mem<80?'color:var(--red)':(mem!=null&&mem<150?'color:#e8a33d':'');
+    dbBody.innerHTML=`<div style="margin-bottom:8px">${infraBadge(db.status)} <b>${esc(db.name)}</b> <span class="muted">${fmtAge(db.age_sec)}</span></div>`
+      +kv('可用内存',`<span style="${memCls}">${fx(mem)} MB</span>`)
+      +kv('Swap 使用',`${fx(me.swap_mb)} MB`)
+      +kv('CPU',fx(me.cpu,1)+'%')
+      +kv('连接数',fx(me.connections))
+      +kv('可用存储',fx(me.free_storage_gb,1)+' GB')
+      +kv('磁盘队列',fx(me.disk_queue,2));
+    _dbMem=s.db_mem_trend||[]; _dbSwap=s.db_swap_trend||[];
+    trendWrap.style.display='flex'; drawInfraTrend();
+  }
+  const insts=s.instances||[];
+  document.getElementById('thInst').innerHTML='<tr><th>实例</th><th>状态</th><th>CPU</th><th>可用内存</th><th>磁盘</th><th>网络出</th><th>突发额度</th><th>新鲜度</th></tr>';
+  document.getElementById('tbInst').innerHTML=insts.map(r=>{const me=r.metrics||{};
+    const memTxt=me.mem_avail_mb!=null?(fx(me.mem_avail_mb)+(me.mem_total_mb?'/'+fx(me.mem_total_mb):'')+' MB'):'<span class="muted">需 agent</span>';
+    const diskTxt=me.disk_used_pct!=null?fx(me.disk_used_pct)+'%':'<span class="muted">需 agent</span>';
+    return `<tr><td><b>${esc(r.name)}</b></td><td>${infraBadge(r.status)}</td><td>${fx(me.cpu,1)}%</td><td>${memTxt}</td><td>${diskTxt}</td><td>${fx(me.net_out_kb)} KB/s</td><td>${fx(me.burst)}%</td><td class="muted">${fmtAge(r.age_sec)}</td></tr>`;
+  }).join('')||'<tr><td colspan="8" class="muted" style="padding:16px">无实例数据</td></tr>';
+  const lb=s.lb, lbBody=document.getElementById('lbBody');
+  if(!lb){lbBody.innerHTML='<span class="muted">无负载均衡数据</span>';}
+  else{const me=lb.metrics||{};
+    lbBody.innerHTML=`<div style="margin-bottom:8px">${infraBadge(lb.status)} <b>${esc(lb.name)}</b> <span class="muted">${fmtAge(lb.age_sec)}</span></div>`
+      +kv('健康节点',fx(me.healthy))+kv('不健康节点',fx(me.unhealthy))+kv('5xx(5min)',fx(me.err_5xx))+kv('响应时间',fx(me.resp_ms)+' ms');
+  }
+}
+async function loadInfra(){
+  try{
+    const res=await fetch('/infra',{headers:{'Accept':'application/json'}});
+    if(res.status===401){location.href='/login';return}
+    const d=await res.json();const eb=document.getElementById('infraErr');
+    if(d.enabled===false){eb.innerHTML='<div class="alert">服务端监控未启用:设置 <code>MONITOR_INFRA_ENABLED=true</code> + AWS 只读凭证后生效。</div>';return}
+    eb.innerHTML='';if(d.snapshot)renderInfra(d.snapshot);
+  }catch(e){document.getElementById('infraErr').innerHTML='<div class="alert">加载失败:'+esc(e.message)+'</div>'}
+}
+function infraSchedule(){if(infraTimer)clearInterval(infraTimer);if(document.getElementById('infraAuto').checked)infraTimer=setInterval(loadInfra,60000)}
+function switchTab(name){
+  document.querySelectorAll('.tabs .tab').forEach(t=>t.classList.toggle('active',t.dataset.tab===name));
+  document.getElementById('tab-model').hidden=(name!=='model');
+  document.getElementById('tab-server').hidden=(name!=='server');
+  if(name==='server'){loadInfra();infraSchedule();setTimeout(()=>{dbMemChart&&dbMemChart.resize();dbSwapChart&&dbSwapChart.resize();},60);}
+  else if(infraTimer){clearInterval(infraTimer);}
+}
+document.querySelectorAll('.tabs .tab').forEach(t=>t.addEventListener('click',()=>switchTab(t.dataset.tab)));
+document.getElementById('infraRefresh').addEventListener('click',loadInfra);
+document.getElementById('infraAuto').addEventListener('change',infraSchedule);
+window.addEventListener('resize',()=>{dbMemChart&&dbMemChart.resize();dbSwapChart&&dbSwapChart.resize();});
+
 setSeg();loadMe();load();schedule();
 document.querySelectorAll('#longSeg a').forEach(a=>{a.href='javascript:void 0';a.classList.toggle('active',+a.dataset.d===longDays);a.addEventListener('click',e=>{e.preventDefault();longDays=+a.dataset.d;document.querySelectorAll('#longSeg a').forEach(x=>x.classList.toggle('active',x===a));loadLongTrend();});});
 loadLongTrend();

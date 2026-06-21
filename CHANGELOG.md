@@ -4,6 +4,17 @@
 
 ## [Unreleased]
 
+### Added
+- **服务端健康监控(新增「服务端监控」Tab)**:在原「模型监控」之外加一个 Tab,监控实例 / 数据库 / 负载均衡健康。
+  - 数据库:CPU / 连接 / 存储 / 磁盘队列 + **可用内存 / Swap(AWS 控制台看不到的)** + 近 6h 内存/Swap 趋势图。
+  - 实例:存活 / CPU / 网络 / 突发额度(AWS 拉取)+ 内存 / 磁盘(节点 agent 推送)。
+  - 负载均衡:健康/不健康节点 / 5xx / 响应时间。
+  - 数据来自 AWS Lightsail 指标接口(只读,对实例零影响)+ 节点 agent 推送的主机 OS 指标(`POST /internal/host`)。
+  - 基础设施告警(复用现有邮件+冷却):DB 可用内存<80MB、DB 存储<8GB、实例 StatusCheckFailed、LB 不健康节点。
+  - **`MONITOR_INFRA_ENABLED` 开关,默认关**;关闭时不调 AWS、不影响模型监控与现网行为。
+  - 新增环境变量:`MONITOR_INFRA_ENABLED` / `AWS_REGION` / `MONITOR_INFRA_SAMPLE_SECONDS` / `MONITOR_INFRA_RETENTION_DAYS` / `MONITOR_INFRA_RESOURCES`(AWS 凭证用 SDK 默认链)。
+  - 配套主机指标采集器:独立仓库 `newapi-host-agent`。
+
 ## [1.3.2] - 2026-06-12
 
 ### Changed
