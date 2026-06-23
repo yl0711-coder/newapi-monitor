@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -62,7 +63,8 @@ func (m *Monitor) RegisterRoutes(r *gin.Engine) {
 		view.GET("/data", m.serveData)
 		view.GET("/monitor/data", m.serveData)
 		view.GET("/trend/long", m.serveLongTrend)
-		view.GET("/infra", m.serveInfra) // 服务端健康监控(实例/DB/LB)快照
+		view.GET("/infra", m.serveInfra)              // 服务端健康监控(实例/DB/LB)快照
+		view.GET("/infra/series", m.serveInfraSeries) // 按需取某资源某些指标的近 N 小时序列(展开图用)
 		view.GET("/me", me)
 	}
 
@@ -139,6 +141,37 @@ func (m *Monitor) serveInfra(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"enabled": true, "snapshot": m.computeInfraSnapshot(time.Now().Unix())})
 }
 
+// serveInfraSeries 按需返回某资源(resource)若干指标(metrics 逗号分隔)近 N 小时(hours,默认6,封顶24)的时序。
+// 展开实例/切换指标组时前端才拉,避免快照一次性塞满所有图。结果:{series:{metric:[{ts,value}]}}。
+func (m *Monitor) serveInfraSeries(c *gin.Context) {
+	if !m.InfraEnabled() {
+		c.JSON(http.StatusOK, gin.H{"enabled": false})
+		return
+	}
+	resource := strings.TrimSpace(c.Query("resource"))
+	if resource == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "resource required"})
+		return
+	}
+	hours := 6
+	if v, err := strconv.Atoi(c.Query("hours")); err == nil && v > 0 {
+		hours = v
+	}
+	if hours > 24 {
+		hours = 24
+	}
+	since := time.Now().Unix() - int64(hours)*3600
+	series := map[string][]InfraPoint{}
+	for _, met := range strings.Split(c.Query("metrics"), ",") {
+		met = strings.TrimSpace(met)
+		if met == "" {
+			continue
+		}
+		series[met] = m.storeInfraSeries(resource, met, since)
+	}
+	c.JSON(http.StatusOK, gin.H{"enabled": true, "series": series})
+}
+
 // ingestHost 接收各节点主机 agent 推来的 OS 指标(内存/磁盘/load),写 infra_samples(rtype=host)。
 // 复用 MONITOR_INGEST_TOKEN 鉴权;未配置则接口关闭(503)。只接非敏感数值,不含任何密钥/业务数据。
 func (m *Monitor) ingestHost(c *gin.Context) {
@@ -152,13 +185,17 @@ func (m *Monitor) ingestHost(c *gin.Context) {
 		return
 	}
 	var in struct {
-		Node        string  `json:"node"`
-		MemTotalMB  float64 `json:"mem_total_mb"`
-		MemAvailMB  float64 `json:"mem_avail_mb"`
-		SwapUsedMB  float64 `json:"swap_used_mb"`
-		DiskUsedPct float64 `json:"disk_used_pct"`
-		Load1       float64 `json:"load1"`
-		Ts          int64   `json:"ts"`
+		Node            string  `json:"node"`
+		MemTotalMB      float64 `json:"mem_total_mb"`
+		MemAvailMB      float64 `json:"mem_avail_mb"`
+		SwapUsedMB      float64 `json:"swap_used_mb"`
+		DiskUsedPct     float64 `json:"disk_used_pct"`
+		Load1           float64 `json:"load1"`
+		Load5           float64 `json:"load5"`
+		Load15          float64 `json:"load15"`
+		ContainersUp    float64 `json:"containers_up"`
+		ContainersTotal float64 `json:"containers_total"`
+		Ts              int64   `json:"ts"`
 	}
 	if err := c.ShouldBindJSON(&in); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
@@ -179,12 +216,17 @@ func (m *Monitor) ingestHost(c *gin.Context) {
 	}
 	rows := []InfraSample{
 		add("mem_avail_mb", in.MemAvailMB),
-		add("swap_used_mb", in.SwapUsedMB),
+		add("swap_mb", in.SwapUsedMB), // 与 DB 的 swap_mb 统一键名(均为「已用 Swap MB」)
 		add("disk_used_pct", in.DiskUsedPct),
 		add("load1", in.Load1),
+		add("load5", in.Load5),
+		add("load15", in.Load15),
 	}
 	if in.MemTotalMB > 0 {
 		rows = append(rows, add("mem_total_mb", in.MemTotalMB))
+	}
+	if in.ContainersTotal > 0 {
+		rows = append(rows, add("containers_total", in.ContainersTotal), add("containers_up", in.ContainersUp))
 	}
 	if err := m.upsertInfra(rows); err != nil {
 		slog.Warn("主机指标入库失败", "err", err)

@@ -22,9 +22,12 @@ import (
 // 响应时间 = ms、CPU/突发额度 = %、连接/磁盘队列/状态/节点数 = 原值。
 
 // infraTarget 是一个被监控资源:name=资源名,rtype=instance/database/lb。
+// memTotalMB / diskTotalGB 来自资源发现时 AWS 一并返回的硬件规格(0=未知,LB 无此概念)。
 type infraTarget struct {
-	name  string
-	rtype string
+	name        string
+	rtype       string
+	memTotalMB  float64 // 总内存(MB);0 表示未知
+	diskTotalGB float64 // 系统盘总量(GB);0 表示未知
 }
 
 // metricSpec 描述一个要拉取的指标:AWS 指标名、统计量、单位、归一后存储的 key、归一除数。
@@ -81,6 +84,7 @@ func (m *Monitor) startInfra(ctx context.Context) {
 		iv = 60 * time.Second
 	}
 	m.sampleInfra(ctx) // 启动即拉一次
+	m.startProbe(ctx)  // 端到端可用性探活(独立循环,默认 60s,对真实域名)
 	go func() {
 		t := time.NewTicker(iv)
 		defer t.Stop()
@@ -131,6 +135,14 @@ func (m *Monitor) sampleInfra(ctx context.Context) {
 				rows = append(rows, InfraSample{BucketTs: bucket, Resource: t.name, RType: t.rtype, Metric: sp.key, Value: v})
 			}
 		}
+		// 合成「硬件总量」指标(来自资源发现时 AWS 已返回的规格,不额外调 API),
+		// 写成普通 InfraSample,computeInfraSnapshot 与前端即可像普通指标一样读到。
+		if t.memTotalMB > 0 {
+			rows = append(rows, InfraSample{BucketTs: bucket, Resource: t.name, RType: t.rtype, Metric: "mem_total_mb", Value: t.memTotalMB})
+		}
+		if t.diskTotalGB > 0 {
+			rows = append(rows, InfraSample{BucketTs: bucket, Resource: t.name, RType: t.rtype, Metric: "disk_total_gb", Value: t.diskTotalGB})
+		}
 	}
 	if err := m.upsertInfra(rows); err != nil {
 		slog.Warn("infra: 采样入库失败(忽略)", "err", err)
@@ -154,18 +166,36 @@ func (m *Monitor) infraTargets(ctx context.Context, cl *lightsail.Client) []infr
 	var out []infraTarget
 	if r, err := cl.GetInstances(ctx, &lightsail.GetInstancesInput{}); err == nil {
 		for _, in := range r.Instances {
-			if in.Name != nil {
-				out = append(out, infraTarget{*in.Name, "instance"})
+			if in.Name == nil {
+				continue
 			}
+			t := infraTarget{name: *in.Name, rtype: "instance"}
+			if h := in.Hardware; h != nil {
+				if h.RamSizeInGb != nil {
+					t.memTotalMB = float64(*h.RamSizeInGb) * 1024
+				}
+				t.diskTotalGB = systemDiskGB(h.Disks)
+			}
+			out = append(out, t)
 		}
 	} else {
 		slog.Warn("infra: 列实例失败", "err", err)
 	}
 	if r, err := cl.GetRelationalDatabases(ctx, &lightsail.GetRelationalDatabasesInput{}); err == nil {
 		for _, d := range r.RelationalDatabases {
-			if d.Name != nil {
-				out = append(out, infraTarget{*d.Name, "database"})
+			if d.Name == nil {
+				continue
 			}
+			t := infraTarget{name: *d.Name, rtype: "database"}
+			if h := d.Hardware; h != nil {
+				if h.RamSizeInGb != nil {
+					t.memTotalMB = float64(*h.RamSizeInGb) * 1024
+				}
+				if h.DiskSizeInGb != nil {
+					t.diskTotalGB = float64(*h.DiskSizeInGb)
+				}
+			}
+			out = append(out, t)
 		}
 	} else {
 		slog.Warn("infra: 列数据库失败", "err", err)
@@ -173,13 +203,31 @@ func (m *Monitor) infraTargets(ctx context.Context, cl *lightsail.Client) []infr
 	if r, err := cl.GetLoadBalancers(ctx, &lightsail.GetLoadBalancersInput{}); err == nil {
 		for _, lb := range r.LoadBalancers {
 			if lb.Name != nil {
-				out = append(out, infraTarget{*lb.Name, "lb"})
+				out = append(out, infraTarget{name: *lb.Name, rtype: "lb"}) // LB 无内存/磁盘概念,跳过总量
 			}
 		}
 	} else {
 		slog.Warn("infra: 列负载均衡失败", "err", err)
 	}
 	return out
+}
+
+// systemDiskGB 从实例硬件的磁盘列表取系统盘容量(GB);取不到系统盘则退而取首块盘,均无则 0。
+func systemDiskGB(disks []lstypes.Disk) float64 {
+	var first float64
+	for i, d := range disks {
+		if d.SizeInGb == nil {
+			continue
+		}
+		sz := float64(*d.SizeInGb)
+		if i == 0 || first == 0 {
+			first = sz
+		}
+		if d.IsSystemDisk != nil && *d.IsSystemDisk {
+			return sz
+		}
+	}
+	return first
 }
 
 // fetchMetric 拉单个 (资源,指标) 的最近值。Lightsail 指标接口【一次只接受一个 statistic】,故逐个拉。
@@ -301,15 +349,62 @@ type InfraResource struct {
 	Metrics map[string]float64 `json:"metrics"`
 }
 
-// InfraSnapshot 是服务端监控一次快照:实例数组 + 数据库 + 负载均衡 + DB 内存/swap 趋势。
+// ProbeResource 是一个前端域名的端到端探活视图。
+type ProbeResource struct {
+	Domain    string  `json:"domain"`
+	Status    string  `json:"status"`     // ok / warn / bad / nosample
+	Reachable bool    `json:"reachable"`  // 最近一次是否可达
+	HTTPCode  int     `json:"http_code"`  // HTTP 状态码(0=不可达/超时)
+	LatencyMs float64 `json:"latency_ms"` // 响应延时(毫秒)
+	CertDays  float64 `json:"cert_days"`  // TLS 证书剩余天数
+	HasCert   bool    `json:"has_cert"`   // 是否取到证书天数
+	ViaCDN    bool    `json:"via_cdn"`    // 响应是否经 CloudFront(脱离 CDN 即漂移)
+	AgeSec    int64   `json:"age_sec"`    // 该探活数据新鲜度
+}
+
+// LockResource 是一个源站端点的锁完整性视图(直连不带头,期望 403)。
+type LockResource struct {
+	Target   string `json:"target"`    // 源站端点 host:port
+	Status   string `json:"status"`    // ok(=403,锁生效) / bad(非403,锁失效) / nosample(连不上)
+	Locked   bool   `json:"locked"`    // 是否 403
+	HTTPCode int    `json:"http_code"` // 实际返回码(期望 403)
+	AgeSec   int64  `json:"age_sec"`   // 数据新鲜度
+}
+
+// InfraOverview 是 NOC 顶部总览:整体状态 + 各类健康计数。
+type InfraOverview struct {
+	Status         string `json:"status"` // ok / warn / bad / nosample(最差状态冒泡)
+	InstancesTotal int    `json:"instances_total"`
+	InstancesOK    int    `json:"instances_ok"`
+	DBStatus       string `json:"db_status"` // ok/warn/bad/nosample/absent
+	LBStatus       string `json:"lb_status"`
+	ProbesTotal    int    `json:"probes_total"`
+	ProbesOK       int    `json:"probes_ok"` // 端到端全通计数(status==ok)
+	LocksTotal     int    `json:"locks_total"`
+	LocksOK        int    `json:"locks_ok"` // 源站锁生效计数(403)
+}
+
+// InfraAlert 是一条最近告警(供告警面板)。
+type InfraAlert struct {
+	Ts     int64  `json:"ts"`
+	When   string `json:"when"`   // 已格式化时间
+	Kind   string `json:"kind"`   // 告警类型(infra_db_mem 等)
+	Target string `json:"target"` // 资源/域名
+	Detail string `json:"detail"` // 标题/详情
+	Status string `json:"status"` // bad(普通)/ warn(_FAILED 等)
+}
+
+// InfraSnapshot 是服务端监控一次快照:总览 + 端到端探活 + 实例 + 数据库 + 负载均衡 + 趋势 + 最近告警。
 type InfraSnapshot struct {
 	GeneratedAt string          `json:"generated_at"`
 	DataAgeSec  int64           `json:"data_age_sec"`
+	Overview    InfraOverview   `json:"overview"`
+	Probes      []ProbeResource `json:"probes"`
+	Locks       []LockResource  `json:"locks"`
 	Instances   []InfraResource `json:"instances"`
 	Database    *InfraResource  `json:"database"`
 	LB          *InfraResource  `json:"lb"`
-	DBMemTrend  []InfraPoint    `json:"db_mem_trend"`
-	DBSwapTrend []InfraPoint    `json:"db_swap_trend"`
+	Alerts      []InfraAlert    `json:"alerts"`
 }
 
 // computeInfraSnapshot 从本地 infra_samples 聚合最新视图(零 AWS 调用,纯读本地)。
@@ -351,8 +446,19 @@ func (m *Monitor) computeInfraSnapshot(nowUnix int64) InfraSnapshot {
 				newest = a.maxTs
 			}
 		}
+		// 端到端探活(rtype=probe)单独成 ProbeResource,不混入实例/DB/LB。
+		if a.rtype == "probe" {
+			snap.Probes = append(snap.Probes, m.buildProbe(name, a.metrics, age))
+			continue
+		}
+		// 源站锁检查(rtype=lock)单独成 LockResource。
+		if a.rtype == "lock" {
+			snap.Locks = append(snap.Locks, buildLock(name, a.metrics, age))
+			continue
+		}
 		res := InfraResource{Name: name, Type: rtypeOrInstance(a.rtype), AgeSec: age, Metrics: a.metrics}
-		res.Status = infraStatus(res)
+		addDerivedPct(&res) // 派生百分比键(前端直接用),需在算 status 前完成
+		res.Status = m.infraStatus(res)
 		switch res.Type {
 		case "database":
 			d := res
@@ -364,6 +470,8 @@ func (m *Monitor) computeInfraSnapshot(nowUnix int64) InfraSnapshot {
 			snap.Instances = append(snap.Instances, res)
 		}
 	}
+	sortProbes(snap.Probes)
+	sortLocks(snap.Locks)
 	if newest > 0 {
 		snap.DataAgeSec = nowUnix - (newest + 60)
 		if snap.DataAgeSec < 0 {
@@ -374,13 +482,159 @@ func (m *Monitor) computeInfraSnapshot(nowUnix int64) InfraSnapshot {
 	}
 	// 实例按名稳定排序,避免每次刷新行序跳动。
 	sortInstances(snap.Instances)
-	// DB 内存/swap 趋势(近 6 小时)。
-	if snap.Database != nil {
-		since := nowUnix - 6*3600
-		snap.DBMemTrend = m.storeInfraSeries(snap.Database.Name, "free_mem_mb", since)
-		snap.DBSwapTrend = m.storeInfraSeries(snap.Database.Name, "swap_mb", since)
-	}
+	// 各资源的指标趋势改为前端按需拉(GET /infra/series),不在快照里预算。
+	snap.Overview = buildOverview(snap)
+	snap.Alerts = m.recentInfraAlerts(nowUnix, 20)
 	return snap
+}
+
+// buildProbe 把某域名的探活指标组装成 ProbeResource 并按阈值定级。
+func (m *Monitor) buildProbe(domain string, mm map[string]float64, age int64) ProbeResource {
+	p := ProbeResource{Domain: domain, AgeSec: age}
+	if len(mm) == 0 {
+		p.Status = "nosample"
+		return p
+	}
+	p.Reachable = mm["reachable"] >= 1
+	p.HTTPCode = int(mm["status_code"])
+	p.LatencyMs = mm["latency_ms"]
+	p.ViaCDN = mm["via_cdn"] >= 1
+	if v, ok := mm["cert_days"]; ok {
+		p.CertDays = v
+		p.HasCert = true
+	}
+	p.Status = m.probeStatus(p)
+	return p
+}
+
+// buildLock 把某源站端点的锁检查指标组装成 LockResource(403=ok,非403=bad)。
+func buildLock(target string, mm map[string]float64, age int64) LockResource {
+	l := LockResource{Target: target, AgeSec: age}
+	if len(mm) == 0 {
+		l.Status = "nosample"
+		return l
+	}
+	l.HTTPCode = int(mm["status_code"])
+	l.Locked = mm["locked"] >= 1
+	if l.Locked {
+		l.Status = "ok"
+	} else {
+		l.Status = "bad" // 拿到响应但不是 403 = 锁失效,最高优先
+	}
+	return l
+}
+
+// probeStatus 端到端探活定级:非 200/不可达=bad;延时超 bad 阈值=bad、超 warn=warn;
+// 证书天数低于 bad=bad、低于 warn=warn(最差状态冒泡)。
+func (m *Monitor) probeStatus(p ProbeResource) string {
+	c := m.cfg
+	if !p.Reachable || p.HTTPCode != 200 {
+		return "bad"
+	}
+	st := "ok"
+	worse := func(s string) {
+		if rank(s) > rank(st) {
+			st = s
+		}
+	}
+	if p.LatencyMs >= c.ProbeLatencyBadMs {
+		worse("bad")
+	} else if p.LatencyMs >= c.ProbeLatencyWarnMs {
+		worse("warn")
+	}
+	if p.HasCert {
+		if p.CertDays <= c.ProbeCertBadDays {
+			worse("bad")
+		} else if p.CertDays <= c.ProbeCertWarnDays {
+			worse("warn")
+		}
+	}
+	// 期望经 CDN 却没走 CloudFront = 边缘漂移(DNS 指错/脱离 CDN),记黄。
+	if c.ProbeExpectCDN && !p.ViaCDN {
+		worse("warn")
+	}
+	return st
+}
+
+// rank 把状态映成可比较的严重度(越大越糟),供"最差状态冒泡"。
+func rank(s string) int {
+	switch s {
+	case "bad":
+		return 3
+	case "warn":
+		return 2
+	case "ok":
+		return 1
+	default: // nosample / absent / ""
+		return 0
+	}
+}
+
+// worst 取多个状态里最差的(nosample 不视作"故障",仅在全部缺数据时冒泡)。
+func worst(states ...string) string {
+	best := ""
+	for _, s := range states {
+		if rank(s) > rank(best) {
+			best = s
+		}
+	}
+	if best == "" {
+		return "nosample"
+	}
+	return best
+}
+
+// buildOverview 由实例/DB/LB/探活的状态聚合顶部总览(最差状态冒泡 + 健康计数)。
+func buildOverview(snap InfraSnapshot) InfraOverview {
+	o := InfraOverview{DBStatus: "absent", LBStatus: "absent"}
+	var states []string
+	for _, in := range snap.Instances {
+		o.InstancesTotal++
+		if in.Status == "ok" {
+			o.InstancesOK++
+		}
+		states = append(states, in.Status)
+	}
+	if snap.Database != nil {
+		o.DBStatus = snap.Database.Status
+		states = append(states, snap.Database.Status)
+	}
+	if snap.LB != nil {
+		o.LBStatus = snap.LB.Status
+		states = append(states, snap.LB.Status)
+	}
+	for _, p := range snap.Probes {
+		o.ProbesTotal++
+		if p.Status == "ok" {
+			o.ProbesOK++
+		}
+		states = append(states, p.Status)
+	}
+	for _, l := range snap.Locks {
+		o.LocksTotal++
+		if l.Status == "ok" {
+			o.LocksOK++
+		}
+		states = append(states, l.Status)
+	}
+	o.Status = worst(states...)
+	return o
+}
+
+func sortProbes(rs []ProbeResource) {
+	for i := 1; i < len(rs); i++ {
+		for j := i; j > 0 && rs[j-1].Domain > rs[j].Domain; j-- {
+			rs[j-1], rs[j] = rs[j], rs[j-1]
+		}
+	}
+}
+
+func sortLocks(rs []LockResource) {
+	for i := 1; i < len(rs); i++ {
+		for j := i; j > 0 && rs[j-1].Target > rs[j].Target; j-- {
+			rs[j-1], rs[j] = rs[j], rs[j-1]
+		}
+	}
 }
 
 func rtypeOrInstance(t string) string {
@@ -390,33 +644,95 @@ func rtypeOrInstance(t string) string {
 	return t
 }
 
+// instRank 按重要程度给实例排序权重(越小越靠前):Master > Slave > Redis > 其余。
+func instRank(name string) int {
+	n := strings.ToLower(name)
+	switch {
+	case strings.Contains(n, "master"):
+		return 0
+	case strings.Contains(n, "slave"):
+		return 1
+	case strings.Contains(n, "redis"):
+		return 2
+	default:
+		return 3
+	}
+}
+
+// sortInstances 按重要程度排;同档按名字稳定排序,避免每次刷新行序跳动。
 func sortInstances(rs []InfraResource) {
+	less := func(a, b InfraResource) bool {
+		ra, rb := instRank(a.Name), instRank(b.Name)
+		if ra != rb {
+			return ra < rb
+		}
+		return a.Name < b.Name
+	}
 	for i := 1; i < len(rs); i++ {
-		for j := i; j > 0 && rs[j-1].Name > rs[j].Name; j-- {
+		for j := i; j > 0 && less(rs[j], rs[j-1]); j-- {
 			rs[j-1], rs[j] = rs[j], rs[j-1]
 		}
 	}
 }
 
-// infraStatus 由阈值给资源一个红/黄/绿色标(无指标=nosample)。
-func infraStatus(r InfraResource) string {
+// addDerivedPct 往资源 Metrics 里写派生百分比键(供 status 与前端直接用)。
+// 一律除零保护:total 缺失或为 0 时不产出该 pct 键。
+func addDerivedPct(r *InfraResource) {
 	m := r.Metrics
-	if len(m) == 0 {
-		return "nosample"
+	if m == nil {
+		return
 	}
-	has := func(k string) (float64, bool) { v, ok := m[k]; return v, ok }
+	memTotal, hasMemTotal := m["mem_total_mb"]
 	switch r.Type {
 	case "database":
-		if v, ok := has("free_mem_mb"); ok && v < 80 {
+		// 可用内存% = 可用内存 / 总内存
+		if free, ok := m["free_mem_mb"]; ok && hasMemTotal && memTotal > 0 {
+			m["mem_avail_pct"] = free / memTotal * 100
+		}
+		// 可用存储% = 可用存储 / 总磁盘
+		if free, ok := m["free_storage_gb"]; ok {
+			if total, ok2 := m["disk_total_gb"]; ok2 && total > 0 {
+				m["storage_avail_pct"] = free / total * 100
+			}
+		}
+	case "lb":
+		// LB 无内存/磁盘总量,无派生
+	default: // instance
+		// 已用内存% = (总内存 - 可用内存) / 总内存;仅当 host-agent 的 mem_avail_mb 存在
+		if avail, ok := m["mem_avail_mb"]; ok && hasMemTotal && memTotal > 0 {
+			m["mem_used_pct"] = (memTotal - avail) / memTotal * 100
+		}
+		// disk_used_pct 直接来自 host-agent(已有),不在此派生
+	}
+}
+
+// infraStatus 由【百分比阈值】给资源一个红/黄/绿色标(无指标=nosample)。
+// 阈值取自 Settings(可经环境变量配置);可用内存/存储「低于」即告急,CPU「高于」即告急,突发额度「低于」即黄。
+func (m *Monitor) infraStatus(r InfraResource) string {
+	mm := r.Metrics
+	if len(mm) == 0 {
+		return "nosample"
+	}
+	c := m.cfg
+	has := func(k string) (float64, bool) { v, ok := mm[k]; return v, ok }
+	switch r.Type {
+	case "database":
+		if v, ok := has("mem_avail_pct"); ok && v < c.InfraMemAvailBadPct {
 			return "bad"
 		}
-		if v, ok := has("free_storage_gb"); ok && v < 8 {
+		if v, ok := has("storage_avail_pct"); ok && v < c.InfraStorageAvailBadPct {
 			return "bad"
 		}
-		if v, ok := has("free_mem_mb"); ok && v < 150 {
+		if v, ok := has("cpu"); ok && v > c.InfraCPUBadPct {
+			return "bad"
+		}
+		if v, ok := has("mem_avail_pct"); ok && v < c.InfraMemAvailWarnPct {
 			return "warn"
 		}
-		if v, ok := has("cpu"); ok && v > 80 {
+		if v, ok := has("storage_avail_pct"); ok && v < c.InfraStorageAvailWarnPct {
+			return "warn"
+		}
+		if v, ok := has("cpu"); ok && v > c.InfraCPUWarnPct {
 			return "warn"
 		}
 		if v, ok := has("connections"); ok && v > 70 {
@@ -441,19 +757,22 @@ func infraStatus(r InfraResource) string {
 		if v, ok := has("status_failed"); ok && v >= 1 {
 			return "bad"
 		}
-		if v, ok := has("mem_avail_mb"); ok && v < 100 {
+		if v, ok := has("mem_used_pct"); ok && v > 100-c.InfraMemAvailBadPct {
 			return "bad"
 		}
-		if v, ok := has("cpu"); ok && v > 80 {
+		if v, ok := has("cpu"); ok && v > c.InfraCPUBadPct {
+			return "bad"
+		}
+		if v, ok := has("cpu"); ok && v > c.InfraCPUWarnPct {
 			return "warn"
 		}
-		if v, ok := has("mem_avail_mb"); ok && v < 200 {
+		if v, ok := has("mem_used_pct"); ok && v > 100-c.InfraMemAvailWarnPct {
 			return "warn"
 		}
-		if v, ok := has("disk_used_pct"); ok && v > 80 {
+		if v, ok := has("disk_used_pct"); ok && v > 100-c.InfraStorageAvailWarnPct {
 			return "warn"
 		}
-		if v, ok := has("burst"); ok && v < 20 {
+		if v, ok := has("burst"); ok && v < c.InfraBurstWarnPct {
 			return "warn"
 		}
 		return "ok"
@@ -471,13 +790,15 @@ func (m *Monitor) evaluateInfraAlerts(now int64) {
 	}
 	snap := m.computeInfraSnapshot(now)
 	if d := snap.Database; d != nil {
-		if v, ok := d.Metrics["free_mem_mb"]; ok && v < 80 {
+		if v, ok := d.Metrics["mem_avail_pct"]; ok && v < m.cfg.InfraMemAvailBadPct {
+			free := d.Metrics["free_mem_mb"]
 			m.fire(c, "infra_db_mem", d.Name, "数据库可用内存告急",
-				fmt.Sprintf("数据库 %s 可用内存仅 %.0f MB(阈值 80MB),内存接近耗尽,有 OOM 重启风险。", d.Name, v), now)
+				fmt.Sprintf("数据库 %s 可用内存仅 %.1f%%(%.0f MB,阈值 %.0f%%),内存接近耗尽,有 OOM 重启风险。", d.Name, v, free, m.cfg.InfraMemAvailBadPct), now)
 		}
-		if v, ok := d.Metrics["free_storage_gb"]; ok && v < 8 {
+		if v, ok := d.Metrics["storage_avail_pct"]; ok && v < m.cfg.InfraStorageAvailBadPct {
+			free := d.Metrics["free_storage_gb"]
 			m.fire(c, "infra_db_storage", d.Name, "数据库存储不足",
-				fmt.Sprintf("数据库 %s 可用存储仅 %.1f GB(阈值 8GB)。", d.Name, v), now)
+				fmt.Sprintf("数据库 %s 可用存储仅 %.1f%%(%.1f GB,阈值 %.0f%%)。", d.Name, v, free, m.cfg.InfraStorageAvailBadPct), now)
 		}
 	}
 	for _, in := range snap.Instances {
@@ -492,4 +813,29 @@ func (m *Monitor) evaluateInfraAlerts(now int64) {
 				fmt.Sprintf("负载均衡 %s 不健康节点数 %.0f。", lb.Name, v), now)
 		}
 	}
+	for _, p := range snap.Probes {
+		if !p.Reachable || p.HTTPCode != 200 {
+			m.fire(c, "infra_probe_down", p.Domain, "站点端到端探活失败",
+				fmt.Sprintf("域名 %s 探活异常:%s。可能站点不可达或返回非 200,客户可能受影响。", p.Domain, probeDownDetail(p)), now)
+		}
+		if p.HasCert && p.CertDays <= m.cfg.ProbeCertBadDays {
+			m.fire(c, "infra_probe_cert", p.Domain, "TLS 证书即将过期",
+				fmt.Sprintf("域名 %s 的 TLS 证书仅剩 %.1f 天(阈值 %.0f 天),过期将导致全站 HTTPS 失败。", p.Domain, p.CertDays, m.cfg.ProbeCertBadDays), now)
+		}
+	}
+	// 源站锁失效:直连源站不带头本应 403,却返回非 403 = F-5 锁被回滚/失效,安全红线。
+	for _, l := range snap.Locks {
+		if l.Status == "bad" {
+			m.fire(c, "infra_origin_lock", l.Target, "源站锁失效(可绕过 CDN 直连)",
+				fmt.Sprintf("源站 %s 直连(不带 X-Origin-Verify)返回 HTTP %d(本应 403)。F-5 源站锁可能被回滚或失效,现在可绕过 CloudFront 直连后端,请立即排查 nginx 配置。", l.Target, l.HTTPCode), now)
+		}
+	}
+}
+
+// probeDownDetail 给探活失败一句人话描述。
+func probeDownDetail(p ProbeResource) string {
+	if !p.Reachable {
+		return "不可达(超时或连接失败)"
+	}
+	return fmt.Sprintf("HTTP %d", p.HTTPCode)
 }

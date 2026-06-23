@@ -147,10 +147,10 @@ type RejectionSample struct {
 // 推送(rtype=host,POST /internal/host)。复合主键使重复写入幂等(同键覆盖)。
 // 存储单位已归一(见 infra.go 注释):内存/swap=MB、存储=GB、网络=KB/s、CPU/突发=%、其余原值。
 type InfraSample struct {
-	BucketTs int64   `gorm:"primaryKey;autoIncrement:false;index:idx_infra_bucket"`
-	Resource string  `gorm:"primaryKey;size:128"` // 资源名,如 Database-NexusAPI
-	RType    string  `gorm:"primaryKey;size:16;column:rtype"`
-	Metric   string  `gorm:"primaryKey;size:48"`
+	BucketTs int64  `gorm:"primaryKey;autoIncrement:false;index:idx_infra_bucket"`
+	Resource string `gorm:"primaryKey;size:128"` // 资源名,如 Database-NexusAPI
+	RType    string `gorm:"primaryKey;size:16;column:rtype"`
+	Metric   string `gorm:"primaryKey;size:48"`
 	Value    float64
 }
 

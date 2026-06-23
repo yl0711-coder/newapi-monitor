@@ -1,0 +1,39 @@
+# hostagent 部署(每节点一个)——采集本机 OS 指标推给 monitor。
+#
+# 镜像由 CI 构建推 GHCR(勿在生产机 build);本机/CI: docker build -f cmd/hostagent/Dockerfile -t <tag> .
+#
+# 每节点在 .env 里设(注意 HOSTAGENT_NODE 必须等于 monitor 里该实例名,否则数据并不进对应实例行):
+#   Master 节点:
+#     HOSTAGENT_NODE=Ubuntu-NexusAPI-Master
+#     HOSTAGENT_SINK_URL=https://monitor.nexusapi.link/internal/host   # 经 Caddy /internal(限 Master 私网放行)
+#     HOSTAGENT_TOKEN=<= monitor 的 MONITOR_INGEST_TOKEN>
+#     # 配合下方 extra_hosts 把域名钉到 Slave 私网,走私网而非公网
+#   Slave 节点(与 monitor 同机同网,直连容器最简):
+#     HOSTAGENT_NODE=Ubuntu-NexusAPI-Slave-1
+#     HOSTAGENT_SINK_URL=http://nexusapi-monitor:8090/internal/host
+#     HOSTAGENT_TOKEN=<= MONITOR_INGEST_TOKEN>
+#
+# Redis-NexusAPI-New / Ubuntu-1 若也要 OS 图,各自部署一份(HOSTAGENT_NODE 改成对应实例名)。
+
+services:
+  hostagent:
+    image: ghcr.io/yl0711-coder/newapi-monitor-hostagent:latest
+    container_name: nexusapi-hostagent
+    restart: unless-stopped
+    environment:
+      - HOSTAGENT_NODE=${HOSTAGENT_NODE:?set HOSTAGENT_NODE = 该实例在 monitor 里的名字}
+      - HOSTAGENT_SINK_URL=${HOSTAGENT_SINK_URL:?set HOSTAGENT_SINK_URL}
+      - HOSTAGENT_TOKEN=${HOSTAGENT_TOKEN:?set HOSTAGENT_TOKEN = MONITOR_INGEST_TOKEN}
+      - HOSTAGENT_INTERVAL_SECONDS=60
+      - HOSTAGENT_PROC=/host/proc
+      - HOSTAGENT_ROOTFS=/host/root
+    volumes:
+      # 只读挂载宿主信息——agent 只读不写
+      - /proc:/host/proc:ro
+      - /:/host/root:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    # 内存极小;给个上限防意外
+    mem_limit: 64m
+    # Master 节点需要把域名钉到 Slave 私网时,取消下面注释(Slave 直连容器则不需要):
+    # extra_hosts:
+    #   - "monitor.nexusapi.link:172.26.10.97"

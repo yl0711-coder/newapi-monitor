@@ -165,16 +165,41 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
     <div class="meta" id="infraGenAt">—</div>
   </div>
   <div id="infraErr"></div>
+
+  <!-- 1. 顶部总览条 -->
+  <div class="banner" id="infraBanner">
+    <div class="banner-main" id="infraBannerMain">—</div>
+    <div class="banner-side" id="infraCounts" style="flex-direction:row;gap:18px;flex-wrap:wrap"></div>
+    <div class="banner-side" style="margin-left:auto"><span>数据更新:<b id="infraFresh">—</b></span></div>
+  </div>
+
+  <!-- 2. 端到端可用性 -->
+  <div class="card"><div class="card-header">🌐 端到端可用性 <span class="muted" style="font-weight:400">· 对各前端域名 HTTPS 探活(状态码 / 延时 / TLS 证书剩余天数 / 是否经 CDN)</span></div>
+    <table><thead id="thProbe"></thead><tbody id="tbProbe"></tbody></table></div>
+
+  <!-- 2b. 源站锁(F-5 看门狗) -->
+  <div class="card"><div class="card-header">🔒 源站锁 <span class="muted" style="font-weight:400">· 直连各源站不带密钥头应被拦 403;变 200 即锁失效(可绕 CDN 直连后端)</span></div>
+    <table><thead id="thLock"></thead><tbody id="tbLock"></tbody></table></div>
+
+  <!-- 3. 数据库 -->
   <div class="card">
     <div class="card-header">🗄 数据库 <span class="muted" style="font-weight:400">· 含 AWS 控制台看不到的「可用内存 / Swap」</span></div>
     <div id="dbBody" style="padding:16px 20px"><span class="muted">加载中…</span></div>
-    <div id="dbTrendWrap" style="padding:0 20px 16px;display:none;gap:24px;flex-wrap:wrap">
-      <div style="flex:1;min-width:300px"><div class="muted" style="font-size:12px;margin-bottom:6px">可用内存(MB,近6h)</div><div id="dbMemTrend" style="width:100%;height:180px"></div></div>
-      <div style="flex:1;min-width:300px"><div class="muted" style="font-size:12px;margin-bottom:6px">Swap(MB,近6h)</div><div id="dbSwapTrend" style="width:100%;height:180px"></div></div>
-    </div>
+    <div id="dbCharts" style="padding:0 20px 16px"></div>
   </div>
-  <div class="card"><div class="card-header">🖥 实例</div><table><thead id="thInst"></thead><tbody id="tbInst"></tbody></table></div>
+
+  <!-- 4. 实例 -->
+  <div class="card"><div class="card-header">🖥 实例 <span class="muted" style="font-weight:400">· CPU/突发额度来自 AWS;内存/磁盘/load/容器需主机 agent</span></div><table><thead id="thInst"></thead><tbody id="tbInst"></tbody></table></div>
+
+  <!-- 5. 负载均衡 -->
   <div class="card"><div class="card-header">⚖️ 负载均衡</div><div id="lbBody" style="padding:16px 20px"><span class="muted">加载中…</span></div></div>
+
+  <!-- 6. Redis(占位) -->
+  <div class="card"><div class="card-header">🧱 Redis</div><div style="padding:16px 20px"><span class="muted">待接入(接入后显示内存 / 命中率 / 连接数等)</span></div></div>
+
+  <!-- 7. 最近告警 -->
+  <div class="card"><div class="card-header">🔔 最近告警 <span class="muted" style="font-weight:400">· 服务端监控触发的告警(最近 20 条)</span></div>
+    <div id="infraAlerts" style="padding:14px 18px"><span class="muted">加载中…</span></div></div>
 </div>
 
 <script>
@@ -485,47 +510,245 @@ document.getElementById('refreshNow').addEventListener('click',load);
 document.getElementById('autoRefresh').addEventListener('change',schedule);
 window.addEventListener('resize',()=>{trendChart&&trendChart.resize();sloGauge&&sloGauge.resize();longChart&&longChart.resize();latChart&&latChart.resize();ttftChart&&ttftChart.resize();});
 // ===== 服务端监控(实例 / DB / LB)=====
-let infraTimer=null, dbMemChart=null, dbSwapChart=null, _dbMem=[], _dbSwap=[];
+let infraTimer=null;
+let infraCharts=[];            // 当前 server tab 内所有 echarts 实例,重渲染前统一 dispose 防泄漏
+const groupSel={};             // 资源名 -> 当前选中的指标组 key(刷新后保留选择)
+const instExpanded=new Set();  // 已展开的实例名(刷新后保留展开态)
 const infraBadge=st=>{const m={ok:['badge-green','正常'],warn:['badge-yellow','注意'],bad:['badge-red','告警'],nosample:['badge-gray','无数据']};const[c,t]=m[st]||m.nosample;return `<span class="badge ${c}">${t}</span>`};
 const fx=(v,n=0)=>v==null?'—':(+v).toFixed(n);
 const kv=(label,val)=>`<span style="display:inline-block;min-width:160px;margin:2px 16px 2px 0"><span class="muted">${label}:</span> <b>${val}</b></span>`;
+const PLACEHOLDER='<span class="muted">待主机 agent</span>';
+const cssAttr=s=>String(s).replace(/["\\]/g,'\\$&'); // 属性选择器里安全转义资源名
+// 前端上色用阈值(与后端 Settings 默认一致;权威判级仍以 snapshot 的 status 为准)。
+const infraCpuWarn=70,infraCpuBad=85,infraBurstWarn=20,infraStorageWarn=25,infraStorageBad=15;
+const infraLatWarn=500,infraLatBad=1500,infraCertWarn=30,infraCertBad=7; // 端到端探活:延时(ms)/证书(天)
+// 按「可用率」上色:availPct 越低越告急。warn/bad 为黄/红阈值(可用率低于即变色)。
+const colAvail=(pct,warn=25,bad=15)=>pct==null?'':(pct<bad?'color:var(--red)':(pct<warn?'color:var(--yellow)':'color:var(--green)'));
+// 按「占用率」上色:usedPct 越高越告急。
+const colUsed=(pct,warn=75,bad=85)=>pct==null?'':(pct>bad?'color:var(--red)':(pct>warn?'color:var(--yellow)':'color:var(--green)'));
+// 「用量 / 总量 (XX%)」文本;style 已含颜色。pct 缺失时只显示用量。
+const usageHtml=(used,total,pct,unit,style)=>{
+  if(used==null)return PLACEHOLDER;
+  const u=fx(used,unit==='GB'?1:0)+' '+unit;
+  if(total==null||!(+total>0)||pct==null)return `<b style="${style||''}">${u}</b>`;
+  return `<b style="${style||''}">${u} / ${fx(total,unit==='GB'?1:0)} ${unit} (${fx(pct,0)}%)</b>`;
+};
 
 function lineOpt(pts,color){
   const x=(pts||[]).map(p=>{const d=new Date(p.ts*1000);return ('0'+d.getHours()).slice(-2)+':'+('0'+d.getMinutes()).slice(-2)});
   const y=(pts||[]).map(p=>+(+p.value).toFixed(1));
   return{grid:{left:48,right:12,top:12,bottom:24},xAxis:{type:'category',data:x,axisLabel:{color:'#888',fontSize:10}},yAxis:{type:'value',axisLabel:{color:'#888',fontSize:10}},series:[{type:'line',data:y,showSymbol:false,lineStyle:{color:color,width:2},areaStyle:{color:color,opacity:0.08}}],tooltip:{trigger:'axis'}};
 }
-function drawInfraTrend(){
+// 多指标合并到一张图(如 load 1/5/15),带图例。
+function multiLineOpt(seriesDefs){
+  let x=[];
+  for(const sd of seriesDefs){if((sd.pts||[]).length>x.length)x=(sd.pts||[]).map(p=>{const d=new Date(p.ts*1000);return ('0'+d.getHours()).slice(-2)+':'+('0'+d.getMinutes()).slice(-2)});}
+  return{grid:{left:48,right:12,top:28,bottom:24},legend:{top:0,textStyle:{color:'#aaa',fontSize:10}},
+    xAxis:{type:'category',data:x,axisLabel:{color:'#888',fontSize:10}},yAxis:{type:'value',axisLabel:{color:'#888',fontSize:10}},
+    series:seriesDefs.map(sd=>({name:sd.name,type:'line',showSymbol:false,data:(sd.pts||[]).map(p=>+(+p.value).toFixed(2)),lineStyle:{color:sd.color,width:2}})),
+    tooltip:{trigger:'axis'}};
+}
+function disposeInfraCharts(){infraCharts.forEach(c=>{try{c.dispose()}catch(e){}});infraCharts=[];}
+function resizeInfraCharts(){infraCharts.forEach(c=>{try{c.resize()}catch(e){}});}
+// 指标分组定义:一组=若干相关指标(放一起看);tone 决定关键值上色方式。
+function groupsFor(type){
+  if(type==='database')return[
+    {k:'mem',label:'内存',metrics:[{m:'free_mem_mb',label:'可用内存',unit:'MB',color:'#2f7ed8',pct:'mem_avail_pct',tone:'avail'},{m:'swap_mb',label:'Swap',unit:'MB',color:'#e8453c',tone:'raw'}]},
+    {k:'compute',label:'算力',metrics:[{m:'cpu',label:'CPU',unit:'%',color:'#7e57c2',tone:'cpu'},{m:'connections',label:'连接数',unit:'',color:'#26a69a',tone:'raw'}]},
+    {k:'storage',label:'存储',metrics:[{m:'free_storage_gb',label:'可用存储',unit:'GB',color:'#2f7ed8',pct:'storage_avail_pct',tone:'avail'},{m:'disk_queue',label:'磁盘队列',unit:'',color:'#fb8c00',tone:'raw'}]},
+  ];
+  return[ // instance(含 Redis 等所有 Lightsail 实例)
+    {k:'compute',label:'算力',metrics:[{m:'cpu',label:'CPU',unit:'%',color:'#7e57c2',tone:'cpu'},{m:'burst',label:'突发额度',unit:'%',color:'#26a69a',tone:'burst'}]},
+    {k:'net',label:'网络',metrics:[{m:'net_out_kb',label:'网络出',unit:'KB/s',color:'#42a5f5',tone:'raw'}]},
+    {k:'mem',label:'内存',metrics:[{m:'mem_avail_mb',label:'可用内存',unit:'MB',color:'#2f7ed8',pct:'mem_used_pct',tone:'availUsed'},{m:'swap_mb',label:'Swap',unit:'MB',color:'#e8453c',tone:'raw'}]},
+    {k:'disk',label:'磁盘',metrics:[{m:'disk_used_pct',label:'磁盘已用',unit:'%',color:'#fb8c00',tone:'used'}]},
+    {k:'load',label:'负载',combined:true,metrics:[{m:'load1',label:'load1',unit:'',color:'#ab47bc'},{m:'load5',label:'load5',unit:'',color:'#7e57c2'},{m:'load15',label:'load15',unit:'',color:'#5c6bc0'}]},
+    {k:'container',label:'容器',metrics:[{m:'containers_up',label:'容器存活',unit:'',color:'#26a69a',tone:'raw'}]},
+  ];
+}
+// 图顶部的「关键值 + 颜色」。
+function metricHead(it,me){
+  const v=me[it.m];let style='',extra='';
+  if(it.tone==='avail'){const p=me[it.pct];style=colAvail(p);if(p!=null)extra=` (${fx(p,0)}%)`;}
+  else if(it.tone==='availUsed'){const up=me[it.pct];const ap=up!=null?100-up:null;style=colAvail(ap);if(ap!=null)extra=` (${fx(ap,0)}% 可用)`;}
+  else if(it.tone==='cpu'){style=colUsed(v,infraCpuWarn,infraCpuBad);}
+  else if(it.tone==='used'){style=colUsed(v,100-infraStorageWarn,100-infraStorageBad);}
+  else if(it.tone==='burst'){style=(v!=null&&v<infraBurstWarn)?'color:var(--yellow)':'color:var(--green)';}
+  const val=v==null?'—':fx(v,it.unit==='GB'?1:(it.unit==='%'?1:0))+(it.unit?(' '+it.unit):'');
+  return `<span class="muted">${it.label}</span> <b style="${style}">${val}${extra}</b> <span class="muted" style="font-weight:400">· 近6h</span>`;
+}
+// 在 host 容器里渲染:指标组下拉 + 图表区(每组关联指标并排;combined 组合一张图)。
+function renderResCharts(host,res,defKey){
+  const me=res.metrics||{};
+  const groups=groupsFor(res.type||'instance').filter(g=>g.metrics.some(mm=>me[mm.m]!=null));
+  if(!groups.length){host.innerHTML='<span class="muted" style="font-size:12px">暂无可画指标(待 host-agent 数据)</span>';return;}
+  let sel=groupSel[res.name];
+  if(!groups.find(g=>g.k===sel))sel=(defKey&&groups.find(g=>g.k===defKey))?defKey:groups[0].k;
+  groupSel[res.name]=sel;
+  const opts=groups.map(g=>`<option value="${g.k}"${g.k===sel?' selected':''}>${g.label}（${g.metrics.map(mm=>mm.label).join(' / ')}）</option>`).join('');
+  host.innerHTML=`<div style="display:flex;align-items:center;gap:8px;margin:6px 0 10px"><span class="muted" style="font-size:12px">指标组</span>`
+    +`<select class="mc-sel" style="background:#1a1d24;color:#ddd;border:1px solid #333;border-radius:6px;padding:3px 8px;font-size:12px">${opts}</select></div>`
+    +`<div class="mc-charts" style="display:flex;gap:24px;flex-wrap:wrap"></div>`;
+  const selEl=host.querySelector('.mc-sel');
+  selEl.addEventListener('change',()=>{groupSel[res.name]=selEl.value;drawGroup(host,res,groups.find(g=>g.k===selEl.value));});
+  drawGroup(host,res,groups.find(g=>g.k===sel));
+}
+async function drawGroup(host,res,g){
+  const wrap=host.querySelector('.mc-charts');if(!wrap||!g)return;
+  const me=res.metrics||{};
+  const items=g.combined?[{combined:true}]:g.metrics;
+  wrap.innerHTML=items.map((it,i)=>{
+    const head=g.combined?`<span class="muted">${g.label}</span> <span class="muted" style="font-weight:400">· 近6h</span>`:metricHead(it,me);
+    return `<div style="flex:1;min-width:300px"><div style="font-size:12px;margin-bottom:6px">${head}</div><div class="mc-c" data-i="${i}" style="width:100%;height:180px"></div></div>`;
+  }).join('');
+  let series={};
+  try{const r=await fetch('/infra/series?resource='+encodeURIComponent(res.name)+'&metrics='+encodeURIComponent(g.metrics.map(mm=>mm.m).join(','))+'&hours=6');
+    if(r.ok){const d=await r.json();series=d.series||{};}}catch(e){}
   if(typeof echarts==='undefined')return;
-  if(!dbMemChart)dbMemChart=echarts.init(document.getElementById('dbMemTrend'));
-  if(!dbSwapChart)dbSwapChart=echarts.init(document.getElementById('dbSwapTrend'));
-  dbMemChart.setOption(lineOpt(_dbMem,'#2f7ed8'));
-  dbSwapChart.setOption(lineOpt(_dbSwap,'#e8453c'));
+  const cdivs=wrap.querySelectorAll('.mc-c');
+  if(g.combined){const ch=echarts.init(cdivs[0]);infraCharts.push(ch);ch.setOption(multiLineOpt(g.metrics.map(mm=>({name:mm.label,color:mm.color,pts:series[mm.m]||[]}))));}
+  else{g.metrics.forEach((mm,i)=>{if(!cdivs[i])return;const ch=echarts.init(cdivs[i]);infraCharts.push(ch);ch.setOption(lineOpt(series[mm.m]||[],mm.color));});}
+}
+// 状态灯(用于总览条与各行):返回带颜色的圆点。
+const infraDot=st=>`<span class="dot ${st==='ok'?'dot-g':(st==='warn'?'dot-y':(st==='bad'?'dot-r':'dot-x'))}"></span>`;
+// 单个计数项:状态灯 + 文本。
+const countItem=(st,txt)=>`<span>${infraDot(st)} ${txt}</span>`;
+function renderInfraOverview(s){
+  const o=s.overview||{}, st=o.status||'nosample';
+  const b=document.getElementById('infraBanner'), m=document.getElementById('infraBannerMain');
+  const cls=st==='bad'?'bad':(st==='warn'?'warn':'ok');
+  const txt=st==='bad'?'存在告警':(st==='warn'?'部分波动':(st==='nosample'?'暂无数据':'运行正常'));
+  b.className='banner '+cls;
+  m.innerHTML=`<span class="dot ${st==='ok'?'dot-g dot-live':(st==='warn'?'dot-y':(st==='bad'?'dot-r':'dot-x'))}"></span> 服务端整体:${txt}`;
+  const cnt=document.getElementById('infraCounts'), parts=[];
+  // 实例 N✓
+  const instSt=o.instances_total?(o.instances_ok===o.instances_total?'ok':'bad'):'nosample';
+  parts.push(countItem(instSt, o.instances_total?`实例 ${o.instances_ok}/${o.instances_total}✓`:'实例 —'));
+  // DB
+  if(o.db_status&&o.db_status!=='absent') parts.push(countItem(o.db_status, 'DB '+(o.db_status==='ok'?'✓':'异常')));
+  // LB
+  if(o.lb_status&&o.lb_status!=='absent') parts.push(countItem(o.lb_status, 'LB '+(o.lb_status==='ok'?'✓':'异常')));
+  // 端到端
+  if(o.probes_total){
+    const probeSt=o.probes_ok===o.probes_total?'ok':'bad';
+    const probeTxt=o.probes_ok===o.probes_total?`端到端 全通(${o.probes_total})`:`端到端 ${o.probes_total-o.probes_ok} 个异常/${o.probes_total}`;
+    parts.push(countItem(probeSt, probeTxt));
+  }
+  // 源站锁
+  if(o.locks_total){
+    const lockSt=o.locks_ok===o.locks_total?'ok':'bad';
+    const lockTxt=o.locks_ok===o.locks_total?`源站锁 全生效(${o.locks_total})`:`源站锁 ${o.locks_total-o.locks_ok} 个失效/${o.locks_total}`;
+    parts.push(countItem(lockSt, lockTxt));
+  }
+  cnt.innerHTML=parts.join('');
+  document.getElementById('infraFresh').textContent=fmtAge(s.data_age_sec);
+}
+function renderProbes(s){
+  const rows=s.probes||[];
+  document.getElementById('thProbe').innerHTML='<tr><th>域名</th><th>状态</th><th class="right">HTTP</th><th class="right">延时</th><th class="right">证书剩余</th><th>经CDN</th><th>新鲜度</th></tr>';
+  const tb=document.getElementById('tbProbe');
+  if(!rows.length){tb.innerHTML='<tr><td colspan="7" class="muted" style="padding:16px">暂无探活数据(配置 MONITOR_PROBE_DOMAINS;首轮探活约 60s 内出)</td></tr>';return}
+  tb.innerHTML=rows.map(p=>{
+    const httpTxt=p.reachable?(`<span style="${p.http_code===200?'color:var(--green)':'color:var(--red)'}">${p.http_code||0}</span>`):'<span style="color:var(--red)">不可达</span>';
+    const latTxt=p.reachable?`<span style="${colUsed(p.latency_ms,infraLatWarn,infraLatBad)}">${fx(p.latency_ms,0)} ms</span>`:'<span class="muted">—</span>';
+    let certTxt='<span class="muted">—</span>';
+    if(p.has_cert){const cs=p.cert_days<=infraCertBad?'color:var(--red)':(p.cert_days<=infraCertWarn?'color:var(--yellow)':'color:var(--green)');certTxt=`<span style="${cs}">${fx(p.cert_days,0)} 天</span>`;}
+    const cdnTxt=p.reachable?(p.via_cdn?'<span style="color:var(--green)">是</span>':'<span style="color:var(--yellow)">否(漂移)</span>'):'<span class="muted">—</span>';
+    return `<tr><td><b>${esc(p.domain)}</b></td><td>${infraBadge(p.status)}</td><td class="right num">${httpTxt}</td><td class="right num">${latTxt}</td><td class="right num">${certTxt}</td><td>${cdnTxt}</td><td class="muted">${fmtAge(p.age_sec)}</td></tr>`;
+  }).join('');
+}
+function renderLocks(s){
+  const rows=s.locks||[];
+  document.getElementById('thLock').innerHTML='<tr><th>源站端点</th><th>状态</th><th class="right">直连返回</th><th>判定</th><th>新鲜度</th></tr>';
+  const tb=document.getElementById('tbLock');
+  if(!rows.length){tb.innerHTML='<tr><td colspan="5" class="muted" style="padding:16px">暂无源站锁数据(配置 MONITOR_ORIGIN_LOCK_TARGETS;走私网,仅部署到实例上可测,本地预览不可达属正常)</td></tr>';return}
+  tb.innerHTML=rows.map(l=>{
+    const codeTxt=`<span style="${l.locked?'color:var(--green)':'color:var(--red)'}">${l.http_code||0}</span>`;
+    const verdict=l.locked?'<span style="color:var(--green)">锁生效</span>':'<span style="color:var(--red)">锁失效·可绕过</span>';
+    return `<tr><td><b>${esc(l.target)}</b></td><td>${infraBadge(l.status)}</td><td class="right num">${codeTxt}</td><td>${verdict}</td><td class="muted">${fmtAge(l.age_sec)}</td></tr>`;
+  }).join('');
+}
+function renderInfraAlerts(s){
+  const box=document.getElementById('infraAlerts'), rows=s.alerts||[];
+  if(!rows.length){box.innerHTML='<span class="attn-empty">✓ 近期无服务端告警</span>';return}
+  box.innerHTML='<div class="attn-list">'+rows.map(a=>{
+    const dotc=a.status==='warn'?'dot-y':'dot-r';
+    return `<div class="attn-item"><span class="dot ${dotc}"></span>
+      <span class="who">${esc(a.detail||a.kind)}</span>
+      ${a.target?`<span class="muted">${esc(a.target)}</span>`:''}
+      <span class="why">${esc(a.when)}</span></div>`;
+  }).join('')+'</div>';
 }
 function renderInfra(s){
+  disposeInfraCharts(); // 重渲染前清掉旧图实例,防泄漏
   document.getElementById('infraGenAt').textContent='更新于 '+(s.generated_at||'')+' · 新鲜度 '+fmtAge(s.data_age_sec);
-  const db=s.database, dbBody=document.getElementById('dbBody'), trendWrap=document.getElementById('dbTrendWrap');
-  if(!db){dbBody.innerHTML='<span class="muted">无数据库数据</span>';trendWrap.style.display='none';}
+  renderInfraOverview(s);
+  renderProbes(s);
+  renderLocks(s);
+  renderInfraAlerts(s);
+  const db=s.database, dbBody=document.getElementById('dbBody'), dbCharts=document.getElementById('dbCharts');
+  if(!db){dbBody.innerHTML='<span class="muted">无数据库数据</span>';dbCharts.innerHTML='';}
   else{
-    const me=db.metrics||{}, mem=me.free_mem_mb;
-    const memCls=mem!=null&&mem<80?'color:var(--red)':(mem!=null&&mem<150?'color:#e8a33d':'');
+    const me=db.metrics||{};
+    // 内存%:用「已用 = 总 - 可用」展示用量,可用率上色
+    const memAvailPct=me.mem_avail_pct, memTotal=me.mem_total_mb;
+    const memUsed=(memTotal!=null&&me.free_mem_mb!=null)?(memTotal-me.free_mem_mb):null;
+    const memUsedPct=memAvailPct!=null?100-memAvailPct:null;
+    const memHtml=memUsed!=null?usageHtml(memUsed,memTotal,memUsedPct,'MB',colAvail(memAvailPct)):`<b style="${colAvail(memAvailPct)}">${fx(me.free_mem_mb)} MB 可用</b>`;
+    // 存储%:同理
+    const stAvailPct=me.storage_avail_pct, dTotal=me.disk_total_gb;
+    const stUsed=(dTotal!=null&&me.free_storage_gb!=null)?(dTotal-me.free_storage_gb):null;
+    const stUsedPct=stAvailPct!=null?100-stAvailPct:null;
+    const stHtml=stUsed!=null?usageHtml(stUsed,dTotal,stUsedPct,'GB',colAvail(stAvailPct)):`<b style="${colAvail(stAvailPct)}">${fx(me.free_storage_gb,1)} GB 可用</b>`;
     dbBody.innerHTML=`<div style="margin-bottom:8px">${infraBadge(db.status)} <b>${esc(db.name)}</b> <span class="muted">${fmtAge(db.age_sec)}</span></div>`
-      +kv('可用内存',`<span style="${memCls}">${fx(mem)} MB</span>`)
-      +kv('Swap 使用',`${fx(me.swap_mb)} MB`)
-      +kv('CPU',fx(me.cpu,1)+'%')
+      +kv('内存(已用/总)',memHtml)
+      +kv('存储(已用/总)',stHtml)
+      +kv('CPU',`<span style="${colUsed(me.cpu,infraCpuWarn,infraCpuBad)}">${fx(me.cpu,1)}%</span>`)
       +kv('连接数',fx(me.connections))
-      +kv('可用存储',fx(me.free_storage_gb,1)+' GB')
-      +kv('磁盘队列',fx(me.disk_queue,2));
-    _dbMem=s.db_mem_trend||[]; _dbSwap=s.db_swap_trend||[];
-    trendWrap.style.display='flex'; drawInfraTrend();
+      +kv('磁盘队列',fx(me.disk_queue,2))
+      +kv('Swap 使用',`${fx(me.swap_mb)} MB`);
+    renderResCharts(dbCharts, db, 'mem'); // DB 图表区:默认内存组(可用内存+Swap),下拉切算力/存储
   }
   const insts=s.instances||[];
-  document.getElementById('thInst').innerHTML='<tr><th>实例</th><th>状态</th><th>CPU</th><th>可用内存</th><th>磁盘</th><th>网络出</th><th>突发额度</th><th>新鲜度</th></tr>';
-  document.getElementById('tbInst').innerHTML=insts.map(r=>{const me=r.metrics||{};
-    const memTxt=me.mem_avail_mb!=null?(fx(me.mem_avail_mb)+(me.mem_total_mb?'/'+fx(me.mem_total_mb):'')+' MB'):'<span class="muted">需 agent</span>';
-    const diskTxt=me.disk_used_pct!=null?fx(me.disk_used_pct)+'%':'<span class="muted">需 agent</span>';
-    return `<tr><td><b>${esc(r.name)}</b></td><td>${infraBadge(r.status)}</td><td>${fx(me.cpu,1)}%</td><td>${memTxt}</td><td>${diskTxt}</td><td>${fx(me.net_out_kb)} KB/s</td><td>${fx(me.burst)}%</td><td class="muted">${fmtAge(r.age_sec)}</td></tr>`;
-  }).join('')||'<tr><td colspan="8" class="muted" style="padding:16px">无实例数据</td></tr>';
+  document.getElementById('thInst').innerHTML='<tr><th></th><th>实例</th><th>状态</th><th>CPU</th><th>突发额度</th><th>内存(已用/总)</th><th>磁盘</th><th>load</th><th>容器</th><th>网络出</th><th>新鲜度</th></tr>';
+  const tbInst=document.getElementById('tbInst');
+  if(!insts.length){tbInst.innerHTML='<tr><td colspan="11" class="muted" style="padding:16px">无实例数据</td></tr>';}
+  else{tbInst.innerHTML=insts.map((r,idx)=>{const me=r.metrics||{};
+    // CPU / 突发额度 来自 AWS,一定有;内存/磁盘/load 需 host-agent,缺失显占位。
+    const cpuHtml=me.cpu!=null?`<span style="${colUsed(me.cpu,infraCpuWarn,infraCpuBad)}">${fx(me.cpu,1)}%</span>`:PLACEHOLDER;
+    const burstHtml=me.burst!=null?`<span style="${me.burst<infraBurstWarn?'color:var(--yellow)':'color:var(--green)'}">${fx(me.burst)}%</span>`:PLACEHOLDER;
+    // 内存:已用/总(可用率上色);仅当 host-agent 推过 mem_avail_mb
+    let memHtml=PLACEHOLDER;
+    if(me.mem_avail_mb!=null){
+      const total=me.mem_total_mb, used=total!=null?(total-me.mem_avail_mb):null;
+      const usedPct=me.mem_used_pct, availPct=usedPct!=null?100-usedPct:null;
+      memHtml=usageHtml(used!=null?used:me.mem_avail_mb,total,usedPct,'MB',colAvail(availPct));
+      if(used==null)memHtml=`<b style="${colAvail(availPct)}">${fx(me.mem_avail_mb)} MB 可用</b>`;
+    }
+    const diskHtml=me.disk_used_pct!=null?`<span style="${colUsed(me.disk_used_pct,100-infraStorageWarn,100-infraStorageBad)}">${fx(me.disk_used_pct)}%</span>`:PLACEHOLDER;
+    const loadHtml=me.load1!=null?`<b>${fx(me.load1,2)}</b>`:PLACEHOLDER;
+    // 容器存活:host-agent 接入后填(containers_up/containers_total);缺数据显占位,行始终渲染。
+    let contHtml=PLACEHOLDER;
+    if(me.containers_total!=null){const up=me.containers_up!=null?me.containers_up:0,tot=me.containers_total;contHtml=`<span style="${up<tot?'color:var(--red)':'color:var(--green)'}">${fx(up)}/${fx(tot)}</span>`;}
+    const open=instExpanded.has(r.name);
+    const caret=`<span style="display:inline-block;width:14px;color:#888;transition:transform .15s;${open?'transform:rotate(90deg)':''}">▶</span>`;
+    return `<tr class="inst-row" data-name="${esc(r.name)}" style="cursor:pointer">`
+      +`<td>${caret}</td><td><b>${esc(r.name)}</b></td><td>${infraBadge(r.status)}</td><td>${cpuHtml}</td><td>${burstHtml}</td><td>${memHtml}</td><td>${diskHtml}</td><td>${loadHtml}</td><td>${contHtml}</td><td>${fx(me.net_out_kb)} KB/s</td><td class="muted">${fmtAge(r.age_sec)}</td></tr>`
+      +`<tr class="inst-exp" data-name="${esc(r.name)}"${open?'':' style="display:none"'}><td colspan="11" style="background:#15171c;padding:8px 20px 14px"><div class="inst-zone"></div></td></tr>`;
+  }).join('');
+    // 绑定点击展开 + 还原已展开行的图
+    insts.forEach(r=>{
+      const row=tbInst.querySelector(`.inst-row[data-name="${cssAttr(r.name)}"]`);
+      const exp=tbInst.querySelector(`.inst-exp[data-name="${cssAttr(r.name)}"]`);
+      if(!row||!exp)return;
+      row.addEventListener('click',()=>{
+        const nowOpen=exp.style.display!=='none';
+        if(nowOpen){exp.style.display='none';instExpanded.delete(r.name);row.querySelector('span').style.transform='';}
+        else{exp.style.display='';instExpanded.add(r.name);row.querySelector('span').style.transform='rotate(90deg)';renderResCharts(exp.querySelector('.inst-zone'),r,'compute');}
+      });
+      if(instExpanded.has(r.name))renderResCharts(exp.querySelector('.inst-zone'),r,'compute'); // 刷新后重绘已展开
+    });
+  }
   const lb=s.lb, lbBody=document.getElementById('lbBody');
   if(!lb){lbBody.innerHTML='<span class="muted">无负载均衡数据</span>';}
   else{const me=lb.metrics||{};
@@ -547,13 +770,13 @@ function switchTab(name){
   document.querySelectorAll('.tabs .tab').forEach(t=>t.classList.toggle('active',t.dataset.tab===name));
   document.getElementById('tab-model').hidden=(name!=='model');
   document.getElementById('tab-server').hidden=(name!=='server');
-  if(name==='server'){loadInfra();infraSchedule();setTimeout(()=>{dbMemChart&&dbMemChart.resize();dbSwapChart&&dbSwapChart.resize();},60);}
+  if(name==='server'){loadInfra();infraSchedule();setTimeout(resizeInfraCharts,80);}
   else if(infraTimer){clearInterval(infraTimer);}
 }
 document.querySelectorAll('.tabs .tab').forEach(t=>t.addEventListener('click',()=>switchTab(t.dataset.tab)));
 document.getElementById('infraRefresh').addEventListener('click',loadInfra);
 document.getElementById('infraAuto').addEventListener('change',infraSchedule);
-window.addEventListener('resize',()=>{dbMemChart&&dbMemChart.resize();dbSwapChart&&dbSwapChart.resize();});
+window.addEventListener('resize',resizeInfraCharts);
 
 setSeg();loadMe();load();schedule();
 document.querySelectorAll('#longSeg a').forEach(a=>{a.href='javascript:void 0';a.classList.toggle('active',+a.dataset.d===longDays);a.addEventListener('click',e=>{e.preventDefault();longDays=+a.dataset.d;document.querySelectorAll('#longSeg a').forEach(x=>x.classList.toggle('active',x===a));loadLongTrend();});});
