@@ -68,18 +68,28 @@ func envInt(k string, def int) int {
 }
 
 // sample 是一轮采集结果(字段名与 monitor /internal/host 契约一致)。
+// 指标用指针 + omitempty:某项采集失败就不带该字段,接收端也就不写——
+// 避免「读失败=0」被下游算成「可用 0 = 已用 100%」这种误报。
 type sample struct {
-	Node            string  `json:"node"`
-	MemTotalMB      float64 `json:"mem_total_mb"`
-	MemAvailMB      float64 `json:"mem_avail_mb"`
-	SwapUsedMB      float64 `json:"swap_used_mb"`
-	DiskUsedPct     float64 `json:"disk_used_pct"`
-	Load1           float64 `json:"load1"`
-	Load5           float64 `json:"load5"`
-	Load15          float64 `json:"load15"`
-	ContainersUp    float64 `json:"containers_up"`
-	ContainersTotal float64 `json:"containers_total"`
-	Ts              int64   `json:"ts"`
+	Node            string   `json:"node"`
+	MemTotalMB      *float64 `json:"mem_total_mb,omitempty"`
+	MemAvailMB      *float64 `json:"mem_avail_mb,omitempty"`
+	SwapUsedMB      *float64 `json:"swap_used_mb,omitempty"`
+	DiskUsedPct     *float64 `json:"disk_used_pct,omitempty"`
+	Load1           *float64 `json:"load1,omitempty"`
+	Load5           *float64 `json:"load5,omitempty"`
+	Load15          *float64 `json:"load15,omitempty"`
+	ContainersUp    *float64 `json:"containers_up,omitempty"`
+	ContainersTotal *float64 `json:"containers_total,omitempty"`
+	Ts              int64    `json:"ts"`
+}
+
+func fp(v float64) *float64 { return &v }
+func dv(p *float64) float64 {
+	if p != nil {
+		return *p
+	}
+	return -1
 }
 
 func main() {
@@ -103,35 +113,35 @@ func runOnce(c config, cl *http.Client) {
 		log.Printf("hostagent: 推送失败(忽略本轮): %v", err)
 		return
 	}
-	log.Printf("hostagent: 已推送 node=%s mem_avail=%.0fMB swap=%.0fMB disk=%.1f%% load1=%.2f 容器=%.0f/%.0f",
-		s.Node, s.MemAvailMB, s.SwapUsedMB, s.DiskUsedPct, s.Load1, s.ContainersUp, s.ContainersTotal)
+	log.Printf("hostagent: 已推送 node=%s mem_avail=%.0fMB swap=%.0fMB disk=%.1f%% load1=%.2f 容器=%.0f/%.0f (-1=该项未采到)",
+		s.Node, dv(s.MemAvailMB), dv(s.SwapUsedMB), dv(s.DiskUsedPct), dv(s.Load1), dv(s.ContainersUp), dv(s.ContainersTotal))
 }
 
-// collect 采一轮;任一项失败只记日志、该项留零,不影响其它项(fail-open)。
+// collect 采一轮;任一项失败只记日志、该项【不带】(留 nil),不影响其它项(fail-open)。
 func collect(c config) sample {
 	s := sample{Node: c.node, Ts: time.Now().Unix()}
 	if b, err := os.ReadFile(c.procPath + "/meminfo"); err == nil {
 		mi := parseMeminfo(b)
-		s.MemTotalMB, s.MemAvailMB, s.SwapUsedMB = mi.totalMB, mi.availMB, mi.swapUsedMB
+		s.MemTotalMB, s.MemAvailMB, s.SwapUsedMB = fp(mi.totalMB), fp(mi.availMB), fp(mi.swapUsedMB)
 	} else {
-		log.Printf("hostagent: 读 meminfo 失败: %v", err)
+		log.Printf("hostagent: 读 meminfo 失败(本项不上报): %v", err)
 	}
 	if b, err := os.ReadFile(c.procPath + "/loadavg"); err == nil {
 		l1, l5, l15 := parseLoadavg(string(b))
-		s.Load1, s.Load5, s.Load15 = l1, l5, l15
+		s.Load1, s.Load5, s.Load15 = fp(l1), fp(l5), fp(l15)
 	} else {
-		log.Printf("hostagent: 读 loadavg 失败: %v", err)
+		log.Printf("hostagent: 读 loadavg 失败(本项不上报): %v", err)
 	}
 	if pct, err := diskUsedPct(c.rootfs); err == nil {
-		s.DiskUsedPct = pct
+		s.DiskUsedPct = fp(pct)
 	} else {
-		log.Printf("hostagent: 统计磁盘失败: %v", err)
+		log.Printf("hostagent: 统计磁盘失败(本项不上报): %v", err)
 	}
 	if c.dockSock != "" {
 		if up, total, err := dockerCounts(c.dockSock); err == nil {
-			s.ContainersUp, s.ContainersTotal = float64(up), float64(total)
+			s.ContainersUp, s.ContainersTotal = fp(float64(up)), fp(float64(total))
 		} else {
-			log.Printf("hostagent: 采集容器数失败(忽略): %v", err)
+			log.Printf("hostagent: 采集容器数失败(本项不上报): %v", err)
 		}
 	}
 	return s

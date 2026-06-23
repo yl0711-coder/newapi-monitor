@@ -553,14 +553,14 @@ function resizeInfraCharts(){infraCharts.forEach(c=>{try{c.resize()}catch(e){}})
 // 指标分组定义:一组=若干相关指标(放一起看);tone 决定关键值上色方式。
 function groupsFor(type){
   if(type==='database')return[
-    {k:'mem',label:'内存',metrics:[{m:'free_mem_mb',label:'可用内存',unit:'MB',color:'#2f7ed8',pct:'mem_avail_pct',tone:'avail'},{m:'swap_mb',label:'Swap',unit:'MB',color:'#e8453c',tone:'raw'}]},
+    {k:'mem',label:'内存',metrics:[{m:'free_mem_mb',label:'已用内存',unit:'MB',color:'#2f7ed8',tone:'usedCap',totalKey:'mem_total_mb'},{m:'swap_mb',label:'Swap',unit:'MB',color:'#e8453c',tone:'raw'}]},
     {k:'compute',label:'算力',metrics:[{m:'cpu',label:'CPU',unit:'%',color:'#7e57c2',tone:'cpu'},{m:'connections',label:'连接数',unit:'',color:'#26a69a',tone:'raw'}]},
-    {k:'storage',label:'存储',metrics:[{m:'free_storage_gb',label:'可用存储',unit:'GB',color:'#2f7ed8',pct:'storage_avail_pct',tone:'avail'},{m:'disk_queue',label:'磁盘队列',unit:'',color:'#fb8c00',tone:'raw'}]},
+    {k:'storage',label:'存储',metrics:[{m:'free_storage_gb',label:'已用存储',unit:'GB',color:'#2f7ed8',tone:'usedCap',totalKey:'disk_total_gb'},{m:'disk_queue',label:'磁盘队列',unit:'',color:'#fb8c00',tone:'raw'}]},
   ];
   return[ // instance(含 Redis 等所有 Lightsail 实例)
     {k:'compute',label:'算力',metrics:[{m:'cpu',label:'CPU',unit:'%',color:'#7e57c2',tone:'cpu'},{m:'burst',label:'突发额度',unit:'%',color:'#26a69a',tone:'burst'}]},
     {k:'net',label:'网络',metrics:[{m:'net_out_kb',label:'网络出',unit:'KB/s',color:'#42a5f5',tone:'raw'}]},
-    {k:'mem',label:'内存',metrics:[{m:'mem_avail_mb',label:'可用内存',unit:'MB',color:'#2f7ed8',pct:'mem_used_pct',tone:'availUsed'},{m:'swap_mb',label:'Swap',unit:'MB',color:'#e8453c',tone:'raw'}]},
+    {k:'mem',label:'内存',metrics:[{m:'mem_avail_mb',label:'已用内存',unit:'MB',color:'#2f7ed8',tone:'usedCap',totalKey:'mem_total_mb'},{m:'swap_mb',label:'Swap',unit:'MB',color:'#e8453c',tone:'raw'}]},
     {k:'disk',label:'磁盘',metrics:[{m:'disk_used_pct',label:'磁盘已用',unit:'%',color:'#fb8c00',tone:'used'}]},
     {k:'load',label:'负载',combined:true,metrics:[{m:'load1',label:'load1',unit:'',color:'#ab47bc'},{m:'load5',label:'load5',unit:'',color:'#7e57c2'},{m:'load15',label:'load15',unit:'',color:'#5c6bc0'}]},
     {k:'container',label:'容器',metrics:[{m:'containers_up',label:'容器存活',unit:'',color:'#26a69a',tone:'raw'}]},
@@ -568,13 +568,19 @@ function groupsFor(type){
 }
 // 图顶部的「关键值 + 颜色」。
 function metricHead(it,me){
-  const v=me[it.m];let style='',extra='';
-  if(it.tone==='avail'){const p=me[it.pct];style=colAvail(p);if(p!=null)extra=` (${fx(p,0)}%)`;}
-  else if(it.tone==='availUsed'){const up=me[it.pct];const ap=up!=null?100-up:null;style=colAvail(ap);if(ap!=null)extra=` (${fx(ap,0)}% 可用)`;}
-  else if(it.tone==='cpu'){style=colUsed(v,infraCpuWarn,infraCpuBad);}
-  else if(it.tone==='used'){style=colUsed(v,100-infraStorageWarn,100-infraStorageBad);}
-  else if(it.tone==='burst'){style=(v!=null&&v<infraBurstWarn)?'color:var(--yellow)':'color:var(--green)';}
-  const val=v==null?'—':fx(v,it.unit==='GB'?1:(it.unit==='%'?1:0))+(it.unit?(' '+it.unit):'');
+  let dv=me[it.m],style='',extra='';
+  if(it.tone==='usedCap'){
+    // 容量类按惯例显示「已用」:已用 = 总 - 可用(free);高用量上红
+    const total=me[it.totalKey], free=me[it.m];
+    dv=(free!=null&&total!=null)?(total-free):free;
+    const pct=(dv!=null&&total>0)?dv/total*100:null;
+    style=colUsed(pct,75,85);
+    if(pct!=null)extra=` (${fx(pct,0)}%)`;
+  }
+  else if(it.tone==='cpu'){style=colUsed(dv,infraCpuWarn,infraCpuBad);}
+  else if(it.tone==='used'){style=colUsed(dv,100-infraStorageWarn,100-infraStorageBad);}
+  else if(it.tone==='burst'){style=(dv!=null&&dv<infraBurstWarn)?'color:var(--yellow)':'color:var(--green)';}
+  const val=dv==null?'—':fx(dv,it.unit==='GB'?1:(it.unit==='%'?1:0))+(it.unit?(' '+it.unit):'');
   return `<span class="muted">${it.label}</span> <b style="${style}">${val}${extra}</b> <span class="muted" style="font-weight:400">· 近6h</span>`;
 }
 // 在 host 容器里渲染:指标组下拉 + 图表区(每组关联指标并排;combined 组合一张图)。
@@ -607,7 +613,10 @@ async function drawGroup(host,res,g){
   if(typeof echarts==='undefined')return;
   const cdivs=wrap.querySelectorAll('.mc-c');
   if(g.combined){const ch=echarts.init(cdivs[0]);infraCharts.push(ch);ch.setOption(multiLineOpt(g.metrics.map(mm=>({name:mm.label,color:mm.color,pts:series[mm.m]||[]}))));}
-  else{g.metrics.forEach((mm,i)=>{if(!cdivs[i])return;const ch=echarts.init(cdivs[i]);infraCharts.push(ch);ch.setOption(lineOpt(series[mm.m]||[],mm.color));});}
+  else{g.metrics.forEach((mm,i)=>{if(!cdivs[i])return;
+    let pts=series[mm.m]||[];
+    if(mm.tone==='usedCap'){const total=me[mm.totalKey];if(total!=null)pts=pts.map(p=>({ts:p.ts,value:total-p.value}));} // 画已用=总-可用
+    const ch=echarts.init(cdivs[i]);infraCharts.push(ch);ch.setOption(lineOpt(pts,mm.color));});}
 }
 // 状态灯(用于总览条与各行):返回带颜色的圆点。
 const infraDot=st=>`<span class="dot ${st==='ok'?'dot-g':(st==='warn'?'dot-y':(st==='bad'?'dot-r':'dot-x'))}"></span>`;

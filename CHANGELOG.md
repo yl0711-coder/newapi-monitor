@@ -5,15 +5,15 @@
 ## [Unreleased]
 
 ### Added
-- **服务端健康监控(新增「服务端监控」Tab)**:在原「模型监控」之外加一个 Tab,监控实例 / 数据库 / 负载均衡健康。
-  - 数据库:CPU / 连接 / 存储 / 磁盘队列 + **可用内存 / Swap(AWS 控制台看不到的)** + 近 6h 内存/Swap 趋势图。
-  - 实例:存活 / CPU / 网络 / 突发额度(AWS 拉取)+ 内存 / 磁盘(节点 agent 推送)。
-  - 负载均衡:健康/不健康节点 / 5xx / 响应时间。
-  - 数据来自 AWS Lightsail 指标接口(只读,对实例零影响)+ 节点 agent 推送的主机 OS 指标(`POST /internal/host`)。
-  - 基础设施告警(复用现有邮件+冷却):DB 可用内存<80MB、DB 存储<8GB、实例 StatusCheckFailed、LB 不健康节点。
+- **服务端健康监控(新增「服务端监控」Tab)**:在原「模型监控」之外加一个 Tab,监控实例 / 数据库 / 负载均衡健康。数据来自 AWS Lightsail 指标接口(只读,对实例零影响)。
+  - **分组指标图**:DB / 实例统一「指标组下拉 + 图」,相关指标同组(内存=已用内存+Swap、算力=CPU+突发/连接、存储=已用存储+磁盘队列、网络、负载=load1/5/15、容器);图顶部带当前值+颜色。实例默认一行、点开看图;近 6h 序列按需经 `GET /infra/series` 拉取。容量类(内存/存储)按惯例显示「已用」。
+  - **端到端可用性探活**:对各前端域名 HTTPS 探活(状态码/延时/TLS 证书剩余天数),并校验「是否经 CloudFront(Via 头)」,脱离 CDN 记黄。
+  - **源站锁看门狗(F-5)**:周期性直连各源站不带密钥头,期望被拦 403;变非 403 即红告警(可绕 CDN 直连后端)。
+  - 实例按重要程度排序(Master>Slave>Redis>其余)。
+  - 基础设施告警(复用现有邮件+冷却):DB 可用内存/存储不足、实例 StatusCheckFailed、LB 不健康节点、探活失败/证书将过期、源站锁失效。
   - **`MONITOR_INFRA_ENABLED` 开关,默认关**;关闭时不调 AWS、不影响模型监控与现网行为。
-  - 新增环境变量:`MONITOR_INFRA_ENABLED` / `AWS_REGION` / `MONITOR_INFRA_SAMPLE_SECONDS` / `MONITOR_INFRA_RETENTION_DAYS` / `MONITOR_INFRA_RESOURCES`(AWS 凭证用 SDK 默认链)。
-  - 配套主机指标采集器:独立仓库 `newapi-host-agent`。
+  - 新增环境变量:`MONITOR_INFRA_*`、`AWS_REGION`、`MONITOR_PROBE_*`、`MONITOR_ORIGIN_LOCK_*`(AWS 凭证用 SDK 默认链)。
+- **节点主机指标采集器 `hostagent`(`cmd/hostagent`,同仓 matrix 构建)**:采本机内存/Swap/磁盘/load/容器存活,`POST /internal/host`(Bearer = `MONITOR_INGEST_TOKEN`)。纯 stdlib、只读、fail-open;某项采集失败即不上报该项(避免「缺失=0」被下游算成异常)。
 
 ## [1.3.2] - 2026-06-12
 

@@ -184,18 +184,19 @@ func (m *Monitor) ingestHost(c *gin.Context) {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
 		return
 	}
+	// 指标用指针:agent 某项采集失败会省略该字段,这里就不写——避免「缺失=0」被算成异常(如可用 0=已用 100%)。
 	var in struct {
-		Node            string  `json:"node"`
-		MemTotalMB      float64 `json:"mem_total_mb"`
-		MemAvailMB      float64 `json:"mem_avail_mb"`
-		SwapUsedMB      float64 `json:"swap_used_mb"`
-		DiskUsedPct     float64 `json:"disk_used_pct"`
-		Load1           float64 `json:"load1"`
-		Load5           float64 `json:"load5"`
-		Load15          float64 `json:"load15"`
-		ContainersUp    float64 `json:"containers_up"`
-		ContainersTotal float64 `json:"containers_total"`
-		Ts              int64   `json:"ts"`
+		Node            string   `json:"node"`
+		MemTotalMB      *float64 `json:"mem_total_mb"`
+		MemAvailMB      *float64 `json:"mem_avail_mb"`
+		SwapUsedMB      *float64 `json:"swap_used_mb"`
+		DiskUsedPct     *float64 `json:"disk_used_pct"`
+		Load1           *float64 `json:"load1"`
+		Load5           *float64 `json:"load5"`
+		Load15          *float64 `json:"load15"`
+		ContainersUp    *float64 `json:"containers_up"`
+		ContainersTotal *float64 `json:"containers_total"`
+		Ts              int64    `json:"ts"`
 	}
 	if err := c.ShouldBindJSON(&in); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
@@ -211,22 +212,28 @@ func (m *Monitor) ingestHost(c *gin.Context) {
 		ts = time.Now().Unix()
 	}
 	bucket := ts / 60 * 60
-	add := func(metric string, v float64) InfraSample {
-		return InfraSample{BucketTs: bucket, Resource: node, RType: "host", Metric: metric, Value: v}
+	var rows []InfraSample
+	addP := func(metric string, p *float64) {
+		if p != nil {
+			rows = append(rows, InfraSample{BucketTs: bucket, Resource: node, RType: "host", Metric: metric, Value: *p})
+		}
 	}
-	rows := []InfraSample{
-		add("mem_avail_mb", in.MemAvailMB),
-		add("swap_mb", in.SwapUsedMB), // 与 DB 的 swap_mb 统一键名(均为「已用 Swap MB」)
-		add("disk_used_pct", in.DiskUsedPct),
-		add("load1", in.Load1),
-		add("load5", in.Load5),
-		add("load15", in.Load15),
+	addP("mem_avail_mb", in.MemAvailMB)
+	addP("swap_mb", in.SwapUsedMB) // 与 DB 的 swap_mb 统一键名(均为「已用 Swap MB」)
+	addP("disk_used_pct", in.DiskUsedPct)
+	addP("load1", in.Load1)
+	addP("load5", in.Load5)
+	addP("load15", in.Load15)
+	if in.MemTotalMB != nil && *in.MemTotalMB > 0 {
+		addP("mem_total_mb", in.MemTotalMB)
 	}
-	if in.MemTotalMB > 0 {
-		rows = append(rows, add("mem_total_mb", in.MemTotalMB))
+	if in.ContainersTotal != nil {
+		addP("containers_total", in.ContainersTotal)
+		addP("containers_up", in.ContainersUp)
 	}
-	if in.ContainersTotal > 0 {
-		rows = append(rows, add("containers_total", in.ContainersTotal), add("containers_up", in.ContainersUp))
+	if len(rows) == 0 {
+		c.JSON(http.StatusOK, gin.H{"ok": true, "stored": 0})
+		return
 	}
 	if err := m.upsertInfra(rows); err != nil {
 		slog.Warn("主机指标入库失败", "err", err)
