@@ -17,7 +17,7 @@
 
 services:
   hostagent:
-    image: ghcr.io/yl0711-coder/newapi-monitor-hostagent:latest
+    image: ghcr.io/yl0711-coder/newapi-monitor-hostagent:${HOSTAGENT_TAG:-latest}
     container_name: nexusapi-hostagent
     restart: unless-stopped
     environment:
@@ -34,6 +34,15 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock:ro
     # 内存极小;给个上限防意外
     mem_limit: 64m
-    # Master 节点需要把域名钉到 Slave 私网时,取消下面注释(Slave 直连容器则不需要):
-    # extra_hosts:
-    #   - "monitor.nexusapi.link:172.26.10.97"
+    # Slave(与 monitor 同机)用容器名直连 monitor,需接入其 docker 网络。
+    # Master 不需要网络(走域名+extra_hosts),但加入也无害(各节点该网络都存在)。
+    networks:
+      - nexusapi-network
+    # Master 节点走私网到 Slave 的 Caddy,需把域名钉到 Slave 私网(Slave 不解析该域名、留着无害):
+    extra_hosts:
+      - "monitor.nexusapi.link:172.26.10.97"
+
+networks:
+  nexusapi-network:
+    external: true
+    name: deploy_nexusapi-network
