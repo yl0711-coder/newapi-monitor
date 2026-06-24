@@ -56,6 +56,10 @@ func (m *Monitor) startSampler(ctx context.Context) {
 	m.heartbeat()                      // 启动即对外打一次心跳,让 dead-man 立刻知道"活着"
 	go m.loop(ctx, interval)
 	slog.Info("采样器已启动", "interval", interval.String(), "note", "生产库仅每周期一条小查询")
+
+	if m.cfg.InfraEnabled { // 服务端健康监控(实例/DB/LB),独立采样循环;默认关
+		m.startInfra(ctx)
+	}
 }
 
 func (m *Monitor) loop(ctx context.Context, interval time.Duration) {

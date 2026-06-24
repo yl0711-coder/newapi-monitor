@@ -26,6 +26,8 @@ jobs:
 
   # 测试通过后才构建并发布镜像到 GHCR(PR 不发布)。
   # 用内置 GITHUB_TOKEN 推送,无需额外配置 secret。首次发布后,在 Packages 设置里把包可见性设为 Public。
+  # 测试通过后才构建并发布镜像到 GHCR(PR 不发布)。
+  # 两个镜像:monitor 主服务 + hostagent 节点采集器,用 matrix 各自构建。
   build-push:
     needs: test
     if: github.event_name != 'pull_request'
@@ -33,6 +35,13 @@ jobs:
     permissions:
       contents: read
       packages: write
+    strategy:
+      matrix:
+        include:
+          - image: newapi-monitor
+            dockerfile: Dockerfile
+          - image: newapi-monitor-hostagent
+            dockerfile: cmd/hostagent/Dockerfile
     steps:
       - uses: actions/checkout@v4
 
@@ -47,7 +56,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ghcr.io/${{ github.repository }}
+          images: ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}
           tags: |
             type=ref,event=branch
             type=semver,pattern={{version}}
@@ -58,6 +67,7 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
+          file: ${{ matrix.dockerfile }}
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}

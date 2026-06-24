@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -48,6 +49,7 @@ func (m *Monitor) RegisterRoutes(r *gin.Engine) {
 	})
 	r.GET("/api/brand", m.brandHandler)                // 公开:站点名,供前端设置页面标题
 	r.POST("/internal/rejections", m.ingestRejections) // 机器对机器:接收采集器推送的前置拒绝(token 鉴权)
+	r.POST("/internal/host", m.ingestHost)             // 机器对机器:接收各节点主机 agent 推送的 OS 内存/磁盘(token 鉴权)
 	r.GET("/login", m.loginPage)
 	r.POST("/login", m.loginSubmit)
 	r.GET("/logout", logout)
@@ -61,6 +63,8 @@ func (m *Monitor) RegisterRoutes(r *gin.Engine) {
 		view.GET("/data", m.serveData)
 		view.GET("/monitor/data", m.serveData)
 		view.GET("/trend/long", m.serveLongTrend)
+		view.GET("/infra", m.serveInfra)              // 服务端健康监控(实例/DB/LB)快照
+		view.GET("/infra/series", m.serveInfraSeries) // 按需取某资源某些指标的近 N 小时序列(展开图用)
 		view.GET("/me", me)
 	}
 
@@ -122,6 +126,117 @@ func (m *Monitor) ingestRejections(c *gin.Context) {
 	}
 	if err := m.upsertRejections(rows); err != nil {
 		slog.Warn("被拒请求入库失败", "err", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "store failed"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"ok": true, "stored": len(rows)})
+}
+
+// serveInfra 返回服务端健康监控(实例/DB/LB)快照;未启用则 enabled:false。
+func (m *Monitor) serveInfra(c *gin.Context) {
+	if !m.InfraEnabled() {
+		c.JSON(http.StatusOK, gin.H{"enabled": false})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"enabled": true, "snapshot": m.computeInfraSnapshot(time.Now().Unix())})
+}
+
+// serveInfraSeries 按需返回某资源(resource)若干指标(metrics 逗号分隔)近 N 小时(hours,默认6,封顶24)的时序。
+// 展开实例/切换指标组时前端才拉,避免快照一次性塞满所有图。结果:{series:{metric:[{ts,value}]}}。
+func (m *Monitor) serveInfraSeries(c *gin.Context) {
+	if !m.InfraEnabled() {
+		c.JSON(http.StatusOK, gin.H{"enabled": false})
+		return
+	}
+	resource := strings.TrimSpace(c.Query("resource"))
+	if resource == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "resource required"})
+		return
+	}
+	hours := 6
+	if v, err := strconv.Atoi(c.Query("hours")); err == nil && v > 0 {
+		hours = v
+	}
+	if hours > 24 {
+		hours = 24
+	}
+	since := time.Now().Unix() - int64(hours)*3600
+	series := map[string][]InfraPoint{}
+	for _, met := range strings.Split(c.Query("metrics"), ",") {
+		met = strings.TrimSpace(met)
+		if met == "" {
+			continue
+		}
+		series[met] = m.storeInfraSeries(resource, met, since)
+	}
+	c.JSON(http.StatusOK, gin.H{"enabled": true, "series": series})
+}
+
+// ingestHost 接收各节点主机 agent 推来的 OS 指标(内存/磁盘/load),写 infra_samples(rtype=host)。
+// 复用 MONITOR_INGEST_TOKEN 鉴权;未配置则接口关闭(503)。只接非敏感数值,不含任何密钥/业务数据。
+func (m *Monitor) ingestHost(c *gin.Context) {
+	want := m.cfg.IngestToken
+	if want == "" {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "ingest disabled"})
+		return
+	}
+	if subtle.ConstantTimeCompare([]byte(c.GetHeader("Authorization")), []byte("Bearer "+want)) != 1 {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
+		return
+	}
+	// 指标用指针:agent 某项采集失败会省略该字段,这里就不写——避免「缺失=0」被算成异常(如可用 0=已用 100%)。
+	var in struct {
+		Node            string   `json:"node"`
+		MemTotalMB      *float64 `json:"mem_total_mb"`
+		MemAvailMB      *float64 `json:"mem_avail_mb"`
+		SwapUsedMB      *float64 `json:"swap_used_mb"`
+		DiskUsedPct     *float64 `json:"disk_used_pct"`
+		Load1           *float64 `json:"load1"`
+		Load5           *float64 `json:"load5"`
+		Load15          *float64 `json:"load15"`
+		ContainersUp    *float64 `json:"containers_up"`
+		ContainersTotal *float64 `json:"containers_total"`
+		Ts              int64    `json:"ts"`
+	}
+	if err := c.ShouldBindJSON(&in); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	node := clip(in.Node, 128)
+	if node == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "node required"})
+		return
+	}
+	ts := in.Ts
+	if ts <= 0 {
+		ts = time.Now().Unix()
+	}
+	bucket := ts / 60 * 60
+	var rows []InfraSample
+	addP := func(metric string, p *float64) {
+		if p != nil {
+			rows = append(rows, InfraSample{BucketTs: bucket, Resource: node, RType: "host", Metric: metric, Value: *p})
+		}
+	}
+	addP("mem_avail_mb", in.MemAvailMB)
+	addP("swap_mb", in.SwapUsedMB) // 与 DB 的 swap_mb 统一键名(均为「已用 Swap MB」)
+	addP("disk_used_pct", in.DiskUsedPct)
+	addP("load1", in.Load1)
+	addP("load5", in.Load5)
+	addP("load15", in.Load15)
+	if in.MemTotalMB != nil && *in.MemTotalMB > 0 {
+		addP("mem_total_mb", in.MemTotalMB)
+	}
+	if in.ContainersTotal != nil {
+		addP("containers_total", in.ContainersTotal)
+		addP("containers_up", in.ContainersUp)
+	}
+	if len(rows) == 0 {
+		c.JSON(http.StatusOK, gin.H{"ok": true, "stored": 0})
+		return
+	}
+	if err := m.upsertInfra(rows); err != nil {
+		slog.Warn("主机指标入库失败", "err", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "store failed"})
 		return
 	}

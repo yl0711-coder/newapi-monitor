@@ -97,6 +97,10 @@ func (m *Monitor) Start(ctx context.Context) { m.startSampler(ctx) }
 // Enabled 报告生产库是否已连通。
 func (m *Monitor) Enabled() bool { return m.prodDB != nil }
 
+// InfraEnabled 报告服务端健康监控(实例/DB/LB)是否启用(MONITOR_INFRA_ENABLED=true)。
+// 关闭时:不调 AWS、/infra 返回 enabled:false、不影响模型监控。
+func (m *Monitor) InfraEnabled() bool { return m.cfg.InfraEnabled }
+
 // ---- 页面数据结构 ----
 
 // Summary 是某时间窗口的总体指标汇总(成功率、时延分位、错误构成等)。

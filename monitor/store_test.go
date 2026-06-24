@@ -7,7 +7,21 @@ import "testing"
 
 func newTestMonitor(t *testing.T) *Monitor {
 	t.Helper()
-	m := &Monitor{chNames: map[string]string{}}
+	// 用与 LoadSettings 一致的 infra 默认阈值,使百分比判级逻辑在测试中按默认值生效。
+	cfg := Settings{
+		InfraMemAvailWarnPct:     25,
+		InfraMemAvailBadPct:      15,
+		InfraStorageAvailWarnPct: 25,
+		InfraStorageAvailBadPct:  15,
+		InfraCPUWarnPct:          70,
+		InfraCPUBadPct:           85,
+		InfraBurstWarnPct:        20,
+		ProbeLatencyWarnMs:       500,
+		ProbeLatencyBadMs:        1500,
+		ProbeCertWarnDays:        30,
+		ProbeCertBadDays:         7,
+	}
+	m := &Monitor{cfg: cfg, chNames: map[string]string{}}
 	if err := m.openStore(t.TempDir() + "/t.db"); err != nil {
 		t.Fatalf("openStore: %v", err)
 	}
