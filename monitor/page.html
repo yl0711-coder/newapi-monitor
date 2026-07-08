@@ -30,6 +30,23 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
   .seg a:last-child{border-right:none}.seg a.active{background:var(--accent);color:#fff}
   .btn{padding:7px 14px;border-radius:8px;border:1px solid var(--border);background:transparent;color:var(--text);cursor:pointer;font-size:13px}
   .btn:hover{border-color:var(--accent);color:var(--accent)}
+  /* 用户用量·消费矩阵:用户多(20-30列)时的可读性——双向滚动容器内粘住表头行/日期列/合计列,列头截断悬停看全,格子按金额热力着色 */
+  .mxwrap{max-height:65vh;overflow:auto;position:relative}
+  .mxwrap table{border-collapse:separate;border-spacing:0}
+  .mxwrap thead th{position:sticky;top:0;background:var(--surface);z-index:3}
+  .mxwrap td:first-child,.mxwrap th:first-child{position:sticky;left:0;background:var(--surface);z-index:2;white-space:nowrap;box-shadow:6px 0 8px -6px rgba(0,0,0,.55)}
+  .mxwrap td:last-child,.mxwrap th:last-child{position:sticky;right:0;background:var(--surface);z-index:2;box-shadow:-6px 0 8px -6px rgba(0,0,0,.55)}
+  .mxwrap thead th:first-child{z-index:4}
+  .mxwrap thead th:last-child{z-index:4}
+  .mxwrap td,.mxwrap th{white-space:nowrap} /* 表头日期绝不折行 */
+  /* 统一列宽:数据列(日期)等宽,不随内容宽窄不一;首列(用户)与尾列(合计)各自给足 */
+  .mxwrap thead th:not(:first-child):not(:last-child),.mxwrap tbody td:not(:first-child):not(:last-child){min-width:72px}
+  .mxwrap thead th:last-child,.mxwrap tbody td:last-child{min-width:88px}
+  .mxwrap thead th:first-child,.mxwrap tbody td:first-child{min-width:140px}
+  .mxwrap tbody tr.mxfoot td{position:sticky;bottom:0;background:var(--surface);z-index:3;border-top:2px solid var(--border)}
+  .mxwrap tbody tr.mxfoot td:first-child{z-index:5}
+  .mxwrap tbody tr.mxfoot td:last-child{z-index:5}
+  .mxhead{display:inline-block;max-width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;vertical-align:middle}
   .meta{font-size:12px;color:var(--text-muted);margin-left:auto}
 
   .banner{display:flex;align-items:center;gap:24px;flex-wrap:wrap;background:var(--surface);border:1px solid var(--border);
@@ -98,6 +115,7 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
 <div class="tabs">
   <div class="tab active" data-tab="model">模型监控</div>
   <div class="tab" data-tab="server">服务端监控</div>
+  <div class="tab" data-tab="usage">用户用量</div>
 </div>
 
 <div class="tabpane" id="tab-model">
@@ -200,6 +218,59 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
   <!-- 7. 最近告警 -->
   <div class="card"><div class="card-header">🔔 最近告警 <span class="muted" style="font-weight:400">· 服务端监控触发的告警(最近 20 条)</span></div>
     <div id="infraAlerts" style="padding:14px 18px"><span class="muted">加载中…</span></div></div>
+</div>
+
+<!-- ═══════════ Tab 3:用户用量(盯指定用户,按需查生产库 logs 聚合) ═══════════ -->
+<div class="tabpane" id="tab-usage" hidden>
+  <div id="usageErr"></div>
+
+  <!-- 共用查询条件(列表/详情都按此范围) -->
+  <div class="toolbar">
+    <div class="seg" id="usageSeg"><a data-r="today">今天</a><a data-r="7d" class="active">近7天</a><a data-r="30d">近30天</a></div>
+    <span class="muted" style="font-size:13px">自定义:</span>
+    <input type="date" id="usageFrom" style="background:var(--bg);border:1px solid var(--border);border-radius:8px;color:var(--text);padding:6px 10px;font-size:13px">
+    <span class="muted">—</span>
+    <input type="date" id="usageTo" style="background:var(--bg);border:1px solid var(--border);border-radius:8px;color:var(--text);padding:6px 10px;font-size:13px">
+    <button class="btn" id="usageQuery">查询</button>
+    <span class="muted" id="usageRangeNote" style="font-size:13px"></span>
+  </div>
+
+  <!-- 视图一:列表页 = 消费矩阵(行=用户 × 列=日期,格=当日费用) -->
+  <div id="usageViewList">
+    <div class="card">
+      <div class="card-header">💰 每日消费 <span class="muted" style="font-weight:400">· 行=用户,列=日期(左右拖动看更多天);点用户进详情。费用=消耗额度折美元</span></div>
+      <div class="mxwrap"><table id="usageMxTable" style="min-width:560px"><thead id="thUsageMx"></thead><tbody id="tbUsageMx"></tbody></table></div>
+    </div>
+
+    <!-- 检测用户名单管理 -->
+    <div class="card">
+      <div class="card-header">👥 检测用户 <span class="muted" style="font-weight:400">· 添加要统计的 new-api 用户(名单只存监控本地,不动主站)</span></div>
+      <div style="padding:14px 18px">
+        <div id="usrAddRow" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:10px">
+          <input id="usrInput" placeholder="邮箱 或 用户ID" style="background:var(--bg);border:1px solid var(--border);border-radius:8px;color:var(--text);padding:7px 12px;font-size:13px;width:240px">
+          <button class="btn" id="usrAdd">添加</button>
+          <span class="muted" id="usrMsg" style="font-size:13px"></span>
+        </div>
+        <table><thead id="thUsr"></thead><tbody id="tbUsr"></tbody></table>
+      </div>
+    </div>
+  </div>
+
+  <!-- 视图二:单用户详情(从矩阵点入,带返回) -->
+  <div id="usageViewDetail" hidden>
+    <div class="toolbar">
+      <button class="btn" id="usageBack">← 返回用户列表</button>
+      <b id="usageDetailTitle" style="font-size:15px"></b>
+    </div>
+    <div class="stats-grid" id="usageSummary" style="margin-top:6px"></div>
+    <div class="card">
+      <div class="card-header">📅 每日用量 <span class="muted" style="font-weight:400">· 按东八区自然日</span></div>
+      <div id="usageDailyChart" style="height:240px;padding:6px 12px 0"></div>
+      <table><thead id="thUsageDaily"></thead><tbody id="tbUsageDaily"></tbody></table>
+    </div>
+    <div class="card"><div class="card-header">按分组</div><table><thead id="thUsageGrp"></thead><tbody id="tbUsageGrp"></tbody></table></div>
+    <div class="card"><div class="card-header">按模型</div><table><thead id="thUsageModel"></thead><tbody id="tbUsageModel"></tbody></table></div>
+  </div>
 </div>
 
 <script>
@@ -503,6 +574,9 @@ async function loadMe(){
     const d=await res.json();
     document.getElementById('userBox').innerHTML='👤 '+esc(d.name||'')+(d.is_root?' · 超级管理员':' · 管理员')+' · <a href="/logout" style="color:var(--accent)">退出</a>';
     if(d.is_root)document.getElementById('alertLink').style.display='';
+    IS_ROOT=!!d.is_root;
+    if(!IS_ROOT)document.getElementById('usrAddRow').innerHTML='<span class="muted" style="font-size:13px">仅超级管理员可增删检测用户;名单与统计管理员可看。</span>';
+    if(usageInited)renderUsageUsers(); // /me 慢于用量页首渲染时,补渲染出超管的「移除」链接
   }catch(e){}
 }
 function schedule(){if(timer)clearInterval(timer);if(document.getElementById('autoRefresh').checked)timer=setInterval(load,30000)}
@@ -779,8 +853,219 @@ function switchTab(name){
   document.querySelectorAll('.tabs .tab').forEach(t=>t.classList.toggle('active',t.dataset.tab===name));
   document.getElementById('tab-model').hidden=(name!=='model');
   document.getElementById('tab-server').hidden=(name!=='server');
+  document.getElementById('tab-usage').hidden=(name!=='usage');
   if(name==='server'){loadInfra();infraSchedule();setTimeout(resizeInfraCharts,80);}
   else if(infraTimer){clearInterval(infraTimer);}
+  if(name==='usage')usageInit();
+}
+
+// ═══════════ 用户用量(tab-usage):列表页=消费矩阵(日期×用户),点用户进详情 ═══════════
+// 与另两个 tab 不同:不自动刷新——每次查询都会打到生产库(窗口化、走索引、后端串行闸),
+// 只在打开 tab / 点查询 / 改名单 / 进出详情时拉取。
+let IS_ROOT=false,usageInited=false,usageUsers=[],usageDailyChart=null,usageRange='7d';
+let usageDetail=null; // null=列表视图;{id,label}=详情视图当前用户
+const fmtCost=v=>{v=+v||0;return '$'+(v>=0.01||v===0?v.toFixed(2):v.toFixed(4))}; // 常规两位小数;<1分钱才放开到4位
+function setUsageSeg(r){document.querySelectorAll('#usageSeg a').forEach(a=>a.classList.toggle('active',a.dataset.r===r))}
+function usageApplyPreset(){ // 预设折成 from/to 填进日期框
+  // 后端按东八区(CST)切日,这里必须按 CST 算"今天"而非浏览器本地时区——
+  // 否则换时区的浏览器点「今天」会整体偏一天。做法:时间戳先 +8h,再用 UTC 取历法字段。
+  const days=usageRange==='today'?0:(usageRange==='30d'?29:6);
+  const cst=off=>new Date(Date.now()+8*3600*1000-off*86400000);
+  const f=d=>d.getUTCFullYear()+'-'+String(d.getUTCMonth()+1).padStart(2,'0')+'-'+String(d.getUTCDate()).padStart(2,'0');
+  document.getElementById('usageFrom').value=f(cst(days));
+  document.getElementById('usageTo').value=f(cst(0));
+}
+// 按当前视图刷新:列表=矩阵,详情=该用户四路聚合
+function usageRefresh(){ usageDetail?usageLoadDetail():usageLoadMatrix(); }
+function usageShowView(){
+  document.getElementById('usageViewList').hidden=!!usageDetail;
+  document.getElementById('usageViewDetail').hidden=!usageDetail;
+  document.getElementById('usageDetailTitle').textContent=usageDetail?usageDetail.label:'';
+}
+function usageOpenDetail(id,label){ usageDetail={id,label}; usageShowView(); usageLoadDetail(); }
+function usageBackToList(){ usageDetail=null; usageShowView(); usageLoadMatrix(); }
+async function usageInit(){
+  if(usageInited)return;
+  usageInited=true;
+  document.getElementById('usrAdd')&&document.getElementById('usrAdd').addEventListener('click',usageAddUser);
+  const inp=document.getElementById('usrInput');
+  inp&&inp.addEventListener('keydown',e=>{if(e.key==='Enter')usageAddUser()});
+  document.getElementById('usageQuery').addEventListener('click',()=>{usageRange='';setUsageSeg('');usageRefresh()});
+  document.querySelectorAll('#usageSeg a').forEach(a=>{a.href='javascript:void 0';a.addEventListener('click',()=>{usageRange=a.dataset.r;setUsageSeg(a.dataset.r);usageApplyPreset();usageRefresh();})});
+  document.getElementById('usageBack').addEventListener('click',usageBackToList);
+  // 矩阵表头点用户进详情(事件委托,表头每次查询都重建)
+  document.getElementById('usageMxTable').addEventListener('click',e=>{
+    const a=e.target.closest('[data-uid]');
+    if(a)usageOpenDetail(+a.dataset.uid,a.dataset.label);
+  });
+  usageApplyPreset();
+  await usageLoadUsers();
+  usageLoadMatrix();
+}
+async function usageLoadUsers(){
+  try{
+    const res=await fetch('/usage/users',{headers:{'Accept':'application/json'}});
+    if(res.status===401){location.href='/login';return}
+    usageUsers=(await res.json()).users||[];
+  }catch(e){usageUsers=[]}
+  renderUsageUsers();
+}
+function renderUsageUsers(){
+  document.getElementById('thUsr').innerHTML='<tr><th>用户ID</th><th>用户名</th><th>邮箱</th><th>添加时间</th><th class="right"></th></tr>';
+  const e=document.getElementById('tbUsr');
+  if(!usageUsers.length){e.innerHTML='<tr><td colspan="5" class="muted" style="text-align:center;padding:18px">名单为空——在上面输入邮箱或用户ID添加</td></tr>'}
+  else e.innerHTML=usageUsers.map(u=>`<tr>
+    <td class="num">#${u.user_id}</td><td>${esc(u.username||'—')}</td><td>${esc(u.email||'—')}</td>
+    <td class="muted">${u.added_at?new Date(u.added_at*1000).toLocaleDateString():'—'}</td>
+    <td class="right">${IS_ROOT?`<a href="javascript:void 0" style="color:#ef4444" onclick="usageDelUser(${u.user_id})">移除</a>`:''}</td></tr>`).join('');
+}
+// POST 必须带 Accept:application/json —— requireRole 按此头区分「401 JSON」还是「302 跳登录页」。
+// 不带的话,会话过期时 fetch 会跟着 302 拿到登录页的 200 HTML,前端误判成功(假"已添加")。
+const usagePostHeaders={'Content-Type':'application/json','Accept':'application/json'};
+async function usageAddUser(){
+  const inp=document.getElementById('usrInput'),msg=document.getElementById('usrMsg');
+  const v=(inp.value||'').trim(); if(!v)return;
+  msg.textContent='添加中…';
+  try{
+    const res=await fetch('/usage/users',{method:'POST',headers:usagePostHeaders,body:JSON.stringify({input:v})});
+    if(res.status===401){location.href='/login';return}
+    const d=await res.json().catch(()=>({}));
+    if(res.status===403){msg.textContent='仅超级管理员可添加';return}
+    if(!res.ok||!d.ok){msg.textContent=(d&&d.error)||('添加失败 '+res.status);return}
+    msg.textContent='已添加:'+((d.user&&(d.user.username||d.user.email))||('#'+(d.user&&d.user.user_id||'')));
+    inp.value='';
+    await usageLoadUsers(); usageRefresh();
+  }catch(e){msg.textContent='网络错误:'+e.message}
+}
+async function usageDelUser(id){
+  if(!confirm('把用户 #'+id+' 移出检测名单?(只影响本监控的统计,不动主站)'))return;
+  const msg=document.getElementById('usrMsg');
+  try{
+    const res=await fetch('/usage/users/delete',{method:'POST',headers:usagePostHeaders,body:JSON.stringify({user_id:id})});
+    if(res.status===401){location.href='/login';return}
+    if(res.status===403){alert('仅超级管理员可移除');return}
+    if(!res.ok){const d=await res.json().catch(()=>({}));msg.textContent=(d&&d.error)||('移除失败 '+res.status);return}
+    msg.textContent='';
+    if(usageDetail&&usageDetail.id===id)usageDetail=null,usageShowView(); // 正看着的用户被移除→回列表
+    await usageLoadUsers(); usageRefresh();
+  }catch(e){msg.textContent='网络错误:'+e.message}
+}
+function usageRangeParams(){
+  const q=new URLSearchParams();
+  const from=document.getElementById('usageFrom').value,to=document.getElementById('usageTo').value;
+  if(from)q.set('from',from); if(to)q.set('to',to);
+  return q;
+}
+// 响应排序:快速连点/切范围时,旧的慢响应可能晚于新的快响应到达;只渲染最后一次发起的结果。
+let usageSeq=0;
+// 列表页:消费矩阵
+async function usageLoadMatrix(){
+  const eb=document.getElementById('usageErr'),seq=++usageSeq;
+  try{
+    const res=await fetch('/usage/matrix?'+usageRangeParams(),{headers:{'Accept':'application/json'}});
+    if(seq!==usageSeq)return; // 已有更新的查询在飞,丢弃本响应
+    if(res.status===401){location.href='/login';return}
+    const d=await res.json().catch(()=>({}));
+    if(!res.ok){eb.innerHTML='<div class="alert">'+esc(d.error||('查询失败 '+res.status))+'</div>';return}
+    if(d.enabled===false){eb.innerHTML='<div class="alert">未连接主站数据库(NEWAPI_LOG_DSN),用户用量不可用。</div>';return}
+    eb.innerHTML='';
+    renderUsageMatrix(d.matrix||{},!!d.empty);
+  }catch(e){if(seq===usageSeq)eb.innerHTML='<div class="alert">加载失败:'+esc(e.message)+'</div>'}
+}
+function renderUsageMatrix(mx,empty){
+  document.getElementById('usageRangeNote').textContent=mx.from?('统计范围 '+mx.from+' ~ '+mx.to+'(CST)'):'';
+  const users=mx.users||[],days=mx.days||[];
+  const th=document.getElementById('thUsageMx'),tb=document.getElementById('tbUsageMx');
+  if(!users.length){
+    th.innerHTML='';
+    tb.innerHTML=`<tr><td class="muted" style="text-align:center;padding:22px">${empty?'名单为空——在下面「检测用户」里添加要统计的用户':'范围内无数据'}</td></tr>`;
+    return;
+  }
+  // 格索引:uid|date → cell;同时找最大格,给热力着色定标(格多时靠色深扫视,不用逐格读数)
+  const cell=new Map(); let maxCost=0;
+  (mx.cells||[]).forEach(c=>{cell.set(c.user_id+'|'+c.date,c);if(c.cost_usd>maxCost)maxCost=c.cost_usd});
+  const heat=v=>v>0&&maxCost>0?` style="background:rgba(245,158,11,${(0.06+0.30*v/maxCost).toFixed(3)})"`:'';
+  // 护栏:格子总数超限(如 500 用户×190 天≈9.5万格)时不硬渲染——一次性 innerHTML 会把浏览器主线程冻住数秒
+  if(users.length*days.length>20000){
+    th.innerHTML='';
+    tb.innerHTML=`<tr><td class="muted" style="text-align:center;padding:22px">用户数(${users.length}) × 天数(${days.length}) 过大,请缩短时间范围后再查(上限约 2 万格)。</td></tr>`;
+    return;
+  }
+  // 格内金额统一两位小数保持列宽整齐;0<金额<1分 显示 <$0.01(恰好 $0 就老实显示 $0.00),精确值放悬停提示
+  const fmtCell=v=>v>=0.005?'$'+v.toFixed(2):(v>0?'<$0.01':'$0.00');
+  // 表头:用户 | 各日期(新→旧,短标 MM-DD,悬停看全) | 合计(锁右)
+  th.innerHTML='<tr><th>用户</th>'+days.map(d=>`<th class="right" title="${esc(d)}">${esc(d.slice(5))}</th>`).join('')+'<th class="right">合计</th></tr>';
+  // 行:每个用户一行(行首邮箱锁左、点击进详情);格=该用户当日费用;行尾=该用户区间合计
+  const daySum={};
+  tb.innerHTML=users.map(u=>{
+    let tds='';
+    for(const day of days){
+      const c=cell.get(u.user_id+'|'+day);
+      if(c)daySum[day]=(daySum[day]||0)+c.cost_usd;
+      tds+=`<td class="right num"${c?heat(c.cost_usd):''} ${c?`title="${esc(u.label)} · ${esc(day)} · $${c.cost_usd.toFixed(4)} · ${fmtNum(c.requests)} 次请求"`:''}>${c?fmtCell(c.cost_usd):'<span class="muted">—</span>'}</td>`;
+    }
+    return `<tr><td><a href="javascript:void 0" data-uid="${u.user_id}" data-label="${esc(u.label)}" style="color:var(--accent);text-decoration:none" title="${esc(u.label)} · 点击看详情"><span class="mxhead">${esc(u.label)}</span></a></td>${tds}<td class="right num"><b>${fmtCost(u.total_usd)}</b></td></tr>`;
+  }).join('')
+  // 尾行(钉底):各日期的当日合计 + 总计
+  +`<tr class="mxfoot"><td><b>当日合计</b></td>${days.map(d=>`<td class="right num" title="${esc(d)}${d in daySum?` · $${daySum[d].toFixed(4)}`:''}"><b>${d in daySum?fmtCell(daySum[d]):'<span class="muted">—</span>'}</b></td>`).join('')}<td class="right num"><b>${fmtCost(users.reduce((s,u)=>s+u.total_usd,0))}</b></td></tr>`;
+}
+// 详情页:单用户每日/分组/模型聚合
+async function usageLoadDetail(){
+  if(!usageDetail)return;
+  const eb=document.getElementById('usageErr'),seq=++usageSeq;
+  const q=usageRangeParams(); q.set('user_id',usageDetail.id);
+  try{
+    const res=await fetch('/usage/stats?'+q,{headers:{'Accept':'application/json'}});
+    if(seq!==usageSeq)return;
+    if(res.status===401){location.href='/login';return}
+    const d=await res.json().catch(()=>({}));
+    if(!res.ok){eb.innerHTML='<div class="alert">'+esc(d.error||('查询失败 '+res.status))+'</div>';return}
+    if(d.enabled===false){eb.innerHTML='<div class="alert">未连接主站数据库(NEWAPI_LOG_DSN),用户用量不可用。</div>';return}
+    eb.innerHTML='';
+    renderUsage(d.stats||{});
+  }catch(e){if(seq===usageSeq)eb.innerHTML='<div class="alert">加载失败:'+esc(e.message)+'</div>'}
+}
+const USAGE_DIM_HEAD=`<tr><th>名称</th><th class="right">请求</th><th class="right">Tokens</th><th class="right">费用</th></tr>`;
+function renderUsageDim(th,tb,rows){
+  document.getElementById(th).innerHTML=USAGE_DIM_HEAD;
+  const e=document.getElementById(tb);
+  if(!rows||!rows.length){e.innerHTML='<tr><td colspan="4" class="muted" style="text-align:center;padding:18px">范围内无数据</td></tr>';return}
+  e.innerHTML=rows.map(r=>`<tr><td>${esc(r.key||'—')}</td><td class="right num">${fmtNum(r.requests)}</td><td class="right num">${fmtNum(r.tokens)}</td><td class="right num">${fmtCost(r.cost_usd)}</td></tr>`).join('');
+}
+function renderUsage(st){
+  document.getElementById('usageRangeNote').textContent=st.from?('统计范围 '+st.from+' ~ '+st.to+'(CST)'):'';
+  const s=st.summary||{};
+  document.getElementById('usageSummary').innerHTML=[
+    ['总请求',fmtNum(s.requests),'#6366f1'],
+    ['总 Tokens',fmtNum(s.tokens),'#6366f1'],
+    ['总费用',fmtCost(s.cost_usd),'#f59e0b']
+  ].map(([l,v,col])=>`<div class="stat-card"><div class="stat-label">${l}</div><div class="stat-value num" style="color:${col}">${v}</div></div>`).join('');
+  const daily=st.daily||[];
+  document.getElementById('thUsageDaily').innerHTML='<tr><th>日期</th><th class="right">请求</th><th class="right">输入 tokens</th><th class="right">输出 tokens</th><th class="right">合计 tokens</th><th class="right">费用</th></tr>';
+  document.getElementById('tbUsageDaily').innerHTML=daily.length?daily.map(d=>`<tr>
+    <td>${esc(d.date)}</td><td class="right num">${fmtNum(d.requests)}</td>
+    <td class="right num">${fmtNum(d.prompt_tokens)}</td><td class="right num">${fmtNum(d.completion_tokens)}</td>
+    <td class="right num">${fmtNum(d.tokens)}</td><td class="right num">${fmtCost(d.cost_usd)}</td></tr>`).join('')
+    :`<tr><td colspan="6" class="muted" style="text-align:center;padding:18px">范围内无数据</td></tr>`;
+  const el=document.getElementById('usageDailyChart');
+  if(!usageDailyChart)usageDailyChart=echarts.init(el);
+  usageDailyChart.setOption({
+    grid:{left:56,right:56,top:30,bottom:24},
+    tooltip:{trigger:'axis',backgroundColor:'#1a1d27',borderColor:'#2a2d3e',textStyle:{color:'#e2e8f0'}},
+    legend:{data:['费用($)','请求数'],textStyle:{color:'#94a3b8'},left:'center',top:2},
+    xAxis:{type:'category',data:daily.map(d=>d.date.slice(5)),axisLabel:{color:'#94a3b8',fontSize:11},axisLine:{lineStyle:{color:'#2a2d3e'}}},
+    yAxis:[
+      {type:'value',axisLabel:{color:'#94a3b8',fontSize:11,formatter:'${value}'},splitLine:{lineStyle:{color:'#2a2d3e'}}},
+      {type:'value',minInterval:1,axisLabel:{color:'#94a3b8',fontSize:11},splitLine:{show:false}}
+    ],
+    series:[
+      {name:'费用($)',type:'bar',barWidth:'55%',data:daily.map(d=>+(d.cost_usd||0).toFixed(4)),itemStyle:{color:'#f59e0b',borderRadius:[3,3,0,0]}},
+      {name:'请求数',type:'line',yAxisIndex:1,smooth:true,symbol:'none',data:daily.map(d=>d.requests),lineStyle:{color:'#6366f1',width:1.5}}
+    ]
+  },true);
+  setTimeout(()=>usageDailyChart.resize(),60);
+  renderUsageDim('thUsageGrp','tbUsageGrp',st.by_group);
+  renderUsageDim('thUsageModel','tbUsageModel',st.by_model);
 }
 document.querySelectorAll('.tabs .tab').forEach(t=>t.addEventListener('click',()=>switchTab(t.dataset.tab)));
 document.getElementById('infraRefresh').addEventListener('click',loadInfra);

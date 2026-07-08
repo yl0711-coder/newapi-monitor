@@ -170,7 +170,7 @@ func (m *Monitor) openStore(path string) error {
 	if err != nil {
 		return fmt.Errorf("打开本地采样库失败: %w", err)
 	}
-	if err := db.AutoMigrate(&MetricSample{}, &TokenSample{}, &HourSample{}, &ChannelSnap{}, &RejectionSample{}, &SelectablePair{}, &InfraSample{}, &AlertConfig{}, &AlertLog{}); err != nil {
+	if err := db.AutoMigrate(&MetricSample{}, &TokenSample{}, &HourSample{}, &ChannelSnap{}, &RejectionSample{}, &SelectablePair{}, &InfraSample{}, &AlertConfig{}, &AlertLog{}, &TrackedUser{}); err != nil {
 		return fmt.Errorf("表迁移失败: %w", err)
 	}
 	m.storeDB = db

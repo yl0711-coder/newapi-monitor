@@ -36,7 +36,7 @@ const minSample = 20
 // 用 New 创建,Start 启动后台采样,RegisterRoutes 挂载页面与接口。零包级全局,可多实例、易测。
 type Monitor struct {
 	cfg     Settings
-	prodDB  *sql.DB  // new-api 生产库【只读】连接(仅采样器用);nil = 未连接
+	prodDB  *sql.DB  // new-api 生产库【只读】连接(采样器周期查询 + 用户用量按需查询);nil = 未连接
 	storeDB *gorm.DB // 本地采样库
 
 	lastRun atomic.Int64 // 采样心跳:最近一次成功采样的 Unix 秒(0=从未)
@@ -46,6 +46,9 @@ type Monitor struct {
 
 	snapMu    sync.Mutex
 	snapCache map[int]cachedSnap // 按窗口缓存快照(短 TTL),去重并发请求、给 slave 减负
+
+	usageMu      sync.Mutex // 「用户用量」聚合串行闸:同一时刻最多一条按需聚合在生产库上跑(usage.go)
+	usageDayExpr string     // 日桶 SQL 表达式覆盖(仅测试用;生产走 MySQL 默认,见 usage.go dayExpr)
 }
 
 // cachedSnap 是一次快照的缓存项。
@@ -79,7 +82,9 @@ func New(s Settings) (*Monitor, error) {
 	if err != nil {
 		return nil, fmt.Errorf("打开生产库失败: %w", err)
 	}
-	conn.SetMaxOpenConns(2)
+	// 3 = 采样器(周期) + 用量聚合(按需,usageMu 已串行化) + 用户解析/SMTP 同步(偶发)。
+	// 曾为 2(仅采样器时代),用量功能加入后两连接会在三方碰撞时把 5s 的解析请求饿到假超时。
+	conn.SetMaxOpenConns(3)
 	conn.SetMaxIdleConns(1)
 	conn.SetConnMaxLifetime(5 * time.Minute)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
