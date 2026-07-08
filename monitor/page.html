@@ -14,6 +14,8 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
 }).catch(function(){});
 </script>
 <script src="/echarts.js"></script>
+<script src="/flatpickr.js"></script>
+<link rel="stylesheet" href="/flatpickr.css">
 <style>
   *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
   :root{--bg:#0f1117;--surface:#1a1d27;--border:#2a2d3e;--accent:#6366f1;--text:#e2e8f0;--text-muted:#94a3b8;
@@ -34,7 +36,10 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
   .mxwrap{max-height:65vh;overflow:auto;position:relative}
   .mxwrap table{border-collapse:separate;border-spacing:0}
   .mxwrap thead th{position:sticky;top:0;background:var(--surface);z-index:3}
-  .mxwrap td:first-child,.mxwrap th:first-child{position:sticky;left:0;background:var(--surface);z-index:2;white-space:nowrap;box-shadow:6px 0 8px -6px rgba(0,0,0,.55)}
+  .mxwrap td:first-child,.mxwrap th:first-child{position:sticky;left:0;background:var(--surface);z-index:2;white-space:nowrap;width:150px;min-width:150px;max-width:150px;box-sizing:border-box}
+  .mxwrap td:nth-child(2),.mxwrap th:nth-child(2){position:sticky;left:150px;background:var(--surface);z-index:2;box-shadow:6px 0 8px -6px rgba(0,0,0,.55)} /* 余额列:随用户列一起锁左 */
+  .mxwrap thead th:nth-child(2){z-index:4}
+  .mxwrap tbody tr.mxfoot td:nth-child(2){z-index:5}
   .mxwrap td:last-child,.mxwrap th:last-child{position:sticky;right:0;background:var(--surface);z-index:2;box-shadow:-6px 0 8px -6px rgba(0,0,0,.55)}
   .mxwrap thead th:first-child{z-index:4}
   .mxwrap thead th:last-child{z-index:4}
@@ -42,11 +47,12 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
   /* 统一列宽:数据列(日期)等宽,不随内容宽窄不一;首列(用户)与尾列(合计)各自给足 */
   .mxwrap thead th:not(:first-child):not(:last-child),.mxwrap tbody td:not(:first-child):not(:last-child){min-width:72px}
   .mxwrap thead th:last-child,.mxwrap tbody td:last-child{min-width:88px}
-  .mxwrap thead th:first-child,.mxwrap tbody td:first-child{min-width:140px}
   .mxwrap tbody tr.mxfoot td{position:sticky;bottom:0;background:var(--surface);z-index:3;border-top:2px solid var(--border)}
   .mxwrap tbody tr.mxfoot td:first-child{z-index:5}
   .mxwrap tbody tr.mxfoot td:last-child{z-index:5}
-  .mxhead{display:inline-block;max-width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;vertical-align:middle}
+  #usageRangeInput{background:var(--bg);border:1px solid var(--border);border-radius:8px;color:var(--text);padding:7px 12px;font-size:13px;width:220px;cursor:pointer}
+  .flatpickr-calendar{background:var(--surface);border:1px solid var(--border);box-shadow:0 8px 24px rgba(0,0,0,.5)}
+  .mxhead{display:inline-block;max-width:122px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;vertical-align:middle}
   .meta{font-size:12px;color:var(--text-muted);margin-left:auto}
 
   .banner{display:flex;align-items:center;gap:24px;flex-wrap:wrap;background:var(--surface);border:1px solid var(--border);
@@ -226,11 +232,9 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
 
   <!-- 共用查询条件(列表/详情都按此范围) -->
   <div class="toolbar">
-    <div class="seg" id="usageSeg"><a data-r="today">今天</a><a data-r="7d" class="active">近7天</a><a data-r="30d">近30天</a></div>
+    <div class="seg" id="usageSeg"><a data-r="today">今天</a><a data-r="7d" class="active">近7天</a><a data-r="15d">近15天</a><a data-r="30d">近30天</a></div>
     <span class="muted" style="font-size:13px">自定义:</span>
-    <input type="date" id="usageFrom" style="background:var(--bg);border:1px solid var(--border);border-radius:8px;color:var(--text);padding:6px 10px;font-size:13px">
-    <span class="muted">—</span>
-    <input type="date" id="usageTo" style="background:var(--bg);border:1px solid var(--border);border-radius:8px;color:var(--text);padding:6px 10px;font-size:13px">
+    <input type="text" id="usageRangeInput" placeholder="选择日期范围(最长90天)" readonly>
     <button class="btn" id="usageQuery">查询</button>
     <span class="muted" id="usageRangeNote" style="font-size:13px"></span>
   </div>
@@ -866,14 +870,14 @@ let IS_ROOT=false,usageInited=false,usageUsers=[],usageDailyChart=null,usageRang
 let usageDetail=null; // null=列表视图;{id,label}=详情视图当前用户
 const fmtCost=v=>{v=+v||0;return '$'+(v>=0.01||v===0?v.toFixed(2):v.toFixed(4))}; // 常规两位小数;<1分钱才放开到4位
 function setUsageSeg(r){document.querySelectorAll('#usageSeg a').forEach(a=>a.classList.toggle('active',a.dataset.r===r))}
-function usageApplyPreset(){ // 预设折成 from/to 填进日期框
+let usageFp=null; // flatpickr 范围选择器实例(双月历,同 new-api 日志查询风格;数据按天聚合故为日期粒度)
+function usageApplyPreset(){ // 预设写进范围选择器
   // 后端按东八区(CST)切日,这里必须按 CST 算"今天"而非浏览器本地时区——
   // 否则换时区的浏览器点「今天」会整体偏一天。做法:时间戳先 +8h,再用 UTC 取历法字段。
-  const days=usageRange==='today'?0:(usageRange==='30d'?29:6);
+  const days=usageRange==='today'?0:(usageRange==='15d'?14:(usageRange==='30d'?29:6));
   const cst=off=>new Date(Date.now()+8*3600*1000-off*86400000);
   const f=d=>d.getUTCFullYear()+'-'+String(d.getUTCMonth()+1).padStart(2,'0')+'-'+String(d.getUTCDate()).padStart(2,'0');
-  document.getElementById('usageFrom').value=f(cst(days));
-  document.getElementById('usageTo').value=f(cst(0));
+  if(usageFp)usageFp.setDate([f(cst(days)),f(cst(0))],false); // 不触发 onChange,由调用方决定何时查询
 }
 // 按当前视图刷新:列表=矩阵,详情=该用户四路聚合
 function usageRefresh(){ usageDetail?usageLoadDetail():usageLoadMatrix(); }
@@ -890,6 +894,21 @@ async function usageInit(){
   document.getElementById('usrAdd')&&document.getElementById('usrAdd').addEventListener('click',usageAddUser);
   const inp=document.getElementById('usrInput');
   inp&&inp.addEventListener('keydown',e=>{if(e.key==='Enter')usageAddUser()});
+  usageFp=flatpickr(document.getElementById('usageRangeInput'),{
+    mode:'range',showMonths:2,locale:'zh',dateFormat:'Y-m-d',maxDate:'today',
+    onChange:(sel,_str,inst)=>{
+      if(sel.length===1){ // 已选起点:把可选窗口收紧到起点±89天(含端点恰90天),硬限最长90天
+        const lo=new Date(sel[0]);lo.setDate(lo.getDate()-89);
+        const hi=new Date(sel[0]);hi.setDate(hi.getDate()+89);
+        const today=new Date();
+        inst.set('minDate',lo);inst.set('maxDate',hi>today?today:hi);
+      }else if(sel.length===2){ // 区间选完:恢复窗口并自动查询
+        inst.set('minDate',null);inst.set('maxDate','today');
+        usageRange='';setUsageSeg('');usageRefresh();
+      }
+    },
+    onClose:(sel,_str,inst)=>{ if(sel.length<2){inst.set('minDate',null);inst.set('maxDate','today')} }
+  });
   document.getElementById('usageQuery').addEventListener('click',()=>{usageRange='';setUsageSeg('');usageRefresh()});
   document.querySelectorAll('#usageSeg a').forEach(a=>{a.href='javascript:void 0';a.addEventListener('click',()=>{usageRange=a.dataset.r;setUsageSeg(a.dataset.r);usageApplyPreset();usageRefresh();})});
   document.getElementById('usageBack').addEventListener('click',usageBackToList);
@@ -952,8 +971,10 @@ async function usageDelUser(id){
 }
 function usageRangeParams(){
   const q=new URLSearchParams();
-  const from=document.getElementById('usageFrom').value,to=document.getElementById('usageTo').value;
-  if(from)q.set('from',from); if(to)q.set('to',to);
+  const sel=usageFp?usageFp.selectedDates:[];
+  const f=d=>d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');
+  if(sel.length===2){q.set('from',f(sel[0]));q.set('to',f(sel[1]))}
+  else if(sel.length===1){q.set('from',f(sel[0]));q.set('to',f(sel[0]))}
   return q;
 }
 // 响应排序:快速连点/切范围时,旧的慢响应可能晚于新的快响应到达;只渲染最后一次发起的结果。
@@ -994,7 +1015,7 @@ function renderUsageMatrix(mx,empty){
   // 格内金额统一两位小数保持列宽整齐;0<金额<1分 显示 <$0.01(恰好 $0 就老实显示 $0.00),精确值放悬停提示
   const fmtCell=v=>v>=0.005?'$'+v.toFixed(2):(v>0?'<$0.01':'$0.00');
   // 表头:用户 | 各日期(新→旧,短标 MM-DD,悬停看全) | 合计(锁右)
-  th.innerHTML='<tr><th>用户</th>'+days.map(d=>`<th class="right" title="${esc(d)}">${esc(d.slice(5))}</th>`).join('')+'<th class="right">合计</th></tr>';
+  th.innerHTML='<tr><th>用户</th><th class="right">余额</th>'+days.map(d=>`<th class="right" title="${esc(d)}">${esc(d.slice(5))}</th>`).join('')+'<th class="right">合计</th></tr>';
   // 行:每个用户一行(行首邮箱锁左、点击进详情);格=该用户当日费用;行尾=该用户区间合计
   const daySum={};
   tb.innerHTML=users.map(u=>{
@@ -1004,10 +1025,11 @@ function renderUsageMatrix(mx,empty){
       if(c)daySum[day]=(daySum[day]||0)+c.cost_usd;
       tds+=`<td class="right num"${c?heat(c.cost_usd):''} ${c?`title="${esc(u.label)} · ${esc(day)} · $${c.cost_usd.toFixed(4)} · ${fmtNum(c.requests)} 次请求"`:''}>${c?fmtCell(c.cost_usd):'<span class="muted">—</span>'}</td>`;
     }
-    return `<tr><td><a href="javascript:void 0" data-uid="${u.user_id}" data-label="${esc(u.label)}" style="color:var(--accent);text-decoration:none" title="${esc(u.label)} · 点击看详情"><span class="mxhead">${esc(u.label)}</span></a></td>${tds}<td class="right num"><b>${fmtCost(u.total_usd)}</b></td></tr>`;
+    const bal=u.balance_usd==null?'<span class="muted">—</span>':fmtCost(u.balance_usd);
+    return `<tr><td><a href="javascript:void 0" data-uid="${u.user_id}" data-label="${esc(u.label)}" style="color:var(--accent);text-decoration:none" title="${esc(u.label)} · 点击看详情"><span class="mxhead">${esc(u.label)}</span></a></td><td class="right num" title="主站当前余额">${bal}</td>${tds}<td class="right num"><b>${fmtCost(u.total_usd)}</b></td></tr>`;
   }).join('')
   // 尾行(钉底):各日期的当日合计 + 总计
-  +`<tr class="mxfoot"><td><b>当日合计</b></td>${days.map(d=>`<td class="right num" title="${esc(d)}${d in daySum?` · $${daySum[d].toFixed(4)}`:''}"><b>${d in daySum?fmtCell(daySum[d]):'<span class="muted">—</span>'}</b></td>`).join('')}<td class="right num"><b>${fmtCost(users.reduce((s,u)=>s+u.total_usd,0))}</b></td></tr>`;
+  +`<tr class="mxfoot"><td><b>当日合计</b></td><td></td>${days.map(d=>`<td class="right num" title="${esc(d)}${d in daySum?` · $${daySum[d].toFixed(4)}`:''}"><b>${d in daySum?fmtCell(daySum[d]):'<span class="muted">—</span>'}</b></td>`).join('')}<td class="right num"><b>${fmtCost(users.reduce((s,u)=>s+u.total_usd,0))}</b></td></tr>`;
 }
 // 详情页:单用户每日/分组/模型聚合
 async function usageLoadDetail(){
@@ -1022,7 +1044,7 @@ async function usageLoadDetail(){
     if(!res.ok){eb.innerHTML='<div class="alert">'+esc(d.error||('查询失败 '+res.status))+'</div>';return}
     if(d.enabled===false){eb.innerHTML='<div class="alert">未连接主站数据库(NEWAPI_LOG_DSN),用户用量不可用。</div>';return}
     eb.innerHTML='';
-    renderUsage(d.stats||{});
+    renderUsage(d.stats||{},d.balance_usd);
   }catch(e){if(seq===usageSeq)eb.innerHTML='<div class="alert">加载失败:'+esc(e.message)+'</div>'}
 }
 const USAGE_DIM_HEAD=`<tr><th>名称</th><th class="right">请求</th><th class="right">Tokens</th><th class="right">费用</th></tr>`;
@@ -1032,13 +1054,14 @@ function renderUsageDim(th,tb,rows){
   if(!rows||!rows.length){e.innerHTML='<tr><td colspan="4" class="muted" style="text-align:center;padding:18px">范围内无数据</td></tr>';return}
   e.innerHTML=rows.map(r=>`<tr><td>${esc(r.key||'—')}</td><td class="right num">${fmtNum(r.requests)}</td><td class="right num">${fmtNum(r.tokens)}</td><td class="right num">${fmtCost(r.cost_usd)}</td></tr>`).join('');
 }
-function renderUsage(st){
+function renderUsage(st,balanceUSD){
   document.getElementById('usageRangeNote').textContent=st.from?('统计范围 '+st.from+' ~ '+st.to+'(CST)'):'';
   const s=st.summary||{};
   document.getElementById('usageSummary').innerHTML=[
     ['总请求',fmtNum(s.requests),'#6366f1'],
     ['总 Tokens',fmtNum(s.tokens),'#6366f1'],
-    ['总费用',fmtCost(s.cost_usd),'#f59e0b']
+    ['总费用',fmtCost(s.cost_usd),'#f59e0b'],
+    ['余额',balanceUSD==null?'—':fmtCost(balanceUSD),'#10b981']
   ].map(([l,v,col])=>`<div class="stat-card"><div class="stat-label">${l}</div><div class="stat-value num" style="color:${col}">${v}</div></div>`).join('');
   const daily=st.daily||[];
   document.getElementById('thUsageDaily').innerHTML='<tr><th>日期</th><th class="right">请求</th><th class="right">输入 tokens</th><th class="right">输出 tokens</th><th class="right">合计 tokens</th><th class="right">费用</th></tr>';

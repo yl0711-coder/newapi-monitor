@@ -107,7 +107,7 @@ func newFakeProdDB(t *testing.T) *sql.DB {
 	}
 	t.Cleanup(func() { db.Close() })
 	stmts := []string{
-		"CREATE TABLE users (id INTEGER PRIMARY KEY, username TEXT, email TEXT)",
+		"CREATE TABLE users (id INTEGER PRIMARY KEY, username TEXT, email TEXT, quota INTEGER)",
 		"CREATE TABLE logs (id INTEGER PRIMARY KEY, user_id INTEGER, created_at INTEGER, type INTEGER, model_name TEXT, quota INTEGER, prompt_tokens INTEGER, completion_tokens INTEGER, `group` TEXT)",
 	}
 	for _, s := range stmts {
@@ -122,9 +122,9 @@ func TestResolveNewAPIUser(t *testing.T) {
 	m := newTestMonitor(t)
 	m.prodDB = newFakeProdDB(t)
 	seed := []string{
-		"INSERT INTO users VALUES (1,'alice','a@b.com')",
-		"INSERT INTO users VALUES (2,'bob','dup@x.com')",
-		"INSERT INTO users VALUES (3,'bob2','dup@x.com')",
+		"INSERT INTO users (id,username,email) VALUES (1,'alice','a@b.com')",
+		"INSERT INTO users (id,username,email) VALUES (2,'bob','dup@x.com')",
+		"INSERT INTO users (id,username,email) VALUES (3,'bob2','dup@x.com')",
 	}
 	for _, s := range seed {
 		if _, err := m.prodDB.Exec(s); err != nil {
@@ -240,13 +240,13 @@ func TestComputeUsageStats(t *testing.T) {
 
 func TestParseUsageRangeBoundary(t *testing.T) {
 	now := time.Date(2026, 7, 7, 15, 0, 0, 0, usageCST)
-	// 含两端点恰 190 天:2026-01-01 + 189 天 = 2026-07-09 → 应通过
-	if _, _, err := parseUsageRange("2026-01-01", "2026-07-09", now); err != nil {
-		t.Fatalf("恰 190 天应通过: %v", err)
+	// 含两端点恰 90 天:2026-01-01 + 89 天 = 2026-03-31 → 应通过
+	if _, _, err := parseUsageRange("2026-01-01", "2026-03-31", now); err != nil {
+		t.Fatalf("恰 90 天应通过: %v", err)
 	}
-	// 191 天(差值恰 190*24h,曾被 > 判定放行)→ 应拒绝
-	if _, _, err := parseUsageRange("2026-01-01", "2026-07-10", now); err == nil {
-		t.Fatal("191 天应被拒绝")
+	// 91 天 → 应拒绝(差值恰 90*24h,>= 判定)
+	if _, _, err := parseUsageRange("2026-01-01", "2026-04-01", now); err == nil {
+		t.Fatal("91 天应被拒绝")
 	}
 }
 
@@ -254,8 +254,8 @@ func TestRefreshTrackedLabels(t *testing.T) {
 	m := newTestMonitor(t)
 	m.prodDB = newFakeProdDB(t)
 	seed := []string{
-		"INSERT INTO users VALUES (1,'alice','new-alice@b.com')", // 主站已改邮箱
-		"INSERT INTO users VALUES (2,'bob','bob@x.com')",         // 未变
+		"INSERT INTO users (id,username,email,quota) VALUES (1,'alice','new-alice@b.com',1000000)", // 主站已改邮箱;余额 $2
+		"INSERT INTO users (id,username,email,quota) VALUES (2,'bob','bob@x.com',250000)",          // 未变;余额 $0.5
 	}
 	for _, s := range seed {
 		if _, err := m.prodDB.Exec(s); err != nil {
@@ -273,12 +273,19 @@ func TestRefreshTrackedLabels(t *testing.T) {
 			t.Fatalf("save tracked: %v", err)
 		}
 	}
-	out := m.refreshTrackedLabels(context.Background(), tracked)
+	out, balances := m.refreshTrackedLabels(context.Background(), tracked)
 	if out[0].Email != "new-alice@b.com" {
 		t.Fatalf("过期快照应被刷新 = %+v", out[0])
 	}
 	if out[1].Email != "bob@x.com" || out[2].Email != "ghost@x.com" {
 		t.Fatalf("未变/已删用户处理不对 = %+v", out[1:])
+	}
+	// 余额顺路取回:alice $2、bob $0.5;已删用户(9)不在表中 → 前端显 —
+	if balances[1] != 2 || balances[2] != 0.5 {
+		t.Fatalf("余额 = %+v", balances)
+	}
+	if _, ok := balances[9]; ok {
+		t.Fatal("已删用户不应有余额")
 	}
 	// 刷新应回写本地库(自愈缓存)
 	var persisted TrackedUser
