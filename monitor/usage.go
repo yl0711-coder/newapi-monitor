@@ -1,7 +1,7 @@
 package monitor
 
 // usage.go:「用户用量」——盯一组指定的 new-api 用户(按邮箱 / 用户ID 添加),
-// 按需对生产库 logs 表做窗口化聚合:每日总量、按分组、按模型、按用户,以及费用(quota/500000 美元)。
+// 按需对生产库 logs 表做窗口化聚合:消费矩阵(用户×日)与单用户详情(每日/分组/模型),费用=quota/500000 美元。
 //
 // 与采样器的边界:采样器是【常驻周期】查询,这里是【按需】查询——只在打开页面 / 点查询时执行,
 // 全部限定时间范围并命中索引(idx_logs_user_id / idx_created_at_type / idx_logs_group / idx_logs_model_name),
@@ -12,7 +12,9 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"log/slog"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -80,7 +82,9 @@ func (m *Monitor) resolveNewAPIUser(ctx context.Context, input string) (*Tracked
 		rows, err = m.prodDB.QueryContext(cctx, "SELECT id, COALESCE(username,''), COALESCE(email,'') FROM users WHERE email = ? LIMIT 2", email)
 	}
 	if err != nil {
-		return nil, fmt.Errorf("查询主站用户失败: %w", err)
+		// 驱动错误可能含内网 DB 地址/schema 细节:细节进日志,给浏览器的信息脱敏
+		slog.Warn("查询主站用户失败", "err", err)
+		return nil, fmt.Errorf("查询主站用户失败,请稍后重试(细节见服务端日志)")
 	}
 	defer rows.Close()
 	var found []TrackedUser
@@ -131,7 +135,7 @@ type UsageDim struct {
 	CostUSD  float64 `json:"cost_usd"`
 }
 
-// UsageStats 一次用户用量查询的完整结果。
+// UsageStats 一次用户用量查询的完整结果(详情页专用:单用户的每日/分组/模型)。
 type UsageStats struct {
 	From    string       `json:"from"`
 	To      string       `json:"to"`
@@ -139,22 +143,21 @@ type UsageStats struct {
 	Daily   []UsageDaily `json:"daily"`
 	ByGroup []UsageDim   `json:"by_group"`
 	ByModel []UsageDim   `json:"by_model"`
-	ByUser  []UsageDim   `json:"by_user"`
 }
 
-// usageIn 生成 "user_id IN (?,?,…)" 片段与参数(ids 已由调用方保证非空)。
-func usageIn(ids []int64) (string, []any) {
+// usageIn 生成 "<col> IN (?,?,…)" 片段与参数(ids 已由调用方保证非空;col 只传代码内常量,勿传用户输入)。
+func usageIn(col string, ids []int64) (string, []any) {
 	ph := make([]string, len(ids))
 	args := make([]any, len(ids))
 	for i, id := range ids {
 		ph[i] = "?"
 		args[i] = id
 	}
-	return "user_id IN (" + strings.Join(ph, ",") + ")", args
+	return col + " IN (" + strings.Join(ph, ",") + ")", args
 }
 
-// computeUsageStats 对 [fromTs, toTs) 内、指定用户集合的消费日志(type=2)做四路聚合。
-// 串行化(usageMu):同一时刻最多一条聚合在生产库上跑,叠加连接池上限(2)双保险。
+// computeUsageStats 对 [fromTs, toTs) 内、指定用户集合的消费日志(type=2)做三路聚合(每日/分组/模型)。
+// 串行化(usageMu):同一时刻最多一条聚合在生产库上跑,叠加连接池上限双保险。
 func (m *Monitor) computeUsageStats(ctx context.Context, ids []int64, fromTs, toTs int64) (*UsageStats, error) {
 	if len(ids) == 0 {
 		return &UsageStats{}, nil // 名单为空不该走到这;防御:不拼 "IN ()" 非法 SQL
@@ -164,7 +167,7 @@ func (m *Monitor) computeUsageStats(ctx context.Context, ids []int64, fromTs, to
 	cctx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
 
-	inSQL, inArgs := usageIn(ids)
+	inSQL, inArgs := usageIn("user_id", ids)
 	where := "type = 2 AND created_at >= ? AND created_at < ? AND " + inSQL
 	args := append([]any{fromTs, toTs}, inArgs...)
 
@@ -204,7 +207,8 @@ func (m *Monitor) computeUsageStats(ctx context.Context, ids []int64, fromTs, to
 		st.Summary.CostUSD += d.CostUSD
 	}
 
-	// 2/3/4) 按分组 / 模型 / 用户。列名 group 是保留字,必须反引号。
+	// 2/3) 按分组 / 模型。列名 group 是保留字,必须反引号。
+	// (曾有第三路 GROUP BY user_id:前端改成矩阵+单用户详情后无人消费,纯耗生产库,已删。)
 	dims := []struct {
 		col  string
 		dst  *[]UsageDim
@@ -212,7 +216,6 @@ func (m *Monitor) computeUsageStats(ctx context.Context, ids []int64, fromTs, to
 	}{
 		{"COALESCE(`group`,'')", &st.ByGroup, "按分组"},
 		{"COALESCE(model_name,'')", &st.ByModel, "按模型"},
-		{"user_id", &st.ByUser, "按用户"},
 	}
 	for _, dim := range dims {
 		q := "SELECT " + dim.col + " AS k, COUNT(*)," +
@@ -242,6 +245,77 @@ func (m *Monitor) computeUsageStats(ctx context.Context, ids []int64, fromTs, to
 	return st, nil
 }
 
+// ---- 列表页矩阵数据(前端渲染为 行=用户 × 列=日期,格=当日消费) ----
+
+// UsageMatrixUser 矩阵列头(一个被盯用户)+ 区间合计。
+type UsageMatrixUser struct {
+	UserID   int64   `json:"user_id"`
+	Label    string  `json:"label"` // 邮箱优先,缺邮箱回退用户名/#id
+	TotalUSD float64 `json:"total_usd"`
+}
+
+// UsageMatrixCell 稀疏格:某用户某天的消费(无消费的天不出格)。
+type UsageMatrixCell struct {
+	UserID   int64   `json:"user_id"`
+	Date     string  `json:"date"`
+	Requests int64   `json:"requests"`
+	CostUSD  float64 `json:"cost_usd"`
+}
+
+// UsageMatrix 列表页数据:days 连续日期(新→旧)+ 用户(按区间消费降序)+ 稀疏格。
+type UsageMatrix struct {
+	From  string            `json:"from"`
+	To    string            `json:"to"`
+	Days  []string          `json:"days"`
+	Users []UsageMatrixUser `json:"users"`
+	Cells []UsageMatrixCell `json:"cells"`
+}
+
+// computeUsageMatrix 一条 GROUP BY user_id×日 的聚合,窗口与索引约束同 computeUsageStats。
+func (m *Monitor) computeUsageMatrix(ctx context.Context, ids []int64, fromTs, toTs int64) (*UsageMatrix, error) {
+	mx := &UsageMatrix{
+		From: time.Unix(fromTs, 0).In(usageCST).Format("2006-01-02"),
+		To:   time.Unix(toTs-1, 0).In(usageCST).Format("2006-01-02"),
+	}
+	// 连续日期轴(新→旧):有没有消费都出行,老板看的是"每个人每天"的完整节奏
+	for ts := toTs - 86400; ts >= fromTs; ts -= 86400 {
+		mx.Days = append(mx.Days, time.Unix(ts, 0).In(usageCST).Format("2006-01-02"))
+	}
+	if len(ids) == 0 {
+		return mx, nil
+	}
+	m.usageMu.Lock()
+	defer m.usageMu.Unlock()
+	cctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+
+	inSQL, inArgs := usageIn("user_id", ids)
+	q := "SELECT user_id, " + m.dayExpr() + " AS day_idx, COUNT(*), CAST(COALESCE(SUM(quota),0) AS SIGNED)" +
+		" FROM logs WHERE type = 2 AND created_at >= ? AND created_at < ? AND " + inSQL +
+		" GROUP BY user_id, day_idx"
+	rows, err := m.prodDB.QueryContext(cctx, q, append([]any{fromTs, toTs}, inArgs...)...)
+	if err != nil {
+		return nil, fmt.Errorf("矩阵聚合失败: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var uid, dayIdx, reqs, quota int64
+		if err := rows.Scan(&uid, &dayIdx, &reqs, &quota); err != nil {
+			return nil, err
+		}
+		mx.Cells = append(mx.Cells, UsageMatrixCell{
+			UserID:   uid,
+			Date:     time.Unix(dayIdx*86400-usageTZOffsetSec, 0).In(usageCST).Format("2006-01-02"),
+			Requests: reqs,
+			CostUSD:  float64(quota) / quotaPerUSD,
+		})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return mx, nil // 用户列(含合计与排序)由 handler 结合名单组装
+}
+
 // parseUsageRange 解析 from/to(YYYY-MM-DD,CST 自然日,含端点),空则默认近 7 天;越界自动收敛。
 func parseUsageRange(fromStr, toStr string, now time.Time) (fromTs, toTs int64, err error) {
 	today := now.In(usageCST).Truncate(0)
@@ -263,7 +337,8 @@ func parseUsageRange(fromStr, toStr string, now time.Time) (fromTs, toTs int64, 
 	if from.After(to) {
 		from, to = to, from
 	}
-	if to.Sub(from) > time.Duration(maxUsageDays)*24*time.Hour {
+	// 含两端点共 N 天 ⇔ 零点差 (N-1)*24h;用 >= 卡在恰好 190 天(> 会放行 191 天)
+	if to.Sub(from) >= time.Duration(maxUsageDays)*24*time.Hour {
 		return 0, 0, fmt.Errorf("时间范围过大,最长 %d 天", maxUsageDays)
 	}
 	return from.Unix(), to.AddDate(0, 0, 1).Unix(), nil // to 含当天 → 上界取次日 0 点(开区间)
@@ -283,6 +358,10 @@ func (m *Monitor) listTrackedUsers(c *gin.Context) {
 
 // addTrackedUser POST /usage/users(仅超管):{input: 邮箱或用户ID} → 解析主站用户后入名单。
 func (m *Monitor) addTrackedUser(c *gin.Context) {
+	if !m.Enabled() { // 与 matrix/stats 同一守卫:无生产库连接时干净拒绝,而非 nil 解引用
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "未连接主站数据库,无法解析用户"})
+		return
+	}
 	var in struct {
 		Input string `json:"input"`
 	}
@@ -290,8 +369,12 @@ func (m *Monitor) addTrackedUser(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
+	// 名单上限是约束生产库 IN 扫描宽度的护栏:计数出错必须拒绝,不能当 0 放行
 	var count int64
-	m.storeDB.Model(&TrackedUser{}).Count(&count)
+	if err := m.storeDB.Model(&TrackedUser{}).Count(&count).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "读取名单失败,请重试"})
+		return
+	}
 	if count >= maxTrackedUsers {
 		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("名单已达上限 %d 个", maxTrackedUsers)})
 		return
@@ -325,7 +408,106 @@ func (m *Monitor) deleteTrackedUser(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
 
-// serveUsageStats GET /usage/stats?from=&to=&user_id=(管理员):对名单(或其中一人)做四路聚合。
+// trackedLabel 展示名:邮箱优先,缺则用户名,再缺回退 #id。
+func trackedLabel(u TrackedUser) string {
+	if u.Email != "" {
+		return u.Email
+	}
+	if u.Username != "" {
+		return u.Username
+	}
+	return "#" + strconv.FormatInt(u.UserID, 10)
+}
+
+// refreshTrackedLabels 按 id 去生产库 users 表把名单的 username/email 刷新成当前值(主键 IN 查询,代价可忽略)。
+// 名单存的是添加时的快照——主站改邮箱/账号易主后,矩阵会把今天的消费记在旧身份上;
+// 这里每次查询顺手校准,变化的顺手回写本地库(自愈缓存);失败则退回快照,绝不阻断统计。
+func (m *Monitor) refreshTrackedLabels(ctx context.Context, tracked []TrackedUser) []TrackedUser {
+	if len(tracked) == 0 {
+		return tracked
+	}
+	cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	inSQL, args := usageIn("id", idsOf(tracked))
+	rows, err := m.prodDB.QueryContext(cctx, "SELECT id, COALESCE(username,''), COALESCE(email,'') FROM users WHERE "+inSQL, args...)
+	if err != nil {
+		slog.Warn("刷新检测用户标签失败,沿用快照", "err", err)
+		return tracked
+	}
+	defer rows.Close()
+	fresh := map[int64]TrackedUser{}
+	for rows.Next() {
+		var u TrackedUser
+		if err := rows.Scan(&u.UserID, &u.Username, &u.Email); err != nil {
+			slog.Warn("刷新检测用户标签失败,沿用快照", "err", err)
+			return tracked
+		}
+		fresh[u.UserID] = u
+	}
+	if err := rows.Err(); err != nil {
+		slog.Warn("刷新检测用户标签失败,沿用快照", "err", err)
+		return tracked
+	}
+	for i, u := range tracked {
+		f, ok := fresh[u.UserID]
+		if !ok {
+			continue // 主站已删的用户:保留快照当历史名
+		}
+		if f.Username != u.Username || f.Email != u.Email {
+			tracked[i].Username, tracked[i].Email = f.Username, f.Email
+			upd := tracked[i]
+			if err := m.storeDB.Save(&upd).Error; err != nil {
+				slog.Warn("回写检测用户标签失败", "err", err, "user_id", u.UserID)
+			}
+		}
+	}
+	return tracked
+}
+
+func idsOf(tracked []TrackedUser) []int64 {
+	ids := make([]int64, 0, len(tracked))
+	for _, u := range tracked {
+		ids = append(ids, u.UserID)
+	}
+	return ids
+}
+
+// serveUsageMatrix GET /usage/matrix?from=&to=(管理员):列表页矩阵数据(前端渲染为 行=用户 × 列=日期)。
+// 用户 label 取邮箱(缺则用户名/#id)并按区间消费降序;零消费用户排最后仍保留。
+func (m *Monitor) serveUsageMatrix(c *gin.Context) {
+	if !m.Enabled() {
+		c.JSON(http.StatusOK, gin.H{"enabled": false})
+		return
+	}
+	tracked, err := m.listTracked()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	fromTs, toTs, err := parseUsageRange(c.Query("from"), c.Query("to"), time.Now())
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	tracked = m.refreshTrackedLabels(c.Request.Context(), tracked) // 身份标签校准到主站当前值
+	mx, err := m.computeUsageMatrix(c.Request.Context(), idsOf(tracked), fromTs, toTs)
+	if err != nil {
+		slog.Warn("用户用量矩阵聚合失败", "err", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "统计查询失败,请稍后重试(细节见服务端日志)"})
+		return
+	}
+	totals := map[int64]float64{}
+	for _, cell := range mx.Cells {
+		totals[cell.UserID] += cell.CostUSD
+	}
+	for _, u := range tracked {
+		mx.Users = append(mx.Users, UsageMatrixUser{UserID: u.UserID, Label: trackedLabel(u), TotalUSD: totals[u.UserID]})
+	}
+	sort.SliceStable(mx.Users, func(i, j int) bool { return mx.Users[i].TotalUSD > mx.Users[j].TotalUSD })
+	c.JSON(http.StatusOK, gin.H{"enabled": true, "matrix": mx, "empty": len(tracked) == 0})
+}
+
+// serveUsageStats GET /usage/stats?from=&to=&user_id=(管理员):对名单(或其中一人)做每日/分组/模型聚合。
 func (m *Monitor) serveUsageStats(c *gin.Context) {
 	if !m.Enabled() {
 		c.JSON(http.StatusOK, gin.H{"enabled": false})
@@ -336,23 +518,15 @@ func (m *Monitor) serveUsageStats(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	label := map[int64]string{}
-	ids := make([]int64, 0, len(tracked))
+	inList := map[int64]bool{}
 	for _, u := range tracked {
-		name := u.Username
-		if name == "" {
-			name = u.Email
-		}
-		if name == "" {
-			name = "#" + strconv.FormatInt(u.UserID, 10)
-		}
-		label[u.UserID] = name
-		ids = append(ids, u.UserID)
+		inList[u.UserID] = true
 	}
-	// 可选:只看名单内某一个用户
+	ids := idsOf(tracked)
+	// 可选:只看名单内某一个用户(详情页即此路径)
 	if f := strings.TrimSpace(c.Query("user_id")); f != "" {
 		id, err := strconv.ParseInt(f, 10, 64)
-		if err != nil || label[id] == "" {
+		if err != nil || !inList[id] {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "user_id 不在名单内"})
 			return
 		}
@@ -369,13 +543,9 @@ func (m *Monitor) serveUsageStats(c *gin.Context) {
 	}
 	st, err := m.computeUsageStats(c.Request.Context(), ids, fromTs, toTs)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		slog.Warn("用户用量详情聚合失败", "err", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "统计查询失败,请稍后重试(细节见服务端日志)"})
 		return
-	}
-	for i := range st.ByUser { // user_id → 可读名(用户名/邮箱)
-		if id, e := strconv.ParseInt(st.ByUser[i].Key, 10, 64); e == nil && label[id] != "" {
-			st.ByUser[i].Key = label[id] + " (#" + st.ByUser[i].Key + ")"
-		}
 	}
 	c.JSON(http.StatusOK, gin.H{"enabled": true, "stats": st})
 }

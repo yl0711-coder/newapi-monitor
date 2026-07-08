@@ -66,7 +66,8 @@ func (m *Monitor) RegisterRoutes(r *gin.Engine) {
 		view.GET("/infra", m.serveInfra)              // 服务端健康监控(实例/DB/LB)快照
 		view.GET("/infra/series", m.serveInfraSeries) // 按需取某资源某些指标的近 N 小时序列(展开图用)
 		view.GET("/usage/users", m.listTrackedUsers)  // 用户用量:被盯名单
-		view.GET("/usage/stats", m.serveUsageStats)   // 用户用量:按需聚合(每日/分组/模型/用户/费用)
+		view.GET("/usage/matrix", m.serveUsageMatrix) // 用户用量:列表页矩阵(前端渲染 行=用户×列=日期,格=当日费用)
+		view.GET("/usage/stats", m.serveUsageStats)   // 用户用量:单用户详情聚合(每日/分组/模型/费用)
 		view.GET("/me", me)
 	}
 

@@ -7,6 +7,7 @@ package monitor
 import (
 	"context"
 	"database/sql"
+	"strconv"
 	"testing"
 	"time"
 
@@ -204,10 +205,6 @@ func TestComputeUsageStats(t *testing.T) {
 	if len(st.ByModel) != 2 || st.ByModel[0].Key != "gpt-4o" || st.ByModel[0].Requests != 2 {
 		t.Fatalf("ByModel = %+v", st.ByModel)
 	}
-	// 按用户:user 2($2) > user 1($1.5);key 为 user_id 文本(可读名由 handler 映射)
-	if len(st.ByUser) != 2 || st.ByUser[0].Key != "2" || st.ByUser[1].Key != "1" {
-		t.Fatalf("ByUser = %+v", st.ByUser)
-	}
 	// 起止日期回显
 	if st.From != "2026-07-01" || st.To != "2026-07-02" {
 		t.Fatalf("From/To = %s/%s", st.From, st.To)
@@ -216,5 +213,80 @@ func TestComputeUsageStats(t *testing.T) {
 	// 空名单:不出 SQL,直接空结果
 	if empty, err := m.computeUsageStats(context.Background(), nil, fromTs, toTs); err != nil || len(empty.Daily) != 0 {
 		t.Fatalf("空名单 = %+v, %v", empty, err)
+	}
+
+	// —— 矩阵数据(列表页,前端渲染为 行=用户×列=日期):days 连续新→旧,格=当日费用 ——
+	mx, err := m.computeUsageMatrix(context.Background(), []int64{1, 2}, fromTs, toTs)
+	if err != nil {
+		t.Fatalf("computeUsageMatrix: %v", err)
+	}
+	if len(mx.Days) != 2 || mx.Days[0] != "2026-07-02" || mx.Days[1] != "2026-07-01" {
+		t.Fatalf("Days 应连续且新→旧 = %+v", mx.Days)
+	}
+	// 稀疏格:user1 只 7-01 一格($1.5,两笔合并),user2 只 7-02 一格($2);没消费的天不出格
+	cell := map[string]float64{}
+	for _, c := range mx.Cells {
+		cell[c.Date+"#"+strconv.FormatInt(c.UserID, 10)] = c.CostUSD
+	}
+	if len(mx.Cells) != 2 || cell["2026-07-01#1"] != 1.5 || cell["2026-07-02#2"] != 2 {
+		t.Fatalf("Cells = %+v", mx.Cells)
+	}
+	// 空名单矩阵:仍出日期轴,零格
+	mx0, err := m.computeUsageMatrix(context.Background(), nil, fromTs, toTs)
+	if err != nil || len(mx0.Days) != 2 || len(mx0.Cells) != 0 {
+		t.Fatalf("空名单矩阵 = %+v, %v", mx0, err)
+	}
+}
+
+func TestParseUsageRangeBoundary(t *testing.T) {
+	now := time.Date(2026, 7, 7, 15, 0, 0, 0, usageCST)
+	// 含两端点恰 190 天:2026-01-01 + 189 天 = 2026-07-09 → 应通过
+	if _, _, err := parseUsageRange("2026-01-01", "2026-07-09", now); err != nil {
+		t.Fatalf("恰 190 天应通过: %v", err)
+	}
+	// 191 天(差值恰 190*24h,曾被 > 判定放行)→ 应拒绝
+	if _, _, err := parseUsageRange("2026-01-01", "2026-07-10", now); err == nil {
+		t.Fatal("191 天应被拒绝")
+	}
+}
+
+func TestRefreshTrackedLabels(t *testing.T) {
+	m := newTestMonitor(t)
+	m.prodDB = newFakeProdDB(t)
+	seed := []string{
+		"INSERT INTO users VALUES (1,'alice','new-alice@b.com')", // 主站已改邮箱
+		"INSERT INTO users VALUES (2,'bob','bob@x.com')",         // 未变
+	}
+	for _, s := range seed {
+		if _, err := m.prodDB.Exec(s); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+	}
+	tracked := []TrackedUser{
+		{UserID: 1, Username: "alice", Email: "old-alice@b.com", AddedAt: 1}, // 快照过期
+		{UserID: 2, Username: "bob", Email: "bob@x.com", AddedAt: 2},         // 快照仍准
+		{UserID: 9, Username: "ghost", Email: "ghost@x.com", AddedAt: 3},     // 主站已删:保留快照
+	}
+	for i := range tracked {
+		u := tracked[i]
+		if err := m.storeDB.Save(&u).Error; err != nil {
+			t.Fatalf("save tracked: %v", err)
+		}
+	}
+	out := m.refreshTrackedLabels(context.Background(), tracked)
+	if out[0].Email != "new-alice@b.com" {
+		t.Fatalf("过期快照应被刷新 = %+v", out[0])
+	}
+	if out[1].Email != "bob@x.com" || out[2].Email != "ghost@x.com" {
+		t.Fatalf("未变/已删用户处理不对 = %+v", out[1:])
+	}
+	// 刷新应回写本地库(自愈缓存)
+	var persisted TrackedUser
+	if err := m.storeDB.First(&persisted, "user_id = ?", int64(1)).Error; err != nil || persisted.Email != "new-alice@b.com" {
+		t.Fatalf("回写本地库失败 = %+v, %v", persisted, err)
+	}
+	// 标签取值:邮箱优先 → 用户名 → #id
+	if trackedLabel(out[0]) != "new-alice@b.com" || trackedLabel(TrackedUser{UserID: 5, Username: "u5"}) != "u5" || trackedLabel(TrackedUser{UserID: 6}) != "#6" {
+		t.Fatal("trackedLabel 优先级不对")
 	}
 }

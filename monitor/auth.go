@@ -221,6 +221,7 @@ func (m *Monitor) loginSubmit(c *gin.Context) {
 	}
 	tok := m.signSession(name, role, time.Now().Unix())
 	secure := c.Request.TLS != nil || c.GetHeader("X-Forwarded-Proto") == "https"
+	c.SetSameSite(http.SameSiteLaxMode) // 会话 cookie 不随跨站请求发送:掐掉表单型 CSRF(监控只有站内导航,Lax 无副作用)
 	c.SetCookie(sessionCookie, tok, int(sessionTTL.Seconds()), "/", "", secure, true)
 	c.JSON(http.StatusOK, gin.H{"ok": true, "name": name, "role": role})
 }

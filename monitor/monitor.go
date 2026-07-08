@@ -82,7 +82,9 @@ func New(s Settings) (*Monitor, error) {
 	if err != nil {
 		return nil, fmt.Errorf("打开生产库失败: %w", err)
 	}
-	conn.SetMaxOpenConns(2)
+	// 3 = 采样器(周期) + 用量聚合(按需,usageMu 已串行化) + 用户解析/SMTP 同步(偶发)。
+	// 曾为 2(仅采样器时代),用量功能加入后两连接会在三方碰撞时把 5s 的解析请求饿到假超时。
+	conn.SetMaxOpenConns(3)
 	conn.SetMaxIdleConns(1)
 	conn.SetConnMaxLifetime(5 * time.Minute)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
