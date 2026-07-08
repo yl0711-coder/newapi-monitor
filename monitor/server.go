@@ -65,6 +65,8 @@ func (m *Monitor) RegisterRoutes(r *gin.Engine) {
 		view.GET("/trend/long", m.serveLongTrend)
 		view.GET("/infra", m.serveInfra)              // 服务端健康监控(实例/DB/LB)快照
 		view.GET("/infra/series", m.serveInfraSeries) // 按需取某资源某些指标的近 N 小时序列(展开图用)
+		view.GET("/usage/users", m.listTrackedUsers)  // 用户用量:被盯名单
+		view.GET("/usage/stats", m.serveUsageStats)   // 用户用量:按需聚合(每日/分组/模型/用户/费用)
 		view.GET("/me", me)
 	}
 
@@ -76,6 +78,13 @@ func (m *Monitor) RegisterRoutes(r *gin.Engine) {
 		root.POST("/config", m.saveAlertConfigHandler)
 		root.POST("/test", m.testAlertHandler)
 		root.POST("/smtp/sync", m.syncSMTPHandler) // 「使用主站配置」:从 new-api 同步 SMTP
+	}
+
+	// 仅超级管理员:用户用量名单增删(看名单/看统计在上面 view 组,管理员即可)
+	rootUsage := r.Group("/usage", m.requireRole(roleRoot))
+	{
+		rootUsage.POST("/users", m.addTrackedUser)
+		rootUsage.POST("/users/delete", m.deleteTrackedUser)
 	}
 }
 
