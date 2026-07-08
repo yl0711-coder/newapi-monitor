@@ -28,6 +28,12 @@ var loginHTML string
 //go:embed echarts.min.js
 var echartsJS []byte // 内嵌 ECharts(Apache 2.0),自服务、不走 CDN,保持自包含
 
+//go:embed flatpickr.min.js
+var flatpickrJS []byte // 内嵌 flatpickr v4.6.13+zh 语言包(MIT),用量页日期范围选择器
+
+//go:embed flatpickr.min.css
+var flatpickrCSS []byte // flatpickr 暗色主题
+
 var allowedWindows = map[int]bool{15: true, 30: true, 60: true, 180: true, 360: true, 720: true, 1440: true}
 
 func parseWindow(c *gin.Context) int {
@@ -46,6 +52,14 @@ func (m *Monitor) RegisterRoutes(r *gin.Engine) {
 	r.GET("/echarts.js", func(c *gin.Context) { // 公开:内嵌 ECharts,自服务、版本固定可长期缓存
 		c.Header("Cache-Control", "public, max-age=31536000, immutable")
 		c.Data(http.StatusOK, "application/javascript; charset=utf-8", echartsJS)
+	})
+	r.GET("/flatpickr.js", func(c *gin.Context) { // 公开:内嵌 flatpickr(同 echarts,自服务)
+		c.Header("Cache-Control", "public, max-age=31536000, immutable")
+		c.Data(http.StatusOK, "application/javascript; charset=utf-8", flatpickrJS)
+	})
+	r.GET("/flatpickr.css", func(c *gin.Context) {
+		c.Header("Cache-Control", "public, max-age=31536000, immutable")
+		c.Data(http.StatusOK, "text/css; charset=utf-8", flatpickrCSS)
 	})
 	r.GET("/api/brand", m.brandHandler)                // 公开:站点名,供前端设置页面标题
 	r.POST("/internal/rejections", m.ingestRejections) // 机器对机器:接收采集器推送的前置拒绝(token 鉴权)
