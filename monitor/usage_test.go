@@ -11,35 +11,11 @@ import (
 	"testing"
 	"time"
 
-	_ "github.com/glebarez/go-sqlite" // 注册 database/sql 驱动 "sqlite"(纯 Go,免 cgo)
+	_ "github.com/glebarez/go-sqlite"
+	"gorm.io/gorm" // 注册 database/sql 驱动 "sqlite"(纯 Go,免 cgo)
 )
 
 const usageDayExprSQLite = "(created_at + 28800) / 86400" // sqlite 整型相除即整除
-
-func TestClassifyUserInput(t *testing.T) {
-	cases := []struct {
-		in        string
-		wantID    int64
-		wantEmail string
-		wantErr   bool
-	}{
-		{"42", 42, "", false},
-		{"  42  ", 42, "", false},
-		{"a@b.com", 0, "a@b.com", false},
-		{"用户@例子.com", 0, "用户@例子.com", false},
-		{"", 0, "", true},
-		{"   ", 0, "", true},
-		{"zhangsan", 0, "", true}, // 非数字且无 @:拒绝,提示用邮箱/ID
-		{"-5", 0, "", true},
-		{"0", 0, "", true},
-	}
-	for _, c := range cases {
-		id, email, err := classifyUserInput(c.in)
-		if (err != nil) != c.wantErr || id != c.wantID || email != c.wantEmail {
-			t.Errorf("classifyUserInput(%q) = (%d, %q, %v), want (%d, %q, err=%v)", c.in, id, email, err, c.wantID, c.wantEmail, c.wantErr)
-		}
-	}
-}
 
 func TestParseUsageRange(t *testing.T) {
 	// 固定“现在”:2026-07-07 15:00 CST
@@ -136,6 +112,9 @@ func TestResolveNewAPIUser(t *testing.T) {
 	if u, err := m.resolveNewAPIUser(ctx, "1"); err != nil || u.UserID != 1 || u.Username != "alice" {
 		t.Fatalf("按ID解析 = %+v, %v", u, err)
 	}
+	if u, err := m.resolveNewAPIUser(ctx, "alice"); err != nil || u.UserID != 1 {
+		t.Fatalf("按用户名解析 = %+v, %v", u, err)
+	}
 	if u, err := m.resolveNewAPIUser(ctx, "a@b.com"); err != nil || u.UserID != 1 {
 		t.Fatalf("按邮箱解析 = %+v, %v", u, err)
 	}
@@ -144,6 +123,69 @@ func TestResolveNewAPIUser(t *testing.T) {
 	}
 	if _, err := m.resolveNewAPIUser(ctx, "999"); err == nil {
 		t.Fatal("不存在的ID应报错")
+	}
+	if _, err := m.resolveNewAPIUser(ctx, "  "); err == nil {
+		t.Fatal("空输入应报错")
+	}
+	// 数字撞车:用户名"7"的人 vs ID=7 的人 → 数字输入按 ID 优先
+	if _, err := m.prodDB.Exec("INSERT INTO users (id,username,email) VALUES (7,'seven','s@x.com'),(8,'7','collide@x.com')"); err != nil {
+		t.Fatalf("seed collide: %v", err)
+	}
+	if u, err := m.resolveNewAPIUser(ctx, "7"); err != nil || u.UserID != 7 || u.Username != "seven" {
+		t.Fatalf("数字撞车应 ID 优先 = %+v, %v", u, err)
+	}
+	if u, err := m.resolveNewAPIUser(ctx, "seven"); err != nil || u.UserID != 7 {
+		t.Fatalf("按用户名 seven = %+v, %v", u, err)
+	}
+}
+
+func TestCustomerGroups(t *testing.T) {
+	m := newTestMonitor(t)
+	// 建组
+	g := CustomerGroup{Name: "AcmeCorp", Note: "重点客户", CreatedAt: 100}
+	if err := m.storeDB.Create(&g).Error; err != nil {
+		t.Fatalf("create group: %v", err)
+	}
+	// 组名唯一
+	if err := m.storeDB.Create(&CustomerGroup{Name: "AcmeCorp"}).Error; err == nil {
+		t.Fatal("重名分组应被唯一索引拒绝")
+	}
+	// 成员归组
+	for _, u := range []TrackedUser{{UserID: 1, Username: "a", GroupID: g.ID}, {UserID: 2, Username: "b", GroupID: g.ID}, {UserID: 3, Username: "c"}} {
+		uu := u
+		if err := m.storeDB.Save(&uu).Error; err != nil {
+			t.Fatalf("save user: %v", err)
+		}
+	}
+	var n int64
+	m.storeDB.Model(&TrackedUser{}).Where("group_id = ?", g.ID).Count(&n)
+	if n != 2 {
+		t.Fatalf("组内人数 = %d", n)
+	}
+	// 解散:成员回未分组,用户仍在
+	err := m.storeDB.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Model(&TrackedUser{}).Where("group_id = ?", g.ID).Update("group_id", 0).Error; err != nil {
+			return err
+		}
+		return tx.Delete(&CustomerGroup{}, g.ID).Error
+	})
+	if err != nil {
+		t.Fatalf("dissolve: %v", err)
+	}
+	var users []TrackedUser
+	m.storeDB.Find(&users)
+	if len(users) != 3 {
+		t.Fatalf("解散不应删用户,got %d", len(users))
+	}
+	for _, u := range users {
+		if u.GroupID != 0 {
+			t.Fatalf("解散后应回未分组 %+v", u)
+		}
+	}
+	var gs []CustomerGroup
+	m.storeDB.Find(&gs)
+	if len(gs) != 0 {
+		t.Fatalf("分组应已删除 %+v", gs)
 	}
 }
 
@@ -292,8 +334,8 @@ func TestRefreshTrackedLabels(t *testing.T) {
 	if err := m.storeDB.First(&persisted, "user_id = ?", int64(1)).Error; err != nil || persisted.Email != "new-alice@b.com" {
 		t.Fatalf("回写本地库失败 = %+v, %v", persisted, err)
 	}
-	// 标签取值:邮箱优先 → 用户名 → #id
-	if trackedLabel(out[0]) != "new-alice@b.com" || trackedLabel(TrackedUser{UserID: 5, Username: "u5"}) != "u5" || trackedLabel(TrackedUser{UserID: 6}) != "#6" {
+	// 标签取值:用户名优先 → 邮箱 → #id(需求:显示用户名)
+	if trackedLabel(out[0]) != "alice" || trackedLabel(TrackedUser{UserID: 5, Email: "e@x.com"}) != "e@x.com" || trackedLabel(TrackedUser{UserID: 6}) != "#6" {
 		t.Fatal("trackedLabel 优先级不对")
 	}
 }
