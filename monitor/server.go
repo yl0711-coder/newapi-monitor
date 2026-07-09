@@ -102,6 +102,7 @@ func (m *Monitor) RegisterRoutes(r *gin.Engine) {
 		rootUsage.POST("/users", m.addTrackedUser)
 		rootUsage.POST("/users/delete", m.deleteTrackedUser)
 		rootUsage.POST("/users/group", m.setUserGroup)  // 改用户归属分组
+		rootUsage.POST("/users/note", m.setUserNote)    // 改用户备注
 		rootUsage.POST("/groups", m.createGroup)        // 客户分组:新建
 		rootUsage.POST("/groups/update", m.updateGroup) // 客户分组:编辑
 		rootUsage.POST("/groups/delete", m.deleteGroup) // 客户分组:解散(成员回未分组)

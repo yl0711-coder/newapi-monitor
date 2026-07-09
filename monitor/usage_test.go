@@ -339,3 +339,26 @@ func TestRefreshTrackedLabels(t *testing.T) {
 		t.Fatal("trackedLabel 优先级不对")
 	}
 }
+
+func TestUserNotePreservedOnLabelRefresh(t *testing.T) {
+	m := newTestMonitor(t)
+	m.prodDB = newFakeProdDB(t)
+	// 主站改了 alice 的邮箱 → 触发标签回写;备注(本地字段)必须保住
+	if _, err := m.prodDB.Exec("INSERT INTO users (id,username,email) VALUES (1,'alice','new@b.com')"); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	u := TrackedUser{UserID: 1, Username: "alice", Email: "old@b.com", Note: "合同7月到期", AddedAt: 1}
+	if err := m.storeDB.Save(&u).Error; err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	out, _ := m.refreshTrackedLabels(context.Background(), []TrackedUser{u})
+	if out[0].Email != "new@b.com" || out[0].Note != "合同7月到期" {
+		t.Fatalf("邮箱应刷新且备注应保留 = %+v", out[0])
+	}
+	// 回写本地库后备注仍在
+	var p TrackedUser
+	m.storeDB.First(&p, "user_id = ?", int64(1))
+	if p.Email != "new@b.com" || p.Note != "合同7月到期" {
+		t.Fatalf("本地库 = %+v", p)
+	}
+}

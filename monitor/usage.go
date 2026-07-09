@@ -43,6 +43,7 @@ type TrackedUser struct {
 	Username string `json:"username"`
 	Email    string `json:"email"`
 	GroupID  int64  `json:"group_id"`
+	Note     string `gorm:"size:200" json:"note"` // 备注:记用户状态/联系人等,监控本地元数据
 	AddedAt  int64  `json:"added_at"`
 }
 
@@ -261,6 +262,7 @@ type UsageMatrixUser struct {
 	Email      string   `json:"email"`
 	GroupID    int64    `json:"group_id"`
 	GroupName  string   `json:"group_name"`
+	Note       string   `json:"note"`
 	TotalUSD   float64  `json:"total_usd"`
 	BalanceUSD *float64 `json:"balance_usd"` // 主站当前余额(users.quota 折美元);null=主站已删/取不到
 }
@@ -510,6 +512,28 @@ func (m *Monitor) deleteGroup(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
 
+// setUserNote POST /usage/users/note(仅超管):{user_id, note};清空 note 传空串。
+func (m *Monitor) setUserNote(c *gin.Context) {
+	var in struct {
+		UserID int64  `json:"user_id"`
+		Note   string `json:"note"`
+	}
+	if err := c.ShouldBindJSON(&in); err != nil || in.UserID <= 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "user_id required"})
+		return
+	}
+	note := strings.TrimSpace(in.Note)
+	if len(note) > 200 {
+		note = note[:200]
+	}
+	res := m.storeDB.Model(&TrackedUser{}).Where("user_id = ?", in.UserID).Update("note", note)
+	if res.Error != nil || res.RowsAffected == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "用户不在名单内"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"ok": true})
+}
+
 // setUserGroup POST /usage/users/group(仅超管):{user_id, group_id};group_id=0 为移出分组。
 func (m *Monitor) setUserGroup(c *gin.Context) {
 	var in struct {
@@ -697,7 +721,7 @@ func (m *Monitor) serveUsageMatrix(c *gin.Context) {
 	gm := m.groupNameMap()
 	for _, u := range tracked {
 		mu := UsageMatrixUser{UserID: u.UserID, Username: u.Username, Email: u.Email,
-			GroupID: u.GroupID, GroupName: gm[u.GroupID], TotalUSD: totals[u.UserID]}
+			GroupID: u.GroupID, GroupName: gm[u.GroupID], Note: u.Note, TotalUSD: totals[u.UserID]}
 		if b, ok := balances[u.UserID]; ok {
 			bv := b
 			mu.BalanceUSD = &bv
