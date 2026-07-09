@@ -8,6 +8,7 @@ import (
 	"context"
 	"database/sql"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -360,5 +361,94 @@ func TestUserNotePreservedOnLabelRefresh(t *testing.T) {
 	m.storeDB.First(&p, "user_id = ?", int64(1))
 	if p.Email != "new@b.com" || p.Note != "合同7月到期" {
 		t.Fatalf("本地库 = %+v", p)
+	}
+}
+
+func TestComputeFollowUps(t *testing.T) {
+	m := newTestMonitor(t)
+	m.prodDB = newFakeProdDB(t)
+	m.usageDayExpr = usageDayExprSQLite
+
+	// 固定"现在"= 2026-07-09 12:00 CST
+	now := time.Date(2026, 7, 9, 12, 0, 0, 0, usageCST).Unix()
+	dayTs := func(y int, mo time.Month, d int) int64 { return time.Date(y, mo, d, 10, 0, 0, 0, usageCST).Unix() }
+
+	// 三个客户:
+	// g1 正式,成员1,连续无消费(最后消费在30天前边界外)+ 低余额 → 命中"流失"+"低余额"
+	// g2 试用,成员2,近7天消费高($25)→ 命中"转化时机"
+	// g3 正式,成员3,近期正常消费、余额充足 → 不命中(不上榜)
+	for _, g := range []CustomerGroup{
+		{ID: 1, Name: "沉睡正式", Stage: "active", CreatedAt: 1},
+		{ID: 2, Name: "活跃试用", Stage: "trial", TrialEnd: now + 20*86400, CreatedAt: 2},
+		{ID: 3, Name: "健康正式", Stage: "active", CreatedAt: 3},
+	} {
+		gg := g
+		if err := m.storeDB.Create(&gg).Error; err != nil {
+			t.Fatalf("group: %v", err)
+		}
+	}
+	users := []TrackedUser{{UserID: 1, GroupID: 1}, {UserID: 2, GroupID: 2}, {UserID: 3, GroupID: 2}, {UserID: 4, GroupID: 3}}
+	for _, u := range users {
+		uu := u
+		m.storeDB.Save(&uu)
+	}
+	// 主站 users:余额 g1 低($1)、g2 各$50、g3 高
+	seed := []string{
+		"INSERT INTO users (id,username,email,quota) VALUES (1,'u1','',500000)",   // $1 低余额
+		"INSERT INTO users (id,username,email,quota) VALUES (2,'u2','',25000000)", // $50
+		"INSERT INTO users (id,username,email,quota) VALUES (3,'u3','',25000000)",
+		"INSERT INTO users (id,username,email,quota) VALUES (4,'u4','',50000000)",
+	}
+	for _, q := range seed {
+		if _, err := m.prodDB.Exec(q); err != nil {
+			t.Fatalf("seed users: %v", err)
+		}
+	}
+	ins := func(uid int64, ts, quota int64) {
+		if _, err := m.prodDB.Exec("INSERT INTO logs (user_id,created_at,type,model_name,quota,prompt_tokens,completion_tokens,`group`) VALUES (?,?,2,'m',?,1,1,'default')", uid, ts, quota); err != nil {
+			t.Fatalf("ins log: %v", err)
+		}
+	}
+	// g1(uid1):只有 40 天前有消费 → 30天窗口内全无 → 流失
+	ins(1, now-40*86400, 100000)
+	// g2(uid2/3):试用期两人近7天各自消费都高(各 >= $20 阈值)→ 各命中转化时机
+	ins(2, dayTs(2026, 7, 8), 12500000) // $25
+	ins(3, dayTs(2026, 7, 7), 11000000) // $22
+	// g3(uid4):近期天天有,余额高 → 不命中
+	ins(4, dayTs(2026, 7, 8), 200000)
+	ins(4, dayTs(2026, 7, 6), 200000)
+
+	items, err := m.computeFollowUps(context.Background(), now)
+	if err != nil {
+		t.Fatalf("computeFollowUps: %v", err)
+	}
+	byName := map[string]FollowUpCompany{}
+	for _, co := range items {
+		byName[co.GroupName] = co
+	}
+	// 健康正式:成员消费正常,不该上榜
+	if _, ok := byName["健康正式"]; ok {
+		t.Fatalf("健康客户不该进待跟进: %+v", items)
+	}
+	// 沉睡正式:成员(uid1)命中 流失 + 低余额
+	g1 := byName["沉睡正式"]
+	if g1.GroupID != 1 || len(g1.Members) != 1 || g1.Members[0].UserID != 1 {
+		t.Fatalf("沉睡正式应有1个需跟进成员uid1: %+v", g1)
+	}
+	joined := strings.Join(g1.Members[0].Reasons, ";")
+	if !strings.Contains(joined, "无消费") || !strings.Contains(joined, "余额低") {
+		t.Fatalf("g1成员原因 = %v", g1.Members[0].Reasons)
+	}
+	// 活跃试用:两个成员都消费高(各命中转化时机)
+	g2 := byName["活跃试用"]
+	if len(g2.Members) != 2 {
+		t.Fatalf("活跃试用应有2个成员: %+v", g2)
+	}
+	if !strings.Contains(strings.Join(g2.Members[0].Reasons, ";"), "试用消耗高") {
+		t.Fatalf("g2成员原因 = %v", g2.Members[0].Reasons)
+	}
+	// member_total 汇总口径
+	if s := m.loadUsageSettings(); s.DormantDays != 7 || s.TrialHighUSD != 20 {
+		t.Fatalf("默认阈值 = %+v", s)
 	}
 }
