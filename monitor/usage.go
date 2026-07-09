@@ -43,6 +43,7 @@ type TrackedUser struct {
 	Username string `json:"username"`
 	Email    string `json:"email"`
 	GroupID  int64  `json:"group_id"`
+	Note     string `gorm:"size:200" json:"note"` // 备注:记用户状态/联系人等,监控本地元数据
 	AddedAt  int64  `json:"added_at"`
 }
 
@@ -51,8 +52,64 @@ type CustomerGroup struct {
 	ID        int64  `gorm:"primaryKey" json:"id"`
 	Name      string `gorm:"uniqueIndex;size:64" json:"name"`
 	Note      string `gorm:"size:500" json:"note"`
+	Stage     string `gorm:"size:16;default:active" json:"stage"` // trial=试用 / active=正式 / churned=已流失
+	TrialEnd  int64  `json:"trial_end"`                           // 试用到期(unix 秒,0=无);仅 trial 有意义
 	CreatedAt int64  `json:"created_at"`
 }
+
+// FollowUpLog 跟进记录(时间线,追加式);跟进落到【人】,按 user_id 归档。
+type FollowUpLog struct {
+	ID        int64  `gorm:"primaryKey" json:"id"`
+	UserID    int64  `gorm:"index" json:"user_id"`
+	Text      string `gorm:"size:500" json:"text"`
+	Author    string `gorm:"size:64" json:"author"`
+	CreatedAt int64  `json:"created_at"`
+}
+
+// UsageSettings 客户跟进阈值(单行,id=1;缺省用 defaultUsageSettings)。
+type UsageSettings struct {
+	ID              int64   `gorm:"primaryKey" json:"-"`
+	DormantDays     int     `json:"dormant_days"`      // 正式客户连续无消费达此天数→疑似流失
+	DropPct         int     `json:"drop_pct"`          // 近7天 vs 前7天 消费降幅≥此%→消费下滑
+	LowBalanceUSD   float64 `json:"low_balance_usd"`   // 余额低于此→催充值
+	TrialLowUSD     float64 `json:"trial_low_usd"`     // 试用近7天消费低于此→用不起来
+	TrialHighUSD    float64 `json:"trial_high_usd"`    // 试用近7天消费高于此→转化时机
+	TrialExpiryDays int     `json:"trial_expiry_days"` // 试用到期剩余≤此天→到期跟进
+}
+
+func defaultUsageSettings() UsageSettings {
+	return UsageSettings{ID: 1, DormantDays: 7, DropPct: 50, LowBalanceUSD: 5, TrialLowUSD: 1, TrialHighUSD: 20, TrialExpiryDays: 7}
+}
+
+// loadUsageSettings 读阈值;无记录/字段为0则用默认补齐(防老库/半配)。
+func (m *Monitor) loadUsageSettings() UsageSettings {
+	var s UsageSettings
+	if err := m.storeDB.First(&s, 1).Error; err != nil {
+		return defaultUsageSettings()
+	}
+	d := defaultUsageSettings()
+	if s.DormantDays <= 0 {
+		s.DormantDays = d.DormantDays
+	}
+	if s.DropPct <= 0 {
+		s.DropPct = d.DropPct
+	}
+	if s.LowBalanceUSD <= 0 {
+		s.LowBalanceUSD = d.LowBalanceUSD
+	}
+	if s.TrialLowUSD <= 0 {
+		s.TrialLowUSD = d.TrialLowUSD
+	}
+	if s.TrialHighUSD <= 0 {
+		s.TrialHighUSD = d.TrialHighUSD
+	}
+	if s.TrialExpiryDays <= 0 {
+		s.TrialExpiryDays = d.TrialExpiryDays
+	}
+	return s
+}
+
+const followUpWindowDays = 30 // 跟进判断固定回看窗口(独立于页面显示范围)
 
 const maxCustomerGroups = 200 // 分组数量护栏
 
@@ -261,6 +318,7 @@ type UsageMatrixUser struct {
 	Email      string   `json:"email"`
 	GroupID    int64    `json:"group_id"`
 	GroupName  string   `json:"group_name"`
+	Note       string   `json:"note"`
 	TotalUSD   float64  `json:"total_usd"`
 	BalanceUSD *float64 `json:"balance_usd"` // 主站当前余额(users.quota 折美元);null=主站已删/取不到
 }
@@ -431,9 +489,14 @@ func normalizeGroupInput(name, note string) (string, string, error) {
 	return name, note, nil
 }
 
-// createGroup POST /usage/groups(仅超管):{name, note}。
+// createGroup POST /usage/groups(仅超管):{name, note, stage?, trial_end?};stage 缺省 active。
 func (m *Monitor) createGroup(c *gin.Context) {
-	var in struct{ Name, Note string }
+	var in struct {
+		Name     string `json:"name"`
+		Note     string `json:"note"`
+		Stage    string `json:"stage"`
+		TrialEnd int64  `json:"trial_end"`
+	}
 	if err := c.ShouldBindJSON(&in); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
@@ -442,6 +505,14 @@ func (m *Monitor) createGroup(c *gin.Context) {
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
+	}
+	stage := in.Stage
+	if stage != "trial" && stage != "active" && stage != "churned" {
+		stage = "active"
+	}
+	trialEnd := in.TrialEnd
+	if stage != "trial" {
+		trialEnd = 0
 	}
 	var count int64
 	if err := m.storeDB.Model(&CustomerGroup{}).Count(&count).Error; err != nil {
@@ -452,7 +523,7 @@ func (m *Monitor) createGroup(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("分组已达上限 %d 个", maxCustomerGroups)})
 		return
 	}
-	g := CustomerGroup{Name: name, Note: note, CreatedAt: time.Now().Unix()}
+	g := CustomerGroup{Name: name, Note: note, Stage: stage, TrialEnd: trialEnd, CreatedAt: time.Now().Unix()}
 	if err := m.storeDB.Create(&g).Error; err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "创建失败:分组名可能已存在"})
 		return
@@ -505,6 +576,28 @@ func (m *Monitor) deleteGroup(c *gin.Context) {
 	})
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"ok": true})
+}
+
+// setUserNote POST /usage/users/note(仅超管):{user_id, note};清空 note 传空串。
+func (m *Monitor) setUserNote(c *gin.Context) {
+	var in struct {
+		UserID int64  `json:"user_id"`
+		Note   string `json:"note"`
+	}
+	if err := c.ShouldBindJSON(&in); err != nil || in.UserID <= 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "user_id required"})
+		return
+	}
+	note := strings.TrimSpace(in.Note)
+	if len(note) > 200 {
+		note = note[:200]
+	}
+	res := m.storeDB.Model(&TrackedUser{}).Where("user_id = ?", in.UserID).Update("note", note)
+	if res.Error != nil || res.RowsAffected == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "用户不在名单内"})
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"ok": true})
@@ -697,7 +790,7 @@ func (m *Monitor) serveUsageMatrix(c *gin.Context) {
 	gm := m.groupNameMap()
 	for _, u := range tracked {
 		mu := UsageMatrixUser{UserID: u.UserID, Username: u.Username, Email: u.Email,
-			GroupID: u.GroupID, GroupName: gm[u.GroupID], TotalUSD: totals[u.UserID]}
+			GroupID: u.GroupID, GroupName: gm[u.GroupID], Note: u.Note, TotalUSD: totals[u.UserID]}
 		if b, ok := balances[u.UserID]; ok {
 			bv := b
 			mu.BalanceUSD = &bv

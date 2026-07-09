@@ -77,12 +77,15 @@ func (m *Monitor) RegisterRoutes(r *gin.Engine) {
 		view.GET("/data", m.serveData)
 		view.GET("/monitor/data", m.serveData)
 		view.GET("/trend/long", m.serveLongTrend)
-		view.GET("/infra", m.serveInfra)              // 服务端健康监控(实例/DB/LB)快照
-		view.GET("/infra/series", m.serveInfraSeries) // 按需取某资源某些指标的近 N 小时序列(展开图用)
-		view.GET("/usage/users", m.listTrackedUsers)  // 用户用量:被盯名单(含分组)
-		view.GET("/usage/groups", m.listGroups)       // 用户用量:客户分组列表
-		view.GET("/usage/matrix", m.serveUsageMatrix) // 用户用量:列表页矩阵(前端渲染 行=用户×列=日期,格=当日费用)
-		view.GET("/usage/stats", m.serveUsageStats)   // 用户用量:单用户详情聚合(每日/分组/模型/费用)
+		view.GET("/infra", m.serveInfra)                   // 服务端健康监控(实例/DB/LB)快照
+		view.GET("/infra/series", m.serveInfraSeries)      // 按需取某资源某些指标的近 N 小时序列(展开图用)
+		view.GET("/usage/users", m.listTrackedUsers)       // 用户用量:被盯名单(含分组)
+		view.GET("/usage/groups", m.listGroups)            // 用户用量:客户分组列表
+		view.GET("/usage/followups", m.serveFollowUps)     // 用户用量:待跟进清单
+		view.GET("/usage/followups/log", m.listFollowLogs) // 用户用量:某客户跟进记录
+		view.GET("/usage/settings", m.getUsageSettings)    // 用户用量:跟进阈值(读)
+		view.GET("/usage/matrix", m.serveUsageMatrix)      // 用户用量:列表页矩阵(前端渲染 行=用户×列=日期,格=当日费用)
+		view.GET("/usage/stats", m.serveUsageStats)        // 用户用量:单用户详情聚合(每日/分组/模型/费用)
 		view.GET("/me", me)
 	}
 
@@ -101,10 +104,14 @@ func (m *Monitor) RegisterRoutes(r *gin.Engine) {
 	{
 		rootUsage.POST("/users", m.addTrackedUser)
 		rootUsage.POST("/users/delete", m.deleteTrackedUser)
-		rootUsage.POST("/users/group", m.setUserGroup)  // 改用户归属分组
-		rootUsage.POST("/groups", m.createGroup)        // 客户分组:新建
-		rootUsage.POST("/groups/update", m.updateGroup) // 客户分组:编辑
-		rootUsage.POST("/groups/delete", m.deleteGroup) // 客户分组:解散(成员回未分组)
+		rootUsage.POST("/users/group", m.setUserGroup)   // 改用户归属分组
+		rootUsage.POST("/users/note", m.setUserNote)     // 改用户备注
+		rootUsage.POST("/groups", m.createGroup)         // 客户分组:新建
+		rootUsage.POST("/groups/update", m.updateGroup)  // 客户分组:编辑
+		rootUsage.POST("/groups/delete", m.deleteGroup)  // 客户分组:解散(成员回未分组)
+		rootUsage.POST("/groups/stage", m.setGroupStage) // 客户分组:改状态(试用/正式/已流失+到期)
+		rootUsage.POST("/followups/log", m.addFollowLog) // 跟进记录:追加
+		rootUsage.POST("/settings", m.saveUsageSettings) // 跟进阈值:保存
 	}
 }
 
