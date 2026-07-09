@@ -10,7 +10,6 @@ package monitor
 
 import (
 	"context"
-	"database/sql"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -20,6 +19,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"gorm.io/gorm"
 )
 
 const (
@@ -37,12 +37,24 @@ var usageCST = time.FixedZone("CST", usageTZOffsetSec)
 const usageDayExprMySQL = "(created_at + 28800) DIV 86400"
 
 // TrackedUser 被盯的 new-api 用户(名单存本地 sqlite,主键=new-api user_id,天然去重)。
+// GroupID 归属的客户分组(customer_groups.id),0=未分组——分组是监控本地的客户管理元数据,与主站无关。
 type TrackedUser struct {
 	UserID   int64  `gorm:"primaryKey;column:user_id" json:"user_id"`
 	Username string `json:"username"`
 	Email    string `json:"email"`
+	GroupID  int64  `json:"group_id"`
 	AddedAt  int64  `json:"added_at"`
 }
+
+// CustomerGroup 客户分组(公司):监控本地的客户管理实体,name 唯一。
+type CustomerGroup struct {
+	ID        int64  `gorm:"primaryKey" json:"id"`
+	Name      string `gorm:"uniqueIndex;size:64" json:"name"`
+	Note      string `gorm:"size:500" json:"note"`
+	CreatedAt int64  `json:"created_at"`
+}
+
+const maxCustomerGroups = 200 // 分组数量护栏
 
 // ---- 名单 CRUD(本地库) ----
 
@@ -52,35 +64,22 @@ func (m *Monitor) listTracked() ([]TrackedUser, error) {
 	return rows, err
 }
 
-// classifyUserInput 判定输入是 user_id(纯数字)还是邮箱(含@);两者都不是则报错。
-func classifyUserInput(input string) (userID int64, email string, err error) {
-	s := strings.TrimSpace(input)
-	if s == "" {
-		return 0, "", fmt.Errorf("请输入邮箱或用户ID")
-	}
-	if id, e := strconv.ParseInt(s, 10, 64); e == nil && id > 0 {
-		return id, "", nil
-	}
-	if strings.Contains(s, "@") {
-		return 0, s, nil
-	}
-	return 0, "", fmt.Errorf("无法识别:请输入纯数字用户ID,或含 @ 的完整邮箱")
-}
-
-// resolveNewAPIUser 去生产库 users 表把输入解析成用户(只读、走主键/邮箱等值查询)。
+// resolveNewAPIUser 去生产库 users 表把输入解析成用户:一条等值查询同时匹配 ID/用户名/邮箱
+// (username 在 new-api 是唯一索引,和邮箱一样可靠)。多命中时数字输入按 ID 优先消歧,仍撞则报错让用 ID。
 func (m *Monitor) resolveNewAPIUser(ctx context.Context, input string) (*TrackedUser, error) {
-	id, email, err := classifyUserInput(input)
-	if err != nil {
-		return nil, err
+	in := strings.TrimSpace(input)
+	if in == "" {
+		return nil, fmt.Errorf("请输入用户ID、用户名或邮箱")
+	}
+	var asID int64
+	if id, e := strconv.ParseInt(in, 10, 64); e == nil && id > 0 {
+		asID = id
 	}
 	cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	var rows *sql.Rows
-	if id > 0 {
-		rows, err = m.prodDB.QueryContext(cctx, "SELECT id, COALESCE(username,''), COALESCE(email,'') FROM users WHERE id = ?", id)
-	} else {
-		rows, err = m.prodDB.QueryContext(cctx, "SELECT id, COALESCE(username,''), COALESCE(email,'') FROM users WHERE email = ? LIMIT 2", email)
-	}
+	rows, err := m.prodDB.QueryContext(cctx,
+		"SELECT id, COALESCE(username,''), COALESCE(email,'') FROM users WHERE id = ? OR username = ? OR email = ? LIMIT 3",
+		asID, in, in)
 	if err != nil {
 		// 驱动错误可能含内网 DB 地址/schema 细节:细节进日志,给浏览器的信息脱敏
 		slog.Warn("查询主站用户失败", "err", err)
@@ -101,10 +100,18 @@ func (m *Monitor) resolveNewAPIUser(ctx context.Context, input string) (*Tracked
 	switch {
 	case len(found) == 0:
 		return nil, fmt.Errorf("主站没有找到该用户(%s)", input)
-	case len(found) > 1:
-		return nil, fmt.Errorf("该邮箱匹配到多个用户,请改用用户ID添加")
+	case len(found) == 1:
+		return &found[0], nil
 	}
-	return &found[0], nil
+	// 多命中:纯数字输入优先当 ID(如用户名恰叫 "123" 与 ID=123 撞车)
+	if asID > 0 {
+		for i := range found {
+			if found[i].UserID == asID {
+				return &found[i], nil
+			}
+		}
+	}
+	return nil, fmt.Errorf("该输入匹配到多个用户(用户名/邮箱撞车),请改用用户ID添加")
 }
 
 // ---- 聚合查询(生产库,只读、窗口化、走索引) ----
@@ -250,7 +257,10 @@ func (m *Monitor) computeUsageStats(ctx context.Context, ids []int64, fromTs, to
 // UsageMatrixUser 矩阵列头(一个被盯用户)+ 区间合计。
 type UsageMatrixUser struct {
 	UserID     int64    `json:"user_id"`
-	Label      string   `json:"label"` // 邮箱优先,缺邮箱回退用户名/#id
+	Username   string   `json:"username"`
+	Email      string   `json:"email"`
+	GroupID    int64    `json:"group_id"`
+	GroupName  string   `json:"group_name"`
 	TotalUSD   float64  `json:"total_usd"`
 	BalanceUSD *float64 `json:"balance_usd"` // 主站当前余额(users.quota 折美元);null=主站已删/取不到
 }
@@ -347,14 +357,183 @@ func parseUsageRange(fromStr, toStr string, now time.Time) (fromTs, toTs int64, 
 
 // ---- HTTP 处理器 ----
 
-// listTrackedUsers GET /usage/users(管理员):返回名单。
+// groupNameMap 分组 id→name(本地库,量小全取)。
+func (m *Monitor) groupNameMap() map[int64]string {
+	var gs []CustomerGroup
+	m.storeDB.Find(&gs)
+	out := map[int64]string{}
+	for _, g := range gs {
+		out[g.ID] = g.Name
+	}
+	return out
+}
+
+// trackedUserView 名单项+冗余分组名(前端免二次拼)。
+type trackedUserView struct {
+	TrackedUser
+	GroupName string `json:"group_name"`
+}
+
+func (m *Monitor) trackedViews(rows []TrackedUser) []trackedUserView {
+	gm := m.groupNameMap()
+	out := make([]trackedUserView, 0, len(rows))
+	for _, u := range rows {
+		out = append(out, trackedUserView{TrackedUser: u, GroupName: gm[u.GroupID]})
+	}
+	return out
+}
+
+// listTrackedUsers GET /usage/users(管理员):返回名单(含分组名)。
 func (m *Monitor) listTrackedUsers(c *gin.Context) {
 	rows, err := m.listTracked()
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"users": rows})
+	c.JSON(http.StatusOK, gin.H{"users": m.trackedViews(rows)})
+}
+
+// ---- 客户分组 CRUD(name 唯一;删除=解散,成员回未分组) ----
+
+// listGroups GET /usage/groups(管理员):分组列表+人数。
+func (m *Monitor) listGroups(c *gin.Context) {
+	var gs []CustomerGroup
+	if err := m.storeDB.Order("created_at").Find(&gs).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	type row struct {
+		CustomerGroup
+		Members int64 `json:"members"`
+	}
+	out := make([]row, 0, len(gs))
+	for _, g := range gs {
+		var n int64
+		m.storeDB.Model(&TrackedUser{}).Where("group_id = ?", g.ID).Count(&n)
+		out = append(out, row{CustomerGroup: g, Members: n})
+	}
+	c.JSON(http.StatusOK, gin.H{"groups": out})
+}
+
+// normalizeGroupInput 清洗分组输入:名称必填≤64,备注≤500。
+func normalizeGroupInput(name, note string) (string, string, error) {
+	name = strings.TrimSpace(name)
+	note = strings.TrimSpace(note)
+	if name == "" {
+		return "", "", fmt.Errorf("分组名称不能为空")
+	}
+	if len(name) > 64 {
+		return "", "", fmt.Errorf("分组名称过长(≤64字节)")
+	}
+	if len(note) > 500 {
+		note = note[:500]
+	}
+	return name, note, nil
+}
+
+// createGroup POST /usage/groups(仅超管):{name, note}。
+func (m *Monitor) createGroup(c *gin.Context) {
+	var in struct{ Name, Note string }
+	if err := c.ShouldBindJSON(&in); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	name, note, err := normalizeGroupInput(in.Name, in.Note)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	var count int64
+	if err := m.storeDB.Model(&CustomerGroup{}).Count(&count).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "读取分组失败,请重试"})
+		return
+	}
+	if count >= maxCustomerGroups {
+		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("分组已达上限 %d 个", maxCustomerGroups)})
+		return
+	}
+	g := CustomerGroup{Name: name, Note: note, CreatedAt: time.Now().Unix()}
+	if err := m.storeDB.Create(&g).Error; err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "创建失败:分组名可能已存在"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"ok": true, "group": g})
+}
+
+// updateGroup POST /usage/groups/update(仅超管):{id, name, note}。
+func (m *Monitor) updateGroup(c *gin.Context) {
+	var in struct {
+		ID   int64
+		Name string
+		Note string
+	}
+	if err := c.ShouldBindJSON(&in); err != nil || in.ID <= 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "id required"})
+		return
+	}
+	name, note, err := normalizeGroupInput(in.Name, in.Note)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	res := m.storeDB.Model(&CustomerGroup{}).Where("id = ?", in.ID).Updates(map[string]any{"name": name, "note": note})
+	if res.Error != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "保存失败:分组名可能已存在"})
+		return
+	}
+	if res.RowsAffected == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "分组不存在"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"ok": true})
+}
+
+// deleteGroup POST /usage/groups/delete(仅超管):解散——成员回未分组,不删用户。
+func (m *Monitor) deleteGroup(c *gin.Context) {
+	var in struct {
+		ID int64 `json:"id"`
+	}
+	if err := c.ShouldBindJSON(&in); err != nil || in.ID <= 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "id required"})
+		return
+	}
+	err := m.storeDB.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Model(&TrackedUser{}).Where("group_id = ?", in.ID).Update("group_id", 0).Error; err != nil {
+			return err
+		}
+		return tx.Delete(&CustomerGroup{}, in.ID).Error
+	})
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"ok": true})
+}
+
+// setUserGroup POST /usage/users/group(仅超管):{user_id, group_id};group_id=0 为移出分组。
+func (m *Monitor) setUserGroup(c *gin.Context) {
+	var in struct {
+		UserID  int64 `json:"user_id"`
+		GroupID int64 `json:"group_id"`
+	}
+	if err := c.ShouldBindJSON(&in); err != nil || in.UserID <= 0 || in.GroupID < 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "user_id/group_id required"})
+		return
+	}
+	if in.GroupID > 0 {
+		var n int64
+		m.storeDB.Model(&CustomerGroup{}).Where("id = ?", in.GroupID).Count(&n)
+		if n == 0 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "分组不存在"})
+			return
+		}
+	}
+	res := m.storeDB.Model(&TrackedUser{}).Where("user_id = ?", in.UserID).Update("group_id", in.GroupID)
+	if res.Error != nil || res.RowsAffected == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "用户不在名单内"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
 
 // addTrackedUser POST /usage/users(仅超管):{input: 邮箱或用户ID} → 解析主站用户后入名单。
@@ -364,11 +543,20 @@ func (m *Monitor) addTrackedUser(c *gin.Context) {
 		return
 	}
 	var in struct {
-		Input string `json:"input"`
+		Input   string `json:"input"`
+		GroupID int64  `json:"group_id"` // 可选:添加同时归入分组;0=未分组
 	}
 	if err := c.ShouldBindJSON(&in); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
+	}
+	if in.GroupID > 0 {
+		var n int64
+		m.storeDB.Model(&CustomerGroup{}).Where("id = ?", in.GroupID).Count(&n)
+		if n == 0 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "所选分组不存在"})
+			return
+		}
 	}
 	// 名单上限是约束生产库 IN 扫描宽度的护栏:计数出错必须拒绝,不能当 0 放行
 	var count int64
@@ -386,7 +574,8 @@ func (m *Monitor) addTrackedUser(c *gin.Context) {
 		return
 	}
 	u.AddedAt = time.Now().Unix()
-	if err := m.storeDB.Save(u).Error; err != nil { // 主键=user_id,重复添加=幂等更新
+	u.GroupID = in.GroupID
+	if err := m.storeDB.Save(u).Error; err != nil { // 主键=user_id,重复添加=幂等更新(含改组)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
@@ -409,13 +598,13 @@ func (m *Monitor) deleteTrackedUser(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
 
-// trackedLabel 展示名:邮箱优先,缺则用户名,再缺回退 #id。
+// trackedLabel 展示名:用户名优先(需求:显示用户名),缺则邮箱,再缺回退 #id。
 func trackedLabel(u TrackedUser) string {
-	if u.Email != "" {
-		return u.Email
-	}
 	if u.Username != "" {
 		return u.Username
+	}
+	if u.Email != "" {
+		return u.Email
 	}
 	return "#" + strconv.FormatInt(u.UserID, 10)
 }
@@ -505,8 +694,10 @@ func (m *Monitor) serveUsageMatrix(c *gin.Context) {
 	for _, cell := range mx.Cells {
 		totals[cell.UserID] += cell.CostUSD
 	}
+	gm := m.groupNameMap()
 	for _, u := range tracked {
-		mu := UsageMatrixUser{UserID: u.UserID, Label: trackedLabel(u), TotalUSD: totals[u.UserID]}
+		mu := UsageMatrixUser{UserID: u.UserID, Username: u.Username, Email: u.Email,
+			GroupID: u.GroupID, GroupName: gm[u.GroupID], TotalUSD: totals[u.UserID]}
 		if b, ok := balances[u.UserID]; ok {
 			bv := b
 			mu.BalanceUSD = &bv
@@ -546,7 +737,8 @@ func (m *Monitor) serveUsageStats(c *gin.Context) {
 		inList[u.UserID] = true
 	}
 	ids := idsOf(tracked)
-	// 可选:只看名单内某一个用户(详情页即此路径)
+	isGroup := false
+	// 可选其一:user_id=单用户详情;group_id=公司详情(聚合整组成员,0=未分组成员)
 	if f := strings.TrimSpace(c.Query("user_id")); f != "" {
 		id, err := strconv.ParseInt(f, 10, 64)
 		if err != nil || !inList[id] {
@@ -554,6 +746,19 @@ func (m *Monitor) serveUsageStats(c *gin.Context) {
 			return
 		}
 		ids = []int64{id}
+	} else if g := strings.TrimSpace(c.Query("group_id")); g != "" {
+		gid, err := strconv.ParseInt(g, 10, 64)
+		if err != nil || gid < 0 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "group_id 不合法"})
+			return
+		}
+		isGroup = true
+		ids = ids[:0]
+		for _, u := range tracked {
+			if u.GroupID == gid {
+				ids = append(ids, u.UserID)
+			}
+		}
 	}
 	if len(ids) == 0 { // 名单为空:不查生产库,直接空结果
 		c.JSON(http.StatusOK, gin.H{"enabled": true, "stats": &UsageStats{}, "empty": true})
@@ -571,8 +776,28 @@ func (m *Monitor) serveUsageStats(c *gin.Context) {
 		return
 	}
 	resp := gin.H{"enabled": true, "stats": st}
-	if len(ids) == 1 { // 详情页:带上该用户的主站当前余额(实时取,null=已删/取不到)
+	if isGroup { // 公司详情:成员数 + 余额合计(一条 SUM,主键 IN)
+		resp["members"] = len(ids)
+		resp["balance_usd"] = m.sumBalanceUSD(c.Request.Context(), ids)
+	} else if len(ids) == 1 { // 单用户详情:个人余额(实时取,null=已删/取不到)
 		resp["balance_usd"] = m.userBalanceUSD(c.Request.Context(), ids[0])
 	}
 	c.JSON(http.StatusOK, resp)
+}
+
+// sumBalanceUSD 一组用户的主站余额合计(users.quota 求和折美元);空组/出错返回 nil。
+func (m *Monitor) sumBalanceUSD(ctx context.Context, ids []int64) *float64 {
+	if len(ids) == 0 {
+		return nil
+	}
+	cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	inSQL, args := usageIn("id", ids)
+	var quota int64
+	if err := m.prodDB.QueryRowContext(cctx, "SELECT COALESCE(SUM(quota),0) FROM users WHERE "+inSQL, args...).Scan(&quota); err != nil {
+		slog.Warn("查询分组余额合计失败", "err", err)
+		return nil
+	}
+	b := float64(quota) / quotaPerUSD
+	return &b
 }
