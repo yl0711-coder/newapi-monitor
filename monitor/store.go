@@ -170,8 +170,14 @@ func (m *Monitor) openStore(path string) error {
 	if err != nil {
 		return fmt.Errorf("打开本地采样库失败: %w", err)
 	}
+	// 栏目开关列是否已存在(迁移前探测):不存在=本次 AutoMigrate 会新建 → 老库存量配置行需补置 true,
+	// 保证从旧版本升级后报警行为不变。字段本身不带 gorm default(布尔 false 会被 default 顶掉,见 AlertConfig 注释)。
+	hadCategoryToggles := db.Migrator().HasColumn(&AlertConfig{}, "server_alerts_enabled")
 	if err := db.AutoMigrate(&MetricSample{}, &TokenSample{}, &HourSample{}, &ChannelSnap{}, &RejectionSample{}, &SelectablePair{}, &InfraSample{}, &AlertConfig{}, &AlertLog{}, &TrackedUser{}, &CustomerGroup{}, &FollowUpLog{}, &UsageSettings{}); err != nil {
 		return fmt.Errorf("表迁移失败: %w", err)
+	}
+	if !hadCategoryToggles {
+		db.Model(&AlertConfig{}).Where("id = 1").Updates(map[string]any{"model_alerts_enabled": true, "server_alerts_enabled": true})
 	}
 	m.storeDB = db
 	slog.Info("本地采样库就绪", "path", path)

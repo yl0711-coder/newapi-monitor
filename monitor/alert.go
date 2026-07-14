@@ -20,9 +20,11 @@ type AlertConfig struct {
 	SiteName string `json:"site_name"` // 站点显示名(默认取 new-api system_name,超管可改)
 
 	// 分类邮件开关:模型监控 / 服务端监控 两栏目各自独立(用户用量无邮件报警,不设开关)。
-	// 关=该栏目命中规则时【不发邮件】,页面「最近告警」仍记录;老库经 AutoMigrate 补列默认开,行为不变。
-	ModelAlertsEnabled  bool `gorm:"default:true" json:"model_alerts_enabled"`
-	ServerAlertsEnabled bool `gorm:"default:true" json:"server_alerts_enabled"`
+	// 关=该栏目命中规则时【不发邮件】,页面「最近告警」仍记录。
+	// ⚠️ 不能加 gorm:"default:true":布尔零值(false)会被 gorm 当"未设置"而不写列,被库默认 true 顶回——
+	// 曾导致"勾掉保存又自动勾上"的 bug。老库升级的默认开由 loadAlertConfig 的 migrated 判断兜底。
+	ModelAlertsEnabled  bool `json:"model_alerts_enabled"`
+	ServerAlertsEnabled bool `json:"server_alerts_enabled"`
 
 	// 发件 SMTP
 	SMTPHost     string `json:"smtp_host"`

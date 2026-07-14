@@ -129,3 +129,60 @@ func TestAlertCategoryGate(t *testing.T) {
 		t.Error("alertCategory 归类不对")
 	}
 }
+
+// 回归:栏目开关保存 false 必须真的持久化为 false(曾因 gorm default:true 把零值顶回 true——"勾掉保存又勾上")。
+func TestAlertCategoryTogglePersistsFalse(t *testing.T) {
+	m := &Monitor{cfg: Settings{SessionSecret: "test-secret"}, chNames: map[string]string{}}
+	if err := m.openStore(t.TempDir() + "/t.db"); err != nil {
+		t.Fatalf("openStore: %v", err)
+	}
+	c := defaultAlertConfig()
+	c.ServerAlertsEnabled = false // 勾掉服务端
+	c.ModelAlertsEnabled = true
+	if err := m.saveAlertConfig(c); err != nil {
+		t.Fatal(err)
+	}
+	got := m.loadAlertConfig()
+	if got.ServerAlertsEnabled {
+		t.Fatal("服务端开关保存 false 后被顶回 true(default 零值坑复发)")
+	}
+	if !got.ModelAlertsEnabled {
+		t.Fatal("模型开关应保持 true")
+	}
+	// 再保存一次全 false,同样要持久化
+	c.ModelAlertsEnabled = false
+	if err := m.saveAlertConfig(c); err != nil {
+		t.Fatal(err)
+	}
+	if got := m.loadAlertConfig(); got.ModelAlertsEnabled || got.ServerAlertsEnabled {
+		t.Fatalf("全关未持久化 = %+v", got)
+	}
+}
+
+// 回归:老库(无栏目开关列)升级后,存量配置行两开关自动补 true(行为不变),而非静默全关。
+func TestAlertCategoryToggleMigrationDefaultsOn(t *testing.T) {
+	dir := t.TempDir()
+	m1 := &Monitor{cfg: Settings{SessionSecret: "s"}, chNames: map[string]string{}}
+	if err := m1.openStore(dir + "/t.db"); err != nil {
+		t.Fatal(err)
+	}
+	// 模拟老库:存一行配置,然后删掉两列(仿佛旧版本建的库)
+	if err := m1.saveAlertConfig(defaultAlertConfig()); err != nil {
+		t.Fatal(err)
+	}
+	if err := m1.storeDB.Exec("ALTER TABLE alert_configs DROP COLUMN model_alerts_enabled").Error; err != nil {
+		t.Skipf("sqlite 不支持 DROP COLUMN: %v", err)
+	}
+	if err := m1.storeDB.Exec("ALTER TABLE alert_configs DROP COLUMN server_alerts_enabled").Error; err != nil {
+		t.Fatal(err)
+	}
+	// 用新代码重新打开(=升级):列新建 + 存量行补 true
+	m2 := &Monitor{cfg: Settings{SessionSecret: "s"}, chNames: map[string]string{}}
+	if err := m2.openStore(dir + "/t.db"); err != nil {
+		t.Fatal(err)
+	}
+	got := m2.loadAlertConfig()
+	if !got.ModelAlertsEnabled || !got.ServerAlertsEnabled {
+		t.Fatalf("老库升级后开关应默认开 = %+v", got)
+	}
+}
