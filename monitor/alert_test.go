@@ -94,3 +94,38 @@ func TestRecipientList(t *testing.T) {
 		t.Fatalf("应解析出 5 个收件人,实际 %d: %v", len(got), got)
 	}
 }
+
+// 验证三栏目邮件开关:关闭的栏目 fire 不发邮件但仍记「最近告警」;打开的栏目会尝试发送(无收件人→记 _FAILED)。
+func TestAlertCategoryGate(t *testing.T) {
+	m := &Monitor{cfg: Settings{SessionSecret: "test-secret"}, chNames: map[string]string{}}
+	if err := m.openStore(t.TempDir() + "/t.db"); err != nil {
+		t.Fatalf("openStore: %v", err)
+	}
+	now := time.Now().Unix()
+	c := defaultAlertConfig()
+	c.ServerAlertsEnabled = false // 关服务端栏目
+	c.ModelAlertsEnabled = true   // 开模型栏目(无收件人,发送会失败→_FAILED)
+
+	m.fire(c, "infra_db_mem", "DB-X", "数据库可用内存告急", "b", now)
+	m.fire(c, "error_rate", "ch1", "错误率超阈值", "b", now)
+
+	var logs []AlertLog
+	if err := m.storeDB.Order("id").Find(&logs).Error; err != nil {
+		t.Fatal(err)
+	}
+	if len(logs) != 2 {
+		t.Fatalf("应记 2 条告警,实际 %d: %+v", len(logs), logs)
+	}
+	// 服务端栏目关:kind 原样、注明未发邮件
+	if logs[0].Kind != "infra_db_mem" || !strings.Contains(logs[0].Detail, "未发邮件") {
+		t.Errorf("关栏目应静音入日志 = %+v", logs[0])
+	}
+	// 模型栏目开:走发送,无收件人失败 → kind_FAILED
+	if logs[1].Kind != "error_rate_FAILED" {
+		t.Errorf("开栏目应尝试发送(无收件人→_FAILED) = %+v", logs[1])
+	}
+	// 归类函数本身(仅 模型/服务端 两栏目)
+	if alertCategory("infra_probe_cert") != "server" || alertCategory("burn_fast") != "model" || alertCategory("sampler_down") != "model" {
+		t.Error("alertCategory 归类不对")
+	}
+}

@@ -313,14 +313,15 @@ func (m *Monitor) computeUsageStats(ctx context.Context, ids []int64, fromTs, to
 
 // UsageMatrixUser 矩阵列头(一个被盯用户)+ 区间合计。
 type UsageMatrixUser struct {
-	UserID     int64    `json:"user_id"`
-	Username   string   `json:"username"`
-	Email      string   `json:"email"`
-	GroupID    int64    `json:"group_id"`
-	GroupName  string   `json:"group_name"`
-	Note       string   `json:"note"`
-	TotalUSD   float64  `json:"total_usd"`
-	BalanceUSD *float64 `json:"balance_usd"` // 主站当前余额(users.quota 折美元);null=主站已删/取不到
+	UserID       int64    `json:"user_id"`
+	Username     string   `json:"username"`
+	Email        string   `json:"email"`
+	GroupID      int64    `json:"group_id"`
+	GroupName    string   `json:"group_name"`
+	Note         string   `json:"note"`
+	TotalUSD     float64  `json:"total_usd"`
+	BalanceUSD   *float64 `json:"balance_usd"`    // 主站当前余额(users.quota 折美元);null=主站已删/取不到
+	TotalUsedUSD *float64 `json:"total_used_usd"` // 主站累计总消耗(users.used_quota 折美元;终身值,不受90天窗口影响);null=已删/取不到
 }
 
 // UsageMatrixCell 稀疏格:某用户某天的消费(无消费的天不出格)。
@@ -331,7 +332,7 @@ type UsageMatrixCell struct {
 	CostUSD  float64 `json:"cost_usd"`
 }
 
-// UsageMatrix 列表页数据:days 连续日期(新→旧)+ 用户(按区间消费降序)+ 稀疏格。
+// UsageMatrix 列表页数据:days 连续日期(新→旧)+ 用户(按累计总消耗降序,稳定)+ 稀疏格。
 type UsageMatrix struct {
 	From  string            `json:"from"`
 	To    string            `json:"to"`
@@ -706,34 +707,37 @@ func trackedLabel(u TrackedUser) string {
 // 并顺路取回各用户【当前余额】(users.quota 折美元;实时值不落库)。主站已删的用户不在余额表 → 前端显示 —。
 // 名单存的是添加时的快照——主站改邮箱/账号易主后,矩阵会把今天的消费记在旧身份上;
 // 这里每次查询顺手校准,变化的顺手回写本地库(自愈缓存);失败则退回快照+空余额,绝不阻断统计。
-func (m *Monitor) refreshTrackedLabels(ctx context.Context, tracked []TrackedUser) ([]TrackedUser, map[int64]float64) {
+func (m *Monitor) refreshTrackedLabels(ctx context.Context, tracked []TrackedUser) ([]TrackedUser, map[int64]float64, map[int64]float64) {
 	balances := map[int64]float64{}
+	used := map[int64]float64{}
 	if len(tracked) == 0 {
-		return tracked, balances
+		return tracked, balances, used
 	}
 	cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	inSQL, args := usageIn("id", idsOf(tracked))
-	rows, err := m.prodDB.QueryContext(cctx, "SELECT id, COALESCE(username,''), COALESCE(email,''), COALESCE(quota,0) FROM users WHERE "+inSQL, args...)
+	// used_quota 与 quota 同表同行,SELECT 多取一列即得累计总消耗,无额外往返/扫描
+	rows, err := m.prodDB.QueryContext(cctx, "SELECT id, COALESCE(username,''), COALESCE(email,''), COALESCE(quota,0), COALESCE(used_quota,0) FROM users WHERE "+inSQL, args...)
 	if err != nil {
 		slog.Warn("刷新检测用户标签失败,沿用快照", "err", err)
-		return tracked, balances
+		return tracked, balances, used
 	}
 	defer rows.Close()
 	fresh := map[int64]TrackedUser{}
 	for rows.Next() {
 		var u TrackedUser
-		var quota int64
-		if err := rows.Scan(&u.UserID, &u.Username, &u.Email, &quota); err != nil {
+		var quota, usedQ int64
+		if err := rows.Scan(&u.UserID, &u.Username, &u.Email, &quota, &usedQ); err != nil {
 			slog.Warn("刷新检测用户标签失败,沿用快照", "err", err)
-			return tracked, map[int64]float64{}
+			return tracked, map[int64]float64{}, map[int64]float64{}
 		}
 		fresh[u.UserID] = u
 		balances[u.UserID] = float64(quota) / quotaPerUSD
+		used[u.UserID] = float64(usedQ) / quotaPerUSD
 	}
 	if err := rows.Err(); err != nil {
 		slog.Warn("刷新检测用户标签失败,沿用快照", "err", err)
-		return tracked, map[int64]float64{}
+		return tracked, map[int64]float64{}, map[int64]float64{}
 	}
 	for i, u := range tracked {
 		f, ok := fresh[u.UserID]
@@ -748,7 +752,7 @@ func (m *Monitor) refreshTrackedLabels(ctx context.Context, tracked []TrackedUse
 			}
 		}
 	}
-	return tracked, balances
+	return tracked, balances, used
 }
 
 func idsOf(tracked []TrackedUser) []int64 {
@@ -760,7 +764,7 @@ func idsOf(tracked []TrackedUser) []int64 {
 }
 
 // serveUsageMatrix GET /usage/matrix?from=&to=(管理员):列表页矩阵数据(前端渲染为 行=用户 × 列=日期)。
-// 用户 label 取邮箱(缺则用户名/#id)并按区间消费降序;零消费用户排最后仍保留。
+// 用户 label 取邮箱(缺则用户名/#id)并按【累计总消耗】降序(稳定,不随日期区间变);零消费用户仍保留。
 func (m *Monitor) serveUsageMatrix(c *gin.Context) {
 	if !m.Enabled() {
 		c.JSON(http.StatusOK, gin.H{"enabled": false})
@@ -776,7 +780,7 @@ func (m *Monitor) serveUsageMatrix(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	tracked, balances := m.refreshTrackedLabels(c.Request.Context(), tracked) // 身份标签校准到主站当前值 + 取当前余额
+	tracked, balances, usedTotals := m.refreshTrackedLabels(c.Request.Context(), tracked) // 身份标签校准 + 取当前余额与累计总消耗
 	mx, err := m.computeUsageMatrix(c.Request.Context(), idsOf(tracked), fromTs, toTs)
 	if err != nil {
 		slog.Warn("用户用量矩阵聚合失败", "err", err)
@@ -795,9 +799,27 @@ func (m *Monitor) serveUsageMatrix(c *gin.Context) {
 			bv := b
 			mu.BalanceUSD = &bv
 		}
+		if uq, ok := usedTotals[u.UserID]; ok {
+			uv := uq
+			mu.TotalUsedUSD = &uv
+		}
 		mx.Users = append(mx.Users, mu)
 	}
-	sort.SliceStable(mx.Users, func(i, j int) bool { return mx.Users[i].TotalUSD > mx.Users[j].TotalUSD })
+	// 排序按【累计总消耗】降序(终身值,与所选日期区间无关)——切换时间范围顺序不变,大客户恒在前;
+	// 同值(如都为0/已删)按用户名兜底,保证顺序完全稳定。
+	usedOf := func(u UsageMatrixUser) float64 {
+		if u.TotalUsedUSD != nil {
+			return *u.TotalUsedUSD
+		}
+		return 0
+	}
+	sort.SliceStable(mx.Users, func(i, j int) bool {
+		ui, uj := usedOf(mx.Users[i]), usedOf(mx.Users[j])
+		if ui != uj {
+			return ui > uj
+		}
+		return mx.Users[i].Username < mx.Users[j].Username
+	})
 	c.JSON(http.StatusOK, gin.H{"enabled": true, "matrix": mx, "empty": len(tracked) == 0})
 }
 
@@ -812,6 +834,19 @@ func (m *Monitor) userBalanceUSD(ctx context.Context, id int64) *float64 {
 	}
 	b := float64(quota) / quotaPerUSD
 	return &b
+}
+
+// userUsedUSD 取单个用户的主站累计总消耗(users.used_quota 折美元;终身值);查不到/出错返回 nil。
+func (m *Monitor) userUsedUSD(ctx context.Context, id int64) *float64 {
+	cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	var used int64
+	if err := m.prodDB.QueryRowContext(cctx, "SELECT COALESCE(used_quota,0) FROM users WHERE id = ?", id).Scan(&used); err != nil {
+		slog.Warn("查询用户累计消耗失败", "err", err, "user_id", id)
+		return nil
+	}
+	u := float64(used) / quotaPerUSD
+	return &u
 }
 
 // serveUsageStats GET /usage/stats?from=&to=&user_id=(管理员):对名单(或其中一人)做每日/分组/模型聚合。
@@ -869,11 +904,13 @@ func (m *Monitor) serveUsageStats(c *gin.Context) {
 		return
 	}
 	resp := gin.H{"enabled": true, "stats": st}
-	if isGroup { // 公司详情:成员数 + 余额合计(一条 SUM,主键 IN)
+	if isGroup { // 公司详情:成员数 + 余额合计 + 累计总消耗合计(主键 IN 的 SUM)
 		resp["members"] = len(ids)
 		resp["balance_usd"] = m.sumBalanceUSD(c.Request.Context(), ids)
-	} else if len(ids) == 1 { // 单用户详情:个人余额(实时取,null=已删/取不到)
+		resp["total_used_usd"] = m.sumUsedUSD(c.Request.Context(), ids)
+	} else if len(ids) == 1 { // 单用户详情:个人余额 + 累计总消耗(实时取,null=已删/取不到)
 		resp["balance_usd"] = m.userBalanceUSD(c.Request.Context(), ids[0])
+		resp["total_used_usd"] = m.userUsedUSD(c.Request.Context(), ids[0])
 	}
 	c.JSON(http.StatusOK, resp)
 }
@@ -893,4 +930,21 @@ func (m *Monitor) sumBalanceUSD(ctx context.Context, ids []int64) *float64 {
 	}
 	b := float64(quota) / quotaPerUSD
 	return &b
+}
+
+// sumUsedUSD 一组用户的主站累计总消耗合计(users.used_quota 求和折美元);空组/出错返回 nil。
+func (m *Monitor) sumUsedUSD(ctx context.Context, ids []int64) *float64 {
+	if len(ids) == 0 {
+		return nil
+	}
+	cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	inSQL, args := usageIn("id", ids)
+	var used int64
+	if err := m.prodDB.QueryRowContext(cctx, "SELECT COALESCE(SUM(used_quota),0) FROM users WHERE "+inSQL, args...).Scan(&used); err != nil {
+		slog.Warn("查询分组累计消耗合计失败", "err", err)
+		return nil
+	}
+	u := float64(used) / quotaPerUSD
+	return &u
 }

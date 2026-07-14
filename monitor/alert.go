@@ -19,6 +19,11 @@ type AlertConfig struct {
 	Enabled  bool   `json:"enabled"`
 	SiteName string `json:"site_name"` // 站点显示名(默认取 new-api system_name,超管可改)
 
+	// 分类邮件开关:模型监控 / 服务端监控 两栏目各自独立(用户用量无邮件报警,不设开关)。
+	// 关=该栏目命中规则时【不发邮件】,页面「最近告警」仍记录;老库经 AutoMigrate 补列默认开,行为不变。
+	ModelAlertsEnabled  bool `gorm:"default:true" json:"model_alerts_enabled"`
+	ServerAlertsEnabled bool `gorm:"default:true" json:"server_alerts_enabled"`
+
 	// 发件 SMTP
 	SMTPHost     string `json:"smtp_host"`
 	SMTPPort     int    `json:"smtp_port"`
@@ -61,6 +66,8 @@ func defaultAlertConfig() AlertConfig {
 	return AlertConfig{
 		ID:                  1,
 		Enabled:             false, // 配好 SMTP 前默认关闭,避免空发
+		ModelAlertsEnabled:  true,
+		ServerAlertsEnabled: true,
 		SMTPPort:            465,
 		SMTPSSL:             true,
 		EvalWindowMin:       15,
@@ -160,8 +167,10 @@ func sendMail(c AlertConfig, subject, body string) error {
 		mail.WithPassword(c.SMTPPassword),
 		mail.WithTimeout(15 * time.Second),
 	}
-	if c.SMTPSSL {
-		opts = append(opts, mail.WithSSL()) // 465 隐式 TLS
+	if c.SMTPSSL || c.SMTPPort == 465 {
+		// 465 一律隐式 TLS(与 new-api 行为一致:见 465 强制 TLS,不看开关)。
+		// 教训:2026-07 曾因"镜像主站没勾的 SSL 开关"在 465 上走 STARTTLS,对 Resend 干等超时。
+		opts = append(opts, mail.WithSSL())
 	} else {
 		opts = append(opts, mail.WithTLSPolicy(mail.TLSMandatory)) // 587 STARTTLS
 	}
@@ -229,8 +238,28 @@ func (m *Monitor) evaluateAlerts(nowUnix int64) {
 	}
 }
 
+// alertCategory 按 kind 归两栏目:infra_*=服务端,其余(error_*/anomaly_*/sampler_down/burn_*)=模型。
+func alertCategory(kind string) string {
+	if strings.HasPrefix(kind, "infra_") {
+		return "server"
+	}
+	return "model"
+}
+
+// categoryEmailEnabled 该 kind 所属栏目的邮件开关是否打开。
+func categoryEmailEnabled(c AlertConfig, kind string) bool {
+	if alertCategory(kind) == "server" {
+		return c.ServerAlertsEnabled
+	}
+	return c.ModelAlertsEnabled
+}
+
 func (m *Monitor) fire(c AlertConfig, kind, target, subject, body string, now int64) {
 	if m.inCooldown(kind, target, c.CooldownMin, now) {
+		return
+	}
+	if !categoryEmailEnabled(c, kind) { // 栏目邮件开关关:不发邮件,仍记入「最近告警」供页面查看
+		m.logAlert(kind, target, subject+"(未发邮件:该栏目报警邮件已关闭)", now)
 		return
 	}
 	if err := sendMail(c, "[new-api监控] "+subject, body); err != nil {

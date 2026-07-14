@@ -56,6 +56,10 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
 <div class="card">
   <h2>总开关</h2>
   <label class="ck"><input type="checkbox" id="enabled"> 启用报警(关闭时只看看板、不发邮件)</label>
+  <h2 style="margin-top:18px">报警栏目开关</h2>
+  <p class="muted" style="margin:-6px 0 10px">两栏目独立控制。关闭的栏目命中规则时<b>不发邮件</b>,但页面「最近告警」仍会记录,不会漏看。</p>
+  <label class="ck"><input type="checkbox" id="model_alerts_enabled"> 📈 模型监控 <span class="muted">· 错误率 / 错误爆发 / 异常爆发 / 采样器掉线 / SLO 燃烧</span></label><br>
+  <label class="ck" style="margin-top:6px;display:inline-block"><input type="checkbox" id="server_alerts_enabled"> 🖥 服务端监控 <span class="muted">· 实例 / 数据库内存与存储 / 负载均衡 / 站点探活 / 证书 / 源站锁</span></label>
 </div>
 
 <div class="card">
@@ -126,7 +130,7 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
 <script>
 const $=id=>document.getElementById(id);
 const numFields=['smtp_port','eval_window_min','err_rate_pct','err_min_count','err_burst_count','anomaly_burst_buckets','anomaly_min_count','cooldown_min','slo_target_pct','slo_window_days','burn_fast_rate','burn_fast_window_min','burn_slow_rate','burn_slow_window_min'];
-const ckFields=['enabled','smtp_ssl','sampler_down_enabled','slo_enabled','burn_fast_enabled','burn_slow_enabled','reject_panel_enabled'];
+const ckFields=['enabled','model_alerts_enabled','server_alerts_enabled','smtp_ssl','sampler_down_enabled','slo_enabled','burn_fast_enabled','burn_slow_enabled','reject_panel_enabled'];
 const txtFields=['site_name','smtp_host','smtp_user','smtp_password','smtp_from','recipients'];
 
 function fill(cfg, pwSet){

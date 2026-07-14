@@ -84,7 +84,7 @@ func newFakeProdDB(t *testing.T) *sql.DB {
 	}
 	t.Cleanup(func() { db.Close() })
 	stmts := []string{
-		"CREATE TABLE users (id INTEGER PRIMARY KEY, username TEXT, email TEXT, quota INTEGER)",
+		"CREATE TABLE users (id INTEGER PRIMARY KEY, username TEXT, email TEXT, quota INTEGER, used_quota INTEGER)",
 		"CREATE TABLE logs (id INTEGER PRIMARY KEY, user_id INTEGER, created_at INTEGER, type INTEGER, model_name TEXT, quota INTEGER, prompt_tokens INTEGER, completion_tokens INTEGER, `group` TEXT)",
 	}
 	for _, s := range stmts {
@@ -297,8 +297,8 @@ func TestRefreshTrackedLabels(t *testing.T) {
 	m := newTestMonitor(t)
 	m.prodDB = newFakeProdDB(t)
 	seed := []string{
-		"INSERT INTO users (id,username,email,quota) VALUES (1,'alice','new-alice@b.com',1000000)", // 主站已改邮箱;余额 $2
-		"INSERT INTO users (id,username,email,quota) VALUES (2,'bob','bob@x.com',250000)",          // 未变;余额 $0.5
+		"INSERT INTO users (id,username,email,quota,used_quota) VALUES (1,'alice','new-alice@b.com',1000000,1500000)", // 主站已改邮箱;余额 $2、累计消耗 $3
+		"INSERT INTO users (id,username,email,quota,used_quota) VALUES (2,'bob','bob@x.com',250000,0)",                // 未变;余额 $0.5、累计消耗 $0
 	}
 	for _, s := range seed {
 		if _, err := m.prodDB.Exec(s); err != nil {
@@ -316,7 +316,7 @@ func TestRefreshTrackedLabels(t *testing.T) {
 			t.Fatalf("save tracked: %v", err)
 		}
 	}
-	out, balances := m.refreshTrackedLabels(context.Background(), tracked)
+	out, balances, used := m.refreshTrackedLabels(context.Background(), tracked)
 	if out[0].Email != "new-alice@b.com" {
 		t.Fatalf("过期快照应被刷新 = %+v", out[0])
 	}
@@ -329,6 +329,13 @@ func TestRefreshTrackedLabels(t *testing.T) {
 	}
 	if _, ok := balances[9]; ok {
 		t.Fatal("已删用户不应有余额")
+	}
+	// 累计总消耗顺路取回:alice $3、bob $0;已删用户(9)不在表中 → 前端显 —
+	if used[1] != 3 || used[2] != 0 {
+		t.Fatalf("累计总消耗 = %+v", used)
+	}
+	if _, ok := used[9]; ok {
+		t.Fatal("已删用户不应有累计消耗")
 	}
 	// 刷新应回写本地库(自愈缓存)
 	var persisted TrackedUser
@@ -352,7 +359,7 @@ func TestUserNotePreservedOnLabelRefresh(t *testing.T) {
 	if err := m.storeDB.Save(&u).Error; err != nil {
 		t.Fatalf("save: %v", err)
 	}
-	out, _ := m.refreshTrackedLabels(context.Background(), []TrackedUser{u})
+	out, _, _ := m.refreshTrackedLabels(context.Background(), []TrackedUser{u})
 	if out[0].Email != "new@b.com" || out[0].Note != "合同7月到期" {
 		t.Fatalf("邮箱应刷新且备注应保留 = %+v", out[0])
 	}

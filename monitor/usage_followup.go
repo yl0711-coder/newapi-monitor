@@ -32,6 +32,7 @@ type FollowUpMember struct {
 	Reasons      []string `json:"reasons"`
 	Actions      []string `json:"actions"`
 	Urgency      int      `json:"urgency"`
+	Level        string   `json:"level"`          // 分级:urgent=紧急(30天内有消费的客户出状况) / info=长期沉默(30天全无消费)
 	LastFollowUp int64    `json:"last_follow_up"` // 该用户上次跟进时间
 }
 
@@ -67,7 +68,7 @@ func (m *Monitor) computeFollowUps(ctx context.Context, nowUnix int64) ([]Follow
 	}
 
 	allIDs := idsOf(tracked)
-	tracked, balances := m.refreshTrackedLabels(ctx, tracked)
+	tracked, balances, _ := m.refreshTrackedLabels(ctx, tracked) // 跟进判断不用累计总消耗,忽略第三返回
 
 	// 固定 30 天窗口(不受页面显示范围影响),按 CST 切日
 	toTs := followUpDayStart(nowUnix+usageTZOffsetSec) + 86400
@@ -183,6 +184,12 @@ func (m *Monitor) computeFollowUps(ctx context.Context, nowUnix int64) ([]Follow
 		}
 		if len(mem.Reasons) > 0 {
 			mem.Urgency += int(spend30)
+			// 分级:30天内有过消费的客户出状况=紧急(该马上催);30天全无消费=长期沉默(低优先级,页面折叠、不进红徽章)
+			if spend30 > 0 {
+				mem.Level = "urgent"
+			} else {
+				mem.Level = "info"
+			}
 			b := getBucket(u.GroupID)
 			b.members = append(b.members, mem)
 			b.comp.Spend30USD += spend30

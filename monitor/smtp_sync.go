@@ -89,7 +89,7 @@ func (m *Monitor) syncSMTPFromMainSite() (AlertConfig, error) {
 	c.SMTPPort = s.port
 	c.SMTPUser = s.user
 	c.SMTPFrom = s.from
-	c.SMTPSSL = s.ssl // 与主站显式 SMTPSSLEnabled 一致(未设置则按端口兜底)
+	c.SMTPSSL = s.ssl || s.port == 465 // 465 一律隐式 TLS(new-api 见 465 也强制 TLS、不看它自己的开关,镜像其真实行为而非存的标志)
 	if s.pass != "" {
 		c.SMTPPassword = s.pass
 	}
