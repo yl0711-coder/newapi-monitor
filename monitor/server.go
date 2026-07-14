@@ -109,7 +109,8 @@ func (m *Monitor) RegisterRoutes(r *gin.Engine) {
 		rootUsage.POST("/groups", m.createGroup)         // 客户分组:新建
 		rootUsage.POST("/groups/update", m.updateGroup)  // 客户分组:编辑
 		rootUsage.POST("/groups/delete", m.deleteGroup)  // 客户分组:解散(成员回未分组)
-		rootUsage.POST("/groups/stage", m.setGroupStage) // 客户分组:改状态(试用/正式/已流失+到期)
+		rootUsage.POST("/groups/stage", m.setGroupStage)   // 客户分组:改状态(试用/正式/已流失+到期)
+		rootUsage.POST("/groups/portal", m.setGroupPortal) // 客户分组:客户端账号(开通/更新/重置/关闭)
 		rootUsage.POST("/followups/log", m.addFollowLog) // 跟进记录:追加
 		rootUsage.POST("/settings", m.saveUsageSettings) // 跟进阈值:保存
 	}

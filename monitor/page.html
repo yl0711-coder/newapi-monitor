@@ -24,6 +24,7 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
   h1{font-size:21px;font-weight:600;margin-bottom:4px}
   h1 small{font-size:13px;color:var(--text-muted);font-weight:400;margin-left:8px}
   .num{font-variant-numeric:tabular-nums}.muted{color:var(--text-muted)}
+  .maskkey{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;color:var(--text-muted);background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:2px 8px;user-select:none}
   td.right,th.right{text-align:right}
 
   .toolbar{display:flex;align-items:center;gap:14px;flex-wrap:wrap;margin:18px 0}
@@ -454,6 +455,7 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
     </div>
     <div class="card"><div class="card-header">按分组</div><table><thead id="thUsageGrp"></thead><tbody id="tbUsageGrp"></tbody></table></div>
     <div class="card"><div class="card-header">按模型</div><table><thead id="thUsageModel"></thead><tbody id="tbUsageModel"></tbody></table></div>
+    <div class="card" id="usageTokCard"><div class="card-header">按令牌 <span class="muted" style="font-weight:400;font-size:12px">· 该用户各令牌用量,密钥已脱敏</span></div><table><thead id="thUsageTok"></thead><tbody id="tbUsageTok"></tbody></table></div>
   </div>
 </div>
 
@@ -1297,14 +1299,63 @@ function renderGroupsManage(){
   grpMgmtPage=gp.page; const pageRows=gp.rows;
   if(!rows.length){e.innerHTML=`<tr><td colspan="7" class="muted" style="text-align:center;padding:18px">${grpMgmtQuery?'没有匹配的分组':'还没有分组——把同一家公司的用户归到一组,方便看整组消耗和跟进'}</td></tr>`;return}
   e.innerHTML=pageRows.map(g=>`<tr id="grpRow${g.id}">
-    <td><b>${esc(g.name)}</b></td>
+    <td><b>${esc(g.name)}</b>${g.portal_set?` <span title="已开通客户账号:${esc(g.portal_email)}">📧</span>`:''}</td>
     <td>${grpStageCell(g)}</td>
     <td class="muted">${esc(g.note||'—')}</td>
     <td class="right num">${fmtNum(g.members)}</td>
     <td class="right num">${usedMap?fmtCost(usedMap[g.id]||0):'<span class="muted">—</span>'}</td>
     <td class="right num">${spend?fmtCost(spend[g.id]||0):'<span class="muted">—</span>'}</td>
-    <td class="right">${IS_ROOT?`<a href="javascript:void 0" style="color:var(--accent);margin-right:12px" onclick="usageGrpEdit(${g.id})">编辑</a><a href="javascript:void 0" class="danger-link" onclick="usageGrpDissolve(${g.id})">解散</a>`:''}</td>
+    <td class="right" style="white-space:nowrap">${IS_ROOT?`<a href="javascript:void 0" style="color:var(--accent);margin-right:12px" onclick="grpPortalEdit(${g.id})">客户账号</a><a href="javascript:void 0" style="color:var(--accent);margin-right:12px" onclick="usageGrpEdit(${g.id})">编辑</a><a href="javascript:void 0" class="danger-link" onclick="usageGrpDissolve(${g.id})">解散</a>`:''}</td>
   </tr>`).join('');
+}
+// ---- 分组客户账号(客户端登录):行下内联编辑器 ----
+function grpPortalEdit(id){
+  const old=document.getElementById('grpPortalRow'+id);
+  if(old){old.remove();return} // 再点=收起
+  const g=usageGroups.find(x=>x.id===id); if(!g)return;
+  const row=document.getElementById('grpRow'+id); if(!row)return;
+  const tr=document.createElement('tr');
+  tr.id='grpPortalRow'+id;
+  tr.innerHTML=`<td colspan="7" style="background:rgba(99,102,241,.05);padding:12px 16px">
+    <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;font-size:13px">
+      <b>客户账号</b><span class="muted">· 客户用它登录独立报表页,只能看本组数据;双密码并存(我方配置的始终有效,客户可自改)</span>
+    </div>
+    <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:10px">
+      <input class="uinput" id="gp-email-${id}" placeholder="登录账号(用户名/邮箱均可)" value="${esc(g.portal_email||'')}" style="width:220px;padding:6px 10px;font-size:13px">
+      <input class="uinput" id="gp-pw-${id}" type="text" placeholder="${g.portal_set?'密码(留空=不改)':'设置密码(至少8位)'}" autocomplete="off" style="width:200px;padding:6px 10px;font-size:13px">
+      <button class="btn" onclick="grpPortalSave(${id})">${g.portal_set?'保存':'开通'}</button>
+      ${g.portal_set?`<a href="javascript:void 0" style="color:var(--accent)" onclick="grpPortalResetUserPw(${id})" title="客户忘了自改密码时用;我方配置密码不受影响">重置客户自改密码</a>`:''}
+      ${g.portal_set?`<a href="javascript:void 0" class="danger-link" onclick="grpPortalClear(${id})">关闭账号</a>`:''}
+      <span class="muted" id="gp-msg-${id}" style="font-size:12px">${g.portal_user_pw_set?'· 客户已自改过密码':''}</span>
+    </div>
+  </td>`;
+  row.after(tr);
+  document.getElementById('gp-email-'+id).focus();
+}
+async function grpPortalPost(id,body,okMsg){
+  const msg=document.getElementById('gp-msg-'+id);
+  try{
+    const res=await fetch('/usage/groups/portal',{method:'POST',headers:usagePostHeaders,body:JSON.stringify(Object.assign({id},body))});
+    const d=await res.json().catch(()=>({}));
+    if(!res.ok||!d.ok){if(msg)msg.textContent='✗ '+(d.error||'操作失败');return false}
+    if(msg)msg.textContent='✓ '+okMsg;
+    await usageLoadUsers();
+    return true;
+  }catch(e){if(msg)msg.textContent='✗ 网络错误';return false}
+}
+async function grpPortalSave(id){
+  const email=document.getElementById('gp-email-'+id).value.trim();
+  const pw=document.getElementById('gp-pw-'+id).value;
+  await grpPortalPost(id,{email,password:pw},'已保存;把邮箱和密码告知客户即可登录');
+}
+async function grpPortalResetUserPw(id){
+  const g=usageGroups.find(x=>x.id===id);
+  if(!confirm('重置后客户自改的密码失效,我方配置的密码不受影响。继续?'))return;
+  await grpPortalPost(id,{email:(g&&g.portal_email)||'',reset_user_pw:true},'已重置客户自改密码');
+}
+async function grpPortalClear(id){
+  if(!confirm('关闭后客户将无法登录报表页(数据不受影响,可随时重新开通)。继续?'))return;
+  await grpPortalPost(id,{clear:true},'已关闭客户账号');
 }
 async function usageGrpCreate(){
   const name=document.getElementById('grpName'),note=document.getElementById('grpNote'),msg=document.getElementById('grpMsg');
@@ -1749,7 +1800,7 @@ async function usageLoadDetail(){
     if(!res.ok){eb.innerHTML='<div class="alert">'+esc(d.error||('查询失败 '+res.status))+'</div>';return}
     if(d.enabled===false){eb.innerHTML='<div class="alert">未连接主站数据库(NEWAPI_LOG_DSN),用户用量不可用。</div>';return}
     eb.innerHTML='';
-    renderUsage(d.stats||{},d.balance_usd,d.members,d.total_used_usd);
+    renderUsage(d.stats||{},d.balance_usd,d.members,d.total_used_usd,d.by_token);
   }catch(e){if(seq===usageSeq)eb.innerHTML='<div class="alert">加载失败:'+esc(e.message)+'</div>'}
 }
 const USAGE_DIM_HEAD=`<tr><th>名称</th><th class="right">请求</th><th class="right">Tokens</th><th class="right">费用</th></tr>`;
@@ -1759,7 +1810,21 @@ function renderUsageDim(th,tb,rows){
   if(!rows||!rows.length){e.innerHTML='<tr><td colspan="4" class="muted" style="text-align:center;padding:18px">范围内无数据</td></tr>';return}
   e.innerHTML=rows.map(r=>`<tr><td>${esc(r.key||'—')}</td><td class="right num">${fmtNum(r.requests)}</td><td class="right num">${fmtNum(r.tokens)}</td><td class="right num">${fmtCost(r.cost_usd)}</td></tr>`).join('');
 }
-function renderUsage(st,balanceUSD,members,totalUsedUSD){
+// 按令牌:密钥脱敏(服务端已打码,前端不接触明文),仅单用户详情显示,公司详情隐藏。
+function renderUsageTokens(rows){
+  const card=document.getElementById('usageTokCard');
+  if(rows===undefined){card.hidden=true;return} // 公司详情:无此维度
+  card.hidden=false;
+  document.getElementById('thUsageTok').innerHTML='<tr><th>所属用户</th><th>令牌名称</th><th>密钥</th><th>分组</th><th class="right">请求</th><th class="right">Tokens</th><th class="right">费用</th></tr>';
+  const e=document.getElementById('tbUsageTok');
+  if(!rows||!rows.length){e.innerHTML='<tr><td colspan="7" class="muted" style="text-align:center;padding:18px">范围内无令牌用量</td></tr>';return}
+  e.innerHTML=rows.map(r=>{
+    const mk=r.masked_key?`<span class="maskkey">${esc(r.masked_key)}</span>`:'<span class="muted">—</span>';
+    const grp=r.group?esc(r.group):'<span class="muted">默认</span>';
+    return `<tr><td>${esc(r.owner||'—')}</td><td>${esc(r.name||'(未命名)')}</td><td>${mk}</td><td>${grp}</td><td class="right num">${fmtNum(r.requests)}</td><td class="right num">${fmtNum(r.tokens)}</td><td class="right num">${fmtCost(r.cost_usd)}</td></tr>`;
+  }).join('');
+}
+function renderUsage(st,balanceUSD,members,totalUsedUSD,byToken){
   document.getElementById('usageRangeNote').textContent=st.from?('统计范围 '+st.from+' ~ '+st.to+'(CST)'):'';
   const s=st.summary||{};
   const cards=[
@@ -1797,6 +1862,7 @@ function renderUsage(st,balanceUSD,members,totalUsedUSD){
   setTimeout(()=>usageDailyChart.resize(),60);
   renderUsageDim('thUsageGrp','tbUsageGrp',st.by_group);
   renderUsageDim('thUsageModel','tbUsageModel',st.by_model);
+  renderUsageTokens(byToken);
 }
 document.querySelectorAll('.tabs .tab').forEach(t=>t.addEventListener('click',()=>switchTab(t.dataset.tab)));
 document.getElementById('infraRefresh').addEventListener('click',loadInfra);

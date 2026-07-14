@@ -1,0 +1,327 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>用量报表</title>
+<script src="/echarts.js"></script>
+<style>
+  :root{
+    --bg:#e6e9f0;          /* 页面浅灰(压深,减对比) */
+    --surface:#f7f8fb;      /* 卡片:柔白,非纯白,不晃眼 */
+    --panel:#eef1f6;        /* 冻结列/表头 浅灰 */
+    --border:#e0e4ec;       /* 更淡描边 */
+    --text:#2b3340;         /* 深字(略柔) */
+    --muted:#6d7684;
+    --muted2:#9aa2b0;
+    --amber:#a4620a;        /* 消耗:柔白底可读的琥珀棕金 */
+    --green:#0c8557;        /* 余额:柔和绿 */
+    --accent:#5257e0;       /* 品牌靛蓝(略柔) */
+    --red:#d33a3a;
+    --th-bg:#edf0f5;
+    --heat:245,158,11;      /* 热力基色(橙) */
+  }
+  *{box-sizing:border-box}
+  body{background:var(--bg);color:var(--text);font-family:-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;margin:0;padding:24px 28px;font-size:14px;line-height:1.5}
+  .num{font-variant-numeric:tabular-nums}.muted{color:var(--muted)}.right{text-align:right}
+  header{display:flex;align-items:center;gap:12px;margin-bottom:18px}
+  header h1{font-size:19px;margin:0}
+  header .co{color:var(--muted);font-size:14px}
+  header .sp{margin-left:auto;display:flex;gap:16px;font-size:13px}
+  header a{color:var(--accent);text-decoration:none;cursor:pointer}
+  .seg{display:inline-flex;border:1px solid var(--border);border-radius:8px;overflow:hidden}
+  .seg a{padding:7px 14px;font-size:13px;color:var(--muted);border-right:1px solid var(--border);cursor:pointer;text-decoration:none}
+  .seg a.active{background:var(--accent);color:#fff}.seg a:last-child{border-right:none}
+  .rangenote{color:var(--muted);font-size:12px;margin:10px 0 16px}
+  .stat{display:flex;gap:28px;align-items:flex-end;margin:16px 2px 18px;flex-wrap:wrap}
+  .stat .s{display:flex;flex-direction:column;gap:4px}
+  .stat .sl{font-size:12px;color:var(--muted)}
+  .stat .sv{font-size:19px;line-height:30px;font-weight:700;color:var(--text);font-variant-numeric:tabular-nums}
+  .stat .sv.amber{color:var(--amber);font-size:26px}
+  .stat .sv.green{color:var(--green)}
+  .stat .div{width:1px;align-self:stretch;background:var(--border);margin:3px 0}
+  .card{background:var(--surface);border:1px solid var(--border);border-radius:12px;overflow:hidden;margin-bottom:16px;box-shadow:0 1px 2px rgba(30,42,70,.04)}
+  .card-header{padding:14px 16px;border-bottom:1px solid var(--border);font-weight:600;font-size:15px;display:flex;align-items:center;gap:10px}
+  .card-header .sub{font-weight:400;color:var(--muted);font-size:12px}
+  .mx-search{margin-left:auto;background:#fdfdff;border:1px solid var(--border);border-radius:8px;color:var(--text);padding:7px 11px;font-size:13px;width:230px;font-weight:400}
+  .mx-search:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px rgba(79,70,229,.12)}
+  .pager{display:flex;align-items:center;justify-content:flex-end;gap:12px;padding:12px 4px 2px}
+  .pg-btn{background:var(--surface);border:1px solid var(--border);border-radius:7px;color:var(--text);padding:6px 14px;font-size:13px;cursor:pointer}
+  .pg-btn:hover:not(:disabled){border-color:var(--accent);color:var(--accent)}
+  .pg-btn:disabled{opacity:.45;cursor:default}
+  .pg-info{color:var(--muted);font-size:12px}
+  /* 脱敏密钥:不可选中/复制 */
+  .maskkey{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;color:var(--muted);background:var(--panel);border:1px solid var(--border);border-radius:6px;padding:2px 8px;user-select:none;-webkit-user-select:none;-moz-user-select:none;pointer-events:none}
+  table{width:100%;border-collapse:collapse}
+  th{padding:10px 12px;text-align:left;font-size:12px;color:var(--muted);font-weight:600;background:var(--th-bg);white-space:nowrap}
+  td{padding:8px 12px;font-size:14px;border-top:1px solid var(--border);white-space:nowrap}
+  th.right,td.right{text-align:right}
+  /* 矩阵:成员/余额/累计 锁左,范围锁右 */
+  .mxwrap{max-height:70vh;overflow:auto;position:relative}
+  .mxwrap table{border-collapse:separate;border-spacing:0;min-width:560px;width:100%}
+  .mxwrap thead th{position:sticky;top:0;background:var(--th-bg);z-index:3}
+  .mxwrap td:first-child,.mxwrap th:first-child{position:sticky;left:0;background:var(--panel);z-index:2;width:150px;min-width:150px;max-width:150px}
+  .mxwrap td:nth-child(2),.mxwrap th:nth-child(2){position:sticky;left:150px;background:var(--panel);z-index:2;width:80px;min-width:80px;max-width:80px}
+  .mxwrap td:nth-child(3),.mxwrap th:nth-child(3){position:sticky;left:230px;background:var(--panel);z-index:2;width:118px;min-width:118px;max-width:118px;box-shadow:6px 0 8px -6px rgba(20,30,50,.16)}
+  .mxwrap thead th:first-child,.mxwrap thead th:nth-child(2),.mxwrap thead th:nth-child(3){z-index:4;background:var(--panel)}
+  .mxwrap td:last-child,.mxwrap th:last-child{position:sticky;right:0;background:var(--panel);z-index:2;box-shadow:-6px 0 8px -6px rgba(20,30,50,.16);min-width:88px}
+  .mxwrap thead th:last-child{z-index:4}
+  .mxwrap thead th:not(:first-child):not(:last-child),.mxwrap tbody td:not(:first-child):not(:last-child){min-width:72px}
+  .mxwrap tbody tr.mxfoot td{position:sticky;bottom:0;background:var(--panel);z-index:3;border-top:2px solid var(--border);font-weight:700}
+  .mxwrap tbody td .dash{color:#c4ccd8}
+  .ucell{color:var(--accent);cursor:pointer;text-decoration:none;line-height:1.25;display:block}
+  .ucell .u-name{display:block;max-width:126px;overflow:hidden;text-overflow:ellipsis}
+  .ucell .u-mail{display:block;font-size:11px;color:var(--muted)}
+  /* 明细区 */
+  #detail{display:none}
+  .backlink{color:var(--accent);cursor:pointer;font-size:13px;text-decoration:none}
+  .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px;margin:14px 0}
+  .stat-card{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:15px 16px}
+  .stat-label{font-size:12px;color:var(--muted)}
+  .stat-value{font-size:23px;font-weight:700;margin-top:7px;font-variant-numeric:tabular-nums}
+  #dailyChart{height:280px;padding:8px 6px}
+  /* 改密码弹窗 */
+  .modal-mask{position:fixed;inset:0;background:rgba(20,30,50,.4);display:none;align-items:center;justify-content:center;z-index:50}
+  .modal{background:var(--surface);border:1px solid var(--border);border-radius:14px;padding:26px 28px;width:340px}
+  .modal h3{margin:0 0 14px;font-size:16px}
+  .modal label{display:block;font-size:12px;color:var(--muted);margin:12px 0 5px}
+  .modal input{width:100%;background:var(--bg);border:1px solid var(--border);border-radius:8px;color:var(--text);padding:9px 12px;font-size:14px}
+  .modal .row{display:flex;gap:10px;margin-top:20px;justify-content:flex-end}
+  .btn{border:1px solid var(--border);border-radius:8px;padding:8px 16px;font-size:13px;cursor:pointer;background:transparent;color:var(--text)}
+  .btn.p{background:var(--accent);border-color:var(--accent);color:#fff}
+  .msg{font-size:13px;margin-top:10px;min-height:16px}
+  .msg.ok{color:var(--green)}.msg.err{color:var(--red)}
+</style>
+</head>
+<body>
+<header>
+  <h1>📊 用量报表</h1><span class="co" id="coName"></span>
+  <span class="sp"><a id="pwLink">修改密码</a><a href="/logout">退出</a></span>
+</header>
+
+<div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+  <div class="seg" id="seg">
+    <a data-r="today">今天</a><a data-r="7d" class="active">近7天</a><a data-r="30d">近30天</a><a data-r="90d">近90天</a>
+  </div>
+  <span class="rangenote" id="rangeNote" style="margin:0"></span>
+</div>
+
+<div class="stat" id="statBar"></div>
+
+<!-- 列表视图:矩阵 + 组织级按分组/按模型 -->
+<div id="listView">
+  <div class="card" id="mxCard">
+    <div class="card-header">每日用量 <span class="sub">· 行=成员,列=日期,格=当日消耗(美元)· 点成员看明细</span>
+      <input id="mxSearch" class="mx-search" placeholder="搜索成员(用户名/邮箱)" autocomplete="off"></div>
+    <div class="mxwrap"><table><thead id="thMx"></thead><tbody id="tbMx"></tbody></table></div>
+    <div id="mxPager" class="pager"></div>
+  </div>
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px" id="bdGrid">
+    <div class="card"><div class="card-header">按分组 <span class="sub">· 范围内本组整体用量</span></div><table><thead id="thBdGroup"></thead><tbody id="tbBdGroup"></tbody></table></div>
+    <div class="card"><div class="card-header">按模型 <span class="sub">· 范围内本组整体用量</span></div><table><thead id="thBdModel"></thead><tbody id="tbBdModel"></tbody></table></div>
+  </div>
+</div>
+
+<!-- 成员明细 -->
+<div id="detail">
+  <div style="margin:2px 0 12px"><a class="backlink" id="backLink">← 返回列表</a>　<b id="dTitle"></b></div>
+  <div class="cards" id="dCards"></div>
+  <div class="card"><div class="card-header">每日消耗</div><div id="dailyChart"></div></div>
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">
+    <div class="card"><div class="card-header">按分组</div><table><thead id="thBdGroupD"></thead><tbody id="tbBdGroupD"></tbody></table></div>
+    <div class="card"><div class="card-header">按模型</div><table><thead id="thModel"></thead><tbody id="tbModel"></tbody></table></div>
+  </div>
+  <div class="card"><div class="card-header">按令牌 <span class="sub">· 该成员各令牌用量;密钥已脱敏</span></div><table><thead id="thTok"></thead><tbody id="tbTok"></tbody></table></div>
+</div>
+
+<!-- 改密码 -->
+<div class="modal-mask" id="pwMask">
+  <div class="modal">
+    <h3>修改密码</h3>
+    <label>当前密码</label><input type="password" id="pwOld" autocomplete="current-password">
+    <label>新密码(至少 8 位)</label><input type="password" id="pwNew" autocomplete="new-password">
+    <label>确认新密码</label><input type="password" id="pwNew2" autocomplete="new-password">
+    <div class="msg" id="pwMsg"></div>
+    <div class="row"><button class="btn" id="pwCancel">取消</button><button class="btn p" id="pwSave">保存</button></div>
+  </div>
+</div>
+
+<script>
+const $=id=>document.getElementById(id);
+const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const fmtCost=v=>{v=+v||0;return '$'+(v>=0.01||v===0?v.toFixed(2):v.toFixed(4))};
+const fmtCell=v=>v>=0.005?'$'+v.toFixed(2):(v>0?'<$0.01':'$0.00');
+let range='7d',ov=null,detailUid=null;
+
+function rangeDates(r){ // 以本地日期为准(东八区客户),与服务端 CST 切日一致
+  const d=new Date(),p=n=>String(n).padStart(2,'0');
+  const ymd=t=>t.getFullYear()+'-'+p(t.getMonth()+1)+'-'+p(t.getDate());
+  const days=r==='today'?0:(r==='7d'?6:(r==='30d'?29:89));
+  const from=new Date(d);from.setDate(d.getDate()-days);
+  return {from:ymd(from),to:ymd(d)};
+}
+async function api(url){
+  const r=await fetch(url,{headers:{'Accept':'application/json'}});
+  if(r.status===401){location.href='/login';throw new Error('未登录')}
+  return r.json();
+}
+async function load(){
+  const {from,to}=rangeDates(range);
+  const d=await api(`/api/overview?from=${from}&to=${to}`);
+  if(!d.ok)return;
+  ov=d.data;
+  $('coName').textContent='· '+ov.group_name;
+  $('rangeNote').textContent=`统计范围 ${ov.from} ~ ${ov.to}`;
+  mxPage=1;renderStat();renderMatrix();loadBreakdown();
+  if(detailUid)loadDetail(detailUid); // 切范围时明细页跟着刷新
+}
+// 组织级(整组)按分组/按模型
+async function loadBreakdown(){
+  const {from,to}=rangeDates(range);
+  try{
+    const d=await api(`/api/breakdown?from=${from}&to=${to}`);
+    if(!d.ok)return;
+    renderDim('thBdGroup','tbBdGroup',d.data.by_group);
+    renderDim('thBdModel','tbBdModel',d.data.by_model);
+  }catch(e){}
+}
+function renderStat(){
+  const us=ov.users||[];
+  let used=0,rangeSum=0,bal=0,balKnown=false;
+  us.forEach(u=>{used+=(+u.total_used_usd||0);rangeSum+=(+u.total_usd||0);if(u.balance_usd!=null){bal+=(+u.balance_usd);balKnown=true}});
+  $('statBar').innerHTML=
+    `<span class="s"><span class="sl">累计总消耗</span><span class="sv amber" title="终身累计,不受日期范围影响">${fmtCost(used)}</span></span><span class="div"></span>`
+   +`<span class="s"><span class="sl">范围消耗</span><span class="sv">${fmtCost(rangeSum)}</span></span><span class="div"></span>`
+   +`<span class="s"><span class="sl">当前总余额</span><span class="sv green">${balKnown?fmtCost(bal):'—'}</span></span><span class="div"></span>`
+   +`<span class="s"><span class="sl">成员数</span><span class="sv">${us.length}</span></span>`;
+}
+let mxSearch='',mxPage=1;const MX_PAGE=20;
+function renderMatrix(){
+  const days=ov.days||[],all=ov.users||[];
+  const cell=new Map();let maxCost=0;
+  (ov.cells||[]).forEach(c=>{cell.set(c.user_id+'|'+c.date,c);if(c.cost_usd>maxCost)maxCost=c.cost_usd});
+  const heat=v=>v>0&&maxCost>0?` style="background:rgba(var(--heat),${(0.07+0.30*Math.sqrt(v/maxCost)).toFixed(3)})"`:'';
+  const colspan=days.length+4;
+  $('thMx').innerHTML='<tr><th>成员</th><th class="right" style="color:var(--green)">余额</th><th class="right" style="color:var(--amber)" title="终身累计,不受日期范围影响">累计总消耗</th>'
+    +days.map(d=>`<th class="right" title="${esc(d)}">${esc(d.slice(5))}</th>`).join('')+'<th class="right">范围消耗</th></tr>';
+  const q=mxSearch.trim().toLowerCase();
+  const us=q?all.filter(u=>(u.username||'').toLowerCase().includes(q)||(u.email||'').toLowerCase().includes(q)):all;
+  if(!us.length){$('tbMx').innerHTML=`<tr><td colspan="${colspan}" class="muted" style="text-align:center;padding:22px">${q?'无匹配成员':'暂无成员数据'}</td></tr>`;$('mxPager').innerHTML='';return}
+  // 合计/列汇总按全部(筛选后)成员算,不随分页变化
+  const daySum={};
+  us.forEach(u=>{for(const day of days){const c=cell.get(u.user_id+'|'+day);if(c)daySum[day]=(daySum[day]||0)+c.cost_usd;}});
+  const pages=Math.ceil(us.length/MX_PAGE);
+  if(mxPage>pages)mxPage=pages;if(mxPage<1)mxPage=1;
+  const pageUsers=us.slice((mxPage-1)*MX_PAGE,mxPage*MX_PAGE);
+  $('tbMx').innerHTML=pageUsers.map(u=>{
+    let tds='';
+    for(const day of days){
+      const c=cell.get(u.user_id+'|'+day);
+      tds+=`<td class="right num"${c?heat(c.cost_usd):''}${c?` title="${esc(day)} · $${c.cost_usd.toFixed(4)}"`:''}>${c?fmtCell(c.cost_usd):'<span class="dash">—</span>'}</td>`;
+    }
+    const bal=u.balance_usd==null?'<span class="muted">—</span>':(u.balance_usd<0?`<span style="color:var(--red);font-weight:600">${fmtCost(u.balance_usd)}</span>`:`<span style="color:var(--green)">${fmtCost(u.balance_usd)}</span>`);
+    const used=u.total_used_usd==null?'<span class="muted">—</span>':`<b style="color:var(--amber)">${fmtCost(u.total_used_usd)}</b>`;
+    return `<tr><td><a class="ucell" data-uid="${u.user_id}"><span class="u-name">${esc(u.username||'#'+u.user_id)}</span><span class="u-mail">${esc(u.email||'')}</span></a></td>`
+      +`<td class="right num">${bal}</td><td class="right num">${used}</td>${tds}<td class="right num"><b>${fmtCost(u.total_usd)}</b></td></tr>`;
+  }).join('')
+  +`<tr class="mxfoot"><td>合计${q?'(筛选)':''}</td><td></td><td class="right num" style="color:var(--amber)">${fmtCost(us.reduce((s,u)=>s+(+u.total_used_usd||0),0))}</td>`
+  +days.map(d=>`<td class="right num">${d in daySum?fmtCell(daySum[d]):'<span class="dash">—</span>'}</td>`).join('')
+  +`<td class="right num">${fmtCost(us.reduce((s,u)=>s+(+u.total_usd||0),0))}</td></tr>`;
+  renderMxPager(us.length,pages);
+}
+function renderMxPager(total,pages){
+  if(pages<=1){$('mxPager').innerHTML=`<span class="pg-info">共 ${total} 位成员</span>`;return}
+  $('mxPager').innerHTML=`<button class="pg-btn" ${mxPage<=1?'disabled':''} data-pg="${mxPage-1}">上一页</button>`
+    +`<span class="pg-info">第 ${mxPage} / ${pages} 页 · 共 ${total} 位</span>`
+    +`<button class="pg-btn" ${mxPage>=pages?'disabled':''} data-pg="${mxPage+1}">下一页</button>`;
+}
+// 明细
+let dailyChart=null;
+async function loadDetail(uid){
+  const {from,to}=rangeDates(range);
+  const d=await api(`/api/user?uid=${uid}&from=${from}&to=${to}`);
+  if(!d.ok)return;
+  detailUid=uid;
+  const u=(ov.users||[]).find(x=>x.user_id===uid)||{};
+  $('listView').style.display='none';$('detail').style.display='block';
+  $('dTitle').textContent=(u.username||('#'+uid))+(u.email?' · '+u.email:'');
+  const st=d.data.stats||{},s=st.summary||{};
+  renderDim('thBdGroupD','tbBdGroupD',st.by_group);
+  renderDim('thModel','tbModel',st.by_model);
+  renderTokens(d.data.by_token);
+  const cards=[
+    ['累计总消耗',d.data.total_used_usd==null?'—':fmtCost(d.data.total_used_usd),'var(--amber)'],
+    ['范围消耗',fmtCost(s.cost_usd),'var(--text)'],
+    ['余额',d.data.balance_usd==null?'—':fmtCost(d.data.balance_usd),'var(--green)'],
+    ['请求数',(s.requests||0).toLocaleString('en-US'),'var(--text)'],
+    ['Tokens',(s.tokens||0).toLocaleString('en-US'),'var(--text)'],
+  ];
+  $('dCards').innerHTML=cards.map(([l,v,col])=>`<div class="stat-card"><div class="stat-label">${l}</div><div class="stat-value num" style="color:${col}">${v}</div></div>`).join('');
+  const daily=st.daily||[];
+  if(!dailyChart)dailyChart=echarts.init($('dailyChart'));
+  dailyChart.setOption({
+    grid:{left:56,right:24,top:26,bottom:26},
+    tooltip:{trigger:'axis',backgroundColor:'#f7f8fb',borderColor:'#e0e4ec',textStyle:{color:'#2b3340'}},
+    xAxis:{type:'category',data:daily.map(x=>x.date.slice(5)),axisLabel:{color:'#64748b',fontSize:11},axisLine:{lineStyle:{color:'#d7dce6'}}},
+    yAxis:{type:'value',axisLabel:{color:'#64748b',fontSize:11,formatter:'${value}'},splitLine:{lineStyle:{color:'#eceff4'}}},
+    series:[{type:'bar',barWidth:'55%',data:daily.map(x=>+(x.cost_usd||0).toFixed(4)),itemStyle:{color:'#e08700',borderRadius:[3,3,0,0]}}]
+  },true);
+  setTimeout(()=>dailyChart.resize(),50);
+}
+// 通用维度表(名称/请求/Tokens/费用)
+function renderDim(thId,tbId,rows){
+  const th=$(thId),tb=$(tbId);if(!tb)return;
+  if(th)th.innerHTML='<tr><th>名称</th><th class="right">请求</th><th class="right">Tokens</th><th class="right">费用</th></tr>';
+  rows=rows||[];
+  tb.innerHTML=rows.length?rows.map(r=>`<tr><td>${esc(r.key||'—')}</td><td class="right num">${(r.requests||0).toLocaleString('en-US')}</td><td class="right num">${(r.tokens||0).toLocaleString('en-US')}</td><td class="right num">${fmtCost(r.cost_usd)}</td></tr>`).join('')
+    :'<tr><td colspan="4" class="muted" style="text-align:center;padding:16px">范围内无数据</td></tr>';
+}
+// 按令牌:密钥列脱敏 + 不可选中复制(maskkey);数据来自服务端已脱敏字段,前端从不接触明文
+function renderTokens(rows){
+  $('thTok').innerHTML='<tr><th>所属用户</th><th>令牌名称</th><th>密钥</th><th>分组</th><th class="right">请求</th><th class="right">Tokens</th><th class="right">费用</th></tr>';
+  rows=rows||[];
+  $('tbTok').innerHTML=rows.length?rows.map(r=>{
+    const mk=r.masked_key?`<span class="maskkey" oncopy="return false" oncontextmenu="return false">${esc(r.masked_key)}</span>`:'<span class="muted">—</span>';
+    const grp=r.group?esc(r.group):'<span class="muted">默认</span>';
+    return `<tr><td>${esc(r.owner||'—')}</td><td>${esc(r.name||'(未命名)')}</td><td>${mk}</td><td>${grp}</td><td class="right num">${(r.requests||0).toLocaleString('en-US')}</td><td class="right num">${(r.tokens||0).toLocaleString('en-US')}</td><td class="right num">${fmtCost(r.cost_usd)}</td></tr>`;
+  }).join('')
+    :'<tr><td colspan="7" class="muted" style="text-align:center;padding:16px">范围内无令牌用量</td></tr>';
+}
+function backToList(){detailUid=null;$('detail').style.display='none';$('listView').style.display='';}
+$('backLink').onclick=backToList;
+$('tbMx').addEventListener('click',e=>{const a=e.target.closest('[data-uid]');if(a)loadDetail(+a.dataset.uid)});
+// 成员搜索(防抖)+分页
+let mxSearchTimer=null;
+$('mxSearch').addEventListener('input',e=>{
+  clearTimeout(mxSearchTimer);
+  mxSearchTimer=setTimeout(()=>{mxSearch=e.target.value;mxPage=1;renderMatrix()},220);
+});
+$('mxPager').addEventListener('click',e=>{
+  const b=e.target.closest('[data-pg]');if(!b||b.disabled)return;
+  mxPage=+b.dataset.pg;renderMatrix();
+  $('mxSearch').scrollIntoView({block:'nearest'});
+});
+// 日期预设
+document.querySelectorAll('#seg a').forEach(a=>a.onclick=()=>{
+  range=a.dataset.r;
+  document.querySelectorAll('#seg a').forEach(x=>x.classList.toggle('active',x===a));
+  load();
+});
+// 改密码
+$('pwLink').onclick=()=>{$('pwMask').style.display='flex';$('pwMsg').textContent='';$('pwOld').value=$('pwNew').value=$('pwNew2').value='';$('pwOld').focus()};
+$('pwCancel').onclick=()=>$('pwMask').style.display='none';
+$('pwSave').onclick=async()=>{
+  const o=$('pwOld').value,n=$('pwNew').value,n2=$('pwNew2').value,msg=$('pwMsg');
+  if(n.length<8){msg.className='msg err';msg.textContent='新密码至少 8 位';return}
+  if(n!==n2){msg.className='msg err';msg.textContent='两次输入的新密码不一致';return}
+  try{
+    const r=await fetch('/api/password',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({old:o,new:n})});
+    const d=await r.json().catch(()=>({}));
+    if(r.ok&&d.ok){msg.className='msg ok';msg.textContent='✓ 已修改,下次可用新密码登录';setTimeout(()=>$('pwMask').style.display='none',1200)}
+    else{msg.className='msg err';msg.textContent=d.error||'修改失败'}
+  }catch(e){msg.className='msg err';msg.textContent='网络错误'}
+};
+load();
+</script>
+</body>
+</html>

@@ -58,6 +58,22 @@ func main() {
 		}
 	}()
 
+	// 客户端「用量报表」:独立引擎+独立端口(配置了才起),上面零管理端路由——客户域名只指它
+	var portalSrv *http.Server
+	if s.PortalAddr != "" {
+		pr := gin.New()
+		pr.Use(gin.Logger(), gin.Recovery())
+		m.RegisterPortalRoutes(pr)
+		portalSrv = &http.Server{Addr: s.PortalAddr, Handler: pr}
+		go func() {
+			slog.Info("客户用量报表已启动", "addr", "http://localhost"+s.PortalAddr)
+			if err := portalSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				slog.Error("客户端监听失败", "err", err)
+				os.Exit(1)
+			}
+		}()
+	}
+
 	<-ctx.Done() // 等待退出信号
 	stop()
 	slog.Info("收到退出信号,优雅关停…")
@@ -65,5 +81,10 @@ func main() {
 	defer cancel()
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		slog.Warn("关停超时", "err", err)
+	}
+	if portalSrv != nil {
+		if err := portalSrv.Shutdown(shutdownCtx); err != nil {
+			slog.Warn("客户端关停超时", "err", err)
+		}
 	}
 }

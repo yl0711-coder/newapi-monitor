@@ -49,6 +49,9 @@ type Monitor struct {
 
 	usageMu      sync.Mutex // 「用户用量」聚合串行闸:同一时刻最多一条按需聚合在生产库上跑(usage.go)
 	usageDayExpr string     // 日桶 SQL 表达式覆盖(仅测试用;生产走 MySQL 默认,见 usage.go dayExpr)
+
+	portalCache *ttlCache      // 客户端组级数据缓存(portal.go;RegisterPortalRoutes 时初始化)
+	portalLim   *portalLimiter // 客户端登录限流
 }
 
 // cachedSnap 是一次快照的缓存项。

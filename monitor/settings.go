@@ -19,6 +19,10 @@ type Settings struct {
 	NewAPIBaseURL string // MONITOR_NEWAPI_BASE_URL,如 http://new-api:3000
 	SessionSecret string // MONITOR_SESSION_SECRET,签发监控自己的会话;留空则启动时随机生成(重启需重新登录)
 
+	// 客户端「用量报表」独立监听(portal.go):客户域名只指这个端口,上面不存在任何管理端路由。
+	// 留空 = 关闭(默认);如 ":8092"。
+	PortalAddr string // MONITOR_PORTAL_ADDR
+
 	// dead-man 心跳:每周期成功采样后向外部服务(如 healthchecks.io)打一次;留空=不启用。
 	// 监控/采样若停了,外部服务收不到心跳即告警——"谁来监控监控"。
 	HeartbeatURL string // MONITOR_HEARTBEAT_URL
@@ -82,6 +86,7 @@ func LoadSettings() Settings {
 		BackfillHours:     envInt("MONITOR_BACKFILL_HOURS", 24),
 		NewAPIBaseURL:     env("MONITOR_NEWAPI_BASE_URL", ""),
 		SessionSecret:     env("MONITOR_SESSION_SECRET", ""),
+		PortalAddr:        env("MONITOR_PORTAL_ADDR", ""),
 		HeartbeatURL:      env("MONITOR_HEARTBEAT_URL", ""),
 		SiteName:          env("MONITOR_SITE_NAME", ""),
 		IngestToken:       env("MONITOR_INGEST_TOKEN", ""),

@@ -85,7 +85,8 @@ func newFakeProdDB(t *testing.T) *sql.DB {
 	t.Cleanup(func() { db.Close() })
 	stmts := []string{
 		"CREATE TABLE users (id INTEGER PRIMARY KEY, username TEXT, email TEXT, quota INTEGER, used_quota INTEGER)",
-		"CREATE TABLE logs (id INTEGER PRIMARY KEY, user_id INTEGER, created_at INTEGER, type INTEGER, model_name TEXT, quota INTEGER, prompt_tokens INTEGER, completion_tokens INTEGER, `group` TEXT)",
+		"CREATE TABLE logs (id INTEGER PRIMARY KEY, user_id INTEGER, created_at INTEGER, type INTEGER, model_name TEXT, quota INTEGER, prompt_tokens INTEGER, completion_tokens INTEGER, `group` TEXT, token_id INTEGER DEFAULT 0, token_name TEXT DEFAULT '')",
+		"CREATE TABLE tokens (id INTEGER PRIMARY KEY, user_id INTEGER, name TEXT, `key` TEXT, `group` TEXT)",
 	}
 	for _, s := range stmts {
 		if _, err := db.Exec(s); err != nil {
@@ -457,5 +458,75 @@ func TestComputeFollowUps(t *testing.T) {
 	// member_total 汇总口径
 	if s := m.loadUsageSettings(); s.DormantDays != 7 || s.TrialHighUSD != 20 {
 		t.Fatalf("默认阈值 = %+v", s)
+	}
+}
+
+// 按令牌聚合:key 脱敏(带 sk- 前缀、只留首尾);令牌已删则回退日志名、key 空;按费用降序。
+func TestComputeUserTokenUsage(t *testing.T) {
+	m := newTestMonitor(t)
+	m.prodDB = newFakeProdDB(t)
+	if _, err := m.prodDB.Exec("INSERT INTO users (id,username,email) VALUES (5,'fiveuser','five@x.com')"); err != nil {
+		t.Fatal(err)
+	}
+	// token 10 = 现存令牌(分组 claude-1.6x);token 20 = 已删除(logs 有记录但 tokens 表无);均属 user 5
+	if _, err := m.prodDB.Exec("INSERT INTO tokens (id,user_id,name,`key`,`group`) VALUES (10,5,'生产key','abcd1234567890wxyz','claude-1.6x')"); err != nil {
+		t.Fatal(err)
+	}
+	seed := [][]any{
+		// user_id, created_at, type, model, quota, pt, ct, group, token_id, token_name
+		{5, 1000, 2, "gpt", 500000, 10, 10, "default", 10, "生产key"}, // $1.0
+		{5, 1100, 2, "gpt", 500000, 10, 10, "default", 10, "生产key"}, // 再 $1.0 → token10 合计 $2
+		{5, 1200, 2, "gpt", 2500000, 5, 5, "default", 20, "旧key"},   // $5.0,令牌已删
+		{6, 1300, 2, "gpt", 999999, 1, 1, "default", 10, "别人的"},     // 别的用户,不该计入
+	}
+	for _, r := range seed {
+		if _, err := m.prodDB.Exec("INSERT INTO logs (user_id,created_at,type,model_name,quota,prompt_tokens,completion_tokens,`group`,token_id,token_name) VALUES (?,?,?,?,?,?,?,?,?,?)", r...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	out, err := m.computeUserTokenUsage(context.Background(), 5, 0, 2000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out) != 2 {
+		t.Fatalf("应有 2 个令牌, 实得 %d: %+v", len(out), out)
+	}
+	// 降序:已删令牌 $5 在前
+	if out[0].CostUSD != 5 || out[1].CostUSD != 2 {
+		t.Fatalf("费用降序不对: %+v", out)
+	}
+	// 已删令牌:回退日志名,key 空(前端显示 —),分组空(前端显示"默认")
+	if out[0].Name != "旧key" || out[0].MaskedKey != "" || out[0].Group != "" {
+		t.Fatalf("已删令牌回退不对: %+v", out[0])
+	}
+	// 现存令牌:名称/分组来自 tokens 表,key 脱敏且不含完整明文
+	if out[1].Name != "生产key" || out[1].Group != "claude-1.6x" {
+		t.Fatalf("现存令牌名/分组不对: %+v", out[1])
+	}
+	// 所属用户:两行都标 user 5 的展示名(username=fiveuser)
+	if out[0].Owner != "fiveuser" || out[1].Owner != "fiveuser" {
+		t.Fatalf("所属用户标注不对: %q / %q", out[0].Owner, out[1].Owner)
+	}
+	mk := out[1].MaskedKey
+	if !strings.HasPrefix(mk, "sk-abcd") || !strings.HasSuffix(mk, "wxyz") || strings.Contains(mk, "567890") {
+		t.Fatalf("脱敏 key 不合规(泄露或格式错): %q", mk)
+	}
+	if out[1].Requests != 2 || out[1].Tokens != 40 {
+		t.Fatalf("现存令牌请求/tokens 不对: %+v", out[1])
+	}
+}
+
+// maskTokenKey 边界:空/极短/中等/长。
+func TestMaskTokenKey(t *testing.T) {
+	cases := map[string]string{
+		"":                   "",
+		"ab":                 "**",
+		"abcdef":             "sk-ab****ef",
+		"abcd1234567890wxyz": "sk-abcd**********wxyz",
+	}
+	for in, want := range cases {
+		if got := maskTokenKey(in); got != want {
+			t.Fatalf("maskTokenKey(%q)=%q want %q", in, got, want)
+		}
 	}
 }

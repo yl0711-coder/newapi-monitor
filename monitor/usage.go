@@ -48,13 +48,18 @@ type TrackedUser struct {
 }
 
 // CustomerGroup 客户分组(公司):监控本地的客户管理实体,name 唯一。
+// Portal* = 客户端(独立域名报表页)登录账号:一组一账号,双密码并存——
+// PortalPwAdmin(我方配置,永久有效)/ PortalPwUser(客户自改,可选),登录任一匹配即可;都只存 bcrypt 哈希。
 type CustomerGroup struct {
-	ID        int64  `gorm:"primaryKey" json:"id"`
-	Name      string `gorm:"uniqueIndex;size:64" json:"name"`
-	Note      string `gorm:"size:500" json:"note"`
-	Stage     string `gorm:"size:16;default:active" json:"stage"` // trial=试用 / active=正式 / churned=已流失
-	TrialEnd  int64  `json:"trial_end"`                           // 试用到期(unix 秒,0=无);仅 trial 有意义
-	CreatedAt int64  `json:"created_at"`
+	ID            int64  `gorm:"primaryKey" json:"id"`
+	Name          string `gorm:"uniqueIndex;size:64" json:"name"`
+	Note          string `gorm:"size:500" json:"note"`
+	Stage         string `gorm:"size:16;default:active" json:"stage"` // trial=试用 / active=正式 / churned=已流失
+	TrialEnd      int64  `json:"trial_end"`                           // 试用到期(unix 秒,0=无);仅 trial 有意义
+	PortalEmail   string `gorm:"size:128;index" json:"portal_email"`  // 客户端登录邮箱;空=未开通(跨组唯一由 handler 校验)
+	PortalPwAdmin string `gorm:"size:128" json:"-"`                   // 我方配置密码 bcrypt;不回显
+	PortalPwUser  string `gorm:"size:128" json:"-"`                   // 客户自改密码 bcrypt;不回显
+	CreatedAt     int64  `json:"created_at"`
 }
 
 // FollowUpLog 跟进记录(时间线,追加式);跟进落到【人】,按 user_id 归档。
@@ -463,13 +468,15 @@ func (m *Monitor) listGroups(c *gin.Context) {
 	}
 	type row struct {
 		CustomerGroup
-		Members int64 `json:"members"`
+		Members         int64 `json:"members"`
+		PortalSet       bool  `json:"portal_set"`         // 已开通客户端账号
+		PortalUserPwSet bool  `json:"portal_user_pw_set"` // 客户自改过密码
 	}
 	out := make([]row, 0, len(gs))
 	for _, g := range gs {
 		var n int64
 		m.storeDB.Model(&TrackedUser{}).Where("group_id = ?", g.ID).Count(&n)
-		out = append(out, row{CustomerGroup: g, Members: n})
+		out = append(out, row{CustomerGroup: g, Members: n, PortalSet: g.PortalEmail != "", PortalUserPwSet: g.PortalPwUser != ""})
 	}
 	c.JSON(http.StatusOK, gin.H{"groups": out})
 }
@@ -820,6 +827,7 @@ func (m *Monitor) serveUsageMatrix(c *gin.Context) {
 		}
 		return mx.Users[i].Username < mx.Users[j].Username
 	})
+	m.portalWarmFromMatrix(mx, tracked, fromTs, toTs) // 写穿透预热:管理端每次刷新顺手把各组客户端缓存灌成最新
 	c.JSON(http.StatusOK, gin.H{"enabled": true, "matrix": mx, "empty": len(tracked) == 0})
 }
 
@@ -847,6 +855,140 @@ func (m *Monitor) userUsedUSD(ctx context.Context, id int64) *float64 {
 	}
 	u := float64(used) / quotaPerUSD
 	return &u
+}
+
+// TokenUsage 单个令牌在时间范围内的用量。MaskedKey 永远是脱敏串,服务端绝不返回明文 key。
+type TokenUsage struct {
+	Owner     string  `json:"owner"` // 令牌所属用户(展示名:用户名/邮箱/#ID)
+	Name      string  `json:"name"`
+	MaskedKey string  `json:"masked_key"`
+	Group     string  `json:"group"` // 令牌绑定的分组(计价档);空=跟随用户默认分组/已删
+	Requests  int64   `json:"requests"`
+	Tokens    int64   `json:"tokens"`
+	CostUSD   float64 `json:"cost_usd"`
+}
+
+// maskTokenKey 与 new-api 的 MaskTokenKey 同风格。tokens.key 不含 sk- 前缀,
+// 客户实际用的是 sk-<key>,故脱敏串带 sk- 前缀以便客户辨认,同时绝不暴露完整 key。
+func maskTokenKey(key string) string {
+	n := len(key)
+	switch {
+	case n == 0:
+		return ""
+	case n <= 4:
+		return strings.Repeat("*", n)
+	case n <= 8:
+		return "sk-" + key[:2] + "****" + key[n-2:]
+	default:
+		return "sk-" + key[:4] + "**********" + key[n-4:]
+	}
+}
+
+// computeUserTokenUsage 按令牌聚合某用户在 [fromTs,toTs) 的消费日志,并联 tokens 表取名称 + 脱敏 key。
+// 生产库只读;key 只在服务端脱敏后返回,明文永不出库。按费用降序。
+func (m *Monitor) computeUserTokenUsage(ctx context.Context, uid, fromTs, toTs int64) ([]TokenUsage, error) {
+	cctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+
+	// 令牌所属用户:logs.user_id 即令牌拥有者,故整批令牌都归 uid;解析其展示名(用户名→邮箱→#ID)
+	owner := fmt.Sprintf("#%d", uid)
+	var oname, oemail string
+	if err := m.prodDB.QueryRowContext(cctx, "SELECT COALESCE(username,''), COALESCE(email,'') FROM users WHERE id = ?", uid).Scan(&oname, &oemail); err == nil {
+		if oname != "" {
+			owner = oname
+		} else if oemail != "" {
+			owner = oemail
+		}
+	}
+
+	type agg struct {
+		logName                 string
+		requests, tokens, quota int64
+	}
+	byTok := map[int64]*agg{}
+	var ids []int64
+
+	q := "SELECT token_id, COALESCE(MAX(token_name),''), COUNT(*)," +
+		" CAST(COALESCE(SUM(prompt_tokens+completion_tokens),0) AS SIGNED)," +
+		" CAST(COALESCE(SUM(quota),0) AS SIGNED)" +
+		" FROM logs WHERE type = 2 AND user_id = ? AND created_at >= ? AND created_at < ?" +
+		" GROUP BY token_id"
+	rows, err := m.prodDB.QueryContext(cctx, q, uid, fromTs, toTs)
+	if err != nil {
+		return nil, fmt.Errorf("按令牌聚合失败: %w", err)
+	}
+	for rows.Next() {
+		var tid, reqs, toks, quota int64
+		var name string
+		if err := rows.Scan(&tid, &name, &reqs, &toks, &quota); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		byTok[tid] = &agg{logName: name, requests: reqs, tokens: toks, quota: quota}
+		if tid > 0 {
+			ids = append(ids, tid)
+		}
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	// tokens 表取当前名称 + 脱敏 key + 分组(令牌可能已删除,取不到则回退日志里的名字、key/分组留空)
+	nameByID := map[int64]string{}
+	maskByID := map[int64]string{}
+	groupByID := map[int64]string{}
+	if len(ids) > 0 {
+		inSQL, inArgs := usageIn("id", ids)
+		// key、group 都是保留字,MySQL 需反引号
+		kq := "SELECT id, COALESCE(name,''), COALESCE(`key`,''), COALESCE(`group`,'') FROM tokens WHERE " + inSQL
+		krows, err := m.prodDB.QueryContext(cctx, kq, inArgs...)
+		if err != nil {
+			return nil, fmt.Errorf("查询令牌信息失败: %w", err)
+		}
+		for krows.Next() {
+			var id int64
+			var name, key, group string
+			if err := krows.Scan(&id, &name, &key, &group); err != nil {
+				krows.Close()
+				return nil, err
+			}
+			nameByID[id] = name
+			maskByID[id] = maskTokenKey(key)
+			groupByID[id] = group
+		}
+		krows.Close()
+		if err := krows.Err(); err != nil {
+			return nil, err
+		}
+	}
+
+	out := make([]TokenUsage, 0, len(byTok))
+	for tid, a := range byTok {
+		name := nameByID[tid]
+		if name == "" {
+			name = a.logName // 令牌已删/无 token_id → 用日志里的名字
+		}
+		if name == "" {
+			name = "(未命名)"
+		}
+		out = append(out, TokenUsage{
+			Owner:     owner,
+			Name:      name,
+			MaskedKey: maskByID[tid], // 已删或老日志(token_id=0)→ 空,前端显示"—"
+			Group:     groupByID[tid],
+			Requests:  a.requests,
+			Tokens:    a.tokens,
+			CostUSD:   float64(a.quota) / quotaPerUSD,
+		})
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		if out[i].CostUSD != out[j].CostUSD {
+			return out[i].CostUSD > out[j].CostUSD
+		}
+		return out[i].Name < out[j].Name
+	})
+	return out, nil
 }
 
 // serveUsageStats GET /usage/stats?from=&to=&user_id=(管理员):对名单(或其中一人)做每日/分组/模型聚合。
@@ -908,9 +1050,14 @@ func (m *Monitor) serveUsageStats(c *gin.Context) {
 		resp["members"] = len(ids)
 		resp["balance_usd"] = m.sumBalanceUSD(c.Request.Context(), ids)
 		resp["total_used_usd"] = m.sumUsedUSD(c.Request.Context(), ids)
-	} else if len(ids) == 1 { // 单用户详情:个人余额 + 累计总消耗(实时取,null=已删/取不到)
+	} else if len(ids) == 1 { // 单用户详情:个人余额 + 累计总消耗(实时取,null=已删/取不到)+ 各令牌用量
 		resp["balance_usd"] = m.userBalanceUSD(c.Request.Context(), ids[0])
 		resp["total_used_usd"] = m.userUsedUSD(c.Request.Context(), ids[0])
+		if toks, err := m.computeUserTokenUsage(c.Request.Context(), ids[0], fromTs, toTs); err != nil {
+			slog.Warn("单用户令牌用量聚合失败", "err", err, "user_id", ids[0])
+		} else {
+			resp["by_token"] = toks
+		}
 	}
 	c.JSON(http.StatusOK, resp)
 }

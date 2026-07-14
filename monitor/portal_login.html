@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>用量报表 · 登录</title>
+<style>
+  :root{--bg:#e6e9f0;--surface:#f7f8fb;--border:#e0e4ec;--text:#2b3340;--muted:#6d7684;--accent:#5257e0;--red:#d33a3a}
+  *{box-sizing:border-box}
+  body{background:linear-gradient(160deg,#e9ecf3 0%,#e0e4ee 100%);color:var(--text);font-family:-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;margin:0;display:flex;align-items:center;justify-content:center;min-height:100vh}
+  .box{background:var(--surface);border:1px solid var(--border);border-radius:16px;padding:36px 38px;width:372px;box-shadow:0 10px 34px rgba(30,45,80,.08)}
+  h1{font-size:21px;margin:0 0 6px;display:flex;align-items:center;gap:8px}
+  .sub{color:var(--muted);font-size:13px;margin-bottom:24px}
+  label{display:block;font-size:12px;color:var(--muted);margin:14px 0 6px}
+  input{width:100%;background:#fdfdff;border:1px solid var(--border);border-radius:9px;color:var(--text);padding:11px 13px;font-size:14px}
+  input:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px rgba(79,70,229,.12)}
+  button{width:100%;margin-top:24px;background:var(--accent);border:none;border-radius:9px;color:#fff;padding:12px;font-size:14px;font-weight:600;cursor:pointer}
+  button:hover{background:#4338ca}
+  button:disabled{opacity:.6;cursor:default}
+  .err{color:var(--red);font-size:13px;margin-top:12px;min-height:18px}
+</style>
+</head>
+<body>
+<div class="box">
+  <h1>📊 用量报表</h1>
+  <div class="sub">使用我方提供的账号登录,查看贵司 API 用量</div>
+  <label>登录账号</label>
+  <input type="text" id="email" autocomplete="username" placeholder="贵司的报表账号">
+  <label>密码</label>
+  <input type="password" id="pw" autocomplete="current-password" placeholder="••••••••">
+  <button id="btn">登 录</button>
+  <div class="err" id="err"></div>
+</div>
+<script>
+const $=id=>document.getElementById(id);
+async function login(){
+  $('btn').disabled=true;$('err').textContent='';
+  try{
+    const r=await fetch('/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email:$('email').value.trim(),password:$('pw').value})});
+    const d=await r.json().catch(()=>({}));
+    if(r.ok&&d.ok){location.href='/';return}
+    $('err').textContent=d.error||'登录失败';
+  }catch(e){$('err').textContent='网络错误,请重试'}
+  $('btn').disabled=false;
+}
+$('btn').onclick=login;
+$('pw').addEventListener('keydown',e=>{if(e.key==='Enter')login()});
+$('email').focus();
+</script>
+</body>
+</html>
