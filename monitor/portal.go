@@ -196,6 +196,26 @@ func (l *portalLimiter) fail(key string, now int64) {
 	l.mu.Unlock()
 }
 
+// prune 清掉窗口内已无失败记录的键,防止攻击者用大量不同 IP/邮箱刷 /login 使 map 无界增长。
+func (l *portalLimiter) prune(now int64) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	cut := now - int64(portalLoginWindow.Seconds())
+	for k, ts := range l.m {
+		kept := ts[:0]
+		for _, t := range ts {
+			if t > cut {
+				kept = append(kept, t)
+			}
+		}
+		if len(kept) == 0 {
+			delete(l.m, k)
+		} else {
+			l.m[k] = kept
+		}
+	}
+}
+
 // ---- 路由注册(独立引擎,挂到独立端口) ----
 
 func (m *Monitor) RegisterPortalRoutes(r *gin.Engine) {
@@ -205,11 +225,12 @@ func (m *Monitor) RegisterPortalRoutes(r *gin.Engine) {
 	if m.portalLim == nil {
 		m.portalLim = &portalLimiter{m: map[string][]int64{}}
 	}
-	// 缓存 GC:低频粗扫,防长期运行缓慢增长
+	// 缓存 + 限流表 GC:低频粗扫,防长期运行/被刷时缓慢增长
 	go func() {
 		t := time.NewTicker(10 * time.Minute)
 		for range t.C {
 			m.portalCache.gc()
+			m.portalLim.prune(time.Now().Unix())
 		}
 	}()
 

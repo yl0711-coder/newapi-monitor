@@ -26,7 +26,8 @@
   .num{font-variant-numeric:tabular-nums}.muted{color:var(--muted)}.right{text-align:right}
   header{display:flex;align-items:center;gap:12px;margin-bottom:18px}
   header h1{font-size:19px;margin:0}
-  header .co{color:var(--muted);font-size:14px}
+  header .co{color:var(--accent);font-size:15px;font-weight:600;background:rgba(82,87,224,.09);border:1px solid rgba(82,87,224,.2);border-radius:8px;padding:4px 13px;letter-spacing:.01em}
+  header .co:empty{display:none}
   header .sp{margin-left:auto;display:flex;gap:16px;font-size:13px}
   header a{color:var(--accent);text-decoration:none;cursor:pointer}
   .seg{display:inline-flex;border:1px solid var(--border);border-radius:8px;overflow:hidden}
@@ -80,6 +81,11 @@
   .stat-label{font-size:12px;color:var(--muted)}
   .stat-value{font-size:23px;font-weight:700;margin-top:7px;font-variant-numeric:tabular-nums}
   #dailyChart{height:280px;padding:8px 6px}
+  /* 图表 */
+  #trendChart{height:240px;padding:6px 4px}
+  #memberBar{min-height:180px;padding:6px 4px}
+  #modelPie,#dModelPie,#groupPie{height:230px;padding:4px}
+  .pie-note{font-size:12px;color:var(--muted);padding:0 14px 10px}
   /* 改密码弹窗 */
   .modal-mask{position:fixed;inset:0;background:rgba(20,30,50,.4);display:none;align-items:center;justify-content:center;z-index:50}
   .modal{background:var(--surface);border:1px solid var(--border);border-radius:14px;padding:26px 28px;width:340px}
@@ -108,17 +114,19 @@
 
 <div class="stat" id="statBar"></div>
 
-<!-- 列表视图:矩阵 + 组织级按分组/按模型 -->
+<!-- 列表视图:趋势 + 矩阵 + 成员排行 + 组织级按分组/按模型 -->
 <div id="listView">
+  <div class="card"><div class="card-header">每日消费趋势 <span class="sub">· 全公司范围内每日消耗</span></div><div id="trendChart"></div></div>
   <div class="card" id="mxCard">
     <div class="card-header">每日用量 <span class="sub">· 行=成员,列=日期,格=当日消耗(美元)· 点成员看明细</span>
       <input id="mxSearch" class="mx-search" placeholder="搜索成员(用户名/邮箱)" autocomplete="off"></div>
     <div class="mxwrap"><table><thead id="thMx"></thead><tbody id="tbMx"></tbody></table></div>
     <div id="mxPager" class="pager"></div>
   </div>
-  <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px" id="bdGrid">
-    <div class="card"><div class="card-header">按分组 <span class="sub">· 范围内本组整体用量</span></div><table><thead id="thBdGroup"></thead><tbody id="tbBdGroup"></tbody></table></div>
-    <div class="card"><div class="card-header">按模型 <span class="sub">· 范围内本组整体用量</span></div><table><thead id="thBdModel"></thead><tbody id="tbBdModel"></tbody></table></div>
+  <div class="card"><div class="card-header">成员消耗排行 <span class="sub">· 范围内消耗 Top 10</span></div><div id="memberBar"></div></div>
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;align-items:start" id="bdGrid">
+    <div class="card"><div class="card-header">按分组 <span class="sub">· 范围内本组整体用量</span></div><div id="groupPie"></div><table><thead id="thBdGroup"></thead><tbody id="tbBdGroup"></tbody></table></div>
+    <div class="card"><div class="card-header">按模型 <span class="sub">· 范围内本组整体用量</span></div><div id="modelPie"></div><table><thead id="thBdModel"></thead><tbody id="tbBdModel"></tbody></table></div>
   </div>
 </div>
 
@@ -129,7 +137,7 @@
   <div class="card"><div class="card-header">每日消耗</div><div id="dailyChart"></div></div>
   <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">
     <div class="card"><div class="card-header">按分组</div><table><thead id="thBdGroupD"></thead><tbody id="tbBdGroupD"></tbody></table></div>
-    <div class="card"><div class="card-header">按模型</div><table><thead id="thModel"></thead><tbody id="tbModel"></tbody></table></div>
+    <div class="card"><div class="card-header">按模型</div><div id="dModelPie"></div><table><thead id="thModel"></thead><tbody id="tbModel"></tbody></table></div>
   </div>
   <div class="card"><div class="card-header">按令牌 <span class="sub">· 该成员各令牌用量;密钥已脱敏</span></div><table><thead id="thTok"></thead><tbody id="tbTok"></tbody></table></div>
 </div>
@@ -150,6 +158,9 @@
 const $=id=>document.getElementById(id);
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const fmtCost=v=>{v=+v||0;return '$'+(v>=0.01||v===0?v.toFixed(2):v.toFixed(4))};
+const fmtNum=n=>(+n||0).toLocaleString('en-US');
+// 紧凑数字:大数用 k/M/B(1位小数去尾零),避免小卡片挤爆
+const fmtCompact=n=>{n=+n||0;const a=Math.abs(n);for(const [d,u] of [[1e9,'B'],[1e6,'M'],[1e3,'k']]){if(a>=d){const v=n/d;return (Math.abs(v)>=100?v.toFixed(0):v.toFixed(1)).replace(/\.0$/,'')+u;}}return n.toLocaleString('en-US');};
 const fmtCell=v=>v>=0.005?'$'+v.toFixed(2):(v>0?'<$0.01':'$0.00');
 let range='7d',ov=null,detailUid=null;
 
@@ -170,9 +181,9 @@ async function load(){
   const d=await api(`/api/overview?from=${from}&to=${to}`);
   if(!d.ok)return;
   ov=d.data;
-  $('coName').textContent='· '+ov.group_name;
+  $('coName').textContent=ov.group_name||'';
   $('rangeNote').textContent=`统计范围 ${ov.from} ~ ${ov.to}`;
-  mxPage=1;renderStat();renderMatrix();loadBreakdown();
+  mxPage=1;renderStat();renderMatrix();renderTrend();renderMemberBar();loadBreakdown();
   if(detailUid)loadDetail(detailUid); // 切范围时明细页跟着刷新
 }
 // 组织级(整组)按分组/按模型
@@ -183,7 +194,72 @@ async function loadBreakdown(){
     if(!d.ok)return;
     renderDim('thBdGroup','tbBdGroup',d.data.by_group);
     renderDim('thBdModel','tbBdModel',d.data.by_model);
+    groupPieCh=getCh(groupPieCh,'groupPie');renderModelPie(groupPieCh,d.data.by_group);
+    modelPieCh=getCh(modelPieCh,'modelPie');renderModelPie(modelPieCh,d.data.by_model);
   }catch(e){}
+}
+// ---- 图表(echarts;数据全来自已加载的 ov / breakdown / detail,不额外请求) ----
+const AXIS='#64748b',SPLIT='#eceff4',AMBER='#e08700',GRAYLINE='#9aa2b0';
+const TIP={backgroundColor:'#f7f8fb',borderColor:'#e0e4ec',textStyle:{color:'#2b3340'}};
+// 模型配色:name 稳定映射到同一色(总览与明细同一模型同色);暖色系为主,不用彩虹
+// 模型/分组配色:名称哈希到固定调色板,保证同一名称在总览与明细里颜色一致;暖色系为主,不用彩虹
+const MODEL_PALETTE=['#e08700','#c2410c','#b45309','#5257e0','#0c8557','#7c6f9c','#a16207'];
+function modelColor(name){let h=0;for(let i=0;i<name.length;i++)h=(h*31+name.charCodeAt(i))>>>0;return MODEL_PALETTE[h%MODEL_PALETTE.length];}
+let trendCh=null,memberCh=null,modelPieCh=null,dModelPieCh=null,groupPieCh=null;
+function getCh(ref,id){return ref||echarts.init($(id));} // 取已缓存的 echarts 实例,无则初始化
+// 图表空态占位:居中提示文字 + 隐藏坐标轴
+function emptyChart(ch,msg){ch.setOption({title:{text:msg||'所选范围暂无消耗数据',left:'center',top:'center',textStyle:{color:GRAYLINE,fontSize:13,fontWeight:400}},xAxis:{show:false},yAxis:{show:false},series:[]},true);}
+// P0 全公司每日消费趋势(费用面积 + 请求数折线);单日(今天)退化为柱
+function renderTrend(){
+  trendCh=getCh(trendCh,'trendChart');
+  const days=(ov.days||[]).slice().reverse(); // 旧→新
+  const by={};(ov.cells||[]).forEach(c=>{const o=by[c.date]||(by[c.date]={c:0,r:0});o.c+=+c.cost_usd||0;o.r+=+c.requests||0;});
+  const cost=days.map(d=>+(((by[d]||{}).c)||0).toFixed(4)),req=days.map(d=>((by[d]||{}).r)||0);
+  if(!days.length||cost.reduce((a,b)=>a+b,0)<=0){emptyChart(trendCh);return;}
+  const single=days.length<=1;
+  trendCh.setOption({
+    grid:{left:56,right:52,top:24,bottom:26},
+    tooltip:Object.assign({trigger:'axis'},TIP),
+    legend:{data:['费用($)','请求数'],textStyle:{color:'#6d7684'},top:0,right:8},
+    xAxis:{type:'category',data:days.map(d=>d.slice(5)),axisLabel:{color:AXIS,fontSize:11},axisLine:{lineStyle:{color:'#d7dce6'}}},
+    yAxis:[{type:'value',axisLabel:{color:AXIS,fontSize:11,formatter:'${value}'},splitLine:{lineStyle:{color:SPLIT}}},
+           {type:'value',minInterval:1,axisLabel:{color:AXIS,fontSize:11},splitLine:{show:false}}],
+    series:[
+      single?{name:'费用($)',type:'bar',barWidth:'38%',data:cost,color:AMBER,itemStyle:{color:AMBER,borderRadius:[3,3,0,0]}}
+            :{name:'费用($)',type:'line',smooth:true,symbol:'none',data:cost,color:AMBER,lineStyle:{color:AMBER,width:2},itemStyle:{color:AMBER},areaStyle:{color:'rgba(224,135,0,.10)'}},
+      {name:'请求数',type:'line',yAxisIndex:1,smooth:true,symbol:'none',data:req,color:GRAYLINE,lineStyle:{color:GRAYLINE,width:1.5},itemStyle:{color:GRAYLINE}}
+    ]
+  },true);
+  setTimeout(()=>trendCh.resize(),40);
+}
+// P2 成员消耗排行(横向条 Top10,范围消耗降序)
+function renderMemberBar(){
+  memberCh=getCh(memberCh,'memberBar');
+  const us=(ov.users||[]).filter(u=>+u.total_usd>0).sort((a,b)=>b.total_usd-a.total_usd).slice(0,10);
+  if(!us.length){$('memberBar').style.height='180px';memberCh.resize();emptyChart(memberCh);return;}
+  const names=us.map(u=>u.username||('#'+u.user_id)).reverse(),vals=us.map(u=>+(+u.total_usd).toFixed(4)).reverse();
+  const H=Math.max(160,us.length*34+30);$('memberBar').style.height=H+'px';memberCh.resize();
+  memberCh.setOption({
+    grid:{left:8,right:64,top:8,bottom:8,containLabel:true},
+    tooltip:Object.assign({trigger:'axis',axisPointer:{type:'shadow'},formatter:p=>`${esc(p[0].name)}<br/>$${(+p[0].value).toFixed(2)}`},TIP),
+    xAxis:{type:'value',axisLabel:{color:AXIS,fontSize:11,formatter:'${value}'},splitLine:{lineStyle:{color:SPLIT}}},
+    yAxis:{type:'category',data:names,axisLabel:{color:'#2b3340',fontSize:12},axisLine:{show:false},axisTick:{show:false}},
+    series:[{type:'bar',data:vals,barWidth:'58%',itemStyle:{color:AMBER,borderRadius:[0,3,3,0]},label:{show:true,position:'right',color:'#6d7684',fontSize:11,formatter:p=>'$'+(+p.value).toFixed(2)}}]
+  },true);
+}
+// P1/P3 按模型占比环形(Top5+其他);rows 用 UsageDim(key/cost_usd)
+function renderModelPie(ch,rows){
+  rows=(rows||[]).filter(r=>+r.cost_usd>0).sort((a,b)=>b.cost_usd-a.cost_usd);
+  if(!rows.length){emptyChart(ch);return;}
+  const top=rows.slice(0,5),rest=rows.slice(5);
+  const data=top.map(r=>({name:r.key||'—',value:+(+r.cost_usd).toFixed(4),itemStyle:{color:modelColor(r.key||'—')}}));
+  if(rest.length)data.push({name:'其他',value:+rest.reduce((s,r)=>s+ +r.cost_usd,0).toFixed(4),itemStyle:{color:'#9aa2b0'}});
+  ch.setOption({
+    tooltip:Object.assign({trigger:'item',formatter:p=>`${esc(p.name)}<br/>$${(+p.value).toFixed(2)} · ${p.percent}%`},TIP),
+    legend:{type:'scroll',orient:'vertical',right:8,top:'middle',itemGap:9,textStyle:{color:'#6d7684',fontSize:11},formatter:n=>n.length>26?n.slice(0,26)+'…':n},
+    series:[{type:'pie',radius:['46%','70%'],center:['27%','50%'],avoidLabelOverlap:true,itemStyle:{borderColor:'#f7f8fb',borderWidth:2},label:{show:false},data}]
+  },true);
+  setTimeout(()=>ch.resize(),40);
 }
 function renderStat(){
   const us=ov.users||[];
@@ -248,13 +324,14 @@ async function loadDetail(uid){
   const st=d.data.stats||{},s=st.summary||{};
   renderDim('thBdGroupD','tbBdGroupD',st.by_group);
   renderDim('thModel','tbModel',st.by_model);
+  dModelPieCh=getCh(dModelPieCh,'dModelPie');renderModelPie(dModelPieCh,st.by_model);
   renderTokens(d.data.by_token);
   const cards=[
     ['累计总消耗',d.data.total_used_usd==null?'—':fmtCost(d.data.total_used_usd),'var(--amber)'],
     ['范围消耗',fmtCost(s.cost_usd),'var(--text)'],
     ['余额',d.data.balance_usd==null?'—':fmtCost(d.data.balance_usd),'var(--green)'],
     ['请求数',(s.requests||0).toLocaleString('en-US'),'var(--text)'],
-    ['Tokens',(s.tokens||0).toLocaleString('en-US'),'var(--text)'],
+    ['Tokens',`<span title="${fmtNum(s.tokens)} tokens">${fmtCompact(s.tokens)}</span>`,'var(--text)'],
   ];
   $('dCards').innerHTML=cards.map(([l,v,col])=>`<div class="stat-card"><div class="stat-label">${l}</div><div class="stat-value num" style="color:${col}">${v}</div></div>`).join('');
   const daily=st.daily||[];
@@ -321,6 +398,7 @@ $('pwSave').onclick=async()=>{
     else{msg.className='msg err';msg.textContent=d.error||'修改失败'}
   }catch(e){msg.className='msg err';msg.textContent='网络错误'}
 };
+let _rz;window.addEventListener('resize',()=>{clearTimeout(_rz);_rz=setTimeout(()=>{[trendCh,memberCh,modelPieCh,dModelPieCh,groupPieCh,dailyChart].forEach(c=>c&&c.resize());},150);});
 load();
 </script>
 </body>

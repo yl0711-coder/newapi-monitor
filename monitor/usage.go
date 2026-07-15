@@ -412,7 +412,7 @@ func parseUsageRange(fromStr, toStr string, now time.Time) (fromTs, toTs int64, 
 	if from.After(to) {
 		from, to = to, from
 	}
-	// 含两端点共 N 天 ⇔ 零点差 (N-1)*24h;用 >= 卡在恰好 190 天(> 会放行 191 天)
+	// 含两端点共 N 天 ⇔ 零点差 (N-1)*24h;用 >= 卡在恰好 maxUsageDays 天(超一天即 91 天会被拒)
 	if to.Sub(from) >= time.Duration(maxUsageDays)*24*time.Hour {
 		return 0, 0, fmt.Errorf("时间范围过大,最长 %d 天", maxUsageDays)
 	}
@@ -887,6 +887,8 @@ func maskTokenKey(key string) string {
 // computeUserTokenUsage 按令牌聚合某用户在 [fromTs,toTs) 的消费日志,并联 tokens 表取名称 + 脱敏 key。
 // 生产库只读;key 只在服务端脱敏后返回,明文永不出库。按费用降序。
 func (m *Monitor) computeUserTokenUsage(ctx context.Context, uid, fromTs, toTs int64) ([]TokenUsage, error) {
+	m.usageMu.Lock() // 与其它大聚合共用串行闸:同一时刻生产库最多跑一条聚合(调用方未持锁,不会重入)
+	defer m.usageMu.Unlock()
 	cctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
 
