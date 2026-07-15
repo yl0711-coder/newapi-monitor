@@ -560,7 +560,7 @@ func (m *Monitor) portalUserDetail(c *gin.Context) {
 // ---- 使用日志(逐条明细):查看 + CSV 导出 ----
 
 // portalLogParams 解析并校验日志相关的公共参数(组隔离:成员必属本组)。
-func (m *Monitor) portalLogParams(c *gin.Context) (gid int64, ids []int64, memberUid, fromTs, toTs int64, model, group, tokenName string, err error) {
+func (m *Monitor) portalLogParams(c *gin.Context) (gid int64, ids []int64, memberUID, fromTs, toTs int64, model, group, tokenName string, err error) {
 	gid = c.GetInt64("portalGID")
 	fromTs, toTs, err = parseUsageRange(c.Query("from"), c.Query("to"), time.Now())
 	if err != nil {
@@ -569,11 +569,11 @@ func (m *Monitor) portalLogParams(c *gin.Context) (gid int64, ids []int64, membe
 	var tracked []TrackedUser
 	m.storeDB.Where("group_id = ?", gid).Find(&tracked)
 	ids = idsOf(tracked)
-	memberUid, _ = strconv.ParseInt(c.Query("member"), 10, 64)
-	if memberUid > 0 { // 成员筛选值必须属本组(越权闸)
+	memberUID, _ = strconv.ParseInt(c.Query("member"), 10, 64)
+	if memberUID > 0 { // 成员筛选值必须属本组(越权闸)
 		in := false
 		for _, id := range ids {
-			if id == memberUid {
+			if id == memberUID {
 				in = true
 				break
 			}
@@ -591,7 +591,7 @@ func (m *Monitor) portalLogParams(c *gin.Context) (gid int64, ids []int64, membe
 
 // portalLogs GET /api/logs:游标分页看本组消费日志(时间倒序)。
 func (m *Monitor) portalLogs(c *gin.Context) {
-	gid, ids, memberUid, fromTs, toTs, model, group, tokenName, err := m.portalLogParams(c)
+	gid, ids, memberUID, fromTs, toTs, model, group, tokenName, err := m.portalLogParams(c)
 	if err != nil {
 		if err.Error() == "member not in group" {
 			c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
@@ -605,8 +605,8 @@ func (m *Monitor) portalLogs(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"ok": true, "rows": []LogRow{}, "has_more": false})
 		return
 	}
-	beforeId, _ := strconv.ParseInt(c.Query("cursor"), 10, 64)
-	rows, err := m.queryGroupLogs(c.Request.Context(), ids, fromTs, toTs, memberUid, model, group, tokenName, beforeId, portalLogPageSize+1)
+	beforeID, _ := strconv.ParseInt(c.Query("cursor"), 10, 64)
+	rows, err := m.queryGroupLogs(c.Request.Context(), ids, fromTs, toTs, memberUID, model, group, tokenName, beforeID, portalLogPageSize+1)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "查询失败,请稍后重试"})
 		return
@@ -617,11 +617,11 @@ func (m *Monitor) portalLogs(c *gin.Context) {
 	}
 	var next int64
 	if len(rows) > 0 {
-		next = rows[len(rows)-1].Id
+		next = rows[len(rows)-1].ID
 	}
 	resp := gin.H{"ok": true, "rows": rows, "has_more": hasMore, "next_cursor": next}
-	if beforeId == 0 { // 仅首页(筛选变更时)数一次总条数,前端据此算总页数并在翻页时复用
-		if total, err := m.countGroupLogs(c.Request.Context(), ids, fromTs, toTs, memberUid, model, group, tokenName); err == nil {
+	if beforeID == 0 { // 仅首页(筛选变更时)数一次总条数,前端据此算总页数并在翻页时复用
+		if total, err := m.countGroupLogs(c.Request.Context(), ids, fromTs, toTs, memberUID, model, group, tokenName); err == nil {
 			resp["total"] = total
 		}
 	}
@@ -631,7 +631,7 @@ func (m *Monitor) portalLogs(c *gin.Context) {
 // portalLogsExport GET /api/logs/export:CSV 导出。超 90 天由 parseUsageRange 拒;超 5 万条且未确认→返回 need_confirm;
 // 确认(confirm=1)则导最新 5 万条。限流每组织账号 1 次/5min,仅计成功下载(探测/取消不计)。
 func (m *Monitor) portalLogsExport(c *gin.Context) {
-	gid, ids, memberUid, fromTs, toTs, model, group, tokenName, err := m.portalLogParams(c)
+	gid, ids, memberUID, fromTs, toTs, model, group, tokenName, err := m.portalLogParams(c)
 	if err != nil {
 		if err.Error() == "member not in group" {
 			c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
@@ -645,7 +645,7 @@ func (m *Monitor) portalLogsExport(c *gin.Context) {
 		return
 	}
 	confirm := c.Query("confirm") == "1"
-	rows, err := m.queryGroupLogs(c.Request.Context(), ids, fromTs, toTs, memberUid, model, group, tokenName, 0, portalExportCap+1)
+	rows, err := m.queryGroupLogs(c.Request.Context(), ids, fromTs, toTs, memberUID, model, group, tokenName, 0, portalExportCap+1)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "查询失败,请稍后重试"})
 		return

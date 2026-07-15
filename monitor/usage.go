@@ -995,7 +995,7 @@ func (m *Monitor) computeUserTokenUsage(ctx context.Context, uid, fromTs, toTs i
 
 // LogRow 一条消费日志(逐条明细,给客户端「使用日志」查看/导出用);只含元数据,不含请求/响应内容。
 type LogRow struct {
-	Id               int64   `json:"id"`
+	ID               int64   `json:"id"`
 	CreatedAt        int64   `json:"created_at"`
 	Member           string  `json:"member"` // 成员用户名(日志写入时记录)
 	TokenName        string  `json:"token_name"`
@@ -1009,13 +1009,13 @@ type LogRow struct {
 
 // logFilterWhere 拼日志筛选的公共 WHERE(不含游标/排序/上限);全部用户可控值参数化,无注入。
 // 查看(queryGroupLogs)与计数(countGroupLogs)共用,保证两者筛选口径完全一致。
-func logFilterWhere(ids []int64, fromTs, toTs, memberUid int64, model, group, tokenName string) (string, []any) {
+func logFilterWhere(ids []int64, fromTs, toTs, memberUID int64, model, group, tokenName string) (string, []any) {
 	inSQL, inArgs := usageIn("user_id", ids)
 	where := "type = 2 AND created_at >= ? AND created_at < ? AND " + inSQL
 	args := append([]any{fromTs, toTs}, inArgs...)
-	if memberUid > 0 { // 仅看某成员
+	if memberUID > 0 { // 仅看某成员
 		where += " AND user_id = ?"
-		args = append(args, memberUid)
+		args = append(args, memberUID)
 	}
 	if model != "" { // 仅看某模型(精确匹配,与聚合的 by_model key 一致)
 		where += " AND model_name = ?"
@@ -1033,7 +1033,7 @@ func logFilterWhere(ids []int64, fromTs, toTs, memberUid int64, model, group, to
 }
 
 // countGroupLogs 数一组成员在当前筛选下的日志总条数(供前端算总页数)。只在翻页首页调用一次,翻页时前端复用。
-func (m *Monitor) countGroupLogs(ctx context.Context, ids []int64, fromTs, toTs, memberUid int64, model, group, tokenName string) (int64, error) {
+func (m *Monitor) countGroupLogs(ctx context.Context, ids []int64, fromTs, toTs, memberUID int64, model, group, tokenName string) (int64, error) {
 	if len(ids) == 0 {
 		return 0, nil
 	}
@@ -1041,7 +1041,7 @@ func (m *Monitor) countGroupLogs(ctx context.Context, ids []int64, fromTs, toTs,
 	defer m.usageMu.Unlock()
 	cctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
-	where, args := logFilterWhere(ids, fromTs, toTs, memberUid, model, group, tokenName)
+	where, args := logFilterWhere(ids, fromTs, toTs, memberUID, model, group, tokenName)
 	var n int64
 	if err := m.prodDB.QueryRowContext(cctx, "SELECT COUNT(*) FROM logs WHERE "+where, args...).Scan(&n); err != nil {
 		return 0, fmt.Errorf("日志计数失败: %w", err)
@@ -1050,8 +1050,8 @@ func (m *Monitor) countGroupLogs(ctx context.Context, ids []int64, fromTs, toTs,
 }
 
 // queryGroupLogs 查一组成员的消费日志(type=2),按 id 倒序游标分页;窗口化、走索引、只读、串行(usageMu)。
-// 全部用户可控值参数化;memberUid 需调用方已校验属本组;limit 由调用方控上限(分页 pageSize+1 / 导出 cap+1)。
-func (m *Monitor) queryGroupLogs(ctx context.Context, ids []int64, fromTs, toTs, memberUid int64, model, group, tokenName string, beforeId int64, limit int) ([]LogRow, error) {
+// 全部用户可控值参数化;memberUID 需调用方已校验属本组;limit 由调用方控上限(分页 pageSize+1 / 导出 cap+1)。
+func (m *Monitor) queryGroupLogs(ctx context.Context, ids []int64, fromTs, toTs, memberUID int64, model, group, tokenName string, beforeID int64, limit int) ([]LogRow, error) {
 	if len(ids) == 0 {
 		return nil, nil
 	}
@@ -1060,10 +1060,10 @@ func (m *Monitor) queryGroupLogs(ctx context.Context, ids []int64, fromTs, toTs,
 	cctx, cancel := context.WithTimeout(ctx, 25*time.Second) // 导出可能取到 5 万行,给足超时
 	defer cancel()
 
-	where, args := logFilterWhere(ids, fromTs, toTs, memberUid, model, group, tokenName)
-	if beforeId > 0 { // 游标:取比上次末尾更早的(id 近似时间序,倒序翻页,不用深 OFFSET)
+	where, args := logFilterWhere(ids, fromTs, toTs, memberUID, model, group, tokenName)
+	if beforeID > 0 { // 游标:取比上次末尾更早的(id 近似时间序,倒序翻页,不用深 OFFSET)
 		where += " AND id < ?"
-		args = append(args, beforeId)
+		args = append(args, beforeID)
 	}
 	q := "SELECT id, created_at, COALESCE(username,''), COALESCE(token_name,''), COALESCE(model_name,''), COALESCE(`group`,''), prompt_tokens, completion_tokens, use_time, quota" +
 		" FROM logs WHERE " + where + " ORDER BY id DESC LIMIT " + strconv.Itoa(limit)
@@ -1076,7 +1076,7 @@ func (m *Monitor) queryGroupLogs(ctx context.Context, ids []int64, fromTs, toTs,
 	for rows.Next() {
 		var r LogRow
 		var quota int64
-		if err := rows.Scan(&r.Id, &r.CreatedAt, &r.Member, &r.TokenName, &r.ModelName, &r.Group, &r.PromptTokens, &r.CompletionTokens, &r.UseTime, &quota); err != nil {
+		if err := rows.Scan(&r.ID, &r.CreatedAt, &r.Member, &r.TokenName, &r.ModelName, &r.Group, &r.PromptTokens, &r.CompletionTokens, &r.UseTime, &quota); err != nil {
 			return nil, err
 		}
 		r.CostUSD = float64(quota) / quotaPerUSD

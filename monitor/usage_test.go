@@ -558,18 +558,18 @@ func TestQueryGroupLogs(t *testing.T) {
 	if len(all) != 4 {
 		t.Fatalf("应 4 条(本组),实得 %d: %+v", len(all), all)
 	}
-	if all[0].Id != 5 || all[3].Id != 1 {
-		t.Fatalf("倒序不对: %d..%d", all[0].Id, all[3].Id)
+	if all[0].ID != 5 || all[3].ID != 1 {
+		t.Fatalf("倒序不对: %d..%d", all[0].ID, all[3].ID)
 	}
 	for _, r := range all {
-		if r.Id == 4 {
+		if r.ID == 4 {
 			t.Fatal("越权:出现了别的组的日志 id=4")
 		}
 	}
 	// 校验字段(id=3 那条)
 	var r3 LogRow
 	for _, r := range all {
-		if r.Id == 3 {
+		if r.ID == 3 {
 			r3 = r
 		}
 	}
@@ -578,12 +578,12 @@ func TestQueryGroupLogs(t *testing.T) {
 	}
 	// 模型筛选 claude:只 id2
 	cl, _ := m.queryGroupLogs(context.Background(), ids, 0, 2000, 0, "claude", "", "", 0, 100)
-	if len(cl) != 1 || cl[0].Id != 2 {
+	if len(cl) != 1 || cl[0].ID != 2 {
 		t.Fatalf("模型筛选不对: %+v", cl)
 	}
 	// 分组筛选 vip:只 id5
 	vg, _ := m.queryGroupLogs(context.Background(), ids, 0, 2000, 0, "", "vip", "", 0, 100)
-	if len(vg) != 1 || vg[0].Id != 5 {
+	if len(vg) != 1 || vg[0].ID != 5 {
 		t.Fatalf("分组筛选不对: %+v", vg)
 	}
 	// 计数:全部=4,与查询口径一致;带筛选也一致
@@ -603,11 +603,11 @@ func TestQueryGroupLogs(t *testing.T) {
 	}
 	// 游标分页:limit 2 → 5,3;再传 cursor=3 → 2,1
 	p1, _ := m.queryGroupLogs(context.Background(), ids, 0, 2000, 0, "", "", "", 0, 2)
-	if len(p1) != 2 || p1[0].Id != 5 || p1[1].Id != 3 {
+	if len(p1) != 2 || p1[0].ID != 5 || p1[1].ID != 3 {
 		t.Fatalf("第一页不对: %+v", p1)
 	}
-	p2, _ := m.queryGroupLogs(context.Background(), ids, 0, 2000, 0, "", "", "", p1[1].Id, 2)
-	if len(p2) != 2 || p2[0].Id != 2 || p2[1].Id != 1 {
+	p2, _ := m.queryGroupLogs(context.Background(), ids, 0, 2000, 0, "", "", "", p1[1].ID, 2)
+	if len(p2) != 2 || p2[0].ID != 2 || p2[1].ID != 1 {
 		t.Fatalf("第二页不对: %+v", p2)
 	}
 	// 时间窗口 [0,1150):只 id 1,2
