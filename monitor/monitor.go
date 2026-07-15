@@ -52,6 +52,7 @@ type Monitor struct {
 
 	portalCache *ttlCache      // 客户端组级数据缓存(portal.go;RegisterPortalRoutes 时初始化)
 	portalLim   *portalLimiter // 客户端登录限流
+	exportLim   *exportLimiter // 客户端日志导出限流(每组织账号 1 次/5min,仅计成功下载)
 }
 
 // cachedSnap 是一次快照的缓存项。

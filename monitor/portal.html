@@ -34,6 +34,28 @@
   .seg a{padding:7px 14px;font-size:13px;color:var(--muted);border-right:1px solid var(--border);cursor:pointer;text-decoration:none}
   .seg a.active{background:var(--accent);color:#fff}.seg a:last-child{border-right:none}
   .rangenote{color:var(--muted);font-size:12px;margin:10px 0 16px}
+  .dateinput{background:#fdfdff;border:1px solid var(--border);border-radius:8px;color:var(--text);padding:7px 9px;font-size:13px;font-family:inherit}
+  .dateinput:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px rgba(79,70,229,.12)}
+  /* new-api 风格紧凑日期选择器 */
+  .dtpick{position:relative;display:inline-block}
+  .dt-trigger{display:inline-flex;align-items:center;gap:8px;background:#fdfdff;border:1px solid var(--border);border-radius:8px;color:var(--text);padding:8px 12px;font-size:13px;cursor:pointer;font-family:inherit;min-width:238px}
+  .dt-trigger:hover{border-color:var(--accent)}
+  .dt-trigger svg{color:var(--muted);flex-shrink:0}
+  .dt-trigger #dtLabel{font-variant-numeric:tabular-nums}
+  .dt-caret{margin-left:auto;color:var(--muted);font-size:11px}
+  .dt-pop{position:absolute;top:calc(100% + 6px);left:0;z-index:40;background:var(--surface);border:1px solid var(--border);border-radius:12px;box-shadow:0 8px 28px rgba(20,30,50,.16);padding:14px;width:420px;max-width:calc(100vw - 40px);display:none}
+  .dt-pop.open{display:block}
+  .dt-fields{display:flex;align-items:flex-end;gap:10px}
+  .dt-field{flex:1;display:flex;flex-direction:column;gap:5px;min-width:0}
+  .dt-lab{font-size:12px;color:var(--muted)}
+  .dt-field .dateinput{width:100%}
+  .dt-tilde{color:var(--muted);padding-bottom:8px}
+  .dt-presets{display:flex;gap:8px;margin:12px 0 2px}
+  .dt-presets button{flex:1;background:var(--panel);border:1px solid var(--border);border-radius:7px;color:var(--text);padding:6px 4px;font-size:12px;cursor:pointer;font-family:inherit}
+  .dt-presets button:hover{border-color:var(--accent);color:var(--accent)}
+  .dt-presets button.active{background:var(--accent);border-color:var(--accent);color:#fff}
+  .dt-err{color:var(--red);font-size:12px;min-height:16px;margin-top:6px}
+  .dt-actions{display:flex;justify-content:flex-end;margin-top:6px}
   .stat{display:flex;gap:28px;align-items:flex-end;margin:16px 2px 18px;flex-wrap:wrap}
   .stat .s{display:flex;flex-direction:column;gap:4px}
   .stat .sl{font-size:12px;color:var(--muted)}
@@ -86,6 +108,37 @@
   #memberBar{min-height:180px;padding:6px 4px}
   #modelPie,#dModelPie,#groupPie{height:230px;padding:4px}
   .pie-note{font-size:12px;color:var(--muted);padding:0 14px 10px}
+  /* 视图切换(用量总览 / 使用日志) */
+  .vnav{display:inline-flex;border:1px solid var(--border);border-radius:9px;overflow:hidden;background:var(--surface)}
+  .vnav a{padding:8px 18px;font-size:14px;color:var(--muted);cursor:pointer;text-decoration:none;border-right:1px solid var(--border)}
+  .vnav a:last-child{border-right:none}
+  .vnav a.on{background:var(--accent);color:#fff;font-weight:600}
+  /* 日志视图 */
+  #logsView{display:none}
+  .logfilters{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin:14px 0}
+  .logfilters select,.logfilters input{background:#fdfdff;border:1px solid var(--border);border-radius:8px;color:var(--text);padding:7px 11px;font-size:13px}
+  .logfilters select:focus,.logfilters input:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px rgba(79,70,229,.12)}
+  .exp-btn{margin-left:auto;background:var(--green);color:#fff;border:none;border-radius:8px;padding:8px 16px;font-size:13px;font-weight:600;cursor:pointer;display:inline-flex;align-items:center;gap:6px}
+  .exp-btn:disabled{opacity:.5;cursor:default}
+  /* 日志表:普通横向滚动,不冻结列(区别于矩阵的 .mxwrap);列宽给足,避免令牌/模型串行 */
+  .logwrap{overflow-x:auto}
+  .logtable{min-width:1040px;table-layout:fixed}
+  .logtable th,.logtable td{overflow:hidden;text-overflow:ellipsis}
+  .logtable col.c-time{width:150px}.logtable col.c-mem{width:104px}.logtable col.c-tok{width:172px}
+  .logtable col.c-mdl{width:180px}.logtable col.c-grp{width:118px}.logtable col.c-num{width:104px}
+  .logtable col.c-dur{width:92px}.logtable col.c-cost{width:106px}
+  #logTb td .tm{color:var(--muted);font-variant-numeric:tabular-nums}
+  #logTb td .mdl{font-weight:600}
+  #logTb td .grp{font-size:11px;color:var(--muted);background:var(--panel);border:1px solid var(--border);border-radius:5px;padding:1px 7px}
+  #logTb td .cost{color:var(--amber);font-weight:600}
+  .lognote{color:var(--muted);font-size:12px;margin:10px 2px 0;line-height:1.6}
+  /* 导出进度弹窗 */
+  .exp-bar{height:8px;background:var(--panel);border-radius:5px;overflow:hidden;margin:16px 0 8px}
+  .exp-bar span{display:block;height:100%;width:0;background:var(--accent);border-radius:5px;transition:width .25s}
+  .exp-bar.indet span{width:38%;animation:expslide 1.1s ease-in-out infinite}
+  @keyframes expslide{0%{margin-left:-38%}100%{margin-left:100%}}
+  .exp-status{font-size:14px;color:var(--text);min-height:20px}
+  .exp-sub{font-size:12px;color:var(--muted);margin-top:4px;min-height:16px}
   /* 改密码弹窗 */
   .modal-mask{position:fixed;inset:0;background:rgba(20,30,50,.4);display:none;align-items:center;justify-content:center;z-index:50}
   .modal{background:var(--surface);border:1px solid var(--border);border-radius:14px;padding:26px 28px;width:340px}
@@ -105,9 +158,29 @@
   <span class="sp"><a id="pwLink">修改密码</a><a href="/logout">退出</a></span>
 </header>
 
+<div class="vnav" id="vnav" style="margin-bottom:16px">
+  <a data-v="overview" class="on">用量总览</a><a data-v="logs">使用日志</a>
+</div>
+
 <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
-  <div class="seg" id="seg">
-    <a data-r="today">今天</a><a data-r="7d" class="active">近7天</a><a data-r="30d">近30天</a><a data-r="90d">近90天</a>
+  <!-- 日期选择:镜像 new-api 使用日志的紧凑选择器(触发按钮 + 弹层内 开始/结束 + 预设 + 确定) -->
+  <div class="dtpick" id="dtPick">
+    <button class="dt-trigger" id="dtTrigger" type="button">
+      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="18" rx="2"/><path d="M16 2v4M8 2v4M3 10h18"/></svg>
+      <span id="dtLabel">选择日期</span><span class="dt-caret">▾</span>
+    </button>
+    <div class="dt-pop" id="dtPop">
+      <div class="dt-fields">
+        <div class="dt-field"><span class="dt-lab">开始日期</span><input type="date" id="dFrom" class="dateinput"></div>
+        <span class="dt-tilde">~</span>
+        <div class="dt-field"><span class="dt-lab">结束日期</span><input type="date" id="dTo" class="dateinput"></div>
+      </div>
+      <div class="dt-presets">
+        <button type="button" data-r="today">今天</button><button type="button" data-r="7d">近7天</button><button type="button" data-r="30d">近30天</button><button type="button" data-r="90d">近90天</button>
+      </div>
+      <div class="dt-err" id="dateErr"></div>
+      <div class="dt-actions"><button type="button" class="btn p" id="dtConfirm">确定</button></div>
+    </div>
   </div>
   <span class="rangenote" id="rangeNote" style="margin:0"></span>
 </div>
@@ -142,6 +215,50 @@
   <div class="card"><div class="card-header">按令牌 <span class="sub">· 该成员各令牌用量;密钥已脱敏</span></div><table><thead id="thTok"></thead><tbody id="tbTok"></tbody></table></div>
 </div>
 
+<!-- 使用日志 -->
+<div id="logsView">
+  <div class="logfilters">
+    <select id="logMember"><option value="">全部成员</option></select>
+    <select id="logModel"><option value="">全部模型</option></select>
+    <select id="logGroup"><option value="">全部分组</option></select>
+    <input id="logToken" placeholder="令牌名搜索" style="width:150px" autocomplete="off">
+    <button class="exp-btn" id="expBtn">⬇ 导出 CSV</button>
+  </div>
+  <div class="card">
+    <div class="logwrap">
+      <table class="logtable">
+        <colgroup><col class="c-time"><col class="c-mem"><col class="c-tok"><col class="c-mdl"><col class="c-grp"><col class="c-num"><col class="c-num"><col class="c-dur"><col class="c-cost"></colgroup>
+        <thead><tr><th>时间</th><th>成员</th><th>令牌</th><th>模型</th><th>分组</th>
+          <th class="right">输入tokens</th><th class="right">输出tokens</th><th class="right">耗时(秒)</th><th class="right">费用(美元)</th></tr></thead>
+        <tbody id="logTb"></tbody>
+      </table>
+    </div>
+    <div class="pager" id="logPager" style="padding:12px 14px"></div>
+  </div>
+  <p class="lognote">· 仅含本公司成员的消费日志(不含请求/响应内容)· 时间倒序 · 时间窗口最多 90 天<br>
+    · CSV 单次最多导出 5 万条,超出将导最新 5 万条;导出限每 5 分钟 1 次,超量请缩小范围分段导</p>
+</div>
+
+<!-- 导出进度 -->
+<div class="modal-mask" id="expMask">
+  <div class="modal" style="width:380px">
+    <h3 id="expTitle">正在导出</h3>
+    <div class="exp-bar indet" id="expBar"><span></span></div>
+    <div class="exp-status" id="expStatus">正在查询日志…</div>
+    <div class="exp-sub" id="expSub"></div>
+    <div class="row"><button class="btn" id="expCancel">取消</button></div>
+  </div>
+</div>
+
+<!-- 导出确认(超 5 万条) -->
+<div class="modal-mask" id="expConfirmMask">
+  <div class="modal" style="width:400px">
+    <h3>数据较多</h3>
+    <div class="msg" id="expConfirmMsg" style="color:var(--text);line-height:1.7"></div>
+    <div class="row"><button class="btn" id="expConfirmNo">取消</button><button class="btn p" id="expConfirmYes">继续导出</button></div>
+  </div>
+</div>
+
 <!-- 改密码 -->
 <div class="modal-mask" id="pwMask">
   <div class="modal">
@@ -164,13 +281,17 @@ const fmtCompact=n=>{n=+n||0;const a=Math.abs(n);for(const [d,u] of [[1e9,'B'],[
 const fmtCell=v=>v>=0.005?'$'+v.toFixed(2):(v>0?'<$0.01':'$0.00');
 let range='7d',ov=null,detailUid=null;
 
+let customFrom='',customTo='';
 function rangeDates(r){ // 以本地日期为准(东八区客户),与服务端 CST 切日一致
+  if(r==='custom')return {from:customFrom,to:customTo};
   const d=new Date(),p=n=>String(n).padStart(2,'0');
   const ymd=t=>t.getFullYear()+'-'+p(t.getMonth()+1)+'-'+p(t.getDate());
   const days=r==='today'?0:(r==='7d'?6:(r==='30d'?29:89));
   const from=new Date(d);from.setDate(d.getDate()-days);
   return {from:ymd(from),to:ymd(d)};
 }
+// 天数(含两端);>90 由此拦下,与服务端 maxUsageDays 一致
+function spanDays(from,to){return Math.round((new Date(to)-new Date(from))/86400000)+1;}
 async function api(url){
   const r=await fetch(url,{headers:{'Accept':'application/json'}});
   if(r.status===401){location.href='/login';throw new Error('未登录')}
@@ -184,7 +305,17 @@ async function load(){
   $('coName').textContent=ov.group_name||'';
   $('rangeNote').textContent=`统计范围 ${ov.from} ~ ${ov.to}`;
   mxPage=1;renderStat();renderMatrix();renderTrend();renderMemberBar();loadBreakdown();
+  fillMemberSelect();
   if(detailUid)loadDetail(detailUid); // 切范围时明细页跟着刷新
+  if(view==='logs')loadLogs(true);    // 日志视图下切范围 → 重新拉第一页
+}
+// 成员下拉:来自已加载的总览成员(值=user_id)
+function fillMemberSelect(){
+  const sel=$('logMember');if(!sel)return;
+  const cur=sel.value;
+  const us=(ov.users||[]).slice().sort((a,b)=>(a.username||'').localeCompare(b.username||''));
+  sel.innerHTML='<option value="">全部成员</option>'+us.map(u=>`<option value="${u.user_id}">${esc(u.username||('#'+u.user_id))}</option>`).join('');
+  if(cur&&us.some(u=>String(u.user_id)===cur))sel.value=cur; else sel.value='';
 }
 // 组织级(整组)按分组/按模型
 async function loadBreakdown(){
@@ -196,7 +327,17 @@ async function loadBreakdown(){
     renderDim('thBdModel','tbBdModel',d.data.by_model);
     groupPieCh=getCh(groupPieCh,'groupPie');renderModelPie(groupPieCh,d.data.by_group);
     modelPieCh=getCh(modelPieCh,'modelPie');renderModelPie(modelPieCh,d.data.by_model);
+    fillFilterSelect('logModel','全部模型',d.data.by_model);
+    fillFilterSelect('logGroup','全部分组',d.data.by_group);
   }catch(e){}
+}
+// 日志筛选下拉:来自当前范围的按模型/按分组汇总(键=名称);尽量保留用户已选值
+function fillFilterSelect(id,allLabel,rows){
+  const sel=$(id);if(!sel)return;
+  const cur=sel.value;
+  const keys=(rows||[]).map(r=>r.key).filter(Boolean).sort();
+  sel.innerHTML=`<option value="">${allLabel}</option>`+keys.map(k=>`<option value="${esc(k)}">${esc(k)}</option>`).join('');
+  if(cur&&keys.includes(cur))sel.value=cur; else sel.value='';
 }
 // ---- 图表(echarts;数据全来自已加载的 ov / breakdown / detail,不额外请求) ----
 const AXIS='#64748b',SPLIT='#eceff4',AMBER='#e08700',GRAYLINE='#9aa2b0';
@@ -378,12 +519,30 @@ $('mxPager').addEventListener('click',e=>{
   mxPage=+b.dataset.pg;renderMatrix();
   $('mxSearch').scrollIntoView({block:'nearest'});
 });
-// 日期预设
-document.querySelectorAll('#seg a').forEach(a=>a.onclick=()=>{
-  range=a.dataset.r;
-  document.querySelectorAll('#seg a').forEach(x=>x.classList.toggle('active',x===a));
-  load();
+// ---- 日期选择器(镜像 new-api 使用日志:触发按钮 + 弹层内 开始/结束草稿 + 预设 + 确定)----
+[$('dFrom'),$('dTo')].forEach(el=>el.setAttribute('max',rangeDates('today').to)); // 不能选未来
+function updateDtLabel(){const {from,to}=rangeDates(range);$('dtLabel').textContent=`${from} ~ ${to}`;}
+function markPreset(){document.querySelectorAll('.dt-presets button').forEach(b=>b.classList.toggle('active',range!=='custom'&&b.dataset.r===range));}
+function openDt(o){
+  const p=$('dtPop');
+  if(o){const {from,to}=rangeDates(range);$('dFrom').value=from;$('dTo').value=to;$('dateErr').textContent='';markPreset();p.classList.add('open');}
+  else p.classList.remove('open');
+}
+$('dtTrigger').onclick=e=>{e.stopPropagation();openDt(!$('dtPop').classList.contains('open'));};
+document.addEventListener('click',e=>{if(!$('dtPick').contains(e.target))openDt(false);}); // 点外部关闭(不应用草稿)
+// 预设:点了立即应用并关闭(与 new-api 一致)
+document.querySelectorAll('.dt-presets button').forEach(b=>b.onclick=()=>{
+  range=b.dataset.r;openDt(false);updateDtLabel();load();
 });
+// 确定:应用草稿区间;两端必填、from>to 自动交换、跨度>90 天拦下(与服务端一致)
+$('dtConfirm').onclick=()=>{
+  let f=$('dFrom').value,t=$('dTo').value;
+  if(!f||!t){$('dateErr').textContent='请选择开始和结束日期';return;}
+  if(f>t){[f,t]=[t,f];$('dFrom').value=f;$('dTo').value=t;}
+  if(spanDays(f,t)>90){$('dateErr').textContent='时间范围最长 90 天,请缩小区间';return;}
+  customFrom=f;customTo=t;range='custom';openDt(false);updateDtLabel();load();
+};
+updateDtLabel();
 // 改密码
 $('pwLink').onclick=()=>{$('pwMask').style.display='flex';$('pwMsg').textContent='';$('pwOld').value=$('pwNew').value=$('pwNew2').value='';$('pwOld').focus()};
 $('pwCancel').onclick=()=>$('pwMask').style.display='none';
@@ -398,6 +557,159 @@ $('pwSave').onclick=async()=>{
     else{msg.className='msg err';msg.textContent=d.error||'修改失败'}
   }catch(e){msg.className='msg err';msg.textContent='网络错误'}
 };
+// ============ 使用日志视图 ============
+let view='overview',logsLoaded=false;
+function showView(v){
+  view=v;
+  document.querySelectorAll('#vnav a').forEach(a=>a.classList.toggle('on',a.dataset.v===v));
+  const logs=v==='logs';
+  $('statBar').style.display=logs?'none':'';
+  $('logsView').style.display=logs?'block':'none';
+  if(logs){$('listView').style.display='none';$('detail').style.display='none';}
+  else{ if(detailUid){$('detail').style.display='block';$('listView').style.display='none';}
+        else{$('detail').style.display='none';$('listView').style.display='';} }
+  if(logs&&!logsLoaded){logsLoaded=true;loadLogs(true);}
+}
+document.querySelectorAll('#vnav a').forEach(a=>a.onclick=()=>showView(a.dataset.v));
+
+// 日志时间:MM-DD HH:mm:ss(本地=东八区客户)
+function fmtLogTime(ts){const d=new Date(ts*1000),p=n=>String(n).padStart(2,'0');
+  return `${p(d.getMonth()+1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;}
+function fmtSec(s){s=+s||0;return s>=1?s.toFixed(1)+'s':(s>0?'<1s':'—');}
+// 当前筛选拼成查询串(member/model/token),供查看与导出共用
+function logQuery(){
+  const {from,to}=rangeDates(range);
+  let q=`from=${from}&to=${to}`;
+  const mem=$('logMember').value,mdl=$('logModel').value,grp=$('logGroup').value,tok=$('logToken').value.trim();
+  if(mem)q+=`&member=${encodeURIComponent(mem)}`;
+  if(mdl)q+=`&model=${encodeURIComponent(mdl)}`;
+  if(grp)q+=`&group=${encodeURIComponent(grp)}`;
+  if(tok)q+=`&token=${encodeURIComponent(tok)}`;
+  return q;
+}
+// 游标分页:logStack 记录各页起始游标(0=首页),末尾即当前页
+let logStack=[0],logHasMore=false,logNextCursor=0,logLoading=false,logTotal=null;
+async function loadLogs(reset){
+  if(logLoading)return;
+  if(reset)logStack=[0];
+  logLoading=true;
+  const cursor=logStack[logStack.length-1];
+  $('logTb').innerHTML=`<tr><td colspan="9" class="muted" style="text-align:center;padding:22px">加载中…</td></tr>`;
+  try{
+    const d=await api(`/api/logs?${logQuery()}&cursor=${cursor}`);
+    if(!d.ok){$('logTb').innerHTML=`<tr><td colspan="9" class="muted" style="text-align:center;padding:22px">${esc(d.error||'加载失败')}</td></tr>`;$('logPager').innerHTML='';return;}
+    logHasMore=!!d.has_more;logNextCursor=d.next_cursor||0;
+    if(typeof d.total==='number')logTotal=d.total; // 仅首页返回,翻页复用
+    renderLogRows(d.rows||[]);
+    renderLogPager();
+  }catch(e){$('logTb').innerHTML=`<tr><td colspan="9" class="muted" style="text-align:center;padding:22px">网络错误,请重试</td></tr>`;}
+  finally{logLoading=false;}
+}
+function renderLogRows(rows){
+  if(!rows.length){$('logTb').innerHTML=`<tr><td colspan="9" class="muted" style="text-align:center;padding:22px">所选范围暂无日志</td></tr>`;return;}
+  $('logTb').innerHTML=rows.map(r=>{
+    const grp=r.group?`<span class="grp">${esc(r.group)}</span>`:'<span class="muted">默认</span>';
+    return `<tr><td class="tm">${fmtLogTime(r.created_at)}</td><td title="${esc(r.member||'')}">${esc(r.member||'—')}</td>`
+      +`<td title="${esc(r.token_name||'')}">${esc(r.token_name||'—')}</td><td class="mdl" title="${esc(r.model_name||'')}">${esc(r.model_name||'—')}</td><td>${grp}</td>`
+      +`<td class="right num">${fmtNum(r.prompt_tokens)}</td><td class="right num">${fmtNum(r.completion_tokens)}</td>`
+      +`<td class="right num">${fmtSec(r.use_time)}</td><td class="right num cost">${fmtCost(r.cost_usd)}</td></tr>`;
+  }).join('');
+}
+function renderLogPager(){
+  const page=logStack.length; // 1-based
+  const prevOK=page>1,nextOK=logHasMore;
+  const pages=logTotal!=null?Math.max(1,Math.ceil(logTotal/50)):null;
+  const info=pages!=null
+    ? `第 ${page} / ${pages} 页 · 共 ${fmtNum(logTotal)} 条 · 时间倒序`
+    : `第 ${page} 页 · 每页 50 条 · 时间倒序`;
+  $('logPager').innerHTML=`<span class="pg-info">${info}</span>`
+    +`<button class="pg-btn" id="logPrev" ${prevOK?'':'disabled'}>上一页</button>`
+    +`<button class="pg-btn" id="logNext" ${nextOK?'':'disabled'}>下一页 →</button>`;
+  const pv=$('logPrev'),nx=$('logNext');
+  if(pv)pv.onclick=()=>{if(logStack.length>1){logStack.pop();loadLogs(false);}};
+  if(nx)nx.onclick=()=>{if(logHasMore){logStack.push(logNextCursor);loadLogs(false);}};
+}
+// 筛选变化 → 回到第一页重拉(令牌搜索防抖)
+$('logMember').onchange=()=>loadLogs(true);
+$('logModel').onchange=()=>loadLogs(true);
+$('logGroup').onchange=()=>loadLogs(true);
+let logTokTimer=null;
+$('logToken').addEventListener('input',()=>{clearTimeout(logTokTimer);logTokTimer=setTimeout(()=>loadLogs(true),300);});
+
+// ============ CSV 导出 ============
+let exporting=false,expCtrl=null,expTimer=null,expHeaders=false;
+function setExpBar(pct){ // pct null=不定态(转圈),数字=确定进度
+  const bar=$('expBar'),span=bar.firstElementChild;
+  if(pct==null){bar.classList.add('indet');span.style.width='';}
+  else{bar.classList.remove('indet');span.style.width=Math.max(0,Math.min(100,pct*100)).toFixed(0)+'%';}
+}
+function expStatus(main,sub){$('expStatus').textContent=main;if(sub!=null)$('expSub').textContent=sub;}
+function closeExp(){$('expMask').style.display='none';clearInterval(expTimer);}
+async function startExport(confirm){
+  if(exporting)return;
+  exporting=true;expHeaders=false;
+  $('expBtn').disabled=true;
+  $('expTitle').textContent='正在导出';
+  $('expCancel').textContent='取消';$('expCancel').disabled=false;
+  setExpBar(null);expStatus('正在查询日志…','');
+  $('expMask').style.display='flex';
+  const ctrl=new AbortController();expCtrl=ctrl;
+  const t0=Date.now();
+  // 计时器:响应头到达前不知道要多久,用阶段文案 + 已用秒数安抚
+  expTimer=setInterval(()=>{
+    if(expHeaders)return;
+    const s=Math.round((Date.now()-t0)/1000);
+    let msg='正在查询日志…';
+    if(s>=8)msg='数据较多,仍在整理…';else if(s>=3)msg='正在整理数据…';
+    expStatus(msg,`已用 ${s} 秒`);
+  },500);
+  try{
+    const r=await fetch(`/api/logs/export?${logQuery()}`+(confirm?'&confirm=1':''),{signal:ctrl.signal});
+    const ct=r.headers.get('Content-Type')||'';
+    if(ct.includes('application/json')){ // 非 CSV:need_confirm / 限流 / 错误
+      const d=await r.json().catch(()=>({}));
+      if(d.need_confirm){closeExp();askExportConfirm(d.cap);return;}
+      expFail(d.error||'导出失败');return;
+    }
+    // CSV 流式读取,有 Content-Length 就显示真实进度
+    expHeaders=true;
+    const total=+r.headers.get('Content-Length')||0;
+    expStatus('正在下载…',total?'':'准备中…');
+    setExpBar(total?0:null);
+    const reader=r.body.getReader();const chunks=[];let recv=0;
+    for(;;){
+      const {done,value}=await reader.read();
+      if(done)break;
+      chunks.push(value);recv+=value.length;
+      if(total){setExpBar(recv/total);expStatus('正在下载…',`${(recv/1048576).toFixed(1)} / ${(total/1048576).toFixed(1)} MB`);}
+      else expStatus('正在下载…',`已接收 ${(recv/1048576).toFixed(1)} MB`);
+    }
+    const blob=new Blob(chunks,{type:'text/csv'});
+    const cd=r.headers.get('Content-Disposition')||'';
+    const mm=cd.match(/filename="?([^"]+)"?/);
+    const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=mm?mm[1]:'usage-logs.csv';
+    document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(a.href),4000);
+    setExpBar(1);expStatus('导出完成 ✓',`共 ${(blob.size/1048576).toFixed(1)} MB,已开始下载`);
+    $('expCancel').textContent='关闭';
+    setTimeout(closeExp,1600);
+  }catch(e){
+    if(e.name==='AbortError')closeExp();
+    else expFail('网络中断,请重试');
+  }finally{
+    clearInterval(expTimer);exporting=false;expCtrl=null;$('expBtn').disabled=false;
+  }
+}
+function expFail(msg){$('expTitle').textContent='导出失败';setExpBar(0);expStatus(msg,'');$('expCancel').textContent='关闭';}
+$('expBtn').onclick=()=>startExport(false);
+$('expCancel').onclick=()=>{if(expCtrl&&exporting)expCtrl.abort();else closeExp();};
+// 超 5 万条确认框
+function askExportConfirm(cap){
+  $('expConfirmMsg').innerHTML=`本次查询结果超过 <b>${(+cap).toLocaleString('en-US')}</b> 条。<br>将按时间倒序导出<b>最新 ${(+cap).toLocaleString('en-US')} 条</b>。<br>如需更早的数据,请取消后缩小时间范围分段导出。`;
+  $('expConfirmMask').style.display='flex';
+}
+$('expConfirmNo').onclick=()=>$('expConfirmMask').style.display='none';
+$('expConfirmYes').onclick=()=>{$('expConfirmMask').style.display='none';startExport(true);};
+
 let _rz;window.addEventListener('resize',()=>{clearTimeout(_rz);_rz=setTimeout(()=>{[trendCh,memberCh,modelPieCh,dModelPieCh,groupPieCh,dailyChart].forEach(c=>c&&c.resize());},150);});
 load();
 </script>

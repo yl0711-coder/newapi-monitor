@@ -15,10 +15,12 @@ package monitor
 // 生产库压力 ≤ 每组每 TTL 一条小查询;管理端刷新时按组切片写穿透预热(portalWarmFromMatrix)。
 
 import (
+	"bytes"
 	"crypto/hmac"
 	"crypto/sha256"
 	_ "embed"
 	"encoding/base64"
+	"encoding/csv"
 	"encoding/hex"
 	"fmt"
 	"net/http"
@@ -43,6 +45,9 @@ const (
 	portalSessionTTL    = 12 * time.Hour
 	portalCacheTTL      = 60 * time.Second // 组级数据缓存;客户看到的数据最多滞后 60s
 	portalLoginWindow   = 10 * time.Minute // 登录限流窗口
+	portalLogPageSize   = 50               // 日志查看每页条数
+	portalExportCap     = 50000            // 单次 CSV 导出封顶行数(超出弹确认导最新这么多)
+	portalExportWindow  = 5 * time.Minute  // 导出限流:每组织账号该窗口内 1 次(仅计成功下载)
 	portalLoginMaxFails = 8                // 窗口内最多失败次数(按 IP+邮箱)
 )
 
@@ -216,6 +221,35 @@ func (l *portalLimiter) prune(now int64) {
 	}
 }
 
+// ---- 导出限流(每组织账号 gid:窗口内最多 1 次,仅计成功下载) ----
+
+type exportLimiter struct {
+	mu   sync.Mutex
+	last map[int64]int64 // gid -> 最近一次成功导出 unix
+}
+
+func (l *exportLimiter) allow(gid, now, window int64) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return now-l.last[gid] >= window
+}
+
+func (l *exportLimiter) consume(gid, now int64) {
+	l.mu.Lock()
+	l.last[gid] = now
+	l.mu.Unlock()
+}
+
+func (l *exportLimiter) prune(now, window int64) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for k, t := range l.last {
+		if now-t > window*2 {
+			delete(l.last, k)
+		}
+	}
+}
+
 // ---- 路由注册(独立引擎,挂到独立端口) ----
 
 func (m *Monitor) RegisterPortalRoutes(r *gin.Engine) {
@@ -225,12 +259,16 @@ func (m *Monitor) RegisterPortalRoutes(r *gin.Engine) {
 	if m.portalLim == nil {
 		m.portalLim = &portalLimiter{m: map[string][]int64{}}
 	}
+	if m.exportLim == nil {
+		m.exportLim = &exportLimiter{last: map[int64]int64{}}
+	}
 	// 缓存 + 限流表 GC:低频粗扫,防长期运行/被刷时缓慢增长
 	go func() {
 		t := time.NewTicker(10 * time.Minute)
 		for range t.C {
 			m.portalCache.gc()
 			m.portalLim.prune(time.Now().Unix())
+			m.exportLim.prune(time.Now().Unix(), int64(portalExportWindow.Seconds()))
 		}
 	}()
 
@@ -257,6 +295,8 @@ func (m *Monitor) RegisterPortalRoutes(r *gin.Engine) {
 	api.GET("/overview", m.portalOverview)
 	api.GET("/breakdown", m.portalBreakdown) // 整组按分组/按模型汇总
 	api.GET("/user", m.portalUserDetail)
+	api.GET("/logs", m.portalLogs)              // 使用日志:游标分页查看
+	api.GET("/logs/export", m.portalLogsExport) // 使用日志:CSV 导出(超5万确认/限流)
 	api.POST("/password", m.portalChangePassword)
 }
 
@@ -515,6 +555,137 @@ func (m *Monitor) portalUserDetail(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"ok": true, "data": val})
+}
+
+// ---- 使用日志(逐条明细):查看 + CSV 导出 ----
+
+// portalLogParams 解析并校验日志相关的公共参数(组隔离:成员必属本组)。
+func (m *Monitor) portalLogParams(c *gin.Context) (gid int64, ids []int64, memberUid, fromTs, toTs int64, model, group, tokenName string, err error) {
+	gid = c.GetInt64("portalGID")
+	fromTs, toTs, err = parseUsageRange(c.Query("from"), c.Query("to"), time.Now())
+	if err != nil {
+		return
+	}
+	var tracked []TrackedUser
+	m.storeDB.Where("group_id = ?", gid).Find(&tracked)
+	ids = idsOf(tracked)
+	memberUid, _ = strconv.ParseInt(c.Query("member"), 10, 64)
+	if memberUid > 0 { // 成员筛选值必须属本组(越权闸)
+		in := false
+		for _, id := range ids {
+			if id == memberUid {
+				in = true
+				break
+			}
+		}
+		if !in {
+			err = fmt.Errorf("member not in group")
+			return
+		}
+	}
+	model = strings.TrimSpace(c.Query("model"))
+	group = strings.TrimSpace(c.Query("group"))
+	tokenName = strings.TrimSpace(c.Query("token"))
+	return
+}
+
+// portalLogs GET /api/logs:游标分页看本组消费日志(时间倒序)。
+func (m *Monitor) portalLogs(c *gin.Context) {
+	gid, ids, memberUid, fromTs, toTs, model, group, tokenName, err := m.portalLogParams(c)
+	if err != nil {
+		if err.Error() == "member not in group" {
+			c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
+		} else {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		}
+		return
+	}
+	_ = gid
+	if len(ids) == 0 {
+		c.JSON(http.StatusOK, gin.H{"ok": true, "rows": []LogRow{}, "has_more": false})
+		return
+	}
+	beforeId, _ := strconv.ParseInt(c.Query("cursor"), 10, 64)
+	rows, err := m.queryGroupLogs(c.Request.Context(), ids, fromTs, toTs, memberUid, model, group, tokenName, beforeId, portalLogPageSize+1)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "查询失败,请稍后重试"})
+		return
+	}
+	hasMore := len(rows) > portalLogPageSize
+	if hasMore {
+		rows = rows[:portalLogPageSize]
+	}
+	var next int64
+	if len(rows) > 0 {
+		next = rows[len(rows)-1].Id
+	}
+	resp := gin.H{"ok": true, "rows": rows, "has_more": hasMore, "next_cursor": next}
+	if beforeId == 0 { // 仅首页(筛选变更时)数一次总条数,前端据此算总页数并在翻页时复用
+		if total, err := m.countGroupLogs(c.Request.Context(), ids, fromTs, toTs, memberUid, model, group, tokenName); err == nil {
+			resp["total"] = total
+		}
+	}
+	c.JSON(http.StatusOK, resp)
+}
+
+// portalLogsExport GET /api/logs/export:CSV 导出。超 90 天由 parseUsageRange 拒;超 5 万条且未确认→返回 need_confirm;
+// 确认(confirm=1)则导最新 5 万条。限流每组织账号 1 次/5min,仅计成功下载(探测/取消不计)。
+func (m *Monitor) portalLogsExport(c *gin.Context) {
+	gid, ids, memberUid, fromTs, toTs, model, group, tokenName, err := m.portalLogParams(c)
+	if err != nil {
+		if err.Error() == "member not in group" {
+			c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
+		} else {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		}
+		return
+	}
+	if len(ids) == 0 {
+		c.JSON(http.StatusOK, gin.H{"error": "本组暂无成员日志"})
+		return
+	}
+	confirm := c.Query("confirm") == "1"
+	rows, err := m.queryGroupLogs(c.Request.Context(), ids, fromTs, toTs, memberUid, model, group, tokenName, 0, portalExportCap+1)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "查询失败,请稍后重试"})
+		return
+	}
+	over := len(rows) > portalExportCap
+	if over && !confirm { // 超上限、未确认:让前端弹确认框(不消耗限流、不下载)
+		c.JSON(http.StatusOK, gin.H{"need_confirm": true, "cap": portalExportCap})
+		return
+	}
+	if over {
+		rows = rows[:portalExportCap] // 确认后导最新 cap 条
+	}
+	now := time.Now().Unix()
+	if !m.exportLim.allow(gid, now, int64(portalExportWindow.Seconds())) {
+		c.JSON(http.StatusTooManyRequests, gin.H{"error": "导出过于频繁,请 5 分钟后再试"})
+		return
+	}
+	// 生成 CSV(带 UTF-8 BOM,Excel 中文不乱码)
+	var buf bytes.Buffer
+	buf.WriteString("\xEF\xBB\xBF")
+	w := csv.NewWriter(&buf)
+	_ = w.Write([]string{"时间", "成员", "令牌", "模型", "分组", "输入tokens", "输出tokens", "耗时(秒)", "费用(美元)"})
+	for _, r := range rows {
+		_ = w.Write([]string{
+			time.Unix(r.CreatedAt, 0).In(usageCST).Format("2006-01-02 15:04:05"),
+			r.Member, r.TokenName, r.ModelName, r.Group,
+			strconv.FormatInt(r.PromptTokens, 10),
+			strconv.FormatInt(r.CompletionTokens, 10),
+			strconv.FormatInt(r.UseTime, 10),
+			strconv.FormatFloat(r.CostUSD, 'f', 4, 64),
+		})
+	}
+	w.Flush()
+	m.exportLim.consume(gid, now) // 成功生成即消耗一次配额
+	fname := fmt.Sprintf("usage-logs-%s_%s.csv",
+		time.Unix(fromTs, 0).In(usageCST).Format("20060102"),
+		time.Unix(toTs-1, 0).In(usageCST).Format("20060102"))
+	c.Header("Content-Disposition", "attachment; filename=\""+fname+"\"")
+	c.Header("Content-Length", strconv.Itoa(buf.Len()))
+	c.Data(http.StatusOK, "text/csv; charset=utf-8", buf.Bytes())
 }
 
 // ---- 写穿透预热:管理端矩阵查询完成后按组切片灌缓存(管理端自身不读缓存) ----

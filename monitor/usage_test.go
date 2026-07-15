@@ -85,7 +85,7 @@ func newFakeProdDB(t *testing.T) *sql.DB {
 	t.Cleanup(func() { db.Close() })
 	stmts := []string{
 		"CREATE TABLE users (id INTEGER PRIMARY KEY, username TEXT, email TEXT, quota INTEGER, used_quota INTEGER)",
-		"CREATE TABLE logs (id INTEGER PRIMARY KEY, user_id INTEGER, created_at INTEGER, type INTEGER, model_name TEXT, quota INTEGER, prompt_tokens INTEGER, completion_tokens INTEGER, `group` TEXT, token_id INTEGER DEFAULT 0, token_name TEXT DEFAULT '')",
+		"CREATE TABLE logs (id INTEGER PRIMARY KEY, user_id INTEGER, created_at INTEGER, type INTEGER, model_name TEXT, quota INTEGER, prompt_tokens INTEGER, completion_tokens INTEGER, `group` TEXT, token_id INTEGER DEFAULT 0, token_name TEXT DEFAULT '', username TEXT DEFAULT '', use_time INTEGER DEFAULT 0)",
 		"CREATE TABLE tokens (id INTEGER PRIMARY KEY, user_id INTEGER, name TEXT, `key` TEXT, `group` TEXT)",
 	}
 	for _, s := range stmts {
@@ -528,5 +528,116 @@ func TestMaskTokenKey(t *testing.T) {
 		if got := maskTokenKey(in); got != want {
 			t.Fatalf("maskTokenKey(%q)=%q want %q", in, got, want)
 		}
+	}
+}
+
+// 日志逐条查询:组隔离(只本组成员)+ 时间窗口 + 模型/成员筛选 + 游标倒序分页。
+func TestQueryGroupLogs(t *testing.T) {
+	m := newTestMonitor(t)
+	m.prodDB = newFakeProdDB(t)
+	// group A = uid 10,11;别的组 uid 20。造 type=2 日志(id 升序=时间升序)
+	seed := [][]any{
+		// id,user_id,created_at,type,model,quota,pt,ct,group,token_name,username,use_time
+		{1, 10, 1000, 2, "gpt", 500000, 100, 20, "default", "tkA", "u10", 3},
+		{2, 11, 1100, 2, "claude", 250000, 50, 10, "default", "tkB", "u11", 5},
+		{3, 10, 1200, 2, "gpt", 1000000, 200, 40, "default", "tkA", "u10", 8},
+		{4, 20, 1300, 2, "gpt", 999999, 1, 1, "default", "tkX", "u20", 1}, // 别的组,不该出现
+		{5, 11, 1400, 2, "gpt", 300000, 30, 6, "vip", "tkB", "u11", 2},    // 分组=vip,验分组筛选
+	}
+	for _, r := range seed {
+		if _, err := m.prodDB.Exec("INSERT INTO logs (id,user_id,created_at,type,model_name,quota,prompt_tokens,completion_tokens,`group`,token_name,username,use_time) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", r...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ids := []int64{10, 11}
+	// 全部(窗口 0..2000):应 4 条(id 1,2,3,5),倒序 → 5,3,2,1;绝无 uid20 的 id4
+	all, err := m.queryGroupLogs(context.Background(), ids, 0, 2000, 0, "", "", "", 0, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) != 4 {
+		t.Fatalf("应 4 条(本组),实得 %d: %+v", len(all), all)
+	}
+	if all[0].Id != 5 || all[3].Id != 1 {
+		t.Fatalf("倒序不对: %d..%d", all[0].Id, all[3].Id)
+	}
+	for _, r := range all {
+		if r.Id == 4 {
+			t.Fatal("越权:出现了别的组的日志 id=4")
+		}
+	}
+	// 校验字段(id=3 那条)
+	var r3 LogRow
+	for _, r := range all {
+		if r.Id == 3 {
+			r3 = r
+		}
+	}
+	if r3.Member != "u10" || r3.ModelName != "gpt" || r3.PromptTokens != 200 || r3.CompletionTokens != 40 || r3.UseTime != 8 || r3.CostUSD != 2 {
+		t.Fatalf("字段不对: %+v", r3)
+	}
+	// 模型筛选 claude:只 id2
+	cl, _ := m.queryGroupLogs(context.Background(), ids, 0, 2000, 0, "claude", "", "", 0, 100)
+	if len(cl) != 1 || cl[0].Id != 2 {
+		t.Fatalf("模型筛选不对: %+v", cl)
+	}
+	// 分组筛选 vip:只 id5
+	vg, _ := m.queryGroupLogs(context.Background(), ids, 0, 2000, 0, "", "vip", "", 0, 100)
+	if len(vg) != 1 || vg[0].Id != 5 {
+		t.Fatalf("分组筛选不对: %+v", vg)
+	}
+	// 计数:全部=4,与查询口径一致;带筛选也一致
+	if n, err := m.countGroupLogs(context.Background(), ids, 0, 2000, 0, "", "", ""); err != nil || n != 4 {
+		t.Fatalf("总计数 = %d, %v; want 4", n, err)
+	}
+	if n, _ := m.countGroupLogs(context.Background(), ids, 0, 2000, 11, "", "", ""); n != 2 {
+		t.Fatalf("成员计数 = %d; want 2", n)
+	}
+	if n, _ := m.countGroupLogs(context.Background(), ids, 0, 2000, 0, "", "vip", ""); n != 1 {
+		t.Fatalf("分组计数 = %d; want 1", n)
+	}
+	// 成员筛选 uid=11:id 2,5
+	mem, _ := m.queryGroupLogs(context.Background(), ids, 0, 2000, 11, "", "", "", 0, 100)
+	if len(mem) != 2 {
+		t.Fatalf("成员筛选不对: %+v", mem)
+	}
+	// 游标分页:limit 2 → 5,3;再传 cursor=3 → 2,1
+	p1, _ := m.queryGroupLogs(context.Background(), ids, 0, 2000, 0, "", "", "", 0, 2)
+	if len(p1) != 2 || p1[0].Id != 5 || p1[1].Id != 3 {
+		t.Fatalf("第一页不对: %+v", p1)
+	}
+	p2, _ := m.queryGroupLogs(context.Background(), ids, 0, 2000, 0, "", "", "", p1[1].Id, 2)
+	if len(p2) != 2 || p2[0].Id != 2 || p2[1].Id != 1 {
+		t.Fatalf("第二页不对: %+v", p2)
+	}
+	// 时间窗口 [0,1150):只 id 1,2
+	win, _ := m.queryGroupLogs(context.Background(), ids, 0, 1150, 0, "", "", "", 0, 100)
+	if len(win) != 2 {
+		t.Fatalf("时间窗口不对: %+v", win)
+	}
+}
+
+// 导出限流:每组织账号窗口内 1 次,仅 consume 才占用。
+func TestExportLimiter(t *testing.T) {
+	l := &exportLimiter{last: map[int64]int64{}}
+	now := int64(100000)
+	win := int64(300) // 5min
+	if !l.allow(1, now, win) {
+		t.Fatal("首次应允许")
+	}
+	l.consume(1, now) // 成功导出
+	if l.allow(1, now+299, win) {
+		t.Fatal("5分钟内应拒绝")
+	}
+	if !l.allow(1, now+300, win) {
+		t.Fatal("满5分钟应放行")
+	}
+	if !l.allow(2, now+10, win) {
+		t.Fatal("别的组织不受影响")
+	}
+	// prune 清理过期
+	l.prune(now+1000, win)
+	if len(l.last) != 0 {
+		t.Fatalf("prune 应清空过期: %d", len(l.last))
 	}
 }
