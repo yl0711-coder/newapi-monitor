@@ -116,16 +116,26 @@ func (m *Monitor) RegisterRoutes(r *gin.Engine) {
 	}
 }
 
-// ingestRejections 接收各节点 newapi-reject-collector 推来的前置拒绝计数(token 鉴权)。
-// 未配置 MONITOR_INGEST_TOKEN 则接口关闭(503),不接受任何推送。
-func (m *Monitor) ingestRejections(c *gin.Context) {
+// checkIngest 校验节点推送接口的 Bearer token(MONITOR_INGEST_TOKEN)。
+// 未配置则接口关闭(503);不匹配 401(常数时间比较)。所有 ingest 端点共用这一道闸,
+// 返回 false 时响应已写好,调用方直接 return。
+func (m *Monitor) checkIngest(c *gin.Context) bool {
 	want := m.cfg.IngestToken
 	if want == "" {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "ingest disabled"})
-		return
+		return false
 	}
 	if subtle.ConstantTimeCompare([]byte(c.GetHeader("Authorization")), []byte("Bearer "+want)) != 1 {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
+		return false
+	}
+	return true
+}
+
+// ingestRejections 接收各节点 newapi-reject-collector 推来的前置拒绝计数(token 鉴权)。
+// 未配置 MONITOR_INGEST_TOKEN 则接口关闭(503),不接受任何推送。
+func (m *Monitor) ingestRejections(c *gin.Context) {
+	if !m.checkIngest(c) {
 		return
 	}
 	var in struct {
@@ -212,13 +222,7 @@ func (m *Monitor) serveInfraSeries(c *gin.Context) {
 // ingestHost 接收各节点主机 agent 推来的 OS 指标(内存/磁盘/load),写 infra_samples(rtype=host)。
 // 复用 MONITOR_INGEST_TOKEN 鉴权;未配置则接口关闭(503)。只接非敏感数值,不含任何密钥/业务数据。
 func (m *Monitor) ingestHost(c *gin.Context) {
-	want := m.cfg.IngestToken
-	if want == "" {
-		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "ingest disabled"})
-		return
-	}
-	if subtle.ConstantTimeCompare([]byte(c.GetHeader("Authorization")), []byte("Bearer "+want)) != 1 {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
+	if !m.checkIngest(c) {
 		return
 	}
 	// 指标用指针:agent 某项采集失败会省略该字段,这里就不写——避免「缺失=0」被算成异常(如可用 0=已用 100%)。

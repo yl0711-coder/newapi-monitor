@@ -14,6 +14,11 @@
 - 管理端切换监控时间窗口不再整页刷新跳回默认 Tab;当前 Tab 记入 URL hash,从报警设置返回/手动刷新均保留。
 - 客户日志令牌名搜索转义 LIKE 通配符并限长 64,防泛匹配拖慢生产库查询。
 
+### Changed
+- 代码质量收尾(无行为变化):portal 越权判定改 sentinel error + `errors.Is`(弃字符串比较);ingest 鉴权抽公共闸 `checkIngest`;服务端监控「页面色标」与「邮件告警」的红线判定收敛为共用谓词(永远同口径);`computeFollowUps` 拆出纯函数 `classifyMember`;本地库读路径 fail-open 时补 `slog.Warn` 留痕;维度列名白名单守卫;客户/分组管理域从 usage.go 拆到 customers.go。
+- 数据库连接数/磁盘队列/LB 响应毫秒三个告警阈值从硬编码提为可配:`MONITOR_INFRA_DB_CONN_WARN`(默认 70)/`MONITOR_INFRA_DB_DISK_QUEUE_WARN`(默认 5)/`MONITOR_INFRA_LB_RESP_WARN_MS`(默认 2000)。
+- CI 测试改跑 `go test -race`(常开竞态检测)。
+
 ## [1.4.0] - 2026-06-24
 
 ### Added

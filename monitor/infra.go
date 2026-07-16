@@ -706,6 +706,34 @@ func addDerivedPct(r *InfraResource) {
 	}
 }
 
+// ---- 红线判定谓词:色标(infraStatus)与邮件告警(evaluateInfraAlerts)共用 ----
+// 「页面变红」和「发邮件」必须永远同口径,所以"什么算命中红线"只在这里写一遍,两边都调用。
+// 返回 (当前值, 是否命中);指标缺失视为未命中(监控自身取不到数不算故障,由 nosample 兜底)。
+
+// dbMemBad 数据库可用内存低于红线。
+func (m *Monitor) dbMemBad(mm map[string]float64) (float64, bool) {
+	v, ok := mm["mem_avail_pct"]
+	return v, ok && v < m.cfg.InfraMemAvailBadPct
+}
+
+// dbStorageBad 数据库可用存储低于红线。
+func (m *Monitor) dbStorageBad(mm map[string]float64) (float64, bool) {
+	v, ok := mm["storage_avail_pct"]
+	return v, ok && v < m.cfg.InfraStorageAvailBadPct
+}
+
+// instanceDown 实例系统健康检查失败(StatusCheckFailed>=1)。
+func instanceDown(mm map[string]float64) (float64, bool) {
+	v, ok := mm["status_failed"]
+	return v, ok && v >= 1
+}
+
+// lbUnhealthy 负载均衡存在不健康节点。
+func lbUnhealthy(mm map[string]float64) (float64, bool) {
+	v, ok := mm["unhealthy"]
+	return v, ok && v >= 1
+}
+
 // infraStatus 由【百分比阈值】给资源一个红/黄/绿色标(无指标=nosample)。
 // 阈值取自 Settings(可经环境变量配置);可用内存/存储「低于」即告急,CPU「高于」即告急,突发额度「低于」即黄。
 func (m *Monitor) infraStatus(r InfraResource) string {
@@ -717,10 +745,10 @@ func (m *Monitor) infraStatus(r InfraResource) string {
 	has := func(k string) (float64, bool) { v, ok := mm[k]; return v, ok }
 	switch r.Type {
 	case "database":
-		if v, ok := has("mem_avail_pct"); ok && v < c.InfraMemAvailBadPct {
+		if _, hit := m.dbMemBad(mm); hit {
 			return "bad"
 		}
-		if v, ok := has("storage_avail_pct"); ok && v < c.InfraStorageAvailBadPct {
+		if _, hit := m.dbStorageBad(mm); hit {
 			return "bad"
 		}
 		if v, ok := has("cpu"); ok && v > c.InfraCPUBadPct {
@@ -735,26 +763,26 @@ func (m *Monitor) infraStatus(r InfraResource) string {
 		if v, ok := has("cpu"); ok && v > c.InfraCPUWarnPct {
 			return "warn"
 		}
-		if v, ok := has("connections"); ok && v > 70 {
+		if v, ok := has("connections"); ok && v > c.InfraDBConnWarn {
 			return "warn"
 		}
-		if v, ok := has("disk_queue"); ok && v > 5 {
+		if v, ok := has("disk_queue"); ok && v > c.InfraDBDiskQueueWarn {
 			return "warn"
 		}
 		return "ok"
 	case "lb":
-		if v, ok := has("unhealthy"); ok && v >= 1 {
+		if _, hit := lbUnhealthy(mm); hit {
 			return "bad"
 		}
 		if v, ok := has("healthy"); ok && v < 1 {
 			return "bad"
 		}
-		if v, ok := has("resp_ms"); ok && v > 2000 {
+		if v, ok := has("resp_ms"); ok && v > c.InfraLBRespWarnMs {
 			return "warn"
 		}
 		return "ok"
 	default: // instance
-		if v, ok := has("status_failed"); ok && v >= 1 {
+		if _, hit := instanceDown(mm); hit {
 			return "bad"
 		}
 		if v, ok := has("mem_used_pct"); ok && v > 100-c.InfraMemAvailBadPct {
@@ -790,25 +818,25 @@ func (m *Monitor) evaluateInfraAlerts(now int64) {
 	}
 	snap := m.computeInfraSnapshot(now)
 	if d := snap.Database; d != nil {
-		if v, ok := d.Metrics["mem_avail_pct"]; ok && v < m.cfg.InfraMemAvailBadPct {
+		if v, hit := m.dbMemBad(d.Metrics); hit {
 			free := d.Metrics["free_mem_mb"]
 			m.fire(c, "infra_db_mem", d.Name, "数据库可用内存告急",
 				fmt.Sprintf("数据库 %s 可用内存仅 %.1f%%(%.0f MB,阈值 %.0f%%),内存接近耗尽,有 OOM 重启风险。", d.Name, v, free, m.cfg.InfraMemAvailBadPct), now)
 		}
-		if v, ok := d.Metrics["storage_avail_pct"]; ok && v < m.cfg.InfraStorageAvailBadPct {
+		if v, hit := m.dbStorageBad(d.Metrics); hit {
 			free := d.Metrics["free_storage_gb"]
 			m.fire(c, "infra_db_storage", d.Name, "数据库存储不足",
 				fmt.Sprintf("数据库 %s 可用存储仅 %.1f%%(%.1f GB,阈值 %.0f%%)。", d.Name, v, free, m.cfg.InfraStorageAvailBadPct), now)
 		}
 	}
 	for _, in := range snap.Instances {
-		if v, ok := in.Metrics["status_failed"]; ok && v >= 1 {
+		if v, hit := instanceDown(in.Metrics); hit {
 			m.fire(c, "infra_instance_down", in.Name, "实例健康检查失败",
 				fmt.Sprintf("实例 %s StatusCheckFailed=%.0f,可能宕机或不可达。", in.Name, v), now)
 		}
 	}
 	if lb := snap.LB; lb != nil {
-		if v, ok := lb.Metrics["unhealthy"]; ok && v >= 1 {
+		if v, hit := lbUnhealthy(lb.Metrics); hit {
 			m.fire(c, "infra_lb_unhealthy", lb.Name, "负载均衡有不健康节点",
 				fmt.Sprintf("负载均衡 %s 不健康节点数 %.0f。", lb.Name, v), now)
 		}

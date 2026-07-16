@@ -22,6 +22,7 @@ import (
 	"encoding/base64"
 	"encoding/csv"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -572,6 +573,18 @@ func (m *Monitor) portalUserDetail(c *gin.Context) {
 
 // ---- 使用日志(逐条明细):查看 + CSV 导出 ----
 
+// errMemberNotInGroup:成员筛选值不属本组(越权探测)。对外统一装作 404,不暴露"组里有没有这个人"。
+var errMemberNotInGroup = errors.New("member not in group")
+
+// portalLogParamsError 统一处理 portalLogParams 的错误响应:越权探测→404,其余参数错→400。
+func portalLogParamsError(c *gin.Context, err error) {
+	if errors.Is(err, errMemberNotInGroup) {
+		c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
+		return
+	}
+	c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+}
+
 // portalLogParams 解析并校验日志相关的公共参数(组隔离:成员必属本组)。
 func (m *Monitor) portalLogParams(c *gin.Context) (gid int64, ids []int64, memberUID, fromTs, toTs int64, logType int, model, group, tokenName string, err error) {
 	gid = c.GetInt64("portalGID")
@@ -592,7 +605,7 @@ func (m *Monitor) portalLogParams(c *gin.Context) (gid int64, ids []int64, membe
 			}
 		}
 		if !in {
-			err = fmt.Errorf("member not in group")
+			err = errMemberNotInGroup
 			return
 		}
 	}
@@ -620,11 +633,7 @@ func (m *Monitor) portalLogParams(c *gin.Context) (gid int64, ids []int64, membe
 func (m *Monitor) portalLogs(c *gin.Context) {
 	gid, ids, memberUID, fromTs, toTs, logType, model, group, tokenName, err := m.portalLogParams(c)
 	if err != nil {
-		if err.Error() == "member not in group" {
-			c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
-		} else {
-			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		}
+		portalLogParamsError(c, err)
 		return
 	}
 	_ = gid
@@ -673,11 +682,7 @@ func csvSafe(s string) string {
 func (m *Monitor) portalLogsExport(c *gin.Context) {
 	gid, ids, memberUID, fromTs, toTs, logType, model, group, tokenName, err := m.portalLogParams(c)
 	if err != nil {
-		if err.Error() == "member not in group" {
-			c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
-		} else {
-			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		}
+		portalLogParamsError(c, err)
 		return
 	}
 	if len(ids) == 0 {

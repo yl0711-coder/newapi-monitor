@@ -54,6 +54,9 @@ type Settings struct {
 	InfraCPUWarnPct          float64 // MONITOR_INFRA_CPU_WARN_PCT,默认 70
 	InfraCPUBadPct           float64 // MONITOR_INFRA_CPU_BAD_PCT,默认 85
 	InfraBurstWarnPct        float64 // MONITOR_INFRA_BURST_WARN_PCT,默认 20
+	InfraDBConnWarn          float64 // MONITOR_INFRA_DB_CONN_WARN,数据库连接数「高于」即黄,默认 70
+	InfraDBDiskQueueWarn     float64 // MONITOR_INFRA_DB_DISK_QUEUE_WARN,数据库磁盘队列深度「高于」即黄,默认 5
+	InfraLBRespWarnMs        float64 // MONITOR_INFRA_LB_RESP_WARN_MS,负载均衡响应毫秒「高于」即黄,默认 2000
 
 	// 端到端可用性探活:周期性对每个前端域名做 HTTPS 探活 + 读 TLS 证书剩余天数。
 	// 受 MONITOR_INFRA_ENABLED 同一开关控制(关时不探活);探活只读公网,对生产零写入。
@@ -104,6 +107,9 @@ func LoadSettings() Settings {
 		InfraCPUWarnPct:          envFloat("MONITOR_INFRA_CPU_WARN_PCT", 70),
 		InfraCPUBadPct:           envFloat("MONITOR_INFRA_CPU_BAD_PCT", 85),
 		InfraBurstWarnPct:        envFloat("MONITOR_INFRA_BURST_WARN_PCT", 20),
+		InfraDBConnWarn:          envFloat("MONITOR_INFRA_DB_CONN_WARN", 70),
+		InfraDBDiskQueueWarn:     envFloat("MONITOR_INFRA_DB_DISK_QUEUE_WARN", 5),
+		InfraLBRespWarnMs:        envFloat("MONITOR_INFRA_LB_RESP_WARN_MS", 2000),
 
 		ProbeDomains:       env("MONITOR_PROBE_DOMAINS", "nexusapi.link,routepath.link,pathgo.link,us.nexusapi.link"),
 		ProbePath:          env("MONITOR_PROBE_PATH", "/api/status"),

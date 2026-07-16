@@ -14,6 +14,14 @@ import (
 // store.go:监控自带的本地采样库(独立 sqlite,不碰 new-api 的库)。
 // 页面只读这里;唯一写入者是采样器。所有存储函数挂在 Monitor 上,用 m.storeDB。
 
+// warnReadErr:读路径统一 fail-open——出错按"无数据"返回,页面显示空而不中断监控;
+// 但必须留痕,否则真实的库损坏/schema 漂移会被静默成"没数据",误导排障。
+func warnReadErr(op string, tx *gorm.DB) {
+	if tx.Error != nil {
+		slog.Warn("本地库读取失败(按无数据处理)", "op", op, "err", tx.Error)
+	}
+}
+
 // MetricSample 按【分钟桶 × 渠道 × 模型 × 分组】聚合的一行采样。
 // 复合主键使采样可幂等 UPSERT,自愈小的采集间隙。
 type MetricSample struct {
@@ -234,7 +242,7 @@ func (m *Monitor) channelEnabledState() map[int]chanPrev {
 		ID, Status   int
 		EnabledSince int64
 	}
-	m.storeDB.Raw("SELECT id, status, enabled_since FROM channel_snaps").Scan(&rows)
+	warnReadErr("channelEnabledState", m.storeDB.Raw("SELECT id, status, enabled_since FROM channel_snaps").Scan(&rows))
 	out := make(map[int]chanPrev, len(rows))
 	for _, r := range rows {
 		out[r.ID] = chanPrev{status: r.Status, since: r.EnabledSince}
@@ -291,9 +299,9 @@ func (m *Monitor) upsertRejections(rows []RejectionSample) error {
 // storeRejections 取窗口内按 (原因 × 模型 × 分组) 聚合的拒绝计数,按次数降序(Top 100)。
 func (m *Monitor) storeRejections(since int64) []RejectionRow {
 	var rows []RejectionRow
-	m.storeDB.Raw(`SELECT reason, model, grp AS `+"`group`"+`, COALESCE(SUM(count),0) AS count
+	warnReadErr("storeRejections", m.storeDB.Raw(`SELECT reason, model, grp AS `+"`group`"+`, COALESCE(SUM(count),0) AS count
 		FROM rejection_samples WHERE bucket_ts >= ?
-		GROUP BY reason, model, grp ORDER BY count DESC LIMIT 100`, since).Scan(&rows)
+		GROUP BY reason, model, grp ORDER BY count DESC LIMIT 100`, since).Scan(&rows))
 	return rows
 }
 
@@ -443,7 +451,20 @@ func (m *Monitor) storeSummary(since int64, windowSec float64) (*Summary, error)
 
 // storeDimSeries 取每个维度取值的分钟桶时间序列(成功/失败),供前端画迷你趋势(sparkline)。
 // 同样在 Go 内粗化,点数受控;返回 key -> 时序。
+// dimColOK:dimCol 是全库唯一被 fmt.Sprintf 进 SQL 的字符串,只允许三个内部常量列名。
+// 白名单在入口卡死——防未来有人把请求参数误传进来,把这里变成注入面。
+func dimColOK(dimCol string) bool {
+	switch dimCol {
+	case "grp", channelDim, "model_name":
+		return true
+	}
+	return false
+}
+
 func (m *Monitor) storeDimSeries(dimCol string, since int64, windowMinutes int) (map[string][]TimePoint, error) {
+	if !dimColOK(dimCol) {
+		return nil, fmt.Errorf("非法维度列: %q", dimCol)
+	}
 	type row struct {
 		K        string
 		BucketTs int64
@@ -490,6 +511,9 @@ func (m *Monitor) storeDimSeries(dimCol string, since int64, windowMinutes int) 
 }
 
 func (m *Monitor) storeDim(dimCol string, since int64, windowSec float64) ([]Row, error) {
+	if !dimColOK(dimCol) {
+		return nil, fmt.Errorf("非法维度列: %q", dimCol)
+	}
 	f := enabledChanFilter + selectableFilter
 	if dimCol == channelDim { // 按渠道明细不过滤,排障仍能看禁用渠道/误路由
 		f = ""
@@ -606,15 +630,15 @@ func (m *Monitor) pruneHoursOlderThan(cutoffTs int64) (int64, error) {
 // storeHourSeries 取小时级序列(长期趋势图用),按时间升序。
 func (m *Monitor) storeHourSeries(sinceTs int64) []HourPoint {
 	var pts []HourPoint
-	m.storeDB.Raw(`SELECT hour_ts AS ts, success, anomaly, failed FROM hour_samples WHERE hour_ts >= ? ORDER BY hour_ts`, sinceTs).Scan(&pts)
+	warnReadErr("storeHourSeries", m.storeDB.Raw(`SELECT hour_ts AS ts, success, anomaly, failed FROM hour_samples WHERE hour_ts >= ? ORDER BY hour_ts`, sinceTs).Scan(&pts))
 	return pts
 }
 
 // periodStat 取 [fromTs,toTs) 的小时级汇总统计(同比环比用)。
 func (m *Monitor) periodStat(fromTs, toTs int64) PeriodStat {
 	var r struct{ S, A, F, Q int64 }
-	m.storeDB.Raw(`SELECT COALESCE(SUM(success),0) s, COALESCE(SUM(anomaly),0) a, COALESCE(SUM(failed),0) f, COALESCE(SUM(quota),0) q
-		FROM hour_samples WHERE hour_ts >= ? AND hour_ts < ?`, fromTs, toTs).Scan(&r)
+	warnReadErr("periodStat", m.storeDB.Raw(`SELECT COALESCE(SUM(success),0) s, COALESCE(SUM(anomaly),0) a, COALESCE(SUM(failed),0) f, COALESCE(SUM(quota),0) q
+		FROM hour_samples WHERE hour_ts >= ? AND hour_ts < ?`, fromTs, toTs).Scan(&r))
 	total := r.S + r.A + r.F
 	return PeriodStat{Total: total, Failed: r.F, SuccessRate: rate(r.S, total), CostUSD: float64(r.Q) / quotaPerUSD}
 }
@@ -632,7 +656,7 @@ func (m *Monitor) storeCompare(nowUnix int64) CompareStat {
 
 func (m *Monitor) storeFreshness() (lastBucket int64) {
 	var v struct{ M int64 }
-	m.storeDB.Raw(`SELECT COALESCE(MAX(bucket_ts),0) AS m FROM metric_samples`).Scan(&v)
+	warnReadErr("storeFreshness", m.storeDB.Raw(`SELECT COALESCE(MAX(bucket_ts),0) AS m FROM metric_samples`).Scan(&v))
 	return v.M
 }
 
@@ -662,10 +686,10 @@ type infraLatestRow struct {
 func (m *Monitor) storeInfraLatest() []infraLatestRow {
 	var rows []infraLatestRow
 	// 取每个 (resource,metric) 的最大 bucket_ts 对应行。
-	m.storeDB.Raw(`SELECT s.resource, s.rtype, s.metric, s.value, s.bucket_ts
+	warnReadErr("storeInfraLatest", m.storeDB.Raw(`SELECT s.resource, s.rtype, s.metric, s.value, s.bucket_ts
 		FROM infra_samples s
 		JOIN (SELECT resource, metric, MAX(bucket_ts) AS mx FROM infra_samples GROUP BY resource, metric) t
-		  ON s.resource=t.resource AND s.metric=t.metric AND s.bucket_ts=t.mx`).Scan(&rows)
+		  ON s.resource=t.resource AND s.metric=t.metric AND s.bucket_ts=t.mx`).Scan(&rows))
 	return rows
 }
 
@@ -678,8 +702,8 @@ type InfraPoint struct {
 // storeInfraSeries 返回某资源某指标自 since 起的时序(升序),供趋势小图(如 DB 内存/swap)。
 func (m *Monitor) storeInfraSeries(resource, metric string, since int64) []InfraPoint {
 	var pts []InfraPoint
-	m.storeDB.Raw(`SELECT bucket_ts AS ts, value FROM infra_samples
-		WHERE resource=? AND metric=? AND bucket_ts >= ? ORDER BY bucket_ts`, resource, metric, since).Scan(&pts)
+	warnReadErr("storeInfraSeries", m.storeDB.Raw(`SELECT bucket_ts AS ts, value FROM infra_samples
+		WHERE resource=? AND metric=? AND bucket_ts >= ? ORDER BY bucket_ts`, resource, metric, since).Scan(&pts))
 	return pts
 }
 

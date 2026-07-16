@@ -49,7 +49,69 @@ type FollowUpCompany struct {
 
 const ungroupedName = "未分组"
 
-// computeFollowUps 逐用户判是否需跟进,再按公司归拢。
+// classifyMember 单个用户的跟进判定(纯函数,便于单测):由按日消费算出 30 天合计/近7天/前7天/静默天数,
+// 按公司阶段(trial=试用/其余=正式)套阈值,产出 reasons/actions/urgency/level。
+// days 键为日序号(0=最早 … followUpWindowDays-1=今天);返回 (成员, 是否需要跟进)。
+func classifyMember(u TrackedUser, stage string, days map[int]float64, balance *float64, lastFollowUp int64, dateOfIdx []string, st UsageSettings) (FollowUpMember, bool) {
+	todayIdx := followUpWindowDays - 1
+	var spend30, last7, prev7 float64
+	lastActiveIdx := -1
+	for di := 0; di < followUpWindowDays; di++ {
+		v := days[di]
+		spend30 += v
+		if v > 0 {
+			lastActiveIdx = di
+		}
+		if di > todayIdx-7 {
+			last7 += v
+		} else if di > todayIdx-14 {
+			prev7 += v
+		}
+	}
+	mem := FollowUpMember{UserID: u.UserID, Username: u.Username, Email: u.Email, Spend30USD: spend30, BalanceUSD: balance, LastFollowUp: lastFollowUp}
+	if lastActiveIdx >= 0 {
+		mem.LastActive = dateOfIdx[lastActiveIdx]
+		mem.DaysIdle = todayIdx - lastActiveIdx
+	} else {
+		mem.DaysIdle = followUpWindowDays
+	}
+	add := func(reason, action string, urgency int) {
+		mem.Reasons = append(mem.Reasons, reason)
+		mem.Actions = append(mem.Actions, action)
+		mem.Urgency += urgency
+	}
+	if stage == "trial" {
+		if last7 < st.TrialLowUSD {
+			add(fmt.Sprintf("试用消耗低(近7天 %s)", fmtUSD2(last7)), "沟通:是不是用不起来/有问题", 30)
+		}
+		if last7 >= st.TrialHighUSD {
+			add(fmt.Sprintf("试用消耗高(近7天 %s)", fmtUSD2(last7)), "转化时机:确认付费/谈转正", 60)
+		}
+	} else {
+		if mem.DaysIdle >= st.DormantDays {
+			add(fmt.Sprintf("连续 %d 天无消费", mem.DaysIdle), "疑似流失:去沟通问原因", 50)
+		} else if prev7 > 0 && last7 < prev7*(1-float64(st.DropPct)/100) {
+			drop := int((1 - last7/prev7) * 100)
+			add(fmt.Sprintf("消费下滑(近7天降 %d%%)", drop), "关注、了解原因", 35)
+		}
+		if mem.BalanceUSD != nil && *mem.BalanceUSD < st.LowBalanceUSD {
+			add(fmt.Sprintf("余额低(%s)", fmtUSD2(*mem.BalanceUSD)), "催充值,避免断服流失", 45)
+		}
+	}
+	if len(mem.Reasons) == 0 {
+		return mem, false
+	}
+	mem.Urgency += int(spend30)
+	// 分级:30天内有过消费的客户出状况=紧急(该马上催);30天全无消费=长期沉默(低优先级,页面折叠、不进红徽章)
+	if spend30 > 0 {
+		mem.Level = "urgent"
+	} else {
+		mem.Level = "info"
+	}
+	return mem, true
+}
+
+// computeFollowUps 逐用户判是否需跟进(判定逻辑在 classifyMember),再按公司归拢。
 func (m *Monitor) computeFollowUps(ctx context.Context, nowUnix int64) ([]FollowUpCompany, error) {
 	tracked, err := m.listTracked()
 	if err != nil {
@@ -100,7 +162,6 @@ func (m *Monitor) computeFollowUps(ctx context.Context, nowUnix int64) ([]Follow
 
 	st := m.loadUsageSettings()
 	lastFollow := m.lastFollowUpByUser()
-	todayIdx := followUpWindowDays - 1
 
 	type bucket struct {
 		comp    *FollowUpCompany
@@ -124,7 +185,7 @@ func (m *Monitor) computeFollowUps(ctx context.Context, nowUnix int64) ([]Follow
 		return b
 	}
 
-	// 逐用户判定
+	// 逐用户判定(具体规则在 classifyMember)
 	for _, u := range tracked {
 		stage := "active"
 		if g, ok := groupByID[u.GroupID]; ok && g.Stage != "" {
@@ -133,67 +194,18 @@ func (m *Monitor) computeFollowUps(ctx context.Context, nowUnix int64) ([]Follow
 		if stage == "churned" { // 已流失公司:不再提醒其成员
 			continue
 		}
-		days := spendByUserDay[u.UserID]
-		var spend30, last7, prev7 float64
-		lastActiveIdx := -1
-		for di := 0; di < followUpWindowDays; di++ {
-			v := days[di]
-			spend30 += v
-			if v > 0 {
-				lastActiveIdx = di
-			}
-			if di > todayIdx-7 {
-				last7 += v
-			} else if di > todayIdx-14 {
-				prev7 += v
-			}
-		}
-		mem := FollowUpMember{UserID: u.UserID, Username: u.Username, Email: u.Email, Spend30USD: spend30, LastFollowUp: lastFollow[u.UserID]}
+		var balance *float64
 		if b, ok := balances[u.UserID]; ok {
 			bv := b
-			mem.BalanceUSD = &bv
+			balance = &bv
 		}
-		if lastActiveIdx >= 0 {
-			mem.LastActive = dateOfIdx[lastActiveIdx]
-			mem.DaysIdle = todayIdx - lastActiveIdx
-		} else {
-			mem.DaysIdle = followUpWindowDays
+		mem, need := classifyMember(u, stage, spendByUserDay[u.UserID], balance, lastFollow[u.UserID], dateOfIdx, st)
+		if !need {
+			continue
 		}
-		add := func(reason, action string, urgency int) {
-			mem.Reasons = append(mem.Reasons, reason)
-			mem.Actions = append(mem.Actions, action)
-			mem.Urgency += urgency
-		}
-		if stage == "trial" {
-			if last7 < st.TrialLowUSD {
-				add(fmt.Sprintf("试用消耗低(近7天 %s)", fmtUSD2(last7)), "沟通:是不是用不起来/有问题", 30)
-			}
-			if last7 >= st.TrialHighUSD {
-				add(fmt.Sprintf("试用消耗高(近7天 %s)", fmtUSD2(last7)), "转化时机:确认付费/谈转正", 60)
-			}
-		} else {
-			if mem.DaysIdle >= st.DormantDays {
-				add(fmt.Sprintf("连续 %d 天无消费", mem.DaysIdle), "疑似流失:去沟通问原因", 50)
-			} else if prev7 > 0 && last7 < prev7*(1-float64(st.DropPct)/100) {
-				drop := int((1 - last7/prev7) * 100)
-				add(fmt.Sprintf("消费下滑(近7天降 %d%%)", drop), "关注、了解原因", 35)
-			}
-			if mem.BalanceUSD != nil && *mem.BalanceUSD < st.LowBalanceUSD {
-				add(fmt.Sprintf("余额低(%s)", fmtUSD2(*mem.BalanceUSD)), "催充值,避免断服流失", 45)
-			}
-		}
-		if len(mem.Reasons) > 0 {
-			mem.Urgency += int(spend30)
-			// 分级:30天内有过消费的客户出状况=紧急(该马上催);30天全无消费=长期沉默(低优先级,页面折叠、不进红徽章)
-			if spend30 > 0 {
-				mem.Level = "urgent"
-			} else {
-				mem.Level = "info"
-			}
-			b := getBucket(u.GroupID)
-			b.members = append(b.members, mem)
-			b.comp.Spend30USD += spend30
-		}
+		b := getBucket(u.GroupID)
+		b.members = append(b.members, mem)
+		b.comp.Spend30USD += mem.Spend30USD
 	}
 
 	// 公司级信号:试用到期临近 / 空分组

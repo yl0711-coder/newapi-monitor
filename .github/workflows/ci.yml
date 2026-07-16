@@ -17,7 +17,8 @@ jobs:
         with:
           go-version: '1.25'
       - run: go vet ./...
-      - run: go test ./...
+      # -race:代码里有 singleflight 缓存/多把 mutex/channel 无锁同步,竞态检测必须常开
+      - run: go test -race ./...
       - name: golangci-lint
         uses: golangci/golangci-lint-action@v6
         with:
