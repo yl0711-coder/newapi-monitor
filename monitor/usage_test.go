@@ -85,7 +85,7 @@ func newFakeProdDB(t *testing.T) *sql.DB {
 	t.Cleanup(func() { db.Close() })
 	stmts := []string{
 		"CREATE TABLE users (id INTEGER PRIMARY KEY, username TEXT, email TEXT, quota INTEGER, used_quota INTEGER)",
-		"CREATE TABLE logs (id INTEGER PRIMARY KEY, user_id INTEGER, created_at INTEGER, type INTEGER, model_name TEXT, quota INTEGER, prompt_tokens INTEGER, completion_tokens INTEGER, `group` TEXT, token_id INTEGER DEFAULT 0, token_name TEXT DEFAULT '', username TEXT DEFAULT '', use_time INTEGER DEFAULT 0)",
+		"CREATE TABLE logs (id INTEGER PRIMARY KEY, user_id INTEGER, created_at INTEGER, type INTEGER, model_name TEXT, quota INTEGER, prompt_tokens INTEGER, completion_tokens INTEGER, `group` TEXT, token_id INTEGER DEFAULT 0, token_name TEXT DEFAULT '', username TEXT DEFAULT '', use_time INTEGER DEFAULT 0, is_stream INTEGER DEFAULT 0, content TEXT DEFAULT '', other TEXT DEFAULT '')",
 		"CREATE TABLE tokens (id INTEGER PRIMARY KEY, user_id INTEGER, name TEXT, `key` TEXT, `group` TEXT)",
 	}
 	for _, s := range stmts {
@@ -535,109 +535,202 @@ func TestMaskTokenKey(t *testing.T) {
 func TestQueryGroupLogs(t *testing.T) {
 	m := newTestMonitor(t)
 	m.prodDB = newFakeProdDB(t)
-	// group A = uid 10,11;别的组 uid 20。造 type=2 日志(id 升序=时间升序)
+	// group A = uid 10,11;别的组 uid 20。id 升序=时间升序;含多种 type + 流/首字 + content/other
 	seed := [][]any{
-		// id,user_id,created_at,type,model,quota,pt,ct,group,token_name,username,use_time
-		{1, 10, 1000, 2, "gpt", 500000, 100, 20, "default", "tkA", "u10", 3},
-		{2, 11, 1100, 2, "claude", 250000, 50, 10, "default", "tkB", "u11", 5},
-		{3, 10, 1200, 2, "gpt", 1000000, 200, 40, "default", "tkA", "u10", 8},
-		{4, 20, 1300, 2, "gpt", 999999, 1, 1, "default", "tkX", "u20", 1}, // 别的组,不该出现
-		{5, 11, 1400, 2, "gpt", 300000, 30, 6, "vip", "tkB", "u11", 2},    // 分组=vip,验分组筛选
+		// id,user_id,created_at,type,model,quota,pt,ct,group,token_name,username,use_time,is_stream,content,other
+		{1, 10, 1000, 2, "gpt", 500000, 100, 20, "default", "tkA", "u10", 3, 0, "", ""},
+		{2, 11, 1100, 2, "claude", 250000, 50, 10, "default", "tkB", "u11", 5, 1, "", `{"frt":3400,"model_ratio":2.5,"group_ratio":1.4,"cache_tokens":100,"cache_ratio":0.1,"channel_id":9,"channel_name":"secret-up"}`}, // 流式+首字;倍率+输入价+缓存读;other含渠道(必须不外传)
+		{3, 10, 1200, 2, "gpt", 1000000, 200, 40, "default", "tkA", "u10", 8, 0, "", `{"group_ratio":1.2}`},
+		{4, 20, 1300, 2, "gpt", 999999, 1, 1, "default", "tkX", "u20", 1, 0, "", ""},                                                    // 别的组,不该出现
+		{5, 11, 1400, 2, "gpt", 300000, 30, 6, "vip", "tkB", "u11", 2, 0, "", ""},                                                       // 分组=vip
+		{6, 10, 1500, 5, "gpt", 0, 0, 0, "default", "tkA", "u10", 120, 0, "上游返回 429 限流", `{"channel_id":9,"channel_name":"secret-up"}`}, // 错误(type=5),content=错误信息
+		{7, 11, 1600, 1, "", 5000000, 0, 0, "", "", "u11", 0, 0, "充值 $10", ""},                                                          // 充值(type=1),content=充值说明
+		{8, 11, 1700, 6, "", 1000000, 0, 0, "", "", "u11", 0, 0, "", ""},                                                                // 退款(type=6):不对客户展示,不该出现
 	}
 	for _, r := range seed {
-		if _, err := m.prodDB.Exec("INSERT INTO logs (id,user_id,created_at,type,model_name,quota,prompt_tokens,completion_tokens,`group`,token_name,username,use_time) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", r...); err != nil {
+		if _, err := m.prodDB.Exec("INSERT INTO logs (id,user_id,created_at,type,model_name,quota,prompt_tokens,completion_tokens,`group`,token_name,username,use_time,is_stream,content,other) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", r...); err != nil {
 			t.Fatal(err)
 		}
 	}
 	ids := []int64{10, 11}
-	// 全部(窗口 0..2000):应 4 条(id 1,2,3,5),倒序 → 5,3,2,1;绝无 uid20 的 id4
-	all, err := m.queryGroupLogs(context.Background(), ids, 0, 2000, 0, "", "", "", 0, 100)
+	// 全部(logType=0)排除错误(5)/退款(6):本组应 5 条(id 1,2,3,5,7),倒序 → 7,5,3,2,1;绝无 uid20 的 id4、错误 id6、退款 id8
+	all, err := m.queryGroupLogs(context.Background(), ids, 0, 2000, 0, 0, "", "", "", 0, 100)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(all) != 4 {
-		t.Fatalf("应 4 条(本组),实得 %d: %+v", len(all), all)
+	if len(all) != 5 {
+		t.Fatalf("全部(不含错误/退款)应 5 条,实得 %d: %+v", len(all), all)
 	}
-	if all[0].ID != 5 || all[3].ID != 1 {
-		t.Fatalf("倒序不对: %d..%d", all[0].ID, all[3].ID)
+	if all[0].ID != 7 || all[4].ID != 1 {
+		t.Fatalf("倒序不对: %d..%d", all[0].ID, all[4].ID)
 	}
 	for _, r := range all {
-		if r.ID == 4 {
-			t.Fatal("越权:出现了别的组的日志 id=4")
+		if r.ID == 4 || r.Type == 5 || r.Type == 6 {
+			t.Fatalf("不该出现的行(越权/错误/退款): %+v", r)
 		}
 	}
-	// 校验字段(id=3 那条)
+	// 类型筛选 消费(2):id 1,2,3,5
+	if cs, _ := m.queryGroupLogs(context.Background(), ids, 0, 2000, 0, 2, "", "", "", 0, 100); len(cs) != 4 {
+		t.Fatalf("消费类型筛选应 4 条,得 %d", len(cs))
+	}
+	// 流式+首字:id2 应 IsStream=true、FirstByteMs=3400,且【绝不】泄露 other 里的渠道
+	var r2 LogRow
+	for _, r := range all {
+		if r.ID == 2 {
+			r2 = r
+		}
+	}
+	if !r2.IsStream || r2.FirstByteMs != 3400 {
+		t.Fatalf("流式/首字不对: %+v", r2)
+	}
+	// 校验字段(id=3):消费、非流、有花费
 	var r3 LogRow
 	for _, r := range all {
 		if r.ID == 3 {
 			r3 = r
 		}
 	}
-	if r3.Member != "u10" || r3.ModelName != "gpt" || r3.PromptTokens != 200 || r3.CompletionTokens != 40 || r3.UseTime != 8 || r3.CostUSD != 2 {
+	if r3.Member != "u10" || r3.Type != 2 || r3.ModelName != "gpt" || r3.PromptTokens != 200 || r3.UseTime != 8 || r3.CostUSD != 2 || r3.IsStream {
 		t.Fatalf("字段不对: %+v", r3)
 	}
+	// 费用仅消费(type=2)有值:充值 id7(type=1)quota 非0 但语义是金额,CostUSD 必须为 0(前端/CSV 留空)
+	for _, r := range all {
+		if r.ID == 7 && r.CostUSD != 0 {
+			t.Fatalf("充值行费用应为 0(不当消费费用), 得 %v", r.CostUSD)
+		}
+	}
 	// 模型筛选 claude:只 id2
-	cl, _ := m.queryGroupLogs(context.Background(), ids, 0, 2000, 0, "claude", "", "", 0, 100)
+	cl, _ := m.queryGroupLogs(context.Background(), ids, 0, 2000, 0, 0, "claude", "", "", 0, 100)
 	if len(cl) != 1 || cl[0].ID != 2 {
 		t.Fatalf("模型筛选不对: %+v", cl)
 	}
 	// 分组筛选 vip:只 id5
-	vg, _ := m.queryGroupLogs(context.Background(), ids, 0, 2000, 0, "", "vip", "", 0, 100)
+	vg, _ := m.queryGroupLogs(context.Background(), ids, 0, 2000, 0, 0, "", "vip", "", 0, 100)
 	if len(vg) != 1 || vg[0].ID != 5 {
 		t.Fatalf("分组筛选不对: %+v", vg)
 	}
-	// 计数:全部=4,与查询口径一致;带筛选也一致
-	if n, err := m.countGroupLogs(context.Background(), ids, 0, 2000, 0, "", "", ""); err != nil || n != 4 {
-		t.Fatalf("总计数 = %d, %v; want 4", n, err)
+	// 计数:全部(不含错误)=5;消费=4;成员 uid11=id 2,5,7=3
+	if n, err := m.countGroupLogs(context.Background(), ids, 0, 2000, 0, 0, "", "", ""); err != nil || n != 5 {
+		t.Fatalf("总计数 = %d, %v; want 5", n, err)
 	}
-	if n, _ := m.countGroupLogs(context.Background(), ids, 0, 2000, 11, "", "", ""); n != 2 {
-		t.Fatalf("成员计数 = %d; want 2", n)
+	if n, _ := m.countGroupLogs(context.Background(), ids, 0, 2000, 0, 2, "", "", ""); n != 4 {
+		t.Fatalf("消费计数 = %d; want 4", n)
 	}
-	if n, _ := m.countGroupLogs(context.Background(), ids, 0, 2000, 0, "", "vip", ""); n != 1 {
-		t.Fatalf("分组计数 = %d; want 1", n)
+	if n, _ := m.countGroupLogs(context.Background(), ids, 0, 2000, 11, 0, "", "", ""); n != 3 {
+		t.Fatalf("成员计数 = %d; want 3", n)
 	}
-	// 成员筛选 uid=11:id 2,5
-	mem, _ := m.queryGroupLogs(context.Background(), ids, 0, 2000, 11, "", "", "", 0, 100)
-	if len(mem) != 2 {
-		t.Fatalf("成员筛选不对: %+v", mem)
-	}
-	// 游标分页:limit 2 → 5,3;再传 cursor=3 → 2,1
-	p1, _ := m.queryGroupLogs(context.Background(), ids, 0, 2000, 0, "", "", "", 0, 2)
-	if len(p1) != 2 || p1[0].ID != 5 || p1[1].ID != 3 {
+	// 游标分页(全部,不含错误):limit 2 → 7,5;再传 cursor=5 → 3,2
+	p1, _ := m.queryGroupLogs(context.Background(), ids, 0, 2000, 0, 0, "", "", "", 0, 2)
+	if len(p1) != 2 || p1[0].ID != 7 || p1[1].ID != 5 {
 		t.Fatalf("第一页不对: %+v", p1)
 	}
-	p2, _ := m.queryGroupLogs(context.Background(), ids, 0, 2000, 0, "", "", "", p1[1].ID, 2)
-	if len(p2) != 2 || p2[0].ID != 2 || p2[1].ID != 1 {
+	p2, _ := m.queryGroupLogs(context.Background(), ids, 0, 2000, 0, 0, "", "", "", p1[1].ID, 2)
+	if len(p2) != 2 || p2[0].ID != 3 || p2[1].ID != 2 {
 		t.Fatalf("第二页不对: %+v", p2)
 	}
 	// 时间窗口 [0,1150):只 id 1,2
-	win, _ := m.queryGroupLogs(context.Background(), ids, 0, 1150, 0, "", "", "", 0, 100)
+	win, _ := m.queryGroupLogs(context.Background(), ids, 0, 1150, 0, 0, "", "", "", 0, 100)
 	if len(win) != 2 {
 		t.Fatalf("时间窗口不对: %+v", win)
 	}
+	// 令牌搜索:通配符按字面匹配(%/_ 已转义),"%"搜不到任何行;正常子串仍可搜到
+	if tw, _ := m.queryGroupLogs(context.Background(), ids, 0, 2000, 0, 0, "", "", "%", 0, 100); len(tw) != 0 {
+		t.Fatalf("通配符应按字面匹配,搜'%%'应 0 条,得 %d", len(tw))
+	}
+	if tw, _ := m.queryGroupLogs(context.Background(), ids, 0, 2000, 0, 0, "", "", "kA", 0, 100); len(tw) != 2 {
+		t.Fatalf("子串搜索 kA 应 2 条(tkA),得 %d", len(tw))
+	}
+	// 详情摘要口径(对齐 new-api):消费按价/倍率,退款固定文案,其余回退 content
+	byID := map[int64]LogRow{}
+	for _, r := range all {
+		byID[r.ID] = r
+	}
+	// 多行详情,对齐 new-api 线上:首行倍率,再 输入价、缓存读(model_ratio 2.5→$5;cache_ratio 0.1→$0.5)
+	if d := byID[2].Detail; d != "分组倍率 1.4x\n输入 $5 / 1M tokens\n缓存读 $0.5 / 1M tokens" {
+		t.Fatalf("id2 计价详情 = %q", d)
+	}
+	if d := byID[3].Detail; d != "分组倍率 1.2x" {
+		t.Fatalf("id3 倍率详情 = %q", d)
+	}
+	if d := byID[7].Detail; d != "充值 $10" { // 充值 → content
+		t.Fatalf("id7 充值详情 = %q", d)
+	}
+	// 渠道零泄露:id2/id6 的 other 里有 channel_name,任何字段都不该带出
+	for _, r := range all {
+		blob := r.Detail + "|" + r.TokenName + "|" + r.ModelName + "|" + r.Group
+		if strings.Contains(blob, "secret-up") || strings.Contains(blob, "channel") {
+			t.Fatalf("渠道泄露: %+v", r)
+		}
+	}
 }
 
-// 导出限流:每组织账号窗口内 1 次,仅 consume 才占用。
+// 导出限流:每组织账号窗口内 1 次;reserve 原子预占(并发只有一个能过),rollback 撤销(探测/失败不计次)。
 func TestExportLimiter(t *testing.T) {
 	l := &exportLimiter{last: map[int64]int64{}}
 	now := int64(100000)
 	win := int64(300) // 5min
-	if !l.allow(1, now, win) {
-		t.Fatal("首次应允许")
+	prev, ok := l.reserve(1, now, win)
+	if !ok {
+		t.Fatal("首次应预占成功")
 	}
-	l.consume(1, now) // 成功导出
-	if l.allow(1, now+299, win) {
-		t.Fatal("5分钟内应拒绝")
+	// 并发第二个请求(占位未释放)必须被挡——check-then-act 竞态的回归防线
+	if _, ok2 := l.reserve(1, now+1, win); ok2 {
+		t.Fatal("预占期间并发请求应被拒")
 	}
-	if !l.allow(1, now+300, win) {
-		t.Fatal("满5分钟应放行")
+	// 探测/失败:回退后立刻可再占(不计次)
+	l.rollback(1, prev, now)
+	if _, ok3 := l.reserve(1, now+2, win); !ok3 {
+		t.Fatal("回退后应放行")
 	}
-	if !l.allow(2, now+10, win) {
+	// 本次视为成功下载(不回退):窗口内拒绝、满窗放行
+	if _, bad := l.reserve(1, now+2+win-1, win); bad {
+		t.Fatal("窗口内应拒绝")
+	}
+	if _, ok4 := l.reserve(1, now+2+win, win); !ok4 {
+		t.Fatal("满窗应放行")
+	}
+	// 迟到的 rollback(占位已被新预占覆盖)不得误撤别人的占位
+	l.rollback(1, prev, now) // reservedAt=now 已不是当前占位
+	if _, bad := l.reserve(1, now+2+win+1, win); bad {
+		t.Fatal("误撤保护失败:新占位被旧 rollback 清掉了")
+	}
+	if _, ok5 := l.reserve(2, now+10, win); !ok5 {
 		t.Fatal("别的组织不受影响")
 	}
 	// prune 清理过期
-	l.prune(now+1000, win)
+	l.prune(now+9000, win)
 	if len(l.last) != 0 {
 		t.Fatalf("prune 应清空过期: %d", len(l.last))
+	}
+}
+
+// 详情文案各分支 + 内部信息剔除(纵深防御)+ 阶梯计费不显错误单价。
+func TestBuildLogDetail(t *testing.T) {
+	f := func(v float64) *float64 { return &v }
+	cases := []struct {
+		name    string
+		logType int
+		o       *logOther
+		content string
+		want    string
+	}{
+		{"退款固定文案", 6, nil, "", "异步任务退款"},
+		{"充值回退content", 1, nil, "充值 $10.00", "充值 $10.00"},
+		{"消费标准价+缓存读", 2, &logOther{GroupRatio: f(1.4), ModelRatio: f(2.5), CacheTokens: 100, CacheRatio: f(0.1)},
+			"", "分组倍率 1.4x\n输入 $5 / 1M tokens\n缓存读 $0.5 / 1M tokens"},
+		{"按次计费", 2, &logOther{ModelPrice: f(0.03)}, "", "模型价格 $0.03"},
+		{"专属倍率优先", 2, &logOther{UserGroupRatio: f(0.8), GroupRatio: f(1.4), ModelRatio: f(1)}, "",
+			"专属倍率 0.8x\n输入 $2 / 1M tokens"},
+		// 阶梯计费:model_ratio/price 为0,绝不能显 "$0/1M",回退 content
+		{"阶梯计费回退content", 2, &logOther{BillingMode: "tiered_expr", ModelRatio: f(0)}, "阶梯: 见计费表", "阶梯: 见计费表"},
+		{"阶梯计费无content标注", 2, &logOther{BillingMode: "tiered_expr", GroupRatio: f(1.2)}, "", "阶梯计费 · 分组倍率 1.2x"},
+		// 纵深防御:含"渠道"的系统日志 content 一律隐去(如管理员账号误入客户组)
+		{"系统日志渠道信息剔除", 4, nil, "查看渠道密钥信息 (渠道ID: 5)", ""},
+		{"管理日志正常保留", 3, nil, "管理员增加用户额度 $50", "管理员增加用户额度 $50"},
+	}
+	for _, c := range cases {
+		if got := buildLogDetail(c.logType, c.o, c.content); got != c.want {
+			t.Errorf("%s: buildLogDetail = %q, want %q", c.name, got, c.want)
+		}
 	}
 }

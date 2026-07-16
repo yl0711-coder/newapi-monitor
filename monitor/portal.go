@@ -23,6 +23,7 @@ import (
 	"encoding/csv"
 	"encoding/hex"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"sort"
 	"strconv"
@@ -222,22 +223,33 @@ func (l *portalLimiter) prune(now int64) {
 }
 
 // ---- 导出限流(每组织账号 gid:窗口内最多 1 次,仅计成功下载) ----
+// 原子预占语义:reserve 在检查通过的同一把锁内立即写入占位,并发请求不可能同时通过
+// (check-then-act 分离会被并发绕过);探测/失败路径用 rollback 退回,保住"仅计成功下载"。
 
 type exportLimiter struct {
 	mu   sync.Mutex
-	last map[int64]int64 // gid -> 最近一次成功导出 unix
+	last map[int64]int64 // gid -> 最近一次占位(成功导出/在途预占)unix
 }
 
-func (l *exportLimiter) allow(gid, now, window int64) bool {
+// reserve 窗口内无占用则原子占位并返回旧值(供回退);否则 ok=false。
+func (l *exportLimiter) reserve(gid, now, window int64) (prev int64, ok bool) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	return now-l.last[gid] >= window
+	if now-l.last[gid] < window {
+		return 0, false
+	}
+	prev = l.last[gid]
+	l.last[gid] = now
+	return prev, true
 }
 
-func (l *exportLimiter) consume(gid, now int64) {
+// rollback 撤销 reserve 的占位(探测/出错未真正下载时调用);仅当占位仍是自己写的才回退。
+func (l *exportLimiter) rollback(gid, prev, reservedAt int64) {
 	l.mu.Lock()
-	l.last[gid] = now
-	l.mu.Unlock()
+	defer l.mu.Unlock()
+	if l.last[gid] == reservedAt {
+		l.last[gid] = prev
+	}
 }
 
 func (l *exportLimiter) prune(now, window int64) {
@@ -388,7 +400,8 @@ func (m *Monitor) portalChangePassword(c *gin.Context) {
 		return
 	}
 	if err := m.storeDB.Model(&CustomerGroup{}).Where("id = ?", gid).Update("portal_pw_user", h).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		slog.Warn("客户改密码写库失败", "gid", gid, "err", err) // 细节进日志,不回显库内部结构给客户
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "保存失败,请稍后重试"})
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"ok": true})
@@ -560,7 +573,7 @@ func (m *Monitor) portalUserDetail(c *gin.Context) {
 // ---- 使用日志(逐条明细):查看 + CSV 导出 ----
 
 // portalLogParams 解析并校验日志相关的公共参数(组隔离:成员必属本组)。
-func (m *Monitor) portalLogParams(c *gin.Context) (gid int64, ids []int64, memberUID, fromTs, toTs int64, model, group, tokenName string, err error) {
+func (m *Monitor) portalLogParams(c *gin.Context) (gid int64, ids []int64, memberUID, fromTs, toTs int64, logType int, model, group, tokenName string, err error) {
 	gid = c.GetInt64("portalGID")
 	fromTs, toTs, err = parseUsageRange(c.Query("from"), c.Query("to"), time.Now())
 	if err != nil {
@@ -583,15 +596,29 @@ func (m *Monitor) portalLogParams(c *gin.Context) (gid int64, ids []int64, membe
 			return
 		}
 	}
+	if t, e := strconv.Atoi(c.Query("type")); e == nil {
+		switch {
+		case t >= 1 && t <= 4:
+			logType = t // 具体类型(充值1/消费2/管理3/系统4)
+		case t == 5 || t == 6:
+			err = fmt.Errorf("该日志类型不对外提供") // 错误/退款不对客户展示;显式拒绝而非静默当"全部"
+			return
+		}
+		// 其余(0/越界)= 全部(本身不含 5/6)
+	}
 	model = strings.TrimSpace(c.Query("model"))
 	group = strings.TrimSpace(c.Query("group"))
 	tokenName = strings.TrimSpace(c.Query("token"))
+	if len(tokenName) > 64 { // 令牌名搜索限长:防超长 LIKE 模式拖慢生产库查询
+		err = fmt.Errorf("令牌名搜索最长 64 字符")
+		return
+	}
 	return
 }
 
 // portalLogs GET /api/logs:游标分页看本组消费日志(时间倒序)。
 func (m *Monitor) portalLogs(c *gin.Context) {
-	gid, ids, memberUID, fromTs, toTs, model, group, tokenName, err := m.portalLogParams(c)
+	gid, ids, memberUID, fromTs, toTs, logType, model, group, tokenName, err := m.portalLogParams(c)
 	if err != nil {
 		if err.Error() == "member not in group" {
 			c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
@@ -606,7 +633,7 @@ func (m *Monitor) portalLogs(c *gin.Context) {
 		return
 	}
 	beforeID, _ := strconv.ParseInt(c.Query("cursor"), 10, 64)
-	rows, err := m.queryGroupLogs(c.Request.Context(), ids, fromTs, toTs, memberUID, model, group, tokenName, beforeID, portalLogPageSize+1)
+	rows, err := m.queryGroupLogs(c.Request.Context(), ids, fromTs, toTs, memberUID, logType, model, group, tokenName, beforeID, portalLogPageSize+1)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "查询失败,请稍后重试"})
 		return
@@ -621,17 +648,30 @@ func (m *Monitor) portalLogs(c *gin.Context) {
 	}
 	resp := gin.H{"ok": true, "rows": rows, "has_more": hasMore, "next_cursor": next}
 	if beforeID == 0 { // 仅首页(筛选变更时)数一次总条数,前端据此算总页数并在翻页时复用
-		if total, err := m.countGroupLogs(c.Request.Context(), ids, fromTs, toTs, memberUID, model, group, tokenName); err == nil {
+		if total, err := m.countGroupLogs(c.Request.Context(), ids, fromTs, toTs, memberUID, logType, model, group, tokenName); err == nil {
 			resp["total"] = total
 		}
 	}
 	c.JSON(http.StatusOK, resp)
 }
 
-// portalLogsExport GET /api/logs/export:CSV 导出。超 90 天由 parseUsageRange 拒;超 5 万条且未确认→返回 need_confirm;
-// 确认(confirm=1)则导最新 5 万条。限流每组织账号 1 次/5min,仅计成功下载(探测/取消不计)。
+// csvSafe 防 CSV 公式注入:文本以 = + - @ 制表符或回车开头时前置单引号,Excel/WPS 打开时按文本处理。
+// 令牌名/详情等值最终来自用户可控输入(如用户把令牌起名 =HYPERLINK(...)),导出前必须消毒。
+func csvSafe(s string) string {
+	if s == "" {
+		return s
+	}
+	switch s[0] {
+	case '=', '+', '-', '@', '\t', '\r':
+		return "'" + s
+	}
+	return s
+}
+
+// portalLogsExport GET /api/logs/export:CSV 导出。顺序:限流(1次/5min,仅计成功下载)→ COUNT 探测
+// (超 5 万条且未确认→need_confirm,不拉行)→ 拉行(封顶 5 万)→ CSV。超 90 天由 parseUsageRange 拒。
 func (m *Monitor) portalLogsExport(c *gin.Context) {
-	gid, ids, memberUID, fromTs, toTs, model, group, tokenName, err := m.portalLogParams(c)
+	gid, ids, memberUID, fromTs, toTs, logType, model, group, tokenName, err := m.portalLogParams(c)
 	if err != nil {
 		if err.Error() == "member not in group" {
 			c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
@@ -644,42 +684,58 @@ func (m *Monitor) portalLogsExport(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"error": "本组暂无成员日志"})
 		return
 	}
-	confirm := c.Query("confirm") == "1"
-	rows, err := m.queryGroupLogs(c.Request.Context(), ids, fromTs, toTs, memberUID, model, group, tokenName, 0, portalExportCap+1)
+	// 限流前置 + 原子预占:窗口内已有占用直接拒,重查询根本不执行;并发请求只有一个能占到位。
+	// 探测(need_confirm)/查询失败走 rollback 不计次,仅成功下载保留占位(defer 统一处理)。
+	now := time.Now().Unix()
+	prev, ok := m.exportLim.reserve(gid, now, int64(portalExportWindow.Seconds()))
+	if !ok {
+		c.JSON(http.StatusTooManyRequests, gin.H{"error": "导出过于频繁,请 5 分钟后再试"})
+		return
+	}
+	downloaded := false
+	defer func() {
+		if !downloaded {
+			m.exportLim.rollback(gid, prev, now)
+		}
+	}()
+	// 探测用轻量 COUNT(走索引,毫秒级),不再为判断超限拉 5 万整行
+	total, err := m.countGroupLogs(c.Request.Context(), ids, fromTs, toTs, memberUID, logType, model, group, tokenName)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "查询失败,请稍后重试"})
 		return
 	}
-	over := len(rows) > portalExportCap
-	if over && !confirm { // 超上限、未确认:让前端弹确认框(不消耗限流、不下载)
+	confirm := c.Query("confirm") == "1"
+	if total > portalExportCap && !confirm { // 超上限、未确认:让前端弹确认框(不消耗限流、不拉行)
 		c.JSON(http.StatusOK, gin.H{"need_confirm": true, "cap": portalExportCap})
 		return
 	}
-	if over {
-		rows = rows[:portalExportCap] // 确认后导最新 cap 条
-	}
-	now := time.Now().Unix()
-	if !m.exportLim.allow(gid, now, int64(portalExportWindow.Seconds())) {
-		c.JSON(http.StatusTooManyRequests, gin.H{"error": "导出过于频繁,请 5 分钟后再试"})
+	rows, err := m.queryGroupLogs(c.Request.Context(), ids, fromTs, toTs, memberUID, logType, model, group, tokenName, 0, portalExportCap)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "查询失败,请稍后重试"})
 		return
 	}
-	// 生成 CSV(带 UTF-8 BOM,Excel 中文不乱码)
+	// 生成 CSV(带 UTF-8 BOM,Excel 中文不乱码;文本列过 csvSafe 防公式注入)
 	var buf bytes.Buffer
 	buf.WriteString("\xEF\xBB\xBF")
 	w := csv.NewWriter(&buf)
-	_ = w.Write([]string{"时间", "成员", "令牌", "模型", "分组", "输入tokens", "输出tokens", "耗时(秒)", "费用(美元)"})
+	_ = w.Write([]string{"时间", "成员", "令牌", "分组", "类型", "模型", "用时(秒)", "输入tokens", "输出tokens", "费用(美元)", "详情"})
 	for _, r := range rows {
+		cost := "" // 费用仅消费有意义;quotaPerUSD=500000,6位小数可精确表示,避免小额行舍入成 0
+		if r.Type == 2 {
+			cost = strconv.FormatFloat(r.CostUSD, 'f', 6, 64)
+		}
 		_ = w.Write([]string{
 			time.Unix(r.CreatedAt, 0).In(usageCST).Format("2006-01-02 15:04:05"),
-			r.Member, r.TokenName, r.ModelName, r.Group,
+			csvSafe(r.Member), csvSafe(r.TokenName), csvSafe(r.Group), logTypeName(r.Type), csvSafe(r.ModelName),
+			strconv.FormatInt(r.UseTime, 10),
 			strconv.FormatInt(r.PromptTokens, 10),
 			strconv.FormatInt(r.CompletionTokens, 10),
-			strconv.FormatInt(r.UseTime, 10),
-			strconv.FormatFloat(r.CostUSD, 'f', 4, 64),
+			cost,
+			csvSafe(r.Detail),
 		})
 	}
 	w.Flush()
-	m.exportLim.consume(gid, now) // 成功生成即消耗一次配额
+	downloaded = true // 成功生成:保留预占 = 消耗一次配额(defer 不再回退)
 	fname := fmt.Sprintf("usage-logs-%s_%s.csv",
 		time.Unix(fromTs, 0).In(usageCST).Format("20060102"),
 		time.Unix(toTs-1, 0).In(usageCST).Format("20060102"))

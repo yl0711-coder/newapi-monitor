@@ -259,3 +259,49 @@ func TestTTLCacheSingleflight(t *testing.T) {
 		t.Fatalf("TTL 内应命中缓存,calls=%d err=%v", calls.Load(), err)
 	}
 }
+
+// CSV 公式注入消毒:= + - @ 开头的文本前置单引号,其余原样。
+func TestCSVSafe(t *testing.T) {
+	cases := map[string]string{
+		"=HYPERLINK(\"x\")": "'=HYPERLINK(\"x\")",
+		"+1+1":              "'+1+1",
+		"-2":                "'-2",
+		"@cmd":              "'@cmd",
+		"\tx":               "'\tx",
+		"\rx":               "'\rx",
+		"正常令牌":              "正常令牌",
+		"tk-01":             "tk-01",
+		"":                  "",
+	}
+	for in, want := range cases {
+		if got := csvSafe(in); got != want {
+			t.Fatalf("csvSafe(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// 客户日志 API 参数契约:错误(5)/退款(6)不对客户提供,显式请求必须 400(防参数层校验被放宽的回归);
+// 令牌名搜索超长同样 400。查看与导出共用 portalLogParams,两端点都验。
+func TestPortalLogsParamContract(t *testing.T) {
+	m, _, portal := newPortalTestMonitor(t)
+	h, _ := hashPassword("password-aaa")
+	g := CustomerGroup{Name: "A公司", PortalEmail: "a@x.com", PortalPwAdmin: h}
+	m.storeDB.Create(&g)
+	m.storeDB.Create(&TrackedUser{UserID: 101, Username: "a-user", GroupID: g.ID})
+	ck := portalCookie(portalDo(portal, "POST", "/login", `{"email":"a@x.com","password":"password-aaa"}`))
+	if ck == nil {
+		t.Fatal("登录失败")
+	}
+	for _, q := range []string{"type=5", "type=6"} {
+		if w := portalDo(portal, "GET", "/api/logs?"+q, "", ck); w.Code != 400 {
+			t.Fatalf("/api/logs?%s 应 400,得 %d %s", q, w.Code, w.Body.String())
+		}
+		if w := portalDo(portal, "GET", "/api/logs/export?"+q, "", ck); w.Code != 400 {
+			t.Fatalf("/api/logs/export?%s 应 400,得 %d", q, w.Code)
+		}
+	}
+	long := strings.Repeat("a", 65)
+	if w := portalDo(portal, "GET", "/api/logs?token="+long, "", ck); w.Code != 400 {
+		t.Fatalf("超长令牌搜索应 400,得 %d", w.Code)
+	}
+}

@@ -48,7 +48,8 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
 </style>
 </head>
 <body>
-<h1>🔔 报警设置 <span class="muted">· <a href="/">← 返回监控看板</a></span></h1>
+<!-- 返回:从监控页跳来的优先走 history.back()(保留来时的 tab/窗口);直接打开本页时回首页 -->
+<h1>🔔 报警设置 <span class="muted">· <a href="/" onclick="if(document.referrer&&history.length>1){history.back();return false}">← 返回监控看板</a></span></h1>
 <p class="muted">配置后,监控会按下面的规则评估,命中且过冷却就给所有收件人发邮件。阈值都是建议值,可自行调整;上线跑一两周后按真实基线再调更准。</p>
 
 <div id="errBox"></div>

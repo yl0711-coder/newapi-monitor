@@ -120,13 +120,41 @@
   .logfilters select:focus,.logfilters input:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px rgba(79,70,229,.12)}
   .exp-btn{margin-left:auto;background:var(--green);color:#fff;border:none;border-radius:8px;padding:8px 16px;font-size:13px;font-weight:600;cursor:pointer;display:inline-flex;align-items:center;gap:6px}
   .exp-btn:disabled{opacity:.5;cursor:default}
+  /* 导出说明:按钮旁 ? 图标(实心醒目),悬停/聚焦弹出规则卡片(右对齐防溢出) */
+  .exp-help{position:relative;display:inline-flex;align-items:center;justify-content:center;width:24px;height:24px;background:var(--accent);border:none;border-radius:50%;color:#fff;font-size:14px;font-weight:700;cursor:help;user-select:none;flex:none;box-shadow:0 1px 3px rgba(82,87,224,.35)}
+  .exp-help:hover,.exp-help:focus{background:#3f44c9;outline:none}
+  .exp-help .tip{display:none;position:fixed;z-index:45;width:340px;background:var(--surface);border:1px solid var(--border);border-radius:10px;box-shadow:0 8px 28px rgba(20,30,50,.16);padding:12px 14px;font-size:12px;line-height:1.8;color:var(--muted);cursor:auto;font-weight:400;text-align:left}
+  .exp-help .tip b{display:block;color:var(--text);font-size:12.5px;margin-bottom:4px}
+  /* 表头小提示:输入tokens 的口径说明(样式同 new-api 表头 ? 徽标) */
+  .th-help{position:relative;display:inline-flex;align-items:center;justify-content:center;width:15px;height:15px;background:var(--muted2);color:#fff;border-radius:50%;font-size:10.5px;font-weight:700;margin-left:4px;cursor:help;user-select:none;vertical-align:1px}
+  .th-help:hover,.th-help:focus{background:var(--accent);outline:none}
+  .th-help .tip{display:none;position:fixed;z-index:46;width:300px;background:var(--surface);border:1px solid var(--border);border-radius:10px;box-shadow:0 8px 28px rgba(20,30,50,.16);padding:10px 12px;font-size:12px;line-height:1.7;color:var(--muted);font-weight:400;text-align:left;white-space:normal}
   /* 日志表:普通横向滚动,不冻结列(区别于矩阵的 .mxwrap);列宽给足,避免令牌/模型串行 */
   .logwrap{overflow-x:auto}
-  .logtable{min-width:1040px;table-layout:fixed}
+  .logtable{min-width:1440px;table-layout:fixed}
   .logtable th,.logtable td{overflow:hidden;text-overflow:ellipsis}
-  .logtable col.c-time{width:150px}.logtable col.c-mem{width:104px}.logtable col.c-tok{width:172px}
-  .logtable col.c-mdl{width:180px}.logtable col.c-grp{width:118px}.logtable col.c-num{width:104px}
-  .logtable col.c-dur{width:92px}.logtable col.c-cost{width:106px}
+  .logtable col.c-time{width:150px}.logtable col.c-mem{width:98px}.logtable col.c-tok{width:160px}
+  .logtable col.c-grp{width:108px}.logtable col.c-type{width:66px}.logtable col.c-mdl{width:160px}
+  .logtable col.c-dur{width:158px}.logtable col.c-numq{width:126px}.logtable col.c-num{width:98px}.logtable col.c-cost{width:96px}.logtable col.c-detail{width:260px}
+  /* 详情列:可折行显全(不截断),学 new-api 的多行明细——首行(倍率)深色,价格行灰色 */
+  .logtable td.dtl-cell{white-space:normal;overflow:visible;text-overflow:clip;vertical-align:top}
+  .logtable td .dtl-main{color:var(--text);font-size:12.5px;line-height:1.5;display:block}
+  .logtable td .dtl{color:var(--muted);font-size:12px;line-height:1.5;display:block}
+  /* 类型小标 */
+  .tp{display:inline-block;font-size:11px;padding:2px 8px;border-radius:5px;font-weight:500;white-space:nowrap}
+  .tp-consume{color:#0c8557;background:rgba(12,133,87,.10)}
+  .tp-topup{color:#2563eb;background:rgba(37,99,235,.10)}
+  .tp-refund{color:#0891b2;background:rgba(8,145,178,.10)}
+  .tp-error{color:#d33a3a;background:rgba(211,58,58,.10)}
+  .tp-manage{color:#6d7684;background:rgba(109,118,132,.14)}
+  .tp-system{color:#7c6f9c;background:rgba(124,111,156,.14)}
+  .tp-other{color:#6d7684;background:rgba(109,118,132,.14)}
+  /* 用时·首字 小标 */
+  .tb{display:inline-block;font-size:11px;padding:2px 7px;border-radius:5px;margin-right:4px;white-space:nowrap;font-variant-numeric:tabular-nums}
+  .tb-total{color:#0c8557;background:rgba(12,133,87,.10)}
+  .tb-frt{color:#c2410c;background:rgba(224,135,0,.14)}
+  .tb-stream{color:#2563eb;background:rgba(37,99,235,.10)}
+  .tb-nostream{color:#7c6f9c;background:rgba(124,111,156,.14)}
   #logTb td .tm{color:var(--muted);font-variant-numeric:tabular-nums}
   #logTb td .mdl{font-weight:600}
   #logTb td .grp{font-size:11px;color:var(--muted);background:var(--panel);border:1px solid var(--border);border-radius:5px;padding:1px 7px}
@@ -162,7 +190,21 @@
   <a data-v="overview" class="on">用量总览</a><a data-v="logs">使用日志</a>
 </div>
 
-<div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+<!-- 总览工具条:内容对齐管理端「用户用量」(预设 + 自定义起止 + 查询 + 搜索用户 + 统计范围),配色仍客户端浅色 -->
+<div id="ovBar" style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+  <div class="seg" id="ovSeg">
+    <a data-r="today">今天</a><a data-r="7d" class="active">近7天</a><a data-r="15d">近15天</a><a data-r="30d">近30天</a>
+  </div>
+  <span class="rangenote" style="margin:0">自定义:</span>
+  <input type="date" id="ovFrom" class="dateinput"><span class="rangenote" style="margin:0">至</span><input type="date" id="ovTo" class="dateinput">
+  <button type="button" class="btn p" id="ovQuery">查询</button>
+  <span id="ovErr" style="color:var(--red);font-size:12px"></span>
+  <input id="mxSearch" class="mx-search" placeholder="搜索用户(用户名 / 邮箱)" autocomplete="off">
+  <span class="rangenote" id="rangeNote" style="margin:0"></span>
+</div>
+
+<!-- 日志工具条:new-api 风格紧凑日期选择器(仅使用日志视图) -->
+<div id="logsBar" style="display:none;align-items:center;gap:12px;flex-wrap:wrap">
   <!-- 日期选择:镜像 new-api 使用日志的紧凑选择器(触发按钮 + 弹层内 开始/结束 + 预设 + 确定) -->
   <div class="dtpick" id="dtPick">
     <button class="dt-trigger" id="dtTrigger" type="button">
@@ -182,7 +224,7 @@
       <div class="dt-actions"><button type="button" class="btn p" id="dtConfirm">确定</button></div>
     </div>
   </div>
-  <span class="rangenote" id="rangeNote" style="margin:0"></span>
+  <span class="rangenote" id="logRangeNote" style="margin:0"></span>
 </div>
 
 <div class="stat" id="statBar"></div>
@@ -191,8 +233,7 @@
 <div id="listView">
   <div class="card"><div class="card-header">每日消费趋势 <span class="sub">· 全公司范围内每日消耗</span></div><div id="trendChart"></div></div>
   <div class="card" id="mxCard">
-    <div class="card-header">每日用量 <span class="sub">· 行=成员,列=日期,格=当日消耗(美元)· 点成员看明细</span>
-      <input id="mxSearch" class="mx-search" placeholder="搜索成员(用户名/邮箱)" autocomplete="off"></div>
+    <div class="card-header">每日用量 <span class="sub">· 行=成员,列=日期,格=当日消耗(美元)· 点成员看明细</span></div>
     <div class="mxwrap"><table><thead id="thMx"></thead><tbody id="tbMx"></tbody></table></div>
     <div id="mxPager" class="pager"></div>
   </div>
@@ -221,21 +262,32 @@
     <select id="logMember"><option value="">全部成员</option></select>
     <select id="logModel"><option value="">全部模型</option></select>
     <select id="logGroup"><option value="">全部分组</option></select>
+    <select id="logType"><option value="">全部类型</option><option value="1">充值</option><option value="2">消费</option><option value="3">管理</option><option value="4">系统</option></select>
     <input id="logToken" placeholder="令牌名搜索" style="width:150px" autocomplete="off">
     <button class="exp-btn" id="expBtn">⬇ 导出 CSV</button>
+    <span class="exp-help" tabindex="0">?
+      <span class="tip">
+        <b>导出说明</b>
+        · 按当前筛选条件导出,时间范围最长 90 天<br>
+        · 单次最多 5 万条;超出会先确认,导出最新 5 万条,更早的请缩小范围分段导<br>
+        · 每 5 分钟可导出 1 次(仅成功下载计次)<br>
+        · UTF-8 CSV,Excel / WPS 直接打开不乱码
+      </span>
+    </span>
   </div>
   <div class="card">
     <div class="logwrap">
       <table class="logtable">
-        <colgroup><col class="c-time"><col class="c-mem"><col class="c-tok"><col class="c-mdl"><col class="c-grp"><col class="c-num"><col class="c-num"><col class="c-dur"><col class="c-cost"></colgroup>
-        <thead><tr><th>时间</th><th>成员</th><th>令牌</th><th>模型</th><th>分组</th>
-          <th class="right">输入tokens</th><th class="right">输出tokens</th><th class="right">耗时(秒)</th><th class="right">费用(美元)</th></tr></thead>
+        <colgroup><col class="c-time"><col class="c-mem"><col class="c-tok"><col class="c-grp"><col class="c-type"><col class="c-mdl"><col class="c-dur"><col class="c-numq"><col class="c-num"><col class="c-cost"><col class="c-detail"></colgroup>
+        <thead><tr><th>时间</th><th>成员</th><th>令牌</th><th>分组</th><th>类型</th><th>模型</th><th>用时·首字</th>
+          <th class="right">输入tokens<span class="th-help" tabindex="0">?<span class="tip">根据 Anthropic 协定,/v1/messages 的输入 tokens 仅统计非缓存输入,不包含缓存读取与缓存写入 tokens。</span></span></th>
+          <th class="right">输出tokens</th><th class="right">费用(美元)</th><th>详情</th></tr></thead>
         <tbody id="logTb"></tbody>
       </table>
     </div>
     <div class="pager" id="logPager" style="padding:12px 14px"></div>
   </div>
-  <p class="lognote">· 仅含本公司成员的消费日志(不含请求/响应内容)· 时间倒序 · 时间窗口最多 90 天<br>
+  <p class="lognote">· 仅含本公司成员的 充值/消费/管理/系统 日志(不含错误与退款记录、不含请求/响应内容及内部信息)· 时间倒序 · 时间窗口最多 90 天<br>
     · CSV 单次最多导出 5 万条,超出将导最新 5 万条;导出限每 5 分钟 1 次,超量请缩小范围分段导</p>
 </div>
 
@@ -274,7 +326,8 @@
 <script>
 const $=id=>document.getElementById(id);
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-const fmtCost=v=>{v=+v||0;return '$'+(v>=0.01||v===0?v.toFixed(2):v.toFixed(4))};
+// 费用格式:负数(管理员负向调账)负号在 $ 前,如 -$5.00;绝对值 <0.01 用 4 位
+const fmtCost=v=>{v=+v||0;const s=v<0?'-':'',a=Math.abs(v);return s+'$'+(a>=0.01||a===0?a.toFixed(2):a.toFixed(4))};
 const fmtNum=n=>(+n||0).toLocaleString('en-US');
 // 紧凑数字:大数用 k/M/B(1位小数去尾零),避免小卡片挤爆
 const fmtCompact=n=>{n=+n||0;const a=Math.abs(n);for(const [d,u] of [[1e9,'B'],[1e6,'M'],[1e3,'k']]){if(a>=d){const v=n/d;return (Math.abs(v)>=100?v.toFixed(0):v.toFixed(1)).replace(/\.0$/,'')+u;}}return n.toLocaleString('en-US');};
@@ -286,7 +339,7 @@ function rangeDates(r){ // 以本地日期为准(东八区客户),与服务端 C
   if(r==='custom')return {from:customFrom,to:customTo};
   const d=new Date(),p=n=>String(n).padStart(2,'0');
   const ymd=t=>t.getFullYear()+'-'+p(t.getMonth()+1)+'-'+p(t.getDate());
-  const days=r==='today'?0:(r==='7d'?6:(r==='30d'?29:89));
+  const days={today:0,'7d':6,'15d':14,'30d':29,'90d':89}[r]??6;
   const from=new Date(d);from.setDate(d.getDate()-days);
   return {from:ymd(from),to:ymd(d)};
 }
@@ -304,10 +357,13 @@ async function load(){
   ov=d.data;
   $('coName').textContent=ov.group_name||'';
   $('rangeNote').textContent=`统计范围 ${ov.from} ~ ${ov.to}`;
+  $('logRangeNote').textContent=`统计范围 ${ov.from} ~ ${ov.to}`;
+  syncOvBar(); // 总览工具条(预设高亮/起止框)随当前范围同步(含从日志视图改的范围)
   mxPage=1;renderStat();renderMatrix();renderTrend();renderMemberBar();loadBreakdown();
   fillMemberSelect();
   if(detailUid)loadDetail(detailUid); // 切范围时明细页跟着刷新
   if(view==='logs')loadLogs(true);    // 日志视图下切范围 → 重新拉第一页
+  else logDirty=true;                 // 总览里改的范围:回日志视图时强制重拉,防止显旧窗口数据
 }
 // 成员下拉:来自已加载的总览成员(值=user_id)
 function fillMemberSelect(){
@@ -517,7 +573,7 @@ $('mxSearch').addEventListener('input',e=>{
 $('mxPager').addEventListener('click',e=>{
   const b=e.target.closest('[data-pg]');if(!b||b.disabled)return;
   mxPage=+b.dataset.pg;renderMatrix();
-  $('mxSearch').scrollIntoView({block:'nearest'});
+  $('mxCard').scrollIntoView({block:'nearest'});
 });
 // ---- 日期选择器(镜像 new-api 使用日志:触发按钮 + 弹层内 开始/结束草稿 + 预设 + 确定)----
 [$('dFrom'),$('dTo')].forEach(el=>el.setAttribute('max',rangeDates('today').to)); // 不能选未来
@@ -543,6 +599,26 @@ $('dtConfirm').onclick=()=>{
   customFrom=f;customTo=t;range='custom';openDt(false);updateDtLabel();load();
 };
 updateDtLabel();
+// ---- 总览工具条(内容对齐管理端「用户用量」:预设 + 自定义起止 + 查询 + 搜索用户)----
+function syncOvBar(){
+  document.querySelectorAll('#ovSeg a').forEach(x=>x.classList.toggle('active',x.dataset.r===range));
+  const {from,to}=rangeDates(range);$('ovFrom').value=from;$('ovTo').value=to;
+}
+[$('ovFrom'),$('ovTo')].forEach(el=>el.setAttribute('max',rangeDates('today').to)); // 不能选未来
+document.querySelectorAll('#ovSeg a').forEach(a=>a.onclick=()=>{
+  range=a.dataset.r;$('ovErr').textContent='';
+  syncOvBar();updateDtLabel();load();
+});
+// 查询:应用自定义起止;两端必填、起>止自动交换、跨度>90天拦下(与服务端一致)
+$('ovQuery').onclick=()=>{
+  let f=$('ovFrom').value,t=$('ovTo').value;
+  if(!f||!t){$('ovErr').textContent='请选择开始和结束日期';return;}
+  if(f>t){[f,t]=[t,f];$('ovFrom').value=f;$('ovTo').value=t;}
+  if(spanDays(f,t)>90){$('ovErr').textContent='时间范围最长 90 天,请缩小区间';return;}
+  $('ovErr').textContent='';customFrom=f;customTo=t;range='custom';
+  syncOvBar();updateDtLabel();load();
+};
+syncOvBar();
 // 改密码
 $('pwLink').onclick=()=>{$('pwMask').style.display='flex';$('pwMsg').textContent='';$('pwOld').value=$('pwNew').value=$('pwNew2').value='';$('pwOld').focus()};
 $('pwCancel').onclick=()=>$('pwMask').style.display='none';
@@ -563,56 +639,90 @@ function showView(v){
   view=v;
   document.querySelectorAll('#vnav a').forEach(a=>a.classList.toggle('on',a.dataset.v===v));
   const logs=v==='logs';
+  $('ovBar').style.display=logs?'none':'flex';
+  $('logsBar').style.display=logs?'flex':'none';
   $('statBar').style.display=logs?'none':'';
   $('logsView').style.display=logs?'block':'none';
   if(logs){$('listView').style.display='none';$('detail').style.display='none';}
   else{ if(detailUid){$('detail').style.display='block';$('listView').style.display='none';}
         else{$('detail').style.display='none';$('listView').style.display='';} }
-  if(logs&&!logsLoaded){logsLoaded=true;loadLogs(true);}
+  if(logs&&(!logsLoaded||logDirty)){logsLoaded=true;logDirty=false;loadLogs(true);}
 }
 document.querySelectorAll('#vnav a').forEach(a=>a.onclick=()=>showView(a.dataset.v));
 
 // 日志时间:MM-DD HH:mm:ss(本地=东八区客户)
 function fmtLogTime(ts){const d=new Date(ts*1000),p=n=>String(n).padStart(2,'0');
   return `${p(d.getMonth()+1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;}
-function fmtSec(s){s=+s||0;return s>=1?s.toFixed(1)+'s':(s>0?'<1s':'—');}
-// 当前筛选拼成查询串(member/model/token),供查看与导出共用
+// 类型小标(1充值/2消费/3管理/4系统/5错误/6退款)
+const LOG_TYPE={1:['充值','tp-topup'],2:['消费','tp-consume'],3:['管理','tp-manage'],4:['系统','tp-system'],5:['错误','tp-error'],6:['退款','tp-refund']};
+function typeTag(t){const m=LOG_TYPE[t]||['其它','tp-other'];return `<span class="tp ${m[1]}">${m[0]}</span>`;}
+// 用时·首字:总用时 +(流式再显首字)+ 流/非流小标。
+// 秒级截断的 0 秒流式请求仍显示首字/流标(不丢数据);完全无计时信息(如充值/管理)才显 —
+function timeCell(r){
+  const hasInfo=r.use_time>0||r.is_stream;
+  if(!hasInfo)return '<span class="muted">—</span>';
+  const total=r.use_time>0?`<span class="tb tb-total">${r.use_time} s</span>`:'';
+  if(r.is_stream){
+    const frt=r.first_byte_ms>0?`<span class="tb tb-frt">${(r.first_byte_ms/1000).toFixed(1)} s</span>`:'';
+    return `${total}${frt}<span class="tb tb-stream">流</span>`;
+  }
+  return `${total}<span class="tb tb-nostream">非流</span>`;
+}
+// 当前筛选拼成查询串(member/model/group/type/token),供查看与导出共用
 function logQuery(){
   const {from,to}=rangeDates(range);
   let q=`from=${from}&to=${to}`;
-  const mem=$('logMember').value,mdl=$('logModel').value,grp=$('logGroup').value,tok=$('logToken').value.trim();
+  const mem=$('logMember').value,mdl=$('logModel').value,grp=$('logGroup').value,typ=$('logType').value,tok=$('logToken').value.trim();
   if(mem)q+=`&member=${encodeURIComponent(mem)}`;
   if(mdl)q+=`&model=${encodeURIComponent(mdl)}`;
   if(grp)q+=`&group=${encodeURIComponent(grp)}`;
+  if(typ)q+=`&type=${encodeURIComponent(typ)}`;
   if(tok)q+=`&token=${encodeURIComponent(tok)}`;
   return q;
 }
 // 游标分页:logStack 记录各页起始游标(0=首页),末尾即当前页
-let logStack=[0],logHasMore=false,logNextCursor=0,logLoading=false,logTotal=null;
+// logDirty:总览视图里改了日期时置位,回到日志视图时强制重拉(否则表格显旧窗口数据)
+// logPending:请求在途时又有新请求(如切筛选),排队而非丢弃,完成后自动补拉最新条件
+let logStack=[0],logHasMore=false,logNextCursor=0,logLoading=false,logTotal=null,logDirty=false,logPending=false;
 async function loadLogs(reset){
-  if(logLoading)return;
+  if(logLoading){if(reset)logPending=true;return;}
   if(reset)logStack=[0];
   logLoading=true;
   const cursor=logStack[logStack.length-1];
-  $('logTb').innerHTML=`<tr><td colspan="9" class="muted" style="text-align:center;padding:22px">加载中…</td></tr>`;
+  $('logTb').innerHTML=`<tr><td colspan="11" class="muted" style="text-align:center;padding:22px">加载中…</td></tr>`;
+  // 加载中禁用翻页按钮:防在途点「下一页」改了 logStack 却被丢弃,导致页码与展示错位
+  const pv=$('logPrev'),nx=$('logNext');if(pv)pv.disabled=true;if(nx)nx.disabled=true;
   try{
     const d=await api(`/api/logs?${logQuery()}&cursor=${cursor}`);
-    if(!d.ok){$('logTb').innerHTML=`<tr><td colspan="9" class="muted" style="text-align:center;padding:22px">${esc(d.error||'加载失败')}</td></tr>`;$('logPager').innerHTML='';return;}
+    if(!d.ok){$('logTb').innerHTML=`<tr><td colspan="11" class="muted" style="text-align:center;padding:22px">${esc(d.error||'加载失败')}</td></tr>`;$('logPager').innerHTML='';return;}
     logHasMore=!!d.has_more;logNextCursor=d.next_cursor||0;
     if(typeof d.total==='number')logTotal=d.total; // 仅首页返回,翻页复用
     renderLogRows(d.rows||[]);
     renderLogPager();
-  }catch(e){$('logTb').innerHTML=`<tr><td colspan="9" class="muted" style="text-align:center;padding:22px">网络错误,请重试</td></tr>`;}
-  finally{logLoading=false;}
+  }catch(e){$('logTb').innerHTML=`<tr><td colspan="11" class="muted" style="text-align:center;padding:22px">网络错误,请重试</td></tr>`;}
+  finally{
+    logLoading=false;
+    if(logPending){logPending=false;loadLogs(true);} // 在途期间有新筛选/范围 → 按最新条件补拉
+  }
 }
+// 除详情外各列都照实显示(不按类型 gating);空值显 —,详情列可折行显全
+const DASH='<span class="muted">—</span>';
 function renderLogRows(rows){
-  if(!rows.length){$('logTb').innerHTML=`<tr><td colspan="9" class="muted" style="text-align:center;padding:22px">所选范围暂无日志</td></tr>`;return;}
+  if(!rows.length){$('logTb').innerHTML=`<tr><td colspan="11" class="muted" style="text-align:center;padding:22px">所选范围暂无日志</td></tr>`;return;}
   $('logTb').innerHTML=rows.map(r=>{
-    const grp=r.group?`<span class="grp">${esc(r.group)}</span>`:'<span class="muted">默认</span>';
-    return `<tr><td class="tm">${fmtLogTime(r.created_at)}</td><td title="${esc(r.member||'')}">${esc(r.member||'—')}</td>`
-      +`<td title="${esc(r.token_name||'')}">${esc(r.token_name||'—')}</td><td class="mdl" title="${esc(r.model_name||'')}">${esc(r.model_name||'—')}</td><td>${grp}</td>`
-      +`<td class="right num">${fmtNum(r.prompt_tokens)}</td><td class="right num">${fmtNum(r.completion_tokens)}</td>`
-      +`<td class="right num">${fmtSec(r.use_time)}</td><td class="right num cost">${fmtCost(r.cost_usd)}</td></tr>`;
+    const grp=r.group?`<span class="grp">${esc(r.group)}</span>`:DASH;
+    // 详情:多行(对齐 new-api——首行倍率深色,价格行灰色)
+    const detail=r.detail?r.detail.split('\n').map((ln,i)=>`<span class="${i===0?'dtl-main':'dtl'}">${esc(ln)}</span>`).join(''):DASH;
+    return `<tr><td class="tm">${fmtLogTime(r.created_at)}</td>`
+      +`<td title="${esc(r.member||'')}">${r.member?esc(r.member):DASH}</td>`
+      +`<td title="${esc(r.token_name||'')}">${r.token_name?esc(r.token_name):DASH}</td>`
+      +`<td>${grp}</td><td>${typeTag(r.type)}</td>`
+      +`<td class="mdl" title="${esc(r.model_name||'')}">${r.model_name?esc(r.model_name):DASH}</td>`
+      +`<td>${timeCell(r)}</td>`
+      +`<td class="right num">${fmtNum(r.prompt_tokens)}</td>`
+      +`<td class="right num">${fmtNum(r.completion_tokens)}</td>`
+      +`<td class="right num">${r.type===2?`<span class="cost">${fmtCost(r.cost_usd)}</span>`:DASH}</td>`
+      +`<td class="dtl-cell">${detail}</td></tr>`;
   }).join('');
 }
 function renderLogPager(){
@@ -630,9 +740,33 @@ function renderLogPager(){
   if(nx)nx.onclick=()=>{if(logHasMore){logStack.push(logNextCursor);loadLogs(false);}};
 }
 // 筛选变化 → 回到第一页重拉(令牌搜索防抖)
+// ? 提示弹层(导出说明/表头口径):fixed 定位跟随图标(不被滚动容器裁剪);
+// 自适应方向——上方空间够优先显示在图标上方,不够才落到下方
+function attachTips(sel){
+  document.querySelectorAll(sel).forEach(h=>{
+    const tip=h.querySelector('.tip');if(!tip)return;
+    const show=()=>{
+      const r=h.getBoundingClientRect();
+      tip.style.position='fixed';tip.style.visibility='hidden';tip.style.display='block'; // 先隐身量宽高再定位
+      const tipW=tip.offsetWidth,tipH=tip.offsetHeight;
+      // 横向:默认右缘对齐图标;若左端会溢出屏幕(窄屏/图标靠左),改为钳在左边距 8px
+      let right=Math.max(8,window.innerWidth-r.right-8);
+      if(window.innerWidth-right-tipW<8)right=Math.max(8,window.innerWidth-tipW-8);
+      tip.style.left='auto';tip.style.right=right+'px';
+      // 纵向:上方够优先上方,否则下方
+      tip.style.top=(r.top-tipH-8>=8 ? r.top-tipH-8 : r.bottom+8)+'px';
+      tip.style.visibility='';
+    };
+    const hide=()=>{tip.style.display='';tip.style.visibility='';};
+    h.addEventListener('mouseenter',show);h.addEventListener('mouseleave',hide);
+    h.addEventListener('focus',show);h.addEventListener('blur',hide);
+  });
+}
+attachTips('.th-help');attachTips('.exp-help');
 $('logMember').onchange=()=>loadLogs(true);
 $('logModel').onchange=()=>loadLogs(true);
 $('logGroup').onchange=()=>loadLogs(true);
+$('logType').onchange=()=>loadLogs(true);
 let logTokTimer=null;
 $('logToken').addEventListener('input',()=>{clearTimeout(logTokTimer);logTokTimer=setTimeout(()=>loadLogs(true),300);});
 

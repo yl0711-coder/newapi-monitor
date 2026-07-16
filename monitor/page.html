@@ -497,6 +497,14 @@ function sparkSVG(pts){
 }
 
 function setSeg(){document.querySelectorAll('#windowSeg a').forEach(a=>{const w=+a.dataset.w;a.href='?window='+w;a.classList.toggle('active',w===WINDOW)})}
+// 切换时间窗口:拦截导航、原地刷新数据(整页刷新会跳回默认 tab);URL 用 replaceState 同步,手动刷新/收藏仍保留窗口
+document.getElementById('windowSeg').addEventListener('click',e=>{
+  const a=e.target.closest('a[data-w]');if(!a)return;
+  e.preventDefault();
+  const w=+a.dataset.w;if(w===WINDOW)return;
+  WINDOW=w;history.replaceState(null,'','?window='+w+location.hash); // 保留 #tab=,刷新后仍回当前 tab
+  setSeg();load();
+});
 
 function renderBanner(s){
   const probs=[...s.by_channel.map(r=>({...r,kind:'渠道'})),...s.by_model.map(r=>({...r,kind:'模型'}))];
@@ -1054,6 +1062,8 @@ function switchTab(name){
   else if(infraTimer){clearInterval(infraTimer);}
   if(name==='usage')usageInit();
   if(name==='model')setTimeout(resizeModelCharts,60); // 模型 tab 非默认可见,切回时按可见宽度重排图表
+  // 当前 tab 记入 URL hash:去报警设置等页再返回/手动刷新时不丢 tab
+  history.replaceState(null,'',location.pathname+location.search+'#tab='+name);
 }
 function resizeModelCharts(){[trendChart,longChart,sloGauge,latChart,ttftChart].forEach(c=>c&&c.resize());}
 
@@ -1982,7 +1992,8 @@ window.addEventListener('resize',resizeInfraCharts);
 setSeg();const _mePromise=loadMe();load();schedule();
 document.querySelectorAll('#longSeg a').forEach(a=>{a.href='javascript:void 0';a.classList.toggle('active',+a.dataset.d===longDays);a.addEventListener('click',e=>{e.preventDefault();longDays=+a.dataset.d;document.querySelectorAll('#longSeg a').forEach(x=>x.classList.toggle('active',x===a));loadLongTrend();});});
 loadLongTrend();
-_mePromise.finally(()=>switchTab('usage')); // 默认落在「用户用量」(现主视图);等 IS_ROOT 就位再渲染,模型/服务端数据后台预载
+// 默认落在「用户用量」;URL hash 带 tab(从报警设置返回/手动刷新)则恢复到该 tab。等 IS_ROOT 就位再渲染,模型/服务端数据后台预载
+_mePromise.finally(()=>{const m=location.hash.match(/tab=(model|server|usage)/);switchTab(m?m[1]:'usage');});
 </script>
 </body>
 </html>

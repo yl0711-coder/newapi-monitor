@@ -87,11 +87,14 @@ status.example.com {
 - `role = 100`(超级管理员):可修改报警配置。
 
 ## 只读账号
-给 new-api 库单独建一个只读账号,仅授予 `logs`、`channels` 表的 `SELECT`,用于 `NEWAPI_LOG_DSN`:
+给 new-api 库单独建一个只读账号,仅授予 `logs`、`channels`、`users`、`tokens` 四表的 `SELECT`
+(后两张是「用户用量 / 客户报表」功能读余额与令牌名所需),用于 `NEWAPI_LOG_DSN`:
 ```sql
 CREATE USER 'ro_user'@'%' IDENTIFIED BY '<strong-password>';
 GRANT SELECT ON newapi.logs     TO 'ro_user'@'%';
 GRANT SELECT ON newapi.channels TO 'ro_user'@'%';
+GRANT SELECT ON newapi.users    TO 'ro_user'@'%';
+GRANT SELECT ON newapi.tokens   TO 'ro_user'@'%';
 ```
 
 ## 安全
