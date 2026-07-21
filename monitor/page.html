@@ -1938,7 +1938,7 @@ function renderUsageMemRank(users){
     tooltip:Object.assign({trigger:'axis',axisPointer:{type:'shadow'},formatter:p=>`${esc(p[0].name)}<br/>$${(+p[0].value).toFixed(2)}`},DK_TIP),
     xAxis:{type:'value',axisLabel:{color:'#94a3b8',fontSize:11,formatter:'${value}'},splitLine:{lineStyle:{color:'#232838'}}},
     yAxis:{type:'category',data:names,axisLabel:{color:'#e2e8f0',fontSize:12},axisLine:{show:false},axisTick:{show:false}},
-    series:[{type:'bar',data:vals,barWidth:'58%',itemStyle:{color:'#f59e0b',borderRadius:[0,3,3,0]},label:{show:true,position:'right',color:'#94a3b8',fontSize:11,formatter:p=>'$'+(+p.value).toFixed(2)}}]
+    series:[{type:'bar',data:vals,barWidth:'42%',itemStyle:{color:{type:'linear',x:0,y:0,x2:1,y2:0,colorStops:[{offset:0,color:'#f59e0b'},{offset:1,color:'#fbbf24'}]},borderRadius:[0,4,4,0]},label:{show:true,position:'right',color:'#94a3b8',fontSize:11,fontWeight:500,formatter:p=>'$'+(+p.value).toFixed(2)}}]
   },true);
 }
 // 按分组/按模型环形图(Top5+其他);show=false 时隐藏容器
