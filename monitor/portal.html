@@ -5,6 +5,8 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>用量报表</title>
 <script src="/echarts.js"></script>
+<script src="/flatpickr.js"></script>
+<link rel="stylesheet" href="/flatpickr.css">
 <style>
   :root{
     --bg:#e6e9f0;          /* 页面浅灰(压深,减对比) */
@@ -36,6 +38,23 @@
   .rangenote{color:var(--muted);font-size:12px;margin:10px 0 16px}
   .dateinput{background:#fdfdff;border:1px solid var(--border);border-radius:8px;color:var(--text);padding:7px 9px;font-size:13px;font-family:inherit}
   .dateinput:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px rgba(79,70,229,.12)}
+  /* 总览工具条日期范围:与管理端同一 flatpickr 控件;内嵌 CSS 是暗色主题,此处整体覆盖成客户端浅色 */
+  #ovRange{background:#fdfdff;border:1px solid var(--border);border-radius:8px;color:var(--text);padding:7px 12px;font-size:13px;width:220px;cursor:pointer;font-family:inherit}
+  #ovRange:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px rgba(79,70,229,.12)}
+  .flatpickr-calendar{background:#fff;border:1px solid var(--border);box-shadow:0 8px 24px rgba(30,40,70,.16)}
+  .flatpickr-calendar.arrowTop:before{border-bottom-color:var(--border)}
+  .flatpickr-calendar.arrowTop:after{border-bottom-color:#fff}
+  .flatpickr-months .flatpickr-month,.flatpickr-current-month .flatpickr-monthDropdown-months,.flatpickr-current-month input.cur-year{color:var(--text);fill:var(--text);background:transparent}
+  .flatpickr-months .flatpickr-prev-month,.flatpickr-months .flatpickr-next-month{color:var(--muted);fill:var(--muted)}
+  .flatpickr-months .flatpickr-prev-month:hover svg,.flatpickr-months .flatpickr-next-month:hover svg{fill:var(--accent)}
+  .flatpickr-weekdays,.flatpickr-days{background:transparent}
+  span.flatpickr-weekday{color:var(--muted);background:transparent}
+  .flatpickr-day{color:var(--text)}
+  .flatpickr-day:hover,.flatpickr-day:focus{background:#eef0f6;border-color:#eef0f6;color:var(--text)}
+  .flatpickr-day.today{border-color:var(--accent)}
+  .flatpickr-day.flatpickr-disabled,.flatpickr-day.flatpickr-disabled:hover,.flatpickr-day.prevMonthDay,.flatpickr-day.nextMonthDay{color:#c3c9d5;background:transparent}
+  .flatpickr-day.selected,.flatpickr-day.startRange,.flatpickr-day.endRange{background:var(--accent);border-color:var(--accent);color:#fff}
+  .flatpickr-day.inRange{background:rgba(79,70,229,.10);border-color:transparent;color:var(--text);box-shadow:-5px 0 0 rgba(79,70,229,.10),5px 0 0 rgba(79,70,229,.10)}
   /* new-api 风格紧凑日期选择器 */
   .dtpick{position:relative;display:inline-block}
   .dt-trigger{display:inline-flex;align-items:center;gap:8px;background:#fdfdff;border:1px solid var(--border);border-radius:8px;color:var(--text);padding:8px 12px;font-size:13px;cursor:pointer;font-family:inherit;min-width:238px}
@@ -74,7 +93,7 @@
   .pg-btn:disabled{opacity:.45;cursor:default}
   .pg-info{color:var(--muted);font-size:12px}
   /* 脱敏密钥:不可选中/复制 */
-  .maskkey{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;color:var(--muted);background:var(--panel);border:1px solid var(--border);border-radius:6px;padding:2px 8px;user-select:none;-webkit-user-select:none;-moz-user-select:none;pointer-events:none}
+  .maskkey{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;color:var(--muted);background:var(--panel);border:1px solid var(--border);border-radius:6px;padding:2px 8px;white-space:nowrap;user-select:none;-webkit-user-select:none;-moz-user-select:none;pointer-events:none}
   table{width:100%;border-collapse:collapse}
   th{padding:10px 12px;text-align:left;font-size:12px;color:var(--muted);font-weight:600;background:var(--th-bg);white-space:nowrap}
   td{padding:8px 12px;font-size:14px;border-top:1px solid var(--border);white-space:nowrap}
@@ -99,6 +118,7 @@
   #detail{display:none}
   .backlink{color:var(--accent);cursor:pointer;font-size:13px;text-decoration:none}
   .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px;margin:14px 0}
+  .stat-card-wide{grid-column:span 2}
   .stat-card{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:15px 16px}
   .stat-label{font-size:12px;color:var(--muted)}
   .stat-value{font-size:23px;font-weight:700;margin-top:7px;font-variant-numeric:tabular-nums}
@@ -196,7 +216,7 @@
     <a data-r="today">今天</a><a data-r="7d" class="active">近7天</a><a data-r="15d">近15天</a><a data-r="30d">近30天</a>
   </div>
   <span class="rangenote" style="margin:0">自定义:</span>
-  <input type="date" id="ovFrom" class="dateinput"><span class="rangenote" style="margin:0">至</span><input type="date" id="ovTo" class="dateinput">
+  <input type="text" id="ovRange" placeholder="选择日期范围(最长90天)" readonly>
   <button type="button" class="btn p" id="ovQuery">查询</button>
   <span id="ovErr" style="color:var(--red);font-size:12px"></span>
   <input id="mxSearch" class="mx-search" placeholder="搜索用户(用户名 / 邮箱)" autocomplete="off">
@@ -253,7 +273,7 @@
     <div class="card"><div class="card-header">按分组</div><table><thead id="thBdGroupD"></thead><tbody id="tbBdGroupD"></tbody></table></div>
     <div class="card"><div class="card-header">按模型</div><div id="dModelPie"></div><table><thead id="thModel"></thead><tbody id="tbModel"></tbody></table></div>
   </div>
-  <div class="card"><div class="card-header">按令牌 <span class="sub">· 该成员各令牌用量;密钥已脱敏</span></div><table><thead id="thTok"></thead><tbody id="tbTok"></tbody></table></div>
+  <div class="card" id="tokCard"><div class="card-header">按令牌 <span class="sub">· 该成员各令牌用量;密钥已脱敏;点令牌名看单令牌详情</span></div><table><thead id="thTok"></thead><tbody id="tbTok"></tbody></table></div>
 </div>
 
 <!-- 使用日志 -->
@@ -361,7 +381,7 @@ async function load(){
   syncOvBar(); // 总览工具条(预设高亮/起止框)随当前范围同步(含从日志视图改的范围)
   mxPage=1;renderStat();renderMatrix();renderTrend();renderMemberBar();loadBreakdown();
   fillMemberSelect();
-  if(detailUid)loadDetail(detailUid); // 切范围时明细页跟着刷新
+  if(detailUid){detailTok?loadTokenDetail(detailTok.tid,detailTok.name):loadDetail(detailUid);} // 切范围时明细页(成员/令牌)跟着刷新
   if(view==='logs')loadLogs(true);    // 日志视图下切范围 → 重新拉第一页
   else logDirty=true;                 // 总览里改的范围:回日志视图时强制重拉,防止显旧窗口数据
 }
@@ -398,34 +418,50 @@ function fillFilterSelect(id,allLabel,rows){
 // ---- 图表(echarts;数据全来自已加载的 ov / breakdown / detail,不额外请求) ----
 const AXIS='#64748b',SPLIT='#eceff4',AMBER='#e08700',GRAYLINE='#9aa2b0';
 const TIP={backgroundColor:'#f7f8fb',borderColor:'#e0e4ec',textStyle:{color:'#2b3340'}};
-// 模型配色:name 稳定映射到同一色(总览与明细同一模型同色);暖色系为主,不用彩虹
-// 模型/分组配色:名称哈希到固定调色板,保证同一名称在总览与明细里颜色一致;暖色系为主,不用彩虹
+// 模型/分组配色:按「范围内费用」排名取色板固定位次,同一张图内每个模型颜色必不相同(避免名称哈希碰撞把两个模型染成同色);
+// 柱状与环形基于同一套 by_model 降序排名,故同一模型两图颜色一致。暖色系为主,不用彩虹。
 const MODEL_PALETTE=['#e08700','#c2410c','#b45309','#5257e0','#0c8557','#7c6f9c','#a16207'];
-function modelColor(name){let h=0;for(let i=0;i<name.length;i++)h=(h*31+name.charCodeAt(i))>>>0;return MODEL_PALETTE[h%MODEL_PALETTE.length];}
 let trendCh=null,memberCh=null,modelPieCh=null,dModelPieCh=null,groupPieCh=null;
 function getCh(ref,id){return ref||echarts.init($(id));} // 取已缓存的 echarts 实例,无则初始化
 // 图表空态占位:居中提示文字 + 隐藏坐标轴
 function emptyChart(ch,msg){ch.setOption({title:{text:msg||'所选范围暂无消耗数据',left:'center',top:'center',textStyle:{color:GRAYLINE,fontSize:13,fontWeight:400}},xAxis:{show:false},yAxis:{show:false},series:[]},true);}
-// P0 全公司每日消费趋势(费用面积 + 请求数折线);单日(今天)退化为柱
+// P0 全公司每日消费趋势:按模型堆叠柱状(与用户/令牌详情页一致)
 function renderTrend(){
   trendCh=getCh(trendCh,'trendChart');
+  const dailyByModel=ov.daily_by_model||[];
+  const byModel=(ov.by_model||[]).filter(r=>+r.cost_usd>0);
   const days=(ov.days||[]).slice().reverse(); // 旧→新
-  const by={};(ov.cells||[]).forEach(c=>{const o=by[c.date]||(by[c.date]={c:0,r:0});o.c+=+c.cost_usd||0;o.r+=+c.requests||0;});
-  const cost=days.map(d=>+(((by[d]||{}).c)||0).toFixed(4)),req=days.map(d=>((by[d]||{}).r)||0);
-  if(!days.length||cost.reduce((a,b)=>a+b,0)<=0){emptyChart(trendCh);return;}
-  const single=days.length<=1;
+  if(!days.length||!byModel.length){emptyChart(trendCh);return;}
+  const byDateModel={};dailyByModel.forEach(r=>{(byDateModel[r.date]||(byDateModel[r.date]={}))[r.model||'—']=r;});
+  const topNames=byModel.slice(0,DAILY_STACK_TOP).map(r=>r.key||'—');
+  const restNames=new Set(byModel.slice(DAILY_STACK_TOP).map(r=>r.key||'—'));
+  const names=restNames.size?[...topNames,'其他']:topNames;
+  const series=names.map((name,i)=>({
+    name,type:'bar',stack:'d',barWidth:'38%',barCategoryGap:'32%',
+    itemStyle:{color:name==='其他'?GRAYLINE:MODEL_PALETTE[i%MODEL_PALETTE.length],borderRadius:i===names.length-1?[4,4,0,0]:0},
+    data:days.map(d=>{
+      const m=byDateModel[d]||{};
+      if(name==='其他'){
+        let cost=0,tok=0;restNames.forEach(n=>{const r=m[n];if(r){cost+=+r.cost_usd||0;tok+=+r.tokens||0;}});
+        return {value:+cost.toFixed(4),tokens:tok};
+      }
+      const r=m[name];
+      return {value:r?+(+r.cost_usd).toFixed(4):0,tokens:r?r.tokens:0};
+    })
+  }));
   trendCh.setOption({
-    grid:{left:56,right:52,top:24,bottom:26},
-    tooltip:Object.assign({trigger:'axis'},TIP),
-    legend:{data:['费用($)','请求数'],textStyle:{color:'#6d7684'},top:0,right:8},
-    xAxis:{type:'category',data:days.map(d=>d.slice(5)),axisLabel:{color:AXIS,fontSize:11},axisLine:{lineStyle:{color:'#d7dce6'}}},
-    yAxis:[{type:'value',axisLabel:{color:AXIS,fontSize:11,formatter:'${value}'},splitLine:{lineStyle:{color:SPLIT}}},
-           {type:'value',minInterval:1,axisLabel:{color:AXIS,fontSize:11},splitLine:{show:false}}],
-    series:[
-      single?{name:'费用($)',type:'bar',barWidth:'38%',data:cost,color:AMBER,itemStyle:{color:AMBER,borderRadius:[3,3,0,0]}}
-            :{name:'费用($)',type:'line',smooth:true,symbol:'none',data:cost,color:AMBER,lineStyle:{color:AMBER,width:2},itemStyle:{color:AMBER},areaStyle:{color:'rgba(224,135,0,.10)'}},
-      {name:'请求数',type:'line',yAxisIndex:1,smooth:true,symbol:'none',data:req,color:GRAYLINE,lineStyle:{color:GRAYLINE,width:1.5},itemStyle:{color:GRAYLINE}}
-    ]
+    grid:{left:50,right:20,top:names.length>1?50:28,bottom:28},
+    tooltip:Object.assign({trigger:'axis',axisPointer:{type:'shadow'},formatter:params=>{
+      const lines=params.filter(p=>+p.value>0).map(p=>`${esc(p.seriesName)}: $${(+p.value).toFixed(4)}${p.data&&p.data.tokens?' ('+fmtCompact(p.data.tokens)+' tokens)':''}`);
+      const total=params.reduce((s,p)=>s+(+p.value||0),0);
+      const totalTok=params.reduce((s,p)=>s+(p.data&&p.data.tokens?p.data.tokens:0),0);
+      const footer=lines.length>1?`<br/><b>总计: $${total.toFixed(4)}${totalTok?' ('+fmtCompact(totalTok)+' tokens)':''}</b>`:'';
+      return `${(params[0]&&params[0].axisValueLabel)||''}<br/>${lines.join('<br/>')||'无消耗'}${footer}`;
+    }},TIP),
+    legend:names.length>1?{type:'scroll',data:names,textStyle:{color:'#6d7684',fontSize:12},top:6,itemGap:16,itemWidth:20,itemHeight:12}:undefined,
+    xAxis:{type:'category',data:days.map(d=>d.slice(5)),axisLabel:{color:'#64748b',fontSize:11},axisLine:{lineStyle:{color:'#d7dce6'}}},
+    yAxis:{type:'value',splitNumber:5,axisLabel:{color:'#64748b',fontSize:11,formatter:'${value}'},splitLine:{lineStyle:{color:'#eceff4'}}},
+    series
   },true);
   setTimeout(()=>trendCh.resize(),40);
 }
@@ -437,10 +473,10 @@ function renderMemberBar(){
   const names=us.map(u=>u.username||('#'+u.user_id)).reverse(),vals=us.map(u=>+(+u.total_usd).toFixed(4)).reverse();
   const H=Math.max(160,us.length*34+30);$('memberBar').style.height=H+'px';memberCh.resize();
   memberCh.setOption({
-    grid:{left:8,right:64,top:8,bottom:8,containLabel:true},
+    grid:{left:8,right:66,top:8,bottom:8,containLabel:true},
     tooltip:Object.assign({trigger:'axis',axisPointer:{type:'shadow'},formatter:p=>`${esc(p[0].name)}<br/>$${(+p[0].value).toFixed(2)}`},TIP),
-    xAxis:{type:'value',axisLabel:{color:AXIS,fontSize:11,formatter:'${value}'},splitLine:{lineStyle:{color:SPLIT}}},
-    yAxis:{type:'category',data:names,axisLabel:{color:'#2b3340',fontSize:12},axisLine:{show:false},axisTick:{show:false}},
+    xAxis:{type:'value',axisLabel:{color:'#64748b',fontSize:11,formatter:'${value}'},splitLine:{lineStyle:{color:'#eef1f5'}}},
+    yAxis:{type:'category',data:names,axisLabel:{color:'#334155',fontSize:12},axisLine:{show:false},axisTick:{show:false}},
     series:[{type:'bar',data:vals,barWidth:'42%',itemStyle:{color:{type:'linear',x:0,y:0,x2:1,y2:0,colorStops:[{offset:0,color:'#f59e0b'},{offset:1,color:'#fbbf24'}]},borderRadius:[0,4,4,0]},label:{show:true,position:'right',color:'#64748b',fontSize:11,fontWeight:500,formatter:p=>'$'+(+p.value).toFixed(2)}}]
   },true);
 }
@@ -449,7 +485,7 @@ function renderModelPie(ch,rows){
   rows=(rows||[]).filter(r=>+r.cost_usd>0).sort((a,b)=>b.cost_usd-a.cost_usd);
   if(!rows.length){emptyChart(ch);return;}
   const top=rows.slice(0,5),rest=rows.slice(5);
-  const data=top.map(r=>({name:r.key||'—',value:+(+r.cost_usd).toFixed(4),itemStyle:{color:modelColor(r.key||'—')}}));
+  const data=top.map((r,i)=>({name:r.key||'—',value:+(+r.cost_usd).toFixed(4),itemStyle:{color:MODEL_PALETTE[i%MODEL_PALETTE.length]}}));
   if(rest.length)data.push({name:'其他',value:+rest.reduce((s,r)=>s+ +r.cost_usd,0).toFixed(4),itemStyle:{color:'#9aa2b0'}});
   ch.setOption({
     tooltip:Object.assign({trigger:'item',formatter:p=>`${esc(p.name)}<br/>$${(+p.value).toFixed(2)} · ${p.percent}%`},TIP),
@@ -509,14 +545,56 @@ function renderMxPager(total,pages){
     +`<button class="pg-btn" ${mxPage>=pages?'disabled':''} data-pg="${mxPage+1}">下一页</button>`;
 }
 // 明细
-let dailyChart=null;
+let dailyChart=null,detailTok=null; // detailTok={tid,name}=令牌下钻视图;null=成员视图
+// 每日消耗按模型堆叠:取 by_model(已按总费用降序)前 6 个模型各开一个堆叠系列,其余归并进「其他」灰色系列;
+// 每个数据点带 tokens,供 tooltip 显示 $ 之外的 token 数(对齐 Anthropic Console 风格)。
+const DAILY_STACK_TOP=6;
+function drawDailyChart(daily,dailyByModel,byModel){
+  daily=daily||[];dailyByModel=dailyByModel||[];byModel=(byModel||[]).filter(r=>+r.cost_usd>0);
+  const dates=daily.map(x=>x.date);
+  const byDateModel={};dailyByModel.forEach(r=>{(byDateModel[r.date]||(byDateModel[r.date]={}))[r.model||'—']=r;});
+  const topNames=byModel.slice(0,DAILY_STACK_TOP).map(r=>r.key||'—');
+  const restNames=new Set(byModel.slice(DAILY_STACK_TOP).map(r=>r.key||'—'));
+  const names=restNames.size?[...topNames,'其他']:topNames;
+  const series=names.map((name,i)=>({
+    name,type:'bar',stack:'d',barWidth:'38%',barCategoryGap:'32%',
+    itemStyle:{color:name==='其他'?GRAYLINE:MODEL_PALETTE[i%MODEL_PALETTE.length],borderRadius:i===names.length-1?[4,4,0,0]:0},
+    data:dates.map(d=>{
+      const m=byDateModel[d]||{};
+      if(name==='其他'){
+        let cost=0,tok=0;restNames.forEach(n=>{const r=m[n];if(r){cost+=+r.cost_usd||0;tok+=+r.tokens||0;}});
+        return {value:+cost.toFixed(4),tokens:tok};
+      }
+      const r=m[name];
+      return {value:r?+(+r.cost_usd).toFixed(4):0,tokens:r?r.tokens:0};
+    })
+  }));
+  if(!dailyChart)dailyChart=echarts.init($('dailyChart'));
+  if(!names.length){emptyChart(dailyChart);return;}
+  dailyChart.setOption({
+    grid:{left:50,right:20,top:names.length>1?50:28,bottom:28},
+    tooltip:Object.assign({trigger:'axis',axisPointer:{type:'shadow'},formatter:params=>{
+      const lines=params.filter(p=>+p.value>0).map(p=>`${esc(p.seriesName)}: $${(+p.value).toFixed(4)}${p.data&&p.data.tokens?' ('+fmtCompact(p.data.tokens)+' tokens)':''}`);
+      const total=params.reduce((s,p)=>s+(+p.value||0),0);
+      const totalTok=params.reduce((s,p)=>s+(p.data&&p.data.tokens?p.data.tokens:0),0);
+      const footer=lines.length>1?`<br/><b>总计: $${total.toFixed(4)}${totalTok?' ('+fmtCompact(totalTok)+' tokens)':''}</b>`:'';
+      return `${(params[0]&&params[0].axisValueLabel)||''}<br/>${lines.join('<br/>')||'无消耗'}${footer}`;
+    }},TIP),
+    legend:names.length>1?{type:'scroll',data:names,textStyle:{color:'#6d7684',fontSize:12},top:6,itemGap:16,itemWidth:20,itemHeight:12}:undefined,
+    xAxis:{type:'category',data:dates.map(d=>d.slice(5)),axisLabel:{color:'#64748b',fontSize:11},axisLine:{lineStyle:{color:'#d7dce6'}}},
+    yAxis:{type:'value',splitNumber:5,axisLabel:{color:'#64748b',fontSize:11,formatter:'${value}'},splitLine:{lineStyle:{color:'#eceff4'}}},
+    series
+  },true);
+  setTimeout(()=>dailyChart.resize(),50);
+}
 async function loadDetail(uid){
   const {from,to}=rangeDates(range);
   const d=await api(`/api/user?uid=${uid}&from=${from}&to=${to}`);
   if(!d.ok)return;
-  detailUid=uid;
+  detailUid=uid;detailTok=null;
   const u=(ov.users||[]).find(x=>x.user_id===uid)||{};
   $('listView').style.display='none';$('detail').style.display='block';
+  $('tokCard').style.display='';
   $('dTitle').textContent=(u.username||('#'+uid))+(u.email?' · '+u.email:'');
   const st=d.data.stats||{},s=st.summary||{};
   renderDim('thBdGroupD','tbBdGroupD',st.by_group);
@@ -530,17 +608,33 @@ async function loadDetail(uid){
     ['请求数',(s.requests||0).toLocaleString('en-US'),'var(--text)'],
     ['Tokens',`<span title="${fmtNum(s.tokens)} tokens">${fmtCompact(s.tokens)}</span>`,'var(--text)'],
   ];
-  $('dCards').innerHTML=cards.map(([l,v,col])=>`<div class="stat-card"><div class="stat-label">${l}</div><div class="stat-value num" style="color:${col}">${v}</div></div>`).join('');
-  const daily=st.daily||[];
-  if(!dailyChart)dailyChart=echarts.init($('dailyChart'));
-  dailyChart.setOption({
-    grid:{left:56,right:24,top:26,bottom:26},
-    tooltip:{trigger:'axis',backgroundColor:'#f7f8fb',borderColor:'#e0e4ec',textStyle:{color:'#2b3340'}},
-    xAxis:{type:'category',data:daily.map(x=>x.date.slice(5)),axisLabel:{color:'#64748b',fontSize:11},axisLine:{lineStyle:{color:'#d7dce6'}}},
-    yAxis:{type:'value',axisLabel:{color:'#64748b',fontSize:11,formatter:'${value}'},splitLine:{lineStyle:{color:'#eceff4'}}},
-    series:[{type:'bar',barWidth:'55%',data:daily.map(x=>+(x.cost_usd||0).toFixed(4)),itemStyle:{color:'#e08700',borderRadius:[3,3,0,0]}}]
-  },true);
-  setTimeout(()=>dailyChart.resize(),50);
+  $('dCards').innerHTML=cards.map(([l,v,col,cls])=>`<div class="stat-card${cls?' '+cls:''}"><div class="stat-label">${l}</div><div class="stat-value num" style="color:${col}">${v}</div></div>`).join('');
+  drawDailyChart(st.daily,st.daily_by_model,st.by_model);
+}
+// 令牌详情:成员详情下钻一层;同一详情面板换令牌口径渲染,按令牌卡隐藏(单令牌无此维度)
+async function loadTokenDetail(tid,tname){
+  const {from,to}=rangeDates(range);
+  const d=await api(`/api/user?uid=${detailUid}&token_id=${tid}&from=${from}&to=${to}`);
+  if(!d.ok)return;
+  detailTok={tid,name:tname};
+  const u=(ov.users||[]).find(x=>x.user_id===detailUid)||{};
+  $('listView').style.display='none';$('detail').style.display='block';
+  $('tokCard').style.display='none';
+  const meta=d.data.token;
+  $('dTitle').textContent=(u.username||('#'+detailUid))+' / '+((meta&&meta.name)||tname)+((meta&&meta.deleted)?'(已删除)':'');
+  const st=d.data.stats||{},s=st.summary||{};
+  renderDim('thBdGroupD','tbBdGroupD',st.by_group);
+  renderDim('thModel','tbModel',st.by_model);
+  dModelPieCh=getCh(dModelPieCh,'dModelPie');renderModelPie(dModelPieCh,st.by_model);
+  const cards=[
+    ['密钥',meta&&meta.masked_key?`<span style="font-size:14px" class="maskkey" oncopy="return false" oncontextmenu="return false">${esc(meta.masked_key)}</span>`:'—','var(--text)','stat-card-wide'],
+    ['累计总消耗',meta&&meta.total_cost_usd!=null?fmtCost(meta.total_cost_usd):'—','var(--amber)'],
+    ['范围消耗',fmtCost(s.cost_usd),'var(--text)'],
+    ['请求数',(s.requests||0).toLocaleString('en-US'),'var(--text)'],
+    ['Tokens',`<span title="${fmtNum(s.tokens)} tokens">${fmtCompact(s.tokens)}</span>`,'var(--text)'],
+  ];
+  $('dCards').innerHTML=cards.map(([l,v,col,cls])=>`<div class="stat-card${cls?' '+cls:''}"><div class="stat-label">${l}</div><div class="stat-value num" style="color:${col}">${v}</div></div>`).join('');
+  drawDailyChart(st.daily,st.daily_by_model,st.by_model);
 }
 // 通用维度表(名称/请求/Tokens/费用)
 function renderDim(thId,tbId,rows){
@@ -551,19 +645,35 @@ function renderDim(thId,tbId,rows){
     :'<tr><td colspan="4" class="muted" style="text-align:center;padding:16px">范围内无数据</td></tr>';
 }
 // 按令牌:密钥列脱敏 + 不可选中复制(maskkey);数据来自服务端已脱敏字段,前端从不接触明文
+// 该用户全部现存令牌都列出(范围内零用量补0);已删除但范围内有消费的沉底单独分区+标记,保证分项加总=范围消耗合计
+// 累计总消耗=创建至今终身值,"—"=令牌已不可查(硬删/老日志)
 function renderTokens(rows){
-  $('thTok').innerHTML='<tr><th>所属用户</th><th>令牌名称</th><th>密钥</th><th>分组</th><th class="right">请求</th><th class="right">Tokens</th><th class="right">费用</th></tr>';
+  $('thTok').innerHTML='<tr><th>所属用户</th><th>令牌名称</th><th>密钥</th><th>分组</th><th class="right">请求</th><th class="right">Tokens</th><th class="right">范围消耗</th><th class="right">累计总消耗</th></tr>';
   rows=rows||[];
-  $('tbTok').innerHTML=rows.length?rows.map(r=>{
+  if(!rows.length){$('tbTok').innerHTML='<tr><td colspan="8" class="muted" style="text-align:center;padding:16px">该用户暂无令牌记录</td></tr>';return}
+  const tr=r=>{
     const mk=r.masked_key?`<span class="maskkey" oncopy="return false" oncontextmenu="return false">${esc(r.masked_key)}</span>`:'<span class="muted">—</span>';
     const grp=r.group?esc(r.group):'<span class="muted">默认</span>';
-    return `<tr><td>${esc(r.owner||'—')}</td><td>${esc(r.name||'(未命名)')}</td><td>${mk}</td><td>${grp}</td><td class="right num">${(r.requests||0).toLocaleString('en-US')}</td><td class="right num">${(r.tokens||0).toLocaleString('en-US')}</td><td class="right num">${fmtCost(r.cost_usd)}</td></tr>`;
-  }).join('')
-    :'<tr><td colspan="7" class="muted" style="text-align:center;padding:16px">范围内无令牌用量</td></tr>';
+    const total=r.total_cost_usd==null?'<span class="muted">—</span>':fmtCost(r.total_cost_usd);
+    const tag=r.deleted?' <span class="muted" style="font-size:11px;border:1px solid var(--border);border-radius:4px;padding:0 4px">已删除</span>':'';
+    // 令牌名可点下钻(token_id>0 才可;老日志 token_id=0 无从定位)
+    const nm=r.token_id>0?`<a href="javascript:void 0" data-tid="${r.token_id}" data-tname="${esc(r.name||'(未命名)')}" style="color:var(--accent);text-decoration:none">${esc(r.name||'(未命名)')}</a>`:esc(r.name||'(未命名)');
+    return `<tr${r.deleted?' style="opacity:.65"':''}><td>${esc(r.owner||'—')}</td><td>${nm}${tag}</td><td>${mk}</td><td>${grp}</td><td class="right num">${(r.requests||0).toLocaleString('en-US')}</td><td class="right num">${(r.tokens||0).toLocaleString('en-US')}</td><td class="right num">${fmtCost(r.cost_usd)}</td><td class="right num">${total}</td></tr>`;
+  };
+  const live=rows.filter(r=>!r.deleted),del=rows.filter(r=>r.deleted); // 服务端已排好:现存在前已删沉底
+  let html=live.map(tr).join('');
+  if(del.length)html+='<tr><td colspan="8" class="muted" style="font-size:11px;padding:10px 12px 4px;border-bottom:none">以下为已删除令牌(范围内仍有消费,计入合计)</td></tr>'+del.map(tr).join('');
+  $('tbTok').innerHTML=html;
 }
-function backToList(){detailUid=null;$('detail').style.display='none';$('listView').style.display='';}
+// 返回:令牌详情→先回成员详情;成员详情→回列表
+function backToList(){
+  if(detailTok){detailTok=null;loadDetail(detailUid);return}
+  detailUid=null;$('detail').style.display='none';$('listView').style.display='';
+}
 $('backLink').onclick=backToList;
 $('tbMx').addEventListener('click',e=>{const a=e.target.closest('[data-uid]');if(a)loadDetail(+a.dataset.uid)});
+// 令牌表点令牌名下钻(事件委托,表体每次查询重建)
+$('tbTok').addEventListener('click',e=>{const a=e.target.closest('[data-tid]');if(a)loadTokenDetail(+a.dataset.tid,a.dataset.tname)});
 // 成员搜索(防抖)+分页
 let mxSearchTimer=null;
 $('mxSearch').addEventListener('input',e=>{
@@ -599,21 +709,38 @@ $('dtConfirm').onclick=()=>{
   customFrom=f;customTo=t;range='custom';openDt(false);updateDtLabel();load();
 };
 updateDtLabel();
-// ---- 总览工具条(内容对齐管理端「用户用量」:预设 + 自定义起止 + 查询 + 搜索用户)----
+// ---- 总览工具条(内容对齐管理端「用户用量」:预设 + flatpickr 范围选择器[与管理端同一控件] + 查询 + 搜索用户)----
+const ymd=d=>d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');
+const addDaysStr=(s,n)=>{const d=new Date(s+'T00:00:00');d.setDate(d.getDate()+n);return ymd(d)};
+const ovFp=flatpickr($('ovRange'),{
+  mode:'range',showMonths:2,locale:'zh',dateFormat:'Y-m-d',maxDate:rangeDates('today').to,
+  onChange:(sel,_str,inst)=>{
+    if(sel.length===1){ // 已选起点:把可选窗口收紧到起点±89天(含端点恰90天),硬限最长90天
+      const startStr=ymd(sel[0]);
+      const lo=addDaysStr(startStr,-89),hi=addDaysStr(startStr,89),today=rangeDates('today').to;
+      inst.set('minDate',lo);inst.set('maxDate',hi<today?hi:today);
+    }else if(sel.length===2){ // 区间选完:恢复窗口并自动查询
+      inst.set('minDate',null);inst.set('maxDate',rangeDates('today').to);
+      $('ovErr').textContent='';customFrom=ymd(sel[0]);customTo=ymd(sel[1]);range='custom';
+      syncOvBar();updateDtLabel();load();
+    }
+  },
+  onClose:(sel,_str,inst)=>{ if(sel.length<2){inst.set('minDate',null);inst.set('maxDate',rangeDates('today').to)} }
+});
 function syncOvBar(){
   document.querySelectorAll('#ovSeg a').forEach(x=>x.classList.toggle('active',x.dataset.r===range));
-  const {from,to}=rangeDates(range);$('ovFrom').value=from;$('ovTo').value=to;
+  const {from,to}=rangeDates(range);ovFp.setDate([from,to],false); // 不触发 onChange,仅同步显示
 }
-[$('ovFrom'),$('ovTo')].forEach(el=>el.setAttribute('max',rangeDates('today').to)); // 不能选未来
 document.querySelectorAll('#ovSeg a').forEach(a=>a.onclick=()=>{
   range=a.dataset.r;$('ovErr').textContent='';
   syncOvBar();updateDtLabel();load();
 });
-// 查询:应用自定义起止;两端必填、起>止自动交换、跨度>90天拦下(与服务端一致)
+// 查询:应用选择器当前区间(与管理端一致;跨度>90天拦下,与服务端一致)
 $('ovQuery').onclick=()=>{
-  let f=$('ovFrom').value,t=$('ovTo').value;
-  if(!f||!t){$('ovErr').textContent='请选择开始和结束日期';return;}
-  if(f>t){[f,t]=[t,f];$('ovFrom').value=f;$('ovTo').value=t;}
+  const sel=ovFp.selectedDates;
+  if(sel.length<2){$('ovErr').textContent='请选择开始和结束日期';return;}
+  let f=ymd(sel[0]),t=ymd(sel[1]);
+  if(f>t)[f,t]=[t,f];
   if(spanDays(f,t)>90){$('ovErr').textContent='时间范围最长 90 天,请缩小区间';return;}
   $('ovErr').textContent='';customFrom=f;customTo=t;range='custom';
   syncOvBar();updateDtLabel();load();
