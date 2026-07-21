@@ -55,6 +55,15 @@ type UsageDaily struct {
 	CostUSD          float64 `json:"cost_usd"`
 }
 
+// UsageDailyModel 某 CST 自然日、某模型的合计(供每日消耗按模型堆叠展示用)。
+type UsageDailyModel struct {
+	Date     string  `json:"date"`
+	Model    string  `json:"model"`
+	Requests int64   `json:"requests"`
+	Tokens   int64   `json:"tokens"`
+	CostUSD  float64 `json:"cost_usd"`
+}
+
 // UsageDim 某维度取值(分组 / 模型 / 用户)的合计。
 type UsageDim struct {
 	Key      string  `json:"key"`
@@ -65,12 +74,13 @@ type UsageDim struct {
 
 // UsageStats 一次用户用量查询的完整结果(详情页专用:单用户的每日/分组/模型)。
 type UsageStats struct {
-	From    string       `json:"from"`
-	To      string       `json:"to"`
-	Summary UsageDim     `json:"summary"`
-	Daily   []UsageDaily `json:"daily"`
-	ByGroup []UsageDim   `json:"by_group"`
-	ByModel []UsageDim   `json:"by_model"`
+	From         string            `json:"from"`
+	To           string            `json:"to"`
+	Summary      UsageDim          `json:"summary"`
+	Daily        []UsageDaily      `json:"daily"`
+	DailyByModel []UsageDailyModel `json:"daily_by_model"`
+	ByGroup      []UsageDim        `json:"by_group"`
+	ByModel      []UsageDim        `json:"by_model"`
 }
 
 // usageIn 生成 "<col> IN (?,?,…)" 片段与参数(ids 已由调用方保证非空;col 只传代码内常量,勿传用户输入)。
@@ -85,8 +95,9 @@ func usageIn(col string, ids []int64) (string, []any) {
 }
 
 // computeUsageStats 对 [fromTs, toTs) 内、指定用户集合的消费日志(type=2)做三路聚合(每日/分组/模型)。
+// tokenID>0 时再按令牌过滤(单用户详情下钻单令牌;与 user_id 双条件,隔离不依赖 token 归属校验)。
 // 串行化(usageMu):同一时刻最多一条聚合在生产库上跑,叠加连接池上限双保险。
-func (m *Monitor) computeUsageStats(ctx context.Context, ids []int64, fromTs, toTs int64) (*UsageStats, error) {
+func (m *Monitor) computeUsageStats(ctx context.Context, ids []int64, fromTs, toTs, tokenID int64) (*UsageStats, error) {
 	if len(ids) == 0 {
 		return &UsageStats{}, nil // 名单为空不该走到这;防御:不拼 "IN ()" 非法 SQL
 	}
@@ -98,6 +109,10 @@ func (m *Monitor) computeUsageStats(ctx context.Context, ids []int64, fromTs, to
 	inSQL, inArgs := usageIn("user_id", ids)
 	where := "type = 2 AND created_at >= ? AND created_at < ? AND " + inSQL
 	args := append([]any{fromTs, toTs}, inArgs...)
+	if tokenID > 0 {
+		where += " AND token_id = ?"
+		args = append(args, tokenID)
+	}
 
 	st := &UsageStats{
 		From: time.Unix(fromTs, 0).In(usageCST).Format("2006-01-02"),
@@ -133,6 +148,33 @@ func (m *Monitor) computeUsageStats(ctx context.Context, ids []int64, fromTs, to
 		st.Summary.Requests += d.Requests
 		st.Summary.Tokens += d.Tokens
 		st.Summary.CostUSD += d.CostUSD
+	}
+
+	// 1b) 按日×模型:供「每日消耗」图按模型堆叠展示;LIMIT 是防御性上限(90天×50模型/天),
+	// 正常场景远远够用,前端再按 by_model 排序做 top-N + 其他归并。
+	dailyModelQ := "SELECT " + m.dayExpr() + " AS day_idx, COALESCE(model_name,''), COUNT(*)," +
+		" CAST(COALESCE(SUM(prompt_tokens+completion_tokens),0) AS SIGNED)," +
+		" CAST(COALESCE(SUM(quota),0) AS SIGNED)" +
+		" FROM logs WHERE " + where + " GROUP BY day_idx, model_name ORDER BY day_idx" +
+		" LIMIT " + strconv.Itoa(maxUsageDays*50)
+	dmRows, err := m.prodDB.QueryContext(cctx, dailyModelQ, args...)
+	if err != nil {
+		return nil, fmt.Errorf("按日按模型聚合失败: %w", err)
+	}
+	for dmRows.Next() {
+		var dayIdx, quota int64
+		var dm UsageDailyModel
+		if err := dmRows.Scan(&dayIdx, &dm.Model, &dm.Requests, &dm.Tokens, &quota); err != nil {
+			dmRows.Close()
+			return nil, err
+		}
+		dm.Date = time.Unix(dayIdx*86400-usageTZOffsetSec, 0).In(usageCST).Format("2006-01-02")
+		dm.CostUSD = float64(quota) / quotaPerUSD
+		st.DailyByModel = append(st.DailyByModel, dm)
+	}
+	dmRows.Close()
+	if err := dmRows.Err(); err != nil {
+		return nil, err
 	}
 
 	// 2/3) 按分组 / 模型。列名 group 是保留字,必须反引号。
@@ -369,13 +411,33 @@ func (m *Monitor) userUsedUSD(ctx context.Context, id int64) *float64 {
 
 // TokenUsage 单个令牌在时间范围内的用量。MaskedKey 永远是脱敏串,服务端绝不返回明文 key。
 type TokenUsage struct {
-	Owner     string  `json:"owner"` // 令牌所属用户(展示名:用户名/邮箱/#ID)
-	Name      string  `json:"name"`
-	MaskedKey string  `json:"masked_key"`
-	Group     string  `json:"group"` // 令牌绑定的分组(计价档);空=跟随用户默认分组/已删
-	Requests  int64   `json:"requests"`
-	Tokens    int64   `json:"tokens"`
-	CostUSD   float64 `json:"cost_usd"`
+	TokenID      int64    `json:"token_id"` // 主站 tokens.id;0=老日志无token_id(不可下钻)
+	Owner        string   `json:"owner"`    // 令牌所属用户(展示名:用户名/邮箱/#ID)
+	Name         string   `json:"name"`
+	MaskedKey    string   `json:"masked_key"`
+	Group        string   `json:"group"` // 令牌绑定的分组(计价档);空=跟随用户默认分组/已删
+	Requests     int64    `json:"requests"`
+	Tokens       int64    `json:"tokens"`
+	CostUSD      float64  `json:"cost_usd"`
+	TotalCostUSD *float64 `json:"total_cost_usd"` // 累计总消耗(tokens.used_quota 折美元;创建至今终身值,不受日期范围影响);null=令牌已不可查(硬删/老日志无token_id)
+	Deleted      bool     `json:"deleted"`        // 已删除令牌(软删有消费仍显示/硬删兜底行);前端沉底+标记,与现存令牌分区
+}
+
+// tokenMetaOf 取单令牌元数据(名称/脱敏key/分组/累计/是否已删),强制归属校验(id+user_id 双条件)。
+// 查不到(硬删/不属于该用户)返回 nil,不报错——令牌详情页此时只展示日志侧数据。
+func (m *Monitor) tokenMetaOf(ctx context.Context, uid, tokenID int64) *TokenUsage {
+	cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	var name, key, group string
+	var used int64
+	var deleted bool
+	q := "SELECT COALESCE(name,''), COALESCE(`key`,''), COALESCE(`group`,''), CAST(COALESCE(used_quota,0) AS SIGNED), (deleted_at IS NOT NULL)" +
+		" FROM tokens WHERE id = ? AND user_id = ?"
+	if err := m.prodDB.QueryRowContext(cctx, q, tokenID, uid).Scan(&name, &key, &group, &used, &deleted); err != nil {
+		return nil
+	}
+	total := float64(used) / quotaPerUSD
+	return &TokenUsage{TokenID: tokenID, Name: name, MaskedKey: maskTokenKey(key), Group: group, TotalCostUSD: &total, Deleted: deleted}
 }
 
 // maskTokenKey 与 new-api 的 MaskTokenKey 同风格。tokens.key 不含 sk- 前缀,
@@ -394,8 +456,10 @@ func maskTokenKey(key string) string {
 	}
 }
 
-// computeUserTokenUsage 按令牌聚合某用户在 [fromTs,toTs) 的消费日志,并联 tokens 表取名称 + 脱敏 key。
-// 生产库只读;key 只在服务端脱敏后返回,明文永不出库。按费用降序。
+// computeUserTokenUsage 列出某用户的全部现存令牌(即使范围内零用量),叠加 [fromTs,toTs) 消费日志的按令牌聚合;
+// 已删除但范围内有用量的令牌也保留一行(名称/key 尽量回查,查不到回退日志名)。
+// 每行带累计总消耗(tokens.used_quota,创建至今终身值);生产库只读;key 只在服务端脱敏后返回,明文永不出库。
+// 排序:现存令牌在前、已删除沉底,区内按范围费用降序。
 func (m *Monitor) computeUserTokenUsage(ctx context.Context, uid, fromTs, toTs int64) ([]TokenUsage, error) {
 	m.usageMu.Lock() // 与其它大聚合共用串行闸:同一时刻生产库最多跑一条聚合(调用方未持锁,不会重入)
 	defer m.usageMu.Unlock()
@@ -446,57 +510,102 @@ func (m *Monitor) computeUserTokenUsage(ctx context.Context, uid, fromTs, toTs i
 		return nil, err
 	}
 
-	// tokens 表取当前名称 + 脱敏 key + 分组(令牌可能已删除,取不到则回退日志里的名字、key/分组留空)
-	nameByID := map[int64]string{}
-	maskByID := map[int64]string{}
-	groupByID := map[int64]string{}
+	// tokens 表:该用户全部现存令牌(零用量也要展示)+ 范围内出现过的已删令牌(软删,名称/key 仍可回查)。
+	// used_quota = 令牌创建至今累计消耗;deleted_at 判定软删;key、group 是保留字,MySQL 需反引号。
+	type tokInfo struct {
+		name, mask, group string
+		usedQuota         int64
+		deleted           bool
+	}
+	infoByID := map[int64]*tokInfo{}
+	kq := "SELECT id, COALESCE(name,''), COALESCE(`key`,''), COALESCE(`group`,''), CAST(COALESCE(used_quota,0) AS SIGNED), (deleted_at IS NOT NULL)" +
+		" FROM tokens WHERE (user_id = ? AND deleted_at IS NULL)"
+	kargs := []any{uid}
 	if len(ids) > 0 {
 		inSQL, inArgs := usageIn("id", ids)
-		// key、group 都是保留字,MySQL 需反引号
-		kq := "SELECT id, COALESCE(name,''), COALESCE(`key`,''), COALESCE(`group`,'') FROM tokens WHERE " + inSQL
-		krows, err := m.prodDB.QueryContext(cctx, kq, inArgs...)
-		if err != nil {
-			return nil, fmt.Errorf("查询令牌信息失败: %w", err)
-		}
-		for krows.Next() {
-			var id int64
-			var name, key, group string
-			if err := krows.Scan(&id, &name, &key, &group); err != nil {
-				krows.Close()
-				return nil, err
-			}
-			nameByID[id] = name
-			maskByID[id] = maskTokenKey(key)
-			groupByID[id] = group
-		}
-		krows.Close()
-		if err := krows.Err(); err != nil {
+		kq += " OR " + inSQL
+		kargs = append(kargs, inArgs...)
+	}
+	krows, err := m.prodDB.QueryContext(cctx, kq, kargs...)
+	if err != nil {
+		return nil, fmt.Errorf("查询令牌信息失败: %w", err)
+	}
+	for krows.Next() {
+		var id, used int64
+		var name, key, group string
+		var deleted bool
+		if err := krows.Scan(&id, &name, &key, &group, &used, &deleted); err != nil {
+			krows.Close()
 			return nil, err
 		}
+		infoByID[id] = &tokInfo{name: name, mask: maskTokenKey(key), group: group, usedQuota: used, deleted: deleted}
+	}
+	krows.Close()
+	if err := krows.Err(); err != nil {
+		return nil, err
 	}
 
-	out := make([]TokenUsage, 0, len(byTok))
-	for tid, a := range byTok {
-		name := nameByID[tid]
+	out := make([]TokenUsage, 0, len(infoByID)+1)
+	// tokens 表里的每个令牌都出一行(现存令牌零用量补零;软删且范围内有用量的也在此列)
+	for tid, info := range infoByID {
+		a := byTok[tid]
+		if a == nil {
+			a = &agg{}
+		}
+		delete(byTok, tid)
+		name := info.name
 		if name == "" {
-			name = a.logName // 令牌已删/无 token_id → 用日志里的名字
+			name = a.logName
 		}
 		if name == "" {
 			name = "(未命名)"
 		}
+		total := float64(info.usedQuota) / quotaPerUSD
 		out = append(out, TokenUsage{
-			Owner:     owner,
-			Name:      name,
-			MaskedKey: maskByID[tid], // 已删或老日志(token_id=0)→ 空,前端显示"—"
-			Group:     groupByID[tid],
-			Requests:  a.requests,
-			Tokens:    a.tokens,
-			CostUSD:   float64(a.quota) / quotaPerUSD,
+			TokenID:      tid,
+			Owner:        owner,
+			Name:         name,
+			MaskedKey:    info.mask,
+			Group:        info.group,
+			Requests:     a.requests,
+			Tokens:       a.tokens,
+			CostUSD:      float64(a.quota) / quotaPerUSD,
+			TotalCostUSD: &total,
+			Deleted:      info.deleted,
+		})
+	}
+	// 剩下的是 tokens 表查不到的:硬删令牌/老日志 token_id=0 → 回退日志名,key/分组/累计留空,归入已删除区
+	for tid, a := range byTok {
+		name := a.logName
+		if name == "" {
+			name = "(未命名)"
+		}
+		out = append(out, TokenUsage{
+			TokenID:  tid,
+			Owner:    owner,
+			Name:     name,
+			Requests: a.requests,
+			Tokens:   a.tokens,
+			CostUSD:  float64(a.quota) / quotaPerUSD,
+			Deleted:  true,
 		})
 	}
 	sort.SliceStable(out, func(i, j int) bool {
+		if out[i].Deleted != out[j].Deleted {
+			return !out[i].Deleted // 现存令牌在前,已删除沉底(前端按此分区渲染)
+		}
 		if out[i].CostUSD != out[j].CostUSD {
 			return out[i].CostUSD > out[j].CostUSD
+		}
+		ti, tj := 0.0, 0.0
+		if out[i].TotalCostUSD != nil {
+			ti = *out[i].TotalCostUSD
+		}
+		if out[j].TotalCostUSD != nil {
+			tj = *out[j].TotalCostUSD
+		}
+		if ti != tj {
+			return ti > tj
 		}
 		return out[i].Name < out[j].Name
 	})
@@ -763,7 +872,7 @@ func (m *Monitor) queryGroupLogs(ctx context.Context, ids []int64, fromTs, toTs,
 	return out, nil
 }
 
-// serveUsageStats GET /usage/stats?from=&to=&user_id=(管理员):对名单(或其中一人)做每日/分组/模型聚合。
+// serveUsageStats GET /usage/stats?from=&to=&user_id=[&token_id=](管理员):对名单(或其中一人/其单个令牌)做每日/分组/模型聚合。
 func (m *Monitor) serveUsageStats(c *gin.Context) {
 	if !m.Enabled() {
 		c.JSON(http.StatusOK, gin.H{"enabled": false})
@@ -780,6 +889,7 @@ func (m *Monitor) serveUsageStats(c *gin.Context) {
 	}
 	ids := idsOf(tracked)
 	isGroup := false
+	var tokenID int64
 	// 可选其一:user_id=单用户详情;group_id=公司详情(聚合整组成员,0=未分组成员)
 	if f := strings.TrimSpace(c.Query("user_id")); f != "" {
 		id, err := strconv.ParseInt(f, 10, 64)
@@ -788,6 +898,14 @@ func (m *Monitor) serveUsageStats(c *gin.Context) {
 			return
 		}
 		ids = []int64{id}
+		// 令牌详情:仅在单用户详情下有效;聚合强制 user_id+token_id 双条件,越权令牌只会查出空
+		if t := strings.TrimSpace(c.Query("token_id")); t != "" {
+			tokenID, err = strconv.ParseInt(t, 10, 64)
+			if err != nil || tokenID <= 0 {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "token_id 不合法"})
+				return
+			}
+		}
 	} else if g := strings.TrimSpace(c.Query("group_id")); g != "" {
 		gid, err := strconv.ParseInt(g, 10, 64)
 		if err != nil || gid < 0 {
@@ -811,7 +929,7 @@ func (m *Monitor) serveUsageStats(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	st, err := m.computeUsageStats(c.Request.Context(), ids, fromTs, toTs)
+	st, err := m.computeUsageStats(c.Request.Context(), ids, fromTs, toTs, tokenID)
 	if err != nil {
 		slog.Warn("用户用量详情聚合失败", "err", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "统计查询失败,请稍后重试(细节见服务端日志)"})
@@ -822,6 +940,8 @@ func (m *Monitor) serveUsageStats(c *gin.Context) {
 		resp["members"] = len(ids)
 		resp["balance_usd"] = m.sumBalanceUSD(c.Request.Context(), ids)
 		resp["total_used_usd"] = m.sumUsedUSD(c.Request.Context(), ids)
+	} else if tokenID > 0 { // 令牌详情:元数据(名称/脱敏key/分组/累计;硬删查不到则为 null,前端用点击时的名字兜底)
+		resp["token"] = m.tokenMetaOf(c.Request.Context(), ids[0], tokenID)
 	} else if len(ids) == 1 { // 单用户详情:个人余额 + 累计总消耗(实时取,null=已删/取不到)+ 各令牌用量
 		resp["balance_usd"] = m.userBalanceUSD(c.Request.Context(), ids[0])
 		resp["total_used_usd"] = m.userUsedUSD(c.Request.Context(), ids[0])

@@ -441,7 +441,7 @@ function renderMemberBar(){
     tooltip:Object.assign({trigger:'axis',axisPointer:{type:'shadow'},formatter:p=>`${esc(p[0].name)}<br/>$${(+p[0].value).toFixed(2)}`},TIP),
     xAxis:{type:'value',axisLabel:{color:AXIS,fontSize:11,formatter:'${value}'},splitLine:{lineStyle:{color:SPLIT}}},
     yAxis:{type:'category',data:names,axisLabel:{color:'#2b3340',fontSize:12},axisLine:{show:false},axisTick:{show:false}},
-    series:[{type:'bar',data:vals,barWidth:'58%',itemStyle:{color:AMBER,borderRadius:[0,3,3,0]},label:{show:true,position:'right',color:'#6d7684',fontSize:11,formatter:p=>'$'+(+p.value).toFixed(2)}}]
+    series:[{type:'bar',data:vals,barWidth:'42%',itemStyle:{color:{type:'linear',x:0,y:0,x2:1,y2:0,colorStops:[{offset:0,color:'#f59e0b'},{offset:1,color:'#fbbf24'}]},borderRadius:[0,4,4,0]},label:{show:true,position:'right',color:'#64748b',fontSize:11,fontWeight:500,formatter:p=>'$'+(+p.value).toFixed(2)}}]
   },true);
 }
 // P1/P3 按模型占比环形(Top5+其他);rows 用 UsageDim(key/cost_usd)

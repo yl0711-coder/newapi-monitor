@@ -193,6 +193,7 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
   .attn-detail .a{color:var(--yellow)}.attn-detail .e{color:var(--red)}
 
   .stats-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:14px;margin-bottom:18px}
+  .stat-card-wide{grid-column:span 2}
   .stat-card{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:18px}
   .stat-label{font-size:12px;color:var(--text-muted);text-transform:uppercase;letter-spacing:.05em}
   .stat-value{font-size:26px;font-weight:700;margin-top:6px}
@@ -460,7 +461,7 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
     <div class="card" id="usageMemRankCard" hidden><div class="card-header">🏆 成员消耗排行 <span class="muted" style="font-weight:400;font-size:12px">· 范围内消耗 Top 10</span></div><div id="usageMemRankChart" style="min-height:180px;padding:6px 10px"></div></div>
     <div class="card"><div class="card-header">按分组</div><div id="usageGrpPie" style="height:230px;padding:4px" hidden></div><table><thead id="thUsageGrp"></thead><tbody id="tbUsageGrp"></tbody></table></div>
     <div class="card"><div class="card-header">按模型</div><div id="usageModelPie" style="height:230px;padding:4px" hidden></div><table><thead id="thUsageModel"></thead><tbody id="tbUsageModel"></tbody></table></div>
-    <div class="card" id="usageTokCard"><div class="card-header">按令牌 <span class="muted" style="font-weight:400;font-size:12px">· 该用户各令牌用量,密钥已脱敏</span></div><table><thead id="thUsageTok"></thead><tbody id="tbUsageTok"></tbody></table></div>
+    <div class="card" id="usageTokCard"><div class="card-header">按令牌 <span class="muted" style="font-weight:400;font-size:12px">· 该用户各令牌用量,密钥已脱敏;点令牌名看单令牌详情</span></div><table><thead id="thUsageTok"></thead><tbody id="tbUsageTok"></tbody></table></div>
   </div>
 </div>
 
@@ -1095,10 +1096,22 @@ function usageShowView(){
   document.getElementById('usageViewList').hidden=!!usageDetail;
   document.getElementById('usageViewDetail').hidden=!usageDetail;
   const t=document.getElementById('usageDetailTitle');
-  if(usageDetail){t.innerHTML=esc(usageDetail.label)+(usageDetail.type==='group'?' <span class="gtag">公司</span>':'')+(usageDetail.note?` <span class="muted" style="font-weight:400;font-size:13px">· 📝 ${esc(usageDetail.note)}</span>`:'')}else{t.textContent=''}
+  if(usageDetail){
+    const tag=usageDetail.type==='group'?' <span class="gtag">公司</span>':(usageDetail.type==='token'?' <span class="gtag">令牌</span>':'');
+    t.innerHTML=esc(usageDetail.label)+tag+(usageDetail.note?` <span class="muted" style="font-weight:400;font-size:13px">· 📝 ${esc(usageDetail.note)}</span>`:'');
+  }else{t.textContent=''}
 }
 function usageOpenDetail(type,id,label,note){ usageDetail={type,id,label,note:note||''}; usageShowView(); usageLoadDetail(); }
-function usageBackToList(){ usageDetail=null; usageShowView(); usageLoadMatrix(); }
+// 令牌详情:单用户详情下钻一层;记住父用户,返回键先回用户详情再回列表
+function usageOpenTokenDetail(tid,tname){
+  if(!usageDetail||usageDetail.type!=='user')return;
+  usageDetail={type:'token',id:tid,uid:usageDetail.id,label:usageDetail.label+' / '+tname,tokenName:tname,parentLabel:usageDetail.label,parentNote:usageDetail.note,note:''};
+  usageShowView(); usageLoadDetail();
+}
+function usageBackToList(){
+  if(usageDetail&&usageDetail.type==='token'){usageOpenDetail('user',usageDetail.uid,usageDetail.parentLabel,usageDetail.parentNote);return}
+  usageDetail=null; usageShowView(); usageLoadMatrix();
+}
 async function usageInit(){
   if(usageInited)return;
   usageInited=true;
@@ -1122,6 +1135,11 @@ async function usageInit(){
   document.getElementById('usageQuery').addEventListener('click',()=>{usageRange='';setUsageSeg('');usageRefresh()});
   document.querySelectorAll('#usageSeg a').forEach(a=>{a.href='javascript:void 0';a.addEventListener('click',()=>{usageRange=a.dataset.r;setUsageSeg(a.dataset.r);usageApplyPreset();usageRefresh();})});
   document.getElementById('usageBack').addEventListener('click',usageBackToList);
+  // 令牌表点令牌名下钻单令牌详情(事件委托,表体每次查询重建)
+  document.getElementById('tbUsageTok').addEventListener('click',e=>{
+    const a=e.target.closest('[data-tid]');
+    if(a)usageOpenTokenDetail(+a.dataset.tid,a.dataset.tname);
+  });
   // 矩阵表头点用户进详情(事件委托,表头每次查询都重建)
   const mxTable=document.getElementById('usageMxTable');
   mxTable.addEventListener('click',e=>{
@@ -1824,7 +1842,8 @@ async function usageLoadDetail(){
   if(usageDetail.type!=='group'){document.getElementById('usageMemCard').hidden=true;document.getElementById('usageMemRankCard').hidden=true;}
   const eb=document.getElementById('usageErr'),seq=++usageSeq;
   const q=usageRangeParams();
-  q.set(usageDetail.type==='group'?'group_id':'user_id',usageDetail.id);
+  if(usageDetail.type==='token'){q.set('user_id',usageDetail.uid);q.set('token_id',usageDetail.id);}
+  else q.set(usageDetail.type==='group'?'group_id':'user_id',usageDetail.id);
   // 组织详情:矩阵缓存可用时先秒出组内成员/排行(不等 stats 查库;范围若变后面会按新范围重画)
   if(usageDetail.type==='group'&&usageMxCache&&usageMxCache.users&&usageMxCache.users.length){
     document.getElementById('usageMemCard').hidden=false;
@@ -1840,7 +1859,7 @@ async function usageLoadDetail(){
     if(!res.ok){eb.innerHTML='<div class="alert">'+esc(d.error||('查询失败 '+res.status))+'</div>';return}
     if(d.enabled===false){eb.innerHTML='<div class="alert">未连接主站数据库(NEWAPI_LOG_DSN),用户用量不可用。</div>';return}
     eb.innerHTML='';
-    renderUsage(d.stats||{},d.balance_usd,d.members,d.total_used_usd,d.by_token);
+    renderUsage(d.stats||{},d.balance_usd,d.members,d.total_used_usd,d.by_token,d.token);
     // 组织详情:补「组内成员」矩阵,内容对齐该客户在报表页看到的(独立拉矩阵,始终按当前日期范围)
     const memCard=document.getElementById('usageMemCard');
     if(usageDetail.type==='group'){
@@ -1872,23 +1891,34 @@ function renderUsageDim(th,tb,rows){
   e.innerHTML=rows.map(r=>`<tr><td>${esc(r.key||'—')}</td><td class="right num">${fmtNum(r.requests)}</td><td class="right num">${fmtNum(r.tokens)}</td><td class="right num">${fmtCost(r.cost_usd)}</td></tr>`).join('');
 }
 // 按令牌:密钥脱敏(服务端已打码,前端不接触明文),仅单用户详情显示,公司详情隐藏。
+// 该用户全部现存令牌都列出(范围内零用量补0);已删除但范围内有消费的沉底单独分区+标记,保证分项加总=范围消耗合计。
+// 累计总消耗=创建至今终身值,"—"=令牌已不可查(硬删/老日志)。
 function renderUsageTokens(rows){
   const card=document.getElementById('usageTokCard');
   if(rows===undefined){card.hidden=true;return} // 公司详情:无此维度
   card.hidden=false;
-  document.getElementById('thUsageTok').innerHTML='<tr><th>所属用户</th><th>令牌名称</th><th>密钥</th><th>分组</th><th class="right">请求</th><th class="right">Tokens</th><th class="right">费用</th></tr>';
+  document.getElementById('thUsageTok').innerHTML='<tr><th>所属用户</th><th>令牌名称</th><th>密钥</th><th>分组</th><th class="right">请求</th><th class="right">Tokens</th><th class="right">范围消耗</th><th class="right">累计总消耗</th></tr>';
   const e=document.getElementById('tbUsageTok');
-  if(!rows||!rows.length){e.innerHTML='<tr><td colspan="7" class="muted" style="text-align:center;padding:18px">范围内无令牌用量</td></tr>';return}
-  e.innerHTML=rows.map(r=>{
+  if(!rows||!rows.length){e.innerHTML='<tr><td colspan="8" class="muted" style="text-align:center;padding:18px">该用户暂无令牌记录</td></tr>';return}
+  const tr=r=>{
     const mk=r.masked_key?`<span class="maskkey">${esc(r.masked_key)}</span>`:'<span class="muted">—</span>';
     const grp=r.group?esc(r.group):'<span class="muted">默认</span>';
-    return `<tr><td>${esc(r.owner||'—')}</td><td>${esc(r.name||'(未命名)')}</td><td>${mk}</td><td>${grp}</td><td class="right num">${fmtNum(r.requests)}</td><td class="right num">${fmtNum(r.tokens)}</td><td class="right num">${fmtCost(r.cost_usd)}</td></tr>`;
-  }).join('');
+    const total=r.total_cost_usd==null?'<span class="muted">—</span>':fmtCost(r.total_cost_usd);
+    const tag=r.deleted?' <span class="muted" style="font-size:11px;border:1px solid var(--border);border-radius:4px;padding:0 4px">已删除</span>':'';
+    // 令牌名可点下钻(token_id>0 才可;老日志 token_id=0 无从定位)
+    const nm=r.token_id>0?`<a href="javascript:void 0" data-tid="${r.token_id}" data-tname="${esc(r.name||'(未命名)')}" style="color:var(--accent);text-decoration:none">${esc(r.name||'(未命名)')}</a>`:esc(r.name||'(未命名)');
+    return `<tr${r.deleted?' style="opacity:.65"':''}><td>${esc(r.owner||'—')}</td><td>${nm}${tag}</td><td>${mk}</td><td>${grp}</td><td class="right num">${fmtNum(r.requests)}</td><td class="right num">${fmtNum(r.tokens)}</td><td class="right num">${fmtCost(r.cost_usd)}</td><td class="right num">${total}</td></tr>`;
+  };
+  const live=rows.filter(r=>!r.deleted),del=rows.filter(r=>r.deleted); // 服务端已排好:现存在前已删沉底
+  let html=live.map(tr).join('');
+  if(del.length)html+='<tr><td colspan="8" class="muted" style="font-size:11px;padding:10px 12px 4px;border-bottom:none">以下为已删除令牌(范围内仍有消费,计入合计)</td></tr>'+del.map(tr).join('');
+  e.innerHTML=html;
 }
 // ---- 组织详情图表(深色,内容对齐客户报表页 portal.html)----
 // 模型/分组配色:名称哈希到固定深色调色板,同一名称颜色稳定(与 portal.html modelColor 同算法,深色板)
 const DK_PALETTE=['#f59e0b','#f97316','#eab308','#6366f1','#10b981','#a78bfa','#d97706'];
 function modelColorDk(n){let h=0;for(let i=0;i<n.length;i++)h=(h*31+n.charCodeAt(i))>>>0;return DK_PALETTE[h%DK_PALETTE.length];}
+const DAILY_STACK_TOP=6; // 每日消耗堆叠柱状:top-N 模型独立系列,其余归并「其他」(与 portal.html 同值)
 function usageEch(el){return echarts.getInstanceByDom(el)||echarts.init(el);} // 取该 DOM 上已有 echarts 实例,无则初始化
 // 图表空态占位:居中提示文字;withAxis=false 时隐藏坐标轴(饼图用)
 function usageEmptyChart(ch,msg,withAxis){const o={title:{text:msg,left:'center',top:'center',textStyle:{color:'#64748b',fontSize:13,fontWeight:400}},series:[]};if(!withAxis){o.xAxis={show:false};o.yAxis={show:false};}ch.setOption(o,true);}
@@ -1928,12 +1958,18 @@ function renderUsagePie(elId,rows,show){
   },true);
   setTimeout(()=>ch.resize(),40);
 }
-function renderUsage(st,balanceUSD,members,totalUsedUSD,byToken){
+function renderUsage(st,balanceUSD,members,totalUsedUSD,byToken,tokenMeta){
   document.getElementById('usageRangeNote').textContent=st.from?('统计范围 '+st.from+' ~ '+st.to+'(CST)'):'';
   const s=st.summary||{};
-  const isGrp=members!=null;
-  // 小结卡:组织详情对齐客户报表页(累计/范围/余额/成员数);用户详情保留原有
-  const cards=isGrp?[
+  const isGrp=members!=null,isTok=usageDetail&&usageDetail.type==='token';
+  // 小结卡:组织详情对齐客户报表页(累计/范围/余额/成员数);令牌详情=该令牌口径(密钥/累计/范围);用户详情保留原有
+  const cards=isTok?[
+    ['密钥',tokenMeta&&tokenMeta.masked_key?`<span style="font-size:14px;white-space:nowrap;font-family:ui-monospace,SFMono-Regular,Menlo,monospace">${esc(tokenMeta.masked_key)}</span>`:'—','#94a3b8','stat-card-wide'],
+    ['总请求',fmtNum(s.requests),'#6366f1'],
+    ['总 Tokens',`<span title="${fmtNum(s.tokens)} tokens">${fmtCompact(s.tokens)}</span>`,'#6366f1'],
+    ['范围消耗',fmtCost(s.cost_usd),'#e2e8f0'],
+    ['累计总消耗',tokenMeta&&tokenMeta.total_cost_usd!=null?fmtCost(tokenMeta.total_cost_usd):'—','#fbbf24'],
+  ]:isGrp?[
     ['累计总消耗合计',totalUsedUSD==null?'—':fmtCost(totalUsedUSD),'#fbbf24'],
     ['范围消耗',fmtCost(s.cost_usd),'#e2e8f0'],
     ['余额合计',balanceUSD==null?'—':fmtCost(balanceUSD),'#34d399'],
@@ -1945,7 +1981,7 @@ function renderUsage(st,balanceUSD,members,totalUsedUSD,byToken){
     ['范围消耗',fmtCost(s.cost_usd),'#e2e8f0'],
     ['余额',balanceUSD==null?'—':fmtCost(balanceUSD),'#34d399'],
   ];
-  document.getElementById('usageDetailSummary').innerHTML=cards.map(([l,v,col])=>`<div class="stat-card"><div class="stat-label">${l}</div><div class="stat-value num" style="color:${col}">${v}</div></div>`).join('');
+  document.getElementById('usageDetailSummary').innerHTML=cards.map(([l,v,col,cls])=>`<div class="stat-card${cls?' '+cls:''}"><div class="stat-label">${l}</div><div class="stat-value num" style="color:${col}">${v}</div></div>`).join('');
   const daily=st.daily||[];
   // 每日明细表:客户报表页组织总览没有此表,组织详情隐藏;用户详情保留
   const dailyTbl=document.getElementById('thUsageDaily').closest('table');
@@ -1961,22 +1997,51 @@ function renderUsage(st,balanceUSD,members,totalUsedUSD,byToken){
   }
   const el=document.getElementById('usageDailyChart');
   if(!usageDailyChart)usageDailyChart=echarts.init(el);
-  usageDailyChart.setOption({
-    grid:{left:56,right:56,top:30,bottom:24},
-    tooltip:{trigger:'axis',backgroundColor:'#1a1d27',borderColor:'#2a2d3e',textStyle:{color:'#e2e8f0'}},
-    legend:{data:['费用($)','请求数'],textStyle:{color:'#94a3b8'},left:'center',top:2},
-    xAxis:{type:'category',boundaryGap:!isGrp,data:daily.map(d=>d.date.slice(5)),axisLabel:{color:'#94a3b8',fontSize:11},axisLine:{lineStyle:{color:'#2a2d3e'}}},
-    yAxis:[
-      {type:'value',axisLabel:{color:'#94a3b8',fontSize:11,formatter:'${value}'},splitLine:{lineStyle:{color:'#2a2d3e'}}},
-      {type:'value',minInterval:1,axisLabel:{color:'#94a3b8',fontSize:11},splitLine:{show:false}}
-    ],
-    series:[
-      isGrp
-        ?{name:'费用($)',type:'line',smooth:true,symbol:'none',color:'#f59e0b',data:daily.map(d=>+(d.cost_usd||0).toFixed(4)),lineStyle:{color:'#f59e0b',width:2},itemStyle:{color:'#f59e0b'},areaStyle:{color:'rgba(245,158,11,.12)'}}
-        :{name:'费用($)',type:'bar',barWidth:'55%',color:'#f59e0b',data:daily.map(d=>+(d.cost_usd||0).toFixed(4)),itemStyle:{color:'#f59e0b',borderRadius:[3,3,0,0]}},
-      {name:'请求数',type:'line',yAxisIndex:1,smooth:true,symbol:'none',color:'#6366f1',data:daily.map(d=>d.requests),lineStyle:{color:'#6366f1',width:1.5},itemStyle:{color:'#6366f1'}}
-    ]
-  },true);
+  {
+    const byModel=(st.by_model||[]).filter(r=>+r.cost_usd>0);
+    const dailyByModel=st.daily_by_model||[];
+    const byDateModel={};dailyByModel.forEach(r=>{(byDateModel[r.date]||(byDateModel[r.date]={}))[r.model||'—']=r;});
+    const topNames=byModel.slice(0,DAILY_STACK_TOP).map(r=>r.key||'—');
+    const restNames=new Set(byModel.slice(DAILY_STACK_TOP).map(r=>r.key||'—'));
+    const modelNames=restNames.size?[...topNames,'其他']:topNames;
+    const costSeries=modelNames.map((name,i)=>({
+      name,type:'bar',stack:'d',barWidth:'38%',barCategoryGap:'32%',
+      itemStyle:{color:name==='其他'?'#475569':modelColorDk(name),borderRadius:i===modelNames.length-1?[4,4,0,0]:0},
+      data:daily.map(d=>{
+        const m=byDateModel[d.date]||{};
+        if(name==='其他'){
+          let cost=0,tok=0;restNames.forEach(n=>{const r=m[n];if(r){cost+=+r.cost_usd||0;tok+=+r.tokens||0;}});
+          return {value:+cost.toFixed(4),tokens:tok};
+        }
+        const r=m[name];
+        return {value:r?+(+r.cost_usd).toFixed(4):0,tokens:r?r.tokens:0};
+      })
+    }));
+    usageDailyChart.setOption({
+      grid:{left:54,right:54,top:modelNames.length>1?52:32,bottom:28},
+      tooltip:{trigger:'axis',backgroundColor:'#1a1d27',borderColor:'#2a2d3e',textStyle:{color:'#e2e8f0'},formatter:params=>{
+        const lines=params.filter(p=>p.seriesType==='bar'?+p.value>0:true).map(p=>{
+          if(p.seriesType!=='bar')return `${esc(p.seriesName)}: ${fmtNum(p.value)}`;
+          return `${esc(p.seriesName)}: $${(+p.value).toFixed(4)}${p.data&&p.data.tokens?' ('+fmtNum(p.data.tokens)+' tokens)':''}`;
+        });
+        const barParams=params.filter(p=>p.seriesType==='bar');
+        const total=barParams.reduce((s,p)=>s+(+p.value||0),0);
+        const totalTok=barParams.reduce((s,p)=>s+(p.data&&p.data.tokens?p.data.tokens:0),0);
+        const footer=barParams.length>1?`<br/><b>总计: $${total.toFixed(4)}${totalTok?' ('+fmtNum(totalTok)+' tokens)':''}</b>`:'';
+        return `${(params[0]&&params[0].axisValueLabel)||''}<br/>${lines.join('<br/>')||'无消耗'}${footer}`;
+      }},
+      legend:{data:[...modelNames,'请求数'],textStyle:{color:'#94a3b8',fontSize:12},left:'center',top:6,itemGap:16,itemWidth:20,itemHeight:12},
+      xAxis:{type:'category',data:daily.map(d=>d.date.slice(5)),axisLabel:{color:'#94a3b8',fontSize:11},axisLine:{lineStyle:{color:'#2a2d3e'}}},
+      yAxis:[
+        {type:'value',splitNumber:5,axisLabel:{color:'#94a3b8',fontSize:11,formatter:'${value}'},splitLine:{lineStyle:{color:'#2a2d3e'}}},
+        {type:'value',minInterval:1,axisLabel:{color:'#94a3b8',fontSize:11},splitLine:{show:false}}
+      ],
+      series:[
+        ...costSeries,
+        {name:'请求数',type:'line',yAxisIndex:1,smooth:true,symbol:'circle',symbolSize:4,color:'#6366f1',data:daily.map(d=>d.requests),lineStyle:{color:'#6366f1',width:1.5,type:'dashed'},itemStyle:{color:'#6366f1'}}
+      ]
+    },true);
+  }
   setTimeout(()=>usageDailyChart.resize(),60);
   renderUsageDim('thUsageGrp','tbUsageGrp',st.by_group);
   renderUsageDim('thUsageModel','tbUsageModel',st.by_model);

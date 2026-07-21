@@ -289,6 +289,14 @@ func (m *Monitor) RegisterPortalRoutes(r *gin.Engine) {
 		c.Header("Cache-Control", "public, max-age=31536000, immutable")
 		c.Data(http.StatusOK, "application/javascript; charset=utf-8", echartsJS)
 	})
+	r.GET("/flatpickr.js", func(c *gin.Context) { // 日期范围选择器,与管理端同一控件、自服务
+		c.Header("Cache-Control", "public, max-age=31536000, immutable")
+		c.Data(http.StatusOK, "application/javascript; charset=utf-8", flatpickrJS)
+	})
+	r.GET("/flatpickr.css", func(c *gin.Context) {
+		c.Header("Cache-Control", "public, max-age=31536000, immutable")
+		c.Data(http.StatusOK, "text/css; charset=utf-8", flatpickrCSS)
+	})
 	r.GET("/login", func(c *gin.Context) {
 		c.Header("Content-Type", "text/html; charset=utf-8")
 		c.String(http.StatusOK, portalLoginHTML)
@@ -411,12 +419,14 @@ func (m *Monitor) portalChangePassword(c *gin.Context) {
 // ---- 组隔离数据接口(gid 只从会话取) ----
 
 type portalOverviewPayload struct {
-	GroupName string            `json:"group_name"`
-	From      string            `json:"from"`
-	To        string            `json:"to"`
-	Days      []string          `json:"days"`
-	Users     []UsageMatrixUser `json:"users"` // 复用矩阵行结构(note/group 字段对本组无泄露风险,前端不展示 note)
-	Cells     []UsageMatrixCell `json:"cells"`
+	GroupName     string            `json:"group_name"`
+	From          string            `json:"from"`
+	To            string            `json:"to"`
+	Days          []string          `json:"days"`
+	Users         []UsageMatrixUser `json:"users"` // 复用矩阵行结构(note/group 字段对本组无泄露风险,前端不展示 note)
+	Cells         []UsageMatrixCell `json:"cells"`
+	DailyByModel  []UsageDailyModel `json:"daily_by_model"`  // 供首页每日消费趋势按模型堆叠展示
+	ByModel       []UsageDim        `json:"by_model"`        // 供堆叠图确定 top-N 模型
 }
 
 func portalOverviewKey(gid, fromTs, toTs int64) string {
@@ -479,6 +489,13 @@ func (m *Monitor) buildPortalOverview(c *gin.Context, gid, fromTs, toTs int64) (
 	}
 	sortPortalUsers(p.Users)
 	p.From, p.To, p.Days, p.Cells = mx.From, mx.To, mx.Days, mx.Cells
+	// 供首页每日趋势图按模型堆叠展示:查询同范围内按日×模型的聚合(复用 computeUsageStats 内部逻辑)
+	st, err := m.computeUsageStats(c.Request.Context(), idsOf(tracked), fromTs, toTs, 0)
+	if err != nil {
+		return nil, err
+	}
+	p.DailyByModel = st.DailyByModel
+	p.ByModel = st.ByModel
 	return p, nil
 }
 
@@ -515,7 +532,7 @@ func (m *Monitor) portalBreakdown(c *gin.Context) {
 		if len(ids) == 0 {
 			return gin.H{"by_group": []UsageDim{}, "by_model": []UsageDim{}}, nil
 		}
-		st, err := m.computeUsageStats(c.Request.Context(), ids, fromTs, toTs)
+		st, err := m.computeUsageStats(c.Request.Context(), ids, fromTs, toTs, 0)
 		if err != nil {
 			return nil, err
 		}
@@ -542,16 +559,28 @@ func (m *Monitor) portalUserDetail(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
 		return
 	}
+	// 令牌下钻(可选):聚合强制 uid+token_id 双条件,别组令牌只会查出空,不做归属探测响应差异
+	var tokenID int64
+	if t := strings.TrimSpace(c.Query("token_id")); t != "" {
+		tokenID, _ = strconv.ParseInt(t, 10, 64)
+		if tokenID <= 0 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "token_id 不合法"})
+			return
+		}
+	}
 	fromTs, toTs, err := parseUsageRange(c.Query("from"), c.Query("to"), time.Now())
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	key := fmt.Sprintf("ud|%d|%d|%d|%d", gid, uid, fromTs, toTs)
+	key := fmt.Sprintf("ud|%d|%d|%d|%d|%d", gid, uid, tokenID, fromTs, toTs)
 	val, err := m.portalCache.Do(key, portalCacheTTL, func() (any, error) {
-		st, err := m.computeUsageStats(c.Request.Context(), []int64{uid}, fromTs, toTs)
+		st, err := m.computeUsageStats(c.Request.Context(), []int64{uid}, fromTs, toTs, tokenID)
 		if err != nil {
 			return nil, err
+		}
+		if tokenID > 0 { // 令牌详情:不带成员余额/令牌列表,补令牌元数据(名称/脱敏key/分组/累计)
+			return gin.H{"stats": st, "token": m.tokenMetaOf(c.Request.Context(), uid, tokenID)}, nil
 		}
 		toks, err := m.computeUserTokenUsage(c.Request.Context(), uid, fromTs, toTs)
 		if err != nil {
