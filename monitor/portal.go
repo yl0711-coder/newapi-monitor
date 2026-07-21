@@ -419,14 +419,14 @@ func (m *Monitor) portalChangePassword(c *gin.Context) {
 // ---- 组隔离数据接口(gid 只从会话取) ----
 
 type portalOverviewPayload struct {
-	GroupName     string            `json:"group_name"`
-	From          string            `json:"from"`
-	To            string            `json:"to"`
-	Days          []string          `json:"days"`
-	Users         []UsageMatrixUser `json:"users"` // 复用矩阵行结构(note/group 字段对本组无泄露风险,前端不展示 note)
-	Cells         []UsageMatrixCell `json:"cells"`
-	DailyByModel  []UsageDailyModel `json:"daily_by_model"`  // 供首页每日消费趋势按模型堆叠展示
-	ByModel       []UsageDim        `json:"by_model"`        // 供堆叠图确定 top-N 模型
+	GroupName    string            `json:"group_name"`
+	From         string            `json:"from"`
+	To           string            `json:"to"`
+	Days         []string          `json:"days"`
+	Users        []UsageMatrixUser `json:"users"` // 复用矩阵行结构(note/group 字段对本组无泄露风险,前端不展示 note)
+	Cells        []UsageMatrixCell `json:"cells"`
+	DailyByModel []UsageDailyModel `json:"daily_by_model"` // 供首页每日消费趋势按模型堆叠展示
+	ByModel      []UsageDim        `json:"by_model"`       // 供堆叠图确定 top-N 模型
 }
 
 func portalOverviewKey(gid, fromTs, toTs int64) string {
