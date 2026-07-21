@@ -1915,9 +1915,9 @@ function renderUsageTokens(rows){
   e.innerHTML=html;
 }
 // ---- 组织详情图表(深色,内容对齐客户报表页 portal.html)----
-// 模型/分组配色:名称哈希到固定深色调色板,同一名称颜色稳定(与 portal.html modelColor 同算法,深色板)
+// 模型/分组配色:按「范围内费用」排名取色板固定位次,同一张图内每个模型颜色必不相同(避免名称哈希碰撞把两个模型染成同色)。
+// 柱状与环形都基于 st.by_model 同一套降序排名,故同一模型两图颜色一致。
 const DK_PALETTE=['#f59e0b','#f97316','#eab308','#6366f1','#10b981','#a78bfa','#d97706'];
-function modelColorDk(n){let h=0;for(let i=0;i<n.length;i++)h=(h*31+n.charCodeAt(i))>>>0;return DK_PALETTE[h%DK_PALETTE.length];}
 const DAILY_STACK_TOP=6; // 每日消耗堆叠柱状:top-N 模型独立系列,其余归并「其他」(与 portal.html 同值)
 function usageEch(el){return echarts.getInstanceByDom(el)||echarts.init(el);} // 取该 DOM 上已有 echarts 实例,无则初始化
 // 图表空态占位:居中提示文字;withAxis=false 时隐藏坐标轴(饼图用)
@@ -1949,7 +1949,7 @@ function renderUsagePie(elId,rows,show){
   rows=(rows||[]).filter(r=>+r.cost_usd>0).sort((a,b)=>b.cost_usd-a.cost_usd);
   if(!rows.length){usageEmptyChart(ch,'范围内无数据',false);return}
   const top=rows.slice(0,5),rest=rows.slice(5);
-  const data=top.map(r=>({name:r.key||'—',value:+(+r.cost_usd).toFixed(4),itemStyle:{color:modelColorDk(r.key||'—')}}));
+  const data=top.map((r,i)=>({name:r.key||'—',value:+(+r.cost_usd).toFixed(4),itemStyle:{color:DK_PALETTE[i%DK_PALETTE.length]}}));
   if(rest.length)data.push({name:'其他',value:+rest.reduce((s,r)=>s+ +r.cost_usd,0).toFixed(4),itemStyle:{color:'#475569'}});
   ch.setOption({
     tooltip:Object.assign({trigger:'item',formatter:p=>`${esc(p.name)}<br/>$${(+p.value).toFixed(2)} · ${p.percent}%`},DK_TIP),
@@ -2006,7 +2006,7 @@ function renderUsage(st,balanceUSD,members,totalUsedUSD,byToken,tokenMeta){
     const modelNames=restNames.size?[...topNames,'其他']:topNames;
     const costSeries=modelNames.map((name,i)=>({
       name,type:'bar',stack:'d',barWidth:'38%',barCategoryGap:'32%',
-      itemStyle:{color:name==='其他'?'#475569':modelColorDk(name),borderRadius:i===modelNames.length-1?[4,4,0,0]:0},
+      itemStyle:{color:name==='其他'?'#475569':DK_PALETTE[i%DK_PALETTE.length],borderRadius:i===modelNames.length-1?[4,4,0,0]:0},
       data:daily.map(d=>{
         const m=byDateModel[d.date]||{};
         if(name==='其他'){
