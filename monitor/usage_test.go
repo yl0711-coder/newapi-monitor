@@ -633,7 +633,7 @@ func TestQueryGroupLogs(t *testing.T) {
 	}
 	ids := []int64{10, 11}
 	// 全部(logType=0)排除错误(5)/退款(6):本组应 5 条(id 1,2,3,5,7),倒序 → 7,5,3,2,1;绝无 uid20 的 id4、错误 id6、退款 id8
-	all, err := m.queryGroupLogs(context.Background(), ids, 0, 2000, 0, 0, "", "", "", 0, 100)
+	all, err := m.queryGroupLogs(context.Background(), ids, 0, 2000, 0, 0, "", "", "", "", 0, 100)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -649,7 +649,7 @@ func TestQueryGroupLogs(t *testing.T) {
 		}
 	}
 	// 类型筛选 消费(2):id 1,2,3,5
-	if cs, _ := m.queryGroupLogs(context.Background(), ids, 0, 2000, 0, 2, "", "", "", 0, 100); len(cs) != 4 {
+	if cs, _ := m.queryGroupLogs(context.Background(), ids, 0, 2000, 0, 2, "", "", "", "", 0, 100); len(cs) != 4 {
 		t.Fatalf("消费类型筛选应 4 条,得 %d", len(cs))
 	}
 	// 流式+首字:id2 应 IsStream=true、FirstByteMs=3400,且【绝不】泄露 other 里的渠道
@@ -679,45 +679,61 @@ func TestQueryGroupLogs(t *testing.T) {
 		}
 	}
 	// 模型筛选 claude:只 id2
-	cl, _ := m.queryGroupLogs(context.Background(), ids, 0, 2000, 0, 0, "claude", "", "", 0, 100)
+	cl, _ := m.queryGroupLogs(context.Background(), ids, 0, 2000, 0, 0, "claude", "", "", "", 0, 100)
 	if len(cl) != 1 || cl[0].ID != 2 {
 		t.Fatalf("模型筛选不对: %+v", cl)
 	}
 	// 分组筛选 vip:只 id5
-	vg, _ := m.queryGroupLogs(context.Background(), ids, 0, 2000, 0, 0, "", "vip", "", 0, 100)
+	vg, _ := m.queryGroupLogs(context.Background(), ids, 0, 2000, 0, 0, "", "vip", "", "", 0, 100)
 	if len(vg) != 1 || vg[0].ID != 5 {
 		t.Fatalf("分组筛选不对: %+v", vg)
 	}
 	// 计数:全部(不含错误)=5;消费=4;成员 uid11=id 2,5,7=3
-	if n, err := m.countGroupLogs(context.Background(), ids, 0, 2000, 0, 0, "", "", ""); err != nil || n != 5 {
+	if n, err := m.countGroupLogs(context.Background(), ids, 0, 2000, 0, 0, "", "", "", ""); err != nil || n != 5 {
 		t.Fatalf("总计数 = %d, %v; want 5", n, err)
 	}
-	if n, _ := m.countGroupLogs(context.Background(), ids, 0, 2000, 0, 2, "", "", ""); n != 4 {
+	if n, _ := m.countGroupLogs(context.Background(), ids, 0, 2000, 0, 2, "", "", "", ""); n != 4 {
 		t.Fatalf("消费计数 = %d; want 4", n)
 	}
-	if n, _ := m.countGroupLogs(context.Background(), ids, 0, 2000, 11, 0, "", "", ""); n != 3 {
+	if n, _ := m.countGroupLogs(context.Background(), ids, 0, 2000, 11, 0, "", "", "", ""); n != 3 {
 		t.Fatalf("成员计数 = %d; want 3", n)
 	}
 	// 游标分页(全部,不含错误):limit 2 → 7,5;再传 cursor=5 → 3,2
-	p1, _ := m.queryGroupLogs(context.Background(), ids, 0, 2000, 0, 0, "", "", "", 0, 2)
+	p1, _ := m.queryGroupLogs(context.Background(), ids, 0, 2000, 0, 0, "", "", "", "", 0, 2)
 	if len(p1) != 2 || p1[0].ID != 7 || p1[1].ID != 5 {
 		t.Fatalf("第一页不对: %+v", p1)
 	}
-	p2, _ := m.queryGroupLogs(context.Background(), ids, 0, 2000, 0, 0, "", "", "", p1[1].ID, 2)
+	p2, _ := m.queryGroupLogs(context.Background(), ids, 0, 2000, 0, 0, "", "", "", "", p1[1].ID, 2)
 	if len(p2) != 2 || p2[0].ID != 3 || p2[1].ID != 2 {
 		t.Fatalf("第二页不对: %+v", p2)
 	}
 	// 时间窗口 [0,1150):只 id 1,2
-	win, _ := m.queryGroupLogs(context.Background(), ids, 0, 1150, 0, 0, "", "", "", 0, 100)
+	win, _ := m.queryGroupLogs(context.Background(), ids, 0, 1150, 0, 0, "", "", "", "", 0, 100)
 	if len(win) != 2 {
 		t.Fatalf("时间窗口不对: %+v", win)
 	}
 	// 令牌搜索:通配符按字面匹配(%/_ 已转义),"%"搜不到任何行;正常子串仍可搜到
-	if tw, _ := m.queryGroupLogs(context.Background(), ids, 0, 2000, 0, 0, "", "", "%", 0, 100); len(tw) != 0 {
+	if tw, _ := m.queryGroupLogs(context.Background(), ids, 0, 2000, 0, 0, "", "", "%", "", 0, 100); len(tw) != 0 {
 		t.Fatalf("通配符应按字面匹配,搜'%%'应 0 条,得 %d", len(tw))
 	}
-	if tw, _ := m.queryGroupLogs(context.Background(), ids, 0, 2000, 0, 0, "", "", "kA", 0, 100); len(tw) != 2 {
+	if tw, _ := m.queryGroupLogs(context.Background(), ids, 0, 2000, 0, 0, "", "", "kA", "", 0, 100); len(tw) != 2 {
 		t.Fatalf("子串搜索 kA 应 2 条(tkA),得 %d", len(tw))
+	}
+	// 详情关键字搜索:普通词只匹配 content 字面
+	if dk, _ := m.queryGroupLogs(context.Background(), ids, 0, 2000, 0, 0, "", "", "", "限流", 0, 100); len(dk) != 0 {
+		// id6(content="上游返回 429 限流")是错误类型(type=5),全局列表本就排除错误行,搜关键字也不该把它捞出来
+		t.Fatalf("详情关键字搜索不该越过错误行过滤,得 %d", len(dk))
+	}
+	if dk, _ := m.queryGroupLogs(context.Background(), ids, 0, 2000, 0, 0, "", "", "", "充值", 0, 100); len(dk) != 1 || dk[0].ID != 7 {
+		t.Fatalf("详情关键字搜索'充值'应命中 id7,得 %+v", dk)
+	}
+	// "违规费"额外命中 other.violation_fee_code(即使 content 里没有这几个字);id2 的 other 不含该标记,不应误中
+	if _, err := m.prodDB.Exec("INSERT INTO logs (id,user_id,created_at,type,model_name,quota,prompt_tokens,completion_tokens,`group`,token_name,username,use_time,is_stream,content,other) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+		9, 11, 1650, 2, "grok", 400000, 10, 10, "default", "tkB", "u11", 1, 0, "", `{"violation_fee_code":"grok-safety"}`); err != nil {
+		t.Fatal(err)
+	}
+	if dk, _ := m.queryGroupLogs(context.Background(), ids, 0, 2000, 0, 0, "", "", "", "违规费", 0, 100); len(dk) != 1 || dk[0].ID != 9 {
+		t.Fatalf("详情关键字搜索'违规费'应只命中带 violation_fee_code 标记的 id9,得 %+v", dk)
 	}
 	// 详情摘要口径(对齐 new-api):消费按价/倍率,退款固定文案,其余回退 content
 	byID := map[int64]LogRow{}

@@ -768,7 +768,7 @@ func scrubContent(content string) string {
 
 // logFilterWhere 拼日志筛选的公共 WHERE(不含游标/排序/上限);全部用户可控值参数化,无注入。
 // 查看(queryGroupLogs)与计数(countGroupLogs)共用,保证两者筛选口径完全一致。logType=0 表示全部类型。
-func logFilterWhere(ids []int64, fromTs, toTs, memberUID int64, logType int, model, group, tokenName string) (string, []any) {
+func logFilterWhere(ids []int64, fromTs, toTs, memberUID int64, logType int, model, group, tokenName, detailKw string) (string, []any) {
 	inSQL, inArgs := usageIn("user_id", ids)
 	where := "created_at >= ? AND created_at < ? AND " + inSQL
 	args := append([]any{fromTs, toTs}, inArgs...)
@@ -794,6 +794,18 @@ func logFilterWhere(ids []int64, fromTs, toTs, memberUID int64, logType int, mod
 		where += " AND token_name LIKE ? ESCAPE '!'"
 		args = append(args, "%"+escapeLike(tokenName)+"%")
 	}
+	if detailKw != "" { // 详情关键字模糊搜索:只匹配 DB 原始 content(详情列里由 other 现算的倍率/单价文本不在 content 里,搜不到——可接受,费用列本身已给准确金额)
+		pat := "%" + escapeLike(detailKw) + "%"
+		if strings.Contains(detailKw, "违规费") {
+			// 违规费是 buildLogDetail 用 other.violation_fee_code 现算的展示文案,content 里没有这几个字;
+			// 但 other 原始 JSON 里的英文字段名 violation_fee_code 是唯一暴露"这条被判违规扣款"的标记,
+			// 客户搜"违规费"时额外把它捞出来(不然这类记录在搜索里完全隐形,无法通过其它列定位)。
+			where += " AND (content LIKE ? ESCAPE '!' OR other LIKE '%violation_fee_code%')"
+		} else {
+			where += " AND content LIKE ? ESCAPE '!'"
+		}
+		args = append(args, pat)
+	}
 	return where, args
 }
 
@@ -804,7 +816,7 @@ func escapeLike(s string) string {
 }
 
 // countGroupLogs 数一组成员在当前筛选下的日志总条数(供前端算总页数)。只在翻页首页调用一次,翻页时前端复用。
-func (m *Monitor) countGroupLogs(ctx context.Context, ids []int64, fromTs, toTs, memberUID int64, logType int, model, group, tokenName string) (int64, error) {
+func (m *Monitor) countGroupLogs(ctx context.Context, ids []int64, fromTs, toTs, memberUID int64, logType int, model, group, tokenName, detailKw string) (int64, error) {
 	if len(ids) == 0 {
 		return 0, nil
 	}
@@ -812,7 +824,7 @@ func (m *Monitor) countGroupLogs(ctx context.Context, ids []int64, fromTs, toTs,
 	defer m.usageMu.Unlock()
 	cctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
-	where, args := logFilterWhere(ids, fromTs, toTs, memberUID, logType, model, group, tokenName)
+	where, args := logFilterWhere(ids, fromTs, toTs, memberUID, logType, model, group, tokenName, detailKw)
 	var n int64
 	if err := m.prodDB.QueryRowContext(cctx, "SELECT COUNT(*) FROM logs WHERE "+where, args...).Scan(&n); err != nil {
 		return 0, fmt.Errorf("日志计数失败: %w", err)
@@ -823,7 +835,7 @@ func (m *Monitor) countGroupLogs(ctx context.Context, ids []int64, fromTs, toTs,
 // queryGroupLogs 查一组成员的日志,按 id 倒序游标分页;窗口化、走索引、只读、串行(usageMu)。
 // 全部用户可控值参数化;memberUID 需调用方已校验属本组;limit 由调用方控上限(分页 pageSize+1 / 导出 cap,超限判定在导出侧用 COUNT 探测)。
 // 取 content+other 拼「详情」与首字(only 安全字段);花费/首字/详情按 new-api 的可展示/计时类型口径填。
-func (m *Monitor) queryGroupLogs(ctx context.Context, ids []int64, fromTs, toTs, memberUID int64, logType int, model, group, tokenName string, beforeID int64, limit int) ([]LogRow, error) {
+func (m *Monitor) queryGroupLogs(ctx context.Context, ids []int64, fromTs, toTs, memberUID int64, logType int, model, group, tokenName, detailKw string, beforeID int64, limit int) ([]LogRow, error) {
 	if len(ids) == 0 {
 		return nil, nil
 	}
@@ -832,7 +844,7 @@ func (m *Monitor) queryGroupLogs(ctx context.Context, ids []int64, fromTs, toTs,
 	cctx, cancel := context.WithTimeout(ctx, 25*time.Second) // 导出可能取到 5 万行,给足超时
 	defer cancel()
 
-	where, args := logFilterWhere(ids, fromTs, toTs, memberUID, logType, model, group, tokenName)
+	where, args := logFilterWhere(ids, fromTs, toTs, memberUID, logType, model, group, tokenName, detailKw)
 	if beforeID > 0 { // 游标:取比上次末尾更早的(id 近似时间序,倒序翻页,不用深 OFFSET)
 		where += " AND id < ?"
 		args = append(args, beforeID)

@@ -615,7 +615,7 @@ func portalLogParamsError(c *gin.Context, err error) {
 }
 
 // portalLogParams 解析并校验日志相关的公共参数(组隔离:成员必属本组)。
-func (m *Monitor) portalLogParams(c *gin.Context) (gid int64, ids []int64, memberUID, fromTs, toTs int64, logType int, model, group, tokenName string, err error) {
+func (m *Monitor) portalLogParams(c *gin.Context) (gid int64, ids []int64, memberUID, fromTs, toTs int64, logType int, model, group, tokenName, detailKw string, err error) {
 	gid = c.GetInt64("portalGID")
 	fromTs, toTs, err = parseUsageRange(c.Query("from"), c.Query("to"), time.Now())
 	if err != nil {
@@ -655,12 +655,17 @@ func (m *Monitor) portalLogParams(c *gin.Context) (gid int64, ids []int64, membe
 		err = fmt.Errorf("令牌名搜索最长 64 字符")
 		return
 	}
+	detailKw = strings.TrimSpace(c.Query("detail_kw"))
+	if len(detailKw) > 64 { // 详情关键字搜索同限长,同一防御理由
+		err = fmt.Errorf("详情关键字搜索最长 64 字符")
+		return
+	}
 	return
 }
 
 // portalLogs GET /api/logs:游标分页看本组消费日志(时间倒序)。
 func (m *Monitor) portalLogs(c *gin.Context) {
-	gid, ids, memberUID, fromTs, toTs, logType, model, group, tokenName, err := m.portalLogParams(c)
+	gid, ids, memberUID, fromTs, toTs, logType, model, group, tokenName, detailKw, err := m.portalLogParams(c)
 	if err != nil {
 		portalLogParamsError(c, err)
 		return
@@ -671,7 +676,7 @@ func (m *Monitor) portalLogs(c *gin.Context) {
 		return
 	}
 	beforeID, _ := strconv.ParseInt(c.Query("cursor"), 10, 64)
-	rows, err := m.queryGroupLogs(c.Request.Context(), ids, fromTs, toTs, memberUID, logType, model, group, tokenName, beforeID, portalLogPageSize+1)
+	rows, err := m.queryGroupLogs(c.Request.Context(), ids, fromTs, toTs, memberUID, logType, model, group, tokenName, detailKw, beforeID, portalLogPageSize+1)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "查询失败,请稍后重试"})
 		return
@@ -686,7 +691,7 @@ func (m *Monitor) portalLogs(c *gin.Context) {
 	}
 	resp := gin.H{"ok": true, "rows": rows, "has_more": hasMore, "next_cursor": next}
 	if beforeID == 0 { // 仅首页(筛选变更时)数一次总条数,前端据此算总页数并在翻页时复用
-		if total, err := m.countGroupLogs(c.Request.Context(), ids, fromTs, toTs, memberUID, logType, model, group, tokenName); err == nil {
+		if total, err := m.countGroupLogs(c.Request.Context(), ids, fromTs, toTs, memberUID, logType, model, group, tokenName, detailKw); err == nil {
 			resp["total"] = total
 		}
 	}
@@ -709,7 +714,7 @@ func csvSafe(s string) string {
 // portalLogsExport GET /api/logs/export:CSV 导出。顺序:限流(1次/5min,仅计成功下载)→ COUNT 探测
 // (超 5 万条且未确认→need_confirm,不拉行)→ 拉行(封顶 5 万)→ CSV。超 90 天由 parseUsageRange 拒。
 func (m *Monitor) portalLogsExport(c *gin.Context) {
-	gid, ids, memberUID, fromTs, toTs, logType, model, group, tokenName, err := m.portalLogParams(c)
+	gid, ids, memberUID, fromTs, toTs, logType, model, group, tokenName, detailKw, err := m.portalLogParams(c)
 	if err != nil {
 		portalLogParamsError(c, err)
 		return
@@ -733,7 +738,7 @@ func (m *Monitor) portalLogsExport(c *gin.Context) {
 		}
 	}()
 	// 探测用轻量 COUNT(走索引,毫秒级),不再为判断超限拉 5 万整行
-	total, err := m.countGroupLogs(c.Request.Context(), ids, fromTs, toTs, memberUID, logType, model, group, tokenName)
+	total, err := m.countGroupLogs(c.Request.Context(), ids, fromTs, toTs, memberUID, logType, model, group, tokenName, detailKw)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "查询失败,请稍后重试"})
 		return
@@ -743,7 +748,7 @@ func (m *Monitor) portalLogsExport(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"need_confirm": true, "cap": portalExportCap})
 		return
 	}
-	rows, err := m.queryGroupLogs(c.Request.Context(), ids, fromTs, toTs, memberUID, logType, model, group, tokenName, 0, portalExportCap)
+	rows, err := m.queryGroupLogs(c.Request.Context(), ids, fromTs, toTs, memberUID, logType, model, group, tokenName, detailKw, 0, portalExportCap)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "查询失败,请稍后重试"})
 		return

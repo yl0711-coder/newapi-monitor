@@ -102,9 +102,9 @@
   .mxwrap{max-height:70vh;overflow:auto;position:relative}
   .mxwrap table{border-collapse:separate;border-spacing:0;min-width:560px;width:100%}
   .mxwrap thead th{position:sticky;top:0;background:var(--th-bg);z-index:3}
-  .mxwrap td:first-child,.mxwrap th:first-child{position:sticky;left:0;background:var(--panel);z-index:2;width:150px;min-width:150px;max-width:150px}
-  .mxwrap td:nth-child(2),.mxwrap th:nth-child(2){position:sticky;left:150px;background:var(--panel);z-index:2;width:80px;min-width:80px;max-width:80px}
-  .mxwrap td:nth-child(3),.mxwrap th:nth-child(3){position:sticky;left:230px;background:var(--panel);z-index:2;width:118px;min-width:118px;max-width:118px;box-shadow:6px 0 8px -6px rgba(20,30,50,.16)}
+  .mxwrap td:first-child,.mxwrap th:first-child{position:sticky;left:0;background:var(--panel);z-index:2;width:200px;min-width:200px;max-width:200px}
+  .mxwrap td:nth-child(2),.mxwrap th:nth-child(2){position:sticky;left:200px;background:var(--panel);z-index:2;width:80px;min-width:80px;max-width:80px}
+  .mxwrap td:nth-child(3),.mxwrap th:nth-child(3){position:sticky;left:280px;background:var(--panel);z-index:2;width:118px;min-width:118px;max-width:118px;box-shadow:6px 0 8px -6px rgba(20,30,50,.16)}
   .mxwrap thead th:first-child,.mxwrap thead th:nth-child(2),.mxwrap thead th:nth-child(3){z-index:4;background:var(--panel)}
   .mxwrap td:last-child,.mxwrap th:last-child{position:sticky;right:0;background:var(--panel);z-index:2;box-shadow:-6px 0 8px -6px rgba(20,30,50,.16);min-width:88px}
   .mxwrap thead th:last-child{z-index:4}
@@ -112,8 +112,8 @@
   .mxwrap tbody tr.mxfoot td{position:sticky;bottom:0;background:var(--panel);z-index:3;border-top:2px solid var(--border);font-weight:700}
   .mxwrap tbody td .dash{color:#c4ccd8}
   .ucell{color:var(--accent);cursor:pointer;text-decoration:none;line-height:1.25;display:block}
-  .ucell .u-name{display:block;max-width:126px;overflow:hidden;text-overflow:ellipsis}
-  .ucell .u-mail{display:block;font-size:11px;color:var(--muted)}
+  .ucell .u-name{display:block;max-width:176px;overflow:hidden;text-overflow:ellipsis}
+  .ucell .u-mail{display:block;max-width:176px;overflow:hidden;text-overflow:ellipsis;font-size:11px;color:var(--muted)}
   /* 明细区 */
   #detail{display:none}
   .backlink{color:var(--accent);cursor:pointer;font-size:13px;text-decoration:none}
@@ -138,6 +138,15 @@
   .logfilters{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin:14px 0}
   .logfilters select,.logfilters input{background:#fdfdff;border:1px solid var(--border);border-radius:8px;color:var(--text);padding:7px 11px;font-size:13px}
   .logfilters select:focus,.logfilters input:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px rgba(79,70,229,.12)}
+  /* 可搜索下拉(成员/模型/分组):文本框当触发器,输入即过滤,选项来自隐藏的原生 select */
+  .cbox{position:relative;display:inline-block}
+  .cbox-input{width:130px;cursor:text}
+  .cbox-pop{position:absolute;top:calc(100% + 4px);left:0;z-index:40;background:var(--surface);border:1px solid var(--border);border-radius:8px;box-shadow:0 8px 24px rgba(20,30,50,.16);max-height:240px;overflow:auto;min-width:180px;display:none}
+  .cbox-pop.open{display:block}
+  .cbox-opt{padding:7px 12px;font-size:13px;color:var(--text);cursor:pointer;white-space:nowrap}
+  .cbox-opt:hover{background:var(--panel)}
+  .cbox-opt.sel{color:var(--accent);font-weight:600}
+  .cbox-empty{padding:7px 12px;font-size:13px;color:var(--muted)}
   .exp-btn{margin-left:auto;background:var(--green);color:#fff;border:none;border-radius:8px;padding:8px 16px;font-size:13px;font-weight:600;cursor:pointer;display:inline-flex;align-items:center;gap:6px}
   .exp-btn:disabled{opacity:.5;cursor:default}
   /* 导出说明:按钮旁 ? 图标(实心醒目),悬停/聚焦弹出规则卡片(右对齐防溢出) */
@@ -219,7 +228,7 @@
   <input type="text" id="ovRange" placeholder="选择日期范围(最长90天)" readonly>
   <button type="button" class="btn p" id="ovQuery">查询</button>
   <span id="ovErr" style="color:var(--red);font-size:12px"></span>
-  <input id="mxSearch" class="mx-search" placeholder="搜索用户(用户名 / 邮箱)" autocomplete="off">
+  <input id="mxSearch" name="mx-filter-q" class="mx-search" placeholder="搜索用户(用户名 / 邮箱)" autocomplete="off" readonly onfocus="this.removeAttribute('readonly')">
   <span class="rangenote" id="rangeNote" style="margin:0"></span>
 </div>
 
@@ -279,11 +288,25 @@
 <!-- 使用日志 -->
 <div id="logsView">
   <div class="logfilters">
-    <select id="logMember"><option value="">全部成员</option></select>
-    <select id="logModel"><option value="">全部模型</option></select>
-    <select id="logGroup"><option value="">全部分组</option></select>
+    <div class="cbox" id="logMemberCbox">
+      <select id="logMember" style="display:none"><option value="">全部成员</option></select>
+      <input class="cbox-input" id="logMemberQ" placeholder="全部成员" autocomplete="off" readonly onfocus="this.removeAttribute('readonly')">
+      <div class="cbox-pop" id="logMemberPop"></div>
+    </div>
+    <div class="cbox" id="logModelCbox">
+      <select id="logModel" style="display:none"><option value="">全部模型</option></select>
+      <input class="cbox-input" id="logModelQ" placeholder="全部模型" autocomplete="off" readonly onfocus="this.removeAttribute('readonly')">
+      <div class="cbox-pop" id="logModelPop"></div>
+    </div>
+    <div class="cbox" id="logGroupCbox">
+      <select id="logGroup" style="display:none"><option value="">全部分组</option></select>
+      <input class="cbox-input" id="logGroupQ" placeholder="全部分组" autocomplete="off" readonly onfocus="this.removeAttribute('readonly')">
+      <div class="cbox-pop" id="logGroupPop"></div>
+    </div>
     <select id="logType"><option value="">全部类型</option><option value="1">充值</option><option value="2">消费</option><option value="3">管理</option><option value="4">系统</option></select>
     <input id="logToken" placeholder="令牌名搜索" style="width:150px" autocomplete="off">
+    <input id="logDetailKw" placeholder="详情关键字搜索" style="width:150px" maxlength="64" autocomplete="off">
+    <button type="button" class="btn p" id="logDetailKwBtn">查询</button>
     <button class="exp-btn" id="expBtn">⬇ 导出 CSV</button>
     <span class="exp-help" tabindex="0">?
       <span class="tip">
@@ -392,6 +415,40 @@ function fillMemberSelect(){
   const us=(ov.users||[]).slice().sort((a,b)=>(a.username||'').localeCompare(b.username||''));
   sel.innerHTML='<option value="">全部成员</option>'+us.map(u=>`<option value="${u.user_id}">${esc(u.username||('#'+u.user_id))}</option>`).join('');
   if(cur&&us.some(u=>String(u.user_id)===cur))sel.value=cur; else sel.value='';
+  cboxSetDisplay('logMember');
+}
+// 可搜索下拉(成员/模型/分组):真实值仍是隐藏 select,input 只做过滤展示层
+function cboxOptions(id){return [...$(id).options].map(o=>({v:o.value,t:o.textContent}));}
+function cboxSetDisplay(id){
+  const sel=$(id),q=$(id+'Q');if(!q)return;
+  const cur=cboxOptions(id).find(o=>o.v===sel.value);
+  q.value=cur?cur.t:'';
+}
+function cboxRenderPop(id,kw){
+  const pop=$(id+'Pop'),sel=$(id);
+  const k=(kw||'').trim().toLowerCase();
+  const list=cboxOptions(id).filter(o=>!k||o.t.toLowerCase().includes(k));
+  pop.innerHTML=list.length?list.map(o=>`<div class="cbox-opt${o.v===sel.value?' sel':''}" data-v="${esc(o.v)}">${esc(o.t)}</div>`).join(''):'<div class="cbox-empty">无匹配项</div>';
+}
+function cboxClose(id){$(id+'Pop').classList.remove('open');cboxSetDisplay(id);}
+function cboxInit(id,onPick){
+  const q=$(id+'Q'),pop=$(id+'Pop'),sel=$(id);
+  q.addEventListener('focus',()=>{q.select();cboxRenderPop(id,'');pop.classList.add('open');});
+  q.addEventListener('input',()=>{cboxRenderPop(id,q.value);pop.classList.add('open');});
+  q.addEventListener('keydown',e=>{
+    if(e.key==='Escape'){cboxClose(id);q.blur();return;}
+    if(e.key==='Enter'){
+      const first=pop.querySelector('.cbox-opt');
+      if(first){sel.value=first.dataset.v;cboxClose(id);onPick();}
+      e.preventDefault();
+    }
+  });
+  pop.addEventListener('click',e=>{
+    const o=e.target.closest('.cbox-opt');if(!o)return;
+    sel.value=o.dataset.v;cboxClose(id);onPick();
+  });
+  document.addEventListener('click',e=>{if(!$(id+'Cbox').contains(e.target))cboxClose(id);});
+  cboxSetDisplay(id);
 }
 // 组织级(整组)按分组/按模型
 async function loadBreakdown(){
@@ -414,6 +471,7 @@ function fillFilterSelect(id,allLabel,rows){
   const keys=(rows||[]).map(r=>r.key).filter(Boolean).sort();
   sel.innerHTML=`<option value="">${allLabel}</option>`+keys.map(k=>`<option value="${esc(k)}">${esc(k)}</option>`).join('');
   if(cur&&keys.includes(cur))sel.value=cur; else sel.value='';
+  cboxSetDisplay(id);
 }
 // ---- 图表(echarts;数据全来自已加载的 ov / breakdown / detail,不额外请求) ----
 const AXIS='#64748b',SPLIT='#eceff4',AMBER='#e08700',GRAYLINE='#9aa2b0';
@@ -430,7 +488,7 @@ function renderTrend(){
   trendCh=getCh(trendCh,'trendChart');
   const dailyByModel=ov.daily_by_model||[];
   const byModel=(ov.by_model||[]).filter(r=>+r.cost_usd>0);
-  const days=(ov.days||[]).slice().reverse(); // 旧→新
+  const days=(ov.days||[]).slice().reverse(); // 旧→新;ov.days 本身就是连续日期轴(含0消耗天),矩阵表也靠它
   if(!days.length||!byModel.length){emptyChart(trendCh);return;}
   const byDateModel={};dailyByModel.forEach(r=>{(byDateModel[r.date]||(byDateModel[r.date]={}))[r.model||'—']=r;});
   const topNames=byModel.slice(0,DAILY_STACK_TOP).map(r=>r.key||'—');
@@ -530,7 +588,8 @@ function renderMatrix(){
     }
     const bal=u.balance_usd==null?'<span class="muted">—</span>':(u.balance_usd<0?`<span style="color:var(--red);font-weight:600">${fmtCost(u.balance_usd)}</span>`:`<span style="color:var(--green)">${fmtCost(u.balance_usd)}</span>`);
     const used=u.total_used_usd==null?'<span class="muted">—</span>':`<b style="color:var(--amber)">${fmtCost(u.total_used_usd)}</b>`;
-    return `<tr><td><a class="ucell" data-uid="${u.user_id}"><span class="u-name">${esc(u.username||'#'+u.user_id)}</span><span class="u-mail">${esc(u.email||'')}</span></a></td>`
+    const uname=u.username||'#'+u.user_id,uTitle=uname+(u.email?' · '+u.email:'');
+    return `<tr><td><a class="ucell" data-uid="${u.user_id}" title="${esc(uTitle)}"><span class="u-name">${esc(uname)}</span><span class="u-mail">${esc(u.email||'')}</span></a></td>`
       +`<td class="right num">${bal}</td><td class="right num">${used}</td>${tds}<td class="right num"><b>${fmtCost(u.total_usd)}</b></td></tr>`;
   }).join('')
   +`<tr class="mxfoot"><td>合计${q?'(筛选)':''}</td><td></td><td class="right num" style="color:var(--amber)">${fmtCost(us.reduce((s,u)=>s+(+u.total_used_usd||0),0))}</td>`
@@ -551,7 +610,10 @@ let dailyChart=null,detailTok=null; // detailTok={tid,name}=令牌下钻视图;n
 const DAILY_STACK_TOP=6;
 function drawDailyChart(daily,dailyByModel,byModel){
   daily=daily||[];dailyByModel=dailyByModel||[];byModel=(byModel||[]).filter(r=>+r.cost_usd>0);
-  const dates=daily.map(x=>x.date);
+  // 连续日期轴(含消耗为0的天):不能用 daily(后端只返回有消费的日期),否则0消耗的天会被跳过压缩时间轴
+  const {from,to}=rangeDates(range);
+  const dates=[];
+  for(let d=new Date(from+'T00:00:00'),end=new Date(to+'T00:00:00');d<=end;d.setDate(d.getDate()+1))dates.push(ymd(d));
   const byDateModel={};dailyByModel.forEach(r=>{(byDateModel[r.date]||(byDateModel[r.date]={}))[r.model||'—']=r;});
   const topNames=byModel.slice(0,DAILY_STACK_TOP).map(r=>r.key||'—');
   const restNames=new Set(byModel.slice(DAILY_STACK_TOP).map(r=>r.key||'—'));
@@ -799,12 +861,13 @@ function timeCell(r){
 function logQuery(){
   const {from,to}=rangeDates(range);
   let q=`from=${from}&to=${to}`;
-  const mem=$('logMember').value,mdl=$('logModel').value,grp=$('logGroup').value,typ=$('logType').value,tok=$('logToken').value.trim();
+  const mem=$('logMember').value,mdl=$('logModel').value,grp=$('logGroup').value,typ=$('logType').value,tok=$('logToken').value.trim(),dkw=$('logDetailKw').value.trim();
   if(mem)q+=`&member=${encodeURIComponent(mem)}`;
   if(mdl)q+=`&model=${encodeURIComponent(mdl)}`;
   if(grp)q+=`&group=${encodeURIComponent(grp)}`;
   if(typ)q+=`&type=${encodeURIComponent(typ)}`;
   if(tok)q+=`&token=${encodeURIComponent(tok)}`;
+  if(dkw)q+=`&detail_kw=${encodeURIComponent(dkw)}`;
   return q;
 }
 // 游标分页:logStack 记录各页起始游标(0=首页),末尾即当前页
@@ -890,12 +953,13 @@ function attachTips(sel){
   });
 }
 attachTips('.th-help');attachTips('.exp-help');
-$('logMember').onchange=()=>loadLogs(true);
-$('logModel').onchange=()=>loadLogs(true);
-$('logGroup').onchange=()=>loadLogs(true);
+cboxInit('logMember',()=>loadLogs(true));
+cboxInit('logModel',()=>loadLogs(true));
+cboxInit('logGroup',()=>loadLogs(true));
 $('logType').onchange=()=>loadLogs(true);
-let logTokTimer=null;
-$('logToken').addEventListener('input',()=>{clearTimeout(logTokTimer);logTokTimer=setTimeout(()=>loadLogs(true),300);});
+$('logDetailKwBtn').addEventListener('click',()=>loadLogs(true));
+$('logToken').addEventListener('keydown',e=>{if(e.key==='Enter')loadLogs(true);});
+$('logDetailKw').addEventListener('keydown',e=>{if(e.key==='Enter')loadLogs(true);});
 
 // ============ CSV 导出 ============
 let exporting=false,expCtrl=null,expTimer=null,expHeaders=false;
