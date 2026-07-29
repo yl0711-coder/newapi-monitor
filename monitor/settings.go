@@ -49,6 +49,9 @@ type Settings struct {
 	// MONITOR_INFRA_RESOURCES:逗号分隔,显式指定要监控的资源,留空=自动发现。
 	// 格式 type:name,type∈ instance/database/lb,如 "instance:Master,database:DB-X,lb:LB-X"。
 	InfraResources string
+	// MONITOR_INFRA_EXCLUDE_RESOURCES:逗号分隔的资源名。用于暂时下线某台实例的
+	// 监控：不再自动采样，也不在现有历史采样的快照、趋势或最近告警中展示。
+	InfraExcludeResources []string
 
 	// 服务端监控告急阈值(百分比)。可用内存/存储「低于」即黄/红;CPU「高于」即黄/红;突发额度「低于」即黄。
 	InfraMemAvailWarnPct     float64 // MONITOR_INFRA_MEM_AVAIL_WARN_PCT,默认 25
@@ -105,11 +108,12 @@ func LoadSettings() Settings {
 		SiteName:          env("MONITOR_SITE_NAME", ""),
 		IngestToken:       env("MONITOR_INGEST_TOKEN", ""),
 
-		InfraEnabled:       env("MONITOR_INFRA_ENABLED", "") == "true",
-		AWSRegion:          env("AWS_REGION", "us-west-2"),
-		InfraSampleSeconds: envInt("MONITOR_INFRA_SAMPLE_SECONDS", 300),
-		InfraRetentionDays: envInt("MONITOR_INFRA_RETENTION_DAYS", 7),
-		InfraResources:     env("MONITOR_INFRA_RESOURCES", ""),
+		InfraEnabled:          env("MONITOR_INFRA_ENABLED", "") == "true",
+		AWSRegion:             env("AWS_REGION", "us-west-2"),
+		InfraSampleSeconds:    envInt("MONITOR_INFRA_SAMPLE_SECONDS", 300),
+		InfraRetentionDays:    envInt("MONITOR_INFRA_RETENTION_DAYS", 7),
+		InfraResources:        env("MONITOR_INFRA_RESOURCES", ""),
+		InfraExcludeResources: envCSV("MONITOR_INFRA_EXCLUDE_RESOURCES"),
 
 		InfraMemAvailWarnPct:     envFloat("MONITOR_INFRA_MEM_AVAIL_WARN_PCT", 25),
 		InfraMemAvailBadPct:      envFloat("MONITOR_INFRA_MEM_AVAIL_BAD_PCT", 15),

@@ -27,6 +27,8 @@ services:
       # 本地验收硬性安全开关：不发邮件、不回填、不做 AWS/域名探测、不打外部心跳。
       MONITOR_ALERTS_DISABLED: "true"
       MONITOR_INFRA_ENABLED: "false"
+      # 可通过启动命令传入已下线资源名，验证历史采样会被隐藏。
+      MONITOR_INFRA_EXCLUDE_RESOURCES: ${MONITOR_INFRA_EXCLUDE_RESOURCES:-}
       MONITOR_HEARTBEAT_URL: ""
       MONITOR_BACKFILL_HOURS: "0"
       MONITOR_SAMPLE_SECONDS: "3600"

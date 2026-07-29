@@ -161,7 +161,7 @@ func (m *Monitor) infraTargets(ctx context.Context, cl *lightsail.Client) []infr
 				out = append(out, infraTarget{name: kv[1], rtype: kv[0]})
 			}
 		}
-		return out
+		return m.filterInfraTargets(out)
 	}
 	var out []infraTarget
 	if r, err := cl.GetInstances(ctx, &lightsail.GetInstancesInput{}); err == nil {
@@ -208,6 +208,25 @@ func (m *Monitor) infraTargets(ctx context.Context, cl *lightsail.Client) []infr
 		}
 	} else {
 		slog.Warn("infra: 列负载均衡失败", "err", err)
+	}
+	return m.filterInfraTargets(out)
+}
+
+func (m *Monitor) infraExcluded(name string) bool {
+	for _, excluded := range m.cfg.InfraExcludeResources {
+		if strings.TrimSpace(excluded) == name {
+			return true
+		}
+	}
+	return false
+}
+
+func (m *Monitor) filterInfraTargets(in []infraTarget) []infraTarget {
+	out := make([]infraTarget, 0, len(in))
+	for _, target := range in {
+		if !m.infraExcluded(target.name) {
+			out = append(out, target)
+		}
 	}
 	return out
 }
@@ -417,6 +436,9 @@ func (m *Monitor) computeInfraSnapshot(nowUnix int64) InfraSnapshot {
 	}
 	byRes := map[string]*acc{}
 	for _, r := range latest {
+		if m.infraExcluded(r.Resource) {
+			continue
+		}
 		a := byRes[r.Resource]
 		if a == nil {
 			a = &acc{rtype: r.RType, metrics: map[string]float64{}}

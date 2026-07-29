@@ -17,6 +17,9 @@ func (m *Monitor) recentInfraAlerts(nowUnix int64, limit int) []InfraAlert {
 	m.storeDB.Where("kind LIKE ?", "infra\\_%").Order("ts DESC").Limit(limit).Find(&logs)
 	out := make([]InfraAlert, 0, len(logs))
 	for _, l := range logs {
+		if m.infraExcluded(l.Target) {
+			continue
+		}
 		st := "bad"
 		kind := l.Kind
 		if strings.HasSuffix(kind, "_FAILED") {

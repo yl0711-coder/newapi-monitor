@@ -350,10 +350,7 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
   <!-- 5. 负载均衡 -->
   <div class="card"><div class="card-header">⚖️ 负载均衡</div><div id="lbBody" style="padding:16px 20px"><span class="muted">加载中…</span></div></div>
 
-  <!-- 6. Redis(占位) -->
-  <div class="card"><div class="card-header">🧱 Redis</div><div style="padding:16px 20px"><span class="muted">待接入(接入后显示内存 / 命中率 / 连接数等)</span></div></div>
-
-  <!-- 7. 最近告警 -->
+  <!-- 6. 最近告警 -->
   <div class="card"><div class="card-header">🔔 最近告警 <span class="muted" style="font-weight:400">· 服务端监控触发的告警(最近 20 条)</span></div>
     <div id="infraAlerts" style="padding:14px 18px"><span class="muted">加载中…</span></div></div>
 </div>

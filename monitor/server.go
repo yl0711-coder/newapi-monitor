@@ -242,6 +242,10 @@ func (m *Monitor) serveInfraSeries(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "resource required"})
 		return
 	}
+	if m.infraExcluded(resource) {
+		c.JSON(http.StatusNotFound, gin.H{"error": "resource is not monitored"})
+		return
+	}
 	hours := 6
 	if v, err := strconv.Atoi(c.Query("hours")); err == nil && v > 0 {
 		hours = v

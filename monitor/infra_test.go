@@ -106,3 +106,24 @@ func TestInfraStatusThresholds(t *testing.T) {
 		}
 	}
 }
+
+func TestInfraExcludedResourceIsNotShown(t *testing.T) {
+	m := newTestMonitor(t)
+	m.cfg.InfraExcludeResources = []string{"Redis-NexusAPI-New"}
+	const bucket = 1_700_000_000 / 60 * 60
+	if err := m.upsertInfra([]InfraSample{
+		{BucketTs: bucket, Resource: "Ubuntu-1", RType: "instance", Metric: "cpu", Value: 5},
+		{BucketTs: bucket, Resource: "Redis-NexusAPI-New", RType: "instance", Metric: "cpu", Value: 5},
+		{BucketTs: bucket, Resource: "Redis-NexusAPI-New", RType: "host", Metric: "mem_avail_mb", Value: 512},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	snap := m.computeInfraSnapshot(bucket + 30)
+	if len(snap.Instances) != 1 || snap.Instances[0].Name != "Ubuntu-1" {
+		t.Fatalf("排除 Redis 后只应展示 Ubuntu-1，得 %+v", snap.Instances)
+	}
+	if got := m.filterInfraTargets([]infraTarget{{name: "Ubuntu-1"}, {name: "Redis-NexusAPI-New"}}); len(got) != 1 || got[0].name != "Ubuntu-1" {
+		t.Fatalf("自动发现目标应排除 Redis，得 %+v", got)
+	}
+}
