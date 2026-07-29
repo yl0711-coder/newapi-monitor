@@ -6,11 +6,16 @@ services:
     container_name: newapi-monitor
     restart: always
     ports:
-      - "8090:8090"
+      # 仅供同机 Nginx/Caddy 反代；不要直接把管理端或客户门户明文暴露到公网。
+      - "127.0.0.1:8090:8090"
+      - "127.0.0.1:8091:8091"
     environment:
       - NEWAPI_LOG_DSN=${NEWAPI_LOG_DSN:?set in .env}
       - MONITOR_NEWAPI_BASE_URL=${MONITOR_NEWAPI_BASE_URL:?set in .env}
       - MONITOR_SESSION_SECRET=${MONITOR_SESSION_SECRET:-}
+      - MONITOR_PORTAL_ADDR=:8091
+      # 同机 Caddy/Nginx 的来源；若反代在容器/其他主机，请按实际网段修改。
+      - MONITOR_TRUSTED_PROXIES=127.0.0.1,::1
       - MONITOR_STORE_PATH=/data/monitor.db
       - MONITOR_SAMPLE_SECONDS=60
       - MONITOR_RETENTION_DAYS=7

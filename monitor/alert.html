@@ -59,7 +59,8 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
   <label class="ck"><input type="checkbox" id="enabled"> 启用报警(关闭时只看看板、不发邮件)</label>
   <h2 style="margin-top:18px">报警栏目开关</h2>
   <p class="muted" style="margin:-6px 0 10px">两栏目独立控制。关闭的栏目命中规则时<b>不发邮件</b>,但页面「最近告警」仍会记录,不会漏看。</p>
-  <label class="ck"><input type="checkbox" id="model_alerts_enabled"> 📈 模型监控 <span class="muted">· 错误率 / 错误爆发 / 异常爆发 / 采样器掉线 / SLO 燃烧</span></label><br>
+  <label class="ck"><input type="checkbox" id="model_alerts_enabled"> 📈 模型监控·错误 <span class="muted">· 错误率 / 错误突发 / 采样器掉线 / SLO 燃烧</span></label><br>
+  <label class="ck" style="margin-top:6px;display:inline-block"><input type="checkbox" id="anomaly_alerts_enabled"> 📉 模型监控·交付异常 <span class="muted">· 异常率 / 已扣费未交付 / 异常成簇(独立于上一项)</span></label><br>
   <label class="ck" style="margin-top:6px;display:inline-block"><input type="checkbox" id="server_alerts_enabled"> 🖥 服务端监控 <span class="muted">· 实例 / 数据库内存与存储 / 负载均衡 / 站点探活 / 证书 / 源站锁</span></label>
 </div>
 
@@ -97,10 +98,23 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
     <tr><td><b>错误率告警</b>:错误率 ≥ ? %</td><td><input type="number" id="err_rate_pct" step="1"> <span class="muted">建议 20</span></td></tr>
     <tr><td>　且 错误数 ≥ ? 条(防低量误报)</td><td><input type="number" id="err_min_count"> <span class="muted">建议 5</span></td></tr>
     <tr><td><b>错误突发</b>:窗口内错误 ≥ ? 条(不论率)</td><td><input type="number" id="err_burst_count"> <span class="muted">建议 10</span></td></tr>
-    <tr><td><b>异常成簇</b>:client_gone 连续 ≥ ? 个采样桶</td><td><input type="number" id="anomaly_burst_buckets"> <span class="muted">建议 3</span></td></tr>
-    <tr><td>　且 异常数 ≥ ? 条</td><td><input type="number" id="anomaly_min_count"> <span class="muted">建议 8</span></td></tr>
     <tr><td><b>采样器掉线</b>报警</td><td><label class="ck"><input type="checkbox" id="sampler_down_enabled"> 启用 <span class="muted">建议开</span></label></td></tr>
     <tr><td><b>冷却</b>:同一(渠道+类型)? 分钟内不重发</td><td><input type="number" id="cooldown_min"> <span class="muted">建议 30</span></td></tr>
+  </table>
+</div>
+
+<div class="card">
+  <h2>交付异常规则(与错误分开控制)</h2>
+  <p class="muted" style="margin-top:-4px">
+    交付异常 = 上游没报错、但用户没拿到内容(零输出/静默断流)。它不触发自动禁用,
+    处理动作是攒证据找上游或人工调渠道权重,所以开关、阈值、冷却都和错误告警分开。
+  </p>
+  <table class="thr">
+    <tr><td><b>交付异常率</b>:异常率 ≥ ? %</td><td><input type="number" id="anomaly_rate_pct" step="1"> <span class="muted">建议 8</span></td></tr>
+    <tr><td>　且 异常数 ≥ ? 条(防低量误报)</td><td><input type="number" id="anomaly_min_count"> <span class="muted">建议 5</span></td></tr>
+    <tr><td><b>已扣费未交付</b>:窗口内已扣 ≥ ? 美元<br><span class="muted">上游收了钱没给东西,不等成簇直接报</span></td><td><input type="number" id="anomaly_billed_usd" step="0.5"> <span class="muted">建议 5</span></td></tr>
+    <tr><td><b>异常成簇</b>:连续 ≥ ? 个采样桶都有异常</td><td><input type="number" id="anomaly_burst_buckets"> <span class="muted">建议 3</span></td></tr>
+    <tr><td><b>冷却</b>:交付异常专用,? 分钟内不重发<br><span class="muted">观察类,不必和错误一样急</span></td><td><input type="number" id="anomaly_cooldown_min"> <span class="muted">建议 60</span></td></tr>
   </table>
 </div>
 
@@ -130,8 +144,8 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
 
 <script>
 const $=id=>document.getElementById(id);
-const numFields=['smtp_port','eval_window_min','err_rate_pct','err_min_count','err_burst_count','anomaly_burst_buckets','anomaly_min_count','cooldown_min','slo_target_pct','slo_window_days','burn_fast_rate','burn_fast_window_min','burn_slow_rate','burn_slow_window_min'];
-const ckFields=['enabled','model_alerts_enabled','server_alerts_enabled','smtp_ssl','sampler_down_enabled','slo_enabled','burn_fast_enabled','burn_slow_enabled','reject_panel_enabled'];
+const numFields=['smtp_port','eval_window_min','err_rate_pct','err_min_count','err_burst_count','anomaly_burst_buckets','anomaly_min_count','cooldown_min','anomaly_rate_pct','anomaly_cooldown_min','anomaly_billed_usd','slo_target_pct','slo_window_days','burn_fast_rate','burn_fast_window_min','burn_slow_rate','burn_slow_window_min'];
+const ckFields=['enabled','model_alerts_enabled','anomaly_alerts_enabled','server_alerts_enabled','smtp_ssl','sampler_down_enabled','slo_enabled','burn_fast_enabled','burn_slow_enabled','reject_panel_enabled'];
 const txtFields=['site_name','smtp_host','smtp_user','smtp_password','smtp_from','recipients'];
 
 function fill(cfg, pwSet){

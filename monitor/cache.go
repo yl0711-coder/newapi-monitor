@@ -3,10 +3,10 @@ package monitor
 // cache.go:进程内 TTL 缓存 + 防击穿(singleflight),给客户端(portal)的组级查询用。
 // 设计(与用户约定一致):
 //   - 客户端【读】缓存:同一组+同一日期范围,TTL 内只真正查一次生产库——在线人数与库压力解耦;
-//   - 管理端【不读】缓存(始终直查最新),但查询完成后按组切片【写】进来(写穿透预热,见 usage.go);
+//   - 管理端【不读】缓存(始终直查最新),查询完成后使受影响组的客户端总览缓存失效;
 //   - 防击穿:缓存失效瞬间同键并发请求只放行第一个去查库,其余等它的结果——
 //     数学上限死:生产库压力 ≤ 每个键每 TTL 一条查询。
-// 失效策略:仅 TTL 自然过期,不做主动失效(报表场景,≤TTL 的旧数据无感;零失效 bug 面)。
+// 失效策略:TTL 自然过期为主；管理端刷新矩阵时仅删除对应组的总览键，避免客户端读到不完整的预热载荷。
 
 import (
 	"sync"
@@ -70,12 +70,19 @@ func (c *ttlCache) Do(key string, ttl time.Duration, fill func() (any, error)) (
 	}
 }
 
-// Put 直接写入(管理端写穿透预热用):无等待语义,覆盖旧值。
+// Put 直接写入:无等待语义,覆盖旧值。
 func (c *ttlCache) Put(key string, val any, ttl time.Duration) {
 	e := &cacheEntry{val: val, exp: time.Now().Add(ttl), ready: make(chan struct{})}
 	close(e.ready)
 	c.mu.Lock()
 	c.m[key] = e
+	c.mu.Unlock()
+}
+
+// Delete 删除一个缓存键。填充中的请求不取消，只保证后续请求不会复用旧值。
+func (c *ttlCache) Delete(key string) {
+	c.mu.Lock()
+	delete(c.m, key)
 	c.mu.Unlock()
 }
 

@@ -44,6 +44,8 @@ docker run -d --name newapi-monitor \
 | `MONITOR_NEWAPI_BASE_URL` | new-api 地址,用于登录鉴权 | 必填 |
 | `MONITOR_SESSION_SECRET` | 会话签名密钥(`openssl rand -hex 32`) | 留空则启动随机生成 |
 | `MONITOR_ADDR` | 监听地址 | `:8090` |
+| `MONITOR_PORTAL_ADDR` | 客户用量门户独立监听地址；留空则不启用 | 留空 |
+| `MONITOR_TRUSTED_PROXIES` | 可提供真实客户端 IP 的可信反代 IP/CIDR，逗号分隔；留空则不信任转发头 | 留空 |
 | `MONITOR_STORE_PATH` | 本地采样库路径 | `/data/monitor.db` |
 | `MONITOR_SAMPLE_SECONDS` | 采样间隔(秒) | `60` |
 | `MONITOR_RETENTION_DAYS` | 分钟级本地留存天数 | `7` |
@@ -96,6 +98,24 @@ GRANT SELECT ON newapi.channels TO 'ro_user'@'%';
 GRANT SELECT ON newapi.users    TO 'ro_user'@'%';
 GRANT SELECT ON newapi.tokens   TO 'ro_user'@'%';
 ```
+
+## 客户用量门户(Usage Portal)
+
+客户门户与管理端使用独立监听端口、独立 Cookie 和独立路由。正式 compose 已默认监听
+`127.0.0.1:8091`，并通过 `MONITOR_PORTAL_ADDR=:8091` 启用；它**不是**给开发机或客户 IP
+加白名单。请用 HTTPS 反代分别暴露管理端和客户门户，例如：
+
+```caddy
+monitor.example.com {
+    reverse_proxy 127.0.0.1:8090
+}
+usage.example.com {
+    reverse_proxy 127.0.0.1:8091
+}
+```
+
+不要直接将 `8090`、`8091` 映射到公网；客户账号需由超级管理员在「用户用量」中为分组开通。
+若 Caddy/Nginx 不在同一主机，需将其实际 IP/CIDR 配入 `MONITOR_TRUSTED_PROXIES`，否则登录限流会按反代地址计算。
 
 ## 安全
 - 镜像内不含任何密钥;DSN、会话密钥、SMTP 凭证均通过环境变量注入。

@@ -30,13 +30,22 @@ type MetricSample struct {
 	ModelName string `gorm:"primaryKey;size:128"`
 	Grp       string `gorm:"primaryKey;size:64;column:grp"`
 
-	Success    int64 // 干净成功(type=2 且正常结束)
-	Anomaly    int64 // 异常(type=2 但 client_gone/scanner_error/panic/ping_fail)
-	Failed     int64 // 错误(type=5,上游返回的错误)
-	SumUseTime int64
-	MaxUseTime int
-	Tokens     int64
-	Quota      int64
+	Success int64 // 干净成功(type=2 且已交付:completion_tokens>0 且流正常结束)
+	// Anomaly 交付异常(B 类):上游没明确拒绝,但用户没拿到东西。判据见 sampler.go 的 ANOM。
+	// 列名保留 anomaly(历史兼容:sparkline/告警/看板多处引用),界面显示为「交付异常」。
+	Anomaly int64
+	Failed  int64 // 错误(type=5,上游返回的错误)
+	// 交付异常明细(互斥,三者之和 = Anomaly)
+	AnomalyBilled int64 `gorm:"column:anomaly_billed"` // B1 零输出且已扣费——唯一直接产生对客损失的一类
+	AnomalyFree   int64 `gorm:"column:anomaly_free"`   // B2 零输出未扣费(上游连 usage 都没返回)
+	AnomalyStream int64 `gorm:"column:anomaly_stream"` // B3/B4 流异常结束或流内错误(可能已产出部分内容)
+	// 严重度补充:B1 已扣配额之和(算金额)、异常请求耗时之和(算平均等待)
+	AnomalyQuota   int64 `gorm:"column:anomaly_quota"`
+	AnomalySumTime int64 `gorm:"column:anomaly_sum_time"`
+	SumUseTime     int64
+	MaxUseTime     int
+	Tokens         int64
+	Quota          int64
 	// 失败粗分类(GORM 默认不在数字前加下划线,故对数字字段显式列名)
 	Err4xx     int64 `gorm:"column:err_4xx"`
 	Err5xx     int64 `gorm:"column:err_5xx"`
@@ -181,11 +190,24 @@ func (m *Monitor) openStore(path string) error {
 	// 栏目开关列是否已存在(迁移前探测):不存在=本次 AutoMigrate 会新建 → 老库存量配置行需补置 true,
 	// 保证从旧版本升级后报警行为不变。字段本身不带 gorm default(布尔 false 会被 default 顶掉,见 AlertConfig 注释)。
 	hadCategoryToggles := db.Migrator().HasColumn(&AlertConfig{}, "server_alerts_enabled")
+	// 交付异常告警列同理:老库升级时这些列刚建出来是零值(开关 false、阈值 0 = 规则不启用),
+	// 需按 defaultAlertConfig 补一次,否则升级后交付异常告警静默失效。
+	hadAnomalyAlerts := db.Migrator().HasColumn(&AlertConfig{}, "anomaly_alerts_enabled")
 	if err := db.AutoMigrate(&MetricSample{}, &TokenSample{}, &HourSample{}, &ChannelSnap{}, &RejectionSample{}, &SelectablePair{}, &InfraSample{}, &AlertConfig{}, &AlertLog{}, &TrackedUser{}, &CustomerGroup{}, &FollowUpLog{}, &UsageSettings{}); err != nil {
 		return fmt.Errorf("表迁移失败: %w", err)
 	}
 	if !hadCategoryToggles {
 		db.Model(&AlertConfig{}).Where("id = 1").Updates(map[string]any{"model_alerts_enabled": true, "server_alerts_enabled": true})
+	}
+	if !hadAnomalyAlerts {
+		d := defaultAlertConfig()
+		db.Model(&AlertConfig{}).Where("id = 1").Updates(map[string]any{
+			"anomaly_alerts_enabled": d.AnomalyAlertsEnabled,
+			"anomaly_rate_pct":       d.AnomalyRatePct,
+			"anomaly_cooldown_min":   d.AnomalyCooldownMin,
+			"anomaly_billed_usd":     d.AnomalyBilledUSD,
+			"anomaly_min_count":      d.AnomalyMinCount,
+		})
 	}
 	m.storeDB = db
 	slog.Info("本地采样库就绪", "path", path)
@@ -312,25 +334,30 @@ func (m *Monitor) pruneRejectionsOlderThan(cutoffTs int64) (int64, error) {
 
 // aggRow 承接聚合结果。
 type aggRow struct {
-	K          string
-	Success    int64
-	Anomaly    int64
-	Failed     int64
-	SumUseTime int64
-	MaxUseTime int
-	Tokens     int64
-	Quota      int64
-	Err4xx     int64 `gorm:"column:err_4xx"`
-	Err5xx     int64 `gorm:"column:err_5xx"`
-	ErrTimeout int64
-	ErrOther   int64
-	Lat1       int64 `gorm:"column:lat_1"`
-	Lat2       int64 `gorm:"column:lat_2"`
-	Lat5       int64 `gorm:"column:lat_5"`
-	Lat10      int64 `gorm:"column:lat_10"`
-	Lat30      int64 `gorm:"column:lat_30"`
-	Lat60      int64 `gorm:"column:lat_60"`
-	LatInf     int64 `gorm:"column:lat_inf"`
+	K              string
+	Success        int64
+	Anomaly        int64
+	Failed         int64
+	AnomalyBilled  int64 `gorm:"column:anomaly_billed"`
+	AnomalyFree    int64 `gorm:"column:anomaly_free"`
+	AnomalyStream  int64 `gorm:"column:anomaly_stream"`
+	AnomalyQuota   int64 `gorm:"column:anomaly_quota"`
+	AnomalySumTime int64 `gorm:"column:anomaly_sum_time"`
+	SumUseTime     int64
+	MaxUseTime     int
+	Tokens         int64
+	Quota          int64
+	Err4xx         int64 `gorm:"column:err_4xx"`
+	Err5xx         int64 `gorm:"column:err_5xx"`
+	ErrTimeout     int64
+	ErrOther       int64
+	Lat1           int64 `gorm:"column:lat_1"`
+	Lat2           int64 `gorm:"column:lat_2"`
+	Lat5           int64 `gorm:"column:lat_5"`
+	Lat10          int64 `gorm:"column:lat_10"`
+	Lat30          int64 `gorm:"column:lat_30"`
+	Lat60          int64 `gorm:"column:lat_60"`
+	LatInf         int64 `gorm:"column:lat_inf"`
 
 	CompletionTokens int64 `gorm:"column:completion_tokens"`
 	Ttft500          int64 `gorm:"column:ttft_500"`
@@ -346,6 +373,11 @@ const aggCols = `
   COALESCE(SUM(success),0)      AS success,
   COALESCE(SUM(anomaly),0)      AS anomaly,
   COALESCE(SUM(failed),0)       AS failed,
+  COALESCE(SUM(anomaly_billed),0)   AS anomaly_billed,
+  COALESCE(SUM(anomaly_free),0)     AS anomaly_free,
+  COALESCE(SUM(anomaly_stream),0)   AS anomaly_stream,
+  COALESCE(SUM(anomaly_quota),0)    AS anomaly_quota,
+  COALESCE(SUM(anomaly_sum_time),0) AS anomaly_sum_time,
   COALESCE(SUM(sum_use_time),0) AS sum_use_time,
   COALESCE(MAX(max_use_time),0) AS max_use_time,
   COALESCE(SUM(tokens),0)       AS tokens,
@@ -369,6 +401,13 @@ func (a aggRow) fill(r *Row, windowSec float64) {
 	r.SuccessRate = rate(a.Success, total) // 干净成功率(异常、错误都不算成功)
 	r.AnomalyRate = rate(a.Anomaly, total)
 	r.ErrorRate = rate(a.Failed, total)
+	// 交付异常明细:拆分 + 严重度(金额、平均等待)。
+	// 金额只算 B1(零输出却已扣费)——这是唯一直接产生对客损失的一类。
+	r.AnomalyBilled, r.AnomalyFree, r.AnomalyStream = a.AnomalyBilled, a.AnomalyFree, a.AnomalyStream
+	r.AnomalyCostUSD = float64(a.AnomalyQuota) / quotaPerUSD
+	if a.Anomaly > 0 {
+		r.AnomalyAvgWait = float64(a.AnomalySumTime) / float64(a.Anomaly)
+	}
 	r.QPS = float64(total) / windowSec
 	if typ2 > 0 {
 		r.AvgLatency = float64(a.SumUseTime) / float64(typ2) // 延迟覆盖全部 type=2(含异常的慢请求)
@@ -439,6 +478,8 @@ func (m *Monitor) storeSummary(since int64, windowSec float64) (*Summary, error)
 	return &Summary{
 		Total: r.Total, Success: r.Success, Anomaly: r.Anomaly, Failed: r.Failed,
 		SuccessRate: r.SuccessRate, AnomalyRate: r.AnomalyRate, ErrorRate: r.ErrorRate,
+		AnomalyBilled: r.AnomalyBilled, AnomalyFree: r.AnomalyFree, AnomalyStream: r.AnomalyStream,
+		AnomalyCostUSD: r.AnomalyCostUSD, AnomalyAvgWait: r.AnomalyAvgWait,
 		QPS: r.QPS, AvgLatency: r.AvgLatency, MaxLatency: r.MaxLatency,
 		P50: r.P50, P95: r.P95, P99: r.P99,
 		TtftP50: r.TtftP50, TtftP95: r.TtftP95, TokPerSec: r.TokPerSec,

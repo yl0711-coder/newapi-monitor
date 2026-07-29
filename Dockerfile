@@ -5,7 +5,7 @@
 # 本地采样库与报警配置落在挂载卷 /data 上,不进镜像。
 
 # ---- 构建阶段 ----
-FROM golang:1.26-alpine AS builder
+FROM golang:1.26-alpine3.23 AS builder
 WORKDIR /build
 COPY go.mod go.sum ./
 RUN go mod download
@@ -16,7 +16,7 @@ COPY . .
 RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /app .
 
 # ---- 运行阶段(最小镜像)----
-FROM alpine:3.19
+FROM alpine:3.23
 RUN apk add --no-cache ca-certificates tzdata
 WORKDIR /app
 COPY --from=builder /app /app/monitor

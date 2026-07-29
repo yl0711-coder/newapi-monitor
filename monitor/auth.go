@@ -202,24 +202,44 @@ func (m *Monitor) loginPage(c *gin.Context) {
 }
 
 func (m *Monitor) loginSubmit(c *gin.Context) {
+	if !limitBodyForLogin(c) {
+		return
+	}
 	var in struct {
 		Username string `json:"username"`
 		Password string `json:"password"`
 	}
+	now := time.Now().Unix()
+	// 管理端登录会转发到主站校验，按来源 IP 限制失败尝试，避免它成为
+	// 对主站的凭证爆破/请求放大入口。ClientIP 仅在 Gin 配置的可信反代下读取 XFF。
+	limKey := c.ClientIP()
+	if m.adminLim != nil && m.adminLim.tooMany(limKey, now) {
+		c.JSON(http.StatusTooManyRequests, gin.H{"error": "尝试次数过多，请稍后再试"})
+		return
+	}
 	if err := c.ShouldBindJSON(&in); err != nil || in.Username == "" {
+		if m.adminLim != nil {
+			m.adminLim.fail(limKey, now)
+		}
 		c.JSON(http.StatusBadRequest, gin.H{"error": "请输入用户名和密码"})
 		return
 	}
 	role, name, err := m.newapiAuth(in.Username, in.Password)
 	if err != nil {
+		if m.adminLim != nil {
+			m.adminLim.fail(limKey, now)
+		}
 		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
 		return
 	}
 	if role < roleAdmin {
+		if m.adminLim != nil {
+			m.adminLim.fail(limKey, now)
+		}
 		c.JSON(http.StatusForbidden, gin.H{"error": "该账号无权限访问监控(需管理员及以上)"})
 		return
 	}
-	tok := m.signSession(name, role, time.Now().Unix())
+	tok := m.signSession(name, role, now)
 	secure := c.Request.TLS != nil || c.GetHeader("X-Forwarded-Proto") == "https"
 	c.SetSameSite(http.SameSiteLaxMode) // 会话 cookie 不随跨站请求发送:掐掉表单型 CSRF(监控只有站内导航,Lax 无副作用)
 	c.SetCookie(sessionCookie, tok, int(sessionTTL.Seconds()), "/", "", secure, true)

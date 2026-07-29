@@ -18,6 +18,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -46,12 +47,16 @@ func main() {
 	gin.SetMode(gin.ReleaseMode)
 	r := gin.New()
 	r.Use(gin.Logger(), gin.Recovery())
+	if err := r.SetTrustedProxies(s.TrustedProxies); err != nil {
+		slog.Error("MONITOR_TRUSTED_PROXIES 配置无效", "err", err)
+		os.Exit(1)
+	}
 	m.RegisterRoutes(r)
 	m.RegisterPublicBoard(r) // 对外公开看板:/status + /public/status(无鉴权、脱敏)
 
-	srv := &http.Server{Addr: s.Addr, Handler: r}
+	srv := monitoredHTTPServer(s.Addr, r)
 	go func() {
-		slog.Info("上游监控已启动", "addr", "http://localhost"+s.Addr)
+		slog.Info("上游监控已启动", "addr", listenURL(s.Addr))
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			slog.Error("监听失败", "err", err)
 			os.Exit(1)
@@ -63,10 +68,14 @@ func main() {
 	if s.PortalAddr != "" {
 		pr := gin.New()
 		pr.Use(gin.Logger(), gin.Recovery())
+		if err := pr.SetTrustedProxies(s.TrustedProxies); err != nil {
+			slog.Error("MONITOR_TRUSTED_PROXIES 配置无效", "err", err)
+			os.Exit(1)
+		}
 		m.RegisterPortalRoutes(pr)
-		portalSrv = &http.Server{Addr: s.PortalAddr, Handler: pr}
+		portalSrv = monitoredHTTPServer(s.PortalAddr, pr)
 		go func() {
-			slog.Info("客户用量报表已启动", "addr", "http://localhost"+s.PortalAddr)
+			slog.Info("客户用量报表已启动", "addr", listenURL(s.PortalAddr))
 			if err := portalSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 				slog.Error("客户端监听失败", "err", err)
 				os.Exit(1)
@@ -87,4 +96,30 @@ func main() {
 			slog.Warn("客户端关停超时", "err", err)
 		}
 	}
+}
+
+// monitoredHTTPServer 为管理端和客户门户统一设置连接边界。ReadHeaderTimeout
+// 防慢请求长期占住连接，ReadTimeout 限制请求体读取；WriteTimeout 留足 CSV
+// 流式下载时间，IdleTimeout 及时回收空闲 keep-alive。业务 JSON 体积限制见
+// requestBodyLimit 中间件。
+func monitoredHTTPServer(addr string, handler http.Handler) *http.Server {
+	return &http.Server{
+		Addr:              addr,
+		Handler:           handler,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      2 * time.Minute,
+		IdleTimeout:       60 * time.Second,
+	}
+}
+
+// listenURL 把监听地址拼成能直接点开的 URL。
+// 监听地址有两种写法:":8090"(所有网卡)和 "127.0.0.1:8090"(指定网卡)。
+// 直接拼 "http://localhost"+addr 时,后者会得到 "http://localhost127.0.0.1:8090" 这种废字符串,
+// 所以只在 addr 以 ":" 开头(即没写主机)时才补 localhost。
+func listenURL(addr string) string {
+	if strings.HasPrefix(addr, ":") {
+		return "http://localhost" + addr
+	}
+	return "http://" + addr
 }

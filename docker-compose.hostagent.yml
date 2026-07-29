@@ -26,14 +26,25 @@ services:
       - HOSTAGENT_TOKEN=${HOSTAGENT_TOKEN:?set HOSTAGENT_TOKEN = MONITOR_INGEST_TOKEN}
       - HOSTAGENT_INTERVAL_SECONDS=60
       - HOSTAGENT_PROC=/host/proc
-      - HOSTAGENT_ROOTFS=/host/root
+      # 默认只采内存/Swap/load；磁盘与容器数需要更高权限，显式开启才采集。
+      - HOSTAGENT_ROOTFS=
+      - HOSTAGENT_DOCKER_SOCK=
     volumes:
-      # 只读挂载宿主信息——agent 只读不写
+      # 默认最小权限：仅读宿主 /proc，不挂载宿主根目录和 Docker Socket。
       - /proc:/host/proc:ro
-      - /:/host/root:ro
-      - /var/run/docker.sock:/var/run/docker.sock:ro
+      # 如确需“磁盘使用率”，由运维评审后显式增加：
+      # - /:/host/root:ro
+      # 并设置 HOSTAGENT_ROOTFS=/host/root。
+      # 如确需“容器数”，由运维评审后显式增加：
+      # - /var/run/docker.sock:/var/run/docker.sock
+      # 并设置 HOSTAGENT_DOCKER_SOCK=/var/run/docker.sock；该权限接近宿主 root。
     # 内存极小;给个上限防意外
     mem_limit: 64m
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
     # Slave(与 monitor 同机)用容器名直连 monitor,需接入其 docker 网络。
     # Master 不需要网络(走域名+extra_hosts),但加入也无害(各节点该网络都存在)。
     networks:

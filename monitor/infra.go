@@ -809,7 +809,7 @@ func (m *Monitor) infraStatus(r InfraResource) string {
 
 // evaluateInfraAlerts 评估基础设施告警(复用现有邮件 + 冷却);复用 alert_config 的开关/SMTP/收件人。
 func (m *Monitor) evaluateInfraAlerts(now int64) {
-	if !m.cfg.InfraEnabled {
+	if !m.cfg.InfraEnabled || m.cfg.AlertsDisabled { // 见 Settings.AlertsDisabled 的断路器说明
 		return
 	}
 	c := m.loadAlertConfig()
