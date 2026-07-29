@@ -14,6 +14,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -31,12 +32,19 @@ import (
 func main() {
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo})))
 	_ = godotenv.Load() // 可选 .env
+	if err := run(); err != nil {
+		slog.Error("monitor 已退出", "err", err)
+		os.Exit(1)
+	}
+}
 
+// run 把所有需要优雅释放的资源放在同一调用栈中；main 仅在 run 返回后才
+// os.Exit，确保监听失败、配置失败都不会跳过 stop/Shutdown 等 defer。
+func run() error {
 	s := monitor.LoadSettings()
 	m, err := monitor.New(s)
 	if err != nil {
-		slog.Error("启动失败", "err", err)
-		os.Exit(1)
+		return fmt.Errorf("启动失败: %w", err)
 	}
 
 	// 收到 SIGINT/SIGTERM 时取消 ctx:采样器退出 + HTTP 优雅关停。
@@ -48,18 +56,17 @@ func main() {
 	r := gin.New()
 	r.Use(gin.Logger(), gin.Recovery())
 	if err := r.SetTrustedProxies(s.TrustedProxies); err != nil {
-		slog.Error("MONITOR_TRUSTED_PROXIES 配置无效", "err", err)
-		os.Exit(1)
+		return fmt.Errorf("MONITOR_TRUSTED_PROXIES 配置无效: %w", err)
 	}
 	m.RegisterRoutes(r)
 	m.RegisterPublicBoard(r) // 对外公开看板:/status + /public/status(无鉴权、脱敏)
 
+	listenErr := make(chan error, 2) // 管理端 + 可选 Portal；避免监听协程直接 os.Exit 跳过优雅关停。
 	srv := monitoredHTTPServer(s.Addr, r)
 	go func() {
 		slog.Info("上游监控已启动", "addr", listenURL(s.Addr))
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			slog.Error("监听失败", "err", err)
-			os.Exit(1)
+			listenErr <- fmt.Errorf("管理端监听失败: %w", err)
 		}
 	}()
 
@@ -69,21 +76,25 @@ func main() {
 		pr := gin.New()
 		pr.Use(gin.Logger(), gin.Recovery())
 		if err := pr.SetTrustedProxies(s.TrustedProxies); err != nil {
-			slog.Error("MONITOR_TRUSTED_PROXIES 配置无效", "err", err)
-			os.Exit(1)
+			return fmt.Errorf("MONITOR_TRUSTED_PROXIES 配置无效: %w", err)
 		}
 		m.RegisterPortalRoutes(pr)
 		portalSrv = monitoredHTTPServer(s.PortalAddr, pr)
 		go func() {
 			slog.Info("客户用量报表已启动", "addr", listenURL(s.PortalAddr))
 			if err := portalSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-				slog.Error("客户端监听失败", "err", err)
-				os.Exit(1)
+				listenErr <- fmt.Errorf("客户端监听失败: %w", err)
 			}
 		}()
 	}
 
-	<-ctx.Done() // 等待退出信号
+	var runErr error
+	select {
+	case <-ctx.Done(): // 正常退出信号
+	case err := <-listenErr:
+		slog.Error("监听失败，开始优雅关停", "err", err)
+		runErr = err
+	}
 	stop()
 	slog.Info("收到退出信号,优雅关停…")
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -96,6 +107,7 @@ func main() {
 			slog.Warn("客户端关停超时", "err", err)
 		}
 	}
+	return runErr
 }
 
 // monitoredHTTPServer 为管理端和客户门户统一设置连接边界。ReadHeaderTimeout
