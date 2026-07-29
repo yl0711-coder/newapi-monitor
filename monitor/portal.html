@@ -6,6 +6,7 @@
 <title>用量报表</title>
 <script src="/echarts.js"></script>
 <script src="/flatpickr.js"></script>
+<script src="/range-picker.js?v=4"></script>
 <link rel="stylesheet" href="/flatpickr.css">
 <style>
   :root{
@@ -39,8 +40,9 @@
   .dateinput{background:#fdfdff;border:1px solid var(--border);border-radius:8px;color:var(--text);padding:7px 9px;font-size:13px;font-family:inherit}
   .dateinput:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px rgba(79,70,229,.12)}
   /* 总览工具条日期范围:与管理端同一 flatpickr 控件;内嵌 CSS 是暗色主题,此处整体覆盖成客户端浅色 */
-  #ovRange{background:#fdfdff;border:1px solid var(--border);border-radius:8px;color:var(--text);padding:7px 12px;font-size:13px;width:220px;cursor:pointer;font-family:inherit}
-  #ovRange:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px rgba(79,70,229,.12)}
+  /* 页面当前以约 200% 缩放显示；300 CSS px 对应截图中约 600px 的目标宽度。 */
+  #ovBar .srp-wrap,#logsBar .srp-wrap{width:300px;min-width:0;flex:0 0 300px}
+  @media(max-width:600px){#ovBar .srp-wrap,#logsBar .srp-wrap{width:100%;flex-basis:100%}}
   .flatpickr-calendar{background:#fff;border:1px solid var(--border);box-shadow:0 8px 24px rgba(30,40,70,.16)}
   .flatpickr-calendar.arrowTop:before{border-bottom-color:var(--border)}
   .flatpickr-calendar.arrowTop:after{border-bottom-color:#fff}
@@ -102,9 +104,9 @@
   .mxwrap{max-height:70vh;overflow:auto;position:relative}
   .mxwrap table{border-collapse:separate;border-spacing:0;min-width:560px;width:100%}
   .mxwrap thead th{position:sticky;top:0;background:var(--th-bg);z-index:3}
-  .mxwrap td:first-child,.mxwrap th:first-child{position:sticky;left:0;background:var(--panel);z-index:2;width:150px;min-width:150px;max-width:150px}
-  .mxwrap td:nth-child(2),.mxwrap th:nth-child(2){position:sticky;left:150px;background:var(--panel);z-index:2;width:80px;min-width:80px;max-width:80px}
-  .mxwrap td:nth-child(3),.mxwrap th:nth-child(3){position:sticky;left:230px;background:var(--panel);z-index:2;width:118px;min-width:118px;max-width:118px;box-shadow:6px 0 8px -6px rgba(20,30,50,.16)}
+  .mxwrap td:first-child,.mxwrap th:first-child{position:sticky;left:0;background:var(--panel);z-index:2;width:200px;min-width:200px;max-width:200px}
+  .mxwrap td:nth-child(2),.mxwrap th:nth-child(2){position:sticky;left:200px;background:var(--panel);z-index:2;width:80px;min-width:80px;max-width:80px}
+  .mxwrap td:nth-child(3),.mxwrap th:nth-child(3){position:sticky;left:280px;background:var(--panel);z-index:2;width:118px;min-width:118px;max-width:118px;box-shadow:6px 0 8px -6px rgba(20,30,50,.16)}
   .mxwrap thead th:first-child,.mxwrap thead th:nth-child(2),.mxwrap thead th:nth-child(3){z-index:4;background:var(--panel)}
   .mxwrap td:last-child,.mxwrap th:last-child{position:sticky;right:0;background:var(--panel);z-index:2;box-shadow:-6px 0 8px -6px rgba(20,30,50,.16);min-width:88px}
   .mxwrap thead th:last-child{z-index:4}
@@ -112,8 +114,8 @@
   .mxwrap tbody tr.mxfoot td{position:sticky;bottom:0;background:var(--panel);z-index:3;border-top:2px solid var(--border);font-weight:700}
   .mxwrap tbody td .dash{color:#c4ccd8}
   .ucell{color:var(--accent);cursor:pointer;text-decoration:none;line-height:1.25;display:block}
-  .ucell .u-name{display:block;max-width:126px;overflow:hidden;text-overflow:ellipsis}
-  .ucell .u-mail{display:block;font-size:11px;color:var(--muted)}
+  .ucell .u-name{display:block;max-width:176px;overflow:hidden;text-overflow:ellipsis}
+  .ucell .u-mail{display:block;max-width:176px;overflow:hidden;text-overflow:ellipsis;font-size:11px;color:var(--muted)}
   /* 明细区 */
   #detail{display:none}
   .backlink{color:var(--accent);cursor:pointer;font-size:13px;text-decoration:none}
@@ -138,6 +140,15 @@
   .logfilters{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin:14px 0}
   .logfilters select,.logfilters input{background:#fdfdff;border:1px solid var(--border);border-radius:8px;color:var(--text);padding:7px 11px;font-size:13px}
   .logfilters select:focus,.logfilters input:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px rgba(79,70,229,.12)}
+  /* 可搜索下拉(成员/模型/分组):文本框当触发器,输入即过滤,选项来自隐藏的原生 select */
+  .cbox{position:relative;display:inline-block}
+  .cbox-input{width:130px;cursor:text}
+  .cbox-pop{position:absolute;top:calc(100% + 4px);left:0;z-index:40;background:var(--surface);border:1px solid var(--border);border-radius:8px;box-shadow:0 8px 24px rgba(20,30,50,.16);max-height:240px;overflow:auto;min-width:180px;display:none}
+  .cbox-pop.open{display:block}
+  .cbox-opt{padding:7px 12px;font-size:13px;color:var(--text);cursor:pointer;white-space:nowrap}
+  .cbox-opt:hover{background:var(--panel)}
+  .cbox-opt.sel{color:var(--accent);font-weight:600}
+  .cbox-empty{padding:7px 12px;font-size:13px;color:var(--muted)}
   .exp-btn{margin-left:auto;background:var(--green);color:#fff;border:none;border-radius:8px;padding:8px 16px;font-size:13px;font-weight:600;cursor:pointer;display:inline-flex;align-items:center;gap:6px}
   .exp-btn:disabled{opacity:.5;cursor:default}
   /* 导出说明:按钮旁 ? 图标(实心醒目),悬停/聚焦弹出规则卡片(右对齐防溢出) */
@@ -149,17 +160,57 @@
   .th-help{position:relative;display:inline-flex;align-items:center;justify-content:center;width:15px;height:15px;background:var(--muted2);color:#fff;border-radius:50%;font-size:10.5px;font-weight:700;margin-left:4px;cursor:help;user-select:none;vertical-align:1px}
   .th-help:hover,.th-help:focus{background:var(--accent);outline:none}
   .th-help .tip{display:none;position:fixed;z-index:46;width:300px;background:var(--surface);border:1px solid var(--border);border-radius:10px;box-shadow:0 8px 28px rgba(20,30,50,.16);padding:10px 12px;font-size:12px;line-height:1.7;color:var(--muted);font-weight:400;text-align:left;white-space:normal}
-  /* 日志表:普通横向滚动,不冻结列(区别于矩阵的 .mxwrap);列宽给足,避免令牌/模型串行 */
+  /* 日志表:成员(首列)+详情(末列)锁定,中间列内容不截断、靠横向滚动查看——
+     对齐 new-api 及主流中转站的日志表模式:首末列固定住"这行是谁/这行详情",
+     中间字段不因宽度不够而被省略号吞掉,宁可多滚动、不丢信息。 */
   .logwrap{overflow-x:auto}
-  .logtable{min-width:1440px;table-layout:fixed}
-  .logtable th,.logtable td{overflow:hidden;text-overflow:ellipsis}
-  .logtable col.c-time{width:150px}.logtable col.c-mem{width:98px}.logtable col.c-tok{width:160px}
-  .logtable col.c-grp{width:108px}.logtable col.c-type{width:66px}.logtable col.c-mdl{width:160px}
-  .logtable col.c-dur{width:158px}.logtable col.c-numq{width:126px}.logtable col.c-num{width:98px}.logtable col.c-cost{width:96px}.logtable col.c-detail{width:260px}
-  /* 详情列:可折行显全(不截断),学 new-api 的多行明细——首行(倍率)深色,价格行灰色 */
-  .logtable td.dtl-cell{white-space:normal;overflow:visible;text-overflow:clip;vertical-align:top}
-  .logtable td .dtl-main{color:var(--text);font-size:12.5px;line-height:1.5;display:block}
-  .logtable td .dtl{color:var(--muted);font-size:12px;line-height:1.5;display:block}
+  .logtable{min-width:1626px;table-layout:fixed}
+  .logtable th,.logtable td{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .logtable col.c-time{width:150px}.logtable col.c-mem{width:200px}.logtable col.c-tok{width:180px}
+  .logtable col.c-grp{width:120px}.logtable col.c-type{width:70px}.logtable col.c-mdl{width:180px}
+  .logtable col.c-dur{width:170px}.logtable col.c-numq{width:140px}.logtable col.c-num{width:100px}.logtable col.c-cost{width:120px}.logtable col.c-detail{width:220px}
+  /* 成员列(首列)锁左:横向滚动查看其它列时,始终知道这行是谁的记录 */
+  .logtable tr:not(.log-expand-row) td:first-child,.logtable th:first-child{position:sticky;left:0;z-index:2;background:var(--panel);box-shadow:6px 0 8px -6px rgba(20,30,50,.16)}
+  .logtable thead th:first-child{z-index:4;background:var(--th-bg)}
+  .logtable td.mem-cell{overflow:visible;text-overflow:clip;white-space:normal;word-break:break-all;vertical-align:middle}
+  .logtable td.mem-cell .mem-inner{display:flex;align-items:center;gap:5px}
+  .log-expand{flex:0 0 auto;border:none;background:transparent;color:var(--muted);cursor:pointer;font-size:11px;padding:1px 2px;line-height:1.6;border-radius:3px}
+  .log-expand:hover{color:var(--accent);background:rgba(79,70,229,.08)}
+  /* 日志行内展开(对齐 new-api web/classic 点击行展开→Descriptions 纵向布局,非弹层模态框):
+     单列纵向列表,每行占满整行、label 固定宽右对齐+value 紧跟左对齐,从上到下逐行排,
+     不是多列网格横排(横排在长文本字段旁挤出裁切问题,纵向列表天然规避)。 */
+  .log-expand-td{background:var(--bg);padding:0!important;overflow:visible}
+  .log-expand-inner{position:sticky;left:0;padding:10px 16px 12px 40px;box-sizing:border-box}
+  .log-desc{display:flex;flex-direction:column}
+  .dr-row{display:grid;grid-template-columns:110px minmax(0,1fr);gap:16px;padding:5px 0;font-size:12.5px;border-bottom:1px solid rgba(120,130,150,.08)}
+  .dr-row:last-child{border-bottom:none}
+  .dr-label{color:var(--muted);font-size:12px;text-align:right}
+  /* 只在整段词放不下时才硬断(break-word),不能用 break-all:计费公式里的
+     "补全 1500 tokens" 会被拦腰断成"补全 1"+"500 tokens",看着像两个不同的数 */
+  .dr-value{min-width:0;overflow-wrap:break-word;word-break:normal}
+  .dr-value.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+  /* 令牌/模型列内容常较长,不截断,允许比其它数值列宽一些,靠横向滚动看全 */
+  .logtable td.tok-cell,.logtable td.mdl{overflow:visible;text-overflow:clip;white-space:normal;word-break:break-all}
+  /* 详情列(末列)锁右+单行截断；错误原文用页面内 Popover 悬停查看，列窄不占宽度。 */
+  .logtable tr:not(.log-expand-row) td:last-child,.logtable th:last-child{position:sticky;right:0;z-index:2;background:var(--panel);box-shadow:-6px 0 8px -6px rgba(20,30,50,.16)}
+  .logtable thead th:last-child{z-index:4;background:var(--th-bg)}
+  /* 详情列:多行堆叠,首行深色/其余灰色小字,每行各自单行截断+省略号(对齐 new-api web/classic
+     renderCompactDetailSummary,不是"首行+个数"标签) */
+  .logtable td.dtl-cell{overflow:visible;white-space:normal;vertical-align:top;line-height:1.4;padding-top:6px;padding-bottom:6px}
+  .logtable td.dtl-cell .dtl-main,.logtable td.dtl-cell .dtl-sub{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .logtable td.dtl-cell .dtl-main{color:var(--text);font-size:12.5px}
+  .logtable td.dtl-cell .dtl-sub{color:var(--muted);font-size:11.5px;margin-top:1px}
+  /* 错误详情沿用中转站原文展示：列表最多两行；完整原文使用页面内 Popover，不能用浏览器原生 title。 */
+  .logtable td.dtl-cell .dtl-raw{display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:2;overflow:hidden;white-space:pre-wrap;color:var(--text);font-size:12px;line-height:1.35;cursor:help}
+  .logtable td.dtl-cell .dtl-raw:focus{outline:2px solid rgba(82,87,224,.35);outline-offset:2px;border-radius:2px}
+  /* 对齐 new-api 的 Typography Popover：白底、圆角、阴影、底部指向箭头；由 body 承载，避免被日志横向滚动区裁切。 */
+  .log-raw-popover{position:fixed;z-index:80;width:240px;max-width:calc(100vw - 16px);padding:10px 12px;background:#fff;border:1px solid var(--border);border-radius:10px;box-shadow:0 8px 24px rgba(20,30,50,.16);color:var(--text);font-size:14px;line-height:1.45;white-space:pre-wrap;overflow-wrap:anywhere;user-select:text;cursor:text;visibility:hidden}
+  .log-raw-popover.open{visibility:visible}
+  .log-raw-popover::before,.log-raw-popover::after{content:"";position:absolute;left:calc(var(--log-tip-arrow-left, 24px) - 7px);border-left:7px solid transparent;border-right:7px solid transparent}
+  .log-raw-popover::before{bottom:-8px;border-top:8px solid var(--border)}
+  .log-raw-popover::after{bottom:-6px;left:calc(var(--log-tip-arrow-left, 24px) - 6px);border-left-width:6px;border-right-width:6px;border-top:7px solid #fff}
+  .log-raw-popover.is-below::before{top:-8px;bottom:auto;border-top:0;border-bottom:8px solid var(--border)}
+  .log-raw-popover.is-below::after{top:-6px;bottom:auto;border-top:0;border-bottom:7px solid #fff}
   /* 类型小标 */
   .tp{display:inline-block;font-size:11px;padding:2px 8px;border-radius:5px;font-weight:500;white-space:nowrap}
   .tp-consume{color:#0c8557;background:rgba(12,133,87,.10)}
@@ -169,16 +220,23 @@
   .tp-manage{color:#6d7684;background:rgba(109,118,132,.14)}
   .tp-system{color:#7c6f9c;background:rgba(124,111,156,.14)}
   .tp-other{color:#6d7684;background:rgba(109,118,132,.14)}
-  /* 用时·首字 小标 */
-  .tb{display:inline-block;font-size:11px;padding:2px 7px;border-radius:5px;margin-right:4px;white-space:nowrap;font-variant-numeric:tabular-nums}
-  .tb-total{color:#0c8557;background:rgba(12,133,87,.10)}
-  .tb-frt{color:#c2410c;background:rgba(224,135,0,.14)}
+  /* 用时/首字:与中转站日志一致，只用颜色区分耗时档位，不在胶囊里重复放色点。 */
+  .tb-row{display:flex;align-items:center;gap:5px;flex-wrap:wrap}
+  .tb-sub{display:block;font-size:11px;color:var(--muted);margin-top:2px}
+  .tb{display:inline-flex;align-items:center;font-size:12px;padding:3px 10px;border-radius:999px;white-space:nowrap;font-variant-numeric:tabular-nums;font-weight:500}
+  .tb-ok{color:#0c8557;background:rgba(12,133,87,.10)}
+  .tb-warn{color:#b45309;background:rgba(180,83,9,.12)}
+  .tb-bad{color:#c0392b;background:rgba(192,57,43,.12)}
+  .tb-na{color:var(--muted);background:rgba(109,118,132,.10)}
   .tb-stream{color:#2563eb;background:rgba(37,99,235,.10)}
   .tb-nostream{color:#7c6f9c;background:rgba(124,111,156,.14)}
   #logTb td .tm{color:var(--muted);font-variant-numeric:tabular-nums}
   #logTb td .mdl{font-weight:600}
   #logTb td .grp{font-size:11px;color:var(--muted);background:var(--panel);border:1px solid var(--border);border-radius:5px;padding:1px 7px}
-  #logTb td .cost{color:var(--amber);font-weight:600}
+  /* 输入/输出沿用中转站的原始 token 数；缓存读单独置于输入下方，费用保留完整 6 位精度。 */
+  .log-token-main{font-variant-numeric:tabular-nums}
+  .log-token-cache{margin-top:2px;color:var(--muted);font-size:11.5px;line-height:1.25;white-space:nowrap;font-variant-numeric:tabular-nums}
+  .log-cost{font-variant-numeric:tabular-nums}
   .lognote{color:var(--muted);font-size:12px;margin:10px 2px 0;line-height:1.6}
   /* 导出进度弹窗 */
   .exp-bar{height:8px;background:var(--panel);border-radius:5px;overflow:hidden;margin:16px 0 8px}
@@ -210,40 +268,17 @@
   <a data-v="overview" class="on">用量总览</a><a data-v="logs">使用日志</a>
 </div>
 
-<!-- 总览工具条:内容对齐管理端「用户用量」(预设 + 自定义起止 + 查询 + 搜索用户 + 统计范围),配色仍客户端浅色 -->
+<!-- 总览工具条:与中转站使用日志同款日期范围控件,配色仍客户端浅色 -->
 <div id="ovBar" style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
-  <div class="seg" id="ovSeg">
-    <a data-r="today">今天</a><a data-r="7d" class="active">近7天</a><a data-r="15d">近15天</a><a data-r="30d">近30天</a>
-  </div>
-  <span class="rangenote" style="margin:0">自定义:</span>
-  <input type="text" id="ovRange" placeholder="选择日期范围(最长90天)" readonly>
-  <button type="button" class="btn p" id="ovQuery">查询</button>
+  <input type="text" id="ovRange" placeholder="选择日期范围(最长一年)" readonly>
   <span id="ovErr" style="color:var(--red);font-size:12px"></span>
-  <input id="mxSearch" class="mx-search" placeholder="搜索用户(用户名 / 邮箱)" autocomplete="off">
+  <input id="mxSearch" name="mx-filter-q" class="mx-search" placeholder="搜索用户(用户名 / 邮箱)" autocomplete="off" readonly onfocus="this.removeAttribute('readonly')">
   <span class="rangenote" id="rangeNote" style="margin:0"></span>
 </div>
 
-<!-- 日志工具条:new-api 风格紧凑日期选择器(仅使用日志视图) -->
+<!-- 日志工具条:与中转站同款双月日期范围选择器(仅使用日志视图) -->
 <div id="logsBar" style="display:none;align-items:center;gap:12px;flex-wrap:wrap">
-  <!-- 日期选择:镜像 new-api 使用日志的紧凑选择器(触发按钮 + 弹层内 开始/结束 + 预设 + 确定) -->
-  <div class="dtpick" id="dtPick">
-    <button class="dt-trigger" id="dtTrigger" type="button">
-      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="18" rx="2"/><path d="M16 2v4M8 2v4M3 10h18"/></svg>
-      <span id="dtLabel">选择日期</span><span class="dt-caret">▾</span>
-    </button>
-    <div class="dt-pop" id="dtPop">
-      <div class="dt-fields">
-        <div class="dt-field"><span class="dt-lab">开始日期</span><input type="date" id="dFrom" class="dateinput"></div>
-        <span class="dt-tilde">~</span>
-        <div class="dt-field"><span class="dt-lab">结束日期</span><input type="date" id="dTo" class="dateinput"></div>
-      </div>
-      <div class="dt-presets">
-        <button type="button" data-r="today">今天</button><button type="button" data-r="7d">近7天</button><button type="button" data-r="30d">近30天</button><button type="button" data-r="90d">近90天</button>
-      </div>
-      <div class="dt-err" id="dateErr"></div>
-      <div class="dt-actions"><button type="button" class="btn p" id="dtConfirm">确定</button></div>
-    </div>
-  </div>
+  <input type="text" id="logRange" placeholder="选择日期范围(最长一年)" readonly>
   <span class="rangenote" id="logRangeNote" style="margin:0"></span>
 </div>
 
@@ -279,16 +314,31 @@
 <!-- 使用日志 -->
 <div id="logsView">
   <div class="logfilters">
-    <select id="logMember"><option value="">全部成员</option></select>
-    <select id="logModel"><option value="">全部模型</option></select>
-    <select id="logGroup"><option value="">全部分组</option></select>
-    <select id="logType"><option value="">全部类型</option><option value="1">充值</option><option value="2">消费</option><option value="3">管理</option><option value="4">系统</option></select>
+    <div class="cbox" id="logMemberCbox">
+      <select id="logMember" style="display:none"><option value="">全部成员</option></select>
+      <input class="cbox-input" id="logMemberQ" placeholder="全部成员" autocomplete="off" readonly onfocus="this.removeAttribute('readonly')">
+      <div class="cbox-pop" id="logMemberPop"></div>
+    </div>
+    <div class="cbox" id="logModelCbox">
+      <select id="logModel" style="display:none"><option value="">全部模型</option></select>
+      <input class="cbox-input" id="logModelQ" placeholder="全部模型" autocomplete="off" readonly onfocus="this.removeAttribute('readonly')">
+      <div class="cbox-pop" id="logModelPop"></div>
+    </div>
+    <div class="cbox" id="logGroupCbox">
+      <select id="logGroup" style="display:none"><option value="">全部分组</option></select>
+      <input class="cbox-input" id="logGroupQ" placeholder="全部分组" autocomplete="off" readonly onfocus="this.removeAttribute('readonly')">
+      <div class="cbox-pop" id="logGroupPop"></div>
+    </div>
+    <select id="logType"><option value="">全部类型</option><option value="1">充值</option><option value="2">消费</option><option value="3">管理</option><option value="4">系统</option><option value="5">错误</option><option value="6">退款</option></select>
     <input id="logToken" placeholder="令牌名搜索" style="width:150px" autocomplete="off">
+    <input id="logDetailKw" placeholder="详情关键字搜索" style="width:150px" maxlength="64" autocomplete="off">
+    <input id="logRequestId" placeholder="Request ID" style="width:150px" maxlength="64" autocomplete="off">
+    <button type="button" class="btn p" id="logDetailKwBtn">查询</button>
     <button class="exp-btn" id="expBtn">⬇ 导出 CSV</button>
     <span class="exp-help" tabindex="0">?
       <span class="tip">
         <b>导出说明</b>
-        · 按当前筛选条件导出,时间范围最长 90 天<br>
+        · 按当前筛选条件导出,时间范围最长一年<br>
         · 单次最多 5 万条;超出会先确认,导出最新 5 万条,更早的请缩小范围分段导<br>
         · 每 5 分钟可导出 1 次(仅成功下载计次)<br>
         · UTF-8 CSV,Excel / WPS 直接打开不乱码
@@ -298,16 +348,16 @@
   <div class="card">
     <div class="logwrap">
       <table class="logtable">
-        <colgroup><col class="c-time"><col class="c-mem"><col class="c-tok"><col class="c-grp"><col class="c-type"><col class="c-mdl"><col class="c-dur"><col class="c-numq"><col class="c-num"><col class="c-cost"><col class="c-detail"></colgroup>
-        <thead><tr><th>时间</th><th>成员</th><th>令牌</th><th>分组</th><th>类型</th><th>模型</th><th>用时·首字</th>
-          <th class="right">输入tokens<span class="th-help" tabindex="0">?<span class="tip">根据 Anthropic 协定,/v1/messages 的输入 tokens 仅统计非缓存输入,不包含缓存读取与缓存写入 tokens。</span></span></th>
-          <th class="right">输出tokens</th><th class="right">费用(美元)</th><th>详情</th></tr></thead>
+        <colgroup><col class="c-mem"><col class="c-time"><col class="c-tok"><col class="c-grp"><col class="c-type"><col class="c-mdl"><col class="c-dur"><col class="c-numq"><col class="c-num"><col class="c-cost"><col class="c-detail"></colgroup>
+        <thead><tr><th>成员</th><th>时间</th><th>令牌</th><th>分组</th><th>类型</th><th>模型</th><th>用时/首字</th>
+          <th class="right">输入<span class="th-help" tabindex="0">?<span class="tip">根据 Anthropic 协定,/v1/messages 的输入 tokens 仅统计非缓存输入,不包含缓存读取与缓存写入 tokens。</span></span></th>
+          <th class="right">输出</th><th class="right">花费</th><th>详情</th></tr></thead>
         <tbody id="logTb"></tbody>
       </table>
     </div>
     <div class="pager" id="logPager" style="padding:12px 14px"></div>
   </div>
-  <p class="lognote">· 仅含本公司成员的 充值/消费/管理/系统 日志(不含错误与退款记录、不含请求/响应内容及内部信息)· 时间倒序 · 时间窗口最多 90 天<br>
+  <p class="lognote">· 仅含本公司成员的 充值/消费/管理/系统/错误/退款 日志(不含请求/响应内容及内部信息)· 时间倒序 · 时间窗口最多一年<br>
     · CSV 单次最多导出 5 万条,超出将导最新 5 万条;导出限每 5 分钟 1 次,超量请缩小范围分段导</p>
 </div>
 
@@ -352,18 +402,28 @@ const fmtNum=n=>(+n||0).toLocaleString('en-US');
 // 紧凑数字:大数用 k/M/B(1位小数去尾零),避免小卡片挤爆
 const fmtCompact=n=>{n=+n||0;const a=Math.abs(n);for(const [d,u] of [[1e9,'B'],[1e6,'M'],[1e3,'k']]){if(a>=d){const v=n/d;return (Math.abs(v)>=100?v.toFixed(0):v.toFixed(1)).replace(/\.0$/,'')+u;}}return n.toLocaleString('en-US');};
 const fmtCell=v=>v>=0.005?'$'+v.toFixed(2):(v>0?'<$0.01':'$0.00');
+// 日志默认滚动查 25 小时：向前 24 小时，并向后多留 1 小时等上游日志写入，避免刚发生的日志因延迟漏掉。
 let range='7d',ov=null,detailUid=null;
 
 let customFrom='',customTo='';
+let recent25hFrom='',recent25hTo=''; // 在本次页面打开时固化，翻页/刷新不让窗口每秒漂移
+const dateTimeText=t=>{const p=n=>String(n).padStart(2,'0');return t.getFullYear()+'-'+p(t.getMonth()+1)+'-'+p(t.getDate())+' '+p(t.getHours())+':'+p(t.getMinutes())+':'+p(t.getSeconds())};
+function recent25hRange(){
+  if(!recent25hFrom){const now=new Date(),from=new Date(now.getTime()-24*3600*1000),to=new Date(now.getTime()+3600*1000);recent25hFrom=dateTimeText(from);recent25hTo=dateTimeText(to);}
+  return {from:recent25hFrom,to:recent25hTo};
+}
 function rangeDates(r){ // 以本地日期为准(东八区客户),与服务端 CST 切日一致
   if(r==='custom')return {from:customFrom,to:customTo};
+  if(r==='recent25h')return recent25hRange();
   const d=new Date(),p=n=>String(n).padStart(2,'0');
   const ymd=t=>t.getFullYear()+'-'+p(t.getMonth()+1)+'-'+p(t.getDate());
-  const days={today:0,'7d':6,'15d':14,'30d':29,'90d':89}[r]??6;
+  if(r==='week'){const from=new Date(d);from.setDate(d.getDate()-d.getDay());return {from:ymd(from),to:ymd(d)};}
+  if(r==='month'){const from=new Date(d.getFullYear(),d.getMonth(),1);return {from:ymd(from),to:ymd(d)};}
+  const days={today:0,'7d':6,'15d':14,'30d':29,'90d':89,halfyear:179,year:364}[r]??6;
   const from=new Date(d);from.setDate(d.getDate()-days);
   return {from:ymd(from),to:ymd(d)};
 }
-// 天数(含两端);>90 由此拦下,与服务端 maxUsageDays 一致
+// 天数(含两端);超过一年由此拦下,与服务端 maxUsageDays 一致
 function spanDays(from,to){return Math.round((new Date(to)-new Date(from))/86400000)+1;}
 async function api(url){
   const r=await fetch(url,{headers:{'Accept':'application/json'}});
@@ -376,8 +436,9 @@ async function load(){
   if(!d.ok)return;
   ov=d.data;
   $('coName').textContent=ov.group_name||'';
-  $('rangeNote').textContent=`统计范围 ${ov.from} ~ ${ov.to}`;
-  $('logRangeNote').textContent=`统计范围 ${ov.from} ~ ${ov.to}`;
+  const rangeLabel=range==='recent25h'?`${from} ~ ${to}`:`${ov.from} ~ ${ov.to}`;
+  $('rangeNote').textContent=`统计范围 ${rangeLabel}`;
+  $('logRangeNote').textContent=`统计范围 ${rangeLabel}`;
   syncOvBar(); // 总览工具条(预设高亮/起止框)随当前范围同步(含从日志视图改的范围)
   mxPage=1;renderStat();renderMatrix();renderTrend();renderMemberBar();loadBreakdown();
   fillMemberSelect();
@@ -392,6 +453,40 @@ function fillMemberSelect(){
   const us=(ov.users||[]).slice().sort((a,b)=>(a.username||'').localeCompare(b.username||''));
   sel.innerHTML='<option value="">全部成员</option>'+us.map(u=>`<option value="${u.user_id}">${esc(u.username||('#'+u.user_id))}</option>`).join('');
   if(cur&&us.some(u=>String(u.user_id)===cur))sel.value=cur; else sel.value='';
+  cboxSetDisplay('logMember');
+}
+// 可搜索下拉(成员/模型/分组):真实值仍是隐藏 select,input 只做过滤展示层
+function cboxOptions(id){return [...$(id).options].map(o=>({v:o.value,t:o.textContent}));}
+function cboxSetDisplay(id){
+  const sel=$(id),q=$(id+'Q');if(!q)return;
+  const cur=cboxOptions(id).find(o=>o.v===sel.value);
+  q.value=cur?cur.t:'';
+}
+function cboxRenderPop(id,kw){
+  const pop=$(id+'Pop'),sel=$(id);
+  const k=(kw||'').trim().toLowerCase();
+  const list=cboxOptions(id).filter(o=>!k||o.t.toLowerCase().includes(k));
+  pop.innerHTML=list.length?list.map(o=>`<div class="cbox-opt${o.v===sel.value?' sel':''}" data-v="${esc(o.v)}">${esc(o.t)}</div>`).join(''):'<div class="cbox-empty">无匹配项</div>';
+}
+function cboxClose(id){$(id+'Pop').classList.remove('open');cboxSetDisplay(id);}
+function cboxInit(id,onPick){
+  const q=$(id+'Q'),pop=$(id+'Pop'),sel=$(id);
+  q.addEventListener('focus',()=>{q.select();cboxRenderPop(id,'');pop.classList.add('open');});
+  q.addEventListener('input',()=>{cboxRenderPop(id,q.value);pop.classList.add('open');});
+  q.addEventListener('keydown',e=>{
+    if(e.key==='Escape'){cboxClose(id);q.blur();return;}
+    if(e.key==='Enter'){
+      const first=pop.querySelector('.cbox-opt');
+      if(first){sel.value=first.dataset.v;cboxClose(id);onPick();}
+      e.preventDefault();
+    }
+  });
+  pop.addEventListener('click',e=>{
+    const o=e.target.closest('.cbox-opt');if(!o)return;
+    sel.value=o.dataset.v;cboxClose(id);onPick();
+  });
+  document.addEventListener('click',e=>{if(!$(id+'Cbox').contains(e.target))cboxClose(id);});
+  cboxSetDisplay(id);
 }
 // 组织级(整组)按分组/按模型
 async function loadBreakdown(){
@@ -414,6 +509,7 @@ function fillFilterSelect(id,allLabel,rows){
   const keys=(rows||[]).map(r=>r.key).filter(Boolean).sort();
   sel.innerHTML=`<option value="">${allLabel}</option>`+keys.map(k=>`<option value="${esc(k)}">${esc(k)}</option>`).join('');
   if(cur&&keys.includes(cur))sel.value=cur; else sel.value='';
+  cboxSetDisplay(id);
 }
 // ---- 图表(echarts;数据全来自已加载的 ov / breakdown / detail,不额外请求) ----
 const AXIS='#64748b',SPLIT='#eceff4',AMBER='#e08700',GRAYLINE='#9aa2b0';
@@ -430,7 +526,7 @@ function renderTrend(){
   trendCh=getCh(trendCh,'trendChart');
   const dailyByModel=ov.daily_by_model||[];
   const byModel=(ov.by_model||[]).filter(r=>+r.cost_usd>0);
-  const days=(ov.days||[]).slice().reverse(); // 旧→新
+  const days=(ov.days||[]).slice().reverse(); // 旧→新;ov.days 本身就是连续日期轴(含0消耗天),矩阵表也靠它
   if(!days.length||!byModel.length){emptyChart(trendCh);return;}
   const byDateModel={};dailyByModel.forEach(r=>{(byDateModel[r.date]||(byDateModel[r.date]={}))[r.model||'—']=r;});
   const topNames=byModel.slice(0,DAILY_STACK_TOP).map(r=>r.key||'—');
@@ -530,7 +626,8 @@ function renderMatrix(){
     }
     const bal=u.balance_usd==null?'<span class="muted">—</span>':(u.balance_usd<0?`<span style="color:var(--red);font-weight:600">${fmtCost(u.balance_usd)}</span>`:`<span style="color:var(--green)">${fmtCost(u.balance_usd)}</span>`);
     const used=u.total_used_usd==null?'<span class="muted">—</span>':`<b style="color:var(--amber)">${fmtCost(u.total_used_usd)}</b>`;
-    return `<tr><td><a class="ucell" data-uid="${u.user_id}"><span class="u-name">${esc(u.username||'#'+u.user_id)}</span><span class="u-mail">${esc(u.email||'')}</span></a></td>`
+    const uname=u.username||'#'+u.user_id,uTitle=uname+(u.email?' · '+u.email:'');
+    return `<tr><td><a class="ucell" data-uid="${u.user_id}" title="${esc(uTitle)}"><span class="u-name">${esc(uname)}</span><span class="u-mail">${esc(u.email||'')}</span></a></td>`
       +`<td class="right num">${bal}</td><td class="right num">${used}</td>${tds}<td class="right num"><b>${fmtCost(u.total_usd)}</b></td></tr>`;
   }).join('')
   +`<tr class="mxfoot"><td>合计${q?'(筛选)':''}</td><td></td><td class="right num" style="color:var(--amber)">${fmtCost(us.reduce((s,u)=>s+(+u.total_used_usd||0),0))}</td>`
@@ -551,7 +648,10 @@ let dailyChart=null,detailTok=null; // detailTok={tid,name}=令牌下钻视图;n
 const DAILY_STACK_TOP=6;
 function drawDailyChart(daily,dailyByModel,byModel){
   daily=daily||[];dailyByModel=dailyByModel||[];byModel=(byModel||[]).filter(r=>+r.cost_usd>0);
-  const dates=daily.map(x=>x.date);
+  // 连续日期轴(含消耗为0的天):不能用 daily(后端只返回有消费的日期),否则0消耗的天会被跳过压缩时间轴
+  const {from,to}=rangeDates(range);
+  const dates=[];
+  for(let d=new Date(from+'T00:00:00'),end=new Date(to+'T00:00:00');d<=end;d.setDate(d.getDate()+1))dates.push(ymd(d));
   const byDateModel={};dailyByModel.forEach(r=>{(byDateModel[r.date]||(byDateModel[r.date]={}))[r.model||'—']=r;});
   const topNames=byModel.slice(0,DAILY_STACK_TOP).map(r=>r.key||'—');
   const restNames=new Set(byModel.slice(DAILY_STACK_TOP).map(r=>r.key||'—'));
@@ -685,66 +785,35 @@ $('mxPager').addEventListener('click',e=>{
   mxPage=+b.dataset.pg;renderMatrix();
   $('mxCard').scrollIntoView({block:'nearest'});
 });
-// ---- 日期选择器(镜像 new-api 使用日志:触发按钮 + 弹层内 开始/结束草稿 + 预设 + 确定)----
-[$('dFrom'),$('dTo')].forEach(el=>el.setAttribute('max',rangeDates('today').to)); // 不能选未来
-function updateDtLabel(){const {from,to}=rangeDates(range);$('dtLabel').textContent=`${from} ~ ${to}`;}
-function markPreset(){document.querySelectorAll('.dt-presets button').forEach(b=>b.classList.toggle('active',range!=='custom'&&b.dataset.r===range));}
-function openDt(o){
-  const p=$('dtPop');
-  if(o){const {from,to}=rangeDates(range);$('dFrom').value=from;$('dTo').value=to;$('dateErr').textContent='';markPreset();p.classList.add('open');}
-  else p.classList.remove('open');
-}
-$('dtTrigger').onclick=e=>{e.stopPropagation();openDt(!$('dtPop').classList.contains('open'));};
-document.addEventListener('click',e=>{if(!$('dtPick').contains(e.target))openDt(false);}); // 点外部关闭(不应用草稿)
-// 预设:点了立即应用并关闭(与 new-api 一致)
-document.querySelectorAll('.dt-presets button').forEach(b=>b.onclick=()=>{
-  range=b.dataset.r;openDt(false);updateDtLabel();load();
-});
-// 确定:应用草稿区间;两端必填、from>to 自动交换、跨度>90 天拦下(与服务端一致)
-$('dtConfirm').onclick=()=>{
-  let f=$('dFrom').value,t=$('dTo').value;
-  if(!f||!t){$('dateErr').textContent='请选择开始和结束日期';return;}
-  if(f>t){[f,t]=[t,f];$('dFrom').value=f;$('dTo').value=t;}
-  if(spanDays(f,t)>90){$('dateErr').textContent='时间范围最长 90 天,请缩小区间';return;}
-  customFrom=f;customTo=t;range='custom';openDt(false);updateDtLabel();load();
-};
-updateDtLabel();
-// ---- 总览工具条(内容对齐管理端「用户用量」:预设 + flatpickr 范围选择器[与管理端同一控件] + 查询 + 搜索用户)----
+// ---- 日期选择器：与中转站使用日志同款双月范围控件（日期两端分别代表 00:00:00 / 23:59:59）----
 const ymd=d=>d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');
-const addDaysStr=(s,n)=>{const d=new Date(s+'T00:00:00');d.setDate(d.getDate()+n);return ymd(d)};
-const ovFp=flatpickr($('ovRange'),{
-  mode:'range',showMonths:2,locale:'zh',dateFormat:'Y-m-d',maxDate:rangeDates('today').to,
-  onChange:(sel,_str,inst)=>{
-    if(sel.length===1){ // 已选起点:把可选窗口收紧到起点±89天(含端点恰90天),硬限最长90天
-      const startStr=ymd(sel[0]);
-      const lo=addDaysStr(startStr,-89),hi=addDaysStr(startStr,89),today=rangeDates('today').to;
-      inst.set('minDate',lo);inst.set('maxDate',hi<today?hi:today);
-    }else if(sel.length===2){ // 区间选完:恢复窗口并自动查询
-      inst.set('minDate',null);inst.set('maxDate',rangeDates('today').to);
-      $('ovErr').textContent='';customFrom=ymd(sel[0]);customTo=ymd(sel[1]);range='custom';
-      syncOvBar();updateDtLabel();load();
-    }
-  },
-  onClose:(sel,_str,inst)=>{ if(sel.length<2){inst.set('minDate',null);inst.set('maxDate',rangeDates('today').to)} }
-});
+const day=(s,isEnd)=>{const m=String(s).match(/^(\d{4})-(\d{2})-(\d{2})(?:[ T](\d{2}):(\d{2})(?::(\d{2}))?)?$/);if(!m)return null;return new Date(+m[1],+m[2]-1,+m[3],m[4]==null?(isEnd?23:0):+m[4],m[5]==null?(isEnd?59:0):+m[5],m[6]==null?(isEnd?59:0):+m[6])};
+function weekStart(){const d=day(rangeDates('today').to);d.setDate(d.getDate()-d.getDay());return d}
+function monthStart(){const d=day(rangeDates('today').to);return new Date(d.getFullYear(),d.getMonth(),1)}
+const portalPresets=[
+  {key:'today',text:'今天',start:()=>day(rangeDates('today').to),end:()=>day(rangeDates('today').to,true)},
+  {key:'7d',text:'近 7 天',start:()=>day(rangeDates('7d').from),end:()=>day(rangeDates('7d').to,true)},
+  {key:'week',text:'本周',start:weekStart,end:()=>day(rangeDates('today').to,true)},
+  {key:'30d',text:'近 30 天',start:()=>day(rangeDates('30d').from),end:()=>day(rangeDates('30d').to,true)},
+  {key:'month',text:'本月',start:monthStart,end:()=>day(rangeDates('today').to,true)},
+  {key:'halfyear',text:'近半年',start:()=>day(rangeDates('halfyear').from),end:()=>day(rangeDates('halfyear').to,true)},
+  {key:'year',text:'近一年',start:()=>day(rangeDates('year').from),end:()=>day(rangeDates('year').to,true)}
+];
+let ovPicker=null,logPicker=null;
 function syncOvBar(){
-  document.querySelectorAll('#ovSeg a').forEach(x=>x.classList.toggle('active',x.dataset.r===range));
-  const {from,to}=rangeDates(range);ovFp.setDate([from,to],false); // 不触发 onChange,仅同步显示
+  const {from,to}=rangeDates(range);
+  [ovPicker,logPicker].filter(Boolean).forEach(p=>p.setDate([day(from),day(to,true)],false));
 }
-document.querySelectorAll('#ovSeg a').forEach(a=>a.onclick=()=>{
-  range=a.dataset.r;$('ovErr').textContent='';
-  syncOvBar();updateDtLabel();load();
-});
-// 查询:应用选择器当前区间(与管理端一致;跨度>90天拦下,与服务端一致)
-$('ovQuery').onclick=()=>{
-  const sel=ovFp.selectedDates;
-  if(sel.length<2){$('ovErr').textContent='请选择开始和结束日期';return;}
-  let f=ymd(sel[0]),t=ymd(sel[1]);
-  if(f>t)[f,t]=[t,f];
-  if(spanDays(f,t)>90){$('ovErr').textContent='时间范围最长 90 天,请缩小区间';return;}
-  $('ovErr').textContent='';customFrom=f;customTo=t;range='custom';
-  syncOvBar();updateDtLabel();load();
+function applyPortalRange(sel,meta){
+  customFrom=dateTimeText(sel[0]);customTo=dateTimeText(sel[1]);range=meta.preset||'custom';
+  $('ovErr').textContent='';syncOvBar();load();
+}
+const portalPickerOptions={
+  maxDate:rangeDates('today').to,maxDays:366,presets:portalPresets,
+  onChange:applyPortalRange,onClear:()=>{$('ovErr').textContent='';}
 };
+ovPicker=new SemiRangePicker($('ovRange'),portalPickerOptions);
+logPicker=new SemiRangePicker($('logRange'),Object.assign({},portalPickerOptions));
 syncOvBar();
 // 改密码
 $('pwLink').onclick=()=>{$('pwMask').style.display='flex';$('pwMsg').textContent='';$('pwOld').value=$('pwNew').value=$('pwNew2').value='';$('pwOld').focus()};
@@ -783,34 +852,59 @@ function fmtLogTime(ts){const d=new Date(ts*1000),p=n=>String(n).padStart(2,'0')
 // 类型小标(1充值/2消费/3管理/4系统/5错误/6退款)
 const LOG_TYPE={1:['充值','tp-topup'],2:['消费','tp-consume'],3:['管理','tp-manage'],4:['系统','tp-system'],5:['错误','tp-error'],6:['退款','tp-refund']};
 function typeTag(t){const m=LOG_TYPE[t]||['其它','tp-other'];return `<span class="tp ${m[1]}">${m[0]}</span>`;}
-// 用时·首字:总用时 +(流式再显首字)+ 流/非流小标。
-// 秒级截断的 0 秒流式请求仍显示首字/流标(不丢数据);完全无计时信息(如充值/管理)才显 —
+// 耗时/首字延迟颜色分级,阈值对齐 new-api web/classic renderUseTime/renderFirstUseTime:
+// 总耗时(秒):<101绿 <300黄 其余红;首字延迟(秒):<3绿 <10黄 其余红
+function timeColorClass(v){return v==='ok'?'tb-ok':v==='warn'?'tb-warn':'tb-bad';}
+function respTimeVariant(useTime){
+  if(useTime<101)return 'ok';
+  if(useTime<300)return 'warn';
+  return 'bad';
+}
+function frtVariant(sec){return sec<3?'ok':sec<10?'warn':'bad';}
+// 用时/首字:总耗时+(流式再显首字)+流/非流,单行圆形胶囊并排(对齐 new-api web/classic
+// renderUseTime/renderFirstUseTime/renderIsStream 三个 Tag 并排,无出字速度这类额外信息)。
 function timeCell(r){
   const hasInfo=r.use_time>0||r.is_stream;
   if(!hasInfo)return '<span class="muted">—</span>';
-  const total=r.use_time>0?`<span class="tb tb-total">${r.use_time} s</span>`:'';
+  const total=r.use_time>0?`<span class="tb ${timeColorClass(respTimeVariant(r.use_time))}">${r.use_time} s</span>`:'';
   if(r.is_stream){
-    const frt=r.first_byte_ms>0?`<span class="tb tb-frt">${(r.first_byte_ms/1000).toFixed(1)} s</span>`:'';
+    const frt=r.first_byte_ms>0?`<span class="tb ${timeColorClass(frtVariant(r.first_byte_ms/1000))}">${(r.first_byte_ms/1000).toFixed(1)} s</span>`:'<span class="tb tb-na">N/A</span>';
     return `${total}${frt}<span class="tb tb-stream">流</span>`;
   }
   return `${total}<span class="tb tb-nostream">非流</span>`;
+}
+function logTokenNumber(v){
+  const n=Number(v);
+  return Number.isFinite(n)?String(Math.trunc(n)):DASH;
+}
+function logInputCell(r){
+  const cache=Number(r.cache_read_tokens)||0;
+  return `<div class="log-token-main">${logTokenNumber(r.prompt_tokens)}</div>`
+    +(cache>0?`<div class="log-token-cache">缓存读 ${fmtNum(cache)}</div>`:'');
+}
+function logCostUSD(v){
+  const n=Number(v);
+  return Number.isFinite(n)?`$${n.toFixed(6)}`:DASH;
 }
 // 当前筛选拼成查询串(member/model/group/type/token),供查看与导出共用
 function logQuery(){
   const {from,to}=rangeDates(range);
   let q=`from=${from}&to=${to}`;
-  const mem=$('logMember').value,mdl=$('logModel').value,grp=$('logGroup').value,typ=$('logType').value,tok=$('logToken').value.trim();
+  const mem=$('logMember').value,mdl=$('logModel').value,grp=$('logGroup').value,typ=$('logType').value,tok=$('logToken').value.trim(),dkw=$('logDetailKw').value.trim(),rid=$('logRequestId').value.trim();
   if(mem)q+=`&member=${encodeURIComponent(mem)}`;
   if(mdl)q+=`&model=${encodeURIComponent(mdl)}`;
   if(grp)q+=`&group=${encodeURIComponent(grp)}`;
   if(typ)q+=`&type=${encodeURIComponent(typ)}`;
   if(tok)q+=`&token=${encodeURIComponent(tok)}`;
+  if(dkw)q+=`&detail_kw=${encodeURIComponent(dkw)}`;
+  if(rid)q+=`&request_id=${encodeURIComponent(rid)}`;
   return q;
 }
 // 游标分页:logStack 记录各页起始游标(0=首页),末尾即当前页
 // logDirty:总览视图里改了日期时置位,回到日志视图时强制重拉(否则表格显旧窗口数据)
 // logPending:请求在途时又有新请求(如切筛选),排队而非丢弃,完成后自动补拉最新条件
 let logStack=[0],logHasMore=false,logNextCursor=0,logLoading=false,logTotal=null,logDirty=false,logPending=false;
+let logRowsCache=[]; // 当前页日志行(供详情弹窗按下标取回,见 renderLogRows)
 async function loadLogs(reset){
   if(logLoading){if(reset)logPending=true;return;}
   if(reset)logStack=[0];
@@ -835,23 +929,164 @@ async function loadLogs(reset){
 // 除详情外各列都照实显示(不按类型 gating);空值显 —,详情列可折行显全
 const DASH='<span class="muted">—</span>';
 function renderLogRows(rows){
+  hideLogRawTip();
   if(!rows.length){$('logTb').innerHTML=`<tr><td colspan="11" class="muted" style="text-align:center;padding:22px">所选范围暂无日志</td></tr>`;return;}
-  $('logTb').innerHTML=rows.map(r=>{
+  logRowsCache=rows; // 供详情弹窗按下标取回整行(避免把整份 JSON 塞进 data-* 属性再解析)
+  $('logTb').innerHTML=rows.map((r,i)=>{
     const grp=r.group?`<span class="grp">${esc(r.group)}</span>`:DASH;
-    // 详情:多行(对齐 new-api——首行倍率深色,价格行灰色)
-    const detail=r.detail?r.detail.split('\n').map((ln,i)=>`<span class="${i===0?'dtl-main':'dtl'}">${esc(ln)}</span>`).join(''):DASH;
-    return `<tr><td class="tm">${fmtLogTime(r.created_at)}</td>`
-      +`<td title="${esc(r.member||'')}">${r.member?esc(r.member):DASH}</td>`
-      +`<td title="${esc(r.token_name||'')}">${r.token_name?esc(r.token_name):DASH}</td>`
+    // 详情:多行堆叠全部展示,首行深色/其余灰色小字,每行各自单行截断(对齐 new-api web/classic
+    // renderCompactDetailSummary——不是"取第一行+个数"标签,是每一段各自展示,只是长度超宽时各自省略号)
+    const detailLines=r.detail?r.detail.split('\n'):[];
+    const detail=r.type===5&&r.detail
+      ?`<span class="dtl-raw" tabindex="0" data-raw-tip="${esc(r.detail)}">${esc(r.detail)}</span>`
+      :detailLines.length
+      ?detailLines.map((ln,idx)=>`<span class="${idx===0?'dtl-main':'dtl-sub'}">${esc(ln)}</span>`).join('')
+      :DASH;
+    return `<tr class="log-row" data-idx="${i}"><td class="mem-cell"><div class="mem-inner"><button type="button" class="log-expand" data-idx="${i}" title="查看详情" aria-label="查看详情">▶</button><span title="${esc(r.member||'')}">${r.member?esc(r.member):DASH}</span></div></td>`
+      +`<td class="tm">${fmtLogTime(r.created_at)}</td>`
+      +`<td class="tok-cell">${r.token_name?esc(r.token_name):DASH}</td>`
       +`<td>${grp}</td><td>${typeTag(r.type)}</td>`
-      +`<td class="mdl" title="${esc(r.model_name||'')}">${r.model_name?esc(r.model_name):DASH}</td>`
+      +`<td class="mdl">${r.model_name?esc(r.model_name):DASH}</td>`
       +`<td>${timeCell(r)}</td>`
-      +`<td class="right num">${fmtNum(r.prompt_tokens)}</td>`
-      +`<td class="right num">${fmtNum(r.completion_tokens)}</td>`
-      +`<td class="right num">${r.type===2?`<span class="cost">${fmtCost(r.cost_usd)}</span>`:DASH}</td>`
-      +`<td class="dtl-cell">${detail}</td></tr>`;
+      +`<td class="right num">${logInputCell(r)}</td>`
+      +`<td class="right num">${logTokenNumber(r.completion_tokens)}</td>`
+      +`<td class="right num log-cost">${(r.type===2||r.type===5)?logCostUSD(r.cost_usd):DASH}</td>`
+      +`<td class="dtl-cell">${detail}</td></tr>`
+      +`<tr class="log-expand-row" data-idx="${i}" style="display:none"><td colspan="11" class="log-expand-td"></td></tr>`;
   }).join('');
 }
+// 错误原文提示层：中转站使用 Semi Popover，而非浏览器 title。原生 title 有悬停延迟且外观随浏览器变化，
+// 因此这里直接在页面上渲染相同形态的即时浮层。
+let logRawTip,logRawTipSource,logRawTipCloseTimer;
+function ensureLogRawTip(){
+  if(logRawTip)return logRawTip;
+  logRawTip=document.createElement('div');
+  logRawTip.className='log-raw-popover';
+  logRawTip.setAttribute('role','tooltip');
+  // 浮层本身可进入、可选择文本。这样鼠标可从列表文字移进来复制，离开两者才关闭。
+  logRawTip.addEventListener('mouseenter',cancelLogRawTipClose);
+  logRawTip.addEventListener('mouseleave',e=>{
+    if(!(e.relatedTarget&&logRawTipSource&&logRawTipSource.contains(e.relatedTarget)))scheduleLogRawTipClose();
+  });
+  document.body.appendChild(logRawTip);
+  return logRawTip;
+}
+function cancelLogRawTipClose(){
+  clearTimeout(logRawTipCloseTimer);logRawTipCloseTimer=null;
+}
+function hideLogRawTip(){
+  cancelLogRawTipClose();
+  if(logRawTip)logRawTip.classList.remove('open');
+  logRawTipSource=null;
+}
+function scheduleLogRawTipClose(){
+  cancelLogRawTipClose();
+  // 给从表格跨过箭头移动到浮层的动作留出余量；不是离开一像素就消失。
+  logRawTipCloseTimer=setTimeout(hideLogRawTip,450);
+}
+function showLogRawTip(source){
+  const content=source&&source.dataset.rawTip;
+  if(!content)return;
+  cancelLogRawTipClose();
+  const tip=ensureLogRawTip();
+  logRawTipSource=source;
+  tip.textContent=content; // 保持后端返回的错误原文，不作前端推断或重写。
+  tip.classList.remove('is-below');
+  tip.style.left='-10000px';tip.style.top='-10000px';
+  tip.classList.add('open');
+  const anchor=source.getBoundingClientRect(),tw=tip.offsetWidth,th=tip.offsetHeight;
+  const anchorX=anchor.left+anchor.width/2;
+  let left=Math.max(8,Math.min(anchorX-tw/2,window.innerWidth-tw-8));
+  let top=anchor.top-th-9;
+  const below=top<8;
+  if(below){top=anchor.bottom+9;tip.classList.add('is-below');}
+  tip.style.left=`${left}px`;tip.style.top=`${top}px`;
+  const arrowX=Math.max(14,Math.min(tw-14,anchorX-left));
+  tip.style.setProperty('--log-tip-arrow-left',`${arrowX}px`);
+}
+$('logTb').addEventListener('mouseover',e=>{
+  const source=e.target.closest('.dtl-raw[data-raw-tip]');
+  if(source&&$('logTb').contains(source))showLogRawTip(source);
+});
+$('logTb').addEventListener('mouseout',e=>{
+  const source=e.target.closest('.dtl-raw[data-raw-tip]');
+  const next=e.relatedTarget;
+  if(source===logRawTipSource&&!(next&&(source.contains(next)||(logRawTip&&logRawTip.contains(next))))){
+    scheduleLogRawTipClose();
+  }
+});
+$('logTb').addEventListener('focusin',e=>{
+  const source=e.target.closest('.dtl-raw[data-raw-tip]');
+  if(source&&$('logTb').contains(source))showLogRawTip(source);
+});
+$('logTb').addEventListener('focusout',e=>{
+  const source=e.target.closest('.dtl-raw[data-raw-tip]');
+  if(source===logRawTipSource)scheduleLogRawTipClose();
+});
+window.addEventListener('scroll',hideLogRawTip,true);
+window.addEventListener('resize',hideLogRawTip);
+// 日志详情弹窗:成员列前箭头点击 → 展开这一行的完整信息(对齐 new-api 详情对话框的普通用户可见部分——
+// 概览 + 计价明细 + tokens 分解 + 违规费/退款专区;渠道/重试链路等管理员专属字段本身就不在 logOther 里,天然不展示)
+// 一行 label/value(对齐 new-api DetailRow:左列固定宽灰色小字,右列 mono 等宽字体)
+function detailRow(label,value,mono){
+  return `<div class="dr-row"><span class="dr-label">${label}</span><span class="dr-value${mono?' mono':''}">${value}</span></div>`;
+}
+// 多行文本(计费过程/订阅结算等 \n 分隔的公式/清单)保留换行,不当 mono(new-api 展开区这些行是普通字号)
+function detailRowPre(label,value){
+  return `<div class="dr-row"><span class="dr-label">${label}</span><span class="dr-value" style="white-space:pre-line">${value}</span></div>`;
+}
+// 行内展开区内容:字段列表与出现顺序严格对齐 new-api web/classic useUsageLogsData.jsx setLogsFormat
+// 的【非管理员】分支(渠道信息/拦截原因/流状态/请求转换/计费模式等管理员专属字段,普通客户端本就看不到,
+// 后端天然不产出这些字段,故此处不写这些分支)。
+function buildLogDetailDesc(idx){
+  const r=logRowsCache[idx];if(!r)return '';
+  let html='';
+  if(r.request_id)html+=detailRow('Request ID',esc(r.request_id),true);
+  if(r.cache_read_tokens>0)html+=detailRow('缓存 Tokens',fmtNum(r.cache_read_tokens),true);
+  if(r.cache_write_tokens>0)html+=detailRow('缓存创建 Tokens',fmtNum(r.cache_write_tokens),true);
+  if(r.type===2){
+    if(r.log_content)html+=detailRow('日志详情',esc(r.log_content));
+    if(r.other_content)html+=detailRowPre('其他详情',esc(r.other_content));
+    if(r.is_model_mapped){
+      html+=detailRow('请求并计费模型',esc(r.model_name||''));
+      html+=detailRow('实际模型',esc(r.upstream_model_name||''));
+    }
+    if(r.billing_process)html+=detailRowPre('计费过程',esc(r.billing_process));
+    if(r.reasoning_effort)html+=detailRow('Reasoning Effort',esc(r.reasoning_effort));
+  }
+  if(r.type===5&&r.detail)html+=detailRowPre('错误详情',esc(r.detail));
+  if(r.type===6){
+    if(r.task_id)html+=detailRow('任务ID',esc(r.task_id),true);
+    if(r.refund_reason)html+=detailRowPre('失败原因',esc(r.refund_reason));
+  }
+  if(r.request_path)html+=detailRow('请求路径',esc(r.request_path),true);
+  if(r.param_override&&r.param_override.length)html+=detailRowPre('参数覆盖',esc(r.param_override.join('\n')));
+  if(r.sub_plan)html+=detailRow('订阅套餐',esc(r.sub_plan));
+  if(r.sub_instance)html+=detailRow('订阅实例',esc(r.sub_instance));
+  if(r.sub_settlement)html+=detailRowPre('订阅结算',esc(r.sub_settlement));
+  if(r.sub_remain)html+=detailRow('订阅剩余',esc(r.sub_remain));
+  if(r.billing_source==='subscription')html+=detailRowPre('订阅说明','token 会按倍率换算成"额度/次数"，请求结束后再做差额结算（补扣/返还）。');
+  return `<div class="log-desc">${html||'<span class="muted">无更多信息</span>'}</div>`;
+}
+$('logTb').addEventListener('click',e=>{
+  const btn=e.target.closest('.log-expand');
+  if(!btn)return;
+  const idx=+btn.dataset.idx;
+  const expandTr=document.querySelector(`.log-expand-row[data-idx="${idx}"]`);
+  if(!expandTr)return;
+  const open=expandTr.style.display==='none';
+  if(open){
+    // 展开内容宽度按 .logwrap 可视宽度设(不是表格逻辑宽度),网格只在看得到的范围内换行
+    const w=document.querySelector('.logwrap').clientWidth;
+    expandTr.querySelector('.log-expand-td').innerHTML=
+      `<div class="log-expand-inner" style="width:${w}px">${buildLogDetailDesc(idx)}</div>`;
+    expandTr.style.display='';
+    btn.textContent='▼';
+  }else{
+    expandTr.style.display='none';
+    btn.textContent='▶';
+  }
+});
 function renderLogPager(){
   const page=logStack.length; // 1-based
   const prevOK=page>1,nextOK=logHasMore;
@@ -890,12 +1125,14 @@ function attachTips(sel){
   });
 }
 attachTips('.th-help');attachTips('.exp-help');
-$('logMember').onchange=()=>loadLogs(true);
-$('logModel').onchange=()=>loadLogs(true);
-$('logGroup').onchange=()=>loadLogs(true);
+cboxInit('logMember',()=>loadLogs(true));
+cboxInit('logModel',()=>loadLogs(true));
+cboxInit('logGroup',()=>loadLogs(true));
 $('logType').onchange=()=>loadLogs(true);
-let logTokTimer=null;
-$('logToken').addEventListener('input',()=>{clearTimeout(logTokTimer);logTokTimer=setTimeout(()=>loadLogs(true),300);});
+$('logDetailKwBtn').addEventListener('click',()=>loadLogs(true));
+$('logToken').addEventListener('keydown',e=>{if(e.key==='Enter')loadLogs(true);});
+$('logDetailKw').addEventListener('keydown',e=>{if(e.key==='Enter')loadLogs(true);});
+$('logRequestId').addEventListener('keydown',e=>{if(e.key==='Enter')loadLogs(true);});
 
 // ============ CSV 导出 ============
 let exporting=false,expCtrl=null,expTimer=null,expHeaders=false;

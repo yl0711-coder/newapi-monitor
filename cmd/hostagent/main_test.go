@@ -41,3 +41,12 @@ func TestDiskUsedPctSmoke(t *testing.T) {
 		t.Fatalf("磁盘用量应在 0~100 之间,得 %v", pct)
 	}
 }
+
+func TestLoadConfigCanDisablePrivilegedMetrics(t *testing.T) {
+	t.Setenv("HOSTAGENT_ROOTFS", "")
+	t.Setenv("HOSTAGENT_DOCKER_SOCK", "")
+	c := loadConfig()
+	if c.rootfs != "" || c.dockSock != "" {
+		t.Fatalf("显式空配置应关闭高权限指标: rootfs=%q socket=%q", c.rootfs, c.dockSock)
+	}
+}

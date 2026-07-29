@@ -80,6 +80,43 @@ func TestLoginFlow(t *testing.T) {
 	}
 }
 
+// 管理端登录按来源 IP 限制失败次数，既保护自身也避免被用作对主站的爆破转发器；
+// 登录请求体独立限制为 64KiB，不能借全局批量上报上限绕过。
+func TestAdminLoginGuards(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	srv := mockNewAPI()
+	defer srv.Close()
+	m := &Monitor{cfg: Settings{NewAPIBaseURL: srv.URL, SessionSecret: "guard-secret"}, chNames: map[string]string{}}
+	r := gin.New()
+	m.RegisterRoutes(r)
+
+	big := `{"username":"` + strings.Repeat("a", maxLoginRequestBody) + `","password":"x"}`
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/login", strings.NewReader(big))
+	req.Header.Set("Content-Type", "application/json")
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("超大登录请求应 413，得 %d", w.Code)
+	}
+
+	for i := 0; i < portalLoginMaxFails; i++ {
+		w = httptest.NewRecorder()
+		req = httptest.NewRequest(http.MethodPost, "/login", strings.NewReader(`{"username":"root","password":"bad"}`))
+		req.Header.Set("Content-Type", "application/json")
+		r.ServeHTTP(w, req)
+		if w.Code != http.StatusUnauthorized {
+			t.Fatalf("第 %d 次失败登录应 401，得 %d", i+1, w.Code)
+		}
+	}
+	w = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodPost, "/login", strings.NewReader(`{"username":"root","password":"bad"}`))
+	req.Header.Set("Content-Type", "application/json")
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusTooManyRequests {
+		t.Fatalf("达到失败上限后应 429，得 %d", w.Code)
+	}
+}
+
 func TestNewapiAuth(t *testing.T) {
 	srv := mockNewAPI()
 	defer srv.Close()

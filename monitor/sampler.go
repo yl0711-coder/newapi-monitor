@@ -4,10 +4,12 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -110,23 +112,121 @@ func (m *Monitor) loop(ctx context.Context, interval time.Duration) {
 	}
 }
 
+// 交付异常(B 类)SQL 判据 —— 口径见 文档/NexusAPI/12-上游渠道监控/09。
+//
+// 为什么用 completion_tokens 作为"是否交付"的唯一信号:
+//   - frt(首字延迟)不行:stream_scanner 在任何 data: 行(含 Claude 的 message_start)
+//     都会置首响应时间,它只证明上游开口了,不证明用户拿到内容。
+//   - prompt_tokens 也不行:上游不返 usage 时 new-api 会本地估算输入并照此扣费,
+//     有输入 token 不代表上游真的处理了。
+//
+// 三个易错点(都实测踩过):
+//   - end_reason 必须走 JSON_EXTRACT。other 里另有 end_error 自由文本字段,内容可能含
+//     "panic" 等词,对整串做正则会误命中——这正是旧口径误报的来源之一。
+//   - anomalyZeroSQL 必须排除天然无输出模型(embedding/rerank/图像生成),
+//     否则这些模型会被整类误判成 B1。当前生产零命中,是防御项。
+//   - REGEXP 里的字符串字面量是 coercible 的,会跟随列的 utf8mb4_unicode_ci;
+//     但换成会话变量(带显式 collation)会抛 Illegal mix of collations。勿改写成变量。
+//
+// 两个 JSON 取值必须用 COALESCE 兜成非 NULL —— 这是踩过的坑:
+// 非流式请求的 other 里没有 stream_status,JSON_EXTRACT 返回 NULL,而
+// `NULL IN (...)` = NULL、`FALSE OR NULL` = NULL,于是整个 ANOM 变 NULL,
+// `NOT ANOM` 也是 NULL,SUM 会跳过该行 —— 结果 success 恒为 0(异常侧因
+// `TRUE OR NULL` = TRUE 反而正常,所以只丢成功数,极难察觉)。
+const (
+	anomalyZeroSQL      = "(completion_tokens = 0 AND model_name NOT REGEXP 'embed|rerank|bge-|m3e|image|seedream|seedance')"
+	anomalyEndReasonSQL = "COALESCE(CASE WHEN JSON_VALID(other) THEN JSON_UNQUOTE(JSON_EXTRACT(other,'$.stream_status.end_reason')) END,'')"
+	anomalyErrCountSQL  = "COALESCE(CASE WHEN JSON_VALID(other) THEN CAST(JSON_EXTRACT(other,'$.stream_status.error_count') AS SIGNED) END,0)"
+)
+
+// expandAnomalyPredicates 把 {{ZERO}} / {{STREAMBAD}} / {{ANOM}} 占位符展开成 SQL。
+// 占位符用 {{}} 包裹是必要的:裸 ANOM 是 anomaly_billed 等列别名的前缀,直接替换会误伤别名。
+// sampleWindow 与 sampleTokens 共用本函数,保证两处口径同源、不会各改一半。
+func expandAnomalyPredicates(q string) string {
+	streamBad := "(" + anomalyEndReasonSQL + " IN ('timeout','scanner_error','panic','ping_fail') OR " + anomalyErrCountSQL + " > 0)"
+	anom := "(" + anomalyZeroSQL + " OR " + streamBad + ")"
+	q = strings.ReplaceAll(q, "{{ANOM}}", anom)
+	q = strings.ReplaceAll(q, "{{STREAMBAD}}", streamBad)
+	q = strings.ReplaceAll(q, "{{ZERO}}", anomalyZeroSQL)
+	return q
+}
+
 // sampleWindow 查询生产库最近 lookbackSec 秒日志,按"分钟桶×渠道×模型×分组"聚合并写本地。
 // 这是全程唯一打到生产库的查询。
 func (m *Monitor) sampleWindow(ctx context.Context, lookbackSec int64) (int, error) {
+	now := time.Now().Unix()
+	// +60 上界留一分钟余量,避免边界那一秒的日志正好落在两次采样之间被漏掉
+	// (桶是幂等 UPSERT,重叠采样只会覆盖同一桶,不会重复累加)。
+	return m.sampleRange(ctx, now-lookbackSec, now+60)
+}
+
+// sampleRange 采集 [fromTs, toTs) 区间的日志并写入本地桶。
+// 常规采样与历史回填共用同一条 SQL,保证两者口径绝不会各改一半。
+func (m *Monitor) sampleRange(ctx context.Context, fromTs, toTs int64) (int, error) {
 	cctx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
 
+	rows, err := m.prodDB.QueryContext(cctx, sampleWindowSQL(), fromTs, toTs)
+	if err != nil {
+		return 0, err
+	}
+	defer rows.Close()
+
+	var batch []MetricSample
+	for rows.Next() {
+		var (
+			s           MetricSample
+			grp         sql.NullString
+			e4, e5, eto int64
+		)
+		if err := rows.Scan(&s.BucketTs, &s.ChannelID, &s.ModelName, &grp,
+			&s.Success, &s.Anomaly, &s.Failed,
+			&s.AnomalyBilled, &s.AnomalyFree, &s.AnomalyStream, &s.AnomalyQuota, &s.AnomalySumTime,
+			&s.SumUseTime, &s.MaxUseTime, &s.Tokens, &s.Quota,
+			&e4, &e5, &eto,
+			&s.Lat1, &s.Lat2, &s.Lat5, &s.Lat10, &s.Lat30, &s.Lat60, &s.LatInf,
+			&s.CompletionTokens,
+			&s.Ttft500, &s.Ttft1k, &s.Ttft2k, &s.Ttft5k, &s.Ttft10k, &s.TtftInf, &s.TtftMaxMs); err != nil {
+			return 0, err
+		}
+		s.Grp = grp.String
+		s.Err4xx, s.Err5xx, s.ErrTimeout = e4, e5, eto
+		if other := s.Failed - e4 - e5 - eto; other > 0 {
+			s.ErrOther = other
+		}
+		batch = append(batch, s)
+	}
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+	if err := m.upsertSamples(batch); err != nil {
+		return 0, err
+	}
+	return len(batch), nil
+}
+
+// sampleWindowSQL 组装采样查询。拆成独立函数是为了能在测试里渲染出成品 SQL
+// 拿到真实 MySQL 上验证语法与 collation——判据里有 REGEXP 和 JSON_EXTRACT,
+// 光靠 Go 侧字符串断言盖不住"打到生产库才报错"这类问题。
+func sampleWindowSQL() string {
 	// MySQL SUM/布尔聚合返回 DECIMAL,需 CAST 成 SIGNED 才能 Scan 进 int64。
 	// 错误分类互斥(优先级:超时 > 5xx > 4xx),四类之和不超过失败数。
 	// FRT = 首字延迟(ms),取自 other JSON 的 frt;非法 JSON 或缺失则计 0(被 frt>0 过滤掉)。
+	//
+	// 交付异常判据见 expandAnomalyPredicates。
 	const frt = "(CASE WHEN JSON_VALID(other) THEN CAST(JSON_EXTRACT(other,'$.frt') AS SIGNED) ELSE 0 END)"
 	q := `
 SELECT
   (created_at DIV 60)*60 AS bucket,
   channel_id, model_name, ` + "`group`" + ` AS grp,
-  CAST(COALESCE(SUM(type=2 AND COALESCE(other,'') NOT REGEXP 'client_gone|scanner_error|panic|ping_fail'),0) AS SIGNED) AS success,
-  CAST(COALESCE(SUM(type=2 AND COALESCE(other,'')     REGEXP 'client_gone|scanner_error|panic|ping_fail'),0) AS SIGNED) AS anomaly,
+  CAST(COALESCE(SUM(type=2 AND NOT {{ANOM}}),0) AS SIGNED) AS success,
+  CAST(COALESCE(SUM(type=2 AND {{ANOM}}),0) AS SIGNED) AS anomaly,
   CAST(COALESCE(SUM(type=5),0) AS SIGNED) AS failed,
+  CAST(COALESCE(SUM(type=2 AND {{ZERO}} AND prompt_tokens > 0),0) AS SIGNED) AS anomaly_billed,
+  CAST(COALESCE(SUM(type=2 AND {{ZERO}} AND prompt_tokens = 0),0) AS SIGNED) AS anomaly_free,
+  CAST(COALESCE(SUM(type=2 AND {{STREAMBAD}} AND NOT {{ZERO}}),0) AS SIGNED) AS anomaly_stream,
+  CAST(COALESCE(SUM(CASE WHEN type=2 AND {{ZERO}} AND prompt_tokens > 0 THEN quota END),0) AS SIGNED) AS anomaly_quota,
+  CAST(COALESCE(SUM(CASE WHEN type=2 AND {{ANOM}} THEN use_time END),0) AS SIGNED) AS anomaly_sum_time,
   CAST(COALESCE(SUM(CASE WHEN type=2 THEN use_time END),0) AS SIGNED) AS sum_use_time,
   CAST(COALESCE(MAX(CASE WHEN type=2 THEN use_time END),0) AS SIGNED) AS max_use_time,
   CAST(COALESCE(SUM(CASE WHEN type=2 THEN prompt_tokens+completion_tokens END),0) AS SIGNED) AS tokens,
@@ -152,63 +252,118 @@ SELECT
   CAST(COALESCE(SUM(type=2 AND FRT>10000),0)               AS SIGNED) AS ttft_inf,
   CAST(COALESCE(MAX(CASE WHEN type=2 AND FRT>0 THEN FRT END),0) AS SIGNED) AS ttft_max_ms
 FROM logs
-WHERE created_at >= UNIX_TIMESTAMP() - ? AND type IN (2,5)
+WHERE created_at >= ? AND created_at < ? AND type IN (2,5)
 GROUP BY bucket, channel_id, model_name, grp`
-	q = strings.ReplaceAll(q, "FRT", frt)
+	q = expandAnomalyPredicates(q)
+	return strings.ReplaceAll(q, "FRT", frt)
+}
 
-	rows, err := m.prodDB.QueryContext(cctx, q, lookbackSec)
-	if err != nil {
-		return 0, err
-	}
-	defer rows.Close()
+// BackfillResult 回填结果,回给管理接口。
+type BackfillResult struct {
+	Hours    int   `json:"hours"`
+	Slices   int   `json:"slices"`
+	Rows     int   `json:"rows"`
+	Failed   int   `json:"failed_slices"`
+	ElapsedS int64 `json:"elapsed_sec"`
+}
 
-	var batch []MetricSample
-	for rows.Next() {
-		var (
-			s           MetricSample
-			grp         sql.NullString
-			e4, e5, eto int64
-		)
-		if err := rows.Scan(&s.BucketTs, &s.ChannelID, &s.ModelName, &grp,
-			&s.Success, &s.Anomaly, &s.Failed, &s.SumUseTime, &s.MaxUseTime, &s.Tokens, &s.Quota,
-			&e4, &e5, &eto,
-			&s.Lat1, &s.Lat2, &s.Lat5, &s.Lat10, &s.Lat30, &s.Lat60, &s.LatInf,
-			&s.CompletionTokens,
-			&s.Ttft500, &s.Ttft1k, &s.Ttft2k, &s.Ttft5k, &s.Ttft10k, &s.TtftInf, &s.TtftMaxMs); err != nil {
-			return 0, err
+// backfillRunning 保证同一时刻只有一次回填在跑:回填要打 168 次生产库,并发跑会放大压力。
+var backfillRunning atomic.Bool
+
+// BackfillHours 用当前判据重算最近 hours 小时的历史桶。
+//
+// 为什么需要:本地库存的是【算好的结果】而非原始日志。判据一改,只影响此后新采的桶,
+// 已存的旧桶仍是旧口径,同一张图里两套口径混着——趋势上出现假台阶,
+// 且跨分界点的告警窗口分子分母来自两套口径,阈值会失真。
+// 生产 logs 保留期远长于本地分钟级留存,所以旧桶可以重算。
+//
+// 为什么按小时切片:生产 logs 约 14.5 万行,单条全窗口 GROUP BY 既压生产库又会撞 20 秒超时
+// (实测全 7 天查询 >20s)。切成一小时一片后每片都在 1 秒内,压力与常规采样同量级。
+// 片间 sleep 让出时间,避免连续 168 次查询把生产库打满。
+//
+// 覆盖是安全的:upsertSamples 按【分钟桶 × 渠道 × 模型 × 分组】幂等 UPSERT,重算即替换,不累加。
+// 但覆盖【不可逆】——旧口径的数值会被冲掉;真要退回需回滚镜像后用旧代码再回填一次。
+func (m *Monitor) BackfillHours(ctx context.Context, hours int) (*BackfillResult, error) {
+	if m.prodDB == nil {
+		return nil, fmt.Errorf("未配置生产库(只读),无法回填")
+	}
+	if hours <= 0 {
+		return nil, fmt.Errorf("hours 需大于 0")
+	}
+	if max := m.cfg.RetentionDays * 24; max > 0 && hours > max {
+		// 超过分钟级留存的部分回填了也会被清理任务删掉,白打生产库。
+		return nil, fmt.Errorf("hours 不能超过分钟级留存 %d 小时(RetentionDays=%d)", max, m.cfg.RetentionDays)
+	}
+	if !backfillRunning.CompareAndSwap(false, true) {
+		return nil, fmt.Errorf("已有回填正在进行,请等待其结束")
+	}
+	defer backfillRunning.Store(false)
+
+	start := time.Now()
+	now := start.Unix()
+	res := &BackfillResult{Hours: hours}
+	slog.Info("开始历史回填", "hours", hours, "note", "只读生产库,按小时切片")
+
+	for i := hours; i >= 1; i-- {
+		select {
+		case <-ctx.Done():
+			return res, ctx.Err()
+		default:
 		}
-		s.Grp = grp.String
-		s.Err4xx, s.Err5xx, s.ErrTimeout = e4, e5, eto
-		if other := s.Failed - e4 - e5 - eto; other > 0 {
-			s.ErrOther = other
+		from, to := now-int64(i)*3600, now-int64(i-1)*3600
+		res.Slices++
+		n, err := m.sampleRange(ctx, from, to)
+		if err != nil {
+			res.Failed++
+			slog.Warn("回填分片失败(跳过)", "from", from, "to", to, "err", err)
+		} else {
+			res.Rows += n
 		}
-		batch = append(batch, s)
+		// 令牌维度跟着一起补,否则回填完主维度对了、令牌页仍是旧口径的旧数。
+		// 与主采样同样的隔离原则:它失败只记日志,不算整体失败。
+		if err := m.sampleTokensRange(ctx, from, to); err != nil {
+			slog.Warn("回填分片令牌维度失败(忽略)", "from", from, "to", to, "err", err)
+		}
+		if i > 1 {
+			time.Sleep(500 * time.Millisecond) // 让生产库喘口气
+		}
 	}
-	if err := rows.Err(); err != nil {
-		return 0, err
+	// 小时级汇总(90 天留存,长期趋势用)也是从分钟桶算出来的,必须跟着重算,
+	// 否则假台阶会在长期趋势图上留三个月。
+	if err := m.rollupHours(now - int64(m.cfg.RetentionDays)*86400); err != nil {
+		slog.Warn("回填后小时汇总失败", "err", err)
 	}
-	if err := m.upsertSamples(batch); err != nil {
-		return 0, err
-	}
-	return len(batch), nil
+	res.ElapsedS = int64(time.Since(start).Seconds())
+	slog.Info("历史回填完成", "hours", hours, "slices", res.Slices, "rows", res.Rows,
+		"failed", res.Failed, "elapsed_sec", res.ElapsedS)
+	return res, nil
 }
 
 // sampleTokens 按【分钟桶 × 令牌】聚合最近 lookbackSec 秒日志,写本地 token_samples。
 // 与主采样隔离:它失败由调用方记日志后继续,绝不影响主监控。
 func (m *Monitor) sampleTokens(ctx context.Context, lookbackSec int64) error {
+	now := time.Now().Unix()
+	return m.sampleTokensRange(ctx, now-lookbackSec, now+60)
+}
+
+// sampleTokensRange 采集 [fromTs, toTs) 区间的令牌维度。与 sampleRange 成对,
+// 两者都必须是区间式,否则回填时令牌维度会悄悄只补最近一段(主维度补齐、令牌维度错位)。
+func (m *Monitor) sampleTokensRange(ctx context.Context, fromTs, toTs int64) error {
 	cctx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
+	// 判据与 sampleWindow 保持一致(口径必须同源),但按令牌维度不拆明细,控制基数。
 	q := `
 SELECT (created_at DIV 60)*60 AS bucket, token_name,
-  CAST(COALESCE(SUM(type=2 AND COALESCE(other,'') NOT REGEXP 'client_gone|scanner_error|panic|ping_fail'),0) AS SIGNED) AS success,
-  CAST(COALESCE(SUM(type=2 AND COALESCE(other,'')     REGEXP 'client_gone|scanner_error|panic|ping_fail'),0) AS SIGNED) AS anomaly,
+  CAST(COALESCE(SUM(type=2 AND NOT {{ANOM}}),0) AS SIGNED) AS success,
+  CAST(COALESCE(SUM(type=2 AND {{ANOM}}),0) AS SIGNED) AS anomaly,
   CAST(COALESCE(SUM(type=5),0) AS SIGNED) AS failed,
   CAST(COALESCE(SUM(CASE WHEN type=2 THEN prompt_tokens+completion_tokens END),0) AS SIGNED) AS tokens,
   CAST(COALESCE(SUM(quota),0) AS SIGNED) AS quota
 FROM logs
-WHERE created_at >= UNIX_TIMESTAMP() - ? AND type IN (2,5)
+WHERE created_at >= ? AND created_at < ? AND type IN (2,5)
 GROUP BY bucket, token_name`
-	rows, err := m.prodDB.QueryContext(cctx, q, lookbackSec)
+	q = expandAnomalyPredicates(q)
+	rows, err := m.prodDB.QueryContext(cctx, q, fromTs, toTs)
 	if err != nil {
 		return err
 	}

@@ -1,0 +1,37 @@
+# 本机验收专用：管理端与客户门户都只绑定回环地址，绝不用于生产。
+#
+# 数据卷 ./\.local-data 持有从线上一致性备份得到的 nexus_monitor.db。
+# 更新代码时只执行：
+#   docker compose -f docker-compose.local-acceptance.yml build monitor
+#   docker compose -f docker-compose.local-acceptance.yml up -d --no-deps --force-recreate monitor
+# 不要使用 `down -v`，也不要删除 .local-data/nexus_monitor.db。
+services:
+  monitor:
+    image: newapi-monitor:local-acceptance
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: newapi-monitor-local-acceptance
+    ports:
+      - "127.0.0.1:8100:8090"
+      - "127.0.0.1:8101:8091"
+    environment:
+      # 只读线上 MySQL 连接由启动命令临时传入，绝不写入仓库。
+      # 留空时应用会拒绝启动；这样仅 build 镜像时无需取得线上只读凭据。
+      NEWAPI_LOG_DSN: ${NEWAPI_LOG_DSN:-}
+      MONITOR_ADDR: ":8090"
+      MONITOR_PORTAL_ADDR: ":8091"
+      MONITOR_STORE_PATH: /data/nexus_monitor.db
+      MONITOR_NEWAPI_BASE_URL: https://nexusapi.link
+      MONITOR_SESSION_SECRET: ${MONITOR_SESSION_SECRET:-local-acceptance-session-only}
+      # 本地验收硬性安全开关：不发邮件、不回填、不做 AWS/域名探测、不打外部心跳。
+      MONITOR_ALERTS_DISABLED: "true"
+      MONITOR_INFRA_ENABLED: "false"
+      # 可通过启动命令传入已下线资源名，验证历史采样会被隐藏。
+      MONITOR_INFRA_EXCLUDE_RESOURCES: ${MONITOR_INFRA_EXCLUDE_RESOURCES:-}
+      MONITOR_HEARTBEAT_URL: ""
+      MONITOR_BACKFILL_HOURS: "0"
+      MONITOR_SAMPLE_SECONDS: "3600"
+    volumes:
+      - ./.local-data:/data
+    restart: unless-stopped

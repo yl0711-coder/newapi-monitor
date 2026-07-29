@@ -36,14 +36,23 @@ type config struct {
 }
 
 func loadConfig() config {
+	// 原生运行时维持原有默认值；容器编排可以显式传空值关闭高权限指标。
+	rootfs := "/"
+	if v, ok := os.LookupEnv("HOSTAGENT_ROOTFS"); ok {
+		rootfs = v
+	}
+	dockSock := "/var/run/docker.sock"
+	if v, ok := os.LookupEnv("HOSTAGENT_DOCKER_SOCK"); ok {
+		dockSock = v
+	}
 	c := config{
 		sinkURL:  os.Getenv("HOSTAGENT_SINK_URL"),
 		token:    os.Getenv("HOSTAGENT_TOKEN"),
 		node:     os.Getenv("HOSTAGENT_NODE"),
 		interval: time.Duration(envInt("HOSTAGENT_INTERVAL_SECONDS", 60)) * time.Second,
 		procPath: envStr("HOSTAGENT_PROC", "/proc"),
-		rootfs:   envStr("HOSTAGENT_ROOTFS", "/"),
-		dockSock: envStr("HOSTAGENT_DOCKER_SOCK", "/var/run/docker.sock"),
+		rootfs:   rootfs,
+		dockSock: dockSock,
 		insecure: os.Getenv("HOSTAGENT_INSECURE") == "true",
 	}
 	if c.interval < 10*time.Second {
@@ -132,10 +141,12 @@ func collect(c config) sample {
 	} else {
 		log.Printf("hostagent: 读 loadavg 失败(本项不上报): %v", err)
 	}
-	if pct, err := diskUsedPct(c.rootfs); err == nil {
-		s.DiskUsedPct = fp(pct)
-	} else {
-		log.Printf("hostagent: 统计磁盘失败(本项不上报): %v", err)
+	if c.rootfs != "" {
+		if pct, err := diskUsedPct(c.rootfs); err == nil {
+			s.DiskUsedPct = fp(pct)
+		} else {
+			log.Printf("hostagent: 统计磁盘失败(本项不上报): %v", err)
+		}
 	}
 	if c.dockSock != "" {
 		if up, total, err := dockerCounts(c.dockSock); err == nil {

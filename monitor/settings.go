@@ -3,6 +3,7 @@ package monitor
 import (
 	"os"
 	"strconv"
+	"strings"
 )
 
 // Settings 是监控服务的独立配置,全部从环境变量读取——不依赖任何外部 config 包。
@@ -22,6 +23,9 @@ type Settings struct {
 	// 客户端「用量报表」独立监听(portal.go):客户域名只指这个端口,上面不存在任何管理端路由。
 	// 留空 = 关闭(默认);如 ":8092"。
 	PortalAddr string // MONITOR_PORTAL_ADDR
+	// 仅信任这些反代来源提供的 X-Forwarded-For/X-Real-IP。留空时不信任任何转发头，
+	// 登录限流按直连地址计算，避免外部请求伪造来源 IP 绕过限流。
+	TrustedProxies []string // MONITOR_TRUSTED_PROXIES，逗号分隔 CIDR/IP
 
 	// dead-man 心跳:每周期成功采样后向外部服务(如 healthchecks.io)打一次;留空=不启用。
 	// 监控/采样若停了,外部服务收不到心跳即告警——"谁来监控监控"。
@@ -45,6 +49,9 @@ type Settings struct {
 	// MONITOR_INFRA_RESOURCES:逗号分隔,显式指定要监控的资源,留空=自动发现。
 	// 格式 type:name,type∈ instance/database/lb,如 "instance:Master,database:DB-X,lb:LB-X"。
 	InfraResources string
+	// MONITOR_INFRA_EXCLUDE_RESOURCES:逗号分隔的资源名。用于暂时下线某台实例的
+	// 监控：不再自动采样，也不在现有历史采样的快照、趋势或最近告警中展示。
+	InfraExcludeResources []string
 
 	// 服务端监控告急阈值(百分比)。可用内存/存储「低于」即黄/红;CPU「高于」即黄/红;突发额度「低于」即黄。
 	InfraMemAvailWarnPct     float64 // MONITOR_INFRA_MEM_AVAIL_WARN_PCT,默认 25
@@ -75,6 +82,12 @@ type Settings struct {
 	OriginLockTargets string // MONITOR_ORIGIN_LOCK_TARGETS,逗号分隔源站端点(host:port),默认两台 nginx 私网;留空=关闭
 	OriginLockHost    string // MONITOR_ORIGIN_LOCK_HOST,检查时带的 Host 头,默认 nexusapi.link
 	OriginLockPath    string // MONITOR_ORIGIN_LOCK_PATH,检查路径,默认 /(/ 无内网豁免,无头必 403;勿用 /api/status)
+
+	// AlertsDisabled 本地/测试用的硬开关:=true 时 evaluateAlerts 直接返回,一封都不发。
+	// 存在的理由是真实事故:本地测试实例连生产库、库里带真实 SMTP 与真实收件人,
+	// 隧道抖动被误判成"采样器掉线",用真实凭据连发了 9 封骚扰邮件。
+	// 不要用"默认配置里 Enabled=false"来代替这个开关——那是约定,这是断路器。
+	AlertsDisabled bool // MONITOR_ALERTS_DISABLED
 }
 
 // LoadSettings 从环境变量装载配置(可配合 .env)。
@@ -90,15 +103,17 @@ func LoadSettings() Settings {
 		NewAPIBaseURL:     env("MONITOR_NEWAPI_BASE_URL", ""),
 		SessionSecret:     env("MONITOR_SESSION_SECRET", ""),
 		PortalAddr:        env("MONITOR_PORTAL_ADDR", ""),
+		TrustedProxies:    envCSV("MONITOR_TRUSTED_PROXIES"),
 		HeartbeatURL:      env("MONITOR_HEARTBEAT_URL", ""),
 		SiteName:          env("MONITOR_SITE_NAME", ""),
 		IngestToken:       env("MONITOR_INGEST_TOKEN", ""),
 
-		InfraEnabled:       env("MONITOR_INFRA_ENABLED", "") == "true",
-		AWSRegion:          env("AWS_REGION", "us-west-2"),
-		InfraSampleSeconds: envInt("MONITOR_INFRA_SAMPLE_SECONDS", 300),
-		InfraRetentionDays: envInt("MONITOR_INFRA_RETENTION_DAYS", 7),
-		InfraResources:     env("MONITOR_INFRA_RESOURCES", ""),
+		InfraEnabled:          env("MONITOR_INFRA_ENABLED", "") == "true",
+		AWSRegion:             env("AWS_REGION", "us-west-2"),
+		InfraSampleSeconds:    envInt("MONITOR_INFRA_SAMPLE_SECONDS", 300),
+		InfraRetentionDays:    envInt("MONITOR_INFRA_RETENTION_DAYS", 7),
+		InfraResources:        env("MONITOR_INFRA_RESOURCES", ""),
+		InfraExcludeResources: envCSV("MONITOR_INFRA_EXCLUDE_RESOURCES"),
 
 		InfraMemAvailWarnPct:     envFloat("MONITOR_INFRA_MEM_AVAIL_WARN_PCT", 25),
 		InfraMemAvailBadPct:      envFloat("MONITOR_INFRA_MEM_AVAIL_BAD_PCT", 15),
@@ -123,6 +138,8 @@ func LoadSettings() Settings {
 		OriginLockTargets: env("MONITOR_ORIGIN_LOCK_TARGETS", "172.26.0.20:80,172.26.10.97:80"),
 		OriginLockHost:    env("MONITOR_ORIGIN_LOCK_HOST", "nexusapi.link"),
 		OriginLockPath:    env("MONITOR_ORIGIN_LOCK_PATH", "/"),
+
+		AlertsDisabled: env("MONITOR_ALERTS_DISABLED", "") == "true",
 	}
 }
 
@@ -131,6 +148,21 @@ func env(k, def string) string {
 		return v
 	}
 	return def
+}
+
+func envCSV(k string) []string {
+	v := strings.TrimSpace(os.Getenv(k))
+	if v == "" {
+		return nil
+	}
+	parts := strings.Split(v, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 func envInt(k string, def int) int {

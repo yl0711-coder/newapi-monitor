@@ -44,6 +44,8 @@ Open `http://<host>:8090` and log in with a new-api admin account. See [`docker-
 | `MONITOR_NEWAPI_BASE_URL` | new-api base URL, used for login auth | required |
 | `MONITOR_SESSION_SECRET` | Session signing key (`openssl rand -hex 32`) | random if empty |
 | `MONITOR_ADDR` | Listen address | `:8090` |
+| `MONITOR_PORTAL_ADDR` | Dedicated client usage-portal listener; empty disables it | empty |
+| `MONITOR_TRUSTED_PROXIES` | Comma-separated trusted proxy IPs/CIDRs allowed to supply the client IP; empty trusts no forwarding headers | empty |
 | `MONITOR_STORE_PATH` | Local sampling DB path | `/data/monitor.db` |
 | `MONITOR_SAMPLE_SECONDS` | Sampling interval (seconds) | `60` |
 | `MONITOR_RETENTION_DAYS` | Local retention (days) | `7` |
@@ -87,12 +89,32 @@ Login reuses new-api identity (only calls its `/api/user/login`):
 - `role = 100` (super admin): can edit alert settings.
 
 ## Read-only account
-Create a dedicated read-only account for new-api's DB, granting only `SELECT` on `logs` and `channels`, for `NEWAPI_LOG_DSN`:
+Create a dedicated read-only account for new-api's DB, granting only `SELECT` on `logs`, `channels`, `users`, and `tokens`, for `NEWAPI_LOG_DSN`:
 ```sql
 CREATE USER 'ro_user'@'%' IDENTIFIED BY '<strong-password>';
 GRANT SELECT ON newapi.logs     TO 'ro_user'@'%';
 GRANT SELECT ON newapi.channels TO 'ro_user'@'%';
+GRANT SELECT ON newapi.users    TO 'ro_user'@'%';
+GRANT SELECT ON newapi.tokens   TO 'ro_user'@'%';
 ```
+
+## Client usage portal
+
+The client portal has its own listener, cookies, and routes. The production compose example enables it at
+`127.0.0.1:8091` through `MONITOR_PORTAL_ADDR=:8091`; this is **not** an IP allowlist for a developer machine or customers.
+Expose the admin site and the client portal through separate HTTPS reverse-proxy hosts:
+
+```caddy
+monitor.example.com {
+    reverse_proxy 127.0.0.1:8090
+}
+usage.example.com {
+    reverse_proxy 127.0.0.1:8091
+}
+```
+
+Do not publish ports `8090` or `8091` directly. A super admin provisions each group account from Usage management.
+If Caddy/Nginx runs on another host or in another container network, add its actual IP/CIDR to `MONITOR_TRUSTED_PROXIES`; otherwise login limiting uses the proxy address.
 
 ## Security
 - The image contains **no secrets**; DSN, session key and SMTP credentials are injected via environment variables.

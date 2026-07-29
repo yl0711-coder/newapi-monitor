@@ -8,6 +8,7 @@ secrets/
 
 # —— 运行时数据 ——
 /data/
+/.local-data/
 *.db
 *.db-wal
 *.db-shm

@@ -25,7 +25,7 @@ import (
 const (
 	// usageTZOffsetSec 天粒度按东八区(CST)切日,与团队运营时区一致(日志本身是 unix 秒,无时区)。
 	usageTZOffsetSec = 8 * 3600
-	maxUsageDays     = 90  // 单次查询时间范围上限,约束单次扫描量(产品要求:最多90天)
+	maxUsageDays     = 366 // 单次查询时间范围上限;支持近一年(含闰年),仍由分页/导出上限控制返回量
 	maxUsageDimRows  = 300 // 分组/模型维度返回上限
 )
 
@@ -292,31 +292,54 @@ func (m *Monitor) computeUsageMatrix(ctx context.Context, ids []int64, fromTs, t
 	return mx, nil // 用户列(含合计与排序)由 handler 结合名单组装
 }
 
-// parseUsageRange 解析 from/to(YYYY-MM-DD,CST 自然日,含端点),空则默认近 7 天;越界自动收敛。
+// parseUsageRange 解析 from/to。旧格式 YYYY-MM-DD 仍按 CST 自然日(含端点)；
+// YYYY-MM-DD HH:MM[:SS] 则是精确时间边界，适合日志页的滚动 25 小时窗口。
+// 空值仍默认近 7 天，保持既有管理端调用兼容。
 func parseUsageRange(fromStr, toStr string, now time.Time) (fromTs, toTs int64, err error) {
 	today := now.In(usageCST).Truncate(0)
 	y, mo, d := today.Date()
 	todayStart := time.Date(y, mo, d, 0, 0, 0, 0, usageCST)
 
-	to := todayStart
+	parseBoundary := func(raw string, isEnd bool) (time.Time, bool, error) {
+		if t, e := time.ParseInLocation("2006-01-02", raw, usageCST); e == nil {
+			return t, false, nil // 自然日模式；结束边界在下方补到次日零点
+		}
+		for _, layout := range []string{"2006-01-02 15:04:05", "2006-01-02 15:04"} {
+			if t, e := time.ParseInLocation(layout, raw, usageCST); e == nil {
+				return t, true, nil
+			}
+		}
+		if isEnd {
+			return time.Time{}, false, fmt.Errorf("结束时间格式应为 YYYY-MM-DD 或 YYYY-MM-DD HH:MM:SS")
+		}
+		return time.Time{}, false, fmt.Errorf("开始时间格式应为 YYYY-MM-DD 或 YYYY-MM-DD HH:MM:SS")
+	}
+
+	to, toPrecise := todayStart, false
 	if toStr != "" {
-		if to, err = time.ParseInLocation("2006-01-02", toStr, usageCST); err != nil {
-			return 0, 0, fmt.Errorf("结束日期格式应为 YYYY-MM-DD")
+		if to, toPrecise, err = parseBoundary(toStr, true); err != nil {
+			return 0, 0, err
 		}
 	}
 	from := to.AddDate(0, 0, -6) // 默认近 7 天(含今天)
+	fromPrecise := toPrecise
 	if fromStr != "" {
-		if from, err = time.ParseInLocation("2006-01-02", fromStr, usageCST); err != nil {
-			return 0, 0, fmt.Errorf("开始日期格式应为 YYYY-MM-DD")
+		if from, fromPrecise, err = parseBoundary(fromStr, false); err != nil {
+			return 0, 0, err
 		}
 	}
 	if from.After(to) {
 		from, to = to, from
+		fromPrecise, toPrecise = toPrecise, fromPrecise
 	}
 	// 含两端点共 N 天 ⇔ 零点差 (N-1)*24h;用 >= 卡在恰好 maxUsageDays 天(超一天即 91 天会被拒)
 	if to.Sub(from) >= time.Duration(maxUsageDays)*24*time.Hour {
 		return 0, 0, fmt.Errorf("时间范围过大,最长 %d 天", maxUsageDays)
 	}
+	if toPrecise {
+		return from.Unix(), to.Add(time.Second).Unix(), nil // 精确结束秒也包含在 [from,to) 内
+	}
+	_ = fromPrecise                                     // 开始端无需特殊处理；保留变量使交换时的语义显式可读。
 	return from.Unix(), to.AddDate(0, 0, 1).Unix(), nil // to 含当天 → 上界取次日 0 点(开区间)
 }
 
@@ -379,7 +402,9 @@ func (m *Monitor) serveUsageMatrix(c *gin.Context) {
 		}
 		return mx.Users[i].Username < mx.Users[j].Username
 	})
-	m.portalWarmFromMatrix(mx, tracked, fromTs, toTs) // 写穿透预热:管理端每次刷新顺手把各组客户端缓存灌成最新
+	// 不能把仅含矩阵的半成品预热进客户端总览缓存：趋势图还需要按日×模型聚合。
+	// 此处只使相关组失效，客户端下一次请求会通过 buildPortalOverview 写入完整载荷。
+	m.invalidatePortalOverviews(tracked, fromTs, toTs)
 	c.JSON(http.StatusOK, gin.H{"enabled": true, "matrix": mx, "empty": len(tracked) == 0})
 }
 
@@ -612,22 +637,41 @@ func (m *Monitor) computeUserTokenUsage(ctx context.Context, uid, fromTs, toTs i
 	return out, nil
 }
 
-// LogRow 一条日志(逐条明细,给客户端「使用日志」查看/导出用);只含元数据,不含请求/响应内容,也不含渠道等内部信息。
+// LogRow 一条日志(逐条明细,给客户端「使用日志」查看/导出用);不含请求/响应正文。
+// 错误日志的 detail 按中转站口径保留 logs.content 原文，便于按原始 status/错误文本排障。
 type LogRow struct {
-	ID               int64   `json:"id"`
-	CreatedAt        int64   `json:"created_at"`
-	Member           string  `json:"member"` // 成员用户名(日志写入时记录)
-	Type             int     `json:"type"`   // 1充值 2消费 3管理 4系统 5错误 6退款
-	TokenName        string  `json:"token_name"`
-	ModelName        string  `json:"model_name"`
-	Group            string  `json:"group"`
-	PromptTokens     int64   `json:"prompt_tokens"`
-	CompletionTokens int64   `json:"completion_tokens"`
-	UseTime          int64   `json:"use_time"`      // 总耗时(秒)
-	IsStream         bool    `json:"is_stream"`     // 流式请求
-	FirstByteMs      int64   `json:"first_byte_ms"` // 首字延迟(毫秒);仅流式且有值时>0
-	CostUSD          float64 `json:"cost_usd"`      // 费用(美元);仅消费(type=2)有值,其它类型 quota 恒为0不代表费用,置0且前端/CSV留空
-	Detail           string  `json:"detail"`        // 详情摘要(消费=计价摘要/退款=退款文案/其它=content)
+	ID                int64    `json:"id"`
+	CreatedAt         int64    `json:"created_at"`
+	Member            string   `json:"member"` // 成员用户名(日志写入时记录)
+	Type              int      `json:"type"`   // 1充值 2消费 3管理 4系统 5错误 6退款
+	TokenName         string   `json:"token_name"`
+	ModelName         string   `json:"model_name"`
+	Group             string   `json:"group"`
+	PromptTokens      int64    `json:"prompt_tokens"`
+	CompletionTokens  int64    `json:"completion_tokens"`
+	UseTime           int64    `json:"use_time"`                      // 总耗时(秒)
+	IsStream          bool     `json:"is_stream"`                     // 流式请求
+	FirstByteMs       int64    `json:"first_byte_ms"`                 // 首字延迟(毫秒);仅流式且有值时>0
+	CostUSD           float64  `json:"cost_usd"`                      // 费用(美元);仅消费(type=2)有值,其它类型 quota 恒为0不代表费用,置0且前端/CSV留空
+	Detail            string   `json:"detail"`                        // 详情摘要(消费=计价摘要/退款=退款文案/其它=content)
+	RequestID         string   `json:"request_id"`                    // new-api logs.request_id,同官方客户端使用日志展示;无则空
+	CacheReadTokens   int64    `json:"cache_read_tokens"`             // 缓存读 tokens(other.cache_tokens);供 tokens 列下方展示,同 new-api
+	CacheWriteTokens  int64    `json:"cache_write_tokens"`            // 缓存写 tokens(优先取 5m/1h 拆分之和,否则 other.cache_creation_tokens)
+	LogContent        string   `json:"log_content,omitempty"`         // 对齐 new-api 展开区"日志详情"(renderLogContent,一句逗号连接的话);仅消费且非阶梯计费有值
+	OtherContent      string   `json:"other_content,omitempty"`       // 对齐 new-api 展开区"其他详情"(logs[i].content,仅消费(type=2)且非空时展示;已过 scrubContent 纵深防御)
+	BillingProcess    string   `json:"billing_process,omitempty"`     // 对齐 new-api 展开区"计费过程"(renderModelPrice,含具体计算公式);见 buildBillingProcess 覆盖范围
+	RequestPath       string   `json:"request_path,omitempty"`        // other.request_path,new-api 展开区可见字段(非渠道/内部信息)
+	TaskID            string   `json:"task_id,omitempty"`             // 退款(type=6)/异步任务消费(type=2)关联任务ID
+	RefundReason      string   `json:"refund_reason,omitempty"`       // 退款(type=6)失败原因
+	ReasoningEffort   string   `json:"reasoning_effort,omitempty"`    // 推理强度,new-api 展开区可见字段
+	IsModelMapped     bool     `json:"is_model_mapped,omitempty"`     // 是否发生了模型映射;为真时前端加"请求并计费模型"(=model_name)/"实际模型"两行
+	UpstreamModelName string   `json:"upstream_model_name,omitempty"` // 映射后实际请求的上游模型名
+	ParamOverride     []string `json:"param_override,omitempty"`      // 参数覆盖审计行(见 logOther.PO)
+	SubPlan           string   `json:"sub_plan,omitempty"`            // 订阅套餐:"#planId planTitle"
+	SubInstance       string   `json:"sub_instance,omitempty"`        // 订阅实例:"#subscriptionId"
+	SubSettlement     string   `json:"sub_settlement,omitempty"`      // 订阅结算:预扣/结算差额/最终抵扣三行(\n 分隔)
+	SubRemain         string   `json:"sub_remain,omitempty"`          // 订阅剩余:"remain/total 额度"
+	BillingSource     string   `json:"billing_source,omitempty"`      // other.billing_source,=="subscription" 时前端加"订阅说明"固定提示行
 }
 
 // logTypeName 日志类型码 → 中文名(与 new-api LogType 常量一致)。
@@ -653,23 +697,42 @@ func logTypeName(t int) string {
 // logOther 日志 other JSON 里【仅】我们要用的安全字段:首字延迟 + 计价摘要所需的价格/倍率。
 // 渠道等内部字段(channel_id/channel_name/admin_info…)不在此结构 → 天然不解析、不外传。
 type logOther struct {
-	FRT                   float64  `json:"frt"`
-	ModelPrice            *float64 `json:"model_price"`
-	ModelRatio            *float64 `json:"model_ratio"`
-	GroupRatio            *float64 `json:"group_ratio"`
-	UserGroupRatio        *float64 `json:"user_group_ratio"`
-	CacheTokens           float64  `json:"cache_tokens"`
-	CacheRatio            *float64 `json:"cache_ratio"`
-	CacheCreationTokens   float64  `json:"cache_creation_tokens"`
-	CacheCreationRatio    *float64 `json:"cache_creation_ratio"`
-	CacheCreationTokens5m float64  `json:"cache_creation_tokens_5m"`
-	CacheCreationRatio5m  *float64 `json:"cache_creation_ratio_5m"`
-	CacheCreationTokens1h float64  `json:"cache_creation_tokens_1h"`
-	CacheCreationRatio1h  *float64 `json:"cache_creation_ratio_1h"`
-	Image                 bool     `json:"image"`
-	ImageRatio            *float64 `json:"image_ratio"`
-	ViolationFeeCode      string   `json:"violation_fee_code"`
-	BillingMode           string   `json:"billing_mode"` // "tiered_expr"=阶梯计费(此时 model_ratio/model_price 均为0,不能当标准单价展示)
+	FRT                     float64  `json:"frt"`
+	ModelPrice              *float64 `json:"model_price"`
+	ModelRatio              *float64 `json:"model_ratio"`
+	GroupRatio              *float64 `json:"group_ratio"`
+	UserGroupRatio          *float64 `json:"user_group_ratio"`
+	CacheTokens             float64  `json:"cache_tokens"`
+	CacheRatio              *float64 `json:"cache_ratio"`
+	CacheCreationTokens     float64  `json:"cache_creation_tokens"`
+	CacheCreationRatio      *float64 `json:"cache_creation_ratio"`
+	CacheCreationTokens5m   float64  `json:"cache_creation_tokens_5m"`
+	CacheCreationRatio5m    *float64 `json:"cache_creation_ratio_5m"`
+	CacheCreationTokens1h   float64  `json:"cache_creation_tokens_1h"`
+	CacheCreationRatio1h    *float64 `json:"cache_creation_ratio_1h"`
+	Image                   bool     `json:"image"`
+	ImageRatio              *float64 `json:"image_ratio"`
+	ViolationFeeCode        string   `json:"violation_fee_code"`
+	BillingMode             string   `json:"billing_mode"`        // "tiered_expr"=阶梯计费(此时 model_ratio/model_price 均为0,不能当标准单价展示)
+	CompletionRatio         *float64 `json:"completion_ratio"`    // 输出倍率,new-api 展开区"计费过程"计算输出价格要用
+	RequestPath             string   `json:"request_path"`        // 请求路径,普通用户可见字段(非渠道/内部信息)
+	TaskID                  string   `json:"task_id"`             // 退款(type=6)关联的异步任务ID / 消费(type=2)异步任务日志的关联任务ID
+	Reason                  string   `json:"reason"`              // 退款(type=6)失败原因,普通用户可见
+	IsModelMapped           bool     `json:"is_model_mapped"`     // 是否发生了模型映射(展开区"请求并计费模型"/"实际模型"两行)
+	UpstreamModelName       string   `json:"upstream_model_name"` // 映射后实际请求的上游模型名
+	ReasoningEffort         string   `json:"reasoning_effort"`    // 推理强度,new-api 展开区可见字段
+	IsTask                  bool     `json:"is_task"`             // 异步任务日志(与 task_id 任一命中即算任务日志,决定"计费过程"是否走任务预扣费文案)
+	Claude                  bool     `json:"claude"`              // 该请求最终以 Claude Messages 格式转发给上游;日志详情/计费过程走 claude 专用公式(缓存读取价格恒展示+缓存创建含5m/1h拆分)
+	BillingSource           string   `json:"billing_source"`      // "subscription" 表示本次由订阅额度结算,非钱包 quota
+	SubscriptionID          *int64   `json:"subscription_id"`
+	SubscriptionPlanID      *int64   `json:"subscription_plan_id"`
+	SubscriptionPlanTitle   string   `json:"subscription_plan_title"`
+	SubscriptionPreConsumed *int64   `json:"subscription_pre_consumed"`
+	SubscriptionPostDelta   *int64   `json:"subscription_post_delta"`
+	SubscriptionConsumed    *int64   `json:"subscription_consumed"`
+	SubscriptionRemain      *int64   `json:"subscription_remain"`
+	SubscriptionTotal       *int64   `json:"subscription_total"`
+	PO                      []string `json:"po"` // 参数覆盖审计行(仅覆盖了审计白名单路径时非空),展开区"参数覆盖"按钮/内容用
 }
 
 func parseLogOther(s string) *logOther {
@@ -693,12 +756,238 @@ func trimNum(v float64, digits int) string {
 	return s
 }
 
+// buildLogContent 对齐 new-api web/classic renderLogContent/renderClaudeLogContent(price 模式,
+// 我们没有 ratio 模式的用户偏好开关故只实现这一种):一句中文逗号连接的话——"输入价格 $X / 1M
+// tokens，输出价格 $Y / 1M tokens[，缓存读取价格 $Z / 1M tokens][，图片输入价格...]，分组倍率/专属倍率 Wx"。
+// 仅消费(type=2)且非阶梯计费(tiered_expr,此时 model_ratio/model_price 恒为0不能当单价展示)时有值。
+func buildLogContent(logType int, o *logOther) string {
+	if logType != 2 || o == nil || o.BillingMode == "tiered_expr" {
+		return ""
+	}
+	// 异步任务日志(model_price=-1,按任务/时长计费)没有"每 1M tokens 多少钱"这回事:
+	// 此时 model_ratio 往往是占位的 1,照公式算会展示成"输入价格 $2 / 1M tokens、输出价格 $0",
+	// 对客户是错的。与 buildBillingProcess 同一判据,这一行整段不出。
+	if (o.IsTask || o.TaskID != "") && o.ModelPrice != nil && *o.ModelPrice == -1 {
+		return ""
+	}
+	ratioText := groupRatioText(o)
+	if o.ModelPrice != nil && *o.ModelPrice > 0 {
+		return "模型价格 " + fmtPriceUSD(*o.ModelPrice) + " / 次，" + ratioText
+	}
+	if o.ModelRatio == nil {
+		return ""
+	}
+	in := *o.ModelRatio * 2.0
+	parts := []string{
+		"输入价格 " + fmtPriceUSD(in) + " / 1M tokens",
+		"输出价格 " + fmtPriceUSD(in*completionRatioOf(o)) + " / 1M tokens",
+	}
+	if o.Claude {
+		// renderClaudeLogContent:缓存读取价格恒展示(cache_ratio 默认1.0,同样套 in*ratio 公式);
+		// 缓存创建价格按 5m/1h 拆分优先,否则回退未拆分字段——三者最多展示其中的 1 或 2 行。
+		cacheRatio := 1.0
+		if o.CacheRatio != nil {
+			cacheRatio = *o.CacheRatio
+		}
+		parts = append(parts, "缓存读取价格 "+fmtPriceUSD(in*cacheRatio)+" / 1M tokens")
+		hasSplit := o.CacheCreationTokens5m > 0 || o.CacheCreationTokens1h > 0
+		if hasSplit {
+			if o.CacheCreationTokens5m > 0 && o.CacheCreationRatio5m != nil {
+				parts = append(parts, "5m缓存创建价格 "+fmtPriceUSD(in**o.CacheCreationRatio5m)+" / 1M tokens")
+			}
+			if o.CacheCreationTokens1h > 0 && o.CacheCreationRatio1h != nil {
+				parts = append(parts, "1h缓存创建价格 "+fmtPriceUSD(in**o.CacheCreationRatio1h)+" / 1M tokens")
+			}
+		} else if o.CacheCreationRatio != nil {
+			parts = append(parts, "缓存创建价格 "+fmtPriceUSD(in**o.CacheCreationRatio)+" / 1M tokens")
+		}
+	} else {
+		if o.CacheRatio != nil && *o.CacheRatio != 1.0 {
+			parts = append(parts, "缓存读取价格 "+fmtPriceUSD(in**o.CacheRatio)+" / 1M tokens")
+		}
+		if o.Image && o.ImageRatio != nil {
+			parts = append(parts, "图片输入价格 "+fmtPriceUSD(in**o.ImageRatio)+" / 1M tokens")
+		}
+	}
+	parts = append(parts, ratioText)
+	return strings.Join(parts, "，")
+}
+
+// groupRatioText 对齐 getGroupRatioText:"专属倍率 Xx"(user_group_ratio 有效时)或"分组倍率 Xx"。
+func groupRatioText(o *logOther) string {
+	if o.UserGroupRatio != nil && *o.UserGroupRatio > 0 {
+		return "专属倍率 " + trimNum(*o.UserGroupRatio, 6) + "x"
+	}
+	if o.GroupRatio != nil {
+		return "分组倍率 " + trimNum(*o.GroupRatio, 6) + "x"
+	}
+	return "分组倍率 0x"
+}
+
+// completionRatioOf 输出倍率;other.completion_ratio 缺失时按 new-api 默认值 0 处理
+// (线上老日志/未落这个字段的记录,renderLogContent 里 _completionRatio ?? 0 同一兜底)。
+func completionRatioOf(o *logOther) float64 {
+	if o.CompletionRatio != nil {
+		return *o.CompletionRatio
+	}
+	return 0
+}
+
+// buildBillingProcess 对齐 new-api web/classic renderModelPrice/renderClaudeModelPrice/
+// renderTaskBillingProcess(按量计费主路径,即 model_price==-1 时的分支):算出实际扣费的公式文本,如
+// "(输入 1000 tokens / 1M tokens * $2 + 缓存 500 tokens / 1M tokens * $0.2) 输出 200 tokens / 1M
+// tokens * $4) * 分组倍率 1.4 = $0.0034"。只覆盖最常见路径(纯文本/Claude 输入输出+缓存读+可选
+// 5m/1h拆分缓存创建、异步任务日志);音频/图片/web搜索/文件搜索等边缘计费(我们实际数据里几乎不出现)
+// 不做,那些场景仍回退到 buildLogDetail 的摘要行。promptTokens/completionTokens 来自 LogRow(数据库列)。
+func buildBillingProcess(logType int, o *logOther, promptTokens, completionTokens int64, rawContent string) string {
+	if logType != 2 || o == nil || o.BillingMode == "tiered_expr" {
+		return ""
+	}
+	// 对齐 renderTaskBillingProcess:异步任务日志(is_task 或带 task_id)且尚未按实际用量结算
+	// (model_price 恰好等于 -1,即调用方未传具体单价)时——有 task_id 用原始 content(无免责声明行,
+	// content 本身就是任务完成后的真实扣费文案);否则(纯 is_task 标记但无 task_id)用固定预扣费文案。
+	// 已结算(model_price!=-1 或缺省)的任务日志走下面正常的按量/按次计费路径,不特殊处理。
+	if (o.IsTask || o.TaskID != "") && o.ModelPrice != nil && *o.ModelPrice == -1 {
+		if o.TaskID != "" {
+			return rawContent
+		}
+		return "任务预扣费（将在任务完成后按实际token重算）\n仅供参考，以实际扣费为准"
+	}
+	if o.ModelRatio == nil {
+		return ""
+	}
+	if o.ModelPrice != nil && *o.ModelPrice > 0 {
+		return "" // 按次计费:new-api 走另一条更简单的分支,我们暂不复刻(极少见,回退摘要行足够)
+	}
+	groupRatio := 0.0
+	ratioText := groupRatioText(o)
+	if o.UserGroupRatio != nil && *o.UserGroupRatio > 0 {
+		groupRatio = *o.UserGroupRatio
+	} else if o.GroupRatio != nil {
+		groupRatio = *o.GroupRatio
+	}
+	inputRatioPrice := *o.ModelRatio * 2.0
+	completionRatioPrice := inputRatioPrice * completionRatioOf(o)
+	cacheTokens := int64(o.CacheTokens)
+
+	if o.Claude {
+		return buildClaudeBillingProcess(o, promptTokens, completionTokens, inputRatioPrice, completionRatioPrice, groupRatio, ratioText)
+	}
+
+	var inputDesc string
+	if cacheTokens > 0 && o.CacheRatio != nil {
+		cachePrice := inputRatioPrice * *o.CacheRatio
+		inputDesc = fmt.Sprintf("(输入 %d tokens / 1M tokens * %s + 缓存 %d tokens / 1M tokens * %s",
+			promptTokens-cacheTokens, fmtPriceUSD(inputRatioPrice), cacheTokens, fmtPriceUSD(cachePrice))
+	} else {
+		inputDesc = fmt.Sprintf("(输入 %d tokens / 1M tokens * %s", promptTokens, fmtPriceUSD(inputRatioPrice))
+	}
+	outputDesc := fmt.Sprintf("输出 %d tokens / 1M tokens * %s) * %s",
+		completionTokens, fmtPriceUSD(completionRatioPrice), ratioText)
+
+	textInputTokens := promptTokens - cacheTokens
+	if textInputTokens < 0 {
+		textInputTokens = 0
+	}
+	price := float64(textInputTokens)/1e6*inputRatioPrice*groupRatio +
+		float64(completionTokens)/1e6*completionRatioPrice*groupRatio
+	if cacheTokens > 0 && o.CacheRatio != nil {
+		price += float64(cacheTokens) / 1e6 * inputRatioPrice * *o.CacheRatio * groupRatio
+	}
+
+	lines := []string{
+		"输入价格：" + fmtPriceUSD(inputRatioPrice) + " / 1M tokens",
+		"输出价格：" + fmtPriceUSD(completionRatioPrice) + " / 1M tokens",
+	}
+	if cacheTokens > 0 && o.CacheRatio != nil {
+		lines = append(lines, "缓存读取价格："+fmtPriceUSD(inputRatioPrice**o.CacheRatio)+" / 1M tokens")
+	}
+	lines = append(lines, inputDesc+" + "+outputDesc+" = "+fmtPriceUSD(price))
+	lines = append(lines, "仅供参考，以实际扣费为准")
+	return strings.Join(lines, "\n")
+}
+
+// buildClaudeBillingProcess 对齐 renderClaudeModelPrice 的按量计费分支:与标准分支的区别——Claude
+// 语义下 prompt_tokens 已在写入时排除缓存 tokens(见 new-api summary.PromptTokens -= cache*),所以
+// effectiveInputTokens 是【累加】缓存/缓存创建换算后的 tokens,而不是从 prompt 里扣除再折算。
+func buildClaudeBillingProcess(o *logOther, promptTokens, completionTokens int64, inputRatioPrice, completionRatioPrice, groupRatio float64, ratioText string) string {
+	cacheTokens := int64(o.CacheTokens)
+	cacheRatio := 1.0
+	if o.CacheRatio != nil {
+		cacheRatio = *o.CacheRatio
+	}
+	cacheCreationRatio := 1.0
+	if o.CacheCreationRatio != nil {
+		cacheCreationRatio = *o.CacheCreationRatio
+	}
+	cacheCreationTokens5m := int64(o.CacheCreationTokens5m)
+	cacheCreationRatio5m := 1.0
+	if o.CacheCreationRatio5m != nil {
+		cacheCreationRatio5m = *o.CacheCreationRatio5m
+	}
+	cacheCreationTokens1h := int64(o.CacheCreationTokens1h)
+	cacheCreationRatio1h := 1.0
+	if o.CacheCreationRatio1h != nil {
+		cacheCreationRatio1h = *o.CacheCreationRatio1h
+	}
+	hasSplit := cacheCreationTokens5m > 0 || cacheCreationTokens1h > 0
+	legacyCacheCreationTokens := int64(0)
+	if !hasSplit {
+		legacyCacheCreationTokens = int64(o.CacheCreationTokens)
+	}
+
+	effectiveInputTokens := float64(promptTokens) +
+		float64(cacheTokens)*cacheRatio +
+		float64(legacyCacheCreationTokens)*cacheCreationRatio +
+		float64(cacheCreationTokens5m)*cacheCreationRatio5m +
+		float64(cacheCreationTokens1h)*cacheCreationRatio1h
+	price := effectiveInputTokens/1e6*inputRatioPrice*groupRatio + float64(completionTokens)/1e6*completionRatioPrice*groupRatio
+
+	breakdown := []string{fmt.Sprintf("提示 %d tokens / 1M tokens * %s", promptTokens, fmtPriceUSD(inputRatioPrice))}
+	if cacheTokens > 0 {
+		breakdown = append(breakdown, fmt.Sprintf("缓存 %d tokens / 1M tokens * %s", cacheTokens, fmtPriceUSD(inputRatioPrice*cacheRatio)))
+	}
+	if !hasSplit && legacyCacheCreationTokens > 0 {
+		breakdown = append(breakdown, fmt.Sprintf("缓存创建 %d tokens / 1M tokens * %s", legacyCacheCreationTokens, fmtPriceUSD(inputRatioPrice*cacheCreationRatio)))
+	}
+	if hasSplit && cacheCreationTokens5m > 0 {
+		breakdown = append(breakdown, fmt.Sprintf("5m缓存创建 %d tokens / 1M tokens * %s", cacheCreationTokens5m, fmtPriceUSD(inputRatioPrice*cacheCreationRatio5m)))
+	}
+	if hasSplit && cacheCreationTokens1h > 0 {
+		breakdown = append(breakdown, fmt.Sprintf("1h缓存创建 %d tokens / 1M tokens * %s", cacheCreationTokens1h, fmtPriceUSD(inputRatioPrice*cacheCreationRatio1h)))
+	}
+	breakdown = append(breakdown, fmt.Sprintf("补全 %d tokens / 1M tokens * %s", completionTokens, fmtPriceUSD(completionRatioPrice)))
+
+	lines := []string{
+		"输入价格：" + fmtPriceUSD(inputRatioPrice) + " / 1M tokens",
+		"输出价格：" + fmtPriceUSD(completionRatioPrice) + " / 1M tokens",
+	}
+	if cacheTokens > 0 {
+		lines = append(lines, "缓存读取价格："+fmtPriceUSD(inputRatioPrice*cacheRatio)+" / 1M tokens")
+	}
+	if !hasSplit && legacyCacheCreationTokens > 0 {
+		lines = append(lines, "缓存创建价格："+fmtPriceUSD(inputRatioPrice*cacheCreationRatio)+" / 1M tokens")
+	}
+	if hasSplit && cacheCreationTokens5m > 0 {
+		lines = append(lines, "5m缓存创建价格："+fmtPriceUSD(inputRatioPrice*cacheCreationRatio5m)+" / 1M tokens")
+	}
+	if hasSplit && cacheCreationTokens1h > 0 {
+		lines = append(lines, "1h缓存创建价格："+fmtPriceUSD(inputRatioPrice*cacheCreationRatio1h)+" / 1M tokens")
+	}
+	lines = append(lines, strings.Join(breakdown, " + ")+" * "+ratioText+" = "+fmtPriceUSD(price))
+	lines = append(lines, "仅供参考，以实际扣费为准")
+	return strings.Join(lines, "\n")
+}
+
 // buildLogDetail 拼「详情」,逐行对齐 new-api 线上(classic 主题 renderPriceSimpleCore segments 模式):
 // 消费=多行(首行 分组/专属倍率,再 输入价、缓存读、5m/1h/缓存创建、图片输入;【不含输出价】,与线上一致);
-// 退款=固定文案;其余类型及无价格信息的消费=回退到原始 content。行以 \n 分隔,前端首行深色其余灰。
+// 退款=固定文案;错误=原始 content;其余类型及无价格信息的消费=回退到原始 content。行以 \n 分隔,前端首行深色其余灰。
 func buildLogDetail(logType int, o *logOther, content string) string {
 	if logType == 6 {
 		return "异步任务退款"
+	}
+	if logType == 5 {
+		return content // 对齐中转站使用日志：不归类/改写上游错误，保留原始排障信息
 	}
 	if logType != 2 || o == nil {
 		return scrubContent(content) // 充值/管理/系统回退 content:先剔除内部信息(纵深防御)
@@ -759,6 +1048,9 @@ func buildLogDetail(logType int, o *logOther, content string) string {
 // scrubContent 纵深防御:回退展示的 new-api 日志 content 里若含"渠道"字样(如系统日志
 // "查看渠道密钥信息 (渠道ID: N)"),整条隐去——正常客户日志不会有这类内部文案,
 // 唯一来源是误把管理员账号加进客户组;宁可少显也绝不把渠道信息漏给客户。
+//
+// 注意:这是【关键字黑名单】,只用于充值/管理/系统/消费这类由 new-api 自己生成、措辞可控的 content。
+// 错误日志(type=5)按中转站使用日志约定直接展示原始 content，不经过本函数。
 func scrubContent(content string) string {
 	if strings.Contains(content, "渠道") {
 		return ""
@@ -766,17 +1058,86 @@ func scrubContent(content string) string {
 	return content
 }
 
+// populateExpandFields 填充 LogRow 里"行展开区"要用的全部字段,严格对齐 new-api web/classic
+// useUsageLogsData.jsx setLogsFormat 的【非管理员】分支字段列表与出现顺序(管理员专属字段——渠道信息/
+// 拦截原因/流状态/请求转换/计费模式/订单支付方式等——普通客户端本就看不到,此处天然不产出)。
+func populateExpandFields(r *LogRow, o *logOther, content string) {
+	if o == nil {
+		return
+	}
+	r.LogContent = buildLogContent(r.Type, o)
+	if r.Type == 2 && content != "" {
+		r.OtherContent = scrubContent(content) // 与 Detail 回退口径一致,先剔"渠道"内部字样纵深防御
+	}
+	if r.Type == 2 {
+		if o.IsModelMapped && o.UpstreamModelName != "" {
+			r.IsModelMapped = true
+			r.UpstreamModelName = o.UpstreamModelName
+		}
+		r.BillingProcess = buildBillingProcess(r.Type, o, r.PromptTokens, r.CompletionTokens, content)
+		// 已结算的任务日志,计费过程就是 content 原文 → 与"其他详情"完全同一句话,
+		// 展开区连着显示两遍同样的内容。留计费过程(那一栏才是讲钱的),去掉重复的其他详情。
+		if r.BillingProcess == r.OtherContent {
+			r.OtherContent = ""
+		}
+		if o.ReasoningEffort != "" {
+			r.ReasoningEffort = o.ReasoningEffort
+		}
+	}
+	if r.Type == 6 {
+		r.TaskID = o.TaskID
+		// 与中转站一致，退款失败原因也保留原始文本，避免二次解释影响排障。
+		if o.Reason != "" {
+			r.RefundReason = o.Reason
+		}
+	}
+	r.RequestPath = o.RequestPath
+	if len(o.PO) > 0 {
+		r.ParamOverride = o.PO
+	}
+	if o.BillingSource == "subscription" {
+		r.BillingSource = o.BillingSource
+		if o.SubscriptionPlanID != nil && *o.SubscriptionPlanID != 0 {
+			r.SubPlan = strings.TrimSpace(fmt.Sprintf("#%d %s", *o.SubscriptionPlanID, o.SubscriptionPlanTitle))
+		}
+		if o.SubscriptionID != nil && *o.SubscriptionID != 0 {
+			r.SubInstance = fmt.Sprintf("#%d", *o.SubscriptionID)
+		}
+		pre := int64(0)
+		if o.SubscriptionPreConsumed != nil {
+			pre = *o.SubscriptionPreConsumed
+		}
+		postDelta := int64(0)
+		if o.SubscriptionPostDelta != nil {
+			postDelta = *o.SubscriptionPostDelta
+		}
+		finalConsumed := pre + postDelta
+		if o.SubscriptionConsumed != nil {
+			finalConsumed = *o.SubscriptionConsumed
+		}
+		deltaSign := ""
+		if postDelta > 0 {
+			deltaSign = "+"
+		}
+		r.SubSettlement = fmt.Sprintf("预扣：%d 额度\n结算差额：%s%d 额度\n最终抵扣：%d 额度", pre, deltaSign, postDelta, finalConsumed)
+		if o.SubscriptionRemain != nil && o.SubscriptionTotal != nil {
+			r.SubRemain = fmt.Sprintf("%d/%d 额度", *o.SubscriptionRemain, *o.SubscriptionTotal)
+		}
+	}
+}
+
 // logFilterWhere 拼日志筛选的公共 WHERE(不含游标/排序/上限);全部用户可控值参数化,无注入。
 // 查看(queryGroupLogs)与计数(countGroupLogs)共用,保证两者筛选口径完全一致。logType=0 表示全部类型。
-func logFilterWhere(ids []int64, fromTs, toTs, memberUID int64, logType int, model, group, tokenName string) (string, []any) {
+// 类型口径对齐 new-api 官方客户端使用日志(model.GetUserLogs):普通用户可见全部 6 种类型,
+// 含错误(5)/退款(6)——官方不在查询层屏蔽,靠写入时已脱敏的 content(见 buildLogDetail/scrubContent)+
+// 不回传渠道信息兜底,故此处不再排除 5/6。
+func logFilterWhere(ids []int64, fromTs, toTs, memberUID int64, logType int, model, group, tokenName, detailKw, requestID string) (string, []any) {
 	inSQL, inArgs := usageIn("user_id", ids)
 	where := "created_at >= ? AND created_at < ? AND " + inSQL
 	args := append([]any{fromTs, toTs}, inArgs...)
-	if logType > 0 { // 仅看某类型(充值1/消费2/管理3/系统4;错误5/退款6 不对客户展示,由参数层挡)
+	if logType > 0 { // 仅看某类型(1-6 全部开放,同 new-api 官方客户端使用日志)
 		where += " AND type = ?"
 		args = append(args, logType)
-	} else { // 全部:排除错误(5)与退款(6),产品要求不在客户使用日志里展示
-		where += " AND type NOT IN (5,6)"
 	}
 	if memberUID > 0 { // 仅看某成员
 		where += " AND user_id = ?"
@@ -794,6 +1155,22 @@ func logFilterWhere(ids []int64, fromTs, toTs, memberUID int64, logType int, mod
 		where += " AND token_name LIKE ? ESCAPE '!'"
 		args = append(args, "%"+escapeLike(tokenName)+"%")
 	}
+	if requestID != "" { // request_id 精确匹配,同 new-api GetUserLogs;logs.request_id 有独立索引(idx_logs_request_id)
+		where += " AND request_id = ?"
+		args = append(args, requestID)
+	}
+	if detailKw != "" { // 详情关键字模糊搜索:只匹配 DB 原始 content(详情列里由 other 现算的倍率/单价文本不在 content 里,搜不到——可接受,费用列本身已给准确金额)
+		pat := "%" + escapeLike(detailKw) + "%"
+		if strings.Contains(detailKw, "违规费") {
+			// 违规费是 buildLogDetail 用 other.violation_fee_code 现算的展示文案,content 里没有这几个字;
+			// 但 other 原始 JSON 里的英文字段名 violation_fee_code 是唯一暴露"这条被判违规扣款"的标记,
+			// 客户搜"违规费"时额外把它捞出来(不然这类记录在搜索里完全隐形,无法通过其它列定位)。
+			where += " AND (content LIKE ? ESCAPE '!' OR other LIKE '%violation_fee_code%')"
+		} else {
+			where += " AND content LIKE ? ESCAPE '!'"
+		}
+		args = append(args, pat)
+	}
 	return where, args
 }
 
@@ -804,7 +1181,7 @@ func escapeLike(s string) string {
 }
 
 // countGroupLogs 数一组成员在当前筛选下的日志总条数(供前端算总页数)。只在翻页首页调用一次,翻页时前端复用。
-func (m *Monitor) countGroupLogs(ctx context.Context, ids []int64, fromTs, toTs, memberUID int64, logType int, model, group, tokenName string) (int64, error) {
+func (m *Monitor) countGroupLogs(ctx context.Context, ids []int64, fromTs, toTs, memberUID int64, logType int, model, group, tokenName, detailKw, requestID string) (int64, error) {
 	if len(ids) == 0 {
 		return 0, nil
 	}
@@ -812,7 +1189,7 @@ func (m *Monitor) countGroupLogs(ctx context.Context, ids []int64, fromTs, toTs,
 	defer m.usageMu.Unlock()
 	cctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
-	where, args := logFilterWhere(ids, fromTs, toTs, memberUID, logType, model, group, tokenName)
+	where, args := logFilterWhere(ids, fromTs, toTs, memberUID, logType, model, group, tokenName, detailKw, requestID)
 	var n int64
 	if err := m.prodDB.QueryRowContext(cctx, "SELECT COUNT(*) FROM logs WHERE "+where, args...).Scan(&n); err != nil {
 		return 0, fmt.Errorf("日志计数失败: %w", err)
@@ -823,7 +1200,7 @@ func (m *Monitor) countGroupLogs(ctx context.Context, ids []int64, fromTs, toTs,
 // queryGroupLogs 查一组成员的日志,按 id 倒序游标分页;窗口化、走索引、只读、串行(usageMu)。
 // 全部用户可控值参数化;memberUID 需调用方已校验属本组;limit 由调用方控上限(分页 pageSize+1 / 导出 cap,超限判定在导出侧用 COUNT 探测)。
 // 取 content+other 拼「详情」与首字(only 安全字段);花费/首字/详情按 new-api 的可展示/计时类型口径填。
-func (m *Monitor) queryGroupLogs(ctx context.Context, ids []int64, fromTs, toTs, memberUID int64, logType int, model, group, tokenName string, beforeID int64, limit int) ([]LogRow, error) {
+func (m *Monitor) queryGroupLogs(ctx context.Context, ids []int64, fromTs, toTs, memberUID int64, logType int, model, group, tokenName, detailKw, requestID string, beforeID int64, limit int) ([]LogRow, error) {
 	if len(ids) == 0 {
 		return nil, nil
 	}
@@ -832,12 +1209,12 @@ func (m *Monitor) queryGroupLogs(ctx context.Context, ids []int64, fromTs, toTs,
 	cctx, cancel := context.WithTimeout(ctx, 25*time.Second) // 导出可能取到 5 万行,给足超时
 	defer cancel()
 
-	where, args := logFilterWhere(ids, fromTs, toTs, memberUID, logType, model, group, tokenName)
+	where, args := logFilterWhere(ids, fromTs, toTs, memberUID, logType, model, group, tokenName, detailKw, requestID)
 	if beforeID > 0 { // 游标:取比上次末尾更早的(id 近似时间序,倒序翻页,不用深 OFFSET)
 		where += " AND id < ?"
 		args = append(args, beforeID)
 	}
-	q := "SELECT id, created_at, COALESCE(username,''), COALESCE(token_name,''), COALESCE(model_name,''), COALESCE(`group`,''), prompt_tokens, completion_tokens, use_time, quota, type, is_stream, COALESCE(content,''), COALESCE(other,'')" +
+	q := "SELECT id, created_at, COALESCE(username,''), COALESCE(token_name,''), COALESCE(model_name,''), COALESCE(`group`,''), prompt_tokens, completion_tokens, use_time, quota, type, is_stream, COALESCE(content,''), COALESCE(other,''), COALESCE(request_id,'')" +
 		" FROM logs WHERE " + where + " ORDER BY id DESC LIMIT " + strconv.Itoa(limit)
 	rows, err := m.prodDB.QueryContext(cctx, q, args...)
 	if err != nil {
@@ -850,7 +1227,7 @@ func (m *Monitor) queryGroupLogs(ctx context.Context, ids []int64, fromTs, toTs,
 		var quota int64
 		var isStream int
 		var content, other string
-		if err := rows.Scan(&r.ID, &r.CreatedAt, &r.Member, &r.TokenName, &r.ModelName, &r.Group, &r.PromptTokens, &r.CompletionTokens, &r.UseTime, &quota, &r.Type, &isStream, &content, &other); err != nil {
+		if err := rows.Scan(&r.ID, &r.CreatedAt, &r.Member, &r.TokenName, &r.ModelName, &r.Group, &r.PromptTokens, &r.CompletionTokens, &r.UseTime, &quota, &r.Type, &isStream, &content, &other, &r.RequestID); err != nil {
 			return nil, err
 		}
 		r.IsStream = isStream != 0
@@ -863,7 +1240,19 @@ func (m *Monitor) queryGroupLogs(ctx context.Context, ids []int64, fromTs, toTs,
 		if r.IsStream && o != nil && o.FRT > 0 {
 			r.FirstByteMs = int64(o.FRT)
 		}
+		if o != nil {
+			r.CacheReadTokens = int64(o.CacheTokens)
+			// 缓存写:5m/1h 拆分优先(有拆分即用其和),否则回退未拆分的 cache_creation_tokens——
+			// 同 buildLogDetail 的 hasSplit 判断口径,避免写 tokens 展示与计价明细数字不一致
+			cw5m, cw1h := int64(o.CacheCreationTokens5m), int64(o.CacheCreationTokens1h)
+			if cw5m > 0 || cw1h > 0 {
+				r.CacheWriteTokens = cw5m + cw1h
+			} else {
+				r.CacheWriteTokens = int64(o.CacheCreationTokens)
+			}
+		}
 		r.Detail = buildLogDetail(r.Type, o, content)
+		populateExpandFields(&r, o, content)
 		out = append(out, r)
 	}
 	if err := rows.Err(); err != nil {

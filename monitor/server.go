@@ -1,6 +1,7 @@
 package monitor
 
 import (
+	"context"
 	"crypto/subtle"
 	_ "embed"
 	"log/slog"
@@ -34,7 +35,36 @@ var flatpickrJS []byte // 内嵌 flatpickr v4.6.13+zh 语言包(MIT),用量页�
 //go:embed flatpickr.min.css
 var flatpickrCSS []byte // flatpickr 暗色主题
 
+//go:embed range_picker.js
+var rangePickerJS []byte // Semi DatePicker 风格的零依赖日期范围选择器
+
 var allowedWindows = map[int]bool{15: true, 30: true, 60: true, 180: true, 360: true, 720: true, 1440: true}
+
+const maxJSONRequestBody = 4 << 20   // 4 MiB:足以覆盖节点批量上报，同时拒绝异常大请求体
+const maxLoginRequestBody = 64 << 10 // 登录只需要账号密码，64 KiB 已远大于正常请求
+
+// requestBodyLimit 在进入业务处理前限制所有带 body 的请求，避免攻击者用大 JSON
+// 长时间占用内存。MaxBytesReader 同时覆盖没有 Content-Length 的 chunked 请求。
+func requestBodyLimit(maxBytes int64) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if c.Request.ContentLength > maxBytes {
+			c.AbortWithStatusJSON(http.StatusRequestEntityTooLarge, gin.H{"error": "请求体过大"})
+			return
+		}
+		c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxBytes)
+		c.Next()
+	}
+}
+
+// limitBodyForLogin 给登录再收紧一层上限；全局 4MiB 是为了节点批量上报保留的。
+func limitBodyForLogin(c *gin.Context) bool {
+	if c.Request.ContentLength > maxLoginRequestBody {
+		c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "登录请求过大"})
+		return false
+	}
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxLoginRequestBody)
+	return true
+}
 
 func parseWindow(c *gin.Context) int {
 	w, _ := strconv.Atoi(c.DefaultQuery("window", "60"))
@@ -47,6 +77,10 @@ func parseWindow(c *gin.Context) int {
 // RegisterRoutes 把监控的页面与数据接口挂到给定的 gin 引擎上。
 // 鉴权:登录复用 new-api 身份;>=管理员可看监控,仅超级管理员可改配置。
 func (m *Monitor) RegisterRoutes(r *gin.Engine) {
+	r.Use(requestBodyLimit(maxJSONRequestBody))
+	if m.adminLim == nil {
+		m.adminLim = &portalLimiter{m: map[string][]int64{}}
+	}
 	// 公开:登录/登出/健康检查/站点名
 	r.GET("/health", func(c *gin.Context) { c.JSON(http.StatusOK, gin.H{"status": "ok"}) })
 	r.GET("/echarts.js", func(c *gin.Context) { // 公开:内嵌 ECharts,自服务、版本固定可长期缓存
@@ -60,6 +94,10 @@ func (m *Monitor) RegisterRoutes(r *gin.Engine) {
 	r.GET("/flatpickr.css", func(c *gin.Context) {
 		c.Header("Cache-Control", "public, max-age=31536000, immutable")
 		c.Data(http.StatusOK, "text/css; charset=utf-8", flatpickrCSS)
+	})
+	r.GET("/range-picker.js", func(c *gin.Context) {
+		c.Header("Cache-Control", "public, max-age=31536000, immutable")
+		c.Data(http.StatusOK, "application/javascript; charset=utf-8", rangePickerJS)
 	})
 	r.GET("/api/brand", m.brandHandler)                // 公开:站点名,供前端设置页面标题
 	r.POST("/internal/rejections", m.ingestRejections) // 机器对机器:接收采集器推送的前置拒绝(token 鉴权)
@@ -98,6 +136,10 @@ func (m *Monitor) RegisterRoutes(r *gin.Engine) {
 		root.POST("/test", m.testAlertHandler)
 		root.POST("/smtp/sync", m.syncSMTPHandler) // 「使用主站配置」:从 new-api 同步 SMTP
 	}
+
+	// 仅超级管理员:用当前判据重算历史桶(判据变更后一次性执行)。
+	// 做成接口而非启动参数:不必重启、可重跑、可只补一段;放启动流程会每次重启都压一遍生产库。
+	r.POST("/admin/backfill", m.requireRole(roleRoot), m.backfillHandler)
 
 	// 仅超级管理员:用户用量名单增删(看名单/看统计在上面 view 组,管理员即可)
 	rootUsage := r.Group("/usage", m.requireRole(roleRoot))
@@ -198,6 +240,10 @@ func (m *Monitor) serveInfraSeries(c *gin.Context) {
 	resource := strings.TrimSpace(c.Query("resource"))
 	if resource == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "resource required"})
+		return
+	}
+	if m.infraExcluded(resource) {
+		c.JSON(http.StatusNotFound, gin.H{"error": "resource is not monitored"})
 		return
 	}
 	hours := 6
@@ -327,7 +373,28 @@ func (m *Monitor) saveAlertConfigHandler(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
 
+// backfillHandler 触发历史回填。同步执行(约 168 片 × 0.5s ≈ 数分钟),完成后返回统计。
+// 超时上限给足:回填按小时切片、片间有间隔,不能被请求超时半途掐断留下半新半旧的数据。
+func (m *Monitor) backfillHandler(c *gin.Context) {
+	hours, _ := strconv.Atoi(c.Query("hours"))
+	if hours <= 0 {
+		hours = m.cfg.RetentionDays * 24 // 默认补满分钟级留存
+	}
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 30*time.Minute)
+	defer cancel()
+	res, err := m.BackfillHours(ctx, hours)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, res)
+}
+
 func (m *Monitor) testAlertHandler(c *gin.Context) {
+	if m.cfg.AlertsDisabled { // 断路器:本地/测试实例连手动测试邮件也不放行
+		c.JSON(http.StatusForbidden, gin.H{"error": "本实例已通过 MONITOR_ALERTS_DISABLED 关闭全部报警发信"})
+		return
+	}
 	cfg := m.loadAlertConfig()
 	if cfg.SMTPHost == "" || cfg.Recipients == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "请先保存 SMTP 服务器和收件人,再发测试邮件"})

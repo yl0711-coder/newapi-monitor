@@ -52,6 +52,7 @@ type Monitor struct {
 
 	portalCache *ttlCache      // 客户端组级数据缓存(portal.go;RegisterPortalRoutes 时初始化)
 	portalLim   *portalLimiter // 客户端登录限流
+	adminLim    *portalLimiter // 管理端登录限流(按来源 IP)
 	exportLim   *exportLimiter // 客户端日志导出限流(每组织账号 1 次/5min,仅计成功下载)
 }
 
@@ -122,54 +123,66 @@ type Summary struct {
 	SuccessRate   float64 `json:"success_rate"` // 干净成功率(异常、错误都不算)
 	AnomalyRate   float64 `json:"anomaly_rate"`
 	ErrorRate     float64 `json:"error_rate"`
-	QPS           float64 `json:"qps"`
-	AvgLatency    float64 `json:"avg_latency"`
-	MaxLatency    int     `json:"max_latency"`
-	P50           float64 `json:"p50"`
-	P95           float64 `json:"p95"`
-	P99           float64 `json:"p99"`
-	TtftP50       float64 `json:"ttft_p50"` // 首字延迟 p50(秒)
-	TtftP95       float64 `json:"ttft_p95"` // 首字延迟 p95(秒)
-	TokPerSec     float64 `json:"tok_per_sec"`
-	Tokens        int64   `json:"tokens"`
-	CostUSD       float64 `json:"cost_usd"`
-	Err4xx        int64   `json:"err_4xx"`
-	Err5xx        int64   `json:"err_5xx"`
-	ErrTimeout    int64   `json:"err_timeout"`
-	ErrOther      int64   `json:"err_other"`
-	LatHist       []int64 `json:"lat_hist"`  // 总延迟分布:≤1/≤2/≤5/≤10/≤30/≤60/>60 秒
-	TtftHist      []int64 `json:"ttft_hist"` // 首字延迟分布:≤.5/≤1/≤2/≤5/≤10/>10 秒
+	// 交付异常明细(B 类)
+	AnomalyBilled  int64   `json:"anomaly_billed"`
+	AnomalyFree    int64   `json:"anomaly_free"`
+	AnomalyStream  int64   `json:"anomaly_stream"`
+	AnomalyCostUSD float64 `json:"anomaly_cost_usd"`
+	AnomalyAvgWait float64 `json:"anomaly_avg_wait"`
+	QPS            float64 `json:"qps"`
+	AvgLatency     float64 `json:"avg_latency"`
+	MaxLatency     int     `json:"max_latency"`
+	P50            float64 `json:"p50"`
+	P95            float64 `json:"p95"`
+	P99            float64 `json:"p99"`
+	TtftP50        float64 `json:"ttft_p50"` // 首字延迟 p50(秒)
+	TtftP95        float64 `json:"ttft_p95"` // 首字延迟 p95(秒)
+	TokPerSec      float64 `json:"tok_per_sec"`
+	Tokens         int64   `json:"tokens"`
+	CostUSD        float64 `json:"cost_usd"`
+	Err4xx         int64   `json:"err_4xx"`
+	Err5xx         int64   `json:"err_5xx"`
+	ErrTimeout     int64   `json:"err_timeout"`
+	ErrOther       int64   `json:"err_other"`
+	LatHist        []int64 `json:"lat_hist"`  // 总延迟分布:≤1/≤2/≤5/≤10/≤30/≤60/>60 秒
+	TtftHist       []int64 `json:"ttft_hist"` // 首字延迟分布:≤.5/≤1/≤2/≤5/≤10/>10 秒
 }
 
 // Row 是某维度取值(分组 / 渠道 / 模型)在窗口内的指标行,含迷你趋势与健康色标。
 type Row struct {
-	Key          string      `json:"key"`
-	Label        string      `json:"label"`
-	Total        int64       `json:"total"`
-	Success      int64       `json:"success"`
-	Anomaly      int64       `json:"anomaly"`
-	Failed       int64       `json:"failed"`
-	SuccessRate  float64     `json:"success_rate"`
-	AnomalyRate  float64     `json:"anomaly_rate"`
-	ErrorRate    float64     `json:"error_rate"`
-	QPS          float64     `json:"qps"`
-	AvgLatency   float64     `json:"avg_latency"`
-	MaxLatency   int         `json:"max_latency"`
-	P50          float64     `json:"p50"`
-	P95          float64     `json:"p95"`
-	P99          float64     `json:"p99"`
-	TtftP50      float64     `json:"ttft_p50"`
-	TtftP95      float64     `json:"ttft_p95"`
-	TokPerSec    float64     `json:"tok_per_sec"`
-	Tokens       int64       `json:"tokens"`
-	CostUSD      float64     `json:"cost_usd"`
-	Err4xx       int64       `json:"err_4xx"`
-	Err5xx       int64       `json:"err_5xx"`
-	ErrTimeout   int64       `json:"err_timeout"`
-	ErrOther     int64       `json:"err_other"`
-	Health       string      `json:"health"`
-	AnomalyBurst bool        `json:"anomaly_burst"` // 异常成簇(连续/突增),需要关注
-	Spark        []TimePoint `json:"spark"`         // 该维度最近若干分钟桶的成功/异常/失败,供迷你趋势
+	Key         string  `json:"key"`
+	Label       string  `json:"label"`
+	Total       int64   `json:"total"`
+	Success     int64   `json:"success"`
+	Anomaly     int64   `json:"anomaly"`
+	Failed      int64   `json:"failed"`
+	SuccessRate float64 `json:"success_rate"`
+	AnomalyRate float64 `json:"anomaly_rate"`
+	ErrorRate   float64 `json:"error_rate"`
+	// 交付异常明细(B 类):三项互斥、之和 = Anomaly;金额只含 B1(零输出却已扣费)。
+	AnomalyBilled  int64       `json:"anomaly_billed"`
+	AnomalyFree    int64       `json:"anomaly_free"`
+	AnomalyStream  int64       `json:"anomaly_stream"`
+	AnomalyCostUSD float64     `json:"anomaly_cost_usd"`
+	AnomalyAvgWait float64     `json:"anomaly_avg_wait"` // 秒;用户白等多久
+	QPS            float64     `json:"qps"`
+	AvgLatency     float64     `json:"avg_latency"`
+	MaxLatency     int         `json:"max_latency"`
+	P50            float64     `json:"p50"`
+	P95            float64     `json:"p95"`
+	P99            float64     `json:"p99"`
+	TtftP50        float64     `json:"ttft_p50"`
+	TtftP95        float64     `json:"ttft_p95"`
+	TokPerSec      float64     `json:"tok_per_sec"`
+	Tokens         int64       `json:"tokens"`
+	CostUSD        float64     `json:"cost_usd"`
+	Err4xx         int64       `json:"err_4xx"`
+	Err5xx         int64       `json:"err_5xx"`
+	ErrTimeout     int64       `json:"err_timeout"`
+	ErrOther       int64       `json:"err_other"`
+	Health         string      `json:"health"`
+	AnomalyBurst   bool        `json:"anomaly_burst"` // 异常成簇(连续/突增),需要关注
+	Spark          []TimePoint `json:"spark"`         // 该维度最近若干分钟桶的成功/异常/失败,供迷你趋势
 }
 
 // TimePoint 是某分钟桶的成功 / 异常 / 失败计数,用于趋势与迷你图(sparkline)。

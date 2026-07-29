@@ -128,54 +128,28 @@ func TestPortalScopeIsolation(t *testing.T) {
 	}
 }
 
-// 写穿透预热隔离:管理端「全组」矩阵切片灌各组缓存时,A 组缓存只含 A 的成员/格,
-// 绝不混入 B 组任何数据,且内部备注(Note)被剥除。这是所有组数据同时流经的唯一位置,切错即串组。
-func TestPortalWarmFromMatrixIsolation(t *testing.T) {
+// 管理端矩阵刷新不能把只有 Users/Cells 的半成品总览写给客户；否则趋势所需的
+// DailyByModel/ByModel 为空。正确策略是删掉当前范围内相关组的总览缓存，迫使下次读走完整聚合。
+func TestPortalMatrixRefreshInvalidatesPartialOverview(t *testing.T) {
 	m, _, _ := newPortalTestMonitor(t)
 	m.portalCache = newTTLCache()
-	ga := CustomerGroup{Name: "A公司"}
-	gb := CustomerGroup{Name: "B公司"}
-	m.storeDB.Create(&ga)
-	m.storeDB.Create(&gb)
 	tracked := []TrackedUser{
-		{UserID: 101, GroupID: ga.ID},
-		{UserID: 102, GroupID: ga.ID},
-		{UserID: 202, GroupID: gb.ID},
+		{UserID: 101, GroupID: 11},
+		{UserID: 202, GroupID: 22},
 	}
-	mx := &UsageMatrix{
-		From: "2026-07-01", To: "2026-07-02", Days: []string{"2026-07-01"},
-		Users: []UsageMatrixUser{
-			{UserID: 101, Username: "a1", Note: "内部备注-A1", GroupID: ga.ID},
-			{UserID: 102, Username: "a2", Note: "机密", GroupID: ga.ID},
-			{UserID: 202, Username: "b1", Note: "内部备注-B1", GroupID: gb.ID},
-		},
-		Cells: []UsageMatrixCell{
-			{UserID: 101, Date: "2026-07-01", CostUSD: 1},
-			{UserID: 202, Date: "2026-07-01", CostUSD: 9},
-		},
+	const fromTs, toTs = 1751328000, 1751414400
+	for _, gid := range []int64{11, 22} {
+		m.portalCache.Put(portalOverviewKey(gid, fromTs, toTs), &portalOverviewPayload{Cells: []UsageMatrixCell{{UserID: 1}}}, portalCacheTTL)
 	}
-	m.portalWarmFromMatrix(mx, tracked, 1751328000, 1751414400)
-
-	raw, err := m.portalCache.Do(portalOverviewKey(ga.ID, 1751328000, 1751414400), portalCacheTTL,
-		func() (any, error) { t.Fatal("A 组缓存未命中,预热未写入"); return nil, nil })
-	if err != nil {
-		t.Fatal(err)
-	}
-	p := raw.(*portalOverviewPayload)
-	for _, u := range p.Users {
-		if u.UserID == 202 {
-			t.Fatalf("A 组缓存混入了 B 组成员 202")
-		}
-		if u.Note != "" {
-			t.Fatalf("A 组缓存未剥除内部备注: uid=%d note=%q", u.UserID, u.Note)
-		}
-	}
-	if len(p.Users) != 2 {
-		t.Fatalf("A 组应恰好 2 名成员, 实得 %d", len(p.Users))
-	}
-	for _, cell := range p.Cells {
-		if cell.UserID == 202 {
-			t.Fatalf("A 组缓存混入了 B 组消费格 202")
+	m.invalidatePortalOverviews(tracked, fromTs, toTs)
+	for _, gid := range []int64{11, 22} {
+		called := false
+		_, err := m.portalCache.Do(portalOverviewKey(gid, fromTs, toTs), portalCacheTTL, func() (any, error) {
+			called = true
+			return &portalOverviewPayload{DailyByModel: []UsageDailyModel{{Date: "2026-07-01", Model: "m"}}}, nil
+		})
+		if err != nil || !called {
+			t.Fatalf("group %d 应重新构建完整总览: called=%v err=%v", gid, called, err)
 		}
 	}
 }
@@ -280,10 +254,18 @@ func TestCSVSafe(t *testing.T) {
 	}
 }
 
+func TestPortalCSVRecord(t *testing.T) {
+	r := portalCSVRecord(LogRow{CreatedAt: 1751328000, Member: "alice", TokenName: "=formula", Group: "vip", Type: 2, ModelName: "m", CostUSD: 0.12, Detail: "raw upstream detail", RequestID: "req-1"})
+	if len(r) != 12 || r[2] != "'=formula" || r[9] != "0.120000" || r[10] != "raw upstream detail" {
+		t.Fatalf("CSV 行字段不符合预期: %#v", r)
+	}
+}
+
 // 客户日志 API 参数契约:错误(5)/退款(6)不对客户提供,显式请求必须 400(防参数层校验被放宽的回归);
 // 令牌名搜索超长同样 400。查看与导出共用 portalLogParams,两端点都验。
 func TestPortalLogsParamContract(t *testing.T) {
 	m, _, portal := newPortalTestMonitor(t)
+	m.prodDB = newFakeProdDB(t) // type 1-6 全开放后会真的查生产库(不再在参数层短路拒绝),需要一个可查的假库
 	h, _ := hashPassword("password-aaa")
 	g := CustomerGroup{Name: "A公司", PortalEmail: "a@x.com", PortalPwAdmin: h}
 	m.storeDB.Create(&g)
@@ -292,16 +274,21 @@ func TestPortalLogsParamContract(t *testing.T) {
 	if ck == nil {
 		t.Fatal("登录失败")
 	}
-	for _, q := range []string{"type=5", "type=6"} {
-		if w := portalDo(portal, "GET", "/api/logs?"+q, "", ck); w.Code != 400 {
-			t.Fatalf("/api/logs?%s 应 400,得 %d %s", q, w.Code, w.Body.String())
+	// 类型 1-6 全部开放(对齐 new-api 官方客户端使用日志,含错误5/退款6);越界(如7)静默当"全部",两者都不应 400。
+	// /api/logs 不限流,循环测;/api/logs/export 有 1 次/5min 的下载限流,只在循环外单测一次,避免第二次触发 429。
+	for _, q := range []string{"type=5", "type=6", "type=7"} {
+		if w := portalDo(portal, "GET", "/api/logs?"+q, "", ck); w.Code != 200 {
+			t.Fatalf("/api/logs?%s 应 200,得 %d %s", q, w.Code, w.Body.String())
 		}
-		if w := portalDo(portal, "GET", "/api/logs/export?"+q, "", ck); w.Code != 400 {
-			t.Fatalf("/api/logs/export?%s 应 400,得 %d", q, w.Code)
-		}
+	}
+	if w := portalDo(portal, "GET", "/api/logs/export?type=6", "", ck); w.Code != 200 {
+		t.Fatalf("/api/logs/export?type=6 应 200,得 %d %s", w.Code, w.Body.String())
 	}
 	long := strings.Repeat("a", 65)
 	if w := portalDo(portal, "GET", "/api/logs?token="+long, "", ck); w.Code != 400 {
 		t.Fatalf("超长令牌搜索应 400,得 %d", w.Code)
+	}
+	if w := portalDo(portal, "GET", "/api/logs?request_id="+long, "", ck); w.Code != 400 {
+		t.Fatalf("超长 Request ID 搜索应 400,得 %d", w.Code)
 	}
 }

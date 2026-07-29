@@ -45,6 +45,15 @@ type AlertConfig struct {
 	SamplerDownEnabled  bool    `json:"sampler_down_enabled"`
 	CooldownMin         int     `json:"cooldown_min"`
 
+	// 交付异常(B 类)告警:与错误告警【完全分开控制】。
+	// 分开的理由:两者要人做的事不同——错误要立刻止损/联系上游;交付异常是观察类,
+	// 动作是攒证据找上游或人工调权重,不需要 30 分钟就催一次。
+	// 冷却、阈值、邮件开关都独立;栏目见 alertCategory 的 "anomaly"。
+	AnomalyAlertsEnabled bool    `json:"anomaly_alerts_enabled"` // 交付异常邮件总开关(独立于 ModelAlertsEnabled)
+	AnomalyRatePct       float64 `json:"anomaly_rate_pct"`       // 交付异常率阈值(%),0=不启用该规则
+	AnomalyCooldownMin   int     `json:"anomaly_cooldown_min"`   // 交付异常专用冷却(分钟)
+	AnomalyBilledUSD     float64 `json:"anomaly_billed_usd"`     // 单窗口 B1 已扣费超此金额即报(钱不等成簇),0=不启用
+
 	// SLO / 错误预算 / 燃烧告警(SLI = 非错误率,全部可配)
 	SLOEnabled        bool    `json:"slo_enabled"`
 	SLOTargetPct      float64 `json:"slo_target_pct"`  // 目标成功率,如 99
@@ -77,18 +86,25 @@ func defaultAlertConfig() AlertConfig {
 		ErrMinCount:         5,
 		ErrBurstCount:       10,
 		AnomalyBurstBuckets: 3,
-		AnomalyMinCount:     8,
-		SamplerDownEnabled:  true,
-		CooldownMin:         30,
-		SLOEnabled:          false, // 配好目标后再开
-		SLOTargetPct:        99,
-		SLOWindowDays:       7,
-		BurnFastEnabled:     true,
-		BurnFastRate:        14,
-		BurnFastWindowMin:   60,
-		BurnSlowEnabled:     true,
-		BurnSlowRate:        3,
-		BurnSlowWindowMin:   360,
+		// 阈值按真实数据标定:7 天内按 15 分钟窗口(渠道×模型)切,有交付异常的窗口 130 个,
+		// 其中 ≥5 条的仅 21 个(约每天 3 次)。故 8% / ≥5 条不会造成告警洪水。
+		// 旧默认 AnomalyMinCount=8 是按旧口径(含 219 条误报)定的,新口径下改 5。
+		AnomalyMinCount:      5,
+		SamplerDownEnabled:   true,
+		CooldownMin:          30,
+		AnomalyAlertsEnabled: true,
+		AnomalyRatePct:       8,
+		AnomalyCooldownMin:   60, // 观察类,不需要和错误一样 30 分钟就催
+		AnomalyBilledUSD:     5,
+		SLOEnabled:           false, // 配好目标后再开
+		SLOTargetPct:         99,
+		SLOWindowDays:        7,
+		BurnFastEnabled:      true,
+		BurnFastRate:         14,
+		BurnFastWindowMin:    60,
+		BurnSlowEnabled:      true,
+		BurnSlowRate:         3,
+		BurnSlowWindowMin:    360,
 	}
 }
 
@@ -96,7 +112,7 @@ func defaultAlertConfig() AlertConfig {
 type AlertLog struct {
 	ID     int64  `gorm:"primaryKey"`
 	Ts     int64  `gorm:"index"`
-	Kind   string // error_rate / error_burst / anomaly_burst / sampler_down
+	Kind   string // error_rate / error_burst / anomaly_rate / anomaly_billed / anomaly_burst / sampler_down / infra_* / burn_*
 	Target string // 渠道/模型标识;sampler_down 为空
 	Detail string
 }
@@ -197,6 +213,9 @@ func htmlWrap(subject, body string) string {
 
 // evaluateAlerts 每个采样周期调用:按配置评估规则,命中且过冷却则发邮件。
 func (m *Monitor) evaluateAlerts(nowUnix int64) {
+	if m.cfg.AlertsDisabled { // 断路器:本地/测试实例一封都不发,不依赖库里的配置
+		return
+	}
 	c := m.loadAlertConfig()
 	if !c.Enabled || c.SMTPHost == "" || c.Recipients == "" {
 		return
@@ -231,33 +250,89 @@ func (m *Monitor) evaluateAlerts(nowUnix int64) {
 				alertBody(r, c, fmt.Sprintf("近%d分钟错误率 %.1f%%(阈值 %.0f%%)、错误 %d/%d", c.EvalWindowMin, r.ErrorRate, c.ErrRatePct, r.Failed, r.Total)), nowUnix)
 			continue
 		}
-		// 异常成簇
-		if anomalyBurst(r.Spark, c.AnomalyBurstBuckets) && r.Anomaly >= int64(c.AnomalyMinCount) {
-			m.fire(c, "anomaly_burst", r.Label,
-				fmt.Sprintf("异常成簇:%s", r.Label),
-				alertBody(r, c, fmt.Sprintf("近%d分钟客户端断开成簇 %d 次(连续≥%d桶),多为上游变慢导致放弃", c.EvalWindowMin, r.Anomaly, c.AnomalyBurstBuckets)), nowUnix)
+		// ---- 交付异常(B 类)走 anomaly 栏目:独立开关 + 独立冷却 ----
+		// 选规则与发信分开:anomalyRuleFor 只返回一个 kind,所以"一行最多一封"
+		// 是结构保证,不再依赖每条规则后面记得写 continue。
+		switch kind := anomalyRuleFor(c, r); kind {
+		case "anomaly_billed":
+			// B1:上游收了钱没给东西。钱的事不等成簇、不看占比。
+			m.fire(c, kind, r.Label,
+				fmt.Sprintf("交付异常·已扣费:%s", r.Label),
+				alertBody(r, c, fmt.Sprintf("近%d分钟有 %d 次请求已扣费但零输出,合计 $%.2f(阈值 $%.2f);用户平均白等 %.0f 秒",
+					c.EvalWindowMin, r.AnomalyBilled, r.AnomalyCostUSD, c.AnomalyBilledUSD, r.AnomalyAvgWait)), nowUnix)
+		case "anomaly_rate":
+			// 持续性的交付质量下降,供人工判断降权。
+			m.fire(c, kind, r.Label,
+				fmt.Sprintf("交付异常率告警:%s", r.Label),
+				alertBody(r, c, fmt.Sprintf("近%d分钟交付异常率 %.1f%%(阈值 %.0f%%)、%d/%d 次用户没拿到内容;其中已扣费 %d 次、未扣费 %d 次,平均白等 %.0f 秒",
+					c.EvalWindowMin, r.AnomalyRate, c.AnomalyRatePct, r.Anomaly, r.Total,
+					r.AnomalyBilled, r.AnomalyFree, r.AnomalyAvgWait)), nowUnix)
+		case "anomaly_burst":
+			// 量不大但连续多桶出现,形态上是持续故障而非抖动。
+			m.fire(c, kind, r.Label,
+				fmt.Sprintf("交付异常成簇:%s", r.Label),
+				alertBody(r, c, fmt.Sprintf("近%d分钟交付异常成簇 %d 次(连续≥%d桶),用户平均白等 %.0f 秒,多为上游静默断流",
+					c.EvalWindowMin, r.Anomaly, c.AnomalyBurstBuckets, r.AnomalyAvgWait)), nowUnix)
 		}
 	}
 }
 
-// alertCategory 按 kind 归两栏目:infra_*=服务端,其余(error_*/anomaly_*/sampler_down/burn_*)=模型。
-func alertCategory(kind string) string {
-	if strings.HasPrefix(kind, "infra_") {
-		return "server"
+// anomalyRuleFor 返回该行应触发的交付异常规则(""=不触发)。
+// 优先级即返回顺序:钱 > 占比 > 成簇。
+//   - 钱(B1 已扣费)不看占比也不等成簇:扣了钱没交付,一次就该知道。
+//   - 占比与成簇都要过 AnomalyMinCount,避免小样本抖动刷屏。
+func anomalyRuleFor(c AlertConfig, r Row) string {
+	if c.AnomalyBilledUSD > 0 && r.AnomalyCostUSD >= c.AnomalyBilledUSD {
+		return "anomaly_billed"
 	}
-	return "model"
+	if r.Anomaly < int64(c.AnomalyMinCount) {
+		return ""
+	}
+	if c.AnomalyRatePct > 0 && r.AnomalyRate >= c.AnomalyRatePct {
+		return "anomaly_rate"
+	}
+	if anomalyBurst(r.Spark, c.AnomalyBurstBuckets) {
+		return "anomaly_burst"
+	}
+	return ""
+}
+
+// alertCategory 按 kind 归三栏目:infra_*=服务端,anomaly_*=交付异常,其余=模型(错误/采样器/燃烧)。
+// 交付异常单列一栏是刻意的:它必须能和错误告警分开开关、分开冷却。
+// 若并回 "model",就会被 ModelAlertsEnabled 一起管——那正是改造前的问题。
+func alertCategory(kind string) string {
+	switch {
+	case strings.HasPrefix(kind, "infra_"):
+		return "server"
+	case strings.HasPrefix(kind, "anomaly_"):
+		return "anomaly"
+	default:
+		return "model"
+	}
 }
 
 // categoryEmailEnabled 该 kind 所属栏目的邮件开关是否打开。
 func categoryEmailEnabled(c AlertConfig, kind string) bool {
-	if alertCategory(kind) == "server" {
+	switch alertCategory(kind) {
+	case "server":
 		return c.ServerAlertsEnabled
+	case "anomaly":
+		return c.AnomalyAlertsEnabled
+	default:
+		return c.ModelAlertsEnabled
 	}
-	return c.ModelAlertsEnabled
+}
+
+// categoryCooldownMin 该 kind 用的冷却分钟数:交付异常有独立冷却,其余用通用值。
+func categoryCooldownMin(c AlertConfig, kind string) int {
+	if alertCategory(kind) == "anomaly" && c.AnomalyCooldownMin > 0 {
+		return c.AnomalyCooldownMin
+	}
+	return c.CooldownMin
 }
 
 func (m *Monitor) fire(c AlertConfig, kind, target, subject, body string, now int64) {
-	if m.inCooldown(kind, target, c.CooldownMin, now) {
+	if m.inCooldown(kind, target, categoryCooldownMin(c, kind), now) {
 		return
 	}
 	if !categoryEmailEnabled(c, kind) { // 栏目邮件开关关:不发邮件,仍记入「最近告警」供页面查看
