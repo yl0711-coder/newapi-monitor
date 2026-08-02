@@ -321,6 +321,22 @@ func (m *Monitor) RegisterPortalRoutes(r *gin.Engine) {
 		c.Header("Cache-Control", "public, max-age=31536000, immutable")
 		c.Data(http.StatusOK, "application/javascript; charset=utf-8", rangePickerJS)
 	})
+	r.GET("/react.js", func(c *gin.Context) {
+		c.Header("Cache-Control", "public, max-age=31536000, immutable")
+		c.Data(http.StatusOK, "application/javascript; charset=utf-8", reactJS)
+	})
+	r.GET("/react-dom.js", func(c *gin.Context) {
+		c.Header("Cache-Control", "public, max-age=31536000, immutable")
+		c.Data(http.StatusOK, "application/javascript; charset=utf-8", reactDOMJS)
+	})
+	r.GET("/semi-ui.js", func(c *gin.Context) {
+		c.Header("Cache-Control", "public, max-age=31536000, immutable")
+		c.Data(http.StatusOK, "application/javascript; charset=utf-8", semiUIJS)
+	})
+	r.GET("/semi-ui.css", func(c *gin.Context) {
+		c.Header("Cache-Control", "public, max-age=31536000, immutable")
+		c.Data(http.StatusOK, "text/css; charset=utf-8", semiUICSS)
+	})
 	r.GET("/login", func(c *gin.Context) {
 		c.Header("Content-Type", "text/html; charset=utf-8")
 		c.String(http.StatusOK, portalLoginHTML)

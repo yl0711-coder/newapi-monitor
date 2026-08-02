@@ -15,8 +15,12 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
 </script>
 <script src="/echarts.js"></script>
 <script src="/flatpickr.js"></script>
-<script src="/range-picker.js?v=4"></script>
 <link rel="stylesheet" href="/flatpickr.css">
+<link rel="stylesheet" href="/semi-ui.css?v=2.72.2">
+<script src="/react.js?v=18.2.0"></script>
+<script src="/react-dom.js?v=18.2.0"></script>
+<script src="/semi-ui.js?v=2.72.2"></script>
+<script src="/range-picker.js?v=8"></script>
 <style>
   *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
   :root{--bg:#0f1117;--surface:#1a1d27;--border:#2a2d3e;--accent:#6366f1;--text:#e2e8f0;--text-muted:#94a3b8;
@@ -69,6 +73,8 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
   .fu-silent-row .sn{color:var(--text)}
   .mxwrap thead th{border-bottom:1px solid var(--border)}
   .toolbar .srp-wrap{min-width:430px}
+  .srp-wrap>.semi-datepicker{width:100%}
+  .semi-input-wrapper,.semi-datepicker-range-input{border-radius:10px!important}
   .uinput{background:var(--bg);border:1px solid var(--border);border-radius:8px;color:var(--text);padding:7px 12px;font-size:13px}
   #usageSearch{background:var(--bg);border:1px solid var(--border);border-radius:8px;color:var(--text);padding:7px 12px;font-size:13px;width:230px}
   /* 全局总账:页顶一行小统计(累计总消耗合计打头) */
@@ -236,7 +242,7 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
   .tabpane[hidden]{display:none}
 </style>
 </head>
-<body>
+<body theme-mode="dark">
 <h1>📈 <span data-brand>new-api</span> 上游监控 <small>分组 / 渠道 / 模型 · 稳定性 · 响应耗时</small></h1>
 
 <div class="tabs">
@@ -1173,17 +1179,19 @@ let usageFp=null; // Semi DatePicker 同款双月范围选择器;数据按天聚
 // CST"今天"的 Y-m-d 串(不能用浏览器时区的 today,否则跨时区用户会偏一天)
 const cstDayStr=off=>{const d=new Date(Date.now()+8*3600*1000-(off||0)*86400000);return d.getUTCFullYear()+'-'+String(d.getUTCMonth()+1).padStart(2,'0')+'-'+String(d.getUTCDate()).padStart(2,'0')};
 const addDaysStr=(ymd,n)=>{const[x,y,z]=ymd.split('-').map(Number);const d=new Date(Date.UTC(x,y-1,z+n));return d.getUTCFullYear()+'-'+String(d.getUTCMonth()+1).padStart(2,'0')+'-'+String(d.getUTCDate()).padStart(2,'0')};
-const usageDate=s=>{const [y,m,d]=s.split('-').map(Number);return new Date(y,m-1,d)};
+const usageDate=(s,isEnd)=>{const [y,m,d]=s.split('-').map(Number);return new Date(y,m-1,d,isEnd?23:0,isEnd?59:0,isEnd?59:0)};
 function usageWeekStart(){const d=usageDate(cstDayStr(0));d.setDate(d.getDate()-d.getDay());return d}
+function usageWeekEnd(){const d=usageWeekStart();d.setDate(d.getDate()+6);d.setHours(23,59,59,0);return d}
 function usageMonthStart(){const d=usageDate(cstDayStr(0));return new Date(d.getFullYear(),d.getMonth(),1)}
+function usageMonthEnd(){const d=usageDate(cstDayStr(0));return new Date(d.getFullYear(),d.getMonth()+1,0,23,59,59)}
 const usagePresets=[
-  {key:'today',text:'今天',start:()=>usageDate(cstDayStr(0)),end:()=>usageDate(cstDayStr(0))},
-  {key:'7d',text:'近 7 天',start:()=>usageDate(cstDayStr(6)),end:()=>usageDate(cstDayStr(0))},
-  {key:'week',text:'本周',start:usageWeekStart,end:()=>usageDate(cstDayStr(0))},
-  {key:'30d',text:'近 30 天',start:()=>usageDate(cstDayStr(29)),end:()=>usageDate(cstDayStr(0))},
-  {key:'month',text:'本月',start:usageMonthStart,end:()=>usageDate(cstDayStr(0))},
-  {key:'halfyear',text:'近半年',start:()=>usageDate(cstDayStr(179)),end:()=>usageDate(cstDayStr(0))},
-  {key:'year',text:'近一年',start:()=>usageDate(cstDayStr(364)),end:()=>usageDate(cstDayStr(0))}
+  {key:'today',text:'今天',start:()=>usageDate(cstDayStr(0)),end:()=>usageDate(cstDayStr(0),true)},
+  {key:'7d',text:'近 7 天',start:()=>usageDate(cstDayStr(6)),end:()=>usageDate(cstDayStr(0),true)},
+  {key:'week',text:'本周',start:usageWeekStart,end:usageWeekEnd},
+  {key:'30d',text:'近 30 天',start:()=>usageDate(cstDayStr(29)),end:()=>usageDate(cstDayStr(0),true)},
+  {key:'month',text:'本月',start:usageMonthStart,end:usageMonthEnd},
+  {key:'halfyear',text:'近半年',start:()=>usageDate(cstDayStr(179)),end:()=>usageDate(cstDayStr(0),true)},
+  {key:'year',text:'近一年',start:()=>usageDate(cstDayStr(364)),end:()=>usageDate(cstDayStr(0),true)}
 ];
 function usageApplyPreset(){ // 预设写进范围选择器
   const p=usagePresets.find(x=>x.key===usageRange)||usagePresets[1];
@@ -1218,7 +1226,7 @@ async function usageInit(){
   const inp=document.getElementById('usrInput');
   inp&&inp.addEventListener('keydown',e=>{if(e.key==='Enter')usageAddUser()});
   usageFp=new SemiRangePicker(document.getElementById('usageRangeInput'),{
-    maxDate:cstDayStr(0),maxDays:366,presets:usagePresets,
+    maxDays:366,presets:usagePresets,showClear:true,theme:'dark',
     onChange:(_sel,meta)=>{usageRange=meta.preset||'custom';usageRefresh();},
     onClear:()=>{usageRange='custom';}
   });
@@ -1608,7 +1616,8 @@ async function usageDelUser(id){
 function usageRangeParams(){
   const q=new URLSearchParams();
   const sel=usageFp?usageFp.selectedDates():[];
-  const f=d=>d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');
+  // 后端支持 YYYY-MM-DD HH:MM:SS；此前这里丢弃控件里的时分秒，导致“日期时间范围”实际只能按整天查询。
+  const f=d=>d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0')+' '+String(d.getHours()).padStart(2,'0')+':'+String(d.getMinutes()).padStart(2,'0')+':'+String(d.getSeconds()).padStart(2,'0');
   if(sel.length===2){q.set('from',f(sel[0]));q.set('to',f(sel[1]))}
   else if(sel.length===1){q.set('from',f(sel[0]));q.set('to',f(sel[0]))}
   return q;

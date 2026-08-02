@@ -6,8 +6,12 @@
 <title>用量报表</title>
 <script src="/echarts.js"></script>
 <script src="/flatpickr.js"></script>
-<script src="/range-picker.js?v=4"></script>
 <link rel="stylesheet" href="/flatpickr.css">
+<link rel="stylesheet" href="/semi-ui.css?v=2.72.2">
+<script src="/react.js?v=18.2.0"></script>
+<script src="/react-dom.js?v=18.2.0"></script>
+<script src="/semi-ui.js?v=2.72.2"></script>
+<script src="/range-picker.js?v=8"></script>
 <style>
   :root{
     --bg:#e6e9f0;          /* 页面浅灰(压深,减对比) */
@@ -39,9 +43,10 @@
   .rangenote{color:var(--muted);font-size:12px;margin:10px 0 16px}
   .dateinput{background:#fdfdff;border:1px solid var(--border);border-radius:8px;color:var(--text);padding:7px 9px;font-size:13px;font-family:inherit}
   .dateinput:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px rgba(79,70,229,.12)}
-  /* 总览工具条日期范围:与管理端同一 flatpickr 控件;内嵌 CSS 是暗色主题,此处整体覆盖成客户端浅色 */
-  /* 页面当前以约 200% 缩放显示；300 CSS px 对应截图中约 600px 的目标宽度。 */
-  #ovBar .srp-wrap,#logsBar .srp-wrap{width:300px;min-width:0;flex:0 0 300px}
+  /* 总览与日志共用 NewAPI 同款 Semi DatePicker；与 Monitor 保持相同宽度。 */
+  #ovBar .srp-wrap,#logsBar .srp-wrap{width:430px;min-width:0;flex:0 0 430px}
+  .srp-wrap>.semi-datepicker{width:100%}
+  .semi-input-wrapper,.semi-datepicker-range-input{border-radius:10px!important}
   @media(max-width:600px){#ovBar .srp-wrap,#logsBar .srp-wrap{width:100%;flex-basis:100%}}
   .flatpickr-calendar{background:#fff;border:1px solid var(--border);box-shadow:0 8px 24px rgba(30,40,70,.16)}
   .flatpickr-calendar.arrowTop:before{border-bottom-color:var(--border)}
@@ -417,8 +422,8 @@ function rangeDates(r){ // 以本地日期为准(东八区客户),与服务端 C
   if(r==='recent25h')return recent25hRange();
   const d=new Date(),p=n=>String(n).padStart(2,'0');
   const ymd=t=>t.getFullYear()+'-'+p(t.getMonth()+1)+'-'+p(t.getDate());
-  if(r==='week'){const from=new Date(d);from.setDate(d.getDate()-d.getDay());return {from:ymd(from),to:ymd(d)};}
-  if(r==='month'){const from=new Date(d.getFullYear(),d.getMonth(),1);return {from:ymd(from),to:ymd(d)};}
+  if(r==='week'){const from=new Date(d);from.setDate(d.getDate()-d.getDay());const to=new Date(from);to.setDate(from.getDate()+6);return {from:ymd(from),to:ymd(to)};}
+  if(r==='month'){const from=new Date(d.getFullYear(),d.getMonth(),1),to=new Date(d.getFullYear(),d.getMonth()+1,0);return {from:ymd(from),to:ymd(to)};}
   const days={today:0,'7d':6,'15d':14,'30d':29,'90d':89,halfyear:179,year:364}[r]??6;
   const from=new Date(d);from.setDate(d.getDate()-days);
   return {from:ymd(from),to:ymd(d)};
@@ -789,13 +794,15 @@ $('mxPager').addEventListener('click',e=>{
 const ymd=d=>d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');
 const day=(s,isEnd)=>{const m=String(s).match(/^(\d{4})-(\d{2})-(\d{2})(?:[ T](\d{2}):(\d{2})(?::(\d{2}))?)?$/);if(!m)return null;return new Date(+m[1],+m[2]-1,+m[3],m[4]==null?(isEnd?23:0):+m[4],m[5]==null?(isEnd?59:0):+m[5],m[6]==null?(isEnd?59:0):+m[6])};
 function weekStart(){const d=day(rangeDates('today').to);d.setDate(d.getDate()-d.getDay());return d}
+function weekEnd(){const d=weekStart();d.setDate(d.getDate()+6);d.setHours(23,59,59,0);return d}
 function monthStart(){const d=day(rangeDates('today').to);return new Date(d.getFullYear(),d.getMonth(),1)}
+function monthEnd(){const d=day(rangeDates('today').to);return new Date(d.getFullYear(),d.getMonth()+1,0,23,59,59)}
 const portalPresets=[
   {key:'today',text:'今天',start:()=>day(rangeDates('today').to),end:()=>day(rangeDates('today').to,true)},
   {key:'7d',text:'近 7 天',start:()=>day(rangeDates('7d').from),end:()=>day(rangeDates('7d').to,true)},
-  {key:'week',text:'本周',start:weekStart,end:()=>day(rangeDates('today').to,true)},
+  {key:'week',text:'本周',start:weekStart,end:weekEnd},
   {key:'30d',text:'近 30 天',start:()=>day(rangeDates('30d').from),end:()=>day(rangeDates('30d').to,true)},
-  {key:'month',text:'本月',start:monthStart,end:()=>day(rangeDates('today').to,true)},
+  {key:'month',text:'本月',start:monthStart,end:monthEnd},
   {key:'halfyear',text:'近半年',start:()=>day(rangeDates('halfyear').from),end:()=>day(rangeDates('halfyear').to,true)},
   {key:'year',text:'近一年',start:()=>day(rangeDates('year').from),end:()=>day(rangeDates('year').to,true)}
 ];
@@ -809,7 +816,7 @@ function applyPortalRange(sel,meta){
   $('ovErr').textContent='';syncOvBar();load();
 }
 const portalPickerOptions={
-  maxDate:rangeDates('today').to,maxDays:366,presets:portalPresets,
+  maxDays:366,presets:portalPresets,showClear:true,
   onChange:applyPortalRange,onClear:()=>{$('ovErr').textContent='';}
 };
 ovPicker=new SemiRangePicker($('ovRange'),portalPickerOptions);

@@ -30,13 +30,25 @@ var loginHTML string
 var echartsJS []byte // 内嵌 ECharts(Apache 2.0),自服务、不走 CDN,保持自包含
 
 //go:embed flatpickr.min.js
-var flatpickrJS []byte // 内嵌 flatpickr v4.6.13+zh 语言包(MIT),用量页日期范围选择器
+var flatpickrJS []byte // 内嵌 flatpickr v4.6.13+zh 语言包(MIT),保留旧静态资源兼容
 
 //go:embed flatpickr.min.css
-var flatpickrCSS []byte // flatpickr 暗色主题
+var flatpickrCSS []byte // flatpickr 旧主题兼容资源
 
 //go:embed range_picker.js
-var rangePickerJS []byte // Semi DatePicker 风格的零依赖日期范围选择器
+var rangePickerJS []byte // 把真实 Semi DatePicker 挂到零构建页面的轻量适配层
+
+//go:embed react.production.min.js
+var reactJS []byte // React 18.2.0（MIT），Semi UI 运行时依赖
+
+//go:embed react-dom.production.min.js
+var reactDOMJS []byte // ReactDOM 18.2.0（MIT），Semi UI 运行时依赖
+
+//go:embed semi-ui.min.js
+var semiUIJS []byte // Semi UI 2.72.2（MIT），与 NewAPI 日期控件相同的组件实现
+
+//go:embed semi-ui.min.css
+var semiUICSS []byte // Semi UI 2.72.2 原始组件样式
 
 var allowedWindows = map[int]bool{15: true, 30: true, 60: true, 180: true, 360: true, 720: true, 1440: true}
 
@@ -98,6 +110,22 @@ func (m *Monitor) RegisterRoutes(r *gin.Engine) {
 	r.GET("/range-picker.js", func(c *gin.Context) {
 		c.Header("Cache-Control", "public, max-age=31536000, immutable")
 		c.Data(http.StatusOK, "application/javascript; charset=utf-8", rangePickerJS)
+	})
+	r.GET("/react.js", func(c *gin.Context) {
+		c.Header("Cache-Control", "public, max-age=31536000, immutable")
+		c.Data(http.StatusOK, "application/javascript; charset=utf-8", reactJS)
+	})
+	r.GET("/react-dom.js", func(c *gin.Context) {
+		c.Header("Cache-Control", "public, max-age=31536000, immutable")
+		c.Data(http.StatusOK, "application/javascript; charset=utf-8", reactDOMJS)
+	})
+	r.GET("/semi-ui.js", func(c *gin.Context) {
+		c.Header("Cache-Control", "public, max-age=31536000, immutable")
+		c.Data(http.StatusOK, "application/javascript; charset=utf-8", semiUIJS)
+	})
+	r.GET("/semi-ui.css", func(c *gin.Context) {
+		c.Header("Cache-Control", "public, max-age=31536000, immutable")
+		c.Data(http.StatusOK, "text/css; charset=utf-8", semiUICSS)
 	})
 	r.GET("/api/brand", m.brandHandler)                // 公开:站点名,供前端设置页面标题
 	r.POST("/internal/rejections", m.ingestRejections) // 机器对机器:接收采集器推送的前置拒绝(token 鉴权)
