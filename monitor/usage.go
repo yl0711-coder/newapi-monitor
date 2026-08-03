@@ -588,32 +588,29 @@ func quotaUSDPtr(quota *int64) *float64 {
 	return &v
 }
 
-// userBalanceQuota 取单个用户的主站当前余额(users.quota);查不到/出错返回 nil(前端显示 —)。
-func (m *Monitor) userBalanceQuota(ctx context.Context, id int64) *int64 {
+// userLiveUsage 用一次 users 主键查询取回单用户的展示名、当前余额和累计总消耗。
+// 用户不存在/查询失败时保留既有降级语义：owner=#ID，两项金额为 nil(前端显示 —)。
+func (m *Monitor) userLiveUsage(ctx context.Context, id int64) (owner string, balance, used *int64) {
+	owner = fmt.Sprintf("#%d", id)
 	cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	var quota int64
-	if err := m.prodDB.QueryRowContext(cctx, "SELECT COALESCE(quota,0) FROM users WHERE id = ?", id).Scan(&quota); err != nil {
+	var username, email string
+	var balanceQ, usedQ int64
+	err := m.prodDB.QueryRowContext(cctx,
+		"SELECT COALESCE(username,''), COALESCE(email,''), COALESCE(quota,0), COALESCE(used_quota,0) FROM users WHERE id = ?", id,
+	).Scan(&username, &email, &balanceQ, &usedQ)
+	if err != nil {
 		if !errors.Is(err, context.Canceled) {
-			slog.Warn("查询用户余额失败", "err", err, "user_id", id)
+			slog.Warn("查询用户实时资料失败", "err", err, "user_id", id)
 		}
-		return nil
+		return owner, nil, nil
 	}
-	return &quota
-}
-
-// userUsedQuota 取单个用户的主站累计总消耗(users.used_quota;终身值);查不到/出错返回 nil。
-func (m *Monitor) userUsedQuota(ctx context.Context, id int64) *int64 {
-	cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-	var used int64
-	if err := m.prodDB.QueryRowContext(cctx, "SELECT COALESCE(used_quota,0) FROM users WHERE id = ?", id).Scan(&used); err != nil {
-		if !errors.Is(err, context.Canceled) {
-			slog.Warn("查询用户累计消耗失败", "err", err, "user_id", id)
-		}
-		return nil
+	if username != "" {
+		owner = username
+	} else if email != "" {
+		owner = email
 	}
-	return &used
+	return owner, &balanceQ, &usedQ
 }
 
 // TokenUsage 单个令牌在时间范围内的用量。MaskedKey 永远是脱敏串,服务端绝不返回明文 key。
@@ -681,7 +678,7 @@ func (m *Monitor) computeUserTokenUsage(ctx context.Context, uid, fromTs, toTs i
 	if err != nil {
 		return nil, err
 	}
-	return m.hydrateUserTokenUsage(ctx, uid, aggregates)
+	return m.hydrateUserTokenUsage(ctx, uid, aggregates, nil)
 }
 
 // computeUserTokenAggregates 只扫时间窗内 logs，结果不含 users/tokens 表的当前资料。
@@ -724,10 +721,19 @@ func (m *Monitor) computeUserTokenAggregates(ctx context.Context, uid, fromTs, t
 
 // hydrateUserTokenUsage 用当前 users/tokens 主键数据补齐令牌列表。这些查询不扫 logs，
 // 因此可在每次响应时执行，既保持实时性又不给日志库增加聚合压力。
-func (m *Monitor) hydrateUserTokenUsage(ctx context.Context, uid int64, aggregates []tokenUsageAggregate) ([]TokenUsage, error) {
+// 响应层已同时取回 users 资料时传入 ownerOverride，避免重复查询 users；
+// 传 nil 时保持 computeUserTokenUsage 等独立调用的原有行为。
+func (m *Monitor) hydrateUserTokenUsage(ctx context.Context, uid int64, aggregates []tokenUsageAggregate, ownerOverride *string) ([]TokenUsage, error) {
 	cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	owner := m.usageOwnerLabel(cctx, uid)
+	owner := fmt.Sprintf("#%d", uid)
+	if ownerOverride != nil {
+		if *ownerOverride != "" {
+			owner = *ownerOverride
+		}
+	} else {
+		owner = m.usageOwnerLabel(cctx, uid)
+	}
 	byTok := make(map[int64]tokenUsageAggregate, len(aggregates))
 	ids := make([]int64, 0, len(aggregates))
 	for _, a := range aggregates {
@@ -1567,8 +1573,7 @@ func (m *Monitor) serveUsageStats(c *gin.Context) {
 	}
 	resp := gin.H{"enabled": true, "stats": st}
 	if isGroup { // 公司详情:成员数 + 余额合计 + 累计总消耗合计(主键 IN 的 SUM)
-		balanceQ := m.sumBalanceQuota(c.Request.Context(), ids)
-		usedQ := m.sumUsedQuota(c.Request.Context(), ids)
+		balanceQ, usedQ := m.sumUsageLiveQuotas(c.Request.Context(), ids)
 		resp["members"] = len(ids)
 		resp["balance_quota"] = balanceQ
 		resp["balance_usd"] = quotaUSDPtr(balanceQ)
@@ -1577,8 +1582,7 @@ func (m *Monitor) serveUsageStats(c *gin.Context) {
 	} else if tokenID > 0 { // 令牌详情:元数据(名称/脱敏key/分组/累计;硬删查不到则为 null,前端用点击时的名字兜底)
 		resp["token"] = m.tokenMetaOf(c.Request.Context(), ids[0], tokenID)
 	} else if len(ids) == 1 { // 单用户详情:个人余额 + 累计总消耗(实时取,null=已删/取不到)+ 各令牌用量
-		balanceQ := m.userBalanceQuota(c.Request.Context(), ids[0])
-		usedQ := m.userUsedQuota(c.Request.Context(), ids[0])
+		owner, balanceQ, usedQ := m.userLiveUsage(c.Request.Context(), ids[0])
 		resp["balance_quota"] = balanceQ
 		resp["balance_usd"] = quotaUSDPtr(balanceQ)
 		resp["total_used_quota"] = usedQ
@@ -1602,7 +1606,7 @@ func (m *Monitor) serveUsageStats(c *gin.Context) {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "令牌统计查询失败,请稍后重试(细节见服务端日志)"})
 			return
 		}
-		toks, err := m.hydrateUserTokenUsage(c.Request.Context(), ids[0], tokenAggregates)
+		toks, err := m.hydrateUserTokenUsage(c.Request.Context(), ids[0], tokenAggregates, &owner)
 		if err != nil {
 			if abortCanceledUsageRequest(c, err) {
 				return
@@ -1623,38 +1627,24 @@ func (m *Monitor) serveUsageStats(c *gin.Context) {
 	c.JSON(http.StatusOK, resp)
 }
 
-// sumBalanceQuota 一组用户的主站余额合计(users.quota);空组/出错返回 nil。
-func (m *Monitor) sumBalanceQuota(ctx context.Context, ids []int64) *int64 {
+// sumUsageLiveQuotas 用一次 users 聚合同时取回一组用户的当前余额和累计总消耗。
+// 空组/查询失败时两项均返回 nil；有成员但主站已无匹配行时 COALESCE 保留既有的 0 值语义。
+func (m *Monitor) sumUsageLiveQuotas(ctx context.Context, ids []int64) (balance, used *int64) {
 	if len(ids) == 0 {
-		return nil
+		return nil, nil
 	}
 	cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	inSQL, args := usageIn("id", ids)
-	var quota int64
-	if err := m.prodDB.QueryRowContext(cctx, "SELECT COALESCE(SUM(quota),0) FROM users WHERE "+inSQL, args...).Scan(&quota); err != nil {
+	var balanceQ, usedQ int64
+	err := m.prodDB.QueryRowContext(cctx,
+		"SELECT COALESCE(SUM(quota),0), COALESCE(SUM(used_quota),0) FROM users WHERE "+inSQL, args...,
+	).Scan(&balanceQ, &usedQ)
+	if err != nil {
 		if !errors.Is(err, context.Canceled) {
-			slog.Warn("查询分组余额合计失败", "err", err)
+			slog.Warn("查询分组实时金额合计失败", "err", err)
 		}
-		return nil
+		return nil, nil
 	}
-	return &quota
-}
-
-// sumUsedQuota 一组用户的主站累计总消耗合计(users.used_quota);空组/出错返回 nil。
-func (m *Monitor) sumUsedQuota(ctx context.Context, ids []int64) *int64 {
-	if len(ids) == 0 {
-		return nil
-	}
-	cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-	inSQL, args := usageIn("id", ids)
-	var used int64
-	if err := m.prodDB.QueryRowContext(cctx, "SELECT COALESCE(SUM(used_quota),0) FROM users WHERE "+inSQL, args...).Scan(&used); err != nil {
-		if !errors.Is(err, context.Canceled) {
-			slog.Warn("查询分组累计消耗合计失败", "err", err)
-		}
-		return nil
-	}
-	return &used
+	return &balanceQ, &usedQ
 }

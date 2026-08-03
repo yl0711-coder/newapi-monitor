@@ -7,6 +7,7 @@ package monitor
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -20,11 +21,58 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	_ "github.com/glebarez/go-sqlite"
-	"gorm.io/gorm" // 注册 database/sql 驱动 "sqlite"(纯 Go,免 cgo)
+	glebarezsqlite "github.com/glebarez/go-sqlite" // 注册 database/sql 驱动 "sqlite"(纯 Go,免 cgo)
+	"gorm.io/gorm"
 )
 
 const usageDayExprSQLite = "(created_at + 28800) / 86400" // sqlite 整型相除即整除
+
+// usageCountingDriver 只用于测试查询往返数：透传真实 SQLite 驱动，
+// 不伪造 SQL 结果，仅统计 users/tokens 表的 SELECT。
+type usageQueryCounts struct {
+	users  atomic.Int64
+	tokens atomic.Int64
+}
+
+func (c *usageQueryCounts) reset() {
+	c.users.Store(0)
+	c.tokens.Store(0)
+}
+
+type usageCountingDriver struct {
+	inner  driver.Driver
+	counts *usageQueryCounts
+}
+
+func (d *usageCountingDriver) Open(name string) (driver.Conn, error) {
+	conn, err := d.inner.Open(name)
+	if err != nil {
+		return nil, err
+	}
+	return &usageCountingConn{Conn: conn, counts: d.counts}, nil
+}
+
+type usageCountingConn struct {
+	driver.Conn
+	counts *usageQueryCounts
+}
+
+func (c *usageCountingConn) QueryContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
+	lower := strings.ToLower(query)
+	if strings.Contains(lower, " from users") {
+		c.counts.users.Add(1)
+	}
+	if strings.Contains(lower, " from tokens") {
+		c.counts.tokens.Add(1)
+	}
+	queryer, ok := c.Conn.(driver.QueryerContext)
+	if !ok {
+		return nil, driver.ErrSkip
+	}
+	return queryer.QueryContext(ctx, query, args)
+}
+
+var usageCountingDriverID atomic.Int64
 
 func TestParseUsageRange(t *testing.T) {
 	// 固定“现在”:2026-07-07 15:00 CST
@@ -337,6 +385,29 @@ func newFakeProdDB(t *testing.T) *sql.DB {
 		}
 	}
 	return db
+}
+
+func newCountingFakeProdDB(t *testing.T) (*sql.DB, *usageQueryCounts) {
+	t.Helper()
+	counts := &usageQueryCounts{}
+	driverName := fmt.Sprintf("usage-counting-sqlite-%d", usageCountingDriverID.Add(1))
+	sql.Register(driverName, &usageCountingDriver{inner: &glebarezsqlite.Driver{}, counts: counts})
+	db, err := sql.Open(driverName, t.TempDir()+"/prod.db")
+	if err != nil {
+		t.Fatalf("open counting fake prod: %v", err)
+	}
+	t.Cleanup(func() { db.Close() })
+	for _, stmt := range []string{
+		"CREATE TABLE users (id INTEGER PRIMARY KEY, username TEXT, email TEXT, quota INTEGER, used_quota INTEGER)",
+		"CREATE TABLE logs (id INTEGER PRIMARY KEY, user_id INTEGER, created_at INTEGER, type INTEGER, model_name TEXT, quota INTEGER, prompt_tokens INTEGER, completion_tokens INTEGER, `group` TEXT, token_id INTEGER DEFAULT 0, token_name TEXT DEFAULT '', username TEXT DEFAULT '', use_time INTEGER DEFAULT 0, is_stream INTEGER DEFAULT 0, content TEXT DEFAULT '', other TEXT DEFAULT '', request_id TEXT DEFAULT '')",
+		"CREATE TABLE tokens (id INTEGER PRIMARY KEY, user_id INTEGER, name TEXT, `key` TEXT, `group` TEXT, used_quota INTEGER DEFAULT 0, deleted_at TIMESTAMP)",
+	} {
+		if _, err := db.Exec(stmt); err != nil {
+			t.Fatalf("create counting schema: %v", err)
+		}
+	}
+	counts.reset()
+	return db, counts
 }
 
 func TestResolveNewAPIUser(t *testing.T) {
@@ -760,6 +831,7 @@ type usageStatsHTTPResponse struct {
 	ByToken        []TokenUsage `json:"by_token"`
 	BalanceQuota   *int64       `json:"balance_quota"`
 	TotalUsedQuota *int64       `json:"total_used_quota"`
+	Members        int          `json:"members"`
 }
 
 func requestUsageStatsForTest(t *testing.T, m *Monitor, path string) usageStatsHTTPResponse {
@@ -842,6 +914,274 @@ func TestServeUsageStatsCachesOnlyAggregatesAndRefreshesExactly(t *testing.T) {
 			strings.Contains(payload, "token-b") || strings.Contains(payload, "qrstuvwxyzabcdef") {
 			t.Fatalf("Redis 详情键 %q 泄漏实时/完整敏感字段: %s", key, payload)
 		}
+	}
+}
+
+// 锁定实时资料查询合并前后的兼容语义：邮箱回退、负余额、NULL、零值、主站已删用户，
+// 以及组织内部分/全部用户缺失时的合计都不能因减少 SQL 往返而改变。
+func TestServeUsageStatsLiveFieldCompatibility(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	m := newTestMonitor(t)
+	m.prodDB = newFakeProdDB(t)
+	m.usageDayExpr = usageDayExprSQLite
+	m.usageCache = newUsageResultCacheForTest(newMemoryByteCacheStore(), 32, 1<<20)
+
+	g := CustomerGroup{Name: "live-fields"}
+	if err := m.storeDB.Create(&g).Error; err != nil {
+		t.Fatal(err)
+	}
+	for _, u := range []TrackedUser{
+		{UserID: 1, GroupID: g.ID, Username: "snapshot-one", Email: "snapshot-one@example.test"},
+		{UserID: 2, GroupID: g.ID, Username: "snapshot-two", Email: "snapshot-two@example.test"},
+	} {
+		if err := m.storeDB.Create(&u).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	day := time.Date(2026, 7, 1, 10, 0, 0, 0, usageCST).Unix()
+	seed := []string{
+		"INSERT INTO users (id,username,email,quota,used_quota) VALUES (1,'','email-only@example.test',-250000,0)",
+		"INSERT INTO users (id,username,email,quota,used_quota) VALUES (2,'second','',NULL,1500000)",
+		"INSERT INTO tokens (id,user_id,name,`key`,`group`,used_quota) VALUES (10,1,'token-one','abcdefghijklmnop','g',0)",
+		fmt.Sprintf("INSERT INTO logs (id,user_id,created_at,type,model_name,quota,prompt_tokens,completion_tokens,`group`,token_id,token_name) VALUES (1,1,%d,2,'m',500000,1,1,'g',10,'token-one')", day),
+		fmt.Sprintf("INSERT INTO logs (id,user_id,created_at,type,model_name,quota,prompt_tokens,completion_tokens,`group`) VALUES (2,2,%d,2,'m',250000,1,1,'g')", day),
+	}
+	for _, q := range seed {
+		if _, err := m.prodDB.Exec(q); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	userPath := "/usage/stats?user_id=1&from=2026-07-01&to=2026-07-01"
+	user := requestUsageStatsForTest(t, m, userPath)
+	if user.BalanceQuota == nil || *user.BalanceQuota != -250000 ||
+		user.TotalUsedQuota == nil || *user.TotalUsedQuota != 0 ||
+		len(user.ByToken) != 1 || user.ByToken[0].Owner != "email-only@example.test" {
+		t.Fatalf("单用户实时字段兼容性错误: %+v", user)
+	}
+
+	groupPath := fmt.Sprintf("/usage/stats?group_id=%d&from=2026-07-01&to=2026-07-01", g.ID)
+	group := requestUsageStatsForTest(t, m, groupPath)
+	if group.Members != 2 || group.BalanceQuota == nil || *group.BalanceQuota != -250000 ||
+		group.TotalUsedQuota == nil || *group.TotalUsedQuota != 1500000 {
+		t.Fatalf("组织实时合计兼容性错误: %+v", group)
+	}
+	// 名单里仍有成员、但其中一人已从主站删除时，只合计仍存在的主站行。
+	if _, err := m.prodDB.Exec("DELETE FROM users WHERE id=2"); err != nil {
+		t.Fatal(err)
+	}
+	partialGroup := requestUsageStatsForTest(t, m, groupPath)
+	if partialGroup.BalanceQuota == nil || *partialGroup.BalanceQuota != -250000 ||
+		partialGroup.TotalUsedQuota == nil || *partialGroup.TotalUsedQuota != 0 {
+		t.Fatalf("组织成员部分从主站删除后的合计错误: %+v", partialGroup)
+	}
+
+	// 主站删掉用户后，日志聚合仍可从缓存读取；单用户金额为 null、owner 回退 #ID。
+	if _, err := m.prodDB.Exec("DELETE FROM users"); err != nil {
+		t.Fatal(err)
+	}
+	deletedUser := requestUsageStatsForTest(t, m, userPath)
+	if deletedUser.BalanceQuota != nil || deletedUser.TotalUsedQuota != nil ||
+		len(deletedUser.ByToken) != 1 || deletedUser.ByToken[0].Owner != "#1" {
+		t.Fatalf("已删用户降级语义错误: %+v", deletedUser)
+	}
+	// 组织聚合 SQL 对零匹配行仍返回 COALESCE 后的 0；这与既有页面语义一致。
+	deletedGroup := requestUsageStatsForTest(t, m, groupPath)
+	if deletedGroup.BalanceQuota == nil || *deletedGroup.BalanceQuota != 0 ||
+		deletedGroup.TotalUsedQuota == nil || *deletedGroup.TotalUsedQuota != 0 {
+		t.Fatalf("组织成员全部从主站删除后的合计语义错误: %+v", deletedGroup)
+	}
+}
+
+func TestUsageBlankLiveIdentityFallsBackToID(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	m := newTestMonitor(t)
+	m.prodDB = newFakeProdDB(t)
+	m.usageDayExpr = usageDayExprSQLite
+	m.usageCache = newUsageResultCacheForTest(newMemoryByteCacheStore(), 32, 1<<20)
+
+	g := CustomerGroup{Name: "blank-live-identity"}
+	if err := m.storeDB.Create(&g).Error; err != nil {
+		t.Fatal(err)
+	}
+	member := TrackedUser{UserID: 1, GroupID: g.ID, Username: "old-snapshot", Email: "old@example.test"}
+	if err := m.storeDB.Create(&member).Error; err != nil {
+		t.Fatal(err)
+	}
+	createdAt := time.Date(2026, 7, 1, 10, 0, 0, 0, usageCST).Unix()
+	for _, stmt := range []string{
+		"INSERT INTO users (id,username,email,quota,used_quota) VALUES (1,'','',500000,750000)",
+		"INSERT INTO tokens (id,user_id,name,`key`,`group`,used_quota) VALUES (10,1,'token','abcdefghijklmnop','g',750000)",
+		fmt.Sprintf("INSERT INTO logs (id,user_id,created_at,type,model_name,quota,prompt_tokens,completion_tokens,`group`,token_id,token_name) VALUES (1,1,%d,2,'m',250000,1,1,'g',10,'token')", createdAt),
+	} {
+		if _, err := m.prodDB.Exec(stmt); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	admin := requestUsageStatsForTest(t, m, "/usage/stats?user_id=1&from=2026-07-01&to=2026-07-01")
+	if len(admin.ByToken) != 1 || admin.ByToken[0].Owner != "#1" ||
+		admin.BalanceQuota == nil || *admin.BalanceQuota != 500000 ||
+		admin.TotalUsedQuota == nil || *admin.TotalUsedQuota != 750000 {
+		t.Fatalf("管理端空用户名/邮箱回退错误: %+v", admin)
+	}
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodGet, "/api/user?uid=1&from=2026-07-01&to=2026-07-01", nil)
+	c.Set("portalGID", g.ID)
+	m.portalUserDetail(c)
+	if w.Code != http.StatusOK {
+		t.Fatalf("Portal 空身份详情失败: %d %s", w.Code, w.Body.String())
+	}
+	var portal struct {
+		Data struct {
+			ByToken        []TokenUsage `json:"by_token"`
+			BalanceQuota   *int64       `json:"balance_quota"`
+			TotalUsedQuota *int64       `json:"total_used_quota"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &portal); err != nil {
+		t.Fatal(err)
+	}
+	if len(portal.Data.ByToken) != 1 || portal.Data.ByToken[0].Owner != "#1" ||
+		portal.Data.BalanceQuota == nil || *portal.Data.BalanceQuota != 500000 ||
+		portal.Data.TotalUsedQuota == nil || *portal.Data.TotalUsedQuota != 750000 {
+		t.Fatalf("Portal 空用户名/邮箱回退错误: %+v", portal.Data)
+	}
+}
+
+func TestUsageUsersQueryFailureKeepsHistoricalDataAvailable(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	m := newTestMonitor(t)
+	m.prodDB = newFakeProdDB(t)
+	m.usageDayExpr = usageDayExprSQLite
+	m.usageCache = newUsageResultCacheForTest(newMemoryByteCacheStore(), 32, 1<<20)
+
+	g := CustomerGroup{Name: "users-query-failure"}
+	if err := m.storeDB.Create(&g).Error; err != nil {
+		t.Fatal(err)
+	}
+	member := TrackedUser{UserID: 1, GroupID: g.ID, Username: "snapshot-owner", Email: "snapshot@example.test"}
+	if err := m.storeDB.Create(&member).Error; err != nil {
+		t.Fatal(err)
+	}
+	createdAt := time.Date(2026, 7, 1, 10, 0, 0, 0, usageCST).Unix()
+	for _, stmt := range []string{
+		"INSERT INTO users (id,username,email,quota,used_quota) VALUES (1,'live-owner','live@example.test',500000,750000)",
+		"INSERT INTO tokens (id,user_id,name,`key`,`group`,used_quota) VALUES (10,1,'token','abcdefghijklmnop','g',750000)",
+		fmt.Sprintf("INSERT INTO logs (id,user_id,created_at,type,model_name,quota,prompt_tokens,completion_tokens,`group`,token_id,token_name) VALUES (1,1,%d,2,'m',250000,1,1,'g',10,'token')", createdAt),
+		"DROP TABLE users",
+	} {
+		if _, err := m.prodDB.Exec(stmt); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	adminPath := "/usage/stats?user_id=1&from=2026-07-01&to=2026-07-01"
+	admin := requestUsageStatsForTest(t, m, adminPath)
+	if admin.Stats.Summary.Requests != 1 || len(admin.ByToken) != 1 || admin.ByToken[0].Owner != "#1" ||
+		admin.BalanceQuota != nil || admin.TotalUsedQuota != nil {
+		t.Fatalf("users 查询失败时管理端降级错误: %+v", admin)
+	}
+
+	groupPath := fmt.Sprintf("/usage/stats?group_id=%d&from=2026-07-01&to=2026-07-01", g.ID)
+	group := requestUsageStatsForTest(t, m, groupPath)
+	if group.Stats.Summary.Requests != 1 || group.BalanceQuota != nil || group.TotalUsedQuota != nil {
+		t.Fatalf("users 查询失败时组织汇总降级错误: %+v", group)
+	}
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodGet, "/api/user?uid=1&from=2026-07-01&to=2026-07-01", nil)
+	c.Set("portalGID", g.ID)
+	m.portalUserDetail(c)
+	if w.Code != http.StatusOK {
+		t.Fatalf("users 查询失败时 Portal 不应中断: %d %s", w.Code, w.Body.String())
+	}
+	var portal struct {
+		Data struct {
+			Stats          UsageStats   `json:"stats"`
+			ByToken        []TokenUsage `json:"by_token"`
+			BalanceQuota   *int64       `json:"balance_quota"`
+			TotalUsedQuota *int64       `json:"total_used_quota"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &portal); err != nil {
+		t.Fatal(err)
+	}
+	if portal.Data.Stats.Summary.Requests != 1 || len(portal.Data.ByToken) != 1 ||
+		portal.Data.ByToken[0].Owner != "snapshot-owner" ||
+		portal.Data.BalanceQuota != nil || portal.Data.TotalUsedQuota != nil {
+		t.Fatalf("users 查询失败时 Portal 降级错误: %+v", portal.Data)
+	}
+}
+
+func TestUsageLiveQueriesAreActuallyConsolidated(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	m := newTestMonitor(t)
+	prodDB, counts := newCountingFakeProdDB(t)
+	m.prodDB = prodDB
+	m.usageDayExpr = usageDayExprSQLite
+	m.usageCache = newUsageResultCacheForTest(newMemoryByteCacheStore(), 32, 1<<20)
+
+	g := CustomerGroup{Name: "query-count"}
+	if err := m.storeDB.Create(&g).Error; err != nil {
+		t.Fatal(err)
+	}
+	member := TrackedUser{UserID: 1, GroupID: g.ID, Username: "snapshot", Email: "snapshot@example.test"}
+	if err := m.storeDB.Create(&member).Error; err != nil {
+		t.Fatal(err)
+	}
+	createdAt := time.Date(2026, 7, 1, 10, 0, 0, 0, usageCST).Unix()
+	for _, stmt := range []string{
+		"INSERT INTO users (id,username,email,quota,used_quota) VALUES (1,'live','live@example.test',500000,750000)",
+		"INSERT INTO tokens (id,user_id,name,`key`,`group`,used_quota) VALUES (10,1,'token','abcdefghijklmnop','g',750000)",
+		fmt.Sprintf("INSERT INTO logs (id,user_id,created_at,type,model_name,quota,prompt_tokens,completion_tokens,`group`,token_id,token_name) VALUES (1,1,%d,2,'m',250000,1,1,'g',10,'token')", createdAt),
+	} {
+		if _, err := m.prodDB.Exec(stmt); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	counts.reset()
+	user := requestUsageStatsForTest(t, m, "/usage/stats?user_id=1&from=2026-07-01&to=2026-07-01")
+	if len(user.ByToken) != 1 || user.ByToken[0].Owner != "live" {
+		t.Fatalf("管理端单用户结果错误: %+v", user)
+	}
+	if got := counts.users.Load(); got != 1 {
+		t.Fatalf("管理端单用户 users SELECT=%d, want 1", got)
+	}
+	if got := counts.tokens.Load(); got != 1 {
+		t.Fatalf("管理端单用户 tokens SELECT=%d, want 1", got)
+	}
+
+	counts.reset()
+	group := requestUsageStatsForTest(t, m, fmt.Sprintf("/usage/stats?group_id=%d&from=2026-07-01&to=2026-07-01", g.ID))
+	if group.Members != 1 || group.BalanceQuota == nil || *group.BalanceQuota != 500000 {
+		t.Fatalf("管理端组织结果错误: %+v", group)
+	}
+	if got := counts.users.Load(); got != 1 {
+		t.Fatalf("管理端组织 users SELECT=%d, want 1", got)
+	}
+	if got := counts.tokens.Load(); got != 0 {
+		t.Fatalf("管理端组织 tokens SELECT=%d, want 0", got)
+	}
+
+	counts.reset()
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodGet, "/api/user?uid=1&from=2026-07-01&to=2026-07-01", nil)
+	c.Set("portalGID", g.ID)
+	m.portalUserDetail(c)
+	if w.Code != http.StatusOK {
+		t.Fatalf("客户端单用户详情失败: %d %s", w.Code, w.Body.String())
+	}
+	if got := counts.users.Load(); got != 1 {
+		t.Fatalf("客户端单用户 users SELECT=%d, want 1", got)
+	}
+	if got := counts.tokens.Load(); got != 1 {
+		t.Fatalf("客户端单用户 tokens SELECT=%d, want 1", got)
 	}
 }
 

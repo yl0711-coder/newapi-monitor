@@ -338,6 +338,17 @@ func TestPortalUserAndTokenDetailCacheKeepsLiveFieldsOutOfRedis(t *testing.T) {
 		t.Fatalf("成员令牌列表也必须在聚合命中时补回实时元数据: data=%+v fills=%d", memberAfterTokenUpdate.Data, m.usageCache.fills.Load())
 	}
 
+	// 主站删除用户后，客户端历史聚合和令牌仍可读；展示名沿用最近自愈快照，金额降级为 null。
+	if _, err := m.prodDB.Exec("DELETE FROM users WHERE id=101"); err != nil {
+		t.Fatal(err)
+	}
+	deletedMember := readMember()
+	if len(deletedMember.Data.ByToken) != 1 || deletedMember.Data.ByToken[0].Owner != "live-name-v2" ||
+		deletedMember.Data.BalanceQuota != nil || deletedMember.Data.TotalUsedQuota != nil ||
+		m.usageCache.fills.Load() != 3 {
+		t.Fatalf("主站用户删除后的 Portal 降级语义错误: data=%+v fills=%d", deletedMember.Data, m.usageCache.fills.Load())
+	}
+
 	remote.mu.Lock()
 	defer remote.mu.Unlock()
 	for key, item := range remote.items {

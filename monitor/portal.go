@@ -763,7 +763,10 @@ func (m *Monitor) portalUserDetail(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "查询失败,请稍后重试"})
 		return
 	}
-	toks, err := m.hydrateUserTokenUsage(c.Request.Context(), uid, tokenAggregates)
+	// owner 最终仍由下方的 users 实时查询校准；先传本地快照只是避免
+	// hydrateUserTokenUsage 内再发起一次必然会被后续结果覆盖的 users 查询。
+	ownerSnapshot := trackedLabel(member)
+	toks, err := m.hydrateUserTokenUsage(c.Request.Context(), uid, tokenAggregates, &ownerSnapshot)
 	if err != nil {
 		if abortCanceledUsageRequest(c, err) {
 			return
