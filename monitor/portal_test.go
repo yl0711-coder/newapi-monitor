@@ -2,6 +2,7 @@ package monitor
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -75,6 +76,10 @@ func TestPortalDualPassword(t *testing.T) {
 	w = portalDo(portal, "POST", "/api/password", `{"old":"admin-pass-123","new":"customer-pass-456"}`, ck)
 	if w.Code != 200 {
 		t.Fatalf("改密码应成功 = %d %s", w.Code, w.Body.String())
+	}
+	// 密码变化后，改密前签发的 12 小时会话必须立即失效。
+	if w := portalDo(portal, "GET", "/api/overview", "", ck); w.Code != http.StatusUnauthorized {
+		t.Fatalf("旧会话应在改密后立即失效 = %d %s", w.Code, w.Body.String())
 	}
 	// 新密码可登录
 	if w := portalDo(portal, "POST", "/login", `{"email":"acme@x.com","password":"customer-pass-456"}`); w.Code != 200 {
@@ -150,6 +155,48 @@ func TestPortalMatrixRefreshInvalidatesPartialOverview(t *testing.T) {
 		})
 		if err != nil || !called {
 			t.Fatalf("group %d 应重新构建完整总览: called=%v err=%v", gid, called, err)
+		}
+	}
+}
+
+// 成员从 A 组移动到 B 组后，两组所有日期范围、总览/维度/成员明细缓存都必须立即失效。
+func TestPortalMemberMoveInvalidatesBothGroupCaches(t *testing.T) {
+	m, admin, _ := newPortalTestMonitor(t)
+	ga := CustomerGroup{Name: "A公司"}
+	gb := CustomerGroup{Name: "B公司"}
+	if err := m.storeDB.Create(&ga).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := m.storeDB.Create(&gb).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := m.storeDB.Create(&TrackedUser{UserID: 101, Username: "member", GroupID: ga.ID}).Error; err != nil {
+		t.Fatal(err)
+	}
+	keys := []string{}
+	for _, gid := range []int64{ga.ID, gb.ID} {
+		keys = append(keys,
+			portalOverviewKey(gid, 100, 200),
+			fmt.Sprintf("bd|%d|100|200", gid),
+			fmt.Sprintf("ud|%d|101|0|100|200", gid),
+		)
+	}
+	for _, key := range keys {
+		m.portalCache.Put(key, "stale", time.Minute)
+	}
+	rootCk := &http.Cookie{Name: sessionCookie, Value: m.signSession("root", roleRoot, time.Now().Unix())}
+	w := portalDo(admin, http.MethodPost, "/usage/users/group", fmt.Sprintf(`{"user_id":101,"group_id":%d}`, gb.ID), rootCk)
+	if w.Code != http.StatusOK {
+		t.Fatalf("移动成员失败 = %d %s", w.Code, w.Body.String())
+	}
+	for _, key := range keys {
+		called := false
+		v, err := m.portalCache.Do(key, time.Minute, func() (any, error) {
+			called = true
+			return "fresh", nil
+		})
+		if err != nil || !called || v != "fresh" {
+			t.Fatalf("缓存 %q 未失效: called=%v value=%v err=%v", key, called, v, err)
 		}
 	}
 }
@@ -234,6 +281,30 @@ func TestTTLCacheSingleflight(t *testing.T) {
 	}
 }
 
+func TestTTLCacheDeletePrefix(t *testing.T) {
+	c := newTTLCache()
+	c.Put("ov|1|a", "a", time.Minute)
+	c.Put("ov|10|b", "b", time.Minute)
+	c.Put("bd|1|c", "c", time.Minute)
+	c.DeletePrefix("ov|1|")
+	called := false
+	v, err := c.Do("ov|1|a", time.Minute, func() (any, error) {
+		called = true
+		return "fresh", nil
+	})
+	if err != nil || !called || v != "fresh" {
+		t.Fatalf("匹配前缀的缓存应删除: called=%v value=%v err=%v", called, v, err)
+	}
+	called = false
+	v, err = c.Do("ov|10|b", time.Minute, func() (any, error) {
+		called = true
+		return "wrong", nil
+	})
+	if err != nil || called || v != "b" {
+		t.Fatalf("相似 gid 的缓存不应误删: called=%v value=%v err=%v", called, v, err)
+	}
+}
+
 // CSV 公式注入消毒:= + - @ 开头的文本前置单引号,其余原样。
 func TestCSVSafe(t *testing.T) {
 	cases := map[string]string{
@@ -290,5 +361,19 @@ func TestPortalLogsParamContract(t *testing.T) {
 	}
 	if w := portalDo(portal, "GET", "/api/logs?request_id="+long, "", ck); w.Code != 400 {
 		t.Fatalf("超长 Request ID 搜索应 400,得 %d", w.Code)
+	}
+}
+
+func TestPortalErrorOnlyModelAndGroupFiltersAcceptExactInput(t *testing.T) {
+	html := string(portalHTML)
+	for _, want := range []string{
+		"function cboxCommitCustom(id)",
+		"cboxInit('logModel',()=>loadLogs(true),true)",
+		"cboxInit('logGroup',()=>loadLogs(true),true)",
+		"mergeLogFilterOptions(rows)",
+	} {
+		if !strings.Contains(html, want) {
+			t.Fatalf("错误日志的模型/分组筛选仍只能依赖消费聚合选项，缺少 %q", want)
+		}
 	}
 }

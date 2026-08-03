@@ -6,9 +6,11 @@ package monitor
 //   - 管理端【不读】缓存(始终直查最新),查询完成后使受影响组的客户端总览缓存失效;
 //   - 防击穿:缓存失效瞬间同键并发请求只放行第一个去查库,其余等它的结果——
 //     数学上限死:生产库压力 ≤ 每个键每 TTL 一条查询。
-// 失效策略:TTL 自然过期为主；管理端刷新矩阵时仅删除对应组的总览键，避免客户端读到不完整的预热载荷。
+// 失效策略:普通数据更新以 TTL 为主；成员/分组权限变化立即删除该组全部键；
+// 管理端只读刷新矩阵时仅删除对应日期范围的总览键，避免客户端读到不完整的预热载荷。
 
 import (
+	"strings"
 	"sync"
 	"time"
 )
@@ -83,6 +85,18 @@ func (c *ttlCache) Put(key string, val any, ttl time.Duration) {
 func (c *ttlCache) Delete(key string) {
 	c.mu.Lock()
 	delete(c.m, key)
+	c.mu.Unlock()
+}
+
+// DeletePrefix 删除某一权限域下的全部缓存。成员移动/删除时同时清旧组和新组，
+// 避免不同日期、明细和维度缓存继续保留变更前的可见成员集合。
+func (c *ttlCache) DeletePrefix(prefix string) {
+	c.mu.Lock()
+	for key := range c.m {
+		if strings.HasPrefix(key, prefix) {
+			delete(c.m, key)
+		}
+	}
 	c.mu.Unlock()
 }
 

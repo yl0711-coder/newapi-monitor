@@ -42,6 +42,7 @@ type CustomerGroup struct {
 	PortalEmail   string `gorm:"size:128;index" json:"portal_email"`  // 客户端登录邮箱;空=未开通(跨组唯一由 handler 校验)
 	PortalPwAdmin string `gorm:"size:128" json:"-"`                   // 我方配置密码 bcrypt;不回显
 	PortalPwUser  string `gorm:"size:128" json:"-"`                   // 客户自改密码 bcrypt;不回显
+	PortalAuthVer int64  `gorm:"not null;default:0" json:"-"`         // 登录凭证版本;账号/密码变化时递增,立即废止旧会话
 	CreatedAt     int64  `json:"created_at"`
 }
 
@@ -302,6 +303,7 @@ func (m *Monitor) updateGroup(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "分组不存在"})
 		return
 	}
+	m.invalidatePortalGroup(in.ID)
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
 
@@ -324,6 +326,7 @@ func (m *Monitor) deleteGroup(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
+	m.invalidatePortalGroup(in.ID)
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
 
@@ -367,11 +370,18 @@ func (m *Monitor) setUserGroup(c *gin.Context) {
 			return
 		}
 	}
+	var current TrackedUser
+	if err := m.storeDB.Where("user_id = ?", in.UserID).First(&current).Error; err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "用户不在名单内"})
+		return
+	}
 	res := m.storeDB.Model(&TrackedUser{}).Where("user_id = ?", in.UserID).Update("group_id", in.GroupID)
 	if res.Error != nil || res.RowsAffected == 0 {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "用户不在名单内"})
 		return
 	}
+	m.invalidatePortalGroup(current.GroupID)
+	m.invalidatePortalGroup(in.GroupID)
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
 
@@ -414,10 +424,14 @@ func (m *Monitor) addTrackedUser(c *gin.Context) {
 	}
 	u.AddedAt = time.Now().Unix()
 	u.GroupID = in.GroupID
+	var previous TrackedUser
+	_ = m.storeDB.Where("user_id = ?", u.UserID).First(&previous).Error
 	if err := m.storeDB.Save(u).Error; err != nil { // 主键=user_id,重复添加=幂等更新(含改组)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
+	m.invalidatePortalGroup(previous.GroupID)
+	m.invalidatePortalGroup(u.GroupID)
 	c.JSON(http.StatusOK, gin.H{"ok": true, "user": u})
 }
 
@@ -430,10 +444,13 @@ func (m *Monitor) deleteTrackedUser(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "user_id required"})
 		return
 	}
+	var current TrackedUser
+	_ = m.storeDB.Where("user_id = ?", in.UserID).First(&current).Error
 	if err := m.storeDB.Delete(&TrackedUser{}, "user_id = ?", in.UserID).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
+	m.invalidatePortalGroup(current.GroupID)
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
 
@@ -449,12 +466,13 @@ func trackedLabel(u TrackedUser) string {
 }
 
 // refreshTrackedLabels 按 id 去生产库 users 表把名单的 username/email 刷新成当前值(主键 IN 查询,代价可忽略),
-// 并顺路取回各用户【当前余额】(users.quota 折美元;实时值不落库)。主站已删的用户不在余额表 → 前端显示 —。
+// 并顺路取回各用户【当前余额】与【累计消耗】的原始整数 quota(实时值不落库)。
+// 金额只在响应边界折美元，避免汇总、比较阶段引入浮点误差。主站已删的用户不在结果表 → 前端显示 —。
 // 名单存的是添加时的快照——主站改邮箱/账号易主后,矩阵会把今天的消费记在旧身份上;
 // 这里每次查询顺手校准,变化的顺手回写本地库(自愈缓存);失败则退回快照+空余额,绝不阻断统计。
-func (m *Monitor) refreshTrackedLabels(ctx context.Context, tracked []TrackedUser) ([]TrackedUser, map[int64]float64, map[int64]float64) {
-	balances := map[int64]float64{}
-	used := map[int64]float64{}
+func (m *Monitor) refreshTrackedLabels(ctx context.Context, tracked []TrackedUser) ([]TrackedUser, map[int64]int64, map[int64]int64) {
+	balances := map[int64]int64{}
+	used := map[int64]int64{}
 	if len(tracked) == 0 {
 		return tracked, balances, used
 	}
@@ -474,15 +492,15 @@ func (m *Monitor) refreshTrackedLabels(ctx context.Context, tracked []TrackedUse
 		var quota, usedQ int64
 		if err := rows.Scan(&u.UserID, &u.Username, &u.Email, &quota, &usedQ); err != nil {
 			slog.Warn("刷新检测用户标签失败,沿用快照", "err", err)
-			return tracked, map[int64]float64{}, map[int64]float64{}
+			return tracked, map[int64]int64{}, map[int64]int64{}
 		}
 		fresh[u.UserID] = u
-		balances[u.UserID] = float64(quota) / quotaPerUSD
-		used[u.UserID] = float64(usedQ) / quotaPerUSD
+		balances[u.UserID] = quota
+		used[u.UserID] = usedQ
 	}
 	if err := rows.Err(); err != nil {
 		slog.Warn("刷新检测用户标签失败,沿用快照", "err", err)
-		return tracked, map[int64]float64{}, map[int64]float64{}
+		return tracked, map[int64]int64{}, map[int64]int64{}
 	}
 	for i, u := range tracked {
 		f, ok := fresh[u.UserID]

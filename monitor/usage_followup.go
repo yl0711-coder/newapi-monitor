@@ -157,7 +157,8 @@ func (m *Monitor) computeFollowUps(ctx context.Context, nowUnix int64) ([]Follow
 		if spendByUserDay[c.UserID] == nil {
 			spendByUserDay[c.UserID] = map[int]float64{}
 		}
-		spendByUserDay[c.UserID][di] += c.CostUSD
+		// 跟进规则继续使用消费毛额，退款/净额展示能力不能悄悄改变既有客户活跃判断。
+		spendByUserDay[c.UserID][di] += float64(c.ConsumeQuota) / quotaPerUSD
 	}
 
 	st := m.loadUsageSettings()
@@ -196,7 +197,7 @@ func (m *Monitor) computeFollowUps(ctx context.Context, nowUnix int64) ([]Follow
 		}
 		var balance *float64
 		if b, ok := balances[u.UserID]; ok {
-			bv := b
+			bv := float64(b) / quotaPerUSD
 			balance = &bv
 		}
 		mem, need := classifyMember(u, stage, spendByUserDay[u.UserID], balance, lastFollow[u.UserID], dateOfIdx, st)

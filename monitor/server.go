@@ -108,7 +108,9 @@ func (m *Monitor) RegisterRoutes(r *gin.Engine) {
 		c.Data(http.StatusOK, "text/css; charset=utf-8", flatpickrCSS)
 	})
 	r.GET("/range-picker.js", func(c *gin.Context) {
-		c.Header("Cache-Control", "public, max-age=31536000, immutable")
+		// 适配层会随 Monitor 功能调整，不能像固定版本的第三方资源一样
+		// 永久缓存，否则升级后浏览器会继续执行旧的日期控件逻辑。
+		c.Header("Cache-Control", "no-cache")
 		c.Data(http.StatusOK, "application/javascript; charset=utf-8", rangePickerJS)
 	})
 	r.GET("/react.js", func(c *gin.Context) {

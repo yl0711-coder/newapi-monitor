@@ -9,28 +9,20 @@
   }
 
   const pad = value => String(value).padStart(2, '0');
-  const dateText = date => `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+  const dateText = date => `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
   const cloneDate = date => new Date(date.getTime());
   const cloneDay = date => new Date(date.getFullYear(), date.getMonth(), date.getDate());
   const ymd = date => `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
-  const parseValue = (value, isEnd) => {
-    if (value instanceof Date) return Number.isNaN(value.getTime()) ? null : cloneDate(value);
+  const parseValue = value => {
+    if (value instanceof Date) return Number.isNaN(value.getTime()) ? null : cloneDay(value);
     if (typeof value === 'number') {
       const parsed = new Date(value);
-      return Number.isNaN(parsed.getTime()) ? null : parsed;
+      return Number.isNaN(parsed.getTime()) ? null : cloneDay(parsed);
     }
     if (!value) return null;
-    const match = String(value).trim().match(/^(\d{4})-(\d{2})-(\d{2})(?:[ T](\d{2}):(\d{2})(?::(\d{2}))?)?$/);
+    const match = String(value).trim().match(/^(\d{4})-(\d{2})-(\d{2})$/);
     if (!match) return null;
-    const parsed = new Date(
-      Number(match[1]),
-      Number(match[2]) - 1,
-      Number(match[3]),
-      match[4] == null ? (isEnd ? 23 : 0) : Number(match[4]),
-      match[5] == null ? (isEnd ? 59 : 0) : Number(match[5]),
-      match[6] == null ? (isEnd ? 59 : 0) : Number(match[6]),
-      0,
-    );
+    const parsed = new Date(Number(match[1]), Number(match[2]) - 1, Number(match[3]));
     if (parsed.getFullYear() !== Number(match[1]) || parsed.getMonth() !== Number(match[2]) - 1 || parsed.getDate() !== Number(match[3])) return null;
     return parsed;
   };
@@ -40,7 +32,7 @@
     this.input = input;
     this.options = Object.assign({ maxDays: 90, presets: [], onChange: null, onClear: null, showClear: true, theme: 'light' }, options || {});
     this.value = [];
-    const parsedMaxDate = this.options.maxDate ? parseValue(this.options.maxDate, true) : null;
+    const parsedMaxDate = this.options.maxDate ? parseValue(this.options.maxDate) : null;
     this.maxDate = parsedMaxDate ? cloneDay(parsedMaxDate) : null;
     this.pickerRef = window.React.createRef();
 
@@ -66,8 +58,8 @@
   SemiRangePicker.prototype.resolvePresetKey = function (dates) {
     if (!Array.isArray(dates) || dates.length !== 2) return '';
     for (const preset of this.options.presets || []) {
-      const start = parseValue(typeof preset.start === 'function' ? preset.start() : preset.start, false);
-      const end = parseValue(typeof preset.end === 'function' ? preset.end() : preset.end, true);
+      const start = parseValue(typeof preset.start === 'function' ? preset.start() : preset.start);
+      const end = parseValue(typeof preset.end === 'function' ? preset.end() : preset.end);
       if (start && end && start.getTime() === dates[0].getTime() && end.getTime() === dates[1].getTime()) return preset.key || '';
     }
     return '';
@@ -85,8 +77,16 @@
   };
 
   SemiRangePicker.prototype.handleChange = function (nextValue) {
-    const dates = (Array.isArray(nextValue) ? nextValue : [nextValue]).map((value, index) => parseValue(value, index === 1)).filter(Boolean);
-    if (dates.length !== 2) {
+    const dates = (Array.isArray(nextValue) ? nextValue : [nextValue]).map(parseValue).filter(Boolean);
+    if (dates.length === 1) {
+      // Semi 在第一次点击起始日时会先回传单个日期。保留这个受控值，
+      // 让用户继续选择结束日；不能重置为空，否则范围选择会被第一步清空。
+      this.value = [cloneDate(dates[0])];
+      this.syncSourceInput();
+      this.render();
+      return;
+    }
+    if (dates.length === 0) {
       this.value = [];
       this.syncSourceInput();
       this.render();
@@ -124,9 +124,9 @@
     this.root.render(window.React.createElement(window.SemiUI.DatePicker, {
       ref: this.pickerRef,
       value: this.value,
-      type: 'dateTimeRange',
-      format: 'yyyy-MM-dd HH:mm:ss',
-      placeholder: ['开始时间', '结束时间'],
+      type: 'dateRange',
+      format: 'yyyy-MM-dd',
+      placeholder: ['开始日期', '结束日期'],
       showClear: this.options.showClear !== false,
       pure: true,
       size: 'small',
@@ -141,8 +141,8 @@
 
   SemiRangePicker.prototype.setDate = function (values, trigger, meta) {
     const list = Array.isArray(values) ? values : [values];
-    const start = parseValue(list[0], false);
-    const end = parseValue(list[1], true);
+    const start = parseValue(list[0]);
+    const end = parseValue(list[1]);
     this.value = start && end ? [start, end] : [];
     this.syncSourceInput();
     this.render();
@@ -168,5 +168,5 @@
   };
 
   window.SemiRangePicker = SemiRangePicker;
-  window.SemiRangePickerDays = { cloneDay, parseDay: value => parseValue(value, false), ymd };
+  window.SemiRangePickerDays = { cloneDay, parseDay: parseValue, ymd };
 })();

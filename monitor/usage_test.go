@@ -7,11 +7,14 @@ package monitor
 import (
 	"context"
 	"database/sql"
+	"fmt"
+	"net/http/httptest"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/gin-gonic/gin"
 	_ "github.com/glebarez/go-sqlite"
 	"gorm.io/gorm" // 注册 database/sql 驱动 "sqlite"(纯 Go,免 cgo)
 )
@@ -52,18 +55,10 @@ func TestParseUsageRange(t *testing.T) {
 	}
 }
 
-func TestParseUsageRangePreciseTime(t *testing.T) {
+func TestParseUsageRangeRejectsPreciseTime(t *testing.T) {
 	now := time.Date(2026, 7, 29, 8, 0, 0, 0, usageCST)
-	from, to, err := parseUsageRange("2026-07-28 08:00:00", "2026-07-29 09:00:00", now)
-	if err != nil {
-		t.Fatalf("parse precise range: %v", err)
-	}
-	if want := time.Date(2026, 7, 28, 8, 0, 0, 0, usageCST).Unix(); from != want {
-		t.Fatalf("from=%d want=%d", from, want)
-	}
-	// 上界是开区间，但精确结束秒仍应被包含。
-	if want := time.Date(2026, 7, 29, 9, 0, 1, 0, usageCST).Unix(); to != want {
-		t.Fatalf("to=%d want=%d", to, want)
+	if _, _, err := parseUsageRange("2026-07-28 08:00:00", "2026-07-29 09:00:00", now); err == nil {
+		t.Fatal("纯日期接口不应继续接受精确时间")
 	}
 }
 
@@ -313,6 +308,131 @@ func TestComputeUsageStats(t *testing.T) {
 	}
 }
 
+func TestUsageRefundAndNetQuota(t *testing.T) {
+	m := newTestMonitor(t)
+	m.prodDB = newFakeProdDB(t)
+	m.usageDayExpr = usageDayExprSQLite
+
+	day1 := time.Date(2026, 7, 1, 10, 0, 0, 0, usageCST).Unix()
+	day2 := time.Date(2026, 7, 2, 10, 0, 0, 0, usageCST).Unix()
+	seed := []string{
+		"INSERT INTO users (id,username,email) VALUES (1,'u1','u1@example.com')",
+		"INSERT INTO tokens (id,user_id,name,`key`,`group`,used_quota) VALUES (10,1,'t1','abcdefghijk','g1',500000)",
+		fmt.Sprintf("INSERT INTO logs (user_id,created_at,type,model_name,quota,prompt_tokens,completion_tokens,`group`,token_id,token_name) VALUES (1,%d,2,'m1',500000,100,50,'g1',10,'t1')", day1),
+		fmt.Sprintf("INSERT INTO logs (user_id,created_at,type,model_name,quota,prompt_tokens,completion_tokens,`group`,token_id,token_name) VALUES (1,%d,6,'m1',200000,0,0,'g1',10,'t1')", day1),
+		fmt.Sprintf("INSERT INTO logs (user_id,created_at,type,model_name,quota,prompt_tokens,completion_tokens,`group`,token_id,token_name) VALUES (1,%d,6,'m1',700000,0,0,'g1',10,'t1')", day2),
+		fmt.Sprintf("INSERT INTO logs (user_id,created_at,type,model_name,quota,prompt_tokens,completion_tokens,`group`,token_id,token_name) VALUES (1,%d,5,'m1',900000,999,999,'g1',10,'t1')", day1),
+	}
+	for _, q := range seed {
+		if _, err := m.prodDB.Exec(q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fromTs := time.Date(2026, 7, 1, 0, 0, 0, 0, usageCST).Unix()
+	toTs := time.Date(2026, 7, 3, 0, 0, 0, 0, usageCST).Unix()
+
+	st, err := m.computeUsageStats(context.Background(), []int64{1}, fromTs, toTs, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(st.Daily) != 2 {
+		t.Fatalf("每日聚合应包含仅退款日期: %+v", st.Daily)
+	}
+	if d := st.Daily[0]; d.Requests != 1 || d.RefundRecords != 1 || d.ConsumeQuota != 500000 || d.RefundQuota != 200000 || d.NetQuota != 300000 || d.Tokens != 150 {
+		t.Fatalf("首日消费/退款口径错误: %+v", d)
+	}
+	if d := st.Daily[1]; d.Requests != 0 || d.RefundRecords != 1 || d.ConsumeQuota != 0 || d.RefundQuota != 700000 || d.NetQuota != -700000 || d.Tokens != 0 {
+		t.Fatalf("仅退款日应允许负净消费: %+v", d)
+	}
+	if s := st.Summary; s.Requests != 1 || s.RefundRecords != 2 || s.ConsumeQuota != 500000 || s.RefundQuota != 900000 || s.NetQuota != -400000 || s.Tokens != 150 || s.CostUSD != 1 {
+		t.Fatalf("汇总口径错误(兼容 cost_usd 必须仍是消费毛额): %+v", s)
+	}
+	if len(st.ByGroup) != 1 || st.ByGroup[0].NetQuota != -400000 || len(st.ByModel) != 1 || st.ByModel[0].RefundQuota != 900000 {
+		t.Fatalf("维度退款口径错误: group=%+v model=%+v", st.ByGroup, st.ByModel)
+	}
+
+	mx, err := m.computeUsageMatrix(context.Background(), []int64{1}, fromTs, toTs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(mx.Cells) != 2 || mx.Cells[0].NetQuota != 300000 || mx.Cells[1].NetQuota != -700000 {
+		t.Fatalf("矩阵应包含消费/退款/净消费: %+v", mx.Cells)
+	}
+	toks, err := m.computeUserTokenUsage(context.Background(), 1, fromTs, toTs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(toks) != 1 || toks[0].Requests != 1 || toks[0].RefundRecords != 2 || toks[0].ConsumeQuota != 500000 || toks[0].RefundQuota != 900000 || toks[0].NetQuota != -400000 {
+		t.Fatalf("令牌退款口径错误: %+v", toks)
+	}
+}
+
+func TestUsageDimensionTruncationAndDailyOtherCompleteness(t *testing.T) {
+	m := newTestMonitor(t)
+	m.prodDB = newFakeProdDB(t)
+	m.usageDayExpr = usageDayExprSQLite
+	day := time.Date(2026, 7, 1, 10, 0, 0, 0, usageCST).Unix()
+	var wantQuota int64
+	for i := 0; i < maxUsageDimRows+2; i++ {
+		quota := int64(i + 1)
+		wantQuota += quota
+		if _, err := m.prodDB.Exec("INSERT INTO logs (user_id,created_at,type,model_name,quota,prompt_tokens,completion_tokens,`group`) VALUES (1,?,2,?,?,1,1,?)",
+			day, fmt.Sprintf("model-%03d", i), quota, fmt.Sprintf("group-%03d", i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fromTs := time.Date(2026, 7, 1, 0, 0, 0, 0, usageCST).Unix()
+	toTs := time.Date(2026, 7, 2, 0, 0, 0, 0, usageCST).Unix()
+	st, err := m.computeUsageStats(context.Background(), []int64{1}, fromTs, toTs, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !st.ByGroupTruncated || !st.ByModelTruncated || len(st.ByGroup) != maxUsageDimRows || len(st.ByModel) != maxUsageDimRows {
+		t.Fatalf("维度截断必须显式标记: groups=%d/%v models=%d/%v", len(st.ByGroup), st.ByGroupTruncated, len(st.ByModel), st.ByModelTruncated)
+	}
+	if len(st.DailyByModel) != 7 {
+		t.Fatalf("每日模型应固定为 Top6+其他，而不是被硬 LIMIT 截断: %+v", st.DailyByModel)
+	}
+	var gotQuota int64
+	var otherCount int
+	for _, r := range st.DailyByModel {
+		gotQuota += r.ConsumeQuota
+		if r.Other {
+			otherCount++
+		}
+	}
+	if gotQuota != wantQuota || otherCount != 1 || st.Summary.ConsumeQuota != wantQuota {
+		t.Fatalf("每日趋势必须覆盖完整消费: got=%d want=%d other=%d summary=%d", gotQuota, wantQuota, otherCount, st.Summary.ConsumeQuota)
+	}
+}
+
+func TestServeUsageStatsDoesNotReturnPartialTokenData(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	m := newTestMonitor(t)
+	m.prodDB = newFakeProdDB(t)
+	m.usageDayExpr = usageDayExprSQLite
+	if err := m.storeDB.Save(&TrackedUser{UserID: 1, Username: "u1", AddedAt: 1}).Error; err != nil {
+		t.Fatal(err)
+	}
+	day := time.Date(2026, 7, 1, 10, 0, 0, 0, usageCST).Unix()
+	for _, q := range []string{
+		"INSERT INTO users (id,username,email) VALUES (1,'u1','')",
+		fmt.Sprintf("INSERT INTO logs (user_id,created_at,type,model_name,quota,prompt_tokens,completion_tokens,`group`,token_id) VALUES (1,%d,2,'m',500000,1,1,'g',10)", day),
+		"DROP TABLE tokens",
+	} {
+		if _, err := m.prodDB.Exec(q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest("GET", "/usage/stats?user_id=1&from=2026-07-01&to=2026-07-01", nil)
+	m.serveUsageStats(c)
+	if w.Code != 500 || strings.Contains(w.Body.String(), `"stats"`) || !strings.Contains(w.Body.String(), "令牌统计查询失败") {
+		t.Fatalf("令牌子查询失败不得返回统计半成品: status=%d body=%s", w.Code, w.Body.String())
+	}
+}
+
 func TestParseUsageRangeBoundary(t *testing.T) {
 	now := time.Date(2026, 7, 7, 15, 0, 0, 0, usageCST)
 	// 含两端点恰 366 天(覆盖闰年):2026-01-01 + 365 天 = 2027-01-01 → 应通过
@@ -322,6 +442,26 @@ func TestParseUsageRangeBoundary(t *testing.T) {
 	// 367 天 → 应拒绝(差值恰 366*24h,>= 判定)
 	if _, _, err := parseUsageRange("2026-01-01", "2027-01-02", now); err == nil {
 		t.Fatal("367 天应被拒绝")
+	}
+	from, to, err := parseUsageRange("2026-07-02", "2026-07-02", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if from != time.Date(2026, 7, 2, 0, 0, 0, 0, usageCST).Unix() || to != time.Date(2026, 7, 3, 0, 0, 0, 0, usageCST).Unix() {
+		t.Fatalf("单日范围应为左闭右开自然日: %d ~ %d", from, to)
+	}
+	if _, _, err := parseUsageRange("2026-07-02 08:00:00", "2026-07-02", now); err == nil {
+		t.Fatal("带时分秒的旧格式应被拒绝")
+	}
+}
+
+func TestEmbeddedRangePickerIsDateOnly(t *testing.T) {
+	js := string(rangePickerJS)
+	if !strings.Contains(js, "type: 'dateRange'") || !strings.Contains(js, "format: 'yyyy-MM-dd'") {
+		t.Fatal("范围控件没有配置为纯日期模式")
+	}
+	if strings.Contains(js, "dateTimeRange") || strings.Contains(js, "HH:mm:ss") {
+		t.Fatal("范围控件仍残留时分秒模式")
 	}
 }
 
@@ -355,15 +495,15 @@ func TestRefreshTrackedLabels(t *testing.T) {
 	if out[1].Email != "bob@x.com" || out[2].Email != "ghost@x.com" {
 		t.Fatalf("未变/已删用户处理不对 = %+v", out[1:])
 	}
-	// 余额顺路取回:alice $2、bob $0.5;已删用户(9)不在表中 → 前端显 —
-	if balances[1] != 2 || balances[2] != 0.5 {
+	// 余额顺路取回原始 quota:alice 1000000、bob 250000;已删用户(9)不在表中 → 前端显 —
+	if balances[1] != 1000000 || balances[2] != 250000 {
 		t.Fatalf("余额 = %+v", balances)
 	}
 	if _, ok := balances[9]; ok {
 		t.Fatal("已删用户不应有余额")
 	}
-	// 累计总消耗顺路取回:alice $3、bob $0;已删用户(9)不在表中 → 前端显 —
-	if used[1] != 3 || used[2] != 0 {
+	// 累计总消耗顺路取回原始 quota:alice 1500000、bob 0;已删用户(9)不在表中 → 前端显 —
+	if used[1] != 1500000 || used[2] != 0 {
 		t.Fatalf("累计总消耗 = %+v", used)
 	}
 	if _, ok := used[9]; ok {
@@ -576,6 +716,35 @@ func TestComputeUserTokenUsage(t *testing.T) {
 	mk := out[0].MaskedKey
 	if !strings.HasPrefix(mk, "sk-abcd") || !strings.HasSuffix(mk, "wxyz") || strings.Contains(mk, "567890") {
 		t.Fatalf("脱敏 key 不合规(泄露或格式错): %q", mk)
+	}
+}
+
+// 即使日志里出现了错误/伪造的 token_id，也只能回退显示该用户日志中的名称，
+// 绝不能借 token_id 读取另一个用户的令牌名称、分组、累计用量或脱敏 key。
+func TestComputeUserTokenUsageDoesNotLeakForeignToken(t *testing.T) {
+	m := newTestMonitor(t)
+	m.prodDB = newFakeProdDB(t)
+	seed := []string{
+		"INSERT INTO users (id,username,email) VALUES (5,'owner','owner@x.com')",
+		"INSERT INTO users (id,username,email) VALUES (6,'other','other@x.com')",
+		"INSERT INTO tokens (id,user_id,name,`key`,`group`,used_quota) VALUES (60,6,'其他用户密钥','foreign-secret-value','private',9000000)",
+		"INSERT INTO logs (user_id,created_at,type,model_name,quota,prompt_tokens,completion_tokens,`group`,token_id,token_name) VALUES (5,1000,2,'gpt',500000,1,1,'default',60,'日志侧名称')",
+	}
+	for _, q := range seed {
+		if _, err := m.prodDB.Exec(q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	out, err := m.computeUserTokenUsage(context.Background(), 5, 0, 2000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out) != 1 {
+		t.Fatalf("应只有日志回退行: %+v", out)
+	}
+	got := out[0]
+	if got.Name != "日志侧名称" || got.MaskedKey != "" || got.Group != "" || got.TotalCostUSD != nil || !got.Deleted {
+		t.Fatalf("发生跨用户令牌元数据泄漏: %+v", got)
 	}
 }
 

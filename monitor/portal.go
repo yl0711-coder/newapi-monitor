@@ -33,6 +33,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"golang.org/x/crypto/bcrypt"
+	"gorm.io/gorm"
 )
 
 //go:embed portal.html
@@ -93,7 +94,7 @@ func (m *Monitor) setGroupPortal(c *gin.Context) {
 	}
 	if in.Clear {
 		if err := m.storeDB.Model(&CustomerGroup{}).Where("id = ?", in.ID).
-			Updates(map[string]any{"portal_email": "", "portal_pw_admin": "", "portal_pw_user": ""}).Error; err != nil {
+			Updates(map[string]any{"portal_email": "", "portal_pw_admin": "", "portal_pw_user": "", "portal_auth_ver": gorm.Expr("portal_auth_ver + 1")}).Error; err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 			return
 		}
@@ -132,6 +133,9 @@ func (m *Monitor) setGroupPortal(c *gin.Context) {
 	if in.ResetUserPw {
 		upd["portal_pw_user"] = ""
 	}
+	if email != g.PortalEmail || in.Password != "" || in.ResetUserPw {
+		upd["portal_auth_ver"] = gorm.Expr("portal_auth_ver + 1")
+	}
 	if err := m.storeDB.Model(&CustomerGroup{}).Where("id = ?", in.ID).Updates(upd).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -143,38 +147,47 @@ func (m *Monitor) setGroupPortal(c *gin.Context) {
 
 func (m *Monitor) portalMACKey() []byte { return []byte(m.cfg.SessionSecret + "|portal") }
 
-func (m *Monitor) signPortalSession(gid int64, nowUnix int64) string {
-	p := fmt.Sprintf("%d|%d", gid, nowUnix)
+func (m *Monitor) signPortalSession(gid, authVer, nowUnix int64) string {
+	p := fmt.Sprintf("%d|%d|%d", gid, authVer, nowUnix)
 	enc := base64.RawURLEncoding.EncodeToString([]byte(p))
 	mac := hmac.New(sha256.New, m.portalMACKey())
 	mac.Write([]byte(enc))
 	return enc + "." + hex.EncodeToString(mac.Sum(nil))
 }
 
-func (m *Monitor) verifyPortalSession(token string, nowUnix int64) (gid int64, ok bool) {
+func (m *Monitor) verifyPortalSession(token string, nowUnix int64) (gid, authVer int64, ok bool) {
 	parts := strings.SplitN(token, ".", 2)
 	if len(parts) != 2 {
-		return 0, false
+		return 0, 0, false
 	}
 	mac := hmac.New(sha256.New, m.portalMACKey())
 	mac.Write([]byte(parts[0]))
 	if !hmac.Equal([]byte(hex.EncodeToString(mac.Sum(nil))), []byte(parts[1])) {
-		return 0, false
+		return 0, 0, false
 	}
 	raw, err := base64.RawURLEncoding.DecodeString(parts[0])
 	if err != nil {
-		return 0, false
+		return 0, 0, false
 	}
 	f := strings.Split(string(raw), "|")
-	if len(f) != 2 {
-		return 0, false
+	if len(f) != 2 && len(f) != 3 {
+		return 0, 0, false
 	}
 	gid, _ = strconv.ParseInt(f[0], 10, 64)
-	issued, _ := strconv.ParseInt(f[1], 10, 64)
-	if gid <= 0 || nowUnix-issued > int64(portalSessionTTL.Seconds()) {
-		return 0, false
+	var issued int64
+	if len(f) == 2 {
+		// 升级前会话没有版本字段，等价于版本 0；这样部署本身不强制全员掉线。
+		// 一旦账号或密码发生变化，库内版本递增，旧会话仍会立即失效。
+		authVer = 0
+		issued, _ = strconv.ParseInt(f[1], 10, 64)
+	} else {
+		authVer, _ = strconv.ParseInt(f[1], 10, 64)
+		issued, _ = strconv.ParseInt(f[2], 10, 64)
 	}
-	return gid, true
+	if gid <= 0 || nowUnix-issued > int64(portalSessionTTL.Seconds()) {
+		return 0, 0, false
+	}
+	return gid, authVer, true
 }
 
 // ---- 登录限流(来源 IP,窗口内失败次数封顶) ----
@@ -318,7 +331,8 @@ func (m *Monitor) RegisterPortalRoutes(r *gin.Engine) {
 		c.Data(http.StatusOK, "text/css; charset=utf-8", flatpickrCSS)
 	})
 	r.GET("/range-picker.js", func(c *gin.Context) { // 与管理端同源的中转站风格范围选择器
-		c.Header("Cache-Control", "public, max-age=31536000, immutable")
+		// 这是会随 Monitor 功能调整的适配层，不做永久不可变缓存。
+		c.Header("Cache-Control", "no-cache")
 		c.Data(http.StatusOK, "application/javascript; charset=utf-8", rangePickerJS)
 	})
 	r.GET("/react.js", func(c *gin.Context) {
@@ -365,7 +379,7 @@ func (m *Monitor) RegisterPortalRoutes(r *gin.Engine) {
 func (m *Monitor) requirePortal(apiMode bool) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		tok, _ := c.Cookie(portalSessionCookie)
-		gid, ok := m.verifyPortalSession(tok, time.Now().Unix())
+		gid, authVer, ok := m.verifyPortalSession(tok, time.Now().Unix())
 		if !ok {
 			if apiMode {
 				c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
@@ -377,7 +391,7 @@ func (m *Monitor) requirePortal(apiMode bool) gin.HandlerFunc {
 		}
 		// 会话有效但账号可能已被关闭:每次核一遍(代价=本地 sqlite 主键查,可忽略)
 		var g CustomerGroup
-		if err := m.storeDB.First(&g, gid).Error; err != nil || g.PortalEmail == "" {
+		if err := m.storeDB.First(&g, gid).Error; err != nil || g.PortalEmail == "" || g.PortalAuthVer != authVer {
 			if apiMode {
 				c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
 			} else {
@@ -421,7 +435,7 @@ func (m *Monitor) portalLogin(c *gin.Context) {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "账号或密码错误"})
 		return
 	}
-	tok := m.signPortalSession(g.ID, now)
+	tok := m.signPortalSession(g.ID, g.PortalAuthVer, now)
 	secure := c.Request.TLS != nil || c.GetHeader("X-Forwarded-Proto") == "https"
 	c.SetSameSite(http.SameSiteLaxMode)
 	c.SetCookie(portalSessionCookie, tok, int(portalSessionTTL.Seconds()), "/", "", secure, true)
@@ -453,29 +467,47 @@ func (m *Monitor) portalChangePassword(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "密码处理失败"})
 		return
 	}
-	if err := m.storeDB.Model(&CustomerGroup{}).Where("id = ?", gid).Update("portal_pw_user", h).Error; err != nil {
+	if err := m.storeDB.Model(&CustomerGroup{}).Where("id = ?", gid).Updates(map[string]any{
+		"portal_pw_user":  h,
+		"portal_auth_ver": gorm.Expr("portal_auth_ver + 1"),
+	}).Error; err != nil {
 		slog.Warn("客户改密码写库失败", "gid", gid, "err", err) // 细节进日志,不回显库内部结构给客户
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "保存失败,请稍后重试"})
 		return
 	}
+	secure := c.Request.TLS != nil || c.GetHeader("X-Forwarded-Proto") == "https"
+	c.SetSameSite(http.SameSiteLaxMode)
+	c.SetCookie(portalSessionCookie, "", -1, "/", "", secure, true)
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
 
 // ---- 组隔离数据接口(gid 只从会话取) ----
 
 type portalOverviewPayload struct {
-	GroupName    string            `json:"group_name"`
-	From         string            `json:"from"`
-	To           string            `json:"to"`
-	Days         []string          `json:"days"`
-	Users        []UsageMatrixUser `json:"users"` // 复用矩阵行结构(note/group 字段对本组无泄露风险,前端不展示 note)
-	Cells        []UsageMatrixCell `json:"cells"`
-	DailyByModel []UsageDailyModel `json:"daily_by_model"` // 供首页每日消费趋势按模型堆叠展示
-	ByModel      []UsageDim        `json:"by_model"`       // 供堆叠图确定 top-N 模型
+	GroupName        string            `json:"group_name"`
+	From             string            `json:"from"`
+	To               string            `json:"to"`
+	Days             []string          `json:"days"`
+	Users            []UsageMatrixUser `json:"users"` // 复用矩阵行结构(note/group 字段对本组无泄露风险,前端不展示 note)
+	Cells            []UsageMatrixCell `json:"cells"`
+	DailyByModel     []UsageDailyModel `json:"daily_by_model"` // 供首页每日消费趋势按模型堆叠展示
+	ByModel          []UsageDim        `json:"by_model"`       // 供堆叠图确定 top-N 模型
+	ByModelTruncated bool              `json:"by_model_truncated"`
 }
 
 func portalOverviewKey(gid, fromTs, toTs int64) string {
 	return fmt.Sprintf("ov|%d|%d|%d", gid, fromTs, toTs)
+}
+
+// invalidatePortalGroup 清掉一个客户组的全部 Portal 数据缓存。只操作 Monitor 进程内存，
+// 不访问或修改 NewAPI 数据库；gid=0(未分组、无客户端账号)无需处理。
+func (m *Monitor) invalidatePortalGroup(gid int64) {
+	if gid <= 0 || m.portalCache == nil {
+		return
+	}
+	for _, kind := range []string{"ov", "bd", "ud"} {
+		m.portalCache.DeletePrefix(fmt.Sprintf("%s|%d|", kind, gid))
+	}
 }
 
 func (m *Monitor) portalOverview(c *gin.Context) {
@@ -516,19 +548,26 @@ func (m *Monitor) buildPortalOverview(c *gin.Context, gid, fromTs, toTs int64) (
 	if err != nil {
 		return nil, err
 	}
-	totals := map[int64]float64{}
+	totals := map[int64]UsageBilling{}
 	for _, cell := range mx.Cells {
-		totals[cell.UserID] += cell.CostUSD
+		t := totals[cell.UserID]
+		t.add(cell.UsageBilling)
+		totals[cell.UserID] = t
 	}
 	for _, u := range tracked {
-		mu := UsageMatrixUser{UserID: u.UserID, Username: u.Username, Email: u.Email, TotalUSD: totals[u.UserID]}
+		t := totals[u.UserID]
+		mu := UsageMatrixUser{UserID: u.UserID, Username: u.Username, Email: u.Email,
+			ConsumeQuota: t.ConsumeQuota, RefundQuota: t.RefundQuota, NetQuota: t.NetQuota,
+			TotalUSD: t.CostUSD, RefundUSD: t.RefundUSD, NetUSD: t.NetUSD}
 		if b, ok := balances[u.UserID]; ok {
-			bv := b
-			mu.BalanceUSD = &bv
+			bq := b
+			bv := float64(bq) / quotaPerUSD
+			mu.BalanceQuota, mu.BalanceUSD = &bq, &bv
 		}
 		if uq, ok := usedTotals[u.UserID]; ok {
-			uv := uq
-			mu.TotalUsedUSD = &uv
+			usedQ := uq
+			uv := float64(usedQ) / quotaPerUSD
+			mu.TotalUsedQuota, mu.TotalUsedUSD = &usedQ, &uv
 		}
 		p.Users = append(p.Users, mu)
 	}
@@ -541,14 +580,15 @@ func (m *Monitor) buildPortalOverview(c *gin.Context, gid, fromTs, toTs int64) (
 	}
 	p.DailyByModel = st.DailyByModel
 	p.ByModel = st.ByModel
+	p.ByModelTruncated = st.ByModelTruncated
 	return p, nil
 }
 
 // sortPortalUsers 与管理端同规则:累计总消耗降序,稳定。
 func sortPortalUsers(users []UsageMatrixUser) {
-	usedOf := func(u UsageMatrixUser) float64 {
-		if u.TotalUsedUSD != nil {
-			return *u.TotalUsedUSD
+	usedOf := func(u UsageMatrixUser) int64 {
+		if u.TotalUsedQuota != nil {
+			return *u.TotalUsedQuota
 		}
 		return 0
 	}
@@ -570,18 +610,23 @@ func (m *Monitor) portalBreakdown(c *gin.Context) {
 		return
 	}
 	var tracked []TrackedUser
-	m.storeDB.Where("group_id = ?", gid).Find(&tracked)
+	if err := m.storeDB.Where("group_id = ?", gid).Find(&tracked).Error; err != nil {
+		slog.Warn("查询客户组成员失败", "gid", gid, "err", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "查询失败,请稍后重试"})
+		return
+	}
 	ids := idsOf(tracked)
 	key := fmt.Sprintf("bd|%d|%d|%d", gid, fromTs, toTs)
 	val, err := m.portalCache.Do(key, portalCacheTTL, func() (any, error) {
 		if len(ids) == 0 {
-			return gin.H{"by_group": []UsageDim{}, "by_model": []UsageDim{}}, nil
+			return gin.H{"by_group": []UsageDim{}, "by_model": []UsageDim{}, "by_group_truncated": false, "by_model_truncated": false}, nil
 		}
 		st, err := m.computeUsageStats(c.Request.Context(), ids, fromTs, toTs, 0)
 		if err != nil {
 			return nil, err
 		}
-		return gin.H{"by_group": st.ByGroup, "by_model": st.ByModel}, nil
+		return gin.H{"by_group": st.ByGroup, "by_model": st.ByModel,
+			"by_group_truncated": st.ByGroupTruncated, "by_model_truncated": st.ByModelTruncated}, nil
 	})
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "查询失败,请稍后重试"})
@@ -631,11 +676,15 @@ func (m *Monitor) portalUserDetail(c *gin.Context) {
 		if err != nil {
 			return nil, err
 		}
+		balanceQ := m.userBalanceQuota(c.Request.Context(), uid)
+		usedQ := m.userUsedQuota(c.Request.Context(), uid)
 		return gin.H{
-			"stats":          st,   // 含每日/按分组/按模型(客户可看自己的分组与模型用量)
-			"by_token":       toks, // 该用户各令牌用量,key 已脱敏
-			"balance_usd":    m.userBalanceUSD(c.Request.Context(), uid),
-			"total_used_usd": m.userUsedUSD(c.Request.Context(), uid),
+			"stats":            st,   // 含每日/按分组/按模型(客户可看自己的分组与模型用量)
+			"by_token":         toks, // 该用户各令牌用量,key 已脱敏
+			"balance_quota":    balanceQ,
+			"balance_usd":      quotaUSDPtr(balanceQ),
+			"total_used_quota": usedQ,
+			"total_used_usd":   quotaUSDPtr(usedQ),
 		}, nil
 	})
 	if err != nil {
