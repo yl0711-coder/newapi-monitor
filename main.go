@@ -46,6 +46,7 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("启动失败: %w", err)
 	}
+	defer m.Close()
 
 	// 收到 SIGINT/SIGTERM 时取消 ctx:采样器退出 + HTTP 优雅关停。
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

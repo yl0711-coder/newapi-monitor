@@ -11,10 +11,11 @@ package monitor
 // 账号模型:一组一账号(portal_email),双密码并存——我方配置密码(PortalPwAdmin,永久有效)
 // 和客户自改密码(PortalPwUser)任一匹配即可登录;均只存 bcrypt 哈希,后台不可见只能重置。
 //
-// 容量设计(100-200 人同时看没事):组级 TTL 缓存 + singleflight(cache.go),
-// 生产库压力 ≤ 每组每 TTL 一条小查询;管理端刷新时只使对应组总览缓存失效，客户端随后写入完整载荷。
+// 容量设计:昂贵聚合结果走 Redis(可选)+有界本机应急缓存+
+// singleflight(cache.go)。Redis 不可用时自动降级；缓存键带服务端成员指纹，成员变化不会串组。
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	_ "embed"
@@ -45,7 +46,6 @@ var portalLoginHTML string
 const (
 	portalSessionCookie  = "report_session" // 中性命名,不带 monitor 字样
 	portalSessionTTL     = 12 * time.Hour
-	portalCacheTTL       = 60 * time.Second // 组级数据缓存;客户看到的数据最多滞后 60s
 	portalLoginWindow    = 10 * time.Minute // 登录限流窗口
 	portalLogPageSize    = 50               // 日志查看每页条数
 	portalExportCap      = 50000            // 单次 CSV 导出封顶行数(超出弹确认导最新这么多)
@@ -299,8 +299,8 @@ func (l *exportLimiter) prune(now, window int64) {
 
 func (m *Monitor) RegisterPortalRoutes(r *gin.Engine) {
 	r.Use(requestBodyLimit(maxJSONRequestBody))
-	if m.portalCache == nil {
-		m.portalCache = newTTLCache()
+	if m.usageCache == nil {
+		m.usageCache = newUsageResultCache(m.cfg)
 	}
 	if m.portalLim == nil {
 		m.portalLim = &portalLimiter{m: map[string][]int64{}}
@@ -308,11 +308,11 @@ func (m *Monitor) RegisterPortalRoutes(r *gin.Engine) {
 	if m.exportLim == nil {
 		m.exportLim = &exportLimiter{last: map[int64]int64{}}
 	}
-	// 缓存 + 限流表 GC:低频粗扫,防长期运行/被刷时缓慢增长
+	// 限流表 GC:低频粗扫,防长期运行/被刷时缓慢增长。结果缓存自身有容量硬上限，
+	// Redis 键又全部带 TTL，不需要后台全表扫描。
 	go func() {
 		t := time.NewTicker(10 * time.Minute)
 		for range t.C {
-			m.portalCache.gc()
 			m.portalLim.prune(time.Now().Unix())
 			m.exportLim.prune(time.Now().Unix(), int64(portalExportWindow.Seconds()))
 		}
@@ -495,19 +495,25 @@ type portalOverviewPayload struct {
 	ByModelTruncated bool              `json:"by_model_truncated"`
 }
 
-func portalOverviewKey(gid, fromTs, toTs int64) string {
-	return fmt.Sprintf("ov|%d|%d|%d", gid, fromTs, toTs)
+// portalMemberFingerprint 只使用服务端名单中的 user_id，排序后取 SHA-256 前 128 位。
+// 它不是鉴权凭据，只用于让成员增删/移动后自然换键，避免 Redis 中旧权限域被重新命中。
+func portalMemberFingerprint(tracked []TrackedUser) string {
+	ids := idsOf(tracked)
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	h := sha256.New()
+	for _, id := range ids {
+		_, _ = h.Write([]byte(strconv.FormatInt(id, 10)))
+		_, _ = h.Write([]byte{','})
+	}
+	return hex.EncodeToString(h.Sum(nil)[:16])
 }
 
-// invalidatePortalGroup 清掉一个客户组的全部 Portal 数据缓存。只操作 Monitor 进程内存，
-// 不访问或修改 NewAPI 数据库；gid=0(未分组、无客户端账号)无需处理。
-func (m *Monitor) invalidatePortalGroup(gid int64) {
-	if gid <= 0 || m.portalCache == nil {
-		return
-	}
-	for _, kind := range []string{"ov", "bd", "ud"} {
-		m.portalCache.DeletePrefix(fmt.Sprintf("%s|%d|", kind, gid))
-	}
+func portalGroupAggregateKey(kind string, gid int64, memberFP string, fromTs, toTs int64) string {
+	return fmt.Sprintf("agg:%s:portal:g:%d:m:%s:r:%d:%d:%s", usageAggregateKeyVersion, gid, memberFP, fromTs, toTs, kind)
+}
+
+func portalUserAggregateKey(kind string, gid int64, memberFP string, uid, tokenID, fromTs, toTs int64) string {
+	return fmt.Sprintf("agg:%s:portal:g:%d:m:%s:r:%d:%d:u:%d:t:%d:%s", usageAggregateKeyVersion, gid, memberFP, fromTs, toTs, uid, tokenID, kind)
 }
 
 func (m *Monitor) portalOverview(c *gin.Context) {
@@ -517,9 +523,7 @@ func (m *Monitor) portalOverview(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	val, err := m.portalCache.DoContext(c.Request.Context(), portalOverviewKey(gid, fromTs, toTs), portalCacheTTL, func() (any, error) {
-		return m.buildPortalOverview(c, gid, fromTs, toTs)
-	})
+	val, err := m.buildPortalOverview(c, gid, fromTs, toTs)
 	if err != nil {
 		if abortCanceledUsageRequest(c, err) {
 			return
@@ -550,7 +554,24 @@ func (m *Monitor) buildPortalOverview(c *gin.Context, gid, fromTs, toTs int64) (
 	if err := c.Request.Context().Err(); err != nil {
 		return nil, err
 	}
-	mx, err := m.computeUsageMatrix(c.Request.Context(), idsOf(tracked), fromTs, toTs)
+	ids := idsOf(tracked)
+	memberFP := portalMemberFingerprint(tracked)
+	cacheTTL := usageAggregateTTL(toTs, time.Now())
+	mx := &UsageMatrix{}
+	err := m.usageCache.DoJSON(
+		c.Request.Context(),
+		portalGroupAggregateKey("matrix", gid, memberFP, fromTs, toTs),
+		cacheTTL,
+		mx,
+		func() (any, error) {
+			result, err := m.computeUsageMatrix(c.Request.Context(), ids, fromTs, toTs)
+			if result != nil {
+				// 防御未来 computeUsageMatrix 改动：Redis 只允许稀疏消费格，不保存用户资料列。
+				result.Users = nil
+			}
+			return result, err
+		},
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -580,7 +601,14 @@ func (m *Monitor) buildPortalOverview(c *gin.Context, gid, fromTs, toTs int64) (
 	sortPortalUsers(p.Users)
 	p.From, p.To, p.Days, p.Cells = mx.From, mx.To, mx.Days, mx.Cells
 	// 供首页每日趋势图按模型堆叠展示:查询同范围内按日×模型的聚合(复用 computeUsageStats 内部逻辑)
-	st, err := m.computeUsageStats(c.Request.Context(), idsOf(tracked), fromTs, toTs, 0)
+	st := &UsageStats{}
+	err = m.usageCache.DoJSON(
+		c.Request.Context(),
+		portalGroupAggregateKey("stats", gid, memberFP, fromTs, toTs),
+		cacheTTL,
+		st,
+		func() (any, error) { return m.computeUsageStats(c.Request.Context(), ids, fromTs, toTs, 0) },
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -607,7 +635,8 @@ func sortPortalUsers(users []UsageMatrixUser) {
 	})
 }
 
-// portalBreakdown GET /api/breakdown:整组(公司)按分组 + 按模型的汇总,独立缓存(不走写穿透)。
+// portalBreakdown GET /api/breakdown:整组(公司)按分组 + 按模型的汇总。
+// 与 overview 复用完全相同的 stats 聚合键，避免同一范围冷启动重复扫描日志。
 func (m *Monitor) portalBreakdown(c *gin.Context) {
 	gid := c.GetInt64("portalGID")
 	fromTs, toTs, err := parseUsageRange(c.Query("from"), c.Query("to"), time.Now())
@@ -622,18 +651,22 @@ func (m *Monitor) portalBreakdown(c *gin.Context) {
 		return
 	}
 	ids := idsOf(tracked)
-	key := fmt.Sprintf("bd|%d|%d|%d", gid, fromTs, toTs)
-	val, err := m.portalCache.DoContext(c.Request.Context(), key, portalCacheTTL, func() (any, error) {
-		if len(ids) == 0 {
-			return gin.H{"by_group": []UsageDim{}, "by_model": []UsageDim{}, "by_group_truncated": false, "by_model_truncated": false}, nil
-		}
-		st, err := m.computeUsageStats(c.Request.Context(), ids, fromTs, toTs, 0)
-		if err != nil {
-			return nil, err
-		}
-		return gin.H{"by_group": st.ByGroup, "by_model": st.ByModel,
-			"by_group_truncated": st.ByGroupTruncated, "by_model_truncated": st.ByModelTruncated}, nil
-	})
+	if len(ids) == 0 {
+		c.JSON(http.StatusOK, gin.H{"ok": true, "data": gin.H{
+			"by_group": []UsageDim{}, "by_model": []UsageDim{},
+			"by_group_truncated": false, "by_model_truncated": false,
+		}})
+		return
+	}
+	st := &UsageStats{}
+	cacheTTL := usageAggregateTTL(toTs, time.Now())
+	err = m.usageCache.DoJSON(
+		c.Request.Context(),
+		portalGroupAggregateKey("stats", gid, portalMemberFingerprint(tracked), fromTs, toTs),
+		cacheTTL,
+		st,
+		func() (any, error) { return m.computeUsageStats(c.Request.Context(), ids, fromTs, toTs, 0) },
+	)
 	if err != nil {
 		if abortCanceledUsageRequest(c, err) {
 			return
@@ -641,7 +674,10 @@ func (m *Monitor) portalBreakdown(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "查询失败,请稍后重试"})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"ok": true, "data": val})
+	c.JSON(http.StatusOK, gin.H{"ok": true, "data": gin.H{
+		"by_group": st.ByGroup, "by_model": st.ByModel,
+		"by_group_truncated": st.ByGroupTruncated, "by_model_truncated": st.ByModelTruncated,
+	}})
 }
 
 func (m *Monitor) portalUserDetail(c *gin.Context) {
@@ -651,10 +687,22 @@ func (m *Monitor) portalUserDetail(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "uid required"})
 		return
 	}
-	// 越权闸:uid 必须是本组成员
-	var cnt int64
-	m.storeDB.Model(&TrackedUser{}).Where("group_id = ? AND user_id = ?", gid, uid).Count(&cnt)
-	if cnt == 0 {
+	// 越权闸:uid 必须是本组成员。顺路取得完整成员集合，服务端成员指纹进入缓存键。
+	var tracked []TrackedUser
+	if err := m.storeDB.Where("group_id = ?", gid).Order("user_id").Find(&tracked).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "查询失败,请稍后重试"})
+		return
+	}
+	found := false
+	var member TrackedUser
+	for _, u := range tracked {
+		if u.UserID == uid {
+			found = true
+			member = u
+			break
+		}
+	}
+	if !found {
 		c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
 		return
 	}
@@ -672,30 +720,18 @@ func (m *Monitor) portalUserDetail(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	key := fmt.Sprintf("ud|%d|%d|%d|%d|%d", gid, uid, tokenID, fromTs, toTs)
-	val, err := m.portalCache.DoContext(c.Request.Context(), key, portalCacheTTL, func() (any, error) {
-		st, err := m.computeUsageStats(c.Request.Context(), []int64{uid}, fromTs, toTs, tokenID)
-		if err != nil {
-			return nil, err
-		}
-		if tokenID > 0 { // 令牌详情:不带成员余额/令牌列表,补令牌元数据(名称/脱敏key/分组/累计)
-			return gin.H{"stats": st, "token": m.tokenMetaOf(c.Request.Context(), uid, tokenID)}, nil
-		}
-		toks, err := m.computeUserTokenUsage(c.Request.Context(), uid, fromTs, toTs)
-		if err != nil {
-			return nil, err
-		}
-		balanceQ := m.userBalanceQuota(c.Request.Context(), uid)
-		usedQ := m.userUsedQuota(c.Request.Context(), uid)
-		return gin.H{
-			"stats":            st,   // 含每日/按分组/按模型(客户可看自己的分组与模型用量)
-			"by_token":         toks, // 该用户各令牌用量,key 已脱敏
-			"balance_quota":    balanceQ,
-			"balance_usd":      quotaUSDPtr(balanceQ),
-			"total_used_quota": usedQ,
-			"total_used_usd":   quotaUSDPtr(usedQ),
-		}, nil
-	})
+	memberFP := portalMemberFingerprint(tracked)
+	cacheTTL := usageAggregateTTL(toTs, time.Now())
+	st := &UsageStats{}
+	err = m.usageCache.DoJSON(
+		c.Request.Context(),
+		portalUserAggregateKey("stats", gid, memberFP, uid, tokenID, fromTs, toTs),
+		cacheTTL,
+		st,
+		func() (any, error) {
+			return m.computeUsageStats(c.Request.Context(), []int64{uid}, fromTs, toTs, tokenID)
+		},
+	)
 	if err != nil {
 		if abortCanceledUsageRequest(c, err) {
 			return
@@ -703,7 +739,68 @@ func (m *Monitor) portalUserDetail(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "查询失败,请稍后重试"})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"ok": true, "data": val})
+	if tokenID > 0 { // 令牌元数据保持实时查询；缓存中只有日志聚合数字。
+		c.JSON(http.StatusOK, gin.H{"ok": true, "data": gin.H{
+			"stats": st, "token": m.tokenMetaOf(c.Request.Context(), uid, tokenID),
+		}})
+		return
+	}
+
+	var tokenAggregates []tokenUsageAggregate
+	err = m.usageCache.DoJSON(
+		c.Request.Context(),
+		portalUserAggregateKey("tokens", gid, memberFP, uid, 0, fromTs, toTs),
+		cacheTTL,
+		&tokenAggregates,
+		func() (any, error) {
+			return m.computeUserTokenAggregates(c.Request.Context(), uid, fromTs, toTs)
+		},
+	)
+	if err != nil {
+		if abortCanceledUsageRequest(c, err) {
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "查询失败,请稍后重试"})
+		return
+	}
+	toks, err := m.hydrateUserTokenUsage(c.Request.Context(), uid, tokenAggregates)
+	if err != nil {
+		if abortCanceledUsageRequest(c, err) {
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "查询失败,请稍后重试"})
+		return
+	}
+	// 用户名/邮箱/余额/累计总消耗保持实时：一个 users 主键查询同时取回四项，
+	// 不进入 Redis。失败时沿用本地脱敏展示名，金额显示 —，不阻断历史统计。
+	fresh, balances, usedTotals := m.refreshTrackedLabels(c.Request.Context(), []TrackedUser{member})
+	if err := c.Request.Context().Err(); err != nil {
+		return
+	}
+	owner := trackedLabel(member)
+	if len(fresh) == 1 {
+		owner = trackedLabel(fresh[0])
+	}
+	for i := range toks {
+		toks[i].Owner = owner
+	}
+	var balanceQ, usedQ *int64
+	if v, ok := balances[uid]; ok {
+		q := v
+		balanceQ = &q
+	}
+	if v, ok := usedTotals[uid]; ok {
+		q := v
+		usedQ = &q
+	}
+	c.JSON(http.StatusOK, gin.H{"ok": true, "data": gin.H{
+		"stats":            st,
+		"by_token":         toks, // key 始终在 hydrateUserTokenUsage 的实时元数据阶段脱敏
+		"balance_quota":    balanceQ,
+		"balance_usd":      quotaUSDPtr(balanceQ),
+		"total_used_quota": usedQ,
+		"total_used_usd":   quotaUSDPtr(usedQ),
+	}})
 }
 
 // ---- 使用日志(逐条明细):查看 + CSV 导出 ----
@@ -932,20 +1029,55 @@ func portalCSVRecord(r LogRow) []string {
 	}
 }
 
-// invalidatePortalOverviews 管理端刷新矩阵后删除受影响客户组的总览缓存。
-// 旧实现会把仅含 Users/Cells 的矩阵切片写成 portalOverviewPayload，遗漏趋势所需的
-// DailyByModel/ByModel，造成“下方有矩阵、上方趋势为空”。总览必须整体缓存或整体失效。
-func (m *Monitor) invalidatePortalOverviews(tracked []TrackedUser, fromTs, toTs int64) {
-	if m.portalCache == nil {
+// invalidatePortalAggregates 管理端手动刷新矩阵后，精确删除同范围内各客户组的
+// matrix/stats 两个聚合键。删除失败不影响响应；旧结果仍受自身有界 TTL 约束。
+func (m *Monitor) invalidatePortalAggregates(tracked []TrackedUser, fromTs, toTs int64) {
+	if m.usageCache == nil {
 		return
 	}
-	seen := make(map[int64]struct{}, len(tracked))
+	byGroup := make(map[int64][]TrackedUser)
 	for _, u := range tracked {
 		if u.GroupID > 0 {
-			seen[u.GroupID] = struct{}{}
+			byGroup[u.GroupID] = append(byGroup[u.GroupID], u)
 		}
 	}
-	for gid := range seen {
-		m.portalCache.Delete(portalOverviewKey(gid, fromTs, toTs))
+	keys := make([]string, 0, len(byGroup)*2)
+	for gid, members := range byGroup {
+		memberFP := portalMemberFingerprint(members)
+		keys = append(keys,
+			portalGroupAggregateKey("matrix", gid, memberFP, fromTs, toTs),
+			portalGroupAggregateKey("stats", gid, memberFP, fromTs, toTs),
+		)
 	}
+	m.usageCache.Delete(context.Background(), keys...)
+}
+
+// invalidatePortalUserAggregates 在管理端主动刷新某用户/令牌后，精确删除该客户组的
+// 对应下钻聚合。指纹必须使用整个客户组的当前成员，不能只用被查的单个用户。
+func (m *Monitor) invalidatePortalUserAggregates(tracked []TrackedUser, uid, tokenID, fromTs, toTs int64) {
+	if m.usageCache == nil || uid <= 0 {
+		return
+	}
+	var gid int64
+	for _, u := range tracked {
+		if u.UserID == uid {
+			gid = u.GroupID
+			break
+		}
+	}
+	if gid <= 0 {
+		return // 未分组用户没有 Usage Portal 权限域。
+	}
+	members := make([]TrackedUser, 0)
+	for _, u := range tracked {
+		if u.GroupID == gid {
+			members = append(members, u)
+		}
+	}
+	memberFP := portalMemberFingerprint(members)
+	keys := []string{portalUserAggregateKey("stats", gid, memberFP, uid, tokenID, fromTs, toTs)}
+	if tokenID == 0 {
+		keys = append(keys, portalUserAggregateKey("tokens", gid, memberFP, uid, 0, fromTs, toTs))
+	}
+	m.usageCache.Delete(context.Background(), keys...)
 }

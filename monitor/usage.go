@@ -3,8 +3,9 @@ package monitor
 // usage.go:「用户用量」——盯一组指定的 new-api 用户(按邮箱 / 用户ID 添加),
 // 按需对生产库 logs 表做窗口化聚合:消费矩阵(用户×日)与单用户详情(每日/分组/模型),费用=quota/500000 美元。
 //
-// 与采样器的边界:采样器是【常驻周期】查询,这里是【按需】查询——只在打开页面 / 点查询时执行,
-// 全部限定时间范围，并由可取消的单槽闸门控制同一时刻最多一条重查询；具体索引利用情况需以
+// 与采样器的边界:采样器是【常驻周期】查询,这里是【按需】查询——只在打开页面 / 重选日期时执行。
+// 可重新计算的聚合结果会进入有界缓存，余额/用户资料/原始日志始终实时读取。源查询全部限定时间范围，
+// 并由可取消的单槽闸门控制同一时刻最多一条重查询；具体索引利用情况需以
 // 生产库 EXPLAIN 为准，不能仅因 WHERE 中存在索引列就假定一定命中。生产库全程只读。
 // 名单存本地 sqlite(tracked_users);鉴权沿用全站约定:管理员可看,仅超管可改名单。
 
@@ -456,6 +457,31 @@ func parseUsageRange(fromStr, toStr string, now time.Time) (fromTs, toTs int64, 
 	return from.Unix(), to.AddDate(0, 0, 1).Unix(), nil // to 含当天 → 上界取次日 0 点(开区间)
 }
 
+// adminUsageAggregateKey 只标识可重算的数字聚合。用户集合取服务端 ID 指纹，
+// 日期/令牌/统计类型均入键；用户名、邮箱、余额等实时字段不进键也不进值。
+func adminUsageAggregateKey(kind, memberFP string, uid, tokenID, fromTs, toTs int64) string {
+	return fmt.Sprintf("agg:%s:admin:m:%s:r:%d:%d:u:%d:t:%d:%s",
+		usageAggregateKeyVersion, memberFP, fromTs, toTs, uid, tokenID, kind)
+}
+
+func usageRefreshRequested(c *gin.Context) bool {
+	return c.Query("refresh") == "1"
+}
+
+func (m *Monitor) loadUsageAggregateJSON(
+	ctx context.Context,
+	key string,
+	ttl time.Duration,
+	forceFresh bool,
+	dst any,
+	fill func() (any, error),
+) error {
+	if forceFresh {
+		return m.usageCache.DoJSONFresh(ctx, key, ttl, dst, fill)
+	}
+	return m.usageCache.DoJSON(ctx, key, ttl, dst, fill)
+}
+
 // ---- HTTP 处理器 ----
 
 // serveUsageMatrix GET /usage/matrix?from=&to=(管理员):列表页矩阵数据(前端渲染为 行=用户 × 列=日期)。
@@ -480,7 +506,24 @@ func (m *Monitor) serveUsageMatrix(c *gin.Context) {
 		abortCanceledUsageRequest(c, err)
 		return
 	}
-	mx, err := m.computeUsageMatrix(c.Request.Context(), idsOf(tracked), fromTs, toTs)
+	memberFP := portalMemberFingerprint(tracked)
+	forceFresh := usageRefreshRequested(c)
+	mx := &UsageMatrix{}
+	err = m.loadUsageAggregateJSON(
+		c.Request.Context(),
+		adminUsageAggregateKey("matrix", memberFP, 0, 0, fromTs, toTs),
+		usageAggregateTTL(toTs, time.Now()),
+		forceFresh,
+		mx,
+		func() (any, error) {
+			result, err := m.computeUsageMatrix(c.Request.Context(), idsOf(tracked), fromTs, toTs)
+			if result != nil {
+				// 管理端身份、余额与分组字段在响应阶段实时组装，不进 Redis。
+				result.Users = nil
+			}
+			return result, err
+		},
+	)
 	if err != nil {
 		if abortCanceledUsageRequest(c, err) {
 			return
@@ -529,9 +572,11 @@ func (m *Monitor) serveUsageMatrix(c *gin.Context) {
 		}
 		return mx.Users[i].Username < mx.Users[j].Username
 	})
-	// 不能把仅含矩阵的半成品预热进客户端总览缓存：趋势图还需要按日×模型聚合。
-	// 此处只使相关组失效，客户端下一次请求会通过 buildPortalOverview 写入完整载荷。
-	m.invalidatePortalOverviews(tracked, fromTs, toTs)
+	// 只有管理员重新选择日期的主动刷新才失效客户端同范围结果。
+	// 普通打开/返回列表不再每次删缓存，避免客户端随后又扫一次生产库。
+	if forceFresh {
+		m.invalidatePortalAggregates(tracked, fromTs, toTs)
+	}
 	c.JSON(http.StatusOK, gin.H{"enabled": true, "matrix": mx, "empty": len(tracked) == 0})
 }
 
@@ -585,6 +630,15 @@ type TokenUsage struct {
 	Deleted        bool     `json:"deleted"`        // 已删除令牌(软删有消费仍显示/硬删兜底行);前端沉底+标记,与现存令牌分区
 }
 
+// tokenUsageAggregate 是可进 Redis 的按令牌日志聚合：只保留计费数字、token_id 和
+// 硬删令牌需要的日志名回退。当前令牌名/分组/脱敏 key/删除状态/累计消耗不进缓存。
+type tokenUsageAggregate struct {
+	UsageBilling
+	TokenID int64  `json:"token_id"`
+	LogName string `json:"log_name,omitempty"`
+	Tokens  int64  `json:"tokens"`
+}
+
 // tokenMetaOf 取单令牌元数据(名称/脱敏key/分组/累计/是否已删),强制归属校验(id+user_id 双条件)。
 // 查不到(硬删/不属于该用户)返回 nil,不报错——令牌详情页此时只展示日志侧数据。
 func (m *Monitor) tokenMetaOf(ctx context.Context, uid, tokenID int64) *TokenUsage {
@@ -623,31 +677,21 @@ func maskTokenKey(key string) string {
 // 每行带累计总消耗(tokens.used_quota,创建至今终身值);生产库只读;key 只在服务端脱敏后返回,明文永不出库。
 // 排序:现存令牌在前、已删除沉底,区内按范围费用降序。
 func (m *Monitor) computeUserTokenUsage(ctx context.Context, uid, fromTs, toTs int64) ([]TokenUsage, error) {
+	aggregates, err := m.computeUserTokenAggregates(ctx, uid, fromTs, toTs)
+	if err != nil {
+		return nil, err
+	}
+	return m.hydrateUserTokenUsage(ctx, uid, aggregates)
+}
+
+// computeUserTokenAggregates 只扫时间窗内 logs，结果不含 users/tokens 表的当前资料。
+func (m *Monitor) computeUserTokenAggregates(ctx context.Context, uid, fromTs, toTs int64) ([]tokenUsageAggregate, error) {
 	cctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
 	if err := m.acquireUsageGate(cctx); err != nil {
 		return nil, fmt.Errorf("等待令牌查询槽位失败: %w", err)
 	}
 	defer m.releaseUsageGate()
-
-	// 令牌所属用户:logs.user_id 即令牌拥有者,故整批令牌都归 uid;解析其展示名(用户名→邮箱→#ID)
-	owner := fmt.Sprintf("#%d", uid)
-	var oname, oemail string
-	if err := m.prodDB.QueryRowContext(cctx, "SELECT COALESCE(username,''), COALESCE(email,'') FROM users WHERE id = ?", uid).Scan(&oname, &oemail); err == nil {
-		if oname != "" {
-			owner = oname
-		} else if oemail != "" {
-			owner = oemail
-		}
-	}
-
-	type agg struct {
-		logName string
-		billing UsageBilling
-		tokens  int64
-	}
-	byTok := map[int64]*agg{}
-	var ids []int64
 
 	q := "SELECT token_id, COALESCE(MAX(token_name),'')," +
 		" CAST(COALESCE(SUM(CASE WHEN type=2 THEN 1 ELSE 0 END),0) AS SIGNED)," +
@@ -661,22 +705,36 @@ func (m *Monitor) computeUserTokenUsage(ctx context.Context, uid, fromTs, toTs i
 	if err != nil {
 		return nil, fmt.Errorf("按令牌聚合失败: %w", err)
 	}
+	out := make([]tokenUsageAggregate, 0)
 	for rows.Next() {
-		var tid int64
-		a := &agg{}
-		if err := rows.Scan(&tid, &a.logName, &a.billing.Requests, &a.billing.RefundRecords, &a.tokens, &a.billing.ConsumeQuota, &a.billing.RefundQuota); err != nil {
+		var a tokenUsageAggregate
+		if err := rows.Scan(&a.TokenID, &a.LogName, &a.Requests, &a.RefundRecords, &a.Tokens, &a.ConsumeQuota, &a.RefundQuota); err != nil {
 			rows.Close()
 			return nil, err
 		}
-		a.billing.finalize()
-		byTok[tid] = a
-		if tid > 0 {
-			ids = append(ids, tid)
-		}
+		a.UsageBilling.finalize()
+		out = append(out, a)
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {
 		return nil, err
+	}
+	return out, nil
+}
+
+// hydrateUserTokenUsage 用当前 users/tokens 主键数据补齐令牌列表。这些查询不扫 logs，
+// 因此可在每次响应时执行，既保持实时性又不给日志库增加聚合压力。
+func (m *Monitor) hydrateUserTokenUsage(ctx context.Context, uid int64, aggregates []tokenUsageAggregate) ([]TokenUsage, error) {
+	cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	owner := m.usageOwnerLabel(cctx, uid)
+	byTok := make(map[int64]tokenUsageAggregate, len(aggregates))
+	ids := make([]int64, 0, len(aggregates))
+	for _, a := range aggregates {
+		byTok[a.TokenID] = a
+		if a.TokenID > 0 {
+			ids = append(ids, a.TokenID)
+		}
 	}
 
 	// tokens 表:该用户全部现存令牌(零用量也要展示)+ 范围内出现过的已删令牌(软删,名称/key 仍可回查)。
@@ -715,30 +773,27 @@ func (m *Monitor) computeUserTokenUsage(ctx context.Context, uid, fromTs, toTs i
 		return nil, err
 	}
 
-	out := make([]TokenUsage, 0, len(infoByID)+1)
+	out := make([]TokenUsage, 0, len(infoByID)+len(byTok))
 	// tokens 表里的每个令牌都出一行(现存令牌零用量补零;软删且范围内有用量的也在此列)
 	for tid, info := range infoByID {
 		a := byTok[tid]
-		if a == nil {
-			a = &agg{}
-		}
 		delete(byTok, tid)
 		name := info.name
 		if name == "" {
-			name = a.logName
+			name = a.LogName
 		}
 		if name == "" {
 			name = "(未命名)"
 		}
 		total := float64(info.usedQuota) / quotaPerUSD
 		out = append(out, TokenUsage{
-			UsageBilling:   a.billing,
+			UsageBilling:   a.UsageBilling,
 			TokenID:        tid,
 			Owner:          owner,
 			Name:           name,
 			MaskedKey:      info.mask,
 			Group:          info.group,
-			Tokens:         a.tokens,
+			Tokens:         a.Tokens,
 			TotalCostQuota: &info.usedQuota,
 			TotalCostUSD:   &total,
 			Deleted:        info.deleted,
@@ -746,16 +801,16 @@ func (m *Monitor) computeUserTokenUsage(ctx context.Context, uid, fromTs, toTs i
 	}
 	// 剩下的是 tokens 表查不到的:硬删令牌/老日志 token_id=0 → 回退日志名,key/分组/累计留空,归入已删除区
 	for tid, a := range byTok {
-		name := a.logName
+		name := a.LogName
 		if name == "" {
 			name = "(未命名)"
 		}
 		out = append(out, TokenUsage{
-			UsageBilling: a.billing,
+			UsageBilling: a.UsageBilling,
 			TokenID:      tid,
 			Owner:        owner,
 			Name:         name,
-			Tokens:       a.tokens,
+			Tokens:       a.Tokens,
 			Deleted:      true,
 		})
 	}
@@ -779,6 +834,25 @@ func (m *Monitor) computeUserTokenUsage(ctx context.Context, uid, fromTs, toTs i
 		return out[i].Name < out[j].Name
 	})
 	return out, nil
+}
+
+// usageOwnerLabel 只读主站 users 主键行，用于在响应边界给已缓存的令牌聚合补回实时展示名。
+// 用户名/邮箱不进入 Redis；查询失败时保留既有 #ID 降级语义。
+func (m *Monitor) usageOwnerLabel(ctx context.Context, uid int64) string {
+	owner := fmt.Sprintf("#%d", uid)
+	cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	var username, email string
+	if err := m.prodDB.QueryRowContext(cctx, "SELECT COALESCE(username,''), COALESCE(email,'') FROM users WHERE id = ?", uid).Scan(&username, &email); err != nil {
+		return owner
+	}
+	if username != "" {
+		return username
+	}
+	if email != "" {
+		return email
+	}
+	return owner
 }
 
 // LogRow 一条日志(逐条明细,给客户端「使用日志」查看/导出用);不含请求/响应正文。
@@ -1420,21 +1494,23 @@ func (m *Monitor) serveUsageStats(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	inList := map[int64]bool{}
+	trackedByID := map[int64]TrackedUser{}
 	for _, u := range tracked {
-		inList[u.UserID] = true
+		trackedByID[u.UserID] = u
 	}
-	ids := idsOf(tracked)
+	selected := append([]TrackedUser(nil), tracked...)
 	isGroup := false
-	var tokenID int64
+	var tokenID, selectedUID int64
 	// 可选其一:user_id=单用户详情;group_id=公司详情(聚合整组成员,0=未分组成员)
 	if f := strings.TrimSpace(c.Query("user_id")); f != "" {
 		id, err := strconv.ParseInt(f, 10, 64)
-		if err != nil || !inList[id] {
+		member, ok := trackedByID[id]
+		if err != nil || !ok {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "user_id 不在名单内"})
 			return
 		}
-		ids = []int64{id}
+		selectedUID = id
+		selected = []TrackedUser{member}
 		// 令牌详情:仅在单用户详情下有效;聚合强制 user_id+token_id 双条件,越权令牌只会查出空
 		if t := strings.TrimSpace(c.Query("token_id")); t != "" {
 			tokenID, err = strconv.ParseInt(t, 10, 64)
@@ -1450,13 +1526,14 @@ func (m *Monitor) serveUsageStats(c *gin.Context) {
 			return
 		}
 		isGroup = true
-		ids = ids[:0]
+		selected = selected[:0]
 		for _, u := range tracked {
 			if u.GroupID == gid {
-				ids = append(ids, u.UserID)
+				selected = append(selected, u)
 			}
 		}
 	}
+	ids := idsOf(selected)
 	if len(ids) == 0 { // 名单为空:不查生产库,直接空结果
 		c.JSON(http.StatusOK, gin.H{"enabled": true, "stats": &UsageStats{}, "empty": true})
 		return
@@ -1466,7 +1543,20 @@ func (m *Monitor) serveUsageStats(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	st, err := m.computeUsageStats(c.Request.Context(), ids, fromTs, toTs, tokenID)
+	memberFP := portalMemberFingerprint(selected)
+	forceFresh := usageRefreshRequested(c)
+	cacheTTL := usageAggregateTTL(toTs, time.Now())
+	st := &UsageStats{}
+	err = m.loadUsageAggregateJSON(
+		c.Request.Context(),
+		adminUsageAggregateKey("stats", memberFP, selectedUID, tokenID, fromTs, toTs),
+		cacheTTL,
+		forceFresh,
+		st,
+		func() (any, error) {
+			return m.computeUsageStats(c.Request.Context(), ids, fromTs, toTs, tokenID)
+		},
+	)
 	if err != nil {
 		if abortCanceledUsageRequest(c, err) {
 			return
@@ -1493,7 +1583,17 @@ func (m *Monitor) serveUsageStats(c *gin.Context) {
 		resp["balance_usd"] = quotaUSDPtr(balanceQ)
 		resp["total_used_quota"] = usedQ
 		resp["total_used_usd"] = quotaUSDPtr(usedQ)
-		toks, err := m.computeUserTokenUsage(c.Request.Context(), ids[0], fromTs, toTs)
+		var tokenAggregates []tokenUsageAggregate
+		err := m.loadUsageAggregateJSON(
+			c.Request.Context(),
+			adminUsageAggregateKey("tokens", memberFP, ids[0], 0, fromTs, toTs),
+			cacheTTL,
+			forceFresh,
+			&tokenAggregates,
+			func() (any, error) {
+				return m.computeUserTokenAggregates(c.Request.Context(), ids[0], fromTs, toTs)
+			},
+		)
 		if err != nil {
 			if abortCanceledUsageRequest(c, err) {
 				return
@@ -1502,7 +1602,23 @@ func (m *Monitor) serveUsageStats(c *gin.Context) {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "令牌统计查询失败,请稍后重试(细节见服务端日志)"})
 			return
 		}
+		toks, err := m.hydrateUserTokenUsage(c.Request.Context(), ids[0], tokenAggregates)
+		if err != nil {
+			if abortCanceledUsageRequest(c, err) {
+				return
+			}
+			slog.Warn("查询令牌实时元数据失败", "err", err, "user_id", ids[0])
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "令牌统计查询失败,请稍后重试(细节见服务端日志)"})
+			return
+		}
 		resp["by_token"] = toks
+	}
+	if forceFresh {
+		if isGroup {
+			m.invalidatePortalAggregates(selected, fromTs, toTs)
+		} else if selectedUID > 0 {
+			m.invalidatePortalUserAggregates(tracked, selectedUID, tokenID, fromTs, toTs)
+		}
 	}
 	c.JSON(http.StatusOK, resp)
 }

@@ -1165,8 +1165,8 @@ function switchTab(name){
 function resizeModelCharts(){[trendChart,longChart,sloGauge,latChart,ttftChart].forEach(c=>c&&c.resize());}
 
 // ═══════════ 用户用量(tab-usage):列表页=消费矩阵(日期×用户),点用户进详情 ═══════════
-// 与另两个 tab 不同:不自动刷新——每次查询都会打到生产库(窗口化、走索引、后端串行闸),
-// 只在打开 tab / 点查询 / 改名单 / 进出详情时拉取。
+// 与另两个 tab 不同:不定时自动刷新。聚合数字复用有界缓存；用户重新选择日期时强制取新，
+// 余额/用户资料仍实时取回。快速切换由可取消查询和后端单槽闸共同保护生产库。
 let IS_ROOT=false,usageInited=false,usageUsers=[],usageGroups=[],usageDailyChart=null,usageRange='7d';
 let usageDetail=null;      // null=列表视图;{type:'user'|'group', id, label}=详情视图
 let usageMxCache=null;     // 最近一次矩阵响应(分组筛选/搜索纯前端,复用缓存不重查生产库)
@@ -1198,7 +1198,7 @@ function usageApplyPreset(){ // 预设写进范围选择器
   if(usageFp)usageFp.setDate([p.start(),p.end()],false); // 不触发 onChange,由调用方决定何时查询
 }
 // 按当前视图刷新:列表=矩阵,详情=该用户四路聚合
-function usageRefresh(){ usageDetail?usageLoadDetail():usageLoadMatrix(); }
+function usageRefresh(forceFresh){ usageDetail?usageLoadDetail(!!forceFresh):usageLoadMatrix(!!forceFresh); }
 function usageShowView(){
   document.getElementById('usageViewList').hidden=!!usageDetail;
   document.getElementById('usageViewDetail').hidden=!usageDetail;
@@ -1227,7 +1227,7 @@ async function usageInit(){
   inp&&inp.addEventListener('keydown',e=>{if(e.key==='Enter')usageAddUser()});
   usageFp=new SemiRangePicker(document.getElementById('usageRangeInput'),{
     maxDays:366,presets:usagePresets,showClear:true,theme:'dark',
-    onChange:(_sel,meta)=>{usageRange=meta.preset||'custom';usageRefresh();},
+    onChange:(_sel,meta)=>{usageRange=meta.preset||'custom';usageRefresh(true);},
     onClear:()=>{usageRange='custom';}
   });
   document.getElementById('usageBack').addEventListener('click',usageBackToList);
@@ -1613,13 +1613,14 @@ async function usageDelUser(id){
     await usageLoadUsers(); usageRefresh();
   }catch(e){msg.textContent='网络错误:'+e.message}
 }
-function usageRangeParams(){
-  const q=new URLSearchParams();
+function usageRangeParams(forceFresh){
+	const q=new URLSearchParams();
   const sel=usageFp?usageFp.selectedDates():[];
   const f=d=>d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');
-  if(sel.length===2){q.set('from',f(sel[0]));q.set('to',f(sel[1]))}
-  else if(sel.length===1){q.set('from',f(sel[0]));q.set('to',f(sel[0]))}
-  return q;
+	if(sel.length===2){q.set('from',f(sel[0]));q.set('to',f(sel[1]))}
+	else if(sel.length===1){q.set('from',f(sel[0]));q.set('to',f(sel[0]))}
+	if(forceFresh)q.set('refresh','1');
+	return q;
 }
 // 快速连点/切范围时取消旧查询，并且只允许最后一次请求渲染。
 // 浏览器 abort 会沿 Gin request context 取消后端等待/查询，避免无用请求继续占用生产库闸门。
@@ -1630,10 +1631,10 @@ function usageBeginRequest(){
   return {seq:++usageSeq,signal:usageAbort.signal};
 }
 // 列表页:消费矩阵
-async function usageLoadMatrix(){
-  const eb=document.getElementById('usageErr'),req=usageBeginRequest(),seq=req.seq;
-  try{
-    const res=await fetch('/usage/matrix?'+usageRangeParams(),{headers:{'Accept':'application/json'},signal:req.signal});
+async function usageLoadMatrix(forceFresh){
+	const eb=document.getElementById('usageErr'),req=usageBeginRequest(),seq=req.seq;
+	try{
+		const res=await fetch('/usage/matrix?'+usageRangeParams(!!forceFresh),{headers:{'Accept':'application/json'},signal:req.signal});
     if(seq!==usageSeq)return; // 已有更新的查询在飞,丢弃本响应
     if(res.status===401){location.href='/login';return}
     const d=await res.json().catch(()=>({}));
@@ -1938,12 +1939,12 @@ function drawUsageMatrix(mx,users,empty,thId,tbId){
   +`<tr class="mxfoot"><td><b>${isList&&(usageFilterGid!==null||usageSearchText)?'筛选合计':'合计'}</b></td><td></td><td class="right num" title="可见用户累计总消耗合计"><b style="color:#fbbf24">${fmtCost(users.reduce((s,u)=>s+(+u.total_used_usd||0),0))}</b></td>${days.map(d=>`<td class="right num" title="${esc(d)}${d in daySum?` · $${daySum[d].toFixed(4)}`:''}"><b>${d in daySum?fmtCell(daySum[d]):'<span class="muted">—</span>'}</b></td>`).join('')}<td class="right num"><b>${fmtCost(users.reduce((s,u)=>s+(+u.total_usd||0),0))}</b></td></tr>`;
 }
 // 详情页:单用户 或 整个公司(分组)的每日/令牌分组/模型聚合
-async function usageLoadDetail(){
+async function usageLoadDetail(forceFresh){
   if(!usageDetail)return;
   // 切用户详情:立即隐藏组织专属块(组内成员/成员排行),避免异步加载时残留上一个组织的内容
   if(usageDetail.type!=='group'){document.getElementById('usageMemCard').hidden=true;document.getElementById('usageMemRankCard').hidden=true;}
   const eb=document.getElementById('usageErr'),req=usageBeginRequest(),seq=req.seq;
-  const q=usageRangeParams();
+	const q=usageRangeParams(!!forceFresh);
   if(usageDetail.type==='token'){q.set('user_id',usageDetail.uid);q.set('token_id',usageDetail.id);}
   else q.set(usageDetail.type==='group'?'group_id':'user_id',usageDetail.id);
   // 组织详情:矩阵缓存可用时先秒出组内成员/排行(不等 stats 查库;范围若变后面会按新范围重画)
@@ -1970,7 +1971,7 @@ async function usageLoadDetail(){
       const sf=(d.stats||{}).from,stt=(d.stats||{}).to;
       let mx=(usageMxCache&&usageMxCache.from===sf&&usageMxCache.to===stt)?usageMxCache:null;
       if(!mx){
-        const mr=await fetch('/usage/matrix?'+usageRangeParams(),{headers:{'Accept':'application/json'},signal:req.signal});
+		const mr=await fetch('/usage/matrix?'+usageRangeParams(!!forceFresh),{headers:{'Accept':'application/json'},signal:req.signal});
         if(seq!==usageSeq)return;
         const md=await mr.json().catch(()=>({}));
         if(mr.ok&&md.matrix)mx=md.matrix;

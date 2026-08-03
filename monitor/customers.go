@@ -304,7 +304,6 @@ func (m *Monitor) updateGroup(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "分组不存在"})
 		return
 	}
-	m.invalidatePortalGroup(in.ID)
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
 
@@ -327,7 +326,6 @@ func (m *Monitor) deleteGroup(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	m.invalidatePortalGroup(in.ID)
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
 
@@ -381,8 +379,6 @@ func (m *Monitor) setUserGroup(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "用户不在名单内"})
 		return
 	}
-	m.invalidatePortalGroup(current.GroupID)
-	m.invalidatePortalGroup(in.GroupID)
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
 
@@ -425,14 +421,10 @@ func (m *Monitor) addTrackedUser(c *gin.Context) {
 	}
 	u.AddedAt = time.Now().Unix()
 	u.GroupID = in.GroupID
-	var previous TrackedUser
-	_ = m.storeDB.Where("user_id = ?", u.UserID).First(&previous).Error
 	if err := m.storeDB.Save(u).Error; err != nil { // 主键=user_id,重复添加=幂等更新(含改组)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	m.invalidatePortalGroup(previous.GroupID)
-	m.invalidatePortalGroup(u.GroupID)
 	c.JSON(http.StatusOK, gin.H{"ok": true, "user": u})
 }
 
@@ -445,13 +437,10 @@ func (m *Monitor) deleteTrackedUser(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "user_id required"})
 		return
 	}
-	var current TrackedUser
-	_ = m.storeDB.Where("user_id = ?", in.UserID).First(&current).Error
 	if err := m.storeDB.Delete(&TrackedUser{}, "user_id = ?", in.UserID).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	m.invalidatePortalGroup(current.GroupID)
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
 

@@ -140,7 +140,21 @@ func (m *Monitor) computeFollowUps(ctx context.Context, nowUnix int64) ([]Follow
 	fromTs := toTs - int64(followUpWindowDays)*86400
 	mx := &UsageMatrix{}
 	if len(allIDs) > 0 {
-		if mx, err = m.computeUsageMatrix(ctx, allIDs, fromTs, toTs); err != nil {
+		err = m.loadUsageAggregateJSON(
+			ctx,
+			adminUsageAggregateKey("matrix", portalMemberFingerprint(tracked), 0, 0, fromTs, toTs),
+			usageAggregateTTL(toTs, time.Unix(nowUnix, 0)),
+			false,
+			mx,
+			func() (any, error) {
+				result, err := m.computeUsageMatrix(ctx, allIDs, fromTs, toTs)
+				if result != nil {
+					result.Users = nil
+				}
+				return result, err
+			},
+		)
+		if err != nil {
 			return nil, err
 		}
 	}

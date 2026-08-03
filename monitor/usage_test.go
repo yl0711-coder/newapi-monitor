@@ -7,8 +7,10 @@ package monitor
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"net/http/httptest"
 	"strconv"
 	"strings"
@@ -664,6 +666,185 @@ func TestServeUsageStatsDoesNotReturnPartialTokenData(t *testing.T) {
 	}
 }
 
+type usageMatrixHTTPResponse struct {
+	Enabled bool        `json:"enabled"`
+	Matrix  UsageMatrix `json:"matrix"`
+}
+
+func requestUsageMatrixForTest(t *testing.T, m *Monitor, path string) usageMatrixHTTPResponse {
+	t.Helper()
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodGet, path, nil)
+	m.serveUsageMatrix(c)
+	if w.Code != http.StatusOK {
+		t.Fatalf("用量矩阵请求失败: status=%d body=%s", w.Code, w.Body.String())
+	}
+	var out usageMatrixHTTPResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &out); err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+func TestServeUsageMatrixBalancesPerformanceAccuracyAndFreshness(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	m := newTestMonitor(t)
+	m.prodDB = newFakeProdDB(t)
+	m.usageDayExpr = usageDayExprSQLite
+	remote := newMemoryByteCacheStore()
+	m.usageCache = newUsageResultCacheForTest(remote, 32, 1<<20)
+
+	g := CustomerGroup{Name: "cache-company"}
+	if err := m.storeDB.Create(&g).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := m.storeDB.Create(&TrackedUser{UserID: 1, GroupID: g.ID, Username: "snapshot", Email: "snapshot@example.test"}).Error; err != nil {
+		t.Fatal(err)
+	}
+	day := time.Date(2026, 7, 1, 10, 0, 0, 0, usageCST).Unix()
+	seed := []string{
+		"INSERT INTO users (id,username,email,quota,used_quota) VALUES (1,'live-v1','live-v1@example.test',500000,1000000)",
+		fmt.Sprintf("INSERT INTO logs (id,user_id,created_at,type,model_name,quota,prompt_tokens,completion_tokens,`group`) VALUES (1,1,%d,2,'m',500000,10,2,'g')", day),
+	}
+	for _, q := range seed {
+		if _, err := m.prodDB.Exec(q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	path := "/usage/matrix?from=2026-07-01&to=2026-07-01"
+	first := requestUsageMatrixForTest(t, m, path)
+	if len(first.Matrix.Cells) != 1 || first.Matrix.Cells[0].Requests != 1 ||
+		len(first.Matrix.Users) != 1 || first.Matrix.Users[0].BalanceQuota == nil || *first.Matrix.Users[0].BalanceQuota != 500000 ||
+		first.Matrix.Users[0].Username != "live-v1" || m.usageCache.fills.Load() != 1 {
+		t.Fatalf("首次矩阵结果错误: matrix=%+v fills=%d", first.Matrix, m.usageCache.fills.Load())
+	}
+
+	if _, err := m.prodDB.Exec("UPDATE users SET username='live-v2',email='live-v2@example.test',quota=750000,used_quota=1250000 WHERE id=1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.prodDB.Exec("INSERT INTO logs (id,user_id,created_at,type,model_name,quota,prompt_tokens,completion_tokens,`group`) VALUES (2,1,?,2,'m',250000,4,1,'g')", day+60); err != nil {
+		t.Fatal(err)
+	}
+
+	// TTL 内聚合保持上次成功结果，但身份/余额/累计消耗每次实时取回。
+	cached := requestUsageMatrixForTest(t, m, path)
+	if cached.Matrix.Cells[0].Requests != 1 || cached.Matrix.Users[0].Username != "live-v2" ||
+		cached.Matrix.Users[0].BalanceQuota == nil || *cached.Matrix.Users[0].BalanceQuota != 750000 ||
+		m.usageCache.fills.Load() != 1 {
+		t.Fatalf("缓存命中时的聚合/实时字段边界错误: matrix=%+v fills=%d", cached.Matrix, m.usageCache.fills.Load())
+	}
+
+	// 现有日期重选动作会带 refresh=1：立即重算并覆盖缓存。
+	refreshed := requestUsageMatrixForTest(t, m, path+"&refresh=1")
+	if refreshed.Matrix.Cells[0].Requests != 2 || refreshed.Matrix.Cells[0].ConsumeQuota != 750000 || m.usageCache.fills.Load() != 2 {
+		t.Fatalf("主动刷新未取到最新聚合: matrix=%+v fills=%d", refreshed.Matrix, m.usageCache.fills.Load())
+	}
+	after := requestUsageMatrixForTest(t, m, path)
+	if after.Matrix.Cells[0].Requests != 2 || m.usageCache.fills.Load() != 2 {
+		t.Fatalf("刷新结果未覆盖缓存: matrix=%+v fills=%d", after.Matrix, m.usageCache.fills.Load())
+	}
+
+	remote.mu.Lock()
+	defer remote.mu.Unlock()
+	for key, item := range remote.items {
+		payload := string(item.value)
+		if strings.Contains(payload, "live-v2") || strings.Contains(payload, "live-v2@example.test") {
+			t.Fatalf("Redis 矩阵键 %q 不得包含身份资料: %s", key, payload)
+		}
+	}
+}
+
+type usageStatsHTTPResponse struct {
+	Stats          UsageStats   `json:"stats"`
+	ByToken        []TokenUsage `json:"by_token"`
+	BalanceQuota   *int64       `json:"balance_quota"`
+	TotalUsedQuota *int64       `json:"total_used_quota"`
+}
+
+func requestUsageStatsForTest(t *testing.T, m *Monitor, path string) usageStatsHTTPResponse {
+	t.Helper()
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodGet, path, nil)
+	m.serveUsageStats(c)
+	if w.Code != http.StatusOK {
+		t.Fatalf("用量详情请求失败: status=%d body=%s", w.Code, w.Body.String())
+	}
+	var out usageStatsHTTPResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &out); err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+func TestServeUsageStatsCachesOnlyAggregatesAndRefreshesExactly(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	m := newTestMonitor(t)
+	m.prodDB = newFakeProdDB(t)
+	m.usageDayExpr = usageDayExprSQLite
+	remote := newMemoryByteCacheStore()
+	m.usageCache = newUsageResultCacheForTest(remote, 32, 1<<20)
+
+	g := CustomerGroup{Name: "detail-company"}
+	if err := m.storeDB.Create(&g).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := m.storeDB.Create(&TrackedUser{UserID: 1, GroupID: g.ID, Username: "snapshot", Email: "snapshot@example.test"}).Error; err != nil {
+		t.Fatal(err)
+	}
+	day := time.Date(2026, 7, 1, 10, 0, 0, 0, usageCST).Unix()
+	seed := []string{
+		"INSERT INTO users (id,username,email,quota,used_quota) VALUES (1,'owner-v1','owner-v1@example.test',500000,1000000)",
+		"INSERT INTO tokens (id,user_id,name,`key`,`group`,used_quota) VALUES (10,1,'token-a','abcdefghijklmnop','g',750000)",
+		fmt.Sprintf("INSERT INTO logs (id,user_id,created_at,type,model_name,quota,prompt_tokens,completion_tokens,`group`,token_id,token_name) VALUES (1,1,%d,2,'m',500000,10,2,'g',10,'token-a')", day),
+	}
+	for _, q := range seed {
+		if _, err := m.prodDB.Exec(q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	path := "/usage/stats?user_id=1&from=2026-07-01&to=2026-07-01"
+	first := requestUsageStatsForTest(t, m, path)
+	if first.Stats.Summary.Requests != 1 || len(first.ByToken) != 1 || first.ByToken[0].Owner != "owner-v1" ||
+		first.BalanceQuota == nil || *first.BalanceQuota != 500000 || m.usageCache.fills.Load() != 2 {
+		t.Fatalf("首次详情结果错误: %+v fills=%d", first, m.usageCache.fills.Load())
+	}
+
+	if _, err := m.prodDB.Exec("UPDATE users SET username='owner-v2',email='owner-v2@example.test',quota=800000,used_quota=1300000 WHERE id=1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.prodDB.Exec("UPDATE tokens SET name='token-b',`key`='qrstuvwxyzabcdef',`group`='g2',used_quota=900000,deleted_at='2026-07-02 00:00:00' WHERE id=10"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.prodDB.Exec("INSERT INTO logs (id,user_id,created_at,type,model_name,quota,prompt_tokens,completion_tokens,`group`,token_id,token_name) VALUES (2,1,?,2,'m',250000,3,1,'g',10,'token-a')", day+60); err != nil {
+		t.Fatal(err)
+	}
+	cached := requestUsageStatsForTest(t, m, path)
+	if cached.Stats.Summary.Requests != 1 || cached.ByToken[0].Owner != "owner-v2" ||
+		cached.ByToken[0].Name != "token-b" || cached.ByToken[0].Group != "g2" || !cached.ByToken[0].Deleted ||
+		cached.ByToken[0].MaskedKey == "qrstuvwxyzabcdef" || cached.ByToken[0].TotalCostQuota == nil || *cached.ByToken[0].TotalCostQuota != 900000 ||
+		cached.BalanceQuota == nil || *cached.BalanceQuota != 800000 ||
+		cached.TotalUsedQuota == nil || *cached.TotalUsedQuota != 1300000 || m.usageCache.fills.Load() != 2 {
+		t.Fatalf("详情缓存命中后实时字段错误: %+v fills=%d", cached, m.usageCache.fills.Load())
+	}
+	refreshed := requestUsageStatsForTest(t, m, path+"&refresh=1")
+	if refreshed.Stats.Summary.Requests != 2 || refreshed.Stats.Summary.ConsumeQuota != 750000 || m.usageCache.fills.Load() != 4 {
+		t.Fatalf("详情主动刷新错误: %+v fills=%d", refreshed, m.usageCache.fills.Load())
+	}
+
+	remote.mu.Lock()
+	defer remote.mu.Unlock()
+	for key, item := range remote.items {
+		payload := string(item.value)
+		if strings.Contains(payload, "owner-v1") || strings.Contains(payload, "owner-v2") ||
+			strings.Contains(payload, "example.test") || strings.Contains(payload, "abcdefghijklmnop") ||
+			strings.Contains(payload, "token-b") || strings.Contains(payload, "qrstuvwxyzabcdef") {
+			t.Fatalf("Redis 详情键 %q 泄漏实时/完整敏感字段: %s", key, payload)
+		}
+	}
+}
+
 func TestParseUsageRangeBoundary(t *testing.T) {
 	now := time.Date(2026, 7, 7, 15, 0, 0, 0, usageCST)
 	// 含两端点恰 366 天(覆盖闰年):2026-01-01 + 365 天 = 2027-01-01 → 应通过
@@ -693,6 +874,9 @@ func TestEmbeddedRangePickerIsDateOnly(t *testing.T) {
 	}
 	if strings.Contains(js, "dateTimeRange") || strings.Contains(js, "HH:mm:ss") {
 		t.Fatal("范围控件仍残留时分秒模式")
+	}
+	if !strings.Contains(pageHTML, "usageRefresh(true)") || !strings.Contains(pageHTML, "q.set('refresh','1')") {
+		t.Fatal("管理端重新选择日期未连接到强制取新语义")
 	}
 }
 
@@ -778,6 +962,7 @@ func TestComputeFollowUps(t *testing.T) {
 	m := newTestMonitor(t)
 	m.prodDB = newFakeProdDB(t)
 	m.usageDayExpr = usageDayExprSQLite
+	m.usageCache = newUsageResultCacheForTest(newMemoryByteCacheStore(), 32, 1<<20)
 
 	// 固定"现在"= 2026-07-09 12:00 CST
 	now := time.Date(2026, 7, 9, 12, 0, 0, 0, usageCST).Unix()
@@ -860,6 +1045,15 @@ func TestComputeFollowUps(t *testing.T) {
 	// member_total 汇总口径
 	if s := m.loadUsageSettings(); s.DormantDays != 7 || s.TrialHighUSD != 20 {
 		t.Fatalf("默认阈值 = %+v", s)
+	}
+	if got := m.usageCache.fills.Load(); got != 1 {
+		t.Fatalf("待跟进首次只应填充一份 30 天矩阵: fills=%d", got)
+	}
+	if _, err := m.computeFollowUps(context.Background(), now); err != nil {
+		t.Fatal(err)
+	}
+	if got := m.usageCache.fills.Load(); got != 1 {
+		t.Fatalf("同窗口待跟进重算应复用矩阵缓存: fills=%d", got)
 	}
 }
 

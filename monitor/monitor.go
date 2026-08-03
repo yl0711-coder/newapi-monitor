@@ -51,10 +51,10 @@ type Monitor struct {
 	usageGate     chan struct{} // 容量 1：同一时刻最多一条按需重查询，等待过程响应 request context 取消
 	usageDayExpr  string        // 日桶 SQL 表达式覆盖(仅测试用;生产走 MySQL 默认,见 usage.go dayExpr)
 
-	portalCache *ttlCache      // 客户端组级数据缓存(portal.go;RegisterPortalRoutes 时初始化)
-	portalLim   *portalLimiter // 客户端登录限流
-	adminLim    *portalLimiter // 管理端登录限流(按来源 IP)
-	exportLim   *exportLimiter // 客户端日志导出限流(每组织账号 1 次/5min,仅计成功下载)
+	usageCache *usageResultCache // 用量昂贵聚合结果缓存：Redis 主缓存 + 有界本机应急缓存
+	portalLim  *portalLimiter    // 客户端登录限流
+	adminLim   *portalLimiter    // 管理端登录限流(按来源 IP)
+	exportLim  *exportLimiter    // 客户端日志导出限流(每组织账号 1 次/5min,仅计成功下载)
 }
 
 // cachedSnap 是一次快照的缓存项。
@@ -77,7 +77,12 @@ func New(s Settings) (*Monitor, error) {
 		slog.Warn("未设置 MONITOR_NEWAPI_BASE_URL,登录将无法验证身份;生产必须配成 new-api 地址,如 http://new-api:3000")
 	}
 
-	m := &Monitor{cfg: s, chNames: map[string]string{}, snapCache: map[int]cachedSnap{}}
+	m := &Monitor{
+		cfg:        s,
+		chNames:    map[string]string{},
+		snapCache:  map[int]cachedSnap{},
+		usageCache: newUsageResultCache(s),
+	}
 	if err := m.openStore(s.StorePath); err != nil {
 		return nil, err
 	}
@@ -107,6 +112,13 @@ func (m *Monitor) Start(ctx context.Context) { m.startSampler(ctx) }
 
 // Enabled 报告生产库是否已连通。
 func (m *Monitor) Enabled() bool { return m.prodDB != nil }
+
+// Close 释放可选外部缓存连接。Redis 只是优化项，关闭失败不影响业务数据正确性。
+func (m *Monitor) Close() {
+	if m.usageCache != nil {
+		m.usageCache.Close()
+	}
+}
 
 // InfraEnabled 报告服务端健康监控(实例/DB/LB)是否启用(MONITOR_INFRA_ENABLED=true)。
 // 关闭时:不调 AWS、/infra 返回 enabled:false、不影响模型监控。

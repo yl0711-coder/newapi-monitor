@@ -135,34 +135,266 @@ func TestPortalScopeIsolation(t *testing.T) {
 	}
 }
 
-// 管理端矩阵刷新不能把只有 Users/Cells 的半成品总览写给客户；否则趋势所需的
-// DailyByModel/ByModel 为空。正确策略是删掉当前范围内相关组的总览缓存，迫使下次读走完整聚合。
-func TestPortalMatrixRefreshInvalidatesPartialOverview(t *testing.T) {
+// 端到端验证：overview 首次只填充 matrix+stats 两项，breakdown 复用同一 stats；
+// 聚合命中缓存后，用户名/邮箱/余额仍由 users 主键查询实时组装，Redis 中不出现这些资料。
+func TestPortalAggregateCacheKeepsLiveUserFieldsOutOfRedis(t *testing.T) {
+	m, _, portal := newPortalTestMonitor(t)
+	m.prodDB = newFakeProdDB(t)
+	m.usageDayExpr = usageDayExprSQLite
+	remote := newMemoryByteCacheStore()
+	m.usageCache = newUsageResultCacheForTest(remote, 32, 1<<20)
+
+	hash, _ := hashPassword("cache-test-password")
+	g := CustomerGroup{Name: "Cache Test", PortalEmail: "cache@test.local", PortalPwAdmin: hash}
+	if err := m.storeDB.Create(&g).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := m.storeDB.Create(&TrackedUser{UserID: 101, GroupID: g.ID, Username: "old-name", Email: "old@example.test"}).Error; err != nil {
+		t.Fatal(err)
+	}
+	createdAt := time.Date(2026, 8, 2, 12, 0, 0, 0, usageCST).Unix()
+	seed := []string{
+		"INSERT INTO users (id,username,email,quota,used_quota) VALUES (101,'live-name','live@example.test',500000,1000000)",
+		fmt.Sprintf("INSERT INTO logs (id,user_id,created_at,type,model_name,quota,prompt_tokens,completion_tokens,`group`) VALUES (1,101,%d,2,'gpt-test',250000,10,5,'test-group')", createdAt),
+	}
+	for _, q := range seed {
+		if _, err := m.prodDB.Exec(q); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	login := portalDo(portal, http.MethodPost, "/login", `{"email":"cache@test.local","password":"cache-test-password"}`)
+	ck := portalCookie(login)
+	if ck == nil {
+		t.Fatalf("登录失败: %d %s", login.Code, login.Body.String())
+	}
+	path := "/api/overview?from=2026-08-02&to=2026-08-02"
+	first := portalDo(portal, http.MethodGet, path, "", ck)
+	if first.Code != http.StatusOK {
+		t.Fatalf("首次总览失败: %d %s", first.Code, first.Body.String())
+	}
+	var firstResp struct {
+		Data portalOverviewPayload `json:"data"`
+	}
+	if err := json.Unmarshal(first.Body.Bytes(), &firstResp); err != nil {
+		t.Fatal(err)
+	}
+	if len(firstResp.Data.Users) != 1 || firstResp.Data.Users[0].Username != "live-name" || firstResp.Data.Users[0].BalanceQuota == nil || *firstResp.Data.Users[0].BalanceQuota != 500000 {
+		t.Fatalf("实时用户字段错误: %+v", firstResp.Data.Users)
+	}
+	if got := m.usageCache.fills.Load(); got != 2 {
+		t.Fatalf("overview 应只填充 matrix+stats，实际 %d", got)
+	}
+
+	// 同范围 breakdown 必须复用 overview 的 stats，不新增源聚合。
+	breakdown := portalDo(portal, http.MethodGet, "/api/breakdown?from=2026-08-02&to=2026-08-02", "", ck)
+	if breakdown.Code != http.StatusOK || m.usageCache.fills.Load() != 2 {
+		t.Fatalf("breakdown 未复用 stats: code=%d fills=%d body=%s", breakdown.Code, m.usageCache.fills.Load(), breakdown.Body.String())
+	}
+
+	// 聚合仍命中缓存，但余额必须立即反映 users 表新值。
+	if _, err := m.prodDB.Exec("UPDATE users SET quota=750000 WHERE id=101"); err != nil {
+		t.Fatal(err)
+	}
+	second := portalDo(portal, http.MethodGet, path, "", ck)
+	var secondResp struct {
+		Data portalOverviewPayload `json:"data"`
+	}
+	if err := json.Unmarshal(second.Body.Bytes(), &secondResp); err != nil {
+		t.Fatal(err)
+	}
+	if len(secondResp.Data.Users) != 1 || secondResp.Data.Users[0].BalanceQuota == nil || *secondResp.Data.Users[0].BalanceQuota != 750000 || m.usageCache.fills.Load() != 2 {
+		t.Fatalf("缓存命中后实时余额错误: users=%+v fills=%d", secondResp.Data.Users, m.usageCache.fills.Load())
+	}
+
+	remote.mu.Lock()
+	defer remote.mu.Unlock()
+	for key, item := range remote.items {
+		text := string(item.value)
+		if strings.Contains(text, "live@example.test") || strings.Contains(text, "live-name") {
+			t.Fatalf("Redis 聚合键 %q 泄漏用户资料: %s", key, text)
+		}
+	}
+}
+
+// 成员详情与令牌详情的日志聚合可以缓存，但用户身份/余额及单令牌元数据必须每次实时读取。
+// 同时验证 Redis 载荷不包含用户名、邮箱或完整令牌 key。
+func TestPortalUserAndTokenDetailCacheKeepsLiveFieldsOutOfRedis(t *testing.T) {
+	m, _, portal := newPortalTestMonitor(t)
+	m.prodDB = newFakeProdDB(t)
+	m.usageDayExpr = usageDayExprSQLite
+	remote := newMemoryByteCacheStore()
+	m.usageCache = newUsageResultCacheForTest(remote, 32, 1<<20)
+
+	hash, _ := hashPassword("detail-cache-password")
+	g := CustomerGroup{Name: "Detail Cache", PortalEmail: "detail@test.local", PortalPwAdmin: hash}
+	if err := m.storeDB.Create(&g).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := m.storeDB.Create(&TrackedUser{UserID: 101, GroupID: g.ID, Username: "snapshot-name", Email: "snapshot@example.test"}).Error; err != nil {
+		t.Fatal(err)
+	}
+	createdAt := time.Date(2026, 8, 2, 12, 0, 0, 0, usageCST).Unix()
+	seed := []string{
+		"INSERT INTO users (id,username,email,quota,used_quota) VALUES (101,'live-name-v1','live-v1@example.test',500000,1000000)",
+		"INSERT INTO tokens (id,user_id,name,`key`,`group`,used_quota) VALUES (9001,101,'token-v1','abcdefghijklmnop','vip',750000)",
+		fmt.Sprintf("INSERT INTO logs (id,user_id,created_at,type,model_name,quota,prompt_tokens,completion_tokens,`group`,token_id,token_name) VALUES (1,101,%d,2,'gpt-test',250000,10,5,'vip',9001,'token-v1')", createdAt),
+	}
+	for _, q := range seed {
+		if _, err := m.prodDB.Exec(q); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	login := portalDo(portal, http.MethodPost, "/login", `{"email":"detail@test.local","password":"detail-cache-password"}`)
+	ck := portalCookie(login)
+	if ck == nil {
+		t.Fatalf("登录失败: %d %s", login.Code, login.Body.String())
+	}
+	memberPath := "/api/user?uid=101&from=2026-08-02&to=2026-08-02"
+	type memberDetailResponse struct {
+		Data struct {
+			Stats          UsageStats   `json:"stats"`
+			ByToken        []TokenUsage `json:"by_token"`
+			BalanceQuota   *int64       `json:"balance_quota"`
+			TotalUsedQuota *int64       `json:"total_used_quota"`
+		} `json:"data"`
+	}
+	readMember := func() memberDetailResponse {
+		w := portalDo(portal, http.MethodGet, memberPath, "", ck)
+		if w.Code != http.StatusOK {
+			t.Fatalf("成员详情失败: %d %s", w.Code, w.Body.String())
+		}
+		var out memberDetailResponse
+		if err := json.Unmarshal(w.Body.Bytes(), &out); err != nil {
+			t.Fatal(err)
+		}
+		return out
+	}
+	first := readMember()
+	if first.Data.Stats.Summary.Requests != 1 || len(first.Data.ByToken) != 1 {
+		t.Fatalf("成员聚合错误: %+v", first.Data)
+	}
+	tok := first.Data.ByToken[0]
+	if tok.Owner != "live-name-v1" || tok.MaskedKey == "abcdefghijklmnop" || tok.MaskedKey == "" ||
+		first.Data.BalanceQuota == nil || *first.Data.BalanceQuota != 500000 ||
+		first.Data.TotalUsedQuota == nil || *first.Data.TotalUsedQuota != 1000000 {
+		t.Fatalf("成员实时字段或令牌脱敏错误: token=%+v balance=%v used=%v", tok, first.Data.BalanceQuota, first.Data.TotalUsedQuota)
+	}
+	if got := m.usageCache.fills.Load(); got != 2 {
+		t.Fatalf("成员详情首次应只填充 stats+tokens，实际 %d", got)
+	}
+
+	// 聚合保持命中，但用户名、邮箱、余额和累计消耗必须立即取到 users 表新值。
+	if _, err := m.prodDB.Exec("UPDATE users SET username='live-name-v2',email='live-v2@example.test',quota=800000,used_quota=1200000 WHERE id=101"); err != nil {
+		t.Fatal(err)
+	}
+	second := readMember()
+	if second.Data.ByToken[0].Owner != "live-name-v2" ||
+		second.Data.BalanceQuota == nil || *second.Data.BalanceQuota != 800000 ||
+		second.Data.TotalUsedQuota == nil || *second.Data.TotalUsedQuota != 1200000 ||
+		m.usageCache.fills.Load() != 2 {
+		t.Fatalf("缓存命中后实时字段错误: data=%+v fills=%d", second.Data, m.usageCache.fills.Load())
+	}
+
+	// 令牌详情只缓存日志统计；名称、脱敏 key、分组和累计消耗由 tokenMetaOf 实时读取。
+	tokenPath := memberPath + "&token_id=9001"
+	type tokenDetailResponse struct {
+		Data struct {
+			Stats UsageStats  `json:"stats"`
+			Token *TokenUsage `json:"token"`
+		} `json:"data"`
+	}
+	readToken := func() tokenDetailResponse {
+		w := portalDo(portal, http.MethodGet, tokenPath, "", ck)
+		if w.Code != http.StatusOK {
+			t.Fatalf("令牌详情失败: %d %s", w.Code, w.Body.String())
+		}
+		var out tokenDetailResponse
+		if err := json.Unmarshal(w.Body.Bytes(), &out); err != nil {
+			t.Fatal(err)
+		}
+		return out
+	}
+	tokenFirst := readToken()
+	if tokenFirst.Data.Stats.Summary.Requests != 1 || tokenFirst.Data.Token == nil || tokenFirst.Data.Token.Name != "token-v1" {
+		t.Fatalf("令牌详情首次结果错误: %+v", tokenFirst.Data)
+	}
+	if _, err := m.prodDB.Exec("UPDATE tokens SET name='token-v2',`key`='qrstuvwxyzabcdef',`group`='vip-v2',used_quota=900000 WHERE id=9001"); err != nil {
+		t.Fatal(err)
+	}
+	tokenSecond := readToken()
+	if tokenSecond.Data.Token == nil || tokenSecond.Data.Token.Name != "token-v2" ||
+		tokenSecond.Data.Token.Group != "vip-v2" || tokenSecond.Data.Token.MaskedKey == "qrstuvwxyzabcdef" ||
+		tokenSecond.Data.Token.TotalCostQuota == nil || *tokenSecond.Data.Token.TotalCostQuota != 900000 ||
+		m.usageCache.fills.Load() != 3 {
+		t.Fatalf("令牌统计命中后实时元数据错误: data=%+v fills=%d", tokenSecond.Data, m.usageCache.fills.Load())
+	}
+	memberAfterTokenUpdate := readMember()
+	if len(memberAfterTokenUpdate.Data.ByToken) != 1 || memberAfterTokenUpdate.Data.ByToken[0].Name != "token-v2" ||
+		memberAfterTokenUpdate.Data.ByToken[0].Group != "vip-v2" ||
+		memberAfterTokenUpdate.Data.ByToken[0].TotalCostQuota == nil || *memberAfterTokenUpdate.Data.ByToken[0].TotalCostQuota != 900000 ||
+		m.usageCache.fills.Load() != 3 {
+		t.Fatalf("成员令牌列表也必须在聚合命中时补回实时元数据: data=%+v fills=%d", memberAfterTokenUpdate.Data, m.usageCache.fills.Load())
+	}
+
+	remote.mu.Lock()
+	defer remote.mu.Unlock()
+	for key, item := range remote.items {
+		text := string(item.value)
+		for _, secret := range []string{
+			"live-name-v1", "live-name-v2", "live-v1@example.test", "live-v2@example.test",
+			"abcdefghijklmnop", "qrstuvwxyzabcdef",
+		} {
+			if strings.Contains(text, secret) {
+				t.Fatalf("Redis 聚合键 %q 泄漏实时或敏感字段 %q: %s", key, secret, text)
+			}
+		}
+	}
+}
+
+// 管理端矩阵刷新后，只精确删除相同成员集合/日期范围的 matrix 与 stats 聚合键。
+// 这既保证客户下次读到完整趋势，也不会对 Redis 使用 KEYS/SCAN。
+func TestPortalMatrixRefreshInvalidatesExactAggregates(t *testing.T) {
 	m, _, _ := newPortalTestMonitor(t)
-	m.portalCache = newTTLCache()
+	remote := newMemoryByteCacheStore()
+	m.usageCache = newUsageResultCacheForTest(remote, 32, 1<<20)
 	tracked := []TrackedUser{
 		{UserID: 101, GroupID: 11},
 		{UserID: 202, GroupID: 22},
 	}
 	const fromTs, toTs = 1751328000, 1751414400
-	for _, gid := range []int64{11, 22} {
-		m.portalCache.Put(portalOverviewKey(gid, fromTs, toTs), &portalOverviewPayload{Cells: []UsageMatrixCell{{UserID: 1}}}, portalCacheTTL)
+	for _, u := range tracked {
+		fp := portalMemberFingerprint([]TrackedUser{u})
+		for _, kind := range []string{"matrix", "stats"} {
+			var out UsageStats
+			if err := m.usageCache.DoJSON(context.Background(), portalGroupAggregateKey(kind, u.GroupID, fp, fromTs, toTs), usageAggregateLiveTTL, &out, func() (any, error) {
+				return &UsageStats{Summary: UsageDim{UsageBilling: UsageBilling{Requests: 99}}}, nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+		}
 	}
-	m.invalidatePortalOverviews(tracked, fromTs, toTs)
-	for _, gid := range []int64{11, 22} {
-		called := false
-		_, err := m.portalCache.Do(portalOverviewKey(gid, fromTs, toTs), portalCacheTTL, func() (any, error) {
-			called = true
-			return &portalOverviewPayload{DailyByModel: []UsageDailyModel{{Date: "2026-07-01", Model: "m"}}}, nil
-		})
-		if err != nil || !called {
-			t.Fatalf("group %d 应重新构建完整总览: called=%v err=%v", gid, called, err)
+	m.invalidatePortalAggregates(tracked, fromTs, toTs)
+	for _, u := range tracked {
+		fp := portalMemberFingerprint([]TrackedUser{u})
+		for _, kind := range []string{"matrix", "stats"} {
+			called := false
+			var out UsageStats
+			err := m.usageCache.DoJSON(context.Background(), portalGroupAggregateKey(kind, u.GroupID, fp, fromTs, toTs), usageAggregateLiveTTL, &out, func() (any, error) {
+				called = true
+				return &UsageStats{Summary: UsageDim{UsageBilling: UsageBilling{Requests: 1}}}, nil
+			})
+			if err != nil || !called || out.Summary.Requests != 1 {
+				t.Fatalf("group=%d kind=%s 应重新聚合: called=%v requests=%d err=%v", u.GroupID, kind, called, out.Summary.Requests, err)
+			}
 		}
 	}
 }
 
-// 成员从 A 组移动到 B 组后，两组所有日期范围、总览/维度/成员明细缓存都必须立即失效。
-func TestPortalMemberMoveInvalidatesBothGroupCaches(t *testing.T) {
+// 成员从 A 组移动到 B 组后，两组成员指纹都会变化；旧 Redis 键即使尚未 TTL 过期，
+// 新请求也不可能命中它，因此无需做危险的前缀扫描删除。
+func TestPortalMemberMoveChangesBothGroupCacheScopes(t *testing.T) {
 	m, admin, _ := newPortalTestMonitor(t)
 	ga := CustomerGroup{Name: "A公司"}
 	gb := CustomerGroup{Name: "B公司"}
@@ -175,31 +407,26 @@ func TestPortalMemberMoveInvalidatesBothGroupCaches(t *testing.T) {
 	if err := m.storeDB.Create(&TrackedUser{UserID: 101, Username: "member", GroupID: ga.ID}).Error; err != nil {
 		t.Fatal(err)
 	}
-	keys := []string{}
-	for _, gid := range []int64{ga.ID, gb.ID} {
-		keys = append(keys,
-			portalOverviewKey(gid, 100, 200),
-			fmt.Sprintf("bd|%d|100|200", gid),
-			fmt.Sprintf("ud|%d|101|0|100|200", gid),
-		)
-	}
-	for _, key := range keys {
-		m.portalCache.Put(key, "stale", time.Minute)
-	}
+	beforeA := []TrackedUser{{UserID: 101, GroupID: ga.ID}}
+	beforeB := []TrackedUser{}
+	oldA := portalGroupAggregateKey("stats", ga.ID, portalMemberFingerprint(beforeA), 100, 200)
+	oldB := portalGroupAggregateKey("stats", gb.ID, portalMemberFingerprint(beforeB), 100, 200)
 	rootCk := &http.Cookie{Name: sessionCookie, Value: m.signSession("root", roleRoot, time.Now().Unix())}
 	w := portalDo(admin, http.MethodPost, "/usage/users/group", fmt.Sprintf(`{"user_id":101,"group_id":%d}`, gb.ID), rootCk)
 	if w.Code != http.StatusOK {
 		t.Fatalf("移动成员失败 = %d %s", w.Code, w.Body.String())
 	}
-	for _, key := range keys {
-		called := false
-		v, err := m.portalCache.Do(key, time.Minute, func() (any, error) {
-			called = true
-			return "fresh", nil
-		})
-		if err != nil || !called || v != "fresh" {
-			t.Fatalf("缓存 %q 未失效: called=%v value=%v err=%v", key, called, v, err)
-		}
+	var afterA, afterB []TrackedUser
+	if err := m.storeDB.Where("group_id = ?", ga.ID).Find(&afterA).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := m.storeDB.Where("group_id = ?", gb.ID).Find(&afterB).Error; err != nil {
+		t.Fatal(err)
+	}
+	newA := portalGroupAggregateKey("stats", ga.ID, portalMemberFingerprint(afterA), 100, 200)
+	newB := portalGroupAggregateKey("stats", gb.ID, portalMemberFingerprint(afterB), 100, 200)
+	if oldA == newA || oldB == newB {
+		t.Fatalf("移动成员后两组缓存域都必须变化: A %q -> %q, B %q -> %q", oldA, newA, oldB, newB)
 	}
 }
 
@@ -253,9 +480,15 @@ func TestSetGroupPortalValidation(t *testing.T) {
 
 func itoa(v int64) string { b, _ := json.Marshal(v); return string(b) }
 
+func cachedString(ctx context.Context, c *usageResultCache, key string, ttl time.Duration, fill func() (any, error)) (string, error) {
+	var out string
+	err := c.DoJSON(ctx, key, ttl, &out, fill)
+	return out, err
+}
+
 // 缓存:singleflight——同键并发只执行一次 fill;TTL 内命中不再执行。
 func TestTTLCacheSingleflight(t *testing.T) {
-	c := newTTLCache()
+	c := newUsageResultCacheForTest(nil, 32, 1<<20)
 	var calls atomic.Int32
 	fill := func() (any, error) {
 		calls.Add(1)
@@ -267,7 +500,7 @@ func TestTTLCacheSingleflight(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			v, err := c.Do("k", time.Second, fill)
+			v, err := cachedString(context.Background(), c, "k", time.Second, fill)
 			if err != nil || v != "v" {
 				t.Errorf("Do = %v %v", v, err)
 			}
@@ -278,18 +511,18 @@ func TestTTLCacheSingleflight(t *testing.T) {
 		t.Fatalf("20 并发应只真正查询 1 次,实际 %d", calls.Load())
 	}
 	// TTL 内再取:仍不查询
-	if _, err := c.Do("k", time.Second, fill); err != nil || calls.Load() != 1 {
+	if _, err := cachedString(context.Background(), c, "k", time.Second, fill); err != nil || calls.Load() != 1 {
 		t.Fatalf("TTL 内应命中缓存,calls=%d err=%v", calls.Load(), err)
 	}
 }
 
 func TestTTLCacheWaiterRespectsContextCancellation(t *testing.T) {
-	c := newTTLCache()
+	c := newUsageResultCacheForTest(nil, 32, 1<<20)
 	started := make(chan struct{})
 	release := make(chan struct{})
 	firstDone := make(chan error, 1)
 	go func() {
-		_, err := c.DoContext(context.Background(), "k", time.Minute, func() (any, error) {
+		_, err := cachedString(context.Background(), c, "k", time.Minute, func() (any, error) {
 			close(started)
 			<-release
 			return "ready", nil
@@ -301,7 +534,7 @@ func TestTTLCacheWaiterRespectsContextCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	called := false
-	if _, err := c.DoContext(ctx, "k", time.Minute, func() (any, error) {
+	if _, err := cachedString(ctx, c, "k", time.Minute, func() (any, error) {
 		called = true
 		return "wrong", nil
 	}); !errors.Is(err, context.Canceled) || called {
@@ -313,7 +546,7 @@ func TestTTLCacheWaiterRespectsContextCancellation(t *testing.T) {
 		t.Fatalf("原填充请求不应受等待者取消影响: %v", err)
 	}
 	called = false
-	v, err := c.Do("k", time.Minute, func() (any, error) {
+	v, err := cachedString(context.Background(), c, "k", time.Minute, func() (any, error) {
 		called = true
 		return "wrong", nil
 	})
@@ -323,12 +556,12 @@ func TestTTLCacheWaiterRespectsContextCancellation(t *testing.T) {
 }
 
 func TestTTLCacheCanceledFillerDoesNotCancelNormalWaiterOrPoisonCache(t *testing.T) {
-	c := newTTLCache()
+	c := newUsageResultCacheForTest(nil, 32, 1<<20)
 	fillStarted := make(chan struct{})
 	firstDone := make(chan error, 1)
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() {
-		_, err := c.DoContext(ctx, "k", time.Minute, func() (any, error) {
+		_, err := cachedString(ctx, c, "k", time.Minute, func() (any, error) {
 			close(fillStarted)
 			<-ctx.Done()
 			return nil, ctx.Err()
@@ -343,7 +576,7 @@ func TestTTLCacheCanceledFillerDoesNotCancelNormalWaiterOrPoisonCache(t *testing
 		err error
 	}, 1)
 	go func() {
-		v, err := c.DoContext(context.Background(), "k", time.Minute, func() (any, error) {
+		v, err := cachedString(context.Background(), c, "k", time.Minute, func() (any, error) {
 			replacementCalls.Add(1)
 			return "fresh", nil
 		})
@@ -363,7 +596,7 @@ func TestTTLCacheCanceledFillerDoesNotCancelNormalWaiterOrPoisonCache(t *testing
 	}
 
 	called := false
-	v, err := c.Do("k", time.Minute, func() (any, error) {
+	v, err := cachedString(context.Background(), c, "k", time.Minute, func() (any, error) {
 		called = true
 		return "wrong", nil
 	})
@@ -373,13 +606,13 @@ func TestTTLCacheCanceledFillerDoesNotCancelNormalWaiterOrPoisonCache(t *testing
 }
 
 func TestTTLCacheCanceledWaitersDoNotCancelNormalWaiters(t *testing.T) {
-	c := newTTLCache()
+	c := newUsageResultCacheForTest(nil, 32, 1<<20)
 	fillStarted := make(chan struct{})
 	releaseFill := make(chan struct{})
 	var fillCalls atomic.Int32
 	firstDone := make(chan error, 1)
 	go func() {
-		_, err := c.DoContext(context.Background(), "k", time.Minute, func() (any, error) {
+		_, err := cachedString(context.Background(), c, "k", time.Minute, func() (any, error) {
 			fillCalls.Add(1)
 			close(fillStarted)
 			<-releaseFill
@@ -396,7 +629,7 @@ func TestTTLCacheCanceledWaitersDoNotCancelNormalWaiters(t *testing.T) {
 		normalWG.Add(1)
 		go func() {
 			defer normalWG.Done()
-			v, err := c.DoContext(context.Background(), "k", time.Minute, func() (any, error) {
+			v, err := cachedString(context.Background(), c, "k", time.Minute, func() (any, error) {
 				fillCalls.Add(1)
 				return "wrong", nil
 			})
@@ -415,7 +648,7 @@ func TestTTLCacheCanceledWaitersDoNotCancelNormalWaiters(t *testing.T) {
 		canceledWG.Add(1)
 		go func(ctx context.Context) {
 			defer canceledWG.Done()
-			_, err := c.DoContext(ctx, "k", time.Minute, func() (any, error) {
+			_, err := cachedString(ctx, c, "k", time.Minute, func() (any, error) {
 				fillCalls.Add(1)
 				return "wrong", nil
 			})
@@ -445,14 +678,17 @@ func TestTTLCacheCanceledWaitersDoNotCancelNormalWaiters(t *testing.T) {
 	}
 }
 
-func TestTTLCacheDeletePrefix(t *testing.T) {
-	c := newTTLCache()
-	c.Put("ov|1|a", "a", time.Minute)
-	c.Put("ov|10|b", "b", time.Minute)
-	c.Put("bd|1|c", "c", time.Minute)
-	c.DeletePrefix("ov|1|")
+func TestUsageResultCacheDeletesOnlyExactKey(t *testing.T) {
+	c := newUsageResultCacheForTest(nil, 32, 1<<20)
+	for key, value := range map[string]string{"ov|1|a": "a", "ov|10|b": "b", "bd|1|c": "c"} {
+		v := value
+		if _, err := cachedString(context.Background(), c, key, time.Minute, func() (any, error) { return v, nil }); err != nil {
+			t.Fatal(err)
+		}
+	}
+	c.Delete(context.Background(), "ov|1|a")
 	called := false
-	v, err := c.Do("ov|1|a", time.Minute, func() (any, error) {
+	v, err := cachedString(context.Background(), c, "ov|1|a", time.Minute, func() (any, error) {
 		called = true
 		return "fresh", nil
 	})
@@ -460,7 +696,7 @@ func TestTTLCacheDeletePrefix(t *testing.T) {
 		t.Fatalf("匹配前缀的缓存应删除: called=%v value=%v err=%v", called, v, err)
 	}
 	called = false
-	v, err = c.Do("ov|10|b", time.Minute, func() (any, error) {
+	v, err = cachedString(context.Background(), c, "ov|10|b", time.Minute, func() (any, error) {
 		called = true
 		return "wrong", nil
 	})
@@ -529,7 +765,7 @@ func TestPortalLogsParamContract(t *testing.T) {
 }
 
 func TestPortalErrorOnlyModelAndGroupFiltersAcceptExactInput(t *testing.T) {
-	html := string(portalHTML)
+	html := portalHTML
 	for _, want := range []string{
 		"function cboxCommitCustom(id)",
 		"cboxInit('logModel',()=>loadLogs(true),true)",

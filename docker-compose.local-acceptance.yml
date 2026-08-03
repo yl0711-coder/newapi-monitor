@@ -1,11 +1,41 @@
 # 本机验收专用：管理端与客户门户都只绑定回环地址，绝不用于生产。
 #
 # 数据卷 ./\.local-data 持有从线上一致性备份得到的 nexus_monitor.db。
+# 首次启动或 Redis 容器不存在时先执行：
+#   docker compose -f docker-compose.local-acceptance.yml up -d redis
 # 更新代码时只执行：
 #   docker compose -f docker-compose.local-acceptance.yml build monitor
 #   docker compose -f docker-compose.local-acceptance.yml up -d --no-deps --force-recreate monitor
 # 不要使用 `down -v`，也不要删除 .local-data/nexus_monitor.db。
 services:
+  redis:
+    image: redis:7-alpine
+    container_name: newapi-monitor-local-redis
+    command:
+      - redis-server
+      - --requirepass
+      - local-acceptance-cache-only
+      - --maxmemory
+      - 128mb
+      - --maxmemory-policy
+      - volatile-lru
+      - --save
+      - ""
+      - --appendonly
+      - "no"
+    ports:
+      # 只供本机真实 Redis 集成测试，绝不暴露到局域网。
+      - "127.0.0.1:17379:6379"
+    tmpfs:
+      - /data
+    mem_limit: 192m
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "local-acceptance-cache-only", "ping"]
+      interval: 5s
+      timeout: 2s
+      retries: 10
+
   monitor:
     image: newapi-monitor:local-acceptance
     build:
@@ -24,6 +54,11 @@ services:
       MONITOR_STORE_PATH: /data/nexus_monitor.db
       MONITOR_NEWAPI_BASE_URL: https://nexusapi.link
       MONITOR_SESSION_SECRET: ${MONITOR_SESSION_SECRET:-local-acceptance-session-only}
+      # 与线上相同架构：Redis 只保存可重算聚合；活跃区间 60 秒、已闭合历史区间 10 分钟。
+      MONITOR_USAGE_REDIS_ADDR: redis:6379
+      MONITOR_USAGE_REDIS_PASSWORD: local-acceptance-cache-only
+      MONITOR_USAGE_REDIS_DB: "0"
+      MONITOR_USAGE_REDIS_PREFIX: nxmon:local:usage:v1
       # 本地验收硬性安全开关：不发邮件、不回填、不做 AWS/域名探测、不打外部心跳。
       MONITOR_ALERTS_DISABLED: "true"
       MONITOR_INFRA_ENABLED: "false"
@@ -34,4 +69,8 @@ services:
       MONITOR_SAMPLE_SECONDS: "3600"
     volumes:
       - ./.local-data:/data
+    depends_on:
+      redis:
+        condition: service_healthy
+    mem_limit: 256m
     restart: unless-stopped
