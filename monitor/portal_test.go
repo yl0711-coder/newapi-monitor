@@ -1,7 +1,9 @@
 package monitor
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -278,6 +280,168 @@ func TestTTLCacheSingleflight(t *testing.T) {
 	// TTL 内再取:仍不查询
 	if _, err := c.Do("k", time.Second, fill); err != nil || calls.Load() != 1 {
 		t.Fatalf("TTL 内应命中缓存,calls=%d err=%v", calls.Load(), err)
+	}
+}
+
+func TestTTLCacheWaiterRespectsContextCancellation(t *testing.T) {
+	c := newTTLCache()
+	started := make(chan struct{})
+	release := make(chan struct{})
+	firstDone := make(chan error, 1)
+	go func() {
+		_, err := c.DoContext(context.Background(), "k", time.Minute, func() (any, error) {
+			close(started)
+			<-release
+			return "ready", nil
+		})
+		firstDone <- err
+	}()
+	<-started
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	called := false
+	if _, err := c.DoContext(ctx, "k", time.Minute, func() (any, error) {
+		called = true
+		return "wrong", nil
+	}); !errors.Is(err, context.Canceled) || called {
+		t.Fatalf("取消的 singleflight 等待者不应继续等待或执行填充: err=%v called=%v", err, called)
+	}
+
+	close(release)
+	if err := <-firstDone; err != nil {
+		t.Fatalf("原填充请求不应受等待者取消影响: %v", err)
+	}
+	called = false
+	v, err := c.Do("k", time.Minute, func() (any, error) {
+		called = true
+		return "wrong", nil
+	})
+	if err != nil || called || v != "ready" {
+		t.Fatalf("取消等待者不应删除或污染原请求生成的缓存: value=%v called=%v err=%v", v, called, err)
+	}
+}
+
+func TestTTLCacheCanceledFillerDoesNotCancelNormalWaiterOrPoisonCache(t *testing.T) {
+	c := newTTLCache()
+	fillStarted := make(chan struct{})
+	firstDone := make(chan error, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		_, err := c.DoContext(ctx, "k", time.Minute, func() (any, error) {
+			close(fillStarted)
+			<-ctx.Done()
+			return nil, ctx.Err()
+		})
+		firstDone <- err
+	}()
+	<-fillStarted
+
+	var replacementCalls atomic.Int32
+	normalDone := make(chan struct {
+		v   any
+		err error
+	}, 1)
+	go func() {
+		v, err := c.DoContext(context.Background(), "k", time.Minute, func() (any, error) {
+			replacementCalls.Add(1)
+			return "fresh", nil
+		})
+		normalDone <- struct {
+			v   any
+			err error
+		}{v: v, err: err}
+	}()
+
+	cancel()
+	if err := <-firstDone; !errors.Is(err, context.Canceled) {
+		t.Fatalf("被取消的填充请求应返回 Canceled: %v", err)
+	}
+	got := <-normalDone
+	if got.err != nil || got.v != "fresh" || replacementCalls.Load() != 1 {
+		t.Fatalf("正常等待者应接手失败填充并成功: value=%v err=%v calls=%d", got.v, got.err, replacementCalls.Load())
+	}
+
+	called := false
+	v, err := c.Do("k", time.Minute, func() (any, error) {
+		called = true
+		return "wrong", nil
+	})
+	if err != nil || called || v != "fresh" {
+		t.Fatalf("取消错误不能污染后续成功缓存: value=%v called=%v err=%v", v, called, err)
+	}
+}
+
+func TestTTLCacheCanceledWaitersDoNotCancelNormalWaiters(t *testing.T) {
+	c := newTTLCache()
+	fillStarted := make(chan struct{})
+	releaseFill := make(chan struct{})
+	var fillCalls atomic.Int32
+	firstDone := make(chan error, 1)
+	go func() {
+		_, err := c.DoContext(context.Background(), "k", time.Minute, func() (any, error) {
+			fillCalls.Add(1)
+			close(fillStarted)
+			<-releaseFill
+			return "ready", nil
+		})
+		firstDone <- err
+	}()
+	<-fillStarted
+
+	const waiterCount = 20
+	var normalWG sync.WaitGroup
+	normalErrs := make(chan error, waiterCount)
+	for i := 0; i < waiterCount; i++ {
+		normalWG.Add(1)
+		go func() {
+			defer normalWG.Done()
+			v, err := c.DoContext(context.Background(), "k", time.Minute, func() (any, error) {
+				fillCalls.Add(1)
+				return "wrong", nil
+			})
+			if err != nil {
+				normalErrs <- fmt.Errorf("正常等待者失败: %w", err)
+			} else if v != "ready" {
+				normalErrs <- fmt.Errorf("正常等待者结果=%v want=ready", v)
+			}
+		}()
+	}
+
+	var canceledWG sync.WaitGroup
+	canceledErrs := make(chan error, waiterCount)
+	for i := 0; i < waiterCount; i++ {
+		ctx, cancel := context.WithCancel(context.Background())
+		canceledWG.Add(1)
+		go func(ctx context.Context) {
+			defer canceledWG.Done()
+			_, err := c.DoContext(ctx, "k", time.Minute, func() (any, error) {
+				fillCalls.Add(1)
+				return "wrong", nil
+			})
+			if !errors.Is(err, context.Canceled) {
+				canceledErrs <- err
+			}
+		}(ctx)
+		cancel()
+	}
+	canceledWG.Wait()
+	close(canceledErrs)
+	for err := range canceledErrs {
+		t.Fatalf("取消等待者应返回 Canceled，got %v", err)
+	}
+
+	close(releaseFill)
+	if err := <-firstDone; err != nil {
+		t.Fatalf("原填充不应受取消等待者影响: %v", err)
+	}
+	normalWG.Wait()
+	close(normalErrs)
+	for err := range normalErrs {
+		t.Fatalf("正常等待者不应被误取消: %v", err)
+	}
+	if got := fillCalls.Load(); got != 1 {
+		t.Fatalf("混合等待者仍应只填充一次，实际=%d", got)
 	}
 }
 

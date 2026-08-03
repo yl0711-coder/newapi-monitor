@@ -10,6 +10,7 @@ package monitor
 // 管理端只读刷新矩阵时仅删除对应日期范围的总览键，避免客户端读到不完整的预热载荷。
 
 import (
+	"context"
 	"strings"
 	"sync"
 	"time"
@@ -32,7 +33,16 @@ func newTTLCache() *ttlCache { return &ttlCache{m: map[string]*cacheEntry{}} }
 // Do 取 key 对应的值:命中且未过期直接返回;否则本协程(或等第一个到的协程)执行 fill 填充。
 // fill 出错不缓存错误结果(下次重试),错误原样返回给本轮所有等待者。
 func (c *ttlCache) Do(key string, ttl time.Duration, fill func() (any, error)) (any, error) {
+	return c.DoContext(context.Background(), key, ttl, fill)
+}
+
+// DoContext 与 Do 语义相同，但等待同键 singleflight 时响应调用方取消。
+// 这能避免客户关闭页面后仍卡在另一个请求的缓存填充上；取消的等待者不会影响正在填充的请求。
+func (c *ttlCache) DoContext(ctx context.Context, key string, ttl time.Duration, fill func() (any, error)) (any, error) {
 	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		c.mu.Lock()
 		e := c.m[key]
 		now := time.Now()
@@ -46,7 +56,11 @@ func (c *ttlCache) Do(key string, ttl time.Duration, fill func() (any, error)) (
 				// 过期或上次失败:走重建
 			default: // 有人正在填充:等它
 				c.mu.Unlock()
-				<-e.ready
+				select {
+				case <-e.ready:
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				}
 				continue // 重进循环取结果(或它失败后本协程接手重建)
 			}
 		}

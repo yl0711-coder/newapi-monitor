@@ -7,10 +7,13 @@ package monitor
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"net/http/httptest"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -53,6 +56,234 @@ func TestParseUsageRange(t *testing.T) {
 	if _, _, err := parseUsageRange("07/01", "", now); err == nil {
 		t.Fatal("坏日期格式应报错")
 	}
+}
+
+func TestUsageGateCanceledBeforeAcquireDoesNotTakeFreeSlot(t *testing.T) {
+	m := &Monitor{}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	// 旧实现中空闲槽位与 Done 同时就绪，select 约一半概率误放行；重复验证避免回归。
+	for i := 0; i < 1000; i++ {
+		err := m.acquireUsageGate(ctx)
+		if err == nil {
+			m.releaseUsageGate()
+			t.Fatalf("第 %d 次：已取消请求不应取得空闲槽位", i+1)
+		}
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("第 %d 次：取消错误=%v", i+1, err)
+		}
+	}
+
+	// 取消请求不能污染闸门；随后的正常请求仍须立即成功。
+	if err := m.acquireUsageGate(context.Background()); err != nil {
+		t.Fatalf("取消请求后正常请求应能取得槽位: %v", err)
+	}
+	m.releaseUsageGate()
+}
+
+func TestUsageGateCanceledWaiterDoesNotReleaseOwner(t *testing.T) {
+	m := &Monitor{}
+	if err := m.acquireUsageGate(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	waiterDone := make(chan error, 1)
+	go func() { waiterDone <- m.acquireUsageGate(ctx) }()
+	cancel()
+	if err := <-waiterDone; !errors.Is(err, context.Canceled) {
+		t.Fatalf("已取消的排队查询应立即退出，got %v", err)
+	}
+
+	// 已取消等待者没有取得槽位，因此绝不能释放当前 owner 的槽位。
+	normalDone := make(chan error, 1)
+	go func() { normalDone <- m.acquireUsageGate(context.Background()) }()
+	select {
+	case err := <-normalDone:
+		t.Fatalf("owner 释放前正常等待者不应取得槽位: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	m.releaseUsageGate()
+	if err := <-normalDone; err != nil {
+		t.Fatalf("owner 释放后正常等待者应取得槽位: %v", err)
+	}
+	m.releaseUsageGate()
+}
+
+func TestUsageGateDeadlineWaiterDoesNotReleaseOwner(t *testing.T) {
+	m := &Monitor{}
+	if err := m.acquireUsageGate(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+	if err := m.acquireUsageGate(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("等待超时应返回 DeadlineExceeded，got %v", err)
+	}
+
+	// 超时等待者同样不能释放 owner 的槽位。
+	normalDone := make(chan error, 1)
+	go func() { normalDone <- m.acquireUsageGate(context.Background()) }()
+	select {
+	case err := <-normalDone:
+		t.Fatalf("owner 释放前正常等待者不应取得槽位: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	m.releaseUsageGate()
+	if err := <-normalDone; err != nil {
+		t.Fatalf("owner 释放后正常等待者应取得槽位: %v", err)
+	}
+	m.releaseUsageGate()
+}
+
+func TestUsageGateDoesNotCancelNormalWaiter(t *testing.T) {
+	m := &Monitor{}
+	if err := m.acquireUsageGate(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	waiterDone := make(chan error, 1)
+	go func() { waiterDone <- m.acquireUsageGate(context.Background()) }()
+	select {
+	case err := <-waiterDone:
+		t.Fatalf("正常等待者不应被提前放行或误取消: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	m.releaseUsageGate()
+	if err := <-waiterDone; err != nil {
+		t.Fatalf("正常等待者在槽位释放后应成功: %v", err)
+	}
+	m.releaseUsageGate()
+}
+
+func TestUsageGateSerializesNormalRequests(t *testing.T) {
+	m := &Monitor{}
+	const workers = 24
+	start := make(chan struct{})
+	errs := make(chan error, workers)
+	var wg sync.WaitGroup
+	var active atomic.Int32
+	var maxActive atomic.Int32
+
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			if err := m.acquireUsageGate(context.Background()); err != nil {
+				errs <- err
+				return
+			}
+			n := active.Add(1)
+			for old := maxActive.Load(); n > old && !maxActive.CompareAndSwap(old, n); old = maxActive.Load() {
+			}
+			time.Sleep(time.Millisecond)
+			active.Add(-1)
+			m.releaseUsageGate()
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatalf("正常并发请求不应失败: %v", err)
+	}
+	if got := maxActive.Load(); got != 1 {
+		t.Fatalf("同一时刻只应放行 1 个请求，实际最大=%d", got)
+	}
+}
+
+func TestUsageGateCancelReleaseRaceNeverLeaksOrDoubleReleases(t *testing.T) {
+	// 模拟 owner 释放与等待者取消同时发生。等待者可以在取消前合法取得槽位，
+	// 也可以返回 Canceled；无论哪种时序，都不能泄漏槽位或释放两次。
+	for i := 0; i < 1000; i++ {
+		m := &Monitor{}
+		if err := m.acquireUsageGate(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		waiterDone := make(chan error, 1)
+		go func() { waiterDone <- m.acquireUsageGate(ctx) }()
+
+		start := make(chan struct{})
+		ownerReleased := make(chan struct{})
+		go func() {
+			<-start
+			m.releaseUsageGate()
+			close(ownerReleased)
+		}()
+		go func() {
+			<-start
+			cancel()
+		}()
+		close(start)
+
+		err := <-waiterDone
+		<-ownerReleased
+		if err == nil {
+			// 等待者在 cancel 生效前取得槽位是合法结果，由它归还自己的槽位。
+			m.releaseUsageGate()
+		} else if !errors.Is(err, context.Canceled) {
+			t.Fatalf("第 %d 次：竞争结果错误=%v", i+1, err)
+		}
+
+		// 每轮都验证闸门最终处于可用且空闲状态；泄漏会在这里超时。
+		probeCtx, probeCancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+		if err := m.acquireUsageGate(probeCtx); err != nil {
+			probeCancel()
+			t.Fatalf("第 %d 次：取消/释放竞争后槽位不可用: %v", i+1, err)
+		}
+		probeCancel()
+		m.releaseUsageGate()
+	}
+}
+
+func TestCanceledUsageRequestClassification(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	tests := []struct {
+		name       string
+		requestCtx context.Context
+		err        error
+		wantAbort  bool
+	}{
+		{name: "wrapped query cancellation", requestCtx: context.Background(), err: fmt.Errorf("wrapped: %w", context.Canceled), wantAbort: true},
+		{name: "request canceled with driver error", requestCtx: canceledContext(), err: errors.New("driver: bad connection"), wantAbort: true},
+		{name: "query deadline is a real timeout", requestCtx: context.Background(), err: context.DeadlineExceeded, wantAbort: false},
+		{name: "request deadline is a real timeout", requestCtx: expiredContext(), err: context.DeadlineExceeded, wantAbort: false},
+		{name: "ordinary database error", requestCtx: context.Background(), err: errors.New("database unavailable"), wantAbort: false},
+		{name: "nil error", requestCtx: context.Background(), err: nil, wantAbort: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(w)
+			c.Request = httptest.NewRequest("GET", "/usage/matrix", nil).WithContext(tt.requestCtx)
+			got := abortCanceledUsageRequest(c, tt.err)
+			if got != tt.wantAbort {
+				t.Fatalf("abort=%v want=%v err=%v requestErr=%v", got, tt.wantAbort, tt.err, tt.requestCtx.Err())
+			}
+			if tt.wantAbort {
+				if w.Code != statusClientClosedRequest {
+					t.Fatalf("取消状态=%d want=%d", w.Code, statusClientClosedRequest)
+				}
+			} else if c.Writer.Written() {
+				t.Fatalf("非取消错误不应被 helper 提前写响应，status=%d", w.Code)
+			}
+		})
+	}
+}
+
+func canceledContext() context.Context {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	return ctx
+}
+
+func expiredContext() context.Context {
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancel()
+	return ctx
 }
 
 func TestParseUsageRangeRejectsPreciseTime(t *testing.T) {

@@ -4,13 +4,14 @@ package monitor
 // 按需对生产库 logs 表做窗口化聚合:消费矩阵(用户×日)与单用户详情(每日/分组/模型),费用=quota/500000 美元。
 //
 // 与采样器的边界:采样器是【常驻周期】查询,这里是【按需】查询——只在打开页面 / 点查询时执行,
-// 全部限定时间范围并命中索引(idx_logs_user_id / idx_created_at_type / idx_logs_group / idx_logs_model_name),
-// 且同一时刻只放行一条聚合(usageMu 串行化),不给生产库常驻负担。生产库全程只读。
+// 全部限定时间范围，并由可取消的单槽闸门控制同一时刻最多一条重查询；具体索引利用情况需以
+// 生产库 EXPLAIN 为准，不能仅因 WHERE 中存在索引列就假定一定命中。生产库全程只读。
 // 名单存本地 sqlite(tracked_users);鉴权沿用全站约定:管理员可看,仅超管可改名单。
 
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -30,6 +31,47 @@ const (
 )
 
 var usageCST = time.FixedZone("CST", usageTZOffsetSec)
+
+const statusClientClosedRequest = 499 // Nginx 约定：客户端主动断开；用于访问日志区分真实服务端 5xx
+
+// acquireUsageGate 等待生产库重查询槽位。与 sync.Mutex 不同，排队中的请求会响应
+// request context 取消/超时，避免用户快速切换筛选后旧请求仍依次进入数据库。
+func (m *Monitor) acquireUsageGate(ctx context.Context) error {
+	// ctx 已经结束时不能让 select 在“空闲槽位”和 Done 同时就绪时随机取得槽位。
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	m.usageGateOnce.Do(func() { m.usageGate = make(chan struct{}, 1) })
+	select {
+	case m.usageGate <- struct{}{}:
+		// 取消可能与取得槽位同时发生；再次确认并归还自己刚取得的槽位，
+		// 不能让已取消请求进入 SQL，也不能误释放其他请求持有的槽位。
+		if err := ctx.Err(); err != nil {
+			<-m.usageGate
+			return err
+		}
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (m *Monitor) releaseUsageGate() { <-m.usageGate }
+
+func isCanceledUsageRequest(c *gin.Context, err error) bool {
+	return errors.Is(err, context.Canceled) || errors.Is(c.Request.Context().Err(), context.Canceled)
+}
+
+// abortCanceledUsageRequest 把浏览器主动取消与真正的服务端故障分开。
+// 内部查询超时仍返回 false，由调用方按真实错误记录和响应。
+func abortCanceledUsageRequest(c *gin.Context, err error) bool {
+	if !isCanceledUsageRequest(c, err) {
+		return false
+	}
+	c.Status(statusClientClosedRequest)
+	c.Writer.WriteHeaderNow()
+	return true
+}
 
 // usageDayExprMySQL 把 created_at(unix 秒)折算成 CST 日序号(自 epoch 起第几天)。
 // MySQL 整除用 DIV;测试里(sqlite)用 usageDayExpr 字段覆盖为 '/'(sqlite 整型相除即整除)。
@@ -125,15 +167,17 @@ func usageIn(col string, ids []int64) (string, []any) {
 
 // computeUsageStats 对 [fromTs, toTs) 内、指定用户集合的消费与退款日志(type=2/6)做三路聚合。
 // tokenID>0 时再按令牌过滤(单用户详情下钻单令牌;与 user_id 双条件,隔离不依赖 token 归属校验)。
-// 串行化(usageMu):同一时刻最多一条聚合在生产库上跑,叠加连接池上限双保险。
+// 串行化(usageGate):同一时刻最多一条聚合在生产库上跑，等待也计入 20 秒总时限。
 func (m *Monitor) computeUsageStats(ctx context.Context, ids []int64, fromTs, toTs, tokenID int64) (*UsageStats, error) {
 	if len(ids) == 0 {
 		return &UsageStats{}, nil // 名单为空不该走到这;防御:不拼 "IN ()" 非法 SQL
 	}
-	m.usageMu.Lock()
-	defer m.usageMu.Unlock()
 	cctx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
+	if err := m.acquireUsageGate(cctx); err != nil {
+		return nil, fmt.Errorf("等待用量查询槽位失败: %w", err)
+	}
+	defer m.releaseUsageGate()
 
 	inSQL, inArgs := usageIn("user_id", ids)
 	where := "type IN (2,6) AND created_at >= ? AND created_at < ? AND " + inSQL
@@ -335,10 +379,12 @@ func (m *Monitor) computeUsageMatrix(ctx context.Context, ids []int64, fromTs, t
 	if len(ids) == 0 {
 		return mx, nil
 	}
-	m.usageMu.Lock()
-	defer m.usageMu.Unlock()
 	cctx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
+	if err := m.acquireUsageGate(cctx); err != nil {
+		return nil, fmt.Errorf("等待用量查询槽位失败: %w", err)
+	}
+	defer m.releaseUsageGate()
 
 	inSQL, inArgs := usageIn("user_id", ids)
 	q := "SELECT user_id, " + m.dayExpr() + " AS day_idx," +
@@ -430,8 +476,15 @@ func (m *Monitor) serveUsageMatrix(c *gin.Context) {
 		return
 	}
 	tracked, balances, usedTotals := m.refreshTrackedLabels(c.Request.Context(), tracked) // 身份标签校准 + 取当前余额与累计总消耗
+	if err := c.Request.Context().Err(); errors.Is(err, context.Canceled) {
+		abortCanceledUsageRequest(c, err)
+		return
+	}
 	mx, err := m.computeUsageMatrix(c.Request.Context(), idsOf(tracked), fromTs, toTs)
 	if err != nil {
+		if abortCanceledUsageRequest(c, err) {
+			return
+		}
 		slog.Warn("用户用量矩阵聚合失败", "err", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "统计查询失败,请稍后重试(细节见服务端日志)"})
 		return
@@ -496,7 +549,9 @@ func (m *Monitor) userBalanceQuota(ctx context.Context, id int64) *int64 {
 	defer cancel()
 	var quota int64
 	if err := m.prodDB.QueryRowContext(cctx, "SELECT COALESCE(quota,0) FROM users WHERE id = ?", id).Scan(&quota); err != nil {
-		slog.Warn("查询用户余额失败", "err", err, "user_id", id)
+		if !errors.Is(err, context.Canceled) {
+			slog.Warn("查询用户余额失败", "err", err, "user_id", id)
+		}
 		return nil
 	}
 	return &quota
@@ -508,7 +563,9 @@ func (m *Monitor) userUsedQuota(ctx context.Context, id int64) *int64 {
 	defer cancel()
 	var used int64
 	if err := m.prodDB.QueryRowContext(cctx, "SELECT COALESCE(used_quota,0) FROM users WHERE id = ?", id).Scan(&used); err != nil {
-		slog.Warn("查询用户累计消耗失败", "err", err, "user_id", id)
+		if !errors.Is(err, context.Canceled) {
+			slog.Warn("查询用户累计消耗失败", "err", err, "user_id", id)
+		}
 		return nil
 	}
 	return &used
@@ -566,10 +623,12 @@ func maskTokenKey(key string) string {
 // 每行带累计总消耗(tokens.used_quota,创建至今终身值);生产库只读;key 只在服务端脱敏后返回,明文永不出库。
 // 排序:现存令牌在前、已删除沉底,区内按范围费用降序。
 func (m *Monitor) computeUserTokenUsage(ctx context.Context, uid, fromTs, toTs int64) ([]TokenUsage, error) {
-	m.usageMu.Lock() // 与其它大聚合共用串行闸:同一时刻生产库最多跑一条聚合(调用方未持锁,不会重入)
-	defer m.usageMu.Unlock()
 	cctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
+	if err := m.acquireUsageGate(cctx); err != nil {
+		return nil, fmt.Errorf("等待令牌查询槽位失败: %w", err)
+	}
+	defer m.releaseUsageGate()
 
 	// 令牌所属用户:logs.user_id 即令牌拥有者,故整批令牌都归 uid;解析其展示名(用户名→邮箱→#ID)
 	owner := fmt.Sprintf("#%d", uid)
@@ -1270,10 +1329,12 @@ func (m *Monitor) countGroupLogs(ctx context.Context, ids []int64, fromTs, toTs,
 	if len(ids) == 0 {
 		return 0, nil
 	}
-	m.usageMu.Lock()
-	defer m.usageMu.Unlock()
 	cctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
+	if err := m.acquireUsageGate(cctx); err != nil {
+		return 0, fmt.Errorf("等待日志计数槽位失败: %w", err)
+	}
+	defer m.releaseUsageGate()
 	where, args := logFilterWhere(ids, fromTs, toTs, memberUID, logType, model, group, tokenName, detailKw, requestID)
 	var n int64
 	if err := m.prodDB.QueryRowContext(cctx, "SELECT COUNT(*) FROM logs WHERE "+where, args...).Scan(&n); err != nil {
@@ -1282,17 +1343,19 @@ func (m *Monitor) countGroupLogs(ctx context.Context, ids []int64, fromTs, toTs,
 	return n, nil
 }
 
-// queryGroupLogs 查一组成员的日志,按 id 倒序游标分页;窗口化、走索引、只读、串行(usageMu)。
+// queryGroupLogs 查一组成员的日志,按 id 倒序游标分页;窗口化、只读、串行(usageGate)。
 // 全部用户可控值参数化;memberUID 需调用方已校验属本组;limit 由调用方控上限(分页 pageSize+1 / 导出 cap,超限判定在导出侧用 COUNT 探测)。
 // 取 content+other 拼「详情」与首字(only 安全字段);花费/首字/详情按 new-api 的可展示/计时类型口径填。
 func (m *Monitor) queryGroupLogs(ctx context.Context, ids []int64, fromTs, toTs, memberUID int64, logType int, model, group, tokenName, detailKw, requestID string, beforeID int64, limit int) ([]LogRow, error) {
 	if len(ids) == 0 {
 		return nil, nil
 	}
-	m.usageMu.Lock() // 与其它大聚合共用串行闸:同一时刻生产库最多一条重查询
-	defer m.usageMu.Unlock()
 	cctx, cancel := context.WithTimeout(ctx, 25*time.Second) // 导出可能取到 5 万行,给足超时
 	defer cancel()
+	if err := m.acquireUsageGate(cctx); err != nil {
+		return nil, fmt.Errorf("等待日志查询槽位失败: %w", err)
+	}
+	defer m.releaseUsageGate()
 
 	where, args := logFilterWhere(ids, fromTs, toTs, memberUID, logType, model, group, tokenName, detailKw, requestID)
 	if beforeID > 0 { // 游标:取比上次末尾更早的(id 近似时间序,倒序翻页,不用深 OFFSET)
@@ -1405,6 +1468,9 @@ func (m *Monitor) serveUsageStats(c *gin.Context) {
 	}
 	st, err := m.computeUsageStats(c.Request.Context(), ids, fromTs, toTs, tokenID)
 	if err != nil {
+		if abortCanceledUsageRequest(c, err) {
+			return
+		}
 		slog.Warn("用户用量详情聚合失败", "err", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "统计查询失败,请稍后重试(细节见服务端日志)"})
 		return
@@ -1429,6 +1495,9 @@ func (m *Monitor) serveUsageStats(c *gin.Context) {
 		resp["total_used_usd"] = quotaUSDPtr(usedQ)
 		toks, err := m.computeUserTokenUsage(c.Request.Context(), ids[0], fromTs, toTs)
 		if err != nil {
+			if abortCanceledUsageRequest(c, err) {
+				return
+			}
 			slog.Warn("单用户令牌用量聚合失败", "err", err, "user_id", ids[0])
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "令牌统计查询失败,请稍后重试(细节见服务端日志)"})
 			return
@@ -1448,7 +1517,9 @@ func (m *Monitor) sumBalanceQuota(ctx context.Context, ids []int64) *int64 {
 	inSQL, args := usageIn("id", ids)
 	var quota int64
 	if err := m.prodDB.QueryRowContext(cctx, "SELECT COALESCE(SUM(quota),0) FROM users WHERE "+inSQL, args...).Scan(&quota); err != nil {
-		slog.Warn("查询分组余额合计失败", "err", err)
+		if !errors.Is(err, context.Canceled) {
+			slog.Warn("查询分组余额合计失败", "err", err)
+		}
 		return nil
 	}
 	return &quota
@@ -1464,7 +1535,9 @@ func (m *Monitor) sumUsedQuota(ctx context.Context, ids []int64) *int64 {
 	inSQL, args := usageIn("id", ids)
 	var used int64
 	if err := m.prodDB.QueryRowContext(cctx, "SELECT COALESCE(SUM(used_quota),0) FROM users WHERE "+inSQL, args...).Scan(&used); err != nil {
-		slog.Warn("查询分组累计消耗合计失败", "err", err)
+		if !errors.Is(err, context.Canceled) {
+			slog.Warn("查询分组累计消耗合计失败", "err", err)
+		}
 		return nil
 	}
 	return &used

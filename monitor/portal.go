@@ -517,10 +517,13 @@ func (m *Monitor) portalOverview(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	val, err := m.portalCache.Do(portalOverviewKey(gid, fromTs, toTs), portalCacheTTL, func() (any, error) {
+	val, err := m.portalCache.DoContext(c.Request.Context(), portalOverviewKey(gid, fromTs, toTs), portalCacheTTL, func() (any, error) {
 		return m.buildPortalOverview(c, gid, fromTs, toTs)
 	})
 	if err != nil {
+		if abortCanceledUsageRequest(c, err) {
+			return
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "查询失败,请稍后重试"})
 		return
 	}
@@ -544,6 +547,9 @@ func (m *Monitor) buildPortalOverview(c *gin.Context, gid, fromTs, toTs int64) (
 		return p, nil
 	}
 	tracked, balances, usedTotals := m.refreshTrackedLabels(c.Request.Context(), tracked)
+	if err := c.Request.Context().Err(); err != nil {
+		return nil, err
+	}
 	mx, err := m.computeUsageMatrix(c.Request.Context(), idsOf(tracked), fromTs, toTs)
 	if err != nil {
 		return nil, err
@@ -617,7 +623,7 @@ func (m *Monitor) portalBreakdown(c *gin.Context) {
 	}
 	ids := idsOf(tracked)
 	key := fmt.Sprintf("bd|%d|%d|%d", gid, fromTs, toTs)
-	val, err := m.portalCache.Do(key, portalCacheTTL, func() (any, error) {
+	val, err := m.portalCache.DoContext(c.Request.Context(), key, portalCacheTTL, func() (any, error) {
 		if len(ids) == 0 {
 			return gin.H{"by_group": []UsageDim{}, "by_model": []UsageDim{}, "by_group_truncated": false, "by_model_truncated": false}, nil
 		}
@@ -629,6 +635,9 @@ func (m *Monitor) portalBreakdown(c *gin.Context) {
 			"by_group_truncated": st.ByGroupTruncated, "by_model_truncated": st.ByModelTruncated}, nil
 	})
 	if err != nil {
+		if abortCanceledUsageRequest(c, err) {
+			return
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "查询失败,请稍后重试"})
 		return
 	}
@@ -664,7 +673,7 @@ func (m *Monitor) portalUserDetail(c *gin.Context) {
 		return
 	}
 	key := fmt.Sprintf("ud|%d|%d|%d|%d|%d", gid, uid, tokenID, fromTs, toTs)
-	val, err := m.portalCache.Do(key, portalCacheTTL, func() (any, error) {
+	val, err := m.portalCache.DoContext(c.Request.Context(), key, portalCacheTTL, func() (any, error) {
 		st, err := m.computeUsageStats(c.Request.Context(), []int64{uid}, fromTs, toTs, tokenID)
 		if err != nil {
 			return nil, err
@@ -688,6 +697,9 @@ func (m *Monitor) portalUserDetail(c *gin.Context) {
 		}, nil
 	})
 	if err != nil {
+		if abortCanceledUsageRequest(c, err) {
+			return
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "查询失败,请稍后重试"})
 		return
 	}
@@ -770,6 +782,9 @@ func (m *Monitor) portalLogs(c *gin.Context) {
 	beforeID, _ := strconv.ParseInt(c.Query("cursor"), 10, 64)
 	rows, err := m.queryGroupLogs(c.Request.Context(), ids, fromTs, toTs, memberUID, logType, model, group, tokenName, detailKw, requestID, beforeID, portalLogPageSize+1)
 	if err != nil {
+		if abortCanceledUsageRequest(c, err) {
+			return
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "查询失败,请稍后重试"})
 		return
 	}
@@ -829,9 +844,12 @@ func (m *Monitor) portalLogsExport(c *gin.Context) {
 			m.exportLim.rollback(gid, prev, now)
 		}
 	}()
-	// 探测用轻量 COUNT(走索引,毫秒级),不再为判断超限拉 5 万整行
+	// COUNT 只取数量、不拉 5 万整行；其执行计划仍取决于生产库索引，受统一查询闸门和 15 秒上限约束。
 	total, err := m.countGroupLogs(c.Request.Context(), ids, fromTs, toTs, memberUID, logType, model, group, tokenName, detailKw, requestID)
 	if err != nil {
+		if abortCanceledUsageRequest(c, err) {
+			return
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "查询失败,请稍后重试"})
 		return
 	}
@@ -870,6 +888,9 @@ func (m *Monitor) portalLogsExport(c *gin.Context) {
 		}
 		rows, qerr := m.queryGroupLogs(c.Request.Context(), ids, fromTs, toTs, memberUID, logType, model, group, tokenName, detailKw, requestID, beforeID, limit)
 		if qerr != nil {
+			if isCanceledUsageRequest(c, qerr) {
+				return
+			}
 			// 响应已开始，不能再写 JSON；日志记录原因，客户端下载到的文件仍是有效的 CSV 前缀。
 			slog.Warn("客户端 CSV 分页查询失败", "gid", gid, "err", qerr)
 			return

@@ -131,6 +131,9 @@ func (m *Monitor) computeFollowUps(ctx context.Context, nowUnix int64) ([]Follow
 
 	allIDs := idsOf(tracked)
 	tracked, balances, _ := m.refreshTrackedLabels(ctx, tracked) // 跟进判断不用累计总消耗,忽略第三返回
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 
 	// 固定 30 天窗口(不受页面显示范围影响),按 CST 切日
 	toTs := followUpDayStart(nowUnix+usageTZOffsetSec) + 86400
@@ -281,6 +284,9 @@ func (m *Monitor) serveFollowUps(c *gin.Context) {
 	}
 	items, err := m.computeFollowUps(c.Request.Context(), time.Now().Unix())
 	if err != nil {
+		if abortCanceledUsageRequest(c, err) {
+			return
+		}
 		slog.Warn("待跟进计算失败", "err", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "待跟进查询失败,请稍后重试"})
 		return

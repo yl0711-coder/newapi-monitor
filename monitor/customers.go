@@ -6,6 +6,7 @@ package monitor
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -482,7 +483,9 @@ func (m *Monitor) refreshTrackedLabels(ctx context.Context, tracked []TrackedUse
 	// used_quota 与 quota 同表同行,SELECT 多取一列即得累计总消耗,无额外往返/扫描
 	rows, err := m.prodDB.QueryContext(cctx, "SELECT id, COALESCE(username,''), COALESCE(email,''), COALESCE(quota,0), COALESCE(used_quota,0) FROM users WHERE "+inSQL, args...)
 	if err != nil {
-		slog.Warn("刷新检测用户标签失败,沿用快照", "err", err)
+		if !errors.Is(err, context.Canceled) {
+			slog.Warn("刷新检测用户标签失败,沿用快照", "err", err)
+		}
 		return tracked, balances, used
 	}
 	defer rows.Close()
@@ -491,7 +494,9 @@ func (m *Monitor) refreshTrackedLabels(ctx context.Context, tracked []TrackedUse
 		var u TrackedUser
 		var quota, usedQ int64
 		if err := rows.Scan(&u.UserID, &u.Username, &u.Email, &quota, &usedQ); err != nil {
-			slog.Warn("刷新检测用户标签失败,沿用快照", "err", err)
+			if !errors.Is(err, context.Canceled) {
+				slog.Warn("刷新检测用户标签失败,沿用快照", "err", err)
+			}
 			return tracked, map[int64]int64{}, map[int64]int64{}
 		}
 		fresh[u.UserID] = u
@@ -499,7 +504,9 @@ func (m *Monitor) refreshTrackedLabels(ctx context.Context, tracked []TrackedUse
 		used[u.UserID] = usedQ
 	}
 	if err := rows.Err(); err != nil {
-		slog.Warn("刷新检测用户标签失败,沿用快照", "err", err)
+		if !errors.Is(err, context.Canceled) {
+			slog.Warn("刷新检测用户标签失败,沿用快照", "err", err)
+		}
 		return tracked, map[int64]int64{}, map[int64]int64{}
 	}
 	for i, u := range tracked {
