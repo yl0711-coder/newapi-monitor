@@ -14,6 +14,9 @@ secrets/
 *.db-shm
 .run/
 
+# —— 本机只读排查工具(不随产品代码提交)——
+/tools/
+
 # —— 构建产物 ——
 /dist/
 /newapi-monitor

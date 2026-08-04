@@ -135,7 +135,32 @@ func TestPortalScopeIsolation(t *testing.T) {
 	}
 }
 
-// 端到端验证：overview 首次只填充 matrix+stats 两项，breakdown 复用同一 stats；
+func TestUsageCacheStatsRequireAdminSessionAndContainNoBusinessData(t *testing.T) {
+	m, admin, _ := newPortalTestMonitor(t)
+	if w := portalDo(admin, http.MethodGet, "/usage/cache-stats", ""); w.Code != http.StatusUnauthorized {
+		t.Fatalf("未登录访问缓存指标应返回 401，得到 %d %s", w.Code, w.Body.String())
+	}
+	ck := &http.Cookie{Name: sessionCookie, Value: m.signSession("admin", roleAdmin, time.Now().Unix())}
+	w := portalDo(admin, http.MethodGet, "/usage/cache-stats", "", ck)
+	if w.Code != http.StatusOK {
+		t.Fatalf("管理员读取缓存指标失败: %d %s", w.Code, w.Body.String())
+	}
+	var body map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	cache, ok := body["cache"].(map[string]any)
+	if !ok || cache["requests"] == nil || cache["remote_configured"] == nil {
+		t.Fatalf("缓存指标字段不完整: %s", w.Body.String())
+	}
+	for _, forbidden := range []string{"key", "prefix", "user", "group", "model", "payload"} {
+		if _, exists := cache[forbidden]; exists {
+			t.Fatalf("缓存指标不应暴露业务字段 %q: %s", forbidden, w.Body.String())
+		}
+	}
+}
+
+// 端到端验证：overview 首次只填充一个 matrix+stats 原子结果，breakdown 复用同一世代；
 // 聚合命中缓存后，用户名/邮箱/余额仍由 users 主键查询实时组装，Redis 中不出现这些资料。
 func TestPortalAggregateCacheKeepsLiveUserFieldsOutOfRedis(t *testing.T) {
 	m, _, portal := newPortalTestMonitor(t)
@@ -182,13 +207,13 @@ func TestPortalAggregateCacheKeepsLiveUserFieldsOutOfRedis(t *testing.T) {
 	if len(firstResp.Data.Users) != 1 || firstResp.Data.Users[0].Username != "live-name" || firstResp.Data.Users[0].BalanceQuota == nil || *firstResp.Data.Users[0].BalanceQuota != 500000 {
 		t.Fatalf("实时用户字段错误: %+v", firstResp.Data.Users)
 	}
-	if got := m.usageCache.fills.Load(); got != 2 {
-		t.Fatalf("overview 应只填充 matrix+stats，实际 %d", got)
+	if got := m.usageCache.fills.Load(); got != 1 {
+		t.Fatalf("overview 应只填充一个原子聚合结果，实际 %d", got)
 	}
 
-	// 同范围 breakdown 必须复用 overview 的 stats，不新增源聚合。
+	// 同范围 breakdown 必须复用 overview 同一世代的 stats，不新增源聚合。
 	breakdown := portalDo(portal, http.MethodGet, "/api/breakdown?from=2026-08-02&to=2026-08-02", "", ck)
-	if breakdown.Code != http.StatusOK || m.usageCache.fills.Load() != 2 {
+	if breakdown.Code != http.StatusOK || m.usageCache.fills.Load() != 1 {
 		t.Fatalf("breakdown 未复用 stats: code=%d fills=%d body=%s", breakdown.Code, m.usageCache.fills.Load(), breakdown.Body.String())
 	}
 
@@ -203,7 +228,7 @@ func TestPortalAggregateCacheKeepsLiveUserFieldsOutOfRedis(t *testing.T) {
 	if err := json.Unmarshal(second.Body.Bytes(), &secondResp); err != nil {
 		t.Fatal(err)
 	}
-	if len(secondResp.Data.Users) != 1 || secondResp.Data.Users[0].BalanceQuota == nil || *secondResp.Data.Users[0].BalanceQuota != 750000 || m.usageCache.fills.Load() != 2 {
+	if len(secondResp.Data.Users) != 1 || secondResp.Data.Users[0].BalanceQuota == nil || *secondResp.Data.Users[0].BalanceQuota != 750000 || m.usageCache.fills.Load() != 1 {
 		t.Fatalf("缓存命中后实时余额错误: users=%+v fills=%d", secondResp.Data.Users, m.usageCache.fills.Load())
 	}
 
@@ -364,7 +389,7 @@ func TestPortalUserAndTokenDetailCacheKeepsLiveFieldsOutOfRedis(t *testing.T) {
 	}
 }
 
-// 管理端矩阵刷新后，只精确删除相同成员集合/日期范围的 matrix 与 stats 聚合键。
+// 管理端矩阵刷新后，只精确删除相同成员集合/日期范围的 overview 原子聚合键。
 // 这既保证客户下次读到完整趋势，也不会对 Redis 使用 KEYS/SCAN。
 func TestPortalMatrixRefreshInvalidatesExactAggregates(t *testing.T) {
 	m, _, _ := newPortalTestMonitor(t)
@@ -377,28 +402,24 @@ func TestPortalMatrixRefreshInvalidatesExactAggregates(t *testing.T) {
 	const fromTs, toTs = 1751328000, 1751414400
 	for _, u := range tracked {
 		fp := portalMemberFingerprint([]TrackedUser{u})
-		for _, kind := range []string{"matrix", "stats"} {
-			var out UsageStats
-			if err := m.usageCache.DoJSON(context.Background(), portalGroupAggregateKey(kind, u.GroupID, fp, fromTs, toTs), usageAggregateLiveTTL, &out, func() (any, error) {
-				return &UsageStats{Summary: UsageDim{UsageBilling: UsageBilling{Requests: 99}}}, nil
-			}); err != nil {
-				t.Fatal(err)
-			}
+		var out portalGroupAggregatePayload
+		if err := m.usageCache.DoJSON(context.Background(), portalGroupAggregateKey("overview", u.GroupID, fp, fromTs, toTs), usageAggregateLiveTTL, &out, func() (any, error) {
+			return &portalGroupAggregatePayload{Stats: UsageStats{Summary: UsageDim{UsageBilling: UsageBilling{Requests: 99}}}}, nil
+		}); err != nil {
+			t.Fatal(err)
 		}
 	}
 	m.invalidatePortalAggregates(tracked, fromTs, toTs)
 	for _, u := range tracked {
 		fp := portalMemberFingerprint([]TrackedUser{u})
-		for _, kind := range []string{"matrix", "stats"} {
-			called := false
-			var out UsageStats
-			err := m.usageCache.DoJSON(context.Background(), portalGroupAggregateKey(kind, u.GroupID, fp, fromTs, toTs), usageAggregateLiveTTL, &out, func() (any, error) {
-				called = true
-				return &UsageStats{Summary: UsageDim{UsageBilling: UsageBilling{Requests: 1}}}, nil
-			})
-			if err != nil || !called || out.Summary.Requests != 1 {
-				t.Fatalf("group=%d kind=%s 应重新聚合: called=%v requests=%d err=%v", u.GroupID, kind, called, out.Summary.Requests, err)
-			}
+		called := false
+		var out portalGroupAggregatePayload
+		err := m.usageCache.DoJSON(context.Background(), portalGroupAggregateKey("overview", u.GroupID, fp, fromTs, toTs), usageAggregateLiveTTL, &out, func() (any, error) {
+			called = true
+			return &portalGroupAggregatePayload{Stats: UsageStats{Summary: UsageDim{UsageBilling: UsageBilling{Requests: 1}}}}, nil
+		})
+		if err != nil || !called || out.Stats.Summary.Requests != 1 {
+			t.Fatalf("group=%d 应重新聚合: called=%v requests=%d err=%v", u.GroupID, called, out.Stats.Summary.Requests, err)
 		}
 	}
 }
@@ -420,8 +441,8 @@ func TestPortalMemberMoveChangesBothGroupCacheScopes(t *testing.T) {
 	}
 	beforeA := []TrackedUser{{UserID: 101, GroupID: ga.ID}}
 	beforeB := []TrackedUser{}
-	oldA := portalGroupAggregateKey("stats", ga.ID, portalMemberFingerprint(beforeA), 100, 200)
-	oldB := portalGroupAggregateKey("stats", gb.ID, portalMemberFingerprint(beforeB), 100, 200)
+	oldA := portalGroupAggregateKey("overview", ga.ID, portalMemberFingerprint(beforeA), 100, 200)
+	oldB := portalGroupAggregateKey("overview", gb.ID, portalMemberFingerprint(beforeB), 100, 200)
 	rootCk := &http.Cookie{Name: sessionCookie, Value: m.signSession("root", roleRoot, time.Now().Unix())}
 	w := portalDo(admin, http.MethodPost, "/usage/users/group", fmt.Sprintf(`{"user_id":101,"group_id":%d}`, gb.ID), rootCk)
 	if w.Code != http.StatusOK {
@@ -434,8 +455,8 @@ func TestPortalMemberMoveChangesBothGroupCacheScopes(t *testing.T) {
 	if err := m.storeDB.Where("group_id = ?", gb.ID).Find(&afterB).Error; err != nil {
 		t.Fatal(err)
 	}
-	newA := portalGroupAggregateKey("stats", ga.ID, portalMemberFingerprint(afterA), 100, 200)
-	newB := portalGroupAggregateKey("stats", gb.ID, portalMemberFingerprint(afterB), 100, 200)
+	newA := portalGroupAggregateKey("overview", ga.ID, portalMemberFingerprint(afterA), 100, 200)
+	newB := portalGroupAggregateKey("overview", gb.ID, portalMemberFingerprint(afterB), 100, 200)
 	if oldA == newA || oldB == newB {
 		t.Fatalf("移动成员后两组缓存域都必须变化: A %q -> %q, B %q -> %q", oldA, newA, oldB, newB)
 	}
@@ -743,8 +764,237 @@ func TestPortalCSVRecord(t *testing.T) {
 	}
 }
 
-// 客户日志 API 参数契约:错误(5)/退款(6)不对客户提供,显式请求必须 400(防参数层校验被放宽的回归);
-// 令牌名搜索超长同样 400。查看与导出共用 portalLogParams,两端点都验。
+func TestPortalLogMemberStoreFailureReturnsServerError(t *testing.T) {
+	m, _, portal := newPortalTestMonitor(t)
+	h, _ := hashPassword("password-aaa")
+	g := CustomerGroup{Name: "A公司", PortalEmail: "a@x.com", PortalPwAdmin: h}
+	if err := m.storeDB.Create(&g).Error; err != nil {
+		t.Fatal(err)
+	}
+	ck := portalCookie(portalDo(portal, http.MethodPost, "/login", `{"email":"a@x.com","password":"password-aaa"}`))
+	if ck == nil {
+		t.Fatal("登录失败")
+	}
+	if err := m.storeDB.Migrator().DropTable(&TrackedUser{}); err != nil {
+		t.Fatal(err)
+	}
+	w := portalDo(portal, http.MethodGet, "/api/logs?from=2026-08-02&to=2026-08-02", "", ck)
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("本地名单库失败应返回 500，得到 %d %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "数据读取失败") || strings.Contains(strings.ToLower(w.Body.String()), "tracked_users") {
+		t.Fatalf("应返回通用错误且不泄漏表结构: %s", w.Body.String())
+	}
+}
+
+func TestPortalExportPrepareTicketAndNativeDownload(t *testing.T) {
+	m, _, portal := newPortalTestMonitor(t)
+	m.prodDB = newFakeProdDB(t)
+	m.usageDayExpr = usageDayExprSQLite
+	h, _ := hashPassword("password-aaa")
+	g := CustomerGroup{Name: "A公司", PortalEmail: "a@x.com", PortalPwAdmin: h}
+	if err := m.storeDB.Create(&g).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := m.storeDB.Create(&TrackedUser{UserID: 101, Username: "alice", GroupID: g.ID}).Error; err != nil {
+		t.Fatal(err)
+	}
+	createdAt := time.Date(2026, 8, 2, 12, 0, 0, 0, usageCST).Unix()
+	if _, err := m.prodDB.Exec("INSERT INTO logs (id,user_id,created_at,type,model_name,quota,prompt_tokens,completion_tokens,`group`,username,content) VALUES (1,101,?,2,'gpt-test',250000,10,5,'test-group','alice','ok')", createdAt); err != nil {
+		t.Fatal(err)
+	}
+	ck := portalCookie(portalDo(portal, http.MethodPost, "/login", `{"email":"a@x.com","password":"password-aaa"}`))
+	if ck == nil {
+		t.Fatal("登录失败")
+	}
+	prep := portalDo(portal, http.MethodGet, "/api/logs/export/prepare?from=2026-08-02&to=2026-08-02", "", ck)
+	if prep.Code != http.StatusOK {
+		t.Fatalf("导出预检失败: %d %s", prep.Code, prep.Body.String())
+	}
+	var p struct {
+		OK          bool   `json:"ok"`
+		Ticket      string `json:"ticket"`
+		Total       int64  `json:"total"`
+		NeedConfirm bool   `json:"need_confirm"`
+	}
+	if err := json.Unmarshal(prep.Body.Bytes(), &p); err != nil {
+		t.Fatal(err)
+	}
+	if !p.OK || p.Ticket == "" || p.Total != 1 || p.NeedConfirm {
+		t.Fatalf("预检结果错误: %+v", p)
+	}
+	// 预检完成后新写入的日志不应混进这次文件；否则预检的总数/5 万行判断会漂移。
+	if _, err := m.prodDB.Exec("INSERT INTO logs (id,user_id,created_at,type,model_name,quota,prompt_tokens,completion_tokens,`group`,username,content) VALUES (2,101,?,2,'after-snapshot',250000,10,5,'test-group','alice','new')", createdAt+1); err != nil {
+		t.Fatal(err)
+	}
+
+	// 篡改票据必须在任何数据库导出或限流占位前被拒绝。
+	bad := portalDo(portal, http.MethodGet, "/api/logs/export?ticket="+p.Ticket+"x", "", ck)
+	if bad.Code != http.StatusBadRequest {
+		t.Fatalf("篡改票据应 400: %d %s", bad.Code, bad.Body.String())
+	}
+
+	dl := portalDo(portal, http.MethodGet, "/api/logs/export?ticket="+p.Ticket, "", ck)
+	if dl.Code != http.StatusOK || !strings.Contains(dl.Header().Get("Content-Type"), "text/csv") {
+		t.Fatalf("凭票下载失败: %d %s", dl.Code, dl.Body.String())
+	}
+	if body := dl.Body.String(); !strings.Contains(body, "alice") || !strings.Contains(body, "gpt-test") || strings.Contains(body, "after-snapshot") {
+		t.Fatalf("CSV 快照内容错误: %s", body)
+	}
+
+	// 票据绑定成员指纹；管理员移动成员后，旧票据不能跨越新的权限范围继续下载。
+	if err := m.storeDB.Model(&TrackedUser{}).Where("user_id = ?", 101).Update("group_id", 0).Error; err != nil {
+		t.Fatal(err)
+	}
+	stale := portalDo(portal, http.MethodGet, "/api/logs/export?ticket="+p.Ticket, "", ck)
+	if stale.Code != http.StatusConflict {
+		t.Fatalf("成员变化后旧票据应 409: %d %s", stale.Code, stale.Body.String())
+	}
+}
+
+// 空结果同样必须固定预检时刻的快照边界。否则 startCursor=0 会被查询层解释为
+// “不限制 ID”，导致预检之后新到的日志意外出现在本应为空的 CSV 中。
+func TestPortalExportEmptySnapshotExcludesLaterRows(t *testing.T) {
+	m, _, portal := newPortalTestMonitor(t)
+	m.prodDB = newFakeProdDB(t)
+	m.usageDayExpr = usageDayExprSQLite
+	h, _ := hashPassword("password-aaa")
+	g := CustomerGroup{Name: "A公司", PortalEmail: "a@x.com", PortalPwAdmin: h}
+	if err := m.storeDB.Create(&g).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := m.storeDB.Create(&TrackedUser{UserID: 101, Username: "alice", GroupID: g.ID}).Error; err != nil {
+		t.Fatal(err)
+	}
+	ck := portalCookie(portalDo(portal, http.MethodPost, "/login", `{"email":"a@x.com","password":"password-aaa"}`))
+	if ck == nil {
+		t.Fatal("登录失败")
+	}
+
+	prep := portalDo(portal, http.MethodGet, "/api/logs/export/prepare?from=2026-08-02&to=2026-08-02", "", ck)
+	if prep.Code != http.StatusOK {
+		t.Fatalf("空结果导出预检失败: %d %s", prep.Code, prep.Body.String())
+	}
+	var p struct {
+		OK     bool   `json:"ok"`
+		Ticket string `json:"ticket"`
+		Total  int64  `json:"total"`
+	}
+	if err := json.Unmarshal(prep.Body.Bytes(), &p); err != nil {
+		t.Fatal(err)
+	}
+	if !p.OK || p.Ticket == "" || p.Total != 0 {
+		t.Fatalf("空结果预检应签发 total=0 的票据: %+v", p)
+	}
+	claim, ok := m.verifyPortalExportClaim(p.Ticket, time.Now().Unix())
+	if !ok || claim.StartCursor != 1 {
+		t.Fatalf("空结果票据必须携带明确快照边界 cursor=1: ok=%v claim=%+v", ok, claim)
+	}
+
+	createdAt := time.Date(2026, 8, 2, 12, 0, 0, 0, usageCST).Unix()
+	if _, err := m.prodDB.Exec("INSERT INTO logs (id,user_id,created_at,type,model_name,quota,prompt_tokens,completion_tokens,`group`,username,content) VALUES (1,101,?,2,'after-empty-snapshot',250000,10,5,'test-group','alice','new')", createdAt); err != nil {
+		t.Fatal(err)
+	}
+	dl := portalDo(portal, http.MethodGet, "/api/logs/export?ticket="+p.Ticket, "", ck)
+	if dl.Code != http.StatusOK || !strings.Contains(dl.Header().Get("Content-Type"), "text/csv") {
+		t.Fatalf("空结果凭票下载失败: %d %s", dl.Code, dl.Body.String())
+	}
+	body := dl.Body.String()
+	if strings.Contains(body, "after-empty-snapshot") || strings.Contains(body, "alice") {
+		t.Fatalf("预检后新日志不应混入空快照 CSV: %s", body)
+	}
+	if lines := strings.Count(strings.TrimSpace(strings.TrimPrefix(body, "\xEF\xBB\xBF")), "\n"); lines != 0 {
+		t.Fatalf("空快照 CSV 应只有表头，得到额外数据行: %s", body)
+	}
+}
+
+// 旧页面可能在发布后继续调用不带 ticket 的导出地址。该兼容路径也必须先取得
+// COUNT+MaxID 快照；用 MaxInt64 边界验证它确实经过快照溢出保护，而不是退回普通 COUNT。
+func TestPortalLegacyExportTakesSnapshot(t *testing.T) {
+	m, _, portal := newPortalTestMonitor(t)
+	m.prodDB = newFakeProdDB(t)
+	m.usageDayExpr = usageDayExprSQLite
+	h, _ := hashPassword("password-aaa")
+	g := CustomerGroup{Name: "A公司", PortalEmail: "a@x.com", PortalPwAdmin: h}
+	if err := m.storeDB.Create(&g).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := m.storeDB.Create(&TrackedUser{UserID: 101, Username: "alice", GroupID: g.ID}).Error; err != nil {
+		t.Fatal(err)
+	}
+	createdAt := time.Date(2026, 8, 2, 12, 0, 0, 0, usageCST).Unix()
+	maxID := int64(^uint64(0) >> 1)
+	if _, err := m.prodDB.Exec("INSERT INTO logs (id,user_id,created_at,type,model_name,quota,prompt_tokens,completion_tokens,`group`,username,content) VALUES (?,101,?,2,'gpt-test',250000,10,5,'test-group','alice','ok')", maxID, createdAt); err != nil {
+		t.Fatal(err)
+	}
+	ck := portalCookie(portalDo(portal, http.MethodPost, "/login", `{"email":"a@x.com","password":"password-aaa"}`))
+	if ck == nil {
+		t.Fatal("登录失败")
+	}
+	w := portalDo(portal, http.MethodGet, "/api/logs/export?from=2026-08-02&to=2026-08-02", "", ck)
+	if w.Code != http.StatusInternalServerError || !strings.Contains(w.Body.String(), "查询失败") {
+		t.Fatalf("旧导出路径必须执行快照边界保护: %d %s", w.Code, w.Body.String())
+	}
+	if strings.Contains(w.Header().Get("Content-Type"), "text/csv") {
+		t.Fatalf("快照校验失败前不应开始 CSV 响应: %s", w.Header().Get("Content-Type"))
+	}
+}
+
+func TestPortalExportClaimExpiresAtBoundary(t *testing.T) {
+	m := &Monitor{cfg: Settings{SessionSecret: "test-export-session-secret"}}
+	now := time.Now().Unix()
+	claim := portalExportClaim{
+		GID: 1, MemberFP: "members", FromTs: 10, ToTs: 20,
+		Total: 1, StartCursor: 2, ExpiresAt: now + 1,
+	}
+	ticket, err := m.signPortalExportClaim(claim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := m.verifyPortalExportClaim(ticket, now); !ok {
+		t.Fatal("有效期内票据应通过")
+	}
+	if _, ok := m.verifyPortalExportClaim(ticket, claim.ExpiresAt); ok {
+		t.Fatal("到达 expires_at 边界的票据必须立即失效")
+	}
+}
+
+func TestExportPrepareLimiterBlocksConcurrentCountPreflight(t *testing.T) {
+	l := &exportLimiter{last: map[int64]int64{}}
+	now := time.Now().Unix()
+	if !l.allowPrepare(7, now, int64(portalExportWindow.Seconds()), int64(portalExportPrepWindow.Seconds())) {
+		t.Fatal("首次导出预检应放行")
+	}
+	if l.allowPrepare(7, now, int64(portalExportWindow.Seconds()), int64(portalExportPrepWindow.Seconds())) {
+		t.Fatal("同组并发/连点预检不应重复执行 COUNT")
+	}
+	if !l.allowPrepare(8, now, int64(portalExportWindow.Seconds()), int64(portalExportPrepWindow.Seconds())) {
+		t.Fatal("一个客户组的预检不应阻塞其他组")
+	}
+	if !l.allowPrepare(7, now+int64(portalExportPrepWindow.Seconds()), int64(portalExportWindow.Seconds()), int64(portalExportPrepWindow.Seconds())) {
+		t.Fatal("短预检窗口结束后应允许重试")
+	}
+}
+
+func TestPortalExportUsesNativeDownloadWithoutBlobAccumulation(t *testing.T) {
+	for _, required := range []string{
+		"/api/logs/export/prepare?${logQuery()}",
+		"function beginNativeExport(ticket,confirm)",
+		"new URLSearchParams({ticket})",
+	} {
+		if !strings.Contains(portalHTML, required) {
+			t.Fatalf("原生 CSV 下载缺少 %q", required)
+		}
+	}
+	for _, forbidden := range []string{"const chunks=[]", "new Blob(chunks", "r.body.getReader()"} {
+		if strings.Contains(portalHTML, forbidden) {
+			t.Fatalf("CSV 仍在浏览器内存累计: %q", forbidden)
+		}
+	}
+}
+
+// 客户日志 API 参数契约:与 new-api 普通用户日志一致，类型 1-6 均可筛选；
+// 超出范围的类型按“全部”处理。令牌名搜索超长仍应 400。查看与导出共用 portalLogParams,两端点都验。
 func TestPortalLogsParamContract(t *testing.T) {
 	m, _, portal := newPortalTestMonitor(t)
 	m.prodDB = newFakeProdDB(t) // type 1-6 全开放后会真的查生产库(不再在参数层短路拒绝),需要一个可查的假库
@@ -786,5 +1036,25 @@ func TestPortalErrorOnlyModelAndGroupFiltersAcceptExactInput(t *testing.T) {
 		if !strings.Contains(html, want) {
 			t.Fatalf("错误日志的模型/分组筛选仍只能依赖消费聚合选项，缺少 %q", want)
 		}
+	}
+}
+
+func TestPortalRangeSwitchIsAtomicAndPickerCannotBeCleared(t *testing.T) {
+	html := portalHTML
+	for _, want := range []string{
+		"function cancelPortalDependentLoads()",
+		"if(breakdownAbort)breakdownAbort.abort()",
+		"if(detailAbort)detailAbort.abort()",
+		"if(logAbort)logAbort.abort()",
+		"cancelPortalDependentLoads();",
+		"restoreLastLoadedRange()",
+		"showClear:false",
+	} {
+		if !strings.Contains(html, want) {
+			t.Fatalf("Portal 日期切换缺少一致性保护 %q", want)
+		}
+	}
+	if strings.Contains(html, "showClear:true") || strings.Contains(html, "onClear:") {
+		t.Fatal("Portal 日期控件仍允许清空为无效范围")
 	}
 }

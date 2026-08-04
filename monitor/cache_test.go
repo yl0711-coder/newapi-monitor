@@ -3,6 +3,7 @@ package monitor
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"strings"
 	"sync"
@@ -108,6 +109,53 @@ func (s *memoryByteCacheStore) putRaw(key string, value []byte, ttl time.Duratio
 	s.items[key] = memoryByteCacheItem{value: append([]byte(nil), value...), exp: time.Now().Add(ttl)}
 }
 
+func TestUsageRedisOptionsDisableRetriesAndCapConnections(t *testing.T) {
+	opts := usageRedisOptions(Settings{UsageRedisAddr: "redis.example:6379"})
+	if opts.MaxRetries != -1 {
+		t.Fatalf("MaxRetries=%d，必须为 -1 才是真正禁用 go-redis 内部重试", opts.MaxRetries)
+	}
+	if opts.PoolSize != usageCacheRedisPoolSize || opts.MaxActiveConns != usageCacheRedisPoolSize {
+		t.Fatalf("Redis 连接池没有硬限制: pool=%d active=%d want=%d",
+			opts.PoolSize, opts.MaxActiveConns, usageCacheRedisPoolSize)
+	}
+}
+
+func TestUsageCacheStatsExposeOnlyOperationalCounters(t *testing.T) {
+	remote := newMemoryByteCacheStore()
+	c := newUsageResultCacheForTest(remote, 32, 1<<20)
+	var first, second map[string]int
+	fill := func() (any, error) { return map[string]int{"requests": 7}, nil }
+	if err := c.DoJSON(context.Background(), "customer:secret-filter", time.Minute, &first, fill); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.DoJSON(context.Background(), "customer:secret-filter", time.Minute, &second, fill); err != nil {
+		t.Fatal(err)
+	}
+	stats := c.Stats(time.Now())
+	if !stats.RemoteConfigured || stats.Requests != 2 || stats.SourceFills != 1 || stats.LocalHits != 1 || stats.RemoteMisses != 1 || stats.LocalEntries != 1 || stats.LocalBytes <= 0 {
+		t.Fatalf("缓存运维计数错误: %+v", stats)
+	}
+	// 指标结构只能有计数和布尔状态；缓存前缀、键及业务结果均无可导出字段。
+	text := fmt.Sprintf("%+v", stats)
+	if strings.Contains(text, "customer") || strings.Contains(text, "secret-filter") || strings.Contains(text, c.prefix) {
+		t.Fatalf("缓存指标泄漏业务键: %s", text)
+	}
+}
+
+func TestUsageCacheStatsDoNotReportMissWhenRedisWasNotContacted(t *testing.T) {
+	c := newUsageResultCacheForTest(nil, 32, 1<<20)
+	var out map[string]int
+	if err := c.DoJSON(context.Background(), "local-only", time.Minute, &out, func() (any, error) {
+		return map[string]int{"requests": 1}, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	stats := c.Stats(time.Now())
+	if stats.RemoteConfigured || stats.RemoteMisses != 0 || stats.SourceFills != 1 {
+		t.Fatalf("未访问 Redis 时不应伪报远端 miss: %+v", stats)
+	}
+}
+
 func TestUsageResultCacheRemoteHitAcrossInstances(t *testing.T) {
 	remote := newMemoryByteCacheStore()
 	c1 := newUsageResultCacheForTest(remote, 32, 1<<20)
@@ -149,6 +197,93 @@ func TestUsageResultCacheRemoteFailureFallsBack(t *testing.T) {
 	}
 	if fills.Load() != 1 || c.remoteErrors.Load() != 1 || c.localHits.Load() == 0 {
 		t.Fatalf("应由本机短缓存承接降级: fills=%d remote_errors=%d local_hits=%d", fills.Load(), c.remoteErrors.Load(), c.localHits.Load())
+	}
+}
+
+func TestUsageResultCacheUnavailableKeepsOnlineBaselineLocalTTL(t *testing.T) {
+	remote := newMemoryByteCacheStore()
+	remote.getErr = errors.New("redis unavailable")
+	c := newUsageResultCacheForTest(remote, usageCacheLocalMaxEntries, usageCacheLocalMaxBytes)
+	var out string
+	if err := c.DoJSON(context.Background(), "baseline-ttl", usageAggregateHistoricalTTL, &out, func() (any, error) {
+		return "source-result", nil
+	}); err != nil || out != "source-result" {
+		t.Fatalf("Redis 故障时应正常回源: value=%q err=%v", out, err)
+	}
+
+	// 旧版线上 Portal 的本机缓存是 60 秒；新版故障降级不得低于这个口径。
+	now := time.Now()
+	if _, ok := c.local.Get(c.fullKey("baseline-ttl"), now.Add(59*time.Second)); !ok {
+		t.Fatal("Redis 故障时本机结果应至少保留 60 秒")
+	}
+	if _, ok := c.local.Get(c.fullKey("baseline-ttl"), now.Add(61*time.Second)); ok {
+		t.Fatal("本机缓存不得超过 60 秒上限")
+	}
+}
+
+func TestUsageResultCacheUnavailableBackoffAvoidsRepeatedRemoteWaits(t *testing.T) {
+	remote := newMemoryByteCacheStore()
+	remote.getErr = errors.New("redis unavailable")
+	c := newUsageResultCacheForTest(remote, usageCacheLocalMaxEntries, usageCacheLocalMaxBytes)
+
+	for _, key := range []string{"first", "second"} {
+		var out string
+		if err := c.DoJSON(context.Background(), key, time.Minute, &out, func() (any, error) {
+			return key, nil
+		}); err != nil || out != key {
+			t.Fatalf("退避期内应正常回源: key=%s value=%q err=%v", key, out, err)
+		}
+	}
+	remote.mu.Lock()
+	getsDuringFailure := remote.gets
+	remote.mu.Unlock()
+	if getsDuringFailure != 1 {
+		t.Fatalf("全局退避期内不得让不同键重复等待 Redis: gets=%d", getsDuringFailure)
+	}
+	now := time.Now()
+	if stats := c.Stats(now.Add(29 * time.Second)); !stats.RemoteBackoffActive {
+		t.Fatalf("30 秒退避应仍生效: %+v", stats)
+	}
+	if stats := c.Stats(now.Add(31 * time.Second)); stats.RemoteBackoffActive {
+		t.Fatalf("30 秒后应允许自动恢复探测: %+v", stats)
+	}
+
+	// 不等真实 30 秒：把退避时钟推到过去，验证下一个新键会重新接入已恢复的 Redis。
+	remote.mu.Lock()
+	remote.getErr = nil
+	remote.mu.Unlock()
+	c.remoteBackoffUntil.Store(time.Now().Add(-time.Second).UnixNano())
+	var recovered string
+	if err := c.DoJSON(context.Background(), "recovered", time.Minute, &recovered, func() (any, error) {
+		return "redis-is-back", nil
+	}); err != nil || recovered != "redis-is-back" {
+		t.Fatalf("Redis 恢复后应自动重新接入: value=%q err=%v", recovered, err)
+	}
+	remote.mu.Lock()
+	getsAfterRecovery, setsAfterRecovery := remote.gets, remote.sets
+	remote.mu.Unlock()
+	if getsAfterRecovery != 2 || setsAfterRecovery != 1 {
+		t.Fatalf("Redis 恢复后未重新读写: gets=%d sets=%d", getsAfterRecovery, setsAfterRecovery)
+	}
+}
+
+func TestUsageResultCacheProductionLocalCapacityIsBounded(t *testing.T) {
+	c := newUsageResultCache(Settings{})
+	defer c.Close()
+	now := time.Now()
+	for i := 0; i < usageCacheLocalMaxEntries+1; i++ {
+		c.local.Put(c.fullKey(fmt.Sprintf("capacity-%03d", i)), []byte(`1`), usageCacheLocalTTL, now)
+	}
+	entries, bytes := c.local.size()
+	if entries != usageCacheLocalMaxEntries || bytes > usageCacheLocalMaxBytes {
+		t.Fatalf("生产本机缓存上限失效: entries=%d/%d bytes=%d/%d",
+			entries, usageCacheLocalMaxEntries, bytes, usageCacheLocalMaxBytes)
+	}
+	if _, ok := c.local.Get(c.fullKey("capacity-000"), now); ok {
+		t.Fatal("超过条目上限时应淘汰最旧项")
+	}
+	if _, ok := c.local.Get(c.fullKey(fmt.Sprintf("capacity-%03d", usageCacheLocalMaxEntries)), now); !ok {
+		t.Fatal("超过条目上限时不得误淘汰最新项")
 	}
 }
 
@@ -311,6 +446,51 @@ func TestUsageResultCacheFreshBypassesAndReplacesExistingValue(t *testing.T) {
 	}
 	if first != 1 || cached != 1 || refreshed != 2 || after != 2 {
 		t.Fatalf("普通命中/主动刷新语义错误: first=%d cached=%d refreshed=%d after=%d", first, cached, refreshed, after)
+	}
+}
+
+func TestUsageResultCacheFailedRemoteRefreshCannotFallBackToOldValue(t *testing.T) {
+	remote := newMemoryByteCacheStore()
+	c := newUsageResultCacheForTest(remote, 32, 1<<20)
+	var warm string
+	if err := c.DoJSON(context.Background(), "refresh-write-failure", time.Minute, &warm, func() (any, error) {
+		return "old-remote", nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	remote.setErr = errors.New("redis set unavailable")
+	c.remoteBackoffUntil.Store(0)
+	var refreshed string
+	if err := c.DoJSONFresh(context.Background(), "refresh-write-failure", time.Minute, &refreshed, func() (any, error) {
+		return "fresh-result", nil
+	}); err != nil || refreshed != "fresh-result" {
+		t.Fatalf("刷新本身应成功并返回源结果: value=%q err=%v", refreshed, err)
+	}
+
+	// 模拟 L1 到期和 Redis 恢复。远端仍是刷新前的旧值，但逐键 bypass 必须让
+	// 本次回源；新值成功写入后，下一台实例也应命中它。
+	c.local.Delete(c.fullKey("refresh-write-failure"))
+	remote.setErr = nil
+	c.remoteBackoffUntil.Store(0)
+	var fills atomic.Int32
+	var after string
+	if err := c.DoJSON(context.Background(), "refresh-write-failure", time.Minute, &after, func() (any, error) {
+		fills.Add(1)
+		return "new-source", nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if after != "new-source" || fills.Load() != 1 {
+		t.Fatalf("Redis 恢复后不得倒退到旧值: value=%q fills=%d", after, fills.Load())
+	}
+
+	c2 := newUsageResultCacheForTest(remote, 32, 1<<20)
+	var shared string
+	if err := c2.DoJSON(context.Background(), "refresh-write-failure", time.Minute, &shared, func() (any, error) {
+		return "unexpected-refill", nil
+	}); err != nil || shared != "new-source" || c2.remoteHits.Load() != 1 {
+		t.Fatalf("恢复后的新值未正确共享: value=%q hits=%d err=%v", shared, c2.remoteHits.Load(), err)
 	}
 }
 
@@ -512,6 +692,85 @@ func TestUsageResultCacheOversizedFreshResultRemovesOldValue(t *testing.T) {
 	}
 	if after != "new-source" || calls.Load() != 1 {
 		t.Fatalf("超大刷新后不得回退到旧缓存: value=%q calls=%d", after, calls.Load())
+	}
+}
+
+func TestUsageResultCacheFailedDeleteCannotRestoreOldRemoteValue(t *testing.T) {
+	remote := newMemoryByteCacheStore()
+	c := newUsageResultCacheForTest(remote, 32, usageCacheMaxPayloadBytes*2)
+	var warm string
+	if err := c.DoJSON(context.Background(), "large-delete-failure", time.Minute, &warm, func() (any, error) {
+		return "old-remote", nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	remote.deleteErr = errors.New("redis delete unavailable")
+	c.remoteBackoffUntil.Store(0)
+	largeValue := strings.Repeat("x", usageCacheMaxPayloadBytes+1)
+	var refreshed string
+	if err := c.DoJSONFresh(context.Background(), "large-delete-failure", time.Minute, &refreshed, func() (any, error) {
+		return largeValue, nil
+	}); err != nil || refreshed != largeValue {
+		t.Fatalf("超大刷新结果仍应正常返回: len=%d err=%v", len(refreshed), err)
+	}
+
+	remote.deleteErr = nil
+	c.remoteBackoffUntil.Store(0)
+	var fills atomic.Int32
+	var after string
+	if err := c.DoJSON(context.Background(), "large-delete-failure", time.Minute, &after, func() (any, error) {
+		fills.Add(1)
+		return "new-source", nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if after != "new-source" || fills.Load() != 1 {
+		t.Fatalf("删除失败恢复后不得读回旧 Redis 值: value=%q fills=%d", after, fills.Load())
+	}
+}
+
+func TestUsageResultCacheDeleteWaitsForInFlightFill(t *testing.T) {
+	c := newUsageResultCacheForTest(nil, 32, 1<<20)
+	fillStarted := make(chan struct{})
+	releaseFill := make(chan struct{})
+	fillDone := make(chan error, 1)
+	go func() {
+		var out string
+		fillDone <- c.DoJSON(context.Background(), "delete-race", time.Minute, &out, func() (any, error) {
+			close(fillStarted)
+			<-releaseFill
+			return "in-flight-value", nil
+		})
+	}()
+	<-fillStarted
+
+	deleteDone := make(chan struct{})
+	go func() {
+		c.Delete(context.Background(), "delete-race")
+		close(deleteDone)
+	}()
+	select {
+	case <-deleteDone:
+		t.Fatal("删除不得越过仍在执行的同键填充")
+	case <-time.After(30 * time.Millisecond):
+	}
+	close(releaseFill)
+	if err := <-fillDone; err != nil {
+		t.Fatal(err)
+	}
+	<-deleteDone
+
+	var fills atomic.Int32
+	var after string
+	if err := c.DoJSON(context.Background(), "delete-race", time.Minute, &after, func() (any, error) {
+		fills.Add(1)
+		return "after-delete", nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if after != "after-delete" || fills.Load() != 1 {
+		t.Fatalf("删除结束后不得残留并发填充值: value=%q fills=%d", after, fills.Load())
 	}
 }
 

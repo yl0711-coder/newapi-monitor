@@ -8,6 +8,18 @@
 - 工作区状态：本批业务修改尚未提交；用户既有未跟踪目录 `tools/` 未修改、未纳入
 - 执行依据：[`docs/QUALITY_REVIEW_AND_TEST_SOP.md`](../QUALITY_REVIEW_AND_TEST_SOP.md)
 
+> 复审更正（2026-08-03）：在四个性能优化提交合并审查时，又发现了 Redis
+> 写入/删除失败后的旧值回流、Portal 日期切换竞态、同页聚合分代以及 CI 未覆盖真实
+> Redis 等问题。原报告保留为当时测试记录；上述问题已按
+> [`2026-08-03-usage-pre-release-review-fixes.md`](./2026-08-03-usage-pre-release-review-fixes.md)
+> 修复并重新执行完整门禁，当前结论以新报告为准。
+
+> 降级性能修订（2026-08-04）：为保证 Redis 不可用时的稳态性能不低于
+> 旧版 60 秒本机缓存，当前本机 L1 已调整为最多 60 秒、128 项/16 MiB，
+> Redis 故障退避调整为 30 秒。本文下方的 10 秒、32 项/8 MiB 保留为当时测试记录；
+> 当前验收结论见
+> [`2026-08-04-usage-redis-degradation-parity.md`](./2026-08-04-usage-redis-degradation-parity.md)。
+
 ## 1. 总体结论
 
 **结论：本批功能、正确性、并发、故障降级、安全与本地容器验证通过，未发现阻断提交或人工验收的代码缺陷。**

@@ -17,7 +17,10 @@ RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /app .
 
 # ---- 运行阶段(最小镜像)----
 FROM alpine:3.23
-RUN apk add --no-cache ca-certificates tzdata
+# 官方 tag 的根文件系统可能早于同一 Alpine 小版本仓库中的安全补丁；构建时先把
+# 已安装基础包升级到 3.23 当前补丁，再安装运行所需的证书和时区数据。
+RUN apk upgrade --no-cache \
+    && apk add --no-cache ca-certificates tzdata
 WORKDIR /app
 COPY --from=builder /app /app/monitor
 RUN adduser -D -u 1000 app && mkdir -p /data && chown -R app /app /data

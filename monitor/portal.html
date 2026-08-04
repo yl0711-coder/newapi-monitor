@@ -409,6 +409,9 @@ const fmtCompact=n=>{n=+n||0;const a=Math.abs(n);for(const [d,u] of [[1e9,'B'],[
 const fmtCell=v=>v>=0.005?'$'+v.toFixed(2):(v>0?'<$0.01':'$0.00');
 let range='7d',ov=null,detailUid=null;
 let overviewSeq=0,overviewAbort=null,breakdownSeq=0,breakdownAbort=null,detailSeq=0,detailAbort=null;
+let logStack=[0],logHasMore=false,logNextCursor=0,logLoading=false,logTotal=null,logDirty=false;
+let logSeq=0,logAbort=null,logRowsCache=[];
+let lastLoadedRange={range:'7d',customFrom:'',customTo:''};
 
 let customFrom='',customTo='';
 const cstDayStr=off=>{const d=new Date(Date.now()+8*3600*1000-(off||0)*86400000);return d.getUTCFullYear()+'-'+String(d.getUTCMonth()+1).padStart(2,'0')+'-'+String(d.getUTCDate()).padStart(2,'0')};
@@ -420,6 +423,22 @@ function rangeDates(r){ // 所有自然日以服务端 Asia/Shanghai 口径为�
   if(r==='month'){const from=new Date(d.getFullYear(),d.getMonth(),1),to=new Date(d.getFullYear(),d.getMonth()+1,0);return {from:ymd(from),to:ymd(to)};}
   const days={today:0,'7d':6,'15d':14,'30d':29,'90d':89,halfyear:179,year:364}[r]??6;
   return {from:addDaysStr(today,-days),to:today};
+}
+
+// 日期切换是一个整体操作：总览、分组/模型、明细和日志必须属于同一范围。
+// 新总览发起前立即取消旧的下游请求；新总览失败则把控件恢复到最后一次成功范围，
+// 避免“新日期控件 + 旧数据”长期并存。
+function cancelPortalDependentLoads(){
+  if(breakdownAbort)breakdownAbort.abort();
+  breakdownSeq++;
+  if(detailAbort)detailAbort.abort();
+  detailSeq++;
+  if(logAbort)logAbort.abort();
+  logSeq++;logLoading=false;
+}
+function restoreLastLoadedRange(){
+  range=lastLoadedRange.range;customFrom=lastLoadedRange.customFrom;customTo=lastLoadedRange.customTo;
+  syncOvBar();
 }
 // 天数(含两端);超过一年由此拦下,与服务端 maxUsageDays 一致
 function spanDays(from,to){return Math.round((new Date(to)-new Date(from))/86400000)+1;}
@@ -434,14 +453,14 @@ async function load(){
   const seq=++overviewSeq;
   if(overviewAbort)overviewAbort.abort();
   overviewAbort=new AbortController();
-  if(detailAbort)detailAbort.abort(); // 日期切换后旧明细也不能再覆盖新范围
-  detailSeq++;
+  cancelPortalDependentLoads();
   const {from,to}=rangeDates(range);
   try{
     const d=await api(`/api/overview?from=${from}&to=${to}`,{signal:overviewAbort.signal});
     if(seq!==overviewSeq)return;
-    if(!d.ok){$('ovErr').textContent=d.error||'加载失败，请重试';return;}
+    if(!d.ok){restoreLastLoadedRange();$('ovErr').textContent=d.error||'加载失败，请重试';return;}
     ov=d.data;
+    lastLoadedRange={range,customFrom,customTo};
     $('ovErr').textContent='';
     $('coName').textContent=ov.group_name||'';
     const rangeLabel=`${ov.from} ~ ${ov.to}`;
@@ -454,7 +473,7 @@ async function load(){
     if(view==='logs')loadLogs(true);    // 日志视图下切范围 → 重新拉第一页
     else logDirty=true;                 // 总览里改的范围:回日志视图时强制重拉,防止显旧窗口数据
   }catch(e){
-    if(e.name!=='AbortError'&&seq===overviewSeq)$('ovErr').textContent='加载失败，请重试';
+    if(e.name!=='AbortError'&&seq===overviewSeq){restoreLastLoadedRange();$('ovErr').textContent='加载失败，请重试';}
   }
 }
 // 成员下拉:来自已加载的总览成员(值=user_id)
@@ -856,8 +875,8 @@ function applyPortalRange(sel,meta){
   $('ovErr').textContent='';syncOvBar();load();
 }
 const portalPickerOptions={
-  maxDays:366,presets:portalPresets,showClear:true,
-  onChange:applyPortalRange,onClear:()=>{$('ovErr').textContent='';}
+  maxDays:366,presets:portalPresets,showClear:false,
+  onChange:applyPortalRange
 };
 ovPicker=new SemiRangePicker($('ovRange'),portalPickerOptions);
 logPicker=new SemiRangePicker($('logRange'),Object.assign({},portalPickerOptions));
@@ -950,9 +969,7 @@ function logQuery(){
 }
 // 游标分页:logStack 记录各页起始游标(0=首页),末尾即当前页
 // logDirty:总览视图里改了日期时置位,回到日志视图时强制重拉(否则表格显旧窗口数据)
-let logStack=[0],logHasMore=false,logNextCursor=0,logLoading=false,logTotal=null,logDirty=false;
-let logSeq=0,logAbort=null;
-let logRowsCache=[]; // 当前页日志行(供详情弹窗按下标取回,见 renderLogRows)
+// 状态变量在脚本顶部统一声明，供日期切换在总览返回前立即取消旧日志请求。
 async function loadLogs(reset){
   if(reset)logStack=[0];
   const seq=++logSeq;
@@ -1186,7 +1203,9 @@ $('logDetailKw').addEventListener('keydown',e=>{if(e.key==='Enter')loadLogs(true
 $('logRequestId').addEventListener('keydown',e=>{if(e.key==='Enter')loadLogs(true);});
 
 // ============ CSV 导出 ============
-let exporting=false,expCtrl=null,expTimer=null,expHeaders=false;
+// 先预检一次并取得服务端签名票据，再交给浏览器原生下载。CSV 不再经过
+// fetch reader + chunks + Blob，因此前端内存不会随最多 5 万行日志增长。
+let exporting=false,expCtrl=null,expTimer=null,expHeaders=false,pendingExportTicket='';
 function setExpBar(pct){ // pct null=不定态(转圈),数字=确定进度
   const bar=$('expBar'),span=bar.firstElementChild;
   if(pct==null){bar.classList.add('indet');span.style.width='';}
@@ -1194,7 +1213,19 @@ function setExpBar(pct){ // pct null=不定态(转圈),数字=确定进度
 }
 function expStatus(main,sub){$('expStatus').textContent=main;if(sub!=null)$('expSub').textContent=sub;}
 function closeExp(){$('expMask').style.display='none';clearInterval(expTimer);}
-async function startExport(confirm){
+function beginNativeExport(ticket,confirm){
+  if(!ticket){expFail('下载凭证已失效,请重新导出');return;}
+  clearInterval(expTimer);expHeaders=true;
+  $('expMask').style.display='flex';$('expTitle').textContent='导出已开始';
+  setExpBar(1);expStatus('已交给浏览器下载','文件由浏览器直接写入磁盘,不会占用页面内存');
+  $('expCancel').textContent='关闭';$('expCancel').disabled=false;
+  const q=new URLSearchParams({ticket});if(confirm)q.set('confirm','1');
+  const a=document.createElement('a');a.href='/api/logs/export?'+q.toString();a.download='usage-logs.csv';a.hidden=true;
+  document.body.appendChild(a);a.click();a.remove();
+  exporting=false;expCtrl=null;$('expBtn').disabled=false;
+  setTimeout(closeExp,1800);
+}
+async function startExport(){
   if(exporting)return;
   exporting=true;expHeaders=false;
   $('expBtn').disabled=true;
@@ -1213,51 +1244,29 @@ async function startExport(confirm){
     expStatus(msg,`已用 ${s} 秒`);
   },500);
   try{
-    const r=await fetch(`/api/logs/export?${logQuery()}`+(confirm?'&confirm=1':''),{signal:ctrl.signal});
-    const ct=r.headers.get('Content-Type')||'';
-    if(ct.includes('application/json')){ // 非 CSV:need_confirm / 限流 / 错误
-      const d=await r.json().catch(()=>({}));
-      if(d.need_confirm){closeExp();askExportConfirm(d.cap);return;}
-      expFail(d.error||'导出失败');return;
-    }
-    // CSV 流式读取,有 Content-Length 就显示真实进度
-    expHeaders=true;
-    const total=+r.headers.get('Content-Length')||0;
-    expStatus('正在下载…',total?'':'准备中…');
-    setExpBar(total?0:null);
-    const reader=r.body.getReader();const chunks=[];let recv=0;
-    for(;;){
-      const {done,value}=await reader.read();
-      if(done)break;
-      chunks.push(value);recv+=value.length;
-      if(total){setExpBar(recv/total);expStatus('正在下载…',`${(recv/1048576).toFixed(1)} / ${(total/1048576).toFixed(1)} MB`);}
-      else expStatus('正在下载…',`已接收 ${(recv/1048576).toFixed(1)} MB`);
-    }
-    const blob=new Blob(chunks,{type:'text/csv'});
-    const cd=r.headers.get('Content-Disposition')||'';
-    const mm=cd.match(/filename="?([^"]+)"?/);
-    const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=mm?mm[1]:'usage-logs.csv';
-    document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(a.href),4000);
-    setExpBar(1);expStatus('导出完成 ✓',`共 ${(blob.size/1048576).toFixed(1)} MB,已开始下载`);
-    $('expCancel').textContent='关闭';
-    setTimeout(closeExp,1600);
+    const r=await fetch(`/api/logs/export/prepare?${logQuery()}`,{signal:ctrl.signal});
+    const d=await r.json().catch(()=>({}));
+    if(!r.ok||!d.ok){expFail(d.error||'导出失败');return;}
+    if(d.need_confirm){pendingExportTicket=d.ticket||'';closeExp();askExportConfirm(d.cap,d.total);return;}
+    beginNativeExport(d.ticket,false);
   }catch(e){
     if(e.name==='AbortError')closeExp();
     else expFail('网络中断,请重试');
   }finally{
-    clearInterval(expTimer);exporting=false;expCtrl=null;$('expBtn').disabled=false;
+    clearInterval(expTimer);
+    if(expCtrl===ctrl){exporting=false;expCtrl=null;$('expBtn').disabled=false;}
   }
 }
 function expFail(msg){$('expTitle').textContent='导出失败';setExpBar(0);expStatus(msg,'');$('expCancel').textContent='关闭';}
-$('expBtn').onclick=()=>startExport(false);
+$('expBtn').onclick=()=>startExport();
 $('expCancel').onclick=()=>{if(expCtrl&&exporting)expCtrl.abort();else closeExp();};
 // 超 5 万条确认框
-function askExportConfirm(cap){
-  $('expConfirmMsg').innerHTML=`本次查询结果超过 <b>${(+cap).toLocaleString('en-US')}</b> 条。<br>将按时间倒序导出<b>最新 ${(+cap).toLocaleString('en-US')} 条</b>。<br>如需更早的数据,请取消后缩小时间范围分段导出。`;
+function askExportConfirm(cap,total){
+  $('expConfirmMsg').innerHTML=`本次查询共 <b>${(+total).toLocaleString('en-US')}</b> 条,超过单次上限 <b>${(+cap).toLocaleString('en-US')}</b> 条。<br>将按时间倒序导出<b>最新 ${(+cap).toLocaleString('en-US')} 条</b>。<br>如需更早的数据,请取消后缩小时间范围分段导出。`;
   $('expConfirmMask').style.display='flex';
 }
-$('expConfirmNo').onclick=()=>$('expConfirmMask').style.display='none';
-$('expConfirmYes').onclick=()=>{$('expConfirmMask').style.display='none';startExport(true);};
+$('expConfirmNo').onclick=()=>{$('expConfirmMask').style.display='none';pendingExportTicket='';};
+$('expConfirmYes').onclick=()=>{const ticket=pendingExportTicket;pendingExportTicket='';$('expConfirmMask').style.display='none';beginNativeExport(ticket,true);};
 
 let _rz;window.addEventListener('resize',()=>{clearTimeout(_rz);_rz=setTimeout(()=>{[trendCh,memberCh,modelPieCh,dModelPieCh,groupPieCh,dailyChart].forEach(c=>c&&c.resize());},150);});
 load();

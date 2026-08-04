@@ -145,15 +145,16 @@ func (m *Monitor) RegisterRoutes(r *gin.Engine) {
 		view.GET("/data", m.serveData)
 		view.GET("/monitor/data", m.serveData)
 		view.GET("/trend/long", m.serveLongTrend)
-		view.GET("/infra", m.serveInfra)                   // 服务端健康监控(实例/DB/LB)快照
-		view.GET("/infra/series", m.serveInfraSeries)      // 按需取某资源某些指标的近 N 小时序列(展开图用)
-		view.GET("/usage/users", m.listTrackedUsers)       // 用户用量:被盯名单(含分组)
-		view.GET("/usage/groups", m.listGroups)            // 用户用量:客户分组列表
-		view.GET("/usage/followups", m.serveFollowUps)     // 用户用量:待跟进清单
-		view.GET("/usage/followups/log", m.listFollowLogs) // 用户用量:某客户跟进记录
-		view.GET("/usage/settings", m.getUsageSettings)    // 用户用量:跟进阈值(读)
-		view.GET("/usage/matrix", m.serveUsageMatrix)      // 用户用量:列表页矩阵(前端渲染 行=用户×列=日期,格=当日费用)
-		view.GET("/usage/stats", m.serveUsageStats)        // 用户用量:单用户详情聚合(每日/分组/模型/费用)
+		view.GET("/infra", m.serveInfra)                       // 服务端健康监控(实例/DB/LB)快照
+		view.GET("/infra/series", m.serveInfraSeries)          // 按需取某资源某些指标的近 N 小时序列(展开图用)
+		view.GET("/usage/users", m.listTrackedUsers)           // 用户用量:被盯名单(含分组)
+		view.GET("/usage/groups", m.listGroups)                // 用户用量:客户分组列表
+		view.GET("/usage/followups", m.serveFollowUps)         // 用户用量:待跟进清单
+		view.GET("/usage/followups/log", m.listFollowLogs)     // 用户用量:某客户跟进记录
+		view.GET("/usage/settings", m.getUsageSettings)        // 用户用量:跟进阈值(读)
+		view.GET("/usage/matrix", m.serveUsageMatrix)          // 用户用量:列表页矩阵(前端渲染 行=用户×列=日期,格=当日费用)
+		view.GET("/usage/stats", m.serveUsageStats)            // 用户用量:单用户详情聚合(每日/分组/模型/费用)
+		view.GET("/usage/cache-stats", m.serveUsageCacheStats) // 用户用量缓存:无敏感信息的运维计数
 		view.GET("/me", me)
 	}
 
@@ -186,6 +187,12 @@ func (m *Monitor) RegisterRoutes(r *gin.Engine) {
 		rootUsage.POST("/followups/log", m.addFollowLog)   // 跟进记录:追加
 		rootUsage.POST("/settings", m.saveUsageSettings)   // 跟进阈值:保存
 	}
+}
+
+// serveUsageCacheStats 只向管理端会话暴露缓存运行计数。接口不主动访问 Redis，
+// 不返回缓存键或任何客户资料，可用于上线后核对命中率、回源次数和降级情况。
+func (m *Monitor) serveUsageCacheStats(c *gin.Context) {
+	c.JSON(http.StatusOK, gin.H{"cache": m.usageCache.Stats(time.Now())})
 }
 
 // checkIngest 校验节点推送接口的 Bearer token(MONITOR_INGEST_TOKEN)。

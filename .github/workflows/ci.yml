@@ -11,21 +11,104 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "REDISCLI_AUTH=ci-only-redis-password redis-cli ping"
+          --health-interval 2s
+          --health-timeout 2s
+          --health-retries 15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
           go-version: '1.25'
+      # 集成测试既验证正常 Redis 往返，也验证错误密码时快速降级；因此测试
+      # Redis 必须真的启用认证。密码只用于这个一次性 CI 服务，不是业务凭据。
+      - name: Enable authentication on test Redis
+        env:
+          MONITOR_TEST_REDIS_PASSWORD: ci-only-redis-password
+        run: |
+          docker exec "${{ job.services.redis.id }}" redis-cli CONFIG SET requirepass "$MONITOR_TEST_REDIS_PASSWORD"
+          test "$(docker exec -e REDISCLI_AUTH="$MONITOR_TEST_REDIS_PASSWORD" "${{ job.services.redis.id }}" redis-cli ping)" = "PONG"
       - run: go vet ./...
-      # -race:代码里有 singleflight 缓存/多把 mutex/channel 无锁同步,竞态检测必须常开
-      - run: go test -race ./...
+      # -race:代码里有 singleflight 缓存/多把 mutex/channel 同步,竞态检测必须常开。
+      # 环境变量让同一套测试同时覆盖真实 Redis 往返、错误凭据和不可用时快速降级。
+      - name: Test with race detector and real Redis
+        env:
+          MONITOR_TEST_REDIS_ADDR: 127.0.0.1:6379
+          MONITOR_TEST_REDIS_PASSWORD: ci-only-redis-password
+          MONITOR_TEST_REDIS_UNAVAILABLE_ADDR: 127.0.0.1:6390
+        run: go test -race ./...
+      - name: Check reachable Go vulnerabilities
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.1.4 ./...
       - name: golangci-lint
         uses: golangci/golangci-lint-action@v6
         with:
           version: v1.64.8
           install-mode: goinstall # 用 runner 的 Go 现编译,避免预编译版 Go 低于 go.mod 目标版本
+      # 放在代码测试之后：探针会在工作树创建假数据，不能让它影响 Go 测试环境。
+      - name: Verify Docker build context isolation
+        run: |
+          mkdir -p .local-data tools data secrets .context-probe/nested
+          touch .local-data/ci-sensitive.db
+          touch tools/ci-local-tool.txt
+          touch data/ci-runtime.db
+          touch secrets/ci-secret.env
+          touch .env .env.local ci-sensitive.db ci-secret.env
+          touch .context-probe/nested/ci-sensitive.db
+          touch .context-probe/nested/ci-secret.env
+          touch .context-probe/nested/.env.production
+          touch .context-probe/nested/ci-sensitive.db-journal
+          touch .context-probe/nested/ci-sensitive.db-wal
+          touch .context-probe/nested/ci-sensitive.db-shm
+          touch .context-probe/nested/ci-sensitive.db.backup
+          touch .context-probe/nested/ci-sensitive.sqlite
+          touch .context-probe/nested/ci-sensitive.sqlite3
+          touch .context-probe/nested/ci-sensitive.sqlite-wal
+          touch .context-probe/nested/ci-private.pem
+          touch .context-probe/nested/ci-private.key
+          touch .context-probe/nested/ci-client.p12
+          touch .context-probe/nested/ci-client.pfx
+          touch local-untracked.txt
+          touch .context-probe/nested/customer-export.csv
+          touch monitor/ci-local-config.json
+          docker build -f .github/Dockerfile.context-check -t newapi-monitor-context-audit:${{ github.run_id }} .
+          docker run --rm --entrypoint sh newapi-monitor-context-audit:${{ github.run_id }} -ec '
+            test -e /context/go.mod &&
+            test -e /context/main.go &&
+            test -e /context/monitor/page.html &&
+            test -e /context/cmd/hostagent/main.go &&
+            test ! -e /context/.local-data &&
+            test ! -e /context/tools &&
+            test ! -e /context/data &&
+            test ! -e /context/secrets &&
+            test ! -e /context/.env &&
+            test ! -e /context/.env.local &&
+            test ! -e /context/ci-sensitive.db &&
+            test ! -e /context/ci-secret.env &&
+            test ! -e /context/.context-probe/nested/ci-sensitive.db &&
+            test ! -e /context/.context-probe/nested/ci-secret.env &&
+            test ! -e /context/.context-probe/nested/.env.production &&
+            test ! -e /context/.context-probe/nested/ci-sensitive.db-journal &&
+            test ! -e /context/.context-probe/nested/ci-sensitive.db-wal &&
+            test ! -e /context/.context-probe/nested/ci-sensitive.db-shm &&
+            test ! -e /context/.context-probe/nested/ci-sensitive.db.backup &&
+            test ! -e /context/.context-probe/nested/ci-sensitive.sqlite &&
+            test ! -e /context/.context-probe/nested/ci-sensitive.sqlite3 &&
+            test ! -e /context/.context-probe/nested/ci-sensitive.sqlite-wal &&
+            test ! -e /context/.context-probe/nested/ci-private.pem &&
+            test ! -e /context/.context-probe/nested/ci-private.key &&
+            test ! -e /context/.context-probe/nested/ci-client.p12 &&
+            test ! -e /context/.context-probe/nested/ci-client.pfx &&
+            test ! -e /context/local-untracked.txt &&
+            test ! -e /context/.context-probe/nested/customer-export.csv &&
+            test ! -e /context/monitor/ci-local-config.json
+          '
 
-  # 测试通过后才构建并发布镜像到 GHCR(PR 不发布)。
   # 用内置 GITHUB_TOKEN 推送,无需额外配置 secret。首次发布后,在 Packages 设置里把包可见性设为 Public。
   # 测试通过后才构建并发布镜像到 GHCR(PR 不发布)。
   # 两个镜像:monitor 主服务 + hostagent 节点采集器,用 matrix 各自构建。

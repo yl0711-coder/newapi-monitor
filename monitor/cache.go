@@ -4,7 +4,8 @@ package monitor
 //
 // 设计边界:
 //   - Redis 是可选的主缓存，只保存可重新计算的 JSON 聚合结果，不参与鉴权；
-//   - 本机只保留最多 10 秒、32 项/8 MiB 的应急缓存，且绝不超过 Redis 记录的绝对过期时间；
+//   - 本机保留最多 60 秒、128 项/16 MiB 的有界缓存，Redis 故障时不低于旧版 60 秒缓存口径；
+//   - 本机记录绝不超过 Redis 记录的绝对过期时间，也不突破条目/字节硬上限；
 //   - 同键并发由进程内 singleflight 合并，等待者取消不会影响正在执行的请求；
 //   - Redis 超时、断连、鉴权失败一律自动降级，绝不能让业务接口因缓存返回 500；
 //   - 所有远端键都带 TTL，删除只用精确键，禁止 KEYS/SCAN。
@@ -17,6 +18,7 @@ import (
 	"fmt"
 	"log/slog"
 	"reflect"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -26,14 +28,15 @@ import (
 )
 
 const (
-	usageCacheLocalTTL        = 10 * time.Second
-	usageCacheLocalMaxEntries = 32
-	usageCacheLocalMaxBytes   = 8 << 20 // 8 MiB，Monitor 256 MiB 容器内的硬上限
-	usageCacheMaxPayloadBytes = 2 << 20 // 单个结果过大时直接返回但不缓存
+	usageCacheLocalTTL        = time.Minute
+	usageCacheLocalMaxEntries = 128
+	usageCacheLocalMaxBytes   = 16 << 20 // 16 MiB，Monitor 256 MiB 容器内的硬上限
+	usageCacheMaxPayloadBytes = 2 << 20  // 单个结果过大时直接返回但不缓存
 	usageCacheRemoteTimeout   = 150 * time.Millisecond
-	usageCacheRemoteBackoff   = 5 * time.Second
+	usageCacheRemoteBackoff   = 30 * time.Second
 	usageCacheWarnInterval    = time.Minute
 	usageCacheRedisPoolSize   = 8
+	usageCacheBypassMaxKeys   = 4096
 
 	// 包含今天的报表是一分钟级准实时；已结束的历史日期基本不再变化，
 	// 用更长 TTL 减少重复扫描。管理端主动重选日期时会绕过旧缓存。
@@ -58,17 +61,24 @@ type redisByteCacheStore struct {
 }
 
 func newRedisByteCacheStore(s Settings) *redisByteCacheStore {
-	return &redisByteCacheStore{client: redis.NewClient(&redis.Options{
-		Addr:         s.UsageRedisAddr,
-		Username:     s.UsageRedisUsername,
-		Password:     s.UsageRedisPassword,
-		DB:           s.UsageRedisDB,
-		DialTimeout:  usageCacheRemoteTimeout,
-		ReadTimeout:  usageCacheRemoteTimeout,
-		WriteTimeout: usageCacheRemoteTimeout,
-		PoolSize:     usageCacheRedisPoolSize,
-		MaxRetries:   0, // 业务层会快速降级，避免客户端内部重试把请求拖长
-	})}
+	return &redisByteCacheStore{client: redis.NewClient(usageRedisOptions(s))}
+}
+
+// usageRedisOptions 集中约束 Redis 客户端资源。go-redis 的 MaxRetries=0
+// 表示使用默认重试次数；要由业务层在 150ms 内快速降级，必须显式设为 -1。
+func usageRedisOptions(s Settings) *redis.Options {
+	return &redis.Options{
+		Addr:           s.UsageRedisAddr,
+		Username:       s.UsageRedisUsername,
+		Password:       s.UsageRedisPassword,
+		DB:             s.UsageRedisDB,
+		DialTimeout:    usageCacheRemoteTimeout,
+		ReadTimeout:    usageCacheRemoteTimeout,
+		WriteTimeout:   usageCacheRemoteTimeout,
+		PoolSize:       usageCacheRedisPoolSize,
+		MaxActiveConns: usageCacheRedisPoolSize,
+		MaxRetries:     -1,
+	}
 }
 
 func (s *redisByteCacheStore) Get(ctx context.Context, key string) ([]byte, error) {
@@ -93,14 +103,18 @@ func (s *redisByteCacheStore) Delete(ctx context.Context, keys ...string) error 
 func (s *redisByteCacheStore) Close() error { return s.client.Close() }
 
 type usageResultCache struct {
-	prefix   string
-	remote   byteCacheStore
-	local    *boundedByteCache
-	flight   cacheFlightGroup
-	fillGate cacheKeyGateGroup
+	prefix string
+	remote byteCacheStore
+	local  *boundedByteCache
+	// remoteBypass 是有界的逐键保护标记。源查询已得到新值、但 Redis 写入或删除失败时，
+	// 在该结果有效期内禁止再次读取可能更旧的远端值，避免 L1 过期后数据倒退。
+	remoteBypass *boundedByteCache
+	flight       cacheFlightGroup
+	fillGate     cacheKeyGateGroup
 
 	remoteBackoffUntil atomic.Int64
 	lastRemoteWarn     atomic.Int64
+	requests           atomic.Uint64
 	remoteHits         atomic.Uint64
 	remoteMisses       atomic.Uint64
 	localHits          atomic.Uint64
@@ -109,9 +123,61 @@ type usageResultCache struct {
 	logRemoteErrors    bool
 }
 
+// usageCacheStats 是只读运维指标，不包含缓存键、用户 ID、筛选条件或业务结果。
+// RemoteBackoffActive 表示客户端正处于快速降级窗口，不主动 PING Redis，避免
+// 为了观测反而给外部缓存增加额外请求。
+type usageCacheStats struct {
+	RemoteConfigured    bool   `json:"remote_configured"`
+	RemoteBackoffActive bool   `json:"remote_backoff_active"`
+	RemoteBackoffMS     int64  `json:"remote_backoff_ms"`
+	LocalEntries        int    `json:"local_entries"`
+	LocalBytes          int    `json:"local_bytes"`
+	RemoteBypassKeys    int    `json:"remote_bypass_keys"`
+	Requests            uint64 `json:"requests"`
+	LocalHits           uint64 `json:"local_hits"`
+	RemoteHits          uint64 `json:"remote_hits"`
+	RemoteMisses        uint64 `json:"remote_misses"`
+	SourceFills         uint64 `json:"source_fills"`
+	RemoteErrors        uint64 `json:"remote_errors"`
+}
+
+func (c *usageResultCache) Stats(now time.Time) usageCacheStats {
+	if c == nil {
+		return usageCacheStats{}
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	var localEntries, localBytes, bypassKeys int
+	if c.local != nil {
+		localEntries, localBytes = c.local.size()
+	}
+	if c.remoteBypass != nil {
+		bypassKeys, _ = c.remoteBypass.size()
+	}
+	backoff := time.Unix(0, c.remoteBackoffUntil.Load()).Sub(now)
+	if backoff < 0 {
+		backoff = 0
+	}
+	return usageCacheStats{
+		RemoteConfigured:    c.remote != nil,
+		RemoteBackoffActive: backoff > 0,
+		RemoteBackoffMS:     backoff.Milliseconds(),
+		LocalEntries:        localEntries,
+		LocalBytes:          localBytes,
+		RemoteBypassKeys:    bypassKeys,
+		Requests:            c.requests.Load(),
+		LocalHits:           c.localHits.Load(),
+		RemoteHits:          c.remoteHits.Load(),
+		RemoteMisses:        c.remoteMisses.Load(),
+		SourceFills:         c.fills.Load(),
+		RemoteErrors:        c.remoteErrors.Load(),
+	}
+}
+
 // usageCacheRecord 把绝对过期时间和业务 JSON 一起存入 Redis。
-// Redis 命中后，本机 L1 只使用“剩余 TTL”，避免 60s 的远端结果被 L1
-// 再延长 10s。它是内部格式，不会返回给前端。
+// Redis 命中后，本机 L1 只使用“剩余 TTL”，避免远端结果被 L1
+// 二次延长。它是内部格式，不会返回给前端。
 type usageCacheRecord struct {
 	Version           int             `json:"v"`
 	ExpiresAtUnixNano int64           `json:"expires_at_unix_nano"`
@@ -126,6 +192,7 @@ func newUsageResultCache(s Settings) *usageResultCache {
 	c := &usageResultCache{
 		prefix:          prefix,
 		local:           newBoundedByteCache(usageCacheLocalMaxEntries, usageCacheLocalMaxBytes),
+		remoteBypass:    newBoundedByteCache(usageCacheBypassMaxKeys, usageCacheBypassMaxKeys),
 		logRemoteErrors: true,
 	}
 	if strings.TrimSpace(s.UsageRedisAddr) != "" {
@@ -138,9 +205,10 @@ func newUsageResultCache(s Settings) *usageResultCache {
 // newUsageResultCacheForTest 注入远端替身，并允许缩小本地上限以验证淘汰行为。
 func newUsageResultCacheForTest(remote byteCacheStore, maxEntries, maxBytes int) *usageResultCache {
 	return &usageResultCache{
-		prefix: "nxmon:test:v1",
-		remote: remote,
-		local:  newBoundedByteCache(maxEntries, maxBytes),
+		prefix:       "nxmon:test:v1",
+		remote:       remote,
+		local:        newBoundedByteCache(maxEntries, maxBytes),
+		remoteBypass: newBoundedByteCache(usageCacheBypassMaxKeys, usageCacheBypassMaxKeys),
 	}
 }
 
@@ -205,6 +273,7 @@ func (c *usageResultCache) doJSON(
 		}
 		return decodeJSON(data, dst)
 	}
+	c.requests.Add(1)
 
 	fullKey := c.fullKey(key)
 	for attempt := 0; attempt < 2; attempt++ {
@@ -277,7 +346,7 @@ func (c *usageResultCache) loadOrFill(
 				c.localHits.Add(1)
 				return data, nil
 			}
-			if data, remaining, ok, err := c.remoteGet(ctx, fullKey); err != nil {
+			if data, remaining, ok, attempted, err := c.remoteGet(ctx, fullKey); err != nil {
 				if ctx.Err() != nil {
 					return nil, ctx.Err()
 				}
@@ -286,7 +355,7 @@ func (c *usageResultCache) loadOrFill(
 				c.remoteHits.Add(1)
 				c.local.Put(fullKey, data, minDuration(remaining, usageCacheLocalTTL), time.Now())
 				return data, nil
-			} else {
+			} else if attempted {
 				c.remoteMisses.Add(1)
 			}
 		}
@@ -307,11 +376,13 @@ func (c *usageResultCache) loadOrFill(
 			now := time.Now()
 			expiresAt := now.Add(ttl)
 			c.local.Put(fullKey, data, minDuration(expiresAt.Sub(now), usageCacheLocalTTL), now)
-			c.remoteSet(ctx, fullKey, data, expiresAt) // 失败自动降级，不覆盖业务结果
-		} else if skipExisting {
-			// 主动刷新已得到一份超过缓存上限的新结果：正常返回本次结果，
-			// 但必须删除旧小结果，否则下一次普通请求会倒退到刷新前。
-			c.Delete(ctx, strings.TrimPrefix(fullKey, c.prefix+":"))
+			if !c.remoteSet(ctx, fullKey, data, expiresAt) {
+				c.blockRemoteRead(fullKey, expiresAt)
+			}
+		} else {
+			// 本次源查询得到的结果超过缓存上限：正常返回，但要清掉旧的小结果。
+			// 此处已持有 fillGate，必须调用无锁内部方法，不能递归调用 Delete。
+			c.deleteFullKeysNoGate(ctx, []string{fullKey}, time.Now().Add(ttl))
 		}
 		return data, nil
 	})
@@ -328,20 +399,45 @@ func (c *usageResultCache) remoteAllowed(now time.Time) bool {
 	return c.remote != nil && now.UnixNano() >= c.remoteBackoffUntil.Load()
 }
 
-func (c *usageResultCache) remoteGet(ctx context.Context, key string) ([]byte, time.Duration, bool, error) {
-	if !c.remoteAllowed(time.Now()) {
-		return nil, 0, false, nil
+func (c *usageResultCache) remoteReadBlocked(key string, now time.Time) bool {
+	if c.remoteBypass == nil {
+		return false
+	}
+	_, ok := c.remoteBypass.Get(key, now)
+	return ok
+}
+
+func (c *usageResultCache) blockRemoteRead(key string, until time.Time) {
+	if c.remote == nil || c.remoteBypass == nil {
+		return
+	}
+	now := time.Now()
+	c.remoteBypass.Put(key, []byte{1}, until.Sub(now), now)
+}
+
+func (c *usageResultCache) unblockRemoteRead(key string) {
+	if c.remoteBypass != nil {
+		c.remoteBypass.Delete(key)
+	}
+}
+
+// remoteGet 的 attempted 区分“Redis 确实返回 miss”和“未配置/退避/逐键保护而未访问”。
+// 运维指标只把前者计为 remote_misses，避免 Redis 未启用时出现误导性的 miss 数量。
+func (c *usageResultCache) remoteGet(ctx context.Context, key string) (data []byte, remaining time.Duration, hit, attempted bool, err error) {
+	now := time.Now()
+	if c.remoteReadBlocked(key, now) || !c.remoteAllowed(now) {
+		return nil, 0, false, false, nil
 	}
 	opCtx, cancel := context.WithTimeout(ctx, usageCacheRemoteTimeout)
 	defer cancel()
-	data, err := c.remote.Get(opCtx, key)
+	data, err = c.remote.Get(opCtx, key)
 	if errors.Is(err, errUsageCacheMiss) {
 		c.remoteBackoffUntil.Store(0)
-		return nil, 0, false, nil
+		return nil, 0, false, true, nil
 	}
 	if err != nil {
 		c.noteRemoteError("GET", err)
-		return nil, 0, false, err
+		return nil, 0, false, true, err
 	}
 	c.remoteBackoffUntil.Store(0)
 	payload, expiresAt, err := decodeUsageCacheRecord(data)
@@ -349,35 +445,42 @@ func (c *usageResultCache) remoteGet(ctx context.Context, key string) ([]byte, t
 		// 旧版/损坏记录精确删除后当作 miss；禁止前缀扫描。
 		if deleteErr := c.remote.Delete(opCtx, key); deleteErr != nil {
 			c.noteRemoteError("DEL", deleteErr)
+			c.blockRemoteRead(key, time.Now().Add(usageAggregateHistoricalTTL))
 		}
-		return nil, 0, false, nil
+		return nil, 0, false, true, nil
 	}
-	remaining := time.Until(expiresAt)
+	remaining = time.Until(expiresAt)
 	if remaining <= 0 {
 		if deleteErr := c.remote.Delete(opCtx, key); deleteErr != nil {
 			c.noteRemoteError("DEL", deleteErr)
+			c.blockRemoteRead(key, time.Now().Add(usageAggregateHistoricalTTL))
 		}
-		return nil, 0, false, nil
+		return nil, 0, false, true, nil
 	}
-	return payload, remaining, true, nil
+	return payload, remaining, true, true, nil
 }
 
-func (c *usageResultCache) remoteSet(ctx context.Context, key string, data []byte, expiresAt time.Time) {
+func (c *usageResultCache) remoteSet(ctx context.Context, key string, data []byte, expiresAt time.Time) bool {
+	if c.remote == nil {
+		return true
+	}
 	ttl := time.Until(expiresAt)
 	if ttl <= 0 || !c.remoteAllowed(time.Now()) {
-		return
+		return false
 	}
 	record, err := encodeUsageCacheRecord(data, expiresAt)
 	if err != nil {
-		return
+		return false
 	}
 	opCtx, cancel := context.WithTimeout(ctx, usageCacheRemoteTimeout)
 	defer cancel()
 	if err := c.remote.Set(opCtx, key, record, ttl); err != nil {
 		c.noteRemoteError("SET", err)
-		return
+		return false
 	}
 	c.remoteBackoffUntil.Store(0)
+	c.unblockRemoteRead(key)
+	return true
 }
 
 func encodeUsageCacheRecord(payload []byte, expiresAt time.Time) ([]byte, error) {
@@ -427,25 +530,74 @@ func (c *usageResultCache) noteRemoteError(op string, err error) {
 	slog.Warn("用量 Redis 缓存暂不可用，已自动降级到本机有界缓存", "op", op, "err", err)
 }
 
-// Delete 只删除代码已知的精确键。远端不可用时旧键最多保留到自身 TTL；权限/成员变化
-// 还会改变成员指纹，因此不会重新命中旧权限域的数据。
+// Delete 只删除代码已知的精确键，并与同键填充串行。删除开始后先阻断远端读取；
+// 即使 Redis 暂时不可用，也不会在 L1 过期后重新读回被判定为失效的旧值。
 func (c *usageResultCache) Delete(ctx context.Context, keys ...string) {
 	if c == nil || len(keys) == 0 {
 		return
 	}
-	fullKeys := make([]string, 0, len(keys))
+	unique := make(map[string]struct{}, len(keys))
 	for _, key := range keys {
 		full := c.fullKey(key)
+		unique[full] = struct{}{}
+	}
+	fullKeys := make([]string, 0, len(unique))
+	bypassUntil := time.Now().Add(usageAggregateHistoricalTTL)
+	for full := range unique {
 		c.local.Delete(full)
+		c.blockRemoteRead(full, bypassUntil)
 		fullKeys = append(fullKeys, full)
 	}
+	sort.Strings(fullKeys) // 多键删除按固定顺序取闸，避免并发删除形成锁顺序反转。
+	releases := make([]func(), 0, len(fullKeys))
+	for _, full := range fullKeys {
+		release, err := c.fillGate.Acquire(ctx, full)
+		if err != nil {
+			for i := len(releases) - 1; i >= 0; i-- {
+				releases[i]()
+			}
+			return
+		}
+		releases = append(releases, release)
+	}
+	defer func() {
+		for i := len(releases) - 1; i >= 0; i-- {
+			releases[i]()
+		}
+	}()
+	c.deleteFullKeysNoGate(ctx, fullKeys, bypassUntil)
+}
+
+// deleteFullKeysNoGate 的调用方必须已经持有对应 fillGate，或正在 loadOrFill 的同键
+// 临界区内。远端删除失败时保留逐键 bypass，成功后才解除。
+func (c *usageResultCache) deleteFullKeysNoGate(ctx context.Context, fullKeys []string, bypassUntil time.Time) {
+	for _, full := range fullKeys {
+		c.local.Delete(full)
+	}
+	if c.remote == nil {
+		for _, full := range fullKeys {
+			c.unblockRemoteRead(full)
+		}
+		return
+	}
 	if !c.remoteAllowed(time.Now()) {
+		for _, full := range fullKeys {
+			c.blockRemoteRead(full, bypassUntil)
+		}
 		return
 	}
 	opCtx, cancel := context.WithTimeout(ctx, usageCacheRemoteTimeout)
 	defer cancel()
 	if err := c.remote.Delete(opCtx, fullKeys...); err != nil {
 		c.noteRemoteError("DEL", err)
+		for _, full := range fullKeys {
+			c.blockRemoteRead(full, bypassUntil)
+		}
+		return
+	}
+	c.remoteBackoffUntil.Store(0)
+	for _, full := range fullKeys {
+		c.unblockRemoteRead(full)
 	}
 }
 

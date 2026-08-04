@@ -450,7 +450,7 @@ func parseUsageRange(fromStr, toStr string, now time.Time) (fromTs, toTs int64, 
 	if from.After(to) {
 		from, to = to, from
 	}
-	// 含两端点共 N 天 ⇔ 零点差 (N-1)*24h;用 >= 卡在恰好 maxUsageDays 天(超一天即 91 天会被拒)
+	// 含两端点共 N 天 ⇔ 零点差 (N-1)*24h；用 >= 卡住“比上限多一天”的范围。
 	if to.Sub(from) >= time.Duration(maxUsageDays)*24*time.Hour {
 		return 0, 0, fmt.Errorf("时间范围过大,最长 %d 天", maxUsageDays)
 	}
@@ -1421,6 +1421,33 @@ func (m *Monitor) countGroupLogs(ctx context.Context, ids []int64, fromTs, toTs,
 		return 0, fmt.Errorf("日志计数失败: %w", err)
 	}
 	return n, nil
+}
+
+// countGroupLogsSnapshot 为浏览器原生 CSV 下载一次取回“总数 + 当前最大 ID”。
+// 后续分页从 maxID+1 开始，预检完成后新到的日志不会混入本次文件，因此不会出现
+// 预检时未超 5 万、下载时却悄悄截断的竞态。与普通计数一样只读、串行且有 15s 上限。
+func (m *Monitor) countGroupLogsSnapshot(ctx context.Context, ids []int64, fromTs, toTs, memberUID int64, logType int, model, group, tokenName, detailKw, requestID string) (total, startCursor int64, err error) {
+	if len(ids) == 0 {
+		return 0, 0, nil
+	}
+	cctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	if err := m.acquireUsageGate(cctx); err != nil {
+		return 0, 0, fmt.Errorf("等待日志计数槽位失败: %w", err)
+	}
+	defer m.releaseUsageGate()
+	where, args := logFilterWhere(ids, fromTs, toTs, memberUID, logType, model, group, tokenName, detailKw, requestID)
+	var maxID int64
+	if err := m.prodDB.QueryRowContext(cctx, "SELECT COUNT(*), COALESCE(MAX(id), 0) FROM logs WHERE "+where, args...).Scan(&total, &maxID); err != nil {
+		return 0, 0, fmt.Errorf("日志计数失败: %w", err)
+	}
+	if maxID == int64(^uint64(0)>>1) {
+		return 0, 0, errors.New("日志 ID 超出可导出范围")
+	}
+	// queryGroupLogs 使用 id < cursor；+1 才包含当前最大 ID。空结果时 maxID=0、
+	// cursor=1，确保预检后新到的正数自增 ID 也不会混入这次空快照。
+	startCursor = maxID + 1
+	return total, startCursor, nil
 }
 
 // queryGroupLogs 查一组成员的日志,按 id 倒序游标分页;窗口化、只读、串行(usageGate)。

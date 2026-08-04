@@ -1226,9 +1226,8 @@ async function usageInit(){
   const inp=document.getElementById('usrInput');
   inp&&inp.addEventListener('keydown',e=>{if(e.key==='Enter')usageAddUser()});
   usageFp=new SemiRangePicker(document.getElementById('usageRangeInput'),{
-    maxDays:366,presets:usagePresets,showClear:true,theme:'dark',
-    onChange:(_sel,meta)=>{usageRange=meta.preset||'custom';usageRefresh(true);},
-    onClear:()=>{usageRange='custom';}
+    maxDays:366,presets:usagePresets,showClear:false,theme:'dark',
+    onChange:(_sel,meta)=>{usageRange=meta.preset||'custom';usageRefresh(true);}
   });
   document.getElementById('usageBack').addEventListener('click',usageBackToList);
   // 令牌表点令牌名下钻单令牌详情(事件委托,表体每次查询重建)
@@ -1679,7 +1678,6 @@ function fuMemberHtml(m){
   const last=m.last_follow_up?('上次跟进 '+new Date(m.last_follow_up*1000).toLocaleDateString()):'未跟进过';
   const reasons=(m.reasons||[]).map((r,i)=>`<div class="fu-r"><span class="r-why">${esc(r)}</span><span class="r-do">→ ${esc((m.actions||[])[i]||'')}</span></div>`).join('');
   const who=m.username?esc(m.username):('#'+m.user_id);
-  const nm=(m.username||m.email||('#'+m.user_id)).replace(/'/g,"\\'").replace(/"/g,'');
   return `<div class="fu-item">
     <div class="fu-left">${fuIcon(m.reasons)}</div>
     <div class="fu-body">
@@ -1688,8 +1686,8 @@ function fuMemberHtml(m){
       <div class="fu-reasons">${reasons}</div>
     </div>
     <div class="fu-act">
-      <a href="javascript:void 0" class="g-link" onclick="usageOpenUserFrom(${m.user_id},'${nm}')">看消费 →</a>
-      ${IS_ROOT?`<a href="javascript:void 0" class="g-link" onclick="openFuDrawer(${m.user_id},'${nm}')">记跟进</a>`:''}
+      <a href="javascript:void 0" class="g-link" data-fu-action="usage" data-user-id="${m.user_id}">看消费 →</a>
+      ${IS_ROOT?`<a href="javascript:void 0" class="g-link" data-fu-action="follow" data-user-id="${m.user_id}">记跟进</a>`:''}
     </div>
   </div>`;
 }
@@ -1704,8 +1702,7 @@ function scrollToMatrix(){
 function fuSilentRow(m,co){
   const bal=m.balance_usd==null?'—':fmtCost(m.balance_usd);
   const who=m.username||m.email||('#'+m.user_id);
-  const nm=(m.username||m.email||('#'+m.user_id)).replace(/'/g,"\\'").replace(/"/g,'');
-  return `<div class="fu-silent-row"><span class="sn">${esc(who)}</span><span>· ${esc(co.group_name||'未分组')}</span><span>余额 ${bal}</span><span>已沉默 ${m.days_idle}+ 天</span><a href="javascript:void 0" class="g-link" style="margin-left:auto" onclick="usageOpenUserFrom(${m.user_id},'${nm}')">看消费 →</a><a href="javascript:void 0" class="g-link" onclick="openFuDrawer(${m.user_id},'${nm}')">记跟进</a></div>`;
+  return `<div class="fu-silent-row"><span class="sn">${esc(who)}</span><span>· ${esc(co.group_name||'未分组')}</span><span>余额 ${bal}</span><span>已沉默 ${m.days_idle}+ 天</span><a href="javascript:void 0" class="g-link" style="margin-left:auto" data-fu-action="usage" data-user-id="${m.user_id}">看消费 →</a><a href="javascript:void 0" class="g-link" data-fu-action="follow" data-user-id="${m.user_id}">记跟进</a></div>`;
 }
 function renderFollowUps(){
   const card=document.getElementById('followCard'),box=document.getElementById('followList'),badge=document.getElementById('followCount');
@@ -1744,6 +1741,26 @@ function toggleFuCo(gid){
   if(fuOpenCos.has(gid))fuOpenCos.delete(gid);else fuOpenCos.add(gid);
   renderFollowUps();
 }
+// 待跟进中的用户名/邮箱来自主站用户输入，绝不能拼进内联 JavaScript。
+// 点击元素只携带数值 user_id；显示名在事件触发后从内存数据中取，彻底隔离
+// HTML 属性上下文与 JavaScript 源码上下文，避免引号/反斜杠形成存储型 XSS。
+function followUpMemberName(uid){
+  for(const co of followCompanies||[]){
+    const m=(co.members||[]).find(x=>Number(x.user_id)===uid);
+    if(m)return m.username||m.email||('#'+uid);
+  }
+  return '#'+uid;
+}
+document.getElementById('followList').addEventListener('click',e=>{
+  const a=e.target.closest('[data-fu-action][data-user-id]');
+  if(!a||!e.currentTarget.contains(a))return;
+  e.preventDefault();
+  const uid=Number(a.dataset.userId);
+  if(!Number.isSafeInteger(uid)||uid<=0)return;
+  const name=followUpMemberName(uid);
+  if(a.dataset.fuAction==='usage')usageOpenUserFrom(uid,name);
+  else if(a.dataset.fuAction==='follow'&&IS_ROOT)openFuDrawer(uid,name);
+});
 // 从待跟进「看消费」进用户详情:范围设近30天(与跟进判断窗口一致),沉睡用户也看得到历史
 function usageOpenUserFrom(uid,name){
   usageRange='30d'; usageApplyPreset();

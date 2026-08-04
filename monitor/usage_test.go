@@ -1218,6 +1218,35 @@ func TestEmbeddedRangePickerIsDateOnly(t *testing.T) {
 	if !strings.Contains(pageHTML, "usageRefresh(true)") || !strings.Contains(pageHTML, "q.set('refresh','1')") {
 		t.Fatal("管理端重新选择日期未连接到强制取新语义")
 	}
+	if !strings.Contains(pageHTML, "showClear:false") || strings.Contains(pageHTML, "showClear:true") || strings.Contains(pageHTML, "onClear:") {
+		t.Fatal("管理端日期控件仍允许清空为无效范围")
+	}
+}
+
+// 主站用户名允许引号和反斜杠；它只能作为显示数据使用，不能进入内联事件源码。
+// 这里锁住待跟进两个入口（普通提醒、长期沉默），防以后为图省事重新拼 onclick。
+func TestFollowUpActionsKeepUserTextOutOfInlineJavaScript(t *testing.T) {
+	html := pageHTML
+	for _, forbidden := range []string{
+		"const nm=(m.username||m.email",
+		"onclick=\"usageOpenUserFrom(${m.user_id}",
+		"onclick=\"openFuDrawer(${m.user_id}",
+	} {
+		if strings.Contains(html, forbidden) {
+			t.Fatalf("待跟进操作仍把用户文本拼进内联 JavaScript: %q", forbidden)
+		}
+	}
+	for _, required := range []string{
+		`data-fu-action="usage" data-user-id="${m.user_id}"`,
+		`data-fu-action="follow" data-user-id="${m.user_id}"`,
+		"function followUpMemberName(uid)",
+		"document.getElementById('followList').addEventListener('click'",
+		"Number.isSafeInteger(uid)",
+	} {
+		if !strings.Contains(html, required) {
+			t.Fatalf("待跟进操作缺少安全事件委托: %q", required)
+		}
+	}
 }
 
 func TestRefreshTrackedLabels(t *testing.T) {
