@@ -15,8 +15,12 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
 </script>
 <script src="/echarts.js"></script>
 <script src="/flatpickr.js"></script>
-<script src="/range-picker.js?v=4"></script>
 <link rel="stylesheet" href="/flatpickr.css">
+<link rel="stylesheet" href="/semi-ui.css?v=2.72.2">
+<script src="/react.js?v=18.2.0"></script>
+<script src="/react-dom.js?v=18.2.0"></script>
+<script src="/semi-ui.js?v=2.72.2"></script>
+<script src="/range-picker.js?v=9"></script>
 <style>
   *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
   :root{--bg:#0f1117;--surface:#1a1d27;--border:#2a2d3e;--accent:#6366f1;--text:#e2e8f0;--text-muted:#94a3b8;
@@ -68,7 +72,9 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
   .fu-silent-row{display:flex;gap:12px;align-items:center;padding:8px 12px;font-size:13px;border-top:1px solid var(--border);color:var(--text-muted)}
   .fu-silent-row .sn{color:var(--text)}
   .mxwrap thead th{border-bottom:1px solid var(--border)}
-  .toolbar .srp-wrap{min-width:430px}
+  .toolbar .srp-wrap{width:320px;min-width:0;flex:0 0 320px}
+  .srp-wrap>.semi-datepicker{width:100%}
+  .semi-input-wrapper,.semi-datepicker-range-input{border-radius:10px!important}
   .uinput{background:var(--bg);border:1px solid var(--border);border-radius:8px;color:var(--text);padding:7px 12px;font-size:13px}
   #usageSearch{background:var(--bg);border:1px solid var(--border);border-radius:8px;color:var(--text);padding:7px 12px;font-size:13px;width:230px}
   /* 全局总账:页顶一行小统计(累计总消耗合计打头) */
@@ -236,7 +242,7 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
   .tabpane[hidden]{display:none}
 </style>
 </head>
-<body>
+<body theme-mode="dark">
 <h1>📈 <span data-brand>new-api</span> 上游监控 <small>分组 / 渠道 / 模型 · 稳定性 · 响应耗时</small></h1>
 
 <div class="tabs">
@@ -396,7 +402,7 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
       <div id="usageGrpCards" class="grpcards"></div>
     </div>
     <div class="card">
-      <div class="card-header">💰 每日消费 <span class="muted" style="font-weight:400;font-size:12px">· 行=用户，列=日期，格=当日消耗（美元）· 点用户看详情，左右拖动看更多天</span></div>
+      <div class="card-header">💰 每日消费 <span class="muted" style="font-weight:400;font-size:12px">· 行=用户，列=日期，格=当日消费（美元）· 点用户看详情，左右拖动看更多天</span></div>
       <div class="mxwrap"><table id="usageMxTable" style="min-width:560px"><thead id="thUsageMx"></thead><tbody id="tbUsageMx"></tbody></table></div>
     </div>
 
@@ -469,7 +475,7 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
       <table><thead id="thUsageDaily"></thead><tbody id="tbUsageDaily"></tbody></table>
     </div>
     <div class="card" id="usageMemCard" hidden>
-      <div class="card-header">👥 组内成员 <span class="muted" style="font-weight:400;font-size:12px">· 行=成员,列=日期,格=当日消耗(美元)· 点成员看明细(与该客户在报表页看到的一致)</span></div>
+      <div class="card-header">👥 组内成员 <span class="muted" style="font-weight:400;font-size:12px">· 行=成员,列=日期,格=当日消费(美元)· 点成员看明细(与该客户在报表页看到的一致)</span></div>
       <div class="mxwrap"><table id="usageMemMxTable" style="min-width:560px"><thead id="thUsageMemMx"></thead><tbody id="tbUsageMemMx"></tbody></table></div>
     </div>
     <div class="card" id="usageMemRankCard" hidden><div class="card-header">🏆 成员消耗排行 <span class="muted" style="font-weight:400;font-size:12px">· 范围内消耗 Top 10</span></div><div id="usageMemRankChart" style="min-height:180px;padding:6px 10px"></div></div>
@@ -1159,8 +1165,8 @@ function switchTab(name){
 function resizeModelCharts(){[trendChart,longChart,sloGauge,latChart,ttftChart].forEach(c=>c&&c.resize());}
 
 // ═══════════ 用户用量(tab-usage):列表页=消费矩阵(日期×用户),点用户进详情 ═══════════
-// 与另两个 tab 不同:不自动刷新——每次查询都会打到生产库(窗口化、走索引、后端串行闸),
-// 只在打开 tab / 点查询 / 改名单 / 进出详情时拉取。
+// 与另两个 tab 不同:不定时自动刷新。聚合数字复用有界缓存；用户重新选择日期时强制取新，
+// 余额/用户资料仍实时取回。快速切换由可取消查询和后端单槽闸共同保护生产库。
 let IS_ROOT=false,usageInited=false,usageUsers=[],usageGroups=[],usageDailyChart=null,usageRange='7d';
 let usageDetail=null;      // null=列表视图;{type:'user'|'group', id, label}=详情视图
 let usageMxCache=null;     // 最近一次矩阵响应(分组筛选/搜索纯前端,复用缓存不重查生产库)
@@ -1175,13 +1181,15 @@ const cstDayStr=off=>{const d=new Date(Date.now()+8*3600*1000-(off||0)*86400000)
 const addDaysStr=(ymd,n)=>{const[x,y,z]=ymd.split('-').map(Number);const d=new Date(Date.UTC(x,y-1,z+n));return d.getUTCFullYear()+'-'+String(d.getUTCMonth()+1).padStart(2,'0')+'-'+String(d.getUTCDate()).padStart(2,'0')};
 const usageDate=s=>{const [y,m,d]=s.split('-').map(Number);return new Date(y,m-1,d)};
 function usageWeekStart(){const d=usageDate(cstDayStr(0));d.setDate(d.getDate()-d.getDay());return d}
+function usageWeekEnd(){const d=usageWeekStart();d.setDate(d.getDate()+6);return d}
 function usageMonthStart(){const d=usageDate(cstDayStr(0));return new Date(d.getFullYear(),d.getMonth(),1)}
+function usageMonthEnd(){const d=usageDate(cstDayStr(0));return new Date(d.getFullYear(),d.getMonth()+1,0)}
 const usagePresets=[
   {key:'today',text:'今天',start:()=>usageDate(cstDayStr(0)),end:()=>usageDate(cstDayStr(0))},
   {key:'7d',text:'近 7 天',start:()=>usageDate(cstDayStr(6)),end:()=>usageDate(cstDayStr(0))},
-  {key:'week',text:'本周',start:usageWeekStart,end:()=>usageDate(cstDayStr(0))},
+  {key:'week',text:'本周',start:usageWeekStart,end:usageWeekEnd},
   {key:'30d',text:'近 30 天',start:()=>usageDate(cstDayStr(29)),end:()=>usageDate(cstDayStr(0))},
-  {key:'month',text:'本月',start:usageMonthStart,end:()=>usageDate(cstDayStr(0))},
+  {key:'month',text:'本月',start:usageMonthStart,end:usageMonthEnd},
   {key:'halfyear',text:'近半年',start:()=>usageDate(cstDayStr(179)),end:()=>usageDate(cstDayStr(0))},
   {key:'year',text:'近一年',start:()=>usageDate(cstDayStr(364)),end:()=>usageDate(cstDayStr(0))}
 ];
@@ -1190,7 +1198,7 @@ function usageApplyPreset(){ // 预设写进范围选择器
   if(usageFp)usageFp.setDate([p.start(),p.end()],false); // 不触发 onChange,由调用方决定何时查询
 }
 // 按当前视图刷新:列表=矩阵,详情=该用户四路聚合
-function usageRefresh(){ usageDetail?usageLoadDetail():usageLoadMatrix(); }
+function usageRefresh(forceFresh){ usageDetail?usageLoadDetail(!!forceFresh):usageLoadMatrix(!!forceFresh); }
 function usageShowView(){
   document.getElementById('usageViewList').hidden=!!usageDetail;
   document.getElementById('usageViewDetail').hidden=!usageDetail;
@@ -1218,9 +1226,8 @@ async function usageInit(){
   const inp=document.getElementById('usrInput');
   inp&&inp.addEventListener('keydown',e=>{if(e.key==='Enter')usageAddUser()});
   usageFp=new SemiRangePicker(document.getElementById('usageRangeInput'),{
-    maxDate:cstDayStr(0),maxDays:366,presets:usagePresets,
-    onChange:(_sel,meta)=>{usageRange=meta.preset||'custom';usageRefresh();},
-    onClear:()=>{usageRange='custom';}
+    maxDays:366,presets:usagePresets,showClear:false,theme:'dark',
+    onChange:(_sel,meta)=>{usageRange=meta.preset||'custom';usageRefresh(true);}
   });
   document.getElementById('usageBack').addEventListener('click',usageBackToList);
   // 令牌表点令牌名下钻单令牌详情(事件委托,表体每次查询重建)
@@ -1605,21 +1612,28 @@ async function usageDelUser(id){
     await usageLoadUsers(); usageRefresh();
   }catch(e){msg.textContent='网络错误:'+e.message}
 }
-function usageRangeParams(){
-  const q=new URLSearchParams();
+function usageRangeParams(forceFresh){
+	const q=new URLSearchParams();
   const sel=usageFp?usageFp.selectedDates():[];
   const f=d=>d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');
-  if(sel.length===2){q.set('from',f(sel[0]));q.set('to',f(sel[1]))}
-  else if(sel.length===1){q.set('from',f(sel[0]));q.set('to',f(sel[0]))}
-  return q;
+	if(sel.length===2){q.set('from',f(sel[0]));q.set('to',f(sel[1]))}
+	else if(sel.length===1){q.set('from',f(sel[0]));q.set('to',f(sel[0]))}
+	if(forceFresh)q.set('refresh','1');
+	return q;
 }
-// 响应排序:快速连点/切范围时,旧的慢响应可能晚于新的快响应到达;只渲染最后一次发起的结果。
-let usageSeq=0;
+// 快速连点/切范围时取消旧查询，并且只允许最后一次请求渲染。
+// 浏览器 abort 会沿 Gin request context 取消后端等待/查询，避免无用请求继续占用生产库闸门。
+let usageSeq=0,usageAbort=null;
+function usageBeginRequest(){
+  if(usageAbort)usageAbort.abort();
+  usageAbort=new AbortController();
+  return {seq:++usageSeq,signal:usageAbort.signal};
+}
 // 列表页:消费矩阵
-async function usageLoadMatrix(){
-  const eb=document.getElementById('usageErr'),seq=++usageSeq;
-  try{
-    const res=await fetch('/usage/matrix?'+usageRangeParams(),{headers:{'Accept':'application/json'}});
+async function usageLoadMatrix(forceFresh){
+	const eb=document.getElementById('usageErr'),req=usageBeginRequest(),seq=req.seq;
+	try{
+		const res=await fetch('/usage/matrix?'+usageRangeParams(!!forceFresh),{headers:{'Accept':'application/json'},signal:req.signal});
     if(seq!==usageSeq)return; // 已有更新的查询在飞,丢弃本响应
     if(res.status===401){location.href='/login';return}
     const d=await res.json().catch(()=>({}));
@@ -1627,7 +1641,7 @@ async function usageLoadMatrix(){
     if(d.enabled===false){eb.innerHTML='<div class="alert">未连接主站数据库(NEWAPI_LOG_DSN),用户用量不可用。</div>';return}
     eb.innerHTML='';
     renderUsageMatrix(d.matrix||{},!!d.empty);
-  }catch(e){if(seq===usageSeq)eb.innerHTML='<div class="alert">加载失败:'+esc(e.message)+'</div>'}
+  }catch(e){if(e.name!=='AbortError'&&seq===usageSeq)eb.innerHTML='<div class="alert">加载失败:'+esc(e.message)+'</div>'}
 }
 function renderUsageMatrix(mx,empty){ usageMxCache=mx; usageMxCache._empty=empty; renderUsageList(); }
 // 可见用户 = 分组筛选 ∩ 搜索(公司/用户名/邮箱)
@@ -1664,7 +1678,6 @@ function fuMemberHtml(m){
   const last=m.last_follow_up?('上次跟进 '+new Date(m.last_follow_up*1000).toLocaleDateString()):'未跟进过';
   const reasons=(m.reasons||[]).map((r,i)=>`<div class="fu-r"><span class="r-why">${esc(r)}</span><span class="r-do">→ ${esc((m.actions||[])[i]||'')}</span></div>`).join('');
   const who=m.username?esc(m.username):('#'+m.user_id);
-  const nm=(m.username||m.email||('#'+m.user_id)).replace(/'/g,"\\'").replace(/"/g,'');
   return `<div class="fu-item">
     <div class="fu-left">${fuIcon(m.reasons)}</div>
     <div class="fu-body">
@@ -1673,8 +1686,8 @@ function fuMemberHtml(m){
       <div class="fu-reasons">${reasons}</div>
     </div>
     <div class="fu-act">
-      <a href="javascript:void 0" class="g-link" onclick="usageOpenUserFrom(${m.user_id},'${nm}')">看消费 →</a>
-      ${IS_ROOT?`<a href="javascript:void 0" class="g-link" onclick="openFuDrawer(${m.user_id},'${nm}')">记跟进</a>`:''}
+      <a href="javascript:void 0" class="g-link" data-fu-action="usage" data-user-id="${m.user_id}">看消费 →</a>
+      ${IS_ROOT?`<a href="javascript:void 0" class="g-link" data-fu-action="follow" data-user-id="${m.user_id}">记跟进</a>`:''}
     </div>
   </div>`;
 }
@@ -1689,8 +1702,7 @@ function scrollToMatrix(){
 function fuSilentRow(m,co){
   const bal=m.balance_usd==null?'—':fmtCost(m.balance_usd);
   const who=m.username||m.email||('#'+m.user_id);
-  const nm=(m.username||m.email||('#'+m.user_id)).replace(/'/g,"\\'").replace(/"/g,'');
-  return `<div class="fu-silent-row"><span class="sn">${esc(who)}</span><span>· ${esc(co.group_name||'未分组')}</span><span>余额 ${bal}</span><span>已沉默 ${m.days_idle}+ 天</span><a href="javascript:void 0" class="g-link" style="margin-left:auto" onclick="usageOpenUserFrom(${m.user_id},'${nm}')">看消费 →</a><a href="javascript:void 0" class="g-link" onclick="openFuDrawer(${m.user_id},'${nm}')">记跟进</a></div>`;
+  return `<div class="fu-silent-row"><span class="sn">${esc(who)}</span><span>· ${esc(co.group_name||'未分组')}</span><span>余额 ${bal}</span><span>已沉默 ${m.days_idle}+ 天</span><a href="javascript:void 0" class="g-link" style="margin-left:auto" data-fu-action="usage" data-user-id="${m.user_id}">看消费 →</a><a href="javascript:void 0" class="g-link" data-fu-action="follow" data-user-id="${m.user_id}">记跟进</a></div>`;
 }
 function renderFollowUps(){
   const card=document.getElementById('followCard'),box=document.getElementById('followList'),badge=document.getElementById('followCount');
@@ -1729,6 +1741,26 @@ function toggleFuCo(gid){
   if(fuOpenCos.has(gid))fuOpenCos.delete(gid);else fuOpenCos.add(gid);
   renderFollowUps();
 }
+// 待跟进中的用户名/邮箱来自主站用户输入，绝不能拼进内联 JavaScript。
+// 点击元素只携带数值 user_id；显示名在事件触发后从内存数据中取，彻底隔离
+// HTML 属性上下文与 JavaScript 源码上下文，避免引号/反斜杠形成存储型 XSS。
+function followUpMemberName(uid){
+  for(const co of followCompanies||[]){
+    const m=(co.members||[]).find(x=>Number(x.user_id)===uid);
+    if(m)return m.username||m.email||('#'+uid);
+  }
+  return '#'+uid;
+}
+document.getElementById('followList').addEventListener('click',e=>{
+  const a=e.target.closest('[data-fu-action][data-user-id]');
+  if(!a||!e.currentTarget.contains(a))return;
+  e.preventDefault();
+  const uid=Number(a.dataset.userId);
+  if(!Number.isSafeInteger(uid)||uid<=0)return;
+  const name=followUpMemberName(uid);
+  if(a.dataset.fuAction==='usage')usageOpenUserFrom(uid,name);
+  else if(a.dataset.fuAction==='follow'&&IS_ROOT)openFuDrawer(uid,name);
+});
 // 从待跟进「看消费」进用户详情:范围设近30天(与跟进判断窗口一致),沉睡用户也看得到历史
 function usageOpenUserFrom(uid,name){
   usageRange='30d'; usageApplyPreset();
@@ -1878,7 +1910,7 @@ function renderUsageSummary(){
   let used=0,range=0,bal=0,balKnown=false;
   for(const u of users){used+=(+u.total_used_usd||0);range+=(+u.total_usd||0);if(u.balance_usd!=null){bal+=(+u.balance_usd);balKnown=true}}
   el.innerHTML=`<span class="us-item"><span class="us-l">全部客户累计总消耗</span><span class="us-v amber" title="终身累计,不受日期范围影响">${fmtCost(used)}</span></span>`
-    +`<span class="us-sep"></span><span class="us-item"><span class="us-l">范围消耗</span><span class="us-v" title="所选日期范围内合计">${fmtCost(range)}</span></span>`
+    +`<span class="us-sep"></span><span class="us-item"><span class="us-l">范围消费</span><span class="us-v" title="所选日期范围内消费合计">${fmtCost(range)}</span></span>`
     +`<span class="us-sep"></span><span class="us-item"><span class="us-l">当前总余额</span><span class="us-v green">${balKnown?fmtCost(bal):'—'}</span></span>`
     +`<span class="us-sep"></span><span class="us-item"><span class="us-l">在管客户</span><span class="us-v">${fmtNum(users.length)}</span></span>`;
 }
@@ -1907,29 +1939,29 @@ function drawUsageMatrix(mx,users,empty,thId,tbId){
   (mx.cells||[]).forEach(c=>{if(!vis.has(c.user_id))return;cell.set(c.user_id+'|'+c.date,c);if(c.cost_usd>maxCost)maxCost=c.cost_usd});
   const heat=v=>v>0&&maxCost>0?` style="background:rgba(245,158,11,${(0.08+0.30*Math.sqrt(v/maxCost)).toFixed(3)})"`:''; // 感知刻度:sqrt 让中段金额也可见,不只头部一人有热力
   const fmtCell=v=>v>=0.005?'$'+v.toFixed(2):(v>0?'<$0.01':'$0.00');
-  th.innerHTML='<tr><th>用户</th><th class="right" style="color:#34d399">余额</th><th class="right" style="color:#fbbf24" title="累计总消耗:该用户终身消耗,不受下方日期范围影响">累计总消耗</th>'+days.map(d=>`<th class="right" title="${esc(d)}">${esc(d.slice(5))}</th>`).join('')+'<th class="right" title="所选日期范围内的消费合计(见上方统计范围;随日期选择器变化)">范围消耗</th></tr>';
+  th.innerHTML='<tr><th>用户</th><th class="right" style="color:#34d399">余额</th><th class="right" style="color:#fbbf24" title="累计总消耗:该用户终身消耗,不受下方日期范围影响">累计总消耗</th>'+days.map(d=>`<th class="right" title="${esc(d)} · 单元格显示消费">${esc(d.slice(5))}</th>`).join('')+'<th class="right">范围消费</th></tr>';
   const daySum={};
   tb.innerHTML=users.map(u=>{
     let tds='';
     for(const day of days){
       const c=cell.get(u.user_id+'|'+day);
       if(c)daySum[day]=(daySum[day]||0)+c.cost_usd;
-      tds+=`<td class="right num"${c?heat(c.cost_usd):''} ${c?`title="${esc(u.username||u.email)} · ${esc(day)} · $${c.cost_usd.toFixed(4)} · ${fmtNum(c.requests)} 次请求"`:''}>${c?fmtCell(c.cost_usd):'<span class="muted">—</span>'}</td>`;
+      tds+=`<td class="right num"${c?heat(c.cost_usd):''} ${c?`title="${esc(u.username||u.email)} · ${esc(day)} · 消费 $${c.cost_usd.toFixed(4)} · ${fmtNum(c.requests)} 次请求"`:''}>${c?fmtCell(c.cost_usd):'<span class="muted">—</span>'}</td>`;
     }
     const label=u.username||u.email||('#'+u.user_id);
     const bal=u.balance_usd==null?'<span class="muted">—</span>':(u.balance_usd<0?`<span style="color:#f87171;font-weight:600">${fmtCost(u.balance_usd)}</span>`:`<span style="color:#34d399">${fmtCost(u.balance_usd)}</span>`); // 负余额=催充值头号信号,必须红
     const used=u.total_used_usd==null?'<span class="muted">—</span>':`<b style="color:#fbbf24">${fmtCost(u.total_used_usd)}</b>`;
     return `<tr><td><a href="javascript:void 0" class="ucell" data-uid="${u.user_id}" data-label="${esc(label)}" data-uname="${esc(u.username||'')}" data-umail="${esc(u.email||'')}" data-ugrp="${esc(u.group_name||'')}" data-unote="${esc(u.note||'')}" style="color:var(--accent);text-decoration:none"><span class="u-name">${esc(u.username||'#'+u.user_id)}</span><span class="u-mail">${esc(u.email||'—')}</span></a></td><td class="right num" title="主站当前余额">${bal}</td><td class="right num" title="主站累计总消耗(终身)">${used}</td>${tds}<td class="right num">${fmtCost(u.total_usd)}</td></tr>`;
   }).join('')
-  +`<tr class="mxfoot"><td><b>${isList&&(usageFilterGid!==null||usageSearchText)?'筛选合计':'合计'}</b></td><td></td><td class="right num" title="可见用户累计总消耗合计"><b style="color:#fbbf24">${fmtCost(users.reduce((s,u)=>s+(+u.total_used_usd||0),0))}</b></td>${days.map(d=>`<td class="right num" title="${esc(d)}${d in daySum?` · $${daySum[d].toFixed(4)}`:''}"><b>${d in daySum?fmtCell(daySum[d]):'<span class="muted">—</span>'}</b></td>`).join('')}<td class="right num"><b>${fmtCost(users.reduce((s,u)=>s+u.total_usd,0))}</b></td></tr>`;
+  +`<tr class="mxfoot"><td><b>${isList&&(usageFilterGid!==null||usageSearchText)?'筛选合计':'合计'}</b></td><td></td><td class="right num" title="可见用户累计总消耗合计"><b style="color:#fbbf24">${fmtCost(users.reduce((s,u)=>s+(+u.total_used_usd||0),0))}</b></td>${days.map(d=>`<td class="right num" title="${esc(d)}${d in daySum?` · $${daySum[d].toFixed(4)}`:''}"><b>${d in daySum?fmtCell(daySum[d]):'<span class="muted">—</span>'}</b></td>`).join('')}<td class="right num"><b>${fmtCost(users.reduce((s,u)=>s+(+u.total_usd||0),0))}</b></td></tr>`;
 }
 // 详情页:单用户 或 整个公司(分组)的每日/令牌分组/模型聚合
-async function usageLoadDetail(){
+async function usageLoadDetail(forceFresh){
   if(!usageDetail)return;
   // 切用户详情:立即隐藏组织专属块(组内成员/成员排行),避免异步加载时残留上一个组织的内容
   if(usageDetail.type!=='group'){document.getElementById('usageMemCard').hidden=true;document.getElementById('usageMemRankCard').hidden=true;}
-  const eb=document.getElementById('usageErr'),seq=++usageSeq;
-  const q=usageRangeParams();
+  const eb=document.getElementById('usageErr'),req=usageBeginRequest(),seq=req.seq;
+	const q=usageRangeParams(!!forceFresh);
   if(usageDetail.type==='token'){q.set('user_id',usageDetail.uid);q.set('token_id',usageDetail.id);}
   else q.set(usageDetail.type==='group'?'group_id':'user_id',usageDetail.id);
   // 组织详情:矩阵缓存可用时先秒出组内成员/排行(不等 stats 查库;范围若变后面会按新范围重画)
@@ -1940,7 +1972,7 @@ async function usageLoadDetail(){
     renderUsageMemRank(mem0);
   }
   try{
-    const res=await fetch('/usage/stats?'+q,{headers:{'Accept':'application/json'}});
+    const res=await fetch('/usage/stats?'+q,{headers:{'Accept':'application/json'},signal:req.signal});
     if(seq!==usageSeq)return;
     if(res.status===401){location.href='/login';return}
     const d=await res.json().catch(()=>({}));
@@ -1956,7 +1988,7 @@ async function usageLoadDetail(){
       const sf=(d.stats||{}).from,stt=(d.stats||{}).to;
       let mx=(usageMxCache&&usageMxCache.from===sf&&usageMxCache.to===stt)?usageMxCache:null;
       if(!mx){
-        const mr=await fetch('/usage/matrix?'+usageRangeParams(),{headers:{'Accept':'application/json'}});
+		const mr=await fetch('/usage/matrix?'+usageRangeParams(!!forceFresh),{headers:{'Accept':'application/json'},signal:req.signal});
         if(seq!==usageSeq)return;
         const md=await mr.json().catch(()=>({}));
         if(mr.ok&&md.matrix)mx=md.matrix;
@@ -1969,14 +2001,15 @@ async function usageLoadDetail(){
         renderUsageMemRank(mem); // 成员消耗排行(对齐客户页)
       }
     }else{memCard.hidden=true;renderUsageMemRank(null);}
-  }catch(e){if(seq===usageSeq)eb.innerHTML='<div class="alert">加载失败:'+esc(e.message)+'</div>'}
+  }catch(e){if(e.name!=='AbortError'&&seq===usageSeq)eb.innerHTML='<div class="alert">加载失败:'+esc(e.message)+'</div>'}
 }
-const USAGE_DIM_HEAD=`<tr><th>名称</th><th class="right">请求</th><th class="right">Tokens</th><th class="right">费用</th></tr>`;
-function renderUsageDim(th,tb,rows){
+const USAGE_DIM_HEAD=`<tr><th>名称</th><th class="right">请求</th><th class="right">Tokens</th><th class="right">消费</th></tr>`;
+function renderUsageDim(th,tb,rows,truncated){
   document.getElementById(th).innerHTML=USAGE_DIM_HEAD;
   const e=document.getElementById(tb);
   if(!rows||!rows.length){e.innerHTML='<tr><td colspan="4" class="muted" style="text-align:center;padding:18px">范围内无数据</td></tr>';return}
-  e.innerHTML=rows.map(r=>`<tr><td>${esc(r.key||'—')}</td><td class="right num">${fmtNum(r.requests)}</td><td class="right num">${fmtNum(r.tokens)}</td><td class="right num">${fmtCost(r.cost_usd)}</td></tr>`).join('');
+  e.innerHTML=rows.map(r=>`<tr><td>${esc(r.key||'—')}</td><td class="right num">${fmtNum(r.requests)}</td><td class="right num">${fmtNum(r.tokens)}</td><td class="right num">${fmtCost(r.cost_usd)}</td></tr>`).join('')
+    +(truncated?'<tr><td colspan="4" class="muted" style="text-align:center;padding:10px">维度较多，仅展示消费最高的前 300 项；汇总与每日趋势仍按完整数据计算。</td></tr>':'');
 }
 // 按令牌:密钥脱敏(服务端已打码,前端不接触明文),仅单用户详情显示,公司详情隐藏。
 // 该用户全部现存令牌都列出(范围内零用量补0);已删除但范围内有消费的沉底单独分区+标记,保证分项加总=范围消耗合计。
@@ -1985,7 +2018,7 @@ function renderUsageTokens(rows){
   const card=document.getElementById('usageTokCard');
   if(rows===undefined){card.hidden=true;return} // 公司详情:无此维度
   card.hidden=false;
-  document.getElementById('thUsageTok').innerHTML='<tr><th>所属用户</th><th>令牌名称</th><th>密钥</th><th>分组</th><th class="right">请求</th><th class="right">Tokens</th><th class="right">范围消耗</th><th class="right">累计总消耗</th></tr>';
+  document.getElementById('thUsageTok').innerHTML='<tr><th>所属用户</th><th>令牌名称</th><th>密钥</th><th>分组</th><th class="right">请求</th><th class="right">Tokens</th><th class="right">范围消费</th><th class="right">累计总消耗</th></tr>';
   const e=document.getElementById('tbUsageTok');
   if(!rows||!rows.length){e.innerHTML='<tr><td colspan="8" class="muted" style="text-align:center;padding:18px">该用户暂无令牌记录</td></tr>';return}
   const tr=r=>{
@@ -1999,7 +2032,7 @@ function renderUsageTokens(rows){
   };
   const live=rows.filter(r=>!r.deleted),del=rows.filter(r=>r.deleted); // 服务端已排好:现存在前已删沉底
   let html=live.map(tr).join('');
-  if(del.length)html+='<tr><td colspan="8" class="muted" style="font-size:11px;padding:10px 12px 4px;border-bottom:none">以下为已删除令牌(范围内仍有消费,计入合计)</td></tr>'+del.map(tr).join('');
+  if(del.length)html+='<tr><td colspan="8" class="muted" style="font-size:11px;padding:10px 12px 4px;border-bottom:none">以下为已删除令牌(范围内仍有用量记录,计入合计)</td></tr>'+del.map(tr).join('');
   e.innerHTML=html;
 }
 // ---- 组织详情图表(深色,内容对齐客户报表页 portal.html)----
@@ -2055,18 +2088,18 @@ function renderUsage(st,balanceUSD,members,totalUsedUSD,byToken,tokenMeta){
     ['密钥',tokenMeta&&tokenMeta.masked_key?`<span style="font-size:14px;white-space:nowrap;font-family:ui-monospace,SFMono-Regular,Menlo,monospace">${esc(tokenMeta.masked_key)}</span>`:'—','#94a3b8','stat-card-wide'],
     ['总请求',fmtNum(s.requests),'#6366f1'],
     ['总 Tokens',`<span title="${fmtNum(s.tokens)} tokens">${fmtCompact(s.tokens)}</span>`,'#6366f1'],
-    ['范围消耗',fmtCost(s.cost_usd),'#e2e8f0'],
+    ['范围消费',fmtCost(s.cost_usd),'#e2e8f0'],
     ['累计总消耗',tokenMeta&&tokenMeta.total_cost_usd!=null?fmtCost(tokenMeta.total_cost_usd):'—','#fbbf24'],
   ]:isGrp?[
     ['累计总消耗合计',totalUsedUSD==null?'—':fmtCost(totalUsedUSD),'#fbbf24'],
-    ['范围消耗',fmtCost(s.cost_usd),'#e2e8f0'],
+    ['范围消费',fmtCost(s.cost_usd),'#e2e8f0'],
     ['余额合计',balanceUSD==null?'—':fmtCost(balanceUSD),'#34d399'],
     ['成员数',fmtNum(members),'#6366f1'],
   ]:[
     ['总请求',fmtNum(s.requests),'#6366f1'],
     ['总 Tokens',`<span title="${fmtNum(s.tokens)} tokens">${fmtCompact(s.tokens)}</span>`,'#6366f1'],
     ['累计总消耗',totalUsedUSD==null?'—':fmtCost(totalUsedUSD),'#fbbf24'],
-    ['范围消耗',fmtCost(s.cost_usd),'#e2e8f0'],
+    ['范围消费',fmtCost(s.cost_usd),'#e2e8f0'],
     ['余额',balanceUSD==null?'—':fmtCost(balanceUSD),'#34d399'],
   ];
   document.getElementById('usageDetailSummary').innerHTML=cards.map(([l,v,col,cls])=>`<div class="stat-card${cls?' '+cls:''}"><div class="stat-label">${l}</div><div class="stat-value num" style="color:${col}">${v}</div></div>`).join('');
@@ -2076,7 +2109,7 @@ function renderUsage(st,balanceUSD,members,totalUsedUSD,byToken,tokenMeta){
   if(isGrp){dailyTbl.style.display='none';}
   else{
     dailyTbl.style.display='';
-    document.getElementById('thUsageDaily').innerHTML='<tr><th>日期</th><th class="right">请求</th><th class="right">输入 tokens</th><th class="right">输出 tokens</th><th class="right">合计 tokens</th><th class="right">费用</th></tr>';
+    document.getElementById('thUsageDaily').innerHTML='<tr><th>日期</th><th class="right">请求</th><th class="right">输入 tokens</th><th class="right">输出 tokens</th><th class="right">合计 tokens</th><th class="right">消费</th></tr>';
     document.getElementById('tbUsageDaily').innerHTML=daily.length?daily.map(d=>`<tr>
       <td>${esc(d.date)}</td><td class="right num">${fmtNum(d.requests)}</td>
       <td class="right num">${fmtNum(d.prompt_tokens)}</td><td class="right num">${fmtNum(d.completion_tokens)}</td>
@@ -2088,25 +2121,21 @@ function renderUsage(st,balanceUSD,members,totalUsedUSD,byToken,tokenMeta){
   {
     const byModel=(st.by_model||[]).filter(r=>+r.cost_usd>0);
     const dailyByModel=st.daily_by_model||[];
-    const byDateModel={};dailyByModel.forEach(r=>{(byDateModel[r.date]||(byDateModel[r.date]={}))[r.model||'—']=r;});
+    const OTHER_MODEL='__other_models__';
+    const byDateModel={};dailyByModel.forEach(r=>{(byDateModel[r.date]||(byDateModel[r.date]={}))[r.other?OTHER_MODEL:(r.model||'—')]=r;});
     const topNames=byModel.slice(0,DAILY_STACK_TOP).map(r=>r.key||'—');
-    const restNames=new Set(byModel.slice(DAILY_STACK_TOP).map(r=>r.key||'—'));
-    const modelNames=restNames.size?[...topNames,'其他']:topNames;
-    const costSeries=modelNames.map((name,i)=>({
-      name,type:'bar',stack:'d',barWidth:'38%',barCategoryGap:'32%',
-      itemStyle:{color:name==='其他'?'#475569':DK_PALETTE[i%DK_PALETTE.length],borderRadius:i===modelNames.length-1?[4,4,0,0]:0},
+    const modelKeys=dailyByModel.some(r=>r.other&&+r.cost_usd>0)?[...topNames,OTHER_MODEL]:topNames;
+    const costSeries=modelKeys.map((key,i)=>({
+      name:key===OTHER_MODEL?'其他模型':key,type:'bar',stack:'d',barWidth:'38%',barCategoryGap:'32%',
+      itemStyle:{color:key===OTHER_MODEL?'#475569':DK_PALETTE[i%DK_PALETTE.length],borderRadius:i===modelKeys.length-1?[4,4,0,0]:0},
       data:daily.map(d=>{
         const m=byDateModel[d.date]||{};
-        if(name==='其他'){
-          let cost=0,tok=0;restNames.forEach(n=>{const r=m[n];if(r){cost+=+r.cost_usd||0;tok+=+r.tokens||0;}});
-          return {value:+cost.toFixed(4),tokens:tok};
-        }
-        const r=m[name];
+        const r=m[key];
         return {value:r?+(+r.cost_usd).toFixed(4):0,tokens:r?r.tokens:0};
       })
     }));
     usageDailyChart.setOption({
-      grid:{left:54,right:54,top:modelNames.length>1?52:32,bottom:28},
+      grid:{left:54,right:54,top:modelKeys.length>1?52:32,bottom:28},
       tooltip:{trigger:'axis',backgroundColor:'#1a1d27',borderColor:'#2a2d3e',textStyle:{color:'#e2e8f0'},formatter:params=>{
         const lines=params.filter(p=>p.seriesType==='bar'?+p.value>0:true).map(p=>{
           if(p.seriesType!=='bar')return `${esc(p.seriesName)}: ${fmtNum(p.value)}`;
@@ -2118,7 +2147,7 @@ function renderUsage(st,balanceUSD,members,totalUsedUSD,byToken,tokenMeta){
         const footer=barParams.length>1?`<br/><b>总计: $${total.toFixed(4)}${totalTok?' ('+fmtNum(totalTok)+' tokens)':''}</b>`:'';
         return `${(params[0]&&params[0].axisValueLabel)||''}<br/>${lines.join('<br/>')||'无消耗'}${footer}`;
       }},
-      legend:{data:[...modelNames,'请求数'],textStyle:{color:'#94a3b8',fontSize:12},left:'center',top:6,itemGap:16,itemWidth:20,itemHeight:12},
+      legend:{data:[...modelKeys.map(k=>k===OTHER_MODEL?'其他模型':k),'请求数'],textStyle:{color:'#94a3b8',fontSize:12},left:'center',top:6,itemGap:16,itemWidth:20,itemHeight:12},
       xAxis:{type:'category',data:daily.map(d=>d.date.slice(5)),axisLabel:{color:'#94a3b8',fontSize:11},axisLine:{lineStyle:{color:'#2a2d3e'}}},
       yAxis:[
         {type:'value',splitNumber:5,axisLabel:{color:'#94a3b8',fontSize:11,formatter:'${value}'},splitLine:{lineStyle:{color:'#2a2d3e'}}},
@@ -2131,8 +2160,8 @@ function renderUsage(st,balanceUSD,members,totalUsedUSD,byToken,tokenMeta){
     },true);
   }
   setTimeout(()=>usageDailyChart.resize(),60);
-  renderUsageDim('thUsageGrp','tbUsageGrp',st.by_group);
-  renderUsageDim('thUsageModel','tbUsageModel',st.by_model);
+  renderUsageDim('thUsageGrp','tbUsageGrp',st.by_group,st.by_group_truncated);
+  renderUsageDim('thUsageModel','tbUsageModel',st.by_model,st.by_model_truncated);
   renderUsagePie('usageGrpPie',st.by_group,isGrp); // 按分组环形:仅组织详情(客户页成员明细无此环形)
   renderUsagePie('usageModelPie',st.by_model,true); // 按模型环形:组织+用户详情都有(对齐客户页)
   renderUsageTokens(byToken);

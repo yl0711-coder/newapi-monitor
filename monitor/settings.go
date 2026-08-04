@@ -23,6 +23,14 @@ type Settings struct {
 	// 客户端「用量报表」独立监听(portal.go):客户域名只指这个端口,上面不存在任何管理端路由。
 	// 留空 = 关闭(默认);如 ":8092"。
 	PortalAddr string // MONITOR_PORTAL_ADDR
+
+	// 客户端用量聚合结果的可选 Redis 缓存。留空地址时完全不连接 Redis，
+	// 自动退化为有严格容量上限的进程内短缓存；Redis 不参与鉴权，也不保存原始日志。
+	UsageRedisAddr     string // MONITOR_USAGE_REDIS_ADDR，如 172.26.4.11:6379
+	UsageRedisUsername string // MONITOR_USAGE_REDIS_USERNAME，生产建议使用仅限 nxmon:* 的 ACL 用户
+	UsageRedisPassword string // MONITOR_USAGE_REDIS_PASSWORD，只从环境变量读取
+	UsageRedisDB       int    // MONITOR_USAGE_REDIS_DB，默认 0；权限隔离仍以 ACL/key prefix 为准
+	UsageRedisPrefix   string // MONITOR_USAGE_REDIS_PREFIX，默认 nxmon:usage:v1
 	// 仅信任这些反代来源提供的 X-Forwarded-For/X-Real-IP。留空时不信任任何转发头，
 	// 登录限流按直连地址计算，避免外部请求伪造来源 IP 绕过限流。
 	TrustedProxies []string // MONITOR_TRUSTED_PROXIES，逗号分隔 CIDR/IP
@@ -93,20 +101,25 @@ type Settings struct {
 // LoadSettings 从环境变量装载配置(可配合 .env)。
 func LoadSettings() Settings {
 	return Settings{
-		Addr:              env("MONITOR_ADDR", ":8090"),
-		ProdDSN:           env("NEWAPI_LOG_DSN", ""),
-		StorePath:         env("MONITOR_STORE_PATH", "monitor.db"),
-		SampleSeconds:     envInt("MONITOR_SAMPLE_SECONDS", 60),
-		RetentionDays:     envInt("MONITOR_RETENTION_DAYS", 7),
-		HourRetentionDays: envInt("MONITOR_HOUR_RETENTION_DAYS", 90),
-		BackfillHours:     envInt("MONITOR_BACKFILL_HOURS", 24),
-		NewAPIBaseURL:     env("MONITOR_NEWAPI_BASE_URL", ""),
-		SessionSecret:     env("MONITOR_SESSION_SECRET", ""),
-		PortalAddr:        env("MONITOR_PORTAL_ADDR", ""),
-		TrustedProxies:    envCSV("MONITOR_TRUSTED_PROXIES"),
-		HeartbeatURL:      env("MONITOR_HEARTBEAT_URL", ""),
-		SiteName:          env("MONITOR_SITE_NAME", ""),
-		IngestToken:       env("MONITOR_INGEST_TOKEN", ""),
+		Addr:               env("MONITOR_ADDR", ":8090"),
+		ProdDSN:            env("NEWAPI_LOG_DSN", ""),
+		StorePath:          env("MONITOR_STORE_PATH", "monitor.db"),
+		SampleSeconds:      envInt("MONITOR_SAMPLE_SECONDS", 60),
+		RetentionDays:      envInt("MONITOR_RETENTION_DAYS", 7),
+		HourRetentionDays:  envInt("MONITOR_HOUR_RETENTION_DAYS", 90),
+		BackfillHours:      envInt("MONITOR_BACKFILL_HOURS", 24),
+		NewAPIBaseURL:      env("MONITOR_NEWAPI_BASE_URL", ""),
+		SessionSecret:      env("MONITOR_SESSION_SECRET", ""),
+		PortalAddr:         env("MONITOR_PORTAL_ADDR", ""),
+		UsageRedisAddr:     strings.TrimSpace(env("MONITOR_USAGE_REDIS_ADDR", "")),
+		UsageRedisUsername: strings.TrimSpace(env("MONITOR_USAGE_REDIS_USERNAME", "")),
+		UsageRedisPassword: env("MONITOR_USAGE_REDIS_PASSWORD", ""),
+		UsageRedisDB:       envInt("MONITOR_USAGE_REDIS_DB", 0),
+		UsageRedisPrefix:   strings.Trim(strings.TrimSpace(env("MONITOR_USAGE_REDIS_PREFIX", "nxmon:usage:v1")), ":"),
+		TrustedProxies:     envCSV("MONITOR_TRUSTED_PROXIES"),
+		HeartbeatURL:       env("MONITOR_HEARTBEAT_URL", ""),
+		SiteName:           env("MONITOR_SITE_NAME", ""),
+		IngestToken:        env("MONITOR_INGEST_TOKEN", ""),
 
 		InfraEnabled:          env("MONITOR_INFRA_ENABLED", "") == "true",
 		AWSRegion:             env("AWS_REGION", "us-west-2"),

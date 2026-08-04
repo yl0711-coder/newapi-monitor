@@ -23,6 +23,11 @@ services:
       # 可选:
       # - MONITOR_HOUR_RETENTION_DAYS=90   # 小时级汇总留存(长期趋势/同比环比)
       # - MONITOR_HEARTBEAT_URL=           # dead-man 心跳(如 healthchecks.io)
+      # - MONITOR_USAGE_REDIS_ADDR=172.26.4.11:6379  # 只使用 Redis 私网地址；留空自动降级
+      # - MONITOR_USAGE_REDIS_USERNAME=monitor       # 建议 ACL 仅允许 nxmon:* 和 GET/SET/DEL/PING
+      # - MONITOR_USAGE_REDIS_PASSWORD=${MONITOR_USAGE_REDIS_PASSWORD:-}
+      # - MONITOR_USAGE_REDIS_DB=0
+      # - MONITOR_USAGE_REDIS_PREFIX=nxmon:usage:v1
       - MONITOR_SITE_NAME=NexusAPI         # 对外状态看板站点名
       - TZ=Asia/Shanghai
     volumes:

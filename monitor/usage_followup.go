@@ -131,13 +131,30 @@ func (m *Monitor) computeFollowUps(ctx context.Context, nowUnix int64) ([]Follow
 
 	allIDs := idsOf(tracked)
 	tracked, balances, _ := m.refreshTrackedLabels(ctx, tracked) // 跟进判断不用累计总消耗,忽略第三返回
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 
 	// 固定 30 天窗口(不受页面显示范围影响),按 CST 切日
 	toTs := followUpDayStart(nowUnix+usageTZOffsetSec) + 86400
 	fromTs := toTs - int64(followUpWindowDays)*86400
 	mx := &UsageMatrix{}
 	if len(allIDs) > 0 {
-		if mx, err = m.computeUsageMatrix(ctx, allIDs, fromTs, toTs); err != nil {
+		err = m.loadUsageAggregateJSON(
+			ctx,
+			adminUsageAggregateKey("matrix", portalMemberFingerprint(tracked), 0, 0, fromTs, toTs),
+			usageAggregateTTL(toTs, time.Unix(nowUnix, 0)),
+			false,
+			mx,
+			func() (any, error) {
+				result, err := m.computeUsageMatrix(ctx, allIDs, fromTs, toTs)
+				if result != nil {
+					result.Users = nil
+				}
+				return result, err
+			},
+		)
+		if err != nil {
 			return nil, err
 		}
 	}
@@ -157,7 +174,8 @@ func (m *Monitor) computeFollowUps(ctx context.Context, nowUnix int64) ([]Follow
 		if spendByUserDay[c.UserID] == nil {
 			spendByUserDay[c.UserID] = map[int]float64{}
 		}
-		spendByUserDay[c.UserID][di] += c.CostUSD
+		// 跟进规则继续使用消费毛额，退款/净额展示能力不能悄悄改变既有客户活跃判断。
+		spendByUserDay[c.UserID][di] += float64(c.ConsumeQuota) / quotaPerUSD
 	}
 
 	st := m.loadUsageSettings()
@@ -196,7 +214,7 @@ func (m *Monitor) computeFollowUps(ctx context.Context, nowUnix int64) ([]Follow
 		}
 		var balance *float64
 		if b, ok := balances[u.UserID]; ok {
-			bv := b
+			bv := float64(b) / quotaPerUSD
 			balance = &bv
 		}
 		mem, need := classifyMember(u, stage, spendByUserDay[u.UserID], balance, lastFollow[u.UserID], dateOfIdx, st)
@@ -280,6 +298,9 @@ func (m *Monitor) serveFollowUps(c *gin.Context) {
 	}
 	items, err := m.computeFollowUps(c.Request.Context(), time.Now().Unix())
 	if err != nil {
+		if abortCanceledUsageRequest(c, err) {
+			return
+		}
 		slog.Warn("待跟进计算失败", "err", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "待跟进查询失败,请稍后重试"})
 		return

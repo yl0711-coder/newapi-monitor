@@ -45,6 +45,11 @@ Open `http://<host>:8090` and log in with a new-api admin account. See [`docker-
 | `MONITOR_SESSION_SECRET` | Session signing key (`openssl rand -hex 32`) | random if empty |
 | `MONITOR_ADDR` | Listen address | `:8090` |
 | `MONITOR_PORTAL_ADDR` | Dedicated client usage-portal listener; empty disables it | empty |
+| `MONITOR_USAGE_REDIS_ADDR` | Private Redis address for usage aggregates; empty uses the bounded local fallback only | empty |
+| `MONITOR_USAGE_REDIS_USERNAME` | Redis ACL user; production should restrict it to `nxmon:*` | empty |
+| `MONITOR_USAGE_REDIS_PASSWORD` | Redis password, injected through the environment only | empty |
+| `MONITOR_USAGE_REDIS_DB` | Redis DB number; ACL and key prefix remain the security boundary | `0` |
+| `MONITOR_USAGE_REDIS_PREFIX` | Usage-cache key prefix | `nxmon:usage:v1` |
 | `MONITOR_TRUSTED_PROXIES` | Comma-separated trusted proxy IPs/CIDRs allowed to supply the client IP; empty trusts no forwarding headers | empty |
 | `MONITOR_STORE_PATH` | Local sampling DB path | `/data/monitor.db` |
 | `MONITOR_SAMPLE_SECONDS` | Sampling interval (seconds) | `60` |
@@ -115,6 +120,8 @@ usage.example.com {
 
 Do not publish ports `8090` or `8091` directly. A super admin provisions each group account from Usage management.
 If Caddy/Nginx runs on another host or in another container network, add its actual IP/CIDR to `MONITOR_TRUSTED_PROXIES`; otherwise login limiting uses the proxy address.
+
+Optional Redis stores only reproducible matrix, daily/group/model, and per-token log aggregates. Ranges containing today use a 60-second TTL; closed historical ranges use a 10-minute TTL. Reselecting dates in the admin view forces a fresh aggregation. Usernames, emails, current balances, current token metadata, sessions, raw logs, and CSV data are never written to Redis. Redis failures fall back to a bounded local cache (128 entries, 16 MiB, at most 60 seconds), whose expiry never exceeds the remote record's remaining TTL. A failed remote operation opens a 30-second backoff window so steady-state fallback does not query the source more frequently than the previous 60-second local cache. Redis is an optimization, not a correctness dependency; production must use a private endpoint and a prefix-scoped ACL user.
 
 ## Security
 - The image contains **no secrets**; DSN, session key and SMTP credentials are injected via environment variables.

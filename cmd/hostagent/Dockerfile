@@ -16,7 +16,8 @@ RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /app/hostage
 
 # ---- 运行阶段(最小镜像)----
 FROM alpine:3.23
-RUN apk add --no-cache ca-certificates tzdata \
+RUN apk upgrade --no-cache \
+    && apk add --no-cache ca-certificates tzdata \
     && adduser -D -u 1000 app
 COPY --from=builder /app/hostagent /usr/local/bin/hostagent
 ENV TZ=Asia/Shanghai \

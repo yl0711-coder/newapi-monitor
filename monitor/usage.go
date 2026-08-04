@@ -3,14 +3,16 @@ package monitor
 // usage.go:「用户用量」——盯一组指定的 new-api 用户(按邮箱 / 用户ID 添加),
 // 按需对生产库 logs 表做窗口化聚合:消费矩阵(用户×日)与单用户详情(每日/分组/模型),费用=quota/500000 美元。
 //
-// 与采样器的边界:采样器是【常驻周期】查询,这里是【按需】查询——只在打开页面 / 点查询时执行,
-// 全部限定时间范围并命中索引(idx_logs_user_id / idx_created_at_type / idx_logs_group / idx_logs_model_name),
-// 且同一时刻只放行一条聚合(usageMu 串行化),不给生产库常驻负担。生产库全程只读。
+// 与采样器的边界:采样器是【常驻周期】查询,这里是【按需】查询——只在打开页面 / 重选日期时执行。
+// 可重新计算的聚合结果会进入有界缓存，余额/用户资料/原始日志始终实时读取。源查询全部限定时间范围，
+// 并由可取消的单槽闸门控制同一时刻最多一条重查询；具体索引利用情况需以
+// 生产库 EXPLAIN 为准，不能仅因 WHERE 中存在索引列就假定一定命中。生产库全程只读。
 // 名单存本地 sqlite(tracked_users);鉴权沿用全站约定:管理员可看,仅超管可改名单。
 
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -31,6 +33,47 @@ const (
 
 var usageCST = time.FixedZone("CST", usageTZOffsetSec)
 
+const statusClientClosedRequest = 499 // Nginx 约定：客户端主动断开；用于访问日志区分真实服务端 5xx
+
+// acquireUsageGate 等待生产库重查询槽位。与 sync.Mutex 不同，排队中的请求会响应
+// request context 取消/超时，避免用户快速切换筛选后旧请求仍依次进入数据库。
+func (m *Monitor) acquireUsageGate(ctx context.Context) error {
+	// ctx 已经结束时不能让 select 在“空闲槽位”和 Done 同时就绪时随机取得槽位。
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	m.usageGateOnce.Do(func() { m.usageGate = make(chan struct{}, 1) })
+	select {
+	case m.usageGate <- struct{}{}:
+		// 取消可能与取得槽位同时发生；再次确认并归还自己刚取得的槽位，
+		// 不能让已取消请求进入 SQL，也不能误释放其他请求持有的槽位。
+		if err := ctx.Err(); err != nil {
+			<-m.usageGate
+			return err
+		}
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (m *Monitor) releaseUsageGate() { <-m.usageGate }
+
+func isCanceledUsageRequest(c *gin.Context, err error) bool {
+	return errors.Is(err, context.Canceled) || errors.Is(c.Request.Context().Err(), context.Canceled)
+}
+
+// abortCanceledUsageRequest 把浏览器主动取消与真正的服务端故障分开。
+// 内部查询超时仍返回 false，由调用方按真实错误记录和响应。
+func abortCanceledUsageRequest(c *gin.Context, err error) bool {
+	if !isCanceledUsageRequest(c, err) {
+		return false
+	}
+	c.Status(statusClientClosedRequest)
+	c.Writer.WriteHeaderNow()
+	return true
+}
+
 // usageDayExprMySQL 把 created_at(unix 秒)折算成 CST 日序号(自 epoch 起第几天)。
 // MySQL 整除用 DIV;测试里(sqlite)用 usageDayExpr 字段覆盖为 '/'(sqlite 整型相除即整除)。
 const usageDayExprMySQL = "(created_at + 28800) DIV 86400"
@@ -45,42 +88,71 @@ func (m *Monitor) dayExpr() string {
 	return usageDayExprMySQL
 }
 
+// UsageBilling 是所有用量聚合共用的计费口径。
+// CostUSD 保留原接口语义，始终表示消费毛额；退款与净消费分别显式返回，避免旧前端被静默改义。
+// 聚合、排序和相加全部使用整数 quota，美元只作为最终展示值，避免浮点累计误差。
+type UsageBilling struct {
+	Requests      int64   `json:"requests"`       // 消费请求数(type=2)，保持现有请求数口径
+	RefundRecords int64   `json:"refund_records"` // 退款日志数(type=6)，不混入请求数
+	ConsumeQuota  int64   `json:"consume_quota"`
+	RefundQuota   int64   `json:"refund_quota"`
+	NetQuota      int64   `json:"net_quota"`
+	CostUSD       float64 `json:"cost_usd"` // 兼容字段：消费毛额
+	RefundUSD     float64 `json:"refund_usd"`
+	NetUSD        float64 `json:"net_usd"`
+}
+
+func (b *UsageBilling) finalize() {
+	b.NetQuota = b.ConsumeQuota - b.RefundQuota
+	b.CostUSD = float64(b.ConsumeQuota) / quotaPerUSD
+	b.RefundUSD = float64(b.RefundQuota) / quotaPerUSD
+	b.NetUSD = float64(b.NetQuota) / quotaPerUSD
+}
+
+func (b *UsageBilling) add(other UsageBilling) {
+	b.Requests += other.Requests
+	b.RefundRecords += other.RefundRecords
+	b.ConsumeQuota += other.ConsumeQuota
+	b.RefundQuota += other.RefundQuota
+	b.finalize()
+}
+
 // UsageDaily 某 CST 自然日的合计。
 type UsageDaily struct {
-	Date             string  `json:"date"`
-	Requests         int64   `json:"requests"`
-	PromptTokens     int64   `json:"prompt_tokens"`
-	CompletionTokens int64   `json:"completion_tokens"`
-	Tokens           int64   `json:"tokens"`
-	CostUSD          float64 `json:"cost_usd"`
+	UsageBilling
+	Date             string `json:"date"`
+	PromptTokens     int64  `json:"prompt_tokens"`
+	CompletionTokens int64  `json:"completion_tokens"`
+	Tokens           int64  `json:"tokens"`
 }
 
 // UsageDailyModel 某 CST 自然日、某模型的合计(供每日消耗按模型堆叠展示用)。
 type UsageDailyModel struct {
-	Date     string  `json:"date"`
-	Model    string  `json:"model"`
-	Requests int64   `json:"requests"`
-	Tokens   int64   `json:"tokens"`
-	CostUSD  float64 `json:"cost_usd"`
+	UsageBilling
+	Date   string `json:"date"`
+	Model  string `json:"model"`
+	Other  bool   `json:"other,omitempty"` // true=非 Top 模型的完整归并桶，不是名为“其他”的真实模型
+	Tokens int64  `json:"tokens"`
 }
 
 // UsageDim 某维度取值(分组 / 模型 / 用户)的合计。
 type UsageDim struct {
-	Key      string  `json:"key"`
-	Requests int64   `json:"requests"`
-	Tokens   int64   `json:"tokens"`
-	CostUSD  float64 `json:"cost_usd"`
+	UsageBilling
+	Key    string `json:"key"`
+	Tokens int64  `json:"tokens"`
 }
 
 // UsageStats 一次用户用量查询的完整结果(详情页专用:单用户的每日/分组/模型)。
 type UsageStats struct {
-	From         string            `json:"from"`
-	To           string            `json:"to"`
-	Summary      UsageDim          `json:"summary"`
-	Daily        []UsageDaily      `json:"daily"`
-	DailyByModel []UsageDailyModel `json:"daily_by_model"`
-	ByGroup      []UsageDim        `json:"by_group"`
-	ByModel      []UsageDim        `json:"by_model"`
+	From             string            `json:"from"`
+	To               string            `json:"to"`
+	Summary          UsageDim          `json:"summary"`
+	Daily            []UsageDaily      `json:"daily"`
+	DailyByModel     []UsageDailyModel `json:"daily_by_model"`
+	ByGroup          []UsageDim        `json:"by_group"`
+	ByModel          []UsageDim        `json:"by_model"`
+	ByGroupTruncated bool              `json:"by_group_truncated"`
+	ByModelTruncated bool              `json:"by_model_truncated"`
 }
 
 // usageIn 生成 "<col> IN (?,?,…)" 片段与参数(ids 已由调用方保证非空;col 只传代码内常量,勿传用户输入)。
@@ -94,20 +166,22 @@ func usageIn(col string, ids []int64) (string, []any) {
 	return col + " IN (" + strings.Join(ph, ",") + ")", args
 }
 
-// computeUsageStats 对 [fromTs, toTs) 内、指定用户集合的消费日志(type=2)做三路聚合(每日/分组/模型)。
+// computeUsageStats 对 [fromTs, toTs) 内、指定用户集合的消费与退款日志(type=2/6)做三路聚合。
 // tokenID>0 时再按令牌过滤(单用户详情下钻单令牌;与 user_id 双条件,隔离不依赖 token 归属校验)。
-// 串行化(usageMu):同一时刻最多一条聚合在生产库上跑,叠加连接池上限双保险。
+// 串行化(usageGate):同一时刻最多一条聚合在生产库上跑，等待也计入 20 秒总时限。
 func (m *Monitor) computeUsageStats(ctx context.Context, ids []int64, fromTs, toTs, tokenID int64) (*UsageStats, error) {
 	if len(ids) == 0 {
 		return &UsageStats{}, nil // 名单为空不该走到这;防御:不拼 "IN ()" 非法 SQL
 	}
-	m.usageMu.Lock()
-	defer m.usageMu.Unlock()
 	cctx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
+	if err := m.acquireUsageGate(cctx); err != nil {
+		return nil, fmt.Errorf("等待用量查询槽位失败: %w", err)
+	}
+	defer m.releaseUsageGate()
 
 	inSQL, inArgs := usageIn("user_id", ids)
-	where := "type = 2 AND created_at >= ? AND created_at < ? AND " + inSQL
+	where := "type IN (2,6) AND created_at >= ? AND created_at < ? AND " + inSQL
 	args := append([]any{fromTs, toTs}, inArgs...)
 	if tokenID > 0 {
 		where += " AND token_id = ?"
@@ -120,24 +194,28 @@ func (m *Monitor) computeUsageStats(ctx context.Context, ids []int64, fromTs, to
 	}
 
 	// 1) 每日:日桶 = CST 日序号,回来再折成日期文本。
-	dailyQ := "SELECT " + m.dayExpr() + " AS day_idx, COUNT(*)," +
-		" CAST(COALESCE(SUM(prompt_tokens),0) AS SIGNED), CAST(COALESCE(SUM(completion_tokens),0) AS SIGNED)," +
-		" CAST(COALESCE(SUM(quota),0) AS SIGNED)" +
+	dailyQ := "SELECT " + m.dayExpr() + " AS day_idx," +
+		" CAST(COALESCE(SUM(CASE WHEN type=2 THEN 1 ELSE 0 END),0) AS SIGNED)," +
+		" CAST(COALESCE(SUM(CASE WHEN type=6 THEN 1 ELSE 0 END),0) AS SIGNED)," +
+		" CAST(COALESCE(SUM(CASE WHEN type=2 THEN COALESCE(prompt_tokens,0) ELSE 0 END),0) AS SIGNED)," +
+		" CAST(COALESCE(SUM(CASE WHEN type=2 THEN COALESCE(completion_tokens,0) ELSE 0 END),0) AS SIGNED)," +
+		" CAST(COALESCE(SUM(CASE WHEN type=2 THEN COALESCE(quota,0) ELSE 0 END),0) AS SIGNED)," +
+		" CAST(COALESCE(SUM(CASE WHEN type=6 THEN COALESCE(quota,0) ELSE 0 END),0) AS SIGNED)" +
 		" FROM logs WHERE " + where + " GROUP BY day_idx ORDER BY day_idx"
 	rows, err := m.prodDB.QueryContext(cctx, dailyQ, args...)
 	if err != nil {
 		return nil, fmt.Errorf("按日聚合失败: %w", err)
 	}
 	for rows.Next() {
-		var dayIdx, quota int64
+		var dayIdx int64
 		var d UsageDaily
-		if err := rows.Scan(&dayIdx, &d.Requests, &d.PromptTokens, &d.CompletionTokens, &quota); err != nil {
+		if err := rows.Scan(&dayIdx, &d.Requests, &d.RefundRecords, &d.PromptTokens, &d.CompletionTokens, &d.ConsumeQuota, &d.RefundQuota); err != nil {
 			rows.Close()
 			return nil, err
 		}
 		d.Date = time.Unix(dayIdx*86400-usageTZOffsetSec, 0).In(usageCST).Format("2006-01-02")
 		d.Tokens = d.PromptTokens + d.CompletionTokens
-		d.CostUSD = float64(quota) / quotaPerUSD
+		d.finalize()
 		st.Daily = append(st.Daily, d)
 	}
 	rows.Close()
@@ -146,69 +224,105 @@ func (m *Monitor) computeUsageStats(ctx context.Context, ids []int64, fromTs, to
 	}
 	for _, d := range st.Daily { // 汇总卡直接由日聚合累加,不再多查一遍
 		st.Summary.Requests += d.Requests
+		st.Summary.RefundRecords += d.RefundRecords
 		st.Summary.Tokens += d.Tokens
-		st.Summary.CostUSD += d.CostUSD
+		st.Summary.ConsumeQuota += d.ConsumeQuota
+		st.Summary.RefundQuota += d.RefundQuota
 	}
-
-	// 1b) 按日×模型:供「每日消耗」图按模型堆叠展示;LIMIT 是防御性上限(90天×50模型/天),
-	// 正常场景远远够用,前端再按 by_model 排序做 top-N + 其他归并。
-	dailyModelQ := "SELECT " + m.dayExpr() + " AS day_idx, COALESCE(model_name,''), COUNT(*)," +
-		" CAST(COALESCE(SUM(prompt_tokens+completion_tokens),0) AS SIGNED)," +
-		" CAST(COALESCE(SUM(quota),0) AS SIGNED)" +
-		" FROM logs WHERE " + where + " GROUP BY day_idx, model_name ORDER BY day_idx" +
-		" LIMIT " + strconv.Itoa(maxUsageDays*50)
-	dmRows, err := m.prodDB.QueryContext(cctx, dailyModelQ, args...)
-	if err != nil {
-		return nil, fmt.Errorf("按日按模型聚合失败: %w", err)
-	}
-	for dmRows.Next() {
-		var dayIdx, quota int64
-		var dm UsageDailyModel
-		if err := dmRows.Scan(&dayIdx, &dm.Model, &dm.Requests, &dm.Tokens, &quota); err != nil {
-			dmRows.Close()
-			return nil, err
-		}
-		dm.Date = time.Unix(dayIdx*86400-usageTZOffsetSec, 0).In(usageCST).Format("2006-01-02")
-		dm.CostUSD = float64(quota) / quotaPerUSD
-		st.DailyByModel = append(st.DailyByModel, dm)
-	}
-	dmRows.Close()
-	if err := dmRows.Err(); err != nil {
-		return nil, err
-	}
+	st.Summary.finalize()
 
 	// 2/3) 按分组 / 模型。列名 group 是保留字,必须反引号。
 	// (曾有第三路 GROUP BY user_id:前端改成矩阵+单用户详情后无人消费,纯耗生产库,已删。)
 	dims := []struct {
-		col  string
-		dst  *[]UsageDim
-		desc string
+		col       string
+		dst       *[]UsageDim
+		truncated *bool
+		desc      string
 	}{
-		{"COALESCE(`group`,'')", &st.ByGroup, "按分组"},
-		{"COALESCE(model_name,'')", &st.ByModel, "按模型"},
+		{"COALESCE(`group`,'')", &st.ByGroup, &st.ByGroupTruncated, "按分组"},
+		{"COALESCE(model_name,'')", &st.ByModel, &st.ByModelTruncated, "按模型"},
 	}
 	for _, dim := range dims {
-		q := "SELECT " + dim.col + " AS k, COUNT(*)," +
-			" CAST(COALESCE(SUM(prompt_tokens+completion_tokens),0) AS SIGNED)," +
-			" CAST(COALESCE(SUM(quota),0) AS SIGNED)" +
+		q := "SELECT " + dim.col + " AS k," +
+			" CAST(COALESCE(SUM(CASE WHEN type=2 THEN 1 ELSE 0 END),0) AS SIGNED)," +
+			" CAST(COALESCE(SUM(CASE WHEN type=6 THEN 1 ELSE 0 END),0) AS SIGNED)," +
+			" CAST(COALESCE(SUM(CASE WHEN type=2 THEN COALESCE(prompt_tokens,0)+COALESCE(completion_tokens,0) ELSE 0 END),0) AS SIGNED)," +
+			" CAST(COALESCE(SUM(CASE WHEN type=2 THEN COALESCE(quota,0) ELSE 0 END),0) AS SIGNED)," +
+			" CAST(COALESCE(SUM(CASE WHEN type=6 THEN COALESCE(quota,0) ELSE 0 END),0) AS SIGNED)" +
 			" FROM logs WHERE " + where +
-			" GROUP BY k ORDER BY SUM(quota) DESC LIMIT " + strconv.Itoa(maxUsageDimRows)
+			" GROUP BY k ORDER BY SUM(CASE WHEN type=2 THEN COALESCE(quota,0) ELSE 0 END) DESC, k" +
+			" LIMIT " + strconv.Itoa(maxUsageDimRows+1)
 		rows, err := m.prodDB.QueryContext(cctx, q, args...)
 		if err != nil {
 			return nil, fmt.Errorf("%s聚合失败: %w", dim.desc, err)
 		}
 		for rows.Next() {
 			var r UsageDim
-			var quota int64
-			if err := rows.Scan(&r.Key, &r.Requests, &r.Tokens, &quota); err != nil {
+			if err := rows.Scan(&r.Key, &r.Requests, &r.RefundRecords, &r.Tokens, &r.ConsumeQuota, &r.RefundQuota); err != nil {
 				rows.Close()
 				return nil, err
 			}
-			r.CostUSD = float64(quota) / quotaPerUSD
+			r.finalize()
 			*dim.dst = append(*dim.dst, r)
 		}
 		rows.Close()
 		if err := rows.Err(); err != nil {
+			return nil, err
+		}
+		if len(*dim.dst) > maxUsageDimRows {
+			*dim.truncated = true
+			*dim.dst = (*dim.dst)[:maxUsageDimRows]
+		}
+	}
+
+	// 1b) 按日×模型。先由完整区间模型排名确定 Top 6，其余模型在 SQL 内归并为单一“其他”桶。
+	// 因此返回行数天然不超过 天数×7，不再用固定 LIMIT 截掉某些日期/模型而让趋势少算。
+	const topDailyModels = 6
+	const otherModelSentinel = "__newapi_monitor_other_models__"
+	topModels := make([]string, 0, topDailyModels)
+	for _, r := range st.ByModel {
+		if len(topModels) == topDailyModels {
+			break
+		}
+		topModels = append(topModels, r.Key)
+	}
+	if len(topModels) > 0 {
+		ph := make([]string, len(topModels))
+		dmArgs := make([]any, 0, len(topModels)+len(args))
+		for i, model := range topModels {
+			ph[i] = "?"
+			dmArgs = append(dmArgs, model)
+		}
+		dmArgs = append(dmArgs, args...)
+		modelExpr := "CASE WHEN COALESCE(model_name,'') IN (" + strings.Join(ph, ",") + ")" +
+			" THEN COALESCE(model_name,'') ELSE '" + otherModelSentinel + "' END"
+		dailyModelQ := "SELECT " + m.dayExpr() + " AS day_idx, " + modelExpr + " AS model_bucket," +
+			" CAST(COALESCE(SUM(CASE WHEN type=2 THEN 1 ELSE 0 END),0) AS SIGNED)," +
+			" CAST(COALESCE(SUM(CASE WHEN type=6 THEN 1 ELSE 0 END),0) AS SIGNED)," +
+			" CAST(COALESCE(SUM(CASE WHEN type=2 THEN COALESCE(prompt_tokens,0)+COALESCE(completion_tokens,0) ELSE 0 END),0) AS SIGNED)," +
+			" CAST(COALESCE(SUM(CASE WHEN type=2 THEN COALESCE(quota,0) ELSE 0 END),0) AS SIGNED)," +
+			" CAST(COALESCE(SUM(CASE WHEN type=6 THEN COALESCE(quota,0) ELSE 0 END),0) AS SIGNED)" +
+			" FROM logs WHERE " + where + " GROUP BY day_idx, model_bucket ORDER BY day_idx, model_bucket"
+		dmRows, err := m.prodDB.QueryContext(cctx, dailyModelQ, dmArgs...)
+		if err != nil {
+			return nil, fmt.Errorf("按日按模型聚合失败: %w", err)
+		}
+		for dmRows.Next() {
+			var dayIdx int64
+			var dm UsageDailyModel
+			if err := dmRows.Scan(&dayIdx, &dm.Model, &dm.Requests, &dm.RefundRecords, &dm.Tokens, &dm.ConsumeQuota, &dm.RefundQuota); err != nil {
+				dmRows.Close()
+				return nil, err
+			}
+			dm.Date = time.Unix(dayIdx*86400-usageTZOffsetSec, 0).In(usageCST).Format("2006-01-02")
+			if dm.Model == otherModelSentinel {
+				dm.Model, dm.Other = "其他", true
+			}
+			dm.finalize()
+			st.DailyByModel = append(st.DailyByModel, dm)
+		}
+		dmRows.Close()
+		if err := dmRows.Err(); err != nil {
 			return nil, err
 		}
 	}
@@ -219,23 +333,29 @@ func (m *Monitor) computeUsageStats(ctx context.Context, ids []int64, fromTs, to
 
 // UsageMatrixUser 矩阵列头(一个被盯用户)+ 区间合计。
 type UsageMatrixUser struct {
-	UserID       int64    `json:"user_id"`
-	Username     string   `json:"username"`
-	Email        string   `json:"email"`
-	GroupID      int64    `json:"group_id"`
-	GroupName    string   `json:"group_name"`
-	Note         string   `json:"note"`
-	TotalUSD     float64  `json:"total_usd"`
-	BalanceUSD   *float64 `json:"balance_usd"`    // 主站当前余额(users.quota 折美元);null=主站已删/取不到
-	TotalUsedUSD *float64 `json:"total_used_usd"` // 主站累计总消耗(users.used_quota 折美元;终身值,不受90天窗口影响);null=已删/取不到
+	UserID         int64    `json:"user_id"`
+	Username       string   `json:"username"`
+	Email          string   `json:"email"`
+	GroupID        int64    `json:"group_id"`
+	GroupName      string   `json:"group_name"`
+	Note           string   `json:"note"`
+	ConsumeQuota   int64    `json:"consume_quota"`
+	RefundQuota    int64    `json:"refund_quota"`
+	NetQuota       int64    `json:"net_quota"`
+	TotalUSD       float64  `json:"total_usd"` // 兼容字段：所选范围消费毛额
+	RefundUSD      float64  `json:"refund_usd"`
+	NetUSD         float64  `json:"net_usd"`
+	BalanceQuota   *int64   `json:"balance_quota"`
+	TotalUsedQuota *int64   `json:"total_used_quota"`
+	BalanceUSD     *float64 `json:"balance_usd"`    // 主站当前余额(users.quota 折美元);null=主站已删/取不到
+	TotalUsedUSD   *float64 `json:"total_used_usd"` // 主站累计总消耗(users.used_quota 折美元;终身值);null=已删/取不到
 }
 
 // UsageMatrixCell 稀疏格:某用户某天的消费(无消费的天不出格)。
 type UsageMatrixCell struct {
-	UserID   int64   `json:"user_id"`
-	Date     string  `json:"date"`
-	Requests int64   `json:"requests"`
-	CostUSD  float64 `json:"cost_usd"`
+	UsageBilling
+	UserID int64  `json:"user_id"`
+	Date   string `json:"date"`
 }
 
 // UsageMatrix 列表页数据:days 连续日期(新→旧)+ 用户(按累计总消耗降序,稳定)+ 稀疏格。
@@ -260,14 +380,20 @@ func (m *Monitor) computeUsageMatrix(ctx context.Context, ids []int64, fromTs, t
 	if len(ids) == 0 {
 		return mx, nil
 	}
-	m.usageMu.Lock()
-	defer m.usageMu.Unlock()
 	cctx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
+	if err := m.acquireUsageGate(cctx); err != nil {
+		return nil, fmt.Errorf("等待用量查询槽位失败: %w", err)
+	}
+	defer m.releaseUsageGate()
 
 	inSQL, inArgs := usageIn("user_id", ids)
-	q := "SELECT user_id, " + m.dayExpr() + " AS day_idx, COUNT(*), CAST(COALESCE(SUM(quota),0) AS SIGNED)" +
-		" FROM logs WHERE type = 2 AND created_at >= ? AND created_at < ? AND " + inSQL +
+	q := "SELECT user_id, " + m.dayExpr() + " AS day_idx," +
+		" CAST(COALESCE(SUM(CASE WHEN type=2 THEN 1 ELSE 0 END),0) AS SIGNED)," +
+		" CAST(COALESCE(SUM(CASE WHEN type=6 THEN 1 ELSE 0 END),0) AS SIGNED)," +
+		" CAST(COALESCE(SUM(CASE WHEN type=2 THEN COALESCE(quota,0) ELSE 0 END),0) AS SIGNED)," +
+		" CAST(COALESCE(SUM(CASE WHEN type=6 THEN COALESCE(quota,0) ELSE 0 END),0) AS SIGNED)" +
+		" FROM logs WHERE type IN (2,6) AND created_at >= ? AND created_at < ? AND " + inSQL +
 		" GROUP BY user_id, day_idx"
 	rows, err := m.prodDB.QueryContext(cctx, q, append([]any{fromTs, toTs}, inArgs...)...)
 	if err != nil {
@@ -275,15 +401,16 @@ func (m *Monitor) computeUsageMatrix(ctx context.Context, ids []int64, fromTs, t
 	}
 	defer rows.Close()
 	for rows.Next() {
-		var uid, dayIdx, reqs, quota int64
-		if err := rows.Scan(&uid, &dayIdx, &reqs, &quota); err != nil {
+		var uid, dayIdx int64
+		var billing UsageBilling
+		if err := rows.Scan(&uid, &dayIdx, &billing.Requests, &billing.RefundRecords, &billing.ConsumeQuota, &billing.RefundQuota); err != nil {
 			return nil, err
 		}
+		billing.finalize()
 		mx.Cells = append(mx.Cells, UsageMatrixCell{
-			UserID:   uid,
-			Date:     time.Unix(dayIdx*86400-usageTZOffsetSec, 0).In(usageCST).Format("2006-01-02"),
-			Requests: reqs,
-			CostUSD:  float64(quota) / quotaPerUSD,
+			UsageBilling: billing,
+			UserID:       uid,
+			Date:         time.Unix(dayIdx*86400-usageTZOffsetSec, 0).In(usageCST).Format("2006-01-02"),
 		})
 	}
 	if err := rows.Err(); err != nil {
@@ -292,55 +419,67 @@ func (m *Monitor) computeUsageMatrix(ctx context.Context, ids []int64, fromTs, t
 	return mx, nil // 用户列(含合计与排序)由 handler 结合名单组装
 }
 
-// parseUsageRange 解析 from/to。旧格式 YYYY-MM-DD 仍按 CST 自然日(含端点)；
-// YYYY-MM-DD HH:MM[:SS] 则是精确时间边界，适合日志页的滚动 25 小时窗口。
-// 空值仍默认近 7 天，保持既有管理端调用兼容。
+// parseUsageRange 只接受 CST 自然日。返回左闭右开区间：
+// [开始日 00:00:00, 结束日次日 00:00:00)，避免 23:59:59/小数秒边界遗漏。
+// 空值默认近 7 个自然日(今天及前 6 天)。
 func parseUsageRange(fromStr, toStr string, now time.Time) (fromTs, toTs int64, err error) {
 	today := now.In(usageCST).Truncate(0)
 	y, mo, d := today.Date()
 	todayStart := time.Date(y, mo, d, 0, 0, 0, 0, usageCST)
 
-	parseBoundary := func(raw string, isEnd bool) (time.Time, bool, error) {
-		if t, e := time.ParseInLocation("2006-01-02", raw, usageCST); e == nil {
-			return t, false, nil // 自然日模式；结束边界在下方补到次日零点
+	parseDay := func(raw, label string) (time.Time, error) {
+		t, e := time.ParseInLocation("2006-01-02", strings.TrimSpace(raw), usageCST)
+		if e != nil {
+			return time.Time{}, fmt.Errorf("%s格式应为 YYYY-MM-DD", label)
 		}
-		for _, layout := range []string{"2006-01-02 15:04:05", "2006-01-02 15:04"} {
-			if t, e := time.ParseInLocation(layout, raw, usageCST); e == nil {
-				return t, true, nil
-			}
-		}
-		if isEnd {
-			return time.Time{}, false, fmt.Errorf("结束时间格式应为 YYYY-MM-DD 或 YYYY-MM-DD HH:MM:SS")
-		}
-		return time.Time{}, false, fmt.Errorf("开始时间格式应为 YYYY-MM-DD 或 YYYY-MM-DD HH:MM:SS")
+		return t, nil
 	}
 
-	to, toPrecise := todayStart, false
+	to := todayStart
 	if toStr != "" {
-		if to, toPrecise, err = parseBoundary(toStr, true); err != nil {
+		if to, err = parseDay(toStr, "结束日期"); err != nil {
 			return 0, 0, err
 		}
 	}
 	from := to.AddDate(0, 0, -6) // 默认近 7 天(含今天)
-	fromPrecise := toPrecise
 	if fromStr != "" {
-		if from, fromPrecise, err = parseBoundary(fromStr, false); err != nil {
+		if from, err = parseDay(fromStr, "开始日期"); err != nil {
 			return 0, 0, err
 		}
 	}
 	if from.After(to) {
 		from, to = to, from
-		fromPrecise, toPrecise = toPrecise, fromPrecise
 	}
-	// 含两端点共 N 天 ⇔ 零点差 (N-1)*24h;用 >= 卡在恰好 maxUsageDays 天(超一天即 91 天会被拒)
+	// 含两端点共 N 天 ⇔ 零点差 (N-1)*24h；用 >= 卡住“比上限多一天”的范围。
 	if to.Sub(from) >= time.Duration(maxUsageDays)*24*time.Hour {
 		return 0, 0, fmt.Errorf("时间范围过大,最长 %d 天", maxUsageDays)
 	}
-	if toPrecise {
-		return from.Unix(), to.Add(time.Second).Unix(), nil // 精确结束秒也包含在 [from,to) 内
-	}
-	_ = fromPrecise                                     // 开始端无需特殊处理；保留变量使交换时的语义显式可读。
 	return from.Unix(), to.AddDate(0, 0, 1).Unix(), nil // to 含当天 → 上界取次日 0 点(开区间)
+}
+
+// adminUsageAggregateKey 只标识可重算的数字聚合。用户集合取服务端 ID 指纹，
+// 日期/令牌/统计类型均入键；用户名、邮箱、余额等实时字段不进键也不进值。
+func adminUsageAggregateKey(kind, memberFP string, uid, tokenID, fromTs, toTs int64) string {
+	return fmt.Sprintf("agg:%s:admin:m:%s:r:%d:%d:u:%d:t:%d:%s",
+		usageAggregateKeyVersion, memberFP, fromTs, toTs, uid, tokenID, kind)
+}
+
+func usageRefreshRequested(c *gin.Context) bool {
+	return c.Query("refresh") == "1"
+}
+
+func (m *Monitor) loadUsageAggregateJSON(
+	ctx context.Context,
+	key string,
+	ttl time.Duration,
+	forceFresh bool,
+	dst any,
+	fill func() (any, error),
+) error {
+	if forceFresh {
+		return m.usageCache.DoJSONFresh(ctx, key, ttl, dst, fill)
+	}
+	return m.usageCache.DoJSON(ctx, key, ttl, dst, fill)
 }
 
 // ---- HTTP 处理器 ----
@@ -363,35 +502,66 @@ func (m *Monitor) serveUsageMatrix(c *gin.Context) {
 		return
 	}
 	tracked, balances, usedTotals := m.refreshTrackedLabels(c.Request.Context(), tracked) // 身份标签校准 + 取当前余额与累计总消耗
-	mx, err := m.computeUsageMatrix(c.Request.Context(), idsOf(tracked), fromTs, toTs)
+	if err := c.Request.Context().Err(); errors.Is(err, context.Canceled) {
+		abortCanceledUsageRequest(c, err)
+		return
+	}
+	memberFP := portalMemberFingerprint(tracked)
+	forceFresh := usageRefreshRequested(c)
+	mx := &UsageMatrix{}
+	err = m.loadUsageAggregateJSON(
+		c.Request.Context(),
+		adminUsageAggregateKey("matrix", memberFP, 0, 0, fromTs, toTs),
+		usageAggregateTTL(toTs, time.Now()),
+		forceFresh,
+		mx,
+		func() (any, error) {
+			result, err := m.computeUsageMatrix(c.Request.Context(), idsOf(tracked), fromTs, toTs)
+			if result != nil {
+				// 管理端身份、余额与分组字段在响应阶段实时组装，不进 Redis。
+				result.Users = nil
+			}
+			return result, err
+		},
+	)
 	if err != nil {
+		if abortCanceledUsageRequest(c, err) {
+			return
+		}
 		slog.Warn("用户用量矩阵聚合失败", "err", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "统计查询失败,请稍后重试(细节见服务端日志)"})
 		return
 	}
-	totals := map[int64]float64{}
+	totals := map[int64]UsageBilling{}
 	for _, cell := range mx.Cells {
-		totals[cell.UserID] += cell.CostUSD
+		t := totals[cell.UserID]
+		t.add(cell.UsageBilling)
+		totals[cell.UserID] = t
 	}
 	gm := m.groupNameMap()
 	for _, u := range tracked {
+		t := totals[u.UserID]
 		mu := UsageMatrixUser{UserID: u.UserID, Username: u.Username, Email: u.Email,
-			GroupID: u.GroupID, GroupName: gm[u.GroupID], Note: u.Note, TotalUSD: totals[u.UserID]}
+			GroupID: u.GroupID, GroupName: gm[u.GroupID], Note: u.Note,
+			ConsumeQuota: t.ConsumeQuota, RefundQuota: t.RefundQuota, NetQuota: t.NetQuota,
+			TotalUSD: t.CostUSD, RefundUSD: t.RefundUSD, NetUSD: t.NetUSD}
 		if b, ok := balances[u.UserID]; ok {
-			bv := b
-			mu.BalanceUSD = &bv
+			bq := b
+			bv := float64(bq) / quotaPerUSD
+			mu.BalanceQuota, mu.BalanceUSD = &bq, &bv
 		}
 		if uq, ok := usedTotals[u.UserID]; ok {
-			uv := uq
-			mu.TotalUsedUSD = &uv
+			usedQ := uq
+			uv := float64(usedQ) / quotaPerUSD
+			mu.TotalUsedQuota, mu.TotalUsedUSD = &usedQ, &uv
 		}
 		mx.Users = append(mx.Users, mu)
 	}
 	// 排序按【累计总消耗】降序(终身值,与所选日期区间无关)——切换时间范围顺序不变,大客户恒在前;
 	// 同值(如都为0/已删)按用户名兜底,保证顺序完全稳定。
-	usedOf := func(u UsageMatrixUser) float64 {
-		if u.TotalUsedUSD != nil {
-			return *u.TotalUsedUSD
+	usedOf := func(u UsageMatrixUser) int64 {
+		if u.TotalUsedQuota != nil {
+			return *u.TotalUsedQuota
 		}
 		return 0
 	}
@@ -402,50 +572,68 @@ func (m *Monitor) serveUsageMatrix(c *gin.Context) {
 		}
 		return mx.Users[i].Username < mx.Users[j].Username
 	})
-	// 不能把仅含矩阵的半成品预热进客户端总览缓存：趋势图还需要按日×模型聚合。
-	// 此处只使相关组失效，客户端下一次请求会通过 buildPortalOverview 写入完整载荷。
-	m.invalidatePortalOverviews(tracked, fromTs, toTs)
+	// 只有管理员重新选择日期的主动刷新才失效客户端同范围结果。
+	// 普通打开/返回列表不再每次删缓存，避免客户端随后又扫一次生产库。
+	if forceFresh {
+		m.invalidatePortalAggregates(tracked, fromTs, toTs)
+	}
 	c.JSON(http.StatusOK, gin.H{"enabled": true, "matrix": mx, "empty": len(tracked) == 0})
 }
 
-// userBalanceUSD 取单个用户的主站当前余额(users.quota 折美元);查不到/出错返回 nil(前端显示 —)。
-func (m *Monitor) userBalanceUSD(ctx context.Context, id int64) *float64 {
-	cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-	var quota int64
-	if err := m.prodDB.QueryRowContext(cctx, "SELECT COALESCE(quota,0) FROM users WHERE id = ?", id).Scan(&quota); err != nil {
-		slog.Warn("查询用户余额失败", "err", err, "user_id", id)
+func quotaUSDPtr(quota *int64) *float64 {
+	if quota == nil {
 		return nil
 	}
-	b := float64(quota) / quotaPerUSD
-	return &b
+	v := float64(*quota) / quotaPerUSD
+	return &v
 }
 
-// userUsedUSD 取单个用户的主站累计总消耗(users.used_quota 折美元;终身值);查不到/出错返回 nil。
-func (m *Monitor) userUsedUSD(ctx context.Context, id int64) *float64 {
+// userLiveUsage 用一次 users 主键查询取回单用户的展示名、当前余额和累计总消耗。
+// 用户不存在/查询失败时保留既有降级语义：owner=#ID，两项金额为 nil(前端显示 —)。
+func (m *Monitor) userLiveUsage(ctx context.Context, id int64) (owner string, balance, used *int64) {
+	owner = fmt.Sprintf("#%d", id)
 	cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	var used int64
-	if err := m.prodDB.QueryRowContext(cctx, "SELECT COALESCE(used_quota,0) FROM users WHERE id = ?", id).Scan(&used); err != nil {
-		slog.Warn("查询用户累计消耗失败", "err", err, "user_id", id)
-		return nil
+	var username, email string
+	var balanceQ, usedQ int64
+	err := m.prodDB.QueryRowContext(cctx,
+		"SELECT COALESCE(username,''), COALESCE(email,''), COALESCE(quota,0), COALESCE(used_quota,0) FROM users WHERE id = ?", id,
+	).Scan(&username, &email, &balanceQ, &usedQ)
+	if err != nil {
+		if !errors.Is(err, context.Canceled) {
+			slog.Warn("查询用户实时资料失败", "err", err, "user_id", id)
+		}
+		return owner, nil, nil
 	}
-	u := float64(used) / quotaPerUSD
-	return &u
+	if username != "" {
+		owner = username
+	} else if email != "" {
+		owner = email
+	}
+	return owner, &balanceQ, &usedQ
 }
 
 // TokenUsage 单个令牌在时间范围内的用量。MaskedKey 永远是脱敏串,服务端绝不返回明文 key。
 type TokenUsage struct {
-	TokenID      int64    `json:"token_id"` // 主站 tokens.id;0=老日志无token_id(不可下钻)
-	Owner        string   `json:"owner"`    // 令牌所属用户(展示名:用户名/邮箱/#ID)
-	Name         string   `json:"name"`
-	MaskedKey    string   `json:"masked_key"`
-	Group        string   `json:"group"` // 令牌绑定的分组(计价档);空=跟随用户默认分组/已删
-	Requests     int64    `json:"requests"`
-	Tokens       int64    `json:"tokens"`
-	CostUSD      float64  `json:"cost_usd"`
-	TotalCostUSD *float64 `json:"total_cost_usd"` // 累计总消耗(tokens.used_quota 折美元;创建至今终身值,不受日期范围影响);null=令牌已不可查(硬删/老日志无token_id)
-	Deleted      bool     `json:"deleted"`        // 已删除令牌(软删有消费仍显示/硬删兜底行);前端沉底+标记,与现存令牌分区
+	UsageBilling
+	TokenID        int64    `json:"token_id"` // 主站 tokens.id;0=老日志无token_id(不可下钻)
+	Owner          string   `json:"owner"`    // 令牌所属用户(展示名:用户名/邮箱/#ID)
+	Name           string   `json:"name"`
+	MaskedKey      string   `json:"masked_key"`
+	Group          string   `json:"group"` // 令牌绑定的分组(计价档);空=跟随用户默认分组/已删
+	Tokens         int64    `json:"tokens"`
+	TotalCostQuota *int64   `json:"total_cost_quota"`
+	TotalCostUSD   *float64 `json:"total_cost_usd"` // 累计总消耗(tokens.used_quota 折美元;创建至今终身值,不受日期范围影响);null=令牌已不可查(硬删/老日志无token_id)
+	Deleted        bool     `json:"deleted"`        // 已删除令牌(软删有消费仍显示/硬删兜底行);前端沉底+标记,与现存令牌分区
+}
+
+// tokenUsageAggregate 是可进 Redis 的按令牌日志聚合：只保留计费数字、token_id 和
+// 硬删令牌需要的日志名回退。当前令牌名/分组/脱敏 key/删除状态/累计消耗不进缓存。
+type tokenUsageAggregate struct {
+	UsageBilling
+	TokenID int64  `json:"token_id"`
+	LogName string `json:"log_name,omitempty"`
+	Tokens  int64  `json:"tokens"`
 }
 
 // tokenMetaOf 取单令牌元数据(名称/脱敏key/分组/累计/是否已删),强制归属校验(id+user_id 双条件)。
@@ -462,7 +650,7 @@ func (m *Monitor) tokenMetaOf(ctx context.Context, uid, tokenID int64) *TokenUsa
 		return nil
 	}
 	total := float64(used) / quotaPerUSD
-	return &TokenUsage{TokenID: tokenID, Name: name, MaskedKey: maskTokenKey(key), Group: group, TotalCostUSD: &total, Deleted: deleted}
+	return &TokenUsage{TokenID: tokenID, Name: name, MaskedKey: maskTokenKey(key), Group: group, TotalCostQuota: &used, TotalCostUSD: &total, Deleted: deleted}
 }
 
 // maskTokenKey 与 new-api 的 MaskTokenKey 同风格。tokens.key 不含 sk- 前缀,
@@ -486,53 +674,73 @@ func maskTokenKey(key string) string {
 // 每行带累计总消耗(tokens.used_quota,创建至今终身值);生产库只读;key 只在服务端脱敏后返回,明文永不出库。
 // 排序:现存令牌在前、已删除沉底,区内按范围费用降序。
 func (m *Monitor) computeUserTokenUsage(ctx context.Context, uid, fromTs, toTs int64) ([]TokenUsage, error) {
-	m.usageMu.Lock() // 与其它大聚合共用串行闸:同一时刻生产库最多跑一条聚合(调用方未持锁,不会重入)
-	defer m.usageMu.Unlock()
+	aggregates, err := m.computeUserTokenAggregates(ctx, uid, fromTs, toTs)
+	if err != nil {
+		return nil, err
+	}
+	return m.hydrateUserTokenUsage(ctx, uid, aggregates, nil)
+}
+
+// computeUserTokenAggregates 只扫时间窗内 logs，结果不含 users/tokens 表的当前资料。
+func (m *Monitor) computeUserTokenAggregates(ctx context.Context, uid, fromTs, toTs int64) ([]tokenUsageAggregate, error) {
 	cctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
-
-	// 令牌所属用户:logs.user_id 即令牌拥有者,故整批令牌都归 uid;解析其展示名(用户名→邮箱→#ID)
-	owner := fmt.Sprintf("#%d", uid)
-	var oname, oemail string
-	if err := m.prodDB.QueryRowContext(cctx, "SELECT COALESCE(username,''), COALESCE(email,'') FROM users WHERE id = ?", uid).Scan(&oname, &oemail); err == nil {
-		if oname != "" {
-			owner = oname
-		} else if oemail != "" {
-			owner = oemail
-		}
+	if err := m.acquireUsageGate(cctx); err != nil {
+		return nil, fmt.Errorf("等待令牌查询槽位失败: %w", err)
 	}
+	defer m.releaseUsageGate()
 
-	type agg struct {
-		logName                 string
-		requests, tokens, quota int64
-	}
-	byTok := map[int64]*agg{}
-	var ids []int64
-
-	q := "SELECT token_id, COALESCE(MAX(token_name),''), COUNT(*)," +
-		" CAST(COALESCE(SUM(prompt_tokens+completion_tokens),0) AS SIGNED)," +
-		" CAST(COALESCE(SUM(quota),0) AS SIGNED)" +
-		" FROM logs WHERE type = 2 AND user_id = ? AND created_at >= ? AND created_at < ?" +
+	q := "SELECT token_id, COALESCE(MAX(token_name),'')," +
+		" CAST(COALESCE(SUM(CASE WHEN type=2 THEN 1 ELSE 0 END),0) AS SIGNED)," +
+		" CAST(COALESCE(SUM(CASE WHEN type=6 THEN 1 ELSE 0 END),0) AS SIGNED)," +
+		" CAST(COALESCE(SUM(CASE WHEN type=2 THEN COALESCE(prompt_tokens,0)+COALESCE(completion_tokens,0) ELSE 0 END),0) AS SIGNED)," +
+		" CAST(COALESCE(SUM(CASE WHEN type=2 THEN COALESCE(quota,0) ELSE 0 END),0) AS SIGNED)," +
+		" CAST(COALESCE(SUM(CASE WHEN type=6 THEN COALESCE(quota,0) ELSE 0 END),0) AS SIGNED)" +
+		" FROM logs WHERE type IN (2,6) AND user_id = ? AND created_at >= ? AND created_at < ?" +
 		" GROUP BY token_id"
 	rows, err := m.prodDB.QueryContext(cctx, q, uid, fromTs, toTs)
 	if err != nil {
 		return nil, fmt.Errorf("按令牌聚合失败: %w", err)
 	}
+	out := make([]tokenUsageAggregate, 0)
 	for rows.Next() {
-		var tid, reqs, toks, quota int64
-		var name string
-		if err := rows.Scan(&tid, &name, &reqs, &toks, &quota); err != nil {
+		var a tokenUsageAggregate
+		if err := rows.Scan(&a.TokenID, &a.LogName, &a.Requests, &a.RefundRecords, &a.Tokens, &a.ConsumeQuota, &a.RefundQuota); err != nil {
 			rows.Close()
 			return nil, err
 		}
-		byTok[tid] = &agg{logName: name, requests: reqs, tokens: toks, quota: quota}
-		if tid > 0 {
-			ids = append(ids, tid)
-		}
+		a.UsageBilling.finalize()
+		out = append(out, a)
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {
 		return nil, err
+	}
+	return out, nil
+}
+
+// hydrateUserTokenUsage 用当前 users/tokens 主键数据补齐令牌列表。这些查询不扫 logs，
+// 因此可在每次响应时执行，既保持实时性又不给日志库增加聚合压力。
+// 响应层已同时取回 users 资料时传入 ownerOverride，避免重复查询 users；
+// 传 nil 时保持 computeUserTokenUsage 等独立调用的原有行为。
+func (m *Monitor) hydrateUserTokenUsage(ctx context.Context, uid int64, aggregates []tokenUsageAggregate, ownerOverride *string) ([]TokenUsage, error) {
+	cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	owner := fmt.Sprintf("#%d", uid)
+	if ownerOverride != nil {
+		if *ownerOverride != "" {
+			owner = *ownerOverride
+		}
+	} else {
+		owner = m.usageOwnerLabel(cctx, uid)
+	}
+	byTok := make(map[int64]tokenUsageAggregate, len(aggregates))
+	ids := make([]int64, 0, len(aggregates))
+	for _, a := range aggregates {
+		byTok[a.TokenID] = a
+		if a.TokenID > 0 {
+			ids = append(ids, a.TokenID)
+		}
 	}
 
 	// tokens 表:该用户全部现存令牌(零用量也要展示)+ 范围内出现过的已删令牌(软删,名称/key 仍可回查)。
@@ -544,13 +752,14 @@ func (m *Monitor) computeUserTokenUsage(ctx context.Context, uid, fromTs, toTs i
 	}
 	infoByID := map[int64]*tokInfo{}
 	kq := "SELECT id, COALESCE(name,''), COALESCE(`key`,''), COALESCE(`group`,''), CAST(COALESCE(used_quota,0) AS SIGNED), (deleted_at IS NOT NULL)" +
-		" FROM tokens WHERE (user_id = ? AND deleted_at IS NULL)"
+		" FROM tokens WHERE user_id = ? AND (deleted_at IS NULL"
 	kargs := []any{uid}
 	if len(ids) > 0 {
 		inSQL, inArgs := usageIn("id", ids)
 		kq += " OR " + inSQL
 		kargs = append(kargs, inArgs...)
 	}
+	kq += ")"
 	krows, err := m.prodDB.QueryContext(cctx, kq, kargs...)
 	if err != nil {
 		return nil, fmt.Errorf("查询令牌信息失败: %w", err)
@@ -570,64 +779,60 @@ func (m *Monitor) computeUserTokenUsage(ctx context.Context, uid, fromTs, toTs i
 		return nil, err
 	}
 
-	out := make([]TokenUsage, 0, len(infoByID)+1)
+	out := make([]TokenUsage, 0, len(infoByID)+len(byTok))
 	// tokens 表里的每个令牌都出一行(现存令牌零用量补零;软删且范围内有用量的也在此列)
 	for tid, info := range infoByID {
 		a := byTok[tid]
-		if a == nil {
-			a = &agg{}
-		}
 		delete(byTok, tid)
 		name := info.name
 		if name == "" {
-			name = a.logName
+			name = a.LogName
 		}
 		if name == "" {
 			name = "(未命名)"
 		}
 		total := float64(info.usedQuota) / quotaPerUSD
 		out = append(out, TokenUsage{
-			TokenID:      tid,
-			Owner:        owner,
-			Name:         name,
-			MaskedKey:    info.mask,
-			Group:        info.group,
-			Requests:     a.requests,
-			Tokens:       a.tokens,
-			CostUSD:      float64(a.quota) / quotaPerUSD,
-			TotalCostUSD: &total,
-			Deleted:      info.deleted,
+			UsageBilling:   a.UsageBilling,
+			TokenID:        tid,
+			Owner:          owner,
+			Name:           name,
+			MaskedKey:      info.mask,
+			Group:          info.group,
+			Tokens:         a.Tokens,
+			TotalCostQuota: &info.usedQuota,
+			TotalCostUSD:   &total,
+			Deleted:        info.deleted,
 		})
 	}
 	// 剩下的是 tokens 表查不到的:硬删令牌/老日志 token_id=0 → 回退日志名,key/分组/累计留空,归入已删除区
 	for tid, a := range byTok {
-		name := a.logName
+		name := a.LogName
 		if name == "" {
 			name = "(未命名)"
 		}
 		out = append(out, TokenUsage{
-			TokenID:  tid,
-			Owner:    owner,
-			Name:     name,
-			Requests: a.requests,
-			Tokens:   a.tokens,
-			CostUSD:  float64(a.quota) / quotaPerUSD,
-			Deleted:  true,
+			UsageBilling: a.UsageBilling,
+			TokenID:      tid,
+			Owner:        owner,
+			Name:         name,
+			Tokens:       a.Tokens,
+			Deleted:      true,
 		})
 	}
 	sort.SliceStable(out, func(i, j int) bool {
 		if out[i].Deleted != out[j].Deleted {
 			return !out[i].Deleted // 现存令牌在前,已删除沉底(前端按此分区渲染)
 		}
-		if out[i].CostUSD != out[j].CostUSD {
-			return out[i].CostUSD > out[j].CostUSD
+		if out[i].ConsumeQuota != out[j].ConsumeQuota {
+			return out[i].ConsumeQuota > out[j].ConsumeQuota
 		}
-		ti, tj := 0.0, 0.0
-		if out[i].TotalCostUSD != nil {
-			ti = *out[i].TotalCostUSD
+		var ti, tj int64
+		if out[i].TotalCostQuota != nil {
+			ti = *out[i].TotalCostQuota
 		}
-		if out[j].TotalCostUSD != nil {
-			tj = *out[j].TotalCostUSD
+		if out[j].TotalCostQuota != nil {
+			tj = *out[j].TotalCostQuota
 		}
 		if ti != tj {
 			return ti > tj
@@ -635,6 +840,25 @@ func (m *Monitor) computeUserTokenUsage(ctx context.Context, uid, fromTs, toTs i
 		return out[i].Name < out[j].Name
 	})
 	return out, nil
+}
+
+// usageOwnerLabel 只读主站 users 主键行，用于在响应边界给已缓存的令牌聚合补回实时展示名。
+// 用户名/邮箱不进入 Redis；查询失败时保留既有 #ID 降级语义。
+func (m *Monitor) usageOwnerLabel(ctx context.Context, uid int64) string {
+	owner := fmt.Sprintf("#%d", uid)
+	cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	var username, email string
+	if err := m.prodDB.QueryRowContext(cctx, "SELECT COALESCE(username,''), COALESCE(email,'') FROM users WHERE id = ?", uid).Scan(&username, &email); err != nil {
+		return owner
+	}
+	if username != "" {
+		return username
+	}
+	if email != "" {
+		return email
+	}
+	return owner
 }
 
 // LogRow 一条日志(逐条明细,给客户端「使用日志」查看/导出用);不含请求/响应正文。
@@ -1185,10 +1409,12 @@ func (m *Monitor) countGroupLogs(ctx context.Context, ids []int64, fromTs, toTs,
 	if len(ids) == 0 {
 		return 0, nil
 	}
-	m.usageMu.Lock()
-	defer m.usageMu.Unlock()
 	cctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
+	if err := m.acquireUsageGate(cctx); err != nil {
+		return 0, fmt.Errorf("等待日志计数槽位失败: %w", err)
+	}
+	defer m.releaseUsageGate()
 	where, args := logFilterWhere(ids, fromTs, toTs, memberUID, logType, model, group, tokenName, detailKw, requestID)
 	var n int64
 	if err := m.prodDB.QueryRowContext(cctx, "SELECT COUNT(*) FROM logs WHERE "+where, args...).Scan(&n); err != nil {
@@ -1197,17 +1423,46 @@ func (m *Monitor) countGroupLogs(ctx context.Context, ids []int64, fromTs, toTs,
 	return n, nil
 }
 
-// queryGroupLogs 查一组成员的日志,按 id 倒序游标分页;窗口化、走索引、只读、串行(usageMu)。
+// countGroupLogsSnapshot 为浏览器原生 CSV 下载一次取回“总数 + 当前最大 ID”。
+// 后续分页从 maxID+1 开始，预检完成后新到的日志不会混入本次文件，因此不会出现
+// 预检时未超 5 万、下载时却悄悄截断的竞态。与普通计数一样只读、串行且有 15s 上限。
+func (m *Monitor) countGroupLogsSnapshot(ctx context.Context, ids []int64, fromTs, toTs, memberUID int64, logType int, model, group, tokenName, detailKw, requestID string) (total, startCursor int64, err error) {
+	if len(ids) == 0 {
+		return 0, 0, nil
+	}
+	cctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	if err := m.acquireUsageGate(cctx); err != nil {
+		return 0, 0, fmt.Errorf("等待日志计数槽位失败: %w", err)
+	}
+	defer m.releaseUsageGate()
+	where, args := logFilterWhere(ids, fromTs, toTs, memberUID, logType, model, group, tokenName, detailKw, requestID)
+	var maxID int64
+	if err := m.prodDB.QueryRowContext(cctx, "SELECT COUNT(*), COALESCE(MAX(id), 0) FROM logs WHERE "+where, args...).Scan(&total, &maxID); err != nil {
+		return 0, 0, fmt.Errorf("日志计数失败: %w", err)
+	}
+	if maxID == int64(^uint64(0)>>1) {
+		return 0, 0, errors.New("日志 ID 超出可导出范围")
+	}
+	// queryGroupLogs 使用 id < cursor；+1 才包含当前最大 ID。空结果时 maxID=0、
+	// cursor=1，确保预检后新到的正数自增 ID 也不会混入这次空快照。
+	startCursor = maxID + 1
+	return total, startCursor, nil
+}
+
+// queryGroupLogs 查一组成员的日志,按 id 倒序游标分页;窗口化、只读、串行(usageGate)。
 // 全部用户可控值参数化;memberUID 需调用方已校验属本组;limit 由调用方控上限(分页 pageSize+1 / 导出 cap,超限判定在导出侧用 COUNT 探测)。
 // 取 content+other 拼「详情」与首字(only 安全字段);花费/首字/详情按 new-api 的可展示/计时类型口径填。
 func (m *Monitor) queryGroupLogs(ctx context.Context, ids []int64, fromTs, toTs, memberUID int64, logType int, model, group, tokenName, detailKw, requestID string, beforeID int64, limit int) ([]LogRow, error) {
 	if len(ids) == 0 {
 		return nil, nil
 	}
-	m.usageMu.Lock() // 与其它大聚合共用串行闸:同一时刻生产库最多一条重查询
-	defer m.usageMu.Unlock()
 	cctx, cancel := context.WithTimeout(ctx, 25*time.Second) // 导出可能取到 5 万行,给足超时
 	defer cancel()
+	if err := m.acquireUsageGate(cctx); err != nil {
+		return nil, fmt.Errorf("等待日志查询槽位失败: %w", err)
+	}
+	defer m.releaseUsageGate()
 
 	where, args := logFilterWhere(ids, fromTs, toTs, memberUID, logType, model, group, tokenName, detailKw, requestID)
 	if beforeID > 0 { // 游标:取比上次末尾更早的(id 近似时间序,倒序翻页,不用深 OFFSET)
@@ -1272,21 +1527,23 @@ func (m *Monitor) serveUsageStats(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	inList := map[int64]bool{}
+	trackedByID := map[int64]TrackedUser{}
 	for _, u := range tracked {
-		inList[u.UserID] = true
+		trackedByID[u.UserID] = u
 	}
-	ids := idsOf(tracked)
+	selected := append([]TrackedUser(nil), tracked...)
 	isGroup := false
-	var tokenID int64
+	var tokenID, selectedUID int64
 	// 可选其一:user_id=单用户详情;group_id=公司详情(聚合整组成员,0=未分组成员)
 	if f := strings.TrimSpace(c.Query("user_id")); f != "" {
 		id, err := strconv.ParseInt(f, 10, 64)
-		if err != nil || !inList[id] {
+		member, ok := trackedByID[id]
+		if err != nil || !ok {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "user_id 不在名单内"})
 			return
 		}
-		ids = []int64{id}
+		selectedUID = id
+		selected = []TrackedUser{member}
 		// 令牌详情:仅在单用户详情下有效;聚合强制 user_id+token_id 双条件,越权令牌只会查出空
 		if t := strings.TrimSpace(c.Query("token_id")); t != "" {
 			tokenID, err = strconv.ParseInt(t, 10, 64)
@@ -1302,13 +1559,14 @@ func (m *Monitor) serveUsageStats(c *gin.Context) {
 			return
 		}
 		isGroup = true
-		ids = ids[:0]
+		selected = selected[:0]
 		for _, u := range tracked {
 			if u.GroupID == gid {
-				ids = append(ids, u.UserID)
+				selected = append(selected, u)
 			}
 		}
 	}
+	ids := idsOf(selected)
 	if len(ids) == 0 { // 名单为空:不查生产库,直接空结果
 		c.JSON(http.StatusOK, gin.H{"enabled": true, "stats": &UsageStats{}, "empty": true})
 		return
@@ -1318,61 +1576,102 @@ func (m *Monitor) serveUsageStats(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	st, err := m.computeUsageStats(c.Request.Context(), ids, fromTs, toTs, tokenID)
+	memberFP := portalMemberFingerprint(selected)
+	forceFresh := usageRefreshRequested(c)
+	cacheTTL := usageAggregateTTL(toTs, time.Now())
+	st := &UsageStats{}
+	err = m.loadUsageAggregateJSON(
+		c.Request.Context(),
+		adminUsageAggregateKey("stats", memberFP, selectedUID, tokenID, fromTs, toTs),
+		cacheTTL,
+		forceFresh,
+		st,
+		func() (any, error) {
+			return m.computeUsageStats(c.Request.Context(), ids, fromTs, toTs, tokenID)
+		},
+	)
 	if err != nil {
+		if abortCanceledUsageRequest(c, err) {
+			return
+		}
 		slog.Warn("用户用量详情聚合失败", "err", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "统计查询失败,请稍后重试(细节见服务端日志)"})
 		return
 	}
 	resp := gin.H{"enabled": true, "stats": st}
 	if isGroup { // 公司详情:成员数 + 余额合计 + 累计总消耗合计(主键 IN 的 SUM)
+		balanceQ, usedQ := m.sumUsageLiveQuotas(c.Request.Context(), ids)
 		resp["members"] = len(ids)
-		resp["balance_usd"] = m.sumBalanceUSD(c.Request.Context(), ids)
-		resp["total_used_usd"] = m.sumUsedUSD(c.Request.Context(), ids)
+		resp["balance_quota"] = balanceQ
+		resp["balance_usd"] = quotaUSDPtr(balanceQ)
+		resp["total_used_quota"] = usedQ
+		resp["total_used_usd"] = quotaUSDPtr(usedQ)
 	} else if tokenID > 0 { // 令牌详情:元数据(名称/脱敏key/分组/累计;硬删查不到则为 null,前端用点击时的名字兜底)
 		resp["token"] = m.tokenMetaOf(c.Request.Context(), ids[0], tokenID)
 	} else if len(ids) == 1 { // 单用户详情:个人余额 + 累计总消耗(实时取,null=已删/取不到)+ 各令牌用量
-		resp["balance_usd"] = m.userBalanceUSD(c.Request.Context(), ids[0])
-		resp["total_used_usd"] = m.userUsedUSD(c.Request.Context(), ids[0])
-		if toks, err := m.computeUserTokenUsage(c.Request.Context(), ids[0], fromTs, toTs); err != nil {
+		owner, balanceQ, usedQ := m.userLiveUsage(c.Request.Context(), ids[0])
+		resp["balance_quota"] = balanceQ
+		resp["balance_usd"] = quotaUSDPtr(balanceQ)
+		resp["total_used_quota"] = usedQ
+		resp["total_used_usd"] = quotaUSDPtr(usedQ)
+		var tokenAggregates []tokenUsageAggregate
+		err := m.loadUsageAggregateJSON(
+			c.Request.Context(),
+			adminUsageAggregateKey("tokens", memberFP, ids[0], 0, fromTs, toTs),
+			cacheTTL,
+			forceFresh,
+			&tokenAggregates,
+			func() (any, error) {
+				return m.computeUserTokenAggregates(c.Request.Context(), ids[0], fromTs, toTs)
+			},
+		)
+		if err != nil {
+			if abortCanceledUsageRequest(c, err) {
+				return
+			}
 			slog.Warn("单用户令牌用量聚合失败", "err", err, "user_id", ids[0])
-		} else {
-			resp["by_token"] = toks
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "令牌统计查询失败,请稍后重试(细节见服务端日志)"})
+			return
+		}
+		toks, err := m.hydrateUserTokenUsage(c.Request.Context(), ids[0], tokenAggregates, &owner)
+		if err != nil {
+			if abortCanceledUsageRequest(c, err) {
+				return
+			}
+			slog.Warn("查询令牌实时元数据失败", "err", err, "user_id", ids[0])
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "令牌统计查询失败,请稍后重试(细节见服务端日志)"})
+			return
+		}
+		resp["by_token"] = toks
+	}
+	if forceFresh {
+		if isGroup {
+			m.invalidatePortalAggregates(selected, fromTs, toTs)
+		} else if selectedUID > 0 {
+			m.invalidatePortalUserAggregates(tracked, selectedUID, tokenID, fromTs, toTs)
 		}
 	}
 	c.JSON(http.StatusOK, resp)
 }
 
-// sumBalanceUSD 一组用户的主站余额合计(users.quota 求和折美元);空组/出错返回 nil。
-func (m *Monitor) sumBalanceUSD(ctx context.Context, ids []int64) *float64 {
+// sumUsageLiveQuotas 用一次 users 聚合同时取回一组用户的当前余额和累计总消耗。
+// 空组/查询失败时两项均返回 nil；有成员但主站已无匹配行时 COALESCE 保留既有的 0 值语义。
+func (m *Monitor) sumUsageLiveQuotas(ctx context.Context, ids []int64) (balance, used *int64) {
 	if len(ids) == 0 {
-		return nil
+		return nil, nil
 	}
 	cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	inSQL, args := usageIn("id", ids)
-	var quota int64
-	if err := m.prodDB.QueryRowContext(cctx, "SELECT COALESCE(SUM(quota),0) FROM users WHERE "+inSQL, args...).Scan(&quota); err != nil {
-		slog.Warn("查询分组余额合计失败", "err", err)
-		return nil
+	var balanceQ, usedQ int64
+	err := m.prodDB.QueryRowContext(cctx,
+		"SELECT COALESCE(SUM(quota),0), COALESCE(SUM(used_quota),0) FROM users WHERE "+inSQL, args...,
+	).Scan(&balanceQ, &usedQ)
+	if err != nil {
+		if !errors.Is(err, context.Canceled) {
+			slog.Warn("查询分组实时金额合计失败", "err", err)
+		}
+		return nil, nil
 	}
-	b := float64(quota) / quotaPerUSD
-	return &b
-}
-
-// sumUsedUSD 一组用户的主站累计总消耗合计(users.used_quota 求和折美元);空组/出错返回 nil。
-func (m *Monitor) sumUsedUSD(ctx context.Context, ids []int64) *float64 {
-	if len(ids) == 0 {
-		return nil
-	}
-	cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-	inSQL, args := usageIn("id", ids)
-	var used int64
-	if err := m.prodDB.QueryRowContext(cctx, "SELECT COALESCE(SUM(used_quota),0) FROM users WHERE "+inSQL, args...).Scan(&used); err != nil {
-		slog.Warn("查询分组累计消耗合计失败", "err", err)
-		return nil
-	}
-	u := float64(used) / quotaPerUSD
-	return &u
+	return &balanceQ, &usedQ
 }

@@ -30,13 +30,25 @@ var loginHTML string
 var echartsJS []byte // 内嵌 ECharts(Apache 2.0),自服务、不走 CDN,保持自包含
 
 //go:embed flatpickr.min.js
-var flatpickrJS []byte // 内嵌 flatpickr v4.6.13+zh 语言包(MIT),用量页日期范围选择器
+var flatpickrJS []byte // 内嵌 flatpickr v4.6.13+zh 语言包(MIT),保留旧静态资源兼容
 
 //go:embed flatpickr.min.css
-var flatpickrCSS []byte // flatpickr 暗色主题
+var flatpickrCSS []byte // flatpickr 旧主题兼容资源
 
 //go:embed range_picker.js
-var rangePickerJS []byte // Semi DatePicker 风格的零依赖日期范围选择器
+var rangePickerJS []byte // 把真实 Semi DatePicker 挂到零构建页面的轻量适配层
+
+//go:embed react.production.min.js
+var reactJS []byte // React 18.2.0（MIT），Semi UI 运行时依赖
+
+//go:embed react-dom.production.min.js
+var reactDOMJS []byte // ReactDOM 18.2.0（MIT），Semi UI 运行时依赖
+
+//go:embed semi-ui.min.js
+var semiUIJS []byte // Semi UI 2.72.2（MIT），与 NewAPI 日期控件相同的组件实现
+
+//go:embed semi-ui.min.css
+var semiUICSS []byte // Semi UI 2.72.2 原始组件样式
 
 var allowedWindows = map[int]bool{15: true, 30: true, 60: true, 180: true, 360: true, 720: true, 1440: true}
 
@@ -96,8 +108,26 @@ func (m *Monitor) RegisterRoutes(r *gin.Engine) {
 		c.Data(http.StatusOK, "text/css; charset=utf-8", flatpickrCSS)
 	})
 	r.GET("/range-picker.js", func(c *gin.Context) {
-		c.Header("Cache-Control", "public, max-age=31536000, immutable")
+		// 适配层会随 Monitor 功能调整，不能像固定版本的第三方资源一样
+		// 永久缓存，否则升级后浏览器会继续执行旧的日期控件逻辑。
+		c.Header("Cache-Control", "no-cache")
 		c.Data(http.StatusOK, "application/javascript; charset=utf-8", rangePickerJS)
+	})
+	r.GET("/react.js", func(c *gin.Context) {
+		c.Header("Cache-Control", "public, max-age=31536000, immutable")
+		c.Data(http.StatusOK, "application/javascript; charset=utf-8", reactJS)
+	})
+	r.GET("/react-dom.js", func(c *gin.Context) {
+		c.Header("Cache-Control", "public, max-age=31536000, immutable")
+		c.Data(http.StatusOK, "application/javascript; charset=utf-8", reactDOMJS)
+	})
+	r.GET("/semi-ui.js", func(c *gin.Context) {
+		c.Header("Cache-Control", "public, max-age=31536000, immutable")
+		c.Data(http.StatusOK, "application/javascript; charset=utf-8", semiUIJS)
+	})
+	r.GET("/semi-ui.css", func(c *gin.Context) {
+		c.Header("Cache-Control", "public, max-age=31536000, immutable")
+		c.Data(http.StatusOK, "text/css; charset=utf-8", semiUICSS)
 	})
 	r.GET("/api/brand", m.brandHandler)                // 公开:站点名,供前端设置页面标题
 	r.POST("/internal/rejections", m.ingestRejections) // 机器对机器:接收采集器推送的前置拒绝(token 鉴权)
@@ -115,15 +145,16 @@ func (m *Monitor) RegisterRoutes(r *gin.Engine) {
 		view.GET("/data", m.serveData)
 		view.GET("/monitor/data", m.serveData)
 		view.GET("/trend/long", m.serveLongTrend)
-		view.GET("/infra", m.serveInfra)                   // 服务端健康监控(实例/DB/LB)快照
-		view.GET("/infra/series", m.serveInfraSeries)      // 按需取某资源某些指标的近 N 小时序列(展开图用)
-		view.GET("/usage/users", m.listTrackedUsers)       // 用户用量:被盯名单(含分组)
-		view.GET("/usage/groups", m.listGroups)            // 用户用量:客户分组列表
-		view.GET("/usage/followups", m.serveFollowUps)     // 用户用量:待跟进清单
-		view.GET("/usage/followups/log", m.listFollowLogs) // 用户用量:某客户跟进记录
-		view.GET("/usage/settings", m.getUsageSettings)    // 用户用量:跟进阈值(读)
-		view.GET("/usage/matrix", m.serveUsageMatrix)      // 用户用量:列表页矩阵(前端渲染 行=用户×列=日期,格=当日费用)
-		view.GET("/usage/stats", m.serveUsageStats)        // 用户用量:单用户详情聚合(每日/分组/模型/费用)
+		view.GET("/infra", m.serveInfra)                       // 服务端健康监控(实例/DB/LB)快照
+		view.GET("/infra/series", m.serveInfraSeries)          // 按需取某资源某些指标的近 N 小时序列(展开图用)
+		view.GET("/usage/users", m.listTrackedUsers)           // 用户用量:被盯名单(含分组)
+		view.GET("/usage/groups", m.listGroups)                // 用户用量:客户分组列表
+		view.GET("/usage/followups", m.serveFollowUps)         // 用户用量:待跟进清单
+		view.GET("/usage/followups/log", m.listFollowLogs)     // 用户用量:某客户跟进记录
+		view.GET("/usage/settings", m.getUsageSettings)        // 用户用量:跟进阈值(读)
+		view.GET("/usage/matrix", m.serveUsageMatrix)          // 用户用量:列表页矩阵(前端渲染 行=用户×列=日期,格=当日费用)
+		view.GET("/usage/stats", m.serveUsageStats)            // 用户用量:单用户详情聚合(每日/分组/模型/费用)
+		view.GET("/usage/cache-stats", m.serveUsageCacheStats) // 用户用量缓存:无敏感信息的运维计数
 		view.GET("/me", me)
 	}
 
@@ -156,6 +187,12 @@ func (m *Monitor) RegisterRoutes(r *gin.Engine) {
 		rootUsage.POST("/followups/log", m.addFollowLog)   // 跟进记录:追加
 		rootUsage.POST("/settings", m.saveUsageSettings)   // 跟进阈值:保存
 	}
+}
+
+// serveUsageCacheStats 只向管理端会话暴露缓存运行计数。接口不主动访问 Redis，
+// 不返回缓存键或任何客户资料，可用于上线后核对命中率、回源次数和降级情况。
+func (m *Monitor) serveUsageCacheStats(c *gin.Context) {
+	c.JSON(http.StatusOK, gin.H{"cache": m.usageCache.Stats(time.Now())})
 }
 
 // checkIngest 校验节点推送接口的 Bearer token(MONITOR_INGEST_TOKEN)。

@@ -6,8 +6,12 @@
 <title>用量报表</title>
 <script src="/echarts.js"></script>
 <script src="/flatpickr.js"></script>
-<script src="/range-picker.js?v=4"></script>
 <link rel="stylesheet" href="/flatpickr.css">
+<link rel="stylesheet" href="/semi-ui.css?v=2.72.2">
+<script src="/react.js?v=18.2.0"></script>
+<script src="/react-dom.js?v=18.2.0"></script>
+<script src="/semi-ui.js?v=2.72.2"></script>
+<script src="/range-picker.js?v=9"></script>
 <style>
   :root{
     --bg:#e6e9f0;          /* 页面浅灰(压深,减对比) */
@@ -39,9 +43,10 @@
   .rangenote{color:var(--muted);font-size:12px;margin:10px 0 16px}
   .dateinput{background:#fdfdff;border:1px solid var(--border);border-radius:8px;color:var(--text);padding:7px 9px;font-size:13px;font-family:inherit}
   .dateinput:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px rgba(79,70,229,.12)}
-  /* 总览工具条日期范围:与管理端同一 flatpickr 控件;内嵌 CSS 是暗色主题,此处整体覆盖成客户端浅色 */
-  /* 页面当前以约 200% 缩放显示；300 CSS px 对应截图中约 600px 的目标宽度。 */
-  #ovBar .srp-wrap,#logsBar .srp-wrap{width:300px;min-width:0;flex:0 0 300px}
+  /* 总览与日志共用 NewAPI 同款 Semi DatePicker；与 Monitor 保持相同宽度。 */
+  #ovBar .srp-wrap,#logsBar .srp-wrap{width:320px;min-width:0;flex:0 0 320px}
+  .srp-wrap>.semi-datepicker{width:100%}
+  .semi-input-wrapper,.semi-datepicker-range-input{border-radius:10px!important}
   @media(max-width:600px){#ovBar .srp-wrap,#logsBar .srp-wrap{width:100%;flex-basis:100%}}
   .flatpickr-calendar{background:#fff;border:1px solid var(--border);box-shadow:0 8px 24px rgba(30,40,70,.16)}
   .flatpickr-calendar.arrowTop:before{border-bottom-color:var(--border)}
@@ -288,7 +293,7 @@
 <div id="listView">
   <div class="card"><div class="card-header">每日消费趋势 <span class="sub">· 全公司范围内每日消耗</span></div><div id="trendChart"></div></div>
   <div class="card" id="mxCard">
-    <div class="card-header">每日用量 <span class="sub">· 行=成员,列=日期,格=当日消耗(美元)· 点成员看明细</span></div>
+    <div class="card-header">每日用量 <span class="sub">· 行=成员,列=日期,格=当日消费(美元)· 点成员看明细</span></div>
     <div class="mxwrap"><table><thead id="thMx"></thead><tbody id="tbMx"></tbody></table></div>
     <div id="mxPager" class="pager"></div>
   </div>
@@ -402,49 +407,74 @@ const fmtNum=n=>(+n||0).toLocaleString('en-US');
 // 紧凑数字:大数用 k/M/B(1位小数去尾零),避免小卡片挤爆
 const fmtCompact=n=>{n=+n||0;const a=Math.abs(n);for(const [d,u] of [[1e9,'B'],[1e6,'M'],[1e3,'k']]){if(a>=d){const v=n/d;return (Math.abs(v)>=100?v.toFixed(0):v.toFixed(1)).replace(/\.0$/,'')+u;}}return n.toLocaleString('en-US');};
 const fmtCell=v=>v>=0.005?'$'+v.toFixed(2):(v>0?'<$0.01':'$0.00');
-// 日志默认滚动查 25 小时：向前 24 小时，并向后多留 1 小时等上游日志写入，避免刚发生的日志因延迟漏掉。
 let range='7d',ov=null,detailUid=null;
+let overviewSeq=0,overviewAbort=null,breakdownSeq=0,breakdownAbort=null,detailSeq=0,detailAbort=null;
+let logStack=[0],logHasMore=false,logNextCursor=0,logLoading=false,logTotal=null,logDirty=false;
+let logSeq=0,logAbort=null,logRowsCache=[];
+let lastLoadedRange={range:'7d',customFrom:'',customTo:''};
 
 let customFrom='',customTo='';
-let recent25hFrom='',recent25hTo=''; // 在本次页面打开时固化，翻页/刷新不让窗口每秒漂移
-const dateTimeText=t=>{const p=n=>String(n).padStart(2,'0');return t.getFullYear()+'-'+p(t.getMonth()+1)+'-'+p(t.getDate())+' '+p(t.getHours())+':'+p(t.getMinutes())+':'+p(t.getSeconds())};
-function recent25hRange(){
-  if(!recent25hFrom){const now=new Date(),from=new Date(now.getTime()-24*3600*1000),to=new Date(now.getTime()+3600*1000);recent25hFrom=dateTimeText(from);recent25hTo=dateTimeText(to);}
-  return {from:recent25hFrom,to:recent25hTo};
-}
-function rangeDates(r){ // 以本地日期为准(东八区客户),与服务端 CST 切日一致
+const cstDayStr=off=>{const d=new Date(Date.now()+8*3600*1000-(off||0)*86400000);return d.getUTCFullYear()+'-'+String(d.getUTCMonth()+1).padStart(2,'0')+'-'+String(d.getUTCDate()).padStart(2,'0')};
+const addDaysStr=(value,n)=>{const [y,m,d]=value.split('-').map(Number),x=new Date(Date.UTC(y,m-1,d+n));return x.getUTCFullYear()+'-'+String(x.getUTCMonth()+1).padStart(2,'0')+'-'+String(x.getUTCDate()).padStart(2,'0')};
+function rangeDates(r){ // 所有自然日以服务端 Asia/Shanghai 口径为准，不受访问者浏览器时区影响
   if(r==='custom')return {from:customFrom,to:customTo};
-  if(r==='recent25h')return recent25hRange();
-  const d=new Date(),p=n=>String(n).padStart(2,'0');
-  const ymd=t=>t.getFullYear()+'-'+p(t.getMonth()+1)+'-'+p(t.getDate());
-  if(r==='week'){const from=new Date(d);from.setDate(d.getDate()-d.getDay());return {from:ymd(from),to:ymd(d)};}
-  if(r==='month'){const from=new Date(d.getFullYear(),d.getMonth(),1);return {from:ymd(from),to:ymd(d)};}
+  const today=cstDayStr(0),d=day(today);
+  if(r==='week'){const from=new Date(d);from.setDate(d.getDate()-d.getDay());const to=new Date(from);to.setDate(from.getDate()+6);return {from:ymd(from),to:ymd(to)};}
+  if(r==='month'){const from=new Date(d.getFullYear(),d.getMonth(),1),to=new Date(d.getFullYear(),d.getMonth()+1,0);return {from:ymd(from),to:ymd(to)};}
   const days={today:0,'7d':6,'15d':14,'30d':29,'90d':89,halfyear:179,year:364}[r]??6;
-  const from=new Date(d);from.setDate(d.getDate()-days);
-  return {from:ymd(from),to:ymd(d)};
+  return {from:addDaysStr(today,-days),to:today};
+}
+
+// 日期切换是一个整体操作：总览、分组/模型、明细和日志必须属于同一范围。
+// 新总览发起前立即取消旧的下游请求；新总览失败则把控件恢复到最后一次成功范围，
+// 避免“新日期控件 + 旧数据”长期并存。
+function cancelPortalDependentLoads(){
+  if(breakdownAbort)breakdownAbort.abort();
+  breakdownSeq++;
+  if(detailAbort)detailAbort.abort();
+  detailSeq++;
+  if(logAbort)logAbort.abort();
+  logSeq++;logLoading=false;
+}
+function restoreLastLoadedRange(){
+  range=lastLoadedRange.range;customFrom=lastLoadedRange.customFrom;customTo=lastLoadedRange.customTo;
+  syncOvBar();
 }
 // 天数(含两端);超过一年由此拦下,与服务端 maxUsageDays 一致
 function spanDays(from,to){return Math.round((new Date(to)-new Date(from))/86400000)+1;}
-async function api(url){
-  const r=await fetch(url,{headers:{'Accept':'application/json'}});
+async function api(url,options){
+  const opts=Object.assign({},options||{});
+  opts.headers=Object.assign({'Accept':'application/json'},opts.headers||{});
+  const r=await fetch(url,opts);
   if(r.status===401){location.href='/login';throw new Error('未登录')}
   return r.json();
 }
 async function load(){
+  const seq=++overviewSeq;
+  if(overviewAbort)overviewAbort.abort();
+  overviewAbort=new AbortController();
+  cancelPortalDependentLoads();
   const {from,to}=rangeDates(range);
-  const d=await api(`/api/overview?from=${from}&to=${to}`);
-  if(!d.ok)return;
-  ov=d.data;
-  $('coName').textContent=ov.group_name||'';
-  const rangeLabel=range==='recent25h'?`${from} ~ ${to}`:`${ov.from} ~ ${ov.to}`;
-  $('rangeNote').textContent=`统计范围 ${rangeLabel}`;
-  $('logRangeNote').textContent=`统计范围 ${rangeLabel}`;
-  syncOvBar(); // 总览工具条(预设高亮/起止框)随当前范围同步(含从日志视图改的范围)
-  mxPage=1;renderStat();renderMatrix();renderTrend();renderMemberBar();loadBreakdown();
-  fillMemberSelect();
-  if(detailUid){detailTok?loadTokenDetail(detailTok.tid,detailTok.name):loadDetail(detailUid);} // 切范围时明细页(成员/令牌)跟着刷新
-  if(view==='logs')loadLogs(true);    // 日志视图下切范围 → 重新拉第一页
-  else logDirty=true;                 // 总览里改的范围:回日志视图时强制重拉,防止显旧窗口数据
+  try{
+    const d=await api(`/api/overview?from=${from}&to=${to}`,{signal:overviewAbort.signal});
+    if(seq!==overviewSeq)return;
+    if(!d.ok){restoreLastLoadedRange();$('ovErr').textContent=d.error||'加载失败，请重试';return;}
+    ov=d.data;
+    lastLoadedRange={range,customFrom,customTo};
+    $('ovErr').textContent='';
+    $('coName').textContent=ov.group_name||'';
+    const rangeLabel=`${ov.from} ~ ${ov.to}`;
+    $('rangeNote').textContent=`统计范围 ${rangeLabel}`;
+    $('logRangeNote').textContent=`统计范围 ${rangeLabel}`;
+    syncOvBar(); // 总览工具条(预设高亮/起止框)随当前范围同步(含从日志视图改的范围)
+    mxPage=1;renderStat();renderMatrix();renderTrend();renderMemberBar();loadBreakdown();
+    fillMemberSelect();
+    if(detailUid){detailTok?loadTokenDetail(detailTok.tid,detailTok.name):loadDetail(detailUid);} // 切范围时明细页(成员/令牌)跟着刷新
+    if(view==='logs')loadLogs(true);    // 日志视图下切范围 → 重新拉第一页
+    else logDirty=true;                 // 总览里改的范围:回日志视图时强制重拉,防止显旧窗口数据
+  }catch(e){
+    if(e.name!=='AbortError'&&seq===overviewSeq){restoreLastLoadedRange();$('ovErr').textContent='加载失败，请重试';}
+  }
 }
 // 成员下拉:来自已加载的总览成员(值=user_id)
 function fillMemberSelect(){
@@ -455,7 +485,7 @@ function fillMemberSelect(){
   if(cur&&us.some(u=>String(u.user_id)===cur))sel.value=cur; else sel.value='';
   cboxSetDisplay('logMember');
 }
-// 可搜索下拉(成员/模型/分组):真实值仍是隐藏 select,input 只做过滤展示层
+// 可搜索下拉：成员只能选名单项；模型/分组还允许提交精确文本，以覆盖只出现在错误日志里的值。
 function cboxOptions(id){return [...$(id).options].map(o=>({v:o.value,t:o.textContent}));}
 function cboxSetDisplay(id){
   const sel=$(id),q=$(id+'Q');if(!q)return;
@@ -469,18 +499,28 @@ function cboxRenderPop(id,kw){
   pop.innerHTML=list.length?list.map(o=>`<div class="cbox-opt${o.v===sel.value?' sel':''}" data-v="${esc(o.v)}">${esc(o.t)}</div>`).join(''):'<div class="cbox-empty">无匹配项</div>';
 }
 function cboxClose(id){$(id+'Pop').classList.remove('open');cboxSetDisplay(id);}
-function cboxInit(id,onPick){
+function cboxCommitCustom(id){
+  const sel=$(id),q=$(id+'Q'),raw=(q.value||'').trim();
+  const exact=cboxOptions(id).find(o=>o.t===raw||o.v===raw);
+  if(exact){sel.value=exact.v;return exact.v;}
+  if(!raw){sel.value='';return '';}
+  const opt=document.createElement('option');opt.value=raw;opt.textContent=raw;opt.dataset.custom='1';sel.appendChild(opt);sel.value=raw;
+  return raw;
+}
+function cboxInit(id,onPick,allowCustom){
   const q=$(id+'Q'),pop=$(id+'Pop'),sel=$(id);
   q.addEventListener('focus',()=>{q.select();cboxRenderPop(id,'');pop.classList.add('open');});
   q.addEventListener('input',()=>{cboxRenderPop(id,q.value);pop.classList.add('open');});
   q.addEventListener('keydown',e=>{
     if(e.key==='Escape'){cboxClose(id);q.blur();return;}
     if(e.key==='Enter'){
-      const first=pop.querySelector('.cbox-opt');
-      if(first){sel.value=first.dataset.v;cboxClose(id);onPick();}
+      if(allowCustom)cboxCommitCustom(id);
+      else{const first=pop.querySelector('.cbox-opt');if(first)sel.value=first.dataset.v;}
+      cboxClose(id);onPick();
       e.preventDefault();
     }
   });
+  if(allowCustom)q.addEventListener('change',()=>cboxCommitCustom(id));
   pop.addEventListener('click',e=>{
     const o=e.target.closest('.cbox-opt');if(!o)return;
     sel.value=o.dataset.v;cboxClose(id);onPick();
@@ -490,17 +530,21 @@ function cboxInit(id,onPick){
 }
 // 组织级(整组)按分组/按模型
 async function loadBreakdown(){
+  const seq=++breakdownSeq;
+  if(breakdownAbort)breakdownAbort.abort();
+  breakdownAbort=new AbortController();
   const {from,to}=rangeDates(range);
   try{
-    const d=await api(`/api/breakdown?from=${from}&to=${to}`);
-    if(!d.ok)return;
-    renderDim('thBdGroup','tbBdGroup',d.data.by_group);
-    renderDim('thBdModel','tbBdModel',d.data.by_model);
+    const d=await api(`/api/breakdown?from=${from}&to=${to}`,{signal:breakdownAbort.signal});
+    if(seq!==breakdownSeq)return;
+    if(!d.ok){$('ovErr').textContent=d.error||'分组与模型统计加载失败，请重试';return;}
+    renderDim('thBdGroup','tbBdGroup',d.data.by_group,d.data.by_group_truncated);
+    renderDim('thBdModel','tbBdModel',d.data.by_model,d.data.by_model_truncated);
     groupPieCh=getCh(groupPieCh,'groupPie');renderModelPie(groupPieCh,d.data.by_group);
     modelPieCh=getCh(modelPieCh,'modelPie');renderModelPie(modelPieCh,d.data.by_model);
     fillFilterSelect('logModel','全部模型',d.data.by_model);
     fillFilterSelect('logGroup','全部分组',d.data.by_group);
-  }catch(e){}
+  }catch(e){if(e.name!=='AbortError'&&seq===breakdownSeq)$('ovErr').textContent='分组与模型统计加载失败，请重试';}
 }
 // 日志筛选下拉:来自当前范围的按模型/按分组汇总(键=名称);尽量保留用户已选值
 function fillFilterSelect(id,allLabel,rows){
@@ -508,8 +552,21 @@ function fillFilterSelect(id,allLabel,rows){
   const cur=sel.value;
   const keys=(rows||[]).map(r=>r.key).filter(Boolean).sort();
   sel.innerHTML=`<option value="">${allLabel}</option>`+keys.map(k=>`<option value="${esc(k)}">${esc(k)}</option>`).join('');
-  if(cur&&keys.includes(cur))sel.value=cur; else sel.value='';
+  if(cur&&!keys.includes(cur)){const opt=document.createElement('option');opt.value=cur;opt.textContent=cur;opt.dataset.custom='1';sel.appendChild(opt);}
+  sel.value=cur||'';
   cboxSetDisplay(id);
+}
+
+// 错误日志可能使用从未产生消费记录的模型/分组，无法出现在消费聚合下拉中。
+// 当前页日志里的真实值会补进建议项，同时输入框允许直接输入精确值，不再因“仅错误”而无法筛选。
+function mergeLogFilterOptions(rows){
+  for(const [id,field] of [['logModel','model_name'],['logGroup','group']]){
+    const sel=$(id),known=new Set(cboxOptions(id).map(o=>o.v));
+    [...new Set((rows||[]).map(r=>(r[field]||'').trim()).filter(Boolean))].sort().forEach(v=>{
+      if(known.has(v))return;const opt=document.createElement('option');opt.value=v;opt.textContent=v;sel.appendChild(opt);known.add(v);
+    });
+    cboxSetDisplay(id);
+  }
 }
 // ---- 图表(echarts;数据全来自已加载的 ov / breakdown / detail,不额外请求) ----
 const AXIS='#64748b',SPLIT='#eceff4',AMBER='#e08700',GRAYLINE='#9aa2b0';
@@ -528,25 +585,21 @@ function renderTrend(){
   const byModel=(ov.by_model||[]).filter(r=>+r.cost_usd>0);
   const days=(ov.days||[]).slice().reverse(); // 旧→新;ov.days 本身就是连续日期轴(含0消耗天),矩阵表也靠它
   if(!days.length||!byModel.length){emptyChart(trendCh);return;}
-  const byDateModel={};dailyByModel.forEach(r=>{(byDateModel[r.date]||(byDateModel[r.date]={}))[r.model||'—']=r;});
+  const OTHER_MODEL='__other_models__';
+  const byDateModel={};dailyByModel.forEach(r=>{(byDateModel[r.date]||(byDateModel[r.date]={}))[r.other?OTHER_MODEL:(r.model||'—')]=r;});
   const topNames=byModel.slice(0,DAILY_STACK_TOP).map(r=>r.key||'—');
-  const restNames=new Set(byModel.slice(DAILY_STACK_TOP).map(r=>r.key||'—'));
-  const names=restNames.size?[...topNames,'其他']:topNames;
-  const series=names.map((name,i)=>({
-    name,type:'bar',stack:'d',barWidth:'38%',barCategoryGap:'32%',
-    itemStyle:{color:name==='其他'?GRAYLINE:MODEL_PALETTE[i%MODEL_PALETTE.length],borderRadius:i===names.length-1?[4,4,0,0]:0},
+  const modelKeys=dailyByModel.some(r=>r.other&&+r.cost_usd>0)?[...topNames,OTHER_MODEL]:topNames;
+  const series=modelKeys.map((key,i)=>({
+    name:key===OTHER_MODEL?'其他模型':key,type:'bar',stack:'d',barWidth:'38%',barCategoryGap:'32%',
+    itemStyle:{color:key===OTHER_MODEL?GRAYLINE:MODEL_PALETTE[i%MODEL_PALETTE.length],borderRadius:i===modelKeys.length-1?[4,4,0,0]:0},
     data:days.map(d=>{
       const m=byDateModel[d]||{};
-      if(name==='其他'){
-        let cost=0,tok=0;restNames.forEach(n=>{const r=m[n];if(r){cost+=+r.cost_usd||0;tok+=+r.tokens||0;}});
-        return {value:+cost.toFixed(4),tokens:tok};
-      }
-      const r=m[name];
+      const r=m[key];
       return {value:r?+(+r.cost_usd).toFixed(4):0,tokens:r?r.tokens:0};
     })
   }));
   trendCh.setOption({
-    grid:{left:50,right:20,top:names.length>1?50:28,bottom:28},
+    grid:{left:50,right:20,top:modelKeys.length>1?50:28,bottom:28},
     tooltip:Object.assign({trigger:'axis',axisPointer:{type:'shadow'},formatter:params=>{
       const lines=params.filter(p=>+p.value>0).map(p=>`${esc(p.seriesName)}: $${(+p.value).toFixed(4)}${p.data&&p.data.tokens?' ('+fmtCompact(p.data.tokens)+' tokens)':''}`);
       const total=params.reduce((s,p)=>s+(+p.value||0),0);
@@ -554,7 +607,7 @@ function renderTrend(){
       const footer=lines.length>1?`<br/><b>总计: $${total.toFixed(4)}${totalTok?' ('+fmtCompact(totalTok)+' tokens)':''}</b>`:'';
       return `${(params[0]&&params[0].axisValueLabel)||''}<br/>${lines.join('<br/>')||'无消耗'}${footer}`;
     }},TIP),
-    legend:names.length>1?{type:'scroll',data:names,textStyle:{color:'#6d7684',fontSize:12},top:6,itemGap:16,itemWidth:20,itemHeight:12}:undefined,
+    legend:modelKeys.length>1?{type:'scroll',data:modelKeys.map(k=>k===OTHER_MODEL?'其他模型':k),textStyle:{color:'#6d7684',fontSize:12},top:6,itemGap:16,itemWidth:20,itemHeight:12}:undefined,
     xAxis:{type:'category',data:days.map(d=>d.slice(5)),axisLabel:{color:'#64748b',fontSize:11},axisLine:{lineStyle:{color:'#d7dce6'}}},
     yAxis:{type:'value',splitNumber:5,axisLabel:{color:'#64748b',fontSize:11,formatter:'${value}'},splitLine:{lineStyle:{color:'#eceff4'}}},
     series
@@ -596,7 +649,7 @@ function renderStat(){
   us.forEach(u=>{used+=(+u.total_used_usd||0);rangeSum+=(+u.total_usd||0);if(u.balance_usd!=null){bal+=(+u.balance_usd);balKnown=true}});
   $('statBar').innerHTML=
     `<span class="s"><span class="sl">累计总消耗</span><span class="sv amber" title="终身累计,不受日期范围影响">${fmtCost(used)}</span></span><span class="div"></span>`
-   +`<span class="s"><span class="sl">范围消耗</span><span class="sv">${fmtCost(rangeSum)}</span></span><span class="div"></span>`
+   +`<span class="s"><span class="sl">范围消费</span><span class="sv">${fmtCost(rangeSum)}</span></span><span class="div"></span>`
    +`<span class="s"><span class="sl">当前总余额</span><span class="sv green">${balKnown?fmtCost(bal):'—'}</span></span><span class="div"></span>`
    +`<span class="s"><span class="sl">成员数</span><span class="sv">${us.length}</span></span>`;
 }
@@ -608,7 +661,7 @@ function renderMatrix(){
   const heat=v=>v>0&&maxCost>0?` style="background:rgba(var(--heat),${(0.07+0.30*Math.sqrt(v/maxCost)).toFixed(3)})"`:'';
   const colspan=days.length+4;
   $('thMx').innerHTML='<tr><th>成员</th><th class="right" style="color:var(--green)">余额</th><th class="right" style="color:var(--amber)" title="终身累计,不受日期范围影响">累计总消耗</th>'
-    +days.map(d=>`<th class="right" title="${esc(d)}">${esc(d.slice(5))}</th>`).join('')+'<th class="right">范围消耗</th></tr>';
+    +days.map(d=>`<th class="right" title="${esc(d)} · 单元格显示消费">${esc(d.slice(5))}</th>`).join('')+'<th class="right">范围消费</th></tr>';
   const q=mxSearch.trim().toLowerCase();
   const us=q?all.filter(u=>(u.username||'').toLowerCase().includes(q)||(u.email||'').toLowerCase().includes(q)):all;
   if(!us.length){$('tbMx').innerHTML=`<tr><td colspan="${colspan}" class="muted" style="text-align:center;padding:22px">${q?'无匹配成员':'暂无成员数据'}</td></tr>`;$('mxPager').innerHTML='';return}
@@ -622,13 +675,13 @@ function renderMatrix(){
     let tds='';
     for(const day of days){
       const c=cell.get(u.user_id+'|'+day);
-      tds+=`<td class="right num"${c?heat(c.cost_usd):''}${c?` title="${esc(day)} · $${c.cost_usd.toFixed(4)}"`:''}>${c?fmtCell(c.cost_usd):'<span class="dash">—</span>'}</td>`;
+      tds+=`<td class="right num"${c?heat(c.cost_usd):''}${c?` title="${esc(day)} · 消费 $${c.cost_usd.toFixed(4)}"`:''}>${c?fmtCell(c.cost_usd):'<span class="dash">—</span>'}</td>`;
     }
     const bal=u.balance_usd==null?'<span class="muted">—</span>':(u.balance_usd<0?`<span style="color:var(--red);font-weight:600">${fmtCost(u.balance_usd)}</span>`:`<span style="color:var(--green)">${fmtCost(u.balance_usd)}</span>`);
     const used=u.total_used_usd==null?'<span class="muted">—</span>':`<b style="color:var(--amber)">${fmtCost(u.total_used_usd)}</b>`;
     const uname=u.username||'#'+u.user_id,uTitle=uname+(u.email?' · '+u.email:'');
     return `<tr><td><a class="ucell" data-uid="${u.user_id}" title="${esc(uTitle)}"><span class="u-name">${esc(uname)}</span><span class="u-mail">${esc(u.email||'')}</span></a></td>`
-      +`<td class="right num">${bal}</td><td class="right num">${used}</td>${tds}<td class="right num"><b>${fmtCost(u.total_usd)}</b></td></tr>`;
+      +`<td class="right num">${bal}</td><td class="right num">${used}</td>${tds}<td class="right num">${fmtCost(u.total_usd)}</td></tr>`;
   }).join('')
   +`<tr class="mxfoot"><td>合计${q?'(筛选)':''}</td><td></td><td class="right num" style="color:var(--amber)">${fmtCost(us.reduce((s,u)=>s+(+u.total_used_usd||0),0))}</td>`
   +days.map(d=>`<td class="right num">${d in daySum?fmtCell(daySum[d]):'<span class="dash">—</span>'}</td>`).join('')
@@ -652,27 +705,23 @@ function drawDailyChart(daily,dailyByModel,byModel){
   const {from,to}=rangeDates(range);
   const dates=[];
   for(let d=new Date(from+'T00:00:00'),end=new Date(to+'T00:00:00');d<=end;d.setDate(d.getDate()+1))dates.push(ymd(d));
-  const byDateModel={};dailyByModel.forEach(r=>{(byDateModel[r.date]||(byDateModel[r.date]={}))[r.model||'—']=r;});
+  const OTHER_MODEL='__other_models__';
+  const byDateModel={};dailyByModel.forEach(r=>{(byDateModel[r.date]||(byDateModel[r.date]={}))[r.other?OTHER_MODEL:(r.model||'—')]=r;});
   const topNames=byModel.slice(0,DAILY_STACK_TOP).map(r=>r.key||'—');
-  const restNames=new Set(byModel.slice(DAILY_STACK_TOP).map(r=>r.key||'—'));
-  const names=restNames.size?[...topNames,'其他']:topNames;
-  const series=names.map((name,i)=>({
-    name,type:'bar',stack:'d',barWidth:'38%',barCategoryGap:'32%',
-    itemStyle:{color:name==='其他'?GRAYLINE:MODEL_PALETTE[i%MODEL_PALETTE.length],borderRadius:i===names.length-1?[4,4,0,0]:0},
+  const modelKeys=dailyByModel.some(r=>r.other&&+r.cost_usd>0)?[...topNames,OTHER_MODEL]:topNames;
+  const series=modelKeys.map((key,i)=>({
+    name:key===OTHER_MODEL?'其他模型':key,type:'bar',stack:'d',barWidth:'38%',barCategoryGap:'32%',
+    itemStyle:{color:key===OTHER_MODEL?GRAYLINE:MODEL_PALETTE[i%MODEL_PALETTE.length],borderRadius:i===modelKeys.length-1?[4,4,0,0]:0},
     data:dates.map(d=>{
       const m=byDateModel[d]||{};
-      if(name==='其他'){
-        let cost=0,tok=0;restNames.forEach(n=>{const r=m[n];if(r){cost+=+r.cost_usd||0;tok+=+r.tokens||0;}});
-        return {value:+cost.toFixed(4),tokens:tok};
-      }
-      const r=m[name];
+      const r=m[key];
       return {value:r?+(+r.cost_usd).toFixed(4):0,tokens:r?r.tokens:0};
     })
   }));
   if(!dailyChart)dailyChart=echarts.init($('dailyChart'));
-  if(!names.length){emptyChart(dailyChart);return;}
+  if(!modelKeys.length){emptyChart(dailyChart);return;}
   dailyChart.setOption({
-    grid:{left:50,right:20,top:names.length>1?50:28,bottom:28},
+    grid:{left:50,right:20,top:modelKeys.length>1?50:28,bottom:28},
     tooltip:Object.assign({trigger:'axis',axisPointer:{type:'shadow'},formatter:params=>{
       const lines=params.filter(p=>+p.value>0).map(p=>`${esc(p.seriesName)}: $${(+p.value).toFixed(4)}${p.data&&p.data.tokens?' ('+fmtCompact(p.data.tokens)+' tokens)':''}`);
       const total=params.reduce((s,p)=>s+(+p.value||0),0);
@@ -680,7 +729,7 @@ function drawDailyChart(daily,dailyByModel,byModel){
       const footer=lines.length>1?`<br/><b>总计: $${total.toFixed(4)}${totalTok?' ('+fmtCompact(totalTok)+' tokens)':''}</b>`:'';
       return `${(params[0]&&params[0].axisValueLabel)||''}<br/>${lines.join('<br/>')||'无消耗'}${footer}`;
     }},TIP),
-    legend:names.length>1?{type:'scroll',data:names,textStyle:{color:'#6d7684',fontSize:12},top:6,itemGap:16,itemWidth:20,itemHeight:12}:undefined,
+    legend:modelKeys.length>1?{type:'scroll',data:modelKeys.map(k=>k===OTHER_MODEL?'其他模型':k),textStyle:{color:'#6d7684',fontSize:12},top:6,itemGap:16,itemWidth:20,itemHeight:12}:undefined,
     xAxis:{type:'category',data:dates.map(d=>d.slice(5)),axisLabel:{color:'#64748b',fontSize:11},axisLine:{lineStyle:{color:'#d7dce6'}}},
     yAxis:{type:'value',splitNumber:5,axisLabel:{color:'#64748b',fontSize:11,formatter:'${value}'},splitLine:{lineStyle:{color:'#eceff4'}}},
     series
@@ -688,67 +737,81 @@ function drawDailyChart(daily,dailyByModel,byModel){
   setTimeout(()=>dailyChart.resize(),50);
 }
 async function loadDetail(uid){
+  const seq=++detailSeq;
+  if(detailAbort)detailAbort.abort();
+  detailAbort=new AbortController();
   const {from,to}=rangeDates(range);
-  const d=await api(`/api/user?uid=${uid}&from=${from}&to=${to}`);
-  if(!d.ok)return;
-  detailUid=uid;detailTok=null;
-  const u=(ov.users||[]).find(x=>x.user_id===uid)||{};
-  $('listView').style.display='none';$('detail').style.display='block';
-  $('tokCard').style.display='';
-  $('dTitle').textContent=(u.username||('#'+uid))+(u.email?' · '+u.email:'');
-  const st=d.data.stats||{},s=st.summary||{};
-  renderDim('thBdGroupD','tbBdGroupD',st.by_group);
-  renderDim('thModel','tbModel',st.by_model);
-  dModelPieCh=getCh(dModelPieCh,'dModelPie');renderModelPie(dModelPieCh,st.by_model);
-  renderTokens(d.data.by_token);
-  const cards=[
-    ['累计总消耗',d.data.total_used_usd==null?'—':fmtCost(d.data.total_used_usd),'var(--amber)'],
-    ['范围消耗',fmtCost(s.cost_usd),'var(--text)'],
-    ['余额',d.data.balance_usd==null?'—':fmtCost(d.data.balance_usd),'var(--green)'],
-    ['请求数',(s.requests||0).toLocaleString('en-US'),'var(--text)'],
-    ['Tokens',`<span title="${fmtNum(s.tokens)} tokens">${fmtCompact(s.tokens)}</span>`,'var(--text)'],
-  ];
-  $('dCards').innerHTML=cards.map(([l,v,col,cls])=>`<div class="stat-card${cls?' '+cls:''}"><div class="stat-label">${l}</div><div class="stat-value num" style="color:${col}">${v}</div></div>`).join('');
-  drawDailyChart(st.daily,st.daily_by_model,st.by_model);
+  try{
+    const d=await api(`/api/user?uid=${uid}&from=${from}&to=${to}`,{signal:detailAbort.signal});
+    if(seq!==detailSeq)return;
+    if(!d.ok){$('ovErr').textContent=d.error||'成员详情加载失败，请重试';return;}
+    detailUid=uid;detailTok=null;
+    const u=(ov.users||[]).find(x=>x.user_id===uid)||{};
+    $('listView').style.display='none';$('detail').style.display='block';
+    $('tokCard').style.display='';
+    $('dTitle').textContent=(u.username||('#'+uid))+(u.email?' · '+u.email:'');
+    const st=d.data.stats||{},s=st.summary||{};
+    renderDim('thBdGroupD','tbBdGroupD',st.by_group,st.by_group_truncated);
+    renderDim('thModel','tbModel',st.by_model,st.by_model_truncated);
+    dModelPieCh=getCh(dModelPieCh,'dModelPie');renderModelPie(dModelPieCh,st.by_model);
+    renderTokens(d.data.by_token);
+    const cards=[
+      ['累计总消耗',d.data.total_used_usd==null?'—':fmtCost(d.data.total_used_usd),'var(--amber)'],
+      ['范围消费',fmtCost(s.cost_usd),'var(--text)'],
+      ['余额',d.data.balance_usd==null?'—':fmtCost(d.data.balance_usd),'var(--green)'],
+      ['请求数',(s.requests||0).toLocaleString('en-US'),'var(--text)'],
+      ['Tokens',`<span title="${fmtNum(s.tokens)} tokens">${fmtCompact(s.tokens)}</span>`,'var(--text)'],
+    ];
+    $('dCards').innerHTML=cards.map(([l,v,col,cls])=>`<div class="stat-card${cls?' '+cls:''}"><div class="stat-label">${l}</div><div class="stat-value num" style="color:${col}">${v}</div></div>`).join('');
+    drawDailyChart(st.daily,st.daily_by_model,st.by_model);
+  }catch(e){if(e.name!=='AbortError'&&seq===detailSeq)$('ovErr').textContent='成员详情加载失败，请重试';}
 }
 // 令牌详情:成员详情下钻一层;同一详情面板换令牌口径渲染,按令牌卡隐藏(单令牌无此维度)
 async function loadTokenDetail(tid,tname){
+  const seq=++detailSeq;
+  if(detailAbort)detailAbort.abort();
+  detailAbort=new AbortController();
   const {from,to}=rangeDates(range);
-  const d=await api(`/api/user?uid=${detailUid}&token_id=${tid}&from=${from}&to=${to}`);
-  if(!d.ok)return;
-  detailTok={tid,name:tname};
-  const u=(ov.users||[]).find(x=>x.user_id===detailUid)||{};
-  $('listView').style.display='none';$('detail').style.display='block';
-  $('tokCard').style.display='none';
-  const meta=d.data.token;
-  $('dTitle').textContent=(u.username||('#'+detailUid))+' / '+((meta&&meta.name)||tname)+((meta&&meta.deleted)?'(已删除)':'');
-  const st=d.data.stats||{},s=st.summary||{};
-  renderDim('thBdGroupD','tbBdGroupD',st.by_group);
-  renderDim('thModel','tbModel',st.by_model);
-  dModelPieCh=getCh(dModelPieCh,'dModelPie');renderModelPie(dModelPieCh,st.by_model);
-  const cards=[
-    ['密钥',meta&&meta.masked_key?`<span style="font-size:14px" class="maskkey" oncopy="return false" oncontextmenu="return false">${esc(meta.masked_key)}</span>`:'—','var(--text)','stat-card-wide'],
-    ['累计总消耗',meta&&meta.total_cost_usd!=null?fmtCost(meta.total_cost_usd):'—','var(--amber)'],
-    ['范围消耗',fmtCost(s.cost_usd),'var(--text)'],
-    ['请求数',(s.requests||0).toLocaleString('en-US'),'var(--text)'],
-    ['Tokens',`<span title="${fmtNum(s.tokens)} tokens">${fmtCompact(s.tokens)}</span>`,'var(--text)'],
-  ];
-  $('dCards').innerHTML=cards.map(([l,v,col,cls])=>`<div class="stat-card${cls?' '+cls:''}"><div class="stat-label">${l}</div><div class="stat-value num" style="color:${col}">${v}</div></div>`).join('');
-  drawDailyChart(st.daily,st.daily_by_model,st.by_model);
+  const uid=detailUid;
+  try{
+    const d=await api(`/api/user?uid=${uid}&token_id=${tid}&from=${from}&to=${to}`,{signal:detailAbort.signal});
+    if(seq!==detailSeq)return;
+    if(!d.ok){$('ovErr').textContent=d.error||'令牌详情加载失败，请重试';return;}
+    detailTok={tid,name:tname};
+    const u=(ov.users||[]).find(x=>x.user_id===uid)||{};
+    $('listView').style.display='none';$('detail').style.display='block';
+    $('tokCard').style.display='none';
+    const meta=d.data.token;
+    $('dTitle').textContent=(u.username||('#'+uid))+' / '+((meta&&meta.name)||tname)+((meta&&meta.deleted)?'(已删除)':'');
+    const st=d.data.stats||{},s=st.summary||{};
+    renderDim('thBdGroupD','tbBdGroupD',st.by_group,st.by_group_truncated);
+    renderDim('thModel','tbModel',st.by_model,st.by_model_truncated);
+    dModelPieCh=getCh(dModelPieCh,'dModelPie');renderModelPie(dModelPieCh,st.by_model);
+    const cards=[
+      ['密钥',meta&&meta.masked_key?`<span style="font-size:14px" class="maskkey" oncopy="return false" oncontextmenu="return false">${esc(meta.masked_key)}</span>`:'—','var(--text)','stat-card-wide'],
+      ['累计总消耗',meta&&meta.total_cost_usd!=null?fmtCost(meta.total_cost_usd):'—','var(--amber)'],
+      ['范围消费',fmtCost(s.cost_usd),'var(--text)'],
+      ['请求数',(s.requests||0).toLocaleString('en-US'),'var(--text)'],
+      ['Tokens',`<span title="${fmtNum(s.tokens)} tokens">${fmtCompact(s.tokens)}</span>`,'var(--text)'],
+    ];
+    $('dCards').innerHTML=cards.map(([l,v,col,cls])=>`<div class="stat-card${cls?' '+cls:''}"><div class="stat-label">${l}</div><div class="stat-value num" style="color:${col}">${v}</div></div>`).join('');
+    drawDailyChart(st.daily,st.daily_by_model,st.by_model);
+  }catch(e){if(e.name!=='AbortError'&&seq===detailSeq)$('ovErr').textContent='令牌详情加载失败，请重试';}
 }
-// 通用维度表(名称/请求/Tokens/费用)
-function renderDim(thId,tbId,rows){
+// 通用维度表(名称/请求/Tokens/消费)
+function renderDim(thId,tbId,rows,truncated){
   const th=$(thId),tb=$(tbId);if(!tb)return;
-  if(th)th.innerHTML='<tr><th>名称</th><th class="right">请求</th><th class="right">Tokens</th><th class="right">费用</th></tr>';
+  if(th)th.innerHTML='<tr><th>名称</th><th class="right">请求</th><th class="right">Tokens</th><th class="right">消费</th></tr>';
   rows=rows||[];
   tb.innerHTML=rows.length?rows.map(r=>`<tr><td>${esc(r.key||'—')}</td><td class="right num">${(r.requests||0).toLocaleString('en-US')}</td><td class="right num">${(r.tokens||0).toLocaleString('en-US')}</td><td class="right num">${fmtCost(r.cost_usd)}</td></tr>`).join('')
+    +(truncated?'<tr><td colspan="4" class="muted" style="text-align:center;padding:10px">维度较多，仅展示消费最高的前 300 项；汇总与每日趋势仍按完整数据计算。</td></tr>':'')
     :'<tr><td colspan="4" class="muted" style="text-align:center;padding:16px">范围内无数据</td></tr>';
 }
 // 按令牌:密钥列脱敏 + 不可选中复制(maskkey);数据来自服务端已脱敏字段,前端从不接触明文
 // 该用户全部现存令牌都列出(范围内零用量补0);已删除但范围内有消费的沉底单独分区+标记,保证分项加总=范围消耗合计
 // 累计总消耗=创建至今终身值,"—"=令牌已不可查(硬删/老日志)
 function renderTokens(rows){
-  $('thTok').innerHTML='<tr><th>所属用户</th><th>令牌名称</th><th>密钥</th><th>分组</th><th class="right">请求</th><th class="right">Tokens</th><th class="right">范围消耗</th><th class="right">累计总消耗</th></tr>';
+  $('thTok').innerHTML='<tr><th>所属用户</th><th>令牌名称</th><th>密钥</th><th>分组</th><th class="right">请求</th><th class="right">Tokens</th><th class="right">范围消费</th><th class="right">累计总消耗</th></tr>';
   rows=rows||[];
   if(!rows.length){$('tbTok').innerHTML='<tr><td colspan="8" class="muted" style="text-align:center;padding:16px">该用户暂无令牌记录</td></tr>';return}
   const tr=r=>{
@@ -762,12 +825,13 @@ function renderTokens(rows){
   };
   const live=rows.filter(r=>!r.deleted),del=rows.filter(r=>r.deleted); // 服务端已排好:现存在前已删沉底
   let html=live.map(tr).join('');
-  if(del.length)html+='<tr><td colspan="8" class="muted" style="font-size:11px;padding:10px 12px 4px;border-bottom:none">以下为已删除令牌(范围内仍有消费,计入合计)</td></tr>'+del.map(tr).join('');
+  if(del.length)html+='<tr><td colspan="8" class="muted" style="font-size:11px;padding:10px 12px 4px;border-bottom:none">以下为已删除令牌(范围内仍有用量记录,计入合计)</td></tr>'+del.map(tr).join('');
   $('tbTok').innerHTML=html;
 }
 // 返回:令牌详情→先回成员详情;成员详情→回列表
 function backToList(){
   if(detailTok){detailTok=null;loadDetail(detailUid);return}
+  detailSeq++;if(detailAbort)detailAbort.abort();
   detailUid=null;$('detail').style.display='none';$('listView').style.display='';
 }
 $('backLink').onclick=backToList;
@@ -785,32 +849,34 @@ $('mxPager').addEventListener('click',e=>{
   mxPage=+b.dataset.pg;renderMatrix();
   $('mxCard').scrollIntoView({block:'nearest'});
 });
-// ---- 日期选择器：与中转站使用日志同款双月范围控件（日期两端分别代表 00:00:00 / 23:59:59）----
+// ---- 日期选择器：只传自然日；服务端统一解释为 [开始日 00:00:00, 结束日次日 00:00:00) ----
 const ymd=d=>d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');
-const day=(s,isEnd)=>{const m=String(s).match(/^(\d{4})-(\d{2})-(\d{2})(?:[ T](\d{2}):(\d{2})(?::(\d{2}))?)?$/);if(!m)return null;return new Date(+m[1],+m[2]-1,+m[3],m[4]==null?(isEnd?23:0):+m[4],m[5]==null?(isEnd?59:0):+m[5],m[6]==null?(isEnd?59:0):+m[6])};
+const day=s=>{const m=String(s).match(/^(\d{4})-(\d{2})-(\d{2})$/);if(!m)return null;return new Date(+m[1],+m[2]-1,+m[3])};
 function weekStart(){const d=day(rangeDates('today').to);d.setDate(d.getDate()-d.getDay());return d}
+function weekEnd(){const d=weekStart();d.setDate(d.getDate()+6);return d}
 function monthStart(){const d=day(rangeDates('today').to);return new Date(d.getFullYear(),d.getMonth(),1)}
+function monthEnd(){const d=day(rangeDates('today').to);return new Date(d.getFullYear(),d.getMonth()+1,0)}
 const portalPresets=[
-  {key:'today',text:'今天',start:()=>day(rangeDates('today').to),end:()=>day(rangeDates('today').to,true)},
-  {key:'7d',text:'近 7 天',start:()=>day(rangeDates('7d').from),end:()=>day(rangeDates('7d').to,true)},
-  {key:'week',text:'本周',start:weekStart,end:()=>day(rangeDates('today').to,true)},
-  {key:'30d',text:'近 30 天',start:()=>day(rangeDates('30d').from),end:()=>day(rangeDates('30d').to,true)},
-  {key:'month',text:'本月',start:monthStart,end:()=>day(rangeDates('today').to,true)},
-  {key:'halfyear',text:'近半年',start:()=>day(rangeDates('halfyear').from),end:()=>day(rangeDates('halfyear').to,true)},
-  {key:'year',text:'近一年',start:()=>day(rangeDates('year').from),end:()=>day(rangeDates('year').to,true)}
+  {key:'today',text:'今天',start:()=>day(rangeDates('today').to),end:()=>day(rangeDates('today').to)},
+  {key:'7d',text:'近 7 天',start:()=>day(rangeDates('7d').from),end:()=>day(rangeDates('7d').to)},
+  {key:'week',text:'本周',start:weekStart,end:weekEnd},
+  {key:'30d',text:'近 30 天',start:()=>day(rangeDates('30d').from),end:()=>day(rangeDates('30d').to)},
+  {key:'month',text:'本月',start:monthStart,end:monthEnd},
+  {key:'halfyear',text:'近半年',start:()=>day(rangeDates('halfyear').from),end:()=>day(rangeDates('halfyear').to)},
+  {key:'year',text:'近一年',start:()=>day(rangeDates('year').from),end:()=>day(rangeDates('year').to)}
 ];
 let ovPicker=null,logPicker=null;
 function syncOvBar(){
   const {from,to}=rangeDates(range);
-  [ovPicker,logPicker].filter(Boolean).forEach(p=>p.setDate([day(from),day(to,true)],false));
+  [ovPicker,logPicker].filter(Boolean).forEach(p=>p.setDate([day(from),day(to)],false));
 }
 function applyPortalRange(sel,meta){
-  customFrom=dateTimeText(sel[0]);customTo=dateTimeText(sel[1]);range=meta.preset||'custom';
+  customFrom=ymd(sel[0]);customTo=ymd(sel[1]);range=meta.preset||'custom';
   $('ovErr').textContent='';syncOvBar();load();
 }
 const portalPickerOptions={
-  maxDate:rangeDates('today').to,maxDays:366,presets:portalPresets,
-  onChange:applyPortalRange,onClear:()=>{$('ovErr').textContent='';}
+  maxDays:366,presets:portalPresets,showClear:false,
+  onChange:applyPortalRange
 };
 ovPicker=new SemiRangePicker($('ovRange'),portalPickerOptions);
 logPicker=new SemiRangePicker($('logRange'),Object.assign({},portalPickerOptions));
@@ -825,7 +891,7 @@ $('pwSave').onclick=async()=>{
   try{
     const r=await fetch('/api/password',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({old:o,new:n})});
     const d=await r.json().catch(()=>({}));
-    if(r.ok&&d.ok){msg.className='msg ok';msg.textContent='✓ 已修改,下次可用新密码登录';setTimeout(()=>$('pwMask').style.display='none',1200)}
+    if(r.ok&&d.ok){msg.className='msg ok';msg.textContent='✓ 已修改，请重新登录';setTimeout(()=>location.href='/login',800)}
     else{msg.className='msg err';msg.textContent=d.error||'修改失败'}
   }catch(e){msg.className='msg err';msg.textContent='网络错误'}
 };
@@ -846,9 +912,9 @@ function showView(v){
 }
 document.querySelectorAll('#vnav a').forEach(a=>a.onclick=()=>showView(a.dataset.v));
 
-// 日志时间:MM-DD HH:mm:ss(本地=东八区客户)
-function fmtLogTime(ts){const d=new Date(ts*1000),p=n=>String(n).padStart(2,'0');
-  return `${p(d.getMonth()+1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;}
+// 日志时间固定按 Asia/Shanghai 展示，不跟随访问者电脑时区。
+function fmtLogTime(ts){const d=new Date(ts*1000+8*3600*1000),p=n=>String(n).padStart(2,'0');
+  return `${p(d.getUTCMonth()+1)}-${p(d.getUTCDate())} ${p(d.getUTCHours())}:${p(d.getUTCMinutes())}:${p(d.getUTCSeconds())}`;}
 // 类型小标(1充值/2消费/3管理/4系统/5错误/6退款)
 const LOG_TYPE={1:['充值','tp-topup'],2:['消费','tp-consume'],3:['管理','tp-manage'],4:['系统','tp-system'],5:['错误','tp-error'],6:['退款','tp-refund']};
 function typeTag(t){const m=LOG_TYPE[t]||['其它','tp-other'];return `<span class="tp ${m[1]}">${m[0]}</span>`;}
@@ -890,6 +956,7 @@ function logCostUSD(v){
 function logQuery(){
   const {from,to}=rangeDates(range);
   let q=`from=${from}&to=${to}`;
+  cboxCommitCustom('logModel');cboxCommitCustom('logGroup');
   const mem=$('logMember').value,mdl=$('logModel').value,grp=$('logGroup').value,typ=$('logType').value,tok=$('logToken').value.trim(),dkw=$('logDetailKw').value.trim(),rid=$('logRequestId').value.trim();
   if(mem)q+=`&member=${encodeURIComponent(mem)}`;
   if(mdl)q+=`&model=${encodeURIComponent(mdl)}`;
@@ -902,28 +969,28 @@ function logQuery(){
 }
 // 游标分页:logStack 记录各页起始游标(0=首页),末尾即当前页
 // logDirty:总览视图里改了日期时置位,回到日志视图时强制重拉(否则表格显旧窗口数据)
-// logPending:请求在途时又有新请求(如切筛选),排队而非丢弃,完成后自动补拉最新条件
-let logStack=[0],logHasMore=false,logNextCursor=0,logLoading=false,logTotal=null,logDirty=false,logPending=false;
-let logRowsCache=[]; // 当前页日志行(供详情弹窗按下标取回,见 renderLogRows)
+// 状态变量在脚本顶部统一声明，供日期切换在总览返回前立即取消旧日志请求。
 async function loadLogs(reset){
-  if(logLoading){if(reset)logPending=true;return;}
   if(reset)logStack=[0];
+  const seq=++logSeq;
+  if(logAbort)logAbort.abort();
+  logAbort=new AbortController();
   logLoading=true;
   const cursor=logStack[logStack.length-1];
   $('logTb').innerHTML=`<tr><td colspan="11" class="muted" style="text-align:center;padding:22px">加载中…</td></tr>`;
   // 加载中禁用翻页按钮:防在途点「下一页」改了 logStack 却被丢弃,导致页码与展示错位
   const pv=$('logPrev'),nx=$('logNext');if(pv)pv.disabled=true;if(nx)nx.disabled=true;
   try{
-    const d=await api(`/api/logs?${logQuery()}&cursor=${cursor}`);
+    const d=await api(`/api/logs?${logQuery()}&cursor=${cursor}`,{signal:logAbort.signal});
+    if(seq!==logSeq)return;
     if(!d.ok){$('logTb').innerHTML=`<tr><td colspan="11" class="muted" style="text-align:center;padding:22px">${esc(d.error||'加载失败')}</td></tr>`;$('logPager').innerHTML='';return;}
     logHasMore=!!d.has_more;logNextCursor=d.next_cursor||0;
     if(typeof d.total==='number')logTotal=d.total; // 仅首页返回,翻页复用
     renderLogRows(d.rows||[]);
     renderLogPager();
-  }catch(e){$('logTb').innerHTML=`<tr><td colspan="11" class="muted" style="text-align:center;padding:22px">网络错误,请重试</td></tr>`;}
+  }catch(e){if(e.name!=='AbortError'&&seq===logSeq)$('logTb').innerHTML=`<tr><td colspan="11" class="muted" style="text-align:center;padding:22px">网络错误,请重试</td></tr>`;}
   finally{
-    logLoading=false;
-    if(logPending){logPending=false;loadLogs(true);} // 在途期间有新筛选/范围 → 按最新条件补拉
+    if(seq===logSeq)logLoading=false;
   }
 }
 // 除详情外各列都照实显示(不按类型 gating);空值显 —,详情列可折行显全
@@ -931,6 +998,7 @@ const DASH='<span class="muted">—</span>';
 function renderLogRows(rows){
   hideLogRawTip();
   if(!rows.length){$('logTb').innerHTML=`<tr><td colspan="11" class="muted" style="text-align:center;padding:22px">所选范围暂无日志</td></tr>`;return;}
+  mergeLogFilterOptions(rows);
   logRowsCache=rows; // 供详情弹窗按下标取回整行(避免把整份 JSON 塞进 data-* 属性再解析)
   $('logTb').innerHTML=rows.map((r,i)=>{
     const grp=r.group?`<span class="grp">${esc(r.group)}</span>`:DASH;
@@ -1125,9 +1193,9 @@ function attachTips(sel){
   });
 }
 attachTips('.th-help');attachTips('.exp-help');
-cboxInit('logMember',()=>loadLogs(true));
-cboxInit('logModel',()=>loadLogs(true));
-cboxInit('logGroup',()=>loadLogs(true));
+cboxInit('logMember',()=>loadLogs(true),false);
+cboxInit('logModel',()=>loadLogs(true),true);
+cboxInit('logGroup',()=>loadLogs(true),true);
 $('logType').onchange=()=>loadLogs(true);
 $('logDetailKwBtn').addEventListener('click',()=>loadLogs(true));
 $('logToken').addEventListener('keydown',e=>{if(e.key==='Enter')loadLogs(true);});
@@ -1135,7 +1203,9 @@ $('logDetailKw').addEventListener('keydown',e=>{if(e.key==='Enter')loadLogs(true
 $('logRequestId').addEventListener('keydown',e=>{if(e.key==='Enter')loadLogs(true);});
 
 // ============ CSV 导出 ============
-let exporting=false,expCtrl=null,expTimer=null,expHeaders=false;
+// 先预检一次并取得服务端签名票据，再交给浏览器原生下载。CSV 不再经过
+// fetch reader + chunks + Blob，因此前端内存不会随最多 5 万行日志增长。
+let exporting=false,expCtrl=null,expTimer=null,expHeaders=false,pendingExportTicket='';
 function setExpBar(pct){ // pct null=不定态(转圈),数字=确定进度
   const bar=$('expBar'),span=bar.firstElementChild;
   if(pct==null){bar.classList.add('indet');span.style.width='';}
@@ -1143,7 +1213,19 @@ function setExpBar(pct){ // pct null=不定态(转圈),数字=确定进度
 }
 function expStatus(main,sub){$('expStatus').textContent=main;if(sub!=null)$('expSub').textContent=sub;}
 function closeExp(){$('expMask').style.display='none';clearInterval(expTimer);}
-async function startExport(confirm){
+function beginNativeExport(ticket,confirm){
+  if(!ticket){expFail('下载凭证已失效,请重新导出');return;}
+  clearInterval(expTimer);expHeaders=true;
+  $('expMask').style.display='flex';$('expTitle').textContent='导出已开始';
+  setExpBar(1);expStatus('已交给浏览器下载','文件由浏览器直接写入磁盘,不会占用页面内存');
+  $('expCancel').textContent='关闭';$('expCancel').disabled=false;
+  const q=new URLSearchParams({ticket});if(confirm)q.set('confirm','1');
+  const a=document.createElement('a');a.href='/api/logs/export?'+q.toString();a.download='usage-logs.csv';a.hidden=true;
+  document.body.appendChild(a);a.click();a.remove();
+  exporting=false;expCtrl=null;$('expBtn').disabled=false;
+  setTimeout(closeExp,1800);
+}
+async function startExport(){
   if(exporting)return;
   exporting=true;expHeaders=false;
   $('expBtn').disabled=true;
@@ -1162,51 +1244,29 @@ async function startExport(confirm){
     expStatus(msg,`已用 ${s} 秒`);
   },500);
   try{
-    const r=await fetch(`/api/logs/export?${logQuery()}`+(confirm?'&confirm=1':''),{signal:ctrl.signal});
-    const ct=r.headers.get('Content-Type')||'';
-    if(ct.includes('application/json')){ // 非 CSV:need_confirm / 限流 / 错误
-      const d=await r.json().catch(()=>({}));
-      if(d.need_confirm){closeExp();askExportConfirm(d.cap);return;}
-      expFail(d.error||'导出失败');return;
-    }
-    // CSV 流式读取,有 Content-Length 就显示真实进度
-    expHeaders=true;
-    const total=+r.headers.get('Content-Length')||0;
-    expStatus('正在下载…',total?'':'准备中…');
-    setExpBar(total?0:null);
-    const reader=r.body.getReader();const chunks=[];let recv=0;
-    for(;;){
-      const {done,value}=await reader.read();
-      if(done)break;
-      chunks.push(value);recv+=value.length;
-      if(total){setExpBar(recv/total);expStatus('正在下载…',`${(recv/1048576).toFixed(1)} / ${(total/1048576).toFixed(1)} MB`);}
-      else expStatus('正在下载…',`已接收 ${(recv/1048576).toFixed(1)} MB`);
-    }
-    const blob=new Blob(chunks,{type:'text/csv'});
-    const cd=r.headers.get('Content-Disposition')||'';
-    const mm=cd.match(/filename="?([^"]+)"?/);
-    const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=mm?mm[1]:'usage-logs.csv';
-    document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(a.href),4000);
-    setExpBar(1);expStatus('导出完成 ✓',`共 ${(blob.size/1048576).toFixed(1)} MB,已开始下载`);
-    $('expCancel').textContent='关闭';
-    setTimeout(closeExp,1600);
+    const r=await fetch(`/api/logs/export/prepare?${logQuery()}`,{signal:ctrl.signal});
+    const d=await r.json().catch(()=>({}));
+    if(!r.ok||!d.ok){expFail(d.error||'导出失败');return;}
+    if(d.need_confirm){pendingExportTicket=d.ticket||'';closeExp();askExportConfirm(d.cap,d.total);return;}
+    beginNativeExport(d.ticket,false);
   }catch(e){
     if(e.name==='AbortError')closeExp();
     else expFail('网络中断,请重试');
   }finally{
-    clearInterval(expTimer);exporting=false;expCtrl=null;$('expBtn').disabled=false;
+    clearInterval(expTimer);
+    if(expCtrl===ctrl){exporting=false;expCtrl=null;$('expBtn').disabled=false;}
   }
 }
 function expFail(msg){$('expTitle').textContent='导出失败';setExpBar(0);expStatus(msg,'');$('expCancel').textContent='关闭';}
-$('expBtn').onclick=()=>startExport(false);
+$('expBtn').onclick=()=>startExport();
 $('expCancel').onclick=()=>{if(expCtrl&&exporting)expCtrl.abort();else closeExp();};
 // 超 5 万条确认框
-function askExportConfirm(cap){
-  $('expConfirmMsg').innerHTML=`本次查询结果超过 <b>${(+cap).toLocaleString('en-US')}</b> 条。<br>将按时间倒序导出<b>最新 ${(+cap).toLocaleString('en-US')} 条</b>。<br>如需更早的数据,请取消后缩小时间范围分段导出。`;
+function askExportConfirm(cap,total){
+  $('expConfirmMsg').innerHTML=`本次查询共 <b>${(+total).toLocaleString('en-US')}</b> 条,超过单次上限 <b>${(+cap).toLocaleString('en-US')}</b> 条。<br>将按时间倒序导出<b>最新 ${(+cap).toLocaleString('en-US')} 条</b>。<br>如需更早的数据,请取消后缩小时间范围分段导出。`;
   $('expConfirmMask').style.display='flex';
 }
-$('expConfirmNo').onclick=()=>$('expConfirmMask').style.display='none';
-$('expConfirmYes').onclick=()=>{$('expConfirmMask').style.display='none';startExport(true);};
+$('expConfirmNo').onclick=()=>{$('expConfirmMask').style.display='none';pendingExportTicket='';};
+$('expConfirmYes').onclick=()=>{const ticket=pendingExportTicket;pendingExportTicket='';$('expConfirmMask').style.display='none';beginNativeExport(ticket,true);};
 
 let _rz;window.addEventListener('resize',()=>{clearTimeout(_rz);_rz=setTimeout(()=>{[trendCh,memberCh,modelPieCh,dModelPieCh,groupPieCh,dailyChart].forEach(c=>c&&c.resize());},150);});
 load();
