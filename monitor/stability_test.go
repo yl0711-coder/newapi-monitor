@@ -1,0 +1,628 @@
+package monitor
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"math"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/gin-gonic/gin"
+)
+
+func newStabilityTestMonitor(t *testing.T) *Monitor {
+	t.Helper()
+	m := &Monitor{cfg: Settings{RetentionDays: 7, StabilityEnabled: true, StabilityRetentionDays: 90}}
+	if err := m.openStore(t.TempDir() + "/stability.db"); err != nil {
+		t.Fatalf("openStore: %v", err)
+	}
+	return m
+}
+
+func TestStabilityRollupAndReportKeepsGroupChannelSemantics(t *testing.T) {
+	m := newStabilityTestMonitor(t)
+	day := time.Date(2026, 8, 5, 0, 0, 0, 0, cstLocation).Unix()
+	currentHour := day + 10*3600
+	previousHour := day - 24*3600 + 10*3600
+	rows := []MetricSample{
+		{BucketTs: currentHour, ChannelID: 33, ModelName: "gpt-5", Grp: "codex", Success: 90, Anomaly: 5, Failed: 5, Tokens: 1000, Quota: 500000, SumUseTime: 190, MaxUseTime: 8, Err5xx: 5},
+		{BucketTs: previousHour, ChannelID: 33, ModelName: "gpt-5", Grp: "codex", Success: 80, Failed: 20, Tokens: 800, Quota: 400000, Err5xx: 20},
+		{BucketTs: currentHour, ChannelID: 44, ModelName: "claude", Grp: "claude", Success: 50, Tokens: 500},
+	}
+	if err := m.upsertSamples(rows); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.storeDB.Create(&ChannelSnap{ID: 33, Name: "route-a", Type: 1, Vendor: newAPIChannelTypeName(1), Status: 1, UpdatedAt: day}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := m.storeDB.Create(&ChannelSnap{ID: 44, Name: "route-b", Type: 14, Vendor: newAPIChannelTypeName(14), Status: 1, UpdatedAt: day}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := m.storeDB.Create(&RejectionSample{BucketTs: currentHour, Node: "master", Reason: "no_available_channel", Model: "gpt-5", Grp: "codex", Count: 2}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := m.rollupStabilityHours(previousHour - 60); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.rollupStabilityRejections(previousHour - 60); err != nil {
+		t.Fatal(err)
+	}
+	// 重复 rollup 必须覆盖而不是翻倍。
+	if err := m.rollupStabilityHours(previousHour - 60); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.rollupStabilityRejections(previousHour - 60); err != nil {
+		t.Fatal(err)
+	}
+
+	report, err := m.buildStabilityReport(context.Background(), stabilityScope{FromTs: day, ToTs: day + 24*3600}, day+20*3600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Summary.Requests != 152 {
+		t.Fatalf("summary requests=%d want 152", report.Summary.Requests)
+	}
+	if len(report.Groups) != 2 {
+		t.Fatalf("groups=%d want 2", len(report.Groups))
+	}
+	var codex StabilityGroup
+	for _, g := range report.Groups {
+		if g.Name == "codex" {
+			codex = g
+		}
+	}
+	if codex.Requests != 102 || codex.Rejected != 2 {
+		t.Fatalf("codex metrics=%+v", codex.StabilityMetrics)
+	}
+	if codex.Stability == nil || math.Abs(*codex.Stability-90.0/102.0*100) > 0.0001 {
+		t.Fatalf("codex stability=%v", codex.Stability)
+	}
+	if len(codex.Channels) != 1 || codex.Channels[0].Requests != 100 || codex.Channels[0].Rejected != 0 {
+		t.Fatalf("channel must exclude pre-route rejection: %+v", codex.Channels)
+	}
+	if codex.DeltaPP == nil || *codex.DeltaPP <= 0 {
+		t.Fatalf("expected positive delta, got %v", codex.DeltaPP)
+	}
+	if len(codex.Daily) != 1 || codex.Daily[0].Rejected != 2 {
+		t.Fatalf("daily rejection missing: %+v", codex.Daily)
+	}
+	if report.Meta.TimelineBucketSec != 3600 || len(codex.Timeline) != 24 || codex.Timeline[10].Requests != 102 || codex.Timeline[10].Problems != 12 {
+		t.Fatalf("timeline/rejection missing: step=%d timeline=%+v", report.Meta.TimelineBucketSec, codex.Timeline)
+	}
+
+	vendorReport, err := m.buildStabilityReport(context.Background(), stabilityScope{FromTs: day, ToTs: day + 24*3600, Vendor: "OpenAI"}, day+20*3600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if vendorReport.Summary.Requests != 100 || vendorReport.Summary.Rejected != 0 {
+		t.Fatalf("vendor filter must not invent rejection ownership: %+v", vendorReport.Summary)
+	}
+}
+
+func TestNewAPIChannelTypeNameUsesOfficialMappingAndNoGuessing(t *testing.T) {
+	for channelType, want := range map[int]string{1: "OpenAI", 14: "Anthropic", 26: "ZhipuV4", 43: "DeepSeek"} {
+		if got := newAPIChannelTypeName(channelType); got != want {
+			t.Fatalf("type=%d vendor=%q want %q", channelType, got, want)
+		}
+	}
+	if got := newAPIChannelTypeName(9999); got != "未标记" {
+		t.Fatalf("unknown type must not be guessed: %q", got)
+	}
+}
+
+func TestStabilityTimelineKeepsNarrowStripCountAcrossRanges(t *testing.T) {
+	start := time.Date(2026, 8, 1, 0, 0, 0, 0, cstLocation).Unix()
+	for _, tc := range []struct {
+		days int
+		step int64
+		bars int
+	}{{7, 2 * 3600, 84}, {15, 4 * 3600, 90}, {30, 8 * 3600, 90}, {90, 24 * 3600, 90}} {
+		scope := stabilityScope{FromTs: start, ToTs: start + int64(tc.days)*86400}
+		step := stabilityTimelineBucketSec(scope)
+		if step != tc.step || len(stabilityBucketKeys(scope, step)) != tc.bars {
+			t.Fatalf("days=%d step=%d bars=%d", tc.days, step, len(stabilityBucketKeys(scope, step)))
+		}
+	}
+}
+
+func TestStabilityProblemTextAndRawGrouping(t *testing.T) {
+	m := newStabilityTestMonitor(t)
+	from := time.Date(2026, 8, 5, 0, 0, 0, 0, cstLocation).Unix()
+	raw := "status_code=524, The origin did not return a complete response."
+	msg, truncated := stabilityProblemText(raw)
+	if truncated || msg != raw {
+		t.Fatalf("raw error changed: %q truncated=%v", msg, truncated)
+	}
+	if got := stabilityProblemCode(raw); got != "524" {
+		t.Fatalf("code=%q", got)
+	}
+	if got := stabilityProblemCode("bad response status code 504"); got != "504" {
+		t.Fatalf("space separated code=%q", got)
+	}
+	if got := stabilityProblemCode("unexpected status 403 Forbidden"); got != "403" {
+		t.Fatalf("unexpected status code=%q", got)
+	}
+	long := strings.Repeat("错", maxStabilityProblemMessage+1)
+	msg, truncated = stabilityProblemText(long)
+	if !truncated || len([]rune(msg)) != maxStabilityProblemMessage {
+		t.Fatalf("safe truncation failed: len=%d truncated=%v", len([]rune(msg)), truncated)
+	}
+	rows := []StabilityProblemSample{
+		{BucketTs: from + 60, Source: "newapi", SignatureHash: stabilityProblemHash("newapi", raw), ChannelID: 33, ModelName: "gpt", Grp: "codex", Code: "524", Message: raw, Count: 2, FirstTs: from + 61, LastTs: from + 90},
+		{BucketTs: from + 120, Source: "newapi", SignatureHash: stabilityProblemHash("newapi", raw), ChannelID: 33, ModelName: "gpt", Grp: "codex", Code: "524", Message: raw, Count: 3, FirstTs: from + 121, LastTs: from + 150},
+	}
+	if err := m.upsertStabilityProblems(rows); err != nil {
+		t.Fatal(err)
+	}
+	result, err := m.queryStabilityProblems(context.Background(), stabilityScope{FromTs: from, ToTs: from + 3600}, 50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Problems) != 1 || result.Problems[0].Message != raw || result.Problems[0].Count != 5 {
+		t.Fatalf("problem aggregation=%+v", result.Problems)
+	}
+	if result.Problems[0].AdviceStatus != "knowledge_base_pending_review" {
+		t.Fatalf("unexpected advice status: %s", result.Problems[0].AdviceStatus)
+	}
+}
+
+func TestStabilityProblemSamplerKeepsRawTextAndIsIdempotent(t *testing.T) {
+	m := newStabilityTestMonitor(t)
+	m.prodDB = newFakeProdDB(t)
+	if _, err := m.prodDB.Exec("ALTER TABLE logs ADD COLUMN channel_id INTEGER DEFAULT 0"); err != nil {
+		t.Fatal(err)
+	}
+	from := time.Date(2026, 8, 5, 10, 0, 0, 0, cstLocation).Unix()
+	raw := "unexpected status 403 Forbidden: affinity channel disabled"
+	for _, row := range []struct {
+		createdAt int64
+		typ       int
+	}{
+		{from + 5, 5}, {from + 35, 5}, {from + 70, 5}, {from + 80, 2},
+	} {
+		if _, err := m.prodDB.Exec(`INSERT INTO logs
+			(user_id,created_at,type,model_name,`+"`group`"+`,channel_id,content)
+			VALUES (1,?,?,?,?,?,?)`, row.createdAt, row.typ, "gpt-test", "codex", 33, raw); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i := 0; i < 2; i++ { // 重叠窗口重跑必须覆盖，不能把同一批错误翻倍。
+		if _, err := m.sampleStabilityProblems(context.Background(), from, from+180); err != nil {
+			t.Fatal(err)
+		}
+	}
+	result, err := m.queryStabilityProblems(context.Background(), stabilityScope{FromTs: from, ToTs: from + 180}, 50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.CapturedTotal != 3 || len(result.Problems) != 1 {
+		t.Fatalf("sampled problems=%+v", result)
+	}
+	problem := result.Problems[0]
+	if problem.Message != raw || problem.Code != "403" || problem.Count != 3 {
+		t.Fatalf("raw problem changed or double counted: %+v", problem)
+	}
+}
+
+func TestStabilityProblemSamplerResumesOverflowWithoutPublishingPartialMinute(t *testing.T) {
+	m := newStabilityTestMonitor(t)
+	m.prodDB = newFakeProdDB(t)
+	if _, err := m.prodDB.Exec("ALTER TABLE logs ADD COLUMN channel_id INTEGER DEFAULT 0"); err != nil {
+		t.Fatal(err)
+	}
+	from := time.Date(2026, 8, 5, 11, 0, 0, 0, cstLocation).Unix()
+	tx, err := m.prodDB.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	stmt, err := tx.Prepare(`INSERT INTO logs (user_id,created_at,type,model_name,` + "`group`" + `,channel_id,content)
+		VALUES (1,?,5,'gpt-test','codex',33,'status_code=503, service unavailable')`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < maxStabilityProblemRowsPerRun+1; i++ {
+		if _, err := stmt.Exec(from + int64(i%60)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	stmt.Close()
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	// 首轮只探测到超限并建立本地续采状态，不发布半截分钟。
+	if _, err := m.sampleStabilityProblems(context.Background(), from, from+60); err != nil {
+		t.Fatal(err)
+	}
+	result, err := m.queryStabilityProblems(context.Background(), stabilityScope{FromTs: from, ToTs: from + 60}, 50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.CapturedTotal != 0 || result.PendingMinutes != 1 || result.CoverageComplete {
+		t.Fatalf("partial minute was exposed as complete: %+v", result)
+	}
+	// 第二轮处理固定预算，仍不发布；第三轮读完余数后原子发布全部 5001 条。
+	if _, err := m.sampleStabilityProblems(context.Background(), from, from+60); err != nil {
+		t.Fatal(err)
+	}
+	if m.stabilityProblemPendingCount() != 1 {
+		t.Fatal("overflow minute should still be pending after one bounded run")
+	}
+	if _, err := m.sampleStabilityProblems(context.Background(), from, from+60); err != nil {
+		t.Fatal(err)
+	}
+	result, err = m.queryStabilityProblems(context.Background(), stabilityScope{FromTs: from, ToTs: from + 60}, 50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.CapturedTotal != maxStabilityProblemRowsPerRun+1 || result.PendingMinutes != 0 || !result.CoverageComplete {
+		t.Fatalf("overflow minute was not fully resumed: %+v", result)
+	}
+}
+
+func TestStabilityProblemSamplerCatchesUpWithoutSkippingElapsedMinutes(t *testing.T) {
+	m := newStabilityTestMonitor(t)
+	m.prodDB = newFakeProdDB(t)
+	if _, err := m.prodDB.Exec("ALTER TABLE logs ADD COLUMN channel_id INTEGER DEFAULT 0"); err != nil {
+		t.Fatal(err)
+	}
+	base := time.Date(2026, 8, 5, 12, 0, 0, 0, cstLocation).Unix()
+	if err := m.storeDB.Create(&StabilityProblemIngestState{BucketTs: base, Complete: true, CompletedAt: base + 60}).Error; err != nil {
+		t.Fatal(err)
+	}
+	for _, createdAt := range []int64{base + 5*60, base + 25*60} {
+		if _, err := m.prodDB.Exec(`INSERT INTO logs
+			(user_id,created_at,type,model_name,`+"`group`"+`,channel_id,content)
+			VALUES (1,?,5,'gpt-test','codex',33,'status_code=503, catchup')`, createdAt); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// 调度器当前窗口是 20~30 分钟，但上一次覆盖只到第 1 分钟。
+	// 本轮应从第 1 分钟连续追赶一个等长窗口，不能跳到第 20 分钟。
+	if _, err := m.sampleStabilityProblems(context.Background(), base+20*60, base+30*60); err != nil {
+		t.Fatal(err)
+	}
+	result, err := m.queryStabilityProblems(context.Background(), stabilityScope{FromTs: base, ToTs: base + 30*60}, 50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.CapturedTotal != 1 || !m.stabilityProblemNeedsCatchup(base+30*60) {
+		t.Fatalf("catch-up skipped or falsely completed elapsed range: %+v", result)
+	}
+	var currentMinute int64
+	if err := m.storeDB.Model(&StabilityProblemIngestState{}).Where("bucket_ts = ?", base+25*60).Count(&currentMinute).Error; err != nil {
+		t.Fatal(err)
+	}
+	if currentMinute != 0 {
+		t.Fatal("current window was sampled before the older gap was covered")
+	}
+}
+
+func TestCompactStabilityReportKeepsSummaryButDefersNestedDetails(t *testing.T) {
+	m := newStabilityTestMonitor(t)
+	day := time.Date(2026, 8, 5, 0, 0, 0, 0, cstLocation).Unix()
+	if err := m.storeDB.Create(&[]StabilityHourSample{
+		{HourTs: day, ChannelID: 1, ModelName: "m1", Grp: "g", Success: 9, Failed: 1},
+		{HourTs: day, ChannelID: 2, ModelName: "m2", Grp: "g", Success: 8, Failed: 2},
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	scope := stabilityScope{FromTs: day, ToTs: day + 24*3600}
+	compact, err := m.buildStabilityReportWithDetails(context.Background(), scope, day+24*3600, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	full, err := m.buildStabilityReportWithDetails(context.Background(), scope, day+24*3600, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if compact.Summary.Requests != full.Summary.Requests || len(compact.Groups) != 1 || len(compact.Groups[0].Channels) != 2 {
+		t.Fatalf("compact report changed summary semantics: compact=%+v full=%+v", compact.Summary, full.Summary)
+	}
+	if compact.Groups[0].ModelCount != 2 || len(compact.Groups[0].Daily) != 1 || len(compact.Groups[0].Timeline) == 0 {
+		t.Fatalf("compact report lost first-screen data: %+v", compact.Groups[0])
+	}
+	for _, channel := range compact.Groups[0].Channels {
+		if channel.ModelCount != 1 || len(channel.Daily) != 0 || len(channel.Timeline) != 0 || len(channel.Models) != 0 {
+			t.Fatalf("compact report eagerly returned nested channel details: %+v", channel)
+		}
+	}
+	if len(full.Groups[0].Channels[0].Daily) == 0 || len(full.Groups[0].Channels[0].Timeline) == 0 || len(full.Groups[0].Channels[0].Models) == 0 {
+		t.Fatalf("detail report did not retain nested data: %+v", full.Groups[0].Channels[0])
+	}
+}
+
+func TestStabilityReportMarksDeletedChannelAsHistorical(t *testing.T) {
+	m := newStabilityTestMonitor(t)
+	day := time.Date(2026, 8, 5, 0, 0, 0, 0, cstLocation).Unix()
+	if err := m.storeDB.Create(&StabilityHourSample{HourTs: day, ChannelID: 33, ModelName: "m", Grp: "g", Success: 1}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := m.storeDB.Create(&ChannelSnap{ID: 33, Name: "deleted-route", Vendor: "OpenAI", Status: 1, DeletedAt: day + 3600}).Error; err != nil {
+		t.Fatal(err)
+	}
+	report, err := m.buildStabilityReport(context.Background(), stabilityScope{FromTs: day, ToTs: day + 86400}, day+86400)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(report.Groups) != 1 || len(report.Groups[0].Channels) != 1 || report.Groups[0].Channels[0].Current {
+		t.Fatalf("deleted channel was presented as current: %+v", report.Groups)
+	}
+	if report.Groups[0].Channels[0].Name != "deleted-route" {
+		t.Fatalf("deleted channel lost last snapshot metadata: %+v", report.Groups[0].Channels[0])
+	}
+}
+
+func TestStabilityProblemCoverageReportsUncoveredHistory(t *testing.T) {
+	m := newStabilityTestMonitor(t)
+	from := time.Date(2026, 8, 5, 8, 0, 0, 0, cstLocation).Unix()
+	if err := m.storeDB.Create(&StabilityProblemIngestState{BucketTs: from + 60, Complete: true, CompletedAt: from + 180}).Error; err != nil {
+		t.Fatal(err)
+	}
+	result, err := m.queryStabilityProblems(context.Background(), stabilityScope{FromTs: from, ToTs: from + 180}, 50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.CoverageComplete || result.PendingMinutes != 0 || result.UncoveredMinutes != 2 {
+		t.Fatalf("missing history was reported as complete: %+v", result)
+	}
+}
+
+func TestStabilityHealthRequiresFreshProblemCoverageWhenEnabled(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	m := newStabilityTestMonitor(t)
+	m.cfg.StabilityEnabled = true
+	m.cfg.SampleSeconds = 60
+	m.cfg.StabilityProblemSampleSec = 300
+	now := time.Now().Unix()
+	m.lastRun.Store(now)
+
+	record := func() stabilityHealthResponse {
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		c.Request = httptest.NewRequest(http.MethodGet, "/stability/health", nil)
+		m.serveStabilityHealth(c)
+		var got stabilityHealthResponse
+		if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+			t.Fatal(err)
+		}
+		return got
+	}
+
+	if got := record(); got.Status != "degraded" || got.ProblemSamplerLastSuccess != 0 {
+		t.Fatalf("uninitialized problem sampler must be degraded: %+v", got)
+	}
+	bucket := now/60*60 - 60
+	if err := m.storeDB.Create(&StabilityProblemIngestState{
+		BucketTs: bucket, Complete: true, UpdatedAt: now, CompletedAt: now,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	m.problemLastSuccess.Store(now)
+	if got := record(); got.Status != "ok" || got.ProblemCoverageTo != bucket+60 || got.ProblemSamplerAgeSec > 2 {
+		t.Fatalf("fresh complete problem coverage must be healthy: %+v", got)
+	}
+	m.problemLastSuccess.Store(now - 2000)
+	if got := record(); got.Status != "degraded" {
+		t.Fatalf("stale problem sampler must be degraded: %+v", got)
+	}
+}
+
+func TestRefreshChannelsPersistsOfficialTypeVendorWithoutSecrets(t *testing.T) {
+	m := newStabilityTestMonitor(t)
+	m.prodDB = newFakeProdDB(t)
+	if _, err := m.prodDB.Exec("CREATE TABLE channels (id INTEGER PRIMARY KEY,name TEXT,type INTEGER,status INTEGER,`group` TEXT,models TEXT,base_url TEXT)"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.prodDB.Exec("INSERT INTO channels (id,name,type,status,`group`,models,base_url) VALUES (33,'route-a',14,1,'claude','claude-opus','https://temp.last-api.ai/v1')"); err != nil {
+		t.Fatal(err)
+	}
+	m.refreshChannels()
+	var snap ChannelSnap
+	if err := m.storeDB.First(&snap, "id = ?", 33).Error; err != nil {
+		t.Fatal(err)
+	}
+	if snap.Name != "route-a" || snap.Type != 14 || snap.Vendor != "Anthropic" || snap.Status != 1 {
+		t.Fatalf("channel snapshot=%+v", snap)
+	}
+	if snap.BaseDomain != "last-api.ai" {
+		t.Fatalf("base domain=%q", snap.BaseDomain)
+	}
+	if snap.BaseHost != "temp.last-api.ai" {
+		t.Fatalf("base host=%q", snap.BaseHost)
+	}
+}
+
+func TestStabilityComparisonUsesSameClockTimeOnPreviousCalendarDay(t *testing.T) {
+	m := newStabilityTestMonitor(t)
+	day := time.Date(2026, 8, 5, 0, 0, 0, 0, cstLocation).Unix()
+	rows := []StabilityHourSample{
+		{HourTs: day + 10*3600, ChannelID: 1, ModelName: "m", Grp: "g", Success: 90, Failed: 10},
+		{HourTs: day - 86400 + 10*3600, ChannelID: 1, ModelName: "m", Grp: "g", Success: 80, Failed: 20},
+	}
+	if err := m.storeDB.Create(&rows).Error; err != nil {
+		t.Fatal(err)
+	}
+	report, err := m.buildStabilityReport(context.Background(), stabilityScope{FromTs: day, ToTs: day + 12*3600}, day+12*3600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !report.Meta.ComparisonAvailable || report.Previous.Requests != 100 || report.DeltaPP == nil || math.Abs(*report.DeltaPP-10) > 0.0001 {
+		t.Fatalf("calendar comparison=%+v delta=%v", report.Previous, report.DeltaPP)
+	}
+}
+
+func TestStabilityProblemShareUsesAllCapturedRowsNotOnlyTopN(t *testing.T) {
+	m := newStabilityTestMonitor(t)
+	from := time.Date(2026, 8, 5, 0, 0, 0, 0, cstLocation).Unix()
+	rows := []StabilityProblemSample{
+		{BucketTs: from, Source: "newapi", SignatureHash: "a", ChannelID: 1, ModelName: "m", Grp: "g", Code: "500", Message: "a", Count: 9, FirstTs: from, LastTs: from},
+		{BucketTs: from, Source: "newapi", SignatureHash: "b", ChannelID: 1, ModelName: "m", Grp: "g", Code: "502", Message: "b", Count: 1, FirstTs: from, LastTs: from},
+	}
+	if err := m.upsertStabilityProblems(rows); err != nil {
+		t.Fatal(err)
+	}
+	result, err := m.queryStabilityProblems(context.Background(), stabilityScope{FromTs: from, ToTs: from + 3600}, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Truncated || result.CapturedTotal != 10 || len(result.Problems) != 1 || math.Abs(result.Problems[0].SharePct-90) > 0.0001 {
+		t.Fatalf("top-N denominator is not exact: %+v", result)
+	}
+}
+
+func TestStabilityRetentionPrunesAllLocalTables(t *testing.T) {
+	m := newStabilityTestMonitor(t)
+	cutoff := time.Date(2026, 8, 5, 0, 0, 0, 0, cstLocation).Unix()
+	old, fresh := cutoff-3600, cutoff+3600
+	if err := m.storeDB.Create(&[]StabilityHourSample{
+		{HourTs: old, ChannelID: 1, ModelName: "old", Grp: "g", Success: 1},
+		{HourTs: fresh, ChannelID: 1, ModelName: "fresh", Grp: "g", Success: 1},
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := m.storeDB.Create(&[]StabilityRejectHour{
+		{HourTs: old, Node: "n", Reason: "old", Model: "m", Grp: "g", Count: 1},
+		{HourTs: fresh, Node: "n", Reason: "fresh", Model: "m", Grp: "g", Count: 1},
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := m.storeDB.Create(&[]StabilityProblemSample{
+		{BucketTs: old, Source: "newapi", SignatureHash: "old", ChannelID: 1, ModelName: "m", Grp: "g", Message: "old", Count: 1},
+		{BucketTs: fresh, Source: "newapi", SignatureHash: "fresh", ChannelID: 1, ModelName: "m", Grp: "g", Message: "fresh", Count: 1},
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := m.pruneStabilityOlderThan(cutoff); err != nil {
+		t.Fatal(err)
+	}
+	for name, model := range map[string]any{
+		"hour": &StabilityHourSample{}, "reject": &StabilityRejectHour{}, "problem": &StabilityProblemSample{},
+	} {
+		var count int64
+		if err := m.storeDB.Model(model).Count(&count).Error; err != nil {
+			t.Fatal(err)
+		}
+		if count != 1 {
+			t.Fatalf("%s rows=%d want 1", name, count)
+		}
+	}
+}
+
+func TestStabilityProblemIntervalBounds(t *testing.T) {
+	if got := stabilityProblemIntervalSeconds(0); got != 300 {
+		t.Fatalf("zero interval=%d want 300", got)
+	}
+	if got := stabilityProblemIntervalSeconds(30); got != 300 {
+		t.Fatalf("short interval=%d want 300", got)
+	}
+	if got := stabilityProblemIntervalSeconds(600); got != 600 {
+		t.Fatalf("normal interval=%d want 600", got)
+	}
+	if got := stabilityProblemIntervalSeconds(7200); got != 3600 {
+		t.Fatalf("long interval=%d want 3600", got)
+	}
+}
+
+func TestStabilityDimensionGuardFailsClosedInsteadOfReturningPartialTotals(t *testing.T) {
+	m := newStabilityTestMonitor(t)
+	day := time.Date(2026, 8, 5, 0, 0, 0, 0, cstLocation).Unix()
+	rows := make([]StabilityHourSample, 0, 2001)
+	for i := 0; i < 2001; i++ {
+		rows = append(rows, StabilityHourSample{HourTs: day, ChannelID: i + 1, ModelName: fmt.Sprintf("m-%04d", i), Grp: "g", Success: 1})
+	}
+	if err := m.storeDB.CreateInBatches(rows, 200).Error; err != nil {
+		t.Fatal(err)
+	}
+	_, err := m.buildStabilityReport(context.Background(), stabilityScope{FromTs: day, ToTs: day + 3600}, day+3600)
+	if err == nil || !strings.Contains(err.Error(), "为保证准确性") {
+		t.Fatalf("维度超限应拒绝返回部分统计，err=%v", err)
+	}
+}
+
+func TestStabilityPageIntegrationKeepsExistingMonitorAndPortalBoundaries(t *testing.T) {
+	for _, id := range []string{`id="tab-usage"`, `id="tab-model"`, `id="tab-server"`, `id="tab-stability"`, `id="tab-channels"`} {
+		if !strings.Contains(pageHTML, id) {
+			t.Fatalf("Monitor page missing %s", id)
+		}
+	}
+	order := []string{`data-tab="usage"`, `data-tab="channels"`, `data-tab="stability"`, `data-tab="model"`, `data-tab="server"`}
+	last := -1
+	for _, marker := range order {
+		at := strings.Index(pageHTML, marker)
+		if at <= last {
+			t.Fatalf("Monitor navigation order incorrect at %s", marker)
+		}
+		last = at
+	}
+	if !strings.Contains(pageHTML, "usageRefresh(true)") || !strings.Contains(pageHTML, "resizeModelCharts") || !strings.Contains(pageHTML, "loadInfra") {
+		t.Fatal("新页面接入时不应移除原有三页的关键交互")
+	}
+	if strings.Contains(portalHTML, "stability/report") || strings.Contains(portalHTML, "tab-stability") || strings.Contains(portalHTML, "channels/report") || strings.Contains(portalHTML, "tab-channels") {
+		t.Fatal("Usage Portal 不应接入 Monitor 稳定性报表或渠道管理")
+	}
+}
+
+func TestStabilityRangeUsesCSTDateBoundariesAndCapsRange(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	now := time.Date(2026, 8, 5, 12, 30, 0, 0, cstLocation)
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest("GET", "/stability/report?days=7", nil)
+	s, err := stabilityRange(c, now, 90)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := time.Date(2026, 7, 30, 0, 0, 0, 0, cstLocation).Unix()
+	if s.FromTs != want || s.ToTs != now.Unix() {
+		t.Fatalf("range=[%v,%v]", time.Unix(s.FromTs, 0), time.Unix(s.ToTs, 0))
+	}
+
+	w = httptest.NewRecorder()
+	c, _ = gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest("GET", "/stability/report?from=2026-01-01&to=2026-08-05", nil)
+	if _, err = stabilityRange(c, now, 90); err == nil {
+		t.Fatal("expected >90 day error")
+	}
+}
+
+func TestStabilityQueriesUseLocalStoreOnly(t *testing.T) {
+	m := newStabilityTestMonitor(t) // prodDB 故意为 nil
+	day := time.Date(2026, 8, 5, 0, 0, 0, 0, cstLocation).Unix()
+	if _, err := m.buildStabilityReport(context.Background(), stabilityScope{FromTs: day, ToTs: day + 12*3600}, day+12*3600); err != nil {
+		t.Fatalf("local-only report failed: %v", err)
+	}
+}
+
+// 代表性规模基准：90 天 × 12 渠道 × 每小时一行，页面读取仍只落在
+// Monitor 本地 SQLite。基准不设脆弱的硬时间阈值，CI 可用 -bench 跟踪回归。
+func BenchmarkStabilityReport90Days(b *testing.B) {
+	m := &Monitor{cfg: Settings{RetentionDays: 7, StabilityEnabled: true, StabilityRetentionDays: 90}}
+	if err := m.openStore(b.TempDir() + "/stability-bench.db"); err != nil {
+		b.Fatal(err)
+	}
+	start := time.Date(2026, 5, 1, 0, 0, 0, 0, cstLocation).Unix()
+	rows := make([]StabilityHourSample, 0, 90*24*12)
+	for hour := 0; hour < 90*24; hour++ {
+		for channel := 1; channel <= 12; channel++ {
+			rows = append(rows, StabilityHourSample{
+				HourTs: start + int64(hour)*3600, ChannelID: channel,
+				ModelName: fmt.Sprintf("model-%d", channel%4), Grp: fmt.Sprintf("group-%d", channel%5),
+				Success: 98, Anomaly: 1, Failed: 1, Tokens: 1000, Quota: 500000, SumUseTime: 200,
+			})
+		}
+	}
+	if err := m.storeDB.CreateInBatches(rows, 200).Error; err != nil {
+		b.Fatal(err)
+	}
+	scope := stabilityScope{FromTs: start, ToTs: start + 90*86400}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := m.buildStabilityReport(context.Background(), scope, scope.ToTs); err != nil {
+			b.Fatal(err)
+		}
+	}
+}

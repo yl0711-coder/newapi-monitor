@@ -241,15 +241,42 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
   .tabs .tab.active{color:var(--text);border-bottom-color:var(--accent);font-weight:600}
   .tabpane[hidden]{display:none}
 </style>
+<link rel="stylesheet" href="/stability.css?v=4">
 </head>
 <body theme-mode="dark">
-<h1>📈 <span data-brand>new-api</span> 上游监控 <small>分组 / 渠道 / 模型 · 稳定性 · 响应耗时</small></h1>
+<div class="monitor-shell">
+  <aside class="monitor-sidebar" aria-label="Monitor 导航">
+    <div class="monitor-brand">
+      <div class="monitor-brand-mark" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M3 12h4l2.4-6 4.2 12 2.4-6h5"/></svg></div>
+      <div><b><span data-brand>NexusAPI</span></b><small>Monitor</small></div>
+    </div>
+    <nav class="tabs monitor-nav">
+      <div class="tab active" data-tab="usage"><span class="monitor-nav-icon"><svg viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"/></svg></span>用户用量</div>
+      <div class="tab" data-tab="channels"><span class="monitor-nav-icon"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a15 15 0 0 1 0 18M12 3a15 15 0 0 0 0 18"/></svg></span>渠道管理</div>
+      <div class="tab" data-tab="stability"><span class="monitor-nav-icon"><svg viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="m9 12 2 2 4-4"/></svg></span>稳定性报表</div>
+      <div class="tab" data-tab="model"><span class="monitor-nav-icon"><svg viewBox="0 0 24 24"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg></span>模型监控</div>
+      <div class="tab" data-tab="server"><span class="monitor-nav-icon"><svg viewBox="0 0 24 24"><path d="M3 3v18h18"/><path d="m7 16 4-5 4 3 5-7"/></svg></span>服务端监控</div>
+    </nav>
+  </aside>
 
-<div class="tabs">
-  <div class="tab active" data-tab="usage">用户用量</div>
-  <div class="tab" data-tab="model">模型监控</div>
-  <div class="tab" data-tab="server">服务端监控</div>
-</div>
+  <main class="monitor-workspace">
+    <header class="monitor-page-head">
+      <div class="monitor-page-heading">
+        <div class="monitor-page-icon" id="monitorPageIcon" aria-hidden="true"></div>
+        <div><h1 id="monitorPageTitle">用户用量</h1><p id="monitorPageSubtitle">客户余额、每日消费、成员矩阵与用量明细</p></div>
+      </div>
+      <div class="monitor-head-meta"><i></i><span>Monitor 管理端</span></div>
+    </header>
+
+    <nav class="tabs monitor-mobile-tabs" aria-label="Monitor 导航">
+      <div class="tab active" data-tab="usage">用户用量</div>
+      <div class="tab" data-tab="channels">渠道管理</div>
+      <div class="tab" data-tab="stability">稳定性报表</div>
+      <div class="tab" data-tab="model">模型监控</div>
+      <div class="tab" data-tab="server">服务端监控</div>
+    </nav>
+
+    <div class="monitor-content">
 
 <div class="tabpane" id="tab-model" hidden>
 <div class="toolbar">
@@ -319,6 +346,145 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
 <div class="card"><div class="card-header">按 Key / 用户 <span class="muted" style="font-weight:400">· 谁在制造错误 / 烧配额(Top 100)</span></div><table><thead id="thToken"></thead><tbody id="tbToken"></tbody></table></div>
 <div class="card" id="rejCard" style="display:none"><div class="card-header">🚫 被拒请求 <span class="muted" style="font-weight:400">· 前置拒绝(无可用渠道等,不进 logs 表;来自各节点旁路采集器)</span></div><table><thead id="thRej"></thead><tbody id="tbRej"></tbody></table></div>
 </div><!-- /tab-model -->
+
+<div class="tabpane stability-page" id="tab-stability" hidden>
+  <div class="stability-module-tabs">
+    <div>
+      <button type="button" class="active" data-stability-view="history"><b>历史交付稳定性</b><small>分组 / 渠道 / 模型的真实用户请求</small></button>
+      <button type="button" data-stability-view="problems"><b>问题分布</b><small>error code + error message 原文聚合</small></button>
+    </div>
+    <div class="stability-source-mini" id="stSourceMini"><span><i class="wait"></i>数据状态加载中</span></div>
+  </div>
+
+  <section id="stHistoryView">
+    <div class="stability-toolbar">
+      <div><h2>用户交付稳定性</h2><p>按用户选择的服务分组看稳定性，展开后核对实际承载渠道与模型。</p></div>
+      <div class="stability-range">
+        <button type="button" class="active" data-stability-days="7">近 7 天</button>
+        <button type="button" data-stability-days="15">近 15 天</button>
+        <button type="button" data-stability-days="30">近 30 天</button>
+        <button type="button" data-stability-days="90">近 90 天</button>
+        <button type="button" id="stCustomToggle">自定义</button>
+        <span class="stability-custom" id="stCustomRange"><input id="stCustomFrom" type="date" aria-label="开始日期"><span>～</span><input id="stCustomTo" type="date" aria-label="结束日期"><button type="button" id="stCustomApply">应用</button></span>
+      </div>
+    </div>
+
+    <div class="stability-layerbar">
+      <div class="stability-layer-switch">
+        <button type="button" class="active" data-stability-layer="delivery"><b>用户交付稳定性</b><small>NewAPI 使用日志 · 分组 / 渠道 / 模型</small></button>
+        <button type="button" data-stability-layer="edge" disabled title="Nginx 旁路采集尚未接入"><b>入口与平台（尚未接入）</b><small>Nginx access + error · 后续能力</small></button>
+      </div>
+      <div class="stability-layer-note">两层事实分别统计<br>Request ID 可靠关联后仅用于交叉核对
+      </div>
+    </div>
+
+    <div id="stDeliveryLayer">
+      <div class="stability-filters">
+        <label>厂商<select id="stVendor"><option value="">全部厂商</option></select></label>
+        <label>服务分组<select id="stGroup"><option value="">全部分组</option></select></label>
+        <label>渠道<select id="stChannel"><option value="">全部渠道</option></select></label>
+        <label>模型<select id="stModel"><option value="">全部模型</option></select></label>
+        <div class="stability-filter-actions"><button type="button" class="stability-link-btn" id="stFilterReset">重置</button><button type="button" class="stability-link-btn" id="stRefresh">刷新</button></div>
+      </div>
+      <div id="stDeliveryBody"><div class="stability-loading"><i class="stability-spinner"></i><span>正在读取本地稳定性汇总…</span></div></div>
+    </div>
+
+    <div id="stEdgeLayer" hidden>
+      <div class="stability-panel"><div class="stability-empty"><b>Nginx 旁路数据尚未接入</b><p>当前版本不会为了展示而去查询或扰动线上 Nginx。接入前，这里只客观显示“未接入”，不生成推测性数字。</p></div></div>
+    </div>
+  </section>
+
+  <section id="stProblemView" hidden>
+    <div class="stability-toolbar">
+      <div><h2>问题分布</h2><p>直接按 error code 和 error message 原文聚合；分类不等于根因。</p></div>
+      <button type="button" class="stability-link-btn" id="stProblemRefresh">刷新</button>
+    </div>
+    <div class="stability-panel" id="stProblemBody"><div class="stability-loading"><i class="stability-spinner"></i><span>正在聚合原始错误签名…</span></div></div>
+  </section>
+
+  <div class="stability-drawer-mask" id="stDrawerMask"></div>
+  <aside class="stability-drawer" id="stDrawer" role="dialog" aria-modal="true" aria-hidden="true" aria-label="稳定性详情">
+    <header class="stability-drawer-head">
+      <div class="stability-drawer-title"><div><h2 id="stDrawerTitle">详情</h2><p id="stDrawerSubtitle"></p></div><button type="button" class="stability-drawer-close" id="stDrawerClose">关闭</button></div>
+      <div class="stability-drawer-tabs"><button type="button" class="active" data-st-drawer-tab="run">运行详情</button><button type="button" data-st-drawer-tab="problems">问题分布</button></div>
+    </header>
+    <div class="stability-drawer-body" id="stDrawerBody"></div>
+  </aside>
+</div>
+
+<div class="tabpane channel-management-page" id="tab-channels" hidden>
+  <div class="cm-toolbar">
+    <div>
+      <h2>渠道使用排行</h2>
+      <p>按渠道配置 URL 的可注册主域名归并，再按厂商、实际渠道和服务分组展开。</p>
+    </div>
+    <div class="cm-range">
+      <button type="button" class="active" data-cm-days="7">近 7 天</button>
+      <button type="button" data-cm-days="15">近 15 天</button>
+      <button type="button" data-cm-days="30">近 30 天</button>
+      <button type="button" data-cm-days="90">近 90 天</button>
+      <button type="button" id="cmCustomToggle">自定义</button>
+      <span class="cm-custom" id="cmCustomRange"><input id="cmCustomFrom" type="date" aria-label="开始日期"><span>～</span><input id="cmCustomTo" type="date" aria-label="结束日期"><button type="button" id="cmCustomApply">应用</button></span>
+    </div>
+  </div>
+
+  <div class="cm-boundary-note">
+    <span><b>归并口径</b> 例如 temp.last-api.ai 与 www.last-api.ai 同属 last-api.ai</span>
+    <span><b>请求口径</b> 仅统计已路由到具体渠道的请求，不含尚未进入渠道的前置拒绝</span>
+    <span><b>财务口径</b> 用量来自使用日志；毛利率由本地维护的双方折扣估算，不等于净利润</span>
+  </div>
+
+  <div class="cm-filters">
+    <label class="cm-search"><span>搜索</span><input id="cmSearch" type="search" placeholder="主域名、具体域名、渠道名或渠道 ID" autocomplete="off"></label>
+    <label><span>主域名</span><select id="cmDomain"><option value="">全部主域名</option></select></label>
+    <label><span>厂商类型</span><select id="cmVendor"><option value="">全部厂商类型</option></select></label>
+    <label><span>服务分组</span><select id="cmGroup"><option value="">全部服务分组</option></select></label>
+    <label><span>状态</span><select id="cmStatus"><option value="">全部状态</option><option value="enabled">当前启用</option><option value="disabled">当前停用</option><option value="historical">历史渠道</option></select></label>
+    <button type="button" class="cm-reset" id="cmReset">重置</button>
+  </div>
+
+  <div class="cm-sortbar">
+    <div><b>排行口径</b><span>切换后主域名、厂商和实际渠道同步重排</span></div>
+    <div class="cm-sort-switch">
+      <button type="button" class="active" data-cm-sort="cost">用户侧消费</button>
+      <button type="button" data-cm-sort="requests">请求数</button>
+      <button type="button" data-cm-sort="tokens">Tokens</button>
+    </div>
+  </div>
+
+  <div id="cmBody"><div class="cm-loading"><i></i><span>正在读取本地渠道用量汇总…</span></div></div>
+
+  <div class="cm-finance-mask" id="cmFinanceMask" hidden></div>
+  <aside class="cm-finance-dialog" id="cmFinanceDialog" role="dialog" aria-modal="true" aria-hidden="true" aria-labelledby="cmFinanceTitle">
+    <header>
+      <div><small>渠道财务配置</small><h2 id="cmFinanceTitle">成本与毛利率</h2><p id="cmFinanceSubtitle"></p></div>
+      <button type="button" id="cmFinanceClose" aria-label="关闭">×</button>
+    </header>
+    <div class="cm-finance-content">
+      <section class="cm-finance-formula">
+        <b>预估毛利率 = 1 − 上游折扣 ÷ 我方折扣</b>
+        <span>折扣 = 倍率 ×（充值支付 ÷ 充值到账）÷ 折扣基准。结果不含手续费、汇损、税费和退款。</span>
+      </section>
+      <section class="cm-finance-fields">
+        <div><h3>我方计价基准</h3><p>全站共用；修改后会影响其他主域名相同服务分组的计算。</p></div>
+        <label><span>折扣基准</span><input id="cmFinanceFX" type="number" min="0.000001" step="0.01" inputmode="decimal"><small>示例：7</small></label>
+        <label><span>我方充值支付</span><input id="cmFinanceSitePaid" type="number" min="0.000001" step="0.0001" inputmode="decimal"><small>1:1 时填 1</small></label>
+        <label><span>我方充值到账</span><input id="cmFinanceSiteCredit" type="number" min="0.000001" step="0.0001" inputmode="decimal"><small>1:1 时填 1</small></label>
+      </section>
+      <section class="cm-finance-fields domain">
+        <div><h3>该主域名的上游充值比例</h3><p>仅作用于当前归并主域名。</p></div>
+        <label><span>上游充值支付</span><input id="cmFinanceUpPaid" type="number" min="0.000001" step="0.0001" inputmode="decimal"><small>按实际支付金额填写</small></label>
+        <label><span>上游充值到账</span><input id="cmFinanceUpCredit" type="number" min="0.000001" step="0.0001" inputmode="decimal"><small>按实际到账额度填写</small></label>
+      </section>
+      <section class="cm-finance-groups">
+        <div class="cm-finance-group-title"><div><h3>服务分组倍率</h3><p>只填写需要核算的分组；双方倍率必须成对填写。</p></div><span id="cmFinanceConfiguredCount"></span></div>
+        <div class="cm-finance-group-head"><span>服务分组</span><span>我方倍率</span><span>上游倍率</span><span>我方折扣</span><span>上游折扣</span><span>预估毛利率</span></div>
+        <div id="cmFinanceGroupRows"></div>
+      </section>
+    </div>
+    <footer><span id="cmFinanceMessage"></span><div><button type="button" class="cm-finance-cancel" id="cmFinanceCancel">取消</button><button type="button" class="cm-finance-save" id="cmFinanceSave">保存配置</button></div></footer>
+  </aside>
+</div>
 
 <div class="tabpane" id="tab-server" hidden>
   <div class="toolbar">
@@ -485,6 +651,12 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
   </div>
 </div>
 
+    </div><!-- /monitor-content -->
+  </main>
+</div><!-- /monitor-shell -->
+
+<script src="/stability.js?v=1"></script>
+<script src="/channel-management.js?v=3"></script>
 <script>
 const params=new URLSearchParams(location.search);
 let WINDOW=parseInt(params.get('window')||'60',10);
@@ -1153,11 +1325,16 @@ function infraSchedule(){if(infraTimer)clearInterval(infraTimer);if(document.get
 function switchTab(name){
   document.querySelectorAll('.tabs .tab').forEach(t=>t.classList.toggle('active',t.dataset.tab===name));
   document.getElementById('tab-model').hidden=(name!=='model');
+  document.getElementById('tab-stability').hidden=(name!=='stability');
+  document.getElementById('tab-channels').hidden=(name!=='channels');
   document.getElementById('tab-server').hidden=(name!=='server');
   document.getElementById('tab-usage').hidden=(name!=='usage');
+  if(window.monitorShellSetTab)window.monitorShellSetTab(name);
   if(name==='server'){loadInfra();infraSchedule();setTimeout(resizeInfraCharts,80);}
   else if(infraTimer){clearInterval(infraTimer);}
   if(name==='usage')usageInit();
+  if(name==='stability'&&window.stabilityActivate)window.stabilityActivate();
+  if(name==='channels'&&window.channelManagementActivate)window.channelManagementActivate();
   if(name==='model')setTimeout(resizeModelCharts,60); // 模型 tab 非默认可见,切回时按可见宽度重排图表
   // 当前 tab 记入 URL hash:去报警设置等页再返回/手动刷新时不丢 tab
   history.replaceState(null,'',location.pathname+location.search+'#tab='+name);
@@ -2175,7 +2352,7 @@ setSeg();const _mePromise=loadMe();load();schedule();
 document.querySelectorAll('#longSeg a').forEach(a=>{a.href='javascript:void 0';a.classList.toggle('active',+a.dataset.d===longDays);a.addEventListener('click',e=>{e.preventDefault();longDays=+a.dataset.d;document.querySelectorAll('#longSeg a').forEach(x=>x.classList.toggle('active',x===a));loadLongTrend();});});
 loadLongTrend();
 // 默认落在「用户用量」;URL hash 带 tab(从报警设置返回/手动刷新)则恢复到该 tab。等 IS_ROOT 就位再渲染,模型/服务端数据后台预载
-_mePromise.finally(()=>{const m=location.hash.match(/tab=(model|server|usage)/);switchTab(m?m[1]:'usage');});
+_mePromise.finally(()=>{const m=location.hash.match(/tab=(model|server|usage|stability|channels)/);switchTab(m?m[1]:'usage');});
 </script>
 </body>
 </html>

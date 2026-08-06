@@ -50,6 +50,15 @@ var semiUIJS []byte // Semi UI 2.72.2（MIT），与 NewAPI 日期控件相同�
 //go:embed semi-ui.min.css
 var semiUICSS []byte // Semi UI 2.72.2 原始组件样式
 
+//go:embed stability.css
+var stabilityCSS []byte // Monitor 管理端新框架与稳定性报表样式；不被 Usage Portal 引用
+
+//go:embed stability.js
+var stabilityJS []byte // 稳定性报表交互；页面请求只访问 /stability/* 本地汇总接口
+
+//go:embed channel_management.js
+var channelManagementJS []byte // 渠道管理交互；只访问 Monitor 本地渠道汇总接口
+
 var allowedWindows = map[int]bool{15: true, 30: true, 60: true, 180: true, 360: true, 720: true, 1440: true}
 
 const maxJSONRequestBody = 4 << 20   // 4 MiB:足以覆盖节点批量上报，同时拒绝异常大请求体
@@ -129,6 +138,18 @@ func (m *Monitor) RegisterRoutes(r *gin.Engine) {
 		c.Header("Cache-Control", "public, max-age=31536000, immutable")
 		c.Data(http.StatusOK, "text/css; charset=utf-8", semiUICSS)
 	})
+	r.GET("/stability.css", func(c *gin.Context) {
+		c.Header("Cache-Control", "no-cache")
+		c.Data(http.StatusOK, "text/css; charset=utf-8", stabilityCSS)
+	})
+	r.GET("/stability.js", func(c *gin.Context) {
+		c.Header("Cache-Control", "no-cache")
+		c.Data(http.StatusOK, "application/javascript; charset=utf-8", stabilityJS)
+	})
+	r.GET("/channel-management.js", func(c *gin.Context) {
+		c.Header("Cache-Control", "no-cache")
+		c.Data(http.StatusOK, "application/javascript; charset=utf-8", channelManagementJS)
+	})
 	r.GET("/api/brand", m.brandHandler)                // 公开:站点名,供前端设置页面标题
 	r.POST("/internal/rejections", m.ingestRejections) // 机器对机器:接收采集器推送的前置拒绝(token 鉴权)
 	r.POST("/internal/host", m.ingestHost)             // 机器对机器:接收各节点主机 agent 推送的 OS 内存/磁盘(token 鉴权)
@@ -145,16 +166,21 @@ func (m *Monitor) RegisterRoutes(r *gin.Engine) {
 		view.GET("/data", m.serveData)
 		view.GET("/monitor/data", m.serveData)
 		view.GET("/trend/long", m.serveLongTrend)
-		view.GET("/infra", m.serveInfra)                       // 服务端健康监控(实例/DB/LB)快照
-		view.GET("/infra/series", m.serveInfraSeries)          // 按需取某资源某些指标的近 N 小时序列(展开图用)
-		view.GET("/usage/users", m.listTrackedUsers)           // 用户用量:被盯名单(含分组)
-		view.GET("/usage/groups", m.listGroups)                // 用户用量:客户分组列表
-		view.GET("/usage/followups", m.serveFollowUps)         // 用户用量:待跟进清单
-		view.GET("/usage/followups/log", m.listFollowLogs)     // 用户用量:某客户跟进记录
-		view.GET("/usage/settings", m.getUsageSettings)        // 用户用量:跟进阈值(读)
-		view.GET("/usage/matrix", m.serveUsageMatrix)          // 用户用量:列表页矩阵(前端渲染 行=用户×列=日期,格=当日费用)
-		view.GET("/usage/stats", m.serveUsageStats)            // 用户用量:单用户详情聚合(每日/分组/模型/费用)
-		view.GET("/usage/cache-stats", m.serveUsageCacheStats) // 用户用量缓存:无敏感信息的运维计数
+		view.GET("/stability/report", m.serveStabilityReport)        // 历史稳定性:只读 Monitor 本地 SQLite
+		view.GET("/stability/detail", m.serveStabilityDetail)        // 单分组详情:按需加载渠道时间条/模型
+		view.GET("/stability/problems", m.serveStabilityProblems)    // 原始错误签名:只读本地问题样本
+		view.GET("/stability/health", m.serveStabilityHealth)        // 采集新鲜度/覆盖/积压:不查生产库
+		view.GET("/channels/report", m.serveChannelManagementReport) // 渠道管理:主域名→厂商→渠道→服务分组的本地汇总
+		view.GET("/infra", m.serveInfra)                             // 服务端健康监控(实例/DB/LB)快照
+		view.GET("/infra/series", m.serveInfraSeries)                // 按需取某资源某些指标的近 N 小时序列(展开图用)
+		view.GET("/usage/users", m.listTrackedUsers)                 // 用户用量:被盯名单(含分组)
+		view.GET("/usage/groups", m.listGroups)                      // 用户用量:客户分组列表
+		view.GET("/usage/followups", m.serveFollowUps)               // 用户用量:待跟进清单
+		view.GET("/usage/followups/log", m.listFollowLogs)           // 用户用量:某客户跟进记录
+		view.GET("/usage/settings", m.getUsageSettings)              // 用户用量:跟进阈值(读)
+		view.GET("/usage/matrix", m.serveUsageMatrix)                // 用户用量:列表页矩阵(前端渲染 行=用户×列=日期,格=当日费用)
+		view.GET("/usage/stats", m.serveUsageStats)                  // 用户用量:单用户详情聚合(每日/分组/模型/费用)
+		view.GET("/usage/cache-stats", m.serveUsageCacheStats)       // 用户用量缓存:无敏感信息的运维计数
 		view.GET("/me", me)
 	}
 
@@ -186,6 +212,13 @@ func (m *Monitor) RegisterRoutes(r *gin.Engine) {
 		rootUsage.POST("/groups/portal", m.setGroupPortal) // 客户分组:客户端账号(开通/更新/重置/关闭)
 		rootUsage.POST("/followups/log", m.addFollowLog)   // 跟进记录:追加
 		rootUsage.POST("/settings", m.saveUsageSettings)   // 跟进阈值:保存
+	}
+
+	// 仅超级管理员:维护渠道毛利率的本地计价配置。接口只写 Monitor SQLite，
+	// 不读取或改写 NewAPI 的渠道、倍率与充值配置。
+	rootChannels := r.Group("/channels", m.requireRole(roleRoot))
+	{
+		rootChannels.POST("/finance", m.saveChannelFinanceHandler)
 	}
 }
 
