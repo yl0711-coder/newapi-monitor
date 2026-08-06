@@ -20,8 +20,11 @@ services:
       - MONITOR_SAMPLE_SECONDS=60
       - MONITOR_RETENTION_DAYS=7
       - MONITOR_BACKFILL_HOURS=24
+      - MONITOR_HOUR_RETENTION_DAYS=90
+      - MONITOR_STABILITY_ENABLED=true
+      - MONITOR_STABILITY_RETENTION_DAYS=90
+      - MONITOR_STABILITY_PROBLEM_SAMPLE_SECONDS=300
       # 可选:
-      # - MONITOR_HOUR_RETENTION_DAYS=90   # 小时级汇总留存(长期趋势/同比环比)
       # - MONITOR_HEARTBEAT_URL=           # dead-man 心跳(如 healthchecks.io)
       # - MONITOR_USAGE_REDIS_ADDR=172.26.4.11:6379  # 只使用 Redis 私网地址；留空自动降级
       # - MONITOR_USAGE_REDIS_USERNAME=monitor       # 建议 ACL 仅允许 nxmon:* 和 GET/SET/DEL/PING

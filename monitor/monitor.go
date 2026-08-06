@@ -3,9 +3,9 @@
 // 自带页面(server.go + page.html),无外部依赖。入口见 main.go。
 //
 // 架构(关键:不给生产库带来负担):
-//   - 采样器(sampler.go)每 N 秒对 new-api 生产 MySQL 做【一条】小窗口聚合查询,
-//     按"分钟桶 × 渠道 × 模型 × 分组"写入本地 sqlite。
-//   - 页面只读本地库,与访问量/刷新/窗口完全解耦——生产库永远只承担"每周期一条小查询"。
+//   - 采样器(sampler.go)每 N 秒对 new-api 生产 MySQL 做有界小窗口只读聚合，
+//     按"分钟桶 × 渠道 × 模型 × 分组"写入本地 SQLite；原始错误低频增量采样。
+//   - 监控页面只读本地库,与访问量/刷新/窗口解耦；页面刷新不会触发生产查询。
 //   - 全程只读、不改 new-api;并本地留存历史,扛日志清理、为后续告警备数据。
 //
 // 状态由 Monitor 持有(无包级全局):用 New 创建、Start 起采样、RegisterRoutes 挂页面。
@@ -39,7 +39,9 @@ type Monitor struct {
 	prodDB  *sql.DB  // new-api 生产库【只读】连接(采样器周期查询 + 用户用量按需查询);nil = 未连接
 	storeDB *gorm.DB // 本地采样库
 
-	lastRun atomic.Int64 // 采样心跳:最近一次成功采样的 Unix 秒(0=从未)
+	lastRun            atomic.Int64 // 采样心跳:最近一次成功采样的 Unix 秒(0=从未)
+	problemLastSuccess atomic.Int64 // 原始错误采集器最近一次成功执行
+	problemLastFailure atomic.Int64 // 原始错误采集器最近一次失败
 
 	chMu    sync.RWMutex
 	chNames map[string]string // 渠道 id->name 映射缓存

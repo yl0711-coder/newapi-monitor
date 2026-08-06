@@ -11,12 +11,14 @@
 给 [new-api](https://github.com/Calcium-Ion/new-api) 网关加一个独立的「上游稳定性」看板:用一个**只读账号**每分钟对其日志库做一次小聚合查询,在本地 SQLite 留存,展示 **分组 / 渠道 / 模型** 维度的成功率、异常、响应耗时(TTFB/TTFT),异常时邮件报警。**不改 new-api、不写它的库。**
 
 ## 特性
-- **零侵入**:只读采样,每周期一条小聚合查询,不给生产库添负担。
+- **零侵入**:只读、小窗口、有预算的后台采样；页面只读本地 SQLite，不随访问量查询生产库。
+- **历史稳定性**:分组 / 渠道 / 模型长期趋势、同比环比、问题原文聚合与渠道使用排行。
+- **渠道配置留痕**:渠道删除后保留最后快照；倍率更新追加版本，不覆盖历史版本。
 - **三态稳定性**:成功 / 异常(`client_gone` 等客户端中断)/ 失败(上游错误),按 分组 × 渠道 × 模型 聚合。
 - **响应耗时**:P50/P95 时延、TTFB/TTFT 首字延迟分布、出字速度(tok/s)。
 - **登录鉴权**:复用 new-api 用户身份(调其 `/api/user/login` 验证),按角色分权,无需自建账号。
 - **邮件报警**:错误率 / 错误突发 / 异常成簇 / 采样掉线 等规则,阈值可调。
-- **轻量**:纯 Go + 内嵌 SQLite(`CGO_ENABLED=0` 静态编译),单容器、无外部依赖。
+- **轻量**:纯 Go + 内嵌 SQLite(`CGO_ENABLED=0` 静态编译),单容器即可运行；Redis 仅为可选用量缓存。
 
 ## 工作原理
 ```
@@ -56,6 +58,9 @@ docker run -d --name newapi-monitor \
 | `MONITOR_RETENTION_DAYS` | 分钟级本地留存天数 | `7` |
 | `MONITOR_HOUR_RETENTION_DAYS` | 小时级汇总留存天数(长期趋势 + 同比环比) | `90` |
 | `MONITOR_BACKFILL_HOURS` | 启动时回填的历史小时数 | `24` |
+| `MONITOR_STABILITY_ENABLED` | 历史稳定性报表与原始问题采集开关；关闭不影响原模型/用量/服务端监控 | `true` |
+| `MONITOR_STABILITY_RETENTION_DAYS` | 稳定性小时汇总、问题签名和页面最大查询范围 | `90` |
+| `MONITOR_STABILITY_PROBLEM_SAMPLE_SECONDS` | 原始错误签名后台采样间隔；高峰时自动按本地游标续采 | `300` |
 | `MONITOR_HEARTBEAT_URL` | dead-man 心跳 URL(如 healthchecks.io);留空=不启用 | 留空 |
 | `MONITOR_SITE_NAME` | 对外看板站点名**兜底值**;站点名/favicon 默认部署时从主站 new-api 的 `system_name`/`logo` 同步,此项仅主站不可达时兜底 | 留空 |
 | `MONITOR_INGEST_TOKEN` | 「被拒请求」接收口 `POST /internal/rejections` 的鉴权 token,供各节点 [newapi-reject-collector](https://github.com/yl0711-coder/newapi-reject-collector) 推送前置拒绝;**留空=关闭该接口** | 留空 |
@@ -136,6 +141,12 @@ Redis 故障后会快速回源并退避 30 秒，使故障稳态的同键回源�
 ## 安全
 - 镜像内不含任何密钥;DSN、会话密钥、SMTP 凭证均通过环境变量注入。
 - SMTP 凭证等敏感信息前端永不回显。
+
+## 稳定性采集健康与数据保护
+
+- `GET /health` 只用于容器存活检查，不会因报表数据暂时延迟而触发错误重启。
+- 管理员登录后可读取 `GET /stability/health`，查看主采样新鲜度、错误采集完整覆盖时间、积压分钟和本地库状态；该接口不查询生产库。
+- Monitor SQLite 已包含稳定性历史、渠道最后快照和倍率版本，必须随 `/data` 数据卷备份。安全备份、恢复、功能关闭和镜像回退步骤见 [`docs/monitor-operations.md`](docs/monitor-operations.md)。
 
 ## 构建
 ```bash

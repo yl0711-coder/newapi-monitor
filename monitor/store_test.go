@@ -28,6 +28,65 @@ func newTestMonitor(t *testing.T) *Monitor {
 	return m
 }
 
+func TestReplaceChannelSnapsKeepsDeletedLastSnapshot(t *testing.T) {
+	m := newTestMonitor(t)
+	if err := m.replaceChannelSnaps([]ChannelSnap{
+		{ID: 1, Name: "old-name", Vendor: "OpenAI", BaseDomain: "a.example", Status: 1, UpdatedAt: 100},
+		{ID: 2, Name: "deleted-later", Vendor: "Anthropic", BaseDomain: "b.example", Status: 1, UpdatedAt: 100},
+	}, 100); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.replaceChannelSnaps([]ChannelSnap{
+		{ID: 1, Name: "new-name", Vendor: "OpenAI", BaseDomain: "a.example", Status: 1, UpdatedAt: 200},
+	}, 200); err != nil {
+		t.Fatal(err)
+	}
+	var rows []ChannelSnap
+	if err := m.storeDB.Order("id ASC").Find(&rows).Error; err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 2 || rows[0].Name != "new-name" || rows[0].DeletedAt != 0 {
+		t.Fatalf("existing channel was not updated in place: %+v", rows)
+	}
+	if rows[1].Name != "deleted-later" || rows[1].BaseDomain != "b.example" || rows[1].DeletedAt != 200 {
+		t.Fatalf("deleted channel lost its last snapshot: %+v", rows[1])
+	}
+	var current ChannelSnap
+	// 权威整表结果即使在同一秒内刷新，也必须按 ID 准确判断删除。
+	if err := m.replaceChannelSnapsAuthoritative([]ChannelSnap{
+		{ID: 1, Name: "new-name", Vendor: "OpenAI", BaseDomain: "a.example", Status: 1, UpdatedAt: 200},
+	}, 200); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.storeDB.First(&current, "id = ?", 2).Error; err != nil || current.DeletedAt != 200 {
+		t.Fatalf("same-second refresh missed deletion: %+v err=%v", current, err)
+	}
+	// 空结果代表读取异常，不能把仍存在的渠道误标删除。
+	if err := m.replaceChannelSnaps(nil, 300); err != nil {
+		t.Fatal(err)
+	}
+	current = ChannelSnap{}
+	if err := m.storeDB.First(&current, "id = ?", 1).Error; err != nil || current.DeletedAt != 0 {
+		t.Fatalf("empty refresh marked current channel deleted: %+v err=%v", current, err)
+	}
+	// 同 ID 重新出现时恢复为当前渠道，并同步最新名称。
+	if err := m.replaceChannelSnaps([]ChannelSnap{{ID: 2, Name: "restored", Status: 1, UpdatedAt: 400}}, 400); err != nil {
+		t.Fatal(err)
+	}
+	current = ChannelSnap{}
+	if err := m.storeDB.First(&current, "id = ?", 2).Error; err != nil || current.DeletedAt != 0 || current.Name != "restored" {
+		t.Fatalf("restored channel snapshot=%+v err=%v", current, err)
+	}
+	// 整表查询成功且返回空，表示所有渠道都已删除；快照仍保留。
+	if err := m.replaceChannelSnapsAuthoritative(nil, 500); err != nil {
+		t.Fatal(err)
+	}
+	var all []ChannelSnap
+	if err := m.storeDB.Order("id ASC").Find(&all).Error; err != nil || len(all) != 2 || all[0].DeletedAt == 0 || all[1].DeletedAt != 500 {
+		t.Fatalf("authoritative empty refresh did not retain tombstones: %+v err=%v", all, err)
+	}
+}
+
 func TestStoreAggregation(t *testing.T) {
 	m := newTestMonitor(t)
 	const bucket = 1_700_000_000 / 60 * 60 // 任意分钟桶
@@ -68,7 +127,7 @@ func TestStoreAggregation(t *testing.T) {
 		t.Errorf("错误分类错: 5xx=%d 4xx=%d(应 1/2)", sum.Err5xx, sum.Err4xx)
 	}
 
-	// —— 按渠道:两行,按 failed 降序(渠道2 failed=2 在前)——
+	// —— 按渠道:两行,按用户侧消费降序(渠道2 $2 在渠道1 $1 前)——
 	ch, err := m.storeDim("channel_id", since, winSec)
 	if err != nil {
 		t.Fatal(err)
@@ -77,7 +136,7 @@ func TestStoreAggregation(t *testing.T) {
 		t.Fatalf("应 2 个渠道,实际 %d", len(ch))
 	}
 	if ch[0].Key != "2" {
-		t.Errorf("应按 failed 降序,渠道2(failed=2)在前,实际首位 %q", ch[0].Key)
+		t.Errorf("应按消费降序,渠道2($2)在前,实际首位 %q", ch[0].Key)
 	}
 	byCh := map[string]Row{ch[0].Key: ch[0], ch[1].Key: ch[1]}
 	if r := byCh["1"]; r.Total != 10 || !approx(r.SuccessRate, 80) {
@@ -103,6 +162,36 @@ func TestStoreAggregation(t *testing.T) {
 	}
 	if len(trend) != 1 || trend[0].Success != 26 || trend[0].Failed != 3 {
 		t.Errorf("趋势错: %+v(应 1 桶 26/3)", trend)
+	}
+}
+
+// TestStoreDimOrdersAllModelMonitorDimensionsByCost 验证 Top-N 排序口径不是旧的错误数。
+// 高消费项即使没有错误，也必须排在低消费高错误项之前。
+func TestStoreDimOrdersAllModelMonitorDimensionsByCost(t *testing.T) {
+	m := newTestMonitor(t)
+	const bucket = 1_700_000_000 / 60 * 60
+	if err := m.upsertSamples([]MetricSample{
+		{BucketTs: bucket, ChannelID: 11, ModelName: "high-cost-model", Grp: "high-cost-group", Success: 1, Quota: 2_000_000},
+		{BucketTs: bucket, ChannelID: 22, ModelName: "high-error-model", Grp: "high-error-group", Failed: 20, Quota: 100_000},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name, dim, want string
+	}{
+		{name: "分组", dim: "grp", want: "high-cost-group"},
+		{name: "渠道", dim: "channel_id", want: "11"},
+		{name: "模型", dim: "model_name", want: "high-cost-model"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rows, err := m.storeDim(tc.dim, int64(bucket-60), 900)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(rows) != 2 || rows[0].Key != tc.want {
+				t.Fatalf("%s未按消费降序: %+v", tc.name, rows)
+			}
+		})
 	}
 }
 

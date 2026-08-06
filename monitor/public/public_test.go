@@ -42,6 +42,7 @@ type channelSnap struct {
 	Models       string
 	EnabledSince int64
 	UpdatedAt    int64
+	DeletedAt    int64 `gorm:"column:deleted_at"`
 }
 
 func (channelSnap) TableName() string { return "channel_snaps" }
@@ -125,6 +126,23 @@ func TestPublicSnapshotSanitized(t *testing.T) {
 	}
 	if !strings.Contains(s, "claude-opus-4-8") { // 模型名应在
 		t.Errorf("缺模型名: %s", b)
+	}
+}
+
+func TestDeletedChannelDoesNotRemainSelectable(t *testing.T) {
+	db := testDB(t)
+	now := int64(1_900_000_000)
+	db.Create(&[]channelSnap{
+		{ID: 1, Status: 1, Groups: "g-current", Models: "m-current", UpdatedAt: now},
+		{ID: 2, Status: 1, Groups: "g-deleted", Models: "m-deleted", UpdatedAt: now - 60, DeletedAt: now},
+	})
+	h := &handler{db: db, cfg: Config{}}
+	maps := h.channelMaps()
+	if maps["g-current"]["m-current"] != 1 {
+		t.Fatalf("current channel missing from selectable map: %+v", maps)
+	}
+	if _, exists := maps["g-deleted"]; exists {
+		t.Fatalf("deleted channel remained selectable: %+v", maps)
 	}
 }
 

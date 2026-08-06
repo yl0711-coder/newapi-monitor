@@ -13,7 +13,8 @@ import (
 	"time"
 )
 
-// sampler.go:唯一访问生产库的组件。每周期对 logs 表做【一条】小窗口聚合查询,写本地 sqlite。
+// sampler.go:唯一访问生产库的组件。每周期对 logs 表做有界小窗口聚合，
+// 错误原文按默认 5 分钟周期另取一个完整分钟小窗口；结果均写入本地 SQLite。
 // 采样心跳(m.lastRun)与渠道名缓存(m.chNames)都挂在 Monitor 上。
 
 // LastSampleRun 返回采样器最近一次成功运行时刻(0=从未)。
@@ -49,6 +50,17 @@ func (m *Monitor) startSampler(ctx context.Context) {
 			slog.Warn("启动小时汇总失败(忽略)", "err", err)
 		}
 	}
+	// 稳定性历史表只从已经存在的本地分钟桶生成。即使关闭了生产历史回填，
+	// 也把本地现有留存转成长期维度表；不会因此多查一次生产库。
+	if m.cfg.StabilityEnabled {
+		since := time.Now().Unix() - int64(m.cfg.RetentionDays)*86400
+		if err := m.rollupStabilityHours(since); err != nil {
+			slog.Warn("启动稳定性维度汇总失败(忽略,不影响原监控)", "err", err)
+		}
+		if err := m.rollupStabilityRejections(since); err != nil {
+			slog.Warn("启动稳定性拒绝汇总失败(忽略,不影响原监控)", "err", err)
+		}
+	}
 
 	interval := time.Duration(m.cfg.SampleSeconds) * time.Second
 	if interval < 10*time.Second {
@@ -57,7 +69,7 @@ func (m *Monitor) startSampler(ctx context.Context) {
 	m.lastRun.Store(time.Now().Unix()) // 初始化心跳,避免启动初期误报"采样异常"
 	m.heartbeat()                      // 启动即对外打一次心跳,让 dead-man 立刻知道"活着"
 	go m.loop(ctx, interval)
-	slog.Info("采样器已启动", "interval", interval.String(), "note", "生产库仅每周期一条小查询")
+	slog.Info("采样器已启动", "interval", interval.String(), "note", "生产库仅执行有界小窗口只读查询")
 
 	if m.cfg.InfraEnabled { // 服务端健康监控(实例/DB/LB),独立采样循环;默认关
 		m.startInfra(ctx)
@@ -69,6 +81,8 @@ func (m *Monitor) loop(ctx context.Context, interval time.Duration) {
 	defer ticker.Stop()
 	lookback := int64(interval.Seconds())*3 + 60
 	var ticks int
+	var nextProblemSample int64
+	var nextStabilityRollup int64
 	for {
 		select {
 		case <-ctx.Done():
@@ -87,6 +101,37 @@ func (m *Monitor) loop(ctx context.Context, interval time.Duration) {
 			}
 			m.refreshChannels()   // 每周期同步渠道开关(小查询),禁用/重启用近乎实时反映到稳定性
 			m.refreshSelectable() // 每周期重算"可选(分组,模型)对",监控只统计用户能选到的模型
+			now := time.Now().Unix()
+			if m.cfg.StabilityEnabled {
+				// 稳定性是历史报表而非秒级看板：每 5 分钟重算最近两小时已足够
+				// 覆盖迟到日志，同时避免每分钟重复扫描本地维度表。
+				if now >= nextStabilityRollup {
+					if err := m.rollupStabilityHours(now - 2*3600); err != nil {
+						slog.Warn("稳定性维度汇总失败(忽略,不影响原监控)", "err", err)
+					}
+					if err := m.rollupStabilityRejections(now - 2*3600); err != nil {
+						slog.Warn("稳定性拒绝汇总失败(忽略,不影响原监控)", "err", err)
+					}
+					nextStabilityRollup = now + 300
+				}
+				problemEvery := stabilityProblemIntervalSeconds(m.cfg.StabilityProblemSampleSec)
+				if now >= nextProblemSample {
+					// 延迟 10 分钟再确认完整分钟，覆盖 360 秒长请求和日志落库抖动；高峰积压时
+					// 采集器按本地游标续跑，不会把超限窗口直接丢掉。
+					problemTargetTo := now - stabilityProblemFinalizeDelaySec
+					if _, err := m.sampleStabilityProblems(ctx, problemTargetTo-2*problemEvery-120, problemTargetTo); err != nil {
+						m.problemLastFailure.Store(now)
+						slog.Warn("稳定性原始错误采样失败(忽略,不影响主采样)", "err", err)
+					} else {
+						m.problemLastSuccess.Store(now)
+					}
+					if m.stabilityProblemPendingCount() > 0 || m.stabilityProblemNeedsCatchup(problemTargetTo) {
+						nextProblemSample = now + 60 // 有积压时加快追赶，但每轮读取预算仍固定。
+					} else {
+						nextProblemSample = now + problemEvery
+					}
+				}
+			}
 			m.evaluateAlerts(time.Now().Unix())
 			ticks++
 			if ticks%(int(600/interval.Seconds())+1) == 0 {
@@ -105,6 +150,15 @@ func (m *Monitor) loop(ctx context.Context, interval time.Duration) {
 				if hd := m.cfg.HourRetentionDays; hd > 0 {
 					if n, err := m.pruneHoursOlderThan(time.Now().Unix() - int64(hd)*86400); err == nil && n > 0 {
 						slog.Info("清理过期小时汇总", "rows", n)
+					}
+				}
+				if m.cfg.StabilityEnabled {
+					days := m.cfg.StabilityRetentionDays
+					if days <= 0 {
+						days = 90
+					}
+					if err := m.pruneStabilityOlderThan(time.Now().Unix() - int64(days)*86400); err != nil {
+						slog.Warn("清理稳定性历史失败(忽略)", "err", err)
 					}
 				}
 			}
@@ -333,6 +387,14 @@ func (m *Monitor) BackfillHours(ctx context.Context, hours int) (*BackfillResult
 	if err := m.rollupHours(now - int64(m.cfg.RetentionDays)*86400); err != nil {
 		slog.Warn("回填后小时汇总失败", "err", err)
 	}
+	if m.cfg.StabilityEnabled {
+		if err := m.rollupStabilityHours(now - int64(m.cfg.RetentionDays)*86400); err != nil {
+			slog.Warn("回填后稳定性维度汇总失败(忽略)", "err", err)
+		}
+		if err := m.rollupStabilityRejections(now - int64(m.cfg.RetentionDays)*86400); err != nil {
+			slog.Warn("回填后稳定性拒绝汇总失败(忽略)", "err", err)
+		}
+	}
 	res.ElapsedS = int64(time.Since(start).Seconds())
 	slog.Info("历史回填完成", "hours", hours, "slices", res.Slices, "rows", res.Rows,
 		"failed", res.Failed, "elapsed_sec", res.ElapsedS)
@@ -384,7 +446,7 @@ GROUP BY bucket, token_name`
 	return m.upsertTokenSamples(batch)
 }
 
-// refreshChannels 刷新渠道 id->name 映射,并把渠道健康快照(状态/分组/模型)写入本地库,
+// refreshChannels 刷新渠道 id->name 映射,并把渠道健康快照(类型/状态/分组/模型)写入本地库,
 // 供对外看板派生"无可用渠道"。低频、失败保留旧值。仅读非密字段(无 key/凭证)。
 func (m *Monitor) refreshChannels() {
 	if m.prodDB == nil {
@@ -392,7 +454,9 @@ func (m *Monitor) refreshChannels() {
 	}
 	cctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	rows, err := m.prodDB.QueryContext(cctx, "SELECT id, name, status, `group`, models FROM channels")
+	// type 按 NewAPI 官方映射展示厂商。base_url 只在内存中提取可注册主域名，
+	// 本地快照不保存完整 URL/路径，更不读取 key。这只是在原有渠道小查询上多取一列。
+	rows, err := m.prodDB.QueryContext(cctx, "SELECT id, name, type, status, `group`, models, base_url FROM channels")
 	if err != nil {
 		return
 	}
@@ -402,28 +466,34 @@ func (m *Monitor) refreshChannels() {
 	now := time.Now().Unix()
 	prev := m.channelEnabledState() // 上一轮各渠道 (status, enabled_since)
 	for rows.Next() {
-		var id, status int
-		var name, grp, models sql.NullString
-		if err := rows.Scan(&id, &name, &status, &grp, &models); err != nil {
+		var id, channelType, status int
+		var name, grp, models, baseURL sql.NullString
+		if err := rows.Scan(&id, &name, &channelType, &status, &grp, &models, &baseURL); err != nil {
 			return
 		}
 		names[strconv.Itoa(id)] = name.String
-		p := prev[id] // 不存在则零值(status 0 / since 0),nextEnabledSince 按"新建即启用"处理
+		p := prev[id] // 不存在或曾被删除都按新建处理，重新出现时从本轮重新计算启用起点。
+		if p.deletedAt > 0 {
+			p.status, p.since = 0, 0
+		}
 		enabledSince := nextEnabledSince(status, p.status, p.since, now)
-		snaps = append(snaps, ChannelSnap{ID: id, Status: status, Groups: grp.String, Models: models.String, EnabledSince: enabledSince, UpdatedAt: now})
+		snaps = append(snaps, ChannelSnap{
+			ID: id, Name: name.String, Type: channelType, Vendor: newAPIChannelTypeName(channelType), Status: status,
+			BaseDomain: normalizeChannelBaseDomain(baseURL.String), BaseHost: normalizeChannelBaseHost(baseURL.String),
+			Groups: grp.String, Models: models.String,
+			EnabledSince: enabledSince, UpdatedAt: now,
+		})
 	}
 	if err := rows.Err(); err != nil {
 		return
 	}
-	if len(names) > 0 {
-		m.chMu.Lock()
-		m.chNames = names
-		m.chMu.Unlock()
-	}
-	if len(snaps) > 0 {
-		if err := m.replaceChannelSnaps(snaps, now); err != nil {
-			slog.Warn("渠道健康快照写入失败(忽略,不影响监控)", "err", err)
-		}
+	// rows 已成功读到 EOF，因此即使为空也是可信的当前状态。
+	// 同步清空内存名称映射，并将本地旧渠道软删除，但保留最后快照。
+	m.chMu.Lock()
+	m.chNames = names
+	m.chMu.Unlock()
+	if err := m.replaceChannelSnapsAuthoritative(snaps, now); err != nil {
+		slog.Warn("渠道健康快照写入失败(忽略,不影响监控)", "err", err)
 	}
 }
 
@@ -469,7 +539,7 @@ func (m *Monitor) refreshSelectable() {
 		visible[g] = true
 	}
 	var rows []struct{ Groups, Models string }
-	m.storeDB.Raw("SELECT groups, models FROM channel_snaps WHERE status = 1").Scan(&rows)
+	m.storeDB.Raw("SELECT groups, models FROM channel_snaps WHERE status = 1 AND deleted_at = 0").Scan(&rows)
 	set := map[[2]string]bool{}
 	for _, r := range rows {
 		for _, g := range splitList(r.Groups) {

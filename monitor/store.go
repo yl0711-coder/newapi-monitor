@@ -102,11 +102,19 @@ type HourSample struct {
 // 供对外看板(public 包)派生"某线路×模型有无可用渠道"。仅存路由与状态,【无任何密钥】。
 type ChannelSnap struct {
 	ID           int    `gorm:"primaryKey;autoIncrement:false"`
+	Name         string `gorm:"size:192"` // 展示名；只读同步，不含 key 等敏感字段
+	Type         int    // NewAPI 官方渠道类型；只用于客观展示渠道厂商/类型，不按名称猜测
+	Vendor       string `gorm:"size:64"`                           // 由 Type 按 NewAPI 官方 ChannelTypeNames 映射
+	BaseDomain   string `gorm:"size:253;column:base_domain;index"` // 仅保存 base_url 的可注册主域名；不保存完整 URL/路径/凭据
+	BaseHost     string `gorm:"size:253;column:base_host;index"`   // 仅保存脱敏主机名；用于核对自动归并依据
 	Status       int    // new-api: 1启用 / 2手动禁用 / 3自动禁用
 	Groups       string `gorm:"size:512"`  // 逗号分隔分组
 	Models       string `gorm:"type:text"` // 逗号分隔模型
 	EnabledSince int64  // 当前这段"启用"的起始 Unix 秒;禁用=0;0 也表示"自始启用"(算全量历史);重启用刷新为重启用时刻
 	UpdatedAt    int64  `gorm:"index"`
+	// DeletedAt 只表示该渠道已不在 NewAPI 当前渠道表中。删除后的最后快照必须保留，
+	// 供稳定性和渠道用量历史继续展示名称、厂商与主域名；0 表示当前仍存在。
+	DeletedAt int64 `gorm:"column:deleted_at;index"`
 }
 
 // enabledChanFilter 把"已知被禁用 / 在其启用时刻之前"的渠道流量排除出稳定性聚合:
@@ -193,8 +201,17 @@ func (m *Monitor) openStore(path string) error {
 	// 交付异常告警列同理:老库升级时这些列刚建出来是零值(开关 false、阈值 0 = 规则不启用),
 	// 需按 defaultAlertConfig 补一次,否则升级后交付异常告警静默失效。
 	hadAnomalyAlerts := db.Migrator().HasColumn(&AlertConfig{}, "anomaly_alerts_enabled")
-	if err := db.AutoMigrate(&MetricSample{}, &TokenSample{}, &HourSample{}, &ChannelSnap{}, &RejectionSample{}, &SelectablePair{}, &InfraSample{}, &AlertConfig{}, &AlertLog{}, &TrackedUser{}, &CustomerGroup{}, &FollowUpLog{}, &UsageSettings{}); err != nil {
+	if err := db.AutoMigrate(
+		&MetricSample{}, &TokenSample{}, &HourSample{}, &ChannelSnap{}, &RejectionSample{}, &SelectablePair{},
+		&StabilityHourSample{}, &StabilityRejectHour{}, &StabilityProblemSample{},
+		&StabilityProblemIngestState{}, &StabilityProblemStage{},
+		&ChannelFinanceSetting{}, &ChannelSaleGroupRate{}, &ChannelDomainCost{}, &ChannelDomainGroupCost{}, &ChannelFinanceVersion{},
+		&InfraSample{}, &AlertConfig{}, &AlertLog{}, &TrackedUser{}, &CustomerGroup{}, &FollowUpLog{}, &UsageSettings{},
+	); err != nil {
 		return fmt.Errorf("表迁移失败: %w", err)
+	}
+	if err := migrateLegacyChannelFinanceVersions(db); err != nil {
+		return fmt.Errorf("倍率版本迁移失败: %w", err)
 	}
 	if !hadCategoryToggles {
 		db.Model(&AlertConfig{}).Where("id = 1").Updates(map[string]any{"model_alerts_enabled": true, "server_alerts_enabled": true})
@@ -253,8 +270,9 @@ func nextEnabledSince(status, prevStatus int, prevSince, now int64) int64 {
 
 // chanPrev 是某渠道上一轮的状态与启用起始时刻,供刷新时判断"禁用→启用"跳变。
 type chanPrev struct {
-	status int
-	since  int64
+	status    int
+	since     int64
+	deletedAt int64
 }
 
 // channelEnabledState 返回当前 channel_snaps 里每个渠道的上一轮状态,
@@ -263,27 +281,51 @@ func (m *Monitor) channelEnabledState() map[int]chanPrev {
 	var rows []struct {
 		ID, Status   int
 		EnabledSince int64
+		DeletedAt    int64
 	}
-	warnReadErr("channelEnabledState", m.storeDB.Raw("SELECT id, status, enabled_since FROM channel_snaps").Scan(&rows))
+	warnReadErr("channelEnabledState", m.storeDB.Raw("SELECT id, status, enabled_since, deleted_at FROM channel_snaps").Scan(&rows))
 	out := make(map[int]chanPrev, len(rows))
 	for _, r := range rows {
-		out[r.ID] = chanPrev{status: r.Status, since: r.EnabledSince}
+		out[r.ID] = chanPrev{status: r.Status, since: r.EnabledSince, deletedAt: r.DeletedAt}
 	}
 	return out
 }
 
-// replaceChannelSnaps 用本轮读到的渠道快照覆盖本地表:幂等 UPSERT + 删除本轮未出现的(已删渠道)。
+// replaceChannelSnaps 用本轮完整读取到的渠道快照更新本地表。
+// 同 ID 的名称/厂商/地址等直接同步最新值；本轮未出现的渠道只标记 deleted_at，
+// 永不物理删除其最后快照，以便历史报表仍能解释旧 channel_id。
 func (m *Monitor) replaceChannelSnaps(rows []ChannelSnap, now int64) error {
 	if len(rows) == 0 {
+		// 空结果可能是上游读取失败或异常，绝不能据此把所有渠道标成已删除。
 		return nil
 	}
-	if err := m.storeDB.Clauses(clause.OnConflict{
-		Columns:   []clause.Column{{Name: "id"}},
-		UpdateAll: true,
-	}).CreateInBatches(rows, 200).Error; err != nil {
-		return err
+	return m.replaceChannelSnapsAuthoritative(rows, now)
+}
+
+// replaceChannelSnapsAuthoritative 只能在 channels 整表查询已成功读完时调用。
+// 与 replaceChannelSnaps 不同，此处的空集合是可信事实，表示当前已没有任何渠道。
+// 删除判断按本轮 ID 集合而不是 updated_at，避免同一秒内连续刷新时漏标。
+func (m *Monitor) replaceChannelSnapsAuthoritative(rows []ChannelSnap, now int64) error {
+	ids := make([]int, 0, len(rows))
+	for i := range rows {
+		rows[i].DeletedAt = 0
+		ids = append(ids, rows[i].ID)
 	}
-	return m.storeDB.Where("updated_at < ?", now).Delete(&ChannelSnap{}).Error
+	return m.storeDB.Transaction(func(tx *gorm.DB) error {
+		if len(rows) > 0 {
+			if err := tx.Clauses(clause.OnConflict{
+				Columns:   []clause.Column{{Name: "id"}},
+				UpdateAll: true,
+			}).CreateInBatches(rows, 200).Error; err != nil {
+				return err
+			}
+		}
+		missing := tx.Model(&ChannelSnap{}).Where("deleted_at = 0")
+		if len(ids) > 0 {
+			missing = missing.Where("id NOT IN ?", ids)
+		}
+		return missing.Update("deleted_at", now).Error
+	})
 }
 
 // replaceSelectablePairs 全量替换可选 (分组,模型) 对表(数量不大,清空+批量插简单可靠)。
@@ -561,7 +603,7 @@ func (m *Monitor) storeDim(dimCol string, since int64, windowSec float64) ([]Row
 	}
 	q := fmt.Sprintf(`SELECT %s AS k, %s FROM metric_samples
 		WHERE bucket_ts >= ?%s GROUP BY %s
-		ORDER BY failed DESC, (success+failed) DESC LIMIT 200`, dimCol, aggCols, f, dimCol)
+		ORDER BY quota DESC, (success+anomaly+failed) DESC, k ASC LIMIT 200`, dimCol, aggCols, f, dimCol)
 	var rows []aggRow
 	if err := m.storeDB.Raw(q, since).Scan(&rows).Error; err != nil {
 		return nil, fmt.Errorf("本地维度聚合失败(%s): %w", dimCol, err)
@@ -615,7 +657,8 @@ func (m *Monitor) storeTrend(since int64, windowMinutes int) ([]TimePoint, error
 	return out, nil
 }
 
-// storeTokens 按令牌(API Key)聚合窗口内的成功/异常/失败/用量/成本,按 错误数→请求数 降序取 Top 100。
+// storeTokens 按令牌(API Key)聚合窗口内的成功/异常/失败/用量/成本，
+// 按用户侧消费→请求数→名称排序取 Top 100，与模型监控另外三个维度保持一致。
 func (m *Monitor) storeTokens(since int64, windowSec float64) ([]TokenRow, error) {
 	type tr struct {
 		K       string
@@ -630,7 +673,7 @@ func (m *Monitor) storeTokens(since int64, windowSec float64) ([]TokenRow, error
 		COALESCE(SUM(success),0) AS success, COALESCE(SUM(anomaly),0) AS anomaly,
 		COALESCE(SUM(failed),0) AS failed, COALESCE(SUM(tokens),0) AS tokens, COALESCE(SUM(quota),0) AS quota
 		FROM token_samples WHERE bucket_ts >= ? GROUP BY token_name
-		ORDER BY failed DESC, (success+failed) DESC LIMIT 100`, since).Scan(&rows).Error; err != nil {
+		ORDER BY quota DESC, (success+anomaly+failed) DESC, k ASC LIMIT 100`, since).Scan(&rows).Error; err != nil {
 		return nil, fmt.Errorf("本地 token 聚合失败: %w", err)
 	}
 	out := make([]TokenRow, 0, len(rows))

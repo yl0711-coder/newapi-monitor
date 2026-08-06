@@ -254,7 +254,7 @@ func (h *handler) channelMaps() map[string]map[string]int {
 		Groups string `gorm:"column:groups"`
 		Models string `gorm:"column:models"`
 	}
-	if err := h.db.Raw("SELECT status, groups, models FROM channel_snaps").Scan(&rows).Error; err != nil {
+	if err := h.db.Raw("SELECT status, groups, models FROM channel_snaps WHERE deleted_at = 0").Scan(&rows).Error; err != nil {
 		slog.Warn("看板:渠道快照查询失败(降级为空)", "err", err)
 	}
 	for _, r := range rows {
