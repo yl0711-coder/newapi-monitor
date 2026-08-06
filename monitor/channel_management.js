@@ -2,7 +2,7 @@
 'use strict';
 
 const cm={
-  inited:false,loaded:false,days:7,custom:null,report:null,abort:null,sort:'cost',
+  inited:false,loaded:false,days:7,custom:null,preset:'',report:null,abort:null,sort:'cost',
   filters:{search:'',domain:'',vendor:'',group:'',status:''},
   expandedDomains:new Set(),expandedVendors:new Set(),expandedChannels:new Set(),
   financeDomain:null,financeGroups:[]
@@ -20,6 +20,14 @@ const metricText=u=>cm.sort==='requests'?nfmt(u?.requests):cm.sort==='tokens'?co
 const dateTime=ts=>ts?new Date(ts*1000).toLocaleString('zh-CN',{hour12:false,timeZone:'Asia/Shanghai'}):'—';
 const shortDateTime=ts=>ts?new Date(ts*1000).toLocaleString('zh-CN',{hour12:false,timeZone:'Asia/Shanghai',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'}):'—';
 const cstDate=ts=>{const p=new Intl.DateTimeFormat('zh-CN',{timeZone:'Asia/Shanghai',year:'numeric',month:'2-digit',day:'2-digit'}).formatToParts(new Date(ts*1000));const v=t=>p.find(x=>x.type===t)?.value||'';return `${v('year')}-${v('month')}-${v('day')}`};
+const cmPresetRange=(preset,now=Date.now())=>{
+  const ts=Math.floor(now/1000),today=cstDate(ts);
+  if(preset==='today')return {from:today,to:today};
+  if(preset==='yesterday'){const day=cstDate(ts-86400);return {from:day,to:day}}
+  const weekday=new Intl.DateTimeFormat('en-US',{timeZone:'Asia/Shanghai',weekday:'short'}).format(new Date(now));
+  const sinceMonday=({Mon:0,Tue:1,Wed:2,Thu:3,Fri:4,Sat:5,Sun:6})[weekday]??0;
+  return {from:cstDate(ts-sinceMonday*86400),to:today};
+};
 
 window.channelManagementActivate=function(){
   if(!cm.inited)init();
@@ -29,7 +37,10 @@ window.channelManagementActivate=function(){
 function init(){
   cm.inited=true;
   document.querySelectorAll('[data-cm-days]').forEach(btn=>btn.addEventListener('click',()=>{
-    cm.days=+btn.dataset.cmDays;cm.custom=null;syncRange();loadReport();
+    cm.days=+btn.dataset.cmDays;cm.custom=null;cm.preset='';syncRange();loadReport();
+  }));
+  document.querySelectorAll('[data-cm-preset]').forEach(btn=>btn.addEventListener('click',()=>{
+    cm.preset=btn.dataset.cmPreset;cm.custom=cmPresetRange(cm.preset);syncRange();loadReport();
   }));
   $('cmCustomToggle')?.addEventListener('click',()=>{
     $('cmCustomRange')?.classList.toggle('show');
@@ -38,7 +49,7 @@ function init(){
   $('cmCustomApply')?.addEventListener('click',()=>{
     const from=$('cmCustomFrom').value,to=$('cmCustomTo').value;
     if(!from||!to||from>to){showError('请选择有效的开始和结束日期。');return}
-    cm.custom={from,to};syncRange();loadReport();
+    cm.custom={from,to};cm.preset='custom';syncRange();loadReport();
   });
   ['cmDomain','cmVendor','cmGroup','cmStatus'].forEach(id=>$(id)?.addEventListener('change',()=>{
     const key={cmDomain:'domain',cmVendor:'vendor',cmGroup:'group',cmStatus:'status'}[id];
@@ -84,8 +95,9 @@ function init(){
 function toggleSet(set,key){if(set.has(key))set.delete(key);else set.add(key)}
 function syncRange(){
   document.querySelectorAll('[data-cm-days]').forEach(btn=>btn.classList.toggle('active',!cm.custom&&+btn.dataset.cmDays===cm.days));
-  $('cmCustomToggle')?.classList.toggle('active',!!cm.custom);
-  $('cmCustomRange')?.classList.toggle('show',!!cm.custom);
+  document.querySelectorAll('[data-cm-preset]').forEach(btn=>btn.classList.toggle('active',btn.dataset.cmPreset===cm.preset));
+  $('cmCustomToggle')?.classList.toggle('active',cm.preset==='custom');
+  $('cmCustomRange')?.classList.toggle('show',cm.preset==='custom');
 }
 function queryString(){
   const q=new URLSearchParams();

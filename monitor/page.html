@@ -419,6 +419,9 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
       <p>按渠道配置 URL 的可注册主域名归并，再按厂商、实际渠道和服务分组展开。</p>
     </div>
     <div class="cm-range">
+      <button type="button" data-cm-preset="today">今天</button>
+      <button type="button" data-cm-preset="yesterday">昨天</button>
+      <button type="button" data-cm-preset="week">本周</button>
       <button type="button" class="active" data-cm-days="7">近 7 天</button>
       <button type="button" data-cm-days="15">近 15 天</button>
       <button type="button" data-cm-days="30">近 30 天</button>

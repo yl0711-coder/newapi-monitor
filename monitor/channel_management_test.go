@@ -3,9 +3,25 @@ package monitor
 import (
 	"context"
 	"math"
+	"strings"
 	"testing"
 	"time"
 )
+
+func TestChannelManagementPageIncludesBusinessDateShortcuts(t *testing.T) {
+	for _, shortcut := range []string{
+		`data-cm-preset="today">今天`,
+		`data-cm-preset="yesterday">昨天`,
+		`data-cm-preset="week">本周`,
+	} {
+		if !strings.Contains(pageHTML, shortcut) {
+			t.Fatalf("渠道管理页缺少日期快捷项 %q", shortcut)
+		}
+	}
+	if strings.Contains(portalHTML, "data-cm-preset") {
+		t.Fatal("Usage Portal 不应接入渠道管理日期快捷项")
+	}
+}
 
 func TestNormalizeChannelBaseDomain(t *testing.T) {
 	tests := map[string]string{
