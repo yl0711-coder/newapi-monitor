@@ -70,6 +70,9 @@ func (m *Monitor) startSampler(ctx context.Context) {
 	m.heartbeat()                      // 启动即对外打一次心跳,让 dead-man 立刻知道"活着"
 	go m.loop(ctx, interval)
 	slog.Info("采样器已启动", "interval", interval.String(), "note", "生产库仅执行有界小窗口只读查询")
+	if m.cfg.StabilityEnabled {
+		m.startStabilityBackfillMaintenance(ctx)
+	}
 
 	if m.cfg.InfraEnabled { // 服务端健康监控(实例/DB/LB),独立采样循环;默认关
 		m.startInfra(ctx)
@@ -153,10 +156,7 @@ func (m *Monitor) loop(ctx context.Context, interval time.Duration) {
 					}
 				}
 				if m.cfg.StabilityEnabled {
-					days := m.cfg.StabilityRetentionDays
-					if days <= 0 {
-						days = 90
-					}
+					days := m.cfg.stabilityStorageDays()
 					if err := m.pruneStabilityOlderThan(time.Now().Unix() - int64(days)*86400); err != nil {
 						slog.Warn("清理稳定性历史失败(忽略)", "err", err)
 					}
@@ -284,7 +284,7 @@ SELECT
   CAST(COALESCE(SUM(CASE WHEN type=2 THEN use_time END),0) AS SIGNED) AS sum_use_time,
   CAST(COALESCE(MAX(CASE WHEN type=2 THEN use_time END),0) AS SIGNED) AS max_use_time,
   CAST(COALESCE(SUM(CASE WHEN type=2 THEN prompt_tokens+completion_tokens END),0) AS SIGNED) AS tokens,
-  CAST(COALESCE(SUM(quota),0) AS SIGNED) AS quota,
+  CAST(COALESCE(SUM(CASE WHEN type=2 THEN quota END),0) AS SIGNED) AS quota,
   CAST(COALESCE(SUM(type=5 AND content REGEXP 'status_code=4'
         AND content NOT LIKE '%timeout%' AND content NOT LIKE '%deadline%'),0) AS SIGNED) AS err_4xx,
   CAST(COALESCE(SUM(type=5 AND content REGEXP 'status_code=5'
@@ -420,7 +420,7 @@ SELECT (created_at DIV 60)*60 AS bucket, token_name,
   CAST(COALESCE(SUM(type=2 AND {{ANOM}}),0) AS SIGNED) AS anomaly,
   CAST(COALESCE(SUM(type=5),0) AS SIGNED) AS failed,
   CAST(COALESCE(SUM(CASE WHEN type=2 THEN prompt_tokens+completion_tokens END),0) AS SIGNED) AS tokens,
-  CAST(COALESCE(SUM(quota),0) AS SIGNED) AS quota
+  CAST(COALESCE(SUM(CASE WHEN type=2 THEN quota END),0) AS SIGNED) AS quota
 FROM logs
 WHERE created_at >= ? AND created_at < ? AND type IN (2,5)
 GROUP BY bucket, token_name`

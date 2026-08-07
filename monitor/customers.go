@@ -35,15 +35,17 @@ type TrackedUser struct {
 // Portal* = 客户端(独立域名报表页)登录账号:一组一账号,双密码并存——
 // PortalPwAdmin(我方配置,永久有效)/ PortalPwUser(客户自改,可选),登录任一匹配即可;都只存 bcrypt 哈希。
 type CustomerGroup struct {
-	ID            int64  `gorm:"primaryKey" json:"id"`
-	Name          string `gorm:"uniqueIndex;size:64" json:"name"`
-	Note          string `gorm:"size:500" json:"note"`
-	Stage         string `gorm:"size:16;default:active" json:"stage"` // trial=试用 / active=正式 / churned=已流失
-	TrialEnd      int64  `json:"trial_end"`                           // 试用到期(unix 秒,0=无);仅 trial 有意义
-	PortalEmail   string `gorm:"size:128;index" json:"portal_email"`  // 客户端登录邮箱;空=未开通(跨组唯一由 handler 校验)
-	PortalPwAdmin string `gorm:"size:128" json:"-"`                   // 我方配置密码 bcrypt;不回显
-	PortalPwUser  string `gorm:"size:128" json:"-"`                   // 客户自改密码 bcrypt;不回显
-	PortalAuthVer int64  `gorm:"not null;default:0" json:"-"`         // 登录凭证版本;账号/密码变化时递增,立即废止旧会话
+	ID   int64  `gorm:"primaryKey" json:"id"`
+	Name string `gorm:"uniqueIndex;size:64" json:"name"`
+	Note string `gorm:"size:500" json:"note"`
+	// Stage/TrialEnd 是旧版客户状态功能留下的兼容列。状态功能已从 Monitor 退出，
+	// 但保留数据库列可避免 SQLite 破坏性迁移；接口不再返回、写入或据此改变业务判断。
+	Stage         string `gorm:"size:16;default:active" json:"-"`
+	TrialEnd      int64  `json:"-"`
+	PortalEmail   string `gorm:"size:128;index" json:"portal_email"` // 客户端登录邮箱;空=未开通(跨组唯一由 handler 校验)
+	PortalPwAdmin string `gorm:"size:128" json:"-"`                  // 我方配置密码 bcrypt;不回显
+	PortalPwUser  string `gorm:"size:128" json:"-"`                  // 客户自改密码 bcrypt;不回显
+	PortalAuthVer int64  `gorm:"not null;default:0" json:"-"`        // 登录凭证版本;账号/密码变化时递增,立即废止旧会话
 	CreatedAt     int64  `json:"created_at"`
 }
 
@@ -58,17 +60,18 @@ type FollowUpLog struct {
 
 // UsageSettings 客户跟进阈值(单行,id=1;缺省用 defaultUsageSettings)。
 type UsageSettings struct {
-	ID              int64   `gorm:"primaryKey" json:"-"`
-	DormantDays     int     `json:"dormant_days"`      // 正式客户连续无消费达此天数→疑似流失
-	DropPct         int     `json:"drop_pct"`          // 近7天 vs 前7天 消费降幅≥此%→消费下滑
-	LowBalanceUSD   float64 `json:"low_balance_usd"`   // 余额低于此→催充值
-	TrialLowUSD     float64 `json:"trial_low_usd"`     // 试用近7天消费低于此→用不起来
-	TrialHighUSD    float64 `json:"trial_high_usd"`    // 试用近7天消费高于此→转化时机
-	TrialExpiryDays int     `json:"trial_expiry_days"` // 试用到期剩余≤此天→到期跟进
+	ID            int64   `gorm:"primaryKey" json:"-"`
+	DormantDays   int     `json:"dormant_days"`    // 连续无消费达此天数→疑似流失
+	DropPct       int     `json:"drop_pct"`        // 近7天 vs 前7天 消费降幅≥此%→消费下滑
+	LowBalanceUSD float64 `json:"low_balance_usd"` // 余额低于此→催充值
+	// 以下三列仅为旧数据库兼容保留，状态功能退出后不再参与判断或通过接口暴露。
+	TrialLowUSD     float64 `json:"-"`
+	TrialHighUSD    float64 `json:"-"`
+	TrialExpiryDays int     `json:"-"`
 }
 
 func defaultUsageSettings() UsageSettings {
-	return UsageSettings{ID: 1, DormantDays: 7, DropPct: 50, LowBalanceUSD: 5, TrialLowUSD: 1, TrialHighUSD: 20, TrialExpiryDays: 7}
+	return UsageSettings{ID: 1, DormantDays: 7, DropPct: 50, LowBalanceUSD: 5}
 }
 
 // loadUsageSettings 读阈值;无记录/字段为0则用默认补齐(防老库/半配)。
@@ -86,15 +89,6 @@ func (m *Monitor) loadUsageSettings() UsageSettings {
 	}
 	if s.LowBalanceUSD <= 0 {
 		s.LowBalanceUSD = d.LowBalanceUSD
-	}
-	if s.TrialLowUSD <= 0 {
-		s.TrialLowUSD = d.TrialLowUSD
-	}
-	if s.TrialHighUSD <= 0 {
-		s.TrialHighUSD = d.TrialHighUSD
-	}
-	if s.TrialExpiryDays <= 0 {
-		s.TrialExpiryDays = d.TrialExpiryDays
 	}
 	return s
 }
@@ -237,13 +231,11 @@ func normalizeGroupInput(name, note string) (string, string, error) {
 	return name, note, nil
 }
 
-// createGroup POST /usage/groups(仅超管):{name, note, stage?, trial_end?};stage 缺省 active。
+// createGroup POST /usage/groups(仅超管):{name, note}。
 func (m *Monitor) createGroup(c *gin.Context) {
 	var in struct {
-		Name     string `json:"name"`
-		Note     string `json:"note"`
-		Stage    string `json:"stage"`
-		TrialEnd int64  `json:"trial_end"`
+		Name string `json:"name"`
+		Note string `json:"note"`
 	}
 	if err := c.ShouldBindJSON(&in); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
@@ -254,14 +246,6 @@ func (m *Monitor) createGroup(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	stage := in.Stage
-	if stage != "trial" && stage != "active" && stage != "churned" {
-		stage = "active"
-	}
-	trialEnd := in.TrialEnd
-	if stage != "trial" {
-		trialEnd = 0
-	}
 	var count int64
 	if err := m.storeDB.Model(&CustomerGroup{}).Count(&count).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "读取分组失败,请重试"})
@@ -271,7 +255,8 @@ func (m *Monitor) createGroup(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("分组已达上限 %d 个", maxCustomerGroups)})
 		return
 	}
-	g := CustomerGroup{Name: name, Note: note, Stage: stage, TrialEnd: trialEnd, CreatedAt: time.Now().Unix()}
+	// 兼容列固定写入 active/0；新版业务不再读取客户状态。
+	g := CustomerGroup{Name: name, Note: note, Stage: "active", TrialEnd: 0, CreatedAt: time.Now().Unix()}
 	if err := m.storeDB.Create(&g).Error; err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "创建失败:分组名可能已存在"})
 		return

@@ -4,12 +4,13 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/gin-gonic/gin"
 )
 
-// rejection_test.go:被拒请求(前置拒绝)采集链路——验证 upsert 累加幂等 + 窗口聚合排序。
+// rejection_test.go:被拒请求(前置拒绝)采集链路——验证不同批次累加、同批次重试幂等和窗口聚合。
 
 func TestRejectionsUpsertAndAggregate(t *testing.T) {
 	m := newTestMonitor(t)
@@ -52,8 +53,7 @@ func TestRejectionsUpsertAndAggregate(t *testing.T) {
 
 func TestIngestRejectionsHandler(t *testing.T) {
 	gin.SetMode(gin.TestMode)
-	body := `{"node":"slave","samples":[{"bucket_ts":1900000020,"reason":"no_available_channel","model":"gpt-5.2","group":"g1","count":3}]}`
-	post := func(m *Monitor, auth string) *httptest.ResponseRecorder {
+	post := func(m *Monitor, auth, body string) *httptest.ResponseRecorder {
 		r := gin.New()
 		m.RegisterRoutes(r)
 		w := httptest.NewRecorder()
@@ -64,26 +64,104 @@ func TestIngestRejectionsHandler(t *testing.T) {
 		r.ServeHTTP(w, req)
 		return w
 	}
+	body := `{"node":"slave","batch_id":"batch-0001","samples":[{"bucket_ts":1900000020,"reason":"no_available_channel","model":"gpt-5.2","group":"g1","count":3}]}`
 
 	// 未配置 token → 接口关闭 503
-	if w := post(newTestMonitor(t), "Bearer x"); w.Code != http.StatusServiceUnavailable {
+	if w := post(newTestMonitor(t), "Bearer x", body); w.Code != http.StatusServiceUnavailable {
 		t.Fatalf("未配置token应503,得%d", w.Code)
 	}
 
 	m := newTestMonitor(t)
 	m.cfg.IngestToken = "secret123"
 	// 无/错 token → 401
-	if w := post(m, ""); w.Code != http.StatusUnauthorized {
+	if w := post(m, "", body); w.Code != http.StatusUnauthorized {
 		t.Fatalf("无token应401,得%d", w.Code)
 	}
-	if w := post(m, "Bearer wrong"); w.Code != http.StatusUnauthorized {
+	if w := post(m, "Bearer wrong", body); w.Code != http.StatusUnauthorized {
 		t.Fatalf("错token应401,得%d", w.Code)
 	}
 	// 正确 token → 200 + 入库
-	if w := post(m, "Bearer secret123"); w.Code != http.StatusOK {
+	if w := post(m, "Bearer secret123", body); w.Code != http.StatusOK {
 		t.Fatalf("正确token应200,得%d: %s", w.Code, w.Body.String())
 	}
 	if rows := m.storeRejections(1900000020 - 60); len(rows) != 1 || rows[0].Count != 3 {
 		t.Fatalf("应入库1行count=3,得%+v", rows)
+	}
+	// 响应在网络中丢失后，采集器会用相同 batch_id 重试；不得再次累加。
+	if w := post(m, "Bearer secret123", body); w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"duplicate":true`) {
+		t.Fatalf("同批重试应返回200 duplicate=true,得%d: %s", w.Code, w.Body.String())
+	}
+	if rows := m.storeRejections(1900000020 - 60); len(rows) != 1 || rows[0].Count != 3 {
+		t.Fatalf("同批重试后计数不得翻倍,得%+v", rows)
+	}
+	// 同一个 ID 携带不同内容是协议错误，必须拒绝且不污染原计数。
+	conflict := strings.Replace(body, `"count":3`, `"count":4`, 1)
+	if w := post(m, "Bearer secret123", conflict); w.Code != http.StatusConflict {
+		t.Fatalf("复用batch_id但内容变化应409,得%d: %s", w.Code, w.Body.String())
+	}
+	if rows := m.storeRejections(1900000020 - 60); len(rows) != 1 || rows[0].Count != 3 {
+		t.Fatalf("冲突批次不得写入,得%+v", rows)
+	}
+	// 不同批次落在同一分钟仍应累加。
+	next := strings.Replace(strings.Replace(body, "batch-0001", "batch-0002", 1), `"count":3`, `"count":4`, 1)
+	if w := post(m, "Bearer secret123", next); w.Code != http.StatusOK {
+		t.Fatalf("新批次应200,得%d: %s", w.Code, w.Body.String())
+	}
+	if rows := m.storeRejections(1900000020 - 60); len(rows) != 1 || rows[0].Count != 7 {
+		t.Fatalf("不同批次应累加到7,得%+v", rows)
+	}
+	missingID := `{"node":"slave","samples":[]}`
+	if w := post(m, "Bearer secret123", missingID); w.Code != http.StatusBadRequest {
+		t.Fatalf("缺batch_id应400,得%d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestRejectionBatchHashIgnoresSampleOrder(t *testing.T) {
+	rows := []RejectionSample{
+		{BucketTs: 120, Node: "n", Reason: "b", Model: "m", Grp: "g", Count: 2},
+		{BucketTs: 60, Node: "n", Reason: "a", Model: "m", Grp: "g", Count: 1},
+	}
+	reversed := []RejectionSample{rows[1], rows[0]}
+	if rejectionBatchPayloadHash(rows) != rejectionBatchPayloadHash(reversed) {
+		t.Fatal("同一批样本仅顺序变化时不应被误判为冲突")
+	}
+}
+
+func TestConcurrentRejectionBatchRetriesAccumulateExactlyOnce(t *testing.T) {
+	m := newTestMonitor(t)
+	rows := []RejectionSample{{BucketTs: 120, Node: "master", Reason: "no_available_channel", Model: "m", Grp: "g", Count: 3}}
+	const workers = 12
+	var wg sync.WaitGroup
+	errs := make(chan error, workers)
+	duplicates := make(chan bool, workers)
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			duplicate, err := m.ingestRejectionBatch("master", "concurrent-batch", rows, 180)
+			errs <- err
+			duplicates <- duplicate
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	close(duplicates)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("并发重试不应入库失败: %v", err)
+		}
+	}
+	duplicateCount := 0
+	for duplicate := range duplicates {
+		if duplicate {
+			duplicateCount++
+		}
+	}
+	if duplicateCount != workers-1 {
+		t.Fatalf("应只有一个新批次，其余均识别为重复: duplicates=%d", duplicateCount)
+	}
+	got := m.storeRejections(60)
+	if len(got) != 1 || got[0].Count != 3 {
+		t.Fatalf("并发重试后计数必须恰好一次: %+v", got)
 	}
 }

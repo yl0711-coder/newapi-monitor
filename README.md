@@ -59,15 +59,17 @@ docker run -d --name newapi-monitor \
 | `MONITOR_HOUR_RETENTION_DAYS` | 小时级汇总留存天数(长期趋势 + 同比环比) | `90` |
 | `MONITOR_BACKFILL_HOURS` | 启动时回填的历史小时数 | `24` |
 | `MONITOR_STABILITY_ENABLED` | 历史稳定性报表与原始问题采集开关；关闭不影响原模型/用量/服务端监控 | `true` |
-| `MONITOR_STABILITY_RETENTION_DAYS` | 稳定性小时汇总、问题签名和页面最大查询范围 | `90` |
+| `MONITOR_STABILITY_QUERY_MAX_DAYS` | 稳定性报表页面单次最大查询范围 | `90` |
+| `MONITOR_STABILITY_RETENTION_DAYS` | 稳定性本地数据留存；运行时至少取 `2×QUERY_MAX+1`，保证上一周期对比完整 | `181` |
 | `MONITOR_STABILITY_PROBLEM_SAMPLE_SECONDS` | 原始错误签名后台采样间隔；高峰时自动按本地游标续采 | `300` |
+| `MONITOR_STABILITY_BACKFILL_ENABLED` | 历史补数总开关；关闭后人工、自动修洞和重启续跑都不访问生产历史库 | `true` |
 | `MONITOR_HEARTBEAT_URL` | dead-man 心跳 URL(如 healthchecks.io);留空=不启用 | 留空 |
 | `MONITOR_SITE_NAME` | 对外看板站点名**兜底值**;站点名/favicon 默认部署时从主站 new-api 的 `system_name`/`logo` 同步,此项仅主站不可达时兜底 | 留空 |
 | `MONITOR_INGEST_TOKEN` | 「被拒请求」接收口 `POST /internal/rejections` 的鉴权 token,供各节点 [newapi-reject-collector](https://github.com/yl0711-coder/newapi-reject-collector) 推送前置拒绝;**留空=关闭该接口** | 留空 |
 
 ## 被拒请求(前置拒绝 · logs 盲区)
 
-new-api 的「无可用渠道」等**前置拒绝**不写 `logs` 表,读 logs 的监控天然看不到。配套的旁路采集器 [newapi-reject-collector](https://github.com/yl0711-coder/newapi-reject-collector) 在每个节点 tail new-api 日志、抽出这类拒绝,`POST /internal/rejections`(带 `MONITOR_INGEST_TOKEN` 鉴权)推来,监控落 `rejection_samples` 表并在「被拒请求」面板按 模型 × 分组 展示。
+new-api 的「无可用渠道」等**前置拒绝**不写 `logs` 表,读 logs 的监控天然看不到。配套的旁路采集器 [newapi-reject-collector](https://github.com/yl0711-coder/newapi-reject-collector) 在每个节点 tail new-api 日志、抽出这类拒绝,`POST /internal/rejections`(带 `MONITOR_INGEST_TOKEN` 鉴权)推来,监控落 `rejection_samples` 表并在「被拒请求」面板按 模型 × 分组 展示。每次推送必须携带稳定的 `batch_id`；中心在同一事务内登记批次并累加样本，响应丢失后的重试不会翻倍。升级时先部署新版采集器（旧 Monitor 会忽略新字段），再部署新版 Monitor。
 
 该面板由**超管开关**控制(报警设置页「被拒请求」,**默认关**):开启后才显示,开关旁附说明需在各节点安装采集器;开启但尚无数据时显示"暂无数据,请部署采集器"空状态。未配置 `MONITOR_INGEST_TOKEN` 时接收口关闭(503)。开关关、无 token 或无数据,都不影响监控其它功能。
 

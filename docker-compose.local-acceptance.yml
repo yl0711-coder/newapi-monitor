@@ -67,6 +67,14 @@ services:
       MONITOR_HEARTBEAT_URL: ""
       MONITOR_BACKFILL_HOURS: "0"
       MONITOR_SAMPLE_SECONDS: "3600"
+      # 总开关关闭后，旧的 queued/running 任务也不会在本地重启续跑。
+      MONITOR_STABILITY_BACKFILL_ENABLED: "false"
+      MONITOR_STABILITY_AUTO_REPAIR: "false"
+      # 默认关闭；Nginx 接口与页面的本地集成测试可临时传 MONITOR_NGINX_ENABLED=true。
+      MONITOR_NGINX_ENABLED: ${MONITOR_NGINX_ENABLED:-false}
+      MONITOR_NGINX_RETENTION_DAYS: "7"
+      MONITOR_NGINX_ALLOWED_NODES: "local-nginx"
+      MONITOR_INGEST_TOKEN: "local-acceptance-ingest-only"
     volumes:
       - ./.local-data:/data
     depends_on:

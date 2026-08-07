@@ -39,9 +39,12 @@ type Monitor struct {
 	prodDB  *sql.DB  // new-api 生产库【只读】连接(采样器周期查询 + 用户用量按需查询);nil = 未连接
 	storeDB *gorm.DB // 本地采样库
 
-	lastRun            atomic.Int64 // 采样心跳:最近一次成功采样的 Unix 秒(0=从未)
-	problemLastSuccess atomic.Int64 // 原始错误采集器最近一次成功执行
-	problemLastFailure atomic.Int64 // 原始错误采集器最近一次失败
+	lastRun                  atomic.Int64 // 采样心跳:最近一次成功采样的 Unix 秒(0=从未)
+	problemLastSuccess       atomic.Int64 // 原始错误采集器最近一次成功执行
+	problemLastFailure       atomic.Int64 // 原始错误采集器最近一次失败
+	stabilityBackfillRunning atomic.Bool  // 长期小时补数串行闸门；人工任务与自动修洞共用
+	ctxMu                    sync.RWMutex
+	backgroundCtx            context.Context // Start 注入；后台任务不绑定浏览器请求生命周期
 
 	chMu    sync.RWMutex
 	chNames map[string]string // 渠道 id->name 映射缓存
@@ -110,7 +113,25 @@ func New(s Settings) (*Monitor, error) {
 }
 
 // Start 启动后台采样(生产库未连接则空操作)。ctx 取消时采样器退出。
-func (m *Monitor) Start(ctx context.Context) { m.startSampler(ctx) }
+func (m *Monitor) Start(ctx context.Context) {
+	m.ctxMu.Lock()
+	m.backgroundCtx = ctx
+	m.ctxMu.Unlock()
+	m.startSampler(ctx)
+	if m.cfg.NginxEnabled {
+		m.startNginxMaintenance(ctx)
+	}
+}
+
+func (m *Monitor) taskContext() context.Context {
+	m.ctxMu.RLock()
+	ctx := m.backgroundCtx
+	m.ctxMu.RUnlock()
+	if ctx == nil {
+		return context.Background()
+	}
+	return ctx
+}
 
 // Enabled 报告生产库是否已连通。
 func (m *Monitor) Enabled() bool { return m.prodDB != nil }

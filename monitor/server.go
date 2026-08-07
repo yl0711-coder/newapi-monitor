@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/subtle"
 	_ "embed"
+	"errors"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -153,6 +154,7 @@ func (m *Monitor) RegisterRoutes(r *gin.Engine) {
 	r.GET("/api/brand", m.brandHandler)                // 公开:站点名,供前端设置页面标题
 	r.POST("/internal/rejections", m.ingestRejections) // 机器对机器:接收采集器推送的前置拒绝(token 鉴权)
 	r.POST("/internal/host", m.ingestHost)             // 机器对机器:接收各节点主机 agent 推送的 OS 内存/磁盘(token 鉴权)
+	r.POST("/internal/nginx", m.ingestNginx)           // 机器对机器:接收已脱敏的 Nginx 分钟聚合(token 鉴权,默认关闭)
 	r.GET("/login", m.loginPage)
 	r.POST("/login", m.loginSubmit)
 	r.GET("/logout", logout)
@@ -170,6 +172,7 @@ func (m *Monitor) RegisterRoutes(r *gin.Engine) {
 		view.GET("/stability/detail", m.serveStabilityDetail)        // 单分组详情:按需加载渠道时间条/模型
 		view.GET("/stability/problems", m.serveStabilityProblems)    // 原始错误签名:只读本地问题样本
 		view.GET("/stability/health", m.serveStabilityHealth)        // 采集新鲜度/覆盖/积压:不查生产库
+		view.GET("/stability/edge", m.serveNginxEdge)                // Nginx 入口层:只读本地脱敏分钟汇总
 		view.GET("/channels/report", m.serveChannelManagementReport) // 渠道管理:主域名→厂商→渠道→服务分组的本地汇总
 		view.GET("/infra", m.serveInfra)                             // 服务端健康监控(实例/DB/LB)快照
 		view.GET("/infra/series", m.serveInfraSeries)                // 按需取某资源某些指标的近 N 小时序列(展开图用)
@@ -197,6 +200,8 @@ func (m *Monitor) RegisterRoutes(r *gin.Engine) {
 	// 仅超级管理员:用当前判据重算历史桶(判据变更后一次性执行)。
 	// 做成接口而非启动参数:不必重启、可重跑、可只补一段;放启动流程会每次重启都压一遍生产库。
 	r.POST("/admin/backfill", m.requireRole(roleRoot), m.backfillHandler)
+	r.POST("/admin/stability/backfill", m.requireRole(roleRoot), m.startStabilityBackfillHandler)
+	r.GET("/admin/stability/backfill", m.requireRole(roleRoot), m.stabilityBackfillStatusHandler)
 
 	// 仅超级管理员:用户用量名单增删(看名单/看统计在上面 view 组,管理员即可)
 	rootUsage := r.Group("/usage", m.requireRole(roleRoot))
@@ -208,7 +213,6 @@ func (m *Monitor) RegisterRoutes(r *gin.Engine) {
 		rootUsage.POST("/groups", m.createGroup)           // 客户分组:新建
 		rootUsage.POST("/groups/update", m.updateGroup)    // 客户分组:编辑
 		rootUsage.POST("/groups/delete", m.deleteGroup)    // 客户分组:解散(成员回未分组)
-		rootUsage.POST("/groups/stage", m.setGroupStage)   // 客户分组:改状态(试用/正式/已流失+到期)
 		rootUsage.POST("/groups/portal", m.setGroupPortal) // 客户分组:客户端账号(开通/更新/重置/关闭)
 		rootUsage.POST("/followups/log", m.addFollowLog)   // 跟进记录:追加
 		rootUsage.POST("/settings", m.saveUsageSettings)   // 跟进阈值:保存
@@ -252,6 +256,7 @@ func (m *Monitor) ingestRejections(c *gin.Context) {
 	}
 	var in struct {
 		Node    string `json:"node"`
+		BatchID string `json:"batch_id"`
 		Samples []struct {
 			BucketTs int64  `json:"bucket_ts"`
 			Reason   string `json:"reason"`
@@ -268,7 +273,16 @@ func (m *Monitor) ingestRejections(c *gin.Context) {
 		c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "too many samples"})
 		return
 	}
-	node := clip(in.Node, 64)
+	node := clip(strings.TrimSpace(in.Node), 64)
+	batchID := strings.TrimSpace(in.BatchID)
+	if node == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "node required"})
+		return
+	}
+	if !validIngestBatchID(batchID) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "valid batch_id required"})
+		return
+	}
 	rows := make([]RejectionSample, 0, len(in.Samples))
 	for _, s := range in.Samples {
 		if s.Model == "" || s.Reason == "" || s.Count <= 0 || s.BucketTs <= 0 {
@@ -283,12 +297,34 @@ func (m *Monitor) ingestRejections(c *gin.Context) {
 			Count:    s.Count,
 		})
 	}
-	if err := m.upsertRejections(rows); err != nil {
+	duplicate, err := m.ingestRejectionBatch(node, batchID, rows, time.Now().Unix())
+	if errors.Is(err, errRejectionBatchConflict) {
+		c.JSON(http.StatusConflict, gin.H{"error": "batch_id payload conflict"})
+		return
+	}
+	if err != nil {
 		slog.Warn("被拒请求入库失败", "err", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "store failed"})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"ok": true, "stored": len(rows)})
+	stored := len(rows)
+	if duplicate {
+		stored = 0
+	}
+	c.JSON(http.StatusOK, gin.H{"ok": true, "stored": stored, "duplicate": duplicate})
+}
+
+func validIngestBatchID(id string) bool {
+	if len(id) < 8 || len(id) > 64 {
+		return false
+	}
+	for _, r := range id {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || strings.ContainsRune("._:-", r) {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 // serveInfra 返回服务端健康监控(实例/DB/LB)快照;未启用则 enabled:false。
@@ -336,7 +372,15 @@ func (m *Monitor) serveInfraSeries(c *gin.Context) {
 }
 
 // ingestHost 接收各节点主机 agent 推来的 OS 指标(内存/磁盘/load),写 infra_samples(rtype=host)。
-// 复用 MONITOR_INGEST_TOKEN 鉴权;未配置则接口关闭(503)。只接非敏感数值,不含任何密钥/业务数据。
+// 复用 MONITOR_INGEST_TOKEN 鉴权;未配置则接口关闭(503)。只接非敏感数值和
+// 显式白名单内的容器 name/state/health/restart_count，不含密钥、配置或业务数据。
+type hostContainerInput struct {
+	Name         string `json:"name"`
+	State        string `json:"state"`
+	Health       string `json:"health"`
+	RestartCount int    `json:"restart_count"`
+}
+
 func (m *Monitor) ingestHost(c *gin.Context) {
 	if !m.checkIngest(c) {
 		return
@@ -353,7 +397,10 @@ func (m *Monitor) ingestHost(c *gin.Context) {
 		Load15          *float64 `json:"load15"`
 		ContainersUp    *float64 `json:"containers_up"`
 		ContainersTotal *float64 `json:"containers_total"`
-		Ts              int64    `json:"ts"`
+		// 指针用于区分旧版 agent 的“字段不存在”和新版 agent 的“明确空列表”。
+		// 前者保留已有快照，后者表示白名单为空并清空该节点的容器明细。
+		Containers *[]hostContainerInput `json:"containers"`
+		Ts         int64                 `json:"ts"`
 	}
 	if err := c.ShouldBindJSON(&in); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
@@ -364,9 +411,10 @@ func (m *Monitor) ingestHost(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "node required"})
 		return
 	}
+	receivedAt := time.Now().Unix()
 	ts := in.Ts
 	if ts <= 0 {
-		ts = time.Now().Unix()
+		ts = receivedAt
 	}
 	bucket := ts / 60 * 60
 	var rows []InfraSample
@@ -388,16 +436,57 @@ func (m *Monitor) ingestHost(c *gin.Context) {
 		addP("containers_total", in.ContainersTotal)
 		addP("containers_up", in.ContainersUp)
 	}
-	if len(rows) == 0 {
-		c.JSON(http.StatusOK, gin.H{"ok": true, "stored": 0})
+	var snapshots []HostContainerSnapshot
+	if in.Containers != nil {
+		if len(*in.Containers) > 64 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "too many containers"})
+			return
+		}
+		seen := make(map[string]struct{}, len(*in.Containers))
+		snapshots = make([]HostContainerSnapshot, 0, len(*in.Containers))
+		for _, item := range *in.Containers {
+			name := clip(strings.TrimSpace(strings.TrimPrefix(item.Name, "/")), 128)
+			if name == "" {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "container name required"})
+				return
+			}
+			if _, exists := seen[name]; exists {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "duplicate container name"})
+				return
+			}
+			seen[name] = struct{}{}
+			restarts := item.RestartCount
+			if restarts < 0 {
+				restarts = 0
+			}
+			snapshots = append(snapshots, HostContainerSnapshot{
+				Node: node, Name: name, State: safeContainerState(item.State),
+				Health: safeContainerHealth(item.Health), RestartCount: restarts, LastSeen: receivedAt,
+			})
+		}
+	}
+	// 所有输入通过校验后再写入，避免错误的容器明细请求留下半套指标。
+	if len(rows) > 0 {
+		if err := m.upsertInfra(rows); err != nil {
+			slog.Warn("主机指标入库失败", "err", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "store failed"})
+			return
+		}
+	}
+	containerStored := 0
+	if in.Containers != nil {
+		if err := m.replaceHostContainerSnapshots(node, snapshots); err != nil {
+			slog.Warn("主机容器明细入库失败", "node", node, "err", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "container snapshot store failed"})
+			return
+		}
+		containerStored = len(snapshots)
+	}
+	if len(rows) == 0 && in.Containers == nil {
+		c.JSON(http.StatusOK, gin.H{"ok": true, "stored": 0, "containers_stored": 0})
 		return
 	}
-	if err := m.upsertInfra(rows); err != nil {
-		slog.Warn("主机指标入库失败", "err", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "store failed"})
-		return
-	}
-	c.JSON(http.StatusOK, gin.H{"ok": true, "stored": len(rows)})
+	c.JSON(http.StatusOK, gin.H{"ok": true, "stored": len(rows), "containers_stored": containerStored})
 }
 
 // clip 截断字符串到 n 字节,防御异常长输入。

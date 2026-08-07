@@ -57,12 +57,13 @@ type ChannelDomainCost struct {
 
 // ChannelDomainGroupCost 是上游主域名在某服务分组下采用的倍率。
 type ChannelDomainGroupCost struct {
-	Domain      string  `gorm:"primaryKey;size:253;column:domain"`
-	Grp         string  `gorm:"primaryKey;size:64;column:grp"`
-	Multiplier  float64 `gorm:"column:multiplier"`
-	EffectiveAt int64   `gorm:"column:effective_at"`
-	UpdatedAt   int64   `gorm:"column:updated_at;index"`
-	UpdatedBy   string  `gorm:"column:updated_by;size:128"`
+	Domain         string  `gorm:"primaryKey;size:253;column:domain"`
+	Grp            string  `gorm:"primaryKey;size:64;column:grp"`
+	Multiplier     float64 `gorm:"column:multiplier"` // 上游公布的基础倍率
+	DiscountFactor float64 `gorm:"column:discount_factor;not null;default:1"`
+	EffectiveAt    int64   `gorm:"column:effective_at"`
+	UpdatedAt      int64   `gorm:"column:updated_at;index"`
+	UpdatedBy      string  `gorm:"column:updated_by;size:128"`
 }
 
 // ChannelFinanceAudit 是早期未发布实现的兼容读取模型。
@@ -109,20 +110,23 @@ type ChannelDomainFinanceView struct {
 	UpdatedBy      string  `json:"updated_by"`
 }
 
-// ChannelGroupFinanceView 在双方倍率完整时给出倍率差，在全部财务口径完整时再给出折扣和毛利率。
-// MultiplierGap = 我方倍率 - 上游倍率；它不是毛利率。
+// ChannelGroupFinanceView 在双方口径完整时给出上游实际倍率、倍率差、计价折扣和毛利率。
+// UpstreamEffectiveMultiplier = 上游基础倍率 × 折扣系数 ÷ 充值比例(到账÷支付)。
+// MultiplierGap = 我方倍率 - 上游实际倍率；它不是毛利率。
 // Discount 为相对官方美元标价的比例，例如 1.3/7 = 0.185714（18.57%）。
 // EstimatedMargin 是预估毛利率，不包含支付手续费、汇损、税费或退款等费用。
 type ChannelGroupFinanceView struct {
-	Complete           bool    `json:"complete"`
-	SiteConfigured     bool    `json:"site_configured"`
-	UpstreamConfigured bool    `json:"upstream_configured"`
-	SiteMultiplier     float64 `json:"site_multiplier"`
-	UpstreamMultiplier float64 `json:"upstream_multiplier"`
-	MultiplierGap      float64 `json:"multiplier_gap"`
-	SiteDiscount       float64 `json:"site_discount"`
-	UpstreamDiscount   float64 `json:"upstream_discount"`
-	EstimatedMargin    float64 `json:"estimated_margin"`
+	Complete                    bool    `json:"complete"`
+	SiteConfigured              bool    `json:"site_configured"`
+	UpstreamConfigured          bool    `json:"upstream_configured"`
+	SiteMultiplier              float64 `json:"site_multiplier"`
+	UpstreamMultiplier          float64 `json:"upstream_multiplier"` // 基础倍率
+	UpstreamDiscountFactor      float64 `json:"upstream_discount_factor"`
+	UpstreamEffectiveMultiplier float64 `json:"upstream_effective_multiplier"`
+	MultiplierGap               float64 `json:"multiplier_gap"`
+	SiteDiscount                float64 `json:"site_discount"`
+	UpstreamDiscount            float64 `json:"upstream_discount"`
+	EstimatedMargin             float64 `json:"estimated_margin"`
 }
 
 type channelFinanceSnapshot struct {
@@ -185,11 +189,17 @@ func (s channelFinanceSnapshot) groupView(domain, group string) ChannelGroupFina
 	}
 	if upstreamOK {
 		view.UpstreamMultiplier = upstream.Multiplier
-	}
-	if siteOK && upstreamOK {
-		view.MultiplierGap = site.Multiplier - upstream.Multiplier
+		view.UpstreamDiscountFactor = normalizedUpstreamDiscountFactor(upstream.DiscountFactor)
 	}
 	domainCost, domainOK := s.domainCosts[domain]
+	if domainOK && upstreamOK && validChannelFinanceNumber(upstream.Multiplier) && validChannelFinanceNumber(view.UpstreamDiscountFactor) &&
+		validChannelFinanceNumber(domainCost.RechargePaid) && validChannelFinanceNumber(domainCost.RechargeCredit) {
+		// 充值比例定义为“到账 ÷ 支付”，故实际倍率 = 基础倍率 × 折扣系数 ÷ 充值比例。
+		view.UpstreamEffectiveMultiplier = upstream.Multiplier * view.UpstreamDiscountFactor * domainCost.RechargePaid / domainCost.RechargeCredit
+		if siteOK {
+			view.MultiplierGap = site.Multiplier - view.UpstreamEffectiveMultiplier
+		}
+	}
 	if !s.hasSettings || !siteOK || !domainOK || !upstreamOK {
 		return view
 	}
@@ -199,11 +209,13 @@ func (s channelFinanceSnapshot) groupView(domain, group string) ChannelGroupFina
 		!validChannelFinanceNumber(site.Multiplier) ||
 		!validChannelFinanceNumber(domainCost.RechargePaid) ||
 		!validChannelFinanceNumber(domainCost.RechargeCredit) ||
-		!validChannelFinanceNumber(upstream.Multiplier) {
+		!validChannelFinanceNumber(upstream.Multiplier) ||
+		!validChannelFinanceNumber(view.UpstreamDiscountFactor) ||
+		!validChannelFinanceNumber(view.UpstreamEffectiveMultiplier) {
 		return view
 	}
 	view.SiteDiscount = site.Multiplier * (s.settings.SiteRechargePaid / s.settings.SiteRechargeCredit) / s.settings.FXBenchmark
-	view.UpstreamDiscount = upstream.Multiplier * (domainCost.RechargePaid / domainCost.RechargeCredit) / s.settings.FXBenchmark
+	view.UpstreamDiscount = view.UpstreamEffectiveMultiplier / s.settings.FXBenchmark
 	if view.SiteDiscount <= 0 || math.IsNaN(view.SiteDiscount) || math.IsInf(view.SiteDiscount, 0) ||
 		math.IsNaN(view.UpstreamDiscount) || math.IsInf(view.UpstreamDiscount, 0) {
 		return view
@@ -211,6 +223,14 @@ func (s channelFinanceSnapshot) groupView(domain, group string) ChannelGroupFina
 	view.EstimatedMargin = (view.SiteDiscount - view.UpstreamDiscount) / view.SiteDiscount
 	view.Complete = true
 	return view
+}
+
+// 旧版表与版本快照没有折扣系数；零值按 1 解释，保证升级前后的计算结果不变。
+func normalizedUpstreamDiscountFactor(v float64) float64 {
+	if v == 0 {
+		return 1
+	}
+	return v
 }
 
 func (m *Monitor) loadChannelFinanceSnapshot(ctx context.Context) (channelFinanceSnapshot, error) {
@@ -262,9 +282,10 @@ func (m *Monitor) loadChannelFinanceSnapshot(ctx context.Context) (channelFinanc
 }
 
 type channelFinanceGroupInput struct {
-	Group              string   `json:"group"`
-	SiteMultiplier     *float64 `json:"site_multiplier"`
-	UpstreamMultiplier *float64 `json:"upstream_multiplier"`
+	Group                  string   `json:"group"`
+	SiteMultiplier         *float64 `json:"site_multiplier"`
+	UpstreamMultiplier     *float64 `json:"upstream_multiplier"`
+	UpstreamDiscountFactor *float64 `json:"upstream_discount_factor"`
 }
 
 type channelFinanceSaveInput struct {
@@ -281,9 +302,10 @@ type channelFinanceSaveInput struct {
 }
 
 type channelFinanceVersionGroup struct {
-	Group              string  `json:"group"`
-	SiteMultiplier     float64 `json:"site_multiplier"`
-	UpstreamMultiplier float64 `json:"upstream_multiplier"`
+	Group                  string  `json:"group"`
+	SiteMultiplier         float64 `json:"site_multiplier"`
+	UpstreamMultiplier     float64 `json:"upstream_multiplier"`
+	UpstreamDiscountFactor float64 `json:"upstream_discount_factor"`
 }
 
 // channelFinanceVersionSnapshot 是版本表中的稳定序列化结构。
@@ -306,11 +328,12 @@ func channelFinanceVersionSnapshotOf(in channelFinanceSaveInput) channelFinanceV
 		Groups: make([]channelFinanceVersionGroup, 0, len(in.Groups)),
 	}
 	for _, group := range in.Groups {
-		if group.SiteMultiplier == nil || group.UpstreamMultiplier == nil {
+		if group.SiteMultiplier == nil || group.UpstreamMultiplier == nil || group.UpstreamDiscountFactor == nil {
 			continue
 		}
 		snapshot.Groups = append(snapshot.Groups, channelFinanceVersionGroup{
 			Group: group.Group, SiteMultiplier: *group.SiteMultiplier, UpstreamMultiplier: *group.UpstreamMultiplier,
+			UpstreamDiscountFactor: *group.UpstreamDiscountFactor,
 		})
 	}
 	sort.Slice(snapshot.Groups, func(i, j int) bool { return snapshot.Groups[i].Group < snapshot.Groups[j].Group })
@@ -326,6 +349,9 @@ func normalizeChannelFinanceVersionJSON(raw string) (string, error) {
 	var snapshot channelFinanceVersionSnapshot
 	if err := json.Unmarshal([]byte(raw), &snapshot); err != nil {
 		return "", err
+	}
+	for i := range snapshot.Groups {
+		snapshot.Groups[i].UpstreamDiscountFactor = normalizedUpstreamDiscountFactor(snapshot.Groups[i].UpstreamDiscountFactor)
 	}
 	sort.Slice(snapshot.Groups, func(i, j int) bool { return snapshot.Groups[i].Group < snapshot.Groups[j].Group })
 	normalized, err := json.Marshal(snapshot)
@@ -463,6 +489,7 @@ func currentChannelFinanceVersionJSON(tx *gorm.DB, domain string) (string, error
 		}
 		snapshot.Groups = append(snapshot.Groups, channelFinanceVersionGroup{
 			Group: row.Grp, SiteMultiplier: site.Multiplier, UpstreamMultiplier: row.Multiplier,
+			UpstreamDiscountFactor: normalizedUpstreamDiscountFactor(row.DiscountFactor),
 		})
 	}
 	raw, err := json.Marshal(snapshot)
@@ -583,11 +610,12 @@ func validateChannelFinanceInput(in *channelFinanceSaveInput) error {
 			return fmt.Errorf("服务分组 %s 重复", group)
 		}
 		seen[group] = true
-		if in.Groups[i].SiteMultiplier == nil || in.Groups[i].UpstreamMultiplier == nil {
-			return fmt.Errorf("服务分组 %s 必须同时填写我方和上游倍率", group)
+		if in.Groups[i].SiteMultiplier == nil || in.Groups[i].UpstreamMultiplier == nil || in.Groups[i].UpstreamDiscountFactor == nil {
+			return fmt.Errorf("服务分组 %s 必须同时填写我方倍率、上游基础倍率和上游折扣系数", group)
 		}
-		if !validChannelFinanceNumber(*in.Groups[i].SiteMultiplier) || !validChannelFinanceNumber(*in.Groups[i].UpstreamMultiplier) {
-			return fmt.Errorf("服务分组 %s 的倍率必须是大于 0 的有限数字", group)
+		if !validChannelFinanceNumber(*in.Groups[i].SiteMultiplier) || !validChannelFinanceNumber(*in.Groups[i].UpstreamMultiplier) ||
+			!validChannelFinanceNumber(*in.Groups[i].UpstreamDiscountFactor) {
+			return fmt.Errorf("服务分组 %s 的倍率和折扣系数必须是大于 0 的有限数字", group)
 		}
 	}
 	return nil
@@ -740,7 +768,10 @@ func (m *Monitor) saveChannelFinanceHandler(c *gin.Context) {
 			if err := tx.Clauses(clause.OnConflict{Columns: []clause.Column{{Name: "grp"}}, UpdateAll: true}).Create(&siteRate).Error; err != nil {
 				return err
 			}
-			upstreamRate := ChannelDomainGroupCost{Domain: in.Domain, Grp: group.Group, Multiplier: *group.UpstreamMultiplier, EffectiveAt: now, UpdatedAt: now, UpdatedBy: updatedBy}
+			upstreamRate := ChannelDomainGroupCost{
+				Domain: in.Domain, Grp: group.Group, Multiplier: *group.UpstreamMultiplier,
+				DiscountFactor: *group.UpstreamDiscountFactor, EffectiveAt: now, UpdatedAt: now, UpdatedBy: updatedBy,
+			}
 			if err := tx.Clauses(clause.OnConflict{Columns: []clause.Column{{Name: "domain"}, {Name: "grp"}}, UpdateAll: true}).Create(&upstreamRate).Error; err != nil {
 				return err
 			}

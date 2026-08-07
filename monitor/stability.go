@@ -2,7 +2,9 @@ package monitor
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net/http"
 	"sort"
 	"strconv"
 	"strings"
@@ -214,7 +216,9 @@ type StabilityReportMeta struct {
 	RetentionDays       int                   `json:"retention_days"`
 	RowsTruncated       bool                  `json:"rows_truncated"`
 	ComparisonAvailable bool                  `json:"comparison_available"`
+	ComparisonCoverage  StabilityDataCoverage `json:"comparison_coverage"`
 	TimelineBucketSec   int64                 `json:"timeline_bucket_sec"`
+	DataCoverage        StabilityDataCoverage `json:"data_coverage"`
 	Sources             StabilitySourceStatus `json:"sources"`
 }
 
@@ -899,7 +903,12 @@ func (m *Monitor) buildStabilityReportWithDetails(ctx context.Context, scope sta
 			}
 			g.Channels = append(g.Channels, ch)
 		}
-		sort.Slice(g.Channels, func(i, j int) bool { return g.Channels[i].Requests > g.Channels[j].Requests })
+		sort.Slice(g.Channels, func(i, j int) bool {
+			if g.Channels[i].Requests == g.Channels[j].Requests {
+				return g.Channels[i].ID < g.Channels[j].ID
+			}
+			return g.Channels[i].Requests > g.Channels[j].Requests
+		})
 		if includeNested {
 			for name, counts := range gb.Models {
 				mm := counts.metrics()
@@ -913,7 +922,12 @@ func (m *Monitor) buildStabilityReportWithDetails(ctx context.Context, scope sta
 		}
 		resultGroups = append(resultGroups, g)
 	}
-	sort.Slice(resultGroups, func(i, j int) bool { return resultGroups[i].Requests > resultGroups[j].Requests })
+	sort.Slice(resultGroups, func(i, j int) bool {
+		if resultGroups[i].Requests == resultGroups[j].Requests {
+			return resultGroups[i].Name < resultGroups[j].Name
+		}
+		return resultGroups[i].Requests > resultGroups[j].Requests
+	})
 
 	modelRanking := make([]StabilityRankItem, 0, len(modelTotals))
 	for name, counts := range modelTotals {
@@ -924,7 +938,12 @@ func (m *Monitor) buildStabilityReportWithDetails(ctx context.Context, scope sta
 		}
 		modelRanking = append(modelRanking, r)
 	}
-	sort.Slice(modelRanking, func(i, j int) bool { return modelRanking[i].Requests > modelRanking[j].Requests })
+	sort.Slice(modelRanking, func(i, j int) bool {
+		if modelRanking[i].Requests == modelRanking[j].Requests {
+			return modelRanking[i].Name < modelRanking[j].Name
+		}
+		return modelRanking[i].Requests > modelRanking[j].Requests
+	})
 	channelRanking := make([]StabilityRankItem, 0, len(channelTotals))
 	for _, cb := range channelTotals {
 		cm := cb.Counts.metrics()
@@ -935,17 +954,21 @@ func (m *Monitor) buildStabilityReportWithDetails(ctx context.Context, scope sta
 		}
 		channelRanking = append(channelRanking, ch)
 	}
-	sort.Slice(channelRanking, func(i, j int) bool { return channelRanking[i].Requests > channelRanking[j].Requests })
+	sort.Slice(channelRanking, func(i, j int) bool {
+		if channelRanking[i].Requests == channelRanking[j].Requests {
+			return channelRanking[i].ID < channelRanking[j].ID
+		}
+		return channelRanking[i].Requests > channelRanking[j].Requests
+	})
 	groupRanking := make([]StabilityRankItem, 0, len(resultGroups))
 	for _, g := range resultGroups {
 		groupRanking = append(groupRanking, StabilityRankItem{Name: g.Name, SharePct: g.SharePct, DeltaPP: g.DeltaPP, StabilityMetrics: g.StabilityMetrics})
 	}
 
-	retention := m.cfg.StabilityRetentionDays
-	if retention <= 0 {
-		retention = 90
-	}
-	meta := StabilityReportMeta{From: time.Unix(scope.FromTs, 0).In(cstLocation).Format("2006-01-02"), To: time.Unix(scope.ToTs-1, 0).In(cstLocation).Format("2006-01-02"), GeneratedAt: now, RetentionDays: retention, RowsTruncated: false, ComparisonAvailable: prevMetrics.Requests > 0, TimelineBucketSec: timelineStep}
+	queryDays := m.cfg.stabilityQueryDays()
+	comparisonCoverage := m.stabilityDataCoverage(ctx, previousScope.FromTs, previousScope.ToTs, now)
+	meta := StabilityReportMeta{From: time.Unix(scope.FromTs, 0).In(cstLocation).Format("2006-01-02"), To: time.Unix(scope.ToTs-1, 0).In(cstLocation).Format("2006-01-02"), GeneratedAt: now, RetentionDays: queryDays, RowsTruncated: false, ComparisonAvailable: comparisonCoverage.Complete, ComparisonCoverage: comparisonCoverage, TimelineBucketSec: timelineStep}
+	meta.DataCoverage = m.stabilityDataCoverage(ctx, scope.FromTs, scope.ToTs, now)
 	var coverage struct{ Min, Max int64 }
 	warnReadErr("stability coverage", m.storeDB.WithContext(ctx).Raw("SELECT COALESCE(MIN(hour_ts),0) min, COALESCE(MAX(hour_ts),0) max FROM stability_hour_samples").Scan(&coverage))
 	meta.FirstDataTs, meta.LastDataTs = coverage.Min, coverage.Max
@@ -976,6 +999,7 @@ func (m *Monitor) buildStabilityReportWithDetails(ctx context.Context, scope sta
 	if meta.Sources.NewAPILastTs > meta.Sources.ProblemCoverageTo && meta.Sources.ProblemCoverageTo > 0 {
 		meta.Sources.ProblemCoverageLagSec = meta.Sources.NewAPILastTs - meta.Sources.ProblemCoverageTo
 	}
+	meta.Sources.NginxConnected, meta.Sources.NginxLastTs, meta.Sources.RequestIDCoverage = m.nginxSourceSummary(ctx, now)
 
 	return &StabilityReport{Enabled: true, Meta: meta, Filters: buildStabilityFilters(rows), Summary: totalMetrics, Previous: prevMetrics, DeltaPP: deltaPP(totalMetrics, prevMetrics), Groups: resultGroups, Rankings: StabilityRankings{Groups: groupRanking, Channels: channelRanking, Models: modelRanking}}, nil
 }
@@ -1070,10 +1094,7 @@ func (m *Monitor) serveStabilityReport(c *gin.Context) {
 		c.JSON(200, gin.H{"enabled": false})
 		return
 	}
-	maxDays := m.cfg.StabilityRetentionDays
-	if maxDays <= 0 || maxDays > 365 {
-		maxDays = 90
-	}
+	maxDays := m.cfg.stabilityQueryDays()
 	scope, err := stabilityRange(c, time.Now(), maxDays)
 	if err != nil {
 		c.JSON(400, gin.H{"error": err.Error()})
@@ -1083,7 +1104,7 @@ func (m *Monitor) serveStabilityReport(c *gin.Context) {
 	defer cancel()
 	report, err := m.buildStabilityReportWithDetails(ctx, scope, time.Now().Unix(), false)
 	if err != nil {
-		c.JSON(500, gin.H{"error": err.Error()})
+		writeStabilityReadError(c, err)
 		return
 	}
 	c.JSON(200, report)
@@ -1094,10 +1115,7 @@ func (m *Monitor) serveStabilityDetail(c *gin.Context) {
 		c.JSON(200, gin.H{"enabled": false})
 		return
 	}
-	maxDays := m.cfg.StabilityRetentionDays
-	if maxDays <= 0 || maxDays > 365 {
-		maxDays = 90
-	}
+	maxDays := m.cfg.stabilityQueryDays()
 	scope, err := stabilityRange(c, time.Now(), maxDays)
 	if err != nil {
 		c.JSON(400, gin.H{"error": err.Error()})
@@ -1111,7 +1129,7 @@ func (m *Monitor) serveStabilityDetail(c *gin.Context) {
 	defer cancel()
 	report, err := m.buildStabilityReportWithDetails(ctx, scope, time.Now().Unix(), true)
 	if err != nil {
-		c.JSON(500, gin.H{"error": err.Error()})
+		writeStabilityReadError(c, err)
 		return
 	}
 	if len(report.Groups) == 0 {
@@ -1119,4 +1137,18 @@ func (m *Monitor) serveStabilityDetail(c *gin.Context) {
 		return
 	}
 	c.JSON(200, gin.H{"enabled": true, "group": report.Groups[0]})
+}
+
+// 前端切换日期/筛选时会主动 AbortController 取消旧请求。499 只记录“客户端已取消”，
+// 不再把正常交互写成服务端 500；服务端自身查询超时仍明确返回 504。
+func writeStabilityReadError(c *gin.Context, err error) {
+	if errors.Is(err, context.Canceled) {
+		c.AbortWithStatus(499)
+		return
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		c.JSON(http.StatusGatewayTimeout, gin.H{"error": "查询超时，请缩小日期范围或增加筛选后重试"})
+		return
+	}
+	c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 }

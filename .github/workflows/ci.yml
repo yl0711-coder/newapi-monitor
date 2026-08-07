@@ -82,6 +82,7 @@ jobs:
             test -e /context/main.go &&
             test -e /context/monitor/page.html &&
             test -e /context/cmd/hostagent/main.go &&
+            test -e /context/cmd/nginxcollector/main.go &&
             test ! -e /context/.local-data &&
             test ! -e /context/tools &&
             test ! -e /context/data &&
@@ -126,6 +127,8 @@ jobs:
             dockerfile: Dockerfile
           - image: newapi-monitor-hostagent
             dockerfile: cmd/hostagent/Dockerfile
+          - image: newapi-monitor-nginxcollector
+            dockerfile: cmd/nginxcollector/Dockerfile
     steps:
       - uses: actions/checkout@v4
 
