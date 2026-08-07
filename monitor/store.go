@@ -1,8 +1,13 @@
 package monitor
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
+	"sort"
 	"strings"
 
 	"github.com/glebarez/sqlite"
@@ -156,7 +161,8 @@ func splitList(s string) []string {
 
 // RejectionSample 是「前置拒绝」按分钟聚合的计数,由各节点的旁路采集器
 // (newapi-reject-collector)POST 推来。这类拒绝(如"无可用渠道")不进 new-api 的 logs 表,
-// 是 logs 维度监控的盲区,这里单列。复合主键使重复推送幂等(同键累加)。
+// 是 logs 维度监控的盲区,这里单列。样本按不同批次累加；同一批次重试由
+// RejectionIngestBatch 台账去重，不能仅靠样本复合主键判断重试。
 type RejectionSample struct {
 	BucketTs int64  `gorm:"primaryKey;autoIncrement:false;index"`
 	Node     string `gorm:"primaryKey;size:64"`  // 来源节点(master/slave)
@@ -164,6 +170,17 @@ type RejectionSample struct {
 	Model    string `gorm:"primaryKey;size:128"` // 被拒模型
 	Grp      string `gorm:"primaryKey;size:64;column:grp"`
 	Count    int64
+}
+
+// RejectionIngestBatch 是前置拒绝采集的幂等台账。同一节点的同一批次只会
+// 累加一次；PayloadHash 用于发现采集器错误复用 batch_id，而不是静默吞数据。
+type RejectionIngestBatch struct {
+	Node        string `gorm:"primaryKey;size:64"`
+	BatchID     string `gorm:"primaryKey;size:64;column:batch_id"`
+	PayloadHash string `gorm:"size:64;column:payload_hash"`
+	Rows        int
+	TotalCount  int64 `gorm:"column:total_count"`
+	ReceivedAt  int64 `gorm:"index;column:received_at"`
 }
 
 // InfraSample 是「服务端健康」长格式时序采样:一行 = 某资源某指标在某分钟桶的取值。
@@ -177,6 +194,55 @@ type InfraSample struct {
 	RType    string `gorm:"primaryKey;size:16;column:rtype"`
 	Metric   string `gorm:"primaryKey;size:48"`
 	Value    float64
+}
+
+// HostContainerSnapshot 保存 HostAgent 显式白名单内的当前容器状态。
+// 这是覆盖式快照而非高频历史，避免本地库随时间增长；不含任何 Docker 敏感配置。
+type HostContainerSnapshot struct {
+	Node         string `gorm:"primaryKey;size:128"`
+	Name         string `gorm:"primaryKey;size:128"`
+	State        string `gorm:"size:16"`
+	Health       string `gorm:"size:16"`
+	RestartCount int
+	LastSeen     int64 `gorm:"index"`
+}
+
+// NginxMinuteSample 是采集器在节点侧先脱敏、再按分钟聚合后的入口事实。
+// 主键维度均为有限集合，存储量与请求量解耦；表内不存在请求级原文或身份信息。
+type NginxMinuteSample struct {
+	BucketTs          int64  `gorm:"primaryKey;autoIncrement:false;index:idx_nginx_minute_bucket"`
+	Node              string `gorm:"primaryKey;size:64"`
+	Route             string `gorm:"primaryKey;size:48"`
+	Method            string `gorm:"primaryKey;size:8"`
+	Status            int    `gorm:"primaryKey;autoIncrement:false"`
+	UpstreamStatus    int    `gorm:"primaryKey;autoIncrement:false"`
+	Count             int64
+	RequestTimeSumMS  int64
+	RequestTimeMaxMS  int64
+	UpstreamTimeSumMS int64
+	UpstreamTimeCount int64
+	BytesSent         int64
+	RequestIDPresent  int64
+}
+
+// NginxIngestBatch 使采集器断线重试保持幂等，避免同一批次重复累计。
+type NginxIngestBatch struct {
+	Node       string `gorm:"primaryKey;size:64"`
+	BatchID    string `gorm:"primaryKey;size:64"`
+	FirstTs    int64
+	LastTs     int64
+	Rows       int
+	ReceivedAt int64 `gorm:"index"`
+}
+
+// NginxSourceState 是入口数据源健康状态；只保留每节点最后进度，不随时间增长。
+type NginxSourceState struct {
+	Node          string `gorm:"primaryKey;size:64"`
+	LastEventTs   int64
+	LastIngestTs  int64
+	LastBatchID   string `gorm:"size:64"`
+	AcceptedRows  int64
+	AcceptedCount int64
 }
 
 // 直方图档位上界。lat 单位秒,ttft 单位毫秒。
@@ -202,11 +268,13 @@ func (m *Monitor) openStore(path string) error {
 	// 需按 defaultAlertConfig 补一次,否则升级后交付异常告警静默失效。
 	hadAnomalyAlerts := db.Migrator().HasColumn(&AlertConfig{}, "anomaly_alerts_enabled")
 	if err := db.AutoMigrate(
-		&MetricSample{}, &TokenSample{}, &HourSample{}, &ChannelSnap{}, &RejectionSample{}, &SelectablePair{},
+		&MetricSample{}, &TokenSample{}, &HourSample{}, &ChannelSnap{}, &RejectionSample{}, &RejectionIngestBatch{}, &SelectablePair{},
 		&StabilityHourSample{}, &StabilityRejectHour{}, &StabilityProblemSample{},
 		&StabilityProblemIngestState{}, &StabilityProblemStage{},
+		&StabilityHourIngestState{}, &StabilityBackfillJob{},
 		&ChannelFinanceSetting{}, &ChannelSaleGroupRate{}, &ChannelDomainCost{}, &ChannelDomainGroupCost{}, &ChannelFinanceVersion{},
-		&InfraSample{}, &AlertConfig{}, &AlertLog{}, &TrackedUser{}, &CustomerGroup{}, &FollowUpLog{}, &UsageSettings{},
+		&InfraSample{}, &HostContainerSnapshot{}, &NginxMinuteSample{}, &NginxIngestBatch{}, &NginxSourceState{},
+		&AlertConfig{}, &AlertLog{}, &TrackedUser{}, &CustomerGroup{}, &FollowUpLog{}, &UsageSettings{},
 	); err != nil {
 		return fmt.Errorf("表迁移失败: %w", err)
 	}
@@ -345,12 +413,17 @@ func (m *Monitor) pruneOlderThan(cutoffTs int64) (int64, error) {
 	return r.RowsAffected, r.Error
 }
 
-// upsertRejections 累加写入采集器推来的拒绝计数(同键累加,重复/分批推送幂等)。
+// upsertRejections 累加一个已经确认是“新批次”的拒绝计数。HTTP 重试幂等由
+// ingestRejectionBatch 的批次台账保证；不同批次落在同一分钟时必须继续累加。
 func (m *Monitor) upsertRejections(rows []RejectionSample) error {
+	return upsertRejectionsDB(m.storeDB, rows)
+}
+
+func upsertRejectionsDB(db *gorm.DB, rows []RejectionSample) error {
 	if len(rows) == 0 {
 		return nil
 	}
-	return m.storeDB.Clauses(clause.OnConflict{
+	return db.Clauses(clause.OnConflict{
 		Columns: []clause.Column{
 			{Name: "bucket_ts"}, {Name: "node"}, {Name: "reason"}, {Name: "model"}, {Name: "grp"},
 		},
@@ -358,6 +431,61 @@ func (m *Monitor) upsertRejections(rows []RejectionSample) error {
 			"count": gorm.Expr("rejection_samples.count + excluded.count"),
 		}),
 	}).CreateInBatches(rows, 200).Error
+}
+
+var errRejectionBatchConflict = errors.New("rejection batch id reused with different payload")
+
+func rejectionBatchPayloadHash(rows []RejectionSample) string {
+	canonical := append([]RejectionSample(nil), rows...)
+	sort.Slice(canonical, func(i, j int) bool {
+		a, b := canonical[i], canonical[j]
+		if a.BucketTs != b.BucketTs {
+			return a.BucketTs < b.BucketTs
+		}
+		if a.Reason != b.Reason {
+			return a.Reason < b.Reason
+		}
+		if a.Model != b.Model {
+			return a.Model < b.Model
+		}
+		if a.Grp != b.Grp {
+			return a.Grp < b.Grp
+		}
+		return a.Count < b.Count
+	})
+	payload, _ := json.Marshal(canonical) // 字段均为基础类型，不存在编码失败路径。
+	sum := sha256.Sum256(payload)
+	return hex.EncodeToString(sum[:])
+}
+
+// ingestRejectionBatch 在同一个 SQLite 事务内先登记批次、再累加样本。
+// 返回 duplicate=true 表示服务端已经完整接收过同一批，调用方可安全丢弃重试。
+func (m *Monitor) ingestRejectionBatch(node, batchID string, rows []RejectionSample, receivedAt int64) (duplicate bool, err error) {
+	hash := rejectionBatchPayloadHash(rows)
+	var total int64
+	for _, row := range rows {
+		total += row.Count
+	}
+	err = m.storeDB.Transaction(func(tx *gorm.DB) error {
+		batch := RejectionIngestBatch{Node: node, BatchID: batchID, PayloadHash: hash, Rows: len(rows), TotalCount: total, ReceivedAt: receivedAt}
+		created := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&batch)
+		if created.Error != nil {
+			return created.Error
+		}
+		if created.RowsAffected == 0 {
+			var existing RejectionIngestBatch
+			if err := tx.First(&existing, "node = ? AND batch_id = ?", node, batchID).Error; err != nil {
+				return err
+			}
+			if existing.PayloadHash != hash {
+				return errRejectionBatchConflict
+			}
+			duplicate = true
+			return nil
+		}
+		return upsertRejectionsDB(tx, rows)
+	})
+	return duplicate, err
 }
 
 // storeRejections 取窗口内按 (原因 × 模型 × 分组) 聚合的拒绝计数,按次数降序(Top 100)。
@@ -370,8 +498,16 @@ func (m *Monitor) storeRejections(since int64) []RejectionRow {
 }
 
 func (m *Monitor) pruneRejectionsOlderThan(cutoffTs int64) (int64, error) {
-	r := m.storeDB.Where("bucket_ts < ?", cutoffTs).Delete(&RejectionSample{})
-	return r.RowsAffected, r.Error
+	var deleted int64
+	err := m.storeDB.Transaction(func(tx *gorm.DB) error {
+		r := tx.Where("bucket_ts < ?", cutoffTs).Delete(&RejectionSample{})
+		if r.Error != nil {
+			return r.Error
+		}
+		deleted = r.RowsAffected
+		return tx.Where("received_at < ?", cutoffTs).Delete(&RejectionIngestBatch{}).Error
+	})
+	return deleted, err
 }
 
 // aggRow 承接聚合结果。

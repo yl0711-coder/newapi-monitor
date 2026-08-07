@@ -18,8 +18,21 @@ type Settings struct {
 	// 历史稳定性报表只使用 Monitor 本地汇总。开关关闭时不采集原始错误、
 	// 不执行稳定性长期汇总，但不影响原有模型/用量/服务端监控。
 	StabilityEnabled          bool // MONITOR_STABILITY_ENABLED,默认 true
-	StabilityRetentionDays    int  // MONITOR_STABILITY_RETENTION_DAYS,默认 90,页面最大查询范围
+	StabilityQueryMaxDays     int  // MONITOR_STABILITY_QUERY_MAX_DAYS,默认 90,页面最大查询范围
+	StabilityRetentionDays    int  // MONITOR_STABILITY_RETENTION_DAYS,默认 181,至少覆盖两个最大查询周期
 	StabilityProblemSampleSec int  // MONITOR_STABILITY_PROBLEM_SAMPLE_SECONDS,默认 300
+	// 长期小时数据补数直接聚合生产 logs 的单个小时，不写分钟表。查询始终串行，
+	// 片间延迟用于给主站数据库让路；自动修洞每轮最多处理一个已结束小时。
+	StabilityBackfillDelayMS    int  // MONITOR_STABILITY_BACKFILL_DELAY_MS,默认 2000
+	StabilityBackfillTimeoutSec int  // MONITOR_STABILITY_BACKFILL_TIMEOUT_SECONDS,默认 20
+	StabilityBackfillEnabled    bool // MONITOR_STABILITY_BACKFILL_ENABLED,默认 true;关闭后禁止人工、自动及重启续跑
+	StabilityAutoRepair         bool // MONITOR_STABILITY_AUTO_REPAIR,默认 true
+
+	// Nginx 入口层旁路聚合。默认关闭；开启后只接收采集器已经脱敏、按分钟聚合的
+	// 客观指标，不读取 access/error 原文，不采集 IP、Header、Key、请求体或响应体。
+	NginxEnabled       bool     // MONITOR_NGINX_ENABLED,默认 false
+	NginxRetentionDays int      // MONITOR_NGINX_RETENTION_DAYS,默认 7
+	NginxAllowedNodes  []string // MONITOR_NGINX_ALLOWED_NODES,逗号分隔；启用 Nginx 采集时必填
 
 	// 登录鉴权:复用 new-api 用户身份(不改 new-api,只调其 API 验证)
 	NewAPIBaseURL string // MONITOR_NEWAPI_BASE_URL,如 http://new-api:3000
@@ -106,28 +119,36 @@ type Settings struct {
 // LoadSettings 从环境变量装载配置(可配合 .env)。
 func LoadSettings() Settings {
 	return Settings{
-		Addr:                      env("MONITOR_ADDR", ":8090"),
-		ProdDSN:                   env("NEWAPI_LOG_DSN", ""),
-		StorePath:                 env("MONITOR_STORE_PATH", "monitor.db"),
-		SampleSeconds:             envInt("MONITOR_SAMPLE_SECONDS", 60),
-		RetentionDays:             envInt("MONITOR_RETENTION_DAYS", 7),
-		HourRetentionDays:         envInt("MONITOR_HOUR_RETENTION_DAYS", 90),
-		BackfillHours:             envInt("MONITOR_BACKFILL_HOURS", 24),
-		StabilityEnabled:          env("MONITOR_STABILITY_ENABLED", "true") == "true",
-		StabilityRetentionDays:    envInt("MONITOR_STABILITY_RETENTION_DAYS", 90),
-		StabilityProblemSampleSec: envInt("MONITOR_STABILITY_PROBLEM_SAMPLE_SECONDS", 300),
-		NewAPIBaseURL:             env("MONITOR_NEWAPI_BASE_URL", ""),
-		SessionSecret:             env("MONITOR_SESSION_SECRET", ""),
-		PortalAddr:                env("MONITOR_PORTAL_ADDR", ""),
-		UsageRedisAddr:            strings.TrimSpace(env("MONITOR_USAGE_REDIS_ADDR", "")),
-		UsageRedisUsername:        strings.TrimSpace(env("MONITOR_USAGE_REDIS_USERNAME", "")),
-		UsageRedisPassword:        env("MONITOR_USAGE_REDIS_PASSWORD", ""),
-		UsageRedisDB:              envInt("MONITOR_USAGE_REDIS_DB", 0),
-		UsageRedisPrefix:          strings.Trim(strings.TrimSpace(env("MONITOR_USAGE_REDIS_PREFIX", "nxmon:usage:v1")), ":"),
-		TrustedProxies:            envCSV("MONITOR_TRUSTED_PROXIES"),
-		HeartbeatURL:              env("MONITOR_HEARTBEAT_URL", ""),
-		SiteName:                  env("MONITOR_SITE_NAME", ""),
-		IngestToken:               env("MONITOR_INGEST_TOKEN", ""),
+		Addr:                        env("MONITOR_ADDR", ":8090"),
+		ProdDSN:                     env("NEWAPI_LOG_DSN", ""),
+		StorePath:                   env("MONITOR_STORE_PATH", "monitor.db"),
+		SampleSeconds:               envInt("MONITOR_SAMPLE_SECONDS", 60),
+		RetentionDays:               envInt("MONITOR_RETENTION_DAYS", 7),
+		HourRetentionDays:           envInt("MONITOR_HOUR_RETENTION_DAYS", 90),
+		BackfillHours:               envInt("MONITOR_BACKFILL_HOURS", 24),
+		StabilityEnabled:            env("MONITOR_STABILITY_ENABLED", "true") == "true",
+		StabilityQueryMaxDays:       envInt("MONITOR_STABILITY_QUERY_MAX_DAYS", 90),
+		StabilityRetentionDays:      envInt("MONITOR_STABILITY_RETENTION_DAYS", 181),
+		StabilityProblemSampleSec:   envInt("MONITOR_STABILITY_PROBLEM_SAMPLE_SECONDS", 300),
+		StabilityBackfillDelayMS:    envInt("MONITOR_STABILITY_BACKFILL_DELAY_MS", 2000),
+		StabilityBackfillTimeoutSec: envInt("MONITOR_STABILITY_BACKFILL_TIMEOUT_SECONDS", 20),
+		StabilityBackfillEnabled:    env("MONITOR_STABILITY_BACKFILL_ENABLED", "true") == "true",
+		StabilityAutoRepair:         env("MONITOR_STABILITY_AUTO_REPAIR", "true") == "true",
+		NginxEnabled:                env("MONITOR_NGINX_ENABLED", "false") == "true",
+		NginxRetentionDays:          envInt("MONITOR_NGINX_RETENTION_DAYS", 7),
+		NginxAllowedNodes:           envCSV("MONITOR_NGINX_ALLOWED_NODES"),
+		NewAPIBaseURL:               env("MONITOR_NEWAPI_BASE_URL", ""),
+		SessionSecret:               env("MONITOR_SESSION_SECRET", ""),
+		PortalAddr:                  env("MONITOR_PORTAL_ADDR", ""),
+		UsageRedisAddr:              strings.TrimSpace(env("MONITOR_USAGE_REDIS_ADDR", "")),
+		UsageRedisUsername:          strings.TrimSpace(env("MONITOR_USAGE_REDIS_USERNAME", "")),
+		UsageRedisPassword:          env("MONITOR_USAGE_REDIS_PASSWORD", ""),
+		UsageRedisDB:                envInt("MONITOR_USAGE_REDIS_DB", 0),
+		UsageRedisPrefix:            strings.Trim(strings.TrimSpace(env("MONITOR_USAGE_REDIS_PREFIX", "nxmon:usage:v1")), ":"),
+		TrustedProxies:              envCSV("MONITOR_TRUSTED_PROXIES"),
+		HeartbeatURL:                env("MONITOR_HEARTBEAT_URL", ""),
+		SiteName:                    env("MONITOR_SITE_NAME", ""),
+		IngestToken:                 env("MONITOR_INGEST_TOKEN", ""),
 
 		InfraEnabled:          env("MONITOR_INFRA_ENABLED", "") == "true",
 		AWSRegion:             env("AWS_REGION", "us-west-2"),
@@ -162,6 +183,27 @@ func LoadSettings() Settings {
 
 		AlertsDisabled: env("MONITOR_ALERTS_DISABLED", "") == "true",
 	}
+}
+
+// stabilityQueryDays 与 stabilityStorageDays 把“页面可查多久”和“本地至少要存多久”
+// 分开。90 天报表还要读取紧邻的上一 90 天做环比，因此留存少于 181 天会让
+// 页面看似支持 90 天、实际却永远缺上一周期。即使旧部署仍配置 90，也在运行时
+// 安全提升到所需下限；只增加 Monitor 本地小时汇总留存，不扩大页面查询范围。
+func (s Settings) stabilityQueryDays() int {
+	days := s.StabilityQueryMaxDays
+	if days <= 0 || days > 365 {
+		return 90
+	}
+	return days
+}
+
+func (s Settings) stabilityStorageDays() int {
+	days := s.StabilityRetentionDays
+	minimum := s.stabilityQueryDays()*2 + 1
+	if days < minimum {
+		return minimum
+	}
+	return days
 }
 
 func env(k, def string) string {

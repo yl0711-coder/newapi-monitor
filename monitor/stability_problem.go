@@ -227,10 +227,7 @@ func (m *Monitor) serveStabilityProblems(c *gin.Context) {
 		c.JSON(200, gin.H{"enabled": false})
 		return
 	}
-	maxDays := m.cfg.StabilityRetentionDays
-	if maxDays <= 0 || maxDays > 365 {
-		maxDays = 90
-	}
+	maxDays := m.cfg.stabilityQueryDays()
 	scope, err := stabilityRange(c, time.Now(), maxDays)
 	if err != nil {
 		c.JSON(400, gin.H{"error": err.Error()})
@@ -247,7 +244,7 @@ func (m *Monitor) serveStabilityProblems(c *gin.Context) {
 	defer cancel()
 	result, err := m.queryStabilityProblems(ctx, scope, limit)
 	if err != nil {
-		c.JSON(500, gin.H{"error": err.Error()})
+		writeStabilityReadError(c, err)
 		return
 	}
 	c.JSON(200, result)

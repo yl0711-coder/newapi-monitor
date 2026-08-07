@@ -53,6 +53,29 @@ func portalCookie(w *httptest.ResponseRecorder) *http.Cookie {
 	return nil
 }
 
+func TestCustomerGroupStageFeatureRemovedWithoutDroppingLegacyColumns(t *testing.T) {
+	m, admin, _ := newPortalTestMonitor(t)
+	root := &http.Cookie{Name: sessionCookie, Value: m.signSession("root", roleRoot, time.Now().Unix())}
+	w := portalDo(admin, http.MethodPost, "/usage/groups", `{"name":"无状态客户","note":"只保留客户资料","stage":"trial","trial_end":9999999999}`, root)
+	if w.Code != http.StatusOK {
+		t.Fatalf("create group: %d %s", w.Code, w.Body.String())
+	}
+	var stored CustomerGroup
+	if err := m.storeDB.Where("name = ?", "无状态客户").First(&stored).Error; err != nil {
+		t.Fatal(err)
+	}
+	if stored.Stage != "active" || stored.TrialEnd != 0 {
+		t.Fatalf("legacy columns must stay inert: %+v", stored)
+	}
+	listed := portalDo(admin, http.MethodGet, "/usage/groups", "", root)
+	if listed.Code != http.StatusOK || strings.Contains(listed.Body.String(), `"stage"`) || strings.Contains(listed.Body.String(), `"trial_end"`) {
+		t.Fatalf("removed status fields leaked from list API: %d %s", listed.Code, listed.Body.String())
+	}
+	if old := portalDo(admin, http.MethodPost, "/usage/groups/stage", `{"id":1,"stage":"trial"}`, root); old.Code != http.StatusNotFound {
+		t.Fatalf("removed stage endpoint should be 404, got %d %s", old.Code, old.Body.String())
+	}
+}
+
 // 双密码:我方配置密码与客户自改密码都能登录;改密码后我方密码仍有效;错误密码拒绝。
 func TestPortalDualPassword(t *testing.T) {
 	m, _, portal := newPortalTestMonitor(t)

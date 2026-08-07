@@ -11,6 +11,7 @@ import (
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/lightsail"
 	lstypes "github.com/aws/aws-sdk-go-v2/service/lightsail/types"
+	"gorm.io/gorm"
 )
 
 // infra.go:服务端健康监控(实例 / 数据库 / 负载均衡)。
@@ -361,11 +362,21 @@ func statValue(dp lstypes.MetricDatapoint, stat lstypes.MetricStatistic) float64
 
 // InfraResource 是一个资源在最近一次采样的健康视图。
 type InfraResource struct {
-	Name    string             `json:"name"`
-	Type    string             `json:"type"`
-	Status  string             `json:"status"` // ok / warn / bad / nosample
-	AgeSec  int64              `json:"age_sec"`
-	Metrics map[string]float64 `json:"metrics"`
+	Name       string             `json:"name"`
+	Type       string             `json:"type"`
+	Status     string             `json:"status"` // ok / warn / bad / nosample
+	AgeSec     int64              `json:"age_sec"`
+	Metrics    map[string]float64 `json:"metrics"`
+	Containers []InfraContainer   `json:"containers,omitempty"`
+}
+
+type InfraContainer struct {
+	Name         string `json:"name"`
+	State        string `json:"state"`
+	Health       string `json:"health,omitempty"`
+	RestartCount int    `json:"restart_count"`
+	AgeSec       int64  `json:"age_sec"`
+	Status       string `json:"status"` // ok / warn / bad
 }
 
 // ProbeResource 是一个前端域名的端到端探活视图。
@@ -479,6 +490,7 @@ func (m *Monitor) computeInfraSnapshot(nowUnix int64) InfraSnapshot {
 			continue
 		}
 		res := InfraResource{Name: name, Type: rtypeOrInstance(a.rtype), AgeSec: age, Metrics: a.metrics}
+		res.Containers = m.hostContainerSnapshot(name, nowUnix)
 		addDerivedPct(&res) // 派生百分比键(前端直接用),需在算 status 前完成
 		res.Status = m.infraStatus(res)
 		switch res.Type {
@@ -508,6 +520,79 @@ func (m *Monitor) computeInfraSnapshot(nowUnix int64) InfraSnapshot {
 	snap.Overview = buildOverview(snap)
 	snap.Alerts = m.recentInfraAlerts(nowUnix, 20)
 	return snap
+}
+
+func containerStatus(state, health string) string {
+	switch state {
+	case "missing", "dead", "exited", "removing":
+		return "bad"
+	case "paused", "restarting", "created":
+		return "warn"
+	case "running":
+		if health == "unhealthy" {
+			return "bad"
+		}
+		if health == "starting" || health == "unknown" {
+			return "warn"
+		}
+		return "ok"
+	default:
+		return "warn"
+	}
+}
+
+func safeContainerState(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	switch value {
+	case "created", "running", "paused", "restarting", "removing", "exited", "dead", "missing":
+		return value
+	default:
+		return "unknown"
+	}
+}
+
+func safeContainerHealth(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	switch value {
+	case "none", "starting", "healthy", "unhealthy":
+		return value
+	case "":
+		return ""
+	default:
+		return "unknown"
+	}
+}
+
+func (m *Monitor) replaceHostContainerSnapshots(node string, rows []HostContainerSnapshot) error {
+	return m.storeDB.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Where("node = ?", node).Delete(&HostContainerSnapshot{}).Error; err != nil {
+			return err
+		}
+		if len(rows) == 0 {
+			return nil
+		}
+		return tx.CreateInBatches(rows, 100).Error
+	})
+}
+
+func (m *Monitor) hostContainerSnapshot(node string, now int64) []InfraContainer {
+	var rows []HostContainerSnapshot
+	warnReadErr("host container snapshot", m.storeDB.Where("node = ?", node).Order("name").Find(&rows))
+	out := make([]InfraContainer, 0, len(rows))
+	for _, row := range rows {
+		age := now - row.LastSeen
+		if age < 0 {
+			age = 0
+		}
+		status := containerStatus(row.State, row.Health)
+		// HostAgent 默认每分钟上报；超过 5 分钟未更新不能继续显示为绿色。
+		if age > 300 && status == "ok" {
+			status = "warn"
+		}
+		out = append(out, InfraContainer{Name: row.Name, State: row.State, Health: row.Health,
+			RestartCount: row.RestartCount, AgeSec: age, Status: status})
+	}
+	return out
 }
 
 // buildProbe 把某域名的探活指标组装成 ProbeResource 并按阈值定级。
@@ -760,7 +845,14 @@ func lbUnhealthy(mm map[string]float64) (float64, bool) {
 // 阈值取自 Settings(可经环境变量配置);可用内存/存储「低于」即告急,CPU「高于」即告急,突发额度「低于」即黄。
 func (m *Monitor) infraStatus(r InfraResource) string {
 	mm := r.Metrics
+	containerState := ""
+	for _, container := range r.Containers {
+		containerState = worst(containerState, container.Status)
+	}
 	if len(mm) == 0 {
+		if containerState != "" {
+			return containerState
+		}
 		return "nosample"
 	}
 	c := m.cfg
@@ -804,6 +896,9 @@ func (m *Monitor) infraStatus(r InfraResource) string {
 		}
 		return "ok"
 	default: // instance
+		if containerState == "bad" {
+			return "bad"
+		}
 		if _, hit := instanceDown(mm); hit {
 			return "bad"
 		}
@@ -823,6 +918,9 @@ func (m *Monitor) infraStatus(r InfraResource) string {
 			return "warn"
 		}
 		if v, ok := has("burst"); ok && v < c.InfraBurstWarnPct {
+			return "warn"
+		}
+		if containerState == "warn" {
 			return "warn"
 		}
 		return "ok"
@@ -855,6 +953,17 @@ func (m *Monitor) evaluateInfraAlerts(now int64) {
 		if v, hit := instanceDown(in.Metrics); hit {
 			m.fire(c, "infra_instance_down", in.Name, "实例健康检查失败",
 				fmt.Sprintf("实例 %s StatusCheckFailed=%.0f,可能宕机或不可达。", in.Name, v), now)
+		}
+		for _, container := range in.Containers {
+			if container.Status != "bad" {
+				continue
+			}
+			detail := fmt.Sprintf("节点 %s 的容器 %s 状态=%s", in.Name, container.Name, container.State)
+			if container.Health != "" {
+				detail += fmt.Sprintf(" health=%s", container.Health)
+			}
+			detail += fmt.Sprintf(" restart_count=%d。", container.RestartCount)
+			m.fire(c, "infra_container", in.Name+"/"+container.Name, "关键容器异常", detail, now)
 		}
 	}
 	if lb := snap.LB; lb != nil {

@@ -29,6 +29,9 @@ services:
       # 默认只采内存/Swap/load；磁盘与容器数需要更高权限，显式开启才采集。
       - HOSTAGENT_ROOTFS=
       - HOSTAGENT_DOCKER_SOCK=
+      # 只有显式列出的容器会做 inspect 并上报 name/state/health/restart_count；
+      # 留空时仍可统计容器总数，但不采明细。禁止使用通配符。
+      - HOSTAGENT_CONTAINER_ALLOWLIST=${HOSTAGENT_CONTAINER_ALLOWLIST:-}
     volumes:
       # 默认最小权限：仅读宿主 /proc，不挂载宿主根目录和 Docker Socket。
       - /proc:/host/proc:ro
@@ -37,7 +40,9 @@ services:
       # 并设置 HOSTAGENT_ROOTFS=/host/root。
       # 如确需“容器数”，由运维评审后显式增加：
       # - /var/run/docker.sock:/var/run/docker.sock
-      # 并设置 HOSTAGENT_DOCKER_SOCK=/var/run/docker.sock；该权限接近宿主 root。
+      # 并设置 HOSTAGENT_DOCKER_SOCK=/var/run/docker.sock 及白名单；该权限接近宿主 root。
+      # HostAgent 以非 root 用户运行，还需按宿主 docker.sock 的实际组 ID 配置 service.group_add，
+      # 例如先执行 stat -c '%g' /var/run/docker.sock，再把结果写入部署机专用 compose 覆盖文件。
     # 内存极小;给个上限防意外
     mem_limit: 64m
     read_only: true

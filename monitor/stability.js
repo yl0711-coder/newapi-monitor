@@ -26,19 +26,21 @@ window.monitorShellSetTab=function(name){
   if(icon)icon.innerHTML=ST_ICONS[h.icon]||'';
 };
 
-const st={inited:false,loaded:false,view:'history',layer:'delivery',days:7,custom:null,filters:{vendor:'',group:'',channel:'',model:''},allFilters:null,report:null,abort:null,problemAbort:null,drawerAbort:null,generation:0,detailPromises:new Map(),detailControllers:new Map(),detailLoading:new Set(),expanded:new Set(),chart:null,drawerChart:null,drawer:null,drawerTab:'run',lastFocus:null};
+const st={inited:false,loaded:false,view:'history',layer:'delivery',days:7,custom:null,filters:{vendor:'',group:'',channel:'',model:''},allFilters:null,report:null,abort:null,problemAbort:null,drawerAbort:null,edgeAbort:null,edgeReport:null,generation:0,detailPromises:new Map(),detailControllers:new Map(),detailLoading:new Set(),expanded:new Set(),chart:null,drawerChart:null,edgeChart:null,drawer:null,drawerTab:'run',lastFocus:null};
 const $=id=>document.getElementById(id);
 const esc=s=>String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const nfmt=n=>(+n||0).toLocaleString('zh-CN');
 const compact=n=>{n=+n||0;const a=Math.abs(n);for(const [d,u] of [[1e9,'B'],[1e6,'M'],[1e3,'k']])if(a>=d)return (n/d>=100?(n/d).toFixed(0):(n/d).toFixed(1)).replace(/\.0$/,'')+u;return nfmt(n)};
 const pct=v=>v==null?'—':(+v).toFixed(2)+'%';
 const usd=v=>'$'+(+v||0).toFixed(2);
+const bytes=v=>{v=+v||0;for(const [d,u] of [[1073741824,'GB'],[1048576,'MB'],[1024,'KB']])if(v>=d)return (v/d).toFixed(v/d>=100?0:1)+' '+u;return nfmt(v)+' B'};
 const dateTime=ts=>ts?new Date(ts*1000).toLocaleString('zh-CN',{hour12:false,timeZone:'Asia/Shanghai'}):'—';
 const age=sec=>sec==null||sec<0?'—':sec<90?Math.round(sec)+' 秒':sec<5400?Math.round(sec/60)+' 分钟':(sec/3600).toFixed(1)+' 小时';
 const health=m=>m&&m.health||'nosample';
 const delta=v=>v==null?'环比 —':`环比 ${v>=0?'+':''}${(+v).toFixed(2)} pp`;
 const deltaClass=v=>v==null?'':v>=0?'up':'down';
 const bucketLabel=sec=>sec>=86400?`${sec/86400} 天/格`:sec>=3600?`${sec/3600} 小时/格`:`${Math.round(sec/60)} 分钟/格`;
+const encodeNav=value=>btoa(unescape(encodeURIComponent(JSON.stringify(value))));
 
 function queryParams(extra){
   const q=new URLSearchParams();
@@ -52,17 +54,29 @@ function errorBox(el,message){if(el)el.innerHTML=`<div class="stability-empty"><
 
 window.stabilityActivate=function(){
   if(!st.inited)init();
-  if(!st.loaded)loadReport();
+  const changed=applyNavigationContext();
+  if(!st.loaded||changed)loadReport();
+  probeEdge();
   setTimeout(resize,80);
 };
-function resize(){if(st.chart)st.chart.resize();if(st.drawerChart)st.drawerChart.resize()}
+window.stabilityOpen=function(context){window.monitorNavigate?.('stability',context||{})};
+function applyNavigationContext(){
+  const c=window.monitorNavigationContext?.()||{};let changed=false;
+  if(!Object.keys(c).length)return false;
+  const next={vendor:c.vendor||'',group:c.group||'',channel:c.channel||'',model:c.model||''};
+  for(const key of Object.keys(next))if(st.filters[key]!==next[key]){st.filters[key]=next[key];changed=true}
+  if(c.from&&c.to){const custom={from:c.from,to:c.to};if(!st.custom||st.custom.from!==custom.from||st.custom.to!==custom.to){st.custom=custom;changed=true}}
+  else if(+c.days>0&&st.days!==+c.days){st.days=+c.days;st.custom=null;changed=true}
+  syncRange();return changed;
+}
+function resize(){if(st.chart)st.chart.resize();if(st.drawerChart)st.drawerChart.resize();if(st.edgeChart)st.edgeChart.resize()}
 
 function init(){
   st.inited=true;
   document.querySelectorAll('[data-stability-view]').forEach(b=>b.addEventListener('click',()=>setView(b.dataset.stabilityView)));
-  document.querySelectorAll('[data-stability-days]').forEach(b=>b.addEventListener('click',()=>{st.days=+b.dataset.stabilityDays;st.custom=null;syncRange();loadReport()}));
+  document.querySelectorAll('[data-stability-days]').forEach(b=>b.addEventListener('click',()=>{st.days=+b.dataset.stabilityDays;st.custom=null;syncRange();reloadActiveLayer()}));
   $('stCustomToggle')?.addEventListener('click',()=>{$('stCustomRange')?.classList.toggle('show')});
-  $('stCustomApply')?.addEventListener('click',()=>{const from=$('stCustomFrom')?.value,to=$('stCustomTo')?.value;if(!from||!to||from>to){alert('请选择正确的开始和结束日期');return}st.custom={from,to};syncRange();loadReport()});
+  $('stCustomApply')?.addEventListener('click',()=>{const from=$('stCustomFrom')?.value,to=$('stCustomTo')?.value;if(!from||!to||from>to){alert('请选择正确的开始和结束日期');return}st.custom={from,to};syncRange();reloadActiveLayer()});
   document.querySelectorAll('[data-stability-layer]').forEach(b=>b.addEventListener('click',()=>setLayer(b.dataset.stabilityLayer)));
   for(const id of ['stVendor','stGroup','stChannel','stModel'])$(id)?.addEventListener('change',()=>{readFilters();loadReport()});
   $('stFilterReset')?.addEventListener('click',()=>{st.filters={vendor:'',group:'',channel:'',model:''};renderFilterOptions();loadReport()});
@@ -76,6 +90,7 @@ function init(){
   document.querySelectorAll('[data-st-drawer-tab]').forEach(b=>b.addEventListener('click',()=>{st.drawerTab=b.dataset.stDrawerTab;renderDrawer()}));
   document.addEventListener('keydown',e=>{if(e.key==='Escape'&&st.drawer)closeDrawer()});
   window.addEventListener('resize',resize);
+  window.addEventListener('monitor:navigate',e=>{if(e.detail?.tab==='stability'&&applyNavigationContext())loadReport()});
   syncRange();setLayer('delivery');setView('history');
 }
 function setView(view){
@@ -87,14 +102,52 @@ function setView(view){
   if(view==='problems')loadProblems();else setTimeout(resize,60);
 }
 function setLayer(layer){
+  const button=document.querySelector(`[data-stability-layer="${layer}"]`);if(button?.disabled)return;
   st.layer=layer;
   document.querySelectorAll('[data-stability-layer]').forEach(b=>b.classList.toggle('active',b.dataset.stabilityLayer===layer));
   if($('stDeliveryLayer'))$('stDeliveryLayer').hidden=layer!=='delivery';
   if($('stEdgeLayer'))$('stEdgeLayer').hidden=layer!=='edge';
-  if(layer==='delivery')setTimeout(resize,60);
+  if(layer==='delivery')setTimeout(resize,60);else loadEdge();
 }
 function syncRange(){document.querySelectorAll('[data-stability-days]').forEach(b=>b.classList.toggle('active',!st.custom&&+b.dataset.stabilityDays===st.days));$('stCustomToggle')?.classList.toggle('active',!!st.custom)}
 function readFilters(){st.filters={vendor:$('stVendor')?.value||'',group:$('stGroup')?.value||'',channel:$('stChannel')?.value||'',model:$('stModel')?.value||''}}
+function reloadActiveLayer(){if(st.layer==='edge')loadEdge();else loadReport()}
+
+async function probeEdge(){
+  const button=document.querySelector('[data-stability-layer="edge"]');if(!button)return;
+  try{
+    const res=await fetch('/stability/edge?'+queryParams(),{headers:{Accept:'application/json'}});if(!res.ok)return;
+    const d=await res.json();
+    button.disabled=!d.enabled;
+    button.title=d.enabled?'查看 Nginx 入口层客观汇总':'Nginx 旁路聚合未启用';
+    const title=button.querySelector('b'),small=button.querySelector('small');
+    if(title)title.textContent=d.enabled?'入口与平台':'入口与平台（尚未接入）';
+    if(small)small.textContent=d.enabled?'Nginx access · 节点 / HTTP / 耗时':'Nginx access · 默认关闭';
+    if(d.enabled)st.edgeReport=d;
+  }catch(e){}
+}
+
+async function loadEdge(){
+  if(st.edgeAbort)st.edgeAbort.abort();st.edgeAbort=new AbortController();loading($('stEdgeLayer'),'正在读取本地 Nginx 分钟聚合…');
+  try{
+    const res=await fetch('/stability/edge?'+queryParams(),{headers:{Accept:'application/json'},signal:st.edgeAbort.signal});
+    if(res.status===401){location.href='/login';return}const d=await res.json();if(!res.ok)throw new Error(d.error||`HTTP ${res.status}`);
+    st.edgeReport=d;renderEdge(d);
+  }catch(e){if(e.name!=='AbortError')errorBox($('stEdgeLayer'),e.message)}
+}
+
+function edgeRows(rows){return (rows||[]).map(r=>`<div class="stability-model-row"><b>${esc(r.name||'—')}</b><span>${nfmt(r.requests)} 请求</span><small>4xx ${nfmt(r.status_4xx)} · 5xx ${nfmt(r.status_5xx)}</small><small>平均 ${(+r.avg_ms||0).toFixed(0)} ms</small></div>`).join('')||'<div class="stability-empty"><p>当前范围无数据</p></div>'}
+function renderEdge(d){
+  const el=$('stEdgeLayer');if(!el)return;if(!d.enabled){el.innerHTML='<div class="stability-panel"><div class="stability-empty"><b>Nginx 旁路聚合未启用</b><p>该能力默认关闭，不影响其他 Monitor 功能。</p></div></div>';return}
+  const s=d.summary||{},sources=d.sources||[];
+  el.innerHTML=`<div class="stability-advice-pending"><b>口径边界：</b>仅展示 Nginx 专用 access log 在节点侧脱敏后的分钟聚合，当前保留 ${nfmt(d.retention_days||7)} 天；超出留存期的查询按页面所示实际起止日期展示。Request ID 只统计携带率，不保存原值、不宣称已与使用日志关联；当前不采集 error log 原文。</div>`
+    +`<section class="stability-kpis"><article class="stability-kpi"><small>入口请求</small><b>${nfmt(s.requests)}</b><em>${esc(d.from||'—')} 至 ${esc(d.to||'—')}</em></article><article class="stability-kpi"><small>HTTP 4xx / 5xx</small><b class="${s.status_5xx?'bad':''}">${nfmt(s.status_4xx)} / ${nfmt(s.status_5xx)}</b><em>客观状态码，不自动归因</em></article><article class="stability-kpi"><small>入口平均 / 最大耗时</small><b>${(+s.avg_request_ms||0).toFixed(0)} / ${nfmt(s.max_request_ms)} ms</b><em>upstream 平均 ${(+s.avg_upstream_ms||0).toFixed(0)} ms</em></article><article class="stability-kpi"><small>Request ID 携带率</small><b>${pct(s.request_id_coverage)}</b><em>仅“存在”，不是关联成功率 · ${bytes(s.bytes_sent)}</em></article></section>`
+    +`<section class="stability-panel"><div class="stability-panel-head"><div><h3>每日入口状态变化</h3><p>折线为 HTTP 5xx 占比，柱形为入口请求量</p></div></div><div id="stEdgeChart" class="stability-chart"></div></section>`
+    +`<section class="stability-ranking-grid"><article class="stability-panel"><div class="stability-panel-head"><div><h3>路径汇总</h3><p>路径已在节点侧归一化，不含 query</p></div></div>${edgeRows(d.routes)}</article><article class="stability-panel"><div class="stability-panel-head"><div><h3>节点汇总</h3><p>用于判断异常是否集中在单一入口节点</p></div></div>${edgeRows(d.nodes)}</article></section>`
+    +`<section class="stability-panel"><div class="stability-panel-head"><div><h3>采集器状态</h3><p>只表示聚合数据是否持续送达，不等于业务可用性</p></div></div>${sources.map(x=>`<div class="stability-model-row"><b>${esc(x.node)}</b><span>${x.status==='ok'?'正常':x.status==='warn'?'延迟':'中断'}</span><small>最新事件 ${dateTime(x.last_event_ts)}</small><small>送达 ${age(x.age_sec)} 前</small></div>`).join('')||'<div class="stability-empty"><p>已启用但尚未收到采集器数据</p></div>'}</section>`;
+  const chart=$('stEdgeChart');if(!chart||!window.echarts)return;if(st.edgeChart)st.edgeChart.dispose();st.edgeChart=echarts.init(chart);const rows=d.daily||[];
+  st.edgeChart.setOption({animation:false,grid:{left:50,right:55,top:28,bottom:38},tooltip:{trigger:'axis'},xAxis:{type:'category',data:rows.map(x=>x.date.slice(5)),axisLabel:{color:'#7e8a9f'},axisLine:{lineStyle:{color:'#354055'}}},yAxis:[{type:'value',axisLabel:{color:'#7e8a9f',formatter:'{value}%'},splitLine:{lineStyle:{color:'#283143'}}},{type:'value',axisLabel:{color:'#657188'},splitLine:{show:false}}],series:[{name:'5xx占比',type:'line',smooth:.2,data:rows.map(x=>x.requests?+(x.status_5xx/x.requests*100).toFixed(3):null),lineStyle:{width:2,color:'#e45b69'},itemStyle:{color:'#e45b69'}},{name:'请求量',type:'bar',yAxisIndex:1,data:rows.map(x=>x.requests),barMaxWidth:20,itemStyle:{color:'rgba(79,153,229,.28)'}}]});
+}
 
 async function loadReport(){
   if(st.drawer)closeDrawer();
@@ -128,8 +181,10 @@ function setOptions(id,rows,value,allLabel,val,label){const el=$(id);if(!el)retu
 
 function renderReport(){
   const d=st.report;if(!d)return;renderFilterOptions();renderSources(d.meta);const body=$('stDeliveryBody');if(!body)return;
-  if(!d.summary?.requests){if(st.chart){st.chart.dispose();st.chart=null}body.innerHTML=`<div class="stability-empty"><b>当前范围没有稳定性数据</b><p>可能是新功能刚开始积累数据、筛选范围没有流量，或本地小时汇总尚未生成。现有模型监控和用户用量不受影响。</p></div>`;return}
-  body.innerHTML=`
+  const cov=d.meta?.data_coverage||{};
+  const coverageWarning=cov.complete?'':`<div class="alert">当前日期范围的小时数据完整率为 ${(+cov.percent||0).toFixed(1)}%（${nfmt(cov.completed_hours)}/${nfmt(cov.expected_hours)} 小时）；缺失时段不会被当作零流量，稳定性和使用量可能偏差。</div>`;
+  if(!d.summary?.requests){if(st.chart){st.chart.dispose();st.chart=null}body.innerHTML=coverageWarning+`<div class="stability-empty"><b>当前范围没有稳定性数据</b><p>可能是所选范围确实没有流量，或上方完整率所示的历史小时尚未补齐。现有模型监控和用户用量不受影响。</p></div>`;return}
+  body.innerHTML=`${coverageWarning}
     <section class="stability-kpis" id="stKpis"></section>
     <section class="stability-panel"><div class="stability-panel-head"><div><h3>每日稳定性变化</h3><p>成功交付 / 真实用户请求；无请求日期断线，柱形为每日请求量</p></div><span class="muted">${esc(d.meta.from)} 至 ${esc(d.meta.to)}</span></div><div id="stTrend" class="stability-chart"></div></section>
     <section class="stability-panel"><div class="stability-panel-head"><div><h3>服务分组稳定性</h3><p>服务分组代表用户体验；展开查看实际承载渠道，未路由请求只计入分组</p></div><span class="muted">${nfmt(d.groups?.length||0)} 个有流量分组</span></div><div class="stability-group-head"><span>服务分组 / 渠道</span><span>区间稳定性 / 环比</span><span>时间窄条 · ${bucketLabel(d.meta.timeline_bucket_sec||3600)}</span><span>请求 / 占比</span><span>问题 / 问题率</span><span>渠道 / 操作</span></div><div id="stGroupList"></div></section>
@@ -144,11 +199,11 @@ function renderSources(meta){
   const problemLabel=problemPending?`积压 ${nfmt(problemPending)} 分钟`:problemCoverage?`至 ${dateTime(problemCoverage)}`:'积累中';
   el.innerHTML=`<span><i></i>${esc(meta?.from||'—')}～${esc(meta?.to||'—')}</span><span title="NewAPI 本地采样新鲜度"><i class="${s.newapi_last_ts?'ok':'wait'}"></i>NewAPI ${s.newapi_last_ts?age(s.newapi_data_age_sec):'无数据'}</span><span title="原始错误采集完整覆盖时间；存在积压时问题排行暂不包含未完成分钟"><i class="${problemState}"></i>错误 ${problemLabel}</span><span title="Nginx 旁路采集状态"><i class="${s.nginx_connected?'ok':'wait'}"></i>Nginx ${s.nginx_connected?'已接入':'未接入'}</span>`;
 }
-function renderKpis(d){const s=d.summary,p=d.previous;const k=$('stKpis');if(!k)return;k.innerHTML=[
+function renderKpis(d){const s=d.summary,p=d.previous,pc=d.meta?.comparison_coverage||{};const k=$('stKpis');if(!k)return;k.innerHTML=[
   ['区间稳定性',pct(s.stability),delta(d.delta_pp),health(s)],
   ['真实用户请求',nfmt(s.requests),`成功 ${nfmt(s.success)} · 问题 ${nfmt(s.problems)}`,''],
   ['问题请求',nfmt(s.problems),`异常 ${nfmt(s.anomaly)} · 错误 ${nfmt(s.failed)} · 未路由 ${nfmt(s.rejected)}`,s.problems?'bad':'good'],
-  ['上一周期',d.meta.comparison_available?pct(p.stability):'—',d.meta.comparison_available?`${nfmt(p.requests)} 次请求`:'历史数据不足','']
+  ['上一周期',d.meta.comparison_available?pct(p.stability):'—',d.meta.comparison_available?`${nfmt(p.requests)} 次请求`:`历史小时待补 ${nfmt(pc.missing_hours)} 个`,'']
 ].map(x=>`<article class="stability-kpi"><small>${x[0]}</small><b class="${x[3]||''}">${x[1]}</b><em>${x[2]}</em></article>`).join('')}
 function aggregateDaily(groups){const by={};for(const g of groups)for(const d of g.daily||[]){const v=by[d.date]||(by[d.date]={date:d.date,success:0,anomaly:0,failed:0,rejected:0,requests:0});v.success+=d.success||0;v.anomaly+=d.anomaly||0;v.failed+=d.failed||0;v.rejected+=d.rejected||0;v.requests+=d.requests||0}return Object.values(by).sort((a,b)=>a.date.localeCompare(b.date)).map(v=>({...v,stability:v.requests?v.success/v.requests*100:null}))}
 function renderTrend(groups){const el=$('stTrend');if(!el||!window.echarts)return;const rows=aggregateDaily(groups);if(st.chart)st.chart.dispose();st.chart=echarts.init(el);st.chart.setOption({animation:false,grid:{left:50,right:55,top:28,bottom:38},tooltip:{trigger:'axis',backgroundColor:'#151b27',borderColor:'#39445a',textStyle:{color:'#e5ebf5'},formatter:p=>{const r=rows[p[0]?.dataIndex];return r?`${esc(r.date)}<br>稳定性 ${pct(r.stability)}<br>请求 ${nfmt(r.requests)}<br>问题 ${nfmt(r.anomaly+r.failed+r.rejected)}`:''}},xAxis:{type:'category',data:rows.map(r=>r.date.slice(5)),axisLabel:{color:'#7e8a9f'},axisLine:{lineStyle:{color:'#354055'}}},yAxis:[{type:'value',min:v=>Math.max(0,Math.floor(v.min-2)),max:100,axisLabel:{color:'#7e8a9f',formatter:'{value}%'},splitLine:{lineStyle:{color:'#283143'}}},{type:'value',axisLabel:{color:'#657188'},splitLine:{show:false}}],series:[{name:'稳定性',type:'line',connectNulls:false,smooth:.25,symbol:'circle',symbolSize:5,data:rows.map(r=>r.stability==null?null:+r.stability.toFixed(3)),lineStyle:{width:2,color:'#8177ff'},itemStyle:{color:'#8177ff'},areaStyle:{color:'rgba(129,119,255,.08)'}},{name:'请求量',type:'bar',yAxisIndex:1,data:rows.map(r=>r.requests),barMaxWidth:20,itemStyle:{color:'rgba(79,153,229,.28)',borderRadius:[3,3,0,0]}}]})}
@@ -166,7 +221,7 @@ function renderRankings(){const r=st.report?.rankings||{};$('stUsageRank').inner
 function findEntity(groupName,channelID){const g=(st.report?.groups||[]).find(x=>x.name===groupName);if(!g)return null;if(channelID)return {kind:'channel',group:g,entity:(g.channels||[]).find(x=>x.id===channelID)};return {kind:'group',group:g,entity:g}}
 async function openDrawer(groupName,channelID){try{await ensureGroupDetail(groupName)}catch(error){if(error.name==='AbortError')return;alert(error.message||'详情加载失败');return}const found=findEntity(groupName,channelID);if(!found?.entity)return;st.lastFocus=document.activeElement;st.drawer=found;st.drawerTab='run';$('stDrawerMask')?.classList.add('open');$('stDrawer')?.classList.add('open');$('stDrawer')?.setAttribute('aria-hidden','false');document.body.style.overflow='hidden';renderDrawer();$('stDrawerClose')?.focus()}
 function closeDrawer(){if(st.drawerAbort){st.drawerAbort.abort();st.drawerAbort=null}st.drawer=null;$('stDrawerMask')?.classList.remove('open');$('stDrawer')?.classList.remove('open');$('stDrawer')?.setAttribute('aria-hidden','true');document.body.style.overflow='';if(st.drawerChart){st.drawerChart.dispose();st.drawerChart=null}if(st.lastFocus?.focus)st.lastFocus.focus();st.lastFocus=null}
-function renderDrawer(){if(!st.drawer)return;const x=st.drawer.entity;const title=st.drawer.kind==='channel'?`#${x.id} ${x.name}`:x.name;$('stDrawerTitle').textContent=title;$('stDrawerSubtitle').textContent=`${st.drawer.kind==='channel'?'上游渠道 · '+st.drawer.group.name:'服务分组'} · ${st.report.meta.from} 至 ${st.report.meta.to}`;document.querySelectorAll('[data-st-drawer-tab]').forEach(b=>b.classList.toggle('active',b.dataset.stDrawerTab===st.drawerTab));const body=$('stDrawerBody');if(st.drawerTab==='problems'){renderDrawerProblems();return}body.innerHTML=`<section class="stability-drawer-kpis"><div><small>区间稳定性</small><b>${pct(x.stability)}</b></div><div><small>真实用户请求</small><b>${nfmt(x.requests)}</b></div><div><small>问题请求</small><b>${nfmt(x.problems)}</b></div><div><small>环比变化</small><b class="${deltaClass(x.delta_pp)}">${x.delta_pp==null?'—':(x.delta_pp>=0?'+':'')+x.delta_pp.toFixed(2)+' pp'}</b></div></section><section class="stability-panel-head" style="border:1px solid #30394b;border-bottom:0;border-radius:10px 10px 0 0"><div><h3>每日稳定性曲线</h3><p>仅还原当前所选对象的每日事实</p></div></section><div id="stDrawerChart" class="stability-chart"></div><section class="stability-model-list"><div class="stability-panel-head"><div><h3>${st.drawer.kind==='group'?'模型表现':'承载模型'}</h3><p>按真实请求量排序</p></div></div>${(x.models||[]).map(m=>`<div class="stability-model-row"><b>${esc(m.name)}</b><span>${pct(m.stability)}</span><small>${nfmt(m.requests)} 请求</small><small>${nfmt(m.problems)} 问题</small></div>`).join('')||'<div class="stability-empty"><p>当前范围无模型数据</p></div>'}</section>`;renderDrawerChart(x.daily||[])}
+function renderDrawer(){if(!st.drawer)return;const x=st.drawer.entity;const title=st.drawer.kind==='channel'?`#${x.id} ${x.name}`:x.name;$('stDrawerTitle').textContent=title;$('stDrawerSubtitle').textContent=`${st.drawer.kind==='channel'?'上游渠道 · '+st.drawer.group.name:'服务分组'} · ${st.report.meta.from} 至 ${st.report.meta.to}`;document.querySelectorAll('[data-st-drawer-tab]').forEach(b=>b.classList.toggle('active',b.dataset.stDrawerTab===st.drawerTab));const body=$('stDrawerBody');if(st.drawerTab==='problems'){renderDrawerProblems();return}const nav={days:st.days,group:st.drawer.group.name};if(st.custom){nav.from=st.custom.from;nav.to=st.custom.to;delete nav.days}if(st.drawer.kind==='channel')nav.channel=x.id;const finance=st.drawer.kind==='channel'?`<div class="monitor-cross-actions"><button type="button" onclick="monitorOpenEncoded('channels','${encodeNav(nav)}')">查看使用与倍率配置 →</button></div>`:'';body.innerHTML=`${finance}<section class="stability-drawer-kpis"><div><small>区间稳定性</small><b>${pct(x.stability)}</b></div><div><small>真实用户请求</small><b>${nfmt(x.requests)}</b></div><div><small>问题请求</small><b>${nfmt(x.problems)}</b></div><div><small>环比变化</small><b class="${deltaClass(x.delta_pp)}">${x.delta_pp==null?'—':(x.delta_pp>=0?'+':'')+x.delta_pp.toFixed(2)+' pp'}</b></div></section><section class="stability-panel-head" style="border:1px solid #30394b;border-bottom:0;border-radius:10px 10px 0 0"><div><h3>每日稳定性曲线</h3><p>仅还原当前所选对象的每日事实</p></div></section><div id="stDrawerChart" class="stability-chart"></div><section class="stability-model-list"><div class="stability-panel-head"><div><h3>${st.drawer.kind==='group'?'模型表现':'承载模型'}</h3><p>按真实请求量排序</p></div></div>${(x.models||[]).map(m=>`<div class="stability-model-row"><b>${esc(m.name)}</b><span>${pct(m.stability)}</span><small>${nfmt(m.requests)} 请求</small><small>${nfmt(m.problems)} 问题</small></div>`).join('')||'<div class="stability-empty"><p>当前范围无模型数据</p></div>'}</section>`;renderDrawerChart(x.daily||[])}
 function renderDrawerChart(days){const el=$('stDrawerChart');if(!el||!window.echarts)return;if(st.drawerChart)st.drawerChart.dispose();st.drawerChart=echarts.init(el);st.drawerChart.setOption({animation:false,grid:{left:48,right:22,top:26,bottom:35},tooltip:{trigger:'axis'},xAxis:{type:'category',data:days.map(d=>d.date.slice(5)),axisLabel:{color:'#778399'},axisLine:{lineStyle:{color:'#354055'}}},yAxis:{type:'value',min:v=>Math.max(0,Math.floor(v.min-2)),max:100,axisLabel:{color:'#778399',formatter:'{value}%'},splitLine:{lineStyle:{color:'#283143'}}},series:[{type:'line',smooth:.25,connectNulls:false,data:days.map(d=>d.stability),lineStyle:{color:'#8177ff',width:2},itemStyle:{color:'#8177ff'},areaStyle:{color:'rgba(129,119,255,.08)'}}]})}
 async function renderDrawerProblems(){const body=$('stDrawerBody');if(!st.drawer)return;if(st.drawerAbort)st.drawerAbort.abort();st.drawerAbort=new AbortController();const current=st.drawer;loading(body,'正在读取该对象的原始错误分布…');const extra={group:current.group.name};if(current.kind==='channel')extra.channel=current.entity.id;try{const res=await fetch('/stability/problems?'+queryParams(extra),{headers:{Accept:'application/json'},signal:st.drawerAbort.signal});const d=await res.json();if(!res.ok)throw new Error(d.error||`HTTP ${res.status}`);if(st.drawer===current)body.innerHTML=problemTable(d,true)}catch(e){if(e.name!=='AbortError'&&st.drawer===current)errorBox(body,e.message)}}
 

@@ -3,6 +3,7 @@ package monitor
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"net/http"
@@ -446,12 +447,75 @@ func TestStabilityComparisonUsesSameClockTimeOnPreviousCalendarDay(t *testing.T)
 	if err := m.storeDB.Create(&rows).Error; err != nil {
 		t.Fatal(err)
 	}
+	states := make([]StabilityHourIngestState, 0, 12)
+	for hour := int64(0); hour < 12; hour++ {
+		states = append(states, StabilityHourIngestState{HourTs: day - 86400 + hour*3600, Status: "complete"})
+	}
+	if err := m.storeDB.Create(&states).Error; err != nil {
+		t.Fatal(err)
+	}
 	report, err := m.buildStabilityReport(context.Background(), stabilityScope{FromTs: day, ToTs: day + 12*3600}, day+12*3600)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !report.Meta.ComparisonAvailable || report.Previous.Requests != 100 || report.DeltaPP == nil || math.Abs(*report.DeltaPP-10) > 0.0001 {
+	if !report.Meta.ComparisonAvailable || !report.Meta.ComparisonCoverage.Complete || report.Previous.Requests != 100 || report.DeltaPP == nil || math.Abs(*report.DeltaPP-10) > 0.0001 {
 		t.Fatalf("calendar comparison=%+v delta=%v", report.Previous, report.DeltaPP)
+	}
+}
+
+func TestStabilityComparisonDoesNotPresentPartialPreviousPeriod(t *testing.T) {
+	m := newStabilityTestMonitor(t)
+	day := time.Date(2026, 8, 5, 0, 0, 0, 0, cstLocation).Unix()
+	if err := m.storeDB.Create(&StabilityHourSample{HourTs: day - 86400, ChannelID: 1, ModelName: "m", Grp: "g", Success: 100}).Error; err != nil {
+		t.Fatal(err)
+	}
+	report, err := m.buildStabilityReport(context.Background(), stabilityScope{FromTs: day, ToTs: day + 12*3600}, day+12*3600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Meta.ComparisonAvailable || report.Meta.ComparisonCoverage.Complete || report.Meta.ComparisonCoverage.MissingHours != 12 {
+		t.Fatalf("有部分历史行但无完整台账时不得展示环比: %+v", report.Meta)
+	}
+}
+
+func TestStabilityReadErrorSeparatesClientCancelTimeoutAndServerError(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	for _, tc := range []struct {
+		name string
+		err  error
+		want int
+	}{
+		{"client_cancel", context.Canceled, 499},
+		{"query_timeout", context.DeadlineExceeded, http.StatusGatewayTimeout},
+		{"server_error", errors.New("sqlite broken"), http.StatusInternalServerError},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(w)
+			writeStabilityReadError(c, tc.err)
+			if w.Code != tc.want {
+				t.Fatalf("status=%d want=%d body=%s", w.Code, tc.want, w.Body.String())
+			}
+		})
+	}
+}
+
+func TestStabilityEqualRequestRankingsAreDeterministic(t *testing.T) {
+	m := newStabilityTestMonitor(t)
+	day := time.Date(2026, 8, 5, 0, 0, 0, 0, cstLocation).Unix()
+	rows := []StabilityHourSample{
+		{HourTs: day, ChannelID: 2, ModelName: "z-model", Grp: "z-group", Success: 1},
+		{HourTs: day, ChannelID: 1, ModelName: "a-model", Grp: "a-group", Success: 1},
+	}
+	if err := m.storeDB.Create(&rows).Error; err != nil {
+		t.Fatal(err)
+	}
+	report, err := m.buildStabilityReport(context.Background(), stabilityScope{FromTs: day, ToTs: day + 3600}, day+3600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(report.Groups) != 2 || report.Groups[0].Name != "a-group" || report.Rankings.Models[0].Name != "a-model" || report.Rankings.Channels[0].ID != 1 {
+		t.Fatalf("同请求数排序必须有稳定次序: groups=%+v models=%+v channels=%+v", report.Groups, report.Rankings.Models, report.Rankings.Channels)
 	}
 }
 

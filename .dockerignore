@@ -3,7 +3,7 @@
 # Dockerfile 中的 "COPY . ." 进入 builder 或 BuildKit 缓存。
 **
 
-# Go 模块与两个生产二进制的源码。
+# Go 模块与三个生产二进制的源码。
 !go.mod
 !go.sum
 !main.go
@@ -22,6 +22,9 @@ cmd/**
 !cmd/hostagent/
 cmd/hostagent/**
 !cmd/hostagent/*.go
+!cmd/nginxcollector/
+cmd/nginxcollector/**
+!cmd/nginxcollector/*.go
 
 # 测试源码不参与生产镜像编译；CI 在宿主工作树中单独执行测试。
 **/*_test.go

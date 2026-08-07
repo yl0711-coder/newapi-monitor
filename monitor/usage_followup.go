@@ -5,12 +5,13 @@ package monitor
 // 跟进记录 / 看消费都是针对那个人。未分组的需跟进用户归到「未分组」桶。
 //
 // 边界同前:只对生产库多一条固定 30 天窗口的按需聚合(复用 computeUsageMatrix,走索引、串行闸),
-// 逐日消费 + 余额 + 公司状态(试用/正式)+ 阈值 在 Go 里算,全本地存储、不给生产库加常驻负担。
+// 逐日消费 + 余额 + 阈值 在 Go 里算,全本地存储、不给生产库加常驻负担。
 
 import (
 	"context"
 	"fmt"
 	"log/slog"
+	"math"
 	"net/http"
 	"sort"
 	"strconv"
@@ -40,8 +41,7 @@ type FollowUpMember struct {
 type FollowUpCompany struct {
 	GroupID        int64            `json:"group_id"` // 0 = 未分组
 	GroupName      string           `json:"group_name"`
-	Stage          string           `json:"stage"`
-	CompanyReasons []string         `json:"company_reasons"` // 公司级(试用到期 / 空分组)
+	CompanyReasons []string         `json:"company_reasons"` // 公司级(当前仅空分组)
 	Members        []FollowUpMember `json:"members"`         // 需跟进的成员(人)
 	Spend30USD     float64          `json:"spend_30d_usd"`   // 公司近30天合计(展示)
 	Urgency        int              `json:"urgency"`
@@ -50,9 +50,9 @@ type FollowUpCompany struct {
 const ungroupedName = "未分组"
 
 // classifyMember 单个用户的跟进判定(纯函数,便于单测):由按日消费算出 30 天合计/近7天/前7天/静默天数,
-// 按公司阶段(trial=试用/其余=正式)套阈值,产出 reasons/actions/urgency/level。
+// 对所有关注客户使用同一套客观阈值,产出 reasons/actions/urgency/level。
 // days 键为日序号(0=最早 … followUpWindowDays-1=今天);返回 (成员, 是否需要跟进)。
-func classifyMember(u TrackedUser, stage string, days map[int]float64, balance *float64, lastFollowUp int64, dateOfIdx []string, st UsageSettings) (FollowUpMember, bool) {
+func classifyMember(u TrackedUser, days map[int]float64, balance *float64, lastFollowUp int64, dateOfIdx []string, st UsageSettings) (FollowUpMember, bool) {
 	todayIdx := followUpWindowDays - 1
 	var spend30, last7, prev7 float64
 	lastActiveIdx := -1
@@ -80,23 +80,14 @@ func classifyMember(u TrackedUser, stage string, days map[int]float64, balance *
 		mem.Actions = append(mem.Actions, action)
 		mem.Urgency += urgency
 	}
-	if stage == "trial" {
-		if last7 < st.TrialLowUSD {
-			add(fmt.Sprintf("试用消耗低(近7天 %s)", fmtUSD2(last7)), "沟通:是不是用不起来/有问题", 30)
-		}
-		if last7 >= st.TrialHighUSD {
-			add(fmt.Sprintf("试用消耗高(近7天 %s)", fmtUSD2(last7)), "转化时机:确认付费/谈转正", 60)
-		}
-	} else {
-		if mem.DaysIdle >= st.DormantDays {
-			add(fmt.Sprintf("连续 %d 天无消费", mem.DaysIdle), "疑似流失:去沟通问原因", 50)
-		} else if prev7 > 0 && last7 < prev7*(1-float64(st.DropPct)/100) {
-			drop := int((1 - last7/prev7) * 100)
-			add(fmt.Sprintf("消费下滑(近7天降 %d%%)", drop), "关注、了解原因", 35)
-		}
-		if mem.BalanceUSD != nil && *mem.BalanceUSD < st.LowBalanceUSD {
-			add(fmt.Sprintf("余额低(%s)", fmtUSD2(*mem.BalanceUSD)), "催充值,避免断服流失", 45)
-		}
+	if mem.DaysIdle >= st.DormantDays {
+		add(fmt.Sprintf("连续 %d 天无消费", mem.DaysIdle), "疑似流失:去沟通问原因", 50)
+	} else if prev7 > 0 && last7 < prev7*(1-float64(st.DropPct)/100) {
+		drop := int((1 - last7/prev7) * 100)
+		add(fmt.Sprintf("消费下滑(近7天降 %d%%)", drop), "关注、了解原因", 35)
+	}
+	if mem.BalanceUSD != nil && *mem.BalanceUSD < st.LowBalanceUSD {
+		add(fmt.Sprintf("余额低(%s)", fmtUSD2(*mem.BalanceUSD)), "催充值,避免断服流失", 45)
 	}
 	if len(mem.Reasons) == 0 {
 		return mem, false
@@ -191,33 +182,22 @@ func (m *Monitor) computeFollowUps(ctx context.Context, nowUnix int64) ([]Follow
 			return b
 		}
 		name := ungroupedName
-		stage := "active"
 		if g, ok := groupByID[gid]; ok {
 			name = g.Name
-			if g.Stage != "" {
-				stage = g.Stage
-			}
 		}
-		b := &bucket{comp: &FollowUpCompany{GroupID: gid, GroupName: name, Stage: stage}}
+		b := &bucket{comp: &FollowUpCompany{GroupID: gid, GroupName: name}}
 		buckets[gid] = b
 		return b
 	}
 
 	// 逐用户判定(具体规则在 classifyMember)
 	for _, u := range tracked {
-		stage := "active"
-		if g, ok := groupByID[u.GroupID]; ok && g.Stage != "" {
-			stage = g.Stage
-		}
-		if stage == "churned" { // 已流失公司:不再提醒其成员
-			continue
-		}
 		var balance *float64
 		if b, ok := balances[u.UserID]; ok {
 			bv := float64(b) / quotaPerUSD
 			balance = &bv
 		}
-		mem, need := classifyMember(u, stage, spendByUserDay[u.UserID], balance, lastFollow[u.UserID], dateOfIdx, st)
+		mem, need := classifyMember(u, spendByUserDay[u.UserID], balance, lastFollow[u.UserID], dateOfIdx, st)
 		if !need {
 			continue
 		}
@@ -226,26 +206,12 @@ func (m *Monitor) computeFollowUps(ctx context.Context, nowUnix int64) ([]Follow
 		b.comp.Spend30USD += mem.Spend30USD
 	}
 
-	// 公司级信号:试用到期临近 / 空分组
+	// 公司级信号:空分组。
 	for _, g := range groups {
-		if g.Stage == "churned" {
-			continue
-		}
 		var count int64
 		m.storeDB.Model(&TrackedUser{}).Where("group_id = ?", g.ID).Count(&count)
 		if count == 0 {
 			getBucket(g.ID).comp.CompanyReasons = append(getBucket(g.ID).comp.CompanyReasons, "分组内没有用户(把该公司的用户加进来)")
-		}
-		if g.Stage == "trial" && g.TrialEnd > 0 {
-			daysLeft := int((g.TrialEnd - nowUnix) / 86400)
-			if daysLeft <= st.TrialExpiryDays {
-				b := getBucket(g.ID)
-				if daysLeft < 0 {
-					b.comp.CompanyReasons = append(b.comp.CompanyReasons, "试用已到期(尽快转正或收回额度)")
-				} else {
-					b.comp.CompanyReasons = append(b.comp.CompanyReasons, fmt.Sprintf("试用还剩 %d 天到期", daysLeft))
-				}
-			}
 		}
 	}
 
@@ -351,33 +317,6 @@ func (m *Monitor) addFollowLog(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"ok": true, "log": lg})
 }
 
-// setGroupStage POST /usage/groups/stage(仅超管):{id, stage, trial_end}。
-func (m *Monitor) setGroupStage(c *gin.Context) {
-	var in struct {
-		ID       int64  `json:"id"`
-		Stage    string `json:"stage"`
-		TrialEnd int64  `json:"trial_end"`
-	}
-	if err := c.ShouldBindJSON(&in); err != nil || in.ID <= 0 {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "id required"})
-		return
-	}
-	if in.Stage != "trial" && in.Stage != "active" && in.Stage != "churned" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "stage 非法"})
-		return
-	}
-	upd := map[string]any{"stage": in.Stage, "trial_end": in.TrialEnd}
-	if in.Stage != "trial" {
-		upd["trial_end"] = 0
-	}
-	res := m.storeDB.Model(&CustomerGroup{}).Where("id = ?", in.ID).Updates(upd)
-	if res.Error != nil || res.RowsAffected == 0 {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "分组不存在"})
-		return
-	}
-	c.JSON(http.StatusOK, gin.H{"ok": true})
-}
-
 // getUsageSettings GET /usage/settings(管理员)。
 func (m *Monitor) getUsageSettings(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"settings": m.loadUsageSettings()})
@@ -390,8 +329,13 @@ func (m *Monitor) saveUsageSettings(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	in.ID = 1
-	if err := m.storeDB.Save(&in).Error; err != nil {
+	if in.DormantDays <= 0 || in.DropPct <= 0 || in.DropPct >= 100 || in.LowBalanceUSD <= 0 || math.IsNaN(in.LowBalanceUSD) || math.IsInf(in.LowBalanceUSD, 0) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "跟进阈值无效"})
+		return
+	}
+	// 只更新仍在使用的三项，保留旧库兼容列且不再让客户端改写它们。
+	values := map[string]any{"dormant_days": in.DormantDays, "drop_pct": in.DropPct, "low_balance_usd": in.LowBalanceUSD}
+	if err := m.storeDB.Model(&UsageSettings{}).Where("id = ?", 1).Assign(values).FirstOrCreate(&UsageSettings{ID: 1}).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}

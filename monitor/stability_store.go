@@ -13,8 +13,9 @@ import (
 
 // StabilityHourSample 是历史稳定性报表自己的长期维度汇总。
 //
-// 它只由本地 metric_samples 滚动生成，不新增生产库查询；页面也只读这张
-// Monitor 本地 SQLite 表。复合主键保证重复汇总是覆盖而不是累加。
+// 它由两条互不并发覆盖的路径生成：近期小时从本地 metric_samples 滚动汇总，
+// 长期缺口由限速补数任务按单小时只读生产 logs 后写入。页面始终只读 Monitor
+// 本地 SQLite；复合主键和小时完整性台账保证重复补数是完整替换而不是累加。
 type StabilityHourSample struct {
 	HourTs        int64  `gorm:"primaryKey;autoIncrement:false;index:idx_stability_hour;index:idx_stability_group_hour,priority:2;index:idx_stability_channel_hour,priority:2;index:idx_stability_model_hour,priority:2"`
 	ChannelID     int    `gorm:"primaryKey;autoIncrement:false;index:idx_stability_channel_hour,priority:1"`
@@ -139,6 +140,10 @@ func (m *Monitor) rollupStabilityHours(sinceTs int64) error {
 		  SUM(sum_use_time), MAX(max_use_time), SUM(tokens), SUM(quota),
 		  SUM(err_4xx), SUM(err_5xx), SUM(err_timeout), SUM(err_other)
 		FROM metric_samples WHERE bucket_ts >= ?
+		  AND NOT EXISTS (
+		    SELECT 1 FROM stability_hour_ingest_states hs
+		    WHERE hs.hour_ts=(metric_samples.bucket_ts/3600)*3600 AND hs.status='complete'
+		  )
 		GROUP BY hour_ts, channel_id, model_name, grp
 		ON CONFLICT(hour_ts, channel_id, model_name, grp) DO UPDATE SET
 		  success=excluded.success, anomaly=excluded.anomaly, failed=excluded.failed,
@@ -206,6 +211,14 @@ func (m *Monitor) pruneStabilityOlderThan(cutoffTs int64) error {
 	}
 	if err := m.storeDB.Where("bucket_ts < ?", cutoffTs).Delete(&StabilityProblemIngestState{}).Error; err != nil {
 		return fmt.Errorf("清理稳定性问题采集状态: %w", err)
+	}
+	if err := m.storeDB.Where("hour_ts < ?", cutoffTs).Delete(&StabilityHourIngestState{}).Error; err != nil {
+		return fmt.Errorf("清理稳定性小时覆盖状态: %w", err)
+	}
+	// 补数任务只保留审计摘要，不随小时明细无限增长。正在执行/等待续跑的任务不能删。
+	jobCutoff := cutoffTs - 30*86400
+	if err := m.storeDB.Where("updated_at < ? AND status IN ?", jobCutoff, []string{"complete", "paused"}).Delete(&StabilityBackfillJob{}).Error; err != nil {
+		return fmt.Errorf("清理稳定性补数任务: %w", err)
 	}
 	return nil
 }

@@ -21,8 +21,8 @@ func TestChannelGroupFinanceFormulaAndIncompleteState(t *testing.T) {
 		settings:        ChannelFinanceSetting{FXBenchmark: 7, SiteRechargePaid: 1, SiteRechargeCredit: 1},
 		hasSettings:     true,
 		siteGroups:      map[string]ChannelSaleGroupRate{"codex-1.3x": {Grp: "codex-1.3x", Multiplier: 1.3}},
-		domainCosts:     map[string]ChannelDomainCost{"last-api.ai": {Domain: "last-api.ai", RechargePaid: 0.8, RechargeCredit: 1}},
-		domainGroupCost: map[string]map[string]ChannelDomainGroupCost{"last-api.ai": {"codex-1.3x": {Domain: "last-api.ai", Grp: "codex-1.3x", Multiplier: 1}}},
+		domainCosts:     map[string]ChannelDomainCost{"last-api.ai": {Domain: "last-api.ai", RechargePaid: 1, RechargeCredit: 2}},
+		domainGroupCost: map[string]map[string]ChannelDomainGroupCost{"last-api.ai": {"codex-1.3x": {Domain: "last-api.ai", Grp: "codex-1.3x", Multiplier: 2, DiscountFactor: 0.8}}},
 	}
 	got := snapshot.groupView("last-api.ai", "codex-1.3x")
 	if !got.Complete {
@@ -37,8 +37,8 @@ func TestChannelGroupFinanceFormulaAndIncompleteState(t *testing.T) {
 	if math.Abs(got.EstimatedMargin-(1-0.8/1.3)) > 1e-12 {
 		t.Fatalf("margin=%v want %v", got.EstimatedMargin, 1-0.8/1.3)
 	}
-	if math.Abs(got.MultiplierGap-0.3) > 1e-12 {
-		t.Fatalf("multiplier gap=%v want %v", got.MultiplierGap, 0.3)
+	if math.Abs(got.UpstreamEffectiveMultiplier-0.8) > 1e-12 || math.Abs(got.MultiplierGap-0.5) > 1e-12 {
+		t.Fatalf("effective multiplier/gap incorrect: %+v", got)
 	}
 
 	missing := snapshot.groupView("last-api.ai", "unconfigured")
@@ -49,7 +49,7 @@ func TestChannelGroupFinanceFormulaAndIncompleteState(t *testing.T) {
 	multiplierOnly := snapshot
 	multiplierOnly.hasSettings = false
 	got = multiplierOnly.groupView("last-api.ai", "codex-1.3x")
-	if got.Complete || math.Abs(got.MultiplierGap-0.3) > 1e-12 {
+	if got.Complete || math.Abs(got.MultiplierGap-0.5) > 1e-12 {
 		t.Fatalf("multiplier gap must remain available before discount inputs are complete: %+v", got)
 	}
 }
@@ -75,7 +75,7 @@ func TestValidateChannelFinanceInputRejectsPartialAndInvalidValues(t *testing.T)
 	valid := channelFinanceSaveInput{
 		Domain: "last-api.ai", FXBenchmark: 7, SiteRechargePaid: 1, SiteRechargeCredit: 1,
 		UpstreamRechargePaid: 1, UpstreamRechargeCredit: 1,
-		Groups: []channelFinanceGroupInput{{Group: "codex", SiteMultiplier: financeFloatPtr(1.3), UpstreamMultiplier: financeFloatPtr(1)}},
+		Groups: []channelFinanceGroupInput{{Group: "codex", SiteMultiplier: financeFloatPtr(1.3), UpstreamMultiplier: financeFloatPtr(1), UpstreamDiscountFactor: financeFloatPtr(0.8)}},
 	}
 	if err := validateChannelFinanceInput(&valid); err != nil {
 		t.Fatalf("valid input: %v", err)
@@ -120,6 +120,21 @@ func TestMigrateLegacyChannelFinanceSnapshotsToPerDomainVersions(t *testing.T) {
 	}
 }
 
+func TestNormalizeLegacyChannelFinanceVersionDefaultsDiscountFactor(t *testing.T) {
+	raw := `{"domain":"legacy.example","fx_benchmark":7,"site_recharge_paid":1,"site_recharge_credit":1,"upstream_recharge_paid":1,"upstream_recharge_credit":1,"groups":[{"group":"codex","site_multiplier":1.3,"upstream_multiplier":0.8}]}`
+	normalized, err := normalizeChannelFinanceVersionJSON(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var snapshot channelFinanceVersionSnapshot
+	if err := json.Unmarshal([]byte(normalized), &snapshot); err != nil {
+		t.Fatal(err)
+	}
+	if len(snapshot.Groups) != 1 || snapshot.Groups[0].UpstreamDiscountFactor != 1 {
+		t.Fatalf("legacy factor must default to 1 without changing historical cost: %+v", snapshot.Groups)
+	}
+}
+
 func TestMigrateLegacyChannelFinanceVersionsDoesNotSkipOtherDomains(t *testing.T) {
 	m := newStabilityTestMonitor(t)
 	if err := m.storeDB.AutoMigrate(&ChannelFinanceAudit{}); err != nil {
@@ -158,7 +173,7 @@ func TestChannelFinanceRouteCreatesImmutableVersionsAndRequiresConfirmation(t *t
 	payload := channelFinanceSaveInput{
 		Domain: "last-api.ai", FXBenchmark: 7, SiteRechargePaid: 1, SiteRechargeCredit: 1,
 		UpstreamRechargePaid: 0.8, UpstreamRechargeCredit: 1,
-		Groups: []channelFinanceGroupInput{{Group: "codex-1.3x", SiteMultiplier: financeFloatPtr(1.3), UpstreamMultiplier: financeFloatPtr(1)}},
+		Groups: []channelFinanceGroupInput{{Group: "codex-1.3x", SiteMultiplier: financeFloatPtr(1.3), UpstreamMultiplier: financeFloatPtr(1), UpstreamDiscountFactor: financeFloatPtr(1)}},
 	}
 	request := func(role int, input channelFinanceSaveInput) *httptest.ResponseRecorder {
 		body, err := json.Marshal(input)
@@ -186,7 +201,7 @@ func TestChannelFinanceRouteCreatesImmutableVersionsAndRequiresConfirmation(t *t
 		t.Fatal(err)
 	}
 	got := snapshot.groupView("last-api.ai", "codex-1.3x")
-	if !got.Complete || math.Abs(got.EstimatedMargin-(1-0.8/1.3)) > 1e-12 {
+	if !got.Complete || got.UpstreamDiscountFactor != 1 || math.Abs(got.UpstreamEffectiveMultiplier-0.8) > 1e-12 || math.Abs(got.EstimatedMargin-(1-0.8/1.3)) > 1e-12 {
 		t.Fatalf("stored finance=%+v", got)
 	}
 	if view := snapshot.domainView("last-api.ai"); view.Version != 1 || view.EffectiveAt <= 0 {
@@ -202,7 +217,7 @@ func TestChannelFinanceRouteCreatesImmutableVersionsAndRequiresConfirmation(t *t
 	}
 
 	updated := payload
-	updated.Groups = []channelFinanceGroupInput{{Group: "codex-1.3x", SiteMultiplier: financeFloatPtr(1.3), UpstreamMultiplier: financeFloatPtr(1.1)}}
+	updated.Groups = []channelFinanceGroupInput{{Group: "codex-1.3x", SiteMultiplier: financeFloatPtr(1.3), UpstreamMultiplier: financeFloatPtr(1.1), UpstreamDiscountFactor: financeFloatPtr(1)}}
 	if w := request(roleRoot, updated); w.Code != http.StatusConflict || !strings.Contains(w.Body.String(), `"confirmation_required":true`) {
 		t.Fatalf("update without confirmation status=%d body=%s", w.Code, w.Body.String())
 	}
@@ -230,7 +245,7 @@ func TestChannelFinanceRouteCreatesImmutableVersionsAndRequiresConfirmation(t *t
 	}
 
 	stale := updated
-	stale.Groups = []channelFinanceGroupInput{{Group: "codex-1.3x", SiteMultiplier: financeFloatPtr(1.3), UpstreamMultiplier: financeFloatPtr(1.2)}}
+	stale.Groups = []channelFinanceGroupInput{{Group: "codex-1.3x", SiteMultiplier: financeFloatPtr(1.3), UpstreamMultiplier: financeFloatPtr(1.2), UpstreamDiscountFactor: financeFloatPtr(1)}}
 	stale.ExpectedVersion = 1
 	if w := request(roleRoot, stale); w.Code != http.StatusConflict || !strings.Contains(w.Body.String(), `"version_conflict":true`) {
 		t.Fatalf("stale update status=%d body=%s", w.Code, w.Body.String())
@@ -265,7 +280,7 @@ func TestGlobalFinanceChangeVersionsEveryAffectedDomain(t *testing.T) {
 		return channelFinanceSaveInput{
 			Domain: domain, FXBenchmark: 7, SiteRechargePaid: 1, SiteRechargeCredit: 1,
 			UpstreamRechargePaid: upstream, UpstreamRechargeCredit: 1,
-			Groups: []channelFinanceGroupInput{{Group: "codex", SiteMultiplier: financeFloatPtr(1.3), UpstreamMultiplier: financeFloatPtr(1)}},
+			Groups: []channelFinanceGroupInput{{Group: "codex", SiteMultiplier: financeFloatPtr(1.3), UpstreamMultiplier: financeFloatPtr(1), UpstreamDiscountFactor: financeFloatPtr(1)}},
 		}
 	}
 	if w := request(base("a.example", 0.8)); w.Code != http.StatusOK {
@@ -349,7 +364,7 @@ func TestFirstDomainVersionRejectsStaleGlobalConfirmation(t *testing.T) {
 		return channelFinanceSaveInput{
 			Domain: domain, FXBenchmark: fx, SiteRechargePaid: 1, SiteRechargeCredit: 1,
 			UpstreamRechargePaid: 1, UpstreamRechargeCredit: 1,
-			Groups: []channelFinanceGroupInput{{Group: "codex", SiteMultiplier: financeFloatPtr(1.3), UpstreamMultiplier: financeFloatPtr(1)}},
+			Groups: []channelFinanceGroupInput{{Group: "codex", SiteMultiplier: financeFloatPtr(1.3), UpstreamMultiplier: financeFloatPtr(1), UpstreamDiscountFactor: financeFloatPtr(1)}},
 		}
 	}
 	if w := request(input("a.example", 7)); w.Code != http.StatusOK {

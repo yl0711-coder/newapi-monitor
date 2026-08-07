@@ -1,0 +1,29 @@
+# Nginx 旁路采集器模板。默认不会随 Monitor 启动；必须在每个 Nginx 节点单独部署。
+# Nginx 需把专用脱敏 JSON access log 以只读方式挂载到 /logs。
+services:
+  nginxcollector:
+    image: ghcr.io/yl0711-coder/newapi-monitor-nginxcollector:${NGINXCOLLECTOR_TAG:-latest}
+    container_name: nexusapi-nginxcollector
+    restart: unless-stopped
+    environment:
+      NGINXCOLLECTOR_NODE: ${NGINXCOLLECTOR_NODE:?set NGINXCOLLECTOR_NODE}
+      NGINXCOLLECTOR_SINK_URL: ${NGINXCOLLECTOR_SINK_URL:?set NGINXCOLLECTOR_SINK_URL}
+      NGINXCOLLECTOR_TOKEN: ${NGINXCOLLECTOR_TOKEN:?set NGINXCOLLECTOR_TOKEN}
+      NGINXCOLLECTOR_LOG_PATH: /logs/nexusapi_access.jsonl
+      NGINXCOLLECTOR_CURSOR_PATH: /data/cursor.json
+      NGINXCOLLECTOR_INTERVAL_SECONDS: "5"
+      NGINXCOLLECTOR_MAX_LINES: "1000"
+    volumes:
+      - ${NGINXCOLLECTOR_LOG_DIR:?set NGINXCOLLECTOR_LOG_DIR}:/logs:ro
+      - nginxcollector-data:/data
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    mem_limit: 64m
+
+volumes:
+  nginxcollector-data:

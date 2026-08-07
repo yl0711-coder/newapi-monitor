@@ -1337,14 +1337,14 @@ func TestComputeFollowUps(t *testing.T) {
 	now := time.Date(2026, 7, 9, 12, 0, 0, 0, usageCST).Unix()
 	dayTs := func(y int, mo time.Month, d int) int64 { return time.Date(y, mo, d, 10, 0, 0, 0, usageCST).Unix() }
 
-	// 三个客户:
-	// g1 正式,成员1,连续无消费(最后消费在30天前边界外)+ 低余额 → 命中"流失"+"低余额"
-	// g2 试用,成员2,近7天消费高($25)→ 命中"转化时机"
-	// g3 正式,成员3,近期正常消费、余额充足 → 不命中(不上榜)
+	// 三个客户。Stage 保留旧值用于验证新版判断完全忽略客户状态：
+	// g1 成员连续无消费(最后消费在30天前边界外)+低余额 → 命中"流失"+"低余额"
+	// g2 近期高消费、余额充足 → 不因旧 trial 值产生任何额外提醒
+	// g3 近期正常消费、余额充足 → 不命中(不上榜)
 	for _, g := range []CustomerGroup{
-		{ID: 1, Name: "沉睡正式", Stage: "active", CreatedAt: 1},
-		{ID: 2, Name: "活跃试用", Stage: "trial", TrialEnd: now + 20*86400, CreatedAt: 2},
-		{ID: 3, Name: "健康正式", Stage: "active", CreatedAt: 3},
+		{ID: 1, Name: "沉睡客户", Stage: "active", CreatedAt: 1},
+		{ID: 2, Name: "活跃客户", Stage: "trial", TrialEnd: now + 20*86400, CreatedAt: 2},
+		{ID: 3, Name: "健康客户", Stage: "active", CreatedAt: 3},
 	} {
 		gg := g
 		if err := m.storeDB.Create(&gg).Error; err != nil {
@@ -1375,7 +1375,7 @@ func TestComputeFollowUps(t *testing.T) {
 	}
 	// g1(uid1):只有 40 天前有消费 → 30天窗口内全无 → 流失
 	ins(1, now-40*86400, 100000)
-	// g2(uid2/3):试用期两人近7天各自消费都高(各 >= $20 阈值)→ 各命中转化时机
+	// g2(uid2/3):近7天消费高且余额充足，应视为正常。
 	ins(2, dayTs(2026, 7, 8), 12500000) // $25
 	ins(3, dayTs(2026, 7, 7), 11000000) // $22
 	// g3(uid4):近期天天有,余额高 → 不命中
@@ -1390,29 +1390,24 @@ func TestComputeFollowUps(t *testing.T) {
 	for _, co := range items {
 		byName[co.GroupName] = co
 	}
-	// 健康正式:成员消费正常,不该上榜
-	if _, ok := byName["健康正式"]; ok {
+	// 健康客户:成员消费正常,不该上榜
+	if _, ok := byName["健康客户"]; ok {
 		t.Fatalf("健康客户不该进待跟进: %+v", items)
 	}
-	// 沉睡正式:成员(uid1)命中 流失 + 低余额
-	g1 := byName["沉睡正式"]
+	// 沉睡客户:成员(uid1)命中 流失 + 低余额
+	g1 := byName["沉睡客户"]
 	if g1.GroupID != 1 || len(g1.Members) != 1 || g1.Members[0].UserID != 1 {
-		t.Fatalf("沉睡正式应有1个需跟进成员uid1: %+v", g1)
+		t.Fatalf("沉睡客户应有1个需跟进成员uid1: %+v", g1)
 	}
 	joined := strings.Join(g1.Members[0].Reasons, ";")
 	if !strings.Contains(joined, "无消费") || !strings.Contains(joined, "余额低") {
 		t.Fatalf("g1成员原因 = %v", g1.Members[0].Reasons)
 	}
-	// 活跃试用:两个成员都消费高(各命中转化时机)
-	g2 := byName["活跃试用"]
-	if len(g2.Members) != 2 {
-		t.Fatalf("活跃试用应有2个成员: %+v", g2)
+	// 旧 trial 状态不能再改变判断结果。
+	if _, ok := byName["活跃客户"]; ok {
+		t.Fatalf("活跃客户不应因旧状态进入待跟进: %+v", items)
 	}
-	if !strings.Contains(strings.Join(g2.Members[0].Reasons, ";"), "试用消耗高") {
-		t.Fatalf("g2成员原因 = %v", g2.Members[0].Reasons)
-	}
-	// member_total 汇总口径
-	if s := m.loadUsageSettings(); s.DormantDays != 7 || s.TrialHighUSD != 20 {
+	if s := m.loadUsageSettings(); s.DormantDays != 7 || s.DropPct != 50 || s.LowBalanceUSD != 5 {
 		t.Fatalf("默认阈值 = %+v", s)
 	}
 	if got := m.usageCache.fills.Load(); got != 1 {

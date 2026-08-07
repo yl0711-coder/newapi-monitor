@@ -17,6 +17,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -25,14 +26,15 @@ import (
 )
 
 type config struct {
-	sinkURL  string
-	token    string
-	node     string
-	interval time.Duration
-	procPath string // 宿主 /proc 路径(容器内挂载,默认 /proc)
-	rootfs   string // 统计磁盘用量的挂载点(默认 /)
-	dockSock string // docker.sock 路径;空=不采容器
-	insecure bool   // 跳过 TLS 校验(私网自签场景)
+	sinkURL        string
+	token          string
+	node           string
+	interval       time.Duration
+	procPath       string   // 宿主 /proc 路径(容器内挂载,默认 /proc)
+	rootfs         string   // 统计磁盘用量的挂载点(默认 /)
+	dockSock       string   // docker.sock 路径;空=不采容器
+	containerAllow []string // 仅这些容器上报明细；总数仍统计全部容器
+	insecure       bool     // 跳过 TLS 校验(私网自签场景)
 }
 
 func loadConfig() config {
@@ -46,19 +48,33 @@ func loadConfig() config {
 		dockSock = v
 	}
 	c := config{
-		sinkURL:  os.Getenv("HOSTAGENT_SINK_URL"),
-		token:    os.Getenv("HOSTAGENT_TOKEN"),
-		node:     os.Getenv("HOSTAGENT_NODE"),
-		interval: time.Duration(envInt("HOSTAGENT_INTERVAL_SECONDS", 60)) * time.Second,
-		procPath: envStr("HOSTAGENT_PROC", "/proc"),
-		rootfs:   rootfs,
-		dockSock: dockSock,
-		insecure: os.Getenv("HOSTAGENT_INSECURE") == "true",
+		sinkURL:        os.Getenv("HOSTAGENT_SINK_URL"),
+		token:          os.Getenv("HOSTAGENT_TOKEN"),
+		node:           os.Getenv("HOSTAGENT_NODE"),
+		interval:       time.Duration(envInt("HOSTAGENT_INTERVAL_SECONDS", 60)) * time.Second,
+		procPath:       envStr("HOSTAGENT_PROC", "/proc"),
+		rootfs:         rootfs,
+		dockSock:       dockSock,
+		containerAllow: envCSV("HOSTAGENT_CONTAINER_ALLOWLIST"),
+		insecure:       os.Getenv("HOSTAGENT_INSECURE") == "true",
 	}
 	if c.interval < 10*time.Second {
 		c.interval = 10 * time.Second
 	}
 	return c
+}
+
+func envCSV(k string) []string {
+	var out []string
+	seen := map[string]bool{}
+	for _, item := range strings.Split(os.Getenv(k), ",") {
+		item = strings.TrimPrefix(strings.TrimSpace(item), "/")
+		if item != "" && !seen[item] {
+			seen[item] = true
+			out = append(out, item)
+		}
+	}
+	return out
 }
 
 func envStr(k, def string) string {
@@ -90,7 +106,19 @@ type sample struct {
 	Load15          *float64 `json:"load15,omitempty"`
 	ContainersUp    *float64 `json:"containers_up,omitempty"`
 	ContainersTotal *float64 `json:"containers_total,omitempty"`
-	Ts              int64    `json:"ts"`
+	// 不使用 omitempty：docker.sock 可用且白名单为空时必须发送 []，让接收端
+	// 明确清除旧快照；未启用/采集失败时 nil 编码为 null，接收端继续保留旧快照。
+	Containers []containerStatus `json:"containers"`
+	Ts         int64             `json:"ts"`
+}
+
+// containerStatus 只包含运维判断所需的安全字段；不采集镜像环境变量、命令、
+// 挂载、标签、网络或日志，避免 docker.sock 的高权限信息被带出主机。
+type containerStatus struct {
+	Name         string `json:"name"`
+	State        string `json:"state"`
+	Health       string `json:"health,omitempty"`
+	RestartCount int    `json:"restart_count"`
 }
 
 func fp(v float64) *float64 { return &v }
@@ -149,8 +177,9 @@ func collect(c config) sample {
 		}
 	}
 	if c.dockSock != "" {
-		if up, total, err := dockerCounts(c.dockSock); err == nil {
+		if up, total, details, err := dockerSnapshot(c.dockSock, c.containerAllow); err == nil {
 			s.ContainersUp, s.ContainersTotal = fp(float64(up)), fp(float64(total))
+			s.Containers = details
 		} else {
 			log.Printf("hostagent: 采集容器数失败(本项不上报): %v", err)
 		}
@@ -213,37 +242,76 @@ func diskUsedPct(path string) (float64, error) {
 	return used / denom * 100, nil
 }
 
-// dockerCounts 经 docker.sock 取运行中 / 全部容器数。
-func dockerCounts(sock string) (up, total int, err error) {
+// dockerSnapshot 经 docker.sock 一次读取全部容器以统计总数，并且只对显式白名单
+// 做 inspect。白名单里已不存在的容器也会上报 missing，避免“消失=看起来正常”。
+func dockerSnapshot(sock string, allow []string) (up, total int, details []containerStatus, err error) {
 	cl := &http.Client{
 		Timeout: 5 * time.Second,
 		Transport: &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 			return (&net.Dialer{}).DialContext(ctx, "unix", sock)
 		}},
 	}
-	count := func(all bool) (int, error) {
-		url := "http://unix/containers/json"
-		if all {
-			url += "?all=1"
-		}
-		resp, e := cl.Get(url)
-		if e != nil {
-			return 0, e
-		}
-		defer resp.Body.Close()
-		var arr []struct{}
-		if e := json.NewDecoder(resp.Body).Decode(&arr); e != nil {
-			return 0, e
-		}
-		return len(arr), nil
+	resp, err := cl.Get("http://unix/containers/json?all=1")
+	if err != nil {
+		return 0, 0, nil, err
 	}
-	if up, err = count(false); err != nil {
-		return 0, 0, err
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return 0, 0, nil, &httpErr{resp.StatusCode}
 	}
-	if total, err = count(true); err != nil {
-		return 0, 0, err
+	var rows []struct {
+		ID    string   `json:"Id"`
+		Names []string `json:"Names"`
+		State string   `json:"State"`
 	}
-	return up, total, nil
+	if err := json.NewDecoder(resp.Body).Decode(&rows); err != nil {
+		return 0, 0, nil, err
+	}
+	details = make([]containerStatus, 0, len(allow))
+	byName := map[string]struct{ ID, State string }{}
+	for _, row := range rows {
+		total++
+		if row.State == "running" {
+			up++
+		}
+		for _, name := range row.Names {
+			byName[strings.TrimPrefix(name, "/")] = struct{ ID, State string }{row.ID, row.State}
+		}
+	}
+	for _, name := range allow {
+		item := containerStatus{Name: name, State: "missing"}
+		row, ok := byName[name]
+		if !ok {
+			details = append(details, item)
+			continue
+		}
+		item.State = row.State
+		inspect, inspectErr := cl.Get("http://unix/containers/" + url.PathEscape(row.ID) + "/json")
+		if inspectErr == nil {
+			var body struct {
+				RestartCount int `json:"RestartCount"`
+				State        struct {
+					Status string `json:"Status"`
+					Health *struct {
+						Status string `json:"Status"`
+					} `json:"Health"`
+				} `json:"State"`
+			}
+			if inspect.StatusCode == http.StatusOK && json.NewDecoder(inspect.Body).Decode(&body) == nil {
+				item.State, item.RestartCount = body.State.Status, body.RestartCount
+				if body.State.Health != nil {
+					item.Health = body.State.Health.Status
+				}
+			} else {
+				item.Health = "unknown"
+			}
+			inspect.Body.Close()
+		} else {
+			item.Health = "unknown"
+		}
+		details = append(details, item)
+	}
+	return up, total, details, nil
 }
 
 func newClient(c config) *http.Client {

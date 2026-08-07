@@ -80,14 +80,15 @@ type ChannelManagementSummary struct {
 }
 
 type ChannelManagementMeta struct {
-	From                   string `json:"from"`
-	To                     string `json:"to"`
-	GeneratedAt            int64  `json:"generated_at"`
-	DataUntil              int64  `json:"data_until"`
-	LatestDataUntil        int64  `json:"latest_data_until"`
-	ChannelConfigUpdatedAt int64  `json:"channel_config_updated_at"`
-	TimeZone               string `json:"time_zone"`
-	Source                 string `json:"source"`
+	From                   string                `json:"from"`
+	To                     string                `json:"to"`
+	GeneratedAt            int64                 `json:"generated_at"`
+	DataUntil              int64                 `json:"data_until"`
+	LatestDataUntil        int64                 `json:"latest_data_until"`
+	ChannelConfigUpdatedAt int64                 `json:"channel_config_updated_at"`
+	TimeZone               string                `json:"time_zone"`
+	Source                 string                `json:"source"`
+	DataCoverage           StabilityDataCoverage `json:"data_coverage"`
 }
 
 type ChannelManagementReport struct {
@@ -473,6 +474,7 @@ func (m *Monitor) buildChannelManagementReport(ctx context.Context, scope stabil
 			To:   time.Unix(toTs, 0).In(cstLocation).Format("2006-01-02"), GeneratedAt: now,
 			DataUntil: dataUntil, LatestDataUntil: latestDataUntil, ChannelConfigUpdatedAt: configUpdatedAt,
 			TimeZone: "Asia/Shanghai", Source: "monitor_local_hourly_rollup",
+			DataCoverage: m.stabilityDataCoverage(ctx, scope.FromTs, scope.ToTs, now),
 		},
 		Summary: ChannelManagementSummary{
 			ConfiguredDomains: len(configuredDomainSet), CurrentChannels: currentChannels,
@@ -489,10 +491,7 @@ func (m *Monitor) serveChannelManagementReport(c *gin.Context) {
 		c.JSON(200, gin.H{"enabled": false})
 		return
 	}
-	maxDays := m.cfg.StabilityRetentionDays
-	if maxDays <= 0 || maxDays > 365 {
-		maxDays = 90
-	}
+	maxDays := m.cfg.stabilityQueryDays()
 	scope, err := stabilityRange(c, time.Now(), maxDays)
 	if err != nil {
 		c.JSON(400, gin.H{"error": err.Error()})
@@ -504,7 +503,7 @@ func (m *Monitor) serveChannelManagementReport(c *gin.Context) {
 	defer cancel()
 	report, err := m.buildChannelManagementReport(ctx, scope, time.Now().Unix())
 	if err != nil {
-		c.JSON(500, gin.H{"error": err.Error()})
+		writeStabilityReadError(c, err)
 		return
 	}
 	report.Finance.CanEdit = c.GetInt("urole") >= roleRoot

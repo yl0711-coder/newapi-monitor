@@ -1,5 +1,7 @@
 FROM alpine:3.23
 
 # 只供 CI 验证 .dockerignore。镜像不会发布，也不参与产品镜像构建。
+RUN addgroup -S context && adduser -S -G context context
 WORKDIR /context
 COPY . .
+USER context
