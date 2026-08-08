@@ -5,7 +5,7 @@ const cm={
   inited:false,loaded:false,days:7,custom:null,preset:'',report:null,abort:null,sort:'cost',
   filters:{search:'',domain:'',vendor:'',group:'',status:''},
   expandedDomains:new Set(),expandedVendors:new Set(),expandedChannels:new Set(),
-  financeDomain:null,financeGroups:[]
+  financeDomain:null,financeGroups:[],upstreamDomain:null,upstreamConfig:null
 };
 const $=id=>document.getElementById(id);
 const esc=s=>String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -85,6 +85,8 @@ function init(){
     if(stability){event.stopPropagation();const ctx={days:cm.days,channel:stability.dataset.cmStability};if(cm.custom){ctx.from=cm.custom.from;ctx.to=cm.custom.to;delete ctx.days}if(cm.filters.group)ctx.group=cm.filters.group;window.stabilityOpen?.(ctx);return}
     const finance=event.target.closest('[data-cm-finance]');
     if(finance){event.stopPropagation();openFinance(finance.dataset.cmFinance);return}
+    const upstream=event.target.closest('[data-cm-upstream]');
+    if(upstream){event.stopPropagation();openUpstream(upstream.dataset.cmUpstream);return}
     const domain=event.target.closest('[data-cm-domain-toggle]');
     if(domain){toggleSet(cm.expandedDomains,domain.dataset.cmDomainToggle);render();return}
     const vendor=event.target.closest('[data-cm-vendor-toggle]');
@@ -94,7 +96,7 @@ function init(){
   });
   $('cmBody')?.addEventListener('keydown',event=>{
     if(event.key!=='Enter'&&event.key!==' ')return;
-    if(event.target.closest('[data-cm-finance]'))return;
+    if(event.target.closest('[data-cm-finance],[data-cm-upstream]'))return;
     const target=event.target.closest('[data-cm-domain-toggle],[data-cm-vendor-toggle],[data-cm-channel-toggle]');
     if(target){event.preventDefault();target.click()}
   });
@@ -104,7 +106,13 @@ function init(){
   $('cmFinanceSave')?.addEventListener('click',saveFinance);
   ['cmFinanceFX','cmFinanceSitePaid','cmFinanceSiteCredit','cmFinanceUpPaid','cmFinanceUpCredit'].forEach(id=>$(id)?.addEventListener('input',refreshFinancePreview));
   $('cmFinanceGroupRows')?.addEventListener('input',event=>{if(event.target.matches('[data-cm-finance-input]'))refreshFinancePreview()});
-  document.addEventListener('keydown',event=>{if(event.key==='Escape'&&cm.financeDomain)closeFinance()});
+  $('cmUpstreamClose')?.addEventListener('click',closeUpstream);
+  $('cmUpstreamCancel')?.addEventListener('click',closeUpstream);
+  $('cmUpstreamMask')?.addEventListener('click',closeUpstream);
+  $('cmUpstreamProvider')?.addEventListener('change',syncUpstreamFields);
+  $('cmUpstreamSave')?.addEventListener('click',saveUpstream);
+  $('cmUpstreamSync')?.addEventListener('click',syncUpstreamNow);
+  document.addEventListener('keydown',event=>{if(event.key==='Escape'){if(cm.upstreamDomain)closeUpstream();else if(cm.financeDomain)closeFinance()}});
   window.addEventListener('monitor:navigate',event=>{if(event.detail?.tab==='channels'&&applyNavigationContext())loadReport()});
 }
 
@@ -260,6 +268,22 @@ function vendorSection(domain,vendor){
     <div class="cm-channel-head"><span>实际渠道</span><span>状态</span><span>请求数</span><span>Tokens</span><span>用户侧消费</span><span>${esc(metricLabel())}占比</span><span>明细</span></div>
     ${vendor.channels.map(ch=>channelRow(domain.key,ch,domain.usage)).join('')}</div>`:''}</section>`;
 }
+function upstreamSummary(upstream){
+  if(!upstream?.configured)return '<span class="pending">余额未配置</span>';
+  const balance=upstream.balance_usd==null?'余额未知':`余额 ${usd(upstream.balance_usd)}`;
+  const assessment=upstream.assessment||{},runway=assessment.estimated_runway_days;
+  const estimate=assessment.available
+    ? assessment.status==='idle'?` · ${esc(assessment.reason||'近期无显著消耗')}`:` · 预计可用 ${Number(runway).toFixed(1)} 天`
+    : assessment.reason?` · ${esc(assessment.reason)}`:'';
+  if(!upstream.enabled)return `<span class="neutral">${esc(upstream.provider_name||upstream.provider)} · 已停用 · ${balance}</span>`;
+  if(upstream.status==='reconnect')return `<span class="bad">${esc(upstream.provider_name||upstream.provider)} · 需要重新连接 · ${balance}</span>`;
+  if(upstream.status==='error')return `<span class="warn">${esc(upstream.provider_name||upstream.provider)} · 同步异常 · ${balance}</span>`;
+  if(upstream.status==='ok'){
+    const cls=assessment.status==='critical'?'bad':assessment.status==='warning'?'warn':assessment.status==='healthy'?'ready':'neutral';
+    return `<span class="${cls}" title="近 ${Number(assessment.lookback_days||0)} 个完整自然日预估日均上游成本 ${usd(assessment.average_daily_cost_usd||0)}；小时完整率 ${Number(assessment.coverage_pct||0).toFixed(1)}%">${esc(upstream.provider_name||upstream.provider)} · ${balance}${estimate}</span>`;
+  }
+  return `<span class="pending">${esc(upstream.provider_name||upstream.provider)} · 等待同步</span>`;
+}
 function domainCard(domain,index,total,filtered){
   const channels=domain.vendors.flatMap(v=>v.channels),enabled=channels.filter(ch=>ch.current&&+ch.status===1).length;
   const open=cm.expandedDomains.has(domain.key),share=metric(total)>0?metric(domain.usage)/metric(total)*100:0;
@@ -267,9 +291,10 @@ function domainCard(domain,index,total,filtered){
   const financeVersion=+domain.finance?.version||0;
   const financeLabel=!financeGroups.length?'暂无可配置分组':financeVersion?`倍率版本 v${financeVersion} · ${completeFinance}/${financeGroups.length} 分组`:`倍率待配置 · 0/${financeGroups.length} 分组`;
   const financeButton=cm.report?.finance?.can_edit&&domain.configured?`<button type="button" class="cm-finance-open" data-cm-finance="${esc(domain.key)}">倍率配置</button>`:'';
+  const upstreamButton=cm.report?.finance?.can_edit&&domain.configured?`<button type="button" class="cm-upstream-open" data-cm-upstream="${esc(domain.key)}">账户配置</button>`:'';
   return `<article class="cm-domain-card${open?' open':''}"><div class="cm-domain-head" role="button" tabindex="0" data-cm-domain-toggle="${esc(domain.key)}">
     <span class="cm-rank">${String(index+1).padStart(2,'0')}</span>
-    <div class="cm-domain-identity"><span class="cm-domain-icon">${domain.configured?'◎':'—'}</span><div><b>${esc(domain.domain)}</b><small>${domain.vendors.length} 个厂商 · ${channels.length} 个实际渠道 · ${enabled} 个启用</small><div class="cm-domain-finance"><span class="${completeFinance===financeGroups.length&&financeGroups.length?'ready':'pending'}">${esc(financeLabel)}</span>${financeButton}</div></div></div>
+    <div class="cm-domain-identity"><span class="cm-domain-icon">${domain.configured?'◎':'—'}</span><div><b>${esc(domain.domain)}</b><small>${domain.vendors.length} 个厂商 · ${channels.length} 个实际渠道 · ${enabled} 个启用</small><div class="cm-domain-config"><div class="cm-domain-finance"><span class="${completeFinance===financeGroups.length&&financeGroups.length?'ready':'pending'}">${esc(financeLabel)}</span>${financeButton}</div><div class="cm-domain-upstream">${upstreamSummary(domain.upstream)}${upstreamButton}</div></div></div></div>
     <div class="cm-share"><div><b>${share.toFixed(1)}%</b><small>${filtered?'筛选内':'全站'}${esc(metricLabel())}</small></div><i><em style="width:${Math.max(share&&2,share)}%"></em></i></div>
     <div class="cm-domain-metrics"><span><small>渠道请求数</small><b>${nfmt(domain.usage.requests)}</b></span><span><small>Tokens</small><b title="${nfmt(domain.usage.tokens)}">${compact(domain.usage.tokens)}</b></span><span><small>用户侧消费</small><b>${usd(domain.usage.cost_usd)}</b></span></div>
     <span class="cm-chevron">${open?'−':'+'}</span>
@@ -410,6 +435,98 @@ async function saveFinance(){
     if(data.unchanged){showFinanceMessage(`配置没有变化，仍为倍率版本 v${data.version}。`);return}
     closeFinance();cm.loaded=false;await loadReport();
   }catch(error){showFinanceMessage(error.message||'保存失败，请稍后重试。',true)}finally{button.disabled=false}
+}
+
+function showUpstreamMessage(message,error=false){
+  const el=$('cmUpstreamMessage');if(!el)return;
+  el.textContent=message||'';el.classList.toggle('error',!!error);
+}
+function syncUpstreamFields(){
+  const provider=$('cmUpstreamProvider')?.value||'newapi';
+  document.querySelectorAll('.cm-upstream-newapi').forEach(el=>el.hidden=provider!=='newapi');
+  document.querySelectorAll('.cm-upstream-sub2api').forEach(el=>el.hidden=provider!=='sub2api');
+}
+function renderUpstreamStatus(account){
+  const el=$('cmUpstreamStatus');if(!el)return;
+  if(!account?.configured){el.hidden=true;el.innerHTML='';return}
+  const state=!account.enabled?'已停用':account.status==='ok'?'同步正常':account.status==='reconnect'?'需要重新连接':account.status==='error'?'同步异常':'等待同步';
+  const balance=account.balance_usd==null?'尚未取得余额':`当前余额 ${usd(account.balance_usd)}`;
+  const error=account.last_error?`<p>${esc(account.last_error)}</p>`:'';
+  el.className=`cm-upstream-status ${esc(account.status||'pending')}`;
+  el.innerHTML=`<div><small>${esc(account.provider_name||account.provider||'上游账户')}</small><b>${esc(state)}</b></div><div><strong>${esc(balance)}</strong><span>账户 ${esc(account.account_masked||'已配置')} · 最近成功 ${esc(dateTime(account.last_success_at))}</span>${account.unit_assumed?'<em>NewAPI 未公开换算单位，暂按默认 500,000 quota / USD 展示</em>':''}</div>${error}`;
+  el.hidden=false;
+}
+async function openUpstream(domainKey){
+  if(!cm.report?.finance?.can_edit)return;
+  const domain=(cm.report.domains||[]).find(item=>item.key===domainKey&&item.configured);
+  if(!domain)return;
+  cm.upstreamDomain=domain;cm.upstreamConfig=null;
+  $('cmUpstreamTitle').textContent=`${domain.domain} · 余额自动同步`;
+  $('cmUpstreamSubtitle').textContent='正在读取当前配置…';
+  $('cmUpstreamStatus').hidden=true;
+  $('cmUpstreamProvider').value='newapi';$('cmUpstreamBaseURL').value=`https://${domain.domain}`;
+  $('cmUpstreamUserID').value='';$('cmUpstreamAccessToken').value='';$('cmUpstreamEmail').value='';$('cmUpstreamPassword').value='';$('cmUpstreamEnabled').checked=true;
+  $('cmUpstreamSync').hidden=true;showUpstreamMessage('');syncUpstreamFields();
+  $('cmUpstreamMask').hidden=false;$('cmUpstreamDialog').classList.add('show');$('cmUpstreamDialog').setAttribute('aria-hidden','false');
+  document.body.classList.add('cm-dialog-open');
+  try{
+    const res=await fetch('/channels/upstream?domain='+encodeURIComponent(domain.domain),{headers:{Accept:'application/json'}});
+    if(res.status===401){location.href='/login';return}
+    const data=await res.json();if(!res.ok)throw new Error(data.error||`HTTP ${res.status}`);
+    if(cm.upstreamDomain!==domain)return;
+    cm.upstreamConfig=data;
+    $('cmUpstreamProvider').value=data.provider||'newapi';$('cmUpstreamBaseURL').value=data.base_url||`https://${domain.domain}`;
+    $('cmUpstreamUserID').value=data.user_id||'';$('cmUpstreamEmail').value=data.email||'';$('cmUpstreamEnabled').checked=data.enabled!==false;
+    $('cmUpstreamSubtitle').textContent=data.account?.configured
+      ?'令牌已加密保存；敏感字段留空表示保持原连接不变。'
+      :'选择中转站类型并填写首次连接参数。';
+    $('cmUpstreamSync').hidden=!data.account?.configured||data.enabled===false;
+    renderUpstreamStatus(data.account);syncUpstreamFields();showUpstreamMessage('');
+    setTimeout(()=>$('cmUpstreamBaseURL')?.focus(),20);
+  }catch(error){showUpstreamMessage(error.message||'读取配置失败。',true)}
+}
+function closeUpstream(){
+  if(!cm.upstreamDomain)return;
+  cm.upstreamDomain=null;cm.upstreamConfig=null;
+  $('cmUpstreamAccessToken').value='';$('cmUpstreamPassword').value='';
+  $('cmUpstreamMask').hidden=true;$('cmUpstreamDialog').classList.remove('show');$('cmUpstreamDialog').setAttribute('aria-hidden','true');
+  document.body.classList.remove('cm-dialog-open');showUpstreamMessage('');
+}
+async function saveUpstream(){
+  if(!cm.upstreamDomain||!cm.report?.finance?.can_edit)return;
+  const provider=$('cmUpstreamProvider').value,baseURL=$('cmUpstreamBaseURL').value.trim();
+  if(!baseURL){showUpstreamMessage('请填写站点地址。',true);return}
+  const payload={domain:cm.upstreamDomain.domain,provider,base_url:baseURL,enabled:$('cmUpstreamEnabled').checked};
+  if(provider==='newapi'){
+    payload.user_id=Number($('cmUpstreamUserID').value);payload.access_token=$('cmUpstreamAccessToken').value.trim();
+    if(!Number.isInteger(payload.user_id)||payload.user_id<=0){showUpstreamMessage('请填写有效的 NewAPI 用户 ID。',true);return}
+  }else{
+    payload.email=$('cmUpstreamEmail').value.trim();payload.password=$('cmUpstreamPassword').value;
+    if(!payload.email){showUpstreamMessage('请填写 Sub2API 登录邮箱。',true);return}
+  }
+  const button=$('cmUpstreamSave');button.disabled=true;$('cmUpstreamSync').disabled=true;showUpstreamMessage(payload.enabled?'正在安全连接并读取余额…':'正在停用自动同步…');
+  try{
+    const res=await fetch('/channels/upstream',{method:'POST',headers:{Accept:'application/json','Content-Type':'application/json'},body:JSON.stringify(payload)});
+    $('cmUpstreamAccessToken').value='';$('cmUpstreamPassword').value='';payload.access_token='';payload.password='';
+    if(res.status===401){location.href='/login';return}
+    const data=await res.json();if(!res.ok)throw new Error(data.error||`HTTP ${res.status}`);
+    cm.upstreamConfig={...(cm.upstreamConfig||{}),provider,base_url:baseURL,enabled:payload.enabled,account:data.account};
+    renderUpstreamStatus(data.account);$('cmUpstreamSync').hidden=!data.account?.configured||!data.account?.enabled;
+    cm.loaded=false;await loadReport();
+    if(data.sync_error){showUpstreamMessage(`配置已保存，但本次同步失败：${data.sync_error}`,true);return}
+    closeUpstream();
+  }catch(error){$('cmUpstreamAccessToken').value='';$('cmUpstreamPassword').value='';showUpstreamMessage(error.message||'保存失败，请稍后重试。',true)}finally{button.disabled=false;$('cmUpstreamSync').disabled=false}
+}
+async function syncUpstreamNow(){
+  if(!cm.upstreamDomain)return;
+  const button=$('cmUpstreamSync');button.disabled=true;$('cmUpstreamSave').disabled=true;showUpstreamMessage('正在读取最新余额…');
+  try{
+    const res=await fetch('/channels/upstream/sync',{method:'POST',headers:{Accept:'application/json','Content-Type':'application/json'},body:JSON.stringify({domain:cm.upstreamDomain.domain})});
+    if(res.status===401){location.href='/login';return}
+    const data=await res.json();if(!res.ok)throw new Error(data.error||`HTTP ${res.status}`);
+    renderUpstreamStatus(data.account);cm.loaded=false;await loadReport();
+    showUpstreamMessage(data.sync_error?`同步失败：${data.sync_error}`:'余额已更新。',!!data.sync_error);
+  }catch(error){showUpstreamMessage(error.message||'同步失败，请稍后重试。',true)}finally{button.disabled=false;$('cmUpstreamSave').disabled=false}
 }
 
 function render(){

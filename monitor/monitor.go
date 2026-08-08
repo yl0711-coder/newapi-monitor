@@ -1,6 +1,7 @@
 // Package monitor 是一个【独立的】上游稳定性监控服务,完全自包含:
 // 自带配置(settings.go,读环境变量)、自带本地采样库(store.go,独立 sqlite)、
-// 自带页面(server.go + page.html),无外部依赖。入口见 main.go。
+// 自带页面(server.go + page.html)。运行时只按配置连接只读生产库、可选 Redis、
+// 上游公开面板 API 及基础设施 API；入口见 main.go。
 //
 // 架构(关键:不给生产库带来负担):
 //   - 采样器(sampler.go)每 N 秒对 new-api 生产 MySQL 做有界小窗口只读聚合，
@@ -19,6 +20,8 @@ import (
 	"database/sql"
 	"fmt"
 	"log/slog"
+	"net/http"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -60,6 +63,13 @@ type Monitor struct {
 	portalLim  *portalLimiter    // 客户端登录限流
 	adminLim   *portalLimiter    // 管理端登录限流(按来源 IP)
 	exportLim  *exportLimiter    // 客户端日志导出限流(每组织账号 1 次/5min,仅计成功下载)
+
+	// 上游账户余额同步只访问各上游公开面板 API，结果和加密凭据均落 Monitor 本地库。
+	// 全局串行锁同时保护 Sub2API 的旋转 refresh token，避免后台同步与人工刷新抢用旧 token。
+	upstreamSyncMu               sync.Mutex
+	upstreamClient               *http.Client
+	upstreamCredentialPersistent bool
+	upstreamBalanceAlertLastEval atomic.Int64 // 动态余额评估最多与余额同步同频，避免每分钟重复扫本地小时汇总
 }
 
 // cachedSnap 是一次快照的缓存项。
@@ -74,6 +84,10 @@ const snapCacheTTL = 15
 // New 创建监控实例:打开本地采样库;若配置了生产 DSN,则连库并校验连通。
 // 不自动启动采样器——需调用 Start 才开始后台采样。
 func New(s Settings) (*Monitor, error) {
+	credentialSecretConfigured := strings.TrimSpace(s.UpstreamCredentialSecret) != "" || strings.TrimSpace(s.SessionSecret) != ""
+	if err := validateNginxSettings(s); err != nil {
+		return nil, err
+	}
 	if s.SessionSecret == "" {
 		s.SessionSecret = randomSecret() // 未配置则随机生成,重启后需重新登录
 		slog.Warn("未设置 MONITOR_SESSION_SECRET,已临时随机生成;重启后所有登录失效,生产建议固定配置一个长随机串")
@@ -83,10 +97,12 @@ func New(s Settings) (*Monitor, error) {
 	}
 
 	m := &Monitor{
-		cfg:        s,
-		chNames:    map[string]string{},
-		snapCache:  map[int]cachedSnap{},
-		usageCache: newUsageResultCache(s),
+		cfg:                          s,
+		chNames:                      map[string]string{},
+		snapCache:                    map[int]cachedSnap{},
+		usageCache:                   newUsageResultCache(s),
+		upstreamClient:               newUpstreamHTTPClient(upstreamSyncTimeout(s)),
+		upstreamCredentialPersistent: credentialSecretConfigured,
 	}
 	if err := m.openStore(s.StorePath); err != nil {
 		return nil, err
@@ -106,6 +122,7 @@ func New(s Settings) (*Monitor, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err = conn.PingContext(ctx); err != nil {
+		_ = conn.Close()
 		return nil, fmt.Errorf("连接生产库失败: %w", err)
 	}
 	m.prodDB = conn
@@ -118,6 +135,7 @@ func (m *Monitor) Start(ctx context.Context) {
 	m.backgroundCtx = ctx
 	m.ctxMu.Unlock()
 	m.startSampler(ctx)
+	m.startChannelUpstreamSync(ctx)
 	if m.cfg.NginxEnabled {
 		m.startNginxMaintenance(ctx)
 	}
@@ -136,10 +154,14 @@ func (m *Monitor) taskContext() context.Context {
 // Enabled 报告生产库是否已连通。
 func (m *Monitor) Enabled() bool { return m.prodDB != nil }
 
-// Close 释放可选外部缓存连接。Redis 只是优化项，关闭失败不影响业务数据正确性。
+// Close 释放可选外部缓存连接和上游 HTTP 空闲连接。
+// Redis 只是优化项，关闭失败不影响业务数据正确性。
 func (m *Monitor) Close() {
 	if m.usageCache != nil {
 		m.usageCache.Close()
+	}
+	if m.upstreamClient != nil {
+		m.upstreamClient.CloseIdleConnections()
 	}
 }
 

@@ -3,6 +3,7 @@ package monitor
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"sort"
 	"strings"
 	"time"
@@ -59,6 +60,7 @@ type ChannelManagementDomain struct {
 	Configured    bool                            `json:"configured"`
 	Usage         ChannelUsageMetrics             `json:"usage"`
 	Finance       ChannelDomainFinanceView        `json:"finance"`
+	Upstream      ChannelUpstreamAccountView      `json:"upstream"`
 	FinanceGroups []ChannelManagementFinanceGroup `json:"finance_groups"`
 	Groups        []ChannelManagementGroup        `json:"groups"`
 	Vendors       []ChannelManagementVendor       `json:"vendors"`
@@ -218,6 +220,16 @@ func (m *Monitor) buildChannelManagementReport(ctx context.Context, scope stabil
 	finance, err := m.loadChannelFinanceSnapshot(ctx)
 	if err != nil {
 		return nil, err
+	}
+	upstreamAccounts, err := m.loadChannelUpstreamViews(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("读取上游账户状态: %w", err)
+	}
+	assessments, assessmentErr := m.upstreamBalanceAssessments(ctx, now, upstreamAccounts, m.loadAlertConfig())
+	if assessmentErr != nil {
+		// 动态余额评估是增强信息；本地评估异常不能让渠道用量主报表不可用。
+		slog.Warn("计算渠道余额可用天数失败", "err", assessmentErr)
+		assessments = map[string]ChannelUpstreamBalanceAssessment{}
 	}
 	var snaps []struct {
 		ID, Type, Status int
@@ -402,9 +414,14 @@ func (m *Monitor) buildChannelManagementReport(ctx context.Context, scope stabil
 			}
 			return vendors[i].Name < vendors[j].Name
 		})
+		upstream := upstreamAccounts[domain.Domain]
+		if assessment, ok := assessments[domain.Domain]; ok {
+			upstream.Assessment = &assessment
+		}
 		responseDomains = append(responseDomains, ChannelManagementDomain{
 			Key: domain.Key, Domain: domain.Domain, Configured: domain.Configured,
 			Usage: domain.Usage.metrics(), Finance: finance.domainView(domain.Domain),
+			Upstream:      upstream,
 			FinanceGroups: managementFinanceGroups(domain.FinanceGroups, domain.Domain, finance),
 			Groups:        managementGroups(domain.Groups, domain.Domain, finance), Vendors: vendors,
 		})

@@ -13,6 +13,7 @@ services:
       - NEWAPI_LOG_DSN=${NEWAPI_LOG_DSN:?set in .env}
       - MONITOR_NEWAPI_BASE_URL=${MONITOR_NEWAPI_BASE_URL:?set in .env}
       - MONITOR_SESSION_SECRET=${MONITOR_SESSION_SECRET:-}
+      - MONITOR_UPSTREAM_CREDENTIAL_SECRET=${MONITOR_UPSTREAM_CREDENTIAL_SECRET:-}
       - MONITOR_PORTAL_ADDR=:8091
       # 同机 Caddy/Nginx 的来源；若反代在容器/其他主机，请按实际网段修改。
       - MONITOR_TRUSTED_PROXIES=127.0.0.1,::1
@@ -21,12 +22,19 @@ services:
       - MONITOR_RETENTION_DAYS=7
       - MONITOR_BACKFILL_HOURS=24
       - MONITOR_HOUR_RETENTION_DAYS=90
+      - MONITOR_UPSTREAM_SYNC_MINUTES=5
+      - MONITOR_UPSTREAM_SYNC_TIMEOUT_SECONDS=15
       - MONITOR_STABILITY_ENABLED=true
       - MONITOR_STABILITY_QUERY_MAX_DAYS=90
       - MONITOR_STABILITY_RETENTION_DAYS=181
       - MONITOR_STABILITY_PROBLEM_SAMPLE_SECONDS=300
       - MONITOR_STABILITY_BACKFILL_ENABLED=true
       # 可选:
+      # Nginx 入口旁路默认保持关闭；两个节点的脱敏日志和采集器验收后再同时取消下列注释。
+      # - MONITOR_INGEST_TOKEN=${MONITOR_INGEST_TOKEN:?set in .env}
+      # - MONITOR_NGINX_ENABLED=true
+      # - MONITOR_NGINX_RETENTION_DAYS=7
+      # - MONITOR_NGINX_ALLOWED_NODES=master,slave
       # - MONITOR_HEARTBEAT_URL=           # dead-man 心跳(如 healthchecks.io)
       # - MONITOR_USAGE_REDIS_ADDR=172.26.4.11:6379  # 只使用 Redis 私网地址；留空自动降级
       # - MONITOR_USAGE_REDIS_USERNAME=monitor       # 建议 ACL 仅允许 nxmon:* 和 GET/SET/DEL/PING
@@ -37,6 +45,15 @@ services:
       - TZ=Asia/Shanghai
     volumes:
       - monitor_data:/data
+    # 除持久化 /data 和有界 /tmp 外，运行层不可写。
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 128
     mem_limit: 256m
     logging:
       driver: json-file

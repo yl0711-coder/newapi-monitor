@@ -223,6 +223,9 @@ func (m *Monitor) RegisterRoutes(r *gin.Engine) {
 	rootChannels := r.Group("/channels", m.requireRole(roleRoot))
 	{
 		rootChannels.POST("/finance", m.saveChannelFinanceHandler)
+		rootChannels.GET("/upstream", m.getChannelUpstreamHandler)
+		rootChannels.POST("/upstream", m.saveChannelUpstreamHandler)
+		rootChannels.POST("/upstream/sync", m.syncChannelUpstreamHandler)
 	}
 }
 

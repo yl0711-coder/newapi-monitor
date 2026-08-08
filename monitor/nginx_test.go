@@ -43,6 +43,31 @@ func TestNginxIngestDisabledAndAuthenticated(t *testing.T) {
 	if got := postNginx(t, m, body, "secret").Code; got != http.StatusBadRequest {
 		t.Fatalf("启用采集但未配置节点白名单时必须拒绝，得 %d", got)
 	}
+	allowedNode := strings.Repeat("m", 64)
+	m.cfg.NginxAllowedNodes = []string{allowedNode}
+	longNode := allowedNode + "-forged-suffix"
+	body = fmt.Sprintf(`{"node":%q,"batch_id":"batch_abcdefgh","samples":[]}`, longNode)
+	if got := postNginx(t, m, body, "secret").Code; got != http.StatusBadRequest {
+		t.Fatalf("超过长度限制的节点名不能被截断后冒充白名单节点，得 %d", got)
+	}
+}
+
+func TestValidateNginxSettingsFailsClosed(t *testing.T) {
+	if err := validateNginxSettings(Settings{}); err != nil {
+		t.Fatalf("默认关闭不应增加启动条件: %v", err)
+	}
+	if err := validateNginxSettings(Settings{NginxEnabled: true, NginxAllowedNodes: []string{"master"}}); err == nil {
+		t.Fatal("已启用但无 ingest token 必须拒绝启动")
+	}
+	if err := validateNginxSettings(Settings{NginxEnabled: true, IngestToken: "secret"}); err == nil {
+		t.Fatal("已启用但无节点白名单必须拒绝启动")
+	}
+	if err := validateNginxSettings(Settings{NginxEnabled: true, IngestToken: "secret", NginxAllowedNodes: []string{"master", "master"}}); err == nil {
+		t.Fatal("重复节点会造成状态页重复，必须拒绝")
+	}
+	if err := validateNginxSettings(Settings{NginxEnabled: true, IngestToken: "secret", NginxAllowedNodes: []string{"master", "slave"}}); err != nil {
+		t.Fatalf("完整配置应通过: %v", err)
+	}
 }
 
 func TestNginxIngestIdempotentAndReport(t *testing.T) {
@@ -50,10 +75,10 @@ func TestNginxIngestIdempotentAndReport(t *testing.T) {
 	m.cfg.NginxEnabled, m.cfg.IngestToken, m.cfg.NginxRetentionDays = true, "secret", 7
 	m.cfg.NginxAllowedNodes = []string{"master"}
 	bucket := time.Now().Unix() / 60 * 60
-	body := fmt.Sprintf(`{"node":"master","batch_id":"batch_abcdefgh","samples":[
+	body := fmt.Sprintf(`{"node":"master","batch_id":"batch_abcdefgh","backlog_bytes":4096,"backlog_known":true,"cursor_discontinuities":2,"last_cursor_discontinuity_at":%d,"discarded_lines":3,"last_discarded_at":%d,"samples":[
 		{"bucket_ts":%d,"route":"/v1/responses?key=must-not-store","method":"post","status":200,"upstream_status":200,"count":2,"request_time_sum_ms":300,"request_time_max_ms":200,"upstream_time_sum_ms":250,"upstream_time_count":2,"bytes_sent":1000,"request_id_present":2},
 		{"bucket_ts":%d,"route":"/api/user/123","method":"GET","status":503,"upstream_status":503,"count":1,"request_time_sum_ms":500,"request_time_max_ms":500,"upstream_time_sum_ms":450,"upstream_time_count":1,"bytes_sent":200,"request_id_present":0}
-	]}`, bucket, bucket)
+	]}`, time.Now().Unix(), time.Now().Unix(), bucket, bucket)
 	for i := 0; i < 2; i++ {
 		w := postNginx(t, m, body, "secret")
 		if w.Code != http.StatusOK {
@@ -68,6 +93,13 @@ func TestNginxIngestIdempotentAndReport(t *testing.T) {
 	m.storeDB.Model(&NginxMinuteSample{}).Where("route LIKE '%?%' OR route LIKE '%123%'").Count(&rawPaths)
 	if rawPaths != 0 {
 		t.Fatalf("query 或动态路径不应入库")
+	}
+	var state NginxSourceState
+	if err := m.storeDB.First(&state, "node = ?", "master").Error; err != nil {
+		t.Fatal(err)
+	}
+	if !state.BacklogKnown || state.BacklogBytes != 4096 || state.CursorDiscontinuities != 2 || state.LastCursorDiscontinuityAt == 0 || state.DiscardedLines != 3 || state.LastDiscardedAt == 0 {
+		t.Fatalf("采集器积压/游标状态未正确保存: %+v", state)
 	}
 }
 
@@ -110,9 +142,24 @@ func TestNginxEdgeReportNumbers(t *testing.T) {
 	if len(report.Routes) != 1 || len(report.Nodes) != 2 || len(report.Daily) != 1 || len(report.Sources) != 2 {
 		t.Fatalf("breakdown 不完整: routes=%d nodes=%d daily=%d sources=%d", len(report.Routes), len(report.Nodes), len(report.Daily), len(report.Sources))
 	}
-	_, _, coverage := m.nginxSourceSummary(context.Background(), time.Now().Unix())
+	connected, healthy, total, _, coverage := m.nginxSourceSummary(context.Background(), time.Now().Unix())
+	if !connected || healthy != 2 || total != 2 {
+		t.Fatalf("source summary health wrong: connected=%v healthy=%d total=%d", connected, healthy, total)
+	}
 	if coverage == nil || *coverage != 70 {
 		t.Fatalf("source summary 携带率错误: %v", coverage)
+	}
+}
+
+func TestNginxQueryToTsIncludesCurrentMinuteAtExactBoundary(t *testing.T) {
+	now := time.Date(2026, 8, 8, 17, 0, 0, 0, cstLocation).Unix()
+	scope := stabilityScope{FromTs: now - 86400, ToTs: now}
+	if got := nginxQueryToTs(scope, now); got != now+1 {
+		t.Fatalf("current minute boundary must be included: got=%d want=%d", got, now+1)
+	}
+	historical := stabilityScope{FromTs: now - 2*86400, ToTs: now - 86400}
+	if got := nginxQueryToTs(historical, now); got != historical.ToTs {
+		t.Fatalf("historical half-open interval changed: got=%d want=%d", got, historical.ToTs)
 	}
 }
 
@@ -132,6 +179,50 @@ func TestValidateNginxSampleRejectsUnboundedValues(t *testing.T) {
 	if _, err := validateNginxSample(bad, now, 7); err == nil {
 		t.Fatal("超留存窗口样本应拒绝")
 	}
+	for name, mutate := range map[string]func(*nginxIngestSample){
+		"missing status": func(v *nginxIngestSample) { v.Status = 0 },
+		"max exceeds sum": func(v *nginxIngestSample) {
+			v.RequestTimeMaxMS, v.RequestTimeSumMS = 2, 1
+		},
+		"upstream sum without count": func(v *nginxIngestSample) { v.UpstreamTimeSumMS = 1 },
+		"upstream sum exceeds count": func(v *nginxIngestSample) {
+			v.UpstreamTimeCount, v.UpstreamTimeSumMS = 1, 86_400_001
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			bad := base
+			mutate(&bad)
+			if _, err := validateNginxSample(bad, now, 7); err == nil {
+				t.Fatalf("非守恒聚合必须拒绝: %+v", bad)
+			}
+		})
+	}
+	zeroUpstream := base
+	zeroUpstream.UpstreamTimeCount = 1
+	if _, err := validateNginxSample(zeroUpstream, now, 7); err != nil {
+		t.Fatalf("0 ms upstream 是合法样本: %v", err)
+	}
+}
+
+func TestNginxIngestRejectsInvalidCollectorTelemetry(t *testing.T) {
+	m := newTestMonitor(t)
+	m.cfg.NginxEnabled, m.cfg.IngestToken = true, "secret"
+	m.cfg.NginxAllowedNodes = []string{"master"}
+	for _, body := range []string{
+		`{"node":"master","batch_id":"batch_abcdefgh","backlog_bytes":-1,"samples":[]}`,
+		`{"node":"master","batch_id":"batch_abcdefgh","backlog_bytes":1,"backlog_known":false,"samples":[]}`,
+		`{"node":"master","batch_id":"batch_abcdefgh","cursor_discontinuities":-1,"samples":[]}`,
+		`{"node":"master","batch_id":"batch_abcdefgh","last_cursor_discontinuity_at":1,"samples":[]}`,
+		`{"node":"master","batch_id":"batch_abcdefgh","cursor_discontinuities":1,"samples":[]}`,
+		`{"node":"master","batch_id":"batch_abcdefgh","discarded_lines":-1,"samples":[]}`,
+		`{"node":"master","batch_id":"batch_abcdefgh","last_discarded_at":1,"samples":[]}`,
+		`{"node":"master","batch_id":"batch_abcdefgh","discarded_lines":1,"samples":[]}`,
+		fmt.Sprintf(`{"node":"master","batch_id":"batch_abcdefgh","last_cursor_discontinuity_at":%d,"samples":[]}`, time.Now().Unix()+600),
+	} {
+		if got := postNginx(t, m, body, "secret").Code; got != http.StatusBadRequest {
+			t.Fatalf("非法采集状态必须拒绝，得 %d body=%s", got, body)
+		}
+	}
 }
 
 func TestNginxRetentionAndAggregateOverflowAreBounded(t *testing.T) {
@@ -148,13 +239,18 @@ func TestNginxRetentionAndAggregateOverflowAreBounded(t *testing.T) {
 
 func TestNginxSourcesExposeMissingAllowedNode(t *testing.T) {
 	m := newTestMonitor(t)
+	m.cfg.NginxEnabled = true
 	m.cfg.NginxAllowedNodes = []string{"master", "slave"}
 	now := time.Now().Unix()
 	if err := m.storeDB.Create(&NginxSourceState{Node: "master", LastEventTs: now, LastIngestTs: now}).Error; err != nil {
 		t.Fatal(err)
 	}
 	rows := m.nginxSources(context.Background(), now)
-	if len(rows) != 2 || rows[0].Node != "master" || rows[0].Status != "ok" || rows[1].Node != "slave" || rows[1].Status != "bad" || rows[1].AgeSec != -1 {
+	if len(rows) != 2 || rows[0].Node != "master" || rows[0].Status != "ok" || rows[1].Node != "slave" || rows[1].Status != "bad" || rows[1].AgeSec != -1 || len(rows[1].HealthReasons) != 1 || rows[1].HealthReasons[0] != "source_missing" {
 		t.Fatalf("白名单内未上报节点必须明确显示中断: %+v", rows)
+	}
+	connected, healthy, total, _, _ := m.nginxSourceSummary(context.Background(), now)
+	if connected || healthy != 1 || total != 2 {
+		t.Fatalf("不能因为一个节点健康就显示 Nginx 整体已接入: connected=%v healthy=%d total=%d", connected, healthy, total)
 	}
 }

@@ -13,6 +13,9 @@ services:
       NGINXCOLLECTOR_CURSOR_PATH: /data/cursor.json
       NGINXCOLLECTOR_INTERVAL_SECONDS: "5"
       NGINXCOLLECTOR_MAX_LINES: "1000"
+      NGINXCOLLECTOR_RETENTION_DAYS: "7"
+      # 默认只允许 HTTPS。仅当 sink 走已核对的私网直连时才显式设 true。
+      NGINXCOLLECTOR_ALLOW_INSECURE_HTTP: ${NGINXCOLLECTOR_ALLOW_INSECURE_HTTP:-false}
     volumes:
       - ${NGINXCOLLECTOR_LOG_DIR:?set NGINXCOLLECTOR_LOG_DIR}:/logs:ro
       - nginxcollector-data:/data
@@ -24,6 +27,14 @@ services:
     cap_drop:
       - ALL
     mem_limit: 64m
+    cpus: "0.25"
+    pids_limit: 64
+    stop_grace_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 
 volumes:
   nginxcollector-data:

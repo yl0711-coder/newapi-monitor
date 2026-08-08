@@ -5,7 +5,8 @@ COPY cmd/nginxcollector/main.go ./main.go
 RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/nginxcollector ./main.go
 
 FROM alpine:3.23
-RUN apk add --no-cache ca-certificates \
+RUN apk upgrade --no-cache \
+    && apk add --no-cache ca-certificates \
     && addgroup -S collector \
     && adduser -S -G collector collector \
     && mkdir -p /data \

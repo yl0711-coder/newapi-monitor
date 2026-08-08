@@ -13,9 +13,11 @@
 
 1. 确认 `/data` 使用具名数据卷，而不是容器可写层。
 2. 确认 `.env` 中固定配置 `MONITOR_SESSION_SECRET`，且不进入仓库或镜像。
-3. 确认只读 DSN 仅有 `SELECT` 权限。
-4. 确认 `GET /health` 返回 200。
-5. 管理员登录后检查 `GET /stability/health`：本地库可达、主采样有成功时间、问题采集无长期积压。
+3. 固定配置独立的 `MONITOR_UPSTREAM_CREDENTIAL_SECRET` 并纳入密钥备份；该值变化后，已保存的上游凭据将无法解密。
+4. 确认只读 DSN 仅有 `SELECT` 权限。
+5. 当前版本不接入 Nginx 旁路采集时，确认 `MONITOR_NGINX_ENABLED=false`，且不启动 nginxcollector。
+6. 确认 `GET /health` 返回 200。
+7. 管理员登录后检查 `GET /stability/health`：本地库可达、主采样有成功时间、问题采集无长期积压。
 
 ## 一致性备份
 

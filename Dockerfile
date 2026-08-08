@@ -23,7 +23,12 @@ RUN apk upgrade --no-cache \
     && apk add --no-cache ca-certificates tzdata
 WORKDIR /app
 COPY --from=builder /app /app/monitor
-RUN adduser -D -u 1000 app && mkdir -p /data && chown -R app /app /data
+# 运行用户只需要写 /data。二进制与 /app 保持 root 所有且只读，
+# 避免应用进程被利用后直接改写自身可执行文件并跨重启留驻。
+RUN adduser -D -u 1000 app \
+    && mkdir -p /data \
+    && chown app:app /data \
+    && chmod 0555 /app /app/monitor
 USER app
 ENV MONITOR_ADDR=:8090 \
     MONITOR_STORE_PATH=/data/monitor.db \
