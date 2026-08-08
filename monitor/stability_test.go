@@ -412,6 +412,62 @@ func TestStabilityHealthRequiresFreshProblemCoverageWhenEnabled(t *testing.T) {
 	}
 }
 
+func TestStabilityHealthIncludesNginxCollectorState(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	m := newStabilityTestMonitor(t)
+	m.cfg.StabilityEnabled = false
+	m.cfg.SampleSeconds = 60
+	m.cfg.NginxEnabled = true
+	m.cfg.NginxAllowedNodes = []string{"master", "slave"}
+	now := time.Now().Unix()
+	m.lastRun.Store(now)
+	if err := m.storeDB.Create(&NginxSourceState{
+		Node: "master", LastEventTs: now, LastIngestTs: now, BacklogKnown: true, BacklogBytes: 512,
+		CursorDiscontinuities: 1, LastCursorDiscontinuityAt: now, DiscardedLines: 2, LastDiscardedAt: now,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	record := func() stabilityHealthResponse {
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		c.Request = httptest.NewRequest(http.MethodGet, "/stability/health", nil)
+		m.serveStabilityHealth(c)
+		var got stabilityHealthResponse
+		if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+			t.Fatal(err)
+		}
+		return got
+	}
+	if got := record(); got.Status != "degraded" || got.NginxSourceCount != 2 || got.NginxUnhealthySources != 2 ||
+		got.NginxBacklogBytes != 512 || got.NginxCursorDiscontinuities != 1 || got.NginxDiscardedLines != 2 || got.NginxRecentDataLossSources != 1 {
+		t.Fatalf("缺少 slave 必须在健康接口客观显示降级: %+v", got)
+	}
+	if err := m.storeDB.Create(&NginxSourceState{Node: "slave", LastEventTs: now, LastIngestTs: now, BacklogKnown: true}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if got := record(); got.Status != "degraded" || got.NginxSourceCount != 2 || got.NginxUnhealthySources != 1 ||
+		got.NginxRecentDataLossSources != 1 {
+		t.Fatalf("新鲜心跳不能掩盖近期游标断裂或丢行: %+v", got)
+	}
+	if err := m.storeDB.Model(&NginxSourceState{}).Where("node = ?", "master").Updates(map[string]any{
+		"backlog_bytes": 0, "last_cursor_discontinuity_at": now - nginxRecentDataLossWindowSec - 1,
+		"last_discarded_at": now - nginxRecentDataLossWindowSec - 1,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if got := record(); got.Status != "ok" || got.NginxSourceCount != 2 || got.NginxUnhealthySources != 0 || got.NginxBacklogUnknown != 0 {
+		t.Fatalf("历史累计异常超过观察窗后不应永久保持降级: %+v", got)
+	}
+	if err := m.storeDB.Model(&NginxSourceState{}).Where("node = ?", "master").Updates(map[string]any{
+		"backlog_bytes": nginxBacklogWarnBytes, "last_event_ts": now,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if got := record(); got.Status != "degraded" || got.NginxLargeBacklogSources != 1 || got.NginxUnhealthySources != 1 {
+		t.Fatalf("大积压必须使健康状态降级: %+v", got)
+	}
+}
+
 func TestRefreshChannelsPersistsOfficialTypeVendorWithoutSecrets(t *testing.T) {
 	m := newStabilityTestMonitor(t)
 	m.prodDB = newFakeProdDB(t)
@@ -630,9 +686,84 @@ func TestStabilityPageIntegrationKeepsExistingMonitorAndPortalBoundaries(t *test
 	}
 }
 
+func TestStabilityPageIncludesBusinessDateShortcuts(t *testing.T) {
+	for _, shortcut := range []string{
+		`data-stability-preset="today">今天`,
+		`data-stability-preset="yesterday">昨天`,
+		`data-stability-preset="week">本周`,
+	} {
+		if !strings.Contains(pageHTML, shortcut) {
+			t.Fatalf("稳定性报表缺少日期快捷项 %q", shortcut)
+		}
+	}
+	js := string(stabilityJS)
+	for _, marker := range []string{`data-stability-preset`, `stPresetRange`, `timeZone:'Asia/Shanghai'`} {
+		if !strings.Contains(js, marker) {
+			t.Fatalf("稳定性报表快捷日期交互缺少 %q", marker)
+		}
+	}
+	if strings.Contains(portalHTML, "data-stability-preset") {
+		t.Fatal("Usage Portal 不应接入 Monitor 稳定性报表日期快捷项")
+	}
+}
+
+func TestMonitorResponsiveShellAndWideTablesStayAdminOnly(t *testing.T) {
+	for _, marker := range []string{
+		`id="monitorSidebarToggle"`,
+		`class="monitor-nav-label"`,
+		`class="mxwrap"><table id="usageMxTable"`,
+		`class="mxwrap"><table id="usageMemMxTable"`,
+		`monitor-table-scroll monitor-table-model"><table><thead id="thGroup"`,
+		`monitor-table-scroll monitor-table-model"><table><thead id="thChannel"`,
+		`monitor-table-scroll monitor-table-model"><table><thead id="thModel"`,
+		`monitor-table-scroll monitor-table-server"><table><thead id="thInst"`,
+		`monitor-table-scroll monitor-table-admin"><table><thead id="thGrp"`,
+		`monitor-table-scroll monitor-table-admin"><table><thead id="thUsr"`,
+		`function sizeUsageMatrix(table,dayCount)`,
+	} {
+		if !strings.Contains(pageHTML, marker) {
+			t.Fatalf("Monitor 响应式布局缺少 %q", marker)
+		}
+	}
+	css := string(stabilityCSS)
+	for _, marker := range []string{
+		`.monitor-shell.sidebar-collapsed{grid-template-columns:76px minmax(0,1fr)}`,
+		`.monitor-table-scroll{width:100%;max-width:100%;overflow-x:auto`,
+		`.monitor-table-model>table{min-width:1120px}`,
+		`.monitor-table-server>table{min-width:1180px}`,
+		`.monitor-table-admin>table{min-width:980px}`,
+	} {
+		if !strings.Contains(css, marker) {
+			t.Fatalf("Monitor 响应式样式缺少 %q", marker)
+		}
+	}
+	if !strings.Contains(string(stabilityJS), `nexusapi-monitor-sidebar-collapsed`) {
+		t.Fatal("侧栏收起状态没有持久化，刷新后会跳回展开态")
+	}
+	for _, forbidden := range []string{`monitorSidebarToggle`, `nexusapi-monitor-sidebar-collapsed`} {
+		if strings.Contains(portalHTML, forbidden) {
+			t.Fatalf("Usage Portal 不应被 Monitor 侧栏改造影响: %q", forbidden)
+		}
+	}
+}
+
 func TestStabilityRangeUsesCSTDateBoundariesAndCapsRange(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	now := time.Date(2026, 8, 5, 12, 30, 0, 0, cstLocation)
+	check := func(rawURL string, wantFrom, wantTo time.Time) {
+		t.Helper()
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		c.Request = httptest.NewRequest("GET", rawURL, nil)
+		s, err := stabilityRange(c, now, 90)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if s.FromTs != wantFrom.Unix() || s.ToTs != wantTo.Unix() {
+			t.Fatalf("%s range=[%v,%v], want [%v,%v]", rawURL, time.Unix(s.FromTs, 0), time.Unix(s.ToTs, 0), wantFrom, wantTo)
+		}
+	}
+
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
 	c.Request = httptest.NewRequest("GET", "/stability/report?days=7", nil)
@@ -644,6 +775,9 @@ func TestStabilityRangeUsesCSTDateBoundariesAndCapsRange(t *testing.T) {
 	if s.FromTs != want || s.ToTs != now.Unix() {
 		t.Fatalf("range=[%v,%v]", time.Unix(s.FromTs, 0), time.Unix(s.ToTs, 0))
 	}
+	check("/stability/report?from=2026-08-05&to=2026-08-05", time.Date(2026, 8, 5, 0, 0, 0, 0, cstLocation), now)
+	check("/stability/report?from=2026-08-04&to=2026-08-04", time.Date(2026, 8, 4, 0, 0, 0, 0, cstLocation), time.Date(2026, 8, 5, 0, 0, 0, 0, cstLocation))
+	check("/stability/report?from=2026-08-03&to=2026-08-05", time.Date(2026, 8, 3, 0, 0, 0, 0, cstLocation), now)
 
 	w = httptest.NewRecorder()
 	c, _ = gin.CreateTestContext(w)

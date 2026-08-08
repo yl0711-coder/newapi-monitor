@@ -6,14 +6,15 @@ import "testing"
 // 改造前 anomaly_* 归在 model 栏目,被 ModelAlertsEnabled 一起管——正是要修的问题。
 func TestAlertCategorySplit(t *testing.T) {
 	cases := map[string]string{
-		"error_rate":     "model",
-		"error_burst":    "model",
-		"sampler_down":   "model",
-		"burn_fast":      "model",
-		"anomaly_rate":   "anomaly",
-		"anomaly_billed": "anomaly",
-		"anomaly_burst":  "anomaly",
-		"infra_db_conn":  "server",
+		"error_rate":           "model",
+		"error_burst":          "model",
+		"sampler_down":         "model",
+		"burn_fast":            "model",
+		"anomaly_rate":         "anomaly",
+		"anomaly_billed":       "anomaly",
+		"anomaly_burst":        "anomaly",
+		"infra_db_conn":        "server",
+		"upstream_balance_low": "upstream",
 	}
 	for kind, want := range cases {
 		if got := alertCategory(kind); got != want {
@@ -39,16 +40,24 @@ func TestCategoryEmailEnabledIndependent(t *testing.T) {
 	if !categoryEmailEnabled(onlyAnom, "anomaly_burst") {
 		t.Error("关闭错误告警后,交付异常告警不应受影响")
 	}
+
+	upstreamOnly := AlertConfig{UpstreamBalanceAlertsEnabled: true}
+	if !categoryEmailEnabled(upstreamOnly, "upstream_balance_low") || categoryEmailEnabled(AlertConfig{}, "upstream_balance_low") {
+		t.Error("渠道余额邮件必须只受自己的栏目开关控制")
+	}
 }
 
 // TestCategoryCooldownIndependent 交付异常用自己的冷却(观察类,不需要和错误一样急)。
 func TestCategoryCooldownIndependent(t *testing.T) {
-	c := AlertConfig{CooldownMin: 30, AnomalyCooldownMin: 60}
+	c := AlertConfig{CooldownMin: 30, AnomalyCooldownMin: 60, UpstreamBalanceCooldownMin: 720}
 	if got := categoryCooldownMin(c, "error_rate"); got != 30 {
 		t.Errorf("错误冷却应为 30,得到 %d", got)
 	}
 	if got := categoryCooldownMin(c, "anomaly_rate"); got != 60 {
 		t.Errorf("交付异常冷却应为 60,得到 %d", got)
+	}
+	if got := categoryCooldownMin(c, "upstream_balance_low"); got != 720 {
+		t.Errorf("渠道余额冷却应为 720,得到 %d", got)
 	}
 	// 未配独立冷却时回落到通用值,避免老库升级后冷却变 0 导致刷屏。
 	if got := categoryCooldownMin(AlertConfig{CooldownMin: 30}, "anomaly_rate"); got != 30 {

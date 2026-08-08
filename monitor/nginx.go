@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"math"
 	"net/http"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -17,6 +18,37 @@ import (
 
 // nginx.go 只处理节点侧已经脱敏并聚合的 Nginx 入口事实。这里不接收原始日志，
 // 也不存 IP、query、Header、Cookie、Key、请求体、响应体或 Request ID 原值。
+
+var nginxNodeNamePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)
+
+// validateNginxSettings 在进程启动前拦住“页面显示已启用，但接收口永远不可用”
+// 的半配置状态。默认关闭时不增加任何新启动条件。
+func validateNginxSettings(s Settings) error {
+	if !s.NginxEnabled {
+		return nil
+	}
+	if strings.TrimSpace(s.IngestToken) == "" {
+		return fmt.Errorf("MONITOR_NGINX_ENABLED=true 时必须配置 MONITOR_INGEST_TOKEN")
+	}
+	if len(s.NginxAllowedNodes) == 0 {
+		return fmt.Errorf("MONITOR_NGINX_ENABLED=true 时必须配置 MONITOR_NGINX_ALLOWED_NODES")
+	}
+	if len(s.NginxAllowedNodes) > 32 {
+		return fmt.Errorf("MONITOR_NGINX_ALLOWED_NODES 最多允许 32 个节点")
+	}
+	seen := make(map[string]struct{}, len(s.NginxAllowedNodes))
+	for _, raw := range s.NginxAllowedNodes {
+		node := strings.TrimSpace(raw)
+		if !nginxNodeNamePattern.MatchString(node) {
+			return fmt.Errorf("MONITOR_NGINX_ALLOWED_NODES 包含无效节点名")
+		}
+		if _, exists := seen[node]; exists {
+			return fmt.Errorf("MONITOR_NGINX_ALLOWED_NODES 包含重复节点")
+		}
+		seen[node] = struct{}{}
+	}
+	return nil
+}
 
 type nginxIngestSample struct {
 	BucketTs          int64  `json:"bucket_ts"`
@@ -34,9 +66,15 @@ type nginxIngestSample struct {
 }
 
 type nginxIngestRequest struct {
-	Node    string              `json:"node"`
-	BatchID string              `json:"batch_id"`
-	Samples []nginxIngestSample `json:"samples"`
+	Node                      string              `json:"node"`
+	BatchID                   string              `json:"batch_id"`
+	Samples                   []nginxIngestSample `json:"samples"`
+	BacklogBytes              int64               `json:"backlog_bytes"`
+	BacklogKnown              bool                `json:"backlog_known"`
+	CursorDiscontinuities     int64               `json:"cursor_discontinuities"`
+	LastCursorDiscontinuityAt int64               `json:"last_cursor_discontinuity_at"`
+	DiscardedLines            int64               `json:"discarded_lines"`
+	LastDiscardedAt           int64               `json:"last_discarded_at"`
 }
 
 func normalizeNginxRoute(path string) string {
@@ -106,7 +144,10 @@ func validateNginxSample(sample nginxIngestSample, now int64, retentionDays int)
 	if bucket <= 0 || bucket < oldest || bucket > now+300 {
 		return NginxMinuteSample{}, fmt.Errorf("bucket_ts outside retention window")
 	}
-	if sample.Status != 0 && (sample.Status < 100 || sample.Status > 599) {
+	// HTTP status 是入口事实的核心维度，不存在“未知状态也计入请求数”
+	// 的合法口径。若放行 0，持有 ingest token 的异常客户端可以稀释
+	// 2xx/4xx/5xx 占比，使报表总请求与状态码之和不守恒。
+	if sample.Status < 100 || sample.Status > 599 {
 		return NginxMinuteSample{}, fmt.Errorf("invalid status")
 	}
 	if sample.UpstreamStatus != 0 && (sample.UpstreamStatus < 100 || sample.UpstreamStatus > 599) {
@@ -123,6 +164,16 @@ func validateNginxSample(sample nginxIngestSample, now int64, retentionDays int)
 	}
 	if sample.RequestTimeSumMS > sample.Count*86_400_000 || sample.UpstreamTimeSumMS > sample.Count*86_400_000 {
 		return NginxMinuteSample{}, fmt.Errorf("aggregate duration too large")
+	}
+	if sample.RequestTimeMaxMS > sample.RequestTimeSumMS {
+		return NginxMinuteSample{}, fmt.Errorf("request_time_max_ms exceeds sum")
+	}
+	// 0 ms 上游响应是合法值：此时 count=1,sum=0。只拒绝“无样本却有总和”。
+	if sample.UpstreamTimeCount == 0 && sample.UpstreamTimeSumMS != 0 {
+		return NginxMinuteSample{}, fmt.Errorf("upstream time sum without samples")
+	}
+	if sample.UpstreamTimeSumMS > sample.UpstreamTimeCount*86_400_000 {
+		return NginxMinuteSample{}, fmt.Errorf("upstream duration exceeds sample count")
 	}
 	return NginxMinuteSample{
 		BucketTs: bucket, Route: normalizeNginxRoute(sample.Route), Method: normalizeNginxMethod(sample.Method),
@@ -156,6 +207,13 @@ func mergeNginxSample(dst *NginxMinuteSample, src NginxMinuteSample) error {
 	if src.RequestTimeMaxMS > dst.RequestTimeMaxMS {
 		dst.RequestTimeMaxMS = src.RequestTimeMaxMS
 	}
+	// 单条样本的上限不能被同 key 多行合并绕过。
+	if dst.Count > 10_000_000 || dst.RequestTimeMaxMS > dst.RequestTimeSumMS ||
+		dst.UpstreamTimeCount > dst.Count || (dst.UpstreamTimeCount == 0 && dst.UpstreamTimeSumMS != 0) ||
+		dst.UpstreamTimeSumMS > dst.UpstreamTimeCount*86_400_000 || dst.BytesSent > dst.Count*(16<<30) ||
+		dst.RequestIDPresent > dst.Count {
+		return fmt.Errorf("merged aggregate exceeds limits")
+	}
 	return nil
 }
 
@@ -172,8 +230,10 @@ func (m *Monitor) ingestNginx(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid json"})
 		return
 	}
-	in.Node = clip(strings.TrimSpace(in.Node), 64)
-	if in.Node == "" || !m.nginxNodeAllowed(in.Node) {
+	in.Node = strings.TrimSpace(in.Node)
+	// 节点名是采集状态与样本的归属键，必须完整校验后再和白名单比较。
+	// 不能先截断：否则“合法白名单名 + 任意后缀”会被截成同一个节点名。
+	if !nginxNodeNamePattern.MatchString(in.Node) || !m.nginxNodeAllowed(in.Node) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "node not allowed"})
 		return
 	}
@@ -186,6 +246,15 @@ func (m *Monitor) ingestNginx(c *gin.Context) {
 		return
 	}
 	now := time.Now().Unix()
+	if in.BacklogBytes < 0 || in.BacklogBytes > 1<<50 || (!in.BacklogKnown && in.BacklogBytes != 0) ||
+		in.CursorDiscontinuities < 0 || in.CursorDiscontinuities > 1_000_000_000 ||
+		in.LastCursorDiscontinuityAt < 0 || in.LastCursorDiscontinuityAt > now+300 ||
+		(in.CursorDiscontinuities == 0) != (in.LastCursorDiscontinuityAt == 0) ||
+		in.DiscardedLines < 0 || in.DiscardedLines > 1_000_000_000_000 || in.LastDiscardedAt < 0 || in.LastDiscardedAt > now+300 ||
+		(in.DiscardedLines == 0) != (in.LastDiscardedAt == 0) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid collector telemetry"})
+		return
+	}
 	merged := make(map[string]NginxMinuteSample, len(in.Samples))
 	var firstTs, lastTs, acceptedCount int64
 	for i, raw := range in.Samples {
@@ -250,7 +319,13 @@ func (m *Monitor) ingestNginx(c *gin.Context) {
 				return err
 			}
 		}
-		state := NginxSourceState{Node: in.Node, LastEventTs: lastTs, LastIngestTs: now, LastBatchID: in.BatchID, AcceptedRows: int64(len(rows)), AcceptedCount: acceptedCount}
+		state := NginxSourceState{
+			Node: in.Node, LastEventTs: lastTs, LastIngestTs: now, LastBatchID: in.BatchID,
+			AcceptedRows: int64(len(rows)), AcceptedCount: acceptedCount,
+			BacklogBytes: in.BacklogBytes, BacklogKnown: in.BacklogKnown,
+			CursorDiscontinuities: in.CursorDiscontinuities, LastCursorDiscontinuityAt: in.LastCursorDiscontinuityAt,
+			DiscardedLines: in.DiscardedLines, LastDiscardedAt: in.LastDiscardedAt,
+		}
 		return tx.Clauses(clause.OnConflict{
 			Columns: []clause.Column{{Name: "node"}},
 			DoUpdates: clause.Assignments(map[string]any{
@@ -259,6 +334,14 @@ func (m *Monitor) ingestNginx(c *gin.Context) {
 				"last_batch_id":  in.BatchID,
 				"accepted_rows":  gorm.Expr("accepted_rows + excluded.accepted_rows"),
 				"accepted_count": gorm.Expr("accepted_count + excluded.accepted_count"),
+				"backlog_bytes":  in.BacklogBytes,
+				"backlog_known":  in.BacklogKnown,
+				"cursor_discontinuities": gorm.Expr(
+					"MAX(COALESCE(cursor_discontinuities, 0), excluded.cursor_discontinuities)"),
+				"last_cursor_discontinuity_at": gorm.Expr(
+					"MAX(COALESCE(last_cursor_discontinuity_at, 0), excluded.last_cursor_discontinuity_at)"),
+				"discarded_lines":   gorm.Expr("MAX(COALESCE(discarded_lines, 0), excluded.discarded_lines)"),
+				"last_discarded_at": gorm.Expr("MAX(COALESCE(last_discarded_at, 0), excluded.last_discarded_at)"),
 			}),
 		}).Create(&state).Error
 	})
@@ -323,12 +406,26 @@ type NginxEdgeDay struct {
 }
 
 type NginxEdgeSource struct {
-	Node         string `json:"node"`
-	LastEventTs  int64  `json:"last_event_ts"`
-	LastIngestTs int64  `json:"last_ingest_ts"`
-	AgeSec       int64  `json:"age_sec"`
-	Status       string `json:"status"`
+	Node                      string   `json:"node"`
+	LastEventTs               int64    `json:"last_event_ts"`
+	LastIngestTs              int64    `json:"last_ingest_ts"`
+	AgeSec                    int64    `json:"age_sec"`
+	EventAgeSec               int64    `json:"event_age_sec"`
+	Status                    string   `json:"status"`
+	HealthReasons             []string `json:"health_reasons,omitempty"`
+	BacklogBytes              int64    `json:"backlog_bytes"`
+	BacklogKnown              bool     `json:"backlog_known"`
+	CursorDiscontinuities     int64    `json:"cursor_discontinuities"`
+	LastCursorDiscontinuityAt int64    `json:"last_cursor_discontinuity_at"`
+	DiscardedLines            int64    `json:"discarded_lines"`
+	LastDiscardedAt           int64    `json:"last_discarded_at"`
 }
+
+const (
+	nginxRecentDataLossWindowSec = int64(15 * 60)
+	nginxEventLagWarnSec         = int64(3 * 60)
+	nginxBacklogWarnBytes        = int64(16 << 20)
+)
 
 type NginxEdgeReport struct {
 	Enabled       bool                 `json:"enabled"`
@@ -388,32 +485,73 @@ func (m *Monitor) nginxSources(ctx context.Context, now int64) []NginxEdgeSource
 	for _, node := range m.cfg.NginxAllowedNodes {
 		state, exists := byNode[node]
 		if !exists {
-			out = append(out, NginxEdgeSource{Node: node, AgeSec: -1, Status: "bad"})
+			out = append(out, NginxEdgeSource{Node: node, AgeSec: -1, EventAgeSec: -1, Status: "bad", HealthReasons: []string{"source_missing"}})
 			continue
 		}
 		age := now - state.LastIngestTs
 		if age < 0 {
 			age = 0
 		}
+		eventAge := now - state.LastEventTs
+		if eventAge < 0 {
+			eventAge = 0
+		}
 		status := "ok"
+		reasons := make([]string, 0, 3)
 		if age > 180 {
 			status = "warn"
+			reasons = append(reasons, "heartbeat_stale")
 		}
 		if age > 900 {
 			status = "bad"
 		}
-		out = append(out, NginxEdgeSource{Node: state.Node, LastEventTs: state.LastEventTs, LastIngestTs: state.LastIngestTs, AgeSec: age, Status: status})
+		if state.BacklogKnown && state.BacklogBytes >= nginxBacklogWarnBytes {
+			if status != "bad" {
+				status = "warn"
+			}
+			reasons = append(reasons, "backlog_large")
+		}
+		if state.BacklogKnown && state.BacklogBytes > 0 && state.LastEventTs > 0 && eventAge > nginxEventLagWarnSec {
+			if status != "bad" {
+				status = "warn"
+			}
+			reasons = append(reasons, "event_lag_with_backlog")
+		}
+		if state.LastCursorDiscontinuityAt > 0 && now-state.LastCursorDiscontinuityAt <= nginxRecentDataLossWindowSec {
+			if status != "bad" {
+				status = "warn"
+			}
+			reasons = append(reasons, "recent_cursor_discontinuity")
+		}
+		if state.LastDiscardedAt > 0 && now-state.LastDiscardedAt <= nginxRecentDataLossWindowSec {
+			if status != "bad" {
+				status = "warn"
+			}
+			reasons = append(reasons, "recent_discarded_lines")
+		}
+		out = append(out, NginxEdgeSource{
+			Node: state.Node, LastEventTs: state.LastEventTs, LastIngestTs: state.LastIngestTs, AgeSec: age,
+			EventAgeSec: eventAge, Status: status, HealthReasons: reasons,
+			BacklogBytes: state.BacklogBytes, BacklogKnown: state.BacklogKnown,
+			CursorDiscontinuities: state.CursorDiscontinuities, LastCursorDiscontinuityAt: state.LastCursorDiscontinuityAt,
+			DiscardedLines: state.DiscardedLines, LastDiscardedAt: state.LastDiscardedAt,
+		})
 	}
 	return out
 }
 
-func (m *Monitor) nginxSourceSummary(ctx context.Context, now int64) (connected bool, lastTs int64, requestIDCoverage *float64) {
+func (m *Monitor) nginxSourceSummary(ctx context.Context, now int64) (connected bool, healthy, total int, lastTs int64, requestIDCoverage *float64) {
 	if !m.cfg.NginxEnabled {
-		return false, 0, nil
+		return false, 0, 0, 0, nil
 	}
-	for _, source := range m.nginxSources(ctx, now) {
+	sources := m.nginxSources(ctx, now)
+	total = len(sources)
+	connected = total > 0
+	for _, source := range sources {
 		if source.Status == "ok" {
-			connected = true
+			healthy++
+		} else {
+			connected = false
 		}
 		if source.LastEventTs > lastTs {
 			lastTs = source.LastEventTs
@@ -425,7 +563,7 @@ func (m *Monitor) nginxSourceSummary(ctx context.Context, now int64) (connected 
 		v := float64(row.Present) / float64(row.Requests) * 100
 		requestIDCoverage = &v
 	}
-	return connected, lastTs, requestIDCoverage
+	return connected, healthy, total, lastTs, requestIDCoverage
 }
 
 func (m *Monitor) serveNginxEdge(c *gin.Context) {
@@ -443,7 +581,7 @@ func (m *Monitor) serveNginxEdge(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
 	defer cancel()
 	report := NginxEdgeReport{Enabled: true, RetentionDays: retentionDays, GeneratedAt: now.Unix(), From: time.Unix(scope.FromTs, 0).In(cstLocation).Format("2006-01-02"), To: time.Unix(scope.ToTs-1, 0).In(cstLocation).Format("2006-01-02")}
-	whereArgs := []any{scope.FromTs, scope.ToTs}
+	whereArgs := []any{scope.FromTs, nginxQueryToTs(scope, now.Unix())}
 	var total NginxEdgeAggregate
 	if err := m.storeDB.WithContext(ctx).Raw(`SELECT `+nginxAggregateColumns+` FROM nginx_minute_samples WHERE bucket_ts >= ? AND bucket_ts < ?`, whereArgs...).Scan(&total).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "读取入口聚合失败"})
@@ -495,4 +633,14 @@ func (m *Monitor) serveNginxEdge(c *gin.Context) {
 	}
 	report.Sources = m.nginxSources(ctx, now.Unix())
 	c.JSON(http.StatusOK, report)
+}
+
+// nginxQueryToTs keeps the report's half-open interval stable at an exact
+// minute boundary. Nginx samples are minute buckets: when now is HH:MM:00,
+// bucket_ts equals scope.ToTs and would otherwise disappear for one second.
+func nginxQueryToTs(scope stabilityScope, nowUnix int64) int64 {
+	if scope.ToTs == nowUnix {
+		return scope.ToTs + 1
+	}
+	return scope.ToTs
 }

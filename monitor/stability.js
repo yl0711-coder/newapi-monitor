@@ -26,7 +26,29 @@ window.monitorShellSetTab=function(name){
   if(icon)icon.innerHTML=ST_ICONS[h.icon]||'';
 };
 
-const st={inited:false,loaded:false,view:'history',layer:'delivery',days:7,custom:null,filters:{vendor:'',group:'',channel:'',model:''},allFilters:null,report:null,abort:null,problemAbort:null,drawerAbort:null,edgeAbort:null,edgeReport:null,generation:0,detailPromises:new Map(),detailControllers:new Map(),detailLoading:new Set(),expanded:new Set(),chart:null,drawerChart:null,edgeChart:null,drawer:null,drawerTab:'run',lastFocus:null};
+// 桌面侧栏只改变 Monitor 的可用内容宽度，不参与任何页面的数据状态。
+// 记住管理员自己的显示偏好；移动端仍使用既有的顶部 Tab。
+(function initMonitorSidebar(){
+  const shell=document.querySelector('.monitor-shell');
+  const button=document.getElementById('monitorSidebarToggle');
+  if(!shell||!button)return;
+  let saved=false;
+  try{saved=localStorage.getItem('nexusapi-monitor-sidebar-collapsed')==='1'}catch(e){}
+  const apply=collapsed=>{
+    shell.classList.toggle('sidebar-collapsed',collapsed);
+    button.setAttribute('aria-expanded',String(!collapsed));
+    button.setAttribute('aria-label',collapsed?'展开侧边栏':'收起侧边栏');
+    button.title=collapsed?'展开侧边栏':'收起侧边栏';
+    const label=button.querySelector('span');if(label)label.textContent=collapsed?'展开侧边栏':'收起侧边栏';
+    try{localStorage.setItem('nexusapi-monitor-sidebar-collapsed',collapsed?'1':'0')}catch(e){}
+    // 等 CSS 宽度过渡结束后统一通知 ECharts 及表格重新测量。
+    setTimeout(()=>window.dispatchEvent(new Event('resize')),220);
+  };
+  apply(saved);
+  button.addEventListener('click',()=>apply(!shell.classList.contains('sidebar-collapsed')));
+})();
+
+const st={inited:false,loaded:false,view:'history',layer:'delivery',days:7,custom:null,preset:'',filters:{vendor:'',group:'',channel:'',model:''},allFilters:null,report:null,abort:null,problemAbort:null,drawerAbort:null,edgeAbort:null,edgeReport:null,generation:0,detailPromises:new Map(),detailControllers:new Map(),detailLoading:new Set(),expanded:new Set(),chart:null,drawerChart:null,edgeChart:null,drawer:null,drawerTab:'run',lastFocus:null};
 const $=id=>document.getElementById(id);
 const esc=s=>String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const nfmt=n=>(+n||0).toLocaleString('zh-CN');
@@ -41,6 +63,15 @@ const delta=v=>v==null?'环比 —':`环比 ${v>=0?'+':''}${(+v).toFixed(2)} pp`
 const deltaClass=v=>v==null?'':v>=0?'up':'down';
 const bucketLabel=sec=>sec>=86400?`${sec/86400} 天/格`:sec>=3600?`${sec/3600} 小时/格`:`${Math.round(sec/60)} 分钟/格`;
 const encodeNav=value=>btoa(unescape(encodeURIComponent(JSON.stringify(value))));
+const cstDate=ts=>{const p=new Intl.DateTimeFormat('zh-CN',{timeZone:'Asia/Shanghai',year:'numeric',month:'2-digit',day:'2-digit'}).formatToParts(new Date(ts*1000));const v=t=>p.find(x=>x.type===t)?.value||'';return `${v('year')}-${v('month')}-${v('day')}`};
+const stPresetRange=(preset,now=Date.now())=>{
+  const ts=Math.floor(now/1000),today=cstDate(ts);
+  if(preset==='today')return {from:today,to:today};
+  if(preset==='yesterday'){const day=cstDate(ts-86400);return {from:day,to:day}}
+  const weekday=new Intl.DateTimeFormat('en-US',{timeZone:'Asia/Shanghai',weekday:'short'}).format(new Date(now));
+  const sinceMonday=({Mon:0,Tue:1,Wed:2,Thu:3,Fri:4,Sat:5,Sun:6})[weekday]??0;
+  return {from:cstDate(ts-sinceMonday*86400),to:today};
+};
 
 function queryParams(extra){
   const q=new URLSearchParams();
@@ -65,8 +96,8 @@ function applyNavigationContext(){
   if(!Object.keys(c).length)return false;
   const next={vendor:c.vendor||'',group:c.group||'',channel:c.channel||'',model:c.model||''};
   for(const key of Object.keys(next))if(st.filters[key]!==next[key]){st.filters[key]=next[key];changed=true}
-  if(c.from&&c.to){const custom={from:c.from,to:c.to};if(!st.custom||st.custom.from!==custom.from||st.custom.to!==custom.to){st.custom=custom;changed=true}}
-  else if(+c.days>0&&st.days!==+c.days){st.days=+c.days;st.custom=null;changed=true}
+  if(c.from&&c.to){const custom={from:c.from,to:c.to};if(!st.custom||st.custom.from!==custom.from||st.custom.to!==custom.to||st.preset!=='custom'){st.custom=custom;st.preset='custom';changed=true}}
+  else if(+c.days>0&&(st.days!==+c.days||st.custom||st.preset)){st.days=+c.days;st.custom=null;st.preset='';changed=true}
   syncRange();return changed;
 }
 function resize(){if(st.chart)st.chart.resize();if(st.drawerChart)st.drawerChart.resize();if(st.edgeChart)st.edgeChart.resize()}
@@ -74,9 +105,10 @@ function resize(){if(st.chart)st.chart.resize();if(st.drawerChart)st.drawerChart
 function init(){
   st.inited=true;
   document.querySelectorAll('[data-stability-view]').forEach(b=>b.addEventListener('click',()=>setView(b.dataset.stabilityView)));
-  document.querySelectorAll('[data-stability-days]').forEach(b=>b.addEventListener('click',()=>{st.days=+b.dataset.stabilityDays;st.custom=null;syncRange();reloadActiveLayer()}));
+  document.querySelectorAll('[data-stability-days]').forEach(b=>b.addEventListener('click',()=>{st.days=+b.dataset.stabilityDays;st.custom=null;st.preset='';$('stCustomRange')?.classList.remove('show');syncRange();reloadActiveLayer()}));
+  document.querySelectorAll('[data-stability-preset]').forEach(b=>b.addEventListener('click',()=>{st.preset=b.dataset.stabilityPreset;st.custom=stPresetRange(st.preset);$('stCustomRange')?.classList.remove('show');syncRange();reloadActiveLayer()}));
   $('stCustomToggle')?.addEventListener('click',()=>{$('stCustomRange')?.classList.toggle('show')});
-  $('stCustomApply')?.addEventListener('click',()=>{const from=$('stCustomFrom')?.value,to=$('stCustomTo')?.value;if(!from||!to||from>to){alert('请选择正确的开始和结束日期');return}st.custom={from,to};syncRange();reloadActiveLayer()});
+  $('stCustomApply')?.addEventListener('click',()=>{const from=$('stCustomFrom')?.value,to=$('stCustomTo')?.value;if(!from||!to||from>to){alert('请选择正确的开始和结束日期');return}st.custom={from,to};st.preset='custom';syncRange();reloadActiveLayer()});
   document.querySelectorAll('[data-stability-layer]').forEach(b=>b.addEventListener('click',()=>setLayer(b.dataset.stabilityLayer)));
   for(const id of ['stVendor','stGroup','stChannel','stModel'])$(id)?.addEventListener('change',()=>{readFilters();loadReport()});
   $('stFilterReset')?.addEventListener('click',()=>{st.filters={vendor:'',group:'',channel:'',model:''};renderFilterOptions();loadReport()});
@@ -109,7 +141,7 @@ function setLayer(layer){
   if($('stEdgeLayer'))$('stEdgeLayer').hidden=layer!=='edge';
   if(layer==='delivery')setTimeout(resize,60);else loadEdge();
 }
-function syncRange(){document.querySelectorAll('[data-stability-days]').forEach(b=>b.classList.toggle('active',!st.custom&&+b.dataset.stabilityDays===st.days));$('stCustomToggle')?.classList.toggle('active',!!st.custom)}
+function syncRange(){document.querySelectorAll('[data-stability-days]').forEach(b=>b.classList.toggle('active',!st.custom&&+b.dataset.stabilityDays===st.days));document.querySelectorAll('[data-stability-preset]').forEach(b=>b.classList.toggle('active',b.dataset.stabilityPreset===st.preset));$('stCustomToggle')?.classList.toggle('active',st.preset==='custom')}
 function readFilters(){st.filters={vendor:$('stVendor')?.value||'',group:$('stGroup')?.value||'',channel:$('stChannel')?.value||'',model:$('stModel')?.value||''}}
 function reloadActiveLayer(){if(st.layer==='edge')loadEdge();else loadReport()}
 
@@ -144,7 +176,7 @@ function renderEdge(d){
     +`<section class="stability-kpis"><article class="stability-kpi"><small>入口请求</small><b>${nfmt(s.requests)}</b><em>${esc(d.from||'—')} 至 ${esc(d.to||'—')}</em></article><article class="stability-kpi"><small>HTTP 4xx / 5xx</small><b class="${s.status_5xx?'bad':''}">${nfmt(s.status_4xx)} / ${nfmt(s.status_5xx)}</b><em>客观状态码，不自动归因</em></article><article class="stability-kpi"><small>入口平均 / 最大耗时</small><b>${(+s.avg_request_ms||0).toFixed(0)} / ${nfmt(s.max_request_ms)} ms</b><em>upstream 平均 ${(+s.avg_upstream_ms||0).toFixed(0)} ms</em></article><article class="stability-kpi"><small>Request ID 携带率</small><b>${pct(s.request_id_coverage)}</b><em>仅“存在”，不是关联成功率 · ${bytes(s.bytes_sent)}</em></article></section>`
     +`<section class="stability-panel"><div class="stability-panel-head"><div><h3>每日入口状态变化</h3><p>折线为 HTTP 5xx 占比，柱形为入口请求量</p></div></div><div id="stEdgeChart" class="stability-chart"></div></section>`
     +`<section class="stability-ranking-grid"><article class="stability-panel"><div class="stability-panel-head"><div><h3>路径汇总</h3><p>路径已在节点侧归一化，不含 query</p></div></div>${edgeRows(d.routes)}</article><article class="stability-panel"><div class="stability-panel-head"><div><h3>节点汇总</h3><p>用于判断异常是否集中在单一入口节点</p></div></div>${edgeRows(d.nodes)}</article></section>`
-    +`<section class="stability-panel"><div class="stability-panel-head"><div><h3>采集器状态</h3><p>只表示聚合数据是否持续送达，不等于业务可用性</p></div></div>${sources.map(x=>`<div class="stability-model-row"><b>${esc(x.node)}</b><span>${x.status==='ok'?'正常':x.status==='warn'?'延迟':'中断'}</span><small>最新事件 ${dateTime(x.last_event_ts)}</small><small>送达 ${age(x.age_sec)} 前</small></div>`).join('')||'<div class="stability-empty"><p>已启用但尚未收到采集器数据</p></div>'}</section>`;
+    +`<section class="stability-panel"><div class="stability-panel-head"><div><h3>采集器状态</h3><p>只表示聚合数据是否持续送达，不等于业务可用性；“游标不连续”是客观采集异常，不自动推断丢失量。</p></div></div>${sources.map(x=>`<div class="stability-model-row"><b>${esc(x.node)}</b><span>${x.status==='ok'?'正常':x.status==='warn'?'延迟':'中断'}</span><small>最新事件 ${dateTime(x.last_event_ts)} · 送达 ${age(x.age_sec)} 前</small><small>${x.backlog_known?'待读 '+bytes(x.backlog_bytes):'待读未知'} · ${x.cursor_discontinuities?`游标不连续 ${nfmt(x.cursor_discontinuities)} 次，最近 ${dateTime(x.last_cursor_discontinuity_at)}`:'游标连续'} · ${x.discarded_lines?`跳过无效或超窗日志 ${nfmt(x.discarded_lines)} 行，最近 ${dateTime(x.last_discarded_at)}`:'未跳过日志'}</small></div>`).join('')||'<div class="stability-empty"><p>已启用但尚未收到采集器数据</p></div>'}</section>`;
   const chart=$('stEdgeChart');if(!chart||!window.echarts)return;if(st.edgeChart)st.edgeChart.dispose();st.edgeChart=echarts.init(chart);const rows=d.daily||[];
   st.edgeChart.setOption({animation:false,grid:{left:50,right:55,top:28,bottom:38},tooltip:{trigger:'axis'},xAxis:{type:'category',data:rows.map(x=>x.date.slice(5)),axisLabel:{color:'#7e8a9f'},axisLine:{lineStyle:{color:'#354055'}}},yAxis:[{type:'value',axisLabel:{color:'#7e8a9f',formatter:'{value}%'},splitLine:{lineStyle:{color:'#283143'}}},{type:'value',axisLabel:{color:'#657188'},splitLine:{show:false}}],series:[{name:'5xx占比',type:'line',smooth:.2,data:rows.map(x=>x.requests?+(x.status_5xx/x.requests*100).toFixed(3):null),lineStyle:{width:2,color:'#e45b69'},itemStyle:{color:'#e45b69'}},{name:'请求量',type:'bar',yAxisIndex:1,data:rows.map(x=>x.requests),barMaxWidth:20,itemStyle:{color:'rgba(79,153,229,.28)'}}]});
 }
@@ -197,7 +229,10 @@ function renderSources(meta){
   const problemPending=+s.problem_pending_minutes||0,problemCoverage=+s.problem_coverage_to||0;
   const problemState=problemPending?'wait':problemCoverage?'ok':'wait';
   const problemLabel=problemPending?`积压 ${nfmt(problemPending)} 分钟`:problemCoverage?`至 ${dateTime(problemCoverage)}`:'积累中';
-  el.innerHTML=`<span><i></i>${esc(meta?.from||'—')}～${esc(meta?.to||'—')}</span><span title="NewAPI 本地采样新鲜度"><i class="${s.newapi_last_ts?'ok':'wait'}"></i>NewAPI ${s.newapi_last_ts?age(s.newapi_data_age_sec):'无数据'}</span><span title="原始错误采集完整覆盖时间；存在积压时问题排行暂不包含未完成分钟"><i class="${problemState}"></i>错误 ${problemLabel}</span><span title="Nginx 旁路采集状态"><i class="${s.nginx_connected?'ok':'wait'}"></i>Nginx ${s.nginx_connected?'已接入':'未接入'}</span>`;
+  const nginxStatus=s.nginx_status||(s.nginx_connected?'ok':s.nginx_enabled?'degraded':'disabled');
+  const nginxClass=nginxStatus==='ok'?'ok':nginxStatus==='degraded'?'bad':'wait';
+  const nginxLabel=nginxStatus==='ok'?`${nfmt(s.nginx_healthy_sources||s.nginx_source_count)}/${nfmt(s.nginx_source_count)} 正常`:nginxStatus==='degraded'?`${nfmt(s.nginx_healthy_sources)}/${nfmt(s.nginx_source_count)} 异常`:'未启用';
+  el.innerHTML=`<span><i></i>${esc(meta?.from||'—')}～${esc(meta?.to||'—')}</span><span title="NewAPI 本地采样新鲜度"><i class="${s.newapi_last_ts?'ok':'wait'}"></i>NewAPI ${s.newapi_last_ts?age(s.newapi_data_age_sec):'无数据'}</span><span title="原始错误采集完整覆盖时间；存在积压时问题排行暂不包含未完成分钟"><i class="${problemState}"></i>错误 ${problemLabel}</span><span title="Nginx 允许节点健康数 / 配置节点数"><i class="${nginxClass}"></i>Nginx ${nginxLabel}</span>`;
 }
 function renderKpis(d){const s=d.summary,p=d.previous,pc=d.meta?.comparison_coverage||{};const k=$('stKpis');if(!k)return;k.innerHTML=[
   ['区间稳定性',pct(s.stability),delta(d.delta_pp),health(s)],

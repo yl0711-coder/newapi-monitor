@@ -14,6 +14,8 @@
 - **零侵入**:只读、小窗口、有预算的后台采样；页面只读本地 SQLite，不随访问量查询生产库。
 - **历史稳定性**:分组 / 渠道 / 模型长期趋势、同比环比、问题原文聚合与渠道使用排行。
 - **渠道配置留痕**:渠道删除后保留最后快照；倍率更新追加版本，不覆盖历史版本。
+- **上游余额同步**:按主域名配置 NewAPI / Sub2API 账户，凭据本地加密保存，失败保留最后成功值并指数退避。
+- **动态充值预警**:用最近完整自然日的本地小时汇总和双方倍率估算余额可用天数；余额、倍率或数据覆盖不可靠时停止评估，不用残缺数据误报。
 - **三态稳定性**:成功 / 异常(`client_gone` 等客户端中断)/ 失败(上游错误),按 分组 × 渠道 × 模型 聚合。
 - **响应耗时**:P50/P95 时延、TTFB/TTFT 首字延迟分布、出字速度(tok/s)。
 - **登录鉴权**:复用 new-api 用户身份(调其 `/api/user/login` 验证),按角色分权,无需自建账号。
@@ -45,6 +47,9 @@ docker run -d --name newapi-monitor \
 | `NEWAPI_LOG_DSN` | new-api 库的**只读** DSN(MySQL) | 必填 |
 | `MONITOR_NEWAPI_BASE_URL` | new-api 地址,用于登录鉴权 | 必填 |
 | `MONITOR_SESSION_SECRET` | 会话签名密钥(`openssl rand -hex 32`) | 留空则启动随机生成 |
+| `MONITOR_UPSTREAM_CREDENTIAL_SECRET` | 渠道管理中上游令牌的 AES-256-GCM 加密密钥；生产应长期固定并与会话密钥分离 | 显式会话密钥；两者都未配置时拒绝保存凭据 |
+| `MONITOR_UPSTREAM_SYNC_MINUTES` | NewAPI / Sub2API 上游账户余额正常同步间隔；失败自动指数退避 | `5` |
+| `MONITOR_UPSTREAM_SYNC_TIMEOUT_SECONDS` | 单个上游同步请求超时 | `15` |
 | `MONITOR_ADDR` | 监听地址 | `:8090` |
 | `MONITOR_PORTAL_ADDR` | 客户用量门户独立监听地址；留空则不启用 | 留空 |
 | `MONITOR_USAGE_REDIS_ADDR` | 客户用量聚合结果 Redis 私网地址；留空时自动使用有界本机短缓存 | 留空 |
@@ -63,9 +68,16 @@ docker run -d --name newapi-monitor \
 | `MONITOR_STABILITY_RETENTION_DAYS` | 稳定性本地数据留存；运行时至少取 `2×QUERY_MAX+1`，保证上一周期对比完整 | `181` |
 | `MONITOR_STABILITY_PROBLEM_SAMPLE_SECONDS` | 原始错误签名后台采样间隔；高峰时自动按本地游标续采 | `300` |
 | `MONITOR_STABILITY_BACKFILL_ENABLED` | 历史补数总开关；关闭后人工、自动修洞和重启续跑都不访问生产历史库 | `true` |
+| `MONITOR_NGINX_ENABLED` | Nginx 入口层脱敏分钟聚合开关；启用前必须配置 ingest token 和节点白名单 | `false` |
+| `MONITOR_NGINX_RETENTION_DAYS` | Nginx 入口分钟聚合本地留存天数；需与节点采集器一致 | `7` |
+| `MONITOR_NGINX_ALLOWED_NODES` | 允许上报 Nginx 聚合的节点名白名单，逗号分隔 | 留空 |
 | `MONITOR_HEARTBEAT_URL` | dead-man 心跳 URL(如 healthchecks.io);留空=不启用 | 留空 |
 | `MONITOR_SITE_NAME` | 对外看板站点名**兜底值**;站点名/favicon 默认部署时从主站 new-api 的 `system_name`/`logo` 同步,此项仅主站不可达时兜底 | 留空 |
 | `MONITOR_INGEST_TOKEN` | 「被拒请求」接收口 `POST /internal/rejections` 的鉴权 token,供各节点 [newapi-reject-collector](https://github.com/yl0711-coder/newapi-reject-collector) 推送前置拒绝;**留空=关闭该接口** | 留空 |
+
+Nginx 入口层只接收节点端已脱敏、已按分钟聚合的事实，不读取原始请求日志。
+安全边界、Nginx 专用日志格式、轮转要求和滚动接入流程见
+[`docs/nginx-collector.md`](docs/nginx-collector.md)。
 
 ## 被拒请求(前置拒绝 · logs 盲区)
 

@@ -25,6 +25,13 @@ type AlertConfig struct {
 	// 曾导致"勾掉保存又自动勾上"的 bug。老库升级的默认开由 loadAlertConfig 的 migrated 判断兜底。
 	ModelAlertsEnabled  bool `json:"model_alerts_enabled"`
 	ServerAlertsEnabled bool `json:"server_alerts_enabled"`
+	// 渠道余额预警独立开关。它只读取 Monitor 本地小时汇总和本地保存的余额，
+	// 不会因为报警评估而查询 NewAPI 生产库或上游面板。
+	UpstreamBalanceAlertsEnabled bool    `json:"upstream_balance_alerts_enabled"`
+	UpstreamBalanceRunwayDays    float64 `json:"upstream_balance_runway_days"`
+	UpstreamBalanceLookbackDays  int     `json:"upstream_balance_lookback_days"`
+	UpstreamBalanceMinCoverage   float64 `json:"upstream_balance_min_coverage_pct"`
+	UpstreamBalanceCooldownMin   int     `json:"upstream_balance_cooldown_min"`
 
 	// 发件 SMTP
 	SMTPHost     string `json:"smtp_host"`
@@ -75,17 +82,22 @@ type AlertConfig struct {
 // defaultAlertConfig 建议配置(预填到页面,用户可改)。
 func defaultAlertConfig() AlertConfig {
 	return AlertConfig{
-		ID:                  1,
-		Enabled:             false, // 配好 SMTP 前默认关闭,避免空发
-		ModelAlertsEnabled:  true,
-		ServerAlertsEnabled: true,
-		SMTPPort:            465,
-		SMTPSSL:             true,
-		EvalWindowMin:       15,
-		ErrRatePct:          20,
-		ErrMinCount:         5,
-		ErrBurstCount:       10,
-		AnomalyBurstBuckets: 3,
+		ID:                           1,
+		Enabled:                      false, // 配好 SMTP 前默认关闭,避免空发
+		ModelAlertsEnabled:           true,
+		ServerAlertsEnabled:          true,
+		UpstreamBalanceAlertsEnabled: true,
+		UpstreamBalanceRunwayDays:    1,
+		UpstreamBalanceLookbackDays:  7,
+		UpstreamBalanceMinCoverage:   95,
+		UpstreamBalanceCooldownMin:   720,
+		SMTPPort:                     465,
+		SMTPSSL:                      true,
+		EvalWindowMin:                15,
+		ErrRatePct:                   20,
+		ErrMinCount:                  5,
+		ErrBurstCount:                10,
+		AnomalyBurstBuckets:          3,
 		// 阈值按真实数据标定:7 天内按 15 分钟窗口(渠道×模型)切,有交付异常的窗口 130 个,
 		// 其中 ≥5 条的仅 21 个(约每天 3 次)。故 8% / ≥5 条不会造成告警洪水。
 		// 旧默认 AnomalyMinCount=8 是按旧口径(含 219 条误报)定的,新口径下改 5。
@@ -126,6 +138,13 @@ func (m *Monitor) loadAlertConfig() AlertConfig {
 }
 
 func (m *Monitor) saveAlertConfig(c AlertConfig) error {
+	policy := upstreamBalancePolicyFor(c)
+	c.UpstreamBalanceRunwayDays = policy.RunwayDays
+	c.UpstreamBalanceLookbackDays = policy.Lookback
+	c.UpstreamBalanceMinCoverage = policy.MinCoverage
+	if c.UpstreamBalanceCooldownMin < 60 || c.UpstreamBalanceCooldownMin > 10080 {
+		c.UpstreamBalanceCooldownMin = defaultAlertConfig().UpstreamBalanceCooldownMin
+	}
 	c.ID = 1
 	c.UpdatedAt = time.Now().Unix()
 	return m.storeDB.Clauses(clause.OnConflict{
@@ -138,7 +157,7 @@ func (m *Monitor) saveAlertConfig(c AlertConfig) error {
 func (m *Monitor) inCooldown(kind, target string, cooldownMin int, now int64) bool {
 	var cnt int64
 	m.storeDB.Model(&AlertLog{}).
-		Where("kind = ? AND target = ? AND ts > ?", kind, target, now-int64(cooldownMin)*60).
+		Where("kind IN ? AND target = ? AND ts > ?", []string{kind, kind + "_FAILED"}, target, now-int64(cooldownMin)*60).
 		Count(&cnt)
 	return cnt > 0
 }
@@ -222,6 +241,7 @@ func (m *Monitor) evaluateAlerts(nowUnix int64) {
 	}
 
 	m.evaluateBurn(c, nowUnix) // SLO 错误预算燃烧告警(快烧/慢烧)
+	m.evaluateUpstreamBalanceAlerts(c, nowUnix)
 
 	// 采样器掉线
 	if c.SamplerDownEnabled {
@@ -297,7 +317,8 @@ func anomalyRuleFor(c AlertConfig, r Row) string {
 	return ""
 }
 
-// alertCategory 按 kind 归三栏目:infra_*=服务端,anomaly_*=交付异常,其余=模型(错误/采样器/燃烧)。
+// alertCategory 按 kind 归四栏目:infra_*=服务端、anomaly_*=交付异常、
+// upstream_balance*=渠道余额，其余=模型(错误/采样器/燃烧)。
 // 交付异常单列一栏是刻意的:它必须能和错误告警分开开关、分开冷却。
 // 若并回 "model",就会被 ModelAlertsEnabled 一起管——那正是改造前的问题。
 func alertCategory(kind string) string {
@@ -306,6 +327,8 @@ func alertCategory(kind string) string {
 		return "server"
 	case strings.HasPrefix(kind, "anomaly_"):
 		return "anomaly"
+	case strings.HasPrefix(kind, "upstream_balance"):
+		return "upstream"
 	default:
 		return "model"
 	}
@@ -318,13 +341,19 @@ func categoryEmailEnabled(c AlertConfig, kind string) bool {
 		return c.ServerAlertsEnabled
 	case "anomaly":
 		return c.AnomalyAlertsEnabled
+	case "upstream":
+		return c.UpstreamBalanceAlertsEnabled
 	default:
 		return c.ModelAlertsEnabled
 	}
 }
 
-// categoryCooldownMin 该 kind 用的冷却分钟数:交付异常有独立冷却,其余用通用值。
+// categoryCooldownMin 返回该 kind 的独立冷却；渠道余额、交付异常各自配置，
+// 其他规则沿用通用冷却。
 func categoryCooldownMin(c AlertConfig, kind string) int {
+	if alertCategory(kind) == "upstream" && c.UpstreamBalanceCooldownMin > 0 {
+		return c.UpstreamBalanceCooldownMin
+	}
 	if alertCategory(kind) == "anomaly" && c.AnomalyCooldownMin > 0 {
 		return c.AnomalyCooldownMin
 	}

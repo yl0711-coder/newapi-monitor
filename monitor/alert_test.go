@@ -55,6 +55,10 @@ func TestAlertConfigRoundtrip(t *testing.T) {
 	if cfg["err_rate_pct"].(float64) != 20 {
 		t.Errorf("默认 err_rate_pct 应为 20,实际 %v", cfg["err_rate_pct"])
 	}
+	if !cfg["upstream_balance_alerts_enabled"].(bool) || cfg["upstream_balance_runway_days"].(float64) != 1 ||
+		cfg["upstream_balance_lookback_days"].(float64) != 7 || cfg["upstream_balance_min_coverage_pct"].(float64) != 95 {
+		t.Errorf("渠道余额动态预警默认值异常: %+v", cfg)
+	}
 	if d["smtp_password_set"].(bool) {
 		t.Error("未存过时 smtp_password_set 应为 false")
 	}
@@ -125,8 +129,47 @@ func TestAlertCategoryGate(t *testing.T) {
 		t.Errorf("开栏目应尝试发送(无收件人→_FAILED) = %+v", logs[1])
 	}
 	// 归类函数本身(仅 模型/服务端 两栏目)
-	if alertCategory("infra_probe_cert") != "server" || alertCategory("burn_fast") != "model" || alertCategory("sampler_down") != "model" {
+	if alertCategory("infra_probe_cert") != "server" || alertCategory("burn_fast") != "model" ||
+		alertCategory("sampler_down") != "model" || alertCategory("upstream_balance_low") != "upstream" {
 		t.Error("alertCategory 归类不对")
+	}
+}
+
+func TestUpstreamBalancePolicyPersistsAndNormalizes(t *testing.T) {
+	m := &Monitor{cfg: Settings{SessionSecret: "test-secret"}, chNames: map[string]string{}}
+	if err := m.openStore(t.TempDir() + "/t.db"); err != nil {
+		t.Fatal(err)
+	}
+	c := defaultAlertConfig()
+	c.UpstreamBalanceAlertsEnabled = false
+	c.UpstreamBalanceRunwayDays = 2.5
+	c.UpstreamBalanceLookbackDays = 14
+	c.UpstreamBalanceMinCoverage = 98.5
+	c.UpstreamBalanceCooldownMin = 1440
+	if err := m.saveAlertConfig(c); err != nil {
+		t.Fatal(err)
+	}
+	got := m.loadAlertConfig()
+	if got.UpstreamBalanceAlertsEnabled || got.UpstreamBalanceRunwayDays != 2.5 ||
+		got.UpstreamBalanceLookbackDays != 14 || got.UpstreamBalanceMinCoverage != 98.5 ||
+		got.UpstreamBalanceCooldownMin != 1440 {
+		t.Fatalf("渠道余额预警配置未按原值持久化: %+v", got)
+	}
+
+	c.UpstreamBalanceRunwayDays = -1
+	c.UpstreamBalanceLookbackDays = 99
+	c.UpstreamBalanceMinCoverage = 10
+	c.UpstreamBalanceCooldownMin = 1
+	if err := m.saveAlertConfig(c); err != nil {
+		t.Fatal(err)
+	}
+	got = m.loadAlertConfig()
+	want := defaultAlertConfig()
+	if got.UpstreamBalanceRunwayDays != want.UpstreamBalanceRunwayDays ||
+		got.UpstreamBalanceLookbackDays != want.UpstreamBalanceLookbackDays ||
+		got.UpstreamBalanceMinCoverage != want.UpstreamBalanceMinCoverage ||
+		got.UpstreamBalanceCooldownMin != want.UpstreamBalanceCooldownMin {
+		t.Fatalf("越界配置未回落到安全默认值: %+v", got)
 	}
 }
 

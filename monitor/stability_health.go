@@ -9,17 +9,27 @@ import (
 )
 
 type stabilityHealthResponse struct {
-	Status                    string `json:"status"`
-	CheckedAt                 int64  `json:"checked_at"`
-	MainSamplerLastSuccess    int64  `json:"main_sampler_last_success"`
-	MainSamplerAgeSec         int64  `json:"main_sampler_age_sec"`
-	ProblemSamplerLastSuccess int64  `json:"problem_sampler_last_success"`
-	ProblemSamplerAgeSec      int64  `json:"problem_sampler_age_sec"`
-	ProblemSamplerLastFailure int64  `json:"problem_sampler_last_failure"`
-	ProblemCoverageTo         int64  `json:"problem_coverage_to"`
-	ProblemPendingMinutes     int64  `json:"problem_pending_minutes"`
-	StoreReachable            bool   `json:"store_reachable"`
-	StoreBytes                int64  `json:"store_bytes"`
+	Status                     string `json:"status"`
+	CheckedAt                  int64  `json:"checked_at"`
+	MainSamplerLastSuccess     int64  `json:"main_sampler_last_success"`
+	MainSamplerAgeSec          int64  `json:"main_sampler_age_sec"`
+	ProblemSamplerLastSuccess  int64  `json:"problem_sampler_last_success"`
+	ProblemSamplerAgeSec       int64  `json:"problem_sampler_age_sec"`
+	ProblemSamplerLastFailure  int64  `json:"problem_sampler_last_failure"`
+	ProblemCoverageTo          int64  `json:"problem_coverage_to"`
+	ProblemPendingMinutes      int64  `json:"problem_pending_minutes"`
+	StoreReachable             bool   `json:"store_reachable"`
+	StoreBytes                 int64  `json:"store_bytes"`
+	NginxEnabled               bool   `json:"nginx_enabled"`
+	NginxSourceCount           int    `json:"nginx_source_count"`
+	NginxUnhealthySources      int    `json:"nginx_unhealthy_sources"`
+	NginxBacklogBytes          int64  `json:"nginx_backlog_bytes"`
+	NginxBacklogUnknown        int    `json:"nginx_backlog_unknown"`
+	NginxLaggingSources        int    `json:"nginx_lagging_sources"`
+	NginxLargeBacklogSources   int    `json:"nginx_large_backlog_sources"`
+	NginxCursorDiscontinuities int64  `json:"nginx_cursor_discontinuities"`
+	NginxDiscardedLines        int64  `json:"nginx_discarded_lines"`
+	NginxRecentDataLossSources int    `json:"nginx_recent_data_loss_sources"`
 }
 
 // serveStabilityHealth 只检查 Monitor 自身和本地采集状态，不主动查询 NewAPI 生产库，
@@ -29,6 +39,7 @@ func (m *Monitor) serveStabilityHealth(c *gin.Context) {
 	result := stabilityHealthResponse{
 		Status: "ok", CheckedAt: now, MainSamplerLastSuccess: m.lastRun.Load(),
 		ProblemSamplerLastSuccess: m.problemLastSuccess.Load(), ProblemSamplerLastFailure: m.problemLastFailure.Load(),
+		NginxEnabled: m.cfg.NginxEnabled,
 	}
 	if result.MainSamplerLastSuccess > 0 {
 		result.MainSamplerAgeSec = now - result.MainSamplerLastSuccess
@@ -81,6 +92,39 @@ func (m *Monitor) serveStabilityHealth(c *gin.Context) {
 	if m.cfg.StabilityEnabled {
 		maxProblemAge := stabilityProblemIntervalSeconds(m.cfg.StabilityProblemSampleSec)*3 + 120
 		if result.ProblemSamplerLastSuccess == 0 || result.ProblemCoverageTo == 0 || result.ProblemSamplerAgeSec > maxProblemAge {
+			result.Status = "degraded"
+		}
+	}
+	if m.cfg.NginxEnabled {
+		sources := m.nginxSources(ctx, now)
+		result.NginxSourceCount = len(sources)
+		for _, source := range sources {
+			if source.Status != "ok" {
+				result.NginxUnhealthySources++
+			}
+			if source.BacklogKnown {
+				result.NginxBacklogBytes += source.BacklogBytes
+			} else {
+				result.NginxBacklogUnknown++
+			}
+			result.NginxCursorDiscontinuities += source.CursorDiscontinuities
+			result.NginxDiscardedLines += source.DiscardedLines
+			recentDataLoss := false
+			for _, reason := range source.HealthReasons {
+				switch reason {
+				case "event_lag_with_backlog":
+					result.NginxLaggingSources++
+				case "backlog_large":
+					result.NginxLargeBacklogSources++
+				case "recent_cursor_discontinuity", "recent_discarded_lines":
+					recentDataLoss = true
+				}
+			}
+			if recentDataLoss {
+				result.NginxRecentDataLossSources++
+			}
+		}
+		if len(sources) != len(m.cfg.NginxAllowedNodes) || result.NginxUnhealthySources > 0 {
 			result.Status = "degraded"
 		}
 	}

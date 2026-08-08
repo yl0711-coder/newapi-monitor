@@ -202,7 +202,11 @@ type StabilitySourceStatus struct {
 	ProblemPendingMinutes     int64    `json:"problem_pending_minutes"`
 	ProblemSamplerLastSuccess int64    `json:"problem_sampler_last_success"`
 	ProblemSamplerLastFailure int64    `json:"problem_sampler_last_failure"`
+	NginxEnabled              bool     `json:"nginx_enabled"`
+	NginxStatus               string   `json:"nginx_status"`
 	NginxConnected            bool     `json:"nginx_connected"`
+	NginxHealthySources       int      `json:"nginx_healthy_sources"`
+	NginxSourceCount          int      `json:"nginx_source_count"`
 	NginxLastTs               int64    `json:"nginx_last_ts"`
 	RequestIDCoverage         *float64 `json:"request_id_coverage"`
 }
@@ -999,7 +1003,16 @@ func (m *Monitor) buildStabilityReportWithDetails(ctx context.Context, scope sta
 	if meta.Sources.NewAPILastTs > meta.Sources.ProblemCoverageTo && meta.Sources.ProblemCoverageTo > 0 {
 		meta.Sources.ProblemCoverageLagSec = meta.Sources.NewAPILastTs - meta.Sources.ProblemCoverageTo
 	}
-	meta.Sources.NginxConnected, meta.Sources.NginxLastTs, meta.Sources.RequestIDCoverage = m.nginxSourceSummary(ctx, now)
+	meta.Sources.NginxEnabled = m.cfg.NginxEnabled
+	meta.Sources.NginxConnected, meta.Sources.NginxHealthySources, meta.Sources.NginxSourceCount,
+		meta.Sources.NginxLastTs, meta.Sources.RequestIDCoverage = m.nginxSourceSummary(ctx, now)
+	meta.Sources.NginxStatus = "disabled"
+	if meta.Sources.NginxEnabled {
+		meta.Sources.NginxStatus = "degraded"
+		if meta.Sources.NginxConnected {
+			meta.Sources.NginxStatus = "ok"
+		}
+	}
 
 	return &StabilityReport{Enabled: true, Meta: meta, Filters: buildStabilityFilters(rows), Summary: totalMetrics, Previous: prevMetrics, DeltaPP: deltaPP(totalMetrics, prevMetrics), Groups: resultGroups, Rankings: StabilityRankings{Groups: groupRanking, Channels: channelRanking, Models: modelRanking}}, nil
 }

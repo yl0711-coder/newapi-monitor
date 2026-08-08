@@ -237,12 +237,18 @@ type NginxIngestBatch struct {
 
 // NginxSourceState 是入口数据源健康状态；只保留每节点最后进度，不随时间增长。
 type NginxSourceState struct {
-	Node          string `gorm:"primaryKey;size:64"`
-	LastEventTs   int64
-	LastIngestTs  int64
-	LastBatchID   string `gorm:"size:64"`
-	AcceptedRows  int64
-	AcceptedCount int64
+	Node                      string `gorm:"primaryKey;size:64"`
+	LastEventTs               int64
+	LastIngestTs              int64
+	LastBatchID               string `gorm:"size:64"`
+	AcceptedRows              int64
+	AcceptedCount             int64
+	BacklogBytes              int64
+	BacklogKnown              bool
+	CursorDiscontinuities     int64
+	LastCursorDiscontinuityAt int64
+	DiscardedLines            int64
+	LastDiscardedAt           int64
 }
 
 // 直方图档位上界。lat 单位秒,ttft 单位毫秒。
@@ -267,12 +273,14 @@ func (m *Monitor) openStore(path string) error {
 	// 交付异常告警列同理:老库升级时这些列刚建出来是零值(开关 false、阈值 0 = 规则不启用),
 	// 需按 defaultAlertConfig 补一次,否则升级后交付异常告警静默失效。
 	hadAnomalyAlerts := db.Migrator().HasColumn(&AlertConfig{}, "anomaly_alerts_enabled")
+	hadUpstreamBalanceAlerts := db.Migrator().HasColumn(&AlertConfig{}, "upstream_balance_alerts_enabled")
 	if err := db.AutoMigrate(
 		&MetricSample{}, &TokenSample{}, &HourSample{}, &ChannelSnap{}, &RejectionSample{}, &RejectionIngestBatch{}, &SelectablePair{},
 		&StabilityHourSample{}, &StabilityRejectHour{}, &StabilityProblemSample{},
 		&StabilityProblemIngestState{}, &StabilityProblemStage{},
 		&StabilityHourIngestState{}, &StabilityBackfillJob{},
 		&ChannelFinanceSetting{}, &ChannelSaleGroupRate{}, &ChannelDomainCost{}, &ChannelDomainGroupCost{}, &ChannelFinanceVersion{},
+		&ChannelUpstreamAccount{},
 		&InfraSample{}, &HostContainerSnapshot{}, &NginxMinuteSample{}, &NginxIngestBatch{}, &NginxSourceState{},
 		&AlertConfig{}, &AlertLog{}, &TrackedUser{}, &CustomerGroup{}, &FollowUpLog{}, &UsageSettings{},
 	); err != nil {
@@ -282,17 +290,36 @@ func (m *Monitor) openStore(path string) error {
 		return fmt.Errorf("倍率版本迁移失败: %w", err)
 	}
 	if !hadCategoryToggles {
-		db.Model(&AlertConfig{}).Where("id = 1").Updates(map[string]any{"model_alerts_enabled": true, "server_alerts_enabled": true})
+		if err := db.Model(&AlertConfig{}).Where("id = 1").Updates(map[string]any{
+			"model_alerts_enabled":  true,
+			"server_alerts_enabled": true,
+		}).Error; err != nil {
+			return fmt.Errorf("初始化报警分类开关失败: %w", err)
+		}
 	}
 	if !hadAnomalyAlerts {
 		d := defaultAlertConfig()
-		db.Model(&AlertConfig{}).Where("id = 1").Updates(map[string]any{
+		if err := db.Model(&AlertConfig{}).Where("id = 1").Updates(map[string]any{
 			"anomaly_alerts_enabled": d.AnomalyAlertsEnabled,
 			"anomaly_rate_pct":       d.AnomalyRatePct,
 			"anomaly_cooldown_min":   d.AnomalyCooldownMin,
 			"anomaly_billed_usd":     d.AnomalyBilledUSD,
 			"anomaly_min_count":      d.AnomalyMinCount,
-		})
+		}).Error; err != nil {
+			return fmt.Errorf("初始化交付异常报警配置失败: %w", err)
+		}
+	}
+	if !hadUpstreamBalanceAlerts {
+		d := defaultAlertConfig()
+		if err := db.Model(&AlertConfig{}).Where("id = 1").Updates(map[string]any{
+			"upstream_balance_alerts_enabled": d.UpstreamBalanceAlertsEnabled,
+			"upstream_balance_runway_days":    d.UpstreamBalanceRunwayDays,
+			"upstream_balance_lookback_days":  d.UpstreamBalanceLookbackDays,
+			"upstream_balance_min_coverage":   d.UpstreamBalanceMinCoverage,
+			"upstream_balance_cooldown_min":   d.UpstreamBalanceCooldownMin,
+		}).Error; err != nil {
+			return fmt.Errorf("初始化上游余额报警配置失败: %w", err)
+		}
 	}
 	m.storeDB = db
 	slog.Info("本地采样库就绪", "path", path)

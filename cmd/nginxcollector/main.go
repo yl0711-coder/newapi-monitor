@@ -15,9 +15,11 @@ import (
 	"log"
 	"math"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -25,30 +27,45 @@ import (
 )
 
 type config struct {
-	node       string
-	logPath    string
-	cursorPath string
-	sinkURL    string
-	token      string
-	interval   time.Duration
-	maxLines   int
+	node          string
+	logPath       string
+	cursorPath    string
+	sinkURL       string
+	token         string
+	interval      time.Duration
+	maxLines      int
+	retentionDays int
+	allowHTTP     bool
 }
 
 func loadConfig() (config, error) {
+	intervalSeconds, err := boundedEnvInt("NGINXCOLLECTOR_INTERVAL_SECONDS", 5, 1, 3600)
+	if err != nil {
+		return config{}, err
+	}
+	maxLines, err := boundedEnvInt("NGINXCOLLECTOR_MAX_LINES", 1000, 1, 2000)
+	if err != nil {
+		return config{}, err
+	}
+	retentionDays, err := boundedEnvInt("NGINXCOLLECTOR_RETENTION_DAYS", 7, 1, 90)
+	if err != nil {
+		return config{}, err
+	}
 	c := config{
 		node: strings.TrimSpace(os.Getenv("NGINXCOLLECTOR_NODE")), logPath: env("NGINXCOLLECTOR_LOG_PATH", "/logs/nexusapi_access.jsonl"),
 		cursorPath: env("NGINXCOLLECTOR_CURSOR_PATH", "/data/cursor.json"), sinkURL: strings.TrimSpace(os.Getenv("NGINXCOLLECTOR_SINK_URL")),
-		token: os.Getenv("NGINXCOLLECTOR_TOKEN"), interval: time.Duration(envInt("NGINXCOLLECTOR_INTERVAL_SECONDS", 5)) * time.Second,
-		maxLines: envInt("NGINXCOLLECTOR_MAX_LINES", 1000),
+		token: os.Getenv("NGINXCOLLECTOR_TOKEN"), interval: time.Duration(intervalSeconds) * time.Second,
+		maxLines: maxLines, retentionDays: retentionDays,
+		allowHTTP: strings.EqualFold(strings.TrimSpace(os.Getenv("NGINXCOLLECTOR_ALLOW_INSECURE_HTTP")), "true"),
 	}
 	if c.node == "" || c.sinkURL == "" || c.token == "" {
 		return config{}, fmt.Errorf("NGINXCOLLECTOR_NODE, NGINXCOLLECTOR_SINK_URL and NGINXCOLLECTOR_TOKEN are required")
 	}
-	if c.interval < time.Second {
-		c.interval = time.Second
+	if !validNodeName(c.node) {
+		return config{}, fmt.Errorf("NGINXCOLLECTOR_NODE must match [A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 	}
-	if c.maxLines < 1 || c.maxLines > 2000 {
-		c.maxLines = 1000
+	if err := validateSinkURL(c.sinkURL, c.allowHTTP); err != nil {
+		return config{}, err
 	}
 	return c, nil
 }
@@ -60,17 +77,57 @@ func env(key, fallback string) string {
 	return fallback
 }
 
-func envInt(key string, fallback int) int {
-	value, err := strconv.Atoi(os.Getenv(key))
-	if err != nil {
-		return fallback
+func boundedEnvInt(key string, fallback, min, max int) (int, error) {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return fallback, nil
 	}
-	return value
+	value, err := strconv.Atoi(raw)
+	if err != nil || value < min || value > max {
+		return 0, fmt.Errorf("%s must be an integer between %d and %d", key, min, max)
+	}
+	return value, nil
 }
 
+func validNodeName(value string) bool {
+	if len(value) < 1 || len(value) > 64 {
+		return false
+	}
+	for i, r := range value {
+		letter := r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z'
+		digit := r >= '0' && r <= '9'
+		if letter || digit || i > 0 && (r == '.' || r == '_' || r == '-') {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func validateSinkURL(raw string, allowHTTP bool) error {
+	u, err := url.ParseRequestURI(raw)
+	if err != nil || u.Host == "" || u.Hostname() == "" || u.User != nil || u.Fragment != "" {
+		return fmt.Errorf("NGINXCOLLECTOR_SINK_URL must be an absolute HTTP(S) URL without credentials or fragment")
+	}
+	if u.Scheme != "https" && u.Scheme != "http" {
+		return fmt.Errorf("NGINXCOLLECTOR_SINK_URL must use HTTPS")
+	}
+	if u.Scheme == "http" && !allowHTTP {
+		return fmt.Errorf("NGINXCOLLECTOR_SINK_URL uses HTTP; set NGINXCOLLECTOR_ALLOW_INSECURE_HTTP=true only for a verified private path")
+	}
+	return nil
+}
+
+const cursorVersion = 1
+
 type cursor struct {
-	Inode  uint64 `json:"inode"`
-	Offset int64  `json:"offset"`
+	Version             int    `json:"version"`
+	Inode               uint64 `json:"inode"`
+	Offset              int64  `json:"offset"`
+	Discontinuities     int64  `json:"discontinuities,omitempty"`
+	LastDiscontinuityAt int64  `json:"last_discontinuity_at,omitempty"`
+	DiscardedLines      int64  `json:"discarded_lines,omitempty"`
+	LastDiscardedAt     int64  `json:"last_discarded_at,omitempty"`
 }
 
 type flexNumber float64
@@ -87,9 +144,13 @@ func (n *flexNumber) UnmarshalJSON(data []byte) error {
 			return err
 		}
 		value = strings.TrimSpace(strings.SplitN(value, ",", 2)[0])
+		if value == "" || value == "-" {
+			*n = 0
+			return nil
+		}
 		parsed, err := strconv.ParseFloat(value, 64)
 		if err != nil {
-			return nil
+			return err
 		}
 		*n = flexNumber(parsed)
 		return nil
@@ -102,19 +163,68 @@ func (n *flexNumber) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
+// upstreamNumber 解析 Nginx upstream 变量。Nginx 在请求重试或内部
+// 跳转时会用逗号或冒号连接多个值；报表的单值口径明确取最后
+// 一次 upstream 响应。Present 用来区分“无 upstream(-)”和“有 upstream
+// 但耗时为 0.000”，避免把后者丢掉。
+type upstreamNumber struct {
+	Value   float64
+	Present bool
+}
+
+func (n *upstreamNumber) UnmarshalJSON(data []byte) error {
+	text := strings.TrimSpace(string(data))
+	if text == "" || text == "null" || text == `""` || text == `"-"` {
+		*n = upstreamNumber{}
+		return nil
+	}
+	if !strings.HasPrefix(text, `"`) {
+		parsed, err := strconv.ParseFloat(text, 64)
+		if err != nil {
+			return err
+		}
+		*n = upstreamNumber{Value: parsed, Present: true}
+		return nil
+	}
+	var value string
+	if err := json.Unmarshal(data, &value); err != nil {
+		return err
+	}
+	parts := strings.FieldsFunc(value, func(r rune) bool { return r == ',' || r == ':' })
+	if len(parts) == 0 {
+		return fmt.Errorf("empty upstream number sequence")
+	}
+	var final float64
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		// '-' 只能表示整个请求没有 upstream；与数值混用时
+		// 不猜测口径，直接拒绝该行并让丢弃计数可见。
+		if part == "" || part == "-" {
+			return fmt.Errorf("invalid upstream number sequence")
+		}
+		parsed, err := strconv.ParseFloat(part, 64)
+		if err != nil {
+			return err
+		}
+		final = parsed
+	}
+	*n = upstreamNumber{Value: final, Present: true}
+	return nil
+}
+
 type rawLine struct {
-	Timestamp      flexNumber `json:"ts"`
-	Msec           flexNumber `json:"msec"`
-	Method         string     `json:"method"`
-	RequestMethod  string     `json:"request_method"`
-	URI            string     `json:"uri"`
-	Path           string     `json:"path"`
-	Status         flexNumber `json:"status"`
-	RequestTime    flexNumber `json:"request_time"`
-	UpstreamStatus flexNumber `json:"upstream_status"`
-	UpstreamTime   flexNumber `json:"upstream_response_time"`
-	BytesSent      flexNumber `json:"bytes_sent"`
-	RequestID      string     `json:"request_id"`
+	Timestamp      flexNumber     `json:"ts"`
+	Msec           flexNumber     `json:"msec"`
+	Method         string         `json:"method"`
+	RequestMethod  string         `json:"request_method"`
+	URI            string         `json:"uri"`
+	Path           string         `json:"path"`
+	Status         flexNumber     `json:"status"`
+	RequestTime    flexNumber     `json:"request_time"`
+	UpstreamStatus upstreamNumber `json:"upstream_status"`
+	UpstreamTime   upstreamNumber `json:"upstream_response_time"`
+	BytesSent      flexNumber     `json:"bytes_sent"`
+	RequestID      string         `json:"request_id"`
 }
 
 type sample struct {
@@ -133,9 +243,15 @@ type sample struct {
 }
 
 type batch struct {
-	Node    string   `json:"node"`
-	BatchID string   `json:"batch_id"`
-	Samples []sample `json:"samples"`
+	Node                      string   `json:"node"`
+	BatchID                   string   `json:"batch_id"`
+	Samples                   []sample `json:"samples"`
+	BacklogBytes              int64    `json:"backlog_bytes,omitempty"`
+	BacklogKnown              bool     `json:"backlog_known,omitempty"`
+	CursorDiscontinuities     int64    `json:"cursor_discontinuities,omitempty"`
+	LastCursorDiscontinuityAt int64    `json:"last_cursor_discontinuity_at,omitempty"`
+	DiscardedLines            int64    `json:"discarded_lines,omitempty"`
+	LastDiscardedAt           int64    `json:"last_discarded_at,omitempty"`
 }
 
 func normalizeRoute(path string) string {
@@ -172,8 +288,18 @@ func parseLine(data []byte) (sample, bool) {
 	if ts <= 0 {
 		ts = float64(raw.Msec)
 	}
-	status := int(raw.Status)
-	if ts <= 0 || status < 100 || status > 599 {
+	statusValue, upstreamStatusValue := float64(raw.Status), raw.UpstreamStatus.Value
+	requestSeconds, upstreamSeconds, sentBytes := float64(raw.RequestTime), raw.UpstreamTime.Value, float64(raw.BytesSent)
+	for _, value := range []float64{ts, statusValue, upstreamStatusValue, requestSeconds, upstreamSeconds, sentBytes} {
+		if math.IsNaN(value) || math.IsInf(value, 0) {
+			return sample{}, false
+		}
+	}
+	status, upstreamStatus := int(statusValue), int(upstreamStatusValue)
+	if ts <= 0 || statusValue != float64(status) || status < 100 || status > 599 ||
+		upstreamStatusValue != float64(upstreamStatus) || (upstreamStatus != 0 && (upstreamStatus < 100 || upstreamStatus > 599)) ||
+		requestSeconds < 0 || requestSeconds > 86400 || upstreamSeconds < 0 || upstreamSeconds > 86400 ||
+		sentBytes < 0 || sentBytes > 16<<30 {
 		return sample{}, false
 	}
 	method := raw.Method
@@ -184,21 +310,26 @@ func parseLine(data []byte) (sample, bool) {
 	if path == "" {
 		path = raw.URI
 	}
-	requestMS := int64(math.Round(float64(raw.RequestTime) * 1000))
-	upstreamMS := int64(math.Round(float64(raw.UpstreamTime) * 1000))
-	if requestMS < 0 || upstreamMS < 0 {
-		return sample{}, false
-	}
+	requestMS := int64(math.Round(requestSeconds * 1000))
+	upstreamMS := int64(math.Round(upstreamSeconds * 1000))
 	out := sample{BucketTs: int64(ts) / 60 * 60, Route: normalizeRoute(path), Method: normalizeMethod(method), Status: status,
-		UpstreamStatus: int(raw.UpstreamStatus), Count: 1, RequestTimeSumMS: requestMS, RequestTimeMaxMS: requestMS,
-		BytesSent: int64(math.Max(0, float64(raw.BytesSent)))}
-	if upstreamMS > 0 {
+		UpstreamStatus: upstreamStatus, Count: 1, RequestTimeSumMS: requestMS, RequestTimeMaxMS: requestMS,
+		BytesSent: int64(sentBytes)}
+	if raw.UpstreamTime.Present {
 		out.UpstreamTimeSumMS, out.UpstreamTimeCount = upstreamMS, 1
 	}
 	if strings.TrimSpace(raw.RequestID) != "" && strings.TrimSpace(raw.RequestID) != "-" {
 		out.RequestIDPresent = 1
 	}
 	return out, true
+}
+
+func sampleWithinWindow(row sample, now int64, retentionDays int) bool {
+	if retentionDays < 1 || retentionDays > 90 {
+		retentionDays = 7
+	}
+	oldest := now - int64(retentionDays+1)*86400
+	return row.BucketTs >= oldest/60*60 && row.BucketTs <= now+300
 }
 
 func sampleKey(row sample) string {
@@ -224,39 +355,70 @@ func fileInode(info os.FileInfo) uint64 {
 	return uint64(info.ModTime().UnixNano())
 }
 
-func loadCursor(path string) cursor {
+func loadCursor(path string) (cursor, error) {
 	data, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return cursor{}, nil
+	}
 	if err != nil {
-		return cursor{}
+		return cursor{}, fmt.Errorf("read cursor: %w", err)
 	}
 	var value cursor
-	if json.Unmarshal(data, &value) != nil || value.Offset < 0 {
-		return cursor{}
+	if json.Unmarshal(data, &value) != nil || value.Version != cursorVersion || value.Inode == 0 || value.Offset < 0 || value.Discontinuities < 0 || value.LastDiscontinuityAt < 0 ||
+		value.DiscardedLines < 0 || value.LastDiscardedAt < 0 {
+		return cursor{}, fmt.Errorf("cursor is invalid; restore the persistent cursor volume before restarting")
 	}
-	return value
+	return value, nil
 }
 
 func saveCursor(path string, value cursor) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
+	value.Version = cursorVersion
 	data, err := json.Marshal(value)
 	if err != nil {
 		return err
 	}
 	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+	file, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
 		return err
 	}
-	return os.Rename(tmp, path)
+	if _, err = file.Write(data); err == nil {
+		err = file.Sync()
+	}
+	if closeErr := file.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	// rename 的目录项也要落盘，否则宿主机异常掉电可能丢失最新游标。
+	dir, err := os.Open(filepath.Dir(path))
+	if err != nil {
+		return err
+	}
+	err = dir.Sync()
+	if closeErr := dir.Close(); err == nil {
+		err = closeErr
+	}
+	return err
 }
 
 // readBoundedLine 最多在内存保留 64 KiB。超长完整行会被安全跳过并推进游标；
 // 文件尾尚未写完的半行不会推进游标，下一轮从同一位置重读。
-func readBoundedLine(reader *bufio.Reader) (line []byte, consumed int64, complete bool, err error) {
+func readBoundedLine(reader *bufio.Reader) (line []byte, digest [sha256.Size]byte, consumed int64, complete bool, err error) {
 	tooLong := false
+	hasher := sha256.New()
 	for {
 		fragment, readErr := reader.ReadSlice('\n')
+		_, _ = hasher.Write(fragment)
 		consumed += int64(len(fragment))
 		if !tooLong && len(line)+len(fragment) <= 64<<10 {
 			line = append(line, fragment...)
@@ -266,40 +428,163 @@ func readBoundedLine(reader *bufio.Reader) (line []byte, consumed int64, complet
 		}
 		switch {
 		case readErr == nil:
-			return line, consumed, true, nil
+			copy(digest[:], hasher.Sum(nil))
+			return line, digest, consumed, true, nil
 		case errors.Is(readErr, bufio.ErrBufferFull):
 			continue
 		case errors.Is(readErr, io.EOF):
-			return nil, 0, false, nil
+			return nil, digest, 0, false, nil
 		default:
-			return nil, 0, false, readErr
+			return nil, digest, 0, false, readErr
 		}
 	}
 }
 
+const maxLogCandidates = 256
+
+type logCandidate struct {
+	path    string
+	info    os.FileInfo
+	inode   uint64
+	current bool
+}
+
+func compressedLogName(name string) bool {
+	name = strings.ToLower(name)
+	for _, suffix := range []string{".gz", ".xz", ".bz2", ".zst", ".zip"} {
+		if strings.HasSuffix(name, suffix) {
+			return true
+		}
+	}
+	return false
+}
+
+// listLogCandidates 只扫描当前日志同目录、同文件名前缀的普通未压缩文件。
+// 轮转文件按最后写入时间从旧到新排列，当前文件固定放在最后，因而即使采集器
+// 跨过多次轮转才恢复，也会先追完仍保留的旧文件再读取当前文件。
+func listLogCandidates(logPath string) ([]logCandidate, error) {
+	currentInfo, err := os.Stat(logPath)
+	if err != nil {
+		return nil, err
+	}
+	if !currentInfo.Mode().IsRegular() {
+		return nil, fmt.Errorf("nginx log is not a regular file")
+	}
+	dir, base := filepath.Dir(logPath), filepath.Base(logPath)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	currentInode := fileInode(currentInfo)
+	rotated := make([]logCandidate, 0, 8)
+	seen := map[uint64]bool{currentInode: true}
+	for _, entry := range entries {
+		name := entry.Name()
+		if name == base || !strings.HasPrefix(name, base) || compressedLogName(name) {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil || !info.Mode().IsRegular() {
+			continue
+		}
+		inode := fileInode(info)
+		if seen[inode] {
+			continue
+		}
+		seen[inode] = true
+		rotated = append(rotated, logCandidate{path: filepath.Join(dir, name), info: info, inode: inode})
+		if len(rotated) > maxLogCandidates {
+			return nil, fmt.Errorf("too many rotated nginx log candidates")
+		}
+	}
+	sort.Slice(rotated, func(i, j int) bool {
+		left, right := rotated[i].info.ModTime(), rotated[j].info.ModTime()
+		if !left.Equal(right) {
+			return left.Before(right)
+		}
+		return rotated[i].path < rotated[j].path
+	})
+	return append(rotated, logCandidate{path: logPath, info: currentInfo, inode: currentInode, current: true}), nil
+}
+
+func markCursorDiscontinuity(value cursor, now int64) cursor {
+	if value.Discontinuities < math.MaxInt64 {
+		value.Discontinuities++
+	}
+	value.LastDiscontinuityAt = now
+	return value
+}
+
+// selectLogCandidate 解析游标应继续读取的文件。只有游标 inode 已不存在、文件被
+// copytruncate 到游标之前或轮转文件只剩不完整尾行时，才记录一次客观的“游标不连续”。
+func selectLogCandidate(logPath string, value cursor, now int64) (logCandidate, cursor, error) {
+	candidates, err := listLogCandidates(logPath)
+	if err != nil {
+		return logCandidate{}, value, err
+	}
+	if value.Inode == 0 {
+		current := candidates[len(candidates)-1]
+		value.Inode, value.Offset = current.inode, 0
+		return current, value, nil
+	}
+	for i, candidate := range candidates {
+		if candidate.inode != value.Inode {
+			continue
+		}
+		if candidate.info.Size() < value.Offset {
+			value = markCursorDiscontinuity(value, now)
+			value.Offset = 0
+			return candidate, value, nil
+		}
+		if candidate.info.Size() > value.Offset || i == len(candidates)-1 {
+			return candidate, value, nil
+		}
+		next := candidates[i+1]
+		value.Inode, value.Offset = next.inode, 0
+		return next, value, nil
+	}
+
+	// 原 inode 已被删除或压缩，无法证明连续性。选择仍保留的最旧候选文件，
+	// 尽量减少缺口；服务端 batch 幂等键会阻止相同分块被重复累计。
+	value = markCursorDiscontinuity(value, now)
+	oldest := candidates[0]
+	value.Inode, value.Offset = oldest.inode, 0
+	return oldest, value, nil
+}
+
 func readBatch(c config, value cursor) (batch, cursor, bool, error) {
-	info, err := os.Stat(c.logPath)
+	original := value
+	now := time.Now().Unix()
+	target, value, err := selectLogCandidate(c.logPath, value, now)
 	if err != nil {
-		return batch{}, value, false, err
+		return batch{}, original, false, err
 	}
-	inode := fileInode(info)
-	if value.Inode != inode || info.Size() < value.Offset {
-		value = cursor{Inode: inode}
-	}
-	file, err := os.Open(c.logPath)
+	file, err := os.Open(target.path)
 	if err != nil {
-		return batch{}, value, false, err
+		return batch{}, original, false, err
 	}
 	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return batch{}, original, false, err
+	}
+	inode := fileInode(info)
+	if inode != target.inode {
+		// 文件在目录扫描与 open 之间发生了轮转。此时原 inode 通常仍以
+		// .1 等名称保留；返回短暂错误让下一轮重新扫描，才能继续追读旧文件。
+		// 若直接从新 inode 开头读，会在轮转瞬间跳过旧文件尚未采集的尾部。
+		return batch{}, original, false, fmt.Errorf("nginx log rotated during scan")
+	}
 	if _, err := file.Seek(value.Offset, io.SeekStart); err != nil {
-		return batch{}, value, false, err
+		return batch{}, original, false, err
 	}
 	reader := bufio.NewReaderSize(file, 64<<10)
 	start, end := value.Offset, value.Offset
+	batchContent := sha256.New()
 	aggregates := make(map[string]sample)
 	completeLines := 0
 	for completeLines < c.maxLines {
-		line, consumed, complete, readErr := readBoundedLine(reader)
+		line, lineDigest, consumed, complete, readErr := readBoundedLine(reader)
 		if readErr != nil {
 			return batch{}, value, false, readErr
 		}
@@ -307,8 +592,9 @@ func readBatch(c config, value cursor) (batch, cursor, bool, error) {
 			break
 		}
 		end += consumed
+		_, _ = batchContent.Write(lineDigest[:])
 		completeLines++
-		if row, ok := parseLine(bytes.TrimSpace(line)); ok {
+		if row, ok := parseLine(bytes.TrimSpace(line)); ok && sampleWithinWindow(row, now, c.retentionDays) {
 			key := sampleKey(row)
 			if current, exists := aggregates[key]; exists {
 				merge(&current, row)
@@ -316,18 +602,82 @@ func readBatch(c config, value cursor) (batch, cursor, bool, error) {
 			} else {
 				aggregates[key] = row
 			}
+		} else {
+			if value.DiscardedLines < math.MaxInt64 {
+				value.DiscardedLines++
+			}
+			value.LastDiscardedAt = now
 		}
 	}
 	if completeLines == 0 {
+		// 已轮转的旧文件不会再补齐最后一条残行。丢弃这段不完整 JSON，并把
+		// 游标切到下一候选文件；runOnce 会原子持久化这个纯游标变更。
+		if !target.current && info.Size() > value.Offset {
+			drained := markCursorDiscontinuity(value, now)
+			drained.Offset = info.Size()
+			_, next, selectErr := selectLogCandidate(c.logPath, drained, now)
+			if selectErr != nil {
+				return batch{}, original, false, selectErr
+			}
+			return batch{}, next, false, nil
+		}
 		return batch{}, value, false, nil
 	}
 	rows := make([]sample, 0, len(aggregates))
 	for _, row := range aggregates {
 		rows = append(rows, row)
 	}
-	digest := sha256.Sum256([]byte(fmt.Sprintf("%s:%d:%d:%d", c.node, inode, start, end)))
-	next := cursor{Inode: inode, Offset: end}
-	return batch{Node: c.node, BatchID: hex.EncodeToString(digest[:]), Samples: rows}, next, true, nil
+	identity := sha256.New()
+	_, _ = fmt.Fprintf(identity, "%s:%d:%d:%d:", c.node, inode, start, end)
+	_, _ = identity.Write(batchContent.Sum(nil))
+	digest := identity.Sum(nil)
+	next := cursor{Version: cursorVersion, Inode: inode, Offset: end}
+	next.Discontinuities = value.Discontinuities
+	next.LastDiscontinuityAt = value.LastDiscontinuityAt
+	next.DiscardedLines = value.DiscardedLines
+	next.LastDiscardedAt = value.LastDiscardedAt
+	return batch{Node: c.node, BatchID: hex.EncodeToString(digest), Samples: rows}, next, true, nil
+}
+
+func collectorTelemetry(c config, value cursor) (backlog int64, known bool) {
+	candidates, err := listLogCandidates(c.logPath)
+	if err != nil {
+		return 0, false
+	}
+	start, found := len(candidates)-1, value.Inode == 0
+	if value.Inode != 0 {
+		for i, candidate := range candidates {
+			if candidate.inode == value.Inode {
+				start, found = i, true
+				break
+			}
+		}
+	}
+	if !found {
+		return 0, false
+	}
+	for i := start; i < len(candidates); i++ {
+		remaining := candidates[i].info.Size()
+		if i == start && candidates[i].inode == value.Inode {
+			remaining -= value.Offset
+			if remaining < 0 {
+				return 0, false
+			}
+		}
+		if backlog > math.MaxInt64-remaining {
+			return 0, false
+		}
+		backlog += remaining
+	}
+	return backlog, true
+}
+
+func decorateBatch(c config, payload *batch, value cursor) {
+	payload.CursorDiscontinuities = value.Discontinuities
+	payload.LastCursorDiscontinuityAt = value.LastDiscontinuityAt
+	payload.DiscardedLines = value.DiscardedLines
+	payload.LastDiscardedAt = value.LastDiscardedAt
+	payload.BacklogBytes, payload.BacklogKnown = collectorTelemetry(c, value)
 }
 
 func postBatch(ctx context.Context, c config, payload batch) error {
@@ -341,7 +691,13 @@ func postBatch(ctx context.Context, c config, payload batch) error {
 	}
 	req.Header.Set("Authorization", "Bearer "+c.token)
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := (&http.Client{Timeout: 10 * time.Second}).Do(req)
+	client := &http.Client{
+		Timeout: 10 * time.Second,
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+			return fmt.Errorf("collector sink redirect refused")
+		},
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		return err
 	}
@@ -354,21 +710,33 @@ func postBatch(ctx context.Context, c config, payload batch) error {
 }
 
 func runOnce(ctx context.Context, c config) error {
-	current := loadCursor(c.cursorPath)
-	payload, next, ok, err := readBatch(c, current)
-	if err != nil || !ok {
+	current, err := loadCursor(c.cursorPath)
+	if err != nil {
 		return err
 	}
+	payload, next, ok, err := readBatch(c, current)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		if next != current {
+			return saveCursor(c.cursorPath, next)
+		}
+		return nil
+	}
+	decorateBatch(c, &payload, next)
 	if err := postBatch(ctx, c, payload); err != nil {
 		return err
 	}
 	return saveCursor(c.cursorPath, next)
 }
 
-func heartbeatBatch(node string, now time.Time) batch {
+func heartbeatBatch(c config, now time.Time, value cursor) batch {
 	minute := now.Unix() / 60
-	digest := sha256.Sum256([]byte(fmt.Sprintf("heartbeat:%s:%d", node, minute)))
-	return batch{Node: node, BatchID: "hb_" + hex.EncodeToString(digest[:16]), Samples: []sample{}}
+	digest := sha256.Sum256([]byte(fmt.Sprintf("heartbeat:%s:%d", c.node, minute)))
+	payload := batch{Node: c.node, BatchID: "hb_" + hex.EncodeToString(digest[:16]), Samples: []sample{}}
+	decorateBatch(c, &payload, value)
+	return payload
 }
 
 func main() {
@@ -386,7 +754,10 @@ func main() {
 			log.Printf("nginxcollector: 本轮未推进游标，将自动重试: %v", err)
 		}
 		if now := time.Now(); !now.Before(nextHeartbeat) && ctx.Err() == nil {
-			if err := postBatch(ctx, c, heartbeatBatch(c.node, now)); err != nil {
+			current, cursorErr := loadCursor(c.cursorPath)
+			if cursorErr != nil {
+				log.Printf("nginxcollector: 游标文件无法安全读取，已停止心跳与推进: %v", cursorErr)
+			} else if err := postBatch(ctx, c, heartbeatBatch(c, now, current)); err != nil {
 				log.Printf("nginxcollector: 心跳发送失败，将自动重试: %v", err)
 			} else {
 				nextHeartbeat = now.Add(time.Minute)

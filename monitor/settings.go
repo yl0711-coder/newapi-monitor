@@ -37,6 +37,11 @@ type Settings struct {
 	// 登录鉴权:复用 new-api 用户身份(不改 new-api,只调其 API 验证)
 	NewAPIBaseURL string // MONITOR_NEWAPI_BASE_URL,如 http://new-api:3000
 	SessionSecret string // MONITOR_SESSION_SECRET,签发监控自己的会话;留空则启动时随机生成(重启需重新登录)
+	// 上游账户凭据只保存在 Monitor 本地 SQLite，使用该密钥经 AES-256-GCM 加密。
+	// 留空时复用 MONITOR_SESSION_SECRET；生产必须至少固定配置二者之一，否则拒绝保存凭据。
+	UpstreamCredentialSecret string // MONITOR_UPSTREAM_CREDENTIAL_SECRET
+	UpstreamSyncMinutes      int    // MONITOR_UPSTREAM_SYNC_MINUTES,默认 5；失败时按账户退避，最长 60 分钟
+	UpstreamSyncTimeoutSec   int    // MONITOR_UPSTREAM_SYNC_TIMEOUT_SECONDS,默认 15
 
 	// 客户端「用量报表」独立监听(portal.go):客户域名只指这个端口,上面不存在任何管理端路由。
 	// 留空 = 关闭(默认);如 ":8092"。
@@ -139,6 +144,9 @@ func LoadSettings() Settings {
 		NginxAllowedNodes:           envCSV("MONITOR_NGINX_ALLOWED_NODES"),
 		NewAPIBaseURL:               env("MONITOR_NEWAPI_BASE_URL", ""),
 		SessionSecret:               env("MONITOR_SESSION_SECRET", ""),
+		UpstreamCredentialSecret:    env("MONITOR_UPSTREAM_CREDENTIAL_SECRET", ""),
+		UpstreamSyncMinutes:         envInt("MONITOR_UPSTREAM_SYNC_MINUTES", 5),
+		UpstreamSyncTimeoutSec:      envInt("MONITOR_UPSTREAM_SYNC_TIMEOUT_SECONDS", 15),
 		PortalAddr:                  env("MONITOR_PORTAL_ADDR", ""),
 		UsageRedisAddr:              strings.TrimSpace(env("MONITOR_USAGE_REDIS_ADDR", "")),
 		UsageRedisUsername:          strings.TrimSpace(env("MONITOR_USAGE_REDIS_USERNAME", "")),
