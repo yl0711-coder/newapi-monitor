@@ -4,7 +4,7 @@
 const cm={
   inited:false,loaded:false,days:7,custom:null,preset:'',report:null,abort:null,sort:'cost',
   filters:{search:'',domain:'',vendor:'',group:'',status:''},
-  expandedDomains:new Set(),expandedVendors:new Set(),expandedChannels:new Set(),
+  expandedDomains:new Set(),expandedVendors:new Set(),collapsedGroups:new Set(),
   financeDomain:null,financeGroups:[],upstreamDomain:null,upstreamConfig:null
 };
 const $=id=>document.getElementById(id);
@@ -81,8 +81,6 @@ function init(){
     render();
   }));
   $('cmBody')?.addEventListener('click',event=>{
-    const stability=event.target.closest('[data-cm-stability]');
-    if(stability){event.stopPropagation();const ctx={days:cm.days,channel:stability.dataset.cmStability};if(cm.custom){ctx.from=cm.custom.from;ctx.to=cm.custom.to;delete ctx.days}if(cm.filters.group)ctx.group=cm.filters.group;window.stabilityOpen?.(ctx);return}
     const finance=event.target.closest('[data-cm-finance]');
     if(finance){event.stopPropagation();openFinance(finance.dataset.cmFinance);return}
     const upstream=event.target.closest('[data-cm-upstream]');
@@ -91,13 +89,13 @@ function init(){
     if(domain){toggleSet(cm.expandedDomains,domain.dataset.cmDomainToggle);render();return}
     const vendor=event.target.closest('[data-cm-vendor-toggle]');
     if(vendor){toggleSet(cm.expandedVendors,vendor.dataset.cmVendorToggle);render();return}
-    const channel=event.target.closest('[data-cm-channel-toggle]');
-    if(channel){toggleSet(cm.expandedChannels,channel.dataset.cmChannelToggle);render()}
+    const group=event.target.closest('[data-cm-group-toggle]');
+    if(group){toggleSet(cm.collapsedGroups,group.dataset.cmGroupToggle);render()}
   });
   $('cmBody')?.addEventListener('keydown',event=>{
     if(event.key!=='Enter'&&event.key!==' ')return;
     if(event.target.closest('[data-cm-finance],[data-cm-upstream]'))return;
-    const target=event.target.closest('[data-cm-domain-toggle],[data-cm-vendor-toggle],[data-cm-channel-toggle]');
+    const target=event.target.closest('[data-cm-domain-toggle],[data-cm-vendor-toggle],[data-cm-group-toggle]');
     if(target){event.preventDefault();target.click()}
   });
   $('cmFinanceClose')?.addEventListener('click',closeFinance);
@@ -222,51 +220,71 @@ function multiplierGap(n){
   const number=Math.abs(value).toFixed(4).replace(/0+$/,'').replace(/\.$/,'')||'0';
   return `${value>0?'+':value<0?'-':''}${number}x`;
 }
-function groupFinance(finance){
-  const multipliersReady=!!finance?.site_configured&&!!finance?.upstream_configured;
-  if(!multipliersReady){
-    const missing=!finance?.site_configured&&!finance?.upstream_configured?'双方倍率待配置':!finance?.site_configured?'我方倍率待配置':'上游倍率待配置';
-    return `<div class="cm-group-finance pending"><span>${esc(missing)}</span></div>`;
+function formatMultiplier(value){
+  const n=Number(value);
+  if(!Number.isFinite(n)||n<=0)return'—';
+  return `${n.toFixed(2).replace(/0+$/,'').replace(/\.$/,'')}×`;
+}
+function stabilityText(value){
+  if(value===null||value===undefined||value==='')return'—';
+  const n=Number(value);
+  return Number.isFinite(n)?`${n.toFixed(2)}%`:'—';
+}
+function channelGroupFor(ch,name){
+  return (ch.groups||[]).find(group=>group.name===name)||{name,usage:zero(),finance:{}};
+}
+function channelGroupRows(group){
+  const finance=group.finance||{};
+  return group.channels.map(({channel,groupData})=>{
+    const usage=groupData.usage||zero();
+    const f=groupData.finance||finance;
+    return `<div class="cm-group-channel-row">
+      <div class="cm-channel-name"><b>#${channel.id} ${esc(channel.name)}</b></div>
+      <div class="cm-group-rate"><b>${formatMultiplier(f.upstream_effective_multiplier)}</b></div>
+      <div class="cm-group-gap"><b>${formatMultiplier(f.multiplier_gap)}</b></div>
+      <div class="cm-group-models"><b>${nfmt(channel.model_count)} 个模型</b></div>
+      <div>${statusLabel(channel)}</div>
+      <div class="cm-group-stability"><b>${stabilityText(channel.stability)}</b></div>
+      <span class="cm-number">${nfmt(usage.requests)}</span>
+      <span class="cm-number" title="${nfmt(usage.tokens)}">${compact(usage.tokens)}</span>
+      <span class="cm-number">${usd(usage.cost_usd)}</span>
+      ${metricCell(usage,group.usage)}
+    </div>`;
+  }).join('')||'<div class="cm-no-groups">该服务分组暂无渠道用量</div>';
+}
+function vendorGroups(vendor){
+  const groups=new Map();
+  for(const channel of vendor.channels||[]){
+    const names=new Set([...(channel.groups||[]).map(group=>group.name),...(channel.configured_groups||[])]);
+    for(const name of names){
+      if(!name)continue;
+      let group=groups.get(name);
+      if(!group){group={name,usage:zero(),channels:[],finance:{}};groups.set(name,group)}
+      const groupData=channelGroupFor(channel,name);
+      add(group.usage,groupData.usage);
+      if(group.channels.every(item=>item.channel.id!==channel.id))group.channels.push({channel,groupData});
+      if(!group.finance?.complete&&groupData.finance)group.finance=groupData.finance;
+    }
   }
-  const gap=`<span class="cm-multiplier-gap" title="我方倍率 − 上游实际倍率（基础倍率 × 折扣系数 ÷ 充值比例）">倍率差 <b>${esc(multiplierGap(finance.multiplier_gap))}</b></span>`;
-  if(!finance.complete)return `<div class="cm-group-finance incomplete">${gap}<span>折扣口径待配置</span></div>`;
-  const margin=+finance.estimated_margin||0,state=margin<0?'loss':margin<.1?'low':'good';
-  return `<div class="cm-group-finance">${gap}<span title="我方折扣 / 上游折扣">双方折扣 <b>${pct(finance.site_discount)} / ${pct(finance.upstream_discount)}</b></span><strong class="${state}">预估毛利 ${pct(margin)}</strong></div>`;
+  return [...groups.values()].sort((a,b)=>metric(b.usage)-metric(a.usage)||b.usage.requests-a.usage.requests||a.name.localeCompare(b.name,'zh-CN'));
 }
-function groupUsage(groups,total){
-  if(!groups?.length)return'<div class="cm-no-groups">该范围暂无服务分组用量</div>';
-  return `<div class="cm-domain-groups"><div class="cm-domain-groups-title"><b>服务分组用量</b><span>当前排行口径：${esc(metricLabel())}</span></div><div class="cm-group-grid">${groups.map(group=>{
-    const share=metric(total)>0?metric(group.usage)/metric(total)*100:0;
-    return `<div class="cm-group-chip"><span title="${esc(group.name)}">${esc(group.name)}</span><b>${esc(metricText(group.usage))}</b><i><em style="width:${Math.max(share&&2,share)}%"></em></i><small>${share.toFixed(1)}%</small>${groupFinance(group.finance)}</div>`;
-  }).join('')}</div></div>`;
-}
-function channelGroups(domainKey,ch){
-  const key=domainKey+':'+ch.id;
-  if(!cm.expandedChannels.has(key))return'';
-  return `<div class="cm-channel-groups"><div class="cm-channel-group-head"><span>服务分组</span><span>请求数</span><span>Tokens</span><span>用户侧消费</span><span>渠道内占比</span></div>${(ch.groups||[]).map(group=>{
-    const share=metric(ch.usage)>0?metric(group.usage)/metric(ch.usage)*100:0;
-    return `<div class="cm-channel-group-row"><b>${esc(group.name)}</b><span>${nfmt(group.usage.requests)}</span><span title="${nfmt(group.usage.tokens)}">${compact(group.usage.tokens)}</span><span>${usd(group.usage.cost_usd)}</span><span>${share.toFixed(1)}%</span></div>`;
-  }).join('')||'<div class="cm-no-groups">该渠道在当前范围无服务分组用量</div>'}</div>`;
-}
-function channelRow(domainKey,ch,domainTotal){
-  const configured=(ch.configured_groups||[]).join('、')||'未配置分组';
-  const key=domainKey+':'+ch.id;
-  const host=ch.host?`主机 ${ch.host} · `:'';
-  return `<div class="cm-channel-wrap"><div class="cm-channel-row">
-    <div class="cm-channel-name"><b>#${ch.id} ${esc(ch.name)}</b><small title="${esc(host+'配置分组 '+configured)}"><span class="cm-channel-host">${esc(host)}</span>配置分组 ${esc(configured)} · ${nfmt(ch.model_count)} 个模型</small></div>
-    <div>${statusLabel(ch)}</div>
-    <span class="cm-number">${nfmt(ch.usage.requests)}</span>
-    <span class="cm-number" title="${nfmt(ch.usage.tokens)}">${compact(ch.usage.tokens)}</span>
-    <span class="cm-number">${usd(ch.usage.cost_usd)}</span>
-    ${metricCell(ch.usage,domainTotal)}
-    <div class="cm-channel-actions"><button type="button" class="cm-detail-btn" data-cm-stability="${ch.id}">稳定性</button><button type="button" class="cm-detail-btn" data-cm-channel-toggle="${esc(key)}">${cm.expandedChannels.has(key)?'收起':'分组用量'} <i>${cm.expandedChannels.has(key)?'▴':'▾'}</i></button></div>
-  </div>${channelGroups(domainKey,ch)}</div>`;
+function groupSection(domain,vendor,group,index,domainTotal){
+  const key=`${domain.key}:group:${vendor.name}:${group.name}`,open=!cm.collapsedGroups.has(key);
+  const f=group.finance||{},active=group.channels.filter(item=>metric(item.groupData.usage)>0).length;
+  const models=group.channels.reduce((total,item)=>total+(+item.channel.model_count||0),0);
+  const share=metric(domainTotal)>0?metric(group.usage)/metric(domainTotal)*100:0;
+  return `<section class="cm-group-section${open?' open':''}">
+    <header class="cm-group-head" role="button" tabindex="0" aria-expanded="${open}" data-cm-group-toggle="${esc(key)}">
+      <div class="cm-group-title"><b>${esc(group.name)}</b><span>本站分组倍率 ${formatMultiplier(f.site_multiplier)}</span><small>${group.channels.length} 个候选渠道 · ${nfmt(models)} 个配置模型 · 本期 ${nfmt(active)} 个渠道有请求</small></div>
+      <div class="cm-group-metrics"><span><small>请求数</small><b>${nfmt(group.usage.requests)}</b></span><span><small>Tokens</small><b>${compact(group.usage.tokens)}</b></span><span><small>用户侧消费</small><b>${usd(group.usage.cost_usd)}</b></span><span><small>域名消费占比</small><b>${share.toFixed(1)}%</b></span></div>
+      <i class="cm-group-chevron">${open?'−':'+'}</i>
+    </header>
+    ${open?`<div class="cm-group-body"><div class="cm-group-channel-head"><span>渠道 ID / 渠道名</span><span>上游折算倍率</span><span>倍率差</span><span>关联模型</span><span>状态</span><span>稳定性</span><span>请求数</span><span>Tokens</span><span>用户侧消费</span><span>本组占比</span></div>${channelGroupRows(group)}</div>`:''}
+  </section>`;
 }
 function vendorSection(domain,vendor){
-  const key=domain.key+':vendor:'+vendor.name,open=cm.expandedVendors.has(key);
-  return `<section class="cm-vendor-section${open?' open':''}"><header class="cm-vendor-head" role="button" tabindex="0" aria-expanded="${open}" data-cm-vendor-toggle="${esc(key)}"><div><span class="cm-vendor-dot"></span><b>${esc(vendor.name)}</b><small>${vendor.channels.length} 个实际渠道</small></div><div><span>${nfmt(vendor.usage.requests)} 渠道请求</span><span>${compact(vendor.usage.tokens)} Tokens</span><strong>${usd(vendor.usage.cost_usd)}</strong><i class="cm-vendor-chevron">${open?'−':'+'}</i></div></header>${open?`<div class="cm-vendor-body">
-    <div class="cm-channel-head"><span>实际渠道</span><span>状态</span><span>请求数</span><span>Tokens</span><span>用户侧消费</span><span>${esc(metricLabel())}占比</span><span>明细</span></div>
-    ${vendor.channels.map(ch=>channelRow(domain.key,ch,domain.usage)).join('')}</div>`:''}</section>`;
+  const key=domain.key+':vendor:'+vendor.name,open=cm.expandedVendors.has(key),groups=vendorGroups(vendor);
+  return `<section class="cm-vendor-section${open?' open':''}"><header class="cm-vendor-head" role="button" tabindex="0" aria-expanded="${open}" data-cm-vendor-toggle="${esc(key)}"><div><span class="cm-vendor-dot"></span><b>${esc(vendor.name)}</b><small>${vendor.channels.length} 个实际渠道 · ${groups.length} 个服务分组</small></div><div><span>${nfmt(vendor.usage.requests)} 渠道请求</span><span>${compact(vendor.usage.tokens)} Tokens</span><strong>${usd(vendor.usage.cost_usd)}</strong><i class="cm-vendor-chevron">${open?'−':'+'}</i></div></header>${open?`<div class="cm-vendor-body">${groups.map((group,index)=>groupSection(domain,vendor,group,index,domain.usage)).join('')}</div>`:''}</section>`;
 }
 function upstreamSummary(upstream){
   if(!upstream?.configured)return '<span class="pending">余额未配置</span>';
@@ -298,18 +316,23 @@ function domainCard(domain,index,total,filtered){
     <div class="cm-share"><div><b>${share.toFixed(1)}%</b><small>${filtered?'筛选内':'全站'}${esc(metricLabel())}</small></div><i><em style="width:${Math.max(share&&2,share)}%"></em></i></div>
     <div class="cm-domain-metrics"><span><small>渠道请求数</small><b>${nfmt(domain.usage.requests)}</b></span><span><small>Tokens</small><b title="${nfmt(domain.usage.tokens)}">${compact(domain.usage.tokens)}</b></span><span><small>用户侧消费</small><b>${usd(domain.usage.cost_usd)}</b></span></div>
     <span class="cm-chevron">${open?'−':'+'}</span>
-  </div>${open?`<div class="cm-domain-body">${groupUsage(domain.groups,domain.usage)}${domain.vendors.map(v=>vendorSection(domain,v)).join('')}</div>`:''}</article>`;
+  </div>${open?`<div class="cm-domain-body">${domain.vendors.map(v=>vendorSection(domain,v)).join('')}</div>`:''}</article>`;
 }
 
 function filtersActive(){return !!(cm.filters.search||cm.filters.domain||cm.filters.vendor||cm.filters.group||cm.filters.status)}
 function freshness(meta){
+  const coverage=meta?.data_coverage||{},hasCoverage=typeof coverage.complete==='boolean',expected=+coverage.expected_hours||0,completed=+coverage.completed_hours||0,missing=+coverage.missing_hours||0;
+  if(hasCoverage&&!coverage.complete&&!coverage.latest_hour_pending){
+    return `<span class="cm-fresh-state warning"><i></i>小时数据待补 · ${(+coverage.percent||0).toFixed(1)}%</span><small>${nfmt(missing)} 个历史小时未完成，当前统计可能偏低</small>`;
+  }
   const historical=meta?.to&&meta.to<cstDate(Date.now()/1000);
   if(historical)return `<span class="cm-fresh-state neutral"><i></i>区间数据截至 ${esc(shortDateTime(meta.data_until))}</span><small>历史区间 · 小时汇总</small>`;
   const until=+meta?.latest_data_until||+meta?.data_until||0;
   if(!until)return '<span class="cm-fresh-state stale"><i></i>暂无小时汇总数据</span><small>等待本地采集器生成汇总</small>';
   const ageSec=Math.max(0,Date.now()/1000-until),state=ageSec<=7200?'normal':ageSec<=10800?'warning':'stale';
   const label=state==='normal'?'正常':state==='warning'?'存在延迟':'采集可能中断';
-  return `<span class="cm-fresh-state ${state}"><i></i>小时汇总 · ${label} · 截至 ${esc(shortDateTime(until))}</span><small>${state==='normal'?'正常延迟不超过约 2 小时':'请核对本地采集器状态'}</small>`;
+  const detail=hasCoverage&&coverage.latest_hour_pending?`最新完整小时汇总中 · ${nfmt(completed)}/${nfmt(expected)} 小时`:state==='normal'?'正常延迟不超过约 2 小时':'请核对本地采集器状态';
+  return `<span class="cm-fresh-state ${state}"><i></i>小时汇总 · ${label} · 截至 ${esc(shortDateTime(until))}</span><small>${detail}</small>`;
 }
 
 function financeNumber(id){
@@ -539,9 +562,7 @@ function render(){
   const historical=channels.filter(ch=>!ch.current).length,filtered=filtersActive();
   const allUsage=cm.report.summary?.usage||zero();
   const share=metric(allUsage)>0?metric(filteredUsage)/metric(allUsage)*100:0;
-  const dataCoverage=cm.report.meta?.data_coverage||{};
-  const coverageWarning=dataCoverage.complete?'':`<div class="alert">当前日期范围的小时数据完整率为 ${(+dataCoverage.percent||0).toFixed(1)}%（${nfmt(dataCoverage.completed_hours)}/${nfmt(dataCoverage.expected_hours)} 小时）；缺失时段不会被当作零流量，当前金额、请求与 Tokens 可能偏低。</div>`;
-  $('cmBody').innerHTML=`${coverageWarning}<section class="cm-kpis">
+  $('cmBody').innerHTML=`<section class="cm-kpis">
     <article><small>已配置主域名</small><b>${nfmt(configuredDomains)}</b><span>当前显示 ${nfmt(domains.length)} 个归并项</span></article>
     <article><small>当前实际渠道</small><b>${nfmt(currentChannels.length)}</b><span>${nfmt(enabled)} 启用 · ${nfmt(currentChannels.length-enabled)} 停用${historical?' · '+nfmt(historical)+' 历史':''}</span></article>
     <article class="${unconfigured?'warn':''}"><small>未归并渠道</small><b>${nfmt(unconfigured)}</b><span>${unconfigured?'尚未配置主地址':'当前渠道均已归并'}</span></article>

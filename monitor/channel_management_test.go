@@ -23,6 +23,37 @@ func TestChannelManagementPageIncludesBusinessDateShortcuts(t *testing.T) {
 	}
 }
 
+func TestChannelManagementUsesCompactCoverageStatus(t *testing.T) {
+	js := string(channelManagementJS)
+	for _, marker := range []string{"latest_hour_pending", "最新完整小时汇总中", "小时数据待补"} {
+		if !strings.Contains(js, marker) {
+			t.Fatalf("渠道管理缺少分级完整性状态 %q", marker)
+		}
+	}
+	if strings.Contains(js, "当前日期范围的小时数据完整率为") {
+		t.Fatal("正常尾部延迟不应再使用全宽红色告警")
+	}
+}
+
+func TestChannelManagementCardTypographyIsReadable(t *testing.T) {
+	css := string(stabilityCSS)
+	for _, marker := range []string{
+		`--cm-font-caption:12px`,
+		`--cm-font-meta:13px`,
+		`--cm-font-body:14px`,
+		`--cm-font-item:15px`,
+		`--cm-font-domain:20px`,
+		`--cm-font-metric:18px`,
+		`.cm-domain-identity b{font-size:var(--cm-font-domain)`,
+		`.cm-domain-metrics b{font-size:var(--cm-font-metric)`,
+		`.cm-channel-name b{font-size:var(--cm-font-item)`,
+	} {
+		if !strings.Contains(css, marker) {
+			t.Fatalf("渠道管理可读性样式缺少 %q", marker)
+		}
+	}
+}
+
 func TestNormalizeChannelBaseDomain(t *testing.T) {
 	tests := map[string]string{
 		"https://temp.last-api.ai/v1":                   "last-api.ai",
@@ -117,6 +148,21 @@ func TestBuildChannelManagementReportGroupsDomainVendorChannelAndServiceGroup(t 
 	}
 	if openAI.Channels[0].Host != "temp.last-api.ai" {
 		t.Fatalf("channel host=%q", openAI.Channels[0].Host)
+	}
+	if openAI.Channels[0].Stability == nil || math.Abs(*openAI.Channels[0].Stability-100) > 1e-9 {
+		t.Fatalf("OpenAI channel stability=%v, want 100", openAI.Channels[0].Stability)
+	}
+	var anthropic *ChannelManagementVendor
+	for i := range last.Vendors {
+		if last.Vendors[i].Name == "Anthropic" {
+			anthropic = &last.Vendors[i]
+		}
+	}
+	if anthropic == nil || len(anthropic.Channels) != 1 {
+		t.Fatalf("Anthropic vendor=%+v", anthropic)
+	}
+	if anthropic.Channels[0].Stability == nil || math.Abs(*anthropic.Channels[0].Stability-(5.0/7.0*100)) > 1e-9 {
+		t.Fatalf("Anthropic channel stability=%v, want %.6f", anthropic.Channels[0].Stability, 5.0/7.0*100)
 	}
 	if report.Meta.DataUntil != day+3600 || report.Meta.LatestDataUntil != day+3600 || report.Meta.ChannelConfigUpdatedAt != day+60 {
 		t.Fatalf("meta=%+v", report.Meta)

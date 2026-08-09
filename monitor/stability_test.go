@@ -707,6 +707,18 @@ func TestStabilityPageIncludesBusinessDateShortcuts(t *testing.T) {
 	}
 }
 
+func TestStabilityPageUsesCompactCoverageStatus(t *testing.T) {
+	js := string(stabilityJS)
+	for _, marker := range []string{"latest_hour_pending", "正常汇总中", "小时待补"} {
+		if !strings.Contains(js, marker) {
+			t.Fatalf("稳定性页缺少分级完整性状态 %q", marker)
+		}
+	}
+	if strings.Contains(js, "当前日期范围的小时数据完整率为") {
+		t.Fatal("正常尾部延迟不应再使用全宽红色告警")
+	}
+}
+
 func TestMonitorResponsiveShellAndWideTablesStayAdminOnly(t *testing.T) {
 	for _, marker := range []string{
 		`id="monitorSidebarToggle"`,

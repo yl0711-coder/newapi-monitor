@@ -44,6 +44,7 @@ type ChannelManagementChannel struct {
 	Current          bool                     `json:"current"`
 	ConfiguredGroups []string                 `json:"configured_groups"`
 	ModelCount       int                      `json:"model_count"`
+	Stability        *float64                 `json:"stability"`
 	Usage            ChannelUsageMetrics      `json:"usage"`
 	Groups           []ChannelManagementGroup `json:"groups"`
 }
@@ -103,19 +104,33 @@ type ChannelManagementReport struct {
 }
 
 type channelUsageAgg struct {
-	requests int64
-	tokens   int64
-	quota    int64
+	requests         int64
+	success, anomaly int64
+	failed           int64
+	tokens           int64
+	quota            int64
 }
 
 func (a *channelUsageAgg) add(other channelUsageAgg) {
 	a.requests += other.requests
+	a.success += other.success
+	a.anomaly += other.anomaly
+	a.failed += other.failed
 	a.tokens += other.tokens
 	a.quota += other.quota
 }
 
 func (a channelUsageAgg) metrics() ChannelUsageMetrics {
 	return ChannelUsageMetrics{Requests: a.requests, Tokens: a.tokens, CostUSD: float64(a.quota) / quotaPerUSD}
+}
+
+func (a channelUsageAgg) stability() *float64 {
+	total := a.success + a.anomaly + a.failed
+	if total == 0 {
+		return nil
+	}
+	value := rate(a.success, total)
+	return &value
 }
 
 type channelManagementBuild struct {
@@ -302,11 +317,16 @@ func (m *Monitor) buildChannelManagementReport(ctx context.Context, scope stabil
 		ChannelID int
 		Grp       string
 		Requests  int64
+		Success   int64
+		Anomaly   int64
+		Failed    int64
 		Tokens    int64
 		Quota     int64
 	}
 	tx = m.storeDB.WithContext(ctx).Raw(`SELECT channel_id,COALESCE(grp,'') grp,
 		COALESCE(SUM(success+anomaly+failed),0) requests,
+		COALESCE(SUM(success),0) success,COALESCE(SUM(anomaly),0) anomaly,
+		COALESCE(SUM(failed),0) failed,
 		COALESCE(SUM(tokens),0) tokens,COALESCE(SUM(quota),0) quota
 		FROM stability_hour_samples WHERE hour_ts>=? AND hour_ts<?
 		GROUP BY channel_id,grp LIMIT ?`, scope.FromTs, scope.ToTs, maxChannelManagementRows+1).Scan(&usageRows)
@@ -327,7 +347,7 @@ func (m *Monitor) buildChannelManagementReport(ctx context.Context, scope stabil
 			}
 			channels[row.ChannelID] = ch
 		}
-		usage := channelUsageAgg{requests: row.Requests, tokens: row.Tokens, quota: row.Quota}
+		usage := channelUsageAgg{requests: row.Requests, success: row.Success, anomaly: row.Anomaly, failed: row.Failed, tokens: row.Tokens, quota: row.Quota}
 		ch.Usage.add(usage)
 		groupName := strings.TrimSpace(row.Grp)
 		if groupName == "" {
@@ -398,7 +418,7 @@ func (m *Monitor) buildChannelManagementReport(ctx context.Context, scope stabil
 				outChannels = append(outChannels, ChannelManagementChannel{
 					ID: ch.ID, Name: ch.Name, Host: ch.BaseHost, Vendor: ch.Vendor, Status: ch.Status, Current: ch.Current,
 					ConfiguredGroups: ch.ConfiguredGroups, ModelCount: ch.ModelCount,
-					Usage: ch.Usage.metrics(), Groups: managementGroups(ch.Groups, ch.BaseDomain, finance),
+					Stability: ch.Usage.stability(), Usage: ch.Usage.metrics(), Groups: managementGroups(ch.Groups, ch.BaseDomain, finance),
 				})
 			}
 			vendors = append(vendors, ChannelManagementVendor{Name: vendor.Name, Usage: vendor.Usage.metrics(), Channels: outChannels})
