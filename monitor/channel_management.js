@@ -5,7 +5,7 @@ const cm={
   inited:false,loaded:false,days:7,custom:null,preset:'',report:null,abort:null,sort:'cost',
   filters:{search:'',domain:'',vendor:'',group:'',status:''},
   expandedDomains:new Set(),expandedVendors:new Set(),collapsedGroups:new Set(),
-  financeDomain:null,financeGroups:[],upstreamDomain:null,upstreamConfig:null
+  financeMode:'',financeDomain:null,financeGroups:[],financeChannels:[],financeChannel:null,upstreamDomain:null,upstreamConfig:null
 };
 const $=id=>document.getElementById(id);
 const esc=s=>String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -102,6 +102,8 @@ function init(){
   $('cmFinanceCancel')?.addEventListener('click',closeFinance);
   $('cmFinanceMask')?.addEventListener('click',closeFinance);
   $('cmFinanceSave')?.addEventListener('click',saveFinance);
+  $('cmFinanceSyncGroups')?.addEventListener('click',syncWebsiteGroups);
+  $('cmSiteFinanceOpen')?.addEventListener('click',openSiteFinance);
   ['cmFinanceFX','cmFinanceSitePaid','cmFinanceSiteCredit','cmFinanceUpPaid','cmFinanceUpCredit'].forEach(id=>$(id)?.addEventListener('input',refreshFinancePreview));
   $('cmFinanceGroupRows')?.addEventListener('input',event=>{if(event.target.matches('[data-cm-finance-input]'))refreshFinancePreview()});
   $('cmUpstreamClose')?.addEventListener('click',closeUpstream);
@@ -110,7 +112,7 @@ function init(){
   $('cmUpstreamProvider')?.addEventListener('change',syncUpstreamFields);
   $('cmUpstreamSave')?.addEventListener('click',saveUpstream);
   $('cmUpstreamSync')?.addEventListener('click',syncUpstreamNow);
-  document.addEventListener('keydown',event=>{if(event.key==='Escape'){if(cm.upstreamDomain)closeUpstream();else if(cm.financeDomain)closeFinance()}});
+  document.addEventListener('keydown',event=>{if(event.key==='Escape'){if(cm.upstreamDomain)closeUpstream();else if(cm.financeMode)closeFinance()}});
   window.addEventListener('monitor:navigate',event=>{if(event.detail?.tab==='channels'&&applyNavigationContext())loadReport()});
 }
 
@@ -233,15 +235,16 @@ function stabilityText(value){
 function channelGroupFor(ch,name){
   return (ch.groups||[]).find(group=>group.name===name)||{name,usage:zero(),finance:{}};
 }
-function channelGroupRows(group){
+function channelGroupRows(domain,group){
   const finance=group.finance||{};
   return group.channels.map(({channel,groupData})=>{
     const usage=groupData.usage||zero();
     const f=groupData.finance||finance;
+    const gap=f.site_configured&&f.upstream_configured?multiplierGap(f.multiplier_gap):'—';
     return `<div class="cm-group-channel-row">
       <div class="cm-channel-name"><b>#${channel.id} ${esc(channel.name)}</b></div>
       <div class="cm-group-rate"><b>${formatMultiplier(f.upstream_effective_multiplier)}</b></div>
-      <div class="cm-group-gap"><b>${formatMultiplier(f.multiplier_gap)}</b></div>
+      <div class="cm-group-gap"><b>${gap}</b></div>
       <div class="cm-group-models"><b>${nfmt(channel.model_count)} 个模型</b></div>
       <div>${statusLabel(channel)}</div>
       <div class="cm-group-stability"><b>${stabilityText(channel.stability)}</b></div>
@@ -275,11 +278,11 @@ function groupSection(domain,vendor,group,index,domainTotal){
   const share=metric(domainTotal)>0?metric(group.usage)/metric(domainTotal)*100:0;
   return `<section class="cm-group-section${open?' open':''}">
     <header class="cm-group-head" role="button" tabindex="0" aria-expanded="${open}" data-cm-group-toggle="${esc(key)}">
-      <div class="cm-group-title"><b>${esc(group.name)}</b><span>本站分组倍率 ${formatMultiplier(f.site_multiplier)}</span><small>${group.channels.length} 个候选渠道 · ${nfmt(models)} 个配置模型 · 本期 ${nfmt(active)} 个渠道有请求</small></div>
+      <div class="cm-group-title"><b>${esc(group.name)}</b><span>网站分组倍率 ${formatMultiplier(f.site_multiplier)}</span><small>${group.channels.length} 个候选渠道 · ${nfmt(models)} 个配置模型 · 本期 ${nfmt(active)} 个渠道有请求</small></div>
       <div class="cm-group-metrics"><span><small>请求数</small><b>${nfmt(group.usage.requests)}</b></span><span><small>Tokens</small><b>${compact(group.usage.tokens)}</b></span><span><small>用户侧消费</small><b>${usd(group.usage.cost_usd)}</b></span><span><small>域名消费占比</small><b>${share.toFixed(1)}%</b></span></div>
       <i class="cm-group-chevron">${open?'−':'+'}</i>
     </header>
-    ${open?`<div class="cm-group-body"><div class="cm-group-channel-head"><span>渠道 ID / 渠道名</span><span>上游折算倍率</span><span>倍率差</span><span>关联模型</span><span>状态</span><span>稳定性</span><span>请求数</span><span>Tokens</span><span>用户侧消费</span><span>本组占比</span></div>${channelGroupRows(group)}</div>`:''}
+    ${open?`<div class="cm-group-body"><div class="cm-group-channel-head"><span>渠道 ID / 渠道名</span><span>上游折算倍率</span><span>倍率差</span><span>关联模型</span><span>状态</span><span>稳定性</span><span>请求数</span><span>Tokens</span><span>用户侧消费</span><span>本组占比</span></div>${channelGroupRows(domain,group)}</div>`:''}
   </section>`;
 }
 function vendorSection(domain,vendor){
@@ -305,14 +308,13 @@ function upstreamSummary(upstream){
 function domainCard(domain,index,total,filtered){
   const channels=domain.vendors.flatMap(v=>v.channels),enabled=channels.filter(ch=>ch.current&&+ch.status===1).length;
   const open=cm.expandedDomains.has(domain.key),share=metric(total)>0?metric(domain.usage)/metric(total)*100:0;
-  const financeGroups=domain.finance_groups||[],completeFinance=financeGroups.filter(g=>g.finance?.complete).length;
   const financeVersion=+domain.finance?.version||0;
-  const financeLabel=!financeGroups.length?'暂无可配置分组':financeVersion?`倍率版本 v${financeVersion} · ${completeFinance}/${financeGroups.length} 分组`:`倍率待配置 · 0/${financeGroups.length} 分组`;
+  const financeLabel=domain.finance?.configured?(financeVersion?`上游充值比例已配置 · v${financeVersion}`:'上游充值比例已配置'):'上游充值比例待配置';
   const financeButton=cm.report?.finance?.can_edit&&domain.configured?`<button type="button" class="cm-finance-open" data-cm-finance="${esc(domain.key)}">倍率配置</button>`:'';
   const upstreamButton=cm.report?.finance?.can_edit&&domain.configured?`<button type="button" class="cm-upstream-open" data-cm-upstream="${esc(domain.key)}">账户配置</button>`:'';
   return `<article class="cm-domain-card${open?' open':''}"><div class="cm-domain-head" role="button" tabindex="0" data-cm-domain-toggle="${esc(domain.key)}">
     <span class="cm-rank">${String(index+1).padStart(2,'0')}</span>
-    <div class="cm-domain-identity"><span class="cm-domain-icon">${domain.configured?'◎':'—'}</span><div><b>${esc(domain.domain)}</b><small>${domain.vendors.length} 个厂商 · ${channels.length} 个实际渠道 · ${enabled} 个启用</small><div class="cm-domain-config"><div class="cm-domain-finance"><span class="${completeFinance===financeGroups.length&&financeGroups.length?'ready':'pending'}">${esc(financeLabel)}</span>${financeButton}</div><div class="cm-domain-upstream">${upstreamSummary(domain.upstream)}${upstreamButton}</div></div></div></div>
+    <div class="cm-domain-identity"><span class="cm-domain-icon">${domain.configured?'◎':'—'}</span><div><b>${esc(domain.domain)}</b><small>${domain.vendors.length} 个厂商 · ${channels.length} 个实际渠道 · ${enabled} 个启用</small><div class="cm-domain-config"><div class="cm-domain-finance"><span class="${domain.finance?.configured?'ready':'pending'}">${esc(financeLabel)}</span>${financeButton}</div><div class="cm-domain-upstream">${upstreamSummary(domain.upstream)}${upstreamButton}</div></div></div></div>
     <div class="cm-share"><div><b>${share.toFixed(1)}%</b><small>${filtered?'筛选内':'全站'}${esc(metricLabel())}</small></div><i><em style="width:${Math.max(share&&2,share)}%"></em></i></div>
     <div class="cm-domain-metrics"><span><small>渠道请求数</small><b>${nfmt(domain.usage.requests)}</b></span><span><small>Tokens</small><b title="${nfmt(domain.usage.tokens)}">${compact(domain.usage.tokens)}</b></span><span><small>用户侧消费</small><b>${usd(domain.usage.cost_usd)}</b></span></div>
     <span class="cm-chevron">${open?'−':'+'}</span>
@@ -351,111 +353,165 @@ function showFinanceMessage(message,error=false){
 }
 function renderFinanceRows(){
   const rows=cm.financeGroups||[];
+  if(cm.financeMode!=='site'){$('cmFinanceGroupRows').innerHTML='';return}
   $('cmFinanceGroupRows').innerHTML=rows.map((row,index)=>{
-    const finance=row.finance||{};
-    const site=finance.site_configured?finance.site_multiplier:'';
-    const upstream=finance.upstream_configured?finance.upstream_multiplier:'';
-    const upstreamFactor=finance.upstream_configured?(finance.upstream_discount_factor||1):'';
+    const site=row.site_configured?row.site_multiplier:'';
+    const source=Number.isFinite(+row.source_multiplier)&&(+row.source_multiplier)>0?`${(+row.source_multiplier).toFixed(2)}×`:'—';
     return `<div class="cm-finance-group-row" data-cm-finance-row="${index}">
-      <b title="${esc(row.name)}">${esc(row.name)}</b>
+      <b class="cm-finance-group-name" title="${esc(row.name)}">${esc(row.name)}</b>
+      <span class="cm-finance-source-rate">${source}</span>
       <input type="number" min="0.000001" step="0.0001" inputmode="decimal" value="${site}" data-cm-finance-input="site" data-cm-finance-index="${index}" aria-label="${esc(row.name)} 我方倍率">
-      <input type="number" min="0.000001" step="0.0001" inputmode="decimal" value="${upstream}" data-cm-finance-input="upstream" data-cm-finance-index="${index}" aria-label="${esc(row.name)} 上游基础倍率">
-      <input type="number" min="0.000001" step="0.0001" inputmode="decimal" value="${upstreamFactor}" placeholder="1" data-cm-finance-input="upstream-factor" data-cm-finance-index="${index}" aria-label="${esc(row.name)} 上游折扣系数">
-      <span data-cm-finance-effective="${index}">—</span><span data-cm-finance-discounts="${index}">—</span><strong data-cm-finance-margin="${index}">待配置</strong>
     </div>`;
-  }).join('')||'<div class="cm-no-groups">该主域名暂无可配置服务分组</div>';
+  }).join('')||'<div class="cm-no-groups">尚未同步 NewAPI 分组，请点击“一键同步 NewAPI 分组”。</div>';
   refreshFinancePreview();
 }
 function refreshFinancePreview(){
-  if(!cm.financeDomain)return;
-  const fx=financeNumber('cmFinanceFX'),sitePaid=financeNumber('cmFinanceSitePaid'),siteCredit=financeNumber('cmFinanceSiteCredit');
-  const upPaid=financeNumber('cmFinanceUpPaid'),upCredit=financeNumber('cmFinanceUpCredit');
-  let complete=0;
-  (cm.financeGroups||[]).forEach((_,index)=>{
-    const site=financeGroupInput(index,'site'),up=financeGroupInput(index,'upstream'),upFactor=financeGroupInput(index,'upstream-factor');
-    const siteDiscount=fx&&sitePaid&&siteCredit&&site?site*(sitePaid/siteCredit)/fx:null;
-    const effective=upPaid&&upCredit&&up&&upFactor?up*upFactor*(upPaid/upCredit):null;
-    const upDiscount=fx&&effective?effective/fx:null;
-    const margin=siteDiscount&&upDiscount!=null?(siteDiscount-upDiscount)/siteDiscount:null;
-    const effectiveEl=document.querySelector(`[data-cm-finance-effective="${index}"]`),discountsEl=document.querySelector(`[data-cm-finance-discounts="${index}"]`),marginEl=document.querySelector(`[data-cm-finance-margin="${index}"]`);
-    if(effectiveEl)effectiveEl.textContent=effective==null?'—':effective.toFixed(4).replace(/0+$/,'').replace(/\.$/,'');
-    if(discountsEl){
-      discountsEl.textContent=siteDiscount==null||upDiscount==null?'—':`${pct(siteDiscount)} / ${pct(upDiscount)}`;
-      discountsEl.title='我方计价折扣 / 上游计价折扣';
-    }
-    if(marginEl){
-      marginEl.textContent=margin==null?'待配置':pct(margin);
-      marginEl.className=margin==null?'':margin<0?'loss':margin<.1?'low':'good';
-    }
-    document.querySelector(`[data-cm-finance-row="${index}"]`)?.classList.toggle('complete',margin!=null);
-    if(margin!=null)complete++;
-  });
-  if($('cmFinanceConfiguredCount'))$('cmFinanceConfiguredCount').textContent=`${complete}/${cm.financeGroups.length} 个分组口径完整`;
+  if(cm.financeMode==='site'){
+    const complete=(cm.financeGroups||[]).filter((_,index)=>financeGroupInput(index,'site')!=null).length;
+    if($('cmFinanceConfiguredCount'))$('cmFinanceConfiguredCount').textContent=`${complete}/${cm.financeGroups.length} 个分组已配置`;
+  }
+}
+function financeChannelGroups(channel){
+  const groups=new Map();
+  (channel.groups||[]).forEach(group=>groups.set(group.name,group));
+  (channel.configured_groups||[]).forEach(name=>{if(name&&!groups.has(name))groups.set(name,{name,usage:zero(),finance:{}})});
+  return [...groups.values()].sort((a,b)=>String(a.name).localeCompare(String(b.name),'zh-CN'));
+}
+function renderFinanceChannelRows(){
+  const target=$('cmFinanceDomainChannelRows');if(!target)return;
+  const channels=cm.financeChannels||[];
+  if(!channels.length){target.innerHTML='<div class="cm-no-groups">该主域名当前没有可配置的实际渠道</div>';return}
+  target.innerHTML=channels.map(channel=>{
+    const groups=financeChannelGroups(channel);
+    const configured=groups.map(group=>group.finance||{}).filter(finance=>finance.upstream_configured);
+    const first=configured[0]||{};
+    const conflict=configured.some(finance=>finance.upstream_group_name!==first.upstream_group_name||finance.upstream_multiplier!==first.upstream_multiplier||finance.upstream_discount_factor!==first.upstream_discount_factor);
+    const upstreamGroupName=configured.find(finance=>String(finance.upstream_group_name||'').trim())?.upstream_group_name||'';
+    const multiplier=conflict?'':(first.upstream_configured?first.upstream_multiplier:'');
+    const discount=conflict?'':(first.upstream_configured?(first.upstream_discount_factor||1):'');
+    const state=conflict?'<small class="cm-finance-channel-warning">历史配置不一致，请重新确认</small>':'';
+    return `<article class="cm-finance-domain-channel"><div class="cm-finance-domain-channel-name"><b>#${esc(channel.id)} ${esc(channel.name)}</b>${state}</div><label class="cm-finance-upstream-group"><input type="text" maxlength="128" value="${esc(upstreamGroupName)}" data-cm-domain-rate="group-name" data-channel-id="${esc(channel.id)}" aria-label="#${esc(channel.id)} 上游分组名" placeholder="填写上游对应分组"></label><label><input type="number" min="0.000001" step="0.0001" inputmode="decimal" value="${multiplier}" data-cm-domain-rate="multiplier" data-channel-id="${esc(channel.id)}" aria-label="#${esc(channel.id)} 上游基础倍率"></label><label><input type="number" min="0.000001" step="0.0001" inputmode="decimal" value="${discount}" data-cm-domain-rate="discount" data-channel-id="${esc(channel.id)}" aria-label="#${esc(channel.id)} 上游折扣系数"></label></article>`;
+  }).join('');
+  target.insertAdjacentHTML('afterbegin','<div class="cm-finance-domain-channel-head"><span>渠道</span><span>上游分组名</span><span>上游基础倍率</span><span>上游折扣系数</span></div>');
+}
+function setFinanceMode(mode){
+  cm.financeMode=mode;
+  $('cmFinanceGlobalSection').hidden=mode!=='site';
+  $('cmFinanceGlobalGroups').hidden=mode!=='site';
+  $('cmFinanceDomainSection').hidden=mode!=='domain';
+  $('cmFinanceDomainChannels').hidden=mode!=='domain';
+}
+function showFinanceDialog(){
+  $('cmFinanceMask').hidden=false;$('cmFinanceDialog').classList.add('show');$('cmFinanceDialog').setAttribute('aria-hidden','false');
+  document.body.classList.add('cm-dialog-open');
+}
+function openSiteFinance(){
+  if(!cm.report?.finance?.can_edit)return;
+  cm.financeDomain=null;cm.financeChannel=null;cm.financeChannels=[];
+  cm.financeGroups=Array.isArray(cm.report.website_groups)?cm.report.website_groups.slice():[];
+  const global=cm.report.finance||{};
+  $('cmFinanceScope').textContent='网站计价配置';
+  $('cmFinanceTitle').textContent='网站计价基准';
+  $('cmFinanceSubtitle').textContent='全站唯一配置；分组目录与当前倍率来自 NewAPI 分组管理，修改后会影响所有主域名和所有渠道的成本对照，并为受影响主域名保留版本。';
+  $('cmFinanceFX').value=global.fx_benchmark||7;$('cmFinanceSitePaid').value=global.site_recharge_paid||1;$('cmFinanceSiteCredit').value=global.site_recharge_credit||1;
+  $('cmFinanceFormulaTitle').textContent='网站计价折扣 = 我方分组倍率 × (我方充值支付 ÷ 我方充值到账) ÷ 折扣基准';
+  $('cmFinanceFormulaNote').textContent='这里只维护网站全局口径；具体上游渠道的基础倍率和折扣系数在对应渠道行中配置。';
+  const syncedAt=+cm.report.website_groups_synced_at||0;
+  $('cmFinanceGroupSource').textContent=syncedAt?`分组来源：NewAPI 分组管理 · 最近同步 ${dateTime(syncedAt)}`:'尚未同步 NewAPI 分组';
+  $('cmFinanceSyncGroups').hidden=false;
+  $('cmFinanceSave').textContent='保存网站计价基准';setFinanceMode('site');showFinanceMessage('');renderFinanceRows();showFinanceDialog();
+  setTimeout(()=>$('cmFinanceFX')?.focus(),30);
 }
 function openFinance(domainKey){
   if(!cm.report?.finance?.can_edit)return;
   const domain=(cm.report.domains||[]).find(item=>item.key===domainKey&&item.configured);
   if(!domain)return;
-  cm.financeDomain=domain;
-  cm.financeGroups=[...(domain.finance_groups||[])];
-  const global=cm.report.finance||{},upstream=domain.finance||{};
-  $('cmFinanceTitle').textContent=`${domain.domain} · 成本与毛利率`;
+  cm.financeDomain=domain;cm.financeChannel=null;cm.financeGroups=[];
+  cm.financeChannels=(domain.vendors||[]).flatMap(vendor=>(vendor.channels||[]).filter(channel=>channel.current).map(channel=>({...channel,vendor:vendor.name})))
+    .sort((a,b)=>(+a.id||0)-(+b.id||0));
+  const upstream=domain.finance||{};
+  $('cmFinanceScope').textContent='主域名倍率配置';
+  $('cmFinanceTitle').textContent=`${domain.domain} · 倍率配置`;
   $('cmFinanceSubtitle').textContent=upstream.version
     ? `当前版本 v${upstream.version} · 生效于 ${dateTime(upstream.effective_at)}。更新会创建新版本，旧版本永久保留。`
     : '首次保存将创建倍率版本 v1，生效时间为保存时间。配置只保存在 Monitor 本地。';
-  $('cmFinanceFX').value=global.fx_benchmark||7;
-  $('cmFinanceSitePaid').value=global.site_recharge_paid||1;
-  $('cmFinanceSiteCredit').value=global.site_recharge_credit||1;
   $('cmFinanceUpPaid').value=upstream.configured?upstream.recharge_paid:1;
   $('cmFinanceUpCredit').value=upstream.configured?upstream.recharge_credit:1;
-  $('cmFinanceSave').textContent=upstream.version?'更新为新版本':'保存为 v1';
-  showFinanceMessage('');renderFinanceRows();
-  $('cmFinanceMask').hidden=false;
-  $('cmFinanceDialog').classList.add('show');$('cmFinanceDialog').setAttribute('aria-hidden','false');
-  document.body.classList.add('cm-dialog-open');
-  setTimeout(()=>$('cmFinanceFX')?.focus(),30);
+  $('cmFinanceFormulaTitle').textContent='上游实际倍率 = 基础倍率 × 折扣系数 ÷ 上游充值比例';
+  $('cmFinanceFormulaNote').textContent='上游充值比例 = 充值到账 ÷ 充值支付；下方集中维护该主域名的所有渠道和其服务分组倍率。';
+  $('cmFinanceSave').textContent=upstream.version?'更新倍率配置':'保存倍率配置';setFinanceMode('domain');showFinanceMessage('');renderFinanceChannelRows();showFinanceDialog();
 }
 function closeFinance(){
-  if(!cm.financeDomain)return;
-  cm.financeDomain=null;cm.financeGroups=[];
+  if(!cm.financeMode)return;
+  cm.financeMode='';cm.financeDomain=null;cm.financeChannel=null;cm.financeGroups=[];
   $('cmFinanceMask').hidden=true;$('cmFinanceDialog').classList.remove('show');$('cmFinanceDialog').setAttribute('aria-hidden','true');
   document.body.classList.remove('cm-dialog-open');showFinanceMessage('');
 }
-async function saveFinance(){
-  if(!cm.financeDomain||!cm.report?.finance?.can_edit)return;
-  const values={
-    fx_benchmark:financeNumber('cmFinanceFX'),site_recharge_paid:financeNumber('cmFinanceSitePaid'),site_recharge_credit:financeNumber('cmFinanceSiteCredit'),
-    upstream_recharge_paid:financeNumber('cmFinanceUpPaid'),upstream_recharge_credit:financeNumber('cmFinanceUpCredit')
-  };
-  if(Object.values(values).some(value=>value==null)){showFinanceMessage('折扣基准和双方充值比例都必须填写大于 0 的数字。',true);return}
-  const groups=[];
-  for(let index=0;index<cm.financeGroups.length;index++){
-    const siteEl=document.querySelector(`[data-cm-finance-input="site"][data-cm-finance-index="${index}"]`),upEl=document.querySelector(`[data-cm-finance-input="upstream"][data-cm-finance-index="${index}"]`),factorEl=document.querySelector(`[data-cm-finance-input="upstream-factor"][data-cm-finance-index="${index}"]`);
-    const siteRaw=siteEl?.value.trim()||'',upRaw=upEl?.value.trim()||'',factorRaw=factorEl?.value.trim()||'';
-    if(!siteRaw&&!upRaw&&!factorRaw)continue;
-    const site=financeGroupInput(index,'site'),upstream=financeGroupInput(index,'upstream'),upstreamFactor=financeGroupInput(index,'upstream-factor');
-    if(site==null||upstream==null||upstreamFactor==null){showFinanceMessage(`${cm.financeGroups[index].name} 必须同时填写我方倍率、上游基础倍率和上游折扣系数，且都大于 0。`,true);return}
-    groups.push({group:cm.financeGroups[index].name,site_multiplier:site,upstream_multiplier:upstream,upstream_discount_factor:upstreamFactor});
-  }
-  const payload={domain:cm.financeDomain.domain,...values,groups};
-  const button=$('cmFinanceSave');button.disabled=true;showFinanceMessage('正在核对倍率版本…');
+async function syncWebsiteGroups(){
+  if(cm.financeMode!=='site'||!cm.report?.finance?.can_edit)return;
+  const button=$('cmFinanceSyncGroups');if(!button)return;
+  button.disabled=true;showFinanceMessage('正在读取 NewAPI 分组管理…');
   try{
-    let res=await fetch('/channels/finance',{method:'POST',headers:{Accept:'application/json','Content-Type':'application/json'},body:JSON.stringify(payload)});
+    let res=await fetch('/channels/finance/site-groups/sync',{method:'POST',headers:{Accept:'application/json','Content-Type':'application/json'},body:'{}'});
     if(res.status===401){location.href='/login';return}
     let data=await res.json();
     if(res.status===409&&data.confirmation_required){
-	  const globalImpact=data.global_changed&&+data.affected_domains>1
-	    ?`\n\n我方计价基准发生变化，将同步核对 ${data.affected_domains} 个主域名并为实际受影响的渠道追加版本。`
-	    :'';
-      const confirmed=window.confirm(`当前是倍率版本 v${data.current_version}。\n\n确认更新为 v${data.next_version} 吗？${globalImpact}\n旧版本会完整保留，新版本从确认保存时开始生效。`);
-      if(!confirmed){showFinanceMessage('已取消更新，当前版本未变更。');return}
-      showFinanceMessage(`正在创建倍率版本 v${data.next_version}…`);
-      res=await fetch('/channels/finance',{method:'POST',headers:{Accept:'application/json','Content-Type':'application/json'},body:JSON.stringify({...payload,confirm_update:true,expected_version:data.current_version,expected_global_revision:data.current_global_revision||''})});
+      const count=Number(data.group_count)||0;
+      const impact=Number(data.affected_domains)||0;
+      const confirmed=window.confirm(`NewAPI 当前有 ${count} 个用户可用分组，网站计价目录将按此结果更新。${impact?`\n\n将为 ${impact} 个主域名追加倍率版本。`:''}\n现有历史版本会保留，是否继续？`);
+      if(!confirmed){showFinanceMessage('已取消同步，当前网站分组和倍率未变更。');return}
+      showFinanceMessage('正在确认并保存 NewAPI 分组…');
+      res=await fetch('/channels/finance/site-groups/sync',{method:'POST',headers:{Accept:'application/json','Content-Type':'application/json'},body:JSON.stringify({confirm_update:true,expected_global_revision:data.current_global_revision||''})});
       if(res.status===401){location.href='/login';return}
       data=await res.json();
     }
     if(!res.ok)throw new Error(data.error||`HTTP ${res.status}`);
-    if(data.unchanged){showFinanceMessage(`配置没有变化，仍为倍率版本 v${data.version}。`);return}
+    closeFinance();cm.loaded=false;await loadReport();
+  }catch(error){showFinanceMessage(error.message||'同步失败，请稍后重试。',true)}finally{button.disabled=false}
+}
+async function saveFinance(){
+  if(!cm.financeMode||!cm.report?.finance?.can_edit)return;
+  let endpoint,payload,kind;
+  if(cm.financeMode==='site'){
+    const values={fx_benchmark:financeNumber('cmFinanceFX'),site_recharge_paid:financeNumber('cmFinanceSitePaid'),site_recharge_credit:financeNumber('cmFinanceSiteCredit')};
+    if(Object.values(values).some(value=>value==null)){showFinanceMessage('折扣基准和我方充值比例都必须填写大于 0 的数字。',true);return}
+    const groups=[];for(let index=0;index<cm.financeGroups.length;index++){const site=financeGroupInput(index,'site');if(site!=null)groups.push({group:cm.financeGroups[index].name,site_multiplier:site})}
+    endpoint='/channels/finance/site';payload={...values,groups};kind='site';
+  }else if(cm.financeMode==='domain'){
+    const paid=financeNumber('cmFinanceUpPaid'),credit=financeNumber('cmFinanceUpCredit');
+    if(paid==null||credit==null){showFinanceMessage('上游充值支付和到账都必须填写大于 0 的数字。',true);return}
+    const rates=[];
+    for(const input of document.querySelectorAll('[data-cm-domain-rate="multiplier"]')){
+      const groupNameInput=input.closest('.cm-finance-domain-channel')?.querySelector('[data-cm-domain-rate="group-name"]');
+      const discountInput=input.closest('.cm-finance-domain-channel')?.querySelector('[data-cm-domain-rate="discount"]');
+      const multiplier=Number(input.value),discount=Number(discountInput?.value);
+      const groupName=String(groupNameInput?.value||'').trim();
+      const hasMultiplier=input.value.trim()!==''||!!discountInput?.value.trim()||!!groupName;
+      if(!hasMultiplier)continue;
+      if(!Number.isFinite(multiplier)||multiplier<=0||!Number.isFinite(discount)||discount<=0){showFinanceMessage(`#${input.dataset.channelId} 的上游基础倍率和折扣系数必须同时填写大于 0 的数字。`,true);return}
+      rates.push({channel_id:+input.dataset.channelId,upstream_group_name:groupName,upstream_multiplier:multiplier,upstream_discount_factor:discount});
+    }
+    endpoint='/channels/finance/domain-rates';payload={domain:cm.financeDomain.domain,upstream_recharge_paid:paid,upstream_recharge_credit:credit,rates};kind='domain';
+  }
+  const button=$('cmFinanceSave');button.disabled=true;showFinanceMessage('正在核对配置版本…');
+  try{
+    let res=await fetch(endpoint,{method:'POST',headers:{Accept:'application/json','Content-Type':'application/json'},body:JSON.stringify(payload)});
+    if(res.status===401){location.href='/login';return}
+    let data=await res.json();
+    if(res.status===409&&data.confirmation_required){
+      const globalImpact=kind==='site'&&+data.affected_domains>0?`\n\n将为 ${data.affected_domains} 个主域名追加版本。`:'';
+      const current=kind==='site'?'全站计价配置':`当前版本 v${data.current_version}`;
+      const next=kind==='site'?'新版本':`v${data.next_version}`;
+      const confirmed=window.confirm(`${current}需要确认更新。\n\n确认保存为 ${next} 吗？${globalImpact}\n旧版本会完整保留，新版本从确认保存时开始生效。`);
+      if(!confirmed){showFinanceMessage('已取消更新，当前版本未变更。');return}
+      showFinanceMessage('正在创建新配置版本…');
+      const confirmPayload={...payload,confirm_update:true};if(kind==='site')confirmPayload.expected_global_revision=data.current_global_revision||'';else confirmPayload.expected_version=data.current_version;
+      res=await fetch(endpoint,{method:'POST',headers:{Accept:'application/json','Content-Type':'application/json'},body:JSON.stringify(confirmPayload)});
+      if(res.status===401){location.href='/login';return}
+      data=await res.json();
+    }
+    if(!res.ok)throw new Error(data.error||`HTTP ${res.status}`);
+    if(data.unchanged){showFinanceMessage('配置没有变化，当前版本保持不变。');return}
     closeFinance();cm.loaded=false;await loadReport();
   }catch(error){showFinanceMessage(error.message||'保存失败，请稍后重试。',true)}finally{button.disabled=false}
 }
@@ -562,6 +618,10 @@ function render(){
   const historical=channels.filter(ch=>!ch.current).length,filtered=filtersActive();
   const allUsage=cm.report.summary?.usage||zero();
   const share=metric(allUsage)>0?metric(filteredUsage)/metric(allUsage)*100:0;
+  const filters=$('cmFilters');
+  // Keep the controls mounted between renders, but place them immediately
+  // before the ranking heading so the page reads as overview -> filters -> list.
+  filters?.remove();
   $('cmBody').innerHTML=`<section class="cm-kpis">
     <article><small>已配置主域名</small><b>${nfmt(configuredDomains)}</b><span>当前显示 ${nfmt(domains.length)} 个归并项</span></article>
     <article><small>当前实际渠道</small><b>${nfmt(currentChannels.length)}</b><span>${nfmt(enabled)} 启用 · ${nfmt(currentChannels.length-enabled)} 停用${historical?' · '+nfmt(historical)+' 历史':''}</span></article>
@@ -571,8 +631,11 @@ function render(){
     <article class="accent"><small>用户侧消费</small><b>${usd(filteredUsage.cost_usd)}</b><span>NewAPI logs.quota</span></article>
     ${filtered?`<article><small>筛选${esc(metricLabel())}占比</small><b>${share.toFixed(1)}%</b><span>相对当前日期全部渠道</span></article>`:''}
   </section>
+  <div id="cmFilterSlot"></div>
   <section class="cm-list-head"><div><h3>渠道排名</h3><p>共 ${nfmt(domains.length)} 个归并项 · 按 ${esc(metricLabel())} 从高到低排序，逐级展开厂商类型、实际渠道与服务分组。</p></div><div class="cm-fresh">${freshness(cm.report.meta)}<small>渠道配置快照 ${esc(dateTime(cm.report.meta.channel_config_updated_at))}</small></div></section>
   <div class="cm-domain-list">${domains.map((domain,index)=>domainCard(domain,index,filteredUsage,filtered)).join('')||'<div class="cm-empty"><b>当前筛选没有匹配渠道</b><p>请重置筛选条件或更换日期范围。</p></div>'}</div>`;
+  const slot=$('cmFilterSlot');
+  if(slot&&filters)slot.replaceWith(filters);
 }
 
 document.addEventListener('DOMContentLoaded',()=>{if($('tab-channels')&&!cm.inited)init()});

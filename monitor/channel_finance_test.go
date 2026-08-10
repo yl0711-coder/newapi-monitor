@@ -419,3 +419,90 @@ func TestFirstDomainVersionRejectsStaleGlobalConfirmation(t *testing.T) {
 		t.Fatalf("stale confirmation must not create b version: count=%d err=%v", bVersions, err)
 	}
 }
+
+func TestLayeredChannelFinanceRoutesKeepScopesSeparate(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	m := newStabilityTestMonitor(t)
+	m.cfg.SessionSecret = "test-session-secret"
+	if err := m.storeDB.Create(&[]ChannelSnap{
+		{ID: 33, Name: "LA-codex", BaseDomain: "last-api.ai", Groups: "codex-1.2x, codex-1.4x", Status: 1},
+		{ID: 44, Name: "LA-codex-temp", BaseDomain: "other.example", Groups: "codex-1.2x", Status: 1},
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	r := gin.New()
+	r.POST("/site", m.requireRole(roleRoot), m.saveChannelFinanceSiteHandler)
+	r.POST("/domain", m.requireRole(roleRoot), m.saveChannelFinanceDomainHandler)
+	r.POST("/channel", m.requireRole(roleRoot), m.saveChannelFinanceChannelHandler)
+	r.POST("/domain-rates", m.requireRole(roleRoot), m.saveChannelFinanceDomainRatesHandler)
+	request := func(path string, input any) *httptest.ResponseRecorder {
+		body, err := json.Marshal(input)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req := httptest.NewRequest(http.MethodPost, path, bytes.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		req.AddCookie(&http.Cookie{Name: sessionCookie, Value: m.signSession("tester", roleRoot, time.Now().Unix())})
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+		return w
+	}
+
+	site := channelFinanceSiteSaveInput{
+		FXBenchmark: 7, SiteRechargePaid: 1, SiteRechargeCredit: 1,
+		Groups: []channelFinanceSiteGroupInput{{Group: "codex-1.2x", SiteMultiplier: financeFloatPtr(1.2)}},
+	}
+	if w := request("/site", site); w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"updated_domains":2`) {
+		t.Fatalf("site config status=%d body=%s", w.Code, w.Body.String())
+	}
+
+	domain := channelFinanceDomainSaveInput{Domain: "last-api.ai", UpstreamRechargePaid: 2, UpstreamRechargeCredit: 1}
+	if w := request("/domain", domain); w.Code != http.StatusConflict || !strings.Contains(w.Body.String(), `"confirmation_required":true`) {
+		t.Fatalf("domain update must require version confirmation: %d %s", w.Code, w.Body.String())
+	}
+	domain.ConfirmUpdate = true
+	domain.ExpectedVersion = 1
+	if w := request("/domain", domain); w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"version":2`) {
+		t.Fatalf("confirmed domain update status=%d body=%s", w.Code, w.Body.String())
+	}
+
+	channelRates := channelFinanceDomainRatesSaveInput{Domain: "last-api.ai", UpstreamRechargePaid: 2, UpstreamRechargeCredit: 1, Rates: []channelFinanceChannelRateInput{{ChannelID: 33, UpstreamGroupName: "上游 Codex 主组", UpstreamMultiplier: 1, UpstreamDiscountFactor: .8}}}
+	if w := request("/domain-rates", channelRates); w.Code != http.StatusConflict || !strings.Contains(w.Body.String(), `"confirmation_required":true`) {
+		t.Fatalf("domain channel rates update must require version confirmation: %d %s", w.Code, w.Body.String())
+	}
+	channelRates.ConfirmUpdate = true
+	channelRates.ExpectedVersion = 2
+	if w := request("/domain-rates", channelRates); w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"version":3`) {
+		t.Fatalf("confirmed domain channel rates update status=%d body=%s", w.Code, w.Body.String())
+	}
+
+	snapshot, err := m.loadChannelFinanceSnapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	view := snapshot.groupViewForChannel("last-api.ai", 33, "codex-1.2x")
+	if !view.Complete || view.UpstreamGroupName != "上游 Codex 主组" || math.Abs(view.SiteMultiplier-1.2) > 1e-12 || math.Abs(view.UpstreamEffectiveMultiplier-1.6) > 1e-12 || math.Abs(view.MultiplierGap-(-.4)) > 1e-12 {
+		t.Fatalf("layered finance values are mixed or incorrect: %+v", view)
+	}
+	var channelCost ChannelFinanceChannelCost
+	if err := m.storeDB.First(&channelCost, "channel_id = ? AND grp = ?", 33, "codex-1.2x").Error; err != nil {
+		t.Fatal(err)
+	}
+	if channelCost.UpstreamGroupName != "上游 Codex 主组" || channelCost.Multiplier != 1 || channelCost.DiscountFactor != .8 {
+		t.Fatalf("channel cost=%+v", channelCost)
+	}
+	var secondChannelCost ChannelFinanceChannelCost
+	if err := m.storeDB.First(&secondChannelCost, "channel_id = ? AND grp = ?", 33, "codex-1.4x").Error; err != nil {
+		t.Fatal(err)
+	}
+	if secondChannelCost.UpstreamGroupName != "上游 Codex 主组" || secondChannelCost.Multiplier != 1 || secondChannelCost.DiscountFactor != .8 {
+		t.Fatalf("channel-level cost must apply to every configured group: %+v", secondChannelCost)
+	}
+	var legacyGroupCost int64
+	if err := m.storeDB.Model(&ChannelDomainGroupCost{}).Where("domain = ?", "last-api.ai").Count(&legacyGroupCost).Error; err != nil {
+		t.Fatal(err)
+	}
+	if legacyGroupCost != 0 {
+		t.Fatalf("new layered routes must not write legacy domain group costs: %d", legacyGroupCost)
+	}
+}

@@ -95,12 +95,14 @@ type ChannelManagementMeta struct {
 }
 
 type ChannelManagementReport struct {
-	Enabled bool                       `json:"enabled"`
-	Meta    ChannelManagementMeta      `json:"meta"`
-	Finance ChannelFinanceSettingsView `json:"finance"`
-	Summary ChannelManagementSummary   `json:"summary"`
-	Filters ChannelManagementFilters   `json:"filters"`
-	Domains []ChannelManagementDomain  `json:"domains"`
+	Enabled               bool                          `json:"enabled"`
+	Meta                  ChannelManagementMeta         `json:"meta"`
+	Finance               ChannelFinanceSettingsView    `json:"finance"`
+	WebsiteGroups         []ChannelWebsiteGroupRateView `json:"website_groups"`
+	WebsiteGroupsSyncedAt int64                         `json:"website_groups_synced_at"`
+	Summary               ChannelManagementSummary      `json:"summary"`
+	Filters               ChannelManagementFilters      `json:"filters"`
+	Domains               []ChannelManagementDomain     `json:"domains"`
 }
 
 type channelUsageAgg struct {
@@ -188,7 +190,7 @@ func usageAggLess(a, b channelUsageAgg) bool {
 	return a.tokens > b.tokens
 }
 
-func managementGroups(rows map[string]*channelUsageAgg, domain string, finance channelFinanceSnapshot) []ChannelManagementGroup {
+func managementGroups(rows map[string]*channelUsageAgg, domain string, channelID int, finance channelFinanceSnapshot) []ChannelManagementGroup {
 	type groupBuild struct {
 		name  string
 		usage channelUsageAgg
@@ -212,7 +214,7 @@ func managementGroups(rows map[string]*channelUsageAgg, domain string, finance c
 	out := make([]ChannelManagementGroup, 0, len(build))
 	for _, group := range build {
 		out = append(out, ChannelManagementGroup{
-			Name: group.name, Usage: group.usage.metrics(), Finance: finance.groupView(domain, group.name),
+			Name: group.name, Usage: group.usage.metrics(), Finance: finance.groupViewForChannel(domain, channelID, group.name),
 		})
 	}
 	return out
@@ -233,6 +235,10 @@ func managementFinanceGroups(names map[string]bool, domain string, finance chann
 
 func (m *Monitor) buildChannelManagementReport(ctx context.Context, scope stabilityScope, now int64) (*ChannelManagementReport, error) {
 	finance, err := m.loadChannelFinanceSnapshot(ctx)
+	if err != nil {
+		return nil, err
+	}
+	websiteGroups, websiteGroupsSyncedAt, err := m.loadWebsiteGroupRates(ctx, finance)
 	if err != nil {
 		return nil, err
 	}
@@ -418,7 +424,7 @@ func (m *Monitor) buildChannelManagementReport(ctx context.Context, scope stabil
 				outChannels = append(outChannels, ChannelManagementChannel{
 					ID: ch.ID, Name: ch.Name, Host: ch.BaseHost, Vendor: ch.Vendor, Status: ch.Status, Current: ch.Current,
 					ConfiguredGroups: ch.ConfiguredGroups, ModelCount: ch.ModelCount,
-					Stability: ch.Usage.stability(), Usage: ch.Usage.metrics(), Groups: managementGroups(ch.Groups, ch.BaseDomain, finance),
+					Stability: ch.Usage.stability(), Usage: ch.Usage.metrics(), Groups: managementGroups(ch.Groups, ch.BaseDomain, ch.ID, finance),
 				})
 			}
 			vendors = append(vendors, ChannelManagementVendor{Name: vendor.Name, Usage: vendor.Usage.metrics(), Channels: outChannels})
@@ -443,7 +449,7 @@ func (m *Monitor) buildChannelManagementReport(ctx context.Context, scope stabil
 			Usage: domain.Usage.metrics(), Finance: finance.domainView(domain.Domain),
 			Upstream:      upstream,
 			FinanceGroups: managementFinanceGroups(domain.FinanceGroups, domain.Domain, finance),
-			Groups:        managementGroups(domain.Groups, domain.Domain, finance), Vendors: vendors,
+			Groups:        managementGroups(domain.Groups, domain.Domain, 0, finance), Vendors: vendors,
 		})
 	}
 	sort.Slice(responseDomains, func(i, j int) bool {
@@ -504,8 +510,9 @@ func (m *Monitor) buildChannelManagementReport(ctx context.Context, scope stabil
 		toTs--
 	}
 	return &ChannelManagementReport{
-		Enabled: true,
-		Finance: finance.settingsView(),
+		Enabled:       true,
+		Finance:       finance.settingsView(),
+		WebsiteGroups: websiteGroups, WebsiteGroupsSyncedAt: websiteGroupsSyncedAt,
 		Meta: ChannelManagementMeta{
 			From: time.Unix(scope.FromTs, 0).In(cstLocation).Format("2006-01-02"),
 			To:   time.Unix(toTs, 0).In(cstLocation).Format("2006-01-02"), GeneratedAt: now,

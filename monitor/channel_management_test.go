@@ -38,12 +38,12 @@ func TestChannelManagementUsesCompactCoverageStatus(t *testing.T) {
 func TestChannelManagementCardTypographyIsReadable(t *testing.T) {
 	css := string(stabilityCSS)
 	for _, marker := range []string{
-		`--cm-font-caption:12px`,
-		`--cm-font-meta:13px`,
-		`--cm-font-body:14px`,
-		`--cm-font-item:15px`,
-		`--cm-font-domain:20px`,
-		`--cm-font-metric:18px`,
+		`--cm-font-caption:13px`,
+		`--cm-font-meta:14px`,
+		`--cm-font-body:15px`,
+		`--cm-font-item:16px`,
+		`--cm-font-domain:22px`,
+		`--cm-font-metric:20px`,
 		`.cm-domain-identity b{font-size:var(--cm-font-domain)`,
 		`.cm-domain-metrics b{font-size:var(--cm-font-metric)`,
 		`.cm-channel-name b{font-size:var(--cm-font-item)`,
@@ -51,6 +51,86 @@ func TestChannelManagementCardTypographyIsReadable(t *testing.T) {
 		if !strings.Contains(css, marker) {
 			t.Fatalf("渠道管理可读性样式缺少 %q", marker)
 		}
+	}
+}
+
+func TestChannelManagementFinanceScopesAreSeparated(t *testing.T) {
+	page := string(pageHTML)
+	js := string(channelManagementJS)
+	css := string(stabilityCSS)
+	for _, marker := range []string{
+		`id="cmSiteFinanceOpen">网站计价基准`,
+		`id="cmFinanceGlobalSection"`,
+		`id="cmFinanceGlobalGroups"`,
+		`id="cmFinanceDomainSection"`,
+		`id="cmFinanceDomainChannels"`,
+		`id="cmFinanceDomainChannelRows"`,
+		`/channels/finance/site`,
+		`/channels/finance/domain`,
+		`/channels/finance/domain-rates`,
+		`倍率配置`,
+	} {
+		if !strings.Contains(page, marker) && !strings.Contains(js, marker) {
+			t.Fatalf("渠道管理缺少分层财务配置标记 %q", marker)
+		}
+	}
+	for _, marker := range []string{
+		`id="cmFinanceGlobalSection" hidden`,
+		`id="cmFinanceGlobalGroups" hidden`,
+		`id="cmFinanceDomainSection" hidden`,
+		`id="cmFinanceDomainChannels" hidden`,
+		`.channel-management-page [hidden]{display:none!important}`,
+	} {
+		if !strings.Contains(page, marker) && !strings.Contains(css, marker) {
+			t.Fatalf("财务配置弹窗缺少明确的模式隐藏标记 %q", marker)
+		}
+	}
+	for _, forbidden := range []string{
+		`本站分组倍率`,
+		`data-cm-finance-input="upstream"`,
+		`data-cm-finance-input="upstream-factor"`,
+		`data-cm-channel-finance`,
+		`上游倍率配置`,
+	} {
+		if strings.Contains(page, forbidden) || strings.Contains(js, forbidden) {
+			t.Fatalf("渠道管理仍把上游分组倍率放在网站配置表中: %q", forbidden)
+		}
+	}
+}
+
+func TestChannelManagementWebsiteGroupsUseNewAPIAndCanSync(t *testing.T) {
+	page := string(pageHTML)
+	js := string(channelManagementJS)
+	for _, marker := range []string{
+		`id="cmFinanceSyncGroups"`,
+		`NewAPI 分组管理`,
+		`/channels/finance/site-groups/sync`,
+		`website_groups`,
+		`source_multiplier`,
+		`上游分组名`,
+		`cm-finance-domain-channel-head`,
+		`<span>渠道</span><span>上游分组名</span><span>上游基础倍率</span><span>上游折扣系数</span>`,
+		`data-cm-domain-rate="group-name"`,
+		`upstream_group_name`,
+		`上游分组名由你按上游令牌实际归属手动填写`,
+	} {
+		if !strings.Contains(page, marker) && !strings.Contains(js, marker) {
+			t.Fatalf("网站分组倍率缺少同步标记 %q", marker)
+		}
+	}
+	if strings.Contains(js, "我方关联服务分组") {
+		t.Fatal("渠道倍率配置不应重复展示我方关联服务分组")
+	}
+}
+
+func TestChannelManagementFiltersRenderBeforeRanking(t *testing.T) {
+	page := string(pageHTML)
+	js := string(channelManagementJS)
+	if !strings.Contains(page, `id="cmFilters"`) {
+		t.Fatal("渠道管理筛选区缺少稳定 DOM 标识")
+	}
+	if !strings.Contains(js, `id="cmFilterSlot"`) || !strings.Contains(js, `filters?.remove()`) {
+		t.Fatal("渠道管理筛选区没有在渲染时移动到排行区域")
 	}
 }
 

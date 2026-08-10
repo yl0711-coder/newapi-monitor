@@ -237,7 +237,7 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
   .tabs .tab.active{color:var(--text);border-bottom-color:var(--accent);font-weight:600}
   .tabpane[hidden]{display:none}
 </style>
-<link rel="stylesheet" href="/stability.css?v=5">
+<link rel="stylesheet" href="/stability.css?v=6">
 </head>
 <body theme-mode="dark">
 <div class="monitor-shell">
@@ -420,6 +420,7 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
       <h2>渠道使用排行</h2>
       <p>按渠道配置 URL 的可注册主域名归并，再按厂商、实际渠道和服务分组展开。</p>
     </div>
+    <div class="cm-toolbar-actions"><button type="button" class="cm-site-finance-open" id="cmSiteFinanceOpen">网站计价基准</button></div>
     <div class="cm-range">
       <button type="button" data-cm-preset="today">今天</button>
       <button type="button" data-cm-preset="yesterday">昨天</button>
@@ -436,10 +437,10 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
   <div class="cm-boundary-note">
     <span><b>归并口径</b> 例如 temp.last-api.ai 与 www.last-api.ai 同属 last-api.ai</span>
     <span><b>请求口径</b> 仅统计已路由到具体渠道的请求，不含尚未进入渠道的前置拒绝</span>
-    <span><b>财务口径</b> 用量来自使用日志；毛利率由本地维护的双方折扣估算，不等于净利润</span>
+    <span><b>财务口径</b> 用量来自使用日志；倍率配置只用于上游成本对照，不替代上游账单或财务结算</span>
   </div>
 
-  <div class="cm-filters">
+  <div class="cm-filters" id="cmFilters">
     <label class="cm-search"><span>搜索</span><input id="cmSearch" type="search" placeholder="主域名、具体域名、渠道名或渠道 ID" autocomplete="off"></label>
     <label><span>主域名</span><select id="cmDomain"><option value="">全部主域名</option></select></label>
     <label><span>厂商类型</span><select id="cmVendor"><option value="">全部厂商类型</option></select></label>
@@ -462,29 +463,33 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
   <div class="cm-finance-mask" id="cmFinanceMask" hidden></div>
   <aside class="cm-finance-dialog" id="cmFinanceDialog" role="dialog" aria-modal="true" aria-hidden="true" aria-labelledby="cmFinanceTitle">
     <header>
-      <div><small>渠道财务配置</small><h2 id="cmFinanceTitle">成本与毛利率</h2><p id="cmFinanceSubtitle"></p></div>
+      <div><small id="cmFinanceScope">网站计价配置</small><h2 id="cmFinanceTitle">计价口径配置</h2><p id="cmFinanceSubtitle"></p></div>
       <button type="button" id="cmFinanceClose" aria-label="关闭">×</button>
     </header>
     <div class="cm-finance-content">
       <section class="cm-finance-formula">
-        <b>上游实际倍率 = 基础倍率 × 折扣系数 ÷ 充值比例</b>
-        <span>充值比例 = 充值到账 ÷ 充值支付；预估毛利率 = 1 − 上游计价折扣 ÷ 我方计价折扣。结果不含手续费、汇损、税费和退款。</span>
+        <b id="cmFinanceFormulaTitle">上游实际倍率 = 基础倍率 × 折扣系数 ÷ 充值比例</b>
+        <span id="cmFinanceFormulaNote">充值比例 = 充值到账 ÷ 充值支付；所有配置只保存在 Monitor 本地，不修改 NewAPI 渠道。</span>
       </section>
-      <section class="cm-finance-fields">
-        <div><h3>全站统一计价基准</h3><p>全站只有这一份配置；修改后会影响所有主域名的计算。各服务分组的我方倍率仍在下表分别维护。</p></div>
+      <section class="cm-finance-fields" id="cmFinanceGlobalSection" hidden>
+        <div><h3>全站统一计价基准</h3><p>全站只有这一份配置；修改后会影响所有主域名。服务分组的我方倍率也只在这里维护。</p></div>
         <label><span>折扣基准</span><input id="cmFinanceFX" type="number" min="0.000001" step="0.01" inputmode="decimal"><small>示例：7</small></label>
         <label><span>我方充值支付</span><input id="cmFinanceSitePaid" type="number" min="0.000001" step="0.0001" inputmode="decimal"><small>1:1 时填 1</small></label>
         <label><span>我方充值到账</span><input id="cmFinanceSiteCredit" type="number" min="0.000001" step="0.0001" inputmode="decimal"><small>1:1 时填 1</small></label>
       </section>
-      <section class="cm-finance-fields domain">
-        <div><h3>该主域名的上游充值比例</h3><p>仅作用于当前归并主域名。</p></div>
+      <section class="cm-finance-fields domain" id="cmFinanceDomainSection" hidden>
+        <div><h3>该主域名的上游充值比例</h3><p>仅作用于当前归并主域名；下面集中维护该主域名下所有实际渠道的倍率。</p></div>
         <label><span>上游充值支付</span><input id="cmFinanceUpPaid" type="number" min="0.000001" step="0.0001" inputmode="decimal"><small>按实际支付金额填写</small></label>
         <label><span>上游充值到账</span><input id="cmFinanceUpCredit" type="number" min="0.000001" step="0.0001" inputmode="decimal"><small>按实际到账额度填写</small></label>
       </section>
-      <section class="cm-finance-groups">
-        <div class="cm-finance-group-title"><div><h3>服务分组倍率</h3><p>只填写需要核算的分组；我方倍率、上游基础倍率和上游折扣系数必须同时填写。</p></div><span id="cmFinanceConfiguredCount"></span></div>
-        <div class="cm-finance-group-head"><span>服务分组</span><span>我方倍率</span><span>上游基础倍率</span><span>上游折扣系数</span><span>上游实际倍率</span><span>双方计价折扣</span><span>预估毛利率</span></div>
+      <section class="cm-finance-groups" id="cmFinanceGlobalGroups" hidden>
+        <div class="cm-finance-group-title"><div><h3>网站分组倍率</h3><p>仅列出 NewAPI 分组管理中用户可选或特殊可用的分组；日志里出现过但用户不可用的分组不会进入这里。</p><small id="cmFinanceGroupSource">尚未同步中转站分组</small></div><div class="cm-finance-group-actions"><span id="cmFinanceConfiguredCount"></span><button type="button" id="cmFinanceSyncGroups">一键同步 NewAPI 分组</button></div></div>
+        <div class="cm-finance-group-head"><span>服务分组</span><span>NewAPI 当前倍率</span><span>网站分组倍率</span></div>
         <div id="cmFinanceGroupRows"></div>
+      </section>
+      <section class="cm-finance-domain-channels" id="cmFinanceDomainChannels" hidden>
+        <div class="cm-finance-domain-channels-title"><div><h3>上游渠道倍率</h3><p>每个渠道只维护一组上游基础倍率和折扣系数；上游分组名由你按上游令牌实际归属手动填写，便于后续核对；保存后为该主域名追加一个新版本。</p></div><span>基础倍率 × 折扣系数 ÷ 上游充值比例</span></div>
+        <div id="cmFinanceDomainChannelRows"></div>
       </section>
     </div>
     <footer><span id="cmFinanceMessage"></span><div><button type="button" class="cm-finance-cancel" id="cmFinanceCancel">取消</button><button type="button" class="cm-finance-save" id="cmFinanceSave">保存配置</button></div></footer>

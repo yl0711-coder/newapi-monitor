@@ -166,7 +166,7 @@ body{max-width:none!important;margin:0!important;padding:0!important;overflow-x:
 .monitor-cross-actions{display:flex;align-items:center;justify-content:flex-end;gap:8px;margin:5px 0}.monitor-cross-actions button,.cm-channel-actions button{border:1px solid #3a4660;border-radius:7px;background:#171d29;color:#aaa3ff;padding:6px 10px;cursor:pointer;font-size:12px}.monitor-cross-actions button:hover,.cm-channel-actions button:hover{border-color:#756bf0;color:#d8d4ff}.cm-channel-actions{display:flex;gap:5px;justify-content:flex-end}
 
 /* 渠道管理可读性：保持布局和交互不变，只提升字号、行高和次要文字对比度。 */
-.channel-management-page{--cm-font-caption:12px;--cm-font-meta:13px;--cm-font-body:14px;--cm-font-item:15px;--cm-font-section:18px;--cm-font-domain:20px;--cm-font-metric:18px;font-size:var(--cm-font-body);line-height:1.55}
+.channel-management-page{--cm-font-caption:13px;--cm-font-meta:14px;--cm-font-body:15px;--cm-font-item:16px;--cm-font-section:20px;--cm-font-domain:22px;--cm-font-metric:20px;font-size:var(--cm-font-body);line-height:1.55}
 .cm-toolbar h2{font-size:24px;line-height:1.35}.cm-toolbar p{font-size:var(--cm-font-body);color:#a0acbe}.cm-range button,.cm-reset,.cm-sort-switch button{font-size:var(--cm-font-meta)}
 .cm-boundary-note{font-size:var(--cm-font-meta);color:#9ca8bb}.cm-boundary-note b{color:#ccd4df}
 .cm-filters label{font-size:var(--cm-font-meta);color:#98a4b7}.cm-filters input,.cm-filters select{font-size:var(--cm-font-body)}.cm-filters input::placeholder{color:#8793a7}
@@ -175,7 +175,7 @@ body{max-width:none!important;margin:0!important;padding:0!important;overflow-x:
 .cm-list-head h3{font-size:var(--cm-font-section)}.cm-list-head p{font-size:var(--cm-font-meta);color:#9ca8ba}.cm-fresh span,.cm-fresh small{font-size:var(--cm-font-caption)}.cm-fresh small{color:#929eb0}
 .cm-domain-head{padding-top:19px;padding-bottom:19px}.cm-rank{font-size:var(--cm-font-body);color:#9aa6b8}.cm-domain-identity b{font-size:var(--cm-font-domain);line-height:1.35}.cm-domain-identity small{font-size:var(--cm-font-body);line-height:1.5;color:#a5b0c1}
 .cm-domain-finance>span,.cm-finance-open,.cm-domain-upstream>span,.cm-upstream-open{font-size:var(--cm-font-meta)}.cm-share b{font-size:var(--cm-font-metric)}.cm-share small,.cm-domain-metrics small{font-size:var(--cm-font-meta);color:#a0abbd}.cm-domain-metrics b{font-size:var(--cm-font-metric)}
-.cm-vendor-head b{font-size:16px}.cm-vendor-head small,.cm-vendor-head>div:last-child{font-size:var(--cm-font-meta);color:#9ea9bb}.cm-vendor-head strong{font-size:var(--cm-font-item)}
+.cm-vendor-head b{font-size:18px}.cm-vendor-head small,.cm-vendor-head>div:last-child{font-size:var(--cm-font-meta);color:#9ea9bb}.cm-vendor-head strong{font-size:var(--cm-font-item)}
 .cm-channel-head{font-size:var(--cm-font-caption);color:#9da8ba}.cm-channel-name b{font-size:var(--cm-font-item)}.cm-channel-name small{font-size:var(--cm-font-caption);line-height:1.5;color:#9aa6b8}.cm-status{font-size:var(--cm-font-caption)}.cm-number,.cm-metric-main b{font-size:var(--cm-font-body)}.cm-metric-main small{font-size:var(--cm-font-caption);color:#98a4b7}.cm-detail-btn{font-size:var(--cm-font-meta)}
 .cm-channel-group-head{font-size:var(--cm-font-caption);color:#9aa6b8}.cm-channel-group-row,.cm-channel-group-row b,.cm-no-groups{font-size:var(--cm-font-meta)}
 .cm-finance-dialog>header h2,.cm-upstream-dialog>header h2{font-size:22px}.cm-finance-dialog>header small,.cm-upstream-dialog>header small{font-size:var(--cm-font-caption)}.cm-finance-dialog>header p,.cm-upstream-dialog>header p{font-size:var(--cm-font-meta);color:#9ca8ba}.cm-finance-formula b{font-size:var(--cm-font-body)}.cm-finance-formula span{font-size:var(--cm-font-meta);color:#9ca8ba}.cm-finance-fields h3,.cm-finance-groups h3{font-size:16px}.cm-finance-fields p,.cm-finance-groups p,.cm-finance-fields label{font-size:var(--cm-font-meta);color:#98a4b7}.cm-finance-fields input,.cm-finance-group-row input,.cm-upstream-fields input,.cm-upstream-fields select{font-size:15px}.cm-finance-fields label small{font-size:var(--cm-font-caption);color:#8793a7}.cm-finance-group-title>span,.cm-finance-group-head{font-size:var(--cm-font-caption)}.cm-finance-group-head{color:#929eb1}.cm-finance-group-row>b,.cm-finance-group-row>span,.cm-finance-group-row>strong{font-size:var(--cm-font-meta)}.cm-finance-dialog>footer>span,.cm-finance-dialog>footer button,.cm-upstream-dialog>footer>span,.cm-upstream-dialog>footer button{font-size:var(--cm-font-meta)}
@@ -193,31 +193,31 @@ body{max-width:none!important;margin:0!important;padding:0!important;overflow-x:
 .channel-management-page .cm-group-head{display:grid;grid-template-columns:minmax(360px,1.15fr) minmax(440px,1fr) 30px;gap:20px;align-items:center;padding:16px 18px;background:#151b27;cursor:pointer}
 .channel-management-page .cm-group-head:hover{background:#18202d}
 .channel-management-page .cm-group-title{display:flex;align-items:center;gap:10px;min-width:0;flex-wrap:wrap}
-.channel-management-page .cm-group-title>b{font-size:18px;line-height:1.35;color:#e5eaf3;white-space:nowrap}
-.channel-management-page .cm-group-title>span{padding:4px 8px;border:1px solid #6259bd;border-radius:7px;color:#c0baff;background:rgba(110,96,236,.08);font-size:12px;white-space:nowrap}
-.channel-management-page .cm-group-title>small{flex:1 1 100%;min-width:0;color:#8995aa;font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.channel-management-page .cm-group-title>b{font-size:20px;line-height:1.35;color:#e5eaf3;white-space:nowrap}
+.channel-management-page .cm-group-title>span{padding:4px 8px;border:1px solid #6259bd;border-radius:7px;color:#c0baff;background:rgba(110,96,236,.08);font-size:13px;white-space:nowrap}
+.channel-management-page .cm-group-title>small{flex:1 1 100%;min-width:0;color:#8995aa;font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .channel-management-page .cm-group-metrics{display:grid;grid-template-columns:repeat(4,minmax(70px,1fr));gap:14px;min-width:0}
 .channel-management-page .cm-group-metrics>span{text-align:right;min-width:0}
-.channel-management-page .cm-group-metrics small{display:block;color:#8591a6;font-size:11px;white-space:nowrap}
-.channel-management-page .cm-group-metrics b{display:block;margin-top:5px;color:#e4eaf4;font-size:16px;font-variant-numeric:tabular-nums;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.channel-management-page .cm-group-metrics small{display:block;color:#8591a6;font-size:13px;white-space:nowrap}
+.channel-management-page .cm-group-metrics b{display:block;margin-top:5px;color:#e4eaf4;font-size:18px;font-variant-numeric:tabular-nums;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .channel-management-page .cm-group-chevron{display:grid;place-items:center;width:28px;height:28px;border:1px solid #354056;border-radius:8px;color:#aaa4ff;font-size:19px;font-style:normal}
 .channel-management-page .cm-group-body{border-top:1px solid #30394b;background:#111720}
 .channel-management-page .cm-group-channel-head,.channel-management-page .cm-group-channel-row{display:grid;grid-template-columns:minmax(230px,1.45fr) 112px 94px 128px 74px 78px 88px 88px 108px 88px;gap:10px;align-items:center}
-.channel-management-page .cm-group-channel-head{padding:12px 18px;background:#121822;color:#8d99ad;font-size:11px}
+.channel-management-page .cm-group-channel-head{padding:12px 18px;background:#121822;color:#8d99ad;font-size:13px}
 .channel-management-page .cm-group-channel-head>span:not(:first-child){text-align:right}
 .channel-management-page .cm-group-channel-row{min-height:76px;padding:14px 18px;border-top:1px solid #293142;background:#111720}
 .channel-management-page .cm-group-channel-row:hover{background:#151e2a}
 .channel-management-page .cm-group-channel-row>div:not(:first-child),.channel-management-page .cm-group-channel-row>span{text-align:right;min-width:0}
 .channel-management-page .cm-group-channel-row .cm-channel-name{text-align:left;min-width:0}
-.channel-management-page .cm-group-channel-row .cm-channel-name b{display:block;color:#e3e8f1;font-size:15px;line-height:1.4;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.channel-management-page .cm-group-rate b,.channel-management-page .cm-group-gap b{font-size:15px;font-variant-numeric:tabular-nums}
+.channel-management-page .cm-group-channel-row .cm-channel-name b{display:block;color:#e3e8f1;font-size:16px;line-height:1.4;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.channel-management-page .cm-group-rate b,.channel-management-page .cm-group-gap b{font-size:16px;font-variant-numeric:tabular-nums}
 .channel-management-page .cm-group-rate b{color:#d7dfec}
 .channel-management-page .cm-group-gap b{color:#4bd09b}
-.channel-management-page .cm-group-models b{color:#d3dbea;font-size:13px;white-space:nowrap}
-.channel-management-page .cm-group-stability b{color:#8fdbbf;font-size:14px;font-variant-numeric:tabular-nums;white-space:nowrap}
+.channel-management-page .cm-group-models b{color:#d3dbea;font-size:14px;white-space:nowrap}
+.channel-management-page .cm-group-stability b{color:#8fdbbf;font-size:15px;font-variant-numeric:tabular-nums;white-space:nowrap}
 .channel-management-page .cm-group-channel-row .cm-status{justify-self:end}
-.channel-management-page .cm-group-channel-row .cm-number,.channel-management-page .cm-group-channel-row .cm-metric-main b{font-size:14px}
-.channel-management-page .cm-group-channel-row .cm-metric-main small{font-size:11px;color:#8793a8}
+.channel-management-page .cm-group-channel-row .cm-number,.channel-management-page .cm-group-channel-row .cm-metric-main b{font-size:15px}
+.channel-management-page .cm-group-channel-row .cm-metric-main small{font-size:12px;color:#8793a8}
 .channel-management-page .cm-group-channel-row .cm-no-groups{grid-column:1/-1}
 
 @media(max-width:1500px){
@@ -226,12 +226,13 @@ body{max-width:none!important;margin:0!important;padding:0!important;overflow-x:
 }
 @media(max-width:1180px){
   .channel-management-page .cm-group-head{grid-template-columns:minmax(270px,1fr) minmax(330px,1fr) 30px;gap:10px;padding:14px}
-  .channel-management-page .cm-group-title>b{font-size:16px}
+  .channel-management-page .cm-group-title>b{font-size:18px}
   .channel-management-page .cm-group-metrics{gap:8px}
-  .channel-management-page .cm-group-metrics b{font-size:14px}
+  .channel-management-page .cm-group-metrics b{font-size:16px}
   .channel-management-page .cm-group-channel-head,.channel-management-page .cm-group-channel-row{grid-template-columns:minmax(185px,1.35fr) 82px 70px 96px 58px 64px 70px 70px 86px 70px;gap:7px;padding-left:14px;padding-right:14px}
 }
-@media(max-width:900px){
+/* 1280px 及以下的可用内容宽度会被侧栏和页面边距压缩；渠道明细改为带字段标签的紧凑卡片，避免十列网格被裁切。 */
+@media(max-width:1320px){
   .channel-management-page .cm-group-head{grid-template-columns:minmax(220px,1fr) 30px}
   .channel-management-page .cm-group-metrics{grid-column:1/-1;grid-row:2;grid-template-columns:repeat(4,1fr);padding-top:4px}
   .channel-management-page .cm-group-metrics>span{text-align:left}
@@ -253,11 +254,59 @@ body{max-width:none!important;margin:0!important;padding:0!important;overflow-x:
   .channel-management-page .cm-group-channel-row>.cm-metric-main{text-align:left}
   .channel-management-page .cm-group-channel-row>.cm-metric-main b{text-align:left}
 }
+@media(min-width:901px) and (max-width:1180px){
+  .monitor-workspace{padding-left:16px;padding-right:16px}
+  .monitor-page-head{gap:16px}
+  .monitor-head-meta{font-size:11px}
+}
 @media(max-width:620px){
   .channel-management-page .cm-vendor-body{padding:0 8px 10px}
   .channel-management-page .cm-group-head{grid-template-columns:minmax(0,1fr) 28px;padding:13px}
-  .channel-management-page .cm-group-title>small{font-size:11px}
+  .channel-management-page .cm-group-title>small{font-size:12px}
   .channel-management-page .cm-group-metrics{grid-template-columns:repeat(2,1fr);row-gap:10px}
   .channel-management-page .cm-group-channel-row{grid-template-columns:1fr 1fr;gap:11px 14px}
   .channel-management-page .cm-group-channel-row>div:first-child,.channel-management-page .cm-group-channel-row>div:nth-child(4){grid-column:1/-1}
 }
+
+/* 财务配置分层：网站全局口径、主域名充值比例、具体渠道成本各自独立。 */
+.cm-toolbar-actions{display:flex;align-items:center;gap:8px;margin-left:auto;flex:none}
+.cm-site-finance-open{border:1px solid #6259bd;border-radius:9px;background:rgba(110,96,236,.1);color:#c0baff;padding:8px 13px;cursor:pointer;font-size:var(--cm-font-meta,14px);white-space:nowrap}
+.cm-site-finance-open:hover{border-color:#8378ff;background:rgba(110,96,236,.2)}
+.channel-management-page [hidden]{display:none!important}
+.cm-finance-domain-channels{padding-top:18px}
+.cm-finance-domain-channels-title{display:flex;align-items:flex-end;justify-content:space-between;gap:15px;margin-bottom:12px}
+.cm-finance-domain-channels-title h3{font-size:16px;margin:0 0 5px}
+.cm-finance-domain-channels-title p,.cm-finance-domain-channels-title>span{font-size:13px;line-height:1.5;color:#98a4b7;margin:0}
+.cm-finance-domain-channels-title>span{white-space:nowrap;color:#aaa4ff}
+.cm-finance-domain-channel-head,.cm-finance-domain-channel{display:grid;grid-template-columns:minmax(260px,1.2fr) minmax(210px,1fr) repeat(2,minmax(180px,.85fr));gap:16px;align-items:center}
+.cm-finance-domain-channel-head{padding:10px 14px;color:#929eb1;font-size:12px;border:1px solid #30384a;border-radius:9px 9px 0 0;background:#171d29}
+.cm-finance-domain-channel{align-items:start;padding:16px 14px;border:1px solid #2b3445;border-top:0;border-bottom:0;background:#141924}
+.cm-finance-domain-channel:first-child{border-radius:9px 9px 0 0}
+.cm-finance-domain-channel:last-child{border-bottom:1px solid #2b3445;border-radius:0 0 9px 9px}
+.cm-finance-domain-channel-name b{display:block;font-size:15px;line-height:1.4}
+.cm-finance-domain-channel label{display:block;color:#98a4b7;font-size:12px}
+.cm-finance-domain-channel input{width:100%;height:38px;border:1px solid #354056;border-radius:8px;background:#181e2a;color:#e2e8f0;padding:8px 10px;outline:none;font-size:14px;font-variant-numeric:tabular-nums}
+.cm-finance-domain-channel input:focus{border-color:#786dff;box-shadow:0 0 0 2px rgba(120,109,255,.08)}
+.cm-finance-upstream-group input{font-size:14px}
+.cm-finance-channel-warning{display:block!important;margin-top:8px;color:#e6ad4f!important}
+.cm-finance-domain-channel .cm-no-groups{color:#8793a7;font-size:13px}
+@media(max-width:900px){.cm-finance-domain-channel-head{display:none}.cm-finance-domain-channel{grid-template-columns:1fr 1fr}.cm-finance-domain-channel-name,.cm-finance-upstream-group{grid-column:1/-1;padding-bottom:2px}.cm-finance-domain-channels-title{align-items:flex-start;flex-direction:column;gap:5px}}
+@media(max-width:620px){.cm-finance-domain-channel{grid-template-columns:1fr;padding:12px 9px}.cm-finance-domain-channel-name,.cm-finance-upstream-group{grid-column:auto}.cm-finance-domain-channels-title>span{white-space:normal}}
+.cm-finance-group-head,.cm-finance-group-row{grid-template-columns:minmax(180px,1.4fr) minmax(160px,1fr)}
+@media(max-width:900px){.cm-toolbar-actions{margin-left:0}.cm-finance-group-head,.cm-finance-group-row{min-width:0}}
+@media(max-width:620px){.cm-toolbar-actions{width:100%}.cm-site-finance-open{width:100%}}
+
+/* 网站分组目录来自 NewAPI；三列布局同时展示主站倍率与同步到的当前倍率。 */
+.cm-finance-group-title{align-items:flex-start}
+.cm-finance-group-title>div:first-child{min-width:0}
+.cm-finance-group-title>div:first-child>small{display:block;margin-top:6px;color:#68758a;font-size:var(--cm-font-caption);line-height:1.4}
+.cm-finance-group-actions{display:flex;align-items:center;gap:10px;flex:none}
+.cm-finance-group-actions>span{font-size:var(--cm-font-caption);color:#9aa6b8;white-space:nowrap}
+.cm-finance-group-actions>button{height:34px;padding:0 12px;border:1px solid #5e55c9;border-radius:8px;background:rgba(102,91,224,.12);color:#bcb7ff;font-size:var(--cm-font-caption);cursor:pointer;white-space:nowrap}
+.cm-finance-group-actions>button:hover{background:rgba(102,91,224,.22)}
+.cm-finance-group-actions>button:disabled{opacity:.55;cursor:wait}
+.cm-finance-group-head,.cm-finance-group-row{grid-template-columns:minmax(180px,1.4fr) minmax(130px,.8fr) minmax(160px,1fr)}
+.cm-finance-group-name{min-width:0}
+.cm-finance-source-rate{text-align:right;color:#9ca8ba!important;font-variant-numeric:tabular-nums}
+@media(max-width:900px){.cm-finance-group-title{flex-direction:column}.cm-finance-group-actions{width:100%;justify-content:space-between}.cm-finance-group-head,.cm-finance-group-row{min-width:0}}
+@media(max-width:620px){.cm-finance-group-head,.cm-finance-group-row{grid-template-columns:minmax(130px,1fr) minmax(90px,.8fr) minmax(120px,1fr)}.cm-finance-group-actions{align-items:flex-start;flex-direction:column;gap:7px}}

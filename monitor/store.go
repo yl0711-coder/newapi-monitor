@@ -279,7 +279,7 @@ func (m *Monitor) openStore(path string) error {
 		&StabilityHourSample{}, &StabilityRejectHour{}, &StabilityProblemSample{},
 		&StabilityProblemIngestState{}, &StabilityProblemStage{},
 		&StabilityHourIngestState{}, &StabilityBackfillJob{},
-		&ChannelFinanceSetting{}, &ChannelSaleGroupRate{}, &ChannelDomainCost{}, &ChannelDomainGroupCost{}, &ChannelFinanceVersion{},
+		&ChannelFinanceSetting{}, &ChannelSaleGroupRate{}, &WebsiteGroupCatalog{}, &ChannelDomainCost{}, &ChannelDomainGroupCost{}, &ChannelFinanceChannelCost{}, &ChannelFinanceVersion{},
 		&ChannelUpstreamAccount{},
 		&InfraSample{}, &HostContainerSnapshot{}, &NginxMinuteSample{}, &NginxIngestBatch{}, &NginxSourceState{},
 		&AlertConfig{}, &AlertLog{}, &TrackedUser{}, &CustomerGroup{}, &FollowUpLog{}, &UsageSettings{},

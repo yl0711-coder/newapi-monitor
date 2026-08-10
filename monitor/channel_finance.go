@@ -20,6 +20,7 @@ import (
 const (
 	defaultChannelFinanceFX = 7.0
 	maxChannelFinanceGroups = 500
+	maxChannelFinanceRows   = 2000
 	maxChannelFinanceBody   = 128 << 10
 )
 
@@ -64,6 +65,24 @@ type ChannelDomainGroupCost struct {
 	EffectiveAt    int64   `gorm:"column:effective_at"`
 	UpdatedAt      int64   `gorm:"column:updated_at;index"`
 	UpdatedBy      string  `gorm:"column:updated_by;size:128"`
+}
+
+// ChannelFinanceChannelCost 保存某个具体渠道在某服务分组上的上游成本口径。
+// 产品层级的倍率属于渠道而不是服务分组；主域名批量保存时会将同一组
+// 基础倍率和折扣系数镜像到该渠道关联的每个服务分组，以兼容现有按渠道+分组
+// 计算和历史快照结构，避免同一渠道出现不同倍率。
+// 渠道 ID 使用本地 ChannelSnap 的快照 ID；即使 NewAPI 后续删除渠道，
+// 这条配置仍保留，历史版本仍可按原渠道解释。旧版只按主域名+分组保存的
+// ChannelDomainGroupCost 仍会作为没有渠道级配置时的兼容回退。
+type ChannelFinanceChannelCost struct {
+	ChannelID         int     `gorm:"primaryKey;autoIncrement:false;column:channel_id"`
+	Grp               string  `gorm:"primaryKey;size:64;column:grp"`
+	UpstreamGroupName string  `gorm:"size:128;column:upstream_group_name"`
+	Multiplier        float64 `gorm:"column:multiplier"`
+	DiscountFactor    float64 `gorm:"column:discount_factor;not null;default:1"`
+	EffectiveAt       int64   `gorm:"column:effective_at"`
+	UpdatedAt         int64   `gorm:"column:updated_at;index"`
+	UpdatedBy         string  `gorm:"column:updated_by;size:128"`
 }
 
 // ChannelFinanceAudit 是早期未发布实现的兼容读取模型。
@@ -122,6 +141,7 @@ type ChannelGroupFinanceView struct {
 	SiteMultiplier              float64 `json:"site_multiplier"`
 	UpstreamMultiplier          float64 `json:"upstream_multiplier"` // 基础倍率
 	UpstreamDiscountFactor      float64 `json:"upstream_discount_factor"`
+	UpstreamGroupName           string  `json:"upstream_group_name"`
 	UpstreamEffectiveMultiplier float64 `json:"upstream_effective_multiplier"`
 	MultiplierGap               float64 `json:"multiplier_gap"`
 	SiteDiscount                float64 `json:"site_discount"`
@@ -130,12 +150,13 @@ type ChannelGroupFinanceView struct {
 }
 
 type channelFinanceSnapshot struct {
-	settings        ChannelFinanceSetting
-	hasSettings     bool
-	siteGroups      map[string]ChannelSaleGroupRate
-	domainCosts     map[string]ChannelDomainCost
-	domainGroupCost map[string]map[string]ChannelDomainGroupCost
-	domainVersions  map[string]ChannelFinanceVersion
+	settings         ChannelFinanceSetting
+	hasSettings      bool
+	siteGroups       map[string]ChannelSaleGroupRate
+	domainCosts      map[string]ChannelDomainCost
+	domainGroupCost  map[string]map[string]ChannelDomainGroupCost
+	channelGroupCost map[int]map[string]ChannelFinanceChannelCost
+	domainVersions   map[string]ChannelFinanceVersion
 }
 
 func defaultChannelFinanceSettingsView() ChannelFinanceSettingsView {
@@ -178,10 +199,24 @@ func (s channelFinanceSnapshot) domainView(domain string) ChannelDomainFinanceVi
 }
 
 func (s channelFinanceSnapshot) groupView(domain, group string) ChannelGroupFinanceView {
+	return s.groupViewForChannel(domain, 0, group)
+}
+
+func (s channelFinanceSnapshot) groupViewForChannel(domain string, channelID int, group string) ChannelGroupFinanceView {
 	view := ChannelGroupFinanceView{}
 	site, siteOK := s.siteGroups[group]
 	upstreamByGroup := s.domainGroupCost[domain]
 	upstream, upstreamOK := upstreamByGroup[group]
+	upstreamGroupName := ""
+	if channelID > 0 {
+		if channelRates := s.channelGroupCost[channelID]; channelRates != nil {
+			if channelRate, exists := channelRates[group]; exists {
+				upstream = ChannelDomainGroupCost{Domain: domain, Grp: group, Multiplier: channelRate.Multiplier, DiscountFactor: channelRate.DiscountFactor}
+				upstreamOK = true
+				upstreamGroupName = strings.TrimSpace(channelRate.UpstreamGroupName)
+			}
+		}
+	}
 	view.SiteConfigured = siteOK
 	view.UpstreamConfigured = upstreamOK
 	if siteOK {
@@ -190,6 +225,7 @@ func (s channelFinanceSnapshot) groupView(domain, group string) ChannelGroupFina
 	if upstreamOK {
 		view.UpstreamMultiplier = upstream.Multiplier
 		view.UpstreamDiscountFactor = normalizedUpstreamDiscountFactor(upstream.DiscountFactor)
+		view.UpstreamGroupName = upstreamGroupName
 	}
 	domainCost, domainOK := s.domainCosts[domain]
 	if domainOK && upstreamOK && validChannelFinanceNumber(upstream.Multiplier) && validChannelFinanceNumber(view.UpstreamDiscountFactor) &&
@@ -236,7 +272,8 @@ func normalizedUpstreamDiscountFactor(v float64) float64 {
 func (m *Monitor) loadChannelFinanceSnapshot(ctx context.Context) (channelFinanceSnapshot, error) {
 	s := channelFinanceSnapshot{
 		siteGroups: map[string]ChannelSaleGroupRate{}, domainCosts: map[string]ChannelDomainCost{},
-		domainGroupCost: map[string]map[string]ChannelDomainGroupCost{}, domainVersions: map[string]ChannelFinanceVersion{},
+		domainGroupCost: map[string]map[string]ChannelDomainGroupCost{}, channelGroupCost: map[int]map[string]ChannelFinanceChannelCost{},
+		domainVersions: map[string]ChannelFinanceVersion{},
 	}
 	var setting ChannelFinanceSetting
 	tx := m.storeDB.WithContext(ctx).First(&setting, "id = ?", 1)
@@ -268,6 +305,16 @@ func (m *Monitor) loadChannelFinanceSnapshot(ctx context.Context) (channelFinanc
 			s.domainGroupCost[cost.Domain] = map[string]ChannelDomainGroupCost{}
 		}
 		s.domainGroupCost[cost.Domain][cost.Grp] = cost
+	}
+	var channelCosts []ChannelFinanceChannelCost
+	if tx := m.storeDB.WithContext(ctx).Find(&channelCosts); tx.Error != nil {
+		return s, fmt.Errorf("读取渠道级上游倍率: %w", tx.Error)
+	}
+	for _, cost := range channelCosts {
+		if s.channelGroupCost[cost.ChannelID] == nil {
+			s.channelGroupCost[cost.ChannelID] = map[string]ChannelFinanceChannelCost{}
+		}
+		s.channelGroupCost[cost.ChannelID][cost.Grp] = cost
 	}
 	var versions []ChannelFinanceVersion
 	if tx := m.storeDB.WithContext(ctx).Order("domain ASC, version DESC").Find(&versions); tx.Error != nil {
@@ -308,16 +355,25 @@ type channelFinanceVersionGroup struct {
 	UpstreamDiscountFactor float64 `json:"upstream_discount_factor"`
 }
 
+type channelFinanceVersionChannel struct {
+	ChannelID              int     `json:"channel_id"`
+	Group                  string  `json:"group"`
+	UpstreamGroupName      string  `json:"upstream_group_name,omitempty"`
+	UpstreamMultiplier     float64 `json:"upstream_multiplier"`
+	UpstreamDiscountFactor float64 `json:"upstream_discount_factor"`
+}
+
 // channelFinanceVersionSnapshot 是版本表中的稳定序列化结构。
 // 确认标记等请求控制字段不进入版本数据。
 type channelFinanceVersionSnapshot struct {
-	Domain                 string                       `json:"domain"`
-	FXBenchmark            float64                      `json:"fx_benchmark"`
-	SiteRechargePaid       float64                      `json:"site_recharge_paid"`
-	SiteRechargeCredit     float64                      `json:"site_recharge_credit"`
-	UpstreamRechargePaid   float64                      `json:"upstream_recharge_paid"`
-	UpstreamRechargeCredit float64                      `json:"upstream_recharge_credit"`
-	Groups                 []channelFinanceVersionGroup `json:"groups"`
+	Domain                 string                         `json:"domain"`
+	FXBenchmark            float64                        `json:"fx_benchmark"`
+	SiteRechargePaid       float64                        `json:"site_recharge_paid"`
+	SiteRechargeCredit     float64                        `json:"site_recharge_credit"`
+	UpstreamRechargePaid   float64                        `json:"upstream_recharge_paid"`
+	UpstreamRechargeCredit float64                        `json:"upstream_recharge_credit"`
+	Groups                 []channelFinanceVersionGroup   `json:"groups"`
+	ChannelRates           []channelFinanceVersionChannel `json:"channel_rates,omitempty"`
 }
 
 func channelFinanceVersionSnapshotOf(in channelFinanceSaveInput) channelFinanceVersionSnapshot {
@@ -353,7 +409,16 @@ func normalizeChannelFinanceVersionJSON(raw string) (string, error) {
 	for i := range snapshot.Groups {
 		snapshot.Groups[i].UpstreamDiscountFactor = normalizedUpstreamDiscountFactor(snapshot.Groups[i].UpstreamDiscountFactor)
 	}
+	for i := range snapshot.ChannelRates {
+		snapshot.ChannelRates[i].UpstreamDiscountFactor = normalizedUpstreamDiscountFactor(snapshot.ChannelRates[i].UpstreamDiscountFactor)
+	}
 	sort.Slice(snapshot.Groups, func(i, j int) bool { return snapshot.Groups[i].Group < snapshot.Groups[j].Group })
+	sort.Slice(snapshot.ChannelRates, func(i, j int) bool {
+		if snapshot.ChannelRates[i].ChannelID != snapshot.ChannelRates[j].ChannelID {
+			return snapshot.ChannelRates[i].ChannelID < snapshot.ChannelRates[j].ChannelID
+		}
+		return snapshot.ChannelRates[i].Group < snapshot.ChannelRates[j].Group
+	})
 	normalized, err := json.Marshal(snapshot)
 	return string(normalized), err
 }
@@ -448,6 +513,34 @@ func channelFinanceDomains(tx *gorm.DB, include string) ([]string, error) {
 	return out, nil
 }
 
+// channelFinanceAllDomains 在网站级口径变更时使用：除已有充值配置外，
+// 还要覆盖渠道快照中已经归并、但尚未填写充值比例的主域名。
+func channelFinanceAllDomains(tx *gorm.DB, include string) ([]string, error) {
+	domains, err := channelFinanceDomains(tx, include)
+	if err != nil {
+		return nil, err
+	}
+	set := make(map[string]bool, len(domains))
+	for _, domain := range domains {
+		set[domain] = true
+	}
+	var rows []struct{ Domain string }
+	if err := tx.Model(&ChannelSnap{}).Select("base_domain AS domain").Where("base_domain <> ''").Distinct().Scan(&rows).Error; err != nil {
+		return nil, err
+	}
+	for _, row := range rows {
+		if domain := strings.TrimSpace(row.Domain); domain != "" {
+			set[domain] = true
+		}
+	}
+	out := make([]string, 0, len(set))
+	for domain := range set {
+		out = append(out, domain)
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
 // currentChannelFinanceVersionJSON 从当前状态表生成某主域名的完整版本快照。
 // 全局口径变化时可为所有主域名各追加一版，从而保证任何渠道的计算变化都有版本依据。
 func currentChannelFinanceVersionJSON(tx *gorm.DB, domain string) (string, error) {
@@ -456,41 +549,76 @@ func currentChannelFinanceVersionJSON(tx *gorm.DB, domain string) (string, error
 		return "", err
 	}
 	var domainCost ChannelDomainCost
-	if err := tx.First(&domainCost, "domain = ?", domain).Error; err != nil {
-		return "", err
+	domainCostErr := tx.First(&domainCost, "domain = ?", domain).Error
+	if domainCostErr != nil && !errors.Is(domainCostErr, gorm.ErrRecordNotFound) {
+		return "", domainCostErr
+	}
+	if errors.Is(domainCostErr, gorm.ErrRecordNotFound) {
+		// 渠道级成本可以先于主域名充值比例配置；版本先记录默认 1:1，
+		// 后续保存主域名充值比例时会追加一版，不阻塞渠道口径维护。
+		domainCost = ChannelDomainCost{Domain: domain, RechargePaid: 1, RechargeCredit: 1}
 	}
 	var upstream []ChannelDomainGroupCost
 	if err := tx.Where("domain = ?", domain).Order("grp ASC").Find(&upstream).Error; err != nil {
 		return "", err
 	}
-	groupNames := make([]string, 0, len(upstream))
-	for _, row := range upstream {
-		groupNames = append(groupNames, row.Grp)
+	var site []ChannelSaleGroupRate
+	if err := tx.Order("grp ASC").Find(&site).Error; err != nil {
+		return "", err
 	}
 	siteByGroup := map[string]ChannelSaleGroupRate{}
-	if len(groupNames) > 0 {
-		var site []ChannelSaleGroupRate
-		if err := tx.Where("grp IN ?", groupNames).Find(&site).Error; err != nil {
-			return "", err
-		}
-		for _, row := range site {
-			siteByGroup[row.Grp] = row
+	groupSet := map[string]bool{}
+	for _, row := range site {
+		siteByGroup[row.Grp] = row
+		groupSet[row.Grp] = true
+	}
+	upstreamByGroup := map[string]ChannelDomainGroupCost{}
+	for _, row := range upstream {
+		upstreamByGroup[row.Grp] = row
+		groupSet[row.Grp] = true
+	}
+	groupNames := make([]string, 0, len(groupSet))
+	for name := range groupSet {
+		if strings.TrimSpace(name) != "" {
+			groupNames = append(groupNames, name)
 		}
 	}
+	sort.Strings(groupNames)
 	snapshot := channelFinanceVersionSnapshot{
 		Domain: domain, FXBenchmark: setting.FXBenchmark,
 		SiteRechargePaid: setting.SiteRechargePaid, SiteRechargeCredit: setting.SiteRechargeCredit,
 		UpstreamRechargePaid: domainCost.RechargePaid, UpstreamRechargeCredit: domainCost.RechargeCredit,
 	}
-	for _, row := range upstream {
-		site, exists := siteByGroup[row.Grp]
+	for _, name := range groupNames {
+		site, exists := siteByGroup[name]
 		if !exists {
 			continue
 		}
+		upstream := upstreamByGroup[name]
 		snapshot.Groups = append(snapshot.Groups, channelFinanceVersionGroup{
-			Group: row.Grp, SiteMultiplier: site.Multiplier, UpstreamMultiplier: row.Multiplier,
-			UpstreamDiscountFactor: normalizedUpstreamDiscountFactor(row.DiscountFactor),
+			Group: name, SiteMultiplier: site.Multiplier, UpstreamMultiplier: upstream.Multiplier,
+			UpstreamDiscountFactor: normalizedUpstreamDiscountFactor(upstream.DiscountFactor),
 		})
+	}
+	var snaps []ChannelSnap
+	if err := tx.Where("base_domain = ?", domain).Find(&snaps).Error; err != nil {
+		return "", err
+	}
+	channelIDs := make([]int, 0, len(snaps))
+	for _, snap := range snaps {
+		channelIDs = append(channelIDs, snap.ID)
+	}
+	if len(channelIDs) > 0 {
+		var rates []ChannelFinanceChannelCost
+		if err := tx.Where("channel_id IN ?", channelIDs).Order("channel_id ASC, grp ASC").Find(&rates).Error; err != nil {
+			return "", err
+		}
+		for _, rate := range rates {
+			snapshot.ChannelRates = append(snapshot.ChannelRates, channelFinanceVersionChannel{
+				ChannelID: rate.ChannelID, Group: rate.Grp, UpstreamGroupName: strings.TrimSpace(rate.UpstreamGroupName), UpstreamMultiplier: rate.Multiplier,
+				UpstreamDiscountFactor: normalizedUpstreamDiscountFactor(rate.DiscountFactor),
+			})
+		}
 	}
 	raw, err := json.Marshal(snapshot)
 	return string(raw), err
