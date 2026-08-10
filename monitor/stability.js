@@ -213,11 +213,9 @@ function setOptions(id,rows,value,allLabel,val,label){const el=$(id);if(!el)retu
 
 function renderReport(){
   const d=st.report;if(!d)return;renderFilterOptions();renderSources(d.meta);const body=$('stDeliveryBody');if(!body)return;
-  const cov=d.meta?.data_coverage||{};
-  const coverageWarning=cov.complete?'':`<div class="alert">当前日期范围的小时数据完整率为 ${(+cov.percent||0).toFixed(1)}%（${nfmt(cov.completed_hours)}/${nfmt(cov.expected_hours)} 小时）；缺失时段不会被当作零流量，稳定性和使用量可能偏差。</div>`;
-  if(!d.summary?.requests){if(st.chart){st.chart.dispose();st.chart=null}body.innerHTML=coverageWarning+`<div class="stability-empty"><b>当前范围没有稳定性数据</b><p>可能是所选范围确实没有流量，或上方完整率所示的历史小时尚未补齐。现有模型监控和用户用量不受影响。</p></div>`;return}
-  body.innerHTML=`${coverageWarning}
-    <section class="stability-kpis" id="stKpis"></section>
+  const cov=d.meta?.data_coverage||{},hasCoverage=typeof cov.complete==='boolean';
+  if(!d.summary?.requests){if(st.chart){st.chart.dispose();st.chart=null}const detail=hasCoverage&&cov.latest_hour_pending?'最新完整小时正在汇总，完成后会自动显示。':hasCoverage&&!cov.complete?`当前有 ${nfmt(cov.missing_hours)} 个历史小时待补，也可能是所选范围确实没有流量。`:'所选范围内没有真实用户请求。';body.innerHTML=`<div class="stability-empty"><b>当前范围没有稳定性数据</b><p>${detail}</p></div>`;return}
+  body.innerHTML=`<section class="stability-kpis" id="stKpis"></section>
     <section class="stability-panel"><div class="stability-panel-head"><div><h3>每日稳定性变化</h3><p>成功交付 / 真实用户请求；无请求日期断线，柱形为每日请求量</p></div><span class="muted">${esc(d.meta.from)} 至 ${esc(d.meta.to)}</span></div><div id="stTrend" class="stability-chart"></div></section>
     <section class="stability-panel"><div class="stability-panel-head"><div><h3>服务分组稳定性</h3><p>服务分组代表用户体验；展开查看实际承载渠道，未路由请求只计入分组</p></div><span class="muted">${nfmt(d.groups?.length||0)} 个有流量分组</span></div><div class="stability-group-head"><span>服务分组 / 渠道</span><span>区间稳定性 / 环比</span><span>时间窄条 · ${bucketLabel(d.meta.timeline_bucket_sec||3600)}</span><span>请求 / 占比</span><span>问题 / 问题率</span><span>渠道 / 操作</span></div><div id="stGroupList"></div></section>
     <section class="stability-ranking-grid"><article class="stability-panel"><div class="stability-panel-head"><div><h3>分组与渠道使用量排行</h3><p>按真实请求数排序，识别优先保障对象</p></div></div><div id="stUsageRank" class="stability-rank-list"></div></article><article class="stability-panel"><div class="stability-panel-head"><div><h3>渠道问题排行</h3><p>按问题数排序；数量分布不等于问题归因</p></div></div><div id="stProblemRank" class="stability-rank-list"></div></article></section>`;
@@ -225,14 +223,18 @@ function renderReport(){
   if(d.meta.rows_truncated){body.insertAdjacentHTML('afterbegin','<div class="alert">当前维度数量超过页面安全上限，列表已截断；汇总口径仍以接口返回范围为准。</div>')}
 }
 function renderSources(meta){
-  const s=meta?.sources||{};const el=$('stSourceMini');if(!el)return;
+  const s=meta?.sources||{},cov=meta?.data_coverage||{},hasCoverage=typeof cov.complete==='boolean';const el=$('stSourceMini');if(!el)return;
   const problemPending=+s.problem_pending_minutes||0,problemCoverage=+s.problem_coverage_to||0;
   const problemState=problemPending?'wait':problemCoverage?'ok':'wait';
   const problemLabel=problemPending?`积压 ${nfmt(problemPending)} 分钟`:problemCoverage?`至 ${dateTime(problemCoverage)}`:'积累中';
   const nginxStatus=s.nginx_status||(s.nginx_connected?'ok':s.nginx_enabled?'degraded':'disabled');
   const nginxClass=nginxStatus==='ok'?'ok':nginxStatus==='degraded'?'bad':'wait';
   const nginxLabel=nginxStatus==='ok'?`${nfmt(s.nginx_healthy_sources||s.nginx_source_count)}/${nfmt(s.nginx_source_count)} 正常`:nginxStatus==='degraded'?`${nfmt(s.nginx_healthy_sources)}/${nfmt(s.nginx_source_count)} 异常`:'未启用';
-  el.innerHTML=`<span><i></i>${esc(meta?.from||'—')}～${esc(meta?.to||'—')}</span><span title="NewAPI 本地采样新鲜度"><i class="${s.newapi_last_ts?'ok':'wait'}"></i>NewAPI ${s.newapi_last_ts?age(s.newapi_data_age_sec):'无数据'}</span><span title="原始错误采集完整覆盖时间；存在积压时问题排行暂不包含未完成分钟"><i class="${problemState}"></i>错误 ${problemLabel}</span><span title="Nginx 允许节点健康数 / 配置节点数"><i class="${nginxClass}"></i>Nginx ${nginxLabel}</span>`;
+  const coverageClass=!hasCoverage||cov.latest_hour_pending?'':cov.complete?'ok':'wait';
+  const coverageLabel=!hasCoverage?'数据状态未知':cov.complete?`数据 ${nfmt(cov.completed_hours)}/${nfmt(cov.expected_hours)}`:cov.latest_hour_pending?`数据 ${nfmt(cov.completed_hours)}/${nfmt(cov.expected_hours)} · 汇总中`:`数据 ${nfmt(cov.completed_hours)}/${nfmt(cov.expected_hours)} · ${nfmt(cov.missing_hours)} 小时待补`;
+  const pendingTime=+cov.pending_hour_ts?` ${dateTime(cov.pending_hour_ts)}`:'';
+  const coverageTitle=!hasCoverage?'暂未获取小时数据状态':cov.latest_hour_pending?`最新小时${pendingTime} 正常汇总中`:cov.complete?'所选范围小时数据已完整':'存在历史小时待补，当前统计可能偏低';
+  el.innerHTML=`<span><i></i>${esc(meta?.from||'—')}～${esc(meta?.to||'—')}</span><span title="${coverageTitle}"><i class="${coverageClass}"></i>${coverageLabel}</span><span title="NewAPI 本地采样新鲜度"><i class="${s.newapi_last_ts?'ok':'wait'}"></i>NewAPI ${s.newapi_last_ts?age(s.newapi_data_age_sec):'无数据'}</span><span title="原始错误采集完整覆盖时间；存在积压时问题排行暂不包含未完成分钟"><i class="${problemState}"></i>错误 ${problemLabel}</span><span title="Nginx 允许节点健康数 / 配置节点数"><i class="${nginxClass}"></i>Nginx ${nginxLabel}</span>`;
 }
 function renderKpis(d){const s=d.summary,p=d.previous,pc=d.meta?.comparison_coverage||{};const k=$('stKpis');if(!k)return;k.innerHTML=[
   ['区间稳定性',pct(s.stability),delta(d.delta_pp),health(s)],

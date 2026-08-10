@@ -81,8 +81,33 @@ func TestStabilityCoverageCountsLedgerNotSamplePresence(t *testing.T) {
 		t.Fatal(err)
 	}
 	cov = m.stabilityDataCoverage(context.Background(), from, from+3*3600, from+5*3600)
-	if cov.CompletedHours != 2 || cov.MissingHours != 1 || cov.Percent < 66 || cov.Percent > 67 {
+	if cov.CompletedHours != 2 || cov.MissingHours != 1 || cov.Percent < 66 || cov.Percent > 67 || cov.LatestHourPending {
 		t.Fatalf("覆盖率应按完整小时计算: %+v", cov)
+	}
+}
+
+func TestStabilityCoverageSeparatesLatestPendingFromHistoricalGap(t *testing.T) {
+	m := newStabilityTestMonitor(t)
+	from := time.Date(2026, 8, 9, 0, 0, 0, 0, cstLocation).Unix()
+	now := from + 3*3600 + stabilityHourFinalizeDelaySec
+	if err := m.storeDB.Create(&[]StabilityHourIngestState{
+		{HourTs: from, Status: "complete"},
+		{HourTs: from + 3600, Status: "complete"},
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	cov := m.stabilityDataCoverage(context.Background(), from, from+4*3600, now)
+	if cov.CompletedHours != 2 || cov.MissingHours != 1 || !cov.LatestHourPending || cov.PendingHourTs != from+2*3600 {
+		t.Fatalf("唯一缺失的最新可归档小时应标记为正常汇总中: %+v", cov)
+	}
+
+	// 同一小时已经失败时不能被降级为正常尾部延迟。
+	if err := m.storeDB.Create(&StabilityHourIngestState{HourTs: from + 2*3600, Status: "failed"}).Error; err != nil {
+		t.Fatal(err)
+	}
+	cov = m.stabilityDataCoverage(context.Background(), from, from+4*3600, now)
+	if cov.LatestHourPending {
+		t.Fatalf("失败小时必须保留真实告警语义: %+v", cov)
 	}
 }
 

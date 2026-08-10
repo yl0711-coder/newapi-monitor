@@ -60,13 +60,15 @@ type StabilityBackfillJob struct {
 
 // StabilityDataCoverage 是报表口径的数据完整率，不是“筛选结果占全量”的比例。
 type StabilityDataCoverage struct {
-	FromTs         int64   `json:"from_ts"`
-	ToTs           int64   `json:"to_ts"`
-	ExpectedHours  int64   `json:"expected_hours"`
-	CompletedHours int64   `json:"completed_hours"`
-	MissingHours   int64   `json:"missing_hours"`
-	Percent        float64 `json:"percent"`
-	Complete       bool    `json:"complete"`
+	FromTs            int64   `json:"from_ts"`
+	ToTs              int64   `json:"to_ts"`
+	ExpectedHours     int64   `json:"expected_hours"`
+	CompletedHours    int64   `json:"completed_hours"`
+	MissingHours      int64   `json:"missing_hours"`
+	Percent           float64 `json:"percent"`
+	Complete          bool    `json:"complete"`
+	LatestHourPending bool    `json:"latest_hour_pending"`
+	PendingHourTs     int64   `json:"pending_hour_ts,omitempty"`
 }
 
 func finalizedStabilityHourTo(now int64) int64 {
@@ -106,6 +108,21 @@ func (m *Monitor) stabilityDataCoverage(ctx context.Context, fromTs, toTs, now i
 		result.Percent = float64(result.CompletedHours) / float64(result.ExpectedHours) * 100
 	}
 	result.Complete = result.MissingHours == 0
+	// 仅当查询范围追到当前最新可归档小时，且唯一缺口正好是
+	// 最后一小时时，才标记为正常的尾部汇总延迟。历史中间缺口或已失败
+	// 的最新小时仍是真实的数据完整性问题，不能被页面降级隐藏。
+	if !result.Complete && result.MissingHours == 1 && toTs == finalizedTo {
+		latestHourTs := toTs - 3600
+		var latest StabilityHourIngestState
+		tx := m.storeDB.WithContext(ctx).First(&latest, "hour_ts = ?", latestHourTs)
+		if errors.Is(tx.Error, gorm.ErrRecordNotFound) ||
+			(tx.Error == nil && (latest.Status == "queued" || latest.Status == "running")) {
+			result.LatestHourPending = true
+			result.PendingHourTs = latestHourTs
+		} else if tx.Error != nil {
+			slog.Warn("读取最新稳定性小时状态失败", "hour", latestHourTs, "err", tx.Error)
+		}
+	}
 	return result
 }
 
