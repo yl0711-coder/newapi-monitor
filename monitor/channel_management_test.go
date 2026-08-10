@@ -55,7 +55,7 @@ func TestChannelManagementCardTypographyIsReadable(t *testing.T) {
 }
 
 func TestChannelManagementFinanceScopesAreSeparated(t *testing.T) {
-	page := string(pageHTML)
+	page := pageHTML
 	js := string(channelManagementJS)
 	css := string(stabilityCSS)
 	for _, marker := range []string{
@@ -99,7 +99,7 @@ func TestChannelManagementFinanceScopesAreSeparated(t *testing.T) {
 }
 
 func TestChannelManagementWebsiteGroupsUseNewAPIAndCanSync(t *testing.T) {
-	page := string(pageHTML)
+	page := pageHTML
 	js := string(channelManagementJS)
 	for _, marker := range []string{
 		`id="cmFinanceSyncGroups"`,
@@ -124,7 +124,7 @@ func TestChannelManagementWebsiteGroupsUseNewAPIAndCanSync(t *testing.T) {
 }
 
 func TestChannelManagementFiltersRenderBeforeRanking(t *testing.T) {
-	page := string(pageHTML)
+	page := pageHTML
 	js := string(channelManagementJS)
 	if !strings.Contains(page, `id="cmFilters"`) {
 		t.Fatal("渠道管理筛选区缺少稳定 DOM 标识")
