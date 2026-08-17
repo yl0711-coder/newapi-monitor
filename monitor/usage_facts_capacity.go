@@ -80,8 +80,9 @@ func (m *Monitor) usageFactHistoryCapacityOK() (bool, error) {
 		m.markUsageFactDiskCapacityUnknown()
 		return false, fmt.Errorf("%w：读取事实卷空间失败: %w", errUsageFactHistoryDiskPressure, err)
 	}
-	total := int64(fs.Blocks) * int64(fs.Bsize)
-	free := int64(fs.Bavail) * int64(fs.Bsize)
+	blockSize := uint64(fs.Bsize)
+	total := int64(fs.Blocks * blockSize)
+	free := int64(fs.Bavail * blockSize)
 	usedBPS := int64(0)
 	if total > 0 {
 		usedBPS = (total - free) * 10_000 / total

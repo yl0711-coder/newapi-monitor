@@ -336,7 +336,7 @@ func preflightStoreBackupSpace(dir string, paths ...string) error {
 	if err := syscall.Statfs(dir, &fs); err != nil {
 		return err
 	}
-	free := int64(fs.Bavail) * int64(fs.Bsize)
+	free := int64(fs.Bavail * uint64(fs.Bsize))
 	reserve := int64(2 * 1024 * 1024 * 1024)
 	if proportional := sourceBytes / 5; proportional > reserve {
 		reserve = proportional
