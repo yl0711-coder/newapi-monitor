@@ -2,6 +2,7 @@
 'use strict';
 
 const ST_HEADERS={
+  sync:{title:'数据同步状态',subtitle:'全历史、实时 Tail、渠道、稳定性、备份与本地存储的统一健康视图',icon:'sync'},
   usage:{title:'用户用量',subtitle:'客户余额、每日消费、成员矩阵与用量明细',icon:'users'},
   stability:{title:'稳定性报表',subtitle:'用户交付 · 分组 / 渠道 / 模型 · 历史趋势 · 问题分析',icon:'shield'},
   channels:{title:'渠道管理',subtitle:'主域名归并 · 厂商 / 实际渠道 / 服务分组 · 使用排行',icon:'globe'},
@@ -9,6 +10,7 @@ const ST_HEADERS={
   server:{title:'服务端监控',subtitle:'实例、数据库、负载均衡、域名探活与证书',icon:'chart'}
 };
 const ST_ICONS={
+  sync:'<svg viewBox="0 0 24 24"><path d="M20 7h-6V1"/><path d="M4 17h6v6"/><path d="M20 7a8 8 0 0 0-13.7-3.6L4 5.7M4 17a8 8 0 0 0 13.7 3.6l2.3-2.3"/></svg>',
   users:'<svg viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"/></svg>',
   shield:'<svg viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="m9 12 2 2 4-4"/></svg>',
   globe:'<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a15 15 0 0 1 0 18M12 3a15 15 0 0 0 0 18"/></svg>',
