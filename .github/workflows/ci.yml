@@ -25,7 +25,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.25'
+          # 与候选镜像构建链对齐到已修补的 Go 版本。不使用模糊的
+          # 1.25，否则 runner 可能解析到存在可达标准库漏洞的 1.25.12。
+          go-version: '1.26.6'
       # 集成测试既验证正常 Redis 往返，也验证错误密码时快速降级；因此测试
       # Redis 必须真的启用认证。密码只用于这个一次性 CI 服务，不是业务凭据。
       - name: Enable authentication on test Redis
