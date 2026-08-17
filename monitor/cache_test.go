@@ -370,6 +370,71 @@ func TestUsageResultCacheTTLExpires(t *testing.T) {
 	}
 }
 
+// 核心统计允许在源库短暂失败时回退到“最近一次成功结果”，但这个能力必须被严格
+// 限制在本机的明确窗口内：普通命中仍是新鲜数据、显式失效后绝不能复活旧结果，
+// 已取消请求也不能绕过取消语义返回陈旧内容。
+func TestUsageResultCacheStaleIfErrorIsBoundedAndExplicit(t *testing.T) {
+	c := newUsageResultCacheForTest(nil, 32, 1<<20)
+	const key = "core-stale"
+	var warm map[string]int
+	stale, err := c.DoJSONStaleIfError(context.Background(), key, time.Millisecond, time.Minute, &warm, func() (any, error) {
+		return map[string]int{"requests": 7}, nil
+	})
+	if err != nil || stale || warm["requests"] != 7 {
+		t.Fatalf("首次成功结果不应标记为陈旧: value=%v stale=%v err=%v", warm, stale, err)
+	}
+
+	// 让正常新鲜期结束，模拟源查询临时失败；应只回退本机最后一次成功值，且必须
+	// 显式返回 stale=true 给 HTTP 层/前端。
+	time.Sleep(10 * time.Millisecond)
+	wantErr := errors.New("source temporarily unavailable")
+	var fallback map[string]int
+	stale, err = c.DoJSONStaleIfError(context.Background(), key, time.Millisecond, time.Minute, &fallback, func() (any, error) {
+		return nil, wantErr
+	})
+	if err != nil || !stale || fallback["requests"] != 7 {
+		t.Fatalf("源失败时应回退最近成功结果: value=%v stale=%v err=%v", fallback, stale, err)
+	}
+
+	// 删除表示成员/配置或主动刷新已使旧值失效，之后绝不能因降级逻辑复活它。
+	c.Delete(context.Background(), key)
+	var deleted map[string]int
+	stale, err = c.DoJSONStaleIfError(context.Background(), key, time.Millisecond, time.Minute, &deleted, func() (any, error) {
+		return nil, wantErr
+	})
+	if !errors.Is(err, wantErr) || stale || deleted != nil {
+		t.Fatalf("显式删除后不得返回旧结果: value=%v stale=%v err=%v", deleted, stale, err)
+	}
+
+	// 即使本机仍有陈旧值，浏览器取消请求也必须保持取消语义，不能渲染旧结果。
+	c.local.PutWithStale(c.fullKey(key), []byte(`{"requests":9}`), time.Millisecond, time.Minute, time.Now().Add(-10*time.Millisecond))
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	var canceled map[string]int
+	stale, err = c.DoJSONStaleIfError(ctx, key, time.Millisecond, time.Minute, &canceled, func() (any, error) {
+		t.Fatal("已取消请求不得执行源查询")
+		return nil, nil
+	})
+	if !errors.Is(err, context.Canceled) || stale || canceled != nil {
+		t.Fatalf("取消请求不得回退陈旧数据: value=%v stale=%v err=%v", canceled, stale, err)
+	}
+}
+
+func TestUsageResultCacheStaleIfErrorNeverExceedsGraceWindow(t *testing.T) {
+	c := newUsageResultCacheForTest(nil, 32, 1<<20)
+	const key = "core-stale-expired"
+	// 直接构造已超过 stale grace 的本机条目，避免依赖墙上时间和长等待。
+	c.local.PutWithStale(c.fullKey(key), []byte(`{"requests":7}`), time.Millisecond, time.Millisecond, time.Now().Add(-time.Second))
+	wantErr := errors.New("source temporarily unavailable")
+	var out map[string]int
+	stale, err := c.DoJSONStaleIfError(context.Background(), key, time.Millisecond, time.Millisecond, &out, func() (any, error) {
+		return nil, wantErr
+	})
+	if !errors.Is(err, wantErr) || stale || out != nil {
+		t.Fatalf("超过回退窗口不得返回陈旧数据: value=%v stale=%v err=%v", out, stale, err)
+	}
+}
+
 func TestUsageAggregateTTLPolicy(t *testing.T) {
 	now := time.Date(2026, 8, 3, 8, 30, 0, 0, usageCST)
 	todayStart := time.Date(2026, 8, 3, 0, 0, 0, 0, usageCST).Unix()
@@ -421,6 +486,37 @@ func TestUsageResultCacheRemoteRemainingTTLDoesNotExtendInL1(t *testing.T) {
 	}
 	if second != 42 || fills.Load() != 1 {
 		t.Fatalf("远端绝对过期后必须重算，不得被 L1 延长: value=%d fills=%d", second, fills.Load())
+	}
+}
+
+// Redis 命中后，L1 可以缩短正常读取的检查周期，但不能把“源结果允许作为失败
+// 回退的最后时刻”从本次命中时间重新起算；否则一次 Redis 命中会悄悄延长旧报表
+// 的可见时间。
+func TestUsageResultCacheRemoteStaleDeadlineIsNotRebasedInL1(t *testing.T) {
+	remote := newMemoryByteCacheStore()
+	c := newUsageResultCacheForTest(remote, 32, 1<<20)
+	now := time.Now()
+	expiresAt := now.Add(10 * time.Minute)
+	staleUntil := expiresAt.Add(time.Hour)
+	record, err := encodeUsageCacheRecord([]byte(`41`), expiresAt, staleUntil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	remote.putRaw(c.fullKey("original-stale-deadline"), record, time.Hour)
+
+	var got int
+	stale, err := c.DoJSONStaleIfError(context.Background(), "original-stale-deadline", time.Minute, 24*time.Hour, &got, func() (any, error) {
+		return 99, nil
+	})
+	if err != nil || stale || got != 41 {
+		t.Fatalf("首次应命中远端新鲜结果: value=%d stale=%v err=%v", got, stale, err)
+	}
+	_, actualDeadline, ok := c.local.GetStaleWithDeadline(c.fullKey("original-stale-deadline"), time.Now())
+	if !ok {
+		t.Fatal("远端命中后应保留本机候选结果")
+	}
+	if !actualDeadline.Equal(staleUntil) {
+		t.Fatalf("L1 回退截止时间被重新计算: got=%s want=%s", actualDeadline, staleUntil)
 	}
 }
 

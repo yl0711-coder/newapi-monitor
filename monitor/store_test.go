@@ -21,7 +21,10 @@ func newTestMonitor(t *testing.T) *Monitor {
 		ProbeCertWarnDays:        30,
 		ProbeCertBadDays:         7,
 	}
-	m := &Monitor{cfg: cfg, chNames: map[string]string{}}
+	m := &Monitor{
+		cfg:     cfg,
+		chNames: map[string]string{},
+	}
 	if err := m.openStore(t.TempDir() + "/t.db"); err != nil {
 		t.Fatalf("openStore: %v", err)
 	}

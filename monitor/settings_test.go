@@ -1,0 +1,175 @@
+package monitor
+
+import "testing"
+
+func TestLoadSettingsSourceLifecycleDefaults(t *testing.T) {
+	t.Setenv("MONITOR_SOURCE_WORKER_ENABLED", "")
+	t.Setenv("MONITOR_SOURCE_LEASE_REQUIRED", "")
+	t.Setenv("MONITOR_SOURCE_LEASE_NAME", "")
+	s := LoadSettings()
+	if !s.SourceWorkerEnabled || !s.SourceLeaseRequired || s.SourceLeaseName != "newapi-monitor-source-worker-v1" {
+		t.Fatalf("unsafe source lifecycle defaults: worker=%v lease=%v name=%q",
+			s.SourceWorkerEnabled, s.SourceLeaseRequired, s.SourceLeaseName)
+	}
+	if !s.sourceLifecycleConfigured {
+		t.Fatal("LoadSettings must distinguish production defaults from legacy Settings{} tests")
+	}
+	legacy := Settings{}
+	if !legacy.sourceWorkerIsEnabled() || legacy.sourceLeaseIsRequired() {
+		t.Fatalf("legacy Settings{} compatibility changed: worker=%v lease=%v",
+			legacy.sourceWorkerIsEnabled(), legacy.sourceLeaseIsRequired())
+	}
+}
+
+func TestLoadSettingsUpstreamSyncEnabled(t *testing.T) {
+	t.Setenv("MONITOR_UPSTREAM_SYNC_ENABLED", "")
+	if !LoadSettings().UpstreamSyncEnabled {
+		t.Fatal("upstream polling must remain enabled by default for existing deployments")
+	}
+
+	t.Setenv("MONITOR_UPSTREAM_SYNC_ENABLED", "false")
+	if LoadSettings().UpstreamSyncEnabled {
+		t.Fatal("explicitly disabling upstream polling must be honored")
+	}
+}
+
+func TestLoadSettingsInfraSnapshotReadOnly(t *testing.T) {
+	t.Setenv("MONITOR_INFRA_ENABLED", "false")
+	t.Setenv("MONITOR_INFRA_SNAPSHOT_READ_ONLY", "true")
+	s := LoadSettings()
+	if s.InfraEnabled {
+		t.Fatal("snapshot-only mode must not enable active infra probes")
+	}
+	if !s.InfraSnapshotReadOnly {
+		t.Fatal("snapshot-only mode must be loaded explicitly")
+	}
+	m := &Monitor{cfg: s}
+	if !m.InfraEnabled() {
+		t.Fatal("stored infra snapshots must remain readable in local acceptance")
+	}
+}
+
+func TestInfraSnapshotReadOnlyIsOffByDefault(t *testing.T) {
+	t.Setenv("MONITOR_INFRA_ENABLED", "false")
+	t.Setenv("MONITOR_INFRA_SNAPSHOT_READ_ONLY", "false")
+	s := LoadSettings()
+	if (&Monitor{cfg: s}).InfraEnabled() {
+		t.Fatal("infra page must remain disabled when neither active nor snapshot mode is enabled")
+	}
+}
+
+func TestLoadSettingsUsageFactsStorePath(t *testing.T) {
+	t.Setenv("MONITOR_USAGE_FACTS_STORE_PATH", "/data/usage-facts.db")
+	if got := LoadSettings().UsageFactsStorePath; got != "/data/usage-facts.db" {
+		t.Fatalf("usage facts store path=%q", got)
+	}
+}
+
+func TestLoadSettingsStabilitySourceProtectionDefaults(t *testing.T) {
+	t.Setenv("MONITOR_BACKGROUND_SOURCE_MIN_START_INTERVAL_MS", "")
+	t.Setenv("MONITOR_STABILITY_BACKFILL_SERVER_MAX_EXECUTION_MS", "")
+	t.Setenv("MONITOR_STABILITY_BACKFILL_SOURCE_DUTY_PERCENT", "")
+	t.Setenv("MONITOR_STABILITY_CLASSIFICATION_MIGRATION_ENABLED", "")
+	s := LoadSettings()
+	if s.BackgroundSourceMinStartIntervalMS != 2000 {
+		t.Fatalf("background source spacing=%d want=2000ms", s.BackgroundSourceMinStartIntervalMS)
+	}
+	if s.StabilityBackfillSourceDutyPercent != 20 {
+		t.Fatalf("stability source duty=%d want=20%%", s.StabilityBackfillSourceDutyPercent)
+	}
+	if s.StabilityBackfillServerMaxExecutionMS != 8000 {
+		t.Fatalf("stability server max execution=%d want=8000ms", s.StabilityBackfillServerMaxExecutionMS)
+	}
+	if s.StabilityClassificationMigrationEnabled {
+		t.Fatal("classification migration must be explicit and off by default")
+	}
+
+	t.Setenv("MONITOR_BACKGROUND_SOURCE_MIN_START_INTERVAL_MS", "3500")
+	t.Setenv("MONITOR_STABILITY_BACKFILL_SERVER_MAX_EXECUTION_MS", "6000")
+	t.Setenv("MONITOR_STABILITY_BACKFILL_SOURCE_DUTY_PERCENT", "15")
+	t.Setenv("MONITOR_STABILITY_CLASSIFICATION_MIGRATION_ENABLED", "true")
+	s = LoadSettings()
+	if s.BackgroundSourceMinStartIntervalMS != 3500 || s.StabilityBackfillServerMaxExecutionMS != 6000 || s.StabilityBackfillSourceDutyPercent != 15 || !s.StabilityClassificationMigrationEnabled {
+		t.Fatalf("explicit stability source settings were not honored: %+v", s)
+	}
+}
+
+func TestValidateUsageFactsSettingsRejectsSilentSourceFallback(t *testing.T) {
+	tests := []struct {
+		name string
+		cfg  Settings
+	}{
+		{
+			name: "production read without collector",
+			cfg:  Settings{UsageFactsReadEnabled: true},
+		},
+		{
+			name: "offline read without explicit facts guard",
+			cfg:  Settings{LocalSnapshotOnly: true, UsageFactsReadEnabled: true},
+		},
+		{
+			name: "offline-only guard in production",
+			cfg:  Settings{UsageFactsLocalReadOnly: true},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := validateUsageFactsSettings(tt.cfg); err == nil {
+				t.Fatal("危险开关组合必须在启动前被拒绝")
+			}
+		})
+	}
+
+	valid := []Settings{
+		{},
+		{UsageFactsEnabled: true},
+		{UsageFactsEnabled: true, UsageFactsReadEnabled: true},
+		{LocalSnapshotOnly: true, UsageFactsLocalReadOnly: true, UsageFactsReadEnabled: true},
+		{LocalSnapshotOnly: true, UsageFactsLocalReadOnly: true, UsageFactsReadEnabled: true,
+			UsageFactsFullHistoryEnabled: true, UsageFactsHistorySourceMode: "complete", UsageFactsHistorySourceEpoch: "restore-v1"},
+	}
+	for i, cfg := range valid {
+		if err := validateUsageFactsSettings(cfg); err != nil {
+			t.Fatalf("合法配置[%d]被拒绝: %v", i, err)
+		}
+	}
+}
+
+func TestUsageFactsFullHistorySnapshotModeNeverEnablesWorker(t *testing.T) {
+	cfg := Settings{
+		LocalSnapshotOnly: true, UsageFactsLocalReadOnly: true, UsageFactsReadEnabled: true,
+		UsageFactsFullHistoryEnabled: true, UsageFactsHistorySourceMode: "complete", UsageFactsHistorySourceEpoch: "restore-v1",
+	}
+	if err := validateUsageFactsSettings(cfg); err != nil {
+		t.Fatal(err)
+	}
+	m := &Monitor{cfg: cfg}
+	if !m.usageFactsFullHistoryMode() {
+		t.Fatal("restored snapshot lost its full-history read semantics")
+	}
+	if m.usageFactsFullHistoryEnabled() {
+		t.Fatal("restored snapshot must not enable full-history source/mutation workers")
+	}
+}
+
+func TestClassificationMigrationRequiresOnlineReadDisabledFullHistoryWindow(t *testing.T) {
+	base := Settings{
+		UsageFactsEnabled: true, UsageFactsFullHistoryEnabled: true,
+		UsageFactsHistorySourceMode: "complete", UsageFactsHistorySourceEpoch: "source-v1",
+		UsageFactsClassificationMigrationEnabled: true,
+	}
+	if err := validateUsageFactsSettings(base); err != nil {
+		t.Fatalf("valid maintenance window rejected: %v", err)
+	}
+	readOn := base
+	readOn.UsageFactsReadEnabled = true
+	if err := validateUsageFactsSettings(readOn); err == nil {
+		t.Fatal("classification migration must reject a live facts read surface")
+	}
+	snapshot := base
+	snapshot.LocalSnapshotOnly = true
+	snapshot.UsageFactsLocalReadOnly = true
+	if err := validateUsageFactsSettings(snapshot); err == nil {
+		t.Fatal("classification migration must never mutate a restored snapshot")
+	}
+}

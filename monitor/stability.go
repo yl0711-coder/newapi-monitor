@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"sort"
 	"strconv"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"gorm.io/gorm"
 )
 
 var cstLocation = time.FixedZone("CST", 8*60*60)
@@ -42,12 +44,13 @@ func newAPIChannelTypeName(channelType int) string {
 }
 
 type stabilityScope struct {
-	FromTs    int64
-	ToTs      int64
-	Group     string
-	ChannelID int
-	Model     string
-	Vendor    string
+	FromTs     int64
+	ToTs       int64
+	RangeHours int
+	Group      string
+	ChannelID  int
+	Model      string
+	Vendor     string
 }
 
 type StabilityMetrics struct {
@@ -194,21 +197,22 @@ type StabilityFilters struct {
 }
 
 type StabilitySourceStatus struct {
-	NewAPILastTs              int64    `json:"newapi_last_ts"`
-	NewAPIDataAgeSec          int64    `json:"newapi_data_age_sec"`
-	ProblemLastTs             int64    `json:"problem_last_ts"`
-	ProblemCoverageTo         int64    `json:"problem_coverage_to"`
-	ProblemCoverageLagSec     int64    `json:"problem_coverage_lag_sec"`
-	ProblemPendingMinutes     int64    `json:"problem_pending_minutes"`
-	ProblemSamplerLastSuccess int64    `json:"problem_sampler_last_success"`
-	ProblemSamplerLastFailure int64    `json:"problem_sampler_last_failure"`
-	NginxEnabled              bool     `json:"nginx_enabled"`
-	NginxStatus               string   `json:"nginx_status"`
-	NginxConnected            bool     `json:"nginx_connected"`
-	NginxHealthySources       int      `json:"nginx_healthy_sources"`
-	NginxSourceCount          int      `json:"nginx_source_count"`
-	NginxLastTs               int64    `json:"nginx_last_ts"`
-	RequestIDCoverage         *float64 `json:"request_id_coverage"`
+	NewAPILastTs              int64                             `json:"newapi_last_ts"`
+	NewAPIDataAgeSec          int64                             `json:"newapi_data_age_sec"`
+	ProblemLastTs             int64                             `json:"problem_last_ts"`
+	ProblemCoverageTo         int64                             `json:"problem_coverage_to"`
+	ProblemCoverageLagSec     int64                             `json:"problem_coverage_lag_sec"`
+	ProblemPendingMinutes     int64                             `json:"problem_pending_minutes"`
+	ProblemSamplerLastSuccess int64                             `json:"problem_sampler_last_success"`
+	ProblemSamplerLastFailure int64                             `json:"problem_sampler_last_failure"`
+	ProblemMigration          stabilityProblemMigrationProgress `json:"problem_migration"`
+	NginxEnabled              bool                              `json:"nginx_enabled"`
+	NginxStatus               string                            `json:"nginx_status"`
+	NginxConnected            bool                              `json:"nginx_connected"`
+	NginxHealthySources       int                               `json:"nginx_healthy_sources"`
+	NginxSourceCount          int                               `json:"nginx_source_count"`
+	NginxLastTs               int64                             `json:"nginx_last_ts"`
+	RequestIDCoverage         *float64                          `json:"request_id_coverage"`
 }
 
 type StabilityReportMeta struct {
@@ -338,8 +342,8 @@ const stabilityAggColumns = `
 	COALESCE(SUM(sh.err_other),0) AS err_other`
 
 func (s stabilityScope) sqlWhere(alias string) (string, []any) {
-	where := " WHERE " + alias + ".hour_ts >= ? AND " + alias + ".hour_ts < ?"
-	args := []any{s.FromTs, s.ToTs}
+	where := " WHERE " + alias + ".hour_ts >= ? AND " + alias + ".hour_ts < ? AND " + alias + ".traffic_class_version = ?"
+	args := []any{s.FromTs, s.ToTs, userTrafficClassificationVersion}
 	if s.Group != "" {
 		where += " AND " + alias + ".grp = ?"
 		args = append(args, s.Group)
@@ -974,7 +978,9 @@ func (m *Monitor) buildStabilityReportWithDetails(ctx context.Context, scope sta
 	meta := StabilityReportMeta{From: time.Unix(scope.FromTs, 0).In(cstLocation).Format("2006-01-02"), To: time.Unix(scope.ToTs-1, 0).In(cstLocation).Format("2006-01-02"), GeneratedAt: now, RetentionDays: queryDays, RowsTruncated: false, ComparisonAvailable: comparisonCoverage.Complete, ComparisonCoverage: comparisonCoverage, TimelineBucketSec: timelineStep}
 	meta.DataCoverage = m.stabilityDataCoverage(ctx, scope.FromTs, scope.ToTs, now)
 	var coverage struct{ Min, Max int64 }
-	warnReadErr("stability coverage", m.storeDB.WithContext(ctx).Raw("SELECT COALESCE(MIN(hour_ts),0) min, COALESCE(MAX(hour_ts),0) max FROM stability_hour_samples").Scan(&coverage))
+	warnReadErr("stability coverage", m.storeDB.WithContext(ctx).Raw(
+		"SELECT COALESCE(MIN(hour_ts),0) min, COALESCE(MAX(hour_ts),0) max FROM stability_hour_samples WHERE traffic_class_version = ?",
+		userTrafficClassificationVersion).Scan(&coverage))
 	meta.FirstDataTs, meta.LastDataTs = coverage.Min, coverage.Max
 	if lastBucket := m.storeFreshness(); lastBucket > 0 {
 		meta.Sources.NewAPILastTs = lastBucket + 60
@@ -984,22 +990,22 @@ func (m *Monitor) buildStabilityReportWithDetails(ctx context.Context, scope sta
 		}
 	}
 	var problemLast struct{ Max int64 }
-	warnReadErr("stability problem freshness", m.storeDB.WithContext(ctx).Raw("SELECT COALESCE(MAX(last_ts),0) max FROM stability_problem_samples WHERE source='newapi'").Scan(&problemLast))
+	warnReadErr("stability problem freshness", m.storeDB.WithContext(ctx).Raw(
+		"SELECT COALESCE(MAX(last_ts),0) max FROM stability_problem_samples WHERE source='newapi' AND traffic_class_version=?",
+		userTrafficClassificationVersion).Scan(&problemLast))
 	meta.Sources.ProblemLastTs = problemLast.Max
-	var problemCoverage struct {
-		MaxComplete int64
-		Pending     int64
+	var problemLive StabilityProblemLiveCursor
+	if err := m.storeDB.WithContext(ctx).First(&problemLive, "id = ? AND traffic_class_version = ?", 1, userTrafficClassificationVersion).Error; err == nil {
+		meta.Sources.ProblemCoverageTo = problemLive.NextTs
+		if problemLive.TargetThroughTs > problemLive.NextTs {
+			meta.Sources.ProblemPendingMinutes = (problemLive.TargetThroughTs - problemLive.NextTs + 59) / 60
+		}
+	} else if !errors.Is(err, gorm.ErrRecordNotFound) {
+		slog.Warn("读取稳定性问题实时水位失败", "err", err)
 	}
-	warnReadErr("stability problem ingest coverage", m.storeDB.WithContext(ctx).Raw(`SELECT
-		COALESCE(MAX(CASE WHEN complete THEN bucket_ts END),0) max_complete,
-		COALESCE(SUM(CASE WHEN complete THEN 0 ELSE 1 END),0) pending
-		FROM stability_problem_ingest_states`).Scan(&problemCoverage))
-	if problemCoverage.MaxComplete > 0 {
-		meta.Sources.ProblemCoverageTo = problemCoverage.MaxComplete + 60
-	}
-	meta.Sources.ProblemPendingMinutes = problemCoverage.Pending
 	meta.Sources.ProblemSamplerLastSuccess = m.problemLastSuccess.Load()
 	meta.Sources.ProblemSamplerLastFailure = m.problemLastFailure.Load()
+	meta.Sources.ProblemMigration = m.stabilityProblemMigrationProgress()
 	if meta.Sources.NewAPILastTs > meta.Sources.ProblemCoverageTo && meta.Sources.ProblemCoverageTo > 0 {
 		meta.Sources.ProblemCoverageLagSec = meta.Sources.NewAPILastTs - meta.Sources.ProblemCoverageTo
 	}

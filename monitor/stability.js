@@ -227,6 +227,13 @@ function renderSources(meta){
   const problemPending=+s.problem_pending_minutes||0,problemCoverage=+s.problem_coverage_to||0;
   const problemState=problemPending?'wait':problemCoverage?'ok':'wait';
   const problemLabel=problemPending?`积压 ${nfmt(problemPending)} 分钟`:problemCoverage?`至 ${dateTime(problemCoverage)}`:'积累中';
+  const migration=s.problem_migration||{},migrationStatus=migration.status||'disabled';
+  const migrationVisible=!['disabled','not_required'].includes(migrationStatus);
+  const migrationState=migrationStatus==='complete'?'ok':['paused','paused_disabled','error','stalled'].includes(migrationStatus)?'bad':'wait';
+  const migrationETA=migration.estimate_status==='observed'&&migration.estimated_seconds!=null?` · 预计剩余 ${age(+migration.estimated_seconds)}`:
+    migration.estimate_status==='backoff'?' · 退避中':migration.estimate_status==='blocked'?' · 已暂停':'';
+  const migrationLabel=migrationStatus==='complete'?'错误历史重签完成':`错误历史重签 ${(+migration.percent||0).toFixed(1)}%${migrationETA}`;
+  const migrationTitle=`原始错误 v5 冷历史迁移；实时错误采集使用独立高优先水位，不受该进度阻塞${migration.last_error?'；最近错误：'+migration.last_error:''}`;
   const nginxStatus=s.nginx_status||(s.nginx_connected?'ok':s.nginx_enabled?'degraded':'disabled');
   const nginxClass=nginxStatus==='ok'?'ok':nginxStatus==='degraded'?'bad':'wait';
   const nginxLabel=nginxStatus==='ok'?`${nfmt(s.nginx_healthy_sources||s.nginx_source_count)}/${nfmt(s.nginx_source_count)} 正常`:nginxStatus==='degraded'?`${nfmt(s.nginx_healthy_sources)}/${nfmt(s.nginx_source_count)} 异常`:'未启用';
@@ -234,7 +241,7 @@ function renderSources(meta){
   const coverageLabel=!hasCoverage?'数据状态未知':cov.complete?`数据 ${nfmt(cov.completed_hours)}/${nfmt(cov.expected_hours)}`:cov.latest_hour_pending?`数据 ${nfmt(cov.completed_hours)}/${nfmt(cov.expected_hours)} · 汇总中`:`数据 ${nfmt(cov.completed_hours)}/${nfmt(cov.expected_hours)} · ${nfmt(cov.missing_hours)} 小时待补`;
   const pendingTime=+cov.pending_hour_ts?` ${dateTime(cov.pending_hour_ts)}`:'';
   const coverageTitle=!hasCoverage?'暂未获取小时数据状态':cov.latest_hour_pending?`最新小时${pendingTime} 正常汇总中`:cov.complete?'所选范围小时数据已完整':'存在历史小时待补，当前统计可能偏低';
-  el.innerHTML=`<span><i></i>${esc(meta?.from||'—')}～${esc(meta?.to||'—')}</span><span title="${coverageTitle}"><i class="${coverageClass}"></i>${coverageLabel}</span><span title="NewAPI 本地采样新鲜度"><i class="${s.newapi_last_ts?'ok':'wait'}"></i>NewAPI ${s.newapi_last_ts?age(s.newapi_data_age_sec):'无数据'}</span><span title="原始错误采集完整覆盖时间；存在积压时问题排行暂不包含未完成分钟"><i class="${problemState}"></i>错误 ${problemLabel}</span><span title="Nginx 允许节点健康数 / 配置节点数"><i class="${nginxClass}"></i>Nginx ${nginxLabel}</span>`;
+  el.innerHTML=`<span><i></i>${esc(meta?.from||'—')}～${esc(meta?.to||'—')}</span><span title="${coverageTitle}"><i class="${coverageClass}"></i>${coverageLabel}</span><span title="NewAPI 本地采样新鲜度"><i class="${s.newapi_last_ts?'ok':'wait'}"></i>NewAPI ${s.newapi_last_ts?age(s.newapi_data_age_sec):'无数据'}</span><span title="原始错误采集完整覆盖时间；存在积压时问题排行暂不包含未完成分钟"><i class="${problemState}"></i>错误 ${problemLabel}</span>${migrationVisible?`<span title="${esc(migrationTitle)}"><i class="${migrationState}"></i>${esc(migrationLabel)}</span>`:''}<span title="Nginx 允许节点健康数 / 配置节点数"><i class="${nginxClass}"></i>Nginx ${nginxLabel}</span>`;
 }
 function renderKpis(d){const s=d.summary,p=d.previous,pc=d.meta?.comparison_coverage||{};const k=$('stKpis');if(!k)return;k.innerHTML=[
   ['区间稳定性',pct(s.stability),delta(d.delta_pp),health(s)],

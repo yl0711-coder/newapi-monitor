@@ -24,6 +24,61 @@ func newStabilityTestMonitor(t *testing.T) *Monitor {
 	return m
 }
 
+func TestReadyStatusKeepsDisabledRawProblemMigrationVisible(t *testing.T) {
+	m := newStabilityTestMonitor(t)
+	now := time.Date(2026, 8, 17, 12, 0, 0, 0, cstLocation).Unix()
+	state := StabilityProblemClassificationMigration{
+		ID: 1, TrafficClassVersion: userTrafficClassificationVersion,
+		FromTs: now - 24*3600, ThroughTs: now, NextTs: now - 12*3600,
+		Status: "queued", CreatedAt: now - 3600, UpdatedAt: now - 60,
+	}
+	if err := m.storeDB.Save(&state).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	m.probeLocalOperationalState(context.Background(), now)
+	if !m.stabilityProblemMigrationIncomplete.Load() {
+		t.Fatal("durable incomplete raw migration was hidden when execution flag was disabled")
+	}
+
+	// Isolate the migration reason from the other readiness inputs. The live
+	// cursor and hourly coverage are healthy; only the persisted cold cursor is
+	// incomplete.
+	m.localStoreProbeOK.Store(true)
+	m.localStoreProbeAt.Store(now)
+	m.storeIntegrityOK.Store(true)
+	m.storeIntegrityCheckedAt.Store(now)
+	m.stabilityCoverageCheckedAt.Store(now)
+	m.stabilityCoverageBPS.Store(10000)
+	m.stabilityBackfillStalled.Store(false)
+	m.problemLastSuccess.Store(now)
+	m.problemLastFailure.Store(0)
+	m.stabilityProblemCoverageTo.Store(now)
+	m.stabilityProblemPending.Store(0)
+	m.processStartedAt.Store(now - 60)
+
+	status, code := m.readyStatus(time.Unix(now, 0))
+	if code != http.StatusOK || status.Status != "degraded" {
+		t.Fatalf("incomplete raw migration must degrade readiness: code=%d status=%+v", code, status)
+	}
+	found := false
+	for _, reason := range status.DegradedReasons {
+		found = found || reason == "stability_problem_migration_incomplete"
+	}
+	if !found {
+		t.Fatalf("raw migration reason missing: %v", status.DegradedReasons)
+	}
+
+	if err := m.storeDB.Model(&StabilityProblemClassificationMigration{}).
+		Where("id = ?", 1).Updates(map[string]any{"status": "complete", "next_ts": now, "completed_at": now}).Error; err != nil {
+		t.Fatal(err)
+	}
+	m.probeLocalOperationalState(context.Background(), now)
+	if m.stabilityProblemMigrationIncomplete.Load() {
+		t.Fatal("completed raw migration remained degraded after local probe")
+	}
+}
+
 func TestStabilityRollupAndReportKeepsGroupChannelSemantics(t *testing.T) {
 	m := newStabilityTestMonitor(t)
 	day := time.Date(2026, 8, 5, 0, 0, 0, 0, cstLocation).Unix()
@@ -174,9 +229,6 @@ func TestStabilityProblemTextAndRawGrouping(t *testing.T) {
 func TestStabilityProblemSamplerKeepsRawTextAndIsIdempotent(t *testing.T) {
 	m := newStabilityTestMonitor(t)
 	m.prodDB = newFakeProdDB(t)
-	if _, err := m.prodDB.Exec("ALTER TABLE logs ADD COLUMN channel_id INTEGER DEFAULT 0"); err != nil {
-		t.Fatal(err)
-	}
 	from := time.Date(2026, 8, 5, 10, 0, 0, 0, cstLocation).Unix()
 	raw := "unexpected status 403 Forbidden: affinity channel disabled"
 	for _, row := range []struct {
@@ -186,8 +238,8 @@ func TestStabilityProblemSamplerKeepsRawTextAndIsIdempotent(t *testing.T) {
 		{from + 5, 5}, {from + 35, 5}, {from + 70, 5}, {from + 80, 2},
 	} {
 		if _, err := m.prodDB.Exec(`INSERT INTO logs
-			(user_id,created_at,type,model_name,`+"`group`"+`,channel_id,content)
-			VALUES (1,?,?,?,?,?,?)`, row.createdAt, row.typ, "gpt-test", "codex", 33, raw); err != nil {
+			(user_id,created_at,type,model_name,`+"`group`"+`,channel_id,content,request_id)
+			VALUES (1,?,?,?,?,?,?,'user-request')`, row.createdAt, row.typ, "gpt-test", "codex", 33, raw); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -212,16 +264,13 @@ func TestStabilityProblemSamplerKeepsRawTextAndIsIdempotent(t *testing.T) {
 func TestStabilityProblemSamplerResumesOverflowWithoutPublishingPartialMinute(t *testing.T) {
 	m := newStabilityTestMonitor(t)
 	m.prodDB = newFakeProdDB(t)
-	if _, err := m.prodDB.Exec("ALTER TABLE logs ADD COLUMN channel_id INTEGER DEFAULT 0"); err != nil {
-		t.Fatal(err)
-	}
 	from := time.Date(2026, 8, 5, 11, 0, 0, 0, cstLocation).Unix()
 	tx, err := m.prodDB.Begin()
 	if err != nil {
 		t.Fatal(err)
 	}
-	stmt, err := tx.Prepare(`INSERT INTO logs (user_id,created_at,type,model_name,` + "`group`" + `,channel_id,content)
-		VALUES (1,?,5,'gpt-test','codex',33,'status_code=503, service unavailable')`)
+	stmt, err := tx.Prepare(`INSERT INTO logs (user_id,created_at,type,model_name,` + "`group`" + `,channel_id,content,request_id)
+		VALUES (1,?,5,'gpt-test','codex',33,'status_code=503, service unavailable','user-request')`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -245,12 +294,31 @@ func TestStabilityProblemSamplerResumesOverflowWithoutPublishingPartialMinute(t 
 	if result.CapturedTotal != 0 || result.PendingMinutes != 1 || result.CoverageComplete {
 		t.Fatalf("partial minute was exposed as complete: %+v", result)
 	}
-	// 第二轮处理固定预算，仍不发布；第三轮读完余数后原子发布全部 5001 条。
-	if _, err := m.sampleStabilityProblems(context.Background(), from, from+60); err != nil {
+	// Live catch-up has a hard budget of three one-minute source queries per
+	// sampler turn.  The first turn used one overflow probe plus two pages.  Two
+	// more turns may add at most six pages (3,000 rows), so the minute must still
+	// be pending and no turn may consume more than its page budget.
+	var state StabilityProblemIngestState
+	if err := m.storeDB.First(&state, "bucket_ts = ?", from).Error; err != nil {
 		t.Fatal(err)
 	}
+	if state.RowsScanned != int64(2*stabilityProblemPageSize) {
+		t.Fatalf("first live turn exceeded its three-query budget: %+v", state)
+	}
+	for i := 0; i < 2; i++ {
+		before := state.RowsScanned
+		if _, err := m.sampleStabilityProblems(context.Background(), from, from+60); err != nil {
+			t.Fatal(err)
+		}
+		if err := m.storeDB.First(&state, "bucket_ts = ?", from).Error; err != nil {
+			t.Fatal(err)
+		}
+		if delta := state.RowsScanned - before; delta > int64(stabilityProblemLiveWindowsPerTurn*stabilityProblemPageSize) {
+			t.Fatalf("one live turn exceeded query/page budget: delta=%d state=%+v", delta, state)
+		}
+	}
 	if m.stabilityProblemPendingCount() != 1 {
-		t.Fatal("overflow minute should still be pending after one bounded run")
+		t.Fatal("overflow minute should still be pending before the final bounded turn")
 	}
 	if _, err := m.sampleStabilityProblems(context.Background(), from, from+60); err != nil {
 		t.Fatal(err)
@@ -267,22 +335,20 @@ func TestStabilityProblemSamplerResumesOverflowWithoutPublishingPartialMinute(t 
 func TestStabilityProblemSamplerCatchesUpWithoutSkippingElapsedMinutes(t *testing.T) {
 	m := newStabilityTestMonitor(t)
 	m.prodDB = newFakeProdDB(t)
-	if _, err := m.prodDB.Exec("ALTER TABLE logs ADD COLUMN channel_id INTEGER DEFAULT 0"); err != nil {
-		t.Fatal(err)
-	}
 	base := time.Date(2026, 8, 5, 12, 0, 0, 0, cstLocation).Unix()
 	if err := m.storeDB.Create(&StabilityProblemIngestState{BucketTs: base, Complete: true, CompletedAt: base + 60}).Error; err != nil {
 		t.Fatal(err)
 	}
 	for _, createdAt := range []int64{base + 5*60, base + 25*60} {
 		if _, err := m.prodDB.Exec(`INSERT INTO logs
-			(user_id,created_at,type,model_name,`+"`group`"+`,channel_id,content)
-			VALUES (1,?,5,'gpt-test','codex',33,'status_code=503, catchup')`, createdAt); err != nil {
+			(user_id,created_at,type,model_name,`+"`group`"+`,channel_id,content,request_id)
+			VALUES (1,?,5,'gpt-test','codex',33,'status_code=503, catchup','user-request')`, createdAt); err != nil {
 			t.Fatal(err)
 		}
 	}
 	// 调度器当前窗口是 20~30 分钟，但上一次覆盖只到第 1 分钟。
-	// 本轮应从第 1 分钟连续追赶一个等长窗口，不能跳到第 20 分钟。
+	// 每轮只允许追赶三个分钟；首轮必须从第 1 分钟连续推到第 4
+	// 分钟，而不是跳到第 20 分钟。第二轮再要捕获第 5 分钟的日志。
 	if _, err := m.sampleStabilityProblems(context.Background(), base+20*60, base+30*60); err != nil {
 		t.Fatal(err)
 	}
@@ -290,8 +356,25 @@ func TestStabilityProblemSamplerCatchesUpWithoutSkippingElapsedMinutes(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.CapturedTotal != 1 || !m.stabilityProblemNeedsCatchup(base+30*60) {
-		t.Fatalf("catch-up skipped or falsely completed elapsed range: %+v", result)
+	var cursor StabilityProblemLiveCursor
+	if err := m.storeDB.First(&cursor, 1).Error; err != nil {
+		t.Fatal(err)
+	}
+	if result.CapturedTotal != 0 || result.CoverageComplete || result.UncoveredMinutes != 26 ||
+		cursor.NextTs != base+4*60 || cursor.TargetThroughTs != base+30*60 ||
+		!m.stabilityProblemNeedsCatchup(base+30*60) {
+		t.Fatalf("first bounded catch-up turn skipped or falsely completed elapsed range: result=%+v cursor=%+v", result, cursor)
+	}
+	if _, err := m.sampleStabilityProblems(context.Background(), base+20*60, base+30*60); err != nil {
+		t.Fatal(err)
+	}
+	result, err = m.queryStabilityProblems(context.Background(), stabilityScope{FromTs: base, ToTs: base + 30*60}, 50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.CapturedTotal != 1 || result.CoverageComplete || result.UncoveredMinutes != 23 ||
+		!m.stabilityProblemNeedsCatchup(base+30*60) {
+		t.Fatalf("second bounded catch-up turn did not capture the next contiguous log: %+v", result)
 	}
 	var currentMinute int64
 	if err := m.storeDB.Model(&StabilityProblemIngestState{}).Where("bucket_ts = ?", base+25*60).Count(&currentMinute).Error; err != nil {
@@ -299,6 +382,319 @@ func TestStabilityProblemSamplerCatchesUpWithoutSkippingElapsedMinutes(t *testin
 	}
 	if currentMinute != 0 {
 		t.Fatal("current window was sampled before the older gap was covered")
+	}
+}
+
+func TestStabilityProblemLiveCursorSurvivesLongGapAndAtomicReset(t *testing.T) {
+	m := newStabilityTestMonitor(t)
+	m.prodDB = newFakeProdDB(t)
+	base := time.Date(2026, 8, 5, 13, 0, 0, 0, cstLocation).Unix()
+	for _, createdAt := range []int64{base + 2*60 + 1, base + 25*60 + 1} {
+		if _, err := m.prodDB.Exec(`INSERT INTO logs
+			(user_id,created_at,type,model_name,`+"`group`"+`,channel_id,content,request_id)
+			VALUES (1,?,5,'gpt-test','codex',33,'status_code=503 durable live cursor','customer')`, createdAt); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := m.sampleStabilityProblems(context.Background(), base, base+60); err != nil {
+		t.Fatal(err)
+	}
+	// Simulate process-local state loss. The next call presents only the current
+	// rolling window, but the durable cursor must resume the preceding 20-minute
+	// gap instead of jumping to it.
+	m.problemLiveThrough.Store(0)
+	m.problemLastSuccess.Store(0)
+	if _, err := m.sampleStabilityProblems(context.Background(), base+20*60, base+30*60); err != nil {
+		t.Fatal(err)
+	}
+	var cursor StabilityProblemLiveCursor
+	if err := m.storeDB.First(&cursor, 1).Error; err != nil {
+		t.Fatal(err)
+	}
+	if cursor.NextTs != base+4*60 || cursor.TargetThroughTs != base+30*60 || cursor.Status != "running" {
+		t.Fatalf("durable live cursor skipped or falsely caught up: %+v", cursor)
+	}
+	var oldRows, futureRows int64
+	if err := m.storeDB.Model(&StabilityProblemSample{}).Where("bucket_ts = ?", base+2*60).Count(&oldRows).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := m.storeDB.Model(&StabilityProblemSample{}).Where("bucket_ts = ?", base+25*60).Count(&futureRows).Error; err != nil {
+		t.Fatal(err)
+	}
+	if oldRows != 1 || futureRows != 0 {
+		t.Fatalf("live cursor sampled out of order: old=%d future=%d", oldRows, futureRows)
+	}
+}
+
+func TestStabilityProblemMigrationAdaptiveBackoffPauseAndRetry(t *testing.T) {
+	m := newStabilityTestMonitor(t)
+	m.cfg.StabilityClassificationMigrationEnabled = true
+	base := time.Date(2026, 2, 1, 0, 0, 0, 0, cstLocation).Unix()
+	state := StabilityProblemClassificationMigration{
+		ID: 1, TrafficClassVersion: userTrafficClassificationVersion,
+		FromTs: base, ThroughTs: base + 12*60, NextTs: base, Status: "running",
+		CurrentSpanMinutes: 12, CreatedAt: base, UpdatedAt: base,
+	}
+	if err := m.storeDB.Create(&state).Error; err != nil {
+		t.Fatal(err)
+	}
+	for attempt := 1; attempt <= 5; attempt++ {
+		if err := m.storeDB.First(&state, 1).Error; err != nil {
+			t.Fatal(err)
+		}
+		now := base + int64(attempt)*100
+		_ = m.recordStabilityProblemMigrationFailure(&state, context.DeadlineExceeded, now)
+		if err := m.storeDB.First(&state, 1).Error; err != nil {
+			t.Fatal(err)
+		}
+		if state.Attempts != attempt {
+			t.Fatalf("attempt=%d state=%+v", attempt, state)
+		}
+		if attempt == 1 && state.CurrentSpanMinutes != 6 || attempt == 2 && state.CurrentSpanMinutes != 3 ||
+			attempt >= 3 && state.CurrentSpanMinutes != 1 {
+			t.Fatalf("adaptive span did not shrink at attempt %d: %+v", attempt, state)
+		}
+	}
+	if state.Status != "paused" || state.NextRetryAt != 0 {
+		t.Fatalf("five source-window failures must pause cold migration: %+v", state)
+	}
+	retried, err := m.retryStabilityProblemMigration(time.Unix(base+1000, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if retried.Status != "queued" || retried.Attempts != 0 || retried.CurrentSpanMinutes != 1 || retried.NextRetryAt != 0 {
+		t.Fatalf("root retry did not resume from the safest span: %+v", retried)
+	}
+}
+
+func TestStabilityProblemLiveFailureBackoffPersistsAndClearsOnProgress(t *testing.T) {
+	m := newStabilityTestMonitor(t)
+	m.prodDB = newFakeProdDB(t)
+	now := time.Now().Unix()
+	base := now/60*60 - 10*60
+	cursor := StabilityProblemLiveCursor{
+		ID: 1, TrafficClassVersion: userTrafficClassificationVersion,
+		NextTs: base, TargetThroughTs: base + 60, Status: "running", UpdatedAt: now,
+	}
+	if err := m.storeDB.Create(&cursor).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	m.recordStabilityProblemLiveFailure(&cursor, context.DeadlineExceeded, now)
+	var stored StabilityProblemLiveCursor
+	if err := m.storeDB.First(&stored, 1).Error; err != nil {
+		t.Fatal(err)
+	}
+	if stored.Attempts != 1 || stored.NextRetryAt != now+60 || stored.LastFailureAt != now {
+		t.Fatalf("live failure did not persist its retry fence: %+v", stored)
+	}
+	m.recordStabilityProblemLiveFailure(&stored, fmt.Errorf("%w: busy", errStabilityProblemSourceGateWait), now+1)
+	var afterGate StabilityProblemLiveCursor
+	if err := m.storeDB.First(&afterGate, 1).Error; err != nil {
+		t.Fatal(err)
+	}
+	if afterGate.Attempts != 1 || afterGate.NextRetryAt != now+60 {
+		t.Fatalf("protected gate wait consumed a live attempt: %+v", afterGate)
+	}
+	if _, err := m.sampleStabilityProblems(context.Background(), base, base+60); !errors.Is(err, errStabilityProblemLiveBackoff) {
+		t.Fatalf("restart-visible retry fence was ignored: %v", err)
+	}
+
+	if err := m.storeDB.Create(&StabilityProblemIngestState{
+		BucketTs: base, TrafficClassVersion: userTrafficClassificationVersion, Complete: true,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	afterGate.NextRetryAt = 0
+	if err := m.storeDB.Model(&StabilityProblemLiveCursor{}).Where("id = ?", 1).Update("next_retry_at", 0).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := m.advanceStabilityProblemLiveCursor(&afterGate, 60, now+61, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.storeDB.First(&stored, 1).Error; err != nil {
+		t.Fatal(err)
+	}
+	if stored.Attempts != 0 || stored.NextRetryAt != 0 || stored.LastFailureAt != 0 || stored.LastError != "" {
+		t.Fatalf("successful live progress did not clear backoff: %+v", stored)
+	}
+}
+
+func TestStabilityProblemMigrationEstimateUsesDurableProgress(t *testing.T) {
+	now := int64(10_000)
+	state := StabilityProblemClassificationMigration{
+		FromTs: 1_000, ThroughTs: 8_200, NextTs: 4_600,
+		CreatedAt: now - 3_600, LastSuccessAt: now - 10,
+	}
+	estimated, status, rate, sample := stabilityProblemMigrationEstimate(state, "running", now)
+	if estimated == nil || *estimated != 3_600 || status != "observed" || sample != 3_600 || math.Abs(rate-1.0/60.0) > 0.000001 {
+		t.Fatalf("durable ETA mismatch: estimated=%v status=%q rate=%f sample=%d", estimated, status, rate, sample)
+	}
+	state.NextRetryAt = now + 60
+	if estimated, status, _, _ := stabilityProblemMigrationEstimate(state, "running", now); estimated != nil || status != "backoff" {
+		t.Fatalf("retry wait must not publish a false ETA: estimated=%v status=%q", estimated, status)
+	}
+	state.NextRetryAt = 0
+	if estimated, status, _, _ := stabilityProblemMigrationEstimate(state, "paused_disabled", now); estimated != nil || status != "blocked" {
+		t.Fatalf("disabled incomplete migration must be blocked: estimated=%v status=%q", estimated, status)
+	}
+	state.NextTs = state.ThroughTs
+	if estimated, status, _, _ := stabilityProblemMigrationEstimate(state, "complete", now); estimated == nil || *estimated != 0 || status != "complete" {
+		t.Fatalf("complete migration ETA mismatch: estimated=%v status=%q", estimated, status)
+	}
+}
+
+func TestStabilityProblemMigrationWorkerDoesNotWaitForMainSamplerTick(t *testing.T) {
+	m := newStabilityTestMonitor(t)
+	m.prodDB = newFakeProdDB(t)
+	m.cfg.StabilityClassificationMigrationEnabled = true
+	m.cfg.StabilityBackfillDelayMS = -1
+	m.cfg.BackgroundSourceMinStartIntervalMS = -1
+	base := time.Date(2026, 2, 1, 0, 0, 0, 0, cstLocation).Unix()
+	now := time.Now().Unix()
+	if err := m.storeDB.Create(&StabilityProblemClassificationMigration{
+		ID: 1, TrafficClassVersion: userTrafficClassificationVersion,
+		FromTs: base, ThroughTs: base + 60, NextTs: base, Status: "running",
+		CurrentSpanMinutes: 1, CreatedAt: now, UpdatedAt: now,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	m.problemLastSuccess.Store(now)
+	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
+	defer cancel()
+	started := time.Now()
+	m.runStabilityProblemMigrationLoop(ctx)
+	if elapsed := time.Since(started); elapsed >= 6*time.Second {
+		t.Fatalf("cold worker remained tied to the main sampler tick: elapsed=%s", elapsed)
+	}
+	var state StabilityProblemClassificationMigration
+	if err := m.storeDB.First(&state, 1).Error; err != nil {
+		t.Fatal(err)
+	}
+	if state.Status != "complete" || state.NextTs != base+60 {
+		t.Fatalf("dedicated low-priority worker did not finish bounded window: %+v", state)
+	}
+}
+
+func TestStabilityProblemMigrationGateWaitDoesNotConsumeAttempt(t *testing.T) {
+	m := newStabilityTestMonitor(t)
+	base := time.Now().Unix()
+	state := StabilityProblemClassificationMigration{
+		ID: 1, TrafficClassVersion: userTrafficClassificationVersion,
+		FromTs: base - 600, ThroughTs: base, NextTs: base - 600, Status: "running",
+		CurrentSpanMinutes: 3, Attempts: 4, CreatedAt: base - 1000, UpdatedAt: base - 100,
+	}
+	if err := m.storeDB.Create(&state).Error; err != nil {
+		t.Fatal(err)
+	}
+	cause := fmt.Errorf("%w: deadline", errStabilityProblemSourceGateWait)
+	_ = m.recordStabilityProblemMigrationFailure(&state, cause, base)
+	if err := m.storeDB.First(&state, 1).Error; err != nil {
+		t.Fatal(err)
+	}
+	if state.Attempts != 4 || state.Status == "paused" || state.CurrentSpanMinutes != 3 {
+		t.Fatalf("yielding at the source gate consumed a window failure: %+v", state)
+	}
+}
+
+func TestStabilityProblemLiveLanePreemptsIndependentColdMigration(t *testing.T) {
+	m := newStabilityTestMonitor(t)
+	m.prodDB = newFakeProdDB(t)
+	m.cfg.StabilityClassificationMigrationEnabled = true
+	m.cfg.StabilityBackfillDelayMS = -1
+	oldMinute := time.Date(2026, 2, 1, 3, 0, 0, 0, cstLocation).Unix()
+	liveMinute := time.Date(2026, 8, 17, 6, 0, 0, 0, cstLocation).Unix()
+	now := time.Now().Unix()
+	if err := m.storeDB.Create(&StabilityProblemClassificationMigration{
+		ID: 1, TrafficClassVersion: userTrafficClassificationVersion,
+		FromTs: oldMinute, ThroughTs: oldMinute + 60, NextTs: oldMinute,
+		Status: "running", CreatedAt: now, UpdatedAt: now,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := m.storeDB.Create(&StabilityProblemIngestState{
+		BucketTs: oldMinute, TrafficClassVersion: userTrafficClassificationVersion, Complete: false,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	for _, row := range []struct {
+		created int64
+		content string
+	}{{oldMinute + 1, "status_code=502 cold"}, {liveMinute + 1, "status_code=503 live"}} {
+		if _, err := m.prodDB.Exec(`INSERT INTO logs
+			(user_id,created_at,type,model_name,`+"`group`"+`,channel_id,content,request_id)
+			VALUES (1,?,5,'gpt-test','codex',33,?,'customer')`, row.created, row.content); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	m.problemLastSuccess.Store(777)
+	if _, err := m.sampleStabilityProblems(context.Background(), liveMinute, liveMinute+60); err != nil {
+		t.Fatal(err)
+	}
+	var liveRows, coldRows int64
+	if err := m.storeDB.Model(&StabilityProblemSample{}).Where("bucket_ts = ?", liveMinute).Count(&liveRows).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := m.storeDB.Model(&StabilityProblemSample{}).Where("bucket_ts = ?", oldMinute).Count(&coldRows).Error; err != nil {
+		t.Fatal(err)
+	}
+	if liveRows != 1 || coldRows != 0 || m.problemLiveThrough.Load() != liveMinute+60 {
+		t.Fatalf("cold cursor hijacked live lane: live=%d cold=%d through=%d", liveRows, coldRows, m.problemLiveThrough.Load())
+	}
+	var before StabilityProblemClassificationMigration
+	if err := m.storeDB.First(&before, 1).Error; err != nil || before.NextTs != oldMinute {
+		t.Fatalf("live lane advanced cold cursor: state=%+v err=%v", before, err)
+	}
+	liveSuccess := m.problemLastSuccess.Load()
+
+	if _, err := m.sampleStabilityProblemMigration(context.Background(), 60); err != nil {
+		t.Fatal(err)
+	}
+	var after StabilityProblemClassificationMigration
+	if err := m.storeDB.First(&after, 1).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := m.storeDB.Model(&StabilityProblemSample{}).Where("bucket_ts = ?", oldMinute).Count(&coldRows).Error; err != nil {
+		t.Fatal(err)
+	}
+	if after.Status != "complete" || after.NextTs != oldMinute+60 || coldRows != 1 {
+		t.Fatalf("cold migration did not advance independently: state=%+v rows=%d", after, coldRows)
+	}
+	if got := m.problemLastSuccess.Load(); got != liveSuccess {
+		t.Fatalf("cold migration manufactured live success: %d", got)
+	}
+}
+
+func TestStabilityProblemPendingUpgradeReplacesOldVersionCursorAndStage(t *testing.T) {
+	m := newStabilityTestMonitor(t)
+	bucket := time.Date(2026, 3, 1, 4, 0, 0, 0, cstLocation).Unix()
+	if err := m.storeDB.Create(&StabilityProblemIngestState{
+		BucketTs: bucket, TrafficClassVersion: userTrafficClassificationVersion - 1,
+		Complete: true, LastCreatedAt: bucket + 59, LastID: 99, RowsScanned: 5001,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := m.storeDB.Create(&StabilityProblemStage{
+		BucketTs: bucket, TrafficClassVersion: userTrafficClassificationVersion - 1,
+		Source: "newapi", SignatureHash: "old", ChannelID: 1, ModelName: "m", Grp: "g", Count: 1,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := m.ensureProblemWindowPending(bucket, bucket+60, time.Now().Unix()); err != nil {
+		t.Fatal(err)
+	}
+	var state StabilityProblemIngestState
+	if err := m.storeDB.First(&state, "bucket_ts = ?", bucket).Error; err != nil {
+		t.Fatal(err)
+	}
+	var stages int64
+	if err := m.storeDB.Model(&StabilityProblemStage{}).Where("bucket_ts = ?", bucket).Count(&stages).Error; err != nil {
+		t.Fatal(err)
+	}
+	if state.TrafficClassVersion != userTrafficClassificationVersion || state.Complete ||
+		state.LastCreatedAt != 0 || state.LastID != 0 || state.RowsScanned != 0 || stages != 0 {
+		t.Fatalf("old cursor/stage blocked v5 paging: state=%+v stages=%d", state, stages)
 	}
 }
 
@@ -403,12 +799,52 @@ func TestStabilityHealthRequiresFreshProblemCoverageWhenEnabled(t *testing.T) {
 		t.Fatal(err)
 	}
 	m.problemLastSuccess.Store(now)
+	m.problemLiveThrough.Store(bucket + 60)
 	if got := record(); got.Status != "ok" || got.ProblemCoverageTo != bucket+60 || got.ProblemSamplerAgeSec > 2 {
 		t.Fatalf("fresh complete problem coverage must be healthy: %+v", got)
 	}
 	m.problemLastSuccess.Store(now - 2000)
 	if got := record(); got.Status != "degraded" {
 		t.Fatalf("stale problem sampler must be degraded: %+v", got)
+	}
+}
+
+func TestStabilityHealthUsesDurableLiveLagAndDisabledMigrationState(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	m := newStabilityTestMonitor(t)
+	m.cfg.StabilityEnabled = true
+	m.cfg.StabilityProblemSampleSec = 300
+	m.cfg.SampleSeconds = 60
+	now := time.Now().Unix()
+	m.lastRun.Store(now)
+	cursor := StabilityProblemLiveCursor{
+		ID: 1, TrafficClassVersion: userTrafficClassificationVersion,
+		NextTs: now/60*60 - 30*60, TargetThroughTs: now/60*60 - 10*60,
+		Status: "running", LastSuccessAt: now, UpdatedAt: now,
+	}
+	if err := m.storeDB.Create(&cursor).Error; err != nil {
+		t.Fatal(err)
+	}
+	migration := StabilityProblemClassificationMigration{
+		ID: 1, TrafficClassVersion: userTrafficClassificationVersion,
+		FromTs: cursor.NextTs - 86400, ThroughTs: cursor.NextTs, NextTs: cursor.NextTs - 86400,
+		Status: "queued", CurrentSpanMinutes: 12, CreatedAt: now, UpdatedAt: now,
+	}
+	if err := m.storeDB.Create(&migration).Error; err != nil {
+		t.Fatal(err)
+	}
+	m.problemLastSuccess.Store(now)
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodGet, "/stability/health", nil)
+	m.serveStabilityHealth(c)
+	var got stabilityHealthResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != "degraded" || got.ProblemLiveLagSec != 20*60 || got.ProblemMigration.Status != "paused_disabled" {
+		t.Fatalf("fresh page success hid durable live/cold backlog: %+v", got)
 	}
 }
 
@@ -731,7 +1167,7 @@ func TestMonitorResponsiveShellAndWideTablesStayAdminOnly(t *testing.T) {
 		`monitor-table-scroll monitor-table-server"><table><thead id="thInst"`,
 		`monitor-table-scroll monitor-table-admin"><table><thead id="thGrp"`,
 		`monitor-table-scroll monitor-table-admin"><table><thead id="thUsr"`,
-		`function sizeUsageMatrix(table,dayCount)`,
+		`function sizeUsageMatrix(table,dayCount,users)`,
 	} {
 		if !strings.Contains(pageHTML, marker) {
 			t.Fatalf("Monitor 响应式布局缺少 %q", marker)

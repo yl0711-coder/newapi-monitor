@@ -31,8 +31,16 @@ import (
 
 func main() {
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo})))
-	_ = godotenv.Load() // 可选 .env
-	if err := run(); err != nil {
+	var err error
+	if len(os.Args) > 1 && os.Args[1] == "restore-pre-migration" {
+		err = runRestorePreMigrationCommand(os.Args[2:], os.Stdout)
+	} else if len(os.Args) > 1 && os.Args[1] == "restore-backup-set" {
+		err = runRestoreStoreBackupSetCommand(os.Args[2:], os.Stdout)
+	} else {
+		_ = godotenv.Load() // 仅服务启动可选读取 .env；恢复命令不读取应用配置/DSN。
+		err = run()
+	}
+	if err != nil {
 		slog.Error("monitor 已退出", "err", err)
 		os.Exit(1)
 	}

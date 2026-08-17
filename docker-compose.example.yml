@@ -2,9 +2,12 @@
 # 敏感值放 .env(已 gitignore),不要写死在本文件。生产建议前面放反代(nginx/Caddy)做 HTTPS。
 services:
   monitor:
-    image: ghcr.io/yl0711-coder/newapi-monitor:latest
+    # 必须固定到已验收的版本标签或 sha256 digest；禁止用 latest 让重启变成隐式升级。
+    image: ${MONITOR_IMAGE:?set an immutable tag or digest in .env}
     container_name: newapi-monitor
     restart: always
+    # HTTP 优雅关闭 5s + 来源 epoch 最长退场 20s，预留额外时间避免 SIGKILL/WAL 中断。
+    stop_grace_period: 40s
     ports:
       # 仅供同机 Nginx/Caddy 反代；不要直接把管理端或客户门户明文暴露到公网。
       - "127.0.0.1:8090:8090"
@@ -18,17 +21,58 @@ services:
       # 同机 Caddy/Nginx 的来源；若反代在容器/其他主机，请按实际网段修改。
       - MONITOR_TRUSTED_PROXIES=127.0.0.1,::1
       - MONITOR_STORE_PATH=/data/monitor.db
+      - MONITOR_USAGE_FACTS_STORE_PATH=/data/usage-facts.db
+      - MONITOR_STORE_BACKUP_ENABLED=true
+      - MONITOR_STORE_BACKUP_DIR=/backup
+      - MONITOR_STORE_BACKUP_INTERVAL_HOURS=24
+      - MONITOR_STORE_BACKUP_RETENTION=7
+      - MONITOR_STORE_MIGRATION_BACKUP_RETENTION=3
+      # 来源短暂断开时继续服务 SQLite；同一 MySQL 来源只允许一个 worker 实例。
+      - MONITOR_SOURCE_WORKER_ENABLED=true
+      - MONITOR_SOURCE_LEASE_REQUIRED=true
+      - MONITOR_SOURCE_LEASE_NAME=newapi-monitor-source-worker-v1
       - MONITOR_SAMPLE_SECONDS=60
       - MONITOR_RETENTION_DAYS=7
-      - MONITOR_BACKFILL_HOURS=24
+      - MONITOR_BACKFILL_HOURS=1
       - MONITOR_HOUR_RETENTION_DAYS=90
       - MONITOR_UPSTREAM_SYNC_MINUTES=5
       - MONITOR_UPSTREAM_SYNC_TIMEOUT_SECONDS=15
+      - MONITOR_UPSTREAM_USAGE_SYNC_MINUTES=30
+      - MONITOR_UPSTREAM_USAGE_BACKFILL_DAYS=90
+      # 生产示例固定 fail-closed：聚合页只读已发布 facts；首次补全期间返回
+      # 部分覆盖/暂不可用，不会回扫来源 logs。
+      - MONITOR_USAGE_FACTS_ENABLED=true
+      - MONITOR_USAGE_FACTS_READ_ENABLED=${MONITOR_USAGE_FACTS_READ_ENABLED:-true}
+      - MONITOR_USAGE_FACTS_FULL_HISTORY_ENABLED=true
+      - MONITOR_USAGE_FACTS_HISTORY_SOURCE_MODE=${MONITOR_USAGE_FACTS_HISTORY_SOURCE_MODE:?DBA must attest complete source in .env}
+      - MONITOR_USAGE_FACTS_HISTORY_SOURCE_EPOCH=${MONITOR_USAGE_FACTS_HISTORY_SOURCE_EPOCH:?set the DBA-signed source epoch in .env}
+      - MONITOR_USAGE_FACTS_HISTORY_DELAY_MS=30000
+      - MONITOR_USAGE_FACTS_HISTORY_SOURCE_DUTY_PERCENT=20
+      - MONITOR_USAGE_FACTS_HISTORY_MAX_DISK_USED_PERCENT=80
+      - MONITOR_USAGE_FACTS_HISTORY_MIN_FREE_BYTES=2147483648
+      - MONITOR_USAGE_FACTS_CLASSIFICATION_MIGRATION_ENABLED=${MONITOR_USAGE_FACTS_CLASSIFICATION_MIGRATION_ENABLED:-false}
+      # 有限窗口兼容参数；FULL_HISTORY=true 时不作为来源历史起点。
+      - MONITOR_USAGE_FACTS_BACKFILL_DAYS=90
+      - MONITOR_USAGE_FACTS_RETENTION_DAYS=400
+      - MONITOR_USAGE_FACTS_HOUR_RETENTION_DAYS=8
+      - MONITOR_USAGE_FACTS_SYNC_MINUTES=5
+      - MONITOR_USAGE_FACTS_PROFILE_SYNC_MINUTES=5
+      - MONITOR_USAGE_FACTS_BACKFILL_DELAY_MS=15000
+      - MONITOR_USAGE_FACTS_QUERY_TIMEOUT_SECONDS=20
+      - MONITOR_USAGE_FACTS_LAG_MINUTES=10
+      - MONITOR_USAGE_FACTS_RECONCILE_MINUTES=30
       - MONITOR_STABILITY_ENABLED=true
       - MONITOR_STABILITY_QUERY_MAX_DAYS=90
       - MONITOR_STABILITY_RETENTION_DAYS=181
       - MONITOR_STABILITY_PROBLEM_SAMPLE_SECONDS=300
       - MONITOR_STABILITY_BACKFILL_ENABLED=true
+      # 生产安全参数必须显式固定，不依赖代码默认值，便于与本机验收逐项对照。
+      - MONITOR_BACKGROUND_SOURCE_MIN_START_INTERVAL_MS=2000
+      - MONITOR_STABILITY_BACKFILL_SERVER_MAX_EXECUTION_MS=8000
+      - MONITOR_STABILITY_BACKFILL_SOURCE_DUTY_PERCENT=20
+      - MONITOR_STABILITY_AUTO_REPAIR=true
+      # 数千小时的分类迁移只能在完成 2h/24h 维护窗 pilot 后显式开启。
+      - MONITOR_STABILITY_CLASSIFICATION_MIGRATION_ENABLED=false
       # 可选:
       # Nginx 入口旁路默认保持关闭；两个节点的脱敏日志和采集器验收后再同时取消下列注释。
       # - MONITOR_INGEST_TOKEN=${MONITOR_INGEST_TOKEN:?set in .env}
@@ -45,6 +89,7 @@ services:
       - TZ=Asia/Shanghai
     volumes:
       - monitor_data:/data
+      - monitor_backup:/backup
     # 除持久化 /data 和有界 /tmp 外，运行层不可写。
     read_only: true
     tmpfs:
@@ -61,7 +106,8 @@ services:
         max-size: "50m"
         max-file: "3"
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8090/health"]
+      # 容器自愈只看进程存活，避免 MySQL 短断触发重启风暴；切流单独验 /ready。
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8090/live"]
       interval: 30s
       timeout: 5s
       retries: 3
@@ -69,3 +115,8 @@ services:
 
 volumes:
   monitor_data:
+    external: true
+    name: ${MONITOR_DATA_VOLUME:?pre-create and set MONITOR_DATA_VOLUME in .env}
+  monitor_backup:
+    external: true
+    name: ${MONITOR_BACKUP_VOLUME:?pre-create and set MONITOR_BACKUP_VOLUME in .env}

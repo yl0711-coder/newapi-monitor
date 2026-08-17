@@ -31,11 +31,12 @@ const (
 	upstreamProviderNewAPI  = "newapi"
 	upstreamProviderSub2API = "sub2api"
 
-	upstreamStatusPending   = "pending"
-	upstreamStatusOK        = "ok"
-	upstreamStatusError     = "error"
-	upstreamStatusReconnect = "reconnect"
-	upstreamStatusDisabled  = "disabled"
+	upstreamStatusPending     = "pending"
+	upstreamStatusOK          = "ok"
+	upstreamStatusError       = "error"
+	upstreamStatusReconnect   = "reconnect"
+	upstreamStatusDisabled    = "disabled"
+	upstreamStatusUnsupported = "unsupported"
 
 	maxChannelUpstreamBody    = 32 << 10
 	maxUpstreamResponseBody   = 1 << 20
@@ -69,36 +70,85 @@ type ChannelUpstreamAccount struct {
 	CreatedAt         int64   `gorm:"column:created_at"`
 	UpdatedAt         int64   `gorm:"column:updated_at;index"`
 	UpdatedBy         string  `gorm:"size:128;column:updated_by"`
+	// 使用日志同步必须由管理员显式打开。它和余额快照独立：余额可用于预警，
+	// 使用日志才可用于某个日期范围内的上游消费汇总。
+	UsageSyncEnabled      bool   `gorm:"column:usage_sync_enabled"`
+	UsageStatus           string `gorm:"size:24;column:usage_status"`
+	UsageLastError        string `gorm:"size:512;column:usage_last_error"`
+	UsageLastAttemptAt    int64  `gorm:"column:usage_last_attempt_at"`
+	UsageLastSuccessAt    int64  `gorm:"column:usage_last_success_at;index"`
+	UsageNextSyncAt       int64  `gorm:"column:usage_next_sync_at;index"`
+	UsageConsecutiveFails int    `gorm:"column:usage_consecutive_fails"`
+	// 当天尾部刷新与历史回填分别退避。历史某一天异常不能拖慢当天数据，
+	// 也不能在每次尾部刷新时无节制重试同一个高流量窗口。
+	UsageBackfillLastAttemptAt    int64  `gorm:"column:usage_backfill_last_attempt_at"`
+	UsageBackfillLastSuccessAt    int64  `gorm:"column:usage_backfill_last_success_at"`
+	UsageBackfillNextSyncAt       int64  `gorm:"column:usage_backfill_next_sync_at;index"`
+	UsageBackfillConsecutiveFails int    `gorm:"column:usage_backfill_consecutive_fails"`
+	UsageBackfillLastError        string `gorm:"size:512;column:usage_backfill_last_error"`
+	// UsageBackfillCursor 是尚待补齐的自然日（CST）起点；0 表示初始化。
+	// UsageBackfillDone 只说明配置范围内的历史已完成，不表示今天的实时性。
+	UsageBackfillCursor int64 `gorm:"column:usage_backfill_cursor"`
+	UsageBackfillDone   bool  `gorm:"column:usage_backfill_done"`
+	UsageDataUntil      int64 `gorm:"column:usage_data_until"`
+}
+
+// ChannelUpstreamUsageHour 是上游账户日志按小时的本地脱敏汇总。
+// 不保留 API Key、Cookie、请求体、响应体、用户内容或远端原始日志 ID；页面按日期范围
+// 仅查询这里，绝不因用户刷新而访问上游。按小时重算能处理上游延迟入库而不依赖不可靠的
+// 跨版本日志 ID 去重。
+type ChannelUpstreamUsageHour struct {
+	Domain    string  `gorm:"primaryKey;size:253;column:domain"`
+	HourTs    int64   `gorm:"primaryKey;column:hour_ts"`
+	Requests  int64   `gorm:"column:requests"`
+	Tokens    int64   `gorm:"column:tokens"`
+	Quota     float64 `gorm:"column:quota"`
+	CostUSD   float64 `gorm:"column:cost_usd"`
+	FetchedAt int64   `gorm:"column:fetched_at;index"`
+	Provider  string  `gorm:"size:24;column:provider"`
 }
 
 // ChannelUpstreamAccountView 是渠道管理页可见的脱敏状态。
 type ChannelUpstreamAccountView struct {
-	Configured    bool                              `json:"configured"`
-	Enabled       bool                              `json:"enabled"`
-	Provider      string                            `json:"provider,omitempty"`
-	ProviderName  string                            `json:"provider_name,omitempty"`
-	BaseURL       string                            `json:"base_url,omitempty"`
-	AccountMasked string                            `json:"account_masked,omitempty"`
-	BalanceUSD    *float64                          `json:"balance_usd,omitempty"`
-	Currency      string                            `json:"currency,omitempty"`
-	UnitAssumed   bool                              `json:"unit_assumed,omitempty"`
-	Status        string                            `json:"status,omitempty"`
-	LastError     string                            `json:"last_error,omitempty"`
-	LastAttemptAt int64                             `json:"last_attempt_at,omitempty"`
-	LastSuccessAt int64                             `json:"last_success_at,omitempty"`
-	NextSyncAt    int64                             `json:"next_sync_at,omitempty"`
-	Assessment    *ChannelUpstreamBalanceAssessment `json:"assessment,omitempty"`
+	Configured                    bool                              `json:"configured"`
+	Enabled                       bool                              `json:"enabled"`
+	Provider                      string                            `json:"provider,omitempty"`
+	ProviderName                  string                            `json:"provider_name,omitempty"`
+	BaseURL                       string                            `json:"base_url,omitempty"`
+	AccountMasked                 string                            `json:"account_masked,omitempty"`
+	BalanceUSD                    *float64                          `json:"balance_usd,omitempty"`
+	Currency                      string                            `json:"currency,omitempty"`
+	UnitAssumed                   bool                              `json:"unit_assumed,omitempty"`
+	Status                        string                            `json:"status,omitempty"`
+	LastError                     string                            `json:"last_error,omitempty"`
+	LastAttemptAt                 int64                             `json:"last_attempt_at,omitempty"`
+	LastSuccessAt                 int64                             `json:"last_success_at,omitempty"`
+	NextSyncAt                    int64                             `json:"next_sync_at,omitempty"`
+	Assessment                    *ChannelUpstreamBalanceAssessment `json:"assessment,omitempty"`
+	UsageSyncEnabled              bool                              `json:"usage_sync_enabled,omitempty"`
+	UsageStatus                   string                            `json:"usage_status,omitempty"`
+	UsageLastError                string                            `json:"usage_last_error,omitempty"`
+	UsageLastSuccessAt            int64                             `json:"usage_last_success_at,omitempty"`
+	UsageNextSyncAt               int64                             `json:"usage_next_sync_at,omitempty"`
+	UsageDataUntil                int64                             `json:"usage_data_until,omitempty"`
+	UsageBackfillDone             bool                              `json:"usage_backfill_done,omitempty"`
+	UsageConsecutiveFails         int                               `json:"usage_consecutive_fails,omitempty"`
+	UsageBackfillLastSuccessAt    int64                             `json:"usage_backfill_last_success_at,omitempty"`
+	UsageBackfillNextSyncAt       int64                             `json:"usage_backfill_next_sync_at,omitempty"`
+	UsageBackfillConsecutiveFails int                               `json:"usage_backfill_consecutive_fails,omitempty"`
+	UsageBackfillLastError        string                            `json:"usage_backfill_last_error,omitempty"`
 }
 
 type channelUpstreamSaveInput struct {
-	Domain      string `json:"domain"`
-	Provider    string `json:"provider"`
-	BaseURL     string `json:"base_url"`
-	Enabled     *bool  `json:"enabled"`
-	UserID      int64  `json:"user_id"`
-	AccessToken string `json:"access_token"`
-	Email       string `json:"email"`
-	Password    string `json:"password"`
+	Domain           string `json:"domain"`
+	Provider         string `json:"provider"`
+	BaseURL          string `json:"base_url"`
+	Enabled          *bool  `json:"enabled"`
+	UserID           int64  `json:"user_id"`
+	AccessToken      string `json:"access_token"`
+	Email            string `json:"email"`
+	Password         string `json:"password"`
+	UsageSyncEnabled *bool  `json:"usage_sync_enabled"`
 }
 
 type channelUpstreamSyncInput struct {
@@ -106,13 +156,14 @@ type channelUpstreamSyncInput struct {
 }
 
 type channelUpstreamConfigView struct {
-	Domain   string                     `json:"domain"`
-	Provider string                     `json:"provider,omitempty"`
-	BaseURL  string                     `json:"base_url,omitempty"`
-	Enabled  bool                       `json:"enabled"`
-	UserID   int64                      `json:"user_id,omitempty"`
-	Email    string                     `json:"email,omitempty"`
-	Account  ChannelUpstreamAccountView `json:"account"`
+	Domain           string                     `json:"domain"`
+	Provider         string                     `json:"provider,omitempty"`
+	BaseURL          string                     `json:"base_url,omitempty"`
+	Enabled          bool                       `json:"enabled"`
+	UsageSyncEnabled bool                       `json:"usage_sync_enabled"`
+	UserID           int64                      `json:"user_id,omitempty"`
+	Email            string                     `json:"email,omitempty"`
+	Account          ChannelUpstreamAccountView `json:"account"`
 }
 
 type newAPICredential struct {
@@ -135,6 +186,7 @@ type upstreamBalanceResult struct {
 type upstreamHTTPError struct {
 	Status  int
 	Message string
+	RetryAt int64
 }
 
 func (e *upstreamHTTPError) Error() string {
@@ -143,6 +195,13 @@ func (e *upstreamHTTPError) Error() string {
 	}
 	return fmt.Sprintf("上游返回 HTTP %d：%s", e.Status, e.Message)
 }
+
+type upstreamStoredSyncError struct {
+	message string
+	retryAt int64
+}
+
+func (e *upstreamStoredSyncError) Error() string { return e.message }
 
 type upstreamAuthError struct{ err error }
 
@@ -168,6 +227,31 @@ func upstreamSyncMinutes(s Settings) int {
 		return 1440
 	}
 	return s.UpstreamSyncMinutes
+}
+
+func upstreamUsageSyncMinutes(s Settings) int {
+	minutes := s.UpstreamUsageSyncMinutes
+	if minutes <= 0 {
+		minutes = 30
+	}
+	if minutes < 15 {
+		minutes = 15
+	}
+	if minutes > 1440 {
+		minutes = 1440
+	}
+	return minutes
+}
+
+func upstreamUsageBackfillDays(s Settings) int {
+	days := s.UpstreamUsageBackfillDays
+	if days <= 0 {
+		days = 90
+	}
+	if days > 180 {
+		days = 180
+	}
+	return days
 }
 
 func upstreamSyncTimeout(s Settings) time.Duration {
@@ -255,6 +339,15 @@ func upstreamAccountView(row ChannelUpstreamAccount) ChannelUpstreamAccountView 
 		Currency:      "USD", UnitAssumed: row.UnitAssumed, Status: row.Status,
 		LastError: row.LastError, LastAttemptAt: row.LastAttemptAt,
 		LastSuccessAt: row.LastSuccessAt, NextSyncAt: row.NextSyncAt,
+		UsageSyncEnabled: row.UsageSyncEnabled, UsageStatus: row.UsageStatus,
+		UsageLastError: row.UsageLastError, UsageLastSuccessAt: row.UsageLastSuccessAt,
+		UsageNextSyncAt: row.UsageNextSyncAt,
+		UsageDataUntil:  row.UsageDataUntil, UsageBackfillDone: row.UsageBackfillDone,
+		UsageConsecutiveFails:         row.UsageConsecutiveFails,
+		UsageBackfillLastSuccessAt:    row.UsageBackfillLastSuccessAt,
+		UsageBackfillNextSyncAt:       row.UsageBackfillNextSyncAt,
+		UsageBackfillConsecutiveFails: row.UsageBackfillConsecutiveFails,
+		UsageBackfillLastError:        row.UsageBackfillLastError,
 	}
 	if row.BalanceKnown {
 		balance := row.BalanceUSD
@@ -291,12 +384,80 @@ func (m *Monitor) upstreamAEAD() (cipher.AEAD, error) {
 	if err != nil {
 		return nil, err
 	}
+	return upstreamAEADForSecret(secret)
+}
+
+func upstreamAEADForSecret(secret string) (cipher.AEAD, error) {
 	key := sha256.Sum256([]byte("newapi-monitor/channel-upstream/v1\x00" + secret))
 	block, err := aes.NewCipher(key[:])
 	if err != nil {
 		return nil, err
 	}
 	return cipher.NewGCM(block)
+}
+
+// migrateLegacyUpstreamCredentialEncryption preserves accounts created before
+// MONITOR_UPSTREAM_CREDENTIAL_SECRET was split from MONITOR_SESSION_SECRET.
+// A row already decryptable by the new key is left untouched. Otherwise the
+// complete set is decrypted with the legacy session key and re-sealed with the
+// new key in one SQLite transaction; any ambiguous/corrupt row aborts startup
+// instead of silently turning configured upstreams into reconnect state.
+func (m *Monitor) migrateLegacyUpstreamCredentialEncryption() error {
+	newSecret := strings.TrimSpace(m.cfg.UpstreamCredentialSecret)
+	legacySecret := strings.TrimSpace(m.cfg.SessionSecret)
+	if newSecret == "" || legacySecret == "" || newSecret == legacySecret || m.storeDB == nil {
+		return nil
+	}
+	newAEAD, err := upstreamAEADForSecret(newSecret)
+	if err != nil {
+		return err
+	}
+	legacyAEAD, err := upstreamAEADForSecret(legacySecret)
+	if err != nil {
+		return err
+	}
+	return m.storeDB.Transaction(func(tx *gorm.DB) error {
+		var rows []ChannelUpstreamAccount
+		if err := tx.Where("credential_version = ? AND credential <> ''", upstreamCredentialVersion).Find(&rows).Error; err != nil {
+			return err
+		}
+		for _, row := range rows {
+			payload, err := base64.RawURLEncoding.DecodeString(row.Credential)
+			if err != nil || len(payload) <= newAEAD.NonceSize() || newAEAD.NonceSize() != legacyAEAD.NonceSize() {
+				return fmt.Errorf("上游 %s 的凭据密文无效，拒绝自动换钥", row.Domain)
+			}
+			aad := upstreamCredentialAAD(row.Domain, row.Provider)
+			if _, err := newAEAD.Open(nil, payload[:newAEAD.NonceSize()], payload[newAEAD.NonceSize():], aad); err == nil {
+				continue
+			}
+			plain, err := legacyAEAD.Open(nil, payload[:legacyAEAD.NonceSize()], payload[legacyAEAD.NonceSize():], aad)
+			if err != nil {
+				return fmt.Errorf("上游 %s 的凭据既不能用新密钥也不能用旧会话密钥解密，拒绝启动", row.Domain)
+			}
+			nonce := make([]byte, newAEAD.NonceSize())
+			if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
+				return err
+			}
+			sealed := newAEAD.Seal(nil, nonce, plain, aad)
+			for i := range plain {
+				plain[i] = 0
+			}
+			rotated := make([]byte, 0, len(nonce)+len(sealed))
+			rotated = append(rotated, nonce...)
+			rotated = append(rotated, sealed...)
+			encoded := base64.RawURLEncoding.EncodeToString(rotated)
+			result := tx.Model(&ChannelUpstreamAccount{}).
+				Where("domain = ? AND credential = ?", row.Domain, row.Credential).
+				Updates(map[string]any{"credential": encoded, "updated_at": time.Now().Unix()})
+			if result.Error != nil {
+				return result.Error
+			}
+			if result.RowsAffected != 1 {
+				return fmt.Errorf("上游 %s 凭据换钥发生并发修改，拒绝提交", row.Domain)
+			}
+		}
+		return nil
+	})
 }
 
 func upstreamCredentialAAD(domain, provider string) []byte {
@@ -390,11 +551,12 @@ func newUpstreamHTTPClient(timeout time.Duration) *http.Client {
 }
 
 func (m *Monitor) channelUpstreamHTTPClient() *http.Client {
-	if m.upstreamClient != nil {
-		return m.upstreamClient
+	client := m.upstreamClient
+	if client == nil {
+		// 仅兼容直接构造 Monitor 的单元测试；生产实例均由 New 初始化并复用连接池。
+		client = newUpstreamHTTPClient(upstreamSyncTimeout(m.cfg))
 	}
-	// 仅兼容直接构造 Monitor 的单元测试；生产实例均由 New 初始化并复用连接池。
-	return newUpstreamHTTPClient(upstreamSyncTimeout(m.cfg))
+	return installUpstreamHostGuard(client, m.storeDB)
 }
 
 func upstreamResponseMessage(body []byte) string {
@@ -451,7 +613,11 @@ func doUpstreamJSON(ctx context.Context, client *http.Client, method, endpoint s
 		return nil, fmt.Errorf("上游响应超过安全上限")
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, &upstreamHTTPError{Status: resp.StatusCode, Message: upstreamResponseMessage(data)}
+		retryAt := int64(0)
+		if resp.StatusCode == http.StatusTooManyRequests {
+			retryAt = parseUpstreamRetryAfter(resp.Header.Get("Retry-After"), time.Now()).Unix()
+		}
+		return nil, &upstreamHTTPError{Status: resp.StatusCode, Message: upstreamResponseMessage(data), RetryAt: retryAt}
 	}
 	return data, nil
 }
@@ -721,7 +887,9 @@ func nextUpstreamSyncAt(s Settings, domain string, now int64, failures int) int6
 	}
 	var jitter int64
 	if jitterMax > 0 {
-		jitter = int64(hash[0])%(jitterMax*2+1) - jitterMax
+		// The configured interval is a safety floor. Jitter may spread due
+		// accounts later, but must never make an upstream request due early.
+		jitter = int64(hash[0]) % (jitterMax + 1)
 	}
 	return now + base + jitter
 }
@@ -746,10 +914,14 @@ func applyUpstreamSyncResult(row *ChannelUpstreamAccount, result upstreamBalance
 	var authErr *upstreamAuthError
 	if errors.As(err, &authErr) {
 		row.Status = upstreamStatusReconnect
+		row.NextSyncAt = upstreamAccountIsolatedUntil
 	} else {
 		row.Status = upstreamStatusError
+		row.NextSyncAt = nextUpstreamSyncAt(s, row.Domain, now, row.ConsecutiveFails)
 	}
-	row.NextSyncAt = nextUpstreamSyncAt(s, row.Domain, now, row.ConsecutiveFails)
+	if retryAt := upstreamRetryAt(err); retryAt > row.NextSyncAt {
+		row.NextSyncAt = retryAt
+	}
 }
 
 func (m *Monitor) credentialForAccount(row ChannelUpstreamAccount) (any, error) {
@@ -801,7 +973,7 @@ func (m *Monitor) syncStoredUpstreamAccount(ctx context.Context, domain string) 
 		if persistErr := m.persistUpstreamAccount(ctx, &row); persistErr != nil {
 			return row, persistErr
 		}
-		return row, errors.New(row.LastError)
+		return row, &upstreamStoredSyncError{message: row.LastError}
 	}
 	originalSecrets := upstreamCredentialSecrets(credential)
 	var result upstreamBalanceResult
@@ -813,7 +985,7 @@ func (m *Monitor) syncStoredUpstreamAccount(ctx context.Context, domain string) 
 		return row, persistErr
 	}
 	if err != nil {
-		return row, errors.New(row.LastError)
+		return row, &upstreamStoredSyncError{message: row.LastError, retryAt: upstreamRetryAt(err)}
 	}
 	return row, nil
 }
@@ -877,7 +1049,7 @@ func (m *Monitor) getChannelUpstreamHandler(c *gin.Context) {
 	}
 	view := channelUpstreamConfigView{
 		Domain: domain, Provider: row.Provider, BaseURL: row.BaseURL, Enabled: row.Enabled,
-		UserID: row.UserID, Account: upstreamAccountView(row),
+		UsageSyncEnabled: row.UsageSyncEnabled, UserID: row.UserID, Account: upstreamAccountView(row),
 	}
 	if row.Provider == upstreamProviderSub2API {
 		view.Email = row.Account
@@ -939,8 +1111,14 @@ func (m *Monitor) saveChannelUpstreamHandler(c *gin.Context) {
 		// 必须等 provider/base URL/账号全部确认相同后才能继承。
 		row.CreatedAt = existing.CreatedAt
 	}
+	if in.UsageSyncEnabled != nil {
+		row.UsageSyncEnabled = *in.UsageSyncEnabled
+	} else if existingErr == nil {
+		row.UsageSyncEnabled = existing.UsageSyncEnabled
+	}
 	var credential any
 	preserveSealedCredential := false
+	credentialUpdated := in.AccessToken != "" || in.Password != ""
 	sameIdentity := existingErr == nil && existing.Provider == in.Provider && existing.BaseURL == in.BaseURL
 	switch in.Provider {
 	case upstreamProviderNewAPI:
@@ -976,6 +1154,29 @@ func (m *Monitor) saveChannelUpstreamHandler(c *gin.Context) {
 		row.BalanceUSD, row.BalanceKnown, row.BalanceRaw = existing.BalanceUSD, existing.BalanceKnown, existing.BalanceRaw
 		row.BalanceUnit, row.UnitAssumed = existing.BalanceUnit, existing.UnitAssumed
 		row.LastSuccessAt = existing.LastSuccessAt
+		row.UsageStatus, row.UsageLastError = existing.UsageStatus, existing.UsageLastError
+		row.UsageLastAttemptAt, row.UsageLastSuccessAt = existing.UsageLastAttemptAt, existing.UsageLastSuccessAt
+		row.UsageNextSyncAt, row.UsageBackfillCursor, row.UsageBackfillDone, row.UsageDataUntil = existing.UsageNextSyncAt, existing.UsageBackfillCursor, existing.UsageBackfillDone, existing.UsageDataUntil
+		row.UsageConsecutiveFails = existing.UsageConsecutiveFails
+		row.UsageBackfillLastAttemptAt, row.UsageBackfillLastSuccessAt = existing.UsageBackfillLastAttemptAt, existing.UsageBackfillLastSuccessAt
+		row.UsageBackfillNextSyncAt, row.UsageBackfillConsecutiveFails = existing.UsageBackfillNextSyncAt, existing.UsageBackfillConsecutiveFails
+		row.UsageBackfillLastError = existing.UsageBackfillLastError
+		// A 401/403 deliberately isolates automatic usage requests until an
+		// administrator supplies credentials again. Saving a replacement secret
+		// for the same account is that explicit recovery action: retain all local
+		// usage/cursor state, but make tail and history eligible to run again.
+		usageAuthIsolated := existing.UsageStatus == upstreamStatusReconnect ||
+			existing.UsageNextSyncAt == upstreamAccountIsolatedUntil ||
+			existing.UsageBackfillNextSyncAt == upstreamAccountIsolatedUntil
+		if credentialUpdated && row.UsageSyncEnabled && usageAuthIsolated {
+			row.UsageStatus, row.UsageLastError = upstreamStatusPending, ""
+			row.UsageNextSyncAt, row.UsageConsecutiveFails = 0, 0
+			row.UsageBackfillNextSyncAt, row.UsageBackfillConsecutiveFails = 0, 0
+			row.UsageBackfillLastError = ""
+		}
+	}
+	if !row.UsageSyncEnabled {
+		row.UsageStatus, row.UsageNextSyncAt = upstreamStatusDisabled, 0
 	}
 	// 密码从这里起不再被引用；它从未进入持久化模型、日志或响应。
 	in.Password = ""
@@ -996,6 +1197,14 @@ func (m *Monitor) saveChannelUpstreamHandler(c *gin.Context) {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "保存上游配置失败"})
 			return
 		}
+		// 账户身份变更后，即使管理员先将账户停用再保存，也不能继续保留
+		// 旧账户的本地小时汇总；它们不再属于当前主域名配置。
+		if existingErr == nil && !sameIdentity {
+			if clearErr := m.storeDB.WithContext(ctx).Where("domain = ?", row.Domain).Delete(&ChannelUpstreamUsageHour{}).Error; clearErr != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "保存账户后清理旧使用汇总失败"})
+				return
+			}
+		}
 		c.JSON(http.StatusOK, gin.H{"account": upstreamAccountView(row)})
 		return
 	}
@@ -1009,6 +1218,14 @@ func (m *Monitor) saveChannelUpstreamHandler(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "保存上游配置失败"})
 		return
 	}
+	// 更换 provider、站点或账户后，旧账户的脱敏小时汇总不能再归因给新账户。
+	// 这里只清理 Monitor 本地汇总，绝不修改主站或上游数据。
+	if existingErr == nil && !sameIdentity {
+		if clearErr := m.storeDB.WithContext(ctx).Where("domain = ?", row.Domain).Delete(&ChannelUpstreamUsageHour{}).Error; clearErr != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "保存账户后清理旧使用汇总失败"})
+			return
+		}
+	}
 	response := gin.H{"account": upstreamAccountView(row)}
 	if syncErr != nil {
 		response["sync_error"] = row.LastError
@@ -1016,7 +1233,9 @@ func (m *Monitor) saveChannelUpstreamHandler(c *gin.Context) {
 	c.JSON(http.StatusOK, response)
 }
 
-func (m *Monitor) syncChannelUpstreamHandler(c *gin.Context) {
+type channelUpstreamSyncOperation func(context.Context, string) (ChannelUpstreamAccount, error)
+
+func (m *Monitor) serveChannelUpstreamSync(c *gin.Context, timeout time.Duration, operation channelUpstreamSyncOperation, emptyResultError string, lastError func(ChannelUpstreamAccount) string) {
 	if c.Request.ContentLength > maxChannelUpstreamBody {
 		c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "请求内容过大"})
 		return
@@ -1028,25 +1247,38 @@ func (m *Monitor) syncChannelUpstreamHandler(c *gin.Context) {
 		return
 	}
 	in.Domain = strings.ToLower(strings.TrimSpace(in.Domain))
-	ctx, cancel := context.WithTimeout(c.Request.Context(), upstreamSyncTimeout(m.cfg)+3*time.Second)
+	ctx, cancel := context.WithTimeout(c.Request.Context(), timeout)
 	defer cancel()
-	row, err := m.syncStoredUpstreamAccount(ctx, in.Domain)
+	row, err := operation(ctx, in.Domain)
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "该主域名尚未配置上游账户"})
 		return
 	}
 	if err != nil && row.Domain == "" {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "同步上游余额失败"})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": emptyResultError})
 		return
 	}
 	response := gin.H{"account": upstreamAccountView(row)}
 	if err != nil {
-		response["sync_error"] = row.LastError
+		response["sync_error"] = lastError(row)
+		if retryAt := upstreamRetryAt(err); retryAt > 0 {
+			response["retry_at"] = retryAt
+		}
 	}
 	c.JSON(http.StatusOK, response)
 }
 
+func (m *Monitor) syncChannelUpstreamHandler(c *gin.Context) {
+	m.serveChannelUpstreamSync(c, upstreamSyncTimeout(m.cfg)+3*time.Second, m.syncStoredUpstreamAccount,
+		"同步上游余额失败", func(row ChannelUpstreamAccount) string { return row.LastError })
+}
+
 func (m *Monitor) startChannelUpstreamSync(ctx context.Context) {
+	if !m.cfg.UpstreamSyncEnabled {
+		slog.Info("上游账户同步已关闭")
+		return
+	}
+
 	var configured int64
 	if err := m.storeDB.Model(&ChannelUpstreamAccount{}).Count(&configured).Error; err != nil {
 		slog.Warn("读取上游账户配置失败，余额同步未启动", "err", err)
@@ -1056,7 +1288,7 @@ func (m *Monitor) startChannelUpstreamSync(ctx context.Context) {
 		slog.Error("上游余额同步未启动：凭据密钥未固定，请配置 MONITOR_SESSION_SECRET 或 MONITOR_UPSTREAM_CREDENTIAL_SECRET")
 		return
 	}
-	go func() {
+	goSourceEpoch(ctx, func(ctx context.Context) {
 		defer m.channelUpstreamHTTPClient().CloseIdleConnections()
 		timer := time.NewTimer(8 * time.Second)
 		defer timer.Stop()
@@ -1065,6 +1297,7 @@ func (m *Monitor) startChannelUpstreamSync(ctx context.Context) {
 			return
 		case <-timer.C:
 			m.syncDueUpstreamAccounts(ctx)
+			m.syncDueUpstreamUsage(ctx)
 		}
 		ticker := time.NewTicker(time.Minute)
 		defer ticker.Stop()
@@ -1074,9 +1307,10 @@ func (m *Monitor) startChannelUpstreamSync(ctx context.Context) {
 				return
 			case <-ticker.C:
 				m.syncDueUpstreamAccounts(ctx)
+				m.syncDueUpstreamUsage(ctx)
 			}
 		}
-	}()
+	})
 }
 
 func (m *Monitor) syncDueUpstreamAccounts(ctx context.Context) {

@@ -103,8 +103,12 @@ func (m *Monitor) RegisterRoutes(r *gin.Engine) {
 	if m.adminLim == nil {
 		m.adminLim = &portalLimiter{m: map[string][]int64{}}
 	}
-	// 公开:登录/登出/健康检查/站点名
-	r.GET("/health", func(c *gin.Context) { c.JSON(http.StatusOK, gin.H{"status": "ok"}) })
+	// 公开健康端点：/live 只证明进程存活，供容器防重启风暴；
+	// /ready 只读后台原子状态，绝不因为探活增加生产库 QPS。
+	// /health 保留为 /live 的向后兼容别名。
+	r.GET("/live", m.serveLive)
+	r.GET("/ready", m.serveReady)
+	r.GET("/health", m.serveLive)
 	r.GET("/echarts.js", func(c *gin.Context) { // 公开:内嵌 ECharts,自服务、版本固定可长期缓存
 		c.Header("Cache-Control", "public, max-age=31536000, immutable")
 		c.Data(http.StatusOK, "application/javascript; charset=utf-8", echartsJS)
@@ -168,22 +172,24 @@ func (m *Monitor) RegisterRoutes(r *gin.Engine) {
 		view.GET("/data", m.serveData)
 		view.GET("/monitor/data", m.serveData)
 		view.GET("/trend/long", m.serveLongTrend)
-		view.GET("/stability/report", m.serveStabilityReport)        // 历史稳定性:只读 Monitor 本地 SQLite
-		view.GET("/stability/detail", m.serveStabilityDetail)        // 单分组详情:按需加载渠道时间条/模型
-		view.GET("/stability/problems", m.serveStabilityProblems)    // 原始错误签名:只读本地问题样本
-		view.GET("/stability/health", m.serveStabilityHealth)        // 采集新鲜度/覆盖/积压:不查生产库
-		view.GET("/stability/edge", m.serveNginxEdge)                // Nginx 入口层:只读本地脱敏分钟汇总
-		view.GET("/channels/report", m.serveChannelManagementReport) // 渠道管理:主域名→厂商→渠道→服务分组的本地汇总
-		view.GET("/infra", m.serveInfra)                             // 服务端健康监控(实例/DB/LB)快照
-		view.GET("/infra/series", m.serveInfraSeries)                // 按需取某资源某些指标的近 N 小时序列(展开图用)
-		view.GET("/usage/users", m.listTrackedUsers)                 // 用户用量:被盯名单(含分组)
-		view.GET("/usage/groups", m.listGroups)                      // 用户用量:客户分组列表
-		view.GET("/usage/followups", m.serveFollowUps)               // 用户用量:待跟进清单
-		view.GET("/usage/followups/log", m.listFollowLogs)           // 用户用量:某客户跟进记录
-		view.GET("/usage/settings", m.getUsageSettings)              // 用户用量:跟进阈值(读)
-		view.GET("/usage/matrix", m.serveUsageMatrix)                // 用户用量:列表页矩阵(前端渲染 行=用户×列=日期,格=当日费用)
-		view.GET("/usage/stats", m.serveUsageStats)                  // 用户用量:单用户详情聚合(每日/分组/模型/费用)
-		view.GET("/usage/cache-stats", m.serveUsageCacheStats)       // 用户用量缓存:无敏感信息的运维计数
+		view.GET("/stability/report", m.serveStabilityReport)                              // 历史稳定性:只读 Monitor 本地 SQLite
+		view.GET("/stability/detail", m.serveStabilityDetail)                              // 单分组详情:按需加载渠道时间条/模型
+		view.GET("/stability/problems", m.serveStabilityProblems)                          // 原始错误签名:只读本地问题样本
+		view.GET("/stability/health", m.serveStabilityHealth)                              // 采集新鲜度/覆盖/积压:不查生产库
+		view.GET("/stability/edge", m.serveNginxEdge)                                      // Nginx 入口层:只读本地脱敏分钟汇总
+		view.GET("/channels/report", m.serveChannelManagementReport)                       // 渠道管理:主域名→厂商→渠道→服务分组的本地汇总
+		view.GET("/infra", m.serveInfra)                                                   // 服务端健康监控(实例/DB/LB)快照
+		view.GET("/infra/series", m.serveInfraSeries)                                      // 按需取某资源某些指标的近 N 小时序列(展开图用)
+		view.GET("/usage/users", m.listTrackedUsers)                                       // 用户用量:被盯名单(含分组)
+		view.GET("/usage/groups", m.listGroups)                                            // 用户用量:客户分组列表
+		view.GET("/usage/followups", m.usageAggregateAuthorizationGuard(m.serveFollowUps)) // 用户用量:待跟进清单
+		view.GET("/usage/followups/log", m.listFollowLogs)                                 // 用户用量:某客户跟进记录
+		view.GET("/usage/settings", m.getUsageSettings)                                    // 用户用量:跟进阈值(读)
+		view.GET("/usage/matrix", m.usageAggregateAuthorizationGuard(m.serveUsageMatrix))  // 用户用量:列表页矩阵(前端渲染 行=用户×列=日期,格=当日费用)
+		view.GET("/usage/stats", m.usageAggregateAuthorizationGuard(m.serveUsageStats))    // 用户用量:单用户详情聚合(每日/分组/模型/费用)
+		view.GET("/usage/cache-stats", m.serveUsageCacheStats)                             // 用户用量缓存:无敏感信息的运维计数
+		view.GET("/usage/facts-status", m.serveUsageFactsStatus)                           // 用户用量本地事实层:覆盖率/同步状态(只读 Monitor SQLite)
+		view.GET("/usage/facts-history", m.serveUsageFactHistoryStatus)                    // 全历史逐成员阶段/水位/失败原因(只读本地)
 		view.GET("/me", me)
 	}
 
@@ -201,21 +207,26 @@ func (m *Monitor) RegisterRoutes(r *gin.Engine) {
 	// 做成接口而非启动参数:不必重启、可重跑、可只补一段;放启动流程会每次重启都压一遍生产库。
 	r.POST("/admin/backfill", m.requireRole(roleRoot), m.backfillHandler)
 	r.POST("/admin/stability/backfill", m.requireRole(roleRoot), m.startStabilityBackfillHandler)
+	r.POST("/admin/stability/backfill/retry", m.requireRole(roleRoot), m.retryStabilityBackfillHandler)
 	r.GET("/admin/stability/backfill", m.requireRole(roleRoot), m.stabilityBackfillStatusHandler)
+	r.POST("/admin/store/backup", m.requireRole(roleRoot), m.triggerStoreBackupHandler)
 
 	// 仅超级管理员:用户用量名单增删(看名单/看统计在上面 view 组,管理员即可)
 	rootUsage := r.Group("/usage", m.requireRole(roleRoot))
 	{
 		rootUsage.POST("/users", m.addTrackedUser)
 		rootUsage.POST("/users/delete", m.deleteTrackedUser)
-		rootUsage.POST("/users/group", m.setUserGroup)     // 改用户归属分组
-		rootUsage.POST("/users/note", m.setUserNote)       // 改用户备注
-		rootUsage.POST("/groups", m.createGroup)           // 客户分组:新建
-		rootUsage.POST("/groups/update", m.updateGroup)    // 客户分组:编辑
-		rootUsage.POST("/groups/delete", m.deleteGroup)    // 客户分组:解散(成员回未分组)
-		rootUsage.POST("/groups/portal", m.setGroupPortal) // 客户分组:客户端账号(开通/更新/重置/关闭)
-		rootUsage.POST("/followups/log", m.addFollowLog)   // 跟进记录:追加
-		rootUsage.POST("/settings", m.saveUsageSettings)   // 跟进阈值:保存
+		rootUsage.POST("/users/group", m.setUserGroup)                    // 改用户归属分组
+		rootUsage.POST("/users/note", m.setUserNote)                      // 改用户备注
+		rootUsage.POST("/groups", m.createGroup)                          // 客户分组:新建
+		rootUsage.POST("/groups/update", m.updateGroup)                   // 客户分组:编辑
+		rootUsage.POST("/groups/delete", m.deleteGroup)                   // 客户分组:解散(成员回未分组)
+		rootUsage.POST("/groups/portal", m.setGroupPortal)                // 客户分组:客户端账号(开通/更新/重置/关闭)
+		rootUsage.POST("/followups/log", m.addFollowLog)                  // 跟进记录:追加
+		rootUsage.POST("/settings", m.saveUsageSettings)                  // 跟进阈值:保存
+		rootUsage.POST("/facts-repair", m.requestUsageFactsRepairHandler) // 历史晚到/旧库 proof 受控补数
+		rootUsage.POST("/facts-history/retry", m.retryUsageFactHistoryHandler)
+		rootUsage.POST("/facts-history/repair", m.requestUsageFactHistoryDayRepairHandler)
 	}
 
 	// 仅超级管理员:维护渠道毛利率的本地计价配置。接口只写 Monitor SQLite，
@@ -231,13 +242,142 @@ func (m *Monitor) RegisterRoutes(r *gin.Engine) {
 		rootChannels.GET("/upstream", m.getChannelUpstreamHandler)
 		rootChannels.POST("/upstream", m.saveChannelUpstreamHandler)
 		rootChannels.POST("/upstream/sync", m.syncChannelUpstreamHandler)
+		rootChannels.POST("/upstream/usage-sync", m.syncChannelUpstreamUsageHandler)
 	}
+}
+
+func (m *Monitor) triggerStoreBackupHandler(c *gin.Context) {
+	if !m.cfg.StoreBackupEnabled {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "本地 SQLite 备份未启用"})
+		return
+	}
+	if !m.triggerManualStoreBackup() {
+		c.JSON(http.StatusConflict, gin.H{"error": "本地 SQLite 备份正在进行或无可备份文件"})
+		return
+	}
+	c.JSON(http.StatusAccepted, gin.H{"ok": true, "running": true})
 }
 
 // serveUsageCacheStats 只向管理端会话暴露缓存运行计数。接口不主动访问 Redis，
 // 不返回缓存键或任何客户资料，可用于上线后核对命中率、回源次数和降级情况。
 func (m *Monitor) serveUsageCacheStats(c *gin.Context) {
-	c.JSON(http.StatusOK, gin.H{"cache": m.usageCache.Stats(time.Now())})
+	c.JSON(http.StatusOK, gin.H{
+		"cache":             m.usageCache.Stats(time.Now()),
+		"source_budget":     m.usageSourceStats(),
+		"facts_read_budget": m.usageFactsReadBudgetStats(),
+	})
+}
+
+// serveUsageFactsStatus 返回本地事实层的可切读状态和 Monitor SQLite 的备份状态。
+// 该接口不会因查看状态而访问 NewAPI 的 logs/users/tokens；用于两阶段上线时确认
+// 历史小时和当前关注客户名单均已同步，再由运维显式打开
+// MONITOR_USAGE_FACTS_READ_ENABLED。store 字段只读内存原子状态，不触发备份或检查。
+func (m *Monitor) serveUsageFactsStatus(c *gin.Context) {
+	status, err := m.usageFactsStatus(c.Request.Context(), time.Now())
+	if err != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{
+			"error":       "读取本地用量事实状态失败",
+			"store":       m.storeReliabilityStatus(),
+			"facts_store": m.usageFactsStoreReliabilityStatus(),
+		})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"facts":       status,
+		"store":       m.storeReliabilityStatus(),
+		"facts_store": m.usageFactsStoreReliabilityStatus(),
+	})
+}
+
+func (m *Monitor) serveUsageFactHistoryStatus(c *gin.Context) {
+	progress, err := m.usageFactHistoryProgress(c.Request.Context(), time.Now())
+	if err != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "读取全历史事实进度失败"})
+		return
+	}
+	c.JSON(http.StatusOK, progress)
+}
+
+func (m *Monitor) retryUsageFactHistoryHandler(c *gin.Context) {
+	var in struct {
+		UserID int64  `json:"user_id"`
+		JobID  string `json:"job_id"`
+	}
+	if err := c.ShouldBindJSON(&in); err != nil || in.UserID <= 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "user_id required"})
+		return
+	}
+	job, err := m.retryUsageFactHistoryJobTarget(c.Request.Context(), in.UserID, in.JobID, time.Now())
+	if err != nil {
+		switch {
+		case errors.Is(err, errUsageFactHistoryJobNotFound):
+			c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+		case errors.Is(err, errUsageFactHistoryRetryConflict):
+			c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+		default:
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "重试全历史事实任务失败"})
+		}
+		return
+	}
+	c.JSON(http.StatusAccepted, gin.H{
+		"ok": true, "user_id": in.UserID, "job_id": job.ID, "stage": job.Kind,
+		"status": job.Status, "next_hour": job.NextHour, "verify_next_hour": job.VerifyNextHour,
+	})
+}
+
+func (m *Monitor) requestUsageFactHistoryDayRepairHandler(c *gin.Context) {
+	var in struct {
+		UserID    int64  `json:"user_id"`
+		Day       string `json:"day"`
+		Reason    string `json:"reason"`
+		RequestID string `json:"request_id"`
+		Confirm   string `json:"confirm"`
+	}
+	if err := c.ShouldBindJSON(&in); err != nil || in.UserID <= 0 || strings.TrimSpace(in.Day) == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "user_id/day required"})
+		return
+	}
+	if strings.TrimSpace(in.Confirm) != "REPAIR_FULL_HISTORY_DAY" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "请明确确认单成员单日全历史修复"})
+		return
+	}
+	if strings.TrimSpace(in.RequestID) == "" && strings.TrimSpace(c.GetHeader("Idempotency-Key")) == "" &&
+		strings.TrimSpace(c.GetHeader("X-Idempotency-Key")) == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "request_id/Idempotency-Key required"})
+		return
+	}
+	meta, err := usageMemberMutationMetaFromGin(c, in.RequestID, in.Reason)
+	if err != nil || strings.TrimSpace(meta.Reason) == "" {
+		if err == nil {
+			err = errors.New("请填写修复原因")
+		}
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	dayText := strings.TrimSpace(in.Day)
+	day, err := time.ParseInLocation("2006-01-02", dayText, usageCST)
+	if err != nil || day.Format("2006-01-02") != dayText {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "day 必须是 CST YYYY-MM-DD"})
+		return
+	}
+	job, err := m.requestUsageFactHistoryDayRepair(
+		c.Request.Context(), in.UserID, day.Unix(), meta.Reason, meta.RequestID, meta.Actor, time.Now(),
+	)
+	if err != nil {
+		switch {
+		case errors.Is(err, errUsageFactHistoryRepairRequestConflict), errors.Is(err, errUsageMemberControlIntegrity):
+			c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+		case errors.Is(err, errUsageFactHistoryManualRepairInvalid):
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		default:
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "创建全历史精确修复失败"})
+		}
+		return
+	}
+	c.JSON(http.StatusAccepted, gin.H{
+		"ok": true, "request_id": meta.RequestID, "user_id": in.UserID, "day": dayText,
+		"job_id": job.ID, "stage": job.Kind, "status": job.Status, "next_hour": job.NextHour,
+	})
 }
 
 // checkIngest 校验节点推送接口的 Bearer token(MONITOR_INGEST_TOKEN)。

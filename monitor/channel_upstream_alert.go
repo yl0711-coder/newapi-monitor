@@ -91,9 +91,12 @@ func (m *Monitor) loadUpstreamBurnEstimates(ctx context.Context, now int64, poli
 		COALESCE(sh.grp,'') grp, COALESCE(SUM(sh.quota),0) quota
 		FROM stability_hour_samples sh
 		JOIN stability_hour_ingest_states hs ON hs.hour_ts=sh.hour_ts AND hs.status='complete'
+		  AND hs.traffic_class_version=?
 		JOIN channel_snaps cs ON cs.id=sh.channel_id
-		WHERE sh.hour_ts>=? AND sh.hour_ts<? AND COALESCE(cs.base_domain,'')<>''
-		GROUP BY cs.base_domain,sh.grp`, from, to).Scan(&rows).Error; err != nil {
+		WHERE sh.hour_ts>=? AND sh.hour_ts<? AND sh.traffic_class_version=?
+		  AND COALESCE(cs.base_domain,'')<>''
+		GROUP BY cs.base_domain,sh.grp`, userTrafficClassificationVersion, from, to,
+		userTrafficClassificationVersion).Scan(&rows).Error; err != nil {
 		return nil, coverage, fmt.Errorf("读取本地渠道消耗汇总: %w", err)
 	}
 
@@ -117,6 +120,57 @@ func (m *Monitor) loadUpstreamBurnEstimates(ctx context.Context, now int64, poli
 		}
 		userCostUSD := float64(row.Quota) / quotaPerUSD
 		totals[domain] += userCostUSD * view.UpstreamEffectiveMultiplier / view.SiteMultiplier
+	}
+
+	// 渠道模型测试没有用户收入，但会真实消耗上游余额。旧 NewAPI 普通/固定价
+	// quota 是未乘网站分组倍率的基数；tiered_expr quota 已经乘过网站倍率。
+	var testRows []struct {
+		Domain    string
+		Grp       string
+		CostBasis string
+		ChannelID int
+		Quota     int64
+	}
+	if err := m.storeDB.WithContext(ctx).Raw(`SELECT COALESCE(cs.base_domain,'') domain,
+		COALESCE(ts.grp,'') grp, COALESCE(ts.cost_basis,'') cost_basis,
+		ts.channel_id, COALESCE(SUM(ts.quota),0) quota
+		FROM channel_test_hour_samples ts
+		JOIN stability_hour_ingest_states hs ON hs.hour_ts=ts.hour_ts AND hs.status='complete'
+		  AND hs.traffic_class_version=?
+		JOIN channel_snaps cs ON cs.id=ts.channel_id
+		WHERE ts.hour_ts>=? AND ts.hour_ts<? AND ts.traffic_class_version=?
+		  AND COALESCE(cs.base_domain,'')<>''
+		GROUP BY cs.base_domain,ts.grp,ts.cost_basis,ts.channel_id`, userTrafficClassificationVersion, from, to,
+		userTrafficClassificationVersion).
+		Scan(&testRows).Error; err != nil {
+		return nil, coverage, fmt.Errorf("读取本地渠道测试成本汇总: %w", err)
+	}
+	for _, row := range testRows {
+		domain, group := strings.TrimSpace(row.Domain), strings.TrimSpace(row.Grp)
+		if domain == "" || row.Quota <= 0 {
+			continue
+		}
+		if row.CostBasis != "legacy_assumed_base" && row.CostBasis != "legacy_after_group" {
+			if missing[domain] == nil {
+				missing[domain] = make(map[string]bool)
+			}
+			missing[domain][fmt.Sprintf("内部测试渠道 #%d 成本口径未标记", row.ChannelID)] = true
+			continue
+		}
+		view := finance.groupViewForChannel(domain, row.ChannelID, group)
+		if !view.UpstreamConfigured || view.UpstreamEffectiveMultiplier <= 0 ||
+			(row.CostBasis == "legacy_after_group" && (!view.Complete || view.SiteMultiplier <= 0)) {
+			if missing[domain] == nil {
+				missing[domain] = make(map[string]bool)
+			}
+			missing[domain][fmt.Sprintf("内部测试渠道 #%d", row.ChannelID)] = true
+			continue
+		}
+		baseCostUSD := float64(row.Quota) / quotaPerUSD
+		if row.CostBasis == "legacy_after_group" {
+			baseCostUSD /= view.SiteMultiplier
+		}
+		totals[domain] += baseCostUSD * view.UpstreamEffectiveMultiplier
 	}
 
 	// 用实际已完整的小时数归一化，允许极少量缺口但不会把缺失小时当零消费。

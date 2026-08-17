@@ -9,31 +9,40 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/glebarez/sqlite"
+	"github.com/yl0711-coder/newapi-monitor/internal/trafficclass"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
 )
 
 // 测试用的表结构(列名与生产一致),避免 import monitor 造成循环。
 type metricSample struct {
-	BucketTs   int64  `gorm:"primaryKey;autoIncrement:false"`
-	ChannelID  int    `gorm:"primaryKey;autoIncrement:false"`
-	ModelName  string `gorm:"primaryKey;size:128"`
-	Grp        string `gorm:"primaryKey;size:64;column:grp"`
-	Success    int64
-	Anomaly    int64
-	Failed     int64
-	MaxUseTime int
-	Err4xx     int64 `gorm:"column:err_4xx"`
-	Lat1       int64 `gorm:"column:lat_1"`
-	Lat2       int64 `gorm:"column:lat_2"`
-	Lat5       int64 `gorm:"column:lat_5"`
-	Lat10      int64 `gorm:"column:lat_10"`
-	Lat30      int64 `gorm:"column:lat_30"`
-	Lat60      int64 `gorm:"column:lat_60"`
-	LatInf     int64 `gorm:"column:lat_inf"`
+	BucketTs            int64  `gorm:"primaryKey;autoIncrement:false"`
+	ChannelID           int    `gorm:"primaryKey;autoIncrement:false"`
+	ModelName           string `gorm:"primaryKey;size:128"`
+	Grp                 string `gorm:"primaryKey;size:64;column:grp"`
+	TrafficClassVersion int    `gorm:"column:traffic_class_version"`
+	Success             int64
+	Anomaly             int64
+	Failed              int64
+	MaxUseTime          int
+	Err4xx              int64 `gorm:"column:err_4xx"`
+	Lat1                int64 `gorm:"column:lat_1"`
+	Lat2                int64 `gorm:"column:lat_2"`
+	Lat5                int64 `gorm:"column:lat_5"`
+	Lat10               int64 `gorm:"column:lat_10"`
+	Lat30               int64 `gorm:"column:lat_30"`
+	Lat60               int64 `gorm:"column:lat_60"`
+	LatInf              int64 `gorm:"column:lat_inf"`
 }
 
 func (metricSample) TableName() string { return "metric_samples" }
+
+func (s *metricSample) BeforeCreate(_ *gorm.DB) error {
+	if s.TrafficClassVersion == 0 {
+		s.TrafficClassVersion = trafficclass.Current
+	}
+	return nil
+}
 
 type channelSnap struct {
 	ID           int `gorm:"primaryKey;autoIncrement:false"`
@@ -106,6 +115,20 @@ func TestComputeTopologyAndTraffic(t *testing.T) {
 		if len(m.Beats) != beatCount {
 			t.Errorf("%s beats=%d, want %d", m.Name, len(m.Beats), beatCount)
 		}
+	}
+}
+
+func TestPublicBoardFailsClosedOnOldTrafficClassification(t *testing.T) {
+	db := testDB(t)
+	now := int64(1_900_000_000)
+	if err := db.Create(&metricSample{
+		BucketTs: now - 60, ChannelID: 1, ModelName: "old", Grp: "g1",
+		TrafficClassVersion: trafficclass.Current - 1, Success: 10,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if totals := (&handler{db: db}).totals(now - windowSec); len(totals) != 0 {
+		t.Fatalf("old traffic classification must remain invisible: %+v", totals)
 	}
 }
 

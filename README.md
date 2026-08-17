@@ -8,7 +8,7 @@
 [![Go Report Card](https://goreportcard.com/badge/github.com/yl0711-coder/newapi-monitor)](https://goreportcard.com/report/github.com/yl0711-coder/newapi-monitor)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-给 [new-api](https://github.com/Calcium-Ion/new-api) 网关加一个独立的「上游稳定性」看板:用一个**只读账号**每分钟对其日志库做一次小聚合查询,在本地 SQLite 留存,展示 **分组 / 渠道 / 模型** 维度的成功率、异常、响应耗时(TTFB/TTFT),异常时邮件报警。**不改 new-api、不写它的库。**
+给 [new-api](https://github.com/Calcium-Ion/new-api) 网关加一个独立的「上游稳定性」看板：用一个**只读账号**执行有界、串行、带退避的来源采样/事实同步，在本地 SQLite 留存并展示 **分组 / 渠道 / 模型** 维度的成功率、异常、响应耗时(TTFB/TTFT)，异常时邮件报警。**不写 new-api 数据库。**
 
 ## 特性
 - **零侵入**:只读、小窗口、有预算的后台采样；页面只读本地 SQLite，不随访问量查询生产库。
@@ -24,7 +24,7 @@
 
 ## 工作原理
 ```
-new-api 日志库 (MySQL) ──每 60s 只读聚合查询──► newapi-monitor ──► 本地 SQLite ──► 看板 / 邮件报警
+new-api 日志库 (MySQL) ──有界只读采样/同步──► newapi-monitor ──► 本地 SQLite ──► 看板 / 邮件报警
 ```
 采样器是**唯一**访问 new-api 库的组件;页面只读本地 SQLite,与生产库隔离。
 
@@ -36,7 +36,7 @@ docker run -d --name newapi-monitor \
   -e MONITOR_NEWAPI_BASE_URL='https://your-newapi.example.com' \
   -e MONITOR_SESSION_SECRET="$(openssl rand -hex 32)" \
   -v newapi_monitor_data:/data \
-  ghcr.io/yl0711-coder/newapi-monitor:latest
+  ghcr.io/yl0711-coder/newapi-monitor:REPLACE_WITH_ACCEPTED_TAG_OR_DIGEST
 ```
 
 打开 `http://<host>:8090`,用 new-api 管理员账号登录。完整 compose 见 [`docker-compose.example.yml`](docker-compose.example.yml)。生产建议前面放一层反向代理(nginx / Caddy)做 HTTPS。
@@ -48,8 +48,11 @@ docker run -d --name newapi-monitor \
 | `MONITOR_NEWAPI_BASE_URL` | new-api 地址,用于登录鉴权 | 必填 |
 | `MONITOR_SESSION_SECRET` | 会话签名密钥(`openssl rand -hex 32`) | 留空则启动随机生成 |
 | `MONITOR_UPSTREAM_CREDENTIAL_SECRET` | 渠道管理中上游令牌的 AES-256-GCM 加密密钥；生产应长期固定并与会话密钥分离 | 显式会话密钥；两者都未配置时拒绝保存凭据 |
+| `MONITOR_UPSTREAM_SYNC_ENABLED` | 上游余额与使用日志后台同步总开关；上游故障/风控维护窗口可临时关闭 | `true` |
 | `MONITOR_UPSTREAM_SYNC_MINUTES` | NewAPI / Sub2API 上游账户余额正常同步间隔；失败自动指数退避 | `5` |
 | `MONITOR_UPSTREAM_SYNC_TIMEOUT_SECONDS` | 单个上游同步请求超时 | `15` |
+| `MONITOR_UPSTREAM_USAGE_SYNC_MINUTES` | NewAPI 上游账户当天使用日志尾部刷新间隔；历史补全独立退避；单轮分页固定限 60 次，所有上游请求全局串行且启动间隔至少 1 秒 | `30` |
+| `MONITOR_UPSTREAM_USAGE_BACKFILL_DAYS` | 首次低频补全的上游账户使用日志天数 | `90` |
 | `MONITOR_ADDR` | 监听地址 | `:8090` |
 | `MONITOR_PORTAL_ADDR` | 客户用量门户独立监听地址；留空则不启用 | 留空 |
 | `MONITOR_USAGE_REDIS_ADDR` | 客户用量聚合结果 Redis 私网地址；留空时自动使用有界本机短缓存 | 留空 |
@@ -59,10 +62,22 @@ docker run -d --name newapi-monitor \
 | `MONITOR_USAGE_REDIS_PREFIX` | 用量缓存键前缀 | `nxmon:usage:v1` |
 | `MONITOR_TRUSTED_PROXIES` | 可提供真实客户端 IP 的可信反代 IP/CIDR，逗号分隔；留空则不信任转发头 | 留空 |
 | `MONITOR_STORE_PATH` | 本地采样库路径 | `/data/monitor.db` |
+| `MONITOR_USAGE_FACTS_STORE_PATH` | 独立用量事实库路径；与主库分文件，避免补数/WAL/损坏影响控制数据 | `<MONITOR_STORE_PATH 目录>/usage-facts.db` |
+| `MONITOR_STORE_BACKUP_ENABLED` | 运行期在线日备份开关；不影响启动时强制迁移前快照 | `true` |
+| `MONITOR_STORE_BACKUP_DIR` | 在线备份和迁移前成套快照目录 | `<MONITOR_STORE_PATH 目录>/backups` |
+| `MONITOR_STORE_BACKUP_RETENTION` | 已验证 main+facts `backup-set` 成套备份保留数 | `7` |
+| `MONITOR_STORE_MIGRATION_BACKUP_RETENTION` | main+facts 同一 manifest 的迁移前快照批次保留数 | `3` |
+| `MONITOR_USAGE_FACTS_ENABLED` | 后台按成员、按小时构建本地用量事实；生产部署示例固定开启 | `false` |
+| `MONITOR_USAGE_FACTS_READ_ENABLED` | 聚合页面只读取完整发布的本地事实；未完成时 fail-closed，不回扫 logs | `false` |
+| `MONITOR_USAGE_FACTS_FULL_HISTORY_ENABLED` | 按成员真实注册/首日志边界构建全历史；生产示例显式开启 | `false` |
+| `MONITOR_USAGE_FACTS_HISTORY_SOURCE_MODE` | 全历史来源完整性声明；只有 DBA 签收后的 `complete` 可启动 | `unverified` |
+| `MONITOR_USAGE_FACTS_HISTORY_SOURCE_EPOCH` | 来源归档/路由契约稳定标识；变化会强制全域重签 | 留空 |
+| `MONITOR_USAGE_FACTS_HISTORY_SOURCE_DUTY_PERCENT` | cold history 来源查询最大 duty；Tail 优先 | `20` |
+| `MONITOR_USAGE_FACTS_CLASSIFICATION_MIGRATION_ENABLED` | 显式分类迁移维护开关；开启时 READ 必须关闭 | `false` |
 | `MONITOR_SAMPLE_SECONDS` | 采样间隔(秒) | `60` |
 | `MONITOR_RETENTION_DAYS` | 分钟级本地留存天数 | `7` |
 | `MONITOR_HOUR_RETENTION_DAYS` | 小时级汇总留存天数(长期趋势 + 同比环比) | `90` |
-| `MONITOR_BACKFILL_HOURS` | 启动时回填的历史小时数 | `24` |
+| `MONITOR_BACKFILL_HOURS` | 来源 epoch 启动缺口配置；自动路径按持久水位且硬限 1 小时 | `1` |
 | `MONITOR_STABILITY_ENABLED` | 历史稳定性报表与原始问题采集开关；关闭不影响原模型/用量/服务端监控 | `true` |
 | `MONITOR_STABILITY_QUERY_MAX_DAYS` | 稳定性报表页面单次最大查询范围 | `90` |
 | `MONITOR_STABILITY_RETENTION_DAYS` | 稳定性本地数据留存；运行时至少取 `2×QUERY_MAX+1`，保证上一周期对比完整 | `181` |
@@ -113,7 +128,7 @@ status.example.com {
 - `role = 100`(超级管理员):可修改报警配置。
 
 ## 只读账号
-给 new-api 库单独建一个只读账号,仅授予 `logs`、`channels`、`users`、`tokens` 四表的 `SELECT`
+给 new-api 库单独建一个只读账号，仅授予 `logs`、`channels`、`users`、`tokens`、`options` 五表的 `SELECT`
 (后两张是「用户用量 / 客户报表」功能读余额与令牌名所需),用于 `NEWAPI_LOG_DSN`:
 ```sql
 CREATE USER 'ro_user'@'%' IDENTIFIED BY '<strong-password>';
@@ -121,6 +136,7 @@ GRANT SELECT ON newapi.logs     TO 'ro_user'@'%';
 GRANT SELECT ON newapi.channels TO 'ro_user'@'%';
 GRANT SELECT ON newapi.users    TO 'ro_user'@'%';
 GRANT SELECT ON newapi.tokens   TO 'ro_user'@'%';
+GRANT SELECT ON newapi.options  TO 'ro_user'@'%';
 ```
 
 ## 客户用量门户(Usage Portal)
@@ -146,9 +162,13 @@ usage.example.com {
 令牌当前元数据、会话、原始日志和 CSV 不写入 Redis。Redis 断连/超时/鉴权失败时接口自动回退到
 最多 128 项、16 MiB 的本机最多 60 秒应急缓存，本机过期时间不会超过 Redis 记录的剩余 TTL。
 Redis 故障后会快速回源并退避 30 秒，使故障稳态的同键回源频率不高于旧版 60 秒本机缓存。
+每个聚合结果最多缓存 4 MiB；每日消费矩阵在“成员数×自然日数”超过 20,000 格时，
+服务端会在执行聚合和缓存填充前拒绝并提示缩小范围。事实层冷查询另有容量为 2 的本地并发闸门，
+避免不同缓存键同时读取大范围 SQLite 时放大 CPU 和内存。
 不能把 Redis 当作业务正确性的依赖。生产必须使用私网地址、
 独立 ACL 用户及带 TTL 的 `nxmon:*` 权限，禁止把 Redis 6379 直接暴露公网。
-管理员登录后可读取 `GET /usage/cache-stats` 查看命中、回源、远端错误、退避状态和本机容量计数；
+管理员登录后可读取 `GET /usage/cache-stats` 查看命中、回源、远端错误、退避状态、本机容量及
+`source_budget`/`facts_read_budget` 查询闸门计数；
 该接口不会主动探测 Redis，也不返回缓存键、筛选条件或客户数据。CSV 导出先做一次带快照的预检，
 随后由浏览器直接流式写入文件；5 万行上限保持不变，页面内存不再随导出行数增长。
 

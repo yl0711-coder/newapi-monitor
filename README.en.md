@@ -2,16 +2,16 @@ English | [简体中文](README.md)
 
 # newapi-monitor
 
-> **Upstream monitor for new-api** — a zero-intrusion, read-only sampling sidecar for stability monitoring and email alerts.
+> **Upstream monitor for new-api** — a read-only, bounded sampling and local-facts sidecar for stability monitoring and email alerts.
 
 [![CI](https://github.com/yl0711-coder/newapi-monitor/actions/workflows/ci.yml/badge.svg)](https://github.com/yl0711-coder/newapi-monitor/actions/workflows/ci.yml)
 [![Go Report Card](https://goreportcard.com/badge/github.com/yl0711-coder/newapi-monitor)](https://goreportcard.com/report/github.com/yl0711-coder/newapi-monitor)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-A standalone "upstream stability" dashboard for the [new-api](https://github.com/Calcium-Ion/new-api) gateway. It uses a **read-only account** to run one small aggregate query per minute against new-api's log database, stores the result in a local SQLite, and shows success rate, anomalies and latency (TTFB/TTFT) broken down by **group / channel / model**, with email alerts on anomalies. **It never modifies new-api and never writes to its database.**
+A standalone "upstream stability" dashboard for the [new-api](https://github.com/Calcium-Ion/new-api) gateway. It uses a **read-only account** for bounded, serialized, backoff-protected sampling and fact synchronization, stores results in local SQLite, and shows success rate, anomalies and latency (TTFB/TTFT) by **group / channel / model**, with email alerts. **It never writes to the new-api database.**
 
 ## Features
-- **Zero intrusion**: read-only sampling, one small aggregate query per cycle, no load on your production DB.
+- **Read-only source boundary**: bounded sampling/fact queries, a shared background-query gate, and exponential backoff protect the production database.
 - **Three-state stability**: success / anomaly (`client_gone` and other client aborts) / failure (upstream errors), aggregated by group × channel × model.
 - **Latency**: P50/P95 total latency, TTFB/TTFT first-token distribution, output speed (tok/s).
 - **Auth via new-api**: reuses new-api user identity (calls its `/api/user/login`), role-gated, no separate account system.
@@ -20,9 +20,9 @@ A standalone "upstream stability" dashboard for the [new-api](https://github.com
 
 ## How it works
 ```
-new-api log DB (MySQL) ──one read-only aggregate query / 60s──► newapi-monitor ──► local SQLite ──► dashboard / email alerts
+new-api log DB (MySQL) ──bounded read-only sampling/sync──► newapi-monitor ──► local SQLite ──► dashboard / email alerts
 ```
-The sampler is the **only** component that touches new-api's DB; the dashboard reads from the local SQLite, fully isolated from production.
+Stability and aggregate-usage dashboards read local SQLite. Background samplers/fact builders are the normal source readers; raw log detail and CSV export remain explicitly bounded direct reads from new-api's database.
 
 ## Quick start (Docker)
 ```bash
@@ -32,7 +32,7 @@ docker run -d --name newapi-monitor \
   -e MONITOR_NEWAPI_BASE_URL='https://your-newapi.example.com' \
   -e MONITOR_SESSION_SECRET="$(openssl rand -hex 32)" \
   -v newapi_monitor_data:/data \
-  ghcr.io/yl0711-coder/newapi-monitor:latest
+  ghcr.io/yl0711-coder/newapi-monitor:REPLACE_WITH_ACCEPTED_TAG_OR_DIGEST
 ```
 
 Open `http://<host>:8090` and log in with a new-api admin account. See [`docker-compose.example.yml`](docker-compose.example.yml) for a full compose file. In production, put a reverse proxy (nginx / Caddy) in front for HTTPS.
@@ -52,13 +52,28 @@ Open `http://<host>:8090` and log in with a new-api admin account. See [`docker-
 | `MONITOR_USAGE_REDIS_PREFIX` | Usage-cache key prefix | `nxmon:usage:v1` |
 | `MONITOR_TRUSTED_PROXIES` | Comma-separated trusted proxy IPs/CIDRs allowed to supply the client IP; empty trusts no forwarding headers | empty |
 | `MONITOR_STORE_PATH` | Local sampling DB path | `/data/monitor.db` |
+| `MONITOR_USAGE_FACTS_STORE_PATH` | Separate usage-facts SQLite path, isolating high-volume facts/WAL from control data | `<MONITOR_STORE_PATH directory>/usage-facts.db` |
+| `MONITOR_STORE_BACKUP_ENABLED` | Runtime paired main+facts backup; migration snapshots remain mandatory independently | `true` |
+| `MONITOR_STORE_BACKUP_DIR` | Runtime and pre-migration snapshot directory | `<MONITOR_STORE_PATH directory>/backups` |
+| `MONITOR_STORE_BACKUP_RETENTION` | Number of verified main+facts `backup-set` manifests retained | `7` |
+| `MONITOR_STORE_MIGRATION_BACKUP_RETENTION` | Number of paired pre-migration snapshot sets retained | `3` |
+| `MONITOR_USAGE_FACTS_ENABLED` | Build member-scoped local usage facts in the background | `false` |
+| `MONITOR_USAGE_FACTS_READ_ENABLED` | Serve aggregates only from a completely published local snapshot; unavailable data fails closed and never falls back to source `logs` | `false` |
+| `MONITOR_USAGE_FACTS_FULL_HISTORY_ENABLED` | Build full history from each member's signed registration/first-log boundary | `false` |
+| `MONITOR_USAGE_FACTS_HISTORY_SOURCE_MODE` | Source-completeness declaration; full history starts only with DBA-attested `complete` | `unverified` |
+| `MONITOR_USAGE_FACTS_HISTORY_SOURCE_EPOCH` | Stable identifier for the source retention/routing contract; changes force a complete re-sign | empty |
+| `MONITOR_USAGE_FACTS_HISTORY_SOURCE_DUTY_PERCENT` | Maximum cold-history source duty cycle; recent Tail always has priority | `20` |
+| `MONITOR_USAGE_FACTS_CLASSIFICATION_MIGRATION_ENABLED` | Explicit classification-maintenance switch; while enabled, usage reads must be disabled | `false` |
 | `MONITOR_SAMPLE_SECONDS` | Sampling interval (seconds) | `60` |
 | `MONITOR_RETENTION_DAYS` | Local retention (days) | `7` |
-| `MONITOR_BACKFILL_HOURS` | Hours of history to backfill on start | `24` |
+| `MONITOR_BACKFILL_HOURS` | Source-epoch startup catch-up; durable-watermark based and hard-capped at one hour | `1` |
 | `MONITOR_HOUR_RETENTION_DAYS` | Hourly-rollup retention (long-term trend + WoW/DoD) | `90` |
+| `MONITOR_STABILITY_CLASSIFICATION_MIGRATION_ENABLED` | Explicit low-priority Stability classification migration; do not run alongside Usage expansion | `false` |
 | `MONITOR_HEARTBEAT_URL` | Dead-man heartbeat URL (e.g. healthchecks.io); empty = off | empty |
 | `MONITOR_SITE_NAME` | Fallback site name for the public board; name/favicon are synced from new-api `system_name`/`logo` at deploy, this is only used when the main site is unreachable | empty |
 | `MONITOR_INGEST_TOKEN` | Auth token for the "Rejected requests" ingest endpoint `POST /internal/rejections`, used by per-node [newapi-reject-collector](https://github.com/yl0711-coder/newapi-reject-collector) to push pre-routing rejections; **empty = endpoint disabled** | empty |
+
+The production compose example deliberately requires pre-created external data and backup volumes plus a DBA-signed source epoch. `SOURCE_MODE=complete` is a declaration, not proof: before enabling full history, verify with read-only SQL and the archive/retention policy that hot `logs` has no gap from every active member's registration time. The paired local `backup-set` protects application consistency, but it is **not** off-site disaster recovery; production sign-off still requires encrypted immutable replication to another failure domain and a restore-to-new-volume drill. See [`docs/monitor-operations.md`](docs/monitor-operations.md).
 
 ## Rejected requests (pre-routing · logs blind spot)
 
@@ -94,13 +109,14 @@ Login reuses new-api identity (only calls its `/api/user/login`):
 - `role = 100` (super admin): can edit alert settings.
 
 ## Read-only account
-Create a dedicated read-only account for new-api's DB, granting only `SELECT` on `logs`, `channels`, `users`, and `tokens`, for `NEWAPI_LOG_DSN`:
+Create a dedicated read-only account for new-api's DB, granting only `SELECT` on `logs`, `channels`, `users`, `tokens`, and `options`, for `NEWAPI_LOG_DSN`:
 ```sql
 CREATE USER 'ro_user'@'%' IDENTIFIED BY '<strong-password>';
 GRANT SELECT ON newapi.logs     TO 'ro_user'@'%';
 GRANT SELECT ON newapi.channels TO 'ro_user'@'%';
 GRANT SELECT ON newapi.users    TO 'ro_user'@'%';
 GRANT SELECT ON newapi.tokens   TO 'ro_user'@'%';
+GRANT SELECT ON newapi.options  TO 'ro_user'@'%';
 ```
 
 ## Client usage portal

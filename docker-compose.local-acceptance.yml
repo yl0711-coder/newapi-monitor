@@ -1,16 +1,23 @@
 # 本机验收专用：管理端与客户门户都只绑定回环地址，绝不用于生产。
 #
-# 数据卷 ./\.local-data 持有从线上一致性备份得到的 nexus_monitor.db。
+# 正在运行的 SQLite 必须放在 Docker 持久化卷 newapi-monitor-local-data 中。
+# 不要把 WAL 模式数据库直接放在 macOS bind mount 上：宿主机与 Linux 容器
+# 同时访问时文件锁语义并不可靠，可能导致 database disk image is malformed。
+# ./\.local-data 只保存停库后取得的一致性备份，不直接承载运行库。
 # 首次启动或 Redis 容器不存在时先执行：
 #   docker compose -f docker-compose.local-acceptance.yml up -d redis
-# 更新代码时只执行：
-#   docker compose -f docker-compose.local-acceptance.yml build monitor
-#   docker compose -f docker-compose.local-acceptance.yml up -d --no-deps --force-recreate monitor
-# 不要使用 `down -v`，也不要删除 .local-data/nexus_monitor.db。
+# 最终验收必须使用待交付的同一 SHA/digest 镜像，例如：
+#   MONITOR_ACCEPTANCE_IMAGE=ghcr.io/yl0711-coder/newapi-monitor:sha-<sha>@sha256:<digest> \
+#     docker compose -f docker-compose.local-acceptance.yml up -d --no-deps --force-recreate monitor
+# 本地开发构建仅用于开发验证，须显式指定 local 标签，不能作为最终上线验收依据：
+#   MONITOR_ACCEPTANCE_IMAGE=newapi-monitor:local-acceptance \
+#     docker compose -f docker-compose.local-acceptance.yml build monitor
+# 不要使用 `down -v`，也不要删除 Docker 卷
+# newapi-monitor-local-data / newapi-monitor-local-backup。
 services:
   redis:
     image: redis:7-alpine
-    container_name: newapi-monitor-local-redis
+    container_name: ${MONITOR_ACCEPTANCE_REDIS_CONTAINER:-newapi-monitor-local-redis}
     command:
       - redis-server
       - --requirepass
@@ -25,7 +32,7 @@ services:
       - "no"
     ports:
       # 只供本机真实 Redis 集成测试，绝不暴露到局域网。
-      - "127.0.0.1:17379:6379"
+      - "127.0.0.1:${MONITOR_ACCEPTANCE_REDIS_PORT:-17379}:6379"
     tmpfs:
       - /data
     mem_limit: 192m
@@ -37,22 +44,28 @@ services:
       retries: 10
 
   monitor:
-    image: newapi-monitor:local-acceptance
+    # 不允许静默回退到本地 build：最终验收必须显式指定 CI 产出的不可变镜像。
+    image: ${MONITOR_ACCEPTANCE_IMAGE:?请显式指定 CI 产出的 MONITOR_ACCEPTANCE_IMAGE（SHA + digest）}
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: newapi-monitor-local-acceptance
+    container_name: ${MONITOR_ACCEPTANCE_CONTAINER:-newapi-monitor-local-acceptance}
     ports:
-      - "127.0.0.1:8100:8090"
-      - "127.0.0.1:8101:8091"
+      - "127.0.0.1:${MONITOR_ACCEPTANCE_ADMIN_PORT:-8100}:8090"
+      - "127.0.0.1:${MONITOR_ACCEPTANCE_PORTAL_PORT:-8101}:8091"
     environment:
-      # 只读线上 MySQL 连接由启动命令临时传入，绝不写入仓库。
-      # 留空时应用会拒绝启动；这样仅 build 镜像时无需取得线上只读凭据。
+      # 只允许叠加本地事实源覆盖文件或显式传入本机隔离 DSN；默认留空，
+      # 绝不把线上连接当成本地验收的隐式回退。
       NEWAPI_LOG_DSN: ${NEWAPI_LOG_DSN:-}
       MONITOR_ADDR: ":8090"
       MONITOR_PORTAL_ADDR: ":8091"
       MONITOR_STORE_PATH: /data/nexus_monitor.db
-      MONITOR_NEWAPI_BASE_URL: https://nexusapi.link
+      MONITOR_USAGE_FACTS_STORE_PATH: /data/usage-facts.db
+      MONITOR_STORE_BACKUP_DIR: /backup
+      MONITOR_SOURCE_WORKER_ENABLED: "true"
+      MONITOR_SOURCE_LEASE_REQUIRED: "true"
+      MONITOR_SOURCE_LEASE_NAME: newapi-monitor-source-worker-v1
+      MONITOR_NEWAPI_BASE_URL: ${MONITOR_NEWAPI_BASE_URL:-}
       MONITOR_SESSION_SECRET: ${MONITOR_SESSION_SECRET:-local-acceptance-session-only}
       # 与线上相同架构：Redis 只保存可重算聚合；活跃区间 60 秒、已闭合历史区间 10 分钟。
       MONITOR_USAGE_REDIS_ADDR: redis:6379
@@ -60,13 +73,23 @@ services:
       MONITOR_USAGE_REDIS_DB: "0"
       MONITOR_USAGE_REDIS_PREFIX: nxmon:local:usage:v1
       # 本地验收硬性安全开关：不发邮件、不回填、不做 AWS/域名探测、不打外部心跳。
+      # 服务端监控页仅读已同步到本机 SQLite 的快照，页面可验收，不会触发探测。
       MONITOR_ALERTS_DISABLED: "true"
       MONITOR_INFRA_ENABLED: "false"
+      MONITOR_INFRA_SNAPSHOT_READ_ONLY: "true"
       # 可通过启动命令传入已下线资源名，验证历史采样会被隐藏。
       MONITOR_INFRA_EXCLUDE_RESOURCES: ${MONITOR_INFRA_EXCLUDE_RESOURCES:-}
       MONITOR_HEARTBEAT_URL: ""
-      MONITOR_BACKFILL_HOURS: "0"
-      MONITOR_SAMPLE_SECONDS: "3600"
+      # 本地验收重建后必须立即具备模型监控数据：启动时只补最近 1 小时，
+      # 之后每 5 分钟采一个小重叠窗口。相比每小时一次的大窗口，单次只读
+      # 查询更小，也避免容器重建后等待一小时才看到数据。
+      MONITOR_BACKFILL_HOURS: "1"
+      MONITOR_SAMPLE_SECONDS: "300"
+      # 用户用量事实层在本地验收时必须显式关闭：不允许页面测试触发线上只读 logs 回填。
+      MONITOR_USAGE_FACTS_ENABLED: "false"
+      MONITOR_USAGE_FACTS_READ_ENABLED: "false"
+      # 本地验收不得轮询任何上游账户余额或使用日志。
+      MONITOR_UPSTREAM_SYNC_ENABLED: "false"
       # 总开关关闭后，旧的 queued/running 任务也不会在本地重启续跑。
       MONITOR_STABILITY_BACKFILL_ENABLED: "false"
       MONITOR_STABILITY_AUTO_REPAIR: "false"
@@ -76,7 +99,8 @@ services:
       MONITOR_NGINX_ALLOWED_NODES: "local-nginx"
       MONITOR_INGEST_TOKEN: "local-acceptance-ingest-only"
     volumes:
-      - ./.local-data:/data
+      - monitor_local_data:/data
+      - monitor_local_backup:/backup
     read_only: true
     tmpfs:
       - /tmp:size=16m,mode=1777
@@ -90,3 +114,21 @@ services:
         condition: service_healthy
     mem_limit: 256m
     restart: unless-stopped
+    stop_grace_period: 40s
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8090/live"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  monitor_local_data:
+    name: ${MONITOR_ACCEPTANCE_VOLUME:-newapi-monitor-local-data}
+    # 验收数据卷由本机独立维护，Compose 只挂载、不创建/删除。
+    # 这样即使误用 `docker compose down -v` 也不会删除 SQLite。
+    external: true
+  monitor_local_backup:
+    name: ${MONITOR_ACCEPTANCE_BACKUP_VOLUME:-newapi-monitor-local-backup}
+    # 与 /data 分离，用于验证生产的成套 backup-set 和新卷恢复路径。
+    external: true

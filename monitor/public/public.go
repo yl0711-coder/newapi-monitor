@@ -9,6 +9,7 @@ package public
 
 import (
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"regexp"
@@ -20,6 +21,7 @@ import (
 	_ "embed"
 
 	"github.com/gin-gonic/gin"
+	"github.com/yl0711-coder/newapi-monitor/internal/trafficclass"
 	"gorm.io/gorm"
 )
 
@@ -296,7 +298,7 @@ func (h *handler) totals(since int64) map[string]agg {
 		COALESCE(SUM(lat_1),0) l1, COALESCE(SUM(lat_2),0) l2, COALESCE(SUM(lat_5),0) l5, COALESCE(SUM(lat_10),0) l10,
 		COALESCE(SUM(lat_30),0) l30, COALESCE(SUM(lat_60),0) l60, COALESCE(SUM(lat_inf),0) linf,
 		COALESCE(MAX(max_use_time),0) mx
-		FROM metric_samples WHERE bucket_ts >= ?`+enabledChanFilter+` GROUP BY grp, model_name`, since).Scan(&rows).Error; err != nil {
+		FROM metric_samples WHERE bucket_ts >= ?`+currentUserTrafficFilter+enabledChanFilter+` GROUP BY grp, model_name`, since).Scan(&rows).Error; err != nil {
 		slog.Warn("看板:分组×模型汇总查询失败(降级为空)", "err", err)
 	}
 	out := make(map[string]agg, len(rows))
@@ -315,6 +317,8 @@ func (h *handler) totals(since int64) map[string]agg {
 const enabledChanFilter = ` AND NOT EXISTS (SELECT 1 FROM channel_snaps c ` +
 	`WHERE c.id = metric_samples.channel_id AND (c.status <> 1 OR metric_samples.bucket_ts < c.enabled_since))`
 
+var currentUserTrafficFilter = fmt.Sprintf(` AND metric_samples.traffic_class_version = %d`, trafficclass.Current)
+
 type seriesPt struct {
 	Ts   int64
 	Up   int64
@@ -331,7 +335,7 @@ func (h *handler) series(since int64) map[string][]seriesPt {
 	}
 	if err := h.db.Raw(`SELECT grp, model_name AS model, bucket_ts,
 		COALESCE(SUM(success+anomaly),0) up, COALESCE(SUM(failed),0) fail
-		FROM metric_samples WHERE bucket_ts >= ?`+enabledChanFilter+` GROUP BY grp, model_name, bucket_ts ORDER BY bucket_ts`, since).Scan(&rows).Error; err != nil {
+		FROM metric_samples WHERE bucket_ts >= ?`+currentUserTrafficFilter+enabledChanFilter+` GROUP BY grp, model_name, bucket_ts ORDER BY bucket_ts`, since).Scan(&rows).Error; err != nil {
 		slog.Warn("看板:分桶序列查询失败(降级为空)", "err", err)
 	}
 	out := map[string][]seriesPt{}

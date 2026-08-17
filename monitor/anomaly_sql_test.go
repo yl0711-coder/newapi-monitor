@@ -44,6 +44,9 @@ SUM(type=2 AND {{STREAMBAD}} AND NOT {{ZERO}}) AS anomaly_stream`
 // 只有打到库才炸,所以必须有断言兜住。
 func TestSampleWindowSQLPlaceholderCount(t *testing.T) {
 	q := sampleWindowSQL()
+	if !strings.Contains(q, "MAX_EXECUTION_TIME(8000)") {
+		t.Fatal("常规来源聚合必须有 8 秒 MySQL 服务端硬上限")
+	}
 	if n := strings.Count(q, "?"); n != 2 {
 		t.Fatalf("sampleWindowSQL 应有 2 个 ?(fromTs, toTs),实际 %d 个", n)
 	}
@@ -57,5 +60,65 @@ func TestSampleWindowSQLPlaceholderCount(t *testing.T) {
 	}
 	if !strings.Contains(q, "type IN (2,5)") {
 		t.Error("只取消费日志与错误日志两类")
+	}
+	for _, marker := range []string{
+		"COALESCE(token_name,'')='模型测试' AND COALESCE(content,'')='模型测试'",
+		"AND NOT (",
+	} {
+		if !strings.Contains(q, marker) {
+			t.Errorf("用户流量 SQL 必须排除渠道测试标记 %q", marker)
+		}
+	}
+}
+
+func TestSourceEpochStartupLookbackIsDurablyBounded(t *testing.T) {
+	now := int64(10_000)
+	if got := boundedSourceEpochStartupLookback(24, now, 0); got != 3600 {
+		t.Fatalf("fresh start replayed an operator-sized window: got %ds", got)
+	}
+	if got := boundedSourceEpochStartupLookback(24, now, now-600); got != 720 {
+		t.Fatalf("durable watermark was ignored: got %ds want 720s", got)
+	}
+	if got := boundedSourceEpochStartupLookback(24, now, now-30); got != 180 {
+		t.Fatalf("small restart overlap=%ds want 180s", got)
+	}
+	if got := boundedSourceEpochStartupLookback(0, now, 0); got != 0 {
+		t.Fatalf("disabled startup catchup=%ds", got)
+	}
+}
+
+func TestTokenSampleSQLHasServerExecutionLimit(t *testing.T) {
+	q := sampleTokenSQL()
+	if !strings.Contains(q, "MAX_EXECUTION_TIME(8000)") {
+		t.Fatal("token 来源聚合必须有 8 秒 MySQL 服务端硬上限")
+	}
+	if n := strings.Count(q, "?"); n != 2 {
+		t.Fatalf("token SQL placeholders=%d want 2", n)
+	}
+	if !strings.Contains(q, "created_at >= ? AND created_at < ?") {
+		t.Fatal("token 来源聚合必须使用显式半开区间")
+	}
+}
+
+func TestChannelTestPredicateUsesOnlyUnmodifiedNewAPILegacyShapes(t *testing.T) {
+	predicate := channelTestLogPredicateSQL()
+	if !strings.Contains(predicate, "COALESCE(token_name,'')='模型测试' AND COALESCE(content,'')='模型测试'") {
+		t.Fatalf("旧日志必须同时匹配 token_name/content，避免误伤普通用户令牌: %s", predicate)
+	}
+	for _, marker := range []string{
+		"type=5 AND user_id=1",
+		"COALESCE(token_id,0)=0",
+		"COALESCE(request_id,'')=''",
+	} {
+		if !strings.Contains(predicate, marker) {
+			t.Fatalf("旧版批量测试失败必须用完整合成请求特征识别，缺少 %q: %s", marker, predicate)
+		}
+	}
+	if strings.Contains(predicate, "channel_test_audit") || strings.Contains(predicate, "$.is_channel_test") {
+		t.Fatalf("Monitor 不得依赖需要修改 NewAPI 才会出现的字段: %s", predicate)
+	}
+	origin := channelTestOriginSQL(predicate)
+	if strings.Contains(origin, "channel_test_origin") || !strings.Contains(origin, "'legacy'") {
+		t.Fatalf("旧日志无法证明手动/定时来源，只能标记 legacy: %s", origin)
 	}
 }
