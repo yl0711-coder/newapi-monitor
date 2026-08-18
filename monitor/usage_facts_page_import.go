@@ -1208,9 +1208,22 @@ func (m *Monitor) executeUsageFactHistoryTailRawPages(ctx context.Context, claim
 			}
 		}
 		if current.NextHour >= current.ThroughTs {
-			current.Kind, current.Status, current.CompletedAt = usageFactHistoryKindVerify, usageFactHistoryJobQueued, 0
-			memberUpdates["coverage_status"] = "verifying"
-			memberUpdates["verification_status"] = "running"
+			dayTarget := usageFactDayStart(current.ThroughTs)
+			alreadyVerified := currentMember.VerificationStatus == "complete" && currentMember.VerifiedThroughHour != nil &&
+				*currentMember.VerifiedThroughHour >= dayTarget
+			current.Kind = usageFactHistoryKindVerify
+			if alreadyVerified {
+				// Intraday Tail adds hours inside a natural day whose durable day
+				// checkpoint is unchanged. Keep the signed serving state ready and
+				// avoid a redundant verify turn that would transiently close reads.
+				current.Status, current.CompletedAt = usageFactHistoryJobComplete, nowUnix
+				memberUpdates["coverage_status"] = "ready"
+				memberUpdates["verification_status"] = "complete"
+			} else {
+				current.Status, current.CompletedAt = usageFactHistoryJobQueued, 0
+				memberUpdates["coverage_status"] = "verifying"
+				memberUpdates["verification_status"] = "running"
+			}
 		}
 		if err := tx.Save(&current).Error; err != nil {
 			return err

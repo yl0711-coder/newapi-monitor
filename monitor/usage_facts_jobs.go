@@ -1890,6 +1890,41 @@ func usageFactMemberRecentServiceReady(state UsageFactMemberState, revision, thr
 		*state.SourceFirstLogHour >= *state.SourceFloorHour
 }
 
+// usageFactMemberPublishedCheckpointReady validates the immutable range that is
+// already published, not the mutable candidate status of the next Tail turn.
+// During an intraday Tail advance the worker may temporarily mark the candidate
+// job as verifying. That must not revoke an older, fully signed serving range.
+// Content corruption and authority changes remain fail-closed through repair
+// holds, the published signature checks and the trailing-hour content audit.
+func usageFactMemberPublishedCheckpointReady(state UsageFactMemberState, row UsageFactPublishedMember, revision, through int64, sourceEpoch string) (full, recent bool) {
+	if !state.Active || revision < 1 || state.TrackedRevision != revision || sourceEpoch == "" ||
+		state.SourceEpoch != sourceEpoch || state.SourceEpoch != row.SourceEpoch ||
+		state.ClassificationVersion != row.ClassificationVersion ||
+		state.QuerySemanticsVersion != row.QuerySemanticsVersion ||
+		state.SourceFloorHour == nil || *state.SourceFloorHour <= 0 || state.SourceFloorCheckedAt <= 0 {
+		return false, false
+	}
+	if state.SourceHistoryStatus == "no_history" {
+		if state.SourceFirstLogHour != nil {
+			return false, false
+		}
+	} else if state.SourceHistoryStatus != "complete_hot" || state.SourceFirstLogHour == nil ||
+		*state.SourceFirstLogHour < *state.SourceFloorHour {
+		return false, false
+	}
+	if *state.SourceFloorHour == row.SourceFloorHour && state.TailThroughHour != nil &&
+		*state.TailThroughHour >= through && state.VerifiedThroughHour != nil &&
+		*state.VerifiedThroughHour >= row.VerifiedThroughHour {
+		return true, false
+	}
+	if state.LiveFromHour != nil && *state.LiveFromHour == row.SourceFloorHour &&
+		state.LiveThroughHour != nil && *state.LiveThroughHour >= through &&
+		state.LiveTargetHour != nil && *state.LiveTargetHour >= through {
+		return false, true
+	}
+	return false, false
+}
+
 func auditUsageFactRecentServiceRange(db *gorm.DB, state UsageFactMemberState, through int64) error {
 	if state.LiveFromHour == nil || *state.LiveFromHour <= 0 || through <= *state.LiveFromHour {
 		return errors.New("recent service audit range is unavailable")
@@ -2342,11 +2377,7 @@ func (m *Monitor) validateUsageFactFullHistoryCheckpoint(ctx context.Context, th
 		if err := db.First(&state, "user_id = ?", row.UserID).Error; err != nil {
 			return err
 		}
-		fullReady := usageFactMemberFullHistoryReady(state, control.TrackedRevision, through, epoch) &&
-			state.SourceFloorHour != nil && *state.SourceFloorHour == row.SourceFloorHour &&
-			state.VerifiedThroughHour != nil && *state.VerifiedThroughHour >= row.VerifiedThroughHour
-		recentReady := usageFactMemberRecentServiceReady(state, control.TrackedRevision, through, epoch) &&
-			state.LiveFromHour != nil && *state.LiveFromHour == row.SourceFloorHour
+		fullReady, recentReady := usageFactMemberPublishedCheckpointReady(state, row, control.TrackedRevision, through, epoch)
 		if !state.Active || state.TrackedRevision != control.TrackedRevision || state.SourceEpoch != row.SourceEpoch ||
 			state.ClassificationVersion != row.ClassificationVersion || state.QuerySemanticsVersion != row.QuerySemanticsVersion ||
 			(!fullReady && !recentReady) {
@@ -3031,6 +3062,16 @@ func (m *Monitor) executeUsageFactHistoryTail(ctx context.Context, claim usageFa
 					memberUpdates["coverage_status"] = "ready"
 					memberUpdates["verification_status"] = "complete"
 					memberUpdates["verified_at"] = nowUnix
+				} else if memberState.VerificationStatus == "complete" && memberState.VerifiedThroughHour != nil &&
+					*memberState.VerifiedThroughHour >= usageFactDayStart(job.ThroughTs) {
+					// The Tail remained within an already verified CST day. Preserve
+					// the serving checkpoint; midnight rollover still takes the normal
+					// durable verify path below.
+					job.Kind = usageFactHistoryKindVerify
+					job.Status = usageFactHistoryJobComplete
+					job.CompletedAt = nowUnix
+					memberUpdates["coverage_status"] = "ready"
+					memberUpdates["verification_status"] = "complete"
 				} else {
 					job.Kind = usageFactHistoryKindVerify
 					job.Status = usageFactHistoryJobQueued

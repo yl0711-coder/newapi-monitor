@@ -880,6 +880,55 @@ func TestRawPageTailYieldsHighVolumeHourWithoutFallingBackToGroupQuery(t *testin
 	}
 }
 
+func TestRawPageIntradayTailKeepsCompletedDayCheckpointReady(t *testing.T) {
+	m := newUsageHistoryTestMonitor(t)
+	m.cfg.UsageFactsRawPageImportEnabled = true
+	const userID int64 = 917
+	day := time.Date(2026, 8, 17, 0, 0, 0, 0, usageCST).Unix()
+	hour := day + 9*usageFactHourSeconds
+	through := hour + usageFactHourSeconds
+	now := time.Unix(through+usageFactHourSeconds, 0)
+	nowUnix := now.Unix()
+	prepareUsageHistoryCommitMember(t, m, userID, 1)
+	epoch := m.cfg.UsageFactsHistorySourceEpoch
+	if err := m.usageFactsStore().Model(&UsageFactMemberState{}).Where("user_id = ?", userID).Updates(map[string]any{
+		"source_epoch": epoch, "classification_version": userTrafficClassificationVersion,
+		"query_semantics_version": usageFactQuerySemanticsVersion, "source_history_status": "complete_hot",
+		"source_floor_hour": day, "source_first_log_hour": day, "source_floor_checked_at": nowUnix,
+		"coverage_status": "ready", "coverage_through_hour": day,
+		"tail_through_hour": hour, "verification_status": "complete",
+		"verified_through_hour": day, "verify_next_hour": day,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	job := UsageFactJob{
+		ID: usageFactHistoryJobID(userID, 1), Kind: usageFactHistoryKindTail, Priority: 100, UserID: ptrInt64(userID),
+		TrackedRevision: 1, SourceEpoch: epoch, FromTs: hour, ThroughTs: through, NextHour: hour,
+		TotalHours: 1, CompletedHours: 0,
+		VerifiedHours: 0, VerifyNextHour: day, Status: usageFactHistoryJobRunning, LeaseOwner: "intraday-tail",
+		LeaseUntil: now.Add(time.Minute).Unix(), CreatedAt: nowUnix, UpdatedAt: nowUnix,
+	}
+	if err := m.usageFactsStore().Create(&job).Error; err != nil {
+		t.Fatal(err)
+	}
+	claim := usageFactHistoryClaim{Jobs: []UsageFactJob{job}, LeaseOwner: job.LeaseOwner, From: hour, Through: through}
+	if err := m.executeUsageFactHistoryTailRawPages(context.Background(), claim, now); err != nil {
+		t.Fatal(err)
+	}
+	job = resumeUsageFactRawJobUntil(t, m, job.ID, through, now, m.executeUsageFactHistoryTailRawPages)
+	if job.Kind != usageFactHistoryKindVerify || job.Status != usageFactHistoryJobComplete || job.CompletedAt == 0 {
+		t.Fatalf("intraday Tail scheduled a redundant verify turn: %+v", job)
+	}
+	var state UsageFactMemberState
+	if err := m.usageFactsStore().First(&state, "user_id = ?", userID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if state.CoverageStatus != "ready" || state.VerificationStatus != "complete" ||
+		state.TailThroughHour == nil || *state.TailThroughHour != through {
+		t.Fatalf("intraday Tail closed the signed serving checkpoint: %+v", state)
+	}
+}
+
 func TestRawPageRepairHourYieldsHighVolumeHourAndKeepsRepairCursor(t *testing.T) {
 	m := newUsageHistoryTestMonitor(t)
 	m.cfg.UsageFactsRawPageImportEnabled = true

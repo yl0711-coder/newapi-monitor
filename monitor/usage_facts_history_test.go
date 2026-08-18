@@ -1476,6 +1476,71 @@ func TestFullHistoryPublisherServesRecentWindowBeforeArchiveAndLaterExpandsLeft(
 	}
 }
 
+func TestFullHistoryCheckpointKeepsPublishedRangeReadyDuringNextTailVerification(t *testing.T) {
+	m := newUsageHistoryTestMonitor(t)
+	m.cfg.UsageFactsReadEnabled = true
+	const userID int64 = 505
+	prepareUsageHistoryCommitMember(t, m, userID, 1)
+
+	now := time.Date(2026, 8, 18, 18, 20, 0, 0, usageCST)
+	through := m.usageFactFinalizedHour(now)
+	floor := usageFactDayStart(through - 2*usageFactDaySeconds)
+	verifiedThrough := usageFactDayStart(through)
+	nowUnix := now.Unix()
+	if err := m.usageFactsStore().Model(&UsageFactMemberState{}).Where("user_id = ?", userID).Updates(map[string]any{
+		"active": true, "tracked_revision": int64(1), "source_floor_hour": floor,
+		"source_floor_checked_at": nowUnix, "source_history_status": "no_history",
+		"coverage_status": "ready", "coverage_through_hour": verifiedThrough,
+		"tail_through_hour": through, "verification_status": "complete",
+		"verify_next_hour": verifiedThrough, "verified_through_hour": verifiedThrough,
+		"verified_at": nowUnix, "classification_version": userTrafficClassificationVersion,
+		"query_semantics_version": usageFactQuerySemanticsVersion,
+		"source_epoch":            m.cfg.UsageFactsHistorySourceEpoch, "updated_at": nowUnix,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	uid := userID
+	job := UsageFactJob{
+		ID: usageFactHistoryJobID(uid, 1), Kind: usageFactHistoryKindVerify, UserID: &uid,
+		TrackedRevision: 1, SourceEpoch: m.cfg.UsageFactsHistorySourceEpoch,
+		FromTs: floor, ThroughTs: through, NextHour: through, VerifyNextHour: verifiedThrough,
+		TotalHours: (through - floor) / usageFactHourSeconds, CompletedHours: (through - floor) / usageFactHourSeconds,
+		VerifiedHours: (verifiedThrough - floor) / usageFactHourSeconds,
+		Status:        usageFactHistoryJobComplete, CreatedAt: nowUnix, UpdatedAt: nowUnix, CompletedAt: nowUnix,
+	}
+	if err := m.usageFactsStore().Create(&job).Error; err != nil {
+		t.Fatal(err)
+	}
+	published, err := m.publishUsageFactFullHistorySnapshot(context.Background(), now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if published.PublishedThrough != through {
+		t.Fatalf("published through=%d want=%d", published.PublishedThrough, through)
+	}
+
+	// A candidate Tail turn may be marked verifying while the immutable service
+	// range is still fully signed. The old range must remain readable.
+	if err := m.usageFactsStore().Model(&UsageFactMemberState{}).Where("user_id = ?", userID).Updates(map[string]any{
+		"coverage_status": "verifying", "verification_status": "running", "updated_at": nowUnix + 1,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := m.validateUsageFactFullHistoryCheckpoint(context.Background(), through); err != nil {
+		t.Fatalf("in-flight next Tail invalidated the published checkpoint: %v", err)
+	}
+
+	// The tolerance is bounded by the published watermark: a real hour gap must
+	// still fail closed.
+	if err := m.usageFactsStore().Model(&UsageFactMemberState{}).Where("user_id = ?", userID).
+		Update("tail_through_hour", through-usageFactHourSeconds).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := m.validateUsageFactFullHistoryCheckpoint(context.Background(), through); err == nil {
+		t.Fatal("published checkpoint accepted a member below the serving watermark")
+	}
+}
+
 func TestRawPagePipelineResumesOnlyLegacyWorkloadPauses(t *testing.T) {
 	workload := UsageFactJob{
 		Kind: usageFactHistoryKindBackfill, Status: usageFactHistoryJobPaused,
