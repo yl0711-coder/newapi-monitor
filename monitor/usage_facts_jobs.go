@@ -153,7 +153,12 @@ type usageFactHistoryTuning struct {
 }
 
 func defaultUsageFactHistoryTuning() usageFactHistoryTuning {
-	return usageFactHistoryTuning{chunkDays: usageFactHistoryInitialMaxDays, memberLimit: usageFactHistoryMaxMembers}
+	// The source logs index is led by user_id.  Starting a cold import with a
+	// wide user_id IN (...) range makes MySQL prefer a table scan on real-world
+	// distributions, even when every individual member-day is a cheap indexed
+	// range.  Keep one member per source range; adaptive tuning may widen only
+	// the time window after repeatedly fast, bounded reads.
+	return usageFactHistoryTuning{chunkDays: usageFactHistoryInitialMaxDays, memberLimit: 1}
 }
 
 // usageFactsFullHistoryMode describes the on-disk/read semantics. A restored
@@ -2675,7 +2680,6 @@ func updateUsageFactHistoryTuning(tuning *usageFactHistoryTuning, result usageFa
 		tuning.healthy++
 		if tuning.healthy >= usageFactHistoryHealthyToGrow {
 			tuning.chunkDays = nextUsageFactHistoryChunkDays(tuning.chunkDays)
-			tuning.memberLimit = usageFactHistoryMaxMembers
 			tuning.healthy = 0
 		}
 		return

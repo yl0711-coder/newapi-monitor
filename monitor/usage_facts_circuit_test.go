@@ -50,6 +50,20 @@ func TestUsageFactBulkCircuitTripsOnThreeSlowSuccessfulQueries(t *testing.T) {
 	}
 }
 
+func TestUsageFactHistoryTuningKeepsSourceRangesSingleMember(t *testing.T) {
+	tuning := defaultUsageFactHistoryTuning()
+	if tuning.memberLimit != 1 || tuning.chunkDays != 1 {
+		t.Fatalf("cold history must begin with one member-day, got %+v", tuning)
+	}
+	fast := usageFactHistoryRange{SourceQueries: 2, QueryDuration: time.Second}
+	for i := 0; i < usageFactHistoryHealthyToGrow; i++ {
+		updateUsageFactHistoryTuning(&tuning, fast)
+	}
+	if tuning.memberLimit != 1 || tuning.chunkDays != 2 {
+		t.Fatalf("only the time window may widen after fast reads, got %+v", tuning)
+	}
+}
+
 func TestUsageFactBulkCircuitPersistsAcrossSchedulerTurns(t *testing.T) {
 	m := newUsageHistoryTestMonitor(t)
 	now := time.Unix(3_000_000, 0)
