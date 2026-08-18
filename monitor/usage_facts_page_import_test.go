@@ -7,12 +7,32 @@ import (
 	"sort"
 	"testing"
 	"time"
+
+	"gorm.io/gorm"
 )
 
 type usageFactRawPageTestSource struct {
 	events        []usageFactRawEvent
 	fetchCalls    int
 	failFetchCall int
+}
+
+type usageFactRawPageHookSource struct {
+	base *usageFactRawPageTestSource
+	hook func([]usageFactRawEvent) error
+}
+
+func (s *usageFactRawPageHookSource) FetchUsageFactRawPage(ctx context.Context, userID, fromTs, throughTs, afterCreatedAt int64, afterType int, afterID int64, limit int) ([]usageFactRawEvent, error) {
+	page, err := s.base.FetchUsageFactRawPage(ctx, userID, fromTs, throughTs, afterCreatedAt, afterType, afterID, limit)
+	if err != nil || s.hook == nil {
+		return page, err
+	}
+	hook := s.hook
+	s.hook = nil
+	if err := hook(page); err != nil {
+		return nil, err
+	}
+	return page, nil
 }
 
 func newUsageFactRawPageTestSource(events []usageFactRawEvent) *usageFactRawPageTestSource {
@@ -193,6 +213,78 @@ func TestUsageFactRawPageImportHighVolumeResumesAndControls(t *testing.T) {
 	}
 	if !usageFactMetricsEqual(factsMetrics(rows), wantMetrics) || usageFactContentHash(rows) != checkpoint.ContentHash {
 		t.Fatalf("local aggregation differs from the bounded source pages: got=%+v want=%+v", factsMetrics(rows), wantMetrics)
+	}
+}
+
+// Live and cold history intentionally share one durable page checkpoint. If
+// both read the same source page concurrently, the cursor CAS must let exactly
+// one writer commit. The loser yields without overwriting/double-counting and
+// can consume the winner's proof on its next turn.
+func TestUsageFactRawPageConcurrentWinnerMakesLoserYieldAndResume(t *testing.T) {
+	m := newTestMonitor(t)
+	const (
+		userID = int64(902)
+		hour   = int64(1_786_996_800)
+		epoch  = "concurrent-page-epoch"
+	)
+	base := newUsageFactRawPageTestSource(makeUsageFactRawPageEvents(hour, userID, 1))
+	source := &usageFactRawPageHookSource{base: base}
+	source.hook = func(page []usageFactRawEvent) error {
+		if len(page) != 1 {
+			return fmt.Errorf("winner page rows=%d, want 1", len(page))
+		}
+		facts, err := usageFactRawEventsToRangeFacts(hour, hour+usageFactHourSeconds, userID, page)
+		if err != nil {
+			return err
+		}
+		metrics := usageFactRawEventMetrics(page)
+		last := page[len(page)-1]
+		return m.usageFactsStore().Transaction(func(tx *gorm.DB) error {
+			var current UsageFactPageIngestState
+			if err := tx.First(&current, "user_id = ? AND hour_ts = ?", userID, hour).Error; err != nil {
+				return err
+			}
+			if err := upsertUsageFactRawPageFacts(tx, facts); err != nil {
+				return err
+			}
+			addUsageFactRawMetrics(&current, metrics)
+			current.RawHash = usageFactRawRollingHash(current.RawHash, page)
+			current.CursorCreatedAt, current.CursorType, current.CursorID = last.CreatedAt, last.Type, last.ID
+			current.Pages = 1
+			current.Status = "verifying"
+			current.UpdatedAt = time.Now().Unix()
+			return tx.Save(&current).Error
+		})
+	}
+
+	complete, err := importUsageFactRawPages(context.Background(), m.usageFactsStore(), source, userID, hour, epoch, usageFactRawPagesPerTurn)
+	if complete || !errors.Is(err, errUsageFactRawPageSuperseded) {
+		t.Fatalf("loser complete=%v err=%v; want durable superseded yield", complete, err)
+	}
+	if !usageFactHistoryFailureIsSourceGlobal(err) {
+		t.Fatalf("superseded cursor would consume a retry attempt: %v", err)
+	}
+
+	for turn := 0; turn < 3 && !complete; turn++ {
+		complete, err = importUsageFactRawPages(context.Background(), m.usageFactsStore(), source, userID, hour, epoch, usageFactRawPagesPerTurn)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if !complete {
+		t.Fatal("loser did not consume winner proof on its next bounded turn")
+	}
+	rows, err := loadUsageFactRange(m.usageFactsStore(), hour, hour+usageFactHourSeconds, userID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	metrics := factsMetrics(rows)
+	want := usageFactRawEventMetrics(base.events)
+	if usageFactRawRecordCount(metrics) != 1 || metrics.Requests != want.Requests ||
+		metrics.RefundRecords != want.RefundRecords || metrics.PromptTokens != want.PromptTokens ||
+		metrics.CompletionTokens != want.CompletionTokens || metrics.ConsumeQuota != want.ConsumeQuota ||
+		metrics.RefundQuota != want.RefundQuota {
+		t.Fatalf("concurrent page was double-counted or lost: rows=%+v metrics=%+v", rows, metrics)
 	}
 }
 

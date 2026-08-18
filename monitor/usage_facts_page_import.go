@@ -28,9 +28,10 @@ const usageFactRawShardMediumHours = 3
 const usageFactRawPageLegacyDayProofError = "日终 24 小时当前来源 epoch 证明尚未完整"
 
 var (
-	errUsageFactRawPageOrder   = errors.New("原始日志分页游标顺序错误")
-	errUsageFactRawPageControl = errors.New("原始日志分页控制数不一致")
-	errUsageFactRawShardDense  = errors.New("原始日志分片密度过高，需要缩小时间范围")
+	errUsageFactRawPageOrder      = errors.New("原始日志分页游标顺序错误")
+	errUsageFactRawPageControl    = errors.New("原始日志分页控制数不一致")
+	errUsageFactRawPageSuperseded = errors.New("原始日志分页游标已由其他同步通道推进")
+	errUsageFactRawShardDense     = errors.New("原始日志分片密度过高，需要缩小时间范围")
 )
 
 // usageFactRawEvent is the minimal non-sensitive projection needed to build a
@@ -522,7 +523,7 @@ func importUsageFactRawShardPages(
 				return err
 			}
 			if current.CursorCreatedAt != state.CursorCreatedAt || current.CursorType != state.CursorType || current.CursorID != state.CursorID || current.Status == "complete" {
-				return errors.New("原始日志分页导入游标并发变化")
+				return errUsageFactRawPageSuperseded
 			}
 			if err := upsertUsageFactRawPageFacts(tx, pageFacts); err != nil {
 				return fmt.Errorf("批量写入本地分页事实失败 user=%d range=[%d,%d): %w", userID, fromTs, throughTs, err)
@@ -604,7 +605,7 @@ func verifyUsageFactRawShardPages(
 			}
 			if current.Status != "verifying" || current.VerifyCursorCreatedAt != state.VerifyCursorCreatedAt ||
 				current.VerifyCursorType != state.VerifyCursorType || current.VerifyCursorID != state.VerifyCursorID {
-				return errors.New("原始日志分页复核游标并发变化")
+				return errUsageFactRawPageSuperseded
 			}
 			current.VerifySourceRows += metrics.Rows
 			current.VerifyRequests += metrics.Requests
@@ -1046,7 +1047,7 @@ func (m *Monitor) executeUsageFactHistoryBackfillRawPages(ctx context.Context, c
 		return m.releaseUsageFactHistoryClaim(context.Background(), claim, errUsageFactAdaptiveBudget, now, true)
 	}
 	if err != nil {
-		immediate := errors.Is(err, errUsageFactSourceBusy) || errors.Is(err, context.Canceled)
+		immediate := errors.Is(err, errUsageFactSourceBusy) || errors.Is(err, context.Canceled) || errors.Is(err, errUsageFactRawPageSuperseded)
 		_ = m.releaseUsageFactHistoryClaim(context.Background(), claim, err, now, immediate)
 		return err
 	}
@@ -1143,7 +1144,7 @@ func (m *Monitor) executeUsageFactHistoryTailRawPages(ctx context.Context, claim
 		}
 		first, err := source.FetchUsageFactRawPage(ctx, *job.UserID, claim.From, claim.From+usageFactHourSeconds, 0, 0, 0, usageFactRawPageSize)
 		if err != nil {
-			immediate := errors.Is(err, errUsageFactSourceBusy) || errors.Is(err, context.Canceled)
+			immediate := errors.Is(err, errUsageFactSourceBusy) || errors.Is(err, context.Canceled) || errors.Is(err, errUsageFactRawPageSuperseded)
 			_ = m.releaseUsageFactHistoryClaim(context.Background(), claim, err, now, immediate)
 			return err
 		}
@@ -1158,7 +1159,7 @@ func (m *Monitor) executeUsageFactHistoryTailRawPages(ctx context.Context, claim
 	}
 	complete, err := importUsageFactRawPages(ctx, m.usageFactsStore(), pageSource, *job.UserID, claim.From, job.SourceEpoch, usageFactRawPagesPerTurn)
 	if err != nil {
-		immediate := errors.Is(err, errUsageFactSourceBusy) || errors.Is(err, context.Canceled)
+		immediate := errors.Is(err, errUsageFactSourceBusy) || errors.Is(err, context.Canceled) || errors.Is(err, errUsageFactRawPageSuperseded)
 		_ = m.releaseUsageFactHistoryClaim(context.Background(), claim, err, now, immediate)
 		return err
 	}
@@ -1262,7 +1263,7 @@ func (m *Monitor) executeUsageFactHistoryRepairHourRawPages(ctx context.Context,
 	}
 	complete, err := importUsageFactRawPages(ctx, m.usageFactsStore(), m.usageFactRawPageSource(true), *job.UserID, claim.From, job.SourceEpoch, usageFactRawPagesPerTurn)
 	if err != nil {
-		immediate := errors.Is(err, errUsageFactSourceBusy) || errors.Is(err, context.Canceled)
+		immediate := errors.Is(err, errUsageFactSourceBusy) || errors.Is(err, context.Canceled) || errors.Is(err, errUsageFactRawPageSuperseded)
 		_ = m.releaseUsageFactHistoryClaim(context.Background(), claim, err, now, immediate)
 		return err
 	}
@@ -1337,7 +1338,7 @@ func (m *Monitor) executeUsageFactHistorySourceAuditHourRawPages(ctx context.Con
 	}
 	complete, err := importUsageFactRawPages(ctx, m.usageFactsStore(), m.usageFactRawPageSource(true), *job.UserID, claim.From, job.SourceEpoch, usageFactRawPagesPerTurn)
 	if err != nil {
-		immediate := errors.Is(err, errUsageFactSourceBusy) || errors.Is(err, context.Canceled)
+		immediate := errors.Is(err, errUsageFactSourceBusy) || errors.Is(err, context.Canceled) || errors.Is(err, errUsageFactRawPageSuperseded)
 		_ = m.releaseUsageFactHistoryClaim(context.Background(), claim, err, now, immediate)
 		return err
 	}

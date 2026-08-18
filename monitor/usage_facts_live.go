@@ -271,6 +271,13 @@ func (m *Monitor) syncUsageFactsRawLiveTail(ctx context.Context, now time.Time) 
 		}
 		turnNow := time.Now()
 		if err := m.syncOneUsageFactRawLiveMember(ctx, state, turnNow); err != nil {
+			// Cold history and the live lane may reach the same member-hour after
+			// the source read has started. The page cursor CAS makes the loser
+			// harmless. Yield without manufacturing a member failure/backoff; its
+			// next fair turn consumes the winner's durable proof.
+			if errors.Is(err, errUsageFactRawPageSuperseded) {
+				continue
+			}
 			joined = errors.Join(joined, err)
 			if persistErr := m.recordUsageFactRawLiveFailure(context.Background(), state, err, turnNow); persistErr != nil {
 				joined = errors.Join(joined, persistErr)

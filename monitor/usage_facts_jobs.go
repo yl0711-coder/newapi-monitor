@@ -1227,7 +1227,7 @@ func (m *Monitor) releaseUsageFactHistoryClaim(ctx context.Context, claim usageF
 func usageFactHistoryFailureIsSourceGlobal(err error) bool {
 	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, errSourceNotReady) ||
 		errors.Is(err, errUsageFactSourceBusy) || errors.Is(err, errUsageFactLeaseBusy) ||
-		errors.Is(err, errUsageFactAdaptiveBudget) {
+		errors.Is(err, errUsageFactAdaptiveBudget) || errors.Is(err, errUsageFactRawPageSuperseded) {
 		return true
 	}
 	return usageFactHistoryShouldReportSourceError(err)

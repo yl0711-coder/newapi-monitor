@@ -278,6 +278,9 @@ func (m *Monitor) syncNextUsageFactRawRecentBridge(ctx context.Context, now time
 		return false, err
 	}
 	if err := m.syncOneUsageFactRawRecentMember(ctx, state, now); err != nil {
+		if errors.Is(err, errUsageFactRawPageSuperseded) {
+			return true, nil
+		}
 		if persistErr := m.recordUsageFactRawRecentFailure(context.Background(), state, err, now); persistErr != nil {
 			return true, errors.Join(err, persistErr)
 		}
