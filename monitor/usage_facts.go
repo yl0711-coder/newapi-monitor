@@ -41,7 +41,23 @@ const (
 	usageFactSourceBackoffBase   = 5 * time.Minute
 	usageFactSourceBackoffMax    = time.Hour
 	usageFactAdaptiveQueryBudget = 8
+	// A local SQLite writer (most commonly the paired online backup at
+	// startup) may briefly outlive busy_timeout.  That is not a source failure
+	// and must not postpone the high-priority live lane for its normal five
+	// minute period.  Retry locally after a bounded pause; the shared source
+	// gate still enforces all production-query spacing and duty limits.
+	usageFactLocalBusyRetry = 30 * time.Second
 )
+
+func usageFactLocalStoreBusy(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "sqlite_busy") ||
+		strings.Contains(message, "database is locked") ||
+		strings.Contains(message, "database table is locked")
+}
 
 var (
 	errUsageFactSourceBusy        = errors.New("生产用量查询槽位繁忙")
@@ -324,6 +340,55 @@ type usageAggregateReadRange struct {
 }
 
 func (m *Monitor) resolveUsageAggregateReadRange(fromTs, toTs int64) usageAggregateReadRange {
+	return m.resolveUsageAggregateReadRangeWithFloor(fromTs, toTs, m.usageFactsReadyFrom.Load())
+}
+
+// resolveUsageAggregateReadRangeForMembers binds the readable left edge to
+// every member selected by this request. The global publication starts at the
+// earliest signed member, but a group containing a recent-only member is not
+// complete before that member's own signed floor. Using the global minimum
+// here would silently omit that member and turn unknown history into zero.
+func (m *Monitor) resolveUsageAggregateReadRangeForMembers(ctx context.Context, fromTs, toTs int64, ids []int64) (usageAggregateReadRange, error) {
+	if !m.usageFactsReadRequested() || !m.usageFactsFullHistoryMode() || len(ids) == 0 || m.usageFactsLocalSnapshotReadOnly() {
+		return m.resolveUsageAggregateReadRange(fromTs, toTs), nil
+	}
+	unique := make(map[int64]struct{}, len(ids))
+	for _, id := range ids {
+		if id > 0 {
+			unique[id] = struct{}{}
+		}
+	}
+	if len(unique) == 0 {
+		return m.resolveUsageAggregateReadRange(fromTs, toTs), nil
+	}
+	memberIDs := make([]int64, 0, len(unique))
+	for id := range unique {
+		memberIDs = append(memberIDs, id)
+	}
+	var rows []UsageFactPublishedMember
+	if err := m.usageFactsStore().WithContext(ctx).Select("user_id", "source_floor_hour").
+		Where("user_id IN ?", memberIDs).Find(&rows).Error; err != nil {
+		return usageAggregateReadRange{}, err
+	}
+	if len(rows) != len(memberIDs) {
+		r := m.resolveUsageAggregateReadRange(fromTs, toTs)
+		r.Available, r.Partial = false, true
+		r.Message = "所选成员的近期用量尚未全部签收，当前拒绝生成不完整合计"
+		return r, nil
+	}
+	requiredFrom := int64(0)
+	for _, row := range rows {
+		if row.SourceFloorHour <= 0 {
+			return usageAggregateReadRange{}, fmt.Errorf("published member floor missing user_id=%d", row.UserID)
+		}
+		if row.SourceFloorHour > requiredFrom {
+			requiredFrom = row.SourceFloorHour
+		}
+	}
+	return m.resolveUsageAggregateReadRangeWithFloor(fromTs, toTs, requiredFrom), nil
+}
+
+func (m *Monitor) resolveUsageAggregateReadRangeWithFloor(fromTs, toTs, readyFrom int64) usageAggregateReadRange {
 	r := usageAggregateReadRange{
 		RequestedFrom: fromTs,
 		RequestedTo:   toTs,
@@ -341,7 +406,6 @@ func (m *Monitor) resolveUsageAggregateReadRange(fromTs, toTs int64) usageAggreg
 		return r
 	}
 
-	readyFrom := m.usageFactsReadyFrom.Load()
 	readyThrough := m.usageFactsReadyThrough.Load()
 	firstAvailable := fromTs
 	if readyFrom > 0 {
@@ -463,37 +527,53 @@ func (m *Monitor) usageFactPublishedSnapshot(ctx context.Context) (UsageFactSync
 // 新用户在历史回填完成前也不会显示半份数据。还没有发布快照时保留
 // 旧模式/测试辅助的当前名单行为。
 func (m *Monitor) listTrackedForUsageRead(ctx context.Context) ([]TrackedUser, error) {
+	tracked, _, err := m.listTrackedForUsageReadCoverage(ctx)
+	return tracked, err
+}
+
+type usageFactReadMembershipCoverage struct {
+	Active    int
+	Published int
+	Complete  bool
+}
+
+func (m *Monitor) listTrackedForUsageReadCoverage(ctx context.Context) ([]TrackedUser, usageFactReadMembershipCoverage, error) {
 	if !m.usageFactsReadRequested() {
-		return m.listTracked()
+		tracked, err := m.listTracked()
+		return tracked, usageFactReadMembershipCoverage{Active: len(tracked), Published: len(tracked), Complete: err == nil}, err
 	}
 	if !m.usageFactsReadEnabled() {
-		return nil, errUsageFactsNotReady
+		return nil, usageFactReadMembershipCoverage{}, errUsageFactsNotReady
 	}
 	qctx, cancel := usageFactQueryContext(ctx)
 	defer cancel()
 	if _, usable, err := m.usageFactPublishedSnapshot(qctx); err != nil {
-		return nil, err
+		return nil, usageFactReadMembershipCoverage{}, err
 	} else if !usable {
 		// 离线快照模式由完整小时台账证明候选库本身可读，不要求快照来自
 		// 新版“发布成员表”。这仅用于完全断开生产库的本机验收；线上采集
 		// 模式仍必须命中下面的原子发布校验，不能借此放宽。
 		if m.usageFactsLocalSnapshotReadOnly() {
 			snapshot, snapshotErr := m.loadUsageMemberControlSnapshot(qctx)
-			return snapshot.Tracked, snapshotErr
+			coverage := usageFactReadMembershipCoverage{Active: len(snapshot.Tracked), Published: len(snapshot.Tracked), Complete: snapshotErr == nil}
+			return snapshot.Tracked, coverage, snapshotErr
 		}
 		// 生产发布路径已经记录了明确左边界；此时若服务版元数据/成员表损坏，
 		// 绝不能退回当前候选名单，否则会把未补齐的新成员暴露给页面。
 		if m.usageFactsReadyFrom.Load() > 0 {
-			return nil, errUsageFactsNotReady
+			return nil, usageFactReadMembershipCoverage{}, errUsageFactsNotReady
 		}
 		snapshot, snapshotErr := m.loadUsageMemberControlSnapshot(qctx)
-		return snapshot.Tracked, snapshotErr
+		coverage := usageFactReadMembershipCoverage{Active: len(snapshot.Tracked), Published: len(snapshot.Tracked), Complete: snapshotErr == nil}
+		return snapshot.Tracked, coverage, snapshotErr
 	}
-	tracked, err := m.currentPublishedUsageMembers(qctx, nil)
+	membership, err := m.currentPublishedUsageMembership(qctx, nil)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %w", errUsageFactsNotReady, err)
+		return nil, usageFactReadMembershipCoverage{}, fmt.Errorf("%w: %w", errUsageFactsNotReady, err)
 	}
-	return tracked, nil
+	return membership.Members, usageFactReadMembershipCoverage{
+		Active: membership.Active, Published: membership.Published, Complete: membership.Complete,
+	}, nil
 }
 
 func (m *Monitor) portalTrackedMembersForUsageRead(ctx context.Context, gid int64) ([]TrackedUser, error) {
@@ -540,9 +620,15 @@ func (m *Monitor) portalTrackedMembersForUsageRead(ctx context.Context, gid int6
 		}
 		return out, nil
 	}
-	tracked, err := m.currentPublishedUsageMembers(qctx, &gid)
+	membership, err := m.currentPublishedUsageMembership(qctx, &gid)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %w", errPortalMemberStore, err)
+	}
+	if !membership.Complete {
+		// Company totals are only meaningful when every currently-authorized
+		// member of that company has a compatible publication. Other companies
+		// remain available while this one catches up.
+		return nil, errUsageFactsNotReady
 	}
 	if blocked, err := m.portalGroupHasActiveUsageFactRepair(qctx, gid); err != nil {
 		return nil, fmt.Errorf("%w: %w", errPortalMemberStore, err)
@@ -553,7 +639,7 @@ func (m *Monitor) portalTrackedMembersForUsageRead(ctx context.Context, gid int6
 		// to the affected company; unrelated customer portals keep serving.
 		return nil, errUsageFactsNotReady
 	}
-	return tracked, nil
+	return membership.Members, nil
 }
 
 func (m *Monitor) portalGroupHasActiveUsageFactRepair(ctx context.Context, gid int64) (bool, error) {
@@ -1324,12 +1410,17 @@ func (m *Monitor) runUsageFactsSync(ctx context.Context) {
 		}
 		now := time.Now()
 		if nextFacts.IsZero() || !now.Before(nextFacts) {
-			if err := m.syncUsageFactsTail(ctx, now); err != nil {
-				if !errors.Is(err, context.Canceled) && !errors.Is(err, errUsageFactSourceBusy) {
-					slog.Warn("用量事实近期同步失败", "err", err)
+			tailErr := m.syncUsageFactsTail(ctx, now)
+			if tailErr != nil {
+				if !errors.Is(tailErr, context.Canceled) && !errors.Is(tailErr, errUsageFactSourceBusy) {
+					slog.Warn("用量事实近期同步失败", "err", tailErr)
 				}
 			}
-			nextFacts = now.Add(m.usageFactJitteredDelay(m.usageFactSyncInterval(), 10))
+			nextDelay := m.usageFactSyncInterval()
+			if usageFactLocalStoreBusy(tailErr) {
+				nextDelay = usageFactLocalBusyRetry
+			}
+			nextFacts = now.Add(m.usageFactJitteredDelay(nextDelay, 10))
 		}
 		if nextProfiles.IsZero() || !now.Before(nextProfiles) {
 			if err := m.syncUsageProfiles(ctx, now); err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, errUsageFactSourceBusy) {
@@ -1621,6 +1712,25 @@ func (m *Monitor) trackedIDsForUsageFactsContext(ctx context.Context) ([]int64, 
 func (m *Monitor) syncUsageFactsTail(ctx context.Context, now time.Time) error {
 	if err := m.ensureUsageFactDerivedWritesCapacity(); err != nil {
 		return err
+	}
+	if m.usageFactsFullHistoryEnabled() && m.usageFactsRawPageImportEnabled() {
+		// Raw mode has its own durable per-member live cursor. Do not also run the
+		// legacy source-side GROUP BY Tail: two owners would duplicate source work
+		// and let a slow batch hide which member is actually stale.
+		if err := m.reconcileUsageFactHistoryJobs(ctx, now); err != nil {
+			return err
+		}
+		var tailErr error
+		if err := m.syncUsageFactsRawLiveTail(ctx, now); err != nil {
+			tailErr = errors.Join(tailErr, err)
+		}
+		if _, err := m.publishUsageFactFullHistorySnapshot(ctx, now); err != nil {
+			tailErr = errors.Join(tailErr, err)
+		}
+		if err := m.pruneUsageFacts(now); err != nil {
+			tailErr = errors.Join(tailErr, err)
+		}
+		return tailErr
 	}
 	ids, err := m.trackedIDsForUsageFactsContext(ctx)
 	if err != nil {

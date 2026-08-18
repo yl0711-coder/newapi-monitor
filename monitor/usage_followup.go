@@ -134,7 +134,26 @@ func (m *Monitor) computeFollowUpsWithCoverage(ctx context.Context, nowUnix int6
 	toTs := followUpDayStart(nowUnix + usageTZOffsetSec)
 	fromTs := toTs - int64(followUpWindowDays)*usageFactDaySeconds
 	requestedRange := newUsageMatrixRange(fromTs, toTs)
-	readRange := m.resolveUsageAggregateReadRange(fromTs, toTs)
+	var selectedIDs []int64
+	if m.usageFactsReadRequested() {
+		tracked, memberCoverage, err := m.listTrackedForUsageReadCoverage(ctx)
+		if err != nil {
+			return followUpComputation{}, err
+		}
+		if !memberCoverage.Complete {
+			return followUpComputation{
+				Companies: []FollowUpCompany{}, RequestedFrom: requestedRange.From, RequestedTo: requestedRange.To,
+				RequestedDays: followUpWindowDays,
+				Message: fmt.Sprintf("待跟进判断需要完整成员集合；当前已签收 %d/%d 个成员，补全后将自动恢复",
+					memberCoverage.Published, memberCoverage.Active),
+			}, nil
+		}
+		selectedIDs = idsOf(tracked)
+	}
+	readRange, err := m.resolveUsageAggregateReadRangeForMembers(ctx, fromTs, toTs, selectedIDs)
+	if err != nil {
+		return followUpComputation{}, err
+	}
 	result := followUpComputation{
 		Companies:     []FollowUpCompany{},
 		RequestedFrom: requestedRange.From,
@@ -164,7 +183,6 @@ func (m *Monitor) computeFollowUpsWithCoverage(ctx context.Context, nowUnix int6
 		}
 		return result, nil
 	}
-
 	items, err := m.computeFollowUpsCompleteWindow(ctx, nowUnix)
 	if err != nil {
 		return result, err

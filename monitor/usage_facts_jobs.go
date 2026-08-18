@@ -64,66 +64,117 @@ var (
 )
 
 type UsageFactHistoryMemberProgress struct {
-	UserID              int64   `json:"user_id"`
-	TrackedRevision     int64   `json:"tracked_revision"`
-	JobID               string  `json:"job_id"`
-	Stage               string  `json:"stage"`
-	JobStatus           string  `json:"job_status"`
-	CoverageStatus      string  `json:"coverage_status"`
-	SourceHistoryStatus string  `json:"source_history_status"`
-	SourceFloorHour     *int64  `json:"source_floor_hour,omitempty"`
-	SourceFirstLogHour  *int64  `json:"source_first_log_hour,omitempty"`
-	CoverageThroughHour *int64  `json:"coverage_through_hour,omitempty"`
-	TailThroughHour     *int64  `json:"tail_through_hour,omitempty"`
-	TargetThroughHour   int64   `json:"target_through_hour"`
-	CompletedHours      int64   `json:"completed_hours"`
-	TotalHours          int64   `json:"total_hours"`
-	VerifiedHours       int64   `json:"verified_hours"`
-	VerificationStatus  string  `json:"verification_status"`
-	CoveragePercent     float64 `json:"coverage_percent"`
-	Attempts            int     `json:"attempts"`
-	NextRetryAt         int64   `json:"next_retry_at"`
-	LastSuccessAt       int64   `json:"last_success_at"`
-	LastFailureAt       int64   `json:"last_failure_at"`
-	LastError           string  `json:"last_error,omitempty"`
-	Published           bool    `json:"published"`
+	UserID               int64   `json:"user_id"`
+	TrackedRevision      int64   `json:"tracked_revision"`
+	JobID                string  `json:"job_id"`
+	Stage                string  `json:"stage"`
+	JobStatus            string  `json:"job_status"`
+	CoverageStatus       string  `json:"coverage_status"`
+	SourceHistoryStatus  string  `json:"source_history_status"`
+	SourceFloorHour      *int64  `json:"source_floor_hour,omitempty"`
+	SourceFirstLogHour   *int64  `json:"source_first_log_hour,omitempty"`
+	CoverageThroughHour  *int64  `json:"coverage_through_hour,omitempty"`
+	TailThroughHour      *int64  `json:"tail_through_hour,omitempty"`
+	LiveFromHour         *int64  `json:"live_from_hour,omitempty"`
+	LiveThroughHour      *int64  `json:"live_through_hour,omitempty"`
+	LiveTargetHour       *int64  `json:"live_target_hour,omitempty"`
+	LiveLagSeconds       int64   `json:"live_lag_seconds"`
+	LiveStatus           string  `json:"live_status,omitempty"`
+	LiveAttempts         int     `json:"live_attempts"`
+	LiveLastServedSeq    int64   `json:"live_last_served_seq"`
+	LiveNextRetryAt      int64   `json:"live_next_retry_at"`
+	LiveLastSuccessAt    int64   `json:"live_last_success_at"`
+	LiveLastFailureAt    int64   `json:"live_last_failure_at"`
+	LiveLastError        string  `json:"live_last_error,omitempty"`
+	RecentFromHour       *int64  `json:"recent_from_hour,omitempty"`
+	RecentThroughHour    *int64  `json:"recent_through_hour,omitempty"`
+	RecentTargetHour     *int64  `json:"recent_target_hour,omitempty"`
+	RecentLagSeconds     int64   `json:"recent_lag_seconds"`
+	RecentStatus         string  `json:"recent_status,omitempty"`
+	RecentAttempts       int     `json:"recent_attempts"`
+	RecentNextRetryAt    int64   `json:"recent_next_retry_at"`
+	RecentLastSuccessAt  int64   `json:"recent_last_success_at"`
+	RecentLastFailureAt  int64   `json:"recent_last_failure_at"`
+	RecentLastError      string  `json:"recent_last_error,omitempty"`
+	TargetThroughHour    int64   `json:"target_through_hour"`
+	CompletedHours       int64   `json:"completed_hours"`
+	TotalHours           int64   `json:"total_hours"`
+	VerifiedHours        int64   `json:"verified_hours"`
+	VerificationStatus   string  `json:"verification_status"`
+	CoveragePercent      float64 `json:"coverage_percent"`
+	Attempts             int     `json:"attempts"`
+	NextRetryAt          int64   `json:"next_retry_at"`
+	LastSuccessAt        int64   `json:"last_success_at"`
+	LastFailureAt        int64   `json:"last_failure_at"`
+	LastError            string  `json:"last_error,omitempty"`
+	Published            bool    `json:"published"`
+	PublishedFromHour    *int64  `json:"published_from_hour,omitempty"`
+	ServiceReady         bool    `json:"service_ready"`
+	ArchiveReady         bool    `json:"archive_ready"`
+	RawPageHour          *int64  `json:"raw_page_hour,omitempty"`
+	RawPageThrough       *int64  `json:"raw_page_through,omitempty"`
+	RawPageSpanHours     int     `json:"raw_page_span_hours,omitempty"`
+	RawPagePreferredSpan int     `json:"raw_page_preferred_span_hours,omitempty"`
+	RawPageStatus        string  `json:"raw_page_status,omitempty"`
+	RawPagePages         int64   `json:"raw_page_pages,omitempty"`
+	RawPageSourceRows    int64   `json:"raw_page_source_rows,omitempty"`
+	RawPageUpdatedAt     int64   `json:"raw_page_updated_at,omitempty"`
+	RawPageLastError     string  `json:"raw_page_last_error,omitempty"`
 }
 
 type UsageFactHistoryProgress struct {
-	Enabled           bool                             `json:"enabled"`
-	SourceMode        string                           `json:"source_mode"`
-	SourceEpoch       string                           `json:"source_epoch"`
-	TotalKnown        bool                             `json:"total_known"`
-	TotalMembers      int                              `json:"total_members"`
-	ReadyMembers      int                              `json:"ready_members"`
-	PublishedMembers  int                              `json:"published_members"`
-	PendingMembers    int                              `json:"pending_members"`
-	PausedMembers     int                              `json:"paused_members"`
-	FailedMembers     int                              `json:"failed_members"`
-	CompletedHours    int64                            `json:"completed_hours"`
-	VerifiedHours     int64                            `json:"verified_hours"`
-	TotalHours        int64                            `json:"total_hours"`
-	CoveragePercent   float64                          `json:"coverage_percent"`
-	EstimatedSeconds  *int64                           `json:"estimated_seconds"`
-	EstimateStatus    string                           `json:"estimate_status"`
-	ThroughputHoursPS float64                          `json:"throughput_hours_per_second"`
-	EstimateSampleSec int64                            `json:"estimate_sample_seconds"`
-	DiskBlocked       bool                             `json:"disk_blocked"`
-	DiskPressure      string                           `json:"disk_pressure"`
-	DiskFreeBytes     int64                            `json:"disk_free_bytes"`
-	DiskUsedPercent   float64                          `json:"disk_used_percent"`
-	AsOf              int64                            `json:"as_of"`
-	Members           []UsageFactHistoryMemberProgress `json:"members"`
-	Maintenance       []UsageFactMaintenanceProgress   `json:"maintenance"`
-	ActiveRepairs     int                              `json:"active_repairs"`
-	PausedMaintenance int                              `json:"paused_maintenance"`
-	BulkCircuitState  string                           `json:"bulk_circuit_state"`
-	BulkOpenedUntil   int64                            `json:"bulk_opened_until"`
-	BulkSlowStreak    int                              `json:"bulk_slow_streak"`
-	BulkFailureStreak int                              `json:"bulk_failure_streak"`
-	BulkLastQueryMS   int64                            `json:"bulk_last_query_ms"`
-	BulkLastQueryAt   int64                            `json:"bulk_last_query_at"`
-	BulkLastError     string                           `json:"bulk_last_error,omitempty"`
+	Enabled                bool                             `json:"enabled"`
+	SourceMode             string                           `json:"source_mode"`
+	SourceEpoch            string                           `json:"source_epoch"`
+	TotalKnown             bool                             `json:"total_known"`
+	TotalMembers           int                              `json:"total_members"`
+	ReadyMembers           int                              `json:"ready_members"`
+	PublishedMembers       int                              `json:"published_members"`
+	PendingMembers         int                              `json:"pending_members"`
+	ServiceReadyMembers    int                              `json:"service_ready_members"`
+	ArchiveReadyMembers    int                              `json:"archive_ready_members"`
+	ArchivePendingMembers  int                              `json:"archive_pending_members"`
+	LiveReadyMembers       int                              `json:"live_ready_members"`
+	LivePendingMembers     int                              `json:"live_pending_members"`
+	LiveMaxLagSeconds      int64                            `json:"live_max_lag_seconds"`
+	RecentReadyMembers     int                              `json:"recent_ready_members"`
+	RecentPendingMembers   int                              `json:"recent_pending_members"`
+	RecentMaxLagSeconds    int64                            `json:"recent_max_lag_seconds"`
+	PausedMembers          int                              `json:"paused_members"`
+	FailedMembers          int                              `json:"failed_members"`
+	CompletedHours         int64                            `json:"completed_hours"`
+	VerifiedHours          int64                            `json:"verified_hours"`
+	TotalHours             int64                            `json:"total_hours"`
+	CoveragePercent        float64                          `json:"coverage_percent"`
+	EstimatedSeconds       *int64                           `json:"estimated_seconds"`
+	EstimateStatus         string                           `json:"estimate_status"`
+	ThroughputHoursPS      float64                          `json:"throughput_hours_per_second"`
+	EstimateSampleSec      int64                            `json:"estimate_sample_seconds"`
+	DiskBlocked            bool                             `json:"disk_blocked"`
+	DiskPressure           string                           `json:"disk_pressure"`
+	DiskFreeBytes          int64                            `json:"disk_free_bytes"`
+	DiskUsedPercent        float64                          `json:"disk_used_percent"`
+	AsOf                   int64                            `json:"as_of"`
+	Members                []UsageFactHistoryMemberProgress `json:"members"`
+	Maintenance            []UsageFactMaintenanceProgress   `json:"maintenance"`
+	ActiveRepairs          int                              `json:"active_repairs"`
+	PausedMaintenance      int                              `json:"paused_maintenance"`
+	BulkCircuitState       string                           `json:"bulk_circuit_state"`
+	BulkOpenedUntil        int64                            `json:"bulk_opened_until"`
+	BulkSlowStreak         int                              `json:"bulk_slow_streak"`
+	BulkFailureStreak      int                              `json:"bulk_failure_streak"`
+	BulkLastQueryMS        int64                            `json:"bulk_last_query_ms"`
+	BulkLastQueryAt        int64                            `json:"bulk_last_query_at"`
+	BulkLastError          string                           `json:"bulk_last_error,omitempty"`
+	RawPageEnabled         bool                             `json:"raw_page_enabled"`
+	RawPageHours           int64                            `json:"raw_page_hours"`
+	RawPageComplete        int64                            `json:"raw_page_complete_hours"`
+	RawPagePages           int64                            `json:"raw_page_pages"`
+	RawPageSourceRows      int64                            `json:"raw_page_source_rows"`
+	RawPageActive          int                              `json:"raw_page_active_members"`
+	RawPageRecentHours     int64                            `json:"raw_page_recent_complete_hours"`
+	RawPageRecentSampleSec int64                            `json:"raw_page_recent_sample_seconds"`
+	RawPageHoursPS         float64                          `json:"raw_page_hours_per_second"`
 }
 
 type UsageFactMaintenanceProgress struct {
@@ -188,6 +239,13 @@ func (m *Monitor) usageFactHistoryDelay() time.Duration {
 	return time.Duration(ms) * time.Millisecond
 }
 
+func usageFactHistoryPostWorkDelay(configured time.Duration, localWork, rawPageEnabled bool, workErr error) time.Duration {
+	if localWork || (rawPageEnabled && workErr == nil) {
+		return 10 * time.Millisecond
+	}
+	return configured
+}
+
 func (m *Monitor) usageFactHistorySourceCooldown(queryDuration time.Duration) time.Duration {
 	pct := m.cfg.UsageFactsHistoryDutyPercent
 	if pct <= 0 || pct > 100 {
@@ -248,6 +306,25 @@ func usageFactHistoryObservedETA(done, total, startedAt, lastProgressAt int64, n
 	return &seconds, "observed", rate, elapsed
 }
 
+func usageFactRawPageRecentETA(completed, firstUpdatedAt, remaining int64, now time.Time) (*int64, float64, int64) {
+	if completed < 3 || firstUpdatedAt <= 0 || remaining <= 0 || now.IsZero() {
+		return nil, 0, 0
+	}
+	sampleSeconds := now.Unix() - firstUpdatedAt
+	if sampleSeconds < 2*60 || sampleSeconds > 20*60 {
+		return nil, 0, sampleSeconds
+	}
+	rate := float64(completed) / float64(sampleSeconds)
+	if rate <= 0 || math.IsNaN(rate) || math.IsInf(rate, 0) {
+		return nil, 0, sampleSeconds
+	}
+	seconds := int64(math.Ceil(float64(remaining) / rate))
+	if seconds < 1 {
+		seconds = 1
+	}
+	return &seconds, rate, sampleSeconds
+}
+
 func (m *Monitor) usageFactHistoryProgress(ctx context.Context, now time.Time) (UsageFactHistoryProgress, error) {
 	if now.IsZero() {
 		now = time.Now()
@@ -257,6 +334,7 @@ func (m *Monitor) usageFactHistoryProgress(ctx context.Context, now time.Time) (
 		SourceMode:  strings.TrimSpace(m.cfg.UsageFactsHistorySourceMode),
 		SourceEpoch: strings.TrimSpace(m.cfg.UsageFactsHistorySourceEpoch),
 		TotalKnown:  true, EstimateStatus: "warming",
+		RawPageEnabled: m.usageFactsRawPageImportEnabled(),
 	}
 	out.DiskBlocked = m.usageFactsHistoryDiskBlocked.Load()
 	out.DiskPressure = usageFactDiskPressureLevel(m.usageFactsHistoryDiskLevel.Load()).String()
@@ -287,6 +365,49 @@ func (m *Monitor) usageFactHistoryProgress(ctx context.Context, now time.Time) (
 	stateByID := make(map[int64]UsageFactMemberState, len(states))
 	for _, state := range states {
 		stateByID[state.UserID] = state
+	}
+	pageByID := make(map[int64]UsageFactPageIngestState)
+	if out.RawPageEnabled {
+		var totals struct {
+			Hours      int64
+			Complete   int64
+			Pages      int64
+			SourceRows int64
+		}
+		if err := m.usageFactsStore().WithContext(ctx).Raw(`SELECT COUNT(*) AS hours,
+ COALESCE(SUM(CASE WHEN status='complete' THEN 1 ELSE 0 END),0) AS complete,
+ COALESCE(SUM(pages),0) AS pages, COALESCE(SUM(source_rows),0) AS source_rows
+ FROM usage_fact_page_ingest_states`).Scan(&totals).Error; err != nil {
+			return out, err
+		}
+		out.RawPageHours, out.RawPageComplete = totals.Hours, totals.Complete
+		out.RawPagePages, out.RawPageSourceRows = totals.Pages, totals.SourceRows
+		var recent struct {
+			Hours   int64
+			FirstAt int64
+		}
+		if err := m.usageFactsStore().WithContext(ctx).Raw(`SELECT COUNT(*) AS hours, COALESCE(MIN(updated_at),0) AS first_at
+ FROM usage_fact_page_ingest_states WHERE status='complete' AND updated_at >= ?`, now.Add(-15*time.Minute).Unix()).Scan(&recent).Error; err != nil {
+			return out, err
+		}
+		out.RawPageRecentHours = recent.Hours
+		if recent.FirstAt > 0 {
+			out.RawPageRecentSampleSec = max(now.Unix()-recent.FirstAt, 0)
+		}
+		var latest []UsageFactPageIngestState
+		if err := m.usageFactsStore().WithContext(ctx).Raw(`SELECT p.*
+ FROM usage_fact_page_ingest_states p
+ JOIN (SELECT user_id, MAX(hour_ts) AS hour_ts FROM usage_fact_page_ingest_states GROUP BY user_id) latest
+   ON latest.user_id=p.user_id AND latest.hour_ts=p.hour_ts
+ ORDER BY p.user_id`).Scan(&latest).Error; err != nil {
+			return out, err
+		}
+		for _, page := range latest {
+			pageByID[page.UserID] = page
+			if page.Status != "complete" {
+				out.RawPageActive++
+			}
+		}
 	}
 	var jobs []UsageFactJob
 	allKinds := []string{usageFactHistoryKindDiscover, usageFactHistoryKindBackfill, usageFactHistoryKindTail,
@@ -342,11 +463,50 @@ func (m *Monitor) usageFactHistoryProgress(ctx context.Context, now time.Time) (
 			Stage: job.Kind, JobStatus: job.Status, CoverageStatus: state.CoverageStatus,
 			SourceHistoryStatus: state.SourceHistoryStatus, SourceFloorHour: state.SourceFloorHour,
 			SourceFirstLogHour: state.SourceFirstLogHour, CoverageThroughHour: state.CoverageThroughHour,
-			TailThroughHour: state.TailThroughHour, TargetThroughHour: job.ThroughTs,
-			CompletedHours: job.CompletedHours, TotalHours: job.TotalHours, Attempts: job.Attempts,
+			TailThroughHour: state.TailThroughHour, LiveFromHour: state.LiveFromHour,
+			LiveThroughHour: state.LiveThroughHour, LiveTargetHour: state.LiveTargetHour,
+			LiveStatus: state.LiveStatus, LiveAttempts: state.LiveAttempts, LiveLastServedSeq: state.LiveLastServedSeq, LiveNextRetryAt: state.LiveNextRetryAt,
+			LiveLastSuccessAt: state.LiveLastSuccessAt, LiveLastFailureAt: state.LiveLastFailureAt,
+			LiveLastError: truncateUsageFactError(state.LiveLastError), TargetThroughHour: job.ThroughTs,
+			RecentFromHour: state.RecentFromHour, RecentThroughHour: state.RecentThroughHour,
+			RecentTargetHour: state.RecentTargetHour, RecentStatus: state.RecentStatus,
+			RecentAttempts: state.RecentAttempts, RecentNextRetryAt: state.RecentNextRetryAt,
+			RecentLastSuccessAt: state.RecentLastSuccessAt, RecentLastFailureAt: state.RecentLastFailureAt,
+			RecentLastError: truncateUsageFactError(state.RecentLastError),
+			CompletedHours:  job.CompletedHours, TotalHours: job.TotalHours, Attempts: job.Attempts,
 			VerifiedHours: job.VerifiedHours, VerificationStatus: state.VerificationStatus,
 			NextRetryAt: job.NextRetryAt, LastSuccessAt: state.LastSuccessAt,
 			LastFailureAt: state.LastFailureAt, LastError: truncateUsageFactError(firstNonEmpty(job.LastError, state.LastError)),
+		}
+		if out.RawPageEnabled {
+			if item.LiveTargetHour != nil && item.LiveThroughHour != nil {
+				item.LiveLagSeconds = max(*item.LiveTargetHour-*item.LiveThroughHour, 0)
+			}
+			if item.LiveLagSeconds == 0 && item.LiveStatus == "ready" {
+				out.LiveReadyMembers++
+			} else {
+				out.LivePendingMembers++
+				out.LiveMaxLagSeconds = max(out.LiveMaxLagSeconds, item.LiveLagSeconds)
+			}
+			if item.RecentTargetHour != nil && item.RecentThroughHour != nil {
+				item.RecentLagSeconds = max(*item.RecentTargetHour-*item.RecentThroughHour, 0)
+			}
+			if item.RecentLagSeconds == 0 && item.RecentStatus == "ready" {
+				out.RecentReadyMembers++
+			} else {
+				out.RecentPendingMembers++
+				out.RecentMaxLagSeconds = max(out.RecentMaxLagSeconds, item.RecentLagSeconds)
+			}
+		}
+		if page, ok := pageByID[tracked.UserID]; ok {
+			hour := page.HourTs
+			through := usageFactRawPageStateThrough(page)
+			item.RawPageHour, item.RawPageStatus = &hour, page.Status
+			item.RawPageThrough = &through
+			item.RawPageSpanHours = int((through - hour) / usageFactHourSeconds)
+			item.RawPagePreferredSpan = normalizedUsageFactRawSpanHours(state.RawPageSpanHours)
+			item.RawPagePages, item.RawPageSourceRows = page.Pages, page.SourceRows
+			item.RawPageUpdatedAt, item.RawPageLastError = page.UpdatedAt, truncateUsageFactError(page.LastError)
 		}
 		if item.TargetThroughHour == 0 {
 			item.TargetThroughHour = target
@@ -356,16 +516,23 @@ func (m *Monitor) usageFactHistoryProgress(ctx context.Context, now time.Time) (
 		}
 		if row, ok := publishedByID[tracked.UserID]; ok && usageFactPublishedMemberCompatible(row, control) {
 			item.Published = true
+			item.ServiceReady = true
+			publishedFrom := row.SourceFloorHour
+			item.PublishedFromHour = &publishedFrom
 			out.PublishedMembers++
+			out.ServiceReadyMembers++
 		}
 		ready := job.Status == usageFactHistoryJobComplete && job.ThroughTs >= target &&
 			job.SourceEpoch == strings.TrimSpace(m.cfg.UsageFactsHistorySourceEpoch) &&
 			usageFactMemberFullHistoryReady(state, control.TrackedRevision, target, strings.TrimSpace(m.cfg.UsageFactsHistorySourceEpoch))
 		if ready {
+			item.ArchiveReady = true
 			item.VerifiedHours = item.TotalHours
 			out.ReadyMembers++
+			out.ArchiveReadyMembers++
 		} else {
 			out.PendingMembers++
+			out.ArchivePendingMembers++
 		}
 		if job.Status == usageFactHistoryJobPaused {
 			out.PausedMembers++
@@ -408,6 +575,14 @@ func (m *Monitor) usageFactHistoryProgress(ctx context.Context, now time.Time) (
 	} else {
 		out.EstimatedSeconds, out.EstimateStatus, out.ThroughputHoursPS, out.EstimateSampleSec =
 			usageFactHistoryObservedETA(workDone, workTotal, startedAt, lastProgressAt, now)
+		if out.RawPageEnabled {
+			if eta, rate, sampleSeconds := usageFactRawPageRecentETA(out.RawPageRecentHours,
+				now.Unix()-out.RawPageRecentSampleSec, max(out.TotalHours-out.CompletedHours, 0), now); eta != nil {
+				out.EstimatedSeconds, out.EstimateStatus = eta, "recent_raw_pages"
+				out.ThroughputHoursPS, out.EstimateSampleSec = rate, sampleSeconds
+				out.RawPageHoursPS = rate
+			}
+		}
 	}
 	if out.DiskBlocked {
 		out.EstimatedSeconds = nil
@@ -512,6 +687,34 @@ func usageFactHistoryTerminal(status string) bool {
 	return status == usageFactHistoryJobComplete || status == usageFactHistoryJobCancelled
 }
 
+// Enabling the bounded raw-page pipeline changes the shape of source work,
+// not the meaning of an already committed fact. A legacy GROUP BY timeout or
+// row-cardinality guard may therefore be retried from the same durable hour
+// without resetting verified history. Integrity, boundary and source-epoch
+// failures are intentionally excluded and remain fail-closed.
+func usageFactRawPageCanResumeLegacyWork(job UsageFactJob) bool {
+	if usageFactHistoryTerminal(job.Status) || job.LastError == "" {
+		return false
+	}
+	switch job.Kind {
+	case usageFactHistoryKindBackfill, usageFactHistoryKindTail,
+		usageFactHistoryKindRepairHour, usageFactHistoryKindAuditHour:
+	default:
+		return false
+	}
+	for _, marker := range []string{
+		errUsageFactHistoryRangeTooLarge.Error(),
+		errUsageFactHourRangeTooLarge.Error(),
+		"maximum execution time exceeded",
+		"context deadline exceeded",
+	} {
+		if strings.Contains(strings.ToLower(job.LastError), strings.ToLower(marker)) {
+			return true
+		}
+	}
+	return false
+}
+
 // reconcileUsageFactHistoryJobs mirrors the authoritative active revisions and
 // creates at most one target-watermark job per member. FromTs/ThroughTs never
 // move after discovery; NextHour is the crash-resumable cursor.
@@ -579,7 +782,7 @@ func (m *Monitor) reconcileUsageFactHistoryJobs(ctx context.Context, now time.Ti
 		for id, control := range active {
 			state, found := stateByID[id]
 			if !found {
-				state = UsageFactMemberState{UserID: id}
+				state = UsageFactMemberState{UserID: id, RawPageSpanHours: usageFactRawShardDefaultHours}
 			}
 			primaryJobID := usageFactHistoryJobID(id, control.TrackedRevision)
 			revisionChanged := found && state.TrackedRevision != control.TrackedRevision
@@ -616,6 +819,27 @@ func (m *Monitor) reconcileUsageFactHistoryJobs(ctx context.Context, now time.Ti
 				}
 				state.CoverageThroughHour = nil
 				state.TailThroughHour = nil
+				state.LiveFromHour = nil
+				state.LiveThroughHour = nil
+				state.LiveTargetHour = nil
+				state.LiveStatus = "pending"
+				state.LiveAttempts = 0
+				state.LiveNextRetryAt = 0
+				state.LiveLastServedAt = 0
+				state.LiveLastSuccessAt = 0
+				state.LiveLastFailureAt = 0
+				state.LiveLastError = ""
+				state.RecentFromHour = nil
+				state.RecentThroughHour = nil
+				state.RecentTargetHour = nil
+				state.RecentStatus = "pending"
+				state.RecentAttempts = 0
+				state.RecentNextRetryAt = 0
+				state.RecentLastServedSeq = 0
+				state.RecentLastServedAt = 0
+				state.RecentLastSuccessAt = 0
+				state.RecentLastFailureAt = 0
+				state.RecentLastError = ""
 				state.VerifyNextHour = nil
 				state.VerifiedThroughHour = nil
 				state.VerificationStatus = "pending"
@@ -666,6 +890,19 @@ func (m *Monitor) reconcileUsageFactHistoryJobs(ctx context.Context, now time.Ti
 			err := tx.First(&existing, "id = ?", jobID).Error
 			if err == nil {
 				existingChanged := false
+				if m.usageFactsRawPageImportEnabled() && usageFactRawPageCanResumeLegacyWork(existing) {
+					existing.Status = usageFactHistoryJobQueued
+					existing.Attempts, existing.NextRetryAt = 0, 0
+					existing.LeaseOwner, existing.LeaseUntil = "", 0
+					existing.LastError = ""
+					state.CoverageStatus = "backfilling"
+					state.LastError = ""
+					state.UpdatedAt = nowUnix
+					if err := tx.Save(&state).Error; err != nil {
+						return err
+					}
+					existingChanged = true
+				}
 				if existing.SourceEpoch != sourceEpoch || resetRequired {
 					existing.SourceEpoch = sourceEpoch
 					existing.Kind = usageFactHistoryKindDiscover
@@ -812,28 +1049,55 @@ func (m *Monitor) claimUsageFactHistoryJobs(ctx context.Context, kind, owner str
 	}
 	nowUnix := now.Unix()
 	err := m.usageFactsStore().WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		eligible := func(db *gorm.DB) *gorm.DB {
+			if m.usageFactsRawPageImportEnabled() {
+				// A legacy hourly worker can leave a mid-day cursor behind an
+				// exponential retry after the raw protocol is enabled. Only this
+				// exact compatibility error bypasses its old retry/paused state;
+				// source timeouts and real integrity failures keep their backoff.
+				return db.Where(`kind = ? AND
+((status IN ? AND next_retry_at <= ?) OR (status IN ? AND last_error = ?)) AND
+(lease_until = 0 OR lease_until < ?)`,
+					kind, []string{usageFactHistoryJobQueued, usageFactHistoryJobRunning}, nowUnix,
+					[]string{usageFactHistoryJobQueued, usageFactHistoryJobRunning, usageFactHistoryJobPaused},
+					usageFactRawPageLegacyDayProofError, nowUnix)
+			}
+			return db.Where("kind = ? AND status IN ? AND next_retry_at <= ? AND (lease_until = 0 OR lease_until < ?)",
+				kind, []string{usageFactHistoryJobQueued, usageFactHistoryJobRunning}, nowUnix, nowUnix)
+		}
 		var first UsageFactJob
 		orderColumn := "next_hour"
 		if kind == usageFactHistoryKindVerify {
 			orderColumn = "verify_next_hour"
 		}
-		query := tx.Where("kind = ? AND status IN ? AND next_retry_at <= ? AND (lease_until = 0 OR lease_until < ?)",
-			kind, []string{usageFactHistoryJobQueued, usageFactHistoryJobRunning}, nowUnix, nowUnix).
-			Order("priority DESC, " + orderColumn + ", created_at, id")
+		rawFairLane := m.usageFactsRawPageImportEnabled() && (kind == usageFactHistoryKindBackfill || kind == usageFactHistoryKindTail ||
+			kind == usageFactHistoryKindRepairHour || kind == usageFactHistoryKindAuditHour)
+		claimOrder := "priority DESC, " + orderColumn + ", created_at, id"
+		if rawFairLane {
+			// next_hour does not advance until a possibly huge hour has exhausted
+			// all of its pages. Order raw work by a durable scheduler sequence so
+			// one member gets one bounded turn and then rotates behind its peers.
+			// updated_at has only second precision and caused hot members to be
+			// selected twice before their peers under fast or clock-skewed turns.
+			// updated_at is only a migration tie-breaker for pre-sequence rows.
+			// Once a job receives its first sequence ticket, zero-valued peers
+			// always sort before it regardless of cursor age.
+			claimOrder = "priority DESC, last_served_seq, updated_at, " + orderColumn + ", created_at, id"
+		}
+		query := eligible(tx).Order(claimOrder)
 		if err := query.First(&first).Error; err != nil {
 			if errors.Is(err, gorm.ErrRecordNotFound) {
 				return nil
 			}
 			return err
 		}
-		q := tx.Where("kind = ? AND status IN ? AND next_retry_at <= ? AND (lease_until = 0 OR lease_until < ?)",
-			kind, []string{usageFactHistoryJobQueued, usageFactHistoryJobRunning}, nowUnix, nowUnix)
+		q := eligible(tx)
 		if kind == usageFactHistoryKindVerify {
 			q = q.Where("verify_next_hour = ?", first.VerifyNextHour)
 		} else if kind != usageFactHistoryKindDiscover {
 			q = q.Where("next_hour = ?", first.NextHour)
 		}
-		if err := q.Order("priority DESC, created_at, id").Limit(limit).Find(&claim.Jobs).Error; err != nil {
+		if err := q.Order(claimOrder).Limit(limit).Find(&claim.Jobs).Error; err != nil {
 			return err
 		}
 		if len(claim.Jobs) == 0 {
@@ -847,6 +1111,13 @@ func (m *Monitor) claimUsageFactHistoryJobs(ctx context.Context, kind, owner str
 		updates := map[string]any{"status": usageFactHistoryJobRunning, "lease_owner": owner,
 			"lease_until": leaseUntil, "heartbeat_at": nowUnix, "updated_at": nowUnix,
 			"started_at": gorm.Expr("CASE WHEN started_at = 0 THEN ? ELSE started_at END", nowUnix)}
+		if rawFairLane {
+			var maxServedSeq int64
+			if err := tx.Model(&UsageFactJob{}).Select("COALESCE(MAX(last_served_seq), 0)").Scan(&maxServedSeq).Error; err != nil {
+				return err
+			}
+			updates["last_served_seq"] = maxServedSeq + 1
+		}
 		if err := tx.Model(&UsageFactJob{}).Where("id IN ?", ids).Updates(updates).Error; err != nil {
 			return err
 		}
@@ -984,20 +1255,36 @@ func usageFactHistoryWorkerOwner() string {
 func (m *Monitor) runUsageFactHistoryWorker(ctx context.Context) {
 	owner := usageFactHistoryWorkerOwner()
 	tuning := defaultUsageFactHistoryTuning()
-	if err := m.reconcileUsageFactHistoryJobs(ctx, time.Now()); err != nil && ctx.Err() == nil {
+	now := time.Now()
+	if err := m.reconcileUsageFactHistoryJobs(ctx, now); err != nil && ctx.Err() == nil {
 		slog.Warn("全历史任务初始化失败", "err", err)
 	}
+	// Archive, repair or a high-volume recent bridge can keep the work queue
+	// nonempty for days. Control-plane reconciliation must therefore have its
+	// own clock instead of running only when that queue becomes idle. Besides
+	// admitting new member revisions, this retries a publication whose first
+	// attempt lost a transient SQLite lock.
+	nextControlReconcile := now.Add(time.Minute)
 	for ctx.Err() == nil {
+		now = time.Now()
+		if !now.Before(nextControlReconcile) {
+			if err := m.reconcileUsageFactHistoryJobs(ctx, now); err != nil && ctx.Err() == nil {
+				slog.Warn("全历史任务定时对账失败", "err", err)
+			}
+			nextControlReconcile = now.Add(time.Minute)
+		}
 		tuning.localWork = false
-		worked, err := m.syncNextUsageFactHistoryWork(ctx, owner, &tuning, time.Now())
+		worked, err := m.syncNextUsageFactHistoryWork(ctx, owner, &tuning, now)
 		if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, errSourceNotReady) {
 			slog.Warn("全历史任务执行失败", "err", err)
 		}
 		if worked {
-			delay := m.usageFactHistoryDelay()
-			if tuning.localWork {
-				delay = 10 * time.Millisecond // yield without applying source-QPS pacing to SQLite-only verification
-			}
+			// SQLite-only work needs only a cooperative yield. Raw-page source
+			// work is already paced at the actual query boundary by the global
+			// 2s start interval, high-lane priority and the low-lane duty window;
+			// retaining the legacy extra 30s sleep would duplicate throttling and
+			// make empty member-hours needlessly dominate a full-history import.
+			delay := usageFactHistoryPostWorkDelay(m.usageFactHistoryDelay(), tuning.localWork, m.usageFactsRawPageImportEnabled(), err)
 			if !waitUsageFact(ctx, delay) {
 				return
 			}
@@ -1062,11 +1349,18 @@ func (m *Monitor) syncNextUsageFactHistoryWork(ctx context.Context, owner string
 		if usageFactDiskPressureLevel(m.usageFactsHistoryDiskLevel.Load()) >= usageFactDiskCritical {
 			return false, capacityErr
 		}
-		claim, err := m.claimUsageFactHistoryJobs(ctx, usageFactHistoryKindTail, owner, usageFactHistoryMaxMembers, 1, now)
+		tailMembers := usageFactHistoryMaxMembers
+		if m.usageFactsRawPageImportEnabled() {
+			tailMembers = 1
+		}
+		claim, err := m.claimUsageFactHistoryJobs(ctx, usageFactHistoryKindTail, owner, tailMembers, 1, now)
 		if err != nil {
 			return false, err
 		}
 		if len(claim.Jobs) > 0 {
+			if m.usageFactsRawPageImportEnabled() {
+				return true, m.executeUsageFactHistoryTailRawPages(ctx, claim, now)
+			}
 			return true, m.executeUsageFactHistoryTail(ctx, claim, now)
 		}
 		return false, capacityErr
@@ -1092,17 +1386,31 @@ func (m *Monitor) syncNextUsageFactHistoryWork(ctx context.Context, owner string
 		tuning.localWork = true
 		return true, m.executeUsageFactHistoryLocalAudit(ctx, claim, now)
 	}
-	claim, err = m.claimUsageFactHistoryJobs(ctx, usageFactHistoryKindRepairHour, owner, usageFactHistoryMaxMembers, 1, now)
+	repairHourMembers := usageFactHistoryMaxMembers
+	if m.usageFactsRawPageImportEnabled() {
+		repairHourMembers = 1
+	}
+	claim, err = m.claimUsageFactHistoryJobs(ctx, usageFactHistoryKindRepairHour, owner, repairHourMembers, 1, now)
 	if err != nil || len(claim.Jobs) > 0 {
 		if err != nil {
 			return false, err
 		}
+		if m.usageFactsRawPageImportEnabled() {
+			return true, m.executeUsageFactHistoryRepairHourRawPages(ctx, claim, now)
+		}
 		return true, m.executeUsageFactHistoryRepairHour(ctx, claim, now)
 	}
-	claim, err = m.claimUsageFactHistoryJobs(ctx, usageFactHistoryKindRepair, owner, usageFactHistoryMaxMembers, 1, now)
+	repairMembers := usageFactHistoryMaxMembers
+	if m.usageFactsRawPageImportEnabled() {
+		repairMembers = 1
+	}
+	claim, err = m.claimUsageFactHistoryJobs(ctx, usageFactHistoryKindRepair, owner, repairMembers, 1, now)
 	if err != nil || len(claim.Jobs) > 0 {
 		if err != nil {
 			return false, err
+		}
+		if m.usageFactsRawPageImportEnabled() {
+			return true, m.downgradeUsageFactRepairToHourly(ctx, claim, nil, now)
 		}
 		return true, m.executeUsageFactHistoryRepair(ctx, claim, now)
 	}
@@ -1113,10 +1421,25 @@ func (m *Monitor) syncNextUsageFactHistoryWork(ctx context.Context, owner string
 		}
 		return true, m.executeUsageFactHistoryDiscovery(ctx, claim, now)
 	}
-	claim, err = m.claimUsageFactHistoryJobs(ctx, usageFactHistoryKindTail, owner, usageFactHistoryMaxMembers, 1, now)
+	// Once the newest live cursor is healthy, bridge the normal seven-day read
+	// window before spending another source slot on deep archive. This lane is
+	// member-fair, page-bounded and still uses the low-duty source gate.
+	if m.usageFactsRawPageImportEnabled() {
+		if worked, bridgeErr := m.syncNextUsageFactRawRecentBridge(ctx, now); bridgeErr != nil || worked {
+			return worked, bridgeErr
+		}
+	}
+	tailMembers := usageFactHistoryMaxMembers
+	if m.usageFactsRawPageImportEnabled() {
+		tailMembers = 1
+	}
+	claim, err = m.claimUsageFactHistoryJobs(ctx, usageFactHistoryKindTail, owner, tailMembers, 1, now)
 	if err != nil || len(claim.Jobs) > 0 {
 		if err != nil {
 			return false, err
+		}
+		if m.usageFactsRawPageImportEnabled() {
+			return true, m.executeUsageFactHistoryTailRawPages(ctx, claim, now)
 		}
 		return true, m.executeUsageFactHistoryTail(ctx, claim, now)
 	}
@@ -1151,12 +1474,22 @@ func (m *Monitor) syncNextUsageFactHistoryWork(ctx context.Context, owner string
 			return worked, auditErr
 		}
 	}
-	claim, err = m.claimUsageFactHistoryJobs(ctx, usageFactHistoryKindBackfill, owner, tuning.memberLimit, tuning.chunkDays, now)
+	backfillMembers, backfillDays := tuning.memberLimit, tuning.chunkDays
+	if m.usageFactsRawPageImportEnabled() {
+		// The raw-page protocol owns one durable member-hour cursor at a time.
+		// Do not batch users or days: a high-volume account must yield after its
+		// bounded pages instead of holding the source lane for the whole group.
+		backfillMembers, backfillDays = 1, 1
+	}
+	claim, err = m.claimUsageFactHistoryJobs(ctx, usageFactHistoryKindBackfill, owner, backfillMembers, backfillDays, now)
 	if err != nil || len(claim.Jobs) > 0 {
 		if err != nil {
 			return false, err
 		}
 		tuning.coldTurns++
+		if m.usageFactsRawPageImportEnabled() {
+			return true, m.executeUsageFactHistoryBackfillRawPages(ctx, claim, now)
+		}
 		return true, m.executeUsageFactHistoryBackfill(ctx, claim, tuning, now)
 	}
 	worked, err := m.syncNextUsageFactHistoryAuditWork(ctx, owner, tuning, now)
@@ -1170,11 +1503,18 @@ func (m *Monitor) syncNextUsageFactHistoryAuditWork(ctx context.Context, owner s
 	// Finish a previously downgraded member-day before starting another daily
 	// source audit. This remains on the cold maintenance lane, so 24 hourly
 	// reads cannot pre-empt current Tail or exact repairs.
-	claim, err := m.claimUsageFactHistoryJobs(ctx, usageFactHistoryKindAuditHour, owner, usageFactHistoryMaxMembers, 1, now)
+	auditHourMembers := usageFactHistoryMaxMembers
+	if m.usageFactsRawPageImportEnabled() {
+		auditHourMembers = 1
+	}
+	claim, err := m.claimUsageFactHistoryJobs(ctx, usageFactHistoryKindAuditHour, owner, auditHourMembers, 1, now)
 	if err != nil {
 		return false, err
 	}
 	if len(claim.Jobs) > 0 {
+		if m.usageFactsRawPageImportEnabled() {
+			return true, m.executeUsageFactHistorySourceAuditHourRawPages(ctx, claim, now)
+		}
 		return true, m.executeUsageFactHistorySourceAuditHour(ctx, claim, now)
 	}
 	kinds := []string{usageFactHistoryKindRecentAudit, usageFactHistoryKindSourceAudit}
@@ -1182,6 +1522,9 @@ func (m *Monitor) syncNextUsageFactHistoryAuditWork(ctx context.Context, owner s
 		index := (tuning.auditCursor + offset) % len(kinds)
 		kind := kinds[index]
 		limit, days := usageFactHistoryMaxMembers, 1
+		if m.usageFactsRawPageImportEnabled() {
+			limit = 1
+		}
 		claim, err := m.claimUsageFactHistoryJobs(ctx, kind, owner, limit, days, now)
 		if err != nil {
 			return false, err
@@ -1190,6 +1533,9 @@ func (m *Monitor) syncNextUsageFactHistoryAuditWork(ctx context.Context, owner s
 			continue
 		}
 		tuning.auditCursor = (index + 1) % len(kinds)
+		if m.usageFactsRawPageImportEnabled() {
+			return true, m.downgradeUsageFactSourceAuditToHourly(ctx, claim, nil, now)
+		}
 		return true, m.executeUsageFactHistorySourceAudit(ctx, claim, now)
 	}
 	return false, nil
@@ -1524,6 +1870,38 @@ func usageFactMemberFullHistoryReady(state UsageFactMemberState, revision, throu
 		*state.SourceFirstLogHour >= *state.SourceFloorHour
 }
 
+// usageFactMemberRecentServiceReady is deliberately independent from archive
+// completion. It proves a continuous recent window for one member, allowing
+// today's usage to become available while the cold lane keeps extending that
+// member's left edge toward the immutable source floor.
+func usageFactMemberRecentServiceReady(state UsageFactMemberState, revision, through int64, sourceEpoch string) bool {
+	if !state.Active || revision < 1 || state.TrackedRevision != revision || sourceEpoch == "" || state.SourceEpoch != sourceEpoch ||
+		state.ClassificationVersion != userTrafficClassificationVersion || state.QuerySemanticsVersion != usageFactQuerySemanticsVersion ||
+		state.SourceFloorHour == nil || *state.SourceFloorHour <= 0 || state.SourceFloorCheckedAt <= 0 ||
+		state.LiveFromHour == nil || state.LiveThroughHour == nil || state.LiveTargetHour == nil ||
+		*state.LiveFromHour <= 0 || *state.LiveFromHour >= through || *state.LiveThroughHour < through || *state.LiveTargetHour < through ||
+		state.LiveStatus != "ready" {
+		return false
+	}
+	if state.SourceHistoryStatus == "no_history" {
+		return state.SourceFirstLogHour == nil
+	}
+	return state.SourceHistoryStatus == "complete_hot" && state.SourceFirstLogHour != nil &&
+		*state.SourceFirstLogHour >= *state.SourceFloorHour
+}
+
+func auditUsageFactRecentServiceRange(db *gorm.DB, state UsageFactMemberState, through int64) error {
+	if state.LiveFromHour == nil || *state.LiveFromHour <= 0 || through <= *state.LiveFromHour {
+		return errors.New("recent service audit range is unavailable")
+	}
+	// A repaired or finalized natural day is intentionally compacted to daily
+	// facts plus its strict day proof; only partial boundary days retain hourly
+	// staging. Audit the same hybrid representation that the read path serves.
+	// Requiring every recent hour to remain staged would permanently hide a
+	// correctly repaired member until its entire cold archive completed.
+	return auditUsageFactFullHistoryDayRange(db, state, *state.LiveFromHour, through)
+}
+
 func auditUsageFactFullHistoryDayRange(db *gorm.DB, state UsageFactMemberState, start, end int64) error {
 	if start >= end {
 		return nil
@@ -1531,10 +1909,27 @@ func auditUsageFactFullHistoryDayRange(db *gorm.DB, state UsageFactMemberState, 
 	if state.SourceEpoch == "" {
 		return fmt.Errorf("full-history source epoch missing user=%d", state.UserID)
 	}
-	for batchStart := start; batchStart < end; {
+	// SourceFirstLogHour is hour-granular. Its first applicable day therefore
+	// often starts after midnight and intentionally has no complete-day fact or
+	// proof: the earlier hours are the separately proved empty prefix. Audit
+	// leading/trailing partial natural days against their hourly proofs, and use
+	// compact daily proofs only for complete CST days in the middle.
+	startDay := usageFactDayStart(start)
+	if start > startDay {
+		leadingThrough := min(end, startDay+usageFactDaySeconds)
+		if err := auditUsageFactTrailingHoursForEpoch(db, start, leadingThrough, []int64{state.UserID}, state.SourceEpoch); err != nil {
+			return err
+		}
+		start = leadingThrough
+	}
+	fullDaysThrough := usageFactDayStart(end)
+	if fullDaysThrough < start {
+		fullDaysThrough = start
+	}
+	for batchStart := start; batchStart < fullDaysThrough; {
 		batchEnd := batchStart + int64(usageFactSemanticAuditDays)*usageFactDaySeconds
-		if batchEnd > end {
-			batchEnd = end
+		if batchEnd > fullDaysThrough {
+			batchEnd = fullDaysThrough
 		}
 		var proofs []UsageFactMemberDayState
 		if err := db.Where("user_id = ? AND date_ts >= ? AND date_ts < ?", state.UserID, batchStart, batchEnd).
@@ -1561,6 +1956,9 @@ func auditUsageFactFullHistoryDayRange(db *gorm.DB, state UsageFactMemberState, 
 			}
 		}
 		batchStart = batchEnd
+	}
+	if fullDaysThrough < end {
+		return auditUsageFactTrailingHoursForEpoch(db, fullDaysThrough, end, []int64{state.UserID}, state.SourceEpoch)
 	}
 	return nil
 }
@@ -1944,15 +2342,21 @@ func (m *Monitor) validateUsageFactFullHistoryCheckpoint(ctx context.Context, th
 		if err := db.First(&state, "user_id = ?", row.UserID).Error; err != nil {
 			return err
 		}
+		fullReady := usageFactMemberFullHistoryReady(state, control.TrackedRevision, through, epoch) &&
+			state.SourceFloorHour != nil && *state.SourceFloorHour == row.SourceFloorHour &&
+			state.VerifiedThroughHour != nil && *state.VerifiedThroughHour >= row.VerifiedThroughHour
+		recentReady := usageFactMemberRecentServiceReady(state, control.TrackedRevision, through, epoch) &&
+			state.LiveFromHour != nil && *state.LiveFromHour == row.SourceFloorHour
 		if !state.Active || state.TrackedRevision != control.TrackedRevision || state.SourceEpoch != row.SourceEpoch ||
-			state.ClassificationVersion != row.ClassificationVersion ||
-			state.QuerySemanticsVersion != row.QuerySemanticsVersion || state.SourceFloorHour == nil ||
-			*state.SourceFloorHour != row.SourceFloorHour || state.VerifiedThroughHour == nil ||
-			*state.VerifiedThroughHour < row.VerifiedThroughHour || state.CoverageStatus != "ready" ||
-			state.VerificationStatus != "complete" || (state.SourceHistoryStatus != "complete_hot" && state.SourceHistoryStatus != "no_history") {
+			state.ClassificationVersion != row.ClassificationVersion || state.QuerySemanticsVersion != row.QuerySemanticsVersion ||
+			(!fullReady && !recentReady) {
 			return fmt.Errorf("full-history verification checkpoint incomplete user_id=%d", row.UserID)
 		}
-		if state.SourceHistoryStatus == "complete_hot" {
+		if recentReady && !fullReady {
+			if err := auditUsageFactRecentServiceRange(db, state, through); err != nil {
+				return fmt.Errorf("recent service checkpoint failed user_id=%d: %w", row.UserID, err)
+			}
+		} else if state.SourceHistoryStatus == "complete_hot" {
 			trailingIDs = append(trailingIDs, row.UserID)
 		}
 		if minFloor == 0 || row.SourceFloorHour < minFloor {
@@ -1981,11 +2385,11 @@ func (m *Monitor) validateUsageFactFullHistoryCheckpoint(ctx context.Context, th
 
 // publishUsageFactFullHistorySnapshot incrementally upgrades the service
 // membership. Existing signed members keep serving while cold history runs;
-// a new/rejoined revision is added only after its complete source-controlled
-// history and current Tail have passed a local semantic audit. The global left
-// edge expands to the earliest member floor only after every serving member is
-// full-history ready, so a legacy 90-day member can never be exposed as zero
-// before its own history has completed.
+// a new/rejoined revision is added after either its recent service window or
+// its complete source-controlled history has passed a local semantic audit.
+// Deep history later expands that member's signed left edge. Read-side range
+// and membership gates ensure that neither an older unknown interval nor an
+// unpublished member can be presented as zero.
 func (m *Monitor) publishUsageFactFullHistorySnapshot(ctx context.Context, now time.Time) (UsageFactSyncState, error) {
 	if !m.usageFactsFullHistoryEnabled() {
 		return UsageFactSyncState{}, errors.New("full-history usage facts are disabled")
@@ -2053,6 +2457,7 @@ func (m *Monitor) publishUsageFactFullHistorySnapshot(ctx context.Context, now t
 	retainedCandidate := make([]UsageFactPublishedMember, 0, len(prior))
 	readyByID := make(map[int64]bool, len(controlBefore.Controls))
 	allTrackedReady := true
+	allTrackedFullReady := true
 	priorHasLegacy := false
 	for _, row := range prior {
 		priorHasLegacy = priorHasLegacy || usageFactPublishedMemberLegacy(row)
@@ -2064,21 +2469,39 @@ func (m *Monitor) publishUsageFactFullHistorySnapshot(ctx context.Context, now t
 		}
 		state, hasState := stateByID[tracked.UserID]
 		job, hasJob := jobByID[usageFactHistoryJobID(tracked.UserID, control.TrackedRevision)]
-		ready := !activeRepairs[tracked.UserID] && hasState && hasJob && job.Status == usageFactHistoryJobComplete && job.ThroughTs >= through &&
+		fullReady := !activeRepairs[tracked.UserID] && hasState && hasJob && job.Status == usageFactHistoryJobComplete && job.ThroughTs >= through &&
 			state.SourceFloorCheckedAt >= now.Add(-usageFactBoundaryRecheck).Unix() &&
 			job.SourceEpoch == strings.TrimSpace(m.cfg.UsageFactsHistorySourceEpoch) &&
 			usageFactMemberFullHistoryReady(state, control.TrackedRevision, through, strings.TrimSpace(m.cfg.UsageFactsHistorySourceEpoch))
+		if !fullReady {
+			allTrackedFullReady = false
+		}
+		recentReady := !activeRepairs[tracked.UserID] && hasState && m.usageFactsRawPageImportEnabled() &&
+			usageFactMemberRecentServiceReady(state, control.TrackedRevision, through, strings.TrimSpace(m.cfg.UsageFactsHistorySourceEpoch))
+		if recentReady && !fullReady {
+			if auditErr := auditUsageFactRecentServiceRange(db, state, through); auditErr != nil {
+				recentReady = false
+			}
+		}
+		ready := fullReady || recentReady
 		if ready {
 			// The durable verify cursor is the publication signature. Its local
 			// hash audit and checkpoint are serialized with every facts writer, so
 			// publication is O(member) and survives large-history restarts without
 			// rescanning years of rows under this 60-second lock.
 			readyByID[tracked.UserID] = true
+			publishedFrom := *state.SourceFloorHour
+			verifiedThrough := usageFactDayStart(through)
+			if !fullReady {
+				publishedFrom = *state.LiveFromHour
+			} else {
+				verifiedThrough = *state.VerifiedThroughHour
+			}
 			signedCandidate = append(signedCandidate, UsageFactPublishedMember{
 				UserID: tracked.UserID, TrackedRevision: control.TrackedRevision,
 				SourceEpoch: state.SourceEpoch, ClassificationVersion: state.ClassificationVersion,
-				QuerySemanticsVersion: state.QuerySemanticsVersion, SourceFloorHour: *state.SourceFloorHour,
-				VerifiedThroughHour: *state.VerifiedThroughHour, PublishedAt: now.Unix(),
+				QuerySemanticsVersion: state.QuerySemanticsVersion, SourceFloorHour: publishedFrom,
+				VerifiedThroughHour: verifiedThrough, PublishedAt: now.Unix(),
 			})
 		} else {
 			allTrackedReady = false
@@ -2094,19 +2517,14 @@ func (m *Monitor) publishUsageFactFullHistorySnapshot(ctx context.Context, now t
 			retainedCandidate = append(retainedCandidate, row)
 		}
 	}
-	// Do not create a mixed legacy/full-history publication. During the first
+	// Do not create a mixed legacy/full-history publication. During a legacy
 	// upgrade the bounded legacy set remains authoritative until every active
-	// member has a durable full-history signature, then one transaction switches
-	// the complete set. Subsequent all-signed publications may add ready members
-	// incrementally while another new member remains admin-only.
+	// member has a durable full-history signature. A clean v5 install has no
+	// legacy authority to preserve, so each independently verified member may be
+	// published immediately. Read-side completeness gates prevent an incomplete
+	// company/global total from being presented as zero.
 	candidate := signedCandidate
-	if len(prior) == 0 && !allTrackedReady {
-		// Clean install / classification re-sign has no complete serving
-		// baseline to retain. Publishing whichever member happens to finish first
-		// would silently undercount an organisation until its peers catch up.
-		// First publication is therefore an all-active-member atomic cutover.
-		candidate = nil
-	} else if priorHasLegacy && !allTrackedReady {
+	if priorHasLegacy && !allTrackedFullReady {
 		candidate = retainedCandidate[:0]
 		for _, row := range retainedCandidate {
 			if usageFactPublishedMemberLegacy(row) {

@@ -20,6 +20,9 @@ CREATE TABLE IF NOT EXISTS users (
   id BIGINT NOT NULL AUTO_INCREMENT,
   username VARCHAR(191),
   email VARCHAR(191),
+  -- Full-history discovery uses the registration boundary as the permanent
+  -- source floor rather than inferring it only from the first retained log.
+  created_at BIGINT DEFAULT 0,
   quota BIGINT DEFAULT 0,
   used_quota BIGINT DEFAULT 0,
   PRIMARY KEY (id),
@@ -40,6 +43,15 @@ CREATE TABLE IF NOT EXISTS tokens (
   KEY idx_tokens_user_id (user_id),
   KEY idx_tokens_name (name),
   KEY idx_tokens_deleted_at (deleted_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+
+-- Source lifecycle performs the same zero-row schema probe as production.
+-- Keep this table even when the synthetic dataset does not need option values,
+-- so a local acceptance run cannot accidentally bypass production preflight.
+CREATE TABLE IF NOT EXISTS options (
+  `key` VARCHAR(191) NOT NULL,
+  `value` LONGTEXT,
+  PRIMARY KEY (`key`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 
 CREATE TABLE IF NOT EXISTS logs (
@@ -76,6 +88,8 @@ CREATE TABLE IF NOT EXISTS logs (
   KEY idx_created_at_id (id, created_at),
   KEY idx_user_id_id (user_id, id),
   KEY idx_logs_user_id (user_id),
+  -- Matches the production boundary seek and its FORCE INDEX contract.
+  KEY idx_user_created_type (user_id, created_at, type),
   KEY index_username_model_name (model_name, username)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 

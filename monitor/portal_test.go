@@ -187,7 +187,7 @@ func TestPortalScopeIsolation(t *testing.T) {
 	}
 }
 
-func TestPortalPartialMemberIsHiddenFromOverviewDetailLogsAndExport(t *testing.T) {
+func TestPortalIncompleteCompanyFailsClosedAcrossOverviewDetailLogsAndExport(t *testing.T) {
 	m, _, portal := newPortalTestMonitor(t)
 	m.prodDB = newFakeProdDB(t)
 	m.usageDayExpr = usageDayExprSQLite
@@ -238,31 +238,22 @@ func TestPortalPartialMemberIsHiddenFromOverviewDetailLogsAndExport(t *testing.T
 	for _, assertion := range []struct {
 		path       string
 		wantStatus int
-		want       string
 		forbidden  string
 	}{
-		{"/api/overview?from=2026-08-02&to=2026-08-02", http.StatusOK, "serving-member", "partial-secret"},
-		{"/api/user?uid=202&from=2026-08-02&to=2026-08-02", http.StatusNotFound, "not found", "partial-secret"},
-		{"/api/logs?member=202&from=2026-08-02&to=2026-08-02", http.StatusNotFound, "not found", "partial-secret"},
-		{"/api/logs?from=2026-08-02&to=2026-08-02", http.StatusOK, "serving-log-model", "partial-secret"},
+		{"/api/overview?from=2026-08-02&to=2026-08-02", http.StatusServiceUnavailable, "partial-secret"},
+		{"/api/user?uid=202&from=2026-08-02&to=2026-08-02", http.StatusServiceUnavailable, "partial-secret"},
+		{"/api/logs?member=202&from=2026-08-02&to=2026-08-02", http.StatusServiceUnavailable, "partial-secret"},
+		{"/api/logs?from=2026-08-02&to=2026-08-02", http.StatusServiceUnavailable, "partial-secret"},
 	} {
 		response := portalDo(portal, http.MethodGet, assertion.path, "", cookie)
-		if response.Code != assertion.wantStatus || !strings.Contains(response.Body.String(), assertion.want) || strings.Contains(response.Body.String(), assertion.forbidden) {
+		if response.Code != assertion.wantStatus || strings.Contains(response.Body.String(), assertion.forbidden) {
 			t.Fatalf("Portal partial 隔离失败 path=%s status=%d body=%s", assertion.path, response.Code, response.Body.String())
 		}
 	}
 
 	prepared := portalDo(portal, http.MethodGet, "/api/logs/export/prepare?from=2026-08-02&to=2026-08-02", "", cookie)
-	var ticket struct {
-		Ticket string `json:"ticket"`
-		Total  int64  `json:"total"`
-	}
-	if prepared.Code != http.StatusOK || json.Unmarshal(prepared.Body.Bytes(), &ticket) != nil || ticket.Ticket == "" || ticket.Total != 1 {
-		t.Fatalf("导出预检未严格使用 serving 名单: %d %s", prepared.Code, prepared.Body.String())
-	}
-	download := portalDo(portal, http.MethodGet, "/api/logs/export?ticket="+ticket.Ticket, "", cookie)
-	if download.Code != http.StatusOK || !strings.Contains(download.Body.String(), "serving-log-model") || strings.Contains(download.Body.String(), "partial-secret") {
-		t.Fatalf("CSV 暴露 partial 成员: %d %s", download.Code, download.Body.String())
+	if prepared.Code != http.StatusServiceUnavailable || strings.Contains(prepared.Body.String(), "partial-secret") {
+		t.Fatalf("不完整公司导出应 fail-closed: %d %s", prepared.Code, prepared.Body.String())
 	}
 }
 

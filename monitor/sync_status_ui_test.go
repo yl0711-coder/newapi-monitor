@@ -17,6 +17,9 @@ func TestSyncStatusPageUsesLocalStatusEndpoints(t *testing.T) {
 		"刷新本页不会发起 NewAPI 来源查询",
 		"syncFactMembers",
 		"syncDeactivate",
+		"分页事实导入",
+		"分页水位",
+		"raw_page_source_rows",
 	} {
 		if !strings.Contains(pageHTML, want) {
 			t.Fatalf("同步状态页缺少 %q", want)

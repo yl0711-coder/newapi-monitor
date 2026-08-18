@@ -17,6 +17,7 @@ volume_name=""
 backup_volume_name=""
 admin_port=""
 portal_port=""
+start_cleanup_required=false
 
 fail() {
   print -u2 -- "local-production-readonly: $*"
@@ -194,16 +195,21 @@ wait_for_monitor_endpoints() {
 
 start_monitor() {
   validate_candidate_image
+  local requested_data_volume requested_backup_volume
+  requested_data_volume="${MONITOR_ACCEPTANCE_VOLUME:-$(env_value MONITOR_ACCEPTANCE_VOLUME "$acceptance_env_file")}"
+  requested_backup_volume="${MONITOR_ACCEPTANCE_BACKUP_VOLUME:-$(env_value MONITOR_ACCEPTANCE_BACKUP_VOLUME "$acceptance_env_file")}"
+  [[ -n "$requested_data_volume" ]] || fail "MONITOR_ACCEPTANCE_VOLUME must explicitly select the already-verified data volume"
+  [[ -n "$requested_backup_volume" ]] || fail "MONITOR_ACCEPTANCE_BACKUP_VOLUME must explicitly select its independent backup volume"
   resolve_compose_identity
   [[ "$volume_name" != "$backup_volume_name" ]] || fail "data and backup volumes must be different"
 
   # Any failed `up` attempt must fail closed. Without this trap an image-ID,
   # mount, or endpoint assertion could leave a source-enabled container and
   # its SSH tunnel running after the command itself returned non-zero.
-  local cleanup_required=true
+  start_cleanup_required=true
   cleanup_failed_start() {
     local original_status="${1:-1}"
-    if [[ "$cleanup_required" == true ]]; then
+    if [[ "$start_cleanup_required" == true ]]; then
       compose stop -t 40 monitor >/dev/null 2>&1 || true
       stop_tunnel >/dev/null 2>&1 || true
     fi
@@ -228,7 +234,7 @@ start_monitor() {
   [[ "$expected_image_id" == "$actual_image_id" ]] || \
     fail "running container image does not match the pinned candidate digest"
   wait_for_monitor_endpoints
-  cleanup_required=false
+  start_cleanup_required=false
   trap - EXIT INT TERM
   print -- "admin:  http://127.0.0.1:${admin_port}"
   print -- "portal: http://127.0.0.1:${portal_port}"

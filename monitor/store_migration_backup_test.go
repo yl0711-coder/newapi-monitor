@@ -179,9 +179,9 @@ func rewritePreMigrationSnapshotPlanForTest(t *testing.T, backupDir, mainPath, f
 
 func TestCredentialKeyRotationPlanBumpCreatesFreshRollbackSnapshot(t *testing.T) {
 	const (
-		priorPlan = "main-facts-schema-20260817-v10"
-		oldSecret = "legacy-session-secret-before-v11-key-rotation"
-		newSecret = "dedicated-upstream-secret-after-v11-key-rotation"
+		priorPlan = "main-facts-schema-20260817-v11"
+		oldSecret = "legacy-session-secret-before-v12-key-rotation"
+		newSecret = "dedicated-upstream-secret-after-v12-key-rotation"
 		domain    = "plan-bump-credential.example"
 	)
 	dir := t.TempDir()
@@ -218,7 +218,7 @@ func TestCredentialKeyRotationPlanBumpCreatesFreshRollbackSnapshot(t *testing.T)
 		UpstreamCredentialSecret: newSecret,
 	}}
 	if err := candidate.openStore(mainPath); err != nil {
-		t.Fatalf("v11 startup failed: %v", err)
+		t.Fatalf("v12 startup failed: %v", err)
 	}
 	defer candidate.Close()
 
@@ -237,7 +237,7 @@ func TestCredentialKeyRotationPlanBumpCreatesFreshRollbackSnapshot(t *testing.T)
 		}
 	}
 	if currentSnapshot == "" || currentSnapshot == prior.SnapshotDir {
-		t.Fatalf("v11 did not publish a distinct rollback point: prior=%s current=%s", prior.SnapshotDir, currentSnapshot)
+		t.Fatalf("v12 did not publish a distinct rollback point: prior=%s current=%s", prior.SnapshotDir, currentSnapshot)
 	}
 
 	snapshotDB := openReadOnlyTestStore(t, filepath.Join(currentSnapshot, preMigrationMainSnapshotName))
@@ -250,7 +250,7 @@ func TestCredentialKeyRotationPlanBumpCreatesFreshRollbackSnapshot(t *testing.T)
 	legacyReader := &Monitor{cfg: Settings{SessionSecret: oldSecret}}
 	var rollbackCredential newAPICredential
 	if err := legacyReader.openUpstreamCredential(rollbackRow, &rollbackCredential); err != nil || rollbackCredential.AccessToken != "rollback-token" {
-		t.Fatalf("v11 rollback snapshot was not captured before key rotation: token=%q err=%v", rollbackCredential.AccessToken, err)
+		t.Fatalf("v12 rollback snapshot was not captured before key rotation: token=%q err=%v", rollbackCredential.AccessToken, err)
 	}
 
 	var liveRow ChannelUpstreamAccount
@@ -258,7 +258,7 @@ func TestCredentialKeyRotationPlanBumpCreatesFreshRollbackSnapshot(t *testing.T)
 		t.Fatal(err)
 	}
 	if liveRow.Credential == rollbackRow.Credential {
-		t.Fatal("live credential was not rotated after the v11 snapshot committed")
+		t.Fatal("live credential was not rotated after the v12 snapshot committed")
 	}
 	var liveCredential newAPICredential
 	if err := candidate.openUpstreamCredential(liveRow, &liveCredential); err != nil || liveCredential.AccessToken != "rollback-token" {

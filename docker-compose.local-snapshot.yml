@@ -1,0 +1,23 @@
+# 完全离线的本机 Smoke Test 覆盖文件。
+# 必须与 docker-compose.local-acceptance.yml 叠加使用；不连接 MySQL、主站或任何上游。
+# 适合验证镜像能否启动、SQLite 数据卷、Redis、/live 与 /ready。
+#
+# 示例：
+#   MONITOR_ACCEPTANCE_IMAGE=newapi-monitor:local-snapshot \
+#     docker compose -f docker-compose.local-acceptance.yml \
+#       -f docker-compose.local-snapshot.yml up -d --build redis monitor
+#
+# 该模式没有 NewAPI 登录来源，因此不能用于登录、用户用量或真实数据验收。
+services:
+  monitor:
+    environment:
+      MONITOR_LOCAL_SNAPSHOT_ONLY: "true"
+      MONITOR_SOURCE_WORKER_ENABLED: "false"
+      MONITOR_SOURCE_LEASE_REQUIRED: "false"
+      MONITOR_NEWAPI_BASE_URL: ""
+      MONITOR_USAGE_FACTS_ENABLED: "false"
+      MONITOR_USAGE_FACTS_READ_ENABLED: "false"
+      MONITOR_USAGE_FACTS_FULL_HISTORY_ENABLED: "false"
+      MONITOR_STABILITY_ENABLED: "false"
+      MONITOR_STABILITY_BACKFILL_ENABLED: "false"
+      MONITOR_STABILITY_AUTO_REPAIR: "false"

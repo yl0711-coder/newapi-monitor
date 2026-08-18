@@ -705,7 +705,10 @@ func (m *Monitor) downgradeUsageFactRepairToHourly(ctx context.Context, claim us
 		job.Status = usageFactHistoryJobQueued
 		job.Attempts, job.NextRetryAt = 0, 0
 		job.LeaseOwner, job.LeaseUntil = "", 0
-		job.LastError = "daily repair downgraded to hourly: " + truncateUsageFactError(cause.Error())
+		job.LastError = "daily repair uses bounded raw-page hourly protocol"
+		if cause != nil {
+			job.LastError += ": " + truncateUsageFactError(cause.Error())
+		}
 		job.UpdatedAt = now.Unix()
 		return tx.Save(&job).Error
 	})
@@ -737,7 +740,10 @@ func (m *Monitor) downgradeUsageFactSourceAuditToHourly(ctx context.Context, cla
 		job.Status = usageFactHistoryJobQueued
 		job.Attempts, job.NextRetryAt = 0, 0
 		job.LeaseOwner, job.LeaseUntil = "", 0
-		job.LastError = "daily source audit downgraded to non-revoking hourly verification: " + truncateUsageFactError(cause.Error())
+		job.LastError = "daily source audit uses bounded raw-page hourly verification"
+		if cause != nil {
+			job.LastError += ": " + truncateUsageFactError(cause.Error())
+		}
 		job.UpdatedAt = now.Unix()
 		return tx.Save(&job).Error
 	})

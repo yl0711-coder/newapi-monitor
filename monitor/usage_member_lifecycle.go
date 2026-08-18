@@ -306,19 +306,31 @@ func (m *Monitor) usageFactJobRevisionCurrent(ctx context.Context, job UsageFact
 // authoritative member control twice. The second manifest read closes the
 // cross-database window where an in-flight Portal request could otherwise
 // return a member after remove/correct-company committed in the main store.
-func (m *Monitor) currentPublishedUsageMembers(ctx context.Context, groupID *int64) ([]TrackedUser, error) {
+type usageFactPublishedMembership struct {
+	Members   []TrackedUser
+	Active    int
+	Published int
+	Complete  bool
+}
+
+// currentPublishedUsageMembership returns one manifest-consistent view of the
+// current authority and the compatible facts publication. Complete is scoped:
+// when groupID is non-nil it only describes that company, otherwise it
+// describes the entire tracked set. This lets a completed member become useful
+// without allowing an incomplete company/global aggregate to masquerade as 0.
+func (m *Monitor) currentPublishedUsageMembership(ctx context.Context, groupID *int64) (usageFactPublishedMembership, error) {
 	for attempt := 0; attempt < 2; attempt++ {
 		before, err := m.loadUsageMemberControlSnapshot(ctx)
 		if err != nil {
-			return nil, err
+			return usageFactPublishedMembership{}, err
 		}
 		var published []UsageFactPublishedMember
 		if err := m.usageFactsStore().WithContext(ctx).Order("user_id").Find(&published).Error; err != nil {
-			return nil, err
+			return usageFactPublishedMembership{}, err
 		}
 		after, err := m.loadUsageMemberControlSnapshot(ctx)
 		if err != nil {
-			return nil, err
+			return usageFactPublishedMembership{}, err
 		}
 		if !usageMemberControlSnapshotsEqual(before, after) {
 			continue
@@ -328,10 +340,12 @@ func (m *Monitor) currentPublishedUsageMembers(ctx context.Context, groupID *int
 			publishedByID[row.UserID] = row
 		}
 		out := make([]TrackedUser, 0, len(after.Tracked))
+		active := 0
 		for _, member := range after.Tracked {
 			if groupID != nil && member.GroupID != *groupID {
 				continue
 			}
+			active++
 			publishedRow, ok := publishedByID[member.UserID]
 			control := after.Controls[member.UserID]
 			if !ok || !usageFactPublishedMemberCompatible(publishedRow, control) {
@@ -339,9 +353,16 @@ func (m *Monitor) currentPublishedUsageMembers(ctx context.Context, groupID *int
 			}
 			out = append(out, member)
 		}
-		return out, nil
+		return usageFactPublishedMembership{
+			Members: out, Active: active, Published: len(out), Complete: len(out) == active,
+		}, nil
 	}
-	return nil, fmt.Errorf("%w: member manifest changed during facts read", errUsageMemberControlIntegrity)
+	return usageFactPublishedMembership{}, fmt.Errorf("%w: member manifest changed during facts read", errUsageMemberControlIntegrity)
+}
+
+func (m *Monitor) currentPublishedUsageMembers(ctx context.Context, groupID *int64) ([]TrackedUser, error) {
+	membership, err := m.currentPublishedUsageMembership(ctx, groupID)
+	return membership.Members, err
 }
 
 type portalUsageAuthorizationSnapshot struct {

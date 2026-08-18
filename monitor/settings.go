@@ -117,6 +117,11 @@ type Settings struct {
 	// semantics change and forces all source proofs to be rebuilt.
 	UsageFactsHistorySourceMode  string // MONITOR_USAGE_FACTS_HISTORY_SOURCE_MODE，默认 unverified
 	UsageFactsHistorySourceEpoch string // MONITOR_USAGE_FACTS_HISTORY_SOURCE_EPOCH，显式稳定标识
+	// RawPageImport switches full-history live/cold/repair work to the bounded
+	// raw-log protocol: one member shard is read as cursor pages and aggregated
+	// only in SQLite. It is the production default; false is an explicit
+	// emergency compatibility rollback to the legacy source GROUP BY path.
+	UsageFactsRawPageImportEnabled bool // MONITOR_USAGE_FACTS_RAW_PAGE_IMPORT_ENABLED，默认 true
 	// 分类口径升级可能要求重签全部日志派生事实。普通启动绝不隐式清表；只有在
 	// 已关闭页面切读、已签完整来源且开启全历史持久任务后，运维才能在维护窗口
 	// 显式撤销旧发布授权并按成员逐日覆盖。旧事实保留，供回滚与分片校验。
@@ -277,6 +282,7 @@ func LoadSettings() Settings {
 		UsageFactsHistoryMinFreeBytes:            envInt64("MONITOR_USAGE_FACTS_HISTORY_MIN_FREE_BYTES", 2*1024*1024*1024),
 		UsageFactsHistorySourceMode:              strings.ToLower(strings.TrimSpace(env("MONITOR_USAGE_FACTS_HISTORY_SOURCE_MODE", "unverified"))),
 		UsageFactsHistorySourceEpoch:             strings.TrimSpace(env("MONITOR_USAGE_FACTS_HISTORY_SOURCE_EPOCH", "")),
+		UsageFactsRawPageImportEnabled:           env("MONITOR_USAGE_FACTS_RAW_PAGE_IMPORT_ENABLED", "true") == "true",
 		UsageFactsClassificationMigrationEnabled: env("MONITOR_USAGE_FACTS_CLASSIFICATION_MIGRATION_ENABLED", "false") == "true",
 		UsageFactsReconcileMinutes:               envInt("MONITOR_USAGE_FACTS_RECONCILE_MINUTES", 30),
 		TrustedProxies:                           envCSV("MONITOR_TRUSTED_PROXIES"),

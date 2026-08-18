@@ -160,6 +160,23 @@ func TestUsageFactBackfillDelayIsConservative(t *testing.T) {
 	}
 }
 
+func TestUsageFactLocalStoreBusyUsesFastRetryClassification(t *testing.T) {
+	for _, err := range []error{
+		errors.New("database is locked (5) (SQLITE_BUSY)"),
+		errors.New("database table is locked"),
+		fmt.Errorf("tail failed: %w", errors.New("SQLITE_BUSY")),
+	} {
+		if !usageFactLocalStoreBusy(err) {
+			t.Fatalf("expected local SQLite busy classification for %q", err)
+		}
+	}
+	for _, err := range []error{nil, context.DeadlineExceeded, errors.New("source query timed out")} {
+		if usageFactLocalStoreBusy(err) {
+			t.Fatalf("source/non-error must not use local busy retry: %v", err)
+		}
+	}
+}
+
 func TestUsageFactScheduleJitterNeverShortensSafeDelay(t *testing.T) {
 	m := newTestMonitor(t)
 	base := 15 * time.Second

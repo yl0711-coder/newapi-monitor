@@ -225,11 +225,65 @@ func (m *Monitor) fetchUsageFactHistoryControls(
 	return controls, duration, nil
 }
 
+// usageFactRawPageDayControls folds 24 already source-controlled member-hours
+// into a CST day control.  Each page state is produced only after its own
+// independent second bounded cursor pass, so summing them preserves exact day
+// arithmetic without asking MySQL to rescan with COUNT/SUM/GROUP BY.
+func (m *Monitor) usageFactRawPageDayControls(ctx context.Context, dayTs int64, ids []int64) (map[usageFactMemberDayKey]usageFactHistoryControl, error) {
+	ordered, err := normalizedUsageFactHistoryIDs(ids, usageFactHistoryMaxMembers)
+	if err != nil {
+		return nil, err
+	}
+	if dayTs <= 0 || usageFactDayStart(dayTs) != dayTs {
+		return nil, errors.New("分页小时控制数必须归并到 CST 自然日")
+	}
+	epoch := strings.TrimSpace(m.cfg.UsageFactsHistorySourceEpoch)
+	if epoch == "" {
+		return nil, errors.New("分页小时控制数缺少来源 epoch")
+	}
+	inSQL, inArgs := usageIn("user_id", ordered)
+	args := append([]any{dayTs, dayTs + usageFactDaySeconds}, inArgs...)
+	args = append(args, "complete", epoch)
+	var states []UsageFactPageIngestState
+	if err := m.usageFactsStore().WithContext(ctx).
+		Where("hour_ts >= ? AND hour_ts < ? AND "+inSQL+" AND status = ? AND source_epoch = ? AND content_hash <> ''", args...).
+		Order("user_id, hour_ts").Find(&states).Error; err != nil {
+		return nil, err
+	}
+	type rawMemberHourKey struct{ userID, hourTs int64 }
+	byMemberHour := make(map[rawMemberHourKey]UsageFactPageIngestState, len(states))
+	for _, state := range states {
+		key := rawMemberHourKey{userID: state.UserID, hourTs: state.HourTs}
+		if _, duplicate := byMemberHour[key]; duplicate {
+			return nil, errors.New("分页小时控制数存在重复状态")
+		}
+		byMemberHour[key] = state
+	}
+	controls := make(map[usageFactMemberDayKey]usageFactHistoryControl, len(ordered))
+	for _, id := range ordered {
+		control := usageFactHistoryControl{UserID: id, DateTs: dayTs}
+		for hour := dayTs; hour < dayTs+usageFactDaySeconds; hour += usageFactHourSeconds {
+			state, ok := byMemberHour[rawMemberHourKey{userID: id, hourTs: hour}]
+			if !ok {
+				return nil, fmt.Errorf("分页小时控制数尚未完整 user_id=%d hour=%d", id, hour)
+			}
+			control.SourceRows += state.SourceRows
+			control.Requests += state.Requests
+			control.RefundRecords += state.RefundRecords
+			control.PromptTokens += state.PromptTokens
+			control.CompletionTokens += state.CompletionTokens
+			control.ConsumeQuota += state.ConsumeQuota
+			control.RefundQuota += state.RefundQuota
+		}
+		controls[usageFactMemberDayKey{userID: id, dayTs: dayTs}] = control
+	}
+	return controls, nil
+}
+
 // finalizeUsageFactHistoryDayFromHours turns 24 independently controlled hour
-// reads into the same source-signed day proof as the cold daily importer. It is
-// used both at the live Tail midnight boundary and by the pathological-day
-// hourly fallback; a failed control query leaves the cursor in place so the
-// operation is idempotently retried.
+// reads into a source-signed day proof. The raw-page protocol sums its durable
+// per-hour controls locally; the legacy path retains its source day control
+// while older workers are still present.
 func (m *Monitor) finalizeUsageFactHistoryDayFromHours(
 	ctx context.Context,
 	dayTs int64,
@@ -244,7 +298,12 @@ func (m *Monitor) finalizeUsageFactHistoryDayFromHours(
 	if dayTs <= 0 || usageFactDayStart(dayTs) != dayTs {
 		return errors.New("小时回填日终范围必须是 CST 自然日")
 	}
-	controls, _, err := m.fetchUsageFactHistoryControls(ctx, dayTs, dayTs+usageFactDaySeconds, ordered)
+	var controls map[usageFactMemberDayKey]usageFactHistoryControl
+	if m.usageFactsRawPageImportEnabled() {
+		controls, err = m.usageFactRawPageDayControls(ctx, dayTs, ordered)
+	} else {
+		controls, _, err = m.fetchUsageFactHistoryControls(ctx, dayTs, dayTs+usageFactDaySeconds, ordered)
+	}
 	if err != nil {
 		return err
 	}
@@ -304,7 +363,7 @@ func (m *Monitor) finalizeUsageFactHistoryDayFromHours(
 		}
 		priorByDay := usageDailyFactsByMemberDay(priorRows)
 		// Hour rows are staging material in full-history mode. Only after the
-		// independent source control query succeeds do we replace daily facts and
+		// independent source proof succeeds do we replace daily facts and
 		// the strict proof together in this one SQLite transaction.
 		if rebuildErr := m.rebuildUsageDailyFact(tx, dayTs, ordered); rebuildErr != nil {
 			return rebuildErr

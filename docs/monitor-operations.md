@@ -163,7 +163,7 @@ Content-Type: application/json
 
 ## 事实层纯本地验收
 
-事实同步和来源 SQL 的验收必须叠加两份 Compose 文件，后者会把 `NEWAPI_LOG_DSN` 固定到隔离的 `mysql:8.4`，清空 NewAPI URL，并把 Monitor、Redis、MySQL 放入无外网出口的 internal 网络：
+事实同步和来源 SQL 的验收必须叠加两份 Compose 文件，后者会把 `NEWAPI_LOG_DSN` 固定到隔离的 `mysql:8.4`，清空 NewAPI URL，并把 Monitor、Redis、MySQL 放入无外网出口的 internal 网络。覆盖会强制启用 v5 全历史协议（`SOURCE_MODE=complete`、固定本地 epoch、成员 source floor 与首次全员原子发布），不再用 90 天有限窗口代替本次上线语义：
 
 ```bash
 docker volume create newapi-monitor-local-data
@@ -177,6 +177,19 @@ MONITOR_ACCEPTANCE_IMAGE=newapi-monitor:local-acceptance \
 表结构和只读账号由 [`../dev/local-facts-mysql-init.sql`](../dev/local-facts-mysql-init.sql) 初始化。只允许从宿主机 `127.0.0.1:13316` 通过 `local_loader` 导入合成或已批准的脱敏数据；不得传入线上 DSN、SSH 隧道或线上 API 地址。没有接近目标规模的数据集时，只能验读路径和代码正确性，不能判定来源库压力验收通过。
 
 仓库内的 `dev/local-facts-loader` 会额外校验账号、库名、回环地址和显式确认串，只能重建 `newapi_local_acceptance`；`dev/local-facts-loadtest` 同样拒绝非回环 HTTP 地址，可执行矩阵边界、366 天查询、原始模糊查询、status 与在线备份的混合负载。`dev/local-facts-resource-sample.sh` 只接受 `nxmon-facts-*` 临时容器名和 `/private/tmp/newapi-monitor-facts-acceptance-*` 报告目录。目标规模合成集约 147 万 logs，MySQL tmpfs 本地实测需要至少 4 GiB。
+
+注意：部分 Docker 实现会让仅连接 `internal: true` 网络的容器无法通过宿主机发布端口访问（当前 OrbStack 即如此）。这时不得为了跑压测而去掉 internal 隔离；应让验收客户端加入同一内部网络命名空间并请求其 `127.0.0.1:8090/8091`。在已加载合成数据、建立临时 Portal 账号且全员 `read_active=true` 后，可用以下 runner；它只接受合成 `@local.test` 账号、受限报告路径和本地测试 session secret：
+
+```bash
+mkdir -p /private/tmp/newapi-monitor-facts-acceptance-<run>
+LOCAL_FACTS_PORTAL_EMAIL='synthetic-portal@local.test' \
+LOCAL_FACTS_PORTAL_PASSWORD='synthetic-portal-pass' \
+LOCAL_FACTS_LOADTEST_DURATION=10m \
+LOCAL_FACTS_LOADTEST_REPORT=/private/tmp/newapi-monitor-facts-acceptance-<run>/load.json \
+  dev/run-local-facts-loadtest.sh /private/tmp/newapi-monitor-local-synth-v5.env
+```
+
+runner 会把当前源码的 Linux/amd64 `local-facts-loadtest` 二进制临时复制到运行中的 `nxmon-facts-monitor-*` 容器 `/tmp`，只调用容器本身的回环 HTTP；结束时删除二进制，报告再复制回受限的 `/private/tmp` 路径。
 
 本地验收至少覆盖：20,000/20,001 矩阵格边界且拒绝路径来源 SQL 为零；同键与不同键冷并发；256 MiB 内存限制下的 stats/matrix、后台同步、备份混合负载；90→366 天扩窗不重查已有 proof；整点滑窗不回退游标；事实行删除/篡改的语义审计与恢复；`facts.read_active=true` 后所有聚合页面来源 `logs` 查询计数为零。
 

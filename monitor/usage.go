@@ -741,7 +741,7 @@ func (m *Monitor) serveUsageMatrix(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"enabled": false})
 		return
 	}
-	tracked, err := m.listTrackedForUsageRead(c.Request.Context())
+	tracked, memberCoverage, err := m.listTrackedForUsageReadCoverage(c.Request.Context())
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -758,7 +758,11 @@ func (m *Monitor) serveUsageMatrix(c *gin.Context) {
 	}
 	memberFP := portalMemberFingerprint(tracked)
 	forceFresh := usageRefreshRequested(c)
-	readRange := m.resolveUsageAggregateReadRange(fromTs, toTs)
+	readRange, err := m.resolveUsageAggregateReadRangeForMembers(c.Request.Context(), fromTs, toTs, idsOf(tracked))
+	if err != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "本地用量发布范围暂不可用"})
+		return
+	}
 	requestedRange := newUsageMatrixRange(fromTs, toTs)
 	requestedFrom, requestedTo := requestedRange.From, requestedRange.To
 	fromTs, toTs = readRange.From, readRange.To
@@ -853,14 +857,20 @@ func (m *Monitor) serveUsageMatrix(c *gin.Context) {
 		dataStale, dataMessage = m.usageDataStaleness(dataStale, fromTs, toTs, time.Now())
 	}
 	resp := gin.H{
-		"enabled":          true,
-		"matrix":           mx,
-		"empty":            len(tracked) == 0,
-		"matrix_available": matrixAvailable,
-		"data_stale":       dataStale,
-		"range_partial":    matrixAvailable && readRange.Partial,
-		"requested_from":   requestedFrom,
-		"requested_to":     requestedTo,
+		"enabled":            true,
+		"matrix":             mx,
+		"empty":              len(tracked) == 0,
+		"matrix_available":   matrixAvailable,
+		"data_stale":         dataStale,
+		"range_partial":      matrixAvailable && readRange.Partial,
+		"requested_from":     requestedFrom,
+		"requested_to":       requestedTo,
+		"membership_partial": !memberCoverage.Complete,
+		"active_members":     memberCoverage.Active,
+		"published_members":  memberCoverage.Published,
+	}
+	if !memberCoverage.Complete {
+		resp["membership_message"] = fmt.Sprintf("成员事实正在逐个签收，当前可查看 %d/%d 个已完成成员；公司及全站合计在成员齐全前不会生成", memberCoverage.Published, memberCoverage.Active)
 	}
 	if matrixAvailable && readRange.Partial {
 		resp["range_message"] = readRange.Message
@@ -1842,7 +1852,7 @@ func (m *Monitor) serveUsageStats(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"enabled": false})
 		return
 	}
-	tracked, err := m.listTrackedForUsageRead(c.Request.Context())
+	tracked, memberCoverage, err := m.listTrackedForUsageReadCoverage(c.Request.Context())
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -1853,6 +1863,7 @@ func (m *Monitor) serveUsageStats(c *gin.Context) {
 	}
 	selected := append([]TrackedUser(nil), tracked...)
 	isGroup := false
+	selectionMembershipComplete := memberCoverage.Complete
 	var tokenID, selectedUID int64
 	// 可选其一:user_id=单用户详情;group_id=公司详情(聚合整组成员,0=未分组成员)
 	if f := strings.TrimSpace(c.Query("user_id")); f != "" {
@@ -1864,6 +1875,9 @@ func (m *Monitor) serveUsageStats(c *gin.Context) {
 		}
 		selectedUID = id
 		selected = []TrackedUser{member}
+		// A published member is independently complete even while unrelated
+		// members are still catching up.
+		selectionMembershipComplete = true
 		// 令牌详情:仅在单用户详情下有效;聚合强制 user_id+token_id 双条件,越权令牌只会查出空
 		if t := strings.TrimSpace(c.Query("token_id")); t != "" {
 			tokenID, err = strconv.ParseInt(t, 10, 64)
@@ -1879,6 +1893,14 @@ func (m *Monitor) serveUsageStats(c *gin.Context) {
 			return
 		}
 		isGroup = true
+		if m.usageFactsReadRequested() {
+			membership, membershipErr := m.currentPublishedUsageMembership(c.Request.Context(), &gid)
+			if membershipErr != nil {
+				c.JSON(http.StatusServiceUnavailable, gin.H{"error": "本地用量成员发布状态暂不可用"})
+				return
+			}
+			selectionMembershipComplete = membership.Complete
+		}
 		selected = selected[:0]
 		for _, u := range tracked {
 			if u.GroupID == gid {
@@ -1896,7 +1918,11 @@ func (m *Monitor) serveUsageStats(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	readRange := m.resolveUsageAggregateReadRange(fromTs, toTs)
+	readRange, err := m.resolveUsageAggregateReadRangeForMembers(c.Request.Context(), fromTs, toTs, ids)
+	if err != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "本地用量发布范围暂不可用"})
+		return
+	}
 	requestedRange := newUsageStatsRange(fromTs, toTs)
 	requestedFrom, requestedTo := requestedRange.From, requestedRange.To
 	fromTs, toTs = readRange.From, readRange.To
@@ -1905,7 +1931,7 @@ func (m *Monitor) serveUsageStats(c *gin.Context) {
 	cacheTTL := usageAggregateTTL(toTs, time.Now())
 	st := requestedRange
 	var dataStale bool
-	if readRange.Available {
+	if readRange.Available && selectionMembershipComplete {
 		st = newUsageStatsRange(fromTs, toTs)
 		dataStale, err = m.loadUsageAggregateJSONStaleIfError(
 			c.Request.Context(),
@@ -1943,14 +1969,18 @@ func (m *Monitor) serveUsageStats(c *gin.Context) {
 		}
 	}
 	resp := gin.H{
-		"enabled":         true,
-		"stats":           st,
-		"stats_available": statsAvailable,
-		"stats_message":   statsMessage,
-		"data_stale":      dataStale,
-		"range_partial":   statsAvailable && readRange.Partial,
-		"requested_from":  requestedFrom,
-		"requested_to":    requestedTo,
+		"enabled":            true,
+		"stats":              st,
+		"stats_available":    statsAvailable,
+		"stats_message":      statsMessage,
+		"data_stale":         dataStale,
+		"range_partial":      statsAvailable && readRange.Partial,
+		"requested_from":     requestedFrom,
+		"requested_to":       requestedTo,
+		"membership_partial": !selectionMembershipComplete,
+	}
+	if !selectionMembershipComplete {
+		resp["membership_message"] = "所选汇总仍有成员尚未完成事实签收，当前拒绝生成不完整合计；可先查看已签收的单个成员"
 	}
 	if statsAvailable && readRange.Partial {
 		resp["range_message"] = readRange.Message

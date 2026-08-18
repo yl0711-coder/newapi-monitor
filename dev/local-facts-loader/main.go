@@ -154,11 +154,11 @@ func run(opt options) error {
 		"(2,1,1,'local-channel-2','default','model-3,model-4','http://127.0.0.1')"); err != nil {
 		return err
 	}
-	if err := insertUsersAndTokens(ctx, db, opt.users); err != nil {
-		return err
-	}
 	end := time.Now().Add(-10 * time.Minute).Truncate(time.Hour).Unix()
 	start := end - int64(opt.days)*86400
+	if err := insertUsersAndTokens(ctx, db, opt.users, start); err != nil {
+		return err
+	}
 	logs, err := insertSyntheticLogs(ctx, db, opt, start, end)
 	if err != nil {
 		return err
@@ -256,23 +256,23 @@ func validateLocalDSN(raw, internalHost string) (*mysql.Config, string, error) {
 	return nil, "", fmt.Errorf("refusing non-loopback MySQL host %q", host)
 }
 
-func insertUsersAndTokens(ctx context.Context, db *sql.DB, users int) error {
+func insertUsersAndTokens(ctx context.Context, db *sql.DB, users int, registeredAt int64) error {
 	for first := 1; first <= users; first += 1000 {
 		last := min(first+1000, users+1)
 		var userSQL strings.Builder
 		var tokenSQL strings.Builder
-		userSQL.WriteString("INSERT INTO users(id,username,email,quota,used_quota) VALUES ")
+		userSQL.WriteString("INSERT INTO users(id,username,email,created_at,quota,used_quota) VALUES ")
 		tokenSQL.WriteString("INSERT INTO tokens(id,user_id,\u0060key\u0060,name,used_quota,\u0060group\u0060) VALUES ")
-		userArgs := make([]any, 0, (last-first)*5)
+		userArgs := make([]any, 0, (last-first)*6)
 		tokenArgs := make([]any, 0, (last-first)*6)
 		for id := first; id < last; id++ {
 			if id > first {
 				userSQL.WriteByte(',')
 				tokenSQL.WriteByte(',')
 			}
-			userSQL.WriteString("(?,?,?,?,?)")
+			userSQL.WriteString("(?,?,?,?,?,?)")
 			tokenSQL.WriteString("(?,?,?,?,?,?)")
-			userArgs = append(userArgs, id, fmt.Sprintf("acceptance-user-%04d", id), fmt.Sprintf("user-%04d@local.test", id), 50_000_000, id*1000)
+			userArgs = append(userArgs, id, fmt.Sprintf("acceptance-user-%04d", id), fmt.Sprintf("user-%04d@local.test", id), registeredAt, 50_000_000, id*1000)
 			tokenArgs = append(tokenArgs, id, id, fmt.Sprintf("local-key-%08d", id), fmt.Sprintf("token-%d-1", id), id*100, "group-1")
 		}
 		if _, err := db.ExecContext(ctx, userSQL.String(), userArgs...); err != nil {

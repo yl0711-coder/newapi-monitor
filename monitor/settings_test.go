@@ -65,6 +65,17 @@ func TestLoadSettingsUsageFactsStorePath(t *testing.T) {
 	}
 }
 
+func TestLoadSettingsUsageFactsRawPageImportDefaultsToBoundedPipeline(t *testing.T) {
+	t.Setenv("MONITOR_USAGE_FACTS_RAW_PAGE_IMPORT_ENABLED", "")
+	if !LoadSettings().UsageFactsRawPageImportEnabled {
+		t.Fatal("bounded raw-page import must be the production default")
+	}
+	t.Setenv("MONITOR_USAGE_FACTS_RAW_PAGE_IMPORT_ENABLED", "false")
+	if LoadSettings().UsageFactsRawPageImportEnabled {
+		t.Fatal("explicit emergency compatibility rollback must still be honored")
+	}
+}
+
 func TestLoadSettingsStabilitySourceProtectionDefaults(t *testing.T) {
 	t.Setenv("MONITOR_BACKGROUND_SOURCE_MIN_START_INTERVAL_MS", "")
 	t.Setenv("MONITOR_STABILITY_BACKFILL_SERVER_MAX_EXECUTION_MS", "")

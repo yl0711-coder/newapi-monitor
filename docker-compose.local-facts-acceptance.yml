@@ -53,6 +53,12 @@ services:
       - acceptance_internal
 
   monitor:
+    # The release image is linux/amd64. Pin the local integration run to that
+    # platform too, rather than accepting a host-native fallback.
+    platform: linux/amd64
+    # A failed synthetic source preflight must leave evidence in logs without a
+    # restart loop. Healthy runs keep running normally.
+    restart: "no"
     environment:
       # 固定本地只读账号，不允许从 env-file 注入其他 DSN/URL。
       NEWAPI_LOG_DSN: monitor_ro:local-facts-read-only@tcp(local-newapi-mysql:3306)/newapi_local_acceptance?charset=utf8mb4&timeout=5s&readTimeout=20s
@@ -63,9 +69,18 @@ services:
       MONITOR_USAGE_FACTS_ENABLED: "true"
       # 默认读取已经完整发布的本地快照；候选回填不完整时程序不会误切读。
       MONITOR_USAGE_FACTS_READ_ENABLED: ${MONITOR_USAGE_FACTS_READ_ENABLED:-true}
-      # 本地验收界面内置了近 7/15/30/90 天预设，默认覆盖 90 天，
-      # 避免容器重建后只有短窗口可用。首次补齐仍使用有节流的小时查询；
-      # 已发布的较短快照在扩窗回填期间继续服务，不回扫主站。
+      # 合成验收同样强制使用 v5 全历史语义：成员 source floor、当前 epoch proof、
+      # 全员首次原子发布和 strict right watermark 不能由90天兼容窗口代替。
+      # 来源、SQLite 和网络都是隔离的，所以本地验收显式取消墙钟节流；生产仍使用30s/20%/2s。
+      MONITOR_USAGE_FACTS_FULL_HISTORY_ENABLED: "true"
+      MONITOR_USAGE_FACTS_HISTORY_SOURCE_MODE: "complete"
+      MONITOR_USAGE_FACTS_HISTORY_SOURCE_EPOCH: "local-synthetic-complete-20260817-v1"
+      MONITOR_USAGE_FACTS_HISTORY_DELAY_MS: "-1"
+      MONITOR_USAGE_FACTS_HISTORY_SOURCE_DUTY_PERCENT: "100"
+      MONITOR_BACKGROUND_SOURCE_MIN_START_INTERVAL_MS: "0"
+      MONITOR_USAGE_FACTS_RAW_PAGE_IMPORT_ENABLED: "true"
+      MONITOR_USAGE_FACTS_CLASSIFICATION_MIGRATION_ENABLED: "false"
+      # FULL_HISTORY=true 时历史范围以成员边界为准；以下仅保留旧读面兼容参数。
       MONITOR_USAGE_FACTS_BACKFILL_DAYS: ${MONITOR_USAGE_FACTS_BACKFILL_DAYS:-90}
       MONITOR_USAGE_FACTS_RETENTION_DAYS: ${MONITOR_USAGE_FACTS_RETENTION_DAYS:-400}
       MONITOR_USAGE_FACTS_HOUR_RETENTION_DAYS: ${MONITOR_USAGE_FACTS_HOUR_RETENTION_DAYS:-8}

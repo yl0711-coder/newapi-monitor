@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"net/http"
 	"testing"
 	"time"
@@ -31,6 +32,71 @@ func newUsageHistoryTestMonitor(t *testing.T) *Monitor {
 		t.Fatal(err)
 	}
 	return m
+}
+
+func TestUsageFactHistoryProgressExposesRawPageCursor(t *testing.T) {
+	m := newUsageHistoryTestMonitor(t)
+	m.cfg.UsageFactsRawPageImportEnabled = true
+	prepareUsageHistoryCommitMember(t, m, 102, 1)
+	now := time.Date(2026, 8, 18, 12, 0, 0, 0, usageCST)
+	hour1 := now.Add(-2 * time.Hour).Unix()
+	hour2 := now.Add(-time.Hour).Unix()
+	states := []UsageFactPageIngestState{
+		{UserID: 102, HourTs: hour1, SourceEpoch: m.cfg.UsageFactsHistorySourceEpoch,
+			Status: "complete", Pages: 2, SourceRows: 1500, UpdatedAt: now.Add(-time.Hour).Unix(), CompletedAt: now.Add(-time.Hour).Unix()},
+		{UserID: 102, HourTs: hour2, SourceEpoch: m.cfg.UsageFactsHistorySourceEpoch,
+			Status: "running", Pages: 1, SourceRows: 1000, LastError: "page timeout", UpdatedAt: now.Unix()},
+	}
+	if err := m.usageFactsStore().Create(&states).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	progress, err := m.usageFactHistoryProgress(context.Background(), now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !progress.RawPageEnabled || progress.RawPageHours != 2 || progress.RawPageComplete != 1 ||
+		progress.RawPagePages != 3 || progress.RawPageSourceRows != 2500 || progress.RawPageActive != 1 {
+		t.Fatalf("raw-page totals missing from progress: %+v", progress)
+	}
+	if len(progress.Members) != 1 {
+		t.Fatalf("member progress count=%d, want 1", len(progress.Members))
+	}
+	member := progress.Members[0]
+	if member.RawPageHour == nil || *member.RawPageHour != hour2 || member.RawPageStatus != "running" ||
+		member.RawPagePages != 1 || member.RawPageSourceRows != 1000 || member.RawPageLastError != "page timeout" {
+		t.Fatalf("latest member raw-page cursor missing: %+v", member)
+	}
+}
+
+func TestUsageFactHistoryRawPagesDoNotApplyLegacyPostQuerySleep(t *testing.T) {
+	configured := 30 * time.Second
+	if got := usageFactHistoryPostWorkDelay(configured, false, true, nil); got != 10*time.Millisecond {
+		t.Fatalf("raw-page success delay=%v, want cooperative yield", got)
+	}
+	if got := usageFactHistoryPostWorkDelay(configured, false, true, errors.New("source failed")); got != configured {
+		t.Fatalf("raw-page failure delay=%v, want configured backoff", got)
+	}
+	if got := usageFactHistoryPostWorkDelay(configured, false, false, nil); got != configured {
+		t.Fatalf("legacy success delay=%v, want configured delay", got)
+	}
+	if got := usageFactHistoryPostWorkDelay(configured, true, false, nil); got != 10*time.Millisecond {
+		t.Fatalf("local work delay=%v, want cooperative yield", got)
+	}
+}
+
+func TestUsageFactRawPageRecentETA(t *testing.T) {
+	now := time.Date(2026, 8, 18, 17, 0, 0, 0, usageCST)
+	eta, rate, sample := usageFactRawPageRecentETA(120, now.Add(-10*time.Minute).Unix(), 600, now)
+	if eta == nil || *eta != 3000 || math.Abs(rate-0.2) > 0.000001 || sample != 600 {
+		t.Fatalf("recent ETA=%v rate=%f sample=%d", eta, rate, sample)
+	}
+	if eta, _, _ := usageFactRawPageRecentETA(2, now.Add(-10*time.Minute).Unix(), 600, now); eta != nil {
+		t.Fatal("two completed hours must remain a warming sample")
+	}
+	if eta, _, _ := usageFactRawPageRecentETA(120, now.Add(-time.Minute).Unix(), 600, now); eta != nil {
+		t.Fatal("one-minute sample must remain warming")
+	}
 }
 
 func TestFullHistorySnapshotReadinessUsesDurableCheckpointWithoutWorkerOrWrites(t *testing.T) {
@@ -1239,6 +1305,238 @@ func TestProvenMismatchReopensUnaffectedPublishedMembers(t *testing.T) {
 	}
 	if fmt.Sprint(publishedIDs) != "[32]" {
 		t.Fatalf("repairing member remained published: %v", publishedIDs)
+	}
+}
+
+func TestFullHistoryPublisherPublishesReadyMembersWithoutUndercountingGroups(t *testing.T) {
+	m := newUsageHistoryTestMonitor(t)
+	m.cfg.UsageFactsReadEnabled = true
+	for _, userID := range []int64{501, 502, 503} {
+		prepareUsageHistoryCommitMember(t, m, userID, 1)
+	}
+	for userID, groupID := range map[int64]int64{501: 10, 502: 10, 503: 11} {
+		if err := m.storeDB.Model(&TrackedUser{}).Where("user_id = ?", userID).Update("group_id", groupID).Error; err != nil {
+			t.Fatal(err)
+		}
+		if err := m.storeDB.Model(&UsageMemberControl{}).Where("user_id = ?", userID).Update("current_group_id", groupID).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	now := time.Date(2026, 8, 18, 18, 0, 0, 0, usageCST)
+	through := m.usageFactFinalizedHour(now)
+	floor := usageFactDayStart(through - 2*usageFactDaySeconds)
+	verifiedThrough := usageFactDayStart(through)
+	readyNoHistory := func(userID int64) {
+		t.Helper()
+		nowUnix := now.Unix()
+		if err := m.usageFactsStore().Model(&UsageFactMemberState{}).Where("user_id = ?", userID).Updates(map[string]any{
+			"active": true, "tracked_revision": int64(1), "source_floor_hour": floor,
+			"source_floor_checked_at": nowUnix, "source_history_status": "no_history",
+			"coverage_status": "ready", "coverage_through_hour": verifiedThrough,
+			"tail_through_hour": through, "verification_status": "complete",
+			"verify_next_hour": verifiedThrough, "verified_through_hour": verifiedThrough,
+			"verified_at": nowUnix, "classification_version": userTrafficClassificationVersion,
+			"query_semantics_version": usageFactQuerySemanticsVersion,
+			"source_epoch":            m.cfg.UsageFactsHistorySourceEpoch, "updated_at": nowUnix,
+		}).Error; err != nil {
+			t.Fatal(err)
+		}
+		uid := userID
+		job := UsageFactJob{
+			ID: usageFactHistoryJobID(uid, 1), Kind: usageFactHistoryKindVerify, UserID: &uid,
+			TrackedRevision: 1, SourceEpoch: m.cfg.UsageFactsHistorySourceEpoch,
+			FromTs: floor, ThroughTs: through, NextHour: through, VerifyNextHour: verifiedThrough,
+			TotalHours:     (through - floor) / usageFactHourSeconds,
+			CompletedHours: (through - floor) / usageFactHourSeconds,
+			VerifiedHours:  (verifiedThrough - floor) / usageFactHourSeconds,
+			Status:         usageFactHistoryJobComplete, CreatedAt: nowUnix, UpdatedAt: nowUnix, CompletedAt: nowUnix,
+		}
+		if err := m.usageFactsStore().Create(&job).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	readyNoHistory(501)
+	readyNoHistory(503)
+
+	published, err := m.publishUsageFactFullHistorySnapshot(context.Background(), now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if published.PublishedAt == 0 || published.PublishedRangeStart != floor || published.PublishedThrough != through {
+		t.Fatalf("ready member subset was not published: %+v", published)
+	}
+	var publishedIDs []int64
+	if err := m.usageFactsStore().Model(&UsageFactPublishedMember{}).Order("user_id").Pluck("user_id", &publishedIDs).Error; err != nil {
+		t.Fatal(err)
+	}
+	if fmt.Sprint(publishedIDs) != "[501 503]" {
+		t.Fatalf("published members=%v, want independently-ready members", publishedIDs)
+	}
+
+	tracked, coverage, err := m.listTrackedForUsageReadCoverage(context.Background())
+	if err != nil || len(tracked) != 2 || coverage.Active != 3 || coverage.Published != 2 || coverage.Complete {
+		t.Fatalf("global partial membership not explicit: tracked=%+v coverage=%+v err=%v", tracked, coverage, err)
+	}
+	if _, err := m.portalTrackedMembersForUsageRead(context.Background(), 10); !errors.Is(err, errUsageFactsNotReady) {
+		t.Fatalf("incomplete company total must fail closed, err=%v", err)
+	}
+	group11, err := m.portalTrackedMembersForUsageRead(context.Background(), 11)
+	if err != nil || len(group11) != 1 || group11[0].UserID != 503 {
+		t.Fatalf("unrelated complete company did not remain available: members=%+v err=%v", group11, err)
+	}
+}
+
+func TestFullHistoryPublisherServesRecentWindowBeforeArchiveAndLaterExpandsLeft(t *testing.T) {
+	m := newUsageHistoryTestMonitor(t)
+	m.cfg.UsageFactsReadEnabled = true
+	m.cfg.UsageFactsRawPageImportEnabled = true
+	const userID int64 = 504
+	prepareUsageHistoryCommitMember(t, m, userID, 1)
+
+	now := time.Date(2026, 8, 18, 18, 20, 0, 0, usageCST)
+	through := m.usageFactFinalizedHour(now)
+	recentFrom := through - usageFactRawLiveInitialLookbackHours*usageFactHourSeconds
+	sourceFloor := usageFactDayStart(through - 5*usageFactDaySeconds)
+	nowUnix := now.Unix()
+	if err := m.usageFactsStore().Model(&UsageFactMemberState{}).Where("user_id = ?", userID).Updates(map[string]any{
+		"active": true, "tracked_revision": int64(1), "source_floor_hour": sourceFloor,
+		"source_floor_checked_at": nowUnix, "source_history_status": "no_history",
+		"classification_version":  userTrafficClassificationVersion,
+		"query_semantics_version": usageFactQuerySemanticsVersion,
+		"source_epoch":            m.cfg.UsageFactsHistorySourceEpoch,
+		"live_from_hour":          recentFrom, "live_through_hour": through, "live_target_hour": through,
+		"live_status": "ready", "live_last_success_at": nowUnix, "updated_at": nowUnix,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	emptyHash := usageFactContentHash(nil)
+	for hour := recentFrom; hour < through; hour += usageFactHourSeconds {
+		if err := m.usageFactsStore().Create(&UsageFactMemberHourState{
+			UserID: userID, HourTs: hour, Status: "complete", ContentHash: emptyHash,
+			SourceEpoch: m.cfg.UsageFactsHistorySourceEpoch, UpdatedAt: nowUnix, CompletedAt: nowUnix,
+		}).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	published, err := m.publishUsageFactFullHistorySnapshot(context.Background(), now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if published.PublishedRangeStart != recentFrom || published.PublishedThrough != through {
+		t.Fatalf("recent service window was not published first: %+v", published)
+	}
+	var member UsageFactPublishedMember
+	if err := m.usageFactsStore().First(&member, "user_id = ?", userID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if member.SourceFloorHour != recentFrom {
+		t.Fatalf("recent publication exposed unknown archive: floor=%d want=%d", member.SourceFloorHour, recentFrom)
+	}
+	if err := m.validateUsageFactFullHistoryCheckpoint(context.Background(), through); err != nil {
+		t.Fatalf("recent service checkpoint did not survive readiness audit: %v", err)
+	}
+
+	// Completing the cold lane must expand the same member's signed left edge;
+	// no destructive reread of the already served recent window is required.
+	verifiedThrough := usageFactDayStart(through)
+	if err := m.usageFactsStore().Model(&UsageFactMemberState{}).Where("user_id = ?", userID).Updates(map[string]any{
+		"coverage_status": "ready", "coverage_through_hour": verifiedThrough,
+		"tail_through_hour": through, "verification_status": "complete",
+		"verify_next_hour": verifiedThrough, "verified_through_hour": verifiedThrough,
+		"verified_at": nowUnix, "updated_at": nowUnix,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	uid := userID
+	job := UsageFactJob{
+		ID: usageFactHistoryJobID(uid, 1), Kind: usageFactHistoryKindVerify, UserID: &uid,
+		TrackedRevision: 1, SourceEpoch: m.cfg.UsageFactsHistorySourceEpoch,
+		FromTs: sourceFloor, ThroughTs: through, NextHour: through, VerifyNextHour: verifiedThrough,
+		TotalHours:     (through - sourceFloor) / usageFactHourSeconds,
+		CompletedHours: (through - sourceFloor) / usageFactHourSeconds,
+		VerifiedHours:  (verifiedThrough - sourceFloor) / usageFactHourSeconds,
+		Status:         usageFactHistoryJobComplete, CreatedAt: nowUnix, UpdatedAt: nowUnix, CompletedAt: nowUnix,
+	}
+	if err := m.usageFactsStore().Create(&job).Error; err != nil {
+		t.Fatal(err)
+	}
+	published, err = m.publishUsageFactFullHistorySnapshot(context.Background(), now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if published.PublishedRangeStart != sourceFloor {
+		t.Fatalf("completed archive did not expand publication left edge: got=%d want=%d", published.PublishedRangeStart, sourceFloor)
+	}
+	if err := m.usageFactsStore().First(&member, "user_id = ?", userID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if member.SourceFloorHour != sourceFloor {
+		t.Fatalf("member publication floor was not upgraded after archive completion: %+v", member)
+	}
+}
+
+func TestRawPagePipelineResumesOnlyLegacyWorkloadPauses(t *testing.T) {
+	workload := UsageFactJob{
+		Kind: usageFactHistoryKindBackfill, Status: usageFactHistoryJobPaused,
+		LastError: "读取历史日维度聚合失败: maximum execution time exceeded",
+	}
+	if !usageFactRawPageCanResumeLegacyWork(workload) {
+		t.Fatal("bounded raw-page pipeline must resume a legacy GROUP BY timeout")
+	}
+	workload.LastError = errUsageFactHistoryRangeTooLarge.Error()
+	if !usageFactRawPageCanResumeLegacyWork(workload) {
+		t.Fatal("bounded raw-page pipeline must resume a legacy cardinality pause")
+	}
+	for _, unsafe := range []UsageFactJob{
+		{Kind: usageFactHistoryKindDiscover, Status: usageFactHistoryJobPaused, LastError: "context deadline exceeded"},
+		{Kind: usageFactHistoryKindBackfill, Status: usageFactHistoryJobPaused, LastError: "source boundary regressed"},
+		{Kind: usageFactHistoryKindBackfill, Status: usageFactHistoryJobPaused, LastError: "content hash mismatch"},
+		{Kind: usageFactHistoryKindBackfill, Status: usageFactHistoryJobComplete, LastError: errUsageFactHistoryRangeTooLarge.Error()},
+	} {
+		if usageFactRawPageCanResumeLegacyWork(unsafe) {
+			t.Fatalf("unsafe legacy state was automatically reopened: %+v", unsafe)
+		}
+	}
+}
+
+func TestMemberScopedReadRangeNeverTreatsAnotherMembersUnknownHistoryAsZero(t *testing.T) {
+	m := newUsageHistoryTestMonitor(t)
+	m.cfg.UsageFactsReadEnabled = true
+	early := time.Date(2026, 8, 1, 0, 0, 0, 0, usageCST).Unix()
+	late := early + 10*usageFactDaySeconds
+	through := late + 5*usageFactDaySeconds
+	nowUnix := time.Now().Unix()
+	rows := []UsageFactPublishedMember{
+		{UserID: 601, TrackedRevision: 1, SourceEpoch: m.cfg.UsageFactsHistorySourceEpoch,
+			ClassificationVersion: userTrafficClassificationVersion, QuerySemanticsVersion: usageFactQuerySemanticsVersion,
+			SourceFloorHour: early, VerifiedThroughHour: usageFactDayStart(through), PublishedAt: nowUnix},
+		{UserID: 602, TrackedRevision: 1, SourceEpoch: m.cfg.UsageFactsHistorySourceEpoch,
+			ClassificationVersion: userTrafficClassificationVersion, QuerySemanticsVersion: usageFactQuerySemanticsVersion,
+			SourceFloorHour: late, VerifiedThroughHour: usageFactDayStart(through), PublishedAt: nowUnix},
+	}
+	if err := m.usageFactsStore().Create(&rows).Error; err != nil {
+		t.Fatal(err)
+	}
+	m.setUsageFactsPublishedReadiness(true, early, through)
+
+	onlyEarly, err := m.resolveUsageAggregateReadRangeForMembers(context.Background(), early, through, []int64{601})
+	if err != nil || !onlyEarly.Available || onlyEarly.Partial || onlyEarly.From != early {
+		t.Fatalf("fully archived member lost its own history: range=%+v err=%v", onlyEarly, err)
+	}
+	mixed, err := m.resolveUsageAggregateReadRangeForMembers(context.Background(), early, through, []int64{601, 602})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !mixed.Available || !mixed.Partial || mixed.From != late {
+		t.Fatalf("mixed publication floors did not clip to the newest member proof: %+v", mixed)
+	}
+	missing, err := m.resolveUsageAggregateReadRangeForMembers(context.Background(), early, through, []int64{601, 603})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if missing.Available || !missing.Partial {
+		t.Fatalf("missing member publication did not fail closed: %+v", missing)
 	}
 }
 

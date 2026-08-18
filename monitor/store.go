@@ -385,17 +385,47 @@ type UsageHourIngestState struct {
 // 新建/停用对应行，不再清空所有小时台账：新增用户只补自己的历史，已有用户
 // 继续服务已发布事实，删除用户则立即从权限交集移除。
 type UsageFactMemberState struct {
-	UserID                int64  `gorm:"primaryKey;autoIncrement:false;column:user_id"`
-	Active                bool   `gorm:"index:idx_usage_fact_member_active_cursor,priority:1;column:active"`
-	TrackedRevision       int64  `gorm:"column:tracked_revision"`
-	BackfillWindowDays    int    `gorm:"column:backfill_window_days"`
-	RangeStart            int64  `gorm:"column:range_start"`
-	NextBackfillHour      int64  `gorm:"index:idx_usage_fact_member_active_cursor,priority:2;column:next_backfill_hour"`
-	SourceFloorHour       *int64 `gorm:"column:source_floor_hour"`
-	SourceFirstLogHour    *int64 `gorm:"column:source_first_log_hour"`
-	SourceCeilingHour     *int64 `gorm:"column:source_ceiling_hour"`
-	CoverageThroughHour   *int64 `gorm:"column:coverage_through_hour"`
-	TailThroughHour       *int64 `gorm:"column:tail_through_hour"`
+	UserID              int64  `gorm:"primaryKey;autoIncrement:false;column:user_id"`
+	Active              bool   `gorm:"index:idx_usage_fact_member_active_cursor,priority:1;column:active"`
+	TrackedRevision     int64  `gorm:"column:tracked_revision"`
+	BackfillWindowDays  int    `gorm:"column:backfill_window_days"`
+	RangeStart          int64  `gorm:"column:range_start"`
+	NextBackfillHour    int64  `gorm:"index:idx_usage_fact_member_active_cursor,priority:2;column:next_backfill_hour"`
+	SourceFloorHour     *int64 `gorm:"column:source_floor_hour"`
+	SourceFirstLogHour  *int64 `gorm:"column:source_first_log_hour"`
+	SourceCeilingHour   *int64 `gorm:"column:source_ceiling_hour"`
+	CoverageThroughHour *int64 `gorm:"column:coverage_through_hour"`
+	TailThroughHour     *int64 `gorm:"column:tail_through_hour"`
+	// LiveThroughHour is an independent, continuous recent-data cursor. It is
+	// never inferred from cold coverage and never jumps across a failed hour.
+	LiveFromHour      *int64 `gorm:"column:live_from_hour"`
+	LiveThroughHour   *int64 `gorm:"index:idx_usage_fact_member_live_cursor;column:live_through_hour"`
+	LiveTargetHour    *int64 `gorm:"column:live_target_hour"`
+	LiveSpanHours     int    `gorm:"column:live_span_hours"`
+	LiveStatus        string `gorm:"size:24;index;column:live_status"`
+	LiveAttempts      int    `gorm:"column:live_attempts"`
+	LiveNextRetryAt   int64  `gorm:"index;column:live_next_retry_at"`
+	LiveLastServedSeq int64  `gorm:"index:idx_usage_fact_member_live_cursor;column:live_last_served_seq"`
+	LiveLastServedAt  int64  `gorm:"index:idx_usage_fact_member_live_cursor;column:live_last_served_at"`
+	LiveLastSuccessAt int64  `gorm:"column:live_last_success_at"`
+	LiveLastFailureAt int64  `gorm:"column:live_last_failure_at"`
+	LiveLastError     string `gorm:"size:512;column:live_last_error"`
+	// Recent bridge expands the already-fresh live publication backwards to
+	// the normal seven-day UI window without making the current Tail wait for
+	// deep archive import. It is a second continuous cursor: publication only
+	// moves LiveFromHour after the whole bridge has reached its fixed target.
+	RecentFromHour        *int64 `gorm:"column:recent_from_hour"`
+	RecentThroughHour     *int64 `gorm:"index:idx_usage_fact_member_recent_cursor;column:recent_through_hour"`
+	RecentTargetHour      *int64 `gorm:"column:recent_target_hour"`
+	RecentSpanHours       int    `gorm:"column:recent_span_hours"`
+	RecentStatus          string `gorm:"size:24;index;column:recent_status"`
+	RecentAttempts        int    `gorm:"column:recent_attempts"`
+	RecentNextRetryAt     int64  `gorm:"index;column:recent_next_retry_at"`
+	RecentLastServedSeq   int64  `gorm:"index:idx_usage_fact_member_recent_cursor;column:recent_last_served_seq"`
+	RecentLastServedAt    int64  `gorm:"index:idx_usage_fact_member_recent_cursor;column:recent_last_served_at"`
+	RecentLastSuccessAt   int64  `gorm:"column:recent_last_success_at"`
+	RecentLastFailureAt   int64  `gorm:"column:recent_last_failure_at"`
+	RecentLastError       string `gorm:"size:512;column:recent_last_error"`
 	VerifyNextHour        *int64 `gorm:"column:verify_next_hour"`
 	VerifiedThroughHour   *int64 `gorm:"column:verified_through_hour"`
 	VerificationStatus    string `gorm:"size:24;index;column:verification_status"`
@@ -410,7 +440,11 @@ type UsageFactMemberState struct {
 	ClassificationVersion int    `gorm:"column:classification_version"`
 	QuerySemanticsVersion int    `gorm:"column:query_semantics_version"`
 	SourceEpoch           string `gorm:"size:64;column:source_epoch"`
-	UpdatedAt             int64  `gorm:"index;column:updated_at"`
+	// RawPageSpanHours is the adaptive cold-import width selected only from
+	// observed page density. Zero is the upgrade-safe alias for the default
+	// width; it is never a customer/user-specific setting.
+	RawPageSpanHours int   `gorm:"column:raw_page_span_hours"`
+	UpdatedAt        int64 `gorm:"index;column:updated_at"`
 }
 
 // UsageFactMemberHourState 是“该用户的该小时已经成功读取”的持久证明。即使
@@ -431,6 +465,55 @@ type UsageFactMemberHourState struct {
 	LastError   string `gorm:"size:512;column:last_error"`
 	LeaseToken  string `gorm:"size:80;column:lease_token"`
 	LeaseUntil  int64  `gorm:"index;column:lease_until"`
+}
+
+// UsageFactPageIngestState is the durable, per-member cursor for the
+// page-oriented importer.  Unlike the legacy source-side GROUP BY path, a
+// page contains a bounded number of raw log events and the cursor advances in
+// the same SQLite transaction as the local aggregation.  It is intentionally
+// member scoped: one high-volume customer can need many pages without making
+// another member's waterline wait.
+//
+// The importer is introduced behind a worker switch.  Keeping its state in
+// the facts database now lets the implementation be verified independently
+// before it replaces any serving path.
+type UsageFactPageIngestState struct {
+	UserID int64 `gorm:"primaryKey;autoIncrement:false;column:user_id"`
+	HourTs int64 `gorm:"primaryKey;autoIncrement:false;column:hour_ts"`
+	// ThroughTs is exclusive. Legacy rows have zero and therefore mean exactly
+	// one hour. A value wider than one hour exists only while an adaptive shard
+	// is in progress; successful finalization expands it into hourly proofs.
+	ThroughTs              int64  `gorm:"column:through_ts"`
+	SourceEpoch            string `gorm:"size:64;column:source_epoch"`
+	CursorCreatedAt        int64  `gorm:"column:cursor_created_at"`
+	CursorType             int    `gorm:"column:cursor_type"`
+	CursorID               int64  `gorm:"column:cursor_id"`
+	Status                 string `gorm:"size:16;index:idx_usage_fact_page_ingest_status;column:status"`
+	Pages                  int64  `gorm:"column:pages"`
+	SourceRows             int64  `gorm:"column:source_rows"`
+	Requests               int64  `gorm:"column:requests"`
+	RefundRecords          int64  `gorm:"column:refund_records"`
+	PromptTokens           int64  `gorm:"column:prompt_tokens"`
+	CompletionTokens       int64  `gorm:"column:completion_tokens"`
+	ConsumeQuota           int64  `gorm:"column:consume_quota"`
+	RefundQuota            int64  `gorm:"column:refund_quota"`
+	RawHash                string `gorm:"size:64;column:raw_hash"`
+	VerifyCursorCreatedAt  int64  `gorm:"column:verify_cursor_created_at"`
+	VerifyCursorType       int    `gorm:"column:verify_cursor_type"`
+	VerifyCursorID         int64  `gorm:"column:verify_cursor_id"`
+	VerifyPages            int64  `gorm:"column:verify_pages"`
+	VerifySourceRows       int64  `gorm:"column:verify_source_rows"`
+	VerifyRequests         int64  `gorm:"column:verify_requests"`
+	VerifyRefundRecords    int64  `gorm:"column:verify_refund_records"`
+	VerifyPromptTokens     int64  `gorm:"column:verify_prompt_tokens"`
+	VerifyCompletionTokens int64  `gorm:"column:verify_completion_tokens"`
+	VerifyConsumeQuota     int64  `gorm:"column:verify_consume_quota"`
+	VerifyRefundQuota      int64  `gorm:"column:verify_refund_quota"`
+	VerifyRawHash          string `gorm:"size:64;column:verify_raw_hash"`
+	ContentHash            string `gorm:"size:64;column:content_hash"`
+	LastError              string `gorm:"size:512;column:last_error"`
+	UpdatedAt              int64  `gorm:"index;column:updated_at"`
+	CompletedAt            int64  `gorm:"column:completed_at"`
 }
 
 // UsageUserSnapshot 和 UsageTokenSnapshot 是资料快照，不参与日志事实汇总。
@@ -500,14 +583,19 @@ type UsageFactJob struct {
 	NextRetryAt     int64  `gorm:"index;column:next_retry_at"`
 	LeaseOwner      string `gorm:"size:80;column:lease_owner"`
 	LeaseUntil      int64  `gorm:"index;column:lease_until"`
-	CreatedAt       int64  `gorm:"index;column:created_at"`
-	UpdatedAt       int64  `gorm:"index;column:updated_at"`
-	StartedAt       int64  `gorm:"column:started_at"`
-	HeartbeatAt     int64  `gorm:"index;column:heartbeat_at"`
-	CompletedAt     int64  `gorm:"column:completed_at"`
-	LastError       string `gorm:"size:512;column:last_error"`
-	RequestedBy     string `gorm:"size:64;column:requested_by"`
-	ApprovedBy      string `gorm:"size:64;column:approved_by"`
+	// LastServedSeq is a durable, monotonically increasing scheduler ticket.
+	// Wall-clock seconds are not a safe fairness key: several bounded turns can
+	// complete in one second and clocks can move backwards. Raw-page lanes sort
+	// never-served/least-recently-served jobs by this sequence instead.
+	LastServedSeq int64  `gorm:"index;column:last_served_seq"`
+	CreatedAt     int64  `gorm:"index;column:created_at"`
+	UpdatedAt     int64  `gorm:"index;column:updated_at"`
+	StartedAt     int64  `gorm:"column:started_at"`
+	HeartbeatAt   int64  `gorm:"index;column:heartbeat_at"`
+	CompletedAt   int64  `gorm:"column:completed_at"`
+	LastError     string `gorm:"size:512;column:last_error"`
+	RequestedBy   string `gorm:"size:64;column:requested_by"`
+	ApprovedBy    string `gorm:"size:64;column:approved_by"`
 }
 
 // UsageFactRepairRequest is the durable HTTP idempotency receipt for one
@@ -840,6 +928,7 @@ func (m *Monitor) openUsageFactsStore(path string, prechecked bool) error {
 	}
 	if err := factsDB.AutoMigrate(
 		&UsageHourFact{}, &UsageDailyFact{}, &UsageFactMemberDayState{}, &UsageHourIngestState{}, &UsageFactMemberState{}, &UsageFactMemberHourState{}, &UsageUserSnapshot{},
+		&UsageFactPageIngestState{},
 		&UsageTokenSnapshot{}, &UsageFactPublishedMember{}, &UsageFactRepairMember{}, &UsageFactJob{}, &UsageFactRepairRequest{}, &UsageFactSyncState{},
 	); err != nil {
 		return fmt.Errorf("用量事实表迁移失败: %w", err)

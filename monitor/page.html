@@ -274,12 +274,12 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
       <div class="monitor-brand-copy"><b><span data-brand>NexusAPI</span></b><small>Monitor</small></div>
     </div>
     <nav class="tabs monitor-nav">
-      <div class="tab" data-tab="sync" title="数据同步状态"><span class="monitor-nav-icon"><svg viewBox="0 0 24 24"><path d="M20 7h-6V1"/><path d="M4 17h6v6"/><path d="M20 7a8 8 0 0 0-13.7-3.6L4 5.7M4 17a8 8 0 0 0 13.7 3.6l2.3-2.3"/></svg></span><span class="monitor-nav-label">数据同步状态</span></div>
       <div class="tab active" data-tab="usage" title="用户用量"><span class="monitor-nav-icon"><svg viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"/></svg></span><span class="monitor-nav-label">用户用量</span></div>
       <div class="tab" data-tab="channels" title="渠道管理"><span class="monitor-nav-icon"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a15 15 0 0 1 0 18M12 3a15 15 0 0 0 0 18"/></svg></span><span class="monitor-nav-label">渠道管理</span></div>
       <div class="tab" data-tab="stability" title="稳定性报表"><span class="monitor-nav-icon"><svg viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="m9 12 2 2 4-4"/></svg></span><span class="monitor-nav-label">稳定性报表</span></div>
       <div class="tab" data-tab="model" title="模型监控"><span class="monitor-nav-icon"><svg viewBox="0 0 24 24"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg></span><span class="monitor-nav-label">模型监控</span></div>
       <div class="tab" data-tab="server" title="服务端监控"><span class="monitor-nav-icon"><svg viewBox="0 0 24 24"><path d="M3 3v18h18"/><path d="m7 16 4-5 4 3 5-7"/></svg></span><span class="monitor-nav-label">服务端监控</span></div>
+      <div class="tab" data-tab="sync" title="数据同步状态"><span class="monitor-nav-icon"><svg viewBox="0 0 24 24"><path d="M20 7h-6V1"/><path d="M4 17h6v6"/><path d="M20 7a8 8 0 0 0-13.7-3.6L4 5.7M4 17a8 8 0 0 0 13.7 3.6l2.3-2.3"/></svg></span><span class="monitor-nav-label">数据同步状态</span></div>
     </nav>
     <button type="button" class="monitor-sidebar-toggle" id="monitorSidebarToggle" aria-expanded="true" aria-label="收起侧边栏" title="收起侧边栏">
       <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m15 18-6-6 6-6"/></svg><span>收起侧边栏</span>
@@ -1493,25 +1493,30 @@ function syncRenderRuntime(ready,stores){
 }
 function syncRenderFacts(facts,history){
   const f=facts.facts||{},h=history||{};
-  const blocked=+h.paused_members>0||+h.failed_members>0||h.disk_blocked||h.bulk_circuit_state==='open'||f.repair_active;
-  const complete=!!f.read_active&&!!h.total_known&&+h.pending_members===0&&!blocked&&+h.published_members===+h.total_members;
-  const level=blocked?'bad':(complete?'ok':'warn');
+  const archiveBlocked=+h.paused_members>0||+h.failed_members>0||h.disk_blocked||h.bulk_circuit_state==='open'||f.repair_active;
+  const serviceComplete=!!f.read_active&&+h.total_members>0&&+h.published_members===+h.total_members&&(!h.raw_page_enabled||(+h.live_ready_members===+h.total_members&&+h.recent_ready_members===+h.total_members));
+  const servicePartial=!!f.read_active&&+h.published_members>0;
+  const archiveComplete=!!h.total_known&&+h.pending_members===0&&!archiveBlocked;
+  const level=serviceComplete?(archiveComplete?'ok':'warn'):(servicePartial?'warn':'bad');
   const serving=f.published_range_start&&f.published_through?`${syncTime(f.published_range_start)} → ${syncTime(f.published_through)}`:'尚无已签收范围';
   document.getElementById('syncFacts').innerHTML=[
     syncKV('读取状态',f.read_active?'已切本地事实':'未切读/校验中',f.read_active?'所有用量页只读本地 SQLite':'页面不会回退扫描来源 logs'),
-    syncKV('发布成员',`${fmtNum(h.published_members||f.serving_users)}/${fmtNum(h.total_members||f.tracked_users)}`,`${fmtNum(h.pending_members||f.pending_users)} 待签收 · ${fmtNum(h.paused_members)} 暂停`),
-    syncKV('历史覆盖',`${(+h.coverage_percent||+f.coverage_percent||0).toFixed(1)}%`,`${fmtNum(h.completed_hours||f.complete_member_hours)}/${fmtNum(h.total_hours||f.expected_member_hours)} member-hours`),
+    syncKV('近期服务成员',`${fmtNum(h.service_ready_members||h.published_members||f.serving_users)}/${fmtNum(h.total_members||f.tracked_users)}`,serviceComplete?'全部成员近期窗口已签收':`${fmtNum((+h.total_members||0)-(+h.published_members||0))} 个成员仍在建立近期窗口`),
+    syncKV('全历史归档',`${(+h.coverage_percent||+f.coverage_percent||0).toFixed(1)}%`,`${fmtNum(h.archive_ready_members||h.ready_members)}/${fmtNum(h.total_members)} 成员完成 · ${fmtNum(h.completed_hours||f.complete_member_hours)}/${fmtNum(h.total_hours||f.expected_member_hours)} member-hours`),
+    syncKV('实时用量水位',h.raw_page_enabled?`${fmtNum(h.live_ready_members)}/${fmtNum(h.total_members)} 成员追平`:'沿用旧 Tail',h.raw_page_enabled?`最大连续缺口 ${usageFactsDuration(h.live_max_lag_seconds||0)} · ${fmtNum(h.live_pending_members)} 个待追平`:''),
+    syncKV('最近 7 天窗口',h.raw_page_enabled?`${fmtNum(h.recent_ready_members)}/${fmtNum(h.total_members)} 成员完整`:'沿用旧窗口',h.raw_page_enabled?`最大桥接缺口 ${usageFactsDuration(h.recent_max_lag_seconds||0)} · ${fmtNum(h.recent_pending_members)} 个待补齐`:''),
+    syncKV('分页事实导入',h.raw_page_enabled?`${fmtNum(h.raw_page_complete_hours)}/${fmtNum(h.raw_page_hours)} 小时完成`:'未启用',h.raw_page_enabled?`${fmtNum(h.raw_page_pages)} 页 · ${fmtNum(h.raw_page_source_rows)} 条原始日志 · ${fmtNum(h.raw_page_active_members)} 个成员处理中`:'仍使用聚合导入'),
     syncKV('签收校验',h.total_hours?`${((+h.verified_hours||0)*100/(+h.total_hours||1)).toFixed(1)}%`:(f.semantic_audit_ok?'通过':'待校验'),h.estimate_status?usageFactsEstimateText(h):''),
     syncKV('服务范围',serving,'成员各自 floor 前的数据不会参与读取'),
     syncKV('Tail 最新完成',syncTime(f.latest_complete_hour),f.last_fact_sync_at?`最近同步 ${syncAge(f.last_fact_sync_at)}前`:''),
     syncKV('修复/审计',f.repair_active?'修复中':'无进行中修复',f.repair_last_error||''),
     syncKV('历史来源',`${h.source_mode||'—'} · ${h.source_epoch||'—'}`,h.bulk_circuit_state&&h.bulk_circuit_state!=='closed'?`来源熔断：${h.bulk_circuit_state}`:'')
   ].join('');
-  const members=(h.members||[]).filter(x=>x.last_error||x.job_status==='paused'||!x.published);
+  const members=(h.members||[]).filter(x=>x.last_error||x.live_last_error||x.recent_last_error||x.live_status!=='ready'||x.recent_status!=='ready'||x.job_status==='paused'||!x.published);
   const target=document.getElementById('syncFactMembers');
-  if(!members.length){target.innerHTML='<div class="sync-table-note">所有已发现成员均已签收；无待处理成员级异常。</div>';return level}
-  const rows=members.map(x=>`<tr><td>#${+x.user_id}</td><td>${esc(usageFactsStageLabel(x.stage))}</td><td>${esc(x.job_status||'—')}</td><td>${(+x.coverage_percent||0).toFixed(1)}%</td><td>${esc(x.verification_status||'—')}</td><td>${x.next_retry_at?syncTime(x.next_retry_at):'—'}</td><td class="history-error">${x.last_error?esc(x.last_error):'待签收'}</td></tr>`).join('');
-  target.innerHTML=`<details class="usage-history-detail" open><summary>需要处理的成员 · ${members.length} 个</summary><div class="monitor-table-scroll"><table><thead><tr><th>用户</th><th>阶段</th><th>任务</th><th>覆盖</th><th>校验</th><th>下次重试</th><th>原因</th></tr></thead><tbody>${rows}</tbody></table></div></details>`;
+  if(!members.length){target.innerHTML='<div class="sync-table-note">所有成员近期服务与全历史归档均已完成；无待处理成员级异常。</div>';return level}
+  const rows=members.map(x=>{const span=+x.raw_page_span_hours||1;const preferred=+x.raw_page_preferred_span_hours||1;const live=`实时 ${esc(x.live_status||'pending')} · 延迟 ${usageFactsDuration(x.live_lag_seconds||0)}<br>近7天 ${esc(x.recent_status||'pending')} · 缺口 ${usageFactsDuration(x.recent_lag_seconds||0)}`;const page=x.raw_page_hour?`${syncTime(x.raw_page_hour)}${span>1?' → '+syncTime(x.raw_page_through):''}<br><span class="muted">${esc(x.raw_page_status||'—')} · 当前 ${span}h / 下个 ${preferred}h · ${fmtNum(x.raw_page_pages)} 页 / ${fmtNum(x.raw_page_source_rows)} 条<br>${live}</span>`:`<span class="muted">尚无分页水位<br>${live}</span>`;const service=x.service_ready?`可用 · ${syncTime(x.published_from_hour)}起`:'建立近期窗口';return `<tr><td>#${+x.user_id}</td><td>${esc(service)}</td><td>${esc(usageFactsStageLabel(x.stage))} · ${esc(x.job_status||'—')}</td><td>${(+x.coverage_percent||0).toFixed(1)}%</td><td>${page}</td><td>${esc(x.verification_status||'—')}</td><td>${x.recent_next_retry_at?syncTime(x.recent_next_retry_at):(x.live_next_retry_at?syncTime(x.live_next_retry_at):(x.next_retry_at?syncTime(x.next_retry_at):'—'))}</td><td class="history-error">${x.recent_last_error?esc(x.recent_last_error)+'<br>':''}${x.live_last_error?esc(x.live_last_error)+'<br>':''}${x.raw_page_last_error?esc(x.raw_page_last_error)+'<br>':''}${x.last_error?esc(x.last_error):(x.service_ready?'历史继续后台扩展':'待签收')}</td></tr>`}).join('');
+  target.innerHTML=`<details class="usage-history-detail" open><summary>尚在同步或需要处理的成员 · ${members.length} 个</summary><div class="monitor-table-scroll"><table><thead><tr><th>用户</th><th>近期服务</th><th>历史阶段</th><th>归档覆盖</th><th>分页水位</th><th>校验</th><th>下次重试</th><th>原因</th></tr></thead><tbody>${rows}</tbody></table></div></details>`;
   return level;
 }
 function syncRenderChannels(report){
@@ -1555,7 +1560,7 @@ function syncRender(data){
   const readiness=ready.status==='ready'&&!(ready.degraded_reasons||[]).length?'ok':(ready.status==='not_ready'?'bad':'warn');
   document.getElementById('syncOverview').innerHTML=[
     syncCard(readiness,'服务就绪',ready.status==='ready'?'本地服务可用':(ready.status||'不可用'),(ready.degraded_reasons||[]).join('、')||'本地状态已检查'),
-    syncCard(factsLevel,'用户用量事实',facts.facts&&facts.facts.read_active?'已签收读取':`${(+history.coverage_percent||0).toFixed(1)}% 补数中`,`${fmtNum(history.published_members||0)}/${fmtNum(history.total_members||0)} 成员已发布`),
+    syncCard(factsLevel,'用户用量事实',facts.facts&&facts.facts.read_active?`${fmtNum(history.published_members||0)}/${fmtNum(history.total_members||0)} 成员可用`:'近期窗口同步中',`全历史归档 ${(+history.coverage_percent||0).toFixed(1)}% · ${fmtNum(history.live_ready_members||0)}/${fmtNum(history.total_members||0)} 实时追平`),
     syncCard(channelsLevel,'渠道上游同步',channels.enabled?`${(channels.domains||[]).filter(x=>x.upstream&&x.upstream.configured).length} 个账户`:'未启用','余额与消费状态均来自本地快照'),
     syncCard(stabilityLevel,'稳定性采样',health.status||'未启用',health.problem_live_lag_sec?`问题 Tail 延迟 ${usageFactsDuration(health.problem_live_lag_sec)}`:'本地采样水位')
   ].join('');
@@ -2096,6 +2101,7 @@ function usageFactsStageLabel(stage){
 }
 function usageFactsEstimateText(h){
   const labels={complete:'已完成',boundary_discovery:'正在确定来源边界',warming:'正在积累速率样本',stalled:'超过1小时无持久进展',blocked:'有任务暂停，ETA 不可用',paused_disk:'磁盘水位阻断冷任务',source_circuit_open:'来源慢查询熔断中'};
+  if(h.estimate_status==='recent_raw_pages'&&h.estimated_seconds!=null)return '按最近15分钟分页速率估算剩余 '+usageFactsDuration(h.estimated_seconds);
   if(h.estimate_status==='observed'&&h.estimated_seconds!=null)return '按已签收速率估算剩余 '+usageFactsDuration(h.estimated_seconds);
   return labels[h.estimate_status]||'暂无可靠 ETA';
 }
@@ -2178,23 +2184,27 @@ function renderUsageFactsHistoryStatus(h,d){
   const serving=f.published_range_start&&f.published_through
     ?`服务已签收 ${usageFactsDay(f.published_range_start)} 至 ${usageFactsTime(f.published_through)}`
     :'尚无可服务的已签收数据';
-  const complete=+h.pending_members===0&&+h.paused_members===0&&+h.failed_members===0&&h.total_known;
-  const cls=complete&&f.read_active?'ok':'warn';
-  const title=complete?'✓ 全历史已签收':`⏳ 全历史回填 ${coverage.toFixed(1)}%`;
+  const archiveComplete=+h.pending_members===0&&+h.paused_members===0&&+h.failed_members===0&&h.total_known;
+  const serviceComplete=!!f.read_active&&+h.total_members>0&&+h.published_members===+h.total_members&&(!h.raw_page_enabled||(+h.live_ready_members===+h.total_members&&+h.recent_ready_members===+h.total_members));
+  const cls=serviceComplete?'ok':'warn';
+  const title=serviceComplete?'✓ 全部成员近期用量已可用':`⏳ 近期用量 ${fmtNum(h.published_members)}/${fmtNum(h.total_members)} 成员可用`;
   const disk=h.disk_pressure&&h.disk_pressure!=='normal'?` · 磁盘 ${esc(h.disk_pressure)} ${(+h.disk_used_percent||0).toFixed(1)}%`:'';
   const circuit=h.bulk_circuit_state&&h.bulk_circuit_state!=='closed'?` · 来源熔断 ${esc(h.bulk_circuit_state)}${h.bulk_opened_until?' 至 '+usageFactsTime(h.bulk_opened_until):''}`:'';
-  const summary=`<div class="usage-facts-state ${cls}"><b>${title}</b><div class="usage-facts-progress"><i style="width:${coverage.toFixed(1)}%"></i></div><span>成员 ${fmtNum(h.ready_members)}/${fmtNum(h.total_members)} ready · 已发布 ${fmtNum(h.published_members)} · 校验 ${verifyPct.toFixed(1)}% · ${esc(usageFactsEstimateText(h))} · ${serving}${disk}${circuit}</span></div>`;
+  const raw=h.raw_page_enabled?` · 实时 ${fmtNum(h.live_ready_members)}/${fmtNum(h.total_members)}追平(最大延迟${usageFactsDuration(h.live_max_lag_seconds||0)}) · 近7天 ${fmtNum(h.recent_ready_members)}/${fmtNum(h.total_members)}完整(最大缺口${usageFactsDuration(h.recent_max_lag_seconds||0)}) · 分页 ${fmtNum(h.raw_page_complete_hours)}/${fmtNum(h.raw_page_hours)}h · ${fmtNum(h.raw_page_pages)}页/${fmtNum(h.raw_page_source_rows)}条`:'';
+  const summary=`<div class="usage-facts-state ${cls}"><b>${title}</b><div class="usage-facts-progress"><i style="width:${coverage.toFixed(1)}%"></i></div><span>全历史归档 ${coverage.toFixed(1)}%（${fmtNum(h.archive_ready_members||h.ready_members)}/${fmtNum(h.total_members)} 成员完成） · 校验 ${verifyPct.toFixed(1)}%${raw} · ${esc(usageFactsEstimateText(h))} · ${serving}${disk}${circuit}</span></div>`;
   const memberRows=(h.members||[]).map(x=>{
     const pct=Math.max(0,Math.min(100,+x.coverage_percent||0));
     const source=x.source_history_status==='no_history'?'已证明无历史':`${usageFactsTime(x.source_floor_hour)} → ${usageFactsTime(x.target_through_hour)}`;
-    const state=x.job_status==='paused'?'<span class="badge badge-red">已暂停</span>'
-      :(x.published?'<span class="badge badge-green">已发布</span>':'<span class="badge badge-yellow">待签收</span>');
-    return `<tr><td class="num">#${+x.user_id}</td><td>${esc(usageFactsStageLabel(x.stage))}<br>${state}</td><td>${pct.toFixed(1)}%<br><span class="muted">${fmtNum(x.completed_hours)}/${fmtNum(x.total_hours)}h</span></td><td>${esc(x.verification_status||'待校验')}<br><span class="muted">${fmtNum(x.verified_hours)}/${fmtNum(x.total_hours)}h</span></td><td>${esc(source)}</td><td class="history-error">${x.last_error?esc(x.last_error):'<span class="muted">—</span>'} ${usageHistoryRetryHTML(x.user_id,x.job_id,x.job_status)} ${usageHistoryRepairHTML(x.user_id,x.published)}</td></tr>`;
+    const state=x.job_status==='paused'?'<span class="badge badge-red">历史暂停</span>'
+      :(x.service_ready?'<span class="badge badge-green">近期可用</span>':'<span class="badge badge-yellow">建立近期窗口</span>');
+    const span=+x.raw_page_span_hours||1,preferred=+x.raw_page_preferred_span_hours||1;
+    const page=x.raw_page_hour?`${usageFactsTime(x.raw_page_hour)}${span>1?' → '+usageFactsTime(x.raw_page_through):''}<br><span class="muted">${esc(x.raw_page_status||'—')} · 当前${span}h/下个${preferred}h · ${fmtNum(x.raw_page_pages)}页 / ${fmtNum(x.raw_page_source_rows)}条<br>实时 ${esc(x.live_status||'pending')} / 延迟 ${usageFactsDuration(x.live_lag_seconds||0)}<br>近7天 ${esc(x.recent_status||'pending')} / 缺口 ${usageFactsDuration(x.recent_lag_seconds||0)}</span>`:`<span class="muted">尚无分页水位<br>实时 ${esc(x.live_status||'pending')} / 延迟 ${usageFactsDuration(x.live_lag_seconds||0)}<br>近7天 ${esc(x.recent_status||'pending')} / 缺口 ${usageFactsDuration(x.recent_lag_seconds||0)}</span>`;
+    return `<tr><td class="num">#${+x.user_id}</td><td>${esc(usageFactsStageLabel(x.stage))}<br>${state}</td><td>${pct.toFixed(1)}%<br><span class="muted">${fmtNum(x.completed_hours)}/${fmtNum(x.total_hours)}h</span></td><td>${page}</td><td>${esc(x.verification_status||'待校验')}<br><span class="muted">${fmtNum(x.verified_hours)}/${fmtNum(x.total_hours)}h</span></td><td>${esc(source)}</td><td class="history-error">${x.raw_page_last_error?esc(x.raw_page_last_error)+'<br>':''}${x.last_error?esc(x.last_error):'<span class="muted">—</span>'} ${usageHistoryRetryHTML(x.user_id,x.job_id,x.job_status)} ${usageHistoryRepairHTML(x.user_id,x.published)}</td></tr>`;
   }).join('');
   const maintenanceRows=(h.maintenance||[]).map(x=>`<tr><td class="num">#${+x.user_id}</td><td>${esc(usageFactsStageLabel(x.kind))}</td><td>${esc(x.status||'—')}</td><td>${fmtNum(x.completed_hours)}/${fmtNum(x.total_hours)}h</td><td class="history-error">${x.last_error?esc(x.last_error):esc(x.reason||'—')} ${usageHistoryRetryHTML(x.user_id,x.job_id,x.status)}</td></tr>`).join('');
-  const details=`<details class="usage-history-detail"><summary>逐成员进度与维护任务 · pending ${fmtNum(h.pending_members)} · paused ${fmtNum(h.paused_members)} · maintenance ${fmtNum((h.maintenance||[]).length)}</summary><div class="monitor-table-scroll"><table><thead><tr><th>用户</th><th>阶段</th><th>回填</th><th>校验</th><th>来源范围</th><th>失败/操作</th></tr></thead><tbody>${memberRows||'<tr><td colspan="6" class="muted">尚未发现成员边界</td></tr>'}</tbody></table></div>${maintenanceRows?`<div class="muted" style="margin-top:10px">修复与滚动审计</div><div class="monitor-table-scroll"><table><thead><tr><th>用户</th><th>任务</th><th>状态</th><th>进度</th><th>原因/操作</th></tr></thead><tbody>${maintenanceRows}</tbody></table></div>`:''}</details>`;
+  const details=`<details class="usage-history-detail"><summary>逐成员进度与维护任务 · pending ${fmtNum(h.pending_members)} · paused ${fmtNum(h.paused_members)} · maintenance ${fmtNum((h.maintenance||[]).length)}</summary><div class="monitor-table-scroll"><table><thead><tr><th>用户</th><th>阶段</th><th>回填</th><th>分页水位</th><th>校验</th><th>来源范围</th><th>失败/操作</th></tr></thead><tbody>${memberRows||'<tr><td colspan="7" class="muted">尚未发现成员边界</td></tr>'}</tbody></table></div>${maintenanceRows?`<div class="muted" style="margin-top:10px">修复与滚动审计</div><div class="monitor-table-scroll"><table><thead><tr><th>用户</th><th>任务</th><th>状态</th><th>进度</th><th>原因/操作</th></tr></thead><tbody>${maintenanceRows}</tbody></table></div>`:''}</details>`;
   el.innerHTML=summary+details;
-  return !complete||!f.read_active||+h.paused_maintenance>0||h.disk_blocked||h.bulk_circuit_state==='open';
+  return !serviceComplete||!archiveComplete||+h.paused_maintenance>0||h.disk_blocked||h.bulk_circuit_state==='open';
 }
 async function usageLoadFactsStatus(){
   clearTimeout(usageFactsTimer);
@@ -2228,6 +2238,11 @@ function usageBeginRequest(){
 // 但不把陈旧数据伪装成实时数据；错误响应仍按下方 alert 显示。
 function usageSetDataNotice(d){
   const eb=document.getElementById('usageErr');
+  if(d&&d.membership_partial){
+    const msg=d.membership_message||`成员事实正在逐个签收，当前 ${fmtNum(d.published_members||0)}/${fmtNum(d.active_members||0)} 可用`;
+    eb.innerHTML=`<div class="usage-sync-note"><b>⏳ 成员级数据补全中</b><span>${esc(msg)}</span></div>`;
+    return;
+  }
   if(d&&d.range_partial){
     const msg=d.range_message||'已先展示本地已完成的数据，其余历史数据正在后台补全；补全后刷新即可查看';
     eb.innerHTML=`<div class="usage-sync-note"><b>⏳ 历史数据补全中</b><span>${esc(msg)}</span></div>`;

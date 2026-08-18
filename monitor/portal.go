@@ -1066,7 +1066,10 @@ func (m *Monitor) buildPortalOverview(c *gin.Context, gid, fromTs, toTs int64) (
 	}
 	ids := idsOf(tracked)
 	memberFP := portalMemberFingerprint(tracked)
-	readRange := m.resolveUsageAggregateReadRange(fromTs, toTs)
+	readRange, err := m.resolveUsageAggregateReadRangeForMembers(c.Request.Context(), fromTs, toTs, ids)
+	if err != nil {
+		return nil, err
+	}
 	fromTs, toTs = readRange.From, readRange.To
 	p.RangePartial, p.RangeMessage = readRange.Partial, readRange.Message
 	mx := requestedRange
@@ -1199,7 +1202,11 @@ func (m *Monitor) portalBreakdown(c *gin.Context) {
 		}})
 		return
 	}
-	readRange := m.resolveUsageAggregateReadRange(fromTs, toTs)
+	readRange, err := m.resolveUsageAggregateReadRangeForMembers(c.Request.Context(), fromTs, toTs, ids)
+	if err != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "本地用量发布范围暂不可用"})
+		return
+	}
 	fromTs, toTs = readRange.From, readRange.To
 	if !readRange.Available {
 		c.JSON(http.StatusOK, gin.H{"ok": true, "data": portalBreakdownPayload{
@@ -1284,7 +1291,11 @@ func (m *Monitor) portalUserDetail(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	readRange := m.resolveUsageAggregateReadRange(fromTs, toTs)
+	readRange, err := m.resolveUsageAggregateReadRangeForMembers(c.Request.Context(), fromTs, toTs, []int64{uid})
+	if err != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "本地用量发布范围暂不可用"})
+		return
+	}
 	requestedRange := newUsageStatsRange(fromTs, toTs)
 	requestedFrom, requestedTo := requestedRange.From, requestedRange.To
 	fromTs, toTs = readRange.From, readRange.To
