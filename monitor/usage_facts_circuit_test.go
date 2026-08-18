@@ -64,6 +64,18 @@ func TestUsageFactHistoryTuningKeepsSourceRangesSingleMember(t *testing.T) {
 	}
 }
 
+func TestUsageFactHistorySingleMemberDayTimeoutCanDowngradeToHourly(t *testing.T) {
+	day := time.Date(2026, 8, 18, 0, 0, 0, 0, usageCST).Unix()
+	claim := usageFactHistoryClaim{From: day, Through: day + usageFactDaySeconds, Jobs: []UsageFactJob{{ID: "one"}}}
+	if !usageFactHistoryClaimCanDowngradeToHourly(claim) {
+		t.Fatal("one member-day must downgrade instead of retrying the same timed-out bulk query")
+	}
+	claim.Jobs = append(claim.Jobs, UsageFactJob{ID: "two"})
+	if usageFactHistoryClaimCanDowngradeToHourly(claim) {
+		t.Fatal("a multi-member claim must shrink before hourly downgrade")
+	}
+}
+
 func TestUsageFactBulkCircuitPersistsAcrossSchedulerTurns(t *testing.T) {
 	m := newUsageHistoryTestMonitor(t)
 	now := time.Unix(3_000_000, 0)

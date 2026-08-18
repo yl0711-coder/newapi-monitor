@@ -2310,6 +2310,19 @@ func (m *Monitor) executeUsageFactHistoryBackfill(ctx context.Context, claim usa
 	if err != nil {
 		if usageFactHistoryBulkTimeout(err) {
 			circuitErr := m.recordUsageFactHistoryBulkFailure(context.Background(), err, now)
+			// A timeout after adaptive shrinking has reached one member-day is not
+			// a reason to retry that exact daily aggregate after every circuit
+			// cooldown.  Preserve the bulk circuit for all other cold work, but
+			// make this member's durable cursor a bounded hourly Tail job.  Tail
+			// runs ahead of the cold circuit and its final hour still performs the
+			// independent full-day control check before publishing daily facts.
+			if usageFactHistoryClaimCanDowngradeToHourly(claim) {
+				if downgradeErr := m.downgradeUsageFactHistoryClaimToHourly(context.Background(), claim, err, now); downgradeErr != nil {
+					return errors.Join(err, circuitErr, downgradeErr)
+				}
+				tuning.healthy = 0
+				return circuitErr
+			}
 			_ = m.releaseUsageFactHistoryClaim(context.Background(), claim, err, now, true)
 			return errors.Join(err, circuitErr)
 		}
@@ -2405,7 +2418,7 @@ func (m *Monitor) executeUsageFactHistoryBackfill(ctx context.Context, claim usa
 }
 
 func (m *Monitor) downgradeUsageFactHistoryClaimToHourly(ctx context.Context, claim usageFactHistoryClaim, cause error, now time.Time) error {
-	if len(claim.Jobs) != 1 || claim.From <= 0 || claim.Through != claim.From+usageFactDaySeconds {
+	if !usageFactHistoryClaimCanDowngradeToHourly(claim) {
 		return errors.New("全历史逐小时降级范围无效")
 	}
 	claimed := claim.Jobs[0]
@@ -2437,6 +2450,10 @@ func (m *Monitor) downgradeUsageFactHistoryClaimToHourly(ctx context.Context, cl
 				*job.UserID, true, job.TrackedRevision, job.SourceEpoch).
 			Updates(map[string]any{"coverage_status": "hourly_backfill", "last_error": message, "updated_at": now.Unix()}).Error
 	})
+}
+
+func usageFactHistoryClaimCanDowngradeToHourly(claim usageFactHistoryClaim) bool {
+	return len(claim.Jobs) == 1 && claim.From > 0 && claim.Through == claim.From+usageFactDaySeconds
 }
 
 func (m *Monitor) executeUsageFactHistoryTail(ctx context.Context, claim usageFactHistoryClaim, now time.Time) error {
