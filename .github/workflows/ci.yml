@@ -44,7 +44,11 @@ jobs:
           MONITOR_TEST_REDIS_ADDR: 127.0.0.1:6379
           MONITOR_TEST_REDIS_PASSWORD: ci-only-redis-password
           MONITOR_TEST_REDIS_UNAVAILABLE_ADDR: 127.0.0.1:6390
-        run: go test -race ./...
+        # The monitor package now contains the full migration, restore and
+        # concurrency fault matrix. On a shared GitHub runner the complete
+        # race pass can legitimately exceed Go's default 10-minute package
+        # timeout even while tests continue to make progress.
+        run: go test -race -timeout 20m ./...
       - name: Check reachable Go vulnerabilities
         run: go run golang.org/x/vuln/cmd/govulncheck@v1.1.4 ./...
       - name: golangci-lint
