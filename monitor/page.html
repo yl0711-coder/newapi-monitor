@@ -629,7 +629,6 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
 
 <!-- ═══════════ Tab 3:用户用量(盯指定用户,按需查生产库 logs 聚合) ═══════════ -->
 <div class="tabpane" id="tab-usage">
-  <div id="usageSyncStatus"></div>
   <div id="usageErr"></div>
 
   <!-- 共用查询条件(列表/详情都按此范围) -->
@@ -2149,80 +2148,25 @@ async function usageRetryHistory(userID,jobID,btn){
     await usageLoadFactsStatus();
   }catch(e){alert(e.message);if(btn)btn.disabled=false}
 }
-function renderUsageFactsStatus(d){
-  const el=document.getElementById('usageSyncStatus'),f=d&&d.facts||{};
-  if(!f.enabled){el.innerHTML='';return false}
-  const serving=f.published_range_start&&f.published_through
-    ?`当前继续服务 ${usageFactsDay(f.published_range_start)} 至 ${usageFactsDay(+f.published_through-1)} 的已签收数据`
-    :'尚无可服务的已签收数据';
-  if(f.repair_active){
-    const total=+f.repair_total_member_hours||0,done=+f.repair_completed_member_hours||0;
-    const pct=total?Math.min(100,done*100/total):0;
-    const title=f.repair_mode==='candidate_gap'?'正在自动修复历史缺口':'正在修复历史数据';
-    const err=f.repair_last_error?` · 最近错误：${esc(f.repair_last_error)}`:'';
-    el.innerHTML=`<div class="usage-facts-state warn"><b>🛠 ${title} ${pct.toFixed(1)}%</b><div class="usage-facts-progress"><i style="width:${pct.toFixed(1)}%"></i></div><span>${fmtNum(f.repair_target_members)} 个成员 · ${fmtNum(done)}/${fmtNum(total)} member-hours · ${serving}${err}</span></div>`;
-    return true;
-  }
-  if(!f.fact_coverage_ready){
-    const pct=Math.max(0,Math.min(100,+f.coverage_percent||0));
-    const err=f.repair_last_error?` · 最近错误：${esc(f.repair_last_error)}`:'';
-    el.innerHTML=`<div class="usage-facts-state warn"><b>⏳ 历史数据同步中 ${pct.toFixed(1)}%</b><div class="usage-facts-progress"><i style="width:${pct.toFixed(1)}%"></i></div><span>${fmtNum(f.complete_member_hours)}/${fmtNum(f.expected_member_hours)} member-hours · ${serving}${err}</span></div>`;
-    return true;
-  }
-  const cls=f.read_active&&f.semantic_audit_ok?'ok':'';
-  const title=cls?'✓ 本地事实数据已通过完整性校验':'事实数据已补齐，等待发布复核';
-  el.innerHTML=`<div class="usage-facts-state ${cls}"><b>${title}</b><span>${serving}</span></div>`;
-  return !cls;
-}
-function renderUsageFactsHistoryStatus(h,d){
-  const el=document.getElementById('usageSyncStatus'),f=d&&d.facts||{};
+function updateUsageFactsHistoryMetadata(h){
   usageFactsHistory=h;
   usageHistoryByUser=new Map((h.members||[]).map(x=>[+x.user_id,x]));
   if(usageInited)renderUsageUsers();
-  const coverage=Math.max(0,Math.min(100,+h.coverage_percent||0));
-  const verifyPct=+h.total_hours?Math.max(0,Math.min(100,(+h.verified_hours||0)*100/+h.total_hours)):0;
-  const serving=f.published_range_start&&f.published_through
-    ?`服务已签收 ${usageFactsDay(f.published_range_start)} 至 ${usageFactsTime(f.published_through)}`
-    :'尚无可服务的已签收数据';
   const archiveComplete=+h.pending_members===0&&+h.paused_members===0&&+h.failed_members===0&&h.total_known;
-  const serviceComplete=!!f.read_active&&+h.total_members>0&&+h.published_members===+h.total_members&&(!h.raw_page_enabled||(+h.live_ready_members===+h.total_members&&+h.recent_ready_members===+h.total_members));
-  const cls=serviceComplete?'ok':'warn';
-  const title=serviceComplete?'✓ 全部成员近期用量已可用':`⏳ 近期用量 ${fmtNum(h.published_members)}/${fmtNum(h.total_members)} 成员可用`;
-  const disk=h.disk_pressure&&h.disk_pressure!=='normal'?` · 磁盘 ${esc(h.disk_pressure)} ${(+h.disk_used_percent||0).toFixed(1)}%`:'';
-  const circuit=h.bulk_circuit_state&&h.bulk_circuit_state!=='closed'?` · 来源熔断 ${esc(h.bulk_circuit_state)}${h.bulk_opened_until?' 至 '+usageFactsTime(h.bulk_opened_until):''}`:'';
-  const raw=h.raw_page_enabled?` · 实时 ${fmtNum(h.live_ready_members)}/${fmtNum(h.total_members)}追平(最大延迟${usageFactsDuration(h.live_max_lag_seconds||0)}) · 近7天 ${fmtNum(h.recent_ready_members)}/${fmtNum(h.total_members)}完整(最大缺口${usageFactsDuration(h.recent_max_lag_seconds||0)}) · 分页 ${fmtNum(h.raw_page_complete_hours)}/${fmtNum(h.raw_page_hours)}h · ${fmtNum(h.raw_page_pages)}页/${fmtNum(h.raw_page_source_rows)}条`:'';
-  const summary=`<div class="usage-facts-state ${cls}"><b>${title}</b><div class="usage-facts-progress"><i style="width:${coverage.toFixed(1)}%"></i></div><span>全历史归档 ${coverage.toFixed(1)}%（${fmtNum(h.archive_ready_members||h.ready_members)}/${fmtNum(h.total_members)} 成员完成） · 校验 ${verifyPct.toFixed(1)}%${raw} · ${esc(usageFactsEstimateText(h))} · ${serving}${disk}${circuit}</span></div>`;
-  const memberRows=(h.members||[]).map(x=>{
-    const pct=Math.max(0,Math.min(100,+x.coverage_percent||0));
-    const source=x.source_history_status==='no_history'?'已证明无历史':`${usageFactsTime(x.source_floor_hour)} → ${usageFactsTime(x.target_through_hour)}`;
-    const state=x.job_status==='paused'?'<span class="badge badge-red">历史暂停</span>'
-      :(x.service_ready?'<span class="badge badge-green">近期可用</span>':'<span class="badge badge-yellow">建立近期窗口</span>');
-    const span=+x.raw_page_span_hours||1,preferred=+x.raw_page_preferred_span_hours||1;
-    const page=x.raw_page_hour?`${usageFactsTime(x.raw_page_hour)}${span>1?' → '+usageFactsTime(x.raw_page_through):''}<br><span class="muted">${esc(x.raw_page_status||'—')} · 当前${span}h/下个${preferred}h · ${fmtNum(x.raw_page_pages)}页 / ${fmtNum(x.raw_page_source_rows)}条<br>实时 ${esc(x.live_status||'pending')} / 延迟 ${usageFactsDuration(x.live_lag_seconds||0)}<br>近7天 ${esc(x.recent_status||'pending')} / 缺口 ${usageFactsDuration(x.recent_lag_seconds||0)}</span>`:`<span class="muted">尚无分页水位<br>实时 ${esc(x.live_status||'pending')} / 延迟 ${usageFactsDuration(x.live_lag_seconds||0)}<br>近7天 ${esc(x.recent_status||'pending')} / 缺口 ${usageFactsDuration(x.recent_lag_seconds||0)}</span>`;
-    return `<tr><td class="num">#${+x.user_id}</td><td>${esc(usageFactsStageLabel(x.stage))}<br>${state}</td><td>${pct.toFixed(1)}%<br><span class="muted">${fmtNum(x.completed_hours)}/${fmtNum(x.total_hours)}h</span></td><td>${page}</td><td>${esc(x.verification_status||'待校验')}<br><span class="muted">${fmtNum(x.verified_hours)}/${fmtNum(x.total_hours)}h</span></td><td>${esc(source)}</td><td class="history-error">${x.raw_page_last_error?esc(x.raw_page_last_error)+'<br>':''}${x.last_error?esc(x.last_error):'<span class="muted">—</span>'} ${usageHistoryRetryHTML(x.user_id,x.job_id,x.job_status)} ${usageHistoryRepairHTML(x.user_id,x.published)}</td></tr>`;
-  }).join('');
-  const maintenanceRows=(h.maintenance||[]).map(x=>`<tr><td class="num">#${+x.user_id}</td><td>${esc(usageFactsStageLabel(x.kind))}</td><td>${esc(x.status||'—')}</td><td>${fmtNum(x.completed_hours)}/${fmtNum(x.total_hours)}h</td><td class="history-error">${x.last_error?esc(x.last_error):esc(x.reason||'—')} ${usageHistoryRetryHTML(x.user_id,x.job_id,x.status)}</td></tr>`).join('');
-  const details=`<details class="usage-history-detail"><summary>逐成员进度与维护任务 · pending ${fmtNum(h.pending_members)} · paused ${fmtNum(h.paused_members)} · maintenance ${fmtNum((h.maintenance||[]).length)}</summary><div class="monitor-table-scroll"><table><thead><tr><th>用户</th><th>阶段</th><th>回填</th><th>分页水位</th><th>校验</th><th>来源范围</th><th>失败/操作</th></tr></thead><tbody>${memberRows||'<tr><td colspan="7" class="muted">尚未发现成员边界</td></tr>'}</tbody></table></div>${maintenanceRows?`<div class="muted" style="margin-top:10px">修复与滚动审计</div><div class="monitor-table-scroll"><table><thead><tr><th>用户</th><th>任务</th><th>状态</th><th>进度</th><th>原因/操作</th></tr></thead><tbody>${maintenanceRows}</tbody></table></div>`:''}</details>`;
-  el.innerHTML=summary+details;
-  return !serviceComplete||!archiveComplete||+h.paused_maintenance>0||h.disk_blocked||h.bulk_circuit_state==='open';
+  return !archiveComplete||+h.paused_maintenance>0||h.disk_blocked||h.bulk_circuit_state==='open';
 }
 async function usageLoadFactsStatus(){
   clearTimeout(usageFactsTimer);
   try{
-    const [res,historyRes]=await Promise.all([
-      fetch('/usage/facts-status',{headers:{'Accept':'application/json'}}),
-      fetch('/usage/facts-history',{headers:{'Accept':'application/json'}})
-    ]);
-    if(res.status===401||historyRes.status===401){location.href='/login';return}
-    const d=await res.json().catch(()=>({}));
-    if(!res.ok)throw new Error(d.error||('状态查询失败 '+res.status));
+    const historyRes=await fetch('/usage/facts-history',{headers:{'Accept':'application/json'}});
+    if(historyRes.status===401){location.href='/login';return}
     const h=await historyRes.json().catch(()=>({}));
     if(!historyRes.ok)throw new Error(h.error||('全历史进度查询失败 '+historyRes.status));
-    const pending=h.enabled?renderUsageFactsHistoryStatus(h,d):renderUsageFactsStatus(d);
+    const pending=h.enabled?updateUsageFactsHistoryMetadata(h):false;
     if(!h.enabled){usageFactsHistory=null;usageHistoryByUser=new Map();if(usageInited)renderUsageUsers()}
     usageFactsTimer=setTimeout(()=>{if(!document.getElementById('tab-usage').hidden)usageLoadFactsStatus()},pending?30000:300000);
   }catch(e){
-    document.getElementById('usageSyncStatus').innerHTML=`<div class="usage-facts-state warn"><b>同步状态暂不可用</b><span>${esc(e.message)}</span></div>`;
+    console.warn('用量事实元数据暂不可用',e);
     usageFactsTimer=setTimeout(()=>{if(!document.getElementById('tab-usage').hidden)usageLoadFactsStatus()},60000);
   }
 }
@@ -2238,16 +2182,6 @@ function usageBeginRequest(){
 // 但不把陈旧数据伪装成实时数据；错误响应仍按下方 alert 显示。
 function usageSetDataNotice(d){
   const eb=document.getElementById('usageErr');
-  if(d&&d.membership_partial){
-    const msg=d.membership_message||`成员事实正在逐个签收，当前 ${fmtNum(d.published_members||0)}/${fmtNum(d.active_members||0)} 可用`;
-    eb.innerHTML=`<div class="usage-sync-note"><b>⏳ 成员级数据补全中</b><span>${esc(msg)}</span></div>`;
-    return;
-  }
-  if(d&&d.range_partial){
-    const msg=d.range_message||'已先展示本地已完成的数据，其余历史数据正在后台补全；补全后刷新即可查看';
-    eb.innerHTML=`<div class="usage-sync-note"><b>⏳ 历史数据补全中</b><span>${esc(msg)}</span></div>`;
-    return;
-  }
   const msg=d&&d.matrix_available===false
     ?(d.matrix_message||'每日消费明细暂不可用，余额和累计消耗仍可查看')
     :(d&&d.data_stale?(d.data_message||'当前显示最近一次成功统计'):'' );
@@ -2281,6 +2215,9 @@ function renderUsageMatrix(mx,empty,matrixAvailable,matrixMessage,meta){
   usageMxCache._matrixMessage=matrixMessage||'';
   usageMxCache._rangePartial=!!(meta&&meta.range_partial);
   usageMxCache._rangeMessage=(meta&&meta.range_message)||'';
+  usageMxCache._membershipPartial=!!(meta&&meta.membership_partial);
+  usageMxCache._publishedMembers=+(meta&&meta.published_members)||0;
+  usageMxCache._activeMembers=+(meta&&meta.active_members)||0;
   usageMxCache._requestedFrom=(meta&&meta.requested_from)||mx.from||'';
   usageMxCache._requestedTo=(meta&&meta.requested_to)||mx.to||'';
   renderUsageList();
@@ -2611,11 +2548,15 @@ window.addEventListener('resize',resizeUsageMatrices);
 function drawUsageMatrix(mx,users,empty,thId,tbId){
   const isList=!thId; thId=thId||'thUsageMx'; tbId=tbId||'tbUsageMx';
   const rangePartial=!!mx._rangePartial;
-  if(isList)document.getElementById('usageRangeNote').textContent=mx.from
+  if(isList){
+    let scope=mx.from
     ?(rangePartial
       ?`查询范围 ${mx._requestedFrom} ~ ${mx._requestedTo} · 当前展示 ${mx.from} ~ ${mx.to}(CST)`
       :`统计范围 ${mx.from} ~ ${mx.to}(CST)`)
     :'';
+    if(mx._membershipPartial)scope+=(scope?' · ':'')+`当前包含已签收成员 ${fmtNum(mx._publishedMembers)}/${fmtNum(mx._activeMembers)}`;
+    document.getElementById('usageRangeNote').textContent=scope;
+  }
   const days=mx.days||[];
   const th=document.getElementById(thId),tb=document.getElementById(tbId);
   const matrixAvailable=mx._matrixAvailable!==false;

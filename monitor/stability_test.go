@@ -732,6 +732,75 @@ func TestCompactStabilityReportKeepsSummaryButDefersNestedDetails(t *testing.T) 
 	}
 }
 
+func TestStabilityReportFallsBackToLegacyHoursWithoutDoubleCountingV5(t *testing.T) {
+	m := newStabilityTestMonitor(t)
+	day := time.Date(2026, 8, 13, 0, 0, 0, 0, cstLocation).Unix()
+
+	// 模拟升级现场：第一天只有旧口径，第二天新旧事实同时存在。
+	// 读取应展示第一天的旧数据，但第二天只能选 v5，不能叠加。
+	if err := m.storeDB.Exec(`INSERT INTO stability_hour_samples
+		(hour_ts,channel_id,model_name,grp,traffic_class_version,success,failed)
+		VALUES (?,?,?,?,NULL,?,?)`, day, 1, "legacy-model", "g", 90, 10).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := m.storeDB.Exec(`INSERT INTO stability_hour_ingest_states
+		(hour_ts,status,traffic_class_version,completed_at) VALUES (?,'complete',NULL,?)`, day, day+3600).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := m.storeDB.Create(&StabilityHourSample{
+		HourTs: day, ChannelID: 3, ModelName: "incomplete-v5-model", Grp: "g", Success: 888,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := m.storeDB.Create(&[]StabilityRejectHour{
+		{HourTs: day, Node: "n", Reason: "legacy", Model: "m", Grp: "g", Count: 7},
+		{HourTs: day + 86400, Node: "n", Reason: "v5", Model: "m", Grp: "g", Count: 5},
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := m.storeDB.Exec(`INSERT INTO stability_hour_samples
+		(hour_ts,channel_id,model_name,grp,traffic_class_version,success,failed)
+		VALUES (?,?,?,?,NULL,?,?)`, day+86400, 2, "stale-legacy-model", "g", 999, 0).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := m.storeDB.Create(&StabilityHourSample{
+		HourTs: day + 86400, ChannelID: 1, ModelName: "v5-model", Grp: "g", Success: 90, Failed: 10,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := m.storeDB.Create(&StabilityHourIngestState{
+		HourTs: day + 86400, Status: "complete",
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	report, err := m.buildStabilityReport(context.Background(), stabilityScope{
+		FromTs: day, ToTs: day + 2*86400,
+	}, day+2*86400)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Summary.Requests != 212 || report.Summary.Rejected != 12 {
+		t.Fatalf("legacy fallback or v5 precedence is wrong: %+v", report.Summary)
+	}
+	if len(report.Groups) != 1 || len(report.Groups[0].Daily) != 2 {
+		t.Fatalf("unexpected report groups: %+v", report.Groups)
+	}
+	first, second := report.Groups[0].Daily[0], report.Groups[0].Daily[1]
+	if first.Requests != 107 || first.Stability == nil || math.Abs(*first.Stability-(90.0/107.0*100)) > 0.0001 {
+		t.Fatalf("legacy fallback day is wrong: %+v", first)
+	}
+	if second.Requests != 105 || second.Stability == nil || math.Abs(*second.Stability-(90.0/105.0*100)) > 0.0001 {
+		t.Fatalf("v5 day was not preferred over stale legacy facts: %+v", second)
+	}
+	if got := report.Meta.DataCoverage.LegacyFallbackHours; got != 1 {
+		t.Fatalf("legacy fallback coverage=%d, want 1", got)
+	}
+	if got := report.Meta.DataCoverage.EffectiveHours; got != 2 {
+		t.Fatalf("effective coverage=%d, want 2", got)
+	}
+}
+
 func TestStabilityReportMarksDeletedChannelAsHistorical(t *testing.T) {
 	m := newStabilityTestMonitor(t)
 	day := time.Date(2026, 8, 5, 0, 0, 0, 0, cstLocation).Unix()
@@ -1145,7 +1214,7 @@ func TestStabilityPageIncludesBusinessDateShortcuts(t *testing.T) {
 
 func TestStabilityPageUsesCompactCoverageStatus(t *testing.T) {
 	js := string(stabilityJS)
-	for _, marker := range []string{"latest_hour_pending", "正常汇总中", "小时待补"} {
+	for _, marker := range []string{"latest_hour_pending", "正常汇总中", "小时待补", "小时为旧口径参考", "v5 重签后将自动替换"} {
 		if !strings.Contains(js, marker) {
 			t.Fatalf("稳定性页缺少分级完整性状态 %q", marker)
 		}

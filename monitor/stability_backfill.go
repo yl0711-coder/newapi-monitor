@@ -94,15 +94,20 @@ type StabilityBackfillJob struct {
 
 // StabilityDataCoverage 是报表口径的数据完整率，不是“筛选结果占全量”的比例。
 type StabilityDataCoverage struct {
-	FromTs            int64   `json:"from_ts"`
-	ToTs              int64   `json:"to_ts"`
-	ExpectedHours     int64   `json:"expected_hours"`
-	CompletedHours    int64   `json:"completed_hours"`
-	MissingHours      int64   `json:"missing_hours"`
-	Percent           float64 `json:"percent"`
-	Complete          bool    `json:"complete"`
-	LatestHourPending bool    `json:"latest_hour_pending"`
-	PendingHourTs     int64   `json:"pending_hour_ts,omitempty"`
+	FromTs                int64   `json:"from_ts"`
+	ToTs                  int64   `json:"to_ts"`
+	ExpectedHours         int64   `json:"expected_hours"`
+	CompletedHours        int64   `json:"completed_hours"`
+	MissingHours          int64   `json:"missing_hours"`
+	Percent               float64 `json:"percent"`
+	Complete              bool    `json:"complete"`
+	EffectiveHours        int64   `json:"effective_hours"`
+	EffectiveMissingHours int64   `json:"effective_missing_hours"`
+	EffectivePercent      float64 `json:"effective_percent"`
+	EffectiveComplete     bool    `json:"effective_complete"`
+	LegacyFallbackHours   int64   `json:"legacy_fallback_hours"`
+	LatestHourPending     bool    `json:"latest_hour_pending"`
+	PendingHourTs         int64   `json:"pending_hour_ts,omitempty"`
 }
 
 func finalizedStabilityHourTo(now int64) int64 {
@@ -124,6 +129,8 @@ func (m *Monitor) stabilityDataCoverage(ctx context.Context, fromTs, toTs, now i
 	if toTs <= fromTs {
 		result.Complete = true
 		result.Percent = 100
+		result.EffectiveComplete = true
+		result.EffectivePercent = 100
 		return result
 	}
 	result.ExpectedHours = (toTs - fromTs) / 3600
@@ -143,6 +150,39 @@ func (m *Monitor) stabilityDataCoverage(ctx context.Context, fromTs, toTs, now i
 		result.Percent = float64(result.CompletedHours) / float64(result.ExpectedHours) * 100
 	}
 	result.Complete = result.MissingHours == 0
+	// 报表读取可在 v5 尚未覆盖的小时回退到旧口径，但同一小时一旦有
+	// v5 事实或 v5 零流量签收就立即停止回退。这里单独暴露“可展示覆盖”
+	// 与严格 v5 覆盖；前者服务页面连续性，后者继续作为迁移/就绪门禁。
+	var effective struct {
+		Hours       int64
+		LegacyHours int64
+	}
+	effectiveSQL := `SELECT
+		COUNT(DISTINCT hs.hour_ts) AS hours,
+		COUNT(DISTINCT CASE WHEN COALESCE(hs.traffic_class_version,0) <> ? THEN hs.hour_ts END) AS legacy_hours
+	FROM stability_hour_ingest_states hs
+	WHERE hs.hour_ts >= ? AND hs.hour_ts < ? AND hs.status = 'complete'
+		AND (hs.traffic_class_version = ? OR (
+			COALESCE(hs.traffic_class_version,0) <> ?
+			AND NOT EXISTS (SELECT 1 FROM stability_hour_ingest_states v5hs
+				WHERE v5hs.hour_ts = hs.hour_ts AND v5hs.status = 'complete' AND v5hs.traffic_class_version = ?)
+		))`
+	v := userTrafficClassificationVersion
+	if tx := m.storeDB.WithContext(ctx).Raw(effectiveSQL,
+		v, fromTs, toTs, v, v, v).Scan(&effective); tx.Error != nil {
+		slog.Warn("读取稳定性兼容覆盖失败", "err", tx.Error)
+	} else {
+		result.EffectiveHours = effective.Hours
+		result.LegacyFallbackHours = effective.LegacyHours
+	}
+	result.EffectiveMissingHours = result.ExpectedHours - result.EffectiveHours
+	if result.EffectiveMissingHours < 0 {
+		result.EffectiveMissingHours = 0
+	}
+	if result.ExpectedHours > 0 {
+		result.EffectivePercent = float64(result.EffectiveHours) / float64(result.ExpectedHours) * 100
+	}
+	result.EffectiveComplete = result.EffectiveMissingHours == 0
 	// 仅当查询范围追到当前最新可归档小时，且唯一缺口正好是
 	// 最后一小时时，才标记为正常的尾部汇总延迟。历史中间缺口或已失败
 	// 的最新小时仍是真实的数据完整性问题，不能被页面降级隐藏。

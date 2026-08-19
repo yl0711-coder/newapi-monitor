@@ -38,3 +38,26 @@ func TestSyncStatusPageAllowsHashNavigation(t *testing.T) {
 		t.Fatal("同步状态页必须更新统一页面标题")
 	}
 }
+
+func TestUsagePageKeepsOperationalProgressInSyncStatus(t *testing.T) {
+	for _, forbidden := range []string{
+		`id="usageSyncStatus"`,
+		"全部成员近期用量已可用",
+		"逐成员进度与维护任务",
+		"⏳ 历史数据补全中",
+	} {
+		if strings.Contains(pageHTML, forbidden) {
+			t.Fatalf("用量业务页仍渲染运维进度 %q", forbidden)
+		}
+	}
+	for _, required := range []string{
+		`id="tab-sync"`,
+		`syncKV('全历史归档'`,
+		`syncKV('来源状态'`,
+		`当前包含已签收成员`,
+	} {
+		if !strings.Contains(pageHTML, required) {
+			t.Fatalf("数据同步状态页或业务范围提示缺少 %q", required)
+		}
+	}
+}

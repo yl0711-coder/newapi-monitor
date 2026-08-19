@@ -71,7 +71,7 @@ func TestUsageMemberUIShowsFullHistoryStagesAndRootRetry(t *testing.T) {
 		"REPAIR_FULL_HISTORY_DAY",
 		"usageHistoryRepairKeys",
 		"estimated_seconds",
-		"disk_pressure",
+		"disk_blocked",
 		"bulk_circuit_state",
 		"仅管理员可见",
 	} {
