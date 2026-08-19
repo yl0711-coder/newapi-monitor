@@ -15,5 +15,8 @@ func TestDumpSampleWindowSQL(t *testing.T) {
 	if err := os.WriteFile("/tmp/sample_window.sql", []byte(sampleWindowSQL()+"\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	t.Log("已写 /tmp/sample_window.sql")
+	if err := os.WriteFile("/tmp/stability_hour.sql", []byte(stabilityHourSQL()+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Log("已写 /tmp/sample_window.sql 与 /tmp/stability_hour.sql")
 }

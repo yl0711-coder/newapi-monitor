@@ -191,7 +191,7 @@ func (m *Monitor) listTrackedUsers(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"users": m.trackedViews(rows)})
 }
 
-// ---- 客户分组 CRUD(name 唯一;删除=解散,成员回未分组) ----
+// ---- 客户分组 CRUD(name 唯一;只允许删除无成员且 Portal 未启用的误建公司) ----
 
 // listGroups GET /usage/groups(管理员):分组列表+人数。
 func (m *Monitor) listGroups(c *gin.Context) {
@@ -292,23 +292,30 @@ func (m *Monitor) updateGroup(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
 
-// deleteGroup POST /usage/groups/delete(仅超管):解散——成员回未分组,不删用户。
+// deleteGroup POST /usage/groups/delete(仅超管):只删除无成员且 Portal 已停用的误建公司。
 func (m *Monitor) deleteGroup(c *gin.Context) {
 	var in struct {
-		ID int64 `json:"id"`
+		ID        int64  `json:"id"`
+		RequestID string `json:"request_id"`
+		Reason    string `json:"reason"`
 	}
 	if err := c.ShouldBindJSON(&in); err != nil || in.ID <= 0 {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "id required"})
 		return
 	}
-	err := m.storeDB.Transaction(func(tx *gorm.DB) error {
-		if err := tx.Model(&TrackedUser{}).Where("group_id = ?", in.ID).Update("group_id", 0).Error; err != nil {
-			return err
-		}
-		return tx.Delete(&CustomerGroup{}, in.ID).Error
-	})
+	meta, err := usageMemberMutationMetaFromGin(c, in.RequestID, in.Reason)
+	if err == nil {
+		_, err = m.removeCustomerGroup(c.Request.Context(), in.ID, meta)
+	}
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		status := http.StatusInternalServerError
+		if errors.Is(err, errCustomerGroupHasMembers) || errors.Is(err, errCustomerGroupPortalEnabled) ||
+			errors.Is(err, errUsageMemberRequestConflict) {
+			status = http.StatusConflict
+		} else if errors.Is(err, gorm.ErrRecordNotFound) || strings.Contains(err.Error(), "幂等键") {
+			status = http.StatusBadRequest
+		}
+		c.JSON(status, gin.H{"error": err.Error()})
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"ok": true})
@@ -336,35 +343,35 @@ func (m *Monitor) setUserNote(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
 
-// setUserGroup POST /usage/users/group(仅超管):{user_id, group_id};group_id=0 为移出分组。
+// setUserGroup POST /usage/users/group(仅超管):显式纠正用户当前所属公司。
+// 它不修改 tracked revision，也不搬迁或重算 facts。
 func (m *Monitor) setUserGroup(c *gin.Context) {
 	var in struct {
-		UserID  int64 `json:"user_id"`
-		GroupID int64 `json:"group_id"`
+		UserID    int64  `json:"user_id"`
+		GroupID   int64  `json:"group_id"`
+		RequestID string `json:"request_id"`
+		Reason    string `json:"reason"`
 	}
 	if err := c.ShouldBindJSON(&in); err != nil || in.UserID <= 0 || in.GroupID < 0 {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "user_id/group_id required"})
 		return
 	}
-	if in.GroupID > 0 {
-		var n int64
-		m.storeDB.Model(&CustomerGroup{}).Where("id = ?", in.GroupID).Count(&n)
-		if n == 0 {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "分组不存在"})
-			return
+	meta, err := usageMemberMutationMetaFromGin(c, in.RequestID, in.Reason)
+	var result usageMemberMutationResult
+	if err == nil {
+		result, err = m.correctUsageMemberCompany(c.Request.Context(), in.UserID, in.GroupID, meta)
+	}
+	if err != nil {
+		status := http.StatusBadRequest
+		if errors.Is(err, errUsageMemberRequestConflict) {
+			status = http.StatusConflict
+		} else if errors.Is(err, errUsageMemberControlIntegrity) {
+			status = http.StatusServiceUnavailable
 		}
-	}
-	var current TrackedUser
-	if err := m.storeDB.Where("user_id = ?", in.UserID).First(&current).Error; err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "用户不在名单内"})
+		c.JSON(status, gin.H{"error": err.Error()})
 		return
 	}
-	res := m.storeDB.Model(&TrackedUser{}).Where("user_id = ?", in.UserID).Update("group_id", in.GroupID)
-	if res.Error != nil || res.RowsAffected == 0 {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "用户不在名单内"})
-		return
-	}
-	c.JSON(http.StatusOK, gin.H{"ok": true})
+	c.JSON(http.StatusOK, gin.H{"ok": true, "action": result.Action, "tracked_revision": result.TrackedRevision, "replayed": result.Replayed})
 }
 
 // addTrackedUser POST /usage/users(仅超管):{input: 邮箱或用户ID} → 解析主站用户后入名单。
@@ -374,29 +381,13 @@ func (m *Monitor) addTrackedUser(c *gin.Context) {
 		return
 	}
 	var in struct {
-		Input   string `json:"input"`
-		GroupID int64  `json:"group_id"` // 可选:添加同时归入分组;0=未分组
+		Input     string `json:"input"`
+		GroupID   int64  `json:"group_id"` // 可选:添加同时归入公司;0=未分组
+		RequestID string `json:"request_id"`
+		Reason    string `json:"reason"`
 	}
 	if err := c.ShouldBindJSON(&in); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
-	}
-	if in.GroupID > 0 {
-		var n int64
-		m.storeDB.Model(&CustomerGroup{}).Where("id = ?", in.GroupID).Count(&n)
-		if n == 0 {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "所选分组不存在"})
-			return
-		}
-	}
-	// 名单上限是约束生产库 IN 扫描宽度的护栏:计数出错必须拒绝,不能当 0 放行
-	var count int64
-	if err := m.storeDB.Model(&TrackedUser{}).Count(&count).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "读取名单失败,请重试"})
-		return
-	}
-	if count >= maxTrackedUsers {
-		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("名单已达上限 %d 个", maxTrackedUsers)})
 		return
 	}
 	u, err := m.resolveNewAPIUser(c.Request.Context(), in.Input)
@@ -404,29 +395,60 @@ func (m *Monitor) addTrackedUser(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	u.AddedAt = time.Now().Unix()
-	u.GroupID = in.GroupID
-	if err := m.storeDB.Save(u).Error; err != nil { // 主键=user_id,重复添加=幂等更新(含改组)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+	meta, err := usageMemberMutationMetaFromGin(c, in.RequestID, in.Reason)
+	var result usageMemberMutationResult
+	if err == nil {
+		result, err = m.addUsageMember(c.Request.Context(), *u, in.GroupID, meta)
+	}
+	if err != nil {
+		status := http.StatusInternalServerError
+		switch {
+		case errors.Is(err, errUsageMemberDifferentCompany), errors.Is(err, errUsageMemberRequestConflict):
+			status = http.StatusConflict
+		case errors.Is(err, errUsageMemberControlIntegrity):
+			status = http.StatusServiceUnavailable
+		case strings.Contains(err.Error(), "不存在"), strings.Contains(err.Error(), "上限"), strings.Contains(err.Error(), "幂等键"):
+			status = http.StatusBadRequest
+		}
+		c.JSON(status, gin.H{"error": err.Error()})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"ok": true, "user": u})
+	c.JSON(http.StatusOK, gin.H{"ok": true, "user": result.User, "action": result.Action,
+		"active": result.Active, "tracked_revision": result.TrackedRevision, "replayed": result.Replayed})
 }
 
 // deleteTrackedUser POST /usage/users/delete(仅超管):{user_id} → 移出名单(不动主站)。
 func (m *Monitor) deleteTrackedUser(c *gin.Context) {
 	var in struct {
-		UserID int64 `json:"user_id"`
+		UserID    int64  `json:"user_id"`
+		RequestID string `json:"request_id"`
+		Reason    string `json:"reason"`
 	}
 	if err := c.ShouldBindJSON(&in); err != nil || in.UserID <= 0 {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "user_id required"})
 		return
 	}
-	if err := m.storeDB.Delete(&TrackedUser{}, "user_id = ?", in.UserID).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+	meta, err := usageMemberMutationMetaFromGin(c, in.RequestID, in.Reason)
+	var result usageMemberMutationResult
+	if err == nil {
+		result, err = m.removeUsageMember(c.Request.Context(), in.UserID, meta)
+	}
+	if err != nil {
+		status := http.StatusInternalServerError
+		if errors.Is(err, errUsageMemberNotActive) || strings.Contains(err.Error(), "幂等键") {
+			status = http.StatusBadRequest
+		} else if errors.Is(err, errUsageMemberRequestConflict) {
+			status = http.StatusConflict
+		} else if errors.Is(err, errUsageMemberControlIntegrity) {
+			status = http.StatusServiceUnavailable
+		}
+		c.JSON(status, gin.H{"error": err.Error()})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"ok": true})
+	// 不撤销已发布事实读取。页面立即与当前 TrackedUser 取交集，
+	// 已删成员不会再显示；后台会在下一轮低频任务中发布新名单版本。
+	c.JSON(http.StatusOK, gin.H{"ok": true, "action": result.Action, "active": result.Active,
+		"tracked_revision": result.TrackedRevision, "replayed": result.Replayed})
 }
 
 // trackedLabel 展示名:用户名优先(需求:显示用户名),缺则邮箱,再缺回退 #id。
@@ -440,27 +462,79 @@ func trackedLabel(u TrackedUser) string {
 	return "#" + strconv.FormatInt(u.UserID, 10)
 }
 
+// refreshTrackedLabelsFromLocalSnapshot 仅在来源 users 表暂时不可读时使用 Monitor
+// 本地已有的资料快照兜底。它不触发来源库查询、不写主站；没有快照的成员仍按本地名单
+// 展示，余额和累计消耗保持空值，避免把缺失资料伪装为实时值。
+func (m *Monitor) refreshTrackedLabelsFromLocalSnapshot(ctx context.Context, tracked []TrackedUser) ([]TrackedUser, map[int64]int64, map[int64]int64, bool) {
+	balances, used := map[int64]int64{}, map[int64]int64{}
+	if m.storeDB == nil || len(tracked) == 0 {
+		return tracked, balances, used, false
+	}
+	var snapshots []UsageUserSnapshot
+	qctx, cancel := usageFactQueryContext(ctx)
+	defer cancel()
+	if err := m.storeDB.WithContext(qctx).Where("user_id IN ?", idsOf(tracked)).Find(&snapshots).Error; err != nil {
+		return tracked, balances, used, false
+	}
+	byID := make(map[int64]UsageUserSnapshot, len(snapshots))
+	for _, snap := range snapshots {
+		if snap.Exists {
+			byID[snap.UserID] = snap
+		}
+	}
+	if len(byID) == 0 {
+		return tracked, balances, used, false
+	}
+	for i := range tracked {
+		snap, ok := byID[tracked[i].UserID]
+		if !ok {
+			continue
+		}
+		if snap.Username != "" {
+			tracked[i].Username = snap.Username
+		}
+		if snap.Email != "" {
+			tracked[i].Email = snap.Email
+		}
+		balances[snap.UserID] = snap.BalanceQuota
+		used[snap.UserID] = snap.UsedQuota
+	}
+	return tracked, balances, used, true
+}
+
 // refreshTrackedLabels 按 id 去生产库 users 表把名单的 username/email 刷新成当前值(主键 IN 查询,代价可忽略),
 // 并顺路取回各用户【当前余额】与【累计消耗】的原始整数 quota(实时值不落库)。
 // 金额只在响应边界折美元，避免汇总、比较阶段引入浮点误差。主站已删的用户不在结果表 → 前端显示 —。
 // 名单存的是添加时的快照——主站改邮箱/账号易主后,矩阵会把今天的消费记在旧身份上;
-// 这里每次查询顺手校准,变化的顺手回写本地库(自愈缓存);失败则退回快照+空余额,绝不阻断统计。
+// 这里每次查询顺手校准,变化的顺手回写本地库(自愈缓存);来源失败时才读取本地已有资料快照，
+// 不会让一条 users 点查错误拖垮用量页面，也不会用短时缓存覆盖正常情况下的实时余额。
 func (m *Monitor) refreshTrackedLabels(ctx context.Context, tracked []TrackedUser) ([]TrackedUser, map[int64]int64, map[int64]int64) {
 	balances := map[int64]int64{}
 	used := map[int64]int64{}
 	if len(tracked) == 0 {
 		return tracked, balances, used
 	}
+	fallback := func(err error) ([]TrackedUser, map[int64]int64, map[int64]int64) {
+		if ctx.Err() != nil || errors.Is(err, context.Canceled) {
+			return tracked, balances, used
+		}
+		if localTracked, localBalances, localUsed, ok := m.refreshTrackedLabelsFromLocalSnapshot(ctx, tracked); ok {
+			slog.Warn("刷新检测用户标签失败,使用本地资料快照", "err", err)
+			return localTracked, localBalances, localUsed
+		}
+		slog.Warn("刷新检测用户标签失败,沿用本地名单", "err", err)
+		return tracked, balances, used
+	}
+	if m.prodDB == nil {
+		return fallback(errors.New("生产库未连接"))
+	}
 	cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	inSQL, args := usageIn("id", idsOf(tracked))
-	// used_quota 与 quota 同表同行,SELECT 多取一列即得累计总消耗,无额外往返/扫描
+	// used_quota 与 quota 同表同行,SELECT 多取一列即得累计总消耗,无额外往返或扫描。
 	rows, err := m.prodDB.QueryContext(cctx, "SELECT id, COALESCE(username,''), COALESCE(email,''), COALESCE(quota,0), COALESCE(used_quota,0) FROM users WHERE "+inSQL, args...)
 	if err != nil {
-		if !errors.Is(err, context.Canceled) {
-			slog.Warn("刷新检测用户标签失败,沿用快照", "err", err)
-		}
-		return tracked, balances, used
+		return fallback(err)
 	}
 	defer rows.Close()
 	fresh := map[int64]TrackedUser{}
@@ -468,25 +542,19 @@ func (m *Monitor) refreshTrackedLabels(ctx context.Context, tracked []TrackedUse
 		var u TrackedUser
 		var quota, usedQ int64
 		if err := rows.Scan(&u.UserID, &u.Username, &u.Email, &quota, &usedQ); err != nil {
-			if !errors.Is(err, context.Canceled) {
-				slog.Warn("刷新检测用户标签失败,沿用快照", "err", err)
-			}
-			return tracked, map[int64]int64{}, map[int64]int64{}
+			return fallback(err)
 		}
 		fresh[u.UserID] = u
 		balances[u.UserID] = quota
 		used[u.UserID] = usedQ
 	}
 	if err := rows.Err(); err != nil {
-		if !errors.Is(err, context.Canceled) {
-			slog.Warn("刷新检测用户标签失败,沿用快照", "err", err)
-		}
-		return tracked, map[int64]int64{}, map[int64]int64{}
+		return fallback(err)
 	}
 	for i, u := range tracked {
 		f, ok := fresh[u.UserID]
 		if !ok {
-			continue // 主站已删的用户:保留快照当历史名
+			continue // 主站已删的用户:保留快照当历史名。
 		}
 		if f.Username != u.Username || f.Email != u.Email {
 			tracked[i].Username, tracked[i].Email = f.Username, f.Email

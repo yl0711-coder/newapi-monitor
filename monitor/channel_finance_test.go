@@ -71,6 +71,85 @@ func TestChannelGroupFinanceAllowsNegativeMargin(t *testing.T) {
 	}
 }
 
+func TestChannelFinanceUsesConsistentHistoricalChannelRateForMissingGroup(t *testing.T) {
+	first := ChannelFinanceChannelCost{ChannelID: 33, Grp: "codex-1.2x", UpstreamGroupName: "upstream-codex", Multiplier: 1, DiscountFactor: .8}
+	snapshot := channelFinanceSnapshot{
+		siteGroups: map[string]ChannelSaleGroupRate{
+			"codex-1.2x": {Grp: "codex-1.2x", Multiplier: 1.2},
+			"internal":   {Grp: "internal", Multiplier: 1},
+		},
+		domainCosts: map[string]ChannelDomainCost{"last-api.ai": {Domain: "last-api.ai", RechargePaid: 1, RechargeCredit: 1}},
+		channelGroupCost: map[int]map[string]ChannelFinanceChannelCost{33: {
+			"codex-1.2x": first,
+			"codex-1.4x": {ChannelID: 33, Grp: "codex-1.4x", UpstreamGroupName: "upstream-codex", Multiplier: 1, DiscountFactor: .8},
+		}},
+		channelCanonicalCost: map[int]ChannelFinanceChannelCost{33: first},
+		channelCostConflict:  map[int]bool{},
+	}
+	got := snapshot.groupViewForChannel("last-api.ai", 33, "internal")
+	if !got.UpstreamConfigured || got.UpstreamConflict || got.UpstreamGroupName != "upstream-codex" || math.Abs(got.UpstreamEffectiveMultiplier-.8) > 1e-12 || math.Abs(got.MultiplierGap-.2) > 1e-12 {
+		t.Fatalf("consistent historical channel rate must safely cover missing group: %+v", got)
+	}
+}
+
+func TestLoadChannelFinanceSnapshotBuildsHistoricalChannelFallback(t *testing.T) {
+	m := newStabilityTestMonitor(t)
+	rows := []ChannelFinanceChannelCost{
+		{ChannelID: 33, Grp: "codex-1.2x", UpstreamGroupName: "upstream-codex", Multiplier: 1, DiscountFactor: .8},
+		{ChannelID: 33, Grp: "codex-1.4x", UpstreamGroupName: "upstream-codex", Multiplier: 1, DiscountFactor: .8},
+	}
+	if err := m.storeDB.Create(&rows).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := m.storeDB.Create(&ChannelDomainCost{Domain: "last-api.ai", RechargePaid: 1, RechargeCredit: 1}).Error; err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := m.loadChannelFinanceSnapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := snapshot.groupViewForChannel("last-api.ai", 33, "internal")
+	if !got.UpstreamConfigured || got.UpstreamConflict || got.UpstreamGroupName != "upstream-codex" || math.Abs(got.UpstreamEffectiveMultiplier-.8) > 1e-12 {
+		t.Fatalf("loaded snapshot did not construct safe channel fallback: %+v", got)
+	}
+}
+
+func TestChannelFinanceDoesNotGuessWhenHistoricalChannelRatesConflict(t *testing.T) {
+	first := ChannelFinanceChannelCost{ChannelID: 33, Grp: "codex-1.2x", UpstreamGroupName: "upstream-a", Multiplier: 1, DiscountFactor: .8}
+	snapshot := channelFinanceSnapshot{
+		siteGroups:  map[string]ChannelSaleGroupRate{"internal": {Grp: "internal", Multiplier: 1}},
+		domainCosts: map[string]ChannelDomainCost{"last-api.ai": {Domain: "last-api.ai", RechargePaid: 1, RechargeCredit: 1}},
+		channelGroupCost: map[int]map[string]ChannelFinanceChannelCost{33: {
+			"codex-1.2x": first,
+			"codex-1.4x": {ChannelID: 33, Grp: "codex-1.4x", UpstreamGroupName: "upstream-b", Multiplier: 1.1, DiscountFactor: .8},
+		}},
+		channelCanonicalCost: map[int]ChannelFinanceChannelCost{33: first},
+		channelCostConflict:  map[int]bool{33: true},
+	}
+	got := snapshot.groupViewForChannel("last-api.ai", 33, "internal")
+	if got.UpstreamConfigured || !got.UpstreamConflict || got.UpstreamEffectiveMultiplier != 0 {
+		t.Fatalf("conflicting historical channel rates must not be guessed: %+v", got)
+	}
+}
+
+func TestChannelRateConfiguredDoesNotDependOnRechargeRatio(t *testing.T) {
+	// 倍率配置完成度与主域名的充值比例是两类独立维护项：前者已填写时，
+	// 不能因为后者尚未填写而在渠道管理页误报“倍率待配置”。
+	rate := ChannelFinanceChannelCost{ChannelID: 33, Grp: "codex-1.2x", UpstreamGroupName: "gpt-codex", Multiplier: 1, DiscountFactor: .8}
+	snapshot := channelFinanceSnapshot{
+		channelCanonicalCost: map[int]ChannelFinanceChannelCost{33: rate},
+		channelCostConflict:  map[int]bool{},
+	}
+	if !snapshot.channelRateConfigured("example.com", 33) {
+		t.Fatal("a complete physical-channel rate must not require recharge configuration")
+	}
+	// 旧版同一渠道记录有冲突时，不能把任意一项误标为已完成。
+	snapshot.channelCostConflict[33] = true
+	if snapshot.channelRateConfigured("example.com", 33) {
+		t.Fatal("conflicting physical-channel rate must remain unconfigured")
+	}
+}
+
 func TestValidateChannelFinanceInputRejectsPartialAndInvalidValues(t *testing.T) {
 	valid := channelFinanceSaveInput{
 		Domain: "last-api.ai", FXBenchmark: 7, SiteRechargePaid: 1, SiteRechargeCredit: 1,

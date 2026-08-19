@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"math"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -21,7 +23,10 @@ func newChannelUpstreamTestMonitor(t *testing.T) *Monitor {
 	m.cfg.SessionSecret = "fixed-channel-upstream-test-secret"
 	m.cfg.UpstreamSyncTimeoutSec = 3
 	m.upstreamCredentialPersistent = true
-	m.upstreamClient = newUpstreamHTTPClient(upstreamSyncTimeout(m.cfg))
+	guard := newUpstreamHostGuard(m.storeDB, upstreamHostGuardOptions{
+		Clock: realUpstreamGuardClock{}, Jitter: func() time.Duration { return 0 }, MinInterval: 0,
+	})
+	m.upstreamClient = installUpstreamHostGuardForTest(newUpstreamHTTPClient(upstreamSyncTimeout(m.cfg)), m.storeDB, guard)
 	t.Cleanup(m.upstreamClient.CloseIdleConnections)
 	return m
 }
@@ -61,6 +66,170 @@ func TestChannelUpstreamCredentialEncryptionAndURLValidation(t *testing.T) {
 	}
 }
 
+func TestLegacyUpstreamCredentialsAreTransactionallyRotatedToDedicatedSecret(t *testing.T) {
+	m := newChannelUpstreamTestMonitor(t)
+	const (
+		domain    = "legacy-upstream.example"
+		oldSecret = "legacy-session-secret-for-upstream"
+		newSecret = "dedicated-upstream-secret-after-upgrade"
+		token     = "legacy-access-token"
+	)
+	m.cfg.SessionSecret = oldSecret
+	m.cfg.UpstreamCredentialSecret = ""
+	sealed, err := m.sealUpstreamCredential(domain, upstreamProviderNewAPI, newAPICredential{AccessToken: token})
+	if err != nil {
+		t.Fatal(err)
+	}
+	row := ChannelUpstreamAccount{
+		Domain: domain, Provider: upstreamProviderNewAPI, Credential: sealed,
+		CredentialVersion: upstreamCredentialVersion,
+	}
+	if err := m.storeDB.Create(&row).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	m.cfg.UpstreamCredentialSecret = newSecret
+	if err := m.migrateLegacyUpstreamCredentialEncryption(); err != nil {
+		t.Fatal(err)
+	}
+	var rotated ChannelUpstreamAccount
+	if err := m.storeDB.First(&rotated, "domain = ?", domain).Error; err != nil {
+		t.Fatal(err)
+	}
+	if rotated.Credential == sealed {
+		t.Fatal("legacy credential was not re-sealed with the dedicated secret")
+	}
+	var decoded newAPICredential
+	if err := m.openUpstreamCredential(rotated, &decoded); err != nil || decoded.AccessToken != token {
+		t.Fatalf("dedicated secret cannot open rotated credential: token=%q err=%v", decoded.AccessToken, err)
+	}
+
+	legacy := &Monitor{cfg: m.cfg}
+	legacy.cfg.UpstreamCredentialSecret = ""
+	decoded = newAPICredential{}
+	if err := legacy.openUpstreamCredential(rotated, &decoded); err == nil {
+		t.Fatal("legacy session secret must not open a credential after rotation")
+	}
+
+	firstRotation := rotated.Credential
+	if err := m.migrateLegacyUpstreamCredentialEncryption(); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.storeDB.First(&rotated, "domain = ?", domain).Error; err != nil {
+		t.Fatal(err)
+	}
+	if rotated.Credential != firstRotation {
+		t.Fatal("idempotent migration unexpectedly re-encrypted an already rotated credential")
+	}
+}
+
+func TestLegacyUpstreamCredentialRotationRollsBackAllRowsOnCorruption(t *testing.T) {
+	m := newChannelUpstreamTestMonitor(t)
+	const (
+		oldSecret = "legacy-session-secret-for-rollback"
+		newSecret = "dedicated-upstream-secret-for-rollback"
+	)
+	m.cfg.SessionSecret = oldSecret
+	m.cfg.UpstreamCredentialSecret = ""
+	sealed, err := m.sealUpstreamCredential("a-valid.example", upstreamProviderNewAPI, newAPICredential{AccessToken: "valid-token"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows := []ChannelUpstreamAccount{
+		{Domain: "a-valid.example", Provider: upstreamProviderNewAPI, Credential: sealed, CredentialVersion: upstreamCredentialVersion},
+		{Domain: "z-corrupt.example", Provider: upstreamProviderNewAPI, Credential: "not-valid-base64!", CredentialVersion: upstreamCredentialVersion},
+	}
+	if err := m.storeDB.Create(&rows).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	m.cfg.UpstreamCredentialSecret = newSecret
+	if err := m.migrateLegacyUpstreamCredentialEncryption(); err == nil {
+		t.Fatal("corrupt credential must abort startup key rotation")
+	}
+	var after ChannelUpstreamAccount
+	if err := m.storeDB.First(&after, "domain = ?", "a-valid.example").Error; err != nil {
+		t.Fatal(err)
+	}
+	if after.Credential != sealed {
+		t.Fatal("transaction committed a partial key rotation before encountering corruption")
+	}
+	legacy := &Monitor{cfg: m.cfg}
+	legacy.cfg.UpstreamCredentialSecret = ""
+	var decoded newAPICredential
+	if err := legacy.openUpstreamCredential(after, &decoded); err != nil || decoded.AccessToken != "valid-token" {
+		t.Fatalf("rollback did not preserve the legacy credential: token=%q err=%v", decoded.AccessToken, err)
+	}
+}
+
+func TestOpenStoreAutomaticallyRotatesLegacyUpstreamCredentials(t *testing.T) {
+	const (
+		oldSecret = "legacy-session-secret-used-by-old-release"
+		newSecret = "dedicated-upstream-secret-used-by-candidate"
+		domain    = "startup-rotation.example"
+	)
+	dir := t.TempDir()
+	mainPath := dir + "/nexus_monitor.db"
+	factsPath := dir + "/usage-facts.db"
+	legacy := &Monitor{cfg: Settings{
+		StorePath: mainPath, UsageFactsStorePath: factsPath, SessionSecret: oldSecret,
+	}}
+	if err := legacy.openStore(mainPath); err != nil {
+		t.Fatal(err)
+	}
+	sealed, err := legacy.sealUpstreamCredential(domain, upstreamProviderNewAPI, newAPICredential{AccessToken: "startup-token"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := legacy.storeDB.Create(&ChannelUpstreamAccount{
+		Domain: domain, Provider: upstreamProviderNewAPI, Credential: sealed,
+		CredentialVersion: upstreamCredentialVersion,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	legacyMainSQL, err := legacy.storeDB.DB()
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacyFactsSQL, err := legacy.usageFactsDB.DB()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := legacyMainSQL.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := legacyFactsSQL.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	upgraded := &Monitor{cfg: Settings{
+		StorePath: mainPath, UsageFactsStorePath: factsPath,
+		SessionSecret: oldSecret, UpstreamCredentialSecret: newSecret,
+	}}
+	if err := upgraded.openStore(mainPath); err != nil {
+		t.Fatalf("candidate startup did not rotate legacy credentials: %v", err)
+	}
+	t.Cleanup(func() {
+		if db, err := upgraded.storeDB.DB(); err == nil {
+			_ = db.Close()
+		}
+		if db, err := upgraded.usageFactsDB.DB(); err == nil {
+			_ = db.Close()
+		}
+	})
+	var row ChannelUpstreamAccount
+	if err := upgraded.storeDB.First(&row, "domain = ?", domain).Error; err != nil {
+		t.Fatal(err)
+	}
+	if row.Credential == sealed {
+		t.Fatal("openStore returned without rotating the legacy ciphertext")
+	}
+	var credential newAPICredential
+	if err := upgraded.openUpstreamCredential(row, &credential); err != nil || credential.AccessToken != "startup-token" {
+		t.Fatalf("rotated startup credential is unavailable: token=%q err=%v", credential.AccessToken, err)
+	}
+}
+
 func TestSyncNewAPIBalanceUsesUserTokenAndPublishedUnit(t *testing.T) {
 	const token = "newapi-access"
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -87,6 +256,43 @@ func TestSyncNewAPIBalanceUsesUserTokenAndPublishedUnit(t *testing.T) {
 	}
 	if math.Abs(result.BalanceUSD-2.05) > 1e-12 || result.BalanceRaw != 1230000 || result.BalanceUnit != 600000 || result.UnitAssumed {
 		t.Fatalf("unexpected NewAPI balance result: %+v", result)
+	}
+}
+
+func TestFetchNewAPIUsageWindowAggregatesLocallyAndKeepsZeroHours(t *testing.T) {
+	const token = "usage-access"
+	from := time.Date(2026, 8, 10, 0, 0, 0, 0, time.UTC).Unix()
+	to := from + 3*3600
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/log/" || r.Header.Get("Authorization") != "Bearer "+token || r.Header.Get("New-Api-User") != "31" {
+			http.Error(w, `{"message":"bad request"}`, http.StatusUnauthorized)
+			return
+		}
+		if r.URL.Query().Get("type") != "2" || r.URL.Query().Get("p") != "1" || r.URL.Query().Get("page_size") != "100" || r.URL.Query().Get("cursor") != "" || r.URL.Query().Get("start_timestamp") != strconv.FormatInt(from, 10) || r.URL.Query().Get("end_timestamp") != strconv.FormatInt(to-1, 10) || r.URL.Query().Get("before_id") != "" || r.URL.Query().Get("skip_total") != "" {
+			http.Error(w, `{"message":"bad range"}`, http.StatusBadRequest)
+			return
+		}
+		_, _ = w.Write([]byte(fmt.Sprintf(`{"success":true,"data":{"total":2,"items":[{"id":1,"created_at":%d,"quota":500000,"prompt_tokens":10,"completion_tokens":2},{"id":2,"created_at":%d,"quota":"250000","prompt_tokens":"3","completion_tokens":"1"}]}}`, from+30, from+3700)))
+	}))
+	defer server.Close()
+
+	result, err := fetchNewAPIUsageWindow(context.Background(), newUpstreamHTTPClient(3*time.Second), ChannelUpstreamAccount{
+		Domain: "example.com", Provider: upstreamProviderNewAPI, BaseURL: server.URL, UserID: 31, BalanceUnit: 500000,
+	}, newAPICredential{AccessToken: token}, from, to)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Hours) != 3 { // 包括无消费的第三个完整小时。
+		t.Fatalf("hours=%d, want 3", len(result.Hours))
+	}
+	if result.Hours[0].Requests != 1 || result.Hours[0].Tokens != 12 || result.Hours[0].CostUSD != 1 {
+		t.Fatalf("first hour=%+v", result.Hours[0])
+	}
+	if result.Hours[1].Requests != 1 || result.Hours[1].Tokens != 4 || result.Hours[1].CostUSD != .5 {
+		t.Fatalf("second hour=%+v", result.Hours[1])
+	}
+	if result.Hours[2].Requests != 0 || result.Hours[2].Quota != 0 || result.Hours[2].CostUSD != 0 {
+		t.Fatalf("zero hour=%+v", result.Hours[2])
 	}
 }
 
@@ -245,8 +451,40 @@ func TestChannelUpstreamNewAPIHandlersProtectSecretsAndPreserveLastBalance(t *te
 		t.Fatalf("decrypt failure overwrote recoverable state: %+v", row)
 	}
 
-	// 改成另一个账户后，即使首次同步失败，也绝不能继续展示前一个账户的余额。
+	// A replacement credential for the same account is an explicit recovery
+	// action for both balance and usage auth isolation. Existing usage facts and
+	// history cursor remain intact; only the retry gates are reopened.
 	m.cfg.UpstreamCredentialSecret = ""
+	fail.Store(false)
+	if err := m.storeDB.Model(&ChannelUpstreamAccount{}).Where("domain = ?", domain).Updates(map[string]any{
+		"usage_sync_enabled":               true,
+		"usage_status":                     upstreamStatusReconnect,
+		"usage_next_sync_at":               upstreamAccountIsolatedUntil,
+		"usage_backfill_next_sync_at":      upstreamAccountIsolatedUntil,
+		"usage_consecutive_fails":          3,
+		"usage_backfill_consecutive_fails": 2,
+		"usage_last_error":                 "authorization failed",
+		"usage_backfill_last_error":        "authorization failed",
+		"usage_backfill_cursor":            int64(123456),
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	usageEnabled := true
+	payload.UsageSyncEnabled = &usageEnabled
+	w = upstreamRouteRequest(t, m, router, roleRoot, http.MethodPost, "/channels/upstream", payload)
+	if w.Code != http.StatusOK {
+		t.Fatalf("replacement credential did not recover account: status=%d body=%s", w.Code, w.Body.String())
+	}
+	if err := m.storeDB.First(&row, "domain = ?", domain).Error; err != nil {
+		t.Fatal(err)
+	}
+	if row.UsageStatus != upstreamStatusPending || row.UsageNextSyncAt != 0 || row.UsageBackfillNextSyncAt != 0 ||
+		row.UsageConsecutiveFails != 0 || row.UsageBackfillConsecutiveFails != 0 || row.UsageBackfillCursor != 123456 {
+		t.Fatalf("replacement credential did not reopen usage without losing progress: %+v", row)
+	}
+
+	// 改成另一个账户后，即使首次同步失败，也绝不能继续展示前一个账户的余额。
+	fail.Store(true)
 	switched := channelUpstreamSaveInput{
 		Domain: domain, Provider: upstreamProviderNewAPI, BaseURL: server.URL,
 		UserID: 10, AccessToken: "new-account-token",
@@ -424,5 +662,24 @@ func TestSyncDueUpstreamAccountsOnlyRunsDueEnabledRows(t *testing.T) {
 	}
 	if future.LastAttemptAt != 0 || disabled.LastAttemptAt != 0 {
 		t.Fatalf("未到期或停用账户不应被请求: future=%+v disabled=%+v", future, disabled)
+	}
+}
+
+func TestUpstreamSchedulesNeverShortenConfiguredInterval(t *testing.T) {
+	now := time.Date(2026, 8, 16, 12, 0, 0, 0, time.UTC).Unix()
+	for i := 0; i < 512; i++ {
+		domain := fmt.Sprintf("upstream-%d.example", i)
+		balanceDue := nextUpstreamSyncAt(Settings{UpstreamSyncMinutes: 5}, domain, now, 0)
+		if balanceDue < now+5*60 || balanceDue > now+5*60+30 {
+			t.Fatalf("balance schedule shortened/exceeded jitter: domain=%s due=%d", domain, balanceDue-now)
+		}
+		usageDue := nextUpstreamUsageSyncAt(Settings{UpstreamUsageSyncMinutes: 30}, domain, now, 0)
+		if usageDue < now+30*60 || usageDue > now+30*60+45 {
+			t.Fatalf("usage schedule shortened/exceeded jitter: domain=%s due=%d", domain, usageDue-now)
+		}
+		backfillDue := nextUpstreamUsageBackfillAt(Settings{UpstreamUsageSyncMinutes: 30}, domain, now, 0)
+		if backfillDue < now+30*60 || backfillDue > now+30*60+45 {
+			t.Fatalf("backfill schedule shortened/exceeded jitter: domain=%s due=%d", domain, backfillDue-now)
+		}
 	}
 }

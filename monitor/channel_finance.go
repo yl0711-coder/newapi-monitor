@@ -135,9 +135,12 @@ type ChannelDomainFinanceView struct {
 // Discount 为相对官方美元标价的比例，例如 1.3/7 = 0.185714（18.57%）。
 // EstimatedMargin 是预估毛利率，不包含支付手续费、汇损、税费或退款等费用。
 type ChannelGroupFinanceView struct {
-	Complete                    bool    `json:"complete"`
-	SiteConfigured              bool    `json:"site_configured"`
-	UpstreamConfigured          bool    `json:"upstream_configured"`
+	Complete           bool `json:"complete"`
+	SiteConfigured     bool `json:"site_configured"`
+	UpstreamConfigured bool `json:"upstream_configured"`
+	// UpstreamConflict 表示旧版渠道×分组配置中，同一渠道保存了互相矛盾的倍率。
+	// 此时只允许使用与当前分组精确匹配的记录，绝不对缺失分组猜测复用。
+	UpstreamConflict            bool    `json:"upstream_conflict"`
 	SiteMultiplier              float64 `json:"site_multiplier"`
 	UpstreamMultiplier          float64 `json:"upstream_multiplier"` // 基础倍率
 	UpstreamDiscountFactor      float64 `json:"upstream_discount_factor"`
@@ -156,7 +159,11 @@ type channelFinanceSnapshot struct {
 	domainCosts      map[string]ChannelDomainCost
 	domainGroupCost  map[string]map[string]ChannelDomainGroupCost
 	channelGroupCost map[int]map[string]ChannelFinanceChannelCost
-	domainVersions   map[string]ChannelFinanceVersion
+	// channelCanonicalCost 用于兼容早期“同一渠道的相同倍率被镜像到部分分组”的
+	// 数据。仅当该渠道所有已保存记录完全一致时才可作为缺失分组的安全回退。
+	channelCanonicalCost map[int]ChannelFinanceChannelCost
+	channelCostConflict  map[int]bool
+	domainVersions       map[string]ChannelFinanceVersion
 }
 
 func defaultChannelFinanceSettingsView() ChannelFinanceSettingsView {
@@ -198,6 +205,24 @@ func (s channelFinanceSnapshot) domainView(domain string) ChannelDomainFinanceVi
 	return view
 }
 
+// channelRateConfigured 用于渠道管理头部的配置完成度。完成度按仍启用的物理
+// 渠道核验，而不是按已废弃的“主域名×服务分组”旧表核验；同一渠道只维护一份
+// 上游倍率，关联的服务分组仅用于展示适用范围。
+func (s channelFinanceSnapshot) channelRateConfigured(_ string, channelID int) bool {
+	if s.channelCostConflict[channelID] {
+		return false
+	}
+	rate, ok := s.channelCanonicalCost[channelID]
+	if !ok || strings.TrimSpace(rate.UpstreamGroupName) == "" ||
+		!validChannelFinanceNumber(rate.Multiplier) ||
+		!validChannelFinanceNumber(normalizedUpstreamDiscountFactor(rate.DiscountFactor)) {
+		return false
+	}
+	// 这里仅表示“渠道倍率是否已维护”。主域名的充值比例是另一项独立财务
+	// 配置，不能反过来把每一条已经填写倍率的渠道判为“未配置”。
+	return true
+}
+
 func (s channelFinanceSnapshot) groupView(domain, group string) ChannelGroupFinanceView {
 	return s.groupViewForChannel(domain, 0, group)
 }
@@ -214,8 +239,17 @@ func (s channelFinanceSnapshot) groupViewForChannel(domain string, channelID int
 				upstream = ChannelDomainGroupCost{Domain: domain, Grp: group, Multiplier: channelRate.Multiplier, DiscountFactor: channelRate.DiscountFactor}
 				upstreamOK = true
 				upstreamGroupName = strings.TrimSpace(channelRate.UpstreamGroupName)
+			} else if !s.channelCostConflict[channelID] {
+				// 历史配置可能只保存了该渠道部分关联分组。若所有已保存的
+				// 渠道级值一致，它们表达的仍是同一渠道唯一的上游成本口径。
+				if channelRate, exists := s.channelCanonicalCost[channelID]; exists {
+					upstream = ChannelDomainGroupCost{Domain: domain, Grp: group, Multiplier: channelRate.Multiplier, DiscountFactor: channelRate.DiscountFactor}
+					upstreamOK = true
+					upstreamGroupName = strings.TrimSpace(channelRate.UpstreamGroupName)
+				}
 			}
 		}
+		view.UpstreamConflict = s.channelCostConflict[channelID]
 	}
 	view.SiteConfigured = siteOK
 	view.UpstreamConfigured = upstreamOK
@@ -273,6 +307,7 @@ func (m *Monitor) loadChannelFinanceSnapshot(ctx context.Context) (channelFinanc
 	s := channelFinanceSnapshot{
 		siteGroups: map[string]ChannelSaleGroupRate{}, domainCosts: map[string]ChannelDomainCost{},
 		domainGroupCost: map[string]map[string]ChannelDomainGroupCost{}, channelGroupCost: map[int]map[string]ChannelFinanceChannelCost{},
+		channelCanonicalCost: map[int]ChannelFinanceChannelCost{}, channelCostConflict: map[int]bool{},
 		domainVersions: map[string]ChannelFinanceVersion{},
 	}
 	var setting ChannelFinanceSetting
@@ -315,6 +350,11 @@ func (m *Monitor) loadChannelFinanceSnapshot(ctx context.Context) (channelFinanc
 			s.channelGroupCost[cost.ChannelID] = map[string]ChannelFinanceChannelCost{}
 		}
 		s.channelGroupCost[cost.ChannelID][cost.Grp] = cost
+		if canonical, exists := s.channelCanonicalCost[cost.ChannelID]; !exists {
+			s.channelCanonicalCost[cost.ChannelID] = cost
+		} else if !sameChannelFinanceCost(canonical, cost) {
+			s.channelCostConflict[cost.ChannelID] = true
+		}
 	}
 	var versions []ChannelFinanceVersion
 	if tx := m.storeDB.WithContext(ctx).Order("domain ASC, version DESC").Find(&versions); tx.Error != nil {
@@ -326,6 +366,12 @@ func (m *Monitor) loadChannelFinanceSnapshot(ctx context.Context) (channelFinanc
 		}
 	}
 	return s, nil
+}
+
+func sameChannelFinanceCost(a, b ChannelFinanceChannelCost) bool {
+	return strings.TrimSpace(a.UpstreamGroupName) == strings.TrimSpace(b.UpstreamGroupName) &&
+		a.Multiplier == b.Multiplier &&
+		normalizedUpstreamDiscountFactor(a.DiscountFactor) == normalizedUpstreamDiscountFactor(b.DiscountFactor)
 }
 
 type channelFinanceGroupInput struct {
@@ -765,7 +811,9 @@ func (m *Monitor) allowedChannelFinanceGroups(ctx context.Context, domain string
 	}
 	var history []struct{ Grp string }
 	if tx := m.storeDB.WithContext(ctx).Raw(`SELECT DISTINCT s.grp FROM stability_hour_samples s
-		JOIN channel_snaps c ON c.id=s.channel_id WHERE c.base_domain=? AND s.grp<>'' LIMIT ?`, domain, maxChannelFinanceGroups+1).Scan(&history); tx.Error != nil {
+		JOIN channel_snaps c ON c.id=s.channel_id
+		WHERE c.base_domain=? AND s.grp<>'' AND s.traffic_class_version=? LIMIT ?`,
+		domain, userTrafficClassificationVersion, maxChannelFinanceGroups+1).Scan(&history); tx.Error != nil {
 		return nil, fmt.Errorf("核对历史服务分组: %w", tx.Error)
 	}
 	if len(history) > maxChannelFinanceGroups {

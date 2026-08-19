@@ -19,6 +19,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -29,26 +31,29 @@ const (
 	usageTZOffsetSec = 8 * 3600
 	maxUsageDays     = 366 // 单次查询时间范围上限;支持近一年(含闰年),仍由分页/导出上限控制返回量
 	maxUsageDimRows  = 300 // 分组/模型维度返回上限
+	// 前端本来就不渲染超过 2 万格的矩阵。服务端同样在计算与
+	// JSON 编码前拒绝该明细域，避免“页面不展示，却照样查询/占内存”。
+	usageMatrixMaxCells = 20_000
 )
 
 var usageCST = time.FixedZone("CST", usageTZOffsetSec)
 
 const statusClientClosedRequest = 499 // Nginx 约定：客户端主动断开；用于访问日志区分真实服务端 5xx
 
-// acquireUsageGate 等待生产库重查询槽位。与 sync.Mutex 不同，排队中的请求会响应
-// request context 取消/超时，避免用户快速切换筛选后旧请求仍依次进入数据库。
-func (m *Monitor) acquireUsageGate(ctx context.Context) error {
+// acquireUsageSemaphore 是可取消的单个 semaphore 获取操作。取得槽位后再次检查
+// context，防止 Done 与空闲槽位同时就绪时把已经取消的请求随机放进数据库。
+func acquireUsageSemaphore(ctx context.Context, once *sync.Once, gate *chan struct{}, capacity int) error {
 	// ctx 已经结束时不能让 select 在“空闲槽位”和 Done 同时就绪时随机取得槽位。
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	m.usageGateOnce.Do(func() { m.usageGate = make(chan struct{}, 1) })
+	once.Do(func() { *gate = make(chan struct{}, capacity) })
 	select {
-	case m.usageGate <- struct{}{}:
+	case *gate <- struct{}{}:
 		// 取消可能与取得槽位同时发生；再次确认并归还自己刚取得的槽位，
 		// 不能让已取消请求进入 SQL，也不能误释放其他请求持有的槽位。
 		if err := ctx.Err(); err != nil {
-			<-m.usageGate
+			<-*gate
 			return err
 		}
 		return nil
@@ -57,7 +62,141 @@ func (m *Monitor) acquireUsageGate(ctx context.Context) error {
 	}
 }
 
-func (m *Monitor) releaseUsageGate() { <-m.usageGate }
+// acquireUsageLane 先领取类别泳道，再领取所有来源查询共享的两槽预算。
+// 类别泳道避免同类慢请求堆叠；共享预算确保聚合、明细和导出最多并发两条，
+// 与生产连接池的第三条采样连接互不争抢。
+func updateUsageMetricMax(dst *atomic.Int64, value int64) {
+	for old := dst.Load(); value > old && !dst.CompareAndSwap(old, value); old = dst.Load() {
+	}
+}
+
+func (m *Monitor) acquireUsageLane(ctx context.Context, once *sync.Once, gate *chan struct{}, metrics *usageQueryLaneMetrics) error {
+	started := time.Now()
+	if err := acquireUsageSemaphore(ctx, once, gate, 1); err != nil {
+		metrics.failed.Add(1)
+		waited := time.Since(started).Nanoseconds()
+		metrics.waitNanos.Add(waited)
+		updateUsageMetricMax(&metrics.maxWaitNanos, waited)
+		return err
+	}
+	if err := acquireUsageSemaphore(ctx, &m.usageSourceBudgetOnce, &m.usageSourceBudget, 2); err != nil {
+		<-*gate
+		metrics.failed.Add(1)
+		waited := time.Since(started).Nanoseconds()
+		metrics.waitNanos.Add(waited)
+		updateUsageMetricMax(&metrics.maxWaitNanos, waited)
+		return err
+	}
+	waited := time.Since(started).Nanoseconds()
+	metrics.waitNanos.Add(waited)
+	updateUsageMetricMax(&metrics.maxWaitNanos, waited)
+	metrics.acquired.Add(1)
+	m.usageSourceInUse.Add(1)
+	metrics.active.Add(1)
+	metrics.holdStartedAt.Store(time.Now().UnixNano())
+	return nil
+}
+
+func (m *Monitor) releaseUsageLane(gate chan struct{}, metrics *usageQueryLaneMetrics) {
+	if started := metrics.holdStartedAt.Swap(0); started > 0 {
+		held := time.Now().UnixNano() - started
+		if held > 0 {
+			metrics.holdNanos.Add(held)
+			updateUsageMetricMax(&metrics.maxHoldNanos, held)
+		}
+	}
+	metrics.active.Add(-1)
+	m.usageSourceInUse.Add(-1)
+	<-m.usageSourceBudget
+	<-gate
+}
+
+// acquireUsageGate 是聚合/后台事实来源查询泳道。保留稳定名称供既有调用和
+// 并发测试使用；日志分页与 CSV 导出分别走独立泳道。
+func (m *Monitor) acquireUsageGate(ctx context.Context) error {
+	return m.acquireUsageLane(ctx, &m.usageGateOnce, &m.usageGate, &m.usageAggregateMetrics)
+}
+
+func (m *Monitor) releaseUsageGate() { m.releaseUsageLane(m.usageGate, &m.usageAggregateMetrics) }
+
+func (m *Monitor) acquireUsageDetailGate(ctx context.Context) error {
+	return m.acquireUsageLane(ctx, &m.usageDetailGateOnce, &m.usageDetailGate, &m.usageDetailMetrics)
+}
+
+func (m *Monitor) releaseUsageDetailGate() {
+	m.releaseUsageLane(m.usageDetailGate, &m.usageDetailMetrics)
+}
+
+func (m *Monitor) acquireUsageExportGate(ctx context.Context) error {
+	return m.acquireUsageLane(ctx, &m.usageExportGateOnce, &m.usageExportGate, &m.usageExportMetrics)
+}
+
+func (m *Monitor) releaseUsageExportGate() {
+	m.releaseUsageLane(m.usageExportGate, &m.usageExportMetrics)
+}
+
+type usageQueryLaneStats struct {
+	Acquired    uint64 `json:"acquired"`
+	Failed      uint64 `json:"failed"`
+	Active      int64  `json:"active"`
+	TotalWaitMS int64  `json:"total_wait_ms"`
+	MaxWaitMS   int64  `json:"max_wait_ms"`
+	TotalHoldMS int64  `json:"total_hold_ms"`
+	MaxHoldMS   int64  `json:"max_hold_ms"`
+}
+
+type usageSourceBudgetStats struct {
+	Capacity           int                 `json:"capacity"`
+	InUse              int                 `json:"in_use"`
+	InteractiveWaiters int64               `json:"interactive_waiters"`
+	Aggregate          usageQueryLaneStats `json:"aggregate"`
+	Detail             usageQueryLaneStats `json:"detail"`
+	Export             usageQueryLaneStats `json:"export"`
+}
+
+func usageLaneStats(metrics *usageQueryLaneMetrics) usageQueryLaneStats {
+	return usageQueryLaneStats{
+		Acquired:    metrics.acquired.Load(),
+		Failed:      metrics.failed.Load(),
+		Active:      metrics.active.Load(),
+		TotalWaitMS: time.Duration(metrics.waitNanos.Load()).Milliseconds(),
+		MaxWaitMS:   time.Duration(metrics.maxWaitNanos.Load()).Milliseconds(),
+		TotalHoldMS: time.Duration(metrics.holdNanos.Load()).Milliseconds(),
+		MaxHoldMS:   time.Duration(metrics.maxHoldNanos.Load()).Milliseconds(),
+	}
+}
+
+func (m *Monitor) usageSourceStats() usageSourceBudgetStats {
+	return usageSourceBudgetStats{
+		Capacity:           2,
+		InUse:              int(m.usageSourceInUse.Load()),
+		InteractiveWaiters: m.usageInteractiveWaiters.Load(),
+		Aggregate:          usageLaneStats(&m.usageAggregateMetrics),
+		Detail:             usageLaneStats(&m.usageDetailMetrics),
+		Export:             usageLaneStats(&m.usageExportMetrics),
+	}
+}
+
+// acquireInteractiveUsageGate 为页面上的重查询登记一个短暂等待标记。标记只覆盖
+// “等待拿到闸门”的阶段；一旦页面已持有闸门，后台自然无法并发进入。这样后台
+// 事实采集即便正好在前台请求前醒来，也会在查询前检测到用户排队并让路。
+func (m *Monitor) acquireInteractiveUsageGate(ctx context.Context) error {
+	m.usageInteractiveWaiters.Add(1)
+	defer m.usageInteractiveWaiters.Add(-1)
+	return m.acquireUsageGate(ctx)
+}
+
+func (m *Monitor) acquireInteractiveUsageDetailGate(ctx context.Context) error {
+	m.usageInteractiveWaiters.Add(1)
+	defer m.usageInteractiveWaiters.Add(-1)
+	return m.acquireUsageDetailGate(ctx)
+}
+
+func (m *Monitor) acquireInteractiveUsageExportGate(ctx context.Context) error {
+	m.usageInteractiveWaiters.Add(1)
+	defer m.usageInteractiveWaiters.Add(-1)
+	return m.acquireUsageExportGate(ctx)
+}
 
 func isCanceledUsageRequest(c *gin.Context, err error) bool {
 	return errors.Is(err, context.Canceled) || errors.Is(c.Request.Context().Err(), context.Canceled)
@@ -155,6 +294,20 @@ type UsageStats struct {
 	ByModelTruncated bool              `json:"by_model_truncated"`
 }
 
+// newUsageStatsRange 构造详情统计的空范围骨架。它只提供前端需要的日期边界，
+// 不把尚未读取到的范围统计伪装成零值；用于正常聚合初始化，以及聚合暂不可用时的
+// 受限降级响应。
+func newUsageStatsRange(fromTs, toTs int64) *UsageStats {
+	return &UsageStats{
+		From:         time.Unix(fromTs, 0).In(usageCST).Format("2006-01-02"),
+		To:           time.Unix(toTs-1, 0).In(usageCST).Format("2006-01-02"),
+		Daily:        []UsageDaily{},
+		DailyByModel: []UsageDailyModel{},
+		ByGroup:      []UsageDim{},
+		ByModel:      []UsageDim{},
+	}
+}
+
 // usageIn 生成 "<col> IN (?,?,…)" 片段与参数(ids 已由调用方保证非空;col 只传代码内常量,勿传用户输入)。
 func usageIn(col string, ids []int64) (string, []any) {
 	ph := make([]string, len(ids))
@@ -175,23 +328,21 @@ func (m *Monitor) computeUsageStats(ctx context.Context, ids []int64, fromTs, to
 	}
 	cctx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
-	if err := m.acquireUsageGate(cctx); err != nil {
+	if err := m.acquireInteractiveUsageGate(cctx); err != nil {
 		return nil, fmt.Errorf("等待用量查询槽位失败: %w", err)
 	}
 	defer m.releaseUsageGate()
 
 	inSQL, inArgs := usageIn("user_id", ids)
-	where := "type IN (2,6) AND created_at >= ? AND created_at < ? AND " + inSQL
+	where := "type IN (2,6) AND created_at >= ? AND created_at < ? AND " + inSQL +
+		" AND NOT (" + m.channelTestSourcePredicateSQL() + ")"
 	args := append([]any{fromTs, toTs}, inArgs...)
 	if tokenID > 0 {
 		where += " AND token_id = ?"
 		args = append(args, tokenID)
 	}
 
-	st := &UsageStats{
-		From: time.Unix(fromTs, 0).In(usageCST).Format("2006-01-02"),
-		To:   time.Unix(toTs-1, 0).In(usageCST).Format("2006-01-02"),
-	}
+	st := newUsageStatsRange(fromTs, toTs)
 
 	// 1) 每日:日桶 = CST 日序号,回来再折成日期文本。
 	dailyQ := "SELECT " + m.dayExpr() + " AS day_idx," +
@@ -367,22 +518,54 @@ type UsageMatrix struct {
 	Cells []UsageMatrixCell `json:"cells"`
 }
 
-// computeUsageMatrix 一条 GROUP BY user_id×日 的聚合,窗口与索引约束同 computeUsageStats。
-func (m *Monitor) computeUsageMatrix(ctx context.Context, ids []int64, fromTs, toTs int64) (*UsageMatrix, error) {
+// newUsageMatrixRange 构造一个只包含日期轴的矩阵骨架。它不读取主站日志，既用于
+// 正常查询的初始化，也用于“资料可读、范围消费聚合暂不可用”的受限降级响应。这样前端
+// 可以继续展示成员、余额和累计消耗，同时不会把未知的范围消费误显示为 0。
+func newUsageMatrixRange(fromTs, toTs int64) *UsageMatrix {
+	if toTs <= fromTs {
+		day := time.Unix(fromTs, 0).In(usageCST).Format("2006-01-02")
+		return &UsageMatrix{From: day, To: day}
+	}
 	mx := &UsageMatrix{
 		From: time.Unix(fromTs, 0).In(usageCST).Format("2006-01-02"),
 		To:   time.Unix(toTs-1, 0).In(usageCST).Format("2006-01-02"),
 	}
-	// 连续日期轴(新→旧):有没有消费都出行,老板看的是"每个人每天"的完整节奏
-	for ts := toTs - 86400; ts >= fromTs; ts -= 86400 {
+	// Facts readiness may clamp the right edge to an hour in the current CST
+	// day.  Build the display axis from calendar-day boundaries rather than
+	// assuming toTs is next-day midnight; otherwise today's returned cells have
+	// no matching column.
+	firstDay := usageFactDayStart(fromTs)
+	lastDay := usageFactDayStart(toTs - 1)
+	for ts := lastDay; ts >= firstDay; ts -= usageFactDaySeconds {
 		mx.Days = append(mx.Days, time.Unix(ts, 0).In(usageCST).Format("2006-01-02"))
 	}
+	return mx
+}
+
+// usageMatrixExceedsCellBudget 按成员数×自然日数实施返回量护栏。
+// parseUsageRange 产生的区间是 CST 自然日左闭右开，可按固定日秒数计算。
+func usageMatrixExceedsCellBudget(memberCount int, fromTs, toTs int64) bool {
+	if memberCount <= 0 || toTs <= fromTs {
+		return false
+	}
+	days := (toTs - fromTs) / usageFactDaySeconds
+	return days > 0 && int64(memberCount) > int64(usageMatrixMaxCells)/days
+}
+
+func usageMatrixCellBudgetMessage(memberCount int, fromTs, toTs int64) string {
+	days := (toTs - fromTs) / usageFactDaySeconds
+	return fmt.Sprintf("每日消费明细未加载：%d 人 × %d 天超过 %d 格上限，请缩短日期范围或查看单个公司/成员", memberCount, days, usageMatrixMaxCells)
+}
+
+// computeUsageMatrix 一条 GROUP BY user_id×日 的聚合,窗口与索引约束同 computeUsageStats。
+func (m *Monitor) computeUsageMatrix(ctx context.Context, ids []int64, fromTs, toTs int64) (*UsageMatrix, error) {
+	mx := newUsageMatrixRange(fromTs, toTs)
 	if len(ids) == 0 {
 		return mx, nil
 	}
 	cctx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
-	if err := m.acquireUsageGate(cctx); err != nil {
+	if err := m.acquireInteractiveUsageGate(cctx); err != nil {
 		return nil, fmt.Errorf("等待用量查询槽位失败: %w", err)
 	}
 	defer m.releaseUsageGate()
@@ -394,6 +577,7 @@ func (m *Monitor) computeUsageMatrix(ctx context.Context, ids []int64, fromTs, t
 		" CAST(COALESCE(SUM(CASE WHEN type=2 THEN COALESCE(quota,0) ELSE 0 END),0) AS SIGNED)," +
 		" CAST(COALESCE(SUM(CASE WHEN type=6 THEN COALESCE(quota,0) ELSE 0 END),0) AS SIGNED)" +
 		" FROM logs WHERE type IN (2,6) AND created_at >= ? AND created_at < ? AND " + inSQL +
+		" AND NOT (" + m.channelTestSourcePredicateSQL() + ")" +
 		" GROUP BY user_id, day_idx"
 	rows, err := m.prodDB.QueryContext(cctx, q, append([]any{fromTs, toTs}, inArgs...)...)
 	if err != nil {
@@ -482,16 +666,82 @@ func (m *Monitor) loadUsageAggregateJSON(
 	return m.usageCache.DoJSON(ctx, key, ttl, dst, fill)
 }
 
+// loadUsageAggregateJSONStaleIfError 只服务于页面的核心汇总数据域。它先按正常
+// 缓存口径查询；仅当新鲜结果已失效且本次源查询失败时，才回退到同键最近成功的本机
+// 结果，并由调用方把 stale 状态明确回传给页面。权限、原始日志和配置写入不得使用它。
+func (m *Monitor) loadUsageAggregateJSONStaleIfError(
+	ctx context.Context,
+	key string,
+	ttl time.Duration,
+	toTs int64,
+	forceFresh bool,
+	dst any,
+	fill func() (any, error),
+) (stale bool, err error) {
+	staleGrace := usageAggregateStaleGrace(toTs, time.Now())
+	if forceFresh {
+		return m.usageCache.DoJSONFreshStaleIfError(ctx, key, ttl, staleGrace, dst, fill)
+	}
+	return m.usageCache.DoJSONStaleIfError(ctx, key, ttl, staleGrace, dst, fill)
+}
+
+// usageAggregateAuthorizationGuard gives administrator aggregates the same
+// publication fence as Portal.  The handler body (including cache lookup) is
+// buffered until the durable ServingGeneration, member fingerprint and read
+// bounds are unchanged.  This covers both DB-commit -> atomic-publication and
+// revoke -> repair -> republish ABA windows.
+func (m *Monitor) usageAggregateAuthorizationGuard(next gin.HandlerFunc) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if !m.usageFactsReadRequested() || m.usageFactsLocalSnapshotReadOnly() {
+			// A mounted read-only snapshot has no publication writer and therefore
+			// no DB->atomic hand-off window. Its startup checkpoint is the authority;
+			// legacy snapshots may intentionally predate PublishedMember rows.
+			next(c)
+			return
+		}
+		for attempt := 0; attempt < 2; attempt++ {
+			before, err := m.loadUsageFactServingReadSnapshot(c.Request.Context())
+			if err != nil {
+				c.JSON(http.StatusServiceUnavailable, gin.H{"error": "本地用量事实正在切换，请稍后重试"})
+				return
+			}
+
+			original := c.Writer
+			buffered := newPortalBufferedResponseWriter(original)
+			func() {
+				c.Writer = buffered
+				defer func() { c.Writer = original }()
+				next(c)
+			}()
+			if buffered.Status() < 200 || buffered.Status() >= 300 {
+				buffered.commitTo(original)
+				return
+			}
+
+			after, err := m.loadUsageFactServingReadSnapshot(c.Request.Context())
+			if err == nil && before.equal(after) {
+				buffered.commitTo(original)
+				return
+			}
+			if attempt == 0 {
+				continue
+			}
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "本地用量事实发布状态已变化，请稍后重试"})
+			return
+		}
+	}
+}
+
 // ---- HTTP 处理器 ----
 
 // serveUsageMatrix GET /usage/matrix?from=&to=(管理员):列表页矩阵数据(前端渲染为 行=用户 × 列=日期)。
 // 用户 label 取邮箱(缺则用户名/#id)并按【累计总消耗】降序(稳定,不随日期区间变);零消费用户仍保留。
 func (m *Monitor) serveUsageMatrix(c *gin.Context) {
-	if !m.Enabled() {
+	if !m.usageReadServingEnabled() {
 		c.JSON(http.StatusOK, gin.H{"enabled": false})
 		return
 	}
-	tracked, err := m.listTracked()
+	tracked, memberCoverage, err := m.listTrackedForUsageReadCoverage(c.Request.Context())
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -501,36 +751,61 @@ func (m *Monitor) serveUsageMatrix(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	tracked, balances, usedTotals := m.refreshTrackedLabels(c.Request.Context(), tracked) // 身份标签校准 + 取当前余额与累计总消耗
+	tracked, balances, usedTotals := m.refreshTrackedLabelsForRead(c.Request.Context(), tracked) // 身份标签校准 + 取当前余额与累计总消耗
 	if err := c.Request.Context().Err(); errors.Is(err, context.Canceled) {
 		abortCanceledUsageRequest(c, err)
 		return
 	}
 	memberFP := portalMemberFingerprint(tracked)
 	forceFresh := usageRefreshRequested(c)
-	mx := &UsageMatrix{}
-	err = m.loadUsageAggregateJSON(
-		c.Request.Context(),
-		adminUsageAggregateKey("matrix", memberFP, 0, 0, fromTs, toTs),
-		usageAggregateTTL(toTs, time.Now()),
-		forceFresh,
-		mx,
-		func() (any, error) {
-			result, err := m.computeUsageMatrix(c.Request.Context(), idsOf(tracked), fromTs, toTs)
-			if result != nil {
-				// 管理端身份、余额与分组字段在响应阶段实时组装，不进 Redis。
-				result.Users = nil
-			}
-			return result, err
-		},
-	)
+	readRange, err := m.resolveUsageAggregateReadRangeForMembers(c.Request.Context(), fromTs, toTs, idsOf(tracked))
 	if err != nil {
-		if abortCanceledUsageRequest(c, err) {
-			return
-		}
-		slog.Warn("用户用量矩阵聚合失败", "err", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "统计查询失败,请稍后重试(细节见服务端日志)"})
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "本地用量发布范围暂不可用"})
 		return
+	}
+	requestedRange := newUsageMatrixRange(fromTs, toTs)
+	requestedFrom, requestedTo := requestedRange.From, requestedRange.To
+	fromTs, toTs = readRange.From, readRange.To
+	// 成员资料/余额与范围消费矩阵是不同的数据域。矩阵暂不可读时仍返回资料列，
+	// 并由前端把范围消费明确标成“不可用”，不能把整页变成错误页或显示假 0。
+	mx := requestedRange
+	matrixAvailable := readRange.Available
+	dataStale := false
+	matrixMessage := readRange.Message
+	if matrixAvailable {
+		mx = newUsageMatrixRange(fromTs, toTs)
+	}
+	if matrixAvailable && len(tracked) > 0 && usageMatrixExceedsCellBudget(len(tracked), fromTs, toTs) {
+		matrixAvailable = false
+		matrixMessage = usageMatrixCellBudgetMessage(len(tracked), fromTs, toTs)
+	} else if matrixAvailable && len(tracked) > 0 {
+		mx = &UsageMatrix{}
+		dataStale, err = m.loadUsageAggregateJSONStaleIfError(
+			c.Request.Context(),
+			m.usageFactCacheKey(adminUsageAggregateKey("matrix", memberFP, 0, 0, fromTs, toTs)),
+			usageAggregateTTL(toTs, time.Now()),
+			toTs,
+			forceFresh,
+			mx,
+			func() (any, error) {
+				result, err := m.computeUsageMatrixForRead(c.Request.Context(), idsOf(tracked), fromTs, toTs)
+				if result != nil {
+					// 管理端身份、余额与分组字段在响应阶段实时组装，不进 Redis。
+					result.Users = nil
+				}
+				return result, err
+			},
+		)
+		if err != nil {
+			if abortCanceledUsageRequest(c, err) {
+				return
+			}
+			matrixAvailable = false
+			readRange.Partial = false
+			matrixMessage = m.usageFactsUnavailableMessage(err, "每日消费明细")
+			mx = requestedRange
+			slog.Warn("用户用量矩阵聚合失败，保留资料快照", "err", err)
+		}
 	}
 	totals := map[int64]UsageBilling{}
 	for _, cell := range mx.Cells {
@@ -574,10 +849,37 @@ func (m *Monitor) serveUsageMatrix(c *gin.Context) {
 	})
 	// 只有管理员重新选择日期的主动刷新才失效客户端同范围结果。
 	// 普通打开/返回列表不再每次删缓存，避免客户端随后又扫一次生产库。
-	if forceFresh {
+	if forceFresh && matrixAvailable {
 		m.invalidatePortalAggregates(tracked, fromTs, toTs)
 	}
-	c.JSON(http.StatusOK, gin.H{"enabled": true, "matrix": mx, "empty": len(tracked) == 0})
+	dataMessage := ""
+	if matrixAvailable {
+		dataStale, dataMessage = m.usageDataStaleness(dataStale, fromTs, toTs, time.Now())
+	}
+	resp := gin.H{
+		"enabled":            true,
+		"matrix":             mx,
+		"empty":              len(tracked) == 0,
+		"matrix_available":   matrixAvailable,
+		"data_stale":         dataStale,
+		"range_partial":      matrixAvailable && readRange.Partial,
+		"requested_from":     requestedFrom,
+		"requested_to":       requestedTo,
+		"membership_partial": !memberCoverage.Complete,
+		"active_members":     memberCoverage.Active,
+		"published_members":  memberCoverage.Published,
+	}
+	if !memberCoverage.Complete {
+		resp["membership_message"] = fmt.Sprintf("成员事实正在逐个签收，当前可查看 %d/%d 个已完成成员；公司及全站合计在成员齐全前不会生成", memberCoverage.Published, memberCoverage.Active)
+	}
+	if matrixAvailable && readRange.Partial {
+		resp["range_message"] = readRange.Message
+	} else if !matrixAvailable {
+		resp["matrix_message"] = matrixMessage
+	} else if dataStale {
+		resp["data_message"] = dataMessage
+	}
+	c.JSON(http.StatusOK, resp)
 }
 
 func quotaUSDPtr(quota *int64) *float64 {
@@ -685,7 +987,7 @@ func (m *Monitor) computeUserTokenUsage(ctx context.Context, uid, fromTs, toTs i
 func (m *Monitor) computeUserTokenAggregates(ctx context.Context, uid, fromTs, toTs int64) ([]tokenUsageAggregate, error) {
 	cctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
-	if err := m.acquireUsageGate(cctx); err != nil {
+	if err := m.acquireInteractiveUsageGate(cctx); err != nil {
 		return nil, fmt.Errorf("等待令牌查询槽位失败: %w", err)
 	}
 	defer m.releaseUsageGate()
@@ -697,6 +999,7 @@ func (m *Monitor) computeUserTokenAggregates(ctx context.Context, uid, fromTs, t
 		" CAST(COALESCE(SUM(CASE WHEN type=2 THEN COALESCE(quota,0) ELSE 0 END),0) AS SIGNED)," +
 		" CAST(COALESCE(SUM(CASE WHEN type=6 THEN COALESCE(quota,0) ELSE 0 END),0) AS SIGNED)" +
 		" FROM logs WHERE type IN (2,6) AND user_id = ? AND created_at >= ? AND created_at < ?" +
+		" AND NOT (" + m.channelTestSourcePredicateSQL() + ")" +
 		" GROUP BY token_id"
 	rows, err := m.prodDB.QueryContext(cctx, q, uid, fromTs, toTs)
 	if err != nil {
@@ -1355,9 +1658,10 @@ func populateExpandFields(r *LogRow, o *logOther, content string) {
 // 类型口径对齐 new-api 官方客户端使用日志(model.GetUserLogs):普通用户可见全部 6 种类型,
 // 含错误(5)/退款(6)——官方不在查询层屏蔽,靠写入时已脱敏的 content(见 buildLogDetail/scrubContent)+
 // 不回传渠道信息兜底,故此处不再排除 5/6。
-func logFilterWhere(ids []int64, fromTs, toTs, memberUID int64, logType int, model, group, tokenName, detailKw, requestID string) (string, []any) {
+func (m *Monitor) logFilterWhere(ids []int64, fromTs, toTs, memberUID int64, logType int, model, group, tokenName, detailKw, requestID string) (string, []any) {
 	inSQL, inArgs := usageIn("user_id", ids)
-	where := "created_at >= ? AND created_at < ? AND " + inSQL
+	where := "created_at >= ? AND created_at < ? AND " + inSQL +
+		" AND NOT (" + m.channelTestSourcePredicateSQL() + ")"
 	args := append([]any{fromTs, toTs}, inArgs...)
 	if logType > 0 { // 仅看某类型(1-6 全部开放,同 new-api 官方客户端使用日志)
 		where += " AND type = ?"
@@ -1411,11 +1715,11 @@ func (m *Monitor) countGroupLogs(ctx context.Context, ids []int64, fromTs, toTs,
 	}
 	cctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
-	if err := m.acquireUsageGate(cctx); err != nil {
+	if err := m.acquireInteractiveUsageDetailGate(cctx); err != nil {
 		return 0, fmt.Errorf("等待日志计数槽位失败: %w", err)
 	}
-	defer m.releaseUsageGate()
-	where, args := logFilterWhere(ids, fromTs, toTs, memberUID, logType, model, group, tokenName, detailKw, requestID)
+	defer m.releaseUsageDetailGate()
+	where, args := m.logFilterWhere(ids, fromTs, toTs, memberUID, logType, model, group, tokenName, detailKw, requestID)
 	var n int64
 	if err := m.prodDB.QueryRowContext(cctx, "SELECT COUNT(*) FROM logs WHERE "+where, args...).Scan(&n); err != nil {
 		return 0, fmt.Errorf("日志计数失败: %w", err)
@@ -1423,22 +1727,27 @@ func (m *Monitor) countGroupLogs(ctx context.Context, ids []int64, fromTs, toTs,
 	return n, nil
 }
 
-// countGroupLogsSnapshot 为浏览器原生 CSV 下载一次取回“总数 + 当前最大 ID”。
-// 后续分页从 maxID+1 开始，预检完成后新到的日志不会混入本次文件，因此不会出现
-// 预检时未超 5 万、下载时却悄悄截断的竞态。与普通计数一样只读、串行且有 15s 上限。
+// countGroupLogsSnapshot 为浏览器原生 CSV 下载取回“有界总数 + 当前最大 ID”。
+// 导出最多只会读取 portalExportCap 行，因此预检也只探测 cap+1 条：达到该值就
+// 足以触发确认，不再为了展示一个精确大数字扫描全部匹配日志。后续分页从
+// maxID+1 开始，预检完成后新到的日志不会混入本次文件。
 func (m *Monitor) countGroupLogsSnapshot(ctx context.Context, ids []int64, fromTs, toTs, memberUID int64, logType int, model, group, tokenName, detailKw, requestID string) (total, startCursor int64, err error) {
 	if len(ids) == 0 {
 		return 0, 0, nil
 	}
 	cctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
-	if err := m.acquireUsageGate(cctx); err != nil {
+	if err := m.acquireInteractiveUsageExportGate(cctx); err != nil {
 		return 0, 0, fmt.Errorf("等待日志计数槽位失败: %w", err)
 	}
-	defer m.releaseUsageGate()
-	where, args := logFilterWhere(ids, fromTs, toTs, memberUID, logType, model, group, tokenName, detailKw, requestID)
+	defer m.releaseUsageExportGate()
+	where, args := m.logFilterWhere(ids, fromTs, toTs, memberUID, logType, model, group, tokenName, detailKw, requestID)
 	var maxID int64
-	if err := m.prodDB.QueryRowContext(cctx, "SELECT COUNT(*), COALESCE(MAX(id), 0) FROM logs WHERE "+where, args...).Scan(&total, &maxID); err != nil {
+	// ORDER BY id DESC 同真实导出顺序；LIMIT 使用编译期常量，不接收用户输入。
+	// 少于等于上限时 total 精确，超过时固定返回 cap+1 作为“至少超限”的哨兵。
+	q := "SELECT COUNT(*), COALESCE(MAX(id), 0) FROM (SELECT id FROM logs WHERE " + where +
+		" ORDER BY id DESC LIMIT " + strconv.Itoa(portalExportCap+1) + ") AS bounded_export_logs"
+	if err := m.prodDB.QueryRowContext(cctx, q, args...).Scan(&total, &maxID); err != nil {
 		return 0, 0, fmt.Errorf("日志计数失败: %w", err)
 	}
 	if maxID == int64(^uint64(0)>>1) {
@@ -1450,26 +1759,47 @@ func (m *Monitor) countGroupLogsSnapshot(ctx context.Context, ids []int64, fromT
 	return total, startCursor, nil
 }
 
-// queryGroupLogs 查一组成员的日志,按 id 倒序游标分页;窗口化、只读、串行(usageGate)。
+// queryGroupLogs 查一组成员的日志,按 id 倒序游标分页；普通页面走明细泳道。
 // 全部用户可控值参数化;memberUID 需调用方已校验属本组;limit 由调用方控上限(分页 pageSize+1 / 导出 cap,超限判定在导出侧用 COUNT 探测)。
 // 取 content+other 拼「详情」与首字(only 安全字段);花费/首字/详情按 new-api 的可展示/计时类型口径填。
 func (m *Monitor) queryGroupLogs(ctx context.Context, ids []int64, fromTs, toTs, memberUID int64, logType int, model, group, tokenName, detailKw, requestID string, beforeID int64, limit int) ([]LogRow, error) {
+	return m.queryGroupLogsWithLane(ctx, ids, fromTs, toTs, memberUID, logType, model, group, tokenName, detailKw, requestID, beforeID, limit, false)
+}
+
+// queryGroupLogsForExport 与页面明细口径完全一致，但使用独立 CSV 泳道。
+// 一个慢下载不会占住普通日志页或聚合页的类别锁；共享来源预算仍限制总并发。
+func (m *Monitor) queryGroupLogsForExport(ctx context.Context, ids []int64, fromTs, toTs, memberUID int64, logType int, model, group, tokenName, detailKw, requestID string, beforeID int64, limit int) ([]LogRow, error) {
+	return m.queryGroupLogsWithLane(ctx, ids, fromTs, toTs, memberUID, logType, model, group, tokenName, detailKw, requestID, beforeID, limit, true)
+}
+
+func (m *Monitor) queryGroupLogsWithLane(ctx context.Context, ids []int64, fromTs, toTs, memberUID int64, logType int, model, group, tokenName, detailKw, requestID string, beforeID int64, limit int, export bool) ([]LogRow, error) {
 	if len(ids) == 0 {
 		return nil, nil
 	}
 	cctx, cancel := context.WithTimeout(ctx, 25*time.Second) // 导出可能取到 5 万行,给足超时
 	defer cancel()
-	if err := m.acquireUsageGate(cctx); err != nil {
+	if export {
+		if err := m.acquireInteractiveUsageExportGate(cctx); err != nil {
+			return nil, fmt.Errorf("等待日志导出槽位失败: %w", err)
+		}
+		defer m.releaseUsageExportGate()
+	} else if err := m.acquireInteractiveUsageDetailGate(cctx); err != nil {
 		return nil, fmt.Errorf("等待日志查询槽位失败: %w", err)
+	} else {
+		defer m.releaseUsageDetailGate()
 	}
-	defer m.releaseUsageGate()
 
-	where, args := logFilterWhere(ids, fromTs, toTs, memberUID, logType, model, group, tokenName, detailKw, requestID)
+	where, args := m.logFilterWhere(ids, fromTs, toTs, memberUID, logType, model, group, tokenName, detailKw, requestID)
 	if beforeID > 0 { // 游标:取比上次末尾更早的(id 近似时间序,倒序翻页,不用深 OFFSET)
 		where += " AND id < ?"
 		args = append(args, beforeID)
 	}
-	q := "SELECT id, created_at, COALESCE(username,''), COALESCE(token_name,''), COALESCE(model_name,''), COALESCE(`group`,''), prompt_tokens, completion_tokens, use_time, quota, type, is_stream, COALESCE(content,''), COALESCE(other,''), COALESCE(request_id,'')" +
+	// NewAPI 历史版本与迁移数据可能让计数/耗时/流式标记保留 NULL。
+	// 这些字段在客户日志语义上都等价于 0；直接 Scan 到 int64/int 会使
+	// 整个分页返回 500。查询层统一归零，既兼容历史数据，也不改变筛选口径。
+	q := "SELECT id, created_at, COALESCE(username,''), COALESCE(token_name,''), COALESCE(model_name,''), COALESCE(`group`,'')," +
+		" COALESCE(prompt_tokens,0), COALESCE(completion_tokens,0), COALESCE(use_time,0), COALESCE(quota,0), COALESCE(type,0), COALESCE(is_stream,0)," +
+		" COALESCE(content,''), COALESCE(other,''), COALESCE(request_id,'')" +
 		" FROM logs WHERE " + where + " ORDER BY id DESC LIMIT " + strconv.Itoa(limit)
 	rows, err := m.prodDB.QueryContext(cctx, q, args...)
 	if err != nil {
@@ -1518,11 +1848,11 @@ func (m *Monitor) queryGroupLogs(ctx context.Context, ids []int64, fromTs, toTs,
 
 // serveUsageStats GET /usage/stats?from=&to=&user_id=[&token_id=](管理员):对名单(或其中一人/其单个令牌)做每日/分组/模型聚合。
 func (m *Monitor) serveUsageStats(c *gin.Context) {
-	if !m.Enabled() {
+	if !m.usageReadServingEnabled() {
 		c.JSON(http.StatusOK, gin.H{"enabled": false})
 		return
 	}
-	tracked, err := m.listTracked()
+	tracked, memberCoverage, err := m.listTrackedForUsageReadCoverage(c.Request.Context())
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -1533,6 +1863,7 @@ func (m *Monitor) serveUsageStats(c *gin.Context) {
 	}
 	selected := append([]TrackedUser(nil), tracked...)
 	isGroup := false
+	selectionMembershipComplete := memberCoverage.Complete
 	var tokenID, selectedUID int64
 	// 可选其一:user_id=单用户详情;group_id=公司详情(聚合整组成员,0=未分组成员)
 	if f := strings.TrimSpace(c.Query("user_id")); f != "" {
@@ -1544,6 +1875,9 @@ func (m *Monitor) serveUsageStats(c *gin.Context) {
 		}
 		selectedUID = id
 		selected = []TrackedUser{member}
+		// A published member is independently complete even while unrelated
+		// members are still catching up.
+		selectionMembershipComplete = true
 		// 令牌详情:仅在单用户详情下有效;聚合强制 user_id+token_id 双条件,越权令牌只会查出空
 		if t := strings.TrimSpace(c.Query("token_id")); t != "" {
 			tokenID, err = strconv.ParseInt(t, 10, 64)
@@ -1559,6 +1893,14 @@ func (m *Monitor) serveUsageStats(c *gin.Context) {
 			return
 		}
 		isGroup = true
+		if m.usageFactsReadRequested() {
+			membership, membershipErr := m.currentPublishedUsageMembership(c.Request.Context(), &gid)
+			if membershipErr != nil {
+				c.JSON(http.StatusServiceUnavailable, gin.H{"error": "本地用量成员发布状态暂不可用"})
+				return
+			}
+			selectionMembershipComplete = membership.Complete
+		}
 		selected = selected[:0]
 		for _, u := range tracked {
 			if u.GroupID == gid {
@@ -1576,75 +1918,136 @@ func (m *Monitor) serveUsageStats(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
+	readRange, err := m.resolveUsageAggregateReadRangeForMembers(c.Request.Context(), fromTs, toTs, ids)
+	if err != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "本地用量发布范围暂不可用"})
+		return
+	}
+	requestedRange := newUsageStatsRange(fromTs, toTs)
+	requestedFrom, requestedTo := requestedRange.From, requestedRange.To
+	fromTs, toTs = readRange.From, readRange.To
 	memberFP := portalMemberFingerprint(selected)
 	forceFresh := usageRefreshRequested(c)
 	cacheTTL := usageAggregateTTL(toTs, time.Now())
-	st := &UsageStats{}
-	err = m.loadUsageAggregateJSON(
-		c.Request.Context(),
-		adminUsageAggregateKey("stats", memberFP, selectedUID, tokenID, fromTs, toTs),
-		cacheTTL,
-		forceFresh,
-		st,
-		func() (any, error) {
-			return m.computeUsageStats(c.Request.Context(), ids, fromTs, toTs, tokenID)
-		},
-	)
+	st := requestedRange
+	var dataStale bool
+	if readRange.Available && selectionMembershipComplete {
+		st = newUsageStatsRange(fromTs, toTs)
+		dataStale, err = m.loadUsageAggregateJSONStaleIfError(
+			c.Request.Context(),
+			m.usageFactCacheKey(adminUsageAggregateKey("stats", memberFP, selectedUID, tokenID, fromTs, toTs)),
+			cacheTTL,
+			toTs,
+			forceFresh,
+			st,
+			func() (any, error) {
+				return m.computeUsageStatsForRead(c.Request.Context(), ids, fromTs, toTs, tokenID)
+			},
+		)
+	} else {
+		err = errUsageFactsNotReady
+	}
 	if err != nil {
 		if abortCanceledUsageRequest(c, err) {
 			return
 		}
 		slog.Warn("用户用量详情聚合失败", "err", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "统计查询失败,请稍后重试(细节见服务端日志)"})
-		return
+		// 用量聚合是详情中的一个数据域，不应把余额、累计消耗和成员资料一并打成失败。
+		// 空骨架明确表示“未知”，前端会显示 —，不会把未知范围误当成零消费。
+		st = requestedRange
 	}
-	resp := gin.H{"enabled": true, "stats": st}
+	statsAvailable := err == nil
+	statsMessage := ""
+	dataMessage := ""
+	if statsAvailable {
+		dataStale, dataMessage = m.usageDataStaleness(dataStale, fromTs, toTs, time.Now())
+	} else {
+		dataStale = false
+		statsMessage = readRange.Message
+		if statsMessage == "" {
+			statsMessage = "范围统计暂不可用，余额和累计消耗仍可查看"
+		}
+	}
+	resp := gin.H{
+		"enabled":            true,
+		"stats":              st,
+		"stats_available":    statsAvailable,
+		"stats_message":      statsMessage,
+		"data_stale":         dataStale,
+		"range_partial":      statsAvailable && readRange.Partial,
+		"requested_from":     requestedFrom,
+		"requested_to":       requestedTo,
+		"membership_partial": !selectionMembershipComplete,
+	}
+	if !selectionMembershipComplete {
+		resp["membership_message"] = "所选汇总仍有成员尚未完成事实签收，当前拒绝生成不完整合计；可先查看已签收的单个成员"
+	}
+	if statsAvailable && readRange.Partial {
+		resp["range_message"] = readRange.Message
+	}
+	if dataStale {
+		resp["data_message"] = dataMessage
+	}
 	if isGroup { // 公司详情:成员数 + 余额合计 + 累计总消耗合计(主键 IN 的 SUM)
-		balanceQ, usedQ := m.sumUsageLiveQuotas(c.Request.Context(), ids)
+		balanceQ, usedQ := m.sumUsageLiveQuotasForRead(c.Request.Context(), ids)
 		resp["members"] = len(ids)
 		resp["balance_quota"] = balanceQ
 		resp["balance_usd"] = quotaUSDPtr(balanceQ)
 		resp["total_used_quota"] = usedQ
 		resp["total_used_usd"] = quotaUSDPtr(usedQ)
 	} else if tokenID > 0 { // 令牌详情:元数据(名称/脱敏key/分组/累计;硬删查不到则为 null,前端用点击时的名字兜底)
-		resp["token"] = m.tokenMetaOf(c.Request.Context(), ids[0], tokenID)
-	} else if len(ids) == 1 { // 单用户详情:个人余额 + 累计总消耗(实时取,null=已删/取不到)+ 各令牌用量
-		owner, balanceQ, usedQ := m.userLiveUsage(c.Request.Context(), ids[0])
+		resp["token"] = m.tokenMetaOfForRead(c.Request.Context(), ids[0], tokenID)
+	} else if len(ids) == 1 { // 单用户详情:个人余额 + 累计总消耗(按当前读取模式取值;null=已删/取不到)+ 各令牌用量
+		owner, balanceQ, usedQ := m.userLiveUsageForRead(c.Request.Context(), ids[0])
 		resp["balance_quota"] = balanceQ
 		resp["balance_usd"] = quotaUSDPtr(balanceQ)
 		resp["total_used_quota"] = usedQ
 		resp["total_used_usd"] = quotaUSDPtr(usedQ)
-		var tokenAggregates []tokenUsageAggregate
-		err := m.loadUsageAggregateJSON(
-			c.Request.Context(),
-			adminUsageAggregateKey("tokens", memberFP, ids[0], 0, fromTs, toTs),
-			cacheTTL,
-			forceFresh,
-			&tokenAggregates,
-			func() (any, error) {
-				return m.computeUserTokenAggregates(c.Request.Context(), ids[0], fromTs, toTs)
-			},
-		)
-		if err != nil {
-			if abortCanceledUsageRequest(c, err) {
-				return
+		// 令牌明细独立于主统计。它临时不可用时仍返回已经取得的余额、累计消耗、
+		// 范围汇总和趋势，避免一个可选下钻拖垮整个“用户用量”详情页。
+		tokenDataAvailable := statsAvailable
+		tokenDataMessage := ""
+		tokenAggregates := make([]tokenUsageAggregate, 0)
+		if !statsAvailable {
+			tokenDataMessage = "令牌明细未加载：范围统计暂不可用"
+		} else {
+			err := m.loadUsageAggregateJSON(
+				c.Request.Context(),
+				m.usageFactCacheKey(adminUsageAggregateKey("tokens", memberFP, ids[0], 0, fromTs, toTs)),
+				cacheTTL,
+				forceFresh,
+				&tokenAggregates,
+				func() (any, error) {
+					return m.computeUserTokenAggregatesForRead(c.Request.Context(), ids[0], fromTs, toTs)
+				},
+			)
+			if err != nil {
+				if abortCanceledUsageRequest(c, err) {
+					return
+				}
+				slog.Warn("单用户令牌用量聚合失败，保留主统计", "err", err, "user_id", ids[0])
+				tokenDataAvailable = false
+				tokenDataMessage = "令牌明细暂不可用，其他统计正常"
 			}
-			slog.Warn("单用户令牌用量聚合失败", "err", err, "user_id", ids[0])
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "令牌统计查询失败,请稍后重试(细节见服务端日志)"})
-			return
 		}
-		toks, err := m.hydrateUserTokenUsage(c.Request.Context(), ids[0], tokenAggregates, &owner)
-		if err != nil {
-			if abortCanceledUsageRequest(c, err) {
-				return
+		toks := make([]TokenUsage, 0)
+		if tokenDataAvailable {
+			toks, err = m.hydrateUserTokenUsageForRead(c.Request.Context(), ids[0], tokenAggregates, &owner)
+			if err != nil {
+				if abortCanceledUsageRequest(c, err) {
+					return
+				}
+				slog.Warn("查询令牌实时元数据失败，保留主统计", "err", err, "user_id", ids[0])
+				tokenDataAvailable = false
+				tokenDataMessage = "令牌明细暂不可用，其他统计正常"
+				toks = []TokenUsage{}
 			}
-			slog.Warn("查询令牌实时元数据失败", "err", err, "user_id", ids[0])
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "令牌统计查询失败,请稍后重试(细节见服务端日志)"})
-			return
 		}
 		resp["by_token"] = toks
+		resp["token_data_available"] = tokenDataAvailable
+		resp["token_data_message"] = tokenDataMessage
 	}
-	if forceFresh {
+	if forceFresh && statsAvailable {
 		if isGroup {
 			m.invalidatePortalAggregates(selected, fromTs, toTs)
 		} else if selectedUID > 0 {

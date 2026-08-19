@@ -39,10 +39,10 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
   .btn{padding:7px 14px;border-radius:8px;border:1px solid var(--border);background:transparent;color:var(--text);cursor:pointer;font-size:13px}
   .btn:hover{border-color:var(--accent);color:var(--accent)}
   /* 用户用量·消费矩阵:用户多(20-30列)时的可读性——双向滚动容器内粘住表头行/日期列/合计列,列头截断悬停看全,格子按金额热力着色 */
-  .mxwrap{max-height:65vh;overflow:auto;position:relative;--mx-left-2:150px;--mx-left-3:282px}
+  .mxwrap{max-height:65vh;overflow:auto;position:relative;--mx-user-w:216px;--mx-user-text-w:188px;--mx-left-2:var(--mx-user-w);--mx-left-3:calc(var(--mx-user-w) + 132px)}
   .mxwrap table{width:100%;min-width:var(--mx-table-min,620px);table-layout:fixed;border-collapse:separate;border-spacing:0}
   .mxwrap thead th{position:sticky;top:0;background:var(--surface);z-index:3}
-  .mxwrap td:first-child,.mxwrap th:first-child{position:sticky;left:0;background:var(--surface);z-index:2;white-space:nowrap;width:150px;min-width:150px;max-width:150px;box-sizing:border-box}
+  .mxwrap td:first-child,.mxwrap th:first-child{position:sticky;left:0;background:var(--surface);z-index:2;white-space:nowrap;width:var(--mx-user-w);min-width:var(--mx-user-w);max-width:var(--mx-user-w);box-sizing:border-box}
   .mxwrap td:nth-child(2),.mxwrap th:nth-child(2){position:sticky;left:var(--mx-left-2);background:var(--surface);z-index:2;width:132px;min-width:132px;max-width:132px;box-sizing:border-box} /* 余额列:锁左；为五位及以上金额保留完整显示空间 */
   .mxwrap td:nth-child(3),.mxwrap th:nth-child(3){position:sticky;left:var(--mx-left-3);background:var(--surface);z-index:2;width:142px;min-width:142px;max-width:142px;box-sizing:border-box;box-shadow:6px 0 8px -6px rgba(0,0,0,.55)} /* 累计总消耗列:随用户/余额一起锁左,阴影收在最后一根固定列上 */
   .mxwrap thead th:nth-child(2),.mxwrap thead th:nth-child(3){z-index:4}
@@ -54,6 +54,19 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
   /* 统一列宽:数据列(日期)等宽,不随内容宽窄不一;首列(用户)与尾列(合计)各自给足 */
   .mxwrap thead th:nth-child(n+4):not(:last-child),.mxwrap tbody td:nth-child(n+4):not(:last-child){width:92px;min-width:92px;max-width:92px}
   .mxwrap thead th:last-child,.mxwrap tbody td:last-child{width:104px;min-width:104px;max-width:104px}
+  /* 每日明细不可用时只剩“用户/余额/累计总消耗”三列。此时不能继续沿用
+     多日期矩阵的冻结列宽规则，否则浏览器会把整行余量几乎都补给用户列。
+     单独按三列总宽分配：用户名有一个有上限的可读宽度，其余空间由两列金额均分。 */
+  .mxwrap table.mx-summary-only{--mx-summary-user-w:clamp(260px,24vw,360px);min-width:calc(var(--mx-summary-user-w) + 400px)}
+  .mxwrap table.mx-summary-only th:first-child,.mxwrap table.mx-summary-only td:first-child{
+    position:static;left:auto;width:var(--mx-summary-user-w);min-width:var(--mx-summary-user-w);max-width:var(--mx-summary-user-w);box-shadow:none
+  }
+  .mxwrap table.mx-summary-only th:nth-child(2),.mxwrap table.mx-summary-only td:nth-child(2),
+  .mxwrap table.mx-summary-only th:nth-child(3),.mxwrap table.mx-summary-only td:nth-child(3){
+    position:static;left:auto;right:auto;width:calc((100% - var(--mx-summary-user-w))/2);min-width:200px;max-width:none;box-shadow:none
+  }
+  .mxwrap table.mx-summary-only td[colspan]{position:static;width:auto;min-width:0;max-width:none;box-shadow:none}
+  .mxwrap table.mx-summary-only .ucell .u-name,.mxwrap table.mx-summary-only .ucell .u-mail{max-width:calc(var(--mx-summary-user-w) - 24px)}
   .mxwrap tbody tr.mxfoot td{position:sticky;bottom:0;background:var(--surface);z-index:3;border-top:2px solid var(--border)}
   .mxwrap tbody tr.mxfoot td:first-child{z-index:5}
   .mxwrap tbody tr.mxfoot td:last-child{z-index:5}
@@ -117,8 +130,8 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
   .grpcard.grpmore .m-s{font-size:12px}
   /* 矩阵用户格两行:用户名(主)+ 邮箱(次) */
   .ucell{line-height:1.25}
-  .ucell .u-name{display:block;max-width:122px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-  .ucell .u-mail{display:block;max-width:122px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11px;color:var(--text-muted)}
+  .ucell .u-name{display:block;max-width:var(--mx-user-text-w);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .ucell .u-mail{display:block;max-width:var(--mx-user-text-w);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11px;color:var(--text-muted)}
   .gtag{display:inline-block;font-size:11px;color:var(--accent);border:1px solid var(--border);border-radius:6px;padding:1px 7px;vertical-align:middle}
   /* 用户悬浮卡:停在用户名上显示 用户名/邮箱/分组/备注,排版规整 */
   /* 待跟进 */
@@ -230,6 +243,20 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
   .drill-arrow{color:var(--accent);font-size:11px;display:inline-block;width:12px}
   tr.drillable{cursor:pointer}tr.drillable:hover td{background:rgba(255,255,255,.03)}
   .alert{padding:12px 16px;border-radius:8px;margin-bottom:16px;font-size:14px;background:rgba(239,68,68,.1);border:1px solid rgba(239,68,68,.3);color:var(--red)}
+  .usage-sync-note{display:flex;align-items:center;gap:10px;padding:10px 14px;margin:0 0 12px;border:1px solid rgba(245,158,11,.32);border-radius:8px;background:rgba(245,158,11,.09);color:#d6d9e2;font-size:13px;line-height:1.45}
+  .usage-sync-note b{color:#fbbf24;white-space:nowrap}.usage-sync-note span{color:var(--text-muted)}
+  .usage-facts-state{display:flex;align-items:center;gap:12px;padding:10px 14px;margin:0 0 10px;border:1px solid rgba(99,102,241,.32);border-radius:8px;background:rgba(99,102,241,.09);font-size:13px;line-height:1.45}
+  .usage-facts-state b{color:#a5b4fc;white-space:nowrap}.usage-facts-state span{color:var(--text-muted)}
+  .usage-facts-state.ok{border-color:rgba(52,211,153,.28);background:rgba(52,211,153,.07)}.usage-facts-state.ok b{color:#6ee7b7}
+  .usage-facts-state.warn{border-color:rgba(245,158,11,.32);background:rgba(245,158,11,.09)}.usage-facts-state.warn b{color:#fbbf24}
+  .usage-facts-progress{width:120px;height:5px;flex:0 0 120px;overflow:hidden;border-radius:999px;background:#272b39}.usage-facts-progress i{display:block;height:100%;border-radius:inherit;background:#818cf8}
+  .usage-history-detail{margin:-3px 0 12px;padding:10px 14px;border:1px solid var(--border);border-radius:8px;background:rgba(255,255,255,.018);font-size:12px}
+  .usage-history-detail summary{cursor:pointer;color:#c7d2fe;font-weight:600}.usage-history-detail table{margin-top:9px}.usage-history-detail th,.usage-history-detail td{padding:7px 9px;font-size:12px}.usage-history-detail .history-error{max-width:320px;color:#fca5a5;white-space:normal;word-break:break-word}
+  .usage-history-inline{display:flex;gap:7px;align-items:center;flex-wrap:wrap}.usage-history-inline .badge{font-size:11px}.usage-history-retry{border:0;border-radius:5px;background:rgba(239,68,68,.18);color:#fca5a5;padding:3px 7px;cursor:pointer}.usage-history-retry:disabled{opacity:.5;cursor:wait}
+  .sync-toolbar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin:0 0 14px}.sync-toolbar .muted{font-size:12px}.sync-toolbar .btn{margin-left:auto}
+  .sync-overview{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-bottom:14px}.sync-card{min-height:112px;padding:15px 16px;border:1px solid var(--border);border-radius:10px;background:rgba(255,255,255,.018)}.sync-card small{display:block;color:var(--text-muted);font-size:12px}.sync-card b{display:block;margin-top:10px;font-size:20px;line-height:1.25}.sync-card p{margin:7px 0 0;color:var(--text-muted);font-size:12px;line-height:1.45}.sync-card.ok{border-color:rgba(52,211,153,.30);background:rgba(52,211,153,.055)}.sync-card.warn{border-color:rgba(245,158,11,.32);background:rgba(245,158,11,.055)}.sync-card.bad{border-color:rgba(239,68,68,.34);background:rgba(239,68,68,.06)}
+  .sync-status{display:inline-flex;align-items:center;gap:6px;font-size:12px;font-weight:600}.sync-status:before{content:'';width:8px;height:8px;border-radius:50%;background:#94a3b8}.sync-status.ok{color:#6ee7b7}.sync-status.ok:before{background:#34d399}.sync-status.warn{color:#fbbf24}.sync-status.warn:before{background:#f59e0b}.sync-status.bad{color:#fca5a5}.sync-status.bad:before{background:#ef4444}.sync-section{margin-bottom:14px}.sync-section .card-header{display:flex;align-items:center;gap:9px}.sync-section .card-header .muted{font-size:12px;font-weight:400}.sync-kv{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:1px;background:var(--border)}.sync-kv>div{min-width:0;padding:12px 14px;background:var(--card)}.sync-kv small{display:block;color:var(--text-muted);font-size:11px}.sync-kv b{display:block;margin-top:5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:14px}.sync-table-note{padding:10px 14px;color:var(--text-muted);font-size:12px}
+  @media(max-width:900px){.sync-overview{grid-template-columns:repeat(2,minmax(0,1fr))}.sync-kv{grid-template-columns:repeat(2,minmax(0,1fr))}}@media(max-width:520px){.sync-overview,.sync-kv{grid-template-columns:1fr}.sync-toolbar .btn{margin-left:0}}
   code{background:rgba(255,255,255,.06);padding:1px 5px;border-radius:4px;font-size:12px}
   .tabs{display:flex;gap:4px;margin:16px 0 0;border-bottom:1px solid var(--border)}
   .tabs .tab{padding:10px 20px;font-size:14px;color:var(--text-muted);cursor:pointer;border-bottom:2px solid transparent;user-select:none}
@@ -252,6 +279,7 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
       <div class="tab" data-tab="stability" title="稳定性报表"><span class="monitor-nav-icon"><svg viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="m9 12 2 2 4-4"/></svg></span><span class="monitor-nav-label">稳定性报表</span></div>
       <div class="tab" data-tab="model" title="模型监控"><span class="monitor-nav-icon"><svg viewBox="0 0 24 24"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg></span><span class="monitor-nav-label">模型监控</span></div>
       <div class="tab" data-tab="server" title="服务端监控"><span class="monitor-nav-icon"><svg viewBox="0 0 24 24"><path d="M3 3v18h18"/><path d="m7 16 4-5 4 3 5-7"/></svg></span><span class="monitor-nav-label">服务端监控</span></div>
+      <div class="tab" data-tab="sync" title="数据同步状态"><span class="monitor-nav-icon"><svg viewBox="0 0 24 24"><path d="M20 7h-6V1"/><path d="M4 17h6v6"/><path d="M20 7a8 8 0 0 0-13.7-3.6L4 5.7M4 17a8 8 0 0 0 13.7 3.6l2.3-2.3"/></svg></span><span class="monitor-nav-label">数据同步状态</span></div>
     </nav>
     <button type="button" class="monitor-sidebar-toggle" id="monitorSidebarToggle" aria-expanded="true" aria-label="收起侧边栏" title="收起侧边栏">
       <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m15 18-6-6 6-6"/></svg><span>收起侧边栏</span>
@@ -268,6 +296,7 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
     </header>
 
     <nav class="tabs monitor-mobile-tabs" aria-label="Monitor 导航">
+      <div class="tab" data-tab="sync">同步状态</div>
       <div class="tab active" data-tab="usage">用户用量</div>
       <div class="tab" data-tab="channels">渠道管理</div>
       <div class="tab" data-tab="stability">稳定性报表</div>
@@ -276,6 +305,37 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
     </nav>
 
     <div class="monitor-content">
+
+<div class="tabpane" id="tab-sync" hidden>
+  <div class="sync-toolbar">
+    <span class="muted">只读取 Monitor 本地 SQLite 与运行水位；刷新本页不会发起 NewAPI 来源查询。</span>
+    <span class="muted" id="syncUpdated">尚未加载</span>
+    <button class="btn" type="button" id="syncRefresh">刷新状态</button>
+  </div>
+  <div id="syncError"></div>
+  <div class="sync-overview" id="syncOverview"><div class="sync-card"><small>同步状态</small><b>加载中…</b></div></div>
+
+  <section class="sync-section card">
+    <div class="card-header">⚙️ 采集服务与本地存储 <span class="muted">来源 worker、租约、SQLite 完整性和备份集</span></div>
+    <div class="sync-kv" id="syncRuntime"><div>加载中…</div></div>
+  </section>
+
+  <section class="sync-section card">
+    <div class="card-header">👥 用户用量事实 <span class="muted">全历史、实时 Tail、签收水位与成员级异常</span></div>
+    <div class="sync-kv" id="syncFacts"><div>加载中…</div></div>
+    <div id="syncFactMembers"></div>
+  </section>
+
+  <section class="sync-section card">
+    <div class="card-header">📡 渠道余额与消费同步 <span class="muted">按上游主域名显示本地已同步状态；不读取上游</span></div>
+    <div id="syncChannels"></div>
+  </section>
+
+  <section class="sync-section card">
+    <div class="card-header">🛡 稳定性与问题样本 <span class="muted">主采样、原始问题 Tail 与冷历史迁移分开显示</span></div>
+    <div class="sync-kv" id="syncStability"><div>加载中…</div></div>
+  </section>
+</div>
 
 <div class="tabpane" id="tab-model" hidden>
 <div class="toolbar">
@@ -422,6 +482,7 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
     </div>
     <div class="cm-toolbar-actions"><button type="button" class="cm-site-finance-open" id="cmSiteFinanceOpen">网站计价基准</button></div>
     <div class="cm-range">
+      <button type="button" data-cm-hours="24">近 24 小时</button>
       <button type="button" data-cm-preset="today">今天</button>
       <button type="button" data-cm-preset="yesterday">昨天</button>
       <button type="button" data-cm-preset="week">本周</button>
@@ -440,15 +501,6 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
     <span><b>财务口径</b> 用量来自使用日志；倍率配置只用于上游成本对照，不替代上游账单或财务结算</span>
   </div>
 
-  <div class="cm-filters" id="cmFilters">
-    <label class="cm-search"><span>搜索</span><input id="cmSearch" type="search" placeholder="主域名、具体域名、渠道名或渠道 ID" autocomplete="off"></label>
-    <label><span>主域名</span><select id="cmDomain"><option value="">全部主域名</option></select></label>
-    <label><span>厂商类型</span><select id="cmVendor"><option value="">全部厂商类型</option></select></label>
-    <label><span>服务分组</span><select id="cmGroup"><option value="">全部服务分组</option></select></label>
-    <label><span>状态</span><select id="cmStatus"><option value="">全部状态</option><option value="enabled">当前启用</option><option value="disabled">当前停用</option><option value="historical">历史渠道</option></select></label>
-    <button type="button" class="cm-reset" id="cmReset">重置</button>
-  </div>
-
   <div class="cm-sortbar">
     <div><b>排行口径</b><span>切换后主域名、厂商和实际渠道同步重排</span></div>
     <div class="cm-sort-switch">
@@ -456,6 +508,17 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
       <button type="button" data-cm-sort="requests">请求数</button>
       <button type="button" data-cm-sort="tokens">Tokens</button>
     </div>
+  </div>
+
+  <div id="cmSummary"></div>
+
+  <div class="cm-filters" id="cmFilters">
+    <label class="cm-search"><span>搜索</span><input id="cmSearch" type="search" placeholder="主域名、具体域名、渠道名或渠道 ID" autocomplete="off"></label>
+    <label><span>主域名</span><select id="cmDomain"><option value="">全部主域名</option></select></label>
+    <label><span>厂商类型</span><select id="cmVendor"><option value="">全部厂商类型</option></select></label>
+    <label><span>服务分组</span><select id="cmGroup"><option value="">全部服务分组</option></select></label>
+    <label><span>状态</span><select id="cmStatus"><option value="">全部状态</option><option value="enabled">当前启用</option><option value="disabled">当前停用</option><option value="historical">历史渠道</option></select></label>
+    <button type="button" class="cm-reset" id="cmReset">重置</button>
   </div>
 
   <div id="cmBody"><div class="cm-loading"><i></i><span>正在读取本地渠道用量汇总…</span></div></div>
@@ -505,7 +568,7 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
       <section class="cm-upstream-status" id="cmUpstreamStatus" hidden></section>
       <section class="cm-upstream-note">
         <b>同步方式</b>
-        <span>后台按设定周期（默认每 5 分钟）读取账户余额；失败会保留最后一次成功值并自动退避，不会把未知余额显示为 0。</span>
+        <span>余额默认每 5 分钟同步；使用日志仅在显式开启后低频汇总到 Monitor 本地，页面查询不会访问上游。</span>
       </section>
       <section class="cm-upstream-fields">
         <label><span>中转站类型</span><select id="cmUpstreamProvider"><option value="newapi">NewAPI</option><option value="sub2api">Sub2API</option></select></label>
@@ -516,6 +579,7 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
         <label class="cm-upstream-sub2api wide"><span>登录密码</span><input id="cmUpstreamPassword" type="password" autocomplete="new-password" placeholder="已连接时留空表示沿用当前会话"><small>密码只用于本次登录换取令牌，不保存、不回显</small></label>
       </section>
       <label class="cm-upstream-enabled"><input id="cmUpstreamEnabled" type="checkbox" checked><span><b>启用后台自动同步</b><small>停用后保留配置和最后余额，但不再访问该上游</small></span></label>
+      <label class="cm-upstream-enabled cm-upstream-usage-option cm-upstream-newapi"><input id="cmUpstreamUsageEnabled" type="checkbox"><span><b>同步使用日志（NewAPI）</b><small>默认每 30 分钟串行汇总一次；首次按天低频补齐历史数据，不保存上游原始日志或用户内容</small></span></label>
       <section class="cm-upstream-security"><b>凭据安全</b><span>访问令牌在本地 SQLite 中经 AES-256-GCM 加密；页面和接口只返回脱敏账户信息。Sub2API 的 refresh token 轮换会原子更新。</span></section>
     </div>
     <footer><span id="cmUpstreamMessage"></span><div><button type="button" class="cm-upstream-cancel" id="cmUpstreamCancel">取消</button><button type="button" class="cm-upstream-sync" id="cmUpstreamSync" hidden>立即同步</button><button type="button" class="cm-upstream-save" id="cmUpstreamSave">保存并验证</button></div></footer>
@@ -675,13 +739,13 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
       <div class="monitor-table-scroll monitor-table-medium"><table><thead id="thUsageDaily"></thead><tbody id="tbUsageDaily"></tbody></table></div>
     </div>
     <div class="card" id="usageMemCard" hidden>
-      <div class="card-header">👥 组内成员 <span class="muted" style="font-weight:400;font-size:12px">· 行=成员,列=日期,格=当日消费(美元)· 点成员看明细(与该客户在报表页看到的一致)</span></div>
+      <div class="card-header">👥 组内成员 <span class="muted" style="font-weight:400;font-size:12px">· 行=成员,列=日期,格=当日消费(美元)· 点成员看明细(与该客户在报表页看到的一致)</span><span id="usageMemState" class="muted" style="font-weight:400;font-size:12px;color:#fbbf24"></span></div>
       <div class="mxwrap"><table id="usageMemMxTable"><thead id="thUsageMemMx"></thead><tbody id="tbUsageMemMx"></tbody></table></div>
     </div>
     <div class="card" id="usageMemRankCard" hidden><div class="card-header">🏆 成员消耗排行 <span class="muted" style="font-weight:400;font-size:12px">· 范围内消耗 Top 10</span></div><div id="usageMemRankChart" style="min-height:180px;padding:6px 10px"></div></div>
     <div class="card"><div class="card-header">按分组</div><div id="usageGrpPie" style="height:230px;padding:4px" hidden></div><div class="monitor-table-scroll monitor-table-medium"><table><thead id="thUsageGrp"></thead><tbody id="tbUsageGrp"></tbody></table></div></div>
     <div class="card"><div class="card-header">按模型</div><div id="usageModelPie" style="height:230px;padding:4px" hidden></div><div class="monitor-table-scroll monitor-table-medium"><table><thead id="thUsageModel"></thead><tbody id="tbUsageModel"></tbody></table></div></div>
-    <div class="card" id="usageTokCard"><div class="card-header">按令牌 <span class="muted" style="font-weight:400;font-size:12px">· 该用户各令牌用量,密钥已脱敏;点令牌名看单令牌详情</span></div><div class="monitor-table-scroll monitor-table-admin"><table><thead id="thUsageTok"></thead><tbody id="tbUsageTok"></tbody></table></div></div>
+    <div class="card" id="usageTokCard"><div class="card-header">按令牌 <span class="muted" style="font-weight:400;font-size:12px">· 该用户各令牌用量,密钥已脱敏;点令牌名看单令牌详情</span><span id="usageTokState" class="muted" style="font-weight:400;font-size:12px;color:#fbbf24"></span></div><div class="monitor-table-scroll monitor-table-admin"><table><thead id="thUsageTok"></thead><tbody id="tbUsageTok"></tbody></table></div></div>
   </div>
 </div>
 
@@ -1380,6 +1444,7 @@ function switchTab(name,preserveHash){
   // 跨页按钮会先写入新 hash 并传 preserveHash=true，因此不会走这里。
   if(!preserveHash)history.replaceState(null,'',location.pathname+location.search+'#tab='+name);
   document.querySelectorAll('.tabs .tab').forEach(t=>t.classList.toggle('active',t.dataset.tab===name));
+  document.getElementById('tab-sync').hidden=(name!=='sync');
   document.getElementById('tab-model').hidden=(name!=='model');
   document.getElementById('tab-stability').hidden=(name!=='stability');
   document.getElementById('tab-channels').hidden=(name!=='channels');
@@ -1388,17 +1453,139 @@ function switchTab(name,preserveHash){
   if(window.monitorShellSetTab)window.monitorShellSetTab(name);
   if(name==='server'){loadInfra();infraSchedule();setTimeout(resizeInfraCharts,80);}
   else if(infraTimer){clearInterval(infraTimer);}
-  if(name==='usage')usageInit();
+  if(name==='sync')syncActivate();else syncDeactivate();
+  if(name==='usage'){usageInit();usageLoadFactsStatus()}
   if(name==='stability'&&window.stabilityActivate)window.stabilityActivate();
   if(name==='channels'&&window.channelManagementActivate)window.channelManagementActivate();
   if(name==='model')setTimeout(resizeModelCharts,60); // 模型 tab 非默认可见,切回时按可见宽度重排图表
 }
 function resizeModelCharts(){[trendChart,longChart,sloGauge,latChart,ttftChart].forEach(c=>c&&c.resize());}
 
+// ═══════════ 数据同步状态(tab-sync):所有请求只读 Monitor 本地状态，不触发来源查询 ═══════════
+let syncTimer=null;
+function syncTime(ts){return +ts?new Date(+ts*1000).toLocaleString('zh-CN',{hour12:false,timeZone:'Asia/Shanghai'}):'—'}
+function syncAge(ts){if(!+ts)return '—';return usageFactsDuration(Math.max(0,Date.now()/1000-(+ts)))}
+function syncStateClass(level){return level==='ok'?'ok':level==='bad'?'bad':'warn'}
+function syncStateText(level){return level==='ok'?'正常':level==='bad'?'异常':'需要关注'}
+function syncCard(level,title,value,detail){return `<div class="sync-card ${syncStateClass(level)}"><small>${esc(title)}</small><b><span class="sync-status ${syncStateClass(level)}">${syncStateText(level)}</span> ${esc(value)}</b><p>${esc(detail||'')}</p></div>`}
+function syncKV(label,value,title){return `<div${title?` title="${esc(title)}"`:''}><small>${esc(label)}</small><b>${value==null?'—':esc(String(value))}</b></div>`}
+async function syncFetchJSON(path){
+  const res=await fetch(path,{headers:{'Accept':'application/json'}});
+  if(res.status===401){location.href='/login';throw new Error('登录已失效')}
+  return {ok:res.ok,status:res.status,data:await res.json().catch(()=>({}))};
+}
+function syncRenderRuntime(ready,stores){
+  const source=ready.source||{},disk=ready.facts_disk||{};
+  const sourceLevel=source.worker_enabled&&source.state!=='ready'?'bad':(source.worker_enabled&&!source.lease_held?'warn':'ok');
+  const main=stores.store||{},facts=stores.facts_store||{};
+  document.getElementById('syncRuntime').innerHTML=[
+    syncKV('来源状态',source.worker_enabled?`${source.state||'未知'}${source.lease_held?' · 已持租约':''}`:'本机只读/未启用',source.last_failure_at?`最近失败：${syncTime(source.last_failure_at)}`:''),
+    syncKV('来源最近成功',syncTime(source.last_success_at),source.failure_streak?`连续失败 ${source.failure_streak} 次`:'全局来源读取水位'),
+    syncKV('主库完整性',main.integrity_ok?'通过':'未通过',main.integrity_checked_at?`检查于 ${syncTime(main.integrity_checked_at)}`:''),
+    syncKV('事实库完整性',facts.integrity_ok?'通过':'未通过',facts.integrity_checked_at?`检查于 ${syncTime(facts.integrity_checked_at)}`:''),
+    syncKV('成套备份',main.backup_set_verified?'已验证':'未验证',main.backup_set_success_at?`最近成功：${syncTime(main.backup_set_success_at)}`:''),
+    syncKV('事实库备份',facts.backup_set_verified?'已验证':'未验证',facts.backup_set_success_at?`最近成功：${syncTime(facts.backup_set_success_at)}`:''),
+    syncKV('事实盘水位',`${disk.pressure||'未知'} · ${(+disk.used_percent||0).toFixed(1)}%`,disk.free_bytes?`可用 ${fmtNum(disk.free_bytes)} B`:''),
+    syncKV('本地就绪',ready.status||'未知',(ready.degraded_reasons||[]).join('、')||'无降级原因')
+  ].join('');
+  return sourceLevel;
+}
+function syncRenderFacts(facts,history){
+  const f=facts.facts||{},h=history||{};
+  const archiveBlocked=+h.paused_members>0||+h.failed_members>0||h.disk_blocked||h.bulk_circuit_state==='open'||f.repair_active;
+  const serviceComplete=!!f.read_active&&+h.total_members>0&&+h.published_members===+h.total_members&&(!h.raw_page_enabled||(+h.live_ready_members===+h.total_members&&+h.recent_ready_members===+h.total_members));
+  const servicePartial=!!f.read_active&&+h.published_members>0;
+  const archiveComplete=!!h.total_known&&+h.pending_members===0&&!archiveBlocked;
+  const level=serviceComplete?(archiveComplete?'ok':'warn'):(servicePartial?'warn':'bad');
+  const serving=f.published_range_start&&f.published_through?`${syncTime(f.published_range_start)} → ${syncTime(f.published_through)}`:'尚无已签收范围';
+  document.getElementById('syncFacts').innerHTML=[
+    syncKV('读取状态',f.read_active?'已切本地事实':'未切读/校验中',f.read_active?'所有用量页只读本地 SQLite':'页面不会回退扫描来源 logs'),
+    syncKV('近期服务成员',`${fmtNum(h.service_ready_members||h.published_members||f.serving_users)}/${fmtNum(h.total_members||f.tracked_users)}`,serviceComplete?'全部成员近期窗口已签收':`${fmtNum((+h.total_members||0)-(+h.published_members||0))} 个成员仍在建立近期窗口`),
+    syncKV('全历史归档',`${(+h.coverage_percent||+f.coverage_percent||0).toFixed(1)}%`,`${fmtNum(h.archive_ready_members||h.ready_members)}/${fmtNum(h.total_members)} 成员完成 · ${fmtNum(h.completed_hours||f.complete_member_hours)}/${fmtNum(h.total_hours||f.expected_member_hours)} member-hours`),
+    syncKV('实时用量水位',h.raw_page_enabled?`${fmtNum(h.live_ready_members)}/${fmtNum(h.total_members)} 成员追平`:'沿用旧 Tail',h.raw_page_enabled?`最大连续缺口 ${usageFactsDuration(h.live_max_lag_seconds||0)} · ${fmtNum(h.live_pending_members)} 个待追平`:''),
+    syncKV('最近 7 天窗口',h.raw_page_enabled?`${fmtNum(h.recent_ready_members)}/${fmtNum(h.total_members)} 成员完整`:'沿用旧窗口',h.raw_page_enabled?`最大桥接缺口 ${usageFactsDuration(h.recent_max_lag_seconds||0)} · ${fmtNum(h.recent_pending_members)} 个待补齐`:''),
+    syncKV('分页事实导入',h.raw_page_enabled?`${fmtNum(h.raw_page_complete_hours)}/${fmtNum(h.raw_page_hours)} 小时完成`:'未启用',h.raw_page_enabled?`${fmtNum(h.raw_page_pages)} 页 · ${fmtNum(h.raw_page_source_rows)} 条原始日志 · ${fmtNum(h.raw_page_active_members)} 个成员处理中`:'仍使用聚合导入'),
+    syncKV('签收校验',h.total_hours?`${((+h.verified_hours||0)*100/(+h.total_hours||1)).toFixed(1)}%`:(f.semantic_audit_ok?'通过':'待校验'),h.estimate_status?usageFactsEstimateText(h):''),
+    syncKV('服务范围',serving,'成员各自 floor 前的数据不会参与读取'),
+    syncKV('Tail 最新完成',syncTime(f.latest_complete_hour),f.last_fact_sync_at?`最近同步 ${syncAge(f.last_fact_sync_at)}前`:''),
+    syncKV('修复/审计',f.repair_active?'修复中':'无进行中修复',f.repair_last_error||''),
+    syncKV('历史来源',`${h.source_mode||'—'} · ${h.source_epoch||'—'}`,h.bulk_circuit_state&&h.bulk_circuit_state!=='closed'?`来源熔断：${h.bulk_circuit_state}`:'')
+  ].join('');
+  const members=(h.members||[]).filter(x=>x.last_error||x.live_last_error||x.recent_last_error||x.live_status!=='ready'||x.recent_status!=='ready'||x.job_status==='paused'||!x.published);
+  const target=document.getElementById('syncFactMembers');
+  if(!members.length){target.innerHTML='<div class="sync-table-note">所有成员近期服务与全历史归档均已完成；无待处理成员级异常。</div>';return level}
+  const rows=members.map(x=>{const span=+x.raw_page_span_hours||1;const preferred=+x.raw_page_preferred_span_hours||1;const live=`实时 ${esc(x.live_status||'pending')} · 延迟 ${usageFactsDuration(x.live_lag_seconds||0)}<br>近7天 ${esc(x.recent_status||'pending')} · 缺口 ${usageFactsDuration(x.recent_lag_seconds||0)}`;const page=x.raw_page_hour?`${syncTime(x.raw_page_hour)}${span>1?' → '+syncTime(x.raw_page_through):''}<br><span class="muted">${esc(x.raw_page_status||'—')} · 当前 ${span}h / 下个 ${preferred}h · ${fmtNum(x.raw_page_pages)} 页 / ${fmtNum(x.raw_page_source_rows)} 条<br>${live}</span>`:`<span class="muted">尚无分页水位<br>${live}</span>`;const service=x.service_ready?`可用 · ${syncTime(x.published_from_hour)}起`:'建立近期窗口';return `<tr><td>#${+x.user_id}</td><td>${esc(service)}</td><td>${esc(usageFactsStageLabel(x.stage))} · ${esc(x.job_status||'—')}</td><td>${(+x.coverage_percent||0).toFixed(1)}%</td><td>${page}</td><td>${esc(x.verification_status||'—')}</td><td>${x.recent_next_retry_at?syncTime(x.recent_next_retry_at):(x.live_next_retry_at?syncTime(x.live_next_retry_at):(x.next_retry_at?syncTime(x.next_retry_at):'—'))}</td><td class="history-error">${x.recent_last_error?esc(x.recent_last_error)+'<br>':''}${x.live_last_error?esc(x.live_last_error)+'<br>':''}${x.raw_page_last_error?esc(x.raw_page_last_error)+'<br>':''}${x.last_error?esc(x.last_error):(x.service_ready?'历史继续后台扩展':'待签收')}</td></tr>`}).join('');
+  target.innerHTML=`<details class="usage-history-detail" open><summary>尚在同步或需要处理的成员 · ${members.length} 个</summary><div class="monitor-table-scroll"><table><thead><tr><th>用户</th><th>近期服务</th><th>历史阶段</th><th>归档覆盖</th><th>分页水位</th><th>校验</th><th>下次重试</th><th>原因</th></tr></thead><tbody>${rows}</tbody></table></div></details>`;
+  return level;
+}
+function syncRenderChannels(report){
+  const el=document.getElementById('syncChannels');
+  if(!report.enabled){el.innerHTML='<div class="sync-table-note">渠道管理未启用，暂无上游账户同步状态。</div>';return 'warn'}
+  const domains=(report.domains||[]).filter(x=>x.upstream&&x.upstream.configured);
+  if(!domains.length){el.innerHTML='<div class="sync-table-note">尚未配置上游账户；渠道余额与上游消费不会同步。</div>';return 'warn'}
+  let level='ok';
+  const rows=domains.map(x=>{
+    const u=x.upstream||{},balanceOK=!u.enabled||u.status==='ok';
+    const usageOK=!u.usage_sync_enabled||u.usage_status==='ok';
+    if(!balanceOK||!usageOK)level='warn';
+    const state=balanceOK&&usageOK?'正常':(!u.enabled?'已停用':'需要关注');
+    return `<tr><td>${esc(x.domain||x.key||'—')}</td><td>${esc(u.provider_name||u.provider||'—')}</td><td><span class="sync-status ${balanceOK?'ok':'warn'}">${esc(u.status||'未同步')}</span><br><span class="muted">${syncTime(u.last_success_at)}</span></td><td>${u.usage_sync_enabled?`<span class="sync-status ${usageOK?'ok':'warn'}">${esc(u.usage_status||'未同步')}</span><br><span class="muted">截至 ${syncTime(u.usage_data_until)}</span>`:'<span class="muted">未启用</span>'}</td><td>${esc(state)}</td><td class="history-error">${esc(u.last_error||u.usage_last_error||'—')}</td></tr>`;
+  }).join('');
+  el.innerHTML=`<div class="monitor-table-scroll"><table><thead><tr><th>上游主域名</th><th>类型</th><th>余额同步</th><th>消费同步</th><th>状态</th><th>最近错误</th></tr></thead><tbody>${rows}</tbody></table></div>`;
+  return level;
+}
+function syncRenderStability(health){
+  const h=health||{},migration=h.problem_migration||{};
+  const enabled=h.nginx_enabled!==undefined||h.checked_at!==undefined;
+  const level=!enabled?'warn':(h.status==='ok'?'ok':'warn');
+  document.getElementById('syncStability').innerHTML=[
+    syncKV('总体状态',h.status||'未启用',(h.status||'')==='ok'?'采样新鲜且无待处理窗口':'请查看采样延迟、迁移和失败时间'),
+    syncKV('主采样',h.main_sampler_last_success?`${syncAge(h.main_sampler_last_success)}前`:'未采样',h.main_sampler_last_success?syncTime(h.main_sampler_last_success):''),
+    syncKV('问题 Tail',h.problem_live_status||'—',`延迟 ${usageFactsDuration(h.problem_live_lag_sec||0)} · 待处理 ${fmtNum(h.problem_pending_minutes)} 分钟`),
+    syncKV('问题最近成功',h.problem_sampler_last_success?`${syncAge(h.problem_sampler_last_success)}前`:'未采样',h.problem_sampler_last_failure?`最近失败：${syncTime(h.problem_sampler_last_failure)}`:''),
+    syncKV('冷历史迁移',migration.status||'—',migration.coverage_percent!=null?`${(+migration.coverage_percent).toFixed(1)}% · ${migration.estimated_seconds==null?'暂无 ETA':usageFactsDuration(migration.estimated_seconds)}`:''),
+    syncKV('本地库',h.store_reachable?'可访问':'不可访问',h.store_bytes?`${fmtNum(h.store_bytes)} B（含 WAL）`:''),
+    syncKV('Nginx 入口',h.nginx_enabled?`${fmtNum(h.nginx_source_count)} 个来源`:'未启用',h.nginx_enabled?`异常 ${fmtNum(h.nginx_unhealthy_sources)} · backlog ${fmtNum(h.nginx_backlog_bytes)} B`:''),
+    syncKV('问题覆盖至',syncTime(h.problem_coverage_to),h.problem_live_target_to?`目标 ${syncTime(h.problem_live_target_to)}`:'')
+  ].join('');
+  return level;
+}
+function syncRender(data){
+  const ready=data.ready.data||{},facts=data.facts.data||{},history=data.history.data||{},health=data.health.data||{},channels=data.channels.data||{};
+  const runtimeLevel=syncRenderRuntime(ready,facts);
+  const factsLevel=syncRenderFacts(facts,history);
+  const channelsLevel=syncRenderChannels(channels);
+  const stabilityLevel=syncRenderStability(health);
+  const readiness=ready.status==='ready'&&!(ready.degraded_reasons||[]).length?'ok':(ready.status==='not_ready'?'bad':'warn');
+  document.getElementById('syncOverview').innerHTML=[
+    syncCard(readiness,'服务就绪',ready.status==='ready'?'本地服务可用':(ready.status||'不可用'),(ready.degraded_reasons||[]).join('、')||'本地状态已检查'),
+    syncCard(factsLevel,'用户用量事实',facts.facts&&facts.facts.read_active?`${fmtNum(history.published_members||0)}/${fmtNum(history.total_members||0)} 成员可用`:'近期窗口同步中',`全历史归档 ${(+history.coverage_percent||0).toFixed(1)}% · ${fmtNum(history.live_ready_members||0)}/${fmtNum(history.total_members||0)} 实时追平`),
+    syncCard(channelsLevel,'渠道上游同步',channels.enabled?`${(channels.domains||[]).filter(x=>x.upstream&&x.upstream.configured).length} 个账户`:'未启用','余额与消费状态均来自本地快照'),
+    syncCard(stabilityLevel,'稳定性采样',health.status||'未启用',health.problem_live_lag_sec?`问题 Tail 延迟 ${usageFactsDuration(health.problem_live_lag_sec)}`:'本地采样水位')
+  ].join('');
+  document.getElementById('syncUpdated').textContent='本地状态更新：'+new Date().toLocaleTimeString('zh-CN',{hour12:false});
+}
+async function syncLoadStatus(){
+  clearTimeout(syncTimer);
+  try{
+    const [ready,facts,history,health,channels]=await Promise.all([
+      syncFetchJSON('/ready'),syncFetchJSON('/usage/facts-status'),syncFetchJSON('/usage/facts-history'),syncFetchJSON('/stability/health'),syncFetchJSON('/channels/report?hours=24')
+    ]);
+    syncRender({ready,facts,history,health,channels});
+    const errors=[ready,facts,history,health,channels].filter(x=>!x.ok);
+    document.getElementById('syncError').innerHTML=errors.length?`<div class="usage-facts-state warn"><b>部分状态暂不可用</b><span>${errors.map(x=>esc(x.data&&x.data.error||('HTTP '+x.status))).join('；')}</span></div>`:'';
+  }catch(e){document.getElementById('syncError').innerHTML=`<div class="usage-facts-state warn"><b>同步状态加载失败</b><span>${esc(e.message)}</span></div>`}
+  finally{if(!document.getElementById('tab-sync').hidden)syncTimer=setTimeout(syncLoadStatus,30000)}
+}
+function syncActivate(){if(!syncTimer)syncLoadStatus()}
+function syncDeactivate(){if(syncTimer){clearTimeout(syncTimer);syncTimer=null}}
+
 // ═══════════ 用户用量(tab-usage):列表页=消费矩阵(日期×用户),点用户进详情 ═══════════
 // 与另两个 tab 不同:不定时自动刷新。聚合数字复用有界缓存；用户重新选择日期时强制取新，
 // 余额/用户资料仍实时取回。快速切换由可取消查询和后端单槽闸共同保护生产库。
 let IS_ROOT=false,usageInited=false,usageUsers=[],usageGroups=[],usageDailyChart=null,usageRange='7d';
+let usageFactsHistory=null,usageHistoryByUser=new Map();
+let usageFactsTimer=null;
 let usageDetail=null;      // null=列表视图;{type:'user'|'group', id, label}=详情视图
 let usageMxCache=null;     // 最近一次矩阵响应(分组筛选/搜索纯前端,复用缓存不重查生产库)
 let usageFilterGid=null;   // null=全部;0=未分组;>0=分组id
@@ -1591,19 +1778,33 @@ function paginate(elId,rows,page,onGo){
   }
   return {rows:rows.slice((p-1)*MGMT_PAGE_SIZE,p*MGMT_PAGE_SIZE),page:p};
 }
+function usageMemberHistoryHTML(userID){
+  if(!usageFactsHistory||!usageFactsHistory.enabled)return '<span class="muted">—</span>';
+  const h=usageHistoryByUser.get(+userID);
+  if(!h)return '<span class="badge badge-muted">等待发现</span>';
+  const pct=Math.max(0,Math.min(100,+h.coverage_percent||0));
+  const status=h.job_status==='paused'?'<span class="badge badge-red">已暂停</span>'
+    :(h.published?'<span class="badge badge-green">已发布</span>':'<span class="badge badge-yellow">仅管理员可见</span>');
+  const verify=h.verification_status==='complete'?'已校验':('校验 '+fmtNum(h.verified_hours)+'/'+fmtNum(h.total_hours));
+  const retry=IS_ROOT&&h.job_status==='paused'
+    ?` <button class="usage-history-retry" data-job-id="${esc(h.job_id||'')}" onclick="usageRetryHistory(${+h.user_id},this.dataset.jobId,this)">重试</button>`:'';
+  const repair=usageHistoryRepairHTML(h.user_id,h.published);
+  return `<div class="usage-history-inline">${status}<span>${esc(usageFactsStageLabel(h.stage))} ${pct.toFixed(1)}%</span><span class="muted">${verify}</span>${retry}${repair}</div>${h.last_error?`<div class="history-error" title="${esc(h.last_error)}">${esc(h.last_error)}</div>`:''}`;
+}
 function renderUsageUsers(){
   const uc=document.getElementById('usrMgmtCount'); if(uc)uc.textContent=usageUsers.length?`· ${usageUsers.length} 人`:'';
-  document.getElementById('thUsr').innerHTML='<tr><th style="white-space:nowrap">用户ID</th><th>用户名</th><th>邮箱</th><th>分组</th><th>备注</th><th>添加时间</th><th class="right"></th></tr>';
+  document.getElementById('thUsr').innerHTML='<tr><th style="white-space:nowrap">用户ID</th><th>用户名</th><th>邮箱</th><th>分组</th><th>全历史</th><th>备注</th><th>添加时间</th><th class="right"></th></tr>';
   const e=document.getElementById('tbUsr');
   // 搜索:用户ID / 用户名 / 邮箱 / 分组名
   const q=usrMgmtQuery;
   const rows=q?usageUsers.filter(u=>String(u.user_id).includes(q)||(u.username||'').toLowerCase().includes(q)||(u.email||'').toLowerCase().includes(q)||(u.group_name||'').toLowerCase().includes(q)):usageUsers;
   const up=paginate('usrPager',rows,usrMgmtPage,p=>{usrMgmtPage=p;renderUsageUsers()});
   usrMgmtPage=up.page; const pageRows=up.rows;
-  if(!rows.length){e.innerHTML=`<tr><td colspan="7" class="muted" style="text-align:center;padding:18px">${q?'没有匹配的用户':'名单为空——在上面输入 用户ID / 用户名 / 邮箱 添加'}</td></tr>`}
+  if(!rows.length){e.innerHTML=`<tr><td colspan="8" class="muted" style="text-align:center;padding:18px">${q?'没有匹配的用户':'名单为空——在上面输入 用户ID / 用户名 / 邮箱 添加'}</td></tr>`}
   else e.innerHTML=pageRows.map(u=>`<tr>
     <td class="num">#${u.user_id}</td><td>${esc(u.username||'—')}</td><td>${esc(u.email||'—')}</td>
     <td>${IS_ROOT?`<select class="uinput" style="padding:4px 8px;font-size:12px" onchange="usageSetUserGroup(${u.user_id},this.value,this)">${groupOptions(u.group_id)}</select>`:esc(u.group_name||'未分组')}</td>
+    <td>${usageMemberHistoryHTML(u.user_id)}</td>
     <td>${IS_ROOT?`<input class="uinput" style="padding:4px 8px;font-size:12px;width:200px" value="${esc(u.note||'')}" placeholder="备注(状态/联系人…)" onchange="usageSetUserNote(${u.user_id},this.value,this)">`:esc(u.note||'—')}</td>
     <td class="muted">${u.added_at?new Date(u.added_at*1000).toLocaleDateString():'—'}</td>
     <td class="right" style="white-space:nowrap">${IS_ROOT?`<a href="javascript:void 0" class="danger-link" onclick="usageDelUser(${u.user_id})">移除</a>`:''}</td></tr>`).join('');
@@ -1611,7 +1812,8 @@ function renderUsageUsers(){
 // ---- 客户分组管理(新建/编辑/解散) ----
 // 从矩阵缓存按 group_id 求区间消耗(与汇总卡同源;矩阵未加载时返回 null)
 function groupSpendMap(){
-  if(!usageMxCache||!usageMxCache.users)return null;
+  // 范围消费只依赖每日矩阵；矩阵域不可用时必须返回 null，不能把未知值当 $0。
+  if(!usageMxCache||usageMxCache._matrixAvailable===false||!usageMxCache.users)return null;
   const m={};
   for(const u of usageMxCache.users){const gid=+u.group_id||0;m[gid]=(m[gid]||0)+(+u.total_usd||0)}
   return m;
@@ -1656,7 +1858,7 @@ function renderGroupsManage(){
     <td class="right num">${balances&&balances.known[g.id]?fmtCost(balances.sums[g.id]||0):'<span class="muted">—</span>'}</td>
     <td class="right num">${usedMap?fmtCost(usedMap[g.id]||0):'<span class="muted">—</span>'}</td>
     <td class="right num">${spend?fmtCost(spend[g.id]||0):'<span class="muted">—</span>'}</td>
-    <td class="right" style="white-space:nowrap">${IS_ROOT?`<a href="javascript:void 0" style="color:var(--accent);margin-right:12px" onclick="grpPortalEdit(${g.id})">客户账号</a><a href="javascript:void 0" style="color:var(--accent);margin-right:12px" onclick="usageGrpEdit(${g.id})">编辑</a><a href="javascript:void 0" class="danger-link" onclick="usageGrpDissolve(${g.id})">解散</a>`:''}</td>
+    <td class="right" style="white-space:nowrap">${IS_ROOT?`<a href="javascript:void 0" style="color:var(--accent);margin-right:12px" onclick="grpPortalEdit(${g.id})">客户账号</a><a href="javascript:void 0" style="color:var(--accent);margin-right:12px" onclick="usageGrpEdit(${g.id})">编辑</a><a href="javascript:void 0" class="danger-link" onclick="usageGrpDissolve(${g.id})">删除</a>`:''}</td>
   </tr>`).join('');
 }
 // ---- 分组客户账号(客户端登录):行下内联编辑器 ----
@@ -1752,26 +1954,42 @@ async function usageGrpSave(id){
 }
 async function usageGrpDissolve(id){
   const g=usageGroups.find(x=>x.id===id); if(!g)return;
-  if(!confirm(`解散分组「${g.name}」?组内 ${g.members} 个用户回到未分组(不会移出监控名单)。`))return;
+  if(+g.members>0){alert(`不能删除公司「${g.name}」：仍有 ${g.members} 个成员。\n\n请先逐个“纠正所属公司”；系统不会把成员批量改成未分组。`);return}
+  if(g.portal_set){alert(`不能删除公司「${g.name}」：客户 Portal 仍已开通。\n\n请先在“客户账号”中关闭 Portal，确认旧会话失效后再删除。`);return}
+  if(!confirm(`确认删除空公司「${g.name}」？\n\n这只用于删除误建的公司资料。该公司当前无成员且 Portal 已关闭，用量 facts 不会被删除。`))return;
   const msg=document.getElementById('grpMsg');
   try{
-    const res=await fetch('/usage/groups/delete',{method:'POST',headers:usagePostHeaders,body:JSON.stringify({id})});
+    const {res,data:d}=await usageMutationPost('/usage/groups/delete',{id},`group-delete:${id}`);
     if(res.status===401){location.href='/login';return}
     if(res.status===403){alert('仅超级管理员可管理分组');return}
-    if(!res.ok){const d=await res.json().catch(()=>({}));msg.textContent=(d&&d.error)||('解散失败 '+res.status);return}
+    if(!res.ok){msg.textContent=(d&&d.error)||('删除失败 '+res.status);return}
     if(usageFilterGid===id)usageFilterGid=null;
     if(usageDetail&&usageDetail.type==='group'&&usageDetail.id===id){usageDetail=null;usageShowView()}
     await usageLoadUsers(); usageRefresh(); loadFollowUps();
-  }catch(e){msg.textContent='网络错误:'+e.message}
+  }catch(e){msg.textContent='网络错误:'+e.message+'；重试会复用同一幂等键'}
 }
 async function usageSetUserGroup(uid,gid,el){
+  const user=usageUsers.find(x=>+x.user_id===+uid),oldGid=+(user&&user.group_id||0),newGid=+gid;
+  if(oldGid===newGid)return;
+  const groupName=id=>id===0?'未分组':((usageGroups.find(x=>+x.id===+id)||{}).name||('#'+id));
+  const who=(user&&(user.username||user.email))||('#'+uid);
+  if(!confirm(`确认纠正「${who}」的所属公司？\n\n${groupName(oldGid)} → ${groupName(newGid)}\n\n该用户的全部历史用量将立即从原公司撤出，并纳入新公司。此操作只应用于纠正最初分错的公司。`)){
+    el.value=String(oldGid);return;
+  }
+  el.disabled=true;
   try{
-    const res=await fetch('/usage/users/group',{method:'POST',headers:usagePostHeaders,body:JSON.stringify({user_id:uid,group_id:+gid})});
+    const {res,data:d}=await usageMutationPost('/usage/users/group',{user_id:uid,group_id:newGid},`member-company:${uid}:${newGid}`);
     if(res.status===401){location.href='/login';return}
     if(res.status===403){alert('仅超级管理员可改分组');await usageLoadUsers();return}
-    if(!res.ok){const d=await res.json().catch(()=>({}));alert((d&&d.error)||('修改失败 '+res.status));await usageLoadUsers();return}
+    if(!res.ok){alert((d&&d.error)||('修改失败 '+res.status));await usageLoadUsers();return}
     await usageLoadUsers(); renderUsageList(); loadFollowUps();
-  }catch(e){alert('网络错误:'+e.message)}
+  }catch(e){
+    // 响应不确定时不刷新/替换当前 select，让用户再选一次
+    // 相同目标即可复用原 key 查回原结果。
+    el.value=String(oldGid);
+    alert('网络错误:'+e.message+'\n请重试；重试会复用同一幂等键。');
+  }
+  finally{if(el&&el.isConnected)el.disabled=false}
 }
 function flashSaved(el){ // 保存成功:绿框闪一下 + 尾巴打个 ✓,让"已生效"看得见
   el.classList.remove('saved-flash'); void el.offsetWidth; el.classList.add('saved-flash');
@@ -1793,34 +2011,61 @@ async function usageSetUserNote(uid,note,el){
 // POST 必须带 Accept:application/json —— requireRole 按此头区分「401 JSON」还是「302 跳登录页」。
 // 不带的话,会话过期时 fetch 会跟着 302 拿到登录页的 200 HTML,前端误判成功(假"已添加")。
 const usagePostHeaders={'Content-Type':'application/json','Accept':'application/json'};
+// 成员生命周期操作使用稳定幂等键：网络中断/5xx 后用户重试同一
+// 动作会复用原 key，双击并发也只会推进一次 revision。服务端给出
+// 明确的 <500 结果后才释放；响应不确定时保留到下次同动作。
+const usageMutationKeys=new Map();
+function usageNewMutationKey(){
+  if(globalThis.crypto&&typeof globalThis.crypto.randomUUID==='function')return 'usage-'+globalThis.crypto.randomUUID();
+  const bytes=new Uint8Array(16);
+  if(globalThis.crypto&&typeof globalThis.crypto.getRandomValues==='function')globalThis.crypto.getRandomValues(bytes);
+  else for(let i=0;i<bytes.length;i++)bytes[i]=Math.floor(Math.random()*256);
+  return 'usage-'+Array.from(bytes,b=>b.toString(16).padStart(2,'0')).join('');
+}
+async function usageMutationPost(path,payload,actionKey){
+  const slot=path+'|'+actionKey;
+  let requestId=usageMutationKeys.get(slot);
+  if(!requestId){requestId=usageNewMutationKey();usageMutationKeys.set(slot,requestId)}
+  const headers=Object.assign({},usagePostHeaders,{'Idempotency-Key':requestId});
+  try{
+    const res=await fetch(path,{method:'POST',headers,body:JSON.stringify(Object.assign({},payload,{request_id:requestId}))});
+    // fetch 在收到响应头后就会 resolve；必须等完整 JSON 体也读完，
+    // 才能把这次操作当成“已明确应答”并释放 key。
+    const data=await res.json();
+    if(res.status<500)usageMutationKeys.delete(slot);
+    return {res,data};
+  }catch(err){
+    // 无法知道服务端是否已提交，保留 key 让下次重试读取原审计结果。
+    throw err;
+  }
+}
 async function usageAddUser(){
   const inp=document.getElementById('usrInput'),msg=document.getElementById('usrMsg');
   const v=(inp.value||'').trim(); if(!v)return;
   msg.textContent='添加中…';
   try{
     const gid=+(document.getElementById('usrGroupSel')?.value||0);
-    const res=await fetch('/usage/users',{method:'POST',headers:usagePostHeaders,body:JSON.stringify({input:v,group_id:gid})});
+    const {res,data:d}=await usageMutationPost('/usage/users',{input:v,group_id:gid},`member-add:${v}:${gid}`);
     if(res.status===401){location.href='/login';return}
-    const d=await res.json().catch(()=>({}));
     if(res.status===403){msg.textContent='仅超级管理员可添加';return}
     if(!res.ok||!d.ok){msg.textContent=(d&&d.error)||('添加失败 '+res.status);return}
     msg.textContent='已添加:'+((d.user&&(d.user.username||d.user.email))||('#'+(d.user&&d.user.user_id||'')));
     inp.value='';
     await usageLoadUsers(); usageRefresh();
-  }catch(e){msg.textContent='网络错误:'+e.message}
+  }catch(e){msg.textContent='网络错误:'+e.message+'；重试会复用同一幂等键'}
 }
 async function usageDelUser(id){
-  if(!confirm('把用户 #'+id+' 移出检测名单?(只影响本监控的统计,不动主站)'))return;
+  if(!confirm('把用户 #'+id+' 移出检测名单？\n\n客户 Portal 会立即隐藏该用户；历史 facts 保留且不修改主站。以后重新加入时，需等停用缺口补齐后才重新对客户可见。'))return;
   const msg=document.getElementById('usrMsg');
   try{
-    const res=await fetch('/usage/users/delete',{method:'POST',headers:usagePostHeaders,body:JSON.stringify({user_id:id})});
+    const {res,data:d}=await usageMutationPost('/usage/users/delete',{user_id:id},`member-remove:${id}`);
     if(res.status===401){location.href='/login';return}
     if(res.status===403){alert('仅超级管理员可移除');return}
-    if(!res.ok){const d=await res.json().catch(()=>({}));msg.textContent=(d&&d.error)||('移除失败 '+res.status);return}
+    if(!res.ok){msg.textContent=(d&&d.error)||('移除失败 '+res.status);return}
     msg.textContent='';
     if(usageDetail&&usageDetail.type==='user'&&usageDetail.id===id)usageDetail=null,usageShowView(); // 正看着的用户被移除→回列表
     await usageLoadUsers(); usageRefresh();
-  }catch(e){msg.textContent='网络错误:'+e.message}
+  }catch(e){msg.textContent='网络错误:'+e.message+'；重试会复用同一幂等键'}
 }
 function usageRangeParams(forceFresh){
 	const q=new URLSearchParams();
@@ -1831,6 +2076,100 @@ function usageRangeParams(forceFresh){
 	if(forceFresh)q.set('refresh','1');
 	return q;
 }
+function usageFactsDay(ts){
+  if(!+ts)return '—';
+  return new Intl.DateTimeFormat('zh-CN',{timeZone:'Asia/Shanghai',year:'numeric',month:'2-digit',day:'2-digit'}).format(new Date(+ts*1000));
+}
+function usageFactsTime(ts){
+  if(!+ts)return '—';
+  return new Intl.DateTimeFormat('zh-CN',{timeZone:'Asia/Shanghai',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',hour12:false}).format(new Date(+ts*1000));
+}
+function usageFactsDuration(seconds){
+  let s=Math.max(0,Math.round(+seconds||0));
+  if(s<60)return s+'秒';
+  if(s<3600)return Math.ceil(s/60)+'分钟';
+  if(s<86400)return (s/3600).toFixed(s<36000?1:0)+'小时';
+  return (s/86400).toFixed(s<864000?1:0)+'天';
+}
+function usageFactsStageLabel(stage){
+  return ({
+    full_history_discover:'发现来源边界',full_history_backfill:'回填历史',full_history_tail:'追平尾部',full_history_verify:'持久校验',
+    full_history_repair:'精确日修复',full_history_repair_hour:'小时降档修复',full_history_source_audit_hour:'逐小时来源核验',full_history_local_audit:'本地滚动审计',
+    full_history_source_audit:'冷历史来源审计',full_history_recent_source_audit:'近14天来源审计'
+  })[stage]||'等待调度';
+}
+function usageFactsEstimateText(h){
+  const labels={complete:'已完成',boundary_discovery:'正在确定来源边界',warming:'正在积累速率样本',stalled:'超过1小时无持久进展',blocked:'有任务暂停，ETA 不可用',paused_disk:'磁盘水位阻断冷任务',source_circuit_open:'来源慢查询熔断中'};
+  if(h.estimate_status==='recent_raw_pages'&&h.estimated_seconds!=null)return '按最近15分钟分页速率估算剩余 '+usageFactsDuration(h.estimated_seconds);
+  if(h.estimate_status==='observed'&&h.estimated_seconds!=null)return '按已签收速率估算剩余 '+usageFactsDuration(h.estimated_seconds);
+  return labels[h.estimate_status]||'暂无可靠 ETA';
+}
+function usageHistoryRetryHTML(userID,jobID,status){
+  if(!IS_ROOT||status!=='paused')return '';
+  return `<button class="usage-history-retry" data-user-id="${+userID}" data-job-id="${esc(jobID||'')}" onclick="usageRetryHistory(+this.dataset.userId,this.dataset.jobId,this)">重试</button>`;
+}
+const usageHistoryRepairKeys=new Map();
+function usageHistoryRepairHTML(userID,published){
+  if(!IS_ROOT||!published)return '';
+  return ` <button class="usage-history-retry" onclick="usageRepairHistoryDay(${+userID},this)">修复单日</button>`;
+}
+function usageDefaultClosedDay(){
+  const d=new Date(Date.now()-86400000),parts=new Intl.DateTimeFormat('en-CA',{timeZone:'Asia/Shanghai',year:'numeric',month:'2-digit',day:'2-digit'}).formatToParts(d);
+  const p=Object.fromEntries(parts.map(x=>[x.type,x.value]));return `${p.year}-${p.month}-${p.day}`;
+}
+async function usageRepairHistoryDay(userID,btn){
+  if(!IS_ROOT)return;
+  const day=(prompt(`输入用户 #${userID} 待修复的已闭合 CST 自然日（YYYY-MM-DD）：`,usageDefaultClosedDay())||'').trim();
+  if(!/^\d{4}-\d{2}-\d{2}$/.test(day))return;
+  const reason=(prompt('请填写已核实的修复原因（会记入持久任务）：','管理员核实的单日事实差异')||'').trim();
+  if(!reason||!confirm(`确认撤下用户 #${userID} 的当前签名，并仅重建 ${day}？\n\n其他已签收成员继续服务；该用户通过独立来源控制对账后才会重新发布。`))return;
+  const slot=`${+userID}:${day}:${reason}`;
+  let requestID=usageHistoryRepairKeys.get(slot);
+  if(!requestID){requestID=`fh-day-repair:${+userID}:${day}:${crypto.randomUUID?crypto.randomUUID():Date.now()}`;usageHistoryRepairKeys.set(slot,requestID)}
+  if(btn)btn.disabled=true;
+  try{
+    const headers={...usagePostHeaders,'Idempotency-Key':requestID};
+    const res=await fetch('/usage/facts-history/repair',{method:'POST',headers,body:JSON.stringify({user_id:+userID,day,reason,request_id:requestID,confirm:'REPAIR_FULL_HISTORY_DAY'})});
+    if(res.status===401){location.href='/login';return}
+    const d=await res.json().catch(()=>({}));
+    if(res.status<500)usageHistoryRepairKeys.delete(slot);
+    if(!res.ok)throw new Error(d.error||('创建修复失败 '+res.status));
+    await usageLoadFactsStatus();
+  }catch(e){alert(e.message);if(btn)btn.disabled=false}
+}
+async function usageRetryHistory(userID,jobID,btn){
+  if(!IS_ROOT||!confirm(`确认重试用户 #${userID} 的全历史任务？\n\n重试仅会从持久游标续跑，不会清空已签收事实。`))return;
+  if(btn)btn.disabled=true;
+  try{
+    const res=await fetch('/usage/facts-history/retry',{method:'POST',headers:usagePostHeaders,body:JSON.stringify({user_id:+userID,job_id:jobID||''})});
+    if(res.status===401){location.href='/login';return}
+    const d=await res.json().catch(()=>({}));
+    if(!res.ok)throw new Error(d.error||('重试失败 '+res.status));
+    await usageLoadFactsStatus();
+  }catch(e){alert(e.message);if(btn)btn.disabled=false}
+}
+function updateUsageFactsHistoryMetadata(h){
+  usageFactsHistory=h;
+  usageHistoryByUser=new Map((h.members||[]).map(x=>[+x.user_id,x]));
+  if(usageInited)renderUsageUsers();
+  const archiveComplete=+h.pending_members===0&&+h.paused_members===0&&+h.failed_members===0&&h.total_known;
+  return !archiveComplete||+h.paused_maintenance>0||h.disk_blocked||h.bulk_circuit_state==='open';
+}
+async function usageLoadFactsStatus(){
+  clearTimeout(usageFactsTimer);
+  try{
+    const historyRes=await fetch('/usage/facts-history',{headers:{'Accept':'application/json'}});
+    if(historyRes.status===401){location.href='/login';return}
+    const h=await historyRes.json().catch(()=>({}));
+    if(!historyRes.ok)throw new Error(h.error||('全历史进度查询失败 '+historyRes.status));
+    const pending=h.enabled?updateUsageFactsHistoryMetadata(h):false;
+    if(!h.enabled){usageFactsHistory=null;usageHistoryByUser=new Map();if(usageInited)renderUsageUsers()}
+    usageFactsTimer=setTimeout(()=>{if(!document.getElementById('tab-usage').hidden)usageLoadFactsStatus()},pending?30000:300000);
+  }catch(e){
+    console.warn('用量事实元数据暂不可用',e);
+    usageFactsTimer=setTimeout(()=>{if(!document.getElementById('tab-usage').hidden)usageLoadFactsStatus()},60000);
+  }
+}
 // 快速连点/切范围时取消旧查询，并且只允许最后一次请求渲染。
 // 浏览器 abort 会沿 Gin request context 取消后端等待/查询，避免无用请求继续占用生产库闸门。
 let usageSeq=0,usageAbort=null;
@@ -1838,6 +2177,15 @@ function usageBeginRequest(){
   if(usageAbort)usageAbort.abort();
   usageAbort=new AbortController();
   return {seq:++usageSeq,signal:usageAbort.signal};
+}
+// 核心统计源短暂不可用时，服务端可能返回严格窗口内的最近成功结果。提示保持低干扰，
+// 但不把陈旧数据伪装成实时数据；错误响应仍按下方 alert 显示。
+function usageSetDataNotice(d){
+  const eb=document.getElementById('usageErr');
+  const msg=d&&d.matrix_available===false
+    ?(d.matrix_message||'每日消费明细暂不可用，余额和累计消耗仍可查看')
+    :(d&&d.data_stale?(d.data_message||'当前显示最近一次成功统计'):'' );
+  eb.innerHTML=msg?`<div class="muted" style="padding:0 2px 8px;font-size:12px">· ${esc(msg)}</div>`:'';
 }
 // 列表页:消费矩阵
 async function usageLoadMatrix(forceFresh){
@@ -1849,11 +2197,31 @@ async function usageLoadMatrix(forceFresh){
     const d=await res.json().catch(()=>({}));
     if(!res.ok){eb.innerHTML='<div class="alert">'+esc(d.error||('查询失败 '+res.status))+'</div>';return}
     if(d.enabled===false){eb.innerHTML='<div class="alert">未连接主站数据库(NEWAPI_LOG_DSN),用户用量不可用。</div>';return}
-    eb.innerHTML='';
-    renderUsageMatrix(d.matrix||{},!!d.empty);
-  }catch(e){if(e.name!=='AbortError'&&seq===usageSeq)eb.innerHTML='<div class="alert">加载失败:'+esc(e.message)+'</div>'}
+    usageSetDataNotice(d);
+    renderUsageMatrix(d.matrix||{},!!d.empty,d.matrix_available!==false,d.matrix_message||'',d);
+  }catch(e){
+    if(e.name!=='AbortError'&&seq===usageSeq){
+      eb.innerHTML='<div class="alert">加载失败:'+esc(e.message)+'</div>';
+      // 组织总览本身失败时，先前已进入加载态的成员矩阵不能继续显示“正在加载”。
+      // 这只影响该可选明细的空状态，不会改写其他页面或产生额外请求。
+      if(usageDetail&&usageDetail.type==='group')usageResetMemberMatrix('成员每日明细未加载');
+    }
+  }
 }
-function renderUsageMatrix(mx,empty){ usageMxCache=mx; usageMxCache._empty=empty; renderUsageList(); }
+function renderUsageMatrix(mx,empty,matrixAvailable,matrixMessage,meta){
+  usageMxCache=mx;
+  usageMxCache._empty=empty;
+  usageMxCache._matrixAvailable=matrixAvailable!==false;
+  usageMxCache._matrixMessage=matrixMessage||'';
+  usageMxCache._rangePartial=!!(meta&&meta.range_partial);
+  usageMxCache._rangeMessage=(meta&&meta.range_message)||'';
+  usageMxCache._membershipPartial=!!(meta&&meta.membership_partial);
+  usageMxCache._publishedMembers=+(meta&&meta.published_members)||0;
+  usageMxCache._activeMembers=+(meta&&meta.active_members)||0;
+  usageMxCache._requestedFrom=(meta&&meta.requested_from)||mx.from||'';
+  usageMxCache._requestedTo=(meta&&meta.requested_to)||mx.to||'';
+  renderUsageList();
+}
 // 可见用户 = 分组筛选 ∩ 搜索(公司/用户名/邮箱)
 function usageVisibleUsers(){
   let us=(usageMxCache&&usageMxCache.users)||[];
@@ -1864,7 +2232,7 @@ function usageVisibleUsers(){
   return us;
 }
 // ═══ 待跟进 ═══
-let followCompanies=[],followMemberTotal=0,usageSettings=null,followOpen=false;
+let followCompanies=[],followMemberTotal=0,followAvailable=false,followMessage='',followCoverage=null,usageSettings=null,followOpen=false;
 let fuOpenCos=new Set(); // 展开中的公司 gid
 function toggleFollowBody(){
   followOpen=!followOpen;
@@ -1876,9 +2244,16 @@ async function loadFollowUps(){
     const res=await fetch('/usage/followups',{headers:{'Accept':'application/json'}});
     if(res.status===401){location.href='/login';return}
     const d=await res.json().catch(()=>({}));
-    if(d.enabled===false)return;
-    followCompanies=d.companies||[]; followMemberTotal=d.member_total||0;
-  }catch(e){followCompanies=[];followMemberTotal=0}
+    if(!res.ok){
+      followAvailable=false;followMessage=d.message||d.error||'待跟进数据暂时无法读取';followCoverage=null;followCompanies=[];followMemberTotal=0;
+    }else{
+      if(d.enabled===false)return;
+      followAvailable=d.available!==false;
+      followMessage=d.message||'';
+      followCoverage={availableDays:+d.available_days||0,requestedDays:+d.requested_days||(+d.window_days||30),from:d.coverage_from||'',to:d.coverage_to||''};
+      followCompanies=d.companies||[]; followMemberTotal=d.member_total||0;
+    }
+  }catch(e){followAvailable=false;followMessage='待跟进数据暂时无法读取';followCoverage=null;followCompanies=[];followMemberTotal=0}
   renderFollowUps();
 }
 const fuIcon=reasons=>{const j=(reasons||[]).join('');return j.includes('无消费')||j.includes('流失')?'⚠️':(j.includes('余额低')?'💵':'🔔')};
@@ -1917,6 +2292,12 @@ function renderFollowUps(){
   const card=document.getElementById('followCard'),box=document.getElementById('followList'),badge=document.getElementById('followCount');
   if(!usageGroups.length){card.style.display='none';return} // 没建分组=没开始用客户管理,不显示
   card.style.display='';
+  if(!followAvailable){
+    badge.textContent='—';badge.className='fu-badge zero';
+    const cov=followCoverage&&followCoverage.availableDays?`<div class="muted" style="margin-top:5px;font-size:12px">已发布 ${followCoverage.availableDays}/${followCoverage.requestedDays} 天${followCoverage.from&&followCoverage.to?' · '+esc(followCoverage.from)+' 至 '+esc(followCoverage.to):''}</div>`:'';
+    box.innerHTML=`<div class="muted" style="padding:14px 8px">${esc(followMessage||'历史每日消费正在补全，暂不生成待跟进结论')}${cov}</div>`;
+    return;
+  }
   // 分级:urgent(30天内有消费的客户出状况)按公司展示并计入红徽章;info(长期沉默)收进底部折叠区
   const urgentCos=[],silent=[];
   followCompanies.forEach(co=>{
@@ -2052,6 +2433,8 @@ function renderGrpCards(){
   const box=document.getElementById('usageGrpCards');
   const all=(usageMxCache&&usageMxCache.users)||[];
   if(!all.length){box.innerHTML='';return}
+  const matrixAvailable=!usageMxCache||usageMxCache._matrixAvailable!==false;
+  const rangePartial=!!(usageMxCache&&usageMxCache._rangePartial);
   const agg=new Map(); // gid -> {name, n, total, bal, balKnown}
   for(const u of all){
     const gid=+u.group_id||0;
@@ -2079,11 +2462,11 @@ function renderGrpCards(){
     return `<div class="grpcard${usageFilterGid===gid?' active':''}" data-gid="${gid}">
       <div class="g-top"><span class="g-ico">${gid===0?'📂':'🏢'}</span><span class="g-nm" title="${esc(a.name)}">${esc(a.name)}</span><a href="javascript:void 0" class="g-link" data-gdetail="${gid}" data-glabel="${esc(a.name)}">详情 →</a></div>
       <div class="g-sub">${a.n} 人 · 总消耗 <b style="color:#fbbf24">${fmtCost(a.used)}</b></div>
-      <div class="g-sub">余额 ${a.balKnown?`<span style="color:#34d399">${fmtCost(a.bal)}</span>`:'—'} · 范围 ${fmtCost(a.total)}</div>
+      <div class="g-sub">余额 ${a.balKnown?`<span style="color:#34d399">${fmtCost(a.bal)}</span>`:'—'} · ${rangePartial?'已展示范围':'范围'} ${matrixAvailable?fmtCost(a.total):'—'}</div>
     </div>`;};
   const allCard=`<div class="grpcard g-all${usageFilterGid===null?' active':''}" data-gid="">
       <div class="g-top"><span class="g-ico">👥</span><span class="g-nm">全部用户</span></div>
-      <div class="g-sub">${all.length} 人 · 范围消耗 ${fmtCost(totalAll)}</div>
+      <div class="g-sub">${all.length} 人 · ${rangePartial?'已展示范围消费':'范围消费'} ${matrixAvailable?fmtCost(totalAll):'—'}</div>
       <div class="g-sub muted" style="font-size:11px">总消耗见页顶</div>
     </div>`;
   const toggle=folded>0
@@ -2110,43 +2493,96 @@ function renderUsageSummary(){
   const el=document.getElementById('usageSummary'); if(!el)return;
   const users=(usageMxCache&&usageMxCache.users)||[];
   if(!users.length){el.innerHTML='';return}
+  const matrixAvailable=!usageMxCache||usageMxCache._matrixAvailable!==false;
+  const rangePartial=!!(usageMxCache&&usageMxCache._rangePartial);
   let used=0,range=0,bal=0,balKnown=false;
   for(const u of users){used+=(+u.total_used_usd||0);range+=(+u.total_usd||0);if(u.balance_usd!=null){bal+=(+u.balance_usd);balKnown=true}}
   el.innerHTML=`<span class="us-item"><span class="us-l">关注客户累计总消耗</span><span class="us-v amber" title="当前关注名单的终身累计，不受日期范围影响">${fmtCost(used)}</span></span>`
-    +`<span class="us-sep"></span><span class="us-item"><span class="us-l">范围消费</span><span class="us-v" title="所选日期范围内消费合计">${fmtCost(range)}</span></span>`
+    +`<span class="us-sep"></span><span class="us-item"><span class="us-l">${rangePartial?'已展示范围消费':'范围消费'}</span><span class="us-v" title="${matrixAvailable?(rangePartial?'当前已展示日期范围内消费合计':'所选日期范围内消费合计'):'每日消费明细暂不可用'}">${matrixAvailable?fmtCost(range):'—'}</span></span>`
     +`<span class="us-sep"></span><span class="us-item"><span class="us-l">当前总余额</span><span class="us-v green">${balKnown?fmtCost(bal):'—'}</span></span>`
     +`<span class="us-sep"></span><span class="us-item"><span class="us-l">关注客户数</span><span class="us-v">${fmtNum(users.length)}</span></span>`;
 }
 // 消费矩阵渲染:行=用户 × 列=日期(格=当日消耗)+ 余额/累计总消耗/范围 + 合计行,含热力与越权前的用户链接。
 // 复用于两处:列表页(不传 thId,默认目标 thUsageMx/tbUsageMx)与组织详情的「组内成员」矩阵(传目标表 id)。
 // isList(=未传 thId)时才更新页顶统计范围提示、空态用列表文案、合计带"筛选"字样;组内成员矩阵不走这些列表专属逻辑。
-function sizeUsageMatrix(table,dayCount){
+function usageMatrixTextWidth(value,font){
+  const text=String(value||'');if(!text)return 0;
+  const canvas=document.createElement('canvas'),ctx=canvas.getContext('2d');
+  if(!ctx)return text.length*8;
+  ctx.font=font;return Math.ceil(ctx.measureText(text).width);
+}
+function sizeUsageMatrix(table,dayCount,users){
   if(!table)return;
-  // 三个冻结身份列 + 日期列 + 范围合计列。窄屏宁可横向滚动，也不压扁日期和金额。
-  table.style.setProperty('--mx-table-min',(150+132+142+Math.max(1,dayCount)*92+104)+'px');
-  requestAnimationFrame(()=>{
-    const cells=table.tHead&&table.tHead.rows[0]&&table.tHead.rows[0].cells;
-    if(!cells||cells.length<3)return;
-    const wrap=table.closest('.mxwrap');if(!wrap)return;
-    const first=Math.round(cells[0].getBoundingClientRect().width);
-    const second=Math.round(cells[1].getBoundingClientRect().width);
-    wrap.style.setProperty('--mx-left-2',first+'px');
-    wrap.style.setProperty('--mx-left-3',(first+second)+'px');
-  });
+  const wrap=table.closest('.mxwrap');if(!wrap)return;
+  if(users)table._usageMatrixUsers=users;
+  const rows=table._usageMatrixUsers||[];
+  const bodyFont=getComputedStyle(document.body).fontFamily||'sans-serif';
+  let longest=0;
+  for(const u of rows){
+    longest=Math.max(longest,
+      usageMatrixTextWidth(u.username||u.email||('#'+u.user_id),'14px '+bodyFont),
+      usageMatrixTextWidth(u.email||'','11px '+bodyFont));
+  }
+  // 仅调整“用户”列：常见账号尽量完整显示，极长账号继续省略；不改变整张
+  // 表格的宽度模式。窄屏由既有横向滚动承接，余额、日期等列不被压缩。
+  const wrapWidth=wrap.clientWidth||960;
+  const minWidth=wrapWidth<900?184:196;
+  const maxWidth=wrapWidth<1200?216:232;
+  const userWidth=Math.min(maxWidth,Math.max(minWidth,longest+28));
+  wrap.style.setProperty('--mx-user-w',userWidth+'px');
+  wrap.style.setProperty('--mx-user-text-w',Math.max(160,userWidth-24)+'px');
+  wrap.style.setProperty('--mx-left-2',userWidth+'px');
+  wrap.style.setProperty('--mx-left-3',(userWidth+132)+'px');
+  // 只把首列的实际宽度带回既有最小宽度公式，其他列和 table 宽度规则不变。
+  const minimumWidth=userWidth+132+142+Math.max(1,dayCount)*92+104;
+  table.style.setProperty('--mx-table-min',minimumWidth+'px');
 }
 function resizeUsageMatrices(){
   for(const id of ['usageMxTable','usageMemMxTable']){
     const table=document.getElementById(id);if(!table)continue;
     const days=Math.max(0,(table.tHead?.rows[0]?.cells.length||4)-4);
-    sizeUsageMatrix(table,days);
+    sizeUsageMatrix(table,days,table._usageMatrixUsers||[]);
   }
 }
 window.addEventListener('resize',resizeUsageMatrices);
 function drawUsageMatrix(mx,users,empty,thId,tbId){
   const isList=!thId; thId=thId||'thUsageMx'; tbId=tbId||'tbUsageMx';
-  if(isList)document.getElementById('usageRangeNote').textContent=mx.from?('统计范围 '+mx.from+' ~ '+mx.to+'(CST)'):'';
+  const rangePartial=!!mx._rangePartial;
+  if(isList){
+    let scope=mx.from
+    ?(rangePartial
+      ?`查询范围 ${mx._requestedFrom} ~ ${mx._requestedTo} · 当前展示 ${mx.from} ~ ${mx.to}(CST)`
+      :`统计范围 ${mx.from} ~ ${mx.to}(CST)`)
+    :'';
+    if(mx._membershipPartial)scope+=(scope?' · ':'')+`当前包含已签收成员 ${fmtNum(mx._publishedMembers)}/${fmtNum(mx._activeMembers)}`;
+    document.getElementById('usageRangeNote').textContent=scope;
+  }
   const days=mx.days||[];
   const th=document.getElementById(thId),tb=document.getElementById(tbId);
+  const matrixAvailable=mx._matrixAvailable!==false;
+  const table=th.closest('table');
+  table.classList.toggle('mx-summary-only',!matrixAvailable);
+  // 每日矩阵是独立资料域。它不可用时，仍保留从 users 快照取得的成员、余额和
+  // 终身累计值；范围消费和每日格子一律不渲染为零，避免造成错误的财务判断。
+  if(!matrixAvailable){
+    th.innerHTML='<tr><th>用户</th><th class="right" style="color:#34d399">余额</th><th class="right" style="color:#fbbf24" title="累计总消耗:该用户终身消耗,不受日期范围影响">累计总消耗</th></tr>';
+    if(!users.length){
+      tb.innerHTML=`<tr><td colspan="3" class="muted" style="text-align:center;padding:22px">${esc(mx._matrixMessage||'每日消费明细暂不可用，余额和累计消耗仍可查看')}</td></tr>`;
+      sizeUsageMatrix(table,0,users);return;
+    }
+    const tr=u=>{
+      const label=u.username||u.email||('#'+u.user_id);
+      const bal=u.balance_usd==null?'<span class="muted">—</span>':(u.balance_usd<0?`<span style="color:#f87171;font-weight:600">${fmtCost(u.balance_usd)}</span>`:`<span style="color:#34d399">${fmtCost(u.balance_usd)}</span>`);
+      const used=u.total_used_usd==null?'<span class="muted">—</span>':`<b style="color:#fbbf24">${fmtCost(u.total_used_usd)}</b>`;
+      const fullLabel=[u.username||('#'+u.user_id),u.email].filter(Boolean).join(' · ');
+      return `<tr><td><a href="javascript:void 0" class="ucell" title="${esc(fullLabel)}" data-uid="${u.user_id}" data-label="${esc(label)}" data-uname="${esc(u.username||'')}" data-umail="${esc(u.email||'')}" data-ugrp="${esc(u.group_name||'')}" data-unote="${esc(u.note||'')}" style="color:var(--accent);text-decoration:none"><span class="u-name">${esc(u.username||'#'+u.user_id)}</span><span class="u-mail">${esc(u.email||'—')}</span></a></td><td class="right num" title="主站当前余额">${bal}</td><td class="right num" title="主站累计总消耗(终身)">${used}</td></tr>`;
+    };
+    const totalUsed=users.reduce((s,u)=>s+(+u.total_used_usd||0),0);
+    tb.innerHTML=`<tr><td colspan="3" class="muted" style="text-align:center;padding:14px">${esc(mx._matrixMessage||'每日消费明细暂不可用，余额和累计消耗仍可查看')}</td></tr>`
+      +users.map(tr).join('')
+      +`<tr class="mxfoot"><td><b>${isList&&(usageFilterGid!==null||usageSearchText)?'筛选合计':'合计'}</b></td><td></td><td class="right num" title="可见用户累计总消耗合计"><b style="color:#fbbf24">${fmtCost(totalUsed)}</b></td></tr>`;
+    sizeUsageMatrix(th.closest('table'),0,users);return;
+  }
   if(!users.length){
     th.innerHTML='';
     tb.innerHTML=`<tr><td class="muted" style="text-align:center;padding:22px">${!isList?'本组范围内暂无成员消费':(empty?'名单为空——在下面「用户管理」里添加要统计的用户':(usageFilterGid!==null||usageSearchText?'没有匹配的用户(试试清掉筛选/搜索)':'范围内无数据'))}</td></tr>`;
@@ -2164,7 +2600,7 @@ function drawUsageMatrix(mx,users,empty,thId,tbId){
   (mx.cells||[]).forEach(c=>{if(!vis.has(c.user_id))return;cell.set(c.user_id+'|'+c.date,c);if(c.cost_usd>maxCost)maxCost=c.cost_usd});
   const heat=v=>v>0&&maxCost>0?` style="background:rgba(245,158,11,${(0.08+0.30*Math.sqrt(v/maxCost)).toFixed(3)})"`:''; // 感知刻度:sqrt 让中段金额也可见,不只头部一人有热力
   const fmtCell=v=>v>=0.005?'$'+v.toFixed(2):(v>0?'<$0.01':'$0.00');
-  th.innerHTML='<tr><th>用户</th><th class="right" style="color:#34d399">余额</th><th class="right" style="color:#fbbf24" title="累计总消耗:该用户终身消耗,不受下方日期范围影响">累计总消耗</th>'+days.map(d=>`<th class="right" title="${esc(d)} · 单元格显示消费">${esc(d.slice(5))}</th>`).join('')+'<th class="right">范围消费</th></tr>';
+  th.innerHTML='<tr><th>用户</th><th class="right" style="color:#34d399">余额</th><th class="right" style="color:#fbbf24" title="累计总消耗:该用户终身消耗,不受下方日期范围影响">累计总消耗</th>'+days.map(d=>`<th class="right" title="${esc(d)} · 单元格显示消费">${esc(d.slice(5))}</th>`).join('')+`<th class="right" title="${rangePartial?'当前已展示日期范围内消费合计':'所选日期范围内消费合计'}">${rangePartial?'已展示范围消费':'范围消费'}</th></tr>`;
   const daySum={};
   tb.innerHTML=users.map(u=>{
     let tds='';
@@ -2176,27 +2612,51 @@ function drawUsageMatrix(mx,users,empty,thId,tbId){
     const label=u.username||u.email||('#'+u.user_id);
     const bal=u.balance_usd==null?'<span class="muted">—</span>':(u.balance_usd<0?`<span style="color:#f87171;font-weight:600">${fmtCost(u.balance_usd)}</span>`:`<span style="color:#34d399">${fmtCost(u.balance_usd)}</span>`); // 负余额=催充值头号信号,必须红
     const used=u.total_used_usd==null?'<span class="muted">—</span>':`<b style="color:#fbbf24">${fmtCost(u.total_used_usd)}</b>`;
-    return `<tr><td><a href="javascript:void 0" class="ucell" data-uid="${u.user_id}" data-label="${esc(label)}" data-uname="${esc(u.username||'')}" data-umail="${esc(u.email||'')}" data-ugrp="${esc(u.group_name||'')}" data-unote="${esc(u.note||'')}" style="color:var(--accent);text-decoration:none"><span class="u-name">${esc(u.username||'#'+u.user_id)}</span><span class="u-mail">${esc(u.email||'—')}</span></a></td><td class="right num" title="主站当前余额">${bal}</td><td class="right num" title="主站累计总消耗(终身)">${used}</td>${tds}<td class="right num">${fmtCost(u.total_usd)}</td></tr>`;
+    const fullLabel=[u.username||('#'+u.user_id),u.email].filter(Boolean).join(' · ');
+    return `<tr><td><a href="javascript:void 0" class="ucell" title="${esc(fullLabel)}" data-uid="${u.user_id}" data-label="${esc(label)}" data-uname="${esc(u.username||'')}" data-umail="${esc(u.email||'')}" data-ugrp="${esc(u.group_name||'')}" data-unote="${esc(u.note||'')}" style="color:var(--accent);text-decoration:none"><span class="u-name">${esc(u.username||'#'+u.user_id)}</span><span class="u-mail">${esc(u.email||'—')}</span></a></td><td class="right num" title="主站当前余额">${bal}</td><td class="right num" title="主站累计总消耗(终身)">${used}</td>${tds}<td class="right num">${fmtCost(u.total_usd)}</td></tr>`;
   }).join('')
   +`<tr class="mxfoot"><td><b>${isList&&(usageFilterGid!==null||usageSearchText)?'筛选合计':'合计'}</b></td><td></td><td class="right num" title="可见用户累计总消耗合计"><b style="color:#fbbf24">${fmtCost(users.reduce((s,u)=>s+(+u.total_used_usd||0),0))}</b></td>${days.map(d=>`<td class="right num" title="${esc(d)}${d in daySum?` · $${daySum[d].toFixed(4)}`:''}"><b>${d in daySum?fmtCell(daySum[d]):'<span class="muted">—</span>'}</b></td>`).join('')}<td class="right num"><b>${fmtCost(users.reduce((s,u)=>s+(+u.total_usd||0),0))}</b></td></tr>`;
-  sizeUsageMatrix(th.closest('table'),days.length);
+  sizeUsageMatrix(th.closest('table'),days.length,users);
 }
 // 详情页:单用户 或 整个公司(分组)的每日/令牌分组/模型聚合
+// 组织详情中的成员矩阵是可选明细：它失败时绝不能沿用上一组或上一时间范围的数据，
+// 也不能让已经成功加载的组织总览随之变成全页错误。
+function usageSetMemberMatrixState(message){
+  const state=document.getElementById('usageMemState');
+  if(state)state.textContent=message?' · '+message:'';
+}
+function usageResetMemberMatrix(message){
+  usageSetMemberMatrixState(message||'');
+  document.getElementById('thUsageMemMx').innerHTML='<tr><th>成员每日明细</th></tr>';
+  document.getElementById('tbUsageMemMx').innerHTML=`<tr><td class="muted" style="text-align:center;padding:18px">${esc(message||'正在加载成员每日明细…')}</td></tr>`;
+  renderUsageMemRank(null);
+}
+function usageRenderMemberMatrix(mx,gid){
+  if(mx&&mx._matrixAvailable===false){
+    usageResetMemberMatrix(mx._matrixMessage||'成员每日明细暂不可用，其他统计正常');
+    return;
+  }
+  const mem=(mx.users||[]).filter(u=>(+u.group_id||0)===gid);
+  usageSetMemberMatrixState('');
+  drawUsageMatrix(mx,mem,false,'thUsageMemMx','tbUsageMemMx');
+  renderUsageMemRank(mem); // 成员消耗排行(对齐客户页)
+}
 async function usageLoadDetail(forceFresh){
   if(!usageDetail)return;
   // 切用户详情:立即隐藏组织专属块(组内成员/成员排行),避免异步加载时残留上一个组织的内容
-  if(usageDetail.type!=='group'){document.getElementById('usageMemCard').hidden=true;document.getElementById('usageMemRankCard').hidden=true;}
+  if(usageDetail.type!=='group'){
+    document.getElementById('usageMemCard').hidden=true;
+    document.getElementById('usageMemRankCard').hidden=true;
+    usageSetMemberMatrixState('');
+  }else{
+    // 不在此处复用旧矩阵：日期或组织切换时，旧数据哪怕只闪现一瞬也会误导用户。
+    document.getElementById('usageMemCard').hidden=false;
+    usageResetMemberMatrix('正在加载成员每日明细…');
+  }
   const eb=document.getElementById('usageErr'),req=usageBeginRequest(),seq=req.seq;
 	const q=usageRangeParams(!!forceFresh);
   if(usageDetail.type==='token'){q.set('user_id',usageDetail.uid);q.set('token_id',usageDetail.id);}
   else q.set(usageDetail.type==='group'?'group_id':'user_id',usageDetail.id);
-  // 组织详情:矩阵缓存可用时先秒出组内成员/排行(不等 stats 查库;范围若变后面会按新范围重画)
-  if(usageDetail.type==='group'&&usageMxCache&&usageMxCache.users&&usageMxCache.users.length){
-    document.getElementById('usageMemCard').hidden=false;
-    const mem0=usageMxCache.users.filter(u=>(+u.group_id||0)===usageDetail.id);
-    drawUsageMatrix(usageMxCache,mem0,false,'thUsageMemMx','tbUsageMemMx');
-    renderUsageMemRank(mem0);
-  }
   try{
     const res=await fetch('/usage/stats?'+q,{headers:{'Accept':'application/json'},signal:req.signal});
     if(seq!==usageSeq)return;
@@ -2204,8 +2664,16 @@ async function usageLoadDetail(forceFresh){
     const d=await res.json().catch(()=>({}));
     if(!res.ok){eb.innerHTML='<div class="alert">'+esc(d.error||('查询失败 '+res.status))+'</div>';return}
     if(d.enabled===false){eb.innerHTML='<div class="alert">未连接主站数据库(NEWAPI_LOG_DSN),用户用量不可用。</div>';return}
-    eb.innerHTML='';
-    renderUsage(d.stats||{},d.balance_usd,d.members,d.total_used_usd,d.by_token,d.token);
+    usageSetDataNotice(d);
+    const detailStats=d.stats||{};
+    detailStats._rangePartial=!!d.range_partial;
+    detailStats._rangeMessage=d.range_message||'';
+    detailStats._requestedFrom=d.requested_from||detailStats.from||'';
+    detailStats._requestedTo=d.requested_to||detailStats.to||'';
+    renderUsage(
+      detailStats,d.balance_usd,d.members,d.total_used_usd,d.by_token,d.token,
+      d.token_data_available,d.token_data_message,d.stats_available,d.stats_message
+    );
     // 组织详情:补「组内成员」矩阵,内容对齐该客户在报表页看到的(独立拉矩阵,始终按当前日期范围)
     const memCard=document.getElementById('usageMemCard');
     if(usageDetail.type==='group'){
@@ -2217,22 +2685,31 @@ async function usageLoadDetail(forceFresh){
 		const mr=await fetch('/usage/matrix?'+usageRangeParams(!!forceFresh),{headers:{'Accept':'application/json'},signal:req.signal});
         if(seq!==usageSeq)return;
         const md=await mr.json().catch(()=>({}));
-        if(mr.ok&&md.matrix)mx=md.matrix;
+        if(mr.ok&&md.matrix){
+          mx=md.matrix;
+          mx._matrixAvailable=md.matrix_available!==false;
+          mx._matrixMessage=md.matrix_message||'';
+          mx._rangePartial=!!md.range_partial;
+          mx._rangeMessage=md.range_message||'';
+          mx._requestedFrom=md.requested_from||mx.from||'';
+          mx._requestedTo=md.requested_to||mx.to||'';
+        }
       }
       if(seq!==usageSeq)return;
       if(mx){
-        const gid=usageDetail.id;
-        const mem=(mx.users||[]).filter(u=>(+u.group_id||0)===gid);
-        drawUsageMatrix(mx,mem,false,'thUsageMemMx','tbUsageMemMx');
-        renderUsageMemRank(mem); // 成员消耗排行(对齐客户页)
+        usageRenderMemberMatrix(mx,usageDetail.id);
+      }else{
+        // /usage/matrix 是独立来源；失败只降级成员明细，不覆盖已渲染的组织总览。
+        usageResetMemberMatrix('成员每日明细暂不可用，其他统计正常');
       }
-    }else{memCard.hidden=true;renderUsageMemRank(null);}
+    }else{memCard.hidden=true;usageSetMemberMatrixState('');renderUsageMemRank(null);}
   }catch(e){if(e.name!=='AbortError'&&seq===usageSeq)eb.innerHTML='<div class="alert">加载失败:'+esc(e.message)+'</div>'}
 }
 const USAGE_DIM_HEAD=`<tr><th>名称</th><th class="right">请求</th><th class="right">Tokens</th><th class="right">消费</th></tr>`;
-function renderUsageDim(th,tb,rows,truncated){
+function renderUsageDim(th,tb,rows,truncated,unavailableMessage){
   document.getElementById(th).innerHTML=USAGE_DIM_HEAD;
   const e=document.getElementById(tb);
+  if(unavailableMessage){e.innerHTML=`<tr><td colspan="4" class="muted" style="text-align:center;padding:18px">${esc(unavailableMessage)}</td></tr>`;return}
   if(!rows||!rows.length){e.innerHTML='<tr><td colspan="4" class="muted" style="text-align:center;padding:18px">范围内无数据</td></tr>';return}
   e.innerHTML=rows.map(r=>`<tr><td>${esc(r.key||'—')}</td><td class="right num">${fmtNum(r.requests)}</td><td class="right num">${fmtNum(r.tokens)}</td><td class="right num">${fmtCost(r.cost_usd)}</td></tr>`).join('')
     +(truncated?'<tr><td colspan="4" class="muted" style="text-align:center;padding:10px">维度较多，仅展示消费最高的前 300 项；汇总与每日趋势仍按完整数据计算。</td></tr>':'');
@@ -2240,13 +2717,15 @@ function renderUsageDim(th,tb,rows,truncated){
 // 按令牌:密钥脱敏(服务端已打码,前端不接触明文),仅单用户详情显示,公司详情隐藏。
 // 该用户全部现存令牌都列出(范围内零用量补0);已删除但范围内有消费的沉底单独分区+标记,保证分项加总=范围消耗合计。
 // 累计总消耗=创建至今终身值,"—"=令牌已不可查(硬删/老日志)。
-function renderUsageTokens(rows){
+function renderUsageTokens(rows,unavailable,message,rangePartial){
   const card=document.getElementById('usageTokCard');
-  if(rows===undefined){card.hidden=true;return} // 公司详情:无此维度
+  const state=document.getElementById('usageTokState');
+  if(rows===undefined){card.hidden=true;if(state)state.textContent='';return} // 公司详情:无此维度
   card.hidden=false;
-  document.getElementById('thUsageTok').innerHTML='<tr><th>所属用户</th><th>令牌名称</th><th>密钥</th><th>分组</th><th class="right">请求</th><th class="right">Tokens</th><th class="right">范围消费</th><th class="right">累计总消耗</th></tr>';
+  if(state)state.textContent=unavailable?' · '+(message||'令牌明细暂不可用，其他统计正常'):'';
+  document.getElementById('thUsageTok').innerHTML=`<tr><th>所属用户</th><th>令牌名称</th><th>密钥</th><th>分组</th><th class="right">请求</th><th class="right">Tokens</th><th class="right">${rangePartial?'已展示范围消费':'范围消费'}</th><th class="right">累计总消耗</th></tr>`;
   const e=document.getElementById('tbUsageTok');
-  if(!rows||!rows.length){e.innerHTML='<tr><td colspan="8" class="muted" style="text-align:center;padding:18px">该用户暂无令牌记录</td></tr>';return}
+  if(!rows||!rows.length){e.innerHTML=`<tr><td colspan="8" class="muted" style="text-align:center;padding:18px">${unavailable?'令牌明细暂不可用，请稍后刷新':'该用户暂无令牌记录'}</td></tr>`;return}
   const tr=r=>{
     const mk=r.masked_key?`<span class="maskkey">${esc(r.masked_key)}</span>`:'<span class="muted">—</span>';
     const grp=r.group?esc(r.group):'<span class="muted">默认</span>';
@@ -2305,38 +2784,47 @@ function renderUsagePie(elId,rows,show){
   },true);
   setTimeout(()=>ch.resize(),40);
 }
-function renderUsage(st,balanceUSD,members,totalUsedUSD,byToken,tokenMeta){
-  document.getElementById('usageRangeNote').textContent=st.from?('统计范围 '+st.from+' ~ '+st.to+'(CST)'):'';
+function renderUsage(st,balanceUSD,members,totalUsedUSD,byToken,tokenMeta,tokenDataAvailable,tokenDataMessage,statsAvailable,statsMessage){
+  statsAvailable=statsAvailable!==false;
+  statsMessage=statsMessage||'范围统计暂不可用，余额和累计消耗仍可查看';
+  const rangePartial=!!st._rangePartial;
+  document.getElementById('usageRangeNote').textContent=st.from
+    ?((rangePartial
+      ?`查询范围 ${st._requestedFrom} ~ ${st._requestedTo} · 当前展示 ${st.from} ~ ${st.to}(CST)`
+      :`统计范围 ${st.from} ~ ${st.to}(CST)`)+(statsAvailable?'':' · '+statsMessage))
+    :'';
   const s=st.summary||{};
   const isGrp=members!=null,isTok=usageDetail&&usageDetail.type==='token';
   // 小结卡:组织详情对齐客户报表页(累计/范围/余额/成员数);令牌详情=该令牌口径(密钥/累计/范围);用户详情保留原有
   const cards=isTok?[
     ['密钥',tokenMeta&&tokenMeta.masked_key?`<span style="font-size:14px;white-space:nowrap;font-family:ui-monospace,SFMono-Regular,Menlo,monospace">${esc(tokenMeta.masked_key)}</span>`:'—','#94a3b8','stat-card-wide'],
-    ['总请求',fmtNum(s.requests),'#6366f1'],
-    ['总 Tokens',`<span title="${fmtNum(s.tokens)} tokens">${fmtCompact(s.tokens)}</span>`,'#6366f1'],
-    ['范围消费',fmtCost(s.cost_usd),'#e2e8f0'],
+    ['总请求',statsAvailable?fmtNum(s.requests):'—','#6366f1'],
+    ['总 Tokens',statsAvailable?`<span title="${fmtNum(s.tokens)} tokens">${fmtCompact(s.tokens)}</span>`:'—','#6366f1'],
+    [rangePartial?'已展示范围消费':'范围消费',statsAvailable?fmtCost(s.cost_usd):'—','#e2e8f0'],
     ['累计总消耗',tokenMeta&&tokenMeta.total_cost_usd!=null?fmtCost(tokenMeta.total_cost_usd):'—','#fbbf24'],
   ]:isGrp?[
     ['累计总消耗合计',totalUsedUSD==null?'—':fmtCost(totalUsedUSD),'#fbbf24'],
-    ['范围消费',fmtCost(s.cost_usd),'#e2e8f0'],
+    [rangePartial?'已展示范围消费':'范围消费',statsAvailable?fmtCost(s.cost_usd):'—','#e2e8f0'],
     ['余额合计',balanceUSD==null?'—':fmtCost(balanceUSD),'#34d399'],
     ['成员数',fmtNum(members),'#6366f1'],
   ]:[
-    ['总请求',fmtNum(s.requests),'#6366f1'],
-    ['总 Tokens',`<span title="${fmtNum(s.tokens)} tokens">${fmtCompact(s.tokens)}</span>`,'#6366f1'],
+    ['总请求',statsAvailable?fmtNum(s.requests):'—','#6366f1'],
+    ['总 Tokens',statsAvailable?`<span title="${fmtNum(s.tokens)} tokens">${fmtCompact(s.tokens)}</span>`:'—','#6366f1'],
     ['累计总消耗',totalUsedUSD==null?'—':fmtCost(totalUsedUSD),'#fbbf24'],
-    ['范围消费',fmtCost(s.cost_usd),'#e2e8f0'],
+    [rangePartial?'已展示范围消费':'范围消费',statsAvailable?fmtCost(s.cost_usd):'—','#e2e8f0'],
     ['余额',balanceUSD==null?'—':fmtCost(balanceUSD),'#34d399'],
   ];
   document.getElementById('usageDetailSummary').innerHTML=cards.map(([l,v,col,cls])=>`<div class="stat-card${cls?' '+cls:''}"><div class="stat-label">${l}</div><div class="stat-value num" style="color:${col}">${v}</div></div>`).join('');
-  const daily=st.daily||[];
+  const daily=statsAvailable?(st.daily||[]):[];
   // 每日明细表:客户报表页组织总览没有此表,组织详情隐藏;用户详情保留
   const dailyTbl=document.getElementById('thUsageDaily').closest('table');
   if(isGrp){dailyTbl.style.display='none';}
   else{
     dailyTbl.style.display='';
     document.getElementById('thUsageDaily').innerHTML='<tr><th>日期</th><th class="right">请求</th><th class="right">输入 tokens</th><th class="right">输出 tokens</th><th class="right">合计 tokens</th><th class="right">消费</th></tr>';
-    document.getElementById('tbUsageDaily').innerHTML=daily.length?daily.map(d=>`<tr>
+    document.getElementById('tbUsageDaily').innerHTML=!statsAvailable
+      ?`<tr><td colspan="6" class="muted" style="text-align:center;padding:18px">${esc(statsMessage)}</td></tr>`
+      :daily.length?daily.map(d=>`<tr>
       <td>${esc(d.date)}</td><td class="right num">${fmtNum(d.requests)}</td>
       <td class="right num">${fmtNum(d.prompt_tokens)}</td><td class="right num">${fmtNum(d.completion_tokens)}</td>
       <td class="right num">${fmtNum(d.tokens)}</td><td class="right num">${fmtCost(d.cost_usd)}</td></tr>`).join('')
@@ -2344,7 +2832,9 @@ function renderUsage(st,balanceUSD,members,totalUsedUSD,byToken,tokenMeta){
   }
   const el=document.getElementById('usageDailyChart');
   if(!usageDailyChart)usageDailyChart=echarts.init(el);
-  {
+  if(!statsAvailable){
+    usageEmptyChart(usageDailyChart,statsMessage,true);
+  }else{
     const byModel=(st.by_model||[]).filter(r=>+r.cost_usd>0);
     const dailyByModel=st.daily_by_model||[];
     const OTHER_MODEL='__other_models__';
@@ -2386,13 +2876,23 @@ function renderUsage(st,balanceUSD,members,totalUsedUSD,byToken,tokenMeta){
     },true);
   }
   setTimeout(()=>usageDailyChart.resize(),60);
-  renderUsageDim('thUsageGrp','tbUsageGrp',st.by_group,st.by_group_truncated);
-  renderUsageDim('thUsageModel','tbUsageModel',st.by_model,st.by_model_truncated);
-  renderUsagePie('usageGrpPie',st.by_group,isGrp); // 按分组环形:仅组织详情(客户页成员明细无此环形)
-  renderUsagePie('usageModelPie',st.by_model,true); // 按模型环形:组织+用户详情都有(对齐客户页)
-  renderUsageTokens(byToken);
+  renderUsageDim('thUsageGrp','tbUsageGrp',st.by_group,st.by_group_truncated,statsAvailable?'':statsMessage);
+  renderUsageDim('thUsageModel','tbUsageModel',st.by_model,st.by_model_truncated,statsAvailable?'':statsMessage);
+  if(statsAvailable){
+    renderUsagePie('usageGrpPie',st.by_group,isGrp); // 按分组环形:仅组织详情(客户页成员明细无此环形)
+    renderUsagePie('usageModelPie',st.by_model,true); // 按模型环形:组织+用户详情都有(对齐客户页)
+  }else{
+    const grpPie=document.getElementById('usageGrpPie');
+    grpPie.hidden=!isGrp;
+    if(isGrp)usageEmptyChart(usageEch(grpPie),statsMessage,false);
+    const modelPie=document.getElementById('usageModelPie');
+    modelPie.hidden=false;
+    usageEmptyChart(usageEch(modelPie),statsMessage,false);
+  }
+  renderUsageTokens(byToken,tokenDataAvailable===false||!statsAvailable,tokenDataMessage||statsMessage,rangePartial);
 }
 document.querySelectorAll('.tabs .tab').forEach(t=>t.addEventListener('click',()=>switchTab(t.dataset.tab,false)));
+document.getElementById('syncRefresh').addEventListener('click',syncLoadStatus);
 document.getElementById('infraRefresh').addEventListener('click',loadInfra);
 document.getElementById('infraAuto').addEventListener('change',infraSchedule);
 window.addEventListener('resize',resizeInfraCharts);
@@ -2401,7 +2901,7 @@ setSeg();const _mePromise=loadMe();load();schedule();
 document.querySelectorAll('#longSeg a').forEach(a=>{a.href='javascript:void 0';a.classList.toggle('active',+a.dataset.d===longDays);a.addEventListener('click',e=>{e.preventDefault();longDays=+a.dataset.d;document.querySelectorAll('#longSeg a').forEach(x=>x.classList.toggle('active',x===a));loadLongTrend();});});
 loadLongTrend();
 // 默认落在「用户用量」;URL hash 带 tab(从报警设置返回/手动刷新)则恢复到该 tab。等 IS_ROOT 就位再渲染,模型/服务端数据后台预载
-_mePromise.finally(()=>{const q=monitorHashParams(),tab=q.get('tab');const target=/^(model|server|usage|stability|channels)$/.test(tab||'')?tab:'usage';switchTab(target,true);window.dispatchEvent(new CustomEvent('monitor:navigate',{detail:{tab:target,context:window.monitorNavigationContext()}}))});
+_mePromise.finally(()=>{const q=monitorHashParams(),tab=q.get('tab');const target=/^(sync|model|server|usage|stability|channels)$/.test(tab||'')?tab:'usage';switchTab(target,true);window.dispatchEvent(new CustomEvent('monitor:navigate',{detail:{tab:target,context:window.monitorNavigationContext()}}))});
 </script>
 </body>
 </html>

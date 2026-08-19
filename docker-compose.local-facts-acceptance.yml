@@ -1,0 +1,104 @@
+# 本机「用户用量事实层」验收覆盖文件。
+#
+# 必须与 docker-compose.local-acceptance.yml 叠加使用；单独运行没有意义。
+# 本文件会启动一个隔离的临时 MySQL，Monitor 只能通过 Docker 内部网络
+# 读取该合成/脱敏数据源。严禁 SSH 隧道、线上 DSN 或线上 NewAPI URL。
+#
+# 默认模式（采集并读取已经原子发布的本地快照）：
+#   MONITOR_ACCEPTANCE_IMAGE=newapi-monitor:local-acceptance \
+#   docker compose --env-file /Users/yl/.config/newapi-monitor/local-acceptance.env \
+#     -f docker-compose.local-acceptance.yml \
+#     -f docker-compose.local-facts-acceptance.yml \
+#     up -d --force-recreate local-newapi-mysql redis monitor
+#
+# 程序仍会执行发布完整性校验：首次回填未完成时不会把候选数据当成可读快照，
+# 扩大历史范围时则继续服务上一个完整快照，直到新范围原子发布。需要只观察采集
+# 状态时，可显式设置 MONITOR_USAGE_FACTS_READ_ENABLED=false。
+#
+# 安全边界：
+# - NEWAPI_LOG_DSN 在本文件中固定为 local-newapi-mysql，不接受环境覆盖；
+# - acceptance_internal 是 internal network，Monitor 无外网出口；
+# - MySQL 数据目录使用 tmpfs，销毁容器即清除；
+# - 宿主机 127.0.0.1:13316 只用于 local_loader 导入合成/脱敏验收集；
+# - 不启用邮件、AWS、上游账户、稳定性回填或其他后台任务；
+# - 不要使用 `docker compose down -v`，也不要删除 Docker 卷
+#   `newapi-monitor-local-data`。`.local-data` 只用于人工备份，不再承载运行中 SQLite。
+
+services:
+  local-newapi-mysql:
+    image: mysql:8.4
+    container_name: ${MONITOR_ACCEPTANCE_MYSQL_CONTAINER:-newapi-monitor-local-facts-mysql}
+    environment:
+      MYSQL_ROOT_PASSWORD: local-facts-root-only
+      MYSQL_DATABASE: newapi_local_acceptance
+    ports:
+      - "127.0.0.1:${MONITOR_ACCEPTANCE_MYSQL_PORT:-13316}:3306"
+    volumes:
+      - ./dev/local-facts-mysql-init.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+    tmpfs:
+      # 200×366、约 147 万 logs 的目标规模合成集连同 MySQL 临时文件
+      # 已实测会超过 2 GiB；4 GiB 是本地验收下限，不代表线上容量配置。
+      - /var/lib/mysql:size=4g
+    networks:
+      - acceptance_internal
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -plocal-facts-root-only --silent"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    restart: "no"
+
+  redis:
+    networks:
+      - acceptance_internal
+
+  monitor:
+    # The release image is linux/amd64. Pin the local integration run to that
+    # platform too, rather than accepting a host-native fallback.
+    platform: linux/amd64
+    # A failed synthetic source preflight must leave evidence in logs without a
+    # restart loop. Healthy runs keep running normally.
+    restart: "no"
+    environment:
+      # 固定本地只读账号，不允许从 env-file 注入其他 DSN/URL。
+      NEWAPI_LOG_DSN: monitor_ro:local-facts-read-only@tcp(local-newapi-mysql:3306)/newapi_local_acceptance?charset=utf8mb4&timeout=5s&readTimeout=20s
+      MONITOR_NEWAPI_BASE_URL: ""
+      MONITOR_LOCAL_SNAPSHOT_ONLY: "false"
+      MONITOR_USAGE_FACTS_LOCAL_READ_ONLY: "false"
+      MONITOR_USAGE_FACTS_STORE_PATH: /data/usage-facts.db
+      MONITOR_USAGE_FACTS_ENABLED: "true"
+      # 默认读取已经完整发布的本地快照；候选回填不完整时程序不会误切读。
+      MONITOR_USAGE_FACTS_READ_ENABLED: ${MONITOR_USAGE_FACTS_READ_ENABLED:-true}
+      # 合成验收同样强制使用 v5 全历史语义：成员 source floor、当前 epoch proof、
+      # 全员首次原子发布和 strict right watermark 不能由90天兼容窗口代替。
+      # 来源、SQLite 和网络都是隔离的，所以本地验收显式取消墙钟节流；生产仍使用30s/20%/2s。
+      MONITOR_USAGE_FACTS_FULL_HISTORY_ENABLED: "true"
+      MONITOR_USAGE_FACTS_HISTORY_SOURCE_MODE: "complete"
+      MONITOR_USAGE_FACTS_HISTORY_SOURCE_EPOCH: "local-synthetic-complete-20260817-v1"
+      MONITOR_USAGE_FACTS_HISTORY_DELAY_MS: "-1"
+      MONITOR_USAGE_FACTS_HISTORY_SOURCE_DUTY_PERCENT: "100"
+      MONITOR_BACKGROUND_SOURCE_MIN_START_INTERVAL_MS: "0"
+      MONITOR_USAGE_FACTS_RAW_PAGE_IMPORT_ENABLED: "true"
+      MONITOR_USAGE_FACTS_CLASSIFICATION_MIGRATION_ENABLED: "false"
+      # FULL_HISTORY=true 时历史范围以成员边界为准；以下仅保留旧读面兼容参数。
+      MONITOR_USAGE_FACTS_BACKFILL_DAYS: ${MONITOR_USAGE_FACTS_BACKFILL_DAYS:-90}
+      MONITOR_USAGE_FACTS_RETENTION_DAYS: ${MONITOR_USAGE_FACTS_RETENTION_DAYS:-400}
+      MONITOR_USAGE_FACTS_HOUR_RETENTION_DAYS: ${MONITOR_USAGE_FACTS_HOUR_RETENTION_DAYS:-8}
+      MONITOR_USAGE_FACTS_SYNC_MINUTES: ${MONITOR_USAGE_FACTS_SYNC_MINUTES:-5}
+      MONITOR_USAGE_FACTS_PROFILE_SYNC_MINUTES: ${MONITOR_USAGE_FACTS_PROFILE_SYNC_MINUTES:-5}
+      # 本机验收使用程序允许的最低安全节流；仍严格串行、每次只查询一个小时。
+      MONITOR_USAGE_FACTS_BACKFILL_DELAY_MS: ${MONITOR_USAGE_FACTS_BACKFILL_DELAY_MS:-5000}
+      MONITOR_USAGE_FACTS_QUERY_TIMEOUT_SECONDS: ${MONITOR_USAGE_FACTS_QUERY_TIMEOUT_SECONDS:-20}
+      MONITOR_USAGE_FACTS_LAG_MINUTES: ${MONITOR_USAGE_FACTS_LAG_MINUTES:-10}
+    networks:
+      - acceptance_internal
+    depends_on:
+      local-newapi-mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+networks:
+  acceptance_internal:
+    name: ${MONITOR_ACCEPTANCE_NETWORK:-newapi-monitor-local-acceptance-internal}
+    internal: true

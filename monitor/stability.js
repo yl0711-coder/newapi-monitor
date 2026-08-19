@@ -2,6 +2,7 @@
 'use strict';
 
 const ST_HEADERS={
+  sync:{title:'数据同步状态',subtitle:'全历史、实时 Tail、渠道、稳定性、备份与本地存储的统一健康视图',icon:'sync'},
   usage:{title:'用户用量',subtitle:'客户余额、每日消费、成员矩阵与用量明细',icon:'users'},
   stability:{title:'稳定性报表',subtitle:'用户交付 · 分组 / 渠道 / 模型 · 历史趋势 · 问题分析',icon:'shield'},
   channels:{title:'渠道管理',subtitle:'主域名归并 · 厂商 / 实际渠道 / 服务分组 · 使用排行',icon:'globe'},
@@ -9,6 +10,7 @@ const ST_HEADERS={
   server:{title:'服务端监控',subtitle:'实例、数据库、负载均衡、域名探活与证书',icon:'chart'}
 };
 const ST_ICONS={
+  sync:'<svg viewBox="0 0 24 24"><path d="M20 7h-6V1"/><path d="M4 17h6v6"/><path d="M20 7a8 8 0 0 0-13.7-3.6L4 5.7M4 17a8 8 0 0 0 13.7 3.6l2.3-2.3"/></svg>',
   users:'<svg viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"/></svg>',
   shield:'<svg viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="m9 12 2 2 4-4"/></svg>',
   globe:'<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a15 15 0 0 1 0 18M12 3a15 15 0 0 0 0 18"/></svg>',
@@ -214,9 +216,13 @@ function setOptions(id,rows,value,allLabel,val,label){const el=$(id);if(!el)retu
 function renderReport(){
   const d=st.report;if(!d)return;renderFilterOptions();renderSources(d.meta);const body=$('stDeliveryBody');if(!body)return;
   const cov=d.meta?.data_coverage||{},hasCoverage=typeof cov.complete==='boolean';
-  if(!d.summary?.requests){if(st.chart){st.chart.dispose();st.chart=null}const detail=hasCoverage&&cov.latest_hour_pending?'最新完整小时正在汇总，完成后会自动显示。':hasCoverage&&!cov.complete?`当前有 ${nfmt(cov.missing_hours)} 个历史小时待补，也可能是所选范围确实没有流量。`:'所选范围内没有真实用户请求。';body.innerHTML=`<div class="stability-empty"><b>当前范围没有稳定性数据</b><p>${detail}</p></div>`;return}
+  if(!d.summary?.requests){if(st.chart){st.chart.dispose();st.chart=null}const missing=+(cov.effective_missing_hours??cov.missing_hours)||0;const detail=hasCoverage&&cov.latest_hour_pending?'最新完整小时正在汇总，完成后会自动显示。':hasCoverage&&missing?`当前有 ${nfmt(missing)} 个历史小时尚无可展示数据，也可能是所选范围确实没有流量。`:'所选范围内没有真实用户请求。';body.innerHTML=`<div class="stability-empty"><b>当前范围没有稳定性数据</b><p>${detail}</p></div>`;return}
+  const effective=+(cov.effective_hours??cov.completed_hours)||0,expected=+cov.expected_hours||0,legacy=+cov.legacy_fallback_hours||0,missing=+(cov.effective_missing_hours??cov.missing_hours)||0;
+  const coverageLabel=hasCoverage&&(legacy||missing)
+    ?`${nfmt(effective)}/${nfmt(expected)} 小时可展示${legacy?` · ${nfmt(legacy)} 小时为旧口径参考`:''}${missing?` · ${nfmt(missing)} 小时未覆盖`:''}`
+    :`${esc(d.meta.from)} 至 ${esc(d.meta.to)}`;
   body.innerHTML=`<section class="stability-kpis" id="stKpis"></section>
-    <section class="stability-panel"><div class="stability-panel-head"><div><h3>每日稳定性变化</h3><p>成功交付 / 真实用户请求；无请求日期断线，柱形为每日请求量</p></div><span class="muted">${esc(d.meta.from)} 至 ${esc(d.meta.to)}</span></div><div id="stTrend" class="stability-chart"></div></section>
+    <section class="stability-panel"><div class="stability-panel-head"><div><h3>每日稳定性变化</h3><p>成功交付 / 真实用户请求；无请求或未覆盖日期断线，柱形为每日请求量</p></div><span class="muted">${coverageLabel}</span></div><div id="stTrend" class="stability-chart"></div></section>
     <section class="stability-panel"><div class="stability-panel-head"><div><h3>服务分组稳定性</h3><p>服务分组代表用户体验；展开查看实际承载渠道，未路由请求只计入分组</p></div><span class="muted">${nfmt(d.groups?.length||0)} 个有流量分组</span></div><div class="stability-group-head"><span>服务分组 / 渠道</span><span>区间稳定性 / 环比</span><span>时间窄条 · ${bucketLabel(d.meta.timeline_bucket_sec||3600)}</span><span>请求 / 占比</span><span>问题 / 问题率</span><span>渠道 / 操作</span></div><div id="stGroupList"></div></section>
     <section class="stability-ranking-grid"><article class="stability-panel"><div class="stability-panel-head"><div><h3>分组与渠道使用量排行</h3><p>按真实请求数排序，识别优先保障对象</p></div></div><div id="stUsageRank" class="stability-rank-list"></div></article><article class="stability-panel"><div class="stability-panel-head"><div><h3>渠道问题排行</h3><p>按问题数排序；数量分布不等于问题归因</p></div></div><div id="stProblemRank" class="stability-rank-list"></div></article></section>`;
   renderKpis(d);renderTrend(d.groups||[]);renderGroups();renderRankings();
@@ -227,14 +233,22 @@ function renderSources(meta){
   const problemPending=+s.problem_pending_minutes||0,problemCoverage=+s.problem_coverage_to||0;
   const problemState=problemPending?'wait':problemCoverage?'ok':'wait';
   const problemLabel=problemPending?`积压 ${nfmt(problemPending)} 分钟`:problemCoverage?`至 ${dateTime(problemCoverage)}`:'积累中';
+  const migration=s.problem_migration||{},migrationStatus=migration.status||'disabled';
+  const migrationVisible=!['disabled','not_required'].includes(migrationStatus);
+  const migrationState=migrationStatus==='complete'?'ok':['paused','paused_disabled','error','stalled'].includes(migrationStatus)?'bad':'wait';
+  const migrationETA=migration.estimate_status==='observed'&&migration.estimated_seconds!=null?` · 预计剩余 ${age(+migration.estimated_seconds)}`:
+    migration.estimate_status==='backoff'?' · 退避中':migration.estimate_status==='blocked'?' · 已暂停':'';
+  const migrationLabel=migrationStatus==='complete'?'错误历史重签完成':`错误历史重签 ${(+migration.percent||0).toFixed(1)}%${migrationETA}`;
+  const migrationTitle=`原始错误 v5 冷历史迁移；实时错误采集使用独立高优先水位，不受该进度阻塞${migration.last_error?'；最近错误：'+migration.last_error:''}`;
   const nginxStatus=s.nginx_status||(s.nginx_connected?'ok':s.nginx_enabled?'degraded':'disabled');
   const nginxClass=nginxStatus==='ok'?'ok':nginxStatus==='degraded'?'bad':'wait';
   const nginxLabel=nginxStatus==='ok'?`${nfmt(s.nginx_healthy_sources||s.nginx_source_count)}/${nfmt(s.nginx_source_count)} 正常`:nginxStatus==='degraded'?`${nfmt(s.nginx_healthy_sources)}/${nfmt(s.nginx_source_count)} 异常`:'未启用';
-  const coverageClass=!hasCoverage||cov.latest_hour_pending?'':cov.complete?'ok':'wait';
-  const coverageLabel=!hasCoverage?'数据状态未知':cov.complete?`数据 ${nfmt(cov.completed_hours)}/${nfmt(cov.expected_hours)}`:cov.latest_hour_pending?`数据 ${nfmt(cov.completed_hours)}/${nfmt(cov.expected_hours)} · 汇总中`:`数据 ${nfmt(cov.completed_hours)}/${nfmt(cov.expected_hours)} · ${nfmt(cov.missing_hours)} 小时待补`;
+  const effective=+(cov.effective_hours??cov.completed_hours)||0,legacy=+cov.legacy_fallback_hours||0,effectiveMissing=+(cov.effective_missing_hours??cov.missing_hours)||0;
+  const coverageClass=!hasCoverage||cov.latest_hour_pending?'':effectiveMissing?'wait':'ok';
+  const coverageLabel=!hasCoverage?'数据状态未知':cov.latest_hour_pending?`数据 ${nfmt(effective)}/${nfmt(cov.expected_hours)} · 汇总中`:`数据 ${nfmt(effective)}/${nfmt(cov.expected_hours)}${legacy?` · 旧口径 ${nfmt(legacy)}h`:''}${effectiveMissing?` · ${nfmt(effectiveMissing)}h 未覆盖`:''}`;
   const pendingTime=+cov.pending_hour_ts?` ${dateTime(cov.pending_hour_ts)}`:'';
-  const coverageTitle=!hasCoverage?'暂未获取小时数据状态':cov.latest_hour_pending?`最新小时${pendingTime} 正常汇总中`:cov.complete?'所选范围小时数据已完整':'存在历史小时待补，当前统计可能偏低';
-  el.innerHTML=`<span><i></i>${esc(meta?.from||'—')}～${esc(meta?.to||'—')}</span><span title="${coverageTitle}"><i class="${coverageClass}"></i>${coverageLabel}</span><span title="NewAPI 本地采样新鲜度"><i class="${s.newapi_last_ts?'ok':'wait'}"></i>NewAPI ${s.newapi_last_ts?age(s.newapi_data_age_sec):'无数据'}</span><span title="原始错误采集完整覆盖时间；存在积压时问题排行暂不包含未完成分钟"><i class="${problemState}"></i>错误 ${problemLabel}</span><span title="Nginx 允许节点健康数 / 配置节点数"><i class="${nginxClass}"></i>Nginx ${nginxLabel}</span>`;
+  const coverageTitle=!hasCoverage?'暂未获取小时数据状态':cov.latest_hour_pending?`最新小时${pendingTime} 正常汇总中`:effectiveMissing?'存在历史小时未覆盖，当前统计可能偏低':legacy?`已连续展示；其中 ${nfmt(legacy)} 小时使用升级前口径，v5 重签后将自动替换，不会重复累加`:'所选范围小时数据已完整';
+  el.innerHTML=`<span><i></i>${esc(meta?.from||'—')}～${esc(meta?.to||'—')}</span><span title="${coverageTitle}"><i class="${coverageClass}"></i>${coverageLabel}</span><span title="NewAPI 本地采样新鲜度"><i class="${s.newapi_last_ts?'ok':'wait'}"></i>NewAPI ${s.newapi_last_ts?age(s.newapi_data_age_sec):'无数据'}</span><span title="原始错误采集完整覆盖时间；存在积压时问题排行暂不包含未完成分钟"><i class="${problemState}"></i>错误 ${problemLabel}</span>${migrationVisible?`<span title="${esc(migrationTitle)}"><i class="${migrationState}"></i>${esc(migrationLabel)}</span>`:''}<span title="Nginx 允许节点健康数 / 配置节点数"><i class="${nginxClass}"></i>Nginx ${nginxLabel}</span>`;
 }
 function renderKpis(d){const s=d.summary,p=d.previous,pc=d.meta?.comparison_coverage||{};const k=$('stKpis');if(!k)return;k.innerHTML=[
   ['区间稳定性',pct(s.stability),delta(d.delta_pp),health(s)],

@@ -11,7 +11,60 @@ import (
 	"strings"
 	"sync/atomic"
 	"time"
+
+	"github.com/yl0711-coder/newapi-monitor/internal/trafficclass"
 )
+
+const sourceEpochStartupMaxLookbackSec int64 = 3600
+
+// boundedSourceEpochStartupLookback prevents every lease reacquisition or
+// transient reconnect from replaying an operator-sized historical window on
+// the high-priority sampler lane. The durable local watermark reduces normal
+// restarts to a small overlap; gaps beyond one hour require the explicitly
+// throttled maintenance backfill instead of a surprise 24-hour GROUP BY.
+func boundedSourceEpochStartupLookback(configuredHours int, now, latestBucket int64) int64 {
+	if configuredHours <= 0 {
+		return 0
+	}
+	limit := sourceEpochStartupMaxLookbackSec
+	if configuredHours < 1 {
+		return 0
+	}
+	if configuredHours == 1 {
+		limit = int64(configuredHours) * 3600
+	}
+	if limit > sourceEpochStartupMaxLookbackSec {
+		limit = sourceEpochStartupMaxLookbackSec
+	}
+	if latestBucket <= 0 {
+		return limit
+	}
+	lookback := now - latestBucket + 120 // overlap two minute buckets
+	if lookback < 180 {
+		lookback = 180
+	}
+	if lookback > limit {
+		lookback = limit
+	}
+	return lookback
+}
+
+func (m *Monitor) sourceEpochStartupLookbacks(now int64) (int64, int64) {
+	if m.cfg.BackfillHours <= 0 {
+		return 0, 0
+	}
+	var metricLatest, tokenLatest int64
+	if err := m.storeDB.Raw(`SELECT COALESCE(MAX(bucket_ts),0) FROM metric_samples WHERE traffic_class_version = ?`,
+		userTrafficClassificationVersion).Scan(&metricLatest).Error; err != nil {
+		metricLatest = 0
+	}
+	if err := m.storeDB.Raw(`SELECT COALESCE(MAX(bucket_ts),0) FROM token_samples WHERE traffic_class_version = ?`,
+		userTrafficClassificationVersion).Scan(&tokenLatest).Error; err != nil {
+		tokenLatest = 0
+	}
+	return boundedSourceEpochStartupLookback(m.cfg.BackfillHours, now, metricLatest),
+		boundedSourceEpochStartupLookback(m.cfg.BackfillHours, now, tokenLatest)
+}
 
 // sampler.go:唯一访问生产库的组件。每周期对 logs 表做有界小窗口聚合，
 // 错误原文按默认 5 分钟周期另取一个完整分钟小窗口；结果均写入本地 SQLite。
@@ -35,16 +88,25 @@ func (m *Monitor) startSampler(ctx context.Context) {
 	if m.prodDB == nil {
 		return
 	}
-	m.refreshChannels()
+	if m.cfg.StabilityEnabled {
+		if err := m.resetStaleStabilityProblemClassification(); err != nil {
+			slog.Warn("重置旧版稳定性问题分类失败，问题页将 fail-closed 隐藏旧数据", "err", err)
+			m.problemLastFailure.Store(time.Now().Unix())
+		}
+	}
+	_ = m.refreshChannelsContext(ctx)
 
-	if h := m.cfg.BackfillHours; h > 0 {
-		if n, err := m.sampleWindow(ctx, int64(h)*3600); err != nil {
+	if metricLookback, tokenLookback := m.sourceEpochStartupLookbacks(time.Now().Unix()); metricLookback > 0 || tokenLookback > 0 {
+		if n, err := m.sampleWindow(ctx, metricLookback); err != nil {
 			slog.Warn("历史回填失败(忽略)", "err", err)
 		} else {
-			slog.Info("历史回填完成", "hours", h, "rows", n)
+			slog.Info("来源 epoch 启动缺口补齐完成", "configured_hours", m.cfg.BackfillHours,
+				"effective_seconds", metricLookback, "rows", n)
 		}
-		if err := m.sampleTokens(ctx, int64(h)*3600); err != nil {
-			slog.Warn("token 维度回填失败(忽略,不影响主监控)", "err", err)
+		if tokenLookback > 0 {
+			if err := m.sampleTokens(ctx, tokenLookback); err != nil {
+				slog.Warn("token 维度启动缺口补齐失败(忽略,不影响主监控)", "err", err)
+			}
 		}
 		if err := m.rollupHours(time.Now().Unix() - int64(m.cfg.RetentionDays)*86400); err != nil {
 			slog.Warn("启动小时汇总失败(忽略)", "err", err)
@@ -66,17 +128,17 @@ func (m *Monitor) startSampler(ctx context.Context) {
 	if interval < 10*time.Second {
 		interval = 10 * time.Second
 	}
-	m.lastRun.Store(time.Now().Unix()) // 初始化心跳,避免启动初期误报"采样异常"
-	m.heartbeat()                      // 启动即对外打一次心跳,让 dead-man 立刻知道"活着"
-	go m.loop(ctx, interval)
+	// lastRun/dead-man 只能由一次真实成功的来源采样更新。
+	// 启动、持有 lease 或本地回填完成都不能伪装新鲜度。
+	goSourceEpoch(ctx, func(loopCtx context.Context) { m.loop(loopCtx, interval) })
 	slog.Info("采样器已启动", "interval", interval.String(), "note", "生产库仅执行有界小窗口只读查询")
 	if m.cfg.StabilityEnabled {
 		m.startStabilityBackfillMaintenance(ctx)
+		if m.cfg.StabilityClassificationMigrationEnabled && m.stabilityProblemClassificationMigrationActive() {
+			goSourceEpoch(ctx, m.runStabilityProblemMigrationLoop)
+		}
 	}
 
-	if m.cfg.InfraEnabled { // 服务端健康监控(实例/DB/LB),独立采样循环;默认关
-		m.startInfra(ctx)
-	}
 }
 
 func (m *Monitor) loop(ctx context.Context, interval time.Duration) {
@@ -91,24 +153,24 @@ func (m *Monitor) loop(ctx context.Context, interval time.Duration) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			now := time.Now().Unix()
+			mainSampleOK := true
 			if _, err := m.sampleWindow(ctx, lookback); err != nil {
 				slog.Error("采样失败(下周期重试)", "err", err)
-				// 采样失败也评估报警:lastRun 不更新 → 超过 3 周期会触发"采样掉线"
-				m.evaluateAlerts(time.Now().Unix())
-				continue
+				mainSampleOK = false
+			} else {
+				m.lastRun.Store(now)
+				m.heartbeat() // 成功采样后向外部 dead-man 服务打心跳
+				if err := m.sampleTokens(ctx, lookback); err != nil {
+					slog.Warn("token 维度采样失败(忽略,不影响主监控)", "err", err)
+				}
+				_ = m.refreshChannelsContext(ctx) // 每周期同步渠道开关；与来源 epoch 一起取消
+				m.refreshSelectable()             // 每周期重算"可选(分组,模型)对",监控只统计用户能选到的模型
 			}
-			m.lastRun.Store(time.Now().Unix())
-			m.heartbeat() // 成功采样后向外部 dead-man 服务打心跳
-			if err := m.sampleTokens(ctx, lookback); err != nil {
-				slog.Warn("token 维度采样失败(忽略,不影响主监控)", "err", err)
-			}
-			m.refreshChannels()   // 每周期同步渠道开关(小查询),禁用/重启用近乎实时反映到稳定性
-			m.refreshSelectable() // 每周期重算"可选(分组,模型)对",监控只统计用户能选到的模型
-			now := time.Now().Unix()
 			if m.cfg.StabilityEnabled {
 				// 稳定性是历史报表而非秒级看板：每 5 分钟重算最近两小时已足够
 				// 覆盖迟到日志，同时避免每分钟重复扫描本地维度表。
-				if now >= nextStabilityRollup {
+				if mainSampleOK && now >= nextStabilityRollup {
 					if err := m.rollupStabilityHours(now - 2*3600); err != nil {
 						slog.Warn("稳定性维度汇总失败(忽略,不影响原监控)", "err", err)
 					}
@@ -128,15 +190,22 @@ func (m *Monitor) loop(ctx context.Context, interval time.Duration) {
 					} else {
 						m.problemLastSuccess.Store(now)
 					}
-					if m.stabilityProblemPendingCount() > 0 || m.stabilityProblemNeedsCatchup(problemTargetTo) {
+					liveFrom := problemTargetTo - 2*problemEvery - 120
+					if m.stabilityProblemPendingCountInRange(liveFrom/60*60, problemTargetTo/60*60) > 0 ||
+						m.stabilityProblemNeedsCatchup(problemTargetTo) {
 						nextProblemSample = now + 60 // 有积压时加快追赶，但每轮读取预算仍固定。
 					} else {
 						nextProblemSample = now + problemEvery
 					}
 				}
 			}
-			m.evaluateAlerts(time.Now().Unix())
+			// 主维度采样失败也必须继续尝试 problem live；两类业务查询
+			// 各自记录水位。只有真实来源生命周期故障才由共享 gate 阻断。
+			m.evaluateAlerts(now)
 			ticks++
+			if !mainSampleOK {
+				continue
+			}
 			if ticks%(int(600/interval.Seconds())+1) == 0 {
 				if d := m.cfg.RetentionDays; d > 0 {
 					cutoff := time.Now().Unix() - int64(d)*86400
@@ -188,10 +257,71 @@ func (m *Monitor) loop(ctx context.Context, interval time.Duration) {
 // `NOT ANOM` 也是 NULL,SUM 会跳过该行 —— 结果 success 恒为 0(异常侧因
 // `TRUE OR NULL` = TRUE 反而正常,所以只丢成功数,极难察觉)。
 const (
-	anomalyZeroSQL      = "(completion_tokens = 0 AND model_name NOT REGEXP 'embed|rerank|bge-|m3e|image|seedream|seedance')"
-	anomalyEndReasonSQL = "COALESCE(CASE WHEN JSON_VALID(other) THEN JSON_UNQUOTE(JSON_EXTRACT(other,'$.stream_status.end_reason')) END,'')"
+	anomalyZeroSQL = "(completion_tokens = 0 AND model_name NOT REGEXP 'embed|rerank|bge-|m3e|image|seedream|seedance')"
+	// REPLACE(CAST(JSON_EXTRACT ... AS CHAR),'\"','') is deliberately used
+	// instead of MySQL-only JSON_UNQUOTE.  The extracted values below are
+	// closed enum fields, so stripping the JSON string quotes is lossless and
+	// keeps the same SQL executable against the SQLite fake-production DB used
+	// by local acceptance.
+	anomalyEndReasonSQL = "COALESCE(CASE WHEN JSON_VALID(other) THEN REPLACE(CAST(JSON_EXTRACT(other,'$.stream_status.end_reason') AS CHAR),'\"','') END,'')"
 	anomalyErrCountSQL  = "COALESCE(CASE WHEN JSON_VALID(other) THEN CAST(JSON_EXTRACT(other,'$.stream_status.error_count') AS SIGNED) END,0)"
 )
+
+// channelTestJSONEnumSQL extracts a closed-enum string from logs.other using
+// syntax shared by MySQL and SQLite.  Callers only pass compile-time JSON
+// paths; this helper must never receive user input.
+func channelTestJSONEnumSQL(path string) string {
+	return `COALESCE(CASE WHEN JSON_VALID(other) THEN REPLACE(CAST(JSON_EXTRACT(other,'` + path + `') AS CHAR),'"','') ELSE '' END,'')`
+}
+
+// channelTestLogPredicateSQL 只使用未修改 NewAPI 已经持久化的稳定旧标记。
+// 两个旧文本字段必须同时命中，避免用户碰巧把普通令牌命名成“模型测试”时被误排除。
+// 旧版批量/定时测试失败会经 processChannelError 写 type=5：合成上下文固定为
+// root、无 token、无 request_id。正常 HTTP 用户请求会经过鉴权和 request-id 中间件，
+// 因此用这组完整特征兼容旧错误日志，而不能只凭 internal 分组猜测。
+// 旧日志没有手动/定时与单渠道/全渠道标记，Monitor 统一记为 legacy，
+// 不会从调度时间或数量反推出一个无法审计的类别。
+// 所有生产 logs 聚合必须复用这个谓词，不能在不同报表里各写一套分类规则。
+func channelTestLogPredicateSQL() string {
+	return trafficclass.SourceExclusionPredicateSQL
+}
+
+// channelTestSourcePredicateSQL is the single source-read boundary used by
+// direct usage, facts and problem sampling. The legacy predicate is portable
+// across production MySQL and the SQLite fake source used by acceptance tests.
+func (m *Monitor) channelTestSourcePredicateSQL() string {
+	return channelTestLogPredicateSQL()
+}
+
+func channelTestOriginSQL(testPredicate string) string {
+	return `CASE WHEN ` + testPredicate + ` THEN 'legacy' ELSE '' END`
+}
+
+func channelTestScopeSQL(testPredicate string) string {
+	return `CASE WHEN ` + testPredicate + ` THEN 'legacy' ELSE '' END`
+}
+
+// channelTestSeriesSQL 保留既有复合主键形状。CostBasis 不在旧表主键中，
+// 因此用两个明确的 legacy 系列避免普通和 tiered 成本行互相覆盖；
+// 它们是成本口径分桶，不表示手动/定时来源。
+func channelTestSeriesSQL(testPredicate string) string {
+	billingMode := channelTestJSONEnumSQL("$.billing_mode")
+	return `CASE WHEN ` + testPredicate + ` THEN CASE ` +
+		`WHEN ` + billingMode + `='tiered_expr' THEN 'legacy_tiered' ` +
+		`ELSE 'legacy_base' END ELSE '' END`
+}
+
+func channelTestResultSQL(testPredicate string) string {
+	return `CASE WHEN ` + testPredicate + ` THEN CASE ` +
+		`WHEN type=5 THEN 'failed' WHEN {{ANOM}} THEN 'anomaly' ELSE 'success' END ELSE '' END`
+}
+
+func channelTestCostBasisSQL(testPredicate string) string {
+	billingMode := channelTestJSONEnumSQL("$.billing_mode")
+	return `CASE WHEN ` + testPredicate + ` THEN CASE ` +
+		`WHEN ` + billingMode + `='tiered_expr' THEN 'legacy_after_group' ` +
+		`ELSE 'legacy_assumed_base' END ELSE '' END`
+}
 
 // expandAnomalyPredicates 把 {{ZERO}} / {{STREAMBAD}} / {{ANOM}} 占位符展开成 SQL。
 // 占位符用 {{}} 包裹是必要的:裸 ANOM 是 anomaly_billed 等列别名的前缀,直接替换会误伤别名。
@@ -219,9 +349,15 @@ func (m *Monitor) sampleWindow(ctx context.Context, lookbackSec int64) (int, err
 func (m *Monitor) sampleRange(ctx context.Context, fromTs, toTs int64) (int, error) {
 	cctx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
+	release, err := m.acquireBackgroundSource(cctx)
+	if err != nil {
+		return 0, err
+	}
+	defer release()
 
 	rows, err := m.prodDB.QueryContext(cctx, sampleWindowSQL(), fromTs, toTs)
 	if err != nil {
+		m.reportSourceQueryError(err)
 		return 0, err
 	}
 	defer rows.Close()
@@ -244,6 +380,7 @@ func (m *Monitor) sampleRange(ctx context.Context, fromTs, toTs int64) (int, err
 			return 0, err
 		}
 		s.Grp = grp.String
+		s.TrafficClassVersion = userTrafficClassificationVersion
 		s.Err4xx, s.Err5xx, s.ErrTimeout = e4, e5, eto
 		if other := s.Failed - e4 - e5 - eto; other > 0 {
 			s.ErrOther = other
@@ -251,6 +388,7 @@ func (m *Monitor) sampleRange(ctx context.Context, fromTs, toTs int64) (int, err
 		batch = append(batch, s)
 	}
 	if err := rows.Err(); err != nil {
+		m.reportSourceQueryError(err)
 		return 0, err
 	}
 	if err := m.upsertSamples(batch); err != nil {
@@ -270,7 +408,7 @@ func sampleWindowSQL() string {
 	// 交付异常判据见 expandAnomalyPredicates。
 	const frt = "(CASE WHEN JSON_VALID(other) THEN CAST(JSON_EXTRACT(other,'$.frt') AS SIGNED) ELSE 0 END)"
 	q := `
-SELECT
+SELECT /*+ MAX_EXECUTION_TIME(8000) */
   (created_at DIV 60)*60 AS bucket,
   channel_id, model_name, ` + "`group`" + ` AS grp,
   CAST(COALESCE(SUM(type=2 AND NOT {{ANOM}}),0) AS SIGNED) AS success,
@@ -307,6 +445,7 @@ SELECT
   CAST(COALESCE(MAX(CASE WHEN type=2 AND FRT>0 THEN FRT END),0) AS SIGNED) AS ttft_max_ms
 FROM logs
 WHERE created_at >= ? AND created_at < ? AND type IN (2,5)
+  AND NOT (` + channelTestLogPredicateSQL() + `)
 GROUP BY bucket, channel_id, model_name, grp`
 	q = expandAnomalyPredicates(q)
 	return strings.ReplaceAll(q, "FRT", frt)
@@ -413,20 +552,14 @@ func (m *Monitor) sampleTokens(ctx context.Context, lookbackSec int64) error {
 func (m *Monitor) sampleTokensRange(ctx context.Context, fromTs, toTs int64) error {
 	cctx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
-	// 判据与 sampleWindow 保持一致(口径必须同源),但按令牌维度不拆明细,控制基数。
-	q := `
-SELECT (created_at DIV 60)*60 AS bucket, token_name,
-  CAST(COALESCE(SUM(type=2 AND NOT {{ANOM}}),0) AS SIGNED) AS success,
-  CAST(COALESCE(SUM(type=2 AND {{ANOM}}),0) AS SIGNED) AS anomaly,
-  CAST(COALESCE(SUM(type=5),0) AS SIGNED) AS failed,
-  CAST(COALESCE(SUM(CASE WHEN type=2 THEN prompt_tokens+completion_tokens END),0) AS SIGNED) AS tokens,
-  CAST(COALESCE(SUM(CASE WHEN type=2 THEN quota END),0) AS SIGNED) AS quota
-FROM logs
-WHERE created_at >= ? AND created_at < ? AND type IN (2,5)
-GROUP BY bucket, token_name`
-	q = expandAnomalyPredicates(q)
-	rows, err := m.prodDB.QueryContext(cctx, q, fromTs, toTs)
+	release, err := m.acquireBackgroundSource(cctx)
 	if err != nil {
+		return err
+	}
+	defer release()
+	rows, err := m.prodDB.QueryContext(cctx, sampleTokenSQL(), fromTs, toTs)
+	if err != nil {
+		m.reportSourceQueryError(err)
 		return err
 	}
 	defer rows.Close()
@@ -438,27 +571,55 @@ GROUP BY bucket, token_name`
 			return err
 		}
 		s.TokenName = tn.String
+		s.TrafficClassVersion = userTrafficClassificationVersion
 		batch = append(batch, s)
 	}
 	if err := rows.Err(); err != nil {
+		m.reportSourceQueryError(err)
 		return err
 	}
 	return m.upsertTokenSamples(batch)
 }
 
+// sampleTokenSQL remains a separate renderable function so tests can lock the
+// server-side execution ceiling as well as the shared classification predicate.
+func sampleTokenSQL() string {
+	// 判据与 sampleWindow 保持一致(口径必须同源),但按令牌维度不拆明细,控制基数。
+	q := `
+SELECT /*+ MAX_EXECUTION_TIME(8000) */ (created_at DIV 60)*60 AS bucket, token_name,
+  CAST(COALESCE(SUM(type=2 AND NOT {{ANOM}}),0) AS SIGNED) AS success,
+  CAST(COALESCE(SUM(type=2 AND {{ANOM}}),0) AS SIGNED) AS anomaly,
+  CAST(COALESCE(SUM(type=5),0) AS SIGNED) AS failed,
+  CAST(COALESCE(SUM(CASE WHEN type=2 THEN prompt_tokens+completion_tokens END),0) AS SIGNED) AS tokens,
+  CAST(COALESCE(SUM(CASE WHEN type=2 THEN quota END),0) AS SIGNED) AS quota
+FROM logs
+WHERE created_at >= ? AND created_at < ? AND type IN (2,5)
+  AND NOT (` + channelTestLogPredicateSQL() + `)
+GROUP BY bucket, token_name`
+	return expandAnomalyPredicates(q)
+}
+
 // refreshChannels 刷新渠道 id->name 映射,并把渠道健康快照(类型/状态/分组/模型)写入本地库,
 // 供对外看板派生"无可用渠道"。低频、失败保留旧值。仅读非密字段(无 key/凭证)。
-func (m *Monitor) refreshChannels() {
+func (m *Monitor) refreshChannels() { _ = m.refreshChannelsContext(context.Background()) }
+
+func (m *Monitor) refreshChannelsContext(parent context.Context) error {
 	if m.prodDB == nil {
-		return
+		return errSourceNotReady
 	}
-	cctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	cctx, cancel := context.WithTimeout(parent, 10*time.Second)
 	defer cancel()
+	release, err := m.acquireBackgroundSource(cctx)
+	if err != nil {
+		return err
+	}
+	defer release()
 	// type 按 NewAPI 官方映射展示厂商。base_url 只在内存中提取可注册主域名，
 	// 本地快照不保存完整 URL/路径，更不读取 key。这只是在原有渠道小查询上多取一列。
 	rows, err := m.prodDB.QueryContext(cctx, "SELECT id, name, type, status, `group`, models, base_url FROM channels")
 	if err != nil {
-		return
+		m.reportSourceQueryError(err)
+		return err
 	}
 	defer rows.Close()
 	names := map[string]string{}
@@ -469,7 +630,7 @@ func (m *Monitor) refreshChannels() {
 		var id, channelType, status int
 		var name, grp, models, baseURL sql.NullString
 		if err := rows.Scan(&id, &name, &channelType, &status, &grp, &models, &baseURL); err != nil {
-			return
+			return err
 		}
 		names[strconv.Itoa(id)] = name.String
 		p := prev[id] // 不存在或曾被删除都按新建处理，重新出现时从本轮重新计算启用起点。
@@ -485,7 +646,8 @@ func (m *Monitor) refreshChannels() {
 		})
 	}
 	if err := rows.Err(); err != nil {
-		return
+		m.reportSourceQueryError(err)
+		return err
 	}
 	// rows 已成功读到 EOF，因此即使为空也是可信的当前状态。
 	// 同步清空内存名称映射，并将本地旧渠道软删除，但保留最后快照。
@@ -495,6 +657,7 @@ func (m *Monitor) refreshChannels() {
 	if err := m.replaceChannelSnapsAuthoritative(snaps, now); err != nil {
 		slog.Warn("渠道健康快照写入失败(忽略,不影响监控)", "err", err)
 	}
+	return nil
 }
 
 // fetchUsableGroups 从 new-api 的 /api/pricing(匿名可读)取可见分组(用户创建令牌时能选的分组)。

@@ -1,20 +1,42 @@
 package monitor
 
 import (
+	"context"
+	"database/sql"
 	"os"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // Settings 是监控服务的独立配置,全部从环境变量读取——不依赖任何外部 config 包。
 type Settings struct {
-	Addr              string // 监听地址,默认 :8090
-	ProdDSN           string // NEWAPI_LOG_DSN:new-api 生产库【只读】DSN
-	StorePath         string // 本地采样库(sqlite)路径,默认 monitor.db
-	SampleSeconds     int    // 采样间隔秒,默认 60
-	RetentionDays     int    // 分钟级本地留存天数,默认 7
-	HourRetentionDays int    // 小时级汇总(rollup)留存天数,默认 90;支撑长期趋势 + 同比环比
-	BackfillHours     int    // 启动回填小时数,默认 24
+	Addr      string // 监听地址,默认 :8090
+	ProdDSN   string // NEWAPI_LOG_DSN:new-api 生产库【只读】DSN
+	StorePath string // 本地采样库(sqlite)路径,默认 monitor.db
+	// Monitor 本地 SQLite 是用量事实和运维历史的事实源。启动时始终
+	// 先做 quick_check；在线备份使用 SQLite 一致性快照，不直接拷贝 WAL 运行库。
+	StoreBackupEnabled       bool   // MONITOR_STORE_BACKUP_ENABLED，默认 true
+	StoreBackupDir           string // MONITOR_STORE_BACKUP_DIR，默认 <StorePath 目录>/backups
+	StoreBackupIntervalHours int    // MONITOR_STORE_BACKUP_INTERVAL_HOURS，默认 24
+	StoreBackupRetention     int    // MONITOR_STORE_BACKUP_RETENTION，默认 7
+	// 迁移前成套快照不受 StoreBackupEnabled 影响，独立限量保留，避免与日备份
+	// 叠加后无提示占满数据卷。
+	StoreMigrationBackupRetention int // MONITOR_STORE_MIGRATION_BACKUP_RETENTION，默认 3
+	// LocalSnapshotOnly 只供本机验收使用：不建立任何 NewAPI 生产库连接，也不启动
+	// 采样、回填、上游轮询等后台任务。页面只能读取已复制到本地 SQLite 的快照。
+	// 生产环境必须保持 false；它不是“连接失败后的降级模式”。
+	LocalSnapshotOnly bool // MONITOR_LOCAL_SNAPSHOT_ONLY，默认 false
+	// 来源 worker 与 Web 进程分离：MySQL 短暂不可达时仍可从
+	// SQLite 服务已发布数据。生产默认开启 worker，并通过 MySQL
+	// advisory lock 保证同一来源只有一个实例采集。
+	SourceWorkerEnabled bool   // MONITOR_SOURCE_WORKER_ENABLED，默认 true
+	SourceLeaseRequired bool   // MONITOR_SOURCE_LEASE_REQUIRED，默认 true
+	SourceLeaseName     string // MONITOR_SOURCE_LEASE_NAME，默认 newapi-monitor-source-worker-v1
+	SampleSeconds       int    // 采样间隔秒,默认 60
+	RetentionDays       int    // 分钟级本地留存天数,默认 7
+	HourRetentionDays   int    // 小时级汇总(rollup)留存天数,默认 90;支撑长期趋势 + 同比环比
+	BackfillHours       int    // 来源 epoch 启动缺口上限,默认且自动硬限 1 小时；更久缺口走维护回填
 	// 历史稳定性报表只使用 Monitor 本地汇总。开关关闭时不采集原始错误、
 	// 不执行稳定性长期汇总，但不影响原有模型/用量/服务端监控。
 	StabilityEnabled          bool // MONITOR_STABILITY_ENABLED,默认 true
@@ -22,11 +44,16 @@ type Settings struct {
 	StabilityRetentionDays    int  // MONITOR_STABILITY_RETENTION_DAYS,默认 181,至少覆盖两个最大查询周期
 	StabilityProblemSampleSec int  // MONITOR_STABILITY_PROBLEM_SAMPLE_SECONDS,默认 300
 	// 长期小时数据补数直接聚合生产 logs 的单个小时，不写分钟表。查询始终串行，
-	// 片间延迟用于给主站数据库让路；自动修洞每轮最多处理一个已结束小时。
-	StabilityBackfillDelayMS    int  // MONITOR_STABILITY_BACKFILL_DELAY_MS,默认 2000
-	StabilityBackfillTimeoutSec int  // MONITOR_STABILITY_BACKFILL_TIMEOUT_SECONDS,默认 20
-	StabilityBackfillEnabled    bool // MONITOR_STABILITY_BACKFILL_ENABLED,默认 true;关闭后禁止人工、自动及重启续跑
-	StabilityAutoRepair         bool // MONITOR_STABILITY_AUTO_REPAIR,默认 true
+	// 片间延迟和来源占用率共同给主站数据库让路。分类规则升级产生的大范围
+	// 缺口只能通过显式 migration 开关自动创建持久任务，不能随普通修洞静默启动。
+	BackgroundSourceMinStartIntervalMS      int  // MONITOR_BACKGROUND_SOURCE_MIN_START_INTERVAL_MS，默认 2000；所有后台来源查询共用
+	StabilityBackfillDelayMS                int  // MONITOR_STABILITY_BACKFILL_DELAY_MS,默认 2000
+	StabilityBackfillTimeoutSec             int  // MONITOR_STABILITY_BACKFILL_TIMEOUT_SECONDS,默认 20
+	StabilityBackfillServerMaxExecutionMS   int  // MONITOR_STABILITY_BACKFILL_SERVER_MAX_EXECUTION_MS，默认且最大 8000
+	StabilityBackfillSourceDutyPercent      int  // MONITOR_STABILITY_BACKFILL_SOURCE_DUTY_PERCENT，默认 20
+	StabilityBackfillEnabled                bool // MONITOR_STABILITY_BACKFILL_ENABLED,默认 true;关闭后禁止人工、自动及重启续跑
+	StabilityAutoRepair                     bool // MONITOR_STABILITY_AUTO_REPAIR,默认 true
+	StabilityClassificationMigrationEnabled bool // MONITOR_STABILITY_CLASSIFICATION_MIGRATION_ENABLED，默认 false；显式允许自动创建分类迁移任务
 
 	// Nginx 入口层旁路聚合。默认关闭；开启后只接收采集器已经脱敏、按分钟聚合的
 	// 客观指标，不读取 access/error 原文，不采集 IP、Header、Key、请求体或响应体。
@@ -40,8 +67,15 @@ type Settings struct {
 	// 上游账户凭据只保存在 Monitor 本地 SQLite，使用该密钥经 AES-256-GCM 加密。
 	// 留空时复用 MONITOR_SESSION_SECRET；生产必须至少固定配置二者之一，否则拒绝保存凭据。
 	UpstreamCredentialSecret string // MONITOR_UPSTREAM_CREDENTIAL_SECRET
-	UpstreamSyncMinutes      int    // MONITOR_UPSTREAM_SYNC_MINUTES,默认 5；失败时按账户退避，最长 60 分钟
-	UpstreamSyncTimeoutSec   int    // MONITOR_UPSTREAM_SYNC_TIMEOUT_SECONDS,默认 15
+	// 关闭后禁止后台主动轮询已配置的上游账户。默认开启，保证已有生产行为不变；
+	// 本地验收可显式关闭，避免启动页面时向任何上游站点发出请求。
+	UpstreamSyncEnabled    bool // MONITOR_UPSTREAM_SYNC_ENABLED,默认 true
+	UpstreamSyncMinutes    int  // MONITOR_UPSTREAM_SYNC_MINUTES,默认 5；失败时按账户退避，最长 60 分钟
+	UpstreamSyncTimeoutSec int  // MONITOR_UPSTREAM_SYNC_TIMEOUT_SECONDS,默认 15
+	// 上游使用日志与余额是两条独立同步链。日志仅在账户显式启用后后台读取，
+	// 默认 30 分钟一次；页面访问绝不会触发访问上游。
+	UpstreamUsageSyncMinutes  int // MONITOR_UPSTREAM_USAGE_SYNC_MINUTES,默认 30，最小 15
+	UpstreamUsageBackfillDays int // MONITOR_UPSTREAM_USAGE_BACKFILL_DAYS,默认 90，首次低频补齐范围
 
 	// 客户端「用量报表」独立监听(portal.go):客户域名只指这个端口,上面不存在任何管理端路由。
 	// 留空 = 关闭(默认);如 ":8092"。
@@ -54,6 +88,47 @@ type Settings struct {
 	UsageRedisPassword string // MONITOR_USAGE_REDIS_PASSWORD，只从环境变量读取
 	UsageRedisDB       int    // MONITOR_USAGE_REDIS_DB，默认 0；权限隔离仍以 ACL/key prefix 为准
 	UsageRedisPrefix   string // MONITOR_USAGE_REDIS_PREFIX，默认 nxmon:usage:v1
+	// 用户用量事实层：采集阶段与页面切读阶段分开开关。上线时先只开采集，
+	// 等本地小时覆盖率校验通过后再开 ReadEnabled；Redis 仅加速，不是事实源。
+	UsageFactsStorePath   string // MONITOR_USAGE_FACTS_STORE_PATH，默认与主库同目录的 usage-facts.db
+	UsageFactsEnabled     bool   // MONITOR_USAGE_FACTS_ENABLED，默认 false
+	UsageFactsReadEnabled bool   // MONITOR_USAGE_FACTS_READ_ENABLED，默认 false；生产仅 FactsEnabled=true 时生效
+	// UsageFactsLocalReadOnly 仅与 LocalSnapshotOnly 同时生效。它允许本机验收
+	// 读取已验证的事实快照，但绝不允许访问来源库或启动事实采集。
+	UsageFactsLocalReadOnly      bool // MONITOR_USAGE_FACTS_LOCAL_READ_ONLY，默认 false
+	UsageFactsBackfillDays       int  // MONITOR_USAGE_FACTS_BACKFILL_DAYS，默认 366
+	UsageFactsRetentionDays      int  // MONITOR_USAGE_FACTS_RETENTION_DAYS，默认 400
+	UsageFactsHourRetentionDays  int  // MONITOR_USAGE_FACTS_HOUR_RETENTION_DAYS，默认 8
+	UsageFactsSyncMinutes        int  // MONITOR_USAGE_FACTS_SYNC_MINUTES，默认 5
+	UsageFactsProfileSyncMinutes int  // MONITOR_USAGE_FACTS_PROFILE_SYNC_MINUTES，默认 5
+	UsageFactsBackfillDelayMS    int  // MONITOR_USAGE_FACTS_BACKFILL_DELAY_MS，默认 15000；后台只读回填的最低保护节流
+	UsageFactsQueryTimeoutSec    int  // MONITOR_USAGE_FACTS_QUERY_TIMEOUT_SECONDS，默认 20
+	UsageFactsLagMinutes         int  // MONITOR_USAGE_FACTS_LAG_MINUTES，默认 10；未闭合尾部不作为漏采
+	// 全历史是显式灰度开关：事实层可先继续服务已签收的固定窗口，只有开启后
+	// 才按成员真实来源边界创建持久日级任务。它绝不把 BackfillDays 当历史起点。
+	UsageFactsFullHistoryEnabled        bool  // MONITOR_USAGE_FACTS_FULL_HISTORY_ENABLED，默认 false
+	UsageFactsHistoryDelayMS            int   // MONITOR_USAGE_FACTS_HISTORY_DELAY_MS，默认 30000；成功 chunk 间隔
+	UsageFactsHistoryDutyPercent        int   // MONITOR_USAGE_FACTS_HISTORY_SOURCE_DUTY_PERCENT，默认 20
+	UsageFactsHistoryMaxDiskUsedPercent int   // MONITOR_USAGE_FACTS_HISTORY_MAX_DISK_USED_PERCENT，默认 80
+	UsageFactsHistoryMinFreeBytes       int64 // MONITOR_USAGE_FACTS_HISTORY_MIN_FREE_BYTES，默认 2GiB
+	// Full-history must be backed by a declared complete source. "complete"
+	// means the selected logs source still contains every retained user-traffic
+	// row since account creation; SourceEpoch changes whenever archival/routing
+	// semantics change and forces all source proofs to be rebuilt.
+	UsageFactsHistorySourceMode  string // MONITOR_USAGE_FACTS_HISTORY_SOURCE_MODE，默认 unverified
+	UsageFactsHistorySourceEpoch string // MONITOR_USAGE_FACTS_HISTORY_SOURCE_EPOCH，显式稳定标识
+	// RawPageImport switches full-history live/cold/repair work to the bounded
+	// raw-log protocol: one member shard is read as cursor pages and aggregated
+	// only in SQLite. It is the production default; false is an explicit
+	// emergency compatibility rollback to the legacy source GROUP BY path.
+	UsageFactsRawPageImportEnabled bool // MONITOR_USAGE_FACTS_RAW_PAGE_IMPORT_ENABLED，默认 true
+	// 分类口径升级可能要求重签全部日志派生事实。普通启动绝不隐式清表；只有在
+	// 已关闭页面切读、已签完整来源且开启全历史持久任务后，运维才能在维护窗口
+	// 显式撤销旧发布授权并按成员逐日覆盖。旧事实保留，供回滚与分片校验。
+	UsageFactsClassificationMigrationEnabled bool // MONITOR_USAGE_FACTS_CLASSIFICATION_MIGRATION_ENABLED，默认 false
+	// 已完成小时也会低频轮换复核，用于修正晚到或事后变更的日志。
+	// 每轮只读一个小时，且仍与前台查询共用串行闸门。
+	UsageFactsReconcileMinutes int // MONITOR_USAGE_FACTS_RECONCILE_MINUTES，默认 30
 	// 仅信任这些反代来源提供的 X-Forwarded-For/X-Real-IP。留空时不信任任何转发头，
 	// 登录限流按直连地址计算，避免外部请求伪造来源 IP 绕过限流。
 	TrustedProxies []string // MONITOR_TRUSTED_PROXIES，逗号分隔 CIDR/IP
@@ -73,10 +148,14 @@ type Settings struct {
 
 	// 服务端健康监控(实例/数据库/负载均衡):基于 AWS Lightsail 指标接口拉取。
 	// 默认【关】——关时完全不调 AWS、不影响模型监控与现网行为。
-	InfraEnabled       bool   // MONITOR_INFRA_ENABLED(=true 才启用)
-	AWSRegion          string // AWS_REGION,如 us-west-2;AWS 凭证用 SDK 默认链(AWS_ACCESS_KEY_ID/_SECRET)
-	InfraSampleSeconds int    // MONITOR_INFRA_SAMPLE_SECONDS,默认 300(AWS 指标本就 5min 分辨率)
-	InfraRetentionDays int    // MONITOR_INFRA_RETENTION_DAYS,默认 7
+	InfraEnabled bool // MONITOR_INFRA_ENABLED(=true 才启用主动采样/探测)
+	// InfraSnapshotReadOnly 只开放已落入 Monitor SQLite 的服务端快照和曲线。
+	// 它不启动 AWS、域名、源站锁探测，也不评估/发送基础设施告警；
+	// 仅用于本机验收和其他只读快照场景。
+	InfraSnapshotReadOnly bool   // MONITOR_INFRA_SNAPSHOT_READ_ONLY，默认 false
+	AWSRegion             string // AWS_REGION,如 us-west-2;AWS 凭证用 SDK 默认链(AWS_ACCESS_KEY_ID/_SECRET)
+	InfraSampleSeconds    int    // MONITOR_INFRA_SAMPLE_SECONDS,默认 300(AWS 指标本就 5min 分辨率)
+	InfraRetentionDays    int    // MONITOR_INFRA_RETENTION_DAYS,默认 7
 	// MONITOR_INFRA_RESOURCES:逗号分隔,显式指定要监控的资源,留空=自动发现。
 	// 格式 type:name,type∈ instance/database/lb,如 "instance:Master,database:DB-X,lb:LB-X"。
 	InfraResources string
@@ -119,46 +198,100 @@ type Settings struct {
 	// 隧道抖动被误判成"采样器掉线",用真实凭据连发了 9 封骚扰邮件。
 	// 不要用"默认配置里 Enabled=false"来代替这个开关——那是约定,这是断路器。
 	AlertsDisabled bool // MONITOR_ALERTS_DISABLED
+
+	// 以下字段只用于包内单元测试注入可控时钟/连接。
+	// LoadSettings 会显式标记 lifecycle 已配置；直接 Settings{}
+	// 保持历史测试语义（worker 开、lease 关）。
+	sourceLifecycleConfigured bool
+	sourceOpen                func(string) (*sql.DB, error)
+	sourceProbe               func(context.Context, *sql.DB) error
+	sourceAcquireLease        func(context.Context, *sql.DB, string) (sourceLeaseHandle, bool, error)
+	sourceRetryDelay          func(int) time.Duration
+	sourceCheckInterval       time.Duration
+	sourcePreflightInterval   time.Duration
+	sourceDrainTimeout        time.Duration
+	localProbeInterval        time.Duration
+	sourceWorkerStart         func(context.Context, *Monitor)
 }
 
 // LoadSettings 从环境变量装载配置(可配合 .env)。
 func LoadSettings() Settings {
 	return Settings{
-		Addr:                        env("MONITOR_ADDR", ":8090"),
-		ProdDSN:                     env("NEWAPI_LOG_DSN", ""),
-		StorePath:                   env("MONITOR_STORE_PATH", "monitor.db"),
-		SampleSeconds:               envInt("MONITOR_SAMPLE_SECONDS", 60),
-		RetentionDays:               envInt("MONITOR_RETENTION_DAYS", 7),
-		HourRetentionDays:           envInt("MONITOR_HOUR_RETENTION_DAYS", 90),
-		BackfillHours:               envInt("MONITOR_BACKFILL_HOURS", 24),
-		StabilityEnabled:            env("MONITOR_STABILITY_ENABLED", "true") == "true",
-		StabilityQueryMaxDays:       envInt("MONITOR_STABILITY_QUERY_MAX_DAYS", 90),
-		StabilityRetentionDays:      envInt("MONITOR_STABILITY_RETENTION_DAYS", 181),
-		StabilityProblemSampleSec:   envInt("MONITOR_STABILITY_PROBLEM_SAMPLE_SECONDS", 300),
-		StabilityBackfillDelayMS:    envInt("MONITOR_STABILITY_BACKFILL_DELAY_MS", 2000),
-		StabilityBackfillTimeoutSec: envInt("MONITOR_STABILITY_BACKFILL_TIMEOUT_SECONDS", 20),
-		StabilityBackfillEnabled:    env("MONITOR_STABILITY_BACKFILL_ENABLED", "true") == "true",
-		StabilityAutoRepair:         env("MONITOR_STABILITY_AUTO_REPAIR", "true") == "true",
-		NginxEnabled:                env("MONITOR_NGINX_ENABLED", "false") == "true",
-		NginxRetentionDays:          envInt("MONITOR_NGINX_RETENTION_DAYS", 7),
-		NginxAllowedNodes:           envCSV("MONITOR_NGINX_ALLOWED_NODES"),
-		NewAPIBaseURL:               env("MONITOR_NEWAPI_BASE_URL", ""),
-		SessionSecret:               env("MONITOR_SESSION_SECRET", ""),
-		UpstreamCredentialSecret:    env("MONITOR_UPSTREAM_CREDENTIAL_SECRET", ""),
-		UpstreamSyncMinutes:         envInt("MONITOR_UPSTREAM_SYNC_MINUTES", 5),
-		UpstreamSyncTimeoutSec:      envInt("MONITOR_UPSTREAM_SYNC_TIMEOUT_SECONDS", 15),
-		PortalAddr:                  env("MONITOR_PORTAL_ADDR", ""),
-		UsageRedisAddr:              strings.TrimSpace(env("MONITOR_USAGE_REDIS_ADDR", "")),
-		UsageRedisUsername:          strings.TrimSpace(env("MONITOR_USAGE_REDIS_USERNAME", "")),
-		UsageRedisPassword:          env("MONITOR_USAGE_REDIS_PASSWORD", ""),
-		UsageRedisDB:                envInt("MONITOR_USAGE_REDIS_DB", 0),
-		UsageRedisPrefix:            strings.Trim(strings.TrimSpace(env("MONITOR_USAGE_REDIS_PREFIX", "nxmon:usage:v1")), ":"),
-		TrustedProxies:              envCSV("MONITOR_TRUSTED_PROXIES"),
-		HeartbeatURL:                env("MONITOR_HEARTBEAT_URL", ""),
-		SiteName:                    env("MONITOR_SITE_NAME", ""),
-		IngestToken:                 env("MONITOR_INGEST_TOKEN", ""),
+		Addr:                                     env("MONITOR_ADDR", ":8090"),
+		ProdDSN:                                  env("NEWAPI_LOG_DSN", ""),
+		StorePath:                                env("MONITOR_STORE_PATH", "monitor.db"),
+		StoreBackupEnabled:                       env("MONITOR_STORE_BACKUP_ENABLED", "true") == "true",
+		StoreBackupDir:                           strings.TrimSpace(env("MONITOR_STORE_BACKUP_DIR", "")),
+		StoreBackupIntervalHours:                 envInt("MONITOR_STORE_BACKUP_INTERVAL_HOURS", 24),
+		StoreBackupRetention:                     envInt("MONITOR_STORE_BACKUP_RETENTION", 7),
+		StoreMigrationBackupRetention:            envInt("MONITOR_STORE_MIGRATION_BACKUP_RETENTION", 3),
+		LocalSnapshotOnly:                        env("MONITOR_LOCAL_SNAPSHOT_ONLY", "false") == "true",
+		SourceWorkerEnabled:                      env("MONITOR_SOURCE_WORKER_ENABLED", "true") == "true",
+		SourceLeaseRequired:                      env("MONITOR_SOURCE_LEASE_REQUIRED", "true") == "true",
+		SourceLeaseName:                          strings.TrimSpace(env("MONITOR_SOURCE_LEASE_NAME", "newapi-monitor-source-worker-v1")),
+		sourceLifecycleConfigured:                true,
+		SampleSeconds:                            envInt("MONITOR_SAMPLE_SECONDS", 60),
+		RetentionDays:                            envInt("MONITOR_RETENTION_DAYS", 7),
+		HourRetentionDays:                        envInt("MONITOR_HOUR_RETENTION_DAYS", 90),
+		BackfillHours:                            envInt("MONITOR_BACKFILL_HOURS", 1),
+		StabilityEnabled:                         env("MONITOR_STABILITY_ENABLED", "true") == "true",
+		StabilityQueryMaxDays:                    envInt("MONITOR_STABILITY_QUERY_MAX_DAYS", 90),
+		StabilityRetentionDays:                   envInt("MONITOR_STABILITY_RETENTION_DAYS", 181),
+		StabilityProblemSampleSec:                envInt("MONITOR_STABILITY_PROBLEM_SAMPLE_SECONDS", 300),
+		BackgroundSourceMinStartIntervalMS:       envInt("MONITOR_BACKGROUND_SOURCE_MIN_START_INTERVAL_MS", 2000),
+		StabilityBackfillDelayMS:                 envInt("MONITOR_STABILITY_BACKFILL_DELAY_MS", 2000),
+		StabilityBackfillTimeoutSec:              envInt("MONITOR_STABILITY_BACKFILL_TIMEOUT_SECONDS", 20),
+		StabilityBackfillServerMaxExecutionMS:    envInt("MONITOR_STABILITY_BACKFILL_SERVER_MAX_EXECUTION_MS", 8000),
+		StabilityBackfillSourceDutyPercent:       envInt("MONITOR_STABILITY_BACKFILL_SOURCE_DUTY_PERCENT", 20),
+		StabilityBackfillEnabled:                 env("MONITOR_STABILITY_BACKFILL_ENABLED", "true") == "true",
+		StabilityAutoRepair:                      env("MONITOR_STABILITY_AUTO_REPAIR", "true") == "true",
+		StabilityClassificationMigrationEnabled:  env("MONITOR_STABILITY_CLASSIFICATION_MIGRATION_ENABLED", "false") == "true",
+		NginxEnabled:                             env("MONITOR_NGINX_ENABLED", "false") == "true",
+		NginxRetentionDays:                       envInt("MONITOR_NGINX_RETENTION_DAYS", 7),
+		NginxAllowedNodes:                        envCSV("MONITOR_NGINX_ALLOWED_NODES"),
+		NewAPIBaseURL:                            env("MONITOR_NEWAPI_BASE_URL", ""),
+		SessionSecret:                            env("MONITOR_SESSION_SECRET", ""),
+		UpstreamCredentialSecret:                 env("MONITOR_UPSTREAM_CREDENTIAL_SECRET", ""),
+		UpstreamSyncEnabled:                      env("MONITOR_UPSTREAM_SYNC_ENABLED", "true") == "true",
+		UpstreamSyncMinutes:                      envInt("MONITOR_UPSTREAM_SYNC_MINUTES", 5),
+		UpstreamSyncTimeoutSec:                   envInt("MONITOR_UPSTREAM_SYNC_TIMEOUT_SECONDS", 15),
+		UpstreamUsageSyncMinutes:                 envInt("MONITOR_UPSTREAM_USAGE_SYNC_MINUTES", 30),
+		UpstreamUsageBackfillDays:                envInt("MONITOR_UPSTREAM_USAGE_BACKFILL_DAYS", 90),
+		PortalAddr:                               env("MONITOR_PORTAL_ADDR", ""),
+		UsageRedisAddr:                           strings.TrimSpace(env("MONITOR_USAGE_REDIS_ADDR", "")),
+		UsageRedisUsername:                       strings.TrimSpace(env("MONITOR_USAGE_REDIS_USERNAME", "")),
+		UsageRedisPassword:                       env("MONITOR_USAGE_REDIS_PASSWORD", ""),
+		UsageRedisDB:                             envInt("MONITOR_USAGE_REDIS_DB", 0),
+		UsageRedisPrefix:                         strings.Trim(strings.TrimSpace(env("MONITOR_USAGE_REDIS_PREFIX", "nxmon:usage:v1")), ":"),
+		UsageFactsStorePath:                      strings.TrimSpace(env("MONITOR_USAGE_FACTS_STORE_PATH", "")),
+		UsageFactsEnabled:                        env("MONITOR_USAGE_FACTS_ENABLED", "false") == "true",
+		UsageFactsReadEnabled:                    env("MONITOR_USAGE_FACTS_READ_ENABLED", "false") == "true",
+		UsageFactsLocalReadOnly:                  env("MONITOR_USAGE_FACTS_LOCAL_READ_ONLY", "false") == "true",
+		UsageFactsBackfillDays:                   envInt("MONITOR_USAGE_FACTS_BACKFILL_DAYS", 366),
+		UsageFactsRetentionDays:                  envInt("MONITOR_USAGE_FACTS_RETENTION_DAYS", 400),
+		UsageFactsHourRetentionDays:              envInt("MONITOR_USAGE_FACTS_HOUR_RETENTION_DAYS", 8),
+		UsageFactsSyncMinutes:                    envInt("MONITOR_USAGE_FACTS_SYNC_MINUTES", 5),
+		UsageFactsProfileSyncMinutes:             envInt("MONITOR_USAGE_FACTS_PROFILE_SYNC_MINUTES", 5),
+		UsageFactsBackfillDelayMS:                envInt("MONITOR_USAGE_FACTS_BACKFILL_DELAY_MS", 15000),
+		UsageFactsQueryTimeoutSec:                envInt("MONITOR_USAGE_FACTS_QUERY_TIMEOUT_SECONDS", 20),
+		UsageFactsLagMinutes:                     envInt("MONITOR_USAGE_FACTS_LAG_MINUTES", 10),
+		UsageFactsFullHistoryEnabled:             env("MONITOR_USAGE_FACTS_FULL_HISTORY_ENABLED", "false") == "true",
+		UsageFactsHistoryDelayMS:                 envInt("MONITOR_USAGE_FACTS_HISTORY_DELAY_MS", 30000),
+		UsageFactsHistoryDutyPercent:             envInt("MONITOR_USAGE_FACTS_HISTORY_SOURCE_DUTY_PERCENT", 20),
+		UsageFactsHistoryMaxDiskUsedPercent:      envInt("MONITOR_USAGE_FACTS_HISTORY_MAX_DISK_USED_PERCENT", 80),
+		UsageFactsHistoryMinFreeBytes:            envInt64("MONITOR_USAGE_FACTS_HISTORY_MIN_FREE_BYTES", 2*1024*1024*1024),
+		UsageFactsHistorySourceMode:              strings.ToLower(strings.TrimSpace(env("MONITOR_USAGE_FACTS_HISTORY_SOURCE_MODE", "unverified"))),
+		UsageFactsHistorySourceEpoch:             strings.TrimSpace(env("MONITOR_USAGE_FACTS_HISTORY_SOURCE_EPOCH", "")),
+		UsageFactsRawPageImportEnabled:           env("MONITOR_USAGE_FACTS_RAW_PAGE_IMPORT_ENABLED", "true") == "true",
+		UsageFactsClassificationMigrationEnabled: env("MONITOR_USAGE_FACTS_CLASSIFICATION_MIGRATION_ENABLED", "false") == "true",
+		UsageFactsReconcileMinutes:               envInt("MONITOR_USAGE_FACTS_RECONCILE_MINUTES", 30),
+		TrustedProxies:                           envCSV("MONITOR_TRUSTED_PROXIES"),
+		HeartbeatURL:                             env("MONITOR_HEARTBEAT_URL", ""),
+		SiteName:                                 env("MONITOR_SITE_NAME", ""),
+		IngestToken:                              env("MONITOR_INGEST_TOKEN", ""),
 
 		InfraEnabled:          env("MONITOR_INFRA_ENABLED", "") == "true",
+		InfraSnapshotReadOnly: env("MONITOR_INFRA_SNAPSHOT_READ_ONLY", "false") == "true",
 		AWSRegion:             env("AWS_REGION", "us-west-2"),
 		InfraSampleSeconds:    envInt("MONITOR_INFRA_SAMPLE_SECONDS", 300),
 		InfraRetentionDays:    envInt("MONITOR_INFRA_RETENTION_DAYS", 7),
@@ -239,6 +372,15 @@ func envCSV(k string) []string {
 func envInt(k string, def int) int {
 	if v := os.Getenv(k); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
+			return n
+		}
+	}
+	return def
+}
+
+func envInt64(k string, def int64) int64 {
+	if v := os.Getenv(k); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
 			return n
 		}
 	}

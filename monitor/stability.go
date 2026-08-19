@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"sort"
 	"strconv"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"gorm.io/gorm"
 )
 
 var cstLocation = time.FixedZone("CST", 8*60*60)
@@ -42,12 +44,13 @@ func newAPIChannelTypeName(channelType int) string {
 }
 
 type stabilityScope struct {
-	FromTs    int64
-	ToTs      int64
-	Group     string
-	ChannelID int
-	Model     string
-	Vendor    string
+	FromTs     int64
+	ToTs       int64
+	RangeHours int
+	Group      string
+	ChannelID  int
+	Model      string
+	Vendor     string
 }
 
 type StabilityMetrics struct {
@@ -194,21 +197,22 @@ type StabilityFilters struct {
 }
 
 type StabilitySourceStatus struct {
-	NewAPILastTs              int64    `json:"newapi_last_ts"`
-	NewAPIDataAgeSec          int64    `json:"newapi_data_age_sec"`
-	ProblemLastTs             int64    `json:"problem_last_ts"`
-	ProblemCoverageTo         int64    `json:"problem_coverage_to"`
-	ProblemCoverageLagSec     int64    `json:"problem_coverage_lag_sec"`
-	ProblemPendingMinutes     int64    `json:"problem_pending_minutes"`
-	ProblemSamplerLastSuccess int64    `json:"problem_sampler_last_success"`
-	ProblemSamplerLastFailure int64    `json:"problem_sampler_last_failure"`
-	NginxEnabled              bool     `json:"nginx_enabled"`
-	NginxStatus               string   `json:"nginx_status"`
-	NginxConnected            bool     `json:"nginx_connected"`
-	NginxHealthySources       int      `json:"nginx_healthy_sources"`
-	NginxSourceCount          int      `json:"nginx_source_count"`
-	NginxLastTs               int64    `json:"nginx_last_ts"`
-	RequestIDCoverage         *float64 `json:"request_id_coverage"`
+	NewAPILastTs              int64                             `json:"newapi_last_ts"`
+	NewAPIDataAgeSec          int64                             `json:"newapi_data_age_sec"`
+	ProblemLastTs             int64                             `json:"problem_last_ts"`
+	ProblemCoverageTo         int64                             `json:"problem_coverage_to"`
+	ProblemCoverageLagSec     int64                             `json:"problem_coverage_lag_sec"`
+	ProblemPendingMinutes     int64                             `json:"problem_pending_minutes"`
+	ProblemSamplerLastSuccess int64                             `json:"problem_sampler_last_success"`
+	ProblemSamplerLastFailure int64                             `json:"problem_sampler_last_failure"`
+	ProblemMigration          stabilityProblemMigrationProgress `json:"problem_migration"`
+	NginxEnabled              bool                              `json:"nginx_enabled"`
+	NginxStatus               string                            `json:"nginx_status"`
+	NginxConnected            bool                              `json:"nginx_connected"`
+	NginxHealthySources       int                               `json:"nginx_healthy_sources"`
+	NginxSourceCount          int                               `json:"nginx_source_count"`
+	NginxLastTs               int64                             `json:"nginx_last_ts"`
+	RequestIDCoverage         *float64                          `json:"request_id_coverage"`
 }
 
 type StabilityReportMeta struct {
@@ -338,7 +342,7 @@ const stabilityAggColumns = `
 	COALESCE(SUM(sh.err_other),0) AS err_other`
 
 func (s stabilityScope) sqlWhere(alias string) (string, []any) {
-	where := " WHERE " + alias + ".hour_ts >= ? AND " + alias + ".hour_ts < ?"
+	where := " WHERE " + alias + ".hour_ts >= ? AND " + alias + ".hour_ts < ? AND " + stabilityEffectiveSampleSQL(alias)
 	args := []any{s.FromTs, s.ToTs}
 	if s.Group != "" {
 		where += " AND " + alias + ".grp = ?"
@@ -357,6 +361,24 @@ func (s stabilityScope) sqlWhere(alias string) (string, []any) {
 		args = append(args, s.Vendor)
 	}
 	return where, args
+}
+
+// stabilityEffectiveSampleSQL 是稳定性报表的升级兼容读取层。同一小时
+// 只有 v5 完整性台账已签收时才用 v5 替换旧事实；否则继续回退到
+// 旧版小时事实。无旧事实的纯 v5 行仍可读，但覆盖状态依然由 complete
+// 台账决定。这使冷迁移期间仍能查看历史，又不会将新旧两版叠加。
+func stabilityEffectiveSampleSQL(alias string) string {
+	v := strconv.Itoa(userTrafficClassificationVersion)
+	return "((" + alias + ".traffic_class_version=" + v +
+		" AND (EXISTS (SELECT 1 FROM stability_hour_ingest_states v5hs WHERE v5hs.hour_ts=" + alias + ".hour_ts AND v5hs.status='complete' AND v5hs.traffic_class_version=" + v + ")" +
+		" OR NOT EXISTS (SELECT 1 FROM stability_hour_samples legacysh WHERE legacysh.hour_ts=" + alias + ".hour_ts AND COALESCE(legacysh.traffic_class_version,0)<>" + v + ")))" +
+		" OR (COALESCE(" + alias + ".traffic_class_version,0)<>" + v +
+		" AND NOT EXISTS (SELECT 1 FROM stability_hour_ingest_states v5hs WHERE v5hs.hour_ts=" + alias + ".hour_ts AND v5hs.status='complete' AND v5hs.traffic_class_version=" + v + ")))"
+}
+
+func stabilityEffectiveRejectCoverageSQL(alias string) string {
+	return "(EXISTS (SELECT 1 FROM stability_hour_ingest_states rhs WHERE rhs.hour_ts=" + alias + ".hour_ts AND rhs.status='complete')" +
+		" OR EXISTS (SELECT 1 FROM stability_hour_samples rsh WHERE rsh.hour_ts=" + alias + ".hour_ts AND " + stabilityEffectiveSampleSQL("rsh") + "))"
 }
 
 func (m *Monitor) queryStabilityDims(ctx context.Context, scope stabilityScope, limit int) ([]stabilityDimRow, bool, error) {
@@ -385,19 +407,22 @@ func (m *Monitor) queryStabilityRejects(ctx context.Context, scope stabilityScop
 	if scope.ChannelID > 0 || scope.Vendor != "" {
 		return nil, nil
 	}
-	where := " WHERE hour_ts >= ? AND hour_ts < ?"
+	// rejection 小时表是历史无版本表。只在同小时有可服务的新/旧事实
+	// 或完整性台账时合并，不得把真正未覆盖的日期画成 0% 稳定性。
+	where := " WHERE " + stabilityEffectiveRejectCoverageSQL("sr") + " AND sr.hour_ts >= ? AND sr.hour_ts < ?"
 	args := []any{scope.FromTs, scope.ToTs}
 	if scope.Group != "" {
-		where += " AND grp = ?"
+		where += " AND sr.grp = ?"
 		args = append(args, scope.Group)
 	}
 	if scope.Model != "" {
-		where += " AND model = ?"
+		where += " AND sr.model = ?"
 		args = append(args, scope.Model)
 	}
 	var rows []stabilityRejectRow
-	err := m.storeDB.WithContext(ctx).Raw(`SELECT grp, model, COALESCE(SUM(count),0) AS count FROM stability_reject_hours`+
-		where+` GROUP BY grp, model`, args...).Scan(&rows).Error
+	err := m.storeDB.WithContext(ctx).Raw(`SELECT sr.grp, sr.model, COALESCE(SUM(sr.count),0) AS count
+		FROM stability_reject_hours sr`+
+		where+` GROUP BY sr.grp, sr.model`, args...).Scan(&rows).Error
 	return rows, err
 }
 
@@ -432,22 +457,23 @@ func (m *Monitor) queryStabilityRejectDaily(ctx context.Context, scope stability
 	if scope.ChannelID > 0 || scope.Vendor != "" {
 		return out, nil
 	}
-	where := " WHERE hour_ts >= ? AND hour_ts < ?"
+	where := " WHERE " + stabilityEffectiveRejectCoverageSQL("sr") + " AND sr.hour_ts >= ? AND sr.hour_ts < ?"
 	args := []any{scope.FromTs, scope.ToTs}
 	if scope.Group != "" {
-		where += " AND grp = ?"
+		where += " AND sr.grp = ?"
 		args = append(args, scope.Group)
 	}
 	if scope.Model != "" {
-		where += " AND model = ?"
+		where += " AND sr.model = ?"
 		args = append(args, scope.Model)
 	}
 	var rows []struct {
 		Day, Grp string
 		Count    int64
 	}
-	err := m.storeDB.WithContext(ctx).Raw(`SELECT strftime('%Y-%m-%d', hour_ts, 'unixepoch', '+8 hours') AS day,
-		grp, COALESCE(SUM(count),0) AS count FROM stability_reject_hours`+where+` GROUP BY day, grp`, args...).Scan(&rows).Error
+	err := m.storeDB.WithContext(ctx).Raw(`SELECT strftime('%Y-%m-%d', sr.hour_ts, 'unixepoch', '+8 hours') AS day,
+		sr.grp, COALESCE(SUM(sr.count),0) AS count FROM stability_reject_hours sr`+
+		where+` GROUP BY day, sr.grp`, args...).Scan(&rows).Error
 	for _, r := range rows {
 		if out[r.Grp] == nil {
 			out[r.Grp] = map[string]int64{}
@@ -527,14 +553,14 @@ func (m *Monitor) queryStabilityRejectTimeline(ctx context.Context, scope stabil
 	if scope.ChannelID > 0 || scope.Vendor != "" {
 		return out, nil
 	}
-	where := " WHERE hour_ts >= ? AND hour_ts < ?"
+	where := " WHERE " + stabilityEffectiveRejectCoverageSQL("sr") + " AND sr.hour_ts >= ? AND sr.hour_ts < ?"
 	args := []any{step, step, scope.FromTs, scope.ToTs}
 	if scope.Group != "" {
-		where += " AND grp = ?"
+		where += " AND sr.grp = ?"
 		args = append(args, scope.Group)
 	}
 	if scope.Model != "" {
-		where += " AND model = ?"
+		where += " AND sr.model = ?"
 		args = append(args, scope.Model)
 	}
 	var rows []struct {
@@ -542,9 +568,10 @@ func (m *Monitor) queryStabilityRejectTimeline(ctx context.Context, scope stabil
 		Grp      string
 		Count    int64
 	}
-	err := m.storeDB.WithContext(ctx).Raw(`SELECT (((hour_ts + 28800) / ?) * ? - 28800) AS bucket_ts,
-		grp, COALESCE(SUM(count),0) AS count FROM stability_reject_hours`+where+`
-		GROUP BY bucket_ts, grp`, args...).Scan(&rows).Error
+	err := m.storeDB.WithContext(ctx).Raw(`SELECT (((sr.hour_ts + 28800) / ?) * ? - 28800) AS bucket_ts,
+		sr.grp, COALESCE(SUM(sr.count),0) AS count FROM stability_reject_hours sr`+
+		where+`
+		GROUP BY bucket_ts, sr.grp`, args...).Scan(&rows).Error
 	for _, r := range rows {
 		if out[r.Grp] == nil {
 			out[r.Grp] = map[int64]int64{}
@@ -974,7 +1001,8 @@ func (m *Monitor) buildStabilityReportWithDetails(ctx context.Context, scope sta
 	meta := StabilityReportMeta{From: time.Unix(scope.FromTs, 0).In(cstLocation).Format("2006-01-02"), To: time.Unix(scope.ToTs-1, 0).In(cstLocation).Format("2006-01-02"), GeneratedAt: now, RetentionDays: queryDays, RowsTruncated: false, ComparisonAvailable: comparisonCoverage.Complete, ComparisonCoverage: comparisonCoverage, TimelineBucketSec: timelineStep}
 	meta.DataCoverage = m.stabilityDataCoverage(ctx, scope.FromTs, scope.ToTs, now)
 	var coverage struct{ Min, Max int64 }
-	warnReadErr("stability coverage", m.storeDB.WithContext(ctx).Raw("SELECT COALESCE(MIN(hour_ts),0) min, COALESCE(MAX(hour_ts),0) max FROM stability_hour_samples").Scan(&coverage))
+	warnReadErr("stability coverage", m.storeDB.WithContext(ctx).Raw(
+		"SELECT COALESCE(MIN(sh.hour_ts),0) min, COALESCE(MAX(sh.hour_ts),0) max FROM stability_hour_samples sh WHERE "+stabilityEffectiveSampleSQL("sh")).Scan(&coverage))
 	meta.FirstDataTs, meta.LastDataTs = coverage.Min, coverage.Max
 	if lastBucket := m.storeFreshness(); lastBucket > 0 {
 		meta.Sources.NewAPILastTs = lastBucket + 60
@@ -984,22 +1012,22 @@ func (m *Monitor) buildStabilityReportWithDetails(ctx context.Context, scope sta
 		}
 	}
 	var problemLast struct{ Max int64 }
-	warnReadErr("stability problem freshness", m.storeDB.WithContext(ctx).Raw("SELECT COALESCE(MAX(last_ts),0) max FROM stability_problem_samples WHERE source='newapi'").Scan(&problemLast))
+	warnReadErr("stability problem freshness", m.storeDB.WithContext(ctx).Raw(
+		"SELECT COALESCE(MAX(last_ts),0) max FROM stability_problem_samples WHERE source='newapi' AND traffic_class_version=?",
+		userTrafficClassificationVersion).Scan(&problemLast))
 	meta.Sources.ProblemLastTs = problemLast.Max
-	var problemCoverage struct {
-		MaxComplete int64
-		Pending     int64
+	var problemLive StabilityProblemLiveCursor
+	if err := m.storeDB.WithContext(ctx).First(&problemLive, "id = ? AND traffic_class_version = ?", 1, userTrafficClassificationVersion).Error; err == nil {
+		meta.Sources.ProblemCoverageTo = problemLive.NextTs
+		if problemLive.TargetThroughTs > problemLive.NextTs {
+			meta.Sources.ProblemPendingMinutes = (problemLive.TargetThroughTs - problemLive.NextTs + 59) / 60
+		}
+	} else if !errors.Is(err, gorm.ErrRecordNotFound) {
+		slog.Warn("读取稳定性问题实时水位失败", "err", err)
 	}
-	warnReadErr("stability problem ingest coverage", m.storeDB.WithContext(ctx).Raw(`SELECT
-		COALESCE(MAX(CASE WHEN complete THEN bucket_ts END),0) max_complete,
-		COALESCE(SUM(CASE WHEN complete THEN 0 ELSE 1 END),0) pending
-		FROM stability_problem_ingest_states`).Scan(&problemCoverage))
-	if problemCoverage.MaxComplete > 0 {
-		meta.Sources.ProblemCoverageTo = problemCoverage.MaxComplete + 60
-	}
-	meta.Sources.ProblemPendingMinutes = problemCoverage.Pending
 	meta.Sources.ProblemSamplerLastSuccess = m.problemLastSuccess.Load()
 	meta.Sources.ProblemSamplerLastFailure = m.problemLastFailure.Load()
+	meta.Sources.ProblemMigration = m.stabilityProblemMigrationProgress()
 	if meta.Sources.NewAPILastTs > meta.Sources.ProblemCoverageTo && meta.Sources.ProblemCoverageTo > 0 {
 		meta.Sources.ProblemCoverageLagSec = meta.Sources.NewAPILastTs - meta.Sources.ProblemCoverageTo
 	}

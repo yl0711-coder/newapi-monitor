@@ -26,6 +26,11 @@ func seedUpstreamBalanceAssessment(t *testing.T, m *Monitor, now int64) (string,
 	if err := m.storeDB.Create(&ChannelDomainGroupCost{Domain: domain, Grp: "codex", Multiplier: 1, DiscountFactor: 1}).Error; err != nil {
 		t.Fatal(err)
 	}
+	if err := m.storeDB.Create(&ChannelFinanceChannelCost{
+		ChannelID: 33, Grp: "codex", UpstreamGroupName: "upstream", Multiplier: 1, DiscountFactor: 1,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
 	states := make([]StabilityHourIngestState, 0, (to-from)/3600)
 	for hour := from; hour < to; hour += 3600 {
 		states = append(states, StabilityHourIngestState{HourTs: hour, Status: "complete"})
@@ -76,6 +81,68 @@ func TestUpstreamBalanceAssessmentUsesCompleteLocalHoursAndConfiguredRates(t *te
 	assessment = assessUpstreamBalance(account, estimates[domain], coverage, policy, now, 5)
 	if assessment.Status != "healthy" || assessment.EstimatedRunwayDays == nil || math.Abs(*assessment.EstimatedRunwayDays-2) > 1e-9 {
 		t.Fatalf("healthy assessment=%+v", assessment)
+	}
+}
+
+func TestUpstreamBurnAddsInternalTestsAsCostWithoutCountingThemAsRevenue(t *testing.T) {
+	m := newStabilityTestMonitor(t)
+	now := time.Date(2026, 8, 8, 12, 0, 0, 0, cstLocation).Unix()
+	domain, _, cfg := seedUpstreamBalanceAssessment(t, m, now)
+	from, _ := upstreamBalanceWindow(now, 7)
+	rows := make([]ChannelTestHourSample, 0, 7)
+	for day := 0; day < 7; day++ {
+		rows = append(rows, ChannelTestHourSample{
+			HourTs: from + int64(day*24)*3600, ChannelID: 33, ModelName: "gpt", Grp: "internal",
+			Origin: "legacy", Scope: "legacy", CostBasis: "legacy_assumed_base",
+			Requests: 6, Tokens: 60, Quota: int64(10 * quotaPerUSD),
+		})
+	}
+	if err := m.storeDB.Create(&rows).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	estimates, coverage, err := m.loadUpstreamBurnEstimates(context.Background(), now, upstreamBalancePolicyFor(cfg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 用户请求每天贡献 $50 上游成本；测试 quota 是未乘网站倍率的成本基数，
+	// 每天再贡献 $10。测试请求没有写回 stability_hour_samples，因此不会成为收入。
+	if !coverage.Complete || math.Abs(estimates[domain].AverageDailyCostUSD-60) > 1e-9 {
+		t.Fatalf("内部测试成本没有独立计入上游消耗: coverage=%+v estimate=%+v", coverage, estimates[domain])
+	}
+	var revenueRows int64
+	if err := m.storeDB.Model(&StabilityHourSample{}).Where("grp = ?", "internal").Count(&revenueRows).Error; err != nil {
+		t.Fatal(err)
+	}
+	if revenueRows != 0 {
+		t.Fatalf("内部测试不得写入用户收入事实，rows=%d", revenueRows)
+	}
+}
+
+func TestUpstreamBurnNormalizesLegacyTieredTestQuotaBySiteMultiplier(t *testing.T) {
+	m := newStabilityTestMonitor(t)
+	now := time.Date(2026, 8, 8, 12, 0, 0, 0, cstLocation).Unix()
+	domain, _, cfg := seedUpstreamBalanceAssessment(t, m, now)
+	from, _ := upstreamBalanceWindow(now, 7)
+	rows := make([]ChannelTestHourSample, 0, 7)
+	for day := 0; day < 7; day++ {
+		// tiered_expr 的旧 NewAPI quota 已经乘过 codex=2 的网站倍率。
+		// $20 / 2 * 上游倍率1 = $10，加用户流量 $50，日均应为 $60。
+		rows = append(rows, ChannelTestHourSample{
+			HourTs: from + int64(day*24)*3600, ChannelID: 33, ModelName: "gpt", Grp: "codex",
+			Origin: "legacy", Scope: "legacy", CostBasis: "legacy_after_group",
+			Requests: 1, Tokens: 10, Quota: int64(20 * quotaPerUSD),
+		})
+	}
+	if err := m.storeDB.Create(&rows).Error; err != nil {
+		t.Fatal(err)
+	}
+	estimates, coverage, err := m.loadUpstreamBurnEstimates(context.Background(), now, upstreamBalancePolicyFor(cfg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !coverage.Complete || len(estimates[domain].MissingGroups) != 0 || math.Abs(estimates[domain].AverageDailyCostUSD-60) > 1e-9 {
+		t.Fatalf("tiered internal-test cost was not normalized: coverage=%+v estimate=%+v", coverage, estimates[domain])
 	}
 }
 

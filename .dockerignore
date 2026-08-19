@@ -7,6 +7,7 @@
 !go.mod
 !go.sum
 !main.go
+!restore_command.go
 !monitor/
 monitor/**
 !monitor/*.go
@@ -17,6 +18,11 @@ monitor/**
 monitor/public/**
 !monitor/public/*.go
 !monitor/public/*.html
+!internal/
+internal/**
+!internal/trafficclass/
+internal/trafficclass/**
+!internal/trafficclass/*.go
 !cmd/
 cmd/**
 !cmd/hostagent/

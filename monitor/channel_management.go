@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -35,6 +36,27 @@ type ChannelManagementFinanceGroup struct {
 	Finance ChannelGroupFinanceView `json:"finance"`
 }
 
+// ChannelManagementRateConfig 只表达渠道倍率配置是否足以做上游成本对照，
+// 不把“网站分组倍率”或财务利润结算混入该判断。
+type ChannelManagementRateConfig struct {
+	EnabledChannels    int  `json:"enabled_channels"`
+	ConfiguredChannels int  `json:"configured_channels"`
+	Complete           bool `json:"complete"`
+}
+
+// ChannelUpstreamUsageMetrics 是上游账户日志的本地小时汇总。它按上游账户（主域名）
+// 归集，不能推断为某一条实际渠道的上游账单。
+type ChannelUpstreamUsageMetrics struct {
+	Available      bool    `json:"available"`
+	Requests       int64   `json:"requests"`
+	Tokens         int64   `json:"tokens"`
+	CostUSD        float64 `json:"cost_usd"`
+	ExpectedHours  int64   `json:"expected_hours"`
+	CompletedHours int64   `json:"completed_hours"`
+	Complete       bool    `json:"complete"`
+	DataUntil      int64   `json:"data_until"`
+}
+
 type ChannelManagementChannel struct {
 	ID               int                      `json:"id"`
 	Name             string                   `json:"name"`
@@ -62,6 +84,8 @@ type ChannelManagementDomain struct {
 	Usage         ChannelUsageMetrics             `json:"usage"`
 	Finance       ChannelDomainFinanceView        `json:"finance"`
 	Upstream      ChannelUpstreamAccountView      `json:"upstream"`
+	RateConfig    ChannelManagementRateConfig     `json:"rate_config"`
+	UpstreamUsage ChannelUpstreamUsageMetrics     `json:"upstream_usage"`
 	FinanceGroups []ChannelManagementFinanceGroup `json:"finance_groups"`
 	Groups        []ChannelManagementGroup        `json:"groups"`
 	Vendors       []ChannelManagementVendor       `json:"vendors"`
@@ -155,6 +179,18 @@ type channelVendorBuild struct {
 	Channels []*channelManagementBuild
 }
 
+// channelManagementStatusRank 保证维护页优先呈现仍启用的真实渠道；停用/自动
+// 禁用渠道保留用于核对，但统一置后，已删除历史快照最后显示。
+func channelManagementStatusRank(ch *channelManagementBuild) int {
+	if !ch.Current {
+		return 2
+	}
+	if ch.Status == 1 {
+		return 0
+	}
+	return 1
+}
+
 type channelDomainBuild struct {
 	Key           string
 	Domain        string
@@ -233,6 +269,70 @@ func managementFinanceGroups(names map[string]bool, domain string, finance chann
 	return out
 }
 
+func managementRateConfig(domain *channelDomainBuild, finance channelFinanceSnapshot) ChannelManagementRateConfig {
+	view := ChannelManagementRateConfig{}
+	for _, vendor := range domain.Vendors {
+		for _, channel := range vendor.Channels {
+			if !channel.Current || channel.Status != 1 {
+				continue
+			}
+			view.EnabledChannels++
+			if finance.channelRateConfigured(domain.Domain, channel.ID) {
+				view.ConfiguredChannels++
+			}
+		}
+	}
+	view.Complete = view.EnabledChannels > 0 && view.EnabledChannels == view.ConfiguredChannels
+	return view
+}
+
+func expectedUpstreamUsageHours(scope stabilityScope, now int64) int64 {
+	end := scope.ToTs
+	completeUntil := now - now%3600
+	if end > completeUntil {
+		end = completeUntil
+	}
+	if end <= scope.FromTs {
+		return 0
+	}
+	return (end - scope.FromTs) / 3600
+}
+
+func (m *Monitor) loadChannelUpstreamUsage(ctx context.Context, scope stabilityScope, now int64, accounts map[string]ChannelUpstreamAccountView) (map[string]ChannelUpstreamUsageMetrics, error) {
+	type row struct {
+		Domain         string
+		Requests       int64
+		Tokens         int64
+		CostUSD        float64
+		CompletedHours int64
+		DataUntil      int64
+	}
+	var rows []row
+	if err := m.storeDB.WithContext(ctx).Raw(`SELECT domain,
+		COALESCE(SUM(requests),0) requests, COALESCE(SUM(tokens),0) tokens,
+		COALESCE(SUM(cost_usd),0) cost_usd, COUNT(*) completed_hours,
+		COALESCE(MAX(hour_ts)+3600,0) data_until
+		FROM channel_upstream_usage_hours WHERE hour_ts >= ? AND hour_ts < ?
+		GROUP BY domain`, scope.FromTs, scope.ToTs).Scan(&rows).Error; err != nil {
+		return nil, err
+	}
+	expected := expectedUpstreamUsageHours(scope, now)
+	result := make(map[string]ChannelUpstreamUsageMetrics, len(rows))
+	for _, row := range rows {
+		account, configured := accounts[row.Domain]
+		if !configured || !account.UsageSyncEnabled {
+			continue
+		}
+		result[row.Domain] = ChannelUpstreamUsageMetrics{
+			Available: true, Requests: row.Requests, Tokens: row.Tokens, CostUSD: row.CostUSD,
+			ExpectedHours: expected, CompletedHours: row.CompletedHours,
+			Complete:  expected == 0 || row.CompletedHours >= expected,
+			DataUntil: row.DataUntil,
+		}
+	}
+	return result, nil
+}
+
 func (m *Monitor) buildChannelManagementReport(ctx context.Context, scope stabilityScope, now int64) (*ChannelManagementReport, error) {
 	finance, err := m.loadChannelFinanceSnapshot(ctx)
 	if err != nil {
@@ -245,6 +345,10 @@ func (m *Monitor) buildChannelManagementReport(ctx context.Context, scope stabil
 	upstreamAccounts, err := m.loadChannelUpstreamViews(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("读取上游账户状态: %w", err)
+	}
+	upstreamUsage, err := m.loadChannelUpstreamUsage(ctx, scope, now, upstreamAccounts)
+	if err != nil {
+		return nil, fmt.Errorf("读取上游使用日志汇总: %w", err)
 	}
 	assessments, assessmentErr := m.upstreamBalanceAssessments(ctx, now, upstreamAccounts, m.loadAlertConfig())
 	if assessmentErr != nil {
@@ -334,8 +438,8 @@ func (m *Monitor) buildChannelManagementReport(ctx context.Context, scope stabil
 		COALESCE(SUM(success),0) success,COALESCE(SUM(anomaly),0) anomaly,
 		COALESCE(SUM(failed),0) failed,
 		COALESCE(SUM(tokens),0) tokens,COALESCE(SUM(quota),0) quota
-		FROM stability_hour_samples WHERE hour_ts>=? AND hour_ts<?
-		GROUP BY channel_id,grp LIMIT ?`, scope.FromTs, scope.ToTs, maxChannelManagementRows+1).Scan(&usageRows)
+		FROM stability_hour_samples WHERE hour_ts>=? AND hour_ts<? AND traffic_class_version=?
+		GROUP BY channel_id,grp LIMIT ?`, scope.FromTs, scope.ToTs, userTrafficClassificationVersion, maxChannelManagementRows+1).Scan(&usageRows)
 	if tx.Error != nil {
 		return nil, fmt.Errorf("读取渠道用量汇总: %w", tx.Error)
 	}
@@ -411,6 +515,10 @@ func (m *Monitor) buildChannelManagementReport(ctx context.Context, scope stabil
 		vendors := make([]ChannelManagementVendor, 0, len(domain.Vendors))
 		for _, vendor := range domain.Vendors {
 			sort.Slice(vendor.Channels, func(i, j int) bool {
+				leftRank, rightRank := channelManagementStatusRank(vendor.Channels[i]), channelManagementStatusRank(vendor.Channels[j])
+				if leftRank != rightRank {
+					return leftRank < rightRank
+				}
 				if usageAggLess(vendor.Channels[i].Usage, vendor.Channels[j].Usage) {
 					return true
 				}
@@ -448,6 +556,8 @@ func (m *Monitor) buildChannelManagementReport(ctx context.Context, scope stabil
 			Key: domain.Key, Domain: domain.Domain, Configured: domain.Configured,
 			Usage: domain.Usage.metrics(), Finance: finance.domainView(domain.Domain),
 			Upstream:      upstream,
+			RateConfig:    managementRateConfig(domain, finance),
+			UpstreamUsage: upstreamUsage[domain.Domain],
 			FinanceGroups: managementFinanceGroups(domain.FinanceGroups, domain.Domain, finance),
 			Groups:        managementGroups(domain.Groups, domain.Domain, 0, finance), Vendors: vendors,
 		})
@@ -467,7 +577,8 @@ func (m *Monitor) buildChannelManagementReport(ctx context.Context, scope stabil
 	})
 
 	var coverage struct{ Max int64 }
-	if tx := m.storeDB.WithContext(ctx).Raw("SELECT COALESCE(MAX(hour_ts),0) max FROM stability_hour_samples WHERE hour_ts>=? AND hour_ts<?", scope.FromTs, scope.ToTs).Scan(&coverage); tx.Error != nil {
+	if tx := m.storeDB.WithContext(ctx).Raw("SELECT COALESCE(MAX(hour_ts),0) max FROM stability_hour_samples WHERE hour_ts>=? AND hour_ts<? AND traffic_class_version=?",
+		scope.FromTs, scope.ToTs, userTrafficClassificationVersion).Scan(&coverage); tx.Error != nil {
 		return nil, fmt.Errorf("读取渠道用量新鲜度: %w", tx.Error)
 	}
 	dataUntil := coverage.Max
@@ -478,7 +589,8 @@ func (m *Monitor) buildChannelManagementReport(ctx context.Context, scope stabil
 		}
 	}
 	var latestCoverage struct{ Max int64 }
-	if tx := m.storeDB.WithContext(ctx).Raw("SELECT COALESCE(MAX(hour_ts),0) max FROM stability_hour_samples").Scan(&latestCoverage); tx.Error != nil {
+	if tx := m.storeDB.WithContext(ctx).Raw("SELECT COALESCE(MAX(hour_ts),0) max FROM stability_hour_samples WHERE traffic_class_version=?",
+		userTrafficClassificationVersion).Scan(&latestCoverage); tx.Error != nil {
 		return nil, fmt.Errorf("读取渠道用量全局新鲜度: %w", tx.Error)
 	}
 	latestDataUntil := latestCoverage.Max
@@ -509,13 +621,17 @@ func (m *Monitor) buildChannelManagementReport(ctx context.Context, scope stabil
 	if toTs > scope.FromTs {
 		toTs--
 	}
+	fromFormat, toFormat := "2006-01-02", "2006-01-02"
+	if scope.RangeHours > 0 {
+		fromFormat, toFormat = "2006-01-02 15:04", "2006-01-02 15:04"
+	}
 	return &ChannelManagementReport{
 		Enabled:       true,
 		Finance:       finance.settingsView(),
 		WebsiteGroups: websiteGroups, WebsiteGroupsSyncedAt: websiteGroupsSyncedAt,
 		Meta: ChannelManagementMeta{
-			From: time.Unix(scope.FromTs, 0).In(cstLocation).Format("2006-01-02"),
-			To:   time.Unix(toTs, 0).In(cstLocation).Format("2006-01-02"), GeneratedAt: now,
+			From: time.Unix(scope.FromTs, 0).In(cstLocation).Format(fromFormat),
+			To:   time.Unix(toTs, 0).In(cstLocation).Format(toFormat), GeneratedAt: now,
 			DataUntil: dataUntil, LatestDataUntil: latestDataUntil, ChannelConfigUpdatedAt: configUpdatedAt,
 			TimeZone: "Asia/Shanghai", Source: "monitor_local_hourly_rollup",
 			DataCoverage: m.stabilityDataCoverage(ctx, scope.FromTs, scope.ToTs, now),
@@ -536,7 +652,7 @@ func (m *Monitor) serveChannelManagementReport(c *gin.Context) {
 		return
 	}
 	maxDays := m.cfg.stabilityQueryDays()
-	scope, err := stabilityRange(c, time.Now(), maxDays)
+	scope, err := channelManagementRange(c, time.Now(), maxDays)
 	if err != nil {
 		c.JSON(400, gin.H{"error": err.Error()})
 		return
@@ -552,4 +668,32 @@ func (m *Monitor) serveChannelManagementReport(c *gin.Context) {
 	}
 	report.Finance.CanEdit = c.GetInt("urole") >= roleRoot
 	c.JSON(200, report)
+}
+
+// channelManagementRange keeps the channel report's date shortcuts compatible
+// with stabilityRange, while adding a rolling-hour option scoped to this page.
+// Hourly reports use completed buckets only, so an in-progress hour is never
+// presented as final usage.
+func channelManagementRange(c *gin.Context, now time.Time, maxDays int) (stabilityScope, error) {
+	rawHours := strings.TrimSpace(c.Query("hours"))
+	if rawHours == "" {
+		return stabilityRange(c, now, maxDays)
+	}
+	if strings.TrimSpace(c.Query("from")) != "" || strings.TrimSpace(c.Query("to")) != "" || strings.TrimSpace(c.Query("days")) != "" {
+		return stabilityScope{}, fmt.Errorf("hours 不能与 days、from 或 to 同时提供")
+	}
+	hours, err := strconv.Atoi(rawHours)
+	if err != nil || hours < 1 {
+		return stabilityScope{}, fmt.Errorf("hours 必须为正整数")
+	}
+	if maxDays <= 0 {
+		maxDays = 90
+	}
+	if hours > maxDays*24 {
+		return stabilityScope{}, fmt.Errorf("查询范围不能超过 %d 天", maxDays)
+	}
+	now = now.In(cstLocation)
+	end := time.Date(now.Year(), now.Month(), now.Day(), now.Hour(), 0, 0, 0, cstLocation)
+	start := end.Add(-time.Duration(hours) * time.Hour)
+	return stabilityScope{FromTs: start.Unix(), ToTs: end.Unix(), RangeHours: hours}, nil
 }

@@ -1,16 +1,20 @@
 package monitor
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
+	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/glebarez/sqlite"
+	"github.com/yl0711-coder/newapi-monitor/internal/trafficclass"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 	"gorm.io/gorm/logger"
@@ -18,6 +22,18 @@ import (
 
 // store.go:监控自带的本地采样库(独立 sqlite,不碰 new-api 的库)。
 // 页面只读这里;唯一写入者是采样器。所有存储函数挂在 Monitor 上,用 m.storeDB。
+
+// userTrafficClassificationVersion 标记“已经排除渠道内部测试”的聚合口径。
+// v2 同时识别旧版批量/定时测试产生的无 request_id 错误日志。旧版本数据可能
+// 混有测试流量，读取时必须 fail-closed，等待后台按小时重算；不能把旧聚合继续
+// 伪装成用户流量。
+const userTrafficClassificationVersion = trafficclass.Current
+
+var (
+	currentMetricTrafficFilter = fmt.Sprintf(" AND metric_samples.traffic_class_version = %d", userTrafficClassificationVersion)
+	currentTokenTrafficFilter  = fmt.Sprintf(" AND token_samples.traffic_class_version = %d", userTrafficClassificationVersion)
+	currentHourTrafficFilter   = fmt.Sprintf(" AND hour_samples.traffic_class_version = %d", userTrafficClassificationVersion)
+)
 
 // warnReadErr:读路径统一 fail-open——出错按"无数据"返回,页面显示空而不中断监控;
 // 但必须留痕,否则真实的库损坏/schema 漂移会被静默成"没数据",误导排障。
@@ -30,10 +46,11 @@ func warnReadErr(op string, tx *gorm.DB) {
 // MetricSample 按【分钟桶 × 渠道 × 模型 × 分组】聚合的一行采样。
 // 复合主键使采样可幂等 UPSERT,自愈小的采集间隙。
 type MetricSample struct {
-	BucketTs  int64  `gorm:"primaryKey;autoIncrement:false;index:idx_metric_bucket"`
-	ChannelID int    `gorm:"primaryKey;autoIncrement:false"`
-	ModelName string `gorm:"primaryKey;size:128"`
-	Grp       string `gorm:"primaryKey;size:64;column:grp"`
+	BucketTs            int64  `gorm:"primaryKey;autoIncrement:false;index:idx_metric_bucket"`
+	ChannelID           int    `gorm:"primaryKey;autoIncrement:false"`
+	ModelName           string `gorm:"primaryKey;size:128"`
+	Grp                 string `gorm:"primaryKey;size:64;column:grp"`
+	TrafficClassVersion int    `gorm:"column:traffic_class_version;index"`
 
 	Success int64 // 干净成功(type=2 且已交付:completion_tokens>0 且流正常结束)
 	// Anomaly 交付异常(B 类):上游没明确拒绝,但用户没拿到东西。判据见 sampler.go 的 ANOM。
@@ -79,28 +96,51 @@ type MetricSample struct {
 	TtftMaxMs int   `gorm:"column:ttft_max_ms"` // 最大 frt(ms),用于分位末档收尾
 }
 
+func (s *MetricSample) BeforeCreate(_ *gorm.DB) error {
+	if s.TrafficClassVersion == 0 {
+		s.TrafficClassVersion = userTrafficClassificationVersion
+	}
+	return nil
+}
+
 // TokenSample 按【分钟桶 × 令牌(API Key)】聚合,用于"谁在制造错误 / 烧配额"维度。
 // 故意比 MetricSample 轻(不交叉渠道/模型)以控制基数。
 type TokenSample struct {
-	BucketTs  int64  `gorm:"primaryKey;autoIncrement:false;index"`
-	TokenName string `gorm:"primaryKey;size:128;column:token_name"`
-	Success   int64
-	Anomaly   int64
-	Failed    int64
-	Tokens    int64
-	Quota     int64
+	BucketTs            int64  `gorm:"primaryKey;autoIncrement:false;index"`
+	TokenName           string `gorm:"primaryKey;size:128;column:token_name"`
+	Success             int64
+	Anomaly             int64
+	Failed              int64
+	Tokens              int64
+	Quota               int64
+	TrafficClassVersion int `gorm:"column:traffic_class_version;index"`
+}
+
+func (s *TokenSample) BeforeCreate(_ *gorm.DB) error {
+	if s.TrafficClassVersion == 0 {
+		s.TrafficClassVersion = userTrafficClassificationVersion
+	}
+	return nil
 }
 
 // HourSample 小时级汇总(rollup):每小时一行总览,长期留存(默认 90 天),支撑长期趋势 + 同比环比。
 // 由分钟级 metric_samples 周期性汇总而来;存储只随时间增长(每小时 1 行),与请求量无关。
 type HourSample struct {
-	HourTs     int64 `gorm:"primaryKey;autoIncrement:false"`
-	Success    int64
-	Anomaly    int64
-	Failed     int64
-	Tokens     int64
-	Quota      int64
-	SumUseTime int64
+	HourTs              int64 `gorm:"primaryKey;autoIncrement:false"`
+	Success             int64
+	Anomaly             int64
+	Failed              int64
+	Tokens              int64
+	Quota               int64
+	SumUseTime          int64
+	TrafficClassVersion int `gorm:"column:traffic_class_version;index"`
+}
+
+func (s *HourSample) BeforeCreate(_ *gorm.DB) error {
+	if s.TrafficClassVersion == 0 {
+		s.TrafficClassVersion = userTrafficClassificationVersion
+	}
+	return nil
 }
 
 // ChannelSnap 渠道健康快照:采样器周期性从生产 channels 表读入(id/状态/分组/模型),
@@ -251,6 +291,405 @@ type NginxSourceState struct {
 	LastDiscardedAt           int64
 }
 
+// UsageHourFact 是用户用量的本地小时事实。它只保存消费/退款的聚合数字，
+// 不保存原始日志、请求内容、Key 或错误详情；既能把页面读取从生产 logs 表移开，
+// 也为后续按渠道核对成本保留必要的 channel_id 维度。
+//
+// DayTs 是该小时所属的 CST 自然日零点。完整自然日会再汇总成 UsageDailyFact；
+// 未完成的当天/缺口日仍直接从小时事实读取，因此不会把缺口错误显示成零流量。
+type UsageHourFact struct {
+	HourTs    int64  `gorm:"primaryKey;autoIncrement:false;index:idx_usage_hour_fact_hour_user,priority:1"`
+	UserID    int64  `gorm:"primaryKey;autoIncrement:false;index:idx_usage_hour_fact_hour_user,priority:2"`
+	ChannelID int64  `gorm:"primaryKey;autoIncrement:false"`
+	Grp       string `gorm:"primaryKey;size:128;column:grp"`
+	ModelName string `gorm:"primaryKey;size:255;column:model_name"`
+	TokenID   int64  `gorm:"primaryKey;autoIncrement:false"`
+	DayTs     int64  `gorm:"index:idx_usage_hour_fact_day;column:day_ts"`
+	TokenName string `gorm:"size:255;column:token_name"` // 日志已有的展示名；不含 token key
+
+	Requests         int64 `gorm:"column:requests"`
+	RefundRecords    int64 `gorm:"column:refund_records"`
+	PromptTokens     int64 `gorm:"column:prompt_tokens"`
+	CompletionTokens int64 `gorm:"column:completion_tokens"`
+	ConsumeQuota     int64 `gorm:"column:consume_quota"`
+	RefundQuota      int64 `gorm:"column:refund_quota"`
+}
+
+// UsageDailyFact 是已完整采到的 CST 自然日聚合。查询优先走它，只有尚未闭合的
+// 当天或存在采集缺口的日期才回退读取该日的小时事实，兼顾历史查询性能与数据诚实性。
+type UsageDailyFact struct {
+	DateTs    int64  `gorm:"primaryKey;autoIncrement:false;index:idx_usage_daily_fact_date_user,priority:1"`
+	UserID    int64  `gorm:"primaryKey;autoIncrement:false;index:idx_usage_daily_fact_date_user,priority:2"`
+	ChannelID int64  `gorm:"primaryKey;autoIncrement:false"`
+	Grp       string `gorm:"primaryKey;size:128;column:grp"`
+	ModelName string `gorm:"primaryKey;size:255;column:model_name"`
+	TokenID   int64  `gorm:"primaryKey;autoIncrement:false"`
+	TokenName string `gorm:"size:255;column:token_name"`
+
+	Requests         int64 `gorm:"column:requests"`
+	RefundRecords    int64 `gorm:"column:refund_records"`
+	PromptTokens     int64 `gorm:"column:prompt_tokens"`
+	CompletionTokens int64 `gorm:"column:completion_tokens"`
+	ConsumeQuota     int64 `gorm:"column:consume_quota"`
+	RefundQuota      int64 `gorm:"column:refund_quota"`
+}
+
+// UsageFactMemberDayState 是日事实的内容证明。小时明细默认只保留近期 8 天，
+// 更早历史无法再用 24 小时明细现场重算；因此每次日事实从已核验小时原子重建时，
+// 同事务保存成员×自然日的稳定内容指纹。发布前和周期语义审计会重新读取日事实
+// 与该指纹比对，防止 quick_check 正常但业务行被误删/误迁移后仍继续提供错误数据。
+// 空流量日同样保存空集合指纹，能区分“确实为零”和“从未构建”。
+type UsageFactMemberDayState struct {
+	UserID                int64  `gorm:"primaryKey;autoIncrement:false;column:user_id"`
+	DateTs                int64  `gorm:"primaryKey;autoIncrement:false;index:idx_usage_fact_member_day_date,priority:1;column:date_ts"`
+	Status                string `gorm:"size:16;index:idx_usage_fact_member_day_status;column:status"`
+	Rows                  int    `gorm:"column:rows"` // legacy fact-row count; retained for rollback compatibility
+	SourceRows            int64  `gorm:"column:source_rows"`
+	Requests              int64  `gorm:"column:requests"`
+	RefundRecords         int64  `gorm:"column:refund_records"`
+	Tokens                int64  `gorm:"column:tokens"` // legacy prompt+completion total
+	PromptTokens          int64  `gorm:"column:prompt_tokens"`
+	CompletionTokens      int64  `gorm:"column:completion_tokens"`
+	ConsumeQuota          int64  `gorm:"column:consume_quota"`
+	RefundQuota           int64  `gorm:"column:refund_quota"`
+	ContentHash           string `gorm:"size:64;column:content_hash"` // legacy alias used by the current semantic audit
+	SourceResultHash      string `gorm:"size:64;column:source_result_hash"`
+	FactContentHash       string `gorm:"size:64;column:fact_content_hash"`
+	ClassificationVersion int    `gorm:"column:classification_version"`
+	QuerySemanticsVersion int    `gorm:"column:query_semantics_version"`
+	SourceEpoch           string `gorm:"size:64;column:source_epoch"`
+	SourceCheckedAt       int64  `gorm:"column:source_checked_at"`
+	CompletedAt           int64  `gorm:"column:completed_at"`
+	JobID                 string `gorm:"size:80;index;column:job_id"`
+	Attempts              int    `gorm:"column:attempts"`
+	LastError             string `gorm:"size:512;column:last_error"`
+	UpdatedAt             int64  `gorm:"index;column:updated_at"`
+}
+
+// UsageHourIngestState 是每个小时的本地采集水位。即使该小时没有任何消费日志，
+// 成功读取也会写一条 complete 状态，避免把“零流量”误判为“漏采”。
+type UsageHourIngestState struct {
+	HourTs      int64  `gorm:"primaryKey;autoIncrement:false;column:hour_ts"`
+	Status      string `gorm:"size:16;index:idx_usage_hour_ingest_status;column:status"` // complete / failed / queued
+	Rows        int    `gorm:"column:rows"`
+	Requests    int64  `gorm:"column:requests"`
+	Tokens      int64  `gorm:"column:tokens"`
+	ContentHash string `gorm:"size:64;column:content_hash"` // 小时聚合内容指纹，用于低频补漏与幂等校验
+	Attempts    int    `gorm:"column:attempts"`
+	UpdatedAt   int64  `gorm:"index;column:updated_at"`
+	CompletedAt int64  `gorm:"column:completed_at"`
+	LastError   string `gorm:"size:512;column:last_error"`
+}
+
+// UsageFactMemberState 为每个关注用户维护独立的历史回填游标。成员增删时只会
+// 新建/停用对应行，不再清空所有小时台账：新增用户只补自己的历史，已有用户
+// 继续服务已发布事实，删除用户则立即从权限交集移除。
+type UsageFactMemberState struct {
+	UserID              int64  `gorm:"primaryKey;autoIncrement:false;column:user_id"`
+	Active              bool   `gorm:"index:idx_usage_fact_member_active_cursor,priority:1;column:active"`
+	TrackedRevision     int64  `gorm:"column:tracked_revision"`
+	BackfillWindowDays  int    `gorm:"column:backfill_window_days"`
+	RangeStart          int64  `gorm:"column:range_start"`
+	NextBackfillHour    int64  `gorm:"index:idx_usage_fact_member_active_cursor,priority:2;column:next_backfill_hour"`
+	SourceFloorHour     *int64 `gorm:"column:source_floor_hour"`
+	SourceFirstLogHour  *int64 `gorm:"column:source_first_log_hour"`
+	SourceCeilingHour   *int64 `gorm:"column:source_ceiling_hour"`
+	CoverageThroughHour *int64 `gorm:"column:coverage_through_hour"`
+	TailThroughHour     *int64 `gorm:"column:tail_through_hour"`
+	// LiveThroughHour is an independent, continuous recent-data cursor. It is
+	// never inferred from cold coverage and never jumps across a failed hour.
+	LiveFromHour      *int64 `gorm:"column:live_from_hour"`
+	LiveThroughHour   *int64 `gorm:"index:idx_usage_fact_member_live_cursor;column:live_through_hour"`
+	LiveTargetHour    *int64 `gorm:"column:live_target_hour"`
+	LiveSpanHours     int    `gorm:"column:live_span_hours"`
+	LiveStatus        string `gorm:"size:24;index;column:live_status"`
+	LiveAttempts      int    `gorm:"column:live_attempts"`
+	LiveNextRetryAt   int64  `gorm:"index;column:live_next_retry_at"`
+	LiveLastServedSeq int64  `gorm:"index:idx_usage_fact_member_live_cursor;column:live_last_served_seq"`
+	LiveLastServedAt  int64  `gorm:"index:idx_usage_fact_member_live_cursor;column:live_last_served_at"`
+	LiveLastSuccessAt int64  `gorm:"column:live_last_success_at"`
+	LiveLastFailureAt int64  `gorm:"column:live_last_failure_at"`
+	LiveLastError     string `gorm:"size:512;column:live_last_error"`
+	// Recent bridge expands the already-fresh live publication backwards to
+	// the normal seven-day UI window without making the current Tail wait for
+	// deep archive import. It is a second continuous cursor: publication only
+	// moves LiveFromHour after the whole bridge has reached its fixed target.
+	RecentFromHour        *int64 `gorm:"column:recent_from_hour"`
+	RecentThroughHour     *int64 `gorm:"index:idx_usage_fact_member_recent_cursor;column:recent_through_hour"`
+	RecentTargetHour      *int64 `gorm:"column:recent_target_hour"`
+	RecentSpanHours       int    `gorm:"column:recent_span_hours"`
+	RecentStatus          string `gorm:"size:24;index;column:recent_status"`
+	RecentAttempts        int    `gorm:"column:recent_attempts"`
+	RecentNextRetryAt     int64  `gorm:"index;column:recent_next_retry_at"`
+	RecentLastServedSeq   int64  `gorm:"index:idx_usage_fact_member_recent_cursor;column:recent_last_served_seq"`
+	RecentLastServedAt    int64  `gorm:"index:idx_usage_fact_member_recent_cursor;column:recent_last_served_at"`
+	RecentLastSuccessAt   int64  `gorm:"column:recent_last_success_at"`
+	RecentLastFailureAt   int64  `gorm:"column:recent_last_failure_at"`
+	RecentLastError       string `gorm:"size:512;column:recent_last_error"`
+	VerifyNextHour        *int64 `gorm:"column:verify_next_hour"`
+	VerifiedThroughHour   *int64 `gorm:"column:verified_through_hour"`
+	VerificationStatus    string `gorm:"size:24;index;column:verification_status"`
+	VerifiedAt            int64  `gorm:"column:verified_at"`
+	SourceFloorCheckedAt  int64  `gorm:"column:source_floor_checked_at"`
+	SourceHistoryStatus   string `gorm:"size:32;column:source_history_status"`
+	CoverageStatus        string `gorm:"size:24;index;column:coverage_status"`
+	LastSyncAt            int64  `gorm:"column:last_sync_at"`
+	LastSuccessAt         int64  `gorm:"column:last_success_at"`
+	LastFailureAt         int64  `gorm:"column:last_failure_at"`
+	LastError             string `gorm:"size:512;column:last_error"`
+	ClassificationVersion int    `gorm:"column:classification_version"`
+	QuerySemanticsVersion int    `gorm:"column:query_semantics_version"`
+	SourceEpoch           string `gorm:"size:64;column:source_epoch"`
+	// RawPageSpanHours is the adaptive cold-import width selected only from
+	// observed page density. Zero is the upgrade-safe alias for the default
+	// width; it is never a customer/user-specific setting.
+	RawPageSpanHours int   `gorm:"column:raw_page_span_hours"`
+	UpdatedAt        int64 `gorm:"index;column:updated_at"`
+}
+
+// UsageFactMemberHourState 是“该用户的该小时已经成功读取”的持久证明。即使
+// 没有任何日志也会保存空集合指纹。LeaseToken/LeaseUntil 让慢 SQL 在本地锁外
+// 执行：进程崩溃或查询超时后，过期租约可由下一轮安全重领。
+type UsageFactMemberHourState struct {
+	UserID      int64  `gorm:"primaryKey;autoIncrement:false;column:user_id"`
+	HourTs      int64  `gorm:"primaryKey;autoIncrement:false;index:idx_usage_fact_member_hour_status,priority:1;column:hour_ts"`
+	Status      string `gorm:"size:16;index:idx_usage_fact_member_hour_status,priority:2;column:status"`
+	Rows        int    `gorm:"column:rows"`
+	Requests    int64  `gorm:"column:requests"`
+	Tokens      int64  `gorm:"column:tokens"`
+	ContentHash string `gorm:"size:64;column:content_hash"`
+	SourceEpoch string `gorm:"size:64;column:source_epoch"`
+	Attempts    int    `gorm:"column:attempts"`
+	UpdatedAt   int64  `gorm:"index;column:updated_at"`
+	CompletedAt int64  `gorm:"column:completed_at"`
+	LastError   string `gorm:"size:512;column:last_error"`
+	LeaseToken  string `gorm:"size:80;column:lease_token"`
+	LeaseUntil  int64  `gorm:"index;column:lease_until"`
+}
+
+// UsageFactPageIngestState is the durable, per-member cursor for the
+// page-oriented importer.  Unlike the legacy source-side GROUP BY path, a
+// page contains a bounded number of raw log events and the cursor advances in
+// the same SQLite transaction as the local aggregation.  It is intentionally
+// member scoped: one high-volume customer can need many pages without making
+// another member's waterline wait.
+//
+// The importer is introduced behind a worker switch.  Keeping its state in
+// the facts database now lets the implementation be verified independently
+// before it replaces any serving path.
+type UsageFactPageIngestState struct {
+	UserID int64 `gorm:"primaryKey;autoIncrement:false;column:user_id"`
+	HourTs int64 `gorm:"primaryKey;autoIncrement:false;column:hour_ts"`
+	// ThroughTs is exclusive. Legacy rows have zero and therefore mean exactly
+	// one hour. A value wider than one hour exists only while an adaptive shard
+	// is in progress; successful finalization expands it into hourly proofs.
+	ThroughTs              int64  `gorm:"column:through_ts"`
+	SourceEpoch            string `gorm:"size:64;column:source_epoch"`
+	CursorCreatedAt        int64  `gorm:"column:cursor_created_at"`
+	CursorType             int    `gorm:"column:cursor_type"`
+	CursorID               int64  `gorm:"column:cursor_id"`
+	Status                 string `gorm:"size:16;index:idx_usage_fact_page_ingest_status;column:status"`
+	Pages                  int64  `gorm:"column:pages"`
+	SourceRows             int64  `gorm:"column:source_rows"`
+	Requests               int64  `gorm:"column:requests"`
+	RefundRecords          int64  `gorm:"column:refund_records"`
+	PromptTokens           int64  `gorm:"column:prompt_tokens"`
+	CompletionTokens       int64  `gorm:"column:completion_tokens"`
+	ConsumeQuota           int64  `gorm:"column:consume_quota"`
+	RefundQuota            int64  `gorm:"column:refund_quota"`
+	RawHash                string `gorm:"size:64;column:raw_hash"`
+	VerifyCursorCreatedAt  int64  `gorm:"column:verify_cursor_created_at"`
+	VerifyCursorType       int    `gorm:"column:verify_cursor_type"`
+	VerifyCursorID         int64  `gorm:"column:verify_cursor_id"`
+	VerifyPages            int64  `gorm:"column:verify_pages"`
+	VerifySourceRows       int64  `gorm:"column:verify_source_rows"`
+	VerifyRequests         int64  `gorm:"column:verify_requests"`
+	VerifyRefundRecords    int64  `gorm:"column:verify_refund_records"`
+	VerifyPromptTokens     int64  `gorm:"column:verify_prompt_tokens"`
+	VerifyCompletionTokens int64  `gorm:"column:verify_completion_tokens"`
+	VerifyConsumeQuota     int64  `gorm:"column:verify_consume_quota"`
+	VerifyRefundQuota      int64  `gorm:"column:verify_refund_quota"`
+	VerifyRawHash          string `gorm:"size:64;column:verify_raw_hash"`
+	ContentHash            string `gorm:"size:64;column:content_hash"`
+	LastError              string `gorm:"size:512;column:last_error"`
+	UpdatedAt              int64  `gorm:"index;column:updated_at"`
+	CompletedAt            int64  `gorm:"column:completed_at"`
+}
+
+// UsageUserSnapshot 和 UsageTokenSnapshot 是资料快照，不参与日志事实汇总。
+// 余额/累计消耗或令牌资料同步失败时，用量图表仍能从事实表返回；前端只会得到
+// 上一次成功快照或空值，而不会因一条 users/tokens 查询失败整页不可用。
+type UsageUserSnapshot struct {
+	UserID       int64  `gorm:"primaryKey;autoIncrement:false"`
+	Username     string `gorm:"size:255"`
+	Email        string `gorm:"size:255"`
+	BalanceQuota int64  `gorm:"column:balance_quota"`
+	UsedQuota    int64  `gorm:"column:used_quota"`
+	Exists       bool   `gorm:"column:exists"`
+	CapturedAt   int64  `gorm:"index;column:captured_at"`
+}
+
+type UsageTokenSnapshot struct {
+	TokenID    int64  `gorm:"primaryKey;autoIncrement:false"`
+	UserID     int64  `gorm:"index:idx_usage_token_snapshot_user;column:user_id"`
+	Name       string `gorm:"size:255"`
+	MaskedKey  string `gorm:"size:64;column:masked_key"` // 永远是脱敏串，绝不落 token 明文
+	Grp        string `gorm:"size:128;column:grp"`
+	UsedQuota  int64  `gorm:"column:used_quota"`
+	Deleted    bool   `gorm:"column:deleted"`
+	CapturedAt int64  `gorm:"index;column:captured_at"`
+}
+
+// UsageFactPublishedMember 是已通过完整性校验、当前允许页面读取的成员快照。
+// 表中只保存 user_id；用户名、邮箱和客户组始终与当前 TrackedUser 取交集，
+// 因此删除/移组会立即生效，不会因为保留上一版事实而越权显示旧成员。
+// 新成员只有在候选回填完整并原子发布后才会进入读取面，避免显示半份历史数据。
+type UsageFactPublishedMember struct {
+	UserID                int64  `gorm:"primaryKey;autoIncrement:false;column:user_id"`
+	TrackedRevision       int64  `gorm:"column:tracked_revision"`
+	SourceEpoch           string `gorm:"size:64;column:source_epoch"`
+	ClassificationVersion int    `gorm:"column:classification_version"`
+	QuerySemanticsVersion int    `gorm:"column:query_semantics_version"`
+	SourceFloorHour       int64  `gorm:"column:source_floor_hour"`
+	VerifiedThroughHour   int64  `gorm:"column:verified_through_hour"`
+	PublishedAt           int64  `gorm:"index;column:published_at"`
+}
+
+// UsageFactJob is the persistent control record for full-history coverage,
+// verification, rolling audit, and exact repair work.
+type UsageFactJob struct {
+	ID             string  `gorm:"primaryKey;size:80;column:id"`
+	IdempotencyKey *string `gorm:"uniqueIndex;size:96;column:idempotency_key"`
+	Kind           string  `gorm:"size:32;index:idx_usage_fact_job_queue,priority:1;column:kind"`
+	Priority       int     `gorm:"index:idx_usage_fact_job_queue,priority:2;column:priority"`
+	UserID         *int64  `gorm:"index;column:user_id"`
+	// TrackedRevision fences work leased before remove/rejoin. A worker may
+	// finish staging old facts, but it cannot advance coverage or publish unless
+	// this revision still equals the authoritative main-store control row.
+	TrackedRevision int64  `gorm:"column:tracked_revision"`
+	SourceEpoch     string `gorm:"size:64;column:source_epoch"`
+	FromTs          int64  `gorm:"column:from_ts"`
+	ThroughTs       int64  `gorm:"column:through_ts"`
+	NextHour        int64  `gorm:"index;column:next_hour"`
+	VerifyNextHour  int64  `gorm:"index;column:verify_next_hour"`
+	TotalHours      int64  `gorm:"column:total_hours"`
+	CompletedHours  int64  `gorm:"column:completed_hours"`
+	VerifiedHours   int64  `gorm:"column:verified_hours"`
+	FailedHours     int64  `gorm:"column:failed_hours"`
+	FailedHourList  string `gorm:"type:text;column:failed_hour_list"`
+	Reason          string `gorm:"size:500;column:reason"`
+	Status          string `gorm:"size:16;index:idx_usage_fact_job_queue,priority:3;column:status"`
+	Attempts        int    `gorm:"column:attempts"`
+	NextRetryAt     int64  `gorm:"index;column:next_retry_at"`
+	LeaseOwner      string `gorm:"size:80;column:lease_owner"`
+	LeaseUntil      int64  `gorm:"index;column:lease_until"`
+	// LastServedSeq is a durable, monotonically increasing scheduler ticket.
+	// Wall-clock seconds are not a safe fairness key: several bounded turns can
+	// complete in one second and clocks can move backwards. Raw-page lanes sort
+	// never-served/least-recently-served jobs by this sequence instead.
+	LastServedSeq int64  `gorm:"index;column:last_served_seq"`
+	CreatedAt     int64  `gorm:"index;column:created_at"`
+	UpdatedAt     int64  `gorm:"index;column:updated_at"`
+	StartedAt     int64  `gorm:"column:started_at"`
+	HeartbeatAt   int64  `gorm:"index;column:heartbeat_at"`
+	CompletedAt   int64  `gorm:"column:completed_at"`
+	LastError     string `gorm:"size:512;column:last_error"`
+	RequestedBy   string `gorm:"size:64;column:requested_by"`
+	ApprovedBy    string `gorm:"size:64;column:approved_by"`
+}
+
+// UsageFactRepairRequest is the durable HTTP idempotency receipt for one
+// administrator-requested member-day repair. The repair job itself is unique
+// by member revision/day so a concurrent rolling audit and a manual request
+// converge on one worker; this receipt prevents a retried HTTP request from
+// re-opening that completed job later.
+type UsageFactRepairRequest struct {
+	RequestID       string `gorm:"primaryKey;size:96;column:request_id"`
+	JobID           string `gorm:"size:80;index;column:job_id"`
+	UserID          int64  `gorm:"index;column:user_id"`
+	TrackedRevision int64  `gorm:"column:tracked_revision"`
+	SourceEpoch     string `gorm:"size:64;column:source_epoch"`
+	DayTs           int64  `gorm:"index;column:day_ts"`
+	Reason          string `gorm:"size:500;column:reason"`
+	RequestedBy     string `gorm:"size:64;column:requested_by"`
+	CreatedAt       int64  `gorm:"index;column:created_at"`
+}
+
+// UsageFactRepairMember 是当前唯一受控修复任务的持久目标清单。修复可能只涉及
+// 候选快照中的部分成员，不能继续用“全部已发布成员”推算进度。ResumeBackfillHour
+// 保存任务前的连续水位；目标自然日完成后原子恢复该水位，避免为了回到候选尾部
+// 再逐周扫描已经验证过的本地 proof。新任务开始时会整体替换此表。
+type UsageFactRepairMember struct {
+	UserID             int64 `gorm:"primaryKey;autoIncrement:false;column:user_id"`
+	RequestedAt        int64 `gorm:"index;column:requested_at"`
+	ResumeBackfillHour int64 `gorm:"column:resume_backfill_hour"`
+}
+
+// UsageFactSyncState 只保留一行全局运行状态。MemberFingerprint /
+// BackfillWindowDays 描述正在回填的“候选版”；Published* 描述上一份
+// 已通过完整性校验的“服务版”。候选版失败、扩展时间窗口或成员变化时，
+// 页面继续读服务版，不回扫主站 logs，也不把整页变成“统计不可用”。
+// Generation 跟踪候选事实变化；ServingGeneration 只在当前发布成员/
+// 窗口的可见数据改变时递增，用作 Redis/L1 缓存世代号。两者分离
+// 可避免新成员几百天候选回填每 15 秒把旧服务版缓存全部换键。
+type UsageFactSyncState struct {
+	ID                  uint   `gorm:"primaryKey;autoIncrement:false"`
+	TrafficClassVersion int    `gorm:"column:traffic_class_version;index"`
+	Generation          int64  `gorm:"column:generation"`
+	ServingGeneration   int64  `gorm:"column:serving_generation"`
+	MemberFingerprint   string `gorm:"size:32;column:member_fingerprint"`
+	// BackfillWindowDays 是创建当前回填游标时的配置窗口。它让运维后续扩展
+	// MONITOR_USAGE_FACTS_BACKFILL_DAYS 时，能识别“游标已到尾部、但新增历史
+	// 范围尚未补齐”的情况，并安全地从新窗口起点恢复，而不是误判为已完成。
+	BackfillWindowDays int `gorm:"column:backfill_window_days"`
+	// NextBackfillHour 是历史回填游标。只前移，不参与页面缓存世代；服务重启后
+	// 可从上次未完成小时继续，避免每轮从保留窗口起点重复扫描本地台账。
+	NextBackfillHour int64 `gorm:"column:next_backfill_hour"`
+	// 历史复核与首次回填使用不同游标：首次回填只负责补齐缺口；复核游标在
+	// 已发布窗口内低频轮转，用于发现晚到、事后修订或曾经静默漏掉的数据。
+	// 两者分开后，复核失败不会阻塞正常 Tail，也不会把完整率改成失败。
+	NextReconcileHour      int64  `gorm:"column:next_reconcile_hour"`
+	LastReconciledHour     int64  `gorm:"column:last_reconciled_hour"`
+	LastReconcileAt        int64  `gorm:"column:last_reconcile_at"`
+	LastReconcileFailureAt int64  `gorm:"column:last_reconcile_failure_at"`
+	ReconcileCorrections   int64  `gorm:"column:reconcile_corrections"`
+	PublishedFingerprint   string `gorm:"size:32;column:published_fingerprint"`
+	PublishedWindowDays    int    `gorm:"column:published_window_days"`
+	PublishedRangeStart    int64  `gorm:"column:published_range_start"`
+	PublishedThrough       int64  `gorm:"column:published_through"`
+	PublishedAt            int64  `gorm:"column:published_at"`
+	// Repair* 记录一次由超级管理员显式发起的历史自然日受控补数。
+	// 补数只删除本地 member-hour 完成证明并回退已发布成员的候选游标，
+	// 然后复用现有串行小时同步逐日重建事实；旧服务版在新日完整前仍可读。
+	RepairFrom                  int64  `gorm:"column:repair_from"`
+	RepairThrough               int64  `gorm:"column:repair_through"`
+	RepairMode                  string `gorm:"size:32;column:repair_mode"`
+	RepairMembershipFingerprint string `gorm:"size:32;column:repair_membership_fingerprint"`
+	RepairTargetMembers         int64  `gorm:"column:repair_target_members"`
+	RepairRequestedAt           int64  `gorm:"column:repair_requested_at"`
+	RepairCompletedAt           int64  `gorm:"column:repair_completed_at"`
+	RepairLastFailureAt         int64  `gorm:"column:repair_last_failure_at"`
+	RepairLastError             string `gorm:"size:512;column:repair_last_error"`
+	RepairTotalMemberHours      int64  `gorm:"column:repair_total_member_hours"`
+	RepairCompletedMemberHours  int64  `gorm:"column:repair_completed_member_hours"`
+	LastFactSyncAt              int64  `gorm:"column:last_fact_sync_at"`
+	LastProfileSyncAt           int64  `gorm:"column:last_profile_sync_at"`
+	LastFactFailureAt           int64  `gorm:"column:last_fact_failure_at"`
+	LastProfileFailureAt        int64  `gorm:"column:last_profile_failure_at"`
+	LastPrunedAt                int64  `gorm:"column:last_pruned_at"`
+	// Full-history cold source circuit is durable so a restart cannot turn a
+	// timed-out minimum chunk into another immediate burst. Tail and local reads
+	// do not use this gate.
+	HistoryBulkCircuitState      string `gorm:"size:16;column:history_bulk_circuit_state"`
+	HistoryBulkOpenedUntil       int64  `gorm:"index;column:history_bulk_opened_until"`
+	HistoryBulkSlowStreak        int    `gorm:"column:history_bulk_slow_streak"`
+	HistoryBulkFailureStreak     int    `gorm:"column:history_bulk_failure_streak"`
+	HistoryBulkHalfOpenSuccesses int    `gorm:"column:history_bulk_half_open_successes"`
+	HistoryBulkLastQueryMS       int64  `gorm:"column:history_bulk_last_query_ms"`
+	HistoryBulkLastQueryAt       int64  `gorm:"column:history_bulk_last_query_at"`
+	HistoryBulkLastError         string `gorm:"size:512;column:history_bulk_last_error"`
+}
+
 // 直方图档位上界。lat 单位秒,ttft 单位毫秒。
 var (
 	latEdges  = []int{1, 2, 5, 10, 30, 60}
@@ -259,6 +698,48 @@ var (
 
 // openStore 打开本地采样库并迁移表结构。
 func (m *Monitor) openStore(path string) error {
+	m.cfg.StorePath = path
+	// A runtime restore publishes two SQLite files separately, guarded by a
+	// durable IN_PROGRESS -> READY -> ACTIVATED protocol. Validate/activate that
+	// pair before the ordinary migration snapshot can mistake a crash-partial
+	// restore for a fresh facts database.
+	if err := m.preflightStoreRestoreActivation(context.Background(), path, m.cfg.UsageFactsStorePath); err != nil {
+		return fmt.Errorf("运行期备份集恢复门禁拒绝启动: %w", err)
+	}
+	// 必须在主库任何 Migrator 探测/AutoMigrate 之前，同时锁定并备份主库与
+	// facts 库。任意一库的 WAL 快照、quick_check、表计数或 manifest 发布
+	// 失败都会在这里终止启动，两库都不会进入迁移。
+	snapshot, err := m.createPreMigrationSnapshot(context.Background(), path, m.cfg.UsageFactsStorePath, time.Now())
+	prechecked := snapshot.checkedPath(path)
+	m.storeIntegrityCheckedAt.Store(time.Now().Unix())
+	m.storeIntegrityOK.Store(err == nil && prechecked)
+	factsPath := strings.TrimSpace(m.cfg.UsageFactsStorePath)
+	factsPrechecked := snapshot.checkedPath(factsPath)
+	if factsPath != "" && !sameStorePath(path, factsPath) {
+		m.usageFactsIntegrityCheckedAt.Store(time.Now().Unix())
+		m.usageFactsIntegrityOK.Store(err == nil && factsPrechecked)
+	}
+	if err != nil {
+		return fmt.Errorf("迁移前双库快照失败，已保留原文件且拒绝执行任何 AutoMigrate: %w", err)
+	}
+	if snapshot.SnapshotDir != "" {
+		if snapshot.Reused {
+			slog.Info("已复核并复用当前 migration plan 的固定迁移前快照", "snapshot", filepath.Base(snapshot.SnapshotDir))
+		} else {
+			slog.Info("迁移前双库快照已校验并原子发布", "snapshot", filepath.Base(snapshot.SnapshotDir))
+		}
+	}
+	// 文件在快照闸门执行时不存在，却在闸门释放后出现，说明仍有另一个
+	// 进程在操作该卷。宁可拒绝启动，也不能迁移一份未进入 manifest 的库。
+	if !prechecked && storeUsesFile(path) {
+		appeared, checkErr := preflightStoreIntegrity(path)
+		if checkErr != nil {
+			return fmt.Errorf("迁移闸门后本地采样库检查失败，拒绝迁移: %w", checkErr)
+		}
+		if appeared {
+			return errors.New("迁移闸门后本地采样库才出现，疑似仍有旧进程运行；拒绝未备份迁移")
+		}
+	}
 	// busy_timeout:采样写入与页面读取并发时,等锁而非立刻报 SQLITE_BUSY;WAL:提升读写并发。
 	dsn := path + "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)"
 	db, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{
@@ -266,6 +747,34 @@ func (m *Monitor) openStore(path string) error {
 	})
 	if err != nil {
 		return fmt.Errorf("打开本地采样库失败: %w", err)
+	}
+	openedSuccessfully := false
+	defer func() {
+		if openedSuccessfully {
+			return
+		}
+		if sqlDB, dbErr := db.DB(); dbErr == nil {
+			_ = sqlDB.Close()
+		}
+		if m.storeDB == db {
+			m.storeDB = nil
+		}
+		if m.usageFactsDB == db {
+			m.usageFactsDB = nil
+		}
+	}()
+	// 新建数据库在打开前不存在，需在建表前补做一次检查；已有库已经由上面的
+	// 只读连接检查过，避免对大库重复扫描两次。
+	if !prechecked {
+		if err := checkGORMStoreIntegrity(db); err != nil {
+			m.storeIntegrityOK.Store(false)
+			if sqlDB, dbErr := db.DB(); dbErr == nil {
+				_ = sqlDB.Close()
+			}
+			return fmt.Errorf("新建本地采样库完整性检查失败: %w", err)
+		}
+		m.storeIntegrityCheckedAt.Store(time.Now().Unix())
+		m.storeIntegrityOK.Store(true)
 	}
 	// 栏目开关列是否已存在(迁移前探测):不存在=本次 AutoMigrate 会新建 → 老库存量配置行需补置 true,
 	// 保证从旧版本升级后报警行为不变。字段本身不带 gorm default(布尔 false 会被 default 顶掉,见 AlertConfig 注释)。
@@ -276,15 +785,18 @@ func (m *Monitor) openStore(path string) error {
 	hadUpstreamBalanceAlerts := db.Migrator().HasColumn(&AlertConfig{}, "upstream_balance_alerts_enabled")
 	if err := db.AutoMigrate(
 		&MetricSample{}, &TokenSample{}, &HourSample{}, &ChannelSnap{}, &RejectionSample{}, &RejectionIngestBatch{}, &SelectablePair{},
-		&StabilityHourSample{}, &StabilityRejectHour{}, &StabilityProblemSample{},
-		&StabilityProblemIngestState{}, &StabilityProblemStage{},
+		&StabilityHourSample{}, &ChannelTestHourSample{}, &StabilityRejectHour{}, &StabilityProblemSample{},
+		&StabilityProblemIngestState{}, &StabilityProblemStage{}, &StabilityProblemClassificationMigration{}, &StabilityProblemLiveCursor{},
 		&StabilityHourIngestState{}, &StabilityBackfillJob{},
 		&ChannelFinanceSetting{}, &ChannelSaleGroupRate{}, &WebsiteGroupCatalog{}, &ChannelDomainCost{}, &ChannelDomainGroupCost{}, &ChannelFinanceChannelCost{}, &ChannelFinanceVersion{},
-		&ChannelUpstreamAccount{},
+		&ChannelUpstreamAccount{}, &ChannelUpstreamUsageHour{}, &UpstreamHostCircuit{},
 		&InfraSample{}, &HostContainerSnapshot{}, &NginxMinuteSample{}, &NginxIngestBatch{}, &NginxSourceState{},
-		&AlertConfig{}, &AlertLog{}, &TrackedUser{}, &CustomerGroup{}, &FollowUpLog{}, &UsageSettings{},
+		&AlertConfig{}, &AlertLog{}, &TrackedUser{}, &CustomerGroup{}, &UsageMemberControl{}, &UsageMemberAudit{}, &UsageMemberControlMigration{}, &FollowUpLog{}, &UsageSettings{},
 	); err != nil {
 		return fmt.Errorf("表迁移失败: %w", err)
+	}
+	if err := migrateUsageMemberControls(db); err != nil {
+		return fmt.Errorf("用量成员控制层迁移失败: %w", err)
 	}
 	if err := migrateLegacyChannelFinanceVersions(db); err != nil {
 		return fmt.Errorf("倍率版本迁移失败: %w", err)
@@ -322,7 +834,168 @@ func (m *Monitor) openStore(path string) error {
 		}
 	}
 	m.storeDB = db
+	if err := m.migrateLegacyUpstreamCredentialEncryption(); err != nil {
+		return fmt.Errorf("上游凭据加密密钥迁移失败: %w", err)
+	}
+	if err := m.openUsageFactsStore(m.cfg.UsageFactsStorePath, factsPrechecked); err != nil {
+		factsPath := strings.TrimSpace(m.cfg.UsageFactsStorePath)
+		separateFactsStore := factsPath != "" && factsPath != m.cfg.StorePath
+		// 现有文件的损坏/备份失败已经由上面的双库迁移闸门拦截。通过闸门后，
+		// facts 独立打开/建新库仍可能遇到瞬时磁盘故障：write-only/shadow 可
+		// 隔离该功能；已显式切读时必须 fail closed，绝不能回扫生产 logs。
+		if separateFactsStore && !m.cfg.UsageFactsReadEnabled && !m.cfg.UsageFactsLocalReadOnly {
+			m.usageFactsDB = nil
+			slog.Error("用量事实库不可用，已隔离该功能并继续启动 Monitor 主库", "err", err)
+		} else {
+			return err
+		}
+	}
 	slog.Info("本地采样库就绪", "path", path)
+	openedSuccessfully = true
+	return nil
+}
+
+// usageFactsStore 返回用量事实专库。测试/迁移工具没有显式配置专库时允许
+// 与主库共用连接；生产 New 会自动填充独立路径，因此不会走这个兼容分支。
+func (m *Monitor) usageFactsStore() *gorm.DB {
+	if m.usageFactsDB != nil {
+		return m.usageFactsDB
+	}
+	path := strings.TrimSpace(m.cfg.UsageFactsStorePath)
+	if path == "" || path == m.cfg.StorePath {
+		return m.storeDB
+	}
+	return nil
+}
+
+func (m *Monitor) openUsageFactsStore(path string, prechecked bool) error {
+	path = strings.TrimSpace(path)
+	openedSeparate := false
+	openedSuccessfully := false
+	defer func() {
+		if !openedSeparate || openedSuccessfully || m.usageFactsDB == nil {
+			return
+		}
+		m.usageFactsIntegrityOK.Store(false)
+		if sqlDB, err := m.usageFactsDB.DB(); err == nil {
+			_ = sqlDB.Close()
+		}
+		m.usageFactsDB = nil
+	}()
+	if path == "" || path == m.cfg.StorePath {
+		m.usageFactsDB = m.storeDB
+	} else {
+		m.usageFactsIntegrityCheckedAt.Store(time.Now().Unix())
+		m.usageFactsIntegrityOK.Store(prechecked)
+		if !prechecked {
+			appeared, err := preflightStoreIntegrity(path)
+			if err != nil {
+				return fmt.Errorf("迁移闸门后用量事实库检查失败，拒绝迁移: %w", err)
+			}
+			if appeared {
+				return errors.New("迁移闸门后用量事实库才出现，疑似仍有旧进程运行；拒绝未备份迁移")
+			}
+		}
+		dsn := path + "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)"
+		db, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})
+		if err != nil {
+			m.usageFactsIntegrityOK.Store(false)
+			return fmt.Errorf("打开用量事实库失败: %w", err)
+		}
+		if !prechecked {
+			if err := checkGORMStoreIntegrity(db); err != nil {
+				m.usageFactsIntegrityOK.Store(false)
+				if sqlDB, dbErr := db.DB(); dbErr == nil {
+					_ = sqlDB.Close()
+				}
+				return fmt.Errorf("新建用量事实库完整性检查失败: %w", err)
+			}
+			m.usageFactsIntegrityCheckedAt.Store(time.Now().Unix())
+			m.usageFactsIntegrityOK.Store(true)
+		}
+		m.cfg.UsageFactsStorePath = path
+		m.usageFactsDB = db
+		openedSeparate = true
+	}
+
+	factsDB := m.usageFactsStore()
+	if factsDB == nil {
+		return errors.New("用量事实库未初始化")
+	}
+	if m.usageFactsDB == m.storeDB {
+		m.usageFactsIntegrityCheckedAt.Store(m.storeIntegrityCheckedAt.Load())
+		m.usageFactsIntegrityOK.Store(m.storeIntegrityOK.Load())
+	}
+	if err := factsDB.AutoMigrate(
+		&UsageHourFact{}, &UsageDailyFact{}, &UsageFactMemberDayState{}, &UsageHourIngestState{}, &UsageFactMemberState{}, &UsageFactMemberHourState{}, &UsageUserSnapshot{},
+		&UsageFactPageIngestState{},
+		&UsageTokenSnapshot{}, &UsageFactPublishedMember{}, &UsageFactRepairMember{}, &UsageFactJob{}, &UsageFactRepairRequest{}, &UsageFactSyncState{},
+	); err != nil {
+		return fmt.Errorf("用量事实表迁移失败: %w", err)
+	}
+	for _, stmt := range []string{
+		"CREATE INDEX IF NOT EXISTS idx_usage_daily_fact_date_group ON usage_daily_facts(date_ts, grp)",
+		"CREATE INDEX IF NOT EXISTS idx_usage_daily_fact_date_model ON usage_daily_facts(date_ts, model_name)",
+		"CREATE INDEX IF NOT EXISTS idx_usage_daily_fact_date_token ON usage_daily_facts(date_ts, user_id, token_id)",
+		// 组织矩阵会按日期扫全部成员，单用户/令牌下钻则相反：先锁定用户再取长日期窗。
+		// 两种方向都保留，避免 90/366 天单用户详情扫描同窗口内所有成员的本地事实。
+		"CREATE INDEX IF NOT EXISTS idx_usage_daily_fact_user_date ON usage_daily_facts(user_id, date_ts)",
+		"CREATE INDEX IF NOT EXISTS idx_usage_daily_fact_user_token_date ON usage_daily_facts(user_id, token_id, date_ts)",
+		"CREATE INDEX IF NOT EXISTS idx_usage_hour_fact_hour_token ON usage_hour_facts(hour_ts, user_id, token_id)",
+		"CREATE INDEX IF NOT EXISTS idx_usage_hour_fact_day_user ON usage_hour_facts(day_ts, user_id)",
+		"CREATE INDEX IF NOT EXISTS idx_usage_hour_fact_user_day ON usage_hour_facts(user_id, day_ts)",
+	} {
+		if err := factsDB.Exec(stmt).Error; err != nil {
+			return fmt.Errorf("创建用量事实索引失败: %w", err)
+		}
+	}
+	// 预建唯一的同步状态行并载入缓存世代。这样服务重启不会把 Redis/L1
+	// 看成同一批事实，避免命中旧数据；若初始化失败则宁可启动失败，不把
+	// “本地事实模式”的正确性建立在不确定状态上。
+	var usageState UsageFactSyncState
+	if err := factsDB.First(&usageState, 1).Error; errors.Is(err, gorm.ErrRecordNotFound) {
+		usageState = UsageFactSyncState{ID: 1, TrafficClassVersion: userTrafficClassificationVersion}
+		if err := factsDB.Create(&usageState).Error; err != nil {
+			return fmt.Errorf("初始化用量事实状态失败: %w", err)
+		}
+	} else if err != nil {
+		return fmt.Errorf("读取用量事实状态失败: %w", err)
+	}
+	migratedState, rebuilt, migrateErr := migrateUsageFactsTrafficClassification(factsDB, m.cfg.UsageFactsClassificationMigrationEnabled)
+	if migrateErr != nil {
+		return fmt.Errorf("用量事实分类版本迁移失败: %w", migrateErr)
+	}
+	usageState = migratedState
+	if rebuilt {
+		slog.Warn("用量事实分类口径已显式进入维护迁移：旧事实保留，旧发布已撤销，等待按新分类逐成员重签",
+			"traffic_class_version", userTrafficClassificationVersion)
+	}
+	if usageState.ServingGeneration == 0 && usageState.PublishedAt > 0 {
+		// 旧快照没有独立服务世代列；首次升级以当前 Generation
+		// 作为安全起点，并且必须持久化。只改内存会让 Portal 的
+		// durable-generation fence 在每次重启后永久看到 DB=0/atomic=N。
+		servingGeneration := usageState.Generation
+		if servingGeneration <= 0 {
+			servingGeneration = 1
+		}
+		updates := map[string]any{"serving_generation": servingGeneration}
+		if usageState.Generation <= 0 {
+			updates["generation"] = servingGeneration
+		}
+		result := factsDB.Model(&UsageFactSyncState{}).
+			Where("id = ? AND serving_generation = ?", usageState.ID, 0).Updates(updates)
+		if result.Error != nil {
+			return fmt.Errorf("持久化旧用量事实服务世代失败: %w", result.Error)
+		}
+		if err := factsDB.First(&usageState, usageState.ID).Error; err != nil {
+			return fmt.Errorf("重读用量事实服务世代失败: %w", err)
+		}
+	}
+	m.publishUsageFactGenerations(usageState.Generation, usageState.ServingGeneration)
+	if path != "" && path != m.cfg.StorePath {
+		slog.Info("用量事实库就绪", "path", path)
+	}
+	openedSuccessfully = true
 	return nil
 }
 
@@ -674,7 +1347,7 @@ func percentile(hist []int64, edges []int, maxVal int, p float64) float64 {
 
 func (m *Monitor) storeSummary(since int64, windowSec float64) (*Summary, error) {
 	var a aggRow
-	if err := m.storeDB.Raw(`SELECT '' AS k, `+aggCols+` FROM metric_samples WHERE bucket_ts >= ?`+enabledChanFilter+selectableFilter, since).
+	if err := m.storeDB.Raw(`SELECT '' AS k, `+aggCols+` FROM metric_samples WHERE bucket_ts >= ?`+currentMetricTrafficFilter+enabledChanFilter+selectableFilter, since).
 		Scan(&a).Error; err != nil {
 		return nil, fmt.Errorf("本地汇总失败: %w", err)
 	}
@@ -718,9 +1391,9 @@ func (m *Monitor) storeDimSeries(dimCol string, since int64, windowMinutes int) 
 		Anomaly  int64
 		Failed   int64
 	}
-	f := enabledChanFilter + selectableFilter
+	f := currentMetricTrafficFilter + enabledChanFilter + selectableFilter
 	if dimCol == channelDim { // 按渠道明细不过滤,排障仍能看禁用渠道/误路由
-		f = ""
+		f = currentMetricTrafficFilter
 	}
 	q := fmt.Sprintf(`SELECT %s AS k, bucket_ts, COALESCE(SUM(success),0) AS success,
 		COALESCE(SUM(anomaly),0) AS anomaly, COALESCE(SUM(failed),0) AS failed
@@ -760,9 +1433,9 @@ func (m *Monitor) storeDim(dimCol string, since int64, windowSec float64) ([]Row
 	if !dimColOK(dimCol) {
 		return nil, fmt.Errorf("非法维度列: %q", dimCol)
 	}
-	f := enabledChanFilter + selectableFilter
+	f := currentMetricTrafficFilter + enabledChanFilter + selectableFilter
 	if dimCol == channelDim { // 按渠道明细不过滤,排障仍能看禁用渠道/误路由
-		f = ""
+		f = currentMetricTrafficFilter
 	}
 	q := fmt.Sprintf(`SELECT %s AS k, %s FROM metric_samples
 		WHERE bucket_ts >= ?%s GROUP BY %s
@@ -792,7 +1465,7 @@ func (m *Monitor) storeTrend(since int64, windowMinutes int) ([]TimePoint, error
 	}
 	var rows []minRow
 	if err := m.storeDB.Raw(`SELECT bucket_ts, COALESCE(SUM(success),0) AS success, COALESCE(SUM(failed),0) AS failed
-		FROM metric_samples WHERE bucket_ts >= ?`+enabledChanFilter+selectableFilter+` GROUP BY bucket_ts ORDER BY bucket_ts`, since).
+		FROM metric_samples WHERE bucket_ts >= ?`+currentMetricTrafficFilter+enabledChanFilter+selectableFilter+` GROUP BY bucket_ts ORDER BY bucket_ts`, since).
 		Scan(&rows).Error; err != nil {
 		return nil, fmt.Errorf("本地趋势失败: %w", err)
 	}
@@ -835,7 +1508,7 @@ func (m *Monitor) storeTokens(since int64, windowSec float64) ([]TokenRow, error
 	if err := m.storeDB.Raw(`SELECT token_name AS k,
 		COALESCE(SUM(success),0) AS success, COALESCE(SUM(anomaly),0) AS anomaly,
 		COALESCE(SUM(failed),0) AS failed, COALESCE(SUM(tokens),0) AS tokens, COALESCE(SUM(quota),0) AS quota
-		FROM token_samples WHERE bucket_ts >= ? GROUP BY token_name
+		FROM token_samples WHERE bucket_ts >= ?`+currentTokenTrafficFilter+` GROUP BY token_name
 		ORDER BY quota DESC, (success+anomaly+failed) DESC, k ASC LIMIT 100`, since).Scan(&rows).Error; err != nil {
 		return nil, fmt.Errorf("本地 token 聚合失败: %w", err)
 	}
@@ -859,14 +1532,16 @@ func (m *Monitor) storeTokens(since int64, windowSec float64) ([]TokenRow, error
 // rollupHours 把【还有分钟数据的近段时间】按小时汇总进 hour_samples(幂等 UPSERT)。
 // 关键:在分钟数据被清理前就已滚动写入小时表,故长期数据不丢失。
 func (m *Monitor) rollupHours(sinceTs int64) error {
-	return m.storeDB.Exec(`INSERT INTO hour_samples (hour_ts, success, anomaly, failed, tokens, quota, sum_use_time)
+	return m.storeDB.Exec(`INSERT INTO hour_samples (hour_ts, success, anomaly, failed, tokens, quota, sum_use_time, traffic_class_version)
 		SELECT (bucket_ts/3600)*3600 AS hour_ts,
-		  SUM(success), SUM(anomaly), SUM(failed), SUM(tokens), SUM(quota), SUM(sum_use_time)
-		FROM metric_samples WHERE bucket_ts >= ?
+		  SUM(success), SUM(anomaly), SUM(failed), SUM(tokens), SUM(quota), SUM(sum_use_time), ?
+		FROM metric_samples WHERE bucket_ts >= ? AND traffic_class_version = ?
 		GROUP BY hour_ts
 		ON CONFLICT(hour_ts) DO UPDATE SET
 		  success=excluded.success, anomaly=excluded.anomaly, failed=excluded.failed,
-		  tokens=excluded.tokens, quota=excluded.quota, sum_use_time=excluded.sum_use_time`, sinceTs).Error
+		  tokens=excluded.tokens, quota=excluded.quota, sum_use_time=excluded.sum_use_time,
+		  traffic_class_version=excluded.traffic_class_version`,
+		userTrafficClassificationVersion, sinceTs, userTrafficClassificationVersion).Error
 }
 
 func (m *Monitor) pruneHoursOlderThan(cutoffTs int64) (int64, error) {
@@ -877,7 +1552,7 @@ func (m *Monitor) pruneHoursOlderThan(cutoffTs int64) (int64, error) {
 // storeHourSeries 取小时级序列(长期趋势图用),按时间升序。
 func (m *Monitor) storeHourSeries(sinceTs int64) []HourPoint {
 	var pts []HourPoint
-	warnReadErr("storeHourSeries", m.storeDB.Raw(`SELECT hour_ts AS ts, success, anomaly, failed FROM hour_samples WHERE hour_ts >= ? ORDER BY hour_ts`, sinceTs).Scan(&pts))
+	warnReadErr("storeHourSeries", m.storeDB.Raw(`SELECT hour_ts AS ts, success, anomaly, failed FROM hour_samples WHERE hour_ts >= ?`+currentHourTrafficFilter+` ORDER BY hour_ts`, sinceTs).Scan(&pts))
 	return pts
 }
 
@@ -885,7 +1560,7 @@ func (m *Monitor) storeHourSeries(sinceTs int64) []HourPoint {
 func (m *Monitor) periodStat(fromTs, toTs int64) PeriodStat {
 	var r struct{ S, A, F, Q int64 }
 	warnReadErr("periodStat", m.storeDB.Raw(`SELECT COALESCE(SUM(success),0) s, COALESCE(SUM(anomaly),0) a, COALESCE(SUM(failed),0) f, COALESCE(SUM(quota),0) q
-		FROM hour_samples WHERE hour_ts >= ? AND hour_ts < ?`, fromTs, toTs).Scan(&r))
+		FROM hour_samples WHERE hour_ts >= ? AND hour_ts < ?`+currentHourTrafficFilter, fromTs, toTs).Scan(&r))
 	total := r.S + r.A + r.F
 	return PeriodStat{Total: total, Failed: r.F, SuccessRate: rate(r.S, total), CostUSD: float64(r.Q) / quotaPerUSD}
 }
@@ -903,7 +1578,7 @@ func (m *Monitor) storeCompare(nowUnix int64) CompareStat {
 
 func (m *Monitor) storeFreshness() (lastBucket int64) {
 	var v struct{ M int64 }
-	warnReadErr("storeFreshness", m.storeDB.Raw(`SELECT COALESCE(MAX(bucket_ts),0) AS m FROM metric_samples`).Scan(&v))
+	warnReadErr("storeFreshness", m.storeDB.Raw(`SELECT COALESCE(MAX(bucket_ts),0) AS m FROM metric_samples WHERE traffic_class_version = ?`, userTrafficClassificationVersion).Scan(&v))
 	return v.M
 }
 

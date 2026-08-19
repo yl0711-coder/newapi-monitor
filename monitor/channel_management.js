@@ -2,7 +2,7 @@
 'use strict';
 
 const cm={
-  inited:false,loaded:false,days:7,custom:null,preset:'',report:null,abort:null,sort:'cost',
+  inited:false,loaded:false,hours:0,days:7,custom:null,preset:'',report:null,abort:null,sort:'cost',
   filters:{search:'',domain:'',vendor:'',group:'',status:''},
   expandedDomains:new Set(),expandedVendors:new Set(),collapsedGroups:new Set(),
   financeMode:'',financeDomain:null,financeGroups:[],financeChannels:[],financeChannel:null,upstreamDomain:null,upstreamConfig:null
@@ -38,8 +38,9 @@ window.channelManagementOpen=function(context){window.monitorNavigate?.('channel
 function applyNavigationContext(){
   const c=window.monitorNavigationContext?.()||{};let changed=false;
   if(!Object.keys(c).length)return false;
-  if(c.from&&c.to){if(!cm.custom||cm.custom.from!==c.from||cm.custom.to!==c.to){cm.custom={from:c.from,to:c.to};cm.preset='custom';changed=true}}
-  else if(+c.days>0&&cm.days!==+c.days){cm.days=+c.days;cm.custom=null;cm.preset='';changed=true}
+  if(c.from&&c.to){if(!cm.custom||cm.custom.from!==c.from||cm.custom.to!==c.to||cm.hours){cm.custom={from:c.from,to:c.to};cm.hours=0;cm.preset='custom';changed=true}}
+  else if(+c.hours>0&&cm.hours!==+c.hours){cm.hours=+c.hours;cm.custom=null;cm.preset='';changed=true}
+  else if(+c.days>0&&(cm.days!==+c.days||cm.hours)){cm.days=+c.days;cm.hours=0;cm.custom=null;cm.preset='';changed=true}
   const search=c.channel?String(c.channel):(c.domain||'');
   if(cm.filters.search!==search){cm.filters.search=search;changed=true}
   for(const [key,value] of Object.entries({domain:'',vendor:'',group:c.group||'',status:''}))if(cm.filters[key]!==value){cm.filters[key]=value;changed=true}
@@ -49,11 +50,14 @@ function applyNavigationContext(){
 
 function init(){
   cm.inited=true;
+  document.querySelectorAll('[data-cm-hours]').forEach(btn=>btn.addEventListener('click',()=>{
+    cm.hours=+btn.dataset.cmHours;cm.custom=null;cm.preset='';syncRange();loadReport();
+  }));
   document.querySelectorAll('[data-cm-days]').forEach(btn=>btn.addEventListener('click',()=>{
-    cm.days=+btn.dataset.cmDays;cm.custom=null;cm.preset='';syncRange();loadReport();
+    cm.days=+btn.dataset.cmDays;cm.hours=0;cm.custom=null;cm.preset='';syncRange();loadReport();
   }));
   document.querySelectorAll('[data-cm-preset]').forEach(btn=>btn.addEventListener('click',()=>{
-    cm.preset=btn.dataset.cmPreset;cm.custom=cmPresetRange(cm.preset);syncRange();loadReport();
+    cm.hours=0;cm.preset=btn.dataset.cmPreset;cm.custom=cmPresetRange(cm.preset);syncRange();loadReport();
   }));
   $('cmCustomToggle')?.addEventListener('click',()=>{
     $('cmCustomRange')?.classList.toggle('show');
@@ -62,7 +66,7 @@ function init(){
   $('cmCustomApply')?.addEventListener('click',()=>{
     const from=$('cmCustomFrom').value,to=$('cmCustomTo').value;
     if(!from||!to||from>to){showError('请选择有效的开始和结束日期。');return}
-    cm.custom={from,to};cm.preset='custom';syncRange();loadReport();
+    cm.hours=0;cm.custom={from,to};cm.preset='custom';syncRange();loadReport();
   });
   ['cmDomain','cmVendor','cmGroup','cmStatus'].forEach(id=>$(id)?.addEventListener('change',()=>{
     const key={cmDomain:'domain',cmVendor:'vendor',cmGroup:'group',cmStatus:'status'}[id];
@@ -118,18 +122,27 @@ function init(){
 
 function toggleSet(set,key){if(set.has(key))set.delete(key);else set.add(key)}
 function syncRange(){
-  document.querySelectorAll('[data-cm-days]').forEach(btn=>btn.classList.toggle('active',!cm.custom&&+btn.dataset.cmDays===cm.days));
+  document.querySelectorAll('[data-cm-hours]').forEach(btn=>btn.classList.toggle('active',!cm.custom&&+btn.dataset.cmHours===cm.hours));
+  document.querySelectorAll('[data-cm-days]').forEach(btn=>btn.classList.toggle('active',!cm.custom&&!cm.hours&&+btn.dataset.cmDays===cm.days));
   document.querySelectorAll('[data-cm-preset]').forEach(btn=>btn.classList.toggle('active',btn.dataset.cmPreset===cm.preset));
   $('cmCustomToggle')?.classList.toggle('active',cm.preset==='custom');
   $('cmCustomRange')?.classList.toggle('show',cm.preset==='custom');
 }
 function queryString(){
   const q=new URLSearchParams();
-  if(cm.custom){q.set('from',cm.custom.from);q.set('to',cm.custom.to)}else q.set('days',String(cm.days));
+  if(cm.custom){q.set('from',cm.custom.from);q.set('to',cm.custom.to)}
+  else if(cm.hours){q.set('hours',String(cm.hours))}
+  else q.set('days',String(cm.days));
   return q.toString();
 }
-function loading(){if($('cmBody'))$('cmBody').innerHTML='<div class="cm-loading"><i></i><span>正在读取本地渠道用量汇总…</span></div>'}
-function showError(message){if($('cmBody'))$('cmBody').innerHTML=`<div class="cm-empty"><b>渠道数据暂时无法读取</b><p>${esc(message||'请稍后重试。')}</p></div>`}
+function loading(){
+  $('cmSummary')?.setAttribute('aria-busy','true');
+  if($('cmBody'))$('cmBody').innerHTML='<div class="cm-loading"><i></i><span>正在读取本地渠道用量汇总…</span></div>';
+}
+function showError(message){
+  if($('cmSummary')){$('cmSummary').innerHTML='';$('cmSummary').removeAttribute('aria-busy')}
+  if($('cmBody'))$('cmBody').innerHTML=`<div class="cm-empty"><b>渠道数据暂时无法读取</b><p>${esc(message||'请稍后重试。')}</p></div>`;
+}
 async function loadReport(){
   if(cm.abort)cm.abort.abort();
   cm.abort=new AbortController();loading();
@@ -240,10 +253,11 @@ function channelGroupRows(domain,group){
   return group.channels.map(({channel,groupData})=>{
     const usage=groupData.usage||zero();
     const f=groupData.finance||finance;
-    const gap=f.site_configured&&f.upstream_configured?multiplierGap(f.multiplier_gap):'—';
+    const conflict=!!f.upstream_conflict;
+    const gap=!conflict&&f.site_configured&&f.upstream_configured?multiplierGap(f.multiplier_gap):'—';
     return `<div class="cm-group-channel-row">
       <div class="cm-channel-name"><b>#${channel.id} ${esc(channel.name)}</b></div>
-      <div class="cm-group-rate"><b>${formatMultiplier(f.upstream_effective_multiplier)}</b></div>
+      <div class="cm-group-rate"><b>${conflict?'配置冲突':formatMultiplier(f.upstream_effective_multiplier)}</b></div>
       <div class="cm-group-gap"><b>${gap}</b></div>
       <div class="cm-group-models"><b>${nfmt(channel.model_count)} 个模型</b></div>
       <div>${statusLabel(channel)}</div>
@@ -296,27 +310,40 @@ function upstreamSummary(upstream){
   const estimate=assessment.available
     ? assessment.status==='idle'?` · ${esc(assessment.reason||'近期无显著消耗')}`:` · 预计可用 ${Number(runway).toFixed(1)} 天`
     : assessment.reason?` · ${esc(assessment.reason)}`:'';
-  if(!upstream.enabled)return `<span class="neutral">${esc(upstream.provider_name||upstream.provider)} · 已停用 · ${balance}</span>`;
+  const usage=upstream.usage_sync_enabled
+    ? upstream.usage_status==='ok'?` · 日志 ${esc(shortDateTime(upstream.usage_last_success_at))} 同步`
+      :upstream.usage_status==='unsupported'?' · 日志接口待支持'
+      :upstream.usage_status==='error'||upstream.usage_status==='reconnect'?' · 日志同步待处理'
+      :' · 日志等待同步'
+    :'';
+	const backfill=upstream.usage_sync_enabled&&!upstream.usage_backfill_done
+		?upstream.usage_backfill_last_error?' · 历史补全退避重试中':' · 历史补全中'
+		:'';
+  if(!upstream.enabled)return `<span class="neutral">${esc(upstream.provider_name||upstream.provider)} · 已停用 · ${balance}${usage}</span>`;
   if(upstream.status==='reconnect')return `<span class="bad">${esc(upstream.provider_name||upstream.provider)} · 需要重新连接 · ${balance}</span>`;
   if(upstream.status==='error')return `<span class="warn">${esc(upstream.provider_name||upstream.provider)} · 同步异常 · ${balance}</span>`;
   if(upstream.status==='ok'){
     const cls=assessment.status==='critical'?'bad':assessment.status==='warning'?'warn':assessment.status==='healthy'?'ready':'neutral';
-    return `<span class="${cls}" title="近 ${Number(assessment.lookback_days||0)} 个完整自然日预估日均上游成本 ${usd(assessment.average_daily_cost_usd||0)}；小时完整率 ${Number(assessment.coverage_pct||0).toFixed(1)}%">${esc(upstream.provider_name||upstream.provider)} · ${balance}${estimate}</span>`;
+	return `<span class="${cls}" title="近 ${Number(assessment.lookback_days||0)} 个完整自然日预估日均上游成本 ${usd(assessment.average_daily_cost_usd||0)}；小时完整率 ${Number(assessment.coverage_pct||0).toFixed(1)}%">${esc(upstream.provider_name||upstream.provider)} · ${balance}${estimate}${usage}${backfill}</span>`;
   }
   return `<span class="pending">${esc(upstream.provider_name||upstream.provider)} · 等待同步</span>`;
 }
 function domainCard(domain,index,total,filtered){
   const channels=domain.vendors.flatMap(v=>v.channels),enabled=channels.filter(ch=>ch.current&&+ch.status===1).length;
   const open=cm.expandedDomains.has(domain.key),share=metric(total)>0?metric(domain.usage)/metric(total)*100:0;
-  const financeVersion=+domain.finance?.version||0;
-  const financeLabel=domain.finance?.configured?(financeVersion?`上游充值比例已配置 · v${financeVersion}`:'上游充值比例已配置'):'上游充值比例待配置';
+  const rates=domain.rate_config||{},rateConfigured=+rates.configured_channels||0,rateEnabled=+rates.enabled_channels||0;
+  const financeLabel=rateEnabled>0&&rates.complete?`上游渠道倍率已配置 · ${rateConfigured}/${rateEnabled}`:`上游渠道倍率待配置 · ${rateConfigured}/${rateEnabled}`;
+  const upstreamUsage=domain.upstream_usage||{};
+  // 上游日志只按账户（归并主域名）汇总；没有可靠的远端渠道 ID 映射时，
+  // 绝不能伪装成某一条本地渠道的上游账单。
+  const upstreamUsageMetric=upstreamUsage.available?`<span class="cm-domain-upstream-usage" title="按上游账户日志汇总；不是逐渠道上游账单。${upstreamUsage.complete?'当前完整小时已覆盖':'部分小时尚未完成同步'}"><small>上游日志消费</small><b>${usd(upstreamUsage.cost_usd)}${upstreamUsage.complete?'':' · 补齐中'}</b></span>`:'';
   const financeButton=cm.report?.finance?.can_edit&&domain.configured?`<button type="button" class="cm-finance-open" data-cm-finance="${esc(domain.key)}">倍率配置</button>`:'';
   const upstreamButton=cm.report?.finance?.can_edit&&domain.configured?`<button type="button" class="cm-upstream-open" data-cm-upstream="${esc(domain.key)}">账户配置</button>`:'';
   return `<article class="cm-domain-card${open?' open':''}"><div class="cm-domain-head" role="button" tabindex="0" data-cm-domain-toggle="${esc(domain.key)}">
     <span class="cm-rank">${String(index+1).padStart(2,'0')}</span>
     <div class="cm-domain-identity"><span class="cm-domain-icon">${domain.configured?'◎':'—'}</span><div><b>${esc(domain.domain)}</b><small>${domain.vendors.length} 个厂商 · ${channels.length} 个实际渠道 · ${enabled} 个启用</small><div class="cm-domain-config"><div class="cm-domain-finance"><span class="${domain.finance?.configured?'ready':'pending'}">${esc(financeLabel)}</span>${financeButton}</div><div class="cm-domain-upstream">${upstreamSummary(domain.upstream)}${upstreamButton}</div></div></div></div>
     <div class="cm-share"><div><b>${share.toFixed(1)}%</b><small>${filtered?'筛选内':'全站'}${esc(metricLabel())}</small></div><i><em style="width:${Math.max(share&&2,share)}%"></em></i></div>
-    <div class="cm-domain-metrics"><span><small>渠道请求数</small><b>${nfmt(domain.usage.requests)}</b></span><span><small>Tokens</small><b title="${nfmt(domain.usage.tokens)}">${compact(domain.usage.tokens)}</b></span><span><small>用户侧消费</small><b>${usd(domain.usage.cost_usd)}</b></span></div>
+    <div class="cm-domain-metrics"><span><small>渠道请求数</small><b>${nfmt(domain.usage.requests)}</b></span><span><small>Tokens</small><b title="${nfmt(domain.usage.tokens)}">${compact(domain.usage.tokens)}</b></span><span><small>用户侧消费</small><b>${usd(domain.usage.cost_usd)}</b></span>${upstreamUsageMetric}</div>
     <span class="cm-chevron">${open?'−':'+'}</span>
   </div>${open?`<div class="cm-domain-body">${domain.vendors.map(v=>vendorSection(domain,v)).join('')}</div>`:''}</article>`;
 }
@@ -377,6 +404,10 @@ function financeChannelGroups(channel){
   (channel.configured_groups||[]).forEach(name=>{if(name&&!groups.has(name))groups.set(name,{name,usage:zero(),finance:{}})});
   return [...groups.values()].sort((a,b)=>String(a.name).localeCompare(String(b.name),'zh-CN'));
 }
+function channelStatusRank(channel){
+  if(!channel.current)return 2;
+  return +channel.status===1?0:1;
+}
 function renderFinanceChannelRows(){
   const target=$('cmFinanceDomainChannelRows');if(!target)return;
   const channels=cm.financeChannels||[];
@@ -385,14 +416,14 @@ function renderFinanceChannelRows(){
     const groups=financeChannelGroups(channel);
     const configured=groups.map(group=>group.finance||{}).filter(finance=>finance.upstream_configured);
     const first=configured[0]||{};
-    const conflict=configured.some(finance=>finance.upstream_group_name!==first.upstream_group_name||finance.upstream_multiplier!==first.upstream_multiplier||finance.upstream_discount_factor!==first.upstream_discount_factor);
+    const conflict=configured.some(finance=>finance.upstream_conflict||finance.upstream_group_name!==first.upstream_group_name||finance.upstream_multiplier!==first.upstream_multiplier||finance.upstream_discount_factor!==first.upstream_discount_factor);
     const upstreamGroupName=configured.find(finance=>String(finance.upstream_group_name||'').trim())?.upstream_group_name||'';
     const multiplier=conflict?'':(first.upstream_configured?first.upstream_multiplier:'');
     const discount=conflict?'':(first.upstream_configured?(first.upstream_discount_factor||1):'');
     const state=conflict?'<small class="cm-finance-channel-warning">历史配置不一致，请重新确认</small>':'';
-    return `<article class="cm-finance-domain-channel"><div class="cm-finance-domain-channel-name"><b>#${esc(channel.id)} ${esc(channel.name)}</b>${state}</div><label class="cm-finance-upstream-group"><input type="text" maxlength="128" value="${esc(upstreamGroupName)}" data-cm-domain-rate="group-name" data-channel-id="${esc(channel.id)}" aria-label="#${esc(channel.id)} 上游分组名" placeholder="填写上游对应分组"></label><label><input type="number" min="0.000001" step="0.0001" inputmode="decimal" value="${multiplier}" data-cm-domain-rate="multiplier" data-channel-id="${esc(channel.id)}" aria-label="#${esc(channel.id)} 上游基础倍率"></label><label><input type="number" min="0.000001" step="0.0001" inputmode="decimal" value="${discount}" data-cm-domain-rate="discount" data-channel-id="${esc(channel.id)}" aria-label="#${esc(channel.id)} 上游折扣系数"></label></article>`;
+    return `<article class="cm-finance-domain-channel"><div class="cm-finance-domain-channel-name"><b>#${esc(channel.id)} ${esc(channel.name)}</b>${state}</div><div class="cm-finance-channel-status">${statusLabel(channel)}</div><label class="cm-finance-upstream-group"><input type="text" maxlength="128" value="${esc(upstreamGroupName)}" data-cm-domain-rate="group-name" data-channel-id="${esc(channel.id)}" aria-label="#${esc(channel.id)} 上游分组名" placeholder="填写上游对应分组"></label><label><input type="number" min="0.000001" step="0.0001" inputmode="decimal" value="${multiplier}" data-cm-domain-rate="multiplier" data-channel-id="${esc(channel.id)}" aria-label="#${esc(channel.id)} 上游基础倍率"></label><label><input type="number" min="0.000001" step="0.0001" inputmode="decimal" value="${discount}" data-cm-domain-rate="discount" data-channel-id="${esc(channel.id)}" aria-label="#${esc(channel.id)} 上游折扣系数"></label></article>`;
   }).join('');
-  target.insertAdjacentHTML('afterbegin','<div class="cm-finance-domain-channel-head"><span>渠道</span><span>上游分组名</span><span>上游基础倍率</span><span>上游折扣系数</span></div>');
+  target.insertAdjacentHTML('afterbegin','<div class="cm-finance-domain-channel-head"><span>渠道</span><span>状态</span><span>上游分组名</span><span>上游基础倍率</span><span>上游折扣系数</span></div>');
 }
 function setFinanceMode(mode){
   cm.financeMode=mode;
@@ -428,7 +459,7 @@ function openFinance(domainKey){
   if(!domain)return;
   cm.financeDomain=domain;cm.financeChannel=null;cm.financeGroups=[];
   cm.financeChannels=(domain.vendors||[]).flatMap(vendor=>(vendor.channels||[]).filter(channel=>channel.current).map(channel=>({...channel,vendor:vendor.name})))
-    .sort((a,b)=>(+a.id||0)-(+b.id||0));
+    .sort((a,b)=>channelStatusRank(a)-channelStatusRank(b)||(+a.id||0)-(+b.id||0));
   const upstream=domain.finance||{};
   $('cmFinanceScope').textContent='主域名倍率配置';
   $('cmFinanceTitle').textContent=`${domain.domain} · 倍率配置`;
@@ -544,7 +575,7 @@ async function openUpstream(domainKey){
   $('cmUpstreamSubtitle').textContent='正在读取当前配置…';
   $('cmUpstreamStatus').hidden=true;
   $('cmUpstreamProvider').value='newapi';$('cmUpstreamBaseURL').value=`https://${domain.domain}`;
-  $('cmUpstreamUserID').value='';$('cmUpstreamAccessToken').value='';$('cmUpstreamEmail').value='';$('cmUpstreamPassword').value='';$('cmUpstreamEnabled').checked=true;
+  $('cmUpstreamUserID').value='';$('cmUpstreamAccessToken').value='';$('cmUpstreamEmail').value='';$('cmUpstreamPassword').value='';$('cmUpstreamEnabled').checked=true;$('cmUpstreamUsageEnabled').checked=false;
   $('cmUpstreamSync').hidden=true;showUpstreamMessage('');syncUpstreamFields();
   $('cmUpstreamMask').hidden=false;$('cmUpstreamDialog').classList.add('show');$('cmUpstreamDialog').setAttribute('aria-hidden','false');
   document.body.classList.add('cm-dialog-open');
@@ -555,7 +586,7 @@ async function openUpstream(domainKey){
     if(cm.upstreamDomain!==domain)return;
     cm.upstreamConfig=data;
     $('cmUpstreamProvider').value=data.provider||'newapi';$('cmUpstreamBaseURL').value=data.base_url||`https://${domain.domain}`;
-    $('cmUpstreamUserID').value=data.user_id||'';$('cmUpstreamEmail').value=data.email||'';$('cmUpstreamEnabled').checked=data.enabled!==false;
+    $('cmUpstreamUserID').value=data.user_id||'';$('cmUpstreamEmail').value=data.email||'';$('cmUpstreamEnabled').checked=data.enabled!==false;$('cmUpstreamUsageEnabled').checked=!!data.usage_sync_enabled;
     $('cmUpstreamSubtitle').textContent=data.account?.configured
       ?'令牌已加密保存；敏感字段留空表示保持原连接不变。'
       :'选择中转站类型并填写首次连接参数。';
@@ -575,7 +606,7 @@ async function saveUpstream(){
   if(!cm.upstreamDomain||!cm.report?.finance?.can_edit)return;
   const provider=$('cmUpstreamProvider').value,baseURL=$('cmUpstreamBaseURL').value.trim();
   if(!baseURL){showUpstreamMessage('请填写站点地址。',true);return}
-  const payload={domain:cm.upstreamDomain.domain,provider,base_url:baseURL,enabled:$('cmUpstreamEnabled').checked};
+  const payload={domain:cm.upstreamDomain.domain,provider,base_url:baseURL,enabled:$('cmUpstreamEnabled').checked,usage_sync_enabled:provider==='newapi'&&$('cmUpstreamUsageEnabled').checked};
   if(provider==='newapi'){
     payload.user_id=Number($('cmUpstreamUserID').value);payload.access_token=$('cmUpstreamAccessToken').value.trim();
     if(!Number.isInteger(payload.user_id)||payload.user_id<=0){showUpstreamMessage('请填写有效的 NewAPI 用户 ID。',true);return}
@@ -618,11 +649,8 @@ function render(){
   const historical=channels.filter(ch=>!ch.current).length,filtered=filtersActive();
   const allUsage=cm.report.summary?.usage||zero();
   const share=metric(allUsage)>0?metric(filteredUsage)/metric(allUsage)*100:0;
-  const filters=$('cmFilters');
-  // Keep the controls mounted between renders, but place them immediately
-  // before the ranking heading so the page reads as overview -> filters -> list.
-  filters?.remove();
-  $('cmBody').innerHTML=`<section class="cm-kpis">
+  const summary=$('cmSummary');
+  if(summary){summary.innerHTML=`<section class="cm-kpis">
     <article><small>已配置主域名</small><b>${nfmt(configuredDomains)}</b><span>当前显示 ${nfmt(domains.length)} 个归并项</span></article>
     <article><small>当前实际渠道</small><b>${nfmt(currentChannels.length)}</b><span>${nfmt(enabled)} 启用 · ${nfmt(currentChannels.length-enabled)} 停用${historical?' · '+nfmt(historical)+' 历史':''}</span></article>
     <article class="${unconfigured?'warn':''}"><small>未归并渠道</small><b>${nfmt(unconfigured)}</b><span>${unconfigured?'尚未配置主地址':'当前渠道均已归并'}</span></article>
@@ -630,12 +658,9 @@ function render(){
     <article><small>区间 Tokens</small><b title="${nfmt(filteredUsage.tokens)}">${compact(filteredUsage.tokens)}</b><span>prompt + completion</span></article>
     <article class="accent"><small>用户侧消费</small><b>${usd(filteredUsage.cost_usd)}</b><span>NewAPI logs.quota</span></article>
     ${filtered?`<article><small>筛选${esc(metricLabel())}占比</small><b>${share.toFixed(1)}%</b><span>相对当前日期全部渠道</span></article>`:''}
-  </section>
-  <div id="cmFilterSlot"></div>
-  <section class="cm-list-head"><div><h3>渠道排名</h3><p>共 ${nfmt(domains.length)} 个归并项 · 按 ${esc(metricLabel())} 从高到低排序，逐级展开厂商类型、实际渠道与服务分组。</p></div><div class="cm-fresh">${freshness(cm.report.meta)}<small>渠道配置快照 ${esc(dateTime(cm.report.meta.channel_config_updated_at))}</small></div></section>
+  </section>`;summary.removeAttribute('aria-busy')}
+  $('cmBody').innerHTML=`<section class="cm-list-head"><div><h3>渠道排名</h3><p>共 ${nfmt(domains.length)} 个归并项 · 按 ${esc(metricLabel())} 从高到低排序，逐级展开厂商类型、实际渠道与服务分组。</p></div><div class="cm-fresh">${freshness(cm.report.meta)}<small>渠道配置快照 ${esc(dateTime(cm.report.meta.channel_config_updated_at))}</small></div></section>
   <div class="cm-domain-list">${domains.map((domain,index)=>domainCard(domain,index,filteredUsage,filtered)).join('')||'<div class="cm-empty"><b>当前筛选没有匹配渠道</b><p>请重置筛选条件或更换日期范围。</p></div>'}</div>`;
-  const slot=$('cmFilterSlot');
-  if(slot&&filters)slot.replaceWith(filters);
 }
 
 document.addEventListener('DOMContentLoaded',()=>{if($('tab-channels')&&!cm.inited)init()});

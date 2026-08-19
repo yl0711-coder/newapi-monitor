@@ -30,13 +30,24 @@ const usageDayExprSQLite = "(created_at + 28800) / 86400" // sqlite 整型相除
 // usageCountingDriver 只用于测试查询往返数：透传真实 SQLite 驱动，
 // 不伪造 SQL 结果，仅统计 users/tokens 表的 SELECT。
 type usageQueryCounts struct {
-	users  atomic.Int64
-	tokens atomic.Int64
+	logs       atomic.Int64
+	users      atomic.Int64
+	tokens     atomic.Int64
+	maxLogArgs atomic.Int64
+	// Test-only fault injection: a positive threshold makes a users SELECT
+	// with more bind arguments fail as a workload-local deadline. It exercises
+	// bounded discovery fallback without mocking production results.
+	failUsersAboveArgs atomic.Int64
+	blockUsers         <-chan struct{}
+	usersStarted       chan struct{}
+	usersOnce          sync.Once
 }
 
 func (c *usageQueryCounts) reset() {
+	c.logs.Store(0)
 	c.users.Store(0)
 	c.tokens.Store(0)
+	c.maxLogArgs.Store(0)
 }
 
 type usageCountingDriver struct {
@@ -59,8 +70,27 @@ type usageCountingConn struct {
 
 func (c *usageCountingConn) QueryContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
 	lower := strings.ToLower(query)
+	if strings.Contains(lower, " from logs") {
+		c.counts.logs.Add(1)
+		n := int64(len(args))
+		for old := c.counts.maxLogArgs.Load(); n > old && !c.counts.maxLogArgs.CompareAndSwap(old, n); old = c.counts.maxLogArgs.Load() {
+		}
+	}
 	if strings.Contains(lower, " from users") {
 		c.counts.users.Add(1)
+		if threshold := c.counts.failUsersAboveArgs.Load(); threshold > 0 && int64(len(args)) > threshold {
+			return nil, context.DeadlineExceeded
+		}
+		if c.counts.usersStarted != nil {
+			c.counts.usersOnce.Do(func() { close(c.counts.usersStarted) })
+		}
+		if c.counts.blockUsers != nil {
+			select {
+			case <-c.counts.blockUsers:
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}
 	}
 	if strings.Contains(lower, " from tokens") {
 		c.counts.tokens.Add(1)
@@ -207,6 +237,36 @@ func TestUsageGateDoesNotCancelNormalWaiter(t *testing.T) {
 	m.releaseUsageGate()
 }
 
+// TestInteractiveUsageGateCanceledWaiterClearsPriorityMarker 防止“用户已取消请求”
+// 把前台优先标记永久留住。若这里泄漏，后台事实同步会持续让路而无法恢复采集。
+func TestInteractiveUsageGateCanceledWaiterClearsPriorityMarker(t *testing.T) {
+	m := &Monitor{}
+	if err := m.acquireUsageGate(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer m.releaseUsageGate()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- m.acquireInteractiveUsageGate(ctx) }()
+
+	deadline := time.Now().Add(time.Second)
+	for m.usageInteractiveWaiters.Load() != 1 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if got := m.usageInteractiveWaiters.Load(); got != 1 {
+		t.Fatalf("交互等待者应登记优先标记，got=%d", got)
+	}
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("取消的交互等待者错误=%v", err)
+	}
+	if got := m.usageInteractiveWaiters.Load(); got != 0 {
+		t.Fatalf("取消后优先标记必须归零，got=%d", got)
+	}
+}
+
 func TestUsageGateSerializesNormalRequests(t *testing.T) {
 	m := &Monitor{}
 	const workers = 24
@@ -241,6 +301,43 @@ func TestUsageGateSerializesNormalRequests(t *testing.T) {
 	}
 	if got := maxActive.Load(); got != 1 {
 		t.Fatalf("同一时刻只应放行 1 个请求，实际最大=%d", got)
+	}
+}
+
+func TestUsageQueryLanesIsolateSlowCategoriesAndShareTwoSlotBudget(t *testing.T) {
+	m := &Monitor{}
+	if err := m.acquireUsageGate(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer m.releaseUsageGate()
+
+	// 聚合泳道被占用时，普通日志页仍能使用第二个来源槽位。
+	if err := m.acquireUsageDetailGate(context.Background()); err != nil {
+		t.Fatalf("聚合不应阻塞日志明细泳道: %v", err)
+	}
+
+	// 两个共享来源槽位均被占用后，第三类查询必须可取消地排队，不能突破预算。
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	err := m.acquireUsageExportGate(ctx)
+	cancel()
+	if !errors.Is(err, context.DeadlineExceeded) {
+		if err == nil {
+			m.releaseUsageExportGate()
+		}
+		t.Fatalf("第三条来源查询应受共享预算限制，got %v", err)
+	}
+
+	m.releaseUsageDetailGate()
+	// 释放一个来源槽位后，导出可以运行；它仍不需要等待聚合泳道。
+	if err := m.acquireUsageExportGate(context.Background()); err != nil {
+		t.Fatalf("导出应在独立泳道取得空闲来源槽位: %v", err)
+	}
+	m.releaseUsageExportGate()
+	stats := m.usageSourceStats()
+	if stats.Capacity != 2 || stats.InUse != 1 || stats.Aggregate.Active != 1 ||
+		stats.Aggregate.Acquired != 1 || stats.Detail.Acquired != 1 ||
+		stats.Export.Acquired != 1 || stats.Export.Failed != 1 {
+		t.Fatalf("来源查询预算观测计数错误: %+v", stats)
 	}
 }
 
@@ -376,7 +473,7 @@ func newFakeProdDB(t *testing.T) *sql.DB {
 	t.Cleanup(func() { db.Close() })
 	stmts := []string{
 		"CREATE TABLE users (id INTEGER PRIMARY KEY, username TEXT, email TEXT, quota INTEGER, used_quota INTEGER)",
-		"CREATE TABLE logs (id INTEGER PRIMARY KEY, user_id INTEGER, created_at INTEGER, type INTEGER, model_name TEXT, quota INTEGER, prompt_tokens INTEGER, completion_tokens INTEGER, `group` TEXT, token_id INTEGER DEFAULT 0, token_name TEXT DEFAULT '', username TEXT DEFAULT '', use_time INTEGER DEFAULT 0, is_stream INTEGER DEFAULT 0, content TEXT DEFAULT '', other TEXT DEFAULT '', request_id TEXT DEFAULT '')",
+		"CREATE TABLE logs (id INTEGER PRIMARY KEY, user_id INTEGER, channel_id INTEGER DEFAULT 0, created_at INTEGER, type INTEGER, model_name TEXT, quota INTEGER, prompt_tokens INTEGER, completion_tokens INTEGER, `group` TEXT, token_id INTEGER DEFAULT 0, token_name TEXT DEFAULT '', username TEXT DEFAULT '', use_time INTEGER DEFAULT 0, is_stream INTEGER DEFAULT 0, content TEXT DEFAULT '', other TEXT DEFAULT '', request_id TEXT DEFAULT '')",
 		"CREATE TABLE tokens (id INTEGER PRIMARY KEY, user_id INTEGER, name TEXT, `key` TEXT, `group` TEXT, used_quota INTEGER DEFAULT 0, deleted_at TIMESTAMP)",
 	}
 	for _, s := range stmts {
@@ -399,7 +496,7 @@ func newCountingFakeProdDB(t *testing.T) (*sql.DB, *usageQueryCounts) {
 	t.Cleanup(func() { db.Close() })
 	for _, stmt := range []string{
 		"CREATE TABLE users (id INTEGER PRIMARY KEY, username TEXT, email TEXT, quota INTEGER, used_quota INTEGER)",
-		"CREATE TABLE logs (id INTEGER PRIMARY KEY, user_id INTEGER, created_at INTEGER, type INTEGER, model_name TEXT, quota INTEGER, prompt_tokens INTEGER, completion_tokens INTEGER, `group` TEXT, token_id INTEGER DEFAULT 0, token_name TEXT DEFAULT '', username TEXT DEFAULT '', use_time INTEGER DEFAULT 0, is_stream INTEGER DEFAULT 0, content TEXT DEFAULT '', other TEXT DEFAULT '', request_id TEXT DEFAULT '')",
+		"CREATE TABLE logs (id INTEGER PRIMARY KEY, user_id INTEGER, channel_id INTEGER DEFAULT 0, created_at INTEGER, type INTEGER, model_name TEXT, quota INTEGER, prompt_tokens INTEGER, completion_tokens INTEGER, `group` TEXT, token_id INTEGER DEFAULT 0, token_name TEXT DEFAULT '', username TEXT DEFAULT '', use_time INTEGER DEFAULT 0, is_stream INTEGER DEFAULT 0, content TEXT DEFAULT '', other TEXT DEFAULT '', request_id TEXT DEFAULT '')",
 		"CREATE TABLE tokens (id INTEGER PRIMARY KEY, user_id INTEGER, name TEXT, `key` TEXT, `group` TEXT, used_quota INTEGER DEFAULT 0, deleted_at TIMESTAMP)",
 	} {
 		if _, err := db.Exec(stmt); err != nil {
@@ -408,6 +505,31 @@ func newCountingFakeProdDB(t *testing.T) (*sql.DB, *usageQueryCounts) {
 	}
 	counts.reset()
 	return db, counts
+}
+
+func TestCountGroupLogsSnapshotStopsAfterExportCap(t *testing.T) {
+	m := newTestMonitor(t)
+	m.prodDB = newFakeProdDB(t)
+	// 五位十进制笛卡尔积一次生成 50,002 行，避免用递归 CTE 的深度上限。
+	_, err := m.prodDB.Exec(`WITH d(n) AS (VALUES(0),(1),(2),(3),(4),(5),(6),(7),(8),(9))
+INSERT INTO logs(id,user_id,created_at,type)
+SELECT x+1,1,100,2 FROM (
+ SELECT a.n+10*b.n+100*c.n+1000*e.n+10000*f.n AS x
+ FROM d a CROSS JOIN d b CROSS JOIN d c CROSS JOIN d e CROSS JOIN d f
+) WHERE x < ?`, portalExportCap+2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	total, cursor, err := m.countGroupLogsSnapshot(context.Background(), []int64{1}, 1, 200, 0, 0, "", "", "", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != portalExportCap+1 {
+		t.Fatalf("超大导出预检应在 cap+1 停止，got=%d want=%d", total, portalExportCap+1)
+	}
+	if cursor != portalExportCap+3 {
+		t.Fatalf("有界预检仍应固定真实最大 ID 快照，cursor=%d want=%d", cursor, portalExportCap+3)
+	}
 }
 
 func TestResolveNewAPIUser(t *testing.T) {
@@ -710,7 +832,7 @@ func TestUsageDimensionTruncationAndDailyOtherCompleteness(t *testing.T) {
 	}
 }
 
-func TestServeUsageStatsDoesNotReturnPartialTokenData(t *testing.T) {
+func TestServeUsageStatsKeepsPrimaryDataWhenTokenDetailFails(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	m := newTestMonitor(t)
 	m.prodDB = newFakeProdDB(t)
@@ -732,14 +854,34 @@ func TestServeUsageStatsDoesNotReturnPartialTokenData(t *testing.T) {
 	c, _ := gin.CreateTestContext(w)
 	c.Request = httptest.NewRequest("GET", "/usage/stats?user_id=1&from=2026-07-01&to=2026-07-01", nil)
 	m.serveUsageStats(c)
-	if w.Code != 500 || strings.Contains(w.Body.String(), `"stats"`) || !strings.Contains(w.Body.String(), "令牌统计查询失败") {
-		t.Fatalf("令牌子查询失败不得返回统计半成品: status=%d body=%s", w.Code, w.Body.String())
+	if w.Code != http.StatusOK {
+		t.Fatalf("令牌子查询失败仍应返回主统计: status=%d body=%s", w.Code, w.Body.String())
+	}
+	var body struct {
+		Stats              *UsageStats  `json:"stats"`
+		ByToken            []TokenUsage `json:"by_token"`
+		TokenDataAvailable *bool        `json:"token_data_available"`
+		TokenDataMessage   string       `json:"token_data_message"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body.Stats == nil || body.Stats.Summary.Requests != 1 || body.TokenDataAvailable == nil || *body.TokenDataAvailable || len(body.ByToken) != 0 || body.TokenDataMessage == "" {
+		t.Fatalf("令牌子查询失败时的降级载荷不正确: %+v", body)
 	}
 }
 
 type usageMatrixHTTPResponse struct {
-	Enabled bool        `json:"enabled"`
-	Matrix  UsageMatrix `json:"matrix"`
+	Enabled         bool        `json:"enabled"`
+	Matrix          UsageMatrix `json:"matrix"`
+	MatrixAvailable bool        `json:"matrix_available"`
+	MatrixMessage   string      `json:"matrix_message"`
+	RangePartial    bool        `json:"range_partial"`
+	RangeMessage    string      `json:"range_message"`
+	RequestedFrom   string      `json:"requested_from"`
+	RequestedTo     string      `json:"requested_to"`
+	DataStale       bool        `json:"data_stale"`
+	DataMessage     string      `json:"data_message"`
 }
 
 func requestUsageMatrixForTest(t *testing.T, m *Monitor, path string) usageMatrixHTTPResponse {
@@ -826,12 +968,213 @@ func TestServeUsageMatrixBalancesPerformanceAccuracyAndFreshness(t *testing.T) {
 	}
 }
 
+// 前端对超过 2 万格的矩阵本来就只显示“请缩短范围”。服务端必须
+// 在扫描 logs/facts 和编码大 JSON 之前停止，否则会出现页面无数据但数据库与
+// Monitor 内存压力仍增加的假降级。
+func TestServeUsageMatrixSkipsOversizedGridBeforeLogsQuery(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	m := newTestMonitor(t)
+	prodDB, counts := newCountingFakeProdDB(t)
+	m.prodDB = prodDB
+	m.usageDayExpr = usageDayExprSQLite
+	m.usageCache = newUsageResultCacheForTest(nil, 32, 8<<20)
+	from, to, err := parseUsageRange("2026-05-07", "2026-08-14", time.Now()) // 100 个 CST 自然日
+	if err != nil {
+		t.Fatal(err)
+	}
+	if usageMatrixExceedsCellBudget(200, from, to) {
+		t.Fatal("200 人 × 100 天恰好 20,000 格，不应被护栏拒绝")
+	}
+	if !usageMatrixExceedsCellBudget(201, from, to) {
+		t.Fatal("201 人 × 100 天为 20,100 格，必须被护栏拒绝")
+	}
+
+	group := CustomerGroup{Name: "large-grid"}
+	if err := m.storeDB.Create(&group).Error; err != nil {
+		t.Fatal(err)
+	}
+	for id := int64(1); id <= 55; id++ {
+		if err := m.storeDB.Create(&TrackedUser{UserID: id, GroupID: group.ID, Username: fmt.Sprintf("u-%d", id)}).Error; err != nil {
+			t.Fatal(err)
+		}
+		if _, err := prodDB.Exec("INSERT INTO users(id,username,email,quota,used_quota) VALUES(?,?,?,?,?)",
+			id, fmt.Sprintf("u-%d", id), fmt.Sprintf("u-%d@example.test", id), 1_000_000, 2_000_000); err != nil {
+			t.Fatal(err)
+		}
+	}
+	counts.reset()
+
+	got := requestUsageMatrixForTest(t, m, "/usage/matrix?from=2025-08-14&to=2026-08-14")
+	if got.MatrixAvailable || got.MatrixMessage == "" || len(got.Matrix.Cells) != 0 ||
+		len(got.Matrix.Users) != 55 || len(got.Matrix.Days) != 366 {
+		t.Fatalf("超限矩阵应只返回资料与明确提示: %+v", got)
+	}
+	if logs := counts.logs.Load(); logs != 0 {
+		t.Fatalf("超限矩阵不得触发 logs 查询，实际=%d", logs)
+	}
+	if fills := m.usageCache.fills.Load(); fills != 0 {
+		t.Fatalf("超限矩阵不得进入缓存 fill，实际=%d", fills)
+	}
+}
+
+// 核心矩阵是管理端用户用量页的第一数据域。源 logs 表发生短暂故障时，页面应保留
+// 最近一次成功聚合并明确标记数据时效；用户资料/余额仍通过各自独立查询返回，不得整页
+// 500 或静默展示陈旧结果。
+func TestServeUsageMatrixReturnsExplicitStaleCoreDataOnSourceFailure(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	m := newTestMonitor(t)
+	m.prodDB = newFakeProdDB(t)
+	m.usageDayExpr = usageDayExprSQLite
+	m.usageCache = newUsageResultCacheForTest(nil, 32, 1<<20)
+
+	g := CustomerGroup{Name: "stale-core-company"}
+	if err := m.storeDB.Create(&g).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := m.storeDB.Create(&TrackedUser{UserID: 1, GroupID: g.ID, Username: "snapshot", Email: "snapshot@example.test"}).Error; err != nil {
+		t.Fatal(err)
+	}
+	day := time.Date(2026, 7, 1, 10, 0, 0, 0, usageCST).Unix()
+	for _, q := range []string{
+		"INSERT INTO users (id,username,email,quota,used_quota) VALUES (1,'live','live@example.test',500000,1000000)",
+		fmt.Sprintf("INSERT INTO logs (id,user_id,created_at,type,model_name,quota,prompt_tokens,completion_tokens,`group`) VALUES (1,1,%d,2,'m',500000,10,2,'g')", day),
+	} {
+		if _, err := m.prodDB.Exec(q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	path := "/usage/matrix?from=2026-07-01&to=2026-07-01"
+	if first := requestUsageMatrixForTest(t, m, path); first.DataStale || len(first.Matrix.Cells) != 1 || first.Matrix.Cells[0].Requests != 1 {
+		t.Fatalf("初次核心统计错误: %+v", first)
+	}
+
+	tracked, err := m.listTracked()
+	if err != nil {
+		t.Fatal(err)
+	}
+	fromTs, toTs, err := parseUsageRange("2026-07-01", "2026-07-01", time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := m.usageFactCacheKey(adminUsageAggregateKey("matrix", portalMemberFingerprint(tracked), 0, 0, fromTs, toTs))
+	fullKey := m.usageCache.fullKey(key)
+	data, ok := m.usageCache.local.GetStale(fullKey, time.Now())
+	if !ok {
+		t.Fatal("首次成功的核心统计应在本机缓存中")
+	}
+	// 不等待真实 TTL：把同一成功结果放入“已过新鲜期、仍处于明确回退窗口”的状态。
+	m.usageCache.local.PutWithStale(fullKey, data, time.Millisecond, time.Minute, time.Now().Add(-10*time.Millisecond))
+	if _, err := m.prodDB.Exec("DROP TABLE logs"); err != nil {
+		t.Fatal(err)
+	}
+
+	got := requestUsageMatrixForTest(t, m, path+"&refresh=1")
+	if !got.DataStale || got.DataMessage == "" || len(got.Matrix.Cells) != 1 || got.Matrix.Cells[0].Requests != 1 ||
+		len(got.Matrix.Users) != 1 || got.Matrix.Users[0].BalanceQuota == nil || *got.Matrix.Users[0].BalanceQuota != 500000 {
+		t.Fatalf("源失败后的核心数据回退载荷错误: %+v", got)
+	}
+}
+
+// 没有可回退的旧矩阵时，日志聚合失败也不能把管理端整个“用户用量”页打成 500。
+// 用户资料、当前余额、累计总消耗来自独立查询，范围消费则明确为不可用而非假零。
+func TestServeUsageMatrixKeepsProfilesWhenMatrixUnavailable(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	m := newTestMonitor(t)
+	m.prodDB = newFakeProdDB(t)
+	m.usageDayExpr = usageDayExprSQLite
+	m.usageCache = newUsageResultCacheForTest(nil, 32, 1<<20)
+
+	g := CustomerGroup{Name: "matrix-unavailable-company"}
+	if err := m.storeDB.Create(&g).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := m.storeDB.Create(&TrackedUser{UserID: 1, GroupID: g.ID, Username: "snapshot", Email: "snapshot@example.test"}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.prodDB.Exec("INSERT INTO users (id,username,email,quota,used_quota) VALUES (1,'live','live@example.test',900000,100000)"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.prodDB.Exec("DROP TABLE logs"); err != nil {
+		t.Fatal(err)
+	}
+
+	got := requestUsageMatrixForTest(t, m, "/usage/matrix?from=2026-07-01&to=2026-07-01")
+	if got.MatrixAvailable || got.MatrixMessage == "" || len(got.Matrix.Cells) != 0 || len(got.Matrix.Users) != 1 ||
+		got.Matrix.Users[0].BalanceQuota == nil || *got.Matrix.Users[0].BalanceQuota != 900000 ||
+		got.Matrix.Users[0].TotalUsedQuota == nil || *got.Matrix.Users[0].TotalUsedQuota != 100000 ||
+		got.Matrix.Users[0].TotalUSD != 0 {
+		t.Fatalf("矩阵不可用时应保留资料快照且不伪造范围消费: %+v", got)
+	}
+}
+
+// 已发布服务版只有近 7 天、候选版仍在补 90 天时，30 天查询应先展示服务版中
+// 完整的自然日，并明确标记为部分范围。这个渐进展示只能读本地 facts，不能为了
+// 补齐更早日期回退扫描生产 logs；详情聚合与列表矩阵必须使用同一实际窗口。
+func TestServeUsageAggregatesShowPublishedOverlapWhileBackfillContinues(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	m := newTestMonitor(t)
+	prodDB, counts := newCountingFakeProdDB(t)
+	m.prodDB = prodDB
+	enableUsageFactsForTest(m)
+	m.usageCache = newUsageResultCacheForTest(nil, 32, 4<<20)
+
+	if err := m.storeDB.Create(&TrackedUser{UserID: 1, Username: "partial", Email: "partial@test.local", AddedAt: 1}).Error; err != nil {
+		t.Fatal(err)
+	}
+	publishedFrom := time.Date(2026, 8, 7, 13, 0, 0, 0, usageCST).Unix()
+	publishedThrough := time.Date(2026, 8, 14, 13, 0, 0, 0, usageCST).Unix()
+	seedPublishedUsageFactsForTest(t, m, []int64{1}, publishedFrom, publishedThrough)
+	if err := m.storeDB.Create(&UsageUserSnapshot{
+		UserID: 1, Username: "partial", Email: "partial@test.local", BalanceQuota: 2_000_000,
+		UsedQuota: 5_000_000, Exists: true, CapturedAt: time.Now().Unix(),
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	availableDay := time.Date(2026, 8, 8, 0, 0, 0, 0, usageCST).Unix()
+	if err := m.storeDB.Create(&UsageDailyFact{
+		DateTs: availableDay, UserID: 1, ChannelID: 1, Grp: "g", ModelName: "m", TokenID: 10,
+		Requests: 2, PromptTokens: 30, CompletionTokens: 10, ConsumeQuota: 500_000,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	counts.reset()
+
+	path := "/usage/matrix?from=2026-07-16&to=2026-08-14"
+	matrix := requestUsageMatrixForTest(t, m, path)
+	if !matrix.MatrixAvailable || !matrix.RangePartial || matrix.RangeMessage == "" ||
+		matrix.RequestedFrom != "2026-07-16" || matrix.RequestedTo != "2026-08-14" ||
+		matrix.Matrix.From != "2026-08-08" || matrix.Matrix.To != "2026-08-14" || len(matrix.Matrix.Days) != 7 ||
+		len(matrix.Matrix.Cells) != 1 || matrix.Matrix.Cells[0].Date != "2026-08-08" ||
+		len(matrix.Matrix.Users) != 1 || matrix.Matrix.Users[0].TotalUSD != 1 {
+		t.Fatalf("30 天渐进矩阵载荷错误: %+v", matrix)
+	}
+
+	stats := requestUsageStatsForTest(t, m, "/usage/stats?user_id=1&from=2026-07-16&to=2026-08-14")
+	if !stats.StatsAvailable || !stats.RangePartial || stats.RangeMessage == "" ||
+		stats.RequestedFrom != "2026-07-16" || stats.RequestedTo != "2026-08-14" ||
+		stats.Stats.From != "2026-08-08" || stats.Stats.To != "2026-08-14" ||
+		stats.Stats.Summary.Requests != 2 || stats.Stats.Summary.CostUSD != 1 {
+		t.Fatalf("30 天渐进详情载荷错误: %+v", stats)
+	}
+	if got := counts.logs.Load(); got != 0 {
+		t.Fatalf("渐进展示不得扫描生产 logs，实际=%d", got)
+	}
+}
+
 type usageStatsHTTPResponse struct {
-	Stats          UsageStats   `json:"stats"`
-	ByToken        []TokenUsage `json:"by_token"`
-	BalanceQuota   *int64       `json:"balance_quota"`
-	TotalUsedQuota *int64       `json:"total_used_quota"`
-	Members        int          `json:"members"`
+	Stats              UsageStats   `json:"stats"`
+	StatsAvailable     bool         `json:"stats_available"`
+	StatsMessage       string       `json:"stats_message"`
+	RangePartial       bool         `json:"range_partial"`
+	RangeMessage       string       `json:"range_message"`
+	RequestedFrom      string       `json:"requested_from"`
+	RequestedTo        string       `json:"requested_to"`
+	ByToken            []TokenUsage `json:"by_token"`
+	TokenDataAvailable *bool        `json:"token_data_available"`
+	TokenDataMessage   string       `json:"token_data_message"`
+	BalanceQuota       *int64       `json:"balance_quota"`
+	TotalUsedQuota     *int64       `json:"total_used_quota"`
+	Members            int          `json:"members"`
 }
 
 func requestUsageStatsForTest(t *testing.T, m *Monitor, path string) usageStatsHTTPResponse {
@@ -848,6 +1191,49 @@ func requestUsageStatsForTest(t *testing.T, m *Monitor, path string) usageStatsH
 		t.Fatal(err)
 	}
 	return out
+}
+
+// 范围日志聚合临时不可用时，管理端成员和公司详情都必须保留独立读取的
+// 当前余额、累计消耗与成员数；同时不得在失败后继续做第二次 logs 扫描。
+func TestServeUsageStatsKeepsLiveFieldsWhenStatsUnavailable(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	m := newTestMonitor(t)
+	prodDB, counts := newCountingFakeProdDB(t)
+	m.prodDB = prodDB
+	m.usageDayExpr = usageDayExprSQLite
+	m.usageCache = newUsageResultCacheForTest(nil, 32, 1<<20)
+
+	g := CustomerGroup{Name: "stats-unavailable-company"}
+	if err := m.storeDB.Create(&g).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := m.storeDB.Create(&TrackedUser{UserID: 1, GroupID: g.ID, Username: "snapshot"}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.prodDB.Exec("INSERT INTO users (id,username,email,quota,used_quota) VALUES (1,'live','live@example.test',900000,100000)"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.prodDB.Exec("DROP TABLE logs"); err != nil {
+		t.Fatal(err)
+	}
+	counts.reset()
+
+	user := requestUsageStatsForTest(t, m, "/usage/stats?user_id=1&from=2026-07-01&to=2026-07-01")
+	if user.StatsAvailable || user.StatsMessage == "" || user.BalanceQuota == nil || *user.BalanceQuota != 900000 ||
+		user.TotalUsedQuota == nil || *user.TotalUsedQuota != 100000 || user.TokenDataAvailable == nil || *user.TokenDataAvailable ||
+		user.TokenDataMessage == "" || len(user.ByToken) != 0 {
+		t.Fatalf("成员统计不可用时的降级载荷错误: %+v", user)
+	}
+
+	group := requestUsageStatsForTest(t, m, fmt.Sprintf("/usage/stats?group_id=%d&from=2026-07-01&to=2026-07-01", g.ID))
+	if group.StatsAvailable || group.StatsMessage == "" || group.Members != 1 ||
+		group.BalanceQuota == nil || *group.BalanceQuota != 900000 ||
+		group.TotalUsedQuota == nil || *group.TotalUsedQuota != 100000 {
+		t.Fatalf("公司统计不可用时的降级载荷错误: %+v", group)
+	}
+	if got := counts.logs.Load(); got != 2 {
+		t.Fatalf("每个详情请求只应触发一次失败的 logs 聚合，实际 %d 次", got)
+	}
 }
 
 func TestServeUsageStatsCachesOnlyAggregatesAndRefreshesExactly(t *testing.T) {
@@ -1223,6 +1609,44 @@ func TestEmbeddedRangePickerIsDateOnly(t *testing.T) {
 	}
 }
 
+// 管理端用户矩阵同样不能把首列固定成过小的宽度；空间不足时应保持日期/金额列宽并横向滚动。
+func TestUsageMatrixUserColumnIsAdaptive(t *testing.T) {
+	for _, required := range []string{
+		"--mx-user-w:216px",
+		"--mx-user-text-w",
+		"function sizeUsageMatrix(table,dayCount,users)",
+		"usageMatrixTextWidth(u.username",
+		"const maxWidth=wrapWidth<1200?216:232",
+		"sizeUsageMatrix(th.closest('table'),days.length,users)",
+		"sizeUsageMatrix(table,days,table._usageMatrixUsers||[])",
+		`class="ucell" title="${esc(fullLabel)}"`,
+	} {
+		if !strings.Contains(pageHTML, required) {
+			t.Fatalf("Monitor 用户列缺少自适应显示保护: %q", required)
+		}
+	}
+	for _, forbidden := range []string{".mxwrap.mx-compact table", "--mx-table-width", "classList.toggle('mx-compact'"} {
+		if strings.Contains(pageHTML, forbidden) {
+			t.Fatalf("Monitor 用户列修复不应改变整表宽度模式: %q", forbidden)
+		}
+	}
+}
+
+// 每日消费明细失败时矩阵会退化成三列。该状态必须有独立列宽，不能让用户列
+// 因 table 的剩余空间分配吞掉大半屏幕；正常多日期矩阵仍沿用原来的冻结列。
+func TestUsageMatrixSummaryFallbackHasIndependentColumnWidths(t *testing.T) {
+	for _, required := range []string{
+		".mxwrap table.mx-summary-only",
+		"--mx-summary-user-w:clamp(260px,24vw,360px)",
+		"table.mx-summary-only td[colspan]",
+		"table.classList.toggle('mx-summary-only',!matrixAvailable)",
+	} {
+		if !strings.Contains(pageHTML, required) {
+			t.Fatalf("Monitor 三列降级表缺少独立列宽保护: %q", required)
+		}
+	}
+}
+
 // 主站用户名允许引号和反斜杠；它只能作为显示数据使用，不能进入内联事件源码。
 // 这里锁住待跟进两个入口（普通提醒、长期沉默），防以后为图省事重新拼 onclick。
 func TestFollowUpActionsKeepUserTextOutOfInlineJavaScript(t *testing.T) {
@@ -1324,6 +1748,27 @@ func TestUserNotePreservedOnLabelRefresh(t *testing.T) {
 	m.storeDB.First(&p, "user_id = ?", int64(1))
 	if p.Email != "new@b.com" || p.Note != "合同7月到期" {
 		t.Fatalf("本地库 = %+v", p)
+	}
+}
+
+// 来源 users 表发生短时故障时，已有的 Monitor 本地资料快照只能做局部兜底；
+// 正常路径仍每次读取当前余额，不能因优化而把实时字段变成短时旧值。
+func TestRefreshTrackedLabelsUsesLocalSnapshotOnlyOnSourceFailure(t *testing.T) {
+	m := newTestMonitor(t)
+	m.prodDB = newFakeProdDB(t)
+	if err := m.storeDB.Create(&UsageUserSnapshot{UserID: 7, Username: "snapshot-alice", Email: "snapshot@example.test", BalanceQuota: 600000, UsedQuota: 800000, Exists: true, CapturedAt: time.Now().Unix()}).Error; err != nil {
+		t.Fatal(err)
+	}
+	tracked := []TrackedUser{{UserID: 7, Username: "old-alice", Email: "old@example.test", Note: "本地备注"}}
+	if _, err := m.prodDB.Exec("DROP TABLE users"); err != nil {
+		t.Fatal(err)
+	}
+	out, balances, used := m.refreshTrackedLabels(context.Background(), tracked)
+	if out[0].Username != "snapshot-alice" || out[0].Email != "snapshot@example.test" || out[0].Note != "本地备注" {
+		t.Fatalf("来源故障应只用本地资料快照兜底: %+v", out[0])
+	}
+	if balances[7] != 600000 || used[7] != 800000 {
+		t.Fatalf("来源故障应返回本地快照金额: balances=%v used=%v", balances, used)
 	}
 }
 
@@ -1604,27 +2049,33 @@ func TestQueryGroupLogs(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	// 历史 NewAPI 数据允许这些数值列为 NULL；页面必须按 0 展示，
+	// 不能因为 database/sql 无法把 NULL Scan 到 int64 而整页 500。
+	if _, err := m.prodDB.Exec("INSERT INTO logs (id,user_id,created_at,type,model_name,quota,prompt_tokens,completion_tokens,`group`,token_name,username,use_time,is_stream,content,other,request_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+		10, 10, 1800, 2, "nullable", nil, nil, nil, "default", "tkA", "u10", nil, nil, "", "", "nullable-row"); err != nil {
+		t.Fatal(err)
+	}
 	ids := []int64{10, 11}
 	// 全部(logType=0)对齐 new-api 官方客户端使用日志:全 6 种类型都可见,含错误(5)/退款(6);
-	// 本组应 7 条(id 1,2,3,5,6,7,8),倒序 → 8,7,6,5,3,2,1;绝无 uid20 的 id4(越权)
+	// 本组应 8 条(id 1,2,3,5,6,7,8,10),倒序；绝无 uid20 的 id4(越权)
 	all, err := m.queryGroupLogs(context.Background(), ids, 0, 2000, 0, 0, "", "", "", "", "", 0, 100)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(all) != 7 {
-		t.Fatalf("全部(含错误/退款)应 7 条,实得 %d: %+v", len(all), all)
+	if len(all) != 8 {
+		t.Fatalf("全部(含错误/退款/NULL 历史行)应 8 条,实得 %d: %+v", len(all), all)
 	}
-	if all[0].ID != 8 || all[6].ID != 1 {
-		t.Fatalf("倒序不对: %d..%d", all[0].ID, all[6].ID)
+	if all[0].ID != 10 || all[7].ID != 1 {
+		t.Fatalf("倒序不对: %d..%d", all[0].ID, all[7].ID)
 	}
 	for _, r := range all {
 		if r.ID == 4 {
 			t.Fatalf("不该出现的行(越权其它组): %+v", r)
 		}
 	}
-	// 类型筛选 消费(2):id 1,2,3,5
-	if cs, _ := m.queryGroupLogs(context.Background(), ids, 0, 2000, 0, 2, "", "", "", "", "", 0, 100); len(cs) != 4 {
-		t.Fatalf("消费类型筛选应 4 条,得 %d", len(cs))
+	// 类型筛选 消费(2):id 1,2,3,5,10
+	if cs, _ := m.queryGroupLogs(context.Background(), ids, 0, 2000, 0, 2, "", "", "", "", "", 0, 100); len(cs) != 5 {
+		t.Fatalf("消费类型筛选应 5 条,得 %d", len(cs))
 	}
 	// 类型筛选 错误(5):只 id6;退款(6):只 id8——对齐 new-api,两者都能单独筛出来
 	if es, _ := m.queryGroupLogs(context.Background(), ids, 0, 2000, 0, 5, "", "", "", "", "", 0, 100); len(es) != 1 || es[0].ID != 6 {
@@ -1676,23 +2127,23 @@ func TestQueryGroupLogs(t *testing.T) {
 	if len(vg) != 1 || vg[0].ID != 5 {
 		t.Fatalf("分组筛选不对: %+v", vg)
 	}
-	// 计数:全部(含错误/退款)=7;消费=4;成员 uid11=id 2,5,7,8=4
-	if n, err := m.countGroupLogs(context.Background(), ids, 0, 2000, 0, 0, "", "", "", "", ""); err != nil || n != 7 {
-		t.Fatalf("总计数 = %d, %v; want 7", n, err)
+	// 计数:全部(含错误/退款/NULL 行)=8;消费=5;成员 uid11=id 2,5,7,8=4
+	if n, err := m.countGroupLogs(context.Background(), ids, 0, 2000, 0, 0, "", "", "", "", ""); err != nil || n != 8 {
+		t.Fatalf("总计数 = %d, %v; want 8", n, err)
 	}
-	if n, _ := m.countGroupLogs(context.Background(), ids, 0, 2000, 0, 2, "", "", "", "", ""); n != 4 {
-		t.Fatalf("消费计数 = %d; want 4", n)
+	if n, _ := m.countGroupLogs(context.Background(), ids, 0, 2000, 0, 2, "", "", "", "", ""); n != 5 {
+		t.Fatalf("消费计数 = %d; want 5", n)
 	}
 	if n, _ := m.countGroupLogs(context.Background(), ids, 0, 2000, 11, 0, "", "", "", "", ""); n != 4 {
 		t.Fatalf("成员计数 = %d; want 4", n)
 	}
-	// 游标分页(全部,含错误/退款):limit 2 → 8,7;再传 cursor=7 → 6,5
+	// 游标分页(全部,含错误/退款):limit 2 → 10,8;再传 cursor=8 → 7,6
 	p1, _ := m.queryGroupLogs(context.Background(), ids, 0, 2000, 0, 0, "", "", "", "", "", 0, 2)
-	if len(p1) != 2 || p1[0].ID != 8 || p1[1].ID != 7 {
+	if len(p1) != 2 || p1[0].ID != 10 || p1[1].ID != 8 {
 		t.Fatalf("第一页不对: %+v", p1)
 	}
 	p2, _ := m.queryGroupLogs(context.Background(), ids, 0, 2000, 0, 0, "", "", "", "", "", p1[1].ID, 2)
-	if len(p2) != 2 || p2[0].ID != 6 || p2[1].ID != 5 {
+	if len(p2) != 2 || p2[0].ID != 7 || p2[1].ID != 6 {
 		t.Fatalf("第二页不对: %+v", p2)
 	}
 	// 时间窗口 [0,1150):只 id 1,2
@@ -1700,12 +2151,21 @@ func TestQueryGroupLogs(t *testing.T) {
 	if len(win) != 2 {
 		t.Fatalf("时间窗口不对: %+v", win)
 	}
+	var nullable LogRow
+	for _, r := range all {
+		if r.ID == 10 {
+			nullable = r
+		}
+	}
+	if nullable.ID != 10 || nullable.PromptTokens != 0 || nullable.CompletionTokens != 0 || nullable.UseTime != 0 || nullable.CostUSD != 0 || nullable.IsStream {
+		t.Fatalf("NULL 数值字段未安全归零: %+v", nullable)
+	}
 	// 令牌搜索:通配符按字面匹配(%/_ 已转义),"%"搜不到任何行;正常子串仍可搜到
 	if tw, _ := m.queryGroupLogs(context.Background(), ids, 0, 2000, 0, 0, "", "", "%", "", "", 0, 100); len(tw) != 0 {
 		t.Fatalf("通配符应按字面匹配,搜'%%'应 0 条,得 %d", len(tw))
 	}
-	if tw, _ := m.queryGroupLogs(context.Background(), ids, 0, 2000, 0, 0, "", "", "kA", "", "", 0, 100); len(tw) != 3 {
-		t.Fatalf("子串搜索 kA 应 3 条(tkA,含错误行 id6),得 %d", len(tw))
+	if tw, _ := m.queryGroupLogs(context.Background(), ids, 0, 2000, 0, 0, "", "", "kA", "", "", 0, 100); len(tw) != 4 {
+		t.Fatalf("子串搜索 kA 应 4 条(tkA,含错误行 id6 与 NULL 行 id10),得 %d", len(tw))
 	}
 	// 详情关键字搜索:普通词只匹配 content 字面;id6(错误类型,content="上游返回 429 限流")现在全局可见,搜"限流"应命中
 	if dk, _ := m.queryGroupLogs(context.Background(), ids, 0, 2000, 0, 0, "", "", "", "限流", "", 0, 100); len(dk) != 1 || dk[0].ID != 6 {

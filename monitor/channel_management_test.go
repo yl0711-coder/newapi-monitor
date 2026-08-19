@@ -3,13 +3,17 @@ package monitor
 import (
 	"context"
 	"math"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/gin-gonic/gin"
 )
 
 func TestChannelManagementPageIncludesBusinessDateShortcuts(t *testing.T) {
 	for _, shortcut := range []string{
+		`data-cm-hours="24">近 24 小时`,
 		`data-cm-preset="today">今天`,
 		`data-cm-preset="yesterday">昨天`,
 		`data-cm-preset="week">本周`,
@@ -18,8 +22,42 @@ func TestChannelManagementPageIncludesBusinessDateShortcuts(t *testing.T) {
 			t.Fatalf("渠道管理页缺少日期快捷项 %q", shortcut)
 		}
 	}
-	if strings.Contains(portalHTML, "data-cm-preset") {
+	if strings.Contains(portalHTML, "data-cm-preset") || strings.Contains(portalHTML, "data-cm-hours") {
 		t.Fatal("Usage Portal 不应接入渠道管理日期快捷项")
+	}
+	js := string(channelManagementJS)
+	for _, marker := range []string{`[data-cm-hours]`, `q.set('hours',String(cm.hours))`} {
+		if !strings.Contains(js, marker) {
+			t.Fatalf("渠道管理近 24 小时交互缺少 %q", marker)
+		}
+	}
+}
+
+func TestChannelManagementRangeUsesLast24CompletedHours(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	now := time.Date(2026, 8, 12, 16, 37, 45, 0, cstLocation)
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest("GET", "/channels/report?hours=24", nil)
+
+	scope, err := channelManagementRange(c, now, 90)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantTo := time.Date(2026, 8, 12, 16, 0, 0, 0, cstLocation)
+	wantFrom := wantTo.Add(-24 * time.Hour)
+	if scope.FromTs != wantFrom.Unix() || scope.ToTs != wantTo.Unix() || scope.RangeHours != 24 {
+		t.Fatalf("range=[%v,%v], want [%v,%v]", time.Unix(scope.FromTs, 0), time.Unix(scope.ToTs, 0), wantFrom, wantTo)
+	}
+}
+
+func TestChannelManagementRangeRejectsConflictingParameters(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest("GET", "/channels/report?hours=24&days=7", nil)
+	if _, err := channelManagementRange(c, time.Now(), 90); err == nil {
+		t.Fatal("hours 与 days 同时提供时应拒绝含糊口径")
 	}
 }
 
@@ -109,7 +147,7 @@ func TestChannelManagementWebsiteGroupsUseNewAPIAndCanSync(t *testing.T) {
 		`source_multiplier`,
 		`上游分组名`,
 		`cm-finance-domain-channel-head`,
-		`<span>渠道</span><span>上游分组名</span><span>上游基础倍率</span><span>上游折扣系数</span>`,
+		`<span>渠道</span><span>状态</span><span>上游分组名</span><span>上游基础倍率</span><span>上游折扣系数</span>`,
 		`data-cm-domain-rate="group-name"`,
 		`upstream_group_name`,
 		`上游分组名由你按上游令牌实际归属手动填写`,
@@ -123,14 +161,54 @@ func TestChannelManagementWebsiteGroupsUseNewAPIAndCanSync(t *testing.T) {
 	}
 }
 
-func TestChannelManagementFiltersRenderBeforeRanking(t *testing.T) {
+func TestChannelManagementFiltersRemainMountedAcrossReportRefresh(t *testing.T) {
 	page := pageHTML
 	js := string(channelManagementJS)
-	if !strings.Contains(page, `id="cmFilters"`) {
-		t.Fatal("渠道管理筛选区缺少稳定 DOM 标识")
+	for _, marker := range []string{`id="cmSummary"`, `id="cmFilters"`, `id="cmBody"`} {
+		if !strings.Contains(page, marker) {
+			t.Fatalf("渠道管理缺少稳定渲染区域 %q", marker)
+		}
 	}
-	if !strings.Contains(js, `id="cmFilterSlot"`) || !strings.Contains(js, `filters?.remove()`) {
-		t.Fatal("渠道管理筛选区没有在渲染时移动到排行区域")
+	if strings.Contains(js, `id="cmFilterSlot"`) || strings.Contains(js, `filters?.remove()`) {
+		t.Fatal("渠道管理筛选区不应移动到会被时间刷新清空的动态容器")
+	}
+	if !strings.Contains(js, `const summary=$('cmSummary')`) || !strings.Contains(js, `$('cmBody').innerHTML=`) {
+		t.Fatal("渠道管理统计与排行未使用独立渲染区域")
+	}
+	summaryIndex := strings.Index(page, `id="cmSummary"`)
+	filtersIndex := strings.Index(page, `id="cmFilters"`)
+	bodyIndex := strings.Index(page, `id="cmBody"`)
+	if summaryIndex < 0 || filtersIndex <= summaryIndex || bodyIndex <= filtersIndex {
+		t.Fatal("渠道管理应按统计、筛选、排名的固定顺序布局")
+	}
+}
+
+func TestChannelManagementUpstreamUsageUsesLocalHourlyRowsOnly(t *testing.T) {
+	m := newStabilityTestMonitor(t)
+	from := time.Date(2026, 8, 8, 0, 0, 0, 0, cstLocation).Unix()
+	now := from + 3*3600
+	if err := m.storeDB.Create(&[]ChannelUpstreamUsageHour{
+		{Domain: "upstream.example", HourTs: from, Requests: 2, Tokens: 30, CostUSD: 1.2, Provider: upstreamProviderNewAPI},
+		{Domain: "upstream.example", HourTs: from + 3600, Requests: 0, Tokens: 0, CostUSD: 0, Provider: upstreamProviderNewAPI},
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	accounts := map[string]ChannelUpstreamAccountView{"upstream.example": {Configured: true, UsageSyncEnabled: true}}
+	usage, err := m.loadChannelUpstreamUsage(context.Background(), stabilityScope{FromTs: from, ToTs: now}, now, accounts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := usage["upstream.example"]
+	if !got.Available || got.Requests != 2 || got.Tokens != 30 || math.Abs(got.CostUSD-1.2) > 1e-9 || got.ExpectedHours != 3 || got.CompletedHours != 2 || got.Complete {
+		t.Fatalf("local upstream usage aggregation=%+v", got)
+	}
+	// 即便本地存在聚合，只要管理员未明确开启日志同步，页面也不显示它。
+	usage, err = m.loadChannelUpstreamUsage(context.Background(), stabilityScope{FromTs: from, ToTs: now}, now, map[string]ChannelUpstreamAccountView{"upstream.example": {Configured: true}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(usage) != 0 {
+		t.Fatalf("disabled usage sync must not expose old local rows: %+v", usage)
 	}
 }
 
@@ -249,6 +327,77 @@ func TestBuildChannelManagementReportGroupsDomainVendorChannelAndServiceGroup(t 
 	}
 }
 
+func TestChannelManagementShowsOnlyUserRequestsAndHidesInternalChannelTests(t *testing.T) {
+	m := newStabilityTestMonitor(t)
+	hour := time.Date(2026, 8, 14, 10, 0, 0, 0, cstLocation).Unix()
+	if err := m.storeDB.Create(&ChannelSnap{
+		ID: 37, Name: "codeyu_claude_2x", Vendor: "Anthropic", BaseDomain: "codeyu.shop",
+		Status: 1, Groups: "claude-0.5x", Models: "claude-sonnet-5", UpdatedAt: hour,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	users := []StabilityHourSample{{
+		HourTs: hour, ChannelID: 37, ModelName: "claude-sonnet-5", Grp: "claude-0.5x",
+		Success: 3, Tokens: 300, Quota: 3000,
+	}}
+	tests := []ChannelTestHourSample{{
+		HourTs: hour, ChannelID: 37, ModelName: "claude-sonnet-5", Grp: "internal", Origin: "legacy",
+		Requests: 6, Tokens: 60, Quota: 600,
+	}}
+	if err := m.replaceStabilityHourTraffic(hour, users, tests, StabilityHourIngestState{}); err != nil {
+		t.Fatal(err)
+	}
+	report, err := m.buildChannelManagementReport(context.Background(), stabilityScope{
+		FromTs: hour, ToTs: hour + 3600,
+	}, hour+3600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Summary.Usage.Requests != 3 || report.Summary.Usage.Tokens != 300 ||
+		math.Abs(report.Summary.Usage.CostUSD-float64(3000)/quotaPerUSD) > 1e-9 {
+		t.Fatalf("渠道管理只能汇总用户请求，得到 %+v", report.Summary.Usage)
+	}
+	for _, group := range report.Filters.Groups {
+		if group == "internal" {
+			t.Fatalf("内部测试分组不得进入渠道管理筛选项: %+v", report.Filters.Groups)
+		}
+	}
+	for _, domain := range report.Domains {
+		for _, group := range domain.Groups {
+			if group.Name == "internal" {
+				t.Fatalf("内部测试不得作为用户服务分组展示: %+v", domain.Groups)
+			}
+		}
+	}
+}
+
+func TestChannelManagementRejectsLegacyMixedTrafficUntilReclassified(t *testing.T) {
+	m := newStabilityTestMonitor(t)
+	hour := time.Date(2026, 8, 14, 10, 0, 0, 0, cstLocation).Unix()
+	row := StabilityHourSample{
+		HourTs: hour, ChannelID: 37, ModelName: "claude-sonnet-5", Grp: "internal",
+		Success: 6, Tokens: 60, Quota: 600,
+	}
+	if err := m.storeDB.Create(&row).Error; err != nil {
+		t.Fatal(err)
+	}
+	// 模拟升级前已经混合了用户/测试流量、没有分类版本的老库存量行。
+	if err := m.storeDB.Model(&StabilityHourSample{}).Where(
+		"hour_ts=? AND channel_id=? AND model_name=? AND grp=?", hour, 37, "claude-sonnet-5", "internal",
+	).Update("traffic_class_version", 0).Error; err != nil {
+		t.Fatal(err)
+	}
+	report, err := m.buildChannelManagementReport(context.Background(), stabilityScope{
+		FromTs: hour, ToTs: hour + 3600,
+	}, hour+3600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Summary.Usage.Requests != 0 {
+		t.Fatalf("未重分类的历史混合行必须 fail-closed，不得冒充用户请求: %+v", report.Summary.Usage)
+	}
+}
+
 func TestChannelManagementReportRejectsPartialDimensionResult(t *testing.T) {
 	m := newStabilityTestMonitor(t)
 	day := time.Date(2026, 8, 5, 0, 0, 0, 0, cstLocation).Unix()
@@ -333,5 +482,22 @@ func TestChannelManagementReportSyncsRenameAndKeepsDeletedSnapshot(t *testing.T)
 	}
 	if found == nil || found.Current || found.Name != "new-name" || found.Host != "api.codeyu.shop" || found.Usage.Requests != 4 {
 		t.Fatalf("deleted channel did not retain its last visible snapshot: %+v", found)
+	}
+}
+
+func TestChannelManagementStatusRankEnabledBeforeDisabledAndHistory(t *testing.T) {
+	cases := []struct {
+		channel channelManagementBuild
+		want    int
+	}{
+		{channel: channelManagementBuild{Current: true, Status: 1}, want: 0},
+		{channel: channelManagementBuild{Current: true, Status: 3}, want: 1},
+		{channel: channelManagementBuild{Current: true, Status: 2}, want: 1},
+		{channel: channelManagementBuild{Current: false, Status: 1}, want: 2},
+	}
+	for _, tc := range cases {
+		if got := channelManagementStatusRank(&tc.channel); got != tc.want {
+			t.Fatalf("status rank(%+v)=%d want %d", tc.channel, got, tc.want)
+		}
 	}
 }
