@@ -178,6 +178,7 @@ func (m *Monitor) RegisterRoutes(r *gin.Engine) {
 		view.GET("/stability/health", m.serveStabilityHealth)                              // 采集新鲜度/覆盖/积压:不查生产库
 		view.GET("/stability/edge", m.serveNginxEdge)                                      // Nginx 入口层:只读本地脱敏分钟汇总
 		view.GET("/channels/report", m.serveChannelManagementReport)                       // 渠道管理:主域名→厂商→渠道→服务分组的本地汇总
+		view.GET("/logchain/requests", m.serveLogChainRequests)                            // 客户排障:逐条请求→渠道→上游主域名→错误原文(含 type=5,含渠道信息,仅管理员)
 		view.GET("/infra", m.serveInfra)                                                   // 服务端健康监控(实例/DB/LB)快照
 		view.GET("/infra/series", m.serveInfraSeries)                                      // 按需取某资源某些指标的近 N 小时序列(展开图用)
 		view.GET("/usage/users", m.listTrackedUsers)                                       // 用户用量:被盯名单(含分组)
