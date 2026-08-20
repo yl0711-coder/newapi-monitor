@@ -230,6 +230,64 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
   th{padding:11px 14px;text-align:left;font-size:12px;text-transform:uppercase;color:var(--text-muted);background:rgba(255,255,255,.03);font-weight:500}
   td{padding:11px 14px;font-size:14px;border-top:1px solid var(--border)}
   tr:hover td{background:rgba(255,255,255,.02)}
+  /* ── 客户排障(tab-logchain) ── */
+  .lc-toolbar{display:flex;justify-content:space-between;align-items:flex-end;gap:16px;flex-wrap:wrap;margin-bottom:14px}
+  .lc-toolbar h2{margin:0 0 4px;font-size:18px}
+  .lc-toolbar p{margin:0;color:var(--text-muted);font-size:13px}
+  .lc-daybar{display:flex;align-items:center;gap:6px}
+  .lc-daybar button,.lc-filterbar button{background:var(--surface);color:var(--text);border:1px solid var(--border);border-radius:7px;padding:6px 11px;font-size:13px;cursor:pointer}
+  .lc-daybar button:hover:not(:disabled),.lc-filterbar button:hover:not(:disabled){border-color:var(--accent)}
+  .lc-daybar button:disabled{opacity:.4;cursor:not-allowed}
+  .lc-daybar input[type=date]{background:var(--surface);color:var(--text);border:1px solid var(--border);border-radius:7px;padding:6px 9px;font-size:13px}
+  .lc-daylabel{color:var(--text-muted);font-size:13px;margin-left:4px}
+  .lc-filterbar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:12px}
+  .lc-filterbar select,.lc-filterbar input[type=text],.lc-filterbar input:not([type]){background:var(--surface);color:var(--text);border:1px solid var(--border);border-radius:7px;padding:6px 9px;font-size:13px;max-width:190px}
+  .lc-filterbar .lc-primary{background:var(--accent);border-color:var(--accent);color:#fff}
+  .lc-check{display:flex;align-items:center;gap:6px;font-size:13px;background:var(--surface);border:1px solid var(--border);border-radius:7px;padding:6px 10px;cursor:pointer;user-select:none}
+  .lc-counter{font-size:13px;color:var(--text-muted)}
+  .lc-counter b{color:var(--text)}
+  .lc-counter .lc-errnum{color:var(--red)}
+  .lc-status{font-size:12px;color:var(--text-muted)}
+  .lc-alert{background:rgba(239,68,68,.1);border:1px solid rgba(239,68,68,.35);color:var(--text);border-radius:9px;padding:11px 14px;font-size:13px;margin-bottom:12px}
+  .lc-notes{font-size:12px;color:var(--text-muted);margin-bottom:10px;display:flex;flex-direction:column;gap:3px}
+  /* 盲区常驻可见,不折叠:防止"查不到"被读成"没发生过" */
+  .lc-blind{background:rgba(245,158,11,.08);border:1px solid rgba(245,158,11,.3);border-radius:9px;padding:11px 14px;margin-bottom:14px}
+  .lc-blind-head{font-size:13px;font-weight:600;color:var(--yellow);margin-bottom:6px}
+  .lc-blind-list{margin:0;padding-left:18px;font-size:12px;color:var(--text-muted);line-height:1.65}
+  .lc-card{padding:0;overflow:hidden}
+  .lc-tablewrap{overflow-x:auto}
+  .lc-table{width:100%;min-width:1080px;border-collapse:collapse;table-layout:fixed}
+  .lc-table th{white-space:nowrap}
+  .lc-table td{vertical-align:top;word-break:break-word}
+  .lc-table tbody tr[data-lc-id]{cursor:pointer}
+  /* 错误行整行标红底:扫一眼就知道有没有问题 */
+  .lc-table tr.lc-err td{background:rgba(239,68,68,.07)}
+  .lc-table tr.lc-err:hover td{background:rgba(239,68,68,.12)}
+  .lc-table tr.lc-open td{background:rgba(99,102,241,.1)}
+  .lc-sub{font-size:11px;color:var(--text-muted);margin-top:2px}
+  .lc-arrow{font-size:12px;color:var(--text-muted);margin-top:3px}
+  .lc-domain{color:var(--accent);font-size:12.5px}
+  .lc-cust>div:first-child{font-weight:500}
+  .lc-time{text-align:right;white-space:nowrap}
+  .lc-time b{font-size:14px;font-variant-numeric:tabular-nums}
+  /* 未展开时限高,避免长错误把表格撑爆;展开区给全文 */
+  .lc-content{font-size:12px;line-height:1.5;max-height:3.9em;overflow:hidden;color:var(--text-muted);font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+  .lc-err .lc-content{color:var(--text)}
+  .lc-empty{text-align:center;padding:34px 16px;color:var(--text-muted);font-size:13px}
+  .lc-detail td{background:rgba(0,0,0,.18)!important;padding:14px 16px}
+  .lc-kvs{display:grid;grid-template-columns:repeat(auto-fill,minmax(190px,1fr));gap:8px 18px;margin-bottom:12px}
+  .lc-kv{font-size:12px;display:flex;flex-direction:column;gap:2px}
+  .lc-kv span{color:var(--text-muted)}
+  .lc-kv b{font-weight:500;word-break:break-all}
+  .lc-raw-head{display:flex;justify-content:space-between;align-items:center;font-size:12px;color:var(--text-muted);margin-bottom:5px}
+  .lc-copy,.lc-jump{background:var(--surface);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:4px 10px;font-size:12px;cursor:pointer}
+  .lc-copy:hover,.lc-jump:hover{border-color:var(--accent)}
+  /* 原文不折行不美化:要能原样拿去问上游客服 */
+  .lc-raw{margin:0;padding:11px 13px;background:var(--bg);border:1px solid var(--border);border-radius:8px;font-size:12px;line-height:1.6;overflow-x:auto;white-space:pre;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+  .lc-more{padding:12px;text-align:center;border-top:1px solid var(--border)}
+  .lc-more button{background:var(--surface);color:var(--text);border:1px solid var(--border);border-radius:7px;padding:7px 16px;font-size:13px;cursor:pointer}
+  .lc-more button:hover{border-color:var(--accent)}
+  .lc-toast{position:fixed;bottom:26px;left:50%;transform:translateX(-50%);background:var(--surface);border:1px solid var(--accent);color:var(--text);padding:9px 18px;border-radius:9px;font-size:13px;z-index:60}
   .badge{display:inline-block;padding:2px 8px;border-radius:6px;font-size:12px;font-weight:500}
   .badge-green{background:rgba(16,185,129,.15);color:var(--green)}
   .badge-yellow{background:rgba(245,158,11,.15);color:var(--yellow)}
@@ -281,6 +339,7 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
       <div class="tab" data-tab="model" title="模型监控"><span class="monitor-nav-icon"><svg viewBox="0 0 24 24"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg></span><span class="monitor-nav-label">模型监控</span></div>
       <div class="tab" data-tab="server" title="服务端监控"><span class="monitor-nav-icon"><svg viewBox="0 0 24 24"><path d="M3 3v18h18"/><path d="m7 16 4-5 4 3 5-7"/></svg></span><span class="monitor-nav-label">服务端监控</span></div>
       <div class="tab" data-tab="sync" title="数据同步状态"><span class="monitor-nav-icon"><svg viewBox="0 0 24 24"><path d="M20 7h-6V1"/><path d="M4 17h6v6"/><path d="M20 7a8 8 0 0 0-13.7-3.6L4 5.7M4 17a8 8 0 0 0 13.7 3.6l2.3-2.3"/></svg></span><span class="monitor-nav-label">数据同步状态</span></div>
+      <div class="tab" data-tab="logchain" title="客户排障"><span class="monitor-nav-icon"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/><path d="M11 8v3"/><path d="M11 14h.01"/></svg></span><span class="monitor-nav-label">客户排障</span></div>
     </nav>
     <button type="button" class="monitor-sidebar-toggle" id="monitorSidebarToggle" aria-expanded="true" aria-label="收起侧边栏" title="收起侧边栏">
       <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m15 18-6-6 6-6"/></svg><span>收起侧边栏</span>
@@ -303,6 +362,7 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
       <div class="tab" data-tab="stability">稳定性报表</div>
       <div class="tab" data-tab="model">模型监控</div>
       <div class="tab" data-tab="server">服务端监控</div>
+      <div class="tab" data-tab="logchain">客户排障</div>
     </nav>
 
     <div class="monitor-content">
@@ -633,6 +693,64 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
     <div id="infraAlerts" style="padding:14px 18px"><span class="muted">加载中…</span></div></div>
 </div>
 
+<!-- ═══════════ Tab 7:客户排障(逐条请求→渠道→上游主域名→错误原文;查生产库 logs,含 type=5) ═══════════ -->
+<div class="tabpane logchain-page" id="tab-logchain" hidden>
+  <div id="lcError" class="lc-alert" hidden></div>
+
+  <div class="lc-toolbar">
+    <div>
+      <h2>客户排障</h2>
+      <p>客户报"AI 用不了/报错"时，定位这条请求走了哪个上游、上游返回了什么。</p>
+    </div>
+    <div class="lc-daybar">
+      <button type="button" id="lcPrevDay" title="前一天">‹</button>
+      <input id="lcDate" type="date" aria-label="选择日期">
+      <button type="button" id="lcNextDay" title="后一天">›</button>
+      <button type="button" id="lcToday">今天</button>
+      <span class="lc-daylabel" id="lcDateLabel"></span>
+    </div>
+  </div>
+
+  <div class="lc-filterbar">
+    <label class="lc-check" title="只列出上游返回错误的请求(type=5)。关掉可看全部请求，错误行仍标红。">
+      <input type="checkbox" id="lcErrorOnly" checked><span>只看错误</span>
+    </label>
+    <select id="lcGroup" aria-label="服务分组"><option value="">全部服务分组</option></select>
+    <select id="lcDomain" aria-label="上游主域名"><option value="">全部上游主域名</option></select>
+    <select id="lcChannel" aria-label="渠道"><option value="">全部渠道</option></select>
+    <input id="lcModel" list="lcModelList" placeholder="模型名(精确)" aria-label="模型名">
+    <datalist id="lcModelList"></datalist>
+    <input id="lcUser" placeholder="客户 ID 或令牌名" aria-label="客户 ID 或令牌名" title="纯数字按用户 ID 精确查；其它按令牌名模糊查">
+    <input id="lcKeyword" placeholder="错误原文关键词" aria-label="错误原文关键词">
+    <button type="button" id="lcApply" class="lc-primary">查询</button>
+    <button type="button" id="lcReset">重置</button>
+    <span class="lc-counter" id="lcCounter"></span>
+    <span class="lc-status" id="lcStatus"></span>
+  </div>
+
+  <div id="lcNotes" class="lc-notes" hidden></div>
+  <div id="lcBlind" class="lc-blind" hidden></div>
+
+  <div class="card lc-card">
+    <div class="lc-tablewrap">
+      <table class="lc-table">
+        <thead><tr>
+          <th style="width:11%">客户</th>
+          <th style="width:10%">令牌</th>
+          <th style="width:8%">分组</th>
+          <th style="width:13%">模型</th>
+          <th style="width:18%">渠道 → 上游主域名</th>
+          <th>上游返回原文</th>
+          <th style="width:7%">时间</th>
+        </tr></thead>
+        <tbody id="lcTableBody"><tr><td colspan="7" class="lc-empty">加载中…</td></tr></tbody>
+      </table>
+    </div>
+    <div class="lc-more"><button type="button" id="lcMore" hidden>加载更早的记录</button></div>
+  </div>
+  <div class="lc-toast" id="lcToast" hidden></div>
+</div>
+
 <!-- ═══════════ Tab 3:用户用量(盯指定用户,按需查生产库 logs 聚合) ═══════════ -->
 <div class="tabpane" id="tab-usage">
   <div id="usageErr"></div>
@@ -761,6 +879,7 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
 
 <script src="/stability.js?v=2"></script>
 <script src="/channel-management.js?v=6"></script>
+<script src="/logchain.js?v=1"></script>
 <script>
 const params=new URLSearchParams(location.search);
 let WINDOW=parseInt(params.get('window')||'60',10);
@@ -1456,6 +1575,7 @@ function switchTab(name,preserveHash){
   document.getElementById('tab-channels').hidden=(name!=='channels');
   document.getElementById('tab-server').hidden=(name!=='server');
   document.getElementById('tab-usage').hidden=(name!=='usage');
+  document.getElementById('tab-logchain').hidden=(name!=='logchain');
   if(window.monitorShellSetTab)window.monitorShellSetTab(name);
   if(name==='server'){loadInfra();infraSchedule();setTimeout(resizeInfraCharts,80);}
   else if(infraTimer){clearInterval(infraTimer);}
@@ -1463,6 +1583,7 @@ function switchTab(name,preserveHash){
   if(name==='usage'){usageInit();usageLoadFactsStatus()}
   if(name==='stability'&&window.stabilityActivate)window.stabilityActivate();
   if(name==='channels'&&window.channelManagementActivate)window.channelManagementActivate();
+  if(name==='logchain'&&window.logChainActivate)window.logChainActivate();
   if(name==='model')setTimeout(resizeModelCharts,60); // 模型 tab 非默认可见,切回时按可见宽度重排图表
 }
 function resizeModelCharts(){[trendChart,longChart,sloGauge,latChart,ttftChart].forEach(c=>c&&c.resize());}
@@ -2948,7 +3069,7 @@ setSeg();const _mePromise=loadMe();load();schedule();
 document.querySelectorAll('#longSeg a').forEach(a=>{a.href='javascript:void 0';a.classList.toggle('active',+a.dataset.d===longDays);a.addEventListener('click',e=>{e.preventDefault();longDays=+a.dataset.d;document.querySelectorAll('#longSeg a').forEach(x=>x.classList.toggle('active',x===a));loadLongTrend();});});
 loadLongTrend();
 // 默认落在「用户用量」;URL hash 带 tab(从报警设置返回/手动刷新)则恢复到该 tab。等 IS_ROOT 就位再渲染,模型/服务端数据后台预载
-_mePromise.finally(()=>{const q=monitorHashParams(),tab=q.get('tab');const target=/^(sync|model|server|usage|stability|channels)$/.test(tab||'')?tab:'usage';switchTab(target,true);window.dispatchEvent(new CustomEvent('monitor:navigate',{detail:{tab:target,context:window.monitorNavigationContext()}}))});
+_mePromise.finally(()=>{const q=monitorHashParams(),tab=q.get('tab');const target=/^(sync|model|server|usage|stability|channels|logchain)$/.test(tab||'')?tab:'usage';switchTab(target,true);window.dispatchEvent(new CustomEvent('monitor:navigate',{detail:{tab:target,context:window.monitorNavigationContext()}}))});
 </script>
 </body>
 </html>

@@ -23,6 +23,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -381,6 +382,62 @@ func (m *Monitor) attachChannelSnaps(ctx context.Context, rows []LogChainRow) er
 		rows[i].ChannelDeleted = s.DeletedAt > 0
 	}
 	return nil
+}
+
+// serveLogChainFilters GET /logchain/filters
+// 供筛选下拉取值：服务分组 / 上游主域名 / 渠道。**只读本地 channel_snaps，不碰生产库。**
+// 单独一个接口而不是塞进 requests 响应：下拉选项与所选日期无关，
+// 换一天不该重新算一遍，也不该因为当天没有错误就让下拉变空。
+func (m *Monitor) serveLogChainFilters(c *gin.Context) {
+	var snaps []ChannelSnap
+	if err := m.storeDB.WithContext(c.Request.Context()).
+		Select("id", "name", "vendor", "base_domain", "groups", "status", "deleted_at").
+		Find(&snaps).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "读取渠道快照失败: " + err.Error()})
+		return
+	}
+	groupSet := map[string]struct{}{}
+	domainSet := map[string]struct{}{}
+	type chanOpt struct {
+		ID      int64  `json:"id"`
+		Name    string `json:"name"`
+		Domain  string `json:"domain"`
+		Deleted bool   `json:"deleted,omitempty"`
+	}
+	chans := make([]chanOpt, 0, len(snaps))
+	for _, s := range snaps {
+		// 服务分组是逗号分隔的多值列，拆开去重。
+		for _, g := range strings.Split(s.Groups, ",") {
+			if g = strings.TrimSpace(g); g != "" {
+				groupSet[g] = struct{}{}
+			}
+		}
+		if s.BaseDomain != "" {
+			domainSet[s.BaseDomain] = struct{}{}
+		}
+		// 已删除渠道也列出：历史请求仍要能按它筛，与 base_domain 保留快照同理。
+		chans = append(chans, chanOpt{ID: int64(s.ID), Name: s.Name, Domain: s.BaseDomain, Deleted: s.DeletedAt > 0})
+	}
+	sortedKeys := func(m map[string]struct{}) []string {
+		out := make([]string, 0, len(m))
+		for k := range m {
+			out = append(out, k)
+		}
+		sort.Strings(out)
+		return out
+	}
+	sort.Slice(chans, func(i, j int) bool {
+		if chans[i].Domain != chans[j].Domain {
+			return chans[i].Domain < chans[j].Domain
+		}
+		return chans[i].Name < chans[j].Name
+	})
+	c.JSON(http.StatusOK, gin.H{
+		"ok":       true,
+		"groups":   sortedKeys(groupSet),
+		"domains":  sortedKeys(domainSet),
+		"channels": chans,
+	})
 }
 
 // logChainBlindSpots 是本接口结构性答不了的问题。随响应一起返回，让前端必须显式面对：

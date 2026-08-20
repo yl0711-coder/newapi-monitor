@@ -57,6 +57,9 @@ var stabilityCSS []byte // Monitor 管理端新框架与稳定性报表样式；
 //go:embed stability.js
 var stabilityJS []byte // 稳定性报表交互；页面请求只访问 /stability/* 本地汇总接口
 
+//go:embed logchain.js
+var logChainJS []byte // 客户排障页交互；只访问 /logchain/* 管理员接口
+
 //go:embed channel_management.js
 var channelManagementJS []byte // 渠道管理交互；只访问 Monitor 本地渠道汇总接口
 
@@ -155,6 +158,10 @@ func (m *Monitor) RegisterRoutes(r *gin.Engine) {
 		c.Header("Cache-Control", "no-cache")
 		c.Data(http.StatusOK, "application/javascript; charset=utf-8", channelManagementJS)
 	})
+	r.GET("/logchain.js", func(c *gin.Context) {
+		c.Header("Cache-Control", "no-cache")
+		c.Data(http.StatusOK, "application/javascript; charset=utf-8", logChainJS)
+	})
 	r.GET("/api/brand", m.brandHandler)                // 公开:站点名,供前端设置页面标题
 	r.POST("/internal/rejections", m.ingestRejections) // 机器对机器:接收采集器推送的前置拒绝(token 鉴权)
 	r.POST("/internal/host", m.ingestHost)             // 机器对机器:接收各节点主机 agent 推送的 OS 内存/磁盘(token 鉴权)
@@ -179,6 +186,7 @@ func (m *Monitor) RegisterRoutes(r *gin.Engine) {
 		view.GET("/stability/edge", m.serveNginxEdge)                                      // Nginx 入口层:只读本地脱敏分钟汇总
 		view.GET("/channels/report", m.serveChannelManagementReport)                       // 渠道管理:主域名→厂商→渠道→服务分组的本地汇总
 		view.GET("/logchain/requests", m.serveLogChainRequests)                            // 客户排障:逐条请求→渠道→上游主域名→错误原文(含 type=5,含渠道信息,仅管理员)
+		view.GET("/logchain/filters", m.serveLogChainFilters)                              // 客户排障:筛选下拉取值(服务分组/上游域名/渠道),只读本地快照
 		view.GET("/infra", m.serveInfra)                                                   // 服务端健康监控(实例/DB/LB)快照
 		view.GET("/infra/series", m.serveInfraSeries)                                      // 按需取某资源某些指标的近 N 小时序列(展开图用)
 		view.GET("/usage/users", m.listTrackedUsers)                                       // 用户用量:被盯名单(含分组)
