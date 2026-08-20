@@ -136,7 +136,7 @@ func TestLogChainWhereParameterizesUserInput(t *testing.T) {
 		FromTs: 100, ToTs: 200, Limit: 50,
 		UserID: 7, ChannelID: 12, Model: "gpt-4o", Group: "vip",
 		TokenName: "50%_off", RequestID: "req-1", Keyword: "'; DROP TABLE logs; --",
-		BeforeID: 999,
+		BeforeTs: 150, BeforeID: 999,
 	}
 	where, args := logChainWhere(s, []int64{3, 4})
 
@@ -159,8 +159,47 @@ func TestLogChainWhereParameterizesUserInput(t *testing.T) {
 	if !strings.Contains(where, "ESCAPE '!'") {
 		t.Errorf("LIKE 缺少 ESCAPE 子句: %s", where)
 	}
-	if !strings.Contains(where, "id < ?") {
-		t.Errorf("游标翻页条件缺失: %s", where)
+	if !strings.Contains(where, "created_at < ? OR (created_at = ? AND id < ?)") {
+		t.Errorf("复合游标条件缺失: %s", where)
+	}
+}
+
+// TestLogChainOrdersByOccurrenceTime 排序必须按发生时间，不能按 id。
+//
+// new-api 在请求**完成时**写日志：一个耗时 60s 的超时请求会比后发起、快速失败的
+// 请求更晚写入，因此 id 序 ≠ 发生时间序。用户要求"按发生错误的时间顺序排列"，
+// 这条在 fixture 实测中真实暴露过（15:40、14:02、09:13 排在 13:22 之前）。
+func TestLogChainOrdersByOccurrenceTime(t *testing.T) {
+	// queryLogChain 在 prodDB 为 nil 时提前返回，拿不到完整 SQL；
+	// 故直接断言排序子句本身——实现与测试共用 logChainOrderBySQL 这一份字面量，
+	// 不会出现"改了 SQL 但测试还在断言旧写法"的漂移。
+	sql := logChainOrderBySQL()
+	if !strings.Contains(sql, "created_at DESC") {
+		t.Errorf("必须按 created_at 倒序: %s", sql)
+	}
+	if !strings.Contains(sql, "id DESC") {
+		t.Errorf("同秒多条需用 id 破平以保证顺序稳定: %s", sql)
+	}
+	if strings.HasPrefix(strings.TrimSpace(sql), "ORDER BY id DESC") {
+		t.Error("不得以 id 为首要排序键：id 序不等于发生时间序")
+	}
+}
+
+// TestLogChainCursorRequiresBothParts 游标是 (created_at, id) 复合键，
+// 只给一半无法定位续查位置。静默忽略会让"加载更多"从头再来、出现重复行。
+func TestLogChainCursorRequiresBothParts(t *testing.T) {
+	now := time.Date(2026, 8, 20, 12, 0, 0, 0, cstLocation)
+	for _, q := range []string{"before_id=100", "before_ts=1700000000"} {
+		if _, err := parseLogChainScope(newLogChainCtx(q), now); err == nil {
+			t.Errorf("只提供半个游标应报错: %s", q)
+		}
+	}
+	s, err := parseLogChainScope(newLogChainCtx("before_ts=1700000000&before_id=100"), now)
+	if err != nil {
+		t.Fatalf("成对提供游标应放行: %v", err)
+	}
+	if s.BeforeTs != 1700000000 || s.BeforeID != 100 {
+		t.Errorf("游标解析错误: ts=%d id=%d", s.BeforeTs, s.BeforeID)
 	}
 }
 

@@ -15,7 +15,7 @@ const lc={
   date:'',            // YYYY-MM-DD（CST），空=今天
   errorOnly:true,
   filters:{group:'',domain:'',channel_id:'',model:'',user:'',keyword:''},
-  rows:[],hasMore:false,nextBeforeID:0,
+  rows:[],hasMore:false,nextBeforeTs:0,nextBeforeID:0,
   blindSpots:[],scope:null,note:'',enrichError:'',
   opts:null,           // /logchain/filters 结果，只取一次
   loading:false,abort:null,generation:0,
@@ -201,7 +201,12 @@ function buildQuery(more){
   const u=lc.filters.user;
   if(u){ if(/^\d+$/.test(u))q.set('user_id',u); else q.set('token_name',u); }
   q.set('limit','100');
-  if(more&&lc.nextBeforeID)q.set('before_id',String(lc.nextBeforeID));
+  // 游标必须成对传：排序键是 (created_at, id)，只给 id 定位不到续查位置，
+  // 后端会显式拒绝（避免"加载更多"从头再来、出现重复行）。
+  if(more&&lc.nextBeforeTs&&lc.nextBeforeID){
+    q.set('before_ts',String(lc.nextBeforeTs));
+    q.set('before_id',String(lc.nextBeforeID));
+  }
   return q.toString();
 }
 
@@ -215,7 +220,7 @@ async function load(more){
   lc.loading=true;
   lc.abort?.abort();
   const ac=new AbortController();lc.abort=ac;
-  if(!more){lc.rows=[];lc.expanded.clear();lc.nextBeforeID=0}
+  if(!more){lc.rows=[];lc.expanded.clear();lc.nextBeforeTs=0;lc.nextBeforeID=0}
   renderStatus(more?'加载更多…':'加载中…');
   try{
     const r=await fetch('/logchain/requests?'+buildQuery(more),{signal:ac.signal,headers:{'Accept':'application/json'}});
@@ -227,6 +232,7 @@ async function load(more){
     if(!r.ok)throw new Error(data.error||`HTTP ${r.status}`);
     lc.rows=more?lc.rows.concat(data.rows||[]):(data.rows||[]);
     lc.hasMore=!!data.has_more;
+    lc.nextBeforeTs=+data.next_before_ts||0;
     lc.nextBeforeID=+data.next_before_id||0;
     lc.blindSpots=data.blind_spots||[];
     lc.scope=data.scope||null;

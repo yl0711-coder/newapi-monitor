@@ -100,8 +100,13 @@ type logChainScope struct {
 	Keyword   string
 	ErrorOnly bool
 	LogType   int
-	BeforeID  int64
-	Limit     int
+	// 复合游标 (created_at, id)。排序按 created_at 而非 id：
+	// new-api 在请求**完成时**写日志，耗时长的请求会比后发起、快速失败的请求更晚写入，
+	// 因此 id 序并不等于发生时间序。排障要的是"几点几分发生的"，必须按 created_at。
+	// 单用 created_at 做游标会在同秒多条时漏行或重复，故带上 id 破平。
+	BeforeTs int64
+	BeforeID int64
+	Limit    int
 }
 
 // parseLogChainScope 解析并收敛查询参数。时间窗按 CST 自然日左闭右开，与事实层口径一致。
@@ -160,8 +165,20 @@ func parseLogChainScope(c *gin.Context, now time.Time) (logChainScope, error) {
 	if s.ErrorOnly && s.LogType != 0 && s.LogType != 5 {
 		return logChainScope{}, errors.New("error_only 与 type 冲突：error_only=true 时 type 只能为 5")
 	}
-	if b, err := strconv.ParseInt(strings.TrimSpace(c.Query("before_id")), 10, 64); err == nil && b > 0 {
-		s.BeforeID = b
+	// 游标必须成对提供：只给一个无法定位 (created_at,id) 的位置，
+	// 静默忽略会让"加载更多"从头再来、出现重复行，所以显式拒绝。
+	beforeTsText := strings.TrimSpace(c.Query("before_ts"))
+	beforeIDText := strings.TrimSpace(c.Query("before_id"))
+	if (beforeTsText == "") != (beforeIDText == "") {
+		return logChainScope{}, errors.New("before_ts 与 before_id 必须同时提供")
+	}
+	if beforeTsText != "" {
+		bt, err1 := strconv.ParseInt(beforeTsText, 10, 64)
+		bi, err2 := strconv.ParseInt(beforeIDText, 10, 64)
+		if err1 != nil || err2 != nil || bt <= 0 || bi <= 0 {
+			return logChainScope{}, errors.New("before_ts / before_id 必须为正整数")
+		}
+		s.BeforeTs, s.BeforeID = bt, bi
 	}
 	if l, err := strconv.Atoi(strings.TrimSpace(c.Query("limit"))); err == nil && l > 0 {
 		s.Limit = l
@@ -250,11 +267,26 @@ func logChainWhere(s logChainScope, domainChans []int64) (string, []any) {
 		where += " AND content LIKE ? ESCAPE '!'"
 		args = append(args, "%"+escapeLike(s.Keyword)+"%")
 	}
-	if s.BeforeID > 0 { // 游标翻页：id 近似时间序，倒序取更早的，不用深 OFFSET
-		where += " AND id < ?"
-		args = append(args, s.BeforeID)
+	// 复合游标：按 (created_at, id) 倒序取"更早的"，不用深 OFFSET。
+	// 写成 created_at < ? OR (created_at = ? AND id < ?) 而非行值比较
+	// ((created_at,id) < (?,?))：前者能用上 created_at 索引，后者在 MySQL 上
+	// 未必走索引。同秒多条时用 id 破平，避免漏行或重复。
+	if s.BeforeTs > 0 && s.BeforeID > 0 {
+		where += " AND (created_at < ? OR (created_at = ? AND id < ?))"
+		args = append(args, s.BeforeTs, s.BeforeTs, s.BeforeID)
 	}
 	return where, args
+}
+
+// logChainOrderBySQL 排序子句。抽成函数是为了让实现与测试共用同一份字面量，
+// 避免"改了 SQL 但测试还在断言旧写法"的漂移。
+//
+// 按发生时间倒序，不按 id：new-api 在请求**完成时**写日志，一个耗时 60s 的超时请求
+// 会比后发起、快速失败的请求更晚写入，故 id 序 ≠ 发生时间序。排障看的是"几点几分
+// 发生的"，用户也明确要求按发生时间排列。同秒多条时用 id 破平以保证顺序稳定
+// （否则复合游标翻页可能漏行或重复）。
+func logChainOrderBySQL() string {
+	return "ORDER BY created_at DESC, id DESC"
 }
 
 // queryLogChain 查生产 logs 取一页排障明细。多取一行判断 has_more，不做 COUNT(*)。
@@ -281,7 +313,7 @@ func (m *Monitor) queryLogChain(ctx context.Context, s logChainScope, domainChan
 		" COALESCE(use_time,0), COALESCE(is_stream,0), COALESCE(quota,0)," +
 		" COALESCE(content,''), COALESCE(other,''), COALESCE(request_id,'')" +
 		" FROM logs WHERE " + where +
-		" ORDER BY id DESC LIMIT " + strconv.Itoa(s.Limit+1)
+		" " + logChainOrderBySQL() + " LIMIT " + strconv.Itoa(s.Limit+1)
 
 	rows, err := m.prodDB.QueryContext(cctx, q, args...)
 	if err != nil {
@@ -504,7 +536,10 @@ func (m *Monitor) serveLogChainRequests(c *gin.Context) {
 		"scope": logChainScopeEcho(scope), "blind_spots": logChainBlindSpots(),
 	}
 	if hasMore && len(rows) > 0 {
-		resp["next_before_id"] = rows[len(rows)-1].ID
+		// 游标必须成对返回：排序键是 (created_at, id)，只给 id 无法定位续查位置。
+		last := rows[len(rows)-1]
+		resp["next_before_ts"] = last.CreatedAt
+		resp["next_before_id"] = last.ID
 	}
 	if domainTruncated {
 		resp["domain_channels_truncated"] = true
