@@ -238,6 +238,27 @@ func TestResolveDomainChannelIDs(t *testing.T) {
 	}
 }
 
+// TestLogChainGateTimeoutDoesNotStarveExistingFeatures 排障接口与客户 Portal 的日志
+// 计数/分页共用 usageDetailGate,而该泳道容量为 1(monitor.go:115)。本接口每多占 1 秒,
+// 就是客户查自己日志时多排队 1 秒。
+//
+// 既有调用方 countGroupLogs / queryGroupLogs 都用 15s。本接口不得放长——
+// 排障是内部功能,不能挤占客户功能。谁把 logChainGateTimeout 改大,这个测试就红。
+func TestLogChainGateTimeoutDoesNotStarveExistingFeatures(t *testing.T) {
+	const existingLaneTimeout = 15 * time.Second // usage.go countGroupLogs / queryGroupLogs
+	if logChainGateTimeout > existingLaneTimeout {
+		t.Fatalf("排障闸门超时(%v)超过既有调用方(%v):容量 1 的泳道会被内部功能挤占,"+
+			"客户查日志将多排队 %v", logChainGateTimeout, existingLaneTimeout,
+			logChainGateTimeout-existingLaneTimeout)
+	}
+	// 生产库单条 SQL 的 MAX_EXECUTION_TIME 也必须落在闸门超时之内,
+	// 否则闸门先超时释放、SQL 仍在生产库上跑,等于绕过了并发控制。
+	if time.Duration(logChainQueryTimeoutMS)*time.Millisecond >= logChainGateTimeout {
+		t.Errorf("MAX_EXECUTION_TIME(%dms) 应小于闸门超时(%v)",
+			logChainQueryTimeoutMS, logChainGateTimeout)
+	}
+}
+
 // TestServeLogChainRequestsGuardsLocalSnapshotOnly 本地快照模式下 prodDB 为 nil,
 // 必须返回可读错误而不是 panic。8202 验收环境正是这个模式。
 func TestServeLogChainRequestsGuardsLocalSnapshotOnly(t *testing.T) {

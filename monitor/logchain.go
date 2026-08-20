@@ -36,6 +36,11 @@ const (
 	logChainMaxDays        = 31   // 单次查询最大跨度，防全表扫
 	logChainQueryTimeoutMS = 8000 // 生产库 MAX_EXECUTION_TIME 上限
 	logChainMaxDomainChans = 500  // 域名反查渠道 ID 的条数上限，防 IN 列表爆炸
+
+	// logChainGateTimeout 必须 <= 既有 detail 泳道调用方的超时(countGroupLogs /
+	// queryGroupLogs 均为 15s)。该泳道容量 1，客户 Portal 查自己日志走的是同一条。
+	// 排障是内部功能，不得比客户功能占用更久。改大这个值即为回归。
+	logChainGateTimeout = 15 * time.Second
 )
 
 // LogChainRow 一条请求的排障视图。含渠道与上游主域名——仅管理员面可见。
@@ -256,7 +261,10 @@ func (m *Monitor) queryLogChain(ctx context.Context, s logChainScope, domainChan
 	if m.prodDB == nil {
 		return nil, false, errors.New("生产库未连接：本地快照只读模式无法查询请求明细")
 	}
-	cctx, cancel := context.WithTimeout(ctx, 25*time.Second)
+	// 超时必须 <= 既有调用方,不得放长。usageDetailGate 容量为 1,与客户 Portal 的
+	// 日志计数/分页(countGroupLogs / queryGroupLogs,均用 15s)是同一条泳道:
+	// 本接口多占 1 秒,就是让客户查自己日志时多排队 1 秒。新功能不得挤占既有功能。
+	cctx, cancel := context.WithTimeout(ctx, logChainGateTimeout)
 	defer cancel()
 	if err := m.acquireInteractiveUsageDetailGate(cctx); err != nil {
 		return nil, false, fmt.Errorf("等待日志查询槽位失败: %w", err)
