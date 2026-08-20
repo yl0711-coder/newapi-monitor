@@ -1137,7 +1137,7 @@ func syncNewAPIBalance(ctx context.Context, client *http.Client, row ChannelUpst
 	return upstreamBalanceResult{BalanceUSD: quota / unit, BalanceRaw: quota, BalanceUnit: unit, UnitAssumed: assumed}, cred, nil
 }
 
-func decodeAICodeWithBalance(body []byte) (float64, error) {
+func decodeAICodeWithBalance(body []byte) (float64, string, error) {
 	var envelope struct {
 		Balance          json.RawMessage `json:"balance"`
 		AvailableBalance json.RawMessage `json:"available_balance"`
@@ -1146,7 +1146,7 @@ func decodeAICodeWithBalance(body []byte) (float64, error) {
 		Data             json.RawMessage `json:"data"`
 	}
 	if err := json.Unmarshal(body, &envelope); err != nil {
-		return 0, fmt.Errorf("AICodeWith 余额响应格式无效")
+		return 0, "", fmt.Errorf("AICodeWith 余额响应格式无效")
 	}
 	if len(envelope.Data) > 0 && string(envelope.Data) != "null" {
 		var nested struct {
@@ -1156,7 +1156,7 @@ func decodeAICodeWithBalance(body []byte) (float64, error) {
 			Currency         string          `json:"currency"`
 		}
 		if err := json.Unmarshal(envelope.Data, &nested); err != nil {
-			return 0, fmt.Errorf("AICodeWith 余额数据格式无效")
+			return 0, "", fmt.Errorf("AICodeWith 余额数据格式无效")
 		}
 		if len(nested.Balance) > 0 {
 			envelope.Balance = nested.Balance
@@ -1172,8 +1172,12 @@ func decodeAICodeWithBalance(body []byte) (float64, error) {
 		}
 	}
 	currency := strings.ToUpper(strings.TrimSpace(envelope.Currency))
-	if currency != "" && currency != "USD" {
-		return 0, fmt.Errorf("AICodeWith 余额币种不是 USD（%s）", sanitizeUpstreamError(errors.New(currency)))
+	if currency == "" {
+		// 兼容春秋早期未返回 currency 的响应；当时接口金额口径为 USD。
+		currency = "USD"
+	}
+	if currency != "USD" && currency != "CNY" {
+		return 0, "", fmt.Errorf("AICodeWith 余额币种不受支持（%s）", sanitizeUpstreamError(errors.New(currency)))
 	}
 	raw := envelope.Balance
 	if len(raw) == 0 {
@@ -1184,9 +1188,9 @@ func decodeAICodeWithBalance(body []byte) (float64, error) {
 	}
 	balance, err := rawJSONNumber(raw)
 	if err != nil {
-		return 0, fmt.Errorf("AICodeWith 未返回有效 USD 余额")
+		return 0, "", fmt.Errorf("AICodeWith 未返回有效余额")
 	}
-	return balance, nil
+	return balance, currency, nil
 }
 
 func syncAICodeWithBalance(ctx context.Context, client *http.Client, row ChannelUpstreamAccount, cred aiCodeWithCredential) (upstreamBalanceResult, aiCodeWithCredential, error) {
@@ -1201,7 +1205,8 @@ func syncAICodeWithBalance(ctx context.Context, client *http.Client, row Channel
 	if len(keys) == 0 {
 		return upstreamBalanceResult{}, cred, &upstreamAuthError{err: fmt.Errorf("AICodeWith API Key 为空，请重新连接")}
 	}
-	var balance float64
+	var balanceRaw, balanceUnit float64
+	var balanceCurrency string
 	for index, apiKey := range keys {
 		body, err := doUpstreamJSON(ctx, client, http.MethodGet, upstreamEndpoint(row.BaseURL, "/api/v1/balance"), map[string]string{
 			"Authorization": "Bearer " + apiKey,
@@ -1213,17 +1218,26 @@ func syncAICodeWithBalance(ctx context.Context, client *http.Client, row Channel
 			}
 			return upstreamBalanceResult{}, cred, fmt.Errorf("第 %d 把 AICodeWith API Key: %w", index+1, err)
 		}
-		current, err := decodeAICodeWithBalance(body)
+		currentRaw, currentCurrency, err := decodeAICodeWithBalance(body)
 		if err != nil {
 			return upstreamBalanceResult{}, cred, fmt.Errorf("第 %d 把 AICodeWith API Key: %w", index+1, err)
 		}
+		currentUnit := 1.0
+		if currentCurrency == "CNY" {
+			// 春秋当前余额与用量金额均以人民币计价。Monitor 的渠道报表以 USD
+			// 为统一比较口径，沿用网站计价的 7:1 折扣基准折算；同时把原始
+			// 人民币和换算单位持久化，后续用量同步使用完全相同的单位。
+			currentUnit = defaultChannelFinanceFX
+		}
 		if index == 0 {
-			balance = current
-		} else if math.Abs(current-balance) > 0.0001 {
+			balanceRaw, balanceUnit, balanceCurrency = currentRaw, currentUnit, currentCurrency
+		} else if currentCurrency != balanceCurrency || math.Abs(currentRaw-balanceRaw) > 0.0001 {
 			return upstreamBalanceResult{}, cred, fmt.Errorf("多把 AICodeWith API Key 返回的账户余额不一致，不能合并为同一主域名账户")
 		}
 	}
-	return upstreamBalanceResult{BalanceUSD: balance, BalanceRaw: balance, BalanceUnit: 1}, normalized, nil
+	return upstreamBalanceResult{
+		BalanceUSD: balanceRaw / balanceUnit, BalanceRaw: balanceRaw, BalanceUnit: balanceUnit,
+	}, normalized, nil
 }
 
 func decodeSub2APIData(body []byte, out any) error {

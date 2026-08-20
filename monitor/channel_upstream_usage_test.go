@@ -164,7 +164,7 @@ func TestFetchAICodeWithUsageWindowValidatesSummaryAndKeepsZeroDays(t *testing.T
 	}))
 	defer server.Close()
 	result, err := fetchAICodeWithUsageWindow(context.Background(), newUpstreamHTTPClient(3*time.Second), ChannelUpstreamAccount{
-		Domain: "aicodewith.com", Provider: upstreamProviderAICodeWith, BaseURL: server.URL,
+		Domain: "aicodewith.com", Provider: upstreamProviderAICodeWith, BaseURL: server.URL, BalanceUnit: 1,
 	}, apiKey, from, to, newUpstreamUsageRequestPacer(2, 0))
 	if err != nil {
 		t.Fatal(err)
@@ -178,6 +178,25 @@ func TestFetchAICodeWithUsageWindowValidatesSummaryAndKeepsZeroDays(t *testing.T
 	}
 	if second.HourTs != from+86400 || second.BucketSeconds != 86400 || second.Requests != 0 || second.Tokens != 0 || second.CostUSD != 0 {
 		t.Fatalf("zero-consumption day was not represented explicitly: %+v", second)
+	}
+}
+
+func TestFetchAICodeWithUsageWindowNormalizesCNYWithSavedBalanceUnit(t *testing.T) {
+	const apiKey = "sk-acw-cny-usage-test"
+	from := time.Date(2026, 8, 20, 0, 0, 0, 0, cstLocation).Unix()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"data":{"api_key_id":9,"period":{"start":"2026-08-20","end":"2026-08-20"},"group_by":"day","summary":{"cost":"70.0000","total_tokens":100,"requests":2},"daily":[{"date":"2026-08-20","cost":"70.0000","total_tokens":100,"requests":2}]}}`))
+	}))
+	defer server.Close()
+
+	result, err := fetchAICodeWithUsageWindow(context.Background(), newUpstreamHTTPClient(3*time.Second), ChannelUpstreamAccount{
+		Domain: "aicodewith.com", Provider: upstreamProviderAICodeWith, BaseURL: server.URL, BalanceUnit: defaultChannelFinanceFX,
+	}, apiKey, from, from+86400, newUpstreamUsageRequestPacer(2, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Hours) != 1 || result.Hours[0].Quota != 70 || math.Abs(result.Hours[0].CostUSD-10) > 1e-12 {
+		t.Fatalf("unexpected normalized CNY usage: %+v", result)
 	}
 }
 

@@ -286,6 +286,28 @@ func TestSyncAICodeWithBalanceUsesAPIKeyAndUSDResponse(t *testing.T) {
 	}
 }
 
+func TestSyncAICodeWithBalanceNormalizesCNYWithFinanceBenchmark(t *testing.T) {
+	const apiKey = "sk-acw-cny-balance-test"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer "+apiKey {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		_, _ = w.Write([]byte(`{"data":{"balance":"700.00","currency":"CNY"}}`))
+	}))
+	defer server.Close()
+
+	result, _, err := syncAICodeWithBalance(context.Background(), newUpstreamHTTPClient(3*time.Second), ChannelUpstreamAccount{
+		Provider: upstreamProviderAICodeWith, BaseURL: server.URL,
+	}, aiCodeWithCredential{APIKey: apiKey})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.BalanceRaw != 700 || result.BalanceUnit != defaultChannelFinanceFX || math.Abs(result.BalanceUSD-100) > 1e-12 {
+		t.Fatalf("unexpected normalized CNY balance: %+v", result)
+	}
+}
+
 func TestAICodeWithNestedErrorMessageIsParsedWithoutLeakingKey(t *testing.T) {
 	const apiKey = "sk-acw-reflected-secret"
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

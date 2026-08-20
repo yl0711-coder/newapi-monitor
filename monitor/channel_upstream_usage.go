@@ -501,6 +501,12 @@ func fetchAICodeWithUsageWindow(ctx context.Context, client *http.Client, row Ch
 		return upstreamUsageResult{}, fmt.Errorf("AICodeWith 使用量分日合计与 summary 不一致")
 	}
 	hours := make([]ChannelUpstreamUsageHour, 0, days)
+	unit := row.BalanceUnit
+	if unit <= 0 {
+		// 已保存的春秋账户会从余额响应持久化真实换算单位。早期仅支持
+		// USD 的账户可能没有单位，继续按 1 兼容；新 CNY 账户不会走这里。
+		unit = 1
+	}
 	for day := from; day <= lastDay; day += 86400 {
 		bucketTo := day + 86400
 		if bucketTo > to {
@@ -510,7 +516,7 @@ func fetchAICodeWithUsageWindow(ctx context.Context, client *http.Client, row Ch
 		hours = append(hours, ChannelUpstreamUsageHour{
 			Domain: row.Domain, HourTs: day, BucketSeconds: bucketTo - day,
 			Requests: metric.Requests, Tokens: metric.Tokens, Quota: metric.Cost,
-			CostUSD: metric.Cost, Provider: row.Provider,
+			CostUSD: metric.Cost / unit, Provider: row.Provider,
 		})
 	}
 	return upstreamUsageResult{Hours: hours, DataUntil: to, SourceKeyID: envelope.Data.APIKeyID}, nil
