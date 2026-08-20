@@ -563,7 +563,7 @@ GET /logchain/requests        # view 组，requireRole(roleAdmin)
   命中数超 `logChainMaxDomainChans=500` 时返回 `domain_channels_truncated=true`——**不静默截断**。
 - **遵守 9.2 节有界要求**：时间窗（跨度硬上限 31 天，超出砍 from 端保 to 端）、
   游标分页（`id < ?` 倒序，不用深 OFFSET）、`MAX_EXECUTION_TIME(8000)`、
-  25s context 超时、复用 `acquireInteractiveUsageDetailGate` 并发闸门、
+  15s context 超时、复用 `acquireInteractiveUsageDetailGate` 并发闸门、
   多取一行判 `has_more` 而不做 `COUNT(*)`。
 - **`scope` 回显生效范围。** 用户传的值可能被收敛（跨度截断、limit 上限），不回显会让前端
   以为筛选按原样生效了。
@@ -572,6 +572,25 @@ GET /logchain/requests        # view 组，requireRole(roleAdmin)
 - **`LocalSnapshotOnly` 下 `prodDB` 为 nil**，返回"生产库未连接：本地快照只读模式无法查询请求明细"
   而不是 panic。8202 验收环境正是此模式，**因此那里只能验接口存在与报错文案，验不了真实数据。**
 - 排除渠道测试流量（复用 `channelTestLogPredicateSQL()`），与既有口径一致。
+
+#### 13.4.1 不得挤占客户 Portal 的日志泳道 【已修·必读】
+
+`usageDetailGate` **容量为 1**（[monitor.go:115](../monitor/monitor.go#L115)），
+客户自助面的日志计数/分页（`countGroupLogs` [usage.go:1712](../monitor/usage.go#L1712) /
+`queryGroupLogs`，**均 15s 超时**）与本接口走**同一条泳道**。
+
+初版实现设了 25s，意味着一次内部排障查询可让**客户查自己日志时多排队最多 10 秒**。
+编译能过、测试不报，属隐性回归。已改为 `logChainGateTimeout = 15s` 与既有调用方对齐。
+
+**规则：排障是内部功能，不得比客户功能占用更久。**
+`TestLogChainGateTimeoutDoesNotStarveExistingFeatures` 钉住两条：
+
+1. 闸门超时不得超过既有调用方（谁改大谁红）；
+2. `MAX_EXECUTION_TIME`(8000ms) 必须小于闸门超时——否则闸门先超时释放、
+   SQL 仍在生产库上跑，等于绕过并发控制。
+
+> **给接手者的通用检查项**：新增任何查生产库的功能前，先查清用了哪个闸门、
+> 容量多少、还有谁在用。共享资源的隐性挤占是这个项目最难发现的一类回归。
 - 全部用户可控值参数化；`LIKE` 值走 `escapeLike` + `ESCAPE '!'`。
   `TestLogChainWhereParameterizesUserInput` 断言占位符数与参数数相等、通配符已转义。
 
