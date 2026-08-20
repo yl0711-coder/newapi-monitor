@@ -286,7 +286,7 @@ func TestSyncAICodeWithBalanceUsesAPIKeyAndUSDResponse(t *testing.T) {
 	}
 }
 
-func TestSyncAICodeWithBalanceNormalizesCNYWithFinanceBenchmark(t *testing.T) {
+func TestSyncAICodeWithBalanceKeepsCNYLedgerAtContractOneToOne(t *testing.T) {
 	const apiKey = "sk-acw-cny-balance-test"
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") != "Bearer "+apiKey {
@@ -303,8 +303,44 @@ func TestSyncAICodeWithBalanceNormalizesCNYWithFinanceBenchmark(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.BalanceRaw != 700 || result.BalanceUnit != defaultChannelFinanceFX || math.Abs(result.BalanceUSD-100) > 1e-12 {
-		t.Fatalf("unexpected normalized CNY balance: %+v", result)
+	if result.BalanceRaw != 700 || result.BalanceUnit != 1 || math.Abs(result.BalanceUSD-700) > 1e-12 {
+		t.Fatalf("unexpected 1:1 CNY balance: %+v", result)
+	}
+}
+
+func TestMigrateAICodeWithContractLedgerUnitIsAtomicAndIdempotent(t *testing.T) {
+	m := newChannelUpstreamTestMonitor(t)
+	row := ChannelUpstreamAccount{
+		Domain: "aicodewith.com", Provider: upstreamProviderAICodeWith,
+		BalanceKnown: true, BalanceRaw: 700, BalanceUSD: 100, BalanceUnit: 7,
+	}
+	if err := m.storeDB.Create(&row).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := m.storeDB.Create(&ChannelUpstreamUsageHour{Domain: row.Domain, HourTs: 1, CostUSD: 10, Quota: 70}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := m.storeDB.Create(&AICodeWithUsageStage{Domain: row.Domain, RoundID: "r1", SlotID: "acw_1", HourTs: 1, CostUSD: 5, Quota: 35}).Error; err != nil {
+		t.Fatal(err)
+	}
+	for pass := 0; pass < 2; pass++ {
+		if err := m.migrateAICodeWithContractLedgerUnit(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := m.storeDB.First(&row, "domain = ?", row.Domain).Error; err != nil {
+		t.Fatal(err)
+	}
+	var usage ChannelUpstreamUsageHour
+	var stage AICodeWithUsageStage
+	if err := m.storeDB.First(&usage, "domain = ?", row.Domain).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := m.storeDB.First(&stage, "domain = ?", row.Domain).Error; err != nil {
+		t.Fatal(err)
+	}
+	if row.BalanceUSD != 700 || row.BalanceUnit != 1 || usage.CostUSD != 70 || stage.CostUSD != 35 {
+		t.Fatalf("unexpected migrated 1:1 ledger: row=%+v usage=%+v stage=%+v", row, usage, stage)
 	}
 }
 

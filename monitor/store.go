@@ -853,6 +853,9 @@ func (m *Monitor) openStore(path string) error {
 	if err := m.migrateAICodeWithCredentialSlots(); err != nil {
 		return fmt.Errorf("AICodeWith Key 槽位迁移失败: %w", err)
 	}
+	if err := m.migrateAICodeWithContractLedgerUnit(); err != nil {
+		return fmt.Errorf("AICodeWith 账面单位迁移失败: %w", err)
+	}
 	if err := m.openUsageFactsStore(m.cfg.UsageFactsStorePath, factsPrechecked); err != nil {
 		factsPath := strings.TrimSpace(m.cfg.UsageFactsStorePath)
 		separateFactsStore := factsPath != "" && factsPath != m.cfg.StorePath

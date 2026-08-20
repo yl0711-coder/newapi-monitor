@@ -181,7 +181,7 @@ func TestFetchAICodeWithUsageWindowValidatesSummaryAndKeepsZeroDays(t *testing.T
 	}
 }
 
-func TestFetchAICodeWithUsageWindowNormalizesCNYWithSavedBalanceUnit(t *testing.T) {
+func TestFetchAICodeWithUsageWindowKeepsCNYLedgerAtContractOneToOne(t *testing.T) {
 	const apiKey = "sk-acw-cny-usage-test"
 	from := time.Date(2026, 8, 20, 0, 0, 0, 0, cstLocation).Unix()
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -190,13 +190,13 @@ func TestFetchAICodeWithUsageWindowNormalizesCNYWithSavedBalanceUnit(t *testing.
 	defer server.Close()
 
 	result, err := fetchAICodeWithUsageWindow(context.Background(), newUpstreamHTTPClient(3*time.Second), ChannelUpstreamAccount{
-		Domain: "aicodewith.com", Provider: upstreamProviderAICodeWith, BaseURL: server.URL, BalanceUnit: defaultChannelFinanceFX,
+		Domain: "aicodewith.com", Provider: upstreamProviderAICodeWith, BaseURL: server.URL, BalanceUnit: 1,
 	}, apiKey, from, from+86400, newUpstreamUsageRequestPacer(2, 0))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(result.Hours) != 1 || result.Hours[0].Quota != 70 || math.Abs(result.Hours[0].CostUSD-10) > 1e-12 {
-		t.Fatalf("unexpected normalized CNY usage: %+v", result)
+	if len(result.Hours) != 1 || result.Hours[0].Quota != 70 || math.Abs(result.Hours[0].CostUSD-70) > 1e-12 {
+		t.Fatalf("unexpected 1:1 CNY usage: %+v", result)
 	}
 }
 

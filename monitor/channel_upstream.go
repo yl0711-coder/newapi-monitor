@@ -874,6 +874,40 @@ func (m *Monitor) migrateAICodeWithCredentialSlots() error {
 	return nil
 }
 
+// migrateAICodeWithContractLedgerUnit reverses the short-lived CNY/7 rollout.
+// AICodeWith's CNY field names its internal ledger currency, while the agreed
+// business accounting basis is 1:1. The predicate on balance_unit makes the
+// correction idempotent and confines it to rows written by that rollout.
+func (m *Monitor) migrateAICodeWithContractLedgerUnit() error {
+	var rows []ChannelUpstreamAccount
+	if err := m.storeDB.Where("provider = ? AND balance_unit > ? AND balance_unit < ?", upstreamProviderAICodeWith, 6.999, 7.001).Find(&rows).Error; err != nil {
+		return err
+	}
+	for i := range rows {
+		row := rows[i]
+		if err := m.storeDB.Transaction(func(tx *gorm.DB) error {
+			if err := tx.Model(&ChannelUpstreamUsageHour{}).Where("domain = ?", row.Domain).
+				UpdateColumn("cost_usd", gorm.Expr("cost_usd * ?", row.BalanceUnit)).Error; err != nil {
+				return err
+			}
+			if err := tx.Model(&AICodeWithUsageStage{}).Where("domain = ?", row.Domain).
+				UpdateColumn("cost_usd", gorm.Expr("cost_usd * ?", row.BalanceUnit)).Error; err != nil {
+				return err
+			}
+			updates := map[string]any{"balance_unit": 1.0, "unit_assumed": false}
+			if row.BalanceKnown {
+				updates["balance_usd"] = row.BalanceRaw
+			}
+			return tx.Model(&ChannelUpstreamAccount{}).
+				Where("domain = ? AND provider = ? AND balance_unit > ? AND balance_unit < ?", row.Domain, upstreamProviderAICodeWith, 6.999, 7.001).
+				Updates(updates).Error
+		}); err != nil {
+			return fmt.Errorf("%s AICodeWith 1:1 账面单位修正失败: %w", row.Domain, err)
+		}
+	}
+	return nil
+}
+
 func upstreamCredentialAAD(domain, provider string) []byte {
 	return []byte("channel-upstream:" + domain + ":" + provider + ":v1")
 }
@@ -1222,13 +1256,10 @@ func syncAICodeWithBalance(ctx context.Context, client *http.Client, row Channel
 		if err != nil {
 			return upstreamBalanceResult{}, cred, fmt.Errorf("第 %d 把 AICodeWith API Key: %w", index+1, err)
 		}
+		// AICodeWith 的 CNY 是其站内账面额度币种。业务计价合同按 1:1
+		// 对账，不能把它当作人民币兑美元再除以汇率；币种仍严格校验，
+		// 余额与按 Key 使用金额则都以相同的 1:1 单位持久化。
 		currentUnit := 1.0
-		if currentCurrency == "CNY" {
-			// 春秋当前余额与用量金额均以人民币计价。Monitor 的渠道报表以 USD
-			// 为统一比较口径，沿用网站计价的 7:1 折扣基准折算；同时把原始
-			// 人民币和换算单位持久化，后续用量同步使用完全相同的单位。
-			currentUnit = defaultChannelFinanceFX
-		}
 		if index == 0 {
 			balanceRaw, balanceUnit, balanceCurrency = currentRaw, currentUnit, currentCurrency
 		} else if currentCurrency != balanceCurrency || math.Abs(currentRaw-balanceRaw) > 0.0001 {
