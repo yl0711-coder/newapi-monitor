@@ -155,10 +155,11 @@ func (m *Monitor) RegisterRoutes(r *gin.Engine) {
 		c.Header("Cache-Control", "no-cache")
 		c.Data(http.StatusOK, "application/javascript; charset=utf-8", channelManagementJS)
 	})
-	r.GET("/api/brand", m.brandHandler)                // 公开:站点名,供前端设置页面标题
-	r.POST("/internal/rejections", m.ingestRejections) // 机器对机器:接收采集器推送的前置拒绝(token 鉴权)
-	r.POST("/internal/host", m.ingestHost)             // 机器对机器:接收各节点主机 agent 推送的 OS 内存/磁盘(token 鉴权)
-	r.POST("/internal/nginx", m.ingestNginx)           // 机器对机器:接收已脱敏的 Nginx 分钟聚合(token 鉴权,默认关闭)
+	r.GET("/api/brand", m.brandHandler)                                 // 公开:站点名,供前端设置页面标题
+	r.POST("/internal/rejections", m.ingestRejections)                  // 机器对机器:接收采集器推送的前置拒绝(token 鉴权)
+	r.POST("/internal/client-outcomes", m.ingestClientDeliveryEvidence) // 可选受控客户端直报；与 NewAPI 无耦合
+	r.POST("/internal/host", m.ingestHost)                              // 机器对机器:接收各节点主机 agent 推送的 OS 内存/磁盘(token 鉴权)
+	r.POST("/internal/nginx", m.ingestNginx)                            // 机器对机器:接收已脱敏的 Nginx 分钟聚合(token 鉴权,默认关闭)
 	r.GET("/login", m.loginPage)
 	r.POST("/login", m.loginSubmit)
 	r.GET("/logout", logout)
@@ -172,24 +173,28 @@ func (m *Monitor) RegisterRoutes(r *gin.Engine) {
 		view.GET("/data", m.serveData)
 		view.GET("/monitor/data", m.serveData)
 		view.GET("/trend/long", m.serveLongTrend)
-		view.GET("/stability/report", m.serveStabilityReport)                              // 历史稳定性:只读 Monitor 本地 SQLite
-		view.GET("/stability/detail", m.serveStabilityDetail)                              // 单分组详情:按需加载渠道时间条/模型
-		view.GET("/stability/problems", m.serveStabilityProblems)                          // 原始错误签名:只读本地问题样本
-		view.GET("/stability/health", m.serveStabilityHealth)                              // 采集新鲜度/覆盖/积压:不查生产库
-		view.GET("/stability/edge", m.serveNginxEdge)                                      // Nginx 入口层:只读本地脱敏分钟汇总
-		view.GET("/channels/report", m.serveChannelManagementReport)                       // 渠道管理:主域名→厂商→渠道→服务分组的本地汇总
-		view.GET("/infra", m.serveInfra)                                                   // 服务端健康监控(实例/DB/LB)快照
-		view.GET("/infra/series", m.serveInfraSeries)                                      // 按需取某资源某些指标的近 N 小时序列(展开图用)
-		view.GET("/usage/users", m.listTrackedUsers)                                       // 用户用量:被盯名单(含分组)
-		view.GET("/usage/groups", m.listGroups)                                            // 用户用量:客户分组列表
-		view.GET("/usage/followups", m.usageAggregateAuthorizationGuard(m.serveFollowUps)) // 用户用量:待跟进清单
-		view.GET("/usage/followups/log", m.listFollowLogs)                                 // 用户用量:某客户跟进记录
-		view.GET("/usage/settings", m.getUsageSettings)                                    // 用户用量:跟进阈值(读)
-		view.GET("/usage/matrix", m.usageAggregateAuthorizationGuard(m.serveUsageMatrix))  // 用户用量:列表页矩阵(前端渲染 行=用户×列=日期,格=当日费用)
-		view.GET("/usage/stats", m.usageAggregateAuthorizationGuard(m.serveUsageStats))    // 用户用量:单用户详情聚合(每日/分组/模型/费用)
-		view.GET("/usage/cache-stats", m.serveUsageCacheStats)                             // 用户用量缓存:无敏感信息的运维计数
-		view.GET("/usage/facts-status", m.serveUsageFactsStatus)                           // 用户用量本地事实层:覆盖率/同步状态(只读 Monitor SQLite)
-		view.GET("/usage/facts-history", m.serveUsageFactHistoryStatus)                    // 全历史逐成员阶段/水位/失败原因(只读本地)
+		view.GET("/stability/report", m.serveStabilityReport)                                   // 历史稳定性:只读 Monitor 本地 SQLite
+		view.GET("/stability/detail", m.serveStabilityDetail)                                   // 单分组详情:按需加载渠道时间条/模型
+		view.GET("/stability/problems", m.serveStabilityProblems)                               // 原始错误签名:只读本地问题样本
+		view.GET("/stability/health", m.serveStabilityHealth)                                   // 采集新鲜度/覆盖/积压:不查生产库
+		view.GET("/stability/edge", m.serveNginxEdge)                                           // Nginx 入口层:只读本地脱敏分钟汇总
+		view.GET("/stability/delivery-evidence", m.serveDeliveryEvidenceSummary)                // 可选客户端技术结果；未接入时明确不可判断
+		view.GET("/stability/delivery-timeline", m.serveDeliveryEvidenceTimeline)               // 单请求客户端脱敏证据时间线
+		view.POST("/stability/delivery-timeline/lookup", m.serveDeliveryEvidenceTimelineLookup) // 原始请求ID仅经JSON请求体进入内存HMAC，不进入URL日志
+		view.GET("/stability/delivery-issues", m.serveDeliveryEvidenceIssues)                   // 最近精确协议/客户端/边缘问题证据
+		view.GET("/channels/report", m.serveChannelManagementReport)                            // 渠道管理:主域名→厂商→渠道→服务分组的本地汇总
+		view.GET("/infra", m.serveInfra)                                                        // 服务端健康监控(实例/DB/LB)快照
+		view.GET("/infra/series", m.serveInfraSeries)                                           // 按需取某资源某些指标的近 N 小时序列(展开图用)
+		view.GET("/usage/users", m.listTrackedUsers)                                            // 用户用量:被盯名单(含分组)
+		view.GET("/usage/groups", m.listGroups)                                                 // 用户用量:客户分组列表
+		view.GET("/usage/followups", m.usageAggregateAuthorizationGuard(m.serveFollowUps))      // 用户用量:待跟进清单
+		view.GET("/usage/followups/log", m.listFollowLogs)                                      // 用户用量:某客户跟进记录
+		view.GET("/usage/settings", m.getUsageSettings)                                         // 用户用量:跟进阈值(读)
+		view.GET("/usage/matrix", m.usageAggregateAuthorizationGuard(m.serveUsageMatrix))       // 用户用量:列表页矩阵(前端渲染 行=用户×列=日期,格=当日费用)
+		view.GET("/usage/stats", m.usageAggregateAuthorizationGuard(m.serveUsageStats))         // 用户用量:单用户详情聚合(每日/分组/模型/费用)
+		view.GET("/usage/cache-stats", m.serveUsageCacheStats)                                  // 用户用量缓存:无敏感信息的运维计数
+		view.GET("/usage/facts-status", m.serveUsageFactsStatus)                                // 用户用量本地事实层:覆盖率/同步状态(只读 Monitor SQLite)
+		view.GET("/usage/facts-history", m.serveUsageFactHistoryStatus)                         // 全历史逐成员阶段/水位/失败原因(只读本地)
 		view.GET("/me", me)
 	}
 

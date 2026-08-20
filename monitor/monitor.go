@@ -270,6 +270,9 @@ func New(s Settings) (*Monitor, error) {
 	if err := validateNginxSettings(s); err != nil {
 		return nil, err
 	}
+	if err := validateDeliveryEvidenceSettings(s); err != nil {
+		return nil, err
+	}
 	if s.SessionSecret == "" {
 		s.SessionSecret = randomSecret() // 未配置则随机生成,重启后需重新登录
 		slog.Warn("未设置 MONITOR_SESSION_SECRET,已临时随机生成;重启后所有登录失效,生产建议固定配置一个长随机串")
@@ -390,6 +393,7 @@ func (m *Monitor) Start(ctx context.Context) {
 	if m.cfg.NginxEnabled {
 		m.startNginxMaintenance(ctx)
 	}
+	m.startDeliveryEvidenceMaintenance(ctx)
 	if m.cfg.InfraEnabled {
 		go m.startInfra(ctx)
 	}

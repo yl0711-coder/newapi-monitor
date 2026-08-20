@@ -483,11 +483,12 @@ async function load(){
     const rangeLabel=ov.range_partial
       ?`查询范围 ${ov.requested_from} ~ ${ov.requested_to} · 当前展示 ${ov.from} ~ ${ov.to}`
       :`${ov.from} ~ ${ov.to}`;
-    const matrixNote=ov.range_partial
+    const liveProjectionNote=ov.live_projection_applied?(ov.live_projection_message||'今日总消费已更新，详细维度稍后封口'):'';
+    const matrixNote=liveProjectionNote|| (ov.range_partial
       ?`⏳ 历史数据补全中：${ov.range_message||'已先展示本地已完成的数据，其余历史数据正在后台补全'}`
       :(ov.matrix_available===false
       ?(ov.matrix_message||'每日消费明细暂不可用，余额和累计消耗仍可查看')
-      :(ov.matrix_stale?(ov.matrix_message||'当前显示最近一次成功统计'):''));
+      :(ov.matrix_stale?(ov.matrix_message||'当前显示最近一次成功统计'):'')));
     $('rangeNote').textContent=`统计范围 ${rangeLabel}${matrixNote?` · ${matrixNote}`:''}`;
     $('logRangeNote').textContent=`统计范围 ${rangeLabel}`;
     syncOvBar(); // 总览工具条(预设高亮/起止框)随当前范围同步(含从日志视图改的范围)
@@ -895,7 +896,7 @@ async function loadDetail(uid){
     if(statsAvailable)renderModelPie(dModelPieCh,'dModelPie',st.by_model);else emptyChart(dModelPieCh,'dModelPie','范围统计暂不可用');
     const tokenUnavailable=d.data.token_data_available===false;
     $('detailDataState').textContent=statsAvailable
-      ?(rangePartial?` · 历史数据补全中：${d.data.range_message||'当前显示已完成的日期范围'}`:(d.data.data_stale?` · ${d.data.data_message||'当前显示最近一次成功统计'}`:''))
+      ?(d.data.live_projection_applied?` · ${d.data.live_projection_message||'今日总消费已更新，详细维度稍后封口'}`:(rangePartial?` · 历史数据补全中：${d.data.range_message||'当前显示已完成的日期范围'}`:(d.data.data_stale?` · ${d.data.data_message||'当前显示最近一次成功统计'}`:'')))
       :` · ${statsMessage}`;
     $('tokState').textContent=tokenUnavailable?'· '+(d.data.token_data_message||'令牌明细暂不可用，其他统计正常'):'';
     renderTokens(d.data.by_token,tokenUnavailable,rangePartial);

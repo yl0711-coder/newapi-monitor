@@ -44,8 +44,9 @@ type ChannelManagementRateConfig struct {
 	Complete           bool `json:"complete"`
 }
 
-// ChannelUpstreamUsageMetrics 是上游账户日志的本地小时汇总。它按上游账户（主域名）
-// 归集，不能推断为某一条实际渠道的上游账单。
+// ChannelUpstreamUsageMetrics 是上游账户使用数据的本地脱敏汇总。NewAPI 使用
+// 小时日志，AICodeWith 使用中国自然日账单；它们均按主域名账户归集，不能推断为
+// 某一条实际渠道的上游账单。
 type ChannelUpstreamUsageMetrics struct {
 	Available      bool    `json:"available"`
 	Requests       int64   `json:"requests"`
@@ -55,6 +56,7 @@ type ChannelUpstreamUsageMetrics struct {
 	CompletedHours int64   `json:"completed_hours"`
 	Complete       bool    `json:"complete"`
 	DataUntil      int64   `json:"data_until"`
+	Granularity    string  `json:"granularity,omitempty"`
 }
 
 type ChannelManagementChannel struct {
@@ -300,34 +302,43 @@ func expectedUpstreamUsageHours(scope stabilityScope, now int64) int64 {
 
 func (m *Monitor) loadChannelUpstreamUsage(ctx context.Context, scope stabilityScope, now int64, accounts map[string]ChannelUpstreamAccountView) (map[string]ChannelUpstreamUsageMetrics, error) {
 	type row struct {
-		Domain         string
-		Requests       int64
-		Tokens         int64
-		CostUSD        float64
-		CompletedHours int64
-		DataUntil      int64
+		Domain           string
+		Provider         string
+		Requests         int64
+		Tokens           int64
+		CostUSD          float64
+		CompletedSeconds int64
+		DataUntil        int64
 	}
 	var rows []row
-	if err := m.storeDB.WithContext(ctx).Raw(`SELECT domain,
+	if err := m.storeDB.WithContext(ctx).Raw(`SELECT domain,provider,
 		COALESCE(SUM(requests),0) requests, COALESCE(SUM(tokens),0) tokens,
-		COALESCE(SUM(cost_usd),0) cost_usd, COUNT(*) completed_hours,
-		COALESCE(MAX(hour_ts)+3600,0) data_until
-		FROM channel_upstream_usage_hours WHERE hour_ts >= ? AND hour_ts < ?
-		GROUP BY domain`, scope.FromTs, scope.ToTs).Scan(&rows).Error; err != nil {
+		COALESCE(SUM(cost_usd),0) cost_usd,
+		COALESCE(SUM(CASE WHEN bucket_seconds>0 THEN bucket_seconds ELSE 3600 END),0) completed_seconds,
+		COALESCE(MAX(hour_ts+(CASE WHEN bucket_seconds>0 THEN bucket_seconds ELSE 3600 END)),0) data_until
+		FROM channel_upstream_usage_hours
+		WHERE hour_ts >= ?
+		  AND hour_ts+(CASE WHEN bucket_seconds>0 THEN bucket_seconds ELSE 3600 END) <= ?
+		GROUP BY domain,provider`, scope.FromTs, scope.ToTs).Scan(&rows).Error; err != nil {
 		return nil, err
 	}
 	expected := expectedUpstreamUsageHours(scope, now)
 	result := make(map[string]ChannelUpstreamUsageMetrics, len(rows))
 	for _, row := range rows {
 		account, configured := accounts[row.Domain]
-		if !configured || !account.UsageSyncEnabled {
+		if !configured || !account.UsageSyncEnabled || row.Provider != account.Provider {
 			continue
 		}
+		granularity := "hour"
+		if account.Provider == upstreamProviderAICodeWith {
+			granularity = "day"
+		}
+		completedHours := row.CompletedSeconds / 3600
 		result[row.Domain] = ChannelUpstreamUsageMetrics{
 			Available: true, Requests: row.Requests, Tokens: row.Tokens, CostUSD: row.CostUSD,
-			ExpectedHours: expected, CompletedHours: row.CompletedHours,
-			Complete:  expected == 0 || row.CompletedHours >= expected,
-			DataUntil: row.DataUntil,
+			ExpectedHours: expected, CompletedHours: completedHours,
+			Complete:  expected == 0 || row.CompletedSeconds >= expected*3600,
+			DataUntil: row.DataUntil, Granularity: granularity,
 		}
 	}
 	return result, nil

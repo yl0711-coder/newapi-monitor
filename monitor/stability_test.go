@@ -226,6 +226,22 @@ func TestStabilityProblemTextAndRawGrouping(t *testing.T) {
 	}
 }
 
+func TestStabilityProblemTextRedactsSensitiveValuesBeforeStorage(t *testing.T) {
+	raw := "upstream 10.8.0.12:443 user@example.com Authorization: Bearer sk-secret-1234567890 request 550e8400-e29b-41d4-a716-446655440000 api_key=abcdefghijklmnopqrstuvwxyz012345"
+	message, truncated := stabilityProblemText(raw)
+	if truncated {
+		t.Fatalf("unexpected truncation: %q", message)
+	}
+	for _, secret := range []string{"10.8.0.12", "user@example.com", "sk-secret-1234567890", "550e8400-e29b-41d4-a716-446655440000", "abcdefghijklmnopqrstuvwxyz012345"} {
+		if strings.Contains(message, secret) {
+			t.Fatalf("sensitive value leaked: %q in %q", secret, message)
+		}
+	}
+	if !strings.Contains(message, "<ip>") || !strings.Contains(message, "<email>") || !strings.Contains(message, "<redacted>") {
+		t.Fatalf("missing redaction markers: %q", message)
+	}
+}
+
 func TestStabilityProblemSamplerKeepsRawTextAndIsIdempotent(t *testing.T) {
 	m := newStabilityTestMonitor(t)
 	m.prodDB = newFakeProdDB(t)

@@ -14,6 +14,7 @@ import (
 	"math"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -54,10 +55,16 @@ type websiteGroupSource struct {
 	Multiplier float64
 }
 
-// collectWebsiteGroupSources 将 /api/pricing 的“用户可选”与 options 中的
-// “分组特殊可用分组”合并。删除标记和缺少合法 GroupRatio 的特殊键不会进入目录。
-func collectWebsiteGroupSources(usable []string, ratios map[string]float64, special map[string]map[string]string) ([]websiteGroupSource, int) {
-	names := make(map[string]struct{}, len(usable))
+// collectWebsiteGroupSources 合并三个当前权威来源：
+//   - /api/pricing 的普通用户可选分组；
+//   - options 中按用户分组追加的“特殊可用分组”；
+//   - NewAPI 当前启用渠道实际配置的分组。
+//
+// 第三项用于覆盖“从普通可勾选列表隐藏，仅对特定用户开放”的分组，
+// 但所有候选名称都必须在 GroupRatio 中有精确、合法的倍率才能进入计价目录。
+// 因此历史日志、删除标记和渠道中的脏分组都不会被误当成计价配置。
+func collectWebsiteGroupSources(usable []string, ratios map[string]float64, special map[string]map[string]string, configured []string) ([]websiteGroupSource, int) {
+	names := make(map[string]struct{}, len(usable)+len(configured))
 	for _, name := range usable {
 		name = strings.TrimSpace(name)
 		if name != "" {
@@ -73,6 +80,12 @@ func collectWebsiteGroupSources(usable []string, ratios map[string]float64, spec
 			names[name] = struct{}{}
 		}
 	}
+	for _, name := range configured {
+		name = strings.TrimSpace(name)
+		if name != "" {
+			names[name] = struct{}{}
+		}
+	}
 	out := make([]websiteGroupSource, 0, len(names))
 	skipped := 0
 	for name := range names {
@@ -85,6 +98,31 @@ func collectWebsiteGroupSources(usable []string, ratios map[string]float64, spec
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return out, skipped
+}
+
+// loadConfiguredWebsiteGroups 只读 Monitor 本地的当前渠道快照，不会因为点击“一键同步”
+// 而额外查询生产 logs。删除、停用渠道不能继续扩展当前网站计价目录。
+func (m *Monitor) loadConfiguredWebsiteGroups(ctx context.Context) ([]string, error) {
+	var rows []struct{ Groups string }
+	if err := m.storeDB.WithContext(ctx).Model(&ChannelSnap{}).
+		Select("groups").Where("deleted_at = 0 AND status = ?", 1).Scan(&rows).Error; err != nil {
+		return nil, fmt.Errorf("读取当前渠道分组失败: %w", err)
+	}
+	seen := make(map[string]struct{})
+	for _, row := range rows {
+		for _, name := range splitList(row.Groups) {
+			name = strings.TrimSpace(name)
+			if name != "" {
+				seen[name] = struct{}{}
+			}
+		}
+	}
+	out := make([]string, 0, len(seen))
+	for name := range seen {
+		out = append(out, name)
+	}
+	sort.Strings(out)
+	return out, nil
 }
 
 // normalizeSpecialWebsiteGroupName handles both the current NewAPI syntax and
@@ -128,8 +166,8 @@ func parseWebsiteGroupRatio(raw json.RawMessage) (float64, error) {
 	if err := json.Unmarshal(raw, &text); err != nil {
 		return 0, err
 	}
-	var value float64
-	if _, err := fmt.Sscanf(strings.TrimSpace(text), "%f", &value); err != nil {
+	value, err := strconv.ParseFloat(strings.TrimSpace(text), 64)
+	if err != nil {
 		return 0, err
 	}
 	return value, nil
@@ -200,7 +238,11 @@ func (m *Monitor) fetchWebsiteGroupSources(ctx context.Context) ([]websiteGroupS
 		return nil, 0, fmt.Errorf("读取分组特殊可用配置失败: %w", err)
 	}
 	rows.Close()
-	sources, skipped := collectWebsiteGroupSources(usable, ratios, special)
+	configured, err := m.loadConfiguredWebsiteGroups(ctx)
+	if err != nil {
+		return nil, 0, err
+	}
+	sources, skipped := collectWebsiteGroupSources(usable, ratios, special, configured)
 	if len(sources) == 0 {
 		return nil, skipped, errors.New("NewAPI 没有返回可用于计价的服务分组")
 	}

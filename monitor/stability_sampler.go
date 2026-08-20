@@ -121,7 +121,7 @@ func aggregateStabilityProblemRows(rows []stabilityProblemRawRow) []StabilityPro
 	agg := make(map[stabilityProblemKey]*StabilityProblemSample)
 	for _, row := range rows {
 		message, truncated := stabilityProblemText(row.Raw)
-		hash := stabilityProblemHash("newapi", row.Raw)
+		hash := stabilityProblemHash("newapi", message)
 		key := stabilityProblemKey{bucket: row.CreatedAt / 60 * 60, channel: row.ChannelID, model: row.Model, group: row.Group, hash: hash}
 		p := agg[key]
 		if p == nil {

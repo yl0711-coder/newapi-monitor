@@ -11,10 +11,12 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"net/http"
 	"net/url"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -33,11 +35,23 @@ const (
 	// Re-read a short overlap on every tail pass so delayed log commits are
 	// corrected without re-reading the whole open day every 30 minutes.
 	upstreamUsageTailOverlap = 3 * time.Hour
+	// AICodeWith 的按 Key 账单接口最多接受 31 个中国自然日。
+	// 历史每轮一次请求批量补齐，避免把按天聚合接口退化为逐日请求。
+	aiCodeWithUsageMaxDays = 31
+	// 文档约定每把 Key 最多 10 次/分钟。一轮最多当天+历史两次，
+	// 两次之间保留 6 秒；轮次又由全局串行锁约束，不会发生补数突发。
+	aiCodeWithUsageMaxRequestsPerRun = 2
+	aiCodeWithUsageRequestInterval   = 6 * time.Second
+	aiCodeWithKeysPerTurn            = 4
 )
 
 type upstreamUsageResult struct {
 	Hours     []ChannelUpstreamUsageHour
 	DataUntil int64
+	// SourceKeyID is populated only by per-Key providers. It is an independent
+	// control identity from the upstream response and prevents two configured
+	// credentials that resolve to the same remote Key from being double-counted.
+	SourceKeyID int64
 }
 
 // cstDayStart 返回给定 Unix 时刻所在中国自然日的起点。使用自然日切片可让历史
@@ -345,7 +359,7 @@ func fetchNewAPIUsageWindowWithPacer(ctx context.Context, client *http.Client, r
 		hour := item.CreatedAt - item.CreatedAt%3600
 		bucket := buckets[hour]
 		if bucket == nil {
-			bucket = &ChannelUpstreamUsageHour{Domain: row.Domain, HourTs: hour, Provider: row.Provider}
+			bucket = &ChannelUpstreamUsageHour{Domain: row.Domain, HourTs: hour, BucketSeconds: 3600, Provider: row.Provider}
 			buckets[hour] = bucket
 		}
 		bucket.Requests++
@@ -359,7 +373,7 @@ func fetchNewAPIUsageWindowWithPacer(ctx context.Context, client *http.Client, r
 	// 为每个已完整读取的小时保留零值桶，后续才能区分“零消费”与“尚未同步”。
 	for hour := from - from%3600; hour+3600 <= to; hour += 3600 {
 		if buckets[hour] == nil {
-			buckets[hour] = &ChannelUpstreamUsageHour{Domain: row.Domain, HourTs: hour, Provider: row.Provider}
+			buckets[hour] = &ChannelUpstreamUsageHour{Domain: row.Domain, HourTs: hour, BucketSeconds: 3600, Provider: row.Provider}
 		}
 	}
 	out := make([]ChannelUpstreamUsageHour, 0, len(buckets))
@@ -373,6 +387,521 @@ func fetchNewAPIUsageWindowWithPacer(ctx context.Context, client *http.Client, r
 
 func (m *Monitor) syncNewAPIUsage(ctx context.Context, row ChannelUpstreamAccount, cred newAPICredential, from, to int64, pacer *upstreamUsageRequestPacer) (upstreamUsageResult, error) {
 	return fetchNewAPIUsageWindowWithPacer(ctx, m.channelUpstreamHTTPClient(), row, cred, from, to, pacer)
+}
+
+type aiCodeWithUsageMetric struct {
+	Cost     float64
+	Tokens   int64
+	Requests int64
+}
+
+func decodeAICodeWithUsageMetric(costRaw, tokensRaw, requestsRaw json.RawMessage) (aiCodeWithUsageMetric, error) {
+	cost, err := rawJSONNumber(costRaw)
+	if err != nil || cost < 0 {
+		return aiCodeWithUsageMetric{}, fmt.Errorf("缺少有效 cost")
+	}
+	tokens, err := rawJSONNumber(tokensRaw)
+	if err != nil || tokens < 0 || tokens != math.Trunc(tokens) || tokens > math.MaxInt64 {
+		return aiCodeWithUsageMetric{}, fmt.Errorf("缺少有效 total_tokens")
+	}
+	requests, err := rawJSONNumber(requestsRaw)
+	if err != nil || requests < 0 || requests != math.Trunc(requests) || requests > math.MaxInt64 {
+		return aiCodeWithUsageMetric{}, fmt.Errorf("缺少有效 requests")
+	}
+	return aiCodeWithUsageMetric{Cost: cost, Tokens: int64(tokens), Requests: int64(requests)}, nil
+}
+
+func fetchAICodeWithUsageWindow(ctx context.Context, client *http.Client, row ChannelUpstreamAccount, apiKey string, from, to int64, pacer *upstreamUsageRequestPacer) (upstreamUsageResult, error) {
+	if strings.TrimSpace(apiKey) == "" {
+		return upstreamUsageResult{}, &upstreamAuthError{err: fmt.Errorf("AICodeWith API Key 为空，请重新连接")}
+	}
+	if to <= from || from != cstDayStart(from) {
+		return upstreamUsageResult{}, fmt.Errorf("AICodeWith 使用量必须按中国自然日同步")
+	}
+	lastDay := cstDayStart(to - 1)
+	days := int((lastDay-from)/86400) + 1
+	if days <= 0 || days > aiCodeWithUsageMaxDays {
+		return upstreamUsageResult{}, fmt.Errorf("AICodeWith 使用量窗口最多 %d 天", aiCodeWithUsageMaxDays)
+	}
+	if err := pacer.beforeRequest(ctx); err != nil {
+		return upstreamUsageResult{}, err
+	}
+	startText := time.Unix(from, 0).In(cstLocation).Format("2006-01-02")
+	endText := time.Unix(lastDay, 0).In(cstLocation).Format("2006-01-02")
+	query := url.Values{}
+	query.Set("start", startText)
+	query.Set("end", endText)
+	query.Set("group_by", "day")
+	body, err := doUpstreamJSON(ctx, client, http.MethodGet, upstreamEndpoint(row.BaseURL, "/api/v1/api-keys/usage")+"?"+query.Encode(), map[string]string{
+		"Authorization": "Bearer " + apiKey,
+	}, nil)
+	if err != nil {
+		var statusErr *upstreamHTTPError
+		if errors.As(err, &statusErr) && (statusErr.Status == http.StatusUnauthorized || statusErr.Status == http.StatusForbidden) {
+			return upstreamUsageResult{}, &upstreamAuthError{err: err}
+		}
+		return upstreamUsageResult{}, err
+	}
+	var envelope struct {
+		Data struct {
+			APIKeyID int64 `json:"api_key_id"`
+			Period   struct {
+				Start string `json:"start"`
+				End   string `json:"end"`
+			} `json:"period"`
+			GroupBy string `json:"group_by"`
+			Summary struct {
+				Cost        json.RawMessage `json:"cost"`
+				TotalTokens json.RawMessage `json:"total_tokens"`
+				Requests    json.RawMessage `json:"requests"`
+			} `json:"summary"`
+			Daily []struct {
+				Date        string          `json:"date"`
+				Cost        json.RawMessage `json:"cost"`
+				TotalTokens json.RawMessage `json:"total_tokens"`
+				Requests    json.RawMessage `json:"requests"`
+			} `json:"daily"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &envelope); err != nil {
+		return upstreamUsageResult{}, fmt.Errorf("AICodeWith 使用量响应格式无效")
+	}
+	if envelope.Data.GroupBy != "day" || envelope.Data.Period.Start != startText || envelope.Data.Period.End != endText {
+		return upstreamUsageResult{}, fmt.Errorf("AICodeWith 使用量返回的统计范围与请求不一致")
+	}
+	if envelope.Data.APIKeyID <= 0 {
+		return upstreamUsageResult{}, fmt.Errorf("AICodeWith 使用量缺少有效 api_key_id")
+	}
+	summary, err := decodeAICodeWithUsageMetric(envelope.Data.Summary.Cost, envelope.Data.Summary.TotalTokens, envelope.Data.Summary.Requests)
+	if err != nil {
+		return upstreamUsageResult{}, fmt.Errorf("AICodeWith 使用量 summary 无效: %w", err)
+	}
+	byDay := make(map[int64]aiCodeWithUsageMetric, len(envelope.Data.Daily))
+	var summed aiCodeWithUsageMetric
+	for _, item := range envelope.Data.Daily {
+		day, parseErr := time.ParseInLocation("2006-01-02", item.Date, cstLocation)
+		if parseErr != nil || day.Format("2006-01-02") != item.Date || day.Unix() < from || day.Unix() > lastDay {
+			return upstreamUsageResult{}, fmt.Errorf("AICodeWith 使用量包含越界或无效日期")
+		}
+		if _, duplicate := byDay[day.Unix()]; duplicate {
+			return upstreamUsageResult{}, fmt.Errorf("AICodeWith 使用量包含重复日期")
+		}
+		metric, metricErr := decodeAICodeWithUsageMetric(item.Cost, item.TotalTokens, item.Requests)
+		if metricErr != nil {
+			return upstreamUsageResult{}, fmt.Errorf("AICodeWith %s 使用量无效: %w", item.Date, metricErr)
+		}
+		byDay[day.Unix()] = metric
+		summed.Cost += metric.Cost
+		summed.Tokens += metric.Tokens
+		summed.Requests += metric.Requests
+	}
+	// summary 是服务端对同一 Key/同一范围的独立控制总数。对不上时整窗口放弃，
+	// 不用部分 daily 覆盖已有 SQLite 账单。
+	if math.Abs(summed.Cost-summary.Cost) > 0.0001 || summed.Tokens != summary.Tokens || summed.Requests != summary.Requests {
+		return upstreamUsageResult{}, fmt.Errorf("AICodeWith 使用量分日合计与 summary 不一致")
+	}
+	hours := make([]ChannelUpstreamUsageHour, 0, days)
+	for day := from; day <= lastDay; day += 86400 {
+		bucketTo := day + 86400
+		if bucketTo > to {
+			bucketTo = to
+		}
+		metric := byDay[day]
+		hours = append(hours, ChannelUpstreamUsageHour{
+			Domain: row.Domain, HourTs: day, BucketSeconds: bucketTo - day,
+			Requests: metric.Requests, Tokens: metric.Tokens, Quota: metric.Cost,
+			CostUSD: metric.Cost, Provider: row.Provider,
+		})
+	}
+	return upstreamUsageResult{Hours: hours, DataUntil: to, SourceKeyID: envelope.Data.APIKeyID}, nil
+}
+
+func (m *Monitor) syncAICodeWithUsage(ctx context.Context, row ChannelUpstreamAccount, cred aiCodeWithCredential, from, to int64, pacers map[string]*upstreamUsageRequestPacer) (upstreamUsageResult, error) {
+	keys, err := aiCodeWithCredentialKeys(cred)
+	if err != nil || len(keys) == 0 {
+		if err == nil {
+			err = fmt.Errorf("AICodeWith API Key 为空，请重新连接")
+		}
+		return upstreamUsageResult{}, &upstreamAuthError{err: err}
+	}
+	combined := make(map[int64]ChannelUpstreamUsageHour)
+	seenKeyIDs := make(map[int64]bool, len(keys))
+	for index, apiKey := range keys {
+		pacer := pacers[apiKey]
+		if pacer == nil {
+			pacer = newUpstreamUsageRequestPacer(aiCodeWithUsageMaxRequestsPerRun, aiCodeWithUsageRequestInterval)
+			pacers[apiKey] = pacer
+		}
+		result, fetchErr := fetchAICodeWithUsageWindow(ctx, m.channelUpstreamHTTPClient(), row, apiKey, from, to, pacer)
+		if fetchErr != nil {
+			return upstreamUsageResult{}, fmt.Errorf("第 %d 把 AICodeWith API Key: %w", index+1, fetchErr)
+		}
+		if seenKeyIDs[result.SourceKeyID] {
+			return upstreamUsageResult{}, fmt.Errorf("多把 AICodeWith 凭据解析为同一个 api_key_id，拒绝重复累计")
+		}
+		seenKeyIDs[result.SourceKeyID] = true
+		for _, bucket := range result.Hours {
+			current, exists := combined[bucket.HourTs]
+			if exists && current.BucketSeconds != bucket.BucketSeconds {
+				return upstreamUsageResult{}, fmt.Errorf("AICodeWith 多 Key 账单覆盖范围不一致")
+			}
+			if !exists {
+				current = ChannelUpstreamUsageHour{
+					Domain: row.Domain, HourTs: bucket.HourTs, BucketSeconds: bucket.BucketSeconds,
+					Provider: row.Provider,
+				}
+			}
+			current.Requests += bucket.Requests
+			current.Tokens += bucket.Tokens
+			current.Quota += bucket.Quota
+			current.CostUSD += bucket.CostUSD
+			combined[bucket.HourTs] = current
+		}
+	}
+	hours := make([]ChannelUpstreamUsageHour, 0, len(combined))
+	for _, bucket := range combined {
+		hours = append(hours, bucket)
+	}
+	sort.Slice(hours, func(i, j int) bool { return hours[i].HourTs < hours[j].HourTs })
+	return upstreamUsageResult{Hours: hours, DataUntil: to}, nil
+}
+
+func newAICodeWithRoundID(domain, kind, version string, from, to int64) string {
+	h := sha256Sum(strings.Join([]string{domain, kind, version, strconv.FormatInt(from, 10), strconv.FormatInt(to, 10), strconv.FormatInt(time.Now().UnixNano(), 10)}, "\x00"))
+	return fmt.Sprintf("acwr_%x", h[:16])
+}
+
+func (m *Monitor) ensureAICodeWithUsageRound(ctx context.Context, row ChannelUpstreamAccount, version, kind string, from, to int64, total int, now int64) (AICodeWithUsageRound, error) {
+	var round AICodeWithUsageRound
+	err := m.storeDB.WithContext(ctx).First(&round, "domain = ? AND kind = ?", row.Domain, kind).Error
+	if err == nil && round.CredentialSetVersion == version && round.Status == upstreamStatusPending {
+		return round, nil
+	}
+	if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+		return round, err
+	}
+	oldRoundID := round.RoundID
+	round = AICodeWithUsageRound{
+		Domain: row.Domain, Kind: kind, RoundID: newAICodeWithRoundID(row.Domain, kind, version, from, to),
+		CredentialSetVersion: version, WindowFrom: from, WindowTo: to, TotalKeys: total,
+		Status: upstreamStatusPending, CreatedAt: now, UpdatedAt: now,
+	}
+	err = m.storeDB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if oldRoundID != "" {
+			if err := tx.Where("domain = ? AND round_id = ?", row.Domain, oldRoundID).Delete(&AICodeWithUsageStage{}).Error; err != nil {
+				return err
+			}
+		}
+		if err := tx.Where("domain = ? AND kind = ?", row.Domain, kind).Delete(&AICodeWithUsageRound{}).Error; err != nil {
+			return err
+		}
+		return tx.Create(&round).Error
+	})
+	return round, err
+}
+
+func (m *Monitor) stageAICodeWithKeyResult(ctx context.Context, round AICodeWithUsageRound, state *AICodeWithKeySyncState, result upstreamUsageResult, now int64) error {
+	return m.storeDB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if result.SourceKeyID <= 0 {
+			return fmt.Errorf("AICodeWith 使用量缺少有效 api_key_id")
+		}
+		var duplicate int64
+		if err := tx.Model(&AICodeWithKeySyncState{}).
+			Where("domain = ? AND credential_set_version = ? AND slot_id <> ? AND source_key_id = ?", state.Domain, round.CredentialSetVersion, state.SlotID, result.SourceKeyID).
+			Count(&duplicate).Error; err != nil {
+			return err
+		}
+		if duplicate > 0 {
+			return fmt.Errorf("多把 AICodeWith 凭据解析为同一个 api_key_id，拒绝重复累计")
+		}
+		if err := tx.Where("domain = ? AND round_id = ? AND slot_id = ?", state.Domain, round.RoundID, state.SlotID).Delete(&AICodeWithUsageStage{}).Error; err != nil {
+			return err
+		}
+		for _, bucket := range result.Hours {
+			stage := AICodeWithUsageStage{
+				Domain: state.Domain, RoundID: round.RoundID, SlotID: state.SlotID,
+				HourTs: bucket.HourTs, CredentialSetVersion: round.CredentialSetVersion,
+				BucketSeconds: bucket.BucketSeconds, Requests: bucket.Requests, Tokens: bucket.Tokens,
+				Quota: bucket.Quota, CostUSD: bucket.CostUSD, FetchedAt: now,
+			}
+			if err := tx.Create(&stage).Error; err != nil {
+				return err
+			}
+		}
+		state.SourceKeyID, state.Status, state.LastError = result.SourceKeyID, upstreamStatusOK, ""
+		state.LastAttemptAt, state.LastSuccessAt, state.ConsecutiveFails, state.NextSyncAt, state.UpdatedAt = now, now, 0, 0, now
+		if round.Kind == "tail" {
+			state.TailRoundID = round.RoundID
+		} else {
+			state.BackfillRoundID = round.RoundID
+			state.BackfillLastSuccessAt, state.BackfillConsecutiveFails, state.BackfillNextSyncAt, state.BackfillLastError = now, 0, 0, ""
+		}
+		return tx.Save(state).Error
+	})
+}
+
+func (m *Monitor) recordAICodeWithKeyFailure(ctx context.Context, round AICodeWithUsageRound, state *AICodeWithKeySyncState, err error, secret string, now int64) error {
+	state.Status = upstreamStatusError
+	state.LastAttemptAt, state.UpdatedAt = now, now
+	state.LastError = sanitizeUpstreamErrorWithSecrets(err, secret)
+	state.ConsecutiveFails++
+	delay := int64(60 * (1 << min(state.ConsecutiveFails-1, 4)))
+	state.NextSyncAt = now + delay
+	var authErr *upstreamAuthError
+	if errors.As(err, &authErr) {
+		state.Status, state.NextSyncAt = upstreamStatusReconnect, upstreamAccountIsolatedUntil
+	}
+	if retryAt := upstreamRetryAt(err); retryAt > state.NextSyncAt {
+		state.NextSyncAt = retryAt
+	}
+	if round.Kind == "backfill" {
+		state.BackfillLastError = state.LastError
+		state.BackfillConsecutiveFails++
+		state.BackfillNextSyncAt = state.NextSyncAt
+	}
+	return m.storeDB.WithContext(ctx).Save(state).Error
+}
+
+func (m *Monitor) publishAICodeWithRound(ctx context.Context, row *ChannelUpstreamAccount, round AICodeWithUsageRound, now int64) (bool, error) {
+	var completed int64
+	roundColumn := "tail_round_id"
+	if round.Kind == "backfill" {
+		roundColumn = "backfill_round_id"
+	}
+	if err := m.storeDB.WithContext(ctx).Model(&AICodeWithKeySyncState{}).
+		Where("domain = ? AND credential_set_version = ? AND "+roundColumn+" = ?", row.Domain, round.CredentialSetVersion, round.RoundID).
+		Count(&completed).Error; err != nil {
+		return false, err
+	}
+	if completed != int64(round.TotalKeys) {
+		return false, nil
+	}
+	var staged []AICodeWithUsageStage
+	if err := m.storeDB.WithContext(ctx).Where("domain = ? AND round_id = ?", row.Domain, round.RoundID).Order("hour_ts ASC").Find(&staged).Error; err != nil {
+		return false, err
+	}
+	aggregated := make(map[int64]ChannelUpstreamUsageHour)
+	for _, part := range staged {
+		bucket := aggregated[part.HourTs]
+		if bucket.Domain == "" {
+			bucket = ChannelUpstreamUsageHour{Domain: row.Domain, HourTs: part.HourTs, BucketSeconds: part.BucketSeconds, Provider: upstreamProviderAICodeWith}
+		} else if bucket.BucketSeconds != part.BucketSeconds {
+			return false, fmt.Errorf("AICodeWith 多 Key 账单覆盖范围不一致")
+		}
+		bucket.Requests += part.Requests
+		bucket.Tokens += part.Tokens
+		bucket.Quota += part.Quota
+		bucket.CostUSD += part.CostUSD
+		bucket.FetchedAt = now
+		aggregated[part.HourTs] = bucket
+	}
+	return true, m.storeDB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var current AICodeWithUsageRound
+		if err := tx.First(&current, "domain = ? AND kind = ?", row.Domain, round.Kind).Error; err != nil {
+			return err
+		}
+		if current.RoundID != round.RoundID || current.CredentialSetVersion != round.CredentialSetVersion {
+			return fmt.Errorf("AICodeWith 凭据集合已变更，拒绝发布旧批次")
+		}
+		if err := tx.Where("domain = ? AND hour_ts >= ? AND hour_ts < ?", row.Domain, round.WindowFrom, round.WindowTo).Delete(&ChannelUpstreamUsageHour{}).Error; err != nil {
+			return err
+		}
+		hours := make([]int64, 0, len(aggregated))
+		for hour := range aggregated {
+			hours = append(hours, hour)
+		}
+		sort.Slice(hours, func(i, j int) bool { return hours[i] < hours[j] })
+		for _, hour := range hours {
+			bucket := aggregated[hour]
+			if err := tx.Create(&bucket).Error; err != nil {
+				return err
+			}
+		}
+		if err := tx.Where("domain = ? AND round_id = ?", row.Domain, round.RoundID).Delete(&AICodeWithUsageStage{}).Error; err != nil {
+			return err
+		}
+		if err := tx.Where("domain = ? AND kind = ?", row.Domain, round.Kind).Delete(&AICodeWithUsageRound{}).Error; err != nil {
+			return err
+		}
+		return nil
+	})
+}
+
+func (m *Monitor) processAICodeWithRound(ctx context.Context, row *ChannelUpstreamAccount, normalized aiCodeWithCredential, version, kind string, from, to, now int64, budget int) (bool, int64, int, error) {
+	var states []AICodeWithKeySyncState
+	if err := m.storeDB.WithContext(ctx).Where("domain = ? AND credential_set_version = ?", row.Domain, version).Order("ordinal ASC").Find(&states).Error; err != nil {
+		return false, 0, 0, err
+	}
+	if len(states) != len(normalized.Slots) {
+		if err := m.storeDB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+			if err := tx.Where("domain = ?", row.Domain).Delete(&AICodeWithKeySyncState{}).Error; err != nil {
+				return err
+			}
+			if err := tx.Where("domain = ?", row.Domain).Delete(&AICodeWithUsageStage{}).Error; err != nil {
+				return err
+			}
+			if err := tx.Where("domain = ?", row.Domain).Delete(&AICodeWithUsageRound{}).Error; err != nil {
+				return err
+			}
+			for i, slot := range normalized.Slots {
+				state := AICodeWithKeySyncState{Domain: row.Domain, SlotID: slot.SlotID, CredentialSetVersion: version, Ordinal: i + 1, Status: upstreamStatusPending, UpdatedAt: now}
+				if err := tx.Create(&state).Error; err != nil {
+					return err
+				}
+			}
+			return nil
+		}); err != nil {
+			return false, 0, 0, err
+		}
+		states = nil
+		if err := m.storeDB.WithContext(ctx).Where("domain = ? AND credential_set_version = ?", row.Domain, version).Order("ordinal ASC").Find(&states).Error; err != nil {
+			return false, 0, 0, err
+		}
+		if len(states) != len(normalized.Slots) {
+			return false, 0, 0, fmt.Errorf("AICodeWith Key 同步状态与凭据集合不一致")
+		}
+	}
+	round, err := m.ensureAICodeWithUsageRound(ctx, *row, version, kind, from, to, len(states), now)
+	if err != nil {
+		return false, 0, 0, err
+	}
+	secretByID := make(map[string]string, len(normalized.Slots))
+	for _, slot := range normalized.Slots {
+		secretByID[slot.SlotID] = slot.Secret
+	}
+	processed := 0
+	for _, i := range selectAICodeWithKeyStatesForTurn(states, round, kind, now, budget) {
+		state := &states[i]
+		result, fetchErr := fetchAICodeWithUsageWindow(ctx, m.channelUpstreamHTTPClient(), *row, secretByID[state.SlotID], round.WindowFrom, round.WindowTo, newUpstreamUsageRequestPacer(aiCodeWithUsageMaxRequestsPerRun, 0))
+		if fetchErr == nil {
+			fetchErr = m.stageAICodeWithKeyResult(ctx, round, state, result, now)
+		}
+		if fetchErr != nil {
+			if persistErr := m.recordAICodeWithKeyFailure(ctx, round, state, fetchErr, secretByID[state.SlotID], now); persistErr != nil {
+				return false, 0, processed, persistErr
+			}
+		}
+		processed++
+		if ctx.Err() != nil {
+			break
+		}
+	}
+	published, err := m.publishAICodeWithRound(ctx, row, round, now)
+	if err != nil {
+		return false, 0, processed, err
+	}
+	if published {
+		// round.WindowTo 在第一轮创建时即被冻结。多 Key 分轮期间即使 now
+		// 已向后推进，也只能发布这个已被所有 Key 完整覆盖的水位，不能把
+		// 尚未读取的几分钟虚报为已同步。
+		if kind == "tail" {
+			row.UsageDataUntil = round.WindowTo
+		}
+		return true, int64(round.TotalKeys), processed, nil
+	}
+	var done int64
+	column := "tail_round_id"
+	if kind == "backfill" {
+		column = "backfill_round_id"
+	}
+	if err := m.storeDB.WithContext(ctx).Model(&AICodeWithKeySyncState{}).
+		Where("domain = ? AND credential_set_version = ? AND "+column+" = ?", row.Domain, version, round.RoundID).Count(&done).Error; err != nil {
+		return false, 0, processed, err
+	}
+	return false, done, processed, nil
+}
+
+// selectAICodeWithKeyStatesForTurn is deliberately pure. The durable state is
+// ordered by Ordinal, so every process restart resumes at the first unfinished
+// key while one worker turn remains strictly bounded. A large account can
+// never expand one two-minute operation into N tail + N history requests.
+func selectAICodeWithKeyStatesForTurn(states []AICodeWithKeySyncState, round AICodeWithUsageRound, kind string, now int64, budget int) []int {
+	if budget <= 0 {
+		return nil
+	}
+	selected := make([]int, 0, min(budget, len(states)))
+	for i := range states {
+		completedRound, nextAt := states[i].TailRoundID, states[i].NextSyncAt
+		if kind == "backfill" {
+			completedRound, nextAt = states[i].BackfillRoundID, states[i].BackfillNextSyncAt
+		}
+		if completedRound == round.RoundID || nextAt == upstreamAccountIsolatedUntil || nextAt > now {
+			continue
+		}
+		selected = append(selected, i)
+		if len(selected) == budget {
+			break
+		}
+	}
+	return selected
+}
+
+func (m *Monitor) syncStoredAICodeWithUsage(ctx context.Context, row *ChannelUpstreamAccount, cred aiCodeWithCredential, now int64) error {
+	normalized, err := normalizeAICodeWithCredential(cred)
+	if err != nil {
+		return err
+	}
+	version, err := aiCodeWithCredentialSetVersion(normalized)
+	if err != nil {
+		return err
+	}
+	total := len(normalized.Slots)
+	budget := aiCodeWithKeysPerTurn
+	today := cstDayStart(now)
+	if row.UsageNextSyncAt == 0 || row.UsageNextSyncAt <= now {
+		published, done, used, roundErr := m.processAICodeWithRound(ctx, row, normalized, version, "tail", today, now, now, budget)
+		budget -= used
+		row.UsageLastAttemptAt = now
+		if roundErr != nil {
+			row.UsageStatus, row.UsageLastError = upstreamStatusError, sanitizeUpstreamError(roundErr)
+			row.UsageNextSyncAt = now + 60
+			return roundErr
+		}
+		if !published {
+			row.UsageStatus, row.UsageLastError = upstreamStatusPending, fmt.Sprintf("AICodeWith 当日 Key 进度 %d/%d，已完成 Key 不会重复请求", done, total)
+			row.UsageNextSyncAt = now + 15
+			return nil
+		}
+		row.UsageStatus, row.UsageLastError = upstreamStatusOK, ""
+		row.UsageLastSuccessAt, row.UsageConsecutiveFails = now, 0
+		row.UsageNextSyncAt = nextUpstreamUsageSyncAt(m.cfg, row.Domain, now, 0)
+	}
+	if row.UsageBackfillCursor == 0 {
+		row.UsageBackfillCursor = cstDayStart(now - int64(upstreamUsageBackfillDays(m.cfg))*86400)
+	}
+	if row.UsageBackfillCursor >= today {
+		row.UsageBackfillDone, row.UsageBackfillNextSyncAt = true, 0
+		return nil
+	}
+	if budget <= 0 || (row.UsageBackfillNextSyncAt > now && row.UsageBackfillNextSyncAt != upstreamAccountIsolatedUntil) || row.UsageBackfillNextSyncAt == upstreamAccountIsolatedUntil {
+		return nil
+	}
+	to := row.UsageBackfillCursor + aiCodeWithUsageMaxDays*86400
+	if to > today {
+		to = today
+	}
+	published, done, _, roundErr := m.processAICodeWithRound(ctx, row, normalized, version, "backfill", row.UsageBackfillCursor, to, now, budget)
+	row.UsageBackfillLastAttemptAt = now
+	if roundErr != nil {
+		row.UsageBackfillLastError = sanitizeUpstreamError(roundErr)
+		row.UsageBackfillConsecutiveFails++
+		row.UsageBackfillNextSyncAt = now + 60
+		return roundErr
+	}
+	if !published {
+		row.UsageBackfillLastError = fmt.Sprintf("AICodeWith 历史 Key 进度 %d/%d", done, total)
+		row.UsageBackfillNextSyncAt = now + 15
+		return nil
+	}
+	row.UsageBackfillCursor, row.UsageBackfillLastSuccessAt = to, now
+	row.UsageBackfillConsecutiveFails, row.UsageBackfillLastError = 0, ""
+	row.UsageBackfillDone = to >= today
+	if row.UsageBackfillDone {
+		row.UsageBackfillNextSyncAt = 0
+	} else {
+		row.UsageBackfillNextSyncAt = now + 15
+	}
+	return nil
 }
 
 // persistUpstreamUsageWindow 仅在完整读取窗口后替换同一窗口的小时桶。事务失败时保留
@@ -428,7 +957,7 @@ type upstreamUsageSyncPlan struct {
 func planUpstreamUsageSync(row ChannelUpstreamAccount, now int64, backfillDays int) upstreamUsageSyncPlan {
 	today := cstDayStart(now)
 	plan := upstreamUsageSyncPlan{tailFrom: today, tailTo: now}
-	if row.UsageDataUntil > today {
+	if row.Provider != upstreamProviderAICodeWith && row.UsageDataUntil > today {
 		plan.tailFrom = row.UsageDataUntil - int64(upstreamUsageTailOverlap/time.Second)
 		if plan.tailFrom < today {
 			plan.tailFrom = today
@@ -442,6 +971,12 @@ func planUpstreamUsageSync(row ChannelUpstreamAccount, now int64, backfillDays i
 	if backfill < today && (row.UsageBackfillNextSyncAt == 0 || row.UsageBackfillNextSyncAt <= now) {
 		plan.backfillFrom = backfill
 		plan.backfillTo = backfill + 86400
+		if row.Provider == upstreamProviderAICodeWith {
+			plan.backfillTo = backfill + aiCodeWithUsageMaxDays*86400
+			if plan.backfillTo > today {
+				plan.backfillTo = today
+			}
+		}
 	}
 	return plan
 }
@@ -479,7 +1014,7 @@ func (m *Monitor) syncStoredUpstreamUsage(ctx context.Context, domain string) (C
 		return row, fmt.Errorf("该上游账户未启用使用日志同步")
 	}
 	now := time.Now().Unix()
-	if row.Provider != upstreamProviderNewAPI {
+	if row.Provider != upstreamProviderNewAPI && row.Provider != upstreamProviderAICodeWith {
 		err := fmt.Errorf("%s 暂未验证公开使用日志接口，未自动读取日志", upstreamProviderName(row.Provider))
 		row.UsageStatus = upstreamStatusUnsupported
 		row.UsageLastAttemptAt = now
@@ -498,11 +1033,29 @@ func (m *Monitor) syncStoredUpstreamUsage(ctx context.Context, domain string) (C
 		}
 		return row, err
 	}
-	cred, ok := credential.(newAPICredential)
-	if !ok {
-		return row, fmt.Errorf("NewAPI 凭据格式无效")
+	if cred, ok := credential.(aiCodeWithCredential); ok && row.Provider == upstreamProviderAICodeWith {
+		err = m.syncStoredAICodeWithUsage(ctx, &row, cred, now)
+		if persistErr := m.persistUpstreamAccount(ctx, &row); persistErr != nil {
+			return row, persistErr
+		}
+		if err != nil {
+			return row, &upstreamStoredSyncError{message: sanitizeUpstreamErrorWithSecrets(err, upstreamCredentialSecrets(cred)...), retryAt: upstreamRetryAt(err)}
+		}
+		return row, nil
 	}
-	secrets := upstreamCredentialSecrets(cred)
+	var syncUsage func(context.Context, int64, int64, *upstreamUsageRequestPacer) (upstreamUsageResult, error)
+	switch cred := credential.(type) {
+	case newAPICredential:
+		if row.Provider != upstreamProviderNewAPI {
+			return row, fmt.Errorf("%s 凭据与供应商不匹配", upstreamProviderName(row.Provider))
+		}
+		syncUsage = func(callCtx context.Context, from, to int64, pacer *upstreamUsageRequestPacer) (upstreamUsageResult, error) {
+			return m.syncNewAPIUsage(callCtx, row, cred, from, to, pacer)
+		}
+	default:
+		return row, fmt.Errorf("%s 凭据格式无效", upstreamProviderName(row.Provider))
+	}
+	secrets := upstreamCredentialSecrets(credential)
 	plan := planUpstreamUsageSync(row, now, upstreamUsageBackfillDays(m.cfg))
 	pacer := newUpstreamUsageRequestPacer(upstreamUsageMaxRequestsPerRun, upstreamUsageRequestInterval)
 	operationRetryAt := int64(0)
@@ -513,7 +1066,7 @@ func (m *Monitor) syncStoredUpstreamUsage(ctx context.Context, domain string) (C
 	// only a successful, atomically persisted tail permits additional history.
 	result := upstreamUsageResult{DataUntil: row.UsageDataUntil}
 	if plan.tailTo > plan.tailFrom {
-		result, err = m.syncNewAPIUsage(ctx, row, cred, plan.tailFrom, plan.tailTo, pacer)
+		result, err = syncUsage(ctx, plan.tailFrom, plan.tailTo, pacer)
 		operationRetryAt = upstreamRetryAt(err)
 		if err == nil {
 			err = m.persistUpstreamUsageWindow(ctx, row.Domain, plan.tailFrom, plan.tailTo, result.Hours, now)
@@ -521,7 +1074,7 @@ func (m *Monitor) syncStoredUpstreamUsage(ctx context.Context, domain string) (C
 	}
 	applyUpstreamUsageResult(&row, result, err, now, m.cfg, secrets...)
 	if err == nil && plan.backfillTo > plan.backfillFrom {
-		history, historyErr := m.syncNewAPIUsage(ctx, row, cred, plan.backfillFrom, plan.backfillTo, pacer)
+		history, historyErr := syncUsage(ctx, plan.backfillFrom, plan.backfillTo, pacer)
 		if retryAt := upstreamRetryAt(historyErr); retryAt > operationRetryAt {
 			operationRetryAt = retryAt
 		}
@@ -560,7 +1113,7 @@ func (m *Monitor) syncStoredUpstreamUsage(ctx context.Context, domain string) (C
 func (m *Monitor) syncDueUpstreamUsage(ctx context.Context) {
 	now := time.Now().Unix()
 	var rows []ChannelUpstreamAccount
-	if err := m.storeDB.WithContext(ctx).Where("enabled = ? AND usage_sync_enabled = ? AND (usage_next_sync_at = 0 OR usage_next_sync_at <= ?)", true, true, now).Order("usage_next_sync_at ASC").Limit(1).Find(&rows).Error; err != nil {
+	if err := m.storeDB.WithContext(ctx).Where("enabled = ? AND usage_sync_enabled = ? AND ((usage_next_sync_at = 0 OR usage_next_sync_at <= ?) OR (usage_backfill_done = ? AND (usage_backfill_next_sync_at = 0 OR usage_backfill_next_sync_at <= ?)))", true, true, now, false, now).Order("usage_next_sync_at ASC").Limit(1).Find(&rows).Error; err != nil {
 		slog.Warn("读取待同步上游使用日志失败", "err", err)
 		return
 	}
@@ -578,8 +1131,8 @@ func (m *Monitor) syncDueUpstreamUsage(ctx context.Context) {
 	}
 }
 
-// syncChannelUpstreamUsageHandler 是管理员明确触发的单账户日志同步。它仍只请求
-// 已开启日志同步的 NewAPI 账户；不接受任何 URL、凭据或时间范围，避免把该接口
+// syncChannelUpstreamUsageHandler 是管理员明确触发的单账户日志同步。它只请求
+// 已开启日志同步且经过适配的 NewAPI/AICodeWith 账户；不接受任何 URL、凭据或时间范围，避免把该接口
 // 变成任意外部请求代理。
 func (m *Monitor) syncChannelUpstreamUsageHandler(c *gin.Context) {
 	m.serveChannelUpstreamSync(c, upstreamUsageOperationTimeout(m.cfg), m.syncStoredUpstreamUsage,

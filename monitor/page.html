@@ -332,8 +332,9 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
   </section>
 
   <section class="sync-section card">
-    <div class="card-header">🛡 稳定性与问题样本 <span class="muted">主采样、原始问题 Tail 与冷历史迁移分开显示</span></div>
+    <div class="card-header">🛡 稳定性与问题样本 <span class="muted">历史日志推断、可选客户端结果与冷历史迁移分开显示</span></div>
     <div class="sync-kv" id="syncStability"><div>加载中…</div></div>
+    <div class="sync-kv" id="syncDelivery" style="margin-top:1px"><div>可选客户端证据加载中…</div></div>
   </section>
 </div>
 
@@ -409,15 +410,15 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
 <div class="tabpane stability-page" id="tab-stability" hidden>
   <div class="stability-module-tabs">
     <div>
-      <button type="button" class="active" data-stability-view="history"><b>历史交付稳定性</b><small>分组 / 渠道 / 模型的真实用户请求</small></button>
-      <button type="button" data-stability-view="problems"><b>问题分布</b><small>error code + error message 原文聚合</small></button>
+      <button type="button" class="active" data-stability-view="history"><b>稳定性总览</b><small>可选客户端结果 / 历史日志推断</small></button>
+      <button type="button" data-stability-view="problems"><b>问题与证据</b><small>客户端技术失败 / 历史脱敏问题签名</small></button>
     </div>
     <div class="stability-source-mini" id="stSourceMini"><span><i class="wait"></i>数据状态加载中</span></div>
   </div>
 
   <section id="stHistoryView">
     <div class="stability-toolbar">
-      <div><h2>用户交付稳定性</h2><p>按用户选择的服务分组看稳定性，展开后核对实际承载渠道与模型。</p></div>
+      <div><h2>稳定性总览</h2><p>各证据层分别陈述结论；没有客户端结果时不会用服务端数据冒充用户侧成功。</p></div>
       <div class="stability-range">
         <button type="button" data-stability-preset="today">今天</button>
         <button type="button" data-stability-preset="yesterday">昨天</button>
@@ -431,12 +432,14 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
       </div>
     </div>
 
+    <div id="stEvidenceOverview" class="stability-evidence-overview"><div class="stability-loading"><i class="stability-spinner"></i><span>正在读取流式交付证据台账…</span></div></div>
+
     <div class="stability-layerbar">
       <div class="stability-layer-switch">
-        <button type="button" class="active" data-stability-layer="delivery"><b>用户交付稳定性</b><small>NewAPI 使用日志 · 分组 / 渠道 / 模型</small></button>
-        <button type="button" data-stability-layer="edge" disabled title="Nginx 旁路采集尚未接入"><b>入口与平台（尚未接入）</b><small>Nginx access · 节点 / HTTP / 耗时</small></button>
+        <button type="button" class="active" data-stability-layer="delivery"><b>历史日志推断</b><small>NewAPI 使用日志 · 非客户端确认结果</small></button>
+        <button type="button" data-stability-layer="edge" disabled title="Nginx 旁路采集尚未接入"><b>边缘观察（尚未接入）</b><small>Nginx access · 只能说明 HTTP 观察结果</small></button>
       </div>
-      <div class="stability-layer-note">两层事实分别统计<br>Request ID 可靠关联后仅用于交叉核对
+      <div class="stability-layer-note">证据分层统计，绝不互相替代<br>NewAPI 源码保持零改动
       </div>
     </div>
 
@@ -458,8 +461,8 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
 
   <section id="stProblemView" hidden>
     <div class="stability-toolbar">
-      <div><h2>问题分布</h2><p>直接按 error code 和 error message 原文聚合；分类不等于根因。</p></div>
-      <button type="button" class="stability-link-btn" id="stProblemRefresh">刷新</button>
+      <div><h2>问题与证据</h2><p>按脱敏错误签名与规范化摘要聚合；分类不等于根因，不展示上游原始敏感文本。</p></div>
+      <div class="stability-filter-actions"><input id="stRequestLookup" type="search" maxlength="256" autocomplete="off" placeholder="输入 Request ID 查证据"><button type="button" class="stability-link-btn" id="stRequestLookupBtn">查询</button><button type="button" class="stability-link-btn" id="stProblemRefresh">刷新</button></div>
     </div>
     <div class="stability-panel" id="stProblemBody"><div class="stability-loading"><i class="stability-spinner"></i><span>正在聚合原始错误签名…</span></div></div>
   </section>
@@ -468,7 +471,7 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
   <aside class="stability-drawer" id="stDrawer" role="dialog" aria-modal="true" aria-hidden="true" aria-label="稳定性详情">
     <header class="stability-drawer-head">
       <div class="stability-drawer-title"><div><h2 id="stDrawerTitle">详情</h2><p id="stDrawerSubtitle"></p></div><button type="button" class="stability-drawer-close" id="stDrawerClose">关闭</button></div>
-      <div class="stability-drawer-tabs"><button type="button" class="active" data-st-drawer-tab="run">运行详情</button><button type="button" data-st-drawer-tab="problems">问题分布</button></div>
+      <div class="stability-drawer-tabs"><button type="button" class="active" data-st-drawer-tab="run">结果概览</button><button type="button" data-st-drawer-tab="timeline">证据时间线</button><button type="button" data-st-drawer-tab="problems">问题签名</button></div>
     </header>
     <div class="stability-drawer-body" id="stDrawerBody"></div>
   </aside>
@@ -568,19 +571,24 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
       <section class="cm-upstream-status" id="cmUpstreamStatus" hidden></section>
       <section class="cm-upstream-note">
         <b>同步方式</b>
-        <span>余额默认每 5 分钟同步；使用日志仅在显式开启后低频汇总到 Monitor 本地，页面查询不会访问上游。</span>
+        <span>余额默认每 5 分钟同步；使用数据仅在显式开启后低频汇总到 Monitor 本地，页面查询不会访问上游。</span>
       </section>
       <section class="cm-upstream-fields">
-        <label><span>中转站类型</span><select id="cmUpstreamProvider"><option value="newapi">NewAPI</option><option value="sub2api">Sub2API</option></select></label>
+        <label><span>中转站类型</span><select id="cmUpstreamProvider"><option value="newapi">NewAPI</option><option value="sub2api">Sub2API</option><option value="aicodewith">AICodeWith（春秋）</option></select></label>
         <label class="wide"><span>站点地址</span><input id="cmUpstreamBaseURL" type="url" placeholder="https://example.com" autocomplete="url"><small>填写站点根地址，不要追加 API 路径</small></label>
         <label class="cm-upstream-newapi"><span>用户 ID</span><input id="cmUpstreamUserID" type="number" min="1" step="1" inputmode="numeric" placeholder="例如 123"></label>
         <label class="cm-upstream-newapi wide"><span>用户访问令牌</span><input id="cmUpstreamAccessToken" type="password" autocomplete="new-password" placeholder="已配置时留空表示保持不变"><small>个人设置中的系统访问令牌，不是模型调用 Key</small></label>
         <label class="cm-upstream-sub2api"><span>登录邮箱</span><input id="cmUpstreamEmail" type="email" autocomplete="username" placeholder="name@example.com"></label>
         <label class="cm-upstream-sub2api wide"><span>登录密码</span><input id="cmUpstreamPassword" type="password" autocomplete="new-password" placeholder="已连接时留空表示沿用当前会话"><small>密码只用于本次登录换取令牌，不保存、不回显</small></label>
+        <section class="cm-upstream-aicodewith wide cm-upstream-key-field">
+          <div class="cm-upstream-key-head"><span>AICodeWith API Keys</span><button type="button" id="cmUpstreamAddAPIKey">+添加 Key</button></div>
+          <div class="cm-upstream-key-list" id="cmUpstreamAPIKeyList"></div>
+          <small id="cmUpstreamAPIKeysHelp">每把 Key 单独一行，可按实际数量继续添加。每把 Key 只读自身消费，Monitor 完整取数后原子求和；已配置时全部留空表示保持不变。</small>
+        </section>
       </section>
       <label class="cm-upstream-enabled"><input id="cmUpstreamEnabled" type="checkbox" checked><span><b>启用后台自动同步</b><small>停用后保留配置和最后余额，但不再访问该上游</small></span></label>
-      <label class="cm-upstream-enabled cm-upstream-usage-option cm-upstream-newapi"><input id="cmUpstreamUsageEnabled" type="checkbox"><span><b>同步使用日志（NewAPI）</b><small>默认每 30 分钟串行汇总一次；首次按天低频补齐历史数据，不保存上游原始日志或用户内容</small></span></label>
-      <section class="cm-upstream-security"><b>凭据安全</b><span>访问令牌在本地 SQLite 中经 AES-256-GCM 加密；页面和接口只返回脱敏账户信息。Sub2API 的 refresh token 轮换会原子更新。</span></section>
+      <label class="cm-upstream-enabled cm-upstream-usage-option"><input id="cmUpstreamUsageEnabled" type="checkbox"><span><b id="cmUpstreamUsageLabel">同步使用日志</b><small id="cmUpstreamUsageHelp">默认每 30 分钟串行汇总一次；首次低频补齐历史数据，不保存上游原始日志或用户内容</small></span></label>
+      <section class="cm-upstream-security"><b>凭据安全</b><span>访问令牌与 AICodeWith API Key 在本地 SQLite 中经 AES-256-GCM 加密；页面和接口只返回脱敏账户信息。Sub2API 的 refresh token 轮换会原子更新。</span></section>
     </div>
     <footer><span id="cmUpstreamMessage"></span><div><button type="button" class="cm-upstream-cancel" id="cmUpstreamCancel">取消</button><button type="button" class="cm-upstream-sync" id="cmUpstreamSync" hidden>立即同步</button><button type="button" class="cm-upstream-save" id="cmUpstreamSave">保存并验证</button></div></footer>
   </aside>
@@ -1550,29 +1558,41 @@ function syncRenderStability(health){
   ].join('');
   return level;
 }
+function syncRenderDelivery(delivery){
+  const s=delivery.summary||{};
+  const level=!delivery.enabled?'warn':(s.conflicts?'bad':s.evidence_sufficient?'ok':'warn');
+  document.getElementById('syncDelivery').innerHTML=[
+    syncKV('受控客户端',delivery.enabled?'已配置':'未接入','可选能力；不要求修改 NewAPI 或 Nginx'),
+    syncKV('结果覆盖',s.coverage==null?'不可判断':(+s.coverage).toFixed(2)+'%',`请求开始 ${fmtNum(s.started)} · 结果回传 ${fmtNum(s.outcomes)}`),
+    syncKV('技术成功率',s.success_rate==null?'不可判断':(+s.success_rate).toFixed(2)+'%',`技术结果 ${fmtNum(s.technical_outcomes)} · 失败 ${fmtNum(s.failures)} · 主动取消 ${fmtNum(s.cancelled)} · 孤儿结果 ${fmtNum(s.orphan_outcomes)}`),
+    syncKV('证据状态',s.evidence_sufficient?'可判断':'样本或覆盖不足',`冲突 ${fmtNum(s.conflicts)} · 最近接收 ${syncTime(s.last_received_at)}`)
+  ].join('');
+  return level;
+}
 function syncRender(data){
-  const ready=data.ready.data||{},facts=data.facts.data||{},history=data.history.data||{},health=data.health.data||{},channels=data.channels.data||{};
+  const ready=data.ready.data||{},facts=data.facts.data||{},history=data.history.data||{},health=data.health.data||{},channels=data.channels.data||{},delivery=data.delivery.data||{};
   const runtimeLevel=syncRenderRuntime(ready,facts);
   const factsLevel=syncRenderFacts(facts,history);
   const channelsLevel=syncRenderChannels(channels);
   const stabilityLevel=syncRenderStability(health);
+  const deliveryLevel=syncRenderDelivery(delivery);
   const readiness=ready.status==='ready'&&!(ready.degraded_reasons||[]).length?'ok':(ready.status==='not_ready'?'bad':'warn');
   document.getElementById('syncOverview').innerHTML=[
     syncCard(readiness,'服务就绪',ready.status==='ready'?'本地服务可用':(ready.status||'不可用'),(ready.degraded_reasons||[]).join('、')||'本地状态已检查'),
     syncCard(factsLevel,'用户用量事实',facts.facts&&facts.facts.read_active?`${fmtNum(history.published_members||0)}/${fmtNum(history.total_members||0)} 成员可用`:'近期窗口同步中',`全历史归档 ${(+history.coverage_percent||0).toFixed(1)}% · ${fmtNum(history.live_ready_members||0)}/${fmtNum(history.total_members||0)} 实时追平`),
     syncCard(channelsLevel,'渠道上游同步',channels.enabled?`${(channels.domains||[]).filter(x=>x.upstream&&x.upstream.configured).length} 个账户`:'未启用','余额与消费状态均来自本地快照'),
-    syncCard(stabilityLevel,'稳定性采样',health.status||'未启用',health.problem_live_lag_sec?`问题 Tail 延迟 ${usageFactsDuration(health.problem_live_lag_sec)}`:'本地采样水位')
+    syncCard(stabilityLevel==='bad'||deliveryLevel==='bad'?'bad':stabilityLevel==='warn'||deliveryLevel==='warn'?'warn':'ok','稳定性采样',health.status||'未启用',delivery.enabled?`客户端回传 ${fmtNum(delivery.summary&&delivery.summary.outcomes)} 条`:(health.problem_live_lag_sec?`问题 Tail 延迟 ${usageFactsDuration(health.problem_live_lag_sec)}`:'客户端证据未接入'))
   ].join('');
   document.getElementById('syncUpdated').textContent='本地状态更新：'+new Date().toLocaleTimeString('zh-CN',{hour12:false});
 }
 async function syncLoadStatus(){
   clearTimeout(syncTimer);
   try{
-    const [ready,facts,history,health,channels]=await Promise.all([
-      syncFetchJSON('/ready'),syncFetchJSON('/usage/facts-status'),syncFetchJSON('/usage/facts-history'),syncFetchJSON('/stability/health'),syncFetchJSON('/channels/report?hours=24')
+    const [ready,facts,history,health,channels,delivery]=await Promise.all([
+      syncFetchJSON('/ready'),syncFetchJSON('/usage/facts-status'),syncFetchJSON('/usage/facts-history'),syncFetchJSON('/stability/health'),syncFetchJSON('/channels/report?hours=24'),syncFetchJSON('/stability/delivery-evidence?hours=24&protocol=openai_responses')
     ]);
-    syncRender({ready,facts,history,health,channels});
-    const errors=[ready,facts,history,health,channels].filter(x=>!x.ok);
+    syncRender({ready,facts,history,health,channels,delivery});
+    const errors=[ready,facts,history,health,channels,delivery].filter(x=>!x.ok);
     document.getElementById('syncError').innerHTML=errors.length?`<div class="usage-facts-state warn"><b>部分状态暂不可用</b><span>${errors.map(x=>esc(x.data&&x.data.error||('HTTP '+x.status))).join('；')}</span></div>`:'';
   }catch(e){document.getElementById('syncError').innerHTML=`<div class="usage-facts-state warn"><b>同步状态加载失败</b><span>${esc(e.message)}</span></div>`}
   finally{if(!document.getElementById('tab-sync').hidden)syncTimer=setTimeout(syncLoadStatus,30000)}
@@ -2182,9 +2202,10 @@ function usageBeginRequest(){
 // 但不把陈旧数据伪装成实时数据；错误响应仍按下方 alert 显示。
 function usageSetDataNotice(d){
   const eb=document.getElementById('usageErr');
+  const liveMsg=d&&d.live_projection_applied?(d.live_projection_message||'今日总消费使用本地累计水位更新，详细维度稍后封口'):'';
   const msg=d&&d.matrix_available===false
     ?(d.matrix_message||'每日消费明细暂不可用，余额和累计消耗仍可查看')
-    :(d&&d.data_stale?(d.data_message||'当前显示最近一次成功统计'):'' );
+    :(liveMsg||(d&&d.data_stale?(d.data_message||'当前显示最近一次成功统计'):'' ));
   eb.innerHTML=msg?`<div class="muted" style="padding:0 2px 8px;font-size:12px">· ${esc(msg)}</div>`:'';
 }
 // 列表页:消费矩阵
@@ -2670,6 +2691,9 @@ async function usageLoadDetail(forceFresh){
     detailStats._rangeMessage=d.range_message||'';
     detailStats._requestedFrom=d.requested_from||detailStats.from||'';
     detailStats._requestedTo=d.requested_to||detailStats.to||'';
+    if(d.live_projection_applied){
+      eb.innerHTML=`<div class="muted" style="padding:0 2px 8px;font-size:12px">· ${esc(d.live_projection_message||'今日总消费已更新，详细维度稍后封口')}</div>`;
+    }
     renderUsage(
       detailStats,d.balance_usd,d.members,d.total_used_usd,d.by_token,d.token,
       d.token_data_available,d.token_data_message,d.stats_available,d.stats_message

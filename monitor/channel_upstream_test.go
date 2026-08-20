@@ -259,6 +259,160 @@ func TestSyncNewAPIBalanceUsesUserTokenAndPublishedUnit(t *testing.T) {
 	}
 }
 
+func TestSyncAICodeWithBalanceUsesAPIKeyAndUSDResponse(t *testing.T) {
+	const apiKey = "sk-acw-balance-test-secret"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/balance" || r.Header.Get("Authorization") != "Bearer "+apiKey {
+			http.Error(w, `{"error":{"type":"UNAUTHORIZED","message":"bad key `+apiKey+`"}}`, http.StatusUnauthorized)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":{"balance":"123.4567","currency":"USD"}}`))
+	}))
+	defer server.Close()
+	client := newUpstreamHTTPClient(3 * time.Second)
+	defer client.CloseIdleConnections()
+	result, _, err := syncAICodeWithBalance(context.Background(), client, ChannelUpstreamAccount{
+		Provider: upstreamProviderAICodeWith, BaseURL: server.URL,
+	}, aiCodeWithCredential{APIKey: apiKey})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if math.Abs(result.BalanceUSD-123.4567) > 1e-12 || result.BalanceRaw != result.BalanceUSD || result.BalanceUnit != 1 || result.UnitAssumed {
+		t.Fatalf("unexpected AICodeWith balance: %+v", result)
+	}
+	if got := aiCodeWithKeyIdentity([]string{apiKey}); strings.Contains(got, apiKey) || !strings.HasPrefix(got, "keys:1:") {
+		t.Fatalf("API key identity is not a safe fingerprint: %q", got)
+	}
+}
+
+func TestAICodeWithNestedErrorMessageIsParsedWithoutLeakingKey(t *testing.T) {
+	const apiKey = "sk-acw-reflected-secret"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		http.Error(w, `{"error":{"type":"UNAUTHORIZED","message":"invalid `+apiKey+`"}}`, http.StatusUnauthorized)
+	}))
+	defer server.Close()
+	_, _, err := syncAICodeWithBalance(context.Background(), newUpstreamHTTPClient(3*time.Second), ChannelUpstreamAccount{
+		Provider: upstreamProviderAICodeWith, BaseURL: server.URL,
+	}, aiCodeWithCredential{APIKey: apiKey})
+	if err == nil {
+		t.Fatal("unauthorized response unexpectedly succeeded")
+	}
+	message := sanitizeUpstreamErrorWithSecrets(err, apiKey)
+	if strings.Contains(message, apiKey) || !strings.Contains(message, "[REDACTED]") {
+		t.Fatalf("nested upstream error leaked API key: %q", message)
+	}
+}
+
+func TestSyncAICodeWithBalanceRejectsKeysFromDifferentAccounts(t *testing.T) {
+	keys := []string{"sk-acw-account-a", "sk-acw-account-b"}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		balance := "10.00"
+		if r.Header.Get("Authorization") == "Bearer "+keys[1] {
+			balance = "20.00"
+		}
+		_, _ = fmt.Fprintf(w, `{"data":{"balance":%q,"currency":"USD"}}`, balance)
+	}))
+	defer server.Close()
+	_, _, err := syncAICodeWithBalance(context.Background(), newUpstreamHTTPClient(3*time.Second), ChannelUpstreamAccount{
+		Provider: upstreamProviderAICodeWith, BaseURL: server.URL,
+	}, aiCodeWithCredential{APIKeys: keys})
+	if err == nil || !strings.Contains(err.Error(), "余额不一致") {
+		t.Fatalf("keys from different balance accounts must not be merged: %v", err)
+	}
+}
+
+func TestAICodeWithDynamicKeyListSafetyBoundaryAndMaskedCount(t *testing.T) {
+	keys := make([]string, maxAICodeWithAPIKeys)
+	for i := range keys {
+		keys[i] = fmt.Sprintf("sk-acw-dynamic-%03d", i)
+	}
+	normalized, err := normalizeAICodeWithAPIKeys("", keys)
+	if err != nil || len(normalized) != maxAICodeWithAPIKeys {
+		t.Fatalf("dynamic key list rejected: count=%d err=%v", len(normalized), err)
+	}
+	tooMany := append(append([]string(nil), keys...), "sk-acw-over-limit")
+	if _, err := normalizeAICodeWithAPIKeys("", tooMany); err == nil {
+		t.Fatal("oversized key list must retain a bounded request/credential safety limit")
+	}
+	view := upstreamAccountView(ChannelUpstreamAccount{
+		Provider: upstreamProviderAICodeWith,
+		Account:  aiCodeWithKeyIdentity(keys),
+	})
+	if view.APIKeyCount != len(keys) || view.AccountMasked != fmt.Sprintf("%d 把 API Key", len(keys)) {
+		t.Fatalf("masked key count = %+v", view)
+	}
+}
+
+func TestStoredAICodeWithBalanceRefreshDoesNotGrowWithKeyCount(t *testing.T) {
+	var requests atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		if r.URL.Path != "/api/v1/balance" || !strings.HasPrefix(r.Header.Get("Authorization"), "Bearer sk-acw-") {
+			http.Error(w, `{"message":"bad request"}`, http.StatusUnauthorized)
+			return
+		}
+		_, _ = w.Write([]byte(`{"balance":"19.25","currency":"USD"}`))
+	}))
+	defer server.Close()
+	m := newChannelUpstreamTestMonitor(t)
+	domain := normalizeChannelBaseDomain(server.URL)
+	keys := []string{"sk-acw-one", "sk-acw-two", "sk-acw-three", "sk-acw-four"}
+	row := ChannelUpstreamAccount{
+		Domain: domain, Provider: upstreamProviderAICodeWith, BaseURL: server.URL,
+		Account: aiCodeWithKeyIdentity(keys), Enabled: true, Status: upstreamStatusPending,
+	}
+	if err := m.persistSyncedUpstreamAccount(context.Background(), &row, aiCodeWithCredential{APIKeys: keys}); err != nil {
+		t.Fatal(err)
+	}
+	synced, err := m.syncStoredUpstreamAccount(context.Background(), domain)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if requests.Load() != 1 || !synced.BalanceKnown || synced.BalanceUSD != 19.25 {
+		t.Fatalf("periodic account snapshot should use one verified key: requests=%d row=%+v", requests.Load(), synced)
+	}
+	var stored aiCodeWithCredential
+	if err := m.openUpstreamCredential(synced, &stored); err != nil {
+		t.Fatal(err)
+	}
+	storedKeys, err := aiCodeWithCredentialKeys(stored)
+	if err != nil || len(storedKeys) != len(keys) {
+		t.Fatalf("periodic balance refresh lost configured keys: keys=%v err=%v", storedKeys, err)
+	}
+}
+
+func TestStoredAICodeWithBalanceFallsBackOnlyAfterExpiredKey(t *testing.T) {
+	var requests atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		switch r.Header.Get("Authorization") {
+		case "Bearer sk-acw-expired":
+			http.Error(w, `{"message":"expired"}`, http.StatusUnauthorized)
+		case "Bearer sk-acw-healthy":
+			_, _ = w.Write([]byte(`{"balance":"27.50","currency":"USD"}`))
+		default:
+			http.Error(w, `{"message":"unexpected"}`, http.StatusForbidden)
+		}
+	}))
+	defer server.Close()
+	result, normalized, err := syncAICodeWithBalanceSnapshot(context.Background(), newUpstreamHTTPClient(3*time.Second), ChannelUpstreamAccount{
+		Provider: upstreamProviderAICodeWith, BaseURL: server.URL,
+	}, aiCodeWithCredential{Slots: []aiCodeWithKeyCredential{
+		{SlotID: "acw_slot_01", Secret: "sk-acw-expired"},
+		{SlotID: "acw_slot_02", Secret: "sk-acw-healthy"},
+		{SlotID: "acw_slot_03", Secret: "sk-acw-unused"},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	keys, keyErr := aiCodeWithCredentialKeys(normalized)
+	if keyErr != nil || len(keys) != 3 || result.BalanceUSD != 27.5 || requests.Load() != 2 {
+		t.Fatalf("expired-key fallback result=%+v keys=%d requests=%d err=%v", result, len(keys), requests.Load(), keyErr)
+	}
+}
+
 func TestFetchNewAPIUsageWindowAggregatesLocallyAndKeepsZeroHours(t *testing.T) {
 	const token = "usage-access"
 	from := time.Date(2026, 8, 10, 0, 0, 0, 0, time.UTC).Unix()
@@ -498,6 +652,167 @@ func TestChannelUpstreamNewAPIHandlersProtectSecretsAndPreserveLastBalance(t *te
 	}
 	if row.UserID != 10 || row.BalanceKnown || row.BalanceUSD != 0 || row.LastSuccessAt != 0 || strings.Contains(row.LastError, "new-account-token") {
 		t.Fatalf("new account inherited stale balance from previous identity: %+v", row)
+	}
+}
+
+func TestChannelUpstreamAICodeWithHandlerEncryptsKeyAndEnablesUsage(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	const apiKey = "sk-acw-handler-secret"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/balance" || r.Header.Get("Authorization") != "Bearer "+apiKey {
+			http.Error(w, `{"error":{"type":"UNAUTHORIZED","message":"invalid `+apiKey+`"}}`, http.StatusUnauthorized)
+			return
+		}
+		_, _ = w.Write([]byte(`{"balance":"9.75","currency":"USD"}`))
+	}))
+	defer server.Close()
+	domain := normalizeChannelBaseDomain(server.URL)
+	m := newChannelUpstreamTestMonitor(t)
+	if err := m.storeDB.Create(&ChannelSnap{ID: 77, Name: "aicodewith", BaseDomain: domain, BaseHost: normalizeChannelBaseHost(server.URL), Status: 1}).Error; err != nil {
+		t.Fatal(err)
+	}
+	router := gin.New()
+	router.POST("/channels/upstream", m.requireRole(roleRoot), m.saveChannelUpstreamHandler)
+	usageEnabled := true
+	payload := channelUpstreamSaveInput{
+		Domain: domain, Provider: upstreamProviderAICodeWith, BaseURL: server.URL,
+		APIKeys: []string{apiKey}, UsageSyncEnabled: &usageEnabled,
+	}
+	w := upstreamRouteRequest(t, m, router, roleRoot, http.MethodPost, "/channels/upstream", payload)
+	if w.Code != http.StatusOK || strings.Contains(w.Body.String(), apiKey) || !strings.Contains(w.Body.String(), `"balance_usd":9.75`) {
+		t.Fatalf("save response invalid or leaked API key: status=%d body=%s", w.Code, w.Body.String())
+	}
+	var row ChannelUpstreamAccount
+	if err := m.storeDB.First(&row, "domain = ?", domain).Error; err != nil {
+		t.Fatal(err)
+	}
+	if row.Provider != upstreamProviderAICodeWith || !row.UsageSyncEnabled || row.Account != aiCodeWithKeyIdentity([]string{apiKey}) || strings.Contains(row.Credential, apiKey) {
+		t.Fatalf("invalid stored AICodeWith account: %+v", row)
+	}
+	var credential aiCodeWithCredential
+	if err := m.openUpstreamCredential(row, &credential); err != nil {
+		t.Fatalf("encrypted AICodeWith key cannot be recovered: credential=%+v err=%v", credential, err)
+	}
+	keys, keysErr := aiCodeWithCredentialKeys(credential)
+	if keysErr != nil || len(keys) != 1 || keys[0] != apiKey {
+		t.Fatalf("encrypted AICodeWith key cannot be recovered: credential=%+v err=%v", credential, keysErr)
+	}
+}
+
+func TestChannelUpstreamAICodeWithRejectedKeyChangeKeepsPublishedConfiguration(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	const oldKey = "sk-acw-existing-valid"
+	const badKey = "sk-acw-rejected-secret"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/balance" {
+			http.NotFound(w, r)
+			return
+		}
+		if r.Header.Get("Authorization") == "Bearer "+badKey {
+			http.Error(w, `{"error":{"message":"invalid `+badKey+`"}}`, http.StatusUnauthorized)
+			return
+		}
+		if r.Header.Get("Authorization") != "Bearer "+oldKey {
+			http.Error(w, `{"error":{"message":"unknown key"}}`, http.StatusUnauthorized)
+			return
+		}
+		_, _ = w.Write([]byte(`{"balance":"9.75","currency":"USD"}`))
+	}))
+	defer server.Close()
+	domain := normalizeChannelBaseDomain(server.URL)
+	m := newChannelUpstreamTestMonitor(t)
+	if err := m.storeDB.Create(&ChannelSnap{ID: 78, Name: "aicodewith", BaseDomain: domain, BaseHost: normalizeChannelBaseHost(server.URL), Status: 1}).Error; err != nil {
+		t.Fatal(err)
+	}
+	router := gin.New()
+	router.POST("/channels/upstream", m.requireRole(roleRoot), m.saveChannelUpstreamHandler)
+	usageEnabled := true
+	initial := channelUpstreamSaveInput{Domain: domain, Provider: upstreamProviderAICodeWith, BaseURL: server.URL, APIKeys: []string{oldKey}, UsageSyncEnabled: &usageEnabled}
+	if w := upstreamRouteRequest(t, m, router, roleRoot, http.MethodPost, "/channels/upstream", initial); w.Code != http.StatusOK {
+		t.Fatalf("initial save=%d %s", w.Code, w.Body.String())
+	}
+	var before ChannelUpstreamAccount
+	if err := m.storeDB.First(&before, "domain = ?", domain).Error; err != nil {
+		t.Fatal(err)
+	}
+	usage := ChannelUpstreamUsageHour{Domain: domain, HourTs: 123456, BucketSeconds: 86400, CostUSD: 7, Provider: upstreamProviderAICodeWith}
+	if err := m.storeDB.Create(&usage).Error; err != nil {
+		t.Fatal(err)
+	}
+	change := channelUpstreamSaveInput{Domain: domain, Provider: upstreamProviderAICodeWith, BaseURL: server.URL, AddAPIKeys: []string{badKey}, UsageSyncEnabled: &usageEnabled}
+	w := upstreamRouteRequest(t, m, router, roleRoot, http.MethodPost, "/channels/upstream", change)
+	if w.Code == http.StatusOK || strings.Contains(w.Body.String(), badKey) || !strings.Contains(w.Body.String(), "原配置未修改") {
+		t.Fatalf("failed key change was not rejected safely: status=%d body=%s", w.Code, w.Body.String())
+	}
+	var after ChannelUpstreamAccount
+	if err := m.storeDB.First(&after, "domain = ?", domain).Error; err != nil {
+		t.Fatal(err)
+	}
+	if after.Credential != before.Credential || after.Account != before.Account || after.BalanceUSD != before.BalanceUSD || after.Status != before.Status {
+		t.Fatalf("rejected key change modified the published account: before=%+v after=%+v", before, after)
+	}
+	var credential aiCodeWithCredential
+	if err := m.openUpstreamCredential(after, &credential); err != nil {
+		t.Fatal(err)
+	}
+	keys, err := aiCodeWithCredentialKeys(credential)
+	if err != nil || len(keys) != 1 || keys[0] != oldKey {
+		t.Fatalf("rejected key entered encrypted set: keys=%v err=%v", keys, err)
+	}
+	var usageCount int64
+	if err := m.storeDB.Model(&ChannelUpstreamUsageHour{}).Where("domain = ? AND hour_ts = ?", domain, usage.HourTs).Count(&usageCount).Error; err != nil || usageCount != 1 {
+		t.Fatalf("rejected key change modified published usage: count=%d err=%v", usageCount, err)
+	}
+}
+
+func TestUpstreamIdentityAndUsageNamespaceChangeCommitAtomically(t *testing.T) {
+	m := newChannelUpstreamTestMonitor(t)
+	domain := "identity-atomic.example"
+	existing := ChannelUpstreamAccount{
+		Domain: domain, Provider: upstreamProviderNewAPI, BaseURL: "https://" + domain,
+		Account: "7", UserID: 7, Enabled: true, Status: upstreamStatusOK,
+	}
+	if err := m.persistSyncedUpstreamAccount(context.Background(), &existing, newAPICredential{AccessToken: "old-token"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.storeDB.Create(&ChannelUpstreamUsageHour{
+		Domain: domain, HourTs: 123456, BucketSeconds: 3600, Requests: 9,
+		Provider: upstreamProviderNewAPI,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	// Force the second half of the account+namespace transaction to fail. The
+	// account upsert must roll back with it; otherwise the new identity would be
+	// shown with the previous identity's local usage rows.
+	if err := m.storeDB.Exec(`CREATE TRIGGER reject_identity_usage_reset
+		BEFORE DELETE ON channel_upstream_usage_hours
+		WHEN OLD.domain = 'identity-atomic.example'
+		BEGIN SELECT RAISE(ABORT, 'injected usage reset failure'); END`).Error; err != nil {
+		t.Fatal(err)
+	}
+	replacement := ChannelUpstreamAccount{
+		Domain: domain, Provider: upstreamProviderAICodeWith, BaseURL: "https://" + domain,
+		Account: aiCodeWithKeyIdentity([]string{"sk-acw-new-identity"}), Enabled: true, Status: upstreamStatusOK,
+	}
+	if err := m.sealUpstreamAccountCredential(&replacement, aiCodeWithCredential{APIKeys: []string{"sk-acw-new-identity"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.persistUpstreamAccountIdentityChange(context.Background(), &replacement, true); err == nil {
+		t.Fatal("injected usage reset failure unexpectedly committed identity change")
+	}
+	var stored ChannelUpstreamAccount
+	if err := m.storeDB.First(&stored, "domain = ?", domain).Error; err != nil {
+		t.Fatal(err)
+	}
+	if stored.Provider != upstreamProviderNewAPI || stored.UserID != 7 || stored.Account != "7" {
+		t.Fatalf("account identity committed without its usage reset: %+v", stored)
+	}
+	var usageRows int64
+	if err := m.storeDB.Model(&ChannelUpstreamUsageHour{}).Where("domain = ?", domain).Count(&usageRows).Error; err != nil {
+		t.Fatal(err)
+	}
+	if usageRows != 1 {
+		t.Fatalf("failed identity transaction changed usage rows: count=%d", usageRows)
 	}
 }
 

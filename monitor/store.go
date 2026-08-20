@@ -267,12 +267,13 @@ type NginxMinuteSample struct {
 
 // NginxIngestBatch 使采集器断线重试保持幂等，避免同一批次重复累计。
 type NginxIngestBatch struct {
-	Node       string `gorm:"primaryKey;size:64"`
-	BatchID    string `gorm:"primaryKey;size:64"`
-	FirstTs    int64
-	LastTs     int64
-	Rows       int
-	ReceivedAt int64 `gorm:"index"`
+	Node        string `gorm:"primaryKey;size:64"`
+	BatchID     string `gorm:"primaryKey;size:64"`
+	PayloadHash string `gorm:"size:64;not null"`
+	FirstTs     int64
+	LastTs      int64
+	Rows        int
+	ReceivedAt  int64 `gorm:"index"`
 }
 
 // NginxSourceState 是入口数据源健康状态；只保留每节点最后进度，不随时间增长。
@@ -527,6 +528,17 @@ type UsageUserSnapshot struct {
 	UsedQuota    int64  `gorm:"column:used_quota"`
 	Exists       bool   `gorm:"column:exists"`
 	CapturedAt   int64  `gorm:"index;column:captured_at"`
+}
+
+// UsageUserQuotaWatermark keeps a short, local history of the cumulative
+// users.used_quota watermark. It lets the read path anchor an unfinalized tail
+// to a nearby finalized hour without re-reading source logs or assuming the
+// cumulative counter has matched historical facts since account creation.
+type UsageUserQuotaWatermark struct {
+	UserID     int64 `gorm:"primaryKey;autoIncrement:false;column:user_id"`
+	CapturedAt int64 `gorm:"primaryKey;autoIncrement:false;index:idx_usage_user_quota_watermark_captured;column:captured_at"`
+	UsedQuota  int64 `gorm:"column:used_quota"`
+	Exists     bool  `gorm:"column:exists"`
 }
 
 type UsageTokenSnapshot struct {
@@ -789,7 +801,8 @@ func (m *Monitor) openStore(path string) error {
 		&StabilityProblemIngestState{}, &StabilityProblemStage{}, &StabilityProblemClassificationMigration{}, &StabilityProblemLiveCursor{},
 		&StabilityHourIngestState{}, &StabilityBackfillJob{},
 		&ChannelFinanceSetting{}, &ChannelSaleGroupRate{}, &WebsiteGroupCatalog{}, &ChannelDomainCost{}, &ChannelDomainGroupCost{}, &ChannelFinanceChannelCost{}, &ChannelFinanceVersion{},
-		&ChannelUpstreamAccount{}, &ChannelUpstreamUsageHour{}, &UpstreamHostCircuit{},
+		&ChannelUpstreamAccount{}, &ChannelUpstreamUsageHour{}, &AICodeWithKeySyncState{}, &AICodeWithUsageStage{}, &AICodeWithUsageRound{}, &UpstreamHostCircuit{},
+		&ClientDeliveryEvidence{}, &ClientEvidenceIngestBatch{},
 		&InfraSample{}, &HostContainerSnapshot{}, &NginxMinuteSample{}, &NginxIngestBatch{}, &NginxSourceState{},
 		&AlertConfig{}, &AlertLog{}, &TrackedUser{}, &CustomerGroup{}, &UsageMemberControl{}, &UsageMemberAudit{}, &UsageMemberControlMigration{}, &FollowUpLog{}, &UsageSettings{},
 	); err != nil {
@@ -836,6 +849,9 @@ func (m *Monitor) openStore(path string) error {
 	m.storeDB = db
 	if err := m.migrateLegacyUpstreamCredentialEncryption(); err != nil {
 		return fmt.Errorf("上游凭据加密密钥迁移失败: %w", err)
+	}
+	if err := m.migrateAICodeWithCredentialSlots(); err != nil {
+		return fmt.Errorf("AICodeWith Key 槽位迁移失败: %w", err)
 	}
 	if err := m.openUsageFactsStore(m.cfg.UsageFactsStorePath, factsPrechecked); err != nil {
 		factsPath := strings.TrimSpace(m.cfg.UsageFactsStorePath)
@@ -927,9 +943,10 @@ func (m *Monitor) openUsageFactsStore(path string, prechecked bool) error {
 		m.usageFactsIntegrityOK.Store(m.storeIntegrityOK.Load())
 	}
 	if err := factsDB.AutoMigrate(
-		&UsageHourFact{}, &UsageDailyFact{}, &UsageFactMemberDayState{}, &UsageHourIngestState{}, &UsageFactMemberState{}, &UsageFactMemberHourState{}, &UsageUserSnapshot{},
+		&UsageHourFact{}, &UsageDailyFact{}, &UsageFactMemberDayState{}, &UsageHourIngestState{}, &UsageFactMemberState{}, &UsageFactMemberHourState{}, &UsageUserSnapshot{}, &UsageUserQuotaWatermark{},
 		&UsageFactPageIngestState{},
 		&UsageTokenSnapshot{}, &UsageFactPublishedMember{}, &UsageFactRepairMember{}, &UsageFactJob{}, &UsageFactRepairRequest{}, &UsageFactSyncState{},
+		&ClientDeliveryEvidence{}, &ClientEvidenceIngestBatch{},
 	); err != nil {
 		return fmt.Errorf("用量事实表迁移失败: %w", err)
 	}

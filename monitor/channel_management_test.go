@@ -193,7 +193,9 @@ func TestChannelManagementUpstreamUsageUsesLocalHourlyRowsOnly(t *testing.T) {
 	}).Error; err != nil {
 		t.Fatal(err)
 	}
-	accounts := map[string]ChannelUpstreamAccountView{"upstream.example": {Configured: true, UsageSyncEnabled: true}}
+	accounts := map[string]ChannelUpstreamAccountView{"upstream.example": {
+		Configured: true, Provider: upstreamProviderNewAPI, UsageSyncEnabled: true,
+	}}
 	usage, err := m.loadChannelUpstreamUsage(context.Background(), stabilityScope{FromTs: from, ToTs: now}, now, accounts)
 	if err != nil {
 		t.Fatal(err)
@@ -203,12 +205,50 @@ func TestChannelManagementUpstreamUsageUsesLocalHourlyRowsOnly(t *testing.T) {
 		t.Fatalf("local upstream usage aggregation=%+v", got)
 	}
 	// 即便本地存在聚合，只要管理员未明确开启日志同步，页面也不显示它。
-	usage, err = m.loadChannelUpstreamUsage(context.Background(), stabilityScope{FromTs: from, ToTs: now}, now, map[string]ChannelUpstreamAccountView{"upstream.example": {Configured: true}})
+	usage, err = m.loadChannelUpstreamUsage(context.Background(), stabilityScope{FromTs: from, ToTs: now}, now, map[string]ChannelUpstreamAccountView{"upstream.example": {
+		Configured: true, Provider: upstreamProviderNewAPI,
+	}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(usage) != 0 {
 		t.Fatalf("disabled usage sync must not expose old local rows: %+v", usage)
+	}
+}
+
+func TestChannelManagementAICodeWithUsageKeepsNaturalDayGranularity(t *testing.T) {
+	m := newStabilityTestMonitor(t)
+	from := time.Date(2026, 8, 8, 0, 0, 0, 0, cstLocation).Unix()
+	to := from + 2*86400
+	if err := m.storeDB.Create(&[]ChannelUpstreamUsageHour{
+		{Domain: "aicodewith.com", HourTs: from, BucketSeconds: 86400, Requests: 2, Tokens: 30, CostUSD: 1.2, Provider: upstreamProviderAICodeWith},
+		{Domain: "aicodewith.com", HourTs: from + 86400, BucketSeconds: 86400, Requests: 3, Tokens: 40, CostUSD: 2.3, Provider: upstreamProviderAICodeWith},
+		// A stale row from a previous provider identity must never be attributed
+		// to the currently configured AICodeWith account.
+		{Domain: "aicodewith.com", HourTs: from + 3600, BucketSeconds: 3600, Requests: 999, Tokens: 999, CostUSD: 999, Provider: upstreamProviderNewAPI},
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	accounts := map[string]ChannelUpstreamAccountView{"aicodewith.com": {
+		Configured: true, Provider: upstreamProviderAICodeWith, UsageSyncEnabled: true,
+	}}
+	usage, err := m.loadChannelUpstreamUsage(context.Background(), stabilityScope{FromTs: from, ToTs: to}, to, accounts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := usage["aicodewith.com"]
+	if !got.Available || !got.Complete || got.Granularity != "day" || got.ExpectedHours != 48 || got.CompletedHours != 48 || got.Requests != 5 || math.Abs(got.CostUSD-3.5) > 1e-9 {
+		t.Fatalf("natural-day upstream aggregation=%+v", got)
+	}
+	// A 24-hour sliding window starts in the middle of the first natural day.
+	// It must not pretend the whole daily bill belongs to that partial range.
+	usage, err = m.loadChannelUpstreamUsage(context.Background(), stabilityScope{FromTs: from + 12*3600, ToTs: to}, to, accounts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got = usage["aicodewith.com"]
+	if got.Complete || got.Requests != 3 || math.Abs(got.CostUSD-2.3) > 1e-9 {
+		t.Fatalf("partial-day range was reported as a complete daily bill: %+v", got)
 	}
 }
 

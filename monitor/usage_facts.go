@@ -2772,6 +2772,21 @@ func (m *Monitor) syncUsageProfiles(ctx context.Context, now time.Time) error {
 	// 不再阻塞小时租约、本地状态读取和事实库维护。
 	m.usageFactsSyncMu.Lock()
 	err = m.usageFactsStore().Transaction(func(tx *gorm.DB) error {
+		watermarks := make([]UsageUserQuotaWatermark, 0, len(users))
+		for _, user := range users {
+			watermarks = append(watermarks, UsageUserQuotaWatermark{
+				UserID: user.UserID, CapturedAt: user.CapturedAt, UsedQuota: user.UsedQuota, Exists: user.Exists,
+			})
+		}
+		if len(watermarks) > 0 {
+			if err := tx.Clauses(clause.OnConflict{DoNothing: true}).CreateInBatches(watermarks, usageFactProfileBatch).Error; err != nil {
+				return err
+			}
+		}
+		if err := tx.Where("captured_at < ?", now.Add(-usageLiveProjectionWatermarkRetention).Unix()).
+			Delete(&UsageUserQuotaWatermark{}).Error; err != nil {
+			return err
+		}
 		inSQL, args := usageIn("user_id", ids)
 		// 先标为已删除，再 UPSERT 本轮完整读取到的令牌；硬删后旧令牌仍可为
 		// 历史消费补齐名称，但不再被当作现存令牌展示。
@@ -3188,41 +3203,76 @@ func (m *Monitor) computeUserTokenAggregatesFromFacts(ctx context.Context, uid, 
 // 即使完整性尚未通过也绝不能再回扫生产 logs。调用方会收到可识别的“暂不可用”
 // 错误并做局部降级，避免一个页面请求在高峰期变成三条宽扫描。
 func (m *Monitor) computeUsageStatsForRead(ctx context.Context, ids []int64, fromTs, toTs, tokenID int64) (*UsageStats, error) {
+	return m.computeUsageStatsForReadRange(ctx, ids, fromTs, toTs, toTs, tokenID)
+}
+
+// computeUsageStatsForReadRange keeps the authoritative fact window separate
+// from the originally requested right edge. The distinction matters around
+// midnight: at 00:10 the last finalized hour ends exactly at today's 00:00,
+// while the requested range already includes today and is eligible for the
+// cumulative-watermark projection.
+func (m *Monitor) computeUsageStatsForReadRange(ctx context.Context, ids []int64, fromTs, factToTs, requestedToTs, tokenID int64) (*UsageStats, error) {
 	if m.usageFactsReadEnabled() {
-		if !m.usageFactsPublishedRangeCovers(fromTs, toTs) {
+		if factToTs > fromTs && !m.usageFactsPublishedRangeCovers(fromTs, factToTs) {
 			return nil, errUsageFactsNotReady
 		}
-		if readyThrough := m.usageFactsReadyThrough.Load(); readyThrough > 0 && toTs > readyThrough {
-			toTs = readyThrough
+		if readyThrough := m.usageFactsReadyThrough.Load(); readyThrough > 0 && factToTs > readyThrough {
+			factToTs = readyThrough
 		}
-		if toTs <= fromTs {
-			return &UsageStats{From: time.Unix(fromTs, 0).In(usageCST).Format("2006-01-02"), To: time.Unix(fromTs, 0).In(usageCST).Format("2006-01-02")}, nil
+		var st *UsageStats
+		var err error
+		if factToTs <= fromTs {
+			displayTo := requestedToTs
+			if displayTo <= fromTs {
+				displayTo = fromTs
+			}
+			st = newUsageStatsRange(fromTs, displayTo)
+		} else {
+			st, err = m.computeUsageStatsFromFacts(ctx, ids, fromTs, factToTs, tokenID)
 		}
-		return m.computeUsageStatsFromFacts(ctx, ids, fromTs, toTs, tokenID)
+		if err == nil {
+			m.projectUsageStatsIfSafe(ctx, st, ids, fromTs, requestedToTs, tokenID, time.Now())
+		}
+		return st, err
 	}
 	if m.usageFactsReadRequested() {
 		return nil, errUsageFactsNotReady
 	}
-	return m.computeUsageStats(ctx, ids, fromTs, toTs, tokenID)
+	return m.computeUsageStats(ctx, ids, fromTs, requestedToTs, tokenID)
 }
 
 func (m *Monitor) computeUsageMatrixForRead(ctx context.Context, ids []int64, fromTs, toTs int64) (*UsageMatrix, error) {
+	return m.computeUsageMatrixForReadRange(ctx, ids, fromTs, toTs, toTs)
+}
+
+func (m *Monitor) computeUsageMatrixForReadRange(ctx context.Context, ids []int64, fromTs, factToTs, requestedToTs int64) (*UsageMatrix, error) {
 	if m.usageFactsReadEnabled() {
-		if !m.usageFactsPublishedRangeCovers(fromTs, toTs) {
+		if factToTs > fromTs && !m.usageFactsPublishedRangeCovers(fromTs, factToTs) {
 			return nil, errUsageFactsNotReady
 		}
-		if readyThrough := m.usageFactsReadyThrough.Load(); readyThrough > 0 && toTs > readyThrough {
-			toTs = readyThrough
+		if readyThrough := m.usageFactsReadyThrough.Load(); readyThrough > 0 && factToTs > readyThrough {
+			factToTs = readyThrough
 		}
-		if toTs <= fromTs {
-			return newUsageMatrixRange(fromTs, fromTs), nil
+		var mx *UsageMatrix
+		var err error
+		if factToTs <= fromTs {
+			displayTo := requestedToTs
+			if displayTo <= fromTs {
+				displayTo = fromTs
+			}
+			mx = newUsageMatrixRange(fromTs, displayTo)
+		} else {
+			mx, err = m.computeUsageMatrixFromFacts(ctx, ids, fromTs, factToTs)
 		}
-		return m.computeUsageMatrixFromFacts(ctx, ids, fromTs, toTs)
+		if err == nil {
+			m.projectUsageMatrixIfSafe(ctx, mx, ids, fromTs, requestedToTs, time.Now())
+		}
+		return mx, err
 	}
 	if m.usageFactsReadRequested() {
 		return nil, errUsageFactsNotReady
 	}
-	return m.computeUsageMatrix(ctx, ids, fromTs, toTs)
+	return m.computeUsageMatrix(ctx, ids, fromTs, requestedToTs)
 }
 
 func (m *Monitor) computeUserTokenAggregatesForRead(ctx context.Context, uid, fromTs, toTs int64) ([]tokenUsageAggregate, error) {

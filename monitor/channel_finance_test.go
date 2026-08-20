@@ -54,6 +54,31 @@ func TestChannelGroupFinanceFormulaAndIncompleteState(t *testing.T) {
 	}
 }
 
+func TestChannelMultiplierGapUsesExactWebsiteGroup(t *testing.T) {
+	const upstreamEffective = 2.0 / 7.0
+	snapshot := channelFinanceSnapshot{
+		siteGroups: map[string]ChannelSaleGroupRate{
+			"codex-0.7x": {Grp: "codex-0.7x", Multiplier: .7},
+			"codex-1.2x": {Grp: "codex-1.2x", Multiplier: 1.2},
+		},
+		domainCosts: map[string]ChannelDomainCost{
+			"codeyu.shop": {Domain: "codeyu.shop", RechargePaid: 1, RechargeCredit: 7},
+		},
+		channelGroupCost: map[int]map[string]ChannelFinanceChannelCost{34: {
+			"codex-0.7x": {ChannelID: 34, Grp: "codex-0.7x", Multiplier: 2, DiscountFactor: 1},
+			"codex-1.2x": {ChannelID: 34, Grp: "codex-1.2x", Multiplier: 2, DiscountFactor: 1},
+		}},
+	}
+	low := snapshot.groupViewForChannel("codeyu.shop", 34, "codex-0.7x")
+	high := snapshot.groupViewForChannel("codeyu.shop", 34, "codex-1.2x")
+	if !low.SiteConfigured || !high.SiteConfigured || math.Abs(low.UpstreamEffectiveMultiplier-upstreamEffective) > 1e-12 || math.Abs(high.UpstreamEffectiveMultiplier-upstreamEffective) > 1e-12 {
+		t.Fatalf("channel cost comparison incomplete: low=%+v high=%+v", low, high)
+	}
+	if math.Abs(low.MultiplierGap-(.7-upstreamEffective)) > 1e-12 || math.Abs(high.MultiplierGap-(1.2-upstreamEffective)) > 1e-12 {
+		t.Fatalf("multiplier gap must use the exact website group: low=%+v high=%+v", low, high)
+	}
+}
+
 func TestChannelGroupFinanceAllowsNegativeMargin(t *testing.T) {
 	snapshot := channelFinanceSnapshot{
 		settings:        ChannelFinanceSetting{FXBenchmark: 7, SiteRechargePaid: 1, SiteRechargeCredit: 1},

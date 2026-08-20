@@ -292,6 +292,12 @@ type UsageStats struct {
 	ByModel          []UsageDim        `json:"by_model"`
 	ByGroupTruncated bool              `json:"by_group_truncated"`
 	ByModelTruncated bool              `json:"by_model_truncated"`
+	// LiveProjectionApplied 表示今日尚未形成最终小时事实的净消费，已使用
+	// users.used_quota 累计水位做了只读补差。它不参与历史 proof，也不会
+	// 改写小时/日事实；小时封口后由权威事实自然接管。
+	LiveProjectionApplied bool  `json:"live_projection_applied,omitempty"`
+	LiveProjectionThrough int64 `json:"live_projection_through,omitempty"`
+	FinalizedThrough      int64 `json:"finalized_through,omitempty"`
 }
 
 // newUsageStatsRange 构造详情统计的空范围骨架。它只提供前端需要的日期边界，
@@ -516,6 +522,11 @@ type UsageMatrix struct {
 	Days  []string          `json:"days"`
 	Users []UsageMatrixUser `json:"users"`
 	Cells []UsageMatrixCell `json:"cells"`
+	// 只补今日总金额，不伪造请求数、模型、渠道或 Token 归属。详细维度仍以
+	// FinalizedThrough 之前的已封口事实为准。
+	LiveProjectionApplied bool  `json:"live_projection_applied,omitempty"`
+	LiveProjectionThrough int64 `json:"live_projection_through,omitempty"`
+	FinalizedThrough      int64 `json:"finalized_through,omitempty"`
 }
 
 // newUsageMatrixRange 构造一个只包含日期轴的矩阵骨架。它不读取主站日志，既用于
@@ -765,6 +776,7 @@ func (m *Monitor) serveUsageMatrix(c *gin.Context) {
 	}
 	requestedRange := newUsageMatrixRange(fromTs, toTs)
 	requestedFrom, requestedTo := requestedRange.From, requestedRange.To
+	requestedToTs := toTs
 	fromTs, toTs = readRange.From, readRange.To
 	// 成员资料/余额与范围消费矩阵是不同的数据域。矩阵暂不可读时仍返回资料列，
 	// 并由前端把范围消费明确标成“不可用”，不能把整页变成错误页或显示假 0。
@@ -782,13 +794,13 @@ func (m *Monitor) serveUsageMatrix(c *gin.Context) {
 		mx = &UsageMatrix{}
 		dataStale, err = m.loadUsageAggregateJSONStaleIfError(
 			c.Request.Context(),
-			m.usageFactCacheKey(adminUsageAggregateKey("matrix", memberFP, 0, 0, fromTs, toTs)),
-			usageAggregateTTL(toTs, time.Now()),
-			toTs,
+			m.usageFactCacheKey(adminUsageAggregateKey("matrix", memberFP, 0, 0, fromTs, requestedToTs)),
+			usageAggregateTTL(requestedToTs, time.Now()),
+			requestedToTs,
 			forceFresh,
 			mx,
 			func() (any, error) {
-				result, err := m.computeUsageMatrixForRead(c.Request.Context(), idsOf(tracked), fromTs, toTs)
+				result, err := m.computeUsageMatrixForReadRange(c.Request.Context(), idsOf(tracked), fromTs, toTs, requestedToTs)
 				if result != nil {
 					// 管理端身份、余额与分组字段在响应阶段实时组装，不进 Redis。
 					result.Users = nil
@@ -868,6 +880,12 @@ func (m *Monitor) serveUsageMatrix(c *gin.Context) {
 		"membership_partial": !memberCoverage.Complete,
 		"active_members":     memberCoverage.Active,
 		"published_members":  memberCoverage.Published,
+	}
+	if mx.LiveProjectionApplied {
+		resp["live_projection_applied"] = true
+		resp["live_projection_through"] = mx.LiveProjectionThrough
+		resp["finalized_through"] = mx.FinalizedThrough
+		resp["live_projection_message"] = usageLiveProjectionMessage(mx.LiveProjectionThrough, mx.FinalizedThrough)
 	}
 	if !memberCoverage.Complete {
 		resp["membership_message"] = fmt.Sprintf("成员事实正在逐个签收，当前可查看 %d/%d 个已完成成员；公司及全站合计在成员齐全前不会生成", memberCoverage.Published, memberCoverage.Active)
@@ -1925,23 +1943,24 @@ func (m *Monitor) serveUsageStats(c *gin.Context) {
 	}
 	requestedRange := newUsageStatsRange(fromTs, toTs)
 	requestedFrom, requestedTo := requestedRange.From, requestedRange.To
+	requestedToTs := toTs
 	fromTs, toTs = readRange.From, readRange.To
 	memberFP := portalMemberFingerprint(selected)
 	forceFresh := usageRefreshRequested(c)
-	cacheTTL := usageAggregateTTL(toTs, time.Now())
+	cacheTTL := usageAggregateTTL(requestedToTs, time.Now())
 	st := requestedRange
 	var dataStale bool
 	if readRange.Available && selectionMembershipComplete {
 		st = newUsageStatsRange(fromTs, toTs)
 		dataStale, err = m.loadUsageAggregateJSONStaleIfError(
 			c.Request.Context(),
-			m.usageFactCacheKey(adminUsageAggregateKey("stats", memberFP, selectedUID, tokenID, fromTs, toTs)),
+			m.usageFactCacheKey(adminUsageAggregateKey("stats", memberFP, selectedUID, tokenID, fromTs, requestedToTs)),
 			cacheTTL,
-			toTs,
+			requestedToTs,
 			forceFresh,
 			st,
 			func() (any, error) {
-				return m.computeUsageStatsForRead(c.Request.Context(), ids, fromTs, toTs, tokenID)
+				return m.computeUsageStatsForReadRange(c.Request.Context(), ids, fromTs, toTs, requestedToTs, tokenID)
 			},
 		)
 	} else {
@@ -1978,6 +1997,12 @@ func (m *Monitor) serveUsageStats(c *gin.Context) {
 		"requested_from":     requestedFrom,
 		"requested_to":       requestedTo,
 		"membership_partial": !selectionMembershipComplete,
+	}
+	if st.LiveProjectionApplied {
+		resp["live_projection_applied"] = true
+		resp["live_projection_through"] = st.LiveProjectionThrough
+		resp["finalized_through"] = st.FinalizedThrough
+		resp["live_projection_message"] = usageLiveProjectionMessage(st.LiveProjectionThrough, st.FinalizedThrough)
 	}
 	if !selectionMembershipComplete {
 		resp["membership_message"] = "所选汇总仍有成员尚未完成事实签收，当前拒绝生成不完整合计；可先查看已签收的单个成员"

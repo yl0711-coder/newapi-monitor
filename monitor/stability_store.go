@@ -99,8 +99,8 @@ type StabilityRejectHour struct {
 	Count  int64
 }
 
-// StabilityProblemSample 按分钟保存原始错误签名的客观计数。
-// Message 保留 logs.content 原文；SignatureHash 只用于稳定主键，不参与展示或归因。
+// StabilityProblemSample 按分钟保存脱敏错误签名的客观计数。
+// Message 只保留规范化摘要；SignatureHash 只用于稳定主键，不参与展示或归因。
 // Source 为 newapi/nginx_access/nginx_error/pre_route，后两类为后续旁路采集预留。
 type StabilityProblemSample struct {
 	BucketTs            int64  `gorm:"primaryKey;autoIncrement:false;index:idx_stability_problem_bucket;index:idx_stability_problem_group_bucket,priority:2;index:idx_stability_problem_channel_bucket,priority:2;index:idx_stability_problem_model_bucket,priority:2"`
@@ -218,7 +218,18 @@ func (s *StabilityProblemStage) BeforeCreate(_ *gorm.DB) error {
 
 const maxStabilityProblemMessage = 4096
 
-var statusCodePattern = regexp.MustCompile(`(?i)(?:status[_ ]?code|http[_ ]?status|response\s+status\s+code|unexpected\s+status|code)\s*(?:[=:]\s*|\s+)([0-9]{3})`)
+var (
+	statusCodePattern         = regexp.MustCompile(`(?i)(?:status[_ ]?code|http[_ ]?status|response\s+status\s+code|unexpected\s+status|code)\s*(?:[=:]\s*|\s+)([0-9]{3})`)
+	problemSecretKVPattern    = regexp.MustCompile(`(?i)\b(authorization|api[-_ ]?key|access[-_ ]?token|refresh[-_ ]?token|secret)\s*[:=]\s*(?:bearer\s+)?[^\s,;]+`)
+	problemBearerPattern      = regexp.MustCompile(`(?i)\bbearer\s+[a-z0-9._~+/=-]{8,}`)
+	problemKeyPattern         = regexp.MustCompile(`(?i)\b(?:sk|rk|pk|sess|token)-[a-z0-9_-]{8,}`)
+	problemQuerySecretPattern = regexp.MustCompile(`(?i)([?&](?:token|key|api_key|access_token|signature)=)[^&\s]+`)
+	problemEmailPattern       = regexp.MustCompile(`(?i)\b[a-z0-9.!#$%&'*+/=?^_` + "`" + `{|}~-]+@[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+\b`)
+	problemIPv4Pattern        = regexp.MustCompile(`\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}(?::[0-9]{1,5})?\b`)
+	problemUUIDPattern        = regexp.MustCompile(`(?i)\b[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\b`)
+	problemOpaqueIDPattern    = regexp.MustCompile(`\b[a-zA-Z0-9_-]{32,}\b`)
+	problemWhitespacePattern  = regexp.MustCompile(`\s+`)
+)
 
 func stabilityProblemCode(message string) string {
 	if m := statusCodePattern.FindStringSubmatch(message); len(m) == 2 {
@@ -227,10 +238,20 @@ func stabilityProblemCode(message string) string {
 	return ""
 }
 
-// stabilityProblemText 只做存储安全截断，不重写、不翻译、不归类原始错误。
-// 截断按 rune 进行，避免把 UTF-8 字符切坏；调用方必须展示 Truncated 标记。
+// stabilityProblemText 只保留排障所需的规范化摘要。凭据、邮箱、地址和
+// 长标识符在进入本地事实库前即被替换，避免页面/API/备份扩散上游原文。
+// 截断按 rune 进行，避免把 UTF-8 字符切坏。
 func stabilityProblemText(message string) (string, bool) {
 	message = strings.TrimSpace(message)
+	message = problemSecretKVPattern.ReplaceAllString(message, "$1=<redacted>")
+	message = problemBearerPattern.ReplaceAllString(message, "Bearer <redacted>")
+	message = problemKeyPattern.ReplaceAllString(message, "<credential>")
+	message = problemQuerySecretPattern.ReplaceAllString(message, "$1<redacted>")
+	message = problemEmailPattern.ReplaceAllString(message, "<email>")
+	message = problemIPv4Pattern.ReplaceAllString(message, "<ip>")
+	message = problemUUIDPattern.ReplaceAllString(message, "<uuid>")
+	message = problemOpaqueIDPattern.ReplaceAllString(message, "<opaque-id>")
+	message = problemWhitespacePattern.ReplaceAllString(message, " ")
 	runes := []rune(message)
 	if len(runes) <= maxStabilityProblemMessage {
 		return message, false

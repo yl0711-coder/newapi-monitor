@@ -117,7 +117,8 @@ func (m *Monitor) queryStabilityProblems(ctx context.Context, scope stabilitySco
 	}
 	out := make([]StabilityProblem, 0, len(rows)+8)
 	for _, r := range rows {
-		out = append(out, StabilityProblem{Source: r.Source, SignatureHash: r.SignatureHash, Code: r.Code, Message: r.Message, Truncated: r.Truncated, Count: r.Count, FirstTs: r.FirstTs, LastTs: r.LastTs, Groups: splitDistinct(r.Groups), ChannelIDs: splitDistinctInts(r.Channels), Models: splitDistinct(r.Models), AdviceStatus: "knowledge_base_pending_review"})
+		message, redactionTruncated := stabilityProblemText(r.Message)
+		out = append(out, StabilityProblem{Source: r.Source, SignatureHash: r.SignatureHash, Code: r.Code, Message: message, Truncated: r.Truncated || redactionTruncated, Count: r.Count, FirstTs: r.FirstTs, LastTs: r.LastTs, Groups: splitDistinct(r.Groups), ChannelIDs: splitDistinctInts(r.Channels), Models: splitDistinct(r.Models), AdviceStatus: "knowledge_base_pending_review"})
 	}
 
 	// 前置拒绝是用户交付问题，但没有 channel_id；只有未选择厂商/渠道时才加入。

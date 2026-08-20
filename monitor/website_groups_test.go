@@ -9,21 +9,43 @@ import (
 func TestCollectWebsiteGroupSourcesUsesUserVisibleAndSpecialGroups(t *testing.T) {
 	sources, skipped := collectWebsiteGroupSources(
 		[]string{" b ", "a", "a"},
-		map[string]float64{"a": 1.2, "b": 2, "special": 3, "special2": 4, "legacy": 5, "zero": 0, "negative": -1},
+		map[string]float64{"a": 1.2, "b": 2, "special": 3, "special2": 4, "legacy": 5, "hidden": .7, "zero": 0, "negative": -1},
 		map[string]map[string]string{
 			"default": {"-:b": "remove", "special": "", "+:special2": "description", "zero": "", "missing": ""},
 			"vip":     {"negative": "", "-:a": "remove", "append_1": "legacy"},
 		},
+		[]string{" hidden ", "missing-configured"},
 	)
 	got := make([]string, 0, len(sources))
 	for _, source := range sources {
 		got = append(got, source.Name)
 	}
-	if want := []string{"a", "b", "legacy", "special", "special2"}; !reflect.DeepEqual(got, want) {
+	if want := []string{"a", "b", "hidden", "legacy", "special", "special2"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("groups = %v, want %v", got, want)
 	}
-	if skipped != 3 {
-		t.Fatalf("skipped = %d, want 3", skipped)
+	if skipped != 4 {
+		t.Fatalf("skipped = %d, want 4", skipped)
+	}
+}
+
+func TestCollectWebsiteGroupSourcesIncludesProductionSpecialSyntax(t *testing.T) {
+	sources, skipped := collectWebsiteGroupSources(
+		[]string{"codex-1.2x"},
+		map[string]float64{"codex-0.7x": .7, "codex-1.2x": 1.2, "codex-1.4x": 1.4},
+		map[string]map[string]string{
+			"shangtang": {"codex-0.7x": "special user group", "-:codex-1.4x": "remove"},
+		},
+		[]string{"codex-0.7x", "codex-1.2x", "codex-1.4x"},
+	)
+	got := make([]string, 0, len(sources))
+	for _, source := range sources {
+		got = append(got, source.Name)
+	}
+	if want := []string{"codex-0.7x", "codex-1.2x", "codex-1.4x"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("groups = %v, want %v", got, want)
+	}
+	if skipped != 0 {
+		t.Fatalf("skipped = %d, want 0", skipped)
 	}
 }
 
@@ -45,6 +67,9 @@ func TestParseWebsiteGroupRatio(t *testing.T) {
 	}
 	if _, err := parseWebsiteGroupRatio([]byte(`"not-a-number"`)); err == nil {
 		t.Fatal("malformed ratio should fail")
+	}
+	if _, err := parseWebsiteGroupRatio([]byte(`"1.2junk"`)); err == nil {
+		t.Fatal("ratio with trailing garbage should fail")
 	}
 	if isPositiveFiniteWebsiteGroupRatio(math.NaN()) || isPositiveFiniteWebsiteGroupRatio(math.Inf(1)) || isPositiveFiniteWebsiteGroupRatio(0) {
 		t.Fatal("non-positive or non-finite ratios should be rejected")

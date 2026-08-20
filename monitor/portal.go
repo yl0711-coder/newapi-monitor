@@ -912,9 +912,13 @@ type portalOverviewPayload struct {
 	TrendMessage string `json:"trend_message,omitempty"`
 	// MatrixAvailable 只描述“所选范围的每日消费矩阵”是否可读；成员资料、当前余额和
 	// 累计消耗是独立资料域，即使这里为 false 也必须继续返回，不能把整页降成 500。
-	MatrixAvailable bool   `json:"matrix_available"`
-	MatrixStale     bool   `json:"matrix_stale"`
-	MatrixMessage   string `json:"matrix_message,omitempty"`
+	MatrixAvailable       bool   `json:"matrix_available"`
+	MatrixStale           bool   `json:"matrix_stale"`
+	MatrixMessage         string `json:"matrix_message,omitempty"`
+	LiveProjectionApplied bool   `json:"live_projection_applied,omitempty"`
+	LiveProjectionThrough int64  `json:"live_projection_through,omitempty"`
+	FinalizedThrough      int64  `json:"finalized_through,omitempty"`
+	LiveProjectionMessage string `json:"live_projection_message,omitempty"`
 }
 
 // portalBreakdownPayload 是门户“按分组/按模型”的独立数据域。Available=false 时，
@@ -963,18 +967,18 @@ func (m *Monitor) loadPortalGroupMatrix(
 	gid int64,
 	memberFP string,
 	ids []int64,
-	fromTs, toTs int64,
+	fromTs, factToTs, requestedToTs int64,
 ) (*UsageMatrix, bool, error) {
 	out := &UsageMatrix{}
 	stale, err := m.loadUsageAggregateJSONStaleIfError(
 		ctx,
-		m.usageFactCacheKey(portalGroupAggregateKey("matrix", gid, memberFP, fromTs, toTs)),
-		usageAggregateTTL(toTs, time.Now()),
-		toTs,
+		m.usageFactCacheKey(portalGroupAggregateKey("matrix", gid, memberFP, fromTs, requestedToTs)),
+		usageAggregateTTL(requestedToTs, time.Now()),
+		requestedToTs,
 		false,
 		out,
 		func() (any, error) {
-			mx, err := m.computeUsageMatrixForRead(ctx, ids, fromTs, toTs)
+			mx, err := m.computeUsageMatrixForReadRange(ctx, ids, fromTs, factToTs, requestedToTs)
 			if err != nil {
 				return nil, err
 			}
@@ -997,18 +1001,18 @@ func (m *Monitor) loadPortalGroupStats(
 	gid int64,
 	memberFP string,
 	ids []int64,
-	fromTs, toTs int64,
+	fromTs, factToTs, requestedToTs int64,
 ) (*UsageStats, bool, error) {
 	out := &UsageStats{}
 	stale, err := m.loadUsageAggregateJSONStaleIfError(
 		ctx,
-		m.usageFactCacheKey(portalGroupAggregateKey("stats", gid, memberFP, fromTs, toTs)),
-		usageAggregateTTL(toTs, time.Now()),
-		toTs,
+		m.usageFactCacheKey(portalGroupAggregateKey("stats", gid, memberFP, fromTs, requestedToTs)),
+		usageAggregateTTL(requestedToTs, time.Now()),
+		requestedToTs,
 		false,
 		out,
 		func() (any, error) {
-			st, err := m.computeUsageStatsForRead(ctx, ids, fromTs, toTs, 0)
+			st, err := m.computeUsageStatsForReadRange(ctx, ids, fromTs, factToTs, requestedToTs, 0)
 			if err != nil {
 				return nil, err
 			}
@@ -1049,6 +1053,7 @@ func (m *Monitor) buildPortalOverview(c *gin.Context, gid, fromTs, toTs int64) (
 		return nil, err
 	}
 	requestedRange := newUsageMatrixRange(fromTs, toTs)
+	requestedToTs := toTs
 	p := &portalOverviewPayload{
 		GroupName: g.Name, TrendAvailable: true, MatrixAvailable: true,
 		RequestedFrom: requestedRange.From, RequestedTo: requestedRange.To,
@@ -1086,7 +1091,7 @@ func (m *Monitor) buildPortalOverview(c *gin.Context, gid, fromTs, toTs int64) (
 		p.RangePartial = false
 		p.MatrixMessage = usageMatrixCellBudgetMessage(len(tracked), fromTs, toTs)
 	} else {
-		mx, matrixStale, matrixErr = m.loadPortalGroupMatrix(c.Request.Context(), gid, memberFP, ids, fromTs, toTs)
+		mx, matrixStale, matrixErr = m.loadPortalGroupMatrix(c.Request.Context(), gid, memberFP, ids, fromTs, toTs, requestedToTs)
 	}
 	if matrixErr != nil {
 		if c.Request.Context().Err() != nil {
@@ -1134,6 +1139,12 @@ func (m *Monitor) buildPortalOverview(c *gin.Context, gid, fromTs, toTs int64) (
 	}
 	sortPortalUsers(p.Users)
 	p.From, p.To, p.Days, p.Cells = mx.From, mx.To, mx.Days, mx.Cells
+	if mx.LiveProjectionApplied {
+		p.LiveProjectionApplied = true
+		p.LiveProjectionThrough = mx.LiveProjectionThrough
+		p.FinalizedThrough = mx.FinalizedThrough
+		p.LiveProjectionMessage = usageLiveProjectionMessage(mx.LiveProjectionThrough, mx.FinalizedThrough)
+	}
 	// 当核心每日矩阵已经明确无法读取时，不再在同一个页面请求中继续触发另一条
 	// 依赖 logs 的趋势聚合。这样既保留用户资料/余额/累计消耗，也避免源库故障时
 	// 一次打开门户连续发起两次无效扫描。矩阵正常时，趋势仍是独立数据域。
@@ -1143,7 +1154,7 @@ func (m *Monitor) buildPortalOverview(c *gin.Context, gid, fromTs, toTs int64) (
 		return p, nil
 	}
 	// 趋势和矩阵刻意分域：趋势失败时，保留已成功取得的矩阵和资料。
-	st, statsStale, err := m.loadPortalGroupStats(c.Request.Context(), gid, memberFP, ids, fromTs, toTs)
+	st, statsStale, err := m.loadPortalGroupStats(c.Request.Context(), gid, memberFP, ids, fromTs, toTs, requestedToTs)
 	if err != nil {
 		if c.Request.Context().Err() != nil {
 			return nil, err
@@ -1156,6 +1167,12 @@ func (m *Monitor) buildPortalOverview(c *gin.Context, gid, fromTs, toTs int64) (
 	p.DailyByModel = st.DailyByModel
 	p.ByModel = st.ByModel
 	p.ByModelTruncated = st.ByModelTruncated
+	if st.LiveProjectionApplied && !p.LiveProjectionApplied {
+		p.LiveProjectionApplied = true
+		p.LiveProjectionThrough = st.LiveProjectionThrough
+		p.FinalizedThrough = st.FinalizedThrough
+		p.LiveProjectionMessage = usageLiveProjectionMessage(st.LiveProjectionThrough, st.FinalizedThrough)
+	}
 	if stale, message := m.usageDataStaleness(statsStale, fromTs, toTs, time.Now()); stale {
 		p.TrendStale = true
 		p.TrendMessage = message
@@ -1189,6 +1206,7 @@ func (m *Monitor) portalBreakdown(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
+	requestedToTs := toTs
 	tracked, err := m.portalTrackedMembersForUsageRead(c.Request.Context(), gid)
 	if err != nil {
 		slog.Warn("查询客户组成员失败", "gid", gid, "err", err)
@@ -1218,7 +1236,7 @@ func (m *Monitor) portalBreakdown(c *gin.Context) {
 		return
 	}
 	st, statsStale, err := m.loadPortalGroupStats(
-		c.Request.Context(), gid, portalMemberFingerprint(tracked), ids, fromTs, toTs,
+		c.Request.Context(), gid, portalMemberFingerprint(tracked), ids, fromTs, toTs, requestedToTs,
 	)
 	if err != nil {
 		if abortCanceledUsageRequest(c, err) {
@@ -1298,22 +1316,23 @@ func (m *Monitor) portalUserDetail(c *gin.Context) {
 	}
 	requestedRange := newUsageStatsRange(fromTs, toTs)
 	requestedFrom, requestedTo := requestedRange.From, requestedRange.To
+	requestedToTs := toTs
 	fromTs, toTs = readRange.From, readRange.To
 	memberFP := portalMemberFingerprint(servingTracked)
-	cacheTTL := usageAggregateTTL(toTs, time.Now())
+	cacheTTL := usageAggregateTTL(requestedToTs, time.Now())
 	st := requestedRange
 	var dataStale bool
 	if statsMemberReady && readRange.Available {
 		st = newUsageStatsRange(fromTs, toTs)
 		dataStale, err = m.loadUsageAggregateJSONStaleIfError(
 			c.Request.Context(),
-			m.usageFactCacheKey(portalUserAggregateKey("stats", gid, memberFP, uid, tokenID, fromTs, toTs)),
+			m.usageFactCacheKey(portalUserAggregateKey("stats", gid, memberFP, uid, tokenID, fromTs, requestedToTs)),
 			cacheTTL,
-			toTs,
+			requestedToTs,
 			false,
 			st,
 			func() (any, error) {
-				return m.computeUsageStatsForRead(c.Request.Context(), []int64{uid}, fromTs, toTs, tokenID)
+				return m.computeUsageStatsForReadRange(c.Request.Context(), []int64{uid}, fromTs, toTs, requestedToTs, tokenID)
 			},
 		)
 	} else {
@@ -1436,6 +1455,12 @@ func (m *Monitor) portalUserDetail(c *gin.Context) {
 		"range_message":        readRange.Message,
 		"requested_from":       requestedFrom,
 		"requested_to":         requestedTo,
+	}
+	if st.LiveProjectionApplied {
+		data["live_projection_applied"] = true
+		data["live_projection_through"] = st.LiveProjectionThrough
+		data["finalized_through"] = st.FinalizedThrough
+		data["live_projection_message"] = usageLiveProjectionMessage(st.LiveProjectionThrough, st.FinalizedThrough)
 	}
 	if dataStale {
 		data["data_stale"] = true
