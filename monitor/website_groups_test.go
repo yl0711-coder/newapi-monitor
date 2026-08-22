@@ -1,6 +1,7 @@
 package monitor
 
 import (
+	"encoding/json"
 	"math"
 	"reflect"
 	"testing"
@@ -73,6 +74,34 @@ func TestParseWebsiteGroupRatio(t *testing.T) {
 	}
 	if isPositiveFiniteWebsiteGroupRatio(math.NaN()) || isPositiveFiniteWebsiteGroupRatio(math.Inf(1)) || isPositiveFiniteWebsiteGroupRatio(0) {
 		t.Fatal("non-positive or non-finite ratios should be rejected")
+	}
+}
+
+func TestMergeWebsiteGroupRatiosIncludesSpecialOnlyAuthoritativeGroup(t *testing.T) {
+	ratios, err := mergeWebsiteGroupRatios(
+		map[string]json.RawMessage{
+			"codex-1.2x": json.RawMessage(`1.2`),
+			"shared":     json.RawMessage(`1`),
+		},
+		`{"codex-0.7x":0.7,"shared":1.1,"invalid":0}`,
+	)
+	if err != nil {
+		t.Fatalf("merge ratios: %v", err)
+	}
+	if got := ratios["codex-0.7x"]; got != .7 {
+		t.Fatalf("special-only ratio = %v, want 0.7", got)
+	}
+	if got := ratios["shared"]; got != 1.1 {
+		t.Fatalf("authoritative ratio = %v, want 1.1", got)
+	}
+	if _, ok := ratios["invalid"]; ok {
+		t.Fatal("non-positive authoritative ratio must be rejected")
+	}
+}
+
+func TestMergeWebsiteGroupRatiosRejectsMalformedAuthoritativeOption(t *testing.T) {
+	if _, err := mergeWebsiteGroupRatios(nil, `{`); err == nil {
+		t.Fatal("malformed GroupRatio option must fail closed")
 	}
 }
 

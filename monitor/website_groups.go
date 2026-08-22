@@ -25,6 +25,7 @@ import (
 
 const (
 	websiteGroupSpecialOption = "group_ratio_setting.group_special_usable_group"
+	websiteGroupRatioOption   = "GroupRatio"
 	maxWebsiteGroupSources    = 500
 	maxWebsiteGroupPayload    = 2 << 20
 )
@@ -173,6 +174,35 @@ func parseWebsiteGroupRatio(raw json.RawMessage) (float64, error) {
 	return value, nil
 }
 
+// mergeWebsiteGroupRatios combines the public pricing view with NewAPI's
+// authoritative GroupRatio option.  /api/pricing intentionally omits groups
+// hidden from ordinary users, while those groups can still be assigned through
+// group_special_usable_group.  The option therefore wins on duplicate names
+// and supplies ratios for special-only/configured-channel groups.
+func mergeWebsiteGroupRatios(public map[string]json.RawMessage, optionRaw string) (map[string]float64, error) {
+	ratios := make(map[string]float64, len(public))
+	merge := func(values map[string]json.RawMessage) {
+		for name, raw := range values {
+			name = strings.TrimSpace(name)
+			value, err := parseWebsiteGroupRatio(raw)
+			if name == "" || err != nil || !isPositiveFiniteWebsiteGroupRatio(value) {
+				continue
+			}
+			ratios[name] = value
+		}
+	}
+	merge(public)
+	if strings.TrimSpace(optionRaw) == "" {
+		return ratios, nil
+	}
+	var authoritative map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(optionRaw), &authoritative); err != nil {
+		return nil, fmt.Errorf("解析 NewAPI GroupRatio 配置失败: %w", err)
+	}
+	merge(authoritative)
+	return ratios, nil
+}
+
 type websiteGroupPricingResponse struct {
 	UsableGroup map[string]json.RawMessage `json:"usable_group"`
 	GroupRatio  map[string]json.RawMessage `json:"group_ratio"`
@@ -207,37 +237,41 @@ func (m *Monitor) fetchWebsiteGroupSources(ctx context.Context) ([]websiteGroupS
 	for name := range pricing.UsableGroup {
 		usable = append(usable, name)
 	}
-	ratios := make(map[string]float64, len(pricing.GroupRatio))
-	for name, raw := range pricing.GroupRatio {
-		value, err := parseWebsiteGroupRatio(raw)
-		if err != nil {
+	special := map[string]map[string]string{}
+	var groupRatioRaw string
+	rows, err := m.prodDB.QueryContext(ctx, "SELECT `key`, `value` FROM options WHERE `key` IN (?, ?)", websiteGroupSpecialOption, websiteGroupRatioOption)
+	if err != nil {
+		return nil, 0, fmt.Errorf("读取 NewAPI 分组配置失败: %w", err)
+	}
+	for rows.Next() {
+		var key string
+		var raw sql.NullString
+		if err := rows.Scan(&key, &raw); err != nil {
+			rows.Close()
+			return nil, 0, fmt.Errorf("读取 NewAPI 分组配置失败: %w", err)
+		}
+		if !raw.Valid || strings.TrimSpace(raw.String) == "" {
 			continue
 		}
-		ratios[name] = value
-	}
-	special := map[string]map[string]string{}
-	rows, err := m.prodDB.QueryContext(ctx, "SELECT `value` FROM options WHERE `key` = ? LIMIT 1", websiteGroupSpecialOption)
-	if err != nil {
-		return nil, 0, fmt.Errorf("读取分组特殊可用配置失败: %w", err)
-	}
-	if rows.Next() {
-		var raw sql.NullString
-		if err := rows.Scan(&raw); err != nil {
-			rows.Close()
-			return nil, 0, fmt.Errorf("读取分组特殊可用配置失败: %w", err)
-		}
-		if raw.Valid && strings.TrimSpace(raw.String) != "" {
+		switch key {
+		case websiteGroupSpecialOption:
 			if err := json.Unmarshal([]byte(raw.String), &special); err != nil {
 				rows.Close()
 				return nil, 0, fmt.Errorf("解析分组特殊可用配置失败: %w", err)
 			}
+		case websiteGroupRatioOption:
+			groupRatioRaw = raw.String
 		}
 	}
 	if err := rows.Err(); err != nil {
 		rows.Close()
-		return nil, 0, fmt.Errorf("读取分组特殊可用配置失败: %w", err)
+		return nil, 0, fmt.Errorf("读取 NewAPI 分组配置失败: %w", err)
 	}
 	rows.Close()
+	ratios, err := mergeWebsiteGroupRatios(pricing.GroupRatio, groupRatioRaw)
+	if err != nil {
+		return nil, 0, err
+	}
 	configured, err := m.loadConfiguredWebsiteGroups(ctx)
 	if err != nil {
 		return nil, 0, err
