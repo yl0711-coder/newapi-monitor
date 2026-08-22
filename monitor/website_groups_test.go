@@ -15,17 +15,16 @@ func TestCollectWebsiteGroupSourcesUsesUserVisibleAndSpecialGroups(t *testing.T)
 			"default": {"-:b": "remove", "special": "", "+:special2": "description", "zero": "", "missing": ""},
 			"vip":     {"negative": "", "-:a": "remove", "append_1": "legacy"},
 		},
-		[]string{" hidden ", "missing-configured"},
 	)
 	got := make([]string, 0, len(sources))
 	for _, source := range sources {
 		got = append(got, source.Name)
 	}
-	if want := []string{"a", "b", "hidden", "legacy", "special", "special2"}; !reflect.DeepEqual(got, want) {
+	if want := []string{"a", "b", "legacy", "special", "special2"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("groups = %v, want %v", got, want)
 	}
-	if skipped != 4 {
-		t.Fatalf("skipped = %d, want 4", skipped)
+	if skipped != 3 {
+		t.Fatalf("skipped = %d, want 3", skipped)
 	}
 }
 
@@ -36,13 +35,12 @@ func TestCollectWebsiteGroupSourcesIncludesProductionSpecialSyntax(t *testing.T)
 		map[string]map[string]string{
 			"shangtang": {"codex-0.7x": "special user group", "-:codex-1.4x": "remove"},
 		},
-		[]string{"codex-0.7x", "codex-1.2x", "codex-1.4x"},
 	)
 	got := make([]string, 0, len(sources))
 	for _, source := range sources {
 		got = append(got, source.Name)
 	}
-	if want := []string{"codex-0.7x", "codex-1.2x", "codex-1.4x"}; !reflect.DeepEqual(got, want) {
+	if want := []string{"codex-0.7x", "codex-1.2x"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("groups = %v, want %v", got, want)
 	}
 	if skipped != 0 {
