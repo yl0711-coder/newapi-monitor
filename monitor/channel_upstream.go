@@ -22,6 +22,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
@@ -42,6 +44,7 @@ const (
 
 	maxChannelUpstreamBody    = 128 << 10
 	maxUpstreamResponseBody   = 1 << 20
+	maxAICodeWithKeyNameRunes = 64
 	defaultNewAPIQuotaPerUSD  = 500000.0
 	upstreamCredentialVersion = 1
 	// 配置页面按行动态添加 Key，不以业务套餐数作人为限制。
@@ -212,6 +215,7 @@ type ChannelUpstreamAccountView struct {
 // actual key and the upstream api_key_id are never returned by an API.
 type AICodeWithKeySlotView struct {
 	SlotID                string `json:"slot_id"`
+	Name                  string `json:"name,omitempty"`
 	Label                 string `json:"label"`
 	Status                string `json:"status,omitempty"`
 	LastSuccessAt         int64  `json:"last_success_at,omitempty"`
@@ -222,19 +226,21 @@ type AICodeWithKeySlotView struct {
 }
 
 type channelUpstreamSaveInput struct {
-	Domain           string   `json:"domain"`
-	Provider         string   `json:"provider"`
-	BaseURL          string   `json:"base_url"`
-	Enabled          *bool    `json:"enabled"`
-	UserID           int64    `json:"user_id"`
-	AccessToken      string   `json:"access_token"`
-	APIKey           string   `json:"api_key"`
-	APIKeys          []string `json:"api_keys"`
-	AddAPIKeys       []string `json:"add_api_keys"`
-	RemoveAPIKeyIDs  []string `json:"remove_api_key_ids"`
-	Email            string   `json:"email"`
-	Password         string   `json:"password"`
-	UsageSyncEnabled *bool    `json:"usage_sync_enabled"`
+	Domain            string                       `json:"domain"`
+	Provider          string                       `json:"provider"`
+	BaseURL           string                       `json:"base_url"`
+	Enabled           *bool                        `json:"enabled"`
+	UserID            int64                        `json:"user_id"`
+	AccessToken       string                       `json:"access_token"`
+	APIKey            string                       `json:"api_key"`
+	APIKeys           []string                     `json:"api_keys"`
+	AddAPIKeys        []string                     `json:"add_api_keys"`
+	AddAPIKeySlots    []aicodeWithKeyAdditionInput `json:"add_api_key_slots"`
+	RenameAPIKeySlots []aicodeWithKeyRenameInput   `json:"rename_api_key_slots"`
+	RemoveAPIKeyIDs   []string                     `json:"remove_api_key_ids"`
+	Email             string                       `json:"email"`
+	Password          string                       `json:"password"`
+	UsageSyncEnabled  *bool                        `json:"usage_sync_enabled"`
 }
 
 type channelUpstreamSyncInput struct {
@@ -270,7 +276,18 @@ type aiCodeWithCredential struct {
 
 type aiCodeWithKeyCredential struct {
 	SlotID string `json:"slot_id"`
+	Name   string `json:"name,omitempty"`
 	Secret string `json:"secret"`
+}
+
+type aicodeWithKeyAdditionInput struct {
+	Name   string `json:"name"`
+	APIKey string `json:"api_key"`
+}
+
+type aicodeWithKeyRenameInput struct {
+	SlotID string `json:"slot_id"`
+	Name   string `json:"name"`
 }
 
 type upstreamBalanceResult struct {
@@ -439,6 +456,67 @@ func newAICodeWithSlotID() (string, error) {
 	return "acw_" + base64.RawURLEncoding.EncodeToString(buf), nil
 }
 
+func normalizeAICodeWithKeyName(value string) (string, error) {
+	name := strings.TrimSpace(value)
+	if !utf8.ValidString(name) || utf8.RuneCountInString(name) > maxAICodeWithKeyNameRunes {
+		return "", fmt.Errorf("AICodeWith Key 名称最多 %d 个字符", maxAICodeWithKeyNameRunes)
+	}
+	for _, r := range name {
+		if unicode.IsControl(r) {
+			return "", fmt.Errorf("AICodeWith Key 名称不能包含控制字符")
+		}
+	}
+	if strings.HasPrefix(strings.ToLower(name), "sk-acw-") {
+		return "", fmt.Errorf("AICodeWith Key 名称不能填写密钥内容")
+	}
+	return name, nil
+}
+
+func normalizeAICodeWithKeyAdditions(values []aicodeWithKeyAdditionInput) ([]aicodeWithKeyAdditionInput, error) {
+	out := make([]aicodeWithKeyAdditionInput, 0, len(values))
+	seen := make(map[string]bool, len(values))
+	for _, value := range values {
+		keys, err := normalizeAICodeWithAPIKeys("", []string{value.APIKey})
+		if err != nil {
+			return nil, err
+		}
+		if len(keys) == 0 {
+			return nil, fmt.Errorf("新增 AICodeWith Key 时必须填写密钥")
+		}
+		if seen[keys[0]] {
+			return nil, fmt.Errorf("新增的 AICodeWith Key 重复")
+		}
+		name, err := normalizeAICodeWithKeyName(value.Name)
+		if err != nil {
+			return nil, err
+		}
+		seen[keys[0]] = true
+		out = append(out, aicodeWithKeyAdditionInput{Name: name, APIKey: keys[0]})
+	}
+	return out, nil
+}
+
+func normalizeAICodeWithKeyRenames(values []aicodeWithKeyRenameInput) ([]aicodeWithKeyRenameInput, error) {
+	out := make([]aicodeWithKeyRenameInput, 0, len(values))
+	seen := make(map[string]bool, len(values))
+	for _, value := range values {
+		id := strings.TrimSpace(value.SlotID)
+		if id == "" || len(id) > 96 || !strings.HasPrefix(id, "acw_") {
+			return nil, fmt.Errorf("待改名的 AICodeWith Key 标识无效")
+		}
+		if seen[id] {
+			return nil, fmt.Errorf("AICodeWith Key 名称更新重复")
+		}
+		name, err := normalizeAICodeWithKeyName(value.Name)
+		if err != nil {
+			return nil, err
+		}
+		seen[id] = true
+		out = append(out, aicodeWithKeyRenameInput{SlotID: id, Name: name})
+	}
+	return out, nil
+}
+
 func normalizeAICodeWithCredential(cred aiCodeWithCredential) (aiCodeWithCredential, error) {
 	seenIDs := make(map[string]bool)
 	seenSecrets := make(map[string]bool)
@@ -465,8 +543,12 @@ func normalizeAICodeWithCredential(cred aiCodeWithCredential) (aiCodeWithCredent
 		if len(id) > 96 || !strings.HasPrefix(id, "acw_") || seenIDs[id] {
 			return fmt.Errorf("AICodeWith Key 标识无效")
 		}
+		name, err := normalizeAICodeWithKeyName(slot.Name)
+		if err != nil {
+			return err
+		}
 		seenIDs[id], seenSecrets[secret] = true, true
-		slots = append(slots, aiCodeWithKeyCredential{SlotID: id, Secret: secret})
+		slots = append(slots, aiCodeWithKeyCredential{SlotID: id, Name: name, Secret: secret})
 		return nil
 	}
 	for _, slot := range cred.Slots {
@@ -503,6 +585,14 @@ func aiCodeWithCredentialKeys(cred aiCodeWithCredential) ([]string, error) {
 }
 
 func applyAICodeWithKeyChanges(existing aiCodeWithCredential, additions, removals []string) (aiCodeWithCredential, error) {
+	structured := make([]aicodeWithKeyAdditionInput, 0, len(additions))
+	for _, secret := range additions {
+		structured = append(structured, aicodeWithKeyAdditionInput{APIKey: secret})
+	}
+	return applyAICodeWithSlotChanges(existing, structured, nil, removals)
+}
+
+func applyAICodeWithSlotChanges(existing aiCodeWithCredential, additions []aicodeWithKeyAdditionInput, renames []aicodeWithKeyRenameInput, removals []string) (aiCodeWithCredential, error) {
 	current, err := normalizeAICodeWithCredential(existing)
 	if err != nil {
 		return aiCodeWithCredential{}, err
@@ -515,12 +605,32 @@ func applyAICodeWithKeyChanges(existing aiCodeWithCredential, additions, removal
 		}
 		remove[id] = true
 	}
+	rename := make(map[string]string, len(renames))
+	for _, update := range renames {
+		id := strings.TrimSpace(update.SlotID)
+		if id == "" || len(id) > 96 || !strings.HasPrefix(id, "acw_") {
+			return aiCodeWithCredential{}, fmt.Errorf("待改名的 AICodeWith Key 标识无效")
+		}
+		if _, exists := rename[id]; exists {
+			return aiCodeWithCredential{}, fmt.Errorf("AICodeWith Key 名称更新重复")
+		}
+		name, nameErr := normalizeAICodeWithKeyName(update.Name)
+		if nameErr != nil {
+			return aiCodeWithCredential{}, nameErr
+		}
+		rename[id] = name
+	}
 	remaining := make([]aiCodeWithKeyCredential, 0, len(current.Slots)+len(additions))
 	found := make(map[string]bool, len(remove))
+	renamed := make(map[string]bool, len(rename))
 	for _, slot := range current.Slots {
 		if remove[slot.SlotID] {
 			found[slot.SlotID] = true
 			continue
+		}
+		if name, ok := rename[slot.SlotID]; ok {
+			slot.Name = name
+			renamed[slot.SlotID] = true
 		}
 		remaining = append(remaining, slot)
 	}
@@ -529,12 +639,27 @@ func applyAICodeWithKeyChanges(existing aiCodeWithCredential, additions, removal
 			return aiCodeWithCredential{}, fmt.Errorf("待删除的 AICodeWith Key 不存在")
 		}
 	}
-	additions, err = normalizeAICodeWithAPIKeys("", additions)
-	if err != nil {
-		return aiCodeWithCredential{}, err
+	for id := range rename {
+		if remove[id] {
+			return aiCodeWithCredential{}, fmt.Errorf("不能同时删除并改名同一把 AICodeWith Key")
+		}
+		if !renamed[id] {
+			return aiCodeWithCredential{}, fmt.Errorf("待改名的 AICodeWith Key 不存在")
+		}
 	}
-	for _, secret := range additions {
-		remaining = append(remaining, aiCodeWithKeyCredential{Secret: secret})
+	for _, addition := range additions {
+		keys, keyErr := normalizeAICodeWithAPIKeys("", []string{addition.APIKey})
+		if keyErr != nil {
+			return aiCodeWithCredential{}, keyErr
+		}
+		if len(keys) == 0 {
+			continue
+		}
+		name, nameErr := normalizeAICodeWithKeyName(addition.Name)
+		if nameErr != nil {
+			return aiCodeWithCredential{}, nameErr
+		}
+		remaining = append(remaining, aiCodeWithKeyCredential{Name: name, Secret: keys[0]})
 	}
 	result, err := normalizeAICodeWithCredential(aiCodeWithCredential{Slots: remaining})
 	if err != nil {
@@ -669,8 +794,12 @@ func (m *Monitor) aicodeWithSlotViews(ctx context.Context, row ChannelUpstreamAc
 	views := make([]AICodeWithKeySlotView, 0, len(normalized.Slots))
 	for i, slot := range normalized.Slots {
 		state := byID[slot.SlotID]
+		label := slot.Name
+		if label == "" {
+			label = fmt.Sprintf("Key %d", i+1)
+		}
 		views = append(views, AICodeWithKeySlotView{
-			SlotID: slot.SlotID, Label: fmt.Sprintf("Key %d", i+1), Status: state.Status,
+			SlotID: slot.SlotID, Name: slot.Name, Label: label, Status: state.Status,
 			LastSuccessAt: state.LastSuccessAt, NextSyncAt: state.NextSyncAt,
 			ConsecutiveFails: state.ConsecutiveFails, BackfillDone: state.BackfillDone,
 			BackfillLastSuccessAt: state.BackfillLastSuccessAt,
@@ -1700,6 +1829,14 @@ func validateChannelUpstreamInput(in *channelUpstreamSaveInput) error {
 		if err != nil {
 			return err
 		}
+		structuredAdditions, err := normalizeAICodeWithKeyAdditions(in.AddAPIKeySlots)
+		if err != nil {
+			return err
+		}
+		renames, err := normalizeAICodeWithKeyRenames(in.RenameAPIKeySlots)
+		if err != nil {
+			return err
+		}
 		seenRemoval := make(map[string]bool, len(in.RemoveAPIKeyIDs))
 		removals := make([]string, 0, len(in.RemoveAPIKeyIDs))
 		for _, id := range in.RemoveAPIKeyIDs {
@@ -1715,6 +1852,8 @@ func validateChannelUpstreamInput(in *channelUpstreamSaveInput) error {
 		in.APIKey = ""
 		in.APIKeys = keys
 		in.AddAPIKeys = additions
+		in.AddAPIKeySlots = structuredAdditions
+		in.RenameAPIKeySlots = renames
 		in.RemoveAPIKeyIDs = removals
 	default:
 		return fmt.Errorf("当前只支持 NewAPI、Sub2API 和 AICodeWith")
@@ -1779,7 +1918,11 @@ func (m *Monitor) saveChannelUpstreamHandler(c *gin.Context) {
 	requestSecrets := []string{in.AccessToken, in.APIKey, in.Password}
 	requestSecrets = append(requestSecrets, in.APIKeys...)
 	requestSecrets = append(requestSecrets, in.AddAPIKeys...)
-	ctx, cancel := context.WithTimeout(c.Request.Context(), upstreamSaveTimeout(m.cfg, in.Provider, len(in.APIKeys)+len(in.AddAPIKeys)))
+	for _, addition := range in.AddAPIKeySlots {
+		requestSecrets = append(requestSecrets, addition.APIKey)
+	}
+	keyChangeCount := len(in.APIKeys) + len(in.AddAPIKeys) + len(in.AddAPIKeySlots)
+	ctx, cancel := context.WithTimeout(c.Request.Context(), upstreamSaveTimeout(m.cfg, in.Provider, keyChangeCount))
 	defer cancel()
 	exists, err := m.channelDomainExists(ctx, in.Domain)
 	if err != nil {
@@ -1820,7 +1963,8 @@ func (m *Monitor) saveChannelUpstreamHandler(c *gin.Context) {
 	}
 	var credential any
 	preserveSealedCredential := false
-	credentialUpdated := in.AccessToken != "" || len(in.APIKeys) > 0 || len(in.AddAPIKeys) > 0 || len(in.RemoveAPIKeyIDs) > 0 || in.Password != ""
+	credentialUpdated := in.AccessToken != "" || len(in.APIKeys) > 0 || len(in.AddAPIKeys) > 0 || len(in.AddAPIKeySlots) > 0 || len(in.RemoveAPIKeyIDs) > 0 || in.Password != ""
+	credentialMetadataChanged := len(in.RenameAPIKeySlots) > 0
 	sameIdentity := existingErr == nil && existing.Provider == in.Provider && existing.BaseURL == in.BaseURL
 	credentialSetChanged := false
 	switch in.Provider {
@@ -1853,7 +1997,14 @@ func (m *Monitor) saveChannelUpstreamHandler(c *gin.Context) {
 			err = fmt.Errorf("首次连接或变更 Sub2API 账户时必须填写登录密码")
 		}
 	case upstreamProviderAICodeWith:
-		additions := append(append([]string(nil), in.APIKeys...), in.AddAPIKeys...)
+		additions := make([]aicodeWithKeyAdditionInput, 0, len(in.APIKeys)+len(in.AddAPIKeys)+len(in.AddAPIKeySlots))
+		for _, secret := range in.APIKeys {
+			additions = append(additions, aicodeWithKeyAdditionInput{APIKey: secret})
+		}
+		for _, secret := range in.AddAPIKeys {
+			additions = append(additions, aicodeWithKeyAdditionInput{APIKey: secret})
+		}
+		additions = append(additions, in.AddAPIKeySlots...)
 		if sameIdentity && existing.Account != "" {
 			var currentAny any
 			currentAny, err = m.credentialForAccount(existing)
@@ -1861,17 +2012,17 @@ func (m *Monitor) saveChannelUpstreamHandler(c *gin.Context) {
 				current, ok := currentAny.(aiCodeWithCredential)
 				if !ok {
 					err = fmt.Errorf("AICodeWith 凭据格式无效")
-				} else if len(additions) > 0 || len(in.RemoveAPIKeyIDs) > 0 {
+				} else if len(additions) > 0 || len(in.RenameAPIKeySlots) > 0 || len(in.RemoveAPIKeyIDs) > 0 {
 					var changed aiCodeWithCredential
-					changed, err = applyAICodeWithKeyChanges(current, additions, in.RemoveAPIKeyIDs)
+					changed, err = applyAICodeWithSlotChanges(current, additions, in.RenameAPIKeySlots, in.RemoveAPIKeyIDs)
 					credential = changed
-					credentialSetChanged = err == nil
+					credentialSetChanged = err == nil && (len(additions) > 0 || len(in.RemoveAPIKeyIDs) > 0)
 				} else {
 					credential, err = normalizeAICodeWithCredential(current)
 				}
 			}
 		} else if len(additions) > 0 && len(in.RemoveAPIKeyIDs) == 0 {
-			credential, err = applyAICodeWithKeyChanges(aiCodeWithCredential{}, additions, nil)
+			credential, err = applyAICodeWithSlotChanges(aiCodeWithCredential{}, additions, nil, nil)
 			credentialSetChanged = err == nil
 			sameIdentity = false
 		} else {
@@ -1933,9 +2084,30 @@ func (m *Monitor) saveChannelUpstreamHandler(c *gin.Context) {
 	in.APIKey = ""
 	in.APIKeys = nil
 	in.AddAPIKeys = nil
+	in.AddAPIKeySlots = nil
+	in.RenameAPIKeySlots = nil
 	in.RemoveAPIKeyIDs = nil
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": sanitizeUpstreamErrorWithSecrets(err, requestSecrets...)})
+		return
+	}
+	labelOnlyChange := row.Provider == upstreamProviderAICodeWith && sameIdentity && credentialMetadataChanged && !credentialSetChanged &&
+		row.Enabled == existing.Enabled && row.UsageSyncEnabled == existing.UsageSyncEnabled
+	if labelOnlyChange {
+		updated := existing
+		updated.UpdatedAt, updated.UpdatedBy = now, row.UpdatedBy
+		cred := credential.(aiCodeWithCredential)
+		if sealErr := m.sealUpstreamAccountCredential(&updated, cred); sealErr != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "保存 Key 名称失败"})
+			return
+		}
+		if persistErr := m.persistAICodeWithAccountChange(ctx, &updated, cred, false); persistErr != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "保存 Key 名称失败"})
+			return
+		}
+		view := upstreamAccountView(updated)
+		view.APIKeySlots = m.aicodeWithSlotViews(ctx, updated)
+		c.JSON(http.StatusOK, gin.H{"account": view})
 		return
 	}
 	if !row.Enabled {

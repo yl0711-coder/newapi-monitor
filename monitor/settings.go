@@ -145,14 +145,6 @@ type Settings struct {
 	// 留空 = 关闭接收接口(POST /internal/rejections 返回 503),不接受任何推送。
 	// 同一 token 也用于 POST /internal/host(各节点主机 agent 推送 OS 内存/磁盘)。
 	IngestToken string // MONITOR_INGEST_TOKEN
-	// 受控客户端结果使用独立 token；不能复用节点采集器 token，否则任一
-	// 节点都能伪装成客户端 cohort 并污染“客户端确认成功率”。留空即关闭。
-	ClientEvidenceToken          string   // MONITOR_CLIENT_EVIDENCE_TOKEN
-	ClientEvidenceAllowedClients []string // MONITOR_CLIENT_EVIDENCE_ALLOWED_CLIENTS, exact family@version
-	// Monitor 自己用来将客户端上报的原始 Request ID /逻辑键立即转为 HMAC。
-	// 它不与 NewAPI 共享，原值绝不落盘。
-	ClientEvidenceHMACSecret string // MONITOR_CLIENT_EVIDENCE_HMAC_SECRET
-
 	// 服务端健康监控(实例/数据库/负载均衡):基于 AWS Lightsail 指标接口拉取。
 	// 默认【关】——关时完全不调 AWS、不影响模型监控与现网行为。
 	InfraEnabled bool // MONITOR_INFRA_ENABLED(=true 才启用主动采样/探测)
@@ -296,17 +288,13 @@ func LoadSettings() Settings {
 		HeartbeatURL:                             env("MONITOR_HEARTBEAT_URL", ""),
 		SiteName:                                 env("MONITOR_SITE_NAME", ""),
 		IngestToken:                              env("MONITOR_INGEST_TOKEN", ""),
-		ClientEvidenceToken:                      env("MONITOR_CLIENT_EVIDENCE_TOKEN", ""),
-		ClientEvidenceAllowedClients:             envCSV("MONITOR_CLIENT_EVIDENCE_ALLOWED_CLIENTS"),
-		ClientEvidenceHMACSecret:                 env("MONITOR_CLIENT_EVIDENCE_HMAC_SECRET", ""),
-
-		InfraEnabled:          env("MONITOR_INFRA_ENABLED", "") == "true",
-		InfraSnapshotReadOnly: env("MONITOR_INFRA_SNAPSHOT_READ_ONLY", "false") == "true",
-		AWSRegion:             env("AWS_REGION", "us-west-2"),
-		InfraSampleSeconds:    envInt("MONITOR_INFRA_SAMPLE_SECONDS", 300),
-		InfraRetentionDays:    envInt("MONITOR_INFRA_RETENTION_DAYS", 7),
-		InfraResources:        env("MONITOR_INFRA_RESOURCES", ""),
-		InfraExcludeResources: envCSV("MONITOR_INFRA_EXCLUDE_RESOURCES"),
+		InfraEnabled:                             env("MONITOR_INFRA_ENABLED", "") == "true",
+		InfraSnapshotReadOnly:                    env("MONITOR_INFRA_SNAPSHOT_READ_ONLY", "false") == "true",
+		AWSRegion:                                env("AWS_REGION", "us-west-2"),
+		InfraSampleSeconds:                       envInt("MONITOR_INFRA_SAMPLE_SECONDS", 300),
+		InfraRetentionDays:                       envInt("MONITOR_INFRA_RETENTION_DAYS", 7),
+		InfraResources:                           env("MONITOR_INFRA_RESOURCES", ""),
+		InfraExcludeResources:                    envCSV("MONITOR_INFRA_EXCLUDE_RESOURCES"),
 
 		InfraMemAvailWarnPct:     envFloat("MONITOR_INFRA_MEM_AVAIL_WARN_PCT", 25),
 		InfraMemAvailBadPct:      envFloat("MONITOR_INFRA_MEM_AVAIL_BAD_PCT", 15),

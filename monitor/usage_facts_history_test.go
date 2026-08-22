@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
@@ -1565,13 +1566,32 @@ func TestRawPagePipelineResumesOnlyLegacyWorkloadPauses(t *testing.T) {
 	}
 }
 
-func TestMemberScopedReadRangeNeverTreatsAnotherMembersUnknownHistoryAsZero(t *testing.T) {
+func TestMemberScopedReadRangeDoesNotLetRecentMemberHidePeerHistory(t *testing.T) {
 	m := newUsageHistoryTestMonitor(t)
 	m.cfg.UsageFactsReadEnabled = true
+	m.usageCache = newUsageResultCacheForTest(newMemoryByteCacheStore(), 32, 4<<20)
 	early := time.Date(2026, 8, 1, 0, 0, 0, 0, usageCST).Unix()
 	late := early + 10*usageFactDaySeconds
 	through := late + 5*usageFactDaySeconds
 	nowUnix := time.Now().Unix()
+	group := CustomerGroup{ID: 91, Name: "新老成员混合客户"}
+	if err := m.storeDB.Create(&group).Error; err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []int64{601, 602} {
+		prepareUsageHistoryCommitMember(t, m, id, 1)
+		if err := m.storeDB.Model(&TrackedUser{}).Where("user_id = ?", id).Update("group_id", group.ID).Error; err != nil {
+			t.Fatal(err)
+		}
+		if err := m.storeDB.Model(&UsageMemberControl{}).Where("user_id = ?", id).Update("current_group_id", group.ID).Error; err != nil {
+			t.Fatal(err)
+		}
+		if err := m.usageFactsStore().Create(&UsageUserSnapshot{
+			UserID: id, Username: fmt.Sprintf("u%d", id), Exists: true, CapturedAt: nowUnix,
+		}).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
 	rows := []UsageFactPublishedMember{
 		{UserID: 601, TrackedRevision: 1, SourceEpoch: m.cfg.UsageFactsHistorySourceEpoch,
 			ClassificationVersion: userTrafficClassificationVersion, QuerySemanticsVersion: usageFactQuerySemanticsVersion,
@@ -1580,10 +1600,12 @@ func TestMemberScopedReadRangeNeverTreatsAnotherMembersUnknownHistoryAsZero(t *t
 			ClassificationVersion: userTrafficClassificationVersion, QuerySemanticsVersion: usageFactQuerySemanticsVersion,
 			SourceFloorHour: late, VerifiedThroughHour: usageFactDayStart(through), PublishedAt: nowUnix},
 	}
-	if err := m.usageFactsStore().Create(&rows).Error; err != nil {
-		t.Fatal(err)
+	seedPublishedUsageFactsForTest(t, m, []int64{601, 602}, early, through)
+	for i := range rows {
+		if err := m.usageFactsStore().Save(&rows[i]).Error; err != nil {
+			t.Fatal(err)
+		}
 	}
-	m.setUsageFactsPublishedReadiness(true, early, through)
 
 	onlyEarly, err := m.resolveUsageAggregateReadRangeForMembers(context.Background(), early, through, []int64{601})
 	if err != nil || !onlyEarly.Available || onlyEarly.Partial || onlyEarly.From != early {
@@ -1593,8 +1615,49 @@ func TestMemberScopedReadRangeNeverTreatsAnotherMembersUnknownHistoryAsZero(t *t
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !mixed.Available || !mixed.Partial || mixed.From != late {
-		t.Fatalf("mixed publication floors did not clip to the newest member proof: %+v", mixed)
+	if !mixed.Available || mixed.Partial || mixed.From != early {
+		t.Fatalf("recent member unexpectedly hid an older peer's signed history: %+v", mixed)
+	}
+	facts := []UsageDailyFact{
+		{DateTs: early, UserID: 601, ChannelID: 1, Grp: "g", ModelName: "m", TokenID: 1,
+			Requests: 3, ConsumeQuota: 3 * quotaPerUSD},
+		{DateTs: late, UserID: 602, ChannelID: 1, Grp: "g", ModelName: "m", TokenID: 2,
+			Requests: 1, ConsumeQuota: quotaPerUSD},
+	}
+	if err := m.usageFactsStore().Create(&facts).Error; err != nil {
+		t.Fatal(err)
+	}
+	matrix, err := m.computeUsageMatrixFromFacts(context.Background(), []int64{601, 602}, mixed.From, mixed.To)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if matrix.From != "2026-08-01" || len(matrix.Days) != 15 || len(matrix.Cells) != 2 {
+		t.Fatalf("mixed-floor matrix lost the older member history: %+v", matrix)
+	}
+	byUser := map[int64]UsageMatrixCell{}
+	for _, cell := range matrix.Cells {
+		byUser[cell.UserID] = cell
+	}
+	if byUser[601].Date != "2026-08-01" || byUser[601].CostUSD != 3 ||
+		byUser[602].Date != "2026-08-11" || byUser[602].CostUSD != 1 {
+		t.Fatalf("per-member applicability boundaries were not preserved: %+v", matrix.Cells)
+	}
+	admin := requestUsageMatrixForTest(t, m, "/usage/matrix?from=2026-08-01&to=2026-08-15")
+	if !admin.MatrixAvailable || admin.RangePartial || admin.Matrix.From != "2026-08-01" ||
+		admin.Matrix.To != "2026-08-15" || len(admin.Matrix.Days) != 15 || len(admin.Matrix.Cells) != 2 {
+		t.Fatalf("administrator matrix was still clipped by the recent member: %+v", admin)
+	}
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodGet, "/api/overview", nil)
+	portal, err := m.buildPortalOverview(c, group.ID, early, through)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !portal.MatrixAvailable || !portal.TrendAvailable || portal.RangePartial ||
+		portal.From != "2026-08-01" || portal.To != "2026-08-15" ||
+		len(portal.Days) != 15 || len(portal.Cells) != 2 || len(portal.Users) != 2 {
+		t.Fatalf("Usage company overview was still clipped by the recent member: %+v", portal)
 	}
 	missing, err := m.resolveUsageAggregateReadRangeForMembers(context.Background(), early, through, []int64{601, 603})
 	if err != nil {

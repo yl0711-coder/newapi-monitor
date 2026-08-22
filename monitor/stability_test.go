@@ -1207,6 +1207,32 @@ func TestStabilityPageIntegrationKeepsExistingMonitorAndPortalBoundaries(t *test
 	}
 }
 
+func TestWithdrawnClientEvidenceFeatureIsNotExposed(t *testing.T) {
+	for _, forbidden := range []string{
+		"/internal/client-outcomes",
+		"/stability/delivery-evidence",
+		"/stability/delivery-timeline",
+		"/stability/delivery-issues",
+		"MONITOR_CLIENT_EVIDENCE_",
+		"可选客户端技术结果",
+		"未接入受控客户端",
+	} {
+		if strings.Contains(pageHTML, forbidden) || strings.Contains(string(stabilityJS), forbidden) {
+			t.Fatalf("已撤回的客户端证据功能仍暴露在前端: %q", forbidden)
+		}
+	}
+
+	gin.SetMode(gin.TestMode)
+	m := newStabilityTestMonitor(t)
+	router := gin.New()
+	m.RegisterRoutes(router)
+	for _, route := range router.Routes() {
+		if strings.Contains(route.Path, "client-outcomes") || strings.Contains(route.Path, "delivery-evidence") || strings.Contains(route.Path, "delivery-timeline") || strings.Contains(route.Path, "delivery-issues") {
+			t.Fatalf("已撤回的客户端证据路由仍存在: %s %s", route.Method, route.Path)
+		}
+	}
+}
+
 func TestStabilityPageIncludesBusinessDateShortcuts(t *testing.T) {
 	for _, shortcut := range []string{
 		`data-stability-preset="today">今天`,

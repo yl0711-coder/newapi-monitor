@@ -332,9 +332,8 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
   </section>
 
   <section class="sync-section card">
-    <div class="card-header">🛡 稳定性与问题样本 <span class="muted">历史日志推断、可选客户端结果与冷历史迁移分开显示</span></div>
+    <div class="card-header">🛡 稳定性与问题样本 <span class="muted">历史日志推断、问题采集与冷历史迁移</span></div>
     <div class="sync-kv" id="syncStability"><div>加载中…</div></div>
-    <div class="sync-kv" id="syncDelivery" style="margin-top:1px"><div>可选客户端证据加载中…</div></div>
   </section>
 </div>
 
@@ -410,15 +409,15 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
 <div class="tabpane stability-page" id="tab-stability" hidden>
   <div class="stability-module-tabs">
     <div>
-      <button type="button" class="active" data-stability-view="history"><b>稳定性总览</b><small>可选客户端结果 / 历史日志推断</small></button>
-      <button type="button" data-stability-view="problems"><b>问题与证据</b><small>客户端技术失败 / 历史脱敏问题签名</small></button>
+      <button type="button" class="active" data-stability-view="history"><b>稳定性总览</b><small>历史日志推断</small></button>
+      <button type="button" data-stability-view="problems"><b>问题与证据</b><small>历史脱敏问题签名</small></button>
     </div>
     <div class="stability-source-mini" id="stSourceMini"><span><i class="wait"></i>数据状态加载中</span></div>
   </div>
 
   <section id="stHistoryView">
     <div class="stability-toolbar">
-      <div><h2>稳定性总览</h2><p>各证据层分别陈述结论；没有客户端结果时不会用服务端数据冒充用户侧成功。</p></div>
+      <div><h2>稳定性总览</h2><p>基于中转站历史日志还原请求稳定性；该口径不等同于用户侧最终感知。</p></div>
       <div class="stability-range">
         <button type="button" data-stability-preset="today">今天</button>
         <button type="button" data-stability-preset="yesterday">昨天</button>
@@ -432,14 +431,12 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
       </div>
     </div>
 
-    <div id="stEvidenceOverview" class="stability-evidence-overview"><div class="stability-loading"><i class="stability-spinner"></i><span>正在读取流式交付证据台账…</span></div></div>
-
     <div class="stability-layerbar">
       <div class="stability-layer-switch">
-        <button type="button" class="active" data-stability-layer="delivery"><b>历史日志推断</b><small>NewAPI 使用日志 · 非客户端确认结果</small></button>
+        <button type="button" class="active" data-stability-layer="delivery"><b>历史日志推断</b><small>NewAPI 使用日志</small></button>
         <button type="button" data-stability-layer="edge" disabled title="Nginx 旁路采集尚未接入"><b>边缘观察（尚未接入）</b><small>Nginx access · 只能说明 HTTP 观察结果</small></button>
       </div>
-      <div class="stability-layer-note">证据分层统计，绝不互相替代<br>NewAPI 源码保持零改动
+      <div class="stability-layer-note">现有数据只支持平台日志口径<br>NewAPI 源码保持零改动
       </div>
     </div>
 
@@ -462,7 +459,7 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
   <section id="stProblemView" hidden>
     <div class="stability-toolbar">
       <div><h2>问题与证据</h2><p>按脱敏错误签名与规范化摘要聚合；分类不等于根因，不展示上游原始敏感文本。</p></div>
-      <div class="stability-filter-actions"><input id="stRequestLookup" type="search" maxlength="256" autocomplete="off" placeholder="输入 Request ID 查证据"><button type="button" class="stability-link-btn" id="stRequestLookupBtn">查询</button><button type="button" class="stability-link-btn" id="stProblemRefresh">刷新</button></div>
+      <div class="stability-filter-actions"><button type="button" class="stability-link-btn" id="stProblemRefresh">刷新</button></div>
     </div>
     <div class="stability-panel" id="stProblemBody"><div class="stability-loading"><i class="stability-spinner"></i><span>正在聚合原始错误签名…</span></div></div>
   </section>
@@ -583,7 +580,7 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
         <section class="cm-upstream-aicodewith wide cm-upstream-key-field">
           <div class="cm-upstream-key-head"><span>AICodeWith API Keys</span><button type="button" id="cmUpstreamAddAPIKey">+添加 Key</button></div>
           <div class="cm-upstream-key-list" id="cmUpstreamAPIKeyList"></div>
-          <small id="cmUpstreamAPIKeysHelp">每把 Key 单独一行，可按实际数量继续添加。每把 Key 只读自身消费，Monitor 完整取数后原子求和；已配置时全部留空表示保持不变。</small>
+          <small id="cmUpstreamAPIKeysHelp">可为每把 Key 填写便于识别的名称；名称可单独修改，不会重置同步进度或访问上游。每把 Key 只读自身消费，Monitor 完整取数后原子求和。</small>
         </section>
       </section>
       <label class="cm-upstream-enabled"><input id="cmUpstreamEnabled" type="checkbox" checked><span><b>启用后台自动同步</b><small>停用后保留配置和最后余额，但不再访问该上游</small></span></label>
@@ -1558,41 +1555,29 @@ function syncRenderStability(health){
   ].join('');
   return level;
 }
-function syncRenderDelivery(delivery){
-  const s=delivery.summary||{};
-  const level=!delivery.enabled?'warn':(s.conflicts?'bad':s.evidence_sufficient?'ok':'warn');
-  document.getElementById('syncDelivery').innerHTML=[
-    syncKV('受控客户端',delivery.enabled?'已配置':'未接入','可选能力；不要求修改 NewAPI 或 Nginx'),
-    syncKV('结果覆盖',s.coverage==null?'不可判断':(+s.coverage).toFixed(2)+'%',`请求开始 ${fmtNum(s.started)} · 结果回传 ${fmtNum(s.outcomes)}`),
-    syncKV('技术成功率',s.success_rate==null?'不可判断':(+s.success_rate).toFixed(2)+'%',`技术结果 ${fmtNum(s.technical_outcomes)} · 失败 ${fmtNum(s.failures)} · 主动取消 ${fmtNum(s.cancelled)} · 孤儿结果 ${fmtNum(s.orphan_outcomes)}`),
-    syncKV('证据状态',s.evidence_sufficient?'可判断':'样本或覆盖不足',`冲突 ${fmtNum(s.conflicts)} · 最近接收 ${syncTime(s.last_received_at)}`)
-  ].join('');
-  return level;
-}
 function syncRender(data){
-  const ready=data.ready.data||{},facts=data.facts.data||{},history=data.history.data||{},health=data.health.data||{},channels=data.channels.data||{},delivery=data.delivery.data||{};
+  const ready=data.ready.data||{},facts=data.facts.data||{},history=data.history.data||{},health=data.health.data||{},channels=data.channels.data||{};
   const runtimeLevel=syncRenderRuntime(ready,facts);
   const factsLevel=syncRenderFacts(facts,history);
   const channelsLevel=syncRenderChannels(channels);
   const stabilityLevel=syncRenderStability(health);
-  const deliveryLevel=syncRenderDelivery(delivery);
   const readiness=ready.status==='ready'&&!(ready.degraded_reasons||[]).length?'ok':(ready.status==='not_ready'?'bad':'warn');
   document.getElementById('syncOverview').innerHTML=[
     syncCard(readiness,'服务就绪',ready.status==='ready'?'本地服务可用':(ready.status||'不可用'),(ready.degraded_reasons||[]).join('、')||'本地状态已检查'),
     syncCard(factsLevel,'用户用量事实',facts.facts&&facts.facts.read_active?`${fmtNum(history.published_members||0)}/${fmtNum(history.total_members||0)} 成员可用`:'近期窗口同步中',`全历史归档 ${(+history.coverage_percent||0).toFixed(1)}% · ${fmtNum(history.live_ready_members||0)}/${fmtNum(history.total_members||0)} 实时追平`),
     syncCard(channelsLevel,'渠道上游同步',channels.enabled?`${(channels.domains||[]).filter(x=>x.upstream&&x.upstream.configured).length} 个账户`:'未启用','余额与消费状态均来自本地快照'),
-    syncCard(stabilityLevel==='bad'||deliveryLevel==='bad'?'bad':stabilityLevel==='warn'||deliveryLevel==='warn'?'warn':'ok','稳定性采样',health.status||'未启用',delivery.enabled?`客户端回传 ${fmtNum(delivery.summary&&delivery.summary.outcomes)} 条`:(health.problem_live_lag_sec?`问题 Tail 延迟 ${usageFactsDuration(health.problem_live_lag_sec)}`:'客户端证据未接入'))
+    syncCard(stabilityLevel,'稳定性采样',health.status||'未启用',health.problem_live_lag_sec?`问题 Tail 延迟 ${usageFactsDuration(health.problem_live_lag_sec)}`:'历史日志采样状态已检查')
   ].join('');
   document.getElementById('syncUpdated').textContent='本地状态更新：'+new Date().toLocaleTimeString('zh-CN',{hour12:false});
 }
 async function syncLoadStatus(){
   clearTimeout(syncTimer);
   try{
-    const [ready,facts,history,health,channels,delivery]=await Promise.all([
-      syncFetchJSON('/ready'),syncFetchJSON('/usage/facts-status'),syncFetchJSON('/usage/facts-history'),syncFetchJSON('/stability/health'),syncFetchJSON('/channels/report?hours=24'),syncFetchJSON('/stability/delivery-evidence?hours=24&protocol=openai_responses')
+    const [ready,facts,history,health,channels]=await Promise.all([
+      syncFetchJSON('/ready'),syncFetchJSON('/usage/facts-status'),syncFetchJSON('/usage/facts-history'),syncFetchJSON('/stability/health'),syncFetchJSON('/channels/report?hours=24')
     ]);
-    syncRender({ready,facts,history,health,channels,delivery});
-    const errors=[ready,facts,history,health,channels,delivery].filter(x=>!x.ok);
+    syncRender({ready,facts,history,health,channels});
+    const errors=[ready,facts,history,health,channels].filter(x=>!x.ok);
     document.getElementById('syncError').innerHTML=errors.length?`<div class="usage-facts-state warn"><b>部分状态暂不可用</b><span>${errors.map(x=>esc(x.data&&x.data.error||('HTTP '+x.status))).join('；')}</span></div>`:'';
   }catch(e){document.getElementById('syncError').innerHTML=`<div class="usage-facts-state warn"><b>同步状态加载失败</b><span>${esc(e.message)}</span></div>`}
   finally{if(!document.getElementById('tab-sync').hidden)syncTimer=setTimeout(syncLoadStatus,30000)}

@@ -343,11 +343,16 @@ func (m *Monitor) resolveUsageAggregateReadRange(fromTs, toTs int64) usageAggreg
 	return m.resolveUsageAggregateReadRangeWithFloor(fromTs, toTs, m.usageFactsReadyFrom.Load())
 }
 
-// resolveUsageAggregateReadRangeForMembers binds the readable left edge to
-// every member selected by this request. The global publication starts at the
-// earliest signed member, but a group containing a recent-only member is not
-// complete before that member's own signed floor. Using the global minimum
-// here would silently omit that member and turn unknown history into zero.
+// resolveUsageAggregateReadRangeForMembers verifies that every selected member
+// belongs to the current signed publication, then uses the publication's global
+// readable range.  A member's SourceFloorHour is an applicability boundary, not
+// a boundary for its peers: full-history discovery has already proved that the
+// member has no source usage before that hour (account not yet created or a
+// verified known-empty prefix). usageFactsCTE applies that boundary per member.
+//
+// Raising the aggregate left edge to MAX(member.SourceFloorHour) would make one
+// newly-created account hide otherwise complete history for every older member
+// in the company and in the administrator's all-user matrix.
 func (m *Monitor) resolveUsageAggregateReadRangeForMembers(ctx context.Context, fromTs, toTs int64, ids []int64) (usageAggregateReadRange, error) {
 	if !m.usageFactsReadRequested() || !m.usageFactsFullHistoryMode() || len(ids) == 0 || m.usageFactsLocalSnapshotReadOnly() {
 		return m.resolveUsageAggregateReadRange(fromTs, toTs), nil
@@ -376,16 +381,12 @@ func (m *Monitor) resolveUsageAggregateReadRangeForMembers(ctx context.Context, 
 		r.Message = "所选成员的近期用量尚未全部签收，当前拒绝生成不完整合计"
 		return r, nil
 	}
-	requiredFrom := int64(0)
 	for _, row := range rows {
 		if row.SourceFloorHour <= 0 {
 			return usageAggregateReadRange{}, fmt.Errorf("published member floor missing user_id=%d", row.UserID)
 		}
-		if row.SourceFloorHour > requiredFrom {
-			requiredFrom = row.SourceFloorHour
-		}
 	}
-	return m.resolveUsageAggregateReadRangeWithFloor(fromTs, toTs, requiredFrom), nil
+	return m.resolveUsageAggregateReadRange(fromTs, toTs), nil
 }
 
 func (m *Monitor) resolveUsageAggregateReadRangeWithFloor(fromTs, toTs, readyFrom int64) usageAggregateReadRange {

@@ -513,6 +513,47 @@ func TestAICodeWithKeySlotsAppendAndRemoveWithoutReenteringSecrets(t *testing.T)
 	}
 }
 
+func TestAICodeWithKeySlotRenamePreservesIdentityAndSyncVersion(t *testing.T) {
+	initial, err := normalizeAICodeWithCredential(aiCodeWithCredential{Slots: []aiCodeWithKeyCredential{
+		{SlotID: "acw_primary", Name: "旧名称", Secret: "sk-acw-existing-a"},
+		{SlotID: "acw_backup", Secret: "sk-acw-existing-b"},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeVersion, err := aiCodeWithCredentialSetVersion(initial)
+	if err != nil {
+		t.Fatal(err)
+	}
+	changed, err := applyAICodeWithSlotChanges(initial, nil, []aicodeWithKeyRenameInput{{SlotID: "acw_primary", Name: "  Claude 主线路  "}}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	afterVersion, err := aiCodeWithCredentialSetVersion(changed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if beforeVersion != afterVersion {
+		t.Fatalf("rename changed credential-set version: before=%s after=%s", beforeVersion, afterVersion)
+	}
+	if len(changed.Slots) != 2 {
+		t.Fatalf("renamed slots=%+v", changed.Slots)
+	}
+	byID := make(map[string]aiCodeWithKeyCredential, len(changed.Slots))
+	for _, slot := range changed.Slots {
+		byID[slot.SlotID] = slot
+	}
+	if byID["acw_primary"].Name != "Claude 主线路" || byID["acw_primary"].Secret != "sk-acw-existing-a" || byID["acw_backup"].Secret != "sk-acw-existing-b" {
+		t.Fatalf("rename did not preserve slots and secrets: %+v", changed.Slots)
+	}
+	if _, err := applyAICodeWithSlotChanges(changed, nil, []aicodeWithKeyRenameInput{{SlotID: "acw_missing", Name: "未知"}}, nil); err == nil {
+		t.Fatal("unknown slot rename must fail closed")
+	}
+	if _, err := normalizeAICodeWithKeyName("sk-acw-do-not-expose"); err == nil {
+		t.Fatal("a key-shaped label must be rejected")
+	}
+}
+
 func TestAICodeWithPerKeyFailureRedactsReflectedSecret(t *testing.T) {
 	m := newChannelUpstreamTestMonitor(t)
 	const secret = "sk-acw-reflected-secret"

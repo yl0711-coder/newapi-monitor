@@ -228,17 +228,37 @@ func usageAggLess(a, b channelUsageAgg) bool {
 	return a.tokens > b.tokens
 }
 
-func managementGroups(rows map[string]*channelUsageAgg, domain string, channelID int, finance channelFinanceSnapshot) []ChannelManagementGroup {
+func managementGroups(rows map[string]*channelUsageAgg, configuredGroups []string, domain string, channelID int, finance channelFinanceSnapshot) []ChannelManagementGroup {
 	type groupBuild struct {
 		name  string
 		usage channelUsageAgg
 	}
-	build := make([]groupBuild, 0, len(rows))
-	for name, usage := range rows {
-		if name == "" {
+	// 渠道倍率属于渠道配置，不依赖当前查询范围内是否已经产生用量。
+	// 新渠道或低频渠道可能只有 channel_snaps.groups 而没有小时汇总；若只
+	// 返回有用量的分组，前端只能补出空壳分组，已保存的倍率会被误显示为空。
+	groupNames := make(map[string]bool, len(rows)+len(configuredGroups))
+	for name := range rows {
+		if strings.TrimSpace(name) == "" {
 			name = "未标记服务分组"
 		}
-		build = append(build, groupBuild{name: name, usage: *usage})
+		groupNames[name] = true
+	}
+	for _, name := range configuredGroups {
+		if name = strings.TrimSpace(name); name != "" {
+			groupNames[name] = true
+		}
+	}
+	build := make([]groupBuild, 0, len(groupNames))
+	for name := range groupNames {
+		usage := channelUsageAgg{}
+		if row := rows[name]; row != nil {
+			usage = *row
+		} else if name == "未标记服务分组" {
+			if row := rows[""]; row != nil {
+				usage = *row
+			}
+		}
+		build = append(build, groupBuild{name: name, usage: usage})
 	}
 	sort.Slice(build, func(i, j int) bool {
 		if usageAggLess(build[i].usage, build[j].usage) {
@@ -543,7 +563,7 @@ func (m *Monitor) buildChannelManagementReport(ctx context.Context, scope stabil
 				outChannels = append(outChannels, ChannelManagementChannel{
 					ID: ch.ID, Name: ch.Name, Host: ch.BaseHost, Vendor: ch.Vendor, Status: ch.Status, Current: ch.Current,
 					ConfiguredGroups: ch.ConfiguredGroups, ModelCount: ch.ModelCount,
-					Stability: ch.Usage.stability(), Usage: ch.Usage.metrics(), Groups: managementGroups(ch.Groups, ch.BaseDomain, ch.ID, finance),
+					Stability: ch.Usage.stability(), Usage: ch.Usage.metrics(), Groups: managementGroups(ch.Groups, ch.ConfiguredGroups, ch.BaseDomain, ch.ID, finance),
 				})
 			}
 			vendors = append(vendors, ChannelManagementVendor{Name: vendor.Name, Usage: vendor.Usage.metrics(), Channels: outChannels})
@@ -570,7 +590,7 @@ func (m *Monitor) buildChannelManagementReport(ctx context.Context, scope stabil
 			RateConfig:    managementRateConfig(domain, finance),
 			UpstreamUsage: upstreamUsage[domain.Domain],
 			FinanceGroups: managementFinanceGroups(domain.FinanceGroups, domain.Domain, finance),
-			Groups:        managementGroups(domain.Groups, domain.Domain, 0, finance), Vendors: vendors,
+			Groups:        managementGroups(domain.Groups, nil, domain.Domain, 0, finance), Vendors: vendors,
 		})
 	}
 	sort.Slice(responseDomains, func(i, j int) bool {
@@ -658,6 +678,8 @@ func (m *Monitor) buildChannelManagementReport(ctx context.Context, scope stabil
 }
 
 func (m *Monitor) serveChannelManagementReport(c *gin.Context) {
+	// 报表包含刚保存的本地倍率配置，禁止浏览器复用同 URL 的旧响应。
+	c.Header("Cache-Control", "no-store")
 	if !m.cfg.StabilityEnabled {
 		c.JSON(200, gin.H{"enabled": false})
 		return

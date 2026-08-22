@@ -33,6 +33,36 @@ func TestChannelManagementPageIncludesBusinessDateShortcuts(t *testing.T) {
 	}
 }
 
+func TestChannelManagementConfiguredGroupWithoutUsageStillIncludesFinance(t *testing.T) {
+	rate := ChannelFinanceChannelCost{
+		ChannelID: 80, Grp: "codex-1.2x", UpstreamGroupName: "gpt-pro-max",
+		Multiplier: 1, DiscountFactor: 1,
+	}
+	finance := channelFinanceSnapshot{
+		channelGroupCost:     map[int]map[string]ChannelFinanceChannelCost{80: {"codex-1.2x": rate}},
+		channelCanonicalCost: map[int]ChannelFinanceChannelCost{80: rate},
+		channelCostConflict:  map[int]bool{},
+	}
+	groups := managementGroups(map[string]*channelUsageAgg{}, []string{"codex-1.2x"}, "jikesoft.com", 80, finance)
+	if len(groups) != 1 {
+		t.Fatalf("零用量已配置分组数量=%d want 1", len(groups))
+	}
+	if groups[0].Name != "codex-1.2x" || !groups[0].Finance.UpstreamConfigured ||
+		groups[0].Finance.UpstreamGroupName != "gpt-pro-max" || groups[0].Finance.UpstreamMultiplier != 1 {
+		t.Fatalf("零用量已配置分组未返回已保存倍率: %+v", groups[0])
+	}
+}
+
+func TestChannelManagementReportBypassesStaleBrowserCache(t *testing.T) {
+	js := string(channelManagementJS)
+	if !strings.Contains(js, `fetch('/channels/report?'+queryString(),{cache:'no-store'`) {
+		t.Fatal("渠道报表请求必须绕过浏览器缓存")
+	}
+	if strings.Contains(js, `if(data.unchanged){showFinanceMessage('配置没有变化`) {
+		t.Fatal("倍率未变化时也必须刷新报表，不能保留旧弹窗")
+	}
+}
+
 func TestChannelManagementRangeUsesLast24CompletedHours(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	now := time.Date(2026, 8, 12, 16, 37, 45, 0, cstLocation)
@@ -341,8 +371,17 @@ func TestBuildChannelManagementReportGroupsDomainVendorChannelAndServiceGroup(t 
 			openAI = &last.Vendors[i]
 		}
 	}
-	if openAI == nil || len(openAI.Channels) != 1 || openAI.Channels[0].ID != 1 || len(openAI.Channels[0].Groups) != 1 {
+	if openAI == nil || len(openAI.Channels) != 1 || openAI.Channels[0].ID != 1 || len(openAI.Channels[0].Groups) != 2 {
 		t.Fatalf("OpenAI vendor=%+v", openAI)
+	}
+	var zeroUsageConfiguredGroup bool
+	for _, group := range openAI.Channels[0].Groups {
+		if group.Name == "codex-1.2x" && group.Usage.Requests == 0 && group.Usage.Tokens == 0 && group.Usage.CostUSD == 0 {
+			zeroUsageConfiguredGroup = true
+		}
+	}
+	if !zeroUsageConfiguredGroup {
+		t.Fatalf("渠道已关联但零用量的分组应保留在报表中: %+v", openAI.Channels[0].Groups)
 	}
 	if openAI.Channels[0].Host != "temp.last-api.ai" {
 		t.Fatalf("channel host=%q", openAI.Channels[0].Host)

@@ -154,7 +154,7 @@ async function loadReport(){
   if(cm.abort)cm.abort.abort();
   cm.abort=new AbortController();loading();
   try{
-    const res=await fetch('/channels/report?'+queryString(),{headers:{Accept:'application/json'},signal:cm.abort.signal});
+    const res=await fetch('/channels/report?'+queryString(),{cache:'no-store',headers:{Accept:'application/json'},signal:cm.abort.signal});
     if(res.status===401){location.href='/login';return}
     const data=await res.json();
     if(!res.ok)throw new Error(data.error||`HTTP ${res.status}`);
@@ -551,7 +551,8 @@ async function saveFinance(){
       data=await res.json();
     }
     if(!res.ok)throw new Error(data.error||`HTTP ${res.status}`);
-    if(data.unchanged){showFinanceMessage('配置没有变化，当前版本保持不变。');return}
+    // “没有变化”只表示数据库中的值已经相同，当前弹窗仍可能来自保存前
+    // 的旧报表。无论是否创建新版本，都重新读取 SQLite 作为页面真相源。
     closeFinance();cm.loaded=false;await loadReport();
   }catch(error){showFinanceMessage(error.message||'保存失败，请稍后重试。',true)}finally{button.disabled=false}
 }
@@ -573,18 +574,20 @@ function addSavedAICodeWithKeySlot(slot){
   const list=$('cmUpstreamAPIKeyList');if(!list||!slot?.slot_id)return;
   const row=document.createElement('div');row.className='cm-upstream-key-row saved';row.dataset.slotId=slot.slot_id;
   const number=document.createElement('span');number.dataset.apiKeyNumber='';
+  const name=document.createElement('input');name.type='text';name.maxLength=64;name.autocomplete='off';name.className='cm-upstream-api-key-name';name.placeholder='名称，例如：主账号';name.value=slot.name||'';name.dataset.originalName=slot.name||'';name.setAttribute('aria-label',`${slot.label||'已保存 Key'} 的名称`);
   const label=document.createElement('span');label.className='cm-upstream-saved-key';label.textContent=`${slot.label||'已保存 Key'} · ${slot.status==='ok'?'同步正常':slot.status==='error'?'同步异常':'等待同步'}`;
   const remove=document.createElement('button');remove.type='button';remove.dataset.removeApiKey='';remove.textContent='删除';
-  row.append(number,label,remove);list.append(row);refreshAICodeWithKeyRows();
+  row.append(number,name,label,remove);list.append(row);refreshAICodeWithKeyRows();
 }
-function addAICodeWithKeyInput(value=''){
+function addAICodeWithKeyInput(value='',keyName=''){
   const list=$('cmUpstreamAPIKeyList');if(!list)return;
   const row=document.createElement('div');row.className='cm-upstream-key-row';
   const number=document.createElement('span');number.dataset.apiKeyNumber='';
+  const name=document.createElement('input');name.type='text';name.maxLength=64;name.autocomplete='off';name.placeholder='名称，例如：Claude 主线路';name.className='cm-upstream-api-key-name';name.value=keyName;
   const input=document.createElement('input');input.type='password';input.autocomplete='new-password';input.placeholder='sk-acw-...';input.className='cm-upstream-api-key';input.value=value;
   const remove=document.createElement('button');remove.type='button';remove.dataset.removeApiKey='';remove.textContent='删除';
-  row.append(number,input,remove);list.append(row);refreshAICodeWithKeyRows();
-  if(value==='')input.focus();
+  row.append(number,name,input,remove);list.append(row);refreshAICodeWithKeyRows();
+  if(value===''&&keyName==='')name.focus();
 }
 function resetAICodeWithKeyInputs(){
   const list=$('cmUpstreamAPIKeyList');if(!list)return;
@@ -595,16 +598,26 @@ function renderAICodeWithKeySlots(slots){
   cm.removedAICodeWithKeyIDs.clear();list.replaceChildren();
   (slots||[]).forEach(addSavedAICodeWithKeySlot);addAICodeWithKeyInput('');
 }
-function readAICodeWithAPIKeys(){
-  const values=[...document.querySelectorAll('.cm-upstream-api-key')].map(input=>input.value.trim()).filter(Boolean);
-  return [...new Set(values)];
+function readAICodeWithKeyChanges(){
+  const additions=[],renames=[];
+  document.querySelectorAll('.cm-upstream-key-row').forEach(row=>{
+    const name=(row.querySelector('.cm-upstream-api-key-name')?.value||'').trim();
+    if(row.dataset.slotId){
+      const original=row.querySelector('.cm-upstream-api-key-name')?.dataset.originalName||'';
+      if(name!==original)renames.push({slot_id:row.dataset.slotId,name});
+      return;
+    }
+    const apiKey=(row.querySelector('.cm-upstream-api-key')?.value||'').trim();
+    if(apiKey||name)additions.push({name,api_key:apiKey});
+  });
+  return {additions,renames};
 }
 function updateAICodeWithKeyHelp(account){
   const help=$('cmUpstreamAPIKeysHelp');if(!help)return;
   const count=Number(account?.api_key_count)||0;
   help.textContent=count>0
-    ?`已加密保存 ${count} 把 Key。可单独追加或删除，无需重新输入已保存 Key；页面永不回显密钥。`
-    :'每把 Key 单独一行，可按实际数量继续添加。每把 Key 只读自身消费，Monitor 完整取数后原子求和。';
+    ?`已加密保存 ${count} 把 Key。名称可随时修改且不访问上游；可单独追加或删除，无需重新输入已保存 Key，页面永不回显密钥。`
+    :'为每把 Key 填写名称和密钥，可按实际数量继续添加。每把 Key 只读自身消费，Monitor 完整取数后原子求和。';
 }
 function syncUpstreamFields(){
   const provider=$('cmUpstreamProvider')?.value||'newapi';
@@ -680,13 +693,14 @@ async function saveUpstream(){
     payload.email=$('cmUpstreamEmail').value.trim();payload.password=$('cmUpstreamPassword').value;
     if(!payload.email){showUpstreamMessage('请填写 Sub2API 登录邮箱。',true);return}
   }else{
-    payload.add_api_keys=readAICodeWithAPIKeys();payload.remove_api_key_ids=[...cm.removedAICodeWithKeyIDs];
-    if(payload.add_api_keys.some(key=>!key.startsWith('sk-acw-'))){showUpstreamMessage('AICodeWith API Key 格式应为 sk-acw-...，请每把 Key 单独填写一行。',true);return}
+    const keyChanges=readAICodeWithKeyChanges();payload.add_api_key_slots=keyChanges.additions;payload.rename_api_key_slots=keyChanges.renames;payload.remove_api_key_ids=[...cm.removedAICodeWithKeyIDs];
+    if(payload.add_api_key_slots.some(item=>!item.api_key)){showUpstreamMessage('填写 Key 名称后，还需要填写对应的 AICodeWith API Key。',true);return}
+    if(payload.add_api_key_slots.some(item=>!item.api_key.startsWith('sk-acw-'))){showUpstreamMessage('AICodeWith API Key 格式应为 sk-acw-...，请每把 Key 单独填写一行。',true);return}
   }
   const button=$('cmUpstreamSave');button.disabled=true;$('cmUpstreamSync').disabled=true;showUpstreamMessage(payload.enabled?'正在安全连接并读取余额…':'正在停用自动同步…');
   try{
     const res=await fetch('/channels/upstream',{method:'POST',headers:{Accept:'application/json','Content-Type':'application/json'},body:JSON.stringify(payload)});
-    $('cmUpstreamAccessToken').value='';$('cmUpstreamPassword').value='';payload.access_token='';payload.password='';payload.add_api_keys=[];payload.remove_api_key_ids=[];
+    $('cmUpstreamAccessToken').value='';$('cmUpstreamPassword').value='';payload.access_token='';payload.password='';payload.add_api_key_slots=[];payload.rename_api_key_slots=[];payload.remove_api_key_ids=[];
     if(res.status===401){location.href='/login';return}
     const data=await res.json();if(!res.ok)throw new Error(data.error||`HTTP ${res.status}`);
     cm.upstreamConfig={...(cm.upstreamConfig||{}),provider,base_url:baseURL,enabled:payload.enabled,account:data.account};

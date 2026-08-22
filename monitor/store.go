@@ -802,7 +802,6 @@ func (m *Monitor) openStore(path string) error {
 		&StabilityHourIngestState{}, &StabilityBackfillJob{},
 		&ChannelFinanceSetting{}, &ChannelSaleGroupRate{}, &WebsiteGroupCatalog{}, &ChannelDomainCost{}, &ChannelDomainGroupCost{}, &ChannelFinanceChannelCost{}, &ChannelFinanceVersion{},
 		&ChannelUpstreamAccount{}, &ChannelUpstreamUsageHour{}, &AICodeWithKeySyncState{}, &AICodeWithUsageStage{}, &AICodeWithUsageRound{}, &UpstreamHostCircuit{},
-		&ClientDeliveryEvidence{}, &ClientEvidenceIngestBatch{},
 		&InfraSample{}, &HostContainerSnapshot{}, &NginxMinuteSample{}, &NginxIngestBatch{}, &NginxSourceState{},
 		&AlertConfig{}, &AlertLog{}, &TrackedUser{}, &CustomerGroup{}, &UsageMemberControl{}, &UsageMemberAudit{}, &UsageMemberControlMigration{}, &FollowUpLog{}, &UsageSettings{},
 	); err != nil {
@@ -949,7 +948,6 @@ func (m *Monitor) openUsageFactsStore(path string, prechecked bool) error {
 		&UsageHourFact{}, &UsageDailyFact{}, &UsageFactMemberDayState{}, &UsageHourIngestState{}, &UsageFactMemberState{}, &UsageFactMemberHourState{}, &UsageUserSnapshot{}, &UsageUserQuotaWatermark{},
 		&UsageFactPageIngestState{},
 		&UsageTokenSnapshot{}, &UsageFactPublishedMember{}, &UsageFactRepairMember{}, &UsageFactJob{}, &UsageFactRepairRequest{}, &UsageFactSyncState{},
-		&ClientDeliveryEvidence{}, &ClientEvidenceIngestBatch{},
 	); err != nil {
 		return fmt.Errorf("用量事实表迁移失败: %w", err)
 	}

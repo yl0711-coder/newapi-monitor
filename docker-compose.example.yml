@@ -75,10 +75,6 @@ services:
       - MONITOR_STABILITY_AUTO_REPAIR=true
       # 数千小时的分类迁移只能在完成 2h/24h 维护窗 pilot 后显式开启。
       - MONITOR_STABILITY_CLASSIFICATION_MIGRATION_ENABLED=false
-      # 可选受控客户端证据；三项全部留空即关闭，不依赖 NewAPI/Nginx。
-      - MONITOR_CLIENT_EVIDENCE_TOKEN=${MONITOR_CLIENT_EVIDENCE_TOKEN:-}
-      - MONITOR_CLIENT_EVIDENCE_HMAC_SECRET=${MONITOR_CLIENT_EVIDENCE_HMAC_SECRET:-}
-      - MONITOR_CLIENT_EVIDENCE_ALLOWED_CLIENTS=${MONITOR_CLIENT_EVIDENCE_ALLOWED_CLIENTS:-}
       # 可选:
       # Nginx 入口旁路默认保持关闭；两个节点的脱敏日志和采集器验收后再同时取消下列注释。
       # - MONITOR_INGEST_TOKEN=${MONITOR_INGEST_TOKEN:?set in .env}

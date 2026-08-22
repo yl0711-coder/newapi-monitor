@@ -734,10 +734,10 @@ func TestChannelUpstreamAICodeWithHandlerEncryptsKeyAndEnablesUsage(t *testing.T
 	usageEnabled := true
 	payload := channelUpstreamSaveInput{
 		Domain: domain, Provider: upstreamProviderAICodeWith, BaseURL: server.URL,
-		APIKeys: []string{apiKey}, UsageSyncEnabled: &usageEnabled,
+		AddAPIKeySlots: []aicodeWithKeyAdditionInput{{Name: "主账号", APIKey: apiKey}}, UsageSyncEnabled: &usageEnabled,
 	}
 	w := upstreamRouteRequest(t, m, router, roleRoot, http.MethodPost, "/channels/upstream", payload)
-	if w.Code != http.StatusOK || strings.Contains(w.Body.String(), apiKey) || !strings.Contains(w.Body.String(), `"balance_usd":9.75`) {
+	if w.Code != http.StatusOK || strings.Contains(w.Body.String(), apiKey) || !strings.Contains(w.Body.String(), `"balance_usd":9.75`) || !strings.Contains(w.Body.String(), `"name":"主账号"`) {
 		t.Fatalf("save response invalid or leaked API key: status=%d body=%s", w.Code, w.Body.String())
 	}
 	var row ChannelUpstreamAccount
@@ -754,6 +754,82 @@ func TestChannelUpstreamAICodeWithHandlerEncryptsKeyAndEnablesUsage(t *testing.T
 	keys, keysErr := aiCodeWithCredentialKeys(credential)
 	if keysErr != nil || len(keys) != 1 || keys[0] != apiKey {
 		t.Fatalf("encrypted AICodeWith key cannot be recovered: credential=%+v err=%v", credential, keysErr)
+	}
+	if len(credential.Slots) != 1 || credential.Slots[0].Name != "主账号" {
+		t.Fatalf("AICodeWith key name was not stored with the encrypted slot: %+v", credential.Slots)
+	}
+}
+
+func TestChannelUpstreamAICodeWithRenameDoesNotCallUpstreamOrResetProgress(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	var requests atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		_, _ = w.Write([]byte(`{"balance":"99","currency":"USD"}`))
+	}))
+	defer server.Close()
+	domain := normalizeChannelBaseDomain(server.URL)
+	m := newChannelUpstreamTestMonitor(t)
+	if err := m.storeDB.Create(&ChannelSnap{ID: 79, Name: "aicodewith-label", BaseDomain: domain, BaseHost: normalizeChannelBaseHost(server.URL), Status: 1}).Error; err != nil {
+		t.Fatal(err)
+	}
+	cred, err := normalizeAICodeWithCredential(aiCodeWithCredential{Slots: []aiCodeWithKeyCredential{{SlotID: "acw_primary", Secret: "sk-acw-existing-valid"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity, err := aiCodeWithCredentialIdentity(cred)
+	if err != nil {
+		t.Fatal(err)
+	}
+	row := ChannelUpstreamAccount{
+		Domain: domain, Provider: upstreamProviderAICodeWith, BaseURL: server.URL, Account: identity,
+		Enabled: true, BalanceUSD: 88.5, BalanceRaw: 88.5, BalanceUnit: 1, BalanceKnown: true,
+		Status: upstreamStatusOK, LastAttemptAt: 101, LastSuccessAt: 100, NextSyncAt: 999,
+		UsageSyncEnabled: true, UsageStatus: upstreamStatusOK, UsageLastSuccessAt: 90,
+		CreatedAt: 1, UpdatedAt: 2,
+	}
+	if err := m.sealUpstreamAccountCredential(&row, cred); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.persistAICodeWithAccountChange(context.Background(), &row, cred, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.storeDB.Model(&AICodeWithKeySyncState{}).Where("domain = ? AND slot_id = ?", domain, "acw_primary").Updates(map[string]any{
+		"status": upstreamStatusOK, "last_success_at": int64(77), "backfill_cursor": int64(66), "backfill_done": true,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	router := gin.New()
+	router.POST("/channels/upstream", m.requireRole(roleRoot), m.saveChannelUpstreamHandler)
+	usageEnabled, enabled := true, true
+	payload := channelUpstreamSaveInput{
+		Domain: domain, Provider: upstreamProviderAICodeWith, BaseURL: server.URL, Enabled: &enabled, UsageSyncEnabled: &usageEnabled,
+		RenameAPIKeySlots: []aicodeWithKeyRenameInput{{SlotID: "acw_primary", Name: "  Claude 主线路  "}},
+	}
+	w := upstreamRouteRequest(t, m, router, roleRoot, http.MethodPost, "/channels/upstream", payload)
+	if w.Code != http.StatusOK || requests.Load() != 0 || strings.Contains(w.Body.String(), "sk-acw-") || !strings.Contains(w.Body.String(), "Claude 主线路") {
+		t.Fatalf("rename response=%d requests=%d body=%s", w.Code, requests.Load(), w.Body.String())
+	}
+	var stored ChannelUpstreamAccount
+	if err := m.storeDB.First(&stored, "domain = ?", domain).Error; err != nil {
+		t.Fatal(err)
+	}
+	if stored.BalanceUSD != 88.5 || stored.Status != upstreamStatusOK || stored.LastSuccessAt != 100 || stored.NextSyncAt != 999 {
+		t.Fatalf("rename changed account sync state: %+v", stored)
+	}
+	var opened aiCodeWithCredential
+	if err := m.openUpstreamCredential(stored, &opened); err != nil {
+		t.Fatal(err)
+	}
+	if len(opened.Slots) != 1 || opened.Slots[0].SlotID != "acw_primary" || opened.Slots[0].Name != "Claude 主线路" || opened.Slots[0].Secret != "sk-acw-existing-valid" {
+		t.Fatalf("renamed credential=%+v", opened.Slots)
+	}
+	var state AICodeWithKeySyncState
+	if err := m.storeDB.First(&state, "domain = ? AND slot_id = ?", domain, "acw_primary").Error; err != nil {
+		t.Fatal(err)
+	}
+	if state.LastSuccessAt != 77 || state.BackfillCursor != 66 || !state.BackfillDone {
+		t.Fatalf("rename reset key progress: %+v", state)
 	}
 }
 

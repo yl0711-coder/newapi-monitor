@@ -2014,6 +2014,35 @@ func TestPortalExportClaimExpiresAtBoundary(t *testing.T) {
 	}
 }
 
+func TestLogPageCursorRoundTripAndLegacyCompatibility(t *testing.T) {
+	want := logPageCursor{
+		BeforeCreatedAt: 1776744000,
+		BeforeType:      2,
+		BeforeTypeValid: true,
+		BeforeID:        987654,
+		HasBefore:       true,
+		UpperID:         999999,
+		HasUpper:        true,
+	}
+	encoded := encodeLogPageCursor(want)
+	if !strings.HasPrefix(encoded, "v1.") {
+		t.Fatalf("新游标必须是 URL-safe 不透明格式: %q", encoded)
+	}
+	got, err := parseLogPageCursor(encoded)
+	if err != nil || got != want {
+		t.Fatalf("复合游标往返不一致: got=%+v err=%v want=%+v", got, err, want)
+	}
+	legacy, err := parseLogPageCursor("12345")
+	if err != nil || legacy.legacyID != 12345 || encodeLogPageCursor(legacy) != "12345" {
+		t.Fatalf("发布前纯 ID 游标兼容失败: %+v err=%v", legacy, err)
+	}
+	for _, raw := range []string{"-1", "garbage", "v1.bad!", "v1.e30"} {
+		if _, err := parseLogPageCursor(raw); err == nil {
+			t.Fatalf("非法游标应被拒绝: %q", raw)
+		}
+	}
+}
+
 func TestExportPrepareLimiterBlocksConcurrentCountPreflight(t *testing.T) {
 	l := &exportLimiter{last: map[int64]int64{}}
 	now := time.Now().Unix()
@@ -2080,8 +2109,8 @@ func TestPortalLogsParamContract(t *testing.T) {
 	}
 }
 
-// token_name/content 包含搜索不能使用普通 B-tree 前缀索引。宽日期、
-// 过短关键词和带模糊条件的宽导出必须在取得来源查询槽位之前拒绝。
+// content 包含搜索不能使用普通 B-tree 前缀索引。宽日期、
+// 过短关键词和带详情模糊条件的宽导出必须在取得来源查询槽位之前拒绝。
 func TestPortalFuzzyLogSearchBudgetsRejectBeforeSourceQuery(t *testing.T) {
 	m, _, portal := newPortalTestMonitor(t)
 	prodDB, counts := newCountingFakeProdDB(t)
@@ -2099,12 +2128,10 @@ func TestPortalFuzzyLogSearchBudgetsRejectBeforeSourceQuery(t *testing.T) {
 		t.Fatal("登录失败")
 	}
 	cases := []string{
-		"/api/logs?from=2026-01-01&to=2026-02-01&token=ab",                // 32 天 token 包含扫描
-		"/api/logs?from=2026-01-01&to=2026-01-08&detail_kw=abc",           // 8 天 content 包含扫描
-		"/api/logs?from=2026-01-01&to=2026-01-01&token=a",                 // 过短 token
-		"/api/logs?from=2026-01-01&to=2026-01-01&detail_kw=ab",            // 过短 content
-		"/api/logs/export/prepare?from=2026-01-01&to=2026-01-08&token=ab", // 导出 token 最多 7 天
-		"/api/logs/export?from=2026-01-01&to=2026-01-02&detail_kw=abc",    // 导出 content 最多 1 天
+		"/api/logs?from=2026-01-01&to=2026-01-02&detail_kw=abc",        // 2 天 content 包含扫描
+		"/api/logs?from=2026-01-01&to=2026-01-08&detail_kw=abc",        // 8 天 content 包含扫描
+		"/api/logs?from=2026-01-01&to=2026-01-01&detail_kw=ab",         // 过短 content
+		"/api/logs/export?from=2026-01-01&to=2026-01-02&detail_kw=abc", // 导出 content 最多 1 天
 	}
 	for _, path := range cases {
 		counts.reset()
@@ -2124,6 +2151,15 @@ func TestPortalFuzzyLogSearchBudgetsRejectBeforeSourceQuery(t *testing.T) {
 	}
 	if got := counts.logs.Load(); got != 1 {
 		t.Fatalf("合法搜索应仅执行一条 LIMIT 查询，实际 %d", got)
+	}
+
+	counts.reset()
+	exactToken := portalDo(portal, http.MethodGet, "/api/logs?from=2026-01-01&to=2026-02-01&token=alice-token", "", ck)
+	if exactToken.Code != http.StatusOK {
+		t.Fatalf("令牌名精确查询应允许宽时间范围: %d %s", exactToken.Code, exactToken.Body.String())
+	}
+	if got := counts.logs.Load(); got != 1 {
+		t.Fatalf("令牌名精确查询应只执行一条 LIMIT 查询，实际 %d", got)
 	}
 }
 

@@ -1217,6 +1217,32 @@ type LogRow struct {
 	SubSettlement     string   `json:"sub_settlement,omitempty"`      // 订阅结算:预扣/结算差额/最终抵扣三行(\n 分隔)
 	SubRemain         string   `json:"sub_remain,omitempty"`          // 订阅剩余:"remain/total 额度"
 	BillingSource     string   `json:"billing_source,omitempty"`      // other.billing_source,=="subscription" 时前端加"订阅说明"固定提示行
+	sortTypeValid     bool     // 复合游标专用：保留历史 NULL type 的排序语义，不对外输出
+}
+
+// logPageCursor 是使用日志的键集分页位点。新页面按
+// (created_at,type,id) 倒序翻页，与生产现有的时间索引列顺序一致；
+// legacyID 只用于兼容发布前已打开页面携带的纯数字游标。
+// hasUpper/upperID 用于 CSV 预检后冻结快照，排除后续新写入的自增 ID。
+type logPageCursor struct {
+	BeforeCreatedAt int64 `json:"t,omitempty"`
+	BeforeType      int   `json:"y,omitempty"`
+	BeforeTypeValid bool  `json:"v,omitempty"`
+	BeforeID        int64 `json:"i,omitempty"`
+	HasBefore       bool  `json:"b,omitempty"`
+	UpperID         int64 `json:"u,omitempty"`
+	HasUpper        bool  `json:"h,omitempty"`
+	legacyID        int64
+}
+
+func logCursorAfterRow(r LogRow, base logPageCursor) logPageCursor {
+	base.BeforeCreatedAt = r.CreatedAt
+	base.BeforeType = r.Type
+	base.BeforeTypeValid = r.sortTypeValid
+	base.BeforeID = r.ID
+	base.HasBefore = true
+	base.legacyID = 0
+	return base
 }
 
 // logTypeName 日志类型码 → 中文名(与 new-api LogType 常量一致)。
@@ -1697,9 +1723,9 @@ func (m *Monitor) logFilterWhere(ids []int64, fromTs, toTs, memberUID int64, log
 		where += " AND `group` = ?"
 		args = append(args, group)
 	}
-	if tokenName != "" { // 令牌名模糊匹配(参数化+通配符转义,防注入/防 %_ 泛匹配拖慢查询)
-		where += " AND token_name LIKE ? ESCAPE '!'"
-		args = append(args, "%"+escapeLike(tokenName)+"%")
+	if tokenName != "" { // 精确匹配才能使用现有 idx_logs_token_name，避免前置 % 扫描整个时间窗口。
+		where += " AND token_name = ?"
+		args = append(args, tokenName)
 	}
 	if requestID != "" { // request_id 精确匹配,同 new-api GetUserLogs;logs.request_id 有独立索引(idx_logs_request_id)
 		where += " AND request_id = ?"
@@ -1726,6 +1752,60 @@ func escapeLike(s string) string {
 	return strings.NewReplacer("!", "!!", "%", "!%", "_", "!_").Replace(s)
 }
 
+// logSourceClause 只在真实 MySQL 读取层上选择 NewAPI 日志表已验证的
+// 复合索引。Request ID、令牌名和模型都有独立索引，让优化器按实际选择；分组精确筛选优先
+// 使用 (user_id,group,created_at,type)，否则保持现有的单成员/组织时间索引。
+// 本地 SQLite 测试不识别 FORCE INDEX，因此根据真实 driver 类型严格限定。
+func (m *Monitor) logSourceClause(ids []int64, memberUID int64, model, group, tokenName, requestID string) string {
+	if m.prodDB == nil {
+		return "logs"
+	}
+	driverType := strings.ToLower(fmt.Sprintf("%T", m.prodDB.Driver()))
+	if !strings.Contains(driverType, "mysql") {
+		return "logs"
+	}
+	return mysqlLogSourceClause(len(ids), memberUID, model, group, tokenName, requestID)
+}
+
+func mysqlLogSourceClause(memberCount int, memberUID int64, model, group, tokenName, requestID string) string {
+	if requestID != "" || tokenName != "" || model != "" {
+		return "logs"
+	}
+	if group != "" {
+		return "logs FORCE INDEX (idx_logs_user_group_created_type)"
+	}
+	if memberUID > 0 || memberCount == 1 {
+		return "logs FORCE INDEX (idx_user_created_type)"
+	}
+	return "logs FORCE INDEX (idx_created_at_type)"
+}
+
+func appendCompositeLogCursor(where string, args []any, cursor logPageCursor) (string, []any) {
+	if cursor.HasUpper {
+		where += " AND id <= ?"
+		args = append(args, cursor.UpperID)
+	}
+	if cursor.legacyID > 0 {
+		where += " AND id < ?"
+		args = append(args, cursor.legacyID)
+		return where, args
+	}
+	if !cursor.HasBefore {
+		return where, args
+	}
+	if cursor.BeforeTypeValid {
+		// DESC 下 NULL type 排在非 NULL 之后。显式包含 type IS NULL，
+		// 保证迁移前历史行在同秒内不丢失。
+		where += " AND (created_at < ? OR (created_at = ? AND (type < ? OR type IS NULL)) OR (created_at = ? AND type = ? AND id < ?))"
+		args = append(args, cursor.BeforeCreatedAt, cursor.BeforeCreatedAt, cursor.BeforeType,
+			cursor.BeforeCreatedAt, cursor.BeforeType, cursor.BeforeID)
+	} else {
+		where += " AND (created_at < ? OR (created_at = ? AND type IS NULL AND id < ?))"
+		args = append(args, cursor.BeforeCreatedAt, cursor.BeforeCreatedAt, cursor.BeforeID)
+	}
+	return where, args
+}
+
 // countGroupLogs 数一组成员在当前筛选下的日志总条数(供前端算总页数)。只在翻页首页调用一次,翻页时前端复用。
 func (m *Monitor) countGroupLogs(ctx context.Context, ids []int64, fromTs, toTs, memberUID int64, logType int, model, group, tokenName, detailKw, requestID string) (int64, error) {
 	if len(ids) == 0 {
@@ -1739,7 +1819,7 @@ func (m *Monitor) countGroupLogs(ctx context.Context, ids []int64, fromTs, toTs,
 	defer m.releaseUsageDetailGate()
 	where, args := m.logFilterWhere(ids, fromTs, toTs, memberUID, logType, model, group, tokenName, detailKw, requestID)
 	var n int64
-	if err := m.prodDB.QueryRowContext(cctx, "SELECT COUNT(*) FROM logs WHERE "+where, args...).Scan(&n); err != nil {
+	if err := m.prodDB.QueryRowContext(cctx, "SELECT /*+ MAX_EXECUTION_TIME(8000) */ COUNT(*) FROM "+m.logSourceClause(ids, memberUID, model, group, tokenName, requestID)+" WHERE "+where, args...).Scan(&n); err != nil {
 		return 0, fmt.Errorf("日志计数失败: %w", err)
 	}
 	return n, nil
@@ -1761,10 +1841,11 @@ func (m *Monitor) countGroupLogsSnapshot(ctx context.Context, ids []int64, fromT
 	defer m.releaseUsageExportGate()
 	where, args := m.logFilterWhere(ids, fromTs, toTs, memberUID, logType, model, group, tokenName, detailKw, requestID)
 	var maxID int64
-	// ORDER BY id DESC 同真实导出顺序；LIMIT 使用编译期常量，不接收用户输入。
+	// ORDER BY 与真实导出的时间复合游标一致；LIMIT 使用编译期常量，不接收用户输入。
 	// 少于等于上限时 total 精确，超过时固定返回 cap+1 作为“至少超限”的哨兵。
-	q := "SELECT COUNT(*), COALESCE(MAX(id), 0) FROM (SELECT id FROM logs WHERE " + where +
-		" ORDER BY id DESC LIMIT " + strconv.Itoa(portalExportCap+1) + ") AS bounded_export_logs"
+	q := "SELECT /*+ MAX_EXECUTION_TIME(8000) */ COUNT(*), COALESCE(MAX(id), 0) FROM (" +
+		"SELECT id FROM " + m.logSourceClause(ids, memberUID, model, group, tokenName, requestID) + " WHERE " + where +
+		" ORDER BY created_at DESC, type DESC, id DESC LIMIT " + strconv.Itoa(portalExportCap+1) + ") AS bounded_export_logs"
 	if err := m.prodDB.QueryRowContext(cctx, q, args...).Scan(&total, &maxID); err != nil {
 		return 0, 0, fmt.Errorf("日志计数失败: %w", err)
 	}
@@ -1777,24 +1858,39 @@ func (m *Monitor) countGroupLogsSnapshot(ctx context.Context, ids []int64, fromT
 	return total, startCursor, nil
 }
 
-// queryGroupLogs 查一组成员的日志,按 id 倒序游标分页；普通页面走明细泳道。
+// queryGroupLogs 保留旧 ID 游标协议；Portal 新页面走下方的时间复合游标。
 // 全部用户可控值参数化;memberUID 需调用方已校验属本组;limit 由调用方控上限(分页 pageSize+1 / 导出 cap,超限判定在导出侧用 COUNT 探测)。
 // 取 content+other 拼「详情」与首字(only 安全字段);花费/首字/详情按 new-api 的可展示/计时类型口径填。
 func (m *Monitor) queryGroupLogs(ctx context.Context, ids []int64, fromTs, toTs, memberUID int64, logType int, model, group, tokenName, detailKw, requestID string, beforeID int64, limit int) ([]LogRow, error) {
-	return m.queryGroupLogsWithLane(ctx, ids, fromTs, toTs, memberUID, logType, model, group, tokenName, detailKw, requestID, beforeID, limit, false)
+	return m.queryGroupLogsWithLane(ctx, ids, fromTs, toTs, memberUID, logType, model, group, tokenName, detailKw, requestID, logPageCursor{legacyID: beforeID}, limit, false, false)
+}
+
+// queryGroupLogsCursor 是 Portal 新页面的时间索引键集分页路径。
+// 旧 queryGroupLogs 包装保留纯 ID 语义，供发布前页面和现有内部调用平滑过渡。
+func (m *Monitor) queryGroupLogsCursor(ctx context.Context, ids []int64, fromTs, toTs, memberUID int64, logType int, model, group, tokenName, detailKw, requestID string, cursor logPageCursor, limit int) ([]LogRow, error) {
+	optimized := cursor.legacyID == 0
+	return m.queryGroupLogsWithLane(ctx, ids, fromTs, toTs, memberUID, logType, model, group, tokenName, detailKw, requestID, cursor, limit, false, optimized)
 }
 
 // queryGroupLogsForExport 与页面明细口径完全一致，但使用独立 CSV 泳道。
 // 一个慢下载不会占住普通日志页或聚合页的类别锁；共享来源预算仍限制总并发。
 func (m *Monitor) queryGroupLogsForExport(ctx context.Context, ids []int64, fromTs, toTs, memberUID int64, logType int, model, group, tokenName, detailKw, requestID string, beforeID int64, limit int) ([]LogRow, error) {
-	return m.queryGroupLogsWithLane(ctx, ids, fromTs, toTs, memberUID, logType, model, group, tokenName, detailKw, requestID, beforeID, limit, true)
+	return m.queryGroupLogsWithLane(ctx, ids, fromTs, toTs, memberUID, logType, model, group, tokenName, detailKw, requestID, logPageCursor{legacyID: beforeID}, limit, true, false)
 }
 
-func (m *Monitor) queryGroupLogsWithLane(ctx context.Context, ids []int64, fromTs, toTs, memberUID int64, logType int, model, group, tokenName, detailKw, requestID string, beforeID int64, limit int, export bool) ([]LogRow, error) {
+func (m *Monitor) queryGroupLogsForExportCursor(ctx context.Context, ids []int64, fromTs, toTs, memberUID int64, logType int, model, group, tokenName, detailKw, requestID string, cursor logPageCursor, limit int) ([]LogRow, error) {
+	return m.queryGroupLogsWithLane(ctx, ids, fromTs, toTs, memberUID, logType, model, group, tokenName, detailKw, requestID, cursor, limit, true, true)
+}
+
+func (m *Monitor) queryGroupLogsWithLane(ctx context.Context, ids []int64, fromTs, toTs, memberUID int64, logType int, model, group, tokenName, detailKw, requestID string, cursor logPageCursor, limit int, export, optimized bool) ([]LogRow, error) {
 	if len(ids) == 0 {
 		return nil, nil
 	}
-	cctx, cancel := context.WithTimeout(ctx, 25*time.Second) // 导出可能取到 5 万行,给足超时
+	timeout := 10 * time.Second
+	if export {
+		timeout = 15 * time.Second
+	}
+	cctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	if export {
 		if err := m.acquireInteractiveUsageExportGate(cctx); err != nil {
@@ -1808,17 +1904,24 @@ func (m *Monitor) queryGroupLogsWithLane(ctx context.Context, ids []int64, fromT
 	}
 
 	where, args := m.logFilterWhere(ids, fromTs, toTs, memberUID, logType, model, group, tokenName, detailKw, requestID)
-	if beforeID > 0 { // 游标:取比上次末尾更早的(id 近似时间序,倒序翻页,不用深 OFFSET)
-		where += " AND id < ?"
-		args = append(args, beforeID)
-	}
+	where, args = appendCompositeLogCursor(where, args, cursor)
 	// NewAPI 历史版本与迁移数据可能让计数/耗时/流式标记保留 NULL。
 	// 这些字段在客户日志语义上都等价于 0；直接 Scan 到 int64/int 会使
 	// 整个分页返回 500。查询层统一归零，既兼容历史数据，也不改变筛选口径。
-	q := "SELECT id, created_at, COALESCE(username,''), COALESCE(token_name,''), COALESCE(model_name,''), COALESCE(`group`,'')," +
-		" COALESCE(prompt_tokens,0), COALESCE(completion_tokens,0), COALESCE(use_time,0), COALESCE(quota,0), COALESCE(type,0), COALESCE(is_stream,0)," +
+	maxExecutionMS := 3000
+	if export {
+		maxExecutionMS = 8000
+	}
+	fromClause := "logs"
+	orderBy := "id DESC"
+	if optimized {
+		fromClause = m.logSourceClause(ids, memberUID, model, group, tokenName, requestID)
+		orderBy = "created_at DESC, type DESC, id DESC"
+	}
+	q := "SELECT /*+ MAX_EXECUTION_TIME(" + strconv.Itoa(maxExecutionMS) + ") */ id, created_at, COALESCE(username,''), COALESCE(token_name,''), COALESCE(model_name,''), COALESCE(`group`,'')," +
+		" COALESCE(prompt_tokens,0), COALESCE(completion_tokens,0), COALESCE(use_time,0), COALESCE(quota,0), COALESCE(type,0), type IS NOT NULL, COALESCE(is_stream,0)," +
 		" COALESCE(content,''), COALESCE(other,''), COALESCE(request_id,'')" +
-		" FROM logs WHERE " + where + " ORDER BY id DESC LIMIT " + strconv.Itoa(limit)
+		" FROM " + fromClause + " WHERE " + where + " ORDER BY " + orderBy + " LIMIT " + strconv.Itoa(limit)
 	rows, err := m.prodDB.QueryContext(cctx, q, args...)
 	if err != nil {
 		return nil, fmt.Errorf("日志查询失败: %w", err)
@@ -1828,11 +1931,12 @@ func (m *Monitor) queryGroupLogsWithLane(ctx context.Context, ids []int64, fromT
 	for rows.Next() {
 		var r LogRow
 		var quota int64
-		var isStream int
+		var isStream, typeValid int
 		var content, other string
-		if err := rows.Scan(&r.ID, &r.CreatedAt, &r.Member, &r.TokenName, &r.ModelName, &r.Group, &r.PromptTokens, &r.CompletionTokens, &r.UseTime, &quota, &r.Type, &isStream, &content, &other, &r.RequestID); err != nil {
+		if err := rows.Scan(&r.ID, &r.CreatedAt, &r.Member, &r.TokenName, &r.ModelName, &r.Group, &r.PromptTokens, &r.CompletionTokens, &r.UseTime, &quota, &r.Type, &typeValid, &isStream, &content, &other, &r.RequestID); err != nil {
 			return nil, err
 		}
+		r.sortTypeValid = typeValid != 0
 		r.IsStream = isStream != 0
 		o := parseLogOther(other)
 		// 费用仅消费(type=2)有意义:充值/管理/系统在 new-api 里 quota 恒为 0(金额只写在 content),

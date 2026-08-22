@@ -2160,12 +2160,15 @@ func TestQueryGroupLogs(t *testing.T) {
 	if nullable.ID != 10 || nullable.PromptTokens != 0 || nullable.CompletionTokens != 0 || nullable.UseTime != 0 || nullable.CostUSD != 0 || nullable.IsStream {
 		t.Fatalf("NULL 数值字段未安全归零: %+v", nullable)
 	}
-	// 令牌搜索:通配符按字面匹配(%/_ 已转义),"%"搜不到任何行;正常子串仍可搜到
+	// 令牌名精确搜索：不接受通配符或子串，使生产库可使用 token_name 索引。
 	if tw, _ := m.queryGroupLogs(context.Background(), ids, 0, 2000, 0, 0, "", "", "%", "", "", 0, 100); len(tw) != 0 {
 		t.Fatalf("通配符应按字面匹配,搜'%%'应 0 条,得 %d", len(tw))
 	}
-	if tw, _ := m.queryGroupLogs(context.Background(), ids, 0, 2000, 0, 0, "", "", "kA", "", "", 0, 100); len(tw) != 4 {
-		t.Fatalf("子串搜索 kA 应 4 条(tkA,含错误行 id6 与 NULL 行 id10),得 %d", len(tw))
+	if tw, _ := m.queryGroupLogs(context.Background(), ids, 0, 2000, 0, 0, "", "", "tkA", "", "", 0, 100); len(tw) != 4 {
+		t.Fatalf("精确搜索 tkA 应 4 条(含错误行 id6 与 NULL 行 id10),得 %d", len(tw))
+	}
+	if tw, _ := m.queryGroupLogs(context.Background(), ids, 0, 2000, 0, 0, "", "", "kA", "", "", 0, 100); len(tw) != 0 {
+		t.Fatalf("令牌子串不应模糊命中，得 %d", len(tw))
 	}
 	// 详情关键字搜索:普通词只匹配 content 字面;id6(错误类型,content="上游返回 429 限流")现在全局可见,搜"限流"应命中
 	if dk, _ := m.queryGroupLogs(context.Background(), ids, 0, 2000, 0, 0, "", "", "", "限流", "", 0, 100); len(dk) != 1 || dk[0].ID != 6 {
@@ -2216,6 +2219,96 @@ func TestQueryGroupLogs(t *testing.T) {
 		if strings.Contains(blob, "secret-up") || strings.Contains(blob, "channel") {
 			t.Fatalf("渠道泄露: %+v", r)
 		}
+	}
+}
+
+func TestMySQLLogSourceClauseRoutesSelectiveFilters(t *testing.T) {
+	cases := []struct {
+		name                                     string
+		members                                  int
+		memberUID                                int64
+		model, group, tokenName, requestID, want string
+	}{
+		{name: "organization", members: 9, want: "logs FORCE INDEX (idx_created_at_type)"},
+		{name: "single member", members: 9, memberUID: 63, want: "logs FORCE INDEX (idx_user_created_type)"},
+		{name: "one member organization", members: 1, want: "logs FORCE INDEX (idx_user_created_type)"},
+		{name: "group", members: 9, group: "codex-1.4x", want: "logs FORCE INDEX (idx_logs_user_group_created_type)"},
+		{name: "model optimizer", members: 9, model: "gpt-5.5", want: "logs"},
+		{name: "token optimizer", members: 9, tokenName: "token-a", want: "logs"},
+		{name: "request optimizer", members: 9, requestID: "request-a", want: "logs"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := mysqlLogSourceClause(tc.members, tc.memberUID, tc.model, tc.group, tc.tokenName, tc.requestID); got != tc.want {
+				t.Fatalf("source=%q want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestQueryGroupLogsCompositeCursorIsCompleteForSameSecondAndOutOfOrderIDs(t *testing.T) {
+	m := newTestMonitor(t)
+	m.prodDB = newFakeProdDB(t)
+	// ID 刻意不按时间顺序，同一秒同时包含多种 type 和历史 NULL type。
+	// 这覆盖复合游标最容易出现的重复/跳行边界。
+	seed := []struct {
+		id        int64
+		createdAt int64
+		typ       any
+	}{
+		{100, 1999, 6},
+		{2, 2000, nil},
+		{6, 2000, nil},
+		{3, 2000, 2},
+		{5, 2000, 2},
+		{4, 2000, 5},
+		{1, 2001, 1},
+	}
+	for _, row := range seed {
+		if _, err := m.prodDB.Exec("INSERT INTO logs(id,user_id,created_at,type,username) VALUES(?,10,?,?, 'u10')", row.id, row.createdAt, row.typ); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	cursor := logPageCursor{}
+	var got []int64
+	for page := 0; page < 10; page++ {
+		rows, err := m.queryGroupLogsCursor(context.Background(), []int64{10}, 1900, 2100, 0, 0, "", "", "", "", "", cursor, 2)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(rows) == 0 {
+			break
+		}
+		for _, row := range rows {
+			got = append(got, row.ID)
+		}
+		cursor = logCursorAfterRow(rows[len(rows)-1], cursor)
+	}
+	want := []int64{1, 4, 5, 3, 6, 2, 100}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("复合游标分页重复、丢行或排序错误: got=%v want=%v", got, want)
+	}
+}
+
+func TestCompositeLogCursorKeepsExportUpperSnapshot(t *testing.T) {
+	m := newTestMonitor(t)
+	m.prodDB = newFakeProdDB(t)
+	for _, row := range []struct {
+		id, createdAt int64
+	}{{1, 100}, {2, 101}, {3, 102}} {
+		if _, err := m.prodDB.Exec("INSERT INTO logs(id,user_id,created_at,type) VALUES(?,10,?,2)", row.id, row.createdAt); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// 快照只允许 id<=2；即使 id=3 的 created_at 更新，也不得混入。
+	cursor := logPageCursor{HasUpper: true, UpperID: 2}
+	rows, err := m.queryGroupLogsForExportCursor(context.Background(), []int64{10}, 1, 200, 0, 0, "", "", "", "", "", cursor, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 2 || rows[0].ID != 2 || rows[1].ID != 1 {
+		t.Fatalf("导出复合游标未保持预检快照上界: %+v", rows)
 	}
 }
 

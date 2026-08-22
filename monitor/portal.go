@@ -69,13 +69,10 @@ const (
 	portalExportTempFilePrefix         = "export-"
 	portalLoginMaxFails                = 8    // 窗口内最多失败次数(按来源 IP)
 	loginLimiterMaxKeys                = 4096 // 防大量伪造来源把限流表撑大
-	// token_name/content 中间包含查询无法利用普通 B-tree 前缀索引。
+	// content 中间包含查询无法利用普通 B-tree 前缀索引。
 	// 必须同时约束关键词长度和日期窗口，导出又比首页 LIMIT 51 更严。
-	portalTokenFuzzyMaxRange   = 31 * 24 * time.Hour
-	portalDetailFuzzyMaxRange  = 7 * 24 * time.Hour
-	portalExportTokenMaxRange  = 7 * 24 * time.Hour
+	portalDetailFuzzyMaxRange  = 24 * time.Hour
 	portalExportDetailMaxRange = 24 * time.Hour
-	portalTokenFuzzyMinRunes   = 2
 	portalDetailFuzzyMinRunes  = 3
 )
 
@@ -311,6 +308,50 @@ func (m *Monitor) verifyPortalExportClaim(token string, nowUnix int64) (portalEx
 		return portalExportClaim{}, false
 	}
 	return claim, true
+}
+
+// encodeLogPageCursor 把复合位点编成不透明 URL-safe 字符串。游标不是
+// 授权凭证，所有成员范围与筛选仍由服务端从当前会话重建并参数化查询。
+func encodeLogPageCursor(cursor logPageCursor) string {
+	if cursor.legacyID > 0 {
+		return strconv.FormatInt(cursor.legacyID, 10)
+	}
+	if !cursor.HasBefore && !cursor.HasUpper {
+		return "0"
+	}
+	raw, err := json.Marshal(cursor)
+	if err != nil {
+		return "0"
+	}
+	return "v1." + base64.RawURLEncoding.EncodeToString(raw)
+}
+
+func parseLogPageCursor(raw string) (logPageCursor, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || raw == "0" {
+		return logPageCursor{}, nil
+	}
+	// 兼容发布前已打开的 Portal 页面：纯数字游标继续按 ID 倒序。
+	if id, err := strconv.ParseInt(raw, 10, 64); err == nil {
+		if id <= 0 {
+			return logPageCursor{}, errors.New("日志游标无效")
+		}
+		return logPageCursor{legacyID: id}, nil
+	}
+	if !strings.HasPrefix(raw, "v1.") {
+		return logPageCursor{}, errors.New("日志游标无效")
+	}
+	decoded, err := base64.RawURLEncoding.DecodeString(strings.TrimPrefix(raw, "v1."))
+	if err != nil {
+		return logPageCursor{}, errors.New("日志游标无效")
+	}
+	var cursor logPageCursor
+	if json.Unmarshal(decoded, &cursor) != nil || cursor.legacyID != 0 ||
+		(cursor.HasBefore && (cursor.BeforeCreatedAt <= 0 || cursor.BeforeID <= 0)) ||
+		(cursor.HasUpper && cursor.UpperID < 0) || (!cursor.HasBefore && !cursor.HasUpper) {
+		return logPageCursor{}, errors.New("日志游标无效")
+	}
+	return cursor, nil
 }
 
 // ---- 登录限流(来源 IP,窗口内失败次数封顶) ----
@@ -1557,21 +1598,10 @@ func (m *Monitor) portalLogParams(c *gin.Context) (gid int64, ids []int64, membe
 }
 
 // validatePortalLogFuzzyRange 在任何来源 SQL 之前拒绝高风险宽扫。
-// request_id/model/group/member 都是精确匹配，不需要这个额外限制。
+// request_id/model/group/member/token 都是精确匹配，不需要这个额外限制。
 func validatePortalLogFuzzyRange(fromTs, toTs int64, tokenName, detailKw string, export bool) error {
 	window := time.Duration(toTs-fromTs) * time.Second
-	if tokenName != "" {
-		if utf8.RuneCountInString(tokenName) < portalTokenFuzzyMinRunes {
-			return fmt.Errorf("令牌名模糊搜索至少输入 %d 个字符", portalTokenFuzzyMinRunes)
-		}
-		limit := portalTokenFuzzyMaxRange
-		if export {
-			limit = portalExportTokenMaxRange
-		}
-		if window > limit {
-			return fmt.Errorf("令牌名模糊搜索的时间范围最长 %d 天", int(limit/(24*time.Hour)))
-		}
-	}
+	_ = tokenName // 保留查看/导出共用的方法签名。
 	if detailKw != "" {
 		if utf8.RuneCountInString(detailKw) < portalDetailFuzzyMinRunes {
 			return fmt.Errorf("详情模糊搜索至少输入 %d 个字符", portalDetailFuzzyMinRunes)
@@ -1599,8 +1629,12 @@ func (m *Monitor) portalLogs(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"ok": true, "rows": []LogRow{}, "has_more": false})
 		return
 	}
-	beforeID, _ := strconv.ParseInt(c.Query("cursor"), 10, 64)
-	rows, err := m.queryGroupLogs(c.Request.Context(), ids, fromTs, toTs, memberUID, logType, model, group, tokenName, detailKw, requestID, beforeID, portalLogPageSize+1)
+	cursor, err := parseLogPageCursor(c.Query("cursor"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	rows, err := m.queryGroupLogsCursor(c.Request.Context(), ids, fromTs, toTs, memberUID, logType, model, group, tokenName, detailKw, requestID, cursor, portalLogPageSize+1)
 	if err != nil {
 		if abortCanceledUsageRequest(c, err) {
 			return
@@ -1612,9 +1646,13 @@ func (m *Monitor) portalLogs(c *gin.Context) {
 	if hasMore {
 		rows = rows[:portalLogPageSize]
 	}
-	var next int64
+	next := "0"
 	if len(rows) > 0 {
-		next = rows[len(rows)-1].ID
+		if cursor.legacyID > 0 {
+			next = strconv.FormatInt(rows[len(rows)-1].ID, 10)
+		} else {
+			next = encodeLogPageCursor(logCursorAfterRow(rows[len(rows)-1], cursor))
+		}
 	}
 	// 游标 + has_more 已足够稳定翻页。不要为了一个总页数在首屏追加 COUNT(*)：
 	// 大窗口/模糊筛选下，50 行本身可能瞬间返回，而全量计数却扫描数百万行，
@@ -1842,14 +1880,16 @@ func (m *Monitor) portalLogsExportWithWriter(c *gin.Context, maxBytes int64, wri
 		return
 	}
 
-	beforeID := startCursor
+	// startCursor 保留旧票据的 maxID+1 协议；内部转成显式上界后，
+	// 第一页即按时间复合索引读取，且不会混入预检后新写入的 ID。
+	cursor := logPageCursor{HasUpper: true, UpperID: startCursor - 1}
 	remaining := portalExportCap
 	for remaining > 0 {
 		limit := portalExportPageSize
 		if remaining < limit {
 			limit = remaining
 		}
-		rows, qerr := m.queryGroupLogsForExport(c.Request.Context(), ids, fromTs, toTs, memberUID, logType, model, group, tokenName, detailKw, requestID, beforeID, limit)
+		rows, qerr := m.queryGroupLogsForExportCursor(c.Request.Context(), ids, fromTs, toTs, memberUID, logType, model, group, tokenName, detailKw, requestID, cursor, limit)
 		if qerr != nil {
 			if isCanceledUsageRequest(c, qerr) {
 				return
@@ -1877,7 +1917,7 @@ func (m *Monitor) portalLogsExportWithWriter(c *gin.Context, maxBytes int64, wri
 			return
 		}
 		remaining -= len(rows)
-		beforeID = rows[len(rows)-1].ID
+		cursor = logCursorAfterRow(rows[len(rows)-1], cursor)
 		if len(rows) < limit {
 			break
 		}
