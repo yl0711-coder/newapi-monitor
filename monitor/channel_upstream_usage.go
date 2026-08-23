@@ -191,7 +191,10 @@ func fetchNewAPIUsagePage(ctx context.Context, client *http.Client, row ChannelU
 	// remains the documented half-open interval [from,to), including splits.
 	query.Set("end_timestamp", strconv.FormatInt(to-1, 10))
 	headers := map[string]string{"Authorization": "Bearer " + cred.AccessToken, "New-Api-User": strconv.FormatInt(row.UserID, 10)}
-	body, err := doUpstreamJSON(ctx, client, http.MethodGet, upstreamEndpoint(row.BaseURL, "/api/log/")+"?"+query.Encode(), headers, nil)
+	// 上游账户保存的是普通用户访问令牌，只能读取该账户自己的消费日志。
+	// /api/log/ 是管理员全站日志接口，普通用户凭据会得到 403；不得为了同步
+	// 上游账单而要求或保存管理员令牌。
+	body, err := doUpstreamJSON(ctx, client, http.MethodGet, upstreamEndpoint(row.BaseURL, "/api/log/self")+"?"+query.Encode(), headers, nil)
 	if err != nil {
 		var statusErr *upstreamHTTPError
 		if errors.As(err, &statusErr) && (statusErr.Status == http.StatusUnauthorized || statusErr.Status == http.StatusForbidden) {

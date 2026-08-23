@@ -31,7 +31,7 @@ func newUpstreamUsageFixtureServer(t *testing.T, initial []upstreamUsageFixtureR
 	var firstPageOnce sync.Once
 	var totalQueries atomic.Int64
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/api/log/" || r.Header.Get("Authorization") != "Bearer usage-token" || r.Header.Get("New-Api-User") != "31" {
+		if r.URL.Path != "/api/log/self" || r.Header.Get("Authorization") != "Bearer usage-token" || r.Header.Get("New-Api-User") != "31" {
 			http.Error(w, `{"message":"bad auth"}`, http.StatusUnauthorized)
 			return
 		}

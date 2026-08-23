@@ -476,7 +476,7 @@ func TestFetchNewAPIUsageWindowAggregatesLocallyAndKeepsZeroHours(t *testing.T) 
 	from := time.Date(2026, 8, 10, 0, 0, 0, 0, time.UTC).Unix()
 	to := from + 3*3600
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/api/log/" || r.Header.Get("Authorization") != "Bearer "+token || r.Header.Get("New-Api-User") != "31" {
+		if r.URL.Path != "/api/log/self" || r.Header.Get("Authorization") != "Bearer "+token || r.Header.Get("New-Api-User") != "31" {
 			http.Error(w, `{"message":"bad request"}`, http.StatusUnauthorized)
 			return
 		}
