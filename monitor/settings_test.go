@@ -33,6 +33,18 @@ func TestLoadSettingsUpstreamSyncEnabled(t *testing.T) {
 	}
 }
 
+func TestLoadSettingsUpstreamUsageSyncDefaultsToGrayOff(t *testing.T) {
+	t.Setenv("MONITOR_UPSTREAM_USAGE_SYNC_ENABLED", "")
+	if LoadSettings().UpstreamUsageSyncEnabled {
+		t.Fatal("new upstream usage polling must remain gray-off unless explicitly enabled")
+	}
+
+	t.Setenv("MONITOR_UPSTREAM_USAGE_SYNC_ENABLED", "true")
+	if !LoadSettings().UpstreamUsageSyncEnabled {
+		t.Fatal("explicitly enabling upstream usage polling must be honored")
+	}
+}
+
 func TestLoadSettingsInfraSnapshotReadOnly(t *testing.T) {
 	t.Setenv("MONITOR_INFRA_ENABLED", "false")
 	t.Setenv("MONITOR_INFRA_SNAPSHOT_READ_ONLY", "true")

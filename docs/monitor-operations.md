@@ -113,14 +113,20 @@ ETA 不得沿用旧“每小时一个 SQL”的静态公式。生产先做 2 小
 - 所有后台来源查询默认至少间隔 2 秒启动；稳定性迁移默认将来源 SQL duty 限制为 20%（查询 1 秒后至少让路 4 秒，且不低于固定 2 秒）。range 明细查询后还会执行一条独立的来源控制总数 SQL，逐小时核对用户/内部测试的 requests、tokens、quota；不一致的 chunk 拒绝发布。两条 MySQL SELECT 都带 `MAX_EXECUTION_TIME(8000)` 服务端硬限制，客户端超时即使配置为 20 秒，也不允许单条数据库执行超过 8 秒。`GET /admin/stability/backfill` 暴露 `source_throttle`、完成/失败/已处理比例、当前 batch、来源查询次数和 ETA。ETA 是基于已观测查询耗时和当前 batch 的滚动估计，不是上线承诺。
 - `partial` 任务不会伪装成完成：先看 `failed_hour_ts` 和对应来源慢查询/基数，再以超级管理员显式调用 `POST /admin/stability/backfill/retry?id=<job-id>`。重试会保留已经 complete 的小时，只重新扫描失败/缺失小时；不得删除台账后整段重跑。
 - 分类规则升级造成数千小时缺口时，普通 `MONITOR_STABILITY_AUTO_REPAIR` 只负责最新小时修洞，不能承担历史迁移。必须先保持 `MONITOR_STABILITY_CLASSIFICATION_MIGRATION_ENABLED=false`，完成只读 `EXPLAIN` 和 2 小时/24 小时 pilot；确认来源 CPU、连接、慢查询和复制延迟在止损线内后，才在独立维护窗口显式改为 `true` 并重启 Monitor。该开关同时要求“小时聚合重签”和“原始错误分钟重签”两域完成；`GET /admin/stability/backfill` 只有在 `hourly_migration_status` 完成且 `problem_migration.status=complete` 时才返回 `migration_ready_to_disable=true`。原始错误实时 Tail 使用独立持久水位和高优先级 lane；冷迁移由独立低优先 worker 连续提交单个 12→6→3→1 分钟窗口，仍受全局 2 秒起步间隔、20% duty、8 秒 SQL 硬上限和高优先任务抢占，不再被主采样器“一分钟一窗”的节拍人为拖慢。`problem_migration` 暴露百分比、退避/暂停原因、已观测速率和 ETA；样本不足、停滞或暂停时不会伪造 ETA。两域完成前必须保持开关为 `true`；提前关闭会把持久 raw cursor 显示为 `paused_disabled` 并令 health 降级，而不是隐藏缺口。任务完成后再改回 `false`，且不要删除 SQLite 中的任务或小时台账。任何时候都不得同时启动 Usage 扩窗。
-- 本次只发布 Monitor，NewAPI 保持现有代码、协议和镜像不变。`MONITOR_UPSTREAM_SYNC_ENABLED` 仅是上游故障/风控维护开关，不再是跨仓发布开关。上线后抽查 Monitor 渠道管理不再把可识别测试当成用户流量，同时余额燃烧成本仍包含已写日志的独立测试成本。
+- 本次只发布 Monitor，NewAPI 保持现有代码、协议和镜像不变。`MONITOR_UPSTREAM_SYNC_ENABLED` 只控制上游余额轮询；新增的消费日志同步由 `MONITOR_UPSTREAM_USAGE_SYNC_ENABLED` 独立控制且默认关闭。首次发布必须保持关闭，先验证已有 Monitor/Usage 业务，再按账户灰度开启。
 - usage facts 的 v5 分类变化可能影响任意用户，不能再用“是否存在 `user_id=1`”豁免，也不能在普通启动里全表 DELETE。旧派生数据存在时普通启动 fail-closed；只有显式 classification maintenance 才撤销发布/取消旧任务并按成员全历史重签，旧 facts 保留供恢复核对。
 
 ## 上游账户使用日志同步
 
-- 当天尾部和历史补全是两条独立调度状态。每个到期轮次先刷新当天最近 3 小时，再至多补 1 个中国自然日；历史窗口失败只让历史任务按 30/60/120/240 分钟退避，不会拖慢当天尾部。尾部自身失败仍指数退避，避免故障期持续命中上游风控。
-- 为兼容现有 NewAPI，日志分页使用它现有的 OFFSET 接口。Monitor 校验每页 `total`、预期行数，并在多页扫描后重读首页指纹；发现并发新日志导致数量或首页变化时整窗口失败重试，不覆盖已有本地汇总。旧接口每页会重复 `COUNT`，这是不修改 NewAPI 时无法消除的残余开销；Monitor 用全局串行、至少 1 秒的请求启动间隔、60 次单轮上限和超时/退避限制风险。单窗超过 5,000 行时自动按时间二分；只有单秒仍超过 5,000 行才 fail-closed。
-- 默认尾部 30 分钟一次并带 0～45 秒确定性单向抖动；历史与尾部分别抖动，所有账户每分钟只挑 1 个到期账户串行执行。同一账户的一轮尾部+历史共享最多 60 次 HTTP 请求，任意两次真实请求启动至少间隔 1 秒并只向后增加 0～250 ms 抖动；触顶或超时会保留旧汇总并进入退避，不以突发请求换取表面进度。429 优先遵守 `Retry-After`，网络错误和可重试 5xx 会触发按 host 持久化熔断。渠道管理页会分别显示“日志同步”和“历史补全/退避”，不要把历史未完成误判为当天数据不新鲜。
+- 余额快照与上游消费账单是两条独立同步链；页面刷新只读 Monitor SQLite，不访问上游。消费账单必须同时满足全局 `MONITOR_UPSTREAM_USAGE_SYNC_ENABLED=true` 和账户显式开启才会运行。首次上线保持全局闸门为 `false`；已有 Monitor/Usage 验收后，先只保留一个账户开关为开，再将全局闸门改为 `true` 重建 Monitor。按“一个账户 → 验证当天水位、账单差额、429/5xx 和实例负载 → 观察至少两个正常周期 → 再开下一个账户”的顺序灰度，禁止一次性全开。
+- 当天追平和历史补全是两条独立健康状态和退避计数。当天和历史同时到期时一定先刷新当天；只有当天完整读取并原子发布成功，才会继续历史任务。当天健康但未到刷新时间时，到期的历史窗口可单独推进；如果当天遇到 401/429/5xx/网络错误，历史车道也至少暂停到当天重试时间，不得绕过退避重复打上游。历史窗口自身失败只让历史任务独立退避，不会拖慢当天追平。任一失败都保留上次完整本地汇总，不会把远端错误、超时或半页结果写成零消费。
+- NewAPI 使用现有 OFFSET 日志接口：当天只重读最近 3 小时重叠窗口以吸收晚到日志，历史每轮至多补 1 个中国自然日。Monitor 校验每页 `total`、预期行数，并在多页扫描后重读首页指纹；并发变化会使整窗口失败重试。单窗超过 5,000 行时按时间二分，单秒仍超过 5,000 行则 fail-closed。单轮当天+历史共用 60 次请求硬预算。
+- Sub2API 优先调用认证后的 `/api/v1/usage/dashboard/trend`，一次读取一个中国自然日的小时汇总；当天每轮重读当日并保留当前未闭合小时，历史每轮至多补 1 日。仅当该路由明确返回 404/405 时，才固定回退 `/api/v1/usage/stats` 并保存一个真实的单日桶；其他错误不会静默降级，也不会伪造小时分布。若 access token 过期，Monitor 使用 refresh token 刷新一次并原子保存轮换后的凭据。
+- AICodeWith 按 Key 读取日账单。多把 Key 分批执行、按远端 `api_key_id` 去重，全部 Key 覆盖同一冻结窗口后才原子求和发布；中途失败不会发布部分 Key 的金额。单轮最多处理 4 把 Key，每把 Key 的接口请求遵守 10 次/分钟约束；历史接口单次最多补 31 个中国自然日。
+- 默认当天间隔 30 分钟并带确定性单向抖动；所有账户共用全局串行锁和 host 访问保护，同一调度周期每分钟只选择 1 个到期账户。429 优先遵守 `Retry-After`，网络错误和可重试 5xx 会触发持久化退避/熔断。管理页“上游账户同步”按账户分开显示余额、账单适配器、粒度、当天水位、当天错误和历史游标，不得用“历史未完成”推断当天不新鲜。
+- 本地只保存脱敏聚合，不保存上游原始日志、提示词、Key 或 IP。Sub2API 小时模式最多约 24 行/账户/日（单日兼容模式为 1 行），即每账户每年约 8,760 行；实际 SQLite 空间还包含索引、WAL 和备份，应通过 `/ready` 与备份状态按现有磁盘水位管理，不把理论行数当作磁盘承诺。
+
+逐账户启用后的验收至少包括：余额同步仍正常、`usage_status=ok`、适配器符合预期、当天水位连续前进、相同中国自然日的上游金额与对方后台一致、历史游标只向前移动、失败后旧汇总仍可读且下次自动恢复。Sub2API 旧版出现“单日汇总（兼容模式）”是可用但粒度受限，不应显示成小时完整度。
 
 ## 受控历史补数与旧事实库升级
 
@@ -372,6 +378,7 @@ docker run -d --name "$audit_container" --network none \
   -e MONITOR_USAGE_FACTS_HISTORY_SOURCE_MODE=complete \
   -e MONITOR_USAGE_FACTS_HISTORY_SOURCE_EPOCH="$RESTORE_SOURCE_EPOCH" \
   -e MONITOR_UPSTREAM_SYNC_ENABLED=false \
+  -e MONITOR_UPSTREAM_USAGE_SYNC_ENABLED=false \
   -e MONITOR_STABILITY_ENABLED=false \
   -e MONITOR_INFRA_ENABLED=false \
   -e MONITOR_STORE_BACKUP_ENABLED=false \

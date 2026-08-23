@@ -87,6 +87,11 @@ type ChannelUpstreamAccount struct {
 	UsageLastSuccessAt    int64  `gorm:"column:usage_last_success_at;index"`
 	UsageNextSyncAt       int64  `gorm:"column:usage_next_sync_at;index"`
 	UsageConsecutiveFails int    `gorm:"column:usage_consecutive_fails"`
+	// UsageAdapter records the verified provider capability selected for this
+	// account. In particular, older Sub2API releases may only expose the daily
+	// stats endpoint; remembering the fallback prevents probing a missing route
+	// on every low-frequency sync.
+	UsageAdapter string `gorm:"size:32;column:usage_adapter"`
 	// 当天尾部刷新与历史回填分别退避。历史某一天异常不能拖慢当天数据，
 	// 也不能在每次尾部刷新时无节制重试同一个高流量窗口。
 	UsageBackfillLastAttemptAt    int64  `gorm:"column:usage_backfill_last_attempt_at"`
@@ -102,8 +107,8 @@ type ChannelUpstreamAccount struct {
 }
 
 // ChannelUpstreamUsageHour 是上游账户账单的本地脱敏汇总。BucketSeconds=3600
-// 表示小时级原始日志；AICodeWith 公开接口只给出中国自然日聚合，因此用
-// BucketSeconds=86400（当天尾部为已覆盖秒数）保留真实粒度，不伪造小时分布。
+// 表示小时级聚合；AICodeWith 以及旧版 Sub2API 兼容接口只给出中国自然日聚合，
+// 因此用 BucketSeconds=86400（当天尾部为已覆盖秒数）保留真实粒度，不伪造小时分布。
 // 不保留 API Key、Cookie、请求体、响应体、用户内容或远端原始日志 ID；页面按日期范围
 // 仅查询这里，绝不因用户刷新而访问上游。按供应商真实粒度重算能处理延迟入账，
 // 又不依赖不可靠的跨版本日志 ID 去重。
@@ -197,7 +202,12 @@ type ChannelUpstreamAccountView struct {
 	NextSyncAt                    int64                             `json:"next_sync_at,omitempty"`
 	Assessment                    *ChannelUpstreamBalanceAssessment `json:"assessment,omitempty"`
 	UsageSyncEnabled              bool                              `json:"usage_sync_enabled,omitempty"`
+	UsageWorkerEnabled            bool                              `json:"usage_worker_enabled"`
 	UsageStatus                   string                            `json:"usage_status,omitempty"`
+	UsageEffectiveStatus          string                            `json:"usage_effective_status,omitempty"`
+	UsageFresh                    bool                              `json:"usage_fresh"`
+	UsageLagSeconds               int64                             `json:"usage_lag_seconds,omitempty"`
+	UsageFreshnessLimitSeconds    int64                             `json:"usage_freshness_limit_seconds,omitempty"`
 	UsageLastError                string                            `json:"usage_last_error,omitempty"`
 	UsageLastSuccessAt            int64                             `json:"usage_last_success_at,omitempty"`
 	UsageNextSyncAt               int64                             `json:"usage_next_sync_at,omitempty"`
@@ -208,6 +218,12 @@ type ChannelUpstreamAccountView struct {
 	UsageBackfillNextSyncAt       int64                             `json:"usage_backfill_next_sync_at,omitempty"`
 	UsageBackfillConsecutiveFails int                               `json:"usage_backfill_consecutive_fails,omitempty"`
 	UsageBackfillLastError        string                            `json:"usage_backfill_last_error,omitempty"`
+	UsageLastAttemptAt            int64                             `json:"usage_last_attempt_at,omitempty"`
+	UsageBackfillLastAttemptAt    int64                             `json:"usage_backfill_last_attempt_at,omitempty"`
+	UsageBackfillCursor           int64                             `json:"usage_backfill_cursor,omitempty"`
+	UsageAdapter                  string                            `json:"usage_adapter,omitempty"`
+	UsageAdapterName              string                            `json:"usage_adapter_name,omitempty"`
+	UsageGranularity              string                            `json:"usage_granularity,omitempty"`
 }
 
 // AICodeWithKeySlotView is the non-secret identity of one configured key.
@@ -333,6 +349,36 @@ func upstreamProviderName(provider string) string {
 	default:
 		return provider
 	}
+}
+
+func upstreamUsageAdapterName(provider, adapter string) string {
+	switch adapter {
+	case upstreamUsageAdapterNewAPILog:
+		return "NewAPI 分页日志"
+	case upstreamUsageAdapterSub2Trend:
+		return "Sub2API 小时汇总"
+	case upstreamUsageAdapterSub2Stats:
+		return "Sub2API 单日汇总（兼容模式）"
+	case upstreamUsageAdapterAICodeWith:
+		return "AICodeWith 按 Key 日账单"
+	}
+	switch provider {
+	case upstreamProviderNewAPI:
+		return "NewAPI 分页日志"
+	case upstreamProviderSub2API:
+		return "Sub2API 账户用量"
+	case upstreamProviderAICodeWith:
+		return "AICodeWith 按 Key 日账单"
+	default:
+		return ""
+	}
+}
+
+func upstreamUsageGranularity(provider, adapter string) string {
+	if provider == upstreamProviderAICodeWith || adapter == upstreamUsageAdapterSub2Stats {
+		return "day"
+	}
+	return "hour"
 }
 
 func upstreamSyncMinutes(s Settings) int {
@@ -820,6 +866,12 @@ func upstreamAccountView(row ChannelUpstreamAccount) ChannelUpstreamAccountView 
 		UsageLastError: row.UsageLastError, UsageLastSuccessAt: row.UsageLastSuccessAt,
 		UsageNextSyncAt: row.UsageNextSyncAt,
 		UsageDataUntil:  row.UsageDataUntil, UsageBackfillDone: row.UsageBackfillDone,
+		UsageLastAttemptAt:            row.UsageLastAttemptAt,
+		UsageBackfillLastAttemptAt:    row.UsageBackfillLastAttemptAt,
+		UsageBackfillCursor:           row.UsageBackfillCursor,
+		UsageAdapter:                  row.UsageAdapter,
+		UsageAdapterName:              upstreamUsageAdapterName(row.Provider, row.UsageAdapter),
+		UsageGranularity:              upstreamUsageGranularity(row.Provider, row.UsageAdapter),
 		UsageConsecutiveFails:         row.UsageConsecutiveFails,
 		UsageBackfillLastSuccessAt:    row.UsageBackfillLastSuccessAt,
 		UsageBackfillNextSyncAt:       row.UsageBackfillNextSyncAt,
@@ -833,6 +885,39 @@ func upstreamAccountView(row ChannelUpstreamAccount) ChannelUpstreamAccountView 
 		balance := row.BalanceUSD
 		view.BalanceUSD = &balance
 	}
+	return view
+}
+
+// decorateUpstreamUsageHealth turns persisted worker state into an
+// authoritative presentation state. A successful run is not green forever:
+// once its published watermark exceeds the bounded freshness window it is
+// explicitly stale. The global gray switch is also visible instead of being
+// mistaken for an account-level failure.
+func decorateUpstreamUsageHealth(view *ChannelUpstreamAccountView, row ChannelUpstreamAccount, s Settings, now int64) {
+	view.UsageWorkerEnabled = s.UpstreamUsageSyncEnabled
+	limit := int64((2*upstreamUsageSyncMinutes(s) + 5) * 60)
+	view.UsageFreshnessLimitSeconds = limit
+	if row.UsageDataUntil > 0 && now > row.UsageDataUntil {
+		view.UsageLagSeconds = now - row.UsageDataUntil
+	}
+	view.UsageFresh = row.UsageDataUntil > 0 && view.UsageLagSeconds <= limit
+	switch {
+	case !s.UpstreamUsageSyncEnabled:
+		view.UsageEffectiveStatus = "global_off"
+	case !row.Enabled || !row.UsageSyncEnabled:
+		view.UsageEffectiveStatus = upstreamStatusDisabled
+	case row.UsageStatus == upstreamStatusError || row.UsageStatus == upstreamStatusReconnect || row.UsageStatus == upstreamStatusUnsupported:
+		view.UsageEffectiveStatus = row.UsageStatus
+	case row.UsageStatus == upstreamStatusOK && !view.UsageFresh:
+		view.UsageEffectiveStatus = "stale"
+	default:
+		view.UsageEffectiveStatus = row.UsageStatus
+	}
+}
+
+func (m *Monitor) channelUpstreamAccountView(row ChannelUpstreamAccount) ChannelUpstreamAccountView {
+	view := upstreamAccountView(row)
+	decorateUpstreamUsageHealth(&view, row, m.cfg, time.Now().Unix())
 	return view
 }
 
@@ -873,7 +958,7 @@ func (m *Monitor) loadChannelUpstreamViews(ctx context.Context) (map[string]Chan
 	}
 	out := make(map[string]ChannelUpstreamAccountView, len(rows))
 	for _, row := range rows {
-		out[row.Domain] = upstreamAccountView(row)
+		out[row.Domain] = m.channelUpstreamAccountView(row)
 	}
 	return out, nil
 }
@@ -1887,7 +1972,7 @@ func (m *Monitor) getChannelUpstreamHandler(c *gin.Context) {
 	}
 	view := channelUpstreamConfigView{
 		Domain: domain, Provider: row.Provider, BaseURL: row.BaseURL, Enabled: row.Enabled,
-		UsageSyncEnabled: row.UsageSyncEnabled, UserID: row.UserID, Account: upstreamAccountView(row),
+		UsageSyncEnabled: row.UsageSyncEnabled, UserID: row.UserID, Account: m.channelUpstreamAccountView(row),
 	}
 	view.Account.APIKeySlots = m.aicodeWithSlotViews(ctx, row)
 	if row.Provider == upstreamProviderSub2API {
@@ -2050,6 +2135,7 @@ func (m *Monitor) saveChannelUpstreamHandler(c *gin.Context) {
 		row.UsageStatus, row.UsageLastError = existing.UsageStatus, existing.UsageLastError
 		row.UsageLastAttemptAt, row.UsageLastSuccessAt = existing.UsageLastAttemptAt, existing.UsageLastSuccessAt
 		row.UsageNextSyncAt, row.UsageBackfillCursor, row.UsageBackfillDone, row.UsageDataUntil = existing.UsageNextSyncAt, existing.UsageBackfillCursor, existing.UsageBackfillDone, existing.UsageDataUntil
+		row.UsageAdapter = existing.UsageAdapter
 		row.UsageConsecutiveFails = existing.UsageConsecutiveFails
 		row.UsageBackfillLastAttemptAt, row.UsageBackfillLastSuccessAt = existing.UsageBackfillLastAttemptAt, existing.UsageBackfillLastSuccessAt
 		row.UsageBackfillNextSyncAt, row.UsageBackfillConsecutiveFails = existing.UsageBackfillNextSyncAt, existing.UsageBackfillConsecutiveFails
@@ -2105,7 +2191,7 @@ func (m *Monitor) saveChannelUpstreamHandler(c *gin.Context) {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "保存 Key 名称失败"})
 			return
 		}
-		view := upstreamAccountView(updated)
+		view := m.channelUpstreamAccountView(updated)
 		view.APIKeySlots = m.aicodeWithSlotViews(ctx, updated)
 		c.JSON(http.StatusOK, gin.H{"account": view})
 		return
@@ -2129,7 +2215,7 @@ func (m *Monitor) saveChannelUpstreamHandler(c *gin.Context) {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "保存上游配置失败"})
 			return
 		}
-		view := upstreamAccountView(row)
+		view := m.channelUpstreamAccountView(row)
 		view.APIKeySlots = m.aicodeWithSlotViews(ctx, row)
 		c.JSON(http.StatusOK, gin.H{"account": view})
 		return
@@ -2162,7 +2248,7 @@ func (m *Monitor) saveChannelUpstreamHandler(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "保存上游配置失败"})
 		return
 	}
-	view := upstreamAccountView(row)
+	view := m.channelUpstreamAccountView(row)
 	view.APIKeySlots = m.aicodeWithSlotViews(ctx, row)
 	response := gin.H{"account": view}
 	if syncErr != nil {
@@ -2196,7 +2282,7 @@ func (m *Monitor) serveChannelUpstreamSync(c *gin.Context, timeout time.Duration
 		c.JSON(http.StatusInternalServerError, gin.H{"error": emptyResultError})
 		return
 	}
-	response := gin.H{"account": upstreamAccountView(row)}
+	response := gin.H{"account": m.channelUpstreamAccountView(row)}
 	if err != nil {
 		response["sync_error"] = lastError(row)
 		if retryAt := upstreamRetryAt(err); retryAt > 0 {
@@ -2212,19 +2298,25 @@ func (m *Monitor) syncChannelUpstreamHandler(c *gin.Context) {
 }
 
 func (m *Monitor) startChannelUpstreamSync(ctx context.Context) {
-	if !m.cfg.UpstreamSyncEnabled {
-		slog.Info("上游账户同步已关闭")
+	if !m.cfg.UpstreamSyncEnabled && !m.cfg.UpstreamUsageSyncEnabled {
+		slog.Info("上游余额与消费账单同步均已关闭")
 		return
 	}
 
 	var configured int64
 	if err := m.storeDB.Model(&ChannelUpstreamAccount{}).Count(&configured).Error; err != nil {
-		slog.Warn("读取上游账户配置失败，余额同步未启动", "err", err)
+		slog.Warn("读取上游账户配置失败，上游同步未启动", "err", err)
 		return
 	}
 	if configured > 0 && !m.upstreamCredentialPersistent {
-		slog.Error("上游余额同步未启动：凭据密钥未固定，请配置 MONITOR_SESSION_SECRET 或 MONITOR_UPSTREAM_CREDENTIAL_SECRET")
+		slog.Error("上游同步未启动：凭据密钥未固定，请配置 MONITOR_SESSION_SECRET 或 MONITOR_UPSTREAM_CREDENTIAL_SECRET")
 		return
+	}
+	if !m.cfg.UpstreamSyncEnabled {
+		slog.Info("上游余额同步已关闭，消费账单同步不受影响")
+	}
+	if !m.cfg.UpstreamUsageSyncEnabled {
+		slog.Info("上游使用日志同步处于灰度关闭状态，余额同步不受影响")
 	}
 	goSourceEpoch(ctx, func(ctx context.Context) {
 		defer m.channelUpstreamHTTPClient().CloseIdleConnections()
@@ -2234,8 +2326,12 @@ func (m *Monitor) startChannelUpstreamSync(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-timer.C:
-			m.syncDueUpstreamAccounts(ctx)
-			m.syncDueUpstreamUsage(ctx)
+			if m.cfg.UpstreamSyncEnabled {
+				m.syncDueUpstreamAccounts(ctx)
+			}
+			if m.cfg.UpstreamUsageSyncEnabled {
+				m.syncDueUpstreamUsage(ctx)
+			}
 		}
 		ticker := time.NewTicker(time.Minute)
 		defer ticker.Stop()
@@ -2244,8 +2340,12 @@ func (m *Monitor) startChannelUpstreamSync(ctx context.Context) {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				m.syncDueUpstreamAccounts(ctx)
-				m.syncDueUpstreamUsage(ctx)
+				if m.cfg.UpstreamSyncEnabled {
+					m.syncDueUpstreamAccounts(ctx)
+				}
+				if m.cfg.UpstreamUsageSyncEnabled {
+					m.syncDueUpstreamUsage(ctx)
+				}
 			}
 		}
 	})

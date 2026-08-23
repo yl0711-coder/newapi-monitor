@@ -123,6 +123,7 @@ function init(){
   });
   $('cmUpstreamSave')?.addEventListener('click',saveUpstream);
   $('cmUpstreamSync')?.addEventListener('click',syncUpstreamNow);
+  $('cmUpstreamUsageSync')?.addEventListener('click',syncUpstreamUsageNow);
   document.addEventListener('keydown',event=>{if(event.key==='Escape'){if(cm.upstreamDomain)closeUpstream();else if(cm.financeMode)closeFinance()}});
   window.addEventListener('monitor:navigate',event=>{if(event.detail?.tab==='channels'&&applyNavigationContext())loadReport()});
 }
@@ -317,13 +318,16 @@ function upstreamSummary(upstream){
   const estimate=assessment.available
     ? assessment.status==='idle'?` · ${esc(assessment.reason||'近期无显著消耗')}`:` · 预计可用 ${Number(runway).toFixed(1)} 天`
     : assessment.reason?` · ${esc(assessment.reason)}`:'';
+  const usageStatus=upstream.usage_effective_status||upstream.usage_status;
   const usage=upstream.usage_sync_enabled
-    ? upstream.usage_status==='ok'?` · 日志 ${esc(shortDateTime(upstream.usage_last_success_at))} 同步`
-      :upstream.usage_status==='unsupported'?' · 日志接口待支持'
-      :upstream.usage_status==='error'||upstream.usage_status==='reconnect'?' · 日志同步待处理'
-      :' · 日志等待同步'
+    ? usageStatus==='global_off'?' · 消费同步灰度关闭'
+      :usageStatus==='stale'?' · 消费数据已陈旧'
+      :usageStatus==='ok'?` · 消费账单 ${esc(shortDateTime(upstream.usage_last_success_at))} 同步`
+      :upstream.usage_status==='unsupported'?' · 消费接口待适配'
+      :upstream.usage_status==='error'||upstream.usage_status==='reconnect'?' · 消费同步待处理'
+      :' · 消费等待同步'
     :'';
-	const backfill=upstream.usage_sync_enabled&&!upstream.usage_backfill_done
+	const backfill=upstream.usage_sync_enabled&&upstream.usage_worker_enabled&&!upstream.usage_backfill_done
 		?upstream.usage_backfill_last_error?' · 历史补全退避重试中':' · 历史补全中'
 		:'';
   if(!upstream.enabled)return `<span class="neutral">${esc(upstream.provider_name||upstream.provider)} · 已停用 · ${balance}${usage}</span>`;
@@ -624,23 +628,46 @@ function syncUpstreamFields(){
   document.querySelectorAll('.cm-upstream-newapi').forEach(el=>el.hidden=provider!=='newapi');
   document.querySelectorAll('.cm-upstream-sub2api').forEach(el=>el.hidden=provider!=='sub2api');
   document.querySelectorAll('.cm-upstream-aicodewith').forEach(el=>el.hidden=provider!=='aicodewith');
-  const usageSupported=provider==='newapi'||provider==='aicodewith';
+  const usageSupported=provider==='newapi'||provider==='sub2api'||provider==='aicodewith';
   const usageOption=document.querySelector('.cm-upstream-usage-option');
   if(usageOption)usageOption.hidden=!usageSupported;
-  if($('cmUpstreamUsageLabel'))$('cmUpstreamUsageLabel').textContent=provider==='aicodewith'?'同步按 Key 消费账单':'同步使用日志（NewAPI）';
+  if($('cmUpstreamUsageLabel'))$('cmUpstreamUsageLabel').textContent=provider==='aicodewith'?'同步按 Key 消费账单':provider==='sub2api'?'同步消费汇总（Sub2API）':'同步消费日志（NewAPI）';
   if($('cmUpstreamUsageHelp'))$('cmUpstreamUsageHelp').textContent=provider==='aicodewith'
-    ?'每 30 分钟同步当天累计；历史每批最多 31 个中国自然日，页面明确按天口径，不伪造小时明细'
-    :'默认每 30 分钟串行汇总一次；首次按天低频补齐历史数据，不保存上游原始日志或用户内容';
+    ?'每 30 分钟同步当天累计；历史每批最多 31 个中国自然日，按天口径展示，不伪造小时明细'
+    :provider==='sub2api'
+      ?'优先使用小时汇总接口，旧版站点自动降级为单日汇总；当天追平与历史补数独立，不保存原始日志'
+      :'默认每 30 分钟分页串行汇总；完整取得时间窗口后才原子替换本地汇总，不保存上游原始内容';
   if(provider==='aicodewith'&&!document.querySelector('.cm-upstream-api-key'))resetAICodeWithKeyInputs();
+}
+function upstreamState(status,enabled=true){
+  if(!enabled)return {label:'已停用',level:'neutral'};
+  if(status==='ok')return {label:'正常',level:'ok'};
+  if(status==='error')return {label:'异常',level:'bad'};
+  if(status==='reconnect')return {label:'需重新连接',level:'bad'};
+  if(status==='unsupported')return {label:'待适配',level:'bad'};
+  if(status==='stale')return {label:'数据陈旧',level:'warn'};
+  if(status==='global_off')return {label:'灰度关闭',level:'neutral'};
+  if(status==='disabled')return {label:'未开启',level:'neutral'};
+  return {label:'等待同步',level:'warn'};
 }
 function renderUpstreamStatus(account){
   const el=$('cmUpstreamStatus');if(!el)return;
   if(!account?.configured){el.hidden=true;el.innerHTML='';return}
-  const state=!account.enabled?'已停用':account.status==='ok'?'同步正常':account.status==='reconnect'?'需要重新连接':account.status==='error'?'同步异常':'等待同步';
+  const balanceState=upstreamState(account.status,account.enabled);
+  const usageState=account.usage_sync_enabled?upstreamState(account.usage_effective_status||account.usage_status,account.enabled):{label:'未开启',level:'neutral'};
   const balance=account.balance_usd==null?'尚未取得余额':`当前余额 ${usd(account.balance_usd)}`;
-  const error=account.last_error?`<p>${esc(account.last_error)}</p>`:'';
-  el.className=`cm-upstream-status ${esc(account.status||'pending')}`;
-  el.innerHTML=`<div><small>${esc(account.provider_name||account.provider||'上游账户')}</small><b>${esc(state)}</b></div><div><strong>${esc(balance)}</strong><span>账户 ${esc(account.account_masked||'已配置')} · 最近成功 ${esc(dateTime(account.last_success_at))}</span>${account.unit_assumed?'<em>NewAPI 未公开换算单位，暂按默认 500,000 quota / USD 展示</em>':''}</div>${error}`;
+  const adapter=account.usage_adapter_name||'尚未确定同步适配器';
+  const granularity=account.usage_granularity==='day'?'按天汇总':'按小时汇总';
+  const backfill=account.usage_backfill_done?'历史补数已完成':account.usage_backfill_last_error?'历史补数退避重试':'历史补数中';
+  const balanceError=account.last_error?`<em class="cm-upstream-status-error">余额错误：${esc(account.last_error)}</em>`:'';
+  const usageError=account.usage_last_error?`<em class="cm-upstream-status-error">当天追平：${esc(account.usage_last_error)}</em>`:'';
+  const historyError=account.usage_backfill_last_error?`<em class="cm-upstream-status-error">历史补数：${esc(account.usage_backfill_last_error)}</em>`:'';
+  el.className=`cm-upstream-status cm-upstream-status-v2 ${esc(account.status||'pending')}`;
+  el.innerHTML=`<div class="cm-upstream-status-head"><div><small>${esc(account.provider_name||account.provider||'上游账户')}</small><b>${esc(account.account_masked||'已配置账户')}</b></div><span>${account.enabled?'后台自动同步已开启':'后台自动同步已停用'}</span></div>
+    <div class="cm-upstream-status-grid">
+      <section class="cm-upstream-status-lane"><header><b>余额快照</b><span class="cm-upstream-status-chip ${balanceState.level}">${balanceState.label}</span></header><strong>${esc(balance)}</strong><span>最近成功 ${esc(dateTime(account.last_success_at))}<br>下次计划 ${esc(dateTime(account.next_sync_at))}</span>${account.unit_assumed?'<em>NewAPI 未公开换算单位，暂按默认 500,000 quota / USD 展示</em>':''}${balanceError}</section>
+      <section class="cm-upstream-status-lane"><header><b>上游消费账单</b><span class="cm-upstream-status-chip ${usageState.level}">${usageState.label}</span></header>${account.usage_sync_enabled&&!account.usage_worker_enabled?'<strong>全局灰度闸门已关闭</strong><span>配置已保留，当前不会访问上游；余额同步不受影响。</span>':account.usage_sync_enabled?`<strong>${esc(adapter)} · ${esc(granularity)}</strong><span>当天水位 ${esc(dateTime(account.usage_data_until))}<br>最近成功 ${esc(dateTime(account.usage_last_success_at))} · 下次 ${esc(dateTime(account.usage_next_sync_at))}</span><div class="cm-upstream-status-progress"><span><small>当天追平</small><b>${esc(usageState.label)}</b></span><span><small>历史任务</small><b>${esc(backfill)}</b></span></div>${usageError}${historyError}`:'<strong>消费同步未开启</strong><span>开启后才会低频读取该上游；页面查询始终只读 Monitor 本地 SQLite。</span>'}</section>
+    </div>`;
   el.hidden=false;
 }
 async function openUpstream(domainKey){
@@ -653,7 +680,7 @@ async function openUpstream(domainKey){
   $('cmUpstreamStatus').hidden=true;
   $('cmUpstreamProvider').value='newapi';$('cmUpstreamBaseURL').value=`https://${domain.domain}`;
   $('cmUpstreamUserID').value='';$('cmUpstreamAccessToken').value='';$('cmUpstreamEmail').value='';$('cmUpstreamPassword').value='';resetAICodeWithKeyInputs();updateAICodeWithKeyHelp(null);$('cmUpstreamEnabled').checked=true;$('cmUpstreamUsageEnabled').checked=false;
-  $('cmUpstreamSync').hidden=true;showUpstreamMessage('');syncUpstreamFields();
+  $('cmUpstreamSync').hidden=true;$('cmUpstreamUsageSync').hidden=true;showUpstreamMessage('');syncUpstreamFields();
   $('cmUpstreamMask').hidden=false;$('cmUpstreamDialog').classList.add('show');$('cmUpstreamDialog').setAttribute('aria-hidden','false');
   document.body.classList.add('cm-dialog-open');
   try{
@@ -668,6 +695,7 @@ async function openUpstream(domainKey){
       ?'令牌已加密保存；敏感字段留空表示保持原连接不变。'
       :'选择中转站类型并填写首次连接参数。';
     $('cmUpstreamSync').hidden=!data.account?.configured||data.enabled===false;
+    $('cmUpstreamUsageSync').hidden=!data.account?.configured||data.enabled===false||!data.account?.usage_sync_enabled;
     if(data.provider==='aicodewith')renderAICodeWithKeySlots(data.account?.api_key_slots||[]);
     renderUpstreamStatus(data.account);updateAICodeWithKeyHelp(data.account);syncUpstreamFields();showUpstreamMessage('');
     setTimeout(()=>$('cmUpstreamBaseURL')?.focus(),20);
@@ -684,7 +712,7 @@ async function saveUpstream(){
   if(!cm.upstreamDomain||!cm.report?.finance?.can_edit)return;
   const provider=$('cmUpstreamProvider').value,baseURL=$('cmUpstreamBaseURL').value.trim();
   if(!baseURL){showUpstreamMessage('请填写站点地址。',true);return}
-  const usageSupported=provider==='newapi'||provider==='aicodewith';
+  const usageSupported=provider==='newapi'||provider==='sub2api'||provider==='aicodewith';
   const payload={domain:cm.upstreamDomain.domain,provider,base_url:baseURL,enabled:$('cmUpstreamEnabled').checked,usage_sync_enabled:usageSupported&&$('cmUpstreamUsageEnabled').checked};
   if(provider==='newapi'){
     payload.user_id=Number($('cmUpstreamUserID').value);payload.access_token=$('cmUpstreamAccessToken').value.trim();
@@ -697,7 +725,7 @@ async function saveUpstream(){
     if(payload.add_api_key_slots.some(item=>!item.api_key)){showUpstreamMessage('填写 Key 名称后，还需要填写对应的 AICodeWith API Key。',true);return}
     if(payload.add_api_key_slots.some(item=>!item.api_key.startsWith('sk-acw-'))){showUpstreamMessage('AICodeWith API Key 格式应为 sk-acw-...，请每把 Key 单独填写一行。',true);return}
   }
-  const button=$('cmUpstreamSave');button.disabled=true;$('cmUpstreamSync').disabled=true;showUpstreamMessage(payload.enabled?'正在安全连接并读取余额…':'正在停用自动同步…');
+  const button=$('cmUpstreamSave');button.disabled=true;$('cmUpstreamSync').disabled=true;$('cmUpstreamUsageSync').disabled=true;showUpstreamMessage(payload.enabled?'正在安全连接并读取余额…':'正在停用自动同步…');
   try{
     const res=await fetch('/channels/upstream',{method:'POST',headers:{Accept:'application/json','Content-Type':'application/json'},body:JSON.stringify(payload)});
     $('cmUpstreamAccessToken').value='';$('cmUpstreamPassword').value='';payload.access_token='';payload.password='';payload.add_api_key_slots=[];payload.rename_api_key_slots=[];payload.remove_api_key_ids=[];
@@ -705,22 +733,34 @@ async function saveUpstream(){
     const data=await res.json();if(!res.ok)throw new Error(data.error||`HTTP ${res.status}`);
     cm.upstreamConfig={...(cm.upstreamConfig||{}),provider,base_url:baseURL,enabled:payload.enabled,account:data.account};
     if(provider==='aicodewith')renderAICodeWithKeySlots(data.account?.api_key_slots||[]);
-    renderUpstreamStatus(data.account);updateAICodeWithKeyHelp(data.account);$('cmUpstreamSync').hidden=!data.account?.configured||!data.account?.enabled;
+    renderUpstreamStatus(data.account);updateAICodeWithKeyHelp(data.account);$('cmUpstreamSync').hidden=!data.account?.configured||!data.account?.enabled;$('cmUpstreamUsageSync').hidden=!data.account?.configured||!data.account?.enabled||!data.account?.usage_sync_enabled;
     cm.loaded=false;await loadReport();
     if(data.sync_error){showUpstreamMessage(`配置已保存，但本次同步失败：${data.sync_error}`,true);return}
     closeUpstream();
-  }catch(error){$('cmUpstreamAccessToken').value='';$('cmUpstreamPassword').value='';if(provider==='aicodewith')renderAICodeWithKeySlots(cm.upstreamConfig?.account?.api_key_slots||[]);showUpstreamMessage(error.message||'保存失败，请稍后重试。',true)}finally{button.disabled=false;$('cmUpstreamSync').disabled=false}
+  }catch(error){$('cmUpstreamAccessToken').value='';$('cmUpstreamPassword').value='';if(provider==='aicodewith')renderAICodeWithKeySlots(cm.upstreamConfig?.account?.api_key_slots||[]);showUpstreamMessage(error.message||'保存失败，请稍后重试。',true)}finally{button.disabled=false;$('cmUpstreamSync').disabled=false;$('cmUpstreamUsageSync').disabled=false}
 }
 async function syncUpstreamNow(){
   if(!cm.upstreamDomain)return;
-  const button=$('cmUpstreamSync');button.disabled=true;$('cmUpstreamSave').disabled=true;showUpstreamMessage('正在读取最新余额…');
+  const button=$('cmUpstreamSync');button.disabled=true;$('cmUpstreamSave').disabled=true;$('cmUpstreamUsageSync').disabled=true;showUpstreamMessage('正在读取最新余额…');
   try{
     const res=await fetch('/channels/upstream/sync',{method:'POST',headers:{Accept:'application/json','Content-Type':'application/json'},body:JSON.stringify({domain:cm.upstreamDomain.domain})});
     if(res.status===401){location.href='/login';return}
     const data=await res.json();if(!res.ok)throw new Error(data.error||`HTTP ${res.status}`);
     renderUpstreamStatus(data.account);cm.loaded=false;await loadReport();
     showUpstreamMessage(data.sync_error?`同步失败：${data.sync_error}`:'余额已更新。',!!data.sync_error);
-  }catch(error){showUpstreamMessage(error.message||'同步失败，请稍后重试。',true)}finally{button.disabled=false;$('cmUpstreamSave').disabled=false}
+  }catch(error){showUpstreamMessage(error.message||'同步失败，请稍后重试。',true)}finally{button.disabled=false;$('cmUpstreamSave').disabled=false;$('cmUpstreamUsageSync').disabled=false}
+}
+
+async function syncUpstreamUsageNow(){
+  if(!cm.upstreamDomain)return;
+  const button=$('cmUpstreamUsageSync');button.disabled=true;$('cmUpstreamSave').disabled=true;$('cmUpstreamSync').disabled=true;showUpstreamMessage('正在同步当天消费水位，并推进一个历史批次…');
+  try{
+    const res=await fetch('/channels/upstream/usage-sync',{method:'POST',headers:{Accept:'application/json','Content-Type':'application/json'},body:JSON.stringify({domain:cm.upstreamDomain.domain})});
+    if(res.status===401){location.href='/login';return}
+    const data=await res.json();if(!res.ok)throw new Error(data.error||`HTTP ${res.status}`);
+    renderUpstreamStatus(data.account);cm.loaded=false;await loadReport();
+    showUpstreamMessage(data.sync_error?`消费同步未完成：${data.sync_error}`:'当天水位已更新，历史补数按保护频率继续。',!!data.sync_error);
+  }catch(error){showUpstreamMessage(error.message||'消费同步失败，请稍后重试。',true)}finally{button.disabled=false;$('cmUpstreamSave').disabled=false;$('cmUpstreamSync').disabled=false}
 }
 
 function render(){

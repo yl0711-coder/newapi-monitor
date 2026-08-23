@@ -27,6 +27,12 @@ CREATE TABLE metric_samples (
 CREATE TABLE legacy_guard (
   id INTEGER PRIMARY KEY,
   value TEXT NOT NULL
+);
+CREATE TABLE channel_upstream_accounts (
+  domain TEXT PRIMARY KEY,
+  provider TEXT NOT NULL,
+  credential TEXT NOT NULL DEFAULT '',
+  credential_version INTEGER NOT NULL DEFAULT 0
 );`
 
 const legacyFactsSchema = `
@@ -274,6 +280,8 @@ func TestPreMigrationSnapshotMigratesRealLegacySchemasIncludesWALRestoresAndIsId
 	mainWriter := createLegacyWALStore(t, mainPath, legacyMainSchema, `
 INSERT INTO metric_samples(bucket_ts, channel_id, model_name, grp, success)
 VALUES (1700000000, 7, 'legacy-model', 'legacy-group', 3);
+INSERT INTO channel_upstream_accounts(domain, provider)
+VALUES ('legacy-upstream.example', 'sub2api');
 INSERT INTO legacy_guard(id, value) VALUES (1, 'main-in-wal');`)
 	factsWriter := createLegacyWALStore(t, factsPath, legacyFactsSchema, `
 INSERT INTO usage_hour_facts(hour_ts, user_id, channel_id, grp, model_name, token_id, day_ts, token_name, requests, consume_quota)
@@ -290,7 +298,8 @@ INSERT INTO legacy_facts_guard(id, value) VALUES (1, 'facts-in-wal');`)
 		t.Fatalf("legacy migration with WAL snapshot failed: %v", err)
 	}
 	if !m.storeDB.Migrator().HasColumn(&MetricSample{}, "traffic_class_version") ||
-		!m.storeDB.Migrator().HasTable(&ChannelTestHourSample{}) {
+		!m.storeDB.Migrator().HasTable(&ChannelTestHourSample{}) ||
+		!m.storeDB.Migrator().HasColumn(&ChannelUpstreamAccount{}, "usage_adapter") {
 		t.Fatal("current main schema was not migrated after the snapshot gate")
 	}
 	if !m.usageFactsDB.Migrator().HasColumn(&UsageHourFact{}, "refund_records") {
@@ -314,7 +323,9 @@ INSERT INTO legacy_facts_guard(id, value) VALUES (1, 'facts-in-wal');`)
 	if err := mainSnapshot.QueryRow("SELECT value FROM legacy_guard WHERE id=1").Scan(&mainSentinel); err != nil || mainSentinel != "main-in-wal" {
 		t.Fatalf("main WAL row missing from snapshot: value=%q err=%v", mainSentinel, err)
 	}
-	if sqliteHasColumn(t, mainSnapshot, "metric_samples", "traffic_class_version") || sqliteHasTable(t, mainSnapshot, "channel_test_hour_samples") {
+	if sqliteHasColumn(t, mainSnapshot, "metric_samples", "traffic_class_version") ||
+		sqliteHasTable(t, mainSnapshot, "channel_test_hour_samples") ||
+		sqliteHasColumn(t, mainSnapshot, "channel_upstream_accounts", "usage_adapter") {
 		t.Fatal("pre-migration main snapshot unexpectedly contains current schema")
 	}
 	factsSnapshot := openReadOnlyTestStore(t, filepath.Join(snapshots[0], preMigrationFactsSnapshotName))
@@ -340,6 +351,7 @@ INSERT INTO legacy_facts_guard(id, value) VALUES (1, 'facts-in-wal');`)
 	restoredMain := openReadOnlyTestStore(t, filepath.Join(restoreDir, filepath.Base(mainPath)))
 	restoredFacts := openReadOnlyTestStore(t, filepath.Join(restoreDir, filepath.Base(factsPath)))
 	if sqliteHasColumn(t, restoredMain, "metric_samples", "traffic_class_version") ||
+		sqliteHasColumn(t, restoredMain, "channel_upstream_accounts", "usage_adapter") ||
 		sqliteHasColumn(t, restoredFacts, "usage_hour_facts", "refund_records") {
 		t.Fatal("restored volume is not the pre-migration schema")
 	}

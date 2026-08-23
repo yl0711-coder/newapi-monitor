@@ -191,6 +191,29 @@ func TestChannelManagementWebsiteGroupsUseNewAPIAndCanSync(t *testing.T) {
 	}
 }
 
+func TestChannelManagementSupportsSub2APIUsageAndSeparatesManualSyncActions(t *testing.T) {
+	page := pageHTML
+	js := string(channelManagementJS)
+	for _, marker := range []string{
+		`id="cmUpstreamUsageSync"`,
+		`provider==='newapi'||provider==='sub2api'||provider==='aicodewith'`,
+		`同步消费汇总（Sub2API）`,
+		`/channels/upstream/usage-sync`,
+		`优先使用小时汇总接口`,
+		`当天水位`,
+		`历史补数`,
+		`余额错误：`,
+		`当天追平：`,
+	} {
+		if !strings.Contains(page, marker) && !strings.Contains(js, marker) {
+			t.Fatalf("上游消费同步界面缺少 %q", marker)
+		}
+	}
+	if strings.Contains(js, `const usageSupported=provider==='newapi'||provider==='aicodewith'`) {
+		t.Fatal("Sub2API 不应继续被消费同步开关排除")
+	}
+}
+
 func TestChannelManagementFiltersRemainMountedAcrossReportRefresh(t *testing.T) {
 	page := pageHTML
 	js := string(channelManagementJS)

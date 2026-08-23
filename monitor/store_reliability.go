@@ -405,10 +405,11 @@ func verifyStoreBackupPublication(
 			_ = rows.Close()
 			return err
 		}
-		if active[id] != revision {
+		mainRevision, activeMember := active[id]
+		if !activeMember || !storeBackupPublicationRevisionCompatible(mainRevision, revision) {
 			_ = rows.Close()
 			return fmt.Errorf("备份发布成员与主库权限版本不一致: user_id=%d facts_revision=%d main_revision=%d",
-				id, revision, active[id])
+				id, revision, mainRevision)
 		}
 		ids = append(ids, id)
 		_, _ = fmt.Fprintf(h, "%d|%d|%s|%d|%d|%d|%d\n", id, revision, epoch, classification, semantics, floor, verified)
@@ -436,6 +437,17 @@ func verifyStoreBackupPublication(
 	}
 	manifest.PublishedFingerprint = stateFingerprint
 	return nil
+}
+
+// storeBackupPublicationRevisionCompatible mirrors the serving layer's one
+// explicit legacy transition. Before tracked revisions were persisted in the
+// facts store, an active member was published as revision 0; the main-store
+// migration initializes that same member at revision 1. That pair represents
+// the same first lifecycle and is safe to back up together. Every later
+// revision mismatch still means a remove/rejoin hand-off is incomplete and
+// must fail closed.
+func storeBackupPublicationRevisionCompatible(mainRevision, factsRevision int64) bool {
+	return mainRevision == factsRevision || (mainRevision == 1 && factsRevision == 0)
 }
 
 func writeStoreBackupSetManifest(dir string, manifest storeBackupSetManifest) (string, error) {
@@ -530,7 +542,13 @@ func verifyStoreBackupSetManifest(ctx context.Context, manifestPath string) (sto
 	if err := json.Unmarshal(data, &manifest); err != nil {
 		return manifest, err
 	}
-	if manifest.Version != storeBackupSetVersion || manifest.MigrationPlan != preMigrationPlanID || manifest.SetID == "" ||
+	// Version is the restore-format compatibility contract. MigrationPlan is
+	// provenance: a newer image must be able to restore a verified backup from
+	// the immediately preceding schema plan and then run its normal adjacent
+	// pre-migration snapshot/AutoMigrate gate. Treating the current plan ID as
+	// the format version would make all existing disaster-recovery sets unusable
+	// at the exact moment an upgrade is deployed.
+	if manifest.Version != storeBackupSetVersion || strings.TrimSpace(manifest.MigrationPlan) == "" || manifest.SetID == "" ||
 		filepath.Base(manifestPath) != storeBackupSetPrefix+manifest.SetID+storeBackupSetSuffix ||
 		(manifest.Main == nil && manifest.Facts == nil) {
 		return manifest, errors.New("备份集 manifest 版本/标识无效")
@@ -581,7 +599,7 @@ func validateStoreRestoreLeafName(name, field string) error {
 	return nil
 }
 
-func loadStoreRestoreReadyRecord(readyPath string, requireCurrentPlan bool) (storeBackupRestoreReady, error) {
+func loadStoreRestoreReadyRecord(readyPath string) (storeBackupRestoreReady, error) {
 	var ready storeBackupRestoreReady
 	info, err := os.Lstat(readyPath)
 	if err != nil {
@@ -600,14 +618,11 @@ func loadStoreRestoreReadyRecord(readyPath string, requireCurrentPlan bool) (sto
 	if ready.Version != storeBackupRestoreVersion || ready.MigrationPlan == "" || ready.SetID == "" || ready.ManifestSHA256 == "" {
 		return ready, errors.New("恢复 READY 版本/计划/标识无效")
 	}
-	if requireCurrentPlan && ready.MigrationPlan != preMigrationPlanID {
-		return ready, errors.New("恢复 READY 迁移计划与当前镜像不匹配")
-	}
 	return ready, nil
 }
 
 func loadAndVerifyStoreRestoreReady(ctx context.Context, readyPath, mainPath, factsPath string) error {
-	ready, err := loadStoreRestoreReadyRecord(readyPath, true)
+	ready, err := loadStoreRestoreReadyRecord(readyPath)
 	if err != nil {
 		return err
 	}
@@ -686,7 +701,7 @@ func (m *Monitor) preflightStoreRestoreActivation(parent context.Context, mainPa
 		// ACTIVATED is a permanent origin audit record, not a schema-version
 		// lock. Future images legitimately advance preMigrationPlanID and run
 		// their own adjacent snapshot/migration gate after this preflight.
-		activeRecord, err := loadStoreRestoreReadyRecord(activePath, false)
+		activeRecord, err := loadStoreRestoreReadyRecord(activePath)
 		if err != nil {
 			return fmt.Errorf("恢复 ACTIVATED 审计记录无效: %w", err)
 		}

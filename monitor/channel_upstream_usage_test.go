@@ -15,6 +15,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/gin-gonic/gin"
 )
 
 type upstreamUsageFixtureRow struct {
@@ -123,6 +125,228 @@ func TestPlanUpstreamUsageSyncKeepsTodayIndependentFromHistory(t *testing.T) {
 	}
 }
 
+func TestPlanUpstreamUsageSyncDoesNotBypassTailBackoff(t *testing.T) {
+	now := time.Date(2026, 8, 23, 9, 0, 0, 0, cstLocation).Unix()
+	today := cstDayStart(now)
+	row := ChannelUpstreamAccount{
+		UsageStatus:                   upstreamStatusError,
+		UsageNextSyncAt:               now + 1800,
+		UsageBackfillCursor:           today - 7*86400,
+		UsageBackfillNextSyncAt:       now - 1,
+		UsageBackfillDone:             false,
+		UsageConsecutiveFails:         1,
+		UsageBackfillConsecutiveFails: 0,
+	}
+	plan := planUpstreamUsageSync(row, now, 90)
+	if plan != (upstreamUsageSyncPlan{}) {
+		t.Fatalf("history bypassed tail backoff: %+v", plan)
+	}
+
+	row.UsageStatus = upstreamStatusOK
+	plan = planUpstreamUsageSync(row, now, 90)
+	if plan.tailTo != 0 || plan.backfillFrom != row.UsageBackfillCursor || plan.backfillTo <= plan.backfillFrom {
+		t.Fatalf("healthy history-only lane was not scheduled: %+v", plan)
+	}
+}
+
+func TestTailFailureDefersHistoryWithoutChangingHistoryFailureCounter(t *testing.T) {
+	now := time.Date(2026, 8, 23, 9, 0, 0, 0, cstLocation).Unix()
+	row := ChannelUpstreamAccount{Domain: "rate-limit.example", UsageBackfillNextSyncAt: now - 1}
+	applyUpstreamUsageResult(&row, upstreamUsageResult{}, &upstreamHTTPError{Status: http.StatusTooManyRequests, RetryAt: now + 3600}, now, Settings{UpstreamUsageSyncMinutes: 30})
+	coupleUpstreamUsageHistoryRetryToTail(&row)
+	if row.UsageNextSyncAt < now+3600 || row.UsageBackfillNextSyncAt != row.UsageNextSyncAt {
+		t.Fatalf("429 retry was not coupled to history deadline: %+v", row)
+	}
+	if row.UsageBackfillConsecutiveFails != 0 || row.UsageBackfillLastError != "" {
+		t.Fatalf("tail failure polluted history health: %+v", row)
+	}
+
+	auth := ChannelUpstreamAccount{Domain: "auth.example"}
+	applyUpstreamUsageResult(&auth, upstreamUsageResult{}, &upstreamAuthError{err: errors.New("bad credential")}, now, Settings{})
+	coupleUpstreamUsageHistoryRetryToTail(&auth)
+	if auth.UsageNextSyncAt != upstreamAccountIsolatedUntil || auth.UsageBackfillNextSyncAt != upstreamAccountIsolatedUntil {
+		t.Fatalf("auth isolation did not cover both lanes: %+v", auth)
+	}
+}
+
+func TestDecorateUpstreamUsageHealthIsFailClosedForGrayAndStaleData(t *testing.T) {
+	now := time.Date(2026, 8, 23, 9, 0, 0, 0, cstLocation).Unix()
+	row := ChannelUpstreamAccount{Enabled: true, UsageSyncEnabled: true, UsageStatus: upstreamStatusOK, UsageDataUntil: now - 10}
+	view := upstreamAccountView(row)
+	decorateUpstreamUsageHealth(&view, row, Settings{UpstreamUsageSyncMinutes: 30}, now)
+	if view.UsageWorkerEnabled || view.UsageEffectiveStatus != "global_off" || !view.UsageFresh {
+		t.Fatalf("gray-off view is misleading: %+v", view)
+	}
+
+	view = upstreamAccountView(row)
+	decorateUpstreamUsageHealth(&view, row, Settings{UpstreamUsageSyncEnabled: true, UpstreamUsageSyncMinutes: 30}, now)
+	if !view.UsageWorkerEnabled || view.UsageEffectiveStatus != upstreamStatusOK || !view.UsageFresh {
+		t.Fatalf("fresh enabled view is not healthy: %+v", view)
+	}
+
+	row.UsageDataUntil = now - 2*3600
+	view = upstreamAccountView(row)
+	decorateUpstreamUsageHealth(&view, row, Settings{UpstreamUsageSyncEnabled: true, UpstreamUsageSyncMinutes: 30}, now)
+	if view.UsageEffectiveStatus != "stale" || view.UsageFresh || view.UsageLagSeconds != 2*3600 {
+		t.Fatalf("stale persisted success remained green: %+v", view)
+	}
+}
+
+func TestSyncChannelUpstreamUsageHandlerHonorsGlobalGraySwitch(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	m := &Monitor{cfg: Settings{UpstreamUsageSyncEnabled: false}}
+	router := gin.New()
+	router.POST("/sync", m.syncChannelUpstreamUsageHandler)
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/sync", strings.NewReader(`{"domain":"example.com"}`))
+	req.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusServiceUnavailable || !strings.Contains(w.Body.String(), "灰度关闭") {
+		t.Fatalf("gray switch handler status=%d body=%s", w.Code, w.Body.String())
+	}
+}
+
+func TestDueUsageSelectionSkipsBackedOffAccountAndDoesNotStarvePeer(t *testing.T) {
+	m := newChannelUpstreamTestMonitor(t)
+	now := time.Date(2026, 8, 23, 9, 0, 0, 0, cstLocation).Unix()
+	today := cstDayStart(now)
+	rows := []ChannelUpstreamAccount{
+		{Domain: "a-blocked.example", Enabled: true, UsageSyncEnabled: true, UsageStatus: upstreamStatusError,
+			UsageNextSyncAt: now + 1800, UsageBackfillCursor: today - 86400, UsageBackfillNextSyncAt: now - 1},
+		{Domain: "b-due.example", Enabled: true, UsageSyncEnabled: true, UsageStatus: upstreamStatusOK,
+			UsageNextSyncAt: now - 1, UsageBackfillCursor: today - 86400, UsageBackfillNextSyncAt: now - 1},
+		{Domain: "c-history.example", Enabled: true, UsageSyncEnabled: true, UsageStatus: upstreamStatusOK,
+			UsageNextSyncAt: now + 1800, UsageBackfillCursor: today - 86400, UsageBackfillNextSyncAt: now - 1},
+		{Domain: "d-account-disabled.example", Enabled: false, UsageSyncEnabled: true, UsageStatus: upstreamStatusOK,
+			UsageNextSyncAt: now - 1, UsageBackfillCursor: today - 86400, UsageBackfillNextSyncAt: now - 1},
+		{Domain: "e-usage-disabled.example", Enabled: true, UsageSyncEnabled: false, UsageStatus: upstreamStatusOK,
+			UsageNextSyncAt: now - 1, UsageBackfillCursor: today - 86400, UsageBackfillNextSyncAt: now - 1},
+	}
+	for index := range rows {
+		if err := m.storeDB.Create(&rows[index]).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	due, err := m.loadDueUpstreamUsageAccounts(context.Background(), now, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var domains []string
+	for _, row := range due {
+		domains = append(domains, row.Domain)
+	}
+	if strings.Contains(strings.Join(domains, ","), "a-blocked.example") {
+		t.Fatalf("backed-off account was selected by history lane: %v", domains)
+	}
+	if len(domains) != 2 || !containsString(domains, "b-due.example") || !containsString(domains, "c-history.example") {
+		t.Fatalf("eligible peers were starved or a disabled account was selected: %v", domains)
+	}
+}
+
+func TestScheduledUsageFailureCannotBeRetriedThroughHistoryLane(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		statusCode int
+		wantStatus string
+	}{
+		{name: "rate_limit", statusCode: http.StatusTooManyRequests, wantStatus: upstreamStatusError},
+		{name: "credential", statusCode: http.StatusUnauthorized, wantStatus: upstreamStatusReconnect},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var calls atomic.Int64
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calls.Add(1)
+				if tc.statusCode == http.StatusTooManyRequests {
+					w.Header().Set("Retry-After", "3600")
+				}
+				http.Error(w, `{"message":"scheduled failure"}`, tc.statusCode)
+			}))
+			defer server.Close()
+
+			m := newChannelUpstreamTestMonitor(t)
+			m.cfg.UpstreamUsageSyncEnabled = true
+			m.cfg.UpstreamUsageBackfillDays = 7
+			now := time.Now().Unix()
+			row := ChannelUpstreamAccount{
+				Domain: server.Listener.Addr().String(), Provider: upstreamProviderNewAPI, BaseURL: server.URL,
+				Account: "31", UserID: 31, Enabled: true, UsageSyncEnabled: true,
+				UsageStatus: upstreamStatusPending, UsageBackfillCursor: cstDayStart(now) - 7*86400,
+			}
+			if err := m.persistSyncedUpstreamAccount(context.Background(), &row, newAPICredential{AccessToken: "usage-token"}); err != nil {
+				t.Fatal(err)
+			}
+			m.syncDueUpstreamUsage(context.Background())
+			if calls.Load() != 1 {
+				t.Fatalf("first scheduled pass calls=%d, want 1", calls.Load())
+			}
+			var stored ChannelUpstreamAccount
+			if err := m.storeDB.First(&stored, "domain = ?", row.Domain).Error; err != nil {
+				t.Fatal(err)
+			}
+			if stored.UsageStatus != tc.wantStatus || stored.UsageNextSyncAt <= now || stored.UsageBackfillNextSyncAt != stored.UsageNextSyncAt {
+				t.Fatalf("failure did not isolate both lanes: %+v", stored)
+			}
+			due, err := m.loadDueUpstreamUsageAccounts(context.Background(), time.Now().Unix(), 10)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(due) != 0 {
+				t.Fatalf("failed account remained due through history: %+v", due)
+			}
+			m.syncDueUpstreamUsage(context.Background())
+			if calls.Load() != 1 {
+				t.Fatalf("second scheduler pass bypassed backoff, calls=%d", calls.Load())
+			}
+		})
+	}
+}
+
+func TestHistoryOnlyAuthFailureIsolatesTailAndHistory(t *testing.T) {
+	var calls atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		http.Error(w, `{"message":"credential expired"}`, http.StatusUnauthorized)
+	}))
+	defer server.Close()
+
+	m := newChannelUpstreamTestMonitor(t)
+	m.cfg.UpstreamUsageSyncEnabled = true
+	m.cfg.UpstreamUsageBackfillDays = 7
+	now := time.Now().Unix()
+	today := cstDayStart(now)
+	row := ChannelUpstreamAccount{
+		Domain: server.Listener.Addr().String(), Provider: upstreamProviderNewAPI, BaseURL: server.URL,
+		Account: "41", UserID: 41, Enabled: true, UsageSyncEnabled: true,
+		UsageStatus: upstreamStatusOK, UsageDataUntil: now, UsageNextSyncAt: now + 3600,
+		UsageBackfillCursor: today - 86400, UsageBackfillNextSyncAt: now - 1,
+	}
+	if err := m.persistSyncedUpstreamAccount(context.Background(), &row, newAPICredential{AccessToken: "history-token"}); err != nil {
+		t.Fatal(err)
+	}
+	synced, err := m.syncStoredUpstreamUsage(context.Background(), row.Domain)
+	if err == nil {
+		t.Fatal("history-only 401 unexpectedly succeeded")
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("history-only 401 calls=%d, want 1", calls.Load())
+	}
+	if synced.UsageStatus != upstreamStatusReconnect || synced.UsageNextSyncAt != upstreamAccountIsolatedUntil ||
+		synced.UsageBackfillNextSyncAt != upstreamAccountIsolatedUntil {
+		t.Fatalf("history auth failure did not isolate both lanes: %+v", synced)
+	}
+	view := m.channelUpstreamAccountView(synced)
+	if view.UsageEffectiveStatus != upstreamStatusReconnect {
+		t.Fatalf("history auth failure remained visually healthy: %+v", view)
+	}
+	due, loadErr := m.loadDueUpstreamUsageAccounts(context.Background(), time.Now().Unix(), 10)
+	if loadErr != nil {
+		t.Fatal(loadErr)
+	}
+	if len(due) != 0 {
+		t.Fatalf("auth-isolated history account remained scheduled: %+v", due)
+	}
+}
+
 func TestPlanAICodeWithUsageSyncRefreshesTodayAndBackfills31Days(t *testing.T) {
 	now := time.Date(2026, 8, 19, 11, 30, 0, 0, cstLocation).Unix()
 	today := cstDayStart(now)
@@ -142,6 +366,165 @@ func TestPlanAICodeWithUsageSyncRefreshesTodayAndBackfills31Days(t *testing.T) {
 	plan = planUpstreamUsageSync(row, now, 90)
 	if plan.backfillTo != today {
 		t.Fatalf("last AICodeWith history batch must stop before the open day: %+v", plan)
+	}
+}
+
+func TestPlanSub2APIUsageSyncRereadsOpenNaturalDay(t *testing.T) {
+	now := time.Date(2026, 8, 19, 11, 30, 0, 0, cstLocation).Unix()
+	today := cstDayStart(now)
+	row := ChannelUpstreamAccount{
+		Provider:            upstreamProviderSub2API,
+		UsageDataUntil:      today + 10*3600,
+		UsageBackfillCursor: today - 10*86400,
+	}
+	plan := planUpstreamUsageSync(row, now, 90)
+	if plan.tailFrom != today || plan.tailTo != now {
+		t.Fatalf("Sub2API tail must re-read today's aggregate: %+v", plan)
+	}
+	if plan.backfillFrom != row.UsageBackfillCursor || plan.backfillTo != row.UsageBackfillCursor+86400 {
+		t.Fatalf("Sub2API history must advance one natural day: %+v", plan)
+	}
+}
+
+func TestFetchSub2APIUsageTrendKeepsZeroAndPartialHours(t *testing.T) {
+	from := time.Date(2026, 8, 19, 0, 0, 0, 0, cstLocation).Unix()
+	to := from + 2*3600 + 900
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/usage/dashboard/trend" || r.Header.Get("Authorization") != "Bearer sub2-access" {
+			http.Error(w, `{"message":"bad request"}`, http.StatusUnauthorized)
+			return
+		}
+		q := r.URL.Query()
+		if q.Get("start_date") != "2026-08-19" || q.Get("end_date") != "2026-08-19" || q.Get("timezone") != "Asia/Shanghai" || q.Get("granularity") != "hour" {
+			http.Error(w, `{"message":"bad range"}`, http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"code": 0, "data": map[string]any{
+			"start_date": "2026-08-19", "end_date": "2026-08-19", "granularity": "hour",
+			"trend": []any{
+				map[string]any{"date": "2026-08-19 00:00", "requests": 3, "total_tokens": 120, "actual_cost": 1.25},
+				map[string]any{"date": "2026-08-19 02:00", "requests": 1, "total_tokens": 10, "actual_cost": 0.2},
+			},
+		}})
+	}))
+	defer server.Close()
+	result, err := fetchSub2APIUsageTrend(context.Background(), newUpstreamHTTPClient(3*time.Second), ChannelUpstreamAccount{
+		Domain: "sub2.example", Provider: upstreamProviderSub2API, BaseURL: server.URL,
+	}, sub2APICredential{AccessToken: "sub2-access"}, from, to, newUpstreamUsageRequestPacer(2, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Adapter != upstreamUsageAdapterSub2Trend || result.DataUntil != to || len(result.Hours) != 3 {
+		t.Fatalf("Sub2API trend result=%+v", result)
+	}
+	if result.Hours[0].Requests != 3 || result.Hours[0].Tokens != 120 || math.Abs(result.Hours[0].CostUSD-1.25) > 1e-9 || result.Hours[0].BucketSeconds != 3600 {
+		t.Fatalf("first bucket=%+v", result.Hours[0])
+	}
+	if result.Hours[1].Requests != 0 || result.Hours[1].CostUSD != 0 || result.Hours[1].BucketSeconds != 3600 {
+		t.Fatalf("zero bucket=%+v", result.Hours[1])
+	}
+	if result.Hours[2].Requests != 1 || result.Hours[2].BucketSeconds != 900 {
+		t.Fatalf("partial bucket=%+v", result.Hours[2])
+	}
+}
+
+func TestFetchSub2APIUsageFallsBackToDailyStatsOnce(t *testing.T) {
+	from := time.Date(2026, 8, 18, 0, 0, 0, 0, cstLocation).Unix()
+	var trendCalls, statsCalls atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/api/v1/usage/dashboard/trend":
+			trendCalls.Add(1)
+			http.Error(w, `{"message":"not found"}`, http.StatusNotFound)
+		case "/api/v1/usage/stats":
+			statsCalls.Add(1)
+			_, _ = w.Write([]byte(`{"code":0,"data":{"total_requests":8,"total_tokens":900,"total_actual_cost":"7.5"}}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	row := ChannelUpstreamAccount{Domain: "legacy-sub2.example", Provider: upstreamProviderSub2API, BaseURL: server.URL}
+	cred := sub2APICredential{AccessToken: "sub2-access"}
+	pacer := newUpstreamUsageRequestPacer(4, 0)
+	result, err := fetchSub2APIUsageWindow(context.Background(), newUpstreamHTTPClient(3*time.Second), row, cred, from, from+86400, pacer, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Adapter != upstreamUsageAdapterSub2Stats || len(result.Hours) != 1 || result.Hours[0].BucketSeconds != 86400 || result.Hours[0].Requests != 8 || math.Abs(result.Hours[0].CostUSD-7.5) > 1e-9 {
+		t.Fatalf("fallback result=%+v", result)
+	}
+	// Once capability detection has been persisted, the caller passes the
+	// selected adapter and no longer probes the missing trend route.
+	if _, err := fetchSub2APIUsageWindow(context.Background(), newUpstreamHTTPClient(3*time.Second), row, cred, from, from+86400, pacer, result.Adapter); err != nil {
+		t.Fatal(err)
+	}
+	if trendCalls.Load() != 1 || statsCalls.Load() != 2 {
+		t.Fatalf("trend calls=%d stats calls=%d", trendCalls.Load(), statsCalls.Load())
+	}
+}
+
+func TestFetchSub2APIUsageDoesNotFallbackOnRateLimit(t *testing.T) {
+	from := time.Date(2026, 8, 18, 0, 0, 0, 0, cstLocation).Unix()
+	var trendCalls, statsCalls atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/usage/dashboard/trend":
+			trendCalls.Add(1)
+			w.Header().Set("Retry-After", "120")
+			http.Error(w, `{"message":"rate limited"}`, http.StatusTooManyRequests)
+		case "/api/v1/usage/stats":
+			statsCalls.Add(1)
+			http.Error(w, `{"message":"must not be called"}`, http.StatusInternalServerError)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	_, err := fetchSub2APIUsageWindow(context.Background(), newUpstreamHTTPClient(3*time.Second), ChannelUpstreamAccount{
+		Domain: "limited-sub2.example", Provider: upstreamProviderSub2API, BaseURL: server.URL,
+	}, sub2APICredential{AccessToken: "sub2-access"}, from, from+86400, newUpstreamUsageRequestPacer(4, 0), "")
+	if err == nil {
+		t.Fatal("429 must fail closed")
+	}
+	var statusErr *upstreamHTTPError
+	if !errors.As(err, &statusErr) || statusErr.Status != http.StatusTooManyRequests || statusErr.RetryAt <= time.Now().Unix() {
+		t.Fatalf("rate-limit error=%v", err)
+	}
+	if trendCalls.Load() != 1 || statsCalls.Load() != 0 {
+		t.Fatalf("trend calls=%d stats calls=%d", trendCalls.Load(), statsCalls.Load())
+	}
+}
+
+func TestSyncSub2APIUsageRefreshesRotatingCredential(t *testing.T) {
+	from := time.Date(2026, 8, 19, 0, 0, 0, 0, cstLocation).Unix()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/api/v1/auth/refresh":
+			_, _ = w.Write([]byte(`{"code":0,"data":{"access_token":"access-new","refresh_token":"refresh-new","expires_in":3600}}`))
+		case "/api/v1/usage/dashboard/trend":
+			if r.Header.Get("Authorization") != "Bearer access-new" {
+				http.Error(w, `{"message":"bad bearer"}`, http.StatusUnauthorized)
+				return
+			}
+			_, _ = w.Write([]byte(`{"code":0,"data":{"start_date":"2026-08-19","end_date":"2026-08-19","granularity":"hour","trend":[]}}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	result, updated, err := syncSub2APIUsage(context.Background(), newUpstreamHTTPClient(3*time.Second), ChannelUpstreamAccount{
+		Domain: "sub2.example", Provider: upstreamProviderSub2API, BaseURL: server.URL,
+	}, sub2APICredential{AccessToken: "access-old", RefreshToken: "refresh-old", ExpiresAt: time.Now().Add(-time.Minute).Unix()}, from, from+3600, newUpstreamUsageRequestPacer(3, 0), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.AccessToken != "access-new" || updated.RefreshToken != "refresh-new" || result.Adapter != upstreamUsageAdapterSub2Trend {
+		t.Fatalf("result=%+v credential=%+v", result, updated)
 	}
 }
 
@@ -301,6 +684,173 @@ func TestSyncStoredAICodeWithUsagePersistsTailAndHistoryAtomically(t *testing.T)
 	if len(buckets) != 2 || buckets[0].HourTs != today-86400 || buckets[0].BucketSeconds != 86400 || buckets[0].Requests != 3 || buckets[0].CostUSD != 3 ||
 		buckets[1].HourTs != today || buckets[1].BucketSeconds <= 0 || buckets[1].BucketSeconds > 86400 || buckets[1].Requests != 3 || buckets[1].CostUSD != 3 {
 		t.Fatalf("tail/history buckets=%+v", buckets)
+	}
+}
+
+func TestAICodeWithAllKeysReconnectIsolatesAccountAndDoesNotStarvePeer(t *testing.T) {
+	var calls atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		http.Error(w, `{"error":{"type":"UNAUTHORIZED","message":"expired"}}`, http.StatusUnauthorized)
+	}))
+	defer server.Close()
+
+	m := newChannelUpstreamTestMonitor(t)
+	m.cfg.UpstreamUsageSyncEnabled = true
+	m.cfg.UpstreamUsageBackfillDays = 1
+	now := time.Now().Unix()
+	keys := []string{"sk-acw-expired-a", "sk-acw-expired-b", "sk-acw-expired-c", "sk-acw-expired-d"}
+	row := ChannelUpstreamAccount{
+		Domain: server.Listener.Addr().String(), Provider: upstreamProviderAICodeWith, BaseURL: server.URL,
+		Account: aiCodeWithKeyIdentity(keys), Enabled: true, Status: upstreamStatusOK,
+		UsageSyncEnabled: true, UsageStatus: upstreamStatusPending,
+	}
+	if err := m.persistSyncedUpstreamAccount(context.Background(), &row, aiCodeWithCredential{APIKeys: keys}); err != nil {
+		t.Fatal(err)
+	}
+	synced, err := m.syncStoredUpstreamUsage(context.Background(), row.Domain)
+	if err == nil {
+		t.Fatal("all-key authentication failure unexpectedly succeeded")
+	}
+	if calls.Load() != int64(len(keys)) {
+		t.Fatalf("calls=%d, want one bounded attempt per key (%d)", calls.Load(), len(keys))
+	}
+	if synced.UsageStatus != upstreamStatusReconnect || synced.UsageNextSyncAt != upstreamAccountIsolatedUntil ||
+		synced.UsageBackfillNextSyncAt != upstreamAccountIsolatedUntil {
+		t.Fatalf("all-key reconnect did not isolate the account: %+v", synced)
+	}
+
+	peer := ChannelUpstreamAccount{
+		Domain: "peer.example", Provider: upstreamProviderNewAPI, BaseURL: "https://peer.example",
+		Account: "52", UserID: 52, Enabled: true, UsageSyncEnabled: true,
+		UsageStatus: upstreamStatusPending, UsageNextSyncAt: now - 1,
+	}
+	if err := m.storeDB.Create(&peer).Error; err != nil {
+		t.Fatal(err)
+	}
+	due, loadErr := m.loadDueUpstreamUsageAccounts(context.Background(), time.Now().Unix(), 1)
+	if loadErr != nil {
+		t.Fatal(loadErr)
+	}
+	if len(due) != 1 || due[0].Domain != peer.Domain {
+		t.Fatalf("isolated AICodeWith account starved due peer: %+v", due)
+	}
+}
+
+func TestAICodeWithRoundWaitUsesEarliestRunnableKeyDeadline(t *testing.T) {
+	m := newChannelUpstreamTestMonitor(t)
+	now := time.Date(2026, 8, 23, 12, 0, 0, 0, cstLocation).Unix()
+	round := AICodeWithUsageRound{Domain: "wait.example", Kind: "tail", RoundID: "round-wait", CredentialSetVersion: "v1", TotalKeys: 4, Status: upstreamStatusPending}
+	if err := m.storeDB.Create(&round).Error; err != nil {
+		t.Fatal(err)
+	}
+	states := []AICodeWithKeySyncState{
+		{Domain: round.Domain, SlotID: "completed", CredentialSetVersion: round.CredentialSetVersion, TailRoundID: round.RoundID},
+		{Domain: round.Domain, SlotID: "isolated", CredentialSetVersion: round.CredentialSetVersion, NextSyncAt: upstreamAccountIsolatedUntil},
+		{Domain: round.Domain, SlotID: "later", CredentialSetVersion: round.CredentialSetVersion, NextSyncAt: now + 120},
+		{Domain: round.Domain, SlotID: "earlier", CredentialSetVersion: round.CredentialSetVersion, NextSyncAt: now + 60},
+	}
+	for i := range states {
+		if err := m.storeDB.Create(&states[i]).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	allIsolated, retryAt, err := m.aiCodeWithRoundWaitState(context.Background(), round.Domain, round.CredentialSetVersion, round.Kind, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if allIsolated || retryAt != now+60 {
+		t.Fatalf("wait state all_isolated=%v retry_at=%d, want false/%d", allIsolated, retryAt, now+60)
+	}
+}
+
+func TestSyncStoredSub2APIUsagePublishesTailHistoryAdapterAndRotatedCredential(t *testing.T) {
+	var refreshCalls, trendCalls atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/api/v1/auth/refresh":
+			refreshCalls.Add(1)
+			_, _ = w.Write([]byte(`{"code":0,"data":{"access_token":"access-rotated","refresh_token":"refresh-rotated","expires_in":3600}}`))
+		case "/api/v1/usage/dashboard/trend":
+			trendCalls.Add(1)
+			if r.Header.Get("Authorization") != "Bearer access-rotated" {
+				http.Error(w, `{"message":"bad bearer"}`, http.StatusUnauthorized)
+				return
+			}
+			day := r.URL.Query().Get("start_date")
+			if day == "" || day != r.URL.Query().Get("end_date") || r.URL.Query().Get("timezone") != "Asia/Shanghai" || r.URL.Query().Get("granularity") != "hour" {
+				http.Error(w, `{"message":"bad range"}`, http.StatusBadRequest)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"code": 0, "data": map[string]any{
+				"start_date": day, "end_date": day, "granularity": "hour",
+				"trend": []any{map[string]any{"date": day + " 00:00", "requests": 4, "total_tokens": 80, "actual_cost": "1.5"}},
+			}})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	m := newChannelUpstreamTestMonitor(t)
+	m.cfg.UpstreamUsageBackfillDays = 1
+	now := time.Now().Unix()
+	today := cstDayStart(now)
+	row := ChannelUpstreamAccount{
+		Domain: server.Listener.Addr().String(), Provider: upstreamProviderSub2API, BaseURL: server.URL,
+		Account: "finance@example.com", Enabled: true, Status: upstreamStatusOK,
+		UsageSyncEnabled: true, UsageStatus: upstreamStatusPending, UsageBackfillCursor: today - 86400,
+	}
+	oldCredential := sub2APICredential{AccessToken: "access-expired", RefreshToken: "refresh-old", ExpiresAt: now - 60}
+	if err := m.persistSyncedUpstreamAccount(context.Background(), &row, oldCredential); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	synced, err := m.syncStoredUpstreamUsage(ctx, row.Domain)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if synced.UsageStatus != upstreamStatusOK || !synced.UsageBackfillDone || synced.UsageAdapter != upstreamUsageAdapterSub2Trend || synced.UsageDataUntil < today {
+		t.Fatalf("stored Sub2API sync state=%+v", synced)
+	}
+	if refreshCalls.Load() != 1 || trendCalls.Load() != 2 {
+		t.Fatalf("refresh calls=%d trend calls=%d, want 1/2", refreshCalls.Load(), trendCalls.Load())
+	}
+	var stored ChannelUpstreamAccount
+	if err := m.storeDB.First(&stored, "domain = ?", row.Domain).Error; err != nil {
+		t.Fatal(err)
+	}
+	var rotated sub2APICredential
+	if err := m.openUpstreamCredential(stored, &rotated); err != nil {
+		t.Fatal(err)
+	}
+	if rotated.AccessToken != "access-rotated" || rotated.RefreshToken != "refresh-rotated" || rotated.ExpiresAt <= now {
+		t.Fatalf("rotating credential was not durably persisted: %+v", rotated)
+	}
+	var buckets []ChannelUpstreamUsageHour
+	if err := m.storeDB.Where("domain = ?", row.Domain).Order("hour_ts ASC").Find(&buckets).Error; err != nil {
+		t.Fatal(err)
+	}
+	if len(buckets) < 25 || buckets[0].HourTs != today-86400 || buckets[0].BucketSeconds != 3600 || buckets[0].Requests != 4 || buckets[0].CostUSD != 1.5 {
+		t.Fatalf("Sub2API history/tail buckets=%+v", buckets)
+	}
+	var historyBuckets int
+	var tailRequests int64
+	for _, bucket := range buckets {
+		if bucket.Provider != upstreamProviderSub2API || bucket.BucketSeconds <= 0 || bucket.BucketSeconds > 3600 {
+			t.Fatalf("invalid persisted Sub2API bucket=%+v", bucket)
+		}
+		if bucket.HourTs >= today-86400 && bucket.HourTs < today {
+			historyBuckets++
+		}
+		if bucket.HourTs >= today {
+			tailRequests += bucket.Requests
+		}
+	}
+	if historyBuckets != 24 || tailRequests != 4 {
+		t.Fatalf("history buckets=%d tail requests=%d", historyBuckets, tailRequests)
 	}
 }
 

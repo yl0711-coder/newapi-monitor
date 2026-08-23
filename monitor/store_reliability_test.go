@@ -635,16 +635,98 @@ func TestRuntimeBackupSetRejectsCrossStoreRevisionMismatchAndTampering(t *testin
 		}
 	}
 
-	if err := m.usageFactsStore().Model(&UsageFactPublishedMember{}).Where("user_id=77").Update("tracked_revision", 1).Error; err != nil {
+	// The first lifecycle used revision 0 in legacy facts stores while the
+	// migrated main-store control starts at revision 1. It must remain a valid
+	// recoverable pair; only later lifecycle mismatches are unsafe.
+	if err := m.usageFactsStore().Model(&UsageFactPublishedMember{}).Where("user_id=77").Update("tracked_revision", 0).Error; err != nil {
 		t.Fatal(err)
 	}
-	manifestPath, err := m.createStoreBackupSet(context.Background(), now.Add(time.Second), true, true)
-	if err != nil {
+	if err := m.storeDB.Model(&UsageMemberControl{}).Where("user_id=77").Update("active", false).Error; err != nil {
 		t.Fatal(err)
+	}
+	if _, err := m.createStoreBackupSet(context.Background(), now.Add(time.Second), true, true); err == nil ||
+		!strings.Contains(err.Error(), "权限版本不一致") {
+		t.Fatalf("主库非活动成员不得被 facts revision 0 绕过: %v", err)
+	}
+	if err := m.storeDB.Model(&UsageMemberControl{}).Where("user_id=77").Update("active", true).Error; err != nil {
+		t.Fatal(err)
+	}
+	manifestPath, err := m.createStoreBackupSet(context.Background(), now.Add(2*time.Second), true, true)
+	if err != nil {
+		t.Fatalf("旧格式 facts revision 0 与 main revision 1 应可成套备份: %v", err)
 	}
 	manifest, err := verifyStoreBackupSetManifest(context.Background(), manifestPath)
 	if err != nil {
 		t.Fatal(err)
+	}
+	legacyRestoreDir := filepath.Join(dir, "legacy-revision-restore")
+	if err := RestoreStoreBackupSet(context.Background(), manifestPath, legacyRestoreDir, "main.db", "facts.db"); err != nil {
+		t.Fatalf("旧格式 revision 0/1 备份集无法端到端恢复: %v", err)
+	}
+	legacyMain, err := sql.Open("sqlite", sqliteReadOnlyDSN(filepath.Join(legacyRestoreDir, "main.db")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var restoredMainRevision int64
+	var restoredActive bool
+	if err := legacyMain.QueryRow("SELECT tracked_revision,active FROM usage_member_controls WHERE user_id=77").Scan(&restoredMainRevision, &restoredActive); err != nil {
+		_ = legacyMain.Close()
+		t.Fatal(err)
+	}
+	if err := legacyMain.Close(); err != nil {
+		t.Fatal(err)
+	}
+	legacyFacts, err := sql.Open("sqlite", sqliteReadOnlyDSN(filepath.Join(legacyRestoreDir, "facts.db")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var restoredFactsRevision int64
+	if err := legacyFacts.QueryRow("SELECT tracked_revision FROM usage_fact_published_members WHERE user_id=77").Scan(&restoredFactsRevision); err != nil {
+		_ = legacyFacts.Close()
+		t.Fatal(err)
+	}
+	if err := legacyFacts.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if restoredMainRevision != 1 || !restoredActive || restoredFactsRevision != 0 {
+		t.Fatalf("旧格式恢复后跨库版本被改写: main=%d active=%v facts=%d", restoredMainRevision, restoredActive, restoredFactsRevision)
+	}
+	// Runtime backup Version, not the creating image's migration-plan ID, is
+	// the restore compatibility contract. Model the real v14 -> v15 upgrade:
+	// the v15 binary must restore and activate the existing v14 set before its
+	// ordinary migration snapshot/gate runs.
+	historicalDir := filepath.Join(dir, "historical-plan-backup")
+	if err := os.Mkdir(historicalDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	manifest.MigrationPlan = "main-facts-schema-20260822-v14"
+	for _, file := range []*storeBackupFileManifest{manifest.Main, manifest.Facts} {
+		data, readErr := os.ReadFile(filepath.Join(m.cfg.StoreBackupDir, file.File))
+		if readErr != nil {
+			t.Fatal(readErr)
+		}
+		if writeErr := os.WriteFile(filepath.Join(historicalDir, file.File), data, 0o600); writeErr != nil {
+			t.Fatal(writeErr)
+		}
+	}
+	historicalManifestData, err := json.MarshalIndent(manifest, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	historicalManifestPath := filepath.Join(historicalDir, filepath.Base(manifestPath))
+	if err := os.WriteFile(historicalManifestPath, append(historicalManifestData, '\n'), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	historicalRestoreDir := filepath.Join(dir, "historical-plan-restore")
+	if err := RestoreStoreBackupSet(context.Background(), historicalManifestPath, historicalRestoreDir, "main.db", "facts.db"); err != nil {
+		t.Fatalf("v15 无法恢复 v14 备份集: %v", err)
+	}
+	activation := &Monitor{}
+	if err := activation.preflightStoreRestoreActivation(context.Background(), filepath.Join(historicalRestoreDir, "main.db"), filepath.Join(historicalRestoreDir, "facts.db")); err != nil {
+		t.Fatalf("v14 READY 无法由 v15 启动门禁激活: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(historicalRestoreDir, storeBackupRestoreActiveName)); err != nil {
+		t.Fatalf("跨 plan 恢复未发布 ACTIVATED: %v", err)
 	}
 	factsPath := filepath.Join(m.cfg.StoreBackupDir, manifest.Facts.File)
 	f, err := os.OpenFile(factsPath, os.O_WRONLY|os.O_APPEND, 0)

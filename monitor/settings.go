@@ -67,15 +67,16 @@ type Settings struct {
 	// 上游账户凭据只保存在 Monitor 本地 SQLite，使用该密钥经 AES-256-GCM 加密。
 	// 留空时复用 MONITOR_SESSION_SECRET；生产必须至少固定配置二者之一，否则拒绝保存凭据。
 	UpstreamCredentialSecret string // MONITOR_UPSTREAM_CREDENTIAL_SECRET
-	// 关闭后禁止后台主动轮询已配置的上游账户。默认开启，保证已有生产行为不变；
+	// 关闭后禁止后台主动轮询已配置的上游账户余额。默认开启，保证已有生产行为不变；
 	// 本地验收可显式关闭，避免启动页面时向任何上游站点发出请求。
 	UpstreamSyncEnabled    bool // MONITOR_UPSTREAM_SYNC_ENABLED,默认 true
 	UpstreamSyncMinutes    int  // MONITOR_UPSTREAM_SYNC_MINUTES,默认 5；失败时按账户退避，最长 60 分钟
 	UpstreamSyncTimeoutSec int  // MONITOR_UPSTREAM_SYNC_TIMEOUT_SECONDS,默认 15
-	// 上游使用日志与余额是两条独立同步链。日志仅在账户显式启用后后台读取，
-	// 默认 30 分钟一次；页面访问绝不会触发访问上游。
-	UpstreamUsageSyncMinutes  int // MONITOR_UPSTREAM_USAGE_SYNC_MINUTES,默认 30，最小 15
-	UpstreamUsageBackfillDays int // MONITOR_UPSTREAM_USAGE_BACKFILL_DAYS,默认 90，首次低频补齐范围
+	// 上游使用日志与余额是两条独立同步链。日志全局开关默认关闭，
+	// 只有全局开关与账户开关同时开启才会后台读取。页面访问绝不会触发上游请求。
+	UpstreamUsageSyncEnabled  bool // MONITOR_UPSTREAM_USAGE_SYNC_ENABLED,默认 false；新功能灰度闸门
+	UpstreamUsageSyncMinutes  int  // MONITOR_UPSTREAM_USAGE_SYNC_MINUTES,默认 30，最小 15
+	UpstreamUsageBackfillDays int  // MONITOR_UPSTREAM_USAGE_BACKFILL_DAYS,默认 90，首次低频补齐范围
 
 	// 客户端「用量报表」独立监听(portal.go):客户域名只指这个端口,上面不存在任何管理端路由。
 	// 留空 = 关闭(默认);如 ":8092"。
@@ -254,6 +255,7 @@ func LoadSettings() Settings {
 		UpstreamSyncEnabled:                      env("MONITOR_UPSTREAM_SYNC_ENABLED", "true") == "true",
 		UpstreamSyncMinutes:                      envInt("MONITOR_UPSTREAM_SYNC_MINUTES", 5),
 		UpstreamSyncTimeoutSec:                   envInt("MONITOR_UPSTREAM_SYNC_TIMEOUT_SECONDS", 15),
+		UpstreamUsageSyncEnabled:                 env("MONITOR_UPSTREAM_USAGE_SYNC_ENABLED", "false") == "true",
 		UpstreamUsageSyncMinutes:                 envInt("MONITOR_UPSTREAM_USAGE_SYNC_MINUTES", 30),
 		UpstreamUsageBackfillDays:                envInt("MONITOR_UPSTREAM_USAGE_BACKFILL_DAYS", 90),
 		PortalAddr:                               env("MONITOR_PORTAL_ADDR", ""),

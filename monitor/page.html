@@ -256,7 +256,8 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
   .sync-toolbar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin:0 0 14px}.sync-toolbar .muted{font-size:12px}.sync-toolbar .btn{margin-left:auto}
   .sync-overview{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-bottom:14px}.sync-card{min-height:112px;padding:15px 16px;border:1px solid var(--border);border-radius:10px;background:rgba(255,255,255,.018)}.sync-card small{display:block;color:var(--text-muted);font-size:12px}.sync-card b{display:block;margin-top:10px;font-size:20px;line-height:1.25}.sync-card p{margin:7px 0 0;color:var(--text-muted);font-size:12px;line-height:1.45}.sync-card.ok{border-color:rgba(52,211,153,.30);background:rgba(52,211,153,.055)}.sync-card.warn{border-color:rgba(245,158,11,.32);background:rgba(245,158,11,.055)}.sync-card.bad{border-color:rgba(239,68,68,.34);background:rgba(239,68,68,.06)}
   .sync-status{display:inline-flex;align-items:center;gap:6px;font-size:12px;font-weight:600}.sync-status:before{content:'';width:8px;height:8px;border-radius:50%;background:#94a3b8}.sync-status.ok{color:#6ee7b7}.sync-status.ok:before{background:#34d399}.sync-status.warn{color:#fbbf24}.sync-status.warn:before{background:#f59e0b}.sync-status.bad{color:#fca5a5}.sync-status.bad:before{background:#ef4444}.sync-section{margin-bottom:14px}.sync-section .card-header{display:flex;align-items:center;gap:9px}.sync-section .card-header .muted{font-size:12px;font-weight:400}.sync-kv{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:1px;background:var(--border)}.sync-kv>div{min-width:0;padding:12px 14px;background:var(--card)}.sync-kv small{display:block;color:var(--text-muted);font-size:11px}.sync-kv b{display:block;margin-top:5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:14px}.sync-table-note{padding:10px 14px;color:var(--text-muted);font-size:12px}
-  @media(max-width:900px){.sync-overview{grid-template-columns:repeat(2,minmax(0,1fr))}.sync-kv{grid-template-columns:repeat(2,minmax(0,1fr))}}@media(max-width:520px){.sync-overview,.sync-kv{grid-template-columns:1fr}.sync-toolbar .btn{margin-left:0}}
+  .sync-upstream-summary{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:1px;background:var(--border);border-bottom:1px solid var(--border)}.sync-upstream-summary>div{padding:12px 14px;background:var(--card)}.sync-upstream-summary small{display:block;color:var(--text-muted);font-size:11px}.sync-upstream-summary b{display:block;margin-top:5px;font-size:18px}.sync-upstream-list{display:flex;flex-direction:column}.sync-upstream-account{padding:15px 16px;border-top:1px solid var(--border)}.sync-upstream-account:first-child{border-top:0}.sync-upstream-head{display:flex;align-items:flex-start;justify-content:space-between;gap:14px;margin-bottom:12px}.sync-upstream-head>div b{display:block;font-size:15px}.sync-upstream-head>div small{display:block;margin-top:4px;color:var(--text-muted);font-size:11px}.sync-upstream-lanes{display:grid;grid-template-columns:1fr 1.45fr;gap:10px}.sync-upstream-lane{min-width:0;padding:12px 13px;border:1px solid var(--border);border-radius:8px;background:rgba(255,255,255,.018)}.sync-upstream-lane>header{display:flex;align-items:center;justify-content:space-between;gap:10px}.sync-upstream-lane>header b{font-size:12px}.sync-upstream-lane>strong{display:block;margin-top:10px;font-size:15px}.sync-upstream-lane>p{margin:5px 0 0;color:var(--text-muted);font-size:11px;line-height:1.55}.sync-upstream-error{margin-top:8px;padding-top:8px;border-top:1px solid var(--border);color:#fca5a5!important;overflow-wrap:anywhere}.sync-upstream-progress{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:10px}.sync-upstream-progress span{padding:8px 9px;border-radius:6px;background:rgba(255,255,255,.025)}.sync-upstream-progress small,.sync-upstream-progress b{display:block}.sync-upstream-progress small{color:var(--text-muted);font-size:10px}.sync-upstream-progress b{margin-top:4px;font-size:12px}
+  @media(max-width:900px){.sync-overview,.sync-upstream-summary{grid-template-columns:repeat(2,minmax(0,1fr))}.sync-kv{grid-template-columns:repeat(2,minmax(0,1fr))}.sync-upstream-lanes{grid-template-columns:1fr}}@media(max-width:520px){.sync-overview,.sync-kv,.sync-upstream-summary{grid-template-columns:1fr}.sync-toolbar .btn{margin-left:0}.sync-upstream-head{flex-direction:column}.sync-upstream-progress{grid-template-columns:1fr}}
   code{background:rgba(255,255,255,.06);padding:1px 5px;border-radius:4px;font-size:12px}
   .tabs{display:flex;gap:4px;margin:16px 0 0;border-bottom:1px solid var(--border)}
   .tabs .tab{padding:10px 20px;font-size:14px;color:var(--text-muted);cursor:pointer;border-bottom:2px solid transparent;user-select:none}
@@ -327,7 +328,7 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
   </section>
 
   <section class="sync-section card">
-    <div class="card-header">📡 渠道余额与消费同步 <span class="muted">按上游主域名显示本地已同步状态；不读取上游</span></div>
+    <div class="card-header">📡 上游账户同步 <span class="muted">余额快照与消费账单分开展示；只读本地状态，不会因刷新页面访问上游</span></div>
     <div id="syncChannels"></div>
   </section>
 
@@ -584,10 +585,10 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
         </section>
       </section>
       <label class="cm-upstream-enabled"><input id="cmUpstreamEnabled" type="checkbox" checked><span><b>启用后台自动同步</b><small>停用后保留配置和最后余额，但不再访问该上游</small></span></label>
-      <label class="cm-upstream-enabled cm-upstream-usage-option"><input id="cmUpstreamUsageEnabled" type="checkbox"><span><b id="cmUpstreamUsageLabel">同步使用日志</b><small id="cmUpstreamUsageHelp">默认每 30 分钟串行汇总一次；首次低频补齐历史数据，不保存上游原始日志或用户内容</small></span></label>
+      <label class="cm-upstream-enabled cm-upstream-usage-option"><input id="cmUpstreamUsageEnabled" type="checkbox"><span><b id="cmUpstreamUsageLabel">同步上游消费账单</b><small id="cmUpstreamUsageHelp">默认每 30 分钟串行汇总一次；当天水位和历史补数独立运行，不保存上游原始内容</small></span></label>
       <section class="cm-upstream-security"><b>凭据安全</b><span>访问令牌与 AICodeWith API Key 在本地 SQLite 中经 AES-256-GCM 加密；页面和接口只返回脱敏账户信息。Sub2API 的 refresh token 轮换会原子更新。</span></section>
     </div>
-    <footer><span id="cmUpstreamMessage"></span><div><button type="button" class="cm-upstream-cancel" id="cmUpstreamCancel">取消</button><button type="button" class="cm-upstream-sync" id="cmUpstreamSync" hidden>立即同步</button><button type="button" class="cm-upstream-save" id="cmUpstreamSave">保存并验证</button></div></footer>
+    <footer><span id="cmUpstreamMessage"></span><div><button type="button" class="cm-upstream-cancel" id="cmUpstreamCancel">取消</button><button type="button" class="cm-upstream-sync" id="cmUpstreamSync" hidden>同步余额</button><button type="button" class="cm-upstream-sync" id="cmUpstreamUsageSync" hidden>同步消费</button><button type="button" class="cm-upstream-save" id="cmUpstreamSave">保存并验证</button></div></footer>
   </aside>
 </div>
 
@@ -1527,16 +1528,46 @@ function syncRenderChannels(report){
   const el=document.getElementById('syncChannels');
   if(!report.enabled){el.innerHTML='<div class="sync-table-note">渠道管理未启用，暂无上游账户同步状态。</div>';return 'warn'}
   const domains=(report.domains||[]).filter(x=>x.upstream&&x.upstream.configured);
-  if(!domains.length){el.innerHTML='<div class="sync-table-note">尚未配置上游账户；渠道余额与上游消费不会同步。</div>';return 'warn'}
-  let level='ok';
-  const rows=domains.map(x=>{
-    const u=x.upstream||{},balanceOK=!u.enabled||u.status==='ok';
-    const usageOK=!u.usage_sync_enabled||u.usage_status==='ok';
-    if(!balanceOK||!usageOK)level='warn';
-    const state=balanceOK&&usageOK?'正常':(!u.enabled?'已停用':'需要关注');
-    return `<tr><td>${esc(x.domain||x.key||'—')}</td><td>${esc(u.provider_name||u.provider||'—')}</td><td><span class="sync-status ${balanceOK?'ok':'warn'}">${esc(u.status||'未同步')}</span><br><span class="muted">${syncTime(u.last_success_at)}</span></td><td>${u.usage_sync_enabled?`<span class="sync-status ${usageOK?'ok':'warn'}">${esc(u.usage_status||'未同步')}</span><br><span class="muted">截至 ${syncTime(u.usage_data_until)}</span>`:'<span class="muted">未启用</span>'}</td><td>${esc(state)}</td><td class="history-error">${esc(u.last_error||u.usage_last_error||'—')}</td></tr>`;
+  if(!domains.length){el.innerHTML='<div class="sync-table-note">尚未配置上游账户；余额与上游消费账单不会同步。</div>';return 'warn'}
+  const now=Math.floor(Date.now()/1000),statusInfo=(status,enabled=true)=>{
+    if(!enabled)return {label:'已停用',level:'neutral'};
+    if(status==='ok')return {label:'正常',level:'ok'};
+    if(status==='error')return {label:'异常',level:'bad'};
+    if(status==='reconnect')return {label:'需重新连接',level:'bad'};
+    if(status==='unsupported')return {label:'待适配',level:'bad'};
+    if(status==='stale')return {label:'数据陈旧',level:'warn'};
+    if(status==='global_off')return {label:'灰度关闭',level:'neutral'};
+    if(status==='disabled')return {label:'未开启',level:'neutral'};
+    return {label:'等待同步',level:'warn'};
+  };
+  let level='ok',enabledAccounts=0,balanceHealthy=0,usageEnabled=0,usageHealthy=0;
+  const cards=domains.map(x=>{
+    const u=x.upstream||{},balance=statusInfo(u.status,u.enabled),usage=u.usage_sync_enabled?statusInfo(u.usage_effective_status||u.usage_status,u.enabled):{label:'未开启',level:'neutral'};
+    if(u.enabled){enabledAccounts++;if(balance.level==='ok')balanceHealthy++}
+    if(u.enabled&&u.usage_sync_enabled&&u.usage_worker_enabled){usageEnabled++;if(usage.level==='ok')usageHealthy++}
+    let accountLevel='ok';
+    if(u.enabled&&(balance.level==='bad'||(u.usage_sync_enabled&&u.usage_worker_enabled&&usage.level==='bad')))accountLevel='bad';
+    else if(u.enabled&&(balance.level==='warn'||(u.usage_sync_enabled&&u.usage_worker_enabled&&(usage.level==='warn'||!u.usage_backfill_done))))accountLevel='warn';
+    if(accountLevel==='bad')level='bad';else if(accountLevel==='warn'&&level==='ok')level='warn';
+    const overall=!u.enabled?'账户已停用':accountLevel==='ok'?'运行正常':accountLevel==='bad'?'需要处理':'同步推进中';
+    const balanceValue=u.balance_usd==null?'余额未知':`$${Number(u.balance_usd).toFixed(2)}`;
+    const adapter=u.usage_adapter_name||'尚未确定同步适配器',granularity=u.usage_granularity==='day'?'单日汇总':'小时汇总';
+    const lag=u.usage_data_until?usageFactsDuration(Math.max(0,now-(+u.usage_data_until))):'—';
+    const historyLabel=u.usage_backfill_done?'已完成':u.usage_backfill_last_error?'退避重试':'补数中';
+    const historyDetail=u.usage_backfill_done?`最近成功 ${syncTime(u.usage_backfill_last_success_at)}`:`下一待补日 ${syncTime(u.usage_backfill_cursor)} · 下次 ${syncTime(u.usage_backfill_next_sync_at)}`;
+    const balanceError=u.last_error?`<p class="sync-upstream-error">余额错误：${esc(u.last_error)}</p>`:'';
+    const usageErrors=[u.usage_last_error?`当天追平：${u.usage_last_error}`:'',u.usage_backfill_last_error?`历史补数：${u.usage_backfill_last_error}`:''].filter(Boolean).map(message=>`<p class="sync-upstream-error">${esc(message)}</p>`).join('');
+    const usageContent=u.usage_sync_enabled&&!u.usage_worker_enabled
+      ?'<strong>全局灰度闸门已关闭</strong><p>账户配置已保留，当前不会访问上游；余额同步不受影响。</p>'
+      :u.usage_sync_enabled
+      ?`<strong>${esc(adapter)} · ${esc(granularity)}</strong><p>当天数据至 ${syncTime(u.usage_data_until)} · 延迟 ${esc(lag)}<br>最近成功 ${syncTime(u.usage_last_success_at)} · 下次 ${syncTime(u.usage_next_sync_at)}</p><div class="sync-upstream-progress"><span><small>当天追平</small><b>${esc(usage.label)}</b></span><span><small>历史补数</small><b>${esc(historyLabel)}</b><small>${esc(historyDetail)}</small></span></div>${usageErrors}`
+      :'<strong>未开启</strong><p>该账户只同步余额，不读取上游消费。后续可按账户逐个开启验证。</p>';
+    return `<article class="sync-upstream-account"><div class="sync-upstream-head"><div><b>${esc(x.domain||x.key||'—')}</b><small>${esc(u.provider_name||u.provider||'—')} · ${esc(u.account_masked||'已配置账户')}</small></div><span class="sync-status ${syncStateClass(accountLevel)}">${esc(overall)}</span></div><div class="sync-upstream-lanes">
+      <section class="sync-upstream-lane"><header><b>余额快照</b><span class="sync-status ${balance.level}">${esc(balance.label)}</span></header><strong>${esc(balanceValue)}</strong><p>最近成功 ${syncTime(u.last_success_at)}<br>下次计划 ${syncTime(u.next_sync_at)}</p>${balanceError}</section>
+      <section class="sync-upstream-lane"><header><b>上游消费账单</b><span class="sync-status ${usage.level}">${esc(usage.label)}</span></header>${usageContent}</section>
+    </div></article>`;
   }).join('');
-  el.innerHTML=`<div class="monitor-table-scroll"><table><thead><tr><th>上游主域名</th><th>类型</th><th>余额同步</th><th>消费同步</th><th>状态</th><th>最近错误</th></tr></thead><tbody>${rows}</tbody></table></div>`;
+  el.innerHTML=`<div class="sync-upstream-summary"><div><small>已配置账户</small><b>${fmtNum(domains.length)}</b></div><div><small>启用的余额同步</small><b>${fmtNum(balanceHealthy)}/${fmtNum(enabledAccounts)}</b></div><div><small>运行中的消费同步</small><b>${fmtNum(usageEnabled)}</b></div><div><small>消费当天追平正常</small><b>${fmtNum(usageHealthy)}/${fmtNum(usageEnabled)}</b></div></div><div class="sync-upstream-list">${cards}</div>`;
   return level;
 }
 function syncRenderStability(health){
@@ -1565,7 +1596,7 @@ function syncRender(data){
   document.getElementById('syncOverview').innerHTML=[
     syncCard(readiness,'服务就绪',ready.status==='ready'?'本地服务可用':(ready.status||'不可用'),(ready.degraded_reasons||[]).join('、')||'本地状态已检查'),
     syncCard(factsLevel,'用户用量事实',facts.facts&&facts.facts.read_active?`${fmtNum(history.published_members||0)}/${fmtNum(history.total_members||0)} 成员可用`:'近期窗口同步中',`全历史归档 ${(+history.coverage_percent||0).toFixed(1)}% · ${fmtNum(history.live_ready_members||0)}/${fmtNum(history.total_members||0)} 实时追平`),
-    syncCard(channelsLevel,'渠道上游同步',channels.enabled?`${(channels.domains||[]).filter(x=>x.upstream&&x.upstream.configured).length} 个账户`:'未启用','余额与消费状态均来自本地快照'),
+    syncCard(channelsLevel,'上游账户同步',channels.enabled?`${(channels.domains||[]).filter(x=>x.upstream&&x.upstream.configured).length} 个账户`:'未启用','余额、当天消费水位和历史补数独立展示'),
     syncCard(stabilityLevel,'稳定性采样',health.status||'未启用',health.problem_live_lag_sec?`问题 Tail 延迟 ${usageFactsDuration(health.problem_live_lag_sec)}`:'历史日志采样状态已检查')
   ].join('');
   document.getElementById('syncUpdated').textContent='本地状态更新：'+new Date().toLocaleTimeString('zh-CN',{hour12:false});

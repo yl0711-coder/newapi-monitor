@@ -18,7 +18,7 @@
 - **零侵入**:只读、小窗口、有预算的后台采样；页面只读本地 SQLite，不随访问量查询生产库。
 - **历史稳定性**:分组 / 渠道 / 模型长期趋势、同比环比、问题原文聚合与渠道使用排行。
 - **渠道配置留痕**:渠道删除后保留最后快照；倍率更新追加版本，不覆盖历史版本。
-- **上游余额同步**:按主域名配置 NewAPI / Sub2API 账户，凭据本地加密保存，失败保留最后成功值并指数退避。
+- **上游账户同步**:按主域名配置 NewAPI / Sub2API / AICodeWith 账户；余额与消费账单是两个独立状态，凭据本地加密保存，失败保留最后成功值并指数退避。
 - **动态充值预警**:用最近完整自然日的本地小时汇总和双方倍率估算余额可用天数；余额、倍率或数据覆盖不可靠时停止评估，不用残缺数据误报。
 - **三态稳定性**:成功 / 异常(`client_gone` 等客户端中断)/ 失败(上游错误),按 分组 × 渠道 × 模型 聚合。
 - **响应耗时**:P50/P95 时延、TTFB/TTFT 首字延迟分布、出字速度(tok/s)。
@@ -52,10 +52,11 @@ docker run -d --name newapi-monitor \
 | `MONITOR_NEWAPI_BASE_URL` | new-api 地址,用于登录鉴权 | 必填 |
 | `MONITOR_SESSION_SECRET` | 会话签名密钥(`openssl rand -hex 32`) | 留空则启动随机生成 |
 | `MONITOR_UPSTREAM_CREDENTIAL_SECRET` | 渠道管理中上游令牌的 AES-256-GCM 加密密钥；生产应长期固定并与会话密钥分离 | 显式会话密钥；两者都未配置时拒绝保存凭据 |
-| `MONITOR_UPSTREAM_SYNC_ENABLED` | 上游余额与使用日志后台同步总开关；上游故障/风控维护窗口可临时关闭 | `true` |
+| `MONITOR_UPSTREAM_SYNC_ENABLED` | 上游余额后台同步开关；上游故障/风控维护窗口可临时关闭 | `true` |
 | `MONITOR_UPSTREAM_SYNC_MINUTES` | NewAPI / Sub2API 上游账户余额正常同步间隔；失败自动指数退避 | `5` |
 | `MONITOR_UPSTREAM_SYNC_TIMEOUT_SECONDS` | 单个上游同步请求超时 | `15` |
-| `MONITOR_UPSTREAM_USAGE_SYNC_MINUTES` | NewAPI 上游账户当天使用日志尾部刷新间隔；历史补全独立退避；单轮分页固定限 60 次，所有上游请求全局串行且启动间隔至少 1 秒 | `30` |
+| `MONITOR_UPSTREAM_USAGE_SYNC_ENABLED` | 上游消费日志后台同步的独立灰度闸门；首次发布不会访问上游，验证后再显式开启 | `false` |
+| `MONITOR_UPSTREAM_USAGE_SYNC_MINUTES` | 上游消费账单当天尾部刷新间隔；支持 NewAPI 分页日志、Sub2API 小时汇总（旧版回退单日汇总）和 AICodeWith 按 Key 日账单；只有全局灰度闸门和账户开关都开启时运行，历史补全独立退避，所有上游请求全局串行 | `30` |
 | `MONITOR_UPSTREAM_USAGE_BACKFILL_DAYS` | 首次低频补全的上游账户使用日志天数 | `90` |
 | `MONITOR_ADDR` | 监听地址 | `:8090` |
 | `MONITOR_PORTAL_ADDR` | 客户用量门户独立监听地址；留空则不启用 | 留空 |

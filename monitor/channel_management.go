@@ -45,7 +45,8 @@ type ChannelManagementRateConfig struct {
 }
 
 // ChannelUpstreamUsageMetrics 是上游账户使用数据的本地脱敏汇总。NewAPI 使用
-// 小时日志，AICodeWith 使用中国自然日账单；它们均按主域名账户归集，不能推断为
+// 小时日志，Sub2API 优先使用小时汇总且兼容单日汇总，AICodeWith 使用中国自然日账单；
+// 它们均按主域名账户归集，不能推断为
 // 某一条实际渠道的上游账单。
 type ChannelUpstreamUsageMetrics struct {
 	Available      bool    `json:"available"`
@@ -349,9 +350,9 @@ func (m *Monitor) loadChannelUpstreamUsage(ctx context.Context, scope stabilityS
 		if !configured || !account.UsageSyncEnabled || row.Provider != account.Provider {
 			continue
 		}
-		granularity := "hour"
-		if account.Provider == upstreamProviderAICodeWith {
-			granularity = "day"
+		granularity := account.UsageGranularity
+		if granularity == "" {
+			granularity = upstreamUsageGranularity(account.Provider, account.UsageAdapter)
 		}
 		completedHours := row.CompletedSeconds / 3600
 		result[row.Domain] = ChannelUpstreamUsageMetrics{

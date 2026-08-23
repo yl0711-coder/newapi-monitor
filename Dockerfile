@@ -10,7 +10,7 @@
 ARG RUNTIME_IMAGE=alpine:3.23
 
 # ---- 构建阶段 ----
-FROM golang:1.26-alpine3.23 AS builder
+FROM golang:1.26.6-alpine3.23 AS builder
 WORKDIR /build
 COPY go.mod go.sum ./
 # 默认仍使用官方 Go 代理；纯本地验收可把 GOPROXY 指向只读的
