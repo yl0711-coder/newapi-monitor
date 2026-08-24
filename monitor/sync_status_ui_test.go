@@ -20,6 +20,10 @@ func TestSyncStatusPageUsesLocalStatusEndpoints(t *testing.T) {
 		"分页事实导入",
 		"分页水位",
 		"raw_page_source_rows",
+		"hourly_migration",
+		"migration.percent",
+		"小时稳定性重签",
+		"问题历史重签",
 	} {
 		if !strings.Contains(pageHTML, want) {
 			t.Fatalf("同步状态页缺少 %q", want)
@@ -27,6 +31,26 @@ func TestSyncStatusPageUsesLocalStatusEndpoints(t *testing.T) {
 	}
 	if strings.Contains(portalHTML, `data-tab="sync"`) || strings.Contains(portalHTML, "syncFactMembers") {
 		t.Fatal("同步状态管理页不得进入客户 Portal")
+	}
+}
+
+func TestSyncStatusPageRendersBothStabilityMigrationsWithCorrectFields(t *testing.T) {
+	for _, want := range []string{
+		`const h=health||{},migration=h.problem_migration||{},hourly=h.hourly_migration||null;`,
+		`hourly.progress_percent`,
+		`hourly.completed_hours`,
+		`hourly.total_hours`,
+		`hourly.failed_hours`,
+		`migration.percent`,
+		`migration.last_success_at`,
+		`'无迁移任务'`,
+	} {
+		if !strings.Contains(pageHTML, want) {
+			t.Fatalf("稳定性双迁移进度缺少 %q", want)
+		}
+	}
+	if strings.Contains(pageHTML, `migration.coverage_percent`) {
+		t.Fatal("问题迁移前端仍读取不存在的 coverage_percent 字段")
 	}
 }
 

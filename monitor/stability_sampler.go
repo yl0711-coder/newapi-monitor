@@ -24,6 +24,10 @@ const (
 	// global start spacing and duty-cycle cooldown, so this only removes idle
 	// scheduler time and cannot create a query burst.
 	stabilityProblemMigrationPollEvery = 2 * time.Second
+	// Waiting for the shared source gate is a normal low-priority yield rather
+	// than a failed history window. Retry soon enough to use the next safe slot;
+	// the gate still enforces spacing, source duty and live-work preemption.
+	stabilityProblemMigrationGateYieldDelay = 5 * time.Second
 	// The live lane uses finalized one-minute source windows.  Processing a
 	// small bounded number per sampler turn lets it catch up after an outage
 	// without ever retrying the old 12-minute aggregate that could repeatedly
@@ -907,6 +911,9 @@ func (m *Monitor) recordStabilityProblemMigrationFailure(state *StabilityProblem
 	span := stabilityProblemMigrationSpanMinutes(state.CurrentSpanMinutes, 12*60)
 	status := "running"
 	nextRetry := now + 60
+	if errors.Is(cause, errStabilityProblemSourceGateWait) {
+		nextRetry = now + int64(stabilityProblemMigrationGateYieldDelay/time.Second)
+	}
 	if !interrupted {
 		attempts++
 		span = smallerStabilityProblemMigrationSpan(span)

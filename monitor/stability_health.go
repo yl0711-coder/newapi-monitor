@@ -10,6 +10,20 @@ import (
 	"gorm.io/gorm"
 )
 
+// stabilityHourlyMigrationProgress keeps the frequently-polled health payload
+// bounded. A backfill job can contain thousands of failed hour timestamps;
+// those details belong to the root-only backfill endpoint, not this status UI.
+type stabilityHourlyMigrationProgress struct {
+	Status                    string  `json:"status"`
+	TotalHours                int     `json:"total_hours"`
+	CompletedHours            int     `json:"completed_hours"`
+	FailedHours               int     `json:"failed_hours"`
+	ProgressPercent           float64 `json:"progress_percent"`
+	RemainingHours            int     `json:"remaining_hours"`
+	EstimatedRemainingSeconds int64   `json:"estimated_remaining_seconds,omitempty"`
+	UpdatedAt                 int64   `json:"updated_at"`
+}
+
 type stabilityHealthResponse struct {
 	Status                     string                            `json:"status"`
 	CheckedAt                  int64                             `json:"checked_at"`
@@ -24,6 +38,7 @@ type stabilityHealthResponse struct {
 	ProblemLiveStatus          string                            `json:"problem_live_status"`
 	ProblemPendingMinutes      int64                             `json:"problem_pending_minutes"`
 	ProblemMigration           stabilityProblemMigrationProgress `json:"problem_migration"`
+	HourlyMigration            *stabilityHourlyMigrationProgress `json:"hourly_migration,omitempty"`
 	StoreReachable             bool                              `json:"store_reachable"`
 	StoreBytes                 int64                             `json:"store_bytes"`
 	NginxEnabled               bool                              `json:"nginx_enabled"`
@@ -48,6 +63,15 @@ func (m *Monitor) serveStabilityHealth(c *gin.Context) {
 		Status: "ok", CheckedAt: now, MainSamplerLastSuccess: m.lastRun.Load(),
 		ProblemSamplerLastSuccess: m.problemLastSuccess.Load(), ProblemSamplerLastFailure: m.problemLastFailure.Load(),
 		ProblemMigration: m.stabilityProblemMigrationProgress(), NginxEnabled: m.cfg.NginxEnabled,
+	}
+	var hourlyMigration stabilityHourlyMigrationProgress
+	if err := m.storeDB.WithContext(ctx).Model(&StabilityBackfillJob{}).
+		Select("status", "total_hours", "completed_hours", "failed_hours", "progress_percent",
+			"remaining_hours", "estimated_remaining_seconds", "updated_at").
+		Where("kind = ?", stabilityMigrationJobKind).Order("updated_at DESC").First(&hourlyMigration).Error; err == nil {
+		result.HourlyMigration = &hourlyMigration
+	} else if !errors.Is(err, gorm.ErrRecordNotFound) {
+		result.Status = "degraded"
 	}
 	var liveCursor StabilityProblemLiveCursor
 	if err := m.storeDB.WithContext(ctx).First(&liveCursor, "id = ? AND traffic_class_version = ?", 1, userTrafficClassificationVersion).Error; err == nil {

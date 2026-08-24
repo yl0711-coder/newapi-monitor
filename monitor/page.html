@@ -1571,15 +1571,22 @@ function syncRenderChannels(report){
   return level;
 }
 function syncRenderStability(health){
-  const h=health||{},migration=h.problem_migration||{};
+  const h=health||{},migration=h.problem_migration||{},hourly=h.hourly_migration||null;
   const enabled=h.nginx_enabled!==undefined||h.checked_at!==undefined;
   const level=!enabled?'warn':(h.status==='ok'?'ok':'warn');
+  const hourlyDetail=hourly
+    ?`${(+hourly.progress_percent||0).toFixed(1)}% · ${fmtNum(hourly.completed_hours)}/${fmtNum(hourly.total_hours)} 小时 · 失败 ${fmtNum(hourly.failed_hours)}${hourly.estimated_remaining_seconds?` · ETA ${usageFactsDuration(hourly.estimated_remaining_seconds)}`:''}`
+    :'无迁移任务';
+  const problemDetail=migration.percent!=null
+    ?`${(+migration.percent).toFixed(1)}% · 最近成功 ${syncTime(migration.last_success_at)} · ${migration.estimated_seconds==null?'暂无 ETA':`ETA ${usageFactsDuration(migration.estimated_seconds)}`}`
+    :'';
   document.getElementById('syncStability').innerHTML=[
     syncKV('总体状态',h.status||'未启用',(h.status||'')==='ok'?'采样新鲜且无待处理窗口':'请查看采样延迟、迁移和失败时间'),
     syncKV('主采样',h.main_sampler_last_success?`${syncAge(h.main_sampler_last_success)}前`:'未采样',h.main_sampler_last_success?syncTime(h.main_sampler_last_success):''),
     syncKV('问题 Tail',h.problem_live_status||'—',`延迟 ${usageFactsDuration(h.problem_live_lag_sec||0)} · 待处理 ${fmtNum(h.problem_pending_minutes)} 分钟`),
     syncKV('问题最近成功',h.problem_sampler_last_success?`${syncAge(h.problem_sampler_last_success)}前`:'未采样',h.problem_sampler_last_failure?`最近失败：${syncTime(h.problem_sampler_last_failure)}`:''),
-    syncKV('冷历史迁移',migration.status||'—',migration.coverage_percent!=null?`${(+migration.coverage_percent).toFixed(1)}% · ${migration.estimated_seconds==null?'暂无 ETA':usageFactsDuration(migration.estimated_seconds)}`:''),
+    syncKV('小时稳定性重签',hourly&&hourly.status?hourly.status:'未要求',hourlyDetail),
+    syncKV('问题历史重签',migration.status||'—',problemDetail),
     syncKV('本地库',h.store_reachable?'可访问':'不可访问',h.store_bytes?`${fmtNum(h.store_bytes)} B（含 WAL）`:''),
     syncKV('Nginx 入口',h.nginx_enabled?`${fmtNum(h.nginx_source_count)} 个来源`:'未启用',h.nginx_enabled?`异常 ${fmtNum(h.nginx_unhealthy_sources)} · backlog ${fmtNum(h.nginx_backlog_bytes)} B`:''),
     syncKV('问题覆盖至',syncTime(h.problem_coverage_to),h.problem_live_target_to?`目标 ${syncTime(h.problem_live_target_to)}`:'')

@@ -611,6 +611,42 @@ func TestStabilityProblemMigrationGateWaitDoesNotConsumeAttempt(t *testing.T) {
 	if state.Attempts != 4 || state.Status == "paused" || state.CurrentSpanMinutes != 3 {
 		t.Fatalf("yielding at the source gate consumed a window failure: %+v", state)
 	}
+	if state.NextRetryAt != base+int64(stabilityProblemMigrationGateYieldDelay/time.Second) {
+		t.Fatalf("protected gate yield must retry promptly without spinning: %+v", state)
+	}
+	if state.LastFailureAt != base || !strings.Contains(state.LastError, errStabilityProblemSourceGateWait.Error()) {
+		t.Fatalf("protected gate yield must remain observable: %+v", state)
+	}
+}
+
+func TestStabilityProblemMigrationOnlyGateWaitUsesShortYield(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		cause error
+	}{
+		{name: "context canceled", cause: context.Canceled},
+		{name: "source not ready", cause: errSourceNotReady},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := newStabilityTestMonitor(t)
+			base := time.Now().Unix()
+			state := StabilityProblemClassificationMigration{
+				ID: 1, TrafficClassVersion: userTrafficClassificationVersion,
+				FromTs: base - 600, ThroughTs: base, NextTs: base - 600, Status: "running",
+				CurrentSpanMinutes: 3, Attempts: 4, CreatedAt: base - 1000, UpdatedAt: base - 100,
+			}
+			if err := m.storeDB.Create(&state).Error; err != nil {
+				t.Fatal(err)
+			}
+			_ = m.recordStabilityProblemMigrationFailure(&state, tc.cause, base)
+			if err := m.storeDB.First(&state, 1).Error; err != nil {
+				t.Fatal(err)
+			}
+			if state.NextRetryAt != base+60 || state.Attempts != 4 || state.CurrentSpanMinutes != 3 {
+				t.Fatalf("non-gate scheduler interruption lost its conservative retry fence: %+v", state)
+			}
+		})
+	}
 }
 
 func TestStabilityProblemLiveLanePreemptsIndependentColdMigration(t *testing.T) {
@@ -930,6 +966,45 @@ func TestStabilityHealthUsesDurableLiveLagAndDisabledMigrationState(t *testing.T
 	}
 	if got.Status != "degraded" || got.ProblemLiveLagSec != 20*60 || got.ProblemMigration.Status != "paused_disabled" {
 		t.Fatalf("fresh page success hid durable live/cold backlog: %+v", got)
+	}
+}
+
+func TestStabilityHealthIncludesHourlyClassificationMigration(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	m := newStabilityTestMonitor(t)
+	m.cfg.StabilityEnabled = false
+	now := time.Now().Unix()
+	job := StabilityBackfillJob{
+		ID: "classification-progress", Kind: stabilityMigrationJobKind, Status: "running",
+		TotalHours: 100, CompletedHours: 37, FailedHours: 2, RemainingHours: 61,
+		ProgressPercent: 37, EstimatedRemainingSeconds: 1234, UpdatedAt: now,
+		FailedHourTs: []int64{now - 3600}, LastError: "source detail must stay root-only",
+	}
+	if err := m.storeDB.Create(&job).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := m.storeDB.Create(&StabilityBackfillJob{
+		ID: "newer-manual-job", Kind: stabilityManualJobKind, Status: "complete",
+		TotalHours: 999, CompletedHours: 999, ProgressPercent: 100, UpdatedAt: now + 60,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodGet, "/stability/health", nil)
+	m.serveStabilityHealth(c)
+	var got stabilityHealthResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(w.Body.String(), "failed_hour_ts") || strings.Contains(w.Body.String(), "source detail") {
+		t.Fatalf("frequently-polled health response leaked unbounded/root-only job details: %s", w.Body.String())
+	}
+	if got.HourlyMigration == nil || got.HourlyMigration.Status != "running" ||
+		got.HourlyMigration.CompletedHours != 37 || got.HourlyMigration.TotalHours != 100 ||
+		got.HourlyMigration.FailedHours != 2 || got.HourlyMigration.ProgressPercent != 37 {
+		t.Fatalf("hourly migration progress missing from local health endpoint: %+v", got.HourlyMigration)
 	}
 }
 
