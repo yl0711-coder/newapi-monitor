@@ -14,7 +14,7 @@ const zero=()=>({requests:0,tokens:0,cost_usd:0});
 const add=(a,b)=>{a.requests+=(+b?.requests||0);a.tokens+=(+b?.tokens||0);a.cost_usd+=(+b?.cost_usd||0);return a};
 const nfmt=n=>(+n||0).toLocaleString('zh-CN');
 const compact=n=>{n=+n||0;const a=Math.abs(n);for(const [d,u] of [[1e12,'T'],[1e9,'B'],[1e6,'M'],[1e3,'k']])if(a>=d)return (n/d>=100?(n/d).toFixed(0):(n/d).toFixed(1)).replace(/\.0$/,'')+u;return nfmt(n)};
-const usd=n=>{n=+n||0;return '$'+(n===0||Math.abs(n)>=.01?n.toFixed(2):n.toFixed(4))};
+const usd=n=>{n=+n||0;const digits=n===0||Math.abs(n)>=.01?2:4;return '$'+n.toLocaleString('en-US',{minimumFractionDigits:digits,maximumFractionDigits:digits})};
 const metric=u=>cm.sort==='requests'?(+u?.requests||0):cm.sort==='tokens'?(+u?.tokens||0):(+u?.cost_usd||0);
 const metricLabel=()=>cm.sort==='requests'?'请求数':cm.sort==='tokens'?'Tokens':'用户侧消费';
 const metricText=u=>cm.sort==='requests'?nfmt(u?.requests):cm.sort==='tokens'?compact(u?.tokens):usd(u?.cost_usd);
@@ -349,14 +349,17 @@ function domainCard(domain,index,total,filtered){
   // 绝不能伪装成某一条本地渠道的上游账单。
   const upstreamGranularity=upstreamUsage.granularity==='day'?'中国自然日账单':'小时日志';
   const upstreamCoverage=upstreamUsage.complete?`当前${upstreamGranularity}已覆盖`:`查询范围含未覆盖时段，当前值为已同步部分`;
-  const upstreamUsageMetric=upstreamUsage.available?`<span class="cm-domain-upstream-usage" title="按上游账户汇总；不是逐渠道上游账单。${upstreamCoverage}"><small>上游消费 · ${upstreamGranularity}</small><b>${usd(upstreamUsage.cost_usd)}${upstreamUsage.complete?'':' · 范围不完整'}</b></span>`:'';
+  const upstreamCoverageState=upstreamUsage.complete?'完整':'补全中';
+  const upstreamBalance=domain.upstream?.balance_usd==null?'未知':usd(domain.upstream.balance_usd);
+  const upstreamSpend=upstreamUsage.available?usd(upstreamUsage.cost_usd):'等待同步';
+  const upstreamMetrics=domain.upstream?.configured||upstreamUsage.available?`<span class="cm-domain-upstream-spend" title="消费按上游账户汇总，且仅统计当前查询时间范围；不是逐渠道上游账单。${upstreamCoverage}"><small>区间上游消费</small><b title="${upstreamSpend}">${upstreamSpend}</b><em class="cm-domain-metric-note ${upstreamUsage.available?(upstreamUsage.complete?'ready':'pending'):'neutral'}">${upstreamUsage.available?`${upstreamGranularity} · ${upstreamCoverageState}`:'同步未开启或尚无数据'}</em></span><span class="cm-domain-upstream-balance"><small>上游当前余额</small><b title="${upstreamBalance}">${upstreamBalance}</b><em class="cm-domain-metric-note neutral">最新余额快照</em></span>`:'';
   const financeButton=cm.report?.finance?.can_edit&&domain.configured?`<button type="button" class="cm-finance-open" data-cm-finance="${esc(domain.key)}">倍率配置</button>`:'';
   const upstreamButton=cm.report?.finance?.can_edit&&domain.configured?`<button type="button" class="cm-upstream-open" data-cm-upstream="${esc(domain.key)}">账户配置</button>`:'';
   return `<article class="cm-domain-card${open?' open':''}"><div class="cm-domain-head" role="button" tabindex="0" data-cm-domain-toggle="${esc(domain.key)}">
     <span class="cm-rank">${String(index+1).padStart(2,'0')}</span>
     <div class="cm-domain-identity"><span class="cm-domain-icon">${domain.configured?'◎':'—'}</span><div><b>${esc(domain.domain)}</b><small>${domain.vendors.length} 个厂商 · ${channels.length} 个实际渠道 · ${enabled} 个启用</small><div class="cm-domain-config"><div class="cm-domain-finance"><span class="${domain.finance?.configured?'ready':'pending'}">${esc(financeLabel)}</span>${financeButton}</div><div class="cm-domain-upstream">${upstreamSummary(domain.upstream)}${upstreamButton}</div></div></div></div>
     <div class="cm-share"><div><b>${share.toFixed(1)}%</b><small>${filtered?'筛选内':'全站'}${esc(metricLabel())}</small></div><i><em style="width:${Math.max(share&&2,share)}%"></em></i></div>
-    <div class="cm-domain-metrics"><span><small>渠道请求数</small><b>${nfmt(domain.usage.requests)}</b></span><span><small>Tokens</small><b title="${nfmt(domain.usage.tokens)}">${compact(domain.usage.tokens)}</b></span><span><small>用户侧消费</small><b>${usd(domain.usage.cost_usd)}</b></span>${upstreamUsageMetric}</div>
+    <div class="cm-domain-metrics"><span class="cm-domain-requests"><small>渠道请求数</small><b>${nfmt(domain.usage.requests)}</b></span><span class="cm-domain-tokens"><small>Tokens</small><b title="${nfmt(domain.usage.tokens)}">${compact(domain.usage.tokens)}</b></span><span class="cm-domain-user-spend"><small>用户侧消费</small><b title="${usd(domain.usage.cost_usd)}">${usd(domain.usage.cost_usd)}</b><em class="cm-domain-metric-note neutral">当前查询区间</em></span>${upstreamMetrics}</div>
     <span class="cm-chevron">${open?'−':'+'}</span>
   </div>${open?`<div class="cm-domain-body">${domain.vendors.map(v=>vendorSection(domain,v)).join('')}</div>`:''}</article>`;
 }
@@ -773,6 +776,15 @@ function render(){
   const historical=channels.filter(ch=>!ch.current).length,filtered=filtersActive();
   const allUsage=cm.report.summary?.usage||zero();
   const share=metric(allUsage)>0?metric(filteredUsage)/metric(allUsage)*100:0;
+  // 上游账单和余额都按归并后的主域名账户计算，不从分组或渠道
+  // 明细反向求和，避免同一渠道关联多个服务分组时被重复累计。
+  const upstreamAccounts=domains.filter(domain=>domain.upstream?.configured);
+  const upstreamUsageDomains=upstreamAccounts.filter(domain=>domain.upstream_usage?.available);
+  const upstreamSpend=upstreamUsageDomains.reduce((sum,domain)=>sum+(+domain.upstream_usage.cost_usd||0),0);
+  const upstreamUsageComplete=upstreamUsageDomains.filter(domain=>domain.upstream_usage.complete).length;
+  const upstreamBalanceDomains=upstreamAccounts.filter(domain=>domain.upstream.balance_usd!=null&&Number.isFinite(Number(domain.upstream.balance_usd)));
+  const upstreamBalance=upstreamBalanceDomains.reduce((sum,domain)=>sum+Number(domain.upstream.balance_usd),0);
+  const upstreamSpendReady=upstreamUsageDomains.length>0&&upstreamUsageComplete===upstreamUsageDomains.length;
   const summary=$('cmSummary');
   if(summary){summary.innerHTML=`<section class="cm-kpis">
     <article><small>已配置主域名</small><b>${nfmt(configuredDomains)}</b><span>当前显示 ${nfmt(domains.length)} 个归并项</span></article>
@@ -781,6 +793,8 @@ function render(){
     <article><small>渠道请求数</small><b>${nfmt(filteredUsage.requests)}</b><span>${cm.report.meta.from} 至 ${cm.report.meta.to}</span></article>
     <article><small>区间 Tokens</small><b title="${nfmt(filteredUsage.tokens)}">${compact(filteredUsage.tokens)}</b><span>prompt + completion</span></article>
     <article class="accent"><small>用户侧消费</small><b>${usd(filteredUsage.cost_usd)}</b><span>NewAPI logs.quota</span></article>
+    <article class="upstream ${upstreamUsageDomains.length&&!upstreamSpendReady?'warn':''}"><small>区间上游消费汇总</small><b>${upstreamUsageDomains.length?usd(upstreamSpend):'—'}</b><span>${upstreamUsageDomains.length?`${nfmt(upstreamUsageComplete)}/${nfmt(upstreamUsageDomains.length)} 个账单完整${upstreamSpendReady?'':' · 补全中'}`:`${nfmt(upstreamAccounts.length)} 个账户尚无消费数据`}</span></article>
+    <article class="balance ${upstreamBalanceDomains.length<upstreamAccounts.length?'warn':''}"><small>上游当前余额汇总</small><b>${upstreamBalanceDomains.length?usd(upstreamBalance):'—'}</b><span>${nfmt(upstreamBalanceDomains.length)}/${nfmt(upstreamAccounts.length)} 个账户已取得余额</span></article>
     ${filtered?`<article><small>筛选${esc(metricLabel())}占比</small><b>${share.toFixed(1)}%</b><span>相对当前日期全部渠道</span></article>`:''}
   </section>`;summary.removeAttribute('aria-busy')}
   $('cmBody').innerHTML=`<section class="cm-list-head"><div><h3>渠道排名</h3><p>共 ${nfmt(domains.length)} 个归并项 · 按 ${esc(metricLabel())} 从高到低排序，逐级展开厂商类型、实际渠道与服务分组。</p></div><div class="cm-fresh">${freshness(cm.report.meta)}<small>渠道配置快照 ${esc(dateTime(cm.report.meta.channel_config_updated_at))}</small></div></section>

@@ -155,6 +155,9 @@ func (m *Monitor) verifySession(token string, nowUnix int64) (name string, role 
 }
 
 func (m *Monitor) currentUser(c *gin.Context) (name string, role int, ok bool) {
+	if m.cfg.LocalAuthBypass {
+		return "本地快照", roleRoot, true
+	}
 	ck, err := c.Cookie(sessionCookie)
 	if err != nil || ck == "" {
 		return "", 0, false

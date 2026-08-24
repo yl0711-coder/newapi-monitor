@@ -12,6 +12,9 @@ services:
   monitor:
     environment:
       MONITOR_LOCAL_SNAPSHOT_ONLY: "true"
+      # 仅此纯本地快照覆盖文件允许免登录；应用会再校验无 DSN、
+      # 无主站和无任何外部后台任务，不满足时直接拒绝启动。
+      MONITOR_LOCAL_AUTH_BYPASS: "true"
       MONITOR_SOURCE_WORKER_ENABLED: "false"
       MONITOR_SOURCE_LEASE_REQUIRED: "false"
       MONITOR_NEWAPI_BASE_URL: ""

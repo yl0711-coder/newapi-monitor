@@ -21,6 +21,43 @@ func TestLoadSettingsSourceLifecycleDefaults(t *testing.T) {
 	}
 }
 
+func TestLocalAuthBypassIsExplicitAndFailsClosed(t *testing.T) {
+	t.Setenv("MONITOR_LOCAL_AUTH_BYPASS", "")
+	if LoadSettings().LocalAuthBypass {
+		t.Fatal("本地免登录必须默认关闭")
+	}
+	t.Setenv("MONITOR_LOCAL_AUTH_BYPASS", "true")
+	if !LoadSettings().LocalAuthBypass {
+		t.Fatal("显式本地免登录开关未生效")
+	}
+
+	base := Settings{
+		LocalAuthBypass: true, LocalSnapshotOnly: true,
+		AlertsDisabled: true,
+	}
+	if err := validateLocalAuthBypassSettings(base); err != nil {
+		t.Fatalf("完全离线快照配置应允许免登录: %v", err)
+	}
+	invalid := []Settings{
+		{LocalAuthBypass: true, AlertsDisabled: true},
+		{LocalAuthBypass: true, LocalSnapshotOnly: true, ProdDSN: "production", AlertsDisabled: true},
+		{LocalAuthBypass: true, LocalSnapshotOnly: true, NewAPIBaseURL: "https://example.com", AlertsDisabled: true},
+		{LocalAuthBypass: true, LocalSnapshotOnly: true, SourceWorkerEnabled: true, AlertsDisabled: true},
+		{LocalAuthBypass: true, LocalSnapshotOnly: true, SourceLeaseRequired: true, AlertsDisabled: true},
+		{LocalAuthBypass: true, LocalSnapshotOnly: true, UpstreamSyncEnabled: true, AlertsDisabled: true},
+		{LocalAuthBypass: true, LocalSnapshotOnly: true, UpstreamUsageSyncEnabled: true, AlertsDisabled: true},
+		{LocalAuthBypass: true, LocalSnapshotOnly: true, NginxEnabled: true, AlertsDisabled: true},
+		{LocalAuthBypass: true, LocalSnapshotOnly: true, InfraEnabled: true, AlertsDisabled: true},
+		{LocalAuthBypass: true, LocalSnapshotOnly: true, HeartbeatURL: "https://example.com"},
+		{LocalAuthBypass: true, LocalSnapshotOnly: true},
+	}
+	for i, cfg := range invalid {
+		if err := validateLocalAuthBypassSettings(cfg); err == nil {
+			t.Fatalf("危险的本地免登录配置[%d]应被拒绝", i)
+		}
+	}
+}
+
 func TestLoadSettingsUpstreamSyncEnabled(t *testing.T) {
 	t.Setenv("MONITOR_UPSTREAM_SYNC_ENABLED", "")
 	if !LoadSettings().UpstreamSyncEnabled {
