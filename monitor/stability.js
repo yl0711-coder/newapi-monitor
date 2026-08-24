@@ -7,7 +7,10 @@ const ST_HEADERS={
   stability:{title:'稳定性报表',subtitle:'历史日志推断 · 问题样本 · 入口旁路观察',icon:'shield'},
   channels:{title:'渠道管理',subtitle:'主域名归并 · 厂商 / 实际渠道 / 服务分组 · 使用排行',icon:'globe'},
   model:{title:'模型监控',subtitle:'分钟级实时状态、告警、SLO、稳定性与响应耗时',icon:'activity'},
-  server:{title:'服务端监控',subtitle:'实例、数据库、负载均衡、域名探活与证书',icon:'chart'}
+  server:{title:'服务端监控',subtitle:'实例、数据库、负载均衡、域名探活与证书',icon:'chart'},
+  // 缺这条会走第 22 行的 ||ST_HEADERS.usage 兜底，顶部标题错显成"用户用量"。
+  // 新增 tab 时必须同步加，否则页面标题静默串台。
+  logchain:{title:'客户排障',subtitle:'逐条请求 · 客户 / 令牌 / 分组 / 模型 · 渠道 → 上游主域名 · 上游返回原文',icon:'search'}
 };
 const ST_ICONS={
   sync:'<svg viewBox="0 0 24 24"><path d="M20 7h-6V1"/><path d="M4 17h6v6"/><path d="M20 7a8 8 0 0 0-13.7-3.6L4 5.7M4 17a8 8 0 0 0 13.7 3.6l2.3-2.3"/></svg>',
@@ -15,7 +18,8 @@ const ST_ICONS={
   shield:'<svg viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="m9 12 2 2 4-4"/></svg>',
   globe:'<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a15 15 0 0 1 0 18M12 3a15 15 0 0 0 0 18"/></svg>',
   activity:'<svg viewBox="0 0 24 24"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>',
-  chart:'<svg viewBox="0 0 24 24"><path d="M3 3v18h18"/><path d="m7 16 4-5 4 3 5-7"/></svg>'
+  chart:'<svg viewBox="0 0 24 24"><path d="M3 3v18h18"/><path d="m7 16 4-5 4 3 5-7"/></svg>',
+  search:'<svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/><path d="M11 8v3"/><path d="M11 14h.01"/></svg>'
 };
 
 window.monitorShellSetTab=function(name){

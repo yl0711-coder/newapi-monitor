@@ -16,7 +16,6 @@ package monitor
 //  1. 未打到渠道即被拒的请求（限流/无可用渠道/分组无权限）不在 logs 里，
 //     只在 stability_reject_hours 的小时聚合中，且该表无 user_id，定位不到具体客户。
 //  2. new-api 换渠道重试会落多条 type=5，本层无法把它们归并成一次客户请求。
-//  3. 从不采集请求/响应正文。
 
 import (
 	"context"
@@ -43,6 +42,246 @@ const (
 	// 排障是内部功能，不得比客户功能占用更久。改大这个值即为回归。
 	logChainGateTimeout = 15 * time.Second
 )
+
+// 异常筛选取值。不认识的值直接 400，不静默忽略——参数拼错会得到"全部请求"，
+// 而人会以为自己在看异常清单。
+const (
+	// anomalyStream 流传输真的出了问题：timeout / scanner_error / panic / ping_fail
+	// 以及任何没见过的新取值。**不含 client_gone**——见 anomalyClientGone。
+	anomalyStream = "stream"
+
+	// anomalyClientGone 下游客户端主动断连，单独一档。
+	//
+	// 为什么从流异常里分出来：2026-08-24 生产实测当天 1594 条 client_gone 里
+	// **92%（1465 条）已经真交付了内容**（平均 324 输出 token）——客户拿到部分回答
+	// 后自己断开，这是下游行为，多数不是故障。把它和 timeout/panic 混在一档，
+	// 真正的流故障会被它淹掉（1594 : 25 的量级差）。
+	//
+	// 但它也不能直接丢掉：耗时长的 client_gone 可能是上游拖慢把客户等跑了，
+	// 那种根因在上游。数据上无法区分主动取消与被拖走，只能并排给出耗时让人判断。
+	anomalyClientGone = "client_gone"
+
+	anomalyBilling       = "billing"        // 消费异常（两个方向）
+	anomalyBillingUnpaid = "billing_unpaid" // 扣费未交付（客户亏）
+	anomalyBillingFree   = "billing_free"   // 交付未扣费（我方亏）
+	// anomalyAll 全部异常：流故障 + 客户断连 + 消费异常。分档后它仍是三者的并集，
+	// 否则"全部异常"会漏掉刚拆出去的 client_gone。
+	anomalyAll = "all"
+	// anomalyErrAnom = 错误(type=5) + 流异常 + 消费异常，即本页能查到的全部问题。
+	// 这是唯一跨 type 的取值，所以它不受"异常判据限定 type=2"那条冲突校验约束。
+	//
+	// 为什么放在后端而不是前端滤：前端过滤会让分页失准——后端按 limit 返 100 行、
+	// 前端滤掉其中正常的消费请求，has_more 与计数就都对不上，"加载更多"行为诡异。
+	anomalyErrAnom = "err_anom"
+)
+
+// 排障页的异常判据。**不复用 expandAnomalyPredicates**：那套服务稳定性报表，
+// 故意排除了 client_gone（客户断连不算我方故障，否则客户关标签页会拉低渠道评分）。
+// 排障页要的恰恰是 client_gone——客户的实际体验是"回答没出来"。
+// 改那套会让历史稳定性数据的判定标准变化，属破坏既有功能。
+//
+// 但**复用它的取值 SQL**（anomalyEndReasonSQL / anomalyErrCountSQL），
+// 那两个常量已处理三个踩过的坑：JSON_VALID 兜底、COALESCE 防 NULL 传染、
+// 用 REPLACE(CAST(...)) 而非 MySQL 专有的 JSON_UNQUOTE（保持本地 SQLite 假库也能跑）。
+// logChainNormalEndReasons 表示"流正常结束"的 end_reason 取值。**SQL 侧与 Go 侧的唯一事实源。**
+//
+// 判定用**排除法**：不在本名单里的取值一律算异常。枚举法（只列已知故障值）会把
+// new-api 新增的取值静默吞掉，而排障最怕"没见过的情况被藏起来"。
+//
+// 名单成员及其来源：
+//   - ""     非流式请求：other 里根本没有 stream_status，取不到值
+//   - "eof"  正常结束（占绝大多数）
+//   - "done" 正常结束的另一种标记。**2026-08-21 在生产真实数据上发现**：
+//     当天 20 条 done 全部真交付（平均 741 输出 token、31 秒），与 eof 无实质差别，
+//     此前被误判成"流未正常结束"。这条只能靠真数据发现——代码和文档里都没有它。
+//
+// 收成一份列表而不是在两处各写一遍：曾经 SQL 侧与 Go 侧各硬编码一份，
+// 加取值时漏改一处就会出现"筛出来了但没标签"的矛盾结果，只能靠测试事后发现。
+var logChainNormalEndReasons = []string{"", "eof", "done"}
+
+// logChainNormalEndReasonSQL 把名单渲染成 SQL 的 IN 列表字面量：
+// 每个取值加单引号后用逗号连接（空串成员渲染为一对单引号）。
+// 取值都是编译期常量、无用户输入，无注入面。
+func logChainNormalEndReasonSQL() string {
+	quoted := make([]string, 0, len(logChainNormalEndReasons))
+	for _, v := range logChainNormalEndReasons {
+		quoted = append(quoted, "'"+v+"'")
+	}
+	return strings.Join(quoted, ",")
+}
+
+// logChainIsNormalEndReason Go 侧的同一判定。与 SQL 侧共用 logChainNormalEndReasons。
+func logChainIsNormalEndReason(endReason string) bool {
+	for _, v := range logChainNormalEndReasons {
+		if endReason == v {
+			return true
+		}
+	}
+	return false
+}
+
+// logChainClientGoneEndReason 下游客户端主动断连的 end_reason 取值。
+//
+// 只有这一个值。单独列成常量而不是散在各处写字面量：SQL 侧、标签侧、
+// 排除逻辑三处都要用它，散写会漂移。
+const logChainClientGoneEndReason = "client_gone"
+
+// logChainClientGoneSQL 客户断连判据。独立一档，不混进流故障。
+//
+// 注意它**不看 error_count**：客户断连时流内可能没有任何错误，
+// 而 error_count > 0 属于真的流故障，归 logChainStreamAnomalySQL。
+func logChainClientGoneSQL() string {
+	return "(" + anomalyEndReasonSQL + " = '" + logChainClientGoneEndReason + "')"
+}
+
+// logChainStreamAnomalySQL 流**真的出故障**的判据：timeout / scanner_error / panic /
+// ping_fail，以及任何没见过的新取值；或流内出错计数 > 0。
+//
+// 仍用**排除法**：正常名单 + client_gone 之外的一律算故障。
+// 排除 client_gone 是因为它已独立成档（92% 实际已交付内容，多数不是故障），
+// 混在一起会让 25 条真故障被 1594 条客户断连淹掉。
+//
+// **排除法本身没有被削弱**：新增的未知取值仍会落到这里，不会被静默吞掉。
+func logChainStreamAnomalySQL() string {
+	excluded := logChainNormalEndReasonSQL() + ",'" + logChainClientGoneEndReason + "'"
+	return "(" + anomalyEndReasonSQL + " NOT IN (" + excluded + ") OR " +
+		anomalyErrCountSQL + " > 0)"
+}
+
+// logChainNoOutputModelKeywords 天然无输出 token 的模型关键词。**SQL 侧与 Go 侧的唯一事实源**：
+// 两处都由这一份列表生成，因此不存在"改了一处忘了另一处"的漂移可能
+// （曾经两侧各写一份，只能靠测试事后发现不一致）。名单口径与 anomalyZeroSQL 保持一致。
+var logChainNoOutputModelKeywords = []string{
+	"embed", "rerank", "bge-", "m3e", "image", "seedream", "seedance",
+}
+
+// logChainNoOutputModelSQL 排除天然无输出模型，否则 embedding 类会被整类误判成"扣费未交付"。
+//
+// 用 LOWER(...) NOT LIKE 链而非 MySQL 专有的 NOT REGEXP：后者在 SQLite 假生产源上直接报语法错，
+// 导致这批判据无法用真执行的测试覆盖（只能做字符串断言，而排序 bug 正是字符串断言漏掉的）。
+// 两种写法都用不上索引，性能无差别；LOWER 显式声明大小写不敏感，也与 Go 侧的 strings.ToLower 对齐，
+// 不再依赖 MySQL 的 collation 恰好是 _ci。
+func logChainNoOutputModelSQL() string {
+	parts := make([]string, 0, len(logChainNoOutputModelKeywords))
+	for _, kw := range logChainNoOutputModelKeywords {
+		parts = append(parts, "LOWER(COALESCE(model_name,'')) NOT LIKE '%"+kw+"%'")
+	}
+	return "(" + strings.Join(parts, " AND ") + ")"
+}
+
+// logChainBillingUnpaidSQL 扣费未交付：客户付了钱，一个 token 都没拿到。
+// 判"是否真交付"只能用 completion_tokens——frt 只证明上游开口（任何 data: 行都置位），
+// prompt_tokens 也不行（上游不返 usage 时 new-api 本地估算并照此扣费）。
+func logChainBillingUnpaidSQL() string {
+	return "(type = 2 AND quota > 0 AND completion_tokens = 0 AND " +
+		logChainNoOutputModelSQL() + ")"
+}
+
+// logChainBillingFreeSQL 交付未扣费：内容给了，钱没收。方向相反，亏的是我方。
+//
+// 写成函数而非常量：它要调 channelTestJSONEnumSQL 取 other.billing_source，
+// 函数调用不是编译期常量。用那个 helper 而不是自己拼，是为了与既有取值写法一致
+// （MySQL 与本地 SQLite 假库都能执行）。
+//
+// 必须排除订阅计费：billing_source='subscription' 时走订阅额度而非钱包 quota，
+// quota 自然为 0，属正常。不排除会把所有订阅客户的请求整批误报成漏计费。
+func logChainBillingFreeSQL() string {
+	return "(type = 2 AND quota = 0 AND completion_tokens > 0 AND " +
+		logChainNoOutputModelSQL() + " AND " +
+		channelTestJSONEnumSQL("$.billing_source") + " <> 'subscription')"
+}
+
+// logChainAnomalyTags 标注这一行为什么被判为异常，可同时命中多类
+// （如 client_gone 且扣费未交付）。让每行自证，而不是让人对着结果猜口径。
+//
+// 判据必须与 SQL 侧保持一致，否则会出现"筛出来了但没标签"或反之的矛盾结果。
+// 两处各写一份是有意的：SQL 在库里筛（不能把全部行捞回来再过滤），
+// 这里给已捞回的行打标签。改动时必须同改两处——测试会钉住一致性。
+//
+// **不读 EndError**：它是自由文本，可能含 "panic" 等词，参与判定会误命中。
+func logChainAnomalyTags(r LogChainRow, quota int64) []string {
+	var tags []string
+	if r.Type == 2 {
+		switch {
+		// 客户断连单独一档。判定顺序：先认 client_gone，再判流故障——
+		// 否则它会被下面那条排除法当成"未知取值"重新算进 stream，等于没拆。
+		//
+		// error_count > 0 时按流故障处理：那说明流内真的出过错，
+		// 不只是客户走了（一行可同时是断连与故障，此时以故障为准更要紧）。
+		case r.EndReason == logChainClientGoneEndReason && r.StreamErrorCount == 0:
+			tags = append(tags, logChainClientGoneEndReason)
+		// 流真的出故障：正常名单与 client_gone 之外的取值，或流内有错误计数。
+		// 排除法保持不变——没见过的新取值仍落在这里。
+		case !logChainIsNormalEndReason(r.EndReason) || r.StreamErrorCount > 0:
+			tags = append(tags, "stream")
+		}
+	}
+	if r.Type == 2 && !logChainNoOutputModel(r.ModelName) {
+		switch {
+		case quota > 0 && r.CompletionTokens == 0:
+			tags = append(tags, "billing_unpaid") // 客户付了钱没拿到内容
+		case quota == 0 && r.CompletionTokens > 0:
+			// 订阅计费的 quota 恒为 0，属正常，不算漏计费。
+			// 这里无法从 LogChainRow 读 billing_source，故由调用方保证：
+			// 该字段已在 SQL 侧排除；标签侧同样跳过订阅来源的行。
+			if r.BillingSource != "subscription" {
+				tags = append(tags, "billing_free") // 我方漏收钱
+			}
+		}
+	}
+	return tags
+}
+
+// logChainNoOutputModel 天然无输出 token 的模型。**与 logChainNoOutputModelSQL 共用
+// logChainNoOutputModelKeywords 这一份名单**，不再各写一份——两侧名单曾是硬编码副本，
+// 一旦漂移就会出现"SQL 筛出来的行在标签侧被判为不是异常"这种自相矛盾的结果。
+func logChainNoOutputModel(model string) bool {
+	m := strings.ToLower(model)
+	for _, kw := range logChainNoOutputModelKeywords {
+		if strings.Contains(m, kw) {
+			return true
+		}
+	}
+	return false
+}
+
+// logChainAnomalySQL 按筛选类型返回判据片段。
+// kind 只来自 parseLogChainScope 校验过的闭集，不接受任意用户输入，无注入面。
+//
+// 流状态异常额外限定 type=2：流结束状态只在消费日志上有意义，
+// 不限定会把 type=5 错误日志里恰好带 stream_status 的行也算进"流异常"，
+// 与「错误」筛选重叠、双重计数。
+func logChainAnomalySQL(kind string) string {
+	streamWithType := "(type = 2 AND " + logChainStreamAnomalySQL() + ")"
+	// 客户断连同样限定 type=2：流结束状态只在消费日志上有意义。
+	// 且必须排除 error_count>0 的行——那些归流故障，否则两档会重叠、双重计数。
+	clientGoneWithType := "(type = 2 AND " + logChainClientGoneSQL() +
+		" AND " + anomalyErrCountSQL + " = 0)"
+	switch kind {
+	case anomalyStream:
+		return streamWithType
+	case anomalyClientGone:
+		return clientGoneWithType
+	case anomalyBillingUnpaid:
+		return logChainBillingUnpaidSQL()
+	case anomalyBillingFree:
+		return logChainBillingFreeSQL()
+	case anomalyBilling:
+		return "(" + logChainBillingUnpaidSQL() + " OR " + logChainBillingFreeSQL() + ")"
+	case anomalyAll:
+		// 拆档后 all 必须显式含 client_gone，否则"全部异常"会漏掉刚分出去的那一档。
+		return "(" + streamWithType + " OR " + clientGoneWithType + " OR " +
+			logChainBillingUnpaidSQL() + " OR " + logChainBillingFreeSQL() + ")"
+	case anomalyErrAnom:
+		// 唯一跨 type 的取值：错误(type=5) + 全部异常(type=2 里的问题请求)。
+		// 在 SQL 层做而非前端滤，否则 limit/has_more/计数三者会全部失准。
+		return "(type = 5 OR " + streamWithType + " OR " + clientGoneWithType + " OR " +
+			logChainBillingUnpaidSQL() + " OR " + logChainBillingFreeSQL() + ")"
+	}
+	// 走不到：kind 已在解析阶段校验。返回恒假而不是恒真——
+	// 万一将来有人绕过校验调进来，宁可查不到也不要把全部请求当异常吐出去。
+	return "1 = 0"
+}
 
 // LogChainRow 一条请求的排障视图。含渠道与上游主域名——仅管理员面可见。
 type LogChainRow struct {
@@ -84,6 +323,31 @@ type LogChainRow struct {
 
 	// Content 是 logs.content 原文，未经 scrubContent。错误(type=5)的上游返回全在这里。
 	Content string `json:"content,omitempty"`
+
+	// 流结束状态。EndReason 直出原值（eof / client_gone / timeout / ...），
+	// 不归类不翻译：new-api 升级新增取值时，归类写法会把它静默吞掉。
+	EndReason string `json:"end_reason,omitempty"`
+	// EndError 是自由文本（如 "context canceled"）。仅展示，不参与任何判定。
+	EndError         string `json:"end_error,omitempty"`
+	StreamErrorCount int    `json:"stream_error_count,omitempty"`
+
+	// BillingSource = "subscription" 表示本次走订阅额度而非钱包 quota，
+	// 此时 quota 恒为 0 属正常，不能算漏计费。判"交付未扣费"必须据此排除。
+	BillingSource string `json:"billing_source,omitempty"`
+
+	// AnomalyTags 说明这一行"为什么被判为异常"，可同时命中多类
+	// （如 client_gone 且扣费未交付）。让每行自证，而不是让人对着结果猜口径。
+	AnomalyTags []string `json:"anomaly_tags,omitempty"`
+
+	// —— 以下三个是**推断，不是事实**（见 logchain_fault.go 的文件头）——
+	//
+	// Fault 疑似责任方：upstream / ours / downstream / unknown。
+	// FaultWhy 是判断依据，FaultConfidence 是可信度。
+	// **三者必须一起显示**：只给 Fault 会让人把推断当成事实，
+	// 而归因判错的代价是去找错人（判成我方会让人去改自己的配置，而问题在上游）。
+	Fault           string `json:"fault,omitempty"`
+	FaultConfidence string `json:"fault_confidence,omitempty"`
+	FaultWhy        string `json:"fault_why,omitempty"`
 }
 
 // logChainScope 已校验的查询范围。所有字段都来自用户输入但已收敛到安全区间。
@@ -99,14 +363,22 @@ type logChainScope struct {
 	RequestID string
 	Keyword   string
 	ErrorOnly bool
-	LogType   int
+	// Anomaly 异常筛选，取值见 anomalyStream 等常量；空=不按异常筛。
+	// 与 ErrorOnly 互斥：错误是 type=5，异常是 type=2 里的问题请求，两者交集为空。
+	// 同时传必然返回空集，所以在解析阶段就拒掉，而不是让人查出 0 行再怀疑功能坏了。
+	Anomaly string
+	LogType int
 	// 复合游标 (created_at, id)。排序按 created_at 而非 id：
 	// new-api 在请求**完成时**写日志，耗时长的请求会比后发起、快速失败的请求更晚写入，
 	// 因此 id 序并不等于发生时间序。排障要的是"几点几分发生的"，必须按 created_at。
 	// 单用 created_at 做游标会在同秒多条时漏行或重复，故带上 id 破平。
 	BeforeTs int64
 	BeforeID int64
-	Limit    int
+	// Asc=true 为时间正序（最早在上），false 为倒序（最新在上，默认）。
+	// 排序方向一变，游标比较方向必须跟着翻转，否则"加载更多"会往反方向取、
+	// 翻出已经看过的行。两者由 logChainOrderBySQL / logChainWhere 统一处理。
+	Asc   bool
+	Limit int
 }
 
 // parseLogChainScope 解析并收敛查询参数。时间窗按 CST 自然日左闭右开，与事实层口径一致。
@@ -165,6 +437,31 @@ func parseLogChainScope(c *gin.Context, now time.Time) (logChainScope, error) {
 	if s.ErrorOnly && s.LogType != 0 && s.LogType != 5 {
 		return logChainScope{}, errors.New("error_only 与 type 冲突：error_only=true 时 type 只能为 5")
 	}
+	// 异常筛选。三类冲突全部显式拒绝，不静默忽略——静默会让人拿着错的结果当真：
+	//   与 error_only 同传：交集为空，必然 0 行
+	//   与 type≠2 同传：异常判据全部限定 type=2
+	//   取值拼错：会退化成"全部请求"，而人以为在看异常清单
+	if a := strings.TrimSpace(c.Query("anomaly")); a != "" {
+		switch a {
+		case anomalyStream, anomalyClientGone, anomalyBilling, anomalyBillingUnpaid,
+			anomalyBillingFree, anomalyAll, anomalyErrAnom:
+			s.Anomaly = a
+		default:
+			return logChainScope{}, fmt.Errorf("anomaly 取值无效：只支持 %s / %s / %s / %s / %s / %s / %s",
+				anomalyStream, anomalyClientGone, anomalyBilling, anomalyBillingUnpaid,
+				anomalyBillingFree, anomalyAll, anomalyErrAnom)
+		}
+		if s.ErrorOnly {
+			return logChainScope{}, errors.New("anomaly 与 error_only 互斥：错误是 type=5，异常是 type=2 里的问题请求，交集为空")
+		}
+		// err_anom 本身就含 type=5，是唯一跨 type 的取值，故不受 type=2 约束。
+		if s.Anomaly != anomalyErrAnom && s.LogType != 0 && s.LogType != 2 {
+			return logChainScope{}, errors.New("anomaly 与 type 冲突：异常判据限定 type=2")
+		}
+		if s.Anomaly == anomalyErrAnom && s.LogType != 0 {
+			return logChainScope{}, errors.New("anomaly=err_anom 已含错误与异常两类，不能再指定 type")
+		}
+	}
 	// 游标必须成对提供：只给一个无法定位 (created_at,id) 的位置，
 	// 静默忽略会让"加载更多"从头再来、出现重复行，所以显式拒绝。
 	beforeTsText := strings.TrimSpace(c.Query("before_ts"))
@@ -180,6 +477,9 @@ func parseLogChainScope(c *gin.Context, now time.Time) (logChainScope, error) {
 		}
 		s.BeforeTs, s.BeforeID = bt, bi
 	}
+	// 排序方向。只认 "asc"，其余一律按默认倒序——排障最常看"刚刚发生了什么"。
+	// 不把用户字符串带进 SQL，只转成 bool，无注入面。
+	s.Asc = strings.EqualFold(strings.TrimSpace(c.Query("order")), "asc")
 	if l, err := strconv.Atoi(strings.TrimSpace(c.Query("limit"))); err == nil && l > 0 {
 		s.Limit = l
 	}
@@ -224,6 +524,10 @@ func logChainWhere(s logChainScope, domainChans []int64) (string, []any) {
 	where += " AND NOT (" + channelTestLogPredicateSQL() + ")"
 
 	switch {
+	case s.Anomaly != "":
+		// 异常判据自带 type=2（见各 SQL 常量），这里不再另加 type 条件，
+		// 否则会出现 "type = 2 AND (type = 2 AND ...)" 这种重复。
+		where += " AND " + logChainAnomalySQL(s.Anomaly)
 	case s.ErrorOnly:
 		where += " AND type = 5"
 	case s.LogType > 0:
@@ -267,12 +571,19 @@ func logChainWhere(s logChainScope, domainChans []int64) (string, []any) {
 		where += " AND content LIKE ? ESCAPE '!'"
 		args = append(args, "%"+escapeLike(s.Keyword)+"%")
 	}
-	// 复合游标：按 (created_at, id) 倒序取"更早的"，不用深 OFFSET。
-	// 写成 created_at < ? OR (created_at = ? AND id < ?) 而非行值比较
+	// 复合游标：沿排序方向取"下一批"，不用深 OFFSET。
+	// 写成 created_at ? ? OR (created_at = ? AND id ? ?) 而非行值比较
 	// ((created_at,id) < (?,?))：前者能用上 created_at 索引，后者在 MySQL 上
 	// 未必走索引。同秒多条时用 id 破平，避免漏行或重复。
+	//
+	// 比较方向必须跟随排序方向：倒序时取更早的（<），正序时取更晚的（>）。
+	// 方向写死会让"加载更多"在正序下往回翻，重复吐出已看过的行。
 	if s.BeforeTs > 0 && s.BeforeID > 0 {
-		where += " AND (created_at < ? OR (created_at = ? AND id < ?))"
+		cmp := "<"
+		if s.Asc {
+			cmp = ">"
+		}
+		where += " AND (created_at " + cmp + " ? OR (created_at = ? AND id " + cmp + " ?))"
 		args = append(args, s.BeforeTs, s.BeforeTs, s.BeforeID)
 	}
 	return where, args
@@ -285,7 +596,12 @@ func logChainWhere(s logChainScope, domainChans []int64) (string, []any) {
 // 会比后发起、快速失败的请求更晚写入，故 id 序 ≠ 发生时间序。排障看的是"几点几分
 // 发生的"，用户也明确要求按发生时间排列。同秒多条时用 id 破平以保证顺序稳定
 // （否则复合游标翻页可能漏行或重复）。
-func logChainOrderBySQL() string {
+// asc=true 为时间正序（最早在上），false 为倒序（最新在上，默认）。
+// 方向只在这一处拼进 SQL，且只取自 bool——不接受用户传入的排序字符串，无注入面。
+func logChainOrderBySQL(asc bool) string {
+	if asc {
+		return "ORDER BY created_at ASC, id ASC"
+	}
 	return "ORDER BY created_at DESC, id DESC"
 }
 
@@ -313,7 +629,7 @@ func (m *Monitor) queryLogChain(ctx context.Context, s logChainScope, domainChan
 		" COALESCE(use_time,0), COALESCE(is_stream,0), COALESCE(quota,0)," +
 		" COALESCE(content,''), COALESCE(other,''), COALESCE(request_id,'')" +
 		" FROM logs WHERE " + where +
-		" " + logChainOrderBySQL() + " LIMIT " + strconv.Itoa(s.Limit+1)
+		" " + logChainOrderBySQL(s.Asc) + " LIMIT " + strconv.Itoa(s.Limit+1)
 
 	rows, err := m.prodDB.QueryContext(cctx, q, args...)
 	if err != nil {
@@ -351,6 +667,18 @@ func (m *Monitor) queryLogChain(ctx context.Context, s logChainScope, domainChan
 				r.IsModelMapped = true
 				r.UpstreamModelName = o.UpstreamModelName
 			}
+			// 流结束状态原值直出，不归类不翻译：new-api 将来新增取值时，
+			// 归类写法会把它静默吞掉，而排障最怕"没见过的情况被吞了"。
+			r.EndReason = o.StreamStatus.EndReason
+			r.EndError = o.StreamStatus.EndError
+			r.StreamErrorCount = o.StreamStatus.ErrorCount
+			r.BillingSource = o.BillingSource
+		}
+		r.AnomalyTags = logChainAnomalyTags(r, quota)
+		// 归因必须在标签算完之后：异常行的责任方依赖标签种类
+		// （client_gone 与 stream 的归因逻辑完全不同）。
+		if f := logChainAttributeFault(r, r.AnomalyTags); f.Fault != "" {
+			r.Fault, r.FaultConfidence, r.FaultWhy = f.Fault, f.Confidence, f.Why
 		}
 		out = append(out, r)
 	}
@@ -481,7 +809,9 @@ func logChainBlindSpots() []string {
 			"客户报“请求根本发不出去”时，本接口查不到属预期，不代表没发生。",
 		"new-api 换渠道重试会落多条 type=5：本接口按条列出，但无法归并成一次客户请求，" +
 			"看到 N 条错误不等于失败 N 次。",
-		"从不采集请求/响应正文：“回答内容质量不对”这类问题本接口答不了。",
+		// 原第三条"从不采集请求/响应正文"已删：加入 end_reason / end_error 后，
+		// "回答只出一半就断了"这类已能回答（看 client_gone + 耗时）。
+		// 剩下真正答不了的是"内容写得不对"，那属内容审查、不是排障范畴，写在这里是跑题。
 	}
 }
 
@@ -588,6 +918,12 @@ func logChainScopeEcho(s logChainScope) gin.H {
 	}
 	if s.LogType > 0 {
 		h["type"] = s.LogType
+	}
+	// 回显生效的排序方向：前端据此高亮对应按钮，避免按钮状态与实际结果不一致。
+	if s.Asc {
+		h["order"] = "asc"
+	} else {
+		h["order"] = "desc"
 	}
 	return h
 }
