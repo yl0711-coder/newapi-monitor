@@ -8,15 +8,21 @@
 # 传入一份已安装 ca-certificates/tzdata 的本机已缓存运行镜像；
 # OFFLINE_RUNTIME 会先校验这两份运行资产，不会把缺包的镜像伪装成可交付产物。
 ARG RUNTIME_IMAGE=alpine:3.23
+# BUILDER_IMAGE 与 RUNTIME_IMAGE 同理：镜像代理不可达时（dockerproxy.com 超时、
+# Docker Hub 直连失败），可传入本机已缓存的任意 golang 镜像完成构建。
+# 产物是 CGO_ENABLED=0 的静态二进制，构建镜像的基础发行版不影响运行结果，
+# 因此 golang:1.25（Debian 基）编出的二进制同样能在 alpine 运行层跑。
+# 仅要求 Go 版本 >= go.mod 里声明的版本。
+ARG BUILDER_IMAGE=golang:1.26.6-alpine3.23
 
 # ---- 构建阶段 ----
-FROM golang:1.26.6-alpine3.23 AS builder
+FROM ${BUILDER_IMAGE} AS builder
 WORKDIR /build
 COPY go.mod go.sum ./
 # 默认仍使用官方 Go 代理；纯本地验收可把 GOPROXY 指向只读的
 # module cache HTTP 容器，并在 Docker internal network 中完成不可发外的构建。
-ARG GOPROXY=https://proxy.golang.org,direct
-ARG GOSUMDB=sum.golang.org
+ARG GOPROXY=https://goproxy.cn,direct
+ARG GOSUMDB=sum.golang.google.cn
 RUN GOPROXY="$GOPROXY" GOSUMDB="$GOSUMDB" go mod download
 COPY . .
 # glebarez/modernc 纯 Go sqlite,无需 CGO,静态编译;main 在模块根。
