@@ -1304,6 +1304,18 @@ type logOther struct {
 	SubscriptionRemain      *int64   `json:"subscription_remain"`
 	SubscriptionTotal       *int64   `json:"subscription_total"`
 	PO                      []string `json:"po"` // 参数覆盖审计行(仅覆盖了审计白名单路径时非空),展开区"参数覆盖"按钮/内容用
+
+	// StreamStatus 是流式请求的结束状态,嵌套对象(非平铺字段,早期漏解析就是因为这个)。
+	// EndReason 为闭集枚举:eof=正常结束 / client_gone=下游客户端断连 /
+	// timeout / scanner_error / panic / ping_fail。非流式请求没有这个对象。
+	//
+	// EndError 是自由文本(如 "context canceled"),**只可用于展示,绝不可参与判定**——
+	// 它可能含 "panic" 等词,对整串做匹配会误命中(sampler.go 的注释记录了这个坑)。
+	StreamStatus struct {
+		EndReason  string `json:"end_reason"`
+		EndError   string `json:"end_error"`
+		ErrorCount int    `json:"error_count"`
+	} `json:"stream_status"`
 }
 
 func parseLogOther(s string) *logOther {
