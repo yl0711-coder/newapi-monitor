@@ -1,8 +1,8 @@
 # 上下游全链路日志与日毛利核算 · 开发说明书
 
-- 文档状态：**P1 后端已实现（前端未做）；P2/P3 未开始**
+- 文档状态：**P1 前后端已实现并实测通过；P2/P3 未开始**
 - 初版日期：2026-08-19（Asia/Shanghai）
-- 最后修订：2026-08-19（第二轮会话：修正三处事实错误 + 补入 P1 实现记录与成本分摊口径）
+- 最后修订：2026-08-20（第三轮会话：前端实现 + fixture 端到端实测 + 排序 bug 修复）
 - 编写者：第一、二轮 AI 会话（基于代码阅读 + 本地脱敏快照实测）
 - 交付对象：接手开发的 AI / 开发人员
 - 前置阅读：[QUALITY_REVIEW_AND_TEST_SOP.md](QUALITY_REVIEW_AND_TEST_SOP.md)、[usage-facts-v2-architecture.md](usage-facts-v2-architecture.md)
@@ -14,7 +14,18 @@
 > 4. 新增：事实表 `type IN (2,6)` 排除错误日志、`scrubContent` 会清空上游错误原文、
 >    前置拒绝无 `user_id`——三件都直接决定排障能做到什么程度。
 > 5. 新增 4.4 节：客户级成本分摊口径（用户已决策：按 token 占比，但必须在 域名×模型×日 摊）。
-> 6. 新增第 13 节：P1 排障链路已实现内容、验证状态、前端方案。第 14 节：本轮修正与失误。
+> 6. 新增第 13 节：P1 排障链路已实现内容、验证状态、前端方案。第 14 节：各轮修正与失误。
+>
+> **第三轮修订摘要**：
+> 7. 前端已实现（13.6）：侧边栏「数据同步状态」下方新增「客户排障」，单日表格 + 筛选。
+> 8. 新增 13.8 节：fixture 端到端实测。快照库无 `logs` 表，8202 验不了表格渲染，
+>    故造一次性 MySQL；含两个 fixture 侧的坑（latin1 双重编码、时区多退 8 小时）
+>    与本机构建镜像的绕法。
+> 9. **修掉一个真实排序 bug**（13.3 第 4 条）：原按 `id DESC`，但 new-api 在请求
+>    完成时写日志，id 序 ≠ 发生时间序，生产同样会乱序。改为 `created_at DESC, id DESC`，
+>    游标随之改成 `(created_at, id)` 复合键。
+> 10. 14.3 节记录前端 5 个缺陷、一条形同虚设的断言（做反向验证才发现）、
+>     以及改破既有测试的处理方式。
 
 > **本文档的证据分级**，务必遵守：
 > - 标 `【已验证】` = 上一轮会话直接读过代码或在本地 8202 快照实测过，可直接依赖。
@@ -518,29 +529,39 @@ SOP 3.2 节明确要求"金额、Token、时间等关键字段使用合适的数
 
 | 文件 | 状态 | 说明 |
 |---|---|---|
-| [monitor/logchain.go](../monitor/logchain.go) | 新增 | 全部后端逻辑 |
-| [monitor/logchain_test.go](../monitor/logchain_test.go) | 新增 | 8 个测试，钉住三条易被后续改动破坏的约束 |
-| [monitor/server.go](../monitor/server.go#L181) | 改 1 行 | `view` 组挂路由 |
+| [monitor/logchain.go](../monitor/logchain.go) | 新增 | 全部后端逻辑（两个接口） |
+| [monitor/logchain.js](../monitor/logchain.js) | 新增 | 前端交互，443 行 |
+| [monitor/logchain_test.go](../monitor/logchain_test.go) | 新增 | 后端约束测试 |
+| [monitor/logchain_ui_test.go](../monitor/logchain_ui_test.go) | 新增 | 前端结构约束测试 |
+| [monitor/page.html](../monitor/page.html) | 改 6 处 | 侧边栏 / 移动导航 / tab 容器 / CSS / `switchTab` / hash 白名单 |
+| [monitor/server.go](../monitor/server.go#L181) | 改 8 行 | 两条路由 + `logchain.js` 的 embed 与静态路由 |
+| [monitor/sync_status_ui_test.go](../monitor/sync_status_ui_test.go) | 改 4 行 | 该测试硬编码 tab 白名单正则，加 logchain 后需同步（详见 14.3） |
 
-**前端未做**（`logchain.js` + `page.html` 改动尚未开始，方案见 13.6）。
+**前后端均已实现并实测通过**（fixture 实测见 13.8）。提交在 `feat/logchain-p1` 分支。
 
 ### 13.2 接口
 
 ```
 GET /logchain/requests        # view 组，requireRole(roleAdmin)
+GET /logchain/filters         # 同上；下拉取值，只读本地 channel_snaps
 ```
 
-参数：`days`(默认1) | `from`+`to`(YYYY-MM-DD)、`user_id`、`channel_id`、`domain`、
-`model`、`group`、`token_name`、`request_id`、`keyword`、`error_only`、`type`(1-6)、
-`before_id`(游标)、`limit`(默认50/上限200)。
+`/logchain/requests` 参数：`days`(默认1) | `from`+`to`(YYYY-MM-DD)、`user_id`、
+`channel_id`、`domain`、`model`、`group`、`token_name`、`request_id`、`keyword`、
+`error_only`、`type`(1-6)、`before_ts`+`before_id`(复合游标，须成对)、
+`limit`(默认50/上限200)。
 
-响应：`{ok, rows[], has_more, next_before_id, scope{}, blind_spots[]}`。
+响应：`{ok, rows[], has_more, next_before_ts, next_before_id, scope{}, blind_spots[]}`。
 `LogChainRow` 含客户侧（`user_id`/`member`/`group`/`token_name`）、
 上游侧（`channel_id`/`channel_name`/`channel_vendor`/`upstream_domain`/`channel_status`/
 `channel_deleted`/`channel_unresolved`）、请求侧（模型/映射后上游模型/tokens/耗时/首字/路径）、
 `cost_usd`、`content`（**原文**）。
 
-### 13.3 三个关键实现决定（改动前请先读懂再动）
+`/logchain/filters` 响应：`{ok, groups[], domains[], channels[{id,name,domain,deleted}], models[]}`。
+单独一个接口而非塞进 requests 响应：下拉选项与所选日期无关，换一天不该重算，
+也不该因当天没有错误就让下拉变空。已删除的渠道也列出（历史请求仍要能按它筛）。
+
+### 13.3 四个关键实现决定（改动前请先读懂再动）
 
 1. **`content` 不过 `scrubContent`。** 这是本接口存在的理由（见 2.1.3）。
    `TestScrubContentWouldBlankUpstreamErrors` 断言
@@ -553,6 +574,13 @@ GET /logchain/requests        # view 组，requireRole(roleAdmin)
 3. **快照查不到渠道时标 `channel_unresolved`，不留空。**
    留空会被读成"这条请求没有上游域名"，真实含义是"我们的快照没覆盖到"。
    `channel_id=0`（未打到渠道）两者都不标——它本就没有渠道。三态在 UI 上必须分开显示。
+4. **按 `created_at` 排序，不按 `id`** 【第三轮修正，fixture 实测暴露】。
+   new-api 在请求**完成时**写日志：一个耗时 60s 的超时请求会比后发起、快速失败的
+   请求更晚拿到 id，故 **id 序 ≠ 发生时间序**，生产上同样会乱序。
+   实测现象：整日全部请求出现 15:40、14:02、09:13 排在 13:22、11:47 之前。
+   排序键即 [logChainOrderBySQL](../monitor/logchain.go)（`ORDER BY created_at DESC, id DESC`），
+   抽成函数是为了让实现与测试共用同一份字面量，避免"改了 SQL 但测试还断言旧写法"。
+   `TestLogChainOrdersByOccurrenceTime` 钉住这条。
 
 ### 13.4 结构性约束
 
@@ -561,8 +589,14 @@ GET /logchain/requests        # view 组，requireRole(roleAdmin)
 - **按 `domain` 筛是"先本地反查渠道 ID，再进生产库"**（`resolveDomainChannelIDs`）。
   域名无对应渠道时直接返回空集，不打生产库。
   命中数超 `logChainMaxDomainChans=500` 时返回 `domain_channels_truncated=true`——**不静默截断**。
+- **复合游标 `(created_at, id)`，必须成对传**。排序键是 `created_at` 后，
+  单用 `id` 已无法定位续查位置。条件写成
+  `created_at < ? OR (created_at = ? AND id < ?)` 而非行值比较 `((created_at,id) < (?,?))`：
+  前者能用上 `created_at` 索引，后者在 MySQL 上未必走索引。同秒多条用 `id` 破平，
+  否则翻页会漏行或重复。只提供半个游标**显式返回 400**，不静默忽略——
+  静默会让"加载更多"从头再来、产生重复行。`TestLogChainCursorRequiresBothParts` 钉住这条。
 - **遵守 9.2 节有界要求**：时间窗（跨度硬上限 31 天，超出砍 from 端保 to 端）、
-  游标分页（`id < ?` 倒序，不用深 OFFSET）、`MAX_EXECUTION_TIME(8000)`、
+  复合游标分页（不用深 OFFSET）、`MAX_EXECUTION_TIME(8000)`、
   15s context 超时、复用 `acquireInteractiveUsageDetailGate` 并发闸门、
   多取一行判 `has_more` 而不做 `COUNT(*)`。
 - **`scope` 回显生效范围。** 用户传的值可能被收敛（跨度截断、limit 上限），不回显会让前端
@@ -594,20 +628,20 @@ GET /logchain/requests        # view 组，requireRole(roleAdmin)
 - 全部用户可控值参数化；`LIKE` 值走 `escapeLike` + `ESCAPE '!'`。
   `TestLogChainWhereParameterizesUserInput` 断言占位符数与参数数相等、通配符已转义。
 
-### 13.5 验证状态（诚实记录）
+### 13.5 验证状态
 
 | 项 | 结果 |
 |---|---|
 | `GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build ./...` | **通过** |
-| `go vet ./monitor/` | logchain 相关无告警 |
-| `gofmt`（`tr -d '\r'` 去 CRLF 后比对） | 三个文件均干净 |
-| logchain 定向测试 8 个 | **全部 PASS**（容器内实跑） |
-| `go test ./...` 全量回归 | **未完成**——Docker 守护进程磁盘中途变只读 |
+| `node --check monitor/logchain.js` | **通过** |
+| `gofmt`（`tr -d '\r'` 去 CRLF 后比对） | 全部干净 |
+| `go test ./...` 全量回归 | **全部包通过**（`monitor` 26.9s） |
+| fixture 端到端实测（8203，13 行编造数据） | **通过**，见 13.8 |
 
-全量回归跑到 279s 时容器 `/tmp` 变只读，随后一批 `TempDir` 失败均为
-`read-only file system`，**不是断言失败**；最终 `docker run` 自身也报
-`/var/lib/desktop-containerd/.../meta.db: read-only file system`。
-**接手者请重启 Docker Desktop 后补跑全量回归。**
+> 初版文档此处记的是"全量回归未完成——Docker 守护进程磁盘变只读"。那次失败是
+> 容器 `/tmp` 变只读导致 `TempDir` 批量失败，**不是断言失败**；重启 Docker Desktop
+> 后补跑即全绿（同一份代码，280s → 27s）。**遇到成批 `read-only file system`
+> 先怀疑环境，别去改代码。**
 
 #### 13.5.1 在 Windows 上真跑测试的办法 【已验证·可复用】
 
@@ -628,40 +662,145 @@ MSYS_NO_PATHCONV=1 docker run --rm \
   容器内连不上 `proxy.golang.org`（connection refused），但宿主缓存是全的。
 - `MSYS_NO_PATHCONV=1` + 双斜杠路径，绕开 MSYS 的路径改写。
 
-### 13.6 前端方案（未实现，待用户确认一个默认值）
+### 13.6 前端实现（已完成）
+
+用户已拍板三项：**服务分组**（不是客户分组/公司）、**默认只看错误**、
+**用一次性 MySQL 造假数据验证**。
 
 - **不引入 React。** 现有 tab（[channel_management.js](../monitor/channel_management.js)、
   [stability.js](../monitor/stability.js)）都是**原生 JS + IIFE + 字符串拼 HTML**；
   React/Semi 只为日期控件存在（`range_picker.js` 适配层）。
-  新建 `logchain.js`，`go:embed` 挂 `/logchain.js`，暴露 `window.logChainActivate()`。
-- **主入口是跨页跳转，tab 只作落地页。** 排障真实起点是"客户报障"——手上有的是**客户**，
-  不是 request_id。新建空白 tab 让人从零填筛选，等于把最常见路径做成最长路径。
-  走现成机制：[monitorNavigate](../monitor/page.html#L1440) +
-  [monitorNavigationContext](../monitor/page.html#L1439)（`channelManagementOpen` 是范例）。
-  路径：用户用量 → [usageOpenDetail](../monitor/page.html#L1629) 客户详情 → 「排障」按钮
-  → 带 `user_id` 跳转。反向也要通：排障行点上游域名 → 跳渠道管理。
-- **`page.html` 需改四处**：两处导航栏 tab 按钮
-  （[277-282](../monitor/page.html#L277-L282) 与 [299-304](../monitor/page.html#L299-L304)）、
-  `tab-logchain` 容器、[switchTab](../monitor/page.html#L1442) 加 hidden 切换与激活调用、
-  [2904 行](../monitor/page.html#L2904)的 tab 名白名单正则加 `logchain`。
-- **表格**：一行一请求，**错误行整行标红底**。列
-  `时间 | 客户 | 模型 | 上游域名 | 渠道 | 耗时 | 费用 | 状态`。
-  `上游域名` 是本功能全部意义所在，列宽给足。
-  行展开放错误原文全文（`<pre>` 保原样，**不折行不美化**——要拿它去问上游客服）
-  \+ `request_id` + token 明细 + 请求路径。
+  新建 [logchain.js](../monitor/logchain.js)，`go:embed` 挂 `/logchain.js`，
+  暴露 `window.logChainActivate()`。
+- **入口在侧边栏「数据同步状态」下方**（用户指定位置）。
+  `TestLogChainNavPlacedAfterSync` 钉住这个相对顺序。
+  跨页跳转也留了：`window.logChainOpen(context)` + `applyNavigationContext()`
+  支持带 `user_id`/`date`/`domain`/`group`/`channel_id` 进来；
+  行展开区有按钮跳回渠道管理看该域名。
+- **`page.html` 改六处**：侧边栏 tab、移动导航 tab、`tab-logchain` 容器、
+  `lc-*` 一组 CSS、[switchTab](../monitor/page.html) 的 hidden 切换与激活调用、
+  hash 白名单正则加 `logchain`。
+- **日期**：单日粒度。前后箭头翻天、日期选择器、「今天」按钮；
+  **不允许选未来日期**（`max` + 校验双保险）。单日查询是 `from=to=当天`，
+  后端把 `to` 当天整日纳入。
+- **筛选栏**：`只看错误`(默认开) / 服务分组 / 上游主域名 / 渠道 / 模型 /
+  客户(纯数字按 `user_id`，其它按令牌名模糊) / 错误原文关键词。
+  选具体渠道时自动清空域名筛选（渠道更精确，避免两者冲突筛出空集）。
+- **表格列序**（按用户要求）：
+  `客户 | 令牌 | 分组 | 模型 | 渠道 → 上游主域名 | 上游返回原文 | 时间`。
+  时间在最后一列、精确到**时分**，hover 显示完整日期到秒。
+  错误行**整行标红底**；「只看错误」时计数显示"本页 N 条错误"，
+  切成全部请求时显示"本页 N 条中 M 条错误"——后者能看出错误占比，
+  避免把偶发错误当成系统性故障。
+- **行展开**：全部字段 + 错误原文全文（`<pre>`，`white-space:pre`，
+  **不折行不美化**——要能原样拿去问上游客服）+ 复制按钮 + 跳渠道管理按钮。
+  未展开时原文限高 `3.9em`，避免长错误把表格撑爆。
 - **`blind_spots` 固定显示在筛选栏下方**，不得收进折叠面板（理由见 13.4）。
-- **待用户拍板**：`error_only` 默认开还是关。
-  默认开＝最快定位，但看不到"该客户大部分请求其实成功"的背景，易把偶发错误当系统性故障；
-  默认关＝一眼看出错误占比（建议，配合整行标红 + "本页 N 条中 M 条错误"计数）。
+  `TestLogChainJSKeepsBlindSpotsVisible` 钉住这条。
+- **三态在 UI 上分开显示**：正常（渠道名 → 域名）/ `⚠ 渠道快照缺失` /
+  `未打到渠道`。留空会被读成"没有上游域名"，语义完全不同。
 
 ### 13.7 还原方式
 
 ```bash
-rm monitor/logchain.go monitor/logchain_test.go
-git checkout monitor/server.go   # 只加了一行，撤它安全
+git checkout monitor/server.go monitor/page.html monitor/sync_status_ui_test.go
+rm monitor/logchain.go monitor/logchain.js monitor/logchain_test.go monitor/logchain_ui_test.go
 ```
 
-## 14. 第二轮会话的修正与失误
+或整个分支弃掉：`git branch -D feat/logchain-p1`（`main` 未被改动）。
+
+### 13.8 fixture 端到端实测 【已跑通·可复用】
+
+**为什么必须造 fixture**：脱敏快照有 42 张表，但**没有 `logs` 表**——`logs` 只存在于
+生产 MySQL。因此 8202 环境永远只能验到"生产库未连接"这一条路，表格恒为空，
+表格渲染/标红/展开/筛选/分页全都验不了。
+
+`.local-test-kit/logchain-fixture/`（**不入库**，已在 `.git/info/exclude`）：
+
+| 文件 | 用途 |
+|---|---|
+| `init.sql` | 建 5 张表。`logs` 含被查询的全部列；另 4 张空表占位 |
+| `seed.sql` | 13 行编造数据，覆盖全部关键用例 |
+| `docker-compose.logchain-fixture.yml` | 独立栈，端口 8203，不改 intern-local |
+| `Dockerfile.prebuilt` | 用已缓存镜像装预编译二进制 |
+| `dumpchans/` | 从快照读真实渠道 ID 的一次性工具 |
+
+**安全边界**：只绑 `127.0.0.1:8203`；MySQL 不映射宿主端口，只在 compose 网络内；
+数据全编造；用完 `down -v` 清卷。注意 `MONITOR_LOCAL_SNAPSHOT_ONLY=false`
+（要连 MySQL 才能验），但所有会外发的后台任务全关，**DSN 绝不可改成生产地址**。
+
+**seed 覆盖的用例**（渠道 ID 取自快照真实值，故补全能验出真实域名）：
+含"渠道"二字的错误原文（验绕过 `scrubContent`）、不含该字样的对照组、
+`channel_id=0`、快照缺失的 `#999`、超长多行原文、成功消费行、模型映射行、
+两类渠道测试流量（须被排除）、昨天的错误（验日期切换）、充值 `type=1`（须被排除）。
+
+**实测结果**：
+
+```
+整日·只看错误    6 行，时间严格倒序
+整日·全部请求    9 行（13 行减去 2 条测试流量、1 条充值、1 条昨天）
+昨天·只看错误    1 行
+按域名筛         last-api.ai → 1 行
+按服务分组筛     gpt-1.3x → 2 行
+分页 limit=4     两页无重复、无缺行、跨页边界正确、翻页后仍倒序
+半个游标         HTTP 400「before_ts 与 before_id 必须同时提供」
+中文原文         渠道 CQ-CC-Kiro-1 (#8) 返回错误：status_code=529 …（正常显示）
+三态             AWS-CH1→208.98.41.154 / [快照缺失 #999] / [未打到渠道]
+```
+
+#### 13.8.1 两个坑（都在 fixture 侧，不是产品代码）
+
+1. **MySQL 入口脚本默认按 latin1 读文件**，把 UTF-8 字节当 latin1 再编码进 utf8mb4 列，
+   "渠道"存成 `C3A6C2B8C2A0…`（正确是 `E6B8A0`），页面看到乱码。
+   **`init.sql` / `seed.sql` 开头必须 `SET NAMES utf8mb4;`**。
+   判定方法：`SELECT HEX(LEFT(content,3)), CHAR_LENGTH(content), LENGTH(content)`——
+   双重编码时字节数会异常膨胀。
+   > 这反过来证明透传是对的：Monitor 把库里字节原样返回，一个字节都没改。
+2. **时间早 8 小时**：容器 `TZ=Asia/Shanghai`，`NOW()` 已是 CST，
+   若再 `CONVERT_TZ` 当 UTC 转一次并减 `8*3600` 就会多退 8 小时。
+   直接 `UNIX_TIMESTAMP(DATE(NOW()))` 即可。
+
+#### 13.8.2 启动会被两道校验拦住（都是 fail-closed，设计正确）
+
+1. `MONITOR_USAGE_FACTS_READ_ENABLED=true` 但 `..._ENABLED=false` →
+   *"已拒绝静默回扫生产 logs"*。排障直查 `logs` 不经事实层，两个都设 `false` 即可。
+2. **五张表必须齐全**（[sourcePreflightQueries](../monitor/source_lifecycle.go#L201)），
+   少一张就 `Table 'newapi.channels' doesn't exist` 起不来。列名必须与预检 SELECT 完全一致。
+
+#### 13.8.3 在本机构建镜像的绕法
+
+仓库根 Dockerfile 的构建阶段固定 `golang:1.26-alpine3.23`，本机未缓存且
+Docker Hub 不可达（与把 `GOPROXY` 换成 `goproxy.cn` 同一个网络原因）。绕法：
+先用已缓存的 `golang:1.25` 在容器内编出二进制，再用 `Dockerfile.prebuilt`
+以本机已有的 `newapi-monitor:intern-main` 为运行基座装进去——全程不拉新镜像。
+
+```bash
+# 1. 编二进制（挂宿主 GOMODCACHE + GOPROXY=off）
+MSYS_NO_PATHCONV=1 docker run --rm --tmpfs /tmp:rw,exec,size=4g \
+  -v "//d/monitorcode/newapi-monitor://src" \
+  -v "//c/Users/86177/go/pkg/mod://go/pkg/mod" \
+  -w //src -e GOFLAGS=-mod=mod -e GOCACHE=/tmp/gocache -e GOPROXY=off \
+  golang:1.25 sh -c 'CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o .local-test-kit/logchain-fixture/monitor-bin .'
+
+# 2. 装进运行基座（注意：不要 cd，否则后面相对路径失效）
+MSYS_NO_PATHCONV=1 docker build -q -f .local-test-kit/logchain-fixture/Dockerfile.prebuilt \
+  -t newapi-monitor:logchain-fixture .local-test-kit/logchain-fixture
+
+# 3. 起栈（--no-build 避免触发拉 golang:1.26）
+MSYS_NO_PATHCONV=1 docker compose -f .local-test-kit/logchain-fixture/docker-compose.logchain-fixture.yml up -d --no-build
+
+# 4. 取 cookie 后调接口（免登录由测试包的两只 Nginx 完成）
+curl -s -c ck.txt -X POST 'http://127.0.0.1:8203/login' \
+  -H 'Content-Type: application/json' -d '{"username":"local","password":"local"}'
+curl -s -b ck.txt 'http://127.0.0.1:8203/logchain/requests?error_only=true'
+
+# 用完清干净
+MSYS_NO_PATHCONV=1 docker compose -f .local-test-kit/logchain-fixture/docker-compose.logchain-fixture.yml down -v
+```
+
+改了 `init.sql`/`seed.sql` 后**必须 `down -v`**：入口脚本只在空卷首次初始化时执行。
+
+## 14. 各轮会话的修正与失误
 
 ### 14.1 对初版文档的修正（三处事实错误）
 
@@ -680,4 +819,53 @@ git checkout monitor/server.go   # 只加了一行，撤它安全
 2. **`grep_search` 工具多次只返回文件名、不给行号内容**，一度看起来像"没找到"。
    与第 12 节第 4 条同源：**改用 `bash grep -n` 才拿到真实结果。**
    反常的空/残缺结果先自检工具，不要当结论。
+
+### 14.3 第三轮（前端）的修正与失误
+
+### 14.3.1 前端代码审查发现的 5 个缺陷（编译能过、跑起来也不一定报错）
+
+1. **复制按钮是死的。** 事件委托里 `closest('tr[data-lc-id]')` 先执行，
+   而复制按钮在展开行（`tr.lc-detail`，无该属性）内 → `closest` 返回 `null` 直接
+   `return`，永远走不到复制分支。**按钮判断必须排在取行之前。**
+2. **跳转按钮是死的。** markup 仍发内联 `onclick`，而 handler 已改看 `data-lc-jump`。
+   顺带去掉内联 `onclick`：那要把域名插进 HTML 属性里的 JS 字符串字面量，多一层转义面，
+   且与复制按钮处理方式不一致、容易漏改。
+3. **请求进行中改筛选被静默丢弃。** `if(lc.loading)return` 让表格停在旧结果上，
+   用户以为筛选没生效；且其后的 `abort()` 不可达。改用**世代计数**：
+   新请求中止旧请求，且只有最新世代有权写状态（否则被中止的旧请求会提前放开 `loading`）。
+4. **模型框发两次相同查询。** 文本框绑 `change` 会在失焦时触发，点「查询」＝blur + click。
+   **detail 泳道容量只有 1 且与客户 Portal 日志分页共用**（见 13.4.1），
+   白发一次就是让客户多排一次队。文本框统一走回车 / 查询按钮。
+5. **`lcModelList` 从未填充。** 模型名本就在 `channel_snaps.Models` 里，
+   由 `/logchain/filters` 一并返回。
+
+### 14.3.2 排序 bug 由 fixture 实测暴露（读代码没发现）
+
+`ORDER BY id DESC` 看起来合理——注释还写着"id 近似时间序"。fixture 一跑就露：
+15:40、14:02、09:13 排在 13:22、11:47 之前。根因是 new-api 在请求**完成时**写日志，
+耗时 60s 的超时请求会比后发起、快速失败的请求更晚拿到 id。**生产同样会乱序。**
+
+教训：**"近似"成立的前提要验，不能靠注释里的断言。**
+详见 13.3 第 4 条与 13.4 的复合游标。
+
+### 14.3.3 本轮自身的失误
+
+1. **写了一条形同虚设的断言。** `TestLogChainJSAvoidsChangeOnTextInputs` 初版用
+   `strings.Index` 只取**第一处** `addEventListener('change'`，那是 `lcDate`（绑 change 正确），
+   于是把 bug 原样改回去测试照样绿。
+   **做反向验证才发现**——把 bug 塞回去确认测试会红，是断言唯一可信的证明方式。
+   已改为扫描每一处绑定。
+2. **另一条断言命中了自己写的注释。** 搜 `if(lc.loading)return` 时，
+   解释"为什么不用它"的注释里就含这串字面量。
+   写"某写法不得出现"类断言前**必须先剔掉注释**（`stripJSLineComments`）。
+3. **多次报告"已修好"，实际编辑没落盘。** 后来重读文件才发现第 197 行的 bug 还在。
+   **改完关键处要重新读文件确认，不能只信工具回执。**
+4. **改破了既有测试。** `sync_status_ui_test.go` 硬编码 tab 白名单正则字面量，
+   加 `logchain` 后匹配不上。`#tab=sync` 行为并未改变（白名单只增不减），
+   属测试过度绑定字面量；已同步更新并注明"新增 tab 时须改这里"。
+   > 这正是用户"不得妨碍已有功能"要求的边界情形：**行为没坏，但测试红了也算破坏**——
+   > 必须查清是行为回归还是断言过紧，不能直接放宽测试了事。
+5. **`execute_bash` 连续约 25 次报成功但未执行**（重定向到文件后文件根本不存在）。
+   期间无法构建/测试/提交。判定方法：`cmd > file` 后读文件，文件不存在即工具故障。
+   与第 12 节第 4 条、14.2 第 2 条同源。**重启 IDE 后恢复。**
 
