@@ -476,12 +476,14 @@ func TestLogChainAnomalyTagsMatchSQL(t *testing.T) {
 		{"断连但流内出过错按故障算", LogChainRow{Type: 2, ModelName: "gpt-4o", EndReason: "client_gone", StreamErrorCount: 1, CompletionTokens: 5}, 100, []string{"stream"}},
 		{"未见过的新取值也算流故障", LogChainRow{Type: 2, ModelName: "gpt-4o", EndReason: "brand_new_reason", CompletionTokens: 5}, 100, []string{"stream"}},
 		{"流错误计数>0", LogChainRow{Type: 2, ModelName: "gpt-4o", EndReason: "eof", StreamErrorCount: 2, CompletionTokens: 5}, 100, []string{"stream"}},
-		{"扣费未交付", LogChainRow{Type: 2, ModelName: "gpt-4o", EndReason: "eof", CompletionTokens: 0}, 100, []string{"billing_unpaid"}},
+		// RequestPath 必填：扣费未交付以端点白名单为主判据（RB-02），
+		// 不带路径的行按"非文本端点"处理而不命中——那是有意的保守行为。
+		{"扣费未交付", LogChainRow{Type: 2, ModelName: "gpt-4o", EndReason: "eof", CompletionTokens: 0, RequestPath: "/v1/chat/completions"}, 100, []string{"billing_unpaid"}},
 		{"交付未扣费", LogChainRow{Type: 2, ModelName: "gpt-4o", EndReason: "eof", CompletionTokens: 8}, 0, []string{"billing_free"}},
 		{"订阅计费不算漏收", LogChainRow{Type: 2, ModelName: "gpt-4o", EndReason: "eof", CompletionTokens: 8, BillingSource: "subscription"}, 0, nil},
 		{"embedding 天然无输出不算异常", LogChainRow{Type: 2, ModelName: "text-embedding-3-small", EndReason: "eof", CompletionTokens: 0}, 100, nil},
 		{"rerank 同理", LogChainRow{Type: 2, ModelName: "bge-reranker-v2", EndReason: "eof", CompletionTokens: 0}, 100, nil},
-		{"可同时命中两类", LogChainRow{Type: 2, ModelName: "gpt-4o", EndReason: "client_gone", CompletionTokens: 0}, 100, []string{"client_gone", "billing_unpaid"}},
+		{"可同时命中两类", LogChainRow{Type: 2, ModelName: "gpt-4o", EndReason: "client_gone", CompletionTokens: 0, RequestPath: "/v1/chat/completions"}, 100, []string{"client_gone", "billing_unpaid"}},
 		{"错误日志不打异常标签", LogChainRow{Type: 5, ModelName: "gpt-4o", EndReason: "client_gone"}, 0, nil},
 	}
 	for _, tc := range cases {

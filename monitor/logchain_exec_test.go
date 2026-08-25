@@ -104,7 +104,9 @@ func TestLogChainQueryExecutesOnFakeSource(t *testing.T) {
 //
 // 时间戳递增且互不相同：排序与游标测试要靠它区分行，同秒多条另有专门用例。
 func logChainAnomalyFixture() []logChainSeedRow {
-	const eof = `{"stream_status":{"end_reason":"eof"}}`
+	// 带 request_path：生产实测每条 type=2 都有该字段（近 5 天 197371 行填充率 100%），
+	// 而「扣费未交付」以端点白名单为主判据（RB-02），fixture 不带路径就测不到那条判据。
+	const eof = `{"stream_status":{"end_reason":"eof"},"request_path":"/v1/chat/completions"}`
 	return []logChainSeedRow{
 		// —— 正常，不该有任何标签 ——
 		{ID: 1, CreatedAt: 1001, Type: 2, UserID: 7, Username: "alice", ChannelID: 3,
@@ -162,7 +164,7 @@ func logChainAnomalyFixture() []logChainSeedRow {
 		// —— 一行同时命中两类：client_gone 且扣费未交付 ——
 		{ID: 12, CreatedAt: 1012, Type: 2, UserID: 8, Username: "bob", ChannelID: 4,
 			ModelName: "gpt-4o", Quota: 400, CompletionTokens: 0, UseTime: 61,
-			Other: `{"stream_status":{"end_reason":"client_gone"}}`},
+			Other: `{"stream_status":{"end_reason":"client_gone"},"request_path":"/v1/chat/completions"}`},
 	}
 }
 

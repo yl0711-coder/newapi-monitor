@@ -148,11 +148,61 @@ func logChainStreamAnomalySQL() string {
 		anomalyErrCountSQL + " > 0)"
 }
 
-// logChainNoOutputModelKeywords 天然无输出 token 的模型关键词。**SQL 侧与 Go 侧的唯一事实源**：
-// 两处都由这一份列表生成，因此不存在"改了一处忘了另一处"的漂移可能
-// （曾经两侧各写一份，只能靠测试事后发现不一致）。名单口径与 anomalyZeroSQL 保持一致。
+// logChainTextCompletionPaths 会产生文本 completion token 的 API 端点白名单。
+//
+// ★★ 这是「扣费未交付」的主判据，模型名关键词只作兜底 ★★
+//
+// 为什么改成端点白名单（2026-08-25 验收报告 RB-02）：
+// 原实现只按模型名关键词排除，漏掉 dall-e / sora / veo / kling / wan / vidu /
+// flux / stable-diffusion 以及语音转录等一整批模态，把它们的成功请求误判为
+// "客户付了钱没拿到内容"。运营可能据此错误赔付、下架渠道或向上游投诉。
+//
+// 端点比模型名可靠：2026-08-25 生产实测近 5 天 197371 行 type=2，
+// other.request_path 填充率 **100%**（无空值），取值只有
+// /v1/responses、/v1/chat/completions、/v1/messages、/pg/chat/completions。
+// 非文本端点（图片/视频/音频）的 completion_tokens=0 属正常。
+//
+// 模型名关键词退为兜底：仅当端点在白名单内时才参与，用于挡住
+// 文本端点上确实不产出 token 的模型（如某些 embedding 走 chat/completions）。
+var logChainTextCompletionPaths = []string{
+	"/v1/chat/completions",
+	"/v1/responses",
+	"/v1/messages",
+	"/v1/completions",
+}
+
+// logChainNoOutputModelKeywords 文本端点上仍可能不产出 token 的模型关键词。
+// **仅作兜底**：主判据是上面的端点白名单。
 var logChainNoOutputModelKeywords = []string{
 	"embed", "rerank", "bge-", "m3e", "image", "seedream", "seedance",
+}
+
+// logChainTextCompletionPathSQL 端点白名单的 SQL 形式。
+// 用等值 OR 而非 LIKE：端点是闭集且实测只有四种取值，等值比模式匹配更精确，
+// 不会因为 /v1/completions 是 /v1/chat/completions 的子串而误命中。
+func logChainTextCompletionPathSQL() string {
+	expr := channelTestJSONEnumSQL("$.request_path")
+	parts := make([]string, 0, len(logChainTextCompletionPaths))
+	for _, p := range logChainTextCompletionPaths {
+		parts = append(parts, expr+" = '"+p+"'")
+	}
+	return "(" + strings.Join(parts, " OR ") + ")"
+}
+
+// logChainIsTextCompletionPath Go 侧的同一判定，与 SQL 侧共用白名单。
+// 空路径按**不在白名单**处理：宁可漏报也不误报——把未知端点当文本端点，
+// 就会重新引入 RB-02 那类"图片请求被判扣费未交付"的误报。
+func logChainIsTextCompletionPath(path string) bool {
+	p := strings.ToLower(strings.TrimSpace(path))
+	if p == "" {
+		return false
+	}
+	for _, want := range logChainTextCompletionPaths {
+		if p == want {
+			return true
+		}
+	}
+	return false
 }
 
 // logChainNoOutputModelSQL 排除天然无输出模型，否则 embedding 类会被整类误判成"扣费未交付"。
@@ -173,7 +223,10 @@ func logChainNoOutputModelSQL() string {
 // 判"是否真交付"只能用 completion_tokens——frt 只证明上游开口（任何 data: 行都置位），
 // prompt_tokens 也不行（上游不返 usage 时 new-api 本地估算并照此扣费）。
 func logChainBillingUnpaidSQL() string {
+	// 端点白名单是主判据（RB-02）：非文本端点的 completion_tokens=0 属正常，
+	// 图片/视频/音频请求本来就不产出文本 token，绝不能判为未交付。
 	return "(type = 2 AND quota > 0 AND completion_tokens = 0 AND " +
+		logChainTextCompletionPathSQL() + " AND " +
 		logChainNoOutputModelSQL() + ")"
 }
 
@@ -216,9 +269,19 @@ func logChainAnomalyTags(r LogChainRow, quota int64) []string {
 			tags = append(tags, "stream")
 		}
 	}
+	// 消费异常只在**文本端点**上判（RB-02）：图片/视频/音频请求的 completion_tokens=0
+	// 属正常，按旧的"模型名关键词"判会把它们整批误报成"客户付钱没拿到内容"。
+	// 端点白名单是主判据，模型名关键词退为白名单内的兜底。
 	if r.Type == 2 && !logChainNoOutputModel(r.ModelName) {
 		switch {
-		case quota > 0 && r.CompletionTokens == 0:
+		// 扣费未交付**只在文本端点上判**（RB-02）：图片/视频/音频的 completion_tokens=0
+		// 属正常，旧判据（仅按模型名关键词）会把它们整批误报成"客户付钱没拿到内容"，
+		// 运营可能据此错误赔付或投诉上游。此处的路径条件必须与
+		// logChainBillingUnpaidSQL 完全一致，否则会出现"筛出来了但没标签"。
+		//
+		// billing_free 分支**不加**路径条件：它要求 completion_tokens > 0，
+		// 即已产出文本，端点必然是文本端点，加了是冗余且会与 SQL 侧不一致。
+		case quota > 0 && r.CompletionTokens == 0 && logChainIsTextCompletionPath(r.RequestPath):
 			tags = append(tags, "billing_unpaid") // 客户付了钱没拿到内容
 		case quota == 0 && r.CompletionTokens > 0:
 			// 订阅计费的 quota 恒为 0，属正常，不算漏计费。
