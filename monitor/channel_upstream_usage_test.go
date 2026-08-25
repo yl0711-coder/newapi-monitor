@@ -1267,6 +1267,30 @@ func TestBackfillBudgetYieldDoesNotBecomeFailureBackoff(t *testing.T) {
 	}
 }
 
+func TestLegacyNewAPIBudgetFailureBecomesImmediatelyDue(t *testing.T) {
+	now := time.Date(2026, 8, 25, 9, 0, 0, 0, cstLocation).Unix()
+	m := newChannelUpstreamTestMonitor(t)
+	row := ChannelUpstreamAccount{
+		Domain: "legacy-budget.example", Provider: upstreamProviderNewAPI,
+		Enabled: true, UsageSyncEnabled: true, UsageStatus: upstreamStatusError,
+		UsageBackfillDone: false, UsageBackfillConsecutiveFails: 4,
+		UsageBackfillLastError:  legacyNewAPIBackfillBudgetError(),
+		UsageBackfillNextSyncAt: now + 3600, UsageNextSyncAt: now + 3600,
+	}
+	if err := m.storeDB.Create(&row).Error; err != nil {
+		t.Fatal(err)
+	}
+	due, err := m.loadDueUpstreamUsageAccounts(context.Background(), now, 1)
+	if err != nil || len(due) != 1 || due[0].Domain != row.Domain {
+		t.Fatalf("legacy budget row was not immediately due: rows=%+v err=%v", due, err)
+	}
+	normalizeLegacyNewAPIBackfillBudgetState(&due[0], now)
+	if due[0].UsageBackfillConsecutiveFails != 0 || due[0].UsageBackfillLastError != "" ||
+		due[0].UsageBackfillProgress != "等待断点续传" || due[0].UsageBackfillNextSyncAt != now {
+		t.Fatalf("legacy budget row was not normalized: %+v", due[0])
+	}
+}
+
 func TestSyncStoredNewAPIHistoryUsesBudgetAcrossHoursAndCompletes(t *testing.T) {
 	now := time.Now().Unix()
 	today := cstDayStart(now)
