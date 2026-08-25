@@ -266,6 +266,9 @@ func New(s Settings) (*Monitor, error) {
 	if err := validateUsageFactsSettings(s); err != nil {
 		return nil, err
 	}
+	if err := validateLocalAuthBypassSettings(s); err != nil {
+		return nil, err
+	}
 	credentialSecretConfigured := strings.TrimSpace(s.UpstreamCredentialSecret) != "" || strings.TrimSpace(s.SessionSecret) != ""
 	if err := validateNginxSettings(s); err != nil {
 		return nil, err
@@ -312,6 +315,28 @@ func New(s Settings) (*Monitor, error) {
 	}
 	initialized = true
 	return m, nil
+}
+
+// validateLocalAuthBypassSettings 让“免登录”只能存在于完全离线的本机快照。
+// 它不依赖部署人员记得关开关：只要配置中仍有任何生产或外部主动连接，
+// 进程就 fail closed，不会带着免登录界面启动。
+func validateLocalAuthBypassSettings(s Settings) error {
+	if !s.LocalAuthBypass {
+		return nil
+	}
+	if !s.LocalSnapshotOnly {
+		return errors.New("MONITOR_LOCAL_AUTH_BYPASS 只能与 MONITOR_LOCAL_SNAPSHOT_ONLY=true 一起使用")
+	}
+	if strings.TrimSpace(s.ProdDSN) != "" || strings.TrimSpace(s.NewAPIBaseURL) != "" {
+		return errors.New("本地免登录模式不允许配置生产 DSN 或 NewAPI 主站地址")
+	}
+	if s.SourceWorkerEnabled || s.SourceLeaseRequired || s.UpstreamSyncEnabled || s.UpstreamUsageSyncEnabled {
+		return errors.New("本地免登录模式要求关闭来源 worker、来源租约和全部上游同步")
+	}
+	if s.NginxEnabled || s.InfraEnabled || strings.TrimSpace(s.HeartbeatURL) != "" || !s.AlertsDisabled {
+		return errors.New("本地免登录模式要求关闭 Nginx/AWS 主动采集、外部心跳和所有告警")
+	}
+	return nil
 }
 
 // validateUsageFactsSettings 把“页面已经要求只读本地事实”的配置意图设为

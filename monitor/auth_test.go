@@ -216,3 +216,23 @@ func TestRoleGating(t *testing.T) {
 		t.Errorf("超管 /alert 应 200,实际 %d", c)
 	}
 }
+
+func TestLocalSnapshotAuthBypassNeedsNoCookie(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	m := &Monitor{cfg: Settings{LocalSnapshotOnly: true, LocalAuthBypass: true, AlertsDisabled: true}, chNames: map[string]string{}}
+	if err := m.openStore(t.TempDir() + "/t.db"); err != nil {
+		t.Fatal(err)
+	}
+	r := gin.New()
+	m.RegisterRoutes(r)
+
+	for _, path := range []string{"/", "/data", "/channels/report", "/alert"} {
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		req.Header.Set("Accept", "application/json")
+		r.ServeHTTP(w, req)
+		if w.Code == http.StatusFound || w.Code == http.StatusUnauthorized || w.Code == http.StatusForbidden {
+			t.Fatalf("本地快照免登录访问 %s 被鉴权拦截: %d", path, w.Code)
+		}
+	}
+}

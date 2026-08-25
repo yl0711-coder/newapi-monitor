@@ -125,6 +125,25 @@ func TestPlanUpstreamUsageSyncKeepsTodayIndependentFromHistory(t *testing.T) {
 	}
 }
 
+func TestPlanNewAPIUsageBackfillAdvancesOneClosedHour(t *testing.T) {
+	now := time.Date(2026, 8, 14, 16, 37, 0, 0, cstLocation).Unix()
+	today := cstDayStart(now)
+	row := ChannelUpstreamAccount{
+		Provider:                      upstreamProviderNewAPI,
+		UsageStatus:                   upstreamStatusOK,
+		UsageNextSyncAt:               now + 3600,
+		UsageBackfillCursor:           today - 86400,
+		UsageBackfillNextSyncAt:       now - 1,
+		UsageBackfillLastAttemptAt:    now - 3600,
+		UsageBackfillLastSuccessAt:    now - 3600,
+		UsageBackfillConsecutiveFails: 0,
+	}
+	plan := planUpstreamUsageSync(row, now, 90)
+	if plan.tailTo != 0 || plan.backfillFrom != row.UsageBackfillCursor || plan.backfillTo != row.UsageBackfillCursor+3600 {
+		t.Fatalf("NewAPI history must advance exactly one closed hour: %+v", plan)
+	}
+}
+
 func TestPlanUpstreamUsageSyncDoesNotBypassTailBackoff(t *testing.T) {
 	now := time.Date(2026, 8, 23, 9, 0, 0, 0, cstLocation).Unix()
 	today := cstDayStart(now)
@@ -1176,6 +1195,114 @@ func TestFetchNewAPIUsageWindowAccepts5000AndSplits5001(t *testing.T) {
 				t.Fatalf("HTTP calls=%d, want %d", pacer.calls, wantCalls)
 			}
 		})
+	}
+}
+
+func TestNewAPIHistoryBackfillPersistsPageCheckpointAcrossBudgetYield(t *testing.T) {
+	from := time.Date(2026, 8, 12, 8, 0, 0, 0, cstLocation).Unix()
+	rows := usageFixtureRows(6500, from, 3600)
+	server, totalQueries := newUpstreamUsageFixtureServer(t, rows, nil)
+	m := newChannelUpstreamTestMonitor(t)
+	row := ChannelUpstreamAccount{
+		Domain: server.Listener.Addr().String(), Provider: upstreamProviderNewAPI,
+		BaseURL: server.URL, UserID: 31, BalanceUnit: 500000,
+	}
+	credential := newAPICredential{AccessToken: "usage-token"}
+
+	firstPacer := newUpstreamUsageRequestPacer(upstreamUsageMaxRequestsPerRun, 0)
+	_, progress, complete, err := m.syncNewAPIUsageBackfillWindow(context.Background(), row, credential, from, from+3600, firstPacer)
+	if err != nil || complete || progress == "" {
+		t.Fatalf("first bounded turn complete=%v progress=%q err=%v", complete, progress, err)
+	}
+	if firstPacer.calls != upstreamUsageMaxRequestsPerRun {
+		t.Fatalf("first turn calls=%d, want safety budget %d", firstPacer.calls, upstreamUsageMaxRequestsPerRun)
+	}
+	var checkpoint NewAPIUsageBackfillCheckpoint
+	if err := m.storeDB.First(&checkpoint, "domain = ?", row.Domain).Error; err != nil {
+		t.Fatal(err)
+	}
+	if checkpoint.NextPage != 61 || checkpoint.SourceRows != 6000 || checkpoint.Total != int64(len(rows)) {
+		t.Fatalf("durable page checkpoint=%+v", checkpoint)
+	}
+	var published int64
+	if err := m.storeDB.Model(&ChannelUpstreamUsageHour{}).Where("domain = ?", row.Domain).Count(&published).Error; err != nil || published != 0 {
+		t.Fatalf("partial hour became public: rows=%d err=%v", published, err)
+	}
+
+	secondPacer := newUpstreamUsageRequestPacer(upstreamUsageMaxRequestsPerRun, 0)
+	result, progress, complete, err := m.syncNewAPIUsageBackfillWindow(context.Background(), row, credential, from, from+3600, secondPacer)
+	if err != nil || !complete || progress != "" {
+		t.Fatalf("resumed turn complete=%v progress=%q err=%v", complete, progress, err)
+	}
+	if secondPacer.calls != 6 { // one restart probe plus pages 61..65
+		t.Fatalf("resume calls=%d, want 6", secondPacer.calls)
+	}
+	if len(result.Hours) != 1 || result.Hours[0].Requests != int64(len(rows)) || result.Hours[0].CostUSD != float64(len(rows)) {
+		t.Fatalf("completed aggregate=%+v", result.Hours)
+	}
+	if err := m.persistNewAPIUsageBackfillWindow(context.Background(), row.Domain, from, from+3600, result.Hours, time.Now().Unix()); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.storeDB.Model(&NewAPIUsageBackfillCheckpoint{}).Where("domain = ?", row.Domain).Count(&published).Error; err != nil || published != 0 {
+		t.Fatalf("completed checkpoint was not cleared: rows=%d err=%v", published, err)
+	}
+	var hour ChannelUpstreamUsageHour
+	if err := m.storeDB.First(&hour, "domain = ? AND hour_ts = ?", row.Domain, from).Error; err != nil {
+		t.Fatal(err)
+	}
+	if hour.Requests != int64(len(rows)) || totalQueries.Load() != 66 {
+		t.Fatalf("published hour=%+v total queries=%d", hour, totalQueries.Load())
+	}
+}
+
+func TestBackfillBudgetYieldDoesNotBecomeFailureBackoff(t *testing.T) {
+	now := time.Date(2026, 8, 25, 8, 0, 0, 0, cstLocation).Unix()
+	row := ChannelUpstreamAccount{
+		Domain: "dense.example", UsageBackfillConsecutiveFails: 3,
+		UsageBackfillLastError: "old failure", UsageBackfillNextSyncAt: now + 3600,
+	}
+	applyUpstreamUsageBackfillYield(&row, "已安全保存 6000/6500 条", now)
+	if row.UsageBackfillConsecutiveFails != 0 || row.UsageBackfillLastError != "" || row.UsageBackfillProgress == "" || row.UsageBackfillNextSyncAt != now+15 {
+		t.Fatalf("healthy budget yield was classified as failure: %+v", row)
+	}
+}
+
+func TestSyncStoredNewAPIHistoryUsesBudgetAcrossHoursAndCompletes(t *testing.T) {
+	now := time.Now().Unix()
+	today := cstDayStart(now)
+	from := today - 2*3600
+	server, totalQueries := newUpstreamUsageFixtureServer(t, []upstreamUsageFixtureRow{
+		{ID: 1, CreatedAt: from + 60},
+		{ID: 2, CreatedAt: from + 3600 + 60},
+	}, nil)
+	m := newChannelUpstreamTestMonitor(t)
+	m.cfg.UpstreamUsageBackfillDays = 1
+	row := ChannelUpstreamAccount{
+		Domain: server.Listener.Addr().String(), Provider: upstreamProviderNewAPI,
+		BaseURL: server.URL, Account: "31", UserID: 31, Enabled: true,
+		UsageSyncEnabled: true, UsageStatus: upstreamStatusOK,
+		UsageDataUntil: now, UsageNextSyncAt: now + 3600,
+		UsageBackfillCursor: from, UsageBackfillNextSyncAt: now - 1,
+	}
+	if err := m.persistSyncedUpstreamAccount(context.Background(), &row, newAPICredential{AccessToken: "usage-token"}); err != nil {
+		t.Fatal(err)
+	}
+	synced, err := m.syncStoredUpstreamUsage(context.Background(), row.Domain)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !synced.UsageBackfillDone || synced.UsageBackfillCursor != today || synced.UsageBackfillConsecutiveFails != 0 || synced.UsageBackfillLastError != "" || synced.UsageBackfillProgress != "" {
+		t.Fatalf("multi-hour history did not complete cleanly: %+v", synced)
+	}
+	if totalQueries.Load() != 2 {
+		t.Fatalf("queries=%d, want one page per sparse hour", totalQueries.Load())
+	}
+	var hours []ChannelUpstreamUsageHour
+	if err := m.storeDB.Where("domain = ?", row.Domain).Order("hour_ts").Find(&hours).Error; err != nil {
+		t.Fatal(err)
+	}
+	if len(hours) != 2 || hours[0].Requests != 1 || hours[1].Requests != 1 {
+		t.Fatalf("published history hours=%+v", hours)
 	}
 }
 

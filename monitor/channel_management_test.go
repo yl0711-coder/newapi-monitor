@@ -122,6 +122,56 @@ func TestChannelManagementCardTypographyIsReadable(t *testing.T) {
 	}
 }
 
+func TestChannelManagementUpstreamSpendMetricKeepsAmountReadable(t *testing.T) {
+	js := string(channelManagementJS)
+	css := string(stabilityCSS)
+	for _, marker := range []string{
+		`<small>区间上游消费</small>`,
+		`<small>上游当前余额</small>`,
+		`domain.upstream?.balance_usd`,
+		`cm-domain-metric-note`,
+		`小时日志`,
+		`补全中`,
+		`.cm-domain-upstream-spend{padding-left:18px`,
+		`.cm-domain-metrics{grid-column:2/4;grid-row:2`,
+		`.cm-domain-requests,.cm-domain-tokens{display:none}`,
+		`.cm-domain-metric-note.pending{color:`,
+	} {
+		if !strings.Contains(js, marker) && !strings.Contains(css, marker) {
+			t.Fatalf("上游消费指标缺少可读性标记 %q", marker)
+		}
+	}
+	if strings.Contains(js, `${usd(upstreamUsage.cost_usd)}${upstreamUsage.complete?'':' · 范围不完整'}`) {
+		t.Fatal("上游消费金额不应再和完整性说明拼在同一个截断字段中")
+	}
+	if strings.Contains(css, `.cm-domain-upstream-spend{display:none}`) || strings.Contains(css, `.cm-domain-upstream-balance{display:none}`) || strings.Contains(css, `.cm-domain-user-spend{display:none}`) {
+		t.Fatal("窄屏不应隐藏用户侧消费或上游账户财务信息")
+	}
+}
+
+func TestChannelManagementSummarizesUpstreamFinanceWithoutGroupDoubleCounting(t *testing.T) {
+	js := string(channelManagementJS)
+	css := string(stabilityCSS)
+	for _, marker := range []string{
+		`const upstreamAccounts=domains.filter(domain=>domain.upstream?.configured)`,
+		`upstreamUsageDomains.reduce((sum,domain)=>sum+(+domain.upstream_usage.cost_usd||0),0)`,
+		`upstreamBalanceDomains.reduce((sum,domain)=>sum+Number(domain.upstream.balance_usd),0)`,
+		`区间上游消费汇总`,
+		`上游当前余额汇总`,
+		`个账单完整`,
+		`补全中`,
+		`.cm-kpis article.upstream b{color:`,
+		`.cm-kpis article.balance b{color:`,
+	} {
+		if !strings.Contains(js, marker) && !strings.Contains(css, marker) {
+			t.Fatalf("渠道财务汇总缺少 %q", marker)
+		}
+	}
+	if strings.Contains(js, `domain.vendors.flatMap`) && strings.Contains(js, `upstreamSpend=channels.reduce`) {
+		t.Fatal("上游消费汇总不应从渠道或分组明细反向求和")
+	}
+}
+
 func TestChannelManagementFinanceScopesAreSeparated(t *testing.T) {
 	page := pageHTML
 	js := string(channelManagementJS)

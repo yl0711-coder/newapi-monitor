@@ -27,6 +27,10 @@ type Settings struct {
 	// 采样、回填、上游轮询等后台任务。页面只能读取已复制到本地 SQLite 的快照。
 	// 生产环境必须保持 false；它不是“连接失败后的降级模式”。
 	LocalSnapshotOnly bool // MONITOR_LOCAL_SNAPSHOT_ONLY，默认 false
+	// LocalAuthBypass 只供完全离线的本机快照容器免登录验收。启动前会同时
+	// 校验本地快照、无生产 DSN、无主站地址、无上游/AWS/心跳与告警任务；
+	// 任意一项不满足都拒绝启动，生产默认永远关闭。
+	LocalAuthBypass bool // MONITOR_LOCAL_AUTH_BYPASS，默认 false
 	// 来源 worker 与 Web 进程分离：MySQL 短暂不可达时仍可从
 	// SQLite 服务已发布数据。生产默认开启 worker，并通过 MySQL
 	// advisory lock 保证同一来源只有一个实例采集。
@@ -226,6 +230,7 @@ func LoadSettings() Settings {
 		StoreBackupRetention:                     envInt("MONITOR_STORE_BACKUP_RETENTION", 7),
 		StoreMigrationBackupRetention:            envInt("MONITOR_STORE_MIGRATION_BACKUP_RETENTION", 3),
 		LocalSnapshotOnly:                        env("MONITOR_LOCAL_SNAPSHOT_ONLY", "false") == "true",
+		LocalAuthBypass:                          env("MONITOR_LOCAL_AUTH_BYPASS", "false") == "true",
 		SourceWorkerEnabled:                      env("MONITOR_SOURCE_WORKER_ENABLED", "true") == "true",
 		SourceLeaseRequired:                      env("MONITOR_SOURCE_LEASE_REQUIRED", "true") == "true",
 		SourceLeaseName:                          strings.TrimSpace(env("MONITOR_SOURCE_LEASE_NAME", "newapi-monitor-source-worker-v1")),
