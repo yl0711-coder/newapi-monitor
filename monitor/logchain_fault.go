@@ -123,10 +123,15 @@ var logChainFaultMessageRules = []logChainFaultMessageRule{
 		// 状态码是 401（看起来像我方凭据问题），但原文说的是**上游的数据库查询出错**，
 		// 并让我们联系管理员——责任方在上游。这正是"状态码不足以定责"的又一个实例，
 		// 也是把 401 默认映射从"我方"改成"待判"的直接原因。
-		pattern:    regexp.MustCompile(`数据库查询出错|database (query )?error|internal server error`),
-		fault:      faultUpstream,
-		confidence: faultConfMid,
-		why:        "上游明示是其自身数据库/内部故障（原文含相应措辞），责任方在上游",
+		// **必须带 requireUpstream=true**（验收报告 P2-03）：
+		// "internal server error" / "database error" 这类措辞我方 new-api 也会产出。
+		// 少了来源门，我方自身故障会被判成上游，运营据此去投诉上游而放过自己的问题。
+		// 本文件上面两条规则都有这道门，这条漏了属实现不一致。
+		pattern:         regexp.MustCompile(`数据库查询出错|database (query )?error|internal server error`),
+		requireUpstream: boolPtr(true),
+		fault:           faultUpstream,
+		confidence:      faultConfMid,
+		why:        "上游明示是其自身数据库/内部故障（上游返回且原文含相应措辞），责任方在上游",
 	},
 }
 
@@ -182,15 +187,6 @@ var logChainFaultByStatus = map[int]logChainFaultStatusRule{
 	408: {faultUnknown, faultConfNone, "请求超时，需读原文判断是我方闸门还是上游超时"},
 }
 
-// 客户断连的耗时/产出阈值。**来自 2026-08-24 生产实测的分布**，不是拍脑袋：
-//
-//	耗时 <5s   342 条(48%)  平均输出 2 tok    → 客户几乎立刻取消
-//	5-30s      291 条(41%)  平均输出 35 tok   → 中间区间，判不了
-//	30-120s     71 条(10%)  平均输出 218 tok  → 拿到不少内容后才断
-//	>=120s       7 条(1%)   平均输出 295 tok  → 疑似上游拖慢
-//
-// 关键发现：client_gone 的平均耗时（13s）**并不比正常请求（15s）长**，
-// 所以"上游拖慢把客户等跑了"不是主因——近半数是客户 5 秒内主动取消。
 // 客户断连的判别阈值。**全部来自 2026-08-24 生产实测(200 条无偏样本)。**
 //
 // 判别核心不是"猜客户为什么走"，而是**上游有没有响应、什么时候响应、响应后有没有产出**——
