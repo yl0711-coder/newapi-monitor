@@ -209,7 +209,7 @@ func TestLogChainScopeBarHasNoAllRequests(t *testing.T) {
 // 而真正的流故障只有 25 条。混在同一档时后者会被彻底淹掉。
 func TestLogChainClientGoneIsSeparateScope(t *testing.T) {
 	js := string(logChainJS)
-	page := string(pageHTML)
+	page := pageHTML
 
 	// 前端必须有这一档，且传给后端而非自己滤（前端滤会让分页与计数失准）。
 	if !strings.Contains(js, "'client_gone'") {
