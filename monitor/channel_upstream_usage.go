@@ -1527,6 +1527,25 @@ func applyUpstreamUsageBackfillYield(row *ChannelUpstreamAccount, progress strin
 	row.UsageBackfillNextSyncAt = now + 15
 }
 
+func legacyNewAPIBackfillBudgetError() string {
+	return (&upstreamUsageRunBudgetExhausted{max: upstreamUsageMaxRequestsPerRun}).Error()
+}
+
+func normalizeLegacyNewAPIBackfillBudgetState(row *ChannelUpstreamAccount, now int64) {
+	if row == nil || row.Provider != upstreamProviderNewAPI || row.UsageBackfillDone ||
+		row.UsageBackfillLastError != legacyNewAPIBackfillBudgetError() {
+		return
+	}
+	// Older images classified a healthy per-run request budget yield as a
+	// failure and left the account behind exponential backoff. The checkpoint
+	// implementation can safely resume that same hour, so make the inherited
+	// state immediately eligible without weakening real upstream failures.
+	row.UsageBackfillConsecutiveFails = 0
+	row.UsageBackfillLastError = ""
+	row.UsageBackfillProgress = "等待断点续传"
+	row.UsageBackfillNextSyncAt = now
+}
+
 func coupleUpstreamUsageHistoryRetryToTail(row *ChannelUpstreamAccount) {
 	if !row.UsageBackfillDone && row.UsageBackfillNextSyncAt < row.UsageNextSyncAt {
 		row.UsageBackfillNextSyncAt = row.UsageNextSyncAt
@@ -1544,6 +1563,7 @@ func (m *Monitor) syncStoredUpstreamUsage(ctx context.Context, domain string) (C
 		return row, fmt.Errorf("该上游账户未启用使用日志同步")
 	}
 	now := time.Now().Unix()
+	normalizeLegacyNewAPIBackfillBudgetState(&row, now)
 	if row.Provider != upstreamProviderNewAPI && row.Provider != upstreamProviderSub2API && row.Provider != upstreamProviderAICodeWith {
 		err := fmt.Errorf("%s 暂未验证公开使用日志接口，未自动读取日志", upstreamProviderName(row.Provider))
 		row.UsageStatus = upstreamStatusUnsupported
@@ -1741,11 +1761,14 @@ func (m *Monitor) loadDueUpstreamUsageAccounts(ctx context.Context, now int64, l
 		limit = 1
 	}
 	var rows []ChannelUpstreamAccount
+	legacyBudgetError := legacyNewAPIBackfillBudgetError()
 	err := m.storeDB.WithContext(ctx).Where(`enabled = ? AND usage_sync_enabled = ? AND (
 		(usage_next_sync_at = 0 OR usage_next_sync_at <= ?)
 		OR (usage_backfill_done = ? AND (usage_backfill_next_sync_at = 0 OR usage_backfill_next_sync_at <= ?)
 			AND usage_status NOT IN (?, ?))
-	)`, true, true, now, false, now, upstreamStatusError, upstreamStatusReconnect).
+		OR (provider = ? AND usage_backfill_done = ? AND usage_backfill_last_error = ?)
+	)`, true, true, now, false, now, upstreamStatusError, upstreamStatusReconnect,
+		upstreamProviderNewAPI, false, legacyBudgetError).
 		Order("CASE WHEN usage_next_sync_at = 0 OR usage_next_sync_at <= " + strconv.FormatInt(now, 10) + " THEN usage_next_sync_at ELSE usage_backfill_next_sync_at END ASC, domain ASC").
 		Limit(limit).Find(&rows).Error
 	return rows, err
