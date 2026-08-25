@@ -127,8 +127,8 @@ type newAPIUsageItem struct {
 	CompletionTokens int64
 }
 
-type newAPIUsagePage struct {
-	Items       []newAPIUsageItem
+type newAPIUsagePage[T any] struct {
+	Items       []T
 	Total       int64
 	Fingerprint [32]byte
 }
@@ -182,12 +182,20 @@ func (p *upstreamUsageRequestPacer) beforeRequest(ctx context.Context) error {
 	return nil
 }
 
-func fetchNewAPIUsagePage(ctx context.Context, client *http.Client, row ChannelUpstreamAccount, cred newAPICredential, from, to int64, pageNumber int, pacer *upstreamUsageRequestPacer) (newAPIUsagePage, error) {
+func fetchNewAPIUsagePage(ctx context.Context, client *http.Client, row ChannelUpstreamAccount, cred newAPICredential, from, to int64, pageNumber int, pacer *upstreamUsageRequestPacer) (newAPIUsagePage[newAPIUsageItem], error) {
+	return fetchNewAPIUsagePageWithDecoder(ctx, client, row, cred, from, to, pageNumber, pacer, decodeLegacyNewAPIUsageItem)
+}
+
+func fetchNewAPIPricingPage(ctx context.Context, client *http.Client, row ChannelUpstreamAccount, cred newAPICredential, from, to int64, pageNumber int, pacer *upstreamUsageRequestPacer) (newAPIUsagePage[newAPIPricingUsageItem], error) {
+	return fetchNewAPIUsagePageWithDecoder(ctx, client, row, cred, from, to, pageNumber, pacer, decodeNewAPIUsageItem)
+}
+
+func fetchNewAPIUsagePageWithDecoder[T any](ctx context.Context, client *http.Client, row ChannelUpstreamAccount, cred newAPICredential, from, to int64, pageNumber int, pacer *upstreamUsageRequestPacer, decodeItem func(json.RawMessage) (T, error)) (newAPIUsagePage[T], error) {
 	if err := pacer.beforeRequest(ctx); err != nil {
-		return newAPIUsagePage{}, err
+		return newAPIUsagePage[T]{}, err
 	}
 	if pageNumber <= 0 {
-		return newAPIUsagePage{}, fmt.Errorf("NewAPI 使用日志页码无效")
+		return newAPIUsagePage[T]{}, fmt.Errorf("NewAPI 使用日志页码无效")
 	}
 	query := url.Values{}
 	query.Set("p", strconv.Itoa(pageNumber))
@@ -205,56 +213,65 @@ func fetchNewAPIUsagePage(ctx context.Context, client *http.Client, row ChannelU
 	if err != nil {
 		var statusErr *upstreamHTTPError
 		if errors.As(err, &statusErr) && (statusErr.Status == http.StatusUnauthorized || statusErr.Status == http.StatusForbidden) {
-			return newAPIUsagePage{}, &upstreamAuthError{err: err}
+			return newAPIUsagePage[T]{}, &upstreamAuthError{err: err}
 		}
-		return newAPIUsagePage{}, err
+		return newAPIUsagePage[T]{}, err
 	}
 	var data struct {
 		Items []json.RawMessage `json:"items"`
 		Total json.RawMessage   `json:"total"`
 	}
 	if err := decodeNewAPIData(body, &data); err != nil {
-		return newAPIUsagePage{}, err
+		return newAPIUsagePage[T]{}, err
 	}
 	total, err := rawJSONNumber(data.Total)
 	if err != nil || total < 0 || total != float64(int64(total)) {
-		return newAPIUsagePage{}, fmt.Errorf("NewAPI 使用日志缺少有效 total")
+		return newAPIUsagePage[T]{}, fmt.Errorf("NewAPI 使用日志缺少有效 total")
 	}
 	fingerprint, err := canonicalUsagePageFingerprint(data.Items)
 	if err != nil {
-		return newAPIUsagePage{}, fmt.Errorf("NewAPI 使用日志条目无效: %w", err)
+		return newAPIUsagePage[T]{}, fmt.Errorf("NewAPI 使用日志条目无效: %w", err)
 	}
-	page := newAPIUsagePage{
-		Items:       make([]newAPIUsageItem, 0, len(data.Items)),
+	page := newAPIUsagePage[T]{
+		Items:       make([]T, 0, len(data.Items)),
 		Total:       int64(total),
 		Fingerprint: fingerprint,
 	}
 	for _, itemJSON := range data.Items {
-		var raw struct {
-			CreatedAt        json.RawMessage `json:"created_at"`
-			Quota            json.RawMessage `json:"quota"`
-			PromptTokens     json.RawMessage `json:"prompt_tokens"`
-			CompletionTokens json.RawMessage `json:"completion_tokens"`
+		item, decodeErr := decodeItem(itemJSON)
+		if decodeErr != nil {
+			return newAPIUsagePage[T]{}, decodeErr
 		}
-		if err := json.Unmarshal(itemJSON, &raw); err != nil {
-			return newAPIUsagePage{}, fmt.Errorf("NewAPI 使用日志条目无效: %w", err)
-		}
-		created, err := rawJSONNumber(raw.CreatedAt)
-		if err != nil {
-			return newAPIUsagePage{}, fmt.Errorf("NewAPI 使用日志缺少有效 created_at")
-		}
-		quota, err := rawJSONNumber(raw.Quota)
-		if err != nil {
-			return newAPIUsagePage{}, fmt.Errorf("NewAPI 使用日志缺少有效 quota")
-		}
-		prompt, _ := rawJSONNumber(raw.PromptTokens)
-		completion, _ := rawJSONNumber(raw.CompletionTokens)
-		page.Items = append(page.Items, newAPIUsageItem{
-			CreatedAt: int64(created), Quota: quota,
-			PromptTokens: int64(prompt), CompletionTokens: int64(completion),
-		})
+		page.Items = append(page.Items, item)
 	}
 	return page, nil
+}
+
+// decodeLegacyNewAPIUsageItem intentionally preserves the old, lightweight
+// usage aggregation parser. The pricing ledger is gray-off by default, so its
+// big.Rat/other parsing must not add CPU, allocation or compatibility risk to
+// the already stable usage worker.
+func decodeLegacyNewAPIUsageItem(itemJSON json.RawMessage) (newAPIUsageItem, error) {
+	var raw struct {
+		CreatedAt        json.RawMessage `json:"created_at"`
+		Quota            json.RawMessage `json:"quota"`
+		PromptTokens     json.RawMessage `json:"prompt_tokens"`
+		CompletionTokens json.RawMessage `json:"completion_tokens"`
+	}
+	if err := json.Unmarshal(itemJSON, &raw); err != nil {
+		return newAPIUsageItem{}, fmt.Errorf("NewAPI 使用日志条目无效: %w", err)
+	}
+	created, err := rawJSONNumber(raw.CreatedAt)
+	if err != nil {
+		return newAPIUsageItem{}, fmt.Errorf("NewAPI 使用日志缺少有效 created_at")
+	}
+	quota, err := rawJSONNumber(raw.Quota)
+	if err != nil {
+		return newAPIUsageItem{}, fmt.Errorf("NewAPI 使用日志缺少有效 quota")
+	}
+	prompt, _ := rawJSONNumber(raw.PromptTokens)
+	completion, _ := rawJSONNumber(raw.CompletionTokens)
+	return newAPIUsageItem{CreatedAt: int64(created), Quota: quota, PromptTokens: int64(prompt), CompletionTokens: int64(completion)}, nil
 }
 
 func canonicalUsagePageFingerprint(raw []json.RawMessage) ([32]byte, error) {
@@ -426,7 +443,7 @@ func accumulateNewAPIBackfillPage(checkpoint *NewAPIUsageBackfillCheckpoint, ite
 	}
 }
 
-func validateNewAPIUsagePage(page newAPIUsagePage, total int64, pageNumber, pageCount int) error {
+func validateNewAPIUsagePage[T any](page newAPIUsagePage[T], total int64, pageNumber, pageCount int) error {
 	if page.Total != total {
 		return fmt.Errorf("NewAPI 使用日志扫描期间 total 变化（%d -> %d）", total, page.Total)
 	}
@@ -471,7 +488,7 @@ func (m *Monitor) syncNewAPIUsageBackfillWindow(ctx context.Context, row Channel
 	}
 
 	client := m.channelUpstreamHTTPClient()
-	var first newAPIUsagePage
+	var first newAPIUsagePage[newAPIUsageItem]
 	firstLoaded := false
 	checkpointVerified := false
 	if hasCheckpoint {

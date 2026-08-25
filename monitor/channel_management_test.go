@@ -149,6 +149,18 @@ func TestChannelManagementUpstreamSpendMetricKeepsAmountReadable(t *testing.T) {
 	}
 }
 
+func TestChannelManagementOmitsGroupShareColumn(t *testing.T) {
+	js := string(channelManagementJS)
+	if strings.Contains(js, "本组占比") || strings.Contains(js, "metricCell(usage,group.usage)") {
+		t.Fatal("渠道明细不应重复展示本组占比列")
+	}
+	for _, marker := range []string{"请求数</span><span>Tokens</span><span>用户侧消费</span>", `${usd(usage.cost_usd)}</span>`} {
+		if !strings.Contains(js, marker) {
+			t.Fatalf("删除本组占比后缺少原有渠道指标 %q", marker)
+		}
+	}
+}
+
 func TestChannelManagementSummarizesUpstreamFinanceWithoutGroupDoubleCounting(t *testing.T) {
 	js := string(channelManagementJS)
 	css := string(stabilityCSS)

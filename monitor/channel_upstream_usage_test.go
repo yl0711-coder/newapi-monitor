@@ -20,8 +20,15 @@ import (
 )
 
 type upstreamUsageFixtureRow struct {
-	ID        int64
-	CreatedAt int64
+	ID               int64
+	CreatedAt        int64
+	Group            string
+	ModelName        string
+	TokenID          int64
+	Other            any
+	PromptTokens     int64
+	CompletionTokens int64
+	Quota            int64
 }
 
 func newUpstreamUsageFixtureServer(t *testing.T, initial []upstreamUsageFixtureRow, afterFirst func(*[]upstreamUsageFixtureRow)) (*httptest.Server, *atomic.Int64) {
@@ -78,10 +85,30 @@ func newUpstreamUsageFixtureServer(t *testing.T, initial []upstreamUsageFixtureR
 
 		items := make([]map[string]any, 0, len(filtered))
 		for index, row := range filtered {
-			items = append(items, map[string]any{
-				"id": start + index + 1, "created_at": row.CreatedAt, "quota": 500000,
-				"prompt_tokens": 2, "completion_tokens": 1,
-			})
+			quota, prompt, completion := row.Quota, row.PromptTokens, row.CompletionTokens
+			if quota == 0 {
+				quota = 500000
+			}
+			if prompt == 0 && completion == 0 {
+				prompt, completion = 2, 1
+			}
+			item := map[string]any{
+				"id": start + index + 1, "created_at": row.CreatedAt, "quota": quota,
+				"prompt_tokens": prompt, "completion_tokens": completion,
+			}
+			if row.Group != "" {
+				item["group"] = row.Group
+			}
+			if row.ModelName != "" {
+				item["model_name"] = row.ModelName
+			}
+			if row.TokenID != 0 {
+				item["token_id"] = row.TokenID
+			}
+			if row.Other != nil {
+				item["other"] = row.Other
+			}
+			items = append(items, item)
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{

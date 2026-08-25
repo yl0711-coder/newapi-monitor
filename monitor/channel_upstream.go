@@ -245,6 +245,23 @@ type ChannelUpstreamAccountView struct {
 	UsageAdapter                  string                            `json:"usage_adapter,omitempty"`
 	UsageAdapterName              string                            `json:"usage_adapter_name,omitempty"`
 	UsageGranularity              string                            `json:"usage_granularity,omitempty"`
+	PricingLedgerWorkerEnabled    bool                              `json:"pricing_ledger_worker_enabled"`
+	PricingLedgerEligible         bool                              `json:"pricing_ledger_eligible"`
+	PricingLedgerCapability       string                            `json:"pricing_ledger_capability,omitempty"`
+	PricingLedgerStatus           string                            `json:"pricing_ledger_status,omitempty"`
+	PricingTailThroughHour        int64                             `json:"pricing_tail_through_hour,omitempty"`
+	PricingBackfillStartHour      int64                             `json:"pricing_backfill_start_hour,omitempty"`
+	PricingBackfillNextHour       int64                             `json:"pricing_backfill_next_hour,omitempty"`
+	PricingBackfillTargetHour     int64                             `json:"pricing_backfill_target_hour,omitempty"`
+	PricingBackfillTotalHours     int64                             `json:"pricing_backfill_total_hours,omitempty"`
+	PricingBackfillDone           bool                              `json:"pricing_backfill_done,omitempty"`
+	PricingLastAttemptAt          int64                             `json:"pricing_last_attempt_at,omitempty"`
+	PricingLastSuccessAt          int64                             `json:"pricing_last_success_at,omitempty"`
+	PricingLastError              string                            `json:"pricing_last_error,omitempty"`
+	PricingProgress               string                            `json:"pricing_progress,omitempty"`
+	PricingVerifiedHours          int64                             `json:"pricing_verified_hours,omitempty"`
+	PricingPendingHours           int64                             `json:"pricing_pending_hours,omitempty"`
+	PricingMismatchHours          int64                             `json:"pricing_mismatch_hours,omitempty"`
 }
 
 // AICodeWithKeySlotView is the non-secret identity of one configured key.
@@ -978,9 +995,54 @@ func (m *Monitor) loadChannelUpstreamViews(ctx context.Context) (map[string]Chan
 	if err := m.storeDB.WithContext(ctx).Find(&rows).Error; err != nil {
 		return nil, err
 	}
+	var pricingStates []ChannelUpstreamPricingSyncState
+	if m.cfg.UpstreamPricingLedgerEnabled {
+		if err := m.storeDB.WithContext(ctx).Find(&pricingStates).Error; err != nil {
+			return nil, err
+		}
+	}
+	stateByAccount := make(map[string]ChannelUpstreamPricingSyncState, len(pricingStates))
+	for _, state := range pricingStates {
+		stateByAccount[state.Domain+"\x00"+state.AccountEpoch] = state
+	}
 	out := make(map[string]ChannelUpstreamAccountView, len(rows))
 	for _, row := range rows {
-		out[row.Domain] = m.channelUpstreamAccountView(row)
+		view := m.channelUpstreamAccountView(row)
+		view.PricingLedgerWorkerEnabled = m.cfg.UpstreamPricingLedgerEnabled
+		view.PricingLedgerEligible = pricingLedgerProviderSupported(row.Provider) && pricingLedgerDomainAllowed(m.cfg.UpstreamPricingLedgerDomains, row.Domain)
+		view.PricingLedgerCapability = pricingLedgerCapabilityLabel(row.Provider)
+		key := row.Domain + "\x00" + newAPIUpstreamAccountEpoch(row)
+		state, hasState := stateByAccount[key]
+		switch {
+		case !m.cfg.UpstreamPricingLedgerEnabled:
+			view.PricingLedgerStatus = "global_off"
+		case !view.PricingLedgerEligible:
+			view.PricingLedgerStatus = "not_selected"
+		case !row.Enabled || !row.UsageSyncEnabled:
+			view.PricingLedgerStatus = upstreamStatusDisabled
+		case !hasState:
+			view.PricingLedgerStatus = upstreamStatusPending
+		default:
+			view.PricingLedgerStatus = state.Status
+		}
+		if hasState {
+			view.PricingTailThroughHour = state.TailThroughHour
+			view.PricingBackfillStartHour = state.BackfillStartHour
+			view.PricingBackfillNextHour = state.BackfillNextHour
+			view.PricingBackfillTargetHour = state.BackfillTargetHour
+			if state.BackfillTargetHour > state.BackfillStartHour {
+				view.PricingBackfillTotalHours = (state.BackfillTargetHour - state.BackfillStartHour) / 3600
+			}
+			view.PricingBackfillDone = state.BackfillDone
+			view.PricingLastAttemptAt = state.LastAttemptAt
+			view.PricingLastSuccessAt = state.LastSuccessAt
+			view.PricingLastError = state.LastError
+			view.PricingProgress = state.Progress
+			view.PricingVerifiedHours = state.VerifiedHours
+			view.PricingPendingHours = state.PendingHours
+			view.PricingMismatchHours = state.MismatchHours
+		}
+		out[row.Domain] = view
 	}
 	return out, nil
 }
@@ -2363,6 +2425,9 @@ func (m *Monitor) startChannelUpstreamSync(ctx context.Context) {
 			if m.cfg.UpstreamUsageSyncEnabled {
 				m.syncDueUpstreamUsage(ctx)
 			}
+			if m.cfg.UpstreamPricingLedgerEnabled {
+				m.syncDueUpstreamPricing(ctx)
+			}
 		}
 		ticker := time.NewTicker(time.Minute)
 		defer ticker.Stop()
@@ -2376,6 +2441,9 @@ func (m *Monitor) startChannelUpstreamSync(ctx context.Context) {
 				}
 				if m.cfg.UpstreamUsageSyncEnabled {
 					m.syncDueUpstreamUsage(ctx)
+				}
+				if m.cfg.UpstreamPricingLedgerEnabled {
+					m.syncDueUpstreamPricing(ctx)
 				}
 			}
 		}

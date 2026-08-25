@@ -1726,6 +1726,10 @@ function syncRenderChannels(report){
     if(status==='stale')return {label:'数据陈旧',level:'warn'};
     if(status==='global_off')return {label:'灰度关闭',level:'neutral'};
     if(status==='disabled')return {label:'未开启',level:'neutral'};
+    if(status==='paging')return {label:'分页续传',level:'warn'};
+    if(status==='pending_verification')return {label:'等待复核',level:'warn'};
+    if(status==='reconcile_blocked')return {label:'对账差异',level:'bad'};
+    if(status==='backfilling')return {label:'历史补全',level:'warn'};
     return {label:'等待同步',level:'warn'};
   };
   let level='ok',enabledAccounts=0,balanceHealthy=0,usageEnabled=0,usageHealthy=0;
@@ -1746,10 +1750,17 @@ function syncRenderChannels(report){
     const balanceError=u.last_error?`<p class="sync-upstream-error">余额错误：${esc(u.last_error)}</p>`:'';
     const usageErrors=[u.usage_last_error?`当天追平：${u.usage_last_error}`:'',u.usage_backfill_last_error?`历史补数：${u.usage_backfill_last_error}`:''].filter(Boolean).map(message=>`<p class="sync-upstream-error">${esc(message)}</p>`).join('');
     const usageProgress=u.usage_backfill_progress?`<p class="sync-upstream-note">历史补数：${esc(u.usage_backfill_progress)}</p>`:'';
+    const pricingStatus=statusInfo(u.pricing_ledger_status,u.enabled),pricingTotal=+u.pricing_backfill_total_hours||0;
+    const pricingPercent=pricingTotal?Math.min(100,(+u.pricing_verified_hours||0)*100/pricingTotal):0;
+    const pricingContent=!u.pricing_ledger_worker_enabled
+      ?'<div class="sync-upstream-note"><b>计价证据账本：灰度关闭</b><br>不访问上游，不影响现有消费账单。</div>'
+      :!u.pricing_ledger_eligible
+      ?'<div class="sync-upstream-note"><b>计价证据账本：未进入灰度</b><br>NewAPI、Sub2API 和 AICodeWith 均需按账户加入白名单后才会同步。</div>'
+      :`<div class="sync-upstream-note"><b>计价证据账本：${esc(pricingStatus.label)}</b><br>${esc(u.pricing_ledger_capability||'已验证计价证据')}<br>近期重叠核对至 ${syncTime(u.pricing_tail_through_hour)} · 历史已确认 ${fmtNum(u.pricing_verified_hours||0)}/${fmtNum(pricingTotal)} 小时${pricingTotal?` (${pricingPercent.toFixed(1)}%)`:''}<br>连续历史下一待补 ${syncTime(u.pricing_backfill_next_hour)} · 待复核 ${fmtNum(u.pricing_pending_hours||0)} · 差异/缺基准 ${fmtNum(u.pricing_mismatch_hours||0)} 小时${u.pricing_progress?`<br>${esc(u.pricing_progress)}`:''}${u.pricing_last_error?`<br><span class="history-error">${esc(u.pricing_last_error)}</span>`:''}</div>`;
     const usageContent=u.usage_sync_enabled&&!u.usage_worker_enabled
       ?'<strong>全局灰度闸门已关闭</strong><p>账户配置已保留，当前不会访问上游；余额同步不受影响。</p>'
       :u.usage_sync_enabled
-      ?`<strong>${esc(adapter)} · ${esc(granularity)}</strong><p>当天数据至 ${syncTime(u.usage_data_until)} · 延迟 ${esc(lag)}<br>最近成功 ${syncTime(u.usage_last_success_at)} · 下次 ${syncTime(u.usage_next_sync_at)}</p><div class="sync-upstream-progress"><span><small>当天追平</small><b>${esc(usage.label)}</b></span><span><small>历史补数</small><b>${esc(historyLabel)}</b><small>${esc(historyDetail)}</small></span></div>${usageErrors}${usageProgress}`
+      ?`<strong>${esc(adapter)} · ${esc(granularity)}</strong><p>当天数据至 ${syncTime(u.usage_data_until)} · 延迟 ${esc(lag)}<br>最近成功 ${syncTime(u.usage_last_success_at)} · 下次 ${syncTime(u.usage_next_sync_at)}</p><div class="sync-upstream-progress"><span><small>当天追平</small><b>${esc(usage.label)}</b></span><span><small>历史补数</small><b>${esc(historyLabel)}</b><small>${esc(historyDetail)}</small></span></div>${usageErrors}${usageProgress}${pricingContent}`
       :'<strong>未开启</strong><p>该账户只同步余额，不读取上游消费。后续可按账户逐个开启验证。</p>';
     return `<article class="sync-upstream-account"><div class="sync-upstream-head"><div><b>${esc(x.domain||x.key||'—')}</b><small>${esc(u.provider_name||u.provider||'—')} · ${esc(u.account_masked||'已配置账户')}</small></div><span class="sync-status ${syncStateClass(accountLevel)}">${esc(overall)}</span></div><div class="sync-upstream-lanes">
       <section class="sync-upstream-lane"><header><b>余额快照</b><span class="sync-status ${balance.level}">${esc(balance.label)}</span></header><strong>${esc(balanceValue)}</strong><p>最近成功 ${syncTime(u.last_success_at)}<br>下次计划 ${syncTime(u.next_sync_at)}</p>${balanceError}</section>

@@ -46,6 +46,7 @@ func TestLocalAuthBypassIsExplicitAndFailsClosed(t *testing.T) {
 		{LocalAuthBypass: true, LocalSnapshotOnly: true, SourceLeaseRequired: true, AlertsDisabled: true},
 		{LocalAuthBypass: true, LocalSnapshotOnly: true, UpstreamSyncEnabled: true, AlertsDisabled: true},
 		{LocalAuthBypass: true, LocalSnapshotOnly: true, UpstreamUsageSyncEnabled: true, AlertsDisabled: true},
+		{LocalAuthBypass: true, LocalSnapshotOnly: true, UpstreamPricingLedgerEnabled: true, AlertsDisabled: true},
 		{LocalAuthBypass: true, LocalSnapshotOnly: true, NginxEnabled: true, AlertsDisabled: true},
 		{LocalAuthBypass: true, LocalSnapshotOnly: true, InfraEnabled: true, AlertsDisabled: true},
 		{LocalAuthBypass: true, LocalSnapshotOnly: true, HeartbeatURL: "https://example.com"},
@@ -79,6 +80,44 @@ func TestLoadSettingsUpstreamUsageSyncDefaultsToGrayOff(t *testing.T) {
 	t.Setenv("MONITOR_UPSTREAM_USAGE_SYNC_ENABLED", "true")
 	if !LoadSettings().UpstreamUsageSyncEnabled {
 		t.Fatal("explicitly enabling upstream usage polling must be honored")
+	}
+}
+
+func TestLoadSettingsUpstreamPricingLedgerDefaultsToFailClosed(t *testing.T) {
+	t.Setenv("MONITOR_UPSTREAM_PRICING_LEDGER_ENABLED", "")
+	t.Setenv("MONITOR_UPSTREAM_PRICING_LEDGER_DOMAINS", "")
+	if LoadSettings().UpstreamPricingLedgerEnabled {
+		t.Fatal("pricing ledger must remain disabled by default")
+	}
+
+	t.Setenv("MONITOR_UPSTREAM_PRICING_LEDGER_ENABLED", "true")
+	t.Setenv("MONITOR_UPSTREAM_PRICING_LEDGER_DOMAINS", "4sapi.com")
+	t.Setenv("MONITOR_UPSTREAM_PRICING_BACKFILL_HOURS_PER_RUN", "1")
+	s := LoadSettings()
+	if !s.UpstreamPricingLedgerEnabled || len(s.UpstreamPricingLedgerDomains) != 1 || s.UpstreamPricingLedgerDomains[0] != "4sapi.com" {
+		t.Fatalf("pricing ledger settings=%+v", s.UpstreamPricingLedgerDomains)
+	}
+}
+
+func TestValidateUpstreamPricingLedgerSettings(t *testing.T) {
+	valid := Settings{
+		UpstreamPricingLedgerEnabled: true, UpstreamUsageSyncEnabled: true,
+		UpstreamPricingLedgerDomains: []string{"4sapi.com"}, UpstreamPricingBackfillHoursPerRun: 1,
+	}
+	if err := validateUpstreamPricingLedgerSettings(valid); err != nil {
+		t.Fatal(err)
+	}
+	invalid := []Settings{
+		{UpstreamPricingLedgerEnabled: true, UpstreamPricingLedgerDomains: []string{"4sapi.com"}, UpstreamPricingBackfillHoursPerRun: 1},
+		{UpstreamPricingLedgerEnabled: true, UpstreamUsageSyncEnabled: true, UpstreamPricingBackfillHoursPerRun: 1},
+		{UpstreamPricingLedgerEnabled: true, UpstreamUsageSyncEnabled: true, UpstreamPricingLedgerDomains: []string{"4sapi.com"}},
+		{UpstreamPricingLedgerEnabled: true, UpstreamUsageSyncEnabled: true, UpstreamPricingLedgerDomains: []string{"4sapi.com"}, UpstreamPricingBackfillHoursPerRun: 7},
+		{UpstreamPricingLedgerEnabled: true, UpstreamUsageSyncEnabled: true, UpstreamPricingLedgerDomains: []string{"4sapi.com"}, UpstreamPricingBackfillHoursPerRun: 1, LocalSnapshotOnly: true},
+	}
+	for i, cfg := range invalid {
+		if err := validateUpstreamPricingLedgerSettings(cfg); err == nil {
+			t.Fatalf("invalid pricing ledger settings[%d] accepted", i)
+		}
 	}
 }
 

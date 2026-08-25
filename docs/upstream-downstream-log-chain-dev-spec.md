@@ -9,7 +9,7 @@
 
 > **第二轮修订摘要**（细节见各节与第 13、14 节）：
 > 1. 修正 7.1 节"`LogRow` 已有全部字段"——**错误**，`LogRow` 无 `ChannelID`，且是故意不给的（客户面）。
-> 2. 修正 3.3 节上游端点 `/api/log/self` → 实际是 `/api/log/`。
+> 2. 修正 3.3 节上游端点：普通用户访问令牌必须读 `/api/log/self`；`/api/log/` 是管理员全站日志接口。
 > 3. 11 节问题 1（生产上游同步是否开启）**代码里已有答案**：默认 `true`。
 > 4. 新增：事实表 `type IN (2,6)` 排除错误日志、`scrubContent` 会清空上游错误原文、
 >    前置拒绝无 `user_id`——三件都直接决定排障能做到什么程度。
@@ -216,14 +216,13 @@ type newAPIUsageItem struct {
 现有代码不解析 model，但**不代表上游不返回**。判定方法：
 `canonicalUsagePageFingerprint` 会解码完整条目，抓一次真实响应即可确认。
 
-**端点修正【已验证·第二轮】**：实际请求的是 **`/api/log/`**，不是初版写的 `/api/log/self`
-（[channel_upstream_usage.go:175](../monitor/channel_upstream_usage.go#L175)）：
+**端点修正【已按生产凭据语义验证】**：Monitor 保存的是普通用户访问令牌，因此必须请求 **`/api/log/self`**。`/api/log/` 是管理员全站日志接口，普通用户凭据会被拒绝；不得为了同步账单而提升凭据权限：
 
 ```go
 query.Set("p", ...); query.Set("page_size", ...); query.Set("type", "2")
 query.Set("start_timestamp", ...); query.Set("end_timestamp", ...)
 headers := {"Authorization": "Bearer "+token, "New-Api-User": userID}
-upstreamEndpoint(row.BaseURL, "/api/log/") + "?" + query.Encode()
+upstreamEndpoint(row.BaseURL, "/api/log/self") + "?" + query.Encode()
 ```
 
 这就是 NewAPI 自己日志页用的接口，其列表本来要渲染"模型"列，因此
@@ -806,7 +805,7 @@ MSYS_NO_PATHCONV=1 docker compose -f .local-test-kit/logchain-fixture/docker-com
 
 1. **7.1 节"`LogRow` 已有全部字段"——错。** `LogRow` 无 `ChannelID`，SQL 也没 SELECT，
    且注释表明是故意不给（客户面）。与第 12 节第 2 条同类失误：**声称字段存在前必须 grep 确认。**
-2. **3.3 节端点 `/api/log/self`——错**，实际 `/api/log/`。
+2. **3.3 节曾把 `/api/log/` 当成普通用户接口——错。** Monitor 使用普通用户访问令牌，实际必须读 `/api/log/self`；管理员全站接口不在凭据范围内。
 3. **11 节问题 1 被列为"最高阻塞的未知"——过度保守。** 答案就在
    `settings.go` 默认值里，不需要问用户。
 
@@ -868,4 +867,3 @@ MSYS_NO_PATHCONV=1 docker compose -f .local-test-kit/logchain-fixture/docker-com
 5. **`execute_bash` 连续约 25 次报成功但未执行**（重定向到文件后文件根本不存在）。
    期间无法构建/测试/提交。判定方法：`cmd > file` 后读文件，文件不存在即工具故障。
    与第 12 节第 4 条、14.2 第 2 条同源。**重启 IDE 后恢复。**
-

@@ -81,6 +81,11 @@ type Settings struct {
 	UpstreamUsageSyncEnabled  bool // MONITOR_UPSTREAM_USAGE_SYNC_ENABLED,默认 false；新功能灰度闸门
 	UpstreamUsageSyncMinutes  int  // MONITOR_UPSTREAM_USAGE_SYNC_MINUTES,默认 30，最小 15
 	UpstreamUsageBackfillDays int  // MONITOR_UPSTREAM_USAGE_BACKFILL_DAYS,默认 90，首次低频补齐范围
+	// 上游计价账本与既有消费汇总使用独立灰度闸门和域名白名单。
+	// 支持 NewAPI、Sub2API 和 AICodeWith；默认关闭且空白名单，迁移不会发起任何上游请求。
+	UpstreamPricingLedgerEnabled       bool     // MONITOR_UPSTREAM_PRICING_LEDGER_ENABLED，默认 false
+	UpstreamPricingLedgerDomains       []string // MONITOR_UPSTREAM_PRICING_LEDGER_DOMAINS，逗号分隔
+	UpstreamPricingBackfillHoursPerRun int      // MONITOR_UPSTREAM_PRICING_BACKFILL_HOURS_PER_RUN，默认 1，最大 6
 
 	// 客户端「用量报表」独立监听(portal.go):客户域名只指这个端口,上面不存在任何管理端路由。
 	// 留空 = 关闭(默认);如 ":8092"。
@@ -263,6 +268,9 @@ func LoadSettings() Settings {
 		UpstreamUsageSyncEnabled:                 env("MONITOR_UPSTREAM_USAGE_SYNC_ENABLED", "false") == "true",
 		UpstreamUsageSyncMinutes:                 envInt("MONITOR_UPSTREAM_USAGE_SYNC_MINUTES", 30),
 		UpstreamUsageBackfillDays:                envInt("MONITOR_UPSTREAM_USAGE_BACKFILL_DAYS", 90),
+		UpstreamPricingLedgerEnabled:             env("MONITOR_UPSTREAM_PRICING_LEDGER_ENABLED", "false") == "true",
+		UpstreamPricingLedgerDomains:             envCSV("MONITOR_UPSTREAM_PRICING_LEDGER_DOMAINS"),
+		UpstreamPricingBackfillHoursPerRun:       envInt("MONITOR_UPSTREAM_PRICING_BACKFILL_HOURS_PER_RUN", 1),
 		PortalAddr:                               env("MONITOR_PORTAL_ADDR", ""),
 		UsageRedisAddr:                           strings.TrimSpace(env("MONITOR_USAGE_REDIS_ADDR", "")),
 		UsageRedisUsername:                       strings.TrimSpace(env("MONITOR_USAGE_REDIS_USERNAME", "")),

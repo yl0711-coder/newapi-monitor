@@ -217,7 +217,10 @@ type Monitor struct {
 
 	// 上游账户余额同步只访问各上游公开面板 API，结果和加密凭据均落 Monitor 本地库。
 	// 全局串行锁同时保护 Sub2API 的旋转 refresh token，避免后台同步与人工刷新抢用旧 token。
-	upstreamSyncMu               sync.Mutex
+	upstreamSyncMu sync.Mutex
+	// 计价影子账本拥有独立串行锁，不占用余额/旧使用日志的粗粒度互斥；
+	// 请求级主机节流与熔断仍由 upstreamHostGuard 共享，避免打爆上游。
+	upstreamPricingMu            sync.Mutex
 	upstreamClient               *http.Client
 	upstreamCredentialPersistent bool
 	upstreamBalanceAlertLastEval atomic.Int64 // 动态余额评估最多与余额同步同频，避免每分钟重复扫本地小时汇总
@@ -264,6 +267,9 @@ func New(s Settings) (*Monitor, error) {
 		s.UsageFactsStorePath = filepath.Join(filepath.Dir(s.StorePath), "usage-facts.db")
 	}
 	if err := validateUsageFactsSettings(s); err != nil {
+		return nil, err
+	}
+	if err := validateUpstreamPricingLedgerSettings(s); err != nil {
 		return nil, err
 	}
 	if err := validateLocalAuthBypassSettings(s); err != nil {
@@ -330,11 +336,30 @@ func validateLocalAuthBypassSettings(s Settings) error {
 	if strings.TrimSpace(s.ProdDSN) != "" || strings.TrimSpace(s.NewAPIBaseURL) != "" {
 		return errors.New("本地免登录模式不允许配置生产 DSN 或 NewAPI 主站地址")
 	}
-	if s.SourceWorkerEnabled || s.SourceLeaseRequired || s.UpstreamSyncEnabled || s.UpstreamUsageSyncEnabled {
+	if s.SourceWorkerEnabled || s.SourceLeaseRequired || s.UpstreamSyncEnabled || s.UpstreamUsageSyncEnabled || s.UpstreamPricingLedgerEnabled {
 		return errors.New("本地免登录模式要求关闭来源 worker、来源租约和全部上游同步")
 	}
 	if s.NginxEnabled || s.InfraEnabled || strings.TrimSpace(s.HeartbeatURL) != "" || !s.AlertsDisabled {
 		return errors.New("本地免登录模式要求关闭 Nginx/AWS 主动采集、外部心跳和所有告警")
+	}
+	return nil
+}
+
+func validateUpstreamPricingLedgerSettings(s Settings) error {
+	if !s.UpstreamPricingLedgerEnabled {
+		return nil
+	}
+	if s.LocalSnapshotOnly {
+		return errors.New("上游计价账本不能在本地快照只读模式开启")
+	}
+	if !s.UpstreamUsageSyncEnabled {
+		return errors.New("MONITOR_UPSTREAM_PRICING_LEDGER_ENABLED=true 时必须同时开启上游使用日志灰度闸门")
+	}
+	if len(s.UpstreamPricingLedgerDomains) == 0 {
+		return errors.New("上游计价账本必须配置非空 MONITOR_UPSTREAM_PRICING_LEDGER_DOMAINS 白名单")
+	}
+	if s.UpstreamPricingBackfillHoursPerRun < 1 || s.UpstreamPricingBackfillHoursPerRun > 6 {
+		return errors.New("MONITOR_UPSTREAM_PRICING_BACKFILL_HOURS_PER_RUN 必须在 1～6 之间")
 	}
 	return nil
 }

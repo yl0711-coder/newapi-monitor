@@ -296,6 +296,45 @@ func TestManualStoreBackupIsAsyncSingleFlightAndKeepsStoresReadable(t *testing.T
 	}).Error; err != nil {
 		t.Fatal(err)
 	}
+	// Keep both a published pricing observation and an in-progress dense-hour
+	// checkpoint in the runtime main store. The paired backup/restore path must
+	// preserve both: losing the checkpoint would repeat upstream reads, while
+	// losing the observed hour would erase the audit trail.
+	pricingHour := int64(1786582800 - 1786582800%3600)
+	pricingAccount := ChannelUpstreamAccount{Domain: restoreUpstreamDomain, Provider: upstreamProviderNewAPI, UserID: 31}
+	pricingItem, err := decodeNewAPIUsageItem(json.RawMessage(`{"created_at":1786582801,"quota":500000,"prompt_tokens":2,"completion_tokens":1,"group":"codex","model_name":"gpt-5.5","other":{"group_ratio":1.2}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	pricingEvidence, pricingHourState, err := buildNewAPIPricingHour(pricingAccount, []newAPIPricingUsageItem{pricingItem}, pricingHour, publishedNow.Unix())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.storeDB.Create(&pricingEvidence).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := m.storeDB.Create(&pricingHourState).Error; err != nil {
+		t.Fatal(err)
+	}
+	checkpointJSON, err := json.Marshal(pricingEvidence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pricingCheckpoint := ChannelUpstreamPricingPageCheckpoint{
+		Domain: restoreUpstreamDomain, AccountEpoch: newAPIUpstreamAccountEpoch(pricingAccount), SemanticsVersion: upstreamPricingSemanticsVersion,
+		HourTs: pricingHour, NextPage: 2, Total: 1, SourceRows: 1,
+		FirstPageFingerprint: strings.Repeat("a", 64), AggregatesJSON: string(checkpointJSON), UpdatedAt: publishedNow.Unix(),
+	}
+	if err := m.storeDB.Create(&pricingCheckpoint).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := m.storeDB.Create(&ChannelUpstreamPricingSyncState{
+		Domain: restoreUpstreamDomain, AccountEpoch: pricingCheckpoint.AccountEpoch, SemanticsVersion: upstreamPricingSemanticsVersion,
+		Status: "paging", Progress: "1/2 页", BackfillStartHour: pricingHour, BackfillNextHour: pricingHour,
+		BackfillTargetHour: pricingHour + 3600, LastAttemptAt: publishedNow.Unix(), UpdatedAt: publishedNow.Unix(),
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
 	if !m.triggerManualStoreBackup() {
 		t.Fatal("首次手动备份应启动")
 	}
@@ -396,6 +435,17 @@ func TestManualStoreBackupIsAsyncSingleFlightAndKeepsStoresReadable(t *testing.T
 	if err := restoredMain.QueryRow("SELECT COUNT(*) FROM tracked_users WHERE user_id=7").Scan(&restoredUsers); err != nil || restoredUsers != 1 {
 		t.Fatalf("恢复主库成员数据错误: users=%d err=%v", restoredUsers, err)
 	}
+	for table, want := range map[string]int64{
+		"channel_upstream_pricing_hour_evidence":    1,
+		"channel_upstream_pricing_hour_states":      1,
+		"channel_upstream_pricing_sync_states":      1,
+		"channel_upstream_pricing_page_checkpoints": 1,
+	} {
+		var got int64
+		if err := restoredMain.QueryRow("SELECT COUNT(*) FROM " + quoteSQLiteIdentifier(table)).Scan(&got); err != nil || got != want {
+			t.Fatalf("恢复计价账本表 %s 错误: rows=%d err=%v", table, got, err)
+		}
+	}
 	if err := restoredMain.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -446,6 +496,13 @@ func TestManualStoreBackupIsAsyncSingleFlightAndKeepsStoresReadable(t *testing.T
 	var restoredUpstream ChannelUpstreamAccount
 	if err := activated.storeDB.First(&restoredUpstream, "domain = ?", restoreUpstreamDomain).Error; err != nil {
 		t.Fatal(err)
+	}
+	var restoredPricingCheckpoint ChannelUpstreamPricingPageCheckpoint
+	if err := activated.storeDB.First(&restoredPricingCheckpoint, "domain = ?", restoreUpstreamDomain).Error; err != nil {
+		t.Fatal(err)
+	}
+	if decoded, err := decodePricingCheckpointEvidence(restoredPricingCheckpoint); err != nil || len(decoded) != 1 {
+		t.Fatalf("恢复后计价分页断点不可续传: rows=%d err=%v", len(decoded), err)
 	}
 	if restoredUpstream.Credential == sealedUpstream {
 		t.Fatal("offline activation did not rotate the restored legacy upstream credential")
