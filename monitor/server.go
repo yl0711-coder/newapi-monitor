@@ -91,6 +91,21 @@ func limitBodyForLogin(c *gin.Context) bool {
 	return true
 }
 
+// noStoreSensitive 禁止缓存敏感诊断响应（验收报告 RB-03）。
+//
+// 适用于返回客户标识、令牌名、渠道名/ID、上游主域名、请求 ID 及错误原文的接口。
+// 风险不是理论上的：反向代理、CDN 或共享浏览器缓存配置不当时，
+// 管理员之间可能串数据，退出登录后本地缓存里也仍可能留着诊断结果。
+//
+// 头必须在 c.Next() **之前**写：Gin 一旦开始写 body，响应头就已发出，
+// 之后再 c.Header 不生效。放在前面才能覆盖 handler 的全部提前返回分支
+// （400 参数错、401 未登录、403 无权限、500 生产库不可达）。
+func noStoreSensitive(c *gin.Context) {
+	c.Header("Cache-Control", "private, no-store")
+	c.Header("Pragma", "no-cache")
+	c.Next()
+}
+
 func parseWindow(c *gin.Context) int {
 	w, _ := strconv.Atoi(c.DefaultQuery("window", "60"))
 	if !allowedWindows[w] {
@@ -185,8 +200,12 @@ func (m *Monitor) RegisterRoutes(r *gin.Engine) {
 		view.GET("/stability/health", m.serveStabilityHealth)                              // 采集新鲜度/覆盖/积压:不查生产库
 		view.GET("/stability/edge", m.serveNginxEdge)                                      // Nginx 入口层:只读本地脱敏分钟汇总
 		view.GET("/channels/report", m.serveChannelManagementReport)                       // 渠道管理:主域名→厂商→渠道→服务分组的本地汇总
-		view.GET("/logchain/requests", m.serveLogChainRequests)                            // 客户排障:逐条请求→渠道→上游主域名→错误原文(含 type=5,含渠道信息,仅管理员)
-		view.GET("/logchain/filters", m.serveLogChainFilters)                              // 客户排障:筛选下拉取值(服务分组/上游域名/渠道),只读本地快照
+		// 排障两个接口挂 noStoreSensitive：响应含客户标识、令牌名、渠道名/ID、
+		// 上游主域名与错误原文，属敏感诊断数据，不得被任何中间层缓存。
+		// 用中间件而非在 handler 里逐个 c.Header：handler 有多条提前 return
+		// 的错误分支（400/401/403/500），逐个加必然漏，而漏掉的恰好是错误响应。
+		view.GET("/logchain/requests", noStoreSensitive, m.serveLogChainRequests) // 客户排障:逐条请求→渠道→上游主域名→错误原文(含 type=5,含渠道信息,仅管理员)
+		view.GET("/logchain/filters", noStoreSensitive, m.serveLogChainFilters)   // 客户排障:筛选下拉取值(服务分组/上游域名/渠道),只读本地快照
 		view.GET("/infra", m.serveInfra)                                                   // 服务端健康监控(实例/DB/LB)快照
 		view.GET("/infra/series", m.serveInfraSeries)                                      // 按需取某资源某些指标的近 N 小时序列(展开图用)
 		view.GET("/usage/users", m.listTrackedUsers)                                       // 用户用量:被盯名单(含分组)

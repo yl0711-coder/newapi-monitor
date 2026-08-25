@@ -256,7 +256,9 @@ function syncControls(){
 async function loadFilterOptions(){
   if(lc.opts)return; // 下拉选项与日期无关，只取一次
   try{
-    const r=await fetch('/logchain/filters',{headers:{'Accept':'application/json'}});
+    // cache:'no-store' 与后端的 Cache-Control: private, no-store 配套（RB-03）：
+    // 响应含渠道名/ID 与上游主域名，不得留在浏览器缓存里被后续会话读到。
+    const r=await fetch('/logchain/filters',{cache:'no-store',headers:{'Accept':'application/json'}});
     if(r.status===401){location.href='/login';return}
     if(!r.ok)return; // 下拉取不到不阻塞主表，用户仍可用文本框筛
     lc.opts=await r.json();
@@ -326,7 +328,8 @@ async function load(more){
   if(!more){lc.rows=[];lc.expanded.clear();lc.nextBeforeTs=0;lc.nextBeforeID=0}
   renderStatus(more?'加载更多…':'加载中…');
   try{
-    const r=await fetch('/logchain/requests?'+buildQuery(more),{signal:ac.signal,headers:{'Accept':'application/json'}});
+    // 同上（RB-03）。这个接口的敏感度更高：含客户标识、令牌名与上游错误原文。
+    const r=await fetch('/logchain/requests?'+buildQuery(more),{cache:'no-store',signal:ac.signal,headers:{'Accept':'application/json'}});
     if(r.status===401){location.href='/login';return}
     const text=await r.text();
     if(gen!==lc.generation)return; // 已被更新的请求取代,丢弃本次结果
@@ -688,6 +691,7 @@ function emptyText(){
 // 这个功能最可能造成的实际损害是：客户说"我请求根本发不出去"，
 // 你在这里查不到，于是判断他在瞎说。所以这段话必须一直在眼前。
 const BLIND_OPEN_KEY='nexusapi-monitor-logchain-blind-open';
+
 function renderBlindSpots(){
   const el=$('lcBlind');
   if(!el)return;
