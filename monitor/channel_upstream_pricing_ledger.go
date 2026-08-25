@@ -1170,7 +1170,7 @@ func (m *Monitor) fetchNewAPIPricingHour(ctx context.Context, account ChannelUps
 			// Delete only this independent shadow checkpoint; the published legacy
 			// usage aggregate and any verified pricing hours remain untouched.
 			if deleteErr := m.deletePricingPageCheckpoint(ctx, account.Domain, epoch, hourTs); deleteErr != nil {
-				return nil, ChannelUpstreamPricingHourState{}, "", false, fmt.Errorf("%v; 清理损坏断点失败: %w", err, deleteErr)
+				return nil, ChannelUpstreamPricingHourState{}, "", false, fmt.Errorf("解码损坏断点失败: %w; 清理损坏断点失败: %w", err, deleteErr)
 			}
 			return nil, ChannelUpstreamPricingHourState{}, "", false, err
 		}
