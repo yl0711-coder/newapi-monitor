@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -147,6 +148,12 @@ type upstreamUsageRequestPacer struct {
 	next        time.Time
 }
 
+type upstreamUsageRunBudgetExhausted struct{ max int }
+
+func (e *upstreamUsageRunBudgetExhausted) Error() string {
+	return fmt.Sprintf("上游使用日志单轮请求达到安全上限（%d 次）", e.max)
+}
+
 func newUpstreamUsageRequestPacer(maxRequests int, interval time.Duration) *upstreamUsageRequestPacer {
 	return &upstreamUsageRequestPacer{maxRequests: maxRequests, interval: interval}
 }
@@ -159,7 +166,7 @@ func (p *upstreamUsageRequestPacer) beforeRequest(ctx context.Context) error {
 		return err
 	}
 	if p.maxRequests > 0 && p.calls >= p.maxRequests {
-		return fmt.Errorf("上游使用日志单轮请求达到安全上限（%d 次）", p.maxRequests)
+		return &upstreamUsageRunBudgetExhausted{max: p.maxRequests}
 	}
 	if wait := time.Until(p.next); wait > 0 {
 		timer := time.NewTimer(wait)
@@ -391,6 +398,183 @@ func fetchNewAPIUsageWindowWithPacer(ctx context.Context, client *http.Client, r
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].HourTs < out[j].HourTs })
 	return upstreamUsageResult{Hours: out, DataUntil: to, Adapter: upstreamUsageAdapterNewAPILog}, nil
+}
+
+func newAPIBackfillProgress(checkpoint NewAPIUsageBackfillCheckpoint) string {
+	pageCount := int((checkpoint.Total + upstreamUsagePageSize - 1) / upstreamUsagePageSize)
+	completedPages := checkpoint.NextPage - 1
+	if completedPages > pageCount {
+		completedPages = pageCount
+	}
+	if completedPages < 1 && checkpoint.Total > 0 {
+		completedPages = 1
+	}
+	return fmt.Sprintf("%s 小时已安全保存 %d/%d 条（%d/%d 页）",
+		time.Unix(checkpoint.WindowFrom, 0).In(cstLocation).Format("2006-01-02 15:00"),
+		checkpoint.SourceRows, checkpoint.Total, completedPages, pageCount)
+}
+
+func accumulateNewAPIBackfillPage(checkpoint *NewAPIUsageBackfillCheckpoint, items []newAPIUsageItem) {
+	checkpoint.SourceRows += int64(len(items))
+	for _, item := range items {
+		if item.CreatedAt < checkpoint.WindowFrom || item.CreatedAt >= checkpoint.WindowTo || item.Quota <= 0 {
+			continue
+		}
+		checkpoint.Requests++
+		checkpoint.Quota += item.Quota
+		checkpoint.Tokens += item.PromptTokens + item.CompletionTokens
+	}
+}
+
+func validateNewAPIUsagePage(page newAPIUsagePage, total int64, pageNumber, pageCount int) error {
+	if page.Total != total {
+		return fmt.Errorf("NewAPI 使用日志扫描期间 total 变化（%d -> %d）", total, page.Total)
+	}
+	expected := upstreamUsagePageSize
+	if pageNumber == pageCount && total%upstreamUsagePageSize != 0 {
+		expected = int(total % upstreamUsagePageSize)
+	}
+	if len(page.Items) != expected {
+		return fmt.Errorf("NewAPI 使用日志第 %d 页数量异常（got=%d want=%d）", pageNumber, len(page.Items), expected)
+	}
+	return nil
+}
+
+func (m *Monitor) saveNewAPIUsageBackfillCheckpoint(ctx context.Context, checkpoint *NewAPIUsageBackfillCheckpoint) error {
+	checkpoint.UpdatedAt = time.Now().Unix()
+	return m.storeDB.WithContext(ctx).Clauses(clause.OnConflict{
+		Columns:   []clause.Column{{Name: "domain"}},
+		UpdateAll: true,
+	}).Create(checkpoint).Error
+}
+
+// syncNewAPIUsageBackfillWindow imports one closed historical hour with a
+// durable page cursor. A request-budget yield is a normal scheduling event:
+// completed pages stay only in the checkpoint and public hourly data remains
+// untouched until the final total/fingerprint verification succeeds.
+func (m *Monitor) syncNewAPIUsageBackfillWindow(ctx context.Context, row ChannelUpstreamAccount, cred newAPICredential, from, to int64, pacer *upstreamUsageRequestPacer) (upstreamUsageResult, string, bool, error) {
+	if to <= from || to-from > 3600 || from%3600 != 0 {
+		return upstreamUsageResult{}, "", false, fmt.Errorf("NewAPI 历史补数窗口必须是整点起始且不超过一小时")
+	}
+	var checkpoint NewAPIUsageBackfillCheckpoint
+	loadErr := m.storeDB.WithContext(ctx).First(&checkpoint, "domain = ?", row.Domain).Error
+	if loadErr != nil && !errors.Is(loadErr, gorm.ErrRecordNotFound) {
+		return upstreamUsageResult{}, "", false, loadErr
+	}
+	hasCheckpoint := loadErr == nil
+	if hasCheckpoint && (checkpoint.WindowFrom != from || checkpoint.WindowTo != to || checkpoint.NextPage < 2 || checkpoint.Total < 0 || checkpoint.SourceRows < 0 || checkpoint.SourceRows > checkpoint.Total || len(checkpoint.FirstPageFingerprint) != 64) {
+		if err := m.storeDB.WithContext(ctx).Where("domain = ?", row.Domain).Delete(&NewAPIUsageBackfillCheckpoint{}).Error; err != nil {
+			return upstreamUsageResult{}, "", false, err
+		}
+		hasCheckpoint = false
+		checkpoint = NewAPIUsageBackfillCheckpoint{}
+	}
+
+	client := m.channelUpstreamHTTPClient()
+	var first newAPIUsagePage
+	firstLoaded := false
+	checkpointVerified := false
+	if hasCheckpoint {
+		page, err := fetchNewAPIUsagePage(ctx, client, row, cred, from, to, 1, pacer)
+		if err != nil {
+			var exhausted *upstreamUsageRunBudgetExhausted
+			if errors.As(err, &exhausted) {
+				return upstreamUsageResult{}, newAPIBackfillProgress(checkpoint), false, nil
+			}
+			return upstreamUsageResult{}, "", false, err
+		}
+		first, firstLoaded = page, true
+		fingerprint := hex.EncodeToString(page.Fingerprint[:])
+		if page.Total == checkpoint.Total && fingerprint == checkpoint.FirstPageFingerprint {
+			checkpointVerified = true
+		} else {
+			if err := m.storeDB.WithContext(ctx).Where("domain = ?", row.Domain).Delete(&NewAPIUsageBackfillCheckpoint{}).Error; err != nil {
+				return upstreamUsageResult{}, "", false, err
+			}
+			hasCheckpoint = false
+			checkpoint = NewAPIUsageBackfillCheckpoint{}
+		}
+	}
+
+	if !hasCheckpoint {
+		if !firstLoaded {
+			page, err := fetchNewAPIUsagePage(ctx, client, row, cred, from, to, 1, pacer)
+			if err != nil {
+				var exhausted *upstreamUsageRunBudgetExhausted
+				if errors.As(err, &exhausted) {
+					return upstreamUsageResult{}, fmt.Sprintf("等待下一轮安全额度继续 %s 小时", time.Unix(from, 0).In(cstLocation).Format("2006-01-02 15:00")), false, nil
+				}
+				return upstreamUsageResult{}, "", false, err
+			}
+			first = page
+		}
+		expectedFirst := int(first.Total)
+		if expectedFirst > upstreamUsagePageSize {
+			expectedFirst = upstreamUsagePageSize
+		}
+		if len(first.Items) != expectedFirst {
+			return upstreamUsageResult{}, "", false, fmt.Errorf("NewAPI 使用日志首页数量异常（got=%d want=%d）", len(first.Items), expectedFirst)
+		}
+		checkpoint = NewAPIUsageBackfillCheckpoint{
+			Domain: row.Domain, WindowFrom: from, WindowTo: to, NextPage: 2,
+			Total: first.Total, FirstPageFingerprint: hex.EncodeToString(first.Fingerprint[:]),
+		}
+		accumulateNewAPIBackfillPage(&checkpoint, first.Items)
+		if err := m.saveNewAPIUsageBackfillCheckpoint(ctx, &checkpoint); err != nil {
+			return upstreamUsageResult{}, "", false, err
+		}
+	}
+
+	pageCount := int((checkpoint.Total + upstreamUsagePageSize - 1) / upstreamUsagePageSize)
+	for checkpoint.NextPage <= pageCount {
+		pageNumber := checkpoint.NextPage
+		page, err := fetchNewAPIUsagePage(ctx, client, row, cred, from, to, pageNumber, pacer)
+		if err != nil {
+			var exhausted *upstreamUsageRunBudgetExhausted
+			if errors.As(err, &exhausted) {
+				return upstreamUsageResult{}, newAPIBackfillProgress(checkpoint), false, nil
+			}
+			return upstreamUsageResult{}, "", false, err
+		}
+		if err := validateNewAPIUsagePage(page, checkpoint.Total, pageNumber, pageCount); err != nil {
+			return upstreamUsageResult{}, "", false, err
+		}
+		accumulateNewAPIBackfillPage(&checkpoint, page.Items)
+		checkpoint.NextPage++
+		if err := m.saveNewAPIUsageBackfillCheckpoint(ctx, &checkpoint); err != nil {
+			return upstreamUsageResult{}, "", false, err
+		}
+	}
+	if checkpoint.SourceRows != checkpoint.Total {
+		return upstreamUsageResult{}, "", false, fmt.Errorf("NewAPI 使用日志分页数量不完整（got=%d want=%d）", checkpoint.SourceRows, checkpoint.Total)
+	}
+	if pageCount > 1 && !checkpointVerified {
+		probe, err := fetchNewAPIUsagePage(ctx, client, row, cred, from, to, 1, pacer)
+		if err != nil {
+			var exhausted *upstreamUsageRunBudgetExhausted
+			if errors.As(err, &exhausted) {
+				return upstreamUsageResult{}, newAPIBackfillProgress(checkpoint), false, nil
+			}
+			return upstreamUsageResult{}, "", false, err
+		}
+		if probe.Total != checkpoint.Total || hex.EncodeToString(probe.Fingerprint[:]) != checkpoint.FirstPageFingerprint {
+			if deleteErr := m.storeDB.WithContext(ctx).Where("domain = ?", row.Domain).Delete(&NewAPIUsageBackfillCheckpoint{}).Error; deleteErr != nil {
+				return upstreamUsageResult{}, "", false, deleteErr
+			}
+			return upstreamUsageResult{}, "", false, fmt.Errorf("NewAPI 使用日志扫描期间首页已变化，窗口将重试")
+		}
+	}
+
+	unit := row.BalanceUnit
+	if unit <= 0 {
+		unit = defaultNewAPIQuotaPerUSD
+	}
+	hour := ChannelUpstreamUsageHour{
+		Domain: row.Domain, HourTs: from, BucketSeconds: to - from,
+		Requests: checkpoint.Requests, Tokens: checkpoint.Tokens, Quota: checkpoint.Quota,
+		CostUSD: checkpoint.Quota / unit, Provider: row.Provider,
+	}
+	return upstreamUsageResult{Hours: []ChannelUpstreamUsageHour{hour}, DataUntil: to, Adapter: upstreamUsageAdapterNewAPILog}, "", true, nil
 }
 
 func (m *Monitor) syncNewAPIUsage(ctx context.Context, row ChannelUpstreamAccount, cred newAPICredential, from, to int64, pacer *upstreamUsageRequestPacer) (upstreamUsageResult, error) {
@@ -1200,16 +1384,29 @@ func (m *Monitor) syncStoredAICodeWithUsage(ctx context.Context, row *ChannelUps
 // 原数据，确保页面既不会出现半窗口，也不会把上游故障解释为零消费。
 func (m *Monitor) persistUpstreamUsageWindow(ctx context.Context, domain string, from, to int64, hours []ChannelUpstreamUsageHour, now int64) error {
 	return m.storeDB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		if err := tx.Where("domain = ? AND hour_ts >= ? AND hour_ts < ?", domain, from, to).Delete(&ChannelUpstreamUsageHour{}).Error; err != nil {
+		return persistUpstreamUsageWindowTx(tx, domain, from, to, hours, now)
+	})
+}
+
+func persistUpstreamUsageWindowTx(tx *gorm.DB, domain string, from, to int64, hours []ChannelUpstreamUsageHour, now int64) error {
+	if err := tx.Where("domain = ? AND hour_ts >= ? AND hour_ts < ?", domain, from, to).Delete(&ChannelUpstreamUsageHour{}).Error; err != nil {
+		return err
+	}
+	for i := range hours {
+		hours[i].FetchedAt = now
+		if err := tx.Clauses(clause.OnConflict{Columns: []clause.Column{{Name: "domain"}, {Name: "hour_ts"}}, UpdateAll: true}).Create(&hours[i]).Error; err != nil {
 			return err
 		}
-		for i := range hours {
-			hours[i].FetchedAt = now
-			if err := tx.Clauses(clause.OnConflict{Columns: []clause.Column{{Name: "domain"}, {Name: "hour_ts"}}, UpdateAll: true}).Create(&hours[i]).Error; err != nil {
-				return err
-			}
+	}
+	return nil
+}
+
+func (m *Monitor) persistNewAPIUsageBackfillWindow(ctx context.Context, domain string, from, to int64, hours []ChannelUpstreamUsageHour, now int64) error {
+	return m.storeDB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := persistUpstreamUsageWindowTx(tx, domain, from, to, hours, now); err != nil {
+			return err
 		}
-		return nil
+		return tx.Where("domain = ? AND window_from = ? AND window_to = ?", domain, from, to).Delete(&NewAPIUsageBackfillCheckpoint{}).Error
 	})
 }
 
@@ -1274,6 +1471,11 @@ func planUpstreamUsageSync(row ChannelUpstreamAccount, now int64, backfillDays i
 	if historyDue && !tailBlocked {
 		plan.backfillFrom = backfill
 		plan.backfillTo = backfill + 86400
+		if row.Provider == upstreamProviderNewAPI {
+			// NewAPI exposes mutable OFFSET pages. Import one closed hour at a
+			// time so a dense day can yield and resume without rescanning it.
+			plan.backfillTo = backfill + 3600
+		}
 		if row.Provider == upstreamProviderAICodeWith {
 			plan.backfillTo = backfill + aiCodeWithUsageMaxDays*86400
 			if plan.backfillTo > today {
@@ -1289,11 +1491,13 @@ func applyUpstreamUsageBackfillResult(row *ChannelUpstreamAccount, err error, no
 	if err == nil {
 		row.UsageBackfillLastSuccessAt = now
 		row.UsageBackfillLastError = ""
+		row.UsageBackfillProgress = ""
 		row.UsageBackfillConsecutiveFails = 0
 		row.UsageBackfillNextSyncAt = nextUpstreamUsageBackfillAt(s, row.Domain, now, 0)
 		return
 	}
 	row.UsageBackfillLastError = sanitizeUpstreamErrorWithSecrets(err, secrets...)
+	row.UsageBackfillProgress = ""
 	row.UsageBackfillConsecutiveFails++
 	var authErr *upstreamAuthError
 	if errors.As(err, &authErr) {
@@ -1311,6 +1515,16 @@ func applyUpstreamUsageBackfillResult(row *ChannelUpstreamAccount, err error, no
 	if retryAt := upstreamRetryAt(err); retryAt > row.UsageBackfillNextSyncAt {
 		row.UsageBackfillNextSyncAt = retryAt
 	}
+}
+
+func applyUpstreamUsageBackfillYield(row *ChannelUpstreamAccount, progress string, now int64) {
+	row.UsageBackfillLastAttemptAt = now
+	row.UsageBackfillConsecutiveFails = 0
+	row.UsageBackfillLastError = ""
+	row.UsageBackfillProgress = progress
+	// A budget yield is healthy progress, not an upstream failure. Continue
+	// soon enough to drain history while still leaving a quiet gap between turns.
+	row.UsageBackfillNextSyncAt = now + 15
 }
 
 func coupleUpstreamUsageHistoryRetryToTail(row *ChannelUpstreamAccount) {
@@ -1416,24 +1630,58 @@ func (m *Monitor) syncStoredUpstreamUsage(ctx context.Context, domain string) (C
 	}
 	if err == nil && plan.backfillTo > plan.backfillFrom {
 		historyRan = true
-		history, historyErr := syncUsage(ctx, plan.backfillFrom, plan.backfillTo, pacer)
-		if retryAt := upstreamRetryAt(historyErr); retryAt > operationRetryAt {
-			operationRetryAt = retryAt
-		}
-		if historyErr == nil {
-			historyErr = m.persistUpstreamUsageWindow(ctx, row.Domain, plan.backfillFrom, plan.backfillTo, history.Hours, now)
-		}
-		if historyErr != nil {
-			// Tail health and schedule remain successful. Only history receives an
-			// independent exponential backoff, so today's spend stays fresh.
-			applyUpstreamUsageBackfillResult(&row, historyErr, now, m.cfg, secrets...)
-			err = historyErr
+		if row.Provider == upstreamProviderNewAPI {
+			cursor := plan.backfillFrom
+			today := cstDayStart(now)
+			for cursor < today {
+				windowTo := cursor + 3600
+				history, progress, complete, historyErr := m.syncNewAPIUsageBackfillWindow(ctx, row, credential.(newAPICredential), cursor, windowTo, pacer)
+				if retryAt := upstreamRetryAt(historyErr); retryAt > operationRetryAt {
+					operationRetryAt = retryAt
+				}
+				if historyErr != nil {
+					applyUpstreamUsageBackfillResult(&row, historyErr, now, m.cfg, secrets...)
+					err = historyErr
+					break
+				}
+				if !complete {
+					applyUpstreamUsageBackfillYield(&row, progress, now)
+					break
+				}
+				if historyErr = m.persistNewAPIUsageBackfillWindow(ctx, row.Domain, cursor, windowTo, history.Hours, now); historyErr != nil {
+					applyUpstreamUsageBackfillResult(&row, historyErr, now, m.cfg, secrets...)
+					err = historyErr
+					break
+				}
+				applyUpstreamUsageBackfillResult(&row, nil, now, m.cfg, secrets...)
+				cursor = windowTo
+				row.UsageBackfillCursor = cursor
+				row.UsageBackfillDone = cursor >= today
+				if row.UsageBackfillDone {
+					row.UsageBackfillNextSyncAt = 0
+					break
+				}
+			}
 		} else {
-			applyUpstreamUsageBackfillResult(&row, nil, now, m.cfg, secrets...)
-			row.UsageBackfillCursor = plan.backfillTo
-			row.UsageBackfillDone = plan.backfillTo >= cstDayStart(now)
-			if row.UsageBackfillDone {
-				row.UsageBackfillNextSyncAt = 0
+			history, historyErr := syncUsage(ctx, plan.backfillFrom, plan.backfillTo, pacer)
+			if retryAt := upstreamRetryAt(historyErr); retryAt > operationRetryAt {
+				operationRetryAt = retryAt
+			}
+			if historyErr == nil {
+				historyErr = m.persistUpstreamUsageWindow(ctx, row.Domain, plan.backfillFrom, plan.backfillTo, history.Hours, now)
+			}
+			if historyErr != nil {
+				// Tail health and schedule remain successful. Only history receives an
+				// independent exponential backoff, so today's spend stays fresh.
+				applyUpstreamUsageBackfillResult(&row, historyErr, now, m.cfg, secrets...)
+				err = historyErr
+			} else {
+				applyUpstreamUsageBackfillResult(&row, nil, now, m.cfg, secrets...)
+				row.UsageBackfillCursor = plan.backfillTo
+				row.UsageBackfillDone = plan.backfillTo >= cstDayStart(now)
+				if row.UsageBackfillDone {
+					row.UsageBackfillNextSyncAt = 0
+				}
 			}
 		}
 	} else if err == nil && tailRan {

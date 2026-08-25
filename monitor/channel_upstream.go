@@ -99,7 +99,9 @@ type ChannelUpstreamAccount struct {
 	UsageBackfillNextSyncAt       int64  `gorm:"column:usage_backfill_next_sync_at;index"`
 	UsageBackfillConsecutiveFails int    `gorm:"column:usage_backfill_consecutive_fails"`
 	UsageBackfillLastError        string `gorm:"size:512;column:usage_backfill_last_error"`
-	// UsageBackfillCursor 是尚待补齐的自然日（CST）起点；0 表示初始化。
+	UsageBackfillProgress         string `gorm:"size:256;column:usage_backfill_progress"`
+	// UsageBackfillCursor 是尚待补齐的时间窗口起点；0 表示初始化。NewAPI
+	// 使用小时游标，只有完整小时原子发布后才前移；按日提供账单的供应商仍使用自然日游标。
 	// UsageBackfillDone 只说明配置范围内的历史已完成，不表示今天的实时性。
 	UsageBackfillCursor int64 `gorm:"column:usage_backfill_cursor"`
 	UsageBackfillDone   bool  `gorm:"column:usage_backfill_done"`
@@ -122,6 +124,24 @@ type ChannelUpstreamUsageHour struct {
 	CostUSD       float64 `gorm:"column:cost_usd"`
 	FetchedAt     int64   `gorm:"column:fetched_at;index"`
 	Provider      string  `gorm:"size:24;column:provider"`
+}
+
+// NewAPIUsageBackfillCheckpoint 是 NewAPI 高密度历史小时的脱敏分页断点。
+// 它只保存累计计数和首页指纹，不保存上游原始日志、用户内容或凭据。每页完成后
+// 与 NextPage 一起原子落库；达到单轮请求预算或进程重启后可从下一页继续。
+// 公共 ChannelUpstreamUsageHour 仍只会在整个小时复核完成后一次性发布。
+type NewAPIUsageBackfillCheckpoint struct {
+	Domain               string  `gorm:"primaryKey;size:253;column:domain"`
+	WindowFrom           int64   `gorm:"column:window_from"`
+	WindowTo             int64   `gorm:"column:window_to"`
+	NextPage             int     `gorm:"column:next_page"`
+	Total                int64   `gorm:"column:total"`
+	SourceRows           int64   `gorm:"column:source_rows"`
+	Requests             int64   `gorm:"column:requests"`
+	Tokens               int64   `gorm:"column:tokens"`
+	Quota                float64 `gorm:"column:quota"`
+	FirstPageFingerprint string  `gorm:"size:64;column:first_page_fingerprint"`
+	UpdatedAt            int64   `gorm:"column:updated_at;index"`
 }
 
 // AICodeWithKeySyncState keeps scheduling and health isolated per credential.
@@ -218,6 +238,7 @@ type ChannelUpstreamAccountView struct {
 	UsageBackfillNextSyncAt       int64                             `json:"usage_backfill_next_sync_at,omitempty"`
 	UsageBackfillConsecutiveFails int                               `json:"usage_backfill_consecutive_fails,omitempty"`
 	UsageBackfillLastError        string                            `json:"usage_backfill_last_error,omitempty"`
+	UsageBackfillProgress         string                            `json:"usage_backfill_progress,omitempty"`
 	UsageLastAttemptAt            int64                             `json:"usage_last_attempt_at,omitempty"`
 	UsageBackfillLastAttemptAt    int64                             `json:"usage_backfill_last_attempt_at,omitempty"`
 	UsageBackfillCursor           int64                             `json:"usage_backfill_cursor,omitempty"`
@@ -877,6 +898,7 @@ func upstreamAccountView(row ChannelUpstreamAccount) ChannelUpstreamAccountView 
 		UsageBackfillNextSyncAt:       row.UsageBackfillNextSyncAt,
 		UsageBackfillConsecutiveFails: row.UsageBackfillConsecutiveFails,
 		UsageBackfillLastError:        row.UsageBackfillLastError,
+		UsageBackfillProgress:         row.UsageBackfillProgress,
 	}
 	if row.Provider == upstreamProviderAICodeWith {
 		view.APIKeyCount = aiCodeWithAccountKeyCount(row.Account)
@@ -1749,6 +1771,9 @@ func (m *Monitor) persistUpstreamAccountIdentityChange(ctx context.Context, row 
 			if err := tx.Where("domain = ?", row.Domain).Delete(&ChannelUpstreamUsageHour{}).Error; err != nil {
 				return err
 			}
+			if err := tx.Where("domain = ?", row.Domain).Delete(&NewAPIUsageBackfillCheckpoint{}).Error; err != nil {
+				return err
+			}
 		}
 		return nil
 	})
@@ -1812,6 +1837,9 @@ func (m *Monitor) persistAICodeWithAccountChange(ctx context.Context, row *Chann
 		}
 		if clearUsage {
 			if err := tx.Where("domain = ?", row.Domain).Delete(&ChannelUpstreamUsageHour{}).Error; err != nil {
+				return err
+			}
+			if err := tx.Where("domain = ?", row.Domain).Delete(&NewAPIUsageBackfillCheckpoint{}).Error; err != nil {
 				return err
 			}
 		}
@@ -2140,6 +2168,7 @@ func (m *Monitor) saveChannelUpstreamHandler(c *gin.Context) {
 		row.UsageBackfillLastAttemptAt, row.UsageBackfillLastSuccessAt = existing.UsageBackfillLastAttemptAt, existing.UsageBackfillLastSuccessAt
 		row.UsageBackfillNextSyncAt, row.UsageBackfillConsecutiveFails = existing.UsageBackfillNextSyncAt, existing.UsageBackfillConsecutiveFails
 		row.UsageBackfillLastError = existing.UsageBackfillLastError
+		row.UsageBackfillProgress = existing.UsageBackfillProgress
 		// A 401/403 deliberately isolates automatic usage requests until an
 		// administrator supplies credentials again. Saving a replacement secret
 		// for the same account is that explicit recovery action: retain all local
@@ -2152,6 +2181,7 @@ func (m *Monitor) saveChannelUpstreamHandler(c *gin.Context) {
 			row.UsageNextSyncAt, row.UsageConsecutiveFails = 0, 0
 			row.UsageBackfillNextSyncAt, row.UsageBackfillConsecutiveFails = 0, 0
 			row.UsageBackfillLastError = ""
+			row.UsageBackfillProgress = ""
 		}
 	}
 	if credentialSetChanged {
@@ -2160,6 +2190,7 @@ func (m *Monitor) saveChannelUpstreamHandler(c *gin.Context) {
 		row.UsageBackfillCursor, row.UsageBackfillDone = 0, false
 		row.UsageBackfillNextSyncAt, row.UsageBackfillConsecutiveFails = 0, 0
 		row.UsageBackfillLastError = ""
+		row.UsageBackfillProgress = ""
 	}
 	if !row.UsageSyncEnabled {
 		row.UsageStatus, row.UsageNextSyncAt = upstreamStatusDisabled, 0
