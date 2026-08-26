@@ -184,6 +184,25 @@ func TestLogChainFaultUpstreamInternalErrorBeatsAuthCode(t *testing.T) {
 	}
 }
 
+// TestLogChainFaultInternalErrorRequiresUpstreamOrigin 内部故障措辞必须带来源门（P2-03）。
+//
+// "internal server error" / "database error" 我方 new-api 也会产出。
+// 少了 status_code= 前缀这道来源门，我方自身故障会被判成上游，
+// 运营据此去投诉上游而放过自己的问题。
+func TestLogChainFaultInternalErrorRequiresUpstreamOrigin(t *testing.T) {
+	// 带前缀 = 上游返回 → 判上游。
+	up := LogChainRow{Type: 5, Content: "status_code=500, internal server error"}
+	if got := logChainAttributeFault(up, nil); got.Fault != faultUpstream {
+		t.Errorf("上游返回的内部错误应判上游: got=%s", got.Fault)
+	}
+
+	// 无前缀 = 我方 new-api 自己产出 → 绝不能判上游。
+	ours := LogChainRow{Type: 5, Content: "internal server error while building fact snapshot"}
+	if got := logChainAttributeFault(ours, nil); got.Fault == faultUpstream {
+		t.Errorf("我方自身内部错误不得判上游: got=%s（依据: %s）", got.Fault, got.Why)
+	}
+}
+
 // TestLogChainFaultOurTimeoutGate 我方超时闸门主动中断 → 我方。
 // 生产原文（08-24 实测 5 条）："status_code=408, 响应时间 125.03s 超过阈值 120.00s"。
 // 这个状态码是 408，但语义是我方阈值生效，不是上游超时。

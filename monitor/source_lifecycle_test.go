@@ -128,9 +128,19 @@ func TestNewTransientSourceFailureKeepsSQLiteAndRecoversWithoutEpochOverlap(t *t
 		t.Fatalf("transient source failure must degrade, not abort: %v", err)
 	}
 	defer m.Close()
-	if m.currentSourceState() != sourceStateDegradedNetwork {
-		t.Fatalf("initial source state=%s", m.currentSourceState())
-	}
+	// ★ 必须等稳定条件，不能在 New 返回后立刻断言（验收报告 RB-04）★
+	//
+	// New 的同步路径探测失败后确实会置 degraded_network，但它同时启动了
+	// superviseSource goroutine；该 goroutine 的第一件事就是把状态置回
+	// connecting 再探测（source_lifecycle.go superviseSource 开头）。
+	// 于是测试与那个 goroutine 赛跑，约 1/3 概率读到 connecting 而非 degraded_network。
+	//
+	// 状态契约：connecting 是**瞬态**（正在探测），degraded_network 是探测失败后的
+	// 稳定态。断言稳定态必须轮询等待，而不是依赖 goroutine 调度先后。
+	// 不允许用 sleep 代替——那只是把赛跑窗口变窄，不是消除它。
+	lifecycleEventually(t, 3*time.Second, func() bool {
+		return m.currentSourceState() == sourceStateDegradedNetwork
+	}, "来源不可达时应稳定在 degraded_network")
 	if w, _ := lifecycleRequest(t, m, "/live"); w.Code != http.StatusOK {
 		t.Fatalf("live during source outage=%d", w.Code)
 	}
