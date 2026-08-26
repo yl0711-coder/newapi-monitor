@@ -194,18 +194,18 @@ func (m *Monitor) RegisterRoutes(r *gin.Engine) {
 		view.GET("/data", m.serveData)
 		view.GET("/monitor/data", m.serveData)
 		view.GET("/trend/long", m.serveLongTrend)
-		view.GET("/stability/report", m.serveStabilityReport)                              // 历史稳定性:只读 Monitor 本地 SQLite
-		view.GET("/stability/detail", m.serveStabilityDetail)                              // 单分组详情:按需加载渠道时间条/模型
-		view.GET("/stability/problems", m.serveStabilityProblems)                          // 原始错误签名:只读本地问题样本
-		view.GET("/stability/health", m.serveStabilityHealth)                              // 采集新鲜度/覆盖/积压:不查生产库
-		view.GET("/stability/edge", m.serveNginxEdge)                                      // Nginx 入口层:只读本地脱敏分钟汇总
-		view.GET("/channels/report", m.serveChannelManagementReport)                       // 渠道管理:主域名→厂商→渠道→服务分组的本地汇总
+		view.GET("/stability/report", m.serveStabilityReport)        // 历史稳定性:只读 Monitor 本地 SQLite
+		view.GET("/stability/detail", m.serveStabilityDetail)        // 单分组详情:按需加载渠道时间条/模型
+		view.GET("/stability/problems", m.serveStabilityProblems)    // 原始错误签名:只读本地问题样本
+		view.GET("/stability/health", m.serveStabilityHealth)        // 采集新鲜度/覆盖/积压:不查生产库
+		view.GET("/stability/edge", m.serveNginxEdge)                // Nginx 入口层:只读本地脱敏分钟汇总
+		view.GET("/channels/report", m.serveChannelManagementReport) // 渠道管理:主域名→厂商→渠道→服务分组的本地汇总
 		// 排障两个接口挂 noStoreSensitive：响应含客户标识、令牌名、渠道名/ID、
 		// 上游主域名与错误原文，属敏感诊断数据，不得被任何中间层缓存。
 		// 用中间件而非在 handler 里逐个 c.Header：handler 有多条提前 return
 		// 的错误分支（400/401/403/500），逐个加必然漏，而漏掉的恰好是错误响应。
-		view.GET("/logchain/requests", noStoreSensitive, m.serveLogChainRequests) // 客户排障:逐条请求→渠道→上游主域名→错误原文(含 type=5,含渠道信息,仅管理员)
-		view.GET("/logchain/filters", noStoreSensitive, m.serveLogChainFilters)   // 客户排障:筛选下拉取值(服务分组/上游域名/渠道),只读本地快照
+		view.GET("/logchain/requests", noStoreSensitive, m.serveLogChainRequests)          // 客户排障:逐条请求→渠道→上游主域名→错误原文(含 type=5,含渠道信息,仅管理员)
+		view.GET("/logchain/filters", noStoreSensitive, m.serveLogChainFilters)            // 客户排障:筛选下拉取值(服务分组/上游域名/渠道),只读本地快照
 		view.GET("/infra", m.serveInfra)                                                   // 服务端健康监控(实例/DB/LB)快照
 		view.GET("/infra/series", m.serveInfraSeries)                                      // 按需取某资源某些指标的近 N 小时序列(展开图用)
 		view.GET("/usage/users", m.listTrackedUsers)                                       // 用户用量:被盯名单(含分组)

@@ -11,11 +11,11 @@ package monitor
 import "testing"
 
 type modalityCase struct {
-	name     string
-	path     string
-	model    string
-	wantTag  bool
-	why      string
+	name    string
+	path    string
+	model   string
+	wantTag bool
+	why     string
 }
 
 // modalityCases 七类用例，端点路径全部取自生产实测（近 5 天 197371 行 type=2，
@@ -73,5 +73,3 @@ func TestLogChainBillingUnpaidModalityMatrix(t *testing.T) {
 		})
 	}
 }
-
-

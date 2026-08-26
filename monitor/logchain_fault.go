@@ -131,7 +131,7 @@ var logChainFaultMessageRules = []logChainFaultMessageRule{
 		requireUpstream: boolPtr(true),
 		fault:           faultUpstream,
 		confidence:      faultConfMid,
-		why:        "上游明示是其自身数据库/内部故障（上游返回且原文含相应措辞），责任方在上游",
+		why:             "上游明示是其自身数据库/内部故障（上游返回且原文含相应措辞），责任方在上游",
 	},
 }
 
