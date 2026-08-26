@@ -810,7 +810,10 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
             <span class="lc-th-sub" id="lcSortHint">最新在上</span>
           </th>
         </tr></thead>
-        <tbody id="lcTableBody"><tr><td colspan="7" class="lc-empty">加载中…</td></tr></tbody>
+        <!-- colspan 必须等于表头列数（当前 8：时间/客户/令牌/分组/模型/渠道/疑似责任方/原文）。
+             P3-01 曾在此写 7，比表头少一列，加载中那行的占位宽度对不上表格。
+             加列时这里、logchain.js 的空状态、rowHTML 的 td 数三处必须同改。 -->
+        <tbody id="lcTableBody"><tr><td colspan="8" class="lc-empty">加载中…</td></tr></tbody>
       </table>
     </div>
     <div class="lc-more"><button type="button" id="lcMore" hidden>加载更早的记录</button></div>

@@ -7,6 +7,7 @@ package monitor
 // 注释写清为什么，避免后来者当成无意义的字符串检查而顺手删掉。
 
 import (
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -243,6 +244,55 @@ func TestLogChainClientGoneIsSeparateScope(t *testing.T) {
 	// 标签用中性色而非告警色。
 	if !strings.Contains(js, "lc-tag-gone") || !strings.Contains(page, ".lc-tag-gone") {
 		t.Error("client_gone 标签应有独立的中性色样式（lc-tag-gone），不与告警色混用")
+	}
+}
+
+// TestLogChainTableColumnCountsAgree 表头列数、初始占位 colspan、每行 td 数必须一致（P3-01）。
+//
+// 报告实测：表格 8 列而初始空状态写 colspan=7，加载中那行占位宽度对不上。
+// 这类缺陷编译能过、测试也不报错，只在肉眼看页面时才发现，
+// 所以用测试把三处数字钉在一起。
+func TestLogChainTableColumnCountsAgree(t *testing.T) {
+	page := pageHTML
+	js := string(logChainJS)
+
+	// 表头列数：截取 lcTable 到 lcTableBody 之间的片段再数 <th。
+	// 用 lcSortTh（排障表格独有的排序表头）反向定位到它所在的 thead，
+	// 再数到 lcTableBody 为止。页面里有多个表格，不能全局数 <th。
+	end := strings.Index(page, `id="lcTableBody"`)
+	sortTh := strings.Index(page, `id="lcSortTh"`)
+	if end < 0 || sortTh < 0 {
+		t.Fatal("找不到 lcTableBody / lcSortTh 锚点")
+	}
+	start := strings.LastIndex(page[:sortTh], "<thead>")
+	if start < 0 {
+		t.Fatal("找不到排障表格的 thead")
+	}
+	// 数 "<th " 与 "<th>" 两种，不能只数 "<th"——那会把 <thead> 也算进来。
+	head := page[start:end]
+	thCount := strings.Count(head, "<th ") + strings.Count(head, "<th>")
+
+	// 初始占位 colspan 必须等于表头列数。
+	want := `colspan="` + strconv.Itoa(thCount) + `" class="lc-empty"`
+	if !strings.Contains(page, want) {
+		t.Errorf("初始占位 colspan 与表头 %d 列不一致", thCount)
+	}
+
+	// rowHTML 里每行渲染的单元格数也必须一致。只数带 lc- 类名的 td，
+	// 避开展开行（lc-detail）里的表格。
+	rowStart := strings.Index(js, "function rowHTML")
+	if rowStart < 0 {
+		t.Fatal("找不到 rowHTML")
+	}
+	rowEnd := strings.Index(js[rowStart:], "\n}")
+	if rowEnd < 0 {
+		t.Fatal("rowHTML 边界不清")
+	}
+	rowFn := js[rowStart : rowStart+rowEnd]
+	// 同理数 "<td " 与 "<td>" 两种：单元格有的带 class 有的不带。
+	tdCount := strings.Count(rowFn, "<td ") + strings.Count(rowFn, "<td>")
+	if tdCount != thCount {
+		t.Errorf("每行 td 数=%d，表头=%d 列", tdCount, thCount)
 	}
 }
 
