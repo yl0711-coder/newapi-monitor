@@ -677,6 +677,20 @@ func pricingLegacyQuotaAsExact(provider string, legacy ChannelUpstreamUsageHour)
 	return int64(math.Round(value)), true
 }
 
+// pricingLegacySnapshotChanged compares only the values used for ledger
+// reconciliation. FetchedAt records when the legacy row was refreshed, not a
+// change to the upstream bill; using it here would continuously requeue an
+// otherwise unchanged hour on every legacy sync cycle.
+func pricingLegacySnapshotChanged(provider string, observed ChannelUpstreamPricingHourState, legacy ChannelUpstreamUsageHour) bool {
+	legacyQuota, comparable := pricingLegacyQuotaAsExact(provider, legacy)
+	if !comparable {
+		return true
+	}
+	return observed.LegacyRequests != legacy.Requests ||
+		observed.LegacyTokens != legacy.Tokens ||
+		observed.LegacyQuota != legacyQuota
+}
+
 func pricingReconcileAccepted(provider, status string) bool {
 	if status == "matched" {
 		return true
@@ -1295,7 +1309,7 @@ func (m *Monitor) pricingTailHourDue(ctx context.Context, account ChannelUpstrea
 			return 0, false, observedErr
 		}
 		if observed.Status != "verified" || !pricingReconcileAccepted(account.Provider, observed.ReconcileStatus) ||
-			(account.Provider != upstreamProviderAICodeWith && observed.LegacyFetchedAt != legacy.FetchedAt) {
+			(account.Provider != upstreamProviderAICodeWith && pricingLegacySnapshotChanged(account.Provider, observed, legacy)) {
 			return hour, true, nil
 		}
 	}

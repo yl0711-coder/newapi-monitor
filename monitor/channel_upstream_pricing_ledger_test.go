@@ -236,6 +236,75 @@ func TestPricingLedgerFinalQuotaConservationAndAtomicReconcile(t *testing.T) {
 	}
 }
 
+func TestPricingTailIgnoresRefreshTimeButRequeuesContentChanges(t *testing.T) {
+	m := newTestMonitor(t)
+	ctx := context.Background()
+	closedThrough := int64(1787626800)
+	hour := closedThrough - 3*3600
+	account := ChannelUpstreamAccount{
+		Domain: "4sapi.com", Provider: upstreamProviderNewAPI,
+		BaseURL: "https://4sapi.com", UserID: 147426,
+	}
+	legacy := ChannelUpstreamUsageHour{
+		Domain: account.Domain, HourTs: hour, BucketSeconds: 3600,
+		Requests: 12, Tokens: 3456, Quota: 789000, CostUSD: 1.578,
+		Provider: upstreamProviderNewAPI, FetchedAt: hour + 7200,
+	}
+	if err := m.storeDB.Create(&legacy).Error; err != nil {
+		t.Fatal(err)
+	}
+	observed := ChannelUpstreamPricingHourState{
+		Domain: account.Domain, AccountEpoch: newAPIUpstreamAccountEpoch(account),
+		HourTs: hour, SemanticsVersion: upstreamPricingSemanticsVersion,
+		Status: "verified", ReconcileStatus: "matched",
+		LegacyRequests: legacy.Requests, LegacyTokens: legacy.Tokens, LegacyQuota: 789000,
+		LegacyFetchedAt: legacy.FetchedAt - 900,
+	}
+	if err := m.storeDB.Create(&observed).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	if dueHour, due, err := m.pricingTailHourDue(ctx, account, closedThrough); err != nil {
+		t.Fatal(err)
+	} else if due {
+		t.Fatalf("refresh-time-only change requeued hour %d", dueHour)
+	}
+
+	for _, tc := range []struct {
+		name   string
+		column string
+		value  any
+	}{
+		{name: "requests", column: "requests", value: legacy.Requests + 1},
+		{name: "tokens", column: "tokens", value: legacy.Tokens + 1},
+		{name: "quota", column: "quota", value: legacy.Quota + 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := m.storeDB.Model(&ChannelUpstreamUsageHour{}).
+				Where("domain = ? AND hour_ts = ?", account.Domain, hour).
+				Update(tc.column, tc.value).Error; err != nil {
+				t.Fatal(err)
+			}
+			dueHour, due, err := m.pricingTailHourDue(ctx, account, closedThrough)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !due || dueHour != hour {
+				t.Fatalf("content change did not requeue hour: due=%v hour=%d", due, dueHour)
+			}
+			if err := m.storeDB.Model(&ChannelUpstreamUsageHour{}).
+				Where("domain = ? AND hour_ts = ?", account.Domain, hour).
+				Updates(map[string]any{
+					"requests": legacy.Requests,
+					"tokens":   legacy.Tokens,
+					"quota":    legacy.Quota,
+				}).Error; err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
 func TestPricingLedgerMismatchDoesNotPublishObservedCurrentState(t *testing.T) {
 	m := newTestMonitor(t)
 	hour := int64(1787623200 - 1787623200%3600)
