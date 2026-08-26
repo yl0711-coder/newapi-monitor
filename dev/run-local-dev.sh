@@ -15,6 +15,8 @@ REPO_DIR="${SCRIPT_DIR:h}"
 IMAGE_TAG="${MONITOR_LOCAL_DEV_IMAGE:-newapi-monitor:local-dev}"
 DATA_VOLUME="${MONITOR_ACCEPTANCE_VOLUME:-newapi-monitor-local-data}"
 BACKUP_VOLUME="${MONITOR_ACCEPTANCE_BACKUP_VOLUME:-newapi-monitor-local-backup}"
+ADMIN_PORT="${MONITOR_ACCEPTANCE_ADMIN_PORT:-8100}"
+PORTAL_PORT="${MONITOR_ACCEPTANCE_PORTAL_PORT:-8101}"
 
 fail() {
   print -u2 -- "错误：$*"
@@ -41,8 +43,8 @@ wait_for_ready() {
   local attempt=1
 
   while (( attempt <= attempts )); do
-    if curl -fsS http://127.0.0.1:8100/live >/dev/null 2>&1 && \
-      curl -fsS http://127.0.0.1:8100/ready >/dev/null 2>&1; then
+    if curl -fsS "http://127.0.0.1:${ADMIN_PORT}/live" >/dev/null 2>&1 && \
+      curl -fsS "http://127.0.0.1:${ADMIN_PORT}/ready" >/dev/null 2>&1; then
       return 0
     fi
     sleep 2
@@ -55,10 +57,10 @@ wait_for_ready() {
 show_urls() {
   print -- ""
   print -- "本机 Monitor 已启动（完全离线模式）。"
-  print -- "健康检查： http://127.0.0.1:8100/live"
-  print -- "就绪检查： http://127.0.0.1:8100/ready"
-  print -- "管理端地址： http://127.0.0.1:8100"
-  print -- "门户地址：   http://127.0.0.1:8101"
+  print -- "健康检查： http://127.0.0.1:${ADMIN_PORT}/live"
+  print -- "就绪检查： http://127.0.0.1:${ADMIN_PORT}/ready"
+  print -- "管理端地址： http://127.0.0.1:${ADMIN_PORT}"
+  print -- "门户地址：   http://127.0.0.1:${PORTAL_PORT}"
   print -- ""
   print -- "说明：离线模式不连接 NewAPI，因此页面不能登录、也没有真实业务数据；"
   print -- "它用于确认镜像、SQLite 数据卷、Redis 与健康检查可正常工作。"
@@ -89,10 +91,10 @@ main() {
       compose ps
       print -- ""
       print -- "健康检查："
-      curl -fsS http://127.0.0.1:8100/live || true
+      curl -fsS "http://127.0.0.1:${ADMIN_PORT}/live" || true
       print -- ""
       print -- "就绪检查："
-      curl -fsS http://127.0.0.1:8100/ready || true
+      curl -fsS "http://127.0.0.1:${ADMIN_PORT}/ready" || true
       print -- ""
       ;;
     logs)

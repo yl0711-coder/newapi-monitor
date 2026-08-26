@@ -11,7 +11,7 @@
 
 > **第二轮修订摘要**（细节见各节与第 13、14 节）：
 > 1. 修正 7.1 节"`LogRow` 已有全部字段"——**错误**，`LogRow` 无 `ChannelID`，且是故意不给的（客户面）。
-> 2. 修正 3.3 节上游端点 `/api/log/self` → 实际是 `/api/log/`。
+> 2. 修正 3.3 节上游端点：普通用户访问令牌必须读 `/api/log/self`；`/api/log/` 是管理员全站日志接口。
 > 3. 11 节问题 1（生产上游同步是否开启）**代码里已有答案**：默认 `true`。
 > 4. 新增：事实表 `type IN (2,6)` 排除错误日志、`scrubContent` 会清空上游错误原文、
 >    前置拒绝无 `user_id`——三件都直接决定排障能做到什么程度。
@@ -297,17 +297,21 @@ EXPLAIN → type=range + Backward index scan（连 filesort 都省了）
 现有代码不解析 model，但**不代表上游不返回**。判定方法：
 `canonicalUsagePageFingerprint` 会解码完整条目，抓一次真实响应即可确认。
 
+<<<<<<< HEAD
 > ⚠️ **本节曾把端点写错，第四轮已更正——先读 3.3.1 再动代码。**
 > 下面这段方框里的 `/api/log/` 是**错的**，保留原文只为让读过旧版的人知道哪里变了。
 
 **端点修正【已作废·第二轮的错误结论】**：曾断言实际请求的是 **`/api/log/`**，不是初版写的 `/api/log/self`
 （[channel_upstream_usage.go:175](../monitor/channel_upstream_usage.go#L175)）：
+=======
+**端点修正【已按生产凭据语义验证】**：Monitor 保存的是普通用户访问令牌，因此必须请求 **`/api/log/self`**。`/api/log/` 是管理员全站日志接口，普通用户凭据会被拒绝；不得为了同步账单而提升凭据权限：
+>>>>>>> origin/main
 
 ```go
 query.Set("p", ...); query.Set("page_size", ...); query.Set("type", "2")
 query.Set("start_timestamp", ...); query.Set("end_timestamp", ...)
 headers := {"Authorization": "Bearer "+token, "New-Api-User": userID}
-upstreamEndpoint(row.BaseURL, "/api/log/") + "?" + query.Encode()
+upstreamEndpoint(row.BaseURL, "/api/log/self") + "?" + query.Encode()
 ```
 
 这就是 NewAPI 自己日志页用的接口，其列表本来要渲染"模型"列，因此
@@ -1092,12 +1096,16 @@ MSYS_NO_PATHCONV=1 docker compose -f .local-test-kit/logchain-fixture/docker-com
 
 1. **7.1 节"`LogRow` 已有全部字段"——错。** `LogRow` 无 `ChannelID`，SQL 也没 SELECT，
    且注释表明是故意不给（客户面）。与第 12 节第 2 条同类失误：**声称字段存在前必须 grep 确认。**
+<<<<<<< HEAD
 2. ~~**3.3 节端点 `/api/log/self`——错**，实际 `/api/log/`。~~
    > **本条本身是错的，已被第四轮生产实测推翻。** 初版写的 `/api/log/self` 是对的，
    > 这次"修正"把它改错了，代码也曾据此改坏（后由 `d8bb1dd` 改回）。
    > 正确结论见 3.3.1，失误分析见 14.4.4。
    > **留着这条不删**，是因为它是本文档最值得记住的一次教训：
    > **"修正"也需要证据，而当时的依据只是读了一遍代码里的字符串常量。**
+=======
+2. **3.3 节曾把 `/api/log/` 当成普通用户接口——错。** Monitor 使用普通用户访问令牌，实际必须读 `/api/log/self`；管理员全站接口不在凭据范围内。
+>>>>>>> origin/main
 3. **11 节问题 1 被列为"最高阻塞的未知"——过度保守。** 答案就在
    `settings.go` 默认值里，不需要问用户。
 
@@ -1159,6 +1167,7 @@ MSYS_NO_PATHCONV=1 docker compose -f .local-test-kit/logchain-fixture/docker-com
 5. **`execute_bash` 连续约 25 次报成功但未执行**（重定向到文件后文件根本不存在）。
    期间无法构建/测试/提交。判定方法：`cmd > file` 后读文件，文件不存在即工具故障。
    与第 12 节第 4 条、14.2 第 2 条同源。**重启 IDE 后恢复。**
+<<<<<<< HEAD
 
 ### 14.4 第四轮的修正与失误（**本节全部来自生产真实数据**）
 
@@ -1375,3 +1384,5 @@ wan / vidu / flux / stable-diffusion 及语音转录等**一整批模态**，
 3. **前置拒绝仍定位不到客户。** 见 3.1.1 第 1 条，要修得改 schema → bump plan ID。
    目前用 `blind_spots` 明确告知，**未解决**。
 
+=======
+>>>>>>> origin/main

@@ -41,6 +41,10 @@ services:
       - MONITOR_UPSTREAM_USAGE_SYNC_ENABLED=false
       - MONITOR_UPSTREAM_USAGE_SYNC_MINUTES=30
       - MONITOR_UPSTREAM_USAGE_BACKFILL_DAYS=90
+      # 新计价证据链路独立灰度；首次部署保持关闭和空白名单。
+      - MONITOR_UPSTREAM_PRICING_LEDGER_ENABLED=false
+      - MONITOR_UPSTREAM_PRICING_LEDGER_DOMAINS=
+      - MONITOR_UPSTREAM_PRICING_BACKFILL_HOURS_PER_RUN=1
       # 生产示例固定 fail-closed：聚合页只读已发布 facts；首次补全期间返回
       # 部分覆盖/暂不可用，不会回扫来源 logs。
       - MONITOR_USAGE_FACTS_ENABLED=true

@@ -204,7 +204,7 @@ body{max-width:none!important;margin:0!important;padding:0!important;overflow-x:
 .channel-management-page .cm-group-metrics b{display:block;margin-top:5px;color:#e4eaf4;font-size:18px;font-variant-numeric:tabular-nums;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .channel-management-page .cm-group-chevron{display:grid;place-items:center;width:28px;height:28px;border:1px solid #354056;border-radius:8px;color:#aaa4ff;font-size:19px;font-style:normal}
 .channel-management-page .cm-group-body{border-top:1px solid #30394b;background:#111720}
-.channel-management-page .cm-group-channel-head,.channel-management-page .cm-group-channel-row{display:grid;grid-template-columns:minmax(230px,1.45fr) 112px 94px 128px 74px 78px 88px 88px 108px 88px;gap:10px;align-items:center}
+.channel-management-page .cm-group-channel-head,.channel-management-page .cm-group-channel-row{display:grid;grid-template-columns:minmax(230px,1.45fr) 112px 94px 128px 74px 78px 88px 88px 108px;gap:10px;align-items:center}
 .channel-management-page .cm-group-channel-head{padding:12px 18px;background:#121822;color:#8d99ad;font-size:13px}
 .channel-management-page .cm-group-channel-head>span:not(:first-child){text-align:right}
 .channel-management-page .cm-group-channel-row{min-height:76px;padding:14px 18px;border-top:1px solid #293142;background:#111720}
@@ -221,22 +221,21 @@ body{max-width:none!important;margin:0!important;padding:0!important;overflow-x:
 .channel-management-page .cm-group-stability button.ready{color:#8fdbbf}.channel-management-page .cm-group-stability button.warn{color:#e7b65f}.channel-management-page .cm-group-stability button.bad{color:#ef7880}
 .channel-management-page .cm-group-stability button small{font-size:10px;color:#738095}.channel-management-page .cm-group-stability button:hover{text-decoration:underline}
 .channel-management-page .cm-group-channel-row .cm-status{justify-self:end}
-.channel-management-page .cm-group-channel-row .cm-number,.channel-management-page .cm-group-channel-row .cm-metric-main b{font-size:15px}
-.channel-management-page .cm-group-channel-row .cm-metric-main small{font-size:12px;color:#8793a8}
+.channel-management-page .cm-group-channel-row .cm-number{font-size:15px}
 .channel-management-page .cm-group-channel-row .cm-no-groups{grid-column:1/-1}
 
 @media(max-width:1500px){
   .channel-management-page .cm-group-head{grid-template-columns:minmax(310px,1.1fr) minmax(390px,1fr) 30px;gap:14px}
-  .channel-management-page .cm-group-channel-head,.channel-management-page .cm-group-channel-row{grid-template-columns:minmax(205px,1.4fr) 92px 78px 106px 64px 70px 76px 76px 94px 78px;gap:8px}
+  .channel-management-page .cm-group-channel-head,.channel-management-page .cm-group-channel-row{grid-template-columns:minmax(205px,1.4fr) 92px 78px 106px 64px 70px 76px 76px 94px;gap:8px}
 }
 @media(max-width:1180px){
   .channel-management-page .cm-group-head{grid-template-columns:minmax(270px,1fr) minmax(330px,1fr) 30px;gap:10px;padding:14px}
   .channel-management-page .cm-group-title>b{font-size:18px}
   .channel-management-page .cm-group-metrics{gap:8px}
   .channel-management-page .cm-group-metrics b{font-size:16px}
-  .channel-management-page .cm-group-channel-head,.channel-management-page .cm-group-channel-row{grid-template-columns:minmax(185px,1.35fr) 82px 70px 96px 58px 64px 70px 70px 86px 70px;gap:7px;padding-left:14px;padding-right:14px}
+  .channel-management-page .cm-group-channel-head,.channel-management-page .cm-group-channel-row{grid-template-columns:minmax(185px,1.35fr) 82px 70px 96px 58px 64px 70px 70px 86px;gap:7px;padding-left:14px;padding-right:14px}
 }
-/* 1280px 及以下的可用内容宽度会被侧栏和页面边距压缩；渠道明细改为带字段标签的紧凑卡片，避免十列网格被裁切。 */
+/* 1280px 及以下的可用内容宽度会被侧栏和页面边距压缩；渠道明细改为带字段标签的紧凑卡片，避免多列网格被裁切。 */
 @media(max-width:1320px){
   .channel-management-page .cm-group-head{grid-template-columns:minmax(220px,1fr) 30px}
   .channel-management-page .cm-group-metrics{grid-column:1/-1;grid-row:2;grid-template-columns:repeat(4,1fr);padding-top:4px}
@@ -245,7 +244,7 @@ body{max-width:none!important;margin:0!important;padding:0!important;overflow-x:
   .channel-management-page .cm-group-channel-row{grid-template-columns:repeat(3,minmax(0,1fr));gap:12px 14px;padding:14px}
   .channel-management-page .cm-group-channel-row>div:first-child{grid-column:1/-1;text-align:left}
   .channel-management-page .cm-group-channel-row>div:nth-child(4){text-align:left}
-  .channel-management-page .cm-group-channel-row>div:nth-child(1)::before,.channel-management-page .cm-group-channel-row>div:nth-child(2)::before,.channel-management-page .cm-group-channel-row>div:nth-child(3)::before,.channel-management-page .cm-group-channel-row>div:nth-child(4)::before,.channel-management-page .cm-group-channel-row>div:nth-child(5)::before,.channel-management-page .cm-group-channel-row>div:nth-child(6)::before,.channel-management-page .cm-group-channel-row>span:nth-of-type(1)::before,.channel-management-page .cm-group-channel-row>span:nth-of-type(2)::before,.channel-management-page .cm-group-channel-row>span:nth-of-type(3)::before,.channel-management-page .cm-group-channel-row>.cm-metric-main::before{display:block;margin-bottom:4px;color:#8290a6;font-size:10px;font-weight:400}
+  .channel-management-page .cm-group-channel-row>div:nth-child(1)::before,.channel-management-page .cm-group-channel-row>div:nth-child(2)::before,.channel-management-page .cm-group-channel-row>div:nth-child(3)::before,.channel-management-page .cm-group-channel-row>div:nth-child(4)::before,.channel-management-page .cm-group-channel-row>div:nth-child(5)::before,.channel-management-page .cm-group-channel-row>div:nth-child(6)::before,.channel-management-page .cm-group-channel-row>span:nth-of-type(1)::before,.channel-management-page .cm-group-channel-row>span:nth-of-type(2)::before,.channel-management-page .cm-group-channel-row>span:nth-of-type(3)::before{display:block;margin-bottom:4px;color:#8290a6;font-size:10px;font-weight:400}
   .channel-management-page .cm-group-channel-row>div:nth-child(1)::before{content:'渠道'}
   .channel-management-page .cm-group-channel-row>div:nth-child(2)::before{content:'上游折算倍率'}
   .channel-management-page .cm-group-channel-row>div:nth-child(3)::before{content:'倍率差'}
@@ -255,9 +254,6 @@ body{max-width:none!important;margin:0!important;padding:0!important;overflow-x:
   .channel-management-page .cm-group-channel-row>span:nth-of-type(1)::before{content:'请求数'}
   .channel-management-page .cm-group-channel-row>span:nth-of-type(2)::before{content:'Tokens'}
   .channel-management-page .cm-group-channel-row>span:nth-of-type(3)::before{content:'用户侧消费'}
-  .channel-management-page .cm-group-channel-row>.cm-metric-main::before{content:'本组占比'}
-  .channel-management-page .cm-group-channel-row>.cm-metric-main{text-align:left}
-  .channel-management-page .cm-group-channel-row>.cm-metric-main b{text-align:left}
 }
 @media(min-width:901px) and (max-width:1180px){
   .monitor-workspace{padding-left:16px;padding-right:16px}

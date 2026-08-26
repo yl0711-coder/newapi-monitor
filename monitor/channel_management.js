@@ -17,7 +17,6 @@ const compact=n=>{n=+n||0;const a=Math.abs(n);for(const [d,u] of [[1e12,'T'],[1e
 const usd=n=>{n=+n||0;const digits=n===0||Math.abs(n)>=.01?2:4;return '$'+n.toLocaleString('en-US',{minimumFractionDigits:digits,maximumFractionDigits:digits})};
 const metric=u=>cm.sort==='requests'?(+u?.requests||0):cm.sort==='tokens'?(+u?.tokens||0):(+u?.cost_usd||0);
 const metricLabel=()=>cm.sort==='requests'?'请求数':cm.sort==='tokens'?'Tokens':'用户侧消费';
-const metricText=u=>cm.sort==='requests'?nfmt(u?.requests):cm.sort==='tokens'?compact(u?.tokens):usd(u?.cost_usd);
 const dateTime=ts=>ts?new Date(ts*1000).toLocaleString('zh-CN',{hour12:false,timeZone:'Asia/Shanghai'}):'—';
 const shortDateTime=ts=>ts?new Date(ts*1000).toLocaleString('zh-CN',{hour12:false,timeZone:'Asia/Shanghai',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'}):'—';
 const cstDate=ts=>{const p=new Intl.DateTimeFormat('zh-CN',{timeZone:'Asia/Shanghai',year:'numeric',month:'2-digit',day:'2-digit'}).formatToParts(new Date(ts*1000));const v=t=>p.find(x=>x.type===t)?.value||'';return `${v('year')}-${v('month')}-${v('day')}`};
@@ -233,10 +232,6 @@ function statusLabel(ch){
   if(+ch.status===3)return'<span class="cm-status disabled">自动禁用</span>';
   return'<span class="cm-status disabled">停用</span>';
 }
-function metricCell(usage,total){
-  const share=metric(total)>0?metric(usage)/metric(total)*100:0;
-  return `<div class="cm-metric-main"><b>${esc(metricText(usage))}</b><small>${share.toFixed(1)}%</small></div>`;
-}
 const pct=n=>(+n*100).toFixed(2)+'%';
 function multiplierGap(n){
   const value=Math.abs(+n)<1e-9?0:+n;
@@ -273,7 +268,6 @@ function channelGroupRows(domain,group){
       <span class="cm-number">${nfmt(usage.requests)}</span>
       <span class="cm-number" title="${nfmt(usage.tokens)}">${compact(usage.tokens)}</span>
       <span class="cm-number">${usd(usage.cost_usd)}</span>
-      ${metricCell(usage,group.usage)}
     </div>`;
   }).join('')||'<div class="cm-no-groups">该服务分组暂无渠道用量</div>';
 }
@@ -304,7 +298,7 @@ function groupSection(domain,vendor,group,index,domainTotal){
       <div class="cm-group-metrics"><span><small>请求数</small><b>${nfmt(group.usage.requests)}</b></span><span><small>Tokens</small><b>${compact(group.usage.tokens)}</b></span><span><small>用户侧消费</small><b>${usd(group.usage.cost_usd)}</b></span><span><small>域名消费占比</small><b>${share.toFixed(1)}%</b></span></div>
       <i class="cm-group-chevron">${open?'−':'+'}</i>
     </header>
-    ${open?`<div class="cm-group-body"><div class="cm-group-channel-head"><span>渠道 ID / 渠道名</span><span>上游折算倍率</span><span>倍率差</span><span>关联模型</span><span>状态</span><span>稳定性</span><span>请求数</span><span>Tokens</span><span>用户侧消费</span><span>本组占比</span></div>${channelGroupRows(domain,group)}</div>`:''}
+    ${open?`<div class="cm-group-body"><div class="cm-group-channel-head"><span>渠道 ID / 渠道名</span><span>上游折算倍率</span><span>倍率差</span><span>关联模型</span><span>状态</span><span>稳定性</span><span>请求数</span><span>Tokens</span><span>用户侧消费</span></div>${channelGroupRows(domain,group)}</div>`:''}
   </section>`;
 }
 function vendorSection(domain,vendor){

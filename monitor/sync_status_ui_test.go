@@ -97,6 +97,24 @@ func TestSyncStatusPageSeparatesUpstreamBalanceTailAndHistory(t *testing.T) {
 	}
 }
 
+func TestSyncStatusPageShowsIndependentPricingLedgerProgress(t *testing.T) {
+	for _, marker := range []string{
+		`计价证据账本`,
+		`pricing_ledger_worker_enabled`,
+		`pricing_ledger_eligible`,
+		`pricing_verified_hours`,
+		`pricing_mismatch_hours`,
+		`不影响现有消费账单`,
+		`分页续传`,
+		`等待复核`,
+		`对账差异`,
+	} {
+		if !strings.Contains(pageHTML, marker) {
+			t.Fatalf("上游计价证据状态缺少 %q", marker)
+		}
+	}
+}
+
 func TestUsagePageKeepsOperationalProgressInSyncStatus(t *testing.T) {
 	for _, forbidden := range []string{
 		`id="usageSyncStatus"`,
