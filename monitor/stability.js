@@ -8,6 +8,7 @@ const ST_HEADERS={
   channels:{title:'渠道管理',subtitle:'主域名归并 · 厂商 / 实际渠道 / 服务分组 · 使用排行',icon:'globe'},
   model:{title:'模型监控',subtitle:'分钟级实时状态、告警、SLO、稳定性与响应耗时',icon:'activity'},
   server:{title:'服务端监控',subtitle:'实例、数据库、负载均衡、域名探活与证书',icon:'chart'},
+  capacity:{title:'容量规划',subtitle:'RPM / TPM · 日志稳定率 · 分组与渠道负载 · 服务资源同轴观察',icon:'capacity'},
   // 缺这条会走第 22 行的 ||ST_HEADERS.usage 兜底，顶部标题错显成"用户用量"。
   // 新增 tab 时必须同步加，否则页面标题静默串台。
   logchain:{title:'客户排障',subtitle:'逐条请求 · 客户 / 令牌 / 分组 / 模型 · 渠道 → 上游主域名 · 上游返回原文',icon:'search'}
@@ -19,6 +20,7 @@ const ST_ICONS={
   globe:'<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a15 15 0 0 1 0 18M12 3a15 15 0 0 0 0 18"/></svg>',
   activity:'<svg viewBox="0 0 24 24"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>',
   chart:'<svg viewBox="0 0 24 24"><path d="M3 3v18h18"/><path d="m7 16 4-5 4 3 5-7"/></svg>',
+  capacity:'<svg viewBox="0 0 24 24"><path d="M4 19V9M10 19V5M16 19v-8M22 19V3"/><path d="M2 19h22"/></svg>',
   search:'<svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/><path d="M11 8v3"/><path d="M11 14h.01"/></svg>'
 };
 
@@ -38,6 +40,15 @@ window.monitorShellSetTab=function(name){
   const shell=document.querySelector('.monitor-shell');
   const button=document.getElementById('monitorSidebarToggle');
   if(!shell||!button)return;
+  // 展开时已有可见文字，不重复显示 tooltip；收起后由 CSS 在持续悬停
+  // 1 秒时读取 data-nav-tooltip。移除原生 title，避免浏览器立即弹出。
+  shell.querySelectorAll('.monitor-sidebar .monitor-nav .tab').forEach(item=>{
+    const text=(item.querySelector('.monitor-nav-label')?.textContent||item.getAttribute('title')||'').trim();
+    if(!text)return;
+    item.dataset.navTooltip=text;
+    item.setAttribute('aria-label',text);
+    item.removeAttribute('title');
+  });
   let saved=false;
   try{saved=localStorage.getItem('nexusapi-monitor-sidebar-collapsed')==='1'}catch(e){}
   const apply=collapsed=>{

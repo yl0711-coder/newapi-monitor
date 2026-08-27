@@ -195,6 +195,12 @@ func TestRoleGating(t *testing.T) {
 	if c := do("/channels/report", "none"); c != 401 {
 		t.Errorf("未登录 /channels/report 应 401,实际 %d", c)
 	}
+	if c := do("/capacity/report", "none"); c != 401 {
+		t.Errorf("未登录 /capacity/report 应 401,实际 %d", c)
+	}
+	if c := do("/sync/overview", "none"); c != 401 {
+		t.Errorf("未登录 /sync/overview 应 401,实际 %d", c)
+	}
 	// 管理员:/data 可(200),/alert 不可(403)
 	if c := do("/data", "admin"); c != 200 {
 		t.Errorf("管理员 /data 应 200,实际 %d", c)
@@ -207,6 +213,15 @@ func TestRoleGating(t *testing.T) {
 	}
 	if c := do("/channels/report", "admin"); c != 200 {
 		t.Errorf("管理员 /channels/report 应 200,实际 %d", c)
+	}
+	if c := do("/capacity/report", "admin"); c != 200 {
+		t.Errorf("管理员 /capacity/report 应 200,实际 %d", c)
+	}
+	if c := do("/sync/overview", "admin"); c != 200 {
+		t.Errorf("管理员 /sync/overview 应 200,实际 %d", c)
+	}
+	if c := do("/sync/workloads?domain=usage", "admin"); c != 200 {
+		t.Errorf("管理员 /sync/workloads 应 200,实际 %d", c)
 	}
 	if c := do("/alert", "admin"); c != 403 {
 		t.Errorf("管理员 /alert 应 403,实际 %d", c)

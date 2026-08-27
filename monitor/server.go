@@ -63,6 +63,12 @@ var logChainJS []byte // 客户排障页交互；只访问 /logchain/* 管理员
 //go:embed channel_management.js
 var channelManagementJS []byte // 渠道管理交互；只访问 Monitor 本地渠道汇总接口
 
+//go:embed capacity.css
+var capacityCSS []byte // 容量规划独立样式，不污染现有 Monitor/Usage 页
+
+//go:embed capacity.js
+var capacityJS []byte // 只访问 /capacity/report 本地事实接口
+
 var allowedWindows = map[int]bool{15: true, 30: true, 60: true, 180: true, 360: true, 720: true, 1440: true}
 
 const maxJSONRequestBody = 4 << 20   // 4 MiB:足以覆盖节点批量上报，同时拒绝异常大请求体
@@ -173,6 +179,14 @@ func (m *Monitor) RegisterRoutes(r *gin.Engine) {
 		c.Header("Cache-Control", "no-cache")
 		c.Data(http.StatusOK, "application/javascript; charset=utf-8", channelManagementJS)
 	})
+	r.GET("/capacity.css", func(c *gin.Context) {
+		c.Header("Cache-Control", "no-cache")
+		c.Data(http.StatusOK, "text/css; charset=utf-8", capacityCSS)
+	})
+	r.GET("/capacity.js", func(c *gin.Context) {
+		c.Header("Cache-Control", "no-cache")
+		c.Data(http.StatusOK, "application/javascript; charset=utf-8", capacityJS)
+	})
 	r.GET("/logchain.js", func(c *gin.Context) {
 		c.Header("Cache-Control", "no-cache")
 		c.Data(http.StatusOK, "application/javascript; charset=utf-8", logChainJS)
@@ -199,6 +213,8 @@ func (m *Monitor) RegisterRoutes(r *gin.Engine) {
 		view.GET("/stability/problems", m.serveStabilityProblems)    // 原始错误签名:只读本地问题样本
 		view.GET("/stability/health", m.serveStabilityHealth)        // 采集新鲜度/覆盖/积压:不查生产库
 		view.GET("/stability/edge", m.serveNginxEdge)                // Nginx 入口层:只读本地脱敏分钟汇总
+		view.GET("/sync/overview", m.serveSyncOverview)              // 统一同步摘要:只读本地状态投影
+		view.GET("/sync/workloads", m.serveSyncWorkloads)            // 有界任务明细:默认仅异常成员,支持分页
 		view.GET("/channels/report", m.serveChannelManagementReport) // 渠道管理:主域名→厂商→渠道→服务分组的本地汇总
 		// 排障两个接口挂 noStoreSensitive：响应含客户标识、令牌名、渠道名/ID、
 		// 上游主域名与错误原文，属敏感诊断数据，不得被任何中间层缓存。
@@ -208,6 +224,7 @@ func (m *Monitor) RegisterRoutes(r *gin.Engine) {
 		view.GET("/logchain/filters", noStoreSensitive, m.serveLogChainFilters)            // 客户排障:筛选下拉取值(服务分组/上游域名/渠道),只读本地快照
 		view.GET("/infra", m.serveInfra)                                                   // 服务端健康监控(实例/DB/LB)快照
 		view.GET("/infra/series", m.serveInfraSeries)                                      // 按需取某资源某些指标的近 N 小时序列(展开图用)
+		view.GET("/capacity/report", m.serveCapacityReport)                                // 容量规划:只读 Monitor 本地三类脱敏事实
 		view.GET("/usage/users", m.listTrackedUsers)                                       // 用户用量:被盯名单(含分组)
 		view.GET("/usage/groups", m.listGroups)                                            // 用户用量:客户分组列表
 		view.GET("/usage/followups", m.usageAggregateAuthorizationGuard(m.serveFollowUps)) // 用户用量:待跟进清单
@@ -347,6 +364,7 @@ func (m *Monitor) retryUsageFactHistoryHandler(c *gin.Context) {
 		}
 		return
 	}
+	m.invalidateSyncStatusCache()
 	c.JSON(http.StatusAccepted, gin.H{
 		"ok": true, "user_id": in.UserID, "job_id": job.ID, "stage": job.Kind,
 		"status": job.Status, "next_hour": job.NextHour, "verify_next_hour": job.VerifyNextHour,
@@ -402,6 +420,7 @@ func (m *Monitor) requestUsageFactHistoryDayRepairHandler(c *gin.Context) {
 		}
 		return
 	}
+	m.invalidateSyncStatusCache()
 	c.JSON(http.StatusAccepted, gin.H{
 		"ok": true, "request_id": meta.RequestID, "user_id": in.UserID, "day": dayText,
 		"job_id": job.ID, "stage": job.Kind, "status": job.Status, "next_hour": job.NextHour,

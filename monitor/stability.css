@@ -12,7 +12,7 @@ body{max-width:none!important;margin:0!important;padding:0!important;overflow-x:
 .monitor-brand b{display:block;font-size:19px;line-height:1.2;letter-spacing:.01em}
 .monitor-brand small{display:block;color:var(--text-muted);font-size:13px;margin-top:4px}
 .monitor-nav.tabs{display:flex;flex-direction:column;gap:8px;margin:0;border:0}
-.monitor-nav.tabs .tab{display:flex;align-items:center;gap:12px;width:100%;padding:14px 13px;border:1px solid transparent;border-radius:12px;color:#98a3b8;font-size:16px;line-height:1;border-bottom:1px solid transparent;white-space:nowrap}
+.monitor-nav.tabs .tab{position:relative;display:flex;align-items:center;gap:12px;width:100%;padding:14px 13px;border:1px solid transparent;border-radius:12px;color:#98a3b8;font-size:16px;line-height:1;border-bottom:1px solid transparent;white-space:nowrap}
 .monitor-nav.tabs .tab:hover{color:var(--text);background:rgba(255,255,255,.025)}
 .monitor-nav.tabs .tab.active{color:#dedbff;background:rgba(99,102,241,.18);border-color:rgba(120,113,255,.1);font-weight:600}
 .monitor-nav-icon{width:23px;height:23px;display:grid;place-items:center;flex:none}
@@ -23,11 +23,13 @@ body{max-width:none!important;margin:0!important;padding:0!important;overflow-x:
 .monitor-sidebar-toggle:focus-visible{outline:2px solid #8076ff;outline-offset:2px}
 .monitor-sidebar-toggle svg{width:18px;height:18px;stroke:currentColor;fill:none;stroke-width:2;transition:transform .18s ease;flex:none}
 .monitor-shell.sidebar-collapsed{grid-template-columns:76px minmax(0,1fr)}
-.monitor-shell.sidebar-collapsed .monitor-sidebar{padding-left:10px;padding-right:10px}
+.monitor-shell.sidebar-collapsed .monitor-sidebar{padding-left:10px;padding-right:10px;overflow:visible}
 .monitor-shell.sidebar-collapsed .monitor-brand{justify-content:center;padding-left:0;padding-right:0}
 .monitor-shell.sidebar-collapsed .monitor-brand-mark{width:42px;height:42px;border-radius:13px}
 .monitor-shell.sidebar-collapsed .monitor-brand-copy,.monitor-shell.sidebar-collapsed .monitor-nav-label,.monitor-shell.sidebar-collapsed .monitor-sidebar-toggle span{display:none;opacity:0}
 .monitor-shell.sidebar-collapsed .monitor-nav.tabs .tab{justify-content:center;gap:0;padding-left:10px;padding-right:10px}
+.monitor-shell.sidebar-collapsed .monitor-nav.tabs .tab::after{content:attr(data-nav-tooltip);position:absolute;left:calc(100% + 12px);top:50%;z-index:50;transform:translateY(-50%) translateX(-3px);padding:8px 10px;border:1px solid #343c50;border-radius:8px;background:#1b2030;box-shadow:0 8px 24px rgba(0,0,0,.32);color:#e5e7eb;font-size:12px;font-weight:500;line-height:1;white-space:nowrap;pointer-events:none;opacity:0;visibility:hidden;transition:opacity .12s ease 0s,transform .12s ease 0s,visibility 0s linear .12s}
+.monitor-shell.sidebar-collapsed .monitor-nav.tabs .tab:hover::after{opacity:1;visibility:visible;transform:translateY(-50%) translateX(0);transition-delay:1s,1s,1s}
 .monitor-shell.sidebar-collapsed .monitor-sidebar-toggle svg{transform:rotate(180deg)}
 .monitor-workspace{min-width:0;width:100%;padding:0 24px 44px}
 .monitor-page-head{min-height:112px;display:flex;align-items:center;justify-content:space-between;gap:24px;border-bottom:1px solid var(--border);padding:23px 2px 20px;margin-bottom:20px}

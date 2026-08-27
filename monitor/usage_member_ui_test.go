@@ -56,11 +56,10 @@ func TestUsageMemberUIConfirmsCompanyCorrectionAndGuardsGroupDelete(t *testing.T
 	}
 }
 
-func TestUsageMemberUIShowsFullHistoryStagesAndRootRetry(t *testing.T) {
+func TestSyncStatusUIOwnsFullHistoryStagesAndRootActions(t *testing.T) {
 	for _, required := range []string{
-		"/usage/facts-history",
-		"usageFactsHistory",
-		"usageHistoryByUser",
+		"/sync/workloads?domain=usage",
+		"syncRenderFactMembers",
 		"verification_status",
 		"usageFactsStageLabel",
 		"full_history_source_audit",
@@ -73,10 +72,15 @@ func TestUsageMemberUIShowsFullHistoryStagesAndRootRetry(t *testing.T) {
 		"estimated_seconds",
 		"disk_blocked",
 		"bulk_circuit_state",
-		"仅管理员可见",
+		"if(!IS_ROOT||status!=='paused')return ''",
 	} {
 		if !strings.Contains(pageHTML, required) {
-			t.Fatalf("全历史管理员 UI 缺少契约 %q", required)
+			t.Fatalf("同步状态的全历史管理员 UI 缺少契约 %q", required)
+		}
+	}
+	for _, forbidden := range []string{"usageLoadFactsStatus", "usageMemberHistoryHTML", "usageHistoryByUser", `<th>全历史</th>`} {
+		if strings.Contains(pageHTML, forbidden) {
+			t.Fatalf("用户用量业务页仍保留全历史运维入口 %q", forbidden)
 		}
 	}
 }

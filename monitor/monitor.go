@@ -109,6 +109,15 @@ type Monitor struct {
 
 	snapMu    sync.Mutex
 	snapCache map[int]cachedSnap // 按窗口缓存快照(短 TTL),去重并发请求、给 slave 减负
+	// 基础设施最新快照与容量时序都会在本地 SQLite 上执行聚合。生产容器的
+	// /tmp 只有 16 MiB；把这两类管理页重查询串行化，避免并发临时表互相
+	// 挤占空间。它不参与采集/写入，也不改变任何业务或稳定性口径。
+	infraAggregateMu sync.Mutex
+	// 同步状态是现有领域状态的只读投影，不是第二份任务真值。短缓存只用于
+	// 合并多个管理员的页面轮询；失效或进程重启后可从本地领域表重建。
+	syncStatusMu       sync.Mutex
+	syncStatusCachedAt time.Time
+	syncStatusCached   *syncStatusSnapshot
 
 	usageGateOnce         sync.Once // 聚合/后台来源查询泳道，容量 1
 	usageGate             chan struct{}

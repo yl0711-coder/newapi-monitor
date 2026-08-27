@@ -9,14 +9,24 @@ func TestSyncStatusPageUsesLocalStatusEndpoints(t *testing.T) {
 	for _, want := range []string{
 		`data-tab="sync"`,
 		`id="tab-sync"`,
-		`/ready`,
-		`/usage/facts-status`,
-		`/usage/facts-history`,
-		`/channels/report?hours=24`,
-		`/stability/health`,
+		`/sync/overview`,
+		`/sync/workloads?domain=usage`,
 		"刷新本页不会发起 NewAPI 来源查询",
 		"syncFactMembers",
 		"syncDeactivate",
+		"syncAbort",
+		"syncWorkloadAbort",
+		"syncWorkloadSeq",
+		"syncMaintenanceAbort",
+		"syncMaintenanceSeq",
+		"syncFactMaintenance",
+		"kind=maintenance",
+		"maintenance_attention",
+		"维护、审计与修复任务",
+		"成员任务${timedOut?'读取超时'",
+		"维护任务${timedOut?'读取超时'",
+		"setTimeout(()=>{timedOut=true;controller.abort()},7000)",
+		"setTimeout(()=>{timedOut=true;controller.abort()},6000)",
 		"分页事实导入",
 		"分页水位",
 		"raw_page_source_rows",
@@ -27,6 +37,17 @@ func TestSyncStatusPageUsesLocalStatusEndpoints(t *testing.T) {
 	} {
 		if !strings.Contains(pageHTML, want) {
 			t.Fatalf("同步状态页缺少 %q", want)
+		}
+	}
+	for _, forbidden := range []string{
+		`syncFetchJSON('/ready'`,
+		`syncFetchJSON('/usage/facts-status'`,
+		`syncFetchJSON('/usage/facts-history'`,
+		`syncFetchJSON('/channels/report?hours=24'`,
+		`const [ready,facts,history,health,channels]=await Promise.all([`,
+	} {
+		if strings.Contains(pageHTML, forbidden) {
+			t.Fatalf("同步状态页仍使用分散或过重读取 %q", forbidden)
 		}
 	}
 	if strings.Contains(portalHTML, `data-tab="sync"`) || strings.Contains(portalHTML, "syncFactMembers") {
@@ -57,7 +78,7 @@ func TestSyncStatusPageRendersBothStabilityMigrationsWithCorrectFields(t *testin
 func TestSyncStatusPageAllowsHashNavigation(t *testing.T) {
 	// 白名单是完整字面量断言：新增 tab 时必须同步改这里。
 	// 这样既保证 #tab=sync 仍可直达，也能挡住"误删某个 tab 名"的回归。
-	if !strings.Contains(pageHTML, `/^(sync|model|server|usage|stability|channels|logchain)$/`) {
+	if !strings.Contains(pageHTML, `/^(sync|model|server|capacity|usage|stability|channels|logchain)$/`) {
 		t.Fatal("同步状态页必须能由 #tab=sync 直接打开")
 	}
 	if !strings.Contains(string(stabilityJS), `sync:{title:'数据同步状态'`) {
@@ -118,6 +139,10 @@ func TestSyncStatusPageShowsIndependentPricingLedgerProgress(t *testing.T) {
 func TestUsagePageKeepsOperationalProgressInSyncStatus(t *testing.T) {
 	for _, forbidden := range []string{
 		`id="usageSyncStatus"`,
+		`<th>全历史</th>`,
+		`usageLoadFactsStatus`,
+		`usageMemberHistoryHTML`,
+		`usageHistoryByUser`,
 		"全部成员近期用量已可用",
 		"逐成员进度与维护任务",
 		"⏳ 历史数据补全中",

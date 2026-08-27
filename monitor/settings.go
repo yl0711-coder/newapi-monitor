@@ -158,6 +158,9 @@ type Settings struct {
 	// 服务端健康监控(实例/数据库/负载均衡):基于 AWS Lightsail 指标接口拉取。
 	// 默认【关】——关时完全不调 AWS、不影响模型监控与现网行为。
 	InfraEnabled bool // MONITOR_INFRA_ENABLED(=true 才启用主动采样/探测)
+	// CapacityEnabled 只开放容量规划的本地读取页。它不启动 worker、
+	// 不访问 NewAPI/MySQL/Nginx/AWS，只联合展示已落盘的脱敏事实。
+	CapacityEnabled bool // MONITOR_CAPACITY_ENABLED，默认 false
 	// InfraSnapshotReadOnly 只开放已落入 Monitor SQLite 的服务端快照和曲线。
 	// 它不启动 AWS、域名、源站锁探测，也不评估/发送基础设施告警；
 	// 仅用于本机验收和其他只读快照场景。
@@ -304,6 +307,7 @@ func LoadSettings() Settings {
 		SiteName:                                 env("MONITOR_SITE_NAME", ""),
 		IngestToken:                              env("MONITOR_INGEST_TOKEN", ""),
 		InfraEnabled:                             env("MONITOR_INFRA_ENABLED", "") == "true",
+		CapacityEnabled:                          env("MONITOR_CAPACITY_ENABLED", "false") == "true",
 		InfraSnapshotReadOnly:                    env("MONITOR_INFRA_SNAPSHOT_READ_ONLY", "false") == "true",
 		AWSRegion:                                env("AWS_REGION", "us-west-2"),
 		InfraSampleSeconds:                       envInt("MONITOR_INFRA_SAMPLE_SECONDS", 300),
