@@ -1279,6 +1279,24 @@ func upstreamEndpoint(baseURL, endpoint string) string {
 	return strings.TrimRight(baseURL, "/") + "/" + strings.TrimLeft(endpoint, "/")
 }
 
+// aicodeWithEndpoint keeps legacy account records working after AICodeWith
+// moved its console API from aicodewith.com to aicodewith.ai. The rewrite is
+// deliberately limited to the exact former official host; the shared HTTP
+// client must continue rejecting redirects so credentials are never forwarded
+// to a host selected by an upstream response.
+func aicodeWithEndpoint(baseURL, endpoint string) string {
+	u, err := url.Parse(strings.TrimSpace(baseURL))
+	if err == nil && strings.EqualFold(u.Hostname(), "aicodewith.com") {
+		if port := u.Port(); port != "" {
+			u.Host = net.JoinHostPort("aicodewith.ai", port)
+		} else {
+			u.Host = "aicodewith.ai"
+		}
+		baseURL = u.String()
+	}
+	return upstreamEndpoint(baseURL, endpoint)
+}
+
 func newUpstreamHTTPClient(timeout time.Duration) *http.Client {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.MaxIdleConns = 8
@@ -1540,7 +1558,7 @@ func syncAICodeWithBalance(ctx context.Context, client *http.Client, row Channel
 	var balanceRaw, balanceUnit float64
 	var balanceCurrency string
 	for index, apiKey := range keys {
-		body, err := doUpstreamJSON(ctx, client, http.MethodGet, upstreamEndpoint(row.BaseURL, "/api/v1/balance"), map[string]string{
+		body, err := doUpstreamJSON(ctx, client, http.MethodGet, aicodeWithEndpoint(row.BaseURL, "/api/v1/balance"), map[string]string{
 			"Authorization": "Bearer " + apiKey,
 		}, nil)
 		if err != nil {

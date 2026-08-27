@@ -226,7 +226,7 @@ func fetchAICodeWithPricingDay(ctx context.Context, client *http.Client, account
 	query.Set("start", day)
 	query.Set("end", day)
 	query.Set("limit", strconv.Itoa(aiCodeWithPricingDetailsLimit))
-	body, err := doUpstreamJSON(ctx, client, http.MethodGet, upstreamEndpoint(account.BaseURL, "/api/v1/usage/details")+"?"+query.Encode(), map[string]string{"Authorization": "Bearer " + apiKey}, nil)
+	body, err := doUpstreamJSON(ctx, client, http.MethodGet, aicodeWithEndpoint(account.BaseURL, "/api/v1/usage/details")+"?"+query.Encode(), map[string]string{"Authorization": "Bearer " + apiKey}, nil)
 	if err != nil {
 		var statusErr *upstreamHTTPError
 		if errors.As(err, &statusErr) && (statusErr.Status == http.StatusUnauthorized || statusErr.Status == http.StatusForbidden) {

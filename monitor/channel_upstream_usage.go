@@ -846,7 +846,7 @@ func fetchAICodeWithUsageWindow(ctx context.Context, client *http.Client, row Ch
 	query.Set("start", startText)
 	query.Set("end", endText)
 	query.Set("group_by", "day")
-	body, err := doUpstreamJSON(ctx, client, http.MethodGet, upstreamEndpoint(row.BaseURL, "/api/v1/api-keys/usage")+"?"+query.Encode(), map[string]string{
+	body, err := doUpstreamJSON(ctx, client, http.MethodGet, aicodeWithEndpoint(row.BaseURL, "/api/v1/api-keys/usage")+"?"+query.Encode(), map[string]string{
 		"Authorization": "Bearer " + apiKey,
 	}, nil)
 	if err != nil {
