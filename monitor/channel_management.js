@@ -312,17 +312,18 @@ function upstreamSummary(upstream){
   const estimate=assessment.available
     ? assessment.status==='idle'?` · ${esc(assessment.reason||'近期无显著消耗')}`:` · 预计可用 ${Number(runway).toFixed(1)} 天`
     : assessment.reason?` · ${esc(assessment.reason)}`:'';
-  const usageStatus=upstream.usage_effective_status||upstream.usage_status;
+  const usageStatus=upstream.usage_tail_phase||upstream.usage_effective_status||upstream.usage_status;
   const usage=upstream.usage_sync_enabled
     ? usageStatus==='global_off'?' · 消费同步灰度关闭'
       :usageStatus==='stale'?' · 消费数据已陈旧'
       :usageStatus==='ok'?` · 消费账单 ${esc(shortDateTime(upstream.usage_last_success_at))} 同步`
+	  :usageStatus==='queued'?' · 消费同步等待首次调度'
       :upstream.usage_status==='unsupported'?' · 消费接口待适配'
       :upstream.usage_status==='error'||upstream.usage_status==='reconnect'?' · 消费同步待处理'
       :' · 消费等待同步'
     :'';
 	const backfill=upstream.usage_sync_enabled&&upstream.usage_worker_enabled&&!upstream.usage_backfill_done
-		?upstream.usage_backfill_last_error?' · 历史补全退避重试中':upstream.usage_backfill_progress?' · 历史补全断点续传中':' · 历史补全中'
+		?upstream.usage_history_phase==='queued'?' · 历史补全等待首次调度':upstream.usage_history_phase==='retry'?' · 历史补全退避重试中':upstream.usage_history_phase==='blocked'?' · 历史补全受阻':upstream.usage_backfill_progress?' · 历史补全断点续传中':' · 历史补全中'
 		:'';
   if(!upstream.enabled)return `<span class="neutral">${esc(upstream.provider_name||upstream.provider)} · 已停用 · ${balance}${usage}</span>`;
   if(upstream.status==='reconnect')return `<span class="bad">${esc(upstream.provider_name||upstream.provider)} · 需要重新连接 · ${balance}</span>`;
@@ -645,17 +646,23 @@ function upstreamState(status,enabled=true){
   if(status==='stale')return {label:'数据陈旧',level:'warn'};
   if(status==='global_off')return {label:'灰度关闭',level:'neutral'};
   if(status==='disabled')return {label:'未开启',level:'neutral'};
+  if(status==='queued')return {label:'等待首次同步',level:'warn'};
+  if(status==='complete')return {label:'已完成',level:'ok'};
+  if(status==='retry')return {label:'退避重试',level:'warn'};
+  if(status==='blocked')return {label:'同步受阻',level:'bad'};
+  if(status==='paging'||status==='backfilling')return {label:'历史补全',level:'warn'};
   return {label:'等待同步',level:'warn'};
 }
 function renderUpstreamStatus(account){
   const el=$('cmUpstreamStatus');if(!el)return;
   if(!account?.configured){el.hidden=true;el.innerHTML='';return}
   const balanceState=upstreamState(account.status,account.enabled);
-  const usageState=account.usage_sync_enabled?upstreamState(account.usage_effective_status||account.usage_status,account.enabled):{label:'未开启',level:'neutral'};
+  const usageState=account.usage_sync_enabled?upstreamState(account.usage_tail_phase||account.usage_effective_status||account.usage_status,account.enabled):{label:'未开启',level:'neutral'};
+  const historyState=account.usage_sync_enabled?upstreamState(account.usage_history_phase,account.enabled):{label:'未开启',level:'neutral'};
   const balance=account.balance_usd==null?'尚未取得余额':`当前余额 ${usd(account.balance_usd)}`;
   const adapter=account.usage_adapter_name||'尚未确定同步适配器';
   const granularity=account.usage_granularity==='day'?'按天汇总':'按小时汇总';
-  const backfill=account.usage_backfill_done?'历史补数已完成':account.usage_backfill_last_error?'历史补数退避重试':account.usage_backfill_progress?'历史补数断点续传':'历史补数中';
+  const backfill=account.usage_history_phase==='complete'?'历史补数已完成':account.usage_history_phase==='queued'?'历史补数等待首次调度':account.usage_history_phase==='retry'?'历史补数退避重试':account.usage_history_phase==='blocked'?'历史补数受阻':account.usage_backfill_progress?'历史补数断点续传':'历史补数中';
   const balanceError=account.last_error?`<em class="cm-upstream-status-error">余额错误：${esc(account.last_error)}</em>`:'';
   const usageError=account.usage_last_error?`<em class="cm-upstream-status-error">当天追平：${esc(account.usage_last_error)}</em>`:'';
   const historyError=account.usage_backfill_last_error?`<em class="cm-upstream-status-error">历史补数：${esc(account.usage_backfill_last_error)}</em>`:'';
@@ -664,7 +671,7 @@ function renderUpstreamStatus(account){
   el.innerHTML=`<div class="cm-upstream-status-head"><div><small>${esc(account.provider_name||account.provider||'上游账户')}</small><b>${esc(account.account_masked||'已配置账户')}</b></div><span>${account.enabled?'后台自动同步已开启':'后台自动同步已停用'}</span></div>
     <div class="cm-upstream-status-grid">
       <section class="cm-upstream-status-lane"><header><b>余额快照</b><span class="cm-upstream-status-chip ${balanceState.level}">${balanceState.label}</span></header><strong>${esc(balance)}</strong><span>最近成功 ${esc(dateTime(account.last_success_at))}<br>下次计划 ${esc(dateTime(account.next_sync_at))}</span>${account.unit_assumed?'<em>NewAPI 未公开换算单位，暂按默认 500,000 quota / USD 展示</em>':''}${balanceError}</section>
-      <section class="cm-upstream-status-lane"><header><b>上游消费账单</b><span class="cm-upstream-status-chip ${usageState.level}">${usageState.label}</span></header>${account.usage_sync_enabled&&!account.usage_worker_enabled?'<strong>全局灰度闸门已关闭</strong><span>配置已保留，当前不会访问上游；余额同步不受影响。</span>':account.usage_sync_enabled?`<strong>${esc(adapter)} · ${esc(granularity)}</strong><span>当天水位 ${esc(dateTime(account.usage_data_until))}<br>最近成功 ${esc(dateTime(account.usage_last_success_at))} · 下次 ${esc(dateTime(account.usage_next_sync_at))}</span><div class="cm-upstream-status-progress"><span><small>当天追平</small><b>${esc(usageState.label)}</b></span><span><small>历史任务</small><b>${esc(backfill)}</b></span></div>${usageError}${historyError}${historyProgress}`:'<strong>消费同步未开启</strong><span>开启后才会低频读取该上游；页面查询始终只读 Monitor 本地 SQLite。</span>'}</section>
+      <section class="cm-upstream-status-lane"><header><b>上游消费账单</b><span class="cm-upstream-status-chip ${usageState.level}">${usageState.label}</span></header>${account.usage_sync_enabled&&!account.usage_worker_enabled?'<strong>全局灰度闸门已关闭</strong><span>配置已保留，当前不会访问上游；余额同步不受影响。</span>':account.usage_sync_enabled?`<strong>${esc(adapter)} · ${esc(granularity)}</strong><span>当天水位 ${esc(dateTime(account.usage_data_until))}<br>最近成功 ${esc(dateTime(account.usage_last_success_at))} · 下次 ${esc(dateTime(account.usage_next_sync_at))}</span><div class="cm-upstream-status-progress"><span><small>当天追平</small><b>${esc(usageState.label)}</b></span><span><small>历史任务</small><b class="${esc(historyState.level)}">${esc(backfill)}</b></span></div>${usageError}${historyError}${historyProgress}`:'<strong>消费同步未开启</strong><span>开启后才会低频读取该上游；页面查询始终只读 Monitor 本地 SQLite。</span>'}</section>
     </div>`;
   el.hidden=false;
 }

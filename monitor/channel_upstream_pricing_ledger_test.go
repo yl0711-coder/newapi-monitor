@@ -3,6 +3,7 @@ package monitor
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -1003,25 +1004,28 @@ func TestPricingLedgerTailHourCannotDeleteHistoricalCheckpoint(t *testing.T) {
 	}
 }
 
-func TestPricingLedgerDoesNotShareStableUpstreamWorkerLock(t *testing.T) {
+func TestPricingLedgerYieldsToSameAccountCredentialOperation(t *testing.T) {
 	var calls atomic.Int64
 	server := newPricingLedgerFixtureServer(t, http.StatusOK, &calls)
 	m := newChannelUpstreamTestMonitor(t)
 	row, _, _ := seedPricingFailureIsolation(t, m, server)
-	m.upstreamSyncMu.Lock()
-	defer m.upstreamSyncMu.Unlock()
+	release, err := m.acquireUpstreamAccountAdmin(context.Background(), row.Domain)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
 	done := make(chan error, 1)
 	go func() {
-		_, err := m.syncStoredNewAPIPricing(context.Background(), row.Domain)
+		_, err := m.syncStoredUpstreamPricing(context.Background(), row.Domain)
 		done <- err
 	}()
 	select {
 	case err := <-done:
-		if err != nil {
-			t.Fatal(err)
+		if !errors.Is(err, errUpstreamAccountBusy) {
+			t.Fatalf("pricing worker did not yield to same-account credential operation: %v", err)
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("pricing shadow worker waited on the stable balance/usage worker lock")
+		t.Fatal("pricing shadow worker blocked instead of yielding immediately")
 	}
 }
 

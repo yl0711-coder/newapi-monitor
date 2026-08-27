@@ -369,9 +369,10 @@ func (m *Monitor) fetchAICodeWithPricingDay(ctx context.Context, account Channel
 		budget = 1
 	}
 	processed := 0
+	pacer := newUpstreamUsageRequestPacer(max(1, budget), m.aiCodeWithRequestInterval())
 	for checkpoint.NextCredential < len(normalized.Slots) && processed < budget {
 		slot := normalized.Slots[checkpoint.NextCredential]
-		items, fetchErr := fetchAICodeWithPricingDay(ctx, m.channelUpstreamHTTPClient(), account, slot.Secret, dayTs, newUpstreamUsageRequestPacer(1, 0))
+		items, fetchErr := fetchAICodeWithPricingDay(ctx, m.channelUpstreamHTTPClient(), account, slot.Secret, dayTs, pacer)
 		if fetchErr != nil {
 			return nil, "", false, fetchErr
 		}

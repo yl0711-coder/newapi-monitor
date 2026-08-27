@@ -24,3 +24,5 @@ services:
       MONITOR_STABILITY_ENABLED: "false"
       MONITOR_STABILITY_BACKFILL_ENABLED: "false"
       MONITOR_STABILITY_AUTO_REPAIR: "false"
+      # 容量规划只读已复制的 Monitor SQLite，不启动新 worker。
+      MONITOR_CAPACITY_ENABLED: "true"

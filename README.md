@@ -56,7 +56,8 @@ docker run -d --name newapi-monitor \
 | `MONITOR_UPSTREAM_SYNC_MINUTES` | NewAPI / Sub2API 上游账户余额正常同步间隔；失败自动指数退避 | `5` |
 | `MONITOR_UPSTREAM_SYNC_TIMEOUT_SECONDS` | 单个上游同步请求超时 | `15` |
 | `MONITOR_UPSTREAM_USAGE_SYNC_ENABLED` | 上游消费日志后台同步的独立灰度闸门；首次发布不会访问上游，验证后再显式开启 | `false` |
-| `MONITOR_UPSTREAM_USAGE_SYNC_MINUTES` | 上游消费账单当天尾部刷新间隔；支持 NewAPI 分页日志、Sub2API 小时汇总（旧版回退单日汇总）和 AICodeWith 按 Key 日账单；只有全局灰度闸门和账户开关都开启时运行，历史补全独立退避，所有上游请求全局串行 | `30` |
+| `MONITOR_UPSTREAM_USAGE_SYNC_MINUTES` | 上游消费账单当天尾部刷新间隔；支持 NewAPI 分页日志、Sub2API 小时汇总（旧版回退单日汇总）和 AICodeWith 按 Key 日账单；AICodeWith 始终至少 30 分钟 | `20` |
+| `MONITOR_UPSTREAM_MAX_CONCURRENCY` | 不同上游主机的全局并发上限；同一主机始终串行，当前硬上限为 2，生产先以 1 灰度 | `1` |
 | `MONITOR_UPSTREAM_USAGE_BACKFILL_DAYS` | 首次低频补全的上游账户使用日志天数 | `90` |
 | `MONITOR_ADDR` | 监听地址 | `:8090` |
 | `MONITOR_PORTAL_ADDR` | 客户用量门户独立监听地址；留空则不启用 | 留空 |

@@ -224,15 +224,20 @@ type Monitor struct {
 	adminLim   *portalLimiter    // 管理端登录限流(按来源 IP)
 	exportLim  *exportLimiter    // 客户端日志导出限流(每组织账号 1 次/5min,仅计成功下载)
 
-	// 上游账户余额同步只访问各上游公开面板 API，结果和加密凭据均落 Monitor 本地库。
-	// 全局串行锁同时保护 Sub2API 的旋转 refresh token，避免后台同步与人工刷新抢用旧 token。
-	upstreamSyncMu sync.Mutex
+	// 上游账户操作按域名隔离。它既保护 Sub2API 的旋转 refresh token，
+	// 又避免一个高量账户的历史补数阻塞其他上游和管理员配置保存。
+	// 后台获取采用 try-lock，管理员保存采用有界等待并享有下一轮优先权。
+	upstreamAccountGatesMu sync.Mutex
+	upstreamAccountGates   map[string]*upstreamAccountGate
 	// 计价影子账本拥有独立串行锁，不占用余额/旧使用日志的粗粒度互斥；
 	// 请求级主机节流与熔断仍由 upstreamHostGuard 共享，避免打爆上游。
 	upstreamPricingMu            sync.Mutex
 	upstreamClient               *http.Client
 	upstreamCredentialPersistent bool
-	upstreamBalanceAlertLastEval atomic.Int64 // 动态余额评估最多与余额同步同频，避免每分钟重复扫本地小时汇总
+	// 仅供确定性测试缩短多 Key 节流等待；生产构造始终为 0，并使用协议安全默认值。
+	upstreamAICodeWithInterval   time.Duration
+	upstreamUsageTailBatches     atomic.Uint64 // Tail 连续批次数；用于在 SLA 内给历史补数有界让路
+	upstreamBalanceAlertLastEval atomic.Int64  // 动态余额评估最多与余额同步同频，避免每分钟重复扫本地小时汇总
 }
 
 // cachedSnap 是一次快照的缓存项。

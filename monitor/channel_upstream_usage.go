@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"net"
 	"net/http"
 	"net/url"
 	"sort"
@@ -39,16 +40,43 @@ const (
 	// AICodeWith 的按 Key 账单接口最多接受 31 个中国自然日。
 	// 历史每轮一次请求批量补齐，避免把按天聚合接口退化为逐日请求。
 	aiCodeWithUsageMaxDays = 31
-	// 文档约定每把 Key 最多 10 次/分钟。一轮最多当天+历史两次，
-	// 两次之间保留 6 秒；轮次又由全局串行锁约束，不会发生补数突发。
+	// 文档约定每把 Key 最多 10 次/分钟。多 Key 账户内的所有请求也共用
+	// 同一个 8 秒节流器，避免逐 Key 新建节流器后瞬时打满上游账户限额。
 	aiCodeWithUsageMaxRequestsPerRun = 2
-	aiCodeWithUsageRequestInterval   = 6 * time.Second
+	aiCodeWithUsageRequestInterval   = 8 * time.Second
 	aiCodeWithKeysPerTurn            = 4
-	upstreamUsageAdapterNewAPILog    = "newapi_log"
-	upstreamUsageAdapterSub2Trend    = "sub2api_trend"
-	upstreamUsageAdapterSub2Stats    = "sub2api_stats"
-	upstreamUsageAdapterAICodeWith   = "aicodewith_key"
+	// The scheduler selects one bounded batch per turn (one account by default,
+	// at most two distinct hosts after explicit rollout). A short cadence removes
+	// the old one-minute idle gap; per-account next_sync_at and host protection
+	// still enforce the actual request frequency.
+	upstreamUsageSchedulerInterval = 10 * time.Second
+	upstreamUsageAdapterNewAPILog  = "newapi_log"
+	upstreamUsageAdapterSub2Trend  = "sub2api_trend"
+	upstreamUsageAdapterSub2Stats  = "sub2api_stats"
+	upstreamUsageAdapterAICodeWith = "aicodewith_key"
+	// Tail 与历史补数是两条调度泳道。管理员手动同步仍走 auto，后台必须
+	// 显式选择一条，防止一个历史密集小时占满整轮而拖延其他账户的 Tail。
+	upstreamUsageLaneAuto    upstreamUsageLane = "auto"
+	upstreamUsageLaneTail    upstreamUsageLane = "tail"
+	upstreamUsageLaneHistory upstreamUsageLane = "history"
+	// 历史是可恢复的低优先级工作。20 次请求/45 秒足够连续推进，又能在
+	// Tail 到期前及时让出调度器；断点会保留在 SQLite，下轮继续。
+	upstreamUsageHistoryMaxRequestsPerRun = 20
+	upstreamUsageHistoryOperationTimeout  = 45 * time.Second
+	// Tail 持续有流量时，每完成 4 个 Tail 批次允许 1 个历史批次；但只要
+	// 最老 Tail 已逾期超过 5 分钟，就继续优先追新，不为历史让路。
+	upstreamUsageHistoryFairnessTailBatches = 4
+	upstreamUsageTailOverdueGuard           = 5 * time.Minute
 )
+
+type upstreamUsageLane string
+
+func (m *Monitor) aiCodeWithRequestInterval() time.Duration {
+	if m != nil && m.upstreamAICodeWithInterval > 0 {
+		return m.upstreamAICodeWithInterval
+	}
+	return aiCodeWithUsageRequestInterval
+}
 
 type upstreamUsageResult struct {
 	Hours     []ChannelUpstreamUsageHour
@@ -69,6 +97,15 @@ func cstDayStart(ts int64) int64 {
 
 func nextUpstreamUsageSyncAt(s Settings, domain string, now int64, failures int) int64 {
 	return nextUpstreamUsageScheduledAt(s, domain+":tail", now, failures)
+}
+
+func nextUpstreamUsageSyncAtForProvider(s Settings, provider, domain string, now int64, failures int) int64 {
+	// AICodeWith 是多 Key 账户级账单接口，且线上已经观察到 429。即使其他
+	// 适配器提速到 20 分钟，也为该提供方保留至少 30 分钟的 Tail 间隔。
+	if provider == upstreamProviderAICodeWith && upstreamUsageSyncMinutes(s) < 30 {
+		s.UpstreamUsageSyncMinutes = 30
+	}
+	return nextUpstreamUsageSyncAt(s, domain, now, failures)
 }
 
 func nextUpstreamUsageBackfillAt(s Settings, domain string, now int64, failures int) int64 {
@@ -102,6 +139,73 @@ func nextUpstreamUsageScheduledAt(s Settings, scheduleKey string, now int64, fai
 	return now + base + jitter
 }
 
+var upstreamUsageTransientRetryDelays = [...]time.Duration{
+	2 * time.Minute, 5 * time.Minute, 15 * time.Minute, 30 * time.Minute, time.Hour,
+}
+
+var upstreamUsageLocalStoreRetryDelays = [...]time.Duration{
+	10 * time.Second, 30 * time.Second, time.Minute, 2 * time.Minute,
+}
+
+func upstreamUsageRetryDelay(delays []time.Duration, failures int) time.Duration {
+	index := failures - 1
+	if index < 0 {
+		index = 0
+	}
+	if index >= len(delays) {
+		index = len(delays) - 1
+	}
+	return delays[index]
+}
+
+func isUpstreamUsageLocalStoreBusy(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "database is locked") || strings.Contains(message, "database is busy") || strings.Contains(message, "sqlite_busy")
+}
+
+func isUpstreamUsageTransientFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		return true
+	}
+	var statusErr *upstreamHTTPError
+	if errors.As(err, &statusErr) {
+		return statusErr.Status == http.StatusRequestTimeout || statusErr.Status == http.StatusTooEarly || statusErr.Status >= 500
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "timeout") || strings.Contains(message, "deadline exceeded") ||
+		strings.Contains(message, "connection reset") || strings.Contains(message, "connection refused") ||
+		strings.Contains(message, "unexpected eof") || strings.Contains(message, "broken pipe") ||
+		strings.Contains(message, "no such host")
+}
+
+func upstreamUsageFailureRetryAt(s Settings, domain string, now int64, failures int, err error, scheduleKey string) int64 {
+	if retryAt := upstreamRetryAt(err); retryAt > now {
+		return retryAt
+	}
+	if isUpstreamUsageLocalStoreBusy(err) {
+		return now + int64(upstreamUsageRetryDelay(upstreamUsageLocalStoreRetryDelays[:], failures)/time.Second)
+	}
+	if isUpstreamUsageTransientFailure(err) {
+		return now + int64(upstreamUsageRetryDelay(upstreamUsageTransientRetryDelays[:], failures)/time.Second)
+	}
+	var statusErr *upstreamHTTPError
+	if errors.As(err, &statusErr) && statusErr.Status == http.StatusTooManyRequests {
+		return now + int64(upstreamRetryAfterDefault/time.Second)
+	}
+	// 响应格式或适配器错误通常不是秒级自愈，保持低频但有上限的探测。
+	return nextUpstreamUsageScheduledAt(s, domain+":"+scheduleKey+":other", now, max(1, failures))
+}
+
 func upstreamUsageOperationTimeout(s Settings) time.Duration {
 	// Leave enough wall-clock budget for a fast upstream to consume the full
 	// guarded request allowance. Slow responses are still bounded by the hard
@@ -115,6 +219,13 @@ func upstreamUsageOperationTimeout(s Settings) time.Duration {
 		return 2 * time.Minute
 	}
 	return timeout
+}
+
+func upstreamUsageOperationTimeoutForLane(s Settings, lane upstreamUsageLane) time.Duration {
+	if lane == upstreamUsageLaneHistory {
+		return upstreamUsageHistoryOperationTimeout
+	}
+	return upstreamUsageOperationTimeout(s)
 }
 
 // sha256Sum 隔离使用日志调度的 hash 细节，避免把凭据混入调度输入。
@@ -1048,9 +1159,10 @@ func (m *Monitor) stageAICodeWithKeyResult(ctx context.Context, round AICodeWith
 				return err
 			}
 		}
-		state.SourceKeyID, state.Status, state.LastError = result.SourceKeyID, upstreamStatusOK, ""
-		state.LastAttemptAt, state.LastSuccessAt, state.ConsecutiveFails, state.NextSyncAt, state.UpdatedAt = now, now, 0, 0, now
+		state.SourceKeyID, state.UpdatedAt = result.SourceKeyID, now
 		if round.Kind == "tail" {
+			state.Status, state.LastError = upstreamStatusOK, ""
+			state.LastAttemptAt, state.LastSuccessAt, state.ConsecutiveFails, state.NextSyncAt = now, now, 0, 0
 			state.TailRoundID = round.RoundID
 		} else {
 			state.BackfillRoundID = round.RoundID
@@ -1061,23 +1173,31 @@ func (m *Monitor) stageAICodeWithKeyResult(ctx context.Context, round AICodeWith
 }
 
 func (m *Monitor) recordAICodeWithKeyFailure(ctx context.Context, round AICodeWithUsageRound, state *AICodeWithKeySyncState, err error, secret string, now int64) error {
+	sanitized := sanitizeUpstreamErrorWithSecrets(err, secret)
+	if round.Kind == "backfill" {
+		state.UpdatedAt = now
+		state.BackfillLastError = sanitized
+		state.BackfillConsecutiveFails++
+		state.BackfillNextSyncAt = upstreamUsageFailureRetryAt(m.cfg, round.Domain, now, state.BackfillConsecutiveFails, err, round.Kind+":"+state.SlotID)
+		var authErr *upstreamAuthError
+		if errors.As(err, &authErr) {
+			// 凭据失效不是历史车道专属问题；只有这种证据才同时隔离 Tail。
+			state.Status, state.LastError = upstreamStatusReconnect, sanitized
+			state.LastAttemptAt = now
+			state.ConsecutiveFails++
+			state.NextSyncAt = upstreamAccountIsolatedUntil
+			state.BackfillNextSyncAt = upstreamAccountIsolatedUntil
+		}
+		return m.storeDB.WithContext(ctx).Save(state).Error
+	}
 	state.Status = upstreamStatusError
 	state.LastAttemptAt, state.UpdatedAt = now, now
-	state.LastError = sanitizeUpstreamErrorWithSecrets(err, secret)
+	state.LastError = sanitized
 	state.ConsecutiveFails++
-	delay := int64(60 * (1 << min(state.ConsecutiveFails-1, 4)))
-	state.NextSyncAt = now + delay
+	state.NextSyncAt = upstreamUsageFailureRetryAt(m.cfg, round.Domain, now, state.ConsecutiveFails, err, round.Kind+":"+state.SlotID)
 	var authErr *upstreamAuthError
 	if errors.As(err, &authErr) {
 		state.Status, state.NextSyncAt = upstreamStatusReconnect, upstreamAccountIsolatedUntil
-	}
-	if retryAt := upstreamRetryAt(err); retryAt > state.NextSyncAt {
-		state.NextSyncAt = retryAt
-	}
-	if round.Kind == "backfill" {
-		state.BackfillLastError = state.LastError
-		state.BackfillConsecutiveFails++
-		state.BackfillNextSyncAt = state.NextSyncAt
 	}
 	return m.storeDB.WithContext(ctx).Save(state).Error
 }
@@ -1190,11 +1310,17 @@ func (m *Monitor) processAICodeWithRound(ctx context.Context, row *ChannelUpstre
 		secretByID[slot.SlotID] = slot.Secret
 	}
 	processed := 0
+	// 单个账户无论有多少 Key 都共享同一个请求节流器；否则每把 Key 各自的
+	// “第一个请求”会同时发出，实际仍可能触发账户级 429。
+	roundPacer := newUpstreamUsageRequestPacer(max(1, budget), m.aiCodeWithRequestInterval())
 	for _, i := range selectAICodeWithKeyStatesForTurn(states, round, kind, now, budget) {
 		state := &states[i]
-		result, fetchErr := fetchAICodeWithUsageWindow(ctx, m.channelUpstreamHTTPClient(), *row, secretByID[state.SlotID], round.WindowFrom, round.WindowTo, newUpstreamUsageRequestPacer(aiCodeWithUsageMaxRequestsPerRun, 0))
+		result, fetchErr := fetchAICodeWithUsageWindow(ctx, m.channelUpstreamHTTPClient(), *row, secretByID[state.SlotID], round.WindowFrom, round.WindowTo, roundPacer)
 		if fetchErr == nil {
 			fetchErr = m.stageAICodeWithKeyResult(ctx, round, state, result, now)
+		}
+		if errors.Is(fetchErr, context.Canceled) {
+			return false, 0, processed, fetchErr
 		}
 		if fetchErr != nil {
 			if persistErr := m.recordAICodeWithKeyFailure(ctx, round, state, fetchErr, secretByID[state.SlotID], now); persistErr != nil {
@@ -1202,6 +1328,14 @@ func (m *Monitor) processAICodeWithRound(ctx context.Context, row *ChannelUpstre
 			}
 		}
 		processed++
+		// 认证错误只隔离当前 Key，继续验证其他 Key；而限流、主机熔断、
+		// 超时和 5xx 属于账户/主机级信号，本轮立即止步，避免一个故障
+		// 被剩余 Key 放大为请求风暴。未处理 Key 保持 pending，下轮续跑。
+		var authErr *upstreamAuthError
+		if fetchErr != nil && !errors.As(fetchErr, &authErr) &&
+			(upstreamRetryAt(fetchErr) > now || isUpstreamUsageTransientFailure(fetchErr)) {
+			break
+		}
 		if ctx.Err() != nil {
 			break
 		}
@@ -1309,7 +1443,7 @@ func isolateAICodeWithUsageAccount(row *ChannelUpstreamAccount) error {
 	return err
 }
 
-func (m *Monitor) syncStoredAICodeWithUsage(ctx context.Context, row *ChannelUpstreamAccount, cred aiCodeWithCredential, now int64) error {
+func (m *Monitor) syncStoredAICodeWithUsage(ctx context.Context, row *ChannelUpstreamAccount, cred aiCodeWithCredential, now int64, lane upstreamUsageLane) error {
 	normalized, err := normalizeAICodeWithCredential(cred)
 	if err != nil {
 		return err
@@ -1321,13 +1455,17 @@ func (m *Monitor) syncStoredAICodeWithUsage(ctx context.Context, row *ChannelUps
 	total := len(normalized.Slots)
 	budget := aiCodeWithKeysPerTurn
 	today := cstDayStart(now)
-	if row.UsageNextSyncAt == 0 || row.UsageNextSyncAt <= now {
+	if lane != upstreamUsageLaneHistory && (row.UsageNextSyncAt == 0 || row.UsageNextSyncAt <= now) {
 		published, done, used, roundErr := m.processAICodeWithRound(ctx, row, normalized, version, "tail", today, now, now, budget)
 		budget -= used
 		row.UsageLastAttemptAt = now
 		if roundErr != nil {
+			if errors.Is(roundErr, context.Canceled) {
+				return roundErr
+			}
 			row.UsageStatus, row.UsageLastError = upstreamStatusError, sanitizeUpstreamError(roundErr)
-			row.UsageNextSyncAt = now + 60
+			row.UsageConsecutiveFails++
+			row.UsageNextSyncAt = upstreamUsageFailureRetryAt(m.cfg, row.Domain, now, row.UsageConsecutiveFails, roundErr, "tail")
 			return roundErr
 		}
 		if !published {
@@ -1347,7 +1485,10 @@ func (m *Monitor) syncStoredAICodeWithUsage(ctx context.Context, row *ChannelUps
 		}
 		row.UsageStatus, row.UsageLastError = upstreamStatusOK, ""
 		row.UsageLastSuccessAt, row.UsageConsecutiveFails = now, 0
-		row.UsageNextSyncAt = nextUpstreamUsageSyncAt(m.cfg, row.Domain, now, 0)
+		row.UsageNextSyncAt = nextUpstreamUsageSyncAtForProvider(m.cfg, row.Provider, row.Domain, now, 0)
+	}
+	if lane == upstreamUsageLaneTail {
+		return nil
 	}
 	if row.UsageBackfillCursor == 0 {
 		row.UsageBackfillCursor = cstDayStart(now - int64(upstreamUsageBackfillDays(m.cfg))*86400)
@@ -1366,9 +1507,12 @@ func (m *Monitor) syncStoredAICodeWithUsage(ctx context.Context, row *ChannelUps
 	published, done, _, roundErr := m.processAICodeWithRound(ctx, row, normalized, version, "backfill", row.UsageBackfillCursor, to, now, budget)
 	row.UsageBackfillLastAttemptAt = now
 	if roundErr != nil {
+		if errors.Is(roundErr, context.Canceled) {
+			return roundErr
+		}
 		row.UsageBackfillLastError = sanitizeUpstreamError(roundErr)
 		row.UsageBackfillConsecutiveFails++
-		row.UsageBackfillNextSyncAt = now + 60
+		row.UsageBackfillNextSyncAt = upstreamUsageFailureRetryAt(m.cfg, row.Domain, now, row.UsageBackfillConsecutiveFails, roundErr, "history")
 		return roundErr
 	}
 	if !published {
@@ -1436,7 +1580,7 @@ func applyUpstreamUsageResult(row *ChannelUpstreamAccount, result upstreamUsageR
 			row.UsageAdapter = result.Adapter
 		}
 		row.UsageConsecutiveFails = 0
-		row.UsageNextSyncAt = nextUpstreamUsageSyncAt(s, row.Domain, now, 0)
+		row.UsageNextSyncAt = nextUpstreamUsageSyncAtForProvider(s, row.Provider, row.Domain, now, 0)
 		return
 	}
 	row.UsageLastError = sanitizeUpstreamErrorWithSecrets(err, secrets...)
@@ -1447,10 +1591,7 @@ func applyUpstreamUsageResult(row *ChannelUpstreamAccount, result upstreamUsageR
 		row.UsageNextSyncAt = upstreamAccountIsolatedUntil
 	} else {
 		row.UsageStatus = upstreamStatusError
-		row.UsageNextSyncAt = nextUpstreamUsageSyncAt(s, row.Domain, now, row.UsageConsecutiveFails)
-	}
-	if retryAt := upstreamRetryAt(err); retryAt > row.UsageNextSyncAt {
-		row.UsageNextSyncAt = retryAt
+		row.UsageNextSyncAt = upstreamUsageFailureRetryAt(s, row.Domain, now, row.UsageConsecutiveFails, err, "tail")
 	}
 }
 
@@ -1503,6 +1644,17 @@ func planUpstreamUsageSync(row ChannelUpstreamAccount, now int64, backfillDays i
 	return plan
 }
 
+func planUpstreamUsageSyncForLane(row ChannelUpstreamAccount, now int64, backfillDays int, lane upstreamUsageLane) upstreamUsageSyncPlan {
+	plan := planUpstreamUsageSync(row, now, backfillDays)
+	switch lane {
+	case upstreamUsageLaneTail:
+		plan.backfillFrom, plan.backfillTo = 0, 0
+	case upstreamUsageLaneHistory:
+		plan.tailFrom, plan.tailTo = 0, 0
+	}
+	return plan
+}
+
 func applyUpstreamUsageBackfillResult(row *ChannelUpstreamAccount, err error, now int64, s Settings, secrets ...string) {
 	row.UsageBackfillLastAttemptAt = now
 	if err == nil {
@@ -1527,10 +1679,7 @@ func applyUpstreamUsageBackfillResult(row *ChannelUpstreamAccount, err error, no
 		row.UsageNextSyncAt = upstreamAccountIsolatedUntil
 		row.UsageBackfillNextSyncAt = upstreamAccountIsolatedUntil
 	} else {
-		row.UsageBackfillNextSyncAt = nextUpstreamUsageBackfillAt(s, row.Domain, now, row.UsageBackfillConsecutiveFails)
-	}
-	if retryAt := upstreamRetryAt(err); retryAt > row.UsageBackfillNextSyncAt {
-		row.UsageBackfillNextSyncAt = retryAt
+		row.UsageBackfillNextSyncAt = upstreamUsageFailureRetryAt(s, row.Domain, now, row.UsageBackfillConsecutiveFails, err, "history")
 	}
 }
 
@@ -1570,11 +1719,32 @@ func coupleUpstreamUsageHistoryRetryToTail(row *ChannelUpstreamAccount) {
 }
 
 func (m *Monitor) syncStoredUpstreamUsage(ctx context.Context, domain string) (ChannelUpstreamAccount, error) {
-	m.upstreamSyncMu.Lock()
-	defer m.upstreamSyncMu.Unlock()
+	return m.syncStoredUpstreamUsageWithPriority(ctx, domain, false, upstreamUsageLaneAuto)
+}
+
+func (m *Monitor) syncStoredUpstreamUsageBackground(ctx context.Context, domain string) (ChannelUpstreamAccount, error) {
+	return m.syncStoredUpstreamUsageWithPriority(ctx, domain, true, upstreamUsageLaneAuto)
+}
+
+func (m *Monitor) syncStoredUpstreamUsageLaneBackground(ctx context.Context, domain string, lane upstreamUsageLane) (ChannelUpstreamAccount, error) {
+	return m.syncStoredUpstreamUsageWithPriority(ctx, domain, true, lane)
+}
+
+func (m *Monitor) syncStoredUpstreamUsageWithPriority(ctx context.Context, domain string, background bool, lane upstreamUsageLane) (ChannelUpstreamAccount, error) {
+	var release func()
+	var err error
+	if background {
+		release, err = m.tryAcquireUpstreamAccountBackground(domain)
+	} else {
+		release, err = m.acquireUpstreamAccountAdmin(ctx, domain)
+	}
+	if err != nil {
+		return ChannelUpstreamAccount{Domain: domain}, err
+	}
+	defer release()
 	var row ChannelUpstreamAccount
-	if err := m.storeDB.WithContext(ctx).First(&row, "domain = ?", domain).Error; err != nil {
-		return row, err
+	if loadErr := m.storeDB.WithContext(ctx).First(&row, "domain = ?", domain).Error; loadErr != nil {
+		return row, loadErr
 	}
 	if !row.Enabled || !row.UsageSyncEnabled {
 		return row, fmt.Errorf("该上游账户未启用使用日志同步")
@@ -1601,7 +1771,7 @@ func (m *Monitor) syncStoredUpstreamUsage(ctx context.Context, domain string) (C
 		return row, err
 	}
 	if cred, ok := credential.(aiCodeWithCredential); ok && row.Provider == upstreamProviderAICodeWith {
-		err = m.syncStoredAICodeWithUsage(ctx, &row, cred, now)
+		err = m.syncStoredAICodeWithUsage(ctx, &row, cred, now, lane)
 		if persistErr := m.persistUpstreamAccount(ctx, &row); persistErr != nil {
 			return row, persistErr
 		}
@@ -1639,8 +1809,12 @@ func (m *Monitor) syncStoredUpstreamUsage(ctx context.Context, domain string) (C
 	default:
 		return row, fmt.Errorf("%s 凭据格式无效", upstreamProviderName(row.Provider))
 	}
-	plan := planUpstreamUsageSync(row, now, upstreamUsageBackfillDays(m.cfg))
-	pacer := newUpstreamUsageRequestPacer(upstreamUsageMaxRequestsPerRun, upstreamUsageRequestInterval)
+	plan := planUpstreamUsageSyncForLane(row, now, upstreamUsageBackfillDays(m.cfg), lane)
+	requestBudget := upstreamUsageMaxRequestsPerRun
+	if lane == upstreamUsageLaneHistory {
+		requestBudget = upstreamUsageHistoryMaxRequestsPerRun
+	}
+	pacer := newUpstreamUsageRequestPacer(requestBudget, upstreamUsageRequestInterval)
 	operationRetryAt := int64(0)
 	if row.UsageBackfillCursor == 0 {
 		row.UsageBackfillCursor = cstDayStart(now - int64(upstreamUsageBackfillDays(m.cfg))*86400)
@@ -1652,9 +1826,15 @@ func (m *Monitor) syncStoredUpstreamUsage(ctx context.Context, domain string) (C
 	historyRan := false
 	if tailRan {
 		result, err = syncUsage(ctx, plan.tailFrom, plan.tailTo, pacer)
+		if errors.Is(err, context.Canceled) {
+			return row, err
+		}
 		operationRetryAt = upstreamRetryAt(err)
 		if err == nil {
 			err = m.persistUpstreamUsageWindow(ctx, row.Domain, plan.tailFrom, plan.tailTo, result.Hours, now)
+		}
+		if errors.Is(err, context.Canceled) {
+			return row, err
 		}
 	}
 	if tailRan {
@@ -1673,6 +1853,9 @@ func (m *Monitor) syncStoredUpstreamUsage(ctx context.Context, domain string) (C
 			for cursor < today {
 				windowTo := cursor + 3600
 				history, progress, complete, historyErr := m.syncNewAPIUsageBackfillWindow(ctx, row, credential.(newAPICredential), cursor, windowTo, pacer)
+				if errors.Is(historyErr, context.Canceled) {
+					return row, historyErr
+				}
 				if retryAt := upstreamRetryAt(historyErr); retryAt > operationRetryAt {
 					operationRetryAt = retryAt
 				}
@@ -1686,6 +1869,9 @@ func (m *Monitor) syncStoredUpstreamUsage(ctx context.Context, domain string) (C
 					break
 				}
 				if historyErr = m.persistNewAPIUsageBackfillWindow(ctx, row.Domain, cursor, windowTo, history.Hours, now); historyErr != nil {
+					if errors.Is(historyErr, context.Canceled) {
+						return row, historyErr
+					}
 					applyUpstreamUsageBackfillResult(&row, historyErr, now, m.cfg, secrets...)
 					err = historyErr
 					break
@@ -1701,11 +1887,17 @@ func (m *Monitor) syncStoredUpstreamUsage(ctx context.Context, domain string) (C
 			}
 		} else {
 			history, historyErr := syncUsage(ctx, plan.backfillFrom, plan.backfillTo, pacer)
+			if errors.Is(historyErr, context.Canceled) {
+				return row, historyErr
+			}
 			if retryAt := upstreamRetryAt(historyErr); retryAt > operationRetryAt {
 				operationRetryAt = retryAt
 			}
 			if historyErr == nil {
 				historyErr = m.persistUpstreamUsageWindow(ctx, row.Domain, plan.backfillFrom, plan.backfillTo, history.Hours, now)
+			}
+			if errors.Is(historyErr, context.Canceled) {
+				return row, historyErr
 			}
 			if historyErr != nil {
 				// Tail health and schedule remain successful. Only history receives an
@@ -1754,41 +1946,135 @@ func (m *Monitor) syncDueUpstreamUsage(ctx context.Context) {
 		return
 	}
 	now := time.Now().Unix()
-	rows, err := m.loadDueUpstreamUsageAccounts(ctx, now, 1)
+	limit := upstreamMaxConcurrency(m.cfg)
+	// 读取较宽的本地候选集，真正发起的同步仍受 limit 严格限制。这样排序
+	// 最前的账户若正被管理员保存/其他 lane 占用，可以跳过它继续服务后续
+	// Tail，不会因为默认并发 1 而每 10 秒重复撞同一个 busy gate。
+	const candidateLimit = 50
+	// Tail 是新鲜度合同：默认先跑 Tail；只有连续批次配额已满且
+	// 最老 Tail 仍在宽限内，才允许一个有界历史批次让路。
+	rows, err := m.loadDueUpstreamUsageAccountsForLane(ctx, now, candidateLimit, upstreamUsageLaneTail)
 	if err != nil {
 		slog.Warn("读取待同步上游使用日志失败", "err", err)
 		return
 	}
-	for _, row := range rows {
-		syncCtx, cancel := context.WithTimeout(ctx, upstreamUsageOperationTimeout(m.cfg))
-		synced, syncErr := m.syncStoredUpstreamUsage(syncCtx, row.Domain)
-		cancel()
-		if syncErr != nil {
-			message := synced.UsageLastError
-			if message == "" {
-				message = synced.UsageBackfillLastError
-			}
-			slog.Warn("上游使用日志同步失败", "domain", row.Domain, "provider", row.Provider, "err", message)
+	lane := upstreamUsageLaneTail
+	if len(rows) > 0 && shouldRunUpstreamUsageHistoryFairness(now, rows[0], m.upstreamUsageTailBatches.Load()) {
+		historyRows, historyErr := m.loadDueUpstreamUsageAccountsForLane(ctx, now, candidateLimit, upstreamUsageLaneHistory)
+		if historyErr != nil {
+			slog.Warn("读取待补全上游历史日志失败", "err", historyErr)
+			return
 		}
+		if len(historyRows) > 0 {
+			lane, rows = upstreamUsageLaneHistory, historyRows
+		}
+	}
+	if len(rows) == 0 {
+		lane = upstreamUsageLaneHistory
+		rows, err = m.loadDueUpstreamUsageAccountsForLane(ctx, now, candidateLimit, lane)
+		if err != nil {
+			slog.Warn("读取待补全上游历史日志失败", "err", err)
+			return
+		}
+	}
+	attempted := m.runDueUpstreamUsageAccounts(ctx, rows, lane, limit)
+	if lane == upstreamUsageLaneHistory {
+		// 即使候选恰好 busy，也只消耗本次公平令牌；下轮先回到 Tail。
+		m.upstreamUsageTailBatches.Store(0)
+	} else if attempted > 0 {
+		m.upstreamUsageTailBatches.Add(1)
 	}
 }
 
+func shouldRunUpstreamUsageHistoryFairness(now int64, oldestTail ChannelUpstreamAccount, completedTailBatches uint64) bool {
+	if completedTailBatches < upstreamUsageHistoryFairnessTailBatches || oldestTail.UsageNextSyncAt <= 0 {
+		return false
+	}
+	return now-oldestTail.UsageNextSyncAt <= int64(upstreamUsageTailOverdueGuard/time.Second)
+}
+
 func (m *Monitor) loadDueUpstreamUsageAccounts(ctx context.Context, now int64, limit int) ([]ChannelUpstreamAccount, error) {
+	// 兼容既有测试/调用者：合并视图仍按 Tail 优先；无 Tail 才返回历史。
+	rows, err := m.loadDueUpstreamUsageAccountsForLane(ctx, now, limit, upstreamUsageLaneTail)
+	if err != nil || len(rows) > 0 {
+		return rows, err
+	}
+	return m.loadDueUpstreamUsageAccountsForLane(ctx, now, limit, upstreamUsageLaneHistory)
+}
+
+func (m *Monitor) loadDueUpstreamUsageAccountsForLane(ctx context.Context, now int64, limit int, lane upstreamUsageLane) ([]ChannelUpstreamAccount, error) {
 	if limit <= 0 || limit > 50 {
 		limit = 1
 	}
 	var rows []ChannelUpstreamAccount
+	if lane == upstreamUsageLaneTail {
+		err := m.storeDB.WithContext(ctx).Where(`enabled = ? AND usage_sync_enabled = ?
+			AND (usage_next_sync_at = 0 OR usage_next_sync_at <= ?)`, true, true, now).
+			Order("usage_next_sync_at ASC, domain ASC").Limit(limit).Find(&rows).Error
+		return rows, err
+	}
 	legacyBudgetError := legacyNewAPIBackfillBudgetError()
 	err := m.storeDB.WithContext(ctx).Where(`enabled = ? AND usage_sync_enabled = ? AND (
-		(usage_next_sync_at = 0 OR usage_next_sync_at <= ?)
-		OR (usage_backfill_done = ? AND (usage_backfill_next_sync_at = 0 OR usage_backfill_next_sync_at <= ?)
-			AND usage_status NOT IN (?, ?))
+		(usage_backfill_done = ? AND (usage_backfill_next_sync_at = 0 OR usage_backfill_next_sync_at <= ?)
+			AND usage_status = ?)
 		OR (provider = ? AND usage_backfill_done = ? AND usage_backfill_last_error = ?)
-	)`, true, true, now, false, now, upstreamStatusError, upstreamStatusReconnect,
+	)`, true, true, false, now, upstreamStatusOK,
 		upstreamProviderNewAPI, false, legacyBudgetError).
-		Order("CASE WHEN usage_next_sync_at = 0 OR usage_next_sync_at <= " + strconv.FormatInt(now, 10) + " THEN usage_next_sync_at ELSE usage_backfill_next_sync_at END ASC, domain ASC").
+		Order("usage_backfill_next_sync_at ASC, domain ASC").
 		Limit(limit).Find(&rows).Error
 	return rows, err
+}
+
+type dueUpstreamUsageResult struct {
+	row    ChannelUpstreamAccount
+	synced ChannelUpstreamAccount
+	err    error
+}
+
+func (m *Monitor) runDueUpstreamUsageAccounts(ctx context.Context, rows []ChannelUpstreamAccount, lane upstreamUsageLane, limit int) int {
+	if limit < 1 {
+		limit = 1
+	}
+	if limit > 2 {
+		limit = 2
+	}
+	results := make(chan dueUpstreamUsageResult, limit)
+	next, active, attempted := 0, 0, 0
+	launch := func(row ChannelUpstreamAccount) {
+		active++
+		go func() {
+			syncCtx, cancel := context.WithTimeout(ctx, upstreamUsageOperationTimeoutForLane(m.cfg, lane))
+			defer cancel()
+			synced, syncErr := m.syncStoredUpstreamUsageLaneBackground(syncCtx, row.Domain, lane)
+			results <- dueUpstreamUsageResult{row: row, synced: synced, err: syncErr}
+		}()
+	}
+	fill := func() {
+		for next < len(rows) && attempted+active < limit && ctx.Err() == nil {
+			launch(rows[next])
+			next++
+		}
+	}
+	fill()
+	for active > 0 {
+		result := <-results
+		active--
+		if errors.Is(result.err, errUpstreamAccountBusy) {
+			// busy 是本地调度让路，不消耗本轮真实同步名额。
+			fill()
+			continue
+		}
+		attempted++
+		if result.err != nil {
+			message := result.synced.UsageLastError
+			if lane == upstreamUsageLaneHistory || message == "" {
+				message = result.synced.UsageBackfillLastError
+			}
+			slog.Warn("上游使用日志同步失败", "domain", result.row.Domain, "provider", result.row.Provider, "lane", lane, "err", message)
+		}
+		fill()
+	}
+	return attempted
 }
 
 // syncChannelUpstreamUsageHandler 是管理员明确触发的单账户日志同步。它只请求

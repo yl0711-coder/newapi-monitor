@@ -98,9 +98,17 @@ func TestSyncStatusPageSeparatesUpstreamBalanceTailAndHistory(t *testing.T) {
 		`usage_backfill_cursor`,
 		`后续可按账户逐个开启验证`,
 		`usage_effective_status`,
+		`usage_tail_phase`,
+		`usage_history_phase`,
 		`usage_worker_enabled`,
 		`全局灰度闸门已关闭`,
 		`数据陈旧`,
+		`等待首次同步`,
+		`历史补数完成`,
+		`历史任务退避`,
+		`AICodeWith Key 同步`,
+		`api_key_slots`,
+		`slot.backfill_last_error`,
 	} {
 		if !strings.Contains(pageHTML, marker) {
 			t.Fatalf("上游账户同步状态缺少 %q", marker)
@@ -109,8 +117,8 @@ func TestSyncStatusPageSeparatesUpstreamBalanceTailAndHistory(t *testing.T) {
 	if strings.Contains(pageHTML, `<th>余额同步</th><th>消费同步</th>`) {
 		t.Fatal("上游同步不应继续使用将状态混在一行的旧表格")
 	}
-	if !strings.Contains(pageHTML, `u.usage_sync_enabled&&u.usage_worker_enabled&&(usage.level==='warn'||!u.usage_backfill_done)`) {
-		t.Fatal("全局灰度关闭时，历史未补完不得把同步状态提升为告警")
+	if !strings.Contains(pageHTML, `u.usage_sync_enabled&&u.usage_worker_enabled&&(usage.level==='warn'||history.level==='warn')`) {
+		t.Fatal("上游账户总状态必须分别读取当天 Tail 与历史补数状态")
 	}
 	managementJS := string(channelManagementJS)
 	if !strings.Contains(managementJS, `upstream.usage_sync_enabled&&upstream.usage_worker_enabled&&!upstream.usage_backfill_done`) {

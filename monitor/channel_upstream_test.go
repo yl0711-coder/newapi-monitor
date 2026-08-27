@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -22,6 +23,7 @@ func newChannelUpstreamTestMonitor(t *testing.T) *Monitor {
 	m := newStabilityTestMonitor(t)
 	m.cfg.SessionSecret = "fixed-channel-upstream-test-secret"
 	m.cfg.UpstreamSyncTimeoutSec = 3
+	m.upstreamAICodeWithInterval = time.Millisecond
 	m.upstreamCredentialPersistent = true
 	guard := newUpstreamHostGuard(m.storeDB, upstreamHostGuardOptions{
 		Clock: realUpstreamGuardClock{}, Jitter: func() time.Duration { return 0 }, MinInterval: 0,
@@ -305,6 +307,79 @@ func TestSyncAICodeWithBalanceKeepsCNYLedgerAtContractOneToOne(t *testing.T) {
 	}
 	if result.BalanceRaw != 700 || result.BalanceUnit != 1 || math.Abs(result.BalanceUSD-700) > 1e-12 {
 		t.Fatalf("unexpected 1:1 CNY balance: %+v", result)
+	}
+}
+
+func TestAICodeWithSaveValidationOnlyChecksChangedKeysAndOneBaseline(t *testing.T) {
+	keys := make([]string, 60)
+	for i := range keys {
+		keys[i] = fmt.Sprintf("sk-acw-existing-%02d", i)
+	}
+	existing, err := normalizeAICodeWithCredential(aiCodeWithCredential{APIKeys: keys})
+	if err != nil {
+		t.Fatal(err)
+	}
+	next, err := applyAICodeWithSlotChanges(existing, []aicodeWithKeyAdditionInput{{Name: "new", APIKey: "sk-acw-new-60"}}, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	validation, count, err := aicodeWithSaveValidationCredential(&existing, next)
+	if err != nil {
+		t.Fatal(err)
+	}
+	validationKeys, err := aiCodeWithCredentialKeys(validation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != 2 || len(validationKeys) != 2 || validationKeys[1] != "sk-acw-new-60" {
+		t.Fatalf("validation count=%d keys=%v, want one baseline plus the new key", count, validationKeys)
+	}
+	if _, count, err = aicodeWithSaveValidationCredential(&existing, existing); err != nil || count != 0 {
+		t.Fatalf("unchanged credential should not call upstream: count=%d err=%v", count, err)
+	}
+	next = existing
+	next.Slots = append([]aiCodeWithKeyCredential(nil), existing.Slots...)
+	for i := 0; i < 5; i++ {
+		next.Slots[i].Secret = fmt.Sprintf("sk-acw-replaced-%d", i)
+	}
+	if _, _, err = aicodeWithSaveValidationCredential(&existing, next); err == nil || !strings.Contains(err.Error(), "每次最多") {
+		t.Fatalf("more than four changed keys must be rejected: %v", err)
+	}
+}
+
+func TestAICodeWithSaveValidationPacesRequests(t *testing.T) {
+	var mu sync.Mutex
+	var calls []time.Time
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		calls = append(calls, time.Now())
+		mu.Unlock()
+		_, _ = w.Write([]byte(`{"data":{"balance":"25","currency":"USD"}}`))
+	}))
+	defer server.Close()
+	credential, err := normalizeAICodeWithCredential(aiCodeWithCredential{APIKeys: []string{"sk-acw-pace-1", "sk-acw-pace-2", "sk-acw-pace-3"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const interval = 20 * time.Millisecond
+	result, _, err := syncAICodeWithBalanceWithPacer(context.Background(), newUpstreamHTTPClient(time.Second), ChannelUpstreamAccount{
+		Provider: upstreamProviderAICodeWith, BaseURL: server.URL,
+	}, credential, newUpstreamUsageRequestPacer(3, interval))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.BalanceUSD != 25 {
+		t.Fatalf("balance=%v", result.BalanceUSD)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(calls) != 3 {
+		t.Fatalf("calls=%d", len(calls))
+	}
+	for i := 1; i < len(calls); i++ {
+		if gap := calls[i].Sub(calls[i-1]); gap < interval-5*time.Millisecond {
+			t.Fatalf("request %d gap=%v, want paced near %v", i+1, gap, interval)
+		}
 	}
 }
 
@@ -757,6 +832,158 @@ func TestChannelUpstreamAICodeWithHandlerEncryptsKeyAndEnablesUsage(t *testing.T
 	}
 	if len(credential.Slots) != 1 || credential.Slots[0].Name != "主账号" {
 		t.Fatalf("AICodeWith key name was not stored with the encrypted slot: %+v", credential.Slots)
+	}
+}
+
+func TestChannelUpstreamAICodeWithExistingSixtyKeysCanAddOne(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	var calls atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		_, _ = w.Write([]byte(`{"balance":"40","currency":"USD"}`))
+	}))
+	defer server.Close()
+	domain := normalizeChannelBaseDomain(server.URL)
+	m := newChannelUpstreamTestMonitor(t)
+	if err := m.storeDB.Create(&ChannelSnap{ID: 188, Name: "aicodewith-sixty", BaseDomain: domain, BaseHost: normalizeChannelBaseHost(server.URL), Status: 1}).Error; err != nil {
+		t.Fatal(err)
+	}
+	keys := make([]string, 60)
+	for i := range keys {
+		keys[i] = fmt.Sprintf("sk-acw-seeded-%02d", i)
+	}
+	credential, err := normalizeAICodeWithCredential(aiCodeWithCredential{APIKeys: keys})
+	if err != nil {
+		t.Fatal(err)
+	}
+	row := ChannelUpstreamAccount{
+		Domain: domain, Provider: upstreamProviderAICodeWith, BaseURL: server.URL,
+		Account: aiCodeWithKeyIdentity(keys), Enabled: true, Status: upstreamStatusOK,
+		BalanceKnown: true, BalanceUSD: 40, BalanceRaw: 40, BalanceUnit: 1,
+	}
+	if err := m.sealUpstreamAccountCredential(&row, credential); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.storeDB.Create(&row).Error; err != nil {
+		t.Fatal(err)
+	}
+	router := gin.New()
+	router.POST("/channels/upstream", m.requireRole(roleRoot), m.saveChannelUpstreamHandler)
+	usageEnabled := true
+	w := upstreamRouteRequest(t, m, router, roleRoot, http.MethodPost, "/channels/upstream", channelUpstreamSaveInput{
+		Domain: domain, Provider: upstreamProviderAICodeWith, BaseURL: server.URL,
+		AddAPIKeySlots: []aicodeWithKeyAdditionInput{{Name: "new", APIKey: "sk-acw-seeded-60"}}, UsageSyncEnabled: &usageEnabled,
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+	}
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("upstream balance calls=%d, want one old baseline plus one new key", got)
+	}
+	if err := m.storeDB.First(&row, "domain = ?", domain).Error; err != nil {
+		t.Fatal(err)
+	}
+	var saved aiCodeWithCredential
+	if err := m.openUpstreamCredential(row, &saved); err != nil {
+		t.Fatal(err)
+	}
+	savedKeys, err := aiCodeWithCredentialKeys(saved)
+	if err != nil || len(savedKeys) != 61 {
+		t.Fatalf("saved keys=%d err=%v", len(savedKeys), err)
+	}
+}
+
+func TestChannelUpstreamAICodeWithFourKeySaveIsNotBlockedByOtherAccount(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/balance" || !strings.HasPrefix(r.Header.Get("Authorization"), "Bearer sk-acw-") {
+			http.Error(w, `{"error":{"message":"invalid key"}}`, http.StatusUnauthorized)
+			return
+		}
+		_, _ = w.Write([]byte(`{"balance":"12.5","currency":"USD"}`))
+	}))
+	defer server.Close()
+	domain := normalizeChannelBaseDomain(server.URL)
+	m := newChannelUpstreamTestMonitor(t)
+	if err := m.storeDB.Create(&ChannelSnap{ID: 177, Name: "aicodewith-four", BaseDomain: domain, BaseHost: normalizeChannelBaseHost(server.URL), Status: 1}).Error; err != nil {
+		t.Fatal(err)
+	}
+	// Simulate a dense history scan on an unrelated provider. This used to
+	// hold the process-wide mutex and make the four-key admin save time out.
+	releaseBusy, err := m.tryAcquireUpstreamAccountBackground("dense-other.example")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer releaseBusy()
+
+	router := gin.New()
+	router.POST("/channels/upstream", m.requireRole(roleRoot), m.saveChannelUpstreamHandler)
+	usageEnabled := true
+	additions := []aicodeWithKeyAdditionInput{
+		{Name: "Codex 主线路", APIKey: "sk-acw-four-1"},
+		{Name: "Claude 主线路", APIKey: "sk-acw-four-2"},
+		{Name: "备用一", APIKey: "sk-acw-four-3"},
+		{Name: "备用二", APIKey: "sk-acw-four-4"},
+	}
+	payload := channelUpstreamSaveInput{
+		Domain: domain, Provider: upstreamProviderAICodeWith, BaseURL: server.URL,
+		AddAPIKeySlots: additions, UsageSyncEnabled: &usageEnabled,
+	}
+	w := upstreamRouteRequest(t, m, router, roleRoot, http.MethodPost, "/channels/upstream", payload)
+	if w.Code != http.StatusOK {
+		t.Fatalf("four-key save status=%d body=%s", w.Code, w.Body.String())
+	}
+	for _, addition := range additions {
+		if !strings.Contains(w.Body.String(), addition.Name) || strings.Contains(w.Body.String(), addition.APIKey) {
+			t.Fatalf("key name missing or secret leaked: body=%s", w.Body.String())
+		}
+	}
+	var row ChannelUpstreamAccount
+	if err := m.storeDB.First(&row, "domain = ?", domain).Error; err != nil {
+		t.Fatal(err)
+	}
+	var credential aiCodeWithCredential
+	if err := m.openUpstreamCredential(row, &credential); err != nil {
+		t.Fatal(err)
+	}
+	if len(credential.Slots) != 4 {
+		t.Fatalf("stored slots=%d, want 4", len(credential.Slots))
+	}
+	wantSecrets := make(map[string]string, len(additions))
+	for _, addition := range additions {
+		wantSecrets[addition.Name] = addition.APIKey
+	}
+	for _, slot := range credential.Slots {
+		if wantSecrets[slot.Name] != slot.Secret {
+			t.Fatalf("slot mismatch: name=%q", slot.Name)
+		}
+	}
+	first := credential.Slots[0]
+	if err := m.storeDB.Model(&AICodeWithKeySyncState{}).
+		Where("domain = ? AND slot_id = ?", domain, first.SlotID).
+		Updates(map[string]any{
+			"status": upstreamStatusOK, "last_success_at": time.Now().Unix(),
+			"backfill_last_error":   "temporary upstream timeout",
+			"backfill_next_sync_at": time.Now().Add(time.Minute).Unix(), "backfill_consecutive_fails": 1,
+		}).Error; err != nil {
+		t.Fatal(err)
+	}
+	views, err := m.loadChannelUpstreamViews(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	view := views[domain]
+	if len(view.APIKeySlots) != 4 || view.APIKeySlots[0].Label != first.Name || view.APIKeySlots[0].BackfillLastError == "" {
+		t.Fatalf("unified sync projection lost per-key state: %+v", view.APIKeySlots)
+	}
+	encoded, err := json.Marshal(view)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, addition := range additions {
+		if bytes.Contains(encoded, []byte(addition.APIKey)) {
+			t.Fatalf("unified sync projection leaked AICodeWith secret: %s", encoded)
+		}
 	}
 }
 

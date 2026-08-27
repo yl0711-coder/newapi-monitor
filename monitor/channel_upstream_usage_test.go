@@ -17,6 +17,8 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/glebarez/sqlite"
+	"gorm.io/gorm"
 )
 
 type upstreamUsageFixtureRow struct {
@@ -224,6 +226,8 @@ func TestDecorateUpstreamUsageHealthIsFailClosedForGrayAndStaleData(t *testing.T
 		t.Fatalf("gray-off view is misleading: %+v", view)
 	}
 
+	row.UsageLastAttemptAt = now - 10
+	row.UsageLastSuccessAt = now - 10
 	view = upstreamAccountView(row)
 	decorateUpstreamUsageHealth(&view, row, Settings{UpstreamUsageSyncEnabled: true, UpstreamUsageSyncMinutes: 30}, now)
 	if !view.UsageWorkerEnabled || view.UsageEffectiveStatus != upstreamStatusOK || !view.UsageFresh {
@@ -235,6 +239,40 @@ func TestDecorateUpstreamUsageHealthIsFailClosedForGrayAndStaleData(t *testing.T
 	decorateUpstreamUsageHealth(&view, row, Settings{UpstreamUsageSyncEnabled: true, UpstreamUsageSyncMinutes: 30}, now)
 	if view.UsageEffectiveStatus != "stale" || view.UsageFresh || view.UsageLagSeconds != 2*3600 {
 		t.Fatalf("stale persisted success remained green: %+v", view)
+	}
+}
+
+func TestDecorateUpstreamUsageHealthSeparatesFirstRunTailAndHistoryPhases(t *testing.T) {
+	now := time.Date(2026, 8, 27, 18, 0, 0, 0, cstLocation).Unix()
+	settings := Settings{UpstreamUsageSyncEnabled: true, UpstreamUsageSyncMinutes: 30}
+	row := ChannelUpstreamAccount{
+		Enabled: true, UsageSyncEnabled: true, UsageStatus: upstreamStatusDisabled,
+		UsageNextSyncAt: now + 10, UsageBackfillNextSyncAt: now + 20,
+	}
+	view := upstreamAccountView(row)
+	decorateUpstreamUsageHealth(&view, row, settings, now)
+	if view.UsageEffectiveStatus != "queued" || view.UsageTailPhase != "queued" || view.UsageHistoryPhase != "queued" {
+		t.Fatalf("newly enabled account was not exposed as queued: %+v", view)
+	}
+
+	row.UsageStatus = upstreamStatusOK
+	row.UsageLastAttemptAt = now - 30
+	row.UsageLastSuccessAt = now - 30
+	row.UsageDataUntil = now - 30
+	row.UsageBackfillLastAttemptAt = now - 20
+	row.UsageBackfillLastError = "upstream timeout"
+	view = upstreamAccountView(row)
+	decorateUpstreamUsageHealth(&view, row, settings, now)
+	if view.UsageTailPhase != upstreamStatusOK || view.UsageHistoryPhase != "retry" {
+		t.Fatalf("history retry polluted a healthy current-day Tail: %+v", view)
+	}
+
+	row.UsageBackfillLastError = ""
+	row.UsageBackfillDone = true
+	view = upstreamAccountView(row)
+	decorateUpstreamUsageHealth(&view, row, settings, now)
+	if view.UsageHistoryPhase != "complete" {
+		t.Fatalf("completed history was not projected independently: %+v", view)
 	}
 }
 
@@ -263,6 +301,8 @@ func TestDueUsageSelectionSkipsBackedOffAccountAndDoesNotStarvePeer(t *testing.T
 			UsageNextSyncAt: now - 1, UsageBackfillCursor: today - 86400, UsageBackfillNextSyncAt: now - 1},
 		{Domain: "c-history.example", Enabled: true, UsageSyncEnabled: true, UsageStatus: upstreamStatusOK,
 			UsageNextSyncAt: now + 1800, UsageBackfillCursor: today - 86400, UsageBackfillNextSyncAt: now - 1},
+		{Domain: "c-pending-tail.example", Enabled: true, UsageSyncEnabled: true, UsageStatus: upstreamStatusPending,
+			UsageNextSyncAt: now + 15, UsageBackfillCursor: today - 86400, UsageBackfillNextSyncAt: now - 1},
 		{Domain: "d-account-disabled.example", Enabled: false, UsageSyncEnabled: true, UsageStatus: upstreamStatusOK,
 			UsageNextSyncAt: now - 1, UsageBackfillCursor: today - 86400, UsageBackfillNextSyncAt: now - 1},
 		{Domain: "e-usage-disabled.example", Enabled: true, UsageSyncEnabled: false, UsageStatus: upstreamStatusOK,
@@ -273,7 +313,7 @@ func TestDueUsageSelectionSkipsBackedOffAccountAndDoesNotStarvePeer(t *testing.T
 			t.Fatal(err)
 		}
 	}
-	due, err := m.loadDueUpstreamUsageAccounts(context.Background(), now, 10)
+	due, err := m.loadDueUpstreamUsageAccountsForLane(context.Background(), now, 10, upstreamUsageLaneTail)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -284,8 +324,189 @@ func TestDueUsageSelectionSkipsBackedOffAccountAndDoesNotStarvePeer(t *testing.T
 	if strings.Contains(strings.Join(domains, ","), "a-blocked.example") {
 		t.Fatalf("backed-off account was selected by history lane: %v", domains)
 	}
+	if len(domains) != 1 || domains[0] != "b-due.example" {
+		t.Fatalf("tail lane selected non-tail work: %v", domains)
+	}
+	due, err = m.loadDueUpstreamUsageAccountsForLane(context.Background(), now, 10, upstreamUsageLaneHistory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	domains = domains[:0]
+	for _, row := range due {
+		domains = append(domains, row.Domain)
+	}
 	if len(domains) != 2 || !containsString(domains, "b-due.example") || !containsString(domains, "c-history.example") {
-		t.Fatalf("eligible peers were starved or a disabled account was selected: %v", domains)
+		t.Fatalf("eligible history peers were starved or a disabled account was selected: %v", domains)
+	}
+}
+
+func TestPlanUpstreamUsageSyncForLaneMasksOtherWork(t *testing.T) {
+	now := time.Date(2026, 8, 23, 9, 0, 0, 0, cstLocation).Unix()
+	row := ChannelUpstreamAccount{
+		Domain: "both-due.example", Provider: upstreamProviderNewAPI,
+		UsageNextSyncAt: now - 1, UsageBackfillCursor: cstDayStart(now) - 86400,
+	}
+	tail := planUpstreamUsageSyncForLane(row, now, 7, upstreamUsageLaneTail)
+	if tail.tailTo == 0 || tail.backfillTo != 0 {
+		t.Fatalf("tail lane plan leaked history work: %+v", tail)
+	}
+	history := planUpstreamUsageSyncForLane(row, now, 7, upstreamUsageLaneHistory)
+	if history.tailTo != 0 || history.backfillTo == 0 {
+		t.Fatalf("history lane plan leaked tail work: %+v", history)
+	}
+}
+
+func TestUpstreamUsageFailureRetryPolicy(t *testing.T) {
+	now := int64(1_800_000_000)
+	settings := Settings{UpstreamUsageSyncMinutes: 20}
+	tests := []struct {
+		name     string
+		err      error
+		failures int
+		want     time.Duration
+	}{
+		{name: "first timeout", err: context.DeadlineExceeded, failures: 1, want: 2 * time.Minute},
+		{name: "second timeout", err: context.DeadlineExceeded, failures: 2, want: 5 * time.Minute},
+		{name: "connection refused", err: errors.New("dial tcp: connection refused"), failures: 1, want: 2 * time.Minute},
+		{name: "sqlite busy", err: errors.New("database is locked"), failures: 1, want: 10 * time.Second},
+		{name: "sqlite busy repeated", err: errors.New("SQLITE_BUSY"), failures: 3, want: time.Minute},
+		{name: "rate limit default", err: &upstreamHTTPError{Status: http.StatusTooManyRequests}, failures: 1, want: upstreamRetryAfterDefault},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got := upstreamUsageFailureRetryAt(settings, "retry.example", now, test.failures, test.err, "tail")
+			if got != now+int64(test.want/time.Second) {
+				t.Fatalf("retry_at=%d, want %d", got, now+int64(test.want/time.Second))
+			}
+		})
+	}
+}
+
+func TestAICodeWithTailKeepsThirtyMinuteMinimum(t *testing.T) {
+	now := int64(1_800_000_000)
+	settings := Settings{UpstreamUsageSyncMinutes: 20}
+	regular := nextUpstreamUsageSyncAtForProvider(settings, upstreamProviderNewAPI, "regular.example", now, 0)
+	aicode := nextUpstreamUsageSyncAtForProvider(settings, upstreamProviderAICodeWith, "aicode.example", now, 0)
+	if regular < now+20*60 || regular > now+20*60+45 {
+		t.Fatalf("regular next sync outside 20-minute window: %d", regular-now)
+	}
+	if aicode < now+30*60 || aicode > now+30*60+45 {
+		t.Fatalf("AICodeWith next sync outside 30-minute window: %d", aicode-now)
+	}
+}
+
+func TestHistoryFairnessRunsAfterFourHealthyTailBatchesButNeverBehindStaleTail(t *testing.T) {
+	now := int64(1_800_000_000)
+	healthyTail := ChannelUpstreamAccount{UsageNextSyncAt: now - int64((upstreamUsageTailOverdueGuard-time.Second)/time.Second)}
+	if shouldRunUpstreamUsageHistoryFairness(now, healthyTail, upstreamUsageHistoryFairnessTailBatches-1) {
+		t.Fatal("history ran before the four-tail fairness quota")
+	}
+	if !shouldRunUpstreamUsageHistoryFairness(now, healthyTail, upstreamUsageHistoryFairnessTailBatches) {
+		t.Fatal("history remained starved after four healthy tail batches")
+	}
+	staleTail := ChannelUpstreamAccount{UsageNextSyncAt: now - int64((upstreamUsageTailOverdueGuard+time.Second)/time.Second)}
+	if shouldRunUpstreamUsageHistoryFairness(now, staleTail, upstreamUsageHistoryFairnessTailBatches+100) {
+		t.Fatal("history must not run while tail violates its freshness guard")
+	}
+	if shouldRunUpstreamUsageHistoryFairness(now, ChannelUpstreamAccount{}, upstreamUsageHistoryFairnessTailBatches) {
+		t.Fatal("zero tail watermark must not spend a history fairness turn")
+	}
+}
+
+func TestDueUsageRunnerSkipsBusyAccountWithoutSpendingConcurrencySlot(t *testing.T) {
+	var calls atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		if r.URL.Path != "/api/log/self" {
+			http.NotFound(w, r)
+			return
+		}
+		_, _ = w.Write([]byte(`{"success":true,"data":{"total":0,"items":[]}}`))
+	}))
+	defer server.Close()
+
+	m := newChannelUpstreamTestMonitor(t)
+	m.cfg.UpstreamUsageBackfillDays = 7
+	now := time.Now().Unix()
+	busy := ChannelUpstreamAccount{
+		Domain: "a-busy.example", Provider: upstreamProviderNewAPI, BaseURL: "https://a-busy.example",
+		Enabled: true, UsageSyncEnabled: true, UsageNextSyncAt: now - 2,
+	}
+	if err := m.storeDB.Create(&busy).Error; err != nil {
+		t.Fatal(err)
+	}
+	healthy := ChannelUpstreamAccount{
+		Domain: server.Listener.Addr().String(), Provider: upstreamProviderNewAPI, BaseURL: server.URL,
+		Account: "31", UserID: 31, Enabled: true, UsageSyncEnabled: true,
+		UsageNextSyncAt: now - 1, UsageBackfillDone: true,
+	}
+	if err := m.persistSyncedUpstreamAccount(context.Background(), &healthy, newAPICredential{AccessToken: "usage-token"}); err != nil {
+		t.Fatal(err)
+	}
+	release, err := m.tryAcquireUpstreamAccountBackground(busy.Domain)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+
+	m.runDueUpstreamUsageAccounts(context.Background(), []ChannelUpstreamAccount{busy, healthy}, upstreamUsageLaneTail, 1)
+	if calls.Load() != 1 {
+		t.Fatalf("healthy peer calls=%d, want 1 after busy candidate was skipped", calls.Load())
+	}
+	var stored ChannelUpstreamAccount
+	if err := m.storeDB.First(&stored, "domain = ?", healthy.Domain).Error; err != nil {
+		t.Fatal(err)
+	}
+	if stored.UsageStatus != upstreamStatusOK || stored.UsageLastSuccessAt == 0 {
+		t.Fatalf("healthy peer did not consume the available slot: %+v", stored)
+	}
+}
+
+func TestAICodeWithHistoryFailureDoesNotPolluteTailKeyState(t *testing.T) {
+	m := newChannelUpstreamTestMonitor(t)
+	now := int64(1_800_000_000)
+	state := AICodeWithKeySyncState{
+		Domain: "aicode.example", SlotID: "slot-1", CredentialSetVersion: "v1",
+		Status: upstreamStatusOK, LastSuccessAt: now - 30, NextSyncAt: now + 1800,
+	}
+	round := AICodeWithUsageRound{Domain: state.Domain, Kind: "backfill", RoundID: "history-round", CredentialSetVersion: state.CredentialSetVersion}
+	err := m.recordAICodeWithKeyFailure(context.Background(), round, &state,
+		&upstreamHTTPError{Status: http.StatusBadGateway, Message: "temporary"}, "secret", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Status != upstreamStatusOK || state.LastSuccessAt != now-30 || state.NextSyncAt != now+1800 || state.ConsecutiveFails != 0 {
+		t.Fatalf("history failure polluted tail fields: %+v", state)
+	}
+	if state.BackfillConsecutiveFails != 1 || state.BackfillLastError == "" || state.BackfillNextSyncAt != now+120 {
+		t.Fatalf("history failure was not recorded independently: %+v", state)
+	}
+}
+
+func TestAICodeWithHistorySuccessDoesNotRewriteTailKeyWatermark(t *testing.T) {
+	m := newChannelUpstreamTestMonitor(t)
+	now := int64(1_800_000_000)
+	state := AICodeWithKeySyncState{
+		Domain: "aicode.example", SlotID: "slot-1", CredentialSetVersion: "v1",
+		Status: upstreamStatusOK, LastAttemptAt: now - 60, LastSuccessAt: now - 60,
+		NextSyncAt: now + 1800, TailRoundID: "tail-round",
+	}
+	if err := m.storeDB.Create(&state).Error; err != nil {
+		t.Fatal(err)
+	}
+	round := AICodeWithUsageRound{
+		Domain: state.Domain, Kind: "backfill", RoundID: "history-round", CredentialSetVersion: state.CredentialSetVersion,
+		WindowFrom: now - 86400, WindowTo: now,
+	}
+	result := upstreamUsageResult{SourceKeyID: 7, Adapter: upstreamUsageAdapterAICodeWith}
+	if err := m.stageAICodeWithKeyResult(context.Background(), round, &state, result, now); err != nil {
+		t.Fatal(err)
+	}
+	if state.Status != upstreamStatusOK || state.LastAttemptAt != now-60 || state.LastSuccessAt != now-60 || state.NextSyncAt != now+1800 || state.TailRoundID != "tail-round" {
+		t.Fatalf("history success rewrote tail watermark: %+v", state)
+	}
+	if state.BackfillRoundID != round.RoundID || state.BackfillLastSuccessAt != now || state.BackfillConsecutiveFails != 0 || state.BackfillLastError != "" {
+		t.Fatalf("history success was not recorded independently: %+v", state)
 	}
 }
 
@@ -982,6 +1203,208 @@ func TestAICodeWithTailPublishesFrozenRoundWatermark(t *testing.T) {
 	}
 }
 
+func TestAICodeWithTransientFailureResumesWithoutRepeatingSuccessfulKeys(t *testing.T) {
+	keys := []string{"sk-acw-resume-1", "sk-acw-resume-2", "sk-acw-resume-3", "sk-acw-resume-4"}
+	keyIDs := map[string]int64{}
+	calls := map[string]int{}
+	var callsMu sync.Mutex
+	requestNumber := 0
+	firstSuccessfulKey := ""
+	for i, key := range keys {
+		keyIDs[key] = int64(i + 1)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		key := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		callsMu.Lock()
+		calls[key]++
+		requestNumber++
+		currentRequest := requestNumber
+		if currentRequest == 1 {
+			firstSuccessfulKey = key
+		}
+		callsMu.Unlock()
+		if currentRequest == 2 {
+			http.Error(w, `{"message":"temporary upstream failure"}`, http.StatusBadGateway)
+			return
+		}
+		id := keyIDs[key]
+		start, end := r.URL.Query().Get("start"), r.URL.Query().Get("end")
+		_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{
+			"api_key_id": id, "period": map[string]any{"start": start, "end": end}, "group_by": "day",
+			"summary": map[string]any{"cost": "1.00", "total_tokens": 10, "requests": 1},
+			"daily":   []any{map[string]any{"date": start, "cost": "1.00", "total_tokens": 10, "requests": 1}},
+		}})
+	}))
+	defer server.Close()
+	m := newChannelUpstreamTestMonitor(t)
+	normalized, err := normalizeAICodeWithCredential(aiCodeWithCredential{APIKeys: keys})
+	if err != nil {
+		t.Fatal(err)
+	}
+	version, err := aiCodeWithCredentialSetVersion(normalized)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 8, 20, 10, 0, 0, 0, cstLocation).Unix()
+	row := ChannelUpstreamAccount{Domain: server.Listener.Addr().String(), Provider: upstreamProviderAICodeWith, BaseURL: server.URL}
+	published, _, used, err := m.processAICodeWithRound(context.Background(), &row, normalized, version, "tail", cstDayStart(now), now, now, aiCodeWithKeysPerTurn)
+	if err != nil || published || used != 2 {
+		t.Fatalf("first turn published=%v used=%d err=%v", published, used, err)
+	}
+	var publicCount int64
+	if err := m.storeDB.Model(&ChannelUpstreamUsageHour{}).Where("domain = ?", row.Domain).Count(&publicCount).Error; err != nil {
+		t.Fatal(err)
+	}
+	if publicCount != 0 {
+		t.Fatalf("partial round leaked %d public usage rows", publicCount)
+	}
+	published, _, used, err = m.processAICodeWithRound(context.Background(), &row, normalized, version, "tail", cstDayStart(now), now, now+3*60, aiCodeWithKeysPerTurn)
+	if err != nil || !published || used != 3 {
+		t.Fatalf("recovery turn published=%v used=%d err=%v", published, used, err)
+	}
+	callsMu.Lock()
+	defer callsMu.Unlock()
+	if calls[firstSuccessfulKey] != 1 || requestNumber != 5 {
+		t.Fatalf("unexpected retry calls=%v", calls)
+	}
+	retriedKeys := 0
+	for _, count := range calls {
+		if count == 2 {
+			retriedKeys++
+		} else if count != 1 {
+			t.Fatalf("unexpected retry calls=%v", calls)
+		}
+	}
+	if retriedKeys != 1 {
+		t.Fatalf("expected exactly one failed key to be retried: %v", calls)
+	}
+	var buckets []ChannelUpstreamUsageHour
+	if err := m.storeDB.Where("domain = ?", row.Domain).Find(&buckets).Error; err != nil {
+		t.Fatal(err)
+	}
+	var totalCost float64
+	for _, bucket := range buckets {
+		totalCost += bucket.CostUSD
+	}
+	if math.Abs(totalCost-4) > 1e-9 {
+		t.Fatalf("published total cost=%v, want 4", totalCost)
+	}
+}
+
+func TestAICodeWithSQLiteWriterLockDoesNotAdvancePublishedWatermarks(t *testing.T) {
+	const key = "sk-acw-sqlite-lock"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start, end := r.URL.Query().Get("start"), r.URL.Query().Get("end")
+		_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{
+			"api_key_id": 91, "period": map[string]any{"start": start, "end": end}, "group_by": "day",
+			"summary": map[string]any{"cost": "9.00", "total_tokens": 90, "requests": 9},
+			"daily":   []any{map[string]any{"date": start, "cost": "9.00", "total_tokens": 90, "requests": 9}},
+		}})
+	}))
+	defer server.Close()
+	m := newChannelUpstreamTestMonitor(t)
+	normalized, err := normalizeAICodeWithCredential(aiCodeWithCredential{APIKey: key})
+	if err != nil {
+		t.Fatal(err)
+	}
+	version, err := aiCodeWithCredentialSetVersion(normalized)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 8, 20, 10, 0, 0, 0, cstLocation).Unix()
+	oldWatermark := now - 3600
+	row := ChannelUpstreamAccount{
+		Domain: server.Listener.Addr().String(), Provider: upstreamProviderAICodeWith, BaseURL: server.URL,
+		Enabled: true, UsageSyncEnabled: true, UsageStatus: upstreamStatusOK, UsageDataUntil: oldWatermark,
+	}
+	if err := m.storeDB.Create(&row).Error; err != nil {
+		t.Fatal(err)
+	}
+	state := AICodeWithKeySyncState{
+		Domain: row.Domain, SlotID: normalized.Slots[0].SlotID, CredentialSetVersion: version,
+		Ordinal: 1, Status: upstreamStatusOK, LastSuccessAt: oldWatermark,
+	}
+	if err := m.storeDB.Create(&state).Error; err != nil {
+		t.Fatal(err)
+	}
+	round := AICodeWithUsageRound{
+		Domain: row.Domain, Kind: "tail", RoundID: "round-before-lock", CredentialSetVersion: version,
+		WindowFrom: cstDayStart(now), WindowTo: now, TotalKeys: 1, Status: upstreamStatusPending, CreatedAt: now, UpdatedAt: now,
+	}
+	if err := m.storeDB.Create(&round).Error; err != nil {
+		t.Fatal(err)
+	}
+	oldBucket := ChannelUpstreamUsageHour{Domain: row.Domain, HourTs: oldWatermark / 3600 * 3600, BucketSeconds: 3600, Provider: upstreamProviderAICodeWith, Requests: 3, CostUSD: 3}
+	if err := m.storeDB.Create(&oldBucket).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	primarySQL, err := m.storeDB.DB()
+	if err != nil {
+		t.Fatal(err)
+	}
+	primarySQL.SetMaxOpenConns(1)
+	if err := m.storeDB.Exec("PRAGMA busy_timeout=0").Error; err != nil {
+		t.Fatal(err)
+	}
+	lockDB, err := gorm.Open(sqlite.Open(m.cfg.StorePath+"?_pragma=busy_timeout(0)&_pragma=journal_mode(WAL)"), &gorm.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	lockSQL, err := lockDB.DB()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lockSQL.Close()
+	if err := lockDB.Exec("BEGIN EXCLUSIVE").Error; err != nil {
+		t.Fatal(err)
+	}
+	locked := true
+	defer func() {
+		if locked {
+			_ = lockDB.Exec("ROLLBACK").Error
+		}
+	}()
+
+	published, _, _, syncErr := m.processAICodeWithRound(context.Background(), &row, normalized, version, "tail", round.WindowFrom, round.WindowTo, now, 1)
+	if syncErr == nil || published || !isUpstreamUsageLocalStoreBusy(syncErr) {
+		t.Fatalf("locked run published=%v err=%v", published, syncErr)
+	}
+	if err := lockDB.Exec("ROLLBACK").Error; err != nil {
+		t.Fatal(err)
+	}
+	locked = false
+
+	var storedRow ChannelUpstreamAccount
+	if err := m.storeDB.First(&storedRow, "domain = ?", row.Domain).Error; err != nil {
+		t.Fatal(err)
+	}
+	if storedRow.UsageDataUntil != oldWatermark || storedRow.UsageLastSuccessAt != 0 {
+		t.Fatalf("account watermark advanced through failed transaction: %+v", storedRow)
+	}
+	var storedState AICodeWithKeySyncState
+	if err := m.storeDB.First(&storedState, "domain = ? AND slot_id = ?", row.Domain, state.SlotID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if storedState.TailRoundID != "" || storedState.SourceKeyID != 0 || storedState.LastSuccessAt != oldWatermark {
+		t.Fatalf("key watermark advanced through failed transaction: %+v", storedState)
+	}
+	var stageCount int64
+	if err := m.storeDB.Model(&AICodeWithUsageStage{}).Where("domain = ?", row.Domain).Count(&stageCount).Error; err != nil {
+		t.Fatal(err)
+	}
+	if stageCount != 0 {
+		t.Fatalf("partial stage rows leaked after lock failure: %d", stageCount)
+	}
+	var buckets []ChannelUpstreamUsageHour
+	if err := m.storeDB.Where("domain = ?", row.Domain).Find(&buckets).Error; err != nil {
+		t.Fatal(err)
+	}
+	if len(buckets) != 1 || buckets[0].HourTs != oldBucket.HourTs || buckets[0].Requests != oldBucket.Requests || buckets[0].CostUSD != oldBucket.CostUSD {
+		t.Fatalf("published usage changed through failed transaction: %+v", buckets)
+	}
+}
+
 func TestAICodeWithFourEightAndSixtyFourKeysPublishTailAndHistoryAcrossDurableTurns(t *testing.T) {
 	for _, total := range []int{4, 8, maxAICodeWithAPIKeys} {
 		t.Run(fmt.Sprintf("keys_%d", total), func(t *testing.T) {
@@ -1033,7 +1456,7 @@ func TestAICodeWithFourEightAndSixtyFourKeysPublishTailAndHistoryAcrossDurableTu
 					if turn >= total/(2*aiCodeWithKeysPerTurn) {
 						// A new worker object has no in-process cursor. It must resume
 						// solely from the SQLite key/round/stage records.
-						worker = &Monitor{storeDB: m.storeDB, upstreamClient: m.upstreamClient}
+						worker = &Monitor{storeDB: m.storeDB, upstreamClient: m.upstreamClient, upstreamAICodeWithInterval: time.Millisecond}
 					}
 					var done int64
 					var used int

@@ -1562,6 +1562,11 @@ func (m *Monitor) syncDueUpstreamPricing(ctx context.Context) {
 }
 
 func (m *Monitor) syncStoredUpstreamPricing(ctx context.Context, domain string) (ChannelUpstreamPricingSyncState, error) {
+	release, err := m.tryAcquireUpstreamAccountBackground(domain)
+	if err != nil {
+		return ChannelUpstreamPricingSyncState{Domain: domain}, err
+	}
+	defer release()
 	var account ChannelUpstreamAccount
 	if err := m.storeDB.WithContext(ctx).Select("domain", "provider").First(&account, "domain = ?", domain).Error; err != nil {
 		return ChannelUpstreamPricingSyncState{}, err

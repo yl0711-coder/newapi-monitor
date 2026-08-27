@@ -110,6 +110,21 @@ func newGuardedTestClient(base http.RoundTripper, store *gorm.DB, clock upstream
 	return installUpstreamHostGuardForTest(&http.Client{Transport: base}, store, guard)
 }
 
+func TestUpstreamHostGuardClampsGlobalConcurrency(t *testing.T) {
+	for _, test := range []struct {
+		configured int
+		want       int
+	}{{0, 1}, {1, 1}, {2, 2}, {99, 2}} {
+		guard := newUpstreamHostGuard(nil, upstreamHostGuardOptions{
+			Clock:  &fakeUpstreamGuardClock{now: time.Unix(1_800_000_000, 0)},
+			Jitter: func() time.Duration { return 0 }, GlobalConcurrency: test.configured,
+		})
+		if got := cap(guard.globalSem); got != test.want {
+			t.Fatalf("configured=%d capacity=%d, want %d", test.configured, got, test.want)
+		}
+	}
+}
+
 func doGuardTestRequest(t *testing.T, client *http.Client, method, endpoint string) (*http.Response, error) {
 	t.Helper()
 	req, err := http.NewRequestWithContext(context.Background(), method, endpoint, nil)

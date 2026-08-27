@@ -50,6 +50,9 @@ const (
 	// 配置页面按行动态添加 Key，不以业务套餐数作人为限制。
 	// 这里的 64 只是请求体/密文和单轮上游访问的安全边界，而不是 UI 固定槽位。
 	maxAICodeWithAPIKeys = 64
+	// 管理端一次只验证少量新增/替换 Key。更大的集合通过多次原子保存逐步加入，
+	// 避免一个浏览器请求为了账户级 8 秒节流持续数分钟。
+	maxAICodeWithKeyChangesPerSave = 4
 )
 
 // ChannelUpstreamAccount 是归并主域名对应的上游面板账户。
@@ -225,6 +228,8 @@ type ChannelUpstreamAccountView struct {
 	UsageWorkerEnabled            bool                              `json:"usage_worker_enabled"`
 	UsageStatus                   string                            `json:"usage_status,omitempty"`
 	UsageEffectiveStatus          string                            `json:"usage_effective_status,omitempty"`
+	UsageTailPhase                string                            `json:"usage_tail_phase,omitempty"`
+	UsageHistoryPhase             string                            `json:"usage_history_phase,omitempty"`
 	UsageFresh                    bool                              `json:"usage_fresh"`
 	UsageLagSeconds               int64                             `json:"usage_lag_seconds,omitempty"`
 	UsageFreshnessLimitSeconds    int64                             `json:"usage_freshness_limit_seconds,omitempty"`
@@ -268,15 +273,19 @@ type ChannelUpstreamAccountView struct {
 // SlotID is generated locally and is safe to round-trip through the UI; the
 // actual key and the upstream api_key_id are never returned by an API.
 type AICodeWithKeySlotView struct {
-	SlotID                string `json:"slot_id"`
-	Name                  string `json:"name,omitempty"`
-	Label                 string `json:"label"`
-	Status                string `json:"status,omitempty"`
-	LastSuccessAt         int64  `json:"last_success_at,omitempty"`
-	NextSyncAt            int64  `json:"next_sync_at,omitempty"`
-	ConsecutiveFails      int    `json:"consecutive_fails,omitempty"`
-	BackfillDone          bool   `json:"backfill_done,omitempty"`
-	BackfillLastSuccessAt int64  `json:"backfill_last_success_at,omitempty"`
+	SlotID                   string `json:"slot_id"`
+	Name                     string `json:"name,omitempty"`
+	Label                    string `json:"label"`
+	Status                   string `json:"status,omitempty"`
+	LastError                string `json:"last_error,omitempty"`
+	LastSuccessAt            int64  `json:"last_success_at,omitempty"`
+	NextSyncAt               int64  `json:"next_sync_at,omitempty"`
+	ConsecutiveFails         int    `json:"consecutive_fails,omitempty"`
+	BackfillDone             bool   `json:"backfill_done,omitempty"`
+	BackfillLastError        string `json:"backfill_last_error,omitempty"`
+	BackfillLastSuccessAt    int64  `json:"backfill_last_success_at,omitempty"`
+	BackfillNextSyncAt       int64  `json:"backfill_next_sync_at,omitempty"`
+	BackfillConsecutiveFails int    `json:"backfill_consecutive_fails,omitempty"`
 }
 
 type channelUpstreamSaveInput struct {
@@ -432,7 +441,7 @@ func upstreamSyncMinutes(s Settings) int {
 func upstreamUsageSyncMinutes(s Settings) int {
 	minutes := s.UpstreamUsageSyncMinutes
 	if minutes <= 0 {
-		minutes = 30
+		minutes = 20
 	}
 	if minutes < 15 {
 		minutes = 15
@@ -454,6 +463,16 @@ func upstreamUsageBackfillDays(s Settings) int {
 	return days
 }
 
+func upstreamMaxConcurrency(s Settings) int {
+	if s.UpstreamMaxConcurrency < 1 {
+		return 1
+	}
+	if s.UpstreamMaxConcurrency > 2 {
+		return 2
+	}
+	return s.UpstreamMaxConcurrency
+}
+
 func upstreamSyncTimeout(s Settings) time.Duration {
 	seconds := s.UpstreamSyncTimeoutSec
 	if seconds <= 0 {
@@ -471,9 +490,9 @@ func upstreamSyncTimeout(s Settings) time.Duration {
 func upstreamSaveTimeout(s Settings, provider string, keyCount int) time.Duration {
 	timeout := upstreamSyncTimeout(s) + 5*time.Second
 	if provider == upstreamProviderAICodeWith && keyCount > 1 {
-		// 首次保存会逐把验证，而 host guard 会对同一上游强制串行和启动间隔。
-		// 把这部分可预知的等待纳入管理员显式保存的 deadline，避免第 16 把之后必然超时。
-		timeout += time.Duration(keyCount-1) * (upstreamGuardMinInterval + upstreamGuardMaxJitter)
+		// 保存只验证一把旧基准 Key 和最多四把变更 Key，并遵守
+		// AICodeWith 账户级请求间隔；把可预知的等待纳入管理请求 deadline。
+		timeout += time.Duration(keyCount-1) * aiCodeWithUsageRequestInterval
 	}
 	if timeout > 2*time.Minute {
 		return 2 * time.Minute
@@ -857,6 +876,15 @@ func (m *Monitor) aicodeWithSlotViews(ctx context.Context, row ChannelUpstreamAc
 	if row.Provider != upstreamProviderAICodeWith {
 		return nil
 	}
+	var states []AICodeWithKeySyncState
+	_ = m.storeDB.WithContext(ctx).Where("domain = ?", row.Domain).Find(&states).Error
+	return m.aicodeWithSlotViewsFromStates(row, states)
+}
+
+func (m *Monitor) aicodeWithSlotViewsFromStates(row ChannelUpstreamAccount, states []AICodeWithKeySyncState) []AICodeWithKeySlotView {
+	if row.Provider != upstreamProviderAICodeWith {
+		return nil
+	}
 	credential, err := m.credentialForAccount(row)
 	if err != nil {
 		return nil
@@ -869,8 +897,6 @@ func (m *Monitor) aicodeWithSlotViews(ctx context.Context, row ChannelUpstreamAc
 	if err != nil {
 		return nil
 	}
-	var states []AICodeWithKeySyncState
-	_ = m.storeDB.WithContext(ctx).Where("domain = ?", row.Domain).Find(&states).Error
 	byID := make(map[string]AICodeWithKeySyncState, len(states))
 	for _, state := range states {
 		byID[state.SlotID] = state
@@ -884,9 +910,10 @@ func (m *Monitor) aicodeWithSlotViews(ctx context.Context, row ChannelUpstreamAc
 		}
 		views = append(views, AICodeWithKeySlotView{
 			SlotID: slot.SlotID, Name: slot.Name, Label: label, Status: state.Status,
-			LastSuccessAt: state.LastSuccessAt, NextSyncAt: state.NextSyncAt,
+			LastError: state.LastError, LastSuccessAt: state.LastSuccessAt, NextSyncAt: state.NextSyncAt,
 			ConsecutiveFails: state.ConsecutiveFails, BackfillDone: state.BackfillDone,
-			BackfillLastSuccessAt: state.BackfillLastSuccessAt,
+			BackfillLastError: state.BackfillLastError, BackfillLastSuccessAt: state.BackfillLastSuccessAt,
+			BackfillNextSyncAt: state.BackfillNextSyncAt, BackfillConsecutiveFails: state.BackfillConsecutiveFails,
 		})
 	}
 	return views
@@ -947,10 +974,43 @@ func decorateUpstreamUsageHealth(view *ChannelUpstreamAccountView, row ChannelUp
 		view.UsageEffectiveStatus = upstreamStatusDisabled
 	case row.UsageStatus == upstreamStatusError || row.UsageStatus == upstreamStatusReconnect || row.UsageStatus == upstreamStatusUnsupported:
 		view.UsageEffectiveStatus = row.UsageStatus
+	case row.UsageLastAttemptAt == 0 && row.UsageLastSuccessAt == 0:
+		// A newly enabled account can still carry the persisted legacy value
+		// "disabled" until the scheduler selects it for the first time. Expose
+		// that as a queue state instead of incorrectly telling operators that
+		// the account is not enabled.
+		view.UsageEffectiveStatus = "queued"
 	case row.UsageStatus == upstreamStatusOK && !view.UsageFresh:
 		view.UsageEffectiveStatus = "stale"
 	default:
 		view.UsageEffectiveStatus = row.UsageStatus
+	}
+	view.UsageTailPhase = view.UsageEffectiveStatus
+	view.UsageHistoryPhase = upstreamUsageHistoryPhase(row, s)
+}
+
+// upstreamUsageHistoryPhase is deliberately independent from the realtime
+// usage Tail. A historical page timeout must not make a fresh current-day
+// watermark look unavailable, and a never-scheduled account must not be
+// presented as if it were already backfilling.
+func upstreamUsageHistoryPhase(row ChannelUpstreamAccount, s Settings) string {
+	switch {
+	case !s.UpstreamUsageSyncEnabled:
+		return "global_off"
+	case !row.Enabled || !row.UsageSyncEnabled:
+		return upstreamStatusDisabled
+	case row.UsageStatus == upstreamStatusError || row.UsageStatus == upstreamStatusReconnect || row.UsageStatus == upstreamStatusUnsupported:
+		return "blocked"
+	case row.UsageBackfillDone:
+		return "complete"
+	case row.UsageBackfillLastError != "":
+		return "retry"
+	case row.UsageBackfillLastAttemptAt == 0 && row.UsageBackfillLastSuccessAt == 0:
+		return "queued"
+	case row.UsageBackfillProgress != "":
+		return "paging"
+	default:
+		return "backfilling"
 	}
 }
 
@@ -977,7 +1037,11 @@ func syncAICodeWithBalanceSnapshot(ctx context.Context, client *http.Client, row
 		}
 		return upstreamBalanceResult{}, cred, &upstreamAuthError{err: err}
 	}
+	pacer := newUpstreamUsageRequestPacer(len(normalized.Slots), aiCodeWithUsageRequestInterval)
 	for index := range normalized.Slots {
+		if paceErr := pacer.beforeRequest(ctx); paceErr != nil {
+			return upstreamBalanceResult{}, normalized, paceErr
+		}
 		result, _, syncErr := syncAICodeWithBalance(ctx, client, row, aiCodeWithCredential{Slots: normalized.Slots[index : index+1]})
 		if syncErr == nil {
 			return result, normalized, nil
@@ -1005,9 +1069,21 @@ func (m *Monitor) loadChannelUpstreamViews(ctx context.Context) (map[string]Chan
 	for _, state := range pricingStates {
 		stateByAccount[state.Domain+"\x00"+state.AccountEpoch] = state
 	}
+	var keyStates []AICodeWithKeySyncState
+	if err := m.storeDB.WithContext(ctx).Find(&keyStates).Error; err != nil {
+		return nil, err
+	}
+	keyStatesByDomain := make(map[string][]AICodeWithKeySyncState)
+	for _, state := range keyStates {
+		keyStatesByDomain[state.Domain] = append(keyStatesByDomain[state.Domain], state)
+	}
 	out := make(map[string]ChannelUpstreamAccountView, len(rows))
 	for _, row := range rows {
 		view := m.channelUpstreamAccountView(row)
+		// Key names and per-key checkpoints are local, non-secret operational
+		// state. Including them here lets the unified sync page explain which
+		// AICodeWith key is waiting or retrying without contacting the upstream.
+		view.APIKeySlots = m.aicodeWithSlotViewsFromStates(row, keyStatesByDomain[row.Domain])
 		view.PricingLedgerWorkerEnabled = m.cfg.UpstreamPricingLedgerEnabled
 		view.PricingLedgerEligible = pricingLedgerProviderSupported(row.Provider) && pricingLedgerDomainAllowed(m.cfg.UpstreamPricingLedgerDomains, row.Domain)
 		view.PricingLedgerCapability = pricingLedgerCapabilityLabel(row.Provider)
@@ -1320,7 +1396,7 @@ func (m *Monitor) channelUpstreamHTTPClient() *http.Client {
 		// 仅兼容直接构造 Monitor 的单元测试；生产实例均由 New 初始化并复用连接池。
 		client = newUpstreamHTTPClient(upstreamSyncTimeout(m.cfg))
 	}
-	return installUpstreamHostGuard(client, m.storeDB)
+	return installUpstreamHostGuardWithConcurrency(client, m.storeDB, upstreamMaxConcurrency(m.cfg))
 }
 
 func upstreamResponseMessage(body []byte) string {
@@ -1544,6 +1620,10 @@ func decodeAICodeWithBalance(body []byte) (float64, string, error) {
 }
 
 func syncAICodeWithBalance(ctx context.Context, client *http.Client, row ChannelUpstreamAccount, cred aiCodeWithCredential) (upstreamBalanceResult, aiCodeWithCredential, error) {
+	return syncAICodeWithBalanceWithPacer(ctx, client, row, cred, nil)
+}
+
+func syncAICodeWithBalanceWithPacer(ctx context.Context, client *http.Client, row ChannelUpstreamAccount, cred aiCodeWithCredential, pacer *upstreamUsageRequestPacer) (upstreamBalanceResult, aiCodeWithCredential, error) {
 	normalized, keyErr := normalizeAICodeWithCredential(cred)
 	keys, keysErr := aiCodeWithCredentialKeys(normalized)
 	if keyErr == nil {
@@ -1558,6 +1638,9 @@ func syncAICodeWithBalance(ctx context.Context, client *http.Client, row Channel
 	var balanceRaw, balanceUnit float64
 	var balanceCurrency string
 	for index, apiKey := range keys {
+		if err := pacer.beforeRequest(ctx); err != nil {
+			return upstreamBalanceResult{}, cred, err
+		}
 		body, err := doUpstreamJSON(ctx, client, http.MethodGet, aicodeWithEndpoint(row.BaseURL, "/api/v1/balance"), map[string]string{
 			"Authorization": "Bearer " + apiKey,
 		}, nil)
@@ -1585,6 +1668,46 @@ func syncAICodeWithBalance(ctx context.Context, client *http.Client, row Channel
 	return upstreamBalanceResult{
 		BalanceUSD: balanceRaw / balanceUnit, BalanceRaw: balanceRaw, BalanceUnit: balanceUnit,
 	}, normalized, nil
+}
+
+func aicodeWithSaveValidationCredential(existing *aiCodeWithCredential, next aiCodeWithCredential) (aiCodeWithCredential, int, error) {
+	normalizedNext, err := normalizeAICodeWithCredential(next)
+	if err != nil {
+		return aiCodeWithCredential{}, 0, err
+	}
+	existingBySlot := make(map[string]aiCodeWithKeyCredential)
+	if existing != nil {
+		normalizedExisting, normalizeErr := normalizeAICodeWithCredential(*existing)
+		if normalizeErr != nil {
+			return aiCodeWithCredential{}, 0, normalizeErr
+		}
+		for _, slot := range normalizedExisting.Slots {
+			existingBySlot[slot.SlotID] = slot
+		}
+	}
+	changed := make([]aiCodeWithKeyCredential, 0, len(normalizedNext.Slots))
+	unchanged := make([]aiCodeWithKeyCredential, 0, len(normalizedNext.Slots))
+	for _, slot := range normalizedNext.Slots {
+		previous, ok := existingBySlot[slot.SlotID]
+		if ok && previous.Secret == slot.Secret {
+			unchanged = append(unchanged, slot)
+			continue
+		}
+		changed = append(changed, slot)
+	}
+	if len(changed) > maxAICodeWithKeyChangesPerSave {
+		return aiCodeWithCredential{}, 0, fmt.Errorf("每次最多新增或替换 %d 把 AICodeWith API Key，请分批保存", maxAICodeWithKeyChangesPerSave)
+	}
+	if len(changed) == 0 {
+		return aiCodeWithCredential{}, 0, nil
+	}
+	validation := make([]aiCodeWithKeyCredential, 0, len(changed)+1)
+	// 用一把仍保留的已验证 Key 作为账户余额基准；不重扫其余旧 Key。
+	if len(unchanged) > 0 {
+		validation = append(validation, unchanged[0])
+	}
+	validation = append(validation, changed...)
+	return aiCodeWithCredential{Slots: validation}, len(validation), nil
 }
 
 func decodeSub2APIData(body []byte, out any) error {
@@ -1945,11 +2068,28 @@ func (m *Monitor) persistUpstreamAccount(ctx context.Context, row *ChannelUpstre
 }
 
 func (m *Monitor) syncStoredUpstreamAccount(ctx context.Context, domain string) (ChannelUpstreamAccount, error) {
-	m.upstreamSyncMu.Lock()
-	defer m.upstreamSyncMu.Unlock()
+	return m.syncStoredUpstreamAccountWithPriority(ctx, domain, false)
+}
+
+func (m *Monitor) syncStoredUpstreamAccountBackground(ctx context.Context, domain string) (ChannelUpstreamAccount, error) {
+	return m.syncStoredUpstreamAccountWithPriority(ctx, domain, true)
+}
+
+func (m *Monitor) syncStoredUpstreamAccountWithPriority(ctx context.Context, domain string, background bool) (ChannelUpstreamAccount, error) {
+	var release func()
+	var err error
+	if background {
+		release, err = m.tryAcquireUpstreamAccountBackground(domain)
+	} else {
+		release, err = m.acquireUpstreamAccountAdmin(ctx, domain)
+	}
+	if err != nil {
+		return ChannelUpstreamAccount{Domain: domain}, err
+	}
+	defer release()
 	var row ChannelUpstreamAccount
-	if err := m.storeDB.WithContext(ctx).First(&row, "domain = ?", domain).Error; err != nil {
-		return row, err
+	if loadErr := m.storeDB.WithContext(ctx).First(&row, "domain = ?", domain).Error; loadErr != nil {
+		return row, loadErr
 	}
 	if !row.Enabled {
 		return row, fmt.Errorf("该上游账户已停用自动同步")
@@ -2114,10 +2254,12 @@ func (m *Monitor) saveChannelUpstreamHandler(c *gin.Context) {
 	for _, addition := range in.AddAPIKeySlots {
 		requestSecrets = append(requestSecrets, addition.APIKey)
 	}
-	keyChangeCount := len(in.APIKeys) + len(in.AddAPIKeys) + len(in.AddAPIKeySlots)
-	ctx, cancel := context.WithTimeout(c.Request.Context(), upstreamSaveTimeout(m.cfg, in.Provider, keyChangeCount))
-	defer cancel()
-	exists, err := m.channelDomainExists(ctx, in.Domain)
+	validationKeyBudget := len(in.APIKeys) + len(in.AddAPIKeys) + len(in.AddAPIKeySlots)
+	if in.Provider == upstreamProviderAICodeWith {
+		// 一把旧 Key 基准 + 每次最多四把变更 Key。
+		validationKeyBudget = maxAICodeWithKeyChangesPerSave + 1
+	}
+	exists, err := m.channelDomainExists(c.Request.Context(), in.Domain)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "核对主域名失败"})
 		return
@@ -2127,8 +2269,16 @@ func (m *Monitor) saveChannelUpstreamHandler(c *gin.Context) {
 		return
 	}
 
-	m.upstreamSyncMu.Lock()
-	defer m.upstreamSyncMu.Unlock()
+	releaseAccount, err := m.acquireUpstreamAccountAdmin(c.Request.Context(), in.Domain)
+	if err != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "该上游账户正在执行其他操作，请稍后重试"})
+		return
+	}
+	defer releaseAccount()
+	// Waiting for an unrelated account no longer consumes this operation's
+	// validation deadline. The timeout starts only after this domain is ours.
+	ctx, cancel := context.WithTimeout(c.Request.Context(), upstreamSaveTimeout(m.cfg, in.Provider, validationKeyBudget))
+	defer cancel()
 	var existing ChannelUpstreamAccount
 	existingErr := m.storeDB.WithContext(ctx).First(&existing, "domain = ?", in.Domain).Error
 	if existingErr != nil && !errors.Is(existingErr, gorm.ErrRecordNotFound) {
@@ -2155,6 +2305,7 @@ func (m *Monitor) saveChannelUpstreamHandler(c *gin.Context) {
 		row.UsageSyncEnabled = existing.UsageSyncEnabled
 	}
 	var credential any
+	var existingAICodeWithCredential *aiCodeWithCredential
 	preserveSealedCredential := false
 	credentialUpdated := in.AccessToken != "" || len(in.APIKeys) > 0 || len(in.AddAPIKeys) > 0 || len(in.AddAPIKeySlots) > 0 || len(in.RemoveAPIKeyIDs) > 0 || in.Password != ""
 	credentialMetadataChanged := len(in.RenameAPIKeySlots) > 0
@@ -2205,12 +2356,16 @@ func (m *Monitor) saveChannelUpstreamHandler(c *gin.Context) {
 				current, ok := currentAny.(aiCodeWithCredential)
 				if !ok {
 					err = fmt.Errorf("AICodeWith 凭据格式无效")
-				} else if len(additions) > 0 || len(in.RenameAPIKeySlots) > 0 || len(in.RemoveAPIKeyIDs) > 0 {
+				} else {
+					existingCopy := current
+					existingAICodeWithCredential = &existingCopy
+				}
+				if err == nil && (len(additions) > 0 || len(in.RenameAPIKeySlots) > 0 || len(in.RemoveAPIKeyIDs) > 0) {
 					var changed aiCodeWithCredential
 					changed, err = applyAICodeWithSlotChanges(current, additions, in.RenameAPIKeySlots, in.RemoveAPIKeyIDs)
 					credential = changed
 					credentialSetChanged = err == nil && (len(additions) > 0 || len(in.RemoveAPIKeyIDs) > 0)
-				} else {
+				} else if err == nil {
 					credential, err = normalizeAICodeWithCredential(current)
 				}
 			}
@@ -2331,7 +2486,26 @@ func (m *Monitor) saveChannelUpstreamHandler(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"account": view})
 		return
 	}
-	result, updatedCredential, syncErr := m.syncUpstreamCredential(ctx, row, credential)
+	var result upstreamBalanceResult
+	updatedCredential := credential
+	var syncErr error
+	if row.Provider == upstreamProviderAICodeWith {
+		fullCredential := credential.(aiCodeWithCredential)
+		validationCredential, validationCount, validationErr := aicodeWithSaveValidationCredential(existingAICodeWithCredential, fullCredential)
+		if validationErr != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": sanitizeUpstreamErrorWithSecrets(validationErr, requestSecrets...)})
+			return
+		}
+		if validationCount == 0 {
+			// 删除、改名或开关操作沿用最近完整余额；后台余额快照会按原频率更新。
+			result = upstreamBalanceResult{BalanceUSD: row.BalanceUSD, BalanceRaw: row.BalanceRaw, BalanceUnit: row.BalanceUnit, UnitAssumed: row.UnitAssumed}
+		} else {
+			pacer := newUpstreamUsageRequestPacer(validationCount, m.aiCodeWithRequestInterval())
+			result, _, syncErr = syncAICodeWithBalanceWithPacer(ctx, m.channelUpstreamHTTPClient(), row, validationCredential, pacer)
+		}
+	} else {
+		result, updatedCredential, syncErr = m.syncUpstreamCredential(ctx, row, credential)
+	}
 	credentialSecrets := append([]string{}, requestSecrets...)
 	credentialSecrets = append(credentialSecrets, upstreamCredentialSecrets(credential)...)
 	credential = updatedCredential
@@ -2429,43 +2603,56 @@ func (m *Monitor) startChannelUpstreamSync(ctx context.Context) {
 	if !m.cfg.UpstreamUsageSyncEnabled {
 		slog.Info("上游使用日志同步处于灰度关闭状态，余额同步不受影响")
 	}
-	goSourceEpoch(ctx, func(ctx context.Context) {
-		defer m.channelUpstreamHTTPClient().CloseIdleConnections()
-		timer := time.NewTimer(8 * time.Second)
-		defer timer.Stop()
+	// Keep the lanes independent. A slow balance provider must not delay usage
+	// freshness or pricing evidence until the whole balance batch finishes.
+	// Request-level host/global protection still bounds aggregate traffic, and
+	// account gates serialize operations that share one credential.
+	if m.cfg.UpstreamSyncEnabled {
+		goSourceEpoch(ctx, func(laneCtx context.Context) {
+			runUpstreamPeriodicLane(laneCtx, 8*time.Second, time.Minute, m.syncDueUpstreamAccounts)
+		})
+	}
+	if m.cfg.UpstreamUsageSyncEnabled {
+		goSourceEpoch(ctx, func(laneCtx context.Context) {
+			runUpstreamPeriodicLane(laneCtx, 9*time.Second, upstreamUsageSchedulerInterval, m.syncDueUpstreamUsage)
+		})
+	}
+	if m.cfg.UpstreamPricingLedgerEnabled {
+		goSourceEpoch(ctx, func(laneCtx context.Context) {
+			runUpstreamPeriodicLane(laneCtx, 10*time.Second, time.Minute, m.syncDueUpstreamPricing)
+		})
+	}
+	goSourceEpoch(ctx, func(cleanupCtx context.Context) {
+		<-cleanupCtx.Done()
+		m.channelUpstreamHTTPClient().CloseIdleConnections()
+	})
+}
+
+func runUpstreamPeriodicLane(ctx context.Context, initialDelay, interval time.Duration, run func(context.Context)) {
+	if initialDelay < 0 {
+		initialDelay = 0
+	}
+	if interval <= 0 {
+		interval = time.Minute
+	}
+	timer := time.NewTimer(initialDelay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return
+	case <-timer.C:
+		run(ctx)
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-timer.C:
-			if m.cfg.UpstreamSyncEnabled {
-				m.syncDueUpstreamAccounts(ctx)
-			}
-			if m.cfg.UpstreamUsageSyncEnabled {
-				m.syncDueUpstreamUsage(ctx)
-			}
-			if m.cfg.UpstreamPricingLedgerEnabled {
-				m.syncDueUpstreamPricing(ctx)
-			}
+		case <-ticker.C:
+			run(ctx)
 		}
-		ticker := time.NewTicker(time.Minute)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				if m.cfg.UpstreamSyncEnabled {
-					m.syncDueUpstreamAccounts(ctx)
-				}
-				if m.cfg.UpstreamUsageSyncEnabled {
-					m.syncDueUpstreamUsage(ctx)
-				}
-				if m.cfg.UpstreamPricingLedgerEnabled {
-					m.syncDueUpstreamPricing(ctx)
-				}
-			}
-		}
-	})
+	}
 }
 
 func (m *Monitor) syncDueUpstreamAccounts(ctx context.Context) {
@@ -2481,9 +2668,12 @@ func (m *Monitor) syncDueUpstreamAccounts(ctx context.Context) {
 			return
 		}
 		syncCtx, cancel := context.WithTimeout(ctx, upstreamSyncTimeout(m.cfg)+2*time.Second)
-		synced, err := m.syncStoredUpstreamAccount(syncCtx, row.Domain)
+		synced, err := m.syncStoredUpstreamAccountBackground(syncCtx, row.Domain)
 		cancel()
 		if err != nil {
+			if errors.Is(err, errUpstreamAccountBusy) {
+				continue
+			}
 			message := synced.LastError
 			if message == "" {
 				// 只有本地读取/持久化失败时可能没有上游错误正文；该错误不含明文凭据。

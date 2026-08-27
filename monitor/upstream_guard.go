@@ -89,9 +89,10 @@ func randomUpstreamGuardJitter() time.Duration {
 }
 
 type upstreamHostGuardOptions struct {
-	Clock       upstreamGuardClock
-	Jitter      upstreamGuardJitter
-	MinInterval time.Duration
+	Clock             upstreamGuardClock
+	Jitter            upstreamGuardJitter
+	MinInterval       time.Duration
+	GlobalConcurrency int
 }
 
 type upstreamHostGuard struct {
@@ -135,9 +136,18 @@ func newUpstreamHostGuard(store *gorm.DB, options upstreamHostGuardOptions) *ups
 	if options.MinInterval == 0 && options.Clock == nil && options.Jitter == nil {
 		interval = upstreamGuardMinInterval
 	}
+	globalConcurrency := options.GlobalConcurrency
+	if globalConcurrency < 1 {
+		globalConcurrency = 1
+	}
+	// 当前生产主机只有约 1 GiB 内存；该硬上限既保护本机，也避免一个
+	// 错误环境变量把多个上游同时打成突发。按 host 的 semaphore 仍是 1。
+	if globalConcurrency > 2 {
+		globalConcurrency = 2
+	}
 	return &upstreamHostGuard{
 		clock: clock, jitter: jitter, minInterval: interval,
-		globalSem: make(chan struct{}, 1), store: store,
+		globalSem: make(chan struct{}, globalConcurrency), store: store,
 		hosts: make(map[string]*upstreamGuardHostState),
 	}
 }
@@ -550,6 +560,10 @@ func (b *upstreamGuardResponseBody) Close() error {
 var upstreamGuardInstallMu sync.Mutex
 
 func installUpstreamHostGuard(client *http.Client, store *gorm.DB) *http.Client {
+	return installUpstreamHostGuardWithConcurrency(client, store, 1)
+}
+
+func installUpstreamHostGuardWithConcurrency(client *http.Client, store *gorm.DB, globalConcurrency int) *http.Client {
 	if client == nil {
 		client = newUpstreamHTTPClient(15 * time.Second)
 	}
@@ -565,7 +579,7 @@ func installUpstreamHostGuard(client *http.Client, store *gorm.DB) *http.Client 
 	}
 	client.Transport = &upstreamGuardTransport{
 		base:  base,
-		guard: newUpstreamHostGuard(store, upstreamHostGuardOptions{}),
+		guard: newUpstreamHostGuard(store, upstreamHostGuardOptions{GlobalConcurrency: globalConcurrency}),
 	}
 	return client
 }
