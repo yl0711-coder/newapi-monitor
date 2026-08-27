@@ -559,10 +559,6 @@ func (b *upstreamGuardResponseBody) Close() error {
 
 var upstreamGuardInstallMu sync.Mutex
 
-func installUpstreamHostGuard(client *http.Client, store *gorm.DB) *http.Client {
-	return installUpstreamHostGuardWithConcurrency(client, store, 1)
-}
-
 func installUpstreamHostGuardWithConcurrency(client *http.Client, store *gorm.DB, globalConcurrency int) *http.Client {
 	if client == nil {
 		client = newUpstreamHTTPClient(15 * time.Second)

@@ -1722,10 +1722,6 @@ func (m *Monitor) syncStoredUpstreamUsage(ctx context.Context, domain string) (C
 	return m.syncStoredUpstreamUsageWithPriority(ctx, domain, false, upstreamUsageLaneAuto)
 }
 
-func (m *Monitor) syncStoredUpstreamUsageBackground(ctx context.Context, domain string) (ChannelUpstreamAccount, error) {
-	return m.syncStoredUpstreamUsageWithPriority(ctx, domain, true, upstreamUsageLaneAuto)
-}
-
 func (m *Monitor) syncStoredUpstreamUsageLaneBackground(ctx context.Context, domain string, lane upstreamUsageLane) (ChannelUpstreamAccount, error) {
 	return m.syncStoredUpstreamUsageWithPriority(ctx, domain, true, lane)
 }
