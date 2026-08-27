@@ -1362,6 +1362,8 @@ func TestMonitorResponsiveShellAndWideTablesStayAdminOnly(t *testing.T) {
 	css := string(stabilityCSS)
 	for _, marker := range []string{
 		`.monitor-shell.sidebar-collapsed{grid-template-columns:76px minmax(0,1fr)}`,
+		`.monitor-shell.sidebar-collapsed .monitor-nav.tabs .tab::after`,
+		`transition-delay:1s,1s,1s`,
 		`.monitor-table-scroll{width:100%;max-width:100%;overflow-x:auto`,
 		`.monitor-table-model>table{min-width:1120px}`,
 		`.monitor-table-server>table{min-width:1180px}`,
@@ -1373,6 +1375,11 @@ func TestMonitorResponsiveShellAndWideTablesStayAdminOnly(t *testing.T) {
 	}
 	if !strings.Contains(string(stabilityJS), `nexusapi-monitor-sidebar-collapsed`) {
 		t.Fatal("侧栏收起状态没有持久化，刷新后会跳回展开态")
+	}
+	for _, marker := range []string{`item.dataset.navTooltip=text`, `item.removeAttribute('title')`, `item.setAttribute('aria-label',text)`} {
+		if !strings.Contains(string(stabilityJS), marker) {
+			t.Fatalf("收起侧栏的延迟文字说明缺少 %q", marker)
+		}
 	}
 	for _, forbidden := range []string{`monitorSidebarToggle`, `nexusapi-monitor-sidebar-collapsed`} {
 		if strings.Contains(portalHTML, forbidden) {

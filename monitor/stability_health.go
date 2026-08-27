@@ -25,6 +25,7 @@ type stabilityHourlyMigrationProgress struct {
 }
 
 type stabilityHealthResponse struct {
+	Enabled                    bool                              `json:"enabled"`
 	Status                     string                            `json:"status"`
 	CheckedAt                  int64                             `json:"checked_at"`
 	MainSamplerLastSuccess     int64                             `json:"main_sampler_last_success"`
@@ -53,14 +54,13 @@ type stabilityHealthResponse struct {
 	NginxRecentDataLossSources int                               `json:"nginx_recent_data_loss_sources"`
 }
 
-// serveStabilityHealth 只检查 Monitor 自身和本地采集状态，不主动查询 NewAPI 生产库，
-// 因而可以被运维页面频繁查看而不给主站增加负担。
-func (m *Monitor) serveStabilityHealth(c *gin.Context) {
-	now := time.Now().Unix()
-	ctx, cancel := context.WithTimeout(c.Request.Context(), 2*time.Second)
-	defer cancel()
+// stabilityHealth 只检查 Monitor 自身和本地采集状态，不主动查询 NewAPI
+// 生产库。独立成纯本地读取函数后，原健康接口和统一同步状态投影可以复用
+// 同一份判定，避免页面通过 HTTP 反调自身接口或复制状态语义。
+func (m *Monitor) stabilityHealth(ctx context.Context, nowTime time.Time) stabilityHealthResponse {
+	now := nowTime.Unix()
 	result := stabilityHealthResponse{
-		Status: "ok", CheckedAt: now, MainSamplerLastSuccess: m.lastRun.Load(),
+		Enabled: m.cfg.StabilityEnabled, Status: "ok", CheckedAt: now, MainSamplerLastSuccess: m.lastRun.Load(),
 		ProblemSamplerLastSuccess: m.problemLastSuccess.Load(), ProblemSamplerLastFailure: m.problemLastFailure.Load(),
 		ProblemMigration: m.stabilityProblemMigrationProgress(), NginxEnabled: m.cfg.NginxEnabled,
 	}
@@ -180,5 +180,13 @@ func (m *Monitor) serveStabilityHealth(c *gin.Context) {
 			result.Status = "degraded"
 		}
 	}
-	c.JSON(200, result)
+	return result
+}
+
+// serveStabilityHealth 只检查 Monitor 自身和本地采集状态，不主动查询 NewAPI 生产库，
+// 因而可以被运维页面频繁查看而不给主站增加负担。
+func (m *Monitor) serveStabilityHealth(c *gin.Context) {
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 2*time.Second)
+	defer cancel()
+	c.JSON(200, m.stabilityHealth(ctx, time.Now()))
 }

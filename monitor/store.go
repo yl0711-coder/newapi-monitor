@@ -1625,6 +1625,9 @@ type infraLatestRow struct {
 
 // storeInfraLatest 返回每个 (资源,指标) 的最新一条取值。
 func (m *Monitor) storeInfraLatest() []infraLatestRow {
+	m.infraAggregateMu.Lock()
+	defer m.infraAggregateMu.Unlock()
+
 	var rows []infraLatestRow
 	// 取每个 (resource,metric) 的最大 bucket_ts 对应行。
 	warnReadErr("storeInfraLatest", m.storeDB.Raw(`SELECT s.resource, s.rtype, s.metric, s.value, s.bucket_ts

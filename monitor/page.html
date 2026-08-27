@@ -363,8 +363,8 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
   .usage-history-detail summary{cursor:pointer;color:#c7d2fe;font-weight:600}.usage-history-detail table{margin-top:9px}.usage-history-detail th,.usage-history-detail td{padding:7px 9px;font-size:12px}.usage-history-detail .history-error{max-width:320px;color:#fca5a5;white-space:normal;word-break:break-word}
   .usage-history-inline{display:flex;gap:7px;align-items:center;flex-wrap:wrap}.usage-history-inline .badge{font-size:11px}.usage-history-retry{border:0;border-radius:5px;background:rgba(239,68,68,.18);color:#fca5a5;padding:3px 7px;cursor:pointer}.usage-history-retry:disabled{opacity:.5;cursor:wait}
   .sync-toolbar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin:0 0 14px}.sync-toolbar .muted{font-size:12px}.sync-toolbar .btn{margin-left:auto}
-  .sync-overview{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-bottom:14px}.sync-card{min-height:112px;padding:15px 16px;border:1px solid var(--border);border-radius:10px;background:rgba(255,255,255,.018)}.sync-card small{display:block;color:var(--text-muted);font-size:12px}.sync-card b{display:block;margin-top:10px;font-size:20px;line-height:1.25}.sync-card p{margin:7px 0 0;color:var(--text-muted);font-size:12px;line-height:1.45}.sync-card.ok{border-color:rgba(52,211,153,.30);background:rgba(52,211,153,.055)}.sync-card.warn{border-color:rgba(245,158,11,.32);background:rgba(245,158,11,.055)}.sync-card.bad{border-color:rgba(239,68,68,.34);background:rgba(239,68,68,.06)}
-  .sync-status{display:inline-flex;align-items:center;gap:6px;font-size:12px;font-weight:600}.sync-status:before{content:'';width:8px;height:8px;border-radius:50%;background:#94a3b8}.sync-status.ok{color:#6ee7b7}.sync-status.ok:before{background:#34d399}.sync-status.warn{color:#fbbf24}.sync-status.warn:before{background:#f59e0b}.sync-status.bad{color:#fca5a5}.sync-status.bad:before{background:#ef4444}.sync-section{margin-bottom:14px}.sync-section .card-header{display:flex;align-items:center;gap:9px}.sync-section .card-header .muted{font-size:12px;font-weight:400}.sync-kv{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:1px;background:var(--border)}.sync-kv>div{min-width:0;padding:12px 14px;background:var(--card)}.sync-kv small{display:block;color:var(--text-muted);font-size:11px}.sync-kv b{display:block;margin-top:5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:14px}.sync-table-note{padding:10px 14px;color:var(--text-muted);font-size:12px}
+  .sync-overview{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-bottom:14px}.sync-card{min-height:112px;padding:15px 16px;border:1px solid var(--border);border-radius:10px;background:rgba(255,255,255,.018)}.sync-card small{display:block;color:var(--text-muted);font-size:12px}.sync-card b{display:block;margin-top:10px;font-size:20px;line-height:1.25}.sync-card p{margin:7px 0 0;color:var(--text-muted);font-size:12px;line-height:1.45}.sync-card.ok{border-color:rgba(52,211,153,.30);background:rgba(52,211,153,.055)}.sync-card.warn{border-color:rgba(245,158,11,.32);background:rgba(245,158,11,.055)}.sync-card.bad{border-color:rgba(239,68,68,.34);background:rgba(239,68,68,.06)}.sync-card.neutral{border-color:var(--border);background:rgba(148,163,184,.035)}
+  .sync-status{display:inline-flex;align-items:center;gap:6px;font-size:12px;font-weight:600}.sync-status:before{content:'';width:8px;height:8px;border-radius:50%;background:#94a3b8}.sync-status.ok{color:#6ee7b7}.sync-status.ok:before{background:#34d399}.sync-status.warn{color:#fbbf24}.sync-status.warn:before{background:#f59e0b}.sync-status.bad{color:#fca5a5}.sync-status.bad:before{background:#ef4444}.sync-status.neutral{color:#94a3b8}.sync-section{margin-bottom:14px}.sync-section .card-header{display:flex;align-items:center;gap:9px}.sync-section .card-header .muted{font-size:12px;font-weight:400}.sync-kv{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:1px;background:var(--border)}.sync-kv>div{min-width:0;padding:12px 14px;background:var(--card)}.sync-kv small{display:block;color:var(--text-muted);font-size:11px}.sync-kv b{display:block;margin-top:5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:14px}.sync-table-note{padding:10px 14px;color:var(--text-muted);font-size:12px}
   .sync-upstream-summary{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:1px;background:var(--border);border-bottom:1px solid var(--border)}.sync-upstream-summary>div{padding:12px 14px;background:var(--card)}.sync-upstream-summary small{display:block;color:var(--text-muted);font-size:11px}.sync-upstream-summary b{display:block;margin-top:5px;font-size:18px}.sync-upstream-list{display:flex;flex-direction:column}.sync-upstream-account{padding:15px 16px;border-top:1px solid var(--border)}.sync-upstream-account:first-child{border-top:0}.sync-upstream-head{display:flex;align-items:flex-start;justify-content:space-between;gap:14px;margin-bottom:12px}.sync-upstream-head>div b{display:block;font-size:15px}.sync-upstream-head>div small{display:block;margin-top:4px;color:var(--text-muted);font-size:11px}.sync-upstream-lanes{display:grid;grid-template-columns:1fr 1.45fr;gap:10px}.sync-upstream-lane{min-width:0;padding:12px 13px;border:1px solid var(--border);border-radius:8px;background:rgba(255,255,255,.018)}.sync-upstream-lane>header{display:flex;align-items:center;justify-content:space-between;gap:10px}.sync-upstream-lane>header b{font-size:12px}.sync-upstream-lane>strong{display:block;margin-top:10px;font-size:15px}.sync-upstream-lane>p{margin:5px 0 0;color:var(--text-muted);font-size:11px;line-height:1.55}.sync-upstream-error{margin-top:8px;padding-top:8px;border-top:1px solid var(--border);color:#fca5a5!important;overflow-wrap:anywhere}.sync-upstream-note{margin-top:8px;padding-top:8px;border-top:1px solid var(--border);color:var(--text-muted)!important;overflow-wrap:anywhere}.sync-upstream-progress{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:10px}.sync-upstream-progress span{padding:8px 9px;border-radius:6px;background:rgba(255,255,255,.025)}.sync-upstream-progress small,.sync-upstream-progress b{display:block}.sync-upstream-progress small{color:var(--text-muted);font-size:10px}.sync-upstream-progress b{margin-top:4px;font-size:12px}
   @media(max-width:900px){.sync-overview,.sync-upstream-summary{grid-template-columns:repeat(2,minmax(0,1fr))}.sync-kv{grid-template-columns:repeat(2,minmax(0,1fr))}.sync-upstream-lanes{grid-template-columns:1fr}}@media(max-width:520px){.sync-overview,.sync-kv,.sync-upstream-summary{grid-template-columns:1fr}.sync-toolbar .btn{margin-left:0}.sync-upstream-head{flex-direction:column}.sync-upstream-progress{grid-template-columns:1fr}}
   code{background:rgba(255,255,255,.06);padding:1px 5px;border-radius:4px;font-size:12px}
@@ -374,7 +374,8 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
   .tabs .tab.active{color:var(--text);border-bottom-color:var(--accent);font-weight:600}
   .tabpane[hidden]{display:none}
 </style>
-<link rel="stylesheet" href="/stability.css?v=6">
+<link rel="stylesheet" href="/stability.css?v=8">
+<link rel="stylesheet" href="/capacity.css?v=1">
 </head>
 <body theme-mode="dark">
 <div class="monitor-shell">
@@ -389,6 +390,7 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
       <div class="tab" data-tab="stability" title="稳定性报表"><span class="monitor-nav-icon"><svg viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="m9 12 2 2 4-4"/></svg></span><span class="monitor-nav-label">稳定性报表</span></div>
       <div class="tab" data-tab="model" title="模型监控"><span class="monitor-nav-icon"><svg viewBox="0 0 24 24"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg></span><span class="monitor-nav-label">模型监控</span></div>
       <div class="tab" data-tab="server" title="服务端监控"><span class="monitor-nav-icon"><svg viewBox="0 0 24 24"><path d="M3 3v18h18"/><path d="m7 16 4-5 4 3 5-7"/></svg></span><span class="monitor-nav-label">服务端监控</span></div>
+      <div class="tab" data-tab="capacity" title="容量规划"><span class="monitor-nav-icon"><svg viewBox="0 0 24 24"><path d="M4 19V9M10 19V5M16 19v-8M22 19V3"/><path d="M2 19h22"/></svg></span><span class="monitor-nav-label">容量规划</span></div>
       <div class="tab" data-tab="sync" title="数据同步状态"><span class="monitor-nav-icon"><svg viewBox="0 0 24 24"><path d="M20 7h-6V1"/><path d="M4 17h6v6"/><path d="M20 7a8 8 0 0 0-13.7-3.6L4 5.7M4 17a8 8 0 0 0 13.7 3.6l2.3-2.3"/></svg></span><span class="monitor-nav-label">数据同步状态</span></div>
       <div class="tab" data-tab="logchain" title="客户排障"><span class="monitor-nav-icon"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/><path d="M11 8v3"/><path d="M11 14h.01"/></svg></span><span class="monitor-nav-label">客户排障</span></div>
     </nav>
@@ -413,6 +415,7 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
       <div class="tab" data-tab="stability">稳定性报表</div>
       <div class="tab" data-tab="model">模型监控</div>
       <div class="tab" data-tab="server">服务端监控</div>
+      <div class="tab" data-tab="capacity">容量规划</div>
       <div class="tab" data-tab="logchain">客户排障</div>
     </nav>
 
@@ -436,6 +439,7 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
     <div class="card-header">👥 用户用量事实 <span class="muted">全历史、实时 Tail、签收水位与成员级异常</span></div>
     <div class="sync-kv" id="syncFacts"><div>加载中…</div></div>
     <div id="syncFactMembers"></div>
+    <div id="syncFactMaintenance"></div>
   </section>
 
   <section class="sync-section card">
@@ -744,6 +748,42 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
     <div id="infraAlerts" style="padding:14px 18px"><span class="muted">加载中…</span></div></div>
 </div>
 
+<!-- 容量规划只读 Monitor 本地事实；开关关闭时不发起任何查询。 -->
+<div class="tabpane capacity-page" id="tab-capacity" hidden>
+  <div class="capacity-toolbar">
+    <div class="capacity-ranges" role="group" aria-label="容量规划时间范围">
+      <button type="button" data-cap-hours="1">1 小时</button><button type="button" data-cap-hours="6">6 小时</button>
+      <button type="button" data-cap-hours="24" class="active">24 小时</button><button type="button" data-cap-hours="168">7 天</button>
+    </div>
+    <div class="capacity-filters">
+      <select id="capGroup" aria-label="服务分组"><option value="">全部分组</option></select>
+      <select id="capChannel" aria-label="渠道"><option value="">全部渠道</option></select>
+      <select id="capModel" aria-label="模型"><option value="">全部模型</option></select>
+      <button type="button" id="capReset">重置</button><button type="button" id="capRefresh" class="primary">刷新</button>
+    </div>
+  </div>
+  <div id="capError"></div>
+  <div class="capacity-source-strip" id="capSources"><span>正在读取本地容量事实…</span></div>
+  <div class="capacity-kpis" id="capKpis"></div>
+
+  <section class="capacity-card">
+    <header><div><h2>业务吞吐与日志稳定率</h2><p>日志 RPM、前置拒绝、TPM 分开计算；该口径不等同于客户端确认结果。</p></div><span id="capRangeMeta">—</span></header>
+    <div class="capacity-chart" id="capTrafficChart"></div>
+  </section>
+
+  <section class="capacity-grid-two">
+    <div class="capacity-card"><header><div><h2>全站入口节点负载</h2><p>POST 推理路由 RPM、入口总占用与代理上游占用；无业务维度，不随分组/渠道/模型筛选。</p></div></header><div class="capacity-chart small" id="capIngressChart"></div></div>
+    <div class="capacity-card"><header><div><h2>全站资源同轴观察</h2><p>不随业务筛选；用于相关性观察，不直接声称因果。</p></div></header><div class="capacity-chart small" id="capInfraChart"></div></div>
+  </section>
+
+  <section class="capacity-grid-two">
+    <div class="capacity-card"><header><div><h2>业务负载排名</h2><p>分组、渠道、模型 Top 20，用于找到负载来源和局部不稳定。</p></div><select id="capRankType"><option value="groups">按分组</option><option value="channels">按渠道</option><option value="models">按模型</option></select></header><div id="capRanking"></div></div>
+    <div class="capacity-card"><header><div><h2>服务容量状态</h2><p>展示已采集实例、数据库、负载均衡的当前证据；数据不足时不给扩容结论。</p></div></header><div id="capComponents"></div></div>
+  </section>
+
+  <section class="capacity-card capacity-economics" id="capEconomics"><b>扩容成本与利润覆盖</b><span>待上游成本与利润模块完成后接入。</span></section>
+</div>
+
 <!-- ═══════════ Tab 7:客户排障(逐条请求→渠道→上游主域名→错误原文;查生产库 logs,含 type=5) ═══════════ -->
 <div class="tabpane logchain-page" id="tab-logchain" hidden>
   <div id="lcError" class="lc-alert" hidden></div>
@@ -947,9 +987,10 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
   </main>
 </div><!-- /monitor-shell -->
 
-<script src="/stability.js?v=2"></script>
+<script src="/stability.js?v=3"></script>
 <script src="/channel-management.js?v=6"></script>
 <script src="/logchain.js?v=1"></script>
+<script src="/capacity.js?v=1"></script>
 <script>
 const params=new URLSearchParams(location.search);
 let WINDOW=parseInt(params.get('window')||'60',10);
@@ -1644,32 +1685,38 @@ function switchTab(name,preserveHash){
   document.getElementById('tab-stability').hidden=(name!=='stability');
   document.getElementById('tab-channels').hidden=(name!=='channels');
   document.getElementById('tab-server').hidden=(name!=='server');
+  document.getElementById('tab-capacity').hidden=(name!=='capacity');
   document.getElementById('tab-usage').hidden=(name!=='usage');
   document.getElementById('tab-logchain').hidden=(name!=='logchain');
   if(window.monitorShellSetTab)window.monitorShellSetTab(name);
   if(name==='server'){loadInfra();infraSchedule();setTimeout(resizeInfraCharts,80);}
   else if(infraTimer){clearInterval(infraTimer);}
   if(name==='sync')syncActivate();else syncDeactivate();
-  if(name==='usage'){usageInit();usageLoadFactsStatus()}
+  if(name==='usage')usageInit();
   if(name==='stability'&&window.stabilityActivate)window.stabilityActivate();
   if(name==='channels'&&window.channelManagementActivate)window.channelManagementActivate();
   if(name==='logchain'&&window.logChainActivate)window.logChainActivate();
+  if(name==='capacity'&&window.capacityActivate)window.capacityActivate();
+  if(name!=='capacity'&&window.capacityDeactivate)window.capacityDeactivate();
   if(name==='model')setTimeout(resizeModelCharts,60); // 模型 tab 非默认可见,切回时按可见宽度重排图表
 }
 function resizeModelCharts(){[trendChart,longChart,sloGauge,latChart,ttftChart].forEach(c=>c&&c.resize());}
 
 // ═══════════ 数据同步状态(tab-sync):所有请求只读 Monitor 本地状态，不触发来源查询 ═══════════
-let syncTimer=null;
+let syncTimer=null,syncAbort=null,syncSeq=0,syncLoginRedirected=false,syncWorkloadAbort=null,syncWorkloadSeq=0,syncMaintenanceAbort=null,syncMaintenanceSeq=0,syncLastUsageHistory=null;
 function syncTime(ts){return +ts?new Date(+ts*1000).toLocaleString('zh-CN',{hour12:false,timeZone:'Asia/Shanghai'}):'—'}
 function syncAge(ts){if(!+ts)return '—';return usageFactsDuration(Math.max(0,Date.now()/1000-(+ts)))}
-function syncStateClass(level){return level==='ok'?'ok':level==='bad'?'bad':'warn'}
-function syncStateText(level){return level==='ok'?'正常':level==='bad'?'异常':'需要关注'}
+function syncStateClass(level){return level==='ok'?'ok':level==='bad'?'bad':level==='neutral'?'neutral':'warn'}
+function syncStateText(level){return level==='ok'?'正常':level==='bad'?'异常':level==='neutral'?'未启用':'需要关注'}
 function syncCard(level,title,value,detail){return `<div class="sync-card ${syncStateClass(level)}"><small>${esc(title)}</small><b><span class="sync-status ${syncStateClass(level)}">${syncStateText(level)}</span> ${esc(value)}</b><p>${esc(detail||'')}</p></div>`}
 function syncKV(label,value,title){return `<div${title?` title="${esc(title)}"`:''}><small>${esc(label)}</small><b>${value==null?'—':esc(String(value))}</b></div>`}
-async function syncFetchJSON(path){
-  const res=await fetch(path,{headers:{'Accept':'application/json'}});
-  if(res.status===401){location.href='/login';throw new Error('登录已失效')}
-  return {ok:res.ok,status:res.status,data:await res.json().catch(()=>({}))};
+async function syncFetchJSON(path,signal){
+  const res=await fetch(path,{headers:{'Accept':'application/json'},cache:'no-store',signal});
+  if(res.status===401){if(!syncLoginRedirected){syncLoginRedirected=true;location.href='/login'}throw new Error('登录已失效')}
+  const text=await res.text();let data={};
+  try{data=text?JSON.parse(text):{}}catch(_){throw new Error('状态接口返回了无效 JSON')}
+  if(!res.ok)throw new Error(data.error||('HTTP '+res.status));
+  return data;
 }
 function syncRenderRuntime(ready,stores){
   const source=ready.source||{},disk=ready.facts_disk||{};
@@ -1687,8 +1734,46 @@ function syncRenderRuntime(ready,stores){
   ].join('');
   return sourceLevel;
 }
+function syncUsageMemberRows(members){
+  return (members||[]).map(x=>{const span=+x.raw_page_span_hours||1;const preferred=+x.raw_page_preferred_span_hours||1;const live=`实时 ${esc(x.live_status||'pending')} · 延迟 ${usageFactsDuration(x.live_lag_seconds||0)}<br>近7天 ${esc(x.recent_status||'pending')} · 缺口 ${usageFactsDuration(x.recent_lag_seconds||0)}`;const page=x.raw_page_hour?`${syncTime(x.raw_page_hour)}${span>1?' → '+syncTime(x.raw_page_through):''}<br><span class="muted">${esc(x.raw_page_status||'—')} · 当前 ${span}h / 下个 ${preferred}h · ${fmtNum(x.raw_page_pages)} 页 / ${fmtNum(x.raw_page_source_rows)} 条<br>${live}</span>`:`<span class="muted">尚无分页水位<br>${live}</span>`;const service=x.service_ready?`可用 · ${syncTime(x.published_from_hour)}起`:'建立近期窗口';const actions=usageHistoryRetryHTML(x.user_id,x.job_id,x.job_status)+usageHistoryRepairHTML(x.user_id,x.published);return `<tr><td>#${+x.user_id}</td><td>${esc(service)}</td><td>${esc(usageFactsStageLabel(x.stage))} · ${esc(x.job_status||'—')}</td><td>${(+x.coverage_percent||0).toFixed(1)}%</td><td>${page}</td><td>${esc(x.verification_status||'—')}</td><td>${x.recent_next_retry_at?syncTime(x.recent_next_retry_at):(x.live_next_retry_at?syncTime(x.live_next_retry_at):(x.next_retry_at?syncTime(x.next_retry_at):'—'))}</td><td class="history-error">${x.recent_last_error?esc(x.recent_last_error)+'<br>':''}${x.live_last_error?esc(x.live_last_error)+'<br>':''}${x.raw_page_last_error?esc(x.raw_page_last_error)+'<br>':''}${x.last_error?esc(x.last_error):(x.service_ready?'历史继续后台扩展':'待签收')}</td><td>${actions||'—'}</td></tr>`}).join('');
+}
+function syncRenderFactMembers(history,meta={}){
+  const members=history.members||[],target=document.getElementById('syncFactMembers');
+  const total=meta.total==null?members.length:+meta.total,allTotal=meta.all_total==null?+history.total_members:+meta.all_total,state=meta.state||'attention';
+  const offset=+meta.offset||0,limit=+meta.limit||50;
+  const controls=`<div class="sync-table-note">${state==='all'?`全部成员任务 ${fmtNum(total)} 个`:`需要处理 ${fmtNum(total)} 个`} · 共 ${fmtNum(allTotal||history.total_members)} 个成员 <button class="btn" type="button" onclick="syncLoadUsageWorkloads('${state==='all'?'attention':'all'}',0)">${state==='all'?'只看待处理':'查看全部成员任务'}</button></div>`;
+  if(!members.length){target.innerHTML=controls+'<div class="sync-table-note">'+(state==='all'?'没有成员任务。':'所有成员近期服务与全历史归档均已完成；无待处理成员级异常。')+'</div>';return}
+  const prev=offset>0?`<button class="btn" type="button" onclick="syncLoadUsageWorkloads('${state}',${Math.max(0,offset-limit)})">上一页</button>`:'';
+  const next=offset+members.length<total?`<button class="btn" type="button" onclick="syncLoadUsageWorkloads('${state}',${offset+limit})">下一页</button>`:'';
+  target.innerHTML=`<details class="usage-history-detail" open><summary>${state==='all'?'逐成员任务':'尚在同步或需要处理的成员'} · ${fmtNum(total)} 个</summary>${controls}<div class="monitor-table-scroll"><table><thead><tr><th>用户</th><th>近期服务</th><th>历史阶段</th><th>归档覆盖</th><th>分页水位</th><th>校验</th><th>下次重试</th><th>原因</th><th>操作</th></tr></thead><tbody>${syncUsageMemberRows(members)}</tbody></table></div><div class="sync-table-note">${prev} ${next}</div></details>`;
+}
+async function syncLoadUsageWorkloads(state='all',offset=0){
+  if(syncWorkloadAbort)syncWorkloadAbort.abort();const controller=new AbortController();syncWorkloadAbort=controller;const seq=++syncWorkloadSeq;
+  const target=document.getElementById('syncFactMembers');target.insertAdjacentHTML('afterbegin','<div class="sync-table-note" data-sync-loading>正在读取成员任务…</div>');
+  let timedOut=false;const timeout=setTimeout(()=>{timedOut=true;controller.abort()},6000);
+  try{const data=await syncFetchJSON(`/sync/workloads?domain=usage&kind=members&state=${encodeURIComponent(state)}&offset=${Math.max(0,+offset||0)}&limit=50`,controller.signal);if(seq!==syncWorkloadSeq||document.getElementById('tab-sync').hidden)return;const history={...(syncLastUsageHistory||{}),members:data.items||[]};syncRenderFactMembers(history,data)}
+  catch(e){if(seq===syncWorkloadSeq&&!document.getElementById('tab-sync').hidden&&(e.name!=='AbortError'||timedOut))target.innerHTML=`<div class="usage-facts-state warn"><b>成员任务${timedOut?'读取超时':'暂不可用'}</b><span>${timedOut?'请稍后重试':esc(e.message)}</span></div>`}
+  finally{clearTimeout(timeout);if(syncWorkloadAbort===controller)syncWorkloadAbort=null}
+}
+function syncMaintenanceRows(jobs){return (jobs||[]).map(x=>{const range=x.from_ts?`${syncTime(x.from_ts)} → ${syncTime(x.through_ts)}`:'—';const progress=+x.total_hours?`${fmtNum(x.completed_hours)}/${fmtNum(x.total_hours)} 小时`:'待定界';const actions=x.user_id?usageHistoryRetryHTML(x.user_id,x.job_id,x.status):'';return `<tr><td>${esc(usageFactsStageLabel(x.kind))}</td><td>${x.user_id?'#'+(+x.user_id):'全局'}</td><td>${esc(x.status||'—')}</td><td>${range}</td><td>${syncTime(x.next_hour)}</td><td>${progress}</td><td>${syncTime(x.next_retry_at)}</td><td class="history-error">${esc(x.last_error||x.reason||'—')}</td><td>${actions||'—'}</td></tr>`}).join('')}
+function syncRenderMaintenance(history,meta={}){
+  const jobs=history.maintenance||[],target=document.getElementById('syncFactMaintenance'),state=meta.state||'attention',total=meta.total==null?jobs.length:+meta.total,allTotal=meta.all_total==null?jobs.length:+meta.all_total,offset=+meta.offset||0,limit=+meta.limit||50;
+  const controls=`<div class="sync-table-note">${state==='all'?'全部维护任务':'需要处理'} ${fmtNum(total)} 个 · 共 ${fmtNum(allTotal)} 个 <button class="btn" type="button" onclick="syncLoadMaintenance('${state==='all'?'attention':'all'}',0)">${state==='all'?'只看待处理':'查看全部维护任务'}</button></div>`;
+  if(!jobs.length){target.innerHTML=controls+'<div class="sync-table-note">'+(state==='all'?'没有维护任务。':'没有暂停、失败或进行中的维护任务。')+'</div>';return}
+  const prev=offset>0?`<button class="btn" type="button" onclick="syncLoadMaintenance('${state}',${Math.max(0,offset-limit)})">上一页</button>`:'',next=offset+jobs.length<total?`<button class="btn" type="button" onclick="syncLoadMaintenance('${state}',${offset+limit})">下一页</button>`:'';
+  target.innerHTML=`<details class="usage-history-detail" open><summary>维护、审计与修复任务 · ${fmtNum(total)} 个</summary>${controls}<div class="monitor-table-scroll"><table><thead><tr><th>类型</th><th>用户</th><th>状态</th><th>范围</th><th>下一水位</th><th>进度</th><th>下次重试</th><th>原因/错误</th><th>操作</th></tr></thead><tbody>${syncMaintenanceRows(jobs)}</tbody></table></div><div class="sync-table-note">${prev} ${next}</div></details>`;
+}
+async function syncLoadMaintenance(state='all',offset=0){
+  if(syncMaintenanceAbort)syncMaintenanceAbort.abort();const controller=new AbortController();syncMaintenanceAbort=controller;const seq=++syncMaintenanceSeq,target=document.getElementById('syncFactMaintenance');
+  target.insertAdjacentHTML('afterbegin','<div class="sync-table-note" data-sync-loading>正在读取维护任务…</div>');let timedOut=false;const timeout=setTimeout(()=>{timedOut=true;controller.abort()},6000);
+  try{const data=await syncFetchJSON(`/sync/workloads?domain=usage&kind=maintenance&state=${encodeURIComponent(state)}&offset=${Math.max(0,+offset||0)}&limit=50`,controller.signal);if(seq!==syncMaintenanceSeq||document.getElementById('tab-sync').hidden)return;syncRenderMaintenance({...(syncLastUsageHistory||{}),maintenance:data.jobs||[]},data)}
+  catch(e){if(seq===syncMaintenanceSeq&&!document.getElementById('tab-sync').hidden&&(e.name!=='AbortError'||timedOut))target.innerHTML=`<div class="usage-facts-state warn"><b>维护任务${timedOut?'读取超时':'暂不可用'}</b><span>${timedOut?'请稍后重试':esc(e.message)}</span></div>`}
+  finally{clearTimeout(timeout);if(syncMaintenanceAbort===controller)syncMaintenanceAbort=null}
+}
+function syncInvalidateUsageWorkloads(){if(syncWorkloadAbort)syncWorkloadAbort.abort();if(syncMaintenanceAbort)syncMaintenanceAbort.abort();syncWorkloadAbort=null;syncMaintenanceAbort=null;syncWorkloadSeq++;syncMaintenanceSeq++;syncLastUsageHistory=null}
 function syncRenderFacts(facts,history){
   const f=facts.facts||{},h=history||{};
+  if(!f.enabled&&!h.enabled&&!f.read_active){document.getElementById('syncFacts').innerHTML=[syncKV('采集状态','未启用','没有后台用量事实采集任务'),syncKV('本地事实','保留现有数据','关闭采集不会删除已落盘事实'),syncKV('读取状态','未切读','业务页不会因状态刷新访问来源库')].join('');syncLastUsageHistory=h;document.getElementById('syncFactMembers').innerHTML='<div class="sync-table-note">当前没有运行中的用量同步任务。</div>';document.getElementById('syncFactMaintenance').innerHTML='';return 'neutral'}
   const archiveBlocked=+h.paused_members>0||+h.failed_members>0||h.disk_blocked||h.bulk_circuit_state==='open'||f.repair_active;
   const serviceComplete=!!f.read_active&&+h.total_members>0&&+h.published_members===+h.total_members&&(!h.raw_page_enabled||(+h.live_ready_members===+h.total_members&&+h.recent_ready_members===+h.total_members));
   const servicePartial=!!f.read_active&&+h.published_members>0;
@@ -1706,18 +1791,17 @@ function syncRenderFacts(facts,history){
     syncKV('服务范围',serving,'成员各自 floor 前的数据不会参与读取'),
     syncKV('Tail 最新完成',syncTime(f.latest_complete_hour),f.last_fact_sync_at?`最近同步 ${syncAge(f.last_fact_sync_at)}前`:''),
     syncKV('修复/审计',f.repair_active?'修复中':'无进行中修复',f.repair_last_error||''),
+    syncKV('维护任务',`${fmtNum(facts.maintenance_attention||0)} 个待处理`,`全部 ${fmtNum(facts.maintenance_total||0)} 个 · 进行中修复 ${fmtNum(h.active_repairs||0)} · 已暂停 ${fmtNum(h.paused_maintenance||0)}`),
     syncKV('历史来源',`${h.source_mode||'—'} · ${h.source_epoch||'—'}`,h.bulk_circuit_state&&h.bulk_circuit_state!=='closed'?`来源熔断：${h.bulk_circuit_state}`:'')
   ].join('');
-  const members=(h.members||[]).filter(x=>x.last_error||x.live_last_error||x.recent_last_error||x.live_status!=='ready'||x.recent_status!=='ready'||x.job_status==='paused'||!x.published);
-  const target=document.getElementById('syncFactMembers');
-  if(!members.length){target.innerHTML='<div class="sync-table-note">所有成员近期服务与全历史归档均已完成；无待处理成员级异常。</div>';return level}
-  const rows=members.map(x=>{const span=+x.raw_page_span_hours||1;const preferred=+x.raw_page_preferred_span_hours||1;const live=`实时 ${esc(x.live_status||'pending')} · 延迟 ${usageFactsDuration(x.live_lag_seconds||0)}<br>近7天 ${esc(x.recent_status||'pending')} · 缺口 ${usageFactsDuration(x.recent_lag_seconds||0)}`;const page=x.raw_page_hour?`${syncTime(x.raw_page_hour)}${span>1?' → '+syncTime(x.raw_page_through):''}<br><span class="muted">${esc(x.raw_page_status||'—')} · 当前 ${span}h / 下个 ${preferred}h · ${fmtNum(x.raw_page_pages)} 页 / ${fmtNum(x.raw_page_source_rows)} 条<br>${live}</span>`:`<span class="muted">尚无分页水位<br>${live}</span>`;const service=x.service_ready?`可用 · ${syncTime(x.published_from_hour)}起`:'建立近期窗口';return `<tr><td>#${+x.user_id}</td><td>${esc(service)}</td><td>${esc(usageFactsStageLabel(x.stage))} · ${esc(x.job_status||'—')}</td><td>${(+x.coverage_percent||0).toFixed(1)}%</td><td>${page}</td><td>${esc(x.verification_status||'—')}</td><td>${x.recent_next_retry_at?syncTime(x.recent_next_retry_at):(x.live_next_retry_at?syncTime(x.live_next_retry_at):(x.next_retry_at?syncTime(x.next_retry_at):'—'))}</td><td class="history-error">${x.recent_last_error?esc(x.recent_last_error)+'<br>':''}${x.live_last_error?esc(x.live_last_error)+'<br>':''}${x.raw_page_last_error?esc(x.raw_page_last_error)+'<br>':''}${x.last_error?esc(x.last_error):(x.service_ready?'历史继续后台扩展':'待签收')}</td></tr>`}).join('');
-  target.innerHTML=`<details class="usage-history-detail" open><summary>尚在同步或需要处理的成员 · ${members.length} 个</summary><div class="monitor-table-scroll"><table><thead><tr><th>用户</th><th>近期服务</th><th>历史阶段</th><th>归档覆盖</th><th>分页水位</th><th>校验</th><th>下次重试</th><th>原因</th></tr></thead><tbody>${rows}</tbody></table></div></details>`;
+  syncLastUsageHistory=h;
+  syncRenderFactMembers(h,{state:'attention',total:+facts.attention_members||0,all_total:+h.total_members||0,offset:0,limit:50});
+  syncRenderMaintenance(h,{state:'attention',total:+facts.maintenance_attention||0,all_total:+facts.maintenance_total||0,offset:0,limit:50});
   return level;
 }
 function syncRenderChannels(report){
   const el=document.getElementById('syncChannels');
-  if(!report.enabled){el.innerHTML='<div class="sync-table-note">渠道管理未启用，暂无上游账户同步状态。</div>';return 'warn'}
+  if(!report.enabled){el.innerHTML='<div class="sync-table-note">上游后台同步未启用；不会访问任何上游，已有本地快照保持不变。</div>';return 'neutral'}
   const domains=(report.domains||[]).filter(x=>x.upstream&&x.upstream.configured);
   if(!domains.length){el.innerHTML='<div class="sync-table-note">尚未配置上游账户；余额与上游消费账单不会同步。</div>';return 'warn'}
   const now=Math.floor(Date.now()/1000),statusInfo=(status,enabled=true)=>{
@@ -1775,8 +1859,9 @@ function syncRenderChannels(report){
 }
 function syncRenderStability(health){
   const h=health||{},migration=h.problem_migration||{},hourly=h.hourly_migration||null;
+  const explicitlyDisabled=h.enabled===false&&!h.nginx_enabled;
   const enabled=h.nginx_enabled!==undefined||h.checked_at!==undefined;
-  const level=!enabled?'warn':(h.status==='ok'?'ok':'warn');
+  const level=explicitlyDisabled?'neutral':(!enabled?'warn':(h.status==='ok'?'ok':'warn'));
   const hourlyDetail=hourly
     ?`${(+hourly.progress_percent||0).toFixed(1)}% · ${fmtNum(hourly.completed_hours)}/${fmtNum(hourly.total_hours)} 小时 · 失败 ${fmtNum(hourly.failed_hours)}${hourly.estimated_remaining_seconds?` · ETA ${usageFactsDuration(hourly.estimated_remaining_seconds)}`:''}`
     :'无迁移任务';
@@ -1784,7 +1869,7 @@ function syncRenderStability(health){
     ?`${(+migration.percent).toFixed(1)}% · 最近成功 ${syncTime(migration.last_success_at)} · ${migration.estimated_seconds==null?'暂无 ETA':`ETA ${usageFactsDuration(migration.estimated_seconds)}`}`
     :'';
   document.getElementById('syncStability').innerHTML=[
-    syncKV('总体状态',h.status||'未启用',(h.status||'')==='ok'?'采样新鲜且无待处理窗口':'请查看采样延迟、迁移和失败时间'),
+    syncKV('总体状态',explicitlyDisabled?'未启用':(h.status||'未启用'),explicitlyDisabled?'没有运行中的稳定性采集任务':((h.status||'')==='ok'?'采样新鲜且无待处理窗口':'请查看采样延迟、迁移和失败时间')),
     syncKV('主采样',h.main_sampler_last_success?`${syncAge(h.main_sampler_last_success)}前`:'未采样',h.main_sampler_last_success?syncTime(h.main_sampler_last_success):''),
     syncKV('问题 Tail',h.problem_live_status||'—',`延迟 ${usageFactsDuration(h.problem_live_lag_sec||0)} · 待处理 ${fmtNum(h.problem_pending_minutes)} 分钟`),
     syncKV('问题最近成功',h.problem_sampler_last_success?`${syncAge(h.problem_sampler_last_success)}前`:'未采样',h.problem_sampler_last_failure?`最近失败：${syncTime(h.problem_sampler_last_failure)}`:''),
@@ -1796,42 +1881,49 @@ function syncRenderStability(health){
   ].join('');
   return level;
 }
+function syncSectionError(section,label,target){
+  if(section&&section.available)return false;
+  const message=section&&section.error?section.error:(label+'状态暂不可用');
+  if(target)document.getElementById(target).innerHTML=`<div class="usage-facts-state warn"><b>${esc(label)}暂不可用</b><span>${esc(message)}</span></div>`;
+  if(target==='syncFacts'){document.getElementById('syncFactMembers').innerHTML='';document.getElementById('syncFactMaintenance').innerHTML=''}
+  return true;
+}
 function syncRender(data){
-  const ready=data.ready.data||{},facts=data.facts.data||{},history=data.history.data||{},health=data.health.data||{},channels=data.channels.data||{};
-  const runtimeLevel=syncRenderRuntime(ready,facts);
-  const factsLevel=syncRenderFacts(facts,history);
-  const channelsLevel=syncRenderChannels(channels);
-  const stabilityLevel=syncRenderStability(health);
+  const runtime=data.runtime||{},usage=data.usage||{},stability=data.stability||{},upstream=data.upstream||{};
+  const ready=runtime.data||{},facts=usage.data||{},history=facts.history||{},health=stability.data||{},channels=upstream.data||{};
+  const runtimeLevel=syncSectionError(runtime,'采集服务与本地存储','syncRuntime')?'warn':syncRenderRuntime(ready,facts);
+  const factsLevel=syncSectionError(usage,'用户用量事实','syncFacts')?'warn':syncRenderFacts(facts,history);
+  const channelsLevel=syncSectionError(upstream,'上游账户同步','syncChannels')?'warn':syncRenderChannels(channels);
+  const stabilityLevel=syncSectionError(stability,'稳定性采样','syncStability')?'warn':syncRenderStability(health);
   const readiness=ready.status==='ready'&&!(ready.degraded_reasons||[]).length?'ok':(ready.status==='not_ready'?'bad':'warn');
   document.getElementById('syncOverview').innerHTML=[
     syncCard(readiness,'服务就绪',ready.status==='ready'?'本地服务可用':(ready.status||'不可用'),(ready.degraded_reasons||[]).join('、')||'本地状态已检查'),
-    syncCard(factsLevel,'用户用量事实',facts.facts&&facts.facts.read_active?`${fmtNum(history.published_members||0)}/${fmtNum(history.total_members||0)} 成员可用`:'近期窗口同步中',`全历史归档 ${(+history.coverage_percent||0).toFixed(1)}% · ${fmtNum(history.live_ready_members||0)}/${fmtNum(history.total_members||0)} 实时追平`),
-    syncCard(channelsLevel,'上游账户同步',channels.enabled?`${(channels.domains||[]).filter(x=>x.upstream&&x.upstream.configured).length} 个账户`:'未启用','余额、当天消费水位和历史补数独立展示'),
-    syncCard(stabilityLevel,'稳定性采样',health.status||'未启用',health.problem_live_lag_sec?`问题 Tail 延迟 ${usageFactsDuration(health.problem_live_lag_sec)}`:'历史日志采样状态已检查')
+    syncCard(factsLevel,'用户用量事实',factsLevel==='neutral'?'未启用':(facts.facts&&facts.facts.read_active?`${fmtNum(history.published_members||0)}/${fmtNum(history.total_members||0)} 成员可用`:'近期窗口同步中'),factsLevel==='neutral'?'本地已有事实保持不变':`全历史归档 ${(+history.coverage_percent||0).toFixed(1)}% · ${fmtNum(history.live_ready_members||0)}/${fmtNum(history.total_members||0)} 实时追平`),
+    syncCard(channelsLevel,'上游账户同步',channels.enabled?`${(channels.domains||[]).filter(x=>x.upstream&&x.upstream.configured).length} 个账户`:'未启用',channels.enabled?'余额、当天消费水位和历史补数独立展示':'当前不会访问任何上游'),
+    syncCard(stabilityLevel,'稳定性采样',stabilityLevel==='neutral'?'未启用':(health.status||'未启用'),stabilityLevel==='neutral'?'当前没有稳定性采集任务':(health.problem_live_lag_sec?`问题 Tail 延迟 ${usageFactsDuration(health.problem_live_lag_sec)}`:'历史日志采样状态已检查'))
   ].join('');
-  document.getElementById('syncUpdated').textContent='本地状态更新：'+new Date().toLocaleTimeString('zh-CN',{hour12:false});
+  const sectionErrors=[runtime,usage,stability,upstream].filter(x=>!x.available).map(x=>x.error||'状态暂不可用');
+  document.getElementById('syncError').innerHTML=sectionErrors.length?`<div class="usage-facts-state warn"><b>部分状态暂不可用</b><span>${sectionErrors.map(esc).join('；')}</span></div>`:'';
+  document.getElementById('syncUpdated').textContent='本地状态快照：'+syncTime(data.snapshot_at);
 }
-async function syncLoadStatus(){
+async function syncLoadStatus(force=false){
   clearTimeout(syncTimer);
+  if(syncAbort)syncAbort.abort();
+  syncAbort=new AbortController();const controller=syncAbort,seq=++syncSeq;
+  let timedOut=false;const timeout=setTimeout(()=>{timedOut=true;controller.abort()},7000);
   try{
-    const [ready,facts,history,health,channels]=await Promise.all([
-      syncFetchJSON('/ready'),syncFetchJSON('/usage/facts-status'),syncFetchJSON('/usage/facts-history'),syncFetchJSON('/stability/health'),syncFetchJSON('/channels/report?hours=24')
-    ]);
-    syncRender({ready,facts,history,health,channels});
-    const errors=[ready,facts,history,health,channels].filter(x=>!x.ok);
-    document.getElementById('syncError').innerHTML=errors.length?`<div class="usage-facts-state warn"><b>部分状态暂不可用</b><span>${errors.map(x=>esc(x.data&&x.data.error||('HTTP '+x.status))).join('；')}</span></div>`:'';
-  }catch(e){document.getElementById('syncError').innerHTML=`<div class="usage-facts-state warn"><b>同步状态加载失败</b><span>${esc(e.message)}</span></div>`}
-  finally{if(!document.getElementById('tab-sync').hidden)syncTimer=setTimeout(syncLoadStatus,30000)}
+    const data=await syncFetchJSON('/sync/overview'+(force?'?refresh=1':''),controller.signal);
+    if(seq===syncSeq&&!document.getElementById('tab-sync').hidden)syncRender(data);
+  }catch(e){if(seq===syncSeq&&!document.getElementById('tab-sync').hidden&&(e.name!=='AbortError'||timedOut))document.getElementById('syncError').innerHTML=`<div class="usage-facts-state warn"><b>同步状态${timedOut?'加载超时':'加载失败'}</b><span>${timedOut?'本地状态在 7 秒内未返回，请稍后重试':esc(e.message)}</span></div>`}
+  finally{clearTimeout(timeout);if(syncAbort===controller)syncAbort=null;if(seq===syncSeq&&!document.getElementById('tab-sync').hidden)syncTimer=setTimeout(syncLoadStatus,30000)}
 }
 function syncActivate(){if(!syncTimer)syncLoadStatus()}
-function syncDeactivate(){if(syncTimer){clearTimeout(syncTimer);syncTimer=null}}
+function syncDeactivate(){if(syncTimer){clearTimeout(syncTimer);syncTimer=null}if(syncAbort)syncAbort.abort();syncAbort=null;syncInvalidateUsageWorkloads();syncSeq++}
 
 // ═══════════ 用户用量(tab-usage):列表页=消费矩阵(日期×用户),点用户进详情 ═══════════
 // 与另两个 tab 不同:不定时自动刷新。聚合数字复用有界缓存；用户重新选择日期时强制取新，
 // 余额/用户资料仍实时取回。快速切换由可取消查询和后端单槽闸共同保护生产库。
 let IS_ROOT=false,usageInited=false,usageUsers=[],usageGroups=[],usageDailyChart=null,usageRange='7d';
-let usageFactsHistory=null,usageHistoryByUser=new Map();
-let usageFactsTimer=null;
 let usageDetail=null;      // null=列表视图;{type:'user'|'group', id, label}=详情视图
 let usageMxCache=null;     // 最近一次矩阵响应(分组筛选/搜索纯前端,复用缓存不重查生产库)
 let usageFilterGid=null;   // null=全部;0=未分组;>0=分组id
@@ -2024,33 +2116,19 @@ function paginate(elId,rows,page,onGo){
   }
   return {rows:rows.slice((p-1)*MGMT_PAGE_SIZE,p*MGMT_PAGE_SIZE),page:p};
 }
-function usageMemberHistoryHTML(userID){
-  if(!usageFactsHistory||!usageFactsHistory.enabled)return '<span class="muted">—</span>';
-  const h=usageHistoryByUser.get(+userID);
-  if(!h)return '<span class="badge badge-muted">等待发现</span>';
-  const pct=Math.max(0,Math.min(100,+h.coverage_percent||0));
-  const status=h.job_status==='paused'?'<span class="badge badge-red">已暂停</span>'
-    :(h.published?'<span class="badge badge-green">已发布</span>':'<span class="badge badge-yellow">仅管理员可见</span>');
-  const verify=h.verification_status==='complete'?'已校验':('校验 '+fmtNum(h.verified_hours)+'/'+fmtNum(h.total_hours));
-  const retry=IS_ROOT&&h.job_status==='paused'
-    ?` <button class="usage-history-retry" data-job-id="${esc(h.job_id||'')}" onclick="usageRetryHistory(${+h.user_id},this.dataset.jobId,this)">重试</button>`:'';
-  const repair=usageHistoryRepairHTML(h.user_id,h.published);
-  return `<div class="usage-history-inline">${status}<span>${esc(usageFactsStageLabel(h.stage))} ${pct.toFixed(1)}%</span><span class="muted">${verify}</span>${retry}${repair}</div>${h.last_error?`<div class="history-error" title="${esc(h.last_error)}">${esc(h.last_error)}</div>`:''}`;
-}
 function renderUsageUsers(){
   const uc=document.getElementById('usrMgmtCount'); if(uc)uc.textContent=usageUsers.length?`· ${usageUsers.length} 人`:'';
-  document.getElementById('thUsr').innerHTML='<tr><th style="white-space:nowrap">用户ID</th><th>用户名</th><th>邮箱</th><th>分组</th><th>全历史</th><th>备注</th><th>添加时间</th><th class="right"></th></tr>';
+  document.getElementById('thUsr').innerHTML='<tr><th style="white-space:nowrap">用户ID</th><th>用户名</th><th>邮箱</th><th>分组</th><th>备注</th><th>添加时间</th><th class="right"></th></tr>';
   const e=document.getElementById('tbUsr');
   // 搜索:用户ID / 用户名 / 邮箱 / 分组名
   const q=usrMgmtQuery;
   const rows=q?usageUsers.filter(u=>String(u.user_id).includes(q)||(u.username||'').toLowerCase().includes(q)||(u.email||'').toLowerCase().includes(q)||(u.group_name||'').toLowerCase().includes(q)):usageUsers;
   const up=paginate('usrPager',rows,usrMgmtPage,p=>{usrMgmtPage=p;renderUsageUsers()});
   usrMgmtPage=up.page; const pageRows=up.rows;
-  if(!rows.length){e.innerHTML=`<tr><td colspan="8" class="muted" style="text-align:center;padding:18px">${q?'没有匹配的用户':'名单为空——在上面输入 用户ID / 用户名 / 邮箱 添加'}</td></tr>`}
+  if(!rows.length){e.innerHTML=`<tr><td colspan="7" class="muted" style="text-align:center;padding:18px">${q?'没有匹配的用户':'名单为空——在上面输入 用户ID / 用户名 / 邮箱 添加'}</td></tr>`}
   else e.innerHTML=pageRows.map(u=>`<tr>
     <td class="num">#${u.user_id}</td><td>${esc(u.username||'—')}</td><td>${esc(u.email||'—')}</td>
     <td>${IS_ROOT?`<select class="uinput" style="padding:4px 8px;font-size:12px" onchange="usageSetUserGroup(${u.user_id},this.value,this)">${groupOptions(u.group_id)}</select>`:esc(u.group_name||'未分组')}</td>
-    <td>${usageMemberHistoryHTML(u.user_id)}</td>
     <td>${IS_ROOT?`<input class="uinput" style="padding:4px 8px;font-size:12px;width:200px" value="${esc(u.note||'')}" placeholder="备注(状态/联系人…)" onchange="usageSetUserNote(${u.user_id},this.value,this)">`:esc(u.note||'—')}</td>
     <td class="muted">${u.added_at?new Date(u.added_at*1000).toLocaleDateString():'—'}</td>
     <td class="right" style="white-space:nowrap">${IS_ROOT?`<a href="javascript:void 0" class="danger-link" onclick="usageDelUser(${u.user_id})">移除</a>`:''}</td></tr>`).join('');
@@ -2380,7 +2458,8 @@ async function usageRepairHistoryDay(userID,btn){
     const d=await res.json().catch(()=>({}));
     if(res.status<500)usageHistoryRepairKeys.delete(slot);
     if(!res.ok)throw new Error(d.error||('创建修复失败 '+res.status));
-    await usageLoadFactsStatus();
+    syncInvalidateUsageWorkloads();
+    await syncLoadStatus(true);
   }catch(e){alert(e.message);if(btn)btn.disabled=false}
 }
 async function usageRetryHistory(userID,jobID,btn){
@@ -2391,30 +2470,9 @@ async function usageRetryHistory(userID,jobID,btn){
     if(res.status===401){location.href='/login';return}
     const d=await res.json().catch(()=>({}));
     if(!res.ok)throw new Error(d.error||('重试失败 '+res.status));
-    await usageLoadFactsStatus();
+    syncInvalidateUsageWorkloads();
+    await syncLoadStatus(true);
   }catch(e){alert(e.message);if(btn)btn.disabled=false}
-}
-function updateUsageFactsHistoryMetadata(h){
-  usageFactsHistory=h;
-  usageHistoryByUser=new Map((h.members||[]).map(x=>[+x.user_id,x]));
-  if(usageInited)renderUsageUsers();
-  const archiveComplete=+h.pending_members===0&&+h.paused_members===0&&+h.failed_members===0&&h.total_known;
-  return !archiveComplete||+h.paused_maintenance>0||h.disk_blocked||h.bulk_circuit_state==='open';
-}
-async function usageLoadFactsStatus(){
-  clearTimeout(usageFactsTimer);
-  try{
-    const historyRes=await fetch('/usage/facts-history',{headers:{'Accept':'application/json'}});
-    if(historyRes.status===401){location.href='/login';return}
-    const h=await historyRes.json().catch(()=>({}));
-    if(!historyRes.ok)throw new Error(h.error||('全历史进度查询失败 '+historyRes.status));
-    const pending=h.enabled?updateUsageFactsHistoryMetadata(h):false;
-    if(!h.enabled){usageFactsHistory=null;usageHistoryByUser=new Map();if(usageInited)renderUsageUsers()}
-    usageFactsTimer=setTimeout(()=>{if(!document.getElementById('tab-usage').hidden)usageLoadFactsStatus()},pending?30000:300000);
-  }catch(e){
-    console.warn('用量事实元数据暂不可用',e);
-    usageFactsTimer=setTimeout(()=>{if(!document.getElementById('tab-usage').hidden)usageLoadFactsStatus()},60000);
-  }
 }
 // 快速连点/切范围时取消旧查询，并且只允许最后一次请求渲染。
 // 浏览器 abort 会沿 Gin request context 取消后端等待/查询，避免无用请求继续占用生产库闸门。
@@ -3142,7 +3200,7 @@ function renderUsage(st,balanceUSD,members,totalUsedUSD,byToken,tokenMeta,tokenD
   renderUsageTokens(byToken,tokenDataAvailable===false||!statsAvailable,tokenDataMessage||statsMessage,rangePartial);
 }
 document.querySelectorAll('.tabs .tab').forEach(t=>t.addEventListener('click',()=>switchTab(t.dataset.tab,false)));
-document.getElementById('syncRefresh').addEventListener('click',syncLoadStatus);
+document.getElementById('syncRefresh').addEventListener('click',()=>syncLoadStatus(true));
 document.getElementById('infraRefresh').addEventListener('click',loadInfra);
 document.getElementById('infraAuto').addEventListener('change',infraSchedule);
 window.addEventListener('resize',resizeInfraCharts);
@@ -3151,7 +3209,7 @@ setSeg();const _mePromise=loadMe();load();schedule();
 document.querySelectorAll('#longSeg a').forEach(a=>{a.href='javascript:void 0';a.classList.toggle('active',+a.dataset.d===longDays);a.addEventListener('click',e=>{e.preventDefault();longDays=+a.dataset.d;document.querySelectorAll('#longSeg a').forEach(x=>x.classList.toggle('active',x===a));loadLongTrend();});});
 loadLongTrend();
 // 默认落在「用户用量」;URL hash 带 tab(从报警设置返回/手动刷新)则恢复到该 tab。等 IS_ROOT 就位再渲染,模型/服务端数据后台预载
-_mePromise.finally(()=>{const q=monitorHashParams(),tab=q.get('tab');const target=/^(sync|model|server|usage|stability|channels|logchain)$/.test(tab||'')?tab:'usage';switchTab(target,true);window.dispatchEvent(new CustomEvent('monitor:navigate',{detail:{tab:target,context:window.monitorNavigationContext()}}))});
+_mePromise.finally(()=>{const q=monitorHashParams(),tab=q.get('tab');const target=/^(sync|model|server|capacity|usage|stability|channels|logchain)$/.test(tab||'')?tab:'usage';switchTab(target,true);window.dispatchEvent(new CustomEvent('monitor:navigate',{detail:{tab:target,context:window.monitorNavigationContext()}}))});
 </script>
 </body>
 </html>
