@@ -1057,6 +1057,27 @@ func TestUpstreamHTTPClientDoesNotForwardTokenAcrossRedirect(t *testing.T) {
 	}
 }
 
+func TestAICodeWithEndpointMigratesOnlyLegacyOfficialHost(t *testing.T) {
+	tests := []struct {
+		name string
+		base string
+		want string
+	}{
+		{name: "legacy root", base: "https://aicodewith.com", want: "https://aicodewith.ai/api/v1/balance"},
+		{name: "legacy path", base: "https://aicodewith.com/console", want: "https://aicodewith.ai/console/api/v1/balance"},
+		{name: "current root", base: "https://aicodewith.ai", want: "https://aicodewith.ai/api/v1/balance"},
+		{name: "unrelated host", base: "https://example.com", want: "https://example.com/api/v1/balance"},
+		{name: "lookalike subdomain", base: "https://api.aicodewith.com", want: "https://api.aicodewith.com/api/v1/balance"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := aicodeWithEndpoint(tt.base, "/api/v1/balance"); got != tt.want {
+				t.Fatalf("aicodeWithEndpoint(%q) = %q, want %q", tt.base, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestSyncDueUpstreamAccountsOnlyRunsDueEnabledRows(t *testing.T) {
 	var hits atomic.Int64
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
