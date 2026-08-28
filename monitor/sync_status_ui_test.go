@@ -57,7 +57,7 @@ func TestSyncStatusPageUsesLocalStatusEndpoints(t *testing.T) {
 
 func TestSyncStatusPageRendersBothStabilityMigrationsWithCorrectFields(t *testing.T) {
 	for _, want := range []string{
-		`const h=health||{},migration=h.problem_migration||{},hourly=h.hourly_migration||null;`,
+		`const h=health||{},migration=h.problem_migration||{},hourly=h.hourly_migration||null,evidence=h.nginx_evidence||{};`,
 		`hourly.progress_percent`,
 		`hourly.completed_hours`,
 		`hourly.total_hours`,
@@ -65,6 +65,8 @@ func TestSyncStatusPageRendersBothStabilityMigrationsWithCorrectFields(t *testin
 		`migration.percent`,
 		`migration.last_success_at`,
 		`'无迁移任务'`,
+		`syncKV('请求证据'`,
+		`syncKV('证据完整性'`,
 	} {
 		if !strings.Contains(pageHTML, want) {
 			t.Fatalf("稳定性双迁移进度缺少 %q", want)

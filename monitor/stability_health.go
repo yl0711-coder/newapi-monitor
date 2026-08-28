@@ -52,6 +52,10 @@ type stabilityHealthResponse struct {
 	NginxCursorDiscontinuities int64                             `json:"nginx_cursor_discontinuities"`
 	NginxDiscardedLines        int64                             `json:"nginx_discarded_lines"`
 	NginxRecentDataLossSources int                               `json:"nginx_recent_data_loss_sources"`
+	NginxErrorEnabled          bool                              `json:"nginx_error_enabled"`
+	NginxErrorSourceCount      int                               `json:"nginx_error_source_count"`
+	NginxErrorUnhealthySources int                               `json:"nginx_error_unhealthy_sources"`
+	NginxEvidence              nginxEvidenceHealth               `json:"nginx_evidence"`
 }
 
 // stabilityHealth 只检查 Monitor 自身和本地采集状态，不主动查询 NewAPI
@@ -62,7 +66,7 @@ func (m *Monitor) stabilityHealth(ctx context.Context, nowTime time.Time) stabil
 	result := stabilityHealthResponse{
 		Enabled: m.cfg.StabilityEnabled, Status: "ok", CheckedAt: now, MainSamplerLastSuccess: m.lastRun.Load(),
 		ProblemSamplerLastSuccess: m.problemLastSuccess.Load(), ProblemSamplerLastFailure: m.problemLastFailure.Load(),
-		ProblemMigration: m.stabilityProblemMigrationProgress(), NginxEnabled: m.cfg.NginxEnabled,
+		ProblemMigration: m.stabilityProblemMigrationProgress(), NginxEnabled: m.cfg.NginxEnabled, NginxErrorEnabled: m.cfg.NginxErrorEnabled,
 	}
 	var hourlyMigration stabilityHourlyMigrationProgress
 	if err := m.storeDB.WithContext(ctx).Model(&StabilityBackfillJob{}).
@@ -179,6 +183,24 @@ func (m *Monitor) stabilityHealth(ctx context.Context, nowTime time.Time) stabil
 		if len(sources) != len(m.cfg.NginxAllowedNodes) || result.NginxUnhealthySources > 0 {
 			result.Status = "degraded"
 		}
+	}
+	if m.cfg.NginxErrorEnabled {
+		errorSources := m.nginxErrorSources(ctx, now)
+		result.NginxErrorSourceCount = len(errorSources)
+		for _, source := range errorSources {
+			if source.Status != "ok" {
+				result.NginxErrorUnhealthySources++
+			}
+		}
+		if len(errorSources) != len(m.cfg.NginxAllowedNodes) || result.NginxErrorUnhealthySources > 0 {
+			result.Status = "degraded"
+		}
+	}
+	result.NginxEvidence = m.nginxEvidenceHealth(ctx, nowTime)
+	// pilot 只做覆盖率与兼容性验证，不改变现有稳定性结论。
+	// verified 是已承诺的排障证据源，此时缺节点、积压或缺口必须显式降级。
+	if result.NginxEvidence.Mode == "verified" && (!result.NginxEvidence.StoreReachable || result.NginxEvidence.UnhealthySources > 0) {
+		result.Status = "degraded"
 	}
 	return result
 }

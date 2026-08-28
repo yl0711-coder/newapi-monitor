@@ -63,6 +63,12 @@ const (
 	// Tail 到期前及时让出调度器；断点会保留在 SQLite，下轮继续。
 	upstreamUsageHistoryMaxRequestsPerRun = 20
 	upstreamUsageHistoryOperationTimeout  = 45 * time.Second
+	// A whole-hour NewAPI query may be slow even when small time ranges are
+	// healthy. After a persisted timeout the history lane switches that hour to
+	// durable five-minute children. The same 20-request/45-second lane budget
+	// still applies, so recovery cannot turn into an upstream request burst.
+	newAPIBackfillAdaptiveSegment    = 5 * time.Minute
+	newAPIBackfillAdaptiveMinSegment = 10 * time.Second
 	// Tail 持续有流量时，每完成 4 个 Tail 批次允许 1 个历史批次；但只要
 	// 最老 Tail 已逾期超过 5 分钟，就继续优先追新，不为历史让路。
 	upstreamUsageHistoryFairnessTailBatches = 4
@@ -580,9 +586,9 @@ func (m *Monitor) saveNewAPIUsageBackfillCheckpoint(ctx context.Context, checkpo
 // durable page cursor. A request-budget yield is a normal scheduling event:
 // completed pages stay only in the checkpoint and public hourly data remains
 // untouched until the final total/fingerprint verification succeeds.
-func (m *Monitor) syncNewAPIUsageBackfillWindow(ctx context.Context, row ChannelUpstreamAccount, cred newAPICredential, from, to int64, pacer *upstreamUsageRequestPacer) (upstreamUsageResult, string, bool, error) {
-	if to <= from || to-from > 3600 || from%3600 != 0 {
-		return upstreamUsageResult{}, "", false, fmt.Errorf("NewAPI 历史补数窗口必须是整点起始且不超过一小时")
+func (m *Monitor) syncNewAPIUsageBackfillWindowDirect(ctx context.Context, row ChannelUpstreamAccount, cred newAPICredential, from, to int64, pacer *upstreamUsageRequestPacer, requireStableProbe bool) (upstreamUsageResult, string, bool, error) {
+	if to <= from || to-from > 3600 || from-from%3600 != (to-1)-(to-1)%3600 {
+		return upstreamUsageResult{}, "", false, fmt.Errorf("NewAPI 历史补数窗口必须位于同一小时且不超过一小时")
 	}
 	var checkpoint NewAPIUsageBackfillCheckpoint
 	loadErr := m.storeDB.WithContext(ctx).First(&checkpoint, "domain = ?", row.Domain).Error
@@ -676,7 +682,7 @@ func (m *Monitor) syncNewAPIUsageBackfillWindow(ctx context.Context, row Channel
 	if checkpoint.SourceRows != checkpoint.Total {
 		return upstreamUsageResult{}, "", false, fmt.Errorf("NewAPI 使用日志分页数量不完整（got=%d want=%d）", checkpoint.SourceRows, checkpoint.Total)
 	}
-	if pageCount > 1 && !checkpointVerified {
+	if (pageCount > 1 || requireStableProbe) && !checkpointVerified {
 		probe, err := fetchNewAPIUsagePage(ctx, client, row, cred, from, to, 1, pacer)
 		if err != nil {
 			var exhausted *upstreamUsageRunBudgetExhausted
@@ -703,6 +709,254 @@ func (m *Monitor) syncNewAPIUsageBackfillWindow(ctx context.Context, row Channel
 		CostUSD: checkpoint.Quota / unit, Provider: row.Provider,
 	}
 	return upstreamUsageResult{Hours: []ChannelUpstreamUsageHour{hour}, DataUntil: to, Adapter: upstreamUsageAdapterNewAPILog}, "", true, nil
+}
+
+const (
+	newAPIBackfillSegmentPending  = "pending"
+	newAPIBackfillSegmentComplete = "complete"
+)
+
+func isNewAPIBackfillTimeout(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var statusErr *upstreamHTTPError
+	if errors.As(err, &statusErr) && (statusErr.Status == http.StatusRequestTimeout || statusErr.Status == http.StatusGatewayTimeout || statusErr.Status == 524) {
+		return true
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "timeout") || strings.Contains(message, "deadline exceeded") ||
+		strings.Contains(message, "awaiting headers") || strings.Contains(message, "请求超时")
+}
+
+func newAPIBackfillNeedsAdaptiveSegments(row ChannelUpstreamAccount) bool {
+	return row.UsageBackfillConsecutiveFails > 0 && isNewAPIBackfillTimeout(errors.New(row.UsageBackfillLastError))
+}
+
+func newAPIBackfillSegmentProgress(from int64, complete, total int, current string) string {
+	progress := fmt.Sprintf("%s 小时慢查询降档已完成 %d/%d 个子窗口",
+		time.Unix(from, 0).In(cstLocation).Format("2006-01-02 15:00"), complete, total)
+	if strings.TrimSpace(current) != "" {
+		progress += "；" + current
+	}
+	return progress
+}
+
+func newAPIBackfillOperationBudgetYield(ctx context.Context, from int64, complete, total int) (upstreamUsageResult, string, bool, error) {
+	return upstreamUsageResult{}, newAPIBackfillSegmentProgress(from, complete, total, "本轮历史读取时间预算已用完，断点已保留"), false, nil
+}
+
+func (m *Monitor) saveNewAPIUsageBackfillSegment(ctx context.Context, segment NewAPIUsageBackfillSegment) error {
+	segment.UpdatedAt = time.Now().Unix()
+	segment.Status = newAPIBackfillSegmentComplete
+	return m.storeDB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Clauses(clause.OnConflict{
+			Columns:   []clause.Column{{Name: "domain"}, {Name: "hour_from"}, {Name: "segment_from"}},
+			UpdateAll: true,
+		}).Create(&segment).Error; err != nil {
+			return err
+		}
+		return tx.Where("domain = ? AND window_from = ? AND window_to = ?", segment.Domain, segment.SegmentFrom, segment.SegmentTo).
+			Delete(&NewAPIUsageBackfillCheckpoint{}).Error
+	})
+}
+
+func (m *Monitor) ensureNewAPIUsageBackfillSegmentPlan(ctx context.Context, domain string, from, to int64) error {
+	return m.storeDB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var count int64
+		if err := tx.Model(&NewAPIUsageBackfillSegment{}).Where("domain = ? AND hour_from = ?", domain, from).Count(&count).Error; err != nil {
+			return err
+		}
+		if count == 0 {
+			step := int64(newAPIBackfillAdaptiveSegment / time.Second)
+			now := time.Now().Unix()
+			for segmentFrom := from; segmentFrom < to; segmentFrom += step {
+				segment := NewAPIUsageBackfillSegment{
+					Domain: domain, HourFrom: from, SegmentFrom: segmentFrom, SegmentTo: min(to, segmentFrom+step),
+					Status: newAPIBackfillSegmentPending, UpdatedAt: now,
+				}
+				if err := tx.Create(&segment).Error; err != nil {
+					return err
+				}
+			}
+		}
+		// Switching topology and discarding an unfinished parent accumulation is
+		// one SQLite commit. A child-page checkpoint is deliberately retained.
+		return tx.Where("domain = ? AND window_from = ? AND window_to = ?", domain, from, to).
+			Delete(&NewAPIUsageBackfillCheckpoint{}).Error
+	})
+}
+
+func nextNewAPIBackfillSegmentSize(seconds int64) int64 {
+	switch {
+	case seconds > 60:
+		return 60
+	case seconds > int64(newAPIBackfillAdaptiveMinSegment/time.Second):
+		return int64(newAPIBackfillAdaptiveMinSegment / time.Second)
+	default:
+		return 0
+	}
+}
+
+func (m *Monitor) splitNewAPIUsageBackfillSegment(ctx context.Context, segment NewAPIUsageBackfillSegment) error {
+	step := nextNewAPIBackfillSegmentSize(segment.SegmentTo - segment.SegmentFrom)
+	if step == 0 {
+		return fmt.Errorf("NewAPI 历史补数最小子窗口仍然超时")
+	}
+	return m.storeDB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		result := tx.Where("domain = ? AND hour_from = ? AND segment_from = ? AND status = ?", segment.Domain, segment.HourFrom, segment.SegmentFrom, newAPIBackfillSegmentPending).
+			Delete(&NewAPIUsageBackfillSegment{})
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected != 1 {
+			return fmt.Errorf("NewAPI 历史补数子窗口状态已变化")
+		}
+		if err := tx.Where("domain = ? AND window_from = ? AND window_to = ?", segment.Domain, segment.SegmentFrom, segment.SegmentTo).
+			Delete(&NewAPIUsageBackfillCheckpoint{}).Error; err != nil {
+			return err
+		}
+		now := time.Now().Unix()
+		for childFrom := segment.SegmentFrom; childFrom < segment.SegmentTo; childFrom += step {
+			child := NewAPIUsageBackfillSegment{
+				Domain: segment.Domain, HourFrom: segment.HourFrom, SegmentFrom: childFrom,
+				SegmentTo: min(segment.SegmentTo, childFrom+step), Status: newAPIBackfillSegmentPending, UpdatedAt: now,
+			}
+			if err := tx.Create(&child).Error; err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+func validateNewAPIUsageBackfillSegments(segments []NewAPIUsageBackfillSegment, from, to int64, requireComplete bool) error {
+	expected := from
+	for _, segment := range segments {
+		if segment.HourFrom != from || segment.SegmentFrom != expected || segment.SegmentTo <= segment.SegmentFrom || segment.SegmentTo > to ||
+			(segment.Status != newAPIBackfillSegmentPending && segment.Status != newAPIBackfillSegmentComplete) {
+			return fmt.Errorf("NewAPI 历史补数子窗口覆盖不连续或证据无效")
+		}
+		if segment.Status == newAPIBackfillSegmentComplete && (segment.Total < 0 || segment.SourceRows != segment.Total || len(segment.FirstPageFingerprint) != 64) {
+			return fmt.Errorf("NewAPI 历史补数子窗口完整性证据无效")
+		}
+		if requireComplete && segment.Status != newAPIBackfillSegmentComplete {
+			return fmt.Errorf("NewAPI 历史补数子窗口尚未全部完成")
+		}
+		expected = segment.SegmentTo
+	}
+	if expected != to {
+		return fmt.Errorf("NewAPI 历史补数子窗口尚未完整覆盖父小时")
+	}
+	return nil
+}
+
+func (m *Monitor) syncNewAPIUsageBackfillWindowSegmented(ctx context.Context, row ChannelUpstreamAccount, cred newAPICredential, from, to int64, pacer *upstreamUsageRequestPacer) (upstreamUsageResult, string, bool, error) {
+	var stored []NewAPIUsageBackfillSegment
+	if err := m.storeDB.WithContext(ctx).Where("domain = ? AND hour_from = ?", row.Domain, from).
+		Order("segment_from ASC").Find(&stored).Error; err != nil {
+		return upstreamUsageResult{}, "", false, err
+	}
+	if len(stored) == 0 {
+		return upstreamUsageResult{}, "", false, fmt.Errorf("NewAPI 历史补数降档计划缺失")
+	}
+	if err := validateNewAPIUsageBackfillSegments(stored, from, to, false); err != nil {
+		return upstreamUsageResult{}, "", false, err
+	}
+	completed := 0
+	for index := range stored {
+		segment := stored[index]
+		if segment.Status == newAPIBackfillSegmentComplete {
+			completed++
+			continue
+		}
+
+		result, progress, complete, err := m.syncNewAPIUsageBackfillWindowDirect(ctx, row, cred, segment.SegmentFrom, segment.SegmentTo, pacer, true)
+		if err != nil {
+			// The lane's 45-second parent deadline is a cooperative yield, not
+			// evidence that this source interval is slow. Preserve topology and
+			// checkpoints; only a request-local timeout may split the interval.
+			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+				return newAPIBackfillOperationBudgetYield(ctx, from, completed, len(stored))
+			}
+			if isNewAPIBackfillTimeout(err) && segment.SegmentTo-segment.SegmentFrom > int64(newAPIBackfillAdaptiveMinSegment/time.Second) {
+				if splitErr := m.splitNewAPIUsageBackfillSegment(ctx, segment); splitErr != nil {
+					return upstreamUsageResult{}, "", false, splitErr
+				}
+				return upstreamUsageResult{}, newAPIBackfillSegmentProgress(from, completed, len(stored), "子窗口再次超时，已持久降档"), false, nil
+			}
+			return upstreamUsageResult{}, "", false, err
+		}
+		if !complete {
+			return upstreamUsageResult{}, newAPIBackfillSegmentProgress(from, completed, len(stored), progress), false, nil
+		}
+		if len(result.Hours) != 1 || result.Hours[0].HourTs != segment.SegmentFrom || result.Hours[0].BucketSeconds != segment.SegmentTo-segment.SegmentFrom {
+			return upstreamUsageResult{}, "", false, fmt.Errorf("NewAPI 历史补数子窗口汇总无效")
+		}
+		var checkpoint NewAPIUsageBackfillCheckpoint
+		if err := m.storeDB.WithContext(ctx).First(&checkpoint, "domain = ? AND window_from = ? AND window_to = ?", row.Domain, segment.SegmentFrom, segment.SegmentTo).Error; err != nil {
+			return upstreamUsageResult{}, "", false, err
+		}
+		segment.Total, segment.SourceRows = checkpoint.Total, checkpoint.SourceRows
+		segment.Requests, segment.Tokens, segment.Quota = result.Hours[0].Requests, result.Hours[0].Tokens, result.Hours[0].Quota
+		segment.FirstPageFingerprint = checkpoint.FirstPageFingerprint
+		if err := m.saveNewAPIUsageBackfillSegment(ctx, segment); err != nil {
+			return upstreamUsageResult{}, "", false, err
+		}
+		segment.Status = newAPIBackfillSegmentComplete
+		stored[index] = segment
+		completed++
+	}
+
+	if err := validateNewAPIUsageBackfillSegments(stored, from, to, true); err != nil {
+		return upstreamUsageResult{}, "", false, err
+	}
+	hour := ChannelUpstreamUsageHour{Domain: row.Domain, HourTs: from, BucketSeconds: to - from, Provider: row.Provider}
+	for _, segment := range stored {
+		hour.Requests += segment.Requests
+		hour.Tokens += segment.Tokens
+		hour.Quota += segment.Quota
+	}
+	unit := row.BalanceUnit
+	if unit <= 0 {
+		unit = defaultNewAPIQuotaPerUSD
+	}
+	hour.CostUSD = hour.Quota / unit
+	return upstreamUsageResult{Hours: []ChannelUpstreamUsageHour{hour}, DataUntil: to, Adapter: upstreamUsageAdapterNewAPILog}, "", true, nil
+}
+
+func (m *Monitor) syncNewAPIUsageBackfillWindow(ctx context.Context, row ChannelUpstreamAccount, cred newAPICredential, from, to int64, pacer *upstreamUsageRequestPacer) (upstreamUsageResult, string, bool, error) {
+	var checkpoint NewAPIUsageBackfillCheckpoint
+	checkpointErr := m.storeDB.WithContext(ctx).First(&checkpoint, "domain = ?", row.Domain).Error
+	if checkpointErr != nil && !errors.Is(checkpointErr, gorm.ErrRecordNotFound) {
+		return upstreamUsageResult{}, "", false, checkpointErr
+	}
+	var segmentCount int64
+	if err := m.storeDB.WithContext(ctx).Model(&NewAPIUsageBackfillSegment{}).
+		Where("domain = ? AND hour_from = ?", row.Domain, from).Count(&segmentCount).Error; err != nil {
+		return upstreamUsageResult{}, "", false, err
+	}
+	checkpointIsChild := checkpointErr == nil && checkpoint.WindowFrom >= from && checkpoint.WindowTo <= to && (checkpoint.WindowFrom != from || checkpoint.WindowTo != to)
+	if segmentCount > 0 || checkpointIsChild || newAPIBackfillNeedsAdaptiveSegments(row) {
+		if err := m.ensureNewAPIUsageBackfillSegmentPlan(ctx, row.Domain, from, to); err != nil {
+			return upstreamUsageResult{}, "", false, err
+		}
+		return m.syncNewAPIUsageBackfillWindowSegmented(ctx, row, cred, from, to, pacer)
+	}
+	result, progress, complete, err := m.syncNewAPIUsageBackfillWindowDirect(ctx, row, cred, from, to, pacer, false)
+	if err != nil && errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return newAPIBackfillOperationBudgetYield(ctx, from, 0, 1)
+	}
+	if !isNewAPIBackfillTimeout(err) {
+		return result, progress, complete, err
+	}
+	if planErr := m.ensureNewAPIUsageBackfillSegmentPlan(ctx, row.Domain, from, to); planErr != nil {
+		return upstreamUsageResult{}, "", false, planErr
+	}
+	return upstreamUsageResult{}, newAPIBackfillSegmentProgress(from, 0, int((to-from)/int64(newAPIBackfillAdaptiveSegment/time.Second)), "整小时查询超时，已持久降档"), false, nil
 }
 
 func (m *Monitor) syncNewAPIUsage(ctx context.Context, row ChannelUpstreamAccount, cred newAPICredential, from, to int64, pacer *upstreamUsageRequestPacer) (upstreamUsageResult, error) {
@@ -1567,7 +1821,10 @@ func (m *Monitor) persistNewAPIUsageBackfillWindow(ctx context.Context, domain s
 		if err := persistUpstreamUsageWindowTx(tx, domain, from, to, hours, now); err != nil {
 			return err
 		}
-		return tx.Where("domain = ? AND window_from = ? AND window_to = ?", domain, from, to).Delete(&NewAPIUsageBackfillCheckpoint{}).Error
+		if err := tx.Where("domain = ?", domain).Delete(&NewAPIUsageBackfillCheckpoint{}).Error; err != nil {
+			return err
+		}
+		return tx.Where("domain = ? AND hour_from = ?", domain, from).Delete(&NewAPIUsageBackfillSegment{}).Error
 	})
 }
 
@@ -1724,6 +1981,16 @@ func (m *Monitor) syncStoredUpstreamUsage(ctx context.Context, domain string) (C
 
 func (m *Monitor) syncStoredUpstreamUsageLaneBackground(ctx context.Context, domain string, lane upstreamUsageLane) (ChannelUpstreamAccount, error) {
 	return m.syncStoredUpstreamUsageWithPriority(ctx, domain, true, lane)
+}
+
+func upstreamUsageLocalCommitContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		// The read budget is exhausted, but durable checkpoints and the next local
+		// schedule still need a bounded SQLite commit. This detached context is
+		// local-only and must never be used for another upstream request.
+		return context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	}
+	return ctx, func() {}
 }
 
 func (m *Monitor) syncStoredUpstreamUsageWithPriority(ctx context.Context, domain string, background bool, lane upstreamUsageLane) (ChannelUpstreamAccount, error) {
@@ -1912,14 +2179,16 @@ func (m *Monitor) syncStoredUpstreamUsageWithPriority(ctx context.Context, domai
 	} else if err == nil && tailRan {
 		row.UsageBackfillDone = row.UsageBackfillCursor >= cstDayStart(now)
 	}
+	persistCtx, persistCancel := upstreamUsageLocalCommitContext(ctx)
+	defer persistCancel()
 	var persistErr error
 	if row.Provider == upstreamProviderSub2API {
 		// Sub2API rotates refresh tokens. Persist the newest token even when the
 		// subsequent usage query fails, otherwise the next run may replay a
 		// consumed refresh token and isolate an otherwise healthy account.
-		persistErr = m.persistSyncedUpstreamAccount(ctx, &row, credential)
+		persistErr = m.persistSyncedUpstreamAccount(persistCtx, &row, credential)
 	} else {
-		persistErr = m.persistUpstreamAccount(ctx, &row)
+		persistErr = m.persistUpstreamAccount(persistCtx, &row)
 	}
 	if persistErr != nil {
 		return row, persistErr

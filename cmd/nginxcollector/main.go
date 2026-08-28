@@ -22,20 +22,33 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
 
 type config struct {
-	node          string
-	logPath       string
-	cursorPath    string
-	sinkURL       string
-	token         string
-	interval      time.Duration
-	maxLines      int
-	retentionDays int
-	allowHTTP     bool
+	node               string
+	logPath            string
+	cursorPath         string
+	sinkURL            string
+	token              string
+	interval           time.Duration
+	maxLines           int
+	retentionDays      int
+	allowHTTP          bool
+	evidenceMode       string
+	evidenceSinkURL    string
+	evidenceHMACKey    []byte
+	evidenceHMACKeyID  string
+	evidenceOutboxPath string
+	evidenceOutboxMax  int64
+	evidenceFSMu       *sync.Mutex
+	errorEnabled       bool
+	errorLogPath       string
+	errorCursorPath    string
+	errorSinkURL       string
+	errorTimezone      string
 }
 
 func loadConfig() (config, error) {
@@ -51,12 +64,28 @@ func loadConfig() (config, error) {
 	if err != nil {
 		return config{}, err
 	}
+	evidenceOutboxMiB, err := boundedEnvInt("NGINXCOLLECTOR_EVIDENCE_OUTBOX_MAX_MIB", 256, 8, 2048)
+	if err != nil {
+		return config{}, err
+	}
 	c := config{
 		node: strings.TrimSpace(os.Getenv("NGINXCOLLECTOR_NODE")), logPath: env("NGINXCOLLECTOR_LOG_PATH", "/logs/nexusapi_access.jsonl"),
 		cursorPath: env("NGINXCOLLECTOR_CURSOR_PATH", "/data/cursor.json"), sinkURL: strings.TrimSpace(os.Getenv("NGINXCOLLECTOR_SINK_URL")),
 		token: os.Getenv("NGINXCOLLECTOR_TOKEN"), interval: time.Duration(intervalSeconds) * time.Second,
 		maxLines: maxLines, retentionDays: retentionDays,
-		allowHTTP: strings.EqualFold(strings.TrimSpace(os.Getenv("NGINXCOLLECTOR_ALLOW_INSECURE_HTTP")), "true"),
+		allowHTTP:          strings.EqualFold(strings.TrimSpace(os.Getenv("NGINXCOLLECTOR_ALLOW_INSECURE_HTTP")), "true"),
+		evidenceMode:       strings.ToLower(strings.TrimSpace(env("NGINXCOLLECTOR_EVIDENCE_MODE", "off"))),
+		evidenceSinkURL:    strings.TrimSpace(os.Getenv("NGINXCOLLECTOR_EVIDENCE_SINK_URL")),
+		evidenceHMACKey:    []byte(os.Getenv("NGINXCOLLECTOR_EVIDENCE_HMAC_KEY")),
+		evidenceHMACKeyID:  strings.TrimSpace(os.Getenv("NGINXCOLLECTOR_EVIDENCE_HMAC_KEY_ID")),
+		evidenceOutboxPath: env("NGINXCOLLECTOR_EVIDENCE_OUTBOX_PATH", "/data/evidence-outbox"),
+		evidenceOutboxMax:  int64(evidenceOutboxMiB) << 20,
+		evidenceFSMu:       &sync.Mutex{},
+		errorEnabled:       strings.EqualFold(strings.TrimSpace(os.Getenv("NGINXCOLLECTOR_ERROR_ENABLED")), "true"),
+		errorLogPath:       env("NGINXCOLLECTOR_ERROR_LOG_PATH", "/logs/error.log"),
+		errorCursorPath:    env("NGINXCOLLECTOR_ERROR_CURSOR_PATH", "/data/error-cursor.json"),
+		errorSinkURL:       strings.TrimSpace(os.Getenv("NGINXCOLLECTOR_ERROR_SINK_URL")),
+		errorTimezone:      strings.TrimSpace(env("NGINXCOLLECTOR_ERROR_TIMEZONE", "UTC")),
 	}
 	if c.node == "" || c.sinkURL == "" || c.token == "" {
 		return config{}, fmt.Errorf("NGINXCOLLECTOR_NODE, NGINXCOLLECTOR_SINK_URL and NGINXCOLLECTOR_TOKEN are required")
@@ -66,6 +95,34 @@ func loadConfig() (config, error) {
 	}
 	if err := validateSinkURL(c.sinkURL, c.allowHTTP); err != nil {
 		return config{}, err
+	}
+	if c.evidenceMode != "off" && c.evidenceMode != "pilot" && c.evidenceMode != "verified" {
+		return config{}, fmt.Errorf("NGINXCOLLECTOR_EVIDENCE_MODE must be off, pilot or verified")
+	}
+	if c.evidenceMode != "off" {
+		if err := validateSinkURL(c.evidenceSinkURL, c.allowHTTP); err != nil {
+			return config{}, fmt.Errorf("invalid evidence sink: %w", err)
+		}
+		if len(c.evidenceHMACKey) < 32 || !validEvidenceKeyID(c.evidenceHMACKeyID) {
+			return config{}, fmt.Errorf("evidence HMAC key must be at least 32 bytes and key id must be valid")
+		}
+		if string(c.evidenceHMACKey) == c.token {
+			return config{}, fmt.Errorf("evidence HMAC key must differ from ingest token")
+		}
+		if c.evidenceOutboxMax < 8<<20 || c.evidenceOutboxMax > 2<<30 {
+			return config{}, fmt.Errorf("NGINXCOLLECTOR_EVIDENCE_OUTBOX_MAX_MIB must be between 8 and 2048")
+		}
+	}
+	if c.errorEnabled {
+		if err := validateSinkURL(c.errorSinkURL, c.allowHTTP); err != nil {
+			return config{}, fmt.Errorf("invalid error sink: %w", err)
+		}
+		if c.errorLogPath == c.logPath || c.errorCursorPath == c.cursorPath {
+			return config{}, fmt.Errorf("Nginx error log must use an independent log and cursor")
+		}
+		if _, err := time.LoadLocation(c.errorTimezone); err != nil {
+			return config{}, fmt.Errorf("NGINXCOLLECTOR_ERROR_TIMEZONE is invalid: %w", err)
+		}
 	}
 	return c, nil
 }
@@ -121,13 +178,20 @@ func validateSinkURL(raw string, allowHTTP bool) error {
 const cursorVersion = 1
 
 type cursor struct {
-	Version             int    `json:"version"`
-	Inode               uint64 `json:"inode"`
-	Offset              int64  `json:"offset"`
-	Discontinuities     int64  `json:"discontinuities,omitempty"`
-	LastDiscontinuityAt int64  `json:"last_discontinuity_at,omitempty"`
-	DiscardedLines      int64  `json:"discarded_lines,omitempty"`
-	LastDiscardedAt     int64  `json:"last_discarded_at,omitempty"`
+	Version                      int    `json:"version"`
+	Inode                        uint64 `json:"inode"`
+	Offset                       int64  `json:"offset"`
+	Discontinuities              int64  `json:"discontinuities,omitempty"`
+	LastDiscontinuityAt          int64  `json:"last_discontinuity_at,omitempty"`
+	DiscardedLines               int64  `json:"discarded_lines,omitempty"`
+	LastDiscardedAt              int64  `json:"last_discarded_at,omitempty"`
+	LastLogSchema                int    `json:"last_log_schema,omitempty"`
+	EvidenceEligible             int64  `json:"evidence_eligible,omitempty"`
+	EvidenceParseRejected        int64  `json:"evidence_parse_rejected,omitempty"`
+	LastEvidenceParseRejectedAt  int64  `json:"last_evidence_parse_rejected_at,omitempty"`
+	EvidencePersistFailures      int64  `json:"evidence_persist_failures,omitempty"`
+	EvidenceDroppedEvents        int64  `json:"evidence_dropped_events,omitempty"`
+	LastEvidencePersistFailureAt int64  `json:"last_evidence_persist_failure_at,omitempty"`
 }
 
 type flexNumber float64
@@ -195,11 +259,13 @@ func (n *upstreamNumber) UnmarshalJSON(data []byte) error {
 		return fmt.Errorf("empty upstream number sequence")
 	}
 	var final float64
+	found := false
 	for _, part := range parts {
 		part = strings.TrimSpace(part)
-		// '-' 只能表示整个请求没有 upstream；与数值混用时
-		// 不猜测口径，直接拒绝该行并让丢弃计数可见。
-		if part == "" || part == "-" {
+		if part == "-" {
+			continue
+		}
+		if part == "" {
 			return fmt.Errorf("invalid upstream number sequence")
 		}
 		parsed, err := strconv.ParseFloat(part, 64)
@@ -207,6 +273,11 @@ func (n *upstreamNumber) UnmarshalJSON(data []byte) error {
 			return err
 		}
 		final = parsed
+		found = true
+	}
+	if !found {
+		*n = upstreamNumber{}
+		return nil
 	}
 	*n = upstreamNumber{Value: final, Present: true}
 	return nil
@@ -240,18 +311,28 @@ type sample struct {
 	UpstreamTimeCount int64  `json:"upstream_time_count"`
 	BytesSent         int64  `json:"bytes_sent"`
 	RequestIDPresent  int64  `json:"request_id_present"`
+	LatencyCount      int64  `json:"latency_count"`
+	Latency0To1s      int64  `json:"latency_0_1s"`
+	Latency1To5s      int64  `json:"latency_1_5s"`
+	Latency5To15s     int64  `json:"latency_5_15s"`
+	Latency15To30s    int64  `json:"latency_15_30s"`
+	Latency30To60s    int64  `json:"latency_30_60s"`
+	LatencyOver60s    int64  `json:"latency_over_60s"`
 }
 
 type batch struct {
-	Node                      string   `json:"node"`
-	BatchID                   string   `json:"batch_id"`
-	Samples                   []sample `json:"samples"`
-	BacklogBytes              int64    `json:"backlog_bytes,omitempty"`
-	BacklogKnown              bool     `json:"backlog_known,omitempty"`
-	CursorDiscontinuities     int64    `json:"cursor_discontinuities,omitempty"`
-	LastCursorDiscontinuityAt int64    `json:"last_cursor_discontinuity_at,omitempty"`
-	DiscardedLines            int64    `json:"discarded_lines,omitempty"`
-	LastDiscardedAt           int64    `json:"last_discarded_at,omitempty"`
+	Node                      string         `json:"node"`
+	BatchID                   string         `json:"batch_id"`
+	Samples                   []sample       `json:"samples"`
+	BacklogBytes              int64          `json:"backlog_bytes,omitempty"`
+	BacklogKnown              bool           `json:"backlog_known,omitempty"`
+	CursorDiscontinuities     int64          `json:"cursor_discontinuities,omitempty"`
+	LastCursorDiscontinuityAt int64          `json:"last_cursor_discontinuity_at,omitempty"`
+	DiscardedLines            int64          `json:"discarded_lines,omitempty"`
+	LastDiscardedAt           int64          `json:"last_discarded_at,omitempty"`
+	EvidencePersistFailures   int64          `json:"evidence_persist_failures,omitempty"`
+	EvidenceDroppedEvents     int64          `json:"evidence_dropped_events,omitempty"`
+	Evidence                  *evidenceBatch `json:"-"`
 }
 
 func normalizeRoute(path string) string {
@@ -279,10 +360,10 @@ func normalizeMethod(method string) string {
 	}
 }
 
-func parseLine(data []byte) (sample, bool) {
+func parseAccessLine(data []byte) (sample, rawLine, bool) {
 	var raw rawLine
 	if len(data) > 64<<10 || json.Unmarshal(data, &raw) != nil {
-		return sample{}, false
+		return sample{}, rawLine{}, false
 	}
 	ts := float64(raw.Timestamp)
 	if ts <= 0 {
@@ -292,7 +373,7 @@ func parseLine(data []byte) (sample, bool) {
 	requestSeconds, upstreamSeconds, sentBytes := float64(raw.RequestTime), raw.UpstreamTime.Value, float64(raw.BytesSent)
 	for _, value := range []float64{ts, statusValue, upstreamStatusValue, requestSeconds, upstreamSeconds, sentBytes} {
 		if math.IsNaN(value) || math.IsInf(value, 0) {
-			return sample{}, false
+			return sample{}, rawLine{}, false
 		}
 	}
 	status, upstreamStatus := int(statusValue), int(upstreamStatusValue)
@@ -300,7 +381,7 @@ func parseLine(data []byte) (sample, bool) {
 		upstreamStatusValue != float64(upstreamStatus) || (upstreamStatus != 0 && (upstreamStatus < 100 || upstreamStatus > 599)) ||
 		requestSeconds < 0 || requestSeconds > 86400 || upstreamSeconds < 0 || upstreamSeconds > 86400 ||
 		sentBytes < 0 || sentBytes > 16<<30 {
-		return sample{}, false
+		return sample{}, rawLine{}, false
 	}
 	method := raw.Method
 	if method == "" {
@@ -314,14 +395,41 @@ func parseLine(data []byte) (sample, bool) {
 	upstreamMS := int64(math.Round(upstreamSeconds * 1000))
 	out := sample{BucketTs: int64(ts) / 60 * 60, Route: normalizeRoute(path), Method: normalizeMethod(method), Status: status,
 		UpstreamStatus: upstreamStatus, Count: 1, RequestTimeSumMS: requestMS, RequestTimeMaxMS: requestMS,
-		BytesSent: int64(sentBytes)}
+		BytesSent: int64(sentBytes), LatencyCount: 1}
+	switch {
+	case requestMS <= 1000:
+		out.Latency0To1s = 1
+	case requestMS <= 5000:
+		out.Latency1To5s = 1
+	case requestMS <= 15000:
+		out.Latency5To15s = 1
+	case requestMS <= 30000:
+		out.Latency15To30s = 1
+	case requestMS <= 60000:
+		out.Latency30To60s = 1
+	default:
+		out.LatencyOver60s = 1
+	}
 	if raw.UpstreamTime.Present {
 		out.UpstreamTimeSumMS, out.UpstreamTimeCount = upstreamMS, 1
 	}
 	if strings.TrimSpace(raw.RequestID) != "" && strings.TrimSpace(raw.RequestID) != "-" {
 		out.RequestIDPresent = 1
 	}
-	return out, true
+	return out, raw, true
+}
+
+func rawEventMS(raw rawLine) int64 {
+	ts := float64(raw.Timestamp)
+	if ts <= 0 {
+		ts = float64(raw.Msec)
+	}
+	return int64(math.Round(ts * 1000))
+}
+
+func parseLine(data []byte) (sample, bool) {
+	row, _, ok := parseAccessLine(data)
+	return row, ok
 }
 
 func sampleWithinWindow(row sample, now int64, retentionDays int) bool {
@@ -346,6 +454,13 @@ func merge(dst *sample, src sample) {
 	dst.UpstreamTimeCount += src.UpstreamTimeCount
 	dst.BytesSent += src.BytesSent
 	dst.RequestIDPresent += src.RequestIDPresent
+	dst.LatencyCount += src.LatencyCount
+	dst.Latency0To1s += src.Latency0To1s
+	dst.Latency1To5s += src.Latency1To5s
+	dst.Latency5To15s += src.Latency5To15s
+	dst.Latency15To30s += src.Latency15To30s
+	dst.Latency30To60s += src.Latency30To60s
+	dst.LatencyOver60s += src.LatencyOver60s
 }
 
 func fileInode(info os.FileInfo) uint64 {
@@ -365,7 +480,10 @@ func loadCursor(path string) (cursor, error) {
 	}
 	var value cursor
 	if json.Unmarshal(data, &value) != nil || value.Version != cursorVersion || value.Inode == 0 || value.Offset < 0 || value.Discontinuities < 0 || value.LastDiscontinuityAt < 0 ||
-		value.DiscardedLines < 0 || value.LastDiscardedAt < 0 {
+		value.DiscardedLines < 0 || value.LastDiscardedAt < 0 || value.LastLogSchema < 0 || value.LastLogSchema > 2 ||
+		value.EvidenceEligible < 0 || value.EvidenceParseRejected < 0 || value.LastEvidenceParseRejectedAt < 0 ||
+		value.EvidencePersistFailures < 0 || value.EvidenceDroppedEvents < 0 || value.LastEvidencePersistFailureAt < 0 ||
+		(value.EvidencePersistFailures == 0) != (value.LastEvidencePersistFailureAt == 0) {
 		return cursor{}, fmt.Errorf("cursor is invalid; restore the persistent cursor volume before restarting")
 	}
 	return value, nil
@@ -582,6 +700,11 @@ func readBatch(c config, value cursor) (batch, cursor, bool, error) {
 	start, end := value.Offset, value.Offset
 	batchContent := sha256.New()
 	aggregates := make(map[string]sample)
+	var evidenceEvents []evidenceEvent
+	if c.evidenceMode != "off" {
+		evidenceEvents = make([]evidenceEvent, 0, c.maxLines)
+	}
+	var firstEventMS, lastEventMS int64
 	completeLines := 0
 	for completeLines < c.maxLines {
 		line, lineDigest, consumed, complete, readErr := readBoundedLine(reader)
@@ -591,16 +714,45 @@ func readBatch(c config, value cursor) (batch, cursor, bool, error) {
 		if !complete {
 			break
 		}
+		lineStart := end
 		end += consumed
 		_, _ = batchContent.Write(lineDigest[:])
 		completeLines++
-		if row, ok := parseLine(bytes.TrimSpace(line)); ok && sampleWithinWindow(row, now, c.retentionDays) {
+		trimmed := bytes.TrimSpace(line)
+		if c.evidenceMode != "off" {
+			var observed struct {
+				LogSchema flexNumber `json:"log_schema"`
+			}
+			if json.Unmarshal(trimmed, &observed) == nil && (int(observed.LogSchema) == 1 || int(observed.LogSchema) == 2) {
+				value.LastLogSchema = int(observed.LogSchema)
+			}
+		}
+		if row, raw, ok := parseAccessLine(trimmed); ok && sampleWithinWindow(row, now, c.retentionDays) {
 			key := sampleKey(row)
 			if current, exists := aggregates[key]; exists {
 				merge(&current, row)
 				aggregates[key] = current
 			} else {
 				aggregates[key] = row
+			}
+			if c.evidenceMode != "off" && evidenceCandidate(trimmed, raw, row) {
+				if value.EvidenceEligible < math.MaxInt64 {
+					value.EvidenceEligible++
+				}
+				if event, eventOK := makeEvidenceEvent(c, trimmed, raw, row, inode, lineStart, lineDigest); eventOK {
+					evidenceEvents = append(evidenceEvents, event)
+					if firstEventMS == 0 || event.EventMS < firstEventMS {
+						firstEventMS = event.EventMS
+					}
+					if event.EventMS > lastEventMS {
+						lastEventMS = event.EventMS
+					}
+				} else {
+					if value.EvidenceParseRejected < math.MaxInt64 {
+						value.EvidenceParseRejected++
+					}
+					value.LastEvidenceParseRejectedAt = now
+				}
 			}
 		} else {
 			if value.DiscardedLines < math.MaxInt64 {
@@ -636,7 +788,19 @@ func readBatch(c config, value cursor) (batch, cursor, bool, error) {
 	next.LastDiscontinuityAt = value.LastDiscontinuityAt
 	next.DiscardedLines = value.DiscardedLines
 	next.LastDiscardedAt = value.LastDiscardedAt
-	return batch{Node: c.node, BatchID: hex.EncodeToString(digest), Samples: rows}, next, true, nil
+	next.LastLogSchema = value.LastLogSchema
+	next.EvidenceEligible = value.EvidenceEligible
+	next.EvidenceParseRejected = value.EvidenceParseRejected
+	next.LastEvidenceParseRejectedAt = value.LastEvidenceParseRejectedAt
+	next.EvidencePersistFailures = value.EvidencePersistFailures
+	next.EvidenceDroppedEvents = value.EvidenceDroppedEvents
+	next.LastEvidencePersistFailureAt = value.LastEvidencePersistFailureAt
+	batchID := hex.EncodeToString(digest)
+	payload := batch{Node: c.node, BatchID: batchID, Samples: rows}
+	if c.evidenceMode != "off" {
+		payload.Evidence = newEvidenceBatch(c, batchID, inode, start, end, firstEventMS, lastEventMS, evidenceEvents, next)
+	}
+	return payload, next, true, nil
 }
 
 func collectorTelemetry(c config, value cursor) (backlog int64, known bool) {
@@ -725,6 +889,22 @@ func runOnce(ctx context.Context, c config) error {
 		return nil
 	}
 	decorateBatch(c, &payload, next)
+	if payload.Evidence != nil {
+		if err := spoolEvidence(c, *payload.Evidence); err != nil {
+			// Evidence is an independent best-effort lane. A local evidence disk
+			// failure must be visible, but must never stop the established minute lane.
+			payload.EvidencePersistFailures = 1
+			payload.EvidenceDroppedEvents = int64(len(payload.Evidence.Events))
+			if next.EvidencePersistFailures < math.MaxInt64 {
+				next.EvidencePersistFailures++
+			}
+			next.LastEvidencePersistFailureAt = time.Now().Unix()
+			if next.EvidenceDroppedEvents <= math.MaxInt64-int64(len(payload.Evidence.Events)) {
+				next.EvidenceDroppedEvents += int64(len(payload.Evidence.Events))
+			}
+			logEvidenceDeliveryError(fmt.Errorf("persist evidence outbox: %w", err))
+		}
+	}
 	if err := postBatch(ctx, c, payload); err != nil {
 		return err
 	}
@@ -748,12 +928,19 @@ func main() {
 	defer stop()
 	ticker := time.NewTicker(c.interval)
 	defer ticker.Stop()
+	if c.evidenceMode != "off" {
+		go runEvidenceWorker(ctx, c)
+	}
+	if c.errorEnabled {
+		go runErrorWorker(ctx, c)
+	}
 	var nextHeartbeat time.Time
 	for {
 		if err := runOnce(ctx, c); err != nil && !errors.Is(err, os.ErrNotExist) && ctx.Err() == nil {
 			log.Printf("nginxcollector: 本轮未推进游标，将自动重试: %v", err)
 		}
-		if now := time.Now(); !now.Before(nextHeartbeat) && ctx.Err() == nil {
+		now := time.Now()
+		if !now.Before(nextHeartbeat) && ctx.Err() == nil {
 			current, cursorErr := loadCursor(c.cursorPath)
 			if cursorErr != nil {
 				log.Printf("nginxcollector: 游标文件无法安全读取，已停止心跳与推进: %v", cursorErr)

@@ -191,10 +191,12 @@ func (m *Monitor) RegisterRoutes(r *gin.Engine) {
 		c.Header("Cache-Control", "no-cache")
 		c.Data(http.StatusOK, "application/javascript; charset=utf-8", logChainJS)
 	})
-	r.GET("/api/brand", m.brandHandler)                // 公开:站点名,供前端设置页面标题
-	r.POST("/internal/rejections", m.ingestRejections) // 机器对机器:接收采集器推送的前置拒绝(token 鉴权)
-	r.POST("/internal/host", m.ingestHost)             // 机器对机器:接收各节点主机 agent 推送的 OS 内存/磁盘(token 鉴权)
-	r.POST("/internal/nginx", m.ingestNginx)           // 机器对机器:接收已脱敏的 Nginx 分钟聚合(token 鉴权,默认关闭)
+	r.GET("/api/brand", m.brandHandler)                          // 公开:站点名,供前端设置页面标题
+	r.POST("/internal/rejections", m.ingestRejections)           // 机器对机器:接收采集器推送的前置拒绝(token 鉴权)
+	r.POST("/internal/host", m.ingestHost)                       // 机器对机器:接收各节点主机 agent 推送的 OS 内存/磁盘(token 鉴权)
+	r.POST("/internal/nginx", m.ingestNginx)                     // 机器对机器:接收已脱敏的 Nginx 分钟聚合(token 鉴权,默认关闭)
+	r.POST("/internal/nginx-errors", m.ingestNginxErrors)        // 机器对机器:error.log 节点侧分类分钟计数，不接收原文
+	r.POST("/internal/nginx-evidence/v1", m.ingestNginxEvidence) // 机器对机器:独立请求证据 lane，默认关闭
 	r.GET("/login", m.loginPage)
 	r.POST("/login", m.loginSubmit)
 	r.GET("/logout", logout)
@@ -208,14 +210,15 @@ func (m *Monitor) RegisterRoutes(r *gin.Engine) {
 		view.GET("/data", m.serveData)
 		view.GET("/monitor/data", m.serveData)
 		view.GET("/trend/long", m.serveLongTrend)
-		view.GET("/stability/report", m.serveStabilityReport)        // 历史稳定性:只读 Monitor 本地 SQLite
-		view.GET("/stability/detail", m.serveStabilityDetail)        // 单分组详情:按需加载渠道时间条/模型
-		view.GET("/stability/problems", m.serveStabilityProblems)    // 原始错误签名:只读本地问题样本
-		view.GET("/stability/health", m.serveStabilityHealth)        // 采集新鲜度/覆盖/积压:不查生产库
-		view.GET("/stability/edge", m.serveNginxEdge)                // Nginx 入口层:只读本地脱敏分钟汇总
-		view.GET("/sync/overview", m.serveSyncOverview)              // 统一同步摘要:只读本地状态投影
-		view.GET("/sync/workloads", m.serveSyncWorkloads)            // 有界任务明细:默认仅异常成员,支持分页
-		view.GET("/channels/report", m.serveChannelManagementReport) // 渠道管理:主域名→厂商→渠道→服务分组的本地汇总
+		view.GET("/stability/report", m.serveStabilityReport)                             // 历史稳定性:只读 Monitor 本地 SQLite
+		view.GET("/stability/detail", m.serveStabilityDetail)                             // 单分组详情:按需加载渠道时间条/模型
+		view.GET("/stability/problems", m.serveStabilityProblems)                         // 原始错误签名:只读本地问题样本
+		view.GET("/stability/health", m.serveStabilityHealth)                             // 采集新鲜度/覆盖/积压:不查生产库
+		view.GET("/stability/edge", m.serveNginxEdge)                                     // Nginx 入口层:只读本地脱敏分钟汇总
+		view.POST("/nginx/evidence/lookup", noStoreSensitive, m.serveNginxEvidenceLookup) // 精确 Request ID 证据查询：只读独立本地库
+		view.GET("/sync/overview", m.serveSyncOverview)                                   // 统一同步摘要:只读本地状态投影
+		view.GET("/sync/workloads", m.serveSyncWorkloads)                                 // 有界任务明细:默认仅异常成员,支持分页
+		view.GET("/channels/report", m.serveChannelManagementReport)                      // 渠道管理:主域名→厂商→渠道→服务分组的本地汇总
 		// 排障两个接口挂 noStoreSensitive：响应含客户标识、令牌名、渠道名/ID、
 		// 上游主域名与错误原文，属敏感诊断数据，不得被任何中间层缓存。
 		// 用中间件而非在 handler 里逐个 c.Header：handler 有多条提前 return

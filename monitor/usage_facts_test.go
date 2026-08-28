@@ -177,6 +177,28 @@ func TestUsageFactLocalStoreBusyUsesFastRetryClassification(t *testing.T) {
 	}
 }
 
+func TestSeparateUsageFactsStoreSerializesSQLiteConnections(t *testing.T) {
+	dir := t.TempDir()
+	m := &Monitor{cfg: Settings{
+		StorePath:           dir + "/main.db",
+		UsageFactsStorePath: dir + "/facts.db",
+	}}
+	if err := m.openStore(m.cfg.StorePath); err != nil {
+		t.Fatalf("openStore: %v", err)
+	}
+	if m.usageFactsDB == nil || m.usageFactsDB == m.storeDB {
+		t.Fatal("test did not open a separate facts store")
+	}
+	sqlDB, err := m.usageFactsDB.DB()
+	if err != nil {
+		t.Fatal(err)
+	}
+	stats := sqlDB.Stats()
+	if stats.MaxOpenConnections != 1 {
+		t.Fatalf("facts SQLite max open connections=%d want 1", stats.MaxOpenConnections)
+	}
+}
+
 func TestUsageFactScheduleJitterNeverShortensSafeDelay(t *testing.T) {
 	m := newTestMonitor(t)
 	base := 15 * time.Second

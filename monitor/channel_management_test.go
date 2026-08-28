@@ -276,6 +276,26 @@ func TestChannelManagementSupportsSub2APIUsageAndSeparatesManualSyncActions(t *t
 	}
 }
 
+func TestChannelManagementSupportsSub2APIBrowserSessionImport(t *testing.T) {
+	page := pageHTML
+	js := string(channelManagementJS)
+	for _, marker := range []string{
+		`id="cmUpstreamAuthMode"`,
+		`value="refresh_token"`,
+		`id="cmUpstreamRefreshToken"`,
+		`导入已登录会话`,
+		`payload.refresh_token`,
+		`cm-upstream-sub2-refresh`,
+	} {
+		if !strings.Contains(page, marker) && !strings.Contains(js, marker) {
+			t.Fatalf("Sub2API 会话导入界面缺少 %q", marker)
+		}
+	}
+	if !strings.Contains(js, `$('cmUpstreamRefreshToken').value=''`) {
+		t.Fatal("Sub2API Refresh Token 未在请求后立即清空")
+	}
+}
+
 func TestChannelManagementFiltersRemainMountedAcrossReportRefresh(t *testing.T) {
 	page := pageHTML
 	js := string(channelManagementJS)

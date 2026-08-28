@@ -68,6 +68,17 @@ func TestValidateNginxSettingsFailsClosed(t *testing.T) {
 	if err := validateNginxSettings(Settings{NginxEnabled: true, IngestToken: "secret", NginxAllowedNodes: []string{"master", "slave"}}); err != nil {
 		t.Fatalf("完整配置应通过: %v", err)
 	}
+	if err := validateNginxSettings(Settings{NginxEvidenceMode: "unknown"}); err == nil {
+		t.Fatal("未知 evidence 模式不能静默降级为 off")
+	}
+	if err := validateNginxSettings(Settings{NginxEvidenceMode: "pilot"}); err == nil {
+		t.Fatal("evidence 不能在 Nginx 分钟采集关闭时单独启用")
+	}
+	validEvidence := Settings{NginxEnabled: true, IngestToken: "secret", NginxAllowedNodes: []string{"master"},
+		NginxEvidenceMode: "pilot", NginxEvidenceStorePath: "evidence.db", NginxEvidenceRetentionHours: 168, NginxEvidenceHMACKey: strings.Repeat("k", 32), NginxEvidenceHMACKeyID: "key-1", NginxEvidenceMaxMiB: 512}
+	if err := validateNginxSettings(validEvidence); err != nil {
+		t.Fatalf("完整 evidence 灰度配置应通过: %v", err)
+	}
 }
 
 func TestNginxIngestIdempotentAndReport(t *testing.T) {
@@ -103,6 +114,37 @@ func TestNginxIngestIdempotentAndReport(t *testing.T) {
 	}
 }
 
+func TestNginxIngestRejectsReusedBatchIDWithDifferentPayload(t *testing.T) {
+	m := newTestMonitor(t)
+	m.cfg.NginxEnabled, m.cfg.IngestToken, m.cfg.NginxRetentionDays = true, "secret", 7
+	m.cfg.NginxAllowedNodes = []string{"master"}
+	bucket := time.Now().Unix() / 60 * 60
+	body := func(count int) string {
+		return fmt.Sprintf(`{"node":"master","batch_id":"batch_conflict_abcdefgh","samples":[{"bucket_ts":%d,"route":"/v1/responses","method":"POST","status":200,"upstream_status":200,"count":%d,"request_time_sum_ms":%d,"request_time_max_ms":100,"upstream_time_sum_ms":%d,"upstream_time_count":%d,"bytes_sent":%d,"request_id_present":%d}]}`,
+			bucket, count, count*100, count*80, count, count*1000, count)
+	}
+	if w := postNginx(t, m, body(1), "secret"); w.Code != http.StatusOK {
+		t.Fatalf("first ingest: %d %s", w.Code, w.Body.String())
+	}
+	if w := postNginx(t, m, body(2), "secret"); w.Code != http.StatusConflict {
+		t.Fatalf("same batch id with changed payload must conflict: %d %s", w.Code, w.Body.String())
+	}
+	var total int64
+	if err := m.storeDB.Model(&NginxMinuteSample{}).Select("COALESCE(SUM(count),0)").Scan(&total).Error; err != nil {
+		t.Fatal(err)
+	}
+	if total != 1 {
+		t.Fatalf("conflicting payload changed aggregate: %d", total)
+	}
+	var batch NginxIngestBatch
+	if err := m.storeDB.First(&batch, "node = ? AND batch_id = ?", "master", "batch_conflict_abcdefgh").Error; err != nil {
+		t.Fatal(err)
+	}
+	if len(batch.PayloadHash) != 64 {
+		t.Fatalf("server-computed payload hash missing: %q", batch.PayloadHash)
+	}
+}
+
 func TestNginxEdgeReportNumbers(t *testing.T) {
 	m := newTestMonitor(t)
 	m.cfg.NginxEnabled, m.cfg.NginxRetentionDays = true, 7
@@ -115,7 +157,7 @@ func TestNginxEdgeReportNumbers(t *testing.T) {
 	if err := m.storeDB.Create(&rows).Error; err != nil {
 		t.Fatal(err)
 	}
-	if err := m.storeDB.Create(&[]NginxSourceState{{Node: "master", LastEventTs: bucket, LastIngestTs: time.Now().Unix()}, {Node: "slave", LastEventTs: bucket, LastIngestTs: time.Now().Unix()}}).Error; err != nil {
+	if err := m.storeDB.Create(&[]NginxSourceState{{Node: "master", LastEventTs: bucket, LastIngestTs: time.Now().Unix(), BacklogKnown: true}, {Node: "slave", LastEventTs: bucket, LastIngestTs: time.Now().Unix(), BacklogKnown: true}}).Error; err != nil {
 		t.Fatal(err)
 	}
 	gin.SetMode(gin.TestMode)
@@ -175,6 +217,11 @@ func TestValidateNginxSampleRejectsUnboundedValues(t *testing.T) {
 		t.Fatal("request_id_present > count 应拒绝")
 	}
 	bad = base
+	bad.LatencyCount, bad.Latency0To1s = 1, 0
+	if _, err := validateNginxSample(bad, now, 7); err == nil {
+		t.Fatal("延迟样本数与直方图不守恒应拒绝")
+	}
+	bad = base
 	bad.BucketTs = now - 10*86400
 	if _, err := validateNginxSample(bad, now, 7); err == nil {
 		t.Fatal("超留存窗口样本应拒绝")
@@ -204,6 +251,15 @@ func TestValidateNginxSampleRejectsUnboundedValues(t *testing.T) {
 	}
 }
 
+func TestApproximateLatencyPercentilesUseBoundedHistogram(t *testing.T) {
+	if got := approximateLatencyPercentile(100, .95, 70, 20, 5, 3, 1, 1); got != 15000 {
+		t.Fatalf("p95 bucket upper bound=%d want=15000", got)
+	}
+	if got := approximateLatencyPercentile(100, .99, 70, 20, 5, 3, 1, 1); got != 60000 {
+		t.Fatalf("p99 bucket upper bound=%d want=60000", got)
+	}
+}
+
 func TestNginxIngestRejectsInvalidCollectorTelemetry(t *testing.T) {
 	m := newTestMonitor(t)
 	m.cfg.NginxEnabled, m.cfg.IngestToken = true, "secret"
@@ -225,6 +281,16 @@ func TestNginxIngestRejectsInvalidCollectorTelemetry(t *testing.T) {
 	}
 }
 
+func TestNginxIngestAcceptsCheckpointPersistFailureWithoutDroppedEvent(t *testing.T) {
+	m := newTestMonitor(t)
+	m.cfg.NginxEnabled, m.cfg.IngestToken = true, "secret"
+	m.cfg.NginxAllowedNodes = []string{"master"}
+	body := `{"node":"master","batch_id":"empty_checkpoint_failure_abcdefgh","evidence_persist_failures":1,"evidence_dropped_events":0,"samples":[]}`
+	if w := postNginx(t, m, body, "secret"); w.Code != http.StatusOK {
+		t.Fatalf("empty checkpoint persistence failure must not block minute lane: %d %s", w.Code, w.Body.String())
+	}
+}
+
 func TestNginxRetentionAndAggregateOverflowAreBounded(t *testing.T) {
 	m := newTestMonitor(t)
 	m.cfg.NginxRetentionDays = 999
@@ -242,7 +308,7 @@ func TestNginxSourcesExposeMissingAllowedNode(t *testing.T) {
 	m.cfg.NginxEnabled = true
 	m.cfg.NginxAllowedNodes = []string{"master", "slave"}
 	now := time.Now().Unix()
-	if err := m.storeDB.Create(&NginxSourceState{Node: "master", LastEventTs: now, LastIngestTs: now}).Error; err != nil {
+	if err := m.storeDB.Create(&NginxSourceState{Node: "master", LastEventTs: now, LastIngestTs: now, BacklogKnown: true}).Error; err != nil {
 		t.Fatal(err)
 	}
 	rows := m.nginxSources(context.Background(), now)

@@ -552,7 +552,7 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
         <button type="button" class="active" data-stability-layer="delivery"><b>历史日志推断</b><small>NewAPI 使用日志</small></button>
         <button type="button" data-stability-layer="edge" disabled title="Nginx 旁路采集尚未接入"><b>边缘观察（尚未接入）</b><small>Nginx access · 只能说明 HTTP 观察结果</small></button>
       </div>
-      <div class="stability-layer-note">现有数据只支持平台日志口径<br>NewAPI 源码保持零改动
+      <div class="stability-layer-note">平台历史日志与入口旁路分层显示<br>NewAPI 源码保持零改动
       </div>
     </div>
 
@@ -692,7 +692,9 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
         <label class="cm-upstream-newapi"><span>用户 ID</span><input id="cmUpstreamUserID" type="number" min="1" step="1" inputmode="numeric" placeholder="例如 123"></label>
         <label class="cm-upstream-newapi wide"><span>用户访问令牌</span><input id="cmUpstreamAccessToken" type="password" autocomplete="new-password" placeholder="已配置时留空表示保持不变"><small>个人设置中的系统访问令牌，不是模型调用 Key</small></label>
         <label class="cm-upstream-sub2api"><span>登录邮箱</span><input id="cmUpstreamEmail" type="email" autocomplete="username" placeholder="name@example.com"></label>
-        <label class="cm-upstream-sub2api wide"><span>登录密码</span><input id="cmUpstreamPassword" type="password" autocomplete="new-password" placeholder="已连接时留空表示沿用当前会话"><small>密码只用于本次登录换取令牌，不保存、不回显</small></label>
+        <label class="cm-upstream-sub2api"><span>认证方式</span><select id="cmUpstreamAuthMode"><option value="password">邮箱密码</option><option value="refresh_token">导入已登录会话</option></select></label>
+        <label class="cm-upstream-sub2api cm-upstream-sub2-password wide"><span>登录密码</span><input id="cmUpstreamPassword" type="password" autocomplete="new-password" placeholder="已连接时留空表示沿用当前会话"><small>适用于没有验证码或 Turnstile 的站点；密码只用于本次换取令牌</small></label>
+        <label class="cm-upstream-sub2api cm-upstream-sub2-refresh wide" hidden><span>Refresh Token</span><input id="cmUpstreamRefreshToken" type="password" autocomplete="new-password" placeholder="从上游浏览器已登录会话复制"><small>先在上游完成登录，再从浏览器开发者工具 → Application（应用）→ Local Storage → 当前站点复制 refresh_token；Monitor 只通过官方刷新接口验证，输入值不原样保存、不回显</small></label>
         <section class="cm-upstream-aicodewith wide cm-upstream-key-field">
           <div class="cm-upstream-key-head"><span>AICodeWith API Keys</span><button type="button" id="cmUpstreamAddAPIKey">+添加 Key</button></div>
           <div class="cm-upstream-key-list" id="cmUpstreamAPIKeyList"></div>
@@ -701,7 +703,7 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
       </section>
       <label class="cm-upstream-enabled"><input id="cmUpstreamEnabled" type="checkbox" checked><span><b>启用后台自动同步</b><small>停用后保留配置和最后余额，但不再访问该上游</small></span></label>
       <label class="cm-upstream-enabled cm-upstream-usage-option"><input id="cmUpstreamUsageEnabled" type="checkbox"><span><b id="cmUpstreamUsageLabel">同步上游消费账单</b><small id="cmUpstreamUsageHelp">默认每 30 分钟串行汇总一次；当天水位和历史补数独立运行，不保存上游原始内容</small></span></label>
-      <section class="cm-upstream-security"><b>凭据安全</b><span>访问令牌与 AICodeWith API Key 在本地 SQLite 中经 AES-256-GCM 加密；页面和接口只返回脱敏账户信息。Sub2API 的 refresh token 轮换会原子更新。</span></section>
+      <section class="cm-upstream-security"><b>凭据安全</b><span>访问令牌、Sub2API Refresh Token 与 AICodeWith API Key 在本地 SQLite 中经 AES-256-GCM 加密；页面和接口只返回脱敏账户信息。Sub2API 的 refresh token 轮换会原子更新。</span></section>
     </div>
     <footer><span id="cmUpstreamMessage"></span><div><button type="button" class="cm-upstream-cancel" id="cmUpstreamCancel">取消</button><button type="button" class="cm-upstream-sync" id="cmUpstreamSync" hidden>同步余额</button><button type="button" class="cm-upstream-sync" id="cmUpstreamUsageSync" hidden>同步消费</button><button type="button" class="cm-upstream-save" id="cmUpstreamSave">保存并验证</button></div></footer>
   </aside>
@@ -1864,7 +1866,7 @@ function syncRenderChannels(report){
   return level;
 }
 function syncRenderStability(health){
-  const h=health||{},migration=h.problem_migration||{},hourly=h.hourly_migration||null;
+  const h=health||{},migration=h.problem_migration||{},hourly=h.hourly_migration||null,evidence=h.nginx_evidence||{};
   const explicitlyDisabled=h.enabled===false&&!h.nginx_enabled;
   const enabled=h.nginx_enabled!==undefined||h.checked_at!==undefined;
   const level=explicitlyDisabled?'neutral':(!enabled?'warn':(h.status==='ok'?'ok':'warn'));
@@ -1882,7 +1884,9 @@ function syncRenderStability(health){
     syncKV('小时稳定性重签',hourly&&hourly.status?hourly.status:'未要求',hourlyDetail),
     syncKV('问题历史重签',migration.status||'—',problemDetail),
     syncKV('本地库',h.store_reachable?'可访问':'不可访问',h.store_bytes?`${fmtNum(h.store_bytes)} B（含 WAL）`:''),
-    syncKV('Nginx 入口',h.nginx_enabled?`${fmtNum(h.nginx_source_count)} 个来源`:'未启用',h.nginx_enabled?`异常 ${fmtNum(h.nginx_unhealthy_sources)} · backlog ${fmtNum(h.nginx_backlog_bytes)} B`:''),
+    syncKV('Nginx 入口',h.nginx_enabled?`${fmtNum(h.nginx_source_count)} 个 access 来源`:'未启用',h.nginx_enabled?`access 异常 ${fmtNum(h.nginx_unhealthy_sources)} · error ${h.nginx_error_enabled?`${fmtNum(h.nginx_error_source_count)} 来源 / 异常 ${fmtNum(h.nginx_error_unhealthy_sources)}`:'未启用'} · backlog ${fmtNum(h.nginx_backlog_bytes)} B`:''),
+    syncKV('请求证据',evidence.enabled?`${evidence.mode==='verified'?'已验证':'灰度验证'} · ${fmtNum(evidence.source_count)} 个来源`:'未启用',evidence.enabled?`异常 ${fmtNum(evidence.unhealthy_sources)} · 队列 ${fmtNum(evidence.outbox_batches)} 批 / ${fmtNum(evidence.outbox_bytes)} B · 本地库 ${fmtNum(evidence.store_bytes)} B`:''),
+    syncKV('证据完整性',evidence.enabled?`接收 ${fmtNum(evidence.accepted)} · 拒绝 ${fmtNum(evidence.rejected)} · 缺口 ${fmtNum(evidence.gap_count)}`:'—',evidence.enabled?`丢弃 ${fmtNum(evidence.dropped_events)} · NewAPI Request ID 缺失 ${fmtNum(evidence.missing_oneapi_id)} · 最近入库 ${syncTime(evidence.last_ingest_at)}`:''),
     syncKV('问题覆盖至',syncTime(h.problem_coverage_to),h.problem_live_target_to?`目标 ${syncTime(h.problem_live_target_to)}`:'')
   ].join('');
   return level;

@@ -2,6 +2,10 @@ package monitor
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math"
@@ -21,9 +25,71 @@ import (
 
 var nginxNodeNamePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)
 
+var errNginxBatchConflict = errors.New("nginx batch id reused with different payload")
+
+// nginxBatchPayloadHash hashes only the validated, merged aggregate rows. Collector
+// telemetry is intentionally excluded because backlog may grow while the same source
+// batch is retried. The server computes this value; callers cannot choose it.
+func nginxBatchPayloadHash(rows []NginxMinuteSample) string {
+	canonical := append([]NginxMinuteSample(nil), rows...)
+	sort.Slice(canonical, func(i, j int) bool {
+		a, b := canonical[i], canonical[j]
+		if a.BucketTs != b.BucketTs {
+			return a.BucketTs < b.BucketTs
+		}
+		if a.Node != b.Node {
+			return a.Node < b.Node
+		}
+		if a.Route != b.Route {
+			return a.Route < b.Route
+		}
+		if a.Method != b.Method {
+			return a.Method < b.Method
+		}
+		if a.Status != b.Status {
+			return a.Status < b.Status
+		}
+		return a.UpstreamStatus < b.UpstreamStatus
+	})
+	payload, _ := json.Marshal(canonical)
+	sum := sha256.Sum256(payload)
+	return hex.EncodeToString(sum[:])
+}
+
 // validateNginxSettings 在进程启动前拦住“页面显示已启用，但接收口永远不可用”
 // 的半配置状态。默认关闭时不增加任何新启动条件。
 func validateNginxSettings(s Settings) error {
+	if s.NginxErrorEnabled && !s.NginxEnabled {
+		return fmt.Errorf("启用 Nginx error 聚合时必须同时开启 MONITOR_NGINX_ENABLED")
+	}
+	evidenceMode := nginxEvidenceMode(s.NginxEvidenceMode)
+	if strings.TrimSpace(s.NginxEvidenceMode) != "" && evidenceMode == "off" && !strings.EqualFold(strings.TrimSpace(s.NginxEvidenceMode), "off") {
+		return fmt.Errorf("MONITOR_NGINX_EVIDENCE_MODE 只允许 off、pilot 或 verified")
+	}
+	if evidenceMode != "off" {
+		if !s.NginxEnabled {
+			return fmt.Errorf("启用 Nginx evidence 时必须同时开启 MONITOR_NGINX_ENABLED")
+		}
+		if strings.TrimSpace(s.NginxEvidenceStorePath) == "" {
+			return fmt.Errorf("启用 Nginx evidence 时必须显式配置独立证据库路径")
+		}
+		if s.NginxEvidenceRetentionHours < 24 || s.NginxEvidenceRetentionHours > 24*31 {
+			return fmt.Errorf("MONITOR_NGINX_EVIDENCE_RETENTION_HOURS 必须在 24～744 小时之间")
+		}
+		if s.NginxEvidenceMaxMiB < 64 || s.NginxEvidenceMaxMiB > 2048 {
+			return fmt.Errorf("MONITOR_NGINX_EVIDENCE_MAX_MIB 必须在 64～2048 之间")
+		}
+		if len(s.NginxEvidenceHMACKey) < 32 || !nginxEvidenceKeyIDPattern.MatchString(s.NginxEvidenceHMACKeyID) {
+			return fmt.Errorf("Nginx evidence HMAC 密钥至少 32 字节，且 key id 必须合法")
+		}
+		if s.NginxEvidenceHMACKey == s.IngestToken || s.NginxEvidenceHMACKey == s.SessionSecret || s.NginxEvidenceHMACKey == s.UpstreamCredentialSecret {
+			return fmt.Errorf("Nginx evidence HMAC 密钥必须独立于登录、ingest 和上游凭据")
+		}
+		prevKey, prevID := s.NginxEvidencePreviousHMACKey, s.NginxEvidencePreviousHMACKeyID
+		if (prevKey == "") != (prevID == "") || prevKey != "" && (len(prevKey) < 32 || !nginxEvidenceKeyIDPattern.MatchString(prevID) || prevID == s.NginxEvidenceHMACKeyID || prevKey == s.NginxEvidenceHMACKey) {
+			return fmt.Errorf("Nginx evidence 上一把 HMAC 密钥和 key id 必须成对、合法且不同于当前密钥")
+		}
+	}
 	if !s.NginxEnabled {
 		return nil
 	}
@@ -63,6 +129,13 @@ type nginxIngestSample struct {
 	UpstreamTimeCount int64  `json:"upstream_time_count"`
 	BytesSent         int64  `json:"bytes_sent"`
 	RequestIDPresent  int64  `json:"request_id_present"`
+	LatencyCount      int64  `json:"latency_count"`
+	Latency0To1s      int64  `json:"latency_0_1s"`
+	Latency1To5s      int64  `json:"latency_1_5s"`
+	Latency5To15s     int64  `json:"latency_5_15s"`
+	Latency15To30s    int64  `json:"latency_15_30s"`
+	Latency30To60s    int64  `json:"latency_30_60s"`
+	LatencyOver60s    int64  `json:"latency_over_60s"`
 }
 
 type nginxIngestRequest struct {
@@ -75,6 +148,8 @@ type nginxIngestRequest struct {
 	LastCursorDiscontinuityAt int64               `json:"last_cursor_discontinuity_at"`
 	DiscardedLines            int64               `json:"discarded_lines"`
 	LastDiscardedAt           int64               `json:"last_discarded_at"`
+	EvidencePersistFailures   int64               `json:"evidence_persist_failures"`
+	EvidenceDroppedEvents     int64               `json:"evidence_dropped_events"`
 }
 
 func normalizeNginxRoute(path string) string {
@@ -168,6 +243,11 @@ func validateNginxSample(sample nginxIngestSample, now int64, retentionDays int)
 	if sample.RequestTimeMaxMS > sample.RequestTimeSumMS {
 		return NginxMinuteSample{}, fmt.Errorf("request_time_max_ms exceeds sum")
 	}
+	latencySum := sample.Latency0To1s + sample.Latency1To5s + sample.Latency5To15s + sample.Latency15To30s + sample.Latency30To60s + sample.LatencyOver60s
+	if sample.LatencyCount < 0 || sample.LatencyCount > sample.Count || latencySum < 0 ||
+		(sample.LatencyCount == 0 && latencySum != 0) || (sample.LatencyCount > 0 && (latencySum != sample.LatencyCount || sample.LatencyCount != sample.Count)) {
+		return NginxMinuteSample{}, fmt.Errorf("invalid latency histogram")
+	}
 	// 0 ms 上游响应是合法值：此时 count=1,sum=0。只拒绝“无样本却有总和”。
 	if sample.UpstreamTimeCount == 0 && sample.UpstreamTimeSumMS != 0 {
 		return NginxMinuteSample{}, fmt.Errorf("upstream time sum without samples")
@@ -181,6 +261,9 @@ func validateNginxSample(sample nginxIngestSample, now int64, retentionDays int)
 		RequestTimeSumMS: sample.RequestTimeSumMS, RequestTimeMaxMS: sample.RequestTimeMaxMS,
 		UpstreamTimeSumMS: sample.UpstreamTimeSumMS, UpstreamTimeCount: sample.UpstreamTimeCount,
 		BytesSent: sample.BytesSent, RequestIDPresent: sample.RequestIDPresent,
+		LatencyCount: sample.LatencyCount, Latency0To1s: sample.Latency0To1s, Latency1To5s: sample.Latency1To5s,
+		Latency5To15s: sample.Latency5To15s, Latency15To30s: sample.Latency15To30s,
+		Latency30To60s: sample.Latency30To60s, LatencyOver60s: sample.LatencyOver60s,
 	}, nil
 }
 
@@ -199,6 +282,9 @@ func mergeNginxSample(dst *NginxMinuteSample, src NginxMinuteSample) error {
 		{&dst.Count, src.Count}, {&dst.RequestTimeSumMS, src.RequestTimeSumMS},
 		{&dst.UpstreamTimeSumMS, src.UpstreamTimeSumMS}, {&dst.UpstreamTimeCount, src.UpstreamTimeCount},
 		{&dst.BytesSent, src.BytesSent}, {&dst.RequestIDPresent, src.RequestIDPresent},
+		{&dst.LatencyCount, src.LatencyCount}, {&dst.Latency0To1s, src.Latency0To1s}, {&dst.Latency1To5s, src.Latency1To5s},
+		{&dst.Latency5To15s, src.Latency5To15s}, {&dst.Latency15To30s, src.Latency15To30s},
+		{&dst.Latency30To60s, src.Latency30To60s}, {&dst.LatencyOver60s, src.LatencyOver60s},
 	} {
 		if err := add(pair.target, pair.value); err != nil {
 			return err
@@ -213,6 +299,10 @@ func mergeNginxSample(dst *NginxMinuteSample, src NginxMinuteSample) error {
 		dst.UpstreamTimeSumMS > dst.UpstreamTimeCount*86_400_000 || dst.BytesSent > dst.Count*(16<<30) ||
 		dst.RequestIDPresent > dst.Count {
 		return fmt.Errorf("merged aggregate exceeds limits")
+	}
+	latencySum := dst.Latency0To1s + dst.Latency1To5s + dst.Latency5To15s + dst.Latency15To30s + dst.Latency30To60s + dst.LatencyOver60s
+	if dst.LatencyCount > dst.Count || latencySum != dst.LatencyCount || (dst.LatencyCount > 0 && dst.LatencyCount != dst.Count) {
+		return fmt.Errorf("merged latency histogram is not conserved")
 	}
 	return nil
 }
@@ -255,6 +345,11 @@ func (m *Monitor) ingestNginx(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid collector telemetry"})
 		return
 	}
+	if in.EvidencePersistFailures < 0 || in.EvidencePersistFailures > 1 || in.EvidenceDroppedEvents < 0 || in.EvidenceDroppedEvents > 2000 ||
+		(in.EvidencePersistFailures == 0 && in.EvidenceDroppedEvents != 0) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid evidence failure telemetry"})
+		return
+	}
 	merged := make(map[string]NginxMinuteSample, len(in.Samples))
 	var firstTs, lastTs, acceptedCount int64
 	for i, raw := range in.Samples {
@@ -293,13 +388,24 @@ func (m *Monitor) ingestNginx(c *gin.Context) {
 		return rows[i].Route < rows[j].Route
 	})
 	duplicate := false
+	payloadHash := nginxBatchPayloadHash(rows)
 	err := m.storeDB.Transaction(func(tx *gorm.DB) error {
-		batch := NginxIngestBatch{Node: in.Node, BatchID: in.BatchID, FirstTs: firstTs, LastTs: lastTs, Rows: len(rows), ReceivedAt: now}
+		batch := NginxIngestBatch{Node: in.Node, BatchID: in.BatchID, PayloadHash: payloadHash, FirstTs: firstTs, LastTs: lastTs, Rows: len(rows), ReceivedAt: now}
 		created := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&batch)
 		if created.Error != nil {
 			return created.Error
 		}
 		if created.RowsAffected == 0 {
+			var existing NginxIngestBatch
+			if err := tx.First(&existing, "node = ? AND batch_id = ?", in.Node, in.BatchID).Error; err != nil {
+				return err
+			}
+			// Rows written by older releases have an empty hash. Treat them as an
+			// already accepted legacy batch rather than inventing a payload claim.
+			// New rows are always hashed and conflicting reuse is rejected.
+			if existing.PayloadHash != "" && existing.PayloadHash != payloadHash {
+				return errNginxBatchConflict
+			}
 			duplicate = true
 			return nil
 		}
@@ -314,6 +420,13 @@ func (m *Monitor) ingestNginx(c *gin.Context) {
 					"upstream_time_count":  gorm.Expr("upstream_time_count + excluded.upstream_time_count"),
 					"bytes_sent":           gorm.Expr("bytes_sent + excluded.bytes_sent"),
 					"request_id_present":   gorm.Expr("request_id_present + excluded.request_id_present"),
+					"latency_count":        gorm.Expr("latency_count + excluded.latency_count"),
+					"latency0_to1s":        gorm.Expr("latency0_to1s + excluded.latency0_to1s"),
+					"latency1_to5s":        gorm.Expr("latency1_to5s + excluded.latency1_to5s"),
+					"latency5_to15s":       gorm.Expr("latency5_to15s + excluded.latency5_to15s"),
+					"latency15_to30s":      gorm.Expr("latency15_to30s + excluded.latency15_to30s"),
+					"latency30_to60s":      gorm.Expr("latency30_to60s + excluded.latency30_to60s"),
+					"latency_over60s":      gorm.Expr("latency_over60s + excluded.latency_over60s"),
 				}),
 			}).CreateInBatches(rows, 200).Error; err != nil {
 				return err
@@ -325,6 +438,10 @@ func (m *Monitor) ingestNginx(c *gin.Context) {
 			BacklogBytes: in.BacklogBytes, BacklogKnown: in.BacklogKnown,
 			CursorDiscontinuities: in.CursorDiscontinuities, LastCursorDiscontinuityAt: in.LastCursorDiscontinuityAt,
 			DiscardedLines: in.DiscardedLines, LastDiscardedAt: in.LastDiscardedAt,
+			EvidencePersistFailures: in.EvidencePersistFailures, EvidenceDroppedEvents: in.EvidenceDroppedEvents,
+		}
+		if in.EvidencePersistFailures > 0 {
+			state.LastEvidencePersistFailureAt = now
 		}
 		return tx.Clauses(clause.OnConflict{
 			Columns: []clause.Column{{Name: "node"}},
@@ -340,12 +457,19 @@ func (m *Monitor) ingestNginx(c *gin.Context) {
 					"MAX(COALESCE(cursor_discontinuities, 0), excluded.cursor_discontinuities)"),
 				"last_cursor_discontinuity_at": gorm.Expr(
 					"MAX(COALESCE(last_cursor_discontinuity_at, 0), excluded.last_cursor_discontinuity_at)"),
-				"discarded_lines":   gorm.Expr("MAX(COALESCE(discarded_lines, 0), excluded.discarded_lines)"),
-				"last_discarded_at": gorm.Expr("MAX(COALESCE(last_discarded_at, 0), excluded.last_discarded_at)"),
+				"discarded_lines":                  gorm.Expr("MAX(COALESCE(discarded_lines, 0), excluded.discarded_lines)"),
+				"last_discarded_at":                gorm.Expr("MAX(COALESCE(last_discarded_at, 0), excluded.last_discarded_at)"),
+				"evidence_persist_failures":        gorm.Expr("COALESCE(evidence_persist_failures, 0) + excluded.evidence_persist_failures"),
+				"evidence_dropped_events":          gorm.Expr("COALESCE(evidence_dropped_events, 0) + excluded.evidence_dropped_events"),
+				"last_evidence_persist_failure_at": gorm.Expr("MAX(COALESCE(last_evidence_persist_failure_at, 0), excluded.last_evidence_persist_failure_at)"),
 			}),
 		}).Create(&state).Error
 	})
 	if err != nil {
+		if errors.Is(err, errNginxBatchConflict) {
+			c.JSON(http.StatusConflict, gin.H{"error": "batch id conflict"})
+			return
+		}
 		slog.Warn("Nginx 聚合入库失败", "node", in.Node, "err", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "store failed"})
 		return
@@ -362,6 +486,12 @@ func (m *Monitor) startNginxMaintenance(ctx context.Context) {
 		}
 		if err := m.storeDB.Where("received_at < ?", cutoff).Delete(&NginxIngestBatch{}).Error; err != nil {
 			slog.Warn("清理 Nginx 幂等批次失败", "err", err)
+		}
+		if err := m.storeDB.Where("bucket_ts < ?", cutoff).Delete(&NginxErrorMinuteSample{}).Error; err != nil {
+			slog.Warn("清理 Nginx error 聚合失败", "err", err)
+		}
+		if err := m.storeDB.Where("received_at < ?", cutoff).Delete(&NginxErrorIngestBatch{}).Error; err != nil {
+			slog.Warn("清理 Nginx error 幂等批次失败", "err", err)
 		}
 	}
 	prune()
@@ -390,6 +520,9 @@ type NginxEdgeSummary struct {
 	AvgUpstreamMS     float64 `json:"avg_upstream_ms"`
 	BytesSent         int64   `json:"bytes_sent"`
 	RequestIDCoverage float64 `json:"request_id_coverage"`
+	LatencyCoverage   float64 `json:"latency_coverage"`
+	P95RequestMS      int64   `json:"p95_request_ms"`
+	P99RequestMS      int64   `json:"p99_request_ms"`
 }
 
 type NginxEdgeBreakdown struct {
@@ -406,19 +539,22 @@ type NginxEdgeDay struct {
 }
 
 type NginxEdgeSource struct {
-	Node                      string   `json:"node"`
-	LastEventTs               int64    `json:"last_event_ts"`
-	LastIngestTs              int64    `json:"last_ingest_ts"`
-	AgeSec                    int64    `json:"age_sec"`
-	EventAgeSec               int64    `json:"event_age_sec"`
-	Status                    string   `json:"status"`
-	HealthReasons             []string `json:"health_reasons,omitempty"`
-	BacklogBytes              int64    `json:"backlog_bytes"`
-	BacklogKnown              bool     `json:"backlog_known"`
-	CursorDiscontinuities     int64    `json:"cursor_discontinuities"`
-	LastCursorDiscontinuityAt int64    `json:"last_cursor_discontinuity_at"`
-	DiscardedLines            int64    `json:"discarded_lines"`
-	LastDiscardedAt           int64    `json:"last_discarded_at"`
+	Node                         string   `json:"node"`
+	LastEventTs                  int64    `json:"last_event_ts"`
+	LastIngestTs                 int64    `json:"last_ingest_ts"`
+	AgeSec                       int64    `json:"age_sec"`
+	EventAgeSec                  int64    `json:"event_age_sec"`
+	Status                       string   `json:"status"`
+	HealthReasons                []string `json:"health_reasons,omitempty"`
+	BacklogBytes                 int64    `json:"backlog_bytes"`
+	BacklogKnown                 bool     `json:"backlog_known"`
+	CursorDiscontinuities        int64    `json:"cursor_discontinuities"`
+	LastCursorDiscontinuityAt    int64    `json:"last_cursor_discontinuity_at"`
+	DiscardedLines               int64    `json:"discarded_lines"`
+	LastDiscardedAt              int64    `json:"last_discarded_at"`
+	EvidencePersistFailures      int64    `json:"evidence_persist_failures"`
+	EvidenceDroppedEvents        int64    `json:"evidence_dropped_events"`
+	LastEvidencePersistFailureAt int64    `json:"last_evidence_persist_failure_at"`
 }
 
 const (
@@ -438,6 +574,8 @@ type NginxEdgeReport struct {
 	Routes        []NginxEdgeBreakdown `json:"routes"`
 	Nodes         []NginxEdgeBreakdown `json:"nodes"`
 	Sources       []NginxEdgeSource    `json:"sources"`
+	Errors        []NginxErrorSummary  `json:"errors,omitempty"`
+	ErrorSources  []NginxErrorSource   `json:"error_sources,omitempty"`
 }
 
 type NginxEdgeAggregate struct {
@@ -445,6 +583,25 @@ type NginxEdgeAggregate struct {
 	RequestTimeSumMS, MaxRequestMS                       int64
 	UpstreamTimeSumMS, UpstreamTimeCount                 int64
 	BytesSent, RequestIDPresent                          int64
+	LatencyCount, Latency0To1s, Latency1To5s             int64
+	Latency5To15s, Latency15To30s, Latency30To60s        int64
+	LatencyOver60s                                       int64
+}
+
+func approximateLatencyPercentile(total int64, percentile float64, buckets ...int64) int64 {
+	if total <= 0 || len(buckets) != 6 {
+		return 0
+	}
+	target := int64(math.Ceil(float64(total) * percentile))
+	var cumulative int64
+	upper := []int64{1000, 5000, 15000, 30000, 60000, 0}
+	for i, count := range buckets {
+		cumulative += count
+		if cumulative >= target {
+			return upper[i]
+		}
+	}
+	return 0
 }
 
 func (row NginxEdgeAggregate) summary() NginxEdgeSummary {
@@ -452,6 +609,17 @@ func (row NginxEdgeAggregate) summary() NginxEdgeSummary {
 	if row.Requests > 0 {
 		out.AvgRequestMS = float64(row.RequestTimeSumMS) / float64(row.Requests)
 		out.RequestIDCoverage = float64(row.RequestIDPresent) / float64(row.Requests) * 100
+	}
+	if row.LatencyCount > 0 {
+		out.LatencyCoverage = float64(row.LatencyCount) / float64(row.Requests) * 100
+		out.P95RequestMS = approximateLatencyPercentile(row.LatencyCount, .95, row.Latency0To1s, row.Latency1To5s, row.Latency5To15s, row.Latency15To30s, row.Latency30To60s, row.LatencyOver60s)
+		out.P99RequestMS = approximateLatencyPercentile(row.LatencyCount, .99, row.Latency0To1s, row.Latency1To5s, row.Latency5To15s, row.Latency15To30s, row.Latency30To60s, row.LatencyOver60s)
+		if out.P95RequestMS == 0 {
+			out.P95RequestMS = row.MaxRequestMS
+		}
+		if out.P99RequestMS == 0 {
+			out.P99RequestMS = row.MaxRequestMS
+		}
 	}
 	if row.UpstreamTimeCount > 0 {
 		out.AvgUpstreamMS = float64(row.UpstreamTimeSumMS) / float64(row.UpstreamTimeCount)
@@ -469,7 +637,14 @@ const nginxAggregateColumns = `COALESCE(SUM(count),0) requests,
 	COALESCE(SUM(upstream_time_sum_ms),0) upstream_time_sum_ms,
 	COALESCE(SUM(upstream_time_count),0) upstream_time_count,
 	COALESCE(SUM(bytes_sent),0) bytes_sent,
-	COALESCE(SUM(request_id_present),0) request_id_present`
+	COALESCE(SUM(request_id_present),0) request_id_present,
+	COALESCE(SUM(latency_count),0) latency_count,
+	COALESCE(SUM(latency0_to1s),0) latency0_to1s,
+	COALESCE(SUM(latency1_to5s),0) latency1_to5s,
+	COALESCE(SUM(latency5_to15s),0) latency5_to15s,
+	COALESCE(SUM(latency15_to30s),0) latency15_to30s,
+	COALESCE(SUM(latency30_to60s),0) latency30_to60s,
+	COALESCE(SUM(latency_over60s),0) latency_over60s`
 
 func (m *Monitor) nginxSources(ctx context.Context, now int64) []NginxEdgeSource {
 	if len(m.cfg.NginxAllowedNodes) == 0 {
@@ -498,6 +673,10 @@ func (m *Monitor) nginxSources(ctx context.Context, now int64) []NginxEdgeSource
 		}
 		status := "ok"
 		reasons := make([]string, 0, 3)
+		if !state.BacklogKnown {
+			status = "warn"
+			reasons = append(reasons, "log_or_backlog_unreadable")
+		}
 		if age > 180 {
 			status = "warn"
 			reasons = append(reasons, "heartbeat_stale")
@@ -529,12 +708,20 @@ func (m *Monitor) nginxSources(ctx context.Context, now int64) []NginxEdgeSource
 			}
 			reasons = append(reasons, "recent_discarded_lines")
 		}
+		if state.LastEvidencePersistFailureAt > 0 && now-state.LastEvidencePersistFailureAt <= nginxRecentDataLossWindowSec {
+			if status != "bad" {
+				status = "warn"
+			}
+			reasons = append(reasons, "recent_evidence_persist_failure")
+		}
 		out = append(out, NginxEdgeSource{
 			Node: state.Node, LastEventTs: state.LastEventTs, LastIngestTs: state.LastIngestTs, AgeSec: age,
 			EventAgeSec: eventAge, Status: status, HealthReasons: reasons,
 			BacklogBytes: state.BacklogBytes, BacklogKnown: state.BacklogKnown,
 			CursorDiscontinuities: state.CursorDiscontinuities, LastCursorDiscontinuityAt: state.LastCursorDiscontinuityAt,
 			DiscardedLines: state.DiscardedLines, LastDiscardedAt: state.LastDiscardedAt,
+			EvidencePersistFailures: state.EvidencePersistFailures, EvidenceDroppedEvents: state.EvidenceDroppedEvents,
+			LastEvidencePersistFailureAt: state.LastEvidencePersistFailureAt,
 		})
 	}
 	return out
@@ -581,7 +768,8 @@ func (m *Monitor) serveNginxEdge(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
 	defer cancel()
 	report := NginxEdgeReport{Enabled: true, RetentionDays: retentionDays, GeneratedAt: now.Unix(), From: time.Unix(scope.FromTs, 0).In(cstLocation).Format("2006-01-02"), To: time.Unix(scope.ToTs-1, 0).In(cstLocation).Format("2006-01-02")}
-	whereArgs := []any{scope.FromTs, nginxQueryToTs(scope, now.Unix())}
+	queryToTs := nginxQueryToTs(scope, now.Unix())
+	whereArgs := []any{scope.FromTs, queryToTs}
 	var total NginxEdgeAggregate
 	if err := m.storeDB.WithContext(ctx).Raw(`SELECT `+nginxAggregateColumns+` FROM nginx_minute_samples WHERE bucket_ts >= ? AND bucket_ts < ?`, whereArgs...).Scan(&total).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "读取入口聚合失败"})
@@ -632,6 +820,10 @@ func (m *Monitor) serveNginxEdge(c *gin.Context) {
 		return
 	}
 	report.Sources = m.nginxSources(ctx, now.Unix())
+	if m.cfg.NginxErrorEnabled {
+		report.Errors = m.nginxErrorSummary(ctx, scope.FromTs, queryToTs)
+		report.ErrorSources = m.nginxErrorSources(ctx, now.Unix())
+	}
 	c.JSON(http.StatusOK, report)
 }
 

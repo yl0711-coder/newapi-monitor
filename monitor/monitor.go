@@ -47,6 +47,9 @@ type Monitor struct {
 	// 写锁把告警配置、渠道配置和其他 Monitor 页面一起拖垮。测试直接调用
 	// openStore 且未配置路径时仍可共用 storeDB，保持轻量构造兼容。
 	usageFactsDB *gorm.DB
+	// nginxEvidenceDB 是短期、高基数的入口请求证据库。它与主库、用量事实库
+	// 分离；损坏、锁或满盘只会关闭 evidence lane，不影响现有 Monitor 页面。
+	nginxEvidenceDB *gorm.DB
 
 	lastRun                   atomic.Int64 // 采样心跳:最近一次成功采样的 Unix 秒(0=从未)
 	problemLastSuccess        atomic.Int64 // 原始错误采集器最近一次成功执行
@@ -314,6 +317,10 @@ func New(s Settings) (*Monitor, error) {
 	if err := m.openStore(s.StorePath); err != nil {
 		return nil, err
 	}
+	if err := m.openNginxEvidenceStore(); err != nil {
+		// 证据是旁路增强，不得让主 Monitor、Usage 或分钟聚合因其启动失败。
+		slog.Error("Nginx 请求证据库不可用，已仅关闭 evidence lane", "err", err)
+	}
 	m.probeLocalStores(context.Background())
 	m.sourceLifecycleInitialized.Store(true)
 	initialized := false
@@ -433,6 +440,7 @@ func (m *Monitor) Start(ctx context.Context) {
 	// 本机验收可用 MONITOR_STORE_BACKUP_ENABLED=false 显式关闭。
 	m.startStoreMaintenance(ctx)
 	m.startLocalStoreProbe(ctx)
+	m.startNginxEvidenceMaintenance(ctx)
 	go func() {
 		select {
 		case <-ctx.Done():
@@ -699,6 +707,11 @@ func (m *Monitor) Close() {
 		}
 		if m.usageFactsDB != nil && m.usageFactsDB != m.storeDB {
 			if db, err := m.usageFactsDB.DB(); err == nil {
+				_ = db.Close()
+			}
+		}
+		if m.nginxEvidenceDB != nil && m.nginxEvidenceDB != m.storeDB && m.nginxEvidenceDB != m.usageFactsDB {
+			if db, err := m.nginxEvidenceDB.DB(); err == nil {
 				_ = db.Close()
 			}
 		}

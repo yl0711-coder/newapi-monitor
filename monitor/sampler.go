@@ -226,7 +226,7 @@ func (m *Monitor) loop(ctx context.Context, interval time.Duration) {
 				}
 				if m.cfg.StabilityEnabled {
 					days := m.cfg.stabilityStorageDays()
-					if err := m.pruneStabilityOlderThan(time.Now().Unix() - int64(days)*86400); err != nil {
+					if err := m.pruneStabilityOlderThan(stabilityRetentionCutoff(time.Now().Unix(), days)); err != nil {
 						slog.Warn("清理稳定性历史失败(忽略)", "err", err)
 					}
 				}

@@ -263,6 +263,13 @@ type NginxMinuteSample struct {
 	UpstreamTimeCount int64
 	BytesSent         int64
 	RequestIDPresent  int64
+	LatencyCount      int64
+	Latency0To1s      int64
+	Latency1To5s      int64
+	Latency5To15s     int64
+	Latency15To30s    int64
+	Latency30To60s    int64
+	LatencyOver60s    int64
 }
 
 // NginxIngestBatch 使采集器断线重试保持幂等，避免同一批次重复累计。
@@ -278,6 +285,44 @@ type NginxIngestBatch struct {
 
 // NginxSourceState 是入口数据源健康状态；只保留每节点最后进度，不随时间增长。
 type NginxSourceState struct {
+	Node                         string `gorm:"primaryKey;size:64"`
+	LastEventTs                  int64
+	LastIngestTs                 int64
+	LastBatchID                  string `gorm:"size:64"`
+	AcceptedRows                 int64
+	AcceptedCount                int64
+	BacklogBytes                 int64
+	BacklogKnown                 bool
+	CursorDiscontinuities        int64
+	LastCursorDiscontinuityAt    int64
+	DiscardedLines               int64
+	LastDiscardedAt              int64
+	EvidencePersistFailures      int64
+	EvidenceDroppedEvents        int64
+	LastEvidencePersistFailureAt int64
+}
+
+// NginxErrorMinuteSample stores only finite node-local classifications. It
+// deliberately contains no raw error text, IP, URI or upstream address.
+type NginxErrorMinuteSample struct {
+	BucketTs int64  `gorm:"primaryKey;autoIncrement:false;index:idx_nginx_error_bucket"`
+	Node     string `gorm:"primaryKey;size:64"`
+	Category string `gorm:"primaryKey;size:40"`
+	Severity string `gorm:"primaryKey;size:8"`
+	Count    int64
+}
+
+type NginxErrorIngestBatch struct {
+	Node        string `gorm:"primaryKey;size:64"`
+	BatchID     string `gorm:"primaryKey;size:64"`
+	PayloadHash string `gorm:"size:64;not null"`
+	FirstTs     int64
+	LastTs      int64
+	Rows        int
+	ReceivedAt  int64 `gorm:"index"`
+}
+
+type NginxErrorSourceState struct {
 	Node                      string `gorm:"primaryKey;size:64"`
 	LastEventTs               int64
 	LastIngestTs              int64
@@ -801,9 +846,10 @@ func (m *Monitor) openStore(path string) error {
 		&StabilityProblemIngestState{}, &StabilityProblemStage{}, &StabilityProblemClassificationMigration{}, &StabilityProblemLiveCursor{},
 		&StabilityHourIngestState{}, &StabilityBackfillJob{},
 		&ChannelFinanceSetting{}, &ChannelSaleGroupRate{}, &WebsiteGroupCatalog{}, &ChannelDomainCost{}, &ChannelDomainGroupCost{}, &ChannelFinanceChannelCost{}, &ChannelFinanceVersion{},
-		&ChannelUpstreamAccount{}, &ChannelUpstreamUsageHour{}, &NewAPIUsageBackfillCheckpoint{}, &AICodeWithKeySyncState{}, &AICodeWithUsageStage{}, &AICodeWithUsageRound{}, &UpstreamHostCircuit{},
+		&ChannelUpstreamAccount{}, &ChannelUpstreamUsageHour{}, &NewAPIUsageBackfillCheckpoint{}, &NewAPIUsageBackfillSegment{}, &AICodeWithKeySyncState{}, &AICodeWithUsageStage{}, &AICodeWithUsageRound{}, &UpstreamHostCircuit{},
 		&ChannelUpstreamPricingHourEvidence{}, &ChannelUpstreamPricingHourState{}, &ChannelUpstreamPricingObservedState{}, &ChannelUpstreamPricingChangeEvent{}, &ChannelUpstreamPricingSyncState{}, &ChannelUpstreamPricingPageCheckpoint{}, &AICodeWithPricingCheckpoint{},
 		&InfraSample{}, &HostContainerSnapshot{}, &NginxMinuteSample{}, &NginxIngestBatch{}, &NginxSourceState{},
+		&NginxErrorMinuteSample{}, &NginxErrorIngestBatch{}, &NginxErrorSourceState{},
 		&AlertConfig{}, &AlertLog{}, &TrackedUser{}, &CustomerGroup{}, &UsageMemberControl{}, &UsageMemberAudit{}, &UsageMemberControlMigration{}, &FollowUpLog{}, &UsageSettings{},
 	); err != nil {
 		return fmt.Errorf("表迁移失败: %w", err)
@@ -920,6 +966,20 @@ func (m *Monitor) openUsageFactsStore(path string, prechecked bool) error {
 		if err != nil {
 			m.usageFactsIntegrityOK.Store(false)
 			return fmt.Errorf("打开用量事实库失败: %w", err)
+		}
+		// SQLite permits many readers but only one writer. The facts store has
+		// several independent background/control-plane writers; allowing the Go
+		// pool to open multiple connections makes those writers compete inside
+		// SQLite and can exhaust busy_timeout. A single pooled connection keeps
+		// commits ordered while WAL still lets backup/read-only connections take
+		// consistent snapshots. The facts DB is deliberately separate and small,
+		// so this does not serialize Monitor's main sampling store.
+		if sqlDB, dbErr := db.DB(); dbErr != nil {
+			m.usageFactsIntegrityOK.Store(false)
+			return fmt.Errorf("配置用量事实库连接池失败: %w", dbErr)
+		} else {
+			sqlDB.SetMaxOpenConns(1)
+			sqlDB.SetMaxIdleConns(1)
 		}
 		if !prechecked {
 			if err := checkGORMStoreIntegrity(db); err != nil {

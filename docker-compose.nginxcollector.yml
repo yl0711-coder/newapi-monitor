@@ -14,11 +14,28 @@ services:
       NGINXCOLLECTOR_INTERVAL_SECONDS: "5"
       NGINXCOLLECTOR_MAX_LINES: "1000"
       NGINXCOLLECTOR_RETENTION_DAYS: "7"
+      # 请求证据是与原分钟汇总独立的持久队列。首次只设 pilot，
+      # 现网核对 X-Oneapi-Request-Id 与 logs.request_id 同值后才能改 verified。
+      NGINXCOLLECTOR_EVIDENCE_MODE: ${NGINXCOLLECTOR_EVIDENCE_MODE:-off}
+      NGINXCOLLECTOR_EVIDENCE_SINK_URL: ${NGINXCOLLECTOR_EVIDENCE_SINK_URL:-}
+      NGINXCOLLECTOR_EVIDENCE_HMAC_KEY: ${NGINXCOLLECTOR_EVIDENCE_HMAC_KEY:-}
+      NGINXCOLLECTOR_EVIDENCE_HMAC_KEY_ID: ${NGINXCOLLECTOR_EVIDENCE_HMAC_KEY_ID:-}
+      NGINXCOLLECTOR_EVIDENCE_OUTBOX_PATH: /evidence/outbox
+      NGINXCOLLECTOR_EVIDENCE_OUTBOX_MAX_MIB: ${NGINXCOLLECTOR_EVIDENCE_OUTBOX_MAX_MIB:-256}
+      # 标准 error.log 只在节点侧分类，原文不会上传。独立游标/接口，故障不阻塞 access lane。
+      NGINXCOLLECTOR_ERROR_ENABLED: ${NGINXCOLLECTOR_ERROR_ENABLED:-false}
+      NGINXCOLLECTOR_ERROR_LOG_PATH: /logs/error.log
+      NGINXCOLLECTOR_ERROR_CURSOR_PATH: /data/error-cursor.json
+      NGINXCOLLECTOR_ERROR_SINK_URL: ${NGINXCOLLECTOR_ERROR_SINK_URL:-}
+      NGINXCOLLECTOR_ERROR_TIMEZONE: ${NGINXCOLLECTOR_ERROR_TIMEZONE:-Asia/Shanghai}
       # 默认只允许 HTTPS。仅当 sink 走已核对的私网直连时才显式设 true。
       NGINXCOLLECTOR_ALLOW_INSECURE_HTTP: ${NGINXCOLLECTOR_ALLOW_INSECURE_HTTP:-false}
     volumes:
       - ${NGINXCOLLECTOR_LOG_DIR:?set NGINXCOLLECTOR_LOG_DIR}:/logs:ro
       - nginxcollector-data:/data
+      - nginxcollector-evidence:/evidence
+    group_add:
+      - ${NGINXCOLLECTOR_LOG_GID:?set NGINXCOLLECTOR_LOG_GID}
     read_only: true
     tmpfs:
       - /tmp
@@ -38,3 +55,4 @@ services:
 
 volumes:
   nginxcollector-data:
+  nginxcollector-evidence:

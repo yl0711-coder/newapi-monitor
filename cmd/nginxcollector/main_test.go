@@ -28,6 +28,9 @@ func TestParseLineKeepsOnlySanitizedAggregate(t *testing.T) {
 	if strings.Contains(fmt.Sprintf("%+v", row), "secret") || strings.Contains(row.Route, "123") || strings.Contains(row.Route, "?") {
 		t.Fatalf("动态路径/query/Request ID 原值不应进入样本: %+v", row)
 	}
+	if row.LatencyCount != 1 || row.Latency0To1s != 1 || row.Latency1To5s+row.Latency5To15s+row.Latency15To30s+row.Latency30To60s+row.LatencyOver60s != 0 {
+		t.Fatalf("延迟直方图必须且只能命中一个桶: %+v", row)
+	}
 }
 
 func TestParseLineUsesFinalUpstreamAttemptForCommaAndColonSequences(t *testing.T) {

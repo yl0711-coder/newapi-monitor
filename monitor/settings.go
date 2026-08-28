@@ -64,6 +64,17 @@ type Settings struct {
 	NginxEnabled       bool     // MONITOR_NGINX_ENABLED,默认 false
 	NginxRetentionDays int      // MONITOR_NGINX_RETENTION_DAYS,默认 7
 	NginxAllowedNodes  []string // MONITOR_NGINX_ALLOWED_NODES,逗号分隔；启用 Nginx 采集时必填
+	NginxErrorEnabled  bool     // MONITOR_NGINX_ERROR_ENABLED，标准 error.log 的节点侧分类分钟聚合
+	// Nginx 请求证据是独立灰度 lane。off 完全不打开证据库；pilot 只采集并
+	// 验证覆盖率；verified 才允许客户排障按 Request ID 精确关联。
+	NginxEvidenceMode              string // MONITOR_NGINX_EVIDENCE_MODE=off|pilot|verified，默认 off
+	NginxEvidenceStorePath         string // MONITOR_NGINX_EVIDENCE_STORE_PATH，启用时必须显式配置独立卷路径
+	NginxEvidenceRetentionHours    int    // MONITOR_NGINX_EVIDENCE_RETENTION_HOURS，默认 168
+	NginxEvidenceHMACKey           string // MONITOR_NGINX_EVIDENCE_HMAC_KEY，独立于会话/上游凭据
+	NginxEvidenceHMACKeyID         string // MONITOR_NGINX_EVIDENCE_HMAC_KEY_ID，轮换时用于区分历史证据
+	NginxEvidenceMaxMiB            int    // MONITOR_NGINX_EVIDENCE_MAX_MIB，证据库硬上限
+	NginxEvidencePreviousHMACKey   string // 上一把轮换密钥，仅过渡期配置
+	NginxEvidencePreviousHMACKeyID string
 
 	// 登录鉴权:复用 new-api 用户身份(不改 new-api,只调其 API 验证)
 	NewAPIBaseURL string // MONITOR_NEWAPI_BASE_URL,如 http://new-api:3000
@@ -265,6 +276,15 @@ func LoadSettings() Settings {
 		NginxEnabled:                             env("MONITOR_NGINX_ENABLED", "false") == "true",
 		NginxRetentionDays:                       envInt("MONITOR_NGINX_RETENTION_DAYS", 7),
 		NginxAllowedNodes:                        envCSV("MONITOR_NGINX_ALLOWED_NODES"),
+		NginxErrorEnabled:                        env("MONITOR_NGINX_ERROR_ENABLED", "false") == "true",
+		NginxEvidenceMode:                        strings.ToLower(strings.TrimSpace(env("MONITOR_NGINX_EVIDENCE_MODE", "off"))),
+		NginxEvidenceStorePath:                   strings.TrimSpace(env("MONITOR_NGINX_EVIDENCE_STORE_PATH", "")),
+		NginxEvidenceRetentionHours:              envInt("MONITOR_NGINX_EVIDENCE_RETENTION_HOURS", 168),
+		NginxEvidenceHMACKey:                     env("MONITOR_NGINX_EVIDENCE_HMAC_KEY", ""),
+		NginxEvidenceHMACKeyID:                   strings.TrimSpace(env("MONITOR_NGINX_EVIDENCE_HMAC_KEY_ID", "")),
+		NginxEvidenceMaxMiB:                      envInt("MONITOR_NGINX_EVIDENCE_MAX_MIB", 512),
+		NginxEvidencePreviousHMACKey:             env("MONITOR_NGINX_EVIDENCE_PREVIOUS_HMAC_KEY", ""),
+		NginxEvidencePreviousHMACKeyID:           strings.TrimSpace(env("MONITOR_NGINX_EVIDENCE_PREVIOUS_HMAC_KEY_ID", "")),
 		NewAPIBaseURL:                            env("MONITOR_NEWAPI_BASE_URL", ""),
 		SessionSecret:                            env("MONITOR_SESSION_SECRET", ""),
 		UpstreamCredentialSecret:                 env("MONITOR_UPSTREAM_CREDENTIAL_SECRET", ""),

@@ -88,6 +88,15 @@ services:
       # - MONITOR_NGINX_ENABLED=true
       # - MONITOR_NGINX_RETENTION_DAYS=7
       # - MONITOR_NGINX_ALLOWED_NODES=master,slave
+      # 标准 error.log 分类聚合；必须在两个节点的独立 error lane 都验收后再开启。
+      # - MONITOR_NGINX_ERROR_ENABLED=true
+      # 请求级证据默认关闭。启用 pilot 时必须同时配置独立 HMAC 密钥与节点采集器。
+      - MONITOR_NGINX_EVIDENCE_MODE=${MONITOR_NGINX_EVIDENCE_MODE:-off}
+      - MONITOR_NGINX_EVIDENCE_STORE_PATH=/evidence/nginx-evidence.db
+      - MONITOR_NGINX_EVIDENCE_RETENTION_HOURS=${MONITOR_NGINX_EVIDENCE_RETENTION_HOURS:-168}
+      - MONITOR_NGINX_EVIDENCE_MAX_MIB=${MONITOR_NGINX_EVIDENCE_MAX_MIB:-512}
+      - MONITOR_NGINX_EVIDENCE_HMAC_KEY=${MONITOR_NGINX_EVIDENCE_HMAC_KEY:-}
+      - MONITOR_NGINX_EVIDENCE_HMAC_KEY_ID=${MONITOR_NGINX_EVIDENCE_HMAC_KEY_ID:-}
       # - MONITOR_HEARTBEAT_URL=           # dead-man 心跳(如 healthchecks.io)
       # - MONITOR_USAGE_REDIS_ADDR=172.26.4.11:6379  # 只使用 Redis 私网地址；留空自动降级
       # - MONITOR_USAGE_REDIS_USERNAME=monitor       # 建议 ACL 仅允许 nxmon:* 和 GET/SET/DEL/PING
@@ -99,6 +108,7 @@ services:
     volumes:
       - monitor_data:/data
       - monitor_backup:/backup
+      - monitor_evidence:/evidence
     # 除持久化 /data 和有界 /tmp 外，运行层不可写。
     read_only: true
     tmpfs:
@@ -129,3 +139,5 @@ volumes:
   monitor_backup:
     external: true
     name: ${MONITOR_BACKUP_VOLUME:?pre-create and set MONITOR_BACKUP_VOLUME in .env}
+  monitor_evidence:
+    # 独立于主库与备份卷；生产可在部署覆盖文件中替换成预建、带配额的卷。

@@ -101,6 +101,9 @@ type capacityIngressPoint struct {
 	AverageLatency            float64 `json:"average_latency_ms"`
 	AverageUpstreamLatency    float64 `json:"average_upstream_latency_ms"`
 	MaxLatency                float64 `json:"max_latency_ms"`
+	P95Latency                float64 `json:"p95_latency_ms"`
+	P99Latency                float64 `json:"p99_latency_ms"`
+	LatencyCoverage           float64 `json:"latency_coverage"`
 	EstimatedInflight         float64 `json:"estimated_inflight"`
 	EstimatedUpstreamInflight float64 `json:"estimated_upstream_inflight"`
 }
@@ -178,6 +181,13 @@ type capacityIngressRow struct {
 	RequestTimeMaxMS  int64 `gorm:"column:request_time_max_ms"`
 	UpstreamTimeSumMS int64 `gorm:"column:upstream_time_sum_ms"`
 	UpstreamTimeCount int64 `gorm:"column:upstream_time_count"`
+	LatencyCount      int64 `gorm:"column:latency_count"`
+	Latency0To1s      int64 `gorm:"column:latency0_to1s"`
+	Latency1To5s      int64 `gorm:"column:latency1_to5s"`
+	Latency5To15s     int64 `gorm:"column:latency5_to15s"`
+	Latency15To30s    int64 `gorm:"column:latency15_to30s"`
+	Latency30To60s    int64 `gorm:"column:latency30_to60s"`
+	LatencyOver60s    int64 `gorm:"column:latency_over60s"`
 }
 
 type capacityInfraRow struct {
@@ -739,7 +749,10 @@ func (m *Monitor) readCapacityIngress(ctx context.Context, from, to, bucket, now
 		SUM(CASE WHEN status >= 500 THEN count ELSE 0 END) error_5xx,
 		SUM(CASE WHEN upstream_status >= 500 THEN count ELSE 0 END) upstream_error_5xx,
 		SUM(request_time_sum_ms) request_time_sum_ms, MAX(request_time_max_ms) request_time_max_ms,
-		SUM(upstream_time_sum_ms) upstream_time_sum_ms, SUM(upstream_time_count) upstream_time_count
+		SUM(upstream_time_sum_ms) upstream_time_sum_ms, SUM(upstream_time_count) upstream_time_count,
+		SUM(latency_count) latency_count, SUM(latency0_to1s) latency0_to1s, SUM(latency1_to5s) latency1_to5s,
+		SUM(latency5_to15s) latency5_to15s, SUM(latency15_to30s) latency15_to30s,
+		SUM(latency30_to60s) latency30_to60s, SUM(latency_over60s) latency_over60s
 		FROM nginx_minute_samples WHERE bucket_ts >= ? AND bucket_ts < ? AND method='POST'
 		AND route IN ('/v1/chat/completions','/v1/responses','/v1/messages','/v1/*')
 		GROUP BY ts,node ORDER BY ts,node`, bucket, bucket, from, to).Scan(&rows).Error
@@ -760,9 +773,22 @@ func (m *Monitor) readCapacityIngress(ctx context.Context, from, to, bucket, now
 				avgUpstream = float64(row.UpstreamTimeSumMS) / float64(row.UpstreamTimeCount)
 			}
 			windowMS := float64(bucket * 1000)
+			latencyCoverage := float64(0)
+			if row.Count > 0 {
+				latencyCoverage = float64(row.LatencyCount) / float64(row.Count) * 100
+			}
+			p95 := approximateLatencyPercentile(row.LatencyCount, .95, row.Latency0To1s, row.Latency1To5s, row.Latency5To15s, row.Latency15To30s, row.Latency30To60s, row.LatencyOver60s)
+			p99 := approximateLatencyPercentile(row.LatencyCount, .99, row.Latency0To1s, row.Latency1To5s, row.Latency5To15s, row.Latency15To30s, row.Latency30To60s, row.LatencyOver60s)
+			if row.LatencyCount > 0 && p95 == 0 {
+				p95 = row.RequestTimeMaxMS
+			}
+			if row.LatencyCount > 0 && p99 == 0 {
+				p99 = row.RequestTimeMaxMS
+			}
 			out = append(out, capacityIngressPoint{Ts: row.Ts, Node: row.Node, Requests: row.Count, RPM: float64(row.Count) / mins,
 				Error5xx: row.Error5xx, UpstreamError5xx: row.UpstreamError5xx, AverageLatency: avg, AverageUpstreamLatency: avgUpstream,
-				MaxLatency: float64(row.RequestTimeMaxMS), EstimatedInflight: float64(row.RequestTimeSumMS) / windowMS,
+				MaxLatency: float64(row.RequestTimeMaxMS), P95Latency: float64(p95), P99Latency: float64(p99), LatencyCoverage: latencyCoverage,
+				EstimatedInflight:         float64(row.RequestTimeSumMS) / windowMS,
 				EstimatedUpstreamInflight: float64(row.UpstreamTimeSumMS) / windowMS})
 			total += row.Count
 		}

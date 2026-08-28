@@ -1265,6 +1265,104 @@ func TestChannelUpstreamSub2APISaveNeverPersistsPassword(t *testing.T) {
 	}
 }
 
+func TestChannelUpstreamSub2APIImportsAndRotatesBrowserRefreshToken(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	const importedToken = "browser-refresh-token-that-must-never-leak"
+	var loginCalls, refreshCalls, profileCalls atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/api/v1/auth/login":
+			loginCalls.Add(1)
+			http.Error(w, `{"message":"interactive login must not be used"}`, http.StatusBadRequest)
+		case "/api/v1/auth/refresh":
+			refreshCalls.Add(1)
+			var input map[string]string
+			_ = json.NewDecoder(r.Body).Decode(&input)
+			if input["refresh_token"] != importedToken {
+				http.Error(w, `{"message":"wrong refresh token"}`, http.StatusUnauthorized)
+				return
+			}
+			_, _ = w.Write([]byte(`{"code":0,"data":{"access_token":"rotated-access","refresh_token":"rotated-refresh","expires_in":3600}}`))
+		case "/api/v1/user/profile":
+			profileCalls.Add(1)
+			if r.Header.Get("Authorization") != "Bearer rotated-access" {
+				http.Error(w, `{"message":"wrong access token"}`, http.StatusUnauthorized)
+				return
+			}
+			_, _ = w.Write([]byte(`{"code":0,"data":{"balance":123.5}}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	domain := normalizeChannelBaseDomain(server.URL)
+	m := newChannelUpstreamTestMonitor(t)
+	if err := m.storeDB.Create(&ChannelSnap{ID: 21, Name: "sub2-turnstile", BaseDomain: domain, BaseHost: normalizeChannelBaseHost(server.URL), Status: 1}).Error; err != nil {
+		t.Fatal(err)
+	}
+	router := gin.New()
+	router.POST("/channels/upstream", m.requireRole(roleRoot), m.saveChannelUpstreamHandler)
+	payload := channelUpstreamSaveInput{
+		Domain: domain, Provider: upstreamProviderSub2API, BaseURL: server.URL,
+		Email: "finance@example.com", RefreshToken: importedToken,
+	}
+	w := upstreamRouteRequest(t, m, router, roleRoot, http.MethodPost, "/channels/upstream", payload)
+	if w.Code != http.StatusOK || strings.Contains(w.Body.String(), importedToken) || strings.Contains(w.Body.String(), "rotated-access") || strings.Contains(w.Body.String(), "rotated-refresh") {
+		t.Fatalf("Sub2API session import leaked credentials or failed: status=%d body=%s", w.Code, w.Body.String())
+	}
+	if loginCalls.Load() != 0 || refreshCalls.Load() != 1 || profileCalls.Load() != 1 {
+		t.Fatalf("unexpected authentication flow: login=%d refresh=%d profile=%d", loginCalls.Load(), refreshCalls.Load(), profileCalls.Load())
+	}
+	var row ChannelUpstreamAccount
+	if err := m.storeDB.First(&row, "domain = ?", domain).Error; err != nil {
+		t.Fatal(err)
+	}
+	if !row.BalanceKnown || row.BalanceUSD != 123.5 || strings.Contains(row.Credential, importedToken) || strings.Contains(row.Credential, "rotated-refresh") {
+		t.Fatalf("session import was not atomically validated and encrypted: %+v", row)
+	}
+	var credential sub2APICredential
+	if err := m.openUpstreamCredential(row, &credential); err != nil {
+		t.Fatal(err)
+	}
+	if credential.AccessToken != "rotated-access" || credential.RefreshToken != "rotated-refresh" || credential.ExpiresAt <= time.Now().Unix() {
+		t.Fatalf("wrong rotated credential stored: %+v", credential)
+	}
+}
+
+func TestChannelUpstreamSub2APIRefreshTokenErrorIsRedactedAndNotPersisted(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	const importedToken = "reflected-refresh-token-that-must-never-leak"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path != "/api/v1/auth/refresh" {
+			http.NotFound(w, r)
+			return
+		}
+		http.Error(w, `{"message":"invalid refresh token: `+importedToken+`"}`, http.StatusUnauthorized)
+	}))
+	defer server.Close()
+	domain := normalizeChannelBaseDomain(server.URL)
+	m := newChannelUpstreamTestMonitor(t)
+	if err := m.storeDB.Create(&ChannelSnap{ID: 22, Name: "sub2-refresh-error", BaseDomain: domain, BaseHost: normalizeChannelBaseHost(server.URL), Status: 1}).Error; err != nil {
+		t.Fatal(err)
+	}
+	router := gin.New()
+	router.POST("/channels/upstream", m.requireRole(roleRoot), m.saveChannelUpstreamHandler)
+	w := upstreamRouteRequest(t, m, router, roleRoot, http.MethodPost, "/channels/upstream", channelUpstreamSaveInput{
+		Domain: domain, Provider: upstreamProviderSub2API, BaseURL: server.URL,
+		Email: "finance@example.com", RefreshToken: importedToken,
+	})
+	if w.Code != http.StatusBadRequest || strings.Contains(w.Body.String(), importedToken) || !strings.Contains(w.Body.String(), "[REDACTED]") {
+		t.Fatalf("reflected refresh token was not redacted: status=%d body=%s", w.Code, w.Body.String())
+	}
+	var count int64
+	if err := m.storeDB.Model(&ChannelUpstreamAccount{}).Where("domain = ?", domain).Count(&count).Error; err != nil || count != 0 {
+		t.Fatalf("failed session import persisted account: rows=%d err=%v", count, err)
+	}
+}
+
 func TestUpstreamHTTPClientDoesNotForwardTokenAcrossRedirect(t *testing.T) {
 	var targetHits atomic.Int64
 	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

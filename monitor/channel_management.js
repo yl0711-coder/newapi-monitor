@@ -114,6 +114,7 @@ function init(){
   $('cmUpstreamCancel')?.addEventListener('click',closeUpstream);
   $('cmUpstreamMask')?.addEventListener('click',closeUpstream);
   $('cmUpstreamProvider')?.addEventListener('change',syncUpstreamFields);
+  $('cmUpstreamAuthMode')?.addEventListener('change',syncUpstreamFields);
   $('cmUpstreamAddAPIKey')?.addEventListener('click',()=>addAICodeWithKeyInput());
   $('cmUpstreamAPIKeyList')?.addEventListener('click',event=>{
     const button=event.target.closest('[data-remove-api-key]');if(!button)return;
@@ -626,6 +627,9 @@ function syncUpstreamFields(){
   document.querySelectorAll('.cm-upstream-newapi').forEach(el=>el.hidden=provider!=='newapi');
   document.querySelectorAll('.cm-upstream-sub2api').forEach(el=>el.hidden=provider!=='sub2api');
   document.querySelectorAll('.cm-upstream-aicodewith').forEach(el=>el.hidden=provider!=='aicodewith');
+  const sub2AuthMode=$('cmUpstreamAuthMode')?.value||'password';
+  document.querySelectorAll('.cm-upstream-sub2-password').forEach(el=>el.hidden=provider!=='sub2api'||sub2AuthMode!=='password');
+  document.querySelectorAll('.cm-upstream-sub2-refresh').forEach(el=>el.hidden=provider!=='sub2api'||sub2AuthMode!=='refresh_token');
   const usageSupported=provider==='newapi'||provider==='sub2api'||provider==='aicodewith';
   const usageOption=document.querySelector('.cm-upstream-usage-option');
   if(usageOption)usageOption.hidden=!usageSupported;
@@ -684,7 +688,7 @@ async function openUpstream(domainKey){
   $('cmUpstreamSubtitle').textContent='正在读取当前配置…';
   $('cmUpstreamStatus').hidden=true;
   $('cmUpstreamProvider').value='newapi';$('cmUpstreamBaseURL').value=`https://${domain.domain}`;
-  $('cmUpstreamUserID').value='';$('cmUpstreamAccessToken').value='';$('cmUpstreamEmail').value='';$('cmUpstreamPassword').value='';resetAICodeWithKeyInputs();updateAICodeWithKeyHelp(null);$('cmUpstreamEnabled').checked=true;$('cmUpstreamUsageEnabled').checked=false;
+  $('cmUpstreamUserID').value='';$('cmUpstreamAccessToken').value='';$('cmUpstreamEmail').value='';$('cmUpstreamAuthMode').value='password';$('cmUpstreamPassword').value='';$('cmUpstreamRefreshToken').value='';resetAICodeWithKeyInputs();updateAICodeWithKeyHelp(null);$('cmUpstreamEnabled').checked=true;$('cmUpstreamUsageEnabled').checked=false;
   $('cmUpstreamSync').hidden=true;$('cmUpstreamUsageSync').hidden=true;showUpstreamMessage('');syncUpstreamFields();
   $('cmUpstreamMask').hidden=false;$('cmUpstreamDialog').classList.add('show');$('cmUpstreamDialog').setAttribute('aria-hidden','false');
   document.body.classList.add('cm-dialog-open');
@@ -709,7 +713,7 @@ async function openUpstream(domainKey){
 function closeUpstream(){
   if(!cm.upstreamDomain)return;
   cm.upstreamDomain=null;cm.upstreamConfig=null;
-  $('cmUpstreamAccessToken').value='';$('cmUpstreamPassword').value='';resetAICodeWithKeyInputs();updateAICodeWithKeyHelp(null);
+  $('cmUpstreamAccessToken').value='';$('cmUpstreamPassword').value='';$('cmUpstreamRefreshToken').value='';resetAICodeWithKeyInputs();updateAICodeWithKeyHelp(null);
   $('cmUpstreamMask').hidden=true;$('cmUpstreamDialog').classList.remove('show');$('cmUpstreamDialog').setAttribute('aria-hidden','true');
   document.body.classList.remove('cm-dialog-open');showUpstreamMessage('');
 }
@@ -723,8 +727,10 @@ async function saveUpstream(){
     payload.user_id=Number($('cmUpstreamUserID').value);payload.access_token=$('cmUpstreamAccessToken').value.trim();
     if(!Number.isInteger(payload.user_id)||payload.user_id<=0){showUpstreamMessage('请填写有效的 NewAPI 用户 ID。',true);return}
   }else if(provider==='sub2api'){
-    payload.email=$('cmUpstreamEmail').value.trim();payload.password=$('cmUpstreamPassword').value;
+    const authMode=$('cmUpstreamAuthMode').value;payload.email=$('cmUpstreamEmail').value.trim();
+    if(authMode==='refresh_token')payload.refresh_token=$('cmUpstreamRefreshToken').value.trim();else payload.password=$('cmUpstreamPassword').value;
     if(!payload.email){showUpstreamMessage('请填写 Sub2API 登录邮箱。',true);return}
+    if(authMode==='refresh_token'&&!payload.refresh_token&&!cm.upstreamConfig?.account?.configured){showUpstreamMessage('首次连接时请填写上游浏览器会话中的 Refresh Token。',true);return}
   }else{
     const keyChanges=readAICodeWithKeyChanges();payload.add_api_key_slots=keyChanges.additions;payload.rename_api_key_slots=keyChanges.renames;payload.remove_api_key_ids=[...cm.removedAICodeWithKeyIDs];
     if(payload.add_api_key_slots.some(item=>!item.api_key)){showUpstreamMessage('填写 Key 名称后，还需要填写对应的 AICodeWith API Key。',true);return}
@@ -733,7 +739,7 @@ async function saveUpstream(){
   const button=$('cmUpstreamSave');button.disabled=true;$('cmUpstreamSync').disabled=true;$('cmUpstreamUsageSync').disabled=true;showUpstreamMessage(payload.enabled?'正在安全连接并读取余额…':'正在停用自动同步…');
   try{
     const res=await fetch('/channels/upstream',{method:'POST',headers:{Accept:'application/json','Content-Type':'application/json'},body:JSON.stringify(payload)});
-    $('cmUpstreamAccessToken').value='';$('cmUpstreamPassword').value='';payload.access_token='';payload.password='';payload.add_api_key_slots=[];payload.rename_api_key_slots=[];payload.remove_api_key_ids=[];
+    $('cmUpstreamAccessToken').value='';$('cmUpstreamPassword').value='';$('cmUpstreamRefreshToken').value='';payload.access_token='';payload.password='';payload.refresh_token='';payload.add_api_key_slots=[];payload.rename_api_key_slots=[];payload.remove_api_key_ids=[];
     if(res.status===401){location.href='/login';return}
     const data=await res.json();if(!res.ok)throw new Error(data.error||`HTTP ${res.status}`);
     cm.upstreamConfig={...(cm.upstreamConfig||{}),provider,base_url:baseURL,enabled:payload.enabled,account:data.account};
@@ -742,7 +748,7 @@ async function saveUpstream(){
     cm.loaded=false;await loadReport();
     if(data.sync_error){showUpstreamMessage(`配置已保存，但本次同步失败：${data.sync_error}`,true);return}
     closeUpstream();
-  }catch(error){$('cmUpstreamAccessToken').value='';$('cmUpstreamPassword').value='';if(provider==='aicodewith')renderAICodeWithKeySlots(cm.upstreamConfig?.account?.api_key_slots||[]);showUpstreamMessage(error.message||'保存失败，请稍后重试。',true)}finally{button.disabled=false;$('cmUpstreamSync').disabled=false;$('cmUpstreamUsageSync').disabled=false}
+  }catch(error){$('cmUpstreamAccessToken').value='';$('cmUpstreamPassword').value='';$('cmUpstreamRefreshToken').value='';if(provider==='aicodewith')renderAICodeWithKeySlots(cm.upstreamConfig?.account?.api_key_slots||[]);showUpstreamMessage(error.message||'保存失败，请稍后重试。',true)}finally{button.disabled=false;$('cmUpstreamSync').disabled=false;$('cmUpstreamUsageSync').disabled=false}
 }
 async function syncUpstreamNow(){
   if(!cm.upstreamDomain)return;

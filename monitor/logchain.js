@@ -35,7 +35,7 @@ const lc={
   rows:[],hasMore:false,nextBeforeTs:0,nextBeforeID:0,
   // scopeEcho 是后端回显的生效范围（时间窗、limit 等），与上面的 scope（查看范围）
   // 是两件事。曾经两者同名，后者静默覆盖前者，默认查看范围直接丢失。
-  blindSpots:[],scopeEcho:null,note:'',enrichError:'',
+  blindSpots:[],scopeEcho:null,note:'',enrichError:'',edgeEvidenceError:'',evidenceMode:'off',evidenceVerified:false,
   opts:null,           // /logchain/filters 结果，只取一次
   loading:false,abort:null,generation:0,
   expanded:new Set()
@@ -344,6 +344,9 @@ async function load(more){
     lc.scopeEcho=data.scope||null;
     lc.note=data.note||'';
     lc.enrichError=data.channel_enrich_error||'';
+    lc.edgeEvidenceError=data.edge_evidence_error||'';
+    lc.evidenceMode=data.nginx_evidence_mode||'off';
+    lc.evidenceVerified=!!data.nginx_evidence_verified;
     render();
   }catch(e){
     if(e.name==='AbortError'||gen!==lc.generation)return;
@@ -578,6 +581,24 @@ function detailHTML(r){
   if(r.channel_vendor)add('厂商',r.channel_vendor);
   if(r.upstream_domain)add('上游主域名',r.upstream_domain);
 
+  const edge=r.edge_evidence||null;
+  let edgeBlock='';
+  if(edge){
+    const verified=!!r.edge_evidence_verified;
+    const label=verified?'已验证入口证据':'灰度入口证据（关联未验收）';
+    const statuses=(()=>{try{return JSON.parse(edge.upstream_statuses||'[]').join(' → ')}catch(_){return ''}})();
+    const rows=[
+      ['节点',edge.node||'—'],['入口状态',String(edge.status||'—')],
+      ['上游状态序列',statuses||String(edge.upstream_status||'—')],
+      ['入口总耗时',(edge.request_ms||0)+'ms'],['上游耗时',edge.upstream_present?(edge.upstream_ms||0)+'ms':'—'],
+      ['连接/首包',(edge.connect_ms||0)+'ms / '+(edge.header_ms||0)+'ms'],
+      ['边缘交付',edge.completion||'—']
+    ];
+    edgeBlock=`<section class="lc-edge ${verified?'verified':'pilot'}"><div class="lc-raw-head"><span>${esc(label)}</span></div>`+
+      `<div class="lc-kvs">${rows.map(x=>`<div class="lc-kv"><span>${esc(x[0])}</span><b>${esc(x[1])}</b></div>`).join('')}</div>`+
+      `${verified?'':'<div class="lc-sub">pilot 仅用于核对 Request ID 覆盖率，不能据此自动改变责任归因。</div>'}</section>`;
+  }
+
   const raw=r.content||'';
   // 标题按行的性质给：type=2 的 content 是计费摘要，不是上游返回。
   // 主列已让位给诊断信息，这里如实说明它是什么，避免被误读成上游报错。
@@ -613,6 +634,7 @@ function detailHTML(r){
 
   return `<tr class="lc-detail"><td colspan="8">
     <div class="lc-kvs">${kv.join('')}</div>
+    ${edgeBlock}
     ${rawBlock}
     ${endErrBlock}
     ${jump?`<div style="margin-top:10px">${jump}</div>`:''}
@@ -714,6 +736,8 @@ function renderNotes(){
   const notes=[];
   if(lc.note)notes.push(esc(lc.note));
   if(lc.enrichError)notes.push(`渠道信息补全失败（明细仍有效）：${esc(lc.enrichError)}`);
+  if(lc.edgeEvidenceError)notes.push(`Nginx 入口证据补全失败（明细仍有效）：${esc(lc.edgeEvidenceError)}`);
+  if(lc.evidenceMode==='pilot')notes.push('Nginx 请求证据处于 pilot：只核对关联覆盖率，尚不作为责任结论。');
   // 后端可能收敛了范围（跨度截断/limit 上限），回显出来，避免以为筛选原样生效。
   if(lc.scopeEcho&&lc.scopeEcho.from&&lc.scopeEcho.to)notes.push(`查询范围：${esc(lc.scopeEcho.from)} ～ ${esc(lc.scopeEcho.to)}（CST）`);
   if(!notes.length){el.hidden=true;return}

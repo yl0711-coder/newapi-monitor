@@ -1228,6 +1228,23 @@ func TestStabilityRetentionPrunesAllLocalTables(t *testing.T) {
 	}
 }
 
+func TestStabilityRetentionCutoffMatchesFinalizedCoverageBoundary(t *testing.T) {
+	now := time.Date(2026, 8, 28, 21, 23, 45, 0, cstLocation).Unix()
+	finalizedTo := finalizedStabilityHourTo(now)
+	got := stabilityRetentionCutoff(now, 181)
+	want := finalizedTo - 181*86400
+	if got != want {
+		t.Fatalf("retention cutoff=%s want finalized coverage boundary %s",
+			time.Unix(got, 0).In(cstLocation), time.Unix(want, 0).In(cstLocation))
+	}
+	if raw := now - 181*86400; got == raw || raw-got != 23*60+45 {
+		t.Fatalf("retention unexpectedly followed wall clock: cutoff=%d raw=%d", got, raw)
+	}
+	if got := stabilityRetentionCutoff(now, 0); got != 0 {
+		t.Fatalf("disabled retention cutoff=%d want 0", got)
+	}
+}
+
 func TestStabilityProblemIntervalBounds(t *testing.T) {
 	if got := stabilityProblemIntervalSeconds(0); got != 300 {
 		t.Fatalf("zero interval=%d want 300", got)
@@ -1338,6 +1355,22 @@ func TestStabilityPageUsesCompactCoverageStatus(t *testing.T) {
 	}
 	if strings.Contains(js, "当前日期范围的小时数据完整率为") {
 		t.Fatal("正常尾部延迟不应再使用全宽红色告警")
+	}
+}
+
+func TestStabilityEdgePageKeepsAccessAndErrorEvidenceSeparate(t *testing.T) {
+	js := string(stabilityJS)
+	for _, marker := range []string{
+		"Nginx error 分类",
+		"节点级旁证，不做时间邻近的伪精确请求关联",
+		"入口 P95 / P99",
+		"桶上界估算",
+		"edgeSourceRows(sources,'access')",
+		"edgeSourceRows(d.error_sources||[],'error')",
+	} {
+		if !strings.Contains(js, marker) {
+			t.Fatalf("稳定性边缘旁证页缺少 %q", marker)
+		}
 	}
 }
 

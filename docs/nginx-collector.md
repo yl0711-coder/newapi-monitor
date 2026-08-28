@@ -4,7 +4,12 @@
 
 ## 安全边界
 
-采集器只读取一份专用 JSON access log，在节点本地先脱敏并按分钟聚合。Monitor 只接收：节点、归一化路径、HTTP 方法、HTTP/upstream 状态、请求数、耗时汇总、响应字节数和“是否携带 Request ID”的计数。
+采集器只读取一份专用 JSON access log。核心分钟字段只解析一次；证据开启时再独立解析可选证据字段，后者格式异常不会污染分钟事实。输出分成两条完全独立的 lane：
+
+1. 原有分钟汇总：节点、归一化路径、HTTP 方法、HTTP/upstream 状态、请求数、耗时汇总、响应字节数和 Request ID 存在计数。
+2. 可选请求证据：每个推理请求的最终 HTTP 状态、多次 upstream 尝试状态序列、connect/header/总耗时、响应字节和入口完成状态。Request ID 在节点上立即使用 HMAC-SHA256 脱敏，Monitor 只存 HMAC，不存原值。
+
+两条 lane 有不同的接收接口、批次幂等账本、本地队列和 SQLite。证据接口故障不会阻止原有分钟汇总推进；队列满时必须先持久化缺口计数，不允许静默丢数。
 
 当 Nginx 因重试或内部跳转在 `$upstream_status` /
 `$upstream_response_time` 中记录逗号或冒号分隔的多个值时，
@@ -13,7 +18,7 @@
 
 即使没有新请求，采集器也会每分钟发送一个不含业务数据的空心跳；因此页面上的“采集器正常”不会把真实零流量误报为采集中断。
 
-禁止写入专用日志或发送到 Monitor 的字段包括：客户端 IP、X-Forwarded-For、Authorization、API Key、Cookie、完整 query、请求体、响应体、User-Agent、Referer、Request ID 原值及 upstream 地址。
+禁止写入专用日志的字段包括：客户端 IP、X-Forwarded-For、Authorization、API Key、Cookie、完整 query、请求体、响应体、User-Agent、Referer 及 upstream 地址。为了不修改 NewAPI 仍能关联它写入 `logs.request_id` 的请求，v2 专用日志会在节点本地短期包含 Nginx/NewAPI Request ID；该文件必须仅宿主机管理员可读，采集器将其 HMAC 后才入持久 outbox/发往 Monitor，原值绝不出节点。Request ID 不是认证凭据，但仍按敏感运维数据管理。
 
 ## Nginx 专用日志格式
 
@@ -35,6 +40,78 @@ log_format nexus_monitor escape=json '{'
 access_log /var/log/nexusapi-monitor/nexusapi_access.jsonl nexus_monitor buffer=64k flush=1s;
 ```
 
+启用请求证据时使用 schema 2；不修改 NewAPI。rc4 已由 RequestId 中间件在响应中返回
+`X-Oneapi-Request-Id`，且 NewAPI 消费/错误日志使用同一上下文 ID。
+
+```nginx
+log_format nexus_monitor_v2 escape=json '{'
+  '"log_schema":2,'
+  '"msec":"$msec",'
+  '"request_method":"$request_method",'
+  '"uri":"$uri",'
+  '"status":"$status",'
+  '"request_time":"$request_time",'
+  '"upstream_status":"$upstream_status",'
+  '"upstream_response_time":"$upstream_response_time",'
+  '"upstream_connect_time":"$upstream_connect_time",'
+  '"upstream_header_time":"$upstream_header_time",'
+  '"bytes_sent":"$bytes_sent",'
+  '"request_id":"$request_id",'
+  '"nginx_request_id":"$request_id",'
+  '"oneapi_request_id":"$sent_http_x_oneapi_request_id",'
+  '"request_completion":"$request_completion"'
+'}';
+```
+
+`request_id` 字段保留是为了原分钟汇总的存在率兼容；证据 lane 使用两个明确命名字段。先用 `pilot` 核对一批真实请求的响应头、Nginx HMAC 证据和 `logs.request_id`；覆盖率与值一致性达标前不得配成 `verified`，也不得在客户排障中宣称精确关联。
+
+## 请求证据灰度开关
+
+Monitor 和节点必须使用相同、独立于登录与 ingest token 的 HMAC 密钥及 key id。默认全部 `off`：
+
+```text
+MONITOR_NGINX_EVIDENCE_MODE=pilot
+MONITOR_NGINX_EVIDENCE_STORE_PATH=/evidence/nginx-evidence.db
+MONITOR_NGINX_EVIDENCE_RETENTION_HOURS=168
+MONITOR_NGINX_EVIDENCE_MAX_MIB=512
+MONITOR_NGINX_EVIDENCE_HMAC_KEY=<at-least-32-random-bytes>
+MONITOR_NGINX_EVIDENCE_HMAC_KEY_ID=2026-08-a
+# 轮换期可暂时保留上一把，待旧 outbox 与留存窗口清空后删除：
+MONITOR_NGINX_EVIDENCE_PREVIOUS_HMAC_KEY=<previous-key>
+MONITOR_NGINX_EVIDENCE_PREVIOUS_HMAC_KEY_ID=2026-07-a
+
+NGINXCOLLECTOR_EVIDENCE_MODE=pilot
+NGINXCOLLECTOR_EVIDENCE_SINK_URL=https://monitor.example/internal/nginx-evidence/v1
+NGINXCOLLECTOR_EVIDENCE_HMAC_KEY=<same-key>
+NGINXCOLLECTOR_EVIDENCE_HMAC_KEY_ID=2026-08-a
+NGINXCOLLECTOR_EVIDENCE_OUTBOX_MAX_MIB=256
+```
+
+`nginx-evidence.db` 不得与 Monitor 主库或 usage facts 库合并，也不进入主库长期备份集。生产环境必须挂载到独立、有配额的卷；`MONITOR_NGINX_EVIDENCE_MAX_MIB` 会设置 SQLite `max_page_count`，过期删除产生的 freelist 页可直接复用，不会因为主文件曾经长大而永久拒绝写入。该限制仍不能替代卷配额。默认保留 7 天并分批清理。管理端只能通过 `POST /nginx/evidence/lookup` 用精确 NewAPI Request ID 查询；输入只用于内存 HMAC，不入库。`pilot` 响应会明确标记 `linkage_verified=false`，供客户排障后续整合，但当前不自动改它的页面结论。
+
+证据 outbox 使用写入游标中的单调序号排序，不依赖文件 mtime；空事件的数据区间也会写入 checkpoint。若证据目录暂时不可写，丢失代次与丢失事件数跟随分钟游标持久化，恢复后的下一批只允许跨越一次已声明缺口。永久 4xx 拒绝的原批次会移入有界 `rejected` 目录，临时 429/5xx 则保留在活跃队列重试。
+
+当前请求级闭环只使用专用 access log。标准 Nginx error log 可能包含客户端 IP、完整请求行、query、upstream 地址等敏感信息，也没有可配置的稳定 Request ID 字段，因此不得把原文直接上传或与请求做时间邻近的伪精确关联。
+
+标准 error log 使用同一采集器进程内的**独立 lane**：独立日志路径、独立持久游标、独立接收接口和独立重试循环。节点侧只保留有限类别（upstream 超时/连接失败/提前关闭/TLS、客户端断开、worker 容量、解析、限流、请求体、其他错误）、严重级别、分钟和数量；原文、IP、URI、请求行与 upstream 地址均不上传。该数据只能作为节点级运维证据，不能冒充请求级证据。error lane 故障不会阻塞 access 分钟汇总或请求证据。
+
+入口分钟汇总另带 0～1s、1～5s、5～15s、15～30s、30～60s、60s 以上六个互斥耗时桶。Monitor 据此展示近似 P95/P99；它们是桶上界估算，不伪装成精确分位值。旧版样本没有直方图时继续可读，并明确反映为覆盖率不足。
+
+error lane 默认关闭，节点和 Monitor 都必须显式开启：
+
+```text
+MONITOR_NGINX_ERROR_ENABLED=true
+
+NGINXCOLLECTOR_ERROR_ENABLED=true
+NGINXCOLLECTOR_ERROR_LOG_PATH=/logs/error.log
+NGINXCOLLECTOR_ERROR_CURSOR_PATH=/data/error-cursor.json
+NGINXCOLLECTOR_ERROR_SINK_URL=https://monitor.example/internal/nginx-errors
+# 必须与 Nginx error_log 的实际时区一致
+NGINXCOLLECTOR_ERROR_TIMEZONE=Asia/Shanghai
+```
+
+采集器挂载的 `/logs/error.log` 必须是现有标准 error log 的只读文件，不要求修改其格式。若该文件不在已有共享日志目录，仍需在节点摘流窗口内补只读挂载；不得为采集赋予 Docker socket 或宿主机广泛读取权限。
+
 先执行 `nginx -t`，再平滑 reload。不要改动现有业务路由、超时、upstream 或原日志。
 现有写往 stdout 的访问日志可保留作为原运维日志；采集器只读取上面这份
 专用脱敏文件。
@@ -51,7 +128,7 @@ access_log /var/log/nexusapi-monitor/nexusapi_access.jsonl nexus_monitor buffer=
 ```
 
 Nginx 容器以读写方式挂载到 `/var/log/nexusapi-monitor`，采集器把同一宿主机
-目录只读挂载到 `/logs`。不使用 `copytruncate`；宿为 Nginx 收到 `USR1`
+目录只读挂载到 `/logs`。不使用 `copytruncate`；宿主机在 Nginx 收到 `USR1`
 后重新打开日志文件，保证 inode 切换可被采集器跟踪。
 
 参考 logrotate 基线（每节点）：
@@ -64,7 +141,7 @@ Nginx 容器以读写方式挂载到 `/var/log/nexusapi-monitor`，采集器把�
     missingok
     notifempty
     nocompress
-    create 0644 root root
+    create 0640 root nexus-monitor
     sharedscripts
     postrotate
         /usr/bin/docker kill -s USR1 nexusapi-nginx >/dev/null 2>&1 || true
@@ -74,8 +151,10 @@ Nginx 容器以读写方式挂载到 `/var/log/nexusapi-monitor`，采集器把�
 
 8 份未压缩日志用来覆盖默认 7 天留存和较长故障恢复；实际保留天数改动时，
 logrotate 保留份数、`NGINXCOLLECTOR_RETENTION_DAYS` 和
-`MONITOR_NGINX_RETENTION_DAYS` 必须一起调整。这份日志不含 IP、Key、query、请求体或
-Request ID 原值，但仍应只对宿主机管理员可见。
+`MONITOR_NGINX_RETENTION_DAYS` 必须一起调整。这份日志不含 IP、Key、query、请求体或响应体；
+schema 2 含短期 Request ID 原值，因此必须只对宿主机管理员和专用
+`nexus-monitor` 组可见。把该组的数字 GID 填入 `NGINXCOLLECTOR_LOG_GID`，
+Compose 只把这个补充组授予非 root 采集器；不得回退到 `0644`。
 
 ## 启用顺序
 
@@ -99,9 +178,9 @@ HTTP 重定向，避免 Bearer token 被带到非预期主机。只有经过核�
 
 ### 上线安排
 
-该能力暂不单独上线，保持 `MONITOR_NGINX_ENABLED=false`，生产 Nginx、ALB 和节点均不做变更。
-下一次中转站版本滚动升级本来就需要逐节点摘流、排空和重建容器，届时在**同一个已摘流窗口**
-增加专用日志挂载和 nginxcollector，避免仅为日志挂载额外重建一次 Nginx。
+该能力只能在批准的受控窗口内上线。先保持 `MONITOR_NGINX_ENABLED=false`
+发布 Monitor 和采集器，再对 Nginx 节点逐台摘流、排空、重建与回挂。严禁同时重建
+两台 Nginx，也不得借采集上线改动 NewAPI 镜像、业务路由、超时或 upstream 配置。
 
 节点先后顺序以届时中转站版本的正式 release runbook 为准；无论先处理 Master 还是 Slave，
 都必须一次只处理一个节点。禁止同时摘除、排空或重建两个节点。
@@ -118,7 +197,7 @@ HTTP 重定向，避免 Bearer token 被带到非预期主机。只有经过核�
 4. 两节点当前 compose、Nginx 模板和运行镜像摘要已分别备份，且已有经过验证的逐节点
    回滚命令；不得用 `docker compose down`。
 5. 脱敏配置在与生产同版的临时 Nginx 容器中通过 `nginx -t`，并人工确认专用日志不含
-   IP、Header、Key、query、请求/响应体、原始 Request ID 或动态路径。
+   IP、认证 Header、Key、query、请求/响应体或动态路径；Request ID 仅允许存在节点本地的 schema 2 短期日志。
 6. 宿主机日志目录、所有者/权限、logrotate 配置和磁盘预算已验证；轮转必须使用
    rename + `USR1`，不得使用 `copytruncate`。
 7. Master 到 Monitor 的私网固定解析、Slave 到 Monitor 的同 Docker 网络直连均已通过

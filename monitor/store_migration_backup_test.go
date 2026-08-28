@@ -299,6 +299,7 @@ INSERT INTO legacy_facts_guard(id, value) VALUES (1, 'facts-in-wal');`)
 	}
 	if !m.storeDB.Migrator().HasColumn(&MetricSample{}, "traffic_class_version") ||
 		!m.storeDB.Migrator().HasTable(&ChannelTestHourSample{}) ||
+		!m.storeDB.Migrator().HasTable(&NewAPIUsageBackfillSegment{}) ||
 		!m.storeDB.Migrator().HasColumn(&ChannelUpstreamAccount{}, "usage_adapter") {
 		t.Fatal("current main schema was not migrated after the snapshot gate")
 	}
@@ -325,6 +326,7 @@ INSERT INTO legacy_facts_guard(id, value) VALUES (1, 'facts-in-wal');`)
 	}
 	if sqliteHasColumn(t, mainSnapshot, "metric_samples", "traffic_class_version") ||
 		sqliteHasTable(t, mainSnapshot, "channel_test_hour_samples") ||
+		sqliteHasTable(t, mainSnapshot, "new_api_usage_backfill_segments") ||
 		sqliteHasColumn(t, mainSnapshot, "channel_upstream_accounts", "usage_adapter") {
 		t.Fatal("pre-migration main snapshot unexpectedly contains current schema")
 	}
@@ -352,6 +354,7 @@ INSERT INTO legacy_facts_guard(id, value) VALUES (1, 'facts-in-wal');`)
 	restoredFacts := openReadOnlyTestStore(t, filepath.Join(restoreDir, filepath.Base(factsPath)))
 	if sqliteHasColumn(t, restoredMain, "metric_samples", "traffic_class_version") ||
 		sqliteHasColumn(t, restoredMain, "channel_upstream_accounts", "usage_adapter") ||
+		sqliteHasTable(t, restoredMain, "new_api_usage_backfill_segments") ||
 		sqliteHasColumn(t, restoredFacts, "usage_hour_facts", "refund_records") {
 		t.Fatal("restored volume is not the pre-migration schema")
 	}
@@ -372,6 +375,9 @@ INSERT INTO legacy_facts_guard(id, value) VALUES (1, 'facts-in-wal');`)
 	var mainRows, factsRows int64
 	if err := m2.storeDB.Table("legacy_guard").Count(&mainRows).Error; err != nil || mainRows != 1 {
 		t.Fatalf("main rows changed after repeated migration: rows=%d err=%v", mainRows, err)
+	}
+	if !m2.storeDB.Migrator().HasTable(&NewAPIUsageBackfillSegment{}) {
+		t.Fatal("repeated startup lost the adaptive backfill segment table")
 	}
 	if err := m2.usageFactsDB.Table("legacy_facts_guard").Count(&factsRows).Error; err != nil || factsRows != 1 {
 		t.Fatalf("facts rows changed after repeated migration: rows=%d err=%v", factsRows, err)

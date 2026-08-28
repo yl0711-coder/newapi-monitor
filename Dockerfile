@@ -47,16 +47,16 @@ ARG VCS_REF=unknown
 LABEL org.opencontainers.image.revision="$VCS_REF"
 WORKDIR /app
 COPY --from=builder /app /app/monitor
-# 运行用户只需要写 /data 和独立备份卷 /backup。二进制与 /app 保持 root 所有且只读，
+# 运行用户只需要写 /data、独立备份卷 /backup 和短期证据卷 /evidence。二进制与 /app 保持 root 所有且只读，
 # 避免应用进程被利用后直接改写自身可执行文件并跨重启留驻。
 RUN if ! id app >/dev/null 2>&1; then adduser -D -u 1000 app; fi \
-    && mkdir -p /data /backup \
-    && chown app:app /data /backup \
+    && mkdir -p /data /backup /evidence \
+    && chown app:app /data /backup /evidence \
     && chmod 0555 /app /app/monitor
 USER app
 ENV MONITOR_ADDR=:8090 \
     MONITOR_STORE_PATH=/data/monitor.db \
     TZ=Asia/Shanghai
 EXPOSE 8090
-VOLUME ["/data", "/backup"]
+VOLUME ["/data", "/backup", "/evidence"]
 ENTRYPOINT ["/app/monitor"]

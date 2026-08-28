@@ -27,7 +27,7 @@ const (
 	// Bump this ID whenever either AutoMigrate model set or a post-migration
 	// schema/data transform changes. Restarts of the same plan reuse its pinned
 	// original snapshot, so they cannot prune away the old-image rollback point.
-	preMigrationPlanID               = "main-facts-schema-20260825-v18-pricing-adapters"
+	preMigrationPlanID               = "main-facts-schema-20260828-v19-upstream-backfill-segments"
 	preMigrationSnapshotPrefix       = "pre-migrate-"
 	preMigrationReferencePrefix      = ".pre-migration-plan-"
 	preMigrationReferenceSuffix      = ".json"

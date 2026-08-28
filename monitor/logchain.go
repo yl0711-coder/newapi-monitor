@@ -411,6 +411,30 @@ type LogChainRow struct {
 	Fault           string `json:"fault,omitempty"`
 	FaultConfidence string `json:"fault_confidence,omitempty"`
 	FaultWhy        string `json:"fault_why,omitempty"`
+
+	// EdgeEvidence 是 Nginx 入口层的短期旁路事实。它只通过本行已经存在的
+	// NewAPI Request ID 在内存中做 HMAC 后查询，不保存或再次回传任何 HMAC。
+	// pilot 只供核对，不参与上面的责任归因；verified 才表示关联已验收。
+	EdgeEvidence         *LogChainEdgeEvidence `json:"edge_evidence,omitempty"`
+	EdgeEvidenceMode     string                `json:"edge_evidence_mode,omitempty"`
+	EdgeEvidenceVerified bool                  `json:"edge_evidence_verified,omitempty"`
+}
+
+type LogChainEdgeEvidence struct {
+	EventMS          int64  `json:"event_ms"`
+	Node             string `json:"node"`
+	Route            string `json:"route"`
+	Status           int    `json:"status"`
+	UpstreamStatus   int    `json:"upstream_status"`
+	UpstreamAttempts int    `json:"upstream_attempts"`
+	UpstreamStatuses string `json:"upstream_statuses,omitempty"`
+	RequestMS        int64  `json:"request_ms"`
+	UpstreamMS       int64  `json:"upstream_ms"`
+	UpstreamPresent  bool   `json:"upstream_present"`
+	ConnectMS        int64  `json:"connect_ms"`
+	HeaderMS         int64  `json:"header_ms"`
+	BytesSent        int64  `json:"bytes_sent"`
+	Completion       string `json:"completion"`
 }
 
 // logChainScope 已校验的查询范围。所有字段都来自用户输入但已收敛到安全区间。
@@ -807,6 +831,89 @@ func (m *Monitor) attachChannelSnaps(ctx context.Context, rows []LogChainRow) er
 	return nil
 }
 
+// attachNginxEvidence performs one bounded local lookup for the whole page.
+// It never adds production-DB work and never turns missing optional evidence
+// into a customer-troubleshooting failure.
+func (m *Monitor) attachNginxEvidence(ctx context.Context, rows []LogChainRow) error {
+	mode := nginxEvidenceMode(m.cfg.NginxEvidenceMode)
+	if mode == "off" || m.nginxEvidenceDB == nil || len(rows) == 0 {
+		return nil
+	}
+	type keySet struct {
+		id     string
+		key    string
+		hashes []string
+	}
+	sets := []keySet{{id: m.cfg.NginxEvidenceHMACKeyID, key: m.cfg.NginxEvidenceHMACKey}}
+	if m.cfg.NginxEvidencePreviousHMACKey != "" {
+		sets = append(sets, keySet{id: m.cfg.NginxEvidencePreviousHMACKeyID, key: m.cfg.NginxEvidencePreviousHMACKey})
+	}
+	seen := make(map[string]struct{}, len(rows))
+	for _, row := range rows {
+		if row.RequestID == "" {
+			continue
+		}
+		for i := range sets {
+			h := nginxEvidenceIDHMAC(sets[i].key, "oneapi-request-id", row.RequestID)
+			if _, ok := seen[sets[i].id+"\x00"+h]; ok {
+				continue
+			}
+			seen[sets[i].id+"\x00"+h] = struct{}{}
+			sets[i].hashes = append(sets[i].hashes, h)
+		}
+	}
+	qctx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
+	defer cancel()
+	query := m.nginxEvidenceDB.WithContext(qctx).Model(&NginxRequestEvidence{})
+	hasClause := false
+	for _, set := range sets {
+		if len(set.hashes) == 0 {
+			continue
+		}
+		clause := "hmac_key_id = ? AND oneapi_id_hmac IN ?"
+		if !hasClause {
+			query = query.Where(clause, set.id, set.hashes)
+			hasClause = true
+		} else {
+			query = query.Or(clause, set.id, set.hashes)
+		}
+	}
+	if !hasClause {
+		return nil
+	}
+	var evidence []NginxRequestEvidence
+	if err := query.Order("event_ms DESC").Limit(len(rows) * len(sets) * 2).Find(&evidence).Error; err != nil {
+		return err
+	}
+	byKey := make(map[string]NginxRequestEvidence, len(evidence))
+	for _, item := range evidence {
+		key := item.HMACKeyID + "\x00" + item.OneAPIIDHMAC
+		if _, exists := byKey[key]; !exists {
+			byKey[key] = item
+		}
+	}
+	for i := range rows {
+		if rows[i].RequestID == "" {
+			continue
+		}
+		for _, set := range sets {
+			h := nginxEvidenceIDHMAC(set.key, "oneapi-request-id", rows[i].RequestID)
+			item, ok := byKey[set.id+"\x00"+h]
+			if !ok {
+				continue
+			}
+			rows[i].EdgeEvidenceMode = mode
+			rows[i].EdgeEvidenceVerified = mode == "verified"
+			rows[i].EdgeEvidence = &LogChainEdgeEvidence{EventMS: item.EventMS, Node: item.Node, Route: item.Route, Status: item.Status,
+				UpstreamStatus: item.UpstreamStatus, UpstreamAttempts: item.UpstreamAttempts, UpstreamStatuses: item.UpstreamStatuses,
+				RequestMS: item.RequestMS, UpstreamMS: item.UpstreamMS, UpstreamPresent: item.UpstreamPresent,
+				ConnectMS: item.ConnectMS, HeaderMS: item.HeaderMS, BytesSent: item.BytesSent, Completion: item.Completion}
+			break
+		}
+	}
+	return nil
+}
+
 // serveLogChainFilters GET /logchain/filters
 // 供筛选下拉取值：服务分组 / 上游主域名 / 渠道。**只读本地 channel_snaps，不碰生产库。**
 // 单独一个接口而不是塞进 requests 响应：下拉选项与所选日期无关，
@@ -915,18 +1022,20 @@ func (m *Monitor) serveLogChainRequests(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	if err := m.attachChannelSnaps(ctx, rows); err != nil {
-		// 渠道补全失败不吞整页：明细本身有效，标注补全缺失即可。
-		c.JSON(http.StatusOK, gin.H{
-			"ok": true, "rows": rows, "has_more": hasMore,
-			"scope": logChainScopeEcho(scope), "blind_spots": logChainBlindSpots(),
-			"channel_enrich_error": err.Error(),
-		})
-		return
-	}
+	channelEnrichErr := m.attachChannelSnaps(ctx, rows)
+	edgeEvidenceErr := m.attachNginxEvidence(ctx, rows)
 	resp := gin.H{
 		"ok": true, "rows": rows, "has_more": hasMore,
 		"scope": logChainScopeEcho(scope), "blind_spots": logChainBlindSpots(),
+		"nginx_evidence_mode":     nginxEvidenceMode(m.cfg.NginxEvidenceMode),
+		"nginx_evidence_verified": nginxEvidenceMode(m.cfg.NginxEvidenceMode) == "verified",
+	}
+	// 两类本地补全都只能降级，不能吞掉已经从生产 logs 取回的明细。
+	if channelEnrichErr != nil {
+		resp["channel_enrich_error"] = channelEnrichErr.Error()
+	}
+	if edgeEvidenceErr != nil {
+		resp["edge_evidence_error"] = edgeEvidenceErr.Error()
 	}
 	if hasMore && len(rows) > 0 {
 		// 游标必须成对返回：排序键是 (created_at, id)，只给 id 无法定位续查位置。

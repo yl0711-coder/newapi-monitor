@@ -547,6 +547,37 @@ func TestPricingLedgerDisabledSchedulerHasZeroSideEffects(t *testing.T) {
 	}
 }
 
+func TestPricingLedgerSub2StatsAccountIsNotEligibleOrScheduled(t *testing.T) {
+	var calls atomic.Int64
+	server := newPricingLedgerFixtureServer(t, http.StatusOK, &calls)
+	m := newChannelUpstreamTestMonitor(t)
+	m.cfg.UpstreamPricingLedgerEnabled = true
+	domain := server.Listener.Addr().String()
+	m.cfg.UpstreamPricingLedgerDomains = []string{domain}
+	row := ChannelUpstreamAccount{
+		Domain: domain, Provider: upstreamProviderSub2API, BaseURL: server.URL,
+		Enabled: true, UsageSyncEnabled: true, UsageAdapter: upstreamUsageAdapterSub2Stats,
+	}
+	if err := m.storeDB.Create(&row).Error; err != nil {
+		t.Fatal(err)
+	}
+	views, err := m.loadChannelUpstreamViews(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if view := views[domain]; view.PricingLedgerEligible || view.PricingLedgerStatus != "not_selected" {
+		t.Fatalf("daily-only Sub2 account advertised as pricing eligible: %+v", view)
+	}
+	m.syncDueUpstreamPricing(context.Background())
+	if calls.Load() != 0 {
+		t.Fatalf("daily-only Sub2 account contacted upstream %d times", calls.Load())
+	}
+	var states int64
+	if err := m.storeDB.Model(&ChannelUpstreamPricingSyncState{}).Where("domain = ?", domain).Count(&states).Error; err != nil || states != 0 {
+		t.Fatalf("daily-only Sub2 account created pricing state: rows=%d err=%v", states, err)
+	}
+}
+
 func TestSyncStoredNewAPIPricingVerifiesWithoutChangingLegacyUsage(t *testing.T) {
 	var calls atomic.Int64
 	server := newPricingLedgerFixtureServer(t, http.StatusOK, &calls)

@@ -118,6 +118,21 @@ func finalizedStabilityHourTo(now int64) int64 {
 	return to / 3600 * 3600
 }
 
+// stabilityRetentionCutoff uses the same finalized-hour boundary as readiness
+// and coverage checks. Using raw wall-clock time here would delete the oldest
+// retained hour before the coverage window advances, leaving readiness
+// permanently one hour short even though every finalized hour was collected.
+func stabilityRetentionCutoff(now int64, days int) int64 {
+	if days <= 0 {
+		return 0
+	}
+	cutoff := finalizedStabilityHourTo(now) - int64(days)*86400
+	if cutoff < 0 {
+		return 0
+	}
+	return cutoff
+}
+
 func (m *Monitor) stabilityDataCoverage(ctx context.Context, fromTs, toTs, now int64) StabilityDataCoverage {
 	fromTs = fromTs / 3600 * 3600
 	finalizedTo := finalizedStabilityHourTo(now)

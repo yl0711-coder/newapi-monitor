@@ -147,6 +147,26 @@ type NewAPIUsageBackfillCheckpoint struct {
 	UpdatedAt            int64   `gorm:"column:updated_at;index"`
 }
 
+// NewAPIUsageBackfillSegment records one fully verified child window of a
+// historical hour. Slow upstreams can time out while evaluating a whole hour;
+// the worker then reads bounded five-minute children, but the public hourly
+// aggregate is still published only after these rows form one continuous,
+// gap-free cover of the parent hour. No source log or credential is retained.
+type NewAPIUsageBackfillSegment struct {
+	Domain               string  `gorm:"primaryKey;size:253;column:domain"`
+	HourFrom             int64   `gorm:"primaryKey;column:hour_from"`
+	SegmentFrom          int64   `gorm:"primaryKey;column:segment_from"`
+	SegmentTo            int64   `gorm:"column:segment_to"`
+	Status               string  `gorm:"size:16;column:status;index"`
+	Total                int64   `gorm:"column:total"`
+	SourceRows           int64   `gorm:"column:source_rows"`
+	Requests             int64   `gorm:"column:requests"`
+	Tokens               int64   `gorm:"column:tokens"`
+	Quota                float64 `gorm:"column:quota"`
+	FirstPageFingerprint string  `gorm:"size:64;column:first_page_fingerprint"`
+	UpdatedAt            int64   `gorm:"column:updated_at;index"`
+}
+
 // AICodeWithKeySyncState keeps scheduling and health isolated per credential.
 // The secret remains inside ChannelUpstreamAccount.Credential; this table only
 // stores the opaque local slot and the remote numeric identity returned by the
@@ -303,6 +323,7 @@ type channelUpstreamSaveInput struct {
 	RemoveAPIKeyIDs   []string                     `json:"remove_api_key_ids"`
 	Email             string                       `json:"email"`
 	Password          string                       `json:"password"`
+	RefreshToken      string                       `json:"refresh_token"`
 	UsageSyncEnabled  *bool                        `json:"usage_sync_enabled"`
 }
 
@@ -1085,7 +1106,7 @@ func (m *Monitor) loadChannelUpstreamViews(ctx context.Context) (map[string]Chan
 		// AICodeWith key is waiting or retrying without contacting the upstream.
 		view.APIKeySlots = m.aicodeWithSlotViewsFromStates(row, keyStatesByDomain[row.Domain])
 		view.PricingLedgerWorkerEnabled = m.cfg.UpstreamPricingLedgerEnabled
-		view.PricingLedgerEligible = pricingLedgerProviderSupported(row.Provider) && pricingLedgerDomainAllowed(m.cfg.UpstreamPricingLedgerDomains, row.Domain)
+		view.PricingLedgerEligible = pricingLedgerAccountSupported(row) && pricingLedgerDomainAllowed(m.cfg.UpstreamPricingLedgerDomains, row.Domain)
 		view.PricingLedgerCapability = pricingLedgerCapabilityLabel(row.Provider)
 		key := row.Domain + "\x00" + newAPIUpstreamAccountEpoch(row)
 		state, hasState := stateByAccount[key]
@@ -1793,6 +1814,19 @@ func refreshSub2API(ctx context.Context, client *http.Client, row ChannelUpstrea
 	return sub2APICredential{AccessToken: auth.AccessToken, RefreshToken: auth.RefreshToken, ExpiresAt: time.Now().Unix() + int64(expiresIn)}, nil
 }
 
+// importSub2APISession supports Sub2API deployments whose interactive login is
+// protected by Turnstile or another browser-only challenge. The administrator
+// completes that challenge on the upstream site and imports only its refresh
+// token; Monitor immediately rotates it through the upstream's official refresh
+// endpoint and never persists the supplied token verbatim.
+func importSub2APISession(ctx context.Context, client *http.Client, row ChannelUpstreamAccount, refreshToken string) (sub2APICredential, error) {
+	refreshToken = strings.TrimSpace(refreshToken)
+	if refreshToken == "" {
+		return sub2APICredential{}, fmt.Errorf("Sub2API Refresh Token 为空")
+	}
+	return refreshSub2API(ctx, client, row, sub2APICredential{RefreshToken: refreshToken})
+}
+
 func sub2APIProfile(ctx context.Context, client *http.Client, row ChannelUpstreamAccount, cred sub2APICredential) (upstreamBalanceResult, error) {
 	body, err := doUpstreamJSON(ctx, client, http.MethodGet, upstreamEndpoint(row.BaseURL, "/api/v1/user/profile"), map[string]string{
 		"Authorization": "Bearer " + cred.AccessToken,
@@ -1977,6 +2011,9 @@ func (m *Monitor) persistUpstreamAccountIdentityChange(ctx context.Context, row 
 			if err := tx.Where("domain = ?", row.Domain).Delete(&NewAPIUsageBackfillCheckpoint{}).Error; err != nil {
 				return err
 			}
+			if err := tx.Where("domain = ?", row.Domain).Delete(&NewAPIUsageBackfillSegment{}).Error; err != nil {
+				return err
+			}
 		}
 		return nil
 	})
@@ -2043,6 +2080,9 @@ func (m *Monitor) persistAICodeWithAccountChange(ctx context.Context, row *Chann
 				return err
 			}
 			if err := tx.Where("domain = ?", row.Domain).Delete(&NewAPIUsageBackfillCheckpoint{}).Error; err != nil {
+				return err
+			}
+			if err := tx.Where("domain = ?", row.Domain).Delete(&NewAPIUsageBackfillSegment{}).Error; err != nil {
 				return err
 			}
 		}
@@ -2131,6 +2171,7 @@ func validateChannelUpstreamInput(in *channelUpstreamSaveInput) error {
 	in.Email = strings.TrimSpace(in.Email)
 	in.AccessToken = strings.TrimSpace(in.AccessToken)
 	in.APIKey = strings.TrimSpace(in.APIKey)
+	in.RefreshToken = strings.TrimSpace(in.RefreshToken)
 	if in.Domain == "" || len(in.Domain) > 253 || normalizeChannelBaseDomain(in.Domain) != in.Domain {
 		return fmt.Errorf("主域名无效")
 	}
@@ -2152,6 +2193,12 @@ func validateChannelUpstreamInput(in *channelUpstreamSaveInput) error {
 		address, err := mail.ParseAddress(in.Email)
 		if err != nil || !strings.EqualFold(address.Address, in.Email) || len(in.Email) > 320 {
 			return fmt.Errorf("Sub2API 登录邮箱无效")
+		}
+		if in.Password != "" && in.RefreshToken != "" {
+			return fmt.Errorf("Sub2API 登录密码和 Refresh Token 只能填写一种")
+		}
+		if len(in.RefreshToken) > 16<<10 {
+			return fmt.Errorf("Sub2API Refresh Token 过长")
 		}
 	case upstreamProviderAICodeWith:
 		keys, err := normalizeAICodeWithAPIKeys(in.APIKey, in.APIKeys)
@@ -2248,7 +2295,7 @@ func (m *Monitor) saveChannelUpstreamHandler(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	requestSecrets := []string{in.AccessToken, in.APIKey, in.Password}
+	requestSecrets := []string{in.AccessToken, in.APIKey, in.Password, in.RefreshToken}
 	requestSecrets = append(requestSecrets, in.APIKeys...)
 	requestSecrets = append(requestSecrets, in.AddAPIKeys...)
 	for _, addition := range in.AddAPIKeySlots {
@@ -2307,7 +2354,7 @@ func (m *Monitor) saveChannelUpstreamHandler(c *gin.Context) {
 	var credential any
 	var existingAICodeWithCredential *aiCodeWithCredential
 	preserveSealedCredential := false
-	credentialUpdated := in.AccessToken != "" || len(in.APIKeys) > 0 || len(in.AddAPIKeys) > 0 || len(in.AddAPIKeySlots) > 0 || len(in.RemoveAPIKeyIDs) > 0 || in.Password != ""
+	credentialUpdated := in.AccessToken != "" || len(in.APIKeys) > 0 || len(in.AddAPIKeys) > 0 || len(in.AddAPIKeySlots) > 0 || len(in.RemoveAPIKeyIDs) > 0 || in.Password != "" || in.RefreshToken != ""
 	credentialMetadataChanged := len(in.RenameAPIKeySlots) > 0
 	sameIdentity := existingErr == nil && existing.Provider == in.Provider && existing.BaseURL == in.BaseURL
 	credentialSetChanged := false
@@ -2329,7 +2376,10 @@ func (m *Monitor) saveChannelUpstreamHandler(c *gin.Context) {
 	case upstreamProviderSub2API:
 		row.Account = strings.ToLower(in.Email)
 		sameIdentity = sameIdentity && strings.EqualFold(existing.Account, row.Account)
-		if in.Password != "" {
+		if in.RefreshToken != "" {
+			client := m.channelUpstreamHTTPClient()
+			credential, err = importSub2APISession(ctx, client, row, in.RefreshToken)
+		} else if in.Password != "" {
 			client := m.channelUpstreamHTTPClient()
 			credential, err = loginSub2API(ctx, client, row, in.Password)
 		} else if sameIdentity && !row.Enabled {
@@ -2338,7 +2388,7 @@ func (m *Monitor) saveChannelUpstreamHandler(c *gin.Context) {
 		} else if sameIdentity {
 			credential, err = m.credentialForAccount(existing)
 		} else {
-			err = fmt.Errorf("首次连接或变更 Sub2API 账户时必须填写登录密码")
+			err = fmt.Errorf("首次连接或变更 Sub2API 账户时必须填写登录密码或 Refresh Token")
 		}
 	case upstreamProviderAICodeWith:
 		additions := make([]aicodeWithKeyAdditionInput, 0, len(in.APIKeys)+len(in.AddAPIKeys)+len(in.AddAPIKeySlots))
@@ -2432,6 +2482,7 @@ func (m *Monitor) saveChannelUpstreamHandler(c *gin.Context) {
 	}
 	// 密码从这里起不再被引用；它从未进入持久化模型、日志或响应。
 	in.Password = ""
+	in.RefreshToken = ""
 	in.AccessToken = ""
 	in.APIKey = ""
 	in.APIKeys = nil

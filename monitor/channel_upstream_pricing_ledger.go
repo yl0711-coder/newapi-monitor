@@ -820,6 +820,21 @@ func pricingLedgerProviderSupported(provider string) bool {
 	}
 }
 
+// pricingLedgerAccountSupported applies provider capabilities to the concrete
+// account adapter. Some legacy Sub2API sites expose only daily aggregate stats;
+// those totals are useful for usage reporting but cannot produce request-level
+// pricing evidence, so they must not be advertised or scheduled as ledger
+// candidates.
+func pricingLedgerAccountSupported(account ChannelUpstreamAccount) bool {
+	if !pricingLedgerProviderSupported(account.Provider) {
+		return false
+	}
+	if account.Provider == upstreamProviderSub2API {
+		return account.UsageAdapter == upstreamUsageAdapterSub2Trend
+	}
+	return true
+}
+
 func pricingLedgerCapabilityLabel(provider string) string {
 	switch provider {
 	case upstreamProviderNewAPI:
@@ -1525,7 +1540,7 @@ func (m *Monitor) syncDueUpstreamPricing(ctx context.Context) {
 			continue
 		}
 		var account ChannelUpstreamAccount
-		if err := m.storeDB.WithContext(ctx).Where("domain = ? AND enabled = ? AND usage_sync_enabled = ?", domain, true, true).First(&account).Error; err != nil || !pricingLedgerProviderSupported(account.Provider) {
+		if err := m.storeDB.WithContext(ctx).Where("domain = ? AND enabled = ? AND usage_sync_enabled = ?", domain, true, true).First(&account).Error; err != nil || !pricingLedgerAccountSupported(account) {
 			continue
 		}
 		epoch := newAPIUpstreamAccountEpoch(account)

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"net/http"
 	"net/http/httptest"
@@ -1702,6 +1703,330 @@ func TestNewAPIHistoryBackfillPersistsPageCheckpointAcrossBudgetYield(t *testing
 	}
 	if hour.Requests != int64(len(rows)) || totalQueries.Load() != 66 {
 		t.Fatalf("published hour=%+v total queries=%d", hour, totalQueries.Load())
+	}
+}
+
+func TestNewAPIHistoryBackfillTimeoutFallsBackToDurableSegments(t *testing.T) {
+	from := time.Date(2026, 8, 12, 8, 0, 0, 0, cstLocation).Unix()
+	rows := usageFixtureRows(2400, from, 3600)
+	server, _ := newUpstreamUsageFixtureServer(t, rows, nil)
+	m := newChannelUpstreamTestMonitor(t)
+	row := ChannelUpstreamAccount{
+		Domain: server.Listener.Addr().String(), Provider: upstreamProviderNewAPI,
+		BaseURL: server.URL, UserID: 31, BalanceUnit: 500000,
+		UsageBackfillConsecutiveFails: 1,
+		UsageBackfillLastError:        `连接上游失败: Client.Timeout exceeded while awaiting headers`,
+	}
+	credential := newAPICredential{AccessToken: "usage-token"}
+
+	firstPacer := newUpstreamUsageRequestPacer(upstreamUsageHistoryMaxRequestsPerRun, 0)
+	_, progress, complete, err := m.syncNewAPIUsageBackfillWindow(context.Background(), row, credential, from, from+3600, firstPacer)
+	if err != nil || complete || !strings.Contains(progress, "慢查询降档") {
+		t.Fatalf("first segmented turn complete=%v progress=%q err=%v", complete, progress, err)
+	}
+	if firstPacer.calls != upstreamUsageHistoryMaxRequestsPerRun {
+		t.Fatalf("first segmented turn calls=%d, want %d", firstPacer.calls, upstreamUsageHistoryMaxRequestsPerRun)
+	}
+	var segments int64
+	if err := m.storeDB.Model(&NewAPIUsageBackfillSegment{}).Where("domain = ? AND hour_from = ? AND status = ?", row.Domain, from, newAPIBackfillSegmentComplete).Count(&segments).Error; err != nil {
+		t.Fatal(err)
+	}
+	if segments != 6 {
+		t.Fatalf("durable completed segments=%d, want 6", segments)
+	}
+	var publicRows int64
+	if err := m.storeDB.Model(&ChannelUpstreamUsageHour{}).Where("domain = ?", row.Domain).Count(&publicRows).Error; err != nil || publicRows != 0 {
+		t.Fatalf("partial segmented hour became public: rows=%d err=%v", publicRows, err)
+	}
+
+	secondPacer := newUpstreamUsageRequestPacer(upstreamUsageHistoryMaxRequestsPerRun, 0)
+	result, progress, complete, err := m.syncNewAPIUsageBackfillWindow(context.Background(), row, credential, from, from+3600, secondPacer)
+	if err != nil || !complete || progress != "" {
+		t.Fatalf("resumed segmented turn complete=%v progress=%q err=%v", complete, progress, err)
+	}
+	if len(result.Hours) != 1 || result.Hours[0].Requests != int64(len(rows)) || result.Hours[0].CostUSD != float64(len(rows)) {
+		t.Fatalf("segmented aggregate=%+v", result.Hours)
+	}
+	if err := m.persistNewAPIUsageBackfillWindow(context.Background(), row.Domain, from, from+3600, result.Hours, time.Now().Unix()); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.storeDB.Model(&NewAPIUsageBackfillSegment{}).Where("domain = ?", row.Domain).Count(&segments).Error; err != nil || segments != 0 {
+		t.Fatalf("completed segment state was not cleared: rows=%d err=%v", segments, err)
+	}
+	var checkpoints int64
+	if err := m.storeDB.Model(&NewAPIUsageBackfillCheckpoint{}).Where("domain = ?", row.Domain).Count(&checkpoints).Error; err != nil || checkpoints != 0 {
+		t.Fatalf("completed page checkpoint was not cleared: rows=%d err=%v", checkpoints, err)
+	}
+	var hour ChannelUpstreamUsageHour
+	if err := m.storeDB.First(&hour, "domain = ? AND hour_ts = ?", row.Domain, from).Error; err != nil {
+		t.Fatal(err)
+	}
+	if hour.Requests != int64(len(rows)) {
+		t.Fatalf("published segmented hour=%+v", hour)
+	}
+}
+
+func TestNewAPIHistoryBackfillPersistsSegmentModeAcrossTimeoutAnd429(t *testing.T) {
+	from := time.Date(2026, 8, 12, 8, 0, 0, 0, cstLocation).Unix()
+	var mode atomic.Int32
+	var fullHourCalls atomic.Int64
+	var childCalls atomic.Int64
+	transport := upstreamRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		start, _ := strconv.ParseInt(req.URL.Query().Get("start_timestamp"), 10, 64)
+		end, _ := strconv.ParseInt(req.URL.Query().Get("end_timestamp"), 10, 64)
+		if end-start+1 == 3600 {
+			fullHourCalls.Add(1)
+			return nil, context.DeadlineExceeded
+		}
+		childCalls.Add(1)
+		if mode.Load() == 1 {
+			header := make(http.Header)
+			header.Set("Retry-After", "120")
+			return &http.Response{
+				StatusCode: http.StatusTooManyRequests, Status: "429 Too Many Requests",
+				Header: header, Body: io.NopCloser(strings.NewReader(`{"message":"rate limited"}`)), Request: req,
+			}, nil
+		}
+		if mode.Load() == 2 {
+			return &http.Response{
+				StatusCode: http.StatusServiceUnavailable, Status: "503 Service Unavailable",
+				Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{"message":"temporarily unavailable"}`)), Request: req,
+			}, nil
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK, Status: "200 OK", Header: make(http.Header),
+			Body: io.NopCloser(strings.NewReader(`{"success":true,"data":{"total":0,"items":[]}}`)), Request: req,
+		}, nil
+	})
+	m := newChannelUpstreamTestMonitor(t)
+	m.upstreamClient = &http.Client{Transport: transport}
+	row := ChannelUpstreamAccount{
+		Domain: "slow.example", Provider: upstreamProviderNewAPI, BaseURL: "https://slow.example",
+		UserID: 31, BalanceUnit: 500000,
+	}
+	credential := newAPICredential{AccessToken: "usage-token"}
+
+	_, progress, complete, err := m.syncNewAPIUsageBackfillWindow(context.Background(), row, credential, from, from+3600, newUpstreamUsageRequestPacer(20, 0))
+	if err != nil || complete || !strings.Contains(progress, "已持久降档") || fullHourCalls.Load() != 1 {
+		t.Fatalf("timeout transition complete=%v progress=%q full_calls=%d err=%v", complete, progress, fullHourCalls.Load(), err)
+	}
+	var planned int64
+	if err := m.storeDB.Model(&NewAPIUsageBackfillSegment{}).Where("domain = ? AND hour_from = ?", row.Domain, from).Count(&planned).Error; err != nil || planned != 12 {
+		t.Fatalf("persisted segment plan=%d err=%v", planned, err)
+	}
+
+	mode.Store(1)
+	_, _, _, err = m.syncNewAPIUsageBackfillWindow(context.Background(), row, credential, from, from+3600, newUpstreamUsageRequestPacer(20, 0))
+	var statusErr *upstreamHTTPError
+	if !errors.As(err, &statusErr) || statusErr.Status != http.StatusTooManyRequests {
+		t.Fatalf("segmented 429 err=%v", err)
+	}
+	if err := m.storeDB.Model(&NewAPIUsageBackfillSegment{}).Where("domain = ? AND hour_from = ?", row.Domain, from).Count(&planned).Error; err != nil || planned != 12 {
+		t.Fatalf("429 lost segment plan: rows=%d err=%v", planned, err)
+	}
+
+	mode.Store(2)
+	if err := m.storeDB.Where("1 = 1").Delete(&UpstreamHostCircuit{}).Error; err != nil {
+		t.Fatal(err)
+	}
+	m2 := &Monitor{storeDB: m.storeDB, cfg: m.cfg, upstreamClient: &http.Client{Transport: transport}}
+	row.UsageBackfillConsecutiveFails = 1
+	row.UsageBackfillLastError = "HTTP 429"
+	_, _, _, err = m2.syncNewAPIUsageBackfillWindow(context.Background(), row, credential, from, from+3600, newUpstreamUsageRequestPacer(4, 0))
+	if !errors.As(err, &statusErr) || statusErr.Status != http.StatusServiceUnavailable {
+		t.Fatalf("segmented 503 err=%v", err)
+	}
+	if err := m.storeDB.Model(&NewAPIUsageBackfillSegment{}).Where("domain = ? AND hour_from = ?", row.Domain, from).Count(&planned).Error; err != nil || planned != 12 {
+		t.Fatalf("503 lost segment plan: rows=%d err=%v", planned, err)
+	}
+	if fullHourCalls.Load() != 1 {
+		t.Fatalf("restart after 429 retried parent query: full=%d", fullHourCalls.Load())
+	}
+
+	mode.Store(3)
+	if err := m.storeDB.Where("1 = 1").Delete(&UpstreamHostCircuit{}).Error; err != nil {
+		t.Fatal(err)
+	}
+	m3 := &Monitor{storeDB: m.storeDB, cfg: m.cfg, upstreamClient: &http.Client{Transport: transport}}
+	row.UsageBackfillConsecutiveFails = 2
+	row.UsageBackfillLastError = "HTTP 503"
+	_, progress, complete, err = m3.syncNewAPIUsageBackfillWindow(context.Background(), row, credential, from, from+3600, newUpstreamUsageRequestPacer(4, 0))
+	if err != nil || complete || progress == "" {
+		t.Fatalf("segmented resume complete=%v progress=%q err=%v", complete, progress, err)
+	}
+	if fullHourCalls.Load() != 1 || childCalls.Load() == 0 {
+		t.Fatalf("mode fell back to parent query: full=%d child=%d", fullHourCalls.Load(), childCalls.Load())
+	}
+}
+
+func TestNewAPIHistoryBackfillPublishRollsBackWhenSegmentCleanupFails(t *testing.T) {
+	m := newChannelUpstreamTestMonitor(t)
+	from := time.Date(2026, 8, 12, 8, 0, 0, 0, cstLocation).Unix()
+	domain := "publish-rollback.example"
+	checkpoint := NewAPIUsageBackfillCheckpoint{
+		Domain: domain, WindowFrom: from, WindowTo: from + 300,
+		NextPage: 2, Total: 1, SourceRows: 1, UpdatedAt: time.Now().Unix(),
+	}
+	if err := m.storeDB.Create(&checkpoint).Error; err != nil {
+		t.Fatal(err)
+	}
+	segment := NewAPIUsageBackfillSegment{
+		Domain: domain, HourFrom: from, SegmentFrom: from, SegmentTo: from + 300,
+		Status: newAPIBackfillSegmentComplete, Total: 1, SourceRows: 1, Requests: 1, UpdatedAt: time.Now().Unix(),
+	}
+	if err := m.storeDB.Create(&segment).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := m.storeDB.Exec(`CREATE TRIGGER fail_segment_cleanup BEFORE DELETE ON new_api_usage_backfill_segments BEGIN SELECT RAISE(ABORT, 'injected segment cleanup failure'); END`).Error; err != nil {
+		t.Fatal(err)
+	}
+	hours := []ChannelUpstreamUsageHour{{Domain: domain, HourTs: from, BucketSeconds: 3600, Requests: 1, Provider: upstreamProviderNewAPI}}
+	if err := m.persistNewAPIUsageBackfillWindow(context.Background(), domain, from, from+3600, hours, time.Now().Unix()); err == nil {
+		t.Fatal("segment cleanup failure did not abort publish transaction")
+	}
+	var publicRows, checkpointRows, segmentRows int64
+	if err := m.storeDB.Model(&ChannelUpstreamUsageHour{}).Where("domain = ?", domain).Count(&publicRows).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := m.storeDB.Model(&NewAPIUsageBackfillCheckpoint{}).Where("domain = ?", domain).Count(&checkpointRows).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := m.storeDB.Model(&NewAPIUsageBackfillSegment{}).Where("domain = ?", domain).Count(&segmentRows).Error; err != nil {
+		t.Fatal(err)
+	}
+	if publicRows != 0 || checkpointRows != 1 || segmentRows != 1 {
+		t.Fatalf("publish transaction was partially committed: public=%d checkpoints=%d segments=%d", publicRows, checkpointRows, segmentRows)
+	}
+}
+
+func TestNewAPIHistoryBackfillSegmentSplitStateMachine(t *testing.T) {
+	m := newChannelUpstreamTestMonitor(t)
+	from := time.Date(2026, 8, 12, 8, 0, 0, 0, cstLocation).Unix()
+	account := ChannelUpstreamAccount{Domain: "split.example", UsageBackfillCursor: from}
+	if err := m.storeDB.Create(&account).Error; err != nil {
+		t.Fatal(err)
+	}
+	parent := NewAPIUsageBackfillSegment{
+		Domain: account.Domain, HourFrom: from, SegmentFrom: from, SegmentTo: from + 300,
+		Status: newAPIBackfillSegmentPending, UpdatedAt: time.Now().Unix(),
+	}
+	if err := m.storeDB.Create(&parent).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := m.splitNewAPIUsageBackfillSegment(context.Background(), parent); err != nil {
+		t.Fatal(err)
+	}
+	var segments []NewAPIUsageBackfillSegment
+	if err := m.storeDB.Where("domain = ? AND hour_from = ?", account.Domain, from).Order("segment_from ASC").Find(&segments).Error; err != nil {
+		t.Fatal(err)
+	}
+	if len(segments) != 5 {
+		t.Fatalf("300s split rows=%d, want 5", len(segments))
+	}
+	for i, segment := range segments {
+		if segment.SegmentFrom != from+int64(i*60) || segment.SegmentTo != from+int64((i+1)*60) || segment.Status != newAPIBackfillSegmentPending {
+			t.Fatalf("invalid 60s child[%d]=%+v", i, segment)
+		}
+	}
+	if err := m.splitNewAPIUsageBackfillSegment(context.Background(), segments[0]); err != nil {
+		t.Fatal(err)
+	}
+	segments = nil
+	if err := m.storeDB.Where("domain = ? AND hour_from = ?", account.Domain, from).Order("segment_from ASC").Find(&segments).Error; err != nil {
+		t.Fatal(err)
+	}
+	if len(segments) != 10 || segments[0].SegmentFrom != from || segments[5].SegmentTo != from+60 || segments[6].SegmentFrom != from+60 {
+		t.Fatalf("60s split did not preserve continuous cover: %+v", segments)
+	}
+	if err := validateNewAPIUsageBackfillSegments(append(segments, NewAPIUsageBackfillSegment{
+		Domain: account.Domain, HourFrom: from, SegmentFrom: from + 300, SegmentTo: from + 3600,
+		Status: newAPIBackfillSegmentPending,
+	}), from, from+3600, false); err != nil {
+		t.Fatalf("split coverage invalid: %v", err)
+	}
+	if err := m.splitNewAPIUsageBackfillSegment(context.Background(), segments[0]); err == nil || !strings.Contains(err.Error(), "最小子窗口") {
+		t.Fatalf("10s segment must fail closed, err=%v", err)
+	}
+	var remaining int64
+	if err := m.storeDB.Model(&NewAPIUsageBackfillSegment{}).Where("domain = ? AND hour_from = ? AND segment_from = ?", account.Domain, from, from).Count(&remaining).Error; err != nil || remaining != 1 {
+		t.Fatalf("minimum segment was removed: rows=%d err=%v", remaining, err)
+	}
+	var publicRows int64
+	if err := m.storeDB.Model(&ChannelUpstreamUsageHour{}).Where("domain = ?", account.Domain).Count(&publicRows).Error; err != nil || publicRows != 0 {
+		t.Fatalf("split state leaked to public facts: rows=%d err=%v", publicRows, err)
+	}
+	var reloaded ChannelUpstreamAccount
+	if err := m.storeDB.First(&reloaded, "domain = ?", account.Domain).Error; err != nil || reloaded.UsageBackfillCursor != from {
+		t.Fatalf("split moved account cursor: row=%+v err=%v", reloaded, err)
+	}
+}
+
+func TestNewAPIHistoryOperationDeadlineYieldsWithoutSplitting(t *testing.T) {
+	m := newChannelUpstreamTestMonitor(t)
+	from := time.Date(2026, 8, 12, 8, 0, 0, 0, cstLocation).Unix()
+	row := ChannelUpstreamAccount{
+		Domain: "budget.example", Provider: upstreamProviderNewAPI,
+		BaseURL: "https://budget.example", UserID: 31, BalanceUnit: 500000,
+	}
+	if err := m.ensureNewAPIUsageBackfillSegmentPlan(context.Background(), row.Domain, from, from+3600); err != nil {
+		t.Fatal(err)
+	}
+	m.upstreamClient = &http.Client{Transport: upstreamRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		<-req.Context().Done()
+		return nil, req.Context().Err()
+	})}
+	deadlineCtx, deadlineCancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer deadlineCancel()
+	_, progress, complete, err := m.syncNewAPIUsageBackfillWindowSegmented(deadlineCtx, row, newAPICredential{AccessToken: "usage-token"}, from, from+3600, newUpstreamUsageRequestPacer(20, 0))
+	if err != nil || complete || !strings.Contains(progress, "时间预算已用完") {
+		t.Fatalf("operation deadline complete=%v progress=%q err=%v", complete, progress, err)
+	}
+	var segments []NewAPIUsageBackfillSegment
+	if err := m.storeDB.Where("domain = ? AND hour_from = ?", row.Domain, from).Order("segment_from ASC").Find(&segments).Error; err != nil {
+		t.Fatal(err)
+	}
+	if len(segments) != 12 {
+		t.Fatalf("operation stop changed topology: rows=%d", len(segments))
+	}
+	for _, segment := range segments {
+		if segment.SegmentTo-segment.SegmentFrom != 300 {
+			t.Fatalf("operation stop split a healthy child: %+v", segment)
+		}
+	}
+}
+
+func TestNewAPIHistoryWorkerPersistsBudgetYieldWithExpiredReadContext(t *testing.T) {
+	m := newChannelUpstreamTestMonitor(t)
+	now := time.Now().Unix()
+	from := cstDayStart(now) - 3600
+	row := ChannelUpstreamAccount{
+		Domain: "budget-worker.example", Provider: upstreamProviderNewAPI, BaseURL: "https://budget-worker.example",
+		Account: "31", UserID: 31, Enabled: true, UsageSyncEnabled: true, UsageStatus: upstreamStatusOK,
+		UsageLastSuccessAt: now - 60, UsageDataUntil: now - 60, UsageNextSyncAt: now + 3600,
+		UsageBackfillCursor: from, UsageBackfillNextSyncAt: 0,
+	}
+	if err := m.persistSyncedUpstreamAccount(context.Background(), &row, newAPICredential{AccessToken: "usage-token"}); err != nil {
+		t.Fatal(err)
+	}
+	m.upstreamClient = &http.Client{Transport: upstreamRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		<-req.Context().Done()
+		return nil, req.Context().Err()
+	})}
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	if _, err := m.syncStoredUpstreamUsageLaneBackground(ctx, row.Domain, upstreamUsageLaneHistory); err != nil {
+		t.Fatalf("budget yield was returned as failure: %v", err)
+	}
+	var stored ChannelUpstreamAccount
+	if err := m.storeDB.First(&stored, "domain = ?", row.Domain).Error; err != nil {
+		t.Fatal(err)
+	}
+	if stored.UsageBackfillCursor != from || stored.UsageBackfillNextSyncAt <= now || !strings.Contains(stored.UsageBackfillProgress, "时间预算已用完") {
+		t.Fatalf("budget yield was not durably scheduled: %+v", stored)
+	}
+	var segments int64
+	if err := m.storeDB.Model(&NewAPIUsageBackfillSegment{}).Where("domain = ?", row.Domain).Count(&segments).Error; err != nil || segments != 0 {
+		t.Fatalf("operation deadline incorrectly changed topology: rows=%d err=%v", segments, err)
 	}
 }
 
