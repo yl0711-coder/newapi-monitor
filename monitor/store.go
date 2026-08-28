@@ -974,13 +974,13 @@ func (m *Monitor) openUsageFactsStore(path string, prechecked bool) error {
 		// commits ordered while WAL still lets backup/read-only connections take
 		// consistent snapshots. The facts DB is deliberately separate and small,
 		// so this does not serialize Monitor's main sampling store.
-		if sqlDB, dbErr := db.DB(); dbErr != nil {
+		sqlDB, dbErr := db.DB()
+		if dbErr != nil {
 			m.usageFactsIntegrityOK.Store(false)
 			return fmt.Errorf("配置用量事实库连接池失败: %w", dbErr)
-		} else {
-			sqlDB.SetMaxOpenConns(1)
-			sqlDB.SetMaxIdleConns(1)
 		}
+		sqlDB.SetMaxOpenConns(1)
+		sqlDB.SetMaxIdleConns(1)
 		if !prechecked {
 			if err := checkGORMStoreIntegrity(db); err != nil {
 				m.usageFactsIntegrityOK.Store(false)
