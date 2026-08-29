@@ -1084,11 +1084,40 @@ func buildStabilityFilters(rows []stabilityDimRow) StabilityFilters {
 	return out
 }
 
+func stabilityScopeWithFilters(c *gin.Context, scope stabilityScope) stabilityScope {
+	scope.Group = clip(strings.TrimSpace(c.Query("group")), 64)
+	scope.Model = clip(strings.TrimSpace(c.Query("model")), 128)
+	scope.Vendor = clip(strings.TrimSpace(c.Query("vendor")), 128)
+	scope.ChannelID, _ = strconv.Atoi(c.Query("channel"))
+	if scope.ChannelID < 0 {
+		scope.ChannelID = 0
+	}
+	return scope
+}
+
 func stabilityRange(c *gin.Context, now time.Time, maxDays int) (stabilityScope, error) {
 	if maxDays <= 0 {
 		maxDays = 90
 	}
 	now = now.In(cstLocation)
+	rawHours := strings.TrimSpace(c.Query("hours"))
+	if rawHours != "" {
+		if strings.TrimSpace(c.Query("from")) != "" || strings.TrimSpace(c.Query("to")) != "" || strings.TrimSpace(c.Query("days")) != "" {
+			return stabilityScope{}, fmt.Errorf("hours 不能与 days、from 或 to 同时提供")
+		}
+		hours, err := strconv.Atoi(rawHours)
+		if err != nil || hours < 1 {
+			return stabilityScope{}, fmt.Errorf("hours 必须为正整数")
+		}
+		if hours > maxDays*24 {
+			return stabilityScope{}, fmt.Errorf("查询范围不能超过 %d 天", maxDays)
+		}
+		end := time.Date(now.Year(), now.Month(), now.Day(), now.Hour(), 0, 0, 0, cstLocation)
+		start := end.Add(-time.Duration(hours) * time.Hour)
+		return stabilityScopeWithFilters(c, stabilityScope{
+			FromTs: start.Unix(), ToTs: end.Unix(), RangeHours: hours,
+		}), nil
+	}
 	days, _ := strconv.Atoi(c.DefaultQuery("days", "7"))
 	if days < 1 {
 		days = 7
@@ -1123,11 +1152,7 @@ func stabilityRange(c *gin.Context, now time.Time, maxDays int) (stabilityScope,
 		}
 		start, end = from, to
 	}
-	channelID, _ := strconv.Atoi(c.Query("channel"))
-	if channelID < 0 {
-		channelID = 0
-	}
-	return stabilityScope{FromTs: start.Unix(), ToTs: end.Unix(), Group: clip(strings.TrimSpace(c.Query("group")), 64), ChannelID: channelID, Model: clip(strings.TrimSpace(c.Query("model")), 128), Vendor: clip(strings.TrimSpace(c.Query("vendor")), 128)}, nil
+	return stabilityScopeWithFilters(c, stabilityScope{FromTs: start.Unix(), ToTs: end.Unix()}), nil
 }
 
 func (m *Monitor) serveStabilityReport(c *gin.Context) {

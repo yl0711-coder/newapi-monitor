@@ -1327,6 +1327,7 @@ func TestWithdrawnClientEvidenceFeatureIsNotExposed(t *testing.T) {
 
 func TestStabilityPageIncludesBusinessDateShortcuts(t *testing.T) {
 	for _, shortcut := range []string{
+		`data-stability-hours="24">近 24 小时`,
 		`data-stability-preset="today">今天`,
 		`data-stability-preset="yesterday">昨天`,
 		`data-stability-preset="week">本周`,
@@ -1336,13 +1337,16 @@ func TestStabilityPageIncludesBusinessDateShortcuts(t *testing.T) {
 		}
 	}
 	js := string(stabilityJS)
-	for _, marker := range []string{`data-stability-preset`, `stPresetRange`, `timeZone:'Asia/Shanghai'`} {
+	for _, marker := range []string{`data-stability-hours`, `q.set('hours',String(st.hours))`, `data-stability-preset`, `stPresetRange`, `timeZone:'Asia/Shanghai'`, `hours:0,days:7`} {
 		if !strings.Contains(js, marker) {
 			t.Fatalf("稳定性报表快捷日期交互缺少 %q", marker)
 		}
 	}
 	if strings.Contains(portalHTML, "data-stability-preset") {
 		t.Fatal("Usage Portal 不应接入 Monitor 稳定性报表日期快捷项")
+	}
+	if !strings.Contains(pageHTML, `class="active" data-stability-days="7">近 7 天`) {
+		t.Fatal("稳定性报表默认时间窗口必须是近 7 天")
 	}
 }
 
@@ -1458,6 +1462,38 @@ func TestStabilityRangeUsesCSTDateBoundariesAndCapsRange(t *testing.T) {
 	c.Request = httptest.NewRequest("GET", "/stability/report?from=2026-01-01&to=2026-08-05", nil)
 	if _, err = stabilityRange(c, now, 90); err == nil {
 		t.Fatal("expected >90 day error")
+	}
+}
+
+func TestStabilityRangeUsesLast24CompletedHours(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	now := time.Date(2026, 8, 12, 16, 37, 45, 0, cstLocation)
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest("GET", "/stability/report?hours=24&group=codex-1.2x&channel=59", nil)
+
+	scope, err := stabilityRange(c, now, 90)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantTo := time.Date(2026, 8, 12, 16, 0, 0, 0, cstLocation)
+	wantFrom := wantTo.Add(-24 * time.Hour)
+	if scope.FromTs != wantFrom.Unix() || scope.ToTs != wantTo.Unix() || scope.RangeHours != 24 || scope.Group != "codex-1.2x" || scope.ChannelID != 59 {
+		t.Fatalf("range=%+v, want [%v,%v] with filters", scope, wantFrom, wantTo)
+	}
+
+	for _, rawURL := range []string{
+		"/stability/report?hours=24&days=7",
+		"/stability/report?hours=24&from=2026-08-11&to=2026-08-12",
+		"/stability/report?hours=0",
+		"/stability/report?hours=2161",
+	} {
+		w = httptest.NewRecorder()
+		c, _ = gin.CreateTestContext(w)
+		c.Request = httptest.NewRequest("GET", rawURL, nil)
+		if _, err = stabilityRange(c, now, 90); err == nil {
+			t.Fatalf("%s should be rejected", rawURL)
+		}
 	}
 }
 

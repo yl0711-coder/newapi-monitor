@@ -535,6 +535,7 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
     <div class="stability-toolbar">
       <div><h2>稳定性总览</h2><p>基于中转站历史日志还原请求稳定性；该口径不等同于用户侧最终感知。</p></div>
       <div class="stability-range">
+        <button type="button" data-stability-hours="24">近 24 小时</button>
         <button type="button" data-stability-preset="today">今天</button>
         <button type="button" data-stability-preset="yesterday">昨天</button>
         <button type="button" data-stability-preset="week">本周</button>
@@ -598,11 +599,11 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
     </div>
     <div class="cm-toolbar-actions"><button type="button" class="cm-site-finance-open" id="cmSiteFinanceOpen">网站计价基准</button></div>
     <div class="cm-range">
-      <button type="button" data-cm-hours="24">近 24 小时</button>
+      <button type="button" class="active" data-cm-hours="24">近 24 小时</button>
       <button type="button" data-cm-preset="today">今天</button>
       <button type="button" data-cm-preset="yesterday">昨天</button>
       <button type="button" data-cm-preset="week">本周</button>
-      <button type="button" class="active" data-cm-days="7">近 7 天</button>
+      <button type="button" data-cm-days="7">近 7 天</button>
       <button type="button" data-cm-days="15">近 15 天</button>
       <button type="button" data-cm-days="30">近 30 天</button>
       <button type="button" data-cm-days="90">近 90 天</button>

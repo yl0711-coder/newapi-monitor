@@ -2,7 +2,7 @@
 'use strict';
 
 const cm={
-  inited:false,loaded:false,hours:0,days:7,custom:null,preset:'',report:null,abort:null,sort:'cost',
+  inited:false,loaded:false,hours:24,days:7,custom:null,preset:'',report:null,abort:null,sort:'cost',
   filters:{search:'',domain:'',vendor:'',group:'',status:''},
   expandedDomains:new Set(),expandedVendors:new Set(),collapsedGroups:new Set(),
   financeMode:'',financeDomain:null,financeGroups:[],financeChannels:[],financeChannel:null,upstreamDomain:null,upstreamConfig:null,

@@ -31,6 +31,12 @@ func TestChannelManagementPageIncludesBusinessDateShortcuts(t *testing.T) {
 			t.Fatalf("渠道管理近 24 小时交互缺少 %q", marker)
 		}
 	}
+	if !strings.Contains(pageHTML, `class="active" data-cm-hours="24">近 24 小时`) || !strings.Contains(string(channelManagementJS), `hours:24,days:7`) {
+		t.Fatal("渠道管理默认时间窗口必须是近 24 小时")
+	}
+	if strings.Contains(pageHTML, `class="active" data-cm-days="7">近 7 天`) {
+		t.Fatal("渠道管理默认近 24 小时时不应同时激活近 7 天")
+	}
 }
 
 func TestChannelManagementConfiguredGroupWithoutUsageStillIncludesFinance(t *testing.T) {
