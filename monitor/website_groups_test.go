@@ -1,10 +1,14 @@
 package monitor
 
 import (
+	"context"
+	"database/sql"
 	"encoding/json"
 	"math"
 	"reflect"
 	"testing"
+
+	_ "github.com/glebarez/go-sqlite"
 )
 
 func TestCollectWebsiteGroupSourcesUsesUserVisibleAndSpecialGroups(t *testing.T) {
@@ -15,16 +19,17 @@ func TestCollectWebsiteGroupSourcesUsesUserVisibleAndSpecialGroups(t *testing.T)
 			"default": {"-:b": "remove", "special": "", "+:special2": "description", "zero": "", "missing": ""},
 			"vip":     {"negative": "", "-:a": "remove", "append_1": "legacy"},
 		},
+		[]string{" hidden ", "zero", "effective-missing"},
 	)
 	got := make([]string, 0, len(sources))
 	for _, source := range sources {
 		got = append(got, source.Name)
 	}
-	if want := []string{"a", "b", "legacy", "special", "special2"}; !reflect.DeepEqual(got, want) {
+	if want := []string{"a", "b", "hidden", "legacy", "special", "special2"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("groups = %v, want %v", got, want)
 	}
-	if skipped != 3 {
-		t.Fatalf("skipped = %d, want 3", skipped)
+	if skipped != 4 {
+		t.Fatalf("skipped = %d, want 4", skipped)
 	}
 }
 
@@ -35,6 +40,7 @@ func TestCollectWebsiteGroupSourcesIncludesProductionSpecialSyntax(t *testing.T)
 		map[string]map[string]string{
 			"shangtang": {"codex-0.7x": "special user group", "-:codex-1.4x": "remove"},
 		},
+		nil,
 	)
 	got := make([]string, 0, len(sources))
 	for _, source := range sources {
@@ -45,6 +51,42 @@ func TestCollectWebsiteGroupSourcesIncludesProductionSpecialSyntax(t *testing.T)
 	}
 	if skipped != 0 {
 		t.Fatalf("skipped = %d, want 0", skipped)
+	}
+}
+
+func TestFetchEffectiveWebsiteGroupsUsesOnlyActiveUsersAndTokens(t *testing.T) {
+	db, err := sql.Open("sqlite", t.TempDir()+"/groups.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	for _, statement := range []string{
+		"CREATE TABLE users (id INTEGER PRIMARY KEY, status INTEGER, deleted_at TIMESTAMP, `group` TEXT)",
+		"CREATE TABLE tokens (id INTEGER PRIMARY KEY, user_id INTEGER, status INTEGER, deleted_at TIMESTAMP, `group` TEXT)",
+		`INSERT INTO users(id,status,deleted_at,"group") VALUES
+            (1,1,NULL,'codex 订阅'),
+            (2,2,NULL,'disabled-user'),
+            (3,1,'2026-01-01','deleted-user'),
+            (4,1,NULL,' active-default ')`,
+		`INSERT INTO tokens(id,user_id,status,deleted_at,"group") VALUES
+            (10,1,1,NULL,''),
+            (11,1,1,NULL,'explicit-token'),
+            (12,1,2,NULL,'disabled-token'),
+            (13,1,1,'2026-01-01','deleted-token'),
+            (14,2,1,NULL,'inactive-owner-token'),
+            (15,4,1,NULL,' explicit-token ')`,
+	} {
+		if _, err := db.Exec(statement); err != nil {
+			t.Fatalf("schema/fixture: %v", err)
+		}
+	}
+	m := &Monitor{prodDB: db}
+	groups, err := m.fetchEffectiveWebsiteGroups(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"active-default", "codex 订阅", "explicit-token"}; !reflect.DeepEqual(groups, want) {
+		t.Fatalf("effective groups = %v, want %v", groups, want)
 	}
 }
 

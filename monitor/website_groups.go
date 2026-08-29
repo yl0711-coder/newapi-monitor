@@ -56,15 +56,16 @@ type websiteGroupSource struct {
 	Multiplier float64
 }
 
-// collectWebsiteGroupSources 合并两个当前权威来源：
+// collectWebsiteGroupSources 合并三类当前权威来源：
 //   - /api/pricing 的普通用户可选分组；
 //   - options 中按用户分组追加的“特殊可用分组”；
+//   - 当前有效用户的默认分组和有效令牌显式指定的分组。
 //
 // 所有候选名称都必须在 GroupRatio 中有精确、合法的倍率才能进入计价目录。
 // 启用渠道、历史日志或测试流量不能自行扩展网站计价分组；隐藏分组只有
-// 明确出现在特殊可用配置中，才属于用户实际可使用的当前分组。
-func collectWebsiteGroupSources(usable []string, ratios map[string]float64, special map[string]map[string]string) ([]websiteGroupSource, int) {
-	names := make(map[string]struct{}, len(usable))
+// 明确出现在特殊可用配置或当前有效用户/令牌中，才属于用户实际可使用的分组。
+func collectWebsiteGroupSources(usable []string, ratios map[string]float64, special map[string]map[string]string, effective []string) ([]websiteGroupSource, int) {
+	names := make(map[string]struct{}, len(usable)+len(effective))
 	for _, name := range usable {
 		name = strings.TrimSpace(name)
 		if name != "" {
@@ -80,6 +81,12 @@ func collectWebsiteGroupSources(usable []string, ratios map[string]float64, spec
 			names[name] = struct{}{}
 		}
 	}
+	for _, name := range effective {
+		name = strings.TrimSpace(name)
+		if name != "" {
+			names[name] = struct{}{}
+		}
+	}
 	out := make([]websiteGroupSource, 0, len(names))
 	skipped := 0
 	for name := range names {
@@ -92,6 +99,44 @@ func collectWebsiteGroupSources(usable []string, ratios map[string]float64, spec
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return out, skipped
+}
+
+// fetchEffectiveWebsiteGroups 只在管理员手动点击“一键同步”时执行。
+// 令牌未显式配置分组时，NewAPI 会跟随 users.group；因此用户默认
+// 分组本身就是可路由的当前分组。这里只返回去重名称，不读用户或令牌内容。
+func (m *Monitor) fetchEffectiveWebsiteGroups(ctx context.Context) ([]string, error) {
+	rows, err := m.prodDB.QueryContext(ctx, `
+SELECT grp FROM (
+    SELECT DISTINCT TRIM(COALESCE(u.`+"`group`"+`, '')) AS grp
+      FROM users u
+     WHERE u.status = 1 AND u.deleted_at IS NULL
+    UNION
+    SELECT DISTINCT TRIM(COALESCE(t.`+"`group`"+`, '')) AS grp
+      FROM tokens t
+      JOIN users u ON u.id = t.user_id
+     WHERE t.status = 1 AND t.deleted_at IS NULL
+       AND u.status = 1 AND u.deleted_at IS NULL
+) effective_groups
+WHERE grp <> ''
+ORDER BY grp`)
+	if err != nil {
+		return nil, fmt.Errorf("读取 NewAPI 用户/令牌实际分组失败: %w", err)
+	}
+	defer rows.Close()
+	groups := make([]string, 0)
+	for rows.Next() {
+		var group string
+		if err := rows.Scan(&group); err != nil {
+			return nil, fmt.Errorf("读取 NewAPI 用户/令牌实际分组失败: %w", err)
+		}
+		if group = strings.TrimSpace(group); group != "" {
+			groups = append(groups, group)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("读取 NewAPI 用户/令牌实际分组失败: %w", err)
+	}
+	return groups, nil
 }
 
 // normalizeSpecialWebsiteGroupName handles both the current NewAPI syntax and
@@ -240,7 +285,11 @@ func (m *Monitor) fetchWebsiteGroupSources(ctx context.Context) ([]websiteGroupS
 	if err != nil {
 		return nil, 0, err
 	}
-	sources, skipped := collectWebsiteGroupSources(usable, ratios, special)
+	effective, err := m.fetchEffectiveWebsiteGroups(ctx)
+	if err != nil {
+		return nil, 0, err
+	}
+	sources, skipped := collectWebsiteGroupSources(usable, ratios, special, effective)
 	if len(sources) == 0 {
 		return nil, skipped, errors.New("NewAPI 没有返回可用于计价的服务分组")
 	}
@@ -407,7 +456,7 @@ func (m *Monitor) syncWebsiteGroupCatalogHandler(c *gin.Context) {
 	})
 	if err != nil {
 		if errors.Is(err, errChannelFinanceConfirmationRequired) {
-			c.JSON(http.StatusConflict, gin.H{"error": "确认后将以 NewAPI 当前用户可用分组和倍率更新网站计价基准，并为受影响主域名追加版本", "confirmation_required": true, "current_global_revision": currentRevision, "affected_domains": affectedDomains, "group_count": len(sources)})
+			c.JSON(http.StatusConflict, gin.H{"error": "确认后将以 NewAPI 当前可选、特殊可用及用户/令牌实际分组和倍率更新网站计价基准，并为受影响主域名追加版本", "confirmation_required": true, "current_global_revision": currentRevision, "affected_domains": affectedDomains, "group_count": len(sources)})
 			return
 		}
 		if errors.Is(err, errChannelFinanceGlobalConflict) {

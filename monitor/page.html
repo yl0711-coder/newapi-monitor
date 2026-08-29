@@ -662,7 +662,7 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
         <label><span>上游充值到账</span><input id="cmFinanceUpCredit" type="number" min="0.000001" step="0.0001" inputmode="decimal"><small>按实际到账额度填写</small></label>
       </section>
       <section class="cm-finance-groups" id="cmFinanceGlobalGroups" hidden>
-        <div class="cm-finance-group-title"><div><h3>网站分组倍率</h3><p>仅列出 NewAPI 分组管理中用户可选或特殊可用的分组；日志里出现过但用户不可用的分组不会进入这里。</p><small id="cmFinanceGroupSource">尚未同步中转站分组</small></div><div class="cm-finance-group-actions"><span id="cmFinanceConfiguredCount"></span><button type="button" id="cmFinanceSyncGroups">一键同步 NewAPI 分组</button></div></div>
+        <div class="cm-finance-group-title"><div><h3>网站分组倍率</h3><p>列出 NewAPI 中用户可选、特殊可用或当前用户/令牌实际使用的分组；仅在历史日志出现过的分组不会进入这里。</p><small id="cmFinanceGroupSource">尚未同步中转站分组</small></div><div class="cm-finance-group-actions"><span id="cmFinanceConfiguredCount"></span><button type="button" id="cmFinanceSyncGroups">一键同步 NewAPI 分组</button></div></div>
         <div class="cm-finance-group-head"><span>服务分组</span><span>NewAPI 当前倍率</span><span>网站分组倍率</span></div>
         <div id="cmFinanceGroupRows"></div>
       </section>

@@ -331,7 +331,12 @@ func TestAICodeWithSaveValidationOnlyChecksChangedKeysAndOneBaseline(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	if count != 2 || len(validationKeys) != 2 || validationKeys[1] != "sk-acw-new-60" {
+	keySet := make(map[string]struct{}, len(validationKeys))
+	for _, key := range validationKeys {
+		keySet[key] = struct{}{}
+	}
+	_, hasNewKey := keySet["sk-acw-new-60"]
+	if count != 2 || len(validationKeys) != 2 || !hasNewKey {
 		t.Fatalf("validation count=%d keys=%v, want one baseline plus the new key", count, validationKeys)
 	}
 	if _, count, err = aicodeWithSaveValidationCredential(&existing, existing); err != nil || count != 0 {
