@@ -32,6 +32,21 @@ func evidenceConfig(dir string) config {
 	}
 }
 
+func TestEvidenceResponseReasonOnlyAllowsFixedProtocolErrors(t *testing.T) {
+	if got := evidenceResponseReason([]byte(`{"error":"invalid evidence envelope"}`)); got != "invalid evidence envelope" {
+		t.Fatalf("known protocol error was not retained: %q", got)
+	}
+	for _, body := range []string{
+		`{"error":"request id abc-secret"}`,
+		`{"error":"invalid evidence envelope","detail":"abc-secret"}`,
+		`not-json`,
+	} {
+		if got := evidenceResponseReason([]byte(body)); got != "" {
+			t.Fatalf("arbitrary response text must not reach logs: body=%q got=%q", body, got)
+		}
+	}
+}
+
 func schema2Line(ts int64, status, upstreamStatus, completion, nginxID, oneAPIID string) string {
 	return fmt.Sprintf(`{"log_schema":2,"msec":"%d.250","request_method":"POST","uri":"/v1/responses","status":"%s","request_time":"0.350","upstream_status":"%s","upstream_response_time":"0.300","upstream_connect_time":"0.025","upstream_header_time":"0.125","bytes_sent":"1024","request_id":"legacy-id","nginx_request_id":"%s","oneapi_request_id":"%s","request_completion":"%s"}`,
 		ts, status, upstreamStatus, nginxID, oneAPIID, completion)

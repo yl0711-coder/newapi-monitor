@@ -177,6 +177,41 @@ type evidenceAck struct {
 	Rejected      int    `json:"rejected"`
 }
 
+type evidenceErrorResponse struct {
+	Error string `json:"error"`
+}
+
+// evidenceResponseReason only exposes Monitor-owned, fixed protocol errors.
+// Never echo an arbitrary response body here: an intermediary or a future
+// upstream could otherwise make collector logs contain request-derived data.
+func evidenceResponseReason(data []byte) string {
+	var response evidenceErrorResponse
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if decoder.Decode(&response) != nil {
+		return ""
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		return ""
+	}
+	switch response.Error {
+	case "nginx evidence disabled",
+		"evidence store capacity unavailable",
+		"evidence store size limit reached",
+		"invalid evidence payload",
+		"invalid evidence envelope",
+		"payload hash mismatch",
+		"evidence source range mismatch",
+		"batch id conflict",
+		"source cursor discontinuity",
+		"evidence store unavailable":
+		return response.Error
+	default:
+		return ""
+	}
+}
+
 func validEvidenceKeyID(value string) bool {
 	if len(value) < 1 || len(value) > 32 {
 		return false
@@ -756,6 +791,9 @@ func postEvidence(ctx context.Context, c config, payload evidenceBatch) (evidenc
 		return evidenceAck{}, resp.StatusCode, readErr
 	}
 	if resp.StatusCode != http.StatusOK {
+		if reason := evidenceResponseReason(data); reason != "" {
+			return evidenceAck{}, resp.StatusCode, fmt.Errorf("monitor evidence returned HTTP %d: %s", resp.StatusCode, reason)
+		}
 		return evidenceAck{}, resp.StatusCode, fmt.Errorf("monitor evidence returned HTTP %d", resp.StatusCode)
 	}
 	var ack evidenceAck
