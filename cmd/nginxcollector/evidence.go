@@ -47,13 +47,13 @@ type evidenceSourceRange struct {
 type evidenceTelemetry struct {
 	OutboxBytes           int64 `json:"outbox_bytes"`
 	OutboxBatches         int64 `json:"outbox_batches"`
-	RejectedBytes         int64 `json:"rejected_bytes"`
-	RejectedBatches       int64 `json:"rejected_batches"`
 	DroppedEvents         int64 `json:"dropped_events"`
-	UnknownDroppedBatches int64 `json:"unknown_dropped_batches"`
 	GapCount              int64 `json:"gap_count"`
 	LastGapFromMS         int64 `json:"last_gap_from_ms"`
 	LastGapToMS           int64 `json:"last_gap_to_ms"`
+	RejectedBytes         int64 `json:"rejected_bytes"`
+	RejectedBatches       int64 `json:"rejected_batches"`
+	UnknownDroppedBatches int64 `json:"unknown_dropped_batches"`
 }
 
 type evidenceEvent struct {

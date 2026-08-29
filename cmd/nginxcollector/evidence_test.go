@@ -47,6 +47,22 @@ func TestEvidenceResponseReasonOnlyAllowsFixedProtocolErrors(t *testing.T) {
 	}
 }
 
+func TestEvidenceTelemetryWireOrderMatchesMonitorHashProtocol(t *testing.T) {
+	payload := evidenceBatch{
+		SchemaVersion: 1, Node: "slave", BatchID: "wire_order_abcdefgh", LogSchema: 2, HMACKeyID: "key-1",
+		Source: evidenceSourceRange{Kind: "access", FileID: "42", StartOffset: 10, EndOffset: 10},
+		Events: []evidenceEvent{},
+	}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const monitorOrder = `"telemetry":{"outbox_bytes":0,"outbox_batches":0,"dropped_events":0,"gap_count":0,"last_gap_from_ms":0,"last_gap_to_ms":0,"rejected_bytes":0,"rejected_batches":0,"unknown_dropped_batches":0}`
+	if !strings.Contains(string(encoded), monitorOrder) {
+		t.Fatalf("collector telemetry order no longer matches Monitor hash protocol: %s", encoded)
+	}
+}
+
 func schema2Line(ts int64, status, upstreamStatus, completion, nginxID, oneAPIID string) string {
 	return fmt.Sprintf(`{"log_schema":2,"msec":"%d.250","request_method":"POST","uri":"/v1/responses","status":"%s","request_time":"0.350","upstream_status":"%s","upstream_response_time":"0.300","upstream_connect_time":"0.025","upstream_header_time":"0.125","bytes_sent":"1024","request_id":"legacy-id","nginx_request_id":"%s","oneapi_request_id":"%s","request_completion":"%s"}`,
 		ts, status, upstreamStatus, nginxID, oneAPIID, completion)
