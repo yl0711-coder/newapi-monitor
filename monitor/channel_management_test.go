@@ -149,6 +149,28 @@ func TestChannelManagementUpstreamSpendMetricKeepsAmountReadable(t *testing.T) {
 	}
 }
 
+func TestChannelManagementShowsRawAndRechargeAdjustedUpstreamSpend(t *testing.T) {
+	js := string(channelManagementJS)
+	css := string(stabilityCSS)
+	for _, marker := range []string{
+		`<small>区间上游消费</small>`,
+		`<small>上游修正消费</small>`,
+		`上游修正消费 = 账面消费 × 充值支付 ÷ 充值到账`,
+		`upstreamUsage.adjusted_cost_available`,
+		`upstreamUsage.adjusted_cost_usd`,
+		`upstreamUsage.recharge_ratio`,
+		`上游修正消费汇总`,
+		`.cm-domain-upstream-adjusted b{color:`,
+	} {
+		if !strings.Contains(js, marker) && !strings.Contains(css, marker) {
+			t.Fatalf("上游修正消费缺少 %q", marker)
+		}
+	}
+	if !strings.Contains(js, `adjustedUsageDomains=upstreamUsageDomains.filter`) {
+		t.Fatal("汇总只能累加已配置充值比例的账户")
+	}
+}
+
 func TestChannelManagementOmitsGroupShareColumn(t *testing.T) {
 	js := string(channelManagementJS)
 	if strings.Contains(js, "本组占比") || strings.Contains(js, "metricCell(usage,group.usage)") {
@@ -331,23 +353,53 @@ func TestChannelManagementUpstreamUsageUsesLocalHourlyRowsOnly(t *testing.T) {
 	accounts := map[string]ChannelUpstreamAccountView{"upstream.example": {
 		Configured: true, Provider: upstreamProviderNewAPI, UsageSyncEnabled: true,
 	}}
-	usage, err := m.loadChannelUpstreamUsage(context.Background(), stabilityScope{FromTs: from, ToTs: now}, now, accounts)
+	finance := channelFinanceSnapshot{domainCosts: map[string]ChannelDomainCost{
+		"upstream.example": {Domain: "upstream.example", RechargePaid: 1, RechargeCredit: 10},
+	}}
+	usage, err := m.loadChannelUpstreamUsage(context.Background(), stabilityScope{FromTs: from, ToTs: now}, now, accounts, finance)
 	if err != nil {
 		t.Fatal(err)
 	}
 	got := usage["upstream.example"]
-	if !got.Available || got.Requests != 2 || got.Tokens != 30 || math.Abs(got.CostUSD-1.2) > 1e-9 || got.ExpectedHours != 3 || got.CompletedHours != 2 || got.Complete {
+	if !got.Available || got.Requests != 2 || got.Tokens != 30 || math.Abs(got.CostUSD-1.2) > 1e-9 ||
+		!got.AdjustedCostAvailable || math.Abs(got.AdjustedCostUSD-0.12) > 1e-9 || math.Abs(got.RechargeRatio-10) > 1e-9 ||
+		got.ExpectedHours != 3 || got.CompletedHours != 2 || got.Complete {
 		t.Fatalf("local upstream usage aggregation=%+v", got)
 	}
 	// 即便本地存在聚合，只要管理员未明确开启日志同步，页面也不显示它。
 	usage, err = m.loadChannelUpstreamUsage(context.Background(), stabilityScope{FromTs: from, ToTs: now}, now, map[string]ChannelUpstreamAccountView{"upstream.example": {
 		Configured: true, Provider: upstreamProviderNewAPI,
-	}})
+	}}, finance)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(usage) != 0 {
 		t.Fatalf("disabled usage sync must not expose old local rows: %+v", usage)
+	}
+}
+
+func TestAdjustedUpstreamUsageCostUsesRechargePaidOverCredit(t *testing.T) {
+	tests := []struct {
+		name       string
+		cost       float64
+		domainCost ChannelDomainCost
+		configured bool
+		want       float64
+		wantRatio  float64
+		wantOK     bool
+	}{
+		{name: "one_to_ten", cost: 100, domainCost: ChannelDomainCost{RechargePaid: 1, RechargeCredit: 10}, configured: true, want: 10, wantRatio: 10, wantOK: true},
+		{name: "seven_to_one", cost: 100, domainCost: ChannelDomainCost{RechargePaid: 7, RechargeCredit: 1}, configured: true, want: 700, wantRatio: 1.0 / 7.0, wantOK: true},
+		{name: "missing_config", cost: 100, domainCost: ChannelDomainCost{RechargePaid: 1, RechargeCredit: 10}, configured: false},
+		{name: "invalid_credit", cost: 100, domainCost: ChannelDomainCost{RechargePaid: 1, RechargeCredit: 0}, configured: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got, ratio, ok := adjustedUpstreamUsageCost(test.cost, test.domainCost, test.configured)
+			if ok != test.wantOK || math.Abs(got-test.want) > 1e-9 || math.Abs(ratio-test.wantRatio) > 1e-9 {
+				t.Fatalf("adjusted cost=%v ratio=%v ok=%v", got, ratio, ok)
+			}
+		})
 	}
 }
 
@@ -367,17 +419,17 @@ func TestChannelManagementAICodeWithUsageKeepsNaturalDayGranularity(t *testing.T
 	accounts := map[string]ChannelUpstreamAccountView{"aicodewith.com": {
 		Configured: true, Provider: upstreamProviderAICodeWith, UsageSyncEnabled: true,
 	}}
-	usage, err := m.loadChannelUpstreamUsage(context.Background(), stabilityScope{FromTs: from, ToTs: to}, to, accounts)
+	usage, err := m.loadChannelUpstreamUsage(context.Background(), stabilityScope{FromTs: from, ToTs: to}, to, accounts, channelFinanceSnapshot{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	got := usage["aicodewith.com"]
-	if !got.Available || !got.Complete || got.Granularity != "day" || got.ExpectedHours != 48 || got.CompletedHours != 48 || got.Requests != 5 || math.Abs(got.CostUSD-3.5) > 1e-9 {
+	if !got.Available || !got.Complete || got.Granularity != "day" || got.ExpectedHours != 48 || got.CompletedHours != 48 || got.Requests != 5 || math.Abs(got.CostUSD-3.5) > 1e-9 || got.AdjustedCostAvailable {
 		t.Fatalf("natural-day upstream aggregation=%+v", got)
 	}
 	// A 24-hour sliding window starts in the middle of the first natural day.
 	// It must not pretend the whole daily bill belongs to that partial range.
-	usage, err = m.loadChannelUpstreamUsage(context.Background(), stabilityScope{FromTs: from + 12*3600, ToTs: to}, to, accounts)
+	usage, err = m.loadChannelUpstreamUsage(context.Background(), stabilityScope{FromTs: from + 12*3600, ToTs: to}, to, accounts, channelFinanceSnapshot{})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"math"
 	"sort"
 	"strconv"
 	"strings"
@@ -49,15 +50,18 @@ type ChannelManagementRateConfig struct {
 // 它们均按主域名账户归集，不能推断为
 // 某一条实际渠道的上游账单。
 type ChannelUpstreamUsageMetrics struct {
-	Available      bool    `json:"available"`
-	Requests       int64   `json:"requests"`
-	Tokens         int64   `json:"tokens"`
-	CostUSD        float64 `json:"cost_usd"`
-	ExpectedHours  int64   `json:"expected_hours"`
-	CompletedHours int64   `json:"completed_hours"`
-	Complete       bool    `json:"complete"`
-	DataUntil      int64   `json:"data_until"`
-	Granularity    string  `json:"granularity,omitempty"`
+	Available             bool    `json:"available"`
+	Requests              int64   `json:"requests"`
+	Tokens                int64   `json:"tokens"`
+	CostUSD               float64 `json:"cost_usd"`
+	AdjustedCostAvailable bool    `json:"adjusted_cost_available"`
+	AdjustedCostUSD       float64 `json:"adjusted_cost_usd"`
+	RechargeRatio         float64 `json:"recharge_ratio"`
+	ExpectedHours         int64   `json:"expected_hours"`
+	CompletedHours        int64   `json:"completed_hours"`
+	Complete              bool    `json:"complete"`
+	DataUntil             int64   `json:"data_until"`
+	Granularity           string  `json:"granularity,omitempty"`
 }
 
 type ChannelManagementChannel struct {
@@ -321,7 +325,21 @@ func expectedUpstreamUsageHours(scope stabilityScope, now int64) int64 {
 	return (end - scope.FromTs) / 3600
 }
 
-func (m *Monitor) loadChannelUpstreamUsage(ctx context.Context, scope stabilityScope, now int64, accounts map[string]ChannelUpstreamAccountView) (map[string]ChannelUpstreamUsageMetrics, error) {
+func adjustedUpstreamUsageCost(cost float64, domainCost ChannelDomainCost, configured bool) (float64, float64, bool) {
+	if !configured || cost < 0 || !validChannelFinanceNumber(domainCost.RechargePaid) || !validChannelFinanceNumber(domainCost.RechargeCredit) {
+		return 0, 0, false
+	}
+	// 充值比例 = 充值到账 ÷ 充值支付。上游账面扣费除以该比例，
+	// 才是实际资金成本；例如 1:10 时账面消费 100，修正成本为 10。
+	ratio := domainCost.RechargeCredit / domainCost.RechargePaid
+	adjusted := cost * domainCost.RechargePaid / domainCost.RechargeCredit
+	if math.IsNaN(adjusted) || math.IsInf(adjusted, 0) || adjusted < 0 || math.IsNaN(ratio) || math.IsInf(ratio, 0) || ratio <= 0 {
+		return 0, 0, false
+	}
+	return adjusted, ratio, true
+}
+
+func (m *Monitor) loadChannelUpstreamUsage(ctx context.Context, scope stabilityScope, now int64, accounts map[string]ChannelUpstreamAccountView, finance channelFinanceSnapshot) (map[string]ChannelUpstreamUsageMetrics, error) {
 	type row struct {
 		Domain           string
 		Provider         string
@@ -355,12 +373,15 @@ func (m *Monitor) loadChannelUpstreamUsage(ctx context.Context, scope stabilityS
 			granularity = upstreamUsageGranularity(account.Provider, account.UsageAdapter)
 		}
 		completedHours := row.CompletedSeconds / 3600
-		result[row.Domain] = ChannelUpstreamUsageMetrics{
+		metrics := ChannelUpstreamUsageMetrics{
 			Available: true, Requests: row.Requests, Tokens: row.Tokens, CostUSD: row.CostUSD,
 			ExpectedHours: expected, CompletedHours: completedHours,
 			Complete:  expected == 0 || row.CompletedSeconds >= expected*3600,
 			DataUntil: row.DataUntil, Granularity: granularity,
 		}
+		domainCost, costConfigured := finance.domainCosts[row.Domain]
+		metrics.AdjustedCostUSD, metrics.RechargeRatio, metrics.AdjustedCostAvailable = adjustedUpstreamUsageCost(row.CostUSD, domainCost, costConfigured)
+		result[row.Domain] = metrics
 	}
 	return result, nil
 }
@@ -378,7 +399,7 @@ func (m *Monitor) buildChannelManagementReport(ctx context.Context, scope stabil
 	if err != nil {
 		return nil, fmt.Errorf("读取上游账户状态: %w", err)
 	}
-	upstreamUsage, err := m.loadChannelUpstreamUsage(ctx, scope, now, upstreamAccounts)
+	upstreamUsage, err := m.loadChannelUpstreamUsage(ctx, scope, now, upstreamAccounts, finance)
 	if err != nil {
 		return nil, fmt.Errorf("读取上游使用日志汇总: %w", err)
 	}

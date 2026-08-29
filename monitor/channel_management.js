@@ -348,7 +348,9 @@ function domainCard(domain,index,total,filtered){
   const upstreamCoverageState=upstreamUsage.complete?'完整':'补全中';
   const upstreamBalance=domain.upstream?.balance_usd==null?'未知':usd(domain.upstream.balance_usd);
   const upstreamSpend=upstreamUsage.available?usd(upstreamUsage.cost_usd):'等待同步';
-  const upstreamMetrics=domain.upstream?.configured||upstreamUsage.available?`<span class="cm-domain-upstream-spend" title="消费按上游账户汇总，且仅统计当前查询时间范围；不是逐渠道上游账单。${upstreamCoverage}"><small>区间上游消费</small><b title="${upstreamSpend}">${upstreamSpend}</b><em class="cm-domain-metric-note ${upstreamUsage.available?(upstreamUsage.complete?'ready':'pending'):'neutral'}">${upstreamUsage.available?`${upstreamGranularity} · ${upstreamCoverageState}`:'同步未开启或尚无数据'}</em></span><span class="cm-domain-upstream-balance"><small>上游当前余额</small><b title="${upstreamBalance}">${upstreamBalance}</b><em class="cm-domain-metric-note neutral">最新余额快照</em></span>`:'';
+	const ratio=Number(upstreamUsage.recharge_ratio),ratioLabel=upstreamUsage.adjusted_cost_available&&Number.isFinite(ratio)&&ratio>0?`到账/支付 ${ratio.toLocaleString(undefined,{maximumFractionDigits:4})}×`:'充值比例待配置';
+	const adjustedSpend=upstreamUsage.adjusted_cost_available?usd(upstreamUsage.adjusted_cost_usd):'待配置';
+	const upstreamMetrics=domain.upstream?.configured||upstreamUsage.available?`<span class="cm-domain-upstream-spend" title="消费按上游账户汇总，且仅统计当前查询时间范围；不是逐渠道上游账单。${upstreamCoverage}"><small>区间上游消费</small><b title="${upstreamSpend}">${upstreamSpend}</b><em class="cm-domain-metric-note ${upstreamUsage.available?(upstreamUsage.complete?'ready':'pending'):'neutral'}">${upstreamUsage.available?`${upstreamGranularity} · ${upstreamCoverageState}`:'同步未开启或尚无数据'}</em></span><span class="cm-domain-upstream-adjusted" title="上游修正消费 = 账面消费 × 充值支付 ÷ 充值到账"><small>上游修正消费</small><b title="${adjustedSpend}">${adjustedSpend}</b><em class="cm-domain-metric-note ${upstreamUsage.adjusted_cost_available?'ready':'pending'}">${esc(ratioLabel)}</em></span><span class="cm-domain-upstream-balance"><small>上游当前余额</small><b title="${upstreamBalance}">${upstreamBalance}</b><em class="cm-domain-metric-note neutral">最新余额快照</em></span>`:'';
   const financeButton=cm.report?.finance?.can_edit&&domain.configured?`<button type="button" class="cm-finance-open" data-cm-finance="${esc(domain.key)}">倍率配置</button>`:'';
   const upstreamButton=cm.report?.finance?.can_edit&&domain.configured?`<button type="button" class="cm-upstream-open" data-cm-upstream="${esc(domain.key)}">账户配置</button>`:'';
   return `<article class="cm-domain-card${open?' open':''}"><div class="cm-domain-head" role="button" tabindex="0" data-cm-domain-toggle="${esc(domain.key)}">
@@ -789,6 +791,8 @@ function render(){
   const upstreamAccounts=domains.filter(domain=>domain.upstream?.configured);
   const upstreamUsageDomains=upstreamAccounts.filter(domain=>domain.upstream_usage?.available);
   const upstreamSpend=upstreamUsageDomains.reduce((sum,domain)=>sum+(+domain.upstream_usage.cost_usd||0),0);
+	const adjustedUsageDomains=upstreamUsageDomains.filter(domain=>domain.upstream_usage.adjusted_cost_available);
+	const adjustedUpstreamSpend=adjustedUsageDomains.reduce((sum,domain)=>sum+(+domain.upstream_usage.adjusted_cost_usd||0),0);
   const upstreamUsageComplete=upstreamUsageDomains.filter(domain=>domain.upstream_usage.complete).length;
   const upstreamBalanceDomains=upstreamAccounts.filter(domain=>domain.upstream.balance_usd!=null&&Number.isFinite(Number(domain.upstream.balance_usd)));
   const upstreamBalance=upstreamBalanceDomains.reduce((sum,domain)=>sum+Number(domain.upstream.balance_usd),0);
@@ -802,6 +806,7 @@ function render(){
     <article><small>区间 Tokens</small><b title="${nfmt(filteredUsage.tokens)}">${compact(filteredUsage.tokens)}</b><span>prompt + completion</span></article>
     <article class="accent"><small>用户侧消费</small><b>${usd(filteredUsage.cost_usd)}</b><span>NewAPI logs.quota</span></article>
     <article class="upstream ${upstreamUsageDomains.length&&!upstreamSpendReady?'warn':''}"><small>区间上游消费汇总</small><b>${upstreamUsageDomains.length?usd(upstreamSpend):'—'}</b><span>${upstreamUsageDomains.length?`${nfmt(upstreamUsageComplete)}/${nfmt(upstreamUsageDomains.length)} 个账单完整${upstreamSpendReady?'':' · 补全中'}`:`${nfmt(upstreamAccounts.length)} 个账户尚无消费数据`}</span></article>
+	<article class="adjusted ${adjustedUsageDomains.length<upstreamUsageDomains.length?'warn':''}"><small>上游修正消费汇总</small><b>${adjustedUsageDomains.length?usd(adjustedUpstreamSpend):'—'}</b><span>${nfmt(adjustedUsageDomains.length)}/${nfmt(upstreamUsageDomains.length)} 个账户已配置充值比例</span></article>
     <article class="balance ${upstreamBalanceDomains.length<upstreamAccounts.length?'warn':''}"><small>上游当前余额汇总</small><b>${upstreamBalanceDomains.length?usd(upstreamBalance):'—'}</b><span>${nfmt(upstreamBalanceDomains.length)}/${nfmt(upstreamAccounts.length)} 个账户已取得余额</span></article>
     ${filtered?`<article><small>筛选${esc(metricLabel())}占比</small><b>${share.toFixed(1)}%</b><span>相对当前日期全部渠道</span></article>`:''}
   </section>`;summary.removeAttribute('aria-busy')}
