@@ -372,7 +372,7 @@ func (m *Monitor) sampleRange(ctx context.Context, fromTs, toTs int64) (int, err
 		if err := rows.Scan(&s.BucketTs, &s.ChannelID, &s.ModelName, &grp,
 			&s.Success, &s.Anomaly, &s.Failed,
 			&s.AnomalyBilled, &s.AnomalyFree, &s.AnomalyStream, &s.AnomalyQuota, &s.AnomalySumTime,
-			&s.SumUseTime, &s.MaxUseTime, &s.Tokens, &s.Quota,
+			&s.SumUseTime, &s.MaxUseTime, &s.Tokens, &s.Quota, &s.RefundRecords, &s.RefundQuota,
 			&e4, &e5, &eto,
 			&s.Lat1, &s.Lat2, &s.Lat5, &s.Lat10, &s.Lat30, &s.Lat60, &s.LatInf,
 			&s.CompletionTokens,
@@ -423,6 +423,8 @@ SELECT /*+ MAX_EXECUTION_TIME(8000) */
   CAST(COALESCE(MAX(CASE WHEN type=2 THEN use_time END),0) AS SIGNED) AS max_use_time,
   CAST(COALESCE(SUM(CASE WHEN type=2 THEN prompt_tokens+completion_tokens END),0) AS SIGNED) AS tokens,
   CAST(COALESCE(SUM(CASE WHEN type=2 THEN quota END),0) AS SIGNED) AS quota,
+  CAST(COALESCE(SUM(type=6),0) AS SIGNED) AS refund_records,
+  CAST(COALESCE(SUM(CASE WHEN type=6 THEN quota END),0) AS SIGNED) AS refund_quota,
   CAST(COALESCE(SUM(type=5 AND content REGEXP 'status_code=4'
         AND content NOT LIKE '%timeout%' AND content NOT LIKE '%deadline%'),0) AS SIGNED) AS err_4xx,
   CAST(COALESCE(SUM(type=5 AND content REGEXP 'status_code=5'
@@ -444,7 +446,7 @@ SELECT /*+ MAX_EXECUTION_TIME(8000) */
   CAST(COALESCE(SUM(type=2 AND FRT>10000),0)               AS SIGNED) AS ttft_inf,
   CAST(COALESCE(MAX(CASE WHEN type=2 AND FRT>0 THEN FRT END),0) AS SIGNED) AS ttft_max_ms
 FROM logs
-WHERE created_at >= ? AND created_at < ? AND type IN (2,5)
+WHERE created_at >= ? AND created_at < ? AND type IN (2,5,6)
   AND NOT (` + channelTestLogPredicateSQL() + `)
 GROUP BY bucket, channel_id, model_name, grp`
 	q = expandAnomalyPredicates(q)

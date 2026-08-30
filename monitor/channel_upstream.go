@@ -2634,6 +2634,10 @@ func (m *Monitor) syncChannelUpstreamHandler(c *gin.Context) {
 }
 
 func (m *Monitor) startChannelUpstreamSync(ctx context.Context) {
+	// 已审批的倍率版本是本地持久化承诺，必须在到点后生效。
+	// 这条 lane 只读写 Monitor SQLite，无上游 I/O，因此先于余额、日志和
+	// 计价采集闸门启动；上游全部停采时也不会丢失已排程任务。
+	m.startChannelFinanceActivationLane(ctx, 7*time.Second)
 	if !m.cfg.UpstreamSyncEnabled && !m.cfg.UpstreamUsageSyncEnabled {
 		slog.Info("上游余额与消费账单同步均已关闭")
 		return
@@ -2677,6 +2681,46 @@ func (m *Monitor) startChannelUpstreamSync(ctx context.Context) {
 		<-cleanupCtx.Done()
 		m.channelUpstreamHTTPClient().CloseIdleConnections()
 	})
+}
+
+func (m *Monitor) startChannelFinanceActivationLane(ctx context.Context, initialDelay time.Duration) bool {
+	if !m.cfg.ChannelCostClosureEnabled {
+		return false
+	}
+	return goSourceEpoch(ctx, func(laneCtx context.Context) {
+		runUpstreamPeriodicLane(laneCtx, initialDelay, time.Minute, m.syncDueChannelFinanceActivations)
+	})
+}
+
+func (m *Monitor) syncDueChannelFinanceActivations(ctx context.Context) {
+	if !m.cfg.ChannelCostClosureEnabled {
+		return
+	}
+	const maxPerTick = 8
+	now := time.Now().Unix()
+	for i := 0; i < maxPerTick; i++ {
+		applied, err := m.applyOneDueChannelFinanceActivation(ctx, now)
+		if err != nil {
+			// SQLite busy/临时错误不消耗持久化槽位，下一分钟继续。
+			slog.Warn("待生效渠道倍率本轮未应用，将自动重试", "err", err)
+			return
+		}
+		if applied {
+			continue
+		}
+		// A false result can mean either an empty queue, or that one corrupt /
+		// orphan head was isolated. Continue only when another due slot exists;
+		// this prevents one bad domain from delaying healthy domains by a minute.
+		var due int64
+		if err := m.storeDB.WithContext(ctx).Model(&ChannelFinanceActivationSlot{}).
+			Where("effective_at <= ?", now).Limit(1).Count(&due).Error; err != nil {
+			slog.Warn("读取待生效渠道倍率队列失败，将自动重试", "err", err)
+			return
+		}
+		if due == 0 {
+			return
+		}
+	}
 }
 
 func runUpstreamPeriodicLane(ctx context.Context, initialDelay, interval time.Duration, run func(context.Context)) {

@@ -455,6 +455,10 @@ func (m *Monitor) syncWebsiteGroupCatalogHandler(c *gin.Context) {
 		return nil
 	})
 	if err != nil {
+		if errors.Is(err, errFinanceActivationConflict) {
+			c.JSON(http.StatusConflict, gin.H{"error": "受影响上游存在待整点生效的倍率变更，请等待生效或先取消"})
+			return
+		}
 		if errors.Is(err, errChannelFinanceConfirmationRequired) {
 			c.JSON(http.StatusConflict, gin.H{"error": "确认后将以 NewAPI 当前可选、特殊可用及用户/令牌实际分组和倍率更新网站计价基准，并为受影响主域名追加版本", "confirmation_required": true, "current_global_revision": currentRevision, "affected_domains": affectedDomains, "group_count": len(sources)})
 			return

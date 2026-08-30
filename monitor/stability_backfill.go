@@ -239,13 +239,15 @@ SELECT channel_id, model_name, ` + "`group`" + ` AS grp,
   CAST(COALESCE(MAX(CASE WHEN type=2 THEN use_time END),0) AS SIGNED) AS max_use_time,
   CAST(COALESCE(SUM(CASE WHEN type=2 THEN prompt_tokens+completion_tokens END),0) AS SIGNED) AS tokens,
   CAST(COALESCE(SUM(CASE WHEN type=2 THEN quota END),0) AS SIGNED) AS quota,
+  CAST(COALESCE(SUM(type=6),0) AS SIGNED) AS refund_records,
+  CAST(COALESCE(SUM(CASE WHEN type=6 THEN quota END),0) AS SIGNED) AS refund_quota,
   CAST(COALESCE(SUM(type=5 AND content REGEXP 'status_code=4'
         AND content NOT LIKE '%timeout%' AND content NOT LIKE '%deadline%'),0) AS SIGNED) AS err_4xx,
   CAST(COALESCE(SUM(type=5 AND content REGEXP 'status_code=5'
         AND content NOT LIKE '%timeout%' AND content NOT LIKE '%deadline%'),0) AS SIGNED) AS err_5xx,
   CAST(COALESCE(SUM(type=5 AND (content LIKE '%timeout%' OR content LIKE '%deadline%')),0) AS SIGNED) AS err_timeout
 FROM logs
-WHERE created_at >= ? AND created_at < ? AND type IN (2,5)
+WHERE created_at >= ? AND created_at < ? AND type IN (2,5,6)
 GROUP BY channel_id, model_name, grp, is_channel_test, channel_test_origin, channel_test_scope, channel_test_cost_basis`
 	return expandAnomalyPredicates(q)
 }
@@ -428,7 +430,7 @@ func (m *Monitor) fetchStabilityRange(ctx context.Context, fromTs, toTs int64) (
 			if err := rows.Scan(&hourTs, &row.ChannelID, &row.ModelName, &group, &isChannelTest, &testOrigin, &testScope, &testCostBasis,
 				&row.Success, &row.Anomaly, &row.Failed,
 				&row.AnomalyBilled, &row.AnomalyFree, &row.AnomalyStream, &row.AnomalyQuota,
-				&row.SumUseTime, &row.MaxUseTime, &row.Tokens, &row.Quota,
+				&row.SumUseTime, &row.MaxUseTime, &row.Tokens, &row.Quota, &row.RefundRecords, &row.RefundQuota,
 				&err4xx, &err5xx, &errTimeout); err != nil {
 				return err
 			}
@@ -644,8 +646,12 @@ func (m *Monitor) replaceStabilityHourTraffic(hourTs int64, rows []StabilityHour
 		state.InternalTestRows = int64(len(testRows))
 		state.InternalTestRequests, state.InternalTestTokens, state.InternalTestQuota = expectedTestRequests, expectedTestTokens, expectedTestQuota
 		state.TrafficClassVersion = userTrafficClassificationVersion
-		state.CompletedAt, state.UpdatedAt, state.LastError = time.Now().Unix(), time.Now().Unix(), ""
-		return tx.Save(&state).Error
+		now := time.Now().Unix()
+		state.CompletedAt, state.UpdatedAt, state.LastError = now, now, ""
+		if err := tx.Save(&state).Error; err != nil {
+			return err
+		}
+		return m.enqueueEconomicsForLocalFactTx(tx, hourTs, now)
 	})
 }
 

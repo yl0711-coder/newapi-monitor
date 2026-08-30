@@ -34,6 +34,11 @@ func TestSyncStatusPageUsesLocalStatusEndpoints(t *testing.T) {
 		"migration.percent",
 		"小时稳定性重签",
 		"问题历史重签",
+		`id="syncCostClosure"`,
+		"渠道成本与利润证据",
+		"syncRenderCostClosure",
+		"profit_known_hours",
+		"unallocated_sources",
 	} {
 		if !strings.Contains(pageHTML, want) {
 			t.Fatalf("同步状态页缺少 %q", want)

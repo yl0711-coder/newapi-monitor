@@ -448,6 +448,11 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
   </section>
 
   <section class="sync-section card">
+    <div class="card-header">🧾 渠道成本与利润证据 <span class="muted">计价证据、来源归属、经济账发布和倍率生效任务</span></div>
+    <div class="sync-kv" id="syncCostClosure"><div>加载中…</div></div>
+  </section>
+
+  <section class="sync-section card">
     <div class="card-header">🛡 稳定性与问题样本 <span class="muted">历史日志推断、问题采集与冷历史迁移</span></div>
     <div class="sync-kv" id="syncStability"><div>加载中…</div></div>
   </section>
@@ -1866,6 +1871,28 @@ function syncRenderChannels(report){
   el.innerHTML=`<div class="sync-upstream-summary"><div><small>已配置账户</small><b>${fmtNum(domains.length)}</b></div><div><small>余额同步正常</small><b>${fmtNum(balanceHealthy)}/${fmtNum(enabledAccounts)}</b></div><div><small>已开启消费同步</small><b>${fmtNum(usageEnabled)}</b></div><div><small>当天 Tail 正常</small><b>${fmtNum(usageHealthy)}/${fmtNum(usageEnabled)}</b></div><div><small>历史补数完成</small><b>${fmtNum(historyComplete)}/${fmtNum(usageEnabled)}</b></div><div><small>历史任务退避</small><b>${fmtNum(historyRetry)}</b></div></div><div class="sync-upstream-list">${cards}</div>`;
   return level;
 }
+function syncRenderCostClosure(report){
+  const r=report||{},target=document.getElementById('syncCostClosure');
+  if(!r.enabled){target.innerHTML=[syncKV('证据闭环','未启用','不会读取上游，已有本地数据保持不变'),syncKV('精确报表','未启用','展示闸门与采集闸门独立')].join('');return 'neutral'}
+  const proposals=r.proposal_status_counts||{},activations=r.activation_status_counts||{};
+  const pendingProposals=(+proposals.pending||0)+(+proposals.scheduled||0),failedActivations=(+activations.conflict||0)+(+activations.failed||0);
+  const blocking=(+r.mismatch_cost_hours||0)>0||(+r.unallocated_sources||0)>0||failedActivations>0||!!r.last_error;
+  const pending=(+r.pending_cost_hours||0)>0||(+r.cost_dirty||0)>0||(+r.economics_dirty||0)>0||(+r.pending_activation_slots||0)>0;
+  const level=blocking?'bad':pending?'warn':'ok';
+  target.innerHTML=[
+    syncKV('灰度域名',`${fmtNum((r.domains||[]).length)} 个`,(r.domains||[]).join('、')),
+    syncKV('核验成本小时',fmtNum(r.verified_cost_hours),`最新 ${syncTime(r.latest_verified_hour)}`),
+    syncKV('待处理 / 对账差异',`${fmtNum(r.pending_cost_hours)} / ${fmtNum(r.mismatch_cost_hours)}`,r.oldest_incomplete_hour?`最早未完成 ${syncTime(r.oldest_incomplete_hour)}`:'暂无未完成小时'),
+    syncKV('重算队列',`证据 ${fmtNum(r.cost_dirty)} · 经济账 ${fmtNum(r.economics_dirty)}`,'队列仅由后台 worker 推进，刷新本页不会唤醒任务'),
+    syncKV('经济账 manifest',`${fmtNum(r.profit_known_hours)}/${fmtNum(r.manifest_hours)} 小时利润可判定`,r.latest_manifest_hour?`最新发布 ${syncTime(r.latest_manifest_hour)}`:'尚无发布'),
+    syncKV('未归属来源',fmtNum(r.unallocated_sources),+r.unallocated_sources?'必须完成来源→本地渠道绑定后才能判定利润':'当前来源均已归属'),
+    syncKV('倍率候选',fmtNum(pendingProposals),Object.entries(proposals).map(([k,v])=>`${k} ${v}`).join('·')),
+    syncKV('待生效倍率',`${fmtNum(r.pending_activation_slots)} 个`,Object.entries(activations).map(([k,v])=>`${k} ${v}`).join('·')),
+    syncKV('精确报表',r.report_enabled?'已开启':'等待验收',r.report_enabled?'渠道页可读取当前不可变发布版本':'manifest 覆盖验收后再开启展示'),
+    syncKV('最近错误',r.last_error||'无',r.last_error||'')
+  ].join('');
+  return level;
+}
 function syncRenderStability(health){
   const h=health||{},migration=h.problem_migration||{},hourly=h.hourly_migration||null,evidence=h.nginx_evidence||{};
   const explicitlyDisabled=h.enabled===false&&!h.nginx_enabled;
@@ -1900,20 +1927,22 @@ function syncSectionError(section,label,target){
   return true;
 }
 function syncRender(data){
-  const runtime=data.runtime||{},usage=data.usage||{},stability=data.stability||{},upstream=data.upstream||{};
-  const ready=runtime.data||{},facts=usage.data||{},history=facts.history||{},health=stability.data||{},channels=upstream.data||{};
+  const runtime=data.runtime||{},usage=data.usage||{},stability=data.stability||{},upstream=data.upstream||{},costClosure=data.cost_closure||{};
+  const ready=runtime.data||{},facts=usage.data||{},history=facts.history||{},health=stability.data||{},channels=upstream.data||{},cost=costClosure.data||{};
   const runtimeLevel=syncSectionError(runtime,'采集服务与本地存储','syncRuntime')?'warn':syncRenderRuntime(ready,facts);
   const factsLevel=syncSectionError(usage,'用户用量事实','syncFacts')?'warn':syncRenderFacts(facts,history);
   const channelsLevel=syncSectionError(upstream,'上游账户同步','syncChannels')?'warn':syncRenderChannels(channels);
+  const costLevel=syncSectionError(costClosure,'渠道成本闭环','syncCostClosure')?'warn':syncRenderCostClosure(cost);
   const stabilityLevel=syncSectionError(stability,'稳定性采样','syncStability')?'warn':syncRenderStability(health);
   const readiness=ready.status==='ready'&&!(ready.degraded_reasons||[]).length?'ok':(ready.status==='not_ready'?'bad':'warn');
   document.getElementById('syncOverview').innerHTML=[
     syncCard(readiness,'服务就绪',ready.status==='ready'?'本地服务可用':(ready.status||'不可用'),(ready.degraded_reasons||[]).join('、')||'本地状态已检查'),
     syncCard(factsLevel,'用户用量事实',factsLevel==='neutral'?'未启用':(facts.facts&&facts.facts.read_active?`${fmtNum(history.published_members||0)}/${fmtNum(history.total_members||0)} 成员可用`:'近期窗口同步中'),factsLevel==='neutral'?'本地已有事实保持不变':`全历史归档 ${(+history.coverage_percent||0).toFixed(1)}% · ${fmtNum(history.live_ready_members||0)}/${fmtNum(history.total_members||0)} 实时追平`),
     syncCard(channelsLevel,'上游账户同步',channels.enabled?`${(channels.domains||[]).filter(x=>x.upstream&&x.upstream.configured).length} 个账户`:'未启用',channels.enabled?'余额、当天消费水位和历史补数独立展示':'当前不会访问任何上游'),
+    syncCard(costLevel,'渠道成本与利润',cost.enabled?`${fmtNum(cost.profit_known_hours||0)}/${fmtNum(cost.manifest_hours||0)} 小时可判定`:'未启用',cost.enabled?`未归属来源 ${fmtNum(cost.unallocated_sources||0)} · 重算 ${fmtNum((+cost.cost_dirty||0)+(+cost.economics_dirty||0))}`:'采集与报表均保持关闭'),
     syncCard(stabilityLevel,'稳定性采样',stabilityLevel==='neutral'?'未启用':(health.status||'未启用'),stabilityLevel==='neutral'?'当前没有稳定性采集任务':(health.problem_live_lag_sec?`问题 Tail 延迟 ${usageFactsDuration(health.problem_live_lag_sec)}`:'历史日志采样状态已检查'))
   ].join('');
-  const sectionErrors=[runtime,usage,stability,upstream].filter(x=>!x.available).map(x=>x.error||'状态暂不可用');
+  const sectionErrors=[runtime,usage,stability,upstream,costClosure].filter(x=>!x.available).map(x=>x.error||'状态暂不可用');
   document.getElementById('syncError').innerHTML=sectionErrors.length?`<div class="usage-facts-state warn"><b>部分状态暂不可用</b><span>${sectionErrors.map(esc).join('；')}</span></div>`:'';
   document.getElementById('syncUpdated').textContent='本地状态快照：'+syncTime(data.snapshot_at);
 }

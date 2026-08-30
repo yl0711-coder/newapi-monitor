@@ -602,6 +602,39 @@ func TestLayeredChannelFinanceRoutesKeepScopesSeparate(t *testing.T) {
 	if secondChannelCost.UpstreamGroupName != "上游 Codex 主组" || secondChannelCost.Multiplier != 1 || secondChannelCost.DiscountFactor != .8 {
 		t.Fatalf("channel-level cost must apply to every configured group: %+v", secondChannelCost)
 	}
+	// 旧版可能留下已经不属于渠道当前分组的行。它不能触发当前配置冲突，
+	// 但下一次批量确认保存必须将其从当前表清掉。
+	staleCost := ChannelFinanceChannelCost{ChannelID: 33, Grp: "internal_test", UpstreamGroupName: "旧上游组", Multiplier: 9, DiscountFactor: 1}
+	if err := m.storeDB.Create(&staleCost).Error; err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err = m.loadChannelFinanceSnapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.channelCostConflict[33] {
+		t.Fatal("removed historical group must not mark the current channel configuration as conflicting")
+	}
+	if equal, err := channelFinanceDomainRatesEqual(m.storeDB, "last-api.ai", channelRates.Rates); err != nil || equal {
+		t.Fatalf("stale current-table rows must require a cleanup save: equal=%v err=%v", equal, err)
+	}
+	channelRates.ConfirmUpdate = false
+	channelRates.ExpectedVersion = 0
+	if w := request("/domain-rates", channelRates); w.Code != http.StatusConflict {
+		t.Fatalf("stale row cleanup must require confirmation: %d %s", w.Code, w.Body.String())
+	}
+	channelRates.ConfirmUpdate = true
+	channelRates.ExpectedVersion = 3
+	if w := request("/domain-rates", channelRates); w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"version":3`) {
+		t.Fatalf("confirmed cleanup save status=%d body=%s", w.Code, w.Body.String())
+	}
+	var remainingCosts []ChannelFinanceChannelCost
+	if err := m.storeDB.Where("channel_id = ?", 33).Order("grp").Find(&remainingCosts).Error; err != nil {
+		t.Fatal(err)
+	}
+	if len(remainingCosts) != 2 || remainingCosts[0].Grp != "codex-1.2x" || remainingCosts[1].Grp != "codex-1.4x" {
+		t.Fatalf("cleanup must leave exactly the current channel groups: %+v", remainingCosts)
+	}
 	var legacyGroupCost int64
 	if err := m.storeDB.Model(&ChannelDomainGroupCost{}).Where("domain = ?", "last-api.ai").Count(&legacyGroupCost).Error; err != nil {
 		t.Fatal(err)

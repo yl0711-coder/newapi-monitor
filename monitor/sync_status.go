@@ -53,12 +53,13 @@ type syncUpstreamStatus struct {
 }
 
 type syncOverviewResponse struct {
-	Version    int                                        `json:"version"`
-	SnapshotAt int64                                      `json:"snapshot_at"`
-	Runtime    syncStatusSection[readyStatusResponse]     `json:"runtime"`
-	Usage      syncStatusSection[syncUsageStatus]         `json:"usage"`
-	Stability  syncStatusSection[stabilityHealthResponse] `json:"stability"`
-	Upstream   syncStatusSection[syncUpstreamStatus]      `json:"upstream"`
+	Version     int                                        `json:"version"`
+	SnapshotAt  int64                                      `json:"snapshot_at"`
+	Runtime     syncStatusSection[readyStatusResponse]     `json:"runtime"`
+	Usage       syncStatusSection[syncUsageStatus]         `json:"usage"`
+	Stability   syncStatusSection[stabilityHealthResponse] `json:"stability"`
+	Upstream    syncStatusSection[syncUpstreamStatus]      `json:"upstream"`
+	CostClosure syncStatusSection[syncChannelCostStatus]   `json:"cost_closure"`
 }
 
 type syncStatusSnapshot struct {
@@ -73,9 +74,10 @@ type syncStatusUsageRead struct {
 }
 
 type syncStatusReaders struct {
-	Usage     func(context.Context) (syncStatusUsageRead, error)
-	Stability func(context.Context) (stabilityHealthResponse, error)
-	Upstream  func(context.Context) (map[string]ChannelUpstreamAccountView, error)
+	Usage       func(context.Context) (syncStatusUsageRead, error)
+	Stability   func(context.Context) (stabilityHealthResponse, error)
+	Upstream    func(context.Context) (map[string]ChannelUpstreamAccountView, error)
+	CostClosure func(context.Context) (syncChannelCostStatus, error)
 }
 
 type syncStatusReadResult[T any] struct {
@@ -162,7 +164,8 @@ func (m *Monitor) defaultSyncStatusReaders(now time.Time) syncStatusReaders {
 		Stability: func(ctx context.Context) (stabilityHealthResponse, error) {
 			return m.stabilityHealth(ctx, now), nil
 		},
-		Upstream: m.loadChannelUpstreamViews,
+		Upstream:    m.loadChannelUpstreamViews,
+		CostClosure: m.channelCostSyncStatus,
 	}
 }
 
@@ -180,7 +183,7 @@ func (m *Monitor) buildSyncStatusSnapshotWith(ctx context.Context, now time.Time
 		},
 	}
 
-	// 三个业务分区并行读本地状态；某一分区超时不阻断其他分区返回。
+	// 四个业务分区并行读本地状态；某一分区超时不阻断其他分区返回。
 	overallCtx, overallCancel := context.WithTimeout(ctx, 5*time.Second)
 	defer overallCancel()
 	usageCtx, usageCancel := context.WithTimeout(overallCtx, 4*time.Second)
@@ -189,13 +192,21 @@ func (m *Monitor) buildSyncStatusSnapshotWith(ctx context.Context, now time.Time
 	defer stabilityCancel()
 	upstreamCtx, upstreamCancel := context.WithTimeout(overallCtx, 2*time.Second)
 	defer upstreamCancel()
+	costCtx, costCancel := context.WithTimeout(overallCtx, 2*time.Second)
+	defer costCancel()
 	usageCh := launchSyncStatusRead(usageCtx, "用量事实", readers.Usage)
 	stabilityCh := launchSyncStatusRead(stabilityCtx, "稳定性", readers.Stability)
 	upstreamCh := launchSyncStatusRead(upstreamCtx, "上游账户", readers.Upstream)
+	costRead := readers.CostClosure
+	if costRead == nil {
+		costRead = func(context.Context) (syncChannelCostStatus, error) { return syncChannelCostStatus{}, nil }
+	}
+	costCh := launchSyncStatusRead(costCtx, "渠道成本闭环", costRead)
 
 	usageResult := awaitSyncStatusRead(overallCtx, usageCh)
 	stabilityResult := awaitSyncStatusRead(overallCtx, stabilityCh)
 	upstreamResult := awaitSyncStatusRead(overallCtx, upstreamCh)
+	costResult := awaitSyncStatusRead(overallCtx, costCh)
 
 	usage := syncUsageStatus{Store: usageResult.Data.Store, FactsStore: usageResult.Data.FactsStore}
 	if usageResult.Err != nil {
@@ -250,6 +261,11 @@ func (m *Monitor) buildSyncStatusSnapshotWith(ctx context.Context, now time.Time
 		snapshot.Overview.Upstream = syncStatusSection[syncUpstreamStatus]{
 			Available: true, CheckedAt: nowUnix, Data: upstream,
 		}
+	}
+	if costResult.Err != nil {
+		snapshot.Overview.CostClosure = syncStatusSection[syncChannelCostStatus]{Available: false, CheckedAt: nowUnix, Error: "读取本地渠道成本闭环状态失败"}
+	} else {
+		snapshot.Overview.CostClosure = syncStatusSection[syncChannelCostStatus]{Available: true, CheckedAt: nowUnix, Data: costResult.Data}
 	}
 	return snapshot
 }

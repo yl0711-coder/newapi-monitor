@@ -19,6 +19,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"path/filepath"
@@ -116,6 +117,9 @@ type Monitor struct {
 	// /tmp 只有 16 MiB；把这两类管理页重查询串行化，避免并发临时表互相
 	// 挤占空间。它不参与采集/写入，也不改变任何业务或稳定性口径。
 	infraAggregateMu sync.Mutex
+	// 来源映射是版本化半开区间；SQLite 没有可表达“区间不重叠”的唯一约束，
+	// 因此同一进程内的检查+追加必须串行。生产仅一个 source lease 实例可写。
+	channelCostBindingMu sync.Mutex
 	// 同步状态是现有领域状态的只读投影，不是第二份任务真值。短缓存只用于
 	// 合并多个管理员的页面轮询；失效或进程重启后可从本地领域表重建。
 	syncStatusMu       sync.Mutex
@@ -289,6 +293,9 @@ func New(s Settings) (*Monitor, error) {
 	if err := validateUpstreamPricingLedgerSettings(s); err != nil {
 		return nil, err
 	}
+	if err := validateChannelCostClosureSettings(s); err != nil {
+		return nil, err
+	}
 	if err := validateLocalAuthBypassSettings(s); err != nil {
 		return nil, err
 	}
@@ -315,6 +322,9 @@ func New(s Settings) (*Monitor, error) {
 	}
 	m.processStartedAt.Store(time.Now().Unix())
 	if err := m.openStore(s.StorePath); err != nil {
+		return nil, err
+	}
+	if err := m.validateChannelCostKeyRegistry(); err != nil {
 		return nil, err
 	}
 	if err := m.openNginxEvidenceStore(); err != nil {
@@ -357,13 +367,67 @@ func validateLocalAuthBypassSettings(s Settings) error {
 	if strings.TrimSpace(s.ProdDSN) != "" || strings.TrimSpace(s.NewAPIBaseURL) != "" {
 		return errors.New("本地免登录模式不允许配置生产 DSN 或 NewAPI 主站地址")
 	}
-	if s.SourceWorkerEnabled || s.SourceLeaseRequired || s.UpstreamSyncEnabled || s.UpstreamUsageSyncEnabled || s.UpstreamPricingLedgerEnabled {
+	if s.SourceWorkerEnabled || s.SourceLeaseRequired || s.UpstreamSyncEnabled || s.UpstreamUsageSyncEnabled || s.UpstreamPricingLedgerEnabled || s.ChannelCostClosureEnabled {
 		return errors.New("本地免登录模式要求关闭来源 worker、来源租约和全部上游同步")
 	}
 	if s.NginxEnabled || s.InfraEnabled || strings.TrimSpace(s.HeartbeatURL) != "" || !s.AlertsDisabled {
 		return errors.New("本地免登录模式要求关闭 Nginx/AWS 主动采集、外部心跳和所有告警")
 	}
 	return nil
+}
+
+func validateChannelCostClosureSettings(s Settings) error {
+	if !s.ChannelCostClosureEnabled {
+		if s.ChannelEconomicsReportEnabled {
+			return errors.New("精确成本报表必须先开启渠道成本闭环")
+		}
+		return nil
+	}
+	if s.LocalSnapshotOnly {
+		return errors.New("渠道成本闭环不能在本地快照只读模式开启")
+	}
+	if !s.UpstreamPricingLedgerEnabled || !s.UpstreamUsageSyncEnabled {
+		return errors.New("渠道成本闭环必须同时开启上游使用日志与计价账本灰度闸门")
+	}
+	if len(s.ChannelCostClosureDomains) == 0 {
+		return errors.New("渠道成本闭环必须配置非空 MONITOR_CHANNEL_COST_CLOSURE_DOMAINS 白名单")
+	}
+	if len(s.ChannelCostHMACKey) < 32 {
+		return errors.New("MONITOR_CHANNEL_COST_HMAC_KEY 必须是至少 32 字节的独立固定密钥")
+	}
+	keyID := strings.TrimSpace(s.ChannelCostHMACKeyID)
+	if keyID == "" || len(keyID) > 64 || !safeChannelCostKeyID(keyID) {
+		return errors.New("MONITOR_CHANNEL_COST_HMAC_KEY_ID 必须是 1～64 字符的稳定标识")
+	}
+	for _, other := range []struct {
+		name  string
+		value string
+	}{
+		{"MONITOR_SESSION_SECRET", s.SessionSecret},
+		{"MONITOR_UPSTREAM_CREDENTIAL_SECRET", s.UpstreamCredentialSecret},
+		{"MONITOR_NGINX_EVIDENCE_HMAC_KEY", s.NginxEvidenceHMACKey},
+		{"MONITOR_INGEST_TOKEN", s.IngestToken},
+	} {
+		if other.value != "" && s.ChannelCostHMACKey == other.value {
+			return fmt.Errorf("MONITOR_CHANNEL_COST_HMAC_KEY 不得复用 %s", other.name)
+		}
+	}
+	for _, domain := range s.ChannelCostClosureDomains {
+		if !pricingLedgerDomainAllowed(s.UpstreamPricingLedgerDomains, domain) {
+			return fmt.Errorf("渠道成本闭环域名 %q 不在计价账本白名单中", domain)
+		}
+	}
+	return nil
+}
+
+func safeChannelCostKeyID(value string) bool {
+	for _, r := range value {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_' || r == '.' {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 func validateUpstreamPricingLedgerSettings(s Settings) error {

@@ -2,6 +2,7 @@ package monitor
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -18,6 +19,52 @@ import (
 	"github.com/glebarez/sqlite"
 	"gorm.io/gorm"
 )
+
+func TestRetryUpstreamPricingLocalStoreWaitsForShortWriterWithoutRefetch(t *testing.T) {
+	m := newTestMonitor(t)
+	defer m.Close()
+
+	locker, err := sql.Open("sqlite", m.cfg.StorePath+"?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_txlock=immediate")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer locker.Close()
+	locker.SetMaxOpenConns(1)
+	if _, err := locker.Exec("BEGIN IMMEDIATE"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := locker.Exec("INSERT INTO tracked_users(user_id, username) VALUES (?, ?)", 99110, "lock-holder"); err != nil {
+		_, _ = locker.Exec("ROLLBACK")
+		t.Fatal(err)
+	}
+
+	released := make(chan error, 1)
+	go func() {
+		time.Sleep(120 * time.Millisecond)
+		_, commitErr := locker.Exec("COMMIT")
+		released <- commitErr
+	}()
+	attempts := 0
+	err = retryUpstreamPricingLocalStore(context.Background(), func() error {
+		attempts++
+		return m.storeDB.Transaction(func(tx *gorm.DB) error {
+			var count int64
+			if err := tx.Model(&TrackedUser{}).Count(&count).Error; err != nil {
+				return err
+			}
+			return tx.Create(&TrackedUser{UserID: 99111, Username: "pricing-writer"}).Error
+		})
+	})
+	if err != nil {
+		t.Fatalf("短时主库写竞争应在本地重试后恢复: %v", err)
+	}
+	if attempts < 2 {
+		t.Fatalf("测试未制造锁升级竞争: attempts=%d", attempts)
+	}
+	if err := <-released; err != nil {
+		t.Fatalf("释放并发写锁: %v", err)
+	}
+}
 
 func TestDecodeNewAPIPricingObservationFromContractFixture(t *testing.T) {
 	fixture := json.RawMessage(`{
@@ -332,6 +379,56 @@ func TestPricingLedgerMismatchDoesNotPublishObservedCurrentState(t *testing.T) {
 	}
 	if count != 0 {
 		t.Fatalf("mismatched hour published %d current pricing states", count)
+	}
+}
+
+func TestSub2PricingLedgerAcceptsOnlyBoundedDecimalRoundingDrift(t *testing.T) {
+	m := newTestMonitor(t)
+	hour := int64(1780988400)
+	account := ChannelUpstreamAccount{Domain: "codeyu.shop", Provider: upstreamProviderSub2API, BaseURL: "https://codeyu.shop"}
+	if err := m.storeDB.Create(&ChannelUpstreamUsageHour{
+		Domain: account.Domain, HourTs: hour, BucketSeconds: 3600,
+		Requests: 129, Tokens: 1000, CostUSD: 10.304608, Provider: upstreamProviderSub2API,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	evidence := []ChannelUpstreamPricingHourEvidence{{
+		Domain: account.Domain, AccountEpoch: newAPIUpstreamAccountEpoch(account), HourTs: hour,
+		SemanticsVersion: upstreamPricingSemanticsVersion, DimensionHash: strings.Repeat("a", 64),
+		Provider: upstreamProviderSub2API, SourceGroup: "OpenAI(GPT pro)", ModelName: "gpt-5.5",
+		EffectiveRatio: "2", EffectiveRatioSource: "rate_multiplier", EvidenceCapability: "effective_rate",
+		GroupRatioState: pricingRatioMissing, UserGroupRatioState: pricingRatioMissing,
+		DiscountRatioState: pricingRatioMissing, OtherValid: true,
+		SourceRows: 129, EligibleRequests: 129, PromptTokens: 900, CompletionTokens: 100,
+		FinalQuota: 10304617,
+	}}
+	state := ChannelUpstreamPricingHourState{
+		Domain: account.Domain, AccountEpoch: newAPIUpstreamAccountEpoch(account), HourTs: hour,
+		SemanticsVersion: upstreamPricingSemanticsVersion, Status: "observed", ContentHash: "same",
+		SourceRows: 129, EligibleRequests: 129, Tokens: 1000, FinalQuota: 10304617, EvidenceRows: 1,
+	}
+	for i := 0; i < 2; i++ {
+		if err := m.persistNewAPIPricingHour(context.Background(), account, hour, evidence, state, hour+4000+int64(i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var stored ChannelUpstreamPricingHourState
+	if err := m.storeDB.First(&stored, "domain = ? AND account_epoch = ? AND hour_ts = ?", account.Domain, newAPIUpstreamAccountEpoch(account), hour).Error; err != nil {
+		t.Fatal(err)
+	}
+	if stored.Status != "verified" || stored.ReconcileStatus != "matched" || stored.QuotaDelta != 9 {
+		t.Fatalf("bounded per-row rounding drift must reconcile without hiding the delta: %+v", stored)
+	}
+	var observed int64
+	if err := m.storeDB.Model(&ChannelUpstreamPricingObservedState{}).Where("domain = ?", account.Domain).Count(&observed).Error; err != nil || observed != 1 {
+		t.Fatalf("reconciled Sub2 rate was not published: rows=%d err=%v", observed, err)
+	}
+
+	if pricingQuotaReconciled(upstreamProviderSub2API, 66, 129) {
+		t.Fatal("drift above the mathematical rounding bound must remain blocked")
+	}
+	if pricingQuotaReconciled(upstreamProviderNewAPI, 1, 1000000) {
+		t.Fatal("NewAPI integer quota must retain zero tolerance")
 	}
 }
 
@@ -1180,6 +1277,83 @@ func TestPricingLedgerDenseHourResumesCheckpointAcrossRestart(t *testing.T) {
 	}
 	if calls.Load() != 132 {
 		t.Fatalf("dense checkpoint requests=%d, want 132 for two bounded complete scans", calls.Load())
+	}
+	m2.Close()
+}
+
+func TestNewAPICostHistoricalUnitFreezesAcrossRestartAndVerification(t *testing.T) {
+	hour := time.Now().Unix()
+	hour = hour - hour%3600 - 3600
+	rows := []upstreamUsageFixtureRow{{
+		ID: 1, CreatedAt: hour + 10, Group: "Gpt-codex", ModelName: "gpt-5.5", TokenID: 75,
+		Other: map[string]any{"group_ratio": 1.1}, Quota: 500000, PromptTokens: 2, CompletionTokens: 1,
+	}}
+	server, _ := newUpstreamUsageFixtureServer(t, rows, nil)
+	dbPath := t.TempDir() + "/cost-unit-restart.db"
+	account := ChannelUpstreamAccount{
+		Domain: server.Listener.Addr().String(), Provider: upstreamProviderNewAPI,
+		BaseURL: server.URL, Account: "31", UserID: 31, BalanceUnit: 500000,
+		Enabled: true, UsageSyncEnabled: true,
+	}
+	configure := func(m *Monitor) {
+		m.cfg.ChannelCostClosureEnabled = true
+		m.cfg.ChannelCostClosureDomains = []string{account.Domain}
+		m.cfg.ChannelCostHMACKey = "0123456789abcdef0123456789abcdef"
+		m.cfg.ChannelCostHMACKeyID = "v1"
+	}
+	runScan := func(m *Monitor, current ChannelUpstreamAccount, now int64) {
+		t.Helper()
+		evidence, state, progress, complete, err := m.fetchNewAPIPricingHour(context.Background(), current, newAPICredential{AccessToken: "usage-token"}, hour, newUpstreamUsageRequestPacer(10, 0), now)
+		if err != nil || !complete || progress != "" {
+			t.Fatalf("fetch complete=%v progress=%q err=%v", complete, progress, err)
+		}
+		if err := m.persistNewAPIPricingHour(context.Background(), current, hour, evidence, state, now); err != nil {
+			t.Fatal(err)
+		}
+		var published ChannelUpstreamPricingHourState
+		if err := m.storeDB.First(&published, "domain = ? AND account_epoch = ? AND hour_ts = ?", current.Domain, newAPIUpstreamAccountEpoch(current), hour).Error; err != nil {
+			t.Fatal(err)
+		}
+		if err := m.publishChannelCostHourFromCheckpoint(context.Background(), current, published, now); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	m1 := openRestartablePricingTestMonitor(t, dbPath)
+	configure(m1)
+	if err := m1.storeDB.Create(&ChannelUpstreamUsageHour{Domain: account.Domain, HourTs: hour, BucketSeconds: 3600, Provider: account.Provider, Requests: 1, Tokens: 3, Quota: 500000, CostUSD: 1}).Error; err != nil {
+		t.Fatal(err)
+	}
+	runScan(m1, account, hour+4000)
+	var first ChannelUpstreamCostHourState
+	if err := m1.storeDB.First(&first, "domain = ? AND hour_ts = ?", account.Domain, hour).Error; err != nil {
+		t.Fatal(err)
+	}
+	if first.Status != "observed" || first.ChargeUnitsPerUSD != "500000" {
+		t.Fatalf("first historical unit state=%+v", first)
+	}
+	m1.Close()
+
+	// Simulate a later balance/config interpretation change. The account epoch
+	// is intentionally stable; the already observed historical hour must keep
+	// its first-scan unit when the second scan verifies it after restart.
+	account.BalanceUnit = 1
+	m2 := openRestartablePricingTestMonitor(t, dbPath)
+	configure(m2)
+	runScan(m2, account, hour+5000)
+	var verified ChannelUpstreamCostHourState
+	if err := m2.storeDB.First(&verified, "domain = ? AND hour_ts = ?", account.Domain, hour).Error; err != nil {
+		t.Fatal(err)
+	}
+	if verified.Status != "verified" || verified.VerifiedScans != 2 || verified.ChargeUnitsPerUSD != "500000" {
+		t.Fatalf("historical unit was rewritten across restart: %+v", verified)
+	}
+	var evidenceRows []ChannelUpstreamCostHourEvidence
+	if err := m2.storeDB.Where("domain = ? AND hour_ts = ?", account.Domain, hour).Find(&evidenceRows).Error; err != nil {
+		t.Fatal(err)
+	}
+	if len(evidenceRows) != 1 || evidenceRows[0].ChargeUnitsPerUSD != "500000" {
+		t.Fatalf("historical evidence unit=%+v", evidenceRows)
 	}
 	m2.Close()
 }

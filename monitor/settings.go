@@ -100,6 +100,15 @@ type Settings struct {
 	UpstreamPricingLedgerEnabled       bool     // MONITOR_UPSTREAM_PRICING_LEDGER_ENABLED，默认 false
 	UpstreamPricingLedgerDomains       []string // MONITOR_UPSTREAM_PRICING_LEDGER_DOMAINS，逗号分隔
 	UpstreamPricingBackfillHoursPerRun int      // MONITOR_UPSTREAM_PRICING_BACKFILL_HOURS_PER_RUN，默认 1，最大 6
+	// 渠道成本闭环是计价账本之上的独立影子层。第一阶段只消费已经拉取并核验的
+	// NewAPI 小时日志，不增加上游请求、不修改人工倍率，也不改变现有页面/告警口径。
+	ChannelCostClosureEnabled bool     // MONITOR_CHANNEL_COST_CLOSURE_ENABLED，默认 false
+	ChannelCostClosureDomains []string // MONITOR_CHANNEL_COST_CLOSURE_DOMAINS，必须是计价账本白名单的子集
+	ChannelCostHMACKey        string   // MONITOR_CHANNEL_COST_HMAC_KEY，独立固定密钥；仅用于匿名化上游来源 ID
+	ChannelCostHMACKeyID      string   // MONITOR_CHANNEL_COST_HMAC_KEY_ID，写入证据供密钥轮换审计
+	// 报表展示闸门与后台证据采集分离：先积累并核验 manifest，
+	// 再显式开启页面，避免把部分数据误当成精确利润。
+	ChannelEconomicsReportEnabled bool // MONITOR_CHANNEL_ECONOMICS_REPORT_ENABLED，默认 false
 
 	// 客户端「用量报表」独立监听(portal.go):客户域名只指这个端口,上面不存在任何管理端路由。
 	// 留空 = 关闭(默认);如 ":8092"。
@@ -298,6 +307,11 @@ func LoadSettings() Settings {
 		UpstreamPricingLedgerEnabled:             env("MONITOR_UPSTREAM_PRICING_LEDGER_ENABLED", "false") == "true",
 		UpstreamPricingLedgerDomains:             envCSV("MONITOR_UPSTREAM_PRICING_LEDGER_DOMAINS"),
 		UpstreamPricingBackfillHoursPerRun:       envInt("MONITOR_UPSTREAM_PRICING_BACKFILL_HOURS_PER_RUN", 1),
+		ChannelCostClosureEnabled:                env("MONITOR_CHANNEL_COST_CLOSURE_ENABLED", "false") == "true",
+		ChannelCostClosureDomains:                envCSV("MONITOR_CHANNEL_COST_CLOSURE_DOMAINS"),
+		ChannelCostHMACKey:                       env("MONITOR_CHANNEL_COST_HMAC_KEY", ""),
+		ChannelCostHMACKeyID:                     strings.TrimSpace(env("MONITOR_CHANNEL_COST_HMAC_KEY_ID", "")),
+		ChannelEconomicsReportEnabled:            env("MONITOR_CHANNEL_ECONOMICS_REPORT_ENABLED", "false") == "true",
 		PortalAddr:                               env("MONITOR_PORTAL_ADDR", ""),
 		UsageRedisAddr:                           strings.TrimSpace(env("MONITOR_USAGE_REDIS_ADDR", "")),
 		UsageRedisUsername:                       strings.TrimSpace(env("MONITOR_USAGE_REDIS_USERNAME", "")),

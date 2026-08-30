@@ -69,6 +69,83 @@ func TestChannelManagementReportBypassesStaleBrowserCache(t *testing.T) {
 	}
 }
 
+func TestChannelManagementEconomicsIsAdditiveAndFailClosed(t *testing.T) {
+	js := string(channelManagementJS)
+	css := string(stabilityCSS)
+	for _, marker := range []string{
+		`fetch('/channels/economics?'+queryString()`,
+		`原有渠道用量不受影响`,
+		`精确修正成本`,
+		`精确毛利润`,
+		`不可判定`,
+		`totals.revenue_known`,
+		`totals.upstream_cost_known`,
+		`服务端权威小时账本`,
+		`全渠道：收入`,
+		`1 小时收入 / 修正成本`,
+		`generation!==cm.economicsSeq`,
+		`signal:cm.abort?.signal`,
+		`.cm-economics-panel`,
+		`.cm-channel-economics`,
+	} {
+		if !strings.Contains(js, marker) && !strings.Contains(css, marker) {
+			t.Fatalf("渠道页精确成本展示缺少 %q", marker)
+		}
+	}
+	if strings.Contains(js, `totals.profit||`) || strings.Contains(js, `corrected_cost||{display:'$0`) {
+		t.Fatal("未知成本/利润不得在前端降级成 0")
+	}
+}
+
+func TestChannelManagementPricingEvidenceWorkflowIsOperable(t *testing.T) {
+	js := string(channelManagementJS)
+	css := string(stabilityCSS)
+	for _, marker := range []string{
+		`倍率证据与变更台账`,
+		`fetch('/channels/cost/sources?'`,
+		`fetch('/channels/cost/proposals?'`,
+		`fetch('/channels/cost/bindings'`,
+		`'/decisions'`,
+		`'/cancel'`,
+		`审批并排期`,
+		`排期回滚`,
+		`自动发现只生成候选`,
+		`costClosureAllowed(domain)`,
+		`costClosureRecoveryAllowed(domain)`,
+		`capability?.recovery_domains`,
+		`安全闸门已关闭 · 仅可查看和取消待生效任务`,
+		`历史版本，不可直接回滚`,
+		`capability?.enabled`,
+		`capability.domains||[]`,
+		`expected_current_signature`,
+		`proposalData.versions`,
+		`实际影响 ${nfmt(impactTotal)} 个服务分组`,
+		`无法确认本次倍率变更的实际影响范围，已拒绝继续操作`,
+		`'/impact'`,
+		`当前预览前 20 个，操作时读取完整清单`,
+		`source.source_groups`,
+		`window.prompt`,
+		`window.confirm`,
+		`generation!==cm.economicsSeq`,
+		`mode==='allocated'?selectedChannelID:0`,
+		`channel.disabled=mode.value!=='allocated'`,
+		`alert(error.message||'保存来源映射失败');await loadCostLedger(key)`,
+		`.cm-cost-ledger`,
+		`.cm-pricing-proposal`,
+		`.cm-finance-version`,
+	} {
+		if !strings.Contains(js, marker) && !strings.Contains(css, marker) {
+			t.Fatalf("渠道计价证据闭环缺少 %q", marker)
+		}
+	}
+	if strings.Contains(js, `action:'approve'`) && !strings.Contains(js, `window.confirm`) {
+		t.Fatal("倍率候选不得在没有人工确认的情况下自动批准")
+	}
+	if strings.Contains(js, `if(!cm.report?.finance?.can_edit)return'';`) {
+		t.Fatal("成本闭环默认关闭/非白名单域不能仅凭 root 权限展示入口")
+	}
+}
+
 func TestChannelManagementRangeUsesLast24CompletedHours(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	now := time.Date(2026, 8, 12, 16, 37, 45, 0, cstLocation)
@@ -165,6 +242,8 @@ func TestChannelManagementShowsRawAndRechargeAdjustedUpstreamSpend(t *testing.T)
 		`upstreamUsage.adjusted_cost_available`,
 		`upstreamUsage.adjusted_cost_usd`,
 		`upstreamUsage.recharge_ratio`,
+		`domain.finance?.configured`,
+		`financeConfigured?'等待消费同步':'待配置'`,
 		`上游修正消费汇总`,
 		`.cm-domain-upstream-adjusted b{color:`,
 	} {
@@ -209,6 +288,22 @@ func TestChannelManagementSummarizesUpstreamFinanceWithoutGroupDoubleCounting(t 
 	}
 	if strings.Contains(js, `domain.vendors.flatMap`) && strings.Contains(js, `upstreamSpend=channels.reduce`) {
 		t.Fatal("上游消费汇总不应从渠道或分组明细反向求和")
+	}
+}
+
+func TestChannelManagementSummaryUsesTwoBalancedRows(t *testing.T) {
+	js := string(channelManagementJS)
+	css := string(stabilityCSS)
+	for _, marker := range []string{
+		`kpis.style.setProperty('--cm-kpi-columns',String(Math.max(1,Math.ceil(count/2))))`,
+		`.cm-kpis{display:grid;grid-template-columns:repeat(var(--cm-kpi-columns,5),minmax(0,1fr))`,
+		`.cm-kpis[data-count="9"] article:nth-child(-n+5){grid-column:span 4}`,
+		`.cm-kpis[data-count="9"] article:nth-child(n+6){grid-column:span 5}`,
+		`.cm-kpis,.cm-kpis[data-count="9"]{grid-template-columns:1fr 1fr}`,
+	} {
+		if !strings.Contains(js, marker) && !strings.Contains(css, marker) {
+			t.Fatalf("渠道概览两行布局缺少 %q", marker)
+		}
 	}
 }
 

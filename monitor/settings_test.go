@@ -47,6 +47,7 @@ func TestLocalAuthBypassIsExplicitAndFailsClosed(t *testing.T) {
 		{LocalAuthBypass: true, LocalSnapshotOnly: true, UpstreamSyncEnabled: true, AlertsDisabled: true},
 		{LocalAuthBypass: true, LocalSnapshotOnly: true, UpstreamUsageSyncEnabled: true, AlertsDisabled: true},
 		{LocalAuthBypass: true, LocalSnapshotOnly: true, UpstreamPricingLedgerEnabled: true, AlertsDisabled: true},
+		{LocalAuthBypass: true, LocalSnapshotOnly: true, ChannelCostClosureEnabled: true, AlertsDisabled: true},
 		{LocalAuthBypass: true, LocalSnapshotOnly: true, NginxEnabled: true, AlertsDisabled: true},
 		{LocalAuthBypass: true, LocalSnapshotOnly: true, InfraEnabled: true, AlertsDisabled: true},
 		{LocalAuthBypass: true, LocalSnapshotOnly: true, HeartbeatURL: "https://example.com"},
@@ -55,6 +56,57 @@ func TestLocalAuthBypassIsExplicitAndFailsClosed(t *testing.T) {
 	for i, cfg := range invalid {
 		if err := validateLocalAuthBypassSettings(cfg); err == nil {
 			t.Fatalf("危险的本地免登录配置[%d]应被拒绝", i)
+		}
+	}
+}
+
+func TestLoadSettingsChannelCostClosureDefaultsToFailClosed(t *testing.T) {
+	t.Setenv("MONITOR_CHANNEL_COST_CLOSURE_ENABLED", "")
+	t.Setenv("MONITOR_CHANNEL_COST_CLOSURE_DOMAINS", "")
+	t.Setenv("MONITOR_CHANNEL_COST_HMAC_KEY", "")
+	t.Setenv("MONITOR_CHANNEL_COST_HMAC_KEY_ID", "")
+	t.Setenv("MONITOR_CHANNEL_ECONOMICS_REPORT_ENABLED", "")
+	defaults := LoadSettings()
+	if defaults.ChannelCostClosureEnabled || defaults.ChannelEconomicsReportEnabled {
+		t.Fatal("channel cost closure and its report must remain disabled by default")
+	}
+
+	t.Setenv("MONITOR_CHANNEL_COST_CLOSURE_ENABLED", "true")
+	t.Setenv("MONITOR_CHANNEL_COST_CLOSURE_DOMAINS", "4sapi.com")
+	t.Setenv("MONITOR_CHANNEL_COST_HMAC_KEY", "0123456789abcdef0123456789abcdef")
+	t.Setenv("MONITOR_CHANNEL_COST_HMAC_KEY_ID", "cost-source-2026-08")
+	s := LoadSettings()
+	if !s.ChannelCostClosureEnabled || len(s.ChannelCostClosureDomains) != 1 || s.ChannelCostHMACKeyID != "cost-source-2026-08" {
+		t.Fatalf("channel cost settings not loaded: %+v", s.ChannelCostClosureDomains)
+	}
+}
+
+func TestValidateChannelCostClosureSettings(t *testing.T) {
+	valid := Settings{
+		UpstreamUsageSyncEnabled: true, UpstreamPricingLedgerEnabled: true,
+		UpstreamPricingLedgerDomains: []string{"4sapi.com", "other.example"},
+		ChannelCostClosureEnabled:    true, ChannelCostClosureDomains: []string{"4sapi.com"},
+		ChannelCostHMACKey: "0123456789abcdef0123456789abcdef", ChannelCostHMACKeyID: "cost-source-v1",
+		ChannelEconomicsReportEnabled: true,
+	}
+	if err := validateChannelCostClosureSettings(valid); err != nil {
+		t.Fatal(err)
+	}
+	invalid := []Settings{
+		{ChannelEconomicsReportEnabled: true},
+		{ChannelCostClosureEnabled: true},
+		{ChannelCostClosureEnabled: true, UpstreamUsageSyncEnabled: true},
+		{ChannelCostClosureEnabled: true, UpstreamUsageSyncEnabled: true, UpstreamPricingLedgerEnabled: true, UpstreamPricingLedgerDomains: []string{"4sapi.com"}},
+		{ChannelCostClosureEnabled: true, UpstreamUsageSyncEnabled: true, UpstreamPricingLedgerEnabled: true, UpstreamPricingLedgerDomains: []string{"4sapi.com"}, ChannelCostClosureDomains: []string{"other.example"}, ChannelCostHMACKey: "0123456789abcdef0123456789abcdef", ChannelCostHMACKeyID: "v1"},
+		{ChannelCostClosureEnabled: true, UpstreamUsageSyncEnabled: true, UpstreamPricingLedgerEnabled: true, UpstreamPricingLedgerDomains: []string{"4sapi.com"}, ChannelCostClosureDomains: []string{"4sapi.com"}, ChannelCostHMACKey: "too-short", ChannelCostHMACKeyID: "v1"},
+		{ChannelCostClosureEnabled: true, UpstreamUsageSyncEnabled: true, UpstreamPricingLedgerEnabled: true, UpstreamPricingLedgerDomains: []string{"4sapi.com"}, ChannelCostClosureDomains: []string{"4sapi.com"}, ChannelCostHMACKey: "0123456789abcdef0123456789abcdef"},
+		{ChannelCostClosureEnabled: true, UpstreamUsageSyncEnabled: true, UpstreamPricingLedgerEnabled: true, UpstreamPricingLedgerDomains: []string{"4sapi.com"}, ChannelCostClosureDomains: []string{"4sapi.com"}, ChannelCostHMACKey: "0123456789abcdef0123456789abcdef", ChannelCostHMACKeyID: "v1", LocalSnapshotOnly: true},
+		{ChannelCostClosureEnabled: true, UpstreamUsageSyncEnabled: true, UpstreamPricingLedgerEnabled: true, UpstreamPricingLedgerDomains: []string{"4sapi.com"}, ChannelCostClosureDomains: []string{"4sapi.com"}, ChannelCostHMACKey: "0123456789abcdef0123456789abcdef", ChannelCostHMACKeyID: "bad key id"},
+		{ChannelCostClosureEnabled: true, UpstreamUsageSyncEnabled: true, UpstreamPricingLedgerEnabled: true, UpstreamPricingLedgerDomains: []string{"4sapi.com"}, ChannelCostClosureDomains: []string{"4sapi.com"}, ChannelCostHMACKey: "0123456789abcdef0123456789abcdef", ChannelCostHMACKeyID: "v1", SessionSecret: "0123456789abcdef0123456789abcdef"},
+	}
+	for i, cfg := range invalid {
+		if err := validateChannelCostClosureSettings(cfg); err == nil {
+			t.Fatalf("invalid channel cost settings[%d] accepted", i)
 		}
 	}
 }

@@ -129,11 +129,22 @@ type ChannelManagementReport struct {
 	Enabled               bool                          `json:"enabled"`
 	Meta                  ChannelManagementMeta         `json:"meta"`
 	Finance               ChannelFinanceSettingsView    `json:"finance"`
+	CostClosure           ChannelCostClosureCapability  `json:"cost_closure"`
 	WebsiteGroups         []ChannelWebsiteGroupRateView `json:"website_groups"`
 	WebsiteGroupsSyncedAt int64                         `json:"website_groups_synced_at"`
 	Summary               ChannelManagementSummary      `json:"summary"`
 	Filters               ChannelManagementFilters      `json:"filters"`
 	Domains               []ChannelManagementDomain     `json:"domains"`
+}
+
+// ChannelCostClosureCapability is an explicit, read-only UI capability. The
+// pricing ledger is default-off and domain allowlisted independently from the
+// economics report, so the browser must not infer this state from finance edit
+// permission or another feature flag.
+type ChannelCostClosureCapability struct {
+	Enabled         bool     `json:"enabled"`
+	Domains         []string `json:"domains"`
+	RecoveryDomains []string `json:"recovery_domains"`
 }
 
 type channelUsageAgg struct {
@@ -722,6 +733,18 @@ func (m *Monitor) serveChannelManagementReport(c *gin.Context) {
 		return
 	}
 	report.Finance.CanEdit = c.GetInt("urole") >= roleRoot
+	report.CostClosure = ChannelCostClosureCapability{
+		Enabled: m.cfg.ChannelCostClosureEnabled,
+		Domains: append([]string(nil), m.cfg.ChannelCostClosureDomains...),
+	}
+	if report.Finance.CanEdit {
+		recoveryDomains, err := m.channelCostRecoveryDomains(c.Request.Context())
+		if err != nil {
+			c.JSON(503, gin.H{"error": "读取待生效计价任务失败"})
+			return
+		}
+		report.CostClosure.RecoveryDomains = recoveryDomains
+	}
 	c.JSON(200, report)
 }
 

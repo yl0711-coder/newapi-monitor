@@ -223,6 +223,10 @@ func (m *Monitor) saveChannelFinanceSiteHandler(c *gin.Context) {
 		return nil
 	})
 	if err != nil {
+		if errors.Is(err, errFinanceActivationConflict) {
+			c.JSON(http.StatusConflict, gin.H{"error": "受影响上游存在待整点生效的倍率变更，请等待生效或先取消"})
+			return
+		}
 		if errors.Is(err, errChannelFinanceConfirmationRequired) {
 			c.JSON(http.StatusConflict, gin.H{"error": "确认后将更新全站计价基准并为受影响主域名追加版本", "confirmation_required": true, "current_global_revision": currentRevision, "affected_domains": affectedDomains})
 			return
@@ -314,6 +318,10 @@ func (m *Monitor) saveChannelFinanceDomainHandler(c *gin.Context) {
 		return err
 	})
 	if err != nil {
+		if errors.Is(err, errFinanceActivationConflict) {
+			c.JSON(http.StatusConflict, gin.H{"error": "该上游存在待整点生效的倍率变更，请等待生效或先取消"})
+			return
+		}
 		if errors.Is(err, errChannelFinanceConfirmationRequired) {
 			c.JSON(http.StatusConflict, gin.H{"error": "确认后将创建新的主域名充值比例版本，历史版本会保留", "confirmation_required": true, "current_version": version, "next_version": version + 1})
 			return
@@ -421,6 +429,10 @@ func (m *Monitor) saveChannelFinanceChannelHandler(c *gin.Context) {
 		return err
 	})
 	if err != nil {
+		if errors.Is(err, errFinanceActivationConflict) {
+			c.JSON(http.StatusConflict, gin.H{"error": "该上游存在待整点生效的倍率变更，请等待生效或先取消"})
+			return
+		}
 		if errors.Is(err, errChannelFinanceConfirmationRequired) {
 			c.JSON(http.StatusConflict, gin.H{"error": "确认后将创建新的渠道成本版本，历史版本会保留", "confirmation_required": true, "current_version": version, "next_version": version + 1})
 			return
@@ -562,6 +574,12 @@ func (m *Monitor) saveChannelFinanceDomainRatesHandler(c *gin.Context) {
 			if len(groups) == 0 {
 				return fmt.Errorf("渠道 #%d 没有关联服务分组，无法保存倍率", row.ChannelID)
 			}
+			// 一个物理渠道只有一份当前上游成本口径。先删除旧版遗留的
+			// 已移除分组行，再为当前分组完整重建；历史值已经保存在追加式
+			// ChannelFinanceVersion 中，不应继续污染当前配置的一致性判断。
+			if err := tx.Where("channel_id = ?", row.ChannelID).Delete(&ChannelFinanceChannelCost{}).Error; err != nil {
+				return err
+			}
 			for _, group := range groups {
 				cost := ChannelFinanceChannelCost{ChannelID: row.ChannelID, Grp: group, UpstreamGroupName: row.UpstreamGroupName, Multiplier: row.UpstreamMultiplier, DiscountFactor: row.UpstreamDiscountFactor, EffectiveAt: now, UpdatedAt: now, UpdatedBy: updatedBy}
 				if err := tx.Clauses(clause.OnConflict{Columns: []clause.Column{{Name: "channel_id"}, {Name: "grp"}}, UpdateAll: true}).Create(&cost).Error; err != nil {
@@ -578,6 +596,10 @@ func (m *Monitor) saveChannelFinanceDomainRatesHandler(c *gin.Context) {
 		return err
 	})
 	if err != nil {
+		if errors.Is(err, errFinanceActivationConflict) {
+			c.JSON(http.StatusConflict, gin.H{"error": "该上游存在待整点生效的倍率变更，请等待生效或先取消"})
+			return
+		}
 		if errors.Is(err, errChannelFinanceConfirmationRequired) {
 			c.JSON(http.StatusConflict, gin.H{"error": "确认后将创建新的渠道倍率版本，历史版本会保留", "confirmation_required": true, "current_version": version, "next_version": version + 1})
 			return
@@ -616,6 +638,9 @@ func channelFinanceDomainRatesEqual(tx *gorm.DB, domain string, rows []channelFi
 		byGroup := make(map[string]ChannelFinanceChannelCost, len(current))
 		for _, cost := range current {
 			byGroup[cost.Grp] = cost
+		}
+		if len(byGroup) != len(groups) {
+			return false, nil
 		}
 		for _, group := range groups {
 			cost, ok := byGroup[group]

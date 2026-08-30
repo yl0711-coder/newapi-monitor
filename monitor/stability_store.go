@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"time"
 
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
@@ -33,6 +34,8 @@ type StabilityHourSample struct {
 	MaxUseTime          int   `gorm:"column:max_use_time"`
 	Tokens              int64
 	Quota               int64
+	RefundRecords       int64 `gorm:"column:refund_records"`
+	RefundQuota         int64 `gorm:"column:refund_quota"`
 	Err4xx              int64 `gorm:"column:err_4xx"`
 	Err5xx              int64 `gorm:"column:err_5xx"`
 	ErrTimeout          int64 `gorm:"column:err_timeout"`
@@ -267,15 +270,16 @@ func stabilityProblemHash(source, message string) string {
 // rollupStabilityHours 从分钟表生成分组×渠道×模型小时表。查询和写入都发生在
 // Monitor 本地 SQLite，调用频率不会增加 NewAPI 生产库压力。
 func (m *Monitor) rollupStabilityHours(sinceTs int64) error {
-	return m.storeDB.Exec(`INSERT INTO stability_hour_samples (
+	return m.storeDB.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Exec(`INSERT INTO stability_hour_samples (
 		hour_ts, channel_id, model_name, grp, success, anomaly, failed,
 		anomaly_billed, anomaly_free, anomaly_stream, anomaly_quota,
-		sum_use_time, max_use_time, tokens, quota, err_4xx, err_5xx, err_timeout, err_other,
+		sum_use_time, max_use_time, tokens, quota, refund_records, refund_quota, err_4xx, err_5xx, err_timeout, err_other,
 		traffic_class_version)
 		SELECT (bucket_ts/3600)*3600 AS hour_ts, channel_id, model_name, grp,
 		  SUM(success), SUM(anomaly), SUM(failed),
 		  SUM(anomaly_billed), SUM(anomaly_free), SUM(anomaly_stream), SUM(anomaly_quota),
-		  SUM(sum_use_time), MAX(max_use_time), SUM(tokens), SUM(quota),
+		  SUM(sum_use_time), MAX(max_use_time), SUM(tokens), SUM(quota), SUM(refund_records), SUM(refund_quota),
 		  SUM(err_4xx), SUM(err_5xx), SUM(err_timeout), SUM(err_other), ?
 		FROM metric_samples WHERE bucket_ts >= ? AND traffic_class_version = ?
 		  AND NOT EXISTS (
@@ -292,8 +296,13 @@ func (m *Monitor) rollupStabilityHours(sinceTs int64) error {
 		  tokens=excluded.tokens, quota=excluded.quota,
 		  err_4xx=excluded.err_4xx, err_5xx=excluded.err_5xx,
 		  err_timeout=excluded.err_timeout, err_other=excluded.err_other,
+		  refund_records=excluded.refund_records, refund_quota=excluded.refund_quota,
 		  traffic_class_version=excluded.traffic_class_version`,
-		userTrafficClassificationVersion, sinceTs, userTrafficClassificationVersion, userTrafficClassificationVersion).Error
+			userTrafficClassificationVersion, sinceTs, userTrafficClassificationVersion, userTrafficClassificationVersion).Error; err != nil {
+			return err
+		}
+		return m.enqueueChangedEconomicsLocalHoursTx(tx, sinceTs, time.Now().Unix(), 16)
+	})
 }
 
 func (m *Monitor) rollupStabilityRejections(sinceTs int64) error {

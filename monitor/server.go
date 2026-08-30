@@ -219,6 +219,7 @@ func (m *Monitor) RegisterRoutes(r *gin.Engine) {
 		view.GET("/sync/overview", m.serveSyncOverview)                                   // 统一同步摘要:只读本地状态投影
 		view.GET("/sync/workloads", m.serveSyncWorkloads)                                 // 有界任务明细:默认仅异常成员,支持分页
 		view.GET("/channels/report", m.serveChannelManagementReport)                      // 渠道管理:主域名→厂商→渠道→服务分组的本地汇总
+		view.GET("/channels/economics", m.serveChannelEconomicsReport)                    // 渠道成本:只读本地不可变经济账当前发布头
 		// 排障两个接口挂 noStoreSensitive：响应含客户标识、令牌名、渠道名/ID、
 		// 上游主域名与错误原文，属敏感诊断数据，不得被任何中间层缓存。
 		// 用中间件而非在 handler 里逐个 c.Header：handler 有多条提前 return
@@ -291,6 +292,12 @@ func (m *Monitor) RegisterRoutes(r *gin.Engine) {
 		rootChannels.POST("/upstream", m.saveChannelUpstreamHandler)
 		rootChannels.POST("/upstream/sync", m.syncChannelUpstreamHandler)
 		rootChannels.POST("/upstream/usage-sync", m.syncChannelUpstreamUsageHandler)
+		rootChannels.GET("/cost/sources", m.listChannelCostSourcesHandler)
+		rootChannels.POST("/cost/bindings", m.saveChannelCostBindingHandler)
+		rootChannels.GET("/cost/proposals", m.listChannelPricingProposalsHandler)
+		rootChannels.GET("/cost/proposals/:proposal_key/impact", m.getChannelPricingProposalImpactHandler)
+		rootChannels.POST("/cost/proposals/:proposal_key/decisions", m.decideChannelPricingProposalHandler)
+		rootChannels.POST("/cost/activations/:activation_id/cancel", m.cancelChannelFinanceActivationHandler)
 	}
 }
 

@@ -58,8 +58,11 @@ func TestSampleWindowSQLPlaceholderCount(t *testing.T) {
 	if strings.Contains(q, "UNIX_TIMESTAMP()") {
 		t.Error("WHERE 不得用 UNIX_TIMESTAMP() 算相对窗口,回填需要显式区间")
 	}
-	if !strings.Contains(q, "type IN (2,5)") {
-		t.Error("只取消费日志与错误日志两类")
+	if !strings.Contains(q, "type IN (2,5,6)") {
+		t.Error("来源聚合必须读取消费、错误和退款日志；退款只进入退款字段")
+	}
+	if !strings.Contains(q, "type=6") || !strings.Contains(q, "refund_quota") || !strings.Contains(q, "refund_records") {
+		t.Error("退款日志必须独立聚合，不能混入成功/异常/失败请求数")
 	}
 	for _, marker := range []string{
 		"COALESCE(token_name,'')='模型测试' AND COALESCE(content,'')='模型测试'",

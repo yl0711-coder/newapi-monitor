@@ -345,11 +345,37 @@ func (m *Monitor) loadChannelFinanceSnapshot(ctx context.Context) (channelFinanc
 	if tx := m.storeDB.WithContext(ctx).Find(&channelCosts); tx.Error != nil {
 		return s, fmt.Errorf("读取渠道级上游倍率: %w", tx.Error)
 	}
+	// 当前倍率表表达“现在生效的渠道配置”，而追加式版本表才负责保留历史。
+	// 渠道从一个服务分组移出后，旧版可能仍在当前表留下对应行。那些行不能
+	// 继续参与当前渠道的一致性判断，否则用户即使把所有现行分组保存为相同
+	// 倍率，页面仍会永久提示“历史配置不一致”。
+	var channelSnaps []ChannelSnap
+	if tx := m.storeDB.WithContext(ctx).Select("id", "groups", "deleted_at").Find(&channelSnaps); tx.Error != nil {
+		return s, fmt.Errorf("读取渠道当前分组: %w", tx.Error)
+	}
+	currentGroups := make(map[int]map[string]bool, len(channelSnaps))
+	for _, snap := range channelSnaps {
+		if snap.DeletedAt != 0 {
+			continue
+		}
+		groups := sortedUnique(splitList(snap.Groups))
+		if len(groups) == 0 {
+			continue
+		}
+		set := make(map[string]bool, len(groups))
+		for _, group := range groups {
+			set[group] = true
+		}
+		currentGroups[snap.ID] = set
+	}
 	for _, cost := range channelCosts {
 		if s.channelGroupCost[cost.ChannelID] == nil {
 			s.channelGroupCost[cost.ChannelID] = map[string]ChannelFinanceChannelCost{}
 		}
 		s.channelGroupCost[cost.ChannelID][cost.Grp] = cost
+		if groups, current := currentGroups[cost.ChannelID]; current && !groups[cost.Grp] {
+			continue
+		}
 		if canonical, exists := s.channelCanonicalCost[cost.ChannelID]; !exists {
 			s.channelCanonicalCost[cost.ChannelID] = cost
 		} else if !sameChannelFinanceCost(canonical, cost) {
@@ -671,6 +697,13 @@ func currentChannelFinanceVersionJSON(tx *gorm.DB, domain string) (string, error
 }
 
 func appendChannelFinanceVersion(tx *gorm.DB, domain, snapshot string, now int64, updatedBy string) (int64, bool, error) {
+	var pending int64
+	if err := tx.Model(&ChannelFinanceActivationSlot{}).Where("domain = ?", domain).Count(&pending).Error; err != nil {
+		return 0, false, err
+	}
+	if pending > 0 {
+		return 0, false, errFinanceActivationConflict
+	}
 	var latest ChannelFinanceVersion
 	err := tx.Where("domain = ?", domain).Order("version DESC").First(&latest).Error
 	if err == nil {
@@ -982,6 +1015,10 @@ func (m *Monitor) saveChannelFinanceHandler(c *gin.Context) {
 				"global_changed": globalChanged, "affected_domains": affectedDomains,
 				"current_global_updated_at": currentGlobalUpdatedAt, "current_global_revision": currentGlobalRevision,
 			})
+			return
+		}
+		if errors.Is(err, errFinanceActivationConflict) {
+			c.JSON(http.StatusConflict, gin.H{"error": "该上游存在待整点生效的倍率变更，请等待生效或先取消"})
 			return
 		}
 		if errors.Is(err, errChannelFinanceVersionConflict) || errors.Is(err, errChannelFinanceGlobalConflict) {

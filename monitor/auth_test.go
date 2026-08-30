@@ -195,6 +195,9 @@ func TestRoleGating(t *testing.T) {
 	if c := do("/channels/report", "none"); c != 401 {
 		t.Errorf("未登录 /channels/report 应 401,实际 %d", c)
 	}
+	if c := do("/channels/economics?hours=24", "none"); c != 401 {
+		t.Errorf("未登录 /channels/economics 应 401,实际 %d", c)
+	}
 	if c := do("/capacity/report", "none"); c != 401 {
 		t.Errorf("未登录 /capacity/report 应 401,实际 %d", c)
 	}
@@ -213,6 +216,9 @@ func TestRoleGating(t *testing.T) {
 	}
 	if c := do("/channels/report", "admin"); c != 200 {
 		t.Errorf("管理员 /channels/report 应 200,实际 %d", c)
+	}
+	if c := do("/channels/economics?hours=24", "admin"); c != 200 {
+		t.Errorf("管理员 /channels/economics 应 200,实际 %d", c)
 	}
 	if c := do("/capacity/report", "admin"); c != 200 {
 		t.Errorf("管理员 /capacity/report 应 200,实际 %d", c)
