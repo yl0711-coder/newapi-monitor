@@ -1268,25 +1268,41 @@ func logTypeName(t int) string {
 // logOther 日志 other JSON 里【仅】我们要用的安全字段:首字延迟 + 计价摘要所需的价格/倍率。
 // 渠道等内部字段(channel_id/channel_name/admin_info…)不在此结构 → 天然不解析、不外传。
 type logOther struct {
-	FRT                     float64  `json:"frt"`
-	ModelPrice              *float64 `json:"model_price"`
-	ModelRatio              *float64 `json:"model_ratio"`
-	GroupRatio              *float64 `json:"group_ratio"`
-	UserGroupRatio          *float64 `json:"user_group_ratio"`
-	CacheTokens             float64  `json:"cache_tokens"`
-	CacheRatio              *float64 `json:"cache_ratio"`
-	CacheCreationTokens     float64  `json:"cache_creation_tokens"`
-	CacheCreationRatio      *float64 `json:"cache_creation_ratio"`
-	CacheCreationTokens5m   float64  `json:"cache_creation_tokens_5m"`
-	CacheCreationRatio5m    *float64 `json:"cache_creation_ratio_5m"`
-	CacheCreationTokens1h   float64  `json:"cache_creation_tokens_1h"`
-	CacheCreationRatio1h    *float64 `json:"cache_creation_ratio_1h"`
-	Image                   bool     `json:"image"`
-	ImageRatio              *float64 `json:"image_ratio"`
-	ViolationFeeCode        string   `json:"violation_fee_code"`
-	BillingMode             string   `json:"billing_mode"`        // "tiered_expr"=阶梯计费(此时 model_ratio/model_price 均为0,不能当标准单价展示)
-	CompletionRatio         *float64 `json:"completion_ratio"`    // 输出倍率,new-api 展开区"计费过程"计算输出价格要用
-	RequestPath             string   `json:"request_path"`        // 请求路径,普通用户可见字段(非渠道/内部信息)
+	FRT                   float64  `json:"frt"`
+	ModelPrice            *float64 `json:"model_price"`
+	ModelRatio            *float64 `json:"model_ratio"`
+	GroupRatio            *float64 `json:"group_ratio"`
+	UserGroupRatio        *float64 `json:"user_group_ratio"`
+	CacheTokens           float64  `json:"cache_tokens"`
+	CacheRatio            *float64 `json:"cache_ratio"`
+	CacheCreationTokens   float64  `json:"cache_creation_tokens"`
+	CacheCreationRatio    *float64 `json:"cache_creation_ratio"`
+	CacheCreationTokens5m float64  `json:"cache_creation_tokens_5m"`
+	CacheCreationRatio5m  *float64 `json:"cache_creation_ratio_5m"`
+	CacheCreationTokens1h float64  `json:"cache_creation_tokens_1h"`
+	CacheCreationRatio1h  *float64 `json:"cache_creation_ratio_1h"`
+	Image                 bool     `json:"image"`
+	ImageRatio            *float64 `json:"image_ratio"`
+	ViolationFeeCode      string   `json:"violation_fee_code"`
+	BillingMode           string   `json:"billing_mode"`     // "tiered_expr"=阶梯计费(此时 model_ratio/model_price 均为0,不能当标准单价展示)
+	CompletionRatio       *float64 `json:"completion_ratio"` // 输出倍率,new-api 展开区"计费过程"计算输出价格要用
+	RequestPath           string   `json:"request_path"`     // 请求路径,普通用户可见字段(非渠道/内部信息)
+	// ErrorType / ErrorCode 是 **new-api 自己对这次失败的分类**,只在 type=5 上有值。
+	//
+	// ★ 这两个是事实,不是我方推断 ★
+	// 2026-08-28 在生产 type=5 行上实测:other 顶层固定含 error_type / error_code /
+	// status_code / channel_name / channel_type / request_path。
+	// 它们的判别力比 HTTP 状态码强得多——例如 408 只说"超时",而
+	// error_code=channel:response_time_exceeded 明说是上游渠道超时。
+	// 归因层据此可把一批原本"待判"的行判掉,见 logchain_fault.go 的 errorCode 判据。
+	//
+	// **绝不可用于客户面**:它们含渠道内部信息(channel_name/channel_type 同层)。
+	// 本结构体已被排障(管理员面)与客户 Portal 共用,故只在排障路径读取这两个字段。
+	ErrorType string `json:"error_type"`
+	ErrorCode string `json:"error_code"`
+	// UpstreamStatusCode 是上游返回的 HTTP 状态码。content 里的 "status_code=" 前缀
+	// 是同一个值的文本形态;有这个字段后不必只靠正则从自由文本抠。
+	UpstreamStatusCode      int      `json:"status_code"`
 	TaskID                  string   `json:"task_id"`             // 退款(type=6)关联的异步任务ID / 消费(type=2)异步任务日志的关联任务ID
 	Reason                  string   `json:"reason"`              // 退款(type=6)失败原因,普通用户可见
 	IsModelMapped           bool     `json:"is_model_mapped"`     // 是否发生了模型映射(展开区"请求并计费模型"/"实际模型"两行)

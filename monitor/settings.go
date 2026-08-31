@@ -78,9 +78,22 @@ type Settings struct {
 	UpstreamSyncTimeoutSec int  // MONITOR_UPSTREAM_SYNC_TIMEOUT_SECONDS,默认 15
 	// 上游使用日志与余额是两条独立同步链。日志全局开关默认关闭，
 	// 只有全局开关与账户开关同时开启才会后台读取。页面访问绝不会触发上游请求。
-	UpstreamUsageSyncEnabled  bool // MONITOR_UPSTREAM_USAGE_SYNC_ENABLED,默认 false；新功能灰度闸门
-	UpstreamUsageSyncMinutes  int  // MONITOR_UPSTREAM_USAGE_SYNC_MINUTES,默认 30，最小 15
-	UpstreamUsageBackfillDays int  // MONITOR_UPSTREAM_USAGE_BACKFILL_DAYS,默认 90，首次低频补齐范围
+	UpstreamUsageSyncEnabled bool // MONITOR_UPSTREAM_USAGE_SYNC_ENABLED,默认 false；新功能灰度闸门
+	// UpstreamErrorLogSyncEnabled 上游**错误**日志采集（MONITOR_UPSTREAM_ERRORLOG_SYNC_ENABLED）。
+	//
+	// ★ 为什么与 UpstreamUsageSyncEnabled 分开，不复用同一个开关 ★
+	//
+	// 两者拉的是同一个端点（/api/log/self）但目的与频率完全不同：
+	//   用量同步  type=2，量大（我方一天 4 万行量级），折进小时桶，为的是账单
+	//   错误采集  type=5，量小（一天几百条），逐条留存，为的是排障
+	// 混在一个开关里会互相牵制：想提高错误采集频率就被迫也提高账单同步频率，
+	// 而后者请求量大、更容易撞上游速率限制。
+	//
+	// 但**依赖账户级的 UsageSyncEnabled**：那是管理员对「允许读这个上游的日志」
+	// 的授权，错误日志同属日志，不应绕过它另开一道授权。
+	UpstreamErrorLogSyncEnabled bool
+	UpstreamUsageSyncMinutes    int // MONITOR_UPSTREAM_USAGE_SYNC_MINUTES,默认 30，最小 15
+	UpstreamUsageBackfillDays   int // MONITOR_UPSTREAM_USAGE_BACKFILL_DAYS,默认 90，首次低频补齐范围
 	// 上游计价账本与既有消费汇总使用独立灰度闸门和域名白名单。
 	// 支持 NewAPI、Sub2API 和 AICodeWith；默认关闭且空白名单，迁移不会发起任何上游请求。
 	UpstreamPricingLedgerEnabled       bool     // MONITOR_UPSTREAM_PRICING_LEDGER_ENABLED，默认 false
@@ -266,6 +279,7 @@ func LoadSettings() Settings {
 		UpstreamSyncMinutes:                      envInt("MONITOR_UPSTREAM_SYNC_MINUTES", 5),
 		UpstreamSyncTimeoutSec:                   envInt("MONITOR_UPSTREAM_SYNC_TIMEOUT_SECONDS", 15),
 		UpstreamUsageSyncEnabled:                 env("MONITOR_UPSTREAM_USAGE_SYNC_ENABLED", "false") == "true",
+		UpstreamErrorLogSyncEnabled:              env("MONITOR_UPSTREAM_ERRORLOG_SYNC_ENABLED", "false") == "true",
 		UpstreamUsageSyncMinutes:                 envInt("MONITOR_UPSTREAM_USAGE_SYNC_MINUTES", 30),
 		UpstreamUsageBackfillDays:                envInt("MONITOR_UPSTREAM_USAGE_BACKFILL_DAYS", 90),
 		UpstreamPricingLedgerEnabled:             env("MONITOR_UPSTREAM_PRICING_LEDGER_ENABLED", "false") == "true",

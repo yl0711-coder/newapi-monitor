@@ -2391,8 +2391,11 @@ func (m *Monitor) syncChannelUpstreamHandler(c *gin.Context) {
 }
 
 func (m *Monitor) startChannelUpstreamSync(ctx context.Context) {
-	if !m.cfg.UpstreamSyncEnabled && !m.cfg.UpstreamUsageSyncEnabled {
-		slog.Info("上游余额与消费账单同步均已关闭")
+	// 三个开关任一打开就得起 worker。漏掉 ErrorLogSync 会导致
+	// 「只开错误日志采集」时整个 worker 不启动，而日志里只说余额和账单关了，
+	// 排查的人看不出错误日志为什么没动。
+	if !m.cfg.UpstreamSyncEnabled && !m.cfg.UpstreamUsageSyncEnabled && !m.cfg.UpstreamErrorLogSyncEnabled {
+		slog.Info("上游余额、消费账单与错误日志采集均已关闭")
 		return
 	}
 
@@ -2411,6 +2414,9 @@ func (m *Monitor) startChannelUpstreamSync(ctx context.Context) {
 	if !m.cfg.UpstreamUsageSyncEnabled {
 		slog.Info("上游使用日志同步处于灰度关闭状态，余额同步不受影响")
 	}
+	if !m.cfg.UpstreamErrorLogSyncEnabled {
+		slog.Info("上游错误日志采集处于灰度关闭状态，其余同步不受影响")
+	}
 	goSourceEpoch(ctx, func(ctx context.Context) {
 		defer m.channelUpstreamHTTPClient().CloseIdleConnections()
 		timer := time.NewTimer(8 * time.Second)
@@ -2428,6 +2434,9 @@ func (m *Monitor) startChannelUpstreamSync(ctx context.Context) {
 			if m.cfg.UpstreamPricingLedgerEnabled {
 				m.syncDueUpstreamPricing(ctx)
 			}
+			if m.cfg.UpstreamErrorLogSyncEnabled {
+				m.syncDueUpstreamErrorLogs(ctx)
+			}
 		}
 		ticker := time.NewTicker(time.Minute)
 		defer ticker.Stop()
@@ -2444,6 +2453,11 @@ func (m *Monitor) startChannelUpstreamSync(ctx context.Context) {
 				}
 				if m.cfg.UpstreamPricingLedgerEnabled {
 					m.syncDueUpstreamPricing(ctx)
+				}
+				// 错误日志采集自带 5 分钟节流与失败退避（见
+				// upstreamErrorLogSyncInterval），这里每分钟叫一次它自己会跳过。
+				if m.cfg.UpstreamErrorLogSyncEnabled {
+					m.syncDueUpstreamErrorLogs(ctx)
 				}
 			}
 		}

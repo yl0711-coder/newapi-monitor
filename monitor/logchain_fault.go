@@ -58,6 +58,85 @@ func logChainFaultFromUpstream(content string) bool {
 	return strings.HasPrefix(content, "status_code=")
 }
 
+// ═══════════ 上游自己的失败分类（other.error_code）═══════════
+//
+// ★★ 这一层的证据强度高于状态码，也高于原文正则 ★★
+//
+// error_code 是 new-api **自己**对这次失败的分类，是它写下的原值——
+// 而状态码映射与原文正则都是我方对文本的解读。同一个 HTTP 408 可能是上游渠道
+// 超时、也可能是我方闸门中断，状态码分不开；error_code 直接说了是哪种。
+//
+// 判据来源：2026-08-28 生产实测近 3 天 1256 条 type=5 行逐类核对。
+// 每条规则的注释里记了实测条数——那是判断可信度的唯一依据。
+//
+// ★ 一条关键前提，实测确认 ★
+// 这 1256 条**全部**带 status_code= 前缀（from_ours = 0），即 error_code 一律
+// 来自上游响应，不存在"我方 new-api 自己生成"的情形。因此 code 里的 user
+// 指的是**我方在上游的账号**，不是我方客户——insufficient_user_quota 是
+// 上游说我方账号余额不足，属我方问题。
+//
+// 若将来出现不带前缀的 error_code（我方自己分类），本表判据会失准：
+// 那时 user 的所指会翻转成我方客户。故 logChainFaultByErrorCode 的调用处
+// 加了来源门（requireUpstream），与本文件既有做法一致。
+var logChainFaultByErrorCode = map[string]struct {
+	fault      string
+	confidence string
+	why        string
+}{
+	// —— 明确指向上游 ——
+	// 40 条，全部 status_code=408。上游明说是**它自己的渠道**响应超时，
+	// 而 408 在状态码层是"待判"（分不清我方闸门还是上游超时）。
+	"channel:response_time_exceeded": {faultUpstream, faultConfHigh,
+		"上游明示其自身渠道响应超时（error_code=channel:response_time_exceeded），责任方在上游"},
+	// 42 条（41 条 new_api_error + 1 条 openai_error），全部 status_code=500。
+	// 上游的 new-api 连请求都没发出去——那是上游侧的分发失败。
+	"do_request_failed": {faultUpstream, faultConfHigh,
+		"上游未能向其渠道发出请求（error_code=do_request_failed），失败发生在上游侧"},
+	// 20 条，全部 500。上游返回的响应体本身不合法。
+	"bad_response_body": {faultUpstream, faultConfHigh,
+		"上游返回的响应体不合法（error_code=bad_response_body），责任方在上游"},
+	// 2 条，400。上游把失败明确归给了它的上游。
+	"upstream_error": {faultUpstream, faultConfHigh,
+		"上游明示错误来自其更上游（error_code=upstream_error）"},
+	// 1 条，502。HTTP/2 流层错误，发生在与上游的连接上。
+	"upstream_http2_stream_error": {faultUpstream, faultConfHigh,
+		"与上游的 HTTP/2 流出错（error_code=upstream_http2_stream_error）"},
+	// 1 条，500，claude_error。读流失败，样本极少故只给中可信度。
+	"stream_read_error": {faultUpstream, faultConfMid,
+		"读取上游流失败（error_code=stream_read_error）。样本仅 1 条，结论待更多数据验证"},
+	// 1 条，403。上游的合规策略拦截，我方无法左右。
+	"session_blocked_by_cyber_policy": {faultUpstream, faultConfMid,
+		"上游合规策略拦截了会话（error_code=session_blocked_by_cyber_policy）。样本仅 1 条"},
+
+	// —— 明确指向我方 ——
+	// 4 条，全部 403。**注意语义**：这里的 user 是我方在上游的账号（见上方前提），
+	// 上游在说"你的余额不够"，需要我方去上游充值，不是客户的问题。
+	"insufficient_user_quota": {faultOurs, faultConfHigh,
+		"上游报告我方账号额度不足（error_code=insufficient_user_quota），需到该上游充值"},
+	// 2 条，429。上游对我方账号限流。可行动方在我方（降并发或申请提额），
+	// 但也可能是上游限额过低，故给中可信度。
+	"user:concurrency_limited": {faultOurs, faultConfMid,
+		"上游对我方账号做了并发限流（error_code=user:concurrency_limited）。可降并发或向上游申请提额"},
+
+	// —— 明确指向客户 ——
+	// 20 条，全部 400。客户传的数组超长，请求本身不合法。
+	"array_above_max_length": {faultDownstream, faultConfHigh,
+		"客户请求中的数组超过长度上限（error_code=array_above_max_length），请求本身不合法"},
+	// 1 条，400。参数值非法。样本少故中可信度。
+	"invalid_value": {faultDownstream, faultConfMid,
+		"客户请求参数值非法（error_code=invalid_value）。样本仅 1 条"},
+
+	// ★ 以下三类**故意不判**，实测确认它们没有判别力 ★
+	//
+	//	unknown_error            490 条，状态码 400~524 全谱，原文也无线索
+	//	bad_response_status_code 466 条，只是"上游返回了坏状态码"，判别力全在状态码本身
+	//	                         → 留给状态码层，本层不插手
+	//	model_not_found          166 条，可能是客户请求了不存在的模型、我方渠道配置
+	//	                         过期、或上游下架了模型；三者措辞相同，无法区分
+	//
+	// 把它们写进本表会让"待判"变成"看似确定实则瞎猜"——那比不给结论更糟。
+}
+
 // logChainFaultMessageRule 按错误原文的语义归因。**必须在状态码之前判**：
 // 上游会用 503/404 这种看起来像上游故障的状态码报告它自己的路由失败，
 // 只看状态码会把语义完全不同的情况混为一谈。
@@ -102,10 +181,26 @@ var logChainFaultMessageRules = []logChainFaultMessageRule{
 		// "status_code=408, 响应时间 125.03s 超过阈值 120.00s"。
 		// 责任方是我方——阈值是我方设的；但上游确实慢到了阈值附近，
 		// 所以依据里同时给出两条线索，让人自己判断该调阈值还是换上游。
-		pattern:    regexp.MustCompile(`超过阈值|exceeds threshold`),
-		fault:      faultOurs,
-		confidence: faultConfMid,
-		why:        "我方超时闸门主动中断（响应时间超过我方设定阈值）。可考虑调阈值或换更快的上游",
+		// ★ 2026-08-28 补来源门。原先没有，导致 40 条被判错 ★
+		//
+		// 原注释举的例子是 "status_code=408, 响应时间 125.03s 超过阈值 120.00s"，
+		// 并断言"责任方是我方——阈值是我方设的"。**那个断言错了**：
+		// 带 status_code= 前缀说明这句话是上游说的，超的是**上游的**阈值。
+		//
+		// 决定性证据（生产实测）：这些行我方 use_time **全为 0**。
+		// 若是我方闸门在 120s 掐断，use_time 应 ≈120；为 0 说明我方压根没观测到
+		// 125.03s 这个时长——观测到它的是上游。且 other.error_code =
+		// channel:response_time_exceeded，上游自己也指向它的渠道。
+		//
+		// 加门后这些行落到 error_code 层，判为上游（见 logChainFaultByErrorCode）。
+		// 本规则保留，用于我方**自己**的闸门消息（无前缀那种）。
+		//
+		// 与验收报告 P2-03 同一类缺陷：同族规则里别人有来源门，这条漏了。
+		pattern:         regexp.MustCompile(`超过阈值|exceeds threshold`),
+		requireUpstream: boolPtr(false),
+		fault:           faultOurs,
+		confidence:      faultConfMid,
+		why:             "我方超时闸门主动中断（响应时间超过我方设定阈值，且无 status_code 前缀即非上游返回）。可考虑调阈值或换更快的上游",
 	},
 	{
 		// "全部上游暂时不可用"分不清：可能上游真的全挂，
@@ -246,6 +341,20 @@ func logChainAttributeFault(r LogChainRow, tags []string) logChainFault {
 				continue
 			}
 			return logChainFault{Fault: rule.fault, Confidence: rule.confidence, Why: rule.why}
+		}
+		// 上游自己的失败分类。放在原文规则之后、状态码之前：
+		//   - 之后：原文规则里有几条带来源门的精细判据（如"无可用渠道"要分我方/上游），
+		//     那些比 error_code 更具体，不能被这一层抢走
+		//   - 之前：error_code 是上游写下的原值，判别力强于我方对状态码的解读
+		//     （408 在状态码层是待判，而 channel:response_time_exceeded 明确指向上游）
+		//
+		// 来源门：只在 content 带 status_code= 前缀时采信。实测这 1256 条全部带前缀，
+		// 但若将来出现我方自己分类的 error_code，其中 user 的所指会翻转成我方客户，
+		// 那时本表判据会反向出错——这道门是防止那种静默失准。
+		if r.UpstreamErrorCode != "" && logChainFaultFromUpstream(r.Content) {
+			if rule, ok := logChainFaultByErrorCode[r.UpstreamErrorCode]; ok {
+				return logChainFault{Fault: rule.fault, Confidence: rule.confidence, Why: rule.why}
+			}
 		}
 		if m := logChainStatusCodeRe.FindStringSubmatch(r.Content); m != nil {
 			code, _ := strconv.Atoi(m[1])

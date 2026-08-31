@@ -250,6 +250,9 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
   .lc-status{font-size:12px;color:var(--text-muted)}
   .lc-alert{background:rgba(239,68,68,.1);border:1px solid rgba(239,68,68,.35);color:var(--text);border-radius:9px;padding:11px 14px;font-size:13px;margin-bottom:12px}
   .lc-notes{font-size:12px;color:var(--text-muted);margin-bottom:10px;display:flex;flex-direction:column;gap:3px}
+  /* 范围被收窄是警告级,不能与普通提示同色:普通提示是"顺便告诉你",
+     这条是"你看到的范围不是你要的范围"。看漏了会据此得出错误结论。 */
+  .lc-note-warn{color:var(--yellow,#fbbf24);font-weight:600}
   /* 盲区提示:默认收起(自用系统,展开占地方),但标题始终可见——
      它的价值在于"你没主动去看时也知道它存在",防止"查不到"被读成"没发生过" */
   .lc-blind{background:rgba(245,158,11,.08);border:1px solid rgba(245,158,11,.3);border-radius:9px;padding:9px 14px;margin-bottom:14px}
@@ -260,6 +263,61 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
   .lc-blind-head:hover{color:#fbbf24}
   .lc-blind-details:focus-visible .lc-blind-head{outline:2px solid var(--yellow);outline-offset:2px;border-radius:4px}
   .lc-blind-list{margin:8px 0 2px;padding-left:18px;font-size:12px;color:var(--text-muted);line-height:1.65}
+  /* 影响面判读:蓝色区分于盲区的黄色——盲区是警告(查不到),影响面是结论(集中在谁身上)。
+     同样默认收起但标题常驻:形状结论本身就是最该先看见的一行。 */
+  .lc-radius{background:rgba(59,130,246,.08);border:1px solid rgba(59,130,246,.3);border-radius:9px;padding:9px 14px;margin-bottom:14px}
+  .lc-radius-head{font-size:12.5px;font-weight:600;color:var(--blue,#60a5fa);cursor:pointer;user-select:none;list-style:none}
+  .lc-radius-head::-webkit-details-marker{display:none}
+  .lc-radius-head::before{content:'▸ ';display:inline-block;transition:transform .15s}
+  .lc-radius-details[open] .lc-radius-head::before{content:'▾ '}
+  .lc-radius-head:hover{color:#93c5fd}
+  .lc-radius-details:focus-visible .lc-radius-head{outline:2px solid var(--blue,#60a5fa);outline-offset:2px;border-radius:4px}
+  /* 「仅本页 N 条」必须紧跟形状结论,不能收在展开区里:
+     统计范围看不见时,单页结论会被当成全窗口结论 */
+  .lc-radius-sub{font-weight:400;color:var(--text-muted);margin-left:8px;font-size:11.5px}
+  .lc-radius-why{margin:8px 0 4px;font-size:12px;color:var(--text-muted);line-height:1.65}
+  .lc-radius-dims{display:flex;flex-wrap:wrap;gap:14px;margin-top:8px}
+  .lc-radius-dim{flex:1 1 260px;min-width:230px}
+  .lc-radius-table{width:100%;border-collapse:collapse;font-size:11.5px}
+  .lc-radius-table th{text-align:left;padding:3px 6px;color:var(--text-muted);font-weight:600;border-bottom:1px solid rgba(148,163,184,.2);white-space:nowrap}
+  .lc-radius-table td{padding:3px 6px;border-bottom:1px solid rgba(148,163,184,.08)}
+  .lc-radius-key{word-break:break-all}
+  .lc-radius-num{text-align:right;white-space:nowrap;font-variant-numeric:tabular-nums}
+  /* 「其余 N 项」行:淡一档并去掉下边框,让它读起来是汇总而不是又一个渠道。
+     不能隐藏或省略——只给 Top5 时这张表看起来就像问题只涉及这 5 项。 */
+  .lc-radius-other td{color:var(--text-muted);font-style:italic;border-bottom:none}
+
+  /* ═══ 上游关联的置信度色块 ═══
+     三档配色的用途是「一眼分出证据和推断」:
+       exact     绿 — 铁证,可直接据此下结论
+       probable  黄 — 推断,约两成可能认错,看之前留个心眼
+       ambiguous 灰 — 无法唯一对应,只给候选数,别拿来解释故障
+     配色沿用本页既有语义(绿=好/确定、黄=警示、灰=无信息),不引入新色系。 */
+  .lc-corr{display:inline-block;padding:1px 6px;border-radius:3px;font-size:11.5px;font-weight:600}
+  .lc-corr-exact{background:rgba(34,197,94,.16);color:var(--green,#22c55e)}
+  .lc-corr-probable{background:rgba(251,191,36,.16);color:var(--yellow,#fbbf24)}
+  .lc-corr-ambiguous{background:rgba(148,163,184,.16);color:var(--text-muted)}
+  /* 表格里的小圆点:让人不展开就知道这行有上游数据可看。
+     只有点、不带文字——表格宽度已经很紧,加文字会挤掉更要紧的列。 */
+  .lc-corr-dot{display:inline-block;width:6px;height:6px;border-radius:50%;margin-left:5px;vertical-align:middle}
+  .lc-corr-dot-exact{background:var(--green,#22c55e)}
+  .lc-corr-dot-probable{background:var(--yellow,#fbbf24)}
+  /* none 与 not_applicable 都是"没有上游数据",但含义相反:
+     none 值得去查采集,not_applicable 不必查。用色区分,避免看的人白跑一趟。 */
+  .lc-corr-none{background:rgba(148,163,184,.14);color:var(--text-muted);border:1px solid rgba(148,163,184,.3)}
+  .lc-corr-na{background:rgba(148,163,184,.1);color:var(--text-muted);border:1px dashed rgba(148,163,184,.35)}
+
+  /* 上游侧原文折叠块,紧跟我方原文之后——同一次失败的两侧视角,挨着才好对比。
+     用折叠而非"相同就隐藏":一行凭空消失与"压根没拿到上游日志"无法区分,
+     那正是「缺失绝不显示为零」要防的。标题如实写核对结果。 */
+  .lc-upraw{margin-top:10px}
+  .lc-upraw-head{font-size:12px;color:var(--text-muted);cursor:pointer;user-select:none;
+    padding:3px 0;list-style:none}
+  .lc-upraw-h
+...[264 chars omitted]...
+;color:var(--yellow,#fbbf24);font-weight:600}
+  .lc-upraw-diff>.lc-raw{border-left:2px solid var(--yellow,#fbbf24)}
+  .lc-radius-stale{font-size:12px;color:var(--text-muted);line-height:1.6}
   .lc-card{padding:0;overflow:hidden}
   .lc-tablewrap{overflow-x:auto}
   .lc-table{width:100%;min-width:1080px;border-collapse:collapse;table-layout:fixed}
@@ -777,7 +835,10 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
     <input id="lcModel" list="lcModelList" placeholder="模型名(精确)" aria-label="模型名">
     <datalist id="lcModelList"></datalist>
     <input id="lcUser" placeholder="客户 ID 或令牌名" aria-label="客户 ID 或令牌名" title="纯数字按用户 ID 精确查；其它按令牌名模糊查">
-    <input id="lcKeyword" placeholder="错误原文关键词" aria-label="错误原文关键词">
+    <!-- 事前提示比事后警告重要:人在输入时就该知道口径被限定,
+         而不是查完才发现消费行没被搜。由 TestLogChainKeywordHintStatesErrorScope 钉住。 -->
+    <input id="lcKeyword" placeholder="错误原文关键词" aria-label="错误原文关键词"
+      title="按错误原文模糊匹配，只搜错误行（type=5）。消费行的错误原文为空，纳入搜索只会拖慢查询并挤占客户查自己日志的通道。与 type / 异常筛选同时使用会被拒绝。">
     <button type="button" id="lcApply" class="lc-primary">查询</button>
     <button type="button" id="lcReset">重置</button>
     <span class="lc-sortbar" role="group" aria-label="时间排序">
@@ -789,6 +850,10 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
   </div>
 
   <div id="lcNotes" class="lc-notes" hidden></div>
+  <!-- 影响面判读（「看范围」层）。由 logchain.js 的 renderRadius 填充，
+       内容只覆盖单页，翻页后改显失效提示。放在盲区提示之前：
+       先看范围，再看这个范围里查不到什么。 -->
+  <div id="lcRadius" class="lc-radius" hidden></div>
   <div id="lcBlind" class="lc-blind" hidden></div>
 
   <div class="card lc-card">

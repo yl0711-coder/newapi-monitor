@@ -27,7 +27,9 @@ const (
 	// Bump this ID whenever either AutoMigrate model set or a post-migration
 	// schema/data transform changes. Restarts of the same plan reuse its pinned
 	// original snapshot, so they cannot prune away the old-image rollback point.
-	preMigrationPlanID               = "main-facts-schema-20260825-v18-pricing-adapters"
+	// v19 新增 ChannelUpstreamErrorLog（上游错误日志逐条明细）。
+	// AutoMigrate 模型集变了，按本常量上方的规则必须 bump。
+	preMigrationPlanID               = "main-facts-schema-20260827-v19-upstream-errorlog"
 	preMigrationSnapshotPrefix       = "pre-migrate-"
 	preMigrationReferencePrefix      = ".pre-migration-plan-"
 	preMigrationReferenceSuffix      = ".json"

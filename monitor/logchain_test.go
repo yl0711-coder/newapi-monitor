@@ -10,6 +10,7 @@ import (
 	"context"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -44,7 +45,10 @@ func TestScrubContentWouldBlankUpstreamErrors(t *testing.T) {
 func TestParseLogChainScopeClampsSpanAndLimit(t *testing.T) {
 	now := time.Date(2026, 8, 19, 15, 30, 0, 0, cstLocation)
 
-	s, err := parseLogChainScope(newLogChainCtx("days=9999&limit=99999"), now)
+	// 带 error_only 是为了绕开「多日 + 无筛选」闸门（guardWideSpanWithoutFilter）。
+	// 本用例测的是跨度与 limit 收敛，与那道闸门无关；不加筛选会先被 400 拦掉，
+	// 根本走不到收敛逻辑。
+	s, err := parseLogChainScope(newLogChainCtx("days=9999&limit=99999&error_only=true"), now)
 	if err != nil {
 		t.Fatalf("parseLogChainScope: %v", err)
 	}
@@ -90,7 +94,8 @@ func TestParseLogChainScopeRejectsContradictions(t *testing.T) {
 func TestParseLogChainScopeExplicitRangeTruncatesFromHead(t *testing.T) {
 	now := time.Date(2026, 8, 19, 12, 0, 0, 0, cstLocation)
 	// 跨度 200 天,应被截成最近 logChainMaxDays 天(保留 to 端,砍 from 端)。
-	s, err := parseLogChainScope(newLogChainCtx("from=2026-01-01&to=2026-07-19"), now)
+	// error_only 用于绕开「多日 + 无筛选」闸门，与本用例要测的截断无关。
+	s, err := parseLogChainScope(newLogChainCtx("from=2026-01-01&to=2026-07-19&error_only=true"), now)
 	if err != nil {
 		t.Fatalf("parseLogChainScope: %v", err)
 	}
@@ -101,6 +106,566 @@ func TestParseLogChainScopeExplicitRangeTruncatesFromHead(t *testing.T) {
 	wantTo := time.Date(2026, 7, 20, 0, 0, 0, 0, cstLocation).Unix() // to 当天整日纳入
 	if s.ToTs != wantTo {
 		t.Errorf("截断应保留 to 端: got=%d want=%d", s.ToTs, wantTo)
+	}
+}
+
+// ═══════════ 关键词限定错误行（验收报告 P2-02）═══════════
+//
+// 背景与生产实测（2026-08-26，nexus_ro 只读隧道，应用同形 SQL）：
+//
+//	type=5        31 天  5.0s  过
+//	type IN (2,5)  3 天  9.6s  ★ 跑满 8s 预算被掐断
+//
+// 成本不由跨度决定，由「需要读 content 的行数」决定：同一 3 天窗口内
+// type=2 有 105,414 行而其中 90,458 行 content 为空（最长 31 字符），
+// type=5 只有 883 行但全部有内容。为搜 883 行却要扫 105,414 行。
+//
+// 所以解法是限定 type=5，而**限定必须显式告知**是它的前提：
+// 静默收窄口径会让人以为"消费行里没有匹配的"，而实际是压根没查。
+
+// TestParseLogChainScopeKeywordForcesErrorScope 带关键词时口径必须被限定到错误行。
+func TestParseLogChainScopeKeywordForcesErrorScope(t *testing.T) {
+	now := time.Date(2026, 8, 19, 15, 30, 0, 0, cstLocation)
+
+	s, err := parseLogChainScope(newLogChainCtx("days=31&keyword=timeout"), now)
+	if err != nil {
+		t.Fatalf("parseLogChainScope: %v", err)
+	}
+	if !s.ErrorOnly {
+		t.Error("带关键词未限定错误行：默认口径含消费行，实测 3 天就跑满 8s 预算")
+	}
+	// ★ 必须记下收窄事实，否则无法告知 ★
+	if !s.KeywordScopedToErrors {
+		t.Error("未记录口径收窄：静默收窄会让人以为「消费行里没有匹配的」")
+	}
+	// 口径限定后跨度不再需要额外收窄——31 天在 type=5 上只要 5.0s。
+	span := time.Unix(s.ToTs, 0).Sub(time.Unix(s.FromTs, 0))
+	if span < 30*24*time.Hour {
+		t.Errorf("限定口径后跨度不应再被砍: got=%v", span)
+	}
+	if s.SpanCap.capped() {
+		t.Errorf("31 天等于硬上限，不该有跨度收窄: %v", s.SpanCap.Reasons)
+	}
+	// SQL 层必须真的落到 type = 5，只置 scope 字段不算修好。
+	where, _ := logChainWhere(s, nil)
+	if !strings.Contains(where, "type = 5") {
+		t.Errorf("WHERE 未限定 type = 5: %s", where)
+	}
+	if strings.Contains(where, "type IN (2,5)") {
+		t.Errorf("WHERE 仍是默认口径，消费行会被扫: %s", where)
+	}
+}
+
+// TestParseLogChainScopeKeywordNoDoubleNoticeWhenErrorOnly 用户已勾「只看错误」时，
+// 不再重复告知口径被限定——他自己选的，再说一遍是噪声。
+func TestParseLogChainScopeKeywordNoDoubleNoticeWhenErrorOnly(t *testing.T) {
+	now := time.Date(2026, 8, 19, 15, 30, 0, 0, cstLocation)
+
+	for _, q := range []string{"keyword=timeout&error_only=true", "keyword=timeout&type=5"} {
+		s, err := parseLogChainScope(newLogChainCtx(q), now)
+		if err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+		if !s.ErrorOnly {
+			t.Errorf("%s: 应为错误口径", q)
+		}
+		if s.KeywordScopedToErrors {
+			t.Errorf("%s: 用户已自选错误口径，不应再告知被收窄", q)
+		}
+	}
+}
+
+// TestParseLogChainScopeKeywordRejectsConflicts 关键词与非错误口径同传必须显式拒绝。
+//
+// 为什么拒绝而不是静默改：用户显式传了 type=2 却查到 type=5，
+// 属于"页面答的不是我问的"。本文件既有做法一致（见 anomaly 与 error_only 的三类冲突）。
+func TestParseLogChainScopeKeywordRejectsConflicts(t *testing.T) {
+	now := time.Date(2026, 8, 19, 15, 30, 0, 0, cstLocation)
+	cases := []struct {
+		name  string
+		query string
+	}{
+		{"关键词 + type=2（消费行）", "keyword=timeout&type=2"},
+		{"关键词 + type=1（充值）", "keyword=timeout&type=1"},
+		{"关键词 + anomaly=stream", "keyword=timeout&anomaly=stream"},
+		{"关键词 + anomaly=all", "keyword=timeout&anomaly=all"},
+		// err_anom 跨 type，但它的 type=2 那半同样 content 为空，
+		// 能匹配的只有 type=5 那部分——等于关键词自己就能给的结果。
+		{"关键词 + anomaly=err_anom", "keyword=timeout&anomaly=err_anom"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := parseLogChainScope(newLogChainCtx(tc.query), now)
+			if err == nil {
+				t.Fatal("矛盾组合必须显式拒绝，不能静默改口径")
+			}
+			// 报错必须说清冲突双方，否则人不知道该改哪个。
+			if !strings.Contains(err.Error(), "keyword") {
+				t.Errorf("报错未提 keyword: %v", err)
+			}
+		})
+	}
+}
+
+// TestParseLogChainScopeExplicitRangeCapReportsUserOriginalAsk 显式区间被砍时，
+// 报给用户的原始天数必须是**他真正要的**，不是收窄后的结果。
+//
+// 查 238 天只回来 31 天的数据，若只说"已收窄"或干脆不说，
+// 人会以为那 207 天真的没有请求。
+//
+// ★ RequestedDays 用「首次收窄时写入、之后不改写」的语义 ★
+// 目前只有一条跨度上限，看不出差别；但将来若再加一条收窄规则，
+// 后一条改写 RequestedDays 就会让页面显示"31 天收窄至 N 天"——
+// 而用户根本没要过 31 天。noteSpanCap 的首写不改写因此不是多余的。
+func TestParseLogChainScopeExplicitRangeCapReportsUserOriginalAsk(t *testing.T) {
+	now := time.Date(2026, 8, 26, 12, 0, 0, 0, cstLocation)
+
+	// error_only 用于绕开「多日 + 无筛选」闸门，与本用例要测的原始天数回显无关。
+	s, err := parseLogChainScope(
+		newLogChainCtx("from=2026-01-01&to=2026-08-26&error_only=true"), now)
+	if err != nil {
+		t.Fatalf("parseLogChainScope: %v", err)
+	}
+	// 2026-01-01 ~ 2026-08-27（to 当天整日纳入）= 238 天。
+	if s.SpanCap.RequestedDays != 238 {
+		t.Errorf("原始天数应是用户真正要的 238 天: got=%d", s.SpanCap.RequestedDays)
+	}
+	if len(s.SpanCap.Reasons) != 1 {
+		t.Fatalf("应记录一条收窄原因: %v", s.SpanCap.Reasons)
+	}
+	if !strings.Contains(s.SpanCap.Reasons[0], strconv.Itoa(logChainMaxDays)) {
+		t.Errorf("原因应指明跨度硬上限: %s", s.SpanCap.Reasons[0])
+	}
+	span := time.Unix(s.ToTs, 0).Sub(time.Unix(s.FromTs, 0))
+	if span > time.Duration(logChainMaxDays)*24*time.Hour {
+		t.Errorf("跨度应受硬上限约束: got=%v", span)
+	}
+}
+
+// TestNoteSpanCapKeepsFirstRequested noteSpanCap 的首写不改写语义。
+// 直接测方法：目前只有一条收窄规则，走不到叠加路径，但语义必须成立。
+func TestNoteSpanCapKeepsFirstRequested(t *testing.T) {
+	var sc logChainSpanCap
+	sc.noteSpanCap(238, "第一条")
+	sc.noteSpanCap(31, "第二条")
+
+	if sc.RequestedDays != 238 {
+		t.Errorf("首次写入的原始天数被改写: got=%d want=238", sc.RequestedDays)
+	}
+	if len(sc.Reasons) != 2 {
+		t.Errorf("原因应累积: %v", sc.Reasons)
+	}
+}
+
+// TestParseLogChainScopeMaxDaysCapIsReported 不带关键词时，31 天硬上限本身也必须回显。
+//
+// 这是补 P2-02 时发现的既有缺口：该收窄一直存在但从不告知，
+// 查 90 天只回来 31 天的数据，人会以为那 59 天真的没有请求。
+func TestParseLogChainScopeMaxDaysCapIsReported(t *testing.T) {
+	now := time.Date(2026, 8, 26, 12, 0, 0, 0, cstLocation)
+
+	// error_only 用于绕开「多日 + 无筛选」闸门，与本用例要测的硬上限回显无关。
+	s, err := parseLogChainScope(newLogChainCtx("days=90&error_only=true"), now)
+	if err != nil {
+		t.Fatalf("parseLogChainScope: %v", err)
+	}
+	if !s.SpanCap.capped() {
+		t.Fatal("31 天硬上限未回显：查 90 天只回来 31 天，人会以为那 59 天没有请求")
+	}
+	if s.SpanCap.RequestedDays != 90 {
+		t.Errorf("原始天数应为 90: got=%d", s.SpanCap.RequestedDays)
+	}
+	if len(s.SpanCap.Reasons) != 1 {
+		t.Errorf("无关键词只应有一条收窄原因: %v", s.SpanCap.Reasons)
+	}
+}
+
+// TestParseLogChainScopeNoKeywordKeepsDefaultScope 没有关键词时口径与跨度都不受影响。
+//
+// ★ 这条是本组里最要紧的一条 ★
+// 限定只针对关键词。渠道、模型、客户、request_id 都能收窄到索引上，
+// 默认口径下跨 31 天也不会跑满预算（实测 type IN (2,5) 不带 LIKE 时 1.4s）。
+// 若把限定误加到全部查询上，就是**削弱既有功能**——排障默认必须能同时看到
+// 消费行与错误行，那正是这个接口不建在事实表上的原因。
+func TestParseLogChainScopeNoKeywordKeepsDefaultScope(t *testing.T) {
+	now := time.Date(2026, 8, 19, 15, 30, 0, 0, cstLocation)
+
+	s, err := parseLogChainScope(newLogChainCtx("days=31&channel_id=52"), now)
+	if err != nil {
+		t.Fatalf("parseLogChainScope: %v", err)
+	}
+	span := time.Unix(s.ToTs, 0).Sub(time.Unix(s.FromTs, 0))
+	// 31 天窗口从当天 00:00 起算，含"现在"这一秒，故略超 30×24h。
+	if span < 30*24*time.Hour {
+		t.Errorf("无关键词的跨度被误收窄: got=%v，应保持 %d 天量级",
+			span, logChainMaxDays)
+	}
+	// days=31 恰好等于硬上限，未触发收窄，故不应有任何收窄标记。
+	if s.SpanCap.capped() {
+		t.Errorf("31 天恰好等于上限，不应标记收窄: %v", s.SpanCap.Reasons)
+	}
+	// 口径必须保持默认（同时含消费行与错误行），不得被误限定。
+	if s.ErrorOnly || s.KeywordScopedToErrors {
+		t.Errorf("无关键词不应限定错误口径: ErrorOnly=%v scoped=%v",
+			s.ErrorOnly, s.KeywordScopedToErrors)
+	}
+	where, _ := logChainWhere(s, nil)
+	if !strings.Contains(where, "type IN (2,5)") {
+		t.Errorf("无关键词应保持默认口径 type IN (2,5): %s", where)
+	}
+}
+
+// TestLogChainScopeEchoReportsSpanCap 跨度收窄必须出现在回显里，且前端要读得到。
+//
+// 后端收窄了但不告知，等于让人拿着一个更小的范围当成他要的范围——
+// 与「缺失绝不显示为零」同一条原则。
+func TestLogChainScopeEchoReportsSpanCap(t *testing.T) {
+	s := logChainScope{Limit: 50,
+		FromTs:  1_800_000_000 - int64(logChainMaxDays)*86400,
+		ToTs:    1_800_000_000,
+		SpanCap: logChainSpanCap{RequestedDays: 238, Reasons: []string{"单次查询跨度上限 31 天（防全表扫）"}},
+	}
+
+	echo := logChainScopeEcho(s)
+	cap, ok := echo["span_capped"].(gin.H)
+	if !ok {
+		t.Fatalf("回显缺 span_capped: %+v", echo)
+	}
+	if cap["requested_days"] != 238 {
+		t.Errorf("requested_days 应为用户原始诉求 238: got=%v", cap["requested_days"])
+	}
+	// ★ effective_days 必须由 from/to 算出，不能套用常量 ★
+	// 将来若再加一条收窄规则，最终跨度由后一条决定；写死常量就会报错数。
+	if cap["effective_days"] != logChainMaxDays {
+		t.Errorf("effective_days 应由 from/to 算出为 %d: got=%v",
+			logChainMaxDays, cap["effective_days"])
+	}
+	if reasons, ok := cap["reasons"].([]string); !ok || len(reasons) != 1 {
+		t.Fatalf("原因必须回显: %v", cap["reasons"])
+	}
+
+	// 未收窄时不得出现该键，否则前端会画出一条假警告。
+	plain := logChainScopeEcho(logChainScope{FromTs: 1000, ToTs: 2000, Limit: 50})
+	if _, exists := plain["span_capped"]; exists {
+		t.Error("未收窄却回显了 span_capped：页面会显示假警告")
+	}
+
+	// 前端必须读这些键并给出绕过办法。
+	js := string(logChainJS)
+	for _, want := range []string{"span_capped", "requested_days", "effective_days", "reasons"} {
+		if !strings.Contains(js, want) {
+			t.Errorf("前端未读 %q：收窄对用户不可见", want)
+		}
+	}
+}
+
+// TestLogChainScopeEchoReportsKeywordErrorScope 口径限定必须回显，且前端要显示。
+//
+// 静默把口径改小，人会以为"消费行里没有匹配的"，而实际是压根没查那一部分。
+func TestLogChainScopeEchoReportsKeywordErrorScope(t *testing.T) {
+	s := logChainScope{Keyword: "kw", ErrorOnly: true, KeywordScopedToErrors: true,
+		FromTs: 1000, ToTs: 2000, Limit: 50}
+
+	got, ok := logChainScopeEcho(s)["keyword_scoped_to_errors"].(gin.H)
+	if !ok {
+		t.Fatalf("回显缺 keyword_scoped_to_errors")
+	}
+	// 必须带原因：只说"已限定"，人无法判断该不该接受这个限定。
+	if r, _ := got["reason"].(string); r == "" {
+		t.Error("回显缺原因说明")
+	}
+
+	// 用户自己勾了错误口径时不该出现该键，否则是重复告知。
+	plain := logChainScopeEcho(logChainScope{Keyword: "kw", ErrorOnly: true,
+		FromTs: 1000, ToTs: 2000, Limit: 50})
+	if _, exists := plain["keyword_scoped_to_errors"]; exists {
+		t.Error("用户自选错误口径时不应回显被限定")
+	}
+
+	js := string(logChainJS)
+	if !strings.Contains(js, "keyword_scoped_to_errors") {
+		t.Error("前端未读 keyword_scoped_to_errors：口径收窄对用户不可见")
+	}
+	if !strings.Contains(js, "消费行未纳入") {
+		t.Error("前端未说明消费行未被搜索")
+	}
+}
+
+// TestLogChainScopeEchoEffectiveDaysNotHardcoded 只触发 31 天硬上限时，
+// effective_days 必须是 31，不能是关键词上限 3。
+//
+// 单独一条：上一个用例是叠加场景，若 effective_days 被写死成
+// 某个别的常量，只断言最终值的用例可能照样过，而这个会红。
+func TestLogChainScopeEchoEffectiveDaysNotHardcoded(t *testing.T) {
+	s := logChainScope{Limit: 50,
+		FromTs:  1_800_000_000 - int64(logChainMaxDays)*86400,
+		ToTs:    1_800_000_000,
+		SpanCap: logChainSpanCap{RequestedDays: 90, Reasons: []string{"单次查询跨度上限 31 天"}},
+	}
+
+	cap, ok := logChainScopeEcho(s)["span_capped"].(gin.H)
+	if !ok {
+		t.Fatal("回显缺 span_capped")
+	}
+	if cap["effective_days"] != logChainMaxDays {
+		t.Errorf("只触发硬上限时 effective_days 应为 %d，疑似写死了关键词上限: got=%v",
+			logChainMaxDays, cap["effective_days"])
+	}
+}
+
+// ═══════════ 多日 + 无筛选的止损闸门（开发说明书 18.7）═══════════
+//
+// 生产实测：默认口径不加筛选时 days=1/2 过（1.8s / 1.1s），
+// days=3/7/14/31 全部 HTTP 500（8.4s 跑满预算）。根因是缺 FORCE INDEX，
+// 那是下一轮的独立设计；本闸门只把 8.4 秒的超时变成立刻返回的 400。
+
+// ═══════════ FROM 子句的索引选择（开发说明书 18.7）═══════════
+//
+// 生产实测：优化器在带筛选时选得比强制更好（channel_id→ref/idx_logs_channel_id 等
+// 精准等值索引），无条件强制会把 5 种现在好用的查法弄成超时。
+// 它只在「完全无筛选」这一格判错（翻成 ALL/none 全表扫，LIMIT 无法短路）。
+
+// TestLogChainSourceClauseForcesIndexOnlyWithoutFilter 强制索引只在完全无筛选时加。
+//
+// ★ 本组最要紧的一条 ★
+// 带筛选却强制，会把实测 2.6~7.9 秒能出结果的查法变成 9.4 秒超时——
+// 那是「新增功能妨碍既有功能」的教科书情形。
+func TestLogChainSourceClauseForcesIndexOnlyWithoutFilter(t *testing.T) {
+	base := logChainScope{FromTs: 100, ToTs: 200, Limit: 50}
+
+	// 无筛选：必须强制。这一格生产上是确定性失败的。
+	if got := mysqlLogChainSourceClause(base, nil); !strings.Contains(got, "FORCE INDEX (idx_created_at_type)") {
+		t.Errorf("无筛选应强制 idx_created_at_type，否则优化器全表扫、LIMIT 无法短路: %s", got)
+	}
+
+	// 任一筛选条件都必须让优化器自选。每种单独测——漏一个就会在生产上
+	// 把那一类查法弄成超时，而单元测试不碰真实数据、发现不了。
+	cases := []struct {
+		name  string
+		mut   func(*logChainScope)
+		chans []int64
+	}{
+		{"error_only", func(s *logChainScope) { s.ErrorOnly = true }, nil},
+		{"type", func(s *logChainScope) { s.LogType = 2 }, nil},
+		{"anomaly", func(s *logChainScope) { s.Anomaly = anomalyAll }, nil},
+		{"keyword", func(s *logChainScope) { s.Keyword = "kw" }, nil},
+		{"user_id", func(s *logChainScope) { s.UserID = 130 }, nil},
+		{"channel_id", func(s *logChainScope) { s.ChannelID = 32 }, nil},
+		{"domain", func(s *logChainScope) { s.Domain = "example.com" }, nil},
+		{"model", func(s *logChainScope) { s.Model = "gpt-4o" }, nil},
+		{"group", func(s *logChainScope) { s.Group = "default" }, nil},
+		{"request_id", func(s *logChainScope) { s.RequestID = "rid" }, nil},
+		{"域名反查出的渠道列表", func(s *logChainScope) {}, []int64{1, 2}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := base
+			tc.mut(&s)
+			got := mysqlLogChainSourceClause(s, tc.chans)
+			if strings.Contains(got, "FORCE INDEX") {
+				t.Errorf("带 %s 应让优化器自选（实测它选得更好），强制会导致超时: %s", tc.name, got)
+			}
+		})
+	}
+
+	// ★ token_name 单独用必须**仍然强制** ★
+	// 它是前导通配 LIKE，用不上 idx_logs_token_name，行为与无筛选一致
+	// （实测 2 天起优化器翻成 ALL/none；强制后 4531ms 出结果）。
+	// 若把它当成「有筛选」，FROM 不强制、闸门也放行，2 天起必然 500。
+	tk := base
+	tk.TokenName = "abc"
+	if got := mysqlLogChainSourceClause(tk, nil); !strings.Contains(got, "FORCE INDEX") {
+		t.Errorf("token_name 单独用不通过索引收窄，应与无筛选同处理: %s", got)
+	}
+	// 但 token_name 搭配一个真能收窄的条件时，要让优化器自选。
+	tk.ChannelID = 32
+	if got := mysqlLogChainSourceClause(tk, nil); strings.Contains(got, "FORCE INDEX") {
+		t.Errorf("token_name + channel_id 有可收窄条件，应让优化器自选: %s", got)
+	}
+}
+
+// TestLogChainSourceClauseSkipsForceIndexOnNonMySQL SQLite 不认 FORCE INDEX。
+//
+// 单元测试的假生产库就是 SQLite。少了这道门，所有涉及假生产库的用例会一起报语法错。
+// 与客户侧 logSourceClause 同一做法。
+func TestLogChainSourceClauseSkipsForceIndexOnNonMySQL(t *testing.T) {
+	m := newTestMonitor(t)
+	// 无筛选 scope：若没有驱动门，这一格会拼出 FORCE INDEX。
+	bare := logChainScope{FromTs: 1, ToTs: 2}
+	if mysqlLogChainSourceClause(bare, nil) == "logs" {
+		t.Fatal("用例前提不成立：该 scope 在 MySQL 下本应强制索引，否则测不出驱动门")
+	}
+
+	m.prodDB = newFakeProdDB(t) // SQLite
+	if got := m.logChainSourceClause(bare, nil); got != "logs" {
+		t.Errorf("非 MySQL 驱动不得拼 FORCE INDEX（SQLite 会报语法错）: %s", got)
+	}
+
+	// prodDB 为 nil 时也不能拼——快照只读模式下会走到这条路径。
+	m.prodDB = nil
+	if got := m.logChainSourceClause(bare, nil); got != "logs" {
+		t.Errorf("prodDB 为 nil 时应返回裸 logs: %s", got)
+	}
+}
+
+// TestLogChainQueryUsesSourceClause 钉住 queryLogChain 真的用了那个函数。
+// 函数写对但 SQL 里没拼，等于没做——而两者各自的单测都会是绿的。
+func TestLogChainQueryUsesSourceClause(t *testing.T) {
+	src := logChainGoSource(t)
+	if !strings.Contains(src, "m.logChainSourceClause(s, domainChans)") {
+		t.Error("queryLogChain 的 FROM 未使用 logChainSourceClause，索引选择不生效")
+	}
+	if strings.Contains(src, `" FROM logs WHERE "`) {
+		t.Error("queryLogChain 仍在拼裸 FROM logs，索引选择被绕过了")
+	}
+}
+
+// TestLogChainGuardAndSourceClauseShareOneFilterJudgement 闸门与 FROM 的判据必须一致。
+//
+// 两处若各写一份，会漂成「闸门认为有筛选所以放行，FROM 却认为无筛选去强制索引」——
+// 那种错配在生产上表现为某类查法莫名变慢，而单元测试各自都是绿的。
+func TestLogChainGuardAndSourceClauseShareOneFilterJudgement(t *testing.T) {
+	// 跨度足够长，保证闸门那条路径会被求值。
+	long := logChainScope{FromTs: 0, ToTs: int64(logChainWideSpanMinDays+1) * 86400, Limit: 50}
+
+	for _, tc := range []struct {
+		name string
+		mut  func(*logChainScope)
+	}{
+		{"无筛选", func(s *logChainScope) {}},
+		{"error_only", func(s *logChainScope) { s.ErrorOnly = true }},
+		{"channel_id", func(s *logChainScope) { s.ChannelID = 32 }},
+		{"model", func(s *logChainScope) { s.Model = "m" }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := long
+			tc.mut(&s)
+			guardBlocks := s.guardWideSpanWithoutFilter() != nil
+			forces := strings.Contains(mysqlLogChainSourceClause(s, nil), "FORCE INDEX")
+			// 闸门拦 ⟺ 无筛选 ⟺ FROM 强制。两者必须同步。
+			if guardBlocks != forces {
+				t.Errorf("判据漂了：闸门拦=%v 而 FROM 强制=%v。"+
+					"两处必须共用 logChainHasNarrowingFilter", guardBlocks, forces)
+			}
+		})
+	}
+}
+
+// TestLogChainDaysSpanned 自然日计数。边界：左闭右开，to 落在次日 00:00 算一天。
+func TestLogChainDaysSpanned(t *testing.T) {
+	d := func(s string) int64 {
+		tm, err := time.ParseInLocation("2006-01-02 15:04:05", s, cstLocation)
+		if err != nil {
+			t.Fatalf("解析 %s: %v", s, err)
+		}
+		return tm.Unix()
+	}
+	cases := []struct {
+		name     string
+		from, to int64
+		want     int
+	}{
+		{"同日整天", d("2026-08-26 00:00:00"), d("2026-08-27 00:00:00"), 1},
+		{"同日部分", d("2026-08-26 00:00:00"), d("2026-08-26 15:30:00"), 1},
+		{"跨两日", d("2026-08-25 00:00:00"), d("2026-08-27 00:00:00"), 2},
+		{"跨三日", d("2026-08-24 00:00:00"), d("2026-08-27 00:00:00"), 3},
+		{"非法区间", d("2026-08-26 00:00:00"), d("2026-08-26 00:00:00"), 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := logChainDaysSpanned(tc.from, tc.to); got != tc.want {
+				t.Errorf("got=%d want=%d", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestLogChainGuardRejectsWideSpanWithoutFilter 多日无筛选必须被拦。
+func TestLogChainGuardRejectsWideSpanWithoutFilter(t *testing.T) {
+	now := time.Date(2026, 8, 26, 15, 30, 0, 0, cstLocation)
+
+	// 门槛是 6，故 7 天起被拦。2/3/5 天由强制索引接住（实测 4988/5551/5984ms），
+	// 不在这里断言——那些属于放行清单。
+	// token_name 单独用也在内：它不通过索引收窄，实测 2 天起就超时。
+	for _, q := range []string{"days=7", "days=10", "days=31",
+		"days=7&token_name=abc", "from=2026-08-01&to=2026-08-26"} {
+		_, err := parseLogChainScope(newLogChainCtx(q), now)
+		if err == nil {
+			t.Errorf("%s: 多日无筛选应被拦（该组合生产上必然 500）", q)
+			continue
+		}
+		// 报错必须给出可执行的下一步，否则人只知道"不行"不知道"怎么办"。
+		for _, want := range []string{"只看错误", "渠道", "缩到"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("%s: 报错未提 %q，人不知道该怎么改: %v", q, want, err)
+			}
+		}
+	}
+}
+
+// TestLogChainGuardAllowsShortSpanAndFilteredQueries ★ 本组最要紧的一条 ★
+//
+// 闸门只拦「完全无筛选」。带筛选的多日查法实测大部分在预算内
+// （channel_id 3.5s、user_id=130 1.1s、model 6.3s、group 6.7s），
+// **拦宽了就是砍掉现在能用的查法**——那正是「不得妨碍既有功能」要防的。
+//
+// 页面恒发单日（logchain.js 的 from=to=同一天），也必须放行，
+// 否则这道闸门会把整个排障页面打死。
+func TestLogChainGuardAllowsShortSpanAndFilteredQueries(t *testing.T) {
+	now := time.Date(2026, 8, 26, 15, 30, 0, 0, cstLocation)
+
+	allowed := []struct {
+		name  string
+		query string
+	}{
+		// 页面真实请求形状：from=to=同一天。这条挂了整个排障页就打不开。
+		{"页面单日（from=to）", "from=2026-08-26&to=2026-08-26"},
+		{"默认（未传 days）", ""},
+		// 无筛选放行到 5 天，靠 logChainSourceClause 的强制索引接住。
+		// 实测（08-27 10:32，表 126 万行）：1 天 2587ms、2 天 4988ms、
+		// 3 天 5551ms、5 天 5984ms，全部在 8 秒预算内。
+		{"1 天无筛选", "days=1"},
+		{"2 天无筛选（靠强制索引）", "days=2"},
+		{"3 天无筛选（靠强制索引）", "days=3"},
+		{"5 天无筛选（门槛边界内）", "days=5"},
+		// 以下都是 31 天带筛选，实测全部在预算内。
+		{"31 天 + 只看错误", "days=31&error_only=true"},
+		{"31 天 + type", "days=31&type=2"},
+		{"31 天 + 异常档", "days=31&anomaly=all"},
+		{"31 天 + 渠道", "days=31&channel_id=32"},
+		{"31 天 + 客户 ID", "days=31&user_id=130"},
+		{"31 天 + 模型", "days=31&model=gpt-5.4"},
+		{"31 天 + 分组", "days=31&group=default"},
+		// 令牌名单独用**不**在放行清单里：它不通过索引收窄，实测 2 天起就超时。
+		// 搭配一个真能收窄的条件才放行。
+		{"31 天 + 令牌名 + 渠道", "days=31&token_name=abc&channel_id=32"},
+		{"31 天 + Request ID", "days=31&request_id=xyz"},
+		{"31 天 + 上游域名", "days=31&domain=example.com"},
+		// 关键词已被 scopeKeywordToErrors 强制为 error_only，算有筛选。
+		{"31 天 + 关键词", "days=31&keyword=timeout"},
+	}
+	for _, tc := range allowed {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := parseLogChainScope(newLogChainCtx(tc.query), now); err != nil {
+				t.Errorf("这个查法当前可用，闸门不得拦: %v", err)
+			}
+		})
+	}
+}
+
+// TestLogChainKeywordHintStatesErrorScope page.html 的事前提示必须说明口径限定。
+//
+// 事前提示比事后警告重要：人在输入时就该知道消费行不会被搜，
+// 而不是查完才发现——那时他已经据此得出"消费行里没有匹配的"这个错结论了。
+func TestLogChainKeywordHintStatesErrorScope(t *testing.T) {
+	for _, want := range []string{"只搜错误行", "type=5"} {
+		if !strings.Contains(pageHTML, want) {
+			t.Errorf("关键词输入框的事前提示应含 %q", want)
+		}
+	}
+	// 必须说明与 type / 异常筛选互斥，否则人撞上 400 才知道。
+	if !strings.Contains(pageHTML, "会被拒绝") {
+		t.Error("事前提示未说明与 type / 异常筛选互斥")
 	}
 }
 

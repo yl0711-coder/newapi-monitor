@@ -206,17 +206,44 @@ func TestLogChainFaultInternalErrorRequiresUpstreamOrigin(t *testing.T) {
 // TestLogChainFaultOurTimeoutGate 我方超时闸门主动中断 → 我方。
 // 生产原文（08-24 实测 5 条）："status_code=408, 响应时间 125.03s 超过阈值 120.00s"。
 // 这个状态码是 408，但语义是我方阈值生效，不是上游超时。
+// TestLogChainFaultOurTimeoutGate 超时闸门归因，**必须按来源分两侧**。
+//
+// ★ 2026-08-28 修正：本用例原先断言错误行为 ★
+//
+// 原版用带 status_code= 前缀的原文断言判"我方"。那是错的——带前缀说明这句话
+// 是上游说的，超的是**上游的**阈值。生产实测的决定性证据：
+//   - 这些行我方 use_time **全为 0**（若我方闸门在 120s 掐断，应 ≈120）
+//   - other.error_code = channel:response_time_exceeded，上游自己指向它的渠道
+//   - 近 3 天 41 条全部如此
+//
+// 判错的代价是方向相反：判我方会让人去调我方阈值，而该做的是换上游或找上游。
+//
+// 现在两侧都钉：带前缀 → 上游；不带前缀（我方自己生成）→ 我方。
 func TestLogChainFaultOurTimeoutGate(t *testing.T) {
-	got := logChainAttributeFault(LogChainRow{
+	// 我方自己的闸门消息：无 status_code 前缀。
+	ours := logChainAttributeFault(LogChainRow{
 		Type:    5,
-		Content: "status_code=408, 响应时间 125.03s 超过阈值 120.00s",
+		Content: "响应时间 125.03s 超过阈值 120.00s",
 	}, nil)
-	if got.Fault != faultOurs {
-		t.Errorf("我方超时闸门应判我方，got=%s（依据: %s）", got.Fault, got.Why)
+	if ours.Fault != faultOurs {
+		t.Errorf("我方超时闸门应判我方，got=%s（依据: %s）", ours.Fault, ours.Why)
 	}
 	// 依据里要提到阈值，人才知道该调阈值还是换上游。
-	if !strings.Contains(got.Why, "阈值") {
-		t.Errorf("依据应说明是我方阈值触发: %s", got.Why)
+	if !strings.Contains(ours.Why, "阈值") {
+		t.Errorf("依据应说明是我方阈值触发: %s", ours.Why)
+	}
+
+	// 上游返回的同措辞消息：带 status_code 前缀，不得判我方。
+	upstream := logChainAttributeFault(LogChainRow{
+		Type:              5,
+		Content:           "status_code=408, 响应时间 125.03s 超过阈值 120.00s",
+		UpstreamErrorCode: "channel:response_time_exceeded",
+	}, nil)
+	if upstream.Fault == faultOurs {
+		t.Errorf("上游返回的超阈值消息不得判我方（超的是上游阈值）: 依据=%s", upstream.Why)
+	}
+	if upstream.Fault != faultUpstream {
+		t.Errorf("应判上游: got=%s 依据=%s", upstream.Fault, upstream.Why)
 	}
 }
 

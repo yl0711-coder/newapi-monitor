@@ -801,7 +801,7 @@ func (m *Monitor) openStore(path string) error {
 		&StabilityProblemIngestState{}, &StabilityProblemStage{}, &StabilityProblemClassificationMigration{}, &StabilityProblemLiveCursor{},
 		&StabilityHourIngestState{}, &StabilityBackfillJob{},
 		&ChannelFinanceSetting{}, &ChannelSaleGroupRate{}, &WebsiteGroupCatalog{}, &ChannelDomainCost{}, &ChannelDomainGroupCost{}, &ChannelFinanceChannelCost{}, &ChannelFinanceVersion{},
-		&ChannelUpstreamAccount{}, &ChannelUpstreamUsageHour{}, &NewAPIUsageBackfillCheckpoint{}, &AICodeWithKeySyncState{}, &AICodeWithUsageStage{}, &AICodeWithUsageRound{}, &UpstreamHostCircuit{},
+		&ChannelUpstreamAccount{}, &ChannelUpstreamUsageHour{}, &ChannelUpstreamErrorLog{}, &UpstreamErrorLogSyncState{}, &NewAPIUsageBackfillCheckpoint{}, &AICodeWithKeySyncState{}, &AICodeWithUsageStage{}, &AICodeWithUsageRound{}, &UpstreamHostCircuit{},
 		&ChannelUpstreamPricingHourEvidence{}, &ChannelUpstreamPricingHourState{}, &ChannelUpstreamPricingObservedState{}, &ChannelUpstreamPricingChangeEvent{}, &ChannelUpstreamPricingSyncState{}, &ChannelUpstreamPricingPageCheckpoint{}, &AICodeWithPricingCheckpoint{},
 		&InfraSample{}, &HostContainerSnapshot{}, &NginxMinuteSample{}, &NginxIngestBatch{}, &NginxSourceState{},
 		&AlertConfig{}, &AlertLog{}, &TrackedUser{}, &CustomerGroup{}, &UsageMemberControl{}, &UsageMemberAudit{}, &UsageMemberControlMigration{}, &FollowUpLog{}, &UsageSettings{},

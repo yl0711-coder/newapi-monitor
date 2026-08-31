@@ -43,6 +43,95 @@ const (
 	logChainGateTimeout = 15 * time.Second
 )
 
+// ★★ 关键词搜索必须限定错误行（type=5）——验收报告 P2-02 的解法 ★★
+//
+// 关键词搜的是 `content LIKE '%kw%'`（见 logChainWhere）——前导通配，用不上索引，
+// 只能逐行读 content 做模式匹配。而 usageDetailGate 容量只有 1，
+// 客户 Portal 查自己日志走同一条泳道（客户翻页自己的 SQL 预算只有 3 秒，
+// 见 usage.go queryGroupLogs）——排障占满 8 秒，就是让客户被一个比自己重
+// 两倍多的查询挡在门外。这与「新增功能不得妨碍既有功能」直接冲突。
+//
+// ★ 曾以为收窄跨度就能解决，生产实测推翻了 ★
+//
+// 2026-08-26 在 nexus_ro 只读隧道上实测（MAX_EXECUTION_TIME 8000，应用同形 SQL）：
+//
+//	口径             跨度        耗时      结果
+//	type=5          31 天      5.0s      过
+//	type=5           3 天      1.7s      过
+//	type IN (2,5)    3 天      9.6s      ★ 跑满预算被掐断
+//	type IN (2,5)    1 天      2.1s      过（余量很小）
+//
+// **成本不由跨度决定，由「需要读 content 的行数」决定。** 同一 3 天窗口内：
+//
+//	type    行数        content 为空    平均长度
+//	2       105,414     90,458          1 字符（最长 31）
+//	5       883         0               95 字符（最长 506）
+//
+// 消费行的 content 几乎全是空的，最长 31 字符——**里面根本没有可搜的东西**。
+// 为搜那 883 行有内容的错误，却要扫 105,414 行（119 倍），9 万多行扫了个空。
+// 所以对症的不是砍跨度，而是限定口径：限定 type=5 后 31 天也只要 5.0s。
+//
+// 语义上也一致：这个输入框在界面上就叫「错误原文关键词」。
+//
+// ★ 限定必须显式告知 ★
+// 静默把口径改小，人会以为"消费行里没有匹配的"，而实际是压根没查。
+// 因此 scope 回显里带 keyword_scoped_to_errors，前端必须显示。
+//
+// keywordScopedReason 是告知文案里的原因，集中一处避免前后端各写一份。
+const keywordScopedReason = "关键词按全文匹配、用不上索引；消费行的错误原文为空，" +
+	"纳入搜索只会拖慢查询并挤占客户查自己日志的通道"
+
+// logChainWideSpanMinDays 「多日 + 完全无筛选」的拦截门槛（自然日计）。
+//
+// ★ 这道闸门止损的是一个尚未修的既有缺陷，不是它的修复 ★
+//
+// 2026-08-26 生产实测：默认口径、不加任何筛选条件时——
+//
+//	days=1  → 200, 1.8s      days=3  → ★ 500, 8.4s
+//	days=2  → 200, 1.1s      days=7/14/31 → ★ 500, 8.4s
+//
+// 根因是 queryLogChain 的 FROM 没有 FORCE INDEX：测试流量排除条件要读 content 等
+// 非索引列，覆盖索引失效后优化器改判全表扫（EXPLAIN 实证 type=ALL, key=NULL,
+// rows=1,070,910），一旦走 filesort，ORDER BY created_at DESC 必须排完所有匹配行，
+// LIMIT 51 完全无法短路。客户 Portal 的 logSourceClause 早已用 FORCE INDEX 解决，
+// 排障这条路径没继承——那是下一轮的独立设计，见开发说明书 18.7。
+//
+// ★ 为什么只拦「完全无筛选」 ★
+//
+// 带筛选的多日查法实测大部分是好的：channel_id 3.5s、user_id=130 1.1s、
+// model 6.3s、group 6.7s 都在预算内。**拦宽了就会砍掉现在能用的查法**，
+// 那正是「新增功能不得妨碍既有功能」要防的。只有「无筛选」是确定性失败。
+//
+// ★★ 这个门槛会随日增量漂，不是稳定常数；改动前必须重测 ★★
+//
+// 它与 logChainSourceClause 的强制索引是**配套的两层**：
+// 强制索引把能救的跨度救回来，本闸门拦住连强制索引也救不动的部分。
+// **只改一层会失配**——若把门槛压到强制索引的能力之下，那些本已能查的跨度
+// 会在进 SQL 前被 400 掉，等于白做了索引那层。
+//
+// 2026-08-27 10:32 生产实测（表 1,262,215 行，无筛选，LIMIT 101）：
+//
+//	跨度   优化器自选        强制 created_at_type   窗口内行数
+//	1 天   3143ms ✓          2587ms ✓                40,232
+//	2 天   9519ms ★超时      4988ms ✓               179,670
+//	3 天   9479ms ★超时      5551ms ✓               204,645
+//	5 天   9480ms ★超时      5984ms ✓               228,273
+//	7 天   9457ms ★超时      7675ms ✓               307,477
+//	10 天  9544ms ★超时      9488ms ★超时           585,094
+//	14/21/31 天  全超时       全超时                 70 万～110 万
+//
+// 取 6（放行到 5 天）而不是 8（放行到 7 天）：7 天那格 7675ms 距 8000ms 预算
+// 只剩 325ms（4% 余量），而当日上午 10:32 已积 40,232 行、按前一日走势整日会到
+// 13 万——那一格很快会翻。5 天及以内每格都有 2 秒以上余量。
+//
+// 历史：初版取 3（依据 08-26 18:26「2 天过 1.08s、3 天挂」），当晚 20:00 复测
+// 2 天已稳定超时，改为 2；加强制索引后重测，改为 6。**同一个常数三天内改了三次**，
+// 这本身就说明固定天数只是止损、不是解法——悬崖由「要读多少行 content」决定。
+//
+// 代价：`user_id=1`（高频账号）与 `token_name` 单独用在长跨度上仍会超时。
+// 那两格带筛选、走 ref 索引，是命中后回表行数太多，索引选择层面无解，本闸门不管。
+const logChainWideSpanMinDays = 6
+
 // 异常筛选取值。不认识的值直接 400，不静默忽略——参数拼错会得到"全部请求"，
 // 而人会以为自己在看异常清单。
 const (
@@ -387,6 +476,26 @@ type LogChainRow struct {
 	// Content 是 logs.content 原文，未经 scrubContent。错误(type=5)的上游返回全在这里。
 	Content string `json:"content,omitempty"`
 
+	// —— 上游自己的失败分类（事实，取自 other，非我方推断）——
+	//
+	// 2026-08-28 生产实测：type=5 行的 other 顶层固定含 error_type / error_code /
+	// status_code。它们比 HTTP 状态码有判别力得多——例如 408 只说"超时"，而
+	// error_code=channel:response_time_exceeded 明说是上游渠道超时。
+	//
+	// 归因层优先用它们（见 logchain_fault.go），因为**它们是上游写下的原值**，
+	// 可信度高于我方对状态码与原文的解读。
+	UpstreamErrorType string `json:"upstream_error_type,omitempty"`
+	UpstreamErrorCode string `json:"upstream_error_code,omitempty"`
+	// UpstreamStatusCode 与 content 里的 "status_code=" 是同一个值。
+	// 两者都留：前者省掉正则，后者在 other 缺失时兜底。
+	UpstreamStatusCode int `json:"upstream_status_code,omitempty"`
+
+	// UpstreamMatch 是与上游错误日志的关联结果（见 logchain_correlate.go）。
+	//
+	// 只在采集开启且找到对应时有值。**前端必须按 Confidence 分档显示**：
+	// exact 是铁证，probable 是推断，两者混在一起显示会让人拿推断当证据。
+	UpstreamMatch *LogChainUpstreamMatch `json:"upstream_match,omitempty"`
+
 	// 流结束状态。EndReason 直出原值（eof / client_gone / timeout / ...），
 	// 不归类不翻译：new-api 升级新增取值时，归类写法会把它静默吞掉。
 	EndReason string `json:"end_reason,omitempty"`
@@ -442,7 +551,46 @@ type logChainScope struct {
 	// 翻出已经看过的行。两者由 logChainOrderBySQL / logChainWhere 统一处理。
 	Asc   bool
 	Limit int
+	// SpanCap 记录跨度被收窄的全过程，空 Reasons 表示按用户要求原样生效。
+	SpanCap logChainSpanCap
+	// KeywordScopedToErrors 记录「因关键词而把口径收窄到 type=5」这件事（P2-02）。
+	//
+	// 只在用户**没有**自己指定错误口径时置位：他已经勾了「只看错误」时再告知一遍
+	// 是噪声。用途是回显给前端，静默收窄会让人以为"消费行里没有匹配的"，
+	// 而实际是压根没查。
+	KeywordScopedToErrors bool
 }
+
+// logChainSpanCap 跨度收窄的记录。
+//
+// 目前只有 logChainMaxDays 一条收窄规则（曾另有一条按关键词收窄跨度的规则，
+// 被生产实测推翻并撤销——成本由「要读多少行 content」决定，不由跨度决定，
+// 详见文件头 keywordScopedReason 上方那段）。
+//
+// ★ 仍然记成「可累积的链条」而不是单个标记 ★
+//
+// 将来若再加一条收窄规则，两条叠加时若各自回显，页面会同时出现
+// 「238 → 31」和「31 → N」两条提示，读的人得自己拼出「我要的 238 天只剩 N 天」；
+// 而只回显后一条会显示「31 → N」——**用户根本没要过 31 天**。
+// 统一记「用户要多少、实际给多少、被哪几条规则砍过」可以从结构上避免这种表达。
+type logChainSpanCap struct {
+	// RequestedDays 用户原本要查的天数。**第一个收窄点写入后不再改写**——
+	// 那才是用户的真实意图，后续规则看到的已经是被砍过的值。
+	RequestedDays int
+	// Reasons 依次触发的收窄原因，供人复核「为什么只剩这么多」。
+	Reasons []string
+}
+
+// noteSpanCap 记一次收窄。requested 只在首次收窄时写入。
+func (sc *logChainSpanCap) noteSpanCap(requestedDays int, reason string) {
+	if sc.RequestedDays == 0 {
+		sc.RequestedDays = requestedDays
+	}
+	sc.Reasons = append(sc.Reasons, reason)
+}
+
+// capped 是否发生过收窄。
+func (sc logChainSpanCap) capped() bool { return len(sc.Reasons) > 0 }
 
 // parseLogChainScope 解析并收敛查询参数。时间窗按 CST 自然日左闭右开，与事实层口径一致。
 // 任何越界值都收敛而非报错，只有语义矛盾（from/to 只给一个、日期格式错）才拒绝。
@@ -455,6 +603,9 @@ func parseLogChainScope(c *gin.Context, now time.Time) (logChainScope, error) {
 		days = 1
 	}
 	if days > logChainMaxDays {
+		// 收窄必须告知：不说的话，查 90 天只回来 31 天的数据，
+		// 人会以为那 59 天真的没有请求。
+		s.SpanCap.noteSpanCap(days, "单次查询跨度上限 "+strconv.Itoa(logChainMaxDays)+" 天（防全表扫）")
 		days = logChainMaxDays
 	}
 	from := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, cstLocation).AddDate(0, 0, -days+1)
@@ -478,7 +629,10 @@ func parseLogChainScope(c *gin.Context, now time.Time) (logChainScope, error) {
 			return logChainScope{}, errors.New("to 不能早于 from")
 		}
 		// 跨度硬上限：宁可截断也不放行全表扫。
-		if t.Sub(f) > time.Duration(logChainMaxDays)*24*time.Hour {
+		if span := t.Sub(f); span > time.Duration(logChainMaxDays)*24*time.Hour {
+			// 天数向上取整：查 30 天零 1 小时时说"31 天"比说"30 天"更贴近他的输入。
+			s.SpanCap.noteSpanCap(int((span+24*time.Hour-time.Second)/(24*time.Hour)),
+				"单次查询跨度上限 "+strconv.Itoa(logChainMaxDays)+" 天（防全表扫）")
 			f = t.AddDate(0, 0, -logChainMaxDays)
 		}
 		from, to = f, t
@@ -549,7 +703,94 @@ func parseLogChainScope(c *gin.Context, now time.Time) (logChainScope, error) {
 	if s.Limit > logChainMaxLimit {
 		s.Limit = logChainMaxLimit
 	}
+	// 关键词限定错误行（P2-02）。必须放在最后：它要看 Keyword、LogType、Anomaly
+	// 三者的最终值，而三者分散在上面各处解析。
+	if err := s.scopeKeywordToErrors(); err != nil {
+		return logChainScope{}, err
+	}
+	// 多日 + 完全无筛选的止损闸门。必须在 scopeKeywordToErrors 之后：
+	// 带关键词的查询已被前者强制为 error_only，算「有筛选」，不该被这道门拦。
+	if err := s.guardWideSpanWithoutFilter(); err != nil {
+		return logChainScope{}, err
+	}
 	return s, nil
+}
+
+// logChainDaysSpanned 时间窗覆盖几个 CST 自然日。
+//
+// 按自然日而非秒数算：用户想的是「查几天」，报错文案里也得说自然日。
+// 用 ToTs-1 秒定右端，因为时间窗是左闭右开——to 落在次日 00:00 时
+// 覆盖的是前一天，不该算成两天。
+func logChainDaysSpanned(fromTs, toTs int64) int {
+	if toTs <= fromTs {
+		return 0
+	}
+	day := func(ts int64) time.Time {
+		t := time.Unix(ts, 0).In(cstLocation)
+		return time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, cstLocation)
+	}
+	return int(day(toTs-1).Sub(day(fromTs)).Hours()/24) + 1
+}
+
+// guardWideSpanWithoutFilter 拦下「跨度 >= logChainWideSpanMinDays 且完全无筛选」的查询。
+//
+// 为什么显式拒绝而不是静默收窄跨度：这不是「范围被改小」，而是「这个查法当前不可用」。
+// 静默给 2 天的数据，用户拿不到他要的 31 天，也不知道该怎么才能拿到。
+// 400 直说「加一个筛选条件」——那是他真正需要知道的信息。
+//
+// 与其他拒绝分支同一原则（见 anomaly 与 error_only 的三类冲突）：
+// 宁可明确拒绝，不要让人拿着错的或空的结果当真。
+func (s *logChainScope) guardWideSpanWithoutFilter() error {
+	days := logChainDaysSpanned(s.FromTs, s.ToTs)
+	if days < logChainWideSpanMinDays {
+		return nil
+	}
+	// 任一筛选条件都算：实测带筛选的多日查法大部分在预算内，不该拦。
+	// 判据与 logChainSourceClause 共用同一函数——两处若各写一份，
+	// 迟早出现「闸门放行但 FROM 去强制索引」这种错配。
+	// 解析阶段还没做域名反查，故 domainChans 传 nil；s.Domain 非空本身已算收窄。
+	if logChainHasNarrowingFilter(*s, nil) {
+		return nil
+	}
+	// 可加项里**不含令牌名**：它是前导通配 LIKE，不通过索引收窄，加了也一样超时
+	// （见 logChainHasNarrowingFilter 的说明）。列一个照做也没用的办法比不列更糟。
+	return fmt.Errorf("跨 %d 天且未加可收窄索引的筛选条件，该查询当前不可用"+
+		"（已知缺陷，见开发说明书 18.7）：会让生产库放弃索引改走全表扫，"+
+		"跑满 %d 秒预算后失败，期间还占用与客户日志查询共用的通道。"+
+		"请任选一项后重试：只看错误 / 指定 type / 指定异常档 / 关键词 / "+
+		"渠道 / 客户 ID / 模型 / 分组 / Request ID / 上游域名；"+
+		"或把跨度缩到 %d 天以内",
+		days, logChainQueryTimeoutMS/1000, logChainWideSpanMinDays)
+}
+
+// scopeKeywordToErrors 带关键词时把口径限定到 type=5，并拒绝语义矛盾的组合。
+//
+// 为什么矛盾要拒绝而不是静默改：本文件既有做法一致（见 anomaly 与 error_only 的
+// 三类冲突）——静默忽略会让人拿着错的结果当真。这里更要拒绝，因为用户显式传了
+// type=2 却查到 type=5，属于"页面答的不是我问的"。
+func (s *logChainScope) scopeKeywordToErrors() error {
+	if s.Keyword == "" {
+		return nil
+	}
+	// 显式指定了非错误 type：矛盾，拒绝。
+	if s.LogType != 0 && s.LogType != 5 {
+		return fmt.Errorf("keyword 与 type=%d 冲突：关键词搜索限定错误行（type=5），"+
+			"因为%s。要查 type=%d 请去掉关键词", s.LogType, keywordScopedReason, s.LogType)
+	}
+	// anomaly 各档都落在 type=2（err_anom 跨 type，但它的 type=2 那半同样 content 为空）。
+	// 与关键词同传时，能匹配的只有 type=5 那部分，等于关键词自己就能给出的结果，
+	// 而 SQL 却要额外跑一遍异常判据。显式拒绝，让人改查法。
+	if s.Anomaly != "" {
+		return fmt.Errorf("keyword 与 anomaly=%s 冲突：异常档位于消费行（type=2），"+
+			"而消费行的错误原文为空、搜不到内容。请二选一", s.Anomaly)
+	}
+	// 走到这里只剩两种情况：未指定 type，或已经是 type=5 / error_only。
+	// 前者需要收窄并告知；后者本来就是错误行，不必再告知（用户已经自己勾了）。
+	if !s.ErrorOnly && s.LogType != 5 {
+		s.KeywordScopedToErrors = true
+	}
+	s.ErrorOnly = true
+	return nil
 }
 
 // resolveDomainChannelIDs 把上游主域名反查成渠道 ID 列表。base_domain 是 channel_snaps
@@ -668,6 +909,98 @@ func logChainOrderBySQL(asc bool) string {
 	return "ORDER BY created_at DESC, id DESC"
 }
 
+// logChainSourceClause 决定 FROM 子句：只在「完全无筛选」时强制 idx_created_at_type，
+// 其余一律裸 logs、让优化器自选。
+//
+// ★★ 为什么只在无筛选时强制，而不照抄客户侧的分派表 ★★
+//
+// 客户侧 mysqlLogSourceClause 按 group / user_id 分派多个 FORCE INDEX。
+// 排障这边**不能照抄**——2026-08-26 生产实测（31 天跨度，同一条 SQL 两种索引选择）：
+//
+//	筛选条件          优化器自选                      强制 created_at_type
+//	无筛选            9571ms ★超时 ALL/none           9826ms ★超时
+//	channel_id=32     4481ms ✓ ref/idx_logs_channel_id   9409ms ★超时
+//	user_id=130       2634ms ✓ ref/idx_user_id_id        11149ms ★超时
+//	model=gpt-5.4     7218ms ✓ ref/idx_logs_model_name    9414ms ★超时
+//	group=default     7890ms ✓ ref/idx_logs_group         9432ms ★超时
+//	request_id=...    1344ms ✓ ref/idx_logs_request_id    9417ms ★超时
+//
+// **优化器在带筛选时选得更好**（全是精准等值索引），无条件强制会把这 5 种
+// 现在好用的查法弄成超时。它只在「完全无筛选」这一格判错——那时它翻成
+// ALL/none 全表扫，而 ORDER BY created_at DESC 一旦走 filesort，
+// LIMIT 就完全无法短路（必须排完所有匹配行）。
+//
+// 无筛选那一格加强制后的实测（08-26 整日 139,439 行，页面形状 LIMIT 101）：
+//
+//	优化器自选           9475ms ★超时  ALL/none/1093096
+//	FORCE created_at_type 4720ms 101行  range/idx_created_at_type/294354
+//
+// 那一格现在是**确定性失败**的，所以强制它不存在「弄坏」，风险面为零。
+//
+// 不用 idx_created_at_id：它的最左列是 id 而非 created_at，实测优化器直接忽略、
+// 仍走全表扫（9449ms 超时）。索引名里有 created_at 不代表它能服务 created_at 范围。
+func (m *Monitor) logChainSourceClause(s logChainScope, domainChans []int64) string {
+	if m.prodDB == nil {
+		return "logs"
+	}
+	// ★ SQLite 不认 FORCE INDEX ★
+	// 单元测试的假生产库（newFakeProdDB）是 SQLite，直接拼进去会让所有涉及
+	// 假生产库的用例一起报语法错。与客户侧 logSourceClause 同一道门。
+	if !strings.Contains(strings.ToLower(fmt.Sprintf("%T", m.prodDB.Driver())), "mysql") {
+		return "logs"
+	}
+	return mysqlLogChainSourceClause(s, domainChans)
+}
+
+// mysqlLogChainSourceClause 是上面那个方法的纯函数部分（已确认驱动是 MySQL）。
+// 拆出来是为了能直接单测判定逻辑而不必造假驱动——与客户侧
+// mysqlLogSourceClause 同一做法（见 usage_test.go 对它的表驱动测试）。
+func mysqlLogChainSourceClause(s logChainScope, domainChans []int64) string {
+	if logChainHasNarrowingFilter(s, domainChans) {
+		return "logs" // 让优化器自选——实测它在带筛选时选得更好
+	}
+	return "logs FORCE INDEX (idx_created_at_type)"
+}
+
+// logChainHasNarrowingFilter 是否带了**能通过索引收窄**的筛选条件。
+//
+// 与 guardWideSpanWithoutFilter 共用同一判据：两处必须一致，否则会出现
+// 「闸门认为有筛选所以放行，FROM 却认为无筛选去强制索引」这种错配。
+// 因此抽成一个函数，不各写一份。
+//
+// ★ 为什么 TokenName 不算 ★
+//
+// 它拼的是 `token_name LIKE '%kw%'`（前导通配），用不上 idx_logs_token_name——
+// **它根本不收窄，只是多一个逐行判断**。2026-08-27 实测它单独用时的行为
+// 与「完全无筛选」一模一样：
+//
+//	跨度   优化器自选              强制 created_at_type
+//	1 天   1992ms  ✓ range         1627ms ✓
+//	2 天   9469ms ★超时 ALL/none    4531ms ✓
+//	5 天   9484ms ★超时 ALL/none    5395ms ✓
+//	7 天   9459ms ★超时 ALL/none    7250ms ✓
+//	14 天  9467ms ★超时 ALL/none    9486ms ★超时
+//
+// 把它算成「有筛选」会同时坏两件事：FROM 不强制索引（于是 2 天起全表扫），
+// 闸门也放行（于是撞到 8 秒超时）。改判后 2/3/5 天由强制索引接住、6 天起被闸门拦，
+// **严格优于此前「2 天起一律 500」**。
+//
+// Keyword 同样是前导通配，但它已被 scopeKeywordToErrors 强制加上 type=5
+// （错误行只有几百条，量级差两个数量级），故仍算收窄。
+//
+// ★ UserID 为什么必须算，即使它有时也超时 ★
+//
+// 实测 `user_id=1`（高频账号）31 天超时，但 `user_id=130` 31 天只要 1.10 秒——
+// **同一个参数、不同取值，行为差一个数量级**，而解析阶段无从知道哪个是高频的。
+// 按跨度拦会把 user_id=130 这类好用的查法一起砍掉，属于「妨碍既有功能」。
+// 所以这一格不拦，留作已知缺口（见开发说明书 18.7）。
+func logChainHasNarrowingFilter(s logChainScope, domainChans []int64) bool {
+	return s.ErrorOnly || s.LogType > 0 || s.Anomaly != "" || s.Keyword != "" ||
+		s.UserID > 0 || s.ChannelID > 0 || s.Domain != "" ||
+		s.Model != "" || s.Group != "" || s.RequestID != "" ||
+		len(domainChans) > 0
+}
+
 // queryLogChain 查生产 logs 取一页排障明细。多取一行判断 has_more，不做 COUNT(*)。
 func (m *Monitor) queryLogChain(ctx context.Context, s logChainScope, domainChans []int64) ([]LogChainRow, bool, error) {
 	if m.prodDB == nil {
@@ -691,7 +1024,7 @@ func (m *Monitor) queryLogChain(ctx context.Context, s logChainScope, domainChan
 		" COALESCE(model_name,''), COALESCE(prompt_tokens,0), COALESCE(completion_tokens,0)," +
 		" COALESCE(use_time,0), COALESCE(is_stream,0), COALESCE(quota,0)," +
 		" COALESCE(content,''), COALESCE(other,''), COALESCE(request_id,'')" +
-		" FROM logs WHERE " + where +
+		" FROM " + m.logChainSourceClause(s, domainChans) + " WHERE " + where +
 		" " + logChainOrderBySQL(s.Asc) + " LIMIT " + strconv.Itoa(s.Limit+1)
 
 	rows, err := m.prodDB.QueryContext(cctx, q, args...)
@@ -726,6 +1059,14 @@ func (m *Monitor) queryLogChain(ctx context.Context, s logChainScope, domainChan
 			}
 			r.CacheReadTokens = int64(o.CacheTokens)
 			r.RequestPath = o.RequestPath
+			// 上游的失败分类只在错误行上有意义；消费行的 other 里没有这些键，
+			// 读了也是空。限定 type=5 是为了让"空值"只有一种含义：
+			// 上游这次没给分类，而不是"这行本来就不该有"。
+			if r.Type == 5 {
+				r.UpstreamErrorType = o.ErrorType
+				r.UpstreamErrorCode = o.ErrorCode
+				r.UpstreamStatusCode = o.UpstreamStatusCode
+			}
 			if o.IsModelMapped && o.UpstreamModelName != "" {
 				r.IsModelMapped = true
 				r.UpstreamModelName = o.UpstreamModelName
@@ -924,9 +1265,35 @@ func (m *Monitor) serveLogChainRequests(c *gin.Context) {
 		})
 		return
 	}
+	// 上游关联。**必须在 attachChannelSnaps 成功之后**：关联要用 UpstreamDomain，
+	// 那是补全填的；放在它之前拿到的是空域名，会一条都匹配不上。
+	// 上面那条补全失败的提前 return 分支因此不带关联结果——与 blast_radius 同理。
+	//
+	// 采集关闭时直接跳过：表必然是空的，白查两次只会加到用户等待上。
+	if m.cfg.UpstreamErrorLogSyncEnabled {
+		matches := m.correlateUpstreamErrors(ctx, rows)
+		for i := range rows {
+			if mt, ok := matches[rows[i].ID]; ok {
+				rows[i].UpstreamMatch = &mt
+			}
+		}
+	}
 	resp := gin.H{
 		"ok": true, "rows": rows, "has_more": hasMore,
 		"scope": logChainScopeEcho(scope), "blind_spots": logChainBlindSpots(),
+		// blast_radius 是「看范围」层：跨行统计问题集中在谁身上。
+		//
+		// ★ 只算当前这一页，不额外查生产库 ★
+		// 算整个筛选范围需要另发一条聚合 SQL，那会再占一次 usageDetailGate
+		// （容量 1，与客户 Portal 的日志查询共用）——排障是内部功能，
+		// 不得为了一个汇总数字让客户多排一次队。代价是翻页后形状会变，
+		// 因此 Rows 字段与前端文案都必须写明"仅本页"。
+		//
+		// 放在 attachChannelSnaps 成功之后：它按渠道名和上游域名分组，
+		// 渠道补全失败时那两个维度是空的，算出来的形状会假。
+		// 上面那条补全失败的提前 return 分支因此**不带** blast_radius，
+		// 宁可不给结论也不给错结论。
+		"blast_radius": computeLogChainBlastRadius(rows),
 	}
 	if hasMore && len(rows) > 0 {
 		// 游标必须成对返回：排序键是 (created_at, id)，只给 id 无法定位续查位置。
@@ -975,6 +1342,27 @@ func logChainScopeEcho(s logChainScope) gin.H {
 	}
 	if s.Keyword != "" {
 		h["keyword"] = s.Keyword
+	}
+	// 跨度收窄必须回显。静默收窄会让人以为"这段时间里就这些"，据此得出错误结论——
+	// 与「缺失绝不显示为零」同一条原则：范围被改小了就必须让人知道。
+	//
+	// effective 由 from/to 算出而非套用常量：两条收窄叠加时，最终跨度由后一条决定，
+	// 写死任一个常量都会在叠加场景下报错数。
+	if s.SpanCap.capped() {
+		effective := 0
+		if s.ToTs > s.FromTs {
+			effective = int((s.ToTs - s.FromTs + 86399) / 86400)
+		}
+		h["span_capped"] = gin.H{
+			"requested_days": s.SpanCap.RequestedDays,
+			"effective_days": effective,
+			"reasons":        s.SpanCap.Reasons,
+		}
+	}
+	// 关键词把口径收窄到错误行也必须回显（P2-02）：不说的话，
+	// 人会以为"消费行里没有匹配的"，而实际是压根没查那一部分。
+	if s.KeywordScopedToErrors {
+		h["keyword_scoped_to_errors"] = gin.H{"reason": keywordScopedReason}
 	}
 	if s.ErrorOnly {
 		h["error_only"] = true
