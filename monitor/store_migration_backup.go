@@ -27,9 +27,13 @@ const (
 	// Bump this ID whenever either AutoMigrate model set or a post-migration
 	// schema/data transform changes. Restarts of the same plan reuse its pinned
 	// original snapshot, so they cannot prune away the old-image rollback point.
-	// v23 在 v21 渠道经济模型上增加上游错误日志明细与同步状态。
-	preMigrationPlanID               = "main-facts-schema-20260831-v23-channel-economics-upstream-errorlog"
-	preMigrationSourceV2PlanID       = "main-facts-schema-20260831-v22-nginx-source-v2-isolated"
+	// v27 将 v23 上游错误日志从页内 (domain, upstream_id) 主键升级为
+	// 稳定的 (domain, event_key)，并增加可恢复缩窗、原文截断状态与连续覆盖
+	// 水位。必须用新 plan，任何已固定的 v23/v25 快照都不能被本版复用。
+	preMigrationPlanID = "main-facts-schema-20260831-v27-upstream-errorlog-event-key-coverage"
+	// v28 是完整 source-v2 schema 与 v27 主库模型的组合目标。已有 v22/v24/v26
+	// source-v2 库升级时必须生成当前时点的新快照，不能复用旧回滚点。
+	preMigrationCombinedPlanID       = "main-facts-schema-20260831-v28-nginx-source-v2-upstream-errorlog-event-key-coverage"
 	preMigrationSnapshotPrefix       = "pre-migrate-"
 	preMigrationReferencePrefix      = ".pre-migration-plan-"
 	preMigrationReferenceSuffix      = ".json"
@@ -718,13 +722,20 @@ func (m *Monitor) createPreMigrationSnapshot(parent context.Context, mainPath, f
 }
 
 func (m *Monitor) preMigrationPlanForStore(ctx context.Context, mainPath string) (string, error) {
+	return InspectPreMigrationPlan(ctx, mainPath, m.cfg.NginxSourceV2Enabled)
+}
+
+// InspectPreMigrationPlan 以只读方式判定候选镜像对现有主库将选择的
+// 迁移方案。发布预检在停旧 Monitor 之前调用它，因此不允许创建、
+// 迁移或改写 SQLite；source-v2 部分存在时也必须是完整 schema。
+func InspectPreMigrationPlan(ctx context.Context, mainPath string, sourceV2Enabled bool) (string, error) {
 	present, err := existingRegularStore(mainPath)
 	if err != nil {
 		return "", err
 	}
 	if !present {
-		if m.cfg.NginxSourceV2Enabled {
-			return preMigrationSourceV2PlanID, nil
+		if sourceV2Enabled {
+			return preMigrationCombinedPlanID, nil
 		}
 		return preMigrationPlanID, nil
 	}
@@ -739,22 +750,22 @@ func (m *Monitor) preMigrationPlanForStore(ctx context.Context, mainPath string)
 		return "", err
 	}
 	if !ready {
-		if m.cfg.NginxSourceV2Enabled {
-			return preMigrationSourceV2PlanID, nil
+		if sourceV2Enabled {
+			return preMigrationCombinedPlanID, nil
 		}
 		return preMigrationPlanID, nil
 	}
-	return preMigrationSourceV2PlanID, nil
+	return preMigrationCombinedPlanID, nil
 }
 
 // currentMigrationPlanID labels periodic backup sets with the schema family
 // they actually contain. A store that already owns the complete isolated
-// source-v2 ledger remains on the v22 plan even when the feature flag is later
-// disabled, so operators cannot mistake that backup for a pre-v2 rollback
-// point.
+// source-v2 ledger remains on the combined v28 plan even when the feature flag
+// is later disabled, so operators cannot mistake that backup for a pre-v2
+// rollback point.
 func (m *Monitor) currentMigrationPlanID() string {
 	if m.cfg.NginxSourceV2Enabled || m.nginxSourceV2SchemaReady.Load() {
-		return preMigrationSourceV2PlanID
+		return preMigrationCombinedPlanID
 	}
 	return preMigrationPlanID
 }

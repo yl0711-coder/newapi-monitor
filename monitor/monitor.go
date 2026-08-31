@@ -257,6 +257,7 @@ type Monitor struct {
 	upstreamAICodeWithInterval   time.Duration
 	upstreamUsageTailBatches     atomic.Uint64 // Tail 连续批次数；用于在 SLA 内给历史补数有界让路
 	upstreamBalanceAlertLastEval atomic.Int64  // 动态余额评估最多与余额同步同频，避免每分钟重复扫本地小时汇总
+	upstreamErrorLogPruneDay     atomic.Int64  // 错误明细保留清理每天最多执行一次
 }
 
 // cachedSnap 是一次快照的缓存项。

@@ -761,7 +761,23 @@ func TestChannelUpstreamNewAPIHandlersProtectSecretsAndPreserveLastBalance(t *te
 	}).Error; err != nil {
 		t.Fatal(err)
 	}
-	usageEnabled := true
+	if err := m.storeDB.Create(&UpstreamErrorLogSyncState{
+		Domain: domain, Status: upstreamStatusReconnect,
+		CoverageFrom: 600, SyncedUntil: 777, WindowFrom: 700, WindowTo: 800,
+		NextSyncAt: upstreamAccountIsolatedUntil, ConsecutiveFails: 4,
+		LastError: "authorization failed",
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := m.storeDB.Create(&ChannelUpstreamErrorLog{
+		Domain: domain, EventKey: "existing-error-evidence", UpstreamID: 9,
+		CreatedAt: 750, Content: "old request evidence",
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	// 停用时更换凭据也必须解除认证隔离；启用开关只控制调度，
+	// 不能把管理员的显式恢复动作吞掉。
+	usageEnabled := false
 	payload.UsageSyncEnabled = &usageEnabled
 	w = upstreamRouteRequest(t, m, router, roleRoot, http.MethodPost, "/channels/upstream", payload)
 	if w.Code != http.StatusOK {
@@ -770,9 +786,37 @@ func TestChannelUpstreamNewAPIHandlersProtectSecretsAndPreserveLastBalance(t *te
 	if err := m.storeDB.First(&row, "domain = ?", domain).Error; err != nil {
 		t.Fatal(err)
 	}
-	if row.UsageStatus != upstreamStatusPending || row.UsageNextSyncAt != 0 || row.UsageBackfillNextSyncAt != 0 ||
+	if row.UsageStatus != upstreamStatusDisabled || row.UsageNextSyncAt != 0 || row.UsageBackfillNextSyncAt != 0 ||
 		row.UsageConsecutiveFails != 0 || row.UsageBackfillConsecutiveFails != 0 || row.UsageBackfillCursor != 123456 {
-		t.Fatalf("replacement credential did not reopen usage without losing progress: %+v", row)
+		t.Fatalf("replacement credential while disabled did not clear usage isolation without losing progress: %+v", row)
+	}
+	var errorLogState UpstreamErrorLogSyncState
+	if err := m.storeDB.First(&errorLogState, "domain = ?", domain).Error; err != nil {
+		t.Fatal(err)
+	}
+	if errorLogState.Status != upstreamStatusPending || errorLogState.NextSyncAt != 0 ||
+		errorLogState.ConsecutiveFails != 0 || errorLogState.LastError != "" ||
+		errorLogState.CoverageFrom != 600 || errorLogState.SyncedUntil != 777 ||
+		errorLogState.WindowFrom != 700 || errorLogState.WindowTo != 800 {
+		t.Fatalf("replacement credential did not reopen error-log sync without losing its cursor: %+v", errorLogState)
+	}
+	var evidenceCount int64
+	if err := m.storeDB.Model(&ChannelUpstreamErrorLog{}).Where("domain = ?", domain).Count(&evidenceCount).Error; err != nil || evidenceCount != 1 {
+		t.Fatalf("same-identity credential recovery must preserve evidence: count=%d err=%v", evidenceCount, err)
+	}
+	usageEnabled = true
+	payload.UsageSyncEnabled = &usageEnabled
+	payload.AccessToken = ""
+	w = upstreamRouteRequest(t, m, router, roleRoot, http.MethodPost, "/channels/upstream", payload)
+	if w.Code != http.StatusOK {
+		t.Fatalf("re-enabling usage without resubmitting the key failed: status=%d body=%s", w.Code, w.Body.String())
+	}
+	if err := m.storeDB.First(&row, "domain = ?", domain).Error; err != nil {
+		t.Fatal(err)
+	}
+	if !row.UsageSyncEnabled || row.UsageNextSyncAt != 0 || row.UsageBackfillNextSyncAt != 0 ||
+		row.UsageConsecutiveFails != 0 || row.UsageBackfillConsecutiveFails != 0 {
+		t.Fatalf("re-enabled usage inherited stale auth isolation: %+v", row)
 	}
 
 	// 改成另一个账户后，即使首次同步失败，也绝不能继续展示前一个账户的余额。
@@ -790,6 +834,13 @@ func TestChannelUpstreamNewAPIHandlersProtectSecretsAndPreserveLastBalance(t *te
 	}
 	if row.UserID != 10 || row.BalanceKnown || row.BalanceUSD != 0 || row.LastSuccessAt != 0 || strings.Contains(row.LastError, "new-account-token") {
 		t.Fatalf("new account inherited stale balance from previous identity: %+v", row)
+	}
+	var stateCount int64
+	if err := m.storeDB.Model(&UpstreamErrorLogSyncState{}).Where("domain = ?", domain).Count(&stateCount).Error; err != nil || stateCount != 0 {
+		t.Fatalf("new account inherited old error-log scheduler state: count=%d err=%v", stateCount, err)
+	}
+	if err := m.storeDB.Model(&ChannelUpstreamErrorLog{}).Where("domain = ?", domain).Count(&evidenceCount).Error; err != nil || evidenceCount != 0 {
+		t.Fatalf("new account inherited old error-log evidence: count=%d err=%v", evidenceCount, err)
 	}
 }
 
@@ -1023,7 +1074,7 @@ func TestChannelUpstreamAICodeWithRenameDoesNotCallUpstreamOrResetProgress(t *te
 	if err := m.sealUpstreamAccountCredential(&row, cred); err != nil {
 		t.Fatal(err)
 	}
-	if err := m.persistAICodeWithAccountChange(context.Background(), &row, cred, false); err != nil {
+	if err := m.persistAICodeWithAccountChange(context.Background(), &row, cred, false, false); err != nil {
 		t.Fatal(err)
 	}
 	if err := m.storeDB.Model(&AICodeWithKeySyncState{}).Where("domain = ? AND slot_id = ?", domain, "acw_primary").Updates(map[string]any{
@@ -1163,7 +1214,7 @@ func TestUpstreamIdentityAndUsageNamespaceChangeCommitAtomically(t *testing.T) {
 	if err := m.sealUpstreamAccountCredential(&replacement, aiCodeWithCredential{APIKeys: []string{"sk-acw-new-identity"}}); err != nil {
 		t.Fatal(err)
 	}
-	if err := m.persistUpstreamAccountIdentityChange(context.Background(), &replacement, true); err == nil {
+	if err := m.persistUpstreamAccountIdentityChange(context.Background(), &replacement, true, false); err == nil {
 		t.Fatal("injected usage reset failure unexpectedly committed identity change")
 	}
 	var stored ChannelUpstreamAccount

@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
@@ -206,9 +207,9 @@ func rewritePreMigrationSnapshotPlanForTest(t *testing.T, backupDir, mainPath, f
 	}
 }
 
-func TestMigrationPlanBumpCreatesFreshRollbackSnapshotBeforeCredentialRotation(t *testing.T) {
+func TestOldV23PlanCreatesFreshRollbackSnapshotBeforeEventKeyUpgrade(t *testing.T) {
 	const (
-		priorPlan = "main-facts-schema-20260818-v12"
+		priorPlan = "main-facts-schema-20260831-v23-channel-economics-upstream-errorlog"
 		oldSecret = "legacy-session-secret-before-v13-migration"
 		newSecret = "dedicated-upstream-secret-after-v13-migration"
 		domain    = "plan-bump-credential.example"
@@ -247,7 +248,7 @@ func TestMigrationPlanBumpCreatesFreshRollbackSnapshotBeforeCredentialRotation(t
 		UpstreamCredentialSecret: newSecret,
 	}}
 	if err := candidate.openStore(mainPath); err != nil {
-		t.Fatalf("v13 startup failed: %v", err)
+		t.Fatalf("event-key candidate startup failed: %v", err)
 	}
 	defer candidate.Close()
 
@@ -266,7 +267,7 @@ func TestMigrationPlanBumpCreatesFreshRollbackSnapshotBeforeCredentialRotation(t
 		}
 	}
 	if currentSnapshot == "" || currentSnapshot == prior.SnapshotDir {
-		t.Fatalf("v13 did not publish a distinct rollback point: prior=%s current=%s", prior.SnapshotDir, currentSnapshot)
+		t.Fatalf("event-key upgrade reused the old v23 rollback point: prior=%s current=%s", prior.SnapshotDir, currentSnapshot)
 	}
 
 	snapshotDB := openReadOnlyTestStore(t, filepath.Join(currentSnapshot, preMigrationMainSnapshotName))
@@ -279,7 +280,7 @@ func TestMigrationPlanBumpCreatesFreshRollbackSnapshotBeforeCredentialRotation(t
 	legacyReader := &Monitor{cfg: Settings{SessionSecret: oldSecret}}
 	var rollbackCredential newAPICredential
 	if err := legacyReader.openUpstreamCredential(rollbackRow, &rollbackCredential); err != nil || rollbackCredential.AccessToken != "rollback-token" {
-		t.Fatalf("v13 rollback snapshot was not captured before key rotation: token=%q err=%v", rollbackCredential.AccessToken, err)
+		t.Fatalf("event-key rollback snapshot was not captured before key rotation: token=%q err=%v", rollbackCredential.AccessToken, err)
 	}
 
 	var liveRow ChannelUpstreamAccount
@@ -293,6 +294,213 @@ func TestMigrationPlanBumpCreatesFreshRollbackSnapshotBeforeCredentialRotation(t
 	if err := candidate.openUpstreamCredential(liveRow, &liveCredential); err != nil || liveCredential.AccessToken != "rollback-token" {
 		t.Fatalf("rotated live credential is unavailable: token=%q err=%v", liveCredential.AccessToken, err)
 	}
+}
+
+func TestUpstreamErrorLogV23PrimaryKeyMigratesAtomically(t *testing.T) {
+	dir := t.TempDir()
+	mainPath := filepath.Join(dir, "monitor.db")
+	factsPath := filepath.Join(dir, "usage-facts.db")
+	backupDir := filepath.Join(dir, "backups")
+	db, err := sql.Open("sqlite", mainPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`CREATE TABLE channel_upstream_error_logs (
+		domain text, upstream_id integer, created_at integer, content text,
+		fetched_at integer, raw_json text, PRIMARY KEY(domain, upstream_id)
+	)`); err != nil {
+		t.Fatal(err)
+	}
+	for id, requestID := range []string{"req-a", "req-b"} {
+		raw := fmt.Sprintf(`{"id":%d,"created_at":1787000001,"request_id":%q}`, id+1, requestID)
+		if _, err := db.Exec(`INSERT INTO channel_upstream_error_logs
+			(domain,upstream_id,created_at,content,fetched_at,raw_json)
+			VALUES (?,?,?,?,?,?)`, "legacy.example", id+1, 1787000001, "legacy", 1787000010, raw); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	m := &Monitor{cfg: Settings{
+		StorePath: mainPath, UsageFactsStorePath: factsPath,
+		StoreBackupDir: backupDir, StoreMigrationBackupRetention: 3,
+	}}
+	if err := m.openStore(mainPath); err != nil {
+		t.Fatalf("legacy error-log primary-key migration failed: %v", err)
+	}
+	defer m.Close()
+	var rows []ChannelUpstreamErrorLog
+	if err := m.storeDB.Order("upstream_id").Find(&rows).Error; err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 2 || rows[0].EventKey == "" || rows[1].EventKey == "" || rows[0].EventKey == rows[1].EventKey {
+		t.Fatalf("legacy evidence was not re-keyed losslessly: %+v", rows)
+	}
+	primary := sqlitePrimaryKeyForTest(t, mainPath, "channel_upstream_error_logs")
+	if len(primary) != 2 || primary[1] != "domain" || primary[2] != "event_key" {
+		t.Fatalf("live table kept legacy primary key: %v", primary)
+	}
+	snapshots := preMigrationSnapshotDirs(t, backupDir)
+	if len(snapshots) != 1 {
+		t.Fatalf("expected one rollback snapshot, got %v", snapshots)
+	}
+	snapshotPath := filepath.Join(snapshots[0], preMigrationMainSnapshotName)
+	oldPrimary := sqlitePrimaryKeyForTest(t, snapshotPath, "channel_upstream_error_logs")
+	if len(oldPrimary) != 2 || oldPrimary[1] != "domain" || oldPrimary[2] != "upstream_id" {
+		t.Fatalf("rollback snapshot was taken after destructive key migration: %v", oldPrimary)
+	}
+}
+
+func TestUpstreamErrorLogV23ExpectedCollisionDeduplicatesWithoutBlockingStartup(t *testing.T) {
+	dir := t.TempDir()
+	mainPath := filepath.Join(dir, "monitor.db")
+	db, err := sql.Open("sqlite", mainPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`CREATE TABLE channel_upstream_error_logs (
+		domain text, upstream_id integer, created_at integer, raw_json text,
+		PRIMARY KEY(domain, upstream_id)
+	)`); err != nil {
+		t.Fatal(err)
+	}
+	for id := 1; id <= 2; id++ {
+		raw := fmt.Sprintf(`{"id":%d,"created_at":1787000001,"request_id":"same"}`, id)
+		if _, err := db.Exec(`INSERT INTO channel_upstream_error_logs(domain,upstream_id,created_at,raw_json)
+			VALUES (?,?,?,?)`, "collision.example", id, 1787000001, raw); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	m := &Monitor{cfg: Settings{
+		StorePath: mainPath, UsageFactsStorePath: filepath.Join(dir, "usage-facts.db"),
+		StoreBackupDir: filepath.Join(dir, "backups"),
+	}}
+	if err := m.openStore(mainPath); err != nil {
+		t.Fatalf("legacy page-local duplicates must not block Monitor startup: %v", err)
+	}
+	m.Close()
+	primary := sqlitePrimaryKeyForTest(t, mainPath, "channel_upstream_error_logs")
+	if len(primary) != 2 || primary[1] != "domain" || primary[2] != "event_key" {
+		t.Fatalf("deduplicating migration did not install current key: %v", primary)
+	}
+	check, err := sql.Open("sqlite", mainPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer check.Close()
+	var count int
+	if err := check.QueryRow("SELECT COUNT(*) FROM channel_upstream_error_logs").Scan(&count); err != nil || count != 1 {
+		t.Fatalf("same legacy event should be retained once: count=%d err=%v", count, err)
+	}
+}
+
+func TestUpstreamErrorLogV23MalformedRawUsesFallbackAndResetsLegacyWatermark(t *testing.T) {
+	dir := t.TempDir()
+	mainPath := filepath.Join(dir, "monitor.db")
+	backupDir := filepath.Join(dir, "backups")
+	db, err := sql.Open("sqlite", mainPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	statements := []string{
+		`CREATE TABLE channel_upstream_error_logs (
+			domain text, upstream_id integer, created_at integer, content text,
+			fetched_at integer, raw_json text, PRIMARY KEY(domain, upstream_id))`,
+		`CREATE TABLE upstream_error_log_sync_states (
+			domain text PRIMARY KEY, synced_until integer, coverage_from integer)`,
+		`INSERT INTO channel_upstream_error_logs
+			(domain,upstream_id,created_at,content,fetched_at,raw_json)
+			VALUES ('broken.example',7,1787000001,'legacy bad raw',1787000010,'{broken-json')`,
+		`INSERT INTO upstream_error_log_sync_states(domain,synced_until,coverage_from)
+			VALUES ('broken.example',1787000010,1786990000)`,
+	}
+	for _, statement := range statements {
+		if _, err := db.Exec(statement); err != nil {
+			_ = db.Close()
+			t.Fatal(err)
+		}
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	m := &Monitor{cfg: Settings{
+		StorePath: mainPath, UsageFactsStorePath: filepath.Join(dir, "facts.db"),
+		StoreBackupDir: backupDir, StoreMigrationBackupRetention: 3,
+	}}
+	if err := m.openStore(mainPath); err != nil {
+		t.Fatalf("malformed legacy raw must not block startup: %v", err)
+	}
+	defer m.Close()
+	var row ChannelUpstreamErrorLog
+	if err := m.storeDB.First(&row, "domain = ?", "broken.example").Error; err != nil {
+		t.Fatal(err)
+	}
+	if len(row.EventKey) != 64 || !strings.HasPrefix(row.EventKey, "legacy-") || row.RawJSON != "{broken-json" {
+		t.Fatalf("malformed legacy evidence did not receive a bounded deterministic fallback key: %+v", row)
+	}
+	var states int64
+	if err := m.storeDB.Model(&UpstreamErrorLogSyncState{}).Where("domain = ?", "broken.example").Count(&states).Error; err != nil || states != 0 {
+		t.Fatalf("untrustworthy legacy watermark survived migration: count=%d err=%v", states, err)
+	}
+	snapshots := preMigrationSnapshotDirs(t, backupDir)
+	if len(snapshots) != 1 {
+		t.Fatalf("expected one pre-migration snapshot, got %v", snapshots)
+	}
+	rollback := filepath.Join(snapshots[0], preMigrationMainSnapshotName)
+	oldPrimary := sqlitePrimaryKeyForTest(t, rollback, "channel_upstream_error_logs")
+	if oldPrimary[1] != "domain" || oldPrimary[2] != "upstream_id" {
+		t.Fatalf("rollback snapshot lost the legacy key: %v", oldPrimary)
+	}
+	rollbackDB, err := sql.Open("sqlite", sqliteReadOnlyDSN(rollback))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rollbackDB.Close()
+	var oldRows, oldStates int
+	if err := rollbackDB.QueryRow("SELECT COUNT(*) FROM channel_upstream_error_logs").Scan(&oldRows); err != nil {
+		t.Fatal(err)
+	}
+	if err := rollbackDB.QueryRow("SELECT COUNT(*) FROM upstream_error_log_sync_states").Scan(&oldStates); err != nil {
+		t.Fatal(err)
+	}
+	if oldRows != 1 || oldStates != 1 {
+		t.Fatalf("rollback snapshot does not preserve the original evidence/watermark: rows=%d states=%d", oldRows, oldStates)
+	}
+}
+
+func sqlitePrimaryKeyForTest(t *testing.T, path, table string) map[int]string {
+	t.Helper()
+	db, err := sql.Open("sqlite", sqliteReadOnlyDSN(path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	rows, err := db.Query("PRAGMA table_info(" + quoteSQLiteIdentifier(table) + ")")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	primary := map[int]string{}
+	for rows.Next() {
+		var cid, notNull, pk int
+		var name, typ string
+		var defaultValue any
+		if err := rows.Scan(&cid, &name, &typ, &notNull, &defaultValue, &pk); err != nil {
+			t.Fatal(err)
+		}
+		if pk > 0 {
+			primary[pk] = name
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return primary
 }
 
 func TestPreMigrationSnapshotMigratesRealLegacySchemasIncludesWALRestoresAndIsIdempotent(t *testing.T) {
@@ -362,8 +570,8 @@ INSERT INTO legacy_facts_guard(id, value) VALUES (1, 'facts-in-wal');`)
 	if err != nil {
 		t.Fatalf("published snapshot set did not verify: %v", err)
 	}
-	if manifest.MigrationPlan != preMigrationSourceV2PlanID {
-		t.Fatalf("source-v2 enable must pin a distinct rollback plan: got=%q want=%q", manifest.MigrationPlan, preMigrationSourceV2PlanID)
+	if manifest.MigrationPlan != preMigrationCombinedPlanID {
+		t.Fatalf("source-v2 + current models must pin the combined rollback plan: got=%q want=%q", manifest.MigrationPlan, preMigrationCombinedPlanID)
 	}
 	if len(manifest.Stores) != 2 || !manifest.Stores[0].Present || !manifest.Stores[1].Present {
 		t.Fatalf("manifest must contain both existing stores: %+v", manifest.Stores)
@@ -513,8 +721,8 @@ func TestPreMigrationPlanForStoreDetectsSourceV2SchemaState(t *testing.T) {
 		t.Fatal(err)
 	}
 	plan, err = m.preMigrationPlanForStore(context.Background(), mainPath)
-	if err != nil || plan != preMigrationSourceV2PlanID {
-		t.Fatalf("complete source-v2 schema must retain v22 plan after flag-off: plan=%q err=%v", plan, err)
+	if err != nil || plan != preMigrationCombinedPlanID {
+		t.Fatalf("complete source-v2 schema must select the combined current plan after flag-off: plan=%q err=%v", plan, err)
 	}
 }
 
@@ -565,8 +773,8 @@ func TestSourceV2PlanCreatesFreshRollbackSnapshotInsteadOfReusingV21(t *testing.
 		}
 		plans[manifest.MigrationPlan] = true
 	}
-	if !plans[preMigrationPlanID] || !plans[preMigrationSourceV2PlanID] {
-		t.Fatalf("missing v21/v22 rollback generation: %v", plans)
+	if !plans[preMigrationPlanID] || !plans[preMigrationCombinedPlanID] {
+		t.Fatalf("missing base/combined rollback generation: %v", plans)
 	}
 }
 

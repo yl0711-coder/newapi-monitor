@@ -26,7 +26,10 @@ package monitor
 // 页面明确显示「该上游无日志接口」——**不能让人以为没记录等于没出错**。
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -38,6 +41,7 @@ import (
 	"strings"
 	"time"
 
+	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
 
@@ -51,19 +55,21 @@ const upstreamErrorLogType = 5
 // 上游同量级。取 2000 留足余量，同时防止上游异常返回超长文本把库撑爆——
 // 截断时保留**前缀**：错误原文的判别信息（status_code=、错误类型）都在开头。
 const upstreamErrorLogContentMax = 2000
+const upstreamErrorLogRawMax = 16 * 1024
 
 // ChannelUpstreamErrorLog 上游错误日志的逐条明细。
 //
 // ★ 主键选择 ★
-// (domain, upstream_id) —— upstream_id 是上游那条日志自己的 id。
-// 用它做主键使重复拉取天然幂等：同一条拉两次是 upsert，不会翻倍。
-// 不用自增 id：那样重跑窗口就会产生重复行，而这张表要能被反复回填。
+// 未修改 NewAPI 会把 /api/log/self 的 id 重写为页内序号，因此 upstream_id
+// 绝不能作为稳定主键。EventKey 是删掉该伪 ID 后对完整规范化事件求 SHA-256；
+// 同一事件跨页、跨轮和重启都稳定，页内序号仅作为诊断字段保留。
 type ChannelUpstreamErrorLog struct {
-	Domain     string `gorm:"primaryKey;size:253;column:domain"`
-	UpstreamID int64  `gorm:"primaryKey;column:upstream_id"`
+	Domain     string `gorm:"primaryKey;size:253;column:domain;index:idx_upstream_err_domain_created,priority:1;index:idx_upstream_err_domain_join,priority:1"`
+	EventKey   string `gorm:"primaryKey;size:64;column:event_key"`
+	UpstreamID int64  `gorm:"column:upstream_id"`
 
 	// CreatedAt 是上游那条日志的发生时间（秒）。带索引：排障按时间窗查。
-	CreatedAt int64  `gorm:"column:created_at;index"`
+	CreatedAt int64  `gorm:"column:created_at;index;index:idx_upstream_err_domain_created,priority:2"`
 	ModelName string `gorm:"size:128;column:model_name;index"`
 
 	// Content 是上游的错误原文。**这是本表存在的理由**——
@@ -126,7 +132,7 @@ type ChannelUpstreamErrorLog struct {
 	//
 	// 单独成列而不是查询时正则：没有索引的 REGEXP 会让每次串联退化成全表扫，
 	// 而这张表会持续增长。
-	JoinKey string `gorm:"size:128;column:join_key;index"`
+	JoinKey string `gorm:"size:128;column:join_key;index;index:idx_upstream_err_domain_join,priority:2"`
 
 	// FetchedAt 本地抓取时刻，用于判断数据新鲜度与做保留期清理。
 	FetchedAt int64 `gorm:"column:fetched_at;index"`
@@ -149,11 +155,201 @@ type ChannelUpstreamErrorLog struct {
 	//     过期了再也拿不回来**；
 	//  2. 上游改版加字段时，原文是唯一能事后发现的凭据。
 	// 代价是磁盘：单条按 2KB 估、一天几百条错误，量级可忽略。
-	RawJSON string `gorm:"type:text;column:raw_json"`
+	RawJSON      string `gorm:"type:text;column:raw_json"`
+	RawTruncated bool   `gorm:"column:raw_truncated"`
+}
+
+// channelUpstreamErrorLogV23 is the only legacy shape ever shipped for this
+// table. Its (domain, upstream_id) key is unsafe because unmodified NewAPI
+// rewrites id as a page-local ordinal. Keep this private migration DTO until
+// every rollback image older than v25 is retired.
+type channelUpstreamErrorLogV23 struct {
+	LegacyRowID               int64  `gorm:"column:legacy_rowid"`
+	Domain                    string `gorm:"column:domain"`
+	UpstreamID                int64  `gorm:"column:upstream_id"`
+	CreatedAt                 int64  `gorm:"column:created_at"`
+	ModelName                 string `gorm:"column:model_name"`
+	Content                   string `gorm:"column:content"`
+	UpstreamRequestID         string `gorm:"column:upstream_request_id"`
+	UpstreamUpstreamRequestID string `gorm:"column:upstream_upstream_request_id"`
+	TokenName                 string `gorm:"column:token_name"`
+	GroupName                 string `gorm:"column:group_name"`
+	UseTime                   int64  `gorm:"column:use_time"`
+	UpstreamChannelName       string `gorm:"column:upstream_channel_name"`
+	UpstreamChannelID         int64  `gorm:"column:upstream_channel_id"`
+	StatusCode                int64  `gorm:"column:status_code"`
+	ErrorCode                 string `gorm:"column:error_code"`
+	ErrorType                 string `gorm:"column:error_type"`
+	RequestPath               string `gorm:"column:request_path"`
+	JoinKey                   string `gorm:"column:join_key"`
+	FetchedAt                 int64  `gorm:"column:fetched_at"`
+	RawJSON                   string `gorm:"column:raw_json"`
+}
+
+// migrateChannelUpstreamErrorLogEventKey explicitly rebuilds the one legacy
+// primary-key shape. GORM's SQLite AutoMigrate adds columns but does not replace
+// a composite primary key; relying on it would make ON CONFLICT(domain,
+// event_key) fail only after deployment.
+//
+// The mandatory dual-store snapshot is created before this function runs.
+// Migration itself is one SQLite transaction and processes bounded batches.
+// The legacy key used a page-local ordinal, so duplicate copies of one event are
+// expected rather than corruption: they are de-duplicated by EventKey and the
+// count is logged. Malformed legacy raw JSON is retained under a deterministic
+// fallback identity. The old collector state is cleared in the same transaction
+// because neither de-duplicated nor fallback evidence proves continuous coverage.
+func migrateChannelUpstreamErrorLogEventKey(db *gorm.DB) error {
+	if !db.Migrator().HasTable(&ChannelUpstreamErrorLog{}) {
+		return nil
+	}
+	type tableColumn struct {
+		Name string `gorm:"column:name"`
+		PK   int    `gorm:"column:pk"`
+	}
+	var columns []tableColumn
+	if err := db.Raw("PRAGMA table_info(channel_upstream_error_logs)").Scan(&columns).Error; err != nil {
+		return err
+	}
+	primary := map[int]string{}
+	for _, column := range columns {
+		if column.PK > 0 {
+			primary[column.PK] = column.Name
+		}
+	}
+	if len(primary) == 2 && primary[1] == "domain" && primary[2] == "event_key" {
+		return nil
+	}
+	if len(primary) != 2 || primary[1] != "domain" || primary[2] != "upstream_id" {
+		return fmt.Errorf("channel_upstream_error_logs 主键结构未知，拒绝自动迁移: %v", primary)
+	}
+	const legacyTable = "channel_upstream_error_logs_v23_migration"
+	if db.Migrator().HasTable(legacyTable) {
+		return fmt.Errorf("发现未完成的上游错误日志迁移临时表 %s", legacyTable)
+	}
+	const createCurrent = `CREATE TABLE channel_upstream_error_logs (
+		domain text, event_key text, upstream_id integer, created_at integer,
+		model_name text, content text, upstream_request_id text,
+		upstream_upstream_request_id text, token_name text, group_name text,
+		use_time integer, upstream_channel_name text, upstream_channel_id integer,
+		status_code integer, error_code text, error_type text, request_path text,
+		join_key text, fetched_at integer, raw_json text, raw_truncated numeric,
+		PRIMARY KEY (domain, event_key)
+	)`
+	var migrated, collisions, fallbackKeys int64
+	err := db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Exec("ALTER TABLE channel_upstream_error_logs RENAME TO " + legacyTable).Error; err != nil {
+			return err
+		}
+		if err := tx.Exec(createCurrent).Error; err != nil {
+			return err
+		}
+		var afterRowID int64
+		for {
+			var batch []channelUpstreamErrorLogV23
+			if err := tx.Raw(`SELECT rowid AS legacy_rowid, * FROM `+legacyTable+`
+				WHERE rowid > ? ORDER BY rowid LIMIT 250`, afterRowID).Scan(&batch).Error; err != nil {
+				return err
+			}
+			if len(batch) == 0 {
+				break
+			}
+			converted := make([]ChannelUpstreamErrorLog, 0, len(batch))
+			for _, old := range batch {
+				var fields map[string]json.RawMessage
+				eventKey := ""
+				var keyErr error
+				if rawErr := json.Unmarshal([]byte(old.RawJSON), &fields); rawErr == nil {
+					eventKey, keyErr = stableUpstreamErrorEventKey(fields)
+				} else {
+					keyErr = rawErr
+				}
+				if eventKey == "" || keyErr != nil {
+					eventKey = legacyUpstreamErrorFallbackEventKey(old)
+					fallbackKeys++
+				}
+				raw := boundedUpstreamErrorField(old.RawJSON, upstreamErrorLogRawMax)
+				converted = append(converted, ChannelUpstreamErrorLog{
+					Domain: old.Domain, EventKey: eventKey, UpstreamID: old.UpstreamID,
+					CreatedAt: old.CreatedAt, ModelName: old.ModelName, Content: old.Content,
+					UpstreamRequestID: old.UpstreamRequestID, UpstreamUpstreamRequestID: old.UpstreamUpstreamRequestID,
+					TokenName: old.TokenName, GroupName: old.GroupName, UseTime: old.UseTime,
+					UpstreamChannelName: old.UpstreamChannelName, UpstreamChannelID: old.UpstreamChannelID,
+					StatusCode: old.StatusCode, ErrorCode: old.ErrorCode, ErrorType: old.ErrorType,
+					RequestPath: old.RequestPath, JoinKey: old.JoinKey, FetchedAt: old.FetchedAt,
+					RawJSON: raw, RawTruncated: len(raw) < len(strings.TrimSpace(old.RawJSON)),
+				})
+				afterRowID = old.LegacyRowID
+			}
+			result := tx.Table("channel_upstream_error_logs").
+				Clauses(clause.OnConflict{DoNothing: true}).Create(&converted)
+			if result.Error != nil {
+				return fmt.Errorf("旧上游错误日志写入失败: %w", result.Error)
+			}
+			migrated += result.RowsAffected
+			collisions += int64(len(converted)) - result.RowsAffected
+		}
+		// v23 可能已经有调度状态表。旧主键曾覆盖/重复证据，原水位不能再证明
+		// 连续完整；在同一事务清空，让后续采集从安全首轮重新建立覆盖。
+		var stateTableCount int64
+		if err := tx.Raw(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='upstream_error_log_sync_states'`).Scan(&stateTableCount).Error; err != nil {
+			return err
+		}
+		if stateTableCount > 0 {
+			if err := tx.Exec("DELETE FROM upstream_error_log_sync_states").Error; err != nil {
+				return fmt.Errorf("重置旧上游错误日志采集水位失败: %w", err)
+			}
+		}
+		return tx.Exec("DROP TABLE " + legacyTable).Error
+	})
+	if err != nil {
+		return err
+	}
+	if collisions > 0 || fallbackKeys > 0 {
+		slog.Warn("上游错误日志主键迁移含旧证据修复",
+			"rows", migrated, "deduplicated", collisions, "fallback_keys", fallbackKeys)
+	} else {
+		slog.Info("上游错误日志主键迁移完成", "rows", migrated)
+	}
+	return nil
+}
+
+func legacyUpstreamErrorFallbackEventKey(old channelUpstreamErrorLogV23) string {
+	// Exclude the parsed UpstreamID column (page-local) and FetchedAt
+	// (collection-local). Malformed RawJSON is retained verbatim and may itself
+	// contain an unparseable id; the fallback remains deterministic, but only
+	// valid JSON receives the stronger field-level page-id exclusion above.
+	encoded, _ := json.Marshal(struct {
+		CreatedAt                 int64  `json:"created_at"`
+		ModelName                 string `json:"model_name"`
+		Content                   string `json:"content"`
+		UpstreamRequestID         string `json:"request_id"`
+		UpstreamUpstreamRequestID string `json:"upstream_request_id"`
+		TokenName                 string `json:"token_name"`
+		GroupName                 string `json:"group_name"`
+		UseTime                   int64  `json:"use_time"`
+		UpstreamChannelName       string `json:"channel_name"`
+		UpstreamChannelID         int64  `json:"channel_id"`
+		StatusCode                int64  `json:"status_code"`
+		ErrorCode                 string `json:"error_code"`
+		ErrorType                 string `json:"error_type"`
+		RequestPath               string `json:"request_path"`
+		JoinKey                   string `json:"join_key"`
+		RawJSON                   string `json:"raw_json"`
+	}{
+		old.CreatedAt, old.ModelName, old.Content, old.UpstreamRequestID,
+		old.UpstreamUpstreamRequestID, old.TokenName, old.GroupName, old.UseTime,
+		old.UpstreamChannelName, old.UpstreamChannelID, old.StatusCode,
+		old.ErrorCode, old.ErrorType, old.RequestPath, old.JoinKey, old.RawJSON,
+	})
+	digest := sha256.Sum256(encoded)
+	// EventKey 的持久化契约是 64 字符。保留可读前缀，再取 228-bit
+	// 哈希；远高于该本地证据集所需的碰撞安全度。
+	return "legacy-" + hex.EncodeToString(digest[:])[:57]
 }
 
 // upstreamErrorLogItem 是从上游响应解出的一条错误日志。
 type upstreamErrorLogItem struct {
+	EventKey                  string
 	ID                        int64
 	CreatedAt                 int64
 	ModelName                 string
@@ -173,7 +369,8 @@ type upstreamErrorLogItem struct {
 	ErrorType           string
 	RequestPath         string
 	// Raw 是原始 JSON，见 ChannelUpstreamErrorLog.RawJSON 的说明。
-	Raw string
+	Raw          string
+	RawTruncated bool
 	// UnresolvedFields 列出**一个候选名都没命中**的字段。
 	// 它不是错误：缺 token_name 不影响排障。但必须能被观测到——
 	// 若上线后发现 content 长期在这个列表里，说明字段名猜错了，
@@ -189,7 +386,8 @@ type upstreamErrorLogItem struct {
 // 错误日志是排障线索，**缺字段不该丢整条**：只要有 id 和 created_at 就值得存，
 // 其余字段空着也比没有这条记录好。所以这里只对那两个字段硬校验。
 //
-// 反过来，id 必须严格：它是主键，错了会让两条不同的日志互相覆盖。
+// id 仍必须是有效正整数：它作为上游页内序号保留供诊断，
+// 但不再作为事件主键（见 EventKey）。
 // ★ 为什么解成 map 再挑键，而不是定型结构体 ★
 //
 // 定型结构体对未知字段是**静默丢弃**——字段名猜错时表现为「解出来是空串」，
@@ -202,7 +400,7 @@ func decodeUpstreamErrorLogItem(itemJSON json.RawMessage) (upstreamErrorLogItem,
 		return upstreamErrorLogItem{}, fmt.Errorf("上游错误日志条目无效: %w", err)
 	}
 
-	// id 与 created_at 是硬要求：前者是主键（错了会互相覆盖），后者是时间轴锚点。
+	// id 与 created_at 是硬要求：前者是页内诊断序号，后者是时间轴锚点。
 	// 这两个已由契约 fixture 与生产计价路径证实，不需要候选名。
 	id, err := rawJSONInt64Exact(fields["id"])
 	if err != nil || id <= 0 {
@@ -213,7 +411,16 @@ func decodeUpstreamErrorLogItem(itemJSON json.RawMessage) (upstreamErrorLogItem,
 		return upstreamErrorLogItem{}, fmt.Errorf("上游错误日志缺少有效 created_at")
 	}
 
-	item := upstreamErrorLogItem{ID: id, CreatedAt: int64(created), Raw: string(itemJSON)}
+	eventKey, err := stableUpstreamErrorEventKey(fields)
+	if err != nil {
+		return upstreamErrorLogItem{}, err
+	}
+	raw := string(itemJSON)
+	boundedRaw := boundedUpstreamErrorField(raw, upstreamErrorLogRawMax)
+	item := upstreamErrorLogItem{
+		EventKey: eventKey, ID: id, CreatedAt: int64(created),
+		Raw: boundedRaw, RawTruncated: len(boundedRaw) < len(strings.TrimSpace(raw)),
+	}
 	// pick 取第一个命中的候选名；一个都没命中时登记到 UnresolvedFields。
 	pick := func(label string, maxBytes int, names ...string) string {
 		for _, n := range names {
@@ -247,6 +454,33 @@ func decodeUpstreamErrorLogItem(itemJSON json.RawMessage) (upstreamErrorLogItem,
 	// 上游还没拿到模型商的响应体，自然没有那个 id。
 	item.JoinKey = logChainJoinKeyFrom(item.Content)
 	return item, nil
+}
+
+// stableUpstreamErrorEventKey removes only NewAPI's page-local synthetic id
+// and hashes the remaining canonical JSON value. RawMessage values must be
+// decoded first: marshaling map[string]RawMessage sorts only the top-level map
+// while preserving nested-object source order, which would split one event into
+// two identities after a harmless upstream JSON serializer change.
+func stableUpstreamErrorEventKey(fields map[string]json.RawMessage) (string, error) {
+	stable := make(map[string]any, len(fields))
+	for key, value := range fields {
+		if key == "id" {
+			continue
+		}
+		decoder := json.NewDecoder(bytes.NewReader(value))
+		decoder.UseNumber()
+		var decoded any
+		if err := decoder.Decode(&decoded); err != nil {
+			return "", fmt.Errorf("规范化上游错误日志字段 %q 失败: %w", key, err)
+		}
+		stable[key] = decoded
+	}
+	encoded, err := json.Marshal(stable)
+	if err != nil {
+		return "", fmt.Errorf("规范化上游错误日志失败: %w", err)
+	}
+	digest := sha256.Sum256(encoded)
+	return hex.EncodeToString(digest[:]), nil
 }
 
 // logChainJoinKeyFrom 从错误原文里抠出上下游串联键。
@@ -382,6 +616,16 @@ type UpstreamErrorLogSyncState struct {
 	// SyncedUntil 已采集到的时间水位（上游日志的 created_at）。
 	// 下一轮从这里往后拉，避免每次都从当天 0 点重扫。
 	SyncedUntil int64 `gorm:"column:synced_until"`
+	// CoverageFrom 与 SyncedUntil 共同描述已经连续核验过的半开区间
+	// [CoverageFrom, SyncedUntil)。只有请求时间落在这个区间内，排障页才有
+	// 资格把“没有命中上游错误日志”解释为确实未找到。旧状态没有这个字段时
+	// 保持 0，宁可显示“采集范围未覆盖”，也不能把未知冒充正常。
+	CoverageFrom int64 `gorm:"column:coverage_from"`
+	// WindowFrom/WindowTo persist an adaptively narrowed dense window. A
+	// restart resumes the same bounded interval rather than retrying the original
+	// oversized range forever.
+	WindowFrom int64 `gorm:"column:window_from"`
+	WindowTo   int64 `gorm:"column:window_to"`
 
 	ConsecutiveFails int    `gorm:"column:consecutive_fails"`
 	LastError        string `gorm:"size:512;column:last_error"`
@@ -407,6 +651,9 @@ type upstreamErrorLogResult struct {
 	// Truncated 为真表示达到单轮请求预算就停了，窗口没读完。
 	// **必须回显**：不然运营会以为「上游那段时间只有这些错误」。
 	Truncated bool
+	// SuggestedTo 是密集窗口安全缩短后的右边界；调用方持久化它，下一轮
+	// 从同一左水位继续，避免反复重扫同一个过大窗口。
+	SuggestedTo int64
 	// UnresolvedFields 统计各字段「一个候选名都没命中」的条数。
 	//
 	// 这是本轮字段名未核实的观测出口：若上线后 content 长期出现在这里，
@@ -419,8 +666,9 @@ type upstreamErrorLogResult struct {
 //
 // 与用量同步的关键差别：**不聚合**。每条都进 Rows，供落库保留明细。
 //
-// 单轮请求预算由 pacer 控制，达到上限时返回已读到的部分并置 Truncated，
-// 而不是报错丢弃——排障宁可拿到一半也比拿不到好，但必须知道是一半。
+// 单轮请求预算由 pacer 控制。当窗口超过可完整校验的页数时，
+// 不返回也不落库部分页；而是置 Truncated 并给出 SuggestedTo，
+// 让调度层持久化缩窗后从同一左水位重试。
 func syncUpstreamErrorLogWindow(ctx context.Context, client *http.Client, row ChannelUpstreamAccount, cred newAPICredential, from, to int64, pacer *upstreamUsageRequestPacer, now int64) (upstreamErrorLogResult, error) {
 	if row.Provider != upstreamProviderNewAPI {
 		return upstreamErrorLogResult{}, fmt.Errorf("%s 无日志接口，无法读取上游错误日志", upstreamProviderName(row.Provider))
@@ -428,70 +676,110 @@ func syncUpstreamErrorLogWindow(ctx context.Context, client *http.Client, row Ch
 	if to <= from {
 		return upstreamErrorLogResult{}, fmt.Errorf("上游错误日志窗口无效")
 	}
-	var out upstreamErrorLogResult
-	seen := map[int64]struct{}{}
-	for page := 1; ; page++ {
-		got, err := fetchUpstreamErrorLogPage(ctx, client, row, cred, from, to, page, pacer)
-		if err != nil {
-			// 请求预算耗尽不是失败：返回已读部分并标明未读完。
-			var budget *upstreamUsageRunBudgetExhausted
-			if errors.As(err, &budget) {
-				out.Truncated = true
-				return out, nil
-			}
-			return out, err
+	first, err := fetchUpstreamErrorLogPage(ctx, client, row, cred, from, to, 1, pacer)
+	if err != nil {
+		return upstreamErrorLogResult{}, err
+	}
+	out := upstreamErrorLogResult{Total: first.Total, PagesRead: 1}
+	// 留一次请求预算给扫描后的首页复核；超过可完整验证的页数时不保存
+	// 部分结果，而是缩短时间窗后在下一轮从同一左水位重试。
+	maxCompletePages := upstreamErrorLogMaxRequestsPerRun - 1
+	if first.Total > int64(maxCompletePages*upstreamUsagePageSize) {
+		if to-from <= 1 {
+			return out, fmt.Errorf("单秒上游错误日志超过 %d 条，无法安全完整采集", maxCompletePages*upstreamUsagePageSize)
 		}
-		out.Total = got.Total
+		out.Truncated = true
+		out.SuggestedTo = from + (to-from)/2
+		return out, nil
+	}
+	expectedFirst := int(first.Total)
+	if expectedFirst > upstreamUsagePageSize {
+		expectedFirst = upstreamUsagePageSize
+	}
+	if len(first.Items) != expectedFirst {
+		return out, fmt.Errorf("NewAPI 错误日志首页数量异常（got=%d want=%d）", len(first.Items), expectedFirst)
+	}
+	all := append(make([]upstreamErrorLogItem, 0, first.Total), first.Items...)
+	pageCount := int((first.Total + upstreamUsagePageSize - 1) / upstreamUsagePageSize)
+	for page := 2; page <= pageCount; page++ {
+		got, fetchErr := fetchUpstreamErrorLogPage(ctx, client, row, cred, from, to, page, pacer)
+		if fetchErr != nil {
+			return out, fetchErr
+		}
 		out.PagesRead = page
-		if len(got.Items) == 0 {
-			return out, nil
+		if got.Total != first.Total {
+			return out, fmt.Errorf("NewAPI 错误日志扫描期间 total 变化（%d -> %d）", first.Total, got.Total)
 		}
-		for _, item := range got.Items {
-			// 上游翻页期间有新日志写入时，同一条可能在两页都出现。
-			// 主键能兜住重复写，但这里先去重可以少一次无用的 upsert。
-			if _, dup := seen[item.ID]; dup {
-				continue
-			}
-			seen[item.ID] = struct{}{}
-			out.Rows = append(out.Rows, ChannelUpstreamErrorLog{
-				Domain:                    row.Domain,
-				UpstreamID:                item.ID,
-				CreatedAt:                 item.CreatedAt,
-				ModelName:                 item.ModelName,
-				Content:                   item.Content,
-				TokenName:                 item.TokenName,
-				GroupName:                 item.GroupName,
-				UpstreamRequestID:         item.UpstreamRequestID,
-				UpstreamUpstreamRequestID: item.UpstreamUpstreamRequestID,
-				JoinKey:                   item.JoinKey,
-				UseTime:                   item.UseTime,
-				UpstreamChannelName:       item.UpstreamChannelName,
-				UpstreamChannelID:         item.UpstreamChannelID,
-				StatusCode:                item.StatusCode,
-				ErrorCode:                 item.ErrorCode,
-				ErrorType:                 item.ErrorType,
-				RequestPath:               item.RequestPath,
-				FetchedAt:                 now,
-				RawJSON:                   item.Raw,
-			})
-			// 汇总未命中的字段名，供调用方回显。一条一条报会淹掉日志，
-			// 而「content 在整个窗口里都没命中」才是真正需要知道的信号。
-			for _, f := range item.UnresolvedFields {
-				if out.UnresolvedFields == nil {
-					out.UnresolvedFields = map[string]int{}
-				}
-				out.UnresolvedFields[f]++
-			}
+		expected := upstreamUsagePageSize
+		if page == pageCount && first.Total%upstreamUsagePageSize != 0 {
+			expected = int(first.Total % upstreamUsagePageSize)
 		}
-		// 读满 total 即止。用 >= 而非 ==：上游 total 可能在翻页期间变大，
-		// 死等相等会多转一圈甚至转不完。
-		if int64(len(seen)) >= got.Total {
-			return out, nil
+		if len(got.Items) != expected {
+			return out, fmt.Errorf("NewAPI 错误日志第 %d 页数量异常（got=%d want=%d）", page, len(got.Items), expected)
+		}
+		all = append(all, got.Items...)
+	}
+	if pageCount > 1 {
+		probe, probeErr := fetchUpstreamErrorLogPage(ctx, client, row, cred, from, to, 1, pacer)
+		if probeErr != nil {
+			return out, probeErr
+		}
+		if probe.Total != first.Total || probe.Fingerprint != first.Fingerprint {
+			return out, fmt.Errorf("NewAPI 错误日志扫描期间首页已变化，窗口将重试")
 		}
 	}
+	seen := map[string]struct{}{}
+	for _, item := range all {
+		if _, dup := seen[item.EventKey]; dup {
+			continue
+		}
+		seen[item.EventKey] = struct{}{}
+		out.Rows = append(out.Rows, ChannelUpstreamErrorLog{
+			Domain:                    row.Domain,
+			EventKey:                  item.EventKey,
+			UpstreamID:                item.ID,
+			CreatedAt:                 item.CreatedAt,
+			ModelName:                 item.ModelName,
+			Content:                   item.Content,
+			TokenName:                 item.TokenName,
+			GroupName:                 item.GroupName,
+			UpstreamRequestID:         item.UpstreamRequestID,
+			UpstreamUpstreamRequestID: item.UpstreamUpstreamRequestID,
+			JoinKey:                   item.JoinKey,
+			UseTime:                   item.UseTime,
+			UpstreamChannelName:       item.UpstreamChannelName,
+			UpstreamChannelID:         item.UpstreamChannelID,
+			StatusCode:                item.StatusCode,
+			ErrorCode:                 item.ErrorCode,
+			ErrorType:                 item.ErrorType,
+			RequestPath:               item.RequestPath,
+			FetchedAt:                 now,
+			RawJSON:                   item.Raw,
+			RawTruncated:              item.RawTruncated,
+		})
+		// 汇总未命中的字段名，供调用方回显。一条一条报会淹掉日志，
+		// 而「content 在整个窗口里都没命中」才是真正需要知道的信号。
+		for _, f := range item.UnresolvedFields {
+			if out.UnresolvedFields == nil {
+				out.UnresolvedFields = map[string]int{}
+			}
+			out.UnresolvedFields[f]++
+		}
+	}
+	if int64(len(out.Rows)) != first.Total {
+		// A duplicate means either two real events collapsed to the same
+		// canonical identity or page contents shifted without changing the
+		// first-page fingerprint. In both cases completeness is unprovable:
+		// return no rows so callers cannot persist a partial set or advance the
+		// watermark.
+		out.Rows = nil
+		out.UnresolvedFields = nil
+		return out, fmt.Errorf("NewAPI 错误日志事件键碰撞或分页漂移（unique=%d total=%d）", len(seen), first.Total)
+	}
+	return out, nil
 }
 
-// persistUpstreamErrorLogs 落库。按 (domain, upstream_id) upsert，重复拉取幂等。
+// persistUpstreamErrorLogs 落库。按 (domain, event_key) upsert，重复拉取幂等。
 //
 // 分批写：单条 SQL 塞几千行会撞 SQLite 的变量上限，也会让一次事务过长
 // 阻塞其它写入。批大小取 200，与本仓库其它批写保持一致的量级。
@@ -507,14 +795,14 @@ func (m *Monitor) persistUpstreamErrorLogs(ctx context.Context, rows []ChannelUp
 		}
 		if err := m.storeDB.WithContext(ctx).
 			Clauses(clause.OnConflict{
-				Columns: []clause.Column{{Name: "domain"}, {Name: "upstream_id"}},
+				Columns: []clause.Column{{Name: "domain"}, {Name: "event_key"}},
 				// 只更新可能变化的字段。upstream_id / domain 是主键不动；
 				// created_at 理论上不会变，但上游若修正过时间戳，以最新为准。
 				DoUpdates: clause.AssignmentColumns([]string{
-					"created_at", "model_name", "content", "token_name", "group_name",
+					"upstream_id", "created_at", "model_name", "content", "token_name", "group_name",
 					"upstream_request_id", "upstream_upstream_request_id", "fetched_at",
 					"raw_json", "use_time", "upstream_channel_name", "upstream_channel_id",
-					"status_code", "error_code", "error_type", "request_path", "join_key",
+					"status_code", "error_code", "error_type", "request_path", "join_key", "raw_truncated",
 				}),
 			}).
 			Create(rows[start:end]).Error; err != nil {
@@ -533,12 +821,48 @@ func (m *Monitor) pruneUpstreamErrorLogs(ctx context.Context, before int64) erro
 	if before <= 0 {
 		return nil
 	}
-	if err := m.storeDB.WithContext(ctx).
-		Where("created_at < ?", before).
-		Delete(&ChannelUpstreamErrorLog{}).Error; err != nil {
-		return fmt.Errorf("清理上游错误日志失败: %w", err)
-	}
-	return nil
+	const batchSize = 500
+	const maxBatches = 2
+	return m.storeDB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		for batch := 0; batch < maxBatches; batch++ {
+			result := tx.Exec(
+				"DELETE FROM channel_upstream_error_logs WHERE rowid IN ("+
+					"SELECT rowid FROM channel_upstream_error_logs WHERE created_at < ? LIMIT ?)",
+				before, batchSize)
+			if result.Error != nil {
+				return fmt.Errorf("清理上游错误日志失败: %w", result.Error)
+			}
+			if result.RowsAffected < batchSize {
+				break
+			}
+		}
+		// 删除证据与收缩覆盖必须是同一事务。否则页面可能在两条语句之间把
+		// 已经删除的历史区间判成“查过且没有异常”。完全早于保留线的旧水位
+		// 归零，等待下一次成功采集重新建立可证明覆盖。
+		if err := tx.Model(&UpstreamErrorLogSyncState{}).
+			Where("coverage_from > 0 AND coverage_from < ? AND synced_until > ?", before, before).
+			Updates(map[string]any{
+				"coverage_from": before,
+				"updated_at":    time.Now().Unix(),
+			}).Error; err != nil {
+			return fmt.Errorf("收缩上游错误日志覆盖范围失败: %w", err)
+		}
+		// 整段覆盖已经落在保留线之前时，不能只清 CoverageFrom 却
+		// 留下旧 SyncedUntil：那会让恢复从 31 天前慢慢追水位。覆盖水位和
+		// 未完成窗口一起归零，下次到期运行将按“首轮近 6 小时”快速恢复。
+		if err := tx.Model(&UpstreamErrorLogSyncState{}).
+			Where("synced_until > 0 AND synced_until <= ?", before).
+			Updates(map[string]any{
+				"coverage_from": 0,
+				"synced_until":  0,
+				"window_from":   0,
+				"window_to":     0,
+				"updated_at":    time.Now().Unix(),
+			}).Error; err != nil {
+			return fmt.Errorf("重置已过期的上游错误日志水位失败: %w", err)
+		}
+		return nil
+	})
 }
 
 // 调度参数。
@@ -556,6 +880,9 @@ const (
 	// upstreamErrorLogMaxRequestsPerRun 单账户单轮请求上限。
 	// 与用量同步的预算机制同源：宁可标 Truncated 也不无限翻页。
 	upstreamErrorLogMaxRequestsPerRun = 6
+	upstreamErrorLogWindow            = 15 * time.Minute
+	upstreamErrorLogRoundTimeout      = 75 * time.Second
+	upstreamErrorLogMaxAccountsPerRun = 4
 
 	// upstreamErrorLogLookbackOnFirstRun 首轮回看多久。
 	// 没有水位时从这里起拉，不从「上游有史以来」起——那会翻很多页。
@@ -577,31 +904,81 @@ const (
 // 串行而非并发：与用量同步同一原则——上游速率限制是按账号算的，
 // 并发只会更快撞限流；而错误日志量小，串行完全够。
 func (m *Monitor) syncDueUpstreamErrorLogs(ctx context.Context) {
-	if !m.cfg.UpstreamErrorLogSyncEnabled {
+	if !m.cfg.UpstreamErrorLogSyncEnabled || len(m.cfg.UpstreamErrorLogDomains) == 0 {
 		return
 	}
+	roundCtx, cancel := context.WithTimeout(ctx, upstreamErrorLogRoundTimeout)
+	defer cancel()
 	now := time.Now().Unix()
 	var rows []ChannelUpstreamAccount
 	// 只取启用了日志同步授权的账户。UsageSyncEnabled 是管理员对
 	// 「允许读这个上游的日志」的授权，错误日志同属日志，不绕过它。
-	if err := m.storeDB.WithContext(ctx).
+	if err := m.storeDB.WithContext(roundCtx).
 		Where("enabled = ? AND usage_sync_enabled = ?", true, true).
-		Find(&rows).Error; err != nil {
+		Order("domain ASC").Find(&rows).Error; err != nil {
 		slog.Warn("读取上游账户失败，本轮错误日志采集跳过", "err", err)
 		return
 	}
+	var states []UpstreamErrorLogSyncState
+	if err := m.storeDB.WithContext(roundCtx).Find(&states).Error; err != nil {
+		slog.Warn("读取上游错误日志状态失败，本轮采集跳过", "err", err)
+		return
+	}
+	stateByDomain := make(map[string]UpstreamErrorLogSyncState, len(states))
+	for _, state := range states {
+		stateByDomain[state.Domain] = state
+	}
+	eligible := make([]ChannelUpstreamAccount, 0, len(rows))
 	for _, row := range rows {
-		if err := ctx.Err(); err != nil {
+		if !upstreamErrorLogDomainAllowed(m.cfg.UpstreamErrorLogDomains, row.Domain) {
+			continue
+		}
+		if state, ok := stateByDomain[row.Domain]; ok &&
+			(state.Status == upstreamStatusUnsupported || state.NextSyncAt > now) {
+			continue
+		}
+		eligible = append(eligible, row)
+	}
+	// Oldest-attempted first is a persistent round-robin without another
+	// cursor table. A dense alphabetically early domain therefore cannot occupy
+	// one of four slots forever; never-attempted domains (zero) lead the queue.
+	sort.SliceStable(eligible, func(i, j int) bool {
+		left, right := stateByDomain[eligible[i].Domain], stateByDomain[eligible[j].Domain]
+		if left.LastAttemptAt != right.LastAttemptAt {
+			return left.LastAttemptAt < right.LastAttemptAt
+		}
+		return eligible[i].Domain < eligible[j].Domain
+	})
+	processed := 0
+	for _, row := range eligible {
+		if err := roundCtx.Err(); err != nil {
 			return
 		}
-		m.syncOneUpstreamErrorLog(ctx, row, now)
+		if processed >= upstreamErrorLogMaxAccountsPerRun {
+			break
+		}
+		if err := m.syncOneUpstreamErrorLog(roundCtx, row, now); err != nil {
+			if errors.Is(err, errUpstreamAccountBusy) {
+				continue
+			}
+			slog.Warn("上游错误日志账户同步未完成", "domain", row.Domain, "err", err)
+		}
+		processed++
 	}
-	// 顺带清理过期数据。放在同一轮里而不另起 goroutine：
-	// 这张表增长慢，没必要为它多一个后台任务。
-	cutoff := now - int64(upstreamErrorLogRetentionDays)*86400
-	if err := m.pruneUpstreamErrorLogs(ctx, cutoff); err != nil {
-		slog.Warn("清理上游错误日志失败", "err", err)
+	// 每天一次、每次最多两批，避免每分钟做无效 DELETE 或形成长写锁。
+	day := now / 86400
+	if m.upstreamErrorLogPruneDay.Load() != day {
+		cutoff := now - int64(upstreamErrorLogRetentionDays)*86400
+		if err := m.pruneUpstreamErrorLogs(roundCtx, cutoff); err != nil {
+			slog.Warn("清理上游错误日志失败", "err", err)
+		} else {
+			m.upstreamErrorLogPruneDay.Store(day)
+		}
 	}
+}
+
+func upstreamErrorLogDomainAllowed(domains []string, domain string) bool {
+	return pricingLedgerDomainAllowed(domains, domain)
 }
 
 // syncOneUpstreamErrorLog 采集单个账户。
@@ -609,41 +986,60 @@ func (m *Monitor) syncDueUpstreamErrorLogs(ctx context.Context) {
 // 不支持的 provider 落 unsupported 状态并**永不重试**（NextSyncAt=0 表示不排期）——
 // sub2api/aicodewith 的端点是聚合/计价语义，重试一万次也不会变出日志接口。
 // 但状态必须落库：页面要能区分「该上游无日志接口」与「该上游没有错误」。
-func (m *Monitor) syncOneUpstreamErrorLog(ctx context.Context, row ChannelUpstreamAccount, now int64) {
-	state := m.loadUpstreamErrorLogState(ctx, row.Domain)
+func (m *Monitor) syncOneUpstreamErrorLog(ctx context.Context, row ChannelUpstreamAccount, now int64) error {
+	release, err := m.tryAcquireUpstreamAccountBackground(row.Domain)
+	if err != nil {
+		return err
+	}
+	defer release()
+	// The account may have been edited after the scheduler snapshot. Reload it
+	// under the same account gate used by admin/usage/pricing operations.
+	if err := m.storeDB.WithContext(ctx).First(&row, "domain = ?", row.Domain).Error; err != nil {
+		return err
+	}
+	if !row.Enabled || !row.UsageSyncEnabled || !upstreamErrorLogDomainAllowed(m.cfg.UpstreamErrorLogDomains, row.Domain) {
+		return nil
+	}
+	state, err := m.loadUpstreamErrorLogState(ctx, row.Domain)
+	if err != nil {
+		return err
+	}
 
 	if row.Provider != upstreamProviderNewAPI {
 		// 已经标过就不再重复写，省掉每轮一次无意义的更新。
 		if state.Status == upstreamStatusUnsupported {
-			return
+			return nil
 		}
 		state.Status = upstreamStatusUnsupported
 		state.LastAttemptAt = now
 		state.NextSyncAt = 0
 		state.LastError = upstreamProviderName(row.Provider) + " 无日志接口（其端点为聚合/计价语义），无法采集上游错误日志"
-		m.saveUpstreamErrorLogState(ctx, &state, now)
-		return
+		return m.saveUpstreamErrorLogState(ctx, &state, now)
 	}
 	if state.NextSyncAt > now {
-		return
+		return nil
 	}
 
 	cred, err := m.credentialForAccount(row)
 	if err != nil {
-		m.failUpstreamErrorLogState(ctx, &state, now, fmt.Errorf("凭据不可用: %w", err))
-		return
+		return m.failUpstreamErrorLogState(ctx, &state, now, &upstreamAuthError{err: fmt.Errorf("凭据不可用: %w", err)})
 	}
 	newCred, ok := cred.(newAPICredential)
 	if !ok {
-		m.failUpstreamErrorLogState(ctx, &state, now, fmt.Errorf("凭据类型与供应商不匹配"))
-		return
+		return m.failUpstreamErrorLogState(ctx, &state, now, &upstreamAuthError{err: fmt.Errorf("凭据类型与供应商不匹配")})
 	}
 
-	from := state.SyncedUntil - int64(upstreamErrorLogOverlap.Seconds())
-	if state.SyncedUntil <= 0 {
-		from = now - int64(upstreamErrorLogLookbackOnFirstRun.Seconds())
+	from, to := state.WindowFrom, state.WindowTo
+	if to <= from {
+		from = state.SyncedUntil - int64(upstreamErrorLogOverlap.Seconds())
+		if state.SyncedUntil <= 0 {
+			from = now - int64(upstreamErrorLogLookbackOnFirstRun.Seconds())
+		}
+		to = from + int64(upstreamErrorLogWindow.Seconds())
+		if to > now+1 {
+			to = now + 1
+		}
 	}
-	to := now + 1 // 含当前秒，避免刚写入的日志被半开区间排除
 
 	// 复用用量同步的请求间隔常量：同一个上游、同一个端点，
 	// 节流口径没有理由不一致。
@@ -652,12 +1048,29 @@ func (m *Monitor) syncOneUpstreamErrorLog(ctx context.Context, row ChannelUpstre
 	result, err := syncUpstreamErrorLogWindow(ctx, m.channelUpstreamHTTPClient(),
 		row, newCred, from, to, pacer, now)
 	if err != nil {
-		m.failUpstreamErrorLogState(ctx, &state, now, err)
-		return
+		return m.failUpstreamErrorLogState(ctx, &state, now, err)
+	}
+	if result.Truncated {
+		state.Status = upstreamStatusPending
+		state.LastAttemptAt = now
+		state.ConsecutiveFails = 0
+		state.LastError = "窗口过密，已缩小后续传"
+		state.WindowFrom, state.WindowTo = from, result.SuggestedTo
+		state.NextSyncAt = now + 30
+		if err := m.saveUpstreamErrorLogState(ctx, &state, now); err != nil {
+			return err
+		}
+		slog.Info("上游错误日志窗口过密，已持久化缩窗", "domain", row.Domain,
+			"from", from, "old_to", to, "next_to", result.SuggestedTo, "total", result.Total)
+		return nil
 	}
 	if err := m.persistUpstreamErrorLogs(ctx, result.Rows); err != nil {
-		m.failUpstreamErrorLogState(ctx, &state, now, err)
-		return
+		return m.failUpstreamErrorLogState(ctx, &state, now, err)
+	}
+	var uniqueRows int64
+	if err := m.storeDB.WithContext(ctx).Model(&ChannelUpstreamErrorLog{}).
+		Where("domain = ?", row.Domain).Count(&uniqueRows).Error; err != nil {
+		return m.failUpstreamErrorLogState(ctx, &state, now, fmt.Errorf("统计上游错误日志唯一行失败: %w", err))
 	}
 
 	state.Status = upstreamStatusOK
@@ -665,25 +1078,23 @@ func (m *Monitor) syncOneUpstreamErrorLog(ctx context.Context, row ChannelUpstre
 	state.LastSuccessAt = now
 	state.ConsecutiveFails = 0
 	state.LastError = ""
-	state.RowsTotal += int64(len(result.Rows))
-	// 水位只在窗口读完时才推进。被 Truncated 就停在原地，
-	// 下一轮从同一处继续——否则未读完的那段会被永久跳过。
-	if !result.Truncated {
-		state.SyncedUntil = to
+	state.RowsTotal = uniqueRows
+	if state.CoverageFrom <= 0 || from < state.CoverageFrom {
+		state.CoverageFrom = from
 	}
+	state.SyncedUntil = to
+	state.WindowFrom, state.WindowTo = 0, 0
 	state.UnresolvedFields = encodeUnresolvedFields(result.UnresolvedFields)
 	state.NextSyncAt = now + int64(upstreamErrorLogSyncInterval.Seconds())
-	m.saveUpstreamErrorLogState(ctx, &state, now)
-
-	if result.Truncated {
-		slog.Info("上游错误日志窗口未读完，下轮从同一水位继续",
-			"domain", row.Domain, "rows", len(result.Rows), "total", result.Total)
+	if err := m.saveUpstreamErrorLogState(ctx, &state, now); err != nil {
+		return err
 	}
 	if len(result.UnresolvedFields) > 0 {
 		// 字段名可能猜错——这是唯一的观测出口，必须显式告警而不是静默。
 		slog.Warn("上游错误日志有字段未命中任何候选名，原文已留存可就地重解",
 			"domain", row.Domain, "unresolved", state.UnresolvedFields)
 	}
+	return nil
 }
 
 // encodeUnresolvedFields 把未命中统计编成紧凑 JSON 文本，供落库与页面展示。
@@ -716,16 +1127,19 @@ func encodeUnresolvedFields(counts map[string]int) string {
 	return boundedUpstreamErrorField(b.String(), 512)
 }
 
-func (m *Monitor) loadUpstreamErrorLogState(ctx context.Context, domain string) UpstreamErrorLogSyncState {
+func (m *Monitor) loadUpstreamErrorLogState(ctx context.Context, domain string) (UpstreamErrorLogSyncState, error) {
 	var state UpstreamErrorLogSyncState
 	if err := m.storeDB.WithContext(ctx).First(&state, "domain = ?", domain).Error; err != nil {
+		if !errors.Is(err, gorm.ErrRecordNotFound) {
+			return UpstreamErrorLogSyncState{}, fmt.Errorf("读取上游错误日志采集状态失败: %w", err)
+		}
 		// 找不到就是首轮，返回零值（NextSyncAt=0 → 立即可同步）。
-		return UpstreamErrorLogSyncState{Domain: domain}
+		return UpstreamErrorLogSyncState{Domain: domain}, nil
 	}
-	return state
+	return state, nil
 }
 
-func (m *Monitor) saveUpstreamErrorLogState(ctx context.Context, state *UpstreamErrorLogSyncState, now int64) {
+func (m *Monitor) saveUpstreamErrorLogState(ctx context.Context, state *UpstreamErrorLogSyncState, now int64) error {
 	state.UpdatedAt = now
 	if err := m.storeDB.WithContext(ctx).
 		Clauses(clause.OnConflict{
@@ -733,26 +1147,39 @@ func (m *Monitor) saveUpstreamErrorLogState(ctx context.Context, state *Upstream
 			UpdateAll: true,
 		}).
 		Create(state).Error; err != nil {
-		slog.Warn("保存上游错误日志采集状态失败", "domain", state.Domain, "err", err)
+		return fmt.Errorf("保存上游错误日志采集状态失败: %w", err)
 	}
+	return nil
 }
 
 // failUpstreamErrorLogState 记一次失败并按连续失败次数指数退避。
 //
 // **不推进水位**：失败那段必须留给下一轮重试，否则会永久漏掉。
-func (m *Monitor) failUpstreamErrorLogState(ctx context.Context, state *UpstreamErrorLogSyncState, now int64, cause error) {
+func (m *Monitor) failUpstreamErrorLogState(ctx context.Context, state *UpstreamErrorLogSyncState, now int64, cause error) error {
 	state.Status = upstreamStatusError
 	state.LastAttemptAt = now
 	state.ConsecutiveFails++
 	state.LastError = boundedUpstreamErrorField(cause.Error(), 512)
-	backoff := upstreamErrorLogBackoffBase << min(state.ConsecutiveFails-1, 6)
-	if backoff > upstreamErrorLogBackoffMax {
-		backoff = upstreamErrorLogBackoffMax
+	var authErr *upstreamAuthError
+	if errors.As(cause, &authErr) {
+		state.Status = upstreamStatusReconnect
+		state.NextSyncAt = upstreamAccountIsolatedUntil
+	} else {
+		backoff := upstreamErrorLogBackoffBase << min(state.ConsecutiveFails-1, 6)
+		if backoff > upstreamErrorLogBackoffMax {
+			backoff = upstreamErrorLogBackoffMax
+		}
+		state.NextSyncAt = now + int64(backoff.Seconds())
+		if retryAt := upstreamRetryAt(cause); retryAt > state.NextSyncAt {
+			state.NextSyncAt = retryAt
+		}
 	}
-	state.NextSyncAt = now + int64(backoff.Seconds())
-	m.saveUpstreamErrorLogState(ctx, state, now)
+	if err := m.saveUpstreamErrorLogState(ctx, state, now); err != nil {
+		return errors.Join(cause, err)
+	}
 	slog.Warn("上游错误日志采集失败", "domain", state.Domain,
-		"fails", state.ConsecutiveFails, "retry_after_s", int64(backoff.Seconds()), "err", cause)
+		"fails", state.ConsecutiveFails, "retry_at", state.NextSyncAt, "err", cause)
+	return cause
 }
 
 // boundedUpstreamErrorField 截断到列宽并去掉首尾空白。

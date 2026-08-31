@@ -21,6 +21,22 @@ func TestLoadSettingsSourceLifecycleDefaults(t *testing.T) {
 	}
 }
 
+func TestLoadSettingsUpstreamErrorLogDefaultsFailClosed(t *testing.T) {
+	t.Setenv("MONITOR_UPSTREAM_ERRORLOG_SYNC_ENABLED", "")
+	t.Setenv("MONITOR_UPSTREAM_ERRORLOG_DOMAINS", "")
+	defaults := LoadSettings()
+	if defaults.UpstreamErrorLogSyncEnabled || len(defaults.UpstreamErrorLogDomains) != 0 {
+		t.Fatalf("error-log collection must default to disabled with an empty allowlist: %+v", defaults.UpstreamErrorLogDomains)
+	}
+	t.Setenv("MONITOR_UPSTREAM_ERRORLOG_SYNC_ENABLED", "true")
+	t.Setenv("MONITOR_UPSTREAM_ERRORLOG_DOMAINS", " a.example, b.example, a.example ")
+	configured := LoadSettings()
+	if !configured.UpstreamErrorLogSyncEnabled || len(configured.UpstreamErrorLogDomains) != 3 {
+		t.Fatalf("explicit error-log settings were not loaded: enabled=%v domains=%v",
+			configured.UpstreamErrorLogSyncEnabled, configured.UpstreamErrorLogDomains)
+	}
+}
+
 func TestLocalAuthBypassIsExplicitAndFailsClosed(t *testing.T) {
 	t.Setenv("MONITOR_LOCAL_AUTH_BYPASS", "")
 	if LoadSettings().LocalAuthBypass {

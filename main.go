@@ -36,6 +36,8 @@ func main() {
 		err = runRestorePreMigrationCommand(os.Args[2:], os.Stdout)
 	} else if len(os.Args) > 1 && os.Args[1] == "restore-backup-set" {
 		err = runRestoreStoreBackupSetCommand(os.Args[2:], os.Stdout)
+	} else if len(os.Args) > 1 && os.Args[1] == "inspect-pre-migration-plan" {
+		err = runInspectPreMigrationPlanCommand(os.Args[2:], os.Stdout)
 	} else {
 		_ = godotenv.Load() // 仅服务启动可选读取 .env；恢复命令不读取应用配置/DSN。
 		err = run()

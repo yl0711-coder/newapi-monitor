@@ -1365,11 +1365,15 @@ func (m *Monitor) serveLogChainRequests(c *gin.Context) {
 	}
 	channelEnrichErr := m.attachChannelSnaps(ctx, rows)
 	edgeEvidenceErr := m.attachNginxEvidence(ctx, rows)
+	var upstreamCorrelationErr error
 	if channelEnrichErr == nil && m.cfg.UpstreamErrorLogSyncEnabled {
-		matches := m.correlateUpstreamErrors(ctx, rows)
-		for i := range rows {
-			if match, ok := matches[rows[i].ID]; ok {
-				rows[i].UpstreamMatch = &match
+		var matches map[int64]LogChainUpstreamMatch
+		matches, upstreamCorrelationErr = m.correlateUpstreamErrors(ctx, rows)
+		if upstreamCorrelationErr == nil {
+			for i := range rows {
+				if match, ok := matches[rows[i].ID]; ok {
+					rows[i].UpstreamMatch = &match
+				}
 			}
 		}
 	}
@@ -1385,6 +1389,9 @@ func (m *Monitor) serveLogChainRequests(c *gin.Context) {
 	}
 	if edgeEvidenceErr != nil {
 		resp["edge_evidence_error"] = edgeEvidenceErr.Error()
+	}
+	if upstreamCorrelationErr != nil {
+		resp["upstream_correlation_error"] = upstreamCorrelationErr.Error()
 	}
 	// 影响面只描述当前页，不额外查生产库。渠道补全失败时
 	// 维度不可信，宁可不给结论，也不返回假的 blast radius。

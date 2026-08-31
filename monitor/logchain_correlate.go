@@ -26,7 +26,7 @@ package monitor
 
 import (
 	"context"
-	"log/slog"
+	"fmt"
 	"sort"
 	"strconv"
 	"strings"
@@ -38,6 +38,10 @@ const (
 	correlateProbable  = "probable"  // 回退键在窗口内唯一
 	correlateAmbiguous = "ambiguous" // 回退键有多个候选，不下结论
 	correlateNone      = "none"      // 找不到对应
+	// 以下三档都表示“不能下没有异常的结论”，不得降级成 none。
+	correlateNotSelected  = "not_selected"  // 该域名未进入采集白名单
+	correlateNotCollected = "not_collected" // 尚无一次成功且连续的采集覆盖
+	correlateIncomplete   = "incomplete"    // 采集异常或请求时刻不在已覆盖区间
 	// correlateNotApplicable 上游**本来就不会有**对应记录，不是采集缺失。
 	//
 	// ★ 为什么必须与 none 分开 ★
@@ -91,21 +95,54 @@ type LogChainUpstreamMatch struct {
 //
 // 只处理 type=5：正常消费行没有"上游错误"可对。
 // domain 为空的行跳过——没有上游域名就无从查起（渠道快照缺失时会这样）。
-func (m *Monitor) correlateUpstreamErrors(ctx context.Context, rows []LogChainRow) map[int64]LogChainUpstreamMatch {
+func (m *Monitor) correlateUpstreamErrors(ctx context.Context, rows []LogChainRow) (map[int64]LogChainUpstreamMatch, error) {
 	out := map[int64]LogChainUpstreamMatch{}
 	if len(rows) == 0 || m.storeDB == nil {
-		return out
+		return out, nil
+	}
+
+	// 先读取各域名的采集覆盖。没有被可靠覆盖的行不能进入匹配：空表在这种
+	// 情况下只能说明“没采到”，不能说明“上游没有异常”。
+	domains := make([]string, 0, len(rows))
+	seenDomains := map[string]bool{}
+	for _, r := range rows {
+		if r.Type == 5 && r.UpstreamDomain != "" && !seenDomains[r.UpstreamDomain] {
+			seenDomains[r.UpstreamDomain] = true
+			domains = append(domains, r.UpstreamDomain)
+		}
+	}
+	stateByDomain := map[string]UpstreamErrorLogSyncState{}
+	if len(domains) > 0 {
+		var states []UpstreamErrorLogSyncState
+		if err := m.storeDB.WithContext(ctx).Where("domain IN ?", domains).Find(&states).Error; err != nil {
+			return nil, fmt.Errorf("读取上游错误日志覆盖状态失败: %w", err)
+		}
+		for _, state := range states {
+			stateByDomain[state.Domain] = state
+		}
 	}
 
 	// 收集待匹配的行：有串联键的走精确路径，其余留给回退路径。
-	keyed := map[string][]int64{}
+	keyed := map[upstreamJoinKey][]int64{}
 	var fallback []LogChainRow
 	for _, r := range rows {
 		if r.Type != 5 || r.UpstreamDomain == "" {
 			continue
 		}
+		// CDN 前置错误在语义上不依赖采集状态：请求未到上游应用，本来就不会
+		// 有应用日志。先判这一档，避免被“未采集”掩盖。
+		if logChainCDNStatusCodes[r.UpstreamStatusCode] {
+			out[r.ID] = noMatchFor(r)
+			continue
+		}
+		coverage := upstreamErrorCoverageForRow(m.cfg.UpstreamErrorLogDomains, stateByDomain, r)
+		if coverage.Confidence != "" {
+			out[r.ID] = coverage
+			continue
+		}
 		if k := logChainJoinKeyFrom(r.Content); k != "" {
-			keyed[k] = append(keyed[k], r.ID)
+			ck := upstreamJoinKey{Domain: r.UpstreamDomain, JoinKey: k}
+			keyed[ck] = append(keyed[ck], r.ID)
 			continue
 		}
 		fallback = append(fallback, r)
@@ -113,7 +150,9 @@ func (m *Monitor) correlateUpstreamErrors(ctx context.Context, rows []LogChainRo
 
 	// 第一趟：串联键精确匹配。
 	if len(keyed) > 0 {
-		m.matchByJoinKey(ctx, keyed, out)
+		if err := m.matchByJoinKey(ctx, keyed, out); err != nil {
+			return nil, err
+		}
 	}
 	// 第二趟：串联键没命中的，走回退键。
 	var leftover []LogChainRow
@@ -123,7 +162,9 @@ func (m *Monitor) correlateUpstreamErrors(ctx context.Context, rows []LogChainRo
 		}
 	}
 	if len(leftover) > 0 {
-		m.matchByFallback(ctx, leftover, out)
+		if err := m.matchByFallback(ctx, leftover, out); err != nil {
+			return nil, err
+		}
 	}
 	// 兜底：两趟都没给结论的行也要有档位。
 	//
@@ -139,7 +180,47 @@ func (m *Monitor) correlateUpstreamErrors(ctx context.Context, rows []LogChainRo
 			out[r.ID] = noMatchFor(r)
 		}
 	}
-	return out
+	return out, nil
+}
+
+// upstreamErrorCoverageForRow 返回非空 Confidence 时，表示这一行不能用于
+// “未找到对应”的判断。返回零值才代表该请求时刻已被连续、成功地覆盖。
+func upstreamErrorCoverageForRow(allowed []string, states map[string]UpstreamErrorLogSyncState, r LogChainRow) LogChainUpstreamMatch {
+	if !upstreamErrorLogDomainAllowed(allowed, r.UpstreamDomain) {
+		return LogChainUpstreamMatch{
+			Confidence: correlateNotSelected,
+			Why:        "该上游未进入错误日志采集白名单，当前没有可用于排除上游异常的证据",
+		}
+	}
+	state, ok := states[r.UpstreamDomain]
+	if !ok || state.LastSuccessAt <= 0 || state.CoverageFrom <= 0 || state.SyncedUntil <= state.CoverageFrom {
+		return LogChainUpstreamMatch{
+			Confidence: correlateNotCollected,
+			Why:        "该上游尚未形成一次成功且连续的错误日志采集覆盖，不能判断是否存在对应异常",
+		}
+	}
+	if state.Status == upstreamStatusError || state.Status == upstreamStatusReconnect || state.Status == upstreamStatusUnsupported {
+		return LogChainUpstreamMatch{
+			Confidence: correlateIncomplete,
+			Why:        "该上游错误日志采集当前异常或不受支持，不能用本地证据排除上游异常",
+		}
+	}
+	if r.CreatedAt < state.CoverageFrom || r.CreatedAt >= state.SyncedUntil {
+		return LogChainUpstreamMatch{
+			Confidence: correlateIncomplete,
+			Why: "请求时刻不在已连续核验的上游错误日志区间 [" +
+				strconv.FormatInt(state.CoverageFrom, 10) + ", " +
+				strconv.FormatInt(state.SyncedUntil, 10) + ") 内",
+		}
+	}
+	return LogChainUpstreamMatch{}
+}
+
+// upstreamJoinKey 把上游域名纳入精确关联键。即使模型商 request id
+// 通常全局唯一，也不能把“通常”当成跨租户串联的安全边界。
+type upstreamJoinKey struct {
+	Domain  string
+	JoinKey string
 }
 
 // logChainCDNStatusCodes 由上游**前置 CDN** 产生、上游自身不会记录的状态码。
@@ -167,28 +248,35 @@ var logChainCDNStatusCodes = map[int]bool{
 
 // matchByJoinKey 精确路径：串联键相等即同一请求。
 //
-// 不限定域名：串联键是最深层模型商生成的，全局唯一，加域名条件只会在
-// 渠道快照与上游域名对不上时误杀。键相等本身就是足够强的证据。
-func (m *Monitor) matchByJoinKey(ctx context.Context, keyed map[string][]int64, out map[int64]LogChainUpstreamMatch) {
+// 域名与串联键必须同时相等。不跨域名“猜”快照错配：如果渠道快照错了，
+// 应当暴露为未关联，而不是拿另一个上游的日志当证据。
+func (m *Monitor) matchByJoinKey(ctx context.Context, keyed map[upstreamJoinKey][]int64, out map[int64]LogChainUpstreamMatch) error {
 	keys := make([]string, 0, len(keyed))
+	domains := make([]string, 0, len(keyed))
+	seenKeys, seenDomains := map[string]bool{}, map[string]bool{}
 	for k := range keyed {
-		keys = append(keys, k)
+		if !seenKeys[k.JoinKey] {
+			seenKeys[k.JoinKey] = true
+			keys = append(keys, k.JoinKey)
+		}
+		if !seenDomains[k.Domain] {
+			seenDomains[k.Domain] = true
+			domains = append(domains, k.Domain)
+		}
 	}
 	var hits []ChannelUpstreamErrorLog
 	if err := m.storeDB.WithContext(ctx).
-		Where("join_key IN ?", keys).
+		Where("domain IN ? AND join_key IN ?", domains, keys).
 		Find(&hits).Error; err != nil {
-		// 关联失败不能拖垮排障主流程：明细已经查到了，少一列关联信息
-		// 仍然可用。记日志、返回空，让前端显示"未关联"。
-		slog.Warn("上游错误日志关联失败，排障明细不受影响", "err", err)
-		return
+		return fmt.Errorf("查询上游错误日志精确关联失败: %w", err)
 	}
-	byKey := map[string]ChannelUpstreamErrorLog{}
+	byKey := map[upstreamJoinKey]ChannelUpstreamErrorLog{}
 	for _, h := range hits {
+		k := upstreamJoinKey{Domain: h.Domain, JoinKey: h.JoinKey}
 		// 同一个键理论上只有一条。真出现多条时取先到的那条并不重要——
 		// 它们描述的是同一个模型商请求，上游侧重复记录不影响我方判读。
-		if _, ok := byKey[h.JoinKey]; !ok {
-			byKey[h.JoinKey] = h
+		if _, ok := byKey[k]; !ok {
+			byKey[k] = h
 		}
 	}
 	for k, ids := range keyed {
@@ -210,6 +298,7 @@ func (m *Monitor) matchByJoinKey(ctx context.Context, keyed map[string][]int64, 
 			}
 		}
 	}
+	return nil
 }
 
 // distinctUpstreamChannels 取候选里去重后的上游渠道名，排序后逗号分隔。
@@ -276,12 +365,14 @@ func noMatchFor(r LogChainRow) LogChainUpstreamMatch {
 //
 // 这一层比原设想弱：原以为能用 other.channel_name 对，但那是**上游自己的**
 // 渠道名，我方无从得知。所以退到模型名——判别力低一些，但至少两侧同义。
-func (m *Monitor) matchByFallback(ctx context.Context, rows []LogChainRow, out map[int64]LogChainUpstreamMatch) {
+func (m *Monitor) matchByFallback(ctx context.Context, rows []LogChainRow, out map[int64]LogChainUpstreamMatch) error {
 	if len(rows) == 0 {
-		return
+		return nil
 	}
 	// 一次捞全窗口，避免逐行查。
 	minTs, maxTs := rows[0].CreatedAt, rows[0].CreatedAt
+	domains := make([]string, 0, len(rows))
+	seenDomains := map[string]bool{}
 	for _, r := range rows {
 		if r.CreatedAt < minTs {
 			minTs = r.CreatedAt
@@ -289,22 +380,28 @@ func (m *Monitor) matchByFallback(ctx context.Context, rows []LogChainRow, out m
 		if r.CreatedAt > maxTs {
 			maxTs = r.CreatedAt
 		}
+		if !seenDomains[r.UpstreamDomain] {
+			seenDomains[r.UpstreamDomain] = true
+			domains = append(domains, r.UpstreamDomain)
+		}
 	}
 	var pool []ChannelUpstreamErrorLog
 	if err := m.storeDB.WithContext(ctx).
-		Where("created_at BETWEEN ? AND ?",
+		Where("domain IN ? AND created_at BETWEEN ? AND ?", domains,
 			minTs-correlateFallbackWindow, maxTs+correlateFallbackWindow).
 		Find(&pool).Error; err != nil {
-		slog.Warn("上游错误日志回退关联失败，排障明细不受影响", "err", err)
-		return
+		return fmt.Errorf("查询上游错误日志回退关联失败: %w", err)
 	}
 	if len(pool) == 0 {
-		return
+		return nil
 	}
 
 	for _, r := range rows {
 		var cands []ChannelUpstreamErrorLog
 		for _, h := range pool {
+			if h.Domain != r.UpstreamDomain {
+				continue
+			}
 			if h.ModelName != r.ModelName {
 				continue
 			}
@@ -350,4 +447,5 @@ func (m *Monitor) matchByFallback(ctx context.Context, rows []LogChainRow, out m
 			UpstreamUseTime:     h.UseTime,
 		}
 	}
+	return nil
 }

@@ -59,6 +59,8 @@ docker run -d --name newapi-monitor \
 | `MONITOR_UPSTREAM_USAGE_SYNC_MINUTES` | 上游消费账单当天尾部刷新间隔；支持 NewAPI 分页日志、Sub2API 小时汇总（旧版回退单日汇总）和 AICodeWith 按 Key 日账单；AICodeWith 始终至少 30 分钟 | `20` |
 | `MONITOR_UPSTREAM_MAX_CONCURRENCY` | 不同上游主机的全局并发上限；同一主机始终串行，当前硬上限为 2，生产先以 1 灰度 | `1` |
 | `MONITOR_UPSTREAM_USAGE_BACKFILL_DAYS` | 首次低频补全的上游账户使用日志天数 | `90` |
+| `MONITOR_UPSTREAM_ERRORLOG_SYNC_ENABLED` | 上游错误证据采集总闸门；与消费日志独立，首发必须关闭 | `false` |
+| `MONITOR_UPSTREAM_ERRORLOG_DOMAINS` | 允许采集错误明细的 NewAPI 上游域名白名单（逗号分隔）；空值时即使总闸门开启也不出网 | 留空 |
 | `MONITOR_ADDR` | 监听地址 | `:8090` |
 | `MONITOR_PORTAL_ADDR` | 客户用量门户独立监听地址；留空则不启用 | 留空 |
 | `MONITOR_USAGE_REDIS_ADDR` | 客户用量聚合结果 Redis 私网地址；留空时自动使用有界本机短缓存 | 留空 |

@@ -130,8 +130,8 @@ func TestRuntimeBackupSetUsesSourceV2MigrationPlanAfterSchemaEnable(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	if manifest.MigrationPlan != preMigrationSourceV2PlanID {
-		t.Fatalf("v22 runtime backup was mislabeled: got=%q want=%q", manifest.MigrationPlan, preMigrationSourceV2PlanID)
+	if manifest.MigrationPlan != preMigrationCombinedPlanID {
+		t.Fatalf("combined runtime backup was mislabeled: got=%q want=%q", manifest.MigrationPlan, preMigrationCombinedPlanID)
 	}
 }
 

@@ -35,7 +35,7 @@ const lc={
   rows:[],hasMore:false,nextBeforeTs:0,nextBeforeID:0,
   // scopeEcho 是后端回显的生效范围（时间窗、limit 等），与上面的 scope（查看范围）
   // 是两件事。曾经两者同名，后者静默覆盖前者，默认查看范围直接丢失。
-  blindSpots:[],scopeEcho:null,note:'',enrichError:'',edgeEvidenceError:'',evidenceMode:'off',evidenceVerified:false,
+  blindSpots:[],scopeEcho:null,note:'',enrichError:'',edgeEvidenceError:'',correlationError:'',evidenceMode:'off',evidenceVerified:false,
   // radius 是后端的影响面判读（「看范围」层），**只覆盖单次请求返回的那一页**。
   // radiusStale 在点过「加载更早的记录」后置为 true：那之后 lc.rows 是累积的
   // （第三页时表格 150 行），而 radius 只描述最后一页的 50 行，两个数字摆在
@@ -358,6 +358,7 @@ async function load(more){
     lc.note=data.note||'';
     lc.enrichError=data.channel_enrich_error||'';
     lc.edgeEvidenceError=data.edge_evidence_error||'';
+    lc.correlationError=data.upstream_correlation_error||'';
     lc.evidenceMode=data.nginx_evidence_mode||'off';
     lc.evidenceVerified=!!data.nginx_evidence_verified;
     render();
@@ -368,7 +369,9 @@ async function load(more){
     showError(e.message||String(e));
   }finally{
     // 只有最新世代能解锁,否则被中止的旧请求会提前放开 loading。
-    if(gen===lc.generation)lc.loading=false;
+    // 解锁后必须重绘，否则成功响应在 loading=true 时把“加载更多”按钮禁用，
+    // finally 只改内存状态会让按钮一直不可点击。
+    if(gen===lc.generation){lc.loading=false;render()}
   }
 }
 
@@ -474,7 +477,13 @@ const CORRELATE_LABEL={
   not_applicable:{t:'上游无此记录（非采集缺失）',cls:'lc-corr-na',
     tip:'该错误由上游前置 CDN 产生，请求未到达上游应用，上游自身不会有对应日志。不必去查采集'},
   none:{t:'未找到对应',cls:'lc-corr-none',
-    tip:'上游日志里没有相近时刻的同模型同状态码错误。可能是采集未覆盖该上游、或时钟偏差过大'},
+    tip:'该请求时刻已经处于连续采集覆盖区间，但上游日志里没有相近时刻的同模型同状态码错误'},
+  not_selected:{t:'该上游未开启采集',cls:'lc-corr-incomplete',
+    tip:'该域名未进入上游错误日志采集白名单。这里表示没有证据，不代表上游没有异常'},
+  not_collected:{t:'尚无有效采集覆盖',cls:'lc-corr-incomplete',
+    tip:'该上游尚未完成一次连续采集。这里表示没有证据，不代表上游没有异常'},
+  incomplete:{t:'采集范围未覆盖',cls:'lc-corr-incomplete',
+    tip:'采集当前异常，或请求时刻不在已经连续核验的区间内。这里表示没有证据，不代表上游没有异常'},
   ambiguous:{t:'无法唯一对应',cls:'lc-corr-ambiguous',
     tip:'上游在相近时刻有多条同模型同状态码的错误。宁可不给结论也不给错结论，故只报候选条数'}
 };
@@ -935,6 +944,7 @@ function renderNotes(){
   if(lc.note)notes.push(esc(lc.note));
   if(lc.enrichError)notes.push(`渠道信息补全失败（明细仍有效）：${esc(lc.enrichError)}`);
   if(lc.edgeEvidenceError)notes.push(`Nginx 入口证据补全失败（明细仍有效）：${esc(lc.edgeEvidenceError)}`);
+  if(lc.correlationError)notes.push(`上游错误证据关联暂不可用（不代表没有上游错误）：${esc(lc.correlationError)}`);
   if(lc.evidenceMode==='pilot')notes.push('Nginx 请求证据处于 pilot：只核对关联覆盖率，尚不作为责任结论。');
   // 后端可能收敛了范围（跨度截断/limit 上限），回显出来，避免以为筛选原样生效。
   if(lc.scopeEcho&&lc.scopeEcho.from&&lc.scopeEcho.to)notes.push(`查询范围：${esc(lc.scopeEcho.from)} ～ ${esc(lc.scopeEcho.to)}（CST）`);

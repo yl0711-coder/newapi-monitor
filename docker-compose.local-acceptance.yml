@@ -62,8 +62,13 @@ services:
       MONITOR_STORE_PATH: /data/nexus_monitor.db
       MONITOR_USAGE_FACTS_STORE_PATH: /data/usage-facts.db
       MONITOR_STORE_BACKUP_DIR: /backup
-      MONITOR_SOURCE_WORKER_ENABLED: "true"
-      MONITOR_SOURCE_LEASE_REQUIRED: "true"
+      # 该 Compose 只验收已下载的 SQLite 快照：绝不连生产 MySQL，
+      # 也不启动任何来源 worker。需要 SSH 只读数据时必须叠加
+      # docker-compose.local-production-readonly.yml，不能改这个安全基线。
+      MONITOR_LOCAL_SNAPSHOT_ONLY: "true"
+      MONITOR_LOCAL_AUTH_BYPASS: "true"
+      MONITOR_SOURCE_WORKER_ENABLED: "false"
+      MONITOR_SOURCE_LEASE_REQUIRED: "false"
       MONITOR_SOURCE_LEASE_NAME: newapi-monitor-source-worker-v1
       MONITOR_NEWAPI_BASE_URL: ${MONITOR_NEWAPI_BASE_URL:-}
       MONITOR_SESSION_SECRET: ${MONITOR_SESSION_SECRET:-local-acceptance-session-only}
@@ -91,6 +96,8 @@ services:
       # 本地验收不得轮询任何上游账户余额或使用日志。
       MONITOR_UPSTREAM_SYNC_ENABLED: "false"
       MONITOR_UPSTREAM_USAGE_SYNC_ENABLED: "false"
+      MONITOR_UPSTREAM_ERRORLOG_SYNC_ENABLED: "false"
+      MONITOR_UPSTREAM_ERRORLOG_DOMAINS: ""
       # 计价证据账本也必须显式关闭；本地免登录模式会在应用层再次 fail-closed 校验。
       MONITOR_UPSTREAM_PRICING_LEDGER_ENABLED: "false"
       # 总开关关闭后，旧的 queued/running 任务也不会在本地重启续跑。

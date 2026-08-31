@@ -20,6 +20,9 @@ services:
       # 不持有 NewAPI 管理 Token，也不通过此地址执行管理写操作。
       MONITOR_NEWAPI_BASE_URL: ${MONITOR_PROD_READONLY_NEWAPI_BASE_URL:-https://nexusapi.link}
       MONITOR_LOCAL_SNAPSHOT_ONLY: "false"
+      MONITOR_LOCAL_AUTH_BYPASS: "false"
+      MONITOR_SOURCE_WORKER_ENABLED: "true"
+      MONITOR_SOURCE_LEASE_REQUIRED: "true"
       # 本机使用独立租约名，避免与线上 Monitor 的源采集租约冲突而
       # 永久停在 standby。租约仍必须获取，只允许一个本机验收实例读源。
       MONITOR_SOURCE_LEASE_NAME: newapi-monitor-local-prod-readonly-source-v1
@@ -69,6 +72,8 @@ services:
       MONITOR_INFRA_SNAPSHOT_READ_ONLY: "true"
       MONITOR_UPSTREAM_SYNC_ENABLED: "false"
       MONITOR_UPSTREAM_USAGE_SYNC_ENABLED: "false"
+      MONITOR_UPSTREAM_ERRORLOG_SYNC_ENABLED: "false"
+      MONITOR_UPSTREAM_ERRORLOG_DOMAINS: ""
       MONITOR_UPSTREAM_PRICING_LEDGER_ENABLED: "false"
       MONITOR_NGINX_ENABLED: "false"
       MONITOR_HEARTBEAT_URL: ""

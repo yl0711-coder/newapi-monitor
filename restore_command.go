@@ -75,3 +75,29 @@ func runRestoreStoreBackupSetCommand(args []string, output io.Writer) error {
 	_, _ = fmt.Fprintf(output, "运行期 main/facts 备份集已恢复并复核到 %s；READY 已最后发布，下一步只能做无来源只读验收。\n", *targetDir)
 	return nil
 }
+
+// runInspectPreMigrationPlanCommand 是发布前的纯只读闸门。它不加载 .env，
+// 不打开任何线上 DSN，也不执行 AutoMigrate。
+func runInspectPreMigrationPlanCommand(args []string, output io.Writer) error {
+	flags := flag.NewFlagSet("inspect-pre-migration-plan", flag.ContinueOnError)
+	flags.SetOutput(output)
+	store := flags.String("store", "", "existing Monitor main SQLite file")
+	sourceV2Enabled := flags.Bool("source-v2-enabled", false, "candidate source-v2 schema flag")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 {
+		return errors.New("inspect-pre-migration-plan 不接受位置参数")
+	}
+	if strings.TrimSpace(*store) == "" {
+		return errors.New("必须提供 --store")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	plan, err := monitor.InspectPreMigrationPlan(ctx, *store, *sourceV2Enabled)
+	if err != nil {
+		return fmt.Errorf("判定迁移方案失败: %w", err)
+	}
+	_, err = fmt.Fprintln(output, plan)
+	return err
+}

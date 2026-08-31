@@ -114,6 +114,8 @@ type Settings struct {
 	// 但**依赖账户级的 UsageSyncEnabled**：那是管理员对「允许读这个上游的日志」
 	// 的授权，错误日志同属日志，不应绕过它另开一道授权。
 	UpstreamErrorLogSyncEnabled bool
+	// 独立灰度白名单；总开关打开但列表为空时仍不访问任何上游。
+	UpstreamErrorLogDomains []string // MONITOR_UPSTREAM_ERRORLOG_DOMAINS，逗号分隔
 	// 上游计价账本与既有消费汇总使用独立灰度闸门和域名白名单。
 	// 支持 NewAPI、Sub2API 和 AICodeWith；默认关闭且空白名单，迁移不会发起任何上游请求。
 	UpstreamPricingLedgerEnabled       bool     // MONITOR_UPSTREAM_PRICING_LEDGER_ENABLED，默认 false
@@ -326,6 +328,7 @@ func LoadSettings() Settings {
 		UpstreamUsageSyncEnabled:                 env("MONITOR_UPSTREAM_USAGE_SYNC_ENABLED", "false") == "true",
 		UpstreamUsageSyncMinutes:                 envInt("MONITOR_UPSTREAM_USAGE_SYNC_MINUTES", 20),
 		UpstreamErrorLogSyncEnabled:              env("MONITOR_UPSTREAM_ERRORLOG_SYNC_ENABLED", "false") == "true",
+		UpstreamErrorLogDomains:                  envCSV("MONITOR_UPSTREAM_ERRORLOG_DOMAINS"),
 		UpstreamUsageBackfillDays:                envInt("MONITOR_UPSTREAM_USAGE_BACKFILL_DAYS", 90),
 		UpstreamMaxConcurrency:                   envInt("MONITOR_UPSTREAM_MAX_CONCURRENCY", 1),
 		UpstreamPricingLedgerEnabled:             env("MONITOR_UPSTREAM_PRICING_LEDGER_ENABLED", "false") == "true",

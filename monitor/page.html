@@ -306,6 +306,7 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
      none 值得去查采集,not_applicable 不必查。用色区分,避免看的人白跑一趟。 */
   .lc-corr-none{background:rgba(148,163,184,.14);color:var(--text-muted);border:1px solid rgba(148,163,184,.3)}
   .lc-corr-na{background:rgba(148,163,184,.1);color:var(--text-muted);border:1px dashed rgba(148,163,184,.35)}
+  .lc-corr-incomplete{background:rgba(251,191,36,.12);color:var(--yellow,#fbbf24);border:1px dashed rgba(251,191,36,.35)}
 
   /* 上游侧原文折叠块,紧跟我方原文之后——同一次失败的两侧视角,挨着才好对比。
      用折叠而非"相同就隐藏":一行凭空消失与"压根没拿到上游日志"无法区分,
@@ -1885,7 +1886,9 @@ function syncRenderChannels(report){
     if(status==='unsupported')return {label:'待适配',level:'bad'};
     if(status==='stale')return {label:'数据陈旧',level:'warn'};
     if(status==='global_off')return {label:'灰度关闭',level:'neutral'};
+	if(status==='not_selected')return {label:'未进入灰度',level:'neutral'};
     if(status==='disabled')return {label:'未开启',level:'neutral'};
+	if(status==='pending')return {label:'等待首次同步',level:'warn'};
     if(status==='queued')return {label:'等待首次同步',level:'warn'};
     if(status==='complete')return {label:'已完成',level:'ok'};
     if(status==='retry')return {label:'退避重试',level:'warn'};
@@ -1898,12 +1901,12 @@ function syncRenderChannels(report){
   };
   let level='ok',enabledAccounts=0,balanceHealthy=0,usageEnabled=0,usageHealthy=0,historyComplete=0,historyRetry=0;
   const cards=domains.map(x=>{
-    const u=x.upstream||{},balance=statusInfo(u.status,u.enabled),usage=u.usage_sync_enabled?statusInfo(u.usage_tail_phase||u.usage_effective_status||u.usage_status,u.enabled):{label:'未开启',level:'neutral'},history=u.usage_sync_enabled?statusInfo(u.usage_history_phase,u.enabled):{label:'未开启',level:'neutral'};
+    const u=x.upstream||{},balance=statusInfo(u.status,u.enabled),usage=u.usage_sync_enabled?statusInfo(u.usage_tail_phase||u.usage_effective_status||u.usage_status,u.enabled):{label:'未开启',level:'neutral'},history=u.usage_sync_enabled?statusInfo(u.usage_history_phase,u.enabled):{label:'未开启',level:'neutral'},errorLog=statusInfo(u.error_log_status,u.enabled);
     if(u.enabled){enabledAccounts++;if(balance.level==='ok')balanceHealthy++}
     if(u.enabled&&u.usage_sync_enabled&&u.usage_worker_enabled){usageEnabled++;if(usage.level==='ok')usageHealthy++;if(history.level==='ok')historyComplete++;if(u.usage_history_phase==='retry')historyRetry++}
     let accountLevel='ok';
-    if(u.enabled&&(balance.level==='bad'||(u.usage_sync_enabled&&u.usage_worker_enabled&&(usage.level==='bad'||history.level==='bad'))))accountLevel='bad';
-    else if(u.enabled&&(balance.level==='warn'||(u.usage_sync_enabled&&u.usage_worker_enabled&&(usage.level==='warn'||history.level==='warn'))))accountLevel='warn';
+    if(u.enabled&&(balance.level==='bad'||(u.usage_sync_enabled&&u.usage_worker_enabled&&(usage.level==='bad'||history.level==='bad'))||(u.error_log_worker_enabled&&u.error_log_selected&&errorLog.level==='bad')))accountLevel='bad';
+    else if(u.enabled&&(balance.level==='warn'||(u.usage_sync_enabled&&u.usage_worker_enabled&&(usage.level==='warn'||history.level==='warn'))||(u.error_log_worker_enabled&&u.error_log_selected&&errorLog.level==='warn')))accountLevel='warn';
     if(accountLevel==='bad')level='bad';else if(accountLevel==='warn'&&level==='ok')level='warn';
     const overall=!u.enabled?'账户已停用':accountLevel==='bad'?'需要处理':u.usage_sync_enabled&&!u.usage_worker_enabled?'消费同步灰度关闭':balance.level==='warn'?'余额等待同步':usage.level==='warn'?'当天追平等待':u.usage_history_phase==='retry'?'历史补数重试':history.level==='warn'?'历史补数中':'运行正常';
     const balanceValue=u.balance_usd==null?'余额未知':`$${Number(u.balance_usd).toFixed(2)}`;
@@ -1928,9 +1931,15 @@ function syncRenderChannels(report){
       :u.usage_sync_enabled
       ?`<strong>${esc(adapter)} · ${esc(granularity)}</strong><p>当天数据至 ${syncTime(u.usage_data_until)} · 延迟 ${esc(lag)}<br>最近成功 ${syncTime(u.usage_last_success_at)} · 下次 ${syncTime(u.usage_next_sync_at)}</p><div class="sync-upstream-progress"><span><small>当天追平</small><b>${esc(usage.label)}</b></span><span><small>历史补数</small><b>${esc(historyLabel)}</b><small>${esc(historyDetail)}</small></span></div>${usageErrors}${usageProgress}${pricingContent}`
       :'<strong>未开启</strong><p>该账户只同步余额，不读取上游消费。后续可按账户逐个开启验证。</p>';
+	const errorLogContent=!u.error_log_worker_enabled
+	  ?'<strong>全局灰度关闭</strong><p>不会访问上游，也不影响已有余额和消费同步。</p>'
+	  :!u.error_log_selected
+	  ?'<strong>未进入错误证据灰度</strong><p>需按上游域名加入独立白名单，不会因开启消费同步而自动启用。</p>'
+	  :`<strong>${esc(errorLog.label)} · ${fmtNum(u.error_log_rows_total||0)} 条</strong><p>连续覆盖 ${syncTime(u.error_log_coverage_from)} → ${syncTime(u.error_log_synced_until)}<br>最近成功 ${syncTime(u.error_log_last_success_at)} · 下次 ${syncTime(u.error_log_next_sync_at)}${u.error_log_window_to?`<br>密集窗口续传 ${syncTime(u.error_log_window_from)} → ${syncTime(u.error_log_window_to)}`:''}</p>${u.error_log_last_error?`<p class="sync-upstream-error">${esc(u.error_log_last_error)}</p>`:''}${u.error_log_unresolved_fields?`<p class="sync-upstream-note">字段未命中：${esc(u.error_log_unresolved_fields)}</p>`:''}`;
     return `<article class="sync-upstream-account"><div class="sync-upstream-head"><div><b>${esc(x.domain||x.key||'—')}</b><small>${esc(u.provider_name||u.provider||'—')} · ${esc(u.account_masked||'已配置账户')}</small></div><span class="sync-status ${syncStateClass(accountLevel)}">${esc(overall)}</span></div><div class="sync-upstream-lanes">
       <section class="sync-upstream-lane"><header><b>余额快照</b><span class="sync-status ${balance.level}">${esc(balance.label)}</span></header><strong>${esc(balanceValue)}</strong><p>最近成功 ${syncTime(u.last_success_at)}<br>下次计划 ${syncTime(u.next_sync_at)}</p>${balanceError}</section>
       <section class="sync-upstream-lane"><header><b>上游消费账单</b><span class="sync-status ${usage.level}">${esc(usage.label)}</span></header>${usageContent}${keyContent}</section>
+	  <section class="sync-upstream-lane" style="grid-column:1/-1"><header><b>上游错误证据</b><span class="sync-status ${errorLog.level}">${esc(errorLog.label)}</span></header>${errorLogContent}</section>
     </div></article>`;
   }).join('');
   el.innerHTML=`<div class="sync-upstream-summary"><div><small>已配置账户</small><b>${fmtNum(domains.length)}</b></div><div><small>余额同步正常</small><b>${fmtNum(balanceHealthy)}/${fmtNum(enabledAccounts)}</b></div><div><small>已开启消费同步</small><b>${fmtNum(usageEnabled)}</b></div><div><small>当天 Tail 正常</small><b>${fmtNum(usageHealthy)}/${fmtNum(usageEnabled)}</b></div><div><small>历史补数完成</small><b>${fmtNum(historyComplete)}/${fmtNum(usageEnabled)}</b></div><div><small>历史任务退避</small><b>${fmtNum(historyRetry)}</b></div></div><div class="sync-upstream-list">${cards}</div>`;

@@ -8,9 +8,12 @@ package monitor
 
 import (
 	"context"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"strings"
 	"testing"
+	"time"
 )
 
 // TestSyncDueUpstreamErrorLogsRespectsGlobalGate 全局开关关闭时一步都不走。
@@ -33,6 +36,34 @@ func TestSyncDueUpstreamErrorLogsRespectsGlobalGate(t *testing.T) {
 	}
 }
 
+func TestSyncDueUpstreamErrorLogsRequiresNonEmptyAllowlist(t *testing.T) {
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests++
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer server.Close()
+	m := newTestMonitor(t)
+	m.cfg.UpstreamErrorLogSyncEnabled = true
+	m.cfg.UpstreamErrorLogDomains = nil
+	if err := m.storeDB.Create(&ChannelUpstreamAccount{
+		Domain: "not-selected.example", Provider: upstreamProviderNewAPI, BaseURL: server.URL,
+		Enabled: true, UsageSyncEnabled: true,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	m.syncDueUpstreamErrorLogs(context.Background())
+	if requests != 0 {
+		t.Fatalf("enabled flag with an empty allowlist made %d upstream requests", requests)
+	}
+	var states, rows int64
+	_ = m.storeDB.Model(&UpstreamErrorLogSyncState{}).Count(&states).Error
+	_ = m.storeDB.Model(&ChannelUpstreamErrorLog{}).Count(&rows).Error
+	if states != 0 || rows != 0 {
+		t.Fatalf("empty allowlist wrote local state/evidence: states=%d rows=%d", states, rows)
+	}
+}
+
 // TestSyncOneUpstreamErrorLogMarksUnsupportedProviders ★ 本组最要紧的一条 ★
 //
 // sub2api / aicodewith 的端点是聚合/计价语义，没有日志接口。必须落 unsupported
@@ -46,6 +77,10 @@ func TestSyncOneUpstreamErrorLogMarksUnsupportedProviders(t *testing.T) {
 			row := ChannelUpstreamAccount{
 				Domain: provider + ".example", Provider: provider,
 				Enabled: true, UsageSyncEnabled: true,
+			}
+			m.cfg.UpstreamErrorLogDomains = []string{row.Domain}
+			if err := m.storeDB.Create(&row).Error; err != nil {
+				t.Fatal(err)
 			}
 
 			m.syncOneUpstreamErrorLog(context.Background(), row, 1000)
@@ -76,6 +111,10 @@ func TestSyncOneUpstreamErrorLogSkipsUnsupportedOnLaterRuns(t *testing.T) {
 		Domain: "s.example", Provider: upstreamProviderSub2API,
 		Enabled: true, UsageSyncEnabled: true,
 	}
+	m.cfg.UpstreamErrorLogDomains = []string{row.Domain}
+	if err := m.storeDB.Create(&row).Error; err != nil {
+		t.Fatal(err)
+	}
 	m.syncOneUpstreamErrorLog(context.Background(), row, 1000)
 
 	var first UpstreamErrorLogSyncState
@@ -100,12 +139,15 @@ func TestSyncOneUpstreamErrorLogSkipsUnsupportedOnLaterRuns(t *testing.T) {
 // 推进了就等于把失败那段永久跳过——而那段里正是出错的时候，最需要日志。
 func TestFailUpstreamErrorLogStateDoesNotAdvanceWatermark(t *testing.T) {
 	m := newTestMonitor(t)
-	state := UpstreamErrorLogSyncState{Domain: "d.example", SyncedUntil: 5000}
+	state := UpstreamErrorLogSyncState{Domain: "d.example", CoverageFrom: 4000, SyncedUntil: 5000}
 
 	m.failUpstreamErrorLogState(context.Background(), &state, 9000, errTestUpstream)
 
 	if state.SyncedUntil != 5000 {
 		t.Errorf("失败时水位被推进了，那段日志将永久漏掉: got=%d want=5000", state.SyncedUntil)
+	}
+	if state.CoverageFrom != 4000 {
+		t.Errorf("失败时连续覆盖起点被改写了: got=%d want=4000", state.CoverageFrom)
 	}
 	if state.Status != upstreamStatusError {
 		t.Errorf("状态应为 error，got=%s", state.Status)
@@ -147,6 +189,10 @@ func TestSyncOneUpstreamErrorLogHonoursNextSyncAt(t *testing.T) {
 		Domain: "n.example", Provider: upstreamProviderNewAPI,
 		Enabled: true, UsageSyncEnabled: true,
 	}
+	m.cfg.UpstreamErrorLogDomains = []string{row.Domain}
+	if err := m.storeDB.Create(&row).Error; err != nil {
+		t.Fatal(err)
+	}
 	// 预置一个未来的下次同步时刻。
 	if err := m.storeDB.Create(&UpstreamErrorLogSyncState{
 		Domain: row.Domain, NextSyncAt: 100000, Status: upstreamStatusOK, UpdatedAt: 500,
@@ -163,6 +209,163 @@ func TestSyncOneUpstreamErrorLogHonoursNextSyncAt(t *testing.T) {
 	}
 	if state.UpdatedAt != 500 || state.Status != upstreamStatusOK {
 		t.Errorf("未到期却动了状态: updated=%d status=%s", state.UpdatedAt, state.Status)
+	}
+}
+
+// TestSyncDueUpstreamErrorLogsSkipsNotDueBeforeRoundLimit protects scheduler
+// fairness. Accounts that are not due must not consume the per-round budget;
+// otherwise four permanently backed-off domains can starve every later domain.
+func TestSyncDueUpstreamErrorLogsSkipsNotDueBeforeRoundLimit(t *testing.T) {
+	m := newTestMonitor(t)
+	m.cfg.UpstreamErrorLogSyncEnabled = true
+	now := time.Now().Unix()
+	var allowlist []string
+	for _, domain := range []string{"a.example", "b.example", "c.example", "d.example"} {
+		allowlist = append(allowlist, domain)
+		if err := m.storeDB.Create(&ChannelUpstreamAccount{
+			Domain: domain, Provider: upstreamProviderNewAPI,
+			Enabled: true, UsageSyncEnabled: true,
+		}).Error; err != nil {
+			t.Fatal(err)
+		}
+		if err := m.storeDB.Create(&UpstreamErrorLogSyncState{
+			Domain: domain, Status: upstreamStatusOK, NextSyncAt: now + 3600,
+		}).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	// The fifth account is deliberately unsupported: processing it needs no
+	// network or credential, and leaves an unambiguous observable state.
+	lastDomain := "e.example"
+	allowlist = append(allowlist, lastDomain)
+	if err := m.storeDB.Create(&ChannelUpstreamAccount{
+		Domain: lastDomain, Provider: upstreamProviderSub2API,
+		Enabled: true, UsageSyncEnabled: true,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	m.cfg.UpstreamErrorLogDomains = allowlist
+
+	m.syncDueUpstreamErrorLogs(context.Background())
+
+	var state UpstreamErrorLogSyncState
+	if err := m.storeDB.First(&state, "domain = ?", lastDomain).Error; err != nil {
+		t.Fatalf("未到期账号占满轮次预算，后排账号被饿死: %v", err)
+	}
+	if state.Status != upstreamStatusUnsupported {
+		t.Fatalf("后排到期账号未被正常处理: status=%q", state.Status)
+	}
+}
+
+func TestSyncDueUpstreamErrorLogsRotatesPastPreviouslyAttemptedDomains(t *testing.T) {
+	m := newTestMonitor(t)
+	m.cfg.UpstreamErrorLogSyncEnabled = true
+	now := time.Now().Unix()
+	domains := []string{"a.example", "b.example", "c.example", "d.example", "e.example"}
+	m.cfg.UpstreamErrorLogDomains = domains
+	for index, domain := range domains {
+		if err := m.storeDB.Create(&ChannelUpstreamAccount{
+			Domain: domain, Provider: upstreamProviderNewAPI,
+			Enabled: true, UsageSyncEnabled: true,
+		}).Error; err != nil {
+			t.Fatal(err)
+		}
+		if index < upstreamErrorLogMaxAccountsPerRun {
+			// Simulate four alphabetically early dense accounts handled in the
+			// previous round and already due again.
+			if err := m.storeDB.Create(&UpstreamErrorLogSyncState{
+				Domain: domain, Status: upstreamStatusPending,
+				LastAttemptAt: now - 60, NextSyncAt: now - 1,
+			}).Error; err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	m.syncDueUpstreamErrorLogs(context.Background())
+
+	var state UpstreamErrorLogSyncState
+	if err := m.storeDB.First(&state, "domain = ?", "e.example").Error; err != nil {
+		t.Fatalf("never-attempted fifth domain was starved by the first four: %v", err)
+	}
+	if state.LastAttemptAt == 0 {
+		t.Fatalf("fifth domain was not attempted: %+v", state)
+	}
+}
+
+func TestSyncOneUpstreamErrorLogPersistsDenseWindowContinuation(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"success":true,"data":{"items":[],"total":1000}}`))
+	}))
+	defer server.Close()
+	m := newChannelUpstreamTestMonitor(t)
+	now := int64(1788170400)
+	row := ChannelUpstreamAccount{
+		Domain: server.Listener.Addr().String(), Provider: upstreamProviderNewAPI,
+		BaseURL: server.URL, UserID: 31, Enabled: true, UsageSyncEnabled: true,
+	}
+	m.cfg.UpstreamErrorLogSyncEnabled = true
+	m.cfg.UpstreamErrorLogDomains = []string{row.Domain}
+	if err := m.persistSyncedUpstreamAccount(context.Background(), &row, newAPICredential{AccessToken: "usage-token"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.syncOneUpstreamErrorLog(context.Background(), row, now); err != nil {
+		t.Fatal(err)
+	}
+	var first UpstreamErrorLogSyncState
+	if err := m.storeDB.First(&first, "domain = ?", row.Domain).Error; err != nil {
+		t.Fatal(err)
+	}
+	if first.WindowTo <= first.WindowFrom || first.SyncedUntil != 0 || first.Status != upstreamStatusPending {
+		t.Fatalf("密集窗口应持久化缩窗且不推进水位: %+v", first)
+	}
+	if err := m.syncOneUpstreamErrorLog(context.Background(), row, now+31); err != nil {
+		t.Fatal(err)
+	}
+	var second UpstreamErrorLogSyncState
+	if err := m.storeDB.First(&second, "domain = ?", row.Domain).Error; err != nil {
+		t.Fatal(err)
+	}
+	if second.WindowFrom != first.WindowFrom || second.WindowTo >= first.WindowTo {
+		t.Fatalf("下一轮应从持久化的同一左水位继续缩窗: first=%+v second=%+v", first, second)
+	}
+	var rows int64
+	if err := m.storeDB.Model(&ChannelUpstreamErrorLog{}).Count(&rows).Error; err != nil {
+		t.Fatal(err)
+	}
+	if rows != 0 {
+		t.Fatalf("未完整读取的密集窗口不得落库: rows=%d", rows)
+	}
+}
+
+func TestSyncOneUpstreamErrorLogPersistsProvableCoverage(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"success":true,"data":{"items":[],"total":0}}`))
+	}))
+	defer server.Close()
+	m := newChannelUpstreamTestMonitor(t)
+	now := int64(1788170400)
+	row := ChannelUpstreamAccount{
+		Domain: server.Listener.Addr().String(), Provider: upstreamProviderNewAPI,
+		BaseURL: server.URL, UserID: 31, Enabled: true, UsageSyncEnabled: true,
+	}
+	m.cfg.UpstreamErrorLogSyncEnabled = true
+	m.cfg.UpstreamErrorLogDomains = []string{row.Domain}
+	if err := m.persistSyncedUpstreamAccount(context.Background(), &row, newAPICredential{AccessToken: "usage-token"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.syncOneUpstreamErrorLog(context.Background(), row, now); err != nil {
+		t.Fatal(err)
+	}
+	var state UpstreamErrorLogSyncState
+	if err := m.storeDB.First(&state, "domain = ?", row.Domain).Error; err != nil {
+		t.Fatal(err)
+	}
+	wantFrom := now - int64(upstreamErrorLogLookbackOnFirstRun.Seconds())
+	wantTo := wantFrom + int64(upstreamErrorLogWindow.Seconds())
+	if state.CoverageFrom != wantFrom || state.SyncedUntil != wantTo {
+		t.Fatalf("首个完整窗口必须形成可证明的连续覆盖: got=[%d,%d) want=[%d,%d)",
+			state.CoverageFrom, state.SyncedUntil, wantFrom, wantTo)
 	}
 }
 

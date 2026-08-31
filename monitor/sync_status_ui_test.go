@@ -151,6 +151,20 @@ func TestSyncStatusPageShowsIndependentPricingLedgerProgress(t *testing.T) {
 	}
 }
 
+func TestSyncStatusPageShowsUpstreamErrorEvidenceProgress(t *testing.T) {
+	html := pageHTML
+	for _, want := range []string{
+		"上游错误证据", "error_log_worker_enabled", "error_log_selected",
+		"error_log_status", "error_log_coverage_from", "error_log_synced_until", "error_log_rows_total",
+		"error_log_window_from", "error_log_window_to", "error_log_last_error",
+		"error_log_unresolved_fields",
+	} {
+		if !strings.Contains(html, want) {
+			t.Errorf("数据同步状态缺上游错误证据字段 %q", want)
+		}
+	}
+}
+
 func TestUsagePageKeepsOperationalProgressInSyncStatus(t *testing.T) {
 	for _, forbidden := range []string{
 		`id="usageSyncStatus"`,

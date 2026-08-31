@@ -10,6 +10,7 @@ package monitor
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -277,6 +278,46 @@ func TestDecodeUpstreamErrorLogItemReadsBothRequestIDs(t *testing.T) {
 	}
 }
 
+func TestUpstreamErrorEventKeyIgnoresPageLocalIDOnly(t *testing.T) {
+	first, err := decodeUpstreamErrorLogItem(json.RawMessage(
+		`{"id":1,"created_at":1787000000,"request_id":"same-request","content":"same"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := decodeUpstreamErrorLogItem(json.RawMessage(
+		`{"content":"same","request_id":"same-request","created_at":1787000000,"id":87}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.EventKey == "" || first.EventKey != second.EventKey {
+		t.Fatalf("同一事件只改页内 id 时身份应稳定: %q != %q", first.EventKey, second.EventKey)
+	}
+	third, err := decodeUpstreamErrorLogItem(json.RawMessage(
+		`{"id":1,"created_at":1787000000,"request_id":"another-request","content":"same"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if third.EventKey == first.EventKey {
+		t.Fatal("真实请求证据变化后不得被去重成同一事件")
+	}
+}
+
+func TestUpstreamErrorEventKeyCanonicalizesNestedObjects(t *testing.T) {
+	first, err := decodeUpstreamErrorLogItem(json.RawMessage(
+		`{"id":1,"created_at":1787000000,"other":{"status_code":502,"meta":{"b":2,"a":1}}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := decodeUpstreamErrorLogItem(json.RawMessage(
+		`{"other":{"meta":{"a":1,"b":2},"status_code":502},"created_at":1787000000,"id":99}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.EventKey != second.EventKey {
+		t.Fatalf("嵌套对象仅字段顺序变化不应改变事件身份: %q != %q", first.EventKey, second.EventKey)
+	}
+}
+
 // TestBoundedUpstreamErrorFieldKeepsUTF8Intact 截断不得切坏 UTF-8。
 //
 // 中文错误原文很常见（"无效的令牌，数据库查询出错" 这类）。按字节截到一半会产生
@@ -401,14 +442,19 @@ func TestSyncUpstreamErrorLogWindowDeduplicatesAcrossPages(t *testing.T) {
 	page := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		page++
-		if page == 1 {
-			_, _ = w.Write([]byte(`{"success":true,"data":{"items":[
-				{"id":11,"created_at":1787000001},{"id":12,"created_at":1787000002}],"total":3}}`))
+		p := r.URL.Query().Get("p")
+		// 101 条才会真正翻两页。服务端每页都把 id 从 1 重编，
+		// 模拟未修改 NewAPI 的真实行为；事件身份必须不依赖这个 id。
+		if p == "1" {
+			items := make([]string, 0, 100)
+			for i := 0; i < 100; i++ {
+				items = append(items, fmt.Sprintf(`{"id":%d,"created_at":1787000001,"request_id":"r-%03d"}`, i+1, i))
+			}
+			_, _ = fmt.Fprintf(w, `{"success":true,"data":{"items":[%s],"total":101}}`, strings.Join(items, ","))
 			return
 		}
-		// 第二页把 12 又给了一次（上游插入新行导致位移）。
 		_, _ = w.Write([]byte(`{"success":true,"data":{"items":[
-			{"id":12,"created_at":1787000002},{"id":13,"created_at":1787000003}],"total":3}}`))
+			{"id":1,"created_at":1787000002,"request_id":"r-100"}],"total":101}}`))
 	}))
 	defer server.Close()
 
@@ -420,25 +466,76 @@ func TestSyncUpstreamErrorLogWindowDeduplicatesAcrossPages(t *testing.T) {
 	if err != nil {
 		t.Fatalf("sync: %v", err)
 	}
-	if len(res.Rows) != 3 {
-		t.Fatalf("重复条目应去重，期望 3 条唯一记录，got=%d", len(res.Rows))
+	if len(res.Rows) != 101 {
+		t.Fatalf("页内 id 重编不得把不同事件合并，got=%d want=101", len(res.Rows))
 	}
-	seen := map[int64]int{}
+	seen := map[string]int{}
 	for _, r := range res.Rows {
-		seen[r.UpstreamID]++
+		seen[r.EventKey]++
 	}
-	for id, n := range seen {
+	for key, n := range seen {
 		if n != 1 {
-			t.Errorf("id=%d 出现 %d 次", id, n)
+			t.Errorf("event_key=%s 出现 %d 次", key, n)
 		}
+	}
+	if page != 3 { // 首页 + 第 2 页 + 首页稳定性复核
+		t.Errorf("应做完整扫描后的首页复核，requests=%d", page)
 	}
 }
 
-// TestSyncUpstreamErrorLogWindowMarksTruncated 预算耗尽必须标 Truncated 而非报错。
+func TestSyncUpstreamErrorLogWindowRejectsEventKeyCollision(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		// NewAPI rewrites id as a page-local ordinal. If two reported events are
+		// otherwise identical, their distinctness cannot be proved safely.
+		_, _ = w.Write([]byte(`{"success":true,"data":{"items":[
+			{"id":1,"created_at":1787000001,"request_id":"same"},
+			{"id":2,"created_at":1787000001,"request_id":"same"}],"total":2}}`))
+	}))
+	defer server.Close()
+	row := ChannelUpstreamAccount{Domain: "d.example", Provider: upstreamProviderNewAPI, BaseURL: server.URL, UserID: 31}
+	res, err := syncUpstreamErrorLogWindow(context.Background(), server.Client(), row,
+		newAPICredential{AccessToken: "tok"}, 1000, 2000,
+		newUpstreamUsageRequestPacer(10, 0), 1787000000)
+	if err == nil || !strings.Contains(err.Error(), "事件键碰撞或分页漂移") {
+		t.Fatalf("事件键碰撞必须 fail closed: err=%v", err)
+	}
+	if len(res.Rows) != 0 {
+		t.Fatalf("碰撞窗口不得返回部分证据: rows=%d", len(res.Rows))
+	}
+}
+
+func TestSyncUpstreamErrorLogWindowRejectsDuplicateAcrossPages(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("p") == "1" {
+			items := make([]string, 100)
+			for i := range items {
+				items[i] = fmt.Sprintf(`{"id":%d,"created_at":1787000001,"request_id":"r-%d"}`, i+1, i)
+			}
+			_, _ = fmt.Fprintf(w, `{"success":true,"data":{"items":[%s],"total":101}}`, strings.Join(items, ","))
+			return
+		}
+		// Page two repeats an event from page one while still reporting 101.
+		_, _ = w.Write([]byte(`{"success":true,"data":{"items":[
+			{"id":1,"created_at":1787000001,"request_id":"r-99"}],"total":101}}`))
+	}))
+	defer server.Close()
+	row := ChannelUpstreamAccount{Domain: "d.example", Provider: upstreamProviderNewAPI, BaseURL: server.URL, UserID: 31}
+	res, err := syncUpstreamErrorLogWindow(context.Background(), server.Client(), row,
+		newAPICredential{AccessToken: "tok"}, 1000, 2000,
+		newUpstreamUsageRequestPacer(10, 0), 1787000000)
+	if err == nil || !strings.Contains(err.Error(), "事件键碰撞或分页漂移") {
+		t.Fatalf("跨页重复造成 unique<total 必须 fail closed: err=%v", err)
+	}
+	if len(res.Rows) != 0 {
+		t.Fatalf("跨页漂移窗口不得返回部分证据: rows=%d", len(res.Rows))
+	}
+}
+
+// TestSyncUpstreamErrorLogWindowMarksTruncated 过密窗口必须缩窗重试。
 //
 // ★ 这条关系到「缺失绝不显示为零」★
 // 读到一半就停而不告知，运营会以为「上游那段时间只有这些错误」。
-// 但也不该报错整个丢掉——排障宁可拿到一半。
+// 部分页不能落库，否则进水位后会永久丢失未读页。
 func TestSyncUpstreamErrorLogWindowMarksTruncated(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// total 恒为 1000，永远读不完，必然撞预算。
@@ -458,19 +555,73 @@ func TestSyncUpstreamErrorLogWindowMarksTruncated(t *testing.T) {
 	if !res.Truncated {
 		t.Error("窗口未读完必须标 Truncated，否则会被当成「上游只有这些错误」")
 	}
-	if len(res.Rows) == 0 {
-		t.Error("应返回已读到的部分，而不是全丢")
+	if len(res.Rows) != 0 {
+		t.Error("过密窗口不得返回部分页供落库")
+	}
+	if res.SuggestedTo <= 1000 || res.SuggestedTo >= 2000 {
+		t.Errorf("应给出可持久化的缩窗右边界: %d", res.SuggestedTo)
+	}
+}
+
+func TestSyncUpstreamErrorLogWindowRejectsTotalDrift(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("p") == "1" {
+			items := make([]string, 100)
+			for i := range items {
+				items[i] = fmt.Sprintf(`{"id":%d,"created_at":1787000001,"request_id":"r-%d"}`, i+1, i)
+			}
+			_, _ = fmt.Fprintf(w, `{"success":true,"data":{"items":[%s],"total":101}}`, strings.Join(items, ","))
+			return
+		}
+		_, _ = w.Write([]byte(`{"success":true,"data":{"items":[{"id":1,"created_at":1787000002,"request_id":"r-100"}],"total":102}}`))
+	}))
+	defer server.Close()
+	row := ChannelUpstreamAccount{Domain: "d.example", Provider: upstreamProviderNewAPI, BaseURL: server.URL, UserID: 31}
+	_, err := syncUpstreamErrorLogWindow(context.Background(), server.Client(), row,
+		newAPICredential{AccessToken: "tok"}, 1000, 2000,
+		newUpstreamUsageRequestPacer(10, 0), 1787000000)
+	if err == nil || !strings.Contains(err.Error(), "total 变化") {
+		t.Fatalf("扫描期间 total 变化必须放弃本窗口: %v", err)
+	}
+}
+
+func TestSyncUpstreamErrorLogWindowRejectsFirstPageDrift(t *testing.T) {
+	firstPageCalls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("p") == "1" {
+			firstPageCalls++
+			items := make([]string, 100)
+			for i := range items {
+				requestID := fmt.Sprintf("r-%d", i)
+				if firstPageCalls > 1 && i == 0 {
+					requestID = "newly-inserted"
+				}
+				items[i] = fmt.Sprintf(`{"id":%d,"created_at":1787000001,"request_id":"%s"}`, i+1, requestID)
+			}
+			_, _ = fmt.Fprintf(w, `{"success":true,"data":{"items":[%s],"total":101}}`, strings.Join(items, ","))
+			return
+		}
+		_, _ = w.Write([]byte(`{"success":true,"data":{"items":[{"id":1,"created_at":1787000002,"request_id":"r-100"}],"total":101}}`))
+	}))
+	defer server.Close()
+	row := ChannelUpstreamAccount{Domain: "d.example", Provider: upstreamProviderNewAPI, BaseURL: server.URL, UserID: 31}
+	_, err := syncUpstreamErrorLogWindow(context.Background(), server.Client(), row,
+		newAPICredential{AccessToken: "tok"}, 1000, 2000,
+		newUpstreamUsageRequestPacer(10, 0), 1787000000)
+	if err == nil || !strings.Contains(err.Error(), "首页已变化") {
+		t.Fatalf("首页指纹变化必须放弃本窗口: %v", err)
 	}
 }
 
 // TestPersistUpstreamErrorLogsIsIdempotent 重复落库不产生重复行。
 //
-// 这张表要能被反复回填（同一窗口重跑），所以主键取 (domain, upstream_id) 而非自增。
+// 这张表要能被反复回填（同一窗口重跑），所以主键取
+// (domain, event_key) 而非页内伪 upstream_id 或自增值。
 func TestPersistUpstreamErrorLogsIsIdempotent(t *testing.T) {
 	m := newTestMonitor(t)
 	rows := []ChannelUpstreamErrorLog{
-		{Domain: "d.example", UpstreamID: 1, CreatedAt: 100, Content: "第一次", FetchedAt: 1},
-		{Domain: "d.example", UpstreamID: 2, CreatedAt: 200, Content: "另一条", FetchedAt: 1},
+		{Domain: "d.example", EventKey: "event-1", UpstreamID: 1, CreatedAt: 100, Content: "第一次", FetchedAt: 1},
+		{Domain: "d.example", EventKey: "event-2", UpstreamID: 2, CreatedAt: 200, Content: "另一条", FetchedAt: 1},
 	}
 	if err := m.persistUpstreamErrorLogs(context.Background(), rows); err != nil {
 		t.Fatalf("首次落库: %v", err)
@@ -490,7 +641,7 @@ func TestPersistUpstreamErrorLogsIsIdempotent(t *testing.T) {
 		t.Errorf("重复落库应 upsert 不应翻倍，got=%d want=2", count)
 	}
 	var got ChannelUpstreamErrorLog
-	if err := m.storeDB.First(&got, "domain = ? AND upstream_id = ?", "d.example", 1).Error; err != nil {
+	if err := m.storeDB.First(&got, "domain = ? AND event_key = ?", "d.example", "event-1").Error; err != nil {
 		t.Fatalf("回读: %v", err)
 	}
 	if got.Content != "第二次·已补全" || got.FetchedAt != 2 {
@@ -506,12 +657,12 @@ func TestPersistUpstreamErrorLogsKeepsRawJSON(t *testing.T) {
 	m := newTestMonitor(t)
 	raw := `{"id":5,"created_at":700,"unknown_future_field":"x"}`
 	if err := m.persistUpstreamErrorLogs(context.Background(), []ChannelUpstreamErrorLog{
-		{Domain: "d", UpstreamID: 5, CreatedAt: 700, RawJSON: raw},
+		{Domain: "d", EventKey: "event-5", UpstreamID: 5, CreatedAt: 700, RawJSON: raw},
 	}); err != nil {
 		t.Fatalf("落库: %v", err)
 	}
 	var got ChannelUpstreamErrorLog
-	if err := m.storeDB.First(&got, "domain = ? AND upstream_id = ?", "d", 5).Error; err != nil {
+	if err := m.storeDB.First(&got, "domain = ? AND event_key = ?", "d", "event-5").Error; err != nil {
 		t.Fatalf("回读: %v", err)
 	}
 	if got.RawJSON != raw {
@@ -524,10 +675,16 @@ func TestPersistUpstreamErrorLogsKeepsRawJSON(t *testing.T) {
 func TestPruneUpstreamErrorLogsRespectsCutoff(t *testing.T) {
 	m := newTestMonitor(t)
 	if err := m.persistUpstreamErrorLogs(context.Background(), []ChannelUpstreamErrorLog{
-		{Domain: "d", UpstreamID: 1, CreatedAt: 100},
-		{Domain: "d", UpstreamID: 2, CreatedAt: 500},
+		{Domain: "d", EventKey: "event-1", UpstreamID: 1, CreatedAt: 100},
+		{Domain: "d", EventKey: "event-2", UpstreamID: 2, CreatedAt: 500},
 	}); err != nil {
 		t.Fatalf("落库: %v", err)
+	}
+	if err := m.storeDB.Create(&[]UpstreamErrorLogSyncState{
+		{Domain: "d", CoverageFrom: 100, SyncedUntil: 600, LastSuccessAt: 600, Status: upstreamStatusOK},
+		{Domain: "expired", CoverageFrom: 100, SyncedUntil: 200, LastSuccessAt: 200, Status: upstreamStatusOK},
+	}).Error; err != nil {
+		t.Fatal(err)
 	}
 	if err := m.pruneUpstreamErrorLogs(context.Background(), 300); err != nil {
 		t.Fatalf("清理: %v", err)
@@ -538,6 +695,19 @@ func TestPruneUpstreamErrorLogsRespectsCutoff(t *testing.T) {
 	}
 	if len(ids) != 1 || ids[0] != 2 {
 		t.Errorf("应只留 created_at>=300 的那条，got=%v", ids)
+	}
+	var active, expired UpstreamErrorLogSyncState
+	if err := m.storeDB.First(&active, "domain = ?", "d").Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := m.storeDB.First(&expired, "domain = ?", "expired").Error; err != nil {
+		t.Fatal(err)
+	}
+	if active.CoverageFrom != 300 || active.SyncedUntil != 600 ||
+		expired.CoverageFrom != 0 || expired.SyncedUntil != 0 ||
+		expired.WindowFrom != 0 || expired.WindowTo != 0 {
+		t.Fatalf("保留期清理必须收缩有效覆盖并重置完全过期水位: active=%+v expired=%+v",
+			active, expired)
 	}
 	// before<=0 是「不清理」，不能当成「删全部」。
 	if err := m.pruneUpstreamErrorLogs(context.Background(), 0); err != nil {

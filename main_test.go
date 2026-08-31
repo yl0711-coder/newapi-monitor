@@ -87,3 +87,37 @@ func TestRunRestoreStoreBackupSetCommandRequiresExplicitConfirmation(t *testing.
 		t.Fatalf("unexpected positional argument was accepted: %v", err)
 	}
 }
+
+func TestRunInspectPreMigrationPlanCommandIsReadOnly(t *testing.T) {
+	dir := t.TempDir()
+	store := filepath.Join(dir, "monitor.db")
+	m, err := monitor.New(monitor.Settings{
+		StorePath: store, UsageFactsStorePath: filepath.Join(dir, "facts.db"),
+		StoreBackupEnabled: false, LocalSnapshotOnly: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.Close()
+	before, err := os.Stat(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var output bytes.Buffer
+	if err := runInspectPreMigrationPlanCommand([]string{"--store", store}, &output); err != nil {
+		t.Fatalf("read-only plan inspection failed: %v", err)
+	}
+	if !strings.Contains(output.String(), "upstream-errorlog-event-key-coverage") {
+		t.Fatalf("unexpected migration plan: %q", output.String())
+	}
+	after, err := os.Stat(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if before.Size() != after.Size() || !before.ModTime().Equal(after.ModTime()) {
+		t.Fatalf("plan inspection changed SQLite file: before=%+v after=%+v", before, after)
+	}
+	if err := runInspectPreMigrationPlanCommand([]string{}, &output); err == nil || !strings.Contains(err.Error(), "--store") {
+		t.Fatalf("missing store path was accepted: %v", err)
+	}
+}

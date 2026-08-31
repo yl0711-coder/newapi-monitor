@@ -14,7 +14,7 @@ import (
 // upRow 造一条上游错误日志。
 func upRow(domain string, id int64, joinKey, model string, sc int64, ts int64) ChannelUpstreamErrorLog {
 	return ChannelUpstreamErrorLog{
-		Domain: domain, UpstreamID: id, JoinKey: joinKey,
+		Domain: domain, EventKey: "event-" + itoa(id), UpstreamID: id, JoinKey: joinKey,
 		ModelName: model, StatusCode: sc, CreatedAt: ts,
 		UpstreamChannelName: "up_ch_" + model,
 		ErrorCode:           "unknown_error",
@@ -32,11 +32,23 @@ func ourRow(id int64, content, model, domain string, sc int, ts int64) LogChainR
 	}
 }
 
+func enableCorrelateCoverage(t *testing.T, m *Monitor, domain string, from, to int64) {
+	t.Helper()
+	m.cfg.UpstreamErrorLogDomains = []string{domain}
+	if err := m.storeDB.Create(&UpstreamErrorLogSyncState{
+		Domain: domain, CoverageFrom: from, SyncedUntil: to,
+		LastSuccessAt: to, Status: upstreamStatusOK,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+}
+
 // TestCorrelateExactByJoinKey ★ 最要紧的一条 ★
 // 双方 content 嵌同一个模型商 id → exact。
 func TestCorrelateExactByJoinKey(t *testing.T) {
 	m := newTestMonitor(t)
 	m.cfg.UpstreamErrorLogSyncEnabled = true
+	enableCorrelateCoverage(t, m, "kpzhu.com", 900, 1100)
 	key := "202608280208089288070118268d9d6WhLijC4B"
 	if err := m.storeDB.Create(&[]ChannelUpstreamErrorLog{
 		upRow("kpzhu.com", 1, key, "gpt-5.5", 503, 1000),
@@ -48,7 +60,10 @@ func TestCorrelateExactByJoinKey(t *testing.T) {
 		ourRow(9, "status_code=503, no available upstream (request id: "+key+")",
 			"gpt-5.5", "kpzhu.com", 503, 1000),
 	}
-	got := m.correlateUpstreamErrors(context.Background(), rows)
+	got, err := m.correlateUpstreamErrors(context.Background(), rows)
+	if err != nil {
+		t.Fatal(err)
+	}
 	mt, ok := got[9]
 	if !ok {
 		t.Fatal("串联键相等却没匹配上")
@@ -64,12 +79,13 @@ func TestCorrelateExactByJoinKey(t *testing.T) {
 	}
 }
 
-// TestCorrelateJoinKeyIgnoresDomainAndTime 精确键不受域名与时间影响。
+// TestCorrelateJoinKeyDoesNotCrossDomain 精确键不能跨上游域名串联。
 //
 // 串联键是模型商全局唯一的 id，加域名或时间条件只会在渠道快照对不上、
 // 或两侧时钟偏差大时误杀。键相等本身就是足够强的证据。
-func TestCorrelateJoinKeyIgnoresDomainAndTime(t *testing.T) {
+func TestCorrelateJoinKeyDoesNotCrossDomain(t *testing.T) {
 	m := newTestMonitor(t)
+	enableCorrelateCoverage(t, m, "kpzhu.com", 900, 5000)
 	key := "req_1787652519221_1a03fa99"
 	if err := m.storeDB.Create(&[]ChannelUpstreamErrorLog{
 		// 域名不同、时间差一小时
@@ -80,9 +96,35 @@ func TestCorrelateJoinKeyIgnoresDomainAndTime(t *testing.T) {
 	rows := []LogChainRow{
 		ourRow(11, "status_code=503, x (request_id: "+key+")", "gpt-5.5", "kpzhu.com", 503, 1000+3600),
 	}
-	got := m.correlateUpstreamErrors(context.Background(), rows)
-	if got[11].Confidence != correlateExact {
-		t.Errorf("键相等就该 exact，不该被域名/时间否掉: %+v", got[11])
+	got, err := m.correlateUpstreamErrors(context.Background(), rows)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got[11].Confidence != correlateNone {
+		t.Errorf("不同上游域名不得串联为 exact: %+v", got[11])
+	}
+}
+
+// TestCorrelateDatabaseFailureIsExplicit 本地证据库异常时必须返回降级错误，
+// 不能给每行填 none。none 表示“已经查过但没找到”，而查询失败根本没有这个结论。
+func TestCorrelateDatabaseFailureIsExplicit(t *testing.T) {
+	m := newTestMonitor(t)
+	sqlDB, err := m.storeDB.DB()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sqlDB.Close(); err != nil {
+		t.Fatal(err)
+	}
+	rows := []LogChainRow{
+		ourRow(91, "status_code=503, x (request id: req-91)", "gpt-5.5", "kpzhu.com", 503, 1000),
+	}
+	got, err := m.correlateUpstreamErrors(context.Background(), rows)
+	if err == nil {
+		t.Fatalf("本地证据库已关闭却未返回关联错误: got=%+v", got)
+	}
+	if len(got) != 0 {
+		t.Fatalf("关联失败时不得伪造 none 结论: %+v", got)
 	}
 }
 
@@ -93,6 +135,7 @@ func TestCorrelateJoinKeyIgnoresDomainAndTime(t *testing.T) {
 // 那 18% 就是会认错的部分。标成 exact 会让人拿别的请求的上游日志下结论。
 func TestCorrelateFallbackUniqueIsProbableNotExact(t *testing.T) {
 	m := newTestMonitor(t)
+	enableCorrelateCoverage(t, m, "kpzhu.com", 900, 1100)
 	if err := m.storeDB.Create(&[]ChannelUpstreamErrorLog{
 		upRow("kpzhu.com", 3, "", "gpt-5.5", 503, 1000),
 	}).Error; err != nil {
@@ -102,7 +145,10 @@ func TestCorrelateFallbackUniqueIsProbableNotExact(t *testing.T) {
 	rows := []LogChainRow{
 		ourRow(12, "status_code=503, no request id here", "gpt-5.5", "kpzhu.com", 503, 1003),
 	}
-	got := m.correlateUpstreamErrors(context.Background(), rows)
+	got, err := m.correlateUpstreamErrors(context.Background(), rows)
+	if err != nil {
+		t.Fatal(err)
+	}
 	mt := got[12]
 	if mt.Confidence == correlateExact {
 		t.Fatal("回退匹配绝不能标 exact——那是把推断当证据")
@@ -118,6 +164,7 @@ func TestCorrelateFallbackUniqueIsProbableNotExact(t *testing.T) {
 // TestCorrelateFallbackMultipleIsAmbiguous 多候选必须标 ambiguous 且不给具体那条。
 func TestCorrelateFallbackMultipleIsAmbiguous(t *testing.T) {
 	m := newTestMonitor(t)
+	enableCorrelateCoverage(t, m, "kpzhu.com", 900, 1100)
 	if err := m.storeDB.Create(&[]ChannelUpstreamErrorLog{
 		upRow("kpzhu.com", 4, "", "gpt-5.5", 503, 1000),
 		upRow("kpzhu.com", 5, "", "gpt-5.5", 503, 1002),
@@ -126,7 +173,10 @@ func TestCorrelateFallbackMultipleIsAmbiguous(t *testing.T) {
 		t.Fatal(err)
 	}
 	rows := []LogChainRow{ourRow(13, "status_code=503, x", "gpt-5.5", "kpzhu.com", 503, 1002)}
-	got := m.correlateUpstreamErrors(context.Background(), rows)
+	got, err := m.correlateUpstreamErrors(context.Background(), rows)
+	if err != nil {
+		t.Fatal(err)
+	}
 	mt := got[13]
 	if mt.Confidence != correlateAmbiguous {
 		t.Fatalf("多候选应为 ambiguous: got=%s", mt.Confidence)
@@ -143,6 +193,7 @@ func TestCorrelateFallbackMultipleIsAmbiguous(t *testing.T) {
 // TestCorrelateSkipsNonErrorAndMissingDomain 正常行与无域名行不参与关联。
 func TestCorrelateSkipsNonErrorAndMissingDomain(t *testing.T) {
 	m := newTestMonitor(t)
+	enableCorrelateCoverage(t, m, "kpzhu.com", 900, 6000)
 	if err := m.storeDB.Create(&[]ChannelUpstreamErrorLog{
 		upRow("kpzhu.com", 7, "k7", "gpt-5.5", 503, 1000),
 	}).Error; err != nil {
@@ -156,12 +207,60 @@ func TestCorrelateSkipsNonErrorAndMissingDomain(t *testing.T) {
 		{ID: 22, Type: 5, Content: "x (request id: k7)", ModelName: "gpt-5.5",
 			UpstreamDomain: "", CreatedAt: 1000},
 	}
-	got := m.correlateUpstreamErrors(context.Background(), rows)
+	got, err := m.correlateUpstreamErrors(context.Background(), rows)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if _, ok := got[21]; ok {
 		t.Error("正常消费行不该参与关联")
 	}
 	if _, ok := got[22]; ok {
 		t.Error("无上游域名的行无从查起，不该参与关联")
+	}
+}
+
+func TestCorrelateCoverageStatesNeverMasqueradeAsNoMatch(t *testing.T) {
+	tests := []struct {
+		name    string
+		allowed bool
+		state   *UpstreamErrorLogSyncState
+		want    string
+	}{
+		{name: "not selected", want: correlateNotSelected},
+		{name: "selected without state", allowed: true, want: correlateNotCollected},
+		{name: "outside watermark", allowed: true, state: &UpstreamErrorLogSyncState{
+			CoverageFrom: 2000, SyncedUntil: 3000, LastSuccessAt: 3000, Status: upstreamStatusOK,
+		}, want: correlateIncomplete},
+		{name: "collector failed", allowed: true, state: &UpstreamErrorLogSyncState{
+			CoverageFrom: 900, SyncedUntil: 1100, LastSuccessAt: 1050, Status: upstreamStatusError,
+		}, want: correlateIncomplete},
+		{name: "covered and healthy", allowed: true, state: &UpstreamErrorLogSyncState{
+			CoverageFrom: 900, SyncedUntil: 1100, LastSuccessAt: 1050, Status: upstreamStatusOK,
+		}, want: correlateNone},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			m := newTestMonitor(t)
+			if tc.allowed {
+				m.cfg.UpstreamErrorLogDomains = []string{"kpzhu.com"}
+			}
+			if tc.state != nil {
+				state := *tc.state
+				state.Domain = "kpzhu.com"
+				if err := m.storeDB.Create(&state).Error; err != nil {
+					t.Fatal(err)
+				}
+			}
+			got, err := m.correlateUpstreamErrors(context.Background(), []LogChainRow{
+				ourRow(71, "status_code=502, no evidence", "gpt-5.5", "kpzhu.com", 502, 1000),
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got[71].Confidence != tc.want {
+				t.Fatalf("confidence=%q want=%q detail=%+v", got[71].Confidence, tc.want, got[71])
+			}
+		})
 	}
 }
 
@@ -173,6 +272,7 @@ func TestCorrelateUIDistinguishesConfidence(t *testing.T) {
 	js := string(logChainJS)
 	for _, want := range []string{
 		"CORRELATE_LABEL", "lc-corr-exact", "lc-corr-probable", "lc-corr-ambiguous",
+		"not_selected", "not_collected", "incomplete", "lc-corr-incomplete",
 	} {
 		if !strings.Contains(js, want) {
 			t.Errorf("前端缺 %q", want)
@@ -198,6 +298,10 @@ func TestCorrelateUIDistinguishesConfidence(t *testing.T) {
 	// 表格里要有标记，不展开也能看出有上游数据。
 	if !strings.Contains(js, "lc-corr-dot") {
 		t.Error("表格缺关联标记")
+	}
+	if !strings.Contains(js, "upstream_correlation_error") ||
+		!strings.Contains(js, "不代表没有上游错误") {
+		t.Error("关联数据库失败时前端没有显式降级提示")
 	}
 	// CSS 缺了色块会退化成无样式文本，四档看起来一模一样。
 	css := pageHTML
@@ -296,6 +400,7 @@ func TestCorrelateUIHidesRedundantFields(t *testing.T) {
 // 判成 none 会让人反复去核对采集，而那趟必然白跑。
 func TestCorrelateCDNStatusIsNotApplicable(t *testing.T) {
 	m := newTestMonitor(t)
+	enableCorrelateCoverage(t, m, "kpzhu.com", 900, 6000)
 	// 上游日志里有同模型的 503，但没有 524——与实测一致。
 	if err := m.storeDB.Create(&[]ChannelUpstreamErrorLog{
 		upRow("kpzhu.com", 30, "", "gpt-5.5", 503, 1000),
@@ -307,7 +412,10 @@ func TestCorrelateCDNStatusIsNotApplicable(t *testing.T) {
 			"gpt-5.5", "kpzhu.com", 524, 1000),
 		ourRow(41, "status_code=502, bad gateway", "gpt-5.5", "kpzhu.com", 502, 5000),
 	}
-	got := m.correlateUpstreamErrors(context.Background(), rows)
+	got, err := m.correlateUpstreamErrors(context.Background(), rows)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	cdn := got[40]
 	if cdn.Confidence != correlateNotApplicable {

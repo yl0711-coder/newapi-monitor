@@ -2709,14 +2709,11 @@ exact=33  probable=33  ambiguous=11  not_applicable=5  none=118   合计 200
 一条不漏，且 `exact` 那 33 条的上游渠道名都取到了（`gptpro - L - 0.15`、
 `gpt - bao - 0.1`）。
 
-**8204 现跑 `prod-readonly-v31`**。`.local-test-kit` 的 compose 里
-`MONITOR_UPSTREAM_ERRORLOG_SYNC_ENABLED` 的默认值**改成了 `true`**，与其余
-上游开关（默认 false）相反。
-
-理由：这个开关同时守着「页面上的上游关联」——排障接口在它为 false 时直接跳过
-关联查询。默认 false 会让重启后关联那几行凭空消失，看起来像功能没做。
-实测代价可接受：本栈 10 个账户 `usage_sync_enabled` 全为 false，
-只会落 10 条状态记录（5 条 `error` 无凭据、5 条 `unsupported`），不会真去拉。
+> **2026-08-31 安全收口（覆盖本节旧结论）**：
+> `MONITOR_UPSTREAM_ERRORLOG_SYNC_ENABLED` 在所有本地与生产模板中都必须显式默认
+> `false`；同时使用 `MONITOR_UPSTREAM_ERRORLOG_DOMAINS` 独立白名单。总开关为真但
+> 白名单为空时仍不访问任何上游。首发只部署表结构、读路径与状态页，
+> 经指定 NewAPI 账户单独审批后才能“开总闸门 + 加入一个域名”灰度。
 
 > 改那行注释时编辑工具把截断标记写进了 YAML，导致 **compose 解析失败、
 > `up` 静默不生效**，我第一次重启后还跑着旧镜像。**每次重启后必须核对镜像 tag。**

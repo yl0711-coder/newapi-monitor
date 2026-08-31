@@ -287,6 +287,20 @@ type ChannelUpstreamAccountView struct {
 	PricingVerifiedHours          int64                             `json:"pricing_verified_hours,omitempty"`
 	PricingPendingHours           int64                             `json:"pricing_pending_hours,omitempty"`
 	PricingMismatchHours          int64                             `json:"pricing_mismatch_hours,omitempty"`
+	ErrorLogWorkerEnabled         bool                              `json:"error_log_worker_enabled"`
+	ErrorLogSelected              bool                              `json:"error_log_selected"`
+	ErrorLogStatus                string                            `json:"error_log_status,omitempty"`
+	ErrorLogLastAttemptAt         int64                             `json:"error_log_last_attempt_at,omitempty"`
+	ErrorLogLastSuccessAt         int64                             `json:"error_log_last_success_at,omitempty"`
+	ErrorLogNextSyncAt            int64                             `json:"error_log_next_sync_at,omitempty"`
+	ErrorLogCoverageFrom          int64                             `json:"error_log_coverage_from,omitempty"`
+	ErrorLogSyncedUntil           int64                             `json:"error_log_synced_until,omitempty"`
+	ErrorLogWindowFrom            int64                             `json:"error_log_window_from,omitempty"`
+	ErrorLogWindowTo              int64                             `json:"error_log_window_to,omitempty"`
+	ErrorLogRowsTotal             int64                             `json:"error_log_rows_total,omitempty"`
+	ErrorLogConsecutiveFails      int                               `json:"error_log_consecutive_fails,omitempty"`
+	ErrorLogLastError             string                            `json:"error_log_last_error,omitempty"`
+	ErrorLogUnresolvedFields      string                            `json:"error_log_unresolved_fields,omitempty"`
 }
 
 // AICodeWithKeySlotView is the non-secret identity of one configured key.
@@ -1098,6 +1112,16 @@ func (m *Monitor) loadChannelUpstreamViews(ctx context.Context) (map[string]Chan
 	for _, state := range keyStates {
 		keyStatesByDomain[state.Domain] = append(keyStatesByDomain[state.Domain], state)
 	}
+	var errorLogStates []UpstreamErrorLogSyncState
+	if m.cfg.UpstreamErrorLogSyncEnabled {
+		if err := m.storeDB.WithContext(ctx).Find(&errorLogStates).Error; err != nil {
+			return nil, err
+		}
+	}
+	errorLogStateByDomain := make(map[string]UpstreamErrorLogSyncState, len(errorLogStates))
+	for _, state := range errorLogStates {
+		errorLogStateByDomain[state.Domain] = state
+	}
 	out := make(map[string]ChannelUpstreamAccountView, len(rows))
 	for _, row := range rows {
 		view := m.channelUpstreamAccountView(row)
@@ -1138,6 +1162,34 @@ func (m *Monitor) loadChannelUpstreamViews(ctx context.Context) (map[string]Chan
 			view.PricingVerifiedHours = state.VerifiedHours
 			view.PricingPendingHours = state.PendingHours
 			view.PricingMismatchHours = state.MismatchHours
+		}
+		view.ErrorLogWorkerEnabled = m.cfg.UpstreamErrorLogSyncEnabled
+		view.ErrorLogSelected = upstreamErrorLogDomainAllowed(m.cfg.UpstreamErrorLogDomains, row.Domain)
+		errorState, hasErrorState := errorLogStateByDomain[row.Domain]
+		switch {
+		case !view.ErrorLogWorkerEnabled:
+			view.ErrorLogStatus = "global_off"
+		case !view.ErrorLogSelected:
+			view.ErrorLogStatus = "not_selected"
+		case !row.Enabled || !row.UsageSyncEnabled:
+			view.ErrorLogStatus = upstreamStatusDisabled
+		case !hasErrorState:
+			view.ErrorLogStatus = upstreamStatusPending
+		default:
+			view.ErrorLogStatus = errorState.Status
+		}
+		if hasErrorState {
+			view.ErrorLogLastAttemptAt = errorState.LastAttemptAt
+			view.ErrorLogLastSuccessAt = errorState.LastSuccessAt
+			view.ErrorLogNextSyncAt = errorState.NextSyncAt
+			view.ErrorLogCoverageFrom = errorState.CoverageFrom
+			view.ErrorLogSyncedUntil = errorState.SyncedUntil
+			view.ErrorLogWindowFrom = errorState.WindowFrom
+			view.ErrorLogWindowTo = errorState.WindowTo
+			view.ErrorLogRowsTotal = errorState.RowsTotal
+			view.ErrorLogConsecutiveFails = errorState.ConsecutiveFails
+			view.ErrorLogLastError = errorState.LastError
+			view.ErrorLogUnresolvedFields = errorState.UnresolvedFields
 		}
 		out[row.Domain] = view
 	}
@@ -1262,7 +1314,7 @@ func (m *Monitor) migrateAICodeWithCredentialSlots() error {
 		if err := m.sealUpstreamAccountCredential(&row, normalized); err != nil {
 			return err
 		}
-		if err := m.persistAICodeWithAccountChange(context.Background(), &row, normalized, false); err != nil {
+		if err := m.persistAICodeWithAccountChange(context.Background(), &row, normalized, false, false); err != nil {
 			return fmt.Errorf("%s Key 槽位迁移失败: %w", row.Domain, err)
 		}
 	}
@@ -1996,7 +2048,7 @@ func (m *Monitor) persistSyncedUpstreamAccount(ctx context.Context, row *Channel
 // never become visible while rows attributed to the previous identity remain.
 // The caller prepares (or preserves) the sealed credential before entering the
 // transaction; no network access or secret handling occurs while SQLite is held.
-func (m *Monitor) persistUpstreamAccountIdentityChange(ctx context.Context, row *ChannelUpstreamAccount, clearUsage bool) error {
+func (m *Monitor) persistUpstreamAccountIdentityChange(ctx context.Context, row *ChannelUpstreamAccount, clearUsage, recoverErrorLogAuth bool) error {
 	return m.storeDB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		if err := tx.Clauses(clause.OnConflict{
 			Columns:   []clause.Column{{Name: "domain"}},
@@ -2015,11 +2067,11 @@ func (m *Monitor) persistUpstreamAccountIdentityChange(ctx context.Context, row 
 				return err
 			}
 		}
-		return nil
+		return reconcileUpstreamErrorLogAccountChange(tx, row.Domain, clearUsage, recoverErrorLogAuth, row.UpdatedAt)
 	})
 }
 
-func (m *Monitor) persistAICodeWithAccountChange(ctx context.Context, row *ChannelUpstreamAccount, cred aiCodeWithCredential, clearUsage bool) error {
+func (m *Monitor) persistAICodeWithAccountChange(ctx context.Context, row *ChannelUpstreamAccount, cred aiCodeWithCredential, clearUsage, recoverErrorLogAuth bool) error {
 	normalized, err := normalizeAICodeWithCredential(cred)
 	if err != nil {
 		return err
@@ -2086,8 +2138,36 @@ func (m *Monitor) persistAICodeWithAccountChange(ctx context.Context, row *Chann
 				return err
 			}
 		}
-		return nil
+		return reconcileUpstreamErrorLogAccountChange(tx, row.Domain, clearUsage, recoverErrorLogAuth, row.UpdatedAt)
 	})
+}
+
+// reconcileUpstreamErrorLogAccountChange keeps the independently scheduled
+// error-evidence lane consistent with an administrator's account change.
+//
+// A provider/base URL/account identity change invalidates both the cursor and
+// evidence rows: retaining either would mix two upstream accounts under one
+// domain. A replacement credential for the same NewAPI identity is different:
+// it is the explicit recovery action after a 401/403, so preserve the cursor
+// and evidence but reopen the isolated scheduler gate. This runs in the same
+// SQLite transaction as the account update; the UI can never observe a new
+// credential with an old permanent isolation state.
+func reconcileUpstreamErrorLogAccountChange(tx *gorm.DB, domain string, clearIdentity, recoverAuth bool, now int64) error {
+	if clearIdentity {
+		if err := tx.Where("domain = ?", domain).Delete(&ChannelUpstreamErrorLog{}).Error; err != nil {
+			return err
+		}
+		return tx.Where("domain = ?", domain).Delete(&UpstreamErrorLogSyncState{}).Error
+	}
+	if !recoverAuth {
+		return nil
+	}
+	return tx.Model(&UpstreamErrorLogSyncState{}).
+		Where("domain = ? AND (status = ? OR next_sync_at = ?)", domain, upstreamStatusReconnect, upstreamAccountIsolatedUntil).
+		Updates(map[string]any{
+			"status": upstreamStatusPending, "next_sync_at": int64(0),
+			"consecutive_fails": 0, "last_error": "", "updated_at": now,
+		}).Error
 }
 
 func (m *Monitor) sealUpstreamAccountCredential(row *ChannelUpstreamAccount, credential any) error {
@@ -2461,7 +2541,7 @@ func (m *Monitor) saveChannelUpstreamHandler(c *gin.Context) {
 		usageAuthIsolated := existing.UsageStatus == upstreamStatusReconnect ||
 			existing.UsageNextSyncAt == upstreamAccountIsolatedUntil ||
 			existing.UsageBackfillNextSyncAt == upstreamAccountIsolatedUntil
-		if credentialUpdated && row.UsageSyncEnabled && usageAuthIsolated {
+		if credentialUpdated && usageAuthIsolated {
 			row.UsageStatus, row.UsageLastError = upstreamStatusPending, ""
 			row.UsageNextSyncAt, row.UsageConsecutiveFails = 0, 0
 			row.UsageBackfillNextSyncAt, row.UsageBackfillConsecutiveFails = 0, 0
@@ -2504,7 +2584,7 @@ func (m *Monitor) saveChannelUpstreamHandler(c *gin.Context) {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "保存 Key 名称失败"})
 			return
 		}
-		if persistErr := m.persistAICodeWithAccountChange(ctx, &updated, cred, false); persistErr != nil {
+		if persistErr := m.persistAICodeWithAccountChange(ctx, &updated, cred, false, false); persistErr != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "保存 Key 名称失败"})
 			return
 		}
@@ -2523,10 +2603,11 @@ func (m *Monitor) saveChannelUpstreamHandler(c *gin.Context) {
 		}
 		clearUsage := existingErr == nil && !sameIdentity && !(in.Provider == upstreamProviderAICodeWith && existing.Provider == upstreamProviderAICodeWith && existing.BaseURL == in.BaseURL)
 		var persistErr error
+		recoverErrorLogAuth := row.Provider == upstreamProviderNewAPI && sameIdentity && credentialUpdated
 		if cred, ok := credential.(aiCodeWithCredential); ok && row.Provider == upstreamProviderAICodeWith && !preserveSealedCredential {
-			persistErr = m.persistAICodeWithAccountChange(ctx, &row, cred, clearUsage)
+			persistErr = m.persistAICodeWithAccountChange(ctx, &row, cred, clearUsage, false)
 		} else {
-			persistErr = m.persistUpstreamAccountIdentityChange(ctx, &row, clearUsage)
+			persistErr = m.persistUpstreamAccountIdentityChange(ctx, &row, clearUsage, recoverErrorLogAuth)
 		}
 		if persistErr != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "保存上游配置失败"})
@@ -2575,10 +2656,11 @@ func (m *Monitor) saveChannelUpstreamHandler(c *gin.Context) {
 	}
 	clearUsage := existingErr == nil && !sameIdentity && !(in.Provider == upstreamProviderAICodeWith && existing.Provider == upstreamProviderAICodeWith && existing.BaseURL == in.BaseURL)
 	var persistErr error
+	recoverErrorLogAuth := row.Provider == upstreamProviderNewAPI && sameIdentity && credentialUpdated
 	if cred, ok := credential.(aiCodeWithCredential); ok && row.Provider == upstreamProviderAICodeWith {
-		persistErr = m.persistAICodeWithAccountChange(ctx, &row, cred, clearUsage)
+		persistErr = m.persistAICodeWithAccountChange(ctx, &row, cred, clearUsage, false)
 	} else {
-		persistErr = m.persistUpstreamAccountIdentityChange(ctx, &row, clearUsage)
+		persistErr = m.persistUpstreamAccountIdentityChange(ctx, &row, clearUsage, recoverErrorLogAuth)
 	}
 	if persistErr != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "保存上游配置失败"})

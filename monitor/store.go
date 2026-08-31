@@ -842,6 +842,13 @@ func (m *Monitor) openStore(path string) error {
 	// 需按 defaultAlertConfig 补一次,否则升级后交付异常告警静默失效。
 	hadAnomalyAlerts := db.Migrator().HasColumn(&AlertConfig{}, "anomaly_alerts_enabled")
 	hadUpstreamBalanceAlerts := db.Migrator().HasColumn(&AlertConfig{}, "upstream_balance_alerts_enabled")
+	// GORM's SQLite AutoMigrate cannot replace the legacy composite primary
+	// key. Rebuild it explicitly after the mandatory snapshot and before the
+	// model set is migrated, otherwise the first EventKey upsert fails at run
+	// time with a missing conflict constraint.
+	if err := migrateChannelUpstreamErrorLogEventKey(db); err != nil {
+		return fmt.Errorf("上游错误日志事件键迁移失败: %w", err)
+	}
 	if err := db.AutoMigrate(
 		&MetricSample{}, &TokenSample{}, &HourSample{}, &ChannelSnap{}, &RejectionSample{}, &RejectionIngestBatch{}, &SelectablePair{},
 		&StabilityHourSample{}, &ChannelTestHourSample{}, &StabilityRejectHour{}, &StabilityProblemSample{},
