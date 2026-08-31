@@ -11,7 +11,6 @@ import (
 	"os"
 	"strings"
 	"testing"
-	"time"
 )
 
 // TestSyncDueUpstreamErrorLogsRespectsGlobalGate 全局开关关闭时一步都不走。
@@ -258,5 +257,7 @@ type testUpstreamError struct{}
 
 func (e *testUpstreamError) Error() string { return "测试用上游错误" }
 
-// upstreamErrorLogBackoffMax 的秒数在用例里要用，这里确保它是 time.Duration。
-var _ = time.Duration(upstreamErrorLogBackoffMax)
+// 不需要「确保 upstreamErrorLogBackoffMax 是 time.Duration」的守卫：
+// 上面第 131/137 行直接调了 .Seconds()，常量若被改成整数，那两行会编译失败。
+// 原先那行 var _ = time.Duration(...) 既守不住（整数也能转换通过），
+// 又被 golangci-lint 的 unconvert 判为多余转换。
