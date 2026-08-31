@@ -65,6 +65,12 @@ type Settings struct {
 	NginxRetentionDays int      // MONITOR_NGINX_RETENTION_DAYS,默认 7
 	NginxAllowedNodes  []string // MONITOR_NGINX_ALLOWED_NODES,逗号分隔；启用 Nginx 采集时必填
 	NginxErrorEnabled  bool     // MONITOR_NGINX_ERROR_ENABLED，标准 error.log 的节点侧分类分钟聚合
+	// v2 是不可逆的逐 lane 连续性切换。总开关和逐节点白名单默认均关闭；
+	// 普通 Nginx ingest token 不能仅凭自身触发生产节点切换。
+	NginxSourceV2Enabled        bool     // MONITOR_NGINX_SOURCE_V2_ENABLED，默认 false
+	NginxSourceV2CutoverEnabled bool     // MONITOR_NGINX_SOURCE_V2_CUTOVER_ENABLED，默认 false；独立开放不可逆 manifest/cutover API
+	NginxSourceV2AllowedNodes   []string // MONITOR_NGINX_SOURCE_V2_ALLOWED_NODES，必须是 NginxAllowedNodes 子集
+	NginxSourceV2AllowedLanes   []string // MONITOR_NGINX_SOURCE_V2_ALLOWED_LANES，例如 slave:access；不允许节点的另一 lane 被顺带切换
 	// Nginx 请求证据是独立灰度 lane。off 完全不打开证据库；pilot 只采集并
 	// 验证覆盖率；verified 才允许客户排障按 Request ID 精确关联。
 	NginxEvidenceMode              string // MONITOR_NGINX_EVIDENCE_MODE=off|pilot|verified，默认 off
@@ -286,6 +292,10 @@ func LoadSettings() Settings {
 		NginxRetentionDays:                       envInt("MONITOR_NGINX_RETENTION_DAYS", 7),
 		NginxAllowedNodes:                        envCSV("MONITOR_NGINX_ALLOWED_NODES"),
 		NginxErrorEnabled:                        env("MONITOR_NGINX_ERROR_ENABLED", "false") == "true",
+		NginxSourceV2Enabled:                     env("MONITOR_NGINX_SOURCE_V2_ENABLED", "false") == "true",
+		NginxSourceV2CutoverEnabled:              env("MONITOR_NGINX_SOURCE_V2_CUTOVER_ENABLED", "false") == "true",
+		NginxSourceV2AllowedNodes:                envCSV("MONITOR_NGINX_SOURCE_V2_ALLOWED_NODES"),
+		NginxSourceV2AllowedLanes:                envCSV("MONITOR_NGINX_SOURCE_V2_ALLOWED_LANES"),
 		NginxEvidenceMode:                        strings.ToLower(strings.TrimSpace(env("MONITOR_NGINX_EVIDENCE_MODE", "off"))),
 		NginxEvidenceStorePath:                   strings.TrimSpace(env("MONITOR_NGINX_EVIDENCE_STORE_PATH", "")),
 		NginxEvidenceRetentionHours:              envInt("MONITOR_NGINX_EVIDENCE_RETENTION_HOURS", 168),

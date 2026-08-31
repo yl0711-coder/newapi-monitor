@@ -44,6 +44,8 @@ type nginxErrorIngestRequest struct {
 	LastCursorDiscontinuityAt int64                    `json:"last_cursor_discontinuity_at"`
 	DiscardedLines            int64                    `json:"discarded_lines"`
 	LastDiscardedAt           int64                    `json:"last_discarded_at"`
+	SourceBoundary            *nginxSourceBoundaryV1   `json:"source_boundary,omitempty"`
+	SourceRangeV2             *nginxSourceRangeV2      `json:"source_range_v2,omitempty"`
 }
 
 type NginxErrorSummary struct {
@@ -113,6 +115,26 @@ func (m *Monitor) ingestNginxErrors(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid source envelope"})
 		return
 	}
+	if err := validateNginxSourceBoundaryV1(in.SourceBoundary); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if in.SourceBoundary != nil && in.SourceRangeV2 != nil || in.SourceRangeV2 != nil && !validNginxSourceRangeV2(*in.SourceRangeV2, "error") {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid or ambiguous source range"})
+		return
+	}
+	if in.SourceRangeV2 != nil && !m.nginxSourceV2LaneAllowed(in.Node, "error") {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "nginx source v2 is not enabled for this node"})
+		return
+	}
+	if in.SourceBoundary != nil && in.SourceBoundary.Checkpoint && len(in.Samples) != 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "source checkpoint must not contain samples"})
+		return
+	}
+	if in.SourceBoundary != nil && !m.nginxSourceV2SchemaReady.Load() {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "nginx source continuity preparation is not enabled"})
+		return
+	}
 	now := time.Now().Unix()
 	if in.BacklogBytes < 0 || in.BacklogBytes > 1<<50 || (!in.BacklogKnown && in.BacklogBytes != 0) ||
 		in.CursorDiscontinuities < 0 || in.LastCursorDiscontinuityAt < 0 || in.LastCursorDiscontinuityAt > now+300 ||
@@ -152,7 +174,24 @@ func (m *Monitor) ingestNginxErrors(c *gin.Context) {
 	}
 	hash, duplicate := nginxErrorPayloadHash(rows), false
 	err := m.storeDB.Transaction(func(tx *gorm.DB) error {
-		created := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&NginxErrorIngestBatch{Node: in.Node, BatchID: in.BatchID, PayloadHash: hash, FirstTs: firstTs, LastTs: lastTs, Rows: len(rows), ReceivedAt: now})
+		sourceDuplicate := false
+		if in.SourceRangeV2 != nil {
+			var err error
+			sourceDuplicate, err = applyNginxSourceRangeV2(tx, in.Node, "error", in.BatchID, hash, *in.SourceRangeV2, now)
+			if err != nil {
+				return err
+			}
+		} else if m.cfg.NginxSourceV2Enabled || m.nginxSourceV2SchemaReady.Load() {
+			allowed, err := legacyNginxSourceAllowed(tx, in.Node, "error")
+			if err != nil {
+				return err
+			}
+			if !allowed {
+				return errNginxLegacyAfterV2
+			}
+		}
+		batch := NginxErrorIngestBatch{Node: in.Node, BatchID: in.BatchID, PayloadHash: hash, FirstTs: firstTs, LastTs: lastTs, Rows: len(rows), ReceivedAt: now}
+		created := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&batch)
 		if created.Error != nil {
 			return created.Error
 		}
@@ -164,8 +203,27 @@ func (m *Monitor) ingestNginxErrors(c *gin.Context) {
 			if existing.PayloadHash != "" && existing.PayloadHash != hash {
 				return errNginxBatchConflict
 			}
+			if in.SourceRangeV2 != nil && !sourceDuplicate {
+				return errNginxSourceConflict
+			}
+			if in.SourceBoundary != nil {
+				if existing.PayloadHash == "" {
+					return errNginxBatchConflict
+				}
+				if err := applyNginxSourceBoundaryV1(tx, in.Node, "error", in.BatchID, hash, *in.SourceBoundary, true, now); err != nil {
+					return err
+				}
+			}
 			duplicate = true
 			return nil
+		}
+		if sourceDuplicate {
+			return errNginxSourceConflict
+		}
+		if in.SourceBoundary != nil {
+			if err := applyNginxSourceBoundaryV1(tx, in.Node, "error", in.BatchID, hash, *in.SourceBoundary, false, now); err != nil {
+				return err
+			}
 		}
 		if len(rows) > 0 {
 			if err := tx.Clauses(clause.OnConflict{Columns: []clause.Column{{Name: "bucket_ts"}, {Name: "node"}, {Name: "category"}, {Name: "severity"}}, DoUpdates: clause.Assignments(map[string]any{"count": gorm.Expr("count + excluded.count")})}).CreateInBatches(rows, 200).Error; err != nil {
@@ -173,23 +231,39 @@ func (m *Monitor) ingestNginxErrors(c *gin.Context) {
 			}
 		}
 		state := NginxErrorSourceState{Node: in.Node, LastEventTs: lastTs, LastIngestTs: now, LastBatchID: in.BatchID, AcceptedRows: int64(len(rows)), AcceptedCount: accepted, BacklogBytes: in.BacklogBytes, BacklogKnown: in.BacklogKnown, CursorDiscontinuities: in.CursorDiscontinuities, LastCursorDiscontinuityAt: in.LastCursorDiscontinuityAt, DiscardedLines: in.DiscardedLines, LastDiscardedAt: in.LastDiscardedAt}
-		return tx.Clauses(clause.OnConflict{Columns: []clause.Column{{Name: "node"}}, DoUpdates: clause.Assignments(map[string]any{
+		updates := map[string]any{
 			"last_event_ts": gorm.Expr("MAX(last_event_ts, excluded.last_event_ts)"), "last_ingest_ts": now, "last_batch_id": in.BatchID,
 			"accepted_rows": gorm.Expr("accepted_rows + excluded.accepted_rows"), "accepted_count": gorm.Expr("accepted_count + excluded.accepted_count"),
 			"backlog_bytes": in.BacklogBytes, "backlog_known": in.BacklogKnown,
 			"cursor_discontinuities": gorm.Expr("MAX(cursor_discontinuities, excluded.cursor_discontinuities)"), "last_cursor_discontinuity_at": gorm.Expr("MAX(last_cursor_discontinuity_at, excluded.last_cursor_discontinuity_at)"),
 			"discarded_lines": gorm.Expr("MAX(discarded_lines, excluded.discarded_lines)"), "last_discarded_at": gorm.Expr("MAX(last_discarded_at, excluded.last_discarded_at)"),
-		})}).Create(&state).Error
+		}
+		return tx.Clauses(clause.OnConflict{Columns: []clause.Column{{Name: "node"}}, DoUpdates: clause.Assignments(updates)}).Create(&state).Error
 	})
+	if errors.Is(err, errNginxLegacyAfterV2) {
+		c.JSON(http.StatusConflict, gin.H{"error": "collector protocol v2 is active; legacy ingest is closed"})
+		return
+	}
 	if errors.Is(err, errNginxBatchConflict) {
 		c.JSON(http.StatusConflict, gin.H{"error": "batch id conflict"})
+		return
+	}
+	if errors.Is(err, errNginxSourceConflict) || errors.Is(err, errNginxSourceGap) || errors.Is(err, errNginxSourceOverlap) || errors.Is(err, errNginxSourceEpoch) || errors.Is(err, errNginxSourceUnregistered) {
+		c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
 		return
 	}
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "store failed"})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"ok": true, "duplicate": duplicate, "stored": len(rows)})
+	response := gin.H{"ok": true, "duplicate": duplicate, "stored": len(rows)}
+	if ack := nginxSourceBoundaryAckForV1(in.SourceBoundary, in.BatchID); ack != nil {
+		response["source_boundary_ack"] = ack
+	}
+	if ack := nginxSourceCommitAckForV2(in.SourceRangeV2, in.BatchID); ack != nil {
+		response["source_ack_v2"] = ack
+	}
+	c.JSON(http.StatusOK, response)
 }
 
 func (m *Monitor) nginxErrorSummary(ctx context.Context, from, to int64) []NginxErrorSummary {

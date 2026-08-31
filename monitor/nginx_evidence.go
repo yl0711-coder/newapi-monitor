@@ -113,11 +113,29 @@ type NginxEvidenceSourceState struct {
 	AppliedPersistFailures       int64  `gorm:"column:applied_persist_failures"`
 }
 
+// NginxEvidenceFileState keeps continuity independently for each manifest
+// file. v2 may interleave the live file with rotated backlog, so a single
+// node-level LastFileID cannot prove byte continuity.
+type NginxEvidenceFileState struct {
+	Node               string `gorm:"primaryKey;size:64"`
+	SourceKind         string `gorm:"primaryKey;size:16;column:source_kind"`
+	SourceEpoch        string `gorm:"primaryKey;size:32;column:source_epoch"`
+	SourceFileID       string `gorm:"primaryKey;size:49;column:source_file_id"`
+	LastEndOffset      int64  `gorm:"column:last_end_offset"`
+	GapCount           int64  `gorm:"column:gap_count"`
+	LastGapStartOffset int64  `gorm:"column:last_gap_start_offset"`
+	LastGapEndOffset   int64  `gorm:"column:last_gap_end_offset"`
+	UpdatedAt          int64  `gorm:"column:updated_at"`
+}
+
 type nginxEvidenceSourceRange struct {
+	Protocol                     int    `json:"protocol,omitempty"`
+	SourceEpoch                  string `json:"source_epoch,omitempty"`
 	Kind                         string `json:"kind"`
 	FileID                       string `json:"file_id"`
 	StartOffset                  int64  `json:"start_offset"`
 	EndOffset                    int64  `json:"end_offset"`
+	ContentSHA256                string `json:"content_sha256,omitempty"`
 	FirstEventMS                 int64  `json:"first_event_ms"`
 	LastEventMS                  int64  `json:"last_event_ms"`
 	CursorDiscontinuities        int64  `json:"cursor_discontinuities"`
@@ -247,6 +265,14 @@ func (m *Monitor) openNginxEvidenceStore() error {
 			_ = sqlDB.Close()
 		}
 		return fmt.Errorf("migrate evidence store: %w", err)
+	}
+	if m.cfg.NginxSourceV2Enabled {
+		if err := db.AutoMigrate(&NginxEvidenceFileState{}); err != nil {
+			if sqlDB, dbErr := db.DB(); dbErr == nil {
+				_ = sqlDB.Close()
+			}
+			return fmt.Errorf("migrate nginx source v2 evidence store: %w", err)
+		}
 	}
 	if err := configureNginxEvidencePageLimit(db, m.cfg.NginxEvidenceMaxMiB); err != nil {
 		if sqlDB, dbErr := db.DB(); dbErr == nil {
@@ -536,7 +562,9 @@ func validNginxEvidenceEvent(e nginxEvidenceEvent, nowMS int64, retentionHours i
 }
 
 func validNginxEvidenceSource(source nginxEvidenceSourceRange, eventCount int) bool {
-	if source.Kind != "access" || !nginxEvidenceFileIDPattern.MatchString(source.FileID) || source.StartOffset < 0 || source.EndOffset < source.StartOffset || source.EndOffset > 1<<50 ||
+	identityValid := source.Protocol == 0 && source.SourceEpoch == "" && source.ContentSHA256 == "" && nginxEvidenceFileIDPattern.MatchString(source.FileID) ||
+		source.Protocol == nginxSourceProtocolV2 && nginxSourceEpochV2Pattern.MatchString(source.SourceEpoch) && nginxSourceFileV2Pattern.MatchString(source.FileID) && strings.HasPrefix(source.FileID, source.SourceEpoch+"-") && nginxSourceHashV2Pattern.MatchString(source.ContentSHA256)
+	if source.Kind != "access" || !identityValid || source.StartOffset < 0 || source.EndOffset < source.StartOffset || source.EndOffset > 1<<50 ||
 		source.FirstEventMS < 0 || source.LastEventMS < source.FirstEventMS {
 		return false
 	}
@@ -619,6 +647,10 @@ func (m *Monitor) ingestNginxEvidence(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid evidence envelope"})
 		return
 	}
+	if in.Source.Protocol == nginxSourceProtocolV2 && !m.nginxSourceV2LaneAllowed(in.Node, "access") {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "nginx source v2 is not enabled for this node"})
+		return
+	}
 	computed := nginxEvidenceHash(in)
 	if computed != in.PayloadHash {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "payload hash mismatch"})
@@ -655,6 +687,43 @@ func (m *Monitor) ingestNginxEvidence(c *gin.Context) {
 			BytesSent: event.BytesSent, Completion: event.Completion,
 			NginxIDHMAC: event.NginxIDHMAC, OneAPIIDHMAC: event.OneAPIIDHMAC, HMACKeyID: in.HMACKeyID, BatchID: in.BatchID, ReceivedAt: now})
 	}
+	v2BaseOffset := int64(0)
+	v2CommitExpired := false
+	if in.Source.Protocol == nginxSourceProtocolV2 {
+		var watermark NginxSourceFileWatermark
+		if err := m.storeDB.First(&watermark, "node = ? AND kind = ? AND source_epoch = ? AND file_id = ?", in.Node, "access", in.Source.SourceEpoch, in.Source.FileID).Error; err != nil {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "evidence source manifest unavailable"})
+			return
+		}
+		var committed NginxSourceCommitV2
+		err := m.storeDB.First(&committed, "node = ? AND kind = ? AND batch_id = ?", in.Node, "access", in.BatchID).Error
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			if watermark.NextOffset >= in.Source.EndOffset {
+				// The durable file watermark can cross an interval only after its
+				// aggregate transaction committed. The evidence transaction below
+				// records and advances this now-unverifiable interval, preventing one
+				// expired FIFO item from poisoning every later range in the file.
+				v2CommitExpired = true
+			} else {
+				c.JSON(http.StatusServiceUnavailable, gin.H{"error": "evidence source range not committed"})
+				return
+			}
+		} else if err != nil {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "evidence source range not committed"})
+			return
+		}
+		if !v2CommitExpired && (committed.SourceEpoch != in.Source.SourceEpoch || committed.FileID != in.Source.FileID ||
+			committed.StartOffset != in.Source.StartOffset || committed.EndOffset != in.Source.EndOffset || committed.ContentHash != in.Source.ContentSHA256) {
+			c.JSON(http.StatusConflict, gin.H{"error": "evidence source range mismatch"})
+			return
+		}
+		v2BaseOffset = watermark.BaseOffset
+	}
+	if v2CommitExpired {
+		acceptedRows = nil
+		rejected = len(in.Events)
+		missingID = 0
+	}
 	duplicate := false
 	err := m.nginxEvidenceDB.Transaction(func(tx *gorm.DB) error {
 		batch := NginxEvidenceIngestBatch{Node: in.Node, SourceKind: in.Source.Kind, BatchID: in.BatchID, PayloadHash: computed,
@@ -682,8 +751,40 @@ func (m *Monitor) ingestNginxEvidence(c *gin.Context) {
 		if stateErr != nil && !errors.Is(stateErr, gorm.ErrRecordNotFound) {
 			return stateErr
 		}
-		if advancesRange && stateErr == nil && !continuousNginxEvidenceSource(previous, in.Source, in.Telemetry) {
+		if advancesRange && in.Source.Protocol == 0 && stateErr == nil && !continuousNginxEvidenceSource(previous, in.Source, in.Telemetry) {
 			return errNginxEvidenceSourceConflict
+		}
+		if advancesRange && in.Source.Protocol == nginxSourceProtocolV2 {
+			var fileState NginxEvidenceFileState
+			fileErr := tx.First(&fileState, "node = ? AND source_kind = ? AND source_epoch = ? AND source_file_id = ?", in.Node, in.Source.Kind, in.Source.SourceEpoch, in.Source.FileID).Error
+			if fileErr != nil && !errors.Is(fileErr, gorm.ErrRecordNotFound) {
+				return fileErr
+			}
+			expected := v2BaseOffset
+			if fileErr == nil {
+				expected = fileState.LastEndOffset
+			}
+			if in.Source.StartOffset < expected {
+				return errNginxEvidenceSourceConflict
+			}
+			if v2CommitExpired {
+				fileState.GapCount++
+				fileState.LastGapStartOffset, fileState.LastGapEndOffset = expected, in.Source.EndOffset
+			} else if in.Source.StartOffset > expected {
+				// The main-store watermark is contiguous and the current range has
+				// an exact commit proof. Therefore only evidence delivery—not source
+				// ingestion—is missing between expected and this batch.
+				fileState.GapCount++
+				fileState.LastGapStartOffset, fileState.LastGapEndOffset = expected, in.Source.StartOffset
+			}
+			fileState.Node, fileState.SourceKind, fileState.SourceEpoch, fileState.SourceFileID = in.Node, in.Source.Kind, in.Source.SourceEpoch, in.Source.FileID
+			fileState.LastEndOffset, fileState.UpdatedAt = in.Source.EndOffset, now
+			if err := tx.Clauses(clause.OnConflict{Columns: []clause.Column{{Name: "node"}, {Name: "source_kind"}, {Name: "source_epoch"}, {Name: "source_file_id"}}, DoUpdates: clause.Assignments(map[string]any{
+				"last_end_offset": in.Source.EndOffset, "gap_count": fileState.GapCount, "last_gap_start_offset": fileState.LastGapStartOffset,
+				"last_gap_end_offset": fileState.LastGapEndOffset, "updated_at": now,
+			})}).Create(&fileState).Error; err != nil {
+				return err
+			}
 		}
 		if len(acceptedRows) > 0 {
 			if err := tx.Clauses(clause.OnConflict{DoNothing: true}).CreateInBatches(acceptedRows, 200).Error; err != nil {

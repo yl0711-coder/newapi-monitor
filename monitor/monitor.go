@@ -51,6 +51,18 @@ type Monitor struct {
 	// nginxEvidenceDB 是短期、高基数的入口请求证据库。它与主库、用量事实库
 	// 分离；损坏、锁或满盘只会关闭 evidence lane，不影响现有 Monitor 页面。
 	nginxEvidenceDB *gorm.DB
+	// nginxSourceV2SchemaReady records whether the isolated v2 ledger exists.
+	// It stays true after a persisted cutover even if the rollout flag is later
+	// turned off, so a restart can never reopen the legacy writer by accident.
+	nginxSourceV2SchemaReady atomic.Bool
+	// nginxSourceV2Active is derived from durable protocol state. Once any lane
+	// has cut over, CUTOVER_ENABLED becomes only a permission for new lanes;
+	// existing v2 lanes must keep ingesting after that permission is closed.
+	nginxSourceV2Active atomic.Bool
+	// nginxSourceV2RuntimeConfigOK is computed once during store open so /ready
+	// can expose an accidentally disabled or de-whitelisted persisted lane
+	// without querying SQLite from the health endpoint.
+	nginxSourceV2RuntimeConfigOK atomic.Bool
 
 	lastRun                   atomic.Int64 // 采样心跳:最近一次成功采样的 Unix 秒(0=从未)
 	problemLastSuccess        atomic.Int64 // 原始错误采集器最近一次成功执行

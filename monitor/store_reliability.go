@@ -1093,7 +1093,7 @@ func (m *Monitor) createStoreBackupSet(parent context.Context, now time.Time, ma
 	defer cancel()
 	setID := now.UTC().Format("20060102-150405.000000000")
 	manifest := storeBackupSetManifest{
-		Version: storeBackupSetVersion, MigrationPlan: preMigrationPlanID, SetID: setID, CreatedAt: now.Unix(),
+		Version: storeBackupSetVersion, MigrationPlan: m.currentMigrationPlanID(), SetID: setID, CreatedAt: now.Unix(),
 	}
 	var mainSuccess, mainFailure, mainBytes atomic.Int64
 	var factsSuccess, factsFailure, factsBytes atomic.Int64

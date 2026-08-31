@@ -49,6 +49,20 @@ type config struct {
 	errorCursorPath    string
 	errorSinkURL       string
 	errorTimezone      string
+	// sourceV2Prepare enables only the v1 boundary proof used before a v2
+	// cutover. It is default-off so a collector-only rolling upgrade remains
+	// byte-for-byte compatible with an older/default-off Monitor.
+	sourceV2Prepare bool
+	sourceV2Access  bool
+	sourceV2Error   bool
+	sourceV2BaseURL string
+	sourceV2Cursor  string
+	errorV2Cursor   string
+	// sourceV2* are runtime-only parser identity. They are set by the v2
+	// runner after a manifest-bound file is selected and are never read from
+	// environment variables.
+	sourceV2Epoch  string
+	sourceV2FileID string
 }
 
 func loadConfig() (config, error) {
@@ -86,7 +100,23 @@ func loadConfig() (config, error) {
 		errorCursorPath:    env("NGINXCOLLECTOR_ERROR_CURSOR_PATH", "/data/error-cursor.json"),
 		errorSinkURL:       strings.TrimSpace(os.Getenv("NGINXCOLLECTOR_ERROR_SINK_URL")),
 		errorTimezone:      strings.TrimSpace(env("NGINXCOLLECTOR_ERROR_TIMEZONE", "UTC")),
+		sourceV2Prepare:    strings.EqualFold(strings.TrimSpace(os.Getenv("NGINXCOLLECTOR_SOURCE_V2_PREPARE")), "true"),
+		sourceV2BaseURL:    strings.TrimRight(strings.TrimSpace(os.Getenv("NGINXCOLLECTOR_SOURCE_V2_BASE_URL")), "/"),
+		sourceV2Cursor:     env("NGINXCOLLECTOR_SOURCE_V2_ACCESS_CURSOR_PATH", "/data/access-source-v2.json"),
+		errorV2Cursor:      env("NGINXCOLLECTOR_SOURCE_V2_ERROR_CURSOR_PATH", "/data/error-source-v2.json"),
 	}
+	lanes := map[string]bool{}
+	for _, raw := range strings.Split(strings.TrimSpace(os.Getenv("NGINXCOLLECTOR_SOURCE_V2_LANES")), ",") {
+		lane := strings.ToLower(strings.TrimSpace(raw))
+		if lane == "" {
+			continue
+		}
+		if lane != "access" && lane != "error" || lanes[lane] {
+			return config{}, fmt.Errorf("NGINXCOLLECTOR_SOURCE_V2_LANES only accepts unique access,error lanes")
+		}
+		lanes[lane] = true
+	}
+	c.sourceV2Access, c.sourceV2Error = lanes["access"], lanes["error"]
 	if c.node == "" || c.sinkURL == "" || c.token == "" {
 		return config{}, fmt.Errorf("NGINXCOLLECTOR_NODE, NGINXCOLLECTOR_SINK_URL and NGINXCOLLECTOR_TOKEN are required")
 	}
@@ -124,7 +154,32 @@ func loadConfig() (config, error) {
 			return config{}, fmt.Errorf("NGINXCOLLECTOR_ERROR_TIMEZONE is invalid: %w", err)
 		}
 	}
+	if c.sourceV2Access || c.sourceV2Error {
+		if !c.sourceV2Prepare {
+			return config{}, fmt.Errorf("source v2 lanes require NGINXCOLLECTOR_SOURCE_V2_PREPARE=true and an acknowledged v1 boundary")
+		}
+		if err := validateSourceV2BaseURL(c.sourceV2BaseURL, c.allowHTTP); err != nil {
+			return config{}, err
+		}
+		if !filepath.IsAbs(c.sourceV2Cursor) || !filepath.IsAbs(c.errorV2Cursor) || c.sourceV2Cursor == c.cursorPath || c.errorV2Cursor == c.errorCursorPath || c.sourceV2Cursor == c.errorV2Cursor {
+			return config{}, errors.New("source v2 access/error cursors must use independent absolute paths")
+		}
+		if c.sourceV2Error && !c.errorEnabled {
+			return config{}, errors.New("source v2 error lane requires NGINXCOLLECTOR_ERROR_ENABLED=true")
+		}
+	}
 	return c, nil
+}
+
+func validateSourceV2BaseURL(raw string, allowHTTP bool) error {
+	if err := validateSinkURL(raw, allowHTTP); err != nil {
+		return fmt.Errorf("invalid source v2 base URL: %w", err)
+	}
+	u, _ := url.ParseRequestURI(raw)
+	if u.RawQuery != "" || u.Path != "" && u.Path != "/" {
+		return errors.New("NGINXCOLLECTOR_SOURCE_V2_BASE_URL must contain only scheme and authority")
+	}
+	return nil
 }
 
 func env(key, fallback string) string {
@@ -179,6 +234,7 @@ const cursorVersion = 1
 
 type cursor struct {
 	Version                      int    `json:"version"`
+	Device                       uint64 `json:"device,omitempty"`
 	Inode                        uint64 `json:"inode"`
 	Offset                       int64  `json:"offset"`
 	Discontinuities              int64  `json:"discontinuities,omitempty"`
@@ -192,6 +248,34 @@ type cursor struct {
 	EvidencePersistFailures      int64  `json:"evidence_persist_failures,omitempty"`
 	EvidenceDroppedEvents        int64  `json:"evidence_dropped_events,omitempty"`
 	LastEvidencePersistFailureAt int64  `json:"last_evidence_persist_failure_at,omitempty"`
+	LastAckedBatchID             string `json:"last_acked_batch_id,omitempty"`
+	LastAckedDevice              uint64 `json:"last_acked_device,omitempty"`
+	LastAckedInode               uint64 `json:"last_acked_inode,omitempty"`
+	LastAckedOffset              int64  `json:"last_acked_offset,omitempty"`
+}
+
+type sourceBoundaryV1 struct {
+	Device      uint64 `json:"device"`
+	Inode       uint64 `json:"inode"`
+	StartOffset int64  `json:"start_offset"`
+	EndOffset   int64  `json:"end_offset"`
+	Checkpoint  bool   `json:"checkpoint,omitempty"`
+}
+
+type sourceBoundaryAckV1 struct {
+	Protocol    int    `json:"protocol"`
+	BatchID     string `json:"batch_id"`
+	Device      uint64 `json:"device"`
+	Inode       uint64 `json:"inode"`
+	StartOffset int64  `json:"start_offset"`
+	EndOffset   int64  `json:"end_offset"`
+	Checkpoint  bool   `json:"checkpoint,omitempty"`
+}
+
+func validSourceBoundaryAckV1(ack *sourceBoundaryAckV1, payload batch) bool {
+	boundary := payload.SourceBoundary
+	return boundary == nil && ack == nil || boundary != nil && ack != nil && ack.Protocol == 1 && ack.BatchID == payload.BatchID &&
+		ack.Device == boundary.Device && ack.Inode == boundary.Inode && ack.StartOffset == boundary.StartOffset && ack.EndOffset == boundary.EndOffset && ack.Checkpoint == boundary.Checkpoint
 }
 
 type flexNumber float64
@@ -321,18 +405,20 @@ type sample struct {
 }
 
 type batch struct {
-	Node                      string         `json:"node"`
-	BatchID                   string         `json:"batch_id"`
-	Samples                   []sample       `json:"samples"`
-	BacklogBytes              int64          `json:"backlog_bytes,omitempty"`
-	BacklogKnown              bool           `json:"backlog_known,omitempty"`
-	CursorDiscontinuities     int64          `json:"cursor_discontinuities,omitempty"`
-	LastCursorDiscontinuityAt int64          `json:"last_cursor_discontinuity_at,omitempty"`
-	DiscardedLines            int64          `json:"discarded_lines,omitempty"`
-	LastDiscardedAt           int64          `json:"last_discarded_at,omitempty"`
-	EvidencePersistFailures   int64          `json:"evidence_persist_failures,omitempty"`
-	EvidenceDroppedEvents     int64          `json:"evidence_dropped_events,omitempty"`
-	Evidence                  *evidenceBatch `json:"-"`
+	Node                      string            `json:"node"`
+	BatchID                   string            `json:"batch_id"`
+	Samples                   []sample          `json:"samples"`
+	BacklogBytes              int64             `json:"backlog_bytes,omitempty"`
+	BacklogKnown              bool              `json:"backlog_known,omitempty"`
+	CursorDiscontinuities     int64             `json:"cursor_discontinuities,omitempty"`
+	LastCursorDiscontinuityAt int64             `json:"last_cursor_discontinuity_at,omitempty"`
+	DiscardedLines            int64             `json:"discarded_lines,omitempty"`
+	LastDiscardedAt           int64             `json:"last_discarded_at,omitempty"`
+	EvidencePersistFailures   int64             `json:"evidence_persist_failures,omitempty"`
+	EvidenceDroppedEvents     int64             `json:"evidence_dropped_events,omitempty"`
+	Evidence                  *evidenceBatch    `json:"-"`
+	SourceBoundary            *sourceBoundaryV1 `json:"source_boundary,omitempty"`
+	SourceRangeV2             *sourceRangeV2    `json:"source_range_v2,omitempty"`
 }
 
 func normalizeRoute(path string) string {
@@ -470,6 +556,13 @@ func fileInode(info os.FileInfo) uint64 {
 	return uint64(info.ModTime().UnixNano())
 }
 
+func fileDevice(info os.FileInfo) uint64 {
+	if stat, ok := info.Sys().(*syscall.Stat_t); ok {
+		return uint64(stat.Dev)
+	}
+	return 0
+}
+
 func loadCursor(path string) (cursor, error) {
 	data, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
@@ -483,7 +576,9 @@ func loadCursor(path string) (cursor, error) {
 		value.DiscardedLines < 0 || value.LastDiscardedAt < 0 || value.LastLogSchema < 0 || value.LastLogSchema > 2 ||
 		value.EvidenceEligible < 0 || value.EvidenceParseRejected < 0 || value.LastEvidenceParseRejectedAt < 0 ||
 		value.EvidencePersistFailures < 0 || value.EvidenceDroppedEvents < 0 || value.LastEvidencePersistFailureAt < 0 ||
-		(value.EvidencePersistFailures == 0) != (value.LastEvidencePersistFailureAt == 0) {
+		(value.EvidencePersistFailures == 0) != (value.LastEvidencePersistFailureAt == 0) ||
+		(value.LastAckedBatchID == "") != (value.LastAckedDevice == 0 && value.LastAckedInode == 0 && value.LastAckedOffset == 0) ||
+		value.LastAckedBatchID != "" && (value.LastAckedDevice == 0 || value.LastAckedInode == 0 || value.LastAckedOffset < 0) {
 		return cursor{}, fmt.Errorf("cursor is invalid; restore the persistent cursor volume before restarting")
 	}
 	return value, nil
@@ -563,6 +658,7 @@ const maxLogCandidates = 256
 type logCandidate struct {
 	path    string
 	info    os.FileInfo
+	device  uint64
 	inode   uint64
 	current bool
 }
@@ -595,7 +691,8 @@ func listLogCandidates(logPath string) ([]logCandidate, error) {
 	}
 	currentInode := fileInode(currentInfo)
 	rotated := make([]logCandidate, 0, 8)
-	seen := map[uint64]bool{currentInode: true}
+	currentDevice := fileDevice(currentInfo)
+	seen := map[string]bool{fmt.Sprintf("%d:%d", currentDevice, currentInode): true}
 	for _, entry := range entries {
 		name := entry.Name()
 		if name == base || !strings.HasPrefix(name, base) || compressedLogName(name) {
@@ -606,11 +703,13 @@ func listLogCandidates(logPath string) ([]logCandidate, error) {
 			continue
 		}
 		inode := fileInode(info)
-		if seen[inode] {
+		device := fileDevice(info)
+		identity := fmt.Sprintf("%d:%d", device, inode)
+		if seen[identity] {
 			continue
 		}
-		seen[inode] = true
-		rotated = append(rotated, logCandidate{path: filepath.Join(dir, name), info: info, inode: inode})
+		seen[identity] = true
+		rotated = append(rotated, logCandidate{path: filepath.Join(dir, name), info: info, device: device, inode: inode})
 		if len(rotated) > maxLogCandidates {
 			return nil, fmt.Errorf("too many rotated nginx log candidates")
 		}
@@ -622,7 +721,7 @@ func listLogCandidates(logPath string) ([]logCandidate, error) {
 		}
 		return rotated[i].path < rotated[j].path
 	})
-	return append(rotated, logCandidate{path: logPath, info: currentInfo, inode: currentInode, current: true}), nil
+	return append(rotated, logCandidate{path: logPath, info: currentInfo, device: currentDevice, inode: currentInode, current: true}), nil
 }
 
 func markCursorDiscontinuity(value cursor, now int64) cursor {
@@ -642,13 +741,14 @@ func selectLogCandidate(logPath string, value cursor, now int64) (logCandidate, 
 	}
 	if value.Inode == 0 {
 		current := candidates[len(candidates)-1]
-		value.Inode, value.Offset = current.inode, 0
+		value.Device, value.Inode, value.Offset = current.device, current.inode, 0
 		return current, value, nil
 	}
 	for i, candidate := range candidates {
-		if candidate.inode != value.Inode {
+		if candidate.inode != value.Inode || value.Device != 0 && candidate.device != value.Device {
 			continue
 		}
+		value.Device = candidate.device
 		if candidate.info.Size() < value.Offset {
 			value = markCursorDiscontinuity(value, now)
 			value.Offset = 0
@@ -658,7 +758,7 @@ func selectLogCandidate(logPath string, value cursor, now int64) (logCandidate, 
 			return candidate, value, nil
 		}
 		next := candidates[i+1]
-		value.Inode, value.Offset = next.inode, 0
+		value.Device, value.Inode, value.Offset = next.device, next.inode, 0
 		return next, value, nil
 	}
 
@@ -666,7 +766,7 @@ func selectLogCandidate(logPath string, value cursor, now int64) (logCandidate, 
 	// 尽量减少缺口；服务端 batch 幂等键会阻止相同分块被重复累计。
 	value = markCursorDiscontinuity(value, now)
 	oldest := candidates[0]
-	value.Inode, value.Offset = oldest.inode, 0
+	value.Device, value.Inode, value.Offset = oldest.device, oldest.inode, 0
 	return oldest, value, nil
 }
 
@@ -687,7 +787,8 @@ func readBatch(c config, value cursor) (batch, cursor, bool, error) {
 		return batch{}, original, false, err
 	}
 	inode := fileInode(info)
-	if inode != target.inode {
+	device := fileDevice(info)
+	if inode != target.inode || device != target.device {
 		// 文件在目录扫描与 open 之间发生了轮转。此时原 inode 通常仍以
 		// .1 等名称保留；返回短暂错误让下一轮重新扫描，才能继续追读旧文件。
 		// 若直接从新 inode 开头读，会在轮转瞬间跳过旧文件尚未采集的尾部。
@@ -780,10 +881,12 @@ func readBatch(c config, value cursor) (batch, cursor, bool, error) {
 		rows = append(rows, row)
 	}
 	identity := sha256.New()
+	// Keep the v1 idempotency key byte-for-byte compatible with deployed
+	// collectors. Device belongs to the acknowledged boundary, not BatchID.
 	_, _ = fmt.Fprintf(identity, "%s:%d:%d:%d:", c.node, inode, start, end)
 	_, _ = identity.Write(batchContent.Sum(nil))
 	digest := identity.Sum(nil)
-	next := cursor{Version: cursorVersion, Inode: inode, Offset: end}
+	next := cursor{Version: cursorVersion, Device: device, Inode: inode, Offset: end}
 	next.Discontinuities = value.Discontinuities
 	next.LastDiscontinuityAt = value.LastDiscontinuityAt
 	next.DiscardedLines = value.DiscardedLines
@@ -795,8 +898,12 @@ func readBatch(c config, value cursor) (batch, cursor, bool, error) {
 	next.EvidencePersistFailures = value.EvidencePersistFailures
 	next.EvidenceDroppedEvents = value.EvidenceDroppedEvents
 	next.LastEvidencePersistFailureAt = value.LastEvidencePersistFailureAt
+	next.LastAckedBatchID, next.LastAckedDevice, next.LastAckedInode, next.LastAckedOffset = value.LastAckedBatchID, value.LastAckedDevice, value.LastAckedInode, value.LastAckedOffset
 	batchID := hex.EncodeToString(digest)
 	payload := batch{Node: c.node, BatchID: batchID, Samples: rows}
+	if c.sourceV2Prepare {
+		payload.SourceBoundary = &sourceBoundaryV1{Device: device, Inode: inode, StartOffset: start, EndOffset: end}
+	}
 	if c.evidenceMode != "off" {
 		payload.Evidence = newEvidenceBatch(c, batchID, inode, start, end, firstEventMS, lastEventMS, evidenceEvents, next)
 	}
@@ -866,9 +973,21 @@ func postBatch(ctx context.Context, c config, payload batch) error {
 		return err
 	}
 	defer resp.Body.Close()
-	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4<<10))
+	data, readErr := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
+	if readErr != nil {
+		return readErr
+	}
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("monitor returned HTTP %d", resp.StatusCode)
+	}
+	if payload.SourceBoundary != nil {
+		var response struct {
+			OK                bool                 `json:"ok"`
+			SourceBoundaryAck *sourceBoundaryAckV1 `json:"source_boundary_ack"`
+		}
+		if json.Unmarshal(data, &response) != nil || !response.OK || !validSourceBoundaryAckV1(response.SourceBoundaryAck, payload) {
+			return errors.New("monitor did not acknowledge the exact source boundary")
+		}
 	}
 	return nil
 }
@@ -883,6 +1002,9 @@ func runOnce(ctx context.Context, c config) error {
 		return err
 	}
 	if !ok {
+		if !c.sourceV2Prepare {
+			next.Device = 0
+		}
 		if next != current {
 			return saveCursor(c.cursorPath, next)
 		}
@@ -908,13 +1030,25 @@ func runOnce(ctx context.Context, c config) error {
 	if err := postBatch(ctx, c, payload); err != nil {
 		return err
 	}
+	if payload.SourceBoundary != nil {
+		next.LastAckedBatchID, next.LastAckedDevice, next.LastAckedInode, next.LastAckedOffset = payload.BatchID, payload.SourceBoundary.Device, payload.SourceBoundary.Inode, payload.SourceBoundary.EndOffset
+	} else {
+		next.Device = 0
+	}
 	return saveCursor(c.cursorPath, next)
 }
 
 func heartbeatBatch(c config, now time.Time, value cursor) batch {
 	minute := now.Unix() / 60
-	digest := sha256.Sum256([]byte(fmt.Sprintf("heartbeat:%s:%d", c.node, minute)))
+	identity := fmt.Sprintf("heartbeat:%s:%d", c.node, minute)
+	if c.sourceV2Prepare {
+		identity = fmt.Sprintf("heartbeat:%s:%d:%d:%d:%d", c.node, minute, value.Device, value.Inode, value.Offset)
+	}
+	digest := sha256.Sum256([]byte(identity))
 	payload := batch{Node: c.node, BatchID: "hb_" + hex.EncodeToString(digest[:16]), Samples: []sample{}}
+	if c.sourceV2Prepare && value.Inode != 0 {
+		payload.SourceBoundary = &sourceBoundaryV1{Device: value.Device, Inode: value.Inode, StartOffset: value.Offset, EndOffset: value.Offset, Checkpoint: true}
+	}
 	decorateBatch(c, &payload, value)
 	return payload
 }
@@ -931,23 +1065,58 @@ func main() {
 	if c.evidenceMode != "off" {
 		go runEvidenceWorker(ctx, c)
 	}
+	var sourceV2Client *sourceV2HTTPClient
+	if c.sourceV2Access || c.sourceV2Error {
+		sourceV2Client, err = newSourceV2HTTPClient(c.sourceV2BaseURL, c.token, c.allowHTTP)
+		if err != nil {
+			log.Fatal(err)
+		}
+	}
 	if c.errorEnabled {
-		go runErrorWorker(ctx, c)
+		if c.sourceV2Error {
+			go runErrorSourceV2Worker(ctx, c, sourceV2Client)
+		} else {
+			go runErrorWorker(ctx, c)
+		}
 	}
 	var nextHeartbeat time.Time
 	for {
-		if err := runOnce(ctx, c); err != nil && !errors.Is(err, os.ErrNotExist) && ctx.Err() == nil {
-			log.Printf("nginxcollector: 本轮未推进游标，将自动重试: %v", err)
+		var runErr error
+		if c.sourceV2Access {
+			runErr = runAccessSourceV2Once(ctx, c, c.sourceV2Cursor, sourceV2Client)
+		} else {
+			runErr = runOnce(ctx, c)
+		}
+		if runErr != nil && !errors.Is(runErr, os.ErrNotExist) && ctx.Err() == nil {
+			log.Printf("nginxcollector: 本轮未推进游标，将自动重试: %v", runErr)
 		}
 		now := time.Now()
 		if !now.Before(nextHeartbeat) && ctx.Err() == nil {
-			current, cursorErr := loadCursor(c.cursorPath)
-			if cursorErr != nil {
-				log.Printf("nginxcollector: 游标文件无法安全读取，已停止心跳与推进: %v", cursorErr)
-			} else if err := postBatch(ctx, c, heartbeatBatch(c, now, current)); err != nil {
-				log.Printf("nginxcollector: 心跳发送失败，将自动重试: %v", err)
+			if c.sourceV2Access {
+				if err := runSourceV2Heartbeat(ctx, c, c.logPath, c.cursorPath, c.sourceV2Cursor, "access", sourceV2Client); err != nil {
+					log.Printf("nginxcollector: source v2 心跳失败，将自动重试: %v", err)
+				} else {
+					nextHeartbeat = now.Add(time.Minute)
+				}
 			} else {
-				nextHeartbeat = now.Add(time.Minute)
+				current, cursorErr := loadCursor(c.cursorPath)
+				if cursorErr != nil {
+					log.Printf("nginxcollector: 游标文件无法安全读取，已停止心跳与推进: %v", cursorErr)
+				} else {
+					payload := heartbeatBatch(c, now, current)
+					if err := postBatch(ctx, c, payload); err != nil {
+						log.Printf("nginxcollector: 心跳发送失败，将自动重试: %v", err)
+					} else {
+						if payload.SourceBoundary != nil {
+							current.LastAckedBatchID, current.LastAckedDevice, current.LastAckedInode, current.LastAckedOffset = payload.BatchID, payload.SourceBoundary.Device, payload.SourceBoundary.Inode, payload.SourceBoundary.EndOffset
+							if err := saveCursor(c.cursorPath, current); err != nil {
+								log.Printf("nginxcollector: 心跳边界持久化失败，将重发同一边界: %v", err)
+								continue
+							}
+						}
+						nextHeartbeat = now.Add(time.Minute)
+					}
+				}
 			}
 		}
 		select {

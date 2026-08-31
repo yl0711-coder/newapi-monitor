@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"gorm.io/gorm"
 )
 
 func enableTestNginxEvidence(t *testing.T, m *Monitor) {
@@ -286,6 +287,165 @@ func TestNginxEvidenceEnforcesPerFileContinuity(t *testing.T) {
 	next.Source.StartOffset = 200
 	if w := postNginxEvidence(t, m, next); w.Code != http.StatusOK {
 		t.Fatalf("continuous batch=%d %s", w.Code, w.Body.String())
+	}
+}
+
+func TestNginxEvidenceV2InterleavedFilesUseIndependentManifestContinuity(t *testing.T) {
+	m := newTestMonitor(t)
+	m.cfg.NginxSourceV2Enabled = true
+	m.cfg.NginxSourceV2CutoverEnabled = true
+	m.cfg.NginxSourceV2AllowedNodes = []string{"master"}
+	m.cfg.NginxSourceV2AllowedLanes = []string{"master:access"}
+	migrateTestNginxSourceV2(t, m.storeDB)
+	enableTestNginxEvidence(t, m)
+	epoch := testSourceEpoch
+	oldFile, currentFile := epoch+"-0000000000000001", epoch+"-0000000000000002"
+	manifest := nginxSourceManifestV2{Protocol: 2, Kind: "access", SourceEpoch: epoch, Files: []nginxSourceManifestFileV2{
+		{FileID: oldFile, Generation: 1, Device: 1, Inode: 10},
+		{FileID: currentFile, Generation: 2, Device: 1, Inode: 11, Current: true},
+	}}
+	if err := m.storeDB.Transaction(func(tx *gorm.DB) error {
+		_, _, err := registerNginxSourceManifestV2(tx, "master", "", manifest, 99)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	type sourceCase struct {
+		batchID string
+		fileID  string
+		start   int64
+		end     int64
+		hash    string
+		eventID string
+	}
+	cases := []sourceCase{
+		{"v2_evidence_old_1_abcdefgh", oldFile, 0, 100, testContentA, strings.Repeat("1", 64)},
+		{"v2_evidence_current_abcdefgh", currentFile, 0, 80, testContentB, strings.Repeat("2", 64)},
+		{"v2_evidence_old_2_abcdefgh", oldFile, 100, 200, testPayloadA, strings.Repeat("3", 64)},
+	}
+	for _, tc := range cases {
+		body := fmt.Sprintf(`{"node":"master","batch_id":%q,"source_range_v2":{"protocol":2,"kind":"access","source_epoch":%q,"file_id":%q,"start_offset":%d,"end_offset":%d,"content_sha256":%q},"samples":[]}`, tc.batchID, epoch, tc.fileID, tc.start, tc.end, tc.hash)
+		if w := postNginx(t, m, body, "secret"); w.Code != http.StatusOK {
+			t.Fatalf("commit %s: %d %s", tc.batchID, w.Code, w.Body.String())
+		}
+		evidence := validEvidenceBatch()
+		evidence.BatchID = tc.batchID
+		evidence.Events[0].EventID = tc.eventID
+		evidence.Source.Protocol, evidence.Source.SourceEpoch = 2, epoch
+		evidence.Source.FileID, evidence.Source.StartOffset, evidence.Source.EndOffset, evidence.Source.ContentSHA256 = tc.fileID, tc.start, tc.end, tc.hash
+		evidence.Source.FirstEventMS, evidence.Source.LastEventMS = evidence.Events[0].EventMS, evidence.Events[0].EventMS
+		if w := postNginxEvidence(t, m, evidence); w.Code != http.StatusOK {
+			t.Fatalf("evidence %s: %d %s", tc.batchID, w.Code, w.Body.String())
+		}
+	}
+	var states []NginxEvidenceFileState
+	if err := m.nginxEvidenceDB.Order("source_file_id").Find(&states).Error; err != nil || len(states) != 2 || states[0].SourceFileID != oldFile || states[0].LastEndOffset != 200 || states[1].SourceFileID != currentFile || states[1].LastEndOffset != 80 {
+		t.Fatalf("per-file continuity=%+v err=%v", states, err)
+	}
+}
+
+func TestNginxEvidenceV2WaitsForMatchingCommittedSourceRange(t *testing.T) {
+	m := newTestMonitor(t)
+	m.cfg.NginxSourceV2Enabled = true
+	m.cfg.NginxSourceV2CutoverEnabled = true
+	m.cfg.NginxSourceV2AllowedNodes = []string{"master"}
+	m.cfg.NginxSourceV2AllowedLanes = []string{"master:access"}
+	migrateTestNginxSourceV2(t, m.storeDB)
+	enableTestNginxEvidence(t, m)
+	registerTestManifest(t, m.storeDB, "access", 0)
+	evidence := validEvidenceBatch()
+	evidence.BatchID = "v2_evidence_wait_abcdefgh"
+	evidence.Source.Protocol, evidence.Source.SourceEpoch = 2, testSourceEpoch
+	evidence.Source.FileID, evidence.Source.StartOffset, evidence.Source.EndOffset, evidence.Source.ContentSHA256 = testSourceFile, 0, 10, testContentA
+	if w := postNginxEvidence(t, m, evidence); w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("uncommitted evidence was not retained for retry: %d %s", w.Code, w.Body.String())
+	}
+	body := fmt.Sprintf(`{"node":"master","batch_id":%q,"source_range_v2":{"protocol":2,"kind":"access","source_epoch":%q,"file_id":%q,"start_offset":0,"end_offset":10,"content_sha256":%q},"samples":[]}`, evidence.BatchID, testSourceEpoch, testSourceFile, testContentA)
+	if w := postNginx(t, m, body, "secret"); w.Code != http.StatusOK {
+		t.Fatalf("source commit: %d %s", w.Code, w.Body.String())
+	}
+	if w := postNginxEvidence(t, m, evidence); w.Code != http.StatusOK {
+		t.Fatalf("evidence retry: %d %s", w.Code, w.Body.String())
+	}
+}
+
+func TestNginxEvidenceV2RecordsExpiredCommitGapAndAdvancesContinuity(t *testing.T) {
+	m := newTestMonitor(t)
+	m.cfg.NginxSourceV2Enabled = true
+	m.cfg.NginxSourceV2CutoverEnabled = true
+	m.cfg.NginxSourceV2AllowedNodes = []string{"master"}
+	m.cfg.NginxSourceV2AllowedLanes = []string{"master:access"}
+	migrateTestNginxSourceV2(t, m.storeDB)
+	enableTestNginxEvidence(t, m)
+	registerTestManifest(t, m.storeDB, "access", 0)
+	if err := m.storeDB.Model(&NginxSourceFileWatermark{}).
+		Where("node = ? AND kind = ? AND source_epoch = ? AND file_id = ?", "master", "access", testSourceEpoch, testSourceFile).
+		Update("next_offset", 10).Error; err != nil {
+		t.Fatal(err)
+	}
+	evidence := validEvidenceBatch()
+	evidence.BatchID = "v2_evidence_expired_abcdefgh"
+	evidence.Source.Protocol, evidence.Source.SourceEpoch = 2, testSourceEpoch
+	evidence.Source.FileID, evidence.Source.StartOffset, evidence.Source.EndOffset, evidence.Source.ContentSHA256 = testSourceFile, 0, 10, testContentA
+	if w := postNginxEvidence(t, m, evidence); w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"accepted":0`) || !strings.Contains(w.Body.String(), `"rejected":1`) {
+		t.Fatalf("expired commit must become an explicit rejected acknowledgement: %d %s", w.Code, w.Body.String())
+	}
+	var batches int64
+	if err := m.nginxEvidenceDB.Model(&NginxEvidenceIngestBatch{}).Count(&batches).Error; err != nil || batches != 1 {
+		t.Fatalf("expired evidence decision is not durable: batches=%d err=%v", batches, err)
+	}
+	var state NginxEvidenceFileState
+	if err := m.nginxEvidenceDB.First(&state, "node = ? AND source_kind = ? AND source_epoch = ? AND source_file_id = ?", "master", "access", testSourceEpoch, testSourceFile).Error; err != nil || state.LastEndOffset != 10 || state.GapCount != 1 || state.LastGapStartOffset != 0 || state.LastGapEndOffset != 10 {
+		t.Fatalf("expired evidence did not advance an audited gap: state=%+v err=%v", state, err)
+	}
+	if err := m.storeDB.Model(&NginxSourceFileWatermark{}).
+		Where("node = ? AND kind = ? AND source_epoch = ? AND file_id = ?", "master", "access", testSourceEpoch, testSourceFile).
+		Update("next_offset", 20).Error; err != nil {
+		t.Fatal(err)
+	}
+	successor := validEvidenceBatch()
+	successor.BatchID = "v2_evidence_expired_next_abcdefgh"
+	successor.Events[0].EventID = strings.Repeat("c", 64)
+	successor.Source.Protocol, successor.Source.SourceEpoch = 2, testSourceEpoch
+	successor.Source.FileID, successor.Source.StartOffset, successor.Source.EndOffset, successor.Source.ContentSHA256 = testSourceFile, 10, 20, testContentB
+	if w := postNginxEvidence(t, m, successor); w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"rejected":1`) {
+		t.Fatalf("expired successor was poisoned by the first gap: %d %s", w.Code, w.Body.String())
+	}
+	if err := m.nginxEvidenceDB.First(&state, "node = ? AND source_kind = ? AND source_epoch = ? AND source_file_id = ?", "master", "access", testSourceEpoch, testSourceFile).Error; err != nil || state.LastEndOffset != 20 || state.GapCount != 2 || state.LastGapStartOffset != 10 || state.LastGapEndOffset != 20 {
+		t.Fatalf("expired successor did not advance independently: state=%+v err=%v", state, err)
+	}
+}
+
+func TestNginxEvidenceV2AuditsMissingOutboxRangeBeforeAcceptingExactCommit(t *testing.T) {
+	m := newTestMonitor(t)
+	m.cfg.NginxSourceV2Enabled = true
+	m.cfg.NginxSourceV2CutoverEnabled = true
+	m.cfg.NginxSourceV2AllowedNodes = []string{"master"}
+	m.cfg.NginxSourceV2AllowedLanes = []string{"master:access"}
+	migrateTestNginxSourceV2(t, m.storeDB)
+	enableTestNginxEvidence(t, m)
+	registerTestManifest(t, m.storeDB, "access", 0)
+	evidence := validEvidenceBatch()
+	evidence.BatchID = "v2_evidence_after_spool_gap_abcdefgh"
+	evidence.Source.Protocol, evidence.Source.SourceEpoch = 2, testSourceEpoch
+	evidence.Source.FileID, evidence.Source.StartOffset, evidence.Source.EndOffset, evidence.Source.ContentSHA256 = testSourceFile, 10, 20, testContentB
+	if err := m.storeDB.Model(&NginxSourceFileWatermark{}).
+		Where("node = ? AND kind = ? AND source_epoch = ? AND file_id = ?", "master", "access", testSourceEpoch, testSourceFile).
+		Updates(map[string]any{"next_offset": 20, "batches": 2}).Error; err != nil {
+		t.Fatal(err)
+	}
+	commit := NginxSourceCommitV2{Node: "master", Kind: "access", BatchID: evidence.BatchID, SourceEpoch: testSourceEpoch, FileID: testSourceFile,
+		StartOffset: 10, EndOffset: 20, ContentHash: testContentB, PayloadHash: testPayloadA, ReceivedAt: time.Now().Unix()}
+	if err := m.storeDB.Create(&commit).Error; err != nil {
+		t.Fatal(err)
+	}
+	if w := postNginxEvidence(t, m, evidence); w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"accepted":1`) {
+		t.Fatalf("exact post-gap commit rejected: %d %s", w.Code, w.Body.String())
+	}
+	var state NginxEvidenceFileState
+	if err := m.nginxEvidenceDB.First(&state, "node = ? AND source_kind = ? AND source_epoch = ? AND source_file_id = ?", "master", "access", testSourceEpoch, testSourceFile).Error; err != nil || state.LastEndOffset != 20 || state.GapCount != 1 || state.LastGapStartOffset != 0 || state.LastGapEndOffset != 10 {
+		t.Fatalf("missing outbox range was not audited before acceptance: state=%+v err=%v", state, err)
 	}
 }
 

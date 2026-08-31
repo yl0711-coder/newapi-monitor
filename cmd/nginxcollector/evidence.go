@@ -26,10 +26,13 @@ const evidenceSchemaVersion = 1
 const maxEvidenceBatchFileBytes int64 = 4 << 20
 
 type evidenceSourceRange struct {
+	Protocol                     int    `json:"protocol,omitempty"`
+	SourceEpoch                  string `json:"source_epoch,omitempty"`
 	Kind                         string `json:"kind"`
 	FileID                       string `json:"file_id"`
 	StartOffset                  int64  `json:"start_offset"`
 	EndOffset                    int64  `json:"end_offset"`
+	ContentSHA256                string `json:"content_sha256,omitempty"`
 	FirstEventMS                 int64  `json:"first_event_ms"`
 	LastEventMS                  int64  `json:"last_event_ms"`
 	CursorDiscontinuities        int64  `json:"cursor_discontinuities"`
@@ -309,7 +312,11 @@ func makeEvidenceEvent(c config, data []byte, raw rawLine, row sample, inode uin
 		return evidenceEvent{}, false
 	}
 	identity := sha256.New()
-	_, _ = fmt.Fprintf(identity, "%s:%d:%d:", c.node, inode, offset)
+	if c.sourceV2Epoch != "" && c.sourceV2FileID != "" {
+		_, _ = fmt.Fprintf(identity, "v2:%s:%s:%s:%d:", c.node, c.sourceV2Epoch, c.sourceV2FileID, offset)
+	} else {
+		_, _ = fmt.Fprintf(identity, "%s:%d:%d:", c.node, inode, offset)
+	}
 	_, _ = identity.Write(lineDigest[:])
 	eventID := hex.EncodeToString(identity.Sum(nil))
 	return evidenceEvent{
@@ -345,8 +352,12 @@ func evidencePayloadHash(in evidenceBatch) string {
 }
 
 func newEvidenceBatch(c config, batchID string, inode uint64, start, end, firstMS, lastMS int64, events []evidenceEvent, value cursor) *evidenceBatch {
+	protocol, sourceEpoch, fileID := 0, "", strconv.FormatUint(inode, 10)
+	if c.sourceV2Epoch != "" && c.sourceV2FileID != "" {
+		protocol, sourceEpoch, fileID = sourceCursorVersionV2, c.sourceV2Epoch, c.sourceV2FileID
+	}
 	payload := &evidenceBatch{SchemaVersion: evidenceSchemaVersion, Node: c.node, BatchID: batchID, LogSchema: value.LastLogSchema, HMACKeyID: c.evidenceHMACKeyID,
-		Source: evidenceSourceRange{Kind: "access", FileID: strconv.FormatUint(inode, 10), StartOffset: start, EndOffset: end, FirstEventMS: firstMS, LastEventMS: lastMS,
+		Source: evidenceSourceRange{Protocol: protocol, SourceEpoch: sourceEpoch, Kind: "access", FileID: fileID, StartOffset: start, EndOffset: end, FirstEventMS: firstMS, LastEventMS: lastMS,
 			CursorDiscontinuities: value.Discontinuities, LastCursorDiscontinuity: value.LastDiscontinuityAt, DiscardedLines: value.DiscardedLines, LastDiscardedAt: value.LastDiscardedAt,
 			EvidenceEligible: value.EvidenceEligible, EvidenceParseRejected: value.EvidenceParseRejected, LastEvidenceParseRejectedAt: value.LastEvidenceParseRejectedAt,
 			EvidencePersistFailures: value.EvidencePersistFailures, EvidenceDroppedEvents: value.EvidenceDroppedEvents,

@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -15,6 +17,30 @@ import (
 
 func fixtureLine(ts int64, uri, status string) string {
 	return fmt.Sprintf(`{"msec":"%d.250","request_method":"POST","uri":"%s","status":"%s","request_time":"0.250","upstream_status":"%s","upstream_response_time":"0.200","bytes_sent":"123","request_id":"secret-request-id"}`, ts, uri, status, status)
+}
+
+func TestV1HeartbeatIDAndBoundaryAckAreRolloutSafe(t *testing.T) {
+	now := time.Unix(1_800_000_000, 0)
+	legacy := heartbeatBatch(config{node: "master"}, now, cursor{Device: 7, Inode: 91, Offset: 123})
+	wantDigest := sha256.Sum256([]byte(fmt.Sprintf("heartbeat:%s:%d", "master", now.Unix()/60)))
+	if want := "hb_" + hex.EncodeToString(wantDigest[:16]); legacy.BatchID != want || legacy.SourceBoundary != nil {
+		t.Fatalf("default heartbeat changed: got=%s boundary=%+v want=%s", legacy.BatchID, legacy.SourceBoundary, want)
+	}
+	payload := heartbeatBatch(config{node: "master", sourceV2Prepare: true}, now, cursor{Device: 7, Inode: 91, Offset: 123})
+	missing := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer missing.Close()
+	if err := postBatch(context.Background(), config{sinkURL: missing.URL, token: "secret"}, payload); err == nil {
+		t.Fatal("prepare mode trusted a response without an exact boundary ack")
+	}
+	exact := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = fmt.Fprintf(w, `{"ok":true,"source_boundary_ack":{"protocol":1,"batch_id":%q,"device":7,"inode":91,"start_offset":123,"end_offset":123,"checkpoint":true}}`, payload.BatchID)
+	}))
+	defer exact.Close()
+	if err := postBatch(context.Background(), config{sinkURL: exact.URL, token: "secret"}, payload); err != nil {
+		t.Fatalf("exact boundary acknowledgement rejected: %v", err)
+	}
 }
 
 func TestParseLineKeepsOnlySanitizedAggregate(t *testing.T) {
@@ -143,6 +169,26 @@ func TestRunOnceOnlyAdvancesCursorAfterAcceptedBatch(t *testing.T) {
 	}
 	if got, err := loadCursor(cursorPath); err != nil || got.Offset != int64(len(line)) {
 		t.Fatalf("成功后应推进到文件尾: %+v", got)
+	}
+}
+
+func TestRunOncePrepareDoesNotAdvanceOnMissingBoundaryAck(t *testing.T) {
+	dir := t.TempDir()
+	logPath, cursorPath := filepath.Join(dir, "access.jsonl"), filepath.Join(dir, "cursor.json")
+	line := fixtureLine(time.Now().Unix(), "/v1/responses", "200") + "\n"
+	if err := os.WriteFile(logPath, []byte(line), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sink := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer sink.Close()
+	cfg := config{node: "master", logPath: logPath, cursorPath: cursorPath, sinkURL: sink.URL, token: "secret", maxLines: 100, retentionDays: 7, sourceV2Prepare: true}
+	if err := runOnce(context.Background(), cfg); err == nil {
+		t.Fatal("prepare mode advanced without an exact source boundary acknowledgement")
+	}
+	if got, err := loadCursor(cursorPath); err != nil || got.Offset != 0 || got.LastAckedBatchID != "" {
+		t.Fatalf("prepare failure changed the durable cursor: cursor=%+v err=%v", got, err)
 	}
 }
 
@@ -318,19 +364,53 @@ func TestBatchIDIncludesContentDigest(t *testing.T) {
 	}
 }
 
+func TestV1AccessBatchIDRemainsCompatibleAfterDeviceBoundaryUpgrade(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "access.jsonl")
+	line := fixtureLine(time.Now().Unix(), "/v1/responses", "200") + "\n"
+	if err := os.WriteFile(path, []byte(line), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	defaultPayload, _, ok, err := readBatch(config{node: "master", logPath: path, maxLines: 100, retentionDays: 7}, cursor{})
+	if err != nil || !ok || defaultPayload.SourceBoundary != nil {
+		t.Fatalf("default-off collector changed v1 envelope: ok=%v boundary=%+v err=%v", ok, defaultPayload.SourceBoundary, err)
+	}
+	payload, _, ok, err := readBatch(config{node: "master", logPath: path, maxLines: 100, retentionDays: 7, sourceV2Prepare: true}, cursor{})
+	if err != nil || !ok {
+		t.Fatalf("read: ok=%v err=%v", ok, err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lineDigest := sha256.Sum256([]byte(line))
+	contentDigest := sha256.Sum256(lineDigest[:])
+	identity := sha256.New()
+	_, _ = fmt.Fprintf(identity, "master:%d:0:%d:", fileInode(info), len(line))
+	_, _ = identity.Write(contentDigest[:])
+	want := hex.EncodeToString(identity.Sum(nil))
+	if payload.BatchID != want || payload.SourceBoundary == nil || payload.SourceBoundary.Device == 0 {
+		t.Fatalf("v1 compatibility changed: got=%s want=%s boundary=%+v", payload.BatchID, want, payload.SourceBoundary)
+	}
+}
+
 func TestLoadConfigRejectsUnsafeOrAmbiguousValues(t *testing.T) {
 	for _, key := range []string{
 		"NGINXCOLLECTOR_NODE", "NGINXCOLLECTOR_SINK_URL", "NGINXCOLLECTOR_TOKEN",
 		"NGINXCOLLECTOR_INTERVAL_SECONDS", "NGINXCOLLECTOR_MAX_LINES", "NGINXCOLLECTOR_RETENTION_DAYS",
 		"NGINXCOLLECTOR_ALLOW_INSECURE_HTTP",
+		"NGINXCOLLECTOR_SOURCE_V2_PREPARE", "NGINXCOLLECTOR_SOURCE_V2_LANES", "NGINXCOLLECTOR_SOURCE_V2_BASE_URL",
+		"NGINXCOLLECTOR_SOURCE_V2_ACCESS_CURSOR_PATH", "NGINXCOLLECTOR_SOURCE_V2_ERROR_CURSOR_PATH",
 	} {
 		t.Setenv(key, "")
 	}
 	t.Setenv("NGINXCOLLECTOR_NODE", "master")
 	t.Setenv("NGINXCOLLECTOR_TOKEN", "secret")
 	t.Setenv("NGINXCOLLECTOR_SINK_URL", "https://monitor.example/internal/nginx")
-	if _, err := loadConfig(); err != nil {
+	if cfg, err := loadConfig(); err != nil {
 		t.Fatalf("安全默认配置应通过: %v", err)
+	} else if cfg.sourceV2Prepare {
+		t.Fatal("source v2 preparation must default off")
 	}
 	t.Setenv("NGINXCOLLECTOR_SINK_URL", "http://monitor.example/internal/nginx")
 	if _, err := loadConfig(); err == nil {
@@ -343,6 +423,33 @@ func TestLoadConfigRejectsUnsafeOrAmbiguousValues(t *testing.T) {
 	t.Setenv("NGINXCOLLECTOR_MAX_LINES", "not-a-number")
 	if _, err := loadConfig(); err == nil {
 		t.Fatal("错误整数不能静默回落，否则会改变批次边界")
+	}
+}
+
+func TestLoadConfigRequiresExplicitSafeSourceV2LaneConfiguration(t *testing.T) {
+	for _, key := range []string{"NGINXCOLLECTOR_ERROR_ENABLED", "NGINXCOLLECTOR_ERROR_SINK_URL", "NGINXCOLLECTOR_SOURCE_V2_LANES", "NGINXCOLLECTOR_SOURCE_V2_PREPARE", "NGINXCOLLECTOR_SOURCE_V2_BASE_URL"} {
+		t.Setenv(key, "")
+	}
+	t.Setenv("NGINXCOLLECTOR_NODE", "master")
+	t.Setenv("NGINXCOLLECTOR_TOKEN", "secret")
+	t.Setenv("NGINXCOLLECTOR_SINK_URL", "https://monitor.example/internal/nginx")
+	t.Setenv("NGINXCOLLECTOR_SOURCE_V2_LANES", "access")
+	if _, err := loadConfig(); err == nil {
+		t.Fatal("v2 lane must not start without prepare boundary mode")
+	}
+	t.Setenv("NGINXCOLLECTOR_SOURCE_V2_PREPARE", "true")
+	t.Setenv("NGINXCOLLECTOR_SOURCE_V2_BASE_URL", "https://monitor.example/internal/nginx")
+	if _, err := loadConfig(); err == nil {
+		t.Fatal("v2 base URL with an endpoint path must be rejected")
+	}
+	t.Setenv("NGINXCOLLECTOR_SOURCE_V2_BASE_URL", "https://monitor.example")
+	cfg, err := loadConfig()
+	if err != nil || !cfg.sourceV2Access || cfg.sourceV2Error {
+		t.Fatalf("explicit access-only v2 lane rejected: cfg=%+v err=%v", cfg, err)
+	}
+	t.Setenv("NGINXCOLLECTOR_SOURCE_V2_LANES", "access,error")
+	if _, err := loadConfig(); err == nil {
+		t.Fatal("error v2 lane must require the independent error collector")
 	}
 }
 

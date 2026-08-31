@@ -31,15 +31,17 @@ type errorSample struct {
 }
 
 type errorBatch struct {
-	Node                      string        `json:"node"`
-	BatchID                   string        `json:"batch_id"`
-	Samples                   []errorSample `json:"samples"`
-	BacklogBytes              int64         `json:"backlog_bytes"`
-	BacklogKnown              bool          `json:"backlog_known"`
-	CursorDiscontinuities     int64         `json:"cursor_discontinuities"`
-	LastCursorDiscontinuityAt int64         `json:"last_cursor_discontinuity_at"`
-	DiscardedLines            int64         `json:"discarded_lines"`
-	LastDiscardedAt           int64         `json:"last_discarded_at"`
+	Node                      string            `json:"node"`
+	BatchID                   string            `json:"batch_id"`
+	Samples                   []errorSample     `json:"samples"`
+	BacklogBytes              int64             `json:"backlog_bytes"`
+	BacklogKnown              bool              `json:"backlog_known"`
+	CursorDiscontinuities     int64             `json:"cursor_discontinuities"`
+	LastCursorDiscontinuityAt int64             `json:"last_cursor_discontinuity_at"`
+	DiscardedLines            int64             `json:"discarded_lines"`
+	LastDiscardedAt           int64             `json:"last_discarded_at"`
+	SourceBoundary            *sourceBoundaryV1 `json:"source_boundary,omitempty"`
+	SourceRangeV2             *sourceRangeV2    `json:"source_range_v2,omitempty"`
 }
 
 var allowedErrorSeverities = map[string]bool{
@@ -119,7 +121,7 @@ func readErrorBatch(c config, value cursor) (errorBatch, cursor, bool, error) {
 	}
 	defer file.Close()
 	info, err := file.Stat()
-	if err != nil || fileInode(info) != target.inode {
+	if err != nil || fileDevice(info) != target.device || fileInode(info) != target.inode {
 		return errorBatch{}, original, false, fmt.Errorf("nginx error log rotated during scan")
 	}
 	if _, err := file.Seek(value.Offset, io.SeekStart); err != nil {
@@ -178,11 +180,15 @@ func readErrorBatch(c config, value cursor) (errorBatch, cursor, bool, error) {
 		rows = append(rows, row)
 	}
 	identity := sha256.New()
+	// Preserve the deployed v1 BatchID algorithm across collector upgrades.
 	_, _ = fmt.Fprintf(identity, "error:%s:%d:%d:%d:", c.node, target.inode, start, end)
 	_, _ = identity.Write(content.Sum(nil))
 	next := value
-	next.Version, next.Inode, next.Offset = cursorVersion, target.inode, end
+	next.Version, next.Device, next.Inode, next.Offset = cursorVersion, target.device, target.inode, end
 	payload := errorBatch{Node: c.node, BatchID: hex.EncodeToString(identity.Sum(nil)), Samples: rows}
+	if c.sourceV2Prepare {
+		payload.SourceBoundary = &sourceBoundaryV1{Device: target.device, Inode: target.inode, StartOffset: start, EndOffset: end}
+	}
 	payload.CursorDiscontinuities, payload.LastCursorDiscontinuityAt = next.Discontinuities, next.LastDiscontinuityAt
 	payload.DiscardedLines, payload.LastDiscardedAt = next.DiscardedLines, next.LastDiscardedAt
 	payload.BacklogBytes, payload.BacklogKnown = collectorTelemetry(config{logPath: c.errorLogPath}, next)
@@ -208,9 +214,21 @@ func postErrorBatch(ctx context.Context, c config, payload errorBatch) error {
 		return err
 	}
 	defer resp.Body.Close()
-	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4<<10))
+	data, readErr := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
+	if readErr != nil {
+		return readErr
+	}
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("monitor error sink returned HTTP %d", resp.StatusCode)
+	}
+	if payload.SourceBoundary != nil {
+		var response struct {
+			OK                bool                 `json:"ok"`
+			SourceBoundaryAck *sourceBoundaryAckV1 `json:"source_boundary_ack"`
+		}
+		if json.Unmarshal(data, &response) != nil || !response.OK || !validSourceBoundaryAckV1(response.SourceBoundaryAck, batch{Node: payload.Node, BatchID: payload.BatchID, SourceBoundary: payload.SourceBoundary}) {
+			return errors.New("monitor error sink did not acknowledge the exact source boundary")
+		}
 	}
 	return nil
 }
@@ -225,6 +243,9 @@ func runErrorOnce(ctx context.Context, c config) error {
 		return err
 	}
 	if !ok {
+		if !c.sourceV2Prepare {
+			next.Device = 0
+		}
 		if next != current {
 			return saveCursor(c.errorCursorPath, next)
 		}
@@ -233,12 +254,24 @@ func runErrorOnce(ctx context.Context, c config) error {
 	if err := postErrorBatch(ctx, c, payload); err != nil {
 		return err
 	}
+	if payload.SourceBoundary != nil {
+		next.LastAckedBatchID, next.LastAckedDevice, next.LastAckedInode, next.LastAckedOffset = payload.BatchID, payload.SourceBoundary.Device, payload.SourceBoundary.Inode, payload.SourceBoundary.EndOffset
+	} else {
+		next.Device = 0
+	}
 	return saveCursor(c.errorCursorPath, next)
 }
 
 func errorHeartbeatBatch(c config, now time.Time, value cursor) errorBatch {
-	digest := sha256.Sum256([]byte(fmt.Sprintf("error-heartbeat:%s:%d", c.node, now.Unix()/60)))
+	identity := fmt.Sprintf("error-heartbeat:%s:%d", c.node, now.Unix()/60)
+	if c.sourceV2Prepare {
+		identity = fmt.Sprintf("error-heartbeat:%s:%d:%d:%d:%d", c.node, now.Unix()/60, value.Device, value.Inode, value.Offset)
+	}
+	digest := sha256.Sum256([]byte(identity))
 	payload := errorBatch{Node: c.node, BatchID: "ehb_" + hex.EncodeToString(digest[:16]), Samples: []errorSample{}}
+	if c.sourceV2Prepare && value.Inode != 0 {
+		payload.SourceBoundary = &sourceBoundaryV1{Device: value.Device, Inode: value.Inode, StartOffset: value.Offset, EndOffset: value.Offset, Checkpoint: true}
+	}
 	payload.CursorDiscontinuities, payload.LastCursorDiscontinuityAt = value.Discontinuities, value.LastDiscontinuityAt
 	payload.DiscardedLines, payload.LastDiscardedAt = value.DiscardedLines, value.LastDiscardedAt
 	payload.BacklogBytes, payload.BacklogKnown = collectorTelemetry(config{logPath: c.errorLogPath}, value)
@@ -258,8 +291,42 @@ func runErrorWorker(ctx context.Context, c config) {
 			current, cursorErr := loadCursor(c.errorCursorPath)
 			if cursorErr != nil {
 				log.Printf("nginxcollector error lane: 独立游标无法安全读取，已停止心跳: %v", cursorErr)
-			} else if err := postErrorBatch(ctx, c, errorHeartbeatBatch(c, now, current)); err != nil {
-				log.Printf("nginxcollector error lane: 心跳发送失败，将自动重试: %v", err)
+			} else {
+				payload := errorHeartbeatBatch(c, now, current)
+				if err := postErrorBatch(ctx, c, payload); err != nil {
+					log.Printf("nginxcollector error lane: 心跳发送失败，将自动重试: %v", err)
+				} else {
+					if payload.SourceBoundary != nil {
+						current.LastAckedBatchID, current.LastAckedDevice, current.LastAckedInode, current.LastAckedOffset = payload.BatchID, payload.SourceBoundary.Device, payload.SourceBoundary.Inode, payload.SourceBoundary.EndOffset
+						if err := saveCursor(c.errorCursorPath, current); err != nil {
+							log.Printf("nginxcollector error lane: 心跳边界持久化失败，将重发: %v", err)
+							continue
+						}
+					}
+					nextHeartbeat = now.Add(time.Minute)
+				}
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+func runErrorSourceV2Worker(ctx context.Context, c config, client *sourceV2HTTPClient) {
+	ticker := time.NewTicker(c.interval)
+	defer ticker.Stop()
+	var nextHeartbeat time.Time
+	for {
+		if err := runErrorSourceV2Once(ctx, c, c.errorV2Cursor, client); err != nil && !errors.Is(err, os.ErrNotExist) && ctx.Err() == nil {
+			log.Printf("nginxcollector error lane: source v2 本轮未推进，将自动重试: %v", err)
+		}
+		now := time.Now()
+		if !now.Before(nextHeartbeat) && ctx.Err() == nil {
+			if err := runSourceV2Heartbeat(ctx, c, c.errorLogPath, c.errorCursorPath, c.errorV2Cursor, "error", client); err != nil {
+				log.Printf("nginxcollector error lane: source v2 心跳失败，将自动重试: %v", err)
 			} else {
 				nextHeartbeat = now.Add(time.Minute)
 			}

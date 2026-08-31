@@ -134,7 +134,7 @@ Nginx 容器以读写方式挂载到 `/var/log/nexusapi-monitor`，采集器把�
 参考 logrotate 基线（每节点）：
 
 ```text
-/opt/nexusapi/logs/nginx-monitor/nexusapi_access.jsonl {
+/opt/nexusapi/logs/nginx-monitor/nexusapi_access.jsonl /opt/nexusapi/logs/nginx-monitor/error.log {
     daily
     maxsize 50M
     rotate 8
@@ -144,12 +144,30 @@ Nginx 容器以读写方式挂载到 `/var/log/nexusapi-monitor`，采集器把�
     create 0640 root nexus-monitor
     sharedscripts
     postrotate
-        /usr/bin/docker kill -s USR1 nexusapi-nginx >/dev/null 2>&1 || true
+        /usr/local/sbin/nexusapi-nginxreopen \
+          -container nexusapi-nginx \
+          -collector-container nexusapi-nginxcollector \
+          -log-dir /opt/nexusapi/logs/nginx-monitor \
+          -logs nexusapi_access.jsonl,error.log \
+          -log-gid <nexus-monitor 数字 GID> \
+          -probe-url http://127.0.0.1:<本机 Nginx 端口>/api/status
     endscript
 }
 ```
 
-8 份未压缩日志用来覆盖默认 7 天留存和较长故障恢复；实际保留天数改动时，
+`nexusapi-nginxreopen` 必须由本仓库 `cmd/nginxreopen` 构建并以 root 安装，
+不得换回直接 `docker kill ... || true`。它只向既有 Nginx master 发 USR1，
+不 reload/restart；但任何权限、collector 可读性、worker FD、容器身份或本地探针校验失败
+都必须让 logrotate 失败。成功后它会原子写入 root 所有的
+`.nginx-writer-release-v2.json`，source v2 只依据这份 inode 证明退役已读完且已消失的旧日志。
+生产 Nginx 容器必须由 root Nginx master 直接作为 PID1；不得再套 shell、tini
+或其他 supervisor，否则安全校验会按设计失败关闭。
+该工具仅支持 Linux `/proc` 和 Docker host PID 语义，不支持 userns-remap。
+如 postrotate 失败，不会中断用户请求，但必须立即告警、保留旧 inode 并暂停后续轮转；
+严禁用 `|| true` 掩盖失败，以免留存删除尚未完整采集的日志。
+
+8 份未压缩日志只是起始基线，不是必然覆盖 7 天；正式数值必须按峰值 bytes/hour
+乘最长恢复窗口实测计算，并配置磁盘 70%/80%、inode 和轮转失败告警。实际保留窗口改动时，
 logrotate 保留份数、`NGINXCOLLECTOR_RETENTION_DAYS` 和
 `MONITOR_NGINX_RETENTION_DAYS` 必须一起调整。这份日志不含 IP、Key、query、请求体或响应体；
 schema 2 含短期 Request ID 原值，因此必须只对宿主机管理员和专用
@@ -244,6 +262,29 @@ HTTP 重定向，避免 Bearer token 被带到非预期主机。只有经过核�
 回滚 NewAPI，并用备份的 compose、Nginx 模板和固定旧镜像摘要恢复 Nginx。完成节点直测后
 才允许回挂。若 Monitor 入口已经启用，可先恢复 `MONITOR_NGINX_ENABLED=false`；这不会影响
 NewAPI、数据库、模型监控、用户用量或渠道管理。
+
+### Source v2 逐 lane 切换与恢复
+
+Source v2 是日志源连续性协议，默认不启用。切换单位是“节点 + access/error lane”，
+不得一次切换整个节点或两个节点。必须按以下顺序执行：
+
+1. Monitor 先只设置 `MONITOR_NGINX_SOURCE_V2_ENABLED=true`，保持
+   `MONITOR_NGINX_SOURCE_V2_CUTOVER_ENABLED=false`；完成隔离 schema 迁移和备份校验。
+2. 采集器只设置 `NGINXCOLLECTOR_SOURCE_V2_PREPARE=true`，保持
+   `NGINXCOLLECTOR_SOURCE_V2_LANES=` 为空。确认 access/error 的 v1 边界都得到精确 ACK，
+   且游标卷、writer-release proof、积压和不连续计数正常。
+3. Monitor 只把候选 lane 放入 `MONITOR_NGINX_SOURCE_V2_ALLOWED_LANES`，临时开启
+   `MONITOR_NGINX_SOURCE_V2_CUTOVER_ENABLED=true`；采集器只把同一 lane 写入
+   `NGINXCOLLECTOR_SOURCE_V2_LANES`。
+4. manifest 持久化成功后立即关闭 `MONITOR_NGINX_SOURCE_V2_CUTOVER_ENABLED`，防止新 lane
+   误切换。已切换 lane 会继续运行，这个闸门不得用作回滚开关。
+5. 至少观察心跳、confirmed offset、backlog、gap/lost、discarded lines 和源端日志行数。
+   全部符合基线后，才允许复制同一流程切换下一 lane。
+
+manifest 一旦持久化，该 lane 不能通过删环境变量或回退二进制恢复 v1。
+切换后发生故障时，先停止该 lane 采集器并保留日志和游标卷，优先前向修复。
+只有在采集器已停止、日志不再增长的受控恢复窗口，才能把 Monitor 主库、事实库和
+access/error 游标卷恢复到同一个已校验的时点；严禁只恢复其中一份。
 
 ## 日志轮转与连续性
 

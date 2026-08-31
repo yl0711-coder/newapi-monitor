@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,6 +16,28 @@ import (
 	"testing"
 	"time"
 )
+
+func TestEvidenceV2EventIdentityUsesEpochAndFileID(t *testing.T) {
+	data := []byte(`{"log_schema":2,"upstream_status":"200","nginx_request_id":"n","oneapi_request_id":"o","request_completion":"OK","upstream_connect_time":"0.1","upstream_header_time":"0.2"}`)
+	digest := sha256.Sum256(data)
+	raw := rawLine{Method: "POST"}
+	row := sample{Route: "/v1/responses", Method: "POST", Status: 200, UpstreamStatus: 200, RequestTimeSumMS: 300, UpstreamTimeSumMS: 200, UpstreamTimeCount: 1}
+	epoch := "0123456789abcdef0123456789abcdef"
+	firstConfig := config{node: "master", evidenceMode: "pilot", evidenceHMACKey: []byte(strings.Repeat("k", 32)), sourceV2Epoch: epoch, sourceV2FileID: epoch + "-0000000000000001"}
+	secondConfig := firstConfig
+	secondConfig.sourceV2FileID = epoch + "-0000000000000002"
+	first, ok := makeEvidenceEvent(firstConfig, data, raw, row, 42, 100, digest)
+	if !ok {
+		t.Fatal("first v2 evidence event rejected")
+	}
+	second, ok := makeEvidenceEvent(secondConfig, data, raw, row, 42, 100, digest)
+	if !ok {
+		t.Fatal("second v2 evidence event rejected")
+	}
+	if first.EventID == second.EventID {
+		t.Fatal("v2 evidence event identity collided across manifest files with the same inode and offset")
+	}
+}
 
 func evidenceConfig(dir string) config {
 	return config{
@@ -312,6 +335,38 @@ func TestCorruptEvidenceHeadIsQuarantinedAndDoesNotBlockNextBatch(t *testing.T) 
 	paths, err := listEvidenceOutbox(cfg.evidenceOutboxPath)
 	if err != nil || len(paths) != 0 {
 		t.Fatalf("valid successor was not delivered: paths=%v err=%v", paths, err)
+	}
+}
+
+func TestUnknownGoneResponseDoesNotDiscardEvidence(t *testing.T) {
+	dir := t.TempDir()
+	cfg := evidenceConfig(dir)
+	payload := evidenceBatch{SchemaVersion: evidenceSchemaVersion, Node: "master", BatchID: "expired_source_commit_abcdefgh", LogSchema: 1, HMACKeyID: "key-1",
+		Source: evidenceSourceRange{Protocol: 2, SourceEpoch: strings.Repeat("a", 32), Kind: "access", FileID: strings.Repeat("a", 32) + "-0000000000000001", StartOffset: 0, EndOffset: 100, ContentSHA256: strings.Repeat("b", 64)}, Events: []evidenceEvent{}}
+	payload.PayloadHash = evidencePayloadHash(payload)
+	if err := spoolEvidence(cfg, payload); err != nil {
+		t.Fatal(err)
+	}
+	sink := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusGone)
+		_, _ = w.Write([]byte(`{"error":"evidence source commit expired"}`))
+	}))
+	defer sink.Close()
+	cfg.evidenceSinkURL, cfg.token = sink.URL, "secret"
+	if err := drainEvidenceOnce(context.Background(), cfg); err == nil {
+		t.Fatal("unknown 410 must remain retryable")
+	}
+	paths, err := listEvidenceOutbox(cfg.evidenceOutboxPath)
+	if err != nil || len(paths) != 1 {
+		t.Fatalf("unknown 410 discarded active evidence: paths=%v err=%v", paths, err)
+	}
+	gap, err := loadGapState(cfg.evidenceOutboxPath)
+	if err != nil || gap.GapCount != 0 {
+		t.Fatalf("retryable 410 recorded a false gap: %+v err=%v", gap, err)
+	}
+	_, rejected, err := evidenceRejectedStats(cfg.evidenceOutboxPath)
+	if err != nil || rejected != 0 {
+		t.Fatalf("retryable 410 was quarantined: rejected=%d err=%v", rejected, err)
 	}
 }
 

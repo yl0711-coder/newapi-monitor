@@ -111,6 +111,30 @@ func TestCreateStoreBackupIsReadableAndPreservesData(t *testing.T) {
 	}
 }
 
+func TestRuntimeBackupSetUsesSourceV2MigrationPlanAfterSchemaEnable(t *testing.T) {
+	dir := t.TempDir()
+	m := &Monitor{cfg: Settings{
+		StorePath: filepath.Join(dir, "main.db"), UsageFactsStorePath: filepath.Join(dir, "facts.db"),
+		StoreBackupEnabled: true, StoreBackupDir: filepath.Join(dir, "backups"), StoreBackupRetention: 2,
+		NginxSourceV2Enabled: true,
+	}}
+	if err := m.openStore(m.cfg.StorePath); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(m.Close)
+	manifestPath, err := m.createStoreBackupSet(context.Background(), time.Date(2026, 8, 31, 6, 0, 0, 0, time.UTC), true, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest, err := verifyStoreBackupSetManifest(context.Background(), manifestPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if manifest.MigrationPlan != preMigrationSourceV2PlanID {
+		t.Fatalf("v22 runtime backup was mislabeled: got=%q want=%q", manifest.MigrationPlan, preMigrationSourceV2PlanID)
+	}
+}
+
 func TestUsageFactsStoreIsIndependentBackedUpAndFailureIsolated(t *testing.T) {
 	dir := t.TempDir()
 	mainPath := filepath.Join(dir, "monitor.db")

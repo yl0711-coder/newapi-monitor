@@ -859,6 +859,38 @@ func (m *Monitor) openStore(path string) error {
 	); err != nil {
 		return fmt.Errorf("表迁移失败: %w", err)
 	}
+	if m.cfg.NginxSourceV2Enabled {
+		if err := migrateNginxSourceV2Schema(db); err != nil {
+			return fmt.Errorf("Nginx source v2 隔离表迁移失败: %w", err)
+		}
+		m.nginxSourceV2SchemaReady.Store(true)
+	} else {
+		// A prior cutover is one-way. Merely disabling the rollout flag may stop
+		// v2 endpoints, but must not let a legacy collector write the same bytes.
+		ready, err := detectNginxSourceV2Schema(db)
+		if err != nil {
+			return fmt.Errorf("Nginx source v2 隔离表状态异常: %w", err)
+		}
+		m.nginxSourceV2SchemaReady.Store(ready)
+	}
+	if m.nginxSourceV2SchemaReady.Load() {
+		active, err := detectActiveNginxSourceV2Protocol(db)
+		if err != nil {
+			return fmt.Errorf("读取 Nginx source v2 持久切流状态失败: %w", err)
+		}
+		m.nginxSourceV2Active.Store(active)
+		configOK, err := nginxSourceV2RuntimeConfigMatches(db, m.cfg)
+		if err != nil {
+			return fmt.Errorf("校验 Nginx source v2 持久 lane 配置失败: %w", err)
+		}
+		m.nginxSourceV2RuntimeConfigOK.Store(configOK)
+		if active && !configOK {
+			slog.Error("Nginx source v2 已有不可逆切流 lane，但当前配置关闭或遗漏其白名单；采集将 fail-closed")
+		}
+	} else {
+		m.nginxSourceV2Active.Store(false)
+		m.nginxSourceV2RuntimeConfigOK.Store(true)
+	}
 	if err := migrateUsageMemberControls(db); err != nil {
 		return fmt.Errorf("用量成员控制层迁移失败: %w", err)
 	}

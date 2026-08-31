@@ -13,6 +13,9 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/glebarez/sqlite"
+	"gorm.io/gorm"
 )
 
 const legacyMainSchema = `
@@ -33,6 +36,26 @@ CREATE TABLE channel_upstream_accounts (
   provider TEXT NOT NULL,
   credential TEXT NOT NULL DEFAULT '',
   credential_version INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE nginx_ingest_batches (
+  node TEXT NOT NULL, batch_id TEXT NOT NULL, payload_hash TEXT NOT NULL DEFAULT '',
+  first_ts INTEGER, last_ts INTEGER, rows INTEGER, received_at INTEGER,
+  PRIMARY KEY (node, batch_id)
+);
+CREATE TABLE nginx_source_states (
+  node TEXT PRIMARY KEY, last_event_ts INTEGER, last_ingest_ts INTEGER,
+  last_batch_id TEXT, accepted_rows INTEGER, accepted_count INTEGER,
+  backlog_bytes INTEGER, backlog_known NUMERIC
+);
+CREATE TABLE nginx_error_ingest_batches (
+  node TEXT NOT NULL, batch_id TEXT NOT NULL, payload_hash TEXT NOT NULL DEFAULT '',
+  first_ts INTEGER, last_ts INTEGER, rows INTEGER, received_at INTEGER,
+  PRIMARY KEY (node, batch_id)
+);
+CREATE TABLE nginx_error_source_states (
+  node TEXT PRIMARY KEY, last_event_ts INTEGER, last_ingest_ts INTEGER,
+  last_batch_id TEXT, accepted_rows INTEGER, accepted_count INTEGER,
+  backlog_bytes INTEGER, backlog_known NUMERIC
 );`
 
 const legacyFactsSchema = `
@@ -282,6 +305,14 @@ INSERT INTO metric_samples(bucket_ts, channel_id, model_name, grp, success)
 VALUES (1700000000, 7, 'legacy-model', 'legacy-group', 3);
 INSERT INTO channel_upstream_accounts(domain, provider)
 VALUES ('legacy-upstream.example', 'sub2api');
+INSERT INTO nginx_ingest_batches(node,batch_id,payload_hash,received_at)
+VALUES ('master','legacy-access-batch','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',1700000000);
+INSERT INTO nginx_source_states(node,last_batch_id,accepted_rows,accepted_count)
+VALUES ('master','legacy-access-batch',1,3);
+INSERT INTO nginx_error_ingest_batches(node,batch_id,payload_hash,received_at)
+VALUES ('master','legacy-error-batch','bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',1700000000);
+INSERT INTO nginx_error_source_states(node,last_batch_id,accepted_rows,accepted_count)
+VALUES ('master','legacy-error-batch',1,2);
 INSERT INTO legacy_guard(id, value) VALUES (1, 'main-in-wal');`)
 	factsWriter := createLegacyWALStore(t, factsPath, legacyFactsSchema, `
 INSERT INTO usage_hour_facts(hour_ts, user_id, channel_id, grp, model_name, token_id, day_ts, token_name, requests, consume_quota)
@@ -293,6 +324,7 @@ INSERT INTO legacy_facts_guard(id, value) VALUES (1, 'facts-in-wal');`)
 		StoreBackupDir:                backupDir,
 		StoreBackupEnabled:            false, // migration snapshots are mandatory regardless of periodic backups
 		StoreMigrationBackupRetention: 3,
+		NginxSourceV2Enabled:          true,
 	}}
 	if err := m.openStore(mainPath); err != nil {
 		t.Fatalf("legacy migration with WAL snapshot failed: %v", err)
@@ -300,8 +332,23 @@ INSERT INTO legacy_facts_guard(id, value) VALUES (1, 'facts-in-wal');`)
 	if !m.storeDB.Migrator().HasColumn(&MetricSample{}, "traffic_class_version") ||
 		!m.storeDB.Migrator().HasTable(&ChannelTestHourSample{}) ||
 		!m.storeDB.Migrator().HasTable(&NewAPIUsageBackfillSegment{}) ||
-		!m.storeDB.Migrator().HasColumn(&ChannelUpstreamAccount{}, "usage_adapter") {
+		!m.storeDB.Migrator().HasColumn(&ChannelUpstreamAccount{}, "usage_adapter") ||
+		!m.storeDB.Migrator().HasTable(&NginxSourceBoundaryBatchV1{}) ||
+		!m.storeDB.Migrator().HasTable(&NginxSourceBoundaryStateV1{}) ||
+		!m.storeDB.Migrator().HasTable(&NginxCollectorProtocolState{}) ||
+		!m.storeDB.Migrator().HasTable(&NginxSourceRangeBatch{}) ||
+		!m.storeDB.Migrator().HasTable(&NginxSourceCommitV2{}) {
 		t.Fatal("current main schema was not migrated after the snapshot gate")
+	}
+	if m.storeDB.Migrator().HasColumn(&NginxIngestBatch{}, "source_device") || m.storeDB.Migrator().HasColumn(&NginxErrorIngestBatch{}, "source_device") {
+		t.Fatal("source continuity must not alter deployed nginx ingest batch tables")
+	}
+	var legacyAccess, legacyError int64
+	if err := m.storeDB.Model(&NginxIngestBatch{}).Where("batch_id = ?", "legacy-access-batch").Count(&legacyAccess).Error; err != nil || legacyAccess != 1 {
+		t.Fatalf("legacy access batch lost during migration: count=%d err=%v", legacyAccess, err)
+	}
+	if err := m.storeDB.Model(&NginxErrorIngestBatch{}).Where("batch_id = ?", "legacy-error-batch").Count(&legacyError).Error; err != nil || legacyError != 1 {
+		t.Fatalf("legacy error batch lost during migration: count=%d err=%v", legacyError, err)
 	}
 	if !m.usageFactsDB.Migrator().HasColumn(&UsageHourFact{}, "refund_records") {
 		t.Fatal("current facts schema was not migrated after the snapshot gate")
@@ -315,6 +362,9 @@ INSERT INTO legacy_facts_guard(id, value) VALUES (1, 'facts-in-wal');`)
 	if err != nil {
 		t.Fatalf("published snapshot set did not verify: %v", err)
 	}
+	if manifest.MigrationPlan != preMigrationSourceV2PlanID {
+		t.Fatalf("source-v2 enable must pin a distinct rollback plan: got=%q want=%q", manifest.MigrationPlan, preMigrationSourceV2PlanID)
+	}
 	if len(manifest.Stores) != 2 || !manifest.Stores[0].Present || !manifest.Stores[1].Present {
 		t.Fatalf("manifest must contain both existing stores: %+v", manifest.Stores)
 	}
@@ -327,7 +377,9 @@ INSERT INTO legacy_facts_guard(id, value) VALUES (1, 'facts-in-wal');`)
 	if sqliteHasColumn(t, mainSnapshot, "metric_samples", "traffic_class_version") ||
 		sqliteHasTable(t, mainSnapshot, "channel_test_hour_samples") ||
 		sqliteHasTable(t, mainSnapshot, "new_api_usage_backfill_segments") ||
-		sqliteHasColumn(t, mainSnapshot, "channel_upstream_accounts", "usage_adapter") {
+		sqliteHasColumn(t, mainSnapshot, "channel_upstream_accounts", "usage_adapter") ||
+		sqliteHasColumn(t, mainSnapshot, "nginx_ingest_batches", "source_device") ||
+		sqliteHasTable(t, mainSnapshot, "nginx_collector_protocol_states") {
 		t.Fatal("pre-migration main snapshot unexpectedly contains current schema")
 	}
 	factsSnapshot := openReadOnlyTestStore(t, filepath.Join(snapshots[0], preMigrationFactsSnapshotName))
@@ -355,6 +407,8 @@ INSERT INTO legacy_facts_guard(id, value) VALUES (1, 'facts-in-wal');`)
 	if sqliteHasColumn(t, restoredMain, "metric_samples", "traffic_class_version") ||
 		sqliteHasColumn(t, restoredMain, "channel_upstream_accounts", "usage_adapter") ||
 		sqliteHasTable(t, restoredMain, "new_api_usage_backfill_segments") ||
+		sqliteHasColumn(t, restoredMain, "nginx_ingest_batches", "source_device") ||
+		sqliteHasTable(t, restoredMain, "nginx_collector_protocol_states") ||
 		sqliteHasColumn(t, restoredFacts, "usage_hour_facts", "refund_records") {
 		t.Fatal("restored volume is not the pre-migration schema")
 	}
@@ -401,6 +455,118 @@ INSERT INTO legacy_facts_guard(id, value) VALUES (1, 'facts-in-wal');`)
 	if err := m3.openStore(mainPath); err == nil {
 		m3.Close()
 		t.Fatal("pinned snapshot reuse skipped current facts quick_check")
+	}
+}
+
+func TestPreMigrationPlanForStoreDetectsSourceV2SchemaState(t *testing.T) {
+	dir := t.TempDir()
+	mainPath := filepath.Join(dir, "monitor.db")
+	m := &Monitor{}
+
+	plan, err := m.preMigrationPlanForStore(context.Background(), mainPath)
+	if err != nil || plan != preMigrationPlanID {
+		t.Fatalf("missing store must retain default plan: plan=%q err=%v", plan, err)
+	}
+
+	db, err := sql.Open("sqlite", mainPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec("CREATE TABLE nginx_source_boundary_batch_v1 (id INTEGER PRIMARY KEY)"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.preMigrationPlanForStore(context.Background(), mainPath); err == nil || !strings.Contains(err.Error(), "1/7") {
+		t.Fatalf("partial source-v2 schema must block migration snapshot: %v", err)
+	}
+	m.cfg.NginxSourceV2Enabled = true
+	if _, err := m.preMigrationPlanForStore(context.Background(), mainPath); err == nil || !strings.Contains(err.Error(), "1/7") {
+		t.Fatalf("explicit source-v2 enable must not repair a partial schema: %v", err)
+	}
+	m.cfg.NginxSourceV2Enabled = false
+
+	db, err = sql.Open("sqlite", mainPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec("DROP TABLE nginx_source_boundary_batch_v1"); err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	gormDB, err := gorm.Open(sqlite.Open(mainPath), &gorm.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := migrateNginxSourceV2Schema(gormDB); err != nil {
+		t.Fatal(err)
+	}
+	sqlGormDB, err := gormDB.DB()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sqlGormDB.Close(); err != nil {
+		t.Fatal(err)
+	}
+	plan, err = m.preMigrationPlanForStore(context.Background(), mainPath)
+	if err != nil || plan != preMigrationSourceV2PlanID {
+		t.Fatalf("complete source-v2 schema must retain v22 plan after flag-off: plan=%q err=%v", plan, err)
+	}
+}
+
+func TestSourceV2PlanCreatesFreshRollbackSnapshotInsteadOfReusingV21(t *testing.T) {
+	dir := t.TempDir()
+	mainPath := filepath.Join(dir, "monitor.db")
+	factsPath := filepath.Join(dir, "usage-facts.db")
+	backupDir := filepath.Join(dir, "backups")
+	m := &Monitor{cfg: Settings{
+		StorePath: mainPath, UsageFactsStorePath: factsPath, StoreBackupDir: backupDir,
+		StoreMigrationBackupRetention: 3,
+	}}
+	db, err := sql.Open("sqlite", mainPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec("CREATE TABLE rollback_marker (id INTEGER PRIMARY KEY, value TEXT)"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec("INSERT INTO rollback_marker(id, value) VALUES (1, 'before-v21')"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	v21, err := m.createPreMigrationSnapshot(context.Background(), mainPath, factsPath, time.Now().Add(-time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.cfg.NginxSourceV2Enabled = true
+	v22, err := m.createPreMigrationSnapshot(context.Background(), mainPath, factsPath, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v22.Reused || v22.SnapshotDir == v21.SnapshotDir {
+		t.Fatalf("source-v2 enable reused the pre-v2 rollback point: v21=%+v v22=%+v", v21, v22)
+	}
+	snapshots := preMigrationSnapshotDirs(t, backupDir)
+	if len(snapshots) != 2 {
+		t.Fatalf("both rollback generations must remain available: %v", snapshots)
+	}
+	plans := map[string]bool{}
+	for _, snapshot := range snapshots {
+		manifest, _, err := loadAndVerifyPreMigrationSnapshot(context.Background(), snapshot)
+		if err != nil {
+			t.Fatal(err)
+		}
+		plans[manifest.MigrationPlan] = true
+	}
+	if !plans[preMigrationPlanID] || !plans[preMigrationSourceV2PlanID] {
+		t.Fatalf("missing v21/v22 rollback generation: %v", plans)
 	}
 }
 

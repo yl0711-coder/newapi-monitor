@@ -1189,6 +1189,9 @@ func (m *Monitor) readyStatus(now time.Time) (readyStatusResponse, int) {
 	if m.cfg.UsageFactsReadEnabled && !m.usageFactsReadReady.Load() {
 		response.DegradedReasons = appendReason(response.DegradedReasons, "facts_not_published")
 	}
+	if m.nginxSourceV2Active.Load() && !m.nginxSourceV2RuntimeConfigOK.Load() {
+		response.DegradedReasons = appendReason(response.DegradedReasons, "nginx_source_v2_runtime_config_mismatch")
+	}
 	if m.cfg.StabilityEnabled && !m.cfg.LocalSnapshotOnly {
 		if m.stabilityCoverageCheckedAt.Load() == 0 || m.stabilityCoverageBPS.Load() < 10000 {
 			response.DegradedReasons = appendReason(response.DegradedReasons, "stability_coverage_incomplete")

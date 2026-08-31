@@ -62,6 +62,15 @@ func validateNginxSettings(s Settings) error {
 	if s.NginxErrorEnabled && !s.NginxEnabled {
 		return fmt.Errorf("启用 Nginx error 聚合时必须同时开启 MONITOR_NGINX_ENABLED")
 	}
+	if s.NginxSourceV2Enabled && !s.NginxEnabled {
+		return fmt.Errorf("启用 Nginx source v2 时必须同时开启 MONITOR_NGINX_ENABLED")
+	}
+	if s.NginxSourceV2CutoverEnabled && !s.NginxSourceV2Enabled {
+		return fmt.Errorf("Nginx source v2 cutover 只能在 source v2 schema/prepare 已启用时开放")
+	}
+	if !s.NginxSourceV2Enabled && (len(s.NginxSourceV2AllowedNodes) > 0 || len(s.NginxSourceV2AllowedLanes) > 0) {
+		return fmt.Errorf("Nginx source v2 白名单只能在 v2 总开关开启时配置")
+	}
 	evidenceMode := nginxEvidenceMode(s.NginxEvidenceMode)
 	if strings.TrimSpace(s.NginxEvidenceMode) != "" && evidenceMode == "off" && !strings.EqualFold(strings.TrimSpace(s.NginxEvidenceMode), "off") {
 		return fmt.Errorf("MONITOR_NGINX_EVIDENCE_MODE 只允许 off、pilot 或 verified")
@@ -113,6 +122,40 @@ func validateNginxSettings(s Settings) error {
 		}
 		seen[node] = struct{}{}
 	}
+	if s.NginxSourceV2Enabled {
+		if len(s.NginxSourceV2AllowedNodes) == 0 {
+			return fmt.Errorf("启用 Nginx source v2 时必须显式配置逐节点白名单")
+		}
+		v2Seen := make(map[string]struct{}, len(s.NginxSourceV2AllowedNodes))
+		for _, raw := range s.NginxSourceV2AllowedNodes {
+			node := strings.TrimSpace(raw)
+			if _, ok := seen[node]; !ok {
+				return fmt.Errorf("Nginx source v2 节点必须属于 MONITOR_NGINX_ALLOWED_NODES")
+			}
+			if _, exists := v2Seen[node]; exists {
+				return fmt.Errorf("MONITOR_NGINX_SOURCE_V2_ALLOWED_NODES 包含重复节点")
+			}
+			v2Seen[node] = struct{}{}
+		}
+		if len(s.NginxSourceV2AllowedLanes) == 0 {
+			return fmt.Errorf("启用 Nginx source v2 时必须显式配置逐 lane 白名单")
+		}
+		laneSeen := make(map[string]struct{}, len(s.NginxSourceV2AllowedLanes))
+		for _, lane := range s.NginxSourceV2AllowedLanes {
+			canonical := strings.TrimSpace(lane)
+			parts := strings.Split(canonical, ":")
+			if len(parts) != 2 || (parts[1] != "access" && parts[1] != "error") {
+				return fmt.Errorf("MONITOR_NGINX_SOURCE_V2_ALLOWED_LANES 只允许 node:access 或 node:error")
+			}
+			if _, ok := v2Seen[parts[0]]; !ok {
+				return fmt.Errorf("Nginx source v2 lane 节点必须属于逐节点白名单")
+			}
+			if _, exists := laneSeen[canonical]; exists {
+				return fmt.Errorf("MONITOR_NGINX_SOURCE_V2_ALLOWED_LANES 包含重复 lane")
+			}
+			laneSeen[canonical] = struct{}{}
+		}
+	}
 	return nil
 }
 
@@ -139,17 +182,19 @@ type nginxIngestSample struct {
 }
 
 type nginxIngestRequest struct {
-	Node                      string              `json:"node"`
-	BatchID                   string              `json:"batch_id"`
-	Samples                   []nginxIngestSample `json:"samples"`
-	BacklogBytes              int64               `json:"backlog_bytes"`
-	BacklogKnown              bool                `json:"backlog_known"`
-	CursorDiscontinuities     int64               `json:"cursor_discontinuities"`
-	LastCursorDiscontinuityAt int64               `json:"last_cursor_discontinuity_at"`
-	DiscardedLines            int64               `json:"discarded_lines"`
-	LastDiscardedAt           int64               `json:"last_discarded_at"`
-	EvidencePersistFailures   int64               `json:"evidence_persist_failures"`
-	EvidenceDroppedEvents     int64               `json:"evidence_dropped_events"`
+	Node                      string                 `json:"node"`
+	BatchID                   string                 `json:"batch_id"`
+	Samples                   []nginxIngestSample    `json:"samples"`
+	BacklogBytes              int64                  `json:"backlog_bytes"`
+	BacklogKnown              bool                   `json:"backlog_known"`
+	CursorDiscontinuities     int64                  `json:"cursor_discontinuities"`
+	LastCursorDiscontinuityAt int64                  `json:"last_cursor_discontinuity_at"`
+	DiscardedLines            int64                  `json:"discarded_lines"`
+	LastDiscardedAt           int64                  `json:"last_discarded_at"`
+	EvidencePersistFailures   int64                  `json:"evidence_persist_failures"`
+	EvidenceDroppedEvents     int64                  `json:"evidence_dropped_events"`
+	SourceBoundary            *nginxSourceBoundaryV1 `json:"source_boundary,omitempty"`
+	SourceRangeV2             *nginxSourceRangeV2    `json:"source_range_v2,omitempty"`
 }
 
 func normalizeNginxRoute(path string) string {
@@ -196,6 +241,31 @@ func (m *Monitor) nginxNodeAllowed(node string) bool {
 	}
 	for _, allowed := range m.cfg.NginxAllowedNodes {
 		if node == allowed {
+			return true
+		}
+	}
+	return false
+}
+
+func (m *Monitor) nginxSourceV2NodeAllowed(node string) bool {
+	if !m.cfg.NginxSourceV2Enabled || (!m.cfg.NginxSourceV2CutoverEnabled && !m.nginxSourceV2Active.Load()) {
+		return false
+	}
+	for _, allowed := range m.cfg.NginxSourceV2AllowedNodes {
+		if node == allowed {
+			return true
+		}
+	}
+	return false
+}
+
+func (m *Monitor) nginxSourceV2LaneAllowed(node, kind string) bool {
+	if !m.nginxSourceV2NodeAllowed(node) || (kind != "access" && kind != "error") {
+		return false
+	}
+	want := node + ":" + kind
+	for _, allowed := range m.cfg.NginxSourceV2AllowedLanes {
+		if strings.TrimSpace(allowed) == want {
 			return true
 		}
 	}
@@ -331,6 +401,26 @@ func (m *Monitor) ingestNginx(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid batch_id"})
 		return
 	}
+	if err := validateNginxSourceBoundaryV1(in.SourceBoundary); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if in.SourceBoundary != nil && in.SourceRangeV2 != nil || in.SourceRangeV2 != nil && !validNginxSourceRangeV2(*in.SourceRangeV2, "access") {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid or ambiguous source range"})
+		return
+	}
+	if in.SourceRangeV2 != nil && !m.nginxSourceV2LaneAllowed(in.Node, "access") {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "nginx source v2 is not enabled for this node"})
+		return
+	}
+	if in.SourceBoundary != nil && in.SourceBoundary.Checkpoint && len(in.Samples) != 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "source checkpoint must not contain samples"})
+		return
+	}
+	if in.SourceBoundary != nil && !m.nginxSourceV2SchemaReady.Load() {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "nginx source continuity preparation is not enabled"})
+		return
+	}
 	if len(in.Samples) > 2000 {
 		c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "too many samples"})
 		return
@@ -390,6 +480,22 @@ func (m *Monitor) ingestNginx(c *gin.Context) {
 	duplicate := false
 	payloadHash := nginxBatchPayloadHash(rows)
 	err := m.storeDB.Transaction(func(tx *gorm.DB) error {
+		sourceDuplicate := false
+		if in.SourceRangeV2 != nil {
+			var err error
+			sourceDuplicate, err = applyNginxSourceRangeV2(tx, in.Node, "access", in.BatchID, payloadHash, *in.SourceRangeV2, now)
+			if err != nil {
+				return err
+			}
+		} else if m.cfg.NginxSourceV2Enabled || m.nginxSourceV2SchemaReady.Load() {
+			allowed, err := legacyNginxSourceAllowed(tx, in.Node, "access")
+			if err != nil {
+				return err
+			}
+			if !allowed {
+				return errNginxLegacyAfterV2
+			}
+		}
 		batch := NginxIngestBatch{Node: in.Node, BatchID: in.BatchID, PayloadHash: payloadHash, FirstTs: firstTs, LastTs: lastTs, Rows: len(rows), ReceivedAt: now}
 		created := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&batch)
 		if created.Error != nil {
@@ -406,8 +512,27 @@ func (m *Monitor) ingestNginx(c *gin.Context) {
 			if existing.PayloadHash != "" && existing.PayloadHash != payloadHash {
 				return errNginxBatchConflict
 			}
+			if in.SourceRangeV2 != nil && !sourceDuplicate {
+				return errNginxSourceConflict
+			}
+			if in.SourceBoundary != nil {
+				if existing.PayloadHash == "" {
+					return errNginxBatchConflict
+				}
+				if err := applyNginxSourceBoundaryV1(tx, in.Node, "access", in.BatchID, payloadHash, *in.SourceBoundary, true, now); err != nil {
+					return err
+				}
+			}
 			duplicate = true
 			return nil
+		}
+		if sourceDuplicate {
+			return errNginxSourceConflict
+		}
+		if in.SourceBoundary != nil {
+			if err := applyNginxSourceBoundaryV1(tx, in.Node, "access", in.BatchID, payloadHash, *in.SourceBoundary, false, now); err != nil {
+				return err
+			}
 		}
 		if len(rows) > 0 {
 			if err := tx.Clauses(clause.OnConflict{
@@ -443,44 +568,61 @@ func (m *Monitor) ingestNginx(c *gin.Context) {
 		if in.EvidencePersistFailures > 0 {
 			state.LastEvidencePersistFailureAt = now
 		}
+		updates := map[string]any{
+			"last_event_ts":  gorm.Expr("MAX(last_event_ts, excluded.last_event_ts)"),
+			"last_ingest_ts": now,
+			"last_batch_id":  in.BatchID,
+			"accepted_rows":  gorm.Expr("accepted_rows + excluded.accepted_rows"),
+			"accepted_count": gorm.Expr("accepted_count + excluded.accepted_count"),
+			"backlog_bytes":  in.BacklogBytes,
+			"backlog_known":  in.BacklogKnown,
+			"cursor_discontinuities": gorm.Expr(
+				"MAX(COALESCE(cursor_discontinuities, 0), excluded.cursor_discontinuities)"),
+			"last_cursor_discontinuity_at": gorm.Expr(
+				"MAX(COALESCE(last_cursor_discontinuity_at, 0), excluded.last_cursor_discontinuity_at)"),
+			"discarded_lines":                  gorm.Expr("MAX(COALESCE(discarded_lines, 0), excluded.discarded_lines)"),
+			"last_discarded_at":                gorm.Expr("MAX(COALESCE(last_discarded_at, 0), excluded.last_discarded_at)"),
+			"evidence_persist_failures":        gorm.Expr("COALESCE(evidence_persist_failures, 0) + excluded.evidence_persist_failures"),
+			"evidence_dropped_events":          gorm.Expr("COALESCE(evidence_dropped_events, 0) + excluded.evidence_dropped_events"),
+			"last_evidence_persist_failure_at": gorm.Expr("MAX(COALESCE(last_evidence_persist_failure_at, 0), excluded.last_evidence_persist_failure_at)"),
+		}
 		return tx.Clauses(clause.OnConflict{
-			Columns: []clause.Column{{Name: "node"}},
-			DoUpdates: clause.Assignments(map[string]any{
-				"last_event_ts":  gorm.Expr("MAX(last_event_ts, excluded.last_event_ts)"),
-				"last_ingest_ts": now,
-				"last_batch_id":  in.BatchID,
-				"accepted_rows":  gorm.Expr("accepted_rows + excluded.accepted_rows"),
-				"accepted_count": gorm.Expr("accepted_count + excluded.accepted_count"),
-				"backlog_bytes":  in.BacklogBytes,
-				"backlog_known":  in.BacklogKnown,
-				"cursor_discontinuities": gorm.Expr(
-					"MAX(COALESCE(cursor_discontinuities, 0), excluded.cursor_discontinuities)"),
-				"last_cursor_discontinuity_at": gorm.Expr(
-					"MAX(COALESCE(last_cursor_discontinuity_at, 0), excluded.last_cursor_discontinuity_at)"),
-				"discarded_lines":                  gorm.Expr("MAX(COALESCE(discarded_lines, 0), excluded.discarded_lines)"),
-				"last_discarded_at":                gorm.Expr("MAX(COALESCE(last_discarded_at, 0), excluded.last_discarded_at)"),
-				"evidence_persist_failures":        gorm.Expr("COALESCE(evidence_persist_failures, 0) + excluded.evidence_persist_failures"),
-				"evidence_dropped_events":          gorm.Expr("COALESCE(evidence_dropped_events, 0) + excluded.evidence_dropped_events"),
-				"last_evidence_persist_failure_at": gorm.Expr("MAX(COALESCE(last_evidence_persist_failure_at, 0), excluded.last_evidence_persist_failure_at)"),
-			}),
+			Columns:   []clause.Column{{Name: "node"}},
+			DoUpdates: clause.Assignments(updates),
 		}).Create(&state).Error
 	})
 	if err != nil {
+		if errors.Is(err, errNginxLegacyAfterV2) {
+			c.JSON(http.StatusConflict, gin.H{"error": "collector protocol v2 is active; legacy ingest is closed"})
+			return
+		}
 		if errors.Is(err, errNginxBatchConflict) {
 			c.JSON(http.StatusConflict, gin.H{"error": "batch id conflict"})
+			return
+		}
+		if errors.Is(err, errNginxSourceConflict) || errors.Is(err, errNginxSourceGap) || errors.Is(err, errNginxSourceOverlap) || errors.Is(err, errNginxSourceEpoch) || errors.Is(err, errNginxSourceUnregistered) {
+			c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
 			return
 		}
 		slog.Warn("Nginx 聚合入库失败", "node", in.Node, "err", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "store failed"})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"ok": true, "duplicate": duplicate, "stored": len(rows)})
+	response := gin.H{"ok": true, "duplicate": duplicate, "stored": len(rows)}
+	if ack := nginxSourceBoundaryAckForV1(in.SourceBoundary, in.BatchID); ack != nil {
+		response["source_boundary_ack"] = ack
+	}
+	if ack := nginxSourceCommitAckForV2(in.SourceRangeV2, in.BatchID); ack != nil {
+		response["source_ack_v2"] = ack
+	}
+	c.JSON(http.StatusOK, response)
 }
 
 func (m *Monitor) startNginxMaintenance(ctx context.Context) {
 	prune := func() {
+		now := time.Now()
 		days := m.nginxRetentionDays()
-		cutoff := time.Now().Unix()/60*60 - int64(days)*86400
+		cutoff := now.Unix()/60*60 - int64(days)*86400
 		if err := m.storeDB.Where("bucket_ts < ?", cutoff).Delete(&NginxMinuteSample{}).Error; err != nil {
 			slog.Warn("清理 Nginx 聚合失败", "err", err)
 		}
@@ -492,6 +634,12 @@ func (m *Monitor) startNginxMaintenance(ctx context.Context) {
 		}
 		if err := m.storeDB.Where("received_at < ?", cutoff).Delete(&NginxErrorIngestBatch{}).Error; err != nil {
 			slog.Warn("清理 Nginx error 幂等批次失败", "err", err)
+		}
+		if err := m.pruneNginxSourceBoundaryV1BatchesOnce(ctx, cutoff); err != nil {
+			slog.Warn("清理 Nginx v1 source 边界幂等批次失败", "err", err)
+		}
+		if err := m.pruneNginxSourceV2CommitsOnce(ctx, now); err != nil {
+			slog.Warn("清理 Nginx source v2 提交证据失败", "err", err)
 		}
 	}
 	prune()
@@ -507,6 +655,37 @@ func (m *Monitor) startNginxMaintenance(ctx context.Context) {
 			}
 		}
 	}()
+}
+
+func (m *Monitor) pruneNginxSourceBoundaryV1BatchesOnce(ctx context.Context, cutoff int64) error {
+	if m.storeDB == nil || !m.nginxSourceV2SchemaReady.Load() {
+		return nil
+	}
+	return m.storeDB.WithContext(ctx).Exec(`DELETE FROM nginx_source_boundary_batch_v1 WHERE rowid IN (
+		SELECT rowid FROM nginx_source_boundary_batch_v1 WHERE received_at < ? ORDER BY received_at LIMIT 10000
+	)`, cutoff).Error
+}
+
+// pruneNginxSourceV2CommitsOnce bounds the permanent data/evidence join.
+// The row is retained for at least the aggregate window and for the complete
+// evidence acceptance window (retention + 24h late-delivery allowance). One
+// small chunk per maintenance pass avoids a long SQLite writer lock.
+func (m *Monitor) pruneNginxSourceV2CommitsOnce(ctx context.Context, now time.Time) error {
+	if m.storeDB == nil || !m.nginxSourceV2SchemaReady.Load() {
+		return nil
+	}
+	hours := m.nginxRetentionDays() * 24
+	evidenceHours := m.cfg.NginxEvidenceRetentionHours
+	if evidenceHours < 24 || evidenceHours > 24*31 {
+		evidenceHours = 168
+	}
+	if evidenceHours > hours {
+		hours = evidenceHours
+	}
+	cutoff := now.Add(-time.Duration(hours+24) * time.Hour).Unix()
+	return m.storeDB.WithContext(ctx).Exec(`DELETE FROM nginx_source_commit_v2 WHERE rowid IN (
+		SELECT rowid FROM nginx_source_commit_v2 WHERE received_at < ? ORDER BY received_at LIMIT 10000
+	)`, cutoff).Error
 }
 
 type NginxEdgeSummary struct {

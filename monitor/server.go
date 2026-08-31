@@ -197,6 +197,12 @@ func (m *Monitor) RegisterRoutes(r *gin.Engine) {
 	r.POST("/internal/nginx", m.ingestNginx)                     // 机器对机器:接收已脱敏的 Nginx 分钟聚合(token 鉴权,默认关闭)
 	r.POST("/internal/nginx-errors", m.ingestNginxErrors)        // 机器对机器:error.log 节点侧分类分钟计数，不接收原文
 	r.POST("/internal/nginx-evidence/v1", m.ingestNginxEvidence) // 机器对机器:独立请求证据 lane，默认关闭
+	r.GET("/internal/nginx-source/v2/capabilities", m.nginxSourceCapabilitiesV2)
+	r.POST("/internal/nginx-source/v2/manifest", m.registerNginxSourceManifestHTTPV2)
+	r.POST("/internal/nginx-source/v2/files", m.registerNginxSourceFileHTTPV2)
+	r.GET("/internal/nginx-source/v2/ack", m.recoverNginxSourceAckHTTPV2)
+	r.POST("/internal/nginx-source/v2/confirm", m.confirmNginxSourceAckHTTPV2)
+	r.POST("/internal/nginx-source/v2/heartbeat", m.nginxSourceHeartbeatHTTPV2)
 	r.GET("/login", m.loginPage)
 	r.POST("/login", m.loginSubmit)
 	r.GET("/logout", logout)

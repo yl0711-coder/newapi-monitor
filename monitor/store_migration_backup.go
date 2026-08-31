@@ -28,6 +28,7 @@ const (
 	// schema/data transform changes. Restarts of the same plan reuse its pinned
 	// original snapshot, so they cannot prune away the old-image rollback point.
 	preMigrationPlanID               = "main-facts-schema-20260830-v21-channel-economics-revisions"
+	preMigrationSourceV2PlanID       = "main-facts-schema-20260831-v22-nginx-source-v2-isolated"
 	preMigrationSnapshotPrefix       = "pre-migrate-"
 	preMigrationReferencePrefix      = ".pre-migration-plan-"
 	preMigrationReferenceSuffix      = ".json"
@@ -450,10 +451,10 @@ func preMigrationReferenceName(mainPath, factsPath string) string {
 	return preMigrationReferencePrefix + hex.EncodeToString(digest[:16]) + preMigrationReferenceSuffix
 }
 
-func writePreMigrationPlanReference(dir, mainPath, factsPath, snapshotName, manifestHash string) error {
+func writePreMigrationPlanReference(dir, mainPath, factsPath, snapshotName, manifestHash, planID string) error {
 	reference := preMigrationPlanReference{
 		FormatVersion:  preMigrationSnapshotVersion,
-		MigrationPlan:  preMigrationPlanID,
+		MigrationPlan:  planID,
 		SnapshotDir:    snapshotName,
 		ManifestSHA256: manifestHash,
 	}
@@ -525,13 +526,13 @@ func readPreMigrationPlanReference(dir, mainPath, factsPath string) (preMigratio
 	return reference, true, nil
 }
 
-func reusePreMigrationPlanSnapshot(ctx context.Context, dir, mainPath, factsPath string) (preMigrationSnapshotResult, bool, error) {
+func reusePreMigrationPlanSnapshot(ctx context.Context, dir, mainPath, factsPath, planID string) (preMigrationSnapshotResult, bool, error) {
 	result := preMigrationSnapshotResult{checked: make(map[string]bool)}
 	reference, found, err := readPreMigrationPlanReference(dir, mainPath, factsPath)
 	if err != nil || !found {
 		return result, found, err
 	}
-	if reference.MigrationPlan != preMigrationPlanID {
+	if reference.MigrationPlan != planID {
 		// A later schema plan supersedes the pointer only after its own snapshot is
 		// durable. The prior plan is not an error and remains recoverable meanwhile.
 		return result, false, nil
@@ -541,7 +542,7 @@ func reusePreMigrationPlanSnapshot(ctx context.Context, dir, mainPath, factsPath
 	if err != nil {
 		return result, true, fmt.Errorf("已固定的迁移前快照不可用: %w", err)
 	}
-	if manifest.MigrationPlan != preMigrationPlanID || manifestHash != reference.ManifestSHA256 {
+	if manifest.MigrationPlan != planID || manifestHash != reference.ManifestSHA256 {
 		return result, true, errors.New("迁移计划引用与快照 manifest 不一致")
 	}
 	manifestStores := make(map[string]preMigrationSnapshotStore, len(manifest.Stores))
@@ -589,10 +590,24 @@ func (m *Monitor) createPreMigrationSnapshot(parent context.Context, mainPath, f
 	ctx, cancel := context.WithTimeout(parent, storeBackupTimeout)
 	defer cancel()
 	dir := m.storeBackupDir()
-	if reused, found, err := reusePreMigrationPlanSnapshot(ctx, dir, mainPath, factsPath); err != nil {
+	planID, err := m.preMigrationPlanForStore(ctx, mainPath)
+	if err != nil {
+		return result, err
+	}
+	if reused, found, err := reusePreMigrationPlanSnapshot(ctx, dir, mainPath, factsPath, planID); err != nil {
 		return result, fmt.Errorf("复核已固定迁移前快照失败: %w", err)
 	} else if found {
 		return reused, nil
+	}
+	// VACUUM INTO temporarily needs another full copy of both stores. Refuse
+	// migration before taking SQLite locks when the shared filesystem cannot
+	// hold source+WAL plus the established 20%/2GiB safety reserve.
+	if sourceBytes, err := storeBackupSourceBytes(mainPath, factsPath); err != nil {
+		return result, fmt.Errorf("迁移前备份空间预检失败: %w", err)
+	} else if sourceBytes > 0 {
+		if err := preflightStoreBackupSpace(dir, mainPath, factsPath); err != nil {
+			return result, fmt.Errorf("迁移前备份空间不足: %w", err)
+		}
 	}
 	for _, source := range sources {
 		if err := lockPreMigrationSource(ctx, source); err != nil {
@@ -640,7 +655,7 @@ func (m *Monitor) createPreMigrationSnapshot(parent context.Context, mainPath, f
 
 	manifest := preMigrationSnapshotManifest{
 		FormatVersion: preMigrationSnapshotVersion,
-		MigrationPlan: preMigrationPlanID,
+		MigrationPlan: planID,
 		CreatedAt:     now.UTC().Format(time.RFC3339Nano),
 		Stores:        make([]preMigrationSnapshotStore, 0, len(sources)),
 	}
@@ -690,7 +705,7 @@ func (m *Monitor) createPreMigrationSnapshot(parent context.Context, mainPath, f
 	if err := syncDirectory(dir); err != nil {
 		return result, fmt.Errorf("迁移前快照发布目录落盘失败: %w", err)
 	}
-	if err := writePreMigrationPlanReference(dir, mainPath, factsPath, finalName, manifestHash); err != nil {
+	if err := writePreMigrationPlanReference(dir, mainPath, factsPath, finalName, manifestHash, planID); err != nil {
 		return result, fmt.Errorf("固定迁移前回滚点失败: %w", err)
 	}
 	if err := prunePreMigrationSnapshots(dir, m.storeMigrationBackupRetention()); err != nil {
@@ -699,6 +714,48 @@ func (m *Monitor) createPreMigrationSnapshot(parent context.Context, mainPath, f
 		return result, fmt.Errorf("迁移前快照已完成，但清理旧快照失败: %w", err)
 	}
 	return result, nil
+}
+
+func (m *Monitor) preMigrationPlanForStore(ctx context.Context, mainPath string) (string, error) {
+	present, err := existingRegularStore(mainPath)
+	if err != nil {
+		return "", err
+	}
+	if !present {
+		if m.cfg.NginxSourceV2Enabled {
+			return preMigrationSourceV2PlanID, nil
+		}
+		return preMigrationPlanID, nil
+	}
+	db, err := sql.Open("sqlite", sqliteReadOnlyDSN(mainPath))
+	if err != nil {
+		return "", err
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+	ready, err := inspectNginxSourceV2Schema(ctx, db)
+	if err != nil {
+		return "", err
+	}
+	if !ready {
+		if m.cfg.NginxSourceV2Enabled {
+			return preMigrationSourceV2PlanID, nil
+		}
+		return preMigrationPlanID, nil
+	}
+	return preMigrationSourceV2PlanID, nil
+}
+
+// currentMigrationPlanID labels periodic backup sets with the schema family
+// they actually contain. A store that already owns the complete isolated
+// source-v2 ledger remains on the v22 plan even when the feature flag is later
+// disabled, so operators cannot mistake that backup for a pre-v2 rollback
+// point.
+func (m *Monitor) currentMigrationPlanID() string {
+	if m.cfg.NginxSourceV2Enabled || m.nginxSourceV2SchemaReady.Load() {
+		return preMigrationSourceV2PlanID
+	}
+	return preMigrationPlanID
 }
 
 func (m *Monitor) storeMigrationBackupRetention() int {

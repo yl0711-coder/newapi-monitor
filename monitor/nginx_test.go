@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"gorm.io/gorm"
 )
 
 func postNginx(t *testing.T, m *Monitor, body, token string) *httptest.ResponseRecorder {
@@ -68,8 +69,27 @@ func TestValidateNginxSettingsFailsClosed(t *testing.T) {
 	if err := validateNginxSettings(Settings{NginxEnabled: true, IngestToken: "secret", NginxAllowedNodes: []string{"master", "slave"}}); err != nil {
 		t.Fatalf("完整配置应通过: %v", err)
 	}
+	baseV2 := Settings{NginxEnabled: true, IngestToken: "secret", NginxAllowedNodes: []string{"master"}, NginxSourceV2Enabled: true, NginxSourceV2AllowedNodes: []string{"master"}}
+	if err := validateNginxSettings(baseV2); err == nil {
+		t.Fatal("v2 必须要求显式的逐 lane 白名单")
+	}
+	baseV2.NginxSourceV2AllowedLanes = []string{"master:access"}
+	if err := validateNginxSettings(baseV2); err != nil {
+		t.Fatalf("合法 v2 prepare 配置被拒绝: %v", err)
+	}
+	baseV2.NginxSourceV2CutoverEnabled = true
+	if err := validateNginxSettings(baseV2); err != nil {
+		t.Fatalf("合法 v2 cutover 配置被拒绝: %v", err)
+	}
+	baseV2.NginxSourceV2AllowedLanes = []string{"master:access", "master:access"}
+	if err := validateNginxSettings(baseV2); err == nil {
+		t.Fatal("重复 v2 lane 必须拒绝")
+	}
 	if err := validateNginxSettings(Settings{NginxEvidenceMode: "unknown"}); err == nil {
 		t.Fatal("未知 evidence 模式不能静默降级为 off")
+	}
+	if err := validateNginxSettings(Settings{NginxSourceV2CutoverEnabled: true}); err == nil {
+		t.Fatal("cutover 不得绕过 source v2 schema/prepare 开关")
 	}
 	if err := validateNginxSettings(Settings{NginxEvidenceMode: "pilot"}); err == nil {
 		t.Fatal("evidence 不能在 Nginx 分钟采集关闭时单独启用")
@@ -142,6 +162,145 @@ func TestNginxIngestRejectsReusedBatchIDWithDifferentPayload(t *testing.T) {
 	}
 	if len(batch.PayloadHash) != 64 {
 		t.Fatalf("server-computed payload hash missing: %q", batch.PayloadHash)
+	}
+}
+
+func TestNginxV1BoundaryRetryAdoptionAndConflict(t *testing.T) {
+	m := newTestMonitor(t)
+	m.cfg.NginxEnabled, m.cfg.IngestToken, m.cfg.NginxRetentionDays = true, "secret", 7
+	m.cfg.NginxAllowedNodes = []string{"master"}
+	bucket := time.Now().Unix() / 60 * 60
+	legacy := fmt.Sprintf(`{"node":"master","batch_id":"boundary_batch_abcdefgh","samples":[{"bucket_ts":%d,"route":"/v1/responses","method":"POST","status":200,"count":1}]}`, bucket)
+	if w := postNginx(t, m, legacy, "secret"); w.Code != http.StatusOK {
+		t.Fatalf("legacy first ingest: %d %s", w.Code, w.Body.String())
+	}
+	enableTestNginxSourceContinuity(t, m)
+	bound := fmt.Sprintf(`{"node":"master","batch_id":"boundary_batch_abcdefgh","source_boundary":{"device":7,"inode":91,"start_offset":100,"end_offset":180},"samples":[{"bucket_ts":%d,"route":"/v1/responses","method":"POST","status":200,"count":1}]}`, bucket)
+	if w := postNginx(t, m, bound, "secret"); w.Code != http.StatusOK {
+		t.Fatalf("boundary adoption retry: %d %s", w.Code, w.Body.String())
+	} else if !strings.Contains(w.Body.String(), `"source_boundary_ack":{"protocol":1`) {
+		t.Fatalf("boundary persistence was not acknowledged: %s", w.Body.String())
+	}
+	if w := postNginx(t, m, legacy, "secret"); w.Code != http.StatusOK {
+		t.Fatalf("old collector rollback must retry the same payload without erasing boundary: %d %s", w.Code, w.Body.String())
+	}
+	var state NginxSourceBoundaryStateV1
+	if err := m.storeDB.First(&state, "node = ? AND kind = ?", "master", "access").Error; err != nil {
+		t.Fatal(err)
+	}
+	if state.LastBatchID != "boundary_batch_abcdefgh" || state.Device != 7 || state.Inode != 91 || state.LastOffset != 180 {
+		t.Fatalf("server boundary was not adopted: %+v", state)
+	}
+	conflict := fmt.Sprintf(`{"node":"master","batch_id":"boundary_batch_abcdefgh","source_boundary":{"device":7,"inode":91,"start_offset":100,"end_offset":181},"samples":[{"bucket_ts":%d,"route":"/v1/responses","method":"POST","status":200,"count":1}]}`, bucket)
+	if w := postNginx(t, m, conflict, "secret"); w.Code != http.StatusConflict {
+		t.Fatalf("conflicting boundary must fail: %d %s", w.Code, w.Body.String())
+	}
+	var total int64
+	if err := m.storeDB.Model(&NginxMinuteSample{}).Select("COALESCE(SUM(count),0)").Scan(&total).Error; err != nil || total != 1 {
+		t.Fatalf("boundary retry changed aggregates: total=%d err=%v", total, err)
+	}
+	manifest := testSourceManifest("access", 180)
+	manifest.CutoverFromV1, manifest.LegacyCursorDevice, manifest.LegacyCursorInode, manifest.LegacyCursorOffset = true, 7, 91, 180
+	manifest.LegacyAckedBatchID = "boundary_batch_abcdefgh"
+	manifest.Files[0].Device, manifest.Files[0].Inode = 7, 91
+	migrateTestNginxSourceV2(t, m.storeDB)
+	if err := m.storeDB.Transaction(func(tx *gorm.DB) error {
+		_, _, err := registerNginxSourceManifestV2(tx, "master", manifest.LegacyAckedBatchID, manifest, time.Now().Unix())
+		return err
+	}); err != nil {
+		t.Fatalf("exact persisted boundary must permit v2 cutover: %v", err)
+	}
+}
+
+func TestNginxV1BoundaryFailsClosedBeforePreparationWithoutMutatingLegacyTables(t *testing.T) {
+	m := newTestMonitor(t)
+	m.cfg.NginxEnabled, m.cfg.IngestToken, m.cfg.NginxRetentionDays = true, "secret", 7
+	m.cfg.NginxAllowedNodes = []string{"master"}
+	bucket := time.Now().Unix() / 60 * 60
+	body := fmt.Sprintf(`{"node":"master","batch_id":"premature_boundary_abcdefgh","source_boundary":{"device":7,"inode":91,"start_offset":0,"end_offset":100},"samples":[{"bucket_ts":%d,"route":"/v1/responses","method":"POST","status":200,"count":1}]}`, bucket)
+	if w := postNginx(t, m, body, "secret"); w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("premature boundary=%d %s", w.Code, w.Body.String())
+	}
+	var batches, samples, states int64
+	if err := m.storeDB.Model(&NginxIngestBatch{}).Count(&batches).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := m.storeDB.Model(&NginxMinuteSample{}).Count(&samples).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := m.storeDB.Model(&NginxSourceState{}).Count(&states).Error; err != nil {
+		t.Fatal(err)
+	}
+	if batches != 0 || samples != 0 || states != 0 {
+		t.Fatalf("rejected preparation mutated legacy state: batches=%d samples=%d states=%d", batches, samples, states)
+	}
+}
+
+func TestNginxV1BoundaryCannotAdoptAnOlderAcceptedBatch(t *testing.T) {
+	m := newTestMonitor(t)
+	m.cfg.NginxEnabled, m.cfg.IngestToken, m.cfg.NginxRetentionDays = true, "secret", 7
+	m.cfg.NginxAllowedNodes = []string{"master"}
+	bucket := time.Now().Unix() / 60 * 60
+	body := func(id string) string {
+		return fmt.Sprintf(`{"node":"master","batch_id":%q,"samples":[{"bucket_ts":%d,"route":"/v1/responses","method":"POST","status":200,"count":1}]}`, id, bucket)
+	}
+	if w := postNginx(t, m, body("older_batch_abcdefgh"), "secret"); w.Code != http.StatusOK {
+		t.Fatal(w.Body.String())
+	}
+	if w := postNginx(t, m, body("latest_batch_abcdefgh"), "secret"); w.Code != http.StatusOK {
+		t.Fatal(w.Body.String())
+	}
+	enableTestNginxSourceContinuity(t, m)
+	stale := fmt.Sprintf(`{"node":"master","batch_id":"older_batch_abcdefgh","source_boundary":{"device":7,"inode":91,"start_offset":0,"end_offset":100},"samples":[{"bucket_ts":%d,"route":"/v1/responses","method":"POST","status":200,"count":1}]}`, bucket)
+	if w := postNginx(t, m, stale, "secret"); w.Code != http.StatusConflict {
+		t.Fatalf("older batch adopted as current boundary: %d %s", w.Code, w.Body.String())
+	}
+	var boundaryCount int64
+	if err := m.storeDB.Model(&NginxSourceBoundaryStateV1{}).Where("node = ? AND kind = ?", "master", "access").Count(&boundaryCount).Error; err != nil || boundaryCount != 0 {
+		t.Fatalf("stale adoption created boundary state: count=%d err=%v", boundaryCount, err)
+	}
+}
+
+func TestNginxV1CheckpointBindsIdleCursor(t *testing.T) {
+	m := newTestMonitor(t)
+	m.cfg.NginxEnabled, m.cfg.IngestToken = true, "secret"
+	m.cfg.NginxAllowedNodes = []string{"master"}
+	enableTestNginxSourceContinuity(t, m)
+	body := `{"node":"master","batch_id":"hb_boundary_abcdefgh","source_boundary":{"device":7,"inode":92,"start_offset":700,"end_offset":700,"checkpoint":true},"samples":[]}`
+	if w := postNginx(t, m, body, "secret"); w.Code != http.StatusOK {
+		t.Fatalf("checkpoint: %d %s", w.Code, w.Body.String())
+	}
+	var state NginxSourceBoundaryStateV1
+	if err := m.storeDB.First(&state, "node = ? AND kind = ?", "master", "access").Error; err != nil {
+		t.Fatal(err)
+	}
+	if state.LastBatchID != "hb_boundary_abcdefgh" || state.Device != 7 || state.Inode != 92 || state.LastOffset != 700 {
+		t.Fatalf("checkpoint did not bind idle cursor: %+v", state)
+	}
+	bucket := time.Now().Unix() / 60 * 60
+	invalid := fmt.Sprintf(`{"node":"master","batch_id":"hb_with_samples_abcdefgh","source_boundary":{"device":7,"inode":92,"start_offset":700,"end_offset":700,"checkpoint":true},"samples":[{"bucket_ts":%d,"route":"/api/status","method":"GET","status":200,"count":1}]}`, bucket)
+	if w := postNginx(t, m, invalid, "secret"); w.Code != http.StatusBadRequest {
+		t.Fatalf("checkpoint with samples must fail: %d %s", w.Code, w.Body.String())
+	}
+}
+
+func TestNginxLegacyAccessIngestIsAtomicallyClosedAfterV2Manifest(t *testing.T) {
+	m := newTestMonitor(t)
+	m.cfg.NginxEnabled, m.cfg.IngestToken = true, "secret"
+	m.cfg.NginxAllowedNodes = []string{"master"}
+	registerTestManifest(t, m.storeDB, "access", 0)
+	m.nginxSourceV2SchemaReady.Store(true)
+	bucket := time.Now().Unix() / 60 * 60
+	body := fmt.Sprintf(`{"node":"master","batch_id":"legacy_after_v2_abcdefgh","samples":[{"bucket_ts":%d,"route":"/v1/responses","method":"POST","status":200,"count":1}]}`, bucket)
+	w := postNginx(t, m, body, "secret")
+	if w.Code != http.StatusConflict {
+		t.Fatalf("legacy access ingest after v2 cutover=%d body=%s", w.Code, w.Body.String())
+	}
+	var batches, samples int64
+	m.storeDB.Model(&NginxIngestBatch{}).Where("batch_id = ?", "legacy_after_v2_abcdefgh").Count(&batches)
+	m.storeDB.Model(&NginxMinuteSample{}).Count(&samples)
+	if batches != 0 || samples != 0 {
+		t.Fatalf("rejected legacy access mutated state: batches=%d samples=%d", batches, samples)
 	}
 }
 
