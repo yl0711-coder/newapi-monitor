@@ -36,6 +36,15 @@ const lc={
   // scopeEcho 是后端回显的生效范围（时间窗、limit 等），与上面的 scope（查看范围）
   // 是两件事。曾经两者同名，后者静默覆盖前者，默认查看范围直接丢失。
   blindSpots:[],scopeEcho:null,note:'',enrichError:'',edgeEvidenceError:'',evidenceMode:'off',evidenceVerified:false,
+  // radius 是后端的影响面判读（「看范围」层），**只覆盖单次请求返回的那一页**。
+  // radiusStale 在点过「加载更早的记录」后置为 true：那之后 lc.rows 是累积的
+  // （第三页时表格 150 行），而 radius 只描述最后一页的 50 行，两个数字摆在
+  // 同一屏上会自相矛盾。此时隐藏影响面并说明原因——宁可不给结论，
+  // 也不给一个与表格对不上的结论。
+  // 不在前端自行重算：判据会变成两份实现，迟早漂。
+  // 也不让后端算全筛选范围：那需要另发一条聚合 SQL，多占一次 usageDetailGate
+  // （容量 1，与客户 Portal 日志查询共用），排障是内部功能不得挤占客户功能。
+  radius:null,radiusStale:false,
   opts:null,           // /logchain/filters 结果，只取一次
   loading:false,abort:null,generation:0,
   expanded:new Set()
@@ -341,6 +350,10 @@ async function load(more){
     lc.nextBeforeTs=+data.next_before_ts||0;
     lc.nextBeforeID=+data.next_before_id||0;
     lc.blindSpots=data.blind_spots||[];
+    // more=true 即「加载更早的记录」：本次 radius 只覆盖新取的这一页，
+    // 而表格显示的是累积行，故标记为失效而不是用它覆盖。
+    if(more){lc.radiusStale=true}
+    else{lc.radius=data.blast_radius||null;lc.radiusStale=false}
     lc.scopeEcho=data.scope||null;
     lc.note=data.note||'';
     lc.enrichError=data.channel_enrich_error||'';
@@ -441,6 +454,30 @@ const FAULT_LABEL={
   downstream:{t:'下游',c:'lc-fault-down'},
   unknown:{t:'待判',c:'lc-fault-unknown'}
 };
+
+// 上游关联的置信度标签。
+//
+// ★ 四档的措辞与配色必须让人一眼分出「证据」和「推断」★
+// exact 是同一请求的铁证（双方错误原文里嵌着同一个模型商 request id）；
+// probable 只是时间窗内唯一，可能认错。把后者当前者用，会照着别的请求的
+// 上游日志去解释眼前的故障——比没有关联更糟。
+// 所以 exact 用绿（放心用），probable 用黄（留个心眼），ambiguous 用灰（别用）。
+const CORRELATE_LABEL={
+  exact:{t:'精确匹配',cls:'lc-corr-exact',
+    tip:'铁证：双方错误原文里嵌着同一个模型商 request id，是同一次请求的两侧视角'},
+  probable:{t:'高置信推断',cls:'lc-corr-probable',
+    tip:'推断，非铁证：按模型名 + 状态码 + 时间窗匹配且窗内唯一。实测 10 秒窗内约 82% 唯一，即约两成可能认错'},
+  // not_applicable 与 none 必须分开显示。
+  // none 会让人去查采集是不是漏了；而这一档是上游自身没有记录，那趟核对必然白跑。
+  // 实测依据：我方 08-26 23:52 那条 524，上游 507 条日志里 524 一条都没有——
+  // 524 由 Cloudflare 在上游应用之前就返回了，上游从未看到这次请求。
+  not_applicable:{t:'上游无此记录（非采集缺失）',cls:'lc-corr-na',
+    tip:'该错误由上游前置 CDN 产生，请求未到达上游应用，上游自身不会有对应日志。不必去查采集'},
+  none:{t:'未找到对应',cls:'lc-corr-none',
+    tip:'上游日志里没有相近时刻的同模型同状态码错误。可能是采集未覆盖该上游、或时钟偏差过大'},
+  ambiguous:{t:'无法唯一对应',cls:'lc-corr-ambiguous',
+    tip:'上游在相近时刻有多条同模型同状态码的错误。宁可不给结论也不给错结论，故只报候选条数'}
+};
 function faultCell(r){
   if(!r.fault)return '<span class="lc-sub">—</span>';
   const m=FAULT_LABEL[r.fault];
@@ -454,7 +491,19 @@ function faultCell(r){
   const dim=conf==='low'?' lc-fault-dim':'';
   const confText={high:'可信度高',mid:'可信度中',low:'可信度低（样本不足）',none:''}[conf]||'';
   const tip=[why,confText].filter(Boolean).join('\n');
-  return `<span class="lc-fault-tag ${cls}${dim}" title="${esc(tip)}">${esc(label)}${mark}</span>`;
+  // 有上游关联时加个小圆点：不展开也能看出这行有上游侧证据可查。
+  // 只对 exact / probable 加——ambiguous 没有可看的内容，加了是空跑一趟。
+  // 挂在责任方这一列而不是单开一列：上游日志正是复核归因结论的材料，
+  // 而表格宽度已经很紧，单开一列要挤掉别的。
+  const um=r.upstream_match;
+  let dot='';
+  if(um&&(um.confidence==='exact'||um.confidence==='probable')){
+    const dt=um.confidence==='exact'
+      ? {c:'lc-corr-dot-exact',t:'有上游侧日志可对照（精确匹配，铁证）'}
+      : {c:'lc-corr-dot-probable',t:'有上游侧日志可对照（高置信推断，约两成可能认错）'};
+    dot=`<span class="lc-corr-dot ${dt.c}" title="${esc(dt.t)}"></span>`;
+  }
+  return `<span class="lc-fault-tag ${cls}${dim}" title="${esc(tip)}">${esc(label)}${mark}</span>${dot}`;
 }
 
 function contentCell(r){
@@ -552,6 +601,10 @@ function rowHTML(r){
 function detailHTML(r){
   const kv=[];
   const add=(k,v,title)=>{if(v!==''&&v!=null)kv.push(`<div class="lc-kv"><span${title?` title="${esc(title)}"`:''}>${esc(k)}</span><b>${esc(v)}</b></div>`)};
+  // addHTML 与 add 的唯一差别：value 不转义。
+  // **只允许传本文件内构造的固定片段**（如置信度色块），绝不可传接口返回的字段值——
+  // 那些要走 add。上游错误原文里可能带 < > 之类字符，不转义就是 XSS 面。
+  const addHTML=(k,html,title)=>{if(html)kv.push(`<div class="lc-kv"><span${title?` title="${esc(title)}"`:''}>${esc(k)}</span><b>${html}</b></div>`)};
   add('请求 ID',r.request_id||'—','new-api logs.request_id，可用它跟上游对账');
   add('类型',r.type_name||String(r.type));
   add('发生时间',fullTime(r.created_at));
@@ -576,6 +629,60 @@ function detailHTML(r){
     add('疑似责任方',(m?m.t:r.fault)+'（'+confText+'）',
       '这是我方规则对事实的**推断**，不是 new-api 或上游写下的事实。判断依据见下一行');
     if(r.fault_why)add('归因依据',r.fault_why,'规则据此得出上面的结论，请据此复核');
+  }
+  // 上游侧视角。紧接归因之后：它是归因的证据来源——上游自己怎么记这次失败，
+  // 比我方对状态码和原文的解读更有力。
+  //
+  // ★ 四档必须视觉上分得开 ★
+  // exact 是铁证（双方嵌同一模型商 id），probable 只是推断。
+  // 混在一起显示会让人拿推断当证据，照着别的请求的上游日志解释眼前的故障。
+  const um=r.upstream_match;
+  // 四档全显示，含 none。
+  //
+  // ★ 原先跳过 none，那是错的 ★
+  // 「没找到对应」与「压根没查（采集未开）」在页面上表现一致——都是什么都不显示。
+  // 于是看的人无法判断该不该去查采集。显式给出 none 才区分得开，
+  // 而 not_applicable 更进一步说明「不必去查」。
+  if(um&&um.confidence){
+    const c=CORRELATE_LABEL[um.confidence]||{t:um.confidence,cls:''};
+    addHTML('上游关联',`<span class="lc-corr ${c.cls}">${esc(c.t)}</span>`,c.tip);
+    if(um.why)add('关联依据',um.why,'据此判断该不该相信下面的上游信息');
+    if(um.confidence==='ambiguous'){
+      // 多义时不给具体某条——给了就是在猜。但「候选涉及几个上游渠道」是真信息：
+      // 都落在同一个渠道说明那个渠道在批量出错；散在多个渠道则指向上游整体。
+      add('候选条数',nfmt(um.candidate_count)+' 条',
+        '上游在相近时刻有多条同模型同状态码的错误，无法唯一对应，故不展示具体内容');
+      if(um.candidate_channels)add('候选涉及渠道',um.candidate_channels,
+        '这些候选分布在上游的哪几个渠道。集中在一个说明该渠道在批量出错');
+    }else{
+      if(um.upstream_channel_name)add('上游用的渠道',um.upstream_channel_name,
+        '**上游自己**用了它哪个渠道去打——我方日志里没有这个信息');
+      // ★★ 状态码 / 错误码 / 错误类型 / 原文只在**与我方不一致**时才显示 ★★
+      //
+      // 2026-08-28 实测 33 条 exact 匹配：这四项两侧**全部逐字相同**。
+      // 机制是上游把返回给我方的响应体原样记进自己的日志，我方也原样记进
+      // content——两边记的是同一个字符串。所以无条件显示等于让人把同一句话
+      // 读两遍，还会误以为拿到了上游的内部诊断。
+      //
+      // 但**不一致时必须显示**：那说明上游记的与它告诉我方的不是一回事，
+      // 那种矛盾本身就是重要线索，不能因为"通常相同"就藏起来。
+      if(um.upstream_status_code&&um.upstream_status_code!==r.upstream_status_code){
+        add('上游状态码（与我方不一致）',String(um.upstream_status_code),
+          '我方记的是 '+(r.upstream_status_code||'—')+'，上游自己记的是这个');
+      }
+      if(um.upstream_error_code&&um.upstream_error_code!==(r.upstream_error_code||'')){
+        add('上游错误码（与我方不一致）',um.upstream_error_code,
+          '我方记的是 '+(r.upstream_error_code||'—'));
+      }
+      // 上游侧原文不放这里：它是长文本，塞进 kv 行会撑破布局。
+      // 改为紧跟「上游返回原文」下方的独立折叠块，见 upstreamRawBlock。
+      // 耗时差是这一跳的开销。只在有差值时给——相同就没有信息量。
+      const dt=(r.use_time||0)-(um.upstream_use_time||0);
+      if(um.upstream_use_time&&dt!==0){
+        add('两侧耗时',dur(r.use_time)+' / 上游 '+dur(um.upstream_use_time),
+          '差值 '+dur(Math.abs(dt))+'，即我方到上游这一跳的开销');
+      }
+    }
   }
   add('渠道 ID',r.channel_id?String(r.channel_id):'（未打到渠道）');
   if(r.channel_vendor)add('厂商',r.channel_vendor);
@@ -611,6 +718,27 @@ function detailHTML(r){
        <pre class="lc-raw">${esc(raw)}</pre>`
     : `<div class="lc-sub" style="margin-top:8px">这条记录没有 content。</div>`;
 
+  // 上游侧的错误日志原文，紧跟我方原文之后——两者是同一次失败的两侧视角，
+  // 挨着放才能一眼对比。
+  //
+  // ★ 用折叠而不是「相同就隐藏」★
+  // 实测 33 条 exact 匹配里两侧原文**逐字相同**，曾据此改成只在不一致时显示。
+  // 但那样一行凭空消失，与「压根没拿到上游日志」无法区分——正是
+  // docs/aimustkonw.md 那条「缺失绝不显示为零」要防的。
+  // 折叠既不占地方，标题又如实说明了核对结果。
+  const um2=r.upstream_match;
+  const uc=um2&&um2.upstream_content||'';
+  const ucSame=uc&&uc.trim()===(r.content||'').trim();
+  let upstreamRawBlock='';
+  if(uc){
+    const head=ucSame
+      ? '上游侧错误日志原文（已逐字核对，与我方一致）'
+      : '⚠ 上游侧错误日志原文（与我方不一致，值得追查）';
+    upstreamRawBlock=`<details class="lc-upraw${ucSame?'':' lc-upraw-diff'}">`+
+      `<summary class="lc-upraw-head">${esc(head)}</summary>`+
+      `<pre class="lc-raw">${esc(uc)}</pre></details>`;
+  }
+
   // end_error 是流中断的错误原文（如 "context canceled"）。单独一块展示，
   // 不混进上面的 content —— 两者来源不同：content 是 new-api 记的上游返回，
   // end_error 是流传输层的失败原因。
@@ -636,6 +764,7 @@ function detailHTML(r){
     <div class="lc-kvs">${kv.join('')}</div>
     ${edgeBlock}
     ${rawBlock}
+    ${upstreamRawBlock}
     ${endErrBlock}
     ${jump?`<div style="margin-top:10px">${jump}</div>`:''}
   </td></tr>`;
@@ -680,6 +809,7 @@ function render(){
     moreBtn.textContent=lc.asc?'加载更晚的记录':'加载更早的记录';
   }
 
+  renderRadius();
   renderBlindSpots();
   renderNotes();
   renderStatus('');
@@ -714,6 +844,74 @@ function emptyText(){
 // 你在这里查不到，于是判断他在瞎说。所以这段话必须一直在眼前。
 const BLIND_OPEN_KEY='nexusapi-monitor-logchain-blind-open';
 
+// SHAPE_LABEL 形状取值的中文说明。取值与 logchain_radius.go 的常量一一对应，
+// 那边加了取值这里必须同步，否则页面会显示原始英文枚举。
+const SHAPE_LABEL={
+  single_channel:'集中在单个渠道',
+  single_customer:'集中在单个客户',
+  single_domain:'集中在单个上游域名',
+  single_model:'集中在单个模型',
+  widespread:'分散，无明显集中',
+  insufficient:'样本不足，不做判读'
+};
+
+// RADIUS_DIM 四个维度的表头。顺序即展示顺序：渠道和客户在前，
+// 因为排障最常问的是"是这个渠道坏了，还是这个客户在做异常请求"。
+const RADIUS_DIM=[
+  ['by_channel','渠道','受影响客户数'],
+  ['by_customer','客户','涉及渠道数'],
+  ['by_domain','上游域名','受影响客户数'],
+  ['by_model','模型','受影响客户数']
+];
+
+function renderRadius(){
+  const el=$('lcRadius');
+  if(!el)return;
+  // 翻页后隐藏：radius 只覆盖最后一页，表格是累积的，两者对不上。
+  // 明确告知而不是静默留空——静默会让人以为"这次没算出影响面"。
+  if(lc.radiusStale){
+    el.hidden=false;
+    el.innerHTML=`<div class="lc-radius-stale">已加载更早的记录，影响面判读仅覆盖单页，`+
+      `与当前表格行数不一致，故不展示。重新查询可再次判读。</div>`;
+    return;
+  }
+  const br=lc.radius;
+  if(!br||!br.shape){el.hidden=true;return}
+  el.hidden=false;
+
+  const dims=RADIUS_DIM.map(([key,dimName,spreadName])=>{
+    const dim=br[key]||{};
+    const items=dim.items;
+    if(!items||!items.length)return '';
+    let rows=items.map(it=>
+      `<tr><td class="lc-radius-key">${esc(it.key)}</td>`+
+      `<td class="lc-radius-num">${nfmt(it.count)}</td>`+
+      `<td class="lc-radius-num">${nfmt(it.spread)}</td></tr>`
+    ).join('');
+    // 被截断的部分必须显式给出，否则这张表看起来就像"问题只涉及这 5 项"，
+    // 而形状结论用的是全量（会说"分散在 12 个渠道"），两者对不上。
+    // Spread 一列给"—"而不是数字：Spread 是去重计数，跨项相加会重复计数。
+    if(dim.other_items>0){
+      rows+=`<tr class="lc-radius-other"><td class="lc-radius-key">`+
+        `其余 ${nfmt(dim.other_items)} 项</td>`+
+        `<td class="lc-radius-num">${nfmt(dim.other_count)}</td>`+
+        `<td class="lc-radius-num" title="去重计数不可跨项相加">—</td></tr>`;
+    }
+    return `<div class="lc-radius-dim">`+
+      `<table class="lc-radius-table"><thead><tr>`+
+      `<th>${esc(dimName)}</th><th>问题数</th><th>${esc(spreadName)}</th>`+
+      `</tr></thead><tbody>${rows}</tbody></table></div>`;
+  }).join('');
+
+  const label=SHAPE_LABEL[br.shape]||br.shape;
+  el.innerHTML=`<details class="lc-radius-details">`+
+    `<summary class="lc-radius-head">影响面：<b>${esc(label)}</b>`+
+    `<span class="lc-radius-sub">仅本页 ${nfmt(br.rows)} 条问题</span></summary>`+
+    `<div class="lc-radius-why">${esc(br.shape_why||'')}</div>`+
+    `<div class="lc-radius-dims">${dims}</div>`+
+    `</details>`;
+}
+
 function renderBlindSpots(){
   const el=$('lcBlind');
   if(!el)return;
@@ -740,6 +938,27 @@ function renderNotes(){
   if(lc.evidenceMode==='pilot')notes.push('Nginx 请求证据处于 pilot：只核对关联覆盖率，尚不作为责任结论。');
   // 后端可能收敛了范围（跨度截断/limit 上限），回显出来，避免以为筛选原样生效。
   if(lc.scopeEcho&&lc.scopeEcho.from&&lc.scopeEcho.to)notes.push(`查询范围：${esc(lc.scopeEcho.from)} ～ ${esc(lc.scopeEcho.to)}（CST）`);
+  // 跨度被收窄。警告级：不说清的话，人会以为"这段时间里就这些"，
+  // 据此得出"那几天没有请求"的错误结论。
+  //
+  // 原因可能有多条（跨度硬上限 + 关键词上限叠加），全部列出：
+  // 只说最后一条会让人看到"31 天收窄到 3 天"，而他根本没要过 31 天。
+  const cap=lc.scopeEcho&&lc.scopeEcho.span_capped;
+  if(cap&&cap.requested_days>cap.effective_days){
+    const why=(cap.reasons||[]).map(r=>esc(r)).join('；');
+    let msg=`<span class="lc-note-warn">查询跨度已从 ${nfmt(cap.requested_days)} 天收窄至 `+
+      `${nfmt(cap.effective_days)} 天。</span>`;
+    if(why)msg+=`原因：${why}。`;
+    msg+=`要查更早的记录，请缩小 to 端后分多次查询。`;
+    notes.push(msg);
+  }
+  // 关键词把口径收窄到错误行（P2-02）。警告级：不说的话，人会以为
+  // "消费行里没有匹配的"，而实际是压根没查那一部分。
+  const kwScope=lc.scopeEcho&&lc.scopeEcho.keyword_scoped_to_errors;
+  if(kwScope){
+    notes.push(`<span class="lc-note-warn">关键词搜索已限定为错误行（type=5），`+
+      `消费行未纳入本次搜索。</span>原因：${esc(kwScope.reason||'')}。`);
+  }
   if(!notes.length){el.hidden=true;return}
   el.hidden=false;
   el.innerHTML=notes.map(n=>`<div>${n}</div>`).join('');

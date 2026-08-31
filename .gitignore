@@ -5,6 +5,7 @@
 *.env
 monitor.env
 secrets/
+1.env
 
 # —— 运行时数据 ——
 /data/
@@ -28,3 +29,13 @@ monitor-bin
 *.swp
 .idea/
 .vscode/
+
+# —— 上游日志抓取工具的输出 ——
+# 内含上游日志原文，可能带客户请求片段与错误详情，**绝不提交**。
+# 路径是仓库根的 out/：工具的 -out 相对容器工作目录 /src，即仓库根。
+# 曾误写成 /dev/upstream-errorlog-fetch/out/，那条挡不住实际落盘位置。
+/out/
+/dev/upstream-errorlog-fetch/out/
+# 本机连生产只读库时生成的临时凭据目录（my.cnf 含明文密码）
+.tmp-env/
+.tmp-q/

@@ -27,7 +27,8 @@ const (
 	// Bump this ID whenever either AutoMigrate model set or a post-migration
 	// schema/data transform changes. Restarts of the same plan reuse its pinned
 	// original snapshot, so they cannot prune away the old-image rollback point.
-	preMigrationPlanID               = "main-facts-schema-20260830-v21-channel-economics-revisions"
+	// v23 在 v21 渠道经济模型上增加上游错误日志明细与同步状态。
+	preMigrationPlanID               = "main-facts-schema-20260831-v23-channel-economics-upstream-errorlog"
 	preMigrationSourceV2PlanID       = "main-facts-schema-20260831-v22-nginx-source-v2-isolated"
 	preMigrationSnapshotPrefix       = "pre-migrate-"
 	preMigrationReferencePrefix      = ".pre-migration-plan-"

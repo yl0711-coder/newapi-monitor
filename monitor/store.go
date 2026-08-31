@@ -848,7 +848,7 @@ func (m *Monitor) openStore(path string) error {
 		&StabilityProblemIngestState{}, &StabilityProblemStage{}, &StabilityProblemClassificationMigration{}, &StabilityProblemLiveCursor{},
 		&StabilityHourIngestState{}, &StabilityBackfillJob{},
 		&ChannelFinanceSetting{}, &ChannelSaleGroupRate{}, &WebsiteGroupCatalog{}, &ChannelDomainCost{}, &ChannelDomainGroupCost{}, &ChannelFinanceChannelCost{}, &ChannelFinanceVersion{},
-		&ChannelUpstreamAccount{}, &ChannelUpstreamUsageHour{}, &NewAPIUsageBackfillCheckpoint{}, &NewAPIUsageBackfillSegment{}, &AICodeWithKeySyncState{}, &AICodeWithUsageStage{}, &AICodeWithUsageRound{}, &UpstreamHostCircuit{},
+		&ChannelUpstreamAccount{}, &ChannelUpstreamUsageHour{}, &ChannelUpstreamErrorLog{}, &UpstreamErrorLogSyncState{}, &NewAPIUsageBackfillCheckpoint{}, &NewAPIUsageBackfillSegment{}, &AICodeWithKeySyncState{}, &AICodeWithUsageStage{}, &AICodeWithUsageRound{}, &UpstreamHostCircuit{},
 		&ChannelUpstreamPricingHourEvidence{}, &ChannelUpstreamPricingHourState{}, &ChannelUpstreamPricingObservedState{}, &ChannelUpstreamPricingChangeEvent{}, &ChannelUpstreamPricingSyncState{}, &ChannelUpstreamPricingPageCheckpoint{}, &AICodeWithPricingCheckpoint{},
 		&ChannelUpstreamCostHourEvidence{}, &ChannelUpstreamCostHourState{}, &ChannelCostPageCheckpoint{}, &ChannelCostSourceBinding{}, &ChannelCostDirtyHour{}, &ChannelCostKeyRegistry{},
 		&ChannelPricingChangeProposal{}, &ChannelPricingProposalEvent{}, &ChannelFinanceActivation{}, &ChannelFinanceActivationSlot{}, &ChannelFinanceActivationEvent{},

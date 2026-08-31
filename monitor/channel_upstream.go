@@ -2638,8 +2638,8 @@ func (m *Monitor) startChannelUpstreamSync(ctx context.Context) {
 	// 这条 lane 只读写 Monitor SQLite，无上游 I/O，因此先于余额、日志和
 	// 计价采集闸门启动；上游全部停采时也不会丢失已排程任务。
 	m.startChannelFinanceActivationLane(ctx, 7*time.Second)
-	if !m.cfg.UpstreamSyncEnabled && !m.cfg.UpstreamUsageSyncEnabled {
-		slog.Info("上游余额与消费账单同步均已关闭")
+	if !m.cfg.UpstreamSyncEnabled && !m.cfg.UpstreamUsageSyncEnabled && !m.cfg.UpstreamPricingLedgerEnabled && !m.cfg.UpstreamErrorLogSyncEnabled {
+		slog.Info("上游余额、消费账单、计价证据与错误日志采集均已关闭")
 		return
 	}
 
@@ -2658,6 +2658,9 @@ func (m *Monitor) startChannelUpstreamSync(ctx context.Context) {
 	if !m.cfg.UpstreamUsageSyncEnabled {
 		slog.Info("上游使用日志同步处于灰度关闭状态，余额同步不受影响")
 	}
+	if !m.cfg.UpstreamErrorLogSyncEnabled {
+		slog.Info("上游错误日志采集处于灰度关闭状态，其余同步不受影响")
+	}
 	// Keep the lanes independent. A slow balance provider must not delay usage
 	// freshness or pricing evidence until the whole balance batch finishes.
 	// Request-level host/global protection still bounds aggregate traffic, and
@@ -2675,6 +2678,12 @@ func (m *Monitor) startChannelUpstreamSync(ctx context.Context) {
 	if m.cfg.UpstreamPricingLedgerEnabled {
 		goSourceEpoch(ctx, func(laneCtx context.Context) {
 			runUpstreamPeriodicLane(laneCtx, 10*time.Second, time.Minute, m.syncDueUpstreamPricing)
+		})
+	}
+	if m.cfg.UpstreamErrorLogSyncEnabled {
+		goSourceEpoch(ctx, func(laneCtx context.Context) {
+			// 同步器内部仍有 5 分钟节流和失败退避；每分钟只做到期检查。
+			runUpstreamPeriodicLane(laneCtx, 11*time.Second, time.Minute, m.syncDueUpstreamErrorLogs)
 		})
 	}
 	goSourceEpoch(ctx, func(cleanupCtx context.Context) {

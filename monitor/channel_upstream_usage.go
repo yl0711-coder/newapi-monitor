@@ -307,7 +307,20 @@ func fetchNewAPIPricingPage(ctx context.Context, client *http.Client, row Channe
 	return fetchNewAPIUsagePageWithDecoder(ctx, client, row, cred, from, to, pageNumber, pacer, decodeNewAPIUsageItem)
 }
 
+// fetchNewAPIUsagePageWithDecoder 取一页上游**消费**日志（type=2）。
+// 保留这个名字与签名：既有调用方（计价台账、回填、趋势）都在用，不动它们。
 func fetchNewAPIUsagePageWithDecoder[T any](ctx context.Context, client *http.Client, row ChannelUpstreamAccount, cred newAPICredential, from, to int64, pageNumber int, pacer *upstreamUsageRequestPacer, decodeItem func(json.RawMessage) (T, error)) (newAPIUsagePage[T], error) {
+	return fetchNewAPILogPageWithType(ctx, client, row, cred, from, to, pageNumber, pacer, 2, decodeItem)
+}
+
+// fetchNewAPILogPageWithType 是上面那个函数的一般化：把写死的 type 抽成参数。
+//
+// 抽出来是为了让上游**错误**日志（type=5，见 channel_upstream_errorlog.go）
+// 能复用同一套分页/限速/认证/页指纹，而不是另写一份——
+// 另写必然漏掉其中几条（半开区间的 to-1、页指纹防漏页、401/403 转换）。
+//
+// logType 只由调用方以常量传入，不接受用户输入，无注入面。
+func fetchNewAPILogPageWithType[T any](ctx context.Context, client *http.Client, row ChannelUpstreamAccount, cred newAPICredential, from, to int64, pageNumber int, pacer *upstreamUsageRequestPacer, logType int, decodeItem func(json.RawMessage) (T, error)) (newAPIUsagePage[T], error) {
 	if err := pacer.beforeRequest(ctx); err != nil {
 		return newAPIUsagePage[T]{}, err
 	}
@@ -317,7 +330,7 @@ func fetchNewAPIUsagePageWithDecoder[T any](ctx context.Context, client *http.Cl
 	query := url.Values{}
 	query.Set("p", strconv.Itoa(pageNumber))
 	query.Set("page_size", strconv.Itoa(upstreamUsagePageSize))
-	query.Set("type", "2")
+	query.Set("type", strconv.Itoa(logType))
 	query.Set("start_timestamp", strconv.FormatInt(from, 10))
 	// NewAPI's existing filter is inclusive. Use to-1 so every Monitor window
 	// remains the documented half-open interval [from,to), including splits.

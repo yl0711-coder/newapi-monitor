@@ -101,6 +101,19 @@ type Settings struct {
 	// 默认 1 保持所有上游请求全局串行；生产观察达标后最多升到 2。
 	// 同一 host 仍由 upstreamHostGuard 强制单并发，不能被此开关绕过。
 	UpstreamMaxConcurrency int // MONITOR_UPSTREAM_MAX_CONCURRENCY,默认 1，范围 1～2
+	// UpstreamErrorLogSyncEnabled 上游**错误**日志采集（MONITOR_UPSTREAM_ERRORLOG_SYNC_ENABLED）。
+	//
+	// ★ 为什么与 UpstreamUsageSyncEnabled 分开，不复用同一个开关 ★
+	//
+	// 两者拉的是同一个端点（/api/log/self）但目的与频率完全不同：
+	//   用量同步  type=2，量大（我方一天 4 万行量级），折进小时桶，为的是账单
+	//   错误采集  type=5，量小（一天几百条），逐条留存，为的是排障
+	// 混在一个开关里会互相牵制：想提高错误采集频率就被迫也提高账单同步频率，
+	// 而后者请求量大、更容易撞上游速率限制。
+	//
+	// 但**依赖账户级的 UsageSyncEnabled**：那是管理员对「允许读这个上游的日志」
+	// 的授权，错误日志同属日志，不应绕过它另开一道授权。
+	UpstreamErrorLogSyncEnabled bool
 	// 上游计价账本与既有消费汇总使用独立灰度闸门和域名白名单。
 	// 支持 NewAPI、Sub2API 和 AICodeWith；默认关闭且空白名单，迁移不会发起任何上游请求。
 	UpstreamPricingLedgerEnabled       bool     // MONITOR_UPSTREAM_PRICING_LEDGER_ENABLED，默认 false
@@ -312,6 +325,7 @@ func LoadSettings() Settings {
 		UpstreamSyncTimeoutSec:                   envInt("MONITOR_UPSTREAM_SYNC_TIMEOUT_SECONDS", 15),
 		UpstreamUsageSyncEnabled:                 env("MONITOR_UPSTREAM_USAGE_SYNC_ENABLED", "false") == "true",
 		UpstreamUsageSyncMinutes:                 envInt("MONITOR_UPSTREAM_USAGE_SYNC_MINUTES", 20),
+		UpstreamErrorLogSyncEnabled:              env("MONITOR_UPSTREAM_ERRORLOG_SYNC_ENABLED", "false") == "true",
 		UpstreamUsageBackfillDays:                envInt("MONITOR_UPSTREAM_USAGE_BACKFILL_DAYS", 90),
 		UpstreamMaxConcurrency:                   envInt("MONITOR_UPSTREAM_MAX_CONCURRENCY", 1),
 		UpstreamPricingLedgerEnabled:             env("MONITOR_UPSTREAM_PRICING_LEDGER_ENABLED", "false") == "true",
