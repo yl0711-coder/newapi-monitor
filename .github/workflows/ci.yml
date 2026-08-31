@@ -37,19 +37,17 @@ jobs:
           docker exec "${{ job.services.redis.id }}" redis-cli CONFIG SET requirepass "$MONITOR_TEST_REDIS_PASSWORD"
           test "$(docker exec -e REDISCLI_AUTH="$MONITOR_TEST_REDIS_PASSWORD" "${{ job.services.redis.id }}" redis-cli ping)" = "PONG"
       - run: go vet ./...
-      # -race:代码里有 singleflight 缓存/多把 mutex/channel 同步,竞态检测必须常开。
-      # 环境变量让同一套测试同时覆盖真实 Redis 往返、错误凭据和不可用时快速降级。
-      - name: Test with race detector and real Redis
+      # monitor 包的 1000+ 个测试由下方 race-monitor 作业分片执行。这里继续
+      # 覆盖其余全部包，避免新增包静默逃离竞态检测。
+      - name: Test non-monitor packages with race detector and real Redis
         env:
           MONITOR_TEST_REDIS_ADDR: 127.0.0.1:6379
           MONITOR_TEST_REDIS_PASSWORD: ci-only-redis-password
           MONITOR_TEST_REDIS_UNAVAILABLE_ADDR: 127.0.0.1:6390
-        # The monitor package now contains the full migration, restore,
-        # channel-cost evidence and concurrency fault matrices. On a shared
-        # GitHub runner the complete race pass can legitimately exceed 20
-        # minutes even while tests continue to make progress. Keep the full
-        # matrix and allow enough package time instead of dropping coverage.
-        run: go test -race -timeout 40m ./...
+        run: |
+          mapfile -t packages < <(go list ./... | grep -v '/monitor$')
+          test "${#packages[@]}" -gt 0
+          go test -race -timeout 20m "${packages[@]}"
       - name: Check reachable Go vulnerabilities
         run: go run golang.org/x/vuln/cmd/govulncheck@v1.1.4 ./...
       - name: golangci-lint
@@ -117,11 +115,64 @@ jobs:
             test ! -e /context/monitor/ci-local-config.json
           '
 
+  # monitor 是单个 Go 包，go test 无法在包内自动并行分片。按测试名称首字母
+  # 划分成四个互斥且完整的集合，既保留全量 race 覆盖，也让每个分片拥有独立
+  # 的 20 分钟卡死保护，避免共享 runner 变慢时触发单包累计超时。
+  race-monitor:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - shard: a-f
+            pattern: '^Test[A-F]'
+          - shard: g-n
+            pattern: '^Test[G-N]'
+          - shard: o-s
+            pattern: '^Test[O-S]'
+          - shard: t-w
+            pattern: '^Test[T-W]'
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "REDISCLI_AUTH=ci-only-redis-password redis-cli ping"
+          --health-interval 2s
+          --health-timeout 2s
+          --health-retries 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.6'
+      - name: Enable authentication on test Redis
+        env:
+          MONITOR_TEST_REDIS_PASSWORD: ci-only-redis-password
+        run: |
+          docker exec "${{ job.services.redis.id }}" redis-cli CONFIG SET requirepass "$MONITOR_TEST_REDIS_PASSWORD"
+          test "$(docker exec -e REDISCLI_AUTH="$MONITOR_TEST_REDIS_PASSWORD" "${{ job.services.redis.id }}" redis-cli ping)" = "PONG"
+      - name: Verify shard is non-empty
+        env:
+          TEST_PATTERN: ${{ matrix.pattern }}
+        run: |
+          test_count="$(go test -list "$TEST_PATTERN" ./monitor | grep -c '^Test')"
+          test "$test_count" -gt 0
+          echo "monitor race shard ${{ matrix.shard }}: $test_count tests"
+      - name: Test monitor shard with race detector and real Redis
+        env:
+          MONITOR_TEST_REDIS_ADDR: 127.0.0.1:6379
+          MONITOR_TEST_REDIS_PASSWORD: ci-only-redis-password
+          MONITOR_TEST_REDIS_UNAVAILABLE_ADDR: 127.0.0.1:6390
+          TEST_PATTERN: ${{ matrix.pattern }}
+        run: go test -race -timeout 20m -run "$TEST_PATTERN" ./monitor
+
   # 用内置 GITHUB_TOKEN 推送,无需额外配置 secret。首次发布后,在 Packages 设置里把包可见性设为 Public。
   # 测试通过后才构建并发布镜像到 GHCR(PR 不发布)。
   # 三个镜像:monitor 主服务 + hostagent 主机采集器 + nginxcollector 入口采集器。
   build-push:
-    needs: test
+    needs: [test, race-monitor]
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     permissions:
