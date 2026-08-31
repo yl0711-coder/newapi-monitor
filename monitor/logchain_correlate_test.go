@@ -200,7 +200,7 @@ func TestCorrelateUIDistinguishesConfidence(t *testing.T) {
 		t.Error("表格缺关联标记")
 	}
 	// CSS 缺了色块会退化成无样式文本，四档看起来一模一样。
-	css := string(pageHTML)
+	css := pageHTML
 	for _, want := range []string{
 		".lc-corr{", ".lc-corr-exact{", ".lc-corr-probable{",
 		".lc-corr-ambiguous{", ".lc-corr-dot{",
@@ -275,7 +275,7 @@ func TestCorrelateUIHidesRedundantFields(t *testing.T) {
 		t.Error("不一致时缺警告样式")
 	}
 	for _, want := range []string{".lc-upraw{", ".lc-upraw-head{", ".lc-upraw-diff"} {
-		if !strings.Contains(string(pageHTML), want) {
+		if !strings.Contains(pageHTML, want) {
 			t.Errorf("page.html 缺样式 %q", want)
 		}
 	}
