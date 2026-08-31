@@ -107,6 +107,10 @@ func statDeviceID[T ~int32 | ~uint32 | ~uint64](device T) uint64 {
 	return uint64(device)
 }
 
+func statModeBits[T ~uint16 | ~uint32](mode T) uint32 {
+	return uint32(mode)
+}
+
 func main() {
 	var rawLogs string
 	var timeout time.Duration
@@ -389,7 +393,7 @@ func inspectLogFiles(dir string, names []string) ([]fileIdentity, error) {
 		if !ok || stat.Nlink != 1 {
 			return nil, fmt.Errorf("%s must have one hard link and a stable inode", path)
 		}
-		out = append(out, fileIdentity{Path: path, Dev: statDeviceID(stat.Dev), Inode: stat.Ino, Size: info.Size(), UID: stat.Uid, GID: stat.Gid, Mode: uint32(stat.Mode & 0o777)})
+		out = append(out, fileIdentity{Path: path, Dev: statDeviceID(stat.Dev), Inode: stat.Ino, Size: info.Size(), UID: stat.Uid, GID: stat.Gid, Mode: statModeBits(stat.Mode & 0o777)})
 	}
 	return out, nil
 }

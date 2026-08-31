@@ -165,9 +165,15 @@ func formatGeneration(value uint64) string {
 	return string(buf)
 }
 
+// statDeviceValue keeps syscall.Stat_t.Dev portable: Linux exposes uint64,
+// while Darwin uses a narrower signed integer.
+func statDeviceValue[T ~int32 | ~uint32 | ~uint64](device T) uint64 {
+	return uint64(device)
+}
+
 func sourceDevice(info os.FileInfo) uint64 {
 	if stat, ok := info.Sys().(*syscall.Stat_t); ok {
-		return uint64(stat.Dev)
+		return statDeviceValue(stat.Dev)
 	}
 	return 0
 }

@@ -96,5 +96,5 @@ func writerIdentityForTest(t *testing.T, path, name string) writerReleaseIdentit
 	if !ok {
 		t.Fatal("missing linux stat identity")
 	}
-	return writerReleaseIdentityV2{Name: name, Device: uint64(stat.Dev), Inode: stat.Ino}
+	return writerReleaseIdentityV2{Name: name, Device: sourceDevice(info), Inode: stat.Ino}
 }

@@ -558,7 +558,7 @@ func fileInode(info os.FileInfo) uint64 {
 
 func fileDevice(info os.FileInfo) uint64 {
 	if stat, ok := info.Sys().(*syscall.Stat_t); ok {
-		return uint64(stat.Dev)
+		return statDeviceValue(stat.Dev)
 	}
 	return 0
 }
