@@ -14,6 +14,7 @@ func TestWriterReleaseProofFileRetiresMissingDrainedAccessAndError(t *testing.T)
 	dir := t.TempDir()
 	type lane struct {
 		name    string
+		oldPath string
 		current writerReleaseIdentityV2
 		old     writerReleaseIdentityV2
 		state   sourceCursorV2
@@ -45,10 +46,16 @@ func TestWriterReleaseProofFileRetiresMissingDrainedAccessAndError(t *testing.T)
 					FirstSeenAt: 100, LastSeenAt: 100, LastGrowthAt: 100, PathBase: name, State: "quiescent", Current: true, Registered: true},
 			},
 		}
-		if err := os.Remove(oldPath); err != nil {
+		// Keep every rotated file alive until all identities have been sampled.
+		// Removing one here lets filesystems immediately reuse its inode for the
+		// next lane, which would correctly make the shared proof fail closed as
+		// a duplicate physical identity and turn this success-path test flaky.
+		lanes = append(lanes, lane{name: name, oldPath: oldPath, current: current, old: old, state: state})
+	}
+	for _, lane := range lanes {
+		if err := os.Remove(lane.oldPath); err != nil {
 			t.Fatal(err)
 		}
-		lanes = append(lanes, lane{name: name, current: current, old: old, state: state})
 	}
 	proof := writerReleaseProofV2{
 		Version: writerReleaseProofVersionV2, GeneratedAt: 200, ContainerID: testWriterContainerIDV2,
