@@ -64,8 +64,15 @@ func TestWriterReleaseProofFileRetiresMissingDrainedAccessAndError(t *testing.T)
 	if err := os.WriteFile(proofPath, data, 0o600); err != nil {
 		t.Fatal(err)
 	}
+	if os.Geteuid() != 0 {
+		_, changed, err := applyWriterReleaseProofV2(lanes[0].state, filepath.Join(dir, lanes[0].name), proofPath, 200)
+		if err == nil || changed {
+			t.Fatalf("production loader accepted a non-root proof: changed=%v err=%v", changed, err)
+		}
+	}
+	trustedUID := uint32(os.Geteuid())
 	for _, lane := range lanes {
-		next, changed, err := applyWriterReleaseProofV2(lane.state, filepath.Join(dir, lane.name), proofPath, 200)
+		next, changed, err := applyWriterReleaseProofOwnedByV2(lane.state, filepath.Join(dir, lane.name), proofPath, 200, trustedUID)
 		if err != nil || !changed || next.Files[0].State != "retired" {
 			t.Fatalf("%s did not consume shared root-owned proof: changed=%v state=%+v err=%v", lane.name, changed, next.Files, err)
 		}

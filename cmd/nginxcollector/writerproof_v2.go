@@ -37,6 +37,14 @@ func defaultWriterReleaseProofPathV2(logPath string) string {
 }
 
 func loadWriterReleaseProofV2(path string) (writerReleaseProofV2, error) {
+	return loadWriterReleaseProofOwnedByV2(path, 0)
+}
+
+// loadWriterReleaseProofOwnedByV2 keeps the production trust boundary in
+// loadWriterReleaseProofV2 fixed at UID 0 while allowing the Linux test suite
+// to exercise the remaining file and payload checks on an unprivileged CI
+// runner.  Runtime callers must use loadWriterReleaseProofV2.
+func loadWriterReleaseProofOwnedByV2(path string, trustedUID uint32) (writerReleaseProofV2, error) {
 	fd, err := syscall.Open(path, syscall.O_RDONLY|syscall.O_CLOEXEC|syscall.O_NOFOLLOW, 0)
 	if err != nil {
 		return writerReleaseProofV2{}, err
@@ -55,7 +63,7 @@ func loadWriterReleaseProofV2(path string) (writerReleaseProofV2, error) {
 		return writerReleaseProofV2{}, errors.New("writer-release proof must be a bounded regular non-symlink file")
 	}
 	stat, ok := info.Sys().(*syscall.Stat_t)
-	if !ok || stat.Nlink != 1 || stat.Uid != 0 || info.Mode().Perm()&0o022 != 0 {
+	if !ok || stat.Nlink != 1 || stat.Uid != trustedUID || info.Mode().Perm()&0o022 != 0 {
 		return writerReleaseProofV2{}, errors.New("writer-release proof must be root-owned, single-linked and not group/world writable")
 	}
 	data, err := io.ReadAll(io.LimitReader(handle, 256<<10))
@@ -118,7 +126,14 @@ func validateWriterReleaseProofV2(proof writerReleaseProofV2, current sourceCand
 }
 
 func applyWriterReleaseProofV2(state sourceCursorV2, logPath, proofPath string, now int64) (sourceCursorV2, bool, error) {
-	proof, err := loadWriterReleaseProofV2(proofPath)
+	return applyWriterReleaseProofOwnedByV2(state, logPath, proofPath, now, 0)
+}
+
+// applyWriterReleaseProofOwnedByV2 is the test seam paired with
+// loadWriterReleaseProofOwnedByV2.  The production wrapper above always pins
+// trustedUID to root.
+func applyWriterReleaseProofOwnedByV2(state sourceCursorV2, logPath, proofPath string, now int64, trustedUID uint32) (sourceCursorV2, bool, error) {
+	proof, err := loadWriterReleaseProofOwnedByV2(proofPath, trustedUID)
 	if errors.Is(err, os.ErrNotExist) {
 		return state, false, nil
 	}
