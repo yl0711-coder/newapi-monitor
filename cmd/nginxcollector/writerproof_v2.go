@@ -36,14 +36,10 @@ func defaultWriterReleaseProofPathV2(logPath string) string {
 	return filepath.Join(filepath.Dir(logPath), ".nginx-writer-release-v2.json")
 }
 
-func loadWriterReleaseProofV2(path string) (writerReleaseProofV2, error) {
-	return loadWriterReleaseProofOwnedByV2(path, 0)
-}
-
-// loadWriterReleaseProofOwnedByV2 keeps the production trust boundary in
-// loadWriterReleaseProofV2 fixed at UID 0 while allowing the Linux test suite
-// to exercise the remaining file and payload checks on an unprivileged CI
-// runner.  Runtime callers must use loadWriterReleaseProofV2.
+// loadWriterReleaseProofOwnedByV2 is called with UID 0 by the production
+// applyWriterReleaseProofV2 wrapper. The explicit owner argument exists only
+// so Linux tests can exercise the remaining file and payload checks on an
+// unprivileged CI runner; runtime callers must use applyWriterReleaseProofV2.
 func loadWriterReleaseProofOwnedByV2(path string, trustedUID uint32) (writerReleaseProofV2, error) {
 	fd, err := syscall.Open(path, syscall.O_RDONLY|syscall.O_CLOEXEC|syscall.O_NOFOLLOW, 0)
 	if err != nil {

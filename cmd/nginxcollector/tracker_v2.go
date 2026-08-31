@@ -232,7 +232,8 @@ func listSourceCandidatesWithHookV2(logPath string, beforeRevalidate func()) ([]
 	if err != nil {
 		return nil, err
 	}
-	candidates := append(rotated, current)
+	rotated = append(rotated, current)
+	candidates := rotated
 	// Rotation can happen between the first current Lstat and directory scan.
 	// Revalidate the whole identity set and ask the caller to retry instead of
 	// returning a mixed path/inode snapshot.
@@ -583,7 +584,7 @@ func verifySourceAnchorV2(candidate sourceCandidateV2, file fileWatermark) error
 	}
 	hasher := sha256.New()
 	if _, err := io.CopyN(hasher, f, file.AckedOffset-file.AnchorStart); err != nil {
-		return fmt.Errorf("%w: cannot read source anchor: %v", errSourceCursorLoss, err)
+		return fmt.Errorf("%w: cannot read source anchor: %w", errSourceCursorLoss, err)
 	}
 	if hex.EncodeToString(hasher.Sum(nil)) != file.AnchorSHA256 {
 		return fmt.Errorf("%w: source content anchor changed for %s", errSourceCursorLoss, file.FileID)

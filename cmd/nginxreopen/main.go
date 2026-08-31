@@ -101,6 +101,12 @@ type writerReleaseProof struct {
 	Released    []writerReleaseIdentity `json:"released"`
 }
 
+// statDeviceID keeps the syscall.Stat_t device conversion portable: Linux
+// exposes Dev as uint64 while Darwin uses a narrower signed integer.
+func statDeviceID[T ~int32 | ~uint32 | ~uint64](device T) uint64 {
+	return uint64(device)
+}
+
 func main() {
 	var rawLogs string
 	var timeout time.Duration
@@ -283,8 +289,7 @@ func run(ctx context.Context, o options) (result, error) {
 	if _, err := command(ctx, "docker", "kill", "-s", "USR1", before.ID); err != nil {
 		return result{}, fmt.Errorf("signal nginx master: %w", err)
 	}
-	workers, err = waitForWorkerFDs(ctx, o.container, before, files, o.logNames, o.logGID)
-	if err != nil {
+	if _, err := waitForWorkerFDs(ctx, o.container, before, files, o.logNames, o.logGID); err != nil {
 		return result{}, err
 	}
 	after, err := inspectContainer(ctx, before.ID)
@@ -384,7 +389,7 @@ func inspectLogFiles(dir string, names []string) ([]fileIdentity, error) {
 		if !ok || stat.Nlink != 1 {
 			return nil, fmt.Errorf("%s must have one hard link and a stable inode", path)
 		}
-		out = append(out, fileIdentity{Path: path, Dev: uint64(stat.Dev), Inode: stat.Ino, Size: info.Size(), UID: stat.Uid, GID: stat.Gid, Mode: uint32(stat.Mode & 0o777)})
+		out = append(out, fileIdentity{Path: path, Dev: statDeviceID(stat.Dev), Inode: stat.Ino, Size: info.Size(), UID: stat.Uid, GID: stat.Gid, Mode: uint32(stat.Mode & 0o777)})
 	}
 	return out, nil
 }
@@ -421,7 +426,7 @@ func inspectRotatedLogIdentities(dir string, names []string) ([]writerReleaseIde
 			return nil, errors.New("rotated logs contain a duplicate physical identity")
 		}
 		seen[key] = true
-		out = append(out, writerReleaseIdentity{Name: name, Device: uint64(stat.Dev), Inode: stat.Ino})
+		out = append(out, writerReleaseIdentity{Name: name, Device: statDeviceID(stat.Dev), Inode: stat.Ino})
 	}
 	sort.Slice(out, func(i, j int) bool {
 		if out[i].Device != out[j].Device {
@@ -615,7 +620,7 @@ func verifyCurrentFileSet(expected []fileIdentity, gid int) error {
 			return fmt.Errorf("current log disappeared or changed type: %s", file.Path)
 		}
 		stat, ok := info.Sys().(*syscall.Stat_t)
-		if !ok || uint64(stat.Dev) != file.Dev || stat.Ino != file.Inode || stat.Nlink != 1 {
+		if !ok || statDeviceID(stat.Dev) != file.Dev || stat.Ino != file.Inode || stat.Nlink != 1 {
 			return fmt.Errorf("current log rotated during preparation: %s", file.Path)
 		}
 		if stat.Uid != 0 || int(stat.Gid) != gid || stat.Mode&0o777 != 0o640 {
@@ -827,7 +832,7 @@ func verifyTraverse(path string, worker workerProcess) error {
 		// supplementary group, otherwise other. It does not OR all classes.
 		canTraverse := false
 		switch {
-		case uint32(stat.Uid) == uint32(worker.UID):
+		case stat.Uid == uint32(worker.UID):
 			canTraverse = perm&0o100 != 0
 		case worker.Groups[int(stat.Gid)]:
 			canTraverse = perm&0o010 != 0
@@ -946,7 +951,7 @@ func verifyWorkerFDs(workers []workerProcess, files []fileIdentity, logNames []s
 				continue
 			}
 			for _, file := range files {
-				if uint64(stat.Dev) == file.Dev && stat.Ino == file.Inode {
+				if statDeviceID(stat.Dev) == file.Dev && stat.Ino == file.Inode {
 					if err := verifyWritableAppendFD(pid, entry.Name()); err != nil {
 						return err
 					}

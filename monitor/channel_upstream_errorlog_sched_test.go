@@ -8,6 +8,7 @@ package monitor
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -83,7 +84,9 @@ func TestSyncOneUpstreamErrorLogMarksUnsupportedProviders(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			m.syncOneUpstreamErrorLog(context.Background(), row, 1000)
+			if err := m.syncOneUpstreamErrorLog(context.Background(), row, 1000); err != nil {
+				t.Fatal(err)
+			}
 
 			var state UpstreamErrorLogSyncState
 			if err := m.storeDB.First(&state, "domain = ?", row.Domain).Error; err != nil {
@@ -115,14 +118,18 @@ func TestSyncOneUpstreamErrorLogSkipsUnsupportedOnLaterRuns(t *testing.T) {
 	if err := m.storeDB.Create(&row).Error; err != nil {
 		t.Fatal(err)
 	}
-	m.syncOneUpstreamErrorLog(context.Background(), row, 1000)
+	if err := m.syncOneUpstreamErrorLog(context.Background(), row, 1000); err != nil {
+		t.Fatal(err)
+	}
 
 	var first UpstreamErrorLogSyncState
 	if err := m.storeDB.First(&first, "domain = ?", row.Domain).Error; err != nil {
 		t.Fatal(err)
 	}
 	// 第二轮：时刻推后，但状态不该被改写。
-	m.syncOneUpstreamErrorLog(context.Background(), row, 9000)
+	if err := m.syncOneUpstreamErrorLog(context.Background(), row, 9000); err != nil {
+		t.Fatal(err)
+	}
 
 	var second UpstreamErrorLogSyncState
 	if err := m.storeDB.First(&second, "domain = ?", row.Domain).Error; err != nil {
@@ -141,7 +148,9 @@ func TestFailUpstreamErrorLogStateDoesNotAdvanceWatermark(t *testing.T) {
 	m := newTestMonitor(t)
 	state := UpstreamErrorLogSyncState{Domain: "d.example", CoverageFrom: 4000, SyncedUntil: 5000}
 
-	m.failUpstreamErrorLogState(context.Background(), &state, 9000, errTestUpstream)
+	if err := m.failUpstreamErrorLogState(context.Background(), &state, 9000, errTestUpstream); !errors.Is(err, errTestUpstream) {
+		t.Fatalf("失败状态应返回原始上游错误，got=%v", err)
+	}
 
 	if state.SyncedUntil != 5000 {
 		t.Errorf("失败时水位被推进了，那段日志将永久漏掉: got=%d want=5000", state.SyncedUntil)
@@ -164,7 +173,9 @@ func TestFailUpstreamErrorLogStateBacksOffExponentially(t *testing.T) {
 	state := UpstreamErrorLogSyncState{Domain: "d.example"}
 	var prev int64
 	for i := 1; i <= 12; i++ {
-		m.failUpstreamErrorLogState(context.Background(), &state, 0, errTestUpstream)
+		if err := m.failUpstreamErrorLogState(context.Background(), &state, 0, errTestUpstream); !errors.Is(err, errTestUpstream) {
+			t.Fatalf("失败状态应返回原始上游错误，got=%v", err)
+		}
 		gap := state.NextSyncAt
 		if i > 1 && gap < prev {
 			t.Errorf("第 %d 次退避比上次短了: %d < %d", i, gap, prev)
@@ -201,7 +212,9 @@ func TestSyncOneUpstreamErrorLogHonoursNextSyncAt(t *testing.T) {
 	}
 
 	// 若未按期跳过，会走到凭据解密并因缺凭据而落 error 状态。
-	m.syncOneUpstreamErrorLog(context.Background(), row, 1000)
+	if err := m.syncOneUpstreamErrorLog(context.Background(), row, 1000); err != nil {
+		t.Fatal(err)
+	}
 
 	var state UpstreamErrorLogSyncState
 	if err := m.storeDB.First(&state, "domain = ?", row.Domain).Error; err != nil {

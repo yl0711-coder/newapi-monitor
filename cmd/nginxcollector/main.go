@@ -1058,19 +1058,19 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-	ticker := time.NewTicker(c.interval)
-	defer ticker.Stop()
-	if c.evidenceMode != "off" {
-		go runEvidenceWorker(ctx, c)
-	}
 	var sourceV2Client *sourceV2HTTPClient
 	if c.sourceV2Access || c.sourceV2Error {
 		sourceV2Client, err = newSourceV2HTTPClient(c.sourceV2BaseURL, c.token, c.allowHTTP)
 		if err != nil {
 			log.Fatal(err)
 		}
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	ticker := time.NewTicker(c.interval)
+	defer ticker.Stop()
+	if c.evidenceMode != "off" {
+		go runEvidenceWorker(ctx, c)
 	}
 	if c.errorEnabled {
 		if c.sourceV2Error {
