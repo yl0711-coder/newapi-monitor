@@ -34,18 +34,19 @@ const (
 )
 
 type options struct {
-	container       string
-	collector       string
-	logDir          string
-	containerLogDir string
-	logNames        []string
-	lockPath        string
-	probeURL        string
-	probeStatus     int
-	proofPath       string
-	logGID          int
-	checkOnly       bool
-	timeout         time.Duration
+	container        string
+	collector        string
+	logDir           string
+	containerLogDir  string
+	logNames         []string
+	lockPath         string
+	probeURL         string
+	probeStatus      int
+	proofPath        string
+	logGID           int
+	trustedParentUID int
+	checkOnly        bool
+	timeout          time.Duration
 }
 
 type containerState struct {
@@ -72,19 +73,20 @@ type fileIdentity struct {
 }
 
 type result struct {
-	OK              bool           `json:"ok"`
-	CheckOnly       bool           `json:"check_only"`
-	Container       string         `json:"container"`
-	ContainerPID    int            `json:"container_pid"`
-	WorkerPIDs      []int          `json:"worker_pids"`
-	WorkerHostUID   int            `json:"worker_host_uid"`
-	CollectorLogGID int            `json:"collector_log_gid"`
-	Files           []fileIdentity `json:"files"`
-	ProbeUsed       bool           `json:"probe_used"`
-	ElapsedMS       int64          `json:"elapsed_ms"`
-	Warnings        []string       `json:"warnings,omitempty"`
-	ProofPath       string         `json:"proof_path,omitempty"`
-	ReleasedInodes  int            `json:"released_inodes,omitempty"`
+	OK               bool           `json:"ok"`
+	CheckOnly        bool           `json:"check_only"`
+	Container        string         `json:"container"`
+	ContainerPID     int            `json:"container_pid"`
+	WorkerPIDs       []int          `json:"worker_pids"`
+	WorkerHostUID    int            `json:"worker_host_uid"`
+	CollectorLogGID  int            `json:"collector_log_gid"`
+	TrustedParentUID int            `json:"trusted_parent_uid,omitempty"`
+	Files            []fileIdentity `json:"files"`
+	ProbeUsed        bool           `json:"probe_used"`
+	ElapsedMS        int64          `json:"elapsed_ms"`
+	Warnings         []string       `json:"warnings,omitempty"`
+	ProofPath        string         `json:"proof_path,omitempty"`
+	ReleasedInodes   int            `json:"released_inodes,omitempty"`
 }
 
 type writerReleaseIdentity struct {
@@ -127,6 +129,7 @@ func main() {
 	flag.IntVar(&opts.probeStatus, "probe-expected-status", http.StatusOK, "exact HTTP status expected from the loopback probe")
 	flag.StringVar(&opts.proofPath, "proof", "", "writer-release proof path (default: inside log-dir)")
 	flag.IntVar(&opts.logGID, "log-gid", -1, "expected numeric host GID of the dedicated log group")
+	flag.IntVar(&opts.trustedParentUID, "trusted-parent-uid", -1, "optional non-root owner UID accepted only on parent directories")
 	flag.BoolVar(&opts.checkOnly, "check", false, "validate only; do not chown, chmod or signal")
 	flag.DurationVar(&timeout, "timeout", 20*time.Second, "total operation timeout")
 	flag.Parse()
@@ -178,6 +181,9 @@ func validateOptions(o options) error {
 	}
 	if o.logGID <= 0 {
 		return errors.New("log-gid must be an explicit positive numeric host GID")
+	}
+	if o.trustedParentUID < -1 || o.trustedParentUID == 0 {
+		return errors.New("trusted-parent-uid must be -1 (disabled) or a positive numeric UID")
 	}
 	if o.probeURL != "" {
 		u, err := url.ParseRequestURI(o.probeURL)
@@ -233,7 +239,7 @@ func run(ctx context.Context, o options) (result, error) {
 		_ = lock.Close()
 	}()
 
-	_, dirStat, err := secureDirectory(o.logDir)
+	_, dirStat, err := secureDirectory(o.logDir, o.trustedParentUID)
 	if err != nil {
 		return result{}, err
 	}
@@ -288,7 +294,7 @@ func run(ctx context.Context, o options) (result, error) {
 		if err := verifyNoRotatedLogFDs(processes, o.logNames); err != nil {
 			return result{}, err
 		}
-		return result{OK: true, CheckOnly: true, Container: o.container, ContainerPID: before.PID, WorkerPIDs: workerPIDs(workers), WorkerHostUID: workerUID, CollectorLogGID: o.logGID, Files: files}, nil
+		return result{OK: true, CheckOnly: true, Container: o.container, ContainerPID: before.PID, WorkerPIDs: workerPIDs(workers), WorkerHostUID: workerUID, CollectorLogGID: o.logGID, TrustedParentUID: o.trustedParentUID, Files: files}, nil
 	}
 
 	// Ownership and mode are deployment invariants. Never repair them in this
@@ -336,7 +342,7 @@ func run(ctx context.Context, o options) (result, error) {
 	if err != nil {
 		return result{}, err
 	}
-	return result{OK: true, Container: o.container, ContainerPID: after.PID, WorkerPIDs: workerPIDs(workers), WorkerHostUID: workerUID, CollectorLogGID: o.logGID, Files: files, ProbeUsed: true, ProofPath: o.proofPath, ReleasedInodes: released}, nil
+	return result{OK: true, Container: o.container, ContainerPID: after.PID, WorkerPIDs: workerPIDs(workers), WorkerHostUID: workerUID, CollectorLogGID: o.logGID, TrustedParentUID: o.trustedParentUID, Files: files, ProbeUsed: true, ProofPath: o.proofPath, ReleasedInodes: released}, nil
 }
 
 func acquireLock(path string) (*os.File, error) {
@@ -364,10 +370,11 @@ func acquireLock(path string) (*os.File, error) {
 	return f, nil
 }
 
-func secureDirectory(path string) (os.FileInfo, *syscall.Stat_t, error) {
+func secureDirectory(path string, trustedParentUID int) (os.FileInfo, *syscall.Stat_t, error) {
 	var finalInfo os.FileInfo
 	var finalStat *syscall.Stat_t
-	for current := filepath.Clean(path); ; current = filepath.Dir(current) {
+	cleaned := filepath.Clean(path)
+	for current := cleaned; ; current = filepath.Dir(current) {
 		info, err := os.Lstat(current)
 		if err != nil {
 			return nil, nil, fmt.Errorf("lstat directory %s: %w", current, err)
@@ -376,8 +383,8 @@ func secureDirectory(path string) (os.FileInfo, *syscall.Stat_t, error) {
 			return nil, nil, fmt.Errorf("directory component must be a real directory: %s", current)
 		}
 		stat, ok := info.Sys().(*syscall.Stat_t)
-		if !ok || stat.Uid != 0 {
-			return nil, nil, fmt.Errorf("directory component must be root-owned: %s", current)
+		if !ok || !directoryOwnerAllowed(stat.Uid, current == cleaned, trustedParentUID) {
+			return nil, nil, fmt.Errorf("directory component has untrusted owner UID %d: %s", stat.Uid, current)
 		}
 		if info.Mode().Perm()&0o022 != 0 {
 			return nil, nil, fmt.Errorf("directory component must not be group/world writable: %s", current)
@@ -390,6 +397,17 @@ func secureDirectory(path string) (os.FileInfo, *syscall.Stat_t, error) {
 		}
 	}
 	return finalInfo, finalStat, nil
+}
+
+func directoryOwnerAllowed(uid uint32, final bool, trustedParentUID int) bool {
+	if uid == 0 {
+		return true
+	}
+	// The terminal log directory is modified by this privileged helper and
+	// must always remain root-owned. A deployment-owned ancestor may be
+	// accepted only when its exact UID is supplied explicitly; group/world
+	// writability is still rejected independently.
+	return !final && trustedParentUID > 0 && uint64(uid) == uint64(trustedParentUID)
 }
 
 func inspectLogFiles(dir string, names []string) ([]fileIdentity, error) {

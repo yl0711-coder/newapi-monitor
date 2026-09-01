@@ -304,6 +304,11 @@ access/error 游标卷恢复到同一个已校验的时点；严禁只恢复其�
 不再被任何 Nginx 进程持有、四条 lane 的审计结果已留档且游标卷完成备份后，才可按该
 offset 恢复；随后先开启 prepare 获取服务端边界 ACK，再逐 lane 切到 source v2。
 
+若专用日志位于部署用户拥有的祖先目录（生产当前为 `/opt/nexusapi`、UID 1000），
+`nginxreopen` 必须显式传入 `-trusted-parent-uid 1000`。该例外只允许匹配 UID 的祖先目录，
+不允许终端日志目录脱离 root 所有权，也不放宽任何 group/world writable 目录；新节点安装前
+必须重新核对 UID，不能照抄旧节点数值。
+
 ## 日志轮转与连续性
 
 采集器以 inode 和字节偏移持久化游标。日志 rename 轮转后，只要旧 inode 仍以未压缩

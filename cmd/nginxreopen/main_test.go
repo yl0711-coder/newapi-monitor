@@ -14,7 +14,7 @@ import (
 )
 
 func TestValidateOptionsRejectsUnsafeTargets(t *testing.T) {
-	base := options{container: defaultContainer, collector: defaultCollector, logDir: "/safe/logs", containerLogDir: "/var/log/safe", logNames: []string{"access.log"}, lockPath: "/tmp/reopen.lock", proofPath: "/safe/logs/.nginx-writer-release-v2.json", logGID: 987, probeStatus: 200, checkOnly: true, timeout: 20 * time.Second}
+	base := options{container: defaultContainer, collector: defaultCollector, logDir: "/safe/logs", containerLogDir: "/var/log/safe", logNames: []string{"access.log"}, lockPath: "/tmp/reopen.lock", proofPath: "/safe/logs/.nginx-writer-release-v2.json", logGID: 987, trustedParentUID: -1, probeStatus: 200, checkOnly: true, timeout: 20 * time.Second}
 	for _, mutate := range []func(*options){
 		func(o *options) { o.container = "nginx;reboot" },
 		func(o *options) { o.logDir = "/" },
@@ -23,6 +23,7 @@ func TestValidateOptionsRejectsUnsafeTargets(t *testing.T) {
 		func(o *options) { o.lockPath = "relative.lock" },
 		func(o *options) { o.proofPath = "/another-dir/proof.json" },
 		func(o *options) { o.logGID = 0 },
+		func(o *options) { o.trustedParentUID = -2 },
 		func(o *options) { o.probeURL = "https://example.com/status" },
 		func(o *options) { o.probeStatus = 99 },
 	} {
@@ -36,13 +37,29 @@ func TestValidateOptionsRejectsUnsafeTargets(t *testing.T) {
 }
 
 func TestValidateOptionsRequiresLoopbackProbeForReopen(t *testing.T) {
-	value := options{container: defaultContainer, collector: defaultCollector, logDir: "/safe/logs", containerLogDir: "/var/log/safe", logNames: []string{"access.log"}, lockPath: "/tmp/reopen.lock", proofPath: "/safe/logs/.nginx-writer-release-v2.json", logGID: 987, probeStatus: 200, timeout: 20 * time.Second}
+	value := options{container: defaultContainer, collector: defaultCollector, logDir: "/safe/logs", containerLogDir: "/var/log/safe", logNames: []string{"access.log"}, lockPath: "/tmp/reopen.lock", proofPath: "/safe/logs/.nginx-writer-release-v2.json", logGID: 987, trustedParentUID: -1, probeStatus: 200, timeout: 20 * time.Second}
 	if err := validateOptions(value); err == nil {
 		t.Fatal("a production reopen without a loopback probe must be rejected")
 	}
 	value.probeURL = "http://127.0.0.1:18080/health"
 	if err := validateOptions(value); err != nil {
 		t.Fatalf("safe production options rejected: %v", err)
+	}
+}
+
+func TestDirectoryOwnerAllowedScopesTrustedUIDToParents(t *testing.T) {
+	const trusted = 1000
+	if !directoryOwnerAllowed(0, true, -1) || !directoryOwnerAllowed(0, false, -1) {
+		t.Fatal("root ownership must always be accepted")
+	}
+	if directoryOwnerAllowed(trusted, true, trusted) {
+		t.Fatal("the terminal log directory must remain root-owned")
+	}
+	if !directoryOwnerAllowed(trusted, false, trusted) {
+		t.Fatal("an explicitly trusted UID must be accepted on an ancestor")
+	}
+	if directoryOwnerAllowed(trusted+1, false, trusted) || directoryOwnerAllowed(trusted, false, -1) {
+		t.Fatal("unlisted non-root ancestor ownership must fail closed")
 	}
 }
 
