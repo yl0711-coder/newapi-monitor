@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"os"
 	"regexp"
@@ -841,6 +842,10 @@ func (m *Monitor) ingestNginxEvidence(c *gin.Context) {
 		return
 	}
 	if err != nil {
+		// The response remains deliberately generic, while the server log keeps
+		// enough non-sensitive context to diagnose SQLite/IO failures. Evidence
+		// payloads and HMAC values must never be logged.
+		slog.Warn("Nginx evidence transaction failed", "node", in.Node, "batch_id", in.BatchID, "events", len(in.Events), "err", err)
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "evidence store unavailable"})
 		return
 	}
