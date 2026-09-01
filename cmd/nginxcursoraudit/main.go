@@ -109,7 +109,7 @@ func run(opts options) (auditResult, error) {
 	if _, err := file.Seek(opts.baseOffset, io.SeekStart); err != nil {
 		return auditResult{}, err
 	}
-	resume, matched, err := reconstruct(file, opts.node, opts.kind, uint64(stat.Ino), opts.baseOffset, opts.maxLines, ids, opts.lastBatchID)
+	resume, matched, err := reconstruct(file, opts.node, opts.kind, stat.Ino, opts.baseOffset, opts.maxLines, ids, opts.lastBatchID)
 	if err != nil {
 		return auditResult{}, err
 	}
@@ -117,8 +117,12 @@ func run(opts options) (auditResult, error) {
 		return auditResult{}, err
 	}
 	return auditResult{OK: true, Node: opts.node, Kind: opts.kind, Path: opts.logPath,
-		Device: uint64(stat.Dev), Inode: uint64(stat.Ino), FileSize: info.Size(), BaseOffset: opts.baseOffset,
+		Device: statDeviceID(stat.Dev), Inode: stat.Ino, FileSize: info.Size(), BaseOffset: opts.baseOffset,
 		ResumeOffset: resume, UnacknowledgedBytes: info.Size() - resume, MatchedBatches: matched, LastBatchID: opts.lastBatchID}, nil
+}
+
+func statDeviceID[T ~int32 | ~uint32 | ~uint64](device T) uint64 {
+	return uint64(device)
 }
 
 func verifyUnchangedLog(path string, expected os.FileInfo, expectedStat *syscall.Stat_t) error {
