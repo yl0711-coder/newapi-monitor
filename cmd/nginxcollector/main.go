@@ -421,6 +421,28 @@ type batch struct {
 	SourceRangeV2             *sourceRangeV2    `json:"source_range_v2,omitempty"`
 }
 
+const (
+	accessInflightVersionV1 = 1
+	accessInflightMaxBytes  = 8 << 20
+	accessInflightPrepared  = "prepared"
+	accessInflightAcked     = "minute_acked"
+	accessInflightQueued    = "evidence_queued"
+	accessInflightDropped   = "evidence_dropped"
+)
+
+// accessInflightV1 freezes one legacy access-lane source range before its
+// network POST. The evidence payload is stored separately because batch keeps
+// it off the minute wire with json:"-". The journal lives beside the durable
+// cursor, never in the evidence outbox consumed by the delivery worker.
+type accessInflightV1 struct {
+	Version  int            `json:"version"`
+	Stage    string         `json:"stage"`
+	Current  cursor         `json:"current"`
+	Next     cursor         `json:"next"`
+	Payload  batch          `json:"payload"`
+	Evidence *evidenceBatch `json:"evidence,omitempty"`
+}
+
 func normalizeRoute(path string) string {
 	path = strings.TrimSpace(strings.SplitN(path, "?", 2)[0])
 	switch path {
@@ -992,10 +1014,175 @@ func postBatch(ctx context.Context, c config, payload batch) error {
 	return nil
 }
 
+func accessInflightPathV1(c config) string {
+	return c.cursorPath + ".inflight-v1.json"
+}
+
+func validAccessInflightV1(c config, pending accessInflightV1) bool {
+	if pending.Version != accessInflightVersionV1 || pending.Payload.Node != c.node || len(pending.Payload.BatchID) != sha256.Size*2 || pending.Next.Inode == 0 || pending.Next.Offset < 0 {
+		return false
+	}
+	if decoded, err := hex.DecodeString(pending.Payload.BatchID); err != nil || len(decoded) != sha256.Size {
+		return false
+	}
+	switch pending.Stage {
+	case accessInflightPrepared, accessInflightAcked, accessInflightQueued, accessInflightDropped:
+	default:
+		return false
+	}
+	if pending.Payload.SourceBoundary != nil {
+		boundary := pending.Payload.SourceBoundary
+		expectedStart := int64(0)
+		if pending.Current.Inode != 0 && pending.Current.Inode == pending.Next.Inode {
+			expectedStart = pending.Current.Offset
+		}
+		if boundary.Device != pending.Next.Device || boundary.Inode != pending.Next.Inode || boundary.StartOffset != expectedStart || boundary.EndOffset != pending.Next.Offset || boundary.StartOffset < 0 || boundary.StartOffset >= boundary.EndOffset {
+			return false
+		}
+	}
+	if pending.Evidence != nil {
+		evidence := pending.Evidence
+		expectedStart := int64(0)
+		if pending.Current.Inode != 0 && pending.Current.Inode == pending.Next.Inode {
+			expectedStart = pending.Current.Offset
+		}
+		if evidence.Node != c.node || evidence.BatchID != pending.Payload.BatchID || evidence.PayloadHash != evidencePayloadHash(*evidence) ||
+			evidence.Source.Kind != "access" || evidence.Source.StartOffset != expectedStart || evidence.Source.EndOffset != pending.Next.Offset || evidence.Source.StartOffset < 0 || evidence.Source.StartOffset >= evidence.Source.EndOffset {
+			return false
+		}
+		if evidence.Source.Protocol == 0 && evidence.Source.FileID != strconv.FormatUint(pending.Next.Inode, 10) {
+			return false
+		}
+	}
+	if pending.Stage == accessInflightDropped && pending.Next.EvidencePersistFailures == 0 {
+		return false
+	}
+	return true
+}
+
+func loadAccessInflightV1(c config) (accessInflightV1, bool, error) {
+	file, err := os.Open(accessInflightPathV1(c))
+	if errors.Is(err, os.ErrNotExist) {
+		return accessInflightV1{}, false, nil
+	}
+	if err != nil {
+		return accessInflightV1{}, false, fmt.Errorf("read access inflight journal: %w", err)
+	}
+	defer file.Close()
+	data, err := io.ReadAll(io.LimitReader(file, accessInflightMaxBytes+1))
+	if err != nil {
+		return accessInflightV1{}, false, fmt.Errorf("read access inflight journal: %w", err)
+	}
+	if len(data) > accessInflightMaxBytes {
+		return accessInflightV1{}, false, errors.New("access inflight journal is too large; restore the persistent cursor volume before restarting")
+	}
+	var pending accessInflightV1
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&pending); err != nil {
+		return accessInflightV1{}, false, errors.New("access inflight journal is invalid; restore the persistent cursor volume before restarting")
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) || !validAccessInflightV1(c, pending) {
+		return accessInflightV1{}, false, errors.New("access inflight journal is invalid; restore the persistent cursor volume before restarting")
+	}
+	pending.Payload.Evidence = pending.Evidence
+	return pending, true, nil
+}
+
+func saveAccessInflightV1(c config, pending accessInflightV1) error {
+	pending.Version = accessInflightVersionV1
+	pending.Payload.Evidence = nil
+	if !validAccessInflightV1(c, pending) {
+		return errors.New("refusing to persist invalid access inflight journal")
+	}
+	data, err := json.Marshal(pending)
+	if err != nil {
+		return err
+	}
+	return writeAtomic(accessInflightPathV1(c), data, 0o600)
+}
+
+func removeAccessInflightV1(c config) error {
+	path := accessInflightPathV1(c)
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return syncDirectory(filepath.Dir(path))
+}
+
+func finishAccessInflightV1(ctx context.Context, c config, pending accessInflightV1) error {
+	if pending.Stage == accessInflightPrepared {
+		if err := postBatch(ctx, c, pending.Payload); err != nil {
+			return err
+		}
+		if pending.Payload.SourceBoundary != nil {
+			boundary := pending.Payload.SourceBoundary
+			pending.Next.LastAckedBatchID, pending.Next.LastAckedDevice = pending.Payload.BatchID, boundary.Device
+			pending.Next.LastAckedInode, pending.Next.LastAckedOffset = boundary.Inode, boundary.EndOffset
+		} else {
+			pending.Next.Device = 0
+		}
+		pending.Stage = accessInflightAcked
+		if err := saveAccessInflightV1(c, pending); err != nil {
+			return fmt.Errorf("persist acknowledged access inflight journal: %w", err)
+		}
+	}
+	if pending.Stage == accessInflightAcked {
+		if pending.Evidence == nil {
+			pending.Stage = accessInflightQueued
+		} else if err := spoolEvidence(c, *pending.Evidence); err != nil {
+			if pending.Next.EvidencePersistFailures < math.MaxInt64 {
+				pending.Next.EvidencePersistFailures++
+			}
+			pending.Next.LastEvidencePersistFailureAt = time.Now().Unix()
+			if pending.Next.EvidenceDroppedEvents <= math.MaxInt64-int64(len(pending.Evidence.Events)) {
+				pending.Next.EvidenceDroppedEvents += int64(len(pending.Evidence.Events))
+			}
+			pending.Stage = accessInflightDropped
+			logEvidenceDeliveryError(fmt.Errorf("persist evidence outbox: %w", err))
+		} else {
+			pending.Stage = accessInflightQueued
+		}
+		if err := saveAccessInflightV1(c, pending); err != nil {
+			return fmt.Errorf("persist finalized access inflight journal: %w", err)
+		}
+	}
+	if pending.Stage != accessInflightQueued && pending.Stage != accessInflightDropped {
+		return errors.New("access inflight journal did not reach a final stage")
+	}
+	// The cursor and evidence outbox are separate persistent volumes. Re-spool a
+	// finalized queued batch before committing/confirming the cursor so a
+	// point-in-time restore of only the cursor volume cannot silently lose it.
+	// spoolEvidence is idempotent by BatchID and payload hash; if the worker had
+	// already delivered and removed the file, the Monitor ledger deduplicates the
+	// replay using the same identity.
+	if pending.Stage == accessInflightQueued && pending.Evidence != nil {
+		if err := spoolEvidence(c, *pending.Evidence); err != nil {
+			return fmt.Errorf("reconfirm queued evidence before cursor commit: %w", err)
+		}
+	}
+	if err := saveCursor(c.cursorPath, pending.Next); err != nil {
+		return err
+	}
+	return removeAccessInflightV1(c)
+}
+
 func runOnce(ctx context.Context, c config) error {
 	current, err := loadCursor(c.cursorPath)
 	if err != nil {
 		return err
+	}
+	if pending, exists, err := loadAccessInflightV1(c); err != nil {
+		return err
+	} else if exists {
+		if current == pending.Next && (pending.Stage == accessInflightQueued || pending.Stage == accessInflightDropped) {
+			return finishAccessInflightV1(ctx, c, pending)
+		}
+		if current != pending.Current {
+			return errors.New("access cursor does not match inflight journal; restore the persistent cursor volume before restarting")
+		}
+		return finishAccessInflightV1(ctx, c, pending)
 	}
 	payload, next, ok, err := readBatch(c, current)
 	if err != nil {
@@ -1011,31 +1198,39 @@ func runOnce(ctx context.Context, c config) error {
 		return nil
 	}
 	decorateBatch(c, &payload, next)
-	if payload.Evidence != nil {
-		if err := spoolEvidence(c, *payload.Evidence); err != nil {
-			// Evidence is an independent best-effort lane. A local evidence disk
-			// failure must be visible, but must never stop the established minute lane.
-			payload.EvidencePersistFailures = 1
-			payload.EvidenceDroppedEvents = int64(len(payload.Evidence.Events))
-			if next.EvidencePersistFailures < math.MaxInt64 {
-				next.EvidencePersistFailures++
-			}
-			next.LastEvidencePersistFailureAt = time.Now().Unix()
-			if next.EvidenceDroppedEvents <= math.MaxInt64-int64(len(payload.Evidence.Events)) {
-				next.EvidenceDroppedEvents += int64(len(payload.Evidence.Events))
-			}
-			logEvidenceDeliveryError(fmt.Errorf("persist evidence outbox: %w", err))
-		}
+	pending := accessInflightV1{Version: accessInflightVersionV1, Stage: accessInflightPrepared, Current: current, Next: next, Payload: payload, Evidence: payload.Evidence}
+	if err := saveAccessInflightV1(c, pending); err != nil {
+		return fmt.Errorf("persist access inflight journal before POST: %w", err)
 	}
+	pending.Payload.Evidence = pending.Evidence
+	return finishAccessInflightV1(ctx, c, pending)
+}
+
+// runLegacyHeartbeatOnce never sends or persists a legacy heartbeat while an
+// access journal exists. In prepare mode a heartbeat carries a source boundary;
+// changing LastAcked* beside an unfinished frozen range would make the next
+// recovery fail its exact cursor/journal match.
+func runLegacyHeartbeatOnce(ctx context.Context, c config, now time.Time) (bool, error) {
+	if _, err := os.Stat(accessInflightPathV1(c)); err == nil {
+		return false, nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return false, fmt.Errorf("inspect access inflight journal before heartbeat: %w", err)
+	}
+	current, err := loadCursor(c.cursorPath)
+	if err != nil {
+		return false, err
+	}
+	payload := heartbeatBatch(c, now, current)
 	if err := postBatch(ctx, c, payload); err != nil {
-		return err
+		return false, err
 	}
 	if payload.SourceBoundary != nil {
-		next.LastAckedBatchID, next.LastAckedDevice, next.LastAckedInode, next.LastAckedOffset = payload.BatchID, payload.SourceBoundary.Device, payload.SourceBoundary.Inode, payload.SourceBoundary.EndOffset
-	} else {
-		next.Device = 0
+		current.LastAckedBatchID, current.LastAckedDevice, current.LastAckedInode, current.LastAckedOffset = payload.BatchID, payload.SourceBoundary.Device, payload.SourceBoundary.Inode, payload.SourceBoundary.EndOffset
+		if err := saveCursor(c.cursorPath, current); err != nil {
+			return false, fmt.Errorf("persist heartbeat boundary: %w", err)
+		}
 	}
-	return saveCursor(c.cursorPath, next)
+	return true, nil
 }
 
 func heartbeatBatch(c config, now time.Time, value cursor) batch {
@@ -1099,23 +1294,11 @@ func main() {
 					nextHeartbeat = now.Add(time.Minute)
 				}
 			} else {
-				current, cursorErr := loadCursor(c.cursorPath)
-				if cursorErr != nil {
-					log.Printf("nginxcollector: 游标文件无法安全读取，已停止心跳与推进: %v", cursorErr)
-				} else {
-					payload := heartbeatBatch(c, now, current)
-					if err := postBatch(ctx, c, payload); err != nil {
-						log.Printf("nginxcollector: 心跳发送失败，将自动重试: %v", err)
-					} else {
-						if payload.SourceBoundary != nil {
-							current.LastAckedBatchID, current.LastAckedDevice, current.LastAckedInode, current.LastAckedOffset = payload.BatchID, payload.SourceBoundary.Device, payload.SourceBoundary.Inode, payload.SourceBoundary.EndOffset
-							if err := saveCursor(c.cursorPath, current); err != nil {
-								log.Printf("nginxcollector: 心跳边界持久化失败，将重发同一边界: %v", err)
-								continue
-							}
-						}
-						nextHeartbeat = now.Add(time.Minute)
-					}
+				sent, err := runLegacyHeartbeatOnce(ctx, c, now)
+				if err != nil {
+					log.Printf("nginxcollector: 心跳未发送或未持久化，将自动重试: %v", err)
+				} else if sent {
+					nextHeartbeat = now.Add(time.Minute)
 				}
 			}
 		}

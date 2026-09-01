@@ -119,7 +119,9 @@ services:
     # 除持久化 /data 和有界 /tmp 外，运行层不可写。
     read_only: true
     tmpfs:
-      - /tmp:size=16m,mode=1777
+      # SQLite may spill evidence ingestion/index work to a temporary file.
+      # Keep this bounded, but large enough for the maximum 1,000-event batch.
+      - /tmp:size=64m,mode=1777
     security_opt:
       - no-new-privileges:true
     cap_drop:

@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -257,6 +258,427 @@ func TestEvidenceOutageDoesNotBlockMinuteCursorAndRecovers(t *testing.T) {
 	}
 }
 
+func TestMinuteFailureFreezesExactInflightRange(t *testing.T) {
+	dir := t.TempDir()
+	cfg := evidenceConfig(dir)
+	first := schema2Line(time.Now().Unix(), "200", "200", "OK", "nginx-id-1", "oneapi-id-1") + "\n"
+	if err := os.WriteFile(cfg.logPath, []byte(first), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var minuteStatus atomic.Int64
+	minuteStatus.Store(http.StatusBadGateway)
+	minute := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(int(minuteStatus.Load()))
+	}))
+	defer minute.Close()
+	cfg.sinkURL, cfg.token = minute.URL, "secret"
+	if err := runOnce(context.Background(), cfg); err == nil {
+		t.Fatal("minute failure must be retried")
+	}
+	paths, err := listEvidenceOutbox(cfg.evidenceOutboxPath)
+	if err != nil || len(paths) != 0 {
+		t.Fatalf("unacknowledged minute range must not enter evidence outbox: paths=%v err=%v", paths, err)
+	}
+	second := schema2Line(time.Now().Unix()+1, "200", "200", "OK", "nginx-id-2", "oneapi-id-2") + "\n"
+	f, err := os.OpenFile(cfg.logPath, os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, writeErr := f.WriteString(second)
+	closeErr := f.Close()
+	if writeErr != nil || closeErr != nil {
+		t.Fatalf("append=%v close=%v", writeErr, closeErr)
+	}
+	minuteStatus.Store(http.StatusOK)
+	if err := runOnce(context.Background(), cfg); err != nil {
+		t.Fatal(err)
+	}
+	paths, err = listEvidenceOutbox(cfg.evidenceOutboxPath)
+	if err != nil || len(paths) != 1 {
+		t.Fatalf("acknowledged expanded range must create exactly one evidence batch: paths=%v err=%v", paths, err)
+	}
+	data, err := os.ReadFile(paths[0])
+	var queued evidenceBatch
+	if err != nil || json.Unmarshal(data, &queued) != nil {
+		t.Fatalf("read queued evidence: %v", err)
+	}
+	if queued.Source.StartOffset != 0 || queued.Source.EndOffset != int64(len(first)) || len(queued.Events) != 1 {
+		t.Fatalf("queued evidence did not preserve the frozen source range: %+v", queued.Source)
+	}
+	value, err := loadCursor(cfg.cursorPath)
+	if err != nil || value.Offset != int64(len(first)) {
+		t.Fatalf("cursor did not stop at the frozen range: cursor=%+v err=%v", value, err)
+	}
+	if err := runOnce(context.Background(), cfg); err != nil {
+		t.Fatal(err)
+	}
+	paths, err = listEvidenceOutbox(cfg.evidenceOutboxPath)
+	if err != nil || len(paths) != 2 {
+		t.Fatalf("newly appended range must be queued separately: paths=%v err=%v", paths, err)
+	}
+	data, err = os.ReadFile(paths[1])
+	var appended evidenceBatch
+	if err != nil || json.Unmarshal(data, &appended) != nil {
+		t.Fatalf("read appended evidence: %v", err)
+	}
+	if appended.Source.StartOffset != int64(len(first)) || appended.Source.EndOffset != int64(len(first)+len(second)) || len(appended.Events) != 1 {
+		t.Fatalf("appended evidence range is not contiguous: %+v", appended.Source)
+	}
+}
+
+func TestLostMinuteAckReplaysFrozenBatchAfterLogGrowth(t *testing.T) {
+	dir := t.TempDir()
+	cfg := evidenceConfig(dir)
+	first := schema2Line(time.Now().Unix(), "200", "200", "OK", "nginx-id-1", "oneapi-id-1") + "\n"
+	if err := os.WriteFile(cfg.logPath, []byte(first), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var mu sync.Mutex
+	var received []batch
+	minute := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload batch
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Errorf("decode minute payload: %v", err)
+			return
+		}
+		mu.Lock()
+		received = append(received, payload)
+		attempt := len(received)
+		mu.Unlock()
+		if attempt == 1 {
+			conn, _, err := w.(http.Hijacker).Hijack()
+			if err != nil {
+				t.Errorf("hijack: %v", err)
+				return
+			}
+			_ = conn.Close() // Simulate a commit whose HTTP acknowledgement is lost.
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer minute.Close()
+	cfg.sinkURL, cfg.token = minute.URL, "secret"
+	if err := runOnce(context.Background(), cfg); err == nil {
+		t.Fatal("lost acknowledgement must leave the frozen batch pending")
+	}
+	f, err := os.OpenFile(cfg.logPath, os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second := schema2Line(time.Now().Unix()+1, "200", "200", "OK", "nginx-id-2", "oneapi-id-2") + "\n"
+	_, writeErr := f.WriteString(second)
+	closeErr := f.Close()
+	if writeErr != nil || closeErr != nil {
+		t.Fatalf("append=%v close=%v", writeErr, closeErr)
+	}
+	if err := runOnce(context.Background(), cfg); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	if len(received) != 2 || received[0].BatchID != received[1].BatchID || !reflect.DeepEqual(received[0].Samples, received[1].Samples) {
+		t.Fatalf("lost ACK did not replay the exact minute batch: %+v", received)
+	}
+	mu.Unlock()
+	paths, err := listEvidenceOutbox(cfg.evidenceOutboxPath)
+	if err != nil || len(paths) != 1 {
+		t.Fatalf("lost ACK recovery must queue one evidence range: paths=%v err=%v", paths, err)
+	}
+	data, err := os.ReadFile(paths[0])
+	var queued evidenceBatch
+	if err != nil || json.Unmarshal(data, &queued) != nil {
+		t.Fatalf("read queued evidence: %v", err)
+	}
+	if queued.Source.StartOffset != 0 || queued.Source.EndOffset != int64(len(first)) || len(queued.Events) != 1 {
+		t.Fatalf("lost ACK recovery expanded the frozen range: %+v", queued.Source)
+	}
+	value, err := loadCursor(cfg.cursorPath)
+	if err != nil || value.Offset != int64(len(first)) {
+		t.Fatalf("lost ACK recovery advanced beyond the frozen range: cursor=%+v err=%v", value, err)
+	}
+}
+
+func prepareAccessInflightForTest(t *testing.T, cfg config, stage string) accessInflightV1 {
+	t.Helper()
+	payload, next, ok, err := readBatch(cfg, cursor{})
+	if err != nil || !ok {
+		t.Fatalf("prepare access inflight: ok=%v err=%v", ok, err)
+	}
+	decorateBatch(cfg, &payload, next)
+	pending := accessInflightV1{
+		Version:  accessInflightVersionV1,
+		Stage:    stage,
+		Current:  cursor{},
+		Next:     next,
+		Payload:  payload,
+		Evidence: payload.Evidence,
+	}
+	if err := saveAccessInflightV1(cfg, pending); err != nil {
+		t.Fatal(err)
+	}
+	return pending
+}
+
+func TestAckedInflightResumesAtEvidenceWithoutRepostingMinute(t *testing.T) {
+	dir := t.TempDir()
+	cfg := evidenceConfig(dir)
+	line := schema2Line(time.Now().Unix(), "200", "200", "OK", "nginx-id", "oneapi-id") + "\n"
+	if err := os.WriteFile(cfg.logPath, []byte(line), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	pending := prepareAccessInflightForTest(t, cfg, accessInflightAcked)
+	var minuteCalls atomic.Int64
+	minute := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		minuteCalls.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer minute.Close()
+	cfg.sinkURL, cfg.token = minute.URL, "secret"
+	if err := runOnce(context.Background(), cfg); err != nil {
+		t.Fatal(err)
+	}
+	if minuteCalls.Load() != 0 {
+		t.Fatalf("acked minute batch was reposted %d times", minuteCalls.Load())
+	}
+	paths, err := listEvidenceOutbox(cfg.evidenceOutboxPath)
+	if err != nil || len(paths) != 1 {
+		t.Fatalf("acked inflight did not queue exactly one evidence batch: paths=%v err=%v", paths, err)
+	}
+	cur, err := loadCursor(cfg.cursorPath)
+	if err != nil || cur != pending.Next {
+		t.Fatalf("acked inflight did not commit exact next cursor: cursor=%+v next=%+v err=%v", cur, pending.Next, err)
+	}
+	if _, err := os.Stat(accessInflightPathV1(cfg)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("completed inflight journal was not removed: %v", err)
+	}
+}
+
+func TestQueuedInflightCommitsCursorWithoutRepostingOrDuplicatingEvidence(t *testing.T) {
+	dir := t.TempDir()
+	cfg := evidenceConfig(dir)
+	line := schema2Line(time.Now().Unix(), "200", "200", "OK", "nginx-id", "oneapi-id") + "\n"
+	if err := os.WriteFile(cfg.logPath, []byte(line), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	pending := prepareAccessInflightForTest(t, cfg, accessInflightQueued)
+	if pending.Evidence == nil {
+		t.Fatal("test requires evidence")
+	}
+	if err := spoolEvidence(cfg, *pending.Evidence); err != nil {
+		t.Fatal(err)
+	}
+	var minuteCalls atomic.Int64
+	minute := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		minuteCalls.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer minute.Close()
+	cfg.sinkURL, cfg.token = minute.URL, "secret"
+	if err := runOnce(context.Background(), cfg); err != nil {
+		t.Fatal(err)
+	}
+	paths, err := listEvidenceOutbox(cfg.evidenceOutboxPath)
+	if err != nil || len(paths) != 1 {
+		t.Fatalf("queued inflight duplicated or lost evidence: paths=%v err=%v", paths, err)
+	}
+	if minuteCalls.Load() != 0 {
+		t.Fatalf("queued inflight reposted minute batch %d times", minuteCalls.Load())
+	}
+	cur, err := loadCursor(cfg.cursorPath)
+	if err != nil || cur != pending.Next {
+		t.Fatalf("queued inflight did not commit exact next cursor: cursor=%+v next=%+v err=%v", cur, pending.Next, err)
+	}
+}
+
+func TestFinalizedInflightWithCommittedCursorOnlyCleansJournal(t *testing.T) {
+	dir := t.TempDir()
+	cfg := evidenceConfig(dir)
+	line := schema2Line(time.Now().Unix(), "200", "200", "OK", "nginx-id", "oneapi-id") + "\n"
+	if err := os.WriteFile(cfg.logPath, []byte(line), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	pending := prepareAccessInflightForTest(t, cfg, accessInflightQueued)
+	if err := saveCursor(cfg.cursorPath, pending.Next); err != nil {
+		t.Fatal(err)
+	}
+	var minuteCalls atomic.Int64
+	minute := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		minuteCalls.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer minute.Close()
+	cfg.sinkURL, cfg.token = minute.URL, "secret"
+	if err := runOnce(context.Background(), cfg); err != nil {
+		t.Fatal(err)
+	}
+	if minuteCalls.Load() != 0 {
+		t.Fatalf("committed inflight reposted minute batch %d times", minuteCalls.Load())
+	}
+	paths, err := listEvidenceOutbox(cfg.evidenceOutboxPath)
+	if err != nil || len(paths) != 1 {
+		t.Fatalf("committed cursor recovery did not restore missing evidence: paths=%v err=%v", paths, err)
+	}
+	if _, err := os.Stat(accessInflightPathV1(cfg)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("stale finalized journal was not removed: %v", err)
+	}
+}
+
+func TestLegacyHeartbeatIsBlockedByPreparedInflight(t *testing.T) {
+	dir := t.TempDir()
+	cfg := evidenceConfig(dir)
+	cfg.sourceV2Prepare = true
+	line := schema2Line(time.Now().Unix(), "200", "200", "OK", "nginx-id", "oneapi-id") + "\n"
+	if err := os.WriteFile(cfg.logPath, []byte(line), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	prepareAccessInflightForTest(t, cfg, accessInflightPrepared)
+	var calls atomic.Int64
+	minute := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer minute.Close()
+	cfg.sinkURL, cfg.token = minute.URL, "secret"
+	sent, err := runLegacyHeartbeatOnce(context.Background(), cfg, time.Now())
+	if err != nil || sent || calls.Load() != 0 {
+		t.Fatalf("heartbeat crossed prepared inflight: sent=%v calls=%d err=%v", sent, calls.Load(), err)
+	}
+	cur, err := loadCursor(cfg.cursorPath)
+	if err != nil || cur != (cursor{}) {
+		t.Fatalf("blocked heartbeat changed cursor: %+v err=%v", cur, err)
+	}
+}
+
+func TestLegacyHeartbeatIsBlockedUntilFinalizedJournalIsRemoved(t *testing.T) {
+	dir := t.TempDir()
+	cfg := evidenceConfig(dir)
+	cfg.sourceV2Prepare = true
+	line := schema2Line(time.Now().Unix(), "200", "200", "OK", "nginx-id", "oneapi-id") + "\n"
+	if err := os.WriteFile(cfg.logPath, []byte(line), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	pending := prepareAccessInflightForTest(t, cfg, accessInflightQueued)
+	if err := saveCursor(cfg.cursorPath, pending.Next); err != nil {
+		t.Fatal(err)
+	}
+	var calls atomic.Int64
+	minute := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer minute.Close()
+	cfg.sinkURL, cfg.token = minute.URL, "secret"
+	sent, err := runLegacyHeartbeatOnce(context.Background(), cfg, time.Now())
+	if err != nil || sent || calls.Load() != 0 {
+		t.Fatalf("heartbeat crossed finalized journal cleanup: sent=%v calls=%d err=%v", sent, calls.Load(), err)
+	}
+	cur, err := loadCursor(cfg.cursorPath)
+	if err != nil || cur != pending.Next {
+		t.Fatalf("blocked heartbeat changed finalized cursor: %+v err=%v", cur, err)
+	}
+}
+
+func TestOversizedAccessInflightJournalFailsClosed(t *testing.T) {
+	dir := t.TempDir()
+	cfg := evidenceConfig(dir)
+	if err := os.WriteFile(accessInflightPathV1(cfg), make([]byte, accessInflightMaxBytes+1), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, exists, err := loadAccessInflightV1(cfg); err == nil || exists {
+		t.Fatalf("oversized journal did not fail closed: exists=%v err=%v", exists, err)
+	}
+}
+
+func TestDroppedInflightRecoveryDoesNotRetryEvidenceOrDoubleCountLoss(t *testing.T) {
+	dir := t.TempDir()
+	cfg := evidenceConfig(dir)
+	line := schema2Line(time.Now().Unix(), "200", "200", "OK", "nginx-id", "oneapi-id") + "\n"
+	if err := os.WriteFile(cfg.logPath, []byte(line), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	pending := prepareAccessInflightForTest(t, cfg, accessInflightAcked)
+	pending.Stage = accessInflightDropped
+	pending.Next.EvidencePersistFailures = 1
+	pending.Next.EvidenceDroppedEvents = int64(len(pending.Evidence.Events))
+	pending.Next.LastEvidencePersistFailureAt = time.Now().Unix()
+	if err := saveAccessInflightV1(cfg, pending); err != nil {
+		t.Fatal(err)
+	}
+	// If recovery incorrectly retries evidence, this non-directory path fails.
+	if err := os.WriteFile(cfg.evidenceOutboxPath, []byte("not-a-directory"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var minuteCalls atomic.Int64
+	minute := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		minuteCalls.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer minute.Close()
+	cfg.sinkURL, cfg.token = minute.URL, "secret"
+	if err := runOnce(context.Background(), cfg); err != nil {
+		t.Fatal(err)
+	}
+	if minuteCalls.Load() != 0 {
+		t.Fatalf("dropped inflight reposted minute batch %d times", minuteCalls.Load())
+	}
+	cur, err := loadCursor(cfg.cursorPath)
+	if err != nil || cur.EvidencePersistFailures != 1 || cur.EvidenceDroppedEvents != int64(len(pending.Evidence.Events)) {
+		t.Fatalf("dropped inflight loss counters changed during recovery: cursor=%+v err=%v", cur, err)
+	}
+}
+
+func TestEvidenceOffKeepsMinuteDeliveryAndLeavesNoJournal(t *testing.T) {
+	dir := t.TempDir()
+	cfg := evidenceConfig(dir)
+	cfg.evidenceMode = "off"
+	line := schema2Line(time.Now().Unix(), "200", "200", "OK", "nginx-id", "oneapi-id") + "\n"
+	if err := os.WriteFile(cfg.logPath, []byte(line), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var received batch
+	minute := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&received); err != nil {
+			t.Error(err)
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer minute.Close()
+	cfg.sinkURL, cfg.token = minute.URL, "secret"
+	if err := runOnce(context.Background(), cfg); err != nil {
+		t.Fatal(err)
+	}
+	if len(received.Samples) != 1 || received.Evidence != nil {
+		t.Fatalf("evidence-off changed minute wire payload: %+v", received)
+	}
+	cur, err := loadCursor(cfg.cursorPath)
+	if err != nil || cur.Offset != int64(len(line)) {
+		t.Fatalf("evidence-off cursor did not advance: cursor=%+v err=%v", cur, err)
+	}
+	if _, err := os.Stat(accessInflightPathV1(cfg)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("evidence-off left inflight journal: %v", err)
+	}
+}
+
+func TestInvalidAccessInflightBoundaryFailsClosed(t *testing.T) {
+	dir := t.TempDir()
+	cfg := evidenceConfig(dir)
+	line := schema2Line(time.Now().Unix(), "200", "200", "OK", "nginx-id", "oneapi-id") + "\n"
+	if err := os.WriteFile(cfg.logPath, []byte(line), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	pending := prepareAccessInflightForTest(t, cfg, accessInflightPrepared)
+	pending.Evidence.Source.StartOffset++
+	data, err := json.Marshal(pending)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(accessInflightPathV1(cfg), data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, exists, err := loadAccessInflightV1(cfg); err == nil || exists {
+		t.Fatalf("inconsistent journal boundary did not fail closed: exists=%v err=%v", exists, err)
+	}
+}
+
 func TestFullEvidenceOutboxRecordsVisibleGapWithoutBlockingMinute(t *testing.T) {
 	dir := t.TempDir()
 	cfg := evidenceConfig(dir)
@@ -491,8 +913,8 @@ func TestEvidenceFilesystemFailureIsReportedButDoesNotStopMinuteLane(t *testing.
 	if err := runOnce(context.Background(), cfg); err != nil {
 		t.Fatalf("evidence filesystem failure blocked minute lane: %v", err)
 	}
-	if received.EvidencePersistFailures != 1 || received.EvidenceDroppedEvents != 1 {
-		t.Fatalf("loss was not visible in minute telemetry: %+v", received)
+	if received.EvidencePersistFailures != 0 || received.EvidenceDroppedEvents != 0 {
+		t.Fatalf("post-ack evidence failure must not rewrite the acknowledged minute payload: %+v", received)
 	}
 	value, err := loadCursor(cfg.cursorPath)
 	if err != nil || value.EvidencePersistFailures != 1 || value.EvidenceDroppedEvents != 1 {
@@ -543,8 +965,8 @@ func TestEmptyEvidenceCheckpointFilesystemFailureDoesNotStopMinuteLane(t *testin
 	if err := runOnce(context.Background(), cfg); err != nil {
 		t.Fatalf("empty evidence filesystem failure blocked minute lane: %v", err)
 	}
-	if received.EvidencePersistFailures != 1 || received.EvidenceDroppedEvents != 0 {
-		t.Fatalf("empty checkpoint loss telemetry is wrong: %+v", received)
+	if received.EvidencePersistFailures != 0 || received.EvidenceDroppedEvents != 0 {
+		t.Fatalf("post-ack empty-checkpoint failure must not rewrite the acknowledged minute payload: %+v", received)
 	}
 	value, err := loadCursor(cfg.cursorPath)
 	if err != nil || value.EvidencePersistFailures != 1 || value.EvidenceDroppedEvents != 0 || value.Offset == 0 {

@@ -89,6 +89,8 @@ NGINXCOLLECTOR_EVIDENCE_OUTBOX_MAX_MIB=256
 
 `nginx-evidence.db` 不得与 Monitor 主库或 usage facts 库合并，也不进入主库长期备份集。生产环境必须挂载到独立、有配额的卷；`MONITOR_NGINX_EVIDENCE_MAX_MIB` 会设置 SQLite `max_page_count`，过期删除产生的 freelist 页可直接复用，不会因为主文件曾经长大而永久拒绝写入。该限制仍不能替代卷配额。默认保留 7 天并分批清理。管理端只能通过 `POST /nginx/evidence/lookup` 用精确 NewAPI Request ID 查询；输入只用于内存 HMAC，不入库。`pilot` 响应会明确标记 `linkage_verified=false`，供客户排障后续整合，但当前不自动改它的页面结论。
 
+Monitor 使用只读根文件系统时，必须为 `/tmp` 配置至少 `64 MiB` 的有界 tmpfs。证据批次写入及索引维护可能使用 SQLite 临时文件；`16 MiB` 会在接近 1,000 条的批次上触发 `SQLITE_FULL`，即使证据卷和 `max_page_count` 仍有空间。调整 tmpfs 不会预分配内存，但仍受容器总内存限制约束。
+
 证据 outbox 使用写入游标中的单调序号排序，不依赖文件 mtime；空事件的数据区间也会写入 checkpoint。若证据目录暂时不可写，丢失代次与丢失事件数跟随分钟游标持久化，恢复后的下一批只允许跨越一次已声明缺口。永久 4xx 拒绝的原批次会移入有界 `rejected` 目录，临时 429/5xx 则保留在活跃队列重试。
 
 当前请求级闭环只使用专用 access log。标准 Nginx error log 可能包含客户端 IP、完整请求行、query、upstream 地址等敏感信息，也没有可配置的稳定 Request ID 字段，因此不得把原文直接上传或与请求做时间邻近的伪精确关联。
@@ -272,6 +274,12 @@ HTTP 重定向，避免 Bearer token 被带到非预期主机。只有经过核�
 回滚 NewAPI，并用备份的 compose、Nginx 模板和固定旧镜像摘要恢复 Nginx。完成节点直测后
 才允许回挂。若 Monitor 入口已经启用，可先恢复 `MONITOR_NGINX_ENABLED=false`；这不会影响
 NewAPI、数据库、模型监控、用户用量或渠道管理。
+
+回滚采集器镜像前必须先停止该节点的新采集器，并在持久化 /data 卷中确认
+access-cursor.json.inflight-v1.json 不存在。旧镜像不识别该日志；只要文件存在，
+不论阶段是 prepared、minute_acked、evidence_queued 还是 evidence_dropped，
+都禁止删除文件或直接启动旧镜像。应使用当前新镜像完成同一日志后再回滚；无法
+完成时保持采集器停止并前向修复，Nginx/NewAPI 可继续正常提供服务。
 
 ### Source v2 逐 lane 切换与恢复
 

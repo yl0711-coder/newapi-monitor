@@ -4,10 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -210,6 +212,77 @@ func TestNginxV1BoundaryRetryAdoptionAndConflict(t *testing.T) {
 		return err
 	}); err != nil {
 		t.Fatalf("exact persisted boundary must permit v2 cutover: %v", err)
+	}
+}
+
+func TestNginxV1ExactRetryAfterCommittedResponseIsLost(t *testing.T) {
+	m := newTestMonitor(t)
+	m.cfg.NginxEnabled, m.cfg.IngestToken, m.cfg.NginxRetentionDays = true, "secret", 7
+	m.cfg.NginxAllowedNodes = []string{"master"}
+	enableTestNginxSourceContinuity(t, m)
+	bucket := time.Now().Unix() / 60 * 60
+	body := fmt.Sprintf(`{"node":"master","batch_id":"lost_ack_batch_abcdefgh","source_boundary":{"device":7,"inode":91,"start_offset":0,"end_offset":180},"samples":[{"bucket_ts":%d,"route":"/v1/responses","method":"POST","status":200,"count":1}]}`, bucket)
+
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.Use(requestBodyLimit(maxJSONRequestBody))
+	router.POST("/internal/nginx", m.ingestNginx)
+	var first atomic.Bool
+	first.Store(true)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if first.CompareAndSwap(true, false) {
+			recorded := httptest.NewRecorder()
+			router.ServeHTTP(recorded, r) // Commit to the real SQLite-backed Monitor first.
+			if recorded.Code != http.StatusOK {
+				t.Errorf("first committed request failed: %d %s", recorded.Code, recorded.Body.String())
+			}
+			conn, _, err := w.(http.Hijacker).Hijack()
+			if err != nil {
+				t.Errorf("hijack committed response: %v", err)
+				return
+			}
+			_ = conn.Close() // The collector cannot observe the successful commit.
+			return
+		}
+		router.ServeHTTP(w, r)
+	}))
+	defer server.Close()
+
+	post := func() (*http.Response, error) {
+		req, err := http.NewRequest(http.MethodPost, server.URL+"/internal/nginx", strings.NewReader(body))
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Authorization", "Bearer secret")
+		req.Header.Set("Content-Type", "application/json")
+		return server.Client().Do(req)
+	}
+	if resp, err := post(); err == nil {
+		resp.Body.Close()
+		t.Fatal("lost committed response unexpectedly produced a usable HTTP response")
+	}
+	resp, err := post()
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, readErr := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if readErr != nil || resp.StatusCode != http.StatusOK || !strings.Contains(string(data), `"source_boundary_ack":{"protocol":1`) {
+		t.Fatalf("exact retry was not acknowledged: status=%d body=%s readErr=%v", resp.StatusCode, data, readErr)
+	}
+	var total, batches int64
+	if err := m.storeDB.Model(&NginxMinuteSample{}).Select("COALESCE(SUM(count),0)").Scan(&total).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := m.storeDB.Model(&NginxIngestBatch{}).Where("node = ? AND batch_id = ?", "master", "lost_ack_batch_abcdefgh").Count(&batches).Error; err != nil {
+		t.Fatal(err)
+	}
+	var state NginxSourceBoundaryStateV1
+	if err := m.storeDB.First(&state, "node = ? AND kind = ?", "master", "access").Error; err != nil {
+		t.Fatal(err)
+	}
+	if total != 1 || batches != 1 || state.LastOffset != 180 || state.LastBatchID != "lost_ack_batch_abcdefgh" {
+		t.Fatalf("lost response retry was not exactly once: total=%d batches=%d state=%+v", total, batches, state)
 	}
 }
 
