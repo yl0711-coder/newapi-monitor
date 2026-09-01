@@ -168,7 +168,7 @@ func (m *Monitor) stabilityHealth(ctx context.Context, nowTime time.Time) stabil
 			recentDataLoss := false
 			for _, reason := range source.HealthReasons {
 				switch reason {
-				case "event_lag_with_backlog":
+				case "event_lag_with_backlog", "event_stream_stale", "event_stream_empty":
 					result.NginxLaggingSources++
 				case "backlog_large":
 					result.NginxLargeBacklogSources++

@@ -4,22 +4,27 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
 
 func TestValidateOptionsRejectsUnsafeTargets(t *testing.T) {
-	base := options{container: defaultContainer, collector: defaultCollector, logDir: "/safe/logs", logNames: []string{"access.log"}, lockPath: "/tmp/reopen.lock", proofPath: "/safe/logs/.nginx-writer-release-v2.json", logGID: 987, checkOnly: true, timeout: 20 * time.Second}
+	base := options{container: defaultContainer, collector: defaultCollector, logDir: "/safe/logs", containerLogDir: "/var/log/safe", logNames: []string{"access.log"}, lockPath: "/tmp/reopen.lock", proofPath: "/safe/logs/.nginx-writer-release-v2.json", logGID: 987, probeStatus: 200, checkOnly: true, timeout: 20 * time.Second}
 	for _, mutate := range []func(*options){
 		func(o *options) { o.container = "nginx;reboot" },
 		func(o *options) { o.logDir = "/" },
+		func(o *options) { o.containerLogDir = "/" },
 		func(o *options) { o.logNames = []string{"../access.log"} },
 		func(o *options) { o.lockPath = "relative.lock" },
 		func(o *options) { o.proofPath = "/another-dir/proof.json" },
 		func(o *options) { o.logGID = 0 },
 		func(o *options) { o.probeURL = "https://example.com/status" },
+		func(o *options) { o.probeStatus = 99 },
 	} {
 		value := base
 		value.logNames = append([]string(nil), base.logNames...)
@@ -31,7 +36,7 @@ func TestValidateOptionsRejectsUnsafeTargets(t *testing.T) {
 }
 
 func TestValidateOptionsRequiresLoopbackProbeForReopen(t *testing.T) {
-	value := options{container: defaultContainer, collector: defaultCollector, logDir: "/safe/logs", logNames: []string{"access.log"}, lockPath: "/tmp/reopen.lock", proofPath: "/safe/logs/.nginx-writer-release-v2.json", logGID: 987, timeout: 20 * time.Second}
+	value := options{container: defaultContainer, collector: defaultCollector, logDir: "/safe/logs", containerLogDir: "/var/log/safe", logNames: []string{"access.log"}, lockPath: "/tmp/reopen.lock", proofPath: "/safe/logs/.nginx-writer-release-v2.json", logGID: 987, probeStatus: 200, timeout: 20 * time.Second}
 	if err := validateOptions(value); err == nil {
 		t.Fatal("a production reopen without a loopback probe must be rejected")
 	}
@@ -171,8 +176,72 @@ func TestVerifyLogPermissionsDoesNotRepairUnsafeMode(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := verifyLogPermissions(files, os.Getgid()); err == nil {
+	if err := verifyLogPermissions(files, os.Getuid(), os.Getgid()); err == nil {
 		t.Fatal("unsafe create mode must fail closed instead of being repaired")
+	}
+}
+
+func TestVerifyLogPermissionsSeparatesPreAndPostReopenOwners(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "access.log")
+	if err := os.WriteFile(path, []byte("line\n"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	files, err := inspectLogFiles(dir, []string{"access.log"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	uid, gid := os.Getuid(), os.Getgid()
+	if err := verifyLogPermissions(files, uid, gid); err != nil {
+		t.Fatalf("steady-state worker ownership rejected: %v", err)
+	}
+	wrongUID := uid + 1
+	if wrongUID == 0 {
+		wrongUID++
+	}
+	if err := verifyLogPermissions(files, wrongUID, gid); err == nil {
+		t.Fatal("a file owned by a different user must be rejected")
+	}
+	if err := verifyCurrentFileSet(files, uid, gid); err != nil {
+		t.Fatalf("unchanged file set rejected: %v", err)
+	}
+	if err := verifyCurrentFileSet(files, wrongUID, gid); err == nil {
+		t.Fatal("current-file validation must enforce the phase-specific owner")
+	}
+}
+
+func TestProbeAcceptsExplicitOriginLockStatusAndRequiresGrowth(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "access.log")
+	if err := os.WriteFile(path, nil, 0o640); err != nil {
+		t.Fatal(err)
+	}
+	files, err := inspectLogFiles(dir, []string{"access.log"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	originalProbe := performProbe
+	t.Cleanup(func() { performProbe = originalProbe })
+	performProbe = func(_ context.Context, _ string) (*http.Response, error) {
+		file, openErr := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0)
+		if openErr != nil {
+			return nil, openErr
+		}
+		_, _ = file.WriteString("probe\n")
+		_ = file.Close()
+		return &http.Response{StatusCode: http.StatusForbidden, Body: io.NopCloser(strings.NewReader("forbidden"))}, nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := probeAndVerifyGrowth(ctx, "http://127.0.0.1/api/status", http.StatusForbidden, files[0]); err != nil {
+		t.Fatalf("explicit origin-lock status rejected: %v", err)
+	}
+	refreshed, err := inspectLogFiles(dir, []string{"access.log"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := probeAndVerifyGrowth(ctx, "http://127.0.0.1/api/status", http.StatusOK, refreshed[0]); err == nil {
+		t.Fatal("unexpected probe status must fail closed")
 	}
 }
 

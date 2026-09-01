@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -477,5 +478,19 @@ func TestNginxSourcesExposeMissingAllowedNode(t *testing.T) {
 	connected, healthy, total, _, _ := m.nginxSourceSummary(context.Background(), now)
 	if connected || healthy != 1 || total != 2 {
 		t.Fatalf("不能因为一个节点健康就显示 Nginx 整体已接入: connected=%v healthy=%d total=%d", connected, healthy, total)
+	}
+}
+
+func TestNginxSourcesRejectFreshHeartbeatWithStaleEventStream(t *testing.T) {
+	m := newTestMonitor(t)
+	m.cfg.NginxEnabled = true
+	m.cfg.NginxAllowedNodes = []string{"master"}
+	now := time.Now().Unix()
+	if err := m.storeDB.Create(&NginxSourceState{Node: "master", LastEventTs: now - nginxEventLagBadSec - 1, LastIngestTs: now, BacklogKnown: true, BacklogBytes: 0}).Error; err != nil {
+		t.Fatal(err)
+	}
+	rows := m.nginxSources(context.Background(), now)
+	if len(rows) != 1 || rows[0].Status != "bad" || !slices.Contains(rows[0].HealthReasons, "event_stream_stale") {
+		t.Fatalf("fresh heartbeat/backlog=0 hid a stale access stream: %+v", rows)
 	}
 }

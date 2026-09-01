@@ -216,3 +216,34 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+
+  # Host-side safety tools are not container images. Build them on the same
+  # tested Linux revision and publish checksums so production never receives
+  # an untraceable binary built by hand on an operator laptop.
+  build-nginx-ops-tools:
+    needs: [test, race-monitor]
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.6'
+      - name: Build static Linux amd64 tools
+        env:
+          CGO_ENABLED: '0'
+          GOOS: linux
+          GOARCH: amd64
+        run: |
+          mkdir -p dist
+          go build -trimpath -ldflags='-s -w' -o dist/nexusapi-nginxreopen ./cmd/nginxreopen
+          go build -trimpath -ldflags='-s -w' -o dist/nexusapi-nginxcursoraudit ./cmd/nginxcursoraudit
+          sha256sum dist/nexusapi-nginxreopen dist/nexusapi-nginxcursoraudit > dist/SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nginx-ops-tools-linux-amd64
+          path: dist/
+          if-no-files-found: error
+          retention-days: 14

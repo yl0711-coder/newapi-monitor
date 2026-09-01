@@ -34,16 +34,18 @@ const (
 )
 
 type options struct {
-	container string
-	collector string
-	logDir    string
-	logNames  []string
-	lockPath  string
-	probeURL  string
-	proofPath string
-	logGID    int
-	checkOnly bool
-	timeout   time.Duration
+	container       string
+	collector       string
+	logDir          string
+	containerLogDir string
+	logNames        []string
+	lockPath        string
+	probeURL        string
+	probeStatus     int
+	proofPath       string
+	logGID          int
+	checkOnly       bool
+	timeout         time.Duration
 }
 
 type containerState struct {
@@ -118,9 +120,11 @@ func main() {
 	flag.StringVar(&opts.container, "container", defaultContainer, "Nginx container name")
 	flag.StringVar(&opts.collector, "collector-container", defaultCollector, "collector container name")
 	flag.StringVar(&opts.logDir, "log-dir", defaultLogDir, "dedicated host log directory")
+	flag.StringVar(&opts.containerLogDir, "container-log-dir", "/var/log/nexusapi-monitor", "dedicated log directory as mounted inside Nginx")
 	flag.StringVar(&rawLogs, "logs", "nexusapi_access.jsonl,error.log", "comma-separated log basenames")
 	flag.StringVar(&opts.lockPath, "lock", "/run/lock/nexusapi-nginx-reopen.lock", "exclusive lock path")
 	flag.StringVar(&opts.probeURL, "probe-url", "", "required loopback HTTP status URL unless -check is used")
+	flag.IntVar(&opts.probeStatus, "probe-expected-status", http.StatusOK, "exact HTTP status expected from the loopback probe")
 	flag.StringVar(&opts.proofPath, "proof", "", "writer-release proof path (default: inside log-dir)")
 	flag.IntVar(&opts.logGID, "log-gid", -1, "expected numeric host GID of the dedicated log group")
 	flag.BoolVar(&opts.checkOnly, "check", false, "validate only; do not chown, chmod or signal")
@@ -163,8 +167,8 @@ func validateOptions(o options) error {
 	if !safeName(o.container) || !safeName(o.collector) {
 		return errors.New("container names must use only letters, digits, dot, underscore or dash")
 	}
-	if !filepath.IsAbs(o.logDir) || !filepath.IsAbs(o.lockPath) || !filepath.IsAbs(o.proofPath) || filepath.Clean(o.logDir) == "/" {
-		return errors.New("log-dir, lock and proof must be absolute, and log-dir cannot be root")
+	if !filepath.IsAbs(o.logDir) || !filepath.IsAbs(o.containerLogDir) || !filepath.IsAbs(o.lockPath) || !filepath.IsAbs(o.proofPath) || filepath.Clean(o.logDir) == "/" || filepath.Clean(o.containerLogDir) == "/" {
+		return errors.New("log-dir, container-log-dir, lock and proof must be absolute, and log directories cannot be root")
 	}
 	if filepath.Dir(filepath.Clean(o.proofPath)) != filepath.Clean(o.logDir) {
 		return errors.New("proof must be a direct child of log-dir")
@@ -185,6 +189,9 @@ func validateOptions(o options) error {
 		if !strings.EqualFold(host, "localhost") && (ip == nil || !ip.IsLoopback()) {
 			return errors.New("probe-url must target localhost or a loopback IP")
 		}
+	}
+	if o.probeStatus < 100 || o.probeStatus > 599 {
+		return errors.New("probe-expected-status must be between 100 and 599")
 	}
 	if !o.checkOnly && o.probeURL == "" {
 		return errors.New("probe-url is required for a production reopen")
@@ -252,16 +259,23 @@ func run(ctx context.Context, o options) (result, error) {
 		return result{}, err
 	}
 	for _, worker := range workers {
-		if err := verifyTraverse(o.logDir, worker); err != nil {
+		if err := verifyDirectoryTraverse(o.logDir, worker); err != nil {
 			return result{}, err
 		}
+	}
+	if err := verifyContainerLogTraverse(ctx, before.ID, workerUID, o.containerLogDir); err != nil {
+		return result{}, err
 	}
 	files, err := inspectLogFiles(o.logDir, o.logNames)
 	if err != nil {
 		return result{}, err
 	}
 	if o.checkOnly {
-		if err := verifyLogPermissions(files, o.logGID); err != nil {
+		// A completed Nginx USR1 reopen deliberately transfers the current
+		// files to the unprivileged worker user.  Check mode validates that
+		// steady-state ownership; it must not require the pre-reopen root
+		// ownership used by logrotate's create directive.
+		if err := verifyLogPermissions(files, workerUID, o.logGID); err != nil {
 			return result{}, err
 		}
 		if err := verifyWorkerFDs(append([]workerProcess{master}, workers...), files, o.logNames); err != nil {
@@ -279,12 +293,12 @@ func run(ctx context.Context, o options) (result, error) {
 
 	// Ownership and mode are deployment invariants. Never repair them in this
 	// safety-critical hook: a bad logrotate create rule must fail closed.
-	if err := verifyLogPermissions(files, o.logGID); err != nil {
+	if err := verifyLogPermissions(files, 0, o.logGID); err != nil {
 		return result{}, err
 	}
 	// Revalidate the whole set after all per-file operations. A second rotation
 	// between the first and last file must abort before USR1.
-	if err := verifyCurrentFileSet(files, o.logGID); err != nil {
+	if err := verifyCurrentFileSet(files, 0, o.logGID); err != nil {
 		return result{}, err
 	}
 	if err := ensureContainerUnchanged(ctx, o.container, before); err != nil {
@@ -293,7 +307,7 @@ func run(ctx context.Context, o options) (result, error) {
 	if _, err := command(ctx, "docker", "kill", "-s", "USR1", before.ID); err != nil {
 		return result{}, fmt.Errorf("signal nginx master: %w", err)
 	}
-	if _, err := waitForWorkerFDs(ctx, o.container, before, files, o.logNames, o.logGID); err != nil {
+	if _, err := waitForWorkerFDs(ctx, o.container, before, files, o.logNames, workerUID, o.logGID); err != nil {
 		return result{}, err
 	}
 	after, err := inspectContainer(ctx, before.ID)
@@ -303,7 +317,7 @@ func run(ctx context.Context, o options) (result, error) {
 	if before != after {
 		return result{}, fmt.Errorf("container identity changed during reopen: before=%+v after=%+v", before, after)
 	}
-	if err := probeAndVerifyGrowth(ctx, o.probeURL, files[0]); err != nil {
+	if err := probeAndVerifyGrowth(ctx, o.probeURL, o.probeStatus, files[0]); err != nil {
 		return result{}, err
 	}
 	// The probe itself can race with a worker replacement or a late writer.
@@ -603,21 +617,21 @@ func writeWriterReleaseProof(o options, state containerState, current []fileIden
 	return len(proof.Released), nil
 }
 
-func verifyLogPermissions(files []fileIdentity, gid int) error {
+func verifyLogPermissions(files []fileIdentity, uid, gid int) error {
 	for _, file := range files {
 		info, err := os.Lstat(file.Path)
 		if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
 			return fmt.Errorf("cannot safely inspect current log %s", file.Path)
 		}
 		stat, ok := info.Sys().(*syscall.Stat_t)
-		if !ok || stat.Uid != 0 || int(stat.Gid) != gid || stat.Mode&0o777 != 0o640 {
-			return fmt.Errorf("current log %s must be owned by root:%d with mode 0640", file.Path, gid)
+		if !ok || int(stat.Uid) != uid || int(stat.Gid) != gid || stat.Mode&0o777 != 0o640 {
+			return fmt.Errorf("current log %s must be owned by %d:%d with mode 0640", file.Path, uid, gid)
 		}
 	}
 	return nil
 }
 
-func verifyCurrentFileSet(expected []fileIdentity, gid int) error {
+func verifyCurrentFileSet(expected []fileIdentity, uid, gid int) error {
 	for _, file := range expected {
 		info, err := os.Lstat(file.Path)
 		if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
@@ -627,7 +641,7 @@ func verifyCurrentFileSet(expected []fileIdentity, gid int) error {
 		if !ok || statDeviceID(stat.Dev) != file.Dev || stat.Ino != file.Inode || stat.Nlink != 1 {
 			return fmt.Errorf("current log rotated during preparation: %s", file.Path)
 		}
-		if stat.Uid != 0 || int(stat.Gid) != gid || stat.Mode&0o777 != 0o640 {
+		if int(stat.Uid) != uid || int(stat.Gid) != gid || stat.Mode&0o777 != 0o640 {
 			return fmt.Errorf("current log permissions changed during preparation: %s", file.Path)
 		}
 	}
@@ -818,42 +832,45 @@ func verifyCollectorAccess(ctx context.Context, collector string, gid int, logNa
 	return fmt.Errorf("collector does not have required log GID %d", gid)
 }
 
-func verifyTraverse(path string, worker workerProcess) error {
-	for current := filepath.Clean(path); ; current = filepath.Dir(current) {
-		info, err := os.Lstat(current)
-		if err != nil {
-			return err
-		}
-		if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
-			return fmt.Errorf("unsafe directory component %s", current)
-		}
-		stat, ok := info.Sys().(*syscall.Stat_t)
-		if !ok {
-			return fmt.Errorf("cannot inspect directory %s", current)
-		}
-		perm := info.Mode().Perm()
-		// Linux DAC selects exactly one class: owner, then any effective/
-		// supplementary group, otherwise other. It does not OR all classes.
-		canTraverse := false
-		switch {
-		case stat.Uid == uint32(worker.UID):
-			canTraverse = perm&0o100 != 0
-		case worker.Groups[int(stat.Gid)]:
-			canTraverse = perm&0o010 != 0
-		default:
-			canTraverse = perm&0o001 != 0
-		}
-		if !canTraverse {
-			return fmt.Errorf("nginx worker PID %d UID %d cannot traverse %s", worker.PID, worker.UID, current)
-		}
-		if current == "/" {
-			break
-		}
+func verifyDirectoryTraverse(path string, worker workerProcess) error {
+	info, err := os.Lstat(filepath.Clean(path))
+	if err != nil {
+		return err
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		return fmt.Errorf("unsafe log directory %s", path)
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return fmt.Errorf("cannot inspect log directory %s", path)
+	}
+	perm := info.Mode().Perm()
+	// Only the bind-mounted directory itself is shared with Nginx. Host parent
+	// directories such as /var/lib/docker are outside the container mount
+	// namespace and must not be evaluated as worker traversal requirements.
+	canTraverse := false
+	switch {
+	case stat.Uid == uint32(worker.UID):
+		canTraverse = perm&0o100 != 0
+	case worker.Groups[int(stat.Gid)]:
+		canTraverse = perm&0o010 != 0
+	default:
+		canTraverse = perm&0o001 != 0
+	}
+	if !canTraverse {
+		return fmt.Errorf("nginx worker PID %d UID %d cannot traverse mounted log directory %s", worker.PID, worker.UID, path)
 	}
 	return nil
 }
 
-func waitForWorkerFDs(ctx context.Context, container string, expected containerState, files []fileIdentity, logNames []string, logGID int) ([]workerProcess, error) {
+func verifyContainerLogTraverse(ctx context.Context, container string, workerUID int, path string) error {
+	if _, err := command(ctx, "docker", "exec", "--user", strconv.Itoa(workerUID), container, "test", "-x", path); err != nil {
+		return fmt.Errorf("nginx worker UID %d cannot traverse container log directory %s: %w", workerUID, path, err)
+	}
+	return nil
+}
+
+func waitForWorkerFDs(ctx context.Context, container string, expected containerState, files []fileIdentity, logNames []string, workerUID, logGID int) ([]workerProcess, error) {
 	ticker := time.NewTicker(250 * time.Millisecond)
 	defer ticker.Stop()
 	stable := 0
@@ -864,7 +881,7 @@ func waitForWorkerFDs(ctx context.Context, container string, expected containerS
 		}
 		workers, err := verifyNginxFDState(ctx, expected.ID, expected.PID, files, logNames)
 		if err == nil {
-			err = verifyCurrentFileSet(files, logGID)
+			err = verifyCurrentFileSet(files, workerUID, logGID)
 		}
 		set := fmt.Sprint(workerPIDs(workers))
 		if err == nil && set == lastSet {
@@ -998,25 +1015,20 @@ func verifyWritableAppendFD(pid int, fd string) error {
 	return fmt.Errorf("worker %d fd %s has no valid flags", pid, fd)
 }
 
-func probeAndVerifyGrowth(ctx context.Context, rawURL string, access fileIdentity) error {
+func probeAndVerifyGrowth(ctx context.Context, rawURL string, expectedStatus int, access fileIdentity) error {
 	baseline, err := inspectLogFiles(filepath.Dir(access.Path), []string{filepath.Base(access.Path)})
 	if err != nil || len(baseline) != 1 || baseline[0].Dev != access.Dev || baseline[0].Inode != access.Inode {
 		return errors.New("access log identity changed before local probe")
 	}
 	access = baseline[0]
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
-	if err != nil {
-		return fmt.Errorf("build local probe: %w", err)
-	}
-	client := &http.Client{Timeout: 3 * time.Second, CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return errors.New("probe redirect refused") }}
-	resp, err := client.Do(req)
+	resp, err := performProbe(ctx, rawURL)
 	if err != nil {
 		return fmt.Errorf("local probe failed: %w", err)
 	}
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
 	_ = resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("local probe returned HTTP %d", resp.StatusCode)
+	if resp.StatusCode != expectedStatus {
+		return fmt.Errorf("local probe returned HTTP %d, expected %d", resp.StatusCode, expectedStatus)
 	}
 	deadline := time.NewTicker(100 * time.Millisecond)
 	defer deadline.Stop()
@@ -1031,6 +1043,15 @@ func probeAndVerifyGrowth(ctx context.Context, rawURL string, access fileIdentit
 		case <-deadline.C:
 		}
 	}
+}
+
+var performProbe = func(ctx context.Context, rawURL string) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("build local probe: %w", err)
+	}
+	client := &http.Client{Timeout: 3 * time.Second, CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return errors.New("probe redirect refused") }}
+	return client.Do(req)
 }
 
 var command = func(ctx context.Context, name string, args ...string) (string, error) {

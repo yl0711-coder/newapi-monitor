@@ -739,6 +739,7 @@ type NginxEdgeSource struct {
 const (
 	nginxRecentDataLossWindowSec = int64(15 * 60)
 	nginxEventLagWarnSec         = int64(3 * 60)
+	nginxEventLagBadSec          = int64(15 * 60)
 	nginxBacklogWarnBytes        = int64(16 << 20)
 )
 
@@ -862,6 +863,23 @@ func (m *Monitor) nginxSources(ctx context.Context, now int64) []NginxEdgeSource
 		}
 		if age > 900 {
 			status = "bad"
+		}
+		// The load balancer probes every active node, so an access lane with
+		// fresh collector heartbeats but no fresh events is not an idle source.
+		// Treat it as a stuck file/cursor instead of allowing backlog=0 to
+		// manufacture a healthy state.
+		if state.LastEventTs == 0 {
+			if status != "bad" {
+				status = "warn"
+			}
+			reasons = append(reasons, "event_stream_empty")
+		} else if eventAge > nginxEventLagWarnSec {
+			if eventAge > nginxEventLagBadSec {
+				status = "bad"
+			} else if status != "bad" {
+				status = "warn"
+			}
+			reasons = append(reasons, "event_stream_stale")
 		}
 		if state.BacklogKnown && state.BacklogBytes >= nginxBacklogWarnBytes {
 			if status != "bad" {

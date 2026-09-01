@@ -107,7 +107,7 @@ NGINXCOLLECTOR_ERROR_LOG_PATH=/logs/error.log
 NGINXCOLLECTOR_ERROR_CURSOR_PATH=/data/error-cursor.json
 NGINXCOLLECTOR_ERROR_SINK_URL=https://monitor.example/internal/nginx-errors
 # 必须与 Nginx error_log 的实际时区一致
-NGINXCOLLECTOR_ERROR_TIMEZONE=Asia/Shanghai
+NGINXCOLLECTOR_ERROR_TIMEZONE=UTC
 ```
 
 采集器挂载的 `/logs/error.log` 必须是现有标准 error log 的只读文件，不要求修改其格式。若该文件不在已有共享日志目录，仍需在节点摘流窗口内补只读挂载；不得为采集赋予 Docker socket 或宿主机广泛读取权限。
@@ -131,6 +131,12 @@ Nginx 容器以读写方式挂载到 `/var/log/nexusapi-monitor`，采集器把�
 目录只读挂载到 `/logs`。不使用 `copytruncate`；宿主机在 Nginx 收到 `USR1`
 后重新打开日志文件，保证 inode 切换可被采集器跟踪。
 
+日志目录必须是 `root:nexus-monitor 0751`（或经过同等验证的 ACL）：采集器通过
+`nexus-monitor` 组读取，Nginx worker 只获得目录穿越权限。`0750` 会导致 master
+打开新文件后 worker 无法按路径重新打开，形成旧 `.1` 仍增长而采集水位假正常的缺口。
+当前日志由 logrotate 以 `root:nexus-monitor 0640` 创建；成功处理 `USR1` 后 Nginx
+会按其标准行为把 owner 调整为 worker UID，group 和 `0640` 必须保持不变。
+
 参考 logrotate 基线（每节点）：
 
 ```text
@@ -150,7 +156,8 @@ Nginx 容器以读写方式挂载到 `/var/log/nexusapi-monitor`，采集器把�
           -log-dir /opt/nexusapi/logs/nginx-monitor \
           -logs nexusapi_access.jsonl,error.log \
           -log-gid <nexus-monitor 数字 GID> \
-          -probe-url http://127.0.0.1:<本机 Nginx 端口>/api/status
+          -probe-url http://127.0.0.1:<本机 Nginx 端口>/api/status \
+          -probe-expected-status 403
     endscript
 }
 ```
@@ -160,6 +167,9 @@ Nginx 容器以读写方式挂载到 `/var/log/nexusapi-monitor`，采集器把�
 不 reload/restart；但任何权限、collector 可读性、worker FD、容器身份或本地探针校验失败
 都必须让 logrotate 失败。成功后它会原子写入 root 所有的
 `.nginx-writer-release-v2.json`，source v2 只依据这份 inode 证明退役已读完且已消失的旧日志。
+当前 NexusAPI 源站锁会让不带内部密钥的 loopback `/api/status` 返回 `403`，因此示例显式
+要求 `403`；这个探针用于证明 worker 已在新 inode 写入，不携带或暴露源站密钥。公网/LB
+健康状态仍应在摘流和回挂闸门中独立验证。
 生产 Nginx 容器必须由 root Nginx master 直接作为 PID1；不得再套 shell、tini
 或其他 supervisor，否则安全校验会按设计失败关闭。
 该工具仅支持 Linux `/proc` 和 Docker host PID 语义，不支持 userns-remap。
@@ -285,6 +295,14 @@ manifest 一旦持久化，该 lane 不能通过删环境变量或回退二进�
 切换后发生故障时，先停止该 lane 采集器并保留日志和游标卷，优先前向修复。
 只有在采集器已停止、日志不再增长的受控恢复窗口，才能把 Monitor 主库、事实库和
 access/error 游标卷恢复到同一个已校验的时点；严禁只恢复其中一份。
+
+遗留 v1 游标错误切到空 current、而 `.1` 仍增长时，不得从 `.1` 文件头重放。
+先使用 `cmd/nginxcursoraudit`，把 Monitor 保留的同节点、同 lane 的 64 位数据批次 ID
+按行输入，并指定最后成功数据批次。工具使用生产 v1 的 node、inode、起止偏移和逐行内容
+摘要算法，从文件开头逐批证明边界，只输出最后确认 offset，不写日志或游标。任一中间批次
+缺失、文件身份异常或目标批次无法到达都会失败关闭。只有在 writer-release 已证明 `.1`
+不再被任何 Nginx 进程持有、四条 lane 的审计结果已留档且游标卷完成备份后，才可按该
+offset 恢复；随后先开启 prepare 获取服务端边界 ACK，再逐 lane 切到 source v2。
 
 ## 日志轮转与连续性
 
