@@ -56,6 +56,9 @@ services:
       MONITOR_SAMPLE_SECONDS: "60"
       MONITOR_BACKFILL_HOURS: "1"
       MONITOR_STABILITY_ENABLED: "true"
+      # 容量规划只读取本机已采集的脱敏事实，不新增来源 worker；真实只读
+      # 验收需要显式开启页面，线上默认开关仍不受影响。
+      MONITOR_CAPACITY_ENABLED: "true"
       # 与拟上线读模型一致：页面始终读本地 SQLite，缺失小时由限速的单小时
       # nexus_ro 查询补齐。只读、每次一个小时切片，不执行任何线上写操作。
       MONITOR_STABILITY_BACKFILL_ENABLED: "true"

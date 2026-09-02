@@ -658,6 +658,7 @@ func (m *Monitor) refreshChannelsContext(parent context.Context) error {
 	m.chMu.Unlock()
 	if err := m.replaceChannelSnapsAuthoritative(snaps, now); err != nil {
 		slog.Warn("渠道健康快照写入失败(忽略,不影响监控)", "err", err)
+		return err
 	}
 	return nil
 }

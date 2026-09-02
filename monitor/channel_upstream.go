@@ -943,12 +943,28 @@ func (m *Monitor) aicodeWithSlotViewsFromStates(row ChannelUpstreamAccount, stat
 		if label == "" {
 			label = fmt.Sprintf("Key %d", i+1)
 		}
+		// UsageBackfillDone is the authoritative, atomically published account
+		// watermark. Older images completed the account-level history without
+		// copying that terminal state to the per-key diagnostic rows. Do not let
+		// those legacy rows keep a healthy account displayed as "backfilling".
+		// A credential-set change resets UsageBackfillDone before the new keys
+		// become visible, so this compatibility projection cannot hide work that
+		// is genuinely due for a newly added or replaced key.
+		backfillDone := state.BackfillDone || row.UsageBackfillDone
+		backfillLastError := state.BackfillLastError
+		backfillNextSyncAt := state.BackfillNextSyncAt
+		backfillConsecutiveFails := state.BackfillConsecutiveFails
+		if row.UsageBackfillDone {
+			backfillLastError = ""
+			backfillNextSyncAt = 0
+			backfillConsecutiveFails = 0
+		}
 		views = append(views, AICodeWithKeySlotView{
 			SlotID: slot.SlotID, Name: slot.Name, Label: label, Status: state.Status,
 			LastError: state.LastError, LastSuccessAt: state.LastSuccessAt, NextSyncAt: state.NextSyncAt,
-			ConsecutiveFails: state.ConsecutiveFails, BackfillDone: state.BackfillDone,
-			BackfillLastError: state.BackfillLastError, BackfillLastSuccessAt: state.BackfillLastSuccessAt,
-			BackfillNextSyncAt: state.BackfillNextSyncAt, BackfillConsecutiveFails: state.BackfillConsecutiveFails,
+			ConsecutiveFails: state.ConsecutiveFails, BackfillDone: backfillDone,
+			BackfillLastError: backfillLastError, BackfillLastSuccessAt: state.BackfillLastSuccessAt,
+			BackfillNextSyncAt: backfillNextSyncAt, BackfillConsecutiveFails: backfillConsecutiveFails,
 		})
 	}
 	return views

@@ -91,8 +91,8 @@ func (s *ChannelTestHourSample) BeforeCreate(_ *gorm.DB) error {
 	return nil
 }
 
-// StabilityRejectHour 把未进入真实渠道的前置拒绝长期保留。
-// 这类请求会计入分组/模型的用户交付稳定性，但永远不归因给某个渠道。
+// StabilityRejectHour 把未进入真实渠道的前置拒绝长期保留。它只作为
+// 分组下的明确记录计数，不参与平台、分组、模型或渠道稳定率。
 type StabilityRejectHour struct {
 	HourTs int64  `gorm:"primaryKey;autoIncrement:false;index:idx_stability_reject_hour;index:idx_stability_reject_group_hour,priority:2"`
 	Node   string `gorm:"primaryKey;size:64"`

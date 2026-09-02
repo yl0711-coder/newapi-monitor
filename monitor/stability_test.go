@@ -101,6 +101,9 @@ func TestStabilityRollupAndReportKeepsGroupChannelSemantics(t *testing.T) {
 	if err := m.storeDB.Create(&RejectionSample{BucketTs: currentHour, Node: "master", Reason: "no_available_channel", Model: "gpt-5", Grp: "codex", Count: 2}).Error; err != nil {
 		t.Fatal(err)
 	}
+	if err := m.storeDB.Create(&RejectionSample{BucketTs: currentHour, Node: "master", Reason: "no_available_channel", Model: "not-offered-model", Grp: "codex", Count: 3}).Error; err != nil {
+		t.Fatal(err)
+	}
 	if err := m.rollupStabilityHours(previousHour - 60); err != nil {
 		t.Fatal(err)
 	}
@@ -119,8 +122,8 @@ func TestStabilityRollupAndReportKeepsGroupChannelSemantics(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if report.Summary.Requests != 152 {
-		t.Fatalf("summary requests=%d want 152", report.Summary.Requests)
+	if report.Summary.Requests != 150 || report.Summary.Rejected != 5 {
+		t.Fatalf("unassigned requests must be counted separately from stability: %+v", report.Summary)
 	}
 	if len(report.Groups) != 2 {
 		t.Fatalf("groups=%d want 2", len(report.Groups))
@@ -131,10 +134,20 @@ func TestStabilityRollupAndReportKeepsGroupChannelSemantics(t *testing.T) {
 			codex = g
 		}
 	}
-	if codex.Requests != 102 || codex.Rejected != 2 {
+	if codex.Requests != 100 || codex.Rejected != 5 || codex.Problems != 10 {
 		t.Fatalf("codex metrics=%+v", codex.StabilityMetrics)
 	}
-	if codex.Stability == nil || math.Abs(*codex.Stability-90.0/102.0*100) > 0.0001 {
+	for _, model := range codex.Models {
+		if model.Name == "not-offered-model" {
+			t.Fatalf("unassigned request model leaked into group model metrics: %+v", model)
+		}
+	}
+	for _, model := range report.Rankings.Models {
+		if model.Name == "not-offered-model" {
+			t.Fatalf("unassigned request model leaked into model ranking: %+v", model)
+		}
+	}
+	if codex.Stability == nil || math.Abs(*codex.Stability-90.0) > 0.0001 {
 		t.Fatalf("codex stability=%v", codex.Stability)
 	}
 	if len(codex.Channels) != 1 || codex.Channels[0].Requests != 100 || codex.Channels[0].Rejected != 0 {
@@ -143,10 +156,10 @@ func TestStabilityRollupAndReportKeepsGroupChannelSemantics(t *testing.T) {
 	if codex.DeltaPP == nil || *codex.DeltaPP <= 0 {
 		t.Fatalf("expected positive delta, got %v", codex.DeltaPP)
 	}
-	if len(codex.Daily) != 1 || codex.Daily[0].Rejected != 2 {
+	if len(codex.Daily) != 1 || codex.Daily[0].Rejected != 5 || codex.Daily[0].Requests != 100 || codex.Daily[0].Problems != 10 {
 		t.Fatalf("daily rejection missing: %+v", codex.Daily)
 	}
-	if report.Meta.TimelineBucketSec != 3600 || len(codex.Timeline) != 24 || codex.Timeline[10].Requests != 102 || codex.Timeline[10].Problems != 12 {
+	if report.Meta.TimelineBucketSec != 3600 || len(codex.Timeline) != 24 || codex.Timeline[10].Requests != 100 || codex.Timeline[10].Problems != 10 {
 		t.Fatalf("timeline/rejection missing: step=%d timeline=%+v", report.Meta.TimelineBucketSec, codex.Timeline)
 	}
 
@@ -156,6 +169,13 @@ func TestStabilityRollupAndReportKeepsGroupChannelSemantics(t *testing.T) {
 	}
 	if vendorReport.Summary.Requests != 100 || vendorReport.Summary.Rejected != 0 {
 		t.Fatalf("vendor filter must not invent rejection ownership: %+v", vendorReport.Summary)
+	}
+	problems, err := m.queryStabilityProblems(context.Background(), stabilityScope{FromTs: day, ToTs: day + 24*3600}, 50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if problems.CapturedTotal != 0 || len(problems.Problems) != 0 {
+		t.Fatalf("unassigned counts must not enter the stability problem evidence list: %+v", problems)
 	}
 }
 
@@ -825,24 +845,23 @@ func TestStabilityReportFallsBackToLegacyHoursWithoutDoubleCountingV5(t *testing
 	}).Error; err != nil {
 		t.Fatal(err)
 	}
-
 	report, err := m.buildStabilityReport(context.Background(), stabilityScope{
 		FromTs: day, ToTs: day + 2*86400,
 	}, day+2*86400)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if report.Summary.Requests != 212 || report.Summary.Rejected != 12 {
+	if report.Summary.Requests != 200 || report.Summary.Rejected != 12 || report.Summary.Problems != 20 {
 		t.Fatalf("legacy fallback or v5 precedence is wrong: %+v", report.Summary)
 	}
 	if len(report.Groups) != 1 || len(report.Groups[0].Daily) != 2 {
 		t.Fatalf("unexpected report groups: %+v", report.Groups)
 	}
 	first, second := report.Groups[0].Daily[0], report.Groups[0].Daily[1]
-	if first.Requests != 107 || first.Stability == nil || math.Abs(*first.Stability-(90.0/107.0*100)) > 0.0001 {
+	if first.Requests != 100 || first.Rejected != 7 || first.Stability == nil || math.Abs(*first.Stability-90) > 0.0001 {
 		t.Fatalf("legacy fallback day is wrong: %+v", first)
 	}
-	if second.Requests != 105 || second.Stability == nil || math.Abs(*second.Stability-(90.0/105.0*100)) > 0.0001 {
+	if second.Requests != 100 || second.Rejected != 5 || second.Stability == nil || math.Abs(*second.Stability-90) > 0.0001 {
 		t.Fatalf("v5 day was not preferred over stale legacy facts: %+v", second)
 	}
 	if got := report.Meta.DataCoverage.LegacyFallbackHours; got != 1 {

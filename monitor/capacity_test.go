@@ -59,8 +59,8 @@ func TestAggregateCapacitySeriesKeepsTrueMinutePeak(t *testing.T) {
 	if p.P95Seconds == nil || *p.P95Seconds != 5 {
 		t.Fatalf("延迟直方图 p95 计算错误: %+v", p.P95Seconds)
 	}
-	if summary.StabilityPct == nil || math.Abs(*summary.StabilityPct-66.6666667) > .001 {
-		t.Fatalf("日志稳定率口径错误: %+v", summary.StabilityPct)
+	if summary.StabilityPct == nil || math.Abs(*summary.StabilityPct-86.6666667) > .001 {
+		t.Fatalf("平台日志稳定率必须排除前置拒绝: %+v", summary.StabilityPct)
 	}
 }
 
@@ -201,12 +201,12 @@ func TestCapacityBreakdownIncludesAttributableRejections(t *testing.T) {
 	breakdowns, _ := m.capacityBreakdowns(metrics, rejections, 60, 0, "", "", true)
 	for _, dimension := range []string{"groups", "models"} {
 		got := breakdowns[dimension]
-		if len(got) != 1 || got[0].Requests != 15 || got[0].RejectedRequests != 5 || got[0].StabilityScope != "log_plus_pre_route" {
-			t.Fatalf("%s 排名必须纳入可归因前置拒绝: %+v", dimension, got)
+		if len(got) != 1 || got[0].Requests != 15 || got[0].RejectedRequests != 5 || got[0].StabilityScope != "routed_log_only" || got[0].StabilityPct == nil || math.Abs(*got[0].StabilityPct-80) > .001 {
+			t.Fatalf("%s 请求量应保留前置拒绝，稳定率必须只算已进入服务链路的日志: %+v", dimension, got)
 		}
 	}
 	got := breakdowns["channels"]
-	if len(got) != 1 || got[0].Requests != 10 || got[0].RejectedRequests != 0 || got[0].StabilityScope != "log_only" {
+	if len(got) != 1 || got[0].Requests != 10 || got[0].RejectedRequests != 0 || got[0].StabilityScope != "routed_log_only" {
 		t.Fatalf("渠道不能伪归因选路前拒绝: %+v", got)
 	}
 }

@@ -1292,6 +1292,59 @@ func TestAICodeWithTransientFailureResumesWithoutRepeatingSuccessfulKeys(t *test
 	}
 }
 
+func TestAICodeWithFinalBackfillPublishesPerKeyCompletion(t *testing.T) {
+	const key = "sk-acw-backfill-completion"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer "+key {
+			http.Error(w, `{"message":"bad key"}`, http.StatusUnauthorized)
+			return
+		}
+		start, end := r.URL.Query().Get("start"), r.URL.Query().Get("end")
+		_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{
+			"api_key_id": 77, "period": map[string]any{"start": start, "end": end}, "group_by": "day",
+			"summary": map[string]any{"cost": "1.00", "total_tokens": 10, "requests": 1},
+			"daily":   []any{map[string]any{"date": start, "cost": "1.00", "total_tokens": 10, "requests": 1}},
+		}})
+	}))
+	defer server.Close()
+
+	m := newChannelUpstreamTestMonitor(t)
+	normalized, err := normalizeAICodeWithCredential(aiCodeWithCredential{APIKey: key})
+	if err != nil {
+		t.Fatal(err)
+	}
+	version, err := aiCodeWithCredentialSetVersion(normalized)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 8, 20, 10, 0, 0, 0, cstLocation).Unix()
+	today := cstDayStart(now)
+	row := ChannelUpstreamAccount{Domain: server.Listener.Addr().String(), Provider: upstreamProviderAICodeWith, BaseURL: server.URL}
+
+	published, _, _, err := m.processAICodeWithRound(context.Background(), &row, normalized, version, "backfill", today-2*86400, today-86400, now, aiCodeWithKeysPerTurn)
+	if err != nil || !published {
+		t.Fatalf("non-final backfill published=%v err=%v", published, err)
+	}
+	var state AICodeWithKeySyncState
+	if err := m.storeDB.First(&state, "domain = ?", row.Domain).Error; err != nil {
+		t.Fatal(err)
+	}
+	if state.BackfillDone {
+		t.Fatalf("non-final backfill marked key complete: %+v", state)
+	}
+
+	published, _, _, err = m.processAICodeWithRound(context.Background(), &row, normalized, version, "backfill", today-86400, today, now+60, aiCodeWithKeysPerTurn)
+	if err != nil || !published {
+		t.Fatalf("final backfill published=%v err=%v", published, err)
+	}
+	if err := m.storeDB.First(&state, "domain = ?", row.Domain).Error; err != nil {
+		t.Fatal(err)
+	}
+	if !state.BackfillDone || state.BackfillLastError != "" || state.BackfillNextSyncAt != 0 || state.BackfillConsecutiveFails != 0 {
+		t.Fatalf("final backfill did not close per-key state: %+v", state)
+	}
+}
+
 func TestAICodeWithSQLiteWriterLockDoesNotAdvancePublishedWatermarks(t *testing.T) {
 	const key = "sk-acw-sqlite-lock"
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

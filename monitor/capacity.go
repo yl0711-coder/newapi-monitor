@@ -589,8 +589,11 @@ func aggregateCapacitySeries(rows []capacityMinuteRow, rejects map[int64]int64, 
 			p.TPM = capacityFloatPtr(float64(p.Tokens) / mins)
 			// 粗粒度并发是窗口内累计处理秒数 / 窗口秒数。
 			p.EstimatedConcurrency = capacityFloatPtr(float64(runtimeByBucket[key]) / (mins * 60))
-			if p.BusinessRequests > 0 {
-				p.StabilityPct = capacityFloatPtr(float64(successByBucket[key]) * 100 / float64(p.BusinessRequests))
+			if p.LoggedRequests > 0 {
+				// 容量页的稳定率只衡量已进入服务链路的日志请求。
+				// 选路前拒绝仍计入业务 RPM，但用独立异常率展示，
+				// 不再把用户请求了未提供模型误报成平台不稳定。
+				p.StabilityPct = capacityFloatPtr(float64(successByBucket[key]) * 100 / float64(p.LoggedRequests))
 			}
 			if v, ok := histogramP95(histByBucket[key]); ok {
 				p.P95Seconds = capacityFloatPtr(v)
@@ -600,12 +603,11 @@ func aggregateCapacitySeries(rows []capacityMinuteRow, rejects map[int64]int64, 
 			// 保持 null，避免把未进入日志误画成 0 token 请求。
 			p.RejectedRPM = capacityFloatPtr(float64(p.RejectedRequests) / mins)
 			p.BusinessRPM = capacityFloatPtr(float64(p.BusinessRequests) / mins)
-			p.StabilityPct = capacityFloatPtr(0)
 		}
 		out = append(out, *p)
 	}
-	if summary.BusinessRequests > 0 {
-		summary.StabilityPct = capacityFloatPtr(float64(totalSuccess) * 100 / float64(summary.BusinessRequests))
+	if summary.LoggedRequests > 0 {
+		summary.StabilityPct = capacityFloatPtr(float64(totalSuccess) * 100 / float64(summary.LoggedRequests))
 	}
 	return out, summary
 }
@@ -699,7 +701,8 @@ func (m *Monitor) capacityBreakdowns(rows []capacityDimensionRow, rejectionRows 
 		mins := math.Max(1, float64(durationSec)/60)
 		out := make([]capacityBreakdown, 0, len(src))
 		for key, a := range src {
-			requests := a.success + a.anomaly + a.failed + a.rejected
+			logged := a.success + a.anomaly + a.failed
+			requests := logged + a.rejected
 			label := key
 			if labels == nil {
 				label = labelFor(key)
@@ -709,8 +712,8 @@ func (m *Monitor) capacityBreakdowns(rows []capacityDimensionRow, rejectionRows 
 			}
 			item := capacityBreakdown{Key: key, Label: label, Requests: requests, RejectedRequests: a.rejected, Tokens: a.tokens,
 				AverageRPM: float64(requests) / mins, AverageTPM: float64(a.tokens) / mins, StabilityScope: scope}
-			if requests > 0 {
-				item.StabilityPct = capacityFloatPtr(float64(a.success) * 100 / float64(requests))
+			if logged > 0 {
+				item.StabilityPct = capacityFloatPtr(float64(a.success) * 100 / float64(logged))
 			}
 			out = append(out, item)
 		}
@@ -720,12 +723,10 @@ func (m *Monitor) capacityBreakdowns(rows []capacityDimensionRow, rejectionRows 
 		}
 		return out
 	}
-	dimensionScope := "log_only"
-	if rejectionsIncluded {
-		dimensionScope = "log_plus_pre_route"
-	}
+	// 请求量/RPM 可以包含前置拒绝；稳定率一律是已进入服务链路的日志口径。
+	dimensionScope := "routed_log_only"
 	breakdowns := map[string][]capacityBreakdown{
-		"groups": convert(groups, nil, dimensionScope), "models": convert(models, nil, dimensionScope), "channels": convert(channels, channelNames, "log_only"),
+		"groups": convert(groups, nil, dimensionScope), "models": convert(models, nil, dimensionScope), "channels": convert(channels, channelNames, "routed_log_only"),
 	}
 	options := map[string][]capacityOption{}
 	for dimension, set := range optionSets {

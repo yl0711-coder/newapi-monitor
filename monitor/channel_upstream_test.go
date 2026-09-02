@@ -1043,6 +1043,42 @@ func TestChannelUpstreamAICodeWithFourKeySaveIsNotBlockedByOtherAccount(t *testi
 	}
 }
 
+func TestAICodeWithSlotViewsUsePublishedAccountBackfillCompletion(t *testing.T) {
+	m := newChannelUpstreamTestMonitor(t)
+	credential, err := normalizeAICodeWithCredential(aiCodeWithCredential{Slots: []aiCodeWithKeyCredential{
+		{SlotID: "acw_primary", Name: "主账号", Secret: "sk-acw-primary-secret"},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	row := ChannelUpstreamAccount{
+		Domain: "aicodewith.example", Provider: upstreamProviderAICodeWith,
+		UsageBackfillDone: true,
+	}
+	if err := m.sealUpstreamAccountCredential(&row, credential); err != nil {
+		t.Fatal(err)
+	}
+	states := []AICodeWithKeySyncState{{
+		Domain: row.Domain, SlotID: "acw_primary", Status: upstreamStatusOK,
+		BackfillDone: false, BackfillLastError: "legacy timeout",
+		BackfillNextSyncAt: 99, BackfillConsecutiveFails: 2,
+	}}
+
+	views := m.aicodeWithSlotViewsFromStates(row, states)
+	if len(views) != 1 || !views[0].BackfillDone {
+		t.Fatalf("published account history must complete legacy per-key view: %+v", views)
+	}
+	if views[0].BackfillLastError != "" || views[0].BackfillNextSyncAt != 0 || views[0].BackfillConsecutiveFails != 0 {
+		t.Fatalf("published account history retained stale per-key retry state: %+v", views[0])
+	}
+
+	row.UsageBackfillDone = false
+	views = m.aicodeWithSlotViewsFromStates(row, states)
+	if len(views) != 1 || views[0].BackfillDone || views[0].BackfillLastError != "legacy timeout" || views[0].BackfillNextSyncAt != 99 || views[0].BackfillConsecutiveFails != 2 {
+		t.Fatalf("genuinely incomplete credential set was hidden by compatibility projection: %+v", views)
+	}
+}
+
 func TestChannelUpstreamAICodeWithRenameDoesNotCallUpstreamOrResetProgress(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	var requests atomic.Int64

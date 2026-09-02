@@ -1530,6 +1530,23 @@ func (m *Monitor) publishAICodeWithRound(ctx context.Context, row *ChannelUpstre
 		if err := tx.Where("domain = ? AND kind = ?", row.Domain, round.Kind).Delete(&AICodeWithUsageRound{}).Error; err != nil {
 			return err
 		}
+		if round.Kind == "backfill" && round.WindowTo >= cstDayStart(now) {
+			// Keep the per-key diagnostic state in the same transaction as the
+			// final account-level history publication. The account row remains the
+			// scheduling authority, while these fields make the sync-status page
+			// accurately report every key as complete.
+			if err := tx.Model(&AICodeWithKeySyncState{}).
+				Where("domain = ? AND credential_set_version = ?", row.Domain, round.CredentialSetVersion).
+				Updates(map[string]any{
+					"backfill_done":              true,
+					"backfill_last_error":        "",
+					"backfill_next_sync_at":      int64(0),
+					"backfill_consecutive_fails": 0,
+					"updated_at":                 now,
+				}).Error; err != nil {
+				return err
+			}
+		}
 		return nil
 	})
 }

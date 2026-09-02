@@ -121,35 +121,6 @@ func (m *Monitor) queryStabilityProblems(ctx context.Context, scope stabilitySco
 		out = append(out, StabilityProblem{Source: r.Source, SignatureHash: r.SignatureHash, Code: r.Code, Message: message, Truncated: r.Truncated || redactionTruncated, Count: r.Count, FirstTs: r.FirstTs, LastTs: r.LastTs, Groups: splitDistinct(r.Groups), ChannelIDs: splitDistinctInts(r.Channels), Models: splitDistinct(r.Models), AdviceStatus: "knowledge_base_pending_review"})
 	}
 
-	// 前置拒绝是用户交付问题，但没有 channel_id；只有未选择厂商/渠道时才加入。
-	if scope.ChannelID == 0 && scope.Vendor == "" {
-		rWhere := " WHERE hour_ts >= ? AND hour_ts < ?"
-		rArgs := []any{scope.FromTs, scope.ToTs}
-		if scope.Group != "" {
-			rWhere += " AND grp = ?"
-			rArgs = append(rArgs, scope.Group)
-		}
-		if scope.Model != "" {
-			rWhere += " AND model = ?"
-			rArgs = append(rArgs, scope.Model)
-		}
-		var rr []struct {
-			Reason          string
-			Count           int64
-			FirstTs, LastTs int64
-			Groups, Models  string
-		}
-		err := db.Raw(`SELECT reason,COALESCE(SUM(count),0) count,MIN(hour_ts) first_ts,MAX(hour_ts)+3599 last_ts,
-			GROUP_CONCAT(DISTINCT grp) groups,GROUP_CONCAT(DISTINCT model) models
-			FROM stability_reject_hours`+rWhere+` GROUP BY reason`, rArgs...).Scan(&rr).Error
-		if err != nil {
-			return nil, err
-		}
-		for _, r := range rr {
-			out = append(out, StabilityProblem{Source: "pre_route", SignatureHash: stabilityProblemHash("pre_route", r.Reason), Code: r.Reason, Message: r.Reason, Count: r.Count, FirstTs: r.FirstTs, LastTs: r.LastTs, Groups: splitDistinct(r.Groups), Models: splitDistinct(r.Models), AdviceStatus: "knowledge_base_pending_review"})
-		}
-	}
-
 	sort.Slice(out, func(i, j int) bool {
 		if out[i].Count == out[j].Count {
 			return out[i].LastTs > out[j].LastTs
@@ -168,23 +139,6 @@ func (m *Monitor) queryStabilityProblems(ctx context.Context, scope stabilitySco
 		return nil, err
 	}
 	total := rawTotal.Count
-	if scope.ChannelID == 0 && scope.Vendor == "" {
-		rWhere := " WHERE hour_ts >= ? AND hour_ts < ?"
-		rArgs := []any{scope.FromTs, scope.ToTs}
-		if scope.Group != "" {
-			rWhere += " AND grp = ?"
-			rArgs = append(rArgs, scope.Group)
-		}
-		if scope.Model != "" {
-			rWhere += " AND model = ?"
-			rArgs = append(rArgs, scope.Model)
-		}
-		var rejectTotal struct{ Count int64 }
-		if err := db.Raw(`SELECT COALESCE(SUM(count),0) count FROM stability_reject_hours`+rWhere, rArgs...).Scan(&rejectTotal).Error; err != nil {
-			return nil, err
-		}
-		total += rejectTotal.Count
-	}
 	if total > 0 {
 		for i := range out {
 			out[i].SharePct = float64(out[i].Count) / float64(total) * 100

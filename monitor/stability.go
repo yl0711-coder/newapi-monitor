@@ -109,8 +109,10 @@ func (c *stabilityCounts) add(o stabilityCounts) {
 func floatPtr(v float64) *float64 { return &v }
 
 func (c stabilityCounts) metrics() StabilityMetrics {
-	requests := c.Success + c.Anomaly + c.Failed + c.Rejected
-	problems := c.Anomaly + c.Failed + c.Rejected
+	// Rejected 是选中真实渠道前结束的明确记录，只用于分组下的独立计数。
+	// 它既没有实际渠道，也不属于当前服务交付稳定率的分子或分母。
+	requests := c.Success + c.Anomaly + c.Failed
+	problems := c.Anomaly + c.Failed
 	m := StabilityMetrics{
 		Requests: requests, Success: c.Success, Anomaly: c.Anomaly, Failed: c.Failed,
 		Rejected: c.Rejected, Problems: problems, Tokens: c.Tokens,
@@ -407,8 +409,6 @@ func (m *Monitor) queryStabilityRejects(ctx context.Context, scope stabilityScop
 	if scope.ChannelID > 0 || scope.Vendor != "" {
 		return nil, nil
 	}
-	// rejection 小时表是历史无版本表。只在同小时有可服务的新/旧事实
-	// 或完整性台账时合并，不得把真正未覆盖的日期画成 0% 稳定性。
 	where := " WHERE " + stabilityEffectiveRejectCoverageSQL("sr") + " AND sr.hour_ts >= ? AND sr.hour_ts < ?"
 	args := []any{scope.FromTs, scope.ToTs}
 	if scope.Group != "" {
@@ -421,8 +421,7 @@ func (m *Monitor) queryStabilityRejects(ctx context.Context, scope stabilityScop
 	}
 	var rows []stabilityRejectRow
 	err := m.storeDB.WithContext(ctx).Raw(`SELECT sr.grp, sr.model, COALESCE(SUM(sr.count),0) AS count
-		FROM stability_reject_hours sr`+
-		where+` GROUP BY sr.grp, sr.model`, args...).Scan(&rows).Error
+		FROM stability_reject_hours sr`+where+` GROUP BY sr.grp, sr.model`, args...).Scan(&rows).Error
 	return rows, err
 }
 
@@ -474,11 +473,11 @@ func (m *Monitor) queryStabilityRejectDaily(ctx context.Context, scope stability
 	err := m.storeDB.WithContext(ctx).Raw(`SELECT strftime('%Y-%m-%d', sr.hour_ts, 'unixepoch', '+8 hours') AS day,
 		sr.grp, COALESCE(SUM(sr.count),0) AS count FROM stability_reject_hours sr`+
 		where+` GROUP BY day, sr.grp`, args...).Scan(&rows).Error
-	for _, r := range rows {
-		if out[r.Grp] == nil {
-			out[r.Grp] = map[string]int64{}
+	for _, row := range rows {
+		if out[row.Grp] == nil {
+			out[row.Grp] = map[string]int64{}
 		}
-		out[r.Grp][r.Day] += r.Count
+		out[row.Grp][row.Day] += row.Count
 	}
 	return out, err
 }
@@ -570,13 +569,12 @@ func (m *Monitor) queryStabilityRejectTimeline(ctx context.Context, scope stabil
 	}
 	err := m.storeDB.WithContext(ctx).Raw(`SELECT (((sr.hour_ts + 28800) / ?) * ? - 28800) AS bucket_ts,
 		sr.grp, COALESCE(SUM(sr.count),0) AS count FROM stability_reject_hours sr`+
-		where+`
-		GROUP BY bucket_ts, sr.grp`, args...).Scan(&rows).Error
-	for _, r := range rows {
-		if out[r.Grp] == nil {
-			out[r.Grp] = map[int64]int64{}
+		where+` GROUP BY bucket_ts, sr.grp`, args...).Scan(&rows).Error
+	for _, row := range rows {
+		if out[row.Grp] == nil {
+			out[row.Grp] = map[int64]int64{}
 		}
-		out[r.Grp][r.BucketTs] += r.Count
+		out[row.Grp][row.BucketTs] += row.Count
 	}
 	return out, err
 }
@@ -750,18 +748,8 @@ func (m *Monitor) buildStabilityReportWithDetails(ctx context.Context, scope sta
 		total.add(c)
 		g := ensureGroup(row.Grp)
 		g.Counts.add(c)
-		gm := g.Models[row.Model]
-		if gm == nil {
-			gm = &stabilityCounts{}
-			g.Models[row.Model] = gm
-		}
-		gm.add(c)
-		mt := modelTotals[row.Model]
-		if mt == nil {
-			mt = &stabilityCounts{}
-			modelTotals[row.Model] = mt
-		}
-		mt.add(c)
+		// 未归属请求只在分组下保留一个明确计数。不要把其请求模型
+		// 注入模型表现或模型排行，否则会出现 0 请求、0 问题的幽灵模型。
 	}
 
 	prevGroup := map[string]stabilityCounts{}
@@ -802,13 +790,6 @@ func (m *Monitor) buildStabilityReportWithDetails(ctx context.Context, scope sta
 		v := prevGroup[row.Grp]
 		v.add(c)
 		prevGroup[row.Grp] = v
-		v = prevModel[row.Model]
-		v.add(c)
-		prevModel[row.Model] = v
-		gmk := row.Grp + "\x00" + row.Model
-		v = prevGroupModel[gmk]
-		v.add(c)
-		prevGroupModel[gmk] = v
 	}
 
 	dailyRows, dailyTruncated, err := m.queryStabilityDaily(ctx, scope, includeNested, maxDailyRows)
