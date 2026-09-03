@@ -855,7 +855,7 @@ func (m *Monitor) openStore(path string) error {
 		&StabilityProblemIngestState{}, &StabilityProblemStage{}, &StabilityProblemClassificationMigration{}, &StabilityProblemLiveCursor{},
 		&StabilityHourIngestState{}, &StabilityBackfillJob{},
 		&ChannelFinanceSetting{}, &ChannelSaleGroupRate{}, &WebsiteGroupCatalog{}, &ChannelDomainCost{}, &ChannelDomainGroupCost{}, &ChannelFinanceChannelCost{}, &ChannelFinanceVersion{},
-		&ChannelUpstreamAccount{}, &ChannelUpstreamUsageHour{}, &ChannelUpstreamErrorLog{}, &UpstreamErrorLogSyncState{}, &NewAPIUsageBackfillCheckpoint{}, &NewAPIUsageBackfillSegment{}, &AICodeWithKeySyncState{}, &AICodeWithUsageStage{}, &AICodeWithUsageRound{}, &UpstreamHostCircuit{},
+		&ChannelUpstreamAccount{}, &ChannelUpstreamUsageHour{}, &ChannelUpstreamUsageArchive{}, &ChannelUpstreamErrorLog{}, &ChannelUpstreamErrorLogArchive{}, &UpstreamErrorLogSyncState{}, &NewAPIUsageBackfillCheckpoint{}, &NewAPIUsageBackfillSegment{}, &AICodeWithKeySyncState{}, &AICodeWithUsageStage{}, &AICodeWithUsageRound{}, &UpstreamHostCircuit{},
 		&ChannelUpstreamPricingHourEvidence{}, &ChannelUpstreamPricingHourState{}, &ChannelUpstreamPricingObservedState{}, &ChannelUpstreamPricingChangeEvent{}, &ChannelUpstreamPricingSyncState{}, &ChannelUpstreamPricingPageCheckpoint{}, &AICodeWithPricingCheckpoint{},
 		&ChannelUpstreamCostHourEvidence{}, &ChannelUpstreamCostHourState{}, &ChannelCostPageCheckpoint{}, &ChannelCostSourceBinding{}, &ChannelCostDirtyHour{}, &ChannelCostKeyRegistry{},
 		&ChannelPricingChangeProposal{}, &ChannelPricingProposalEvent{}, &ChannelFinanceActivation{}, &ChannelFinanceActivationSlot{}, &ChannelFinanceActivationEvent{},
@@ -901,6 +901,9 @@ func (m *Monitor) openStore(path string) error {
 	if err := migrateUsageMemberControls(db); err != nil {
 		return fmt.Errorf("用量成员控制层迁移失败: %w", err)
 	}
+	if err := migrateUpstreamIdentityArchives(db); err != nil {
+		return fmt.Errorf("上游历史归档不可变约束迁移失败: %w", err)
+	}
 	if err := migrateLegacyChannelFinanceVersions(db); err != nil {
 		return fmt.Errorf("倍率版本迁移失败: %w", err)
 	}
@@ -942,6 +945,9 @@ func (m *Monitor) openStore(path string) error {
 	}
 	if err := m.migrateAICodeWithCredentialSlots(); err != nil {
 		return fmt.Errorf("AICodeWith Key 槽位迁移失败: %w", err)
+	}
+	if err := m.reconcileAICodeWithPublishedBackfillStates(); err != nil {
+		return fmt.Errorf("AICodeWith Key 历史完成状态修复失败: %w", err)
 	}
 	if err := m.migrateAICodeWithContractLedgerUnit(); err != nil {
 		return fmt.Errorf("AICodeWith 账面单位迁移失败: %w", err)

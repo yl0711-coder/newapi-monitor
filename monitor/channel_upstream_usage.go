@@ -976,6 +976,73 @@ func (m *Monitor) syncNewAPIUsage(ctx context.Context, row ChannelUpstreamAccoun
 	return fetchNewAPIUsageWindowWithPacer(ctx, m.channelUpstreamHTTPClient(), row, cred, from, to, pacer)
 }
 
+// syncNewAPITailIncremental keeps the live NewAPI watermark moving even when a
+// busy account cannot fit its entire catch-up range inside one request budget.
+// Each hour is still fully scanned, verified and atomically replaced before the
+// watermark advances; an incomplete hour is never published. The forward range
+// is processed before the overlap range so repeatedly refreshing recent closed
+// hours cannot starve a stale account forever.
+func (m *Monitor) syncNewAPITailIncremental(ctx context.Context, row ChannelUpstreamAccount, cred newAPICredential, from, to, now int64, pacer *upstreamUsageRequestPacer) (upstreamUsageResult, bool, error) {
+	result := upstreamUsageResult{DataUntil: row.UsageDataUntil, Adapter: upstreamUsageAdapterNewAPILog}
+	if to <= from {
+		return result, false, fmt.Errorf("上游日志同步窗口无效")
+	}
+
+	forwardFrom := from
+	if row.UsageDataUntil > from && row.UsageDataUntil < to {
+		// Re-read the whole hour containing the published watermark. Replacing a
+		// partial hour from the exact watermark would discard its earlier rows.
+		forwardFrom = row.UsageDataUntil - row.UsageDataUntil%3600
+	}
+	completedForward := false
+	for cursor := forwardFrom; cursor < to; {
+		windowTo := min(to, cursor-cursor%3600+3600)
+		window, err := m.syncNewAPIUsage(ctx, row, cred, cursor, windowTo, pacer)
+		if err != nil {
+			var exhausted *upstreamUsageRunBudgetExhausted
+			if errors.As(err, &exhausted) && completedForward {
+				return result, true, nil
+			}
+			return result, false, err
+		}
+		if err := m.persistUpstreamUsageWindow(ctx, row.Domain, cursor, windowTo, window.Hours, now); err != nil {
+			return result, false, err
+		}
+		completedForward = true
+		if windowTo > result.DataUntil {
+			result.DataUntil = windowTo
+		}
+		cursor = windowTo
+	}
+
+	// Best-effort overlap refresh captures delayed or corrected upstream rows.
+	// Freshness is already satisfied above, so exhausting the remaining budget
+	// here must not turn a current account into an error or move its watermark.
+	for cursor := from; cursor < forwardFrom; {
+		windowTo := min(forwardFrom, cursor-cursor%3600+3600)
+		window, err := m.syncNewAPIUsage(ctx, row, cred, cursor, windowTo, pacer)
+		if err != nil {
+			var exhausted *upstreamUsageRunBudgetExhausted
+			if errors.As(err, &exhausted) {
+				return result, false, nil
+			}
+			return result, false, err
+		}
+		if err := m.persistUpstreamUsageWindow(ctx, row.Domain, cursor, windowTo, window.Hours, now); err != nil {
+			return result, false, err
+		}
+		cursor = windowTo
+	}
+	return result, false, nil
+}
+
+func newAPITailNeedsIncrementalSync(row ChannelUpstreamAccount, now int64) bool {
+	if row.UsageLastError == legacyNewAPIBackfillBudgetError() {
+		return true
+	}
+	return row.UsageDataUntil > 0 && now-row.UsageDataUntil > int64(upstreamUsageTailOverlap/time.Second)
+}
+
 type sub2APIUsageMetric struct {
 	Requests int64
 	Tokens   int64
@@ -2116,14 +2183,21 @@ func (m *Monitor) syncStoredUpstreamUsageWithPriority(ctx context.Context, domai
 	// first; only a successful, atomically persisted tail permits history.
 	result := upstreamUsageResult{DataUntil: row.UsageDataUntil}
 	tailRan := plan.tailTo > plan.tailFrom
+	tailPersisted := false
+	tailYielded := false
 	historyRan := false
 	if tailRan {
-		result, err = syncUsage(ctx, plan.tailFrom, plan.tailTo, pacer)
+		if newAPICred, ok := credential.(newAPICredential); ok && row.Provider == upstreamProviderNewAPI && newAPITailNeedsIncrementalSync(row, now) {
+			result, tailYielded, err = m.syncNewAPITailIncremental(ctx, row, newAPICred, plan.tailFrom, plan.tailTo, now, pacer)
+			tailPersisted = err == nil
+		} else {
+			result, err = syncUsage(ctx, plan.tailFrom, plan.tailTo, pacer)
+		}
 		if errors.Is(err, context.Canceled) {
 			return row, err
 		}
 		operationRetryAt = upstreamRetryAt(err)
-		if err == nil {
+		if err == nil && !tailPersisted {
 			err = m.persistUpstreamUsageWindow(ctx, row.Domain, plan.tailFrom, plan.tailTo, result.Hours, now)
 		}
 		if errors.Is(err, context.Canceled) {
@@ -2132,13 +2206,18 @@ func (m *Monitor) syncStoredUpstreamUsageWithPriority(ctx context.Context, domai
 	}
 	if tailRan {
 		applyUpstreamUsageResult(&row, result, err, now, m.cfg, secrets...)
-		if err != nil {
+		if tailYielded {
+			// The source is healthy and at least one complete hour was committed.
+			// Resume quickly instead of waiting for the normal live-sync interval.
+			row.UsageNextSyncAt = now + 15
+		} else if err != nil {
 			// Couple only the retry deadline, not the health counters: a due
 			// history lane must not reselect this account before tail recovery.
 			coupleUpstreamUsageHistoryRetryToTail(&row)
 		}
 	}
-	if err == nil && plan.backfillTo > plan.backfillFrom {
+	if err == nil && !tailYielded && plan.backfillTo > plan.backfillFrom &&
+		(pacer.maxRequests <= 0 || pacer.calls < pacer.maxRequests) {
 		historyRan = true
 		if row.Provider == upstreamProviderNewAPI {
 			cursor := plan.backfillFrom

@@ -661,7 +661,7 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
       <h2>渠道使用排行</h2>
       <p>按渠道配置 URL 的可注册主域名归并，再按厂商、实际渠道和服务分组展开。</p>
     </div>
-    <div class="cm-toolbar-actions"><button type="button" class="cm-site-finance-open" id="cmSiteFinanceOpen">网站计价基准</button></div>
+    <div class="cm-toolbar-actions"><button type="button" class="cm-site-finance-open" id="cmRefresh">刷新状态</button><button type="button" class="cm-site-finance-open" id="cmSiteFinanceOpen">网站计价基准</button></div>
     <div class="cm-range">
       <button type="button" class="active" data-cm-hours="24">近 24 小时</button>
       <button type="button" data-cm-preset="today">今天</button>
@@ -1062,7 +1062,7 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
 </div><!-- /monitor-shell -->
 
 <script src="/stability.js?v=3"></script>
-<script src="/channel-management.js?v=6"></script>
+<script src="/channel-management.js?v=7"></script>
 <script src="/logchain.js?v=1"></script>
 <script src="/capacity.js?v=1"></script>
 <script>
@@ -1769,6 +1769,7 @@ function switchTab(name,preserveHash){
   if(name==='usage')usageInit();
   if(name==='stability'&&window.stabilityActivate)window.stabilityActivate();
   if(name==='channels'&&window.channelManagementActivate)window.channelManagementActivate();
+  else if(window.channelManagementDeactivate)window.channelManagementDeactivate();
   if(name==='logchain'&&window.logChainActivate)window.logChainActivate();
   if(name==='capacity'&&window.capacityActivate)window.capacityActivate();
   if(name!=='capacity'&&window.capacityDeactivate)window.capacityDeactivate();
