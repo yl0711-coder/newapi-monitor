@@ -217,7 +217,8 @@ func TestChannelManagementUpstreamSpendMetricKeepsAmountReadable(t *testing.T) {
 	js := string(channelManagementJS)
 	css := string(stabilityCSS)
 	for _, marker := range []string{
-		`<small>区间上游消费</small>`,
+		`区间上游消费`,
+		`自然日上游消费`,
 		`<small>上游当前余额</small>`,
 		`domain.upstream?.balance_usd`,
 		`cm-domain-metric-note`,
@@ -244,7 +245,8 @@ func TestChannelManagementShowsRawAndRechargeAdjustedUpstreamSpend(t *testing.T)
 	js := string(channelManagementJS)
 	css := string(stabilityCSS)
 	for _, marker := range []string{
-		`<small>区间上游消费</small>`,
+		`区间上游消费`,
+		`自然日上游消费`,
 		`<small>上游修正消费</small>`,
 		`上游修正消费 = 账面消费 × 充值支付 ÷ 充值到账`,
 		`upstreamUsage.adjusted_cost_available`,
