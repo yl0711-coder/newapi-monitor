@@ -108,7 +108,7 @@ func TestChannelManagementShowsDynamicUpstreamRunwayBesideBalance(t *testing.T) 
 			t.Fatalf("渠道当前余额缺少动态可用时长展示 %q", marker)
 		}
 	}
-	if !strings.Contains(alertPageHTML, `动态阈值 = 近 N 个完整自然日预估日均上游成本 × 余额保障天数`) ||
+	if !strings.Contains(alertPageHTML, `动态阈值 = 近 N 个完整自然日上游账面日均消费 × 余额保障天数`) ||
 		!strings.Contains(alertPageHTML, `1 天 = 至少保障未来 24 小时`) {
 		t.Fatal("报警设置页没有明确动态余额阈值口径")
 	}
