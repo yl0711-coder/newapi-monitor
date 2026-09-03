@@ -361,6 +361,16 @@ func (m *Monitor) loadChannelUpstreamUsage(ctx context.Context, scope stabilityS
 		DataUntil        int64
 	}
 	var rows []row
+	// Rolling-hour reports end at the latest completed local hour. Natural-day
+	// providers, however, continuously replace today's partial day bucket and
+	// its data-until timestamp can be a few minutes newer than that boundary.
+	// Admit only that live, current-day bucket; historical partial days and
+	// hourly buckets must still be fully contained in the requested interval.
+	liveDayStart := int64(-1)
+	if scope.ToTs <= now && now-scope.ToTs < 3600 {
+		current := time.Unix(now, 0).In(cstLocation)
+		liveDayStart = time.Date(current.Year(), current.Month(), current.Day(), 0, 0, 0, 0, cstLocation).Unix()
+	}
 	if err := m.storeDB.WithContext(ctx).Raw(`SELECT domain,provider,
 		COALESCE(SUM(requests),0) requests, COALESCE(SUM(tokens),0) tokens,
 		COALESCE(SUM(cost_usd),0) cost_usd,
@@ -368,8 +378,9 @@ func (m *Monitor) loadChannelUpstreamUsage(ctx context.Context, scope stabilityS
 		COALESCE(MAX(hour_ts+(CASE WHEN bucket_seconds>0 THEN bucket_seconds ELSE 3600 END)),0) data_until
 		FROM channel_upstream_usage_hours
 		WHERE hour_ts >= ?
-		  AND hour_ts+(CASE WHEN bucket_seconds>0 THEN bucket_seconds ELSE 3600 END) <= ?
-		GROUP BY domain,provider`, scope.FromTs, scope.ToTs).Scan(&rows).Error; err != nil {
+		  AND (hour_ts+(CASE WHEN bucket_seconds>0 THEN bucket_seconds ELSE 3600 END) <= ?
+		       OR (hour_ts = ? AND hour_ts < ? AND bucket_seconds > 3600))
+		GROUP BY domain,provider`, scope.FromTs, scope.ToTs, liveDayStart, scope.ToTs).Scan(&rows).Error; err != nil {
 		return nil, err
 	}
 	expected := expectedUpstreamUsageHours(scope, now)

@@ -602,7 +602,7 @@ function domainCard(domain,index,total,filtered){
   // 上游日志只按账户（归并主域名）汇总；没有可靠的远端渠道 ID 映射时，
   // 绝不能伪装成某一条本地渠道的上游账单。
   const upstreamGranularity=upstreamUsage.granularity==='day'?'中国自然日账单':'小时日志';
-  const upstreamCoverage=upstreamUsage.complete?`当前${upstreamGranularity}已覆盖`:`查询范围含未覆盖时段，当前值为已同步部分`;
+  const upstreamCoverage=upstreamUsage.complete?`当前${upstreamGranularity}已覆盖`:`${upstreamUsage.granularity==='day'?'当前自然日':'查询范围'}为已同步部分`;
   const upstreamCoverageState=upstreamUsage.complete?'完整':'补全中';
   const upstreamBalance=domain.upstream?.balance_usd==null?'未知':usd(domain.upstream.balance_usd);
   const upstreamSpend=upstreamUsage.available?usd(upstreamUsage.cost_usd):'等待同步';
@@ -611,7 +611,8 @@ function domainCard(domain,index,total,filtered){
 	const observedRatio=Number(upstreamUsage.recharge_ratio),ratio=Number.isFinite(observedRatio)&&observedRatio>0?observedRatio:configuredRatio;
 	const ratioLabel=financeConfigured&&Number.isFinite(ratio)&&ratio>0?`到账/支付 ${ratio.toLocaleString(undefined,{maximumFractionDigits:4})}×`:'充值比例待配置';
 	const adjustedSpend=upstreamUsage.adjusted_cost_available?usd(upstreamUsage.adjusted_cost_usd):(financeConfigured?'等待消费同步':'待配置');
-	const upstreamMetrics=domain.upstream?.configured||upstreamUsage.available?`<span class="cm-domain-upstream-spend" title="消费按上游账户汇总，且仅统计当前查询时间范围；不是逐渠道上游账单。${upstreamCoverage}"><small>区间上游消费</small><b title="${upstreamSpend}">${upstreamSpend}</b><em class="cm-domain-metric-note ${upstreamUsage.available?(upstreamUsage.complete?'ready':'pending'):'neutral'}">${upstreamUsage.available?`${upstreamGranularity} · ${upstreamCoverageState}`:'同步未开启或尚无数据'}</em></span><span class="cm-domain-upstream-adjusted" title="上游修正消费 = 账面消费 × 充值支付 ÷ 充值到账"><small>上游修正消费</small><b title="${adjustedSpend}">${adjustedSpend}</b><em class="cm-domain-metric-note ${upstreamUsage.adjusted_cost_available?'ready':'pending'}">${esc(ratioLabel)}</em></span><span class="cm-domain-upstream-balance"><small>上游当前余额</small><b title="${upstreamBalance}">${upstreamBalance}</b><em class="cm-domain-metric-note neutral">最新余额快照</em></span>`:'';
+  const upstreamSpendLabel=upstreamUsage.granularity==='day'?'自然日上游消费':'区间上游消费';
+  const upstreamMetrics=domain.upstream?.configured||upstreamUsage.available?`<span class="cm-domain-upstream-spend" title="消费按上游账户（主域名）汇总，不是逐渠道上游账单。${upstreamCoverage}"><small>${upstreamSpendLabel}</small><b title="${upstreamSpend}">${upstreamSpend}</b><em class="cm-domain-metric-note ${upstreamUsage.available?(upstreamUsage.complete?'ready':'pending'):'neutral'}">${upstreamUsage.available?`${upstreamGranularity} · ${upstreamCoverageState}`:'同步未开启或尚无数据'}</em></span><span class="cm-domain-upstream-adjusted" title="上游修正消费 = 账面消费 × 充值支付 ÷ 充值到账"><small>上游修正消费</small><b title="${adjustedSpend}">${adjustedSpend}</b><em class="cm-domain-metric-note ${upstreamUsage.adjusted_cost_available?'ready':'pending'}">${esc(ratioLabel)}</em></span><span class="cm-domain-upstream-balance"><small>上游当前余额</small><b title="${upstreamBalance}">${upstreamBalance}</b><em class="cm-domain-metric-note neutral">最新余额快照</em></span>`:'';
   const financeButton=cm.report?.finance?.can_edit&&domain.configured?`<button type="button" class="cm-finance-open" data-cm-finance="${esc(domain.key)}">倍率配置</button>`:'';
   const upstreamButton=cm.report?.finance?.can_edit&&domain.configured?`<button type="button" class="cm-upstream-open" data-cm-upstream="${esc(domain.key)}">账户配置</button>`:'';
   return `<article class="cm-domain-card${open?' open':''}"><div class="cm-domain-head" role="button" tabindex="0" data-cm-domain-toggle="${esc(domain.key)}">

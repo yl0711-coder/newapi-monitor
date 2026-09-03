@@ -548,6 +548,42 @@ func TestChannelManagementAICodeWithUsageKeepsNaturalDayGranularity(t *testing.T
 	}
 }
 
+func TestChannelManagementAICodeWithLivePartialDayIsVisible(t *testing.T) {
+	m := newStabilityTestMonitor(t)
+	dayStart := time.Date(2026, 9, 3, 0, 0, 0, 0, cstLocation).Unix()
+	now := dayStart + 11*3600 + 46*60
+	to := dayStart + 11*3600
+	from := to - 24*3600
+	if err := m.storeDB.Create(&ChannelUpstreamUsageHour{
+		Domain: "aicodewith.com", HourTs: dayStart, BucketSeconds: now - dayStart,
+		Requests: 13475, Tokens: 100, CostUSD: 275.2466, Provider: upstreamProviderAICodeWith,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	accounts := map[string]ChannelUpstreamAccountView{"aicodewith.com": {
+		Configured: true, Provider: upstreamProviderAICodeWith, UsageSyncEnabled: true,
+	}}
+	usage, err := m.loadChannelUpstreamUsage(context.Background(), stabilityScope{FromTs: from, ToTs: to}, now, accounts, channelFinanceSnapshot{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := usage["aicodewith.com"]
+	if !got.Available || got.Complete || got.Granularity != "day" || got.Requests != 13475 || math.Abs(got.CostUSD-275.2466) > 1e-9 {
+		t.Fatalf("live natural-day partial bucket=%+v", got)
+	}
+
+	// The exception is strictly for the live current day. The same bucket must
+	// not leak into a historical report whose upper boundary cuts through it.
+	historicalTo := to - 2*3600
+	usage, err = m.loadChannelUpstreamUsage(context.Background(), stabilityScope{FromTs: from, ToTs: historicalTo}, now, accounts, channelFinanceSnapshot{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(usage) != 0 {
+		t.Fatalf("historical partial day must stay excluded: %+v", usage)
+	}
+}
+
 func TestNormalizeChannelBaseDomain(t *testing.T) {
 	tests := map[string]string{
 		"https://temp.last-api.ai/v1":                   "last-api.ai",
