@@ -362,7 +362,7 @@ function vendorSection(domain,vendor){
 function upstreamRunway(upstream){
   const assessment=upstream?.assessment||{},days=Number(assessment.estimated_runway_days);
   const required=Number(assessment.required_balance_usd);
-  const basis=`近 ${Number(assessment.lookback_days||0)} 个完整自然日预估日均上游成本 ${usd(assessment.average_daily_cost_usd||0)} × 余额保障 ${Number(assessment.threshold_days||0).toFixed(1)} 天；小时完整率 ${Number(assessment.coverage_pct||0).toFixed(1)}%`;
+  const basis=`近 ${Number(assessment.lookback_days||0)} 个完整自然日上游账面日均消费 ${usd(assessment.average_daily_cost_usd||0)} × 余额保障 ${Number(assessment.threshold_days||0).toFixed(1)} 天；上游账单覆盖率 ${Number(assessment.coverage_pct||0).toFixed(1)}%`;
   const title=assessment.available&&assessment.status!=='idle'&&Number.isFinite(required)?`动态最低余额 ${usd(required)} = ${basis}`:`动态余额评估：${basis}`;
   if(!assessment.available)return {text:assessment.reason?`暂不可评估：${assessment.reason}`:'暂不可评估',cls:'pending',title};
   if(assessment.status==='idle')return {text:assessment.reason||'近期无显著消耗',cls:'neutral',title};
