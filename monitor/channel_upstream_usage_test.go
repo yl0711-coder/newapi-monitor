@@ -1702,6 +1702,59 @@ func TestFetchNewAPIUsageWindowAccepts5000AndSplits5001(t *testing.T) {
 	}
 }
 
+func TestNewAPITailPersistsCompleteHoursAndResumesAfterBudgetYield(t *testing.T) {
+	from := time.Date(2026, 8, 12, 0, 0, 0, 0, cstLocation).Unix()
+	to := from + 7*3600
+	rows := usageFixtureRows(7700, from, to-from) // 1,100 rows and 12 requests per hour.
+	server, _ := newUpstreamUsageFixtureServer(t, rows, nil)
+	m := newChannelUpstreamTestMonitor(t)
+	row := ChannelUpstreamAccount{
+		Domain: server.Listener.Addr().String(), Provider: upstreamProviderNewAPI,
+		BaseURL: server.URL, UserID: 31, BalanceUnit: 500000, UsageDataUntil: from,
+	}
+	credential := newAPICredential{AccessToken: "usage-token"}
+
+	firstPacer := newUpstreamUsageRequestPacer(upstreamUsageMaxRequestsPerRun, 0)
+	first, yielded, err := m.syncNewAPITailIncremental(context.Background(), row, credential, from, to, to, firstPacer)
+	if err != nil || !yielded {
+		t.Fatalf("first tail turn yielded=%v err=%v", yielded, err)
+	}
+	if first.DataUntil != from+5*3600 || firstPacer.calls != upstreamUsageMaxRequestsPerRun {
+		t.Fatalf("first tail watermark=%d calls=%d", first.DataUntil, firstPacer.calls)
+	}
+	var published []ChannelUpstreamUsageHour
+	if err := m.storeDB.Order("hour_ts ASC").Find(&published, "domain = ?", row.Domain).Error; err != nil {
+		t.Fatal(err)
+	}
+	if len(published) != 5 {
+		t.Fatalf("published complete hours=%d, want 5", len(published))
+	}
+	for _, hour := range published {
+		if hour.Requests != 1100 || hour.BucketSeconds != 3600 {
+			t.Fatalf("partial or corrupt hour published: %+v", hour)
+		}
+	}
+
+	// A scheduler retry starts with the unpublished forward range, then uses
+	// any remaining budget to refresh the configured three-hour overlap.
+	row.UsageDataUntil = first.DataUntil
+	secondPacer := newUpstreamUsageRequestPacer(upstreamUsageMaxRequestsPerRun, 0)
+	second, yielded, err := m.syncNewAPITailIncremental(context.Background(), row, credential, first.DataUntil-3*3600, to, to+15, secondPacer)
+	if err != nil || yielded || second.DataUntil != to {
+		t.Fatalf("second tail turn watermark=%d yielded=%v err=%v", second.DataUntil, yielded, err)
+	}
+	if err := m.storeDB.Order("hour_ts ASC").Find(&published, "domain = ?", row.Domain).Error; err != nil {
+		t.Fatal(err)
+	}
+	var requests int64
+	for _, hour := range published {
+		requests += hour.Requests
+	}
+	if len(published) != 7 || requests != int64(len(rows)) {
+		t.Fatalf("final published hours=%d requests=%d, want 7/%d", len(published), requests, len(rows))
+	}
+}
+
 func TestNewAPIHistoryBackfillPersistsPageCheckpointAcrossBudgetYield(t *testing.T) {
 	from := time.Date(2026, 8, 12, 8, 0, 0, 0, cstLocation).Unix()
 	rows := usageFixtureRows(6500, from, 3600)

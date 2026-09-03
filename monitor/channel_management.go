@@ -2,6 +2,7 @@ package monitor
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"math"
@@ -56,13 +57,21 @@ type ChannelUpstreamUsageMetrics struct {
 	CostUSD               float64 `json:"cost_usd"`
 	AdjustedCostAvailable bool    `json:"adjusted_cost_available"`
 	AdjustedCostUSD       float64 `json:"adjusted_cost_usd"`
+	AdjustedCostStatus    string  `json:"adjusted_cost_status,omitempty"`
 	RechargeRatio         float64 `json:"recharge_ratio"`
+	RechargeRatioVaries   bool    `json:"recharge_ratio_varies,omitempty"`
 	ExpectedHours         int64   `json:"expected_hours"`
 	CompletedHours        int64   `json:"completed_hours"`
 	Complete              bool    `json:"complete"`
 	DataUntil             int64   `json:"data_until"`
 	Granularity           string  `json:"granularity,omitempty"`
 }
+
+const (
+	upstreamAdjustedCostComplete        = "complete"
+	upstreamAdjustedCostMissingHistory  = "missing_history"
+	upstreamAdjustedCostBucketAmbiguous = "bucket_boundary_ambiguous"
+)
 
 type ChannelManagementChannel struct {
 	ID               int                      `json:"id"`
@@ -350,17 +359,84 @@ func adjustedUpstreamUsageCost(cost float64, domainCost ChannelDomainCost, confi
 	return adjusted, ratio, true
 }
 
-func (m *Monitor) loadChannelUpstreamUsage(ctx context.Context, scope stabilityScope, now int64, accounts map[string]ChannelUpstreamAccountView, finance channelFinanceSnapshot) (map[string]ChannelUpstreamUsageMetrics, error) {
-	type row struct {
-		Domain           string
-		Provider         string
-		Requests         int64
-		Tokens           int64
-		CostUSD          float64
-		CompletedSeconds int64
-		DataUntil        int64
+type channelRechargeVersion struct {
+	Version     int64
+	EffectiveAt int64
+	Paid        float64
+	Credit      float64
+	Valid       bool
+}
+
+func rechargeTermsForBucket(versions []channelRechargeVersion, start, end int64) (float64, float64, string) {
+	selected := -1
+	for i := range versions {
+		if versions[i].EffectiveAt > start {
+			break
+		}
+		selected = i
 	}
-	var rows []row
+	if selected < 0 || !versions[selected].Valid {
+		return 0, 0, upstreamAdjustedCostMissingHistory
+	}
+	paid, credit := versions[selected].Paid, versions[selected].Credit
+	correction := paid / credit
+	for i := selected + 1; i < len(versions) && versions[i].EffectiveAt < end; i++ {
+		if versions[i].EffectiveAt <= start {
+			continue
+		}
+		if !versions[i].Valid || math.Abs(versions[i].Paid/versions[i].Credit-correction) > 1e-12 {
+			// 上游账单表只保留小时/自然日聚合。充值比例在桶中途变化时，
+			// 无法把该桶的账面消费精确拆到变化前后，因此必须停止修正而不是猜测。
+			return 0, 0, upstreamAdjustedCostBucketAmbiguous
+		}
+	}
+	return paid, credit, upstreamAdjustedCostComplete
+}
+
+func (m *Monitor) loadChannelRechargeVersions(ctx context.Context, accounts map[string]ChannelUpstreamAccountView, finance channelFinanceSnapshot) (map[string][]channelRechargeVersion, error) {
+	domains := make([]string, 0, len(accounts))
+	for domain, account := range accounts {
+		if account.Configured && account.UsageSyncEnabled {
+			domains = append(domains, domain)
+		}
+	}
+	result := make(map[string][]channelRechargeVersion, len(domains))
+	if len(domains) == 0 {
+		return result, nil
+	}
+	var rows []ChannelFinanceVersion
+	if err := m.storeDB.WithContext(ctx).Where("domain IN ?", domains).Order("domain ASC, effective_at ASC, version ASC").Find(&rows).Error; err != nil {
+		return nil, err
+	}
+	for _, row := range rows {
+		var snapshot channelFinanceVersionSnapshot
+		err := json.Unmarshal([]byte(row.SnapshotJSON), &snapshot)
+		valid := err == nil && validChannelFinanceNumber(snapshot.UpstreamRechargePaid) && validChannelFinanceNumber(snapshot.UpstreamRechargeCredit)
+		result[row.Domain] = append(result[row.Domain], channelRechargeVersion{
+			Version: row.Version, EffectiveAt: row.EffectiveAt,
+			Paid: snapshot.UpstreamRechargePaid, Credit: snapshot.UpstreamRechargeCredit, Valid: valid,
+		})
+	}
+	// 兼容极早期仅有当前状态、尚未来得及生成版本的数据库。只有明确记录了
+	// EffectiveAt 的当前配置，才允许从该时刻起参与计算；绝不追溯套用到更早账单。
+	for _, domain := range domains {
+		if len(result[domain]) > 0 {
+			continue
+		}
+		cost, ok := finance.domainCosts[domain]
+		if !ok || cost.EffectiveAt <= 0 {
+			continue
+		}
+		result[domain] = []channelRechargeVersion{{
+			Version: 1, EffectiveAt: cost.EffectiveAt, Paid: cost.RechargePaid, Credit: cost.RechargeCredit,
+			Valid: validChannelFinanceNumber(cost.RechargePaid) && validChannelFinanceNumber(cost.RechargeCredit),
+		}}
+	}
+	return result, nil
+}
+
+func (m *Monitor) loadChannelUpstreamUsage(ctx context.Context, scope stabilityScope, now int64, accounts map[string]ChannelUpstreamAccountView, finance channelFinanceSnapshot) (map[string]ChannelUpstreamUsageMetrics, error) {
+	var rows []ChannelUpstreamUsageHour
 	// Rolling-hour reports end at the latest completed local hour. Natural-day
 	// providers, however, continuously replace today's partial day bucket and
 	// its data-until timestamp can be a few minutes newer than that boundary.
@@ -371,39 +447,90 @@ func (m *Monitor) loadChannelUpstreamUsage(ctx context.Context, scope stabilityS
 		current := time.Unix(now, 0).In(cstLocation)
 		liveDayStart = time.Date(current.Year(), current.Month(), current.Day(), 0, 0, 0, 0, cstLocation).Unix()
 	}
-	if err := m.storeDB.WithContext(ctx).Raw(`SELECT domain,provider,
-		COALESCE(SUM(requests),0) requests, COALESCE(SUM(tokens),0) tokens,
-		COALESCE(SUM(cost_usd),0) cost_usd,
-		COALESCE(SUM(CASE WHEN bucket_seconds>0 THEN bucket_seconds ELSE 3600 END),0) completed_seconds,
-		COALESCE(MAX(hour_ts+(CASE WHEN bucket_seconds>0 THEN bucket_seconds ELSE 3600 END)),0) data_until
+	if err := m.storeDB.WithContext(ctx).Raw(`SELECT domain,hour_ts,bucket_seconds,requests,tokens,quota,cost_usd,fetched_at,provider
 		FROM channel_upstream_usage_hours
 		WHERE hour_ts >= ?
 		  AND (hour_ts+(CASE WHEN bucket_seconds>0 THEN bucket_seconds ELSE 3600 END) <= ?
 		       OR (hour_ts = ? AND hour_ts < ? AND bucket_seconds > 3600))
-		GROUP BY domain,provider`, scope.FromTs, scope.ToTs, liveDayStart, scope.ToTs).Scan(&rows).Error; err != nil {
+		ORDER BY domain ASC,hour_ts ASC`, scope.FromTs, scope.ToTs, liveDayStart, scope.ToTs).Scan(&rows).Error; err != nil {
+		return nil, err
+	}
+	versions, err := m.loadChannelRechargeVersions(ctx, accounts, finance)
+	if err != nil {
 		return nil, err
 	}
 	expected := expectedUpstreamUsageHours(scope, now)
-	result := make(map[string]ChannelUpstreamUsageMetrics, len(rows))
+	type aggregate struct {
+		metrics        ChannelUpstreamUsageMetrics
+		completed      int64
+		adjusted       float64
+		adjustedOK     bool
+		adjustedStatus string
+		ratio          float64
+		ratioSet       bool
+		ratioVaries    bool
+	}
+	aggregates := make(map[string]*aggregate)
 	for _, row := range rows {
 		account, configured := accounts[row.Domain]
 		if !configured || !account.UsageSyncEnabled || row.Provider != account.Provider {
 			continue
 		}
-		granularity := account.UsageGranularity
-		if granularity == "" {
-			granularity = upstreamUsageGranularity(account.Provider, account.UsageAdapter)
+		a := aggregates[row.Domain]
+		if a == nil {
+			granularity := account.UsageGranularity
+			if granularity == "" {
+				granularity = upstreamUsageGranularity(account.Provider, account.UsageAdapter)
+			}
+			a = &aggregate{metrics: ChannelUpstreamUsageMetrics{Available: true, ExpectedHours: expected, Granularity: granularity}, adjustedOK: true, adjustedStatus: upstreamAdjustedCostComplete}
+			aggregates[row.Domain] = a
 		}
-		completedHours := row.CompletedSeconds / 3600
-		metrics := ChannelUpstreamUsageMetrics{
-			Available: true, Requests: row.Requests, Tokens: row.Tokens, CostUSD: row.CostUSD,
-			ExpectedHours: expected, CompletedHours: completedHours,
-			Complete:  expected == 0 || row.CompletedSeconds >= expected*3600,
-			DataUntil: row.DataUntil, Granularity: granularity,
+		seconds := row.BucketSeconds
+		if seconds <= 0 {
+			seconds = 3600
 		}
-		domainCost, costConfigured := finance.domainCosts[row.Domain]
-		metrics.AdjustedCostUSD, metrics.RechargeRatio, metrics.AdjustedCostAvailable = adjustedUpstreamUsageCost(row.CostUSD, domainCost, costConfigured)
-		result[row.Domain] = metrics
+		a.metrics.Requests += row.Requests
+		a.metrics.Tokens += row.Tokens
+		a.metrics.CostUSD += row.CostUSD
+		a.completed += seconds
+		if until := row.HourTs + seconds; until > a.metrics.DataUntil {
+			a.metrics.DataUntil = until
+		}
+		paid, credit, status := rechargeTermsForBucket(versions[row.Domain], row.HourTs, row.HourTs+seconds)
+		if status != upstreamAdjustedCostComplete {
+			a.adjustedOK = false
+			if a.adjustedStatus == upstreamAdjustedCostComplete || status == upstreamAdjustedCostBucketAmbiguous {
+				a.adjustedStatus = status
+			}
+			continue
+		}
+		adjusted, ratio, ok := adjustedUpstreamUsageCost(row.CostUSD, ChannelDomainCost{RechargePaid: paid, RechargeCredit: credit}, true)
+		if !ok {
+			a.adjustedOK = false
+			a.adjustedStatus = upstreamAdjustedCostMissingHistory
+			continue
+		}
+		a.adjusted += adjusted
+		if !a.ratioSet {
+			a.ratio, a.ratioSet = ratio, true
+		} else if math.Abs(a.ratio-ratio) > 1e-12 {
+			a.ratioVaries = true
+		}
+	}
+	result := make(map[string]ChannelUpstreamUsageMetrics, len(aggregates))
+	for domain, a := range aggregates {
+		a.metrics.CompletedHours = a.completed / 3600
+		a.metrics.Complete = expected == 0 || a.completed >= expected*3600
+		a.metrics.AdjustedCostAvailable = a.adjustedOK && a.ratioSet
+		a.metrics.AdjustedCostStatus = a.adjustedStatus
+		if a.metrics.AdjustedCostAvailable {
+			a.metrics.AdjustedCostUSD = a.adjusted
+			a.metrics.RechargeRatioVaries = a.ratioVaries
+			if !a.ratioVaries {
+				a.metrics.RechargeRatio = a.ratio
+			}
+		}
+		result[domain] = a.metrics
 	}
 	return result, nil
 }

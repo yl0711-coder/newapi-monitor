@@ -821,6 +821,13 @@ func TestChannelUpstreamNewAPIHandlersProtectSecretsAndPreserveLastBalance(t *te
 		row.UsageConsecutiveFails != 0 || row.UsageBackfillConsecutiveFails != 0 {
 		t.Fatalf("re-enabled usage inherited stale auth isolation: %+v", row)
 	}
+	legacyUsage := ChannelUpstreamUsageHour{
+		Domain: domain, HourTs: 3600, BucketSeconds: 3600, Requests: 3,
+		CostUSD: 1.25, Provider: upstreamProviderNewAPI,
+	}
+	if err := m.storeDB.Create(&legacyUsage).Error; err != nil {
+		t.Fatal(err)
+	}
 
 	// 改成另一个账户后，即使首次同步失败，也绝不能继续展示前一个账户的余额。
 	fail.Store(true)
@@ -844,6 +851,45 @@ func TestChannelUpstreamNewAPIHandlersProtectSecretsAndPreserveLastBalance(t *te
 	}
 	if err := m.storeDB.Model(&ChannelUpstreamErrorLog{}).Where("domain = ?", domain).Count(&evidenceCount).Error; err != nil || evidenceCount != 0 {
 		t.Fatalf("new account inherited old error-log evidence: count=%d err=%v", evidenceCount, err)
+	}
+	var usageCount, usageArchiveCount, errorArchiveCount int64
+	if err := m.storeDB.Model(&ChannelUpstreamUsageHour{}).Where("domain = ?", domain).Count(&usageCount).Error; err != nil || usageCount != 0 {
+		t.Fatalf("new account inherited old usage rows: count=%d err=%v", usageCount, err)
+	}
+	if err := m.storeDB.Model(&ChannelUpstreamUsageArchive{}).Where("domain = ?", domain).Count(&usageArchiveCount).Error; err != nil || usageArchiveCount != 1 {
+		t.Fatalf("old account usage was not archived exactly once: count=%d err=%v", usageArchiveCount, err)
+	}
+	if err := m.storeDB.Model(&ChannelUpstreamErrorLogArchive{}).Where("domain = ?", domain).Count(&errorArchiveCount).Error; err != nil || errorArchiveCount != 1 {
+		t.Fatalf("old account error evidence was not archived exactly once: count=%d err=%v", errorArchiveCount, err)
+	}
+	var archivedUsage ChannelUpstreamUsageArchive
+	if err := m.storeDB.First(&archivedUsage, "domain = ?", domain).Error; err != nil {
+		t.Fatal(err)
+	}
+	if archivedUsage.AccountEpoch == "" || archivedUsage.HourTs != legacyUsage.HourTs || archivedUsage.Requests != legacyUsage.Requests || archivedUsage.CostUSD != legacyUsage.CostUSD || archivedUsage.Provider != legacyUsage.Provider {
+		t.Fatalf("archived usage changed historical values: %+v", archivedUsage)
+	}
+	var archivedError ChannelUpstreamErrorLogArchive
+	if err := m.storeDB.First(&archivedError, "domain = ?", domain).Error; err != nil {
+		t.Fatal(err)
+	}
+	if archivedError.AccountEpoch == "" || archivedError.EventKey != "existing-error-evidence" || archivedError.PayloadJSON == "" || len(archivedError.PayloadHash) != 64 {
+		t.Fatalf("archived error evidence is incomplete: %+v", archivedError)
+	}
+	// The archive is an audit boundary, not another mutable cache. Exercise raw
+	// SQL so this verifies the database trigger rather than only GORM hooks.
+	if err := m.storeDB.Exec("UPDATE channel_upstream_usage_archives SET cost_usd = ? WHERE id = ?", 999, archivedUsage.ID).Error; err == nil {
+		t.Fatal("raw SQL unexpectedly rewrote archived usage")
+	}
+	if err := m.storeDB.Exec("DELETE FROM channel_upstream_error_log_archives WHERE id = ?", archivedError.ID).Error; err == nil {
+		t.Fatal("raw SQL unexpectedly deleted archived error evidence")
+	}
+	var preservedUsage ChannelUpstreamUsageArchive
+	if err := m.storeDB.First(&preservedUsage, archivedUsage.ID).Error; err != nil || preservedUsage.CostUSD != legacyUsage.CostUSD {
+		t.Fatalf("immutable archived usage changed: row=%+v err=%v", preservedUsage, err)
+	}
+	if err := m.storeDB.Model(&ChannelUpstreamErrorLogArchive{}).Where("id = ?", archivedError.ID).Count(&errorArchiveCount).Error; err != nil || errorArchiveCount != 1 {
+		t.Fatalf("immutable archived error evidence changed: count=%d err=%v", errorArchiveCount, err)
 	}
 }
 
@@ -1307,6 +1353,7 @@ func TestUpstreamIdentityAndUsageNamespaceChangeCommitAtomically(t *testing.T) {
 	replacement := ChannelUpstreamAccount{
 		Domain: domain, Provider: upstreamProviderAICodeWith, BaseURL: "https://" + domain,
 		Account: aiCodeWithKeyIdentity([]string{"sk-acw-new-identity"}), Enabled: true, Status: upstreamStatusOK,
+		UpdatedAt: time.Now().Unix(),
 	}
 	if err := m.sealUpstreamAccountCredential(&replacement, aiCodeWithCredential{APIKeys: []string{"sk-acw-new-identity"}}); err != nil {
 		t.Fatal(err)
@@ -1327,6 +1374,10 @@ func TestUpstreamIdentityAndUsageNamespaceChangeCommitAtomically(t *testing.T) {
 	}
 	if usageRows != 1 {
 		t.Fatalf("failed identity transaction changed usage rows: count=%d", usageRows)
+	}
+	var archivedRows int64
+	if err := m.storeDB.Model(&ChannelUpstreamUsageArchive{}).Where("domain = ?", domain).Count(&archivedRows).Error; err != nil || archivedRows != 0 {
+		t.Fatalf("failed identity transaction leaked archive rows: count=%d err=%v", archivedRows, err)
 	}
 }
 
