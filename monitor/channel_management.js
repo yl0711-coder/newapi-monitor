@@ -2,7 +2,7 @@
 'use strict';
 
 const cm={
-  inited:false,loaded:false,hours:24,days:7,custom:null,preset:'',report:null,abort:null,sort:'cost',
+  inited:false,loaded:false,loadedAt:0,loading:false,refreshTimer:null,hours:24,days:7,custom:null,preset:'',report:null,abort:null,sort:'cost',
   economics:null,economicsError:'',economicsSeq:0,economicsHourly:new Map(),economicsHourlySeq:new Map(),
   costLedger:new Map(),costLedgerSeq:new Map(),costLedgerOpen:new Set(),
   pricingOps:new Map(),
@@ -35,9 +35,22 @@ const cmPresetRange=(preset,now=Date.now())=>{
 window.channelManagementActivate=function(){
   if(!cm.inited)init();
   const changed=applyNavigationContext();
-  if(!cm.loaded||changed)loadReport();
+  if(!cm.loaded||changed||Date.now()-cm.loadedAt>=30000)loadReport({quiet:cm.loaded&&!changed});
+  scheduleReportRefresh();
 };
+window.channelManagementDeactivate=function(){if(cm.refreshTimer){clearTimeout(cm.refreshTimer);cm.refreshTimer=null}};
 window.channelManagementOpen=function(context){window.monitorNavigate?.('channels',context||{})};
+function scheduleReportRefresh(){
+  if(cm.refreshTimer)clearTimeout(cm.refreshTimer);
+  if($('tab-channels')?.hidden)return;
+  cm.refreshTimer=setTimeout(async()=>{
+    cm.refreshTimer=null;
+    // 编辑弹窗或计价台账打开时不在后台替换其依赖的报表，
+    // 避免自动刷新打断人工配置和审批。
+    if(!$('tab-channels')?.hidden&&!cm.financeMode&&!cm.upstreamDomain&&!cm.costLedgerOpen.size&&!cm.pricingOps.size)await loadReport({quiet:true});
+    scheduleReportRefresh();
+  },60000);
+}
 function applyNavigationContext(){
   const c=window.monitorNavigationContext?.()||{};let changed=false;
   if(!Object.keys(c).length)return false;
@@ -82,6 +95,7 @@ function init(){
     ['cmDomain','cmVendor','cmGroup','cmStatus'].forEach(id=>{if($(id))$(id).value=''});
     render();
   });
+  $('cmRefresh')?.addEventListener('click',()=>loadReport());
   document.querySelectorAll('[data-cm-sort]').forEach(btn=>btn.addEventListener('click',()=>{
     cm.sort=btn.dataset.cmSort;
     document.querySelectorAll('[data-cm-sort]').forEach(x=>x.classList.toggle('active',x===btn));
@@ -172,18 +186,19 @@ function showError(message){
   if($('cmSummary')){$('cmSummary').innerHTML='';$('cmSummary').removeAttribute('aria-busy')}
   if($('cmBody'))$('cmBody').innerHTML=`<div class="cm-empty"><b>渠道数据暂时无法读取</b><p>${esc(message||'请稍后重试。')}</p></div>`;
 }
-async function loadReport(){
+async function loadReport({quiet=false}={}){
+  if(quiet&&cm.loading)return;
   if(cm.abort)cm.abort.abort();
-  cm.abort=new AbortController();const signal=cm.abort.signal,seq=++cm.economicsSeq;
-  cm.economics=null;cm.economicsError='';cm.economicsHourly.clear();cm.economicsHourlySeq.clear();cm.costLedger.clear();cm.costLedgerSeq.clear();loading();
+  cm.abort=new AbortController();const controller=cm.abort,signal=controller.signal,seq=++cm.economicsSeq;cm.loading=true;
+  if(!quiet){cm.economics=null;cm.economicsError='';cm.economicsHourly.clear();cm.economicsHourlySeq.clear();cm.costLedger.clear();cm.costLedgerSeq.clear();loading()}
   try{
     const res=await fetch('/channels/report?'+queryString(),{cache:'no-store',headers:{Accept:'application/json'},signal});
     if(res.status===401){location.href='/login';return}
     const data=await res.json();
     if(!res.ok)throw new Error(data.error||`HTTP ${res.status}`);
     if(data.enabled===false){showError('渠道用量依赖稳定性本地小时汇总，当前功能未启用。');return}
-    cm.report=data;cm.loaded=true;populateFilters();render();
-    for(const key of cm.costLedgerOpen)loadCostLedger(key);
+    cm.report=data;cm.loaded=true;cm.loadedAt=Date.now();populateFilters();render();
+    if(!quiet)for(const key of cm.costLedgerOpen)loadCostLedger(key);
     // 精确成本是独立的影子读模型。先交付原有渠道页，再加载经济账；
     // 新接口关闭、超时或迁移中都不得破坏原有功能。
     try{
@@ -198,7 +213,8 @@ async function loadReport(){
       if(error.name==='AbortError'||seq!==cm.economicsSeq)return;
       cm.economics=null;cm.economicsError=error.message||'精确成本读模型暂不可用';render();
     }
-  }catch(error){if(error.name!=='AbortError')showError(error.message)}
+  }catch(error){if(error.name!=='AbortError'&&(!quiet||!cm.report))showError(error.message)}
+  finally{if(cm.abort===controller)cm.abort=null;if(seq===cm.economicsSeq)cm.loading=false}
 }
 
 function setOptions(id,items,current,placeholder){
@@ -940,7 +956,7 @@ async function openUpstream(domainKey){
   $('cmUpstreamMask').hidden=false;$('cmUpstreamDialog').classList.add('show');$('cmUpstreamDialog').setAttribute('aria-hidden','false');
   document.body.classList.add('cm-dialog-open');
   try{
-    const res=await fetch('/channels/upstream?domain='+encodeURIComponent(domain.domain),{headers:{Accept:'application/json'}});
+    const res=await fetch('/channels/upstream?domain='+encodeURIComponent(domain.domain),{cache:'no-store',headers:{Accept:'application/json'}});
     if(res.status===401){location.href='/login';return}
     const data=await res.json();if(!res.ok)throw new Error(data.error||`HTTP ${res.status}`);
     if(cm.upstreamDomain!==domain)return;

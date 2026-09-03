@@ -64,6 +64,14 @@ func TestChannelManagementReportBypassesStaleBrowserCache(t *testing.T) {
 	if !strings.Contains(js, `fetch('/channels/report?'+queryString(),{cache:'no-store'`) {
 		t.Fatal("渠道报表请求必须绕过浏览器缓存")
 	}
+	if !strings.Contains(js, `fetch('/channels/upstream?domain='+encodeURIComponent(domain.domain),{cache:'no-store'`) {
+		t.Fatal("上游同步状态请求必须绕过浏览器缓存")
+	}
+	for _, marker := range []string{`scheduleReportRefresh()`, `setTimeout(async()=>`, `channelManagementDeactivate`, `id="cmRefresh"`} {
+		if !strings.Contains(js+pageHTML, marker) {
+			t.Fatalf("渠道同步状态刷新机制缺少 %q", marker)
+		}
+	}
 	if strings.Contains(js, `if(data.unchanged){showFinanceMessage('配置没有变化`) {
 		t.Fatal("倍率未变化时也必须刷新报表，不能保留旧弹窗")
 	}

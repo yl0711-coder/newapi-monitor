@@ -943,6 +943,9 @@ func (m *Monitor) openStore(path string) error {
 	if err := m.migrateAICodeWithCredentialSlots(); err != nil {
 		return fmt.Errorf("AICodeWith Key 槽位迁移失败: %w", err)
 	}
+	if err := m.reconcileAICodeWithPublishedBackfillStates(); err != nil {
+		return fmt.Errorf("AICodeWith Key 历史完成状态修复失败: %w", err)
+	}
 	if err := m.migrateAICodeWithContractLedgerUnit(); err != nil {
 		return fmt.Errorf("AICodeWith 账面单位迁移失败: %w", err)
 	}

@@ -1337,6 +1337,60 @@ func (m *Monitor) migrateAICodeWithCredentialSlots() error {
 	return nil
 }
 
+// reconcileAICodeWithPublishedBackfillStates repairs the diagnostic rows left
+// by releases that atomically published account history completion without
+// copying the terminal state to each active key. It is a local, idempotent
+// migration: current credentials determine the exact set version and slot IDs,
+// so stale/removed keys can never be marked complete by accident.
+func (m *Monitor) reconcileAICodeWithPublishedBackfillStates() error {
+	var rows []ChannelUpstreamAccount
+	if err := m.storeDB.Where("provider = ? AND usage_backfill_done = ?", upstreamProviderAICodeWith, true).Find(&rows).Error; err != nil {
+		return err
+	}
+	for i := range rows {
+		row := rows[i]
+		credential, err := m.credentialForAccount(row)
+		if err != nil {
+			return fmt.Errorf("%s 无法核对已完成的 Key 历史状态: %w", row.Domain, err)
+		}
+		cred, ok := credential.(aiCodeWithCredential)
+		if !ok {
+			return fmt.Errorf("%s 无法核对已完成的 Key 历史状态: 凭据类型不匹配", row.Domain)
+		}
+		normalized, err := normalizeAICodeWithCredential(cred)
+		if err != nil {
+			return fmt.Errorf("%s 无法核对已完成的 Key 历史状态: %w", row.Domain, err)
+		}
+		setVersion, err := aiCodeWithCredentialSetVersion(normalized)
+		if err != nil {
+			return err
+		}
+		slotIDs := make([]string, 0, len(normalized.Slots))
+		for _, slot := range normalized.Slots {
+			slotIDs = append(slotIDs, slot.SlotID)
+		}
+		if len(slotIDs) == 0 {
+			continue
+		}
+		now := time.Now().Unix()
+		if err := m.storeDB.Model(&AICodeWithKeySyncState{}).
+			Where("domain = ? AND credential_set_version = ? AND slot_id IN ? AND backfill_done = ?", row.Domain, setVersion, slotIDs, false).
+			Updates(map[string]any{
+				"backfill_done":              true,
+				"backfill_cursor":            row.UsageBackfillCursor,
+				"backfill_round_id":          "",
+				"backfill_last_success_at":   row.UsageBackfillLastSuccessAt,
+				"backfill_last_error":        "",
+				"backfill_next_sync_at":      int64(0),
+				"backfill_consecutive_fails": 0,
+				"updated_at":                 now,
+			}).Error; err != nil {
+			return fmt.Errorf("%s Key 历史完成状态修复失败: %w", row.Domain, err)
+		}
+	}
+	return nil
+}
+
 // migrateAICodeWithContractLedgerUnit reverses the short-lived CNY/7 rollout.
 // AICodeWith's CNY field names its internal ledger currency, while the agreed
 // business accounting basis is 1:1. The predicate on balance_unit makes the
@@ -2344,6 +2398,9 @@ func (m *Monitor) channelDomainExists(ctx context.Context, domain string) (bool,
 }
 
 func (m *Monitor) getChannelUpstreamHandler(c *gin.Context) {
+	// 后台 worker 会持续推进同步水位；配置页必须每次读取
+	// SQLite 当前状态，不能被浏览器的旧 GET 响应固定为“等待同步”。
+	c.Header("Cache-Control", "no-store")
 	domain := strings.ToLower(strings.TrimSpace(c.Query("domain")))
 	if domain == "" || len(domain) > 253 {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "主域名无效"})

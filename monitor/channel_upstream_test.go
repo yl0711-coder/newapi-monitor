@@ -717,6 +717,9 @@ func TestChannelUpstreamNewAPIHandlersProtectSecretsAndPreserveLastBalance(t *te
 	if get.Code != http.StatusOK || strings.Contains(get.Body.String(), "handler-secret-token") || !strings.Contains(get.Body.String(), `"user_id":9`) {
 		t.Fatalf("config GET leaked secret or omitted account: status=%d body=%s", get.Code, get.Body.String())
 	}
+	if get.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("config GET may retain stale worker state: Cache-Control=%q", get.Header().Get("Cache-Control"))
+	}
 
 	fail.Store(true)
 	w = upstreamRouteRequest(t, m, router, roleRoot, http.MethodPost, "/channels/upstream/sync", channelUpstreamSyncInput{Domain: domain})
@@ -1076,6 +1079,64 @@ func TestAICodeWithSlotViewsUsePublishedAccountBackfillCompletion(t *testing.T) 
 	views = m.aicodeWithSlotViewsFromStates(row, states)
 	if len(views) != 1 || views[0].BackfillDone || views[0].BackfillLastError != "legacy timeout" || views[0].BackfillNextSyncAt != 99 || views[0].BackfillConsecutiveFails != 2 {
 		t.Fatalf("genuinely incomplete credential set was hidden by compatibility projection: %+v", views)
+	}
+}
+
+func TestReconcileAICodeWithPublishedBackfillStatesOnlyRepairsCurrentCredentialSet(t *testing.T) {
+	m := newChannelUpstreamTestMonitor(t)
+	credential, err := normalizeAICodeWithCredential(aiCodeWithCredential{Slots: []aiCodeWithKeyCredential{
+		{SlotID: "acw_primary", Name: "主账号", Secret: "sk-acw-primary-secret"},
+		{SlotID: "acw_backup", Name: "备用", Secret: "sk-acw-backup-secret"},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	row := ChannelUpstreamAccount{
+		Domain: "aicodewith.example", Provider: upstreamProviderAICodeWith,
+		UsageBackfillDone: true, UsageBackfillCursor: 12345, UsageBackfillLastSuccessAt: 12340,
+	}
+	if err := m.sealUpstreamAccountCredential(&row, credential); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.storeDB.Create(&row).Error; err != nil {
+		t.Fatal(err)
+	}
+	version, err := aiCodeWithCredentialSetVersion(credential)
+	if err != nil {
+		t.Fatal(err)
+	}
+	states := []AICodeWithKeySyncState{
+		{Domain: row.Domain, SlotID: "acw_primary", CredentialSetVersion: version, Status: upstreamStatusOK, BackfillLastError: "legacy timeout", BackfillNextSyncAt: 999, BackfillConsecutiveFails: 2},
+		{Domain: row.Domain, SlotID: "acw_backup", CredentialSetVersion: version, Status: upstreamStatusOK, BackfillRoundID: "legacy-round"},
+		{Domain: row.Domain, SlotID: "acw_removed", CredentialSetVersion: "obsolete-version", Status: upstreamStatusOK, BackfillLastError: "must remain"},
+	}
+	if err := m.storeDB.Create(&states).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	if err := m.reconcileAICodeWithPublishedBackfillStates(); err != nil {
+		t.Fatal(err)
+	}
+	var repaired []AICodeWithKeySyncState
+	if err := m.storeDB.Where("domain = ?", row.Domain).Order("slot_id").Find(&repaired).Error; err != nil {
+		t.Fatal(err)
+	}
+	if len(repaired) != 3 {
+		t.Fatalf("state count=%d want 3", len(repaired))
+	}
+	for _, state := range repaired {
+		if state.SlotID == "acw_removed" {
+			if state.BackfillDone || state.BackfillLastError != "must remain" {
+				t.Fatalf("过期凭据集被误修复: %+v", state)
+			}
+			continue
+		}
+		if !state.BackfillDone || state.BackfillCursor != row.UsageBackfillCursor || state.BackfillLastSuccessAt != row.UsageBackfillLastSuccessAt || state.BackfillRoundID != "" || state.BackfillLastError != "" || state.BackfillNextSyncAt != 0 || state.BackfillConsecutiveFails != 0 {
+			t.Fatalf("当前 Key 历史完成状态未完整修复: %+v", state)
+		}
+	}
+	if err := m.reconcileAICodeWithPublishedBackfillStates(); err != nil {
+		t.Fatal(err)
 	}
 }
 
