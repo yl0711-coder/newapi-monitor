@@ -2114,12 +2114,22 @@ func (m *Monitor) persistSyncedUpstreamAccount(ctx context.Context, row *Channel
 }
 
 // persistUpstreamAccountIdentityChange makes the account identity and its local
-// usage namespace one SQLite commit. A provider/base URL/account change must
-// never become visible while rows attributed to the previous identity remain.
+// usage namespace one SQLite commit. A provider/base URL/account change first
+// archives the previous identity's finalized rows, then resets the live
+// namespace. The new identity must never become visible while rows attributed
+// to the previous identity remain or before their archive is durable.
 // The caller prepares (or preserves) the sealed credential before entering the
 // transaction; no network access or secret handling occurs while SQLite is held.
 func (m *Monitor) persistUpstreamAccountIdentityChange(ctx context.Context, row *ChannelUpstreamAccount, clearUsage, recoverErrorLogAuth bool) error {
+	if row.UpdatedAt <= 0 {
+		row.UpdatedAt = time.Now().Unix()
+	}
 	return m.storeDB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if clearUsage {
+			if err := archiveUpstreamIdentityDataTx(tx, *row, row.UpdatedAt); err != nil {
+				return err
+			}
+		}
 		if err := tx.Clauses(clause.OnConflict{
 			Columns:   []clause.Column{{Name: "domain"}},
 			UpdateAll: true,
@@ -2151,7 +2161,15 @@ func (m *Monitor) persistAICodeWithAccountChange(ctx context.Context, row *Chann
 		return err
 	}
 	now := time.Now().Unix()
+	if row.UpdatedAt <= 0 {
+		row.UpdatedAt = now
+	}
 	return m.storeDB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if clearUsage {
+			if err := archiveUpstreamIdentityDataTx(tx, *row, row.UpdatedAt); err != nil {
+				return err
+			}
+		}
 		if err := tx.Clauses(clause.OnConflict{Columns: []clause.Column{{Name: "domain"}}, UpdateAll: true}).Create(row).Error; err != nil {
 			return err
 		}
@@ -2216,8 +2234,9 @@ func (m *Monitor) persistAICodeWithAccountChange(ctx context.Context, row *Chann
 // error-evidence lane consistent with an administrator's account change.
 //
 // A provider/base URL/account identity change invalidates both the cursor and
-// evidence rows: retaining either would mix two upstream accounts under one
-// domain. A replacement credential for the same NewAPI identity is different:
+// live evidence rows after those rows have been archived: retaining either in
+// the live namespace would mix two upstream accounts under one domain. A
+// replacement credential for the same NewAPI identity is different:
 // it is the explicit recovery action after a 401/403, so preserve the cursor
 // and evidence but reopen the isolated scheduler gate. This runs in the same
 // SQLite transaction as the account update; the UI can never observe a new

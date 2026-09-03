@@ -107,7 +107,7 @@ func TestRunInspectPreMigrationPlanCommandIsReadOnly(t *testing.T) {
 	if err := runInspectPreMigrationPlanCommand([]string{"--store", store}, &output); err != nil {
 		t.Fatalf("read-only plan inspection failed: %v", err)
 	}
-	if !strings.Contains(output.String(), "upstream-errorlog-event-key-coverage") {
+	if !strings.Contains(output.String(), "upstream-errorlog-identity-archive") {
 		t.Fatalf("unexpected migration plan: %q", output.String())
 	}
 	after, err := os.Stat(store)

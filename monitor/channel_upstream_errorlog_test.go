@@ -732,6 +732,10 @@ func TestUpstreamErrorLogTableIsRegisteredForMigration(t *testing.T) {
 	if !strings.Contains(string(srcBytes), "&ChannelUpstreamErrorLog{}") {
 		t.Error("新表未注册进 AutoMigrate 模型集，生产上会「表不存在」")
 	}
+	if !strings.Contains(string(srcBytes), "&ChannelUpstreamUsageArchive{}") ||
+		!strings.Contains(string(srcBytes), "&ChannelUpstreamErrorLogArchive{}") {
+		t.Error("上游身份切换归档表未完整注册进 AutoMigrate 模型集")
+	}
 	planBytes, err := os.ReadFile("store_migration_backup.go")
 	if err != nil {
 		t.Fatalf("读 store_migration_backup.go: %v", err)
@@ -742,7 +746,13 @@ func TestUpstreamErrorLogTableIsRegisteredForMigration(t *testing.T) {
 	if strings.Contains(plan, `"main-facts-schema-20260825-v18-pricing-adapters"`) {
 		t.Error("AutoMigrate 模型集已变但 preMigrationPlanID 未 bump")
 	}
+	if strings.Contains(plan, `preMigrationPlanID = "main-facts-schema-20260831-v27-upstream-errorlog-event-key-coverage"`) {
+		t.Error("新增身份归档表后仍复用 v27 迁移计划")
+	}
 	if !strings.Contains(plan, "upstream-errorlog") {
 		t.Error("preMigrationPlanID 未标出上游错误日志变更")
+	}
+	if !strings.Contains(plan, "identity-archive") {
+		t.Error("preMigrationPlanID 未标出上游身份归档变更")
 	}
 }

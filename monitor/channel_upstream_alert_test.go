@@ -74,13 +74,49 @@ func TestUpstreamBalanceAssessmentUsesCompleteLocalHoursAndConfiguredRates(t *te
 		t.Fatalf("average daily upstream cost=%v want=50", estimates[domain].AverageDailyCostUSD)
 	}
 	assessment := assessUpstreamBalance(account, estimates[domain], coverage, policy, now, 5)
-	if !assessment.Available || assessment.Status != "warning" || assessment.EstimatedRunwayDays == nil || math.Abs(*assessment.EstimatedRunwayDays-0.8) > 1e-9 {
+	if !assessment.Available || assessment.Status != "warning" || assessment.EstimatedRunwayDays == nil ||
+		math.Abs(*assessment.EstimatedRunwayDays-0.8) > 1e-9 || assessment.RequiredBalanceUSD == nil ||
+		math.Abs(*assessment.RequiredBalanceUSD-50) > 1e-9 {
 		t.Fatalf("assessment=%+v", assessment)
 	}
 	*account.BalanceUSD = 100
 	assessment = assessUpstreamBalance(account, estimates[domain], coverage, policy, now, 5)
 	if assessment.Status != "healthy" || assessment.EstimatedRunwayDays == nil || math.Abs(*assessment.EstimatedRunwayDays-2) > 1e-9 {
 		t.Fatalf("healthy assessment=%+v", assessment)
+	}
+}
+
+func TestUpstreamBurnUsesEachPhysicalChannelRateBeforeDomainAggregation(t *testing.T) {
+	m := newStabilityTestMonitor(t)
+	now := time.Date(2026, 8, 8, 12, 0, 0, 0, cstLocation).Unix()
+	domain, _, cfg := seedUpstreamBalanceAssessment(t, m, now)
+	from, _ := upstreamBalanceWindow(now, 7)
+	if err := m.storeDB.Create(&ChannelSnap{ID: 34, Name: "expensive-route", BaseDomain: domain, BaseHost: "other.last-api.ai", Status: 1}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := m.storeDB.Create(&ChannelFinanceChannelCost{
+		ChannelID: 34, Grp: "codex", UpstreamGroupName: "upstream-premium", Multiplier: 3, DiscountFactor: 1,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	rows := make([]StabilityHourSample, 0, 7)
+	for day := 0; day < 7; day++ {
+		rows = append(rows, StabilityHourSample{
+			HourTs: from + int64(day*24)*3600, ChannelID: 34, ModelName: "gpt", Grp: "codex",
+			Success: 1, Quota: int64(100 * quotaPerUSD),
+		})
+	}
+	if err := m.storeDB.Create(&rows).Error; err != nil {
+		t.Fatal(err)
+	}
+	estimates, coverage, err := m.loadUpstreamBurnEstimates(context.Background(), now, upstreamBalancePolicyFor(cfg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 原渠道每天 $100 × 1/2 = $50；新增渠道每天 $100 × 3/2 = $150。
+	// 两条渠道即使属于同一域名、同一网站分组，也必须先分别折算再汇总。
+	if !coverage.Complete || len(estimates[domain].MissingGroups) != 0 || math.Abs(estimates[domain].AverageDailyCostUSD-200) > 1e-9 {
+		t.Fatalf("多渠道动态余额成本估算错误: coverage=%+v estimate=%+v", coverage, estimates[domain])
 	}
 }
 

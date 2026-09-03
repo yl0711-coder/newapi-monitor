@@ -2,6 +2,7 @@ package monitor
 
 import (
 	"context"
+	"encoding/json"
 	"math"
 	"net/http/httptest"
 	"strings"
@@ -10,6 +11,21 @@ import (
 
 	"github.com/gin-gonic/gin"
 )
+
+func createChannelRechargeVersion(t *testing.T, m *Monitor, domain string, version, effectiveAt int64, paid, credit float64) {
+	t.Helper()
+	raw, err := json.Marshal(channelFinanceVersionSnapshot{
+		Domain: domain, UpstreamRechargePaid: paid, UpstreamRechargeCredit: credit,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.storeDB.Create(&ChannelFinanceVersion{
+		Domain: domain, Version: version, SnapshotJSON: string(raw), EffectiveAt: effectiveAt, CreatedAt: effectiveAt,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+}
 
 func TestChannelManagementPageIncludesBusinessDateShortcuts(t *testing.T) {
 	for _, shortcut := range []string{
@@ -74,6 +90,27 @@ func TestChannelManagementReportBypassesStaleBrowserCache(t *testing.T) {
 	}
 	if strings.Contains(js, `if(data.unchanged){showFinanceMessage('配置没有变化`) {
 		t.Fatal("倍率未变化时也必须刷新报表，不能保留旧弹窗")
+	}
+}
+
+func TestChannelManagementShowsDynamicUpstreamRunwayBesideBalance(t *testing.T) {
+	js := string(channelManagementJS)
+	for _, marker := range []string{
+		`function upstreamRunway(upstream)`,
+		`动态最低余额`,
+		`assessment.required_balance_usd`,
+		`预计可用 ${days.toFixed(1)} 天`,
+		`(days*24).toFixed(1)`,
+		`<small>上游当前余额</small>`,
+		`upstreamRunwayView.text`,
+	} {
+		if !strings.Contains(js, marker) {
+			t.Fatalf("渠道当前余额缺少动态可用时长展示 %q", marker)
+		}
+	}
+	if !strings.Contains(alertPageHTML, `动态阈值 = 近 N 个完整自然日预估日均上游成本 × 余额保障天数`) ||
+		!strings.Contains(alertPageHTML, `1 天 = 至少保障未来 24 小时`) {
+		t.Fatal("报警设置页没有明确动态余额阈值口径")
 	}
 }
 
@@ -252,8 +289,9 @@ func TestChannelManagementShowsRawAndRechargeAdjustedUpstreamSpend(t *testing.T)
 		`upstreamUsage.adjusted_cost_available`,
 		`upstreamUsage.adjusted_cost_usd`,
 		`upstreamUsage.recharge_ratio`,
-		`domain.finance?.configured`,
-		`financeConfigured?'等待消费同步':'待配置'`,
+		`upstreamUsage.adjusted_cost_status==='bucket_boundary_ambiguous'`,
+		`按历史充值比例版本修正`,
+		`缺少对应时段的充值比例版本`,
 		`上游修正消费汇总`,
 		`.cm-domain-upstream-adjusted b{color:`,
 	} {
@@ -262,7 +300,7 @@ func TestChannelManagementShowsRawAndRechargeAdjustedUpstreamSpend(t *testing.T)
 		}
 	}
 	if !strings.Contains(js, `adjustedUsageDomains=upstreamUsageDomains.filter`) {
-		t.Fatal("汇总只能累加已配置充值比例的账户")
+		t.Fatal("汇总只能累加可按历史充值比例精确修正的账户")
 	}
 }
 
@@ -282,13 +320,16 @@ func TestChannelManagementSummarizesUpstreamFinanceWithoutGroupDoubleCounting(t 
 	js := string(channelManagementJS)
 	css := string(stabilityCSS)
 	for _, marker := range []string{
-		`const upstreamAccounts=domains.filter(domain=>domain.upstream?.configured)`,
-		`upstreamUsageDomains.reduce((sum,domain)=>sum+(+domain.upstream_usage.cost_usd||0),0)`,
+		`const upstreamConfiguredAccounts=domains.filter(domain=>domain.upstream?.configured)`,
+		`const upstreamAccounts=upstreamConfiguredAccounts.filter(domain=>domain.upstream?.usage_sync_enabled)`,
+		`upstreamAggregateLabel(upstreamUsageDomains,'cost_usd',upstreamUsageMixed)`,
 		`upstreamBalanceDomains.reduce((sum,domain)=>sum+Number(domain.upstream.balance_usd),0)`,
 		`区间上游消费汇总`,
 		`上游当前余额汇总`,
-		`个账单完整`,
-		`补全中`,
+		`个账户账单完整`,
+		`部分数据`,
+		`小时账单与自然日账单分列，不合并`,
+		`当前渠道/分组筛选下不作比较`,
 		`.cm-kpis article.upstream b{color:`,
 		`.cm-kpis article.balance b{color:`,
 	} {
@@ -461,6 +502,7 @@ func TestChannelManagementUpstreamUsageUsesLocalHourlyRowsOnly(t *testing.T) {
 	}).Error; err != nil {
 		t.Fatal(err)
 	}
+	createChannelRechargeVersion(t, m, "upstream.example", 1, from, 1, 10)
 	accounts := map[string]ChannelUpstreamAccountView{"upstream.example": {
 		Configured: true, Provider: upstreamProviderNewAPI, UsageSyncEnabled: true,
 	}}
@@ -511,6 +553,57 @@ func TestAdjustedUpstreamUsageCostUsesRechargePaidOverCredit(t *testing.T) {
 				t.Fatalf("adjusted cost=%v ratio=%v ok=%v", got, ratio, ok)
 			}
 		})
+	}
+}
+
+func TestChannelManagementAdjustedSpendUsesHistoricalRechargeVersions(t *testing.T) {
+	m := newStabilityTestMonitor(t)
+	from := time.Date(2026, 8, 8, 0, 0, 0, 0, cstLocation).Unix()
+	to := from + 2*3600
+	if err := m.storeDB.Create(&[]ChannelUpstreamUsageHour{
+		{Domain: "upstream.example", HourTs: from, BucketSeconds: 3600, CostUSD: 10, Provider: upstreamProviderNewAPI},
+		{Domain: "upstream.example", HourTs: from + 3600, BucketSeconds: 3600, CostUSD: 10, Provider: upstreamProviderNewAPI},
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	createChannelRechargeVersion(t, m, "upstream.example", 1, from, 1, 10)
+	createChannelRechargeVersion(t, m, "upstream.example", 2, from+3600, 1, 5)
+	accounts := map[string]ChannelUpstreamAccountView{"upstream.example": {
+		Configured: true, Provider: upstreamProviderNewAPI, UsageSyncEnabled: true,
+	}}
+	usage, err := m.loadChannelUpstreamUsage(context.Background(), stabilityScope{FromTs: from, ToTs: to}, to, accounts, channelFinanceSnapshot{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := usage["upstream.example"]
+	// 第一小时 10/10=1，第二小时 10/5=2。不能把最新的 1:5
+	// 倒灌到第一小时，也不能用一个比例冒充整个区间。
+	if !got.AdjustedCostAvailable || math.Abs(got.AdjustedCostUSD-3) > 1e-9 || !got.RechargeRatioVaries || got.RechargeRatio != 0 || got.AdjustedCostStatus != upstreamAdjustedCostComplete {
+		t.Fatalf("historical adjusted upstream spend=%+v", got)
+	}
+}
+
+func TestChannelManagementAdjustedSpendFailsClosedOnMidBucketRatioChange(t *testing.T) {
+	m := newStabilityTestMonitor(t)
+	from := time.Date(2026, 8, 8, 0, 0, 0, 0, cstLocation).Unix()
+	to := from + 3600
+	if err := m.storeDB.Create(&ChannelUpstreamUsageHour{
+		Domain: "upstream.example", HourTs: from, BucketSeconds: 3600, CostUSD: 10, Provider: upstreamProviderNewAPI,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	createChannelRechargeVersion(t, m, "upstream.example", 1, from, 1, 10)
+	createChannelRechargeVersion(t, m, "upstream.example", 2, from+40*60, 1, 5)
+	accounts := map[string]ChannelUpstreamAccountView{"upstream.example": {
+		Configured: true, Provider: upstreamProviderNewAPI, UsageSyncEnabled: true,
+	}}
+	usage, err := m.loadChannelUpstreamUsage(context.Background(), stabilityScope{FromTs: from, ToTs: to}, to, accounts, channelFinanceSnapshot{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := usage["upstream.example"]
+	if got.AdjustedCostAvailable || got.AdjustedCostUSD != 0 || got.AdjustedCostStatus != upstreamAdjustedCostBucketAmbiguous {
+		t.Fatalf("mid-bucket recharge change must fail closed: %+v", got)
 	}
 }
 

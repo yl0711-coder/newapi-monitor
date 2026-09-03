@@ -25,6 +25,7 @@ type ChannelUpstreamBalanceAssessment struct {
 	Status              string   `json:"status"` // healthy / warning / critical / idle / unavailable
 	AverageDailyCostUSD float64  `json:"average_daily_cost_usd"`
 	EstimatedRunwayDays *float64 `json:"estimated_runway_days,omitempty"`
+	RequiredBalanceUSD  *float64 `json:"required_balance_usd,omitempty"`
 	ThresholdDays       float64  `json:"threshold_days"`
 	LookbackDays        int      `json:"lookback_days"`
 	ExpectedHours       int64    `json:"expected_hours"`
@@ -83,19 +84,20 @@ func (m *Monitor) loadUpstreamBurnEstimates(ctx context.Context, now int64, poli
 		return nil, coverage, fmt.Errorf("读取渠道倍率配置: %w", err)
 	}
 	var rows []struct {
-		Domain string
-		Grp    string
-		Quota  int64
+		Domain    string
+		ChannelID int
+		Grp       string
+		Quota     int64
 	}
 	if err := m.storeDB.WithContext(ctx).Raw(`SELECT COALESCE(cs.base_domain,'') domain,
-		COALESCE(sh.grp,'') grp, COALESCE(SUM(sh.quota),0) quota
+		sh.channel_id, COALESCE(sh.grp,'') grp, COALESCE(SUM(sh.quota),0) quota
 		FROM stability_hour_samples sh
 		JOIN stability_hour_ingest_states hs ON hs.hour_ts=sh.hour_ts AND hs.status='complete'
 		  AND hs.traffic_class_version=?
 		JOIN channel_snaps cs ON cs.id=sh.channel_id
 		WHERE sh.hour_ts>=? AND sh.hour_ts<? AND sh.traffic_class_version=?
 		  AND COALESCE(cs.base_domain,'')<>''
-		GROUP BY cs.base_domain,sh.grp`, userTrafficClassificationVersion, from, to,
+		GROUP BY cs.base_domain,sh.channel_id,sh.grp`, userTrafficClassificationVersion, from, to,
 		userTrafficClassificationVersion).Scan(&rows).Error; err != nil {
 		return nil, coverage, fmt.Errorf("读取本地渠道消耗汇总: %w", err)
 	}
@@ -110,12 +112,15 @@ func (m *Monitor) loadUpstreamBurnEstimates(ctx context.Context, now int64, poli
 		if group == "" {
 			group = "未标记服务分组"
 		}
-		view := finance.groupView(domain, group)
+		// 同一上游、同一网站分组可能同时挂载多个成本不同的物理渠道。
+		// 必须先按 channel_id 使用各自的倍率折算再汇总；若先按域名×分组
+		// 合并，会把 jikesoft/aicodewith 这类多档渠道错误套成同一个成本。
+		view := finance.groupViewForChannel(domain, row.ChannelID, group)
 		if !view.Complete || view.SiteMultiplier <= 0 || view.UpstreamEffectiveMultiplier <= 0 {
 			if missing[domain] == nil {
 				missing[domain] = make(map[string]bool)
 			}
-			missing[domain][group] = true
+			missing[domain][fmt.Sprintf("#%d %s", row.ChannelID, group)] = true
 			continue
 		}
 		userCostUSD := float64(row.Quota) / quotaPerUSD
@@ -237,6 +242,8 @@ func assessUpstreamBalance(account ChannelUpstreamAccountView, estimate upstream
 		assessment.Reason = fmt.Sprintf("近 %d 个完整自然日无显著上游消耗", policy.Lookback)
 		return assessment
 	}
+	requiredBalance := estimate.AverageDailyCostUSD * policy.RunwayDays
+	assessment.RequiredBalanceUSD = &requiredBalance
 	runway := *account.BalanceUSD / estimate.AverageDailyCostUSD
 	if runway < 0 {
 		runway = 0
@@ -302,8 +309,9 @@ func (m *Monitor) evaluateUpstreamBalanceAlerts(c AlertConfig, now int64) {
 		account := accounts[domain]
 		m.fire(c, "upstream_balance_low", domain,
 			fmt.Sprintf("渠道余额预计不足 %.1f 天：%s", assessment.ThresholdDays, domain),
-			fmt.Sprintf("主域名：%s\n当前余额：$%.2f\n近 %d 个完整自然日预估日均上游成本：$%.2f\n预计可用：%.2f 天\n小时数据完整率：%.1f%%（%d/%d 小时）\n\n该数值为按本地倍率配置估算的充值提醒，不是上游正式账单。",
+			fmt.Sprintf("主域名：%s\n当前余额：$%.2f\n近 %d 个完整自然日预估日均上游成本：$%.2f\n余额保障时长：%.1f 天\n当前动态预警线：$%.2f\n预计可用：%.2f 天（%.1f 小时）\n小时数据完整率：%.1f%%（%d/%d 小时）\n\n该数值为按本地倍率配置估算的充值提醒，不是上游正式账单。",
 				domain, *account.BalanceUSD, assessment.LookbackDays, assessment.AverageDailyCostUSD,
-				*assessment.EstimatedRunwayDays, assessment.CoveragePct, assessment.CompletedHours, assessment.ExpectedHours), now)
+				assessment.ThresholdDays, *assessment.RequiredBalanceUSD, *assessment.EstimatedRunwayDays,
+				*assessment.EstimatedRunwayDays*24, assessment.CoveragePct, assessment.CompletedHours, assessment.ExpectedHours), now)
 	}
 }

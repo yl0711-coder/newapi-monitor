@@ -27,13 +27,12 @@ const (
 	// Bump this ID whenever either AutoMigrate model set or a post-migration
 	// schema/data transform changes. Restarts of the same plan reuse its pinned
 	// original snapshot, so they cannot prune away the old-image rollback point.
-	// v27 将 v23 上游错误日志从页内 (domain, upstream_id) 主键升级为
-	// 稳定的 (domain, event_key)，并增加可恢复缩窗、原文截断状态与连续覆盖
-	// 水位。必须用新 plan，任何已固定的 v23/v25 快照都不能被本版复用。
-	preMigrationPlanID = "main-facts-schema-20260831-v27-upstream-errorlog-event-key-coverage"
-	// v28 是完整 source-v2 schema 与 v27 主库模型的组合目标。已有 v22/v24/v26
-	// source-v2 库升级时必须生成当前时点的新快照，不能复用旧回滚点。
-	preMigrationCombinedPlanID       = "main-facts-schema-20260831-v28-nginx-source-v2-upstream-errorlog-event-key-coverage"
+	// v29 在 v27 上增加上游账户身份切换的不可变消费/错误证据归档。新增
+	// AutoMigrate 表和触发器必须取得当前数据的新回滚点，不能复用 v27 快照。
+	preMigrationPlanID = "main-facts-schema-20260903-v29-upstream-errorlog-identity-archive"
+	// v30 是完整 source-v2 schema 与 v29 主库模型的组合目标。已有 v28
+	// source-v2 库升级时同样必须生成当前时点的新快照。
+	preMigrationCombinedPlanID       = "main-facts-schema-20260903-v30-nginx-source-v2-upstream-errorlog-identity-archive"
 	preMigrationSnapshotPrefix       = "pre-migrate-"
 	preMigrationReferencePrefix      = ".pre-migration-plan-"
 	preMigrationReferenceSuffix      = ".json"
