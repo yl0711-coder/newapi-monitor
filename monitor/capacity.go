@@ -365,10 +365,14 @@ func (m *Monitor) buildCapacityReport(ctx context.Context, from, to, bucket int6
 	if m.InfraEnabled() {
 		snap := m.computeInfraSnapshot(now)
 		report.Components = append(report.Components, snap.Instances...)
-		if snap.Database != nil {
+		if len(snap.Databases) > 0 {
+			report.Components = append(report.Components, snap.Databases...)
+		} else if snap.Database != nil {
 			report.Components = append(report.Components, *snap.Database)
 		}
-		if snap.LB != nil {
+		if len(snap.LoadBalancers) > 0 {
+			report.Components = append(report.Components, snap.LoadBalancers...)
+		} else if snap.LB != nil {
 			report.Components = append(report.Components, *snap.LB)
 		}
 	}

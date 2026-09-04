@@ -118,6 +118,25 @@ type TokenSample struct {
 	TrafficClassVersion int `gorm:"column:traffic_class_version;index"`
 }
 
+// MetricFinalizeState is the durable cursor for the delayed metric/token
+// reconciliation lane. The realtime sampler intentionally reads only a tiny
+// recent window; requests that finish tens of minutes later can therefore be
+// inserted into NewAPI's logs after that window has moved on. This cursor lets
+// a low-frequency closed-window pass catch those late rows without widening
+// every realtime query or replaying a large range after each restart.
+type MetricFinalizeState struct {
+	ID              uint   `gorm:"primaryKey;autoIncrement:false"`
+	NextTs          int64  `gorm:"column:next_ts"`
+	TargetThroughTs int64  `gorm:"column:target_through_ts"`
+	Status          string `gorm:"size:24"`
+	Attempts        int
+	NextRetryAt     int64  `gorm:"column:next_retry_at"`
+	LastSuccessAt   int64  `gorm:"column:last_success_at"`
+	LastFailureAt   int64  `gorm:"column:last_failure_at"`
+	LastError       string `gorm:"size:512;column:last_error"`
+	UpdatedAt       int64  `gorm:"index;column:updated_at"`
+}
+
 func (s *TokenSample) BeforeCreate(_ *gorm.DB) error {
 	if s.TrafficClassVersion == 0 {
 		s.TrafficClassVersion = userTrafficClassificationVersion
@@ -850,7 +869,7 @@ func (m *Monitor) openStore(path string) error {
 		return fmt.Errorf("上游错误日志事件键迁移失败: %w", err)
 	}
 	if err := db.AutoMigrate(
-		&MetricSample{}, &TokenSample{}, &HourSample{}, &ChannelSnap{}, &RejectionSample{}, &RejectionIngestBatch{}, &SelectablePair{},
+		&MetricSample{}, &TokenSample{}, &MetricFinalizeState{}, &HourSample{}, &ChannelSnap{}, &RejectionSample{}, &RejectionIngestBatch{}, &SelectablePair{},
 		&StabilityHourSample{}, &ChannelTestHourSample{}, &StabilityRejectHour{}, &StabilityProblemSample{},
 		&StabilityProblemIngestState{}, &StabilityProblemStage{}, &StabilityProblemClassificationMigration{}, &StabilityProblemLiveCursor{},
 		&StabilityHourIngestState{}, &StabilityBackfillJob{},

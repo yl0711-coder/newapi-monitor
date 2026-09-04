@@ -2,7 +2,7 @@
 
 ## 1. 用途和边界
 
-本文档用于让 AI 在本机运行 `newapi-monitor` 的受控测试，通过 SSH 隧道以生产 MySQL 的 `nexus_ro` 账号读取真实数据。
+本文档用于让 AI 在本机运行 `newapi-monitor` 的受控测试，通过 SSH 隧道以生产 MySQL 的 `monitor_ro` 账号读取真实数据。
 
 这是“本机代码 + 本机容器/工具 + 线上只读数据源”，不是部署，不会替换线上 Monitor，也不得修改 NewAPI、Nginx、线上容器或生产数据。
 
@@ -10,7 +10,7 @@
 本机 Go 检查工具  -> 127.0.0.1:13316             \
                                                       SSH -> Ubuntu-1 -> 托管 MySQL
 本机 Monitor 容器 -> host.docker.internal:13316       /
-                              仅允许 nexus_ro / nexusapi
+                              仅允许 monitor_ro / nexusapi
 ```
 
 生产库是只读也不等于可以无限查询。所有测试都必须小窗口、低并发、可中断，不得将生产库用作压测库。
@@ -18,7 +18,7 @@
 ## 2. AI 必须遵守的执行契约
 
 1. 优先使用仓库内的 `dev/ai-production-readonly-access.sh`；它会调用 `dev/run-local-production-readonly.sh` 管理隧道。不自行拼接 `ssh -L`。
-2. 只能使用 `nexus_ro` 账号连接 `nexusapi`；脚本检查不通过时必须停止，不得绕过。
+2. 只能使用 `monitor_ro` 账号连接 `nexusapi`；脚本检查不通过时必须停止，不得绕过。
 3. 优先使用 `tools/readonly-inspect`，不得用通用 MySQL 客户端临时执行未审核 SQL。
 4. 禁止任何写操作，包括 `INSERT` / `UPDATE` / `DELETE` / `REPLACE` / DDL / `ANALYZE TABLE` / `OPTIMIZE TABLE` / `LOCK TABLES` / `KILL` / `SET GLOBAL`。
 5. 禁止压测、高并发、全表导出、长时间范围聚合、无 `LIMIT` 的原始日志查询和反复刷新大范围页面。
@@ -32,7 +32,7 @@
 
 默认使用以下文件，它们均不应进入 Git：
 
-- `~/.config/newapi-monitor/local-acceptance.env`：保存本机验收配置和指向 `host.docker.internal:13316` 的 `nexus_ro` DSN。
+- `~/.config/newapi-monitor/local-acceptance.env`：保存本机验收配置和指向 `host.docker.internal:13316` 的 `monitor_ro` DSN。
 - `../NexusAPI/deploy/release-rc19/release.env`：保存 `MONITOR_SSH_TARGET` 和 `SSH_IDENTITY_FILE` 的本机引用。
 - `dev/run-local-production-readonly.sh`：校验账号、数据库和本地端口，再建立/关闭回环 SSH 隧道。
 - `dev/ai-production-readonly-access.sh`：供 AI 使用的一键入口，只暴露开启、关闭和有界查询，不接受任意 SQL。
@@ -51,16 +51,16 @@ dev/ai-production-readonly-access.sh start
 
 `start` 会通过底层 `preflight` 完成：
 
-1. 拒绝非 `nexus_ro`、非 `nexusapi` 或非 `host.docker.internal:13316` 的本机 DSN。
+1. 拒绝非 `monitor_ro`、非 `nexusapi` 或非 `host.docker.internal:13316` 的本机 DSN。
 2. 经 SSH 只在内存中解析线上 Monitor 的数据库 `host:port`，不输出密码或完整 DSN。
 3. 将本机 `127.0.0.1:13316` 转发到线上 MySQL。
-4. 以 `nexus_ro` 执行一条极小的 `SELECT` 探针。
+4. 以 `monitor_ro` 执行一条极小的 `SELECT` 探针。
 
 正常结果应包含：
 
 ```text
 readonly tunnel: started on 127.0.0.1:13316
-database preflight: nexus_ro SELECT succeeded
+database preflight: monitor_ro SELECT succeeded
 ```
 
 如果隧道已存在，第一行可能是 `healthy`。任何其他错误都应立即停止测试，不修改脚本以绕过门禁。
@@ -191,7 +191,7 @@ nc -z 127.0.0.1 13316
 | 现象 | 正确处理 | 禁止处理 |
 |---|---|---|
 | `required file is missing` | 停止，请管理员在本机补齐受控配置 | 向聊天中索要或输出密码/私钥 |
-| `database user must be nexus_ro` | 立即停止，报告本机配置错误 | 改用线上写账号 |
+| `database user must be monitor_ro` | 立即停止，报告本机配置错误 | 改用线上写账号 |
 | `127.0.0.1:13316 is already occupied` | 用 `lsof -nP -iTCP:13316 -sTCP:LISTEN` 只读确认进程，由管理员判断 | 盲目 `kill -9` 或改为局域网监听 |
 | SSH 连接失败 | 检查当前网络/VPN 和授权，再重试一次 | 关闭 host key 检查或将私钥复制进仓库 |
 | 查询超时 | 立即缩小为 1 用户×1 小时，仍失败则关闭隧道并报告 | 去掉超时、放大范围或并发重试 |

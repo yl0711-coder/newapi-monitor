@@ -977,3 +977,34 @@ func TestChannelManagementStatusRankEnabledBeforeDisabledAndHistory(t *testing.T
 		}
 	}
 }
+
+func TestManagementRateConfigIncludesAutoDisabledChannels(t *testing.T) {
+	rate := ChannelFinanceChannelCost{ChannelID: 10, Grp: "codex", UpstreamGroupName: "gpt-codex", Multiplier: 1, DiscountFactor: 1}
+	autoRate := rate
+	autoRate.ChannelID = 11
+	finance := channelFinanceSnapshot{
+		channelCanonicalCost: map[int]ChannelFinanceChannelCost{10: rate, 11: autoRate},
+		channelCostConflict:  map[int]bool{},
+	}
+	domain := &channelDomainBuild{Domain: "example.com", Vendors: map[string]*channelVendorBuild{
+		"OpenAI": {Channels: []*channelManagementBuild{
+			{ID: 10, Current: true, Status: 1},
+			{ID: 11, Current: true, Status: 3},
+			{ID: 12, Current: true, Status: 2},
+			{ID: 13, Current: false, Status: 1},
+		}},
+	}}
+
+	view := managementRateConfig(domain, finance)
+	if view.EnabledChannels != 1 || view.ManagedChannels != 2 || view.ConfiguredChannels != 2 || !view.Complete {
+		t.Fatalf("auto-disabled channel was not governed: %+v", view)
+	}
+	delete(finance.channelCanonicalCost, 11)
+	view = managementRateConfig(domain, finance)
+	if view.ConfiguredChannels != 1 || view.Complete {
+		t.Fatalf("missing auto-disabled rate was hidden: %+v", view)
+	}
+	if !strings.Contains(string(channelManagementJS), `rates.managed_channels`) || !strings.Contains(string(channelManagementJS), `在用渠道倍率`) {
+		t.Fatal("前端未使用在用渠道口径")
+	}
+}

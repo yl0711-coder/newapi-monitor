@@ -108,7 +108,9 @@ ETA 不得沿用旧“每小时一个 SQL”的静态公式。生产先做 2 小
 
 - **不要删除或重建 Monitor SQLite。** 启动时 `AutoMigrate` 只追加分类列和测试成本表；渠道倍率、上游账户、本地权限及历史配置继续保留。
 - 分类规则升级时旧聚合会被 fail-closed，不会继续冒充用户流量。正常 60 秒采样和最近窗口滚动汇总照常运行；历史报表在补数期间显示已有完整小时并明确提示“小时数据待补”，不会显示假零。
-- 分钟稳定性采样故意只处理用户流量，不写内部测试成本；`channel_test_hour_samples` 由完整小时自动修洞或人工补数生成。小时需先等待结束后 10 分钟定稿，自动修洞在启动 45 秒后首次运行、随后每 30 分钟最多修 1 小时，因此一条新测试成本正常约在请求后 10～100 分钟进入 Monitor 本地表。必须保持 `MONITOR_STABILITY_BACKFILL_ENABLED=true` 和 `MONITOR_STABILITY_AUTO_REPAIR=true`；关闭任一项时须安排人工补数，否则测试审计仍在 NewAPI 日志中，但 Monitor 的渠道燃烧会永久缺口。
+- 分钟稳定性采样故意只处理用户流量，不写内部测试成本；`channel_test_hour_samples` 由完整小时自动修洞或人工补数生成。NewAPI 在请求结束时才写日志，线上已观测到超过 30 分钟的长请求，因此小时需结束后 60 分钟才作为权威定稿；自动修洞在启动 45 秒后首次运行、随后每 30 分钟最多修 1 小时。必须保持 `MONITOR_STABILITY_BACKFILL_ENABLED=true` 和 `MONITOR_STABILITY_AUTO_REPAIR=true`；关闭任一项时须安排人工补数，否则测试审计仍在 NewAPI 日志中，但 Monitor 的渠道燃烧会永久缺口。
+
+- 模型监控仍每分钟读取 240 秒小窗口，保持新鲜度和低压力；另有迟到日志定稿 lane 在 60 分钟后按 10 分钟分片重读模型与令牌两个投影。该 lane 有持久水位、失败不前进、重启续跑；`/ready` 中的 `metric_finalize` 显示定稿右水位，落后超过 20 分钟会出现 `metric_finalize_lagging`。
 - 在维护窗口以超级管理员调用 `POST /admin/stability/backfill?days=7`（按实际验收范围改为 30 或留存天数），再用 `GET /admin/stability/backfill` 检查 `job.status=complete`、`failed_hours=0` 和目标区间覆盖率。任务保持来源单并发，但会把连续缺口按 `2→4→6→12` 个完整小时合成一次来源聚合；每个小时仍在独立本地事务中原子替换并生成零流量 proof。整个 range 最多接收 20,000 个聚合维度，超时或超限会自动降为单小时；单个病态小时在受控重试后进入 `failed_hour_ts`，任务继续处理其他小时并以 `partial` 结束，不能把 partial 当完成签收。
 - 所有后台来源查询默认至少间隔 2 秒启动；稳定性迁移默认将来源 SQL duty 限制为 20%（查询 1 秒后至少让路 4 秒，且不低于固定 2 秒）。range 明细查询后还会执行一条独立的来源控制总数 SQL，逐小时核对用户/内部测试的 requests、tokens、quota；不一致的 chunk 拒绝发布。两条 MySQL SELECT 都带 `MAX_EXECUTION_TIME(8000)` 服务端硬限制，客户端超时即使配置为 20 秒，也不允许单条数据库执行超过 8 秒。`GET /admin/stability/backfill` 暴露 `source_throttle`、完成/失败/已处理比例、当前 batch、来源查询次数和 ETA。ETA 是基于已观测查询耗时和当前 batch 的滚动估计，不是上线承诺。
 - `partial` 任务不会伪装成完成：先看 `failed_hour_ts` 和对应来源慢查询/基数，再以超级管理员显式调用 `POST /admin/stability/backfill/retry?id=<job-id>`。重试会保留已经 complete 的小时，只重新扫描失败/缺失小时；不得删除台账后整段重跑。
@@ -216,10 +218,10 @@ runner 会把当前源码的 Linux/amd64 `local-facts-loadtest` 二进制临时�
 合成数据门禁通过后，如需在本机 `8100/8101` 查看真实业务分布，可叠加
 [`../docker-compose.local-production-readonly.yml`](../docker-compose.local-production-readonly.yml)。这不是“纯本地验收”，也不是部署：候选代码、SQLite、备份和 Redis 仍全部在本机，仅通过回环 SSH 隧道读取生产 MySQL。
 
-必须通过 [`../dev/run-local-production-readonly.sh`](../dev/run-local-production-readonly.sh) 操作。脚本会拒绝非 `nexus_ro`、非 `nexusapi`、非 `host.docker.internal:13316` 的 DSN；隧道只绑定 `127.0.0.1`，数据库探针只执行一条按不存在 ID 的 `SELECT`。线上密码仍只保存在受控 env-file，绝不能提交到仓库或打印到日志。
+必须通过 [`../dev/run-local-production-readonly.sh`](../dev/run-local-production-readonly.sh) 操作。脚本会拒绝非专用 `monitor_ro`、非 `nexusapi`、非 `host.docker.internal:13316` 的 DSN；隧道只绑定 `127.0.0.1`，数据库探针只执行一条按不存在 ID 的 `SELECT`。线上密码仍只保存在受控 env-file，绝不能提交到仓库或打印到日志。
 
 ```bash
-# 1. 建立隧道并验证 nexus_ro；不启动/重建容器。
+# 1. 建立隧道并验证 monitor_ro；不启动/重建容器。
 dev/run-local-production-readonly.sh preflight
 
 # 2. 预创建两个不同的外部卷（不要用 down -v）。
@@ -373,7 +375,7 @@ docker run -d --name "$audit_container" --network none \
   -v "$RESTORE_DATA_VOLUME:/data" \
   -v "$RESTORE_AUDIT_BACKUP_VOLUME:/backup" \
   --env-file "$RESTORE_SECRET_ENV" \
-  -e 'NEWAPI_LOG_DSN=nexus_ro:disabled@tcp(127.0.0.1:1)/nexusapi' \
+  -e 'NEWAPI_LOG_DSN=monitor_ro:disabled@tcp(127.0.0.1:1)/nexusapi' \
   -e MONITOR_NEWAPI_BASE_URL=https://invalid.local \
   -e MONITOR_ADDR=:8090 \
   -e MONITOR_PORTAL_ADDR=:8091 \

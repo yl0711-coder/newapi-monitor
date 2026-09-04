@@ -1,6 +1,20 @@
 package monitor
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
+
+func TestLoadSettingsProbeDomainsExcludeRetiredRoutepath(t *testing.T) {
+	t.Setenv("MONITOR_PROBE_DOMAINS", "")
+	domains := LoadSettings().ProbeDomains
+	if strings.Contains(domains, "routepath.link") {
+		t.Fatalf("retired routepath.link must not be present in default probes: %q", domains)
+	}
+	if domains != "nexusapi.link,pathgo.link,us.nexusapi.link" {
+		t.Fatalf("unexpected default probe domains: %q", domains)
+	}
+}
 
 func TestLoadSettingsSourceLifecycleDefaults(t *testing.T) {
 	t.Setenv("MONITOR_SOURCE_WORKER_ENABLED", "")

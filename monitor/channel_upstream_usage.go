@@ -54,6 +54,7 @@ const (
 	upstreamUsageAdapterSub2Trend  = "sub2api_trend"
 	upstreamUsageAdapterSub2Stats  = "sub2api_stats"
 	upstreamUsageAdapterAICodeWith = "aicodewith_key"
+	upstreamUsageTailModeHourly    = "hourly"
 	// Tail 与历史补数是两条调度泳道。管理员手动同步仍走 auto，后台必须
 	// 显式选择一条，防止一个历史密集小时占满整轮而拖延其他账户的 Tail。
 	upstreamUsageLaneAuto    upstreamUsageLane = "auto"
@@ -191,7 +192,12 @@ func isUpstreamUsageTransientFailure(err error) bool {
 	return strings.Contains(message, "timeout") || strings.Contains(message, "deadline exceeded") ||
 		strings.Contains(message, "connection reset") || strings.Contains(message, "connection refused") ||
 		strings.Contains(message, "unexpected eof") || strings.Contains(message, "broken pipe") ||
-		strings.Contains(message, "no such host")
+		strings.Contains(message, "no such host") ||
+		// OFFSET 分页上游在扫描期间刚好写入一条日志时，total/首页指纹会变。
+		// 本轮已 fail-closed 且没有覆盖本地数据，这是短暂并发变化而非格式不兼容；
+		// 应在 2/5/15 分钟退避后重读，不能等完整的常规同步周期。
+		strings.Contains(message, "newapi 使用日志扫描期间 total 变化") ||
+		strings.Contains(message, "newapi 使用日志扫描期间首页已变化")
 }
 
 func upstreamUsageFailureRetryAt(s Settings, domain string, now int64, failures int, err error, scheduleKey string) int64 {
@@ -1034,13 +1040,6 @@ func (m *Monitor) syncNewAPITailIncremental(ctx context.Context, row ChannelUpst
 		cursor = windowTo
 	}
 	return result, false, nil
-}
-
-func newAPITailNeedsIncrementalSync(row ChannelUpstreamAccount, now int64) bool {
-	if row.UsageLastError == legacyNewAPIBackfillBudgetError() {
-		return true
-	}
-	return row.UsageDataUntil > 0 && now-row.UsageDataUntil > int64(upstreamUsageTailOverlap/time.Second)
 }
 
 type sub2APIUsageMetric struct {
@@ -2051,6 +2050,21 @@ func legacyNewAPIBackfillBudgetError() string {
 	return (&upstreamUsageRunBudgetExhausted{max: upstreamUsageMaxRequestsPerRun}).Error()
 }
 
+func newAPITailNeedsIncrementalSync(row ChannelUpstreamAccount, now int64) bool {
+	if row.UsageTailMode == upstreamUsageTailModeHourly || row.UsageLastError == legacyNewAPIBackfillBudgetError() {
+		return true
+	}
+	// A stale watermark needs forward-first hourly commits so one dense overlap
+	// cannot prevent the current edge from advancing. This alone does not pin the
+	// account to hourly mode; only an observed request-budget exhaustion does.
+	return row.UsageDataUntil > 0 && now-row.UsageDataUntil > int64(upstreamUsageTailOverlap/time.Second)
+}
+
+func upstreamUsageRunBudgetWasExhausted(err error) bool {
+	var exhausted *upstreamUsageRunBudgetExhausted
+	return errors.As(err, &exhausted)
+}
+
 func normalizeLegacyNewAPIBackfillBudgetState(row *ChannelUpstreamAccount, now int64) {
 	if row == nil || row.Provider != upstreamProviderNewAPI || row.UsageBackfillDone ||
 		row.UsageBackfillLastError != legacyNewAPIBackfillBudgetError() {
@@ -2187,11 +2201,18 @@ func (m *Monitor) syncStoredUpstreamUsageWithPriority(ctx context.Context, domai
 	tailYielded := false
 	historyRan := false
 	if tailRan {
+		// NewAPI 先用单窗口查询保持低流量账户每轮只请求一次。仅当水位
+		// 已滞后，或该账户曾真实触发单轮请求上限，才按小时增量提交。
+		// 预算耗尽会持久切换到 hourly 模式，避免高流量账户每轮在
+		// 整段失败和增量恢复之间震荡。
 		if newAPICred, ok := credential.(newAPICredential); ok && row.Provider == upstreamProviderNewAPI && newAPITailNeedsIncrementalSync(row, now) {
 			result, tailYielded, err = m.syncNewAPITailIncremental(ctx, row, newAPICred, plan.tailFrom, plan.tailTo, now, pacer)
 			tailPersisted = err == nil
 		} else {
 			result, err = syncUsage(ctx, plan.tailFrom, plan.tailTo, pacer)
+			if row.Provider == upstreamProviderNewAPI && upstreamUsageRunBudgetWasExhausted(err) {
+				row.UsageTailMode = upstreamUsageTailModeHourly
+			}
 		}
 		if errors.Is(err, context.Canceled) {
 			return row, err

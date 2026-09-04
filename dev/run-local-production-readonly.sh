@@ -1,6 +1,6 @@
 #!/bin/zsh
 # 在本机 8100/8101 运行当前候选代码，数据源只允许是经 SSH 隧道访问的
-# 生产 nexus_ro。脚本绝不打印 DSN/密码，也不修改线上容器或数据库。
+# 生产 monitor_ro。脚本绝不打印 DSN/密码，也不修改线上容器或数据库。
 set -euo pipefail
 
 script_dir="${0:A:h}"
@@ -39,7 +39,7 @@ validate_local_dsn() {
   dsn_value="$(env_value NEWAPI_LOG_DSN "$acceptance_env_file")"
   [[ -n "$dsn_value" ]] || fail "NEWAPI_LOG_DSN is missing from $acceptance_env_file"
   user_value="${dsn_value%%:*}"
-  [[ "$user_value" == "nexus_ro" ]] || fail "database user must be nexus_ro"
+  [[ "$user_value" == "monitor_ro" ]] || fail "database user must be monitor_ro"
   rest_value="${dsn_value#*@tcp\(}"
   [[ "$rest_value" != "$dsn_value" ]] || fail "NEWAPI_LOG_DSN must use tcp(...)"
   address_value="${rest_value%%\)*}"
@@ -84,14 +84,14 @@ start_tunnel() {
   local remote_target
   remote_target="$(
     ssh -i "$SSH_IDENTITY_FILE" -o BatchMode=yes -o ConnectTimeout=15 "$MONITOR_SSH_TARGET" \
-      "docker inspect nexusapi-monitor --format '{{range .Config.Env}}{{println .}}{{end}}'" |
+      "sudo docker inspect nexusapi-monitor --format '{{range .Config.Env}}{{println .}}{{end}}'" |
       awk -F= '
         $1 == "NEWAPI_LOG_DSN" {
           value=$0
           sub(/^NEWAPI_LOG_DSN=/, "", value)
           user=value
           sub(/:.*/, "", user)
-          if (user != "nexus_ro") exit 41
+          if (user != "monitor_ro") exit 41
           sub(/^.*@tcp\(/, "", value)
           sub(/\).*/, "", value)
           print value
@@ -100,7 +100,7 @@ start_tunnel() {
         }
         END {if (!found) exit 42}
       '
-  )" || fail "failed to resolve the production nexus_ro target"
+  )" || fail "failed to resolve the production monitor_ro target"
   [[ "$remote_target" == *:* ]] || fail "invalid production database target"
 
   ssh -i "$SSH_IDENTITY_FILE" -M -S "$control_socket" -fN \
@@ -135,7 +135,7 @@ probe_database() {
     GOCACHE=/private/tmp/newapi-monitor-prod-readonly-gocache \
       go run ./tools/readonly-inspect -channels 2147483647 >/dev/null
   )
-  print -- "database preflight: nexus_ro SELECT succeeded"
+  print -- "database preflight: monitor_ro SELECT succeeded"
 }
 
 compose() {

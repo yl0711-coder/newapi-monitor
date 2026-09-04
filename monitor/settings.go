@@ -199,7 +199,8 @@ type Settings struct {
 	// 留空 = 关闭接收接口(POST /internal/rejections 返回 503),不接受任何推送。
 	// 同一 token 也用于 POST /internal/host(各节点主机 agent 推送 OS 内存/磁盘)。
 	IngestToken string // MONITOR_INGEST_TOKEN
-	// 服务端健康监控(实例/数据库/负载均衡):基于 AWS Lightsail 指标接口拉取。
+	// 服务端健康监控(实例/数据库/负载均衡):自动发现 Lightsail、ECS/Fargate、
+	// RDS 与 ALB，并从各服务控制面和 CloudWatch 只读拉取。
 	// 默认【关】——关时完全不调 AWS、不影响模型监控与现网行为。
 	InfraEnabled bool // MONITOR_INFRA_ENABLED(=true 才启用主动采样/探测)
 	// CapacityEnabled 只开放容量规划的本地读取页。它不启动 worker、
@@ -214,6 +215,7 @@ type Settings struct {
 	InfraRetentionDays    int    // MONITOR_INFRA_RETENTION_DAYS,默认 7
 	// MONITOR_INFRA_RESOURCES:逗号分隔,显式指定要监控的资源,留空=自动发现。
 	// 格式 type:name,type∈ instance/database/lb,如 "instance:Master,database:DB-X,lb:LB-X"。
+	// 该显式列表只约束 Lightsail；ECS/RDS/ALB 始终自动发现，避免新部署漏监控。
 	InfraResources string
 	// MONITOR_INFRA_EXCLUDE_RESOURCES:逗号分隔的资源名。用于暂时下线某台实例的
 	// 监控：不再自动采样，也不在现有历史采样的快照、趋势或最近告警中展示。
@@ -391,7 +393,7 @@ func LoadSettings() Settings {
 		InfraDBDiskQueueWarn:     envFloat("MONITOR_INFRA_DB_DISK_QUEUE_WARN", 5),
 		InfraLBRespWarnMs:        envFloat("MONITOR_INFRA_LB_RESP_WARN_MS", 2000),
 
-		ProbeDomains:       env("MONITOR_PROBE_DOMAINS", "nexusapi.link,routepath.link,pathgo.link,us.nexusapi.link"),
+		ProbeDomains:       env("MONITOR_PROBE_DOMAINS", "nexusapi.link,pathgo.link,us.nexusapi.link"),
 		ProbePath:          env("MONITOR_PROBE_PATH", "/api/status"),
 		ProbeSeconds:       envInt("MONITOR_PROBE_SECONDS", 60),
 		ProbeLatencyWarnMs: envFloat("MONITOR_PROBE_LATENCY_WARN_MS", 500),

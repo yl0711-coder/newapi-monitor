@@ -573,6 +573,16 @@ func TestUpstreamRetryAfterBoundsAndUsageBudget(t *testing.T) {
 	if balance.NextSyncAt != retryAt {
 		t.Fatalf("balance Retry-After schedule=%d, want %d", balance.NextSyncAt, retryAt)
 	}
+	timeoutBalance := ChannelUpstreamAccount{Domain: "timeout.example"}
+	applyUpstreamSyncResult(&timeoutBalance, upstreamBalanceResult{}, context.DeadlineExceeded, now.Unix(), Settings{UpstreamSyncMinutes: 10})
+	if want := now.Add(2 * time.Minute).Unix(); timeoutBalance.NextSyncAt != want {
+		t.Fatalf("transient balance retry=%d, want %d", timeoutBalance.NextSyncAt, want)
+	}
+	busyBalance := ChannelUpstreamAccount{Domain: "store.example"}
+	applyUpstreamSyncResult(&busyBalance, upstreamBalanceResult{}, errors.New("database is locked (SQLITE_BUSY)"), now.Unix(), Settings{})
+	if want := now.Add(10 * time.Second).Unix(); busyBalance.NextSyncAt != want {
+		t.Fatalf("local-store balance retry=%d, want %d", busyBalance.NextSyncAt, want)
+	}
 	usage := ChannelUpstreamAccount{Domain: "rate.example"}
 	applyUpstreamUsageResult(&usage, upstreamUsageResult{}, &upstreamHTTPError{Status: http.StatusTooManyRequests, RetryAt: retryAt}, now.Unix(), Settings{})
 	if usage.UsageNextSyncAt != retryAt {

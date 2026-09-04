@@ -17,6 +17,19 @@ import (
 
 const sourceEpochStartupMaxLookbackSec int64 = 3600
 
+const (
+	// The realtime sampler stays deliberately small. A separate closed-window
+	// pass waits an hour, then advances in bounded ten-minute slices so requests
+	// that took tens of minutes to finish are eventually included.
+	metricFinalizeDelaySec          int64 = 60 * 60
+	metricFinalizeSliceSec          int64 = 10 * 60
+	metricFinalizeInitialOverlapSec int64 = 15 * 60
+	metricFinalizeRunEverySec       int64 = 5 * 60
+)
+
+type metricRangeSampler func(context.Context, int64, int64) (int, error)
+type tokenRangeSampler func(context.Context, int64, int64) error
+
 // boundedSourceEpochStartupLookback prevents every lease reacquisition or
 // transient reconnect from replaying an operator-sized historical window on
 // the high-priority sampler lane. The durable local watermark reduces normal
@@ -148,6 +161,7 @@ func (m *Monitor) loop(ctx context.Context, interval time.Duration) {
 	var ticks int
 	var nextProblemSample int64
 	var nextStabilityRollup int64
+	var nextMetricFinalize int64
 	for {
 		select {
 		case <-ctx.Done():
@@ -199,6 +213,19 @@ func (m *Monitor) loop(ctx context.Context, interval time.Duration) {
 					}
 				}
 			}
+			// Do not widen the every-minute source query to accommodate long
+			// requests. Re-read a small, already closed range on a durable cursor
+			// instead. Failure leaves the cursor untouched, so restart/retry cannot
+			// silently turn a source outage into a permanent chart gap.
+			if mainSampleOK && now >= nextMetricFinalize {
+				err := m.runMetricFinalizeTurn(ctx, now)
+				if err != nil {
+					slog.Warn("模型监控迟到日志定稿失败(保留水位重试)", "err", err)
+					nextMetricFinalize = now + 60
+				} else {
+					nextMetricFinalize = now + metricFinalizeRunEverySec
+				}
+			}
 			// 主维度采样失败也必须继续尝试 problem live；两类业务查询
 			// 各自记录水位。只有真实来源生命周期故障才由共享 gate 阻断。
 			m.evaluateAlerts(now)
@@ -233,6 +260,130 @@ func (m *Monitor) loop(ctx context.Context, interval time.Duration) {
 			}
 		}
 	}
+}
+
+func metricFinalizeTarget(now int64) int64 {
+	target := now - metricFinalizeDelaySec
+	if target <= 0 {
+		return 0
+	}
+	return target / 60 * 60
+}
+
+func metricFinalizeRetryDelay(attempts int) int64 {
+	if attempts < 1 {
+		attempts = 1
+	}
+	if attempts > 5 {
+		attempts = 5
+	}
+	return min(int64(60)<<uint(attempts-1), int64(10*60))
+}
+
+func (m *Monitor) loadOrExtendMetricFinalizeState(now int64) (*MetricFinalizeState, error) {
+	target := metricFinalizeTarget(now)
+	start := target - metricFinalizeInitialOverlapSec
+	if start < 0 {
+		start = 0
+	}
+	start = start / 60 * 60
+	defaults := MetricFinalizeState{
+		ID: 1, NextTs: start, TargetThroughTs: target, Status: "queued", UpdatedAt: now,
+	}
+	var state MetricFinalizeState
+	if err := m.storeDB.Where("id = ?", 1).Attrs(defaults).FirstOrCreate(&state).Error; err != nil {
+		return nil, err
+	}
+	updates := map[string]any{}
+	if state.NextTs <= 0 && target > 0 {
+		state.NextTs = start
+		updates["next_ts"] = start
+	}
+	if target > state.TargetThroughTs {
+		state.TargetThroughTs = target
+		updates["target_through_ts"] = target
+	}
+	if len(updates) > 0 {
+		updates["updated_at"] = now
+		if err := m.storeDB.Model(&MetricFinalizeState{}).Where("id = ?", 1).Updates(updates).Error; err != nil {
+			return nil, err
+		}
+	}
+	m.metricFinalizeThrough.Store(state.NextTs)
+	m.metricFinalizeTarget.Store(state.TargetThroughTs)
+	m.metricFinalizeLastSuccess.Store(state.LastSuccessAt)
+	m.metricFinalizeLastFailure.Store(state.LastFailureAt)
+	return &state, nil
+}
+
+func (m *Monitor) recordMetricFinalizeFailure(state *MetricFinalizeState, cause error, now int64) {
+	if state == nil || cause == nil {
+		return
+	}
+	attempts := state.Attempts + 1
+	if err := m.storeDB.Model(&MetricFinalizeState{}).Where("id = ? AND next_ts = ?", state.ID, state.NextTs).Updates(map[string]any{
+		"status": "retry", "attempts": attempts, "next_retry_at": now + metricFinalizeRetryDelay(attempts),
+		"last_failure_at": now, "last_error": clip(cause.Error(), 512), "updated_at": now,
+	}).Error; err == nil {
+		m.metricFinalizeLastFailure.Store(now)
+	}
+}
+
+// runMetricFinalizeTurnWith executes at most one bounded source slice. The
+// cursor advances only after both the model and token projections plus their
+// local hour rollup succeed. Replaying a partly written slice is safe because
+// both minute tables use replace-style UPSERTs.
+func (m *Monitor) runMetricFinalizeTurnWith(ctx context.Context, now int64, metric metricRangeSampler, token tokenRangeSampler) error {
+	state, err := m.loadOrExtendMetricFinalizeState(now)
+	if err != nil {
+		return err
+	}
+	if state.NextRetryAt > now {
+		return nil
+	}
+	if state.NextTs >= state.TargetThroughTs {
+		return m.storeDB.Model(&MetricFinalizeState{}).Where("id = ?", state.ID).Updates(map[string]any{
+			"status": "caught_up", "attempts": 0, "next_retry_at": 0, "last_error": "", "updated_at": now,
+		}).Error
+	}
+	from, to := state.NextTs, min(state.NextTs+metricFinalizeSliceSec, state.TargetThroughTs)
+	if _, err := metric(ctx, from, to); err != nil {
+		m.recordMetricFinalizeFailure(state, err, now)
+		return err
+	}
+	if err := token(ctx, from, to); err != nil {
+		m.recordMetricFinalizeFailure(state, err, now)
+		return err
+	}
+	if err := m.rollupHours(from / 3600 * 3600); err != nil {
+		m.recordMetricFinalizeFailure(state, err, now)
+		return err
+	}
+	status := "queued"
+	if to >= state.TargetThroughTs {
+		status = "caught_up"
+	}
+	result := m.storeDB.Model(&MetricFinalizeState{}).
+		Where("id = ? AND next_ts = ?", state.ID, from).Updates(map[string]any{
+		"next_ts": to, "target_through_ts": state.TargetThroughTs, "status": status,
+		"attempts": 0, "next_retry_at": 0, "last_success_at": now,
+		"last_failure_at": 0, "last_error": "", "updated_at": now,
+	})
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected != 1 {
+		return fmt.Errorf("模型监控迟到日志水位并发更新冲突")
+	}
+	m.metricFinalizeThrough.Store(to)
+	m.metricFinalizeTarget.Store(state.TargetThroughTs)
+	m.metricFinalizeLastSuccess.Store(now)
+	m.metricFinalizeLastFailure.Store(0)
+	return nil
+}
+
+func (m *Monitor) runMetricFinalizeTurn(ctx context.Context, now int64) error {
+	return m.runMetricFinalizeTurnWith(ctx, now, m.sampleRange, m.sampleTokensRange)
 }
 
 // 交付异常(B 类)SQL 判据 —— 口径见 文档/NexusAPI/12-上游渠道监控/09。

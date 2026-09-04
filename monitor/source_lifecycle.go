@@ -1066,15 +1066,23 @@ type sourceReadyStatus struct {
 }
 
 type readyStatusResponse struct {
-	Status          string                   `json:"status"`
-	StartedAt       int64                    `json:"started_at"`
-	Store           lifecycleComponentStatus `json:"store"`
-	FactsStore      lifecycleComponentStatus `json:"facts_store"`
-	Source          sourceReadyStatus        `json:"source"`
-	SampledAt       int64                    `json:"sampled_at"`
-	FactsHeartbeat  int64                    `json:"facts_heartbeat_at"`
-	FactsDisk       factsDiskReadyStatus     `json:"facts_disk"`
-	DegradedReasons []string                 `json:"degraded_reasons,omitempty"`
+	Status          string                    `json:"status"`
+	StartedAt       int64                     `json:"started_at"`
+	Store           lifecycleComponentStatus  `json:"store"`
+	FactsStore      lifecycleComponentStatus  `json:"facts_store"`
+	Source          sourceReadyStatus         `json:"source"`
+	SampledAt       int64                     `json:"sampled_at"`
+	MetricFinalize  metricFinalizeReadyStatus `json:"metric_finalize"`
+	FactsHeartbeat  int64                     `json:"facts_heartbeat_at"`
+	FactsDisk       factsDiskReadyStatus      `json:"facts_disk"`
+	DegradedReasons []string                  `json:"degraded_reasons,omitempty"`
+}
+
+type metricFinalizeReadyStatus struct {
+	ThroughTs     int64 `json:"through_ts"`
+	TargetTs      int64 `json:"target_ts"`
+	LastSuccessAt int64 `json:"last_success_at"`
+	LastFailureAt int64 `json:"last_failure_at"`
 }
 
 type factsDiskReadyStatus struct {
@@ -1118,7 +1126,11 @@ func (m *Monitor) readyStatus(now time.Time) (readyStatusResponse, int) {
 			NextRetryAt:   m.sourceNextRetryAt.Load(),
 			FailureStreak: m.sourceFailureStreak.Load(),
 		},
-		SampledAt:      m.lastRun.Load(),
+		SampledAt: m.lastRun.Load(),
+		MetricFinalize: metricFinalizeReadyStatus{
+			ThroughTs: m.metricFinalizeThrough.Load(), TargetTs: m.metricFinalizeTarget.Load(),
+			LastSuccessAt: m.metricFinalizeLastSuccess.Load(), LastFailureAt: m.metricFinalizeLastFailure.Load(),
+		},
 		FactsHeartbeat: m.usageFactsLoopHeartbeat.Load(),
 		FactsDisk: factsDiskReadyStatus{
 			Pressure:    usageFactDiskPressureLevel(m.usageFactsHistoryDiskLevel.Load()).String(),
@@ -1157,6 +1169,16 @@ func (m *Monitor) readyStatus(now time.Time) (readyStatusResponse, int) {
 			if now.Unix()-last > int64(seconds*3+60) {
 				response.DegradedReasons = appendReason(response.DegradedReasons, "sampler_stale")
 			}
+		}
+		finalizeThrough := m.metricFinalizeThrough.Load()
+		finalizeTarget := metricFinalizeTarget(now.Unix())
+		if finalizeThrough == 0 {
+			response.DegradedReasons = appendReason(response.DegradedReasons, "metric_finalize_warming_up")
+		} else if finalizeTarget-finalizeThrough > 20*60 {
+			response.DegradedReasons = appendReason(response.DegradedReasons, "metric_finalize_lagging")
+		}
+		if m.metricFinalizeLastFailure.Load() > m.metricFinalizeLastSuccess.Load() {
+			response.DegradedReasons = appendReason(response.DegradedReasons, "metric_finalize_failed")
 		}
 	}
 	if m.cfg.UsageFactsEnabled {

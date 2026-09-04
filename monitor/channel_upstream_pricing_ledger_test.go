@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -1157,6 +1158,50 @@ func TestPricingLedgerYieldsToSameAccountCredentialOperation(t *testing.T) {
 	}
 }
 
+func TestPricingLedgerSchedulerSkipsBusyAccountAndRunsNextDueAccount(t *testing.T) {
+	var firstCalls, secondCalls atomic.Int64
+	firstServer := newPricingLedgerFixtureServer(t, http.StatusOK, &firstCalls)
+	secondServer := newPricingLedgerFixtureServer(t, http.StatusOK, &secondCalls)
+	m := newChannelUpstreamTestMonitor(t)
+	m.cfg.UpstreamUsageSyncEnabled = true
+	m.cfg.UpstreamPricingLedgerEnabled = true
+	m.cfg.UpstreamPricingBackfillHoursPerRun = 1
+
+	domains := []string{firstServer.Listener.Addr().String(), secondServer.Listener.Addr().String()}
+	sort.Strings(domains)
+	servers := map[string]*httptest.Server{
+		firstServer.Listener.Addr().String():  firstServer,
+		secondServer.Listener.Addr().String(): secondServer,
+	}
+	_ = servers // documents that domain identity, not declaration order, drives fairness
+	m.cfg.UpstreamPricingLedgerDomains = domains
+	for _, domain := range domains {
+		row := ChannelUpstreamAccount{Domain: domain, Provider: upstreamProviderNewAPI,
+			BaseURL: "http://" + domain, UserID: 31, Enabled: true, UsageSyncEnabled: true}
+		if err := m.persistSyncedUpstreamAccount(context.Background(), &row, newAPICredential{AccessToken: "usage-token"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	release, err := m.acquireUpstreamAccountAdmin(context.Background(), domains[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.syncDueUpstreamPricing(context.Background())
+	release()
+
+	callCount := map[string]int64{
+		firstServer.Listener.Addr().String():  firstCalls.Load(),
+		secondServer.Listener.Addr().String(): secondCalls.Load(),
+	}
+	if callCount[domains[0]] != 0 {
+		t.Fatalf("busy account contacted upstream %d times", callCount[domains[0]])
+	}
+	if callCount[domains[1]] == 0 {
+		t.Fatal("next due account was starved by busy first account")
+	}
+}
+
 func openRestartablePricingTestMonitor(t *testing.T, path string) *Monitor {
 	t.Helper()
 	m := &Monitor{cfg: Settings{SessionSecret: "pricing-restart-secret", UpstreamSyncTimeoutSec: 3}}
@@ -1660,14 +1705,86 @@ func TestPricingLedgerDueOrderingPreventsDomainStarvation(t *testing.T) {
 		{Domain: "c.example", NextDueAt: 200, LastAttemptAt: 0},
 	}
 	sorted := sortUpstreamPricingDueAccounts(candidates)
-	if sorted[0].Domain != "b.example" || sorted[1].Domain != "a.example" || sorted[2].Domain != "c.example" {
+	if sorted[0].Domain != "c.example" || sorted[1].Domain != "b.example" || sorted[2].Domain != "a.example" {
 		t.Fatalf("due ordering=%+v", sorted)
 	}
-	// After b gets a turn, its due/attempt timestamps move forward and a must be
-	// selected next; fixed alphabetical ordering would starve it forever.
+	// After c gets a turn, its due/attempt timestamps move forward and b must be
+	// selected next; fixed alphabetical or oldest-subqueue ordering would starve it.
 	sorted[0].NextDueAt, sorted[0].LastAttemptAt = 300, 1000
 	sorted = sortUpstreamPricingDueAccounts(sorted)
-	if sorted[0].Domain != "a.example" {
+	if sorted[0].Domain != "b.example" {
 		t.Fatalf("round-robin fairness lost after first account advanced: %+v", sorted)
+	}
+}
+
+func TestPricingLedgerDueOrderingDoesNotLetCostRecoveryStarvePeer(t *testing.T) {
+	candidates := []upstreamPricingDueAccount{
+		// Mirrors production: a large 4sapi cost-recovery queue has an older due
+		// item, but the account itself just received a scheduler turn.
+		{Domain: "4sapi.com", NextDueAt: 100, LastAttemptAt: 1000},
+		{Domain: "codeyu.shop", NextDueAt: 200, LastAttemptAt: 10},
+	}
+	sorted := sortUpstreamPricingDueAccounts(candidates)
+	if sorted[0].Domain != "codeyu.shop" {
+		t.Fatalf("stale peer remained starved by older cost recovery: %+v", sorted)
+	}
+}
+
+func TestPricingLedgerSyncStateStaleOnlyAfterDueGrace(t *testing.T) {
+	const now int64 = 10_000
+	tests := []struct {
+		name  string
+		state ChannelUpstreamPricingSyncState
+		want  bool
+	}{
+		{name: "overdue and unvisited", state: ChannelUpstreamPricingSyncState{Status: upstreamStatusOK, LastAttemptAt: now - 901, TailNextSyncAt: now - 1, BackfillDone: true}, want: true},
+		{name: "inside grace", state: ChannelUpstreamPricingSyncState{Status: upstreamStatusOK, LastAttemptAt: now - 900, TailNextSyncAt: now - 1, BackfillDone: true}},
+		{name: "not due", state: ChannelUpstreamPricingSyncState{Status: upstreamStatusOK, LastAttemptAt: now - 3600, TailNextSyncAt: now + 60, BackfillDone: true}},
+		{name: "history not due", state: ChannelUpstreamPricingSyncState{Status: upstreamStatusOK, LastAttemptAt: now - 3600, TailNextSyncAt: now + 60, BackfillNextSyncAt: now + 60}},
+		{name: "never attempted", state: ChannelUpstreamPricingSyncState{Status: upstreamStatusPending, TailNextSyncAt: now - 1}},
+		{name: "explicit error remains error", state: ChannelUpstreamPricingSyncState{Status: upstreamStatusError, LastAttemptAt: now - 3600, TailNextSyncAt: now - 1, BackfillDone: true}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := pricingLedgerSyncStateStale(tc.state, now, 2); got != tc.want {
+				t.Fatalf("stale=%v want %v state=%+v", got, tc.want, tc.state)
+			}
+		})
+	}
+	// With many selected accounts, the grace grows to cover two complete
+	// scheduler rounds instead of raising a false stale warning.
+	many := ChannelUpstreamPricingSyncState{Status: upstreamStatusOK, LastAttemptAt: now - 1800, TailNextSyncAt: now - 1, BackfillDone: true}
+	if pricingLedgerSyncStateStale(many, now, 20) {
+		t.Fatal("large gray cohort did not receive proportional scheduling grace")
+	}
+}
+
+func TestPricingLedgerViewExposesOverdueSchedulerState(t *testing.T) {
+	m := newChannelUpstreamTestMonitor(t)
+	m.cfg.UpstreamPricingLedgerEnabled = true
+	m.cfg.UpstreamPricingLedgerDomains = []string{"pricing.example"}
+	now := time.Now().Unix()
+	account := ChannelUpstreamAccount{
+		Domain: "pricing.example", Provider: upstreamProviderNewAPI, BaseURL: "https://pricing.example",
+		UserID: 41, Enabled: true, UsageSyncEnabled: true,
+	}
+	if err := m.storeDB.Create(&account).Error; err != nil {
+		t.Fatal(err)
+	}
+	state := ChannelUpstreamPricingSyncState{
+		Domain: "pricing.example", AccountEpoch: newAPIUpstreamAccountEpoch(account), SemanticsVersion: upstreamPricingSemanticsVersion,
+		Status: upstreamStatusOK, TailNextSyncAt: now - 1, BackfillDone: true,
+		LastAttemptAt: now - 3600, LastSuccessAt: now - 7200,
+	}
+	if err := m.storeDB.Create(&state).Error; err != nil {
+		t.Fatal(err)
+	}
+	views, err := m.loadChannelUpstreamViews(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	view := views[account.Domain]
+	if view.PricingLedgerStatus != "stale" || view.PricingTailNextSyncAt != state.TailNextSyncAt || view.PricingLastAttemptAt != state.LastAttemptAt {
+		t.Fatalf("overdue pricing state was not visible: %+v", view)
 	}
 }

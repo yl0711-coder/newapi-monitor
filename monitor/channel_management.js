@@ -604,8 +604,8 @@ async function loadEconomicsDomain(key){
 function domainCard(domain,index,total,filtered){
   const channels=domain.vendors.flatMap(v=>v.channels),enabled=channels.filter(ch=>ch.current&&+ch.status===1).length;
   const open=cm.expandedDomains.has(domain.key),share=metric(total)>0?metric(domain.usage)/metric(total)*100:0;
-  const rates=domain.rate_config||{},rateConfigured=+rates.configured_channels||0,rateEnabled=+rates.enabled_channels||0;
-  const financeLabel=rateEnabled>0&&rates.complete?`上游渠道倍率已配置 · ${rateConfigured}/${rateEnabled}`:`上游渠道倍率待配置 · ${rateConfigured}/${rateEnabled}`;
+  const rates=domain.rate_config||{},rateConfigured=+rates.configured_channels||0,rateManaged=Number.isFinite(+rates.managed_channels)?+rates.managed_channels:(+rates.enabled_channels||0);
+  const financeLabel=rateManaged>0&&rates.complete?`在用渠道倍率已配置 · ${rateConfigured}/${rateManaged}`:`在用渠道倍率待配置 · ${rateConfigured}/${rateManaged}`;
   const upstreamUsage=domain.upstream_usage||{};
   // 上游日志只按账户（归并主域名）汇总；没有可靠的远端渠道 ID 映射时，
   // 绝不能伪装成某一条本地渠道的上游账单。

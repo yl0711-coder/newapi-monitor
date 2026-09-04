@@ -1181,6 +1181,7 @@ func TestReconcileAICodeWithPublishedBackfillStatesOnlyRepairsCurrentCredentialS
 			t.Fatalf("当前 Key 历史完成状态未完整修复: %+v", state)
 		}
 	}
+	// 迁移可重入，第二次执行不应改变已闭合的状态。
 	if err := m.reconcileAICodeWithPublishedBackfillStates(); err != nil {
 		t.Fatal(err)
 	}

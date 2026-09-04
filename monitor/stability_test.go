@@ -1256,7 +1256,7 @@ func TestStabilityRetentionCutoffMatchesFinalizedCoverageBoundary(t *testing.T) 
 		t.Fatalf("retention cutoff=%s want finalized coverage boundary %s",
 			time.Unix(got, 0).In(cstLocation), time.Unix(want, 0).In(cstLocation))
 	}
-	if raw := now - 181*86400; got == raw || raw-got != 23*60+45 {
+	if raw := now - 181*86400; got == raw || raw-got != now-finalizedTo {
 		t.Fatalf("retention unexpectedly followed wall clock: cutoff=%d raw=%d", got, raw)
 	}
 	if got := stabilityRetentionCutoff(now, 0); got != 0 {

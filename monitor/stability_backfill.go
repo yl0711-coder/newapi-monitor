@@ -19,7 +19,12 @@ import (
 )
 
 const (
-	stabilityHourFinalizeDelaySec  = int64(10 * 60)
+	// NewAPI writes a request log when the request finishes but keeps the
+	// request's original created_at. Production has observed >30 minute
+	// requests, so an hour cannot be called authoritative only ten minutes
+	// after its boundary. One hour covers the observed tail plus insertion
+	// jitter; the realtime model page remains fresh through its own sampler.
+	stabilityHourFinalizeDelaySec  = int64(60 * 60)
 	maxStabilityRowsPerHour        = 10000
 	maxStabilityRowsPerRange       = 20000
 	maxStabilityBackfillAttempts   = 3
@@ -29,9 +34,10 @@ const (
 )
 
 var (
-	errStabilityBackfillDisabled = errors.New("稳定性历史补数已禁用")
-	errStabilityRangeTooLarge    = errors.New("稳定性分段结果超过安全上限")
-	errStabilityControlMismatch  = errors.New("稳定性来源控制总数不一致")
+	errStabilityBackfillDisabled  = errors.New("稳定性历史补数已禁用")
+	errStabilityRangeTooLarge     = errors.New("稳定性分段结果超过安全上限")
+	errStabilityControlMismatch   = errors.New("稳定性来源控制总数不一致")
+	errStabilityZeroContradiction = errors.New("稳定性来源零流量与本地分钟事实矛盾")
 )
 
 // StabilityHourIngestState 是长期小时汇总的完整性台账。
@@ -133,6 +139,19 @@ func stabilityRetentionCutoff(now int64, days int) int64 {
 	return cutoff
 }
 
+// stabilityCompleteHourPredicateSQL keeps a signed zero-traffic hour from
+// hiding a source-cutover gap. A positive current-version minute aggregate is
+// durable evidence that the same logs hour was not empty. It is deliberately
+// only a one-way contradiction check: absence of minute rows is not proof of
+// zero traffic because minute retention is shorter than stability retention.
+func stabilityCompleteHourPredicateSQL(alias string) string {
+	return alias + `.status = 'complete' AND ` + alias + `.traffic_class_version = ? AND NOT (` +
+		alias + `.requests = 0 AND EXISTS (` +
+		`SELECT 1 FROM metric_samples ms WHERE ms.bucket_ts >= ` + alias + `.hour_ts ` +
+		`AND ms.bucket_ts < ` + alias + `.hour_ts + 3600 AND ms.traffic_class_version = ? ` +
+		`AND (ms.success + ms.anomaly + ms.failed) > 0))`
+}
+
 func (m *Monitor) stabilityDataCoverage(ctx context.Context, fromTs, toTs, now int64) StabilityDataCoverage {
 	fromTs = fromTs / 3600 * 3600
 	finalizedTo := finalizedStabilityHourTo(now)
@@ -150,9 +169,10 @@ func (m *Monitor) stabilityDataCoverage(ctx context.Context, fromTs, toTs, now i
 	}
 	result.ExpectedHours = (toTs - fromTs) / 3600
 	var count int64
-	if tx := m.storeDB.WithContext(ctx).Model(&StabilityHourIngestState{}).
-		Where("hour_ts >= ? AND hour_ts < ? AND status = ? AND traffic_class_version = ?",
-			fromTs, toTs, "complete", userTrafficClassificationVersion).Count(&count); tx.Error != nil {
+	strictSQL := `SELECT COUNT(*) FROM stability_hour_ingest_states hs WHERE hs.hour_ts >= ? AND hs.hour_ts < ? AND ` +
+		stabilityCompleteHourPredicateSQL("hs")
+	if tx := m.storeDB.WithContext(ctx).Raw(strictSQL, fromTs, toTs,
+		userTrafficClassificationVersion, userTrafficClassificationVersion).Scan(&count); tx.Error != nil {
 		slog.Warn("读取稳定性小时覆盖台账失败", "err", tx.Error)
 		return result
 	}
@@ -177,14 +197,16 @@ func (m *Monitor) stabilityDataCoverage(ctx context.Context, fromTs, toTs, now i
 		COUNT(DISTINCT CASE WHEN COALESCE(hs.traffic_class_version,0) <> ? THEN hs.hour_ts END) AS legacy_hours
 	FROM stability_hour_ingest_states hs
 	WHERE hs.hour_ts >= ? AND hs.hour_ts < ? AND hs.status = 'complete'
-		AND (hs.traffic_class_version = ? OR (
+		AND ((hs.traffic_class_version = ? AND NOT (hs.requests = 0 AND EXISTS (
+			SELECT 1 FROM metric_samples ms WHERE ms.bucket_ts >= hs.hour_ts AND ms.bucket_ts < hs.hour_ts + 3600
+				AND ms.traffic_class_version = ? AND (ms.success + ms.anomaly + ms.failed) > 0))) OR (
 			COALESCE(hs.traffic_class_version,0) <> ?
 			AND NOT EXISTS (SELECT 1 FROM stability_hour_ingest_states v5hs
-				WHERE v5hs.hour_ts = hs.hour_ts AND v5hs.status = 'complete' AND v5hs.traffic_class_version = ?)
+				WHERE v5hs.hour_ts = hs.hour_ts AND ` + stabilityCompleteHourPredicateSQL("v5hs") + `)
 		))`
 	v := userTrafficClassificationVersion
 	if tx := m.storeDB.WithContext(ctx).Raw(effectiveSQL,
-		v, fromTs, toTs, v, v, v).Scan(&effective); tx.Error != nil {
+		v, fromTs, toTs, v, v, v, v, v).Scan(&effective); tx.Error != nil {
 		slog.Warn("读取稳定性兼容覆盖失败", "err", tx.Error)
 	} else {
 		result.EffectiveHours = effective.Hours
@@ -602,6 +624,17 @@ func (m *Monitor) replaceStabilityHourTraffic(hourTs int64, rows []StabilityHour
 		rows[i].TrafficClassVersion = userTrafficClassificationVersion
 	}
 	return m.storeDB.Transaction(func(tx *gorm.DB) error {
+		if expectedRequests == 0 {
+			var minuteRequests int64
+			if err := tx.Raw(`SELECT COALESCE(SUM(success+anomaly+failed),0) FROM metric_samples
+				WHERE bucket_ts >= ? AND bucket_ts < ? AND traffic_class_version = ?`,
+				hourTs, hourTs+3600, userTrafficClassificationVersion).Scan(&minuteRequests).Error; err != nil {
+				return err
+			}
+			if minuteRequests > 0 {
+				return fmt.Errorf("%w: hour=%d minute_requests=%d", errStabilityZeroContradiction, hourTs, minuteRequests)
+			}
+		}
 		if err := tx.Where("hour_ts = ?", hourTs).Delete(&StabilityHourSample{}).Error; err != nil {
 			return err
 		}
@@ -1089,9 +1122,10 @@ func (m *Monitor) runStabilityBackfillWithFetcher(ctx context.Context, jobID str
 
 func (m *Monitor) completeStabilityHours(fromTs, toTs int64) (map[int64]bool, error) {
 	var hours []int64
-	if err := m.storeDB.Model(&StabilityHourIngestState{}).
-		Where("hour_ts >= ? AND hour_ts < ? AND status = ? AND traffic_class_version = ?",
-			fromTs, toTs, "complete", userTrafficClassificationVersion).Pluck("hour_ts", &hours).Error; err != nil {
+	query := `SELECT hs.hour_ts FROM stability_hour_ingest_states hs
+		WHERE hs.hour_ts >= ? AND hs.hour_ts < ? AND ` + stabilityCompleteHourPredicateSQL("hs")
+	if err := m.storeDB.Raw(query, fromTs, toTs,
+		userTrafficClassificationVersion, userTrafficClassificationVersion).Scan(&hours).Error; err != nil {
 		return nil, err
 	}
 	known := make(map[int64]bool, len(hours))
@@ -1260,18 +1294,12 @@ func (m *Monitor) repairOneStabilityHour(ctx context.Context) {
 	retention := m.cfg.stabilityStorageDays()
 	to := finalizedStabilityHourTo(time.Now().Unix())
 	from := to - int64(retention)*86400
-	var complete []int64
-	if err := m.storeDB.Model(&StabilityHourIngestState{}).
-		Where("hour_ts >= ? AND hour_ts < ? AND status = ? AND traffic_class_version = ?",
-			from, to, "complete", userTrafficClassificationVersion).Pluck("hour_ts", &complete).Error; err != nil {
+	complete, err := m.completeStabilityHours(from, to)
+	if err != nil {
 		return
 	}
-	known := make(map[int64]bool, len(complete))
-	for _, hour := range complete {
-		known[hour] = true
-	}
 	for hour := to - 3600; hour >= from; hour -= 3600 {
-		if known[hour] {
+		if complete[hour] {
 			continue
 		}
 		if err := m.backfillOneStabilityHour(ctx, hour, "auto-repair"); err != nil {

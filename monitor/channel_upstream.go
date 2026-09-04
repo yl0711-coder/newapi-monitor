@@ -95,6 +95,10 @@ type ChannelUpstreamAccount struct {
 	// stats endpoint; remembering the fallback prevents probing a missing route
 	// on every low-frequency sync.
 	UsageAdapter string `gorm:"size:32;column:usage_adapter"`
+	// UsageTailMode is a durable scheduling strategy, not provider capability.
+	// Empty keeps the one-window low-request path; "hourly" is learned only
+	// after this account exhausts a bounded NewAPI tail request budget.
+	UsageTailMode string `gorm:"size:16;column:usage_tail_mode"`
 	// 当天尾部刷新与历史回填分别退避。历史某一天异常不能拖慢当天数据，
 	// 也不能在每次尾部刷新时无节制重试同一个高流量窗口。
 	UsageBackfillLastAttemptAt    int64  `gorm:"column:usage_backfill_last_attempt_at"`
@@ -269,6 +273,7 @@ type ChannelUpstreamAccountView struct {
 	UsageBackfillCursor           int64                             `json:"usage_backfill_cursor,omitempty"`
 	UsageAdapter                  string                            `json:"usage_adapter,omitempty"`
 	UsageAdapterName              string                            `json:"usage_adapter_name,omitempty"`
+	UsageTailMode                 string                            `json:"usage_tail_mode,omitempty"`
 	UsageGranularity              string                            `json:"usage_granularity,omitempty"`
 	PricingLedgerWorkerEnabled    bool                              `json:"pricing_ledger_worker_enabled"`
 	PricingLedgerEligible         bool                              `json:"pricing_ledger_eligible"`
@@ -280,6 +285,8 @@ type ChannelUpstreamAccountView struct {
 	PricingBackfillTargetHour     int64                             `json:"pricing_backfill_target_hour,omitempty"`
 	PricingBackfillTotalHours     int64                             `json:"pricing_backfill_total_hours,omitempty"`
 	PricingBackfillDone           bool                              `json:"pricing_backfill_done,omitempty"`
+	PricingTailNextSyncAt         int64                             `json:"pricing_tail_next_sync_at,omitempty"`
+	PricingBackfillNextSyncAt     int64                             `json:"pricing_backfill_next_sync_at,omitempty"`
 	PricingLastAttemptAt          int64                             `json:"pricing_last_attempt_at,omitempty"`
 	PricingLastSuccessAt          int64                             `json:"pricing_last_success_at,omitempty"`
 	PricingLastError              string                            `json:"pricing_last_error,omitempty"`
@@ -987,6 +994,7 @@ func upstreamAccountView(row ChannelUpstreamAccount) ChannelUpstreamAccountView 
 		UsageBackfillCursor:           row.UsageBackfillCursor,
 		UsageAdapter:                  row.UsageAdapter,
 		UsageAdapterName:              upstreamUsageAdapterName(row.Provider, row.UsageAdapter),
+		UsageTailMode:                 row.UsageTailMode,
 		UsageGranularity:              upstreamUsageGranularity(row.Provider, row.UsageAdapter),
 		UsageConsecutiveFails:         row.UsageConsecutiveFails,
 		UsageBackfillLastSuccessAt:    row.UsageBackfillLastSuccessAt,
@@ -1139,6 +1147,7 @@ func (m *Monitor) loadChannelUpstreamViews(ctx context.Context) (map[string]Chan
 		errorLogStateByDomain[state.Domain] = state
 	}
 	out := make(map[string]ChannelUpstreamAccountView, len(rows))
+	now := time.Now().Unix()
 	for _, row := range rows {
 		view := m.channelUpstreamAccountView(row)
 		// Key names and per-key checkpoints are local, non-secret operational
@@ -1161,6 +1170,9 @@ func (m *Monitor) loadChannelUpstreamViews(ctx context.Context) (map[string]Chan
 			view.PricingLedgerStatus = upstreamStatusPending
 		default:
 			view.PricingLedgerStatus = state.Status
+			if pricingLedgerSyncStateStale(state, now, len(m.cfg.UpstreamPricingLedgerDomains)) {
+				view.PricingLedgerStatus = "stale"
+			}
 		}
 		if hasState {
 			view.PricingTailThroughHour = state.TailThroughHour
@@ -1171,6 +1183,8 @@ func (m *Monitor) loadChannelUpstreamViews(ctx context.Context) (map[string]Chan
 				view.PricingBackfillTotalHours = (state.BackfillTargetHour - state.BackfillStartHour) / 3600
 			}
 			view.PricingBackfillDone = state.BackfillDone
+			view.PricingTailNextSyncAt = state.TailNextSyncAt
+			view.PricingBackfillNextSyncAt = state.BackfillNextSyncAt
 			view.PricingLastAttemptAt = state.LastAttemptAt
 			view.PricingLastSuccessAt = state.LastSuccessAt
 			view.PricingLastError = state.LastError
@@ -2057,6 +2071,21 @@ func nextUpstreamSyncAt(s Settings, domain string, now int64, failures int) int6
 	return now + base + jitter
 }
 
+func upstreamBalanceFailureRetryAt(s Settings, domain string, now int64, failures int, err error) int64 {
+	// 明确的上游限流优先服从 Retry-After；没有返回该头时沿用普通退避，
+	// 避免在对方已经限流时主动加压。
+	if retryAt := upstreamRetryAt(err); retryAt > now {
+		return retryAt
+	}
+	if isUpstreamUsageLocalStoreBusy(err) {
+		return now + int64(upstreamUsageRetryDelay(upstreamUsageLocalStoreRetryDelays[:], failures)/time.Second)
+	}
+	if isUpstreamUsageTransientFailure(err) {
+		return now + int64(upstreamUsageRetryDelay(upstreamUsageTransientRetryDelays[:], failures)/time.Second)
+	}
+	return nextUpstreamSyncAt(s, domain, now, failures)
+}
+
 func applyUpstreamSyncResult(row *ChannelUpstreamAccount, result upstreamBalanceResult, err error, now int64, s Settings, secrets ...string) {
 	row.LastAttemptAt = now
 	if err == nil {
@@ -2080,10 +2109,7 @@ func applyUpstreamSyncResult(row *ChannelUpstreamAccount, result upstreamBalance
 		row.NextSyncAt = upstreamAccountIsolatedUntil
 	} else {
 		row.Status = upstreamStatusError
-		row.NextSyncAt = nextUpstreamSyncAt(s, row.Domain, now, row.ConsecutiveFails)
-	}
-	if retryAt := upstreamRetryAt(err); retryAt > row.NextSyncAt {
-		row.NextSyncAt = retryAt
+		row.NextSyncAt = upstreamBalanceFailureRetryAt(s, row.Domain, now, row.ConsecutiveFails, err)
 	}
 }
 
@@ -2620,7 +2646,7 @@ func (m *Monitor) saveChannelUpstreamHandler(c *gin.Context) {
 		row.UsageStatus, row.UsageLastError = existing.UsageStatus, existing.UsageLastError
 		row.UsageLastAttemptAt, row.UsageLastSuccessAt = existing.UsageLastAttemptAt, existing.UsageLastSuccessAt
 		row.UsageNextSyncAt, row.UsageBackfillCursor, row.UsageBackfillDone, row.UsageDataUntil = existing.UsageNextSyncAt, existing.UsageBackfillCursor, existing.UsageBackfillDone, existing.UsageDataUntil
-		row.UsageAdapter = existing.UsageAdapter
+		row.UsageAdapter, row.UsageTailMode = existing.UsageAdapter, existing.UsageTailMode
 		row.UsageConsecutiveFails = existing.UsageConsecutiveFails
 		row.UsageBackfillLastAttemptAt, row.UsageBackfillLastSuccessAt = existing.UsageBackfillLastAttemptAt, existing.UsageBackfillLastSuccessAt
 		row.UsageBackfillNextSyncAt, row.UsageBackfillConsecutiveFails = existing.UsageBackfillNextSyncAt, existing.UsageBackfillConsecutiveFails

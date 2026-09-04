@@ -65,6 +65,10 @@ type Monitor struct {
 	nginxSourceV2RuntimeConfigOK atomic.Bool
 
 	lastRun                   atomic.Int64 // 采样心跳:最近一次成功采样的 Unix 秒(0=从未)
+	metricFinalizeThrough     atomic.Int64 // 模型/token 迟到日志已定稿到的右水位
+	metricFinalizeTarget      atomic.Int64 // 当前延迟定稿目标水位
+	metricFinalizeLastSuccess atomic.Int64
+	metricFinalizeLastFailure atomic.Int64
 	problemLastSuccess        atomic.Int64 // 原始错误采集器最近一次成功执行
 	problemLastFailure        atomic.Int64 // 原始错误采集器最近一次失败
 	problemLiveThrough        atomic.Int64 // 原始错误实时 lane 已确认到的分钟右水位

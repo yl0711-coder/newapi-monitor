@@ -1,8 +1,11 @@
 package monitor
 
-import "strings"
-
-import "testing"
+import (
+	"context"
+	"errors"
+	"strings"
+	"testing"
+)
 
 // TestExpandAnomalyPredicates 守住三件事:
 //  1. 占位符全部被展开(SQL 里不留 {{}},否则打到生产库直接语法错);
@@ -87,6 +90,98 @@ func TestSourceEpochStartupLookbackIsDurablyBounded(t *testing.T) {
 	}
 	if got := boundedSourceEpochStartupLookback(0, now, 0); got != 0 {
 		t.Fatalf("disabled startup catchup=%ds", got)
+	}
+}
+
+func TestMetricFinalizeCursorRetriesBothProjectionsWithoutSkipping(t *testing.T) {
+	path := t.TempDir() + "/metric-finalize.db"
+	m := &Monitor{cfg: Settings{SessionSecret: "metric-finalize-test"}, chNames: map[string]string{}}
+	if err := m.openStore(path); err != nil {
+		t.Fatal(err)
+	}
+	now := int64(2_000_000)
+	target := metricFinalizeTarget(now)
+	wantStart := (target - metricFinalizeInitialOverlapSec) / 60 * 60
+	metricCalls, tokenCalls := 0, 0
+	metric := func(_ context.Context, from, to int64) (int, error) {
+		metricCalls++
+		if metricCalls == 1 {
+			return 0, errors.New("temporary metric source failure")
+		}
+		if from != wantStart || to != wantStart+metricFinalizeSliceSec {
+			t.Fatalf("metric slice=[%d,%d) want=[%d,%d)", from, to, wantStart, wantStart+metricFinalizeSliceSec)
+		}
+		return 1, m.upsertSamples([]MetricSample{{
+			BucketTs: from, ChannelID: 7, ModelName: "late-model", Grp: "late-group", Success: 1,
+		}})
+	}
+	token := func(_ context.Context, from, to int64) error {
+		tokenCalls++
+		if tokenCalls == 1 {
+			return errors.New("temporary token source failure")
+		}
+		return m.upsertTokenSamples([]TokenSample{{BucketTs: from, TokenName: "late-token", Success: 1}})
+	}
+
+	if err := m.runMetricFinalizeTurnWith(context.Background(), now, metric, token); err == nil {
+		t.Fatal("metric failure unexpectedly succeeded")
+	}
+	var state MetricFinalizeState
+	if err := m.storeDB.First(&state, "id = ?", 1).Error; err != nil {
+		t.Fatal(err)
+	}
+	if state.NextTs != wantStart || state.Attempts != 1 || state.NextRetryAt <= now {
+		t.Fatalf("metric failure advanced or lost retry state: %+v", state)
+	}
+	if err := m.runMetricFinalizeTurnWith(context.Background(), state.NextRetryAt-1, metric, token); err != nil {
+		t.Fatal(err)
+	}
+	if metricCalls != 1 || tokenCalls != 0 {
+		t.Fatalf("backoff still contacted source: metric=%d token=%d", metricCalls, tokenCalls)
+	}
+
+	if err := m.runMetricFinalizeTurnWith(context.Background(), state.NextRetryAt, metric, token); err == nil {
+		t.Fatal("token failure unexpectedly succeeded")
+	}
+	if err := m.storeDB.First(&state, "id = ?", 1).Error; err != nil {
+		t.Fatal(err)
+	}
+	if state.NextTs != wantStart || state.Attempts != 2 {
+		t.Fatalf("partial metric write advanced cursor: %+v", state)
+	}
+	var partialMetric int64
+	if err := m.storeDB.Model(&MetricSample{}).Where("bucket_ts = ?", wantStart).Count(&partialMetric).Error; err != nil || partialMetric != 1 {
+		t.Fatalf("expected replayable partial metric write, count=%d err=%v", partialMetric, err)
+	}
+
+	if err := m.runMetricFinalizeTurnWith(context.Background(), state.NextRetryAt, metric, token); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.storeDB.First(&state, "id = ?", 1).Error; err != nil {
+		t.Fatal(err)
+	}
+	if state.NextTs != wantStart+metricFinalizeSliceSec || state.Attempts != 0 || state.LastSuccessAt == 0 {
+		t.Fatalf("successful dual projection did not advance exactly one slice: %+v", state)
+	}
+	var tokenRows int64
+	if err := m.storeDB.Model(&TokenSample{}).Where("bucket_ts = ?", wantStart).Count(&tokenRows).Error; err != nil || tokenRows != 1 {
+		t.Fatalf("token projection missing after commit, count=%d err=%v", tokenRows, err)
+	}
+
+	// A new Monitor instance must resume the persisted remainder instead of
+	// reinitializing at wall-clock time and skipping it.
+	m2 := &Monitor{cfg: Settings{SessionSecret: "metric-finalize-restart"}, chNames: map[string]string{}}
+	if err := m2.openStore(path); err != nil {
+		t.Fatal(err)
+	}
+	var resumedFrom int64
+	if err := m2.runMetricFinalizeTurnWith(context.Background(), now,
+		func(_ context.Context, from, _ int64) (int, error) { resumedFrom = from; return 0, nil },
+		func(context.Context, int64, int64) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if resumedFrom != wantStart+metricFinalizeSliceSec {
+		t.Fatalf("restart resumed at %d want %d", resumedFrom, wantStart+metricFinalizeSliceSec)
 	}
 }
 

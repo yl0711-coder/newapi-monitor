@@ -44,7 +44,7 @@ load_readonly_dsn() {
   dsn_value="$(awk 'index($0, "NEWAPI_LOG_DSN=") == 1 {sub(/^NEWAPI_LOG_DSN=/, ""); sub(/\r$/, ""); print; exit}' "$acceptance_env_file")"
   [[ -n "$dsn_value" ]] || fail "NEWAPI_LOG_DSN is missing from the local acceptance env"
   # 完整校验还会由 tunnel_runner 执行；这里只再做一层失效关闭。
-  [[ "${dsn_value%%:*}" == "nexus_ro" ]] || fail "database user must be nexus_ro"
+  [[ "${dsn_value%%:*}" == "monitor_ro" ]] || fail "database user must be monitor_ro"
   print -r -- "$dsn_value"
 }
 

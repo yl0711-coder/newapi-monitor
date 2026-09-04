@@ -805,7 +805,7 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
   </div>
 
   <!-- 4. 实例 -->
-  <div class="card"><div class="card-header">🖥 实例 <span class="muted" style="font-weight:400">· CPU/突发额度来自 AWS;内存/磁盘/load/容器需主机 agent</span></div><div class="monitor-table-scroll monitor-table-server"><table><thead id="thInst"></thead><tbody id="tbInst"></tbody></table></div></div>
+  <div class="card"><div class="card-header">🖥 实例与服务 <span class="muted" style="font-weight:400">· Lightsail 主机细节来自 agent；ECS/Fargate 服务状态与 CPU/内存来自 AWS，无需容器内 agent</span></div><div class="monitor-table-scroll monitor-table-server"><table><thead id="thInst"></thead><tbody id="tbInst"></tbody></table></div></div>
 
   <!-- 5. 负载均衡 -->
   <div class="card"><div class="card-header">⚖️ 负载均衡</div><div id="lbBody" style="padding:16px 20px"><span class="muted">加载中…</span></div></div>
@@ -1665,9 +1665,11 @@ function renderInfra(s){
   renderProbes(s);
   renderLocks(s);
   renderInfraAlerts(s);
-  const db=s.database, dbBody=document.getElementById('dbBody'), dbCharts=document.getElementById('dbCharts');
-  if(!db){dbBody.innerHTML='<span class="muted">无数据库数据</span>';dbCharts.innerHTML='';}
+  const databases=(s.databases&&s.databases.length)?s.databases:(s.database?[s.database]:[]), dbBody=document.getElementById('dbBody'), dbCharts=document.getElementById('dbCharts');
+  if(!databases.length){dbBody.innerHTML='<span class="muted">无数据库数据</span>';dbCharts.innerHTML='';}
   else{
+    dbBody.innerHTML='';dbCharts.innerHTML='';
+    databases.forEach((db,idx)=>{
     const me=db.metrics||{};
     // 内存%:用「已用 = 总 - 可用」展示用量,可用率上色
     const memAvailPct=me.mem_avail_pct, memTotal=me.mem_total_mb;
@@ -1679,14 +1681,16 @@ function renderInfra(s){
     const stUsed=(dTotal!=null&&me.free_storage_gb!=null)?(dTotal-me.free_storage_gb):null;
     const stUsedPct=stAvailPct!=null?100-stAvailPct:null;
     const stHtml=stUsed!=null?usageHtml(stUsed,dTotal,stUsedPct,'GB',colAvail(stAvailPct)):`<b style="${colAvail(stAvailPct)}">${fx(me.free_storage_gb,1)} GB 可用</b>`;
-    dbBody.innerHTML=`<div style="margin-bottom:8px">${infraBadge(db.status)} <b>${esc(db.name)}</b> <span class="muted">${fmtAge(db.age_sec)}</span></div>`
+    dbBody.insertAdjacentHTML('beforeend',`<div style="${idx?'border-top:1px solid #2b3040;padding-top:14px;margin-top:14px;':''}"><div style="margin-bottom:8px">${infraBadge(db.status)} <b>${esc(db.display_name||db.name)}</b> <span class="muted">· ${esc(db.group||'其他资源')} · ${esc(db.platform||'AWS')} · ${fmtAge(db.age_sec)}</span></div>`
       +kv('内存(已用/总)',memHtml)
       +kv('存储(已用/总)',stHtml)
       +kv('CPU',`<span style="${colUsed(me.cpu,infraCpuWarn,infraCpuBad)}">${fx(me.cpu,1)}%</span>`)
       +kv('连接数',fx(me.connections))
       +kv('磁盘队列',fx(me.disk_queue,2))
-      +kv('Swap 使用',`${fx(me.swap_mb)} MB`);
-    renderResCharts(dbCharts, db, 'mem'); // DB 图表区:默认内存组(可用内存+Swap),下拉切算力/存储
+      +kv('Swap 使用',`${fx(me.swap_mb)} MB`)+'</div>');
+    const chartHost=document.createElement('div');chartHost.style.cssText=idx?'border-top:1px solid #2b3040;padding-top:14px;margin-top:14px':'';dbCharts.appendChild(chartHost);
+    renderResCharts(chartHost, db, 'mem'); // 每个 DB 独立图表区，避免多个数据库互相覆盖
+    });
   }
   const insts=s.instances||[];
   document.getElementById('thInst').innerHTML='<tr><th></th><th>实例</th><th>状态</th><th>CPU</th><th>突发额度</th><th>内存(已用/总)</th><th>磁盘</th><th>load</th><th>容器</th><th>网络出</th><th>新鲜度</th></tr>';
@@ -1703,6 +1707,8 @@ function renderInfra(s){
       const usedPct=me.mem_used_pct, availPct=usedPct!=null?100-usedPct:null;
       memHtml=usageHtml(used!=null?used:me.mem_avail_mb,total,usedPct,'MB',colAvail(availPct));
       if(used==null)memHtml=`<b style="${colAvail(availPct)}">${fx(me.mem_avail_mb)} MB 可用</b>`;
+    }else if(me.mem_used_pct!=null){
+      memHtml=`<b style="${colUsed(me.mem_used_pct)}">${fx(me.mem_used_pct,1)}% 已用</b>`;
     }
     const diskHtml=me.disk_used_pct!=null?`<span style="${colUsed(me.disk_used_pct,100-infraStorageWarn,100-infraStorageBad)}">${fx(me.disk_used_pct)}%</span>`:PLACEHOLDER;
     const loadHtml=me.load1!=null?`<b>${fx(me.load1,2)}</b>`:PLACEHOLDER;
@@ -1711,8 +1717,9 @@ function renderInfra(s){
     if(me.containers_total!=null){const up=me.containers_up!=null?me.containers_up:0,tot=me.containers_total;contHtml=`<span style="${up<tot?'color:var(--red)':'color:var(--green)'}">${fx(up)}/${fx(tot)}</span>`;}
     const open=instExpanded.has(r.name);
     const caret=`<span style="display:inline-block;width:14px;color:#888;transition:transform .15s;${open?'transform:rotate(90deg)':''}">▶</span>`;
-    return `<tr class="inst-row" data-name="${esc(r.name)}" style="cursor:pointer">`
-      +`<td>${caret}</td><td><b>${esc(r.name)}</b></td><td>${infraBadge(r.status)}</td><td>${cpuHtml}</td><td>${burstHtml}</td><td>${memHtml}</td><td>${diskHtml}</td><td>${loadHtml}</td><td>${contHtml}</td><td>${fx(me.net_out_kb)} KB/s</td><td class="muted">${fmtAge(r.age_sec)}</td></tr>`
+    const groupHeader=idx===0||insts[idx-1].group!==r.group?`<tr><td colspan="11" style="background:#171b25;padding:9px 14px;color:#aeb8d0"><b>${esc(r.group||'其他资源')}</b></td></tr>`:'';
+    return groupHeader+`<tr class="inst-row" data-name="${esc(r.name)}" style="cursor:pointer">`
+      +`<td>${caret}</td><td><b>${esc(r.display_name||r.name)}</b><div class="muted" style="font-size:11px">${esc(r.platform||'Lightsail')}</div></td><td>${infraBadge(r.status)}</td><td>${cpuHtml}</td><td>${burstHtml}</td><td>${memHtml}</td><td>${diskHtml}</td><td>${loadHtml}</td><td>${contHtml}</td><td>${me.net_out_kb!=null?fx(me.net_out_kb)+' KB/s':PLACEHOLDER}</td><td class="muted">${fmtAge(r.age_sec)}</td></tr>`
       +`<tr class="inst-exp" data-name="${esc(r.name)}"${open?'':' style="display:none"'}><td colspan="11" style="background:#15171c;padding:8px 20px 14px"><div class="inst-zone"></div></td></tr>`;
   }).join('');
     // 绑定点击展开 + 还原已展开行的图
@@ -1728,12 +1735,12 @@ function renderInfra(s){
       if(instExpanded.has(r.name))renderResCharts(exp.querySelector('.inst-zone'),r,'compute'); // 刷新后重绘已展开
     });
   }
-  const lb=s.lb, lbBody=document.getElementById('lbBody');
-  if(!lb){lbBody.innerHTML='<span class="muted">无负载均衡数据</span>';}
-  else{const me=lb.metrics||{};
-    lbBody.innerHTML=`<div style="margin-bottom:8px">${infraBadge(lb.status)} <b>${esc(lb.name)}</b> <span class="muted">${fmtAge(lb.age_sec)}</span></div>`
-      +kv('健康节点',fx(me.healthy))+kv('不健康节点',fx(me.unhealthy))+kv('5xx(5min)',fx(me.err_5xx))+kv('响应时间',fx(me.resp_ms)+' ms');
-  }
+  const lbs=(s.load_balancers&&s.load_balancers.length)?s.load_balancers:(s.lb?[s.lb]:[]), lbBody=document.getElementById('lbBody');
+  if(!lbs.length){lbBody.innerHTML='<span class="muted">无负载均衡数据</span>';}
+  else{lbBody.innerHTML=lbs.map((lb,idx)=>{const me=lb.metrics||{};
+    return `<div style="${idx?'border-top:1px solid #2b3040;padding-top:14px;margin-top:14px;':''}"><div style="margin-bottom:8px">${infraBadge(lb.status)} <b>${esc(lb.display_name||lb.name)}</b> <span class="muted">· ${esc(lb.group||'其他资源')} · ${esc(lb.platform||'AWS')} · ${fmtAge(lb.age_sec)}</span></div>`
+      +kv('健康节点',fx(me.healthy))+kv('不健康节点',fx(me.unhealthy))+kv('5xx(5min)',fx(me.err_5xx))+kv('响应时间',me.resp_ms!=null?fx(me.resp_ms)+' ms':'—')+'</div>';
+  }).join('');}
 }
 async function loadInfra(){
   try{
@@ -1794,12 +1801,15 @@ async function syncFetchJSON(path,signal){
   return data;
 }
 function syncRenderRuntime(ready,stores){
-  const source=ready.source||{},disk=ready.facts_disk||{};
+  const source=ready.source||{},disk=ready.facts_disk||{},finalize=ready.metric_finalize||{},degraded=ready.degraded_reasons||[];
   const sourceLevel=source.worker_enabled&&source.state!=='ready'?'bad':(source.worker_enabled&&!source.lease_held?'warn':'ok');
+  const finalizeLevel=degraded.some(x=>String(x).indexOf('metric_finalize_')===0)?'warn':'ok';
   const main=stores.store||{},facts=stores.facts_store||{};
   document.getElementById('syncRuntime').innerHTML=[
     syncKV('来源状态',source.worker_enabled?`${source.state||'未知'}${source.lease_held?' · 已持租约':''}`:'本机只读/未启用',source.last_failure_at?`最近失败：${syncTime(source.last_failure_at)}`:''),
     syncKV('来源最近成功',syncTime(source.last_success_at),source.failure_streak?`连续失败 ${source.failure_streak} 次`:'全局来源读取水位'),
+    syncKV('模型/令牌定稿',finalize.through_ts?syncTime(finalize.through_ts):'等待首次定稿',finalize.target_ts?`目标 ${syncTime(finalize.target_ts)}`:'来源 worker 启动后建立水位'),
+    syncKV('定稿最近成功',syncTime(finalize.last_success_at),finalize.last_failure_at?`最近失败：${syncTime(finalize.last_failure_at)}`:'长请求迟到日志补全'),
     syncKV('主库完整性',main.integrity_ok?'通过':'未通过',main.integrity_checked_at?`检查于 ${syncTime(main.integrity_checked_at)}`:''),
     syncKV('事实库完整性',facts.integrity_ok?'通过':'未通过',facts.integrity_checked_at?`检查于 ${syncTime(facts.integrity_checked_at)}`:''),
     syncKV('成套备份',main.backup_set_verified?'已验证':'未验证',main.backup_set_success_at?`最近成功：${syncTime(main.backup_set_success_at)}`:''),
@@ -1807,7 +1817,7 @@ function syncRenderRuntime(ready,stores){
     syncKV('事实盘水位',`${disk.pressure||'未知'} · ${(+disk.used_percent||0).toFixed(1)}%`,disk.free_bytes?`可用 ${fmtNum(disk.free_bytes)} B`:''),
     syncKV('本地就绪',ready.status||'未知',(ready.degraded_reasons||[]).join('、')||'无降级原因')
   ].join('');
-  return sourceLevel;
+  return sourceLevel==='bad'?'bad':(sourceLevel==='warn'||finalizeLevel==='warn'?'warn':'ok');
 }
 function syncUsageMemberRows(members){
   return (members||[]).map(x=>{const span=+x.raw_page_span_hours||1;const preferred=+x.raw_page_preferred_span_hours||1;const live=`实时 ${esc(x.live_status||'pending')} · 延迟 ${usageFactsDuration(x.live_lag_seconds||0)}<br>近7天 ${esc(x.recent_status||'pending')} · 缺口 ${usageFactsDuration(x.recent_lag_seconds||0)}`;const page=x.raw_page_hour?`${syncTime(x.raw_page_hour)}${span>1?' → '+syncTime(x.raw_page_through):''}<br><span class="muted">${esc(x.raw_page_status||'—')} · 当前 ${span}h / 下个 ${preferred}h · ${fmtNum(x.raw_page_pages)} 页 / ${fmtNum(x.raw_page_source_rows)} 条<br>${live}</span>`:`<span class="muted">尚无分页水位<br>${live}</span>`;const service=x.service_ready?`可用 · ${syncTime(x.published_from_hour)}起`:'建立近期窗口';const actions=usageHistoryRetryHTML(x.user_id,x.job_id,x.job_status)+usageHistoryRepairHTML(x.user_id,x.published);return `<tr><td>#${+x.user_id}</td><td>${esc(service)}</td><td>${esc(usageFactsStageLabel(x.stage))} · ${esc(x.job_status||'—')}</td><td>${(+x.coverage_percent||0).toFixed(1)}%</td><td>${page}</td><td>${esc(x.verification_status||'—')}</td><td>${x.recent_next_retry_at?syncTime(x.recent_next_retry_at):(x.live_next_retry_at?syncTime(x.live_next_retry_at):(x.next_retry_at?syncTime(x.next_retry_at):'—'))}</td><td class="history-error">${x.recent_last_error?esc(x.recent_last_error)+'<br>':''}${x.live_last_error?esc(x.live_last_error)+'<br>':''}${x.raw_page_last_error?esc(x.raw_page_last_error)+'<br>':''}${x.last_error?esc(x.last_error):(x.service_ready?'历史继续后台扩展':'待签收')}</td><td>${actions||'—'}</td></tr>`}).join('');
@@ -1902,14 +1912,14 @@ function syncRenderChannels(report){
   };
   let level='ok',enabledAccounts=0,balanceHealthy=0,usageEnabled=0,usageHealthy=0,historyComplete=0,historyRetry=0;
   const cards=domains.map(x=>{
-    const u=x.upstream||{},balance=statusInfo(u.status,u.enabled),usage=u.usage_sync_enabled?statusInfo(u.usage_tail_phase||u.usage_effective_status||u.usage_status,u.enabled):{label:'未开启',level:'neutral'},history=u.usage_sync_enabled?statusInfo(u.usage_history_phase,u.enabled):{label:'未开启',level:'neutral'},errorLog=statusInfo(u.error_log_status,u.enabled);
+    const u=x.upstream||{},balance=statusInfo(u.status,u.enabled),usage=u.usage_sync_enabled?statusInfo(u.usage_tail_phase||u.usage_effective_status||u.usage_status,u.enabled):{label:'未开启',level:'neutral'},history=u.usage_sync_enabled?statusInfo(u.usage_history_phase,u.enabled):{label:'未开启',level:'neutral'},pricingStatus=statusInfo(u.pricing_ledger_status,u.enabled),errorLog=statusInfo(u.error_log_status,u.enabled);
     if(u.enabled){enabledAccounts++;if(balance.level==='ok')balanceHealthy++}
     if(u.enabled&&u.usage_sync_enabled&&u.usage_worker_enabled){usageEnabled++;if(usage.level==='ok')usageHealthy++;if(history.level==='ok')historyComplete++;if(u.usage_history_phase==='retry')historyRetry++}
     let accountLevel='ok';
-    if(u.enabled&&(balance.level==='bad'||(u.usage_sync_enabled&&u.usage_worker_enabled&&(usage.level==='bad'||history.level==='bad'))||(u.error_log_worker_enabled&&u.error_log_selected&&errorLog.level==='bad')))accountLevel='bad';
-    else if(u.enabled&&(balance.level==='warn'||(u.usage_sync_enabled&&u.usage_worker_enabled&&(usage.level==='warn'||history.level==='warn'))||(u.error_log_worker_enabled&&u.error_log_selected&&errorLog.level==='warn')))accountLevel='warn';
+    if(u.enabled&&(balance.level==='bad'||(u.usage_sync_enabled&&u.usage_worker_enabled&&(usage.level==='bad'||history.level==='bad'))||(u.pricing_ledger_worker_enabled&&u.pricing_ledger_eligible&&pricingStatus.level==='bad')||(u.error_log_worker_enabled&&u.error_log_selected&&errorLog.level==='bad')))accountLevel='bad';
+    else if(u.enabled&&(balance.level==='warn'||(u.usage_sync_enabled&&u.usage_worker_enabled&&(usage.level==='warn'||history.level==='warn'))||(u.pricing_ledger_worker_enabled&&u.pricing_ledger_eligible&&pricingStatus.level==='warn')||(u.error_log_worker_enabled&&u.error_log_selected&&errorLog.level==='warn')))accountLevel='warn';
     if(accountLevel==='bad')level='bad';else if(accountLevel==='warn'&&level==='ok')level='warn';
-    const overall=!u.enabled?'账户已停用':accountLevel==='bad'?'需要处理':u.usage_sync_enabled&&!u.usage_worker_enabled?'消费同步灰度关闭':balance.level==='warn'?'余额等待同步':usage.level==='warn'?'当天追平等待':u.usage_history_phase==='retry'?'历史补数重试':history.level==='warn'?'历史补数中':'运行正常';
+    const overall=!u.enabled?'账户已停用':accountLevel==='bad'?'需要处理':u.usage_sync_enabled&&!u.usage_worker_enabled?'消费同步灰度关闭':balance.level==='warn'?'余额等待同步':usage.level==='warn'?'当天追平等待':u.usage_history_phase==='retry'?'历史补数重试':history.level==='warn'?'历史补数中':pricingStatus.level==='warn'?'计价证据数据陈旧':'运行正常';
     const balanceValue=u.balance_usd==null?'余额未知':`$${Number(u.balance_usd).toFixed(2)}`;
     const adapter=u.usage_adapter_name||'尚未确定同步适配器',granularity=u.usage_granularity==='day'?'单日汇总':'小时汇总';
     const lag=u.usage_data_until?usageFactsDuration(Math.max(0,now-(+u.usage_data_until))):'—';
@@ -1920,13 +1930,13 @@ function syncRenderChannels(report){
     const usageProgress=u.usage_backfill_progress?`<p class="sync-upstream-note">历史补数：${esc(u.usage_backfill_progress)}</p>`:'';
     const keySlots=Array.isArray(u.api_key_slots)?u.api_key_slots:[];
     const keyContent=keySlots.length?`<details class="sync-upstream-keys" open><summary>AICodeWith Key 同步 · ${fmtNum(keySlots.length)} 把</summary>${keySlots.map(slot=>{const state=statusInfo(slot.status||'queued',u.enabled),slotHistory=slot.backfill_done?'历史已完成':slot.backfill_last_error?'历史退避重试':slot.status?'历史补数中':'等待首次同步',error=slot.last_error||slot.backfill_last_error||'';return `<div class="sync-upstream-key"><b>${esc(slot.label||'未命名 Key')}</b><span class="sync-status ${syncStateClass(state.level)}">${esc(state.label)}</span><small>${esc(slotHistory)}${slot.last_success_at?` · 最近 ${syncTime(slot.last_success_at)}`:''}${error?`<br><span class="history-error">${esc(error)}</span>`:''}</small></div>`}).join('')}</details>`:'';
-    const pricingStatus=statusInfo(u.pricing_ledger_status,u.enabled),pricingTotal=+u.pricing_backfill_total_hours||0;
+    const pricingTotal=+u.pricing_backfill_total_hours||0;
     const pricingPercent=pricingTotal?Math.min(100,(+u.pricing_verified_hours||0)*100/pricingTotal):0;
     const pricingContent=!u.pricing_ledger_worker_enabled
       ?'<div class="sync-upstream-note"><b>计价证据账本：灰度关闭</b><br>不访问上游，不影响现有消费账单。</div>'
       :!u.pricing_ledger_eligible
       ?'<div class="sync-upstream-note"><b>计价证据账本：未进入灰度</b><br>NewAPI、Sub2API 和 AICodeWith 均需按账户加入白名单后才会同步。</div>'
-      :`<div class="sync-upstream-note"><b>计价证据账本：${esc(pricingStatus.label)}</b><br>${esc(u.pricing_ledger_capability||'已验证计价证据')}<br>近期重叠核对至 ${syncTime(u.pricing_tail_through_hour)} · 历史已确认 ${fmtNum(u.pricing_verified_hours||0)}/${fmtNum(pricingTotal)} 小时${pricingTotal?` (${pricingPercent.toFixed(1)}%)`:''}<br>连续历史下一待补 ${syncTime(u.pricing_backfill_next_hour)} · 待复核 ${fmtNum(u.pricing_pending_hours||0)} · 差异/缺基准 ${fmtNum(u.pricing_mismatch_hours||0)} 小时${u.pricing_progress?`<br>${esc(u.pricing_progress)}`:''}${u.pricing_last_error?`<br><span class="history-error">${esc(u.pricing_last_error)}</span>`:''}</div>`;
+      :`<div class="sync-upstream-note"><b>计价证据账本：${esc(pricingStatus.label)}</b><br>${esc(u.pricing_ledger_capability||'已验证计价证据')}<br>近期重叠核对至 ${syncTime(u.pricing_tail_through_hour)} · 历史已确认 ${fmtNum(u.pricing_verified_hours||0)}/${fmtNum(pricingTotal)} 小时${pricingTotal?` (${pricingPercent.toFixed(1)}%)`:''}<br>连续历史下一待补 ${syncTime(u.pricing_backfill_next_hour)} · 待复核 ${fmtNum(u.pricing_pending_hours||0)} · 差异/缺基准 ${fmtNum(u.pricing_mismatch_hours||0)} 小时<br>最近尝试 ${syncTime(u.pricing_last_attempt_at)} · 最近成功 ${syncTime(u.pricing_last_success_at)} · Tail 下次 ${syncTime(u.pricing_tail_next_sync_at)}${u.pricing_progress?`<br>${esc(u.pricing_progress)}`:''}${u.pricing_last_error?`<br><span class="history-error">${esc(u.pricing_last_error)}</span>`:''}</div>`;
     const usageContent=u.usage_sync_enabled&&!u.usage_worker_enabled
       ?'<strong>全局灰度闸门已关闭</strong><p>账户配置已保留，当前不会访问上游；余额同步不受影响。</p>'
       :u.usage_sync_enabled

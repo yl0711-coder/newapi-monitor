@@ -416,6 +416,58 @@ func TestReplaceStabilityHourIsAtomicIdempotentAndMarksZeroTrafficComplete(t *te
 	}
 }
 
+func TestReplaceStabilityHourRejectsContradictoryZeroTraffic(t *testing.T) {
+	m := newStabilityTestMonitor(t)
+	hour := time.Date(2026, 9, 4, 3, 0, 0, 0, time.UTC).Unix()
+	if err := m.storeDB.Create(&MetricSample{
+		BucketTs: hour + 60, ChannelID: 7, ModelName: "gpt", Grp: "codex", Success: 3,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	previous := StabilityHourSample{HourTs: hour, ChannelID: 7, ModelName: "gpt", Grp: "codex", Success: 3}
+	if err := m.storeDB.Create(&previous).Error; err != nil {
+		t.Fatal(err)
+	}
+	err := m.replaceStabilityHour(hour, nil, StabilityHourIngestState{JobID: "source-cutover"})
+	if !errors.Is(err, errStabilityZeroContradiction) {
+		t.Fatalf("positive minute facts must reject a signed zero source hour: %v", err)
+	}
+	var count int64
+	if err := m.storeDB.Model(&StabilityHourSample{}).Where("hour_ts = ?", hour).Count(&count).Error; err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("contradictory replacement must roll back existing facts, rows=%d", count)
+	}
+}
+
+func TestStabilityCoverageAndRepairMapRejectContradictoryZeroTraffic(t *testing.T) {
+	m := newStabilityTestMonitor(t)
+	from := time.Date(2026, 9, 4, 0, 0, 0, 0, time.UTC).Unix()
+	if err := m.storeDB.Create(&[]StabilityHourIngestState{
+		{HourTs: from, Status: "complete", Requests: 0},
+		{HourTs: from + 3600, Status: "complete", Requests: 0},
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := m.storeDB.Create(&MetricSample{
+		BucketTs: from + 60, ChannelID: 9, ModelName: "gpt", Grp: "codex", Success: 2,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	cov := m.stabilityDataCoverage(context.Background(), from, from+2*3600, from+4*3600)
+	if cov.CompletedHours != 1 || cov.MissingHours != 1 || cov.Complete {
+		t.Fatalf("contradictory signed zero must be a visible coverage gap: %+v", cov)
+	}
+	complete, err := m.completeStabilityHours(from, from+2*3600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if complete[from] || !complete[from+3600] {
+		t.Fatalf("automatic repair map did not isolate the contradictory hour: %+v", complete)
+	}
+}
+
 func TestStabilityCoverageCountsLedgerNotSamplePresence(t *testing.T) {
 	m := newStabilityTestMonitor(t)
 	from := time.Date(2026, 8, 5, 0, 0, 0, 0, cstLocation).Unix()

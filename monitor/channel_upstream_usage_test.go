@@ -369,6 +369,7 @@ func TestUpstreamUsageFailureRetryPolicy(t *testing.T) {
 		{name: "first timeout", err: context.DeadlineExceeded, failures: 1, want: 2 * time.Minute},
 		{name: "second timeout", err: context.DeadlineExceeded, failures: 2, want: 5 * time.Minute},
 		{name: "connection refused", err: errors.New("dial tcp: connection refused"), failures: 1, want: 2 * time.Minute},
+		{name: "moving upstream page", err: errors.New("NewAPI 使用日志扫描期间 total 变化（334 -> 335）"), failures: 1, want: 2 * time.Minute},
 		{name: "sqlite busy", err: errors.New("database is locked"), failures: 1, want: 10 * time.Second},
 		{name: "sqlite busy repeated", err: errors.New("SQLITE_BUSY"), failures: 3, want: time.Minute},
 		{name: "rate limit default", err: &upstreamHTTPError{Status: http.StatusTooManyRequests}, failures: 1, want: upstreamRetryAfterDefault},
@@ -393,6 +394,26 @@ func TestAICodeWithTailKeepsThirtyMinuteMinimum(t *testing.T) {
 	}
 	if aicode < now+30*60 || aicode > now+30*60+45 {
 		t.Fatalf("AICodeWith next sync outside 30-minute window: %d", aicode-now)
+	}
+}
+
+func TestNewAPITailIncrementalModeRequiresStaleOrObservedDenseAccount(t *testing.T) {
+	now := int64(1_800_000_000)
+	if newAPITailNeedsIncrementalSync(ChannelUpstreamAccount{Provider: upstreamProviderNewAPI}, now) {
+		t.Fatal("new low-volume account must keep the one-window request path")
+	}
+	if !newAPITailNeedsIncrementalSync(ChannelUpstreamAccount{
+		Provider: upstreamProviderNewAPI, UsageDataUntil: now - int64(upstreamUsageTailOverlap/time.Second) - 1,
+	}, now) {
+		t.Fatal("stale watermark must use forward-first hourly recovery")
+	}
+	if !newAPITailNeedsIncrementalSync(ChannelUpstreamAccount{
+		Provider: upstreamProviderNewAPI, UsageDataUntil: now - 60, UsageTailMode: upstreamUsageTailModeHourly,
+	}, now) {
+		t.Fatal("learned dense account lost its durable hourly strategy")
+	}
+	if !upstreamUsageRunBudgetWasExhausted(&upstreamUsageRunBudgetExhausted{max: upstreamUsageMaxRequestsPerRun}) {
+		t.Fatal("request-budget exhaustion was not recognized")
 	}
 }
 

@@ -42,6 +42,7 @@ type ChannelManagementFinanceGroup struct {
 // 不把“网站分组倍率”或财务利润结算混入该判断。
 type ChannelManagementRateConfig struct {
 	EnabledChannels    int  `json:"enabled_channels"`
+	ManagedChannels    int  `json:"managed_channels"`
 	ConfiguredChannels int  `json:"configured_channels"`
 	Complete           bool `json:"complete"`
 }
@@ -218,6 +219,15 @@ func channelManagementStatusRank(ch *channelManagementBuild) int {
 	return 1
 }
 
+// channelRequiresRateConfiguration reports whether a current channel may
+// carry user traffic without an operator changing its configuration. NewAPI
+// status 3 is auto-disabled rather than administratively retired: the channel
+// can be enabled again by the health checker, so its rate configuration must
+// remain complete while it is temporarily out of rotation.
+func channelRequiresRateConfiguration(ch *channelManagementBuild) bool {
+	return ch != nil && ch.Current && (ch.Status == 1 || ch.Status == 3)
+}
+
 type channelDomainBuild struct {
 	Key           string
 	Domain        string
@@ -320,16 +330,19 @@ func managementRateConfig(domain *channelDomainBuild, finance channelFinanceSnap
 	view := ChannelManagementRateConfig{}
 	for _, vendor := range domain.Vendors {
 		for _, channel := range vendor.Channels {
-			if !channel.Current || channel.Status != 1 {
+			if !channelRequiresRateConfiguration(channel) {
 				continue
 			}
-			view.EnabledChannels++
+			view.ManagedChannels++
+			if channel.Status == 1 {
+				view.EnabledChannels++
+			}
 			if finance.channelRateConfigured(domain.Domain, channel.ID) {
 				view.ConfiguredChannels++
 			}
 		}
 	}
-	view.Complete = view.EnabledChannels > 0 && view.EnabledChannels == view.ConfiguredChannels
+	view.Complete = view.ManagedChannels > 0 && view.ManagedChannels == view.ConfiguredChannels
 	return view
 }
 

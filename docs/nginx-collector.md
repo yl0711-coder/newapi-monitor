@@ -147,7 +147,8 @@ Nginx 容器以读写方式挂载到 `/var/log/nexusapi-monitor`，采集器把�
     maxsize 50M
     rotate 8
     missingok
-    notifempty
+    # 两个日志必须作为同一原子集合轮转；即使 error.log 为空也要创建新 inode，
+    # 避免一个文件已轮转、另一个仍为 worker owner，导致安全 reopen 按设计拒绝。
     nocompress
     create 0640 root nexus-monitor
     sharedscripts
@@ -169,6 +170,8 @@ Nginx 容器以读写方式挂载到 `/var/log/nexusapi-monitor`，采集器把�
 不 reload/restart；但任何权限、collector 可读性、worker FD、容器身份或本地探针校验失败
 都必须让 logrotate 失败。成功后它会原子写入 root 所有的
 `.nginx-writer-release-v2.json`，source v2 只依据这份 inode 证明退役已读完且已消失的旧日志。
+不要在这一组配置中增加 `notifempty`：它会让空日志跳过轮转，破坏两个当前文件在
+`postrotate` 开始前必须同时为 `root:<log-gid> 0640` 的不变量。
 当前 NexusAPI 源站锁会让不带内部密钥的 loopback `/api/status` 返回 `403`，因此示例显式
 要求 `403`；这个探针用于证明 worker 已在新 inode 写入，不携带或暴露源站密钥。公网/LB
 健康状态仍应在摘流和回挂闸门中独立验证。
