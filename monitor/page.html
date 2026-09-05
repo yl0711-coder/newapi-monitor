@@ -434,7 +434,8 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
   .tabpane[hidden]{display:none}
 </style>
 <link rel="stylesheet" href="/stability.css?v=8">
-<link rel="stylesheet" href="/capacity.css?v=1">
+<link rel="stylesheet" href="/capacity.css?v=2">
+<link rel="stylesheet" href="/group-governance.css?v=1">
 </head>
 <body theme-mode="dark">
 <div class="monitor-shell">
@@ -445,6 +446,7 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
     </div>
     <nav class="tabs monitor-nav">
       <div class="tab active" data-tab="usage" title="用户用量"><span class="monitor-nav-icon"><svg viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"/></svg></span><span class="monitor-nav-label">用户用量</span></div>
+      <div class="tab" data-tab="group-governance" title="分组治理"><span class="monitor-nav-icon"><svg viewBox="0 0 24 24"><circle cx="6" cy="6" r="2"/><circle cx="18" cy="6" r="2"/><circle cx="12" cy="18" r="2"/><path d="M8 7.2l3 8.2M16 7.2l-3 8.2M8 6h8"/></svg></span><span class="monitor-nav-label">分组治理</span></div>
       <div class="tab" data-tab="channels" title="渠道管理"><span class="monitor-nav-icon"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a15 15 0 0 1 0 18M12 3a15 15 0 0 0 0 18"/></svg></span><span class="monitor-nav-label">渠道管理</span></div>
       <div class="tab" data-tab="stability" title="稳定性报表"><span class="monitor-nav-icon"><svg viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="m9 12 2 2 4-4"/></svg></span><span class="monitor-nav-label">稳定性报表</span></div>
       <div class="tab" data-tab="model" title="模型监控"><span class="monitor-nav-icon"><svg viewBox="0 0 24 24"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg></span><span class="monitor-nav-label">模型监控</span></div>
@@ -470,6 +472,7 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
     <nav class="tabs monitor-mobile-tabs" aria-label="Monitor 导航">
       <div class="tab" data-tab="sync">同步状态</div>
       <div class="tab active" data-tab="usage">用户用量</div>
+      <div class="tab" data-tab="group-governance">分组治理</div>
       <div class="tab" data-tab="channels">渠道管理</div>
       <div class="tab" data-tab="stability">稳定性报表</div>
       <div class="tab" data-tab="model">模型监控</div>
@@ -655,6 +658,30 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
   </aside>
 </div>
 
+<div class="tabpane group-governance-page" id="tab-group-governance" hidden>
+  <section class="gg-readonly">
+    <div><b>只读审计，不会修改 NewAPI 配置</b><p>后台低频生成脱敏快照；本页、用户展开和 CSV 只读 Monitor 本地 SQLite，页面刷新不会查询生产库。</p><p id="ggCoverage">历史覆盖尚未核验</p></div>
+    <div class="gg-readonly-actions"><button class="gg-btn" type="button" id="ggRefresh">刷新本地结果</button><a class="gg-btn primary" id="ggExport" href="/group-governance/export.csv">导出 CSV</a></div>
+  </section>
+  <div class="gg-alert" id="ggAlert" hidden></div>
+  <div class="gg-kpis">
+    <div class="gg-kpi"><small>当前分组总数</small><b id="ggTotal">—</b></div>
+    <div class="gg-kpi bad"><small>高风险问题</small><b id="ggHigh">—</b></div>
+    <div class="gg-kpi warn"><small>无启用渠道分组</small><b id="ggNoChannelCount">—</b></div>
+    <div class="gg-kpi observe"><small>清理候选</small><b id="ggCleanup">—</b></div>
+  </div>
+  <div class="gg-toolbar">
+    <input type="search" id="ggSearch" placeholder="搜索分组名或展示说明" aria-label="搜索分组">
+    <select id="ggStatus" aria-label="按状态筛选"><option value="">全部状态</option><option value="high">高风险</option><option value="pending">待处理</option><option value="observe">观察</option><option value="normal">正常</option></select>
+    <label class="gg-check"><input type="checkbox" id="ggRatioName"> 名称含倍率</label>
+    <label class="gg-check"><input type="checkbox" id="ggNoChannel"> 无启用渠道</label>
+    <label class="gg-check"><input type="checkbox" id="ggNoRequest"> 30 天无请求</label>
+    <span class="gg-count" id="ggVisible"></span>
+    <span class="gg-count" id="ggUpdated">尚未加载</span>
+  </div>
+  <div class="gg-table-wrap"><table class="gg-table"><thead><tr><th>状态</th><th>分组标识</th><th>展示说明</th><th>倍率</th><th>渠道 启/禁</th><th>用户</th><th>显式令牌</th><th>请求 7d/30d</th><th>主要问题</th><th>建议</th></tr></thead><tbody id="ggRows"><tr><td colspan="10" class="gg-empty">进入页面后加载本地快照</td></tr></tbody></table></div>
+</div><!-- /tab-group-governance -->
+
 <div class="tabpane channel-management-page" id="tab-channels" hidden>
   <div class="cm-toolbar">
     <div>
@@ -747,12 +774,13 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
     </header>
     <div class="cm-upstream-content">
       <section class="cm-upstream-status" id="cmUpstreamStatus" hidden></section>
+      <section class="cm-upstream-funds" id="cmUpstreamFunds" hidden></section>
       <section class="cm-upstream-note">
         <b>同步方式</b>
         <span>余额默认每 5 分钟同步；使用数据仅在显式开启后低频汇总到 Monitor 本地，页面查询不会访问上游。</span>
       </section>
       <section class="cm-upstream-fields">
-        <label><span>中转站类型</span><select id="cmUpstreamProvider"><option value="newapi">NewAPI</option><option value="sub2api">Sub2API</option><option value="aicodewith">AICodeWith（春秋）</option></select></label>
+        <label><span>中转站类型</span><select id="cmUpstreamProvider"><option value="newapi">NewAPI</option><option value="sub2api">Sub2API</option><option value="aicodewith">AICodeWith（春秋）</option><option value="tokenforce">海南海纳（TokenForce MaaS）</option></select></label>
         <label class="wide"><span>站点地址</span><input id="cmUpstreamBaseURL" type="url" placeholder="https://example.com" autocomplete="url"><small>填写站点根地址，不要追加 API 路径</small></label>
         <label class="cm-upstream-newapi"><span>用户 ID</span><input id="cmUpstreamUserID" type="number" min="1" step="1" inputmode="numeric" placeholder="例如 123"></label>
         <label class="cm-upstream-newapi wide"><span>用户访问令牌</span><input id="cmUpstreamAccessToken" type="password" autocomplete="new-password" placeholder="已配置时留空表示保持不变"><small>个人设置中的系统访问令牌，不是模型调用 Key</small></label>
@@ -760,6 +788,9 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
         <label class="cm-upstream-sub2api"><span>认证方式</span><select id="cmUpstreamAuthMode"><option value="password">邮箱密码</option><option value="refresh_token">导入已登录会话</option></select></label>
         <label class="cm-upstream-sub2api cm-upstream-sub2-password wide"><span>登录密码</span><input id="cmUpstreamPassword" type="password" autocomplete="new-password" placeholder="已连接时留空表示沿用当前会话"><small>适用于没有验证码或 Turnstile 的站点；密码只用于本次换取令牌</small></label>
         <label class="cm-upstream-sub2api cm-upstream-sub2-refresh wide" hidden><span>Refresh Token</span><input id="cmUpstreamRefreshToken" type="password" autocomplete="new-password" placeholder="从上游浏览器已登录会话复制"><small>先在上游完成登录，再从浏览器开发者工具 → Application（应用）→ Local Storage → 当前站点复制 refresh_token；Monitor 只通过官方刷新接口验证，输入值不原样保存、不回显</small></label>
+        <label class="cm-upstream-tokenforce"><span>组织 ID（orgId）</span><input id="cmUpstreamOrgID" type="number" min="1" step="1" inputmode="numeric" placeholder="例如 123"><small>填写上游组织 ID，不是租户 tenantId、API Key 名称或本地令牌名</small></label>
+        <label class="cm-upstream-tokenforce"><span>人民币结算换算</span><input id="cmUpstreamUnitPerUSD" type="number" min="0.000001" step="0.000001" inputmode="decimal" placeholder="每 1 USD 对应多少 CNY"><small>接口账面金额为 CNY；必须按结算口径配置 CNY/每 USD，不能把人民币直接当美元</small></label>
+        <label class="cm-upstream-tokenforce wide"><span>Refresh Token</span><input id="cmUpstreamTokenForceRefreshToken" type="password" autocomplete="new-password" placeholder="从上游已登录浏览器会话复制"><small>密码登录有阿里云人机验证，Monitor 不保存账号密码；这里只导入可轮换会话，输入值验证后不会原样回显</small></label>
         <section class="cm-upstream-aicodewith wide cm-upstream-key-field">
           <div class="cm-upstream-key-head"><span>AICodeWith API Keys</span><button type="button" id="cmUpstreamAddAPIKey">+添加 Key</button></div>
           <div class="cm-upstream-key-list" id="cmUpstreamAPIKeyList"></div>
@@ -768,9 +799,9 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
       </section>
       <label class="cm-upstream-enabled"><input id="cmUpstreamEnabled" type="checkbox" checked><span><b>启用后台自动同步</b><small>停用后保留配置和最后余额，但不再访问该上游</small></span></label>
       <label class="cm-upstream-enabled cm-upstream-usage-option"><input id="cmUpstreamUsageEnabled" type="checkbox"><span><b id="cmUpstreamUsageLabel">同步上游消费账单</b><small id="cmUpstreamUsageHelp">默认每 30 分钟串行汇总一次；当天水位和历史补数独立运行，不保存上游原始内容</small></span></label>
-      <section class="cm-upstream-security"><b>凭据安全</b><span>访问令牌、Sub2API Refresh Token 与 AICodeWith API Key 在本地 SQLite 中经 AES-256-GCM 加密；页面和接口只返回脱敏账户信息。Sub2API 的 refresh token 轮换会原子更新。</span></section>
+      <section class="cm-upstream-security"><b>凭据安全</b><span>访问令牌、Refresh Token 与 AICodeWith API Key 在本地 SQLite 中经 AES-256-GCM 加密；页面和接口只返回脱敏账户信息。Sub2API 与 TokenForce 的 refresh token 轮换会原子更新。</span></section>
     </div>
-    <footer><span id="cmUpstreamMessage"></span><div><button type="button" class="cm-upstream-cancel" id="cmUpstreamCancel">取消</button><button type="button" class="cm-upstream-sync" id="cmUpstreamSync" hidden>同步余额</button><button type="button" class="cm-upstream-sync" id="cmUpstreamUsageSync" hidden>同步消费</button><button type="button" class="cm-upstream-save" id="cmUpstreamSave">保存并验证</button></div></footer>
+    <footer><span id="cmUpstreamMessage"></span><div><button type="button" class="cm-upstream-cancel" id="cmUpstreamCancel">取消</button><button type="button" class="cm-upstream-sync" id="cmUpstreamSync" hidden>同步余额</button><button type="button" class="cm-upstream-sync" id="cmUpstreamUsageSync" hidden>同步消费</button><button type="button" class="cm-upstream-sync" id="cmUpstreamFundsSync" hidden>同步资金流水</button><button type="button" class="cm-upstream-save" id="cmUpstreamSave">保存并验证</button></div></footer>
   </aside>
 </div>
 
@@ -799,9 +830,8 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
 
   <!-- 3. 数据库 -->
   <div class="card">
-    <div class="card-header">🗄 数据库 <span class="muted" style="font-weight:400">· 含 AWS 控制台看不到的「可用内存 / Swap」</span></div>
+    <div class="card-header">🗄 数据库 <span class="muted" style="font-weight:400">· 每个数据库的当前值与趋势图放在同一卡片内</span></div>
     <div id="dbBody" style="padding:16px 20px"><span class="muted">加载中…</span></div>
-    <div id="dbCharts" style="padding:0 20px 16px"></div>
   </div>
 
   <!-- 4. 实例 -->
@@ -821,8 +851,12 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
     <div class="capacity-ranges" role="group" aria-label="容量规划时间范围">
       <button type="button" data-cap-hours="1">1 小时</button><button type="button" data-cap-hours="6">6 小时</button>
       <button type="button" data-cap-hours="24" class="active">24 小时</button><button type="button" data-cap-hours="168">7 天</button>
+      <input type="datetime-local" id="capFrom" aria-label="开始时间"><span class="muted">至</span>
+      <input type="datetime-local" id="capTo" aria-label="结束时间"><button type="button" id="capApplyRange">查询区间</button>
     </div>
     <div class="capacity-filters">
+      <input type="search" id="capSearch" placeholder="搜索用户 / 分组 / 模型 / 渠道" aria-label="搜索筛选项">
+      <select id="capUser" aria-label="用户"><option value="">全部用户</option></select>
       <select id="capGroup" aria-label="服务分组"><option value="">全部分组</option></select>
       <select id="capChannel" aria-label="渠道"><option value="">全部渠道</option></select>
       <select id="capModel" aria-label="模型"><option value="">全部模型</option></select>
@@ -844,7 +878,7 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
   </section>
 
   <section class="capacity-grid-two">
-    <div class="capacity-card"><header><div><h2>业务负载排名</h2><p>分组、渠道、模型 Top 20，用于找到负载来源和局部不稳定。</p></div><select id="capRankType"><option value="groups">按分组</option><option value="channels">按渠道</option><option value="models">按模型</option></select></header><div id="capRanking"></div></div>
+    <div class="capacity-card"><header><div><h2>业务负载排名</h2><p>用户、分组、渠道、模型 Top 20，用于找到负载来源和局部不稳定。</p></div><select id="capRankType"><option value="users">按用户</option><option value="groups">按分组</option><option value="channels">按渠道</option><option value="models">按模型</option></select></header><div id="capRanking"></div></div>
     <div class="capacity-card"><header><div><h2>服务容量状态</h2><p>展示已采集实例、数据库、负载均衡的当前证据；数据不足时不给扩容结论。</p></div></header><div id="capComponents"></div></div>
   </section>
 
@@ -1064,7 +1098,8 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
 <script src="/stability.js?v=3"></script>
 <script src="/channel-management.js?v=7"></script>
 <script src="/logchain.js?v=1"></script>
-<script src="/capacity.js?v=1"></script>
+<script src="/capacity.js?v=2"></script>
+<script src="/group-governance.js?v=1"></script>
 <script>
 const params=new URLSearchParams(location.search);
 let WINDOW=parseInt(params.get('window')||'60',10);
@@ -1471,6 +1506,7 @@ window.addEventListener('resize',()=>{trendChart&&trendChart.resize();sloGauge&&
 let infraTimer=null;
 let infraCharts=[];            // 当前 server tab 内所有 echarts 实例,重渲染前统一 dispose 防泄漏
 const groupSel={};             // 资源名 -> 当前选中的指标组 key(刷新后保留选择)
+const dbExpanded=new Set();    // 已展开的数据库名(刷新后保留展开态)
 const instExpanded=new Set();  // 已展开的实例名(刷新后保留展开态)
 const infraBadge=st=>{const m={ok:['badge-green','正常'],warn:['badge-yellow','注意'],bad:['badge-red','告警'],nosample:['badge-gray','无数据']};const[c,t]=m[st]||m.nosample;return `<span class="badge ${c}">${t}</span>`};
 const fx=(v,n=0)=>v==null?'—':(+v).toFixed(n);
@@ -1511,9 +1547,16 @@ function resizeInfraCharts(){infraCharts.forEach(c=>{try{c.resize()}catch(e){}})
 // 指标分组定义:一组=若干相关指标(放一起看);tone 决定关键值上色方式。
 function groupsFor(type){
   if(type==='database')return[
-    {k:'mem',label:'内存',metrics:[{m:'free_mem_mb',label:'已用内存',unit:'MB',color:'#2f7ed8',tone:'usedCap',totalKey:'mem_total_mb'},{m:'swap_mb',label:'Swap',unit:'MB',color:'#e8453c',tone:'raw'}]},
+    {k:'mem',label:'内存',metrics:[{m:'free_mem_mb',label:'已用内存',availableLabel:'可用内存',unit:'MB',color:'#2f7ed8',tone:'usedCap',totalKey:'mem_total_mb'},{m:'swap_mb',label:'Swap',unit:'MB',color:'#e8453c',tone:'raw'}]},
     {k:'compute',label:'算力',metrics:[{m:'cpu',label:'CPU',unit:'%',color:'#7e57c2',tone:'cpu'},{m:'connections',label:'连接数',unit:'',color:'#26a69a',tone:'raw'}]},
-    {k:'storage',label:'存储',metrics:[{m:'free_storage_gb',label:'已用存储',unit:'GB',color:'#2f7ed8',tone:'usedCap',totalKey:'disk_total_gb'},{m:'disk_queue',label:'磁盘队列',unit:'',color:'#fb8c00',tone:'raw'}]},
+    {k:'storage',label:'存储',metrics:[{m:'free_storage_gb',label:'已用存储',availableLabel:'可用存储',unit:'GB',color:'#2f7ed8',tone:'usedCap',totalKey:'disk_total_gb'},{m:'disk_queue',label:'磁盘队列',unit:'',color:'#fb8c00',tone:'raw'}]},
+  ];
+  if(type==='ecs_service')return[
+    {k:'compute',label:'算力',metrics:[{m:'cpu',label:'CPU',unit:'%',color:'#7e57c2',tone:'cpu'},{m:'mem_used_pct',label:'内存已用',unit:'%',color:'#2f7ed8',tone:'used'}]},
+    {k:'service',label:'服务副本',metrics:[{m:'running',label:'运行中',unit:'',color:'#26a69a',tone:'raw'},{m:'desired',label:'期望',unit:'',color:'#42a5f5',tone:'raw'},{m:'pending',label:'等待中',unit:'',color:'#fb8c00',tone:'raw'}]},
+    {k:'net',label:'任务网络',metrics:[{m:'net_in_kb',label:'网络入',unit:'KB/s',color:'#26a69a',tone:'raw'},{m:'net_out_kb',label:'网络出',unit:'KB/s',color:'#42a5f5',tone:'raw'}]},
+    {k:'storage',label:'临时存储',metrics:[{m:'disk_used_pct',label:'临时存储已用',unit:'%',color:'#fb8c00',tone:'used'}]},
+    {k:'health',label:'容器健康',metrics:[{m:'health_checked',label:'已配置健康检查',unit:'',color:'#26a69a',tone:'raw'},{m:'unhealthy_containers',label:'不健康容器',unit:'',color:'#e8453c',tone:'raw'},{m:'restart_count',label:'重启次数',unit:'',color:'#fb8c00',tone:'raw'}]},
   ];
   return[ // instance(含 Redis 等所有 Lightsail 实例)
     {k:'compute',label:'算力',metrics:[{m:'cpu',label:'CPU',unit:'%',color:'#7e57c2',tone:'cpu'},{m:'burst',label:'突发额度',unit:'%',color:'#26a69a',tone:'burst'}]},
@@ -1526,7 +1569,7 @@ function groupsFor(type){
 }
 // 图顶部的「关键值 + 颜色」。
 function metricHead(it,me){
-  let dv=me[it.m],style='',extra='';
+  let dv=me[it.m],style='',extra='',label=it.label;
   if(it.tone==='usedCap'){
     // 容量类按惯例显示「已用」:已用 = 总 - 可用(free);高用量上红
     const total=me[it.totalKey], free=me[it.m];
@@ -1534,12 +1577,13 @@ function metricHead(it,me){
     const pct=(dv!=null&&total>0)?dv/total*100:null;
     style=colUsed(pct,75,85);
     if(pct!=null)extra=` (${fx(pct,0)}%)`;
+    else if(it.availableLabel)label=it.availableLabel;
   }
   else if(it.tone==='cpu'){style=colUsed(dv,infraCpuWarn,infraCpuBad);}
   else if(it.tone==='used'){style=colUsed(dv,100-infraStorageWarn,100-infraStorageBad);}
   else if(it.tone==='burst'){style=(dv!=null&&dv<infraBurstWarn)?'color:var(--yellow)':'color:var(--green)';}
   const val=dv==null?'—':fx(dv,it.unit==='GB'?1:(it.unit==='%'?1:0))+(it.unit?(' '+it.unit):'');
-  return `<span class="muted">${it.label}</span> <b style="${style}">${val}${extra}</b> <span class="muted" style="font-weight:400">· 近6h</span>`;
+  return `<span class="muted">${label}</span> <b style="${style}">${val}${extra}</b> <span class="muted" style="font-weight:400">· 近6h</span>`;
 }
 function renderContainerDetails(res){
   const rows=res.containers||[];
@@ -1582,10 +1626,16 @@ async function drawGroup(host,res,g){
     if(r.ok){const d=await r.json();series=d.series||{};}}catch(e){}
   if(typeof echarts==='undefined')return;
   const cdivs=wrap.querySelectorAll('.mc-c');
-  if(g.combined){const ch=echarts.init(cdivs[0]);infraCharts.push(ch);ch.setOption(multiLineOpt(g.metrics.map(mm=>({name:mm.label,color:mm.color,pts:series[mm.m]||[]}))));}
+  const waiting='<div class="muted" style="height:48px;display:flex;align-items:center">历史数据积累中（至少需要 2 个采样点）</div>';
+  if(g.combined){
+    const defs=g.metrics.map(mm=>({name:mm.label,color:mm.color,pts:series[mm.m]||[]}));
+    if(!defs.some(sd=>sd.pts.length>=2)){cdivs[0].style.height='48px';cdivs[0].innerHTML=waiting;return;}
+    const ch=echarts.init(cdivs[0]);infraCharts.push(ch);ch.setOption(multiLineOpt(defs));
+  }
   else{g.metrics.forEach((mm,i)=>{if(!cdivs[i])return;
     let pts=series[mm.m]||[];
     if(mm.tone==='usedCap'){const total=me[mm.totalKey];if(total!=null)pts=pts.map(p=>({ts:p.ts,value:total-p.value}));} // 画已用=总-可用
+    if(pts.length<2){cdivs[i].style.height='48px';cdivs[i].innerHTML=waiting;return;}
     const ch=echarts.init(cdivs[i]);infraCharts.push(ch);ch.setOption(lineOpt(pts,mm.color));});}
 }
 // 状态灯(用于总览条与各行):返回带颜色的圆点。
@@ -1665,11 +1715,11 @@ function renderInfra(s){
   renderProbes(s);
   renderLocks(s);
   renderInfraAlerts(s);
-  const databases=(s.databases&&s.databases.length)?s.databases:(s.database?[s.database]:[]), dbBody=document.getElementById('dbBody'), dbCharts=document.getElementById('dbCharts');
-  if(!databases.length){dbBody.innerHTML='<span class="muted">无数据库数据</span>';dbCharts.innerHTML='';}
+  const databases=(s.databases&&s.databases.length)?s.databases:(s.database?[s.database]:[]), dbBody=document.getElementById('dbBody');
+  if(!databases.length){dbBody.innerHTML='<span class="muted">无数据库数据</span>';}
   else{
-    dbBody.innerHTML='';dbCharts.innerHTML='';
-    databases.forEach((db,idx)=>{
+    dbBody.innerHTML='';
+    databases.forEach(db=>{
     const me=db.metrics||{};
     // 内存%:用「已用 = 总 - 可用」展示用量,可用率上色
     const memAvailPct=me.mem_avail_pct, memTotal=me.mem_total_mb;
@@ -1681,15 +1731,38 @@ function renderInfra(s){
     const stUsed=(dTotal!=null&&me.free_storage_gb!=null)?(dTotal-me.free_storage_gb):null;
     const stUsedPct=stAvailPct!=null?100-stAvailPct:null;
     const stHtml=stUsed!=null?usageHtml(stUsed,dTotal,stUsedPct,'GB',colAvail(stAvailPct)):`<b style="${colAvail(stAvailPct)}">${fx(me.free_storage_gb,1)} GB 可用</b>`;
-    dbBody.insertAdjacentHTML('beforeend',`<div style="${idx?'border-top:1px solid #2b3040;padding-top:14px;margin-top:14px;':''}"><div style="margin-bottom:8px">${infraBadge(db.status)} <b>${esc(db.display_name||db.name)}</b> <span class="muted">· ${esc(db.group||'其他资源')} · ${esc(db.platform||'AWS')} · ${fmtAge(db.age_sec)}</span></div>`
-      +kv('内存(已用/总)',memHtml)
-      +kv('存储(已用/总)',stHtml)
+    const dbCard=document.createElement('section');
+    dbCard.style.cssText='border:1px solid #2b3040;border-radius:10px;background:#171a21;padding:14px 16px;margin-bottom:12px';
+    const memLabel=memTotal!=null?'内存(已用/总)':'可用内存';
+    const storageLabel=dTotal!=null?'存储(已用/总)':'可用存储';
+    const open=dbExpanded.has(db.name);
+    const caret=`<span class="db-caret" style="display:inline-block;width:14px;color:#888;transition:transform .15s;${open?'transform:rotate(90deg)':''}">▶</span>`;
+    dbCard.innerHTML=`<div class="db-summary" role="button" tabindex="0" aria-expanded="${open?'true':'false'}" style="cursor:pointer;outline:none">`
+      +`<div style="margin-bottom:8px">${caret} ${infraBadge(db.status)} <b>${esc(db.display_name||db.name)}</b> <span class="muted">· ${esc(db.group||'其他资源')} · ${esc(db.platform||'AWS')} · ${fmtAge(db.age_sec)}</span></div>`
+      +`<div>${kv(memLabel,memHtml)}`
+      +kv(storageLabel,stHtml)
       +kv('CPU',`<span style="${colUsed(me.cpu,infraCpuWarn,infraCpuBad)}">${fx(me.cpu,1)}%</span>`)
       +kv('连接数',fx(me.connections))
       +kv('磁盘队列',fx(me.disk_queue,2))
-      +kv('Swap 使用',`${fx(me.swap_mb)} MB`)+'</div>');
-    const chartHost=document.createElement('div');chartHost.style.cssText=idx?'border-top:1px solid #2b3040;padding-top:14px;margin-top:14px':'';dbCharts.appendChild(chartHost);
-    renderResCharts(chartHost, db, 'mem'); // 每个 DB 独立图表区，避免多个数据库互相覆盖
+      +kv('Swap 使用',`${fx(me.swap_mb)} MB`)+'</div></div>';
+    const chartHost=document.createElement('div');
+    chartHost.style.cssText=`border-top:1px solid #2b3040;padding-top:10px;margin-top:10px;${open?'':'display:none'}`;
+    dbCard.appendChild(chartHost);
+    dbBody.appendChild(dbCard);
+    let rendered=open;
+    if(open)renderResCharts(chartHost, db, 'mem');
+    const summary=dbCard.querySelector('.db-summary'), caretEl=dbCard.querySelector('.db-caret');
+    const toggle=()=>{
+      const nowOpen=chartHost.style.display!=='none';
+      if(nowOpen){
+        chartHost.style.display='none';dbExpanded.delete(db.name);caretEl.style.transform='';summary.setAttribute('aria-expanded','false');
+      }else{
+        chartHost.style.display='';dbExpanded.add(db.name);caretEl.style.transform='rotate(90deg)';summary.setAttribute('aria-expanded','true');
+        if(!rendered){renderResCharts(chartHost, db, 'mem');rendered=true;}
+      }
+    };
+    summary.addEventListener('click',toggle);
+    summary.addEventListener('keydown',e=>{if(e.key==='Enter'||e.key===' '){e.preventDefault();toggle();}});
     });
   }
   const insts=s.instances||[];
@@ -1699,7 +1772,9 @@ function renderInfra(s){
   else{tbInst.innerHTML=insts.map((r,idx)=>{const me=r.metrics||{};
     // CPU / 突发额度 来自 AWS,一定有;内存/磁盘/load 需 host-agent,缺失显占位。
     const cpuHtml=me.cpu!=null?`<span style="${colUsed(me.cpu,infraCpuWarn,infraCpuBad)}">${fx(me.cpu,1)}%</span>`:PLACEHOLDER;
-    const burstHtml=me.burst!=null?`<span style="${me.burst<infraBurstWarn?'color:var(--yellow)':'color:var(--green)'}">${fx(me.burst)}%</span>`:PLACEHOLDER;
+    const isECS=r.type==='ecs_service'||r.platform==='ECS/Fargate';
+    const managedNA='<span class="muted">云托管·不适用</span>';
+    const burstHtml=me.burst!=null?`<span style="${me.burst<infraBurstWarn?'color:var(--yellow)':'color:var(--green)'}">${fx(me.burst)}%</span>`:(isECS?managedNA:PLACEHOLDER);
     // 内存:已用/总(可用率上色);仅当 host-agent 推过 mem_avail_mb
     let memHtml=PLACEHOLDER;
     if(me.mem_avail_mb!=null){
@@ -1707,19 +1782,21 @@ function renderInfra(s){
       const usedPct=me.mem_used_pct, availPct=usedPct!=null?100-usedPct:null;
       memHtml=usageHtml(used!=null?used:me.mem_avail_mb,total,usedPct,'MB',colAvail(availPct));
       if(used==null)memHtml=`<b style="${colAvail(availPct)}">${fx(me.mem_avail_mb)} MB 可用</b>`;
+    }else if(isECS&&me.mem_used_mb!=null&&me.mem_total_mb!=null){
+      memHtml=usageHtml(me.mem_used_mb,me.mem_total_mb,me.mem_used_pct,'MB',colUsed(me.mem_used_pct));
     }else if(me.mem_used_pct!=null){
       memHtml=`<b style="${colUsed(me.mem_used_pct)}">${fx(me.mem_used_pct,1)}% 已用</b>`;
     }
-    const diskHtml=me.disk_used_pct!=null?`<span style="${colUsed(me.disk_used_pct,100-infraStorageWarn,100-infraStorageBad)}">${fx(me.disk_used_pct)}%</span>`:PLACEHOLDER;
-    const loadHtml=me.load1!=null?`<b>${fx(me.load1,2)}</b>`:PLACEHOLDER;
+    const diskHtml=me.disk_used_pct!=null?`<span style="${colUsed(me.disk_used_pct,100-infraStorageWarn,100-infraStorageBad)}">${fx(me.disk_used_pct)}%</span>`:(isECS?managedNA:PLACEHOLDER);
+    const loadHtml=me.load1!=null?`<b>${fx(me.load1,2)}</b>`:(isECS?managedNA:PLACEHOLDER);
     // 容器存活:host-agent 接入后填(containers_up/containers_total);缺数据显占位,行始终渲染。
     let contHtml=PLACEHOLDER;
-    if(me.containers_total!=null){const up=me.containers_up!=null?me.containers_up:0,tot=me.containers_total;contHtml=`<span style="${up<tot?'color:var(--red)':'color:var(--green)'}">${fx(up)}/${fx(tot)}</span>`;}
+    if(me.containers_total!=null){const up=me.containers_up!=null?me.containers_up:0,tot=me.containers_total;contHtml=`<span style="${up<tot?'color:var(--red)':'color:var(--green)'}">${isECS?'任务 ':''}${fx(up)}/${fx(tot)}</span>`;}
     const open=instExpanded.has(r.name);
     const caret=`<span style="display:inline-block;width:14px;color:#888;transition:transform .15s;${open?'transform:rotate(90deg)':''}">▶</span>`;
     const groupHeader=idx===0||insts[idx-1].group!==r.group?`<tr><td colspan="11" style="background:#171b25;padding:9px 14px;color:#aeb8d0"><b>${esc(r.group||'其他资源')}</b></td></tr>`:'';
     return groupHeader+`<tr class="inst-row" data-name="${esc(r.name)}" style="cursor:pointer">`
-      +`<td>${caret}</td><td><b>${esc(r.display_name||r.name)}</b><div class="muted" style="font-size:11px">${esc(r.platform||'Lightsail')}</div></td><td>${infraBadge(r.status)}</td><td>${cpuHtml}</td><td>${burstHtml}</td><td>${memHtml}</td><td>${diskHtml}</td><td>${loadHtml}</td><td>${contHtml}</td><td>${me.net_out_kb!=null?fx(me.net_out_kb)+' KB/s':PLACEHOLDER}</td><td class="muted">${fmtAge(r.age_sec)}</td></tr>`
+      +`<td>${caret}</td><td><b>${esc(r.display_name||r.name)}</b><div class="muted" style="font-size:11px">${esc(r.platform||'Lightsail')}</div></td><td>${infraBadge(r.status)}</td><td>${cpuHtml}</td><td>${burstHtml}</td><td>${memHtml}</td><td>${diskHtml}</td><td>${loadHtml}</td><td>${contHtml}</td><td>${me.net_out_kb!=null?fx(me.net_out_kb)+' KB/s':(isECS?managedNA:PLACEHOLDER)}</td><td class="muted">${fmtAge(r.age_sec)}</td></tr>`
       +`<tr class="inst-exp" data-name="${esc(r.name)}"${open?'':' style="display:none"'}><td colspan="11" style="background:#15171c;padding:8px 20px 14px"><div class="inst-zone"></div></td></tr>`;
   }).join('');
     // 绑定点击展开 + 还原已展开行的图
@@ -1768,12 +1845,15 @@ function switchTab(name,preserveHash){
   document.getElementById('tab-server').hidden=(name!=='server');
   document.getElementById('tab-capacity').hidden=(name!=='capacity');
   document.getElementById('tab-usage').hidden=(name!=='usage');
+  document.getElementById('tab-group-governance').hidden=(name!=='group-governance');
   document.getElementById('tab-logchain').hidden=(name!=='logchain');
   if(window.monitorShellSetTab)window.monitorShellSetTab(name);
   if(name==='server'){loadInfra();infraSchedule();setTimeout(resizeInfraCharts,80);}
   else if(infraTimer){clearInterval(infraTimer);}
   if(name==='sync')syncActivate();else syncDeactivate();
   if(name==='usage')usageInit();
+  if(name==='group-governance'&&window.groupGovernanceActivate)window.groupGovernanceActivate();
+  else if(window.groupGovernanceDeactivate)window.groupGovernanceDeactivate();
   if(name==='stability'&&window.stabilityActivate)window.stabilityActivate();
   if(name==='channels'&&window.channelManagementActivate)window.channelManagementActivate();
   else if(window.channelManagementDeactivate)window.channelManagementDeactivate();
@@ -3334,7 +3414,7 @@ setSeg();const _mePromise=loadMe();load();schedule();
 document.querySelectorAll('#longSeg a').forEach(a=>{a.href='javascript:void 0';a.classList.toggle('active',+a.dataset.d===longDays);a.addEventListener('click',e=>{e.preventDefault();longDays=+a.dataset.d;document.querySelectorAll('#longSeg a').forEach(x=>x.classList.toggle('active',x===a));loadLongTrend();});});
 loadLongTrend();
 // 默认落在「用户用量」;URL hash 带 tab(从报警设置返回/手动刷新)则恢复到该 tab。等 IS_ROOT 就位再渲染,模型/服务端数据后台预载
-_mePromise.finally(()=>{const q=monitorHashParams(),tab=q.get('tab');const target=/^(sync|model|server|capacity|usage|stability|channels|logchain)$/.test(tab||'')?tab:'usage';switchTab(target,true);window.dispatchEvent(new CustomEvent('monitor:navigate',{detail:{tab:target,context:window.monitorNavigationContext()}}))});
+_mePromise.finally(()=>{const q=monitorHashParams(),tab=q.get('tab');const target=/^(sync|model|server|capacity|usage|stability|channels|logchain|group-governance)$/.test(tab||'')?tab:'usage';switchTab(target,true);window.dispatchEvent(new CustomEvent('monitor:navigate',{detail:{tab:target,context:window.monitorNavigationContext()}}))});
 </script>
 </body>
 </html>

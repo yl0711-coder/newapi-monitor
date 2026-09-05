@@ -18,13 +18,47 @@ func TestCapacityBucketPolicy(t *testing.T) {
 	for _, tc := range []struct {
 		hours int
 		want  int64
-	}{{1, 60}, {6, 60}, {24, 300}, {168, 900}} {
+	}{{1, 60}, {6, 60}, {24, 300}, {168, 1800}} {
 		if got := capacityBucketSeconds(tc.hours); got != tc.want {
 			t.Fatalf("hours=%d bucket=%d want=%d", tc.hours, got, tc.want)
 		}
 	}
 	if capacityHours("7") != 24 || capacityHours("168") != 168 {
 		t.Fatal("时间范围必须只接受有界白名单")
+	}
+}
+
+func TestCapacityBucketPolicySupportsTenAndThirtyMinuteCurves(t *testing.T) {
+	for _, tc := range []struct {
+		seconds int64
+		want    int64
+	}{{6 * 3600, 60}, {24 * 3600, 300}, {72 * 3600, 600}, {7 * 86400, 1800}} {
+		if got := capacityBucketSecondsForRange(tc.seconds); got != tc.want {
+			t.Fatalf("seconds=%d bucket=%d want=%d", tc.seconds, got, tc.want)
+		}
+	}
+}
+
+func TestCapacityCustomRangeIsMinuteAlignedAndRetentionBounded(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	now := int64(1_800_000_000)
+	request := func(path string) *gin.Context {
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		c.Request = httptest.NewRequest(http.MethodGet, path, nil)
+		return c
+	}
+	from := now/60*60 - 48*3600
+	to := now / 60 * 60
+	f, end, bucket, err := capacityQueryRange(request("/?from="+strconv.FormatInt(from, 10)+"&to="+strconv.FormatInt(to, 10)), now, 7)
+	if err != nil || f != from || end != to || bucket != 600 {
+		t.Fatalf("custom range=(%d,%d,%d) err=%v", f, end, bucket, err)
+	}
+	if _, _, _, err := capacityQueryRange(request("/?from=61&to=121"), now, 7); err == nil {
+		t.Fatal("未按分钟对齐的范围必须拒绝")
+	}
+	if _, _, _, err := capacityQueryRange(request("/?from="+strconv.FormatInt(to-8*86400, 10)+"&to="+strconv.FormatInt(to, 10)), now, 7); err == nil {
+		t.Fatal("超过分钟事实留存的范围必须拒绝")
 	}
 }
 
@@ -104,6 +138,38 @@ func TestBuildCapacityReportUsesOnlyLocalFactsAndFilters(t *testing.T) {
 	}
 	if got := report.Breakdowns["channels"]; len(got) != 1 || got[0].Label != "#7 channel-seven" {
 		t.Fatalf("渠道维度映射错误: %+v", got)
+	}
+}
+
+func TestCapacityUserFilterUsesMinuteFactsAndExcludesUnattributableRejections(t *testing.T) {
+	m := newTestMonitor(t)
+	m.cfg.CapacityEnabled = true
+	m.cfg.IngestToken = "configured"
+	rows := []CapacityUserMinuteSample{
+		{BucketTs: 120, UserID: 7, Username: "alice", ChannelID: 9, ModelName: "m1", Grp: "g1", Success: 2, Failed: 1, Tokens: 900},
+		{BucketTs: 120, UserID: 8, Username: "bob", ChannelID: 9, ModelName: "m1", Grp: "g1", Success: 50, Tokens: 5000},
+	}
+	if err := m.storeDB.Create(&rows).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := m.storeDB.Create(&MetricSample{BucketTs: 120, ChannelID: 9, ModelName: "m1", Grp: "g1", Success: 52, Failed: 1, Tokens: 5900}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := m.storeDB.Create(&RejectionSample{BucketTs: 120, Node: "n", Reason: "no_channel", Model: "m1", Grp: "g1", Count: 10}).Error; err != nil {
+		t.Fatal(err)
+	}
+	report, err := m.buildCapacityReportFiltered(context.Background(), 60, 180, 60, 9, 7, "g1", "m1", 240)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Summary.LoggedRequests != 3 || report.Summary.RejectedRequests != 0 || report.Summary.Tokens != 900 {
+		t.Fatalf("用户组合筛选口径错误: %+v", report.Summary)
+	}
+	if report.Summary.PeakConcurrency != nil || len(report.Series) != 1 || report.Series[0].P95Seconds != nil {
+		t.Fatalf("用户事实不能伪造延迟/并发: summary=%+v series=%+v", report.Summary, report.Series)
+	}
+	if got, ranking := report.Options["users"], report.Breakdowns["users"]; len(got) != 2 || len(ranking) != 1 || ranking[0].Label != "#7 alice" {
+		t.Fatalf("用户搜索目录/排名错误: options=%+v ranking=%+v", got, report.Breakdowns["users"])
 	}
 }
 
@@ -240,8 +306,9 @@ func TestCapacityHandlerExcludesCurrentMinuteAndOldTrafficVersion(t *testing.T) 
 		t.Fatalf("当前未完整分钟或旧口径混入容量事实: %+v", report.Summary)
 	}
 	source := report.Meta.Sources["business_log"]
-	if source.Watermark != currentMinute-60 || source.FilteredWatermark != currentMinute-120 || report.Summary.CurrentAt != currentMinute-120 {
-		t.Fatalf("全局采集水位、筛选最后事件和最新观测必须分离: source=%+v summary=%+v", source, report.Summary)
+	if source.Watermark != currentMinute-60 || source.FilteredWatermark != currentMinute-60 || report.Summary.CurrentAt != currentMinute-60 ||
+		report.Summary.CurrentBusinessRPM == nil || *report.Summary.CurrentBusinessRPM != 0 {
+		t.Fatalf("筛选无流量的已覆盖分钟必须明确落到零值: source=%+v summary=%+v", source, report.Summary)
 	}
 }
 
@@ -289,6 +356,26 @@ func TestCapacityMetricPlanUsesBucketIndex(t *testing.T) {
 	}
 }
 
+func TestCapacityUserMetricPlanUsesUserAndBucketIndex(t *testing.T) {
+	m := newTestMonitor(t)
+	type planRow struct{ Detail string }
+	var plan []planRow
+	err := m.storeDB.Raw(`EXPLAIN QUERY PLAN SELECT bucket_ts, SUM(success) FROM capacity_user_minute_samples
+		WHERE user_id = ? AND bucket_ts >= ? AND bucket_ts < ? AND traffic_class_version = ? GROUP BY bucket_ts`,
+		7, 1, 2, userTrafficClassificationVersion).Scan(&plan).Error
+	if err != nil {
+		t.Fatal(err)
+	}
+	var joined strings.Builder
+	for _, row := range plan {
+		joined.WriteString(row.Detail)
+		joined.WriteByte('\n')
+	}
+	if !strings.Contains(joined.String(), "idx_capacity_user_minute_user_bucket") {
+		t.Fatalf("用户时间区间查询必须命中 user+bucket 复合索引: %s", joined.String())
+	}
+}
+
 func TestCapacitySevenDaySeriesIsBounded(t *testing.T) {
 	m := newTestMonitor(t)
 	const minutes = 7 * 24 * 60
@@ -306,12 +393,12 @@ func TestCapacitySevenDaySeriesIsBounded(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), capacityQueryTimeout)
 	defer cancel()
 	start := time.Now()
-	report, err := m.buildCapacityReport(ctx, 60, int64(minutes+1)*60, 900, 0, "", "", int64(minutes+2)*60)
+	report, err := m.buildCapacityReport(ctx, 60, int64(minutes+1)*60, 1800, 0, "", "", int64(minutes+2)*60)
 	if err != nil {
 		t.Fatal(err)
 	}
-	// 区间两端各可能有一个不完整的 UTC 15 分钟桶，因此最多 672+1 点。
-	if len(report.Series) > 7*24*4+1 || len(report.Breakdowns["groups"]) > 20 || len(report.Options["groups"]) != 35 {
+	// 区间两端各可能有一个不完整的 UTC 30 分钟桶，因此最多 336+1 点。
+	if len(report.Series) > 7*24*2+1 || len(report.Breakdowns["groups"]) > 20 || len(report.Options["groups"]) != 35 {
 		t.Fatalf("7 天响应未保持有界: series=%d breakdown=%d options=%d", len(report.Series), len(report.Breakdowns["groups"]), len(report.Options["groups"]))
 	}
 	if elapsed := time.Since(start); elapsed >= capacityQueryTimeout {

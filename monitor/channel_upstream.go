@@ -34,6 +34,7 @@ const (
 	upstreamProviderNewAPI     = "newapi"
 	upstreamProviderSub2API    = "sub2api"
 	upstreamProviderAICodeWith = "aicodewith"
+	upstreamProviderTokenForce = "tokenforce"
 
 	upstreamStatusPending     = "pending"
 	upstreamStatusOK          = "ok"
@@ -240,7 +241,10 @@ type ChannelUpstreamAccountView struct {
 	APIKeyCount                   int                               `json:"api_key_count,omitempty"`
 	APIKeySlots                   []AICodeWithKeySlotView           `json:"api_key_slots,omitempty"`
 	BalanceUSD                    *float64                          `json:"balance_usd,omitempty"`
+	BalanceRaw                    *float64                          `json:"balance_raw,omitempty"`
 	Currency                      string                            `json:"currency,omitempty"`
+	NativeCurrency                string                            `json:"native_currency,omitempty"`
+	UnitPerUSD                    float64                           `json:"unit_per_usd,omitempty"`
 	UnitAssumed                   bool                              `json:"unit_assumed,omitempty"`
 	Status                        string                            `json:"status,omitempty"`
 	LastError                     string                            `json:"last_error,omitempty"`
@@ -345,6 +349,7 @@ type channelUpstreamSaveInput struct {
 	Email             string                       `json:"email"`
 	Password          string                       `json:"password"`
 	RefreshToken      string                       `json:"refresh_token"`
+	UnitPerUSD        float64                      `json:"unit_per_usd"`
 	UsageSyncEnabled  *bool                        `json:"usage_sync_enabled"`
 }
 
@@ -360,6 +365,7 @@ type channelUpstreamConfigView struct {
 	UsageSyncEnabled bool                       `json:"usage_sync_enabled"`
 	UserID           int64                      `json:"user_id,omitempty"`
 	Email            string                     `json:"email,omitempty"`
+	UnitPerUSD       float64                    `json:"unit_per_usd,omitempty"`
 	Account          ChannelUpstreamAccountView `json:"account"`
 }
 
@@ -368,6 +374,12 @@ type newAPICredential struct {
 }
 
 type sub2APICredential struct {
+	AccessToken  string `json:"access_token"`
+	RefreshToken string `json:"refresh_token"`
+	ExpiresAt    int64  `json:"expires_at"`
+}
+
+type tokenForceCredential struct {
 	AccessToken  string `json:"access_token"`
 	RefreshToken string `json:"refresh_token"`
 	ExpiresAt    int64  `json:"expires_at"`
@@ -435,6 +447,8 @@ func upstreamProviderName(provider string) string {
 		return "Sub2API"
 	case upstreamProviderAICodeWith:
 		return "AICodeWith（春秋）"
+	case upstreamProviderTokenForce:
+		return "海南海纳（TokenForce MaaS）"
 	default:
 		return provider
 	}
@@ -450,6 +464,8 @@ func upstreamUsageAdapterName(provider, adapter string) string {
 		return "Sub2API 单日汇总（兼容模式）"
 	case upstreamUsageAdapterAICodeWith:
 		return "AICodeWith 按 Key 日账单"
+	case upstreamUsageAdapterTokenForce:
+		return "TokenForce 分页调用明细"
 	}
 	switch provider {
 	case upstreamProviderNewAPI:
@@ -458,6 +474,8 @@ func upstreamUsageAdapterName(provider, adapter string) string {
 		return "Sub2API 账户用量"
 	case upstreamProviderAICodeWith:
 		return "AICodeWith 按 Key 日账单"
+	case upstreamProviderTokenForce:
+		return "TokenForce 分页调用明细"
 	default:
 		return ""
 	}
@@ -830,6 +848,12 @@ func upstreamCredentialSecrets(credential any) []string {
 		if cred != nil {
 			return []string{cred.AccessToken, cred.RefreshToken}
 		}
+	case tokenForceCredential:
+		return []string{cred.AccessToken, cred.RefreshToken}
+	case *tokenForceCredential:
+		if cred != nil {
+			return []string{cred.AccessToken, cred.RefreshToken}
+		}
 	case aiCodeWithCredential:
 		keys, _ := aiCodeWithCredentialKeys(cred)
 		return keys
@@ -865,6 +889,10 @@ func maskUpstreamAccount(provider, account string, userID int64) string {
 			}
 		}
 		return "API Key 已配置"
+	case upstreamProviderTokenForce:
+		if userID > 0 {
+			return fmt.Sprintf("组织 ID %d", userID)
+		}
 	}
 	return "已配置"
 }
@@ -1009,6 +1037,14 @@ func upstreamAccountView(row ChannelUpstreamAccount) ChannelUpstreamAccountView 
 	if row.BalanceKnown {
 		balance := row.BalanceUSD
 		view.BalanceUSD = &balance
+		if row.Provider == upstreamProviderTokenForce {
+			raw := row.BalanceRaw
+			view.BalanceRaw = &raw
+		}
+	}
+	if row.Provider == upstreamProviderTokenForce {
+		view.NativeCurrency = "CNY"
+		view.UnitPerUSD = row.BalanceUnit
 	}
 	return view
 }
@@ -2015,6 +2051,240 @@ func syncSub2APIBalance(ctx context.Context, client *http.Client, row ChannelUps
 	return upstreamBalanceResult{}, cred, err
 }
 
+type tokenForceAPIError struct {
+	Status  int
+	Code    string
+	Message string
+}
+
+func (e *tokenForceAPIError) Error() string {
+	message := strings.TrimSpace(e.Message)
+	if message == "" {
+		message = strings.TrimSpace(e.Code)
+	}
+	if message == "" {
+		message = fmt.Sprintf("错误码 %d", e.Status)
+	}
+	return "TokenForce：" + sanitizeUpstreamError(errors.New(message))
+}
+
+func (e *tokenForceAPIError) authenticationFailure() bool {
+	if e == nil {
+		return false
+	}
+	code := strings.ToUpper(strings.TrimSpace(e.Code))
+	return e.Status == 10023 || e.Status == 10025 || strings.Contains(code, "TOKEN_EXPIRED") || strings.Contains(code, "UNAUTHORIZED")
+}
+
+func decodeTokenForceData(body []byte, out any) error {
+	var envelope struct {
+		Status  int             `json:"status"`
+		Message string          `json:"message"`
+		Result  json.RawMessage `json:"result"`
+		Error   struct {
+			Code string `json:"code"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(body, &envelope); err != nil {
+		return fmt.Errorf("TokenForce 响应格式无效")
+	}
+	if envelope.Status != 0 {
+		return &tokenForceAPIError{Status: envelope.Status, Code: envelope.Error.Code, Message: envelope.Message}
+	}
+	if len(envelope.Result) == 0 || string(envelope.Result) == "null" {
+		return fmt.Errorf("TokenForce 响应缺少 result")
+	}
+	if err := json.Unmarshal(envelope.Result, out); err != nil {
+		return fmt.Errorf("TokenForce 数据格式无效")
+	}
+	return nil
+}
+
+func tokenForceAccessTokenExpiry(raw json.RawMessage, accessToken string, now int64) int64 {
+	parseNumber := func(value float64) int64 {
+		if value <= 0 || value > math.MaxInt64 || math.IsNaN(value) || math.IsInf(value, 0) {
+			return 0
+		}
+		if value > 1e12 { // Unix milliseconds.
+			return int64(value / 1000)
+		}
+		if value > float64(now-86400) { // Unix seconds.
+			return int64(value)
+		}
+		if value <= 31*86400 { // Relative lifetime in seconds.
+			return now + int64(value)
+		}
+		return 0
+	}
+	if len(raw) > 0 && string(raw) != "null" {
+		if value, err := rawJSONNumber(raw); err == nil {
+			if expiry := parseNumber(value); expiry > 0 {
+				return expiry
+			}
+		}
+		var text string
+		if json.Unmarshal(raw, &text) == nil {
+			if value, err := strconv.ParseFloat(strings.TrimSpace(text), 64); err == nil {
+				if expiry := parseNumber(value); expiry > 0 {
+					return expiry
+				}
+			}
+			for _, layout := range []string{time.RFC3339, "2006/01/02 15:04:05", "2006-01-02 15:04:05"} {
+				var parsed time.Time
+				var err error
+				if strings.Contains(layout, "Z07") {
+					parsed, err = time.Parse(layout, strings.TrimSpace(text))
+				} else {
+					parsed, err = time.ParseInLocation(layout, strings.TrimSpace(text), cstLocation)
+				}
+				if err == nil {
+					return parsed.Unix()
+				}
+			}
+		}
+	}
+	parts := strings.Split(accessToken, ".")
+	if len(parts) == 3 {
+		if payload, err := base64.RawURLEncoding.DecodeString(parts[1]); err == nil {
+			var claims struct {
+				Exp json.RawMessage `json:"exp"`
+			}
+			if json.Unmarshal(payload, &claims) == nil {
+				if value, err := rawJSONNumber(claims.Exp); err == nil {
+					if expiry := parseNumber(value); expiry > 0 {
+						return expiry
+					}
+				}
+			}
+		}
+	}
+	// Unknown formats are not trusted as long-lived. The access token can be
+	// used briefly; the next run refreshes it again instead of assuming expiry.
+	return now + 5*60
+}
+
+func refreshTokenForce(ctx context.Context, client *http.Client, row ChannelUpstreamAccount, cred tokenForceCredential) (tokenForceCredential, error) {
+	if strings.TrimSpace(cred.RefreshToken) == "" {
+		return cred, &upstreamAuthError{err: fmt.Errorf("TokenForce Refresh Token 为空，请重新连接")}
+	}
+	body, err := doUpstreamJSON(ctx, client, http.MethodPost, upstreamEndpoint(row.BaseURL, "/api/sys/login/refresh"), nil, map[string]string{
+		"refreshToken": cred.RefreshToken,
+	})
+	if err != nil {
+		var statusErr *upstreamHTTPError
+		if errors.As(err, &statusErr) && statusErr.Status >= 400 && statusErr.Status < 500 {
+			return cred, &upstreamAuthError{err: err}
+		}
+		return cred, err
+	}
+	var auth struct {
+		Token        string          `json:"token"`
+		AccessToken  string          `json:"accessToken"`
+		RefreshToken string          `json:"refreshToken"`
+		Expires      json.RawMessage `json:"expires"`
+		ExpiresIn    json.RawMessage `json:"expiresIn"`
+	}
+	if err := decodeTokenForceData(body, &auth); err != nil {
+		var apiErr *tokenForceAPIError
+		if errors.As(err, &apiErr) && apiErr.authenticationFailure() {
+			return cred, &upstreamAuthError{err: err}
+		}
+		return cred, err
+	}
+	accessToken := strings.TrimSpace(auth.Token)
+	if accessToken == "" {
+		// Some white-label tenants name the same response field accessToken.
+		// Accept the explicit alias, but never guess any other credential field.
+		accessToken = strings.TrimSpace(auth.AccessToken)
+	}
+	if accessToken == "" || strings.TrimSpace(auth.RefreshToken) == "" {
+		return cred, fmt.Errorf("TokenForce 刷新未返回完整令牌")
+	}
+	now := time.Now().Unix()
+	expires := auth.Expires
+	if len(expires) == 0 {
+		expires = auth.ExpiresIn
+	}
+	return tokenForceCredential{
+		AccessToken: accessToken, RefreshToken: auth.RefreshToken,
+		ExpiresAt: tokenForceAccessTokenExpiry(expires, accessToken, now),
+	}, nil
+}
+
+func importTokenForceSession(ctx context.Context, client *http.Client, row ChannelUpstreamAccount, refreshToken string) (tokenForceCredential, error) {
+	refreshToken = strings.TrimSpace(refreshToken)
+	if refreshToken == "" {
+		return tokenForceCredential{}, fmt.Errorf("TokenForce Refresh Token 为空")
+	}
+	return refreshTokenForce(ctx, client, row, tokenForceCredential{RefreshToken: refreshToken})
+}
+
+func tokenForceBalance(ctx context.Context, client *http.Client, row ChannelUpstreamAccount, cred tokenForceCredential) (upstreamBalanceResult, error) {
+	if row.UserID <= 0 {
+		return upstreamBalanceResult{}, fmt.Errorf("TokenForce 组织 ID 无效")
+	}
+	if row.BalanceUnit <= 0 || math.IsNaN(row.BalanceUnit) || math.IsInf(row.BalanceUnit, 0) {
+		return upstreamBalanceResult{}, fmt.Errorf("TokenForce CNY/USD 换算值无效")
+	}
+	body, err := doUpstreamJSON(ctx, client, http.MethodGet,
+		upstreamEndpoint(row.BaseURL, fmt.Sprintf("/api/orgs/%d/balance", row.UserID)),
+		map[string]string{"Authorization": "Bearer " + cred.AccessToken}, nil)
+	if err != nil {
+		return upstreamBalanceResult{}, err
+	}
+	var balance struct {
+		CurrentBalance json.RawMessage `json:"currentBalance"`
+	}
+	if err := decodeTokenForceData(body, &balance); err != nil {
+		var apiErr *tokenForceAPIError
+		if errors.As(err, &apiErr) && apiErr.authenticationFailure() {
+			return upstreamBalanceResult{}, &upstreamAuthError{err: err}
+		}
+		return upstreamBalanceResult{}, err
+	}
+	raw, err := rawJSONNumber(balance.CurrentBalance)
+	if err != nil || math.IsNaN(raw) || math.IsInf(raw, 0) {
+		return upstreamBalanceResult{}, fmt.Errorf("TokenForce 未返回有效 currentBalance")
+	}
+	return upstreamBalanceResult{BalanceUSD: raw / row.BalanceUnit, BalanceRaw: raw, BalanceUnit: row.BalanceUnit}, nil
+}
+
+func syncTokenForceBalance(ctx context.Context, client *http.Client, row ChannelUpstreamAccount, cred tokenForceCredential) (upstreamBalanceResult, tokenForceCredential, error) {
+	refreshed := false
+	if cred.AccessToken == "" || cred.ExpiresAt <= time.Now().Add(2*time.Minute).Unix() {
+		var err error
+		cred, err = refreshTokenForce(ctx, client, row, cred)
+		if err != nil {
+			return upstreamBalanceResult{}, cred, err
+		}
+		refreshed = true
+	}
+	result, err := tokenForceBalance(ctx, client, row, cred)
+	if err == nil {
+		return result, cred, nil
+	}
+	var authErr *upstreamAuthError
+	var statusErr *upstreamHTTPError
+	if !refreshed && errors.As(err, &authErr) {
+		updated, refreshErr := refreshTokenForce(ctx, client, row, cred)
+		if refreshErr != nil {
+			return upstreamBalanceResult{}, cred, refreshErr
+		}
+		cred = updated
+		result, err = tokenForceBalance(ctx, client, row, cred)
+		if err == nil {
+			return result, cred, nil
+		}
+	}
+	if errors.As(err, &authErr) {
+		return upstreamBalanceResult{}, cred, err
+	}
+	if errors.As(err, &statusErr) && (statusErr.Status == http.StatusUnauthorized || statusErr.Status == http.StatusForbidden) {
+		return upstreamBalanceResult{}, cred, &upstreamAuthError{err: err}
+	}
+	return upstreamBalanceResult{}, cred, err
+}
+
 func (m *Monitor) syncUpstreamCredential(ctx context.Context, row ChannelUpstreamAccount, credential any) (upstreamBalanceResult, any, error) {
 	client := m.channelUpstreamHTTPClient()
 	switch row.Provider {
@@ -2038,6 +2308,13 @@ func (m *Monitor) syncUpstreamCredential(ctx context.Context, row ChannelUpstrea
 			return upstreamBalanceResult{}, credential, fmt.Errorf("AICodeWith 凭据格式无效")
 		}
 		result, updated, err := syncAICodeWithBalance(ctx, client, row, cred)
+		return result, updated, err
+	case upstreamProviderTokenForce:
+		cred, ok := credential.(tokenForceCredential)
+		if !ok {
+			return upstreamBalanceResult{}, credential, fmt.Errorf("TokenForce 凭据格式无效")
+		}
+		result, updated, err := syncTokenForceBalance(ctx, client, row, cred)
 		return result, updated, err
 	default:
 		return upstreamBalanceResult{}, credential, fmt.Errorf("不支持的中转站类型")
@@ -2123,6 +2400,9 @@ func (m *Monitor) credentialForAccount(row ChannelUpstreamAccount) (any, error) 
 		return cred, m.openUpstreamCredential(row, &cred)
 	case upstreamProviderAICodeWith:
 		var cred aiCodeWithCredential
+		return cred, m.openUpstreamCredential(row, &cred)
+	case upstreamProviderTokenForce:
+		var cred tokenForceCredential
 		return cred, m.openUpstreamCredential(row, &cred)
 	default:
 		return nil, fmt.Errorf("不支持的中转站类型")
@@ -2430,8 +2710,21 @@ func validateChannelUpstreamInput(in *channelUpstreamSaveInput) error {
 		in.AddAPIKeySlots = structuredAdditions
 		in.RenameAPIKeySlots = renames
 		in.RemoveAPIKeyIDs = removals
+	case upstreamProviderTokenForce:
+		if in.UserID <= 0 {
+			return fmt.Errorf("TokenForce 组织 ID 必须大于 0")
+		}
+		if in.RefreshToken == "" && in.AccessToken != "" {
+			return fmt.Errorf("TokenForce 只接受可轮换的 Refresh Token，不接受短期 Access Token")
+		}
+		if len(in.RefreshToken) > 16<<10 {
+			return fmt.Errorf("TokenForce Refresh Token 过长")
+		}
+		if in.UnitPerUSD <= 0 || in.UnitPerUSD > 1_000_000 || math.IsNaN(in.UnitPerUSD) || math.IsInf(in.UnitPerUSD, 0) {
+			return fmt.Errorf("TokenForce CNY/每 USD 换算值必须大于 0")
+		}
 	default:
-		return fmt.Errorf("当前只支持 NewAPI、Sub2API 和 AICodeWith")
+		return fmt.Errorf("当前只支持 NewAPI、Sub2API、AICodeWith 和 TokenForce MaaS")
 	}
 	return nil
 }
@@ -2466,6 +2759,9 @@ func (m *Monitor) getChannelUpstreamHandler(c *gin.Context) {
 	view := channelUpstreamConfigView{
 		Domain: domain, Provider: row.Provider, BaseURL: row.BaseURL, Enabled: row.Enabled,
 		UsageSyncEnabled: row.UsageSyncEnabled, UserID: row.UserID, Account: m.channelUpstreamAccountView(row),
+	}
+	if row.Provider == upstreamProviderTokenForce {
+		view.UnitPerUSD = row.BalanceUnit
 	}
 	view.Account.APIKeySlots = m.aicodeWithSlotViews(ctx, row)
 	if row.Provider == upstreamProviderSub2API {
@@ -2552,6 +2848,7 @@ func (m *Monitor) saveChannelUpstreamHandler(c *gin.Context) {
 	var credential any
 	var existingAICodeWithCredential *aiCodeWithCredential
 	preserveSealedCredential := false
+	economicUnitChanged := false
 	credentialUpdated := in.AccessToken != "" || len(in.APIKeys) > 0 || len(in.AddAPIKeys) > 0 || len(in.AddAPIKeySlots) > 0 || len(in.RemoveAPIKeyIDs) > 0 || in.Password != "" || in.RefreshToken != ""
 	credentialMetadataChanged := len(in.RenameAPIKeySlots) > 0
 	sameIdentity := existingErr == nil && existing.Provider == in.Provider && existing.BaseURL == in.BaseURL
@@ -2638,6 +2935,24 @@ func (m *Monitor) saveChannelUpstreamHandler(c *gin.Context) {
 				row.UsageBackfillNextSyncAt = 0
 			}
 		}
+	case upstreamProviderTokenForce:
+		row.UserID = in.UserID
+		row.Account = "org:" + strconv.FormatInt(in.UserID, 10)
+		row.BalanceUnit = in.UnitPerUSD
+		sameIdentity = sameIdentity && existing.UserID == in.UserID
+		if sameIdentity {
+			economicUnitChanged = math.Abs(existing.BalanceUnit-in.UnitPerUSD) > 1e-12
+		}
+		if in.RefreshToken != "" {
+			credential, err = importTokenForceSession(ctx, m.channelUpstreamHTTPClient(), row, in.RefreshToken)
+		} else if sameIdentity && !row.Enabled {
+			row.Credential, row.CredentialVersion = existing.Credential, existing.CredentialVersion
+			preserveSealedCredential = true
+		} else if sameIdentity {
+			credential, err = m.credentialForAccount(existing)
+		} else {
+			err = fmt.Errorf("首次连接或变更 TokenForce 组织时必须填写 Refresh Token")
+		}
 	}
 	if sameIdentity {
 		row.BalanceUSD, row.BalanceKnown, row.BalanceRaw = existing.BalanceUSD, existing.BalanceKnown, existing.BalanceRaw
@@ -2665,6 +2980,24 @@ func (m *Monitor) saveChannelUpstreamHandler(c *gin.Context) {
 			row.UsageBackfillNextSyncAt, row.UsageBackfillConsecutiveFails = 0, 0
 			row.UsageBackfillLastError = ""
 			row.UsageBackfillProgress = ""
+		}
+	}
+	if row.Provider == upstreamProviderTokenForce {
+		// BalanceUnit is an explicit settlement conversion, not a value learned
+		// from the upstream. Preserve the new form value after the common state
+		// copy above. Existing raw balance can be re-normalized even while the
+		// account is temporarily disabled.
+		row.BalanceUnit, row.UnitAssumed = in.UnitPerUSD, false
+		if row.BalanceKnown && row.BalanceUnit > 0 {
+			row.BalanceUSD = row.BalanceRaw / row.BalanceUnit
+		}
+		if economicUnitChanged {
+			row.UsageStatus, row.UsageLastError = upstreamStatusPending, ""
+			row.UsageNextSyncAt, row.UsageConsecutiveFails = 0, 0
+			row.UsageBackfillCursor, row.UsageBackfillDone = 0, false
+			row.UsageBackfillNextSyncAt, row.UsageBackfillConsecutiveFails = 0, 0
+			row.UsageBackfillLastError, row.UsageBackfillProgress = "", ""
+			row.UsageDataUntil = 0
 		}
 	}
 	if credentialSetChanged {
@@ -2719,7 +3052,7 @@ func (m *Monitor) saveChannelUpstreamHandler(c *gin.Context) {
 				return
 			}
 		}
-		clearUsage := existingErr == nil && !sameIdentity && !(in.Provider == upstreamProviderAICodeWith && existing.Provider == upstreamProviderAICodeWith && existing.BaseURL == in.BaseURL)
+		clearUsage := existingErr == nil && (!sameIdentity || economicUnitChanged) && !(in.Provider == upstreamProviderAICodeWith && existing.Provider == upstreamProviderAICodeWith && existing.BaseURL == in.BaseURL)
 		var persistErr error
 		recoverErrorLogAuth := row.Provider == upstreamProviderNewAPI && sameIdentity && credentialUpdated
 		if cred, ok := credential.(aiCodeWithCredential); ok && row.Provider == upstreamProviderAICodeWith && !preserveSealedCredential {
@@ -2772,7 +3105,7 @@ func (m *Monitor) saveChannelUpstreamHandler(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "保存上游配置失败"})
 		return
 	}
-	clearUsage := existingErr == nil && !sameIdentity && !(in.Provider == upstreamProviderAICodeWith && existing.Provider == upstreamProviderAICodeWith && existing.BaseURL == in.BaseURL)
+	clearUsage := existingErr == nil && (!sameIdentity || economicUnitChanged) && !(in.Provider == upstreamProviderAICodeWith && existing.Provider == upstreamProviderAICodeWith && existing.BaseURL == in.BaseURL)
 	var persistErr error
 	recoverErrorLogAuth := row.Provider == upstreamProviderNewAPI && sameIdentity && credentialUpdated
 	if cred, ok := credential.(aiCodeWithCredential); ok && row.Provider == upstreamProviderAICodeWith {
@@ -2838,8 +3171,8 @@ func (m *Monitor) startChannelUpstreamSync(ctx context.Context) {
 	// 这条 lane 只读写 Monitor SQLite，无上游 I/O，因此先于余额、日志和
 	// 计价采集闸门启动；上游全部停采时也不会丢失已排程任务。
 	m.startChannelFinanceActivationLane(ctx, 7*time.Second)
-	if !m.cfg.UpstreamSyncEnabled && !m.cfg.UpstreamUsageSyncEnabled && !m.cfg.UpstreamPricingLedgerEnabled && !m.cfg.UpstreamErrorLogSyncEnabled {
-		slog.Info("上游余额、消费账单、计价证据与错误日志采集均已关闭")
+	if !m.cfg.UpstreamSyncEnabled && !m.cfg.UpstreamUsageSyncEnabled && !m.cfg.UpstreamPricingLedgerEnabled && !m.cfg.UpstreamErrorLogSyncEnabled && !m.cfg.UpstreamFundsSyncEnabled {
+		slog.Info("上游余额、消费账单、计价证据、错误日志与资金流水采集均已关闭")
 		return
 	}
 
@@ -2860,6 +3193,9 @@ func (m *Monitor) startChannelUpstreamSync(ctx context.Context) {
 	}
 	if !m.cfg.UpstreamErrorLogSyncEnabled {
 		slog.Info("上游错误日志采集处于灰度关闭状态，其余同步不受影响")
+	}
+	if !m.cfg.UpstreamFundsSyncEnabled {
+		slog.Info("上游资金流水采集处于灰度关闭状态，其余同步不受影响")
 	}
 	// Keep the lanes independent. A slow balance provider must not delay usage
 	// freshness or pricing evidence until the whole balance batch finishes.
@@ -2884,6 +3220,11 @@ func (m *Monitor) startChannelUpstreamSync(ctx context.Context) {
 		goSourceEpoch(ctx, func(laneCtx context.Context) {
 			// 同步器内部仍有 5 分钟节流和失败退避；每分钟只做到期检查。
 			runUpstreamPeriodicLane(laneCtx, 11*time.Second, time.Minute, m.syncDueUpstreamErrorLogs)
+		})
+	}
+	if m.cfg.UpstreamFundsSyncEnabled {
+		goSourceEpoch(ctx, func(laneCtx context.Context) {
+			runUpstreamPeriodicLane(laneCtx, 12*time.Second, time.Minute, m.syncDueUpstreamFunds)
 		})
 	}
 	goSourceEpoch(ctx, func(cleanupCtx context.Context) {

@@ -3,6 +3,7 @@ package monitor
 import (
 	"context"
 	"log/slog"
+	"strconv"
 	"strings"
 	"time"
 
@@ -11,6 +12,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/cloudwatch"
 	cwtypes "github.com/aws/aws-sdk-go-v2/service/cloudwatch/types"
 	"github.com/aws/aws-sdk-go-v2/service/ecs"
+	ecstypes "github.com/aws/aws-sdk-go-v2/service/ecs/types"
 	"github.com/aws/aws-sdk-go-v2/service/elasticloadbalancingv2"
 	elbtypes "github.com/aws/aws-sdk-go-v2/service/elasticloadbalancingv2/types"
 	"github.com/aws/aws-sdk-go-v2/service/rds"
@@ -23,11 +25,101 @@ type cloudWatchMetricAPI interface {
 	GetMetricStatistics(context.Context, *cloudwatch.GetMetricStatisticsInput, ...func(*cloudwatch.Options)) (*cloudwatch.GetMetricStatisticsOutput, error)
 }
 
+type ecsTaskHealthAPI interface {
+	ListTasks(context.Context, *ecs.ListTasksInput, ...func(*ecs.Options)) (*ecs.ListTasksOutput, error)
+	DescribeTasks(context.Context, *ecs.DescribeTasksInput, ...func(*ecs.Options)) (*ecs.DescribeTasksOutput, error)
+}
+
 type managedMetricSpec struct {
 	name  string
 	key   string
 	stat  cwtypes.Statistic
 	scale float64
+}
+
+type ecsServiceTaskSnapshot struct {
+	HealthChecked       int
+	Unhealthy           int
+	MemoryReservedMB    float64
+	EphemeralReservedGB float64
+}
+
+// ecsContainerInsightsSpecs are optional, service-level metrics emitted only
+// when Container Insights is enabled for the cluster. Keeping them separate
+// from the always-on AWS/ECS metrics gives us a clean fallback: a cluster can
+// be observed before the feature is enabled, and starts exposing the richer
+// Fargate telemetry without changing or restarting Monitor.
+func ecsContainerInsightsSpecs() []managedMetricSpec {
+	return []managedMetricSpec{
+		{name: "MemoryUtilized", key: "mem_used_mb", stat: cwtypes.StatisticAverage, scale: 1},
+		{name: "MemoryReserved", key: "mem_total_mb", stat: cwtypes.StatisticAverage, scale: 1},
+		{name: "EphemeralStorageUtilized", key: "disk_used_gb", stat: cwtypes.StatisticAverage, scale: 1},
+		{name: "EphemeralStorageReserved", key: "disk_total_gb", stat: cwtypes.StatisticAverage, scale: 1},
+		{name: "NetworkRxBytes", key: "net_in_kb", stat: cwtypes.StatisticAverage, scale: 1024},
+		{name: "NetworkTxBytes", key: "net_out_kb", stat: cwtypes.StatisticAverage, scale: 1024},
+		{name: "RestartCount", key: "restart_count", stat: cwtypes.StatisticMaximum, scale: 1},
+	}
+}
+
+// ecsServiceContainerHealth reads the current ECS control-plane state. The
+// enhanced UnHealthyContainerHealthStatus metric has no service-only
+// dimension (it also requires ContainerName), so querying it with only
+// ClusterName/ServiceName silently produces no datapoints. DescribeTasks is
+// both cheaper and authoritative for the current state. UNKNOWN is deliberately
+// not treated as healthy: it means no task-definition health check is present.
+func ecsServiceTaskState(ctx context.Context, client ecsTaskHealthAPI, clusterARN, serviceName string) (snapshot ecsServiceTaskSnapshot, err error) {
+	var token *string
+	for {
+		listed, listErr := client.ListTasks(ctx, &ecs.ListTasksInput{
+			Cluster: aws.String(clusterARN), ServiceName: aws.String(serviceName),
+			DesiredStatus: ecstypes.DesiredStatusRunning, NextToken: token,
+		})
+		if listErr != nil {
+			return snapshot, listErr
+		}
+		for start := 0; start < len(listed.TaskArns); start += 100 {
+			end := start + 100
+			if end > len(listed.TaskArns) {
+				end = len(listed.TaskArns)
+			}
+			described, describeErr := client.DescribeTasks(ctx, &ecs.DescribeTasksInput{
+				Cluster: aws.String(clusterARN), Tasks: listed.TaskArns[start:end],
+			})
+			if describeErr != nil {
+				return snapshot, describeErr
+			}
+			for _, task := range described.Tasks {
+				if task.LastStatus != nil && aws.ToString(task.LastStatus) != "RUNNING" {
+					continue
+				}
+				if memory, parseErr := strconv.ParseFloat(strings.TrimSpace(aws.ToString(task.Memory)), 64); parseErr == nil && memory > 0 {
+					snapshot.MemoryReservedMB += memory
+				}
+				if task.EphemeralStorage != nil && task.EphemeralStorage.SizeInGiB > 0 {
+					snapshot.EphemeralReservedGB += float64(task.EphemeralStorage.SizeInGiB)
+				}
+				for _, container := range task.Containers {
+					switch container.HealthStatus {
+					case ecstypes.HealthStatusHealthy:
+						snapshot.HealthChecked++
+					case ecstypes.HealthStatusUnhealthy:
+						snapshot.HealthChecked++
+						snapshot.Unhealthy++
+					}
+				}
+			}
+		}
+		if listed.NextToken == nil || strings.TrimSpace(aws.ToString(listed.NextToken)) == "" {
+			break
+		}
+		token = listed.NextToken
+	}
+	return snapshot, nil
+}
+
+func ecsServiceContainerHealth(ctx context.Context, client ecsTaskHealthAPI, clusterARN, serviceName string) (checked, unhealthy int, err error) {
+	snapshot, err := ecsServiceTaskState(ctx, client, clusterARN, serviceName)
+	return snapshot.HealthChecked, snapshot.Unhealthy, err
 }
 
 func (m *Monitor) sampleManagedAWSInfra(ctx context.Context, bucket int64) {
@@ -127,6 +219,30 @@ func collectECSInfra(ctx context.Context, client *ecs.Client, cw cloudWatchMetri
 							{name: "CPUUtilization", key: "cpu", stat: cwtypes.StatisticAverage, scale: 1},
 							{name: "MemoryUtilization", key: "mem_used_pct", stat: cwtypes.StatisticAverage, scale: 1},
 						})
+						// Enhanced Container Insights is intentionally optional. Missing
+						// datapoints are ignored metric-by-metric and never downgrade the
+						// standard service health collected above.
+						rows = appendCloudWatchMetrics(ctx, rows, cw, bucket, resource, "ecs_service", "ECS/ContainerInsights", dims, ecsContainerInsightsSpecs())
+						taskState, taskErr := ecsServiceTaskState(ctx, client, clusterARN, serviceName)
+						if taskErr != nil {
+							slog.Warn("infra managed: ECS 任务状态读取失败(保留服务指标)", "resource", resource, "err", taskErr)
+						} else {
+							if taskState.HealthChecked > 0 {
+								rows = append(rows,
+									managedRow(bucket, resource, "ecs_service", "health_checked", float64(taskState.HealthChecked)),
+									managedRow(bucket, resource, "ecs_service", "unhealthy_containers", float64(taskState.Unhealthy)),
+								)
+							}
+							// DescribeTasks exposes reserved task capacity without paid
+							// Container Insights. This lets the standard MemoryUtilization
+							// percentage render a Lightsail-like used/total value immediately.
+							if taskState.MemoryReservedMB > 0 {
+								rows = append(rows, managedRow(bucket, resource, "ecs_service", "mem_total_mb", taskState.MemoryReservedMB))
+							}
+							if taskState.EphemeralReservedGB > 0 {
+								rows = append(rows, managedRow(bucket, resource, "ecs_service", "disk_total_gb", taskState.EphemeralReservedGB))
+							}
+						}
 						count++
 					}
 				}

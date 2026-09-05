@@ -98,8 +98,14 @@ services:
       MONITOR_UPSTREAM_USAGE_SYNC_ENABLED: "false"
       MONITOR_UPSTREAM_ERRORLOG_SYNC_ENABLED: "false"
       MONITOR_UPSTREAM_ERRORLOG_DOMAINS: ""
+      MONITOR_UPSTREAM_FUNDS_SYNC_ENABLED: "false"
+      MONITOR_UPSTREAM_FUNDS_DOMAINS: ""
       # 计价证据账本也必须显式关闭；本地免登录模式会在应用层再次 fail-closed 校验。
       MONITOR_UPSTREAM_PRICING_LEDGER_ENABLED: "false"
+      # 分组治理页面可在完全离线模式下做 UI 验收；默认关闭，开发时由
+      # run-local-dev.sh 的调用环境显式打开，不会因此启用任何生产来源查询。
+      MONITOR_GROUP_GOVERNANCE_ENABLED: ${MONITOR_GROUP_GOVERNANCE_ENABLED:-false}
+      MONITOR_GROUP_GOVERNANCE_SYNC_MINUTES: ${MONITOR_GROUP_GOVERNANCE_SYNC_MINUTES:-10}
       # 总开关关闭后，旧的 queued/running 任务也不会在本地重启续跑。
       MONITOR_STABILITY_BACKFILL_ENABLED: "false"
       MONITOR_STABILITY_AUTO_REPAIR: "false"

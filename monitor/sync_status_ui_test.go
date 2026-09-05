@@ -85,7 +85,7 @@ func TestSyncStatusPageRendersBothStabilityMigrationsWithCorrectFields(t *testin
 func TestSyncStatusPageAllowsHashNavigation(t *testing.T) {
 	// 白名单是完整字面量断言：新增 tab 时必须同步改这里。
 	// 这样既保证 #tab=sync 仍可直达，也能挡住"误删某个 tab 名"的回归。
-	if !strings.Contains(pageHTML, `/^(sync|model|server|capacity|usage|stability|channels|logchain)$/`) {
+	if !strings.Contains(pageHTML, `/^(sync|model|server|capacity|usage|stability|channels|logchain|group-governance)$/`) {
 		t.Fatal("同步状态页必须能由 #tab=sync 直接打开")
 	}
 	if !strings.Contains(string(stabilityJS), `sync:{title:'数据同步状态'`) {

@@ -242,7 +242,7 @@ func (m *Monitor) buildSyncStatusSnapshotWith(ctx context.Context, now time.Time
 	}
 
 	views, upstreamErr := upstreamResult.Data, upstreamResult.Err
-	upstream := syncUpstreamStatus{Enabled: m.cfg.UpstreamSyncEnabled || m.cfg.UpstreamUsageSyncEnabled || m.cfg.UpstreamPricingLedgerEnabled || m.cfg.UpstreamErrorLogSyncEnabled}
+	upstream := syncUpstreamStatus{Enabled: m.cfg.UpstreamSyncEnabled || m.cfg.UpstreamUsageSyncEnabled || m.cfg.UpstreamPricingLedgerEnabled || m.cfg.UpstreamErrorLogSyncEnabled || m.cfg.UpstreamFundsSyncEnabled}
 	if upstreamErr != nil {
 		snapshot.Overview.Upstream = syncStatusSection[syncUpstreamStatus]{
 			Available: false, CheckedAt: nowUnix, Error: "读取本地上游同步状态失败", Data: upstream,

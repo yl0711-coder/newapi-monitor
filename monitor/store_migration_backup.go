@@ -27,10 +27,10 @@ const (
 	// Bump this ID whenever either AutoMigrate model set or a post-migration
 	// schema/data transform changes. Restarts of the same plan reuse its pinned
 	// original snapshot, so they cannot prune away the old-image rollback point.
-	// v31 在 v30 上增加模型监控迟到日志定稿水位和上游用量尾部同步模式。
-	// 新表/字段会改变 AutoMigrate 模型集，必须先生成当前时点的新快照，不得复用 v30。
-	preMigrationPlanID               = "main-facts-schema-20260904-v31-upstream-errorlog-identity-archive-metric-finalize-cursor-upstream-usage-tail-mode"
-	preMigrationCombinedPlanID       = "main-facts-schema-20260904-v31-nginx-source-v2-upstream-errorlog-identity-archive-metric-finalize-cursor-upstream-usage-tail-mode"
+	// v33 在 v32 上增加上游资金流水与独立同步状态表。新增表会改变
+	// AutoMigrate 模型集，必须先生成当前时点的新快照，不得复用 v32。
+	preMigrationPlanID               = "main-facts-schema-20260904-v33-upstream-funds-capacity-user-minute-group-governance-upstream-errorlog-identity-archive-metric-finalize-cursor-upstream-usage-tail-mode"
+	preMigrationCombinedPlanID       = "main-facts-schema-20260904-v33-upstream-funds-capacity-user-minute-group-governance-nginx-source-v2-upstream-errorlog-identity-archive-metric-finalize-cursor-upstream-usage-tail-mode"
 	preMigrationSnapshotPrefix       = "pre-migrate-"
 	preMigrationReferencePrefix      = ".pre-migration-plan-"
 	preMigrationReferenceSuffix      = ".json"

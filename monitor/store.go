@@ -98,6 +98,30 @@ type MetricSample struct {
 	TtftMaxMs int   `gorm:"column:ttft_max_ms"` // 最大 frt(ms),用于分位末档收尾
 }
 
+// CapacityUserMinuteSample 是容量/RPM 查询专用的最小用户分钟事实。
+// 它与 MetricSample 由同一次来源查询生成，避免为用户筛选额外扫描生产 logs。
+// 只保留吞吐所需字段，不保存请求内容、Key、Request ID 或错误原文。
+type CapacityUserMinuteSample struct {
+	BucketTs            int64  `gorm:"primaryKey;autoIncrement:false;index:idx_capacity_user_minute_bucket;index:idx_capacity_user_minute_user_bucket,priority:2;index:idx_capacity_user_minute_channel_bucket,priority:2;index:idx_capacity_user_minute_model_bucket,priority:2;index:idx_capacity_user_minute_group_bucket,priority:2"`
+	UserID              int64  `gorm:"primaryKey;autoIncrement:false;index:idx_capacity_user_minute_user_bucket,priority:1;column:user_id"`
+	ChannelID           int    `gorm:"primaryKey;autoIncrement:false;index:idx_capacity_user_minute_channel_bucket,priority:1;column:channel_id"`
+	ModelName           string `gorm:"primaryKey;size:128;index:idx_capacity_user_minute_model_bucket,priority:1;column:model_name"`
+	Grp                 string `gorm:"primaryKey;size:64;index:idx_capacity_user_minute_group_bucket,priority:1;column:grp"`
+	Username            string `gorm:"size:255;column:username"`
+	TrafficClassVersion int    `gorm:"column:traffic_class_version;index"`
+	Success             int64  `gorm:"column:success"`
+	Anomaly             int64  `gorm:"column:anomaly"`
+	Failed              int64  `gorm:"column:failed"`
+	Tokens              int64  `gorm:"column:tokens"`
+}
+
+func (s *CapacityUserMinuteSample) BeforeCreate(_ *gorm.DB) error {
+	if s.TrafficClassVersion == 0 {
+		s.TrafficClassVersion = userTrafficClassificationVersion
+	}
+	return nil
+}
+
 func (s *MetricSample) BeforeCreate(_ *gorm.DB) error {
 	if s.TrafficClassVersion == 0 {
 		s.TrafficClassVersion = userTrafficClassificationVersion
@@ -869,12 +893,12 @@ func (m *Monitor) openStore(path string) error {
 		return fmt.Errorf("上游错误日志事件键迁移失败: %w", err)
 	}
 	if err := db.AutoMigrate(
-		&MetricSample{}, &TokenSample{}, &MetricFinalizeState{}, &HourSample{}, &ChannelSnap{}, &RejectionSample{}, &RejectionIngestBatch{}, &SelectablePair{},
+		&MetricSample{}, &CapacityUserMinuteSample{}, &TokenSample{}, &MetricFinalizeState{}, &HourSample{}, &ChannelSnap{}, &RejectionSample{}, &RejectionIngestBatch{}, &SelectablePair{},
 		&StabilityHourSample{}, &ChannelTestHourSample{}, &StabilityRejectHour{}, &StabilityProblemSample{},
 		&StabilityProblemIngestState{}, &StabilityProblemStage{}, &StabilityProblemClassificationMigration{}, &StabilityProblemLiveCursor{},
 		&StabilityHourIngestState{}, &StabilityBackfillJob{},
 		&ChannelFinanceSetting{}, &ChannelSaleGroupRate{}, &WebsiteGroupCatalog{}, &ChannelDomainCost{}, &ChannelDomainGroupCost{}, &ChannelFinanceChannelCost{}, &ChannelFinanceVersion{},
-		&ChannelUpstreamAccount{}, &ChannelUpstreamUsageHour{}, &ChannelUpstreamUsageArchive{}, &ChannelUpstreamErrorLog{}, &ChannelUpstreamErrorLogArchive{}, &UpstreamErrorLogSyncState{}, &NewAPIUsageBackfillCheckpoint{}, &NewAPIUsageBackfillSegment{}, &AICodeWithKeySyncState{}, &AICodeWithUsageStage{}, &AICodeWithUsageRound{}, &UpstreamHostCircuit{},
+		&ChannelUpstreamAccount{}, &ChannelUpstreamUsageHour{}, &ChannelUpstreamUsageArchive{}, &ChannelUpstreamErrorLog{}, &ChannelUpstreamErrorLogArchive{}, &UpstreamErrorLogSyncState{}, &ChannelUpstreamFundEvent{}, &UpstreamFundSyncState{}, &NewAPIUsageBackfillCheckpoint{}, &NewAPIUsageBackfillSegment{}, &AICodeWithKeySyncState{}, &AICodeWithUsageStage{}, &AICodeWithUsageRound{}, &UpstreamHostCircuit{},
 		&ChannelUpstreamPricingHourEvidence{}, &ChannelUpstreamPricingHourState{}, &ChannelUpstreamPricingObservedState{}, &ChannelUpstreamPricingChangeEvent{}, &ChannelUpstreamPricingSyncState{}, &ChannelUpstreamPricingPageCheckpoint{}, &AICodeWithPricingCheckpoint{},
 		&ChannelUpstreamCostHourEvidence{}, &ChannelUpstreamCostHourState{}, &ChannelCostPageCheckpoint{}, &ChannelCostSourceBinding{}, &ChannelCostDirtyHour{}, &ChannelCostKeyRegistry{},
 		&ChannelPricingChangeProposal{}, &ChannelPricingProposalEvent{}, &ChannelFinanceActivation{}, &ChannelFinanceActivationSlot{}, &ChannelFinanceActivationEvent{},
@@ -882,6 +906,7 @@ func (m *Monitor) openStore(path string) error {
 		&InfraSample{}, &HostContainerSnapshot{}, &NginxMinuteSample{}, &NginxIngestBatch{}, &NginxSourceState{},
 		&NginxErrorMinuteSample{}, &NginxErrorIngestBatch{}, &NginxErrorSourceState{},
 		&AlertConfig{}, &AlertLog{}, &TrackedUser{}, &CustomerGroup{}, &UsageMemberControl{}, &UsageMemberAudit{}, &UsageMemberControlMigration{}, &FollowUpLog{}, &UsageSettings{},
+		&GroupGovernanceState{}, &GroupGovernanceGroup{}, &GroupGovernanceUser{},
 	); err != nil {
 		return fmt.Errorf("表迁移失败: %w", err)
 	}
@@ -1148,12 +1173,28 @@ func (m *Monitor) openUsageFactsStore(path string, prechecked bool) error {
 }
 
 func (m *Monitor) upsertSamples(rows []MetricSample) error {
+	return upsertSamplesDB(m.storeDB, rows)
+}
+
+func upsertSamplesDB(db *gorm.DB, rows []MetricSample) error {
 	if len(rows) == 0 {
 		return nil
 	}
-	return m.storeDB.Clauses(clause.OnConflict{
+	return db.Clauses(clause.OnConflict{
 		Columns: []clause.Column{
 			{Name: "bucket_ts"}, {Name: "channel_id"}, {Name: "model_name"}, {Name: "grp"},
+		},
+		UpdateAll: true,
+	}).CreateInBatches(rows, 200).Error
+}
+
+func upsertCapacityUserMinuteSamplesDB(db *gorm.DB, rows []CapacityUserMinuteSample) error {
+	if len(rows) == 0 {
+		return nil
+	}
+	return db.Clauses(clause.OnConflict{
+		Columns: []clause.Column{
+			{Name: "bucket_ts"}, {Name: "user_id"}, {Name: "channel_id"}, {Name: "model_name"}, {Name: "grp"},
 		},
 		UpdateAll: true,
 	}).CreateInBatches(rows, 200).Error
@@ -1257,8 +1298,15 @@ func (m *Monitor) replaceSelectablePairs(pairs []SelectablePair) error {
 
 func (m *Monitor) pruneOlderThan(cutoffTs int64) (int64, error) {
 	r := m.storeDB.Where("bucket_ts < ?", cutoffTs).Delete(&MetricSample{})
-	m.storeDB.Where("bucket_ts < ?", cutoffTs).Delete(&TokenSample{}) // token 维度一并清理
-	return r.RowsAffected, r.Error
+	if r.Error != nil {
+		return r.RowsAffected, r.Error
+	}
+	users := m.storeDB.Where("bucket_ts < ?", cutoffTs).Delete(&CapacityUserMinuteSample{})
+	if users.Error != nil {
+		return r.RowsAffected, users.Error
+	}
+	tokens := m.storeDB.Where("bucket_ts < ?", cutoffTs).Delete(&TokenSample{}) // token 维度一并清理
+	return r.RowsAffected + users.RowsAffected + tokens.RowsAffected, tokens.Error
 }
 
 // upsertRejections 累加一个已经确认是“新批次”的拒绝计数。HTTP 重试幂等由

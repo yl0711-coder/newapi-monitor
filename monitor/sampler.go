@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/yl0711-coder/newapi-monitor/internal/trafficclass"
+	"gorm.io/gorm"
 )
 
 const sourceEpochStartupMaxLookbackSec int64 = 3600
@@ -150,6 +151,11 @@ func (m *Monitor) startSampler(ctx context.Context) {
 		if m.cfg.StabilityClassificationMigrationEnabled && m.stabilityProblemClassificationMigrationActive() {
 			goSourceEpoch(ctx, m.runStabilityProblemMigrationLoop)
 		}
+	}
+	// 治理快照是低优先级审计任务；必须在核心采样启动和启动缺口
+	// 补齐之后才挂载，避免首次整表用户读取延迟实时采样。
+	if m.cfg.GroupGovernanceEnabled {
+		goSourceEpoch(ctx, m.runGroupGovernanceLoop)
 	}
 
 }
@@ -506,28 +512,45 @@ func (m *Monitor) sampleRange(ctx context.Context, fromTs, toTs int64) (int, err
 	}
 	defer release()
 
-	rows, err := m.prodDB.QueryContext(cctx, sampleWindowSQL(), fromTs, toTs)
+	query := sampleWindowSQL()
+	if m.cfg.CapacityEnabled {
+		query = sampleWindowUserSQL()
+	}
+	rows, err := m.prodDB.QueryContext(cctx, query, fromTs, toTs)
 	if err != nil {
 		m.reportSourceQueryError(err)
 		return 0, err
 	}
 	defer rows.Close()
 
-	var batch []MetricSample
+	type metricKey struct {
+		bucketTs  int64
+		channelID int
+		modelName string
+		grp       string
+	}
+	metricByKey := map[metricKey]*MetricSample{}
+	var userBatch []CapacityUserMinuteSample
 	for rows.Next() {
 		var (
 			s           MetricSample
 			grp         sql.NullString
+			username    sql.NullString
+			userID      int64
 			e4, e5, eto int64
 		)
-		if err := rows.Scan(&s.BucketTs, &s.ChannelID, &s.ModelName, &grp,
-			&s.Success, &s.Anomaly, &s.Failed,
+		scanArgs := []any{&s.BucketTs, &s.ChannelID, &s.ModelName, &grp}
+		if m.cfg.CapacityEnabled {
+			scanArgs = append(scanArgs, &userID, &username)
+		}
+		scanArgs = append(scanArgs, &s.Success, &s.Anomaly, &s.Failed,
 			&s.AnomalyBilled, &s.AnomalyFree, &s.AnomalyStream, &s.AnomalyQuota, &s.AnomalySumTime,
 			&s.SumUseTime, &s.MaxUseTime, &s.Tokens, &s.Quota, &s.RefundRecords, &s.RefundQuota,
 			&e4, &e5, &eto,
 			&s.Lat1, &s.Lat2, &s.Lat5, &s.Lat10, &s.Lat30, &s.Lat60, &s.LatInf,
 			&s.CompletionTokens,
-			&s.Ttft500, &s.Ttft1k, &s.Ttft2k, &s.Ttft5k, &s.Ttft10k, &s.TtftInf, &s.TtftMaxMs); err != nil {
+			&s.Ttft500, &s.Ttft1k, &s.Ttft2k, &s.Ttft5k, &s.Ttft10k, &s.TtftInf, &s.TtftMaxMs)
+		if err := rows.Scan(scanArgs...); err != nil {
 			return 0, err
 		}
 		s.Grp = grp.String
@@ -536,32 +559,105 @@ func (m *Monitor) sampleRange(ctx context.Context, fromTs, toTs int64) (int, err
 		if other := s.Failed - e4 - e5 - eto; other > 0 {
 			s.ErrOther = other
 		}
-		batch = append(batch, s)
+		key := metricKey{bucketTs: s.BucketTs, channelID: s.ChannelID, modelName: s.ModelName, grp: s.Grp}
+		aggregated := metricByKey[key]
+		if aggregated == nil {
+			aggregated = &MetricSample{BucketTs: s.BucketTs, ChannelID: s.ChannelID, ModelName: s.ModelName,
+				Grp: s.Grp, TrafficClassVersion: userTrafficClassificationVersion}
+			metricByKey[key] = aggregated
+		}
+		mergeMetricSample(aggregated, s)
+		if m.cfg.CapacityEnabled && (s.Success+s.Anomaly+s.Failed > 0 || s.Tokens > 0) {
+			userBatch = append(userBatch, CapacityUserMinuteSample{
+				BucketTs: s.BucketTs, UserID: userID, Username: username.String, ChannelID: s.ChannelID,
+				ModelName: s.ModelName, Grp: s.Grp, TrafficClassVersion: userTrafficClassificationVersion,
+				Success: s.Success, Anomaly: s.Anomaly, Failed: s.Failed, Tokens: s.Tokens,
+			})
+		}
 	}
 	if err := rows.Err(); err != nil {
 		m.reportSourceQueryError(err)
 		return 0, err
 	}
-	if err := m.upsertSamples(batch); err != nil {
+	batch := make([]MetricSample, 0, len(metricByKey))
+	for _, sample := range metricByKey {
+		batch = append(batch, *sample)
+	}
+	if err := m.storeDB.Transaction(func(tx *gorm.DB) error {
+		if err := upsertSamplesDB(tx, batch); err != nil {
+			return err
+		}
+		return upsertCapacityUserMinuteSamplesDB(tx, userBatch)
+	}); err != nil {
 		return 0, err
 	}
 	return len(batch), nil
 }
 
+func mergeMetricSample(dst *MetricSample, src MetricSample) {
+	dst.Success += src.Success
+	dst.Anomaly += src.Anomaly
+	dst.Failed += src.Failed
+	dst.AnomalyBilled += src.AnomalyBilled
+	dst.AnomalyFree += src.AnomalyFree
+	dst.AnomalyStream += src.AnomalyStream
+	dst.AnomalyQuota += src.AnomalyQuota
+	dst.AnomalySumTime += src.AnomalySumTime
+	dst.SumUseTime += src.SumUseTime
+	if src.MaxUseTime > dst.MaxUseTime {
+		dst.MaxUseTime = src.MaxUseTime
+	}
+	dst.Tokens += src.Tokens
+	dst.Quota += src.Quota
+	dst.RefundRecords += src.RefundRecords
+	dst.RefundQuota += src.RefundQuota
+	dst.Err4xx += src.Err4xx
+	dst.Err5xx += src.Err5xx
+	dst.ErrTimeout += src.ErrTimeout
+	dst.ErrOther += src.ErrOther
+	dst.Lat1 += src.Lat1
+	dst.Lat2 += src.Lat2
+	dst.Lat5 += src.Lat5
+	dst.Lat10 += src.Lat10
+	dst.Lat30 += src.Lat30
+	dst.Lat60 += src.Lat60
+	dst.LatInf += src.LatInf
+	dst.CompletionTokens += src.CompletionTokens
+	dst.Ttft500 += src.Ttft500
+	dst.Ttft1k += src.Ttft1k
+	dst.Ttft2k += src.Ttft2k
+	dst.Ttft5k += src.Ttft5k
+	dst.Ttft10k += src.Ttft10k
+	dst.TtftInf += src.TtftInf
+	if src.TtftMaxMs > dst.TtftMaxMs {
+		dst.TtftMaxMs = src.TtftMaxMs
+	}
+}
+
 // sampleWindowSQL 组装采样查询。拆成独立函数是为了能在测试里渲染出成品 SQL
 // 拿到真实 MySQL 上验证语法与 collation——判据里有 REGEXP 和 JSON_EXTRACT,
 // 光靠 Go 侧字符串断言盖不住"打到生产库才报错"这类问题。
-func sampleWindowSQL() string {
+func sampleWindowSQL() string { return sampleWindowSQLWithUser(false) }
+
+func sampleWindowUserSQL() string { return sampleWindowSQLWithUser(true) }
+
+func sampleWindowSQLWithUser(includeUser bool) string {
 	// MySQL SUM/布尔聚合返回 DECIMAL,需 CAST 成 SIGNED 才能 Scan 进 int64。
 	// 错误分类互斥(优先级:超时 > 5xx > 4xx),四类之和不超过失败数。
 	// FRT = 首字延迟(ms),取自 other JSON 的 frt;非法 JSON 或缺失则计 0(被 frt>0 过滤掉)。
 	//
 	// 交付异常判据见 expandAnomalyPredicates。
 	const frt = "(CASE WHEN JSON_VALID(other) THEN CAST(JSON_EXTRACT(other,'$.frt') AS SIGNED) ELSE 0 END)"
+	userColumns, userGroup := "", ""
+	if includeUser {
+		userColumns = "  user_id, MAX(COALESCE(username,'')) AS username,\n"
+		userGroup = ", user_id"
+	}
 	q := `
 SELECT /*+ MAX_EXECUTION_TIME(8000) */
   (created_at DIV 60)*60 AS bucket,
   channel_id, model_name, ` + "`group`" + ` AS grp,
+` + userColumns + `
   CAST(COALESCE(SUM(type=2 AND NOT {{ANOM}}),0) AS SIGNED) AS success,
   CAST(COALESCE(SUM(type=2 AND {{ANOM}}),0) AS SIGNED) AS anomaly,
   CAST(COALESCE(SUM(type=5),0) AS SIGNED) AS failed,
@@ -599,7 +695,7 @@ SELECT /*+ MAX_EXECUTION_TIME(8000) */
 FROM logs
 WHERE created_at >= ? AND created_at < ? AND type IN (2,5,6)
   AND NOT (` + channelTestLogPredicateSQL() + `)
-GROUP BY bucket, channel_id, model_name, grp`
+GROUP BY bucket, channel_id, model_name, grp` + userGroup
 	q = expandAnomalyPredicates(q)
 	return strings.ReplaceAll(q, "FRT", frt)
 }

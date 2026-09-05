@@ -310,6 +310,9 @@ func New(s Settings) (*Monitor, error) {
 	if err := validateUpstreamPricingLedgerSettings(s); err != nil {
 		return nil, err
 	}
+	if err := validateUpstreamFundsSettings(s); err != nil {
+		return nil, err
+	}
 	if err := validateChannelCostClosureSettings(s); err != nil {
 		return nil, err
 	}
@@ -384,11 +387,27 @@ func validateLocalAuthBypassSettings(s Settings) error {
 	if strings.TrimSpace(s.ProdDSN) != "" || strings.TrimSpace(s.NewAPIBaseURL) != "" {
 		return errors.New("本地免登录模式不允许配置生产 DSN 或 NewAPI 主站地址")
 	}
-	if s.SourceWorkerEnabled || s.SourceLeaseRequired || s.UpstreamSyncEnabled || s.UpstreamUsageSyncEnabled || s.UpstreamPricingLedgerEnabled || s.ChannelCostClosureEnabled {
+	if s.SourceWorkerEnabled || s.SourceLeaseRequired || s.UpstreamSyncEnabled || s.UpstreamUsageSyncEnabled || s.UpstreamPricingLedgerEnabled || s.UpstreamErrorLogSyncEnabled || s.UpstreamFundsSyncEnabled || s.ChannelCostClosureEnabled {
 		return errors.New("本地免登录模式要求关闭来源 worker、来源租约和全部上游同步")
 	}
 	if s.NginxEnabled || s.InfraEnabled || strings.TrimSpace(s.HeartbeatURL) != "" || !s.AlertsDisabled {
 		return errors.New("本地免登录模式要求关闭 Nginx/AWS 主动采集、外部心跳和所有告警")
+	}
+	return nil
+}
+
+func validateUpstreamFundsSettings(s Settings) error {
+	if !s.UpstreamFundsSyncEnabled {
+		return nil
+	}
+	if s.LocalSnapshotOnly {
+		return errors.New("上游资金流水不能在本地快照只读模式开启")
+	}
+	if len(s.UpstreamFundsDomains) == 0 {
+		return errors.New("上游资金流水必须配置非空 MONITOR_UPSTREAM_FUNDS_DOMAINS 白名单")
+	}
+	if s.UpstreamFundsBackfillDays < 1 || s.UpstreamFundsBackfillDays > 365 {
+		return errors.New("MONITOR_UPSTREAM_FUNDS_BACKFILL_DAYS 必须在 1～365 之间")
 	}
 	return nil
 }

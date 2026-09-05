@@ -64,6 +64,17 @@ func TestSampleWindowSQLPlaceholderCount(t *testing.T) {
 	if !strings.Contains(q, "type IN (2,5,6)") {
 		t.Error("来源聚合必须读取消费、错误和退款日志；退款只进入退款字段")
 	}
+	userQuery := sampleWindowUserSQL()
+	if n := strings.Count(userQuery, "?"); n != 2 {
+		t.Fatalf("用户分钟 SQL 应有 2 个区间参数，实际 %d 个", n)
+	}
+	if !strings.Contains(userQuery, "user_id, MAX(COALESCE(username,'')) AS username") ||
+		!strings.Contains(userQuery, "GROUP BY bucket, channel_id, model_name, grp, user_id") {
+		t.Error("单次来源扫描必须同时生成用户分钟事实，不能另起第二条全量聚合查询")
+	}
+	if strings.Contains(q, "MAX(COALESCE(username,''))") {
+		t.Error("容量规划关闭时必须保留低基数来源查询，不能产生用户维度额外开销")
+	}
 	if !strings.Contains(q, "type=6") || !strings.Contains(q, "refund_quota") || !strings.Contains(q, "refund_records") {
 		t.Error("退款日志必须独立聚合，不能混入成功/异常/失败请求数")
 	}
@@ -74,6 +85,19 @@ func TestSampleWindowSQLPlaceholderCount(t *testing.T) {
 		if !strings.Contains(q, marker) {
 			t.Errorf("用户流量 SQL 必须排除渠道测试标记 %q", marker)
 		}
+	}
+}
+
+func TestMergeMetricSamplePreservesOriginalAggregateSemantics(t *testing.T) {
+	dst := &MetricSample{BucketTs: 60, ChannelID: 9, ModelName: "m", Grp: "g", TrafficClassVersion: userTrafficClassificationVersion}
+	mergeMetricSample(dst, MetricSample{Success: 2, Failed: 1, Tokens: 100, SumUseTime: 7, MaxUseTime: 7,
+		Err4xx: 1, Lat2: 2, CompletionTokens: 40, Ttft1k: 2, TtftMaxMs: 900})
+	mergeMetricSample(dst, MetricSample{Success: 3, Anomaly: 1, Tokens: 300, SumUseTime: 11, MaxUseTime: 9,
+		AnomalyBilled: 1, AnomalyQuota: 8, Lat5: 3, CompletionTokens: 70, Ttft2k: 3, TtftMaxMs: 1600})
+	if dst.Success != 5 || dst.Anomaly != 1 || dst.Failed != 1 || dst.Tokens != 400 || dst.SumUseTime != 18 ||
+		dst.MaxUseTime != 9 || dst.Err4xx != 1 || dst.AnomalyBilled != 1 || dst.AnomalyQuota != 8 ||
+		dst.Lat2 != 2 || dst.Lat5 != 3 || dst.CompletionTokens != 110 || dst.Ttft1k != 2 || dst.Ttft2k != 3 || dst.TtftMaxMs != 1600 {
+		t.Fatalf("按用户拆分后回聚合改变了原有 MetricSample 口径: %+v", dst)
 	}
 }
 

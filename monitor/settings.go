@@ -116,6 +116,11 @@ type Settings struct {
 	UpstreamErrorLogSyncEnabled bool
 	// 独立灰度白名单；总开关打开但列表为空时仍不访问任何上游。
 	UpstreamErrorLogDomains []string // MONITOR_UPSTREAM_ERRORLOG_DOMAINS，逗号分隔
+	// 上游资金流水（充值、兑换码、管理员额度调整、消费退款）是独立证据链。
+	// 默认关闭且空白名单；还必须同时开启账户的 UsageSyncEnabled，不绕过日志读取授权。
+	UpstreamFundsSyncEnabled  bool     // MONITOR_UPSTREAM_FUNDS_SYNC_ENABLED，默认 false
+	UpstreamFundsDomains      []string // MONITOR_UPSTREAM_FUNDS_DOMAINS，逗号分隔
+	UpstreamFundsBackfillDays int      // MONITOR_UPSTREAM_FUNDS_BACKFILL_DAYS，默认 90，范围 1～365
 	// 上游计价账本与既有消费汇总使用独立灰度闸门和域名白名单。
 	// 支持 NewAPI、Sub2API 和 AICodeWith；默认关闭且空白名单，迁移不会发起任何上游请求。
 	UpstreamPricingLedgerEnabled       bool     // MONITOR_UPSTREAM_PRICING_LEDGER_ENABLED，默认 false
@@ -206,6 +211,10 @@ type Settings struct {
 	// CapacityEnabled 只开放容量规划的本地读取页。它不启动 worker、
 	// 不访问 NewAPI/MySQL/Nginx/AWS，只联合展示已落盘的脱敏事实。
 	CapacityEnabled bool // MONITOR_CAPACITY_ENABLED，默认 false
+	// 分组治理是独立灰度功能：后台低频读取 NewAPI 当前分组配置与引用，
+	// 只把脱敏快照写入 Monitor SQLite；页面请求绝不回源生产库。
+	GroupGovernanceEnabled     bool // MONITOR_GROUP_GOVERNANCE_ENABLED，默认 false
+	GroupGovernanceSyncMinutes int  // MONITOR_GROUP_GOVERNANCE_SYNC_MINUTES，默认 10，最小 5
 	// InfraSnapshotReadOnly 只开放已落入 Monitor SQLite 的服务端快照和曲线。
 	// 它不启动 AWS、域名、源站锁探测，也不评估/发送基础设施告警；
 	// 仅用于本机验收和其他只读快照场景。
@@ -331,6 +340,9 @@ func LoadSettings() Settings {
 		UpstreamUsageSyncMinutes:                 envInt("MONITOR_UPSTREAM_USAGE_SYNC_MINUTES", 20),
 		UpstreamErrorLogSyncEnabled:              env("MONITOR_UPSTREAM_ERRORLOG_SYNC_ENABLED", "false") == "true",
 		UpstreamErrorLogDomains:                  envCSV("MONITOR_UPSTREAM_ERRORLOG_DOMAINS"),
+		UpstreamFundsSyncEnabled:                 env("MONITOR_UPSTREAM_FUNDS_SYNC_ENABLED", "false") == "true",
+		UpstreamFundsDomains:                     envCSV("MONITOR_UPSTREAM_FUNDS_DOMAINS"),
+		UpstreamFundsBackfillDays:                envInt("MONITOR_UPSTREAM_FUNDS_BACKFILL_DAYS", 90),
 		UpstreamUsageBackfillDays:                envInt("MONITOR_UPSTREAM_USAGE_BACKFILL_DAYS", 90),
 		UpstreamMaxConcurrency:                   envInt("MONITOR_UPSTREAM_MAX_CONCURRENCY", 1),
 		UpstreamPricingLedgerEnabled:             env("MONITOR_UPSTREAM_PRICING_LEDGER_ENABLED", "false") == "true",
@@ -375,6 +387,8 @@ func LoadSettings() Settings {
 		IngestToken:                              env("MONITOR_INGEST_TOKEN", ""),
 		InfraEnabled:                             env("MONITOR_INFRA_ENABLED", "") == "true",
 		CapacityEnabled:                          env("MONITOR_CAPACITY_ENABLED", "false") == "true",
+		GroupGovernanceEnabled:                   env("MONITOR_GROUP_GOVERNANCE_ENABLED", "false") == "true",
+		GroupGovernanceSyncMinutes:               envInt("MONITOR_GROUP_GOVERNANCE_SYNC_MINUTES", 10),
 		InfraSnapshotReadOnly:                    env("MONITOR_INFRA_SNAPSHOT_READ_ONLY", "false") == "true",
 		AWSRegion:                                env("AWS_REGION", "us-west-2"),
 		InfraSampleSeconds:                       envInt("MONITOR_INFRA_SAMPLE_SECONDS", 300),

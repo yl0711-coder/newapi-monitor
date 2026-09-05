@@ -69,6 +69,12 @@ var capacityCSS []byte // 容量规划独立样式，不污染现有 Monitor/Usa
 //go:embed capacity.js
 var capacityJS []byte // 只访问 /capacity/report 本地事实接口
 
+//go:embed group_governance.css
+var groupGovernanceCSS []byte // 分组治理独立样式，不污染其他 Monitor Tab
+
+//go:embed group_governance.js
+var groupGovernanceJS []byte // 只访问 Monitor 本地快照与 CSV 接口
+
 var allowedWindows = map[int]bool{15: true, 30: true, 60: true, 180: true, 360: true, 720: true, 1440: true}
 
 const maxJSONRequestBody = 4 << 20   // 4 MiB:足以覆盖节点批量上报，同时拒绝异常大请求体
@@ -187,6 +193,14 @@ func (m *Monitor) RegisterRoutes(r *gin.Engine) {
 		c.Header("Cache-Control", "no-cache")
 		c.Data(http.StatusOK, "application/javascript; charset=utf-8", capacityJS)
 	})
+	r.GET("/group-governance.css", func(c *gin.Context) {
+		c.Header("Cache-Control", "no-cache")
+		c.Data(http.StatusOK, "text/css; charset=utf-8", groupGovernanceCSS)
+	})
+	r.GET("/group-governance.js", func(c *gin.Context) {
+		c.Header("Cache-Control", "no-cache")
+		c.Data(http.StatusOK, "application/javascript; charset=utf-8", groupGovernanceJS)
+	})
 	r.GET("/logchain.js", func(c *gin.Context) {
 		c.Header("Cache-Control", "no-cache")
 		c.Data(http.StatusOK, "application/javascript; charset=utf-8", logChainJS)
@@ -230,11 +244,14 @@ func (m *Monitor) RegisterRoutes(r *gin.Engine) {
 		// 上游主域名与错误原文，属敏感诊断数据，不得被任何中间层缓存。
 		// 用中间件而非在 handler 里逐个 c.Header：handler 有多条提前 return
 		// 的错误分支（400/401/403/500），逐个加必然漏，而漏掉的恰好是错误响应。
-		view.GET("/logchain/requests", noStoreSensitive, m.serveLogChainRequests)          // 客户排障:逐条请求→渠道→上游主域名→错误原文(含 type=5,含渠道信息,仅管理员)
-		view.GET("/logchain/filters", noStoreSensitive, m.serveLogChainFilters)            // 客户排障:筛选下拉取值(服务分组/上游域名/渠道),只读本地快照
-		view.GET("/infra", m.serveInfra)                                                   // 服务端健康监控(实例/DB/LB)快照
-		view.GET("/infra/series", m.serveInfraSeries)                                      // 按需取某资源某些指标的近 N 小时序列(展开图用)
-		view.GET("/capacity/report", m.serveCapacityReport)                                // 容量规划:只读 Monitor 本地三类脱敏事实
+		view.GET("/logchain/requests", noStoreSensitive, m.serveLogChainRequests)            // 客户排障:逐条请求→渠道→上游主域名→错误原文(含 type=5,含渠道信息,仅管理员)
+		view.GET("/logchain/filters", noStoreSensitive, m.serveLogChainFilters)              // 客户排障:筛选下拉取值(服务分组/上游域名/渠道),只读本地快照
+		view.GET("/infra", m.serveInfra)                                                     // 服务端健康监控(实例/DB/LB)快照
+		view.GET("/infra/series", m.serveInfraSeries)                                        // 按需取某资源某些指标的近 N 小时序列(展开图用)
+		view.GET("/capacity/report", m.serveCapacityReport)                                  // 容量规划:只读 Monitor 本地三类脱敏事实
+		view.GET("/group-governance/report", noStoreSensitive, m.serveGroupGovernanceReport) // 分组治理:只读本地快照
+		view.GET("/group-governance/users", noStoreSensitive, m.serveGroupGovernanceUsers)   // 分组实际关联用户，本地分页
+		view.GET("/group-governance/export.csv", noStoreSensitive, m.exportGroupGovernanceCSV)
 		view.GET("/usage/users", m.listTrackedUsers)                                       // 用户用量:被盯名单(含分组)
 		view.GET("/usage/groups", m.listGroups)                                            // 用户用量:客户分组列表
 		view.GET("/usage/followups", m.usageAggregateAuthorizationGuard(m.serveFollowUps)) // 用户用量:待跟进清单
@@ -298,6 +315,8 @@ func (m *Monitor) RegisterRoutes(r *gin.Engine) {
 		rootChannels.POST("/upstream", m.saveChannelUpstreamHandler)
 		rootChannels.POST("/upstream/sync", m.syncChannelUpstreamHandler)
 		rootChannels.POST("/upstream/usage-sync", m.syncChannelUpstreamUsageHandler)
+		rootChannels.GET("/upstream/funds", m.getChannelUpstreamFundsHandler)
+		rootChannels.POST("/upstream/funds-sync", m.syncChannelUpstreamFundsHandler)
 		rootChannels.GET("/cost/sources", m.listChannelCostSourcesHandler)
 		rootChannels.POST("/cost/bindings", m.saveChannelCostBindingHandler)
 		rootChannels.GET("/cost/proposals", m.listChannelPricingProposalsHandler)

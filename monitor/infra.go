@@ -979,6 +979,23 @@ func addDerivedPct(r *InfraResource) {
 		}
 	case "lb":
 		// LB 无内存/磁盘总量,无派生
+	case "ecs_service":
+		// Enhanced Container Insights gives absolute utilized/reserved task
+		// memory and ephemeral storage. Standard AWS/ECS already provides
+		// mem_used_pct; derive it only as a fallback when the standard point
+		// is temporarily late.
+		if used, ok := m["mem_used_mb"]; ok && hasMemTotal && memTotal > 0 {
+			if _, exists := m["mem_used_pct"]; !exists {
+				m["mem_used_pct"] = used / memTotal * 100
+			}
+		} else if usedPct, ok := m["mem_used_pct"]; ok && hasMemTotal && memTotal > 0 {
+			m["mem_used_mb"] = memTotal * usedPct / 100
+		}
+		if used, ok := m["disk_used_gb"]; ok {
+			if total, ok2 := m["disk_total_gb"]; ok2 && total > 0 {
+				m["disk_used_pct"] = used / total * 100
+			}
+		}
 	default: // instance
 		// 已用内存% = (总内存 - 可用内存) / 总内存;仅当 host-agent 的 mem_avail_mb 存在
 		if avail, ok := m["mem_avail_mb"]; ok && hasMemTotal && memTotal > 0 {
@@ -1081,6 +1098,9 @@ func (m *Monitor) infraStatus(r InfraResource) string {
 			return "bad"
 		}
 		if _, hit := instanceDown(mm); hit {
+			return "bad"
+		}
+		if v, ok := has("unhealthy_containers"); ok && v >= 1 {
 			return "bad"
 		}
 		if v, ok := has("mem_used_pct"); ok && v > 100-c.InfraMemAvailBadPct {

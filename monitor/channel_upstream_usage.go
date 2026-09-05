@@ -54,6 +54,7 @@ const (
 	upstreamUsageAdapterSub2Trend  = "sub2api_trend"
 	upstreamUsageAdapterSub2Stats  = "sub2api_stats"
 	upstreamUsageAdapterAICodeWith = "aicodewith_key"
+	upstreamUsageAdapterTokenForce = "tokenforce_detail"
 	upstreamUsageTailModeHourly    = "hourly"
 	// Tail 与历史补数是两条调度泳道。管理员手动同步仍走 auto，后台必须
 	// 显式选择一条，防止一个历史密集小时占满整轮而拖延其他账户的 Tail。
@@ -254,6 +255,331 @@ type newAPIUsagePage[T any] struct {
 	Items       []T
 	Total       int64
 	Fingerprint [32]byte
+}
+
+type tokenForceUsageItem struct {
+	RequestID    string
+	RequestAt    int64
+	InputTokens  int64
+	OutputTokens int64
+	CostCNY      float64
+}
+
+func tokenForceUsageNumber(raw json.RawMessage, field string, integer bool) (float64, error) {
+	value, err := rawJSONNumber(raw)
+	if err != nil || value < 0 || math.IsNaN(value) || math.IsInf(value, 0) ||
+		integer && (value != math.Trunc(value) || value > math.MaxInt64) {
+		return 0, fmt.Errorf("TokenForce 使用明细缺少有效 %s", field)
+	}
+	return value, nil
+}
+
+func tokenForceOptionalTokenCount(raw json.RawMessage, field string) (int64, error) {
+	if len(raw) == 0 || string(raw) == "null" {
+		return 0, nil
+	}
+	value, err := tokenForceUsageNumber(raw, field, true)
+	return int64(value), err
+}
+
+func parseTokenForceUsageTime(raw json.RawMessage) (int64, error) {
+	if value, err := rawJSONNumber(raw); err == nil {
+		if value > 1e12 {
+			value = math.Floor(value / 1000)
+		}
+		if value > 0 && value <= math.MaxInt64 {
+			return int64(value), nil
+		}
+	}
+	var text string
+	if json.Unmarshal(raw, &text) != nil {
+		return 0, fmt.Errorf("TokenForce 使用明细缺少有效 requestTime")
+	}
+	text = strings.TrimSpace(text)
+	for _, layout := range []string{time.RFC3339Nano, "2006-01-02 15:04:05", "2006-01-02 15:04:05.999999999"} {
+		var parsed time.Time
+		var err error
+		if strings.Contains(layout, "Z07") {
+			parsed, err = time.Parse(layout, text)
+		} else {
+			parsed, err = time.ParseInLocation(layout, text, cstLocation)
+		}
+		if err == nil {
+			return parsed.Unix(), nil
+		}
+	}
+	return 0, fmt.Errorf("TokenForce 使用明细 requestTime 格式无效")
+}
+
+func validateUniqueTokenForceUsageItems(items []tokenForceUsageItem, scope string) error {
+	seen := make(map[string]struct{}, len(items))
+	for _, item := range items {
+		if _, duplicate := seen[item.RequestID]; duplicate {
+			return fmt.Errorf("TokenForce 使用明细包含%s重复 requestId，窗口将重试", scope)
+		}
+		seen[item.RequestID] = struct{}{}
+	}
+	return nil
+}
+
+func decodeTokenForceUsageItem(raw json.RawMessage) (tokenForceUsageItem, error) {
+	var item struct {
+		RequestID    string          `json:"requestId"`
+		RequestTime  json.RawMessage `json:"requestTime"`
+		InputTokens  json.RawMessage `json:"inputTokens"`
+		OutputTokens json.RawMessage `json:"outputTokens"`
+		CostInCNY    json.RawMessage `json:"costInCny"`
+	}
+	if err := json.Unmarshal(raw, &item); err != nil {
+		return tokenForceUsageItem{}, fmt.Errorf("TokenForce 使用明细格式无效")
+	}
+	item.RequestID = strings.TrimSpace(item.RequestID)
+	if item.RequestID == "" || len(item.RequestID) > 512 {
+		return tokenForceUsageItem{}, fmt.Errorf("TokenForce 使用明细缺少有效 requestId")
+	}
+	requestAt, err := parseTokenForceUsageTime(item.RequestTime)
+	if err != nil {
+		return tokenForceUsageItem{}, err
+	}
+	input, err := tokenForceOptionalTokenCount(item.InputTokens, "inputTokens")
+	if err != nil {
+		return tokenForceUsageItem{}, err
+	}
+	output, err := tokenForceOptionalTokenCount(item.OutputTokens, "outputTokens")
+	if err != nil {
+		return tokenForceUsageItem{}, err
+	}
+	cost, err := tokenForceUsageNumber(item.CostInCNY, "costInCny", false)
+	if err != nil {
+		return tokenForceUsageItem{}, err
+	}
+	return tokenForceUsageItem{RequestID: item.RequestID, RequestAt: requestAt, InputTokens: input, OutputTokens: output, CostCNY: cost}, nil
+}
+
+func fetchTokenForceUsagePage(ctx context.Context, client *http.Client, row ChannelUpstreamAccount, cred tokenForceCredential, from, to int64, pageNumber int, pacer *upstreamUsageRequestPacer) (newAPIUsagePage[tokenForceUsageItem], error) {
+	if err := pacer.beforeRequest(ctx); err != nil {
+		return newAPIUsagePage[tokenForceUsageItem]{}, err
+	}
+	if pageNumber < 0 || row.UserID <= 0 {
+		return newAPIUsagePage[tokenForceUsageItem]{}, fmt.Errorf("TokenForce 使用日志查询参数无效")
+	}
+	query := url.Values{}
+	query.Set("orgId", strconv.FormatInt(row.UserID, 10))
+	query.Set("beginTime", time.Unix(from, 0).UTC().Format(time.RFC3339))
+	query.Set("endTime", time.Unix(to, 0).UTC().Format(time.RFC3339))
+	query.Set("page", strconv.Itoa(pageNumber))
+	query.Set("size", strconv.Itoa(upstreamUsagePageSize))
+	body, err := doUpstreamJSON(ctx, client, http.MethodGet, upstreamEndpoint(row.BaseURL, "/api/usages/detail")+"?"+query.Encode(), map[string]string{
+		"Authorization": "Bearer " + cred.AccessToken,
+	}, nil)
+	if err != nil {
+		var statusErr *upstreamHTTPError
+		if errors.As(err, &statusErr) && (statusErr.Status == http.StatusUnauthorized || statusErr.Status == http.StatusForbidden) {
+			return newAPIUsagePage[tokenForceUsageItem]{}, &upstreamAuthError{err: err}
+		}
+		return newAPIUsagePage[tokenForceUsageItem]{}, err
+	}
+	var data struct {
+		Content       []json.RawMessage `json:"content"`
+		TotalElements json.RawMessage   `json:"totalElements"`
+		Page          struct {
+			TotalElements json.RawMessage `json:"totalElements"`
+		} `json:"page"`
+	}
+	if err := decodeTokenForceData(body, &data); err != nil {
+		var apiErr *tokenForceAPIError
+		if errors.As(err, &apiErr) && apiErr.authenticationFailure() {
+			return newAPIUsagePage[tokenForceUsageItem]{}, &upstreamAuthError{err: err}
+		}
+		return newAPIUsagePage[tokenForceUsageItem]{}, err
+	}
+	totalRaw := data.TotalElements
+	if len(totalRaw) == 0 {
+		totalRaw = data.Page.TotalElements
+	}
+	total, err := tokenForceUsageNumber(totalRaw, "totalElements", true)
+	if err != nil {
+		return newAPIUsagePage[tokenForceUsageItem]{}, err
+	}
+	fingerprint, err := canonicalUsagePageFingerprint(data.Content)
+	if err != nil {
+		return newAPIUsagePage[tokenForceUsageItem]{}, fmt.Errorf("TokenForce 使用明细页无效: %w", err)
+	}
+	page := newAPIUsagePage[tokenForceUsageItem]{Items: make([]tokenForceUsageItem, 0, len(data.Content)), Total: int64(total), Fingerprint: fingerprint}
+	for _, raw := range data.Content {
+		item, decodeErr := decodeTokenForceUsageItem(raw)
+		if decodeErr != nil {
+			return newAPIUsagePage[tokenForceUsageItem]{}, decodeErr
+		}
+		page.Items = append(page.Items, item)
+	}
+	return page, nil
+}
+
+func fetchTokenForceUsageItems(ctx context.Context, client *http.Client, row ChannelUpstreamAccount, cred tokenForceCredential, from, to int64, pacer *upstreamUsageRequestPacer) ([]tokenForceUsageItem, error) {
+	first, err := fetchTokenForceUsagePage(ctx, client, row, cred, from, to, 0, pacer)
+	if err != nil {
+		return nil, err
+	}
+	if first.Total > int64(maxUpstreamUsagePages*upstreamUsagePageSize) {
+		return nil, &upstreamUsageWindowTooDense{total: first.Total}
+	}
+	expectedFirst := int(first.Total)
+	if expectedFirst > upstreamUsagePageSize {
+		expectedFirst = upstreamUsagePageSize
+	}
+	if len(first.Items) != expectedFirst {
+		return nil, fmt.Errorf("TokenForce 使用明细首页数量异常（got=%d want=%d）", len(first.Items), expectedFirst)
+	}
+	items := append(make([]tokenForceUsageItem, 0, first.Total), first.Items...)
+	pages := int((first.Total + upstreamUsagePageSize - 1) / upstreamUsagePageSize)
+	for pageNumber := 1; pageNumber < pages; pageNumber++ {
+		page, pageErr := fetchTokenForceUsagePage(ctx, client, row, cred, from, to, pageNumber, pacer)
+		if pageErr != nil {
+			return nil, pageErr
+		}
+		if page.Total != first.Total {
+			return nil, fmt.Errorf("TokenForce 使用明细扫描期间 total 变化（%d -> %d）", first.Total, page.Total)
+		}
+		expected := upstreamUsagePageSize
+		if pageNumber == pages-1 && first.Total%upstreamUsagePageSize != 0 {
+			expected = int(first.Total % upstreamUsagePageSize)
+		}
+		if len(page.Items) != expected {
+			return nil, fmt.Errorf("TokenForce 使用明细第 %d 页数量异常（got=%d want=%d）", pageNumber+1, len(page.Items), expected)
+		}
+		items = append(items, page.Items...)
+	}
+	if pages > 1 {
+		probe, probeErr := fetchTokenForceUsagePage(ctx, client, row, cred, from, to, 0, pacer)
+		if probeErr != nil {
+			return nil, probeErr
+		}
+		if probe.Total != first.Total || probe.Fingerprint != first.Fingerprint {
+			return nil, fmt.Errorf("TokenForce 使用明细扫描期间首页已变化，窗口将重试")
+		}
+	}
+	if err := validateUniqueTokenForceUsageItems(items, ""); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+func fetchTokenForceUsageItemsSplit(ctx context.Context, client *http.Client, row ChannelUpstreamAccount, cred tokenForceCredential, from, to int64, pacer *upstreamUsageRequestPacer) ([]tokenForceUsageItem, error) {
+	items, err := fetchTokenForceUsageItems(ctx, client, row, cred, from, to, pacer)
+	var dense *upstreamUsageWindowTooDense
+	if !errors.As(err, &dense) {
+		return items, err
+	}
+	if to-from <= 1 {
+		return nil, fmt.Errorf("TokenForce 单秒使用明细超过 %d 条，无法安全拆分", maxUpstreamUsagePages*upstreamUsagePageSize)
+	}
+	mid := from + (to-from)/2
+	left, err := fetchTokenForceUsageItemsSplit(ctx, client, row, cred, from, mid, pacer)
+	if err != nil {
+		return nil, err
+	}
+	right, err := fetchTokenForceUsageItemsSplit(ctx, client, row, cred, mid, to, pacer)
+	if err != nil {
+		return nil, err
+	}
+	return append(left, right...), nil
+}
+
+func fetchTokenForceUsageWindow(ctx context.Context, client *http.Client, row ChannelUpstreamAccount, cred tokenForceCredential, from, to int64, pacer *upstreamUsageRequestPacer) (upstreamUsageResult, error) {
+	if cred.AccessToken == "" {
+		return upstreamUsageResult{}, &upstreamAuthError{err: fmt.Errorf("TokenForce 访问令牌为空，请重新连接")}
+	}
+	if to <= from || to-from > 26*3600 {
+		return upstreamUsageResult{}, fmt.Errorf("TokenForce 使用明细同步窗口无效")
+	}
+	if row.BalanceUnit <= 0 || math.IsNaN(row.BalanceUnit) || math.IsInf(row.BalanceUnit, 0) {
+		return upstreamUsageResult{}, fmt.Errorf("TokenForce CNY/USD 换算值无效")
+	}
+	items, err := fetchTokenForceUsageItemsSplit(ctx, client, row, cred, from, to, pacer)
+	if err != nil {
+		return upstreamUsageResult{}, err
+	}
+	// Dense windows are recursively split. The API could still return the same
+	// boundary request in both half-open ranges, so re-check the combined result
+	// before aggregating. Silently double billing is never acceptable here.
+	if err := validateUniqueTokenForceUsageItems(items, "跨窗口"); err != nil {
+		return upstreamUsageResult{}, err
+	}
+	buckets := make(map[int64]*ChannelUpstreamUsageHour)
+	for _, item := range items {
+		if item.RequestAt < from || item.RequestAt >= to {
+			return upstreamUsageResult{}, fmt.Errorf("TokenForce 使用明细包含查询区间之外的 requestTime")
+		}
+		hour := item.RequestAt - item.RequestAt%3600
+		bucket := buckets[hour]
+		if bucket == nil {
+			bucket = &ChannelUpstreamUsageHour{Domain: row.Domain, HourTs: hour, Provider: row.Provider}
+			buckets[hour] = bucket
+		}
+		if bucket.Requests == math.MaxInt64 || item.InputTokens > math.MaxInt64-item.OutputTokens ||
+			bucket.Tokens > math.MaxInt64-item.InputTokens-item.OutputTokens {
+			return upstreamUsageResult{}, fmt.Errorf("TokenForce 使用明细聚合计数溢出")
+		}
+		costUSD := item.CostCNY / row.BalanceUnit
+		if math.IsInf(bucket.Quota+item.CostCNY, 0) || math.IsNaN(bucket.Quota+item.CostCNY) ||
+			math.IsInf(bucket.CostUSD+costUSD, 0) || math.IsNaN(bucket.CostUSD+costUSD) {
+			return upstreamUsageResult{}, fmt.Errorf("TokenForce 使用明细聚合金额溢出")
+		}
+		bucket.Requests++
+		bucket.Tokens += item.InputTokens + item.OutputTokens
+		bucket.Quota += item.CostCNY
+		bucket.CostUSD += costUSD
+	}
+	firstHour := from - from%3600
+	for hour := firstHour; hour < to; hour += 3600 {
+		bucket := buckets[hour]
+		if bucket == nil {
+			bucket = &ChannelUpstreamUsageHour{Domain: row.Domain, HourTs: hour, Provider: row.Provider}
+			buckets[hour] = bucket
+		}
+		coveredFrom := hour
+		if coveredFrom < from {
+			coveredFrom = from
+		}
+		coveredTo := hour + 3600
+		if coveredTo > to {
+			coveredTo = to
+		}
+		bucket.BucketSeconds = coveredTo - coveredFrom
+	}
+	hours := make([]ChannelUpstreamUsageHour, 0, len(buckets))
+	for _, bucket := range buckets {
+		hours = append(hours, *bucket)
+	}
+	sort.Slice(hours, func(i, j int) bool { return hours[i].HourTs < hours[j].HourTs })
+	return upstreamUsageResult{Hours: hours, DataUntil: to, Adapter: upstreamUsageAdapterTokenForce}, nil
+}
+
+func syncTokenForceUsage(ctx context.Context, client *http.Client, row ChannelUpstreamAccount, cred tokenForceCredential, from, to int64, pacer *upstreamUsageRequestPacer) (upstreamUsageResult, tokenForceCredential, error) {
+	refreshed := false
+	if cred.AccessToken == "" || cred.ExpiresAt <= time.Now().Add(2*time.Minute).Unix() {
+		var err error
+		cred, err = refreshTokenForce(ctx, client, row, cred)
+		if err != nil {
+			return upstreamUsageResult{}, cred, err
+		}
+		refreshed = true
+	}
+	result, err := fetchTokenForceUsageWindow(ctx, client, row, cred, from, to, pacer)
+	if err == nil {
+		return result, cred, nil
+	}
+	var authErr *upstreamAuthError
+	if !refreshed && errors.As(err, &authErr) {
+		updated, refreshErr := refreshTokenForce(ctx, client, row, cred)
+		if refreshErr != nil {
+			return upstreamUsageResult{}, cred, refreshErr
+		}
+		cred = updated
+		result, err = fetchTokenForceUsageWindow(ctx, client, row, cred, from, to, pacer)
+	}
+	return result, cred, err
 }
 
 type upstreamUsageWindowTooDense struct {
@@ -2125,7 +2451,7 @@ func (m *Monitor) syncStoredUpstreamUsageWithPriority(ctx context.Context, domai
 	}
 	now := time.Now().Unix()
 	normalizeLegacyNewAPIBackfillBudgetState(&row, now)
-	if row.Provider != upstreamProviderNewAPI && row.Provider != upstreamProviderSub2API && row.Provider != upstreamProviderAICodeWith {
+	if row.Provider != upstreamProviderNewAPI && row.Provider != upstreamProviderSub2API && row.Provider != upstreamProviderAICodeWith && row.Provider != upstreamProviderTokenForce {
 		err := fmt.Errorf("%s 暂未验证公开使用日志接口，未自动读取日志", upstreamProviderName(row.Provider))
 		row.UsageStatus = upstreamStatusUnsupported
 		row.UsageLastAttemptAt = now
@@ -2180,10 +2506,29 @@ func (m *Monitor) syncStoredUpstreamUsageWithPriority(ctx context.Context, domai
 			}
 			return result, syncErr
 		}
+	case tokenForceCredential:
+		if row.Provider != upstreamProviderTokenForce {
+			return row, fmt.Errorf("%s 凭据与供应商不匹配", upstreamProviderName(row.Provider))
+		}
+		current := cred
+		syncUsage = func(callCtx context.Context, from, to int64, pacer *upstreamUsageRequestPacer) (upstreamUsageResult, error) {
+			result, updated, syncErr := syncTokenForceUsage(callCtx, m.channelUpstreamHTTPClient(), row, current, from, to, pacer)
+			current = updated
+			credential = current
+			secrets = upstreamCredentialSecrets(current)
+			return result, syncErr
+		}
 	default:
 		return row, fmt.Errorf("%s 凭据格式无效", upstreamProviderName(row.Provider))
 	}
-	plan := planUpstreamUsageSyncForLane(row, now, upstreamUsageBackfillDays(m.cfg), lane)
+	backfillDays := upstreamUsageBackfillDays(m.cfg)
+	if row.Provider == upstreamProviderTokenForce && backfillDays > 7 {
+		// The console enforces a seven-day unfiltered query range. Until the
+		// provider publishes a stable API contract, do not silently probe older
+		// history or create a permanent retry loop.
+		backfillDays = 7
+	}
+	plan := planUpstreamUsageSyncForLane(row, now, backfillDays, lane)
 	requestBudget := upstreamUsageMaxRequestsPerRun
 	if lane == upstreamUsageLaneHistory {
 		requestBudget = upstreamUsageHistoryMaxRequestsPerRun
@@ -2191,7 +2536,7 @@ func (m *Monitor) syncStoredUpstreamUsageWithPriority(ctx context.Context, domai
 	pacer := newUpstreamUsageRequestPacer(requestBudget, upstreamUsageRequestInterval)
 	operationRetryAt := int64(0)
 	if row.UsageBackfillCursor == 0 {
-		row.UsageBackfillCursor = cstDayStart(now - int64(upstreamUsageBackfillDays(m.cfg))*86400)
+		row.UsageBackfillCursor = cstDayStart(now - int64(backfillDays)*86400)
 	}
 	// Tail is the primary freshness contract. When both lanes are due it runs
 	// first; only a successful, atomically persisted tail permits history.
@@ -2312,7 +2657,7 @@ func (m *Monitor) syncStoredUpstreamUsageWithPriority(ctx context.Context, domai
 	persistCtx, persistCancel := upstreamUsageLocalCommitContext(ctx)
 	defer persistCancel()
 	var persistErr error
-	if row.Provider == upstreamProviderSub2API {
+	if row.Provider == upstreamProviderSub2API || row.Provider == upstreamProviderTokenForce {
 		// Sub2API rotates refresh tokens. Persist the newest token even when the
 		// subsequent usage query fails, otherwise the next run may replay a
 		// consumed refresh token and isolate an otherwise healthy account.

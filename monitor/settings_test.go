@@ -51,6 +51,37 @@ func TestLoadSettingsUpstreamErrorLogDefaultsFailClosed(t *testing.T) {
 	}
 }
 
+func TestLoadAndValidateUpstreamFundsSettingsFailClosed(t *testing.T) {
+	t.Setenv("MONITOR_UPSTREAM_FUNDS_SYNC_ENABLED", "")
+	t.Setenv("MONITOR_UPSTREAM_FUNDS_DOMAINS", "")
+	t.Setenv("MONITOR_UPSTREAM_FUNDS_BACKFILL_DAYS", "")
+	defaults := LoadSettings()
+	if defaults.UpstreamFundsSyncEnabled || len(defaults.UpstreamFundsDomains) != 0 || defaults.UpstreamFundsBackfillDays != 90 {
+		t.Fatalf("funds collection defaults are unsafe: enabled=%v domains=%v days=%d", defaults.UpstreamFundsSyncEnabled, defaults.UpstreamFundsDomains, defaults.UpstreamFundsBackfillDays)
+	}
+	t.Setenv("MONITOR_UPSTREAM_FUNDS_SYNC_ENABLED", "true")
+	t.Setenv("MONITOR_UPSTREAM_FUNDS_DOMAINS", " a.example,b.example ")
+	t.Setenv("MONITOR_UPSTREAM_FUNDS_BACKFILL_DAYS", "120")
+	configured := LoadSettings()
+	if err := validateUpstreamFundsSettings(configured); err != nil {
+		t.Fatal(err)
+	}
+	if !configured.UpstreamFundsSyncEnabled || len(configured.UpstreamFundsDomains) != 2 || configured.UpstreamFundsBackfillDays != 120 {
+		t.Fatalf("funds settings were not loaded: %+v", configured.UpstreamFundsDomains)
+	}
+	invalid := []Settings{
+		{UpstreamFundsSyncEnabled: true, UpstreamFundsBackfillDays: 90},
+		{UpstreamFundsSyncEnabled: true, UpstreamFundsDomains: []string{"a.example"}, UpstreamFundsBackfillDays: 0},
+		{UpstreamFundsSyncEnabled: true, UpstreamFundsDomains: []string{"a.example"}, UpstreamFundsBackfillDays: 366},
+		{UpstreamFundsSyncEnabled: true, UpstreamFundsDomains: []string{"a.example"}, UpstreamFundsBackfillDays: 90, LocalSnapshotOnly: true},
+	}
+	for i, cfg := range invalid {
+		if err := validateUpstreamFundsSettings(cfg); err == nil {
+			t.Fatalf("unsafe funds settings[%d] accepted", i)
+		}
+	}
+}
+
 func TestLocalAuthBypassIsExplicitAndFailsClosed(t *testing.T) {
 	t.Setenv("MONITOR_LOCAL_AUTH_BYPASS", "")
 	if LoadSettings().LocalAuthBypass {
@@ -77,6 +108,8 @@ func TestLocalAuthBypassIsExplicitAndFailsClosed(t *testing.T) {
 		{LocalAuthBypass: true, LocalSnapshotOnly: true, UpstreamSyncEnabled: true, AlertsDisabled: true},
 		{LocalAuthBypass: true, LocalSnapshotOnly: true, UpstreamUsageSyncEnabled: true, AlertsDisabled: true},
 		{LocalAuthBypass: true, LocalSnapshotOnly: true, UpstreamPricingLedgerEnabled: true, AlertsDisabled: true},
+		{LocalAuthBypass: true, LocalSnapshotOnly: true, UpstreamErrorLogSyncEnabled: true, AlertsDisabled: true},
+		{LocalAuthBypass: true, LocalSnapshotOnly: true, UpstreamFundsSyncEnabled: true, AlertsDisabled: true},
 		{LocalAuthBypass: true, LocalSnapshotOnly: true, ChannelCostClosureEnabled: true, AlertsDisabled: true},
 		{LocalAuthBypass: true, LocalSnapshotOnly: true, NginxEnabled: true, AlertsDisabled: true},
 		{LocalAuthBypass: true, LocalSnapshotOnly: true, InfraEnabled: true, AlertsDisabled: true},
