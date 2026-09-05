@@ -483,10 +483,6 @@ func (m *Monitor) buildCapacityReportFiltered(ctx context.Context, from, to, buc
 	return report, nil
 }
 
-func (m *Monitor) readCapacityMetrics(ctx context.Context, from, to int64, channelID int, group, model string, now int64) ([]capacityMinuteRow, []capacityDimensionRow, capacitySource, error) {
-	return m.readCapacityMetricsFiltered(ctx, from, to, channelID, 0, group, model, now)
-}
-
 func (m *Monitor) readCapacityMetricsFiltered(ctx context.Context, from, to int64, channelID int, userID int64, group, model string, now int64) ([]capacityMinuteRow, []capacityDimensionRow, capacitySource, error) {
 	baseWhere := "bucket_ts >= ? AND bucket_ts < ? AND traffic_class_version = ?"
 	baseArgs := []any{from, to, userTrafficClassificationVersion}
@@ -633,10 +629,6 @@ func (m *Monitor) readCapacityRejectionDimensions(ctx context.Context, from, to 
 	err := m.storeDB.WithContext(ctx).Raw(`SELECT model model_name, grp, SUM(count) count
 		FROM rejection_samples WHERE bucket_ts >= ? AND bucket_ts < ? GROUP BY model, grp`, from, to).Scan(&rows).Error
 	return rows, err
-}
-
-func (m *Monitor) readCapacityRejections(ctx context.Context, from, to int64, channelID int, group, model string, now int64) (map[int64]int64, capacitySource) {
-	return m.readCapacityRejectionsFiltered(ctx, from, to, channelID, 0, group, model, now)
 }
 
 func (m *Monitor) readCapacityRejectionsFiltered(ctx context.Context, from, to int64, channelID int, userID int64, group, model string, now int64) (map[int64]int64, capacitySource) {

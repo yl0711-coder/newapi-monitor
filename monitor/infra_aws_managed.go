@@ -117,11 +117,6 @@ func ecsServiceTaskState(ctx context.Context, client ecsTaskHealthAPI, clusterAR
 	return snapshot, nil
 }
 
-func ecsServiceContainerHealth(ctx context.Context, client ecsTaskHealthAPI, clusterARN, serviceName string) (checked, unhealthy int, err error) {
-	snapshot, err := ecsServiceTaskState(ctx, client, clusterARN, serviceName)
-	return snapshot.HealthChecked, snapshot.Unhealthy, err
-}
-
 func (m *Monitor) sampleManagedAWSInfra(ctx context.Context, bucket int64) {
 	cfg, err := awsconfig.LoadDefaultConfig(ctx, awsconfig.WithRegion(m.cfg.AWSRegion))
 	if err != nil {
