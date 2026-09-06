@@ -299,8 +299,8 @@ func TestChannelManagementShowsRawAndRechargeAdjustedUpstreamSpend(t *testing.T)
 			t.Fatalf("上游修正消费缺少 %q", marker)
 		}
 	}
-	if !strings.Contains(js, `adjustedUsageDomains=upstreamUsageDomains.filter`) {
-		t.Fatal("汇总只能累加可按历史充值比例精确修正的账户")
+	if !strings.Contains(js, `adjustedUsageDomains=trustedUsageDomains.filter`) {
+		t.Fatal("汇总只能累加已通过完整性校验且可按历史充值比例精确修正的账户")
 	}
 }
 
@@ -322,14 +322,15 @@ func TestChannelManagementSummarizesUpstreamFinanceWithoutGroupDoubleCounting(t 
 	for _, marker := range []string{
 		`const upstreamConfiguredAccounts=domains.filter(domain=>domain.upstream?.configured)`,
 		`const upstreamAccounts=upstreamConfiguredAccounts.filter(domain=>domain.upstream?.usage_sync_enabled)`,
-		`upstreamAggregateLabel(upstreamUsageDomains,'cost_usd')`,
+		`upstreamAggregateLabel(trustedUsageDomains,'cost_usd')`,
 		`upstreamBalanceDomains.reduce((sum,domain)=>sum+Number(domain.upstream.balance_usd),0)`,
 		`区间上游消费汇总`,
 		`上游当前余额汇总`,
 		`个账户账单完整`,
-		`数据不完整，汇总不可判定`,
-		`const upstreamSpendLabel=upstreamSpendReady?upstreamSpendValue:'—'`,
-		`const adjustedUpstreamSpendLabel=adjustedSpendReady?adjustedUpstreamSpendValue:'—'`,
+		`仅显示已校验部分`,
+		`const trustedUsageDomains=upstreamUsageDomains.filter`,
+		`upstreamAccountComparable&&trustedUsageDomains.length?(upstreamSpendReady?upstreamSpendValue:`,
+		`upstreamAccountComparable&&adjustedUsageDomains.length?(adjustedSpendReady?adjustedUpstreamSpendValue:`,
 		`源账单含小时/自然日粒度，已统一按账户金额合计`,
 		`当前渠道/分组筛选下不作比较`,
 		`.cm-kpis article.upstream b{color:`,

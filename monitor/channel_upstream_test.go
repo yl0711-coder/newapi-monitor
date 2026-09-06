@@ -144,7 +144,6 @@ func TestLegacyUpstreamCredentialRotationRollsBackAllRowsOnCorruption(t *testing
 	if err := m.storeDB.Create(&rows).Error; err != nil {
 		t.Fatal(err)
 	}
-
 	m.cfg.UpstreamCredentialSecret = newSecret
 	if err := m.migrateLegacyUpstreamCredentialEncryption(); err == nil {
 		t.Fatal("corrupt credential must abort startup key rotation")
@@ -1536,6 +1535,11 @@ func TestMigrateLegacyUpstreamEconomicUnitEvidenceUsesPublishedFacts(t *testing.
 		{Domain: "ambiguous.example", HourTs: 3600, Provider: upstreamProviderNewAPI, Quota: 1000000, CostUSD: 0},
 	}
 	if err := m.storeDB.Create(&rows).Error; err != nil {
+		t.Fatal(err)
+	}
+	// AutoMigrate adds the column as NULL to historical SQLite rows. Exercise
+	// that real legacy shape rather than only Go's float zero value.
+	if err := m.storeDB.Exec(`UPDATE channel_upstream_usage_hours SET unit_per_usd = NULL WHERE domain = ?`, "legacy.example").Error; err != nil {
 		t.Fatal(err)
 	}
 	if err := migrateLegacyUpstreamEconomicUnitEvidence(m.storeDB); err != nil {

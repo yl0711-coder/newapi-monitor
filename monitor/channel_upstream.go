@@ -2464,7 +2464,7 @@ func validUpstreamEconomicUnit(unit float64) bool {
 func migrateLegacyUpstreamEconomicUnitEvidence(db *gorm.DB) error {
 	return db.Exec(`UPDATE channel_upstream_usage_hours
 		SET unit_per_usd = quota / cost_usd
-		WHERE unit_per_usd = 0
+		WHERE COALESCE(unit_per_usd, 0) = 0
 		  AND quota > 0 AND cost_usd > 0
 		  AND quota / cost_usd > 0
 		  AND quota / cost_usd <= 1000000000000000000`).Error

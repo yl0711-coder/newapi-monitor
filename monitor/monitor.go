@@ -1092,6 +1092,16 @@ func (m *Monitor) computeSnapshot(windowMinutes int, nowUnix int64) (*Snapshot, 
 			WindowMinutes: windowMinutes, GeneratedAt: time.Unix(nowUnix, 0).Format("2006-01-02 15:04:05"),
 			SamplingActive: age >= 0 && m.LastSampleRun() > nowUnix-int64(m.cfg.SampleSeconds)*3,
 			DataAgeSec:     age, DataComplete: false, CoverageFromTs: coverageFrom, CoverageToTs: coverageTo,
+			// The dashboard renders these fields even while a historical coverage
+			// migration is in progress. Keep the JSON collection contract stable:
+			// [] means "no publishable rows yet"; null is not a collection and used
+			// to make the browser fail on Array.map.
+			ByGroup:    []Row{},
+			ByChannel:  []Row{},
+			ByModel:    []Row{},
+			ByToken:    []TokenRow{},
+			Trend:      []TimePoint{},
+			Rejections: []RejectionRow{},
 		}, nil
 	}
 

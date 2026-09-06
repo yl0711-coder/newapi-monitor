@@ -1153,7 +1153,11 @@ document.getElementById('windowSeg').addEventListener('click',e=>{
 });
 
 function renderBanner(s){
-  const probs=[...s.by_channel.map(r=>({...r,kind:'渠道'})),...s.by_model.map(r=>({...r,kind:'模型'}))];
+  // Older/cached snapshots may still contain null while a server-side data
+  // migration is running. Treat a non-array value as an empty collection so
+  // one incomplete snapshot cannot take down the whole model dashboard.
+  const channels=Array.isArray(s.by_channel)?s.by_channel:[],models=Array.isArray(s.by_model)?s.by_model:[];
+  const probs=[...channels.map(r=>({...r,kind:'渠道'})),...models.map(r=>({...r,kind:'模型'}))];
   const bad=probs.filter(r=>r.health==='bad'),warn=probs.filter(r=>r.health==='warn');
   const b=document.getElementById('banner'),m=document.getElementById('bannerMain');
   let cls,txt;
