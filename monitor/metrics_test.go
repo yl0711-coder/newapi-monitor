@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"math"
+	"strings"
 	"testing"
 )
 
@@ -59,7 +60,7 @@ func TestModelDashboardGuardsNullableSnapshotCollections(t *testing.T) {
 		`Array.isArray(s.by_channel)?s.by_channel:[]`,
 		`Array.isArray(s.by_model)?s.by_model:[]`,
 	} {
-		if !bytes.Contains([]byte(page), []byte(marker)) {
+		if !strings.Contains(page, marker) {
 			t.Fatalf("model dashboard lacks nullable collection guard %q", marker)
 		}
 	}
