@@ -1,7 +1,6 @@
 package monitor
 
 import (
-	"bytes"
 	"encoding/json"
 	"math"
 	"strings"
@@ -44,18 +43,19 @@ func TestIncompleteSnapshotKeepsCollectionJSONContract(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, field := range [][]byte{
-		[]byte(`"by_group":[]`), []byte(`"by_channel":[]`), []byte(`"by_model":[]`),
-		[]byte(`"by_token":[]`), []byte(`"trend":[]`), []byte(`"rejections":[]`),
+	payloadText := string(payload)
+	for _, field := range []string{
+		`"by_group":[]`, `"by_channel":[]`, `"by_model":[]`,
+		`"by_token":[]`, `"trend":[]`, `"rejections":[]`,
 	} {
-		if !bytes.Contains(payload, field) {
-			t.Fatalf("incomplete snapshot collection is not an array: missing %s in %s", field, payload)
+		if !strings.Contains(payloadText, field) {
+			t.Fatalf("incomplete snapshot collection is not an array: missing %s in %s", field, payloadText)
 		}
 	}
 }
 
 func TestModelDashboardGuardsNullableSnapshotCollections(t *testing.T) {
-	page := string(pageHTML)
+	page := pageHTML
 	for _, marker := range []string{
 		`Array.isArray(s.by_channel)?s.by_channel:[]`,
 		`Array.isArray(s.by_model)?s.by_model:[]`,
