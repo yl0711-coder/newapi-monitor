@@ -514,7 +514,7 @@ func fetchTokenForceUsageWindow(ctx context.Context, client *http.Client, row Ch
 		hour := item.RequestAt - item.RequestAt%3600
 		bucket := buckets[hour]
 		if bucket == nil {
-			bucket = &ChannelUpstreamUsageHour{Domain: row.Domain, HourTs: hour, Provider: row.Provider}
+			bucket = &ChannelUpstreamUsageHour{Domain: row.Domain, HourTs: hour, Provider: row.Provider, UnitPerUSD: row.BalanceUnit}
 			buckets[hour] = bucket
 		}
 		if bucket.Requests == math.MaxInt64 || item.InputTokens > math.MaxInt64-item.OutputTokens ||
@@ -530,12 +530,13 @@ func fetchTokenForceUsageWindow(ctx context.Context, client *http.Client, row Ch
 		bucket.Tokens += item.InputTokens + item.OutputTokens
 		bucket.Quota += item.CostCNY
 		bucket.CostUSD += costUSD
+		bucket.UnitPerUSD = row.BalanceUnit
 	}
 	firstHour := from - from%3600
 	for hour := firstHour; hour < to; hour += 3600 {
 		bucket := buckets[hour]
 		if bucket == nil {
-			bucket = &ChannelUpstreamUsageHour{Domain: row.Domain, HourTs: hour, Provider: row.Provider}
+			bucket = &ChannelUpstreamUsageHour{Domain: row.Domain, HourTs: hour, Provider: row.Provider, UnitPerUSD: row.BalanceUnit}
 			buckets[hour] = bucket
 		}
 		coveredFrom := hour
@@ -873,6 +874,7 @@ func fetchNewAPIUsageWindowWithPacer(ctx context.Context, client *http.Client, r
 	out := make([]ChannelUpstreamUsageHour, 0, len(buckets))
 	for _, bucket := range buckets {
 		bucket.CostUSD = bucket.Quota / unit
+		bucket.UnitPerUSD = unit
 		out = append(out, *bucket)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].HourTs < out[j].HourTs })
@@ -1051,7 +1053,7 @@ func (m *Monitor) syncNewAPIUsageBackfillWindowDirect(ctx context.Context, row C
 	hour := ChannelUpstreamUsageHour{
 		Domain: row.Domain, HourTs: from, BucketSeconds: to - from,
 		Requests: checkpoint.Requests, Tokens: checkpoint.Tokens, Quota: checkpoint.Quota,
-		CostUSD: checkpoint.Quota / unit, Provider: row.Provider,
+		CostUSD: checkpoint.Quota / unit, UnitPerUSD: unit, Provider: row.Provider,
 	}
 	return upstreamUsageResult{Hours: []ChannelUpstreamUsageHour{hour}, DataUntil: to, Adapter: upstreamUsageAdapterNewAPILog}, "", true, nil
 }
@@ -1270,6 +1272,7 @@ func (m *Monitor) syncNewAPIUsageBackfillWindowSegmented(ctx context.Context, ro
 		unit = defaultNewAPIQuotaPerUSD
 	}
 	hour.CostUSD = hour.Quota / unit
+	hour.UnitPerUSD = unit
 	return upstreamUsageResult{Hours: []ChannelUpstreamUsageHour{hour}, DataUntil: to, Adapter: upstreamUsageAdapterNewAPILog}, "", true, nil
 }
 
@@ -2226,6 +2229,49 @@ func (m *Monitor) persistUpstreamUsageWindow(ctx context.Context, domain string,
 }
 
 func persistUpstreamUsageWindowTx(tx *gorm.DB, domain string, from, to int64, hours []ChannelUpstreamUsageHour, now int64) error {
+	// A row with explicit conversion evidence is an immutable accounting fact.
+	// Tail overlap and later backfills may refresh requests/tokens, but a newly
+	// configured unit must not retroactively rewrite the bucket. When a unit is
+	// changed during an open hour, that hour therefore keeps its original unit
+	// while accepting the refreshed complete facts; the new unit starts with the
+	// next bucket. This avoids both historical repricing and dropped requests.
+	var existing []ChannelUpstreamUsageHour
+	if err := tx.Where("domain = ? AND hour_ts >= ? AND hour_ts < ? AND unit_per_usd > 0", domain, from, to).Find(&existing).Error; err != nil {
+		return err
+	}
+	existingUnit := make(map[int64]float64, len(existing))
+	for _, old := range existing {
+		existingUnit[old.HourTs] = old.UnitPerUSD
+	}
+	var account ChannelUpstreamAccount
+	accountErr := tx.First(&account, "domain = ?", domain).Error
+	if accountErr != nil && !errors.Is(accountErr, gorm.ErrRecordNotFound) {
+		return accountErr
+	}
+	for i := range hours {
+		oldUnit, present := existingUnit[hours[i].HourTs]
+		unit := hours[i].UnitPerUSD
+		if present && validUpstreamEconomicUnit(oldUnit) {
+			unit = oldUnit
+		} else if accountErr == nil && (account.Provider == upstreamProviderNewAPI || account.Provider == upstreamProviderTokenForce) {
+			var known bool
+			unit, known = upstreamEconomicUnitAt(account, hours[i].HourTs)
+			if !known {
+				// Retain requests/tokens/quota, but never guess a historical USD
+				// amount after the unit was changed.
+				hours[i].UnitPerUSD, hours[i].CostUSD = 0, 0
+				continue
+			}
+		}
+		if !validUpstreamEconomicUnit(unit) {
+			continue
+		}
+		hours[i].UnitPerUSD = unit
+		hours[i].CostUSD = hours[i].Quota / unit
+		if math.IsNaN(hours[i].CostUSD) || math.IsInf(hours[i].CostUSD, 0) {
+			return fmt.Errorf("按历史换算证据重算上游消费失败: domain=%s hour=%d", domain, hours[i].HourTs)
+		}
+	}
 	if err := tx.Where("domain = ? AND hour_ts >= ? AND hour_ts < ?", domain, from, to).Delete(&ChannelUpstreamUsageHour{}).Error; err != nil {
 		return err
 	}

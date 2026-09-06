@@ -6,11 +6,31 @@ import "testing"
 func TestComputeSLO(t *testing.T) {
 	m := newTestMonitor(t)
 	now := int64(1_700_000_400)
-	bucket := now / 60 * 60
-	// 窗口内 990 成功 + 10 失败 = 1000,非错误率 99%
-	if err := m.upsertSamples([]MetricSample{
-		{BucketTs: bucket, ChannelID: 1, ModelName: "m", Grp: "g", Success: 990, Failed: 10},
-	}); err != nil {
+	to := finalizedStabilityHourTo(now)
+	from := to - 86400
+	bucket := to - 60
+	states := make([]StabilityHourIngestState, 0, 24)
+	for hour := from; hour < to; hour += 3600 {
+		requests := int64(0)
+		if bucket >= hour && bucket < hour+3600 {
+			requests = 1000
+		}
+		states = append(states, StabilityHourIngestState{HourTs: hour, Status: "complete", Requests: requests, TrafficClassVersion: stabilityTrafficClassificationVersion})
+	}
+	if err := m.storeDB.Create(&states).Error; err != nil {
+		t.Fatal(err)
+	}
+	// 签收小时账本内 990 成功 + 10 失败 = 1000,非错误率 99%。故意写入
+	// 相反的 minute 事实，证明 SLO 不会拿另一套短留存数据冒充完整窗口。
+	if err := m.storeDB.Create(&StabilityHourSample{
+		HourTs: bucket / 3600 * 3600, ChannelID: 1, ModelName: "m", Grp: "g",
+		Success: 990, Failed: 10, TrafficClassVersion: stabilityTrafficClassificationVersion,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := m.upsertSamples([]MetricSample{{
+		BucketTs: bucket, ChannelID: 1, ModelName: "m", Grp: "g", Failed: 1000,
+	}}); err != nil {
 		t.Fatal(err)
 	}
 	c := AlertConfig{
@@ -19,6 +39,9 @@ func TestComputeSLO(t *testing.T) {
 		BurnSlowEnabled: true, BurnSlowRate: 3, BurnSlowWindowMin: 360,
 	}
 	s := m.computeSLO(c, now)
+	if !s.DataAvailable {
+		t.Fatal("有窗口事实时 SLO 应标记 data_available")
+	}
 	if !approx(s.CurrentPct, 99) {
 		t.Errorf("当前非错误率应 99%%,实际 %v", s.CurrentPct)
 	}
@@ -49,5 +72,38 @@ func TestComputeSLO(t *testing.T) {
 	c.SLOEnabled = false
 	if got := m.computeSLO(c, now); got.Enabled {
 		t.Error("未启用应 Enabled=false")
+	}
+}
+
+func TestComputeSLOPartialCoverageIsUnavailable(t *testing.T) {
+	m := newTestMonitor(t)
+	now := int64(1_800_000_000)
+	to := finalizedStabilityHourTo(now)
+	from := to - 86400
+	if err := m.storeDB.Create(&StabilityHourIngestState{
+		HourTs: from, Status: "complete", Requests: 10, TrafficClassVersion: stabilityTrafficClassificationVersion,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := m.upsertSamples([]MetricSample{{BucketTs: from, ChannelID: 1, ModelName: "m", Grp: "g", Success: 10}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.storeDB.Create(&StabilityHourSample{
+		HourTs: from, ChannelID: 1, ModelName: "m", Grp: "g", Success: 10,
+		TrafficClassVersion: stabilityTrafficClassificationVersion,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	s := m.computeSLO(AlertConfig{SLOEnabled: true, SLOTargetPct: 99, SLOWindowDays: 1}, now)
+	if s.DataAvailable || s.Compliant || s.CoverageComplete || s.CoveragePct <= 0 || s.CoveragePct >= 100 {
+		t.Fatalf("partial SLO window must fail closed: %+v", s)
+	}
+}
+
+func TestComputeSLONoDataIsNotCompliant(t *testing.T) {
+	m := newTestMonitor(t)
+	s := m.computeSLO(AlertConfig{SLOEnabled: true, SLOTargetPct: 99, SLOWindowDays: 1}, 1_800_000_000)
+	if s.DataAvailable || s.Compliant || s.CurrentPct != 0 {
+		t.Fatalf("no-data SLO must not look 100%% healthy: %+v", s)
 	}
 }

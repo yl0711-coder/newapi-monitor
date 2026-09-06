@@ -309,7 +309,7 @@ func TestChannelManagementOmitsGroupShareColumn(t *testing.T) {
 	if strings.Contains(js, "本组占比") || strings.Contains(js, "metricCell(usage,group.usage)") {
 		t.Fatal("渠道明细不应重复展示本组占比列")
 	}
-	for _, marker := range []string{"请求数</span><span>Tokens</span><span>用户侧消费</span>", `${usd(usage.cost_usd)}</span>`} {
+	for _, marker := range []string{"请求数</span><span>Tokens</span><span>用户侧消费</span>", `${usageMetric(usage.cost_usd,usd)}</span>`} {
 		if !strings.Contains(js, marker) {
 			t.Fatalf("删除本组占比后缺少原有渠道指标 %q", marker)
 		}
@@ -322,13 +322,15 @@ func TestChannelManagementSummarizesUpstreamFinanceWithoutGroupDoubleCounting(t 
 	for _, marker := range []string{
 		`const upstreamConfiguredAccounts=domains.filter(domain=>domain.upstream?.configured)`,
 		`const upstreamAccounts=upstreamConfiguredAccounts.filter(domain=>domain.upstream?.usage_sync_enabled)`,
-		`upstreamAggregateLabel(upstreamUsageDomains,'cost_usd',upstreamUsageMixed)`,
+		`upstreamAggregateLabel(upstreamUsageDomains,'cost_usd')`,
 		`upstreamBalanceDomains.reduce((sum,domain)=>sum+Number(domain.upstream.balance_usd),0)`,
 		`区间上游消费汇总`,
 		`上游当前余额汇总`,
 		`个账户账单完整`,
-		`部分数据`,
-		`小时账单与自然日账单分列，不合并`,
+		`数据不完整，汇总不可判定`,
+		`const upstreamSpendLabel=upstreamSpendReady?upstreamSpendValue:'—'`,
+		`const adjustedUpstreamSpendLabel=adjustedSpendReady?adjustedUpstreamSpendValue:'—'`,
+		`源账单含小时/自然日粒度，已统一按账户金额合计`,
 		`当前渠道/分组筛选下不作比较`,
 		`.cm-kpis article.upstream b{color:`,
 		`.cm-kpis article.balance b{color:`,
@@ -336,6 +338,10 @@ func TestChannelManagementSummarizesUpstreamFinanceWithoutGroupDoubleCounting(t 
 		if !strings.Contains(js, marker) && !strings.Contains(css, marker) {
 			t.Fatalf("渠道财务汇总缺少 %q", marker)
 		}
+	}
+	if strings.Contains(js, `小时 ${hourly.length?usd(sum(hourly)):'—'} / 自然日`) ||
+		strings.Contains(js, `小时账单与自然日账单分列，不合并`) {
+		t.Fatal("顶部汇总每栏必须只展示一个统一金额")
 	}
 	if strings.Contains(js, `domain.vendors.flatMap`) && strings.Contains(js, `upstreamSpend=channels.reduce`) {
 		t.Fatal("上游消费汇总不应从渠道或分组明细反向求和")
@@ -531,6 +537,81 @@ func TestChannelManagementUpstreamUsageUsesLocalHourlyRowsOnly(t *testing.T) {
 	}
 }
 
+func TestChannelManagementUpstreamUsageFailsClosedOnOverlappingBuckets(t *testing.T) {
+	m := newStabilityTestMonitor(t)
+	from := time.Date(2026, 8, 8, 0, 0, 0, 0, cstLocation).Unix()
+	to := from + 24*3600
+	if err := m.storeDB.Create(&[]ChannelUpstreamUsageHour{
+		{Domain: "mixed.example", HourTs: from, BucketSeconds: 24 * 3600, Requests: 100, CostUSD: 10, Provider: upstreamProviderAICodeWith},
+		{Domain: "mixed.example", HourTs: from + 3600, BucketSeconds: 3600, Requests: 5, CostUSD: 2, Provider: upstreamProviderAICodeWith},
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	accounts := map[string]ChannelUpstreamAccountView{"mixed.example": {
+		Configured: true, Provider: upstreamProviderAICodeWith, UsageSyncEnabled: true,
+	}}
+	usage, err := m.loadChannelUpstreamUsage(context.Background(), stabilityScope{FromTs: from, ToTs: to}, to, accounts, channelFinanceSnapshot{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := usage["mixed.example"]
+	if !got.Available || got.IntegrityStatus != upstreamUsageIntegrityOverlap || got.Complete || got.CostUSD != 0 || got.Requests != 0 || got.AdjustedCostAvailable {
+		t.Fatalf("overlapping financial buckets must fail closed: %+v", got)
+	}
+}
+
+func TestChannelManagementUpstreamUsageIntegrityFailureIsIsolatedPerAccount(t *testing.T) {
+	m := newStabilityTestMonitor(t)
+	from := time.Date(2026, 8, 8, 0, 0, 0, 0, cstLocation).Unix()
+	to := from + 3600
+	if err := m.storeDB.Create(&[]ChannelUpstreamUsageHour{
+		{Domain: "invalid.example", HourTs: from, BucketSeconds: 3600, Requests: 10, CostUSD: -1, Provider: upstreamProviderAICodeWith},
+		{Domain: "healthy.example", HourTs: from, BucketSeconds: 3600, Requests: 20, CostUSD: 2, Provider: upstreamProviderAICodeWith},
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	accounts := map[string]ChannelUpstreamAccountView{
+		"invalid.example": {Configured: true, Provider: upstreamProviderAICodeWith, UsageSyncEnabled: true},
+		"healthy.example": {Configured: true, Provider: upstreamProviderAICodeWith, UsageSyncEnabled: true},
+	}
+	usage, err := m.loadChannelUpstreamUsage(context.Background(), stabilityScope{FromTs: from, ToTs: to}, to, accounts, channelFinanceSnapshot{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	invalid := usage["invalid.example"]
+	if !invalid.Available || invalid.IntegrityStatus != upstreamUsageIntegrityInvalidAmount || invalid.CostUSD != 0 || invalid.Complete {
+		t.Fatalf("invalid account must fail closed: %+v", invalid)
+	}
+	healthy := usage["healthy.example"]
+	if !healthy.Available || healthy.IntegrityStatus != upstreamUsageIntegrityComplete || healthy.CostUSD != 2 || healthy.Requests != 20 || !healthy.Complete {
+		t.Fatalf("healthy account must remain independently usable: %+v", healthy)
+	}
+}
+
+func TestChannelManagementUpstreamUsageRejectsInconsistentUnitEvidence(t *testing.T) {
+	m := newStabilityTestMonitor(t)
+	from := time.Date(2026, 8, 8, 0, 0, 0, 0, cstLocation).Unix()
+	to := from + 3600
+	row := ChannelUpstreamUsageHour{
+		Domain: "unit.example", HourTs: from, BucketSeconds: 3600, Requests: 10,
+		Quota: 1000000, CostUSD: 0, UnitPerUSD: 500000, Provider: upstreamProviderNewAPI,
+	}
+	if err := m.storeDB.Create(&row).Error; err != nil {
+		t.Fatal(err)
+	}
+	accounts := map[string]ChannelUpstreamAccountView{"unit.example": {
+		Configured: true, Provider: upstreamProviderNewAPI, UsageSyncEnabled: true,
+	}}
+	usage, err := m.loadChannelUpstreamUsage(context.Background(), stabilityScope{FromTs: from, ToTs: to}, to, accounts, channelFinanceSnapshot{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := usage["unit.example"]
+	if !got.Available || got.IntegrityStatus != upstreamUsageIntegrityInvalidAmount || got.CostUSD != 0 || got.Requests != 0 || got.Complete {
+		t.Fatalf("quota/cost/unit mismatch must fail closed: %+v", got)
+	}
+}
+
 func TestAdjustedUpstreamUsageCostUsesRechargePaidOverCredit(t *testing.T) {
 	tests := []struct {
 		name       string
@@ -663,8 +744,8 @@ func TestChannelManagementAICodeWithLivePartialDayIsVisible(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := usage["aicodewith.com"]
-	if !got.Available || got.Complete || got.Granularity != "day" || got.Requests != 13475 || math.Abs(got.CostUSD-275.2466) > 1e-9 {
-		t.Fatalf("live natural-day partial bucket=%+v", got)
+	if !got.Available || got.Complete || got.Granularity != "day" || got.IntegrityStatus != upstreamUsageIntegrityWindowMismatch || got.Requests != 0 || got.CostUSD != 0 {
+		t.Fatalf("live natural-day bucket beyond the common cutoff must fail closed: %+v", got)
 	}
 
 	// The exception is strictly for the live current day. The same bucket must

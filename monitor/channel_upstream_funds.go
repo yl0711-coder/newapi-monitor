@@ -25,14 +25,28 @@ import (
 )
 
 const (
-	upstreamFundKindTopup       = "topup"
-	upstreamFundKindRedemption  = "redemption"
-	upstreamFundKindManualTopup = "manual_topup"
-	upstreamFundKindAdminAdd    = "admin_add"
-	upstreamFundKindAdminSub    = "admin_subtract"
-	upstreamFundKindAdminSet    = "admin_override"
-	upstreamFundKindRefund      = "usage_refund"
-	upstreamFundKindUnknown     = "unknown"
+	upstreamFundParserVersion = 3
+	// Four log types, each at most four pages plus a first-page stability
+	// probe, require a ceiling of 20. Keep a small margin for compatibility.
+	upstreamFundMaxRequestsPerWindow = 24
+	upstreamFundSyncRoundTimeout     = 75 * time.Second
+	upstreamFundAccountsPerRound     = 2
+	upstreamFundDefaultLookback      = 30 * 24 * time.Hour
+	upstreamFundMaxQueryRange        = 366 * 24 * time.Hour
+	upstreamFundEventQueryLimit      = 500
+
+	upstreamFundKindTopup          = "topup"
+	upstreamFundKindRedemption     = "redemption"
+	upstreamFundKindManualTopup    = "manual_topup"
+	upstreamFundKindAdminAdd       = "admin_add"
+	upstreamFundKindAdminSub       = "admin_subtract"
+	upstreamFundKindAdminSet       = "admin_override"
+	upstreamFundKindSignupGrant    = "signup_grant"
+	upstreamFundKindCheckinGrant   = "checkin_grant"
+	upstreamFundKindAffiliateGrant = "affiliate_grant"
+	upstreamFundKindSystemAdjust   = "system_adjustment"
+	upstreamFundKindRefund         = "usage_refund"
+	upstreamFundKindUnknown        = "unknown"
 
 	upstreamFundConfidenceStructured = "structured"
 	upstreamFundConfidenceField      = "field"
@@ -45,27 +59,46 @@ type ChannelUpstreamFundEvent struct {
 	AccountEpoch string `gorm:"primaryKey;size:64;column:account_epoch" json:"-"`
 	EventKey     string `gorm:"primaryKey;size:72;column:event_key" json:"event_key"`
 
-	OccurredAt int64  `gorm:"column:occurred_at;index;index:idx_upstream_fund_domain_time,priority:2" json:"occurred_at"`
-	Provider   string `gorm:"size:24;column:provider" json:"provider"`
-	SourceType int    `gorm:"column:source_type" json:"source_type"`
-	Kind       string `gorm:"size:32;column:kind;index" json:"kind"`
-	Direction  string `gorm:"size:12;column:direction" json:"direction"`
-	Confidence string `gorm:"size:20;column:confidence" json:"confidence"`
+	OccurredAt    int64  `gorm:"column:occurred_at;index;index:idx_upstream_fund_domain_time,priority:2" json:"occurred_at"`
+	Provider      string `gorm:"size:24;column:provider" json:"provider"`
+	SourceType    int    `gorm:"column:source_type" json:"source_type"`
+	Kind          string `gorm:"size:32;column:kind;index" json:"kind"`
+	Direction     string `gorm:"size:12;column:direction" json:"direction"`
+	Confidence    string `gorm:"size:20;column:confidence" json:"confidence"`
+	ParserVersion int    `gorm:"column:parser_version" json:"-"`
 
-	AmountUSD    float64 `gorm:"column:amount_usd" json:"amount_usd"`
-	AmountKnown  bool    `gorm:"column:amount_known" json:"amount_known"`
-	PaidAmount   float64 `gorm:"column:paid_amount" json:"paid_amount"`
-	PaidKnown    bool    `gorm:"column:paid_known" json:"paid_known"`
-	PaidCurrency string  `gorm:"size:12;column:paid_currency" json:"paid_currency,omitempty"`
-	BeforeUSD    float64 `gorm:"column:before_usd" json:"before_usd"`
-	BeforeKnown  bool    `gorm:"column:before_known" json:"before_known"`
-	AfterUSD     float64 `gorm:"column:after_usd" json:"after_usd"`
-	AfterKnown   bool    `gorm:"column:after_known" json:"after_known"`
+	AmountUSD   float64 `gorm:"column:amount_usd" json:"amount_usd"`
+	AmountKnown bool    `gorm:"column:amount_known" json:"amount_known"`
+	// UnitPerUSD is the immutable conversion evidence used when a NewAPI quota
+	// value was normalized to USD. Zero means that no defensible historical unit
+	// was available; the raw event remains auditable but USD totals fail closed.
+	UnitPerUSD float64 `gorm:"column:unit_per_usd" json:"unit_per_usd,omitempty"`
+	// UpstreamAmount preserves the amount exactly as expressed by the upstream
+	// account ledger. It is separate from AmountUSD: a ¥-denominated account
+	// event is useful evidence, but must not silently enter a USD total.
+	UpstreamAmount      float64 `gorm:"column:upstream_amount" json:"upstream_amount"`
+	UpstreamAmountKnown bool    `gorm:"column:upstream_amount_known" json:"upstream_amount_known"`
+	UpstreamCurrency    string  `gorm:"size:12;column:upstream_currency" json:"upstream_currency,omitempty"`
+	PaidAmount          float64 `gorm:"column:paid_amount" json:"paid_amount"`
+	PaidKnown           bool    `gorm:"column:paid_known" json:"paid_known"`
+	PaidCurrency        string  `gorm:"size:12;column:paid_currency" json:"paid_currency,omitempty"`
+	BeforeUSD           float64 `gorm:"column:before_usd" json:"before_usd"`
+	BeforeKnown         bool    `gorm:"column:before_known" json:"before_known"`
+	AfterUSD            float64 `gorm:"column:after_usd" json:"after_usd"`
+	AfterKnown          bool    `gorm:"column:after_known" json:"after_known"`
+	UpstreamBefore      float64 `gorm:"column:upstream_before" json:"upstream_before"`
+	UpstreamBeforeKnown bool    `gorm:"column:upstream_before_known" json:"upstream_before_known"`
+	UpstreamAfter       float64 `gorm:"column:upstream_after" json:"upstream_after"`
+	UpstreamAfterKnown  bool    `gorm:"column:upstream_after_known" json:"upstream_after_known"`
 
-	Content       string `gorm:"type:text;column:content" json:"content"`
-	RequestID     string `gorm:"size:128;column:request_id;index" json:"request_id,omitempty"`
-	RawJSON       string `gorm:"type:text;column:raw_json" json:"-"`
-	RawTruncated  bool   `gorm:"column:raw_truncated" json:"-"`
+	Content      string `gorm:"type:text;column:content" json:"content"`
+	RequestID    string `gorm:"size:128;column:request_id;index" json:"request_id,omitempty"`
+	RawJSON      string `gorm:"type:text;column:raw_json" json:"-"`
+	RawTruncated bool   `gorm:"column:raw_truncated" json:"-"`
+	// ReparseError quarantines an old record whose retained evidence can no
+	// longer be decoded. A malformed historical row must never block the live
+	// tail from collecting newer fund events.
+	ReparseError  string `gorm:"size:512;column:reparse_error" json:"reparse_error,omitempty"`
 	ObservedCount int    `gorm:"column:observed_count" json:"observed_count"`
 	FetchedAt     int64  `gorm:"column:fetched_at;index" json:"fetched_at"`
 }
@@ -88,35 +121,46 @@ type UpstreamFundSyncState struct {
 	ConsecutiveFails int    `gorm:"column:consecutive_fails" json:"-"`
 	LastError        string `gorm:"size:512;column:last_error" json:"last_error,omitempty"`
 	UpdatedAt        int64  `gorm:"column:updated_at;index" json:"-"`
+	// provider_recent means the upstream exposes only a recent-activity
+	// snapshot, without historical pagination or an explicit time range.
+	HistoryScope string `gorm:"size:24;column:history_scope" json:"history_scope,omitempty"`
 }
 
 type upstreamFundItem struct {
-	EventKey     string
-	OccurredAt   int64
-	SourceType   int
-	Kind         string
-	Direction    string
-	Confidence   string
-	AmountUSD    float64
-	AmountKnown  bool
-	PaidAmount   float64
-	PaidKnown    bool
-	PaidCurrency string
-	BeforeUSD    float64
-	BeforeKnown  bool
-	AfterUSD     float64
-	AfterKnown   bool
-	Content      string
-	RequestID    string
-	Raw          string
-	RawTruncated bool
-	Financial    bool
+	EventKey            string
+	OccurredAt          int64
+	SourceType          int
+	Kind                string
+	Direction           string
+	Confidence          string
+	AmountUSD           float64
+	AmountKnown         bool
+	UnitPerUSD          float64
+	UpstreamAmount      float64
+	UpstreamAmountKnown bool
+	UpstreamCurrency    string
+	PaidAmount          float64
+	PaidKnown           bool
+	PaidCurrency        string
+	BeforeUSD           float64
+	BeforeKnown         bool
+	AfterUSD            float64
+	AfterKnown          bool
+	UpstreamBefore      float64
+	UpstreamBeforeKnown bool
+	UpstreamAfter       float64
+	UpstreamAfterKnown  bool
+	Content             string
+	RequestID           string
+	Raw                 string
+	RawTruncated        bool
+	Financial           bool
 }
 
 var (
-	fundCreditRE = regexp.MustCompile(`(?i)(?:充值金额|到账额度|credited(?:\s+amount)?)\s*[:：]?\s*\$?\s*([0-9]+(?:\.[0-9]+)?)`)
-	fundPaidRE   = regexp.MustCompile(`(?i)(?:支付金额|实付(?:金额)?|paid(?:\s+amount)?)\s*[:：]?\s*([$￥¥]?)\s*([0-9]+(?:\.[0-9]+)?)`)
-	fundDollarRE = regexp.MustCompile(`\$\s*([0-9]+(?:\.[0-9]+)?)`)
+	fundCreditRE        = regexp.MustCompile(`(?i)(?:充值金额|到账额度|credited(?:\s+amount)?)\s*[:：]?\s*([$＄￥¥]?)\s*(-?[0-9]+(?:\.[0-9]+)?)`)
+	fundPaidRE          = regexp.MustCompile(`(?i)(?:支付金额|实付(?:金额)?|paid(?:\s+amount)?)\s*[:：]?\s*([$＄￥¥]?)\s*(-?[0-9]+(?:\.[0-9]+)?)`)
+	fundCurrencyMoneyRE = regexp.MustCompile(`([$＄￥¥])\s*(-?[0-9]+(?:\.[0-9]+)?)`)
 )
 
 func decodeFundObject(raw json.RawMessage) map[string]json.RawMessage {
@@ -155,6 +199,9 @@ func fundString(fields map[string]json.RawMessage, names ...string) string {
 }
 
 func fundUSDFromQuota(value float64, row ChannelUpstreamAccount) (float64, bool) {
+	if row.EconomicUnitUnavailable {
+		return 0, false
+	}
 	unit := row.BalanceUnit
 	if unit <= 0 || math.IsNaN(unit) || math.IsInf(unit, 0) {
 		unit = defaultNewAPIQuotaPerUSD
@@ -165,25 +212,95 @@ func fundUSDFromQuota(value float64, row ChannelUpstreamAccount) (float64, bool)
 	return value / unit, true
 }
 
-func parseFundTextAmount(re *regexp.Regexp, content string, index int) (float64, bool, string) {
+func fundCurrency(symbol string) string {
+	switch symbol {
+	case "$", "＄":
+		return "USD"
+	case "¥", "￥":
+		return "CNY"
+	default:
+		return ""
+	}
+}
+
+func parseFundTextAmount(re *regexp.Regexp, content string, symbolIndex, numberIndex int) (float64, bool, string) {
 	m := re.FindStringSubmatch(content)
-	if len(m) <= index {
+	if len(m) <= numberIndex {
 		return 0, false, ""
 	}
-	n, err := strconv.ParseFloat(m[index], 64)
+	n, err := strconv.ParseFloat(m[numberIndex], 64)
 	if err != nil || math.IsNaN(n) || math.IsInf(n, 0) {
 		return 0, false, ""
 	}
-	currency := ""
-	if re == fundPaidRE && len(m) > 1 {
-		switch m[1] {
-		case "¥", "￥":
-			currency = "CNY"
-		case "$":
-			currency = "USD"
+	symbol := ""
+	if symbolIndex > 0 && len(m) > symbolIndex {
+		symbol = m[symbolIndex]
+	}
+	return n, true, fundCurrency(symbol)
+}
+
+func applyUpstreamFundAmount(item *upstreamFundItem, amount float64, currency, confidence string) {
+	item.UpstreamAmount, item.UpstreamAmountKnown, item.UpstreamCurrency = math.Abs(amount), true, currency
+	item.Confidence = confidence
+	if currency == "USD" {
+		item.AmountUSD, item.AmountKnown = math.Abs(amount), true
+	}
+}
+
+func applyUpstreamFundUSD(item *upstreamFundItem, amount float64, confidence string) {
+	item.AmountUSD, item.AmountKnown = math.Abs(amount), true
+	item.UpstreamAmount, item.UpstreamAmountKnown, item.UpstreamCurrency = math.Abs(amount), true, "USD"
+	item.Confidence = confidence
+
+}
+
+func applyUpstreamFundAbsolute(item *upstreamFundItem, amount float64, currency, confidence string) {
+	item.UpstreamAfter, item.UpstreamAfterKnown, item.UpstreamCurrency = amount, true, currency
+	item.Confidence = confidence
+	if currency == "USD" {
+		item.AfterUSD, item.AfterKnown = amount, true
+	}
+}
+
+func explicitFundDirection(content string) (string, bool) {
+	lower := strings.ToLower(content)
+	creditTerms := []string{"增加", "新增", "赠送", "获得", "收到", "充值", "补充", "add", "credit", "grant", "receive"}
+	debitTerms := []string{"减少", "扣减", "扣除", "撤回", "subtract", "decrease", "debit", "deduct"}
+	for _, term := range debitTerms {
+		if strings.Contains(lower, term) {
+			return "debit", true
 		}
 	}
-	return n, true, currency
+	for _, term := range creditTerms {
+		if strings.Contains(lower, term) {
+			return "credit", true
+		}
+	}
+	return "info", false
+}
+
+func fundCurrencyAmounts(content string, limit int) []struct {
+	Amount   float64
+	Currency string
+} {
+	matches := fundCurrencyMoneyRE.FindAllStringSubmatch(content, limit)
+	out := make([]struct {
+		Amount   float64
+		Currency string
+	}, 0, len(matches))
+	for _, match := range matches {
+		if len(match) < 3 {
+			continue
+		}
+		amount, err := strconv.ParseFloat(match[2], 64)
+		if err == nil && !math.IsNaN(amount) && !math.IsInf(amount, 0) {
+			out = append(out, struct {
+				Amount   float64
+				Currency string
+			}{Amount: amount, Currency: fundCurrency(match[1])})
+		}
+	}
+	return out
 }
 
 func decodeUpstreamFundItem(row ChannelUpstreamAccount, logType int, itemJSON json.RawMessage) (upstreamFundItem, error) {
@@ -194,6 +311,10 @@ func decodeUpstreamFundItem(row ChannelUpstreamAccount, logType int, itemJSON js
 	created, ok := fundNumber(fields, "created_at", "createdAt")
 	if !ok || created <= 0 || created != math.Trunc(created) {
 		return upstreamFundItem{}, fmt.Errorf("NewAPI 资金日志缺少有效 created_at")
+	}
+	actualType, typeOK := fundNumber(fields, "type")
+	if !typeOK || actualType != math.Trunc(actualType) || int(actualType) != logType {
+		return upstreamFundItem{}, fmt.Errorf("NewAPI 资金日志 type 与查询类型不一致: got=%v want=%d", actualType, logType)
 	}
 	stable, err := stableUpstreamErrorEventKey(fields)
 	if err != nil {
@@ -211,95 +332,323 @@ func decodeUpstreamFundItem(row ChannelUpstreamAccount, logType int, itemJSON js
 		RequestID: boundedUpstreamErrorField(fundString(fields, "request_id", "requestId"), 128),
 		Raw:       raw, RawTruncated: truncated,
 	}
+	if unit, known := upstreamEconomicUnitAt(row, item.OccurredAt); known {
+		row.BalanceUnit = unit
+		item.UnitPerUSD = unit
+	} else if row.BalanceUnitEffectiveAt > 0 {
+		row.EconomicUnitUnavailable = true
+	} else if row.Provider == upstreamProviderNewAPI {
+		row.BalanceUnit = defaultNewAPIQuotaPerUSD
+		item.UnitPerUSD = defaultNewAPIQuotaPerUSD
+	}
 	quota, quotaKnown := fundNumber(fields, "quota")
 	switch logType {
 	case 1:
-		item.Financial, item.Direction, item.Kind = true, "credit", upstreamFundKindTopup
-		lower := strings.ToLower(item.Content)
-		if strings.Contains(item.Content, "兑换码") || strings.Contains(lower, "redeem") {
-			item.Kind = upstreamFundKindRedemption
-		} else if strings.Contains(item.Content, "手动") || strings.Contains(item.Content, "管理员") || strings.Contains(lower, "manual") {
-			item.Kind = upstreamFundKindManualTopup
-		}
-		if amount, found, _ := parseFundTextAmount(fundCreditRE, item.Content, 1); found {
-			item.AmountUSD, item.AmountKnown, item.Confidence = amount, true, upstreamFundConfidenceLegacyText
-		} else if quotaKnown && quota != 0 {
-			item.AmountUSD, item.AmountKnown = fundUSDFromQuota(quota, row)
-			item.Confidence = upstreamFundConfidenceField
-		} else if amount, found, _ := parseFundTextAmount(fundDollarRE, item.Content, 1); found {
-			item.AmountUSD, item.AmountKnown, item.Confidence = amount, true, upstreamFundConfidenceLegacyText
-		}
-		if paid, found, currency := parseFundTextAmount(fundPaidRE, item.Content, 2); found {
-			item.PaidAmount, item.PaidKnown, item.PaidCurrency = paid, true, currency
-		}
+		decodeNewAPITopup(&item, row, fields, quota, quotaKnown)
 	case 3:
-		other := decodeFundObject(fields["other"])
-		op := decodeFundObject(other["op"])
-		action := strings.ToLower(fundString(op, "action"))
-		params := decodeFundObject(op["params"])
-		if len(params) == 0 {
-			params = decodeFundObject(other["params"])
-		}
-		switch action {
-		case "user.quota_add":
-			item.Financial, item.Kind, item.Direction, item.Confidence = true, upstreamFundKindAdminAdd, "credit", upstreamFundConfidenceStructured
-			if v, found := fundNumber(params, "quota", "amount"); found {
-				item.AmountUSD, item.AmountKnown = fundUSDFromQuota(v, row)
-			}
-		case "user.quota_subtract":
-			item.Financial, item.Kind, item.Direction, item.Confidence = true, upstreamFundKindAdminSub, "debit", upstreamFundConfidenceStructured
-			if v, found := fundNumber(params, "quota", "amount"); found {
-				item.AmountUSD, item.AmountKnown = fundUSDFromQuota(math.Abs(v), row)
-			}
-		case "user.quota_override":
-			item.Financial, item.Kind, item.Direction, item.Confidence = true, upstreamFundKindAdminSet, "info", upstreamFundConfidenceStructured
-			from, fromOK := fundNumber(params, "from", "before", "old")
-			to, toOK := fundNumber(params, "to", "after", "new")
-			if fromOK {
-				item.BeforeUSD, item.BeforeKnown = fundUSDFromQuota(from, row)
-			}
-			if toOK {
-				item.AfterUSD, item.AfterKnown = fundUSDFromQuota(to, row)
-			}
-			if item.BeforeKnown && item.AfterKnown {
-				delta := item.AfterUSD - item.BeforeUSD
-				item.AmountUSD, item.AmountKnown = math.Abs(delta), true
-				if delta > 0 {
-					item.Direction = "credit"
-				} else if delta < 0 {
-					item.Direction = "debit"
-				}
-			}
-		default:
-			// 兼容早期没有结构化 op 的 NewAPI，但只在文本明确出现“额度”时保留，
-			// 避免把改分组、改角色等普通管理日志误当资金。
-			if strings.Contains(item.Content, "额度") || strings.Contains(strings.ToLower(item.Content), "quota") {
-				item.Financial, item.Kind, item.Confidence = true, upstreamFundKindAdminSet, upstreamFundConfidenceLegacyText
-				amounts := fundDollarRE.FindAllStringSubmatch(item.Content, 3)
-				if len(amounts) >= 2 {
-					before, e1 := strconv.ParseFloat(amounts[0][1], 64)
-					after, e2 := strconv.ParseFloat(amounts[1][1], 64)
-					if e1 == nil && e2 == nil {
-						item.BeforeUSD, item.BeforeKnown, item.AfterUSD, item.AfterKnown = before, true, after, true
-						delta := after - before
-						item.AmountUSD, item.AmountKnown = math.Abs(delta), true
-						if delta > 0 {
-							item.Direction = "credit"
-						} else if delta < 0 {
-							item.Direction = "debit"
-						}
-					}
-				}
-			}
-		}
+		decodeNewAPIAdmin(&item, row, fields)
+	case 4:
+		decodeNewAPISystem(&item)
 	case 6:
-		item.Financial, item.Kind, item.Direction = true, upstreamFundKindRefund, "credit"
-		if quotaKnown {
-			item.AmountUSD, item.AmountKnown = fundUSDFromQuota(math.Abs(quota), row)
+		decodeNewAPIRefund(&item, row, quota, quotaKnown)
+	}
+	return item, nil
+}
+
+func decodeNewAPITopup(item *upstreamFundItem, row ChannelUpstreamAccount, fields map[string]json.RawMessage, quota float64, quotaKnown bool) {
+	item.Financial, item.Direction, item.Kind = true, "credit", upstreamFundKindTopup
+	lower := strings.ToLower(item.Content)
+	other := decodeFundObject(fields["other"])
+	op := decodeFundObject(other["op"])
+	action := strings.ToLower(fundString(op, "action"))
+	if strings.Contains(item.Content, "兑换码") || strings.Contains(lower, "redeem") {
+		item.Kind = upstreamFundKindRedemption
+	} else if strings.Contains(item.Content, "手动") || strings.Contains(item.Content, "管理员") || strings.Contains(lower, "manual") || strings.Contains(lower, "administrator") || action == "user.quota_received" {
+		item.Kind = upstreamFundKindManualTopup
+	}
+	if amount, found, currency := parseFundTextAmount(fundCreditRE, item.Content, 1, 2); found {
+		applyUpstreamFundAmount(item, amount, currency, upstreamFundConfidenceLegacyText)
+	} else if amounts := fundCurrencyAmounts(item.Content, 1); len(amounts) == 1 {
+		applyUpstreamFundAmount(item, amounts[0].Amount, amounts[0].Currency, upstreamFundConfidenceLegacyText)
+	}
+	if !item.AmountKnown && quotaKnown && quota != 0 {
+		if amount, found := fundUSDFromQuota(quota, row); found {
+			item.AmountUSD, item.AmountKnown = math.Abs(amount), true
+			if !item.UpstreamAmountKnown {
+				item.UpstreamAmount, item.UpstreamAmountKnown, item.UpstreamCurrency = math.Abs(amount), true, "USD"
+			}
 			item.Confidence = upstreamFundConfidenceField
 		}
 	}
+	if paid, found, currency := parseFundTextAmount(fundPaidRE, item.Content, 1, 2); found {
+		item.PaidAmount, item.PaidKnown, item.PaidCurrency = math.Abs(paid), true, currency
+	}
+}
+
+func decodeNewAPIAdmin(item *upstreamFundItem, row ChannelUpstreamAccount, fields map[string]json.RawMessage) {
+	other := decodeFundObject(fields["other"])
+	op := decodeFundObject(other["op"])
+	action := strings.ToLower(fundString(op, "action"))
+	params := decodeFundObject(op["params"])
+	if len(params) == 0 {
+		params = decodeFundObject(other["params"])
+	}
+	switch action {
+	case "user.quota_add":
+		item.Financial, item.Kind, item.Direction, item.Confidence = true, upstreamFundKindAdminAdd, "credit", upstreamFundConfidenceStructured
+		if v, found := fundNumber(params, "quota", "amount"); found {
+			if amount, known := fundUSDFromQuota(v, row); known {
+				applyUpstreamFundUSD(item, amount, upstreamFundConfidenceStructured)
+			}
+		}
+	case "user.quota_subtract":
+		item.Financial, item.Kind, item.Direction, item.Confidence = true, upstreamFundKindAdminSub, "debit", upstreamFundConfidenceStructured
+		if v, found := fundNumber(params, "quota", "amount"); found {
+			if amount, known := fundUSDFromQuota(v, row); known {
+				applyUpstreamFundUSD(item, amount, upstreamFundConfidenceStructured)
+			}
+		}
+	case "user.quota_override":
+		decodeNewAPIQuotaOverride(item, row, params)
+	default:
+		decodeLegacyNewAPIAdmin(item)
+	}
+}
+
+func decodeNewAPIQuotaOverride(item *upstreamFundItem, row ChannelUpstreamAccount, params map[string]json.RawMessage) {
+	item.Financial, item.Kind, item.Direction, item.Confidence = true, upstreamFundKindAdminSet, "info", upstreamFundConfidenceStructured
+	from, fromOK := fundNumber(params, "from", "before", "old")
+	to, toOK := fundNumber(params, "to", "after", "new")
+	if fromOK {
+		item.BeforeUSD, item.BeforeKnown = fundUSDFromQuota(from, row)
+		item.UpstreamBefore, item.UpstreamBeforeKnown = item.BeforeUSD, item.BeforeKnown
+	}
+	if toOK {
+		item.AfterUSD, item.AfterKnown = fundUSDFromQuota(to, row)
+		item.UpstreamAfter, item.UpstreamAfterKnown = item.AfterUSD, item.AfterKnown
+	}
+	if item.BeforeKnown && item.AfterKnown {
+		delta := item.AfterUSD - item.BeforeUSD
+		applyUpstreamFundUSD(item, delta, upstreamFundConfidenceStructured)
+		item.Direction = fundDeltaDirection(delta)
+	}
+}
+
+func decodeLegacyNewAPIAdmin(item *upstreamFundItem) {
+	if !strings.Contains(item.Content, "额度") && !strings.Contains(strings.ToLower(item.Content), "quota") {
+		return
+	}
+	item.Financial, item.Kind, item.Confidence = true, upstreamFundKindAdminSet, upstreamFundConfidenceLegacyText
+	amounts := fundCurrencyAmounts(item.Content, 3)
+	if len(amounts) >= 2 {
+		before, after := amounts[0], amounts[1]
+		if before.Currency != after.Currency || before.Currency == "" {
+			return
+		}
+		item.UpstreamCurrency = before.Currency
+		item.UpstreamBefore, item.UpstreamBeforeKnown = before.Amount, true
+		item.UpstreamAfter, item.UpstreamAfterKnown = after.Amount, true
+		delta := after.Amount - before.Amount
+		applyUpstreamFundAmount(item, delta, before.Currency, upstreamFundConfidenceLegacyText)
+		if before.Currency == "USD" {
+			item.BeforeUSD, item.BeforeKnown, item.AfterUSD, item.AfterKnown = before.Amount, true, after.Amount, true
+		}
+		item.Direction = fundDeltaDirection(delta)
+		return
+	}
+	if len(amounts) != 1 {
+		return
+	}
+	if direction, explicit := explicitFundDirection(item.Content); explicit {
+		item.Direction = direction
+		if direction == "credit" {
+			item.Kind = upstreamFundKindAdminAdd
+		} else {
+			item.Kind = upstreamFundKindAdminSub
+		}
+		applyUpstreamFundAmount(item, amounts[0].Amount, amounts[0].Currency, upstreamFundConfidenceLegacyText)
+		return
+	}
+	applyUpstreamFundAbsolute(item, amounts[0].Amount, amounts[0].Currency, upstreamFundConfidenceLegacyText)
+}
+
+func decodeNewAPISystem(item *upstreamFundItem) {
+	lower := strings.ToLower(item.Content)
+	if !strings.Contains(item.Content, "额度") && !strings.Contains(lower, "quota") {
+		return
+	}
+	amounts := fundCurrencyAmounts(item.Content, 3)
+	if len(amounts) == 1 {
+		item.Financial, item.Direction, item.Kind = true, "info", upstreamFundKindSystemAdjust
+		switch {
+		case strings.Contains(item.Content, "注册") || strings.Contains(lower, "signup") || strings.Contains(lower, "register"):
+			item.Kind, item.Direction = upstreamFundKindSignupGrant, "credit"
+		case strings.Contains(item.Content, "签到") || strings.Contains(lower, "check-in") || strings.Contains(lower, "checkin"):
+			item.Kind, item.Direction = upstreamFundKindCheckinGrant, "credit"
+		default:
+			item.Direction, _ = explicitFundDirection(item.Content)
+		}
+		if item.Direction == "credit" || item.Direction == "debit" {
+			applyUpstreamFundAmount(item, amounts[0].Amount, amounts[0].Currency, upstreamFundConfidenceLegacyText)
+		} else {
+			applyUpstreamFundAbsolute(item, amounts[0].Amount, amounts[0].Currency, upstreamFundConfidenceLegacyText)
+		}
+		return
+	}
+	if len(amounts) < 2 || amounts[0].Currency != amounts[1].Currency || amounts[0].Currency == "" {
+		return
+	}
+	item.Financial, item.Kind = true, upstreamFundKindSystemAdjust
+	item.UpstreamCurrency = amounts[0].Currency
+	item.UpstreamBefore, item.UpstreamBeforeKnown = amounts[0].Amount, true
+	item.UpstreamAfter, item.UpstreamAfterKnown = amounts[1].Amount, true
+	delta := amounts[1].Amount - amounts[0].Amount
+	applyUpstreamFundAmount(item, delta, amounts[0].Currency, upstreamFundConfidenceLegacyText)
+	if amounts[0].Currency == "USD" {
+		item.BeforeUSD, item.BeforeKnown, item.AfterUSD, item.AfterKnown = amounts[0].Amount, true, amounts[1].Amount, true
+	}
+	item.Direction = fundDeltaDirection(delta)
+}
+
+func decodeNewAPIRefund(item *upstreamFundItem, row ChannelUpstreamAccount, quota float64, quotaKnown bool) {
+	item.Financial, item.Kind, item.Direction = true, upstreamFundKindRefund, "credit"
+	if quotaKnown {
+		if amount, known := fundUSDFromQuota(quota, row); known {
+			applyUpstreamFundUSD(item, amount, upstreamFundConfidenceField)
+		}
+	} else if amounts := fundCurrencyAmounts(item.Content, 1); len(amounts) == 1 {
+		applyUpstreamFundAmount(item, amounts[0].Amount, amounts[0].Currency, upstreamFundConfidenceLegacyText)
+	}
+}
+
+func fundDeltaDirection(delta float64) string {
+	if delta > 0 {
+		return "credit"
+	}
+	if delta < 0 {
+		return "debit"
+	}
+	return "info"
+}
+
+func makeChannelUpstreamFundEvent(row ChannelUpstreamAccount, epoch string, item upstreamFundItem, observedCount int, fetchedAt int64) ChannelUpstreamFundEvent {
+	if observedCount < 1 {
+		observedCount = 1
+	}
+	return ChannelUpstreamFundEvent{
+		Domain: row.Domain, AccountEpoch: epoch, EventKey: item.EventKey, OccurredAt: item.OccurredAt,
+		Provider: row.Provider, SourceType: item.SourceType, Kind: item.Kind, Direction: item.Direction,
+		Confidence: item.Confidence, ParserVersion: upstreamFundParserVersion,
+		AmountUSD: item.AmountUSD, AmountKnown: item.AmountKnown, UnitPerUSD: item.UnitPerUSD,
+		UpstreamAmount: item.UpstreamAmount, UpstreamAmountKnown: item.UpstreamAmountKnown, UpstreamCurrency: item.UpstreamCurrency,
+		PaidAmount: item.PaidAmount, PaidKnown: item.PaidKnown, PaidCurrency: item.PaidCurrency,
+		BeforeUSD: item.BeforeUSD, BeforeKnown: item.BeforeKnown, AfterUSD: item.AfterUSD, AfterKnown: item.AfterKnown,
+		UpstreamBefore: item.UpstreamBefore, UpstreamBeforeKnown: item.UpstreamBeforeKnown,
+		UpstreamAfter: item.UpstreamAfter, UpstreamAfterKnown: item.UpstreamAfterKnown,
+		Content: item.Content, RequestID: item.RequestID, RawJSON: item.Raw, RawTruncated: item.RawTruncated,
+		ObservedCount: observedCount, FetchedAt: fetchedAt,
+	}
+}
+
+func decodeSub2APIFundItem(itemJSON json.RawMessage) (upstreamFundItem, error) {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(itemJSON, &fields); err != nil {
+		return upstreamFundItem{}, fmt.Errorf("Sub2API 资金记录无效: %w", err)
+	}
+	id, ok := fundNumber(fields, "id")
+	if !ok || id <= 0 || id != math.Trunc(id) {
+		return upstreamFundItem{}, fmt.Errorf("Sub2API 资金记录缺少有效 id")
+	}
+	typeName := strings.ToLower(fundString(fields, "type"))
+	status := strings.ToLower(fundString(fields, "status"))
+	value, valueKnown := fundNumber(fields, "value")
+	timeText := fundString(fields, "used_at", "usedAt", "created_at", "createdAt")
+	occurred, err := time.Parse(time.RFC3339Nano, timeText)
+	if err != nil {
+		return upstreamFundItem{}, fmt.Errorf("Sub2API 资金记录时间无效")
+	}
+	// Redeem codes remain sensitive even after use. Preserve the rest of the
+	// source evidence, but never persist the code itself.
+	delete(fields, "code")
+	safeRaw, err := json.Marshal(fields)
+	if err != nil {
+		return upstreamFundItem{}, fmt.Errorf("Sub2API 资金记录无法安全保存")
+	}
+	raw, truncated := string(safeRaw), false
+	if len(raw) > upstreamErrorLogRawMax {
+		raw, truncated = raw[:upstreamErrorLogRawMax], true
+	}
+	item := upstreamFundItem{
+		EventKey: "sub2-" + strconv.FormatInt(int64(id), 10), OccurredAt: occurred.Unix(),
+		Kind: upstreamFundKindUnknown, Direction: "info", Confidence: upstreamFundConfidenceStructured,
+		Content: boundedUpstreamErrorField(fundString(fields, "notes", "message"), upstreamErrorLogContentMax),
+		Raw:     raw, RawTruncated: truncated,
+	}
+	if status != "used" || !valueKnown || value == 0 {
+		return item, nil
+	}
+	switch typeName {
+	case "balance":
+		item.Financial, item.SourceType, item.Kind = true, 1, upstreamFundKindRedemption
+	case "admin_balance":
+		item.Financial, item.SourceType = true, 3
+		if value > 0 {
+			item.Kind = upstreamFundKindAdminAdd
+		} else {
+			item.Kind = upstreamFundKindAdminSub
+		}
+	case "affiliate_balance":
+		item.Financial, item.SourceType, item.Kind = true, 4, upstreamFundKindAffiliateGrant
+	default:
+		return item, nil
+	}
+	if value > 0 {
+		item.Direction = "credit"
+	} else {
+		item.Direction = "debit"
+	}
+	applyUpstreamFundUSD(&item, math.Abs(value), upstreamFundConfidenceStructured)
+	if item.Content == "" {
+		item.Content = typeName
+	}
 	return item, nil
+}
+
+func (m *Monitor) fetchSub2APIFundEvents(ctx context.Context, row ChannelUpstreamAccount, cred sub2APICredential, now int64) ([]ChannelUpstreamFundEvent, int64, error) {
+	body, err := doUpstreamJSON(ctx, m.channelUpstreamHTTPClient(), http.MethodGet, upstreamEndpoint(row.BaseURL, "/api/v1/redeem/history"), sub2APIUsageHeaders(cred), nil)
+	if err != nil {
+		var statusErr *upstreamHTTPError
+		if errors.As(err, &statusErr) && (statusErr.Status == http.StatusUnauthorized || statusErr.Status == http.StatusForbidden) {
+			return nil, 0, &upstreamAuthError{err: err}
+		}
+		return nil, 0, err
+	}
+	var rawItems []json.RawMessage
+	if err := decodeSub2APIData(body, &rawItems); err != nil {
+		return nil, 0, err
+	}
+	epoch := newAPIUpstreamAccountEpoch(row)
+	seen := make(map[string]struct{}, len(rawItems))
+	events := make([]ChannelUpstreamFundEvent, 0, len(rawItems))
+	var earliest int64
+	for _, raw := range rawItems {
+		item, err := decodeSub2APIFundItem(raw)
+		if err != nil {
+			return nil, 0, err
+		}
+		if _, exists := seen[item.EventKey]; exists {
+			return nil, 0, fmt.Errorf("Sub2API 资金记录 id 重复")
+		}
+		seen[item.EventKey] = struct{}{}
+		if !item.Financial {
+			continue
+		}
+		if earliest == 0 || item.OccurredAt < earliest {
+			earliest = item.OccurredAt
+		}
+		events = append(events, makeChannelUpstreamFundEvent(row, epoch, item, 1, now))
+	}
+	return events, earliest, nil
 }
 
 type upstreamFundWindowResult struct {
@@ -325,10 +674,10 @@ func (m *Monitor) syncUpstreamFundWindow(ctx context.Context, row ChannelUpstrea
 	if to <= from {
 		return upstreamFundWindowResult{}, fmt.Errorf("上游资金流水窗口无效")
 	}
-	pacer := newUpstreamUsageRequestPacer(18, upstreamUsageRequestInterval)
+	pacer := newUpstreamUsageRequestPacer(upstreamFundMaxRequestsPerWindow, upstreamUsageRequestInterval)
 	epoch := newAPIUpstreamAccountEpoch(row)
 	grouped := map[string]*ChannelUpstreamFundEvent{}
-	for _, logType := range []int{1, 3, 6} {
+	for _, logType := range []int{1, 3, 4, 6} {
 		decode := func(raw json.RawMessage) (upstreamFundItem, error) { return decodeUpstreamFundItem(row, logType, raw) }
 		first, err := fetchNewAPILogPageWithType(ctx, m.channelUpstreamHTTPClient(), row, cred, from, to, 1, pacer, logType, decode)
 		if err != nil {
@@ -379,15 +728,8 @@ func (m *Monitor) syncUpstreamFundWindow(ctx context.Context, row ChannelUpstrea
 				existing.ObservedCount++
 				continue
 			}
-			grouped[item.EventKey] = &ChannelUpstreamFundEvent{
-				Domain: row.Domain, AccountEpoch: epoch, EventKey: item.EventKey, OccurredAt: item.OccurredAt,
-				Provider: row.Provider, SourceType: item.SourceType, Kind: item.Kind, Direction: item.Direction,
-				Confidence: item.Confidence, AmountUSD: item.AmountUSD, AmountKnown: item.AmountKnown,
-				PaidAmount: item.PaidAmount, PaidKnown: item.PaidKnown, PaidCurrency: item.PaidCurrency,
-				BeforeUSD: item.BeforeUSD, BeforeKnown: item.BeforeKnown, AfterUSD: item.AfterUSD, AfterKnown: item.AfterKnown,
-				Content: item.Content, RequestID: item.RequestID, RawJSON: item.Raw, RawTruncated: item.RawTruncated,
-				ObservedCount: 1, FetchedAt: now,
-			}
+			event := makeChannelUpstreamFundEvent(row, epoch, item, 1, now)
+			grouped[item.EventKey] = &event
 		}
 	}
 	keys := make([]string, 0, len(grouped))
@@ -416,14 +758,20 @@ func (m *Monitor) persistUpstreamFundEvents(ctx context.Context, rows []ChannelU
 			DoUpdates: clause.Assignments(map[string]any{
 				"occurred_at": gorm.Expr("excluded.occurred_at"), "provider": gorm.Expr("excluded.provider"),
 				"source_type": gorm.Expr("excluded.source_type"), "kind": gorm.Expr("excluded.kind"),
-				"direction": gorm.Expr("excluded.direction"), "confidence": gorm.Expr("excluded.confidence"),
-				"amount_usd": gorm.Expr("excluded.amount_usd"), "amount_known": gorm.Expr("excluded.amount_known"),
-				"paid_amount": gorm.Expr("excluded.paid_amount"), "paid_known": gorm.Expr("excluded.paid_known"),
-				"paid_currency": gorm.Expr("excluded.paid_currency"), "before_usd": gorm.Expr("excluded.before_usd"),
-				"before_known": gorm.Expr("excluded.before_known"), "after_usd": gorm.Expr("excluded.after_usd"),
-				"after_known": gorm.Expr("excluded.after_known"), "content": gorm.Expr("excluded.content"),
+				"direction": gorm.Expr("excluded.direction"), "confidence": gorm.Expr("excluded.confidence"), "parser_version": gorm.Expr("excluded.parser_version"),
+				"amount_usd": upstreamFundMoneyAssignment("amount_usd"), "amount_known": upstreamFundMoneyAssignment("amount_known"),
+				"unit_per_usd":    upstreamFundUnitAssignment(),
+				"upstream_amount": upstreamFundMoneyAssignment("upstream_amount"), "upstream_amount_known": upstreamFundMoneyAssignment("upstream_amount_known"),
+				"upstream_currency": upstreamFundMoneyAssignment("upstream_currency"),
+				"paid_amount":       upstreamFundMoneyAssignment("paid_amount"), "paid_known": upstreamFundMoneyAssignment("paid_known"),
+				"paid_currency": upstreamFundMoneyAssignment("paid_currency"), "before_usd": upstreamFundMoneyAssignment("before_usd"),
+				"before_known": upstreamFundMoneyAssignment("before_known"), "after_usd": upstreamFundMoneyAssignment("after_usd"),
+				"after_known": upstreamFundMoneyAssignment("after_known"), "upstream_before": upstreamFundMoneyAssignment("upstream_before"),
+				"upstream_before_known": upstreamFundMoneyAssignment("upstream_before_known"), "upstream_after": upstreamFundMoneyAssignment("upstream_after"),
+				"upstream_after_known": upstreamFundMoneyAssignment("upstream_after_known"), "content": gorm.Expr("excluded.content"),
 				"request_id": gorm.Expr("excluded.request_id"), "raw_json": gorm.Expr("excluded.raw_json"),
 				"raw_truncated": gorm.Expr("excluded.raw_truncated"), "fetched_at": gorm.Expr("excluded.fetched_at"),
+				"reparse_error":  gorm.Expr("excluded.reparse_error"),
 				"observed_count": gorm.Expr("MAX(observed_count, excluded.observed_count)"),
 			}),
 		}).Create(rows[start:end]).Error; err != nil {
@@ -431,6 +779,83 @@ func (m *Monitor) persistUpstreamFundEvents(ctx context.Context, rows []ChannelU
 		}
 	}
 	return nil
+}
+
+func upstreamFundPreserveExistingUnitSQL() string {
+	return `channel_upstream_fund_events.provider = ? AND
+		(channel_upstream_fund_events.unit_per_usd = 0 OR
+		 (excluded.unit_per_usd > 0 AND ABS(channel_upstream_fund_events.unit_per_usd-excluded.unit_per_usd) > 0.000000000001))`
+}
+
+func upstreamFundMoneyAssignment(column string) clause.Expr {
+	return gorm.Expr(fmt.Sprintf(`CASE WHEN %s THEN channel_upstream_fund_events.%s ELSE excluded.%s END`, upstreamFundPreserveExistingUnitSQL(), column, column), upstreamProviderNewAPI)
+}
+
+func upstreamFundUnitAssignment() clause.Expr {
+	return gorm.Expr(`CASE WHEN `+upstreamFundPreserveExistingUnitSQL()+` THEN channel_upstream_fund_events.unit_per_usd ELSE excluded.unit_per_usd END`, upstreamProviderNewAPI)
+}
+
+func (m *Monitor) reparseStoredUpstreamFundEvents(ctx context.Context, row ChannelUpstreamAccount, now int64) error {
+	epoch := newAPIUpstreamAccountEpoch(row)
+	var stored []ChannelUpstreamFundEvent
+	if err := m.storeDB.WithContext(ctx).
+		Where("domain = ? AND account_epoch = ? AND parser_version < ? AND raw_json <> ''", row.Domain, epoch, upstreamFundParserVersion).
+		Order("occurred_at DESC,event_key DESC").Limit(200).Find(&stored).Error; err != nil {
+		return fmt.Errorf("读取待重解析资金流水失败: %w", err)
+	}
+	if len(stored) == 0 {
+		return nil
+	}
+	updated := make([]ChannelUpstreamFundEvent, 0, len(stored))
+	for _, old := range stored {
+		quarantine := func(cause error) error {
+			reason := boundedUpstreamErrorField(cause.Error(), 512)
+			if err := m.storeDB.WithContext(ctx).Model(&ChannelUpstreamFundEvent{}).
+				Where("domain = ? AND account_epoch = ? AND event_key = ?", old.Domain, old.AccountEpoch, old.EventKey).
+				Updates(map[string]any{"parser_version": upstreamFundParserVersion, "reparse_error": reason}).Error; err != nil {
+				return fmt.Errorf("隔离无法重解析的资金流水 %s 失败: %w", old.EventKey, err)
+			}
+			slog.Warn("历史资金流水已隔离，继续同步最新记录", "domain", row.Domain, "event_key", old.EventKey, "err", cause)
+			return nil
+		}
+		if old.RawTruncated {
+			if err := quarantine(fmt.Errorf("保留的原始证据已截断")); err != nil {
+				return err
+			}
+			continue
+		}
+		decodeRow := row
+		if old.Provider == upstreamProviderNewAPI {
+			if !validUpstreamEconomicUnit(old.UnitPerUSD) {
+				if err := quarantine(fmt.Errorf("历史资金流水缺少换算单位证据")); err != nil {
+					return err
+				}
+				continue
+			}
+			decodeRow.BalanceUnit = old.UnitPerUSD
+			decodeRow.BalanceUnitEffectiveAt = 0
+			decodeRow.BalanceUnitPrevious = 0
+		}
+		item, err := decodeUpstreamFundItem(decodeRow, old.SourceType, json.RawMessage(old.RawJSON))
+		if err != nil {
+			if err := quarantine(err); err != nil {
+				return err
+			}
+			continue
+		}
+		if !item.Financial || item.EventKey != old.EventKey {
+			if err := quarantine(fmt.Errorf("解析后语义或事件标识不一致")); err != nil {
+				return err
+			}
+			continue
+		}
+		fetchedAt := old.FetchedAt
+		if fetchedAt <= 0 {
+			fetchedAt = now
+		}
+		updated = append(updated, makeChannelUpstreamFundEvent(row, epoch, item, old.ObservedCount, fetchedAt))
+	}
+	return m.persistUpstreamFundEvents(ctx, updated)
 }
 
 func upstreamFundsBackfillDays(s Settings) int {
@@ -484,6 +909,78 @@ func (m *Monitor) failFundState(ctx context.Context, state *UpstreamFundSyncStat
 	return cause
 }
 
+func upstreamFundProviderSupported(provider string) bool {
+	return provider == upstreamProviderNewAPI || provider == upstreamProviderSub2API
+}
+
+func (m *Monitor) syncSub2UpstreamFunds(ctx context.Context, row ChannelUpstreamAccount, state UpstreamFundSyncState, now int64) (UpstreamFundSyncState, error) {
+	credential, err := m.credentialForAccount(row)
+	if err != nil {
+		return state, m.failFundState(ctx, &state, now, &upstreamAuthError{err: err})
+	}
+	cred, ok := credential.(sub2APICredential)
+	if !ok {
+		return state, m.failFundState(ctx, &state, now, &upstreamAuthError{err: fmt.Errorf("凭据类型不匹配")})
+	}
+	refreshed := false
+	if cred.AccessToken == "" || cred.ExpiresAt <= time.Now().Add(2*time.Minute).Unix() {
+		cred, err = refreshSub2API(ctx, m.channelUpstreamHTTPClient(), row, cred)
+		if err != nil {
+			return state, m.failFundState(ctx, &state, now, err)
+		}
+		refreshed = true
+		// Sub2API rotates refresh tokens. Persist the newest token before any
+		// subsequent request so a transient history failure cannot strand the
+		// account with an already-consumed refresh token.
+		if err = m.persistSyncedUpstreamAccount(ctx, &row, cred); err != nil {
+			return state, m.failFundState(ctx, &state, now, err)
+		}
+	}
+	events, earliest, err := m.fetchSub2APIFundEvents(ctx, row, cred, now)
+	if err != nil && !refreshed {
+		var statusErr *upstreamHTTPError
+		if errors.As(err, &statusErr) && statusErr.Status == http.StatusUnauthorized {
+			if cred, err = refreshSub2API(ctx, m.channelUpstreamHTTPClient(), row, cred); err == nil {
+				refreshed = true
+				if err = m.persistSyncedUpstreamAccount(ctx, &row, cred); err == nil {
+					events, earliest, err = m.fetchSub2APIFundEvents(ctx, row, cred, now)
+				}
+			}
+		}
+	}
+	if err != nil {
+		return state, m.failFundState(ctx, &state, now, err)
+	}
+	if err = m.persistUpstreamFundEvents(ctx, events); err != nil {
+		return state, m.failFundState(ctx, &state, now, err)
+	}
+	state.Status = upstreamStatusOK
+	state.HistoryScope = "provider_recent"
+	state.LastAttemptAt = now
+	state.LastSuccessAt = now
+	state.TailSyncedUntil = now
+	if earliest > 0 && (state.CoverageFrom == 0 || earliest < state.CoverageFrom) {
+		state.CoverageFrom = earliest
+	}
+	// /redeem/history has no verified pagination or time-range contract. It is
+	// a useful recent snapshot, but must never be labelled as complete history.
+	state.BackfillDone = false
+	state.BackfillBefore = 0
+	state.WindowFrom = 0
+	state.WindowTo = 0
+	state.WindowBackfill = false
+	state.ConsecutiveFails = 0
+	state.LastError = ""
+	state.NextSyncAt = now + 1800
+	if err = m.storeDB.WithContext(ctx).Model(&ChannelUpstreamFundEvent{}).Where("domain = ? AND account_epoch = ?", row.Domain, state.AccountEpoch).Count(&state.RowsTotal).Error; err != nil {
+		return state, m.failFundState(ctx, &state, now, err)
+	}
+	if err = m.saveFundState(ctx, &state, now); err != nil {
+		return state, err
+	}
+	return state, nil
+}
+
 func (m *Monitor) syncOneUpstreamFunds(ctx context.Context, domain string, background bool) (UpstreamFundSyncState, error) {
 	var release func()
 	var err error
@@ -511,12 +1008,18 @@ func (m *Monitor) syncOneUpstreamFunds(ctx context.Context, domain string, backg
 	if !upstreamErrorLogDomainAllowed(m.cfg.UpstreamFundsDomains, row.Domain) {
 		return state, fmt.Errorf("该上游未加入资金流水灰度白名单")
 	}
-	if row.Provider != upstreamProviderNewAPI {
+	if !upstreamFundProviderSupported(row.Provider) {
 		state.Status = upstreamStatusUnsupported
 		state.LastAttemptAt = now
 		state.NextSyncAt = 0
 		state.LastError = upstreamProviderName(row.Provider) + "资金明细接口尚未完成契约验证，未进行猜测采集"
 		return state, m.saveFundState(ctx, &state, now)
+	}
+	if row.Provider == upstreamProviderSub2API {
+		return m.syncSub2UpstreamFunds(ctx, row, state, now)
+	}
+	if err := m.reparseStoredUpstreamFundEvents(ctx, row, now); err != nil {
+		return state, m.failFundState(ctx, &state, now, err)
 	}
 	credential, err := m.credentialForAccount(row)
 	if err != nil {
@@ -616,7 +1119,7 @@ func (m *Monitor) syncDueUpstreamFunds(ctx context.Context) {
 	if !m.cfg.UpstreamFundsSyncEnabled || len(m.cfg.UpstreamFundsDomains) == 0 {
 		return
 	}
-	roundCtx, cancel := context.WithTimeout(ctx, 75*time.Second)
+	roundCtx, cancel := context.WithTimeout(ctx, upstreamFundSyncRoundTimeout)
 	defer cancel()
 	now := time.Now().Unix()
 	var rows []ChannelUpstreamAccount
@@ -637,7 +1140,7 @@ func (m *Monitor) syncDueUpstreamFunds(ctx context.Context) {
 		if err != nil {
 			continue
 		}
-		if state.Status == upstreamStatusUnsupported || state.NextSyncAt > now {
+		if (!upstreamFundProviderSupported(row.Provider) && state.Status == upstreamStatusUnsupported) || state.NextSyncAt > now {
 			continue
 		}
 		eligible = append(eligible, dueRow{row, state.LastAttemptAt})
@@ -649,7 +1152,7 @@ func (m *Monitor) syncDueUpstreamFunds(ctx context.Context) {
 		return eligible[i].row.Domain < eligible[j].row.Domain
 	})
 	for i, item := range eligible {
-		if i >= 2 || roundCtx.Err() != nil {
+		if i >= upstreamFundAccountsPerRound || roundCtx.Err() != nil {
 			return
 		}
 		if _, err := m.syncOneUpstreamFunds(roundCtx, item.row.Domain, true); err != nil && !errors.Is(err, errUpstreamAccountBusy) {
@@ -665,11 +1168,24 @@ type upstreamFundSummary struct {
 	UnknownAmountEvents       int64   `json:"unknown_amount_events"`
 	PaidUnknownCurrencyEvents int64   `json:"paid_unknown_currency_events"`
 	EventOccurrences          int64   `json:"event_occurrences"`
+	QuarantinedEvents         int64   `json:"quarantined_events"`
 }
 
 type upstreamFundPaidTotal struct {
 	Currency string  `json:"currency"`
 	Amount   float64 `json:"amount"`
+}
+
+type upstreamFundCurrencyTotal struct {
+	Currency string  `json:"currency"`
+	Credited float64 `json:"credited"`
+	Debited  float64 `json:"debited"`
+	Refunded float64 `json:"refunded"`
+}
+
+func upstreamFundQueryComplete(capability string, state UpstreamFundSyncState, from, to int64) bool {
+	return capability == "supported" && state.BackfillDone && state.HistoryScope != "provider_recent" &&
+		state.CoverageFrom > 0 && state.CoverageFrom <= from && state.TailSyncedUntil >= to
 }
 
 func (m *Monitor) getChannelUpstreamFundsHandler(c *gin.Context) {
@@ -691,8 +1207,9 @@ func (m *Monitor) getChannelUpstreamFundsHandler(c *gin.Context) {
 		return
 	}
 	now := time.Now().Unix()
-	from := now - 30*86400
+	from := now - int64(upstreamFundDefaultLookback/time.Second)
 	to := now + 1
+	explicitFrom, explicitTo := c.Query("from") != "", c.Query("to") != ""
 	if raw := c.Query("from"); raw != "" {
 		if parsed, err := strconv.ParseInt(raw, 10, 64); err == nil {
 			from = parsed
@@ -709,14 +1226,26 @@ func (m *Monitor) getChannelUpstreamFundsHandler(c *gin.Context) {
 			return
 		}
 	}
-	if to <= from || to-from > 366*86400 {
+	state, err := m.loadFundState(ctx, row)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "读取资金流水同步状态失败"})
+		return
+	}
+	// 默认区间截止在最后一个已成功同步的水位，不把从
+	// 水位到“现在”的未采集尾部偷偷算成零元。
+	if !explicitTo && state.TailSyncedUntil > 0 {
+		to = state.TailSyncedUntil
+		if !explicitFrom {
+			from = to - int64(upstreamFundDefaultLookback/time.Second)
+		}
+	}
+	if to <= from || to-from > int64(upstreamFundMaxQueryRange/time.Second) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "查询时间范围无效（最多 366 天）"})
 		return
 	}
-	state, _ := m.loadFundState(ctx, row)
 	var events []ChannelUpstreamFundEvent
 	epoch := newAPIUpstreamAccountEpoch(row)
-	if err := m.storeDB.WithContext(ctx).Where("domain = ? AND account_epoch = ? AND occurred_at >= ? AND occurred_at < ?", domain, epoch, from, to).Order("occurred_at DESC,event_key DESC").Limit(500).Find(&events).Error; err != nil {
+	if err := m.storeDB.WithContext(ctx).Where("domain = ? AND account_epoch = ? AND occurred_at >= ? AND occurred_at < ?", domain, epoch, from, to).Order("occurred_at DESC,event_key DESC").Limit(upstreamFundEventQueryLimit).Find(&events).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "读取资金流水失败"})
 		return
 	}
@@ -725,12 +1254,13 @@ func (m *Monitor) getChannelUpstreamFundsHandler(c *gin.Context) {
 	summary := upstreamFundSummary{}
 	if err := m.storeDB.WithContext(ctx).Model(&ChannelUpstreamFundEvent{}).
 		Select(`
-			COALESCE(SUM(CASE WHEN amount_known AND kind <> ? AND direction = 'credit' THEN amount_usd * CASE WHEN observed_count > 0 THEN observed_count ELSE 1 END ELSE 0 END), 0) AS credited_usd,
-			COALESCE(SUM(CASE WHEN amount_known AND kind <> ? AND direction = 'debit' THEN amount_usd * CASE WHEN observed_count > 0 THEN observed_count ELSE 1 END ELSE 0 END), 0) AS debited_usd,
-			COALESCE(SUM(CASE WHEN amount_known AND kind = ? THEN amount_usd * CASE WHEN observed_count > 0 THEN observed_count ELSE 1 END ELSE 0 END), 0) AS refunded_usd,
-			COALESCE(SUM(CASE WHEN NOT amount_known THEN CASE WHEN observed_count > 0 THEN observed_count ELSE 1 END ELSE 0 END), 0) AS unknown_amount_events,
-			COALESCE(SUM(CASE WHEN paid_known AND paid_currency = '' THEN CASE WHEN observed_count > 0 THEN observed_count ELSE 1 END ELSE 0 END), 0) AS paid_unknown_currency_events,
-			COALESCE(SUM(CASE WHEN observed_count > 0 THEN observed_count ELSE 1 END), 0) AS event_occurrences`,
+			COALESCE(SUM(CASE WHEN COALESCE(reparse_error,'') = '' AND amount_known AND kind <> ? AND direction = 'credit' THEN amount_usd * CASE WHEN observed_count > 0 THEN observed_count ELSE 1 END ELSE 0 END), 0) AS credited_usd,
+			COALESCE(SUM(CASE WHEN COALESCE(reparse_error,'') = '' AND amount_known AND kind <> ? AND direction = 'debit' THEN amount_usd * CASE WHEN observed_count > 0 THEN observed_count ELSE 1 END ELSE 0 END), 0) AS debited_usd,
+			COALESCE(SUM(CASE WHEN COALESCE(reparse_error,'') = '' AND amount_known AND kind = ? THEN amount_usd * CASE WHEN observed_count > 0 THEN observed_count ELSE 1 END ELSE 0 END), 0) AS refunded_usd,
+			COALESCE(SUM(CASE WHEN COALESCE(reparse_error,'') = '' AND NOT amount_known AND (NOT upstream_amount_known OR upstream_currency = '') THEN CASE WHEN observed_count > 0 THEN observed_count ELSE 1 END ELSE 0 END), 0) AS unknown_amount_events,
+			COALESCE(SUM(CASE WHEN COALESCE(reparse_error,'') = '' AND paid_known AND paid_currency = '' THEN CASE WHEN observed_count > 0 THEN observed_count ELSE 1 END ELSE 0 END), 0) AS paid_unknown_currency_events,
+			COALESCE(SUM(CASE WHEN observed_count > 0 THEN observed_count ELSE 1 END), 0) AS event_occurrences,
+			COALESCE(SUM(CASE WHEN COALESCE(reparse_error,'') <> '' THEN CASE WHEN observed_count > 0 THEN observed_count ELSE 1 END ELSE 0 END), 0) AS quarantined_events`,
 			upstreamFundKindRefund, upstreamFundKindRefund, upstreamFundKindRefund).
 		Where("domain = ? AND account_epoch = ? AND occurred_at >= ? AND occurred_at < ?", domain, epoch, from, to).
 		Scan(&summary).Error; err != nil {
@@ -740,14 +1270,29 @@ func (m *Monitor) getChannelUpstreamFundsHandler(c *gin.Context) {
 	var paidTotals []upstreamFundPaidTotal
 	if err := m.storeDB.WithContext(ctx).Model(&ChannelUpstreamFundEvent{}).
 		Select("paid_currency AS currency, SUM(paid_amount * CASE WHEN observed_count > 0 THEN observed_count ELSE 1 END) AS amount").
-		Where("domain = ? AND account_epoch = ? AND occurred_at >= ? AND occurred_at < ? AND paid_known = ? AND paid_currency <> ''", domain, epoch, from, to, true).
+		Where("domain = ? AND account_epoch = ? AND occurred_at >= ? AND occurred_at < ? AND paid_known = ? AND paid_currency <> '' AND COALESCE(reparse_error,'') = ''", domain, epoch, from, to, true).
 		Group("paid_currency").Order("paid_currency ASC").Scan(&paidTotals).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "汇总上游实付原币失败"})
 		return
 	}
+	// Only return upstream-currency totals that are not already represented by
+	// amount_usd. This avoids displaying the same full-width-dollar event twice,
+	// while still making ¥-denominated evidence visible and auditable.
+	var upstreamTotals []upstreamFundCurrencyTotal
+	if err := m.storeDB.WithContext(ctx).Model(&ChannelUpstreamFundEvent{}).
+		Select(`upstream_currency AS currency,
+			COALESCE(SUM(CASE WHEN kind <> ? AND direction = 'credit' THEN upstream_amount * CASE WHEN observed_count > 0 THEN observed_count ELSE 1 END ELSE 0 END), 0) AS credited,
+			COALESCE(SUM(CASE WHEN kind <> ? AND direction = 'debit' THEN upstream_amount * CASE WHEN observed_count > 0 THEN observed_count ELSE 1 END ELSE 0 END), 0) AS debited,
+			COALESCE(SUM(CASE WHEN kind = ? THEN upstream_amount * CASE WHEN observed_count > 0 THEN observed_count ELSE 1 END ELSE 0 END), 0) AS refunded`,
+			upstreamFundKindRefund, upstreamFundKindRefund, upstreamFundKindRefund).
+		Where("domain = ? AND account_epoch = ? AND occurred_at >= ? AND occurred_at < ? AND upstream_amount_known = ? AND amount_known = ? AND upstream_currency <> '' AND COALESCE(reparse_error,'') = ''", domain, epoch, from, to, true, false).
+		Group("upstream_currency").Order("upstream_currency ASC").Scan(&upstreamTotals).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "汇总上游账面金额失败"})
+		return
+	}
 	capability := "supported"
 	reason := ""
-	if row.Provider != upstreamProviderNewAPI {
+	if !upstreamFundProviderSupported(row.Provider) {
 		capability = "pending_adapter"
 		reason = upstreamProviderName(row.Provider) + "资金明细接口待契约验证"
 	} else if !row.UsageSyncEnabled {
@@ -760,12 +1305,16 @@ func (m *Monitor) getChannelUpstreamFundsHandler(c *gin.Context) {
 		capability = "not_allowed"
 		reason = "该主域名未加入资金流水白名单"
 	}
+	queryComplete := upstreamFundQueryComplete(capability, state, from, to)
 	limitations := []string{}
 	if row.Provider == upstreamProviderNewAPI {
 		limitations = append(limitations, "NewAPI 普通用户的 self 日志可能看不到管理员记在操作人名下的额度调整；这类缺口必须继续保留人工记账或后续用余额快照对账发现。")
 		limitations = append(limitations, "实付金额没有明确币种时保留为原币未知，不与美元到账额度相加。")
+	} else if row.Provider == upstreamProviderSub2API {
+		limitations = append(limitations, "Sub2API 普通账户只提供近期活动快照，未验证到历史分页或时间范围参数；已采集记录会保留，但不能据此证明更早历史完整。")
+		limitations = append(limitations, "兑换码原文属于敏感凭据，入库前会删除 code 字段；并发、订阅等非金额变更不会计入资金汇总。")
 	}
-	c.JSON(http.StatusOK, gin.H{"domain": domain, "capability": capability, "capability_reason": reason, "limitations": limitations, "state": state, "from": from, "to": to, "limited": len(events) >= 500, "summary": summary, "paid_totals": paidTotals, "events": events})
+	c.JSON(http.StatusOK, gin.H{"domain": domain, "capability": capability, "capability_reason": reason, "limitations": limitations, "state": state, "from": from, "to": to, "query_complete": queryComplete, "limited": len(events) >= upstreamFundEventQueryLimit, "returned_events": len(events), "summary": summary, "paid_totals": paidTotals, "upstream_totals": upstreamTotals, "events": events})
 }
 
 func (m *Monitor) syncChannelUpstreamFundsHandler(c *gin.Context) {
@@ -787,7 +1336,7 @@ func (m *Monitor) syncChannelUpstreamFundsHandler(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "主域名无效"})
 		return
 	}
-	ctx, cancel := context.WithTimeout(c.Request.Context(), 75*time.Second)
+	ctx, cancel := context.WithTimeout(c.Request.Context(), upstreamFundSyncRoundTimeout)
 	defer cancel()
 	state, err := m.syncOneUpstreamFunds(ctx, in.Domain, false)
 	if err != nil {

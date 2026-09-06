@@ -142,7 +142,7 @@ func TestResetStaleStabilityProblemClassificationRequiresExplicitNonDestructiveM
 		if err := m.storeDB.Exec("UPDATE "+table+" SET traffic_class_version=NULL WHERE bucket_ts=?", base).Error; err != nil {
 			t.Fatal(err)
 		}
-		if err := m.storeDB.Exec("UPDATE "+table+" SET traffic_class_version=? WHERE bucket_ts=?", userTrafficClassificationVersion-1, base+60).Error; err != nil {
+		if err := m.storeDB.Exec("UPDATE "+table+" SET traffic_class_version=? WHERE bucket_ts=?", stabilityTrafficClassificationVersion-1, base+60).Error; err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -168,7 +168,7 @@ func TestResetStaleStabilityProblemClassificationRequiresExplicitNonDestructiveM
 			t.Fatalf("%s must remain intact until bounded replacement, rows=%d", name, rows)
 		}
 		var current int64
-		if err := m.storeDB.Model(model).Where("bucket_ts=? AND traffic_class_version=?", base+120, userTrafficClassificationVersion).Count(&current).Error; err != nil || current != 1 {
+		if err := m.storeDB.Model(model).Where("bucket_ts=? AND traffic_class_version=?", base+120, stabilityTrafficClassificationVersion).Count(&current).Error; err != nil || current != 1 {
 			t.Fatalf("%s current row was removed: count=%d err=%v", name, current, err)
 		}
 	}
@@ -181,7 +181,7 @@ func TestResetStaleStabilityProblemClassificationRequiresExplicitNonDestructiveM
 		t.Fatalf("cold migration included an unfinalized minute: through=%s finalized=%s",
 			time.Unix(migration.ThroughTs, 0), time.Unix(finalizedThrough, 0))
 	}
-	if migration.TrafficClassVersion != userTrafficClassificationVersion || migration.Status != "queued" || migration.NextTs != migration.FromTs {
+	if migration.TrafficClassVersion != stabilityTrafficClassificationVersion || migration.Status != "queued" || migration.NextTs != migration.FromTs {
 		t.Fatalf("unexpected durable problem migration: %+v", migration)
 	}
 }
@@ -203,7 +203,7 @@ func TestRecentFinalizedHourRepairPersistsOnlyChannelTestCostOnSQLite(t *testing
 		quota, prompt, completion int
 	}{
 		{1, "success", `{"group_ratio":2}`, 120, 8, 3},
-		{2, "anomaly", `{"billing_mode":"tiered_expr","group_ratio":2}`, 80, 6, 0},
+		{2, "anomaly", `{"billing_mode":"tiered_expr","group_ratio":2,"request_path":"/v1/chat/completions"}`, 80, 6, 0},
 		{3, "failed", `{"status_code":503}`, 0, 0, 0},
 	}
 	for _, row := range tests {
@@ -249,7 +249,7 @@ func TestRecentFinalizedHourRepairPersistsOnlyChannelTestCostOnSQLite(t *testing
 		if row.Origin == "legacy_tiered" {
 			wantCost = "legacy_after_group"
 		}
-		if !ok || row.CostBasis != wantCost || row.Scope != "legacy" || row.TrafficClassVersion != userTrafficClassificationVersion ||
+		if !ok || row.CostBasis != wantCost || row.Scope != "legacy" || row.TrafficClassVersion != stabilityTrafficClassificationVersion ||
 			row.Success != expected.success || row.Anomaly != expected.anomaly || row.Failed != expected.failed || row.Quota != expected.quota {
 			t.Fatalf("unexpected channel-test hour row: %+v expected=%+v", row, expected)
 		}

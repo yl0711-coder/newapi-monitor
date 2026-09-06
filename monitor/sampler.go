@@ -26,6 +26,7 @@ const (
 	metricFinalizeSliceSec          int64 = 10 * 60
 	metricFinalizeInitialOverlapSec int64 = 15 * 60
 	metricFinalizeRunEverySec       int64 = 5 * 60
+	metricMigrationLookbackSec      int64 = 24 * 60 * 60
 )
 
 type metricRangeSampler func(context.Context, int64, int64) (int, error)
@@ -69,11 +70,11 @@ func (m *Monitor) sourceEpochStartupLookbacks(now int64) (int64, int64) {
 	}
 	var metricLatest, tokenLatest int64
 	if err := m.storeDB.Raw(`SELECT COALESCE(MAX(bucket_ts),0) FROM metric_samples WHERE traffic_class_version = ?`,
-		userTrafficClassificationVersion).Scan(&metricLatest).Error; err != nil {
+		stabilityTrafficClassificationVersion).Scan(&metricLatest).Error; err != nil {
 		metricLatest = 0
 	}
 	if err := m.storeDB.Raw(`SELECT COALESCE(MAX(bucket_ts),0) FROM token_samples WHERE traffic_class_version = ?`,
-		userTrafficClassificationVersion).Scan(&tokenLatest).Error; err != nil {
+		stabilityTrafficClassificationVersion).Scan(&tokenLatest).Error; err != nil {
 		tokenLatest = 0
 	}
 	return boundedSourceEpochStartupLookback(m.cfg.BackfillHours, now, metricLatest),
@@ -242,11 +243,14 @@ func (m *Monitor) loop(ctx context.Context, interval time.Duration) {
 			if ticks%(int(600/interval.Seconds())+1) == 0 {
 				if d := m.cfg.RetentionDays; d > 0 {
 					cutoff := time.Now().Unix() - int64(d)*86400
-					if n, err := m.pruneOlderThan(cutoff); err == nil && n > 0 {
-						slog.Info("清理过期采样", "rows", n)
-					}
-					if err := m.rollupHours(cutoff); err != nil { // 分钟数据被清前,先滚动汇总进小时表
+					// 必须先把即将越过保留线的分钟事实汇总成功，再删除原始数据。
+					// 汇总失败时保留分钟事实供下轮重试，避免维护任务主动制造永久缺口。
+					if err := m.rollupHours(cutoff); err != nil {
 						slog.Warn("小时汇总失败(忽略)", "err", err)
+					} else if n, err := m.pruneOlderThan(cutoff); err != nil {
+						slog.Warn("清理过期采样失败(保留下轮重试)", "err", err)
+					} else if n > 0 {
+						slog.Info("清理过期采样", "rows", n)
 					}
 					if n, err := m.pruneRejectionsOlderThan(cutoff); err == nil && n > 0 {
 						slog.Info("清理过期被拒采样", "rows", n)
@@ -289,21 +293,60 @@ func metricFinalizeRetryDelay(attempts int) int64 {
 func (m *Monitor) loadOrExtendMetricFinalizeState(now int64) (*MetricFinalizeState, error) {
 	target := metricFinalizeTarget(now)
 	start := target - metricFinalizeInitialOverlapSec
+	var legacyCount int64
+	if err := m.storeDB.Model(&MetricSample{}).Where("traffic_class_version <> ?", stabilityTrafficClassificationVersion).Limit(1).Count(&legacyCount).Error; err != nil {
+		return nil, err
+	}
+	if legacyCount > 0 {
+		start = target - metricMigrationLookbackSec
+	}
 	if start < 0 {
 		start = 0
 	}
 	start = start / 60 * 60
+	hourStart := ((start + 3599) / 3600) * 3600
 	defaults := MetricFinalizeState{
-		ID: 1, NextTs: start, TargetThroughTs: target, Status: "queued", UpdatedAt: now,
+		ID: 1, NextTs: start, TargetThroughTs: target, CoverageFromTs: start,
+		SemanticsVersion:   stabilityTrafficClassificationVersion,
+		HourCoverageFromTs: hourStart, HourCoverageToTs: hourStart,
+		HourSemanticsVersion: stabilityTrafficClassificationVersion,
+		Status:               "queued", UpdatedAt: now,
 	}
 	var state MetricFinalizeState
 	if err := m.storeDB.Where("id = ?", 1).Attrs(defaults).FirstOrCreate(&state).Error; err != nil {
 		return nil, err
 	}
 	updates := map[string]any{}
+	if state.SemanticsVersion != stabilityTrafficClassificationVersion {
+		state.NextTs = start
+		state.TargetThroughTs = target
+		state.CoverageFromTs = start
+		state.SemanticsVersion = stabilityTrafficClassificationVersion
+		state.Status = "queued"
+		state.Attempts = 0
+		state.NextRetryAt = 0
+		state.LastError = ""
+		updates = map[string]any{
+			"next_ts": start, "target_through_ts": target, "coverage_from_ts": start,
+			"semantics_version": stabilityTrafficClassificationVersion, "status": "queued",
+			"attempts": 0, "next_retry_at": 0, "last_error": "",
+		}
+	}
+	if state.HourSemanticsVersion != stabilityTrafficClassificationVersion {
+		state.HourCoverageFromTs = hourStart
+		state.HourCoverageToTs = hourStart
+		state.HourSemanticsVersion = stabilityTrafficClassificationVersion
+		updates["hour_coverage_from_ts"] = hourStart
+		updates["hour_coverage_to_ts"] = hourStart
+		updates["hour_semantics_version"] = stabilityTrafficClassificationVersion
+	}
 	if state.NextTs <= 0 && target > 0 {
 		state.NextTs = start
 		updates["next_ts"] = start
+	}
+	if state.CoverageFromTs <= 0 {
+		state.CoverageFromTs = state.NextTs
+		updates["coverage_from_ts"] = state.CoverageFromTs
 	}
 	if target > state.TargetThroughTs {
 		state.TargetThroughTs = target
@@ -320,6 +363,70 @@ func (m *Monitor) loadOrExtendMetricFinalizeState(now int64) (*MetricFinalizeSta
 	m.metricFinalizeLastSuccess.Store(state.LastSuccessAt)
 	m.metricFinalizeLastFailure.Store(state.LastFailureAt)
 	return &state, nil
+}
+
+func (m *Monitor) metricWindowCoverage(fromTs, now int64) (bool, int64, int64) {
+	target := metricFinalizeTarget(now)
+	var state MetricFinalizeState
+	if err := m.storeDB.First(&state, "id = ?", 1).Error; err != nil {
+		return false, 0, target
+	}
+	complete := state.SemanticsVersion == stabilityTrafficClassificationVersion &&
+		state.CoverageFromTs > 0 && state.CoverageFromTs <= fromTs && state.NextTs >= target
+	return complete, state.CoverageFromTs, min(state.NextTs, target)
+}
+
+// metricHourWindowCoverage proves long-range hour_samples independently from
+// the much shorter minute retention. This lets operators rebuild a 30-day
+// trend without retaining 30 days of high-cardinality minute rows.
+func (m *Monitor) metricHourWindowCoverage(fromTs, now int64) (bool, int64, int64) {
+	target := metricFinalizeTarget(now) / 3600 * 3600
+	var state MetricFinalizeState
+	if err := m.storeDB.First(&state, "id = ?", 1).Error; err != nil {
+		return false, 0, target
+	}
+	complete := state.HourSemanticsVersion == stabilityTrafficClassificationVersion &&
+		state.HourCoverageFromTs > 0 && state.HourCoverageFromTs <= fromTs &&
+		state.HourCoverageToTs >= target
+	return complete, state.HourCoverageFromTs, min(state.HourCoverageToTs, target)
+}
+
+func (m *Monitor) publishMetricBackfillCoverage(stateID uint, minuteFrom, finalizeTarget, hourlyFrom, hourlyUntil, finishedAt int64) error {
+	return m.storeDB.Model(&MetricFinalizeState{}).Where("id = ?", stateID).Updates(map[string]any{
+		// Only union intervals that actually overlap. A long backfill may finish
+		// after the live finalizer has started a newer, disjoint interval; treating
+		// MIN(left)..MAX(right) as continuous would manufacture evidence for the
+		// gap. In that case keep whichever interval is newer, and fail closed until
+		// a later catch-up/retry joins the two ranges.
+		"coverage_from_ts": gorm.Expr(`CASE
+			WHEN semantics_version=? AND coverage_from_ts>0 AND next_ts>coverage_from_ts AND next_ts>=? AND ?>=coverage_from_ts THEN MIN(coverage_from_ts,?)
+			WHEN semantics_version=? AND coverage_from_ts>0 AND next_ts>coverage_from_ts AND ?>next_ts THEN ?
+			WHEN semantics_version=? AND coverage_from_ts>0 AND next_ts>coverage_from_ts THEN coverage_from_ts
+			WHEN next_ts>? THEN next_ts
+			ELSE ? END`, stabilityTrafficClassificationVersion, minuteFrom, finalizeTarget, minuteFrom,
+			stabilityTrafficClassificationVersion, minuteFrom, minuteFrom,
+			stabilityTrafficClassificationVersion, finalizeTarget, minuteFrom),
+		"next_ts":           gorm.Expr("MAX(next_ts,?)", finalizeTarget),
+		"target_through_ts": gorm.Expr("MAX(target_through_ts,?)", finalizeTarget),
+		"semantics_version": stabilityTrafficClassificationVersion,
+		"status":            gorm.Expr(`CASE WHEN MAX(next_ts,?)>=target_through_ts THEN 'caught_up' ELSE status END`, finalizeTarget),
+		"hour_coverage_from_ts": gorm.Expr(`CASE
+			WHEN hour_semantics_version=? AND hour_coverage_from_ts>0 AND hour_coverage_to_ts>hour_coverage_from_ts AND hour_coverage_to_ts>=? AND ?>=hour_coverage_from_ts THEN MIN(hour_coverage_from_ts,?)
+			WHEN hour_semantics_version=? AND hour_coverage_from_ts>0 AND hour_coverage_to_ts>hour_coverage_from_ts AND ?>hour_coverage_to_ts THEN ?
+			WHEN hour_semantics_version=? AND hour_coverage_from_ts>0 AND hour_coverage_to_ts>hour_coverage_from_ts THEN hour_coverage_from_ts
+			ELSE ? END`, stabilityTrafficClassificationVersion, hourlyFrom, hourlyUntil, hourlyFrom,
+			stabilityTrafficClassificationVersion, hourlyFrom, hourlyFrom,
+			stabilityTrafficClassificationVersion, hourlyFrom),
+		"hour_coverage_to_ts": gorm.Expr(`CASE
+			WHEN hour_semantics_version=? AND hour_coverage_from_ts>0 AND hour_coverage_to_ts>hour_coverage_from_ts AND hour_coverage_to_ts>=? AND ?>=hour_coverage_from_ts THEN MAX(hour_coverage_to_ts,?)
+			WHEN hour_semantics_version=? AND hour_coverage_from_ts>0 AND hour_coverage_to_ts>hour_coverage_from_ts AND ?>hour_coverage_to_ts THEN ?
+			WHEN hour_semantics_version=? AND hour_coverage_from_ts>0 AND hour_coverage_to_ts>hour_coverage_from_ts THEN hour_coverage_to_ts
+			ELSE ? END`, stabilityTrafficClassificationVersion, hourlyFrom, hourlyUntil, hourlyUntil,
+			stabilityTrafficClassificationVersion, hourlyFrom, hourlyUntil,
+			stabilityTrafficClassificationVersion, hourlyUntil),
+		"hour_semantics_version": stabilityTrafficClassificationVersion,
+		"updated_at":             finishedAt,
+	}).Error
 }
 
 func (m *Monitor) recordMetricFinalizeFailure(state *MetricFinalizeState, cause error, now int64) {
@@ -369,12 +476,18 @@ func (m *Monitor) runMetricFinalizeTurnWith(ctx context.Context, now int64, metr
 	if to >= state.TargetThroughTs {
 		status = "caught_up"
 	}
-	result := m.storeDB.Model(&MetricFinalizeState{}).
-		Where("id = ? AND next_ts = ?", state.ID, from).Updates(map[string]any{
+	updates := map[string]any{
 		"next_ts": to, "target_through_ts": state.TargetThroughTs, "status": status,
 		"attempts": 0, "next_retry_at": 0, "last_success_at": now,
 		"last_failure_at": 0, "last_error": "", "updated_at": now,
-	})
+	}
+	completedHourTo := to / 3600 * 3600
+	if completedHourTo > state.HourCoverageToTs {
+		updates["hour_coverage_to_ts"] = completedHourTo
+		updates["hour_semantics_version"] = stabilityTrafficClassificationVersion
+	}
+	result := m.storeDB.Model(&MetricFinalizeState{}).
+		Where("id = ? AND next_ts = ?", state.ID, from).Updates(updates)
 	if result.Error != nil {
 		return result.Error
 	}
@@ -391,38 +504,6 @@ func (m *Monitor) runMetricFinalizeTurnWith(ctx context.Context, now int64, metr
 func (m *Monitor) runMetricFinalizeTurn(ctx context.Context, now int64) error {
 	return m.runMetricFinalizeTurnWith(ctx, now, m.sampleRange, m.sampleTokensRange)
 }
-
-// 交付异常(B 类)SQL 判据 —— 口径见 文档/NexusAPI/12-上游渠道监控/09。
-//
-// 为什么用 completion_tokens 作为"是否交付"的唯一信号:
-//   - frt(首字延迟)不行:stream_scanner 在任何 data: 行(含 Claude 的 message_start)
-//     都会置首响应时间,它只证明上游开口了,不证明用户拿到内容。
-//   - prompt_tokens 也不行:上游不返 usage 时 new-api 会本地估算输入并照此扣费,
-//     有输入 token 不代表上游真的处理了。
-//
-// 三个易错点(都实测踩过):
-//   - end_reason 必须走 JSON_EXTRACT。other 里另有 end_error 自由文本字段,内容可能含
-//     "panic" 等词,对整串做正则会误命中——这正是旧口径误报的来源之一。
-//   - anomalyZeroSQL 必须排除天然无输出模型(embedding/rerank/图像生成),
-//     否则这些模型会被整类误判成 B1。当前生产零命中,是防御项。
-//   - REGEXP 里的字符串字面量是 coercible 的,会跟随列的 utf8mb4_unicode_ci;
-//     但换成会话变量(带显式 collation)会抛 Illegal mix of collations。勿改写成变量。
-//
-// 两个 JSON 取值必须用 COALESCE 兜成非 NULL —— 这是踩过的坑:
-// 非流式请求的 other 里没有 stream_status,JSON_EXTRACT 返回 NULL,而
-// `NULL IN (...)` = NULL、`FALSE OR NULL` = NULL,于是整个 ANOM 变 NULL,
-// `NOT ANOM` 也是 NULL,SUM 会跳过该行 —— 结果 success 恒为 0(异常侧因
-// `TRUE OR NULL` = TRUE 反而正常,所以只丢成功数,极难察觉)。
-const (
-	anomalyZeroSQL = "(completion_tokens = 0 AND model_name NOT REGEXP 'embed|rerank|bge-|m3e|image|seedream|seedance')"
-	// REPLACE(CAST(JSON_EXTRACT ... AS CHAR),'\"','') is deliberately used
-	// instead of MySQL-only JSON_UNQUOTE.  The extracted values below are
-	// closed enum fields, so stripping the JSON string quotes is lossless and
-	// keeps the same SQL executable against the SQLite fake-production DB used
-	// by local acceptance.
-	anomalyEndReasonSQL = "COALESCE(CASE WHEN JSON_VALID(other) THEN REPLACE(CAST(JSON_EXTRACT(other,'$.stream_status.end_reason') AS CHAR),'\"','') END,'')"
-	anomalyErrCountSQL  = "COALESCE(CASE WHEN JSON_VALID(other) THEN CAST(JSON_EXTRACT(other,'$.stream_status.error_count') AS SIGNED) END,0)"
-)
 
 // channelTestJSONEnumSQL extracts a closed-enum string from logs.other using
 // syntax shared by MySQL and SQLite.  Callers only pass compile-time JSON
@@ -480,18 +561,6 @@ func channelTestCostBasisSQL(testPredicate string) string {
 		`ELSE 'legacy_assumed_base' END ELSE '' END`
 }
 
-// expandAnomalyPredicates 把 {{ZERO}} / {{STREAMBAD}} / {{ANOM}} 占位符展开成 SQL。
-// 占位符用 {{}} 包裹是必要的:裸 ANOM 是 anomaly_billed 等列别名的前缀,直接替换会误伤别名。
-// sampleWindow 与 sampleTokens 共用本函数,保证两处口径同源、不会各改一半。
-func expandAnomalyPredicates(q string) string {
-	streamBad := "(" + anomalyEndReasonSQL + " IN ('timeout','scanner_error','panic','ping_fail') OR " + anomalyErrCountSQL + " > 0)"
-	anom := "(" + anomalyZeroSQL + " OR " + streamBad + ")"
-	q = strings.ReplaceAll(q, "{{ANOM}}", anom)
-	q = strings.ReplaceAll(q, "{{STREAMBAD}}", streamBad)
-	q = strings.ReplaceAll(q, "{{ZERO}}", anomalyZeroSQL)
-	return q
-}
-
 // sampleWindow 查询生产库最近 lookbackSec 秒日志,按"分钟桶×渠道×模型×分组"聚合并写本地。
 // 这是全程唯一打到生产库的查询。
 func (m *Monitor) sampleWindow(ctx context.Context, lookbackSec int64) (int, error) {
@@ -504,16 +573,46 @@ func (m *Monitor) sampleWindow(ctx context.Context, lookbackSec int64) (int, err
 // sampleRange 采集 [fromTs, toTs) 区间的日志并写入本地桶。
 // 常规采样与历史回填共用同一条 SQL,保证两者口径绝不会各改一半。
 func (m *Monitor) sampleRange(ctx context.Context, fromTs, toTs int64) (int, error) {
-	cctx, cancel := context.WithTimeout(ctx, 20*time.Second)
-	defer cancel()
-	release, err := m.acquireBackgroundSource(cctx)
+	return m.sampleRangeWithPriority(ctx, fromTs, toTs, false, m.cfg.CapacityEnabled)
+}
+
+func (m *Monitor) sampleRangeLow(ctx context.Context, fromTs, toTs int64) (int, error) {
+	return m.sampleRangeWithPriority(ctx, fromTs, toTs, true, m.cfg.CapacityEnabled)
+}
+
+func (m *Monitor) sampleMetricRangeLow(ctx context.Context, fromTs, toTs int64) (int, error) {
+	return m.sampleRangeWithPriority(ctx, fromTs, toTs, true, false)
+}
+
+func (m *Monitor) sampleRangeWithPriority(ctx context.Context, fromTs, toTs int64, lowPriority, includeCapacity bool) (int, error) {
+	gateCtx := ctx
+	var cctx context.Context
+	var cancel context.CancelFunc
+	if !lowPriority {
+		cctx, cancel = context.WithTimeout(ctx, 20*time.Second)
+		gateCtx = cctx
+	}
+	var release func()
+	var err error
+	if lowPriority {
+		release, err = m.acquireBackgroundSourceLow(gateCtx)
+	} else {
+		release, err = m.acquireBackgroundSource(gateCtx)
+	}
 	if err != nil {
+		if cancel != nil {
+			cancel()
+		}
 		return 0, err
 	}
 	defer release()
+	if lowPriority {
+		cctx, cancel = context.WithTimeout(ctx, 20*time.Second)
+	}
+	defer cancel()
 
 	query := sampleWindowSQL()
-	if m.cfg.CapacityEnabled {
+	if includeCapacity {
 		query = sampleWindowUserSQL()
 	}
 	rows, err := m.prodDB.QueryContext(cctx, query, fromTs, toTs)
@@ -540,7 +639,7 @@ func (m *Monitor) sampleRange(ctx context.Context, fromTs, toTs int64) (int, err
 			e4, e5, eto int64
 		)
 		scanArgs := []any{&s.BucketTs, &s.ChannelID, &s.ModelName, &grp}
-		if m.cfg.CapacityEnabled {
+		if includeCapacity {
 			scanArgs = append(scanArgs, &userID, &username)
 		}
 		scanArgs = append(scanArgs, &s.Success, &s.Anomaly, &s.Failed,
@@ -554,7 +653,7 @@ func (m *Monitor) sampleRange(ctx context.Context, fromTs, toTs int64) (int, err
 			return 0, err
 		}
 		s.Grp = grp.String
-		s.TrafficClassVersion = userTrafficClassificationVersion
+		s.TrafficClassVersion = stabilityTrafficClassificationVersion
 		s.Err4xx, s.Err5xx, s.ErrTimeout = e4, e5, eto
 		if other := s.Failed - e4 - e5 - eto; other > 0 {
 			s.ErrOther = other
@@ -563,14 +662,14 @@ func (m *Monitor) sampleRange(ctx context.Context, fromTs, toTs int64) (int, err
 		aggregated := metricByKey[key]
 		if aggregated == nil {
 			aggregated = &MetricSample{BucketTs: s.BucketTs, ChannelID: s.ChannelID, ModelName: s.ModelName,
-				Grp: s.Grp, TrafficClassVersion: userTrafficClassificationVersion}
+				Grp: s.Grp, TrafficClassVersion: stabilityTrafficClassificationVersion}
 			metricByKey[key] = aggregated
 		}
 		mergeMetricSample(aggregated, s)
-		if m.cfg.CapacityEnabled && (s.Success+s.Anomaly+s.Failed > 0 || s.Tokens > 0) {
+		if includeCapacity && (s.Success+s.Anomaly+s.Failed > 0 || s.Tokens > 0) {
 			userBatch = append(userBatch, CapacityUserMinuteSample{
 				BucketTs: s.BucketTs, UserID: userID, Username: username.String, ChannelID: s.ChannelID,
-				ModelName: s.ModelName, Grp: s.Grp, TrafficClassVersion: userTrafficClassificationVersion,
+				ModelName: s.ModelName, Grp: s.Grp, TrafficClassVersion: stabilityTrafficClassificationVersion,
 				Success: s.Success, Anomaly: s.Anomaly, Failed: s.Failed, Tokens: s.Tokens,
 			})
 		}
@@ -661,10 +760,10 @@ SELECT /*+ MAX_EXECUTION_TIME(8000) */
   CAST(COALESCE(SUM(type=2 AND NOT {{ANOM}}),0) AS SIGNED) AS success,
   CAST(COALESCE(SUM(type=2 AND {{ANOM}}),0) AS SIGNED) AS anomaly,
   CAST(COALESCE(SUM(type=5),0) AS SIGNED) AS failed,
-  CAST(COALESCE(SUM(type=2 AND {{ZERO}} AND prompt_tokens > 0),0) AS SIGNED) AS anomaly_billed,
-  CAST(COALESCE(SUM(type=2 AND {{ZERO}} AND prompt_tokens = 0),0) AS SIGNED) AS anomaly_free,
+  CAST(COALESCE(SUM(type=2 AND {{ZERO}} AND quota > 0),0) AS SIGNED) AS anomaly_billed,
+  CAST(COALESCE(SUM(type=2 AND {{ZERO}} AND quota = 0),0) AS SIGNED) AS anomaly_free,
   CAST(COALESCE(SUM(type=2 AND {{STREAMBAD}} AND NOT {{ZERO}}),0) AS SIGNED) AS anomaly_stream,
-  CAST(COALESCE(SUM(CASE WHEN type=2 AND {{ZERO}} AND prompt_tokens > 0 THEN quota END),0) AS SIGNED) AS anomaly_quota,
+  CAST(COALESCE(SUM(CASE WHEN type=2 AND {{ZERO}} AND quota > 0 THEN quota END),0) AS SIGNED) AS anomaly_quota,
   CAST(COALESCE(SUM(CASE WHEN type=2 AND {{ANOM}} THEN use_time END),0) AS SIGNED) AS anomaly_sum_time,
   CAST(COALESCE(SUM(CASE WHEN type=2 THEN use_time END),0) AS SIGNED) AS sum_use_time,
   CAST(COALESCE(MAX(CASE WHEN type=2 THEN use_time END),0) AS SIGNED) AS max_use_time,
@@ -672,11 +771,9 @@ SELECT /*+ MAX_EXECUTION_TIME(8000) */
   CAST(COALESCE(SUM(CASE WHEN type=2 THEN quota END),0) AS SIGNED) AS quota,
   CAST(COALESCE(SUM(type=6),0) AS SIGNED) AS refund_records,
   CAST(COALESCE(SUM(CASE WHEN type=6 THEN quota END),0) AS SIGNED) AS refund_quota,
-  CAST(COALESCE(SUM(type=5 AND content REGEXP 'status_code=4'
-        AND content NOT LIKE '%timeout%' AND content NOT LIKE '%deadline%'),0) AS SIGNED) AS err_4xx,
-  CAST(COALESCE(SUM(type=5 AND content REGEXP 'status_code=5'
-        AND content NOT LIKE '%timeout%' AND content NOT LIKE '%deadline%'),0) AS SIGNED) AS err_5xx,
-  CAST(COALESCE(SUM(type=5 AND (content LIKE '%timeout%' OR content LIKE '%deadline%')),0) AS SIGNED) AS err_timeout,
+  CAST(COALESCE(SUM(type=5 AND {{ERR4XX}}),0) AS SIGNED) AS err_4xx,
+  CAST(COALESCE(SUM(type=5 AND {{ERR5XX}}),0) AS SIGNED) AS err_5xx,
+  CAST(COALESCE(SUM(type=5 AND {{ERRTIMEOUT}}),0) AS SIGNED) AS err_timeout,
   CAST(COALESCE(SUM(type=2 AND use_time<=1),0) AS SIGNED)                 AS lat_1,
   CAST(COALESCE(SUM(type=2 AND use_time>1  AND use_time<=2),0) AS SIGNED) AS lat_2,
   CAST(COALESCE(SUM(type=2 AND use_time>2  AND use_time<=5),0) AS SIGNED) AS lat_5,
@@ -709,7 +806,29 @@ type BackfillResult struct {
 	ElapsedS int64 `json:"elapsed_sec"`
 }
 
-// backfillRunning 保证同一时刻只有一次回填在跑:回填要打 168 次生产库,并发跑会放大压力。
+type MetricBackfillStatus struct {
+	Status     string          `json:"status"`
+	Hours      int             `json:"hours"`
+	StartedAt  int64           `json:"started_at,omitempty"`
+	FinishedAt int64           `json:"finished_at,omitempty"`
+	Error      string          `json:"error,omitempty"`
+	Result     *BackfillResult `json:"result,omitempty"`
+}
+
+func (m *Monitor) setMetricBackfillStatus(status MetricBackfillStatus) {
+	m.metricBackfillMu.Lock()
+	m.metricBackfillStatus = status
+	m.metricBackfillMu.Unlock()
+}
+
+func (m *Monitor) getMetricBackfillStatus() MetricBackfillStatus {
+	m.metricBackfillMu.RLock()
+	defer m.metricBackfillMu.RUnlock()
+	return m.metricBackfillStatus
+}
+
+// backfillRunning 保证同一时刻只有一次回填在跑：30 天回填要按小时
+// 访问 720 个来源分片，并发执行会放大生产库压力。
 var backfillRunning atomic.Bool
 
 // BackfillHours 用当前判据重算最近 hours 小时的历史桶。
@@ -726,61 +845,135 @@ var backfillRunning atomic.Bool
 // 覆盖是安全的:upsertSamples 按【分钟桶 × 渠道 × 模型 × 分组】幂等 UPSERT,重算即替换,不累加。
 // 但覆盖【不可逆】——旧口径的数值会被冲掉;真要退回需回滚镜像后用旧代码再回填一次。
 func (m *Monitor) BackfillHours(ctx context.Context, hours int) (*BackfillResult, error) {
-	if m.prodDB == nil {
-		return nil, fmt.Errorf("未配置生产库(只读),无法回填")
-	}
-	if hours <= 0 {
-		return nil, fmt.Errorf("hours 需大于 0")
-	}
-	if max := m.cfg.RetentionDays * 24; max > 0 && hours > max {
-		// 超过分钟级留存的部分回填了也会被清理任务删掉,白打生产库。
-		return nil, fmt.Errorf("hours 不能超过分钟级留存 %d 小时(RetentionDays=%d)", max, m.cfg.RetentionDays)
+	return m.backfillHoursWith(ctx, hours, m.sampleRangeLow, m.sampleMetricRangeLow, m.sampleTokensRangeLow, m.rollupHourRange)
+}
+
+func (m *Monitor) backfillHoursWith(ctx context.Context, hours int, metric, historicalMetric metricRangeSampler, token tokenRangeSampler, rollup func(int64, int64) error) (*BackfillResult, error) {
+	if err := m.validateMetricBackfill(hours); err != nil {
+		return nil, err
 	}
 	if !backfillRunning.CompareAndSwap(false, true) {
 		return nil, fmt.Errorf("已有回填正在进行,请等待其结束")
 	}
+	return m.backfillHoursLocked(ctx, hours, metric, historicalMetric, token, rollup)
+}
+
+func (m *Monitor) validateMetricBackfill(hours int) error {
+	if m.prodDB == nil {
+		return fmt.Errorf("未配置生产库(只读),无法回填")
+	}
+	if hours <= 0 {
+		return fmt.Errorf("hours 需大于 0")
+	}
+	if max := m.cfg.HourRetentionDays * 24; max > 0 && hours > max {
+		return fmt.Errorf("hours 不能超过小时级留存 %d 小时(HourRetentionDays=%d)", max, m.cfg.HourRetentionDays)
+	}
+	return nil
+}
+
+// backfillHoursLocked runs after the global maintenance lease has already
+// been acquired. Both synchronous tests/tools and the async HTTP job use the
+// same implementation, so there is only one coverage publication path.
+func (m *Monitor) backfillHoursLocked(ctx context.Context, hours int, metric, historicalMetric metricRangeSampler, token tokenRangeSampler, rollup func(int64, int64) error) (*BackfillResult, error) {
 	defer backfillRunning.Store(false)
 
 	start := time.Now()
-	now := start.Unix()
+	// 小时历史以已定稿整点为右边界；分钟覆盖再单独补到定稿水位。
+	// 这样 720 小时回填会精确产生 720 个完整小时，不会缺首尾半小时。
+	now := start.Unix() / 60 * 60
+	finalizeTarget := metricFinalizeTarget(now)
+	hourlyUntil := finalizeTarget / 3600 * 3600
+	hourlyFrom := hourlyUntil - int64(hours)*3600
+	minuteCutoff := now - int64(m.cfg.RetentionDays)*86400
 	res := &BackfillResult{Hours: hours}
 	slog.Info("开始历史回填", "hours", hours, "note", "只读生产库,按小时切片")
 
-	for i := hours; i >= 1; i-- {
+	for from := hourlyFrom; from < hourlyUntil; from += 3600 {
 		select {
 		case <-ctx.Done():
 			return res, ctx.Err()
 		default:
 		}
-		from, to := now-int64(i)*3600, now-int64(i-1)*3600
+		to := from + 3600
 		res.Slices++
-		n, err := m.sampleRange(ctx, from, to)
+		sliceFailed := false
+		keepMinutes := to > minuteCutoff
+		metricSampler := historicalMetric
+		if keepMinutes {
+			metricSampler = metric
+		}
+		n, err := metricSampler(ctx, from, to)
 		if err != nil {
-			res.Failed++
+			sliceFailed = true
 			slog.Warn("回填分片失败(跳过)", "from", from, "to", to, "err", err)
 		} else {
 			res.Rows += n
 		}
-		// 令牌维度跟着一起补,否则回填完主维度对了、令牌页仍是旧口径的旧数。
-		// 与主采样同样的隔离原则:它失败只记日志,不算整体失败。
-		if err := m.sampleTokensRange(ctx, from, to); err != nil {
-			slog.Warn("回填分片令牌维度失败(忽略)", "from", from, "to", to, "err", err)
+		// 令牌是分钟级功能，只回填仍在分钟留存线内的分片。
+		// 更旧分片仅用于小时趋势/同比，不制造无法保留的令牌明细。
+		if keepMinutes {
+			if err := token(ctx, from, to); err != nil {
+				sliceFailed = true
+				slog.Warn("回填分片令牌维度失败", "from", from, "to", to, "err", err)
+			}
 		}
-		if i > 1 {
+		if !sliceFailed {
+			if err := rollup(from, to); err != nil {
+				sliceFailed = true
+				slog.Warn("回填分片小时汇总失败", "from", from, "to", to, "err", err)
+			}
+		}
+		if !sliceFailed && !keepMinutes {
+			if err := m.pruneMetricRange(from, to); err != nil {
+				sliceFailed = true
+				slog.Warn("回填临时分钟事实清理失败", "from", from, "to", to, "err", err)
+			}
+		}
+		if sliceFailed {
+			res.Failed++
+		}
+		if to < hourlyUntil {
 			time.Sleep(500 * time.Millisecond) // 让生产库喘口气
 		}
 	}
-	// 小时级汇总(90 天留存,长期趋势用)也是从分钟桶算出来的,必须跟着重算,
-	// 否则假台阶会在长期趋势图上留三个月。
-	if err := m.rollupHours(now - int64(m.cfg.RetentionDays)*86400); err != nil {
-		slog.Warn("回填后小时汇总失败", "err", err)
+	// 整点至定稿水位的尾段只服务分钟看板，不能宣布为完整小时。
+	if finalizeTarget > hourlyUntil {
+		res.Slices++
+		if n, err := metric(ctx, hourlyUntil, finalizeTarget); err != nil {
+			res.Failed++
+			slog.Warn("回填分钟尾段失败", "from", hourlyUntil, "to", finalizeTarget, "err", err)
+		} else {
+			res.Rows += n
+			if err := token(ctx, hourlyUntil, finalizeTarget); err != nil {
+				res.Failed++
+				slog.Warn("回填分钟尾段令牌维度失败", "from", hourlyUntil, "to", finalizeTarget, "err", err)
+			}
+		}
 	}
 	if m.cfg.StabilityEnabled {
-		if err := m.rollupStabilityHours(now - int64(m.cfg.RetentionDays)*86400); err != nil {
+		stabilityFrom := max(hourlyFrom, minuteCutoff)
+		if err := m.rollupStabilityHours(stabilityFrom); err != nil {
 			slog.Warn("回填后稳定性维度汇总失败(忽略)", "err", err)
 		}
 		if err := m.rollupStabilityRejections(now - int64(m.cfg.RetentionDays)*86400); err != nil {
 			slog.Warn("回填后稳定性拒绝汇总失败(忽略)", "err", err)
+		}
+	}
+	if res.Failed == 0 {
+		// 长周期小时覆盖与短周期分钟覆盖分别发布。
+		// 小时回填可扩展到 HourRetentionDays，分钟水位仍严格受 RetentionDays 限制。
+		state, stateErr := m.loadOrExtendMetricFinalizeState(now)
+		if stateErr != nil {
+			res.Failed++
+			slog.Warn("回填完整性水位读取失败", "err", stateErr)
+		} else {
+			minuteFrom := max(hourlyFrom, minuteCutoff)
+			minuteFrom = minuteFrom / 60 * 60
+			finishedAt := time.Now().Unix()
+			if err := m.publishMetricBackfillCoverage(state.ID, minuteFrom, finalizeTarget, hourlyFrom, hourlyUntil, finishedAt); err != nil {
+				res.Failed++
+				slog.Warn("回填完整性水位保存失败", "err", err)
+			}
 		}
 	}
 	res.ElapsedS = int64(time.Since(start).Seconds())
@@ -799,13 +992,39 @@ func (m *Monitor) sampleTokens(ctx context.Context, lookbackSec int64) error {
 // sampleTokensRange 采集 [fromTs, toTs) 区间的令牌维度。与 sampleRange 成对,
 // 两者都必须是区间式,否则回填时令牌维度会悄悄只补最近一段(主维度补齐、令牌维度错位)。
 func (m *Monitor) sampleTokensRange(ctx context.Context, fromTs, toTs int64) error {
-	cctx, cancel := context.WithTimeout(ctx, 20*time.Second)
-	defer cancel()
-	release, err := m.acquireBackgroundSource(cctx)
+	return m.sampleTokensRangeWithPriority(ctx, fromTs, toTs, false)
+}
+
+func (m *Monitor) sampleTokensRangeLow(ctx context.Context, fromTs, toTs int64) error {
+	return m.sampleTokensRangeWithPriority(ctx, fromTs, toTs, true)
+}
+
+func (m *Monitor) sampleTokensRangeWithPriority(ctx context.Context, fromTs, toTs int64, lowPriority bool) error {
+	gateCtx := ctx
+	var cctx context.Context
+	var cancel context.CancelFunc
+	if !lowPriority {
+		cctx, cancel = context.WithTimeout(ctx, 20*time.Second)
+		gateCtx = cctx
+	}
+	var release func()
+	var err error
+	if lowPriority {
+		release, err = m.acquireBackgroundSourceLow(gateCtx)
+	} else {
+		release, err = m.acquireBackgroundSource(gateCtx)
+	}
 	if err != nil {
+		if cancel != nil {
+			cancel()
+		}
 		return err
 	}
 	defer release()
+	if lowPriority {
+		cctx, cancel = context.WithTimeout(ctx, 20*time.Second)
+	}
+	defer cancel()
 	rows, err := m.prodDB.QueryContext(cctx, sampleTokenSQL(), fromTs, toTs)
 	if err != nil {
 		m.reportSourceQueryError(err)
@@ -820,7 +1039,7 @@ func (m *Monitor) sampleTokensRange(ctx context.Context, fromTs, toTs int64) err
 			return err
 		}
 		s.TokenName = tn.String
-		s.TrafficClassVersion = userTrafficClassificationVersion
+		s.TrafficClassVersion = stabilityTrafficClassificationVersion
 		batch = append(batch, s)
 	}
 	if err := rows.Err(); err != nil {

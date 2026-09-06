@@ -1133,11 +1133,12 @@ const fmtLat=v=>v>=10?Math.round(v)+'s':(v||0).toFixed(1)+'s';
 function sparkSVG(pts){
   const W=92,H=22,pad=2;
   if(!pts||!pts.length) return `<svg width="${W}" height="${H}"></svg>`;
-  let max=1; pts.forEach(p=>max=Math.max(max,p.success+p.failed));
+  let max=1; pts.forEach(p=>max=Math.max(max,p.success+p.anomaly+p.failed));
   const n=pts.length, x=i=>pad+(n===1?(W-2*pad)/2:(W-2*pad)*i/(n-1)), y=v=>H-pad-(H-2*pad)*v/max;
   let line='', dots='';
-  pts.forEach((p,i)=>{ line+=(i?'L':'M')+x(i).toFixed(1)+' '+y(p.success+p.failed).toFixed(1)+' ';
-    if(p.failed>0) dots+=`<circle cx="${x(i).toFixed(1)}" cy="${y(p.success+p.failed).toFixed(1)}" r="1.6" fill="#ef4444"/>`; });
+  pts.forEach((p,i)=>{const total=p.success+p.anomaly+p.failed;line+=(i?'L':'M')+x(i).toFixed(1)+' '+y(total).toFixed(1)+' ';
+    if(p.anomaly>0) dots+=`<circle cx="${x(i).toFixed(1)}" cy="${y(total).toFixed(1)}" r="1.6" fill="#f59e0b"/>`;
+    if(p.failed>0) dots+=`<circle cx="${x(i).toFixed(1)}" cy="${y(total).toFixed(1)}" r="1.8" fill="#ef4444"/>`; });
   return `<svg width="${W}" height="${H}"><path d="${line}" fill="none" stroke="#10b981" stroke-width="1.3"/>${dots}</svg>`;
 }
 
@@ -1158,7 +1159,10 @@ function renderBanner(s){
   let cls,txt;
   // 主结论只由【错误】驱动(错误才需要立刻止损)。交付异常另起一段灰字追加,
   // 不参与 bad/warn 三态配色——口径见 文档 09 §5.1「B 类不驱动 health」。
-  if(bad.length){cls='bad';txt=`<span class="dot dot-r"></span> ${bad.length} 项错误`}
+  if(s.data_complete===false){cls='warn';txt='<span class="dot dot-y"></span> 新统计口径历史数据补齐中，当前窗口暂不判定'}
+  else if(!s.sampling_active){cls='bad';txt='<span class="dot dot-r"></span> 监控数据不可用或采样已停止'}
+  else if((s.summary?.total||0)===0){cls='warn';txt='<span class="dot dot-y"></span> 当前窗口无请求，无法判断稳定性'}
+  else if(bad.length){cls='bad';txt=`<span class="dot dot-r"></span> ${bad.length} 项错误`}
   else if(warn.length){cls='warn';txt=`<span class="dot dot-y"></span> ${warn.length} 项波动`}
   else{cls='ok';txt='<span class="dot dot-g"></span> 运行正常'}
   // 顶部横幅只报"达门槛"的条数(不然低频异常天天挂在标题上,横幅就没意义了),
@@ -1341,6 +1345,11 @@ function renderSLO(s){
   const card=document.getElementById('sloCard');
   if(!s||!s.enabled){card.style.display='none';return}
   card.style.display='';
+	if(!s.data_available){
+		if(sloGauge){sloGauge.dispose();sloGauge=null}
+		document.getElementById('sloBody').innerHTML=`<div class="muted" style="padding:24px 4px">近${s.window_days||0}天没有可用事实，暂不判定 SLO 达标，也不计算错误预算。</div>`;
+		return;
+	}
   if(!document.getElementById('sloGauge')){
     document.getElementById('sloBody').innerHTML='<div style="display:flex;gap:8px 28px;align-items:center;flex-wrap:wrap"><div id="sloGauge" style="width:200px;height:140px;flex:none"></div><div id="sloText" style="font-size:14px;line-height:2.1"></div></div>';
   }
@@ -1374,7 +1383,8 @@ function ptDelta(cur,base){ // 百分点差(成功率用)
 }
 function renderCompare(c){
   const card=document.getElementById('cmpCard');
-  if(!c||!c.now||(!c.now.total&&!c.prev.total&&!c.last_week.total)){card.style.display='none';return}
+  if(!c){card.style.display='';document.getElementById('cmpBody').innerHTML='<span class="muted">历史新口径补齐中，当前覆盖证据不足，暂不计算同比环比。</span>';return}
+  if(!c.now||(!c.now.total&&!c.prev.total&&!c.last_week.total)){card.style.display='none';return}
   card.style.display='';
   const n=c.now,p=c.prev,w=c.last_week;
   const rows=[
@@ -1392,8 +1402,16 @@ async function loadLongTrend(){
   try{
     const res=await fetch('/trend/long?days='+longDays,{headers:{'Accept':'application/json'}});
     if(!res.ok)return;
-    const arr=(await res.json()).series||[];
+    const payload=await res.json();
+    const arr=payload.series||[];
     const card=document.getElementById('longCard');
+    if(payload.data_complete===false){
+      card.style.display='';
+      if(!longChart)longChart=echarts.init(document.getElementById('longTrend'));
+      longChart.clear();
+      longChart.setOption({title:{text:'长期新口径数据补齐中',subtext:'已覆盖 '+syncTime(payload.coverage_from_ts)+' 至 '+syncTime(payload.coverage_to_ts),left:'center',top:'middle',textStyle:{color:'#94a3b8',fontSize:14},subtextStyle:{color:'#64748b',fontSize:11}}});
+      return
+    }
     if(!arr.length){card.style.display='none';return}
     card.style.display='';
     if(!longChart)longChart=echarts.init(document.getElementById('longTrend'));
@@ -1401,11 +1419,12 @@ async function loadLongTrend(){
     longChart.setOption({
       grid:{left:46,right:14,top:32,bottom:24},
       tooltip:{trigger:'axis',backgroundColor:'#1a1d27',borderColor:'#2a2d3e',textStyle:{color:'#e2e8f0'}},
-      legend:{data:['成功','失败'],textStyle:{color:'#94a3b8'},right:8,top:2},
+      legend:{data:['成功','交付异常','失败'],textStyle:{color:'#94a3b8'},right:8,top:2},
       xAxis:{type:'category',data:arr.map(p=>fmtDay(p.ts)),boundaryGap:false,axisLabel:{color:'#94a3b8',fontSize:11},axisLine:{lineStyle:{color:'#2a2d3e'}}},
       yAxis:{type:'value',minInterval:1,axisLabel:{color:'#94a3b8',fontSize:11},splitLine:{lineStyle:{color:'#2a2d3e'}}},
       series:[
         {name:'成功',type:'line',smooth:true,symbol:'none',data:arr.map(p=>p.success),lineStyle:{color:'#10b981',width:1.5},areaStyle:{color:'rgba(16,185,129,.08)'}},
+        {name:'交付异常',type:'line',smooth:true,symbol:'none',data:arr.map(p=>p.anomaly),lineStyle:{color:'#f59e0b',width:1.5},areaStyle:{color:'rgba(245,158,11,.08)'}},
         {name:'失败',type:'line',smooth:true,symbol:'none',data:arr.map(p=>p.failed),lineStyle:{color:'#ef4444',width:1.5},areaStyle:{color:'rgba(239,68,68,.10)'}}
       ]
     });
@@ -1457,18 +1476,34 @@ function drawTrend(points){
   trendChart.setOption({
     grid:{left:46,right:14,top:32,bottom:24},
     tooltip:{trigger:'axis',backgroundColor:'#1a1d27',borderColor:'#2a2d3e',textStyle:{color:'#e2e8f0'}},
-    legend:{data:['成功','失败'],textStyle:{color:'#94a3b8'},right:8,top:2},
+    legend:{data:['成功','交付异常','失败'],textStyle:{color:'#94a3b8'},right:8,top:2},
     xAxis:{type:'category',data:points.map(p=>clock(p.ts)),boundaryGap:false,axisLabel:{color:'#94a3b8',fontSize:11},axisLine:{lineStyle:{color:'#2a2d3e'}}},
     yAxis:{type:'value',minInterval:1,axisLabel:{color:'#94a3b8',fontSize:11},splitLine:{lineStyle:{color:'#2a2d3e'}}},
     series:[
       {name:'成功',type:'line',smooth:true,symbol:'none',data:points.map(p=>p.success),lineStyle:{color:'#10b981',width:2},areaStyle:{color:'rgba(16,185,129,.10)'}},
+      {name:'交付异常',type:'line',smooth:true,symbol:'none',data:points.map(p=>p.anomaly),lineStyle:{color:'#f59e0b',width:2},areaStyle:{color:'rgba(245,158,11,.10)'}},
       {name:'失败',type:'line',smooth:true,symbol:'none',data:points.map(p=>p.failed),lineStyle:{color:'#ef4444',width:2},areaStyle:{color:'rgba(239,68,68,.12)'}}
     ]
   });
 }
 function apply(s){
-  document.getElementById('genAt').textContent='更新于 '+s.generated_at+' · 窗口 '+s.window_minutes+' 分钟';
-  renderBanner(s);renderSummary(s.summary);renderSLO(s.slo);renderCompare(s.compare);renderLatHist(s.summary);lastTrend=s.trend||[];drawTrend(lastTrend);
+  document.getElementById('genAt').textContent='生成于 '+s.generated_at+' · 统计截至 '+syncTime(s.coverage_to_ts)+'（延迟签收）· 窗口 '+s.window_minutes+' 分钟';
+  if(s.data_complete===false){
+    renderBanner(s);
+    document.getElementById('summary').innerHTML='<div class="card"><span class="muted">该时间窗口的新口径数据尚未形成连续覆盖，补齐前不展示部分金额、成功率或趋势。</span></div>';
+    document.getElementById('attnList').innerHTML='<div class="attn-empty">数据补齐中，暂不判定错误与波动</div>';
+    document.getElementById('undelivSec').style.display='none';
+    document.getElementById('attnStat').innerHTML='';
+    document.getElementById('sloCard').style.display='none';
+    renderCompare(null);
+    ['tbGroup','tbChannel','tbModel'].forEach(id=>{document.getElementById(id).innerHTML=''});
+    document.getElementById('thToken').innerHTML=TOKHEAD;
+    document.getElementById('tbToken').innerHTML='<tr><td colspan="7" class="muted" style="text-align:center;padding:24px">数据补齐中</td></tr>';
+    renderRejections([],false);
+    lastTrend=[];drawTrend([]);
+    return;
+  }
+  renderBanner(s);renderSummary(s.summary);renderSLO(s.slo);renderCompare(s.compare_available?s.compare:null);renderLatHist(s.summary);lastTrend=s.trend||[];drawTrend(lastTrend);
   renderTable('thGroup','tbGroup',s.by_group);renderTable('thChannel','tbChannel',s.by_channel);renderTable('thModel','tbModel',s.by_model);
   renderTokens(s.by_token);
   renderRejections(s.rejections, s.reject_enabled);
@@ -1512,6 +1547,7 @@ const infraBadge=st=>{const m={ok:['badge-green','正常'],warn:['badge-yellow',
 const fx=(v,n=0)=>v==null?'—':(+v).toFixed(n);
 const kv=(label,val)=>`<span style="display:inline-block;min-width:160px;margin:2px 16px 2px 0"><span class="muted">${label}:</span> <b>${val}</b></span>`;
 const PLACEHOLDER='<span class="muted">待主机 agent</span>';
+const infraCoverageNote=res=>(res.missing_metrics||[]).length?`<span style="color:var(--yellow)">· 采集不完整：${esc(res.missing_metrics.join(', '))}</span>`:'';
 const cssAttr=s=>String(s).replace(/["\\]/g,'\\$&'); // 属性选择器里安全转义资源名
 // 前端上色用阈值(与后端 Settings 默认一致;权威判级仍以 snapshot 的 status 为准)。
 const infraCpuWarn=70,infraCpuBad=85,infraBurstWarn=20,infraStorageWarn=25,infraStorageBad=15;
@@ -1669,6 +1705,10 @@ function renderInfraOverview(s){
     const lockTxt=o.locks_ok===o.locks_total?`源站锁 全生效(${o.locks_total})`:`源站锁 ${o.locks_total-o.locks_ok} 个失效/${o.locks_total}`;
     parts.push(countItem(lockSt, lockTxt));
   }
+  if(o.discovery_total){
+    const discoverySt=o.discovery_ok===o.discovery_total?'ok':'bad';
+    parts.push(countItem(discoverySt,`AWS发现 ${o.discovery_ok}/${o.discovery_total}✓`));
+  }
   cnt.innerHTML=parts.join('');
   document.getElementById('infraFresh').textContent=fmtAge(s.data_age_sec);
 }
@@ -1738,7 +1778,7 @@ function renderInfra(s){
     const open=dbExpanded.has(db.name);
     const caret=`<span class="db-caret" style="display:inline-block;width:14px;color:#888;transition:transform .15s;${open?'transform:rotate(90deg)':''}">▶</span>`;
     dbCard.innerHTML=`<div class="db-summary" role="button" tabindex="0" aria-expanded="${open?'true':'false'}" style="cursor:pointer;outline:none">`
-      +`<div style="margin-bottom:8px">${caret} ${infraBadge(db.status)} <b>${esc(db.display_name||db.name)}</b> <span class="muted">· ${esc(db.group||'其他资源')} · ${esc(db.platform||'AWS')} · ${fmtAge(db.age_sec)}</span></div>`
+      +`<div style="margin-bottom:8px">${caret} ${infraBadge(db.status)} <b>${esc(db.display_name||db.name)}</b> <span class="muted">· ${esc(db.group||'其他资源')} · ${esc(db.platform||'AWS')} · ${fmtAge(db.age_sec)}</span> ${infraCoverageNote(db)}</div>`
       +`<div>${kv(memLabel,memHtml)}`
       +kv(storageLabel,stHtml)
       +kv('CPU',`<span style="${colUsed(me.cpu,infraCpuWarn,infraCpuBad)}">${fx(me.cpu,1)}%</span>`)
@@ -1796,7 +1836,7 @@ function renderInfra(s){
     const caret=`<span style="display:inline-block;width:14px;color:#888;transition:transform .15s;${open?'transform:rotate(90deg)':''}">▶</span>`;
     const groupHeader=idx===0||insts[idx-1].group!==r.group?`<tr><td colspan="11" style="background:#171b25;padding:9px 14px;color:#aeb8d0"><b>${esc(r.group||'其他资源')}</b></td></tr>`:'';
     return groupHeader+`<tr class="inst-row" data-name="${esc(r.name)}" style="cursor:pointer">`
-      +`<td>${caret}</td><td><b>${esc(r.display_name||r.name)}</b><div class="muted" style="font-size:11px">${esc(r.platform||'Lightsail')}</div></td><td>${infraBadge(r.status)}</td><td>${cpuHtml}</td><td>${burstHtml}</td><td>${memHtml}</td><td>${diskHtml}</td><td>${loadHtml}</td><td>${contHtml}</td><td>${me.net_out_kb!=null?fx(me.net_out_kb)+' KB/s':(isECS?managedNA:PLACEHOLDER)}</td><td class="muted">${fmtAge(r.age_sec)}</td></tr>`
+      +`<td>${caret}</td><td><b>${esc(r.display_name||r.name)}</b><div class="muted" style="font-size:11px">${esc(r.platform||'Lightsail')} ${infraCoverageNote(r)}</div></td><td>${infraBadge(r.status)}</td><td>${cpuHtml}</td><td>${burstHtml}</td><td>${memHtml}</td><td>${diskHtml}</td><td>${loadHtml}</td><td>${contHtml}</td><td>${me.net_out_kb!=null?fx(me.net_out_kb)+' KB/s':(isECS?managedNA:PLACEHOLDER)}</td><td class="muted">${fmtAge(r.age_sec)}</td></tr>`
       +`<tr class="inst-exp" data-name="${esc(r.name)}"${open?'':' style="display:none"'}><td colspan="11" style="background:#15171c;padding:8px 20px 14px"><div class="inst-zone"></div></td></tr>`;
   }).join('');
     // 绑定点击展开 + 还原已展开行的图
@@ -1815,7 +1855,7 @@ function renderInfra(s){
   const lbs=(s.load_balancers&&s.load_balancers.length)?s.load_balancers:(s.lb?[s.lb]:[]), lbBody=document.getElementById('lbBody');
   if(!lbs.length){lbBody.innerHTML='<span class="muted">无负载均衡数据</span>';}
   else{lbBody.innerHTML=lbs.map((lb,idx)=>{const me=lb.metrics||{};
-    return `<div style="${idx?'border-top:1px solid #2b3040;padding-top:14px;margin-top:14px;':''}"><div style="margin-bottom:8px">${infraBadge(lb.status)} <b>${esc(lb.display_name||lb.name)}</b> <span class="muted">· ${esc(lb.group||'其他资源')} · ${esc(lb.platform||'AWS')} · ${fmtAge(lb.age_sec)}</span></div>`
+    return `<div style="${idx?'border-top:1px solid #2b3040;padding-top:14px;margin-top:14px;':''}"><div style="margin-bottom:8px">${infraBadge(lb.status)} <b>${esc(lb.display_name||lb.name)}</b> <span class="muted">· ${esc(lb.group||'其他资源')} · ${esc(lb.platform||'AWS')} · ${fmtAge(lb.age_sec)}</span> ${infraCoverageNote(lb)}</div>`
       +kv('健康节点',fx(me.healthy))+kv('不健康节点',fx(me.unhealthy))+kv('5xx(5min)',fx(me.err_5xx))+kv('响应时间',me.resp_ms!=null?fx(me.resp_ms)+' ms':'—')+'</div>';
   }).join('');}
 }

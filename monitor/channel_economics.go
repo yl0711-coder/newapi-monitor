@@ -48,7 +48,7 @@ func loadChannelEconomicsUnallocatedRefundTx(tx *gorm.DB, hourTs int64) (channel
 	err := tx.Raw(`SELECT COALESCE(SUM(refund_records),0) records,
 		COALESCE(SUM(refund_quota),0) quota
 		FROM stability_hour_samples
-		WHERE hour_ts=? AND traffic_class_version=? AND channel_id<=0`, hourTs, userTrafficClassificationVersion).Scan(&fact).Error
+		WHERE hour_ts=? AND traffic_class_version=? AND channel_id<=0`, hourTs, stabilityTrafficClassificationVersion).Scan(&fact).Error
 	if err != nil {
 		return fact, err
 	}
@@ -407,7 +407,7 @@ func (m *Monitor) publishChannelEconomicsHour(ctx context.Context, account Chann
 			FROM stability_hour_samples s
 			JOIN channel_snaps c ON c.id=s.channel_id
 			WHERE s.hour_ts=? AND s.traffic_class_version=? AND c.base_domain=?
-			GROUP BY s.channel_id`, hourTs, userTrafficClassificationVersion, account.Domain).Scan(&localRows).Error; err != nil {
+			GROUP BY s.channel_id`, hourTs, stabilityTrafficClassificationVersion, account.Domain).Scan(&localRows).Error; err != nil {
 			return err
 		}
 		for _, local := range localRows {
@@ -431,7 +431,7 @@ func (m *Monitor) publishChannelEconomicsHour(ctx context.Context, account Chann
 		}
 		localFactStatus := "observed"
 		var ingest StabilityHourIngestState
-		if err := tx.First(&ingest, "hour_ts = ?", hourTs).Error; err == nil && ingest.Status == "complete" && ingest.TrafficClassVersion == userTrafficClassificationVersion {
+		if err := tx.First(&ingest, "hour_ts = ?", hourTs).Error; err == nil && ingest.Status == "complete" && ingest.TrafficClassVersion == stabilityTrafficClassificationVersion {
 			localFactStatus = "verified"
 		} else if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
 			return err
@@ -664,7 +664,7 @@ func (m *Monitor) enqueueChangedEconomicsLocalHoursTx(tx *gorm.DB, sinceTs, now 
 	LEFT JOIN channel_economics_global_hour_facts g ON g.hour_ts=h.hour_ts AND g.semantics_version=?
 	WHERE COALESCE(s.records,0)<>COALESCE(g.unallocated_refund_records,0)
 	   OR COALESCE(s.quota,0)<>COALESCE(g.unallocated_refund_quota,0)
-	ORDER BY h.hour_ts DESC LIMIT ?`, sinceTs, userTrafficClassificationVersion, sinceTs, channelEconomicsSemanticsVersion, channelEconomicsSemanticsVersion, limit).
+	ORDER BY h.hour_ts DESC LIMIT ?`, sinceTs, stabilityTrafficClassificationVersion, sinceTs, channelEconomicsSemanticsVersion, channelEconomicsSemanticsVersion, limit).
 		Scan(&globalChangedHours).Error; err != nil {
 		return err
 	}
@@ -720,7 +720,7 @@ func (m *Monitor) enqueueChangedEconomicsLocalHoursTx(tx *gorm.DB, sinceTs, now 
 	        AND NOT EXISTS (SELECT 1 FROM local l WHERE l.domain=p.domain AND l.hour_ts=p.hour_ts AND l.channel_id=p.local_channel_id))
 	  )
 	ORDER BY c.hour_ts DESC LIMIT ?`,
-		sinceTs, userTrafficClassificationVersion, m.cfg.ChannelCostClosureDomains,
+		sinceTs, stabilityTrafficClassificationVersion, m.cfg.ChannelCostClosureDomains,
 		sinceTs, channelCostEvidenceSemanticsVersion, m.cfg.ChannelCostClosureDomains,
 		channelEconomicsSemanticsVersion, channelEconomicsSemanticsVersion, limit).Scan(&changed).Error
 	if err != nil {

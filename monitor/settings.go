@@ -238,6 +238,8 @@ type Settings struct {
 	InfraCPUWarnPct          float64 // MONITOR_INFRA_CPU_WARN_PCT,默认 70
 	InfraCPUBadPct           float64 // MONITOR_INFRA_CPU_BAD_PCT,默认 85
 	InfraBurstWarnPct        float64 // MONITOR_INFRA_BURST_WARN_PCT,默认 20
+	InfraDBFreeMemWarnMB     float64 // MONITOR_INFRA_DB_FREE_MEM_WARN_MB,RDS 无总内存指标时的可用内存黄线,默认 512
+	InfraDBFreeMemBadMB      float64 // MONITOR_INFRA_DB_FREE_MEM_BAD_MB,RDS 无总内存指标时的可用内存红线,默认 256
 	InfraDBConnWarn          float64 // MONITOR_INFRA_DB_CONN_WARN,数据库连接数「高于」即黄,默认 70
 	InfraDBDiskQueueWarn     float64 // MONITOR_INFRA_DB_DISK_QUEUE_WARN,数据库磁盘队列深度「高于」即黄,默认 5
 	InfraLBRespWarnMs        float64 // MONITOR_INFRA_LB_RESP_WARN_MS,负载均衡响应毫秒「高于」即黄,默认 2000
@@ -403,6 +405,8 @@ func LoadSettings() Settings {
 		InfraCPUWarnPct:          envFloat("MONITOR_INFRA_CPU_WARN_PCT", 70),
 		InfraCPUBadPct:           envFloat("MONITOR_INFRA_CPU_BAD_PCT", 85),
 		InfraBurstWarnPct:        envFloat("MONITOR_INFRA_BURST_WARN_PCT", 20),
+		InfraDBFreeMemWarnMB:     envFloat("MONITOR_INFRA_DB_FREE_MEM_WARN_MB", 512),
+		InfraDBFreeMemBadMB:      envFloat("MONITOR_INFRA_DB_FREE_MEM_BAD_MB", 256),
 		InfraDBConnWarn:          envFloat("MONITOR_INFRA_DB_CONN_WARN", 70),
 		InfraDBDiskQueueWarn:     envFloat("MONITOR_INFRA_DB_DISK_QUEUE_WARN", 5),
 		InfraLBRespWarnMs:        envFloat("MONITOR_INFRA_LB_RESP_WARN_MS", 2000),

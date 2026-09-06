@@ -66,12 +66,17 @@ type ChannelUpstreamUsageMetrics struct {
 	Complete              bool    `json:"complete"`
 	DataUntil             int64   `json:"data_until"`
 	Granularity           string  `json:"granularity,omitempty"`
+	IntegrityStatus       string  `json:"integrity_status,omitempty"` // complete / overlapping_buckets / invalid_amount / window_mismatch
 }
 
 const (
-	upstreamAdjustedCostComplete        = "complete"
-	upstreamAdjustedCostMissingHistory  = "missing_history"
-	upstreamAdjustedCostBucketAmbiguous = "bucket_boundary_ambiguous"
+	upstreamAdjustedCostComplete         = "complete"
+	upstreamAdjustedCostMissingHistory   = "missing_history"
+	upstreamAdjustedCostBucketAmbiguous  = "bucket_boundary_ambiguous"
+	upstreamUsageIntegrityComplete       = "complete"
+	upstreamUsageIntegrityOverlap        = "overlapping_buckets"
+	upstreamUsageIntegrityInvalidAmount  = "invalid_amount"
+	upstreamUsageIntegrityWindowMismatch = "window_mismatch"
 )
 
 type ChannelManagementChannel struct {
@@ -460,7 +465,7 @@ func (m *Monitor) loadChannelUpstreamUsage(ctx context.Context, scope stabilityS
 		current := time.Unix(now, 0).In(cstLocation)
 		liveDayStart = time.Date(current.Year(), current.Month(), current.Day(), 0, 0, 0, 0, cstLocation).Unix()
 	}
-	if err := m.storeDB.WithContext(ctx).Raw(`SELECT domain,hour_ts,bucket_seconds,requests,tokens,quota,cost_usd,fetched_at,provider
+	if err := m.storeDB.WithContext(ctx).Raw(`SELECT domain,hour_ts,bucket_seconds,requests,tokens,quota,cost_usd,unit_per_usd,fetched_at,provider
 		FROM channel_upstream_usage_hours
 		WHERE hour_ts >= ?
 		  AND (hour_ts+(CASE WHEN bucket_seconds>0 THEN bucket_seconds ELSE 3600 END) <= ?
@@ -482,6 +487,8 @@ func (m *Monitor) loadChannelUpstreamUsage(ctx context.Context, scope stabilityS
 		ratio          float64
 		ratioSet       bool
 		ratioVaries    bool
+		lastEnd        int64
+		integrity      string
 	}
 	aggregates := make(map[string]*aggregate)
 	for _, row := range rows {
@@ -495,18 +502,39 @@ func (m *Monitor) loadChannelUpstreamUsage(ctx context.Context, scope stabilityS
 			if granularity == "" {
 				granularity = upstreamUsageGranularity(account.Provider, account.UsageAdapter)
 			}
-			a = &aggregate{metrics: ChannelUpstreamUsageMetrics{Available: true, ExpectedHours: expected, Granularity: granularity}, adjustedOK: true, adjustedStatus: upstreamAdjustedCostComplete}
+			a = &aggregate{metrics: ChannelUpstreamUsageMetrics{Available: true, ExpectedHours: expected, Granularity: granularity}, adjustedOK: true, adjustedStatus: upstreamAdjustedCostComplete, integrity: upstreamUsageIntegrityComplete}
 			aggregates[row.Domain] = a
 		}
 		seconds := row.BucketSeconds
 		if seconds <= 0 {
 			seconds = 3600
 		}
+		end := row.HourTs + seconds
+		if end > scope.ToTs {
+			a.integrity = upstreamUsageIntegrityWindowMismatch
+			continue
+		}
+		if a.lastEnd > row.HourTs {
+			a.integrity = upstreamUsageIntegrityOverlap
+			continue
+		}
+		a.lastEnd = end
+		unitBased := row.Provider == upstreamProviderNewAPI || row.Provider == upstreamProviderTokenForce
+		expectedCost := 0.0
+		if unitBased && validUpstreamEconomicUnit(row.UnitPerUSD) {
+			expectedCost = row.Quota / row.UnitPerUSD
+		}
+		costTolerance := math.Max(1e-9, math.Abs(expectedCost)*1e-9)
+		if math.IsNaN(row.CostUSD) || math.IsInf(row.CostUSD, 0) || row.CostUSD < 0 ||
+			(row.Quota != 0 && unitBased && (!validUpstreamEconomicUnit(row.UnitPerUSD) || math.Abs(row.CostUSD-expectedCost) > costTolerance)) {
+			a.integrity = upstreamUsageIntegrityInvalidAmount
+			continue
+		}
 		a.metrics.Requests += row.Requests
 		a.metrics.Tokens += row.Tokens
 		a.metrics.CostUSD += row.CostUSD
 		a.completed += seconds
-		if until := row.HourTs + seconds; until > a.metrics.DataUntil {
+		if until := end; until > a.metrics.DataUntil {
 			a.metrics.DataUntil = until
 		}
 		paid, credit, status := rechargeTermsForBucket(versions[row.Domain], row.HourTs, row.HourTs+seconds)
@@ -532,6 +560,21 @@ func (m *Monitor) loadChannelUpstreamUsage(ctx context.Context, scope stabilityS
 	}
 	result := make(map[string]ChannelUpstreamUsageMetrics, len(aggregates))
 	for domain, a := range aggregates {
+		a.metrics.IntegrityStatus = a.integrity
+		if a.integrity != upstreamUsageIntegrityComplete {
+			// 有重叠或非法金额时，任何部分合计都可能误导财务判断；保留“有数据”
+			// 和明确错误状态，但金额/请求/覆盖一律 fail closed。
+			a.metrics.Requests = 0
+			a.metrics.Tokens = 0
+			a.metrics.CostUSD = 0
+			a.metrics.CompletedHours = 0
+			a.metrics.Complete = false
+			a.metrics.AdjustedCostAvailable = false
+			a.metrics.AdjustedCostUSD = 0
+			a.metrics.AdjustedCostStatus = a.integrity
+			result[domain] = a.metrics
+			continue
+		}
 		a.metrics.CompletedHours = a.completed / 3600
 		a.metrics.Complete = expected == 0 || a.completed >= expected*3600
 		a.metrics.AdjustedCostAvailable = a.adjustedOK && a.ratioSet
@@ -654,7 +697,7 @@ func (m *Monitor) buildChannelManagementReport(ctx context.Context, scope stabil
 		COALESCE(SUM(failed),0) failed,
 		COALESCE(SUM(tokens),0) tokens,COALESCE(SUM(quota),0) quota
 		FROM stability_hour_samples WHERE hour_ts>=? AND hour_ts<? AND traffic_class_version=?
-		GROUP BY channel_id,grp LIMIT ?`, scope.FromTs, scope.ToTs, userTrafficClassificationVersion, maxChannelManagementRows+1).Scan(&usageRows)
+		GROUP BY channel_id,grp LIMIT ?`, scope.FromTs, scope.ToTs, stabilityTrafficClassificationVersion, maxChannelManagementRows+1).Scan(&usageRows)
 	if tx.Error != nil {
 		return nil, fmt.Errorf("读取渠道用量汇总: %w", tx.Error)
 	}
@@ -793,7 +836,7 @@ func (m *Monitor) buildChannelManagementReport(ctx context.Context, scope stabil
 
 	var coverage struct{ Max int64 }
 	if tx := m.storeDB.WithContext(ctx).Raw("SELECT COALESCE(MAX(hour_ts),0) max FROM stability_hour_samples WHERE hour_ts>=? AND hour_ts<? AND traffic_class_version=?",
-		scope.FromTs, scope.ToTs, userTrafficClassificationVersion).Scan(&coverage); tx.Error != nil {
+		scope.FromTs, scope.ToTs, stabilityTrafficClassificationVersion).Scan(&coverage); tx.Error != nil {
 		return nil, fmt.Errorf("读取渠道用量新鲜度: %w", tx.Error)
 	}
 	dataUntil := coverage.Max
@@ -805,7 +848,7 @@ func (m *Monitor) buildChannelManagementReport(ctx context.Context, scope stabil
 	}
 	var latestCoverage struct{ Max int64 }
 	if tx := m.storeDB.WithContext(ctx).Raw("SELECT COALESCE(MAX(hour_ts),0) max FROM stability_hour_samples WHERE traffic_class_version=?",
-		userTrafficClassificationVersion).Scan(&latestCoverage); tx.Error != nil {
+		stabilityTrafficClassificationVersion).Scan(&latestCoverage); tx.Error != nil {
 		return nil, fmt.Errorf("读取渠道用量全局新鲜度: %w", tx.Error)
 	}
 	latestDataUntil := latestCoverage.Max

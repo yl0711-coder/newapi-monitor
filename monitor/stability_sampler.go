@@ -73,7 +73,7 @@ func (m *Monitor) resetStaleStabilityProblemClassification() error {
 	for _, table := range []string{"stability_problem_samples", "stability_problem_stages", "stability_problem_ingest_states"} {
 		var exists int
 		if err := m.storeDB.Raw("SELECT EXISTS(SELECT 1 FROM "+table+" WHERE COALESCE(traffic_class_version,0) <> ? LIMIT 1)",
-			userTrafficClassificationVersion).Scan(&exists).Error; err != nil {
+			stabilityTrafficClassificationVersion).Scan(&exists).Error; err != nil {
 			return err
 		}
 		stale = stale || exists == 1
@@ -95,14 +95,14 @@ func (m *Monitor) resetStaleStabilityProblemClassification() error {
 	err := m.storeDB.Transaction(func(tx *gorm.DB) error {
 		var state StabilityProblemClassificationMigration
 		err := tx.First(&state, 1).Error
-		if err == nil && state.TrafficClassVersion == userTrafficClassificationVersion {
+		if err == nil && state.TrafficClassVersion == stabilityTrafficClassificationVersion {
 			return nil
 		}
 		if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
 			return err
 		}
 		state = StabilityProblemClassificationMigration{
-			ID: 1, TrafficClassVersion: userTrafficClassificationVersion,
+			ID: 1, TrafficClassVersion: stabilityTrafficClassificationVersion,
 			FromTs: from, ThroughTs: to, NextTs: from, Status: "queued", CurrentSpanMinutes: 12,
 			CreatedAt: now, UpdatedAt: now,
 		}
@@ -130,7 +130,7 @@ func aggregateStabilityProblemRows(rows []stabilityProblemRawRow) []StabilityPro
 		p := agg[key]
 		if p == nil {
 			p = &StabilityProblemSample{
-				BucketTs: key.bucket, TrafficClassVersion: userTrafficClassificationVersion,
+				BucketTs: key.bucket, TrafficClassVersion: stabilityTrafficClassificationVersion,
 				Source: "newapi", SignatureHash: hash,
 				ChannelID: int(row.ChannelID), ModelName: row.Model, Grp: row.Group,
 				Code: stabilityProblemCode(row.Raw), Message: message, Truncated: truncated,
@@ -179,7 +179,7 @@ func scanStabilityProblemRows(rows interface {
 
 func (m *Monitor) pendingStabilityProblemStateInRange(fromTs, toTs int64) (*StabilityProblemIngestState, error) {
 	var state StabilityProblemIngestState
-	query := m.storeDB.Where("complete = ? AND traffic_class_version = ?", false, userTrafficClassificationVersion)
+	query := m.storeDB.Where("complete = ? AND traffic_class_version = ?", false, stabilityTrafficClassificationVersion)
 	if fromTs > 0 {
 		query = query.Where("bucket_ts >= ?", fromTs)
 	}
@@ -199,7 +199,7 @@ func (m *Monitor) pendingStabilityProblemStateInRange(fromTs, toTs int64) (*Stab
 func (m *Monitor) stabilityProblemPendingCountInRange(fromTs, toTs int64) int64 {
 	var count int64
 	query := m.storeDB.Model(&StabilityProblemIngestState{}).
-		Where("complete = ? AND traffic_class_version = ?", false, userTrafficClassificationVersion)
+		Where("complete = ? AND traffic_class_version = ?", false, stabilityTrafficClassificationVersion)
 	if fromTs > 0 {
 		query = query.Where("bucket_ts >= ?", fromTs)
 	}
@@ -213,20 +213,20 @@ func (m *Monitor) stabilityProblemPendingCountInRange(fromTs, toTs int64) int64 
 func (m *Monitor) stabilityProblemPendingCount() int64 {
 	var count int64
 	warnReadErr("stability problem pending", m.storeDB.Model(&StabilityProblemIngestState{}).
-		Where("complete = ? AND traffic_class_version = ?", false, userTrafficClassificationVersion).Count(&count))
+		Where("complete = ? AND traffic_class_version = ?", false, stabilityTrafficClassificationVersion).Count(&count))
 	return count
 }
 
 func (m *Monitor) stabilityProblemNeedsCatchup(targetTo int64) bool {
 	var cursor StabilityProblemLiveCursor
-	if err := m.storeDB.First(&cursor, "id = ? AND traffic_class_version = ?", 1, userTrafficClassificationVersion).Error; err == nil {
+	if err := m.storeDB.First(&cursor, "id = ? AND traffic_class_version = ?", 1, stabilityTrafficClassificationVersion).Error; err == nil {
 		return cursor.NextTs < max(cursor.TargetThroughTs, targetTo/60*60)
 	} else if !errors.Is(err, gorm.ErrRecordNotFound) {
 		return true
 	}
 	var last struct{ Max int64 }
 	if err := m.storeDB.Raw("SELECT COALESCE(MAX(bucket_ts),0) max FROM stability_problem_ingest_states WHERE traffic_class_version = ?",
-		userTrafficClassificationVersion).Scan(&last).Error; err != nil {
+		stabilityTrafficClassificationVersion).Scan(&last).Error; err != nil {
 		return true
 	}
 	return last.Max > 0 && last.Max+60 < targetTo/60*60
@@ -236,7 +236,7 @@ func (m *Monitor) stabilityProblemNeedsCatchup(targetTo int64) bool {
 func (m *Monitor) nextUncoveredProblemWindow(fromTs, toTs int64) (int64, int64, error) {
 	var rows []StabilityProblemIngestState
 	if err := m.storeDB.Select("bucket_ts", "complete").Where(
-		"bucket_ts >= ? AND bucket_ts < ? AND traffic_class_version = ?", fromTs, toTs, userTrafficClassificationVersion).Find(&rows).Error; err != nil {
+		"bucket_ts >= ? AND bucket_ts < ? AND traffic_class_version = ?", fromTs, toTs, stabilityTrafficClassificationVersion).Find(&rows).Error; err != nil {
 		return 0, 0, err
 	}
 	complete := make(map[int64]bool, len(rows))
@@ -275,7 +275,7 @@ func (m *Monitor) markProblemWindowComplete(tx *gorm.DB, fromTs, toTs, now int64
 	}
 	byMinute := map[int64]*StabilityProblemIngestState{}
 	for bucket := fromTs; bucket < toTs; bucket += 60 {
-		byMinute[bucket] = &StabilityProblemIngestState{BucketTs: bucket, TrafficClassVersion: userTrafficClassificationVersion,
+		byMinute[bucket] = &StabilityProblemIngestState{BucketTs: bucket, TrafficClassVersion: stabilityTrafficClassificationVersion,
 			Complete: true, UpdatedAt: now, CompletedAt: now}
 	}
 	for _, row := range rows {
@@ -299,7 +299,7 @@ func (m *Monitor) ensureProblemWindowPending(fromTs, toTs, now int64) error {
 	states := make([]StabilityProblemIngestState, 0, (toTs-fromTs)/60)
 	for bucket := fromTs; bucket < toTs; bucket += 60 {
 		states = append(states, StabilityProblemIngestState{BucketTs: bucket,
-			TrafficClassVersion: userTrafficClassificationVersion, UpdatedAt: now})
+			TrafficClassVersion: stabilityTrafficClassificationVersion, UpdatedAt: now})
 	}
 	if len(states) == 0 {
 		return nil
@@ -311,7 +311,7 @@ func (m *Monitor) ensureProblemWindowPending(fromTs, toTs, now int64) error {
 		// forever. Old stages are likewise not a rollback copy; rollback uses the
 		// pinned pre-migration SQLite snapshot.
 		if err := tx.Where("bucket_ts >= ? AND bucket_ts < ? AND COALESCE(traffic_class_version,0) <> ?",
-			fromTs, toTs, userTrafficClassificationVersion).Delete(&StabilityProblemStage{}).Error; err != nil {
+			fromTs, toTs, stabilityTrafficClassificationVersion).Delete(&StabilityProblemStage{}).Error; err != nil {
 			return err
 		}
 		return tx.Clauses(clause.OnConflict{
@@ -327,7 +327,7 @@ func (m *Monitor) finishProblemMinute(tx *gorm.DB, state StabilityProblemIngestS
 	}
 	var staged []StabilityProblemStage
 	if err := tx.Where("bucket_ts = ? AND traffic_class_version = ?", state.BucketTs,
-		userTrafficClassificationVersion).Find(&staged).Error; err != nil {
+		stabilityTrafficClassificationVersion).Find(&staged).Error; err != nil {
 		return err
 	}
 	if len(staged) > 0 {
@@ -344,7 +344,7 @@ func (m *Monitor) finishProblemMinute(tx *gorm.DB, state StabilityProblemIngestS
 	}
 	return tx.Model(&StabilityProblemIngestState{}).Where("bucket_ts = ?", state.BucketTs).Updates(map[string]any{
 		"complete": true, "completed_at": now, "updated_at": now,
-		"traffic_class_version": userTrafficClassificationVersion,
+		"traffic_class_version": stabilityTrafficClassificationVersion,
 	}).Error
 }
 
@@ -401,7 +401,7 @@ func (m *Monitor) stabilityProblemClassificationMigrationActive() bool {
 	}
 	var count int64
 	if err := m.storeDB.Model(&StabilityProblemClassificationMigration{}).
-		Where("id = ? AND traffic_class_version = ? AND status <> ?", 1, userTrafficClassificationVersion, "complete").
+		Where("id = ? AND traffic_class_version = ? AND status <> ?", 1, stabilityTrafficClassificationVersion, "complete").
 		Count(&count).Error; err != nil {
 		return true // fail toward the protected low-priority lane
 	}
@@ -489,7 +489,7 @@ func (m *Monitor) loadOrExtendStabilityProblemLiveCursor(requestedFrom, requeste
 	migrationActive := m.stabilityProblemClassificationMigrationActive()
 	err := m.storeDB.Transaction(func(tx *gorm.DB) error {
 		err := tx.First(&result, 1).Error
-		if errors.Is(err, gorm.ErrRecordNotFound) || err == nil && result.TrafficClassVersion != userTrafficClassificationVersion {
+		if errors.Is(err, gorm.ErrRecordNotFound) || err == nil && result.TrafficClassVersion != stabilityTrafficClassificationVersion {
 			next := requestedFrom
 			// Before a classification migration existed, the minute table was the
 			// only live cursor. Import that one legacy watermark once. During a raw
@@ -497,14 +497,14 @@ func (m *Monitor) loadOrExtendStabilityProblemLiveCursor(requestedFrom, requeste
 			if !migrationActive {
 				var last struct{ Max int64 }
 				if err := tx.Raw("SELECT COALESCE(MAX(bucket_ts),0) max FROM stability_problem_ingest_states WHERE complete = ? AND traffic_class_version = ?",
-					true, userTrafficClassificationVersion).Scan(&last).Error; err != nil {
+					true, stabilityTrafficClassificationVersion).Scan(&last).Error; err != nil {
 					return err
 				}
 				if last.Max > 0 && last.Max+60 < requestedFrom {
 					next = last.Max + 60
 				}
 			}
-			result = StabilityProblemLiveCursor{ID: 1, TrafficClassVersion: userTrafficClassificationVersion,
+			result = StabilityProblemLiveCursor{ID: 1, TrafficClassVersion: stabilityTrafficClassificationVersion,
 				NextTs: next, TargetThroughTs: requestedTo, Status: "running", UpdatedAt: now}
 			return tx.Save(&result).Error
 		}
@@ -556,7 +556,7 @@ func (m *Monitor) advanceStabilityProblemLiveCursor(cursor *StabilityProblemLive
 	if probeTo > next {
 		if err := m.storeDB.Model(&StabilityProblemIngestState{}).
 			Where("bucket_ts >= ? AND bucket_ts < ? AND complete = ? AND traffic_class_version = ?",
-				next, probeTo, true, userTrafficClassificationVersion).
+				next, probeTo, true, stabilityTrafficClassificationVersion).
 			Order("bucket_ts").Pluck("bucket_ts", &complete).Error; err != nil {
 			return err
 		}
@@ -697,7 +697,7 @@ func truncateStabilityProblemMigrationError(err error) string {
 
 func (m *Monitor) loadStabilityProblemMigration() (*StabilityProblemClassificationMigration, error) {
 	var state StabilityProblemClassificationMigration
-	err := m.storeDB.First(&state, "id = ? AND traffic_class_version = ?", 1, userTrafficClassificationVersion).Error
+	err := m.storeDB.First(&state, "id = ? AND traffic_class_version = ?", 1, stabilityTrafficClassificationVersion).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		return nil, nil
 	}
@@ -817,7 +817,7 @@ func (m *Monitor) advanceStabilityProblemMigration(state *StabilityProblemClassi
 	if probeTo > next {
 		if err := m.storeDB.Model(&StabilityProblemIngestState{}).
 			Where("bucket_ts >= ? AND bucket_ts < ? AND complete = ? AND traffic_class_version = ?",
-				next, probeTo, true, userTrafficClassificationVersion).
+				next, probeTo, true, stabilityTrafficClassificationVersion).
 			Order("bucket_ts").Pluck("bucket_ts", &complete).Error; err != nil {
 			return err
 		}

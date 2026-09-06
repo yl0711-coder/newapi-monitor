@@ -64,7 +64,7 @@ type StabilityHourIngestState struct {
 
 func (s *StabilityHourIngestState) BeforeCreate(_ *gorm.DB) error {
 	if s.TrafficClassVersion == 0 {
-		s.TrafficClassVersion = userTrafficClassificationVersion
+		s.TrafficClassVersion = stabilityTrafficClassificationVersion
 	}
 	return nil
 }
@@ -172,7 +172,7 @@ func (m *Monitor) stabilityDataCoverage(ctx context.Context, fromTs, toTs, now i
 	strictSQL := `SELECT COUNT(*) FROM stability_hour_ingest_states hs WHERE hs.hour_ts >= ? AND hs.hour_ts < ? AND ` +
 		stabilityCompleteHourPredicateSQL("hs")
 	if tx := m.storeDB.WithContext(ctx).Raw(strictSQL, fromTs, toTs,
-		userTrafficClassificationVersion, userTrafficClassificationVersion).Scan(&count); tx.Error != nil {
+		stabilityTrafficClassificationVersion, stabilityTrafficClassificationVersion).Scan(&count); tx.Error != nil {
 		slog.Warn("读取稳定性小时覆盖台账失败", "err", tx.Error)
 		return result
 	}
@@ -204,7 +204,7 @@ func (m *Monitor) stabilityDataCoverage(ctx context.Context, fromTs, toTs, now i
 			AND NOT EXISTS (SELECT 1 FROM stability_hour_ingest_states v5hs
 				WHERE v5hs.hour_ts = hs.hour_ts AND ` + stabilityCompleteHourPredicateSQL("v5hs") + `)
 		))`
-	v := userTrafficClassificationVersion
+	v := stabilityTrafficClassificationVersion
 	if tx := m.storeDB.WithContext(ctx).Raw(effectiveSQL,
 		v, fromTs, toTs, v, v, v, v, v).Scan(&effective); tx.Error != nil {
 		slog.Warn("读取稳定性兼容覆盖失败", "err", tx.Error)
@@ -253,21 +253,19 @@ SELECT channel_id, model_name, ` + "`group`" + ` AS grp,
   CAST(COALESCE(SUM(CASE WHEN ` + testPredicate + ` THEN ` + testResult + `='success' ELSE type=2 AND NOT {{ANOM}} END),0) AS SIGNED) AS success,
   CAST(COALESCE(SUM(CASE WHEN ` + testPredicate + ` THEN ` + testResult + `='anomaly' ELSE type=2 AND {{ANOM}} END),0) AS SIGNED) AS anomaly,
   CAST(COALESCE(SUM(CASE WHEN ` + testPredicate + ` THEN ` + testResult + `='failed' ELSE type=5 END),0) AS SIGNED) AS failed,
-  CAST(COALESCE(SUM(type=2 AND {{ZERO}} AND prompt_tokens > 0),0) AS SIGNED) AS anomaly_billed,
-  CAST(COALESCE(SUM(type=2 AND {{ZERO}} AND prompt_tokens = 0),0) AS SIGNED) AS anomaly_free,
+  CAST(COALESCE(SUM(type=2 AND {{ZERO}} AND quota > 0),0) AS SIGNED) AS anomaly_billed,
+  CAST(COALESCE(SUM(type=2 AND {{ZERO}} AND quota = 0),0) AS SIGNED) AS anomaly_free,
   CAST(COALESCE(SUM(type=2 AND {{STREAMBAD}} AND NOT {{ZERO}}),0) AS SIGNED) AS anomaly_stream,
-  CAST(COALESCE(SUM(CASE WHEN type=2 AND {{ZERO}} AND prompt_tokens > 0 THEN quota END),0) AS SIGNED) AS anomaly_quota,
+  CAST(COALESCE(SUM(CASE WHEN type=2 AND {{ZERO}} AND quota > 0 THEN quota END),0) AS SIGNED) AS anomaly_quota,
   CAST(COALESCE(SUM(CASE WHEN type=2 THEN use_time END),0) AS SIGNED) AS sum_use_time,
   CAST(COALESCE(MAX(CASE WHEN type=2 THEN use_time END),0) AS SIGNED) AS max_use_time,
   CAST(COALESCE(SUM(CASE WHEN type=2 THEN prompt_tokens+completion_tokens END),0) AS SIGNED) AS tokens,
   CAST(COALESCE(SUM(CASE WHEN type=2 THEN quota END),0) AS SIGNED) AS quota,
   CAST(COALESCE(SUM(type=6),0) AS SIGNED) AS refund_records,
   CAST(COALESCE(SUM(CASE WHEN type=6 THEN quota END),0) AS SIGNED) AS refund_quota,
-  CAST(COALESCE(SUM(type=5 AND content REGEXP 'status_code=4'
-        AND content NOT LIKE '%timeout%' AND content NOT LIKE '%deadline%'),0) AS SIGNED) AS err_4xx,
-  CAST(COALESCE(SUM(type=5 AND content REGEXP 'status_code=5'
-        AND content NOT LIKE '%timeout%' AND content NOT LIKE '%deadline%'),0) AS SIGNED) AS err_5xx,
-  CAST(COALESCE(SUM(type=5 AND (content LIKE '%timeout%' OR content LIKE '%deadline%')),0) AS SIGNED) AS err_timeout
+  CAST(COALESCE(SUM(type=5 AND {{ERR4XX}}),0) AS SIGNED) AS err_4xx,
+  CAST(COALESCE(SUM(type=5 AND {{ERR5XX}}),0) AS SIGNED) AS err_5xx,
+  CAST(COALESCE(SUM(type=5 AND {{ERRTIMEOUT}}),0) AS SIGNED) AS err_timeout
 FROM logs
 WHERE created_at >= ? AND created_at < ? AND type IN (2,5,6)
 GROUP BY channel_id, model_name, grp, is_channel_test, channel_test_origin, channel_test_scope, channel_test_cost_basis`
@@ -464,7 +462,7 @@ func (m *Monitor) fetchStabilityRange(ctx context.Context, fromTs, toTs int64) (
 				traffic.Users = make([]StabilityHourSample, 0, 128)
 				traffic.InternalTests = make([]ChannelTestHourSample, 0, 16)
 			}
-			row.HourTs, row.Grp, row.TrafficClassVersion = hourTs, group.String, userTrafficClassificationVersion
+			row.HourTs, row.Grp, row.TrafficClassVersion = hourTs, group.String, stabilityTrafficClassificationVersion
 			row.Err4xx, row.Err5xx, row.ErrTimeout = err4xx, err5xx, errTimeout
 			if other := row.Failed - err4xx - err5xx - errTimeout; other > 0 {
 				row.ErrOther = other
@@ -488,7 +486,7 @@ func (m *Monitor) fetchStabilityRange(ctx context.Context, fromTs, toTs int64) (
 				}
 				traffic.InternalTests = append(traffic.InternalTests, ChannelTestHourSample{
 					HourTs: hourTs, ChannelID: row.ChannelID, ModelName: row.ModelName, Grp: row.Grp, Origin: origin,
-					Scope: scope, CostBasis: costBasis, TrafficClassVersion: userTrafficClassificationVersion,
+					Scope: scope, CostBasis: costBasis, TrafficClassVersion: stabilityTrafficClassificationVersion,
 					Requests: row.Success + row.Anomaly + row.Failed, Success: row.Success, Anomaly: row.Anomaly, Failed: row.Failed,
 					Tokens: row.Tokens, Quota: row.Quota, SumUseTime: row.SumUseTime, MaxUseTime: row.MaxUseTime,
 				})
@@ -616,19 +614,19 @@ func (m *Monitor) replaceStabilityHourTraffic(hourTs int64, rows []StabilityHour
 			return fmt.Errorf("渠道测试结果分类不完整: origin=%s requests=%d success=%d anomaly=%d failed=%d",
 				testRows[i].Origin, testRows[i].Requests, testRows[i].Success, testRows[i].Anomaly, testRows[i].Failed)
 		}
-		testRows[i].TrafficClassVersion = userTrafficClassificationVersion
+		testRows[i].TrafficClassVersion = stabilityTrafficClassificationVersion
 	}
 	expectedRequests, expectedTokens, expectedQuota := stabilityHourTotals(rows)
 	expectedTestRequests, expectedTestTokens, expectedTestQuota := channelTestHourTotals(testRows)
 	for i := range rows {
-		rows[i].TrafficClassVersion = userTrafficClassificationVersion
+		rows[i].TrafficClassVersion = stabilityTrafficClassificationVersion
 	}
 	return m.storeDB.Transaction(func(tx *gorm.DB) error {
 		if expectedRequests == 0 {
 			var minuteRequests int64
 			if err := tx.Raw(`SELECT COALESCE(SUM(success+anomaly+failed),0) FROM metric_samples
 				WHERE bucket_ts >= ? AND bucket_ts < ? AND traffic_class_version = ?`,
-				hourTs, hourTs+3600, userTrafficClassificationVersion).Scan(&minuteRequests).Error; err != nil {
+				hourTs, hourTs+3600, stabilityTrafficClassificationVersion).Scan(&minuteRequests).Error; err != nil {
 				return err
 			}
 			if minuteRequests > 0 {
@@ -678,7 +676,7 @@ func (m *Monitor) replaceStabilityHourTraffic(hourTs int64, rows []StabilityHour
 		state.Requests, state.Tokens, state.Quota = expectedRequests, expectedTokens, expectedQuota
 		state.InternalTestRows = int64(len(testRows))
 		state.InternalTestRequests, state.InternalTestTokens, state.InternalTestQuota = expectedTestRequests, expectedTestTokens, expectedTestQuota
-		state.TrafficClassVersion = userTrafficClassificationVersion
+		state.TrafficClassVersion = stabilityTrafficClassificationVersion
 		now := time.Now().Unix()
 		state.CompletedAt, state.UpdatedAt, state.LastError = now, now, ""
 		if err := tx.Save(&state).Error; err != nil {
@@ -1125,7 +1123,7 @@ func (m *Monitor) completeStabilityHours(fromTs, toTs int64) (map[int64]bool, er
 	query := `SELECT hs.hour_ts FROM stability_hour_ingest_states hs
 		WHERE hs.hour_ts >= ? AND hs.hour_ts < ? AND ` + stabilityCompleteHourPredicateSQL("hs")
 	if err := m.storeDB.Raw(query, fromTs, toTs,
-		userTrafficClassificationVersion, userTrafficClassificationVersion).Scan(&hours).Error; err != nil {
+		stabilityTrafficClassificationVersion, stabilityTrafficClassificationVersion).Scan(&hours).Error; err != nil {
 		return nil, err
 	}
 	known := make(map[int64]bool, len(hours))

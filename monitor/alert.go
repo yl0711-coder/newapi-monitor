@@ -132,8 +132,9 @@ type AlertLog struct {
 func (m *Monitor) loadAlertConfig() AlertConfig {
 	var c AlertConfig
 	if err := m.storeDB.First(&c, 1).Error; err != nil {
-		return defaultAlertConfig() // 没存过 → 返回建议默认
+		c = defaultAlertConfig() // 没存过 → 返回建议默认
 	}
+	m.normalizeSLOWindow(&c)
 	return c
 }
 
@@ -145,12 +146,39 @@ func (m *Monitor) saveAlertConfig(c AlertConfig) error {
 	if c.UpstreamBalanceCooldownMin < 60 || c.UpstreamBalanceCooldownMin > 10080 {
 		c.UpstreamBalanceCooldownMin = defaultAlertConfig().UpstreamBalanceCooldownMin
 	}
+	m.normalizeSLOWindow(&c)
 	c.ID = 1
 	c.UpdatedAt = time.Now().Unix()
 	return m.storeDB.Clauses(clause.OnConflict{
 		Columns:   []clause.Column{{Name: "id"}},
 		UpdateAll: true,
 	}).Create(&c).Error
+}
+
+func (m *Monitor) normalizeSLOWindow(c *AlertConfig) {
+	retention := m.cfg.RetentionDays
+	if retention <= 0 {
+		retention = 7
+	}
+	if c.SLOWindowDays <= 0 {
+		c.SLOWindowDays = min(defaultAlertConfig().SLOWindowDays, retention)
+	}
+	if c.SLOWindowDays > retention {
+		c.SLOWindowDays = retention
+	}
+	maxBurnMinutes := retention * 24 * 60
+	normalizeBurnWindow := func(value, fallback int) int {
+		if value >= 60 && value%60 == 0 && value <= maxBurnMinutes {
+			return value
+		}
+		if fallback > maxBurnMinutes {
+			return maxBurnMinutes - maxBurnMinutes%60
+		}
+		return fallback
+	}
+	defaults := defaultAlertConfig()
+	c.BurnFastWindowMin = normalizeBurnWindow(c.BurnFastWindowMin, defaults.BurnFastWindowMin)
+	c.BurnSlowWindowMin = normalizeBurnWindow(c.BurnSlowWindowMin, defaults.BurnSlowWindowMin)
 }
 
 // inCooldown 判断 (kind,target) 是否在冷却期内(冷却内不重发)。

@@ -72,16 +72,23 @@ type ChannelUpstreamAccount struct {
 	BalanceKnown      bool    `gorm:"column:balance_known"`
 	BalanceRaw        float64 `gorm:"column:balance_raw"`
 	BalanceUnit       float64 `gorm:"column:balance_unit"`
-	UnitAssumed       bool    `gorm:"column:unit_assumed"`
-	Status            string  `gorm:"size:24;index"`
-	LastError         string  `gorm:"size:512;column:last_error"`
-	LastAttemptAt     int64   `gorm:"column:last_attempt_at"`
-	LastSuccessAt     int64   `gorm:"column:last_success_at;index"`
-	NextSyncAt        int64   `gorm:"column:next_sync_at;index"`
-	ConsecutiveFails  int     `gorm:"column:consecutive_fails"`
-	CreatedAt         int64   `gorm:"column:created_at"`
-	UpdatedAt         int64   `gorm:"column:updated_at;index"`
-	UpdatedBy         string  `gorm:"size:128;column:updated_by"`
+	// A unit edit is effective at the next UTC accounting hour. The immediately
+	// preceding open hour can still be decoded with BalanceUnitPrevious; older
+	// unseen history is retained as unpriced evidence rather than guessed using
+	// today's unit. Published buckets/events carry their own immutable unit.
+	BalanceUnitPrevious     float64 `gorm:"column:balance_unit_previous"`
+	BalanceUnitEffectiveAt  int64   `gorm:"column:balance_unit_effective_at"`
+	EconomicUnitUnavailable bool    `gorm:"-" json:"-"`
+	UnitAssumed             bool    `gorm:"column:unit_assumed"`
+	Status                  string  `gorm:"size:24;index"`
+	LastError               string  `gorm:"size:512;column:last_error"`
+	LastAttemptAt           int64   `gorm:"column:last_attempt_at"`
+	LastSuccessAt           int64   `gorm:"column:last_success_at;index"`
+	NextSyncAt              int64   `gorm:"column:next_sync_at;index"`
+	ConsecutiveFails        int     `gorm:"column:consecutive_fails"`
+	CreatedAt               int64   `gorm:"column:created_at"`
+	UpdatedAt               int64   `gorm:"column:updated_at;index"`
+	UpdatedBy               string  `gorm:"size:128;column:updated_by"`
 	// 使用日志同步必须由管理员显式打开。它和余额快照独立：余额可用于预警，
 	// 使用日志才可用于某个日期范围内的上游消费汇总。
 	UsageSyncEnabled      bool   `gorm:"column:usage_sync_enabled"`
@@ -130,8 +137,12 @@ type ChannelUpstreamUsageHour struct {
 	Tokens        int64   `gorm:"column:tokens"`
 	Quota         float64 `gorm:"column:quota"`
 	CostUSD       float64 `gorm:"column:cost_usd"`
-	FetchedAt     int64   `gorm:"column:fetched_at;index"`
-	Provider      string  `gorm:"size:24;column:provider"`
+	// UnitPerUSD records the conversion evidence used to derive CostUSD from
+	// Quota. It is intentionally stored on every converted bucket so an account
+	// unit change cannot silently mix two monetary bases in one report.
+	UnitPerUSD float64 `gorm:"column:unit_per_usd"`
+	FetchedAt  int64   `gorm:"column:fetched_at;index"`
+	Provider   string  `gorm:"size:24;column:provider"`
 }
 
 // NewAPIUsageBackfillCheckpoint 是 NewAPI 高密度历史小时的脱敏分页断点。
@@ -1453,8 +1464,9 @@ func (m *Monitor) migrateAICodeWithContractLedgerUnit() error {
 	for i := range rows {
 		row := rows[i]
 		if err := m.storeDB.Transaction(func(tx *gorm.DB) error {
-			if err := tx.Model(&ChannelUpstreamUsageHour{}).Where("domain = ?", row.Domain).
-				UpdateColumn("cost_usd", gorm.Expr("cost_usd * ?", row.BalanceUnit)).Error; err != nil {
+			if err := tx.Model(&ChannelUpstreamUsageHour{}).
+				Where("domain = ? AND (unit_per_usd = 0 OR (unit_per_usd > ? AND unit_per_usd < ?))", row.Domain, 6.999, 7.001).
+				Updates(map[string]any{"cost_usd": gorm.Expr("cost_usd * ?", row.BalanceUnit), "unit_per_usd": 1.0}).Error; err != nil {
 				return err
 			}
 			if err := tx.Model(&AICodeWithUsageStage{}).Where("domain = ?", row.Domain).
@@ -1739,7 +1751,13 @@ func syncNewAPIBalance(ctx context.Context, client *http.Client, row ChannelUpst
 	if err != nil {
 		return upstreamBalanceResult{}, cred, fmt.Errorf("NewAPI 未返回有效账户余额")
 	}
-	unit, assumed := defaultNewAPIQuotaPerUSD, true
+	// A transient /api/status failure must not replace a previously verified
+	// conversion unit with the fallback. Mixing units across adjacent usage
+	// buckets silently corrupts historical cost and fund totals.
+	unit, assumed := row.BalanceUnit, row.UnitAssumed
+	if unit <= 0 || math.IsNaN(unit) || math.IsInf(unit, 0) {
+		unit, assumed = defaultNewAPIQuotaPerUSD, true
+	}
 	if statusBody, statusErr := doUpstreamJSON(ctx, client, http.MethodGet, upstreamEndpoint(row.BaseURL, "/api/status"), nil, nil); statusErr == nil {
 		var status struct {
 			QuotaPerUnit json.RawMessage `json:"quota_per_unit"`
@@ -2416,7 +2434,100 @@ func (m *Monitor) persistSyncedUpstreamAccount(ctx context.Context, row *Channel
 	}
 	row.Credential = sealed
 	row.CredentialVersion = upstreamCredentialVersion
-	return m.persistUpstreamAccount(ctx, row)
+	return m.storeDB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var previous ChannelUpstreamAccount
+		loadErr := tx.First(&previous, "domain = ?", row.Domain).Error
+		if loadErr != nil && !errors.Is(loadErr, gorm.ErrRecordNotFound) {
+			return loadErr
+		}
+		if loadErr == nil {
+			if err := reconcileUpstreamEconomicUnitTx(tx, previous, row); err != nil {
+				return err
+			}
+		}
+		return tx.Clauses(clause.OnConflict{
+			Columns:   []clause.Column{{Name: "domain"}},
+			UpdateAll: true,
+		}).Create(row).Error
+	})
+}
+
+func validUpstreamEconomicUnit(unit float64) bool {
+	return unit > 0 && !math.IsNaN(unit) && !math.IsInf(unit, 0)
+}
+
+// migrateLegacyUpstreamEconomicUnitEvidence upgrades rows created before the
+// per-bucket unit column existed. quota/cost_usd is the exact conversion used
+// when those rows were originally published, so deriving the unit from that
+// immutable pair preserves the historical amount without consulting today's
+// account configuration. Ambiguous rows remain unit=0 and fail closed.
+func migrateLegacyUpstreamEconomicUnitEvidence(db *gorm.DB) error {
+	return db.Exec(`UPDATE channel_upstream_usage_hours
+		SET unit_per_usd = quota / cost_usd
+		WHERE unit_per_usd = 0
+		  AND quota > 0 AND cost_usd > 0
+		  AND quota / cost_usd > 0
+		  AND quota / cost_usd <= 1000000000000000000`).Error
+}
+
+// reconcileUpstreamEconomicUnitTx preserves the conversion evidence already
+// attached to historical rows. A newly observed account unit is forward
+// effective: it must not rewrite amounts that were derived under an older
+// contract. Legacy rows without provable evidence remain unknown/fail-closed;
+// explicit historical corrections require a separate, audited repair flow.
+func reconcileUpstreamEconomicUnitTx(tx *gorm.DB, previous ChannelUpstreamAccount, next *ChannelUpstreamAccount) error {
+	if next == nil || previous.Provider != next.Provider || newAPIUpstreamAccountEpoch(previous) != newAPIUpstreamAccountEpoch(*next) {
+		return nil
+	}
+	if next.Provider != upstreamProviderNewAPI && next.Provider != upstreamProviderTokenForce {
+		return nil
+	}
+	if !validUpstreamEconomicUnit(previous.BalanceUnit) || !validUpstreamEconomicUnit(next.BalanceUnit) ||
+		math.Abs(previous.BalanceUnit-next.BalanceUnit) <= 1e-12 {
+		return nil
+	}
+	// Freeze the currently open accounting hour on the old unit even when no
+	// usage sample has been published yet. Subsequent tail refreshes can replace
+	// its counters, while persistUpstreamUsageWindowTx keeps this unit evidence.
+	// The newly configured unit consequently becomes effective at the next hour.
+	effectiveAt := next.UpdatedAt
+	if effectiveAt <= 0 {
+		effectiveAt = time.Now().Unix()
+	}
+	openHour := effectiveAt - effectiveAt%3600
+	previousEffectiveUnit := previous.BalanceUnit
+	// Multiple edits inside the same still-open hour must keep the unit that was
+	// actually effective before that hour. The intermediate configured value has
+	// not become an accounting fact yet.
+	if previous.BalanceUnitEffectiveAt > effectiveAt && validUpstreamEconomicUnit(previous.BalanceUnitPrevious) {
+		previousEffectiveUnit = previous.BalanceUnitPrevious
+	}
+	marker := ChannelUpstreamUsageHour{
+		Domain: next.Domain, HourTs: openHour, BucketSeconds: 3600,
+		Provider: next.Provider, UnitPerUSD: previousEffectiveUnit, FetchedAt: effectiveAt,
+	}
+	if err := tx.Clauses(clause.OnConflict{
+		Columns:   []clause.Column{{Name: "domain"}, {Name: "hour_ts"}},
+		DoNothing: true,
+	}).Create(&marker).Error; err != nil {
+		return fmt.Errorf("固化当前小时上游换算边界失败: %w", err)
+	}
+	next.BalanceUnitPrevious = previousEffectiveUnit
+	next.BalanceUnitEffectiveAt = openHour + 3600
+	return nil
+}
+
+func upstreamEconomicUnitAt(row ChannelUpstreamAccount, ts int64) (float64, bool) {
+	if !validUpstreamEconomicUnit(row.BalanceUnit) {
+		return 0, false
+	}
+	if row.BalanceUnitEffectiveAt <= 0 || ts >= row.BalanceUnitEffectiveAt {
+		return row.BalanceUnit, true
+	}
+	if ts >= row.BalanceUnitEffectiveAt-3600 && validUpstreamEconomicUnit(row.BalanceUnitPrevious) {
+		return row.BalanceUnitPrevious, true
+	}
+	return 0, false
 }
 
 // persistUpstreamAccountIdentityChange makes the account identity and its local
@@ -2431,8 +2542,17 @@ func (m *Monitor) persistUpstreamAccountIdentityChange(ctx context.Context, row 
 		row.UpdatedAt = time.Now().Unix()
 	}
 	return m.storeDB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var previous ChannelUpstreamAccount
+		loadErr := tx.First(&previous, "domain = ?", row.Domain).Error
+		if loadErr != nil && !errors.Is(loadErr, gorm.ErrRecordNotFound) {
+			return loadErr
+		}
 		if clearUsage {
 			if err := archiveUpstreamIdentityDataTx(tx, *row, row.UpdatedAt); err != nil {
+				return err
+			}
+		} else if loadErr == nil {
+			if err := reconcileUpstreamEconomicUnitTx(tx, previous, row); err != nil {
 				return err
 			}
 		}
@@ -2957,6 +3077,7 @@ func (m *Monitor) saveChannelUpstreamHandler(c *gin.Context) {
 	if sameIdentity {
 		row.BalanceUSD, row.BalanceKnown, row.BalanceRaw = existing.BalanceUSD, existing.BalanceKnown, existing.BalanceRaw
 		row.BalanceUnit, row.UnitAssumed = existing.BalanceUnit, existing.UnitAssumed
+		row.BalanceUnitPrevious, row.BalanceUnitEffectiveAt = existing.BalanceUnitPrevious, existing.BalanceUnitEffectiveAt
 		row.LastSuccessAt = existing.LastSuccessAt
 		row.UsageStatus, row.UsageLastError = existing.UsageStatus, existing.UsageLastError
 		row.UsageLastAttemptAt, row.UsageLastSuccessAt = existing.UsageLastAttemptAt, existing.UsageLastSuccessAt
@@ -2992,12 +3113,9 @@ func (m *Monitor) saveChannelUpstreamHandler(c *gin.Context) {
 			row.BalanceUSD = row.BalanceRaw / row.BalanceUnit
 		}
 		if economicUnitChanged {
-			row.UsageStatus, row.UsageLastError = upstreamStatusPending, ""
+			// 新换算单位仅对之后新采集的窗口生效。保留历史水位，
+			// 否则重跑回填会用今天的单位渐进重写过去的成本。
 			row.UsageNextSyncAt, row.UsageConsecutiveFails = 0, 0
-			row.UsageBackfillCursor, row.UsageBackfillDone = 0, false
-			row.UsageBackfillNextSyncAt, row.UsageBackfillConsecutiveFails = 0, 0
-			row.UsageBackfillLastError, row.UsageBackfillProgress = "", ""
-			row.UsageDataUntil = 0
 		}
 	}
 	if credentialSetChanged {
@@ -3052,7 +3170,7 @@ func (m *Monitor) saveChannelUpstreamHandler(c *gin.Context) {
 				return
 			}
 		}
-		clearUsage := existingErr == nil && (!sameIdentity || economicUnitChanged) && !(in.Provider == upstreamProviderAICodeWith && existing.Provider == upstreamProviderAICodeWith && existing.BaseURL == in.BaseURL)
+		clearUsage := existingErr == nil && !sameIdentity && !(in.Provider == upstreamProviderAICodeWith && existing.Provider == upstreamProviderAICodeWith && existing.BaseURL == in.BaseURL)
 		var persistErr error
 		recoverErrorLogAuth := row.Provider == upstreamProviderNewAPI && sameIdentity && credentialUpdated
 		if cred, ok := credential.(aiCodeWithCredential); ok && row.Provider == upstreamProviderAICodeWith && !preserveSealedCredential {
@@ -3105,7 +3223,7 @@ func (m *Monitor) saveChannelUpstreamHandler(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "保存上游配置失败"})
 		return
 	}
-	clearUsage := existingErr == nil && (!sameIdentity || economicUnitChanged) && !(in.Provider == upstreamProviderAICodeWith && existing.Provider == upstreamProviderAICodeWith && existing.BaseURL == in.BaseURL)
+	clearUsage := existingErr == nil && !sameIdentity && !(in.Provider == upstreamProviderAICodeWith && existing.Provider == upstreamProviderAICodeWith && existing.BaseURL == in.BaseURL)
 	var persistErr error
 	recoverErrorLogAuth := row.Provider == upstreamProviderNewAPI && sameIdentity && credentialUpdated
 	if cred, ok := credential.(aiCodeWithCredential); ok && row.Provider == upstreamProviderAICodeWith {

@@ -485,7 +485,7 @@ func (m *Monitor) buildCapacityReportFiltered(ctx context.Context, from, to, buc
 
 func (m *Monitor) readCapacityMetricsFiltered(ctx context.Context, from, to int64, channelID int, userID int64, group, model string, now int64) ([]capacityMinuteRow, []capacityDimensionRow, capacitySource, error) {
 	baseWhere := "bucket_ts >= ? AND bucket_ts < ? AND traffic_class_version = ?"
-	baseArgs := []any{from, to, userTrafficClassificationVersion}
+	baseArgs := []any{from, to, stabilityTrafficClassificationVersion}
 	where := baseWhere
 	args := append([]any{}, baseArgs...)
 	table := "metric_samples"
@@ -532,7 +532,7 @@ func (m *Monitor) readCapacityMetricsFiltered(ctx context.Context, from, to int6
 		}
 		if err := m.storeDB.WithContext(ctx).Raw(`SELECT DISTINCT bucket_ts FROM `+table+`
 			WHERE bucket_ts >= ? AND bucket_ts < ? AND traffic_class_version = ? ORDER BY bucket_ts`,
-			from, to, userTrafficClassificationVersion).Scan(&covered).Error; err != nil {
+			from, to, stabilityTrafficClassificationVersion).Scan(&covered).Error; err != nil {
 			return nil, nil, capacitySource{}, err
 		}
 		byMinute := make(map[int64]capacityMinuteRow, len(rows))
@@ -564,7 +564,7 @@ func (m *Monitor) readCapacityMetricsFiltered(ctx context.Context, from, to int6
 	}
 	var globalWatermark int64
 	if err := m.storeDB.WithContext(ctx).Raw(`SELECT COALESCE(MAX(bucket_ts),0) FROM `+table+`
-		WHERE traffic_class_version = ? AND bucket_ts < ?`, userTrafficClassificationVersion, to).Scan(&globalWatermark).Error; err != nil {
+		WHERE traffic_class_version = ? AND bucket_ts < ?`, stabilityTrafficClassificationVersion, to).Scan(&globalWatermark).Error; err != nil {
 		return nil, nil, capacitySource{}, err
 	}
 	note := "Rows 为当前筛选可判定的已覆盖分钟数；已排除渠道内部测试，数据缺口不会伪造成零流量。"
@@ -579,7 +579,7 @@ func (m *Monitor) readCapacityMetricsFiltered(ctx context.Context, from, to int6
 
 func (m *Monitor) capacityUserBreakdowns(ctx context.Context, from, to int64, channelID int, group, model string) ([]capacityBreakdown, []capacityOption, error) {
 	where := "bucket_ts >= ? AND bucket_ts < ? AND traffic_class_version = ?"
-	args := []any{from, to, userTrafficClassificationVersion}
+	args := []any{from, to, stabilityTrafficClassificationVersion}
 	if channelID != 0 {
 		where += " AND channel_id = ?"
 		args = append(args, capacityActualChannelID(channelID))

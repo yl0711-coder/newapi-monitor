@@ -983,7 +983,7 @@ func (m *Monitor) probeLocalOperationalState(parent context.Context, now int64) 
 	var completed int64
 	err := m.storeDB.WithContext(ctx).Model(&StabilityHourIngestState{}).
 		Where("hour_ts >= ? AND hour_ts < ? AND status = ? AND traffic_class_version = ?",
-			from, to, "complete", userTrafficClassificationVersion).Count(&completed).Error
+			from, to, "complete", stabilityTrafficClassificationVersion).Count(&completed).Error
 	bps := int64(0)
 	if err == nil {
 		if expected <= 0 {
@@ -1009,7 +1009,7 @@ func (m *Monitor) probeLocalOperationalState(parent context.Context, now int64) 
 	}
 
 	var problem StabilityProblemLiveCursor
-	if tx := m.storeDB.WithContext(ctx).First(&problem, "id = ? AND traffic_class_version = ?", 1, userTrafficClassificationVersion); tx.Error == nil {
+	if tx := m.storeDB.WithContext(ctx).First(&problem, "id = ? AND traffic_class_version = ?", 1, stabilityTrafficClassificationVersion); tx.Error == nil {
 		m.stabilityProblemCoverageTo.Store(problem.NextTs)
 		if problem.NextTs < problem.TargetThroughTs || problem.Status != "caught_up" {
 			m.stabilityProblemPending.Store(1)
@@ -1023,7 +1023,7 @@ func (m *Monitor) probeLocalOperationalState(parent context.Context, now int64) 
 
 	var incompleteProblemMigrations int64
 	migrationQuery := m.storeDB.WithContext(ctx).Model(&StabilityProblemClassificationMigration{}).
-		Where("id = ? AND traffic_class_version = ? AND status NOT IN ?", 1, userTrafficClassificationVersion,
+		Where("id = ? AND traffic_class_version = ? AND status NOT IN ?", 1, stabilityTrafficClassificationVersion,
 			[]string{"complete", "not_required"}).Count(&incompleteProblemMigrations)
 	// A local read error is not evidence that the migration is complete. Keep
 	// readiness degraded until the next successful probe can prove otherwise.

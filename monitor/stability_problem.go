@@ -74,7 +74,7 @@ func splitDistinctInts(s string) []int {
 func (m *Monitor) queryStabilityProblems(ctx context.Context, scope stabilityScope, limit int) (*StabilityProblemsResponse, error) {
 	db := m.storeDB.WithContext(ctx)
 	where := " WHERE p.bucket_ts >= ? AND p.bucket_ts < ? AND p.traffic_class_version = ?"
-	args := []any{scope.FromTs, scope.ToTs, userTrafficClassificationVersion}
+	args := []any{scope.FromTs, scope.ToTs, stabilityTrafficClassificationVersion}
 	if scope.Group != "" {
 		where += " AND p.grp = ?"
 		args = append(args, scope.Group)
@@ -164,7 +164,7 @@ func (m *Monitor) queryStabilityProblems(ctx context.Context, scope stabilitySco
 		COALESCE(SUM(CASE WHEN complete THEN 1 ELSE 0 END),0) complete,
 		COALESCE(SUM(CASE WHEN complete THEN 0 ELSE 1 END),0) pending
 		FROM stability_problem_ingest_states WHERE bucket_ts>=? AND bucket_ts<? AND traffic_class_version=?`,
-		coverageFrom, coverageTargetTo, userTrafficClassificationVersion).Scan(&coverage))
+		coverageFrom, coverageTargetTo, stabilityTrafficClassificationVersion).Scan(&coverage))
 	expectedMinutes := (coverageTargetTo - coverageFrom) / 60
 	uncoveredMinutes := expectedMinutes - coverage.Total
 	if uncoveredMinutes < 0 {

@@ -39,6 +39,13 @@ func TestHostContainerSnapshotBackwardCompatibility(t *testing.T) {
 	if rows[0].LastSeen < now-1 || rows[0].LastSeen > time.Now().Unix()+1 {
 		t.Fatalf("容器新鲜度必须使用服务端接收时间，不能被客户端未来时间污染: %+v", rows[0])
 	}
+	var metric InfraSample
+	if err := m.storeDB.Where("resource = ? AND metric = ?", "Node-A", "mem_total_mb").First(&metric).Error; err != nil {
+		t.Fatal(err)
+	}
+	if metric.BucketTs > time.Now().Unix()/60*60 {
+		t.Fatalf("主机指标水位不能使用客户端未来时间: %+v", metric)
+	}
 	// 旧 agent 不含 containers 字段，必须保留已有快照。
 	legacy := fmt.Sprintf(`{"node":"Node-A","ts":%d,"load1":0.5}`, now+60)
 	if w := postHost(t, m, legacy); w.Code != http.StatusOK {
@@ -57,6 +64,19 @@ func TestHostContainerSnapshotBackwardCompatibility(t *testing.T) {
 	m.storeDB.Model(&HostContainerSnapshot{}).Where("node = ?", "Node-A").Count(&count)
 	if count != 0 {
 		t.Fatalf("明确空列表应清空快照，剩余 %d", count)
+	}
+}
+
+func TestInfraSeriesMetricAllowlist(t *testing.T) {
+	for _, metric := range []string{"cpu", "mem_used_mb", "unhealthy_containers", "disk_used_pct"} {
+		if !validInfraSeriesMetric(metric) {
+			t.Fatalf("expected metric %q to be allowed", metric)
+		}
+	}
+	for _, metric := range []string{"", "sqlite_master", "cpu) OR 1=1"} {
+		if validInfraSeriesMetric(metric) {
+			t.Fatalf("unexpected metric %q accepted", metric)
+		}
 	}
 }
 

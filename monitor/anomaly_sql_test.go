@@ -10,11 +10,14 @@ import (
 // TestExpandAnomalyPredicates 守住三件事:
 //  1. 占位符全部被展开(SQL 里不留 {{}},否则打到生产库直接语法错);
 //  2. 列别名 anomaly_billed 等不被误伤(裸 ANOM 是它们的前缀);
-//  3. 判据用 completion_tokens 且排除天然无输出模型。
+//  3. 判据用 completion_tokens、请求路径和 quota，且排除天然无输出模型。
 func TestExpandAnomalyPredicates(t *testing.T) {
 	in := `SUM(type=2 AND {{ANOM}}) AS anomaly,
-SUM(type=2 AND {{ZERO}} AND prompt_tokens > 0) AS anomaly_billed,
-SUM(type=2 AND {{STREAMBAD}} AND NOT {{ZERO}}) AS anomaly_stream`
+SUM(type=2 AND {{ZERO}} AND quota > 0) AS anomaly_billed,
+SUM(type=2 AND {{STREAMBAD}} AND NOT {{ZERO}}) AS anomaly_stream,
+SUM(type=5 AND {{ERR4XX}}) AS err_4xx,
+SUM(type=5 AND {{ERR5XX}}) AS err_5xx,
+SUM(type=5 AND {{ERRTIMEOUT}}) AS err_timeout`
 	got := expandAnomalyPredicates(in)
 
 	if strings.Contains(got, "{{") || strings.Contains(got, "}}") {
@@ -32,8 +35,17 @@ SUM(type=2 AND {{STREAMBAD}} AND NOT {{ZERO}}) AS anomaly_stream`
 	if strings.Contains(got, "$.frt") {
 		t.Error("不得用 frt 判断是否交付")
 	}
-	if !strings.Contains(got, "embed|rerank") {
+	if !strings.Contains(got, "LOWER(COALESCE(model_name,'')) NOT LIKE '%embed%'") {
 		t.Error("必须排除天然无输出模型,否则 embedding 类会被整类误判成 B1")
+	}
+	if !strings.Contains(got, "$.request_path") || !strings.Contains(got, "/pg/chat/completions") {
+		t.Error("零输出异常必须以完整文本端点白名单为主判据")
+	}
+	if !strings.Contains(got, "quota > 0") || strings.Contains(got, "prompt_tokens > 0") {
+		t.Error("是否已扣费必须使用 quota，不能使用 prompt_tokens")
+	}
+	if !strings.Contains(got, "NOT (content REGEXP 'status_code=5') AND content REGEXP 'status_code=4'") {
+		t.Error("失败分类必须按 timeout > 5xx > 4xx 互斥")
 	}
 	// end_reason 必须走 JSON_EXTRACT:other 里的 end_error 自由文本可能含 panic 等词。
 	if !strings.Contains(got, "JSON_EXTRACT(other,'$.stream_status.end_reason')") {
@@ -89,7 +101,7 @@ func TestSampleWindowSQLPlaceholderCount(t *testing.T) {
 }
 
 func TestMergeMetricSamplePreservesOriginalAggregateSemantics(t *testing.T) {
-	dst := &MetricSample{BucketTs: 60, ChannelID: 9, ModelName: "m", Grp: "g", TrafficClassVersion: userTrafficClassificationVersion}
+	dst := &MetricSample{BucketTs: 60, ChannelID: 9, ModelName: "m", Grp: "g", TrafficClassVersion: stabilityTrafficClassificationVersion}
 	mergeMetricSample(dst, MetricSample{Success: 2, Failed: 1, Tokens: 100, SumUseTime: 7, MaxUseTime: 7,
 		Err4xx: 1, Lat2: 2, CompletionTokens: 40, Ttft1k: 2, TtftMaxMs: 900})
 	mergeMetricSample(dst, MetricSample{Success: 3, Anomaly: 1, Tokens: 300, SumUseTime: 11, MaxUseTime: 9,
@@ -206,6 +218,46 @@ func TestMetricFinalizeCursorRetriesBothProjectionsWithoutSkipping(t *testing.T)
 	}
 	if resumedFrom != wantStart+metricFinalizeSliceSec {
 		t.Fatalf("restart resumed at %d want %d", resumedFrom, wantStart+metricFinalizeSliceSec)
+	}
+}
+
+func TestMetricWindowCoverageFailsClosedAcrossSemanticsMigration(t *testing.T) {
+	m := newTestMonitor(t)
+	now := int64(2_000_000)
+	target := metricFinalizeTarget(now)
+	if err := m.storeDB.Create(&MetricSample{
+		BucketTs: target - 60, ChannelID: 1, ModelName: "legacy", Grp: "legacy",
+		Success: 1, TrafficClassVersion: stabilityTrafficClassificationVersion - 1,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	state, err := m.loadOrExtendMetricFinalizeState(now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantCoverageFrom := (target - metricMigrationLookbackSec) / 60 * 60
+	if state.CoverageFromTs != wantCoverageFrom || state.SemanticsVersion != stabilityTrafficClassificationVersion {
+		t.Fatalf("migration coverage state=%+v want_from=%d", state, wantCoverageFrom)
+	}
+	if complete, _, _ := m.metricWindowCoverage(now-6*3600, now); complete {
+		t.Fatal("partly migrated six-hour model window was presented as complete")
+	}
+	for _, minutes := range []int64{15, 30, 60} {
+		if complete, _, _ := m.metricWindowCoverage(target-minutes*60, now); complete {
+			t.Fatalf("partly migrated %d-minute model window was presented as complete", minutes)
+		}
+	}
+	if err := m.storeDB.Model(&MetricFinalizeState{}).Where("id = ?", state.ID).Updates(map[string]any{
+		"next_ts": target, "target_through_ts": target, "status": "caught_up",
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if complete, _, _ := m.metricWindowCoverage(now-6*3600, now); !complete {
+		t.Fatal("fully migrated six-hour model window remained unavailable")
+	}
+	compareFrom := now/3600*3600 - 192*3600
+	if complete, _, _ := m.metricWindowCoverage(compareFrom, now); complete {
+		t.Fatal("week-over-week comparison was enabled without historical v6 coverage")
 	}
 }
 

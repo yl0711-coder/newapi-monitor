@@ -286,7 +286,7 @@ func TestCapacityHandlerExcludesCurrentMinuteAndOldTrafficVersion(t *testing.T) 
 		{BucketTs: currentMinute - 120, ChannelID: 1, ModelName: "current", Grp: "g", Success: 3},
 		{BucketTs: currentMinute - 60, ChannelID: 8, ModelName: "other", Grp: "g", Success: 4},
 		{BucketTs: currentMinute, ChannelID: 1, ModelName: "incomplete", Grp: "g", Success: 99},
-		{BucketTs: currentMinute - 60, ChannelID: 2, ModelName: "old", Grp: "g", TrafficClassVersion: userTrafficClassificationVersion - 1, Success: 88},
+		{BucketTs: currentMinute - 60, ChannelID: 2, ModelName: "old", Grp: "g", TrafficClassVersion: stabilityTrafficClassificationVersion - 1, Success: 88},
 	}
 	if err := m.storeDB.Create(&rows).Error; err != nil {
 		t.Fatal(err)
@@ -342,7 +342,7 @@ func TestCapacityMetricPlanUsesBucketIndex(t *testing.T) {
 	type planRow struct{ Detail string }
 	var plan []planRow
 	err := m.storeDB.Raw(`EXPLAIN QUERY PLAN SELECT bucket_ts, SUM(success) FROM metric_samples
-		WHERE bucket_ts >= ? AND bucket_ts < ? AND traffic_class_version = ? GROUP BY bucket_ts`, 1, 2, userTrafficClassificationVersion).Scan(&plan).Error
+		WHERE bucket_ts >= ? AND bucket_ts < ? AND traffic_class_version = ? GROUP BY bucket_ts`, 1, 2, stabilityTrafficClassificationVersion).Scan(&plan).Error
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -362,7 +362,7 @@ func TestCapacityUserMetricPlanUsesUserAndBucketIndex(t *testing.T) {
 	var plan []planRow
 	err := m.storeDB.Raw(`EXPLAIN QUERY PLAN SELECT bucket_ts, SUM(success) FROM capacity_user_minute_samples
 		WHERE user_id = ? AND bucket_ts >= ? AND bucket_ts < ? AND traffic_class_version = ? GROUP BY bucket_ts`,
-		7, 1, 2, userTrafficClassificationVersion).Scan(&plan).Error
+		7, 1, 2, stabilityTrafficClassificationVersion).Scan(&plan).Error
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -42,3 +42,36 @@ func TestRollupAndCompare(t *testing.T) {
 		t.Errorf("应删 1 条过期小时汇总,实际 n=%d err=%v", n, err)
 	}
 }
+
+func TestRollupHourRangeRemovesStaleHourWhenNewSemanticsHasNoRows(t *testing.T) {
+	m := newTestMonitor(t)
+	const hour = int64(3_600_000)
+	if err := m.storeDB.Create(&HourSample{HourTs: hour, Success: 99, TrafficClassVersion: stabilityTrafficClassificationVersion - 1}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := m.rollupHourRange(hour, hour+3600); err != nil {
+		t.Fatal(err)
+	}
+	var count int64
+	if err := m.storeDB.Model(&HourSample{}).Where("hour_ts = ?", hour).Count(&count).Error; err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("stale hour survived zero-row rebuild: count=%d", count)
+	}
+}
+
+func TestBoundedHourSeriesPreservesProvenZeroTrafficHours(t *testing.T) {
+	m := newTestMonitor(t)
+	const start = int64(3_600_000)
+	if err := m.storeDB.Create(&HourSample{HourTs: start + 3600, Success: 7, TrafficClassVersion: stabilityTrafficClassificationVersion}).Error; err != nil {
+		t.Fatal(err)
+	}
+	points, err := m.storeHourSeriesRangeE(start, start+3*3600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(points) != 3 || points[0].Ts != start || points[0].Success != 0 || points[1].Success != 7 || points[2].Ts != start+2*3600 {
+		t.Fatalf("bounded series compressed zero-traffic hours: %+v", points)
+	}
+}

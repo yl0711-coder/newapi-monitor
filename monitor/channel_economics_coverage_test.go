@@ -68,7 +68,7 @@ func publishEconomicsCoverageFixture(t *testing.T, fixture economicsCoverageFixt
 	if fixture.withLocal {
 		if err := db.Create(&StabilityHourSample{
 			HourTs: hour, ChannelID: 59, ModelName: "gpt-5.5", Grp: "codex-1.2x",
-			TrafficClassVersion: userTrafficClassificationVersion, Success: 10, Quota: 1_000_000,
+			TrafficClassVersion: stabilityTrafficClassificationVersion, Success: 10, Quota: 1_000_000,
 		}).Error; err != nil {
 			t.Fatal(err)
 		}
@@ -76,13 +76,13 @@ func publishEconomicsCoverageFixture(t *testing.T, fixture economicsCoverageFixt
 	if fixture.unallocatedRefund {
 		if err := db.Create(&StabilityHourSample{
 			HourTs: hour, ChannelID: 0, ModelName: "refund", Grp: "",
-			TrafficClassVersion: userTrafficClassificationVersion, RefundRecords: 1, RefundQuota: 100_000,
+			TrafficClassVersion: stabilityTrafficClassificationVersion, RefundRecords: 1, RefundQuota: 100_000,
 		}).Error; err != nil {
 			t.Fatal(err)
 		}
 	}
 	if fixture.localVerified {
-		if err := db.Create(&StabilityHourIngestState{HourTs: hour, Status: "complete", TrafficClassVersion: userTrafficClassificationVersion}).Error; err != nil {
+		if err := db.Create(&StabilityHourIngestState{HourTs: hour, Status: "complete", TrafficClassVersion: stabilityTrafficClassificationVersion}).Error; err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -199,10 +199,10 @@ func TestChannelEconomicsRemapSupersedesOldAttributionWithoutDoubleCount(t *test
 	if err := db.Create(&ChannelSnap{ID: 59, BaseDomain: account.Domain}).Error; err != nil {
 		t.Fatal(err)
 	}
-	if err := db.Create(&StabilityHourSample{HourTs: hour, ChannelID: 59, ModelName: "gpt-5.5", Grp: "codex-1.2x", TrafficClassVersion: userTrafficClassificationVersion, Success: 10, Quota: 1_000_000}).Error; err != nil {
+	if err := db.Create(&StabilityHourSample{HourTs: hour, ChannelID: 59, ModelName: "gpt-5.5", Grp: "codex-1.2x", TrafficClassVersion: stabilityTrafficClassificationVersion, Success: 10, Quota: 1_000_000}).Error; err != nil {
 		t.Fatal(err)
 	}
-	if err := db.Create(&StabilityHourIngestState{HourTs: hour, Status: "complete", TrafficClassVersion: userTrafficClassificationVersion}).Error; err != nil {
+	if err := db.Create(&StabilityHourIngestState{HourTs: hour, Status: "complete", TrafficClassVersion: stabilityTrafficClassificationVersion}).Error; err != nil {
 		t.Fatal(err)
 	}
 	snapshot, _ := json.Marshal(channelFinanceVersionSnapshot{Domain: account.Domain, UpstreamRechargePaid: 1, UpstreamRechargeCredit: 1})
@@ -305,7 +305,7 @@ func TestChannelEconomicsGlobalRefundConservedAcrossDomains(t *testing.T) {
 		}
 		if err := db.Create(&StabilityHourSample{
 			HourTs: hour, ChannelID: domain.channelID, ModelName: "gpt-5.5", Grp: "codex",
-			TrafficClassVersion: userTrafficClassificationVersion, Success: 10, Quota: 1_000_000,
+			TrafficClassVersion: stabilityTrafficClassificationVersion, Success: 10, Quota: 1_000_000,
 		}).Error; err != nil {
 			t.Fatal(err)
 		}
@@ -322,12 +322,12 @@ func TestChannelEconomicsGlobalRefundConservedAcrossDomains(t *testing.T) {
 		}
 	}
 	if err := db.Create(&StabilityHourSample{
-		HourTs: hour, ChannelID: 0, ModelName: "refund", TrafficClassVersion: userTrafficClassificationVersion,
+		HourTs: hour, ChannelID: 0, ModelName: "refund", TrafficClassVersion: stabilityTrafficClassificationVersion,
 		RefundRecords: 1, RefundQuota: 100_000,
 	}).Error; err != nil {
 		t.Fatal(err)
 	}
-	if err := db.Create(&StabilityHourIngestState{HourTs: hour, Status: "complete", TrafficClassVersion: userTrafficClassificationVersion}).Error; err != nil {
+	if err := db.Create(&StabilityHourIngestState{HourTs: hour, Status: "complete", TrafficClassVersion: stabilityTrafficClassificationVersion}).Error; err != nil {
 		t.Fatal(err)
 	}
 	if err := db.Transaction(func(tx *gorm.DB) error {
@@ -385,7 +385,7 @@ func TestGlobalRefundChangeQueuesEveryDomainBeforeWatermarkAdvance(t *testing.T)
 	if err := db.Create(&ChannelEconomicsGlobalHourFact{HourTs: hour, SemanticsVersion: channelEconomicsSemanticsVersion, SourceHash: strings.Repeat("0", 64)}).Error; err != nil {
 		t.Fatal(err)
 	}
-	if err := db.Create(&StabilityHourSample{HourTs: hour, ChannelID: 0, ModelName: "refund", TrafficClassVersion: userTrafficClassificationVersion, RefundRecords: 1, RefundQuota: 100_000}).Error; err != nil {
+	if err := db.Create(&StabilityHourSample{HourTs: hour, ChannelID: 0, ModelName: "refund", TrafficClassVersion: stabilityTrafficClassificationVersion, RefundRecords: 1, RefundQuota: 100_000}).Error; err != nil {
 		t.Fatal(err)
 	}
 	if err := db.Transaction(func(tx *gorm.DB) error {

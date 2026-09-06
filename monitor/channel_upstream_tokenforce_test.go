@@ -170,7 +170,7 @@ func TestValidateTokenForceConfigurationRequiresOrgRefreshAndCurrencyUnit(t *tes
 	}
 }
 
-func TestTokenForceCurrencyUnitChangeArchivesAndRebuildsUsageNamespace(t *testing.T) {
+func TestTokenForceCurrencyUnitChangePreservesHistoricalUsage(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	now := time.Now().Unix()
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -197,7 +197,7 @@ func TestTokenForceCurrencyUnitChangeArchivesAndRebuildsUsageNamespace(t *testin
 	if w := upstreamRouteRequest(t, m, router, roleRoot, http.MethodPost, "/channels/upstream", initial); w.Code != http.StatusOK {
 		t.Fatalf("initial save status=%d body=%s", w.Code, w.Body.String())
 	}
-	if err := m.storeDB.Create(&ChannelUpstreamUsageHour{Domain: domain, HourTs: 3600, BucketSeconds: 3600, Requests: 1, Quota: 72, CostUSD: 10, Provider: upstreamProviderTokenForce}).Error; err != nil {
+	if err := m.storeDB.Create(&ChannelUpstreamUsageHour{Domain: domain, HourTs: 3600, BucketSeconds: 3600, Requests: 1, Quota: 72, CostUSD: 10, UnitPerUSD: 7.2, Provider: upstreamProviderTokenForce}).Error; err != nil {
 		t.Fatal(err)
 	}
 	changed := initial
@@ -220,8 +220,15 @@ func TestTokenForceCurrencyUnitChangeArchivesAndRebuildsUsageNamespace(t *testin
 	if err := m.storeDB.Model(&ChannelUpstreamUsageArchive{}).Where("domain = ?", domain).Count(&archiveCount).Error; err != nil {
 		t.Fatal(err)
 	}
-	if liveCount != 0 || archiveCount != 1 {
-		t.Fatalf("unit change did not atomically archive current usage: live=%d archive=%d", liveCount, archiveCount)
+	if liveCount != 2 || archiveCount != 0 {
+		t.Fatalf("unit change discarded immutable usage evidence: live=%d archive=%d", liveCount, archiveCount)
+	}
+	var usage ChannelUpstreamUsageHour
+	if err := m.storeDB.First(&usage, "domain = ? AND hour_ts = ?", domain, int64(3600)).Error; err != nil {
+		t.Fatal(err)
+	}
+	if usage.CostUSD != 10 || usage.UnitPerUSD != 7.2 || usage.Quota != 72 {
+		t.Fatalf("unit change rewrote historical usage evidence: %+v", usage)
 	}
 }
 

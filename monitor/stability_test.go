@@ -28,7 +28,7 @@ func TestReadyStatusKeepsDisabledRawProblemMigrationVisible(t *testing.T) {
 	m := newStabilityTestMonitor(t)
 	now := time.Date(2026, 8, 17, 12, 0, 0, 0, cstLocation).Unix()
 	state := StabilityProblemClassificationMigration{
-		ID: 1, TrafficClassVersion: userTrafficClassificationVersion,
+		ID: 1, TrafficClassVersion: stabilityTrafficClassificationVersion,
 		FromTs: now - 24*3600, ThroughTs: now, NextTs: now - 12*3600,
 		Status: "queued", CreatedAt: now - 3600, UpdatedAt: now - 60,
 	}
@@ -108,6 +108,20 @@ func TestStabilityRollupAndReportKeepsGroupChannelSemantics(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := m.rollupStabilityRejections(previousHour - 60); err != nil {
+		t.Fatal(err)
+	}
+	comparisonStates := make([]StabilityHourIngestState, 0, 24)
+	for hour := int64(0); hour < 24; hour++ {
+		requests := int64(0)
+		if hour == 10 {
+			requests = 100
+		}
+		comparisonStates = append(comparisonStates, StabilityHourIngestState{
+			HourTs: day - 86400 + hour*3600, Status: "complete", Requests: requests,
+			TrafficClassVersion: stabilityTrafficClassificationVersion,
+		})
+	}
+	if err := m.storeDB.Create(&comparisonStates).Error; err != nil {
 		t.Fatal(err)
 	}
 	// 重复 rollup 必须覆盖而不是翻倍。
@@ -467,7 +481,7 @@ func TestStabilityProblemMigrationAdaptiveBackoffPauseAndRetry(t *testing.T) {
 	m.cfg.StabilityClassificationMigrationEnabled = true
 	base := time.Date(2026, 2, 1, 0, 0, 0, 0, cstLocation).Unix()
 	state := StabilityProblemClassificationMigration{
-		ID: 1, TrafficClassVersion: userTrafficClassificationVersion,
+		ID: 1, TrafficClassVersion: stabilityTrafficClassificationVersion,
 		FromTs: base, ThroughTs: base + 12*60, NextTs: base, Status: "running",
 		CurrentSpanMinutes: 12, CreatedAt: base, UpdatedAt: base,
 	}
@@ -509,7 +523,7 @@ func TestStabilityProblemLiveFailureBackoffPersistsAndClearsOnProgress(t *testin
 	now := time.Now().Unix()
 	base := now/60*60 - 10*60
 	cursor := StabilityProblemLiveCursor{
-		ID: 1, TrafficClassVersion: userTrafficClassificationVersion,
+		ID: 1, TrafficClassVersion: stabilityTrafficClassificationVersion,
 		NextTs: base, TargetThroughTs: base + 60, Status: "running", UpdatedAt: now,
 	}
 	if err := m.storeDB.Create(&cursor).Error; err != nil {
@@ -537,7 +551,7 @@ func TestStabilityProblemLiveFailureBackoffPersistsAndClearsOnProgress(t *testin
 	}
 
 	if err := m.storeDB.Create(&StabilityProblemIngestState{
-		BucketTs: base, TrafficClassVersion: userTrafficClassificationVersion, Complete: true,
+		BucketTs: base, TrafficClassVersion: stabilityTrafficClassificationVersion, Complete: true,
 	}).Error; err != nil {
 		t.Fatal(err)
 	}
@@ -589,7 +603,7 @@ func TestStabilityProblemMigrationWorkerDoesNotWaitForMainSamplerTick(t *testing
 	base := time.Date(2026, 2, 1, 0, 0, 0, 0, cstLocation).Unix()
 	now := time.Now().Unix()
 	if err := m.storeDB.Create(&StabilityProblemClassificationMigration{
-		ID: 1, TrafficClassVersion: userTrafficClassificationVersion,
+		ID: 1, TrafficClassVersion: stabilityTrafficClassificationVersion,
 		FromTs: base, ThroughTs: base + 60, NextTs: base, Status: "running",
 		CurrentSpanMinutes: 1, CreatedAt: now, UpdatedAt: now,
 	}).Error; err != nil {
@@ -616,7 +630,7 @@ func TestStabilityProblemMigrationGateWaitDoesNotConsumeAttempt(t *testing.T) {
 	m := newStabilityTestMonitor(t)
 	base := time.Now().Unix()
 	state := StabilityProblemClassificationMigration{
-		ID: 1, TrafficClassVersion: userTrafficClassificationVersion,
+		ID: 1, TrafficClassVersion: stabilityTrafficClassificationVersion,
 		FromTs: base - 600, ThroughTs: base, NextTs: base - 600, Status: "running",
 		CurrentSpanMinutes: 3, Attempts: 4, CreatedAt: base - 1000, UpdatedAt: base - 100,
 	}
@@ -651,7 +665,7 @@ func TestStabilityProblemMigrationOnlyGateWaitUsesShortYield(t *testing.T) {
 			m := newStabilityTestMonitor(t)
 			base := time.Now().Unix()
 			state := StabilityProblemClassificationMigration{
-				ID: 1, TrafficClassVersion: userTrafficClassificationVersion,
+				ID: 1, TrafficClassVersion: stabilityTrafficClassificationVersion,
 				FromTs: base - 600, ThroughTs: base, NextTs: base - 600, Status: "running",
 				CurrentSpanMinutes: 3, Attempts: 4, CreatedAt: base - 1000, UpdatedAt: base - 100,
 			}
@@ -678,14 +692,14 @@ func TestStabilityProblemLiveLanePreemptsIndependentColdMigration(t *testing.T) 
 	liveMinute := time.Date(2026, 8, 17, 6, 0, 0, 0, cstLocation).Unix()
 	now := time.Now().Unix()
 	if err := m.storeDB.Create(&StabilityProblemClassificationMigration{
-		ID: 1, TrafficClassVersion: userTrafficClassificationVersion,
+		ID: 1, TrafficClassVersion: stabilityTrafficClassificationVersion,
 		FromTs: oldMinute, ThroughTs: oldMinute + 60, NextTs: oldMinute,
 		Status: "running", CreatedAt: now, UpdatedAt: now,
 	}).Error; err != nil {
 		t.Fatal(err)
 	}
 	if err := m.storeDB.Create(&StabilityProblemIngestState{
-		BucketTs: oldMinute, TrafficClassVersion: userTrafficClassificationVersion, Complete: false,
+		BucketTs: oldMinute, TrafficClassVersion: stabilityTrafficClassificationVersion, Complete: false,
 	}).Error; err != nil {
 		t.Fatal(err)
 	}
@@ -742,13 +756,13 @@ func TestStabilityProblemPendingUpgradeReplacesOldVersionCursorAndStage(t *testi
 	m := newStabilityTestMonitor(t)
 	bucket := time.Date(2026, 3, 1, 4, 0, 0, 0, cstLocation).Unix()
 	if err := m.storeDB.Create(&StabilityProblemIngestState{
-		BucketTs: bucket, TrafficClassVersion: userTrafficClassificationVersion - 1,
+		BucketTs: bucket, TrafficClassVersion: stabilityTrafficClassificationVersion - 1,
 		Complete: true, LastCreatedAt: bucket + 59, LastID: 99, RowsScanned: 5001,
 	}).Error; err != nil {
 		t.Fatal(err)
 	}
 	if err := m.storeDB.Create(&StabilityProblemStage{
-		BucketTs: bucket, TrafficClassVersion: userTrafficClassificationVersion - 1,
+		BucketTs: bucket, TrafficClassVersion: stabilityTrafficClassificationVersion - 1,
 		Source: "newapi", SignatureHash: "old", ChannelID: 1, ModelName: "m", Grp: "g", Count: 1,
 	}).Error; err != nil {
 		t.Fatal(err)
@@ -764,7 +778,7 @@ func TestStabilityProblemPendingUpgradeReplacesOldVersionCursorAndStage(t *testi
 	if err := m.storeDB.Model(&StabilityProblemStage{}).Where("bucket_ts = ?", bucket).Count(&stages).Error; err != nil {
 		t.Fatal(err)
 	}
-	if state.TrafficClassVersion != userTrafficClassificationVersion || state.Complete ||
+	if state.TrafficClassVersion != stabilityTrafficClassificationVersion || state.Complete ||
 		state.LastCreatedAt != 0 || state.LastID != 0 || state.RowsScanned != 0 || stages != 0 {
 		t.Fatalf("old cursor/stage blocked v5 paging: state=%+v stages=%d", state, stages)
 	}
@@ -958,7 +972,7 @@ func TestStabilityHealthUsesDurableLiveLagAndDisabledMigrationState(t *testing.T
 	now := time.Now().Unix()
 	m.lastRun.Store(now)
 	cursor := StabilityProblemLiveCursor{
-		ID: 1, TrafficClassVersion: userTrafficClassificationVersion,
+		ID: 1, TrafficClassVersion: stabilityTrafficClassificationVersion,
 		NextTs: now/60*60 - 30*60, TargetThroughTs: now/60*60 - 10*60,
 		Status: "running", LastSuccessAt: now, UpdatedAt: now,
 	}
@@ -966,7 +980,7 @@ func TestStabilityHealthUsesDurableLiveLagAndDisabledMigrationState(t *testing.T
 		t.Fatal(err)
 	}
 	migration := StabilityProblemClassificationMigration{
-		ID: 1, TrafficClassVersion: userTrafficClassificationVersion,
+		ID: 1, TrafficClassVersion: stabilityTrafficClassificationVersion,
 		FromTs: cursor.NextTs - 86400, ThroughTs: cursor.NextTs, NextTs: cursor.NextTs - 86400,
 		Status: "queued", CurrentSpanMinutes: 12, CreatedAt: now, UpdatedAt: now,
 	}
@@ -1137,7 +1151,11 @@ func TestStabilityComparisonUsesSameClockTimeOnPreviousCalendarDay(t *testing.T)
 func TestStabilityComparisonDoesNotPresentPartialPreviousPeriod(t *testing.T) {
 	m := newStabilityTestMonitor(t)
 	day := time.Date(2026, 8, 5, 0, 0, 0, 0, cstLocation).Unix()
-	if err := m.storeDB.Create(&StabilityHourSample{HourTs: day - 86400, ChannelID: 1, ModelName: "m", Grp: "g", Success: 100}).Error; err != nil {
+	rows := []StabilityHourSample{
+		{HourTs: day, ChannelID: 1, ModelName: "m", Grp: "g", Success: 90, Failed: 10},
+		{HourTs: day - 86400, ChannelID: 1, ModelName: "m", Grp: "g", Success: 100},
+	}
+	if err := m.storeDB.Create(&rows).Error; err != nil {
 		t.Fatal(err)
 	}
 	report, err := m.buildStabilityReport(context.Background(), stabilityScope{FromTs: day, ToTs: day + 12*3600}, day+12*3600)
@@ -1146,6 +1164,18 @@ func TestStabilityComparisonDoesNotPresentPartialPreviousPeriod(t *testing.T) {
 	}
 	if report.Meta.ComparisonAvailable || report.Meta.ComparisonCoverage.Complete || report.Meta.ComparisonCoverage.MissingHours != 12 {
 		t.Fatalf("有部分历史行但无完整台账时不得展示环比: %+v", report.Meta)
+	}
+	if report.DeltaPP != nil || len(report.Groups) != 1 || report.Groups[0].DeltaPP != nil {
+		t.Fatalf("incomplete comparison leaked total/group delta: total=%v groups=%+v", report.DeltaPP, report.Groups)
+	}
+	g := report.Groups[0]
+	if len(g.Channels) != 1 || g.Channels[0].DeltaPP != nil || len(g.Models) != 1 || g.Models[0].DeltaPP != nil || len(g.Channels[0].Models) != 1 || g.Channels[0].Models[0].DeltaPP != nil {
+		t.Fatalf("incomplete comparison leaked nested delta: %+v", g)
+	}
+	for name, ranking := range map[string][]StabilityRankItem{"groups": report.Rankings.Groups, "channels": report.Rankings.Channels, "models": report.Rankings.Models} {
+		if len(ranking) != 1 || ranking[0].DeltaPP != nil {
+			t.Fatalf("incomplete comparison leaked %s ranking delta: %+v", name, ranking)
+		}
 	}
 }
 

@@ -258,6 +258,7 @@ var logChainTextCompletionPaths = []string{
 	"/v1/responses",
 	"/v1/messages",
 	"/v1/completions",
+	"/pg/chat/completions",
 }
 
 // logChainNoOutputModelKeywords 文本端点上仍可能不产出 token 的模型关键词。

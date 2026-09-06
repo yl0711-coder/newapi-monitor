@@ -47,10 +47,10 @@ func TestLatestCloudWatchMetricUsesNewestPointAndNormalizesUnit(t *testing.T) {
 		{Timestamp: &newest, Average: aws.Float64(20 * 1048576)},
 		{Timestamp: &old, Average: aws.Float64(10 * 1048576)},
 	}}}
-	value, ok, err := latestCloudWatchMetric(context.Background(), fake, "AWS/RDS", "FreeableMemory",
+	value, observedAt, ok, err := latestCloudWatchMetric(context.Background(), fake, "AWS/RDS", "FreeableMemory",
 		[]cwtypes.Dimension{{Name: aws.String("DBInstanceIdentifier"), Value: aws.String("db")}}, cwtypes.StatisticAverage, 1048576)
-	if err != nil || !ok || value != 20 {
-		t.Fatalf("value=%v ok=%v err=%v", value, ok, err)
+	if err != nil || !ok || value != 20 || observedAt != 180 {
+		t.Fatalf("value=%v observed_at=%d ok=%v err=%v", value, observedAt, ok, err)
 	}
 	if aws.ToString(fake.input.Namespace) != "AWS/RDS" || aws.ToString(fake.input.MetricName) != "FreeableMemory" || aws.ToInt32(fake.input.Period) != 300 {
 		t.Fatalf("unexpected CloudWatch request: %+v", fake.input)

@@ -39,7 +39,7 @@ func (metricSample) TableName() string { return "metric_samples" }
 
 func (s *metricSample) BeforeCreate(_ *gorm.DB) error {
 	if s.TrafficClassVersion == 0 {
-		s.TrafficClassVersion = trafficclass.Current
+		s.TrafficClassVersion = trafficclass.DeliveryCurrent
 	}
 	return nil
 }
@@ -123,7 +123,7 @@ func TestPublicBoardFailsClosedOnOldTrafficClassification(t *testing.T) {
 	now := int64(1_900_000_000)
 	if err := db.Create(&metricSample{
 		BucketTs: now - 60, ChannelID: 1, ModelName: "old", Grp: "g1",
-		TrafficClassVersion: trafficclass.Current - 1, Success: 10,
+		TrafficClassVersion: trafficclass.DeliveryCurrent - 1, Success: 10,
 	}).Error; err != nil {
 		t.Fatal(err)
 	}

@@ -11,6 +11,20 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+func TestNormalizeSLOBurnWindowsUsesWholeHours(t *testing.T) {
+	m := &Monitor{cfg: Settings{RetentionDays: 7}}
+	cfg := AlertConfig{SLOWindowDays: 7, BurnFastWindowMin: 30, BurnSlowWindowMin: 90}
+	m.normalizeSLOWindow(&cfg)
+	if cfg.BurnFastWindowMin != 60 || cfg.BurnSlowWindowMin != 360 {
+		t.Fatalf("sub-hour/fractional-hour burn windows must normalize to safe defaults: %+v", cfg)
+	}
+	cfg.BurnFastWindowMin, cfg.BurnSlowWindowMin = 120, 8*24*60
+	m.normalizeSLOWindow(&cfg)
+	if cfg.BurnFastWindowMin != 120 || cfg.BurnSlowWindowMin != 360 {
+		t.Fatalf("valid whole-hour window or retention overflow normalized incorrectly: %+v", cfg)
+	}
+}
+
 // 验证报警配置接口:默认值、保存、密码不回显、留空保留原密码。不连生产库。
 func TestAlertConfigRoundtrip(t *testing.T) {
 	gin.SetMode(gin.TestMode)
@@ -170,6 +184,19 @@ func TestUpstreamBalancePolicyPersistsAndNormalizes(t *testing.T) {
 		got.UpstreamBalanceMinCoverage != want.UpstreamBalanceMinCoverage ||
 		got.UpstreamBalanceCooldownMin != want.UpstreamBalanceCooldownMin {
 		t.Fatalf("越界配置未回落到安全默认值: %+v", got)
+	}
+}
+
+func TestSLOWindowCannotExceedMinuteRetention(t *testing.T) {
+	m := newTestMonitor(t)
+	m.cfg.RetentionDays = 3
+	c := defaultAlertConfig()
+	c.SLOWindowDays = 30
+	if err := m.saveAlertConfig(c); err != nil {
+		t.Fatal(err)
+	}
+	if got := m.loadAlertConfig().SLOWindowDays; got != 3 {
+		t.Fatalf("SLO label would exceed available minute facts: got %d want 3", got)
 	}
 }
 

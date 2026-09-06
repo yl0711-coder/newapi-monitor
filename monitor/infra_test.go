@@ -84,6 +84,10 @@ func TestInfraStatusThresholds(t *testing.T) {
 		{"db-mem-bad", InfraResource{Type: "database", Metrics: map[string]float64{"mem_avail_pct": 10}}, "bad"},
 		// DB 可用内存 20% 在 warn(25%)与 bad(15%)之间 → warn
 		{"db-mem-warn", InfraResource{Type: "database", Metrics: map[string]float64{"mem_avail_pct": 20}}, "warn"},
+		// RDS 不提供总内存时使用绝对可用内存阈值。
+		{"rds-mem-bad-absolute", InfraResource{Type: "database", Metrics: map[string]float64{"free_mem_mb": 200}}, "bad"},
+		{"rds-mem-warn-absolute", InfraResource{Type: "database", Metrics: map[string]float64{"free_mem_mb": 400}}, "warn"},
+		{"rds-mem-ok-absolute", InfraResource{Type: "database", Metrics: map[string]float64{"free_mem_mb": 900}}, "ok"},
 		// DB 存储可用 10% < bad 15% → bad
 		{"db-storage-bad", InfraResource{Type: "database", Metrics: map[string]float64{"storage_avail_pct": 10}}, "bad"},
 		// DB CPU 90% > bad 85% → bad
@@ -104,6 +108,138 @@ func TestInfraStatusThresholds(t *testing.T) {
 		if got := m.infraStatus(c.r); got != c.want {
 			t.Errorf("%s: 期望 %s, 得 %s", c.name, c.want, got)
 		}
+	}
+}
+
+func TestCriticalStaleMetricsExcludesOptionalTelemetry(t *testing.T) {
+	got := criticalStaleMetrics([]string{"net_out_kb", "cpu", "free_mem_mb", "disk_queue"})
+	if len(got) != 2 || got[0] != "cpu" || got[1] != "free_mem_mb" {
+		t.Fatalf("unexpected critical stale metrics: %v", got)
+	}
+}
+
+func TestMergeInfraTargetsKeepsExplicitAndDiscoversNewResources(t *testing.T) {
+	explicit := parseInfraTargets("instance:old-node,database:db-a,invalid:x,lb:")
+	discovered := []infraTarget{
+		{name: "old-node", rtype: "instance", memTotalMB: 2048},
+		{name: "new-node", rtype: "instance", memTotalMB: 1024},
+	}
+	got := mergeInfraTargets(explicit, discovered)
+	if len(got) != 3 {
+		t.Fatalf("expected explicit union discovered, got %+v", got)
+	}
+	if got[0].name != "old-node" || got[0].memTotalMB != 2048 {
+		t.Fatalf("discovery should enrich explicit target: %+v", got[0])
+	}
+	if got[2].name != "new-node" {
+		t.Fatalf("newly discovered target missing: %+v", got)
+	}
+}
+
+func TestInfraSnapshotDoesNotPresentStaleMetricAsHealthy(t *testing.T) {
+	m := newTestMonitor(t)
+	m.cfg.InfraSampleSeconds = 300
+	now := int64(1_800_000_000)
+	currentBucket := now / 60 * 60
+	oldBucket := currentBucket - 3600
+	if err := m.upsertInfra([]InfraSample{
+		{BucketTs: currentBucket, Resource: "Node-Stale", RType: "instance", Metric: "status_failed", Value: 0},
+		{BucketTs: oldBucket, Resource: "Node-Stale", RType: "instance", Metric: "cpu", Value: 5},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	snap := m.computeInfraSnapshot(now)
+	if len(snap.Instances) != 1 {
+		t.Fatalf("unexpected instances: %+v", snap.Instances)
+	}
+	got := snap.Instances[0]
+	if got.Status != "warn" || len(got.StaleMetrics) != 1 || got.StaleMetrics[0] != "cpu" {
+		t.Fatalf("stale metric must make resource visibly incomplete: %+v", got)
+	}
+	if _, exists := got.Metrics["cpu"]; exists {
+		t.Fatalf("stale CPU must not participate in health calculation: %+v", got.Metrics)
+	}
+	if snap.Overview.Status != "warn" {
+		t.Fatalf("incomplete resource must propagate to overview: %+v", snap.Overview)
+	}
+}
+
+func TestInfraSnapshotDoesNotPresentNeverObservedRequiredMetricsAsHealthy(t *testing.T) {
+	m := newTestMonitor(t)
+	now := int64(1_800_000_000)
+	bucket := now / 60 * 60
+	if err := m.upsertInfra([]InfraSample{
+		// Discovery/static rows alone must not prove workload health.
+		{BucketTs: bucket, Resource: "Node-Only-Static", RType: "instance", Metric: "mem_total_mb", Value: 2048},
+		{BucketTs: bucket, Resource: "rds/prod", RType: "database", Metric: "available", Value: 1},
+		{BucketTs: bucket, Resource: "ecs/prod/api", RType: "ecs_service", Metric: "desired", Value: 2},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	snap := m.computeInfraSnapshot(now)
+	if len(snap.Instances) != 2 || len(snap.Databases) != 1 {
+		t.Fatalf("unexpected resources: instances=%+v db=%+v", snap.Instances, snap.Databases)
+	}
+	for _, resource := range append(append([]InfraResource{}, snap.Instances...), snap.Databases...) {
+		if resource.Status == "ok" || resource.CoverageComplete || len(resource.MissingMetrics) == 0 {
+			t.Fatalf("incomplete resource must not look healthy: %+v", resource)
+		}
+	}
+}
+
+func TestOptionalStaleInfraMetricDoesNotDowngradeCompleteResource(t *testing.T) {
+	m := newTestMonitor(t)
+	m.cfg.InfraSampleSeconds = 300
+	now := int64(1_800_000_000)
+	current := now / 60 * 60
+	old := current - 3600
+	if err := m.upsertInfra([]InfraSample{
+		{BucketTs: current, Resource: "alb/prod", RType: "lb", Metric: "status_failed", Value: 0},
+		{BucketTs: current, Resource: "alb/prod", RType: "lb", Metric: "healthy", Value: 5},
+		{BucketTs: current, Resource: "alb/prod", RType: "lb", Metric: "unhealthy", Value: 0},
+		{BucketTs: old, Resource: "alb/prod", RType: "lb", Metric: "resp_ms", Value: 100},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	snap := m.computeInfraSnapshot(now)
+	if len(snap.LoadBalancers) != 1 {
+		t.Fatalf("unexpected load balancers: %+v", snap.LoadBalancers)
+	}
+	got := snap.LoadBalancers[0]
+	if got.Status != "ok" || !got.CoverageComplete || len(got.StaleMetrics) != 1 || got.StaleMetrics[0] != "resp_ms" {
+		t.Fatalf("optional stale telemetry must remain auditable without false warning: %+v", got)
+	}
+	if got.AgeSec > 60 {
+		t.Fatalf("stale optional metric must not make a healthy resource look old: %+v", got)
+	}
+}
+
+func TestInfraDiscoveryFailureIsVisibleAndPropagatesToOverview(t *testing.T) {
+	m := newTestMonitor(t)
+	now := int64(1_800_000_000)
+	bucket := now / 60 * 60
+	rows := append(managedDiscoveryRows(bucket, "ECS/Fargate", false, 0), managedDiscoveryRows(bucket, "RDS", true, 2)...)
+	if err := m.upsertInfra(rows); err != nil {
+		t.Fatal(err)
+	}
+	snap := m.computeInfraSnapshot(now)
+	if len(snap.Discoveries) != 2 || snap.Overview.DiscoveryTotal != 2 || snap.Overview.DiscoveryOK != 1 {
+		t.Fatalf("discovery state was not exposed: %+v", snap)
+	}
+	if snap.Overview.Status != "bad" {
+		t.Fatalf("failed AWS inventory discovery must prevent an all-green overview: %+v", snap.Overview)
+	}
+	if len(snap.Instances) != 0 || len(snap.Databases) != 0 || len(snap.LoadBalancers) != 0 {
+		t.Fatalf("inventory sentinel leaked into resource lists: %+v", snap)
+	}
+}
+
+func TestWorstDoesNotLetHealthyResourceHideMissingCoverage(t *testing.T) {
+	if got := worst("ok", "nosample"); got != "nosample" {
+		t.Fatalf("healthy resource hid missing coverage: got=%q", got)
+	}
+	if got := worst("nosample", "warn"); got != "warn" {
+		t.Fatalf("real warning must remain more severe than missing coverage: got=%q", got)
 	}
 }
 

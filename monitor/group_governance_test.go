@@ -159,7 +159,7 @@ func TestGroupGovernanceActivityUsesCompletenessLedgerAndIncludesRejections(t *t
 	hour := now.Unix()/3600*3600 - 3600
 	if err := m.storeDB.Create(&StabilityHourSample{
 		HourTs: hour, ChannelID: 1, ModelName: "gpt", Grp: "vip",
-		TrafficClassVersion: userTrafficClassificationVersion, Success: 2,
+		TrafficClassVersion: stabilityTrafficClassificationVersion, Success: 2,
 	}).Error; err != nil {
 		t.Fatal(err)
 	}
@@ -177,7 +177,7 @@ func TestGroupGovernanceActivityUsesCompletenessLedgerAndIncludesRejections(t *t
 		if ts == hour {
 			requests = 2
 		}
-		states = append(states, StabilityHourIngestState{HourTs: ts, Status: "complete", Requests: requests, TrafficClassVersion: userTrafficClassificationVersion})
+		states = append(states, StabilityHourIngestState{HourTs: ts, Status: "complete", Requests: requests, TrafficClassVersion: stabilityTrafficClassificationVersion})
 	}
 	if err := m.storeDB.CreateInBatches(states, 200).Error; err != nil {
 		t.Fatal(err)

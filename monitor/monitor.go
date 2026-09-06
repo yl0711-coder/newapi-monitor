@@ -73,6 +73,8 @@ type Monitor struct {
 	problemLastFailure        atomic.Int64 // 原始错误采集器最近一次失败
 	problemLiveThrough        atomic.Int64 // 原始错误实时 lane 已确认到的分钟右水位
 	stabilityBackfillRunning  atomic.Bool  // 长期小时补数串行闸门；人工任务与自动修洞共用
+	metricBackfillMu          sync.RWMutex
+	metricBackfillStatus      MetricBackfillStatus
 	usageFactsHistoryRestarts atomic.Int64 // 全历史持久 worker panic/意外退出后的守护重启次数
 	ctxMu                     sync.RWMutex
 	backgroundCtx             context.Context // Start 注入；后台任务不绑定浏览器请求生命周期
@@ -967,27 +969,32 @@ type CompareStat struct {
 
 // Snapshot 是一次完整看板快照:总览 + 分组 / 渠道 / 模型 / 令牌明细 + 趋势 + SLO + 同比环比。
 type Snapshot struct {
-	WindowMinutes  int            `json:"window_minutes"`
-	GeneratedAt    string         `json:"generated_at"`
-	SamplingActive bool           `json:"sampling_active"`
-	DataAgeSec     int64          `json:"data_age_sec"`
-	Summary        Summary        `json:"summary"`
-	ByGroup        []Row          `json:"by_group"`
-	ByChannel      []Row          `json:"by_channel"`
-	ByModel        []Row          `json:"by_model"`
-	ByToken        []TokenRow     `json:"by_token"`
-	Trend          []TimePoint    `json:"trend"`
-	SLO            SLOStatus      `json:"slo"`
-	Compare        CompareStat    `json:"compare"`
-	Rejections     []RejectionRow `json:"rejections"`     // 前置拒绝(采集器旁路采集,logs 盲区)
-	RejectEnabled  bool           `json:"reject_enabled"` // 超管是否开启「被拒请求」面板
+	WindowMinutes    int            `json:"window_minutes"`
+	GeneratedAt      string         `json:"generated_at"`
+	SamplingActive   bool           `json:"sampling_active"`
+	DataAgeSec       int64          `json:"data_age_sec"`
+	DataComplete     bool           `json:"data_complete"`
+	CoverageFromTs   int64          `json:"coverage_from_ts,omitempty"`
+	CoverageToTs     int64          `json:"coverage_to_ts,omitempty"`
+	Summary          Summary        `json:"summary"`
+	ByGroup          []Row          `json:"by_group"`
+	ByChannel        []Row          `json:"by_channel"`
+	ByModel          []Row          `json:"by_model"`
+	ByToken          []TokenRow     `json:"by_token"`
+	Trend            []TimePoint    `json:"trend"`
+	SLO              SLOStatus      `json:"slo"`
+	Compare          CompareStat    `json:"compare"`
+	CompareAvailable bool           `json:"compare_available"`
+	Rejections       []RejectionRow `json:"rejections"`     // 前置拒绝(采集器旁路采集,logs 盲区)
+	RejectEnabled    bool           `json:"reject_enabled"` // 超管是否开启「被拒请求」面板
 }
 
-// attachSpark 给每行挂上对应维度取值的分钟桶时序(失败则静默跳过)。
-func (m *Monitor) attachSpark(rows []Row, dimCol string, since int64, windowMinutes int) {
-	series, err := m.storeDimSeries(dimCol, since, windowMinutes)
+// attachSpark 给每行挂上对应维度取值的分钟桶时序。Spark 还用于
+// AnomalyBurst 健康升级，因此读取失败必须阻止快照声称完整。
+func (m *Monitor) attachSpark(rows []Row, dimCol string, since, until int64, windowMinutes int) error {
+	series, err := m.storeDimSeriesRange(dimCol, since, until, windowMinutes)
 	if err != nil {
-		return
+		return err
 	}
 	for i := range rows {
 		if s := series[rows[i].Key]; s != nil {
@@ -999,6 +1006,7 @@ func (m *Monitor) attachSpark(rows []Row, dimCol string, since int64, windowMinu
 			}
 		}
 	}
+	return nil
 }
 
 // anomalyBurst 判断异常是否"成簇/连续":连续 ≥n 个采样桶都有异常。
@@ -1068,18 +1076,34 @@ func (m *Monitor) computeSnapshot(windowMinutes int, nowUnix int64) (*Snapshot, 
 	if windowMinutes <= 0 {
 		windowMinutes = 60
 	}
-	since := nowUnix - int64(windowMinutes)*60
+	// 快照与覆盖证据必须是同一个已完结区间。实时 lane
+	// 继续采样，但不与延迟签收数据混在一个“完整”快照中。
+	until := metricFinalizeTarget(nowUnix)
+	since := until - int64(windowMinutes)*60
 	windowSec := float64(windowMinutes) * 60
+	coverageComplete, coverageFrom, coverageTo := m.metricWindowCoverage(since, nowUnix)
+	if !coverageComplete {
+		lastBucket := m.storeFreshness()
+		age := int64(-1)
+		if lastBucket > 0 {
+			age = max(int64(0), nowUnix-(lastBucket+60))
+		}
+		return &Snapshot{
+			WindowMinutes: windowMinutes, GeneratedAt: time.Unix(nowUnix, 0).Format("2006-01-02 15:04:05"),
+			SamplingActive: age >= 0 && m.LastSampleRun() > nowUnix-int64(m.cfg.SampleSeconds)*3,
+			DataAgeSec:     age, DataComplete: false, CoverageFromTs: coverageFrom, CoverageToTs: coverageTo,
+		}, nil
+	}
 
-	sum, err := m.storeSummary(since, windowSec)
+	sum, err := m.storeSummaryRange(since, until, windowSec)
 	if err != nil {
 		return nil, err
 	}
-	grp, err := m.storeDim("grp", since, windowSec)
+	grp, err := m.storeDimRange("grp", since, until, windowSec)
 	if err != nil {
 		return nil, err
 	}
-	ch, err := m.storeDim("channel_id", since, windowSec)
+	ch, err := m.storeDimRange("channel_id", since, until, windowSec)
 	if err != nil {
 		return nil, err
 	}
@@ -1091,54 +1115,71 @@ func (m *Monitor) computeSnapshot(windowMinutes int, nowUnix int64) (*Snapshot, 
 			ch[i].Label = "#" + ch[i].Key
 		}
 	}
-	md, err := m.storeDim("model_name", since, windowSec)
+	md, err := m.storeDimRange("model_name", since, until, windowSec)
 	if err != nil {
 		return nil, err
 	}
-	trend, err := m.storeTrend(since, windowMinutes)
+	trend, err := m.storeTrendRange(since, until, windowMinutes)
 	if err != nil {
 		return nil, err
 	}
 	// 给每行挂上迷你趋势(sparkline)序列
-	m.attachSpark(grp, "grp", since, windowMinutes)
-	m.attachSpark(ch, "channel_id", since, windowMinutes)
-	m.attachSpark(md, "model_name", since, windowMinutes)
+	if err := m.attachSpark(grp, "grp", since, until, windowMinutes); err != nil {
+		return nil, err
+	}
+	if err := m.attachSpark(ch, "channel_id", since, until, windowMinutes); err != nil {
+		return nil, err
+	}
+	if err := m.attachSpark(md, "model_name", since, until, windowMinutes); err != nil {
+		return nil, err
+	}
 
-	tokens, terr := m.storeTokens(since, windowSec)
+	tokens, terr := m.storeTokensRange(since, until, windowSec)
 	if terr != nil {
-		tokens = nil // token 维度失败不影响主看板
+		return nil, terr
 	}
 	ac := m.loadAlertConfig()
 	slo := m.computeSLO(ac, nowUnix)
-	compare := m.storeCompare(nowUnix)
+	compareFrom, _ := metricCompareRange(nowUnix)
+	compareAvailable, _, _ := m.metricHourWindowCoverage(compareFrom, nowUnix)
+	compare := CompareStat{}
+	if compareAvailable {
+		compare, err = m.storeCompareE(nowUnix)
+		if err != nil {
+			return nil, err
+		}
+	}
 	var rejections []RejectionRow
 	if ac.RejectPanelEnabled { // 关闭时不查、不下发,面板隐藏
-		rejections = m.storeRejections(nowUnix - int64(windowMinutes)*60)
+		rejections = m.storeRejectionsRange(since, until)
 	}
 
 	lastBucket := m.storeFreshness()
-	age := int64(-1)
-	if lastBucket > 0 {
-		age = nowUnix - (lastBucket + 60)
-		if age < 0 {
-			age = 0
-		}
-	}
+	liveAvailable := lastBucket > 0
+	// data_age_sec 表达这份签收快照的截止时间，不能用更新的
+	// provisional 采样冒充快照新鲜度。
+	age := max(int64(0), nowUnix-until)
 
 	return &Snapshot{
-		WindowMinutes:  windowMinutes,
-		GeneratedAt:    time.Unix(nowUnix, 0).Format("2006-01-02 15:04:05"),
-		SamplingActive: m.LastSampleRun() > nowUnix-int64(m.cfg.SampleSeconds)*3,
-		DataAgeSec:     age,
-		Summary:        *sum,
-		ByGroup:        grp,
-		ByChannel:      ch,
-		ByModel:        md,
-		ByToken:        tokens,
-		Trend:          trend,
-		SLO:            slo,
-		Compare:        compare,
-		Rejections:     rejections,
-		RejectEnabled:  ac.RejectPanelEnabled,
+		WindowMinutes: windowMinutes,
+		GeneratedAt:   time.Unix(nowUnix, 0).Format("2006-01-02 15:04:05"),
+		// 查询成功但本地从未形成过任何事实，不能向用户表达成“采样正常”。
+		// 这既覆盖新环境尚无流量，也能把迁库/权限错误造成的空结果显式暴露出来。
+		SamplingActive:   liveAvailable && m.LastSampleRun() > nowUnix-int64(m.cfg.SampleSeconds)*3,
+		DataAgeSec:       age,
+		DataComplete:     true,
+		CoverageFromTs:   since,
+		CoverageToTs:     until,
+		Summary:          *sum,
+		ByGroup:          grp,
+		ByChannel:        ch,
+		ByModel:          md,
+		ByToken:          tokens,
+		Trend:            trend,
+		SLO:              slo,
+		Compare:          compare,
+		CompareAvailable: compareAvailable,
+		Rejections:       rejections,
+		RejectEnabled:    ac.RejectPanelEnabled,
 	}, nil
 }

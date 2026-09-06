@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"sort"
 	"strings"
 	"time"
 
@@ -120,20 +121,24 @@ func (m *Monitor) sampleInfra(ctx context.Context) {
 	// 暂未授权也 fail-open，不得阻断已有 Lightsail 数据。
 	cctx, cancel := context.WithTimeout(ctx, 120*time.Second)
 	defer cancel()
+	bucket := time.Now().Unix() / 60 * 60
 	cl, err := m.lightsailClient(cctx)
 	if err != nil {
-		slog.Warn("infra: AWS 客户端初始化失败(忽略本轮)", "err", err)
+		slog.Warn("infra: Lightsail 客户端初始化失败", "err", err)
+		rows := append(append(managedDiscoveryRows(bucket, "Lightsail/实例", false, 0), managedDiscoveryRows(bucket, "Lightsail/数据库", false, 0)...), managedDiscoveryRows(bucket, "Lightsail/负载均衡", false, 0)...)
+		if storeErr := m.upsertInfra(rows); storeErr != nil {
+			slog.Warn("infra: Lightsail 发现失败状态入库失败", "err", storeErr)
+		}
 	} else {
-		targets := m.infraTargets(cctx, cl)
+		targets, discoveryRows := m.infraTargetsWithDiscovery(cctx, cl, bucket)
 		if len(targets) == 0 {
 			slog.Warn("infra: Lightsail 自动发现为空且未配 MONITOR_INFRA_RESOURCES")
 		}
-		bucket := time.Now().Unix() / 60 * 60
-		var rows []InfraSample
+		rows := append([]InfraSample{}, discoveryRows...)
 		for _, t := range targets {
 			for _, sp := range specsFor(t.rtype) {
-				if v, ok := m.fetchMetric(cctx, cl, t, sp); ok {
-					rows = append(rows, InfraSample{BucketTs: bucket, Resource: t.name, RType: t.rtype, Metric: sp.key, Value: v})
+				if v, observedAt, ok := m.fetchMetric(cctx, cl, t, sp); ok {
+					rows = append(rows, InfraSample{BucketTs: observedAt, Resource: t.name, RType: t.rtype, Metric: sp.key, Value: v})
 				}
 			}
 			// 合成「硬件总量」指标(来自资源发现时 AWS 已返回的规格,不额外调 API),
@@ -156,19 +161,17 @@ func (m *Monitor) sampleInfra(ctx context.Context) {
 	m.sampleManagedAWSInfra(cctx, time.Now().Unix()/60*60)
 }
 
-// infraTargets 决定监控哪些资源:显式配置(MONITOR_INFRA_RESOURCES)优先,否则自动发现。
+// infraTargets 将显式配置与自动发现取并集。显式项用于兜底，但不能阻止后来新增的
+// Lightsail 资源进入监控；需要排除的资源只能通过 MONITOR_INFRA_EXCLUDE_RESOURCES 表达。
 func (m *Monitor) infraTargets(ctx context.Context, cl *lightsail.Client) []infraTarget {
-	if s := strings.TrimSpace(m.cfg.InfraResources); s != "" {
-		var out []infraTarget
-		for _, part := range strings.Split(s, ",") {
-			kv := strings.SplitN(strings.TrimSpace(part), ":", 2)
-			if len(kv) == 2 && kv[0] != "" && kv[1] != "" {
-				out = append(out, infraTarget{name: kv[1], rtype: kv[0]})
-			}
-		}
-		return m.filterInfraTargets(out)
-	}
-	var out []infraTarget
+	targets, _ := m.infraTargetsWithDiscovery(ctx, cl, time.Now().Unix()/60*60)
+	return targets
+}
+
+func (m *Monitor) infraTargetsWithDiscovery(ctx context.Context, cl *lightsail.Client, bucket int64) ([]infraTarget, []InfraSample) {
+	explicit := parseInfraTargets(m.cfg.InfraResources)
+	var discovered []infraTarget
+	var discoveryRows []InfraSample
 	if r, err := cl.GetInstances(ctx, &lightsail.GetInstancesInput{}); err == nil {
 		for _, in := range r.Instances {
 			if in.Name == nil {
@@ -181,10 +184,12 @@ func (m *Monitor) infraTargets(ctx context.Context, cl *lightsail.Client) []infr
 				}
 				t.diskTotalGB = systemDiskGB(h.Disks)
 			}
-			out = append(out, t)
+			discovered = append(discovered, t)
 		}
+		discoveryRows = append(discoveryRows, managedDiscoveryRows(bucket, "Lightsail/实例", true, len(r.Instances))...)
 	} else {
 		slog.Warn("infra: 列实例失败", "err", err)
+		discoveryRows = append(discoveryRows, managedDiscoveryRows(bucket, "Lightsail/实例", false, 0)...)
 	}
 	if r, err := cl.GetRelationalDatabases(ctx, &lightsail.GetRelationalDatabasesInput{}); err == nil {
 		for _, d := range r.RelationalDatabases {
@@ -200,21 +205,60 @@ func (m *Monitor) infraTargets(ctx context.Context, cl *lightsail.Client) []infr
 					t.diskTotalGB = float64(*h.DiskSizeInGb)
 				}
 			}
-			out = append(out, t)
+			discovered = append(discovered, t)
 		}
+		discoveryRows = append(discoveryRows, managedDiscoveryRows(bucket, "Lightsail/数据库", true, len(r.RelationalDatabases))...)
 	} else {
 		slog.Warn("infra: 列数据库失败", "err", err)
+		discoveryRows = append(discoveryRows, managedDiscoveryRows(bucket, "Lightsail/数据库", false, 0)...)
 	}
 	if r, err := cl.GetLoadBalancers(ctx, &lightsail.GetLoadBalancersInput{}); err == nil {
 		for _, lb := range r.LoadBalancers {
 			if lb.Name != nil {
-				out = append(out, infraTarget{name: *lb.Name, rtype: "lb"}) // LB 无内存/磁盘概念,跳过总量
+				discovered = append(discovered, infraTarget{name: *lb.Name, rtype: "lb"}) // LB 无内存/磁盘概念,跳过总量
 			}
 		}
+		discoveryRows = append(discoveryRows, managedDiscoveryRows(bucket, "Lightsail/负载均衡", true, len(r.LoadBalancers))...)
 	} else {
 		slog.Warn("infra: 列负载均衡失败", "err", err)
+		discoveryRows = append(discoveryRows, managedDiscoveryRows(bucket, "Lightsail/负载均衡", false, 0)...)
 	}
-	return m.filterInfraTargets(out)
+	return m.filterInfraTargets(mergeInfraTargets(explicit, discovered)), discoveryRows
+}
+
+func parseInfraTargets(value string) []infraTarget {
+	var out []infraTarget
+	for _, part := range strings.Split(value, ",") {
+		kv := strings.SplitN(strings.TrimSpace(part), ":", 2)
+		if len(kv) != 2 {
+			continue
+		}
+		rtype, name := strings.TrimSpace(kv[0]), strings.TrimSpace(kv[1])
+		if name == "" || (rtype != "instance" && rtype != "database" && rtype != "lb") {
+			continue
+		}
+		out = append(out, infraTarget{name: name, rtype: rtype})
+	}
+	return out
+}
+
+func mergeInfraTargets(explicit, discovered []infraTarget) []infraTarget {
+	out := append([]infraTarget(nil), explicit...)
+	positions := make(map[string]int, len(out))
+	for i, target := range out {
+		positions[target.rtype+":"+target.name] = i
+	}
+	for _, target := range discovered {
+		key := target.rtype + ":" + target.name
+		if pos, exists := positions[key]; exists {
+			// 自动发现包含硬件规格，覆盖显式配置里的零值。
+			out[pos] = target
+			continue
+		}
+		positions[key] = len(out)
+		out = append(out, target)
+	}
+	return out
 }
 
 func (m *Monitor) infraExcluded(name string) bool {
@@ -255,7 +299,7 @@ func systemDiskGB(disks []lstypes.Disk) float64 {
 }
 
 // fetchMetric 拉单个 (资源,指标) 的最近值。Lightsail 指标接口【一次只接受一个 statistic】,故逐个拉。
-func (m *Monitor) fetchMetric(ctx context.Context, cl *lightsail.Client, t infraTarget, sp metricSpec) (float64, bool) {
+func (m *Monitor) fetchMetric(ctx context.Context, cl *lightsail.Client, t infraTarget, sp metricSpec) (float64, int64, bool) {
 	end := time.Now()
 	start := end.Add(-2 * time.Hour)
 	period := int32(300)
@@ -294,21 +338,21 @@ func (m *Monitor) fetchMetric(ctx context.Context, cl *lightsail.Client, t infra
 			dps = out.MetricData
 		}
 	default:
-		return 0, false
+		return 0, 0, false
 	}
 	if err != nil {
 		slog.Warn("infra: 拉取指标失败", "resource", t.name, "metric", sp.metric, "err", err)
-		return 0, false
+		return 0, 0, false
 	}
 	dp, ok := latestDatapoint(dps, sp.stat)
 	if !ok {
-		return 0, false
+		return 0, 0, false
 	}
 	scale := sp.scale
 	if scale == 0 {
 		scale = 1
 	}
-	return statValue(dp, sp.stat) / scale, true
+	return statValue(dp, sp.stat) / scale, dp.Timestamp.Unix() / 60 * 60, true
 }
 
 // latestDatapoint 取含指定统计量的最新(时间最大)数据点。
@@ -366,15 +410,18 @@ func statValue(dp lstypes.MetricDatapoint, stat lstypes.MetricStatistic) float64
 
 // InfraResource 是一个资源在最近一次采样的健康视图。
 type InfraResource struct {
-	Name        string             `json:"name"`
-	DisplayName string             `json:"display_name,omitempty"`
-	Type        string             `json:"type"`
-	Platform    string             `json:"platform,omitempty"`
-	Group       string             `json:"group,omitempty"`
-	Status      string             `json:"status"` // ok / warn / bad / nosample
-	AgeSec      int64              `json:"age_sec"`
-	Metrics     map[string]float64 `json:"metrics"`
-	Containers  []InfraContainer   `json:"containers,omitempty"`
+	Name             string             `json:"name"`
+	DisplayName      string             `json:"display_name,omitempty"`
+	Type             string             `json:"type"`
+	Platform         string             `json:"platform,omitempty"`
+	Group            string             `json:"group,omitempty"`
+	Status           string             `json:"status"` // ok / warn / bad / nosample
+	AgeSec           int64              `json:"age_sec"`
+	Metrics          map[string]float64 `json:"metrics"`
+	StaleMetrics     []string           `json:"stale_metrics,omitempty"`
+	MissingMetrics   []string           `json:"missing_metrics,omitempty"`
+	CoverageComplete bool               `json:"coverage_complete"`
+	Containers       []InfraContainer   `json:"containers,omitempty"`
 }
 
 // InfraResourceGroup 是服务端页的业务边界。采集仍按 AWS 资源独立进行，
@@ -429,6 +476,18 @@ type InfraOverview struct {
 	ProbesOK       int    `json:"probes_ok"` // 端到端全通计数(status==ok)
 	LocksTotal     int    `json:"locks_total"`
 	LocksOK        int    `json:"locks_ok"` // 源站锁生效计数(403)
+	DiscoveryTotal int    `json:"discovery_total"`
+	DiscoveryOK    int    `json:"discovery_ok"`
+}
+
+// InfraDiscovery makes AWS inventory permissions observable. Without these
+// sentinels a discovery API failure could hide newly added resources while
+// every already-known row remained green.
+type InfraDiscovery struct {
+	Name          string `json:"name"`
+	Status        string `json:"status"`
+	ResourceCount int    `json:"resource_count"`
+	AgeSec        int64  `json:"age_sec"`
 }
 
 // InfraAlert 是一条最近告警(供告警面板)。
@@ -448,6 +507,7 @@ type InfraSnapshot struct {
 	Overview      InfraOverview        `json:"overview"`
 	Probes        []ProbeResource      `json:"probes"`
 	Locks         []LockResource       `json:"locks"`
+	Discoveries   []InfraDiscovery     `json:"discoveries,omitempty"`
 	Instances     []InfraResource      `json:"instances"`
 	Databases     []InfraResource      `json:"databases,omitempty"`
 	LoadBalancers []InfraResource      `json:"load_balancers,omitempty"`
@@ -462,9 +522,10 @@ type InfraSnapshot struct {
 func (m *Monitor) computeInfraSnapshot(nowUnix int64) InfraSnapshot {
 	latest := m.storeInfraLatest()
 	type acc struct {
-		rtype   string
-		metrics map[string]float64
-		maxTs   int64
+		rtype    string
+		metrics  map[string]float64
+		metricTs map[string]int64
+		minTs    int64
 	}
 	byRes := map[string]*acc{}
 	for _, r := range latest {
@@ -473,7 +534,7 @@ func (m *Monitor) computeInfraSnapshot(nowUnix int64) InfraSnapshot {
 		}
 		a := byRes[r.Resource]
 		if a == nil {
-			a = &acc{rtype: r.RType, metrics: map[string]float64{}}
+			a = &acc{rtype: r.RType, metrics: map[string]float64{}, metricTs: map[string]int64{}}
 			byRes[r.Resource] = a
 		}
 		// host 行并入同名实例(agent 的 node 名 = 实例名);若先有 host 后有 instance,保留 instance 类型。
@@ -481,24 +542,50 @@ func (m *Monitor) computeInfraSnapshot(nowUnix int64) InfraSnapshot {
 			a.rtype = r.RType
 		}
 		a.metrics[r.Metric] = r.Value
-		if r.BucketTs > a.maxTs {
-			a.maxTs = r.BucketTs
+		a.metricTs[r.Metric] = r.BucketTs
+		if a.minTs == 0 || r.BucketTs < a.minTs {
+			a.minTs = r.BucketTs
 		}
 	}
 
 	var snap InfraSnapshot
 	snap.GeneratedAt = time.Unix(nowUnix, 0).Format("2006-01-02 15:04:05")
-	var newest int64
+	var oldest int64
 	for name, a := range byRes {
+		staleAfter := m.infraMetricFreshnessSec()
+		staleMetrics := make([]string, 0)
+		for metric, observedAt := range a.metricTs {
+			metricAge := nowUnix - (observedAt + 60)
+			if metricAge > staleAfter {
+				delete(a.metrics, metric)
+				staleMetrics = append(staleMetrics, metric)
+			}
+		}
+		sort.Strings(staleMetrics)
+		freshOldest := int64(0)
+		for metric, observedAt := range a.metricTs {
+			if _, retained := a.metrics[metric]; retained && (freshOldest == 0 || observedAt < freshOldest) {
+				freshOldest = observedAt
+			}
+		}
 		age := int64(-1)
-		if a.maxTs > 0 {
-			age = nowUnix - (a.maxTs + 60)
-			if age < 0 {
-				age = 0
+		if freshOldest > 0 {
+			age = max(int64(0), nowUnix-(freshOldest+60))
+			if oldest == 0 || freshOldest < oldest {
+				oldest = freshOldest
 			}
-			if a.maxTs > newest {
-				newest = a.maxTs
+		}
+		if a.rtype == "inventory" {
+			status := "nosample"
+			if ok, exists := a.metrics["discovery_ok"]; exists {
+				if ok >= 1 {
+					status = "ok"
+				} else {
+					status = "bad"
+				}
 			}
+			snap.Discoveries = append(snap.Discoveries, InfraDiscovery{Name: name, Status: status, ResourceCount: int(a.metrics["resource_count"]), AgeSec: age})
+			continue
 		}
 		// 端到端探活(rtype=probe)单独成 ProbeResource,不混入实例/DB/LB。
 		if a.rtype == "probe" {
@@ -510,11 +597,17 @@ func (m *Monitor) computeInfraSnapshot(nowUnix int64) InfraSnapshot {
 			snap.Locks = append(snap.Locks, buildLock(name, a.metrics, age))
 			continue
 		}
+		missingMetrics := missingInfraMetrics(name, a.rtype, a.metrics)
 		res := InfraResource{Name: name, DisplayName: infraDisplayName(name), Type: rtypeOrInstance(a.rtype),
-			Platform: infraPlatform(name, a.rtype), Group: infraResourceGroup(name), AgeSec: age, Metrics: a.metrics}
+			Platform: infraPlatform(name, a.rtype), Group: infraResourceGroup(name), AgeSec: age, Metrics: a.metrics, StaleMetrics: staleMetrics}
+		res.MissingMetrics = missingMetrics
+		res.CoverageComplete = len(missingMetrics) == 0
 		res.Containers = m.hostContainerSnapshot(name, nowUnix)
 		addDerivedPct(&res) // 派生百分比键(前端直接用),需在算 status 前完成
 		res.Status = m.infraStatus(res)
+		if (len(missingMetrics) > 0 || len(criticalStaleMetrics(staleMetrics)) > 0) && res.Status == "ok" {
+			res.Status = "warn"
+		}
 		switch res.Type {
 		case "database":
 			snap.Databases = append(snap.Databases, res)
@@ -526,8 +619,9 @@ func (m *Monitor) computeInfraSnapshot(nowUnix int64) InfraSnapshot {
 	}
 	sortProbes(snap.Probes)
 	sortLocks(snap.Locks)
-	if newest > 0 {
-		snap.DataAgeSec = nowUnix - (newest + 60)
+	sort.Slice(snap.Discoveries, func(i, j int) bool { return snap.Discoveries[i].Name < snap.Discoveries[j].Name })
+	if oldest > 0 {
+		snap.DataAgeSec = nowUnix - (oldest + 60)
 		if snap.DataAgeSec < 0 {
 			snap.DataAgeSec = 0
 		}
@@ -553,6 +647,54 @@ func (m *Monitor) computeInfraSnapshot(nowUnix int64) InfraSnapshot {
 	snap.Overview = buildOverview(snap)
 	snap.Alerts = m.recentInfraAlerts(nowUnix, 20)
 	return snap
+}
+
+// requiredInfraMetrics defines the minimum evidence needed before a resource
+// can be presented as fully observed. Static capacity/control-plane rows prove
+// discovery, but never prove that workload telemetry is healthy.
+func requiredInfraMetrics(resource, rtype string) []string {
+	switch rtype {
+	case "ecs_service":
+		return []string{"status_failed", "desired", "running", "cpu", "mem_used_pct"}
+	case "database":
+		if strings.HasPrefix(resource, "rds/") {
+			return []string{"available", "cpu", "free_mem_mb", "free_storage_gb"}
+		}
+		return []string{"cpu", "free_mem_mb", "free_storage_gb"}
+	case "lb":
+		if strings.HasPrefix(resource, "alb/") {
+			return []string{"status_failed", "healthy", "unhealthy"}
+		}
+		return []string{"healthy", "unhealthy"}
+	case "host":
+		return []string{"mem_avail_mb", "disk_used_pct"}
+	case "instance", "":
+		return []string{"status_failed", "cpu", "mem_avail_mb", "disk_used_pct"}
+	default:
+		return nil
+	}
+}
+
+func missingInfraMetrics(resource, rtype string, metrics map[string]float64) []string {
+	missing := make([]string, 0)
+	for _, metric := range requiredInfraMetrics(resource, rtype) {
+		if _, ok := metrics[metric]; !ok {
+			missing = append(missing, metric)
+		}
+	}
+	return missing
+}
+
+func (m *Monitor) infraMetricFreshnessSec() int64 {
+	seconds := m.cfg.InfraSampleSeconds
+	if seconds <= 0 {
+		seconds = 300
+	}
+	limit := int64(seconds * 3)
+	if limit < 15*60 {
+		limit = 15 * 60
+	}
+	return limit
 }
 
 func infraDisplayName(name string) string {
@@ -812,12 +954,14 @@ func (m *Monitor) probeStatus(p ProbeResource) string {
 func rank(s string) int {
 	switch s {
 	case "bad":
-		return 3
+		return 4
 	case "warn":
+		return 3
+	case "nosample":
 		return 2
 	case "ok":
 		return 1
-	default: // nosample / absent / ""
+	default: // absent / ""
 		return 0
 	}
 }
@@ -882,6 +1026,13 @@ func buildOverview(snap InfraSnapshot) InfraOverview {
 			o.LocksOK++
 		}
 		states = append(states, l.Status)
+	}
+	for _, discovery := range snap.Discoveries {
+		o.DiscoveryTotal++
+		if discovery.Status == "ok" {
+			o.DiscoveryOK++
+		}
+		states = append(states, discovery.Status)
 	}
 	o.Status = worst(states...)
 	return o
@@ -1011,8 +1162,21 @@ func addDerivedPct(r *InfraResource) {
 
 // dbMemBad 数据库可用内存低于红线。
 func (m *Monitor) dbMemBad(mm map[string]float64) (float64, bool) {
-	v, ok := mm["mem_avail_pct"]
-	return v, ok && v < m.cfg.InfraMemAvailBadPct
+	if v, ok := mm["mem_avail_pct"]; ok {
+		return v, v < m.cfg.InfraMemAvailBadPct
+	}
+	v, ok := mm["free_mem_mb"]
+	return v, ok && v < m.cfg.InfraDBFreeMemBadMB
+}
+
+// dbMemWarn 在数据库规格未知（RDS/CloudWatch 不提供总内存）时回退为绝对 MB 阈值。
+// 有百分比时始终优先使用百分比，避免同一资源同时被两套口径判定。
+func (m *Monitor) dbMemWarn(mm map[string]float64) (float64, bool) {
+	if v, ok := mm["mem_avail_pct"]; ok {
+		return v, v < m.cfg.InfraMemAvailWarnPct
+	}
+	v, ok := mm["free_mem_mb"]
+	return v, ok && v < m.cfg.InfraDBFreeMemWarnMB
 }
 
 // dbStorageBad 数据库可用存储低于红线。
@@ -1063,7 +1227,7 @@ func (m *Monitor) infraStatus(r InfraResource) string {
 		if v, ok := has("cpu"); ok && v > c.InfraCPUBadPct {
 			return "bad"
 		}
-		if v, ok := has("mem_avail_pct"); ok && v < c.InfraMemAvailWarnPct {
+		if _, hit := m.dbMemWarn(mm); hit {
 			return "warn"
 		}
 		if v, ok := has("storage_avail_pct"); ok && v < c.InfraStorageAvailWarnPct {
@@ -1149,8 +1313,11 @@ func (m *Monitor) evaluateInfraAlerts(now int64) {
 		}
 		if v, hit := m.dbMemBad(d.Metrics); hit {
 			free := d.Metrics["free_mem_mb"]
-			m.fire(c, "infra_db_mem", d.Name, "数据库可用内存告急",
-				fmt.Sprintf("数据库 %s 可用内存仅 %.1f%%(%.0f MB,阈值 %.0f%%),内存接近耗尽,有 OOM 重启风险。", d.Name, v, free, m.cfg.InfraMemAvailBadPct), now)
+			detail := fmt.Sprintf("数据库 %s 可用内存仅 %.0f MB(绝对红线 %.0f MB),内存接近耗尽,有 OOM 重启风险。", d.Name, v, m.cfg.InfraDBFreeMemBadMB)
+			if _, hasPct := d.Metrics["mem_avail_pct"]; hasPct {
+				detail = fmt.Sprintf("数据库 %s 可用内存仅 %.1f%%(%.0f MB,阈值 %.0f%%),内存接近耗尽,有 OOM 重启风险。", d.Name, v, free, m.cfg.InfraMemAvailBadPct)
+			}
+			m.fire(c, "infra_db_mem", d.Name, "数据库可用内存告急", detail, now)
 		}
 		if v, hit := m.dbStorageBad(d.Metrics); hit {
 			free := d.Metrics["free_storage_gb"]
@@ -1162,6 +1329,18 @@ func (m *Monitor) evaluateInfraAlerts(now int64) {
 		if v, hit := instanceDown(in.Metrics); hit {
 			m.fire(c, "infra_instance_down", in.Name, "实例健康检查失败",
 				fmt.Sprintf("实例 %s StatusCheckFailed=%.0f,可能宕机或不可达。", in.Name, v), now)
+		}
+		if v, ok := in.Metrics["unhealthy_containers"]; ok && v >= 1 {
+			m.fire(c, "infra_ecs_unhealthy", in.Name, "ECS 服务存在不健康任务",
+				fmt.Sprintf("ECS 服务 %s 当前有 %.0f 个不健康任务，请检查任务事件、健康检查和最近部署。", in.Name, v), now)
+		}
+		if v, ok := in.Metrics["cpu"]; ok && v > m.cfg.InfraCPUBadPct {
+			m.fire(c, "infra_instance_cpu", in.Name, "实例 CPU 告急",
+				fmt.Sprintf("实例 %s CPU %.1f%%，已超过红线 %.0f%%。", in.Name, v, m.cfg.InfraCPUBadPct), now)
+		}
+		if v, ok := in.Metrics["mem_used_pct"]; ok && v > 100-m.cfg.InfraMemAvailBadPct {
+			m.fire(c, "infra_instance_mem", in.Name, "实例内存告急",
+				fmt.Sprintf("实例 %s 内存使用率 %.1f%%，已超过红线 %.0f%%。", in.Name, v, 100-m.cfg.InfraMemAvailBadPct), now)
 		}
 		for _, container := range in.Containers {
 			if container.Status != "bad" {
@@ -1189,6 +1368,24 @@ func (m *Monitor) evaluateInfraAlerts(now int64) {
 				fmt.Sprintf("负载均衡 %s 不健康节点数 %.0f。", lb.Name, v), now)
 		}
 	}
+	for _, resource := range append(append(append([]InfraResource{}, snap.Instances...), databases...), lbs...) {
+		if len(resource.MissingMetrics) > 0 {
+			m.fire(c, "infra_metrics_missing", resource.Name, "服务端监控采集不完整",
+				fmt.Sprintf("资源 %s 从未采到必需指标：%s。页面已标记为不可完整判定，请检查 AWS 权限、CloudWatch 或主机 agent。", resource.Name, strings.Join(resource.MissingMetrics, ", ")), now)
+		}
+		stale := criticalStaleMetrics(resource.StaleMetrics)
+		if len(stale) == 0 {
+			continue
+		}
+		m.fire(c, "infra_metrics_stale", resource.Name, "服务端监控指标断流",
+			fmt.Sprintf("资源 %s 的关键指标超过 %d 分钟未更新：%s。页面已停止用这些旧值判定健康，请检查 AWS 权限、采集器和网络。", resource.Name, m.infraMetricFreshnessSec()/60, strings.Join(stale, ", ")), now)
+	}
+	for _, discovery := range snap.Discoveries {
+		if discovery.Status != "ok" {
+			m.fire(c, "infra_discovery_failed", discovery.Name, "AWS 资源发现失败",
+				fmt.Sprintf("%s 发现接口未成功，新资源可能未出现在监控页；请检查 IAM 权限、AWS API 与网络。", discovery.Name), now)
+		}
+	}
 	for _, p := range snap.Probes {
 		if !p.Reachable || p.HTTPCode != 200 {
 			m.fire(c, "infra_probe_down", p.Domain, "站点端到端探活失败",
@@ -1206,6 +1403,22 @@ func (m *Monitor) evaluateInfraAlerts(now int64) {
 				fmt.Sprintf("源站 %s 直连(不带 X-Origin-Verify)返回 HTTP %d(本应 403)。F-5 源站锁可能被回滚或失效,现在可绕过 CloudFront 直连后端,请立即排查 nginx 配置。", l.Target, l.HTTPCode), now)
 		}
 	}
+}
+
+func criticalStaleMetrics(metrics []string) []string {
+	critical := map[string]bool{
+		"available": true, "status_failed": true, "cpu": true,
+		"free_mem_mb": true, "mem_avail_mb": true, "mem_used_pct": true,
+		"desired": true, "running": true, "unhealthy_containers": true,
+		"healthy": true, "unhealthy": true,
+	}
+	out := make([]string, 0, len(metrics))
+	for _, metric := range metrics {
+		if critical[metric] {
+			out = append(out, metric)
+		}
+	}
+	return out
 }
 
 // probeDownDetail 给探活失败一句人话描述。

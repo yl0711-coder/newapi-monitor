@@ -192,6 +192,8 @@ func TestInfraOverviewWorstBubbles(t *testing.T) {
 	rows := []InfraSample{
 		{BucketTs: bucket, Resource: "Node-A", RType: "instance", Metric: "cpu", Value: 5},
 		{BucketTs: bucket, Resource: "Node-A", RType: "instance", Metric: "status_failed", Value: 0},
+		{BucketTs: bucket, Resource: "Node-A", RType: "instance", Metric: "mem_avail_mb", Value: 1024},
+		{BucketTs: bucket, Resource: "Node-A", RType: "instance", Metric: "disk_used_pct", Value: 20},
 		{BucketTs: bucket, Resource: "w.example", RType: "probe", Metric: "reachable", Value: 1},
 		{BucketTs: bucket, Resource: "w.example", RType: "probe", Metric: "status_code", Value: 200},
 		{BucketTs: bucket, Resource: "w.example", RType: "probe", Metric: "latency_ms", Value: 900},

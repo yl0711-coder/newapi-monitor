@@ -120,7 +120,11 @@ func ecsServiceTaskState(ctx context.Context, client ecsTaskHealthAPI, clusterAR
 func (m *Monitor) sampleManagedAWSInfra(ctx context.Context, bucket int64) {
 	cfg, err := awsconfig.LoadDefaultConfig(ctx, awsconfig.WithRegion(m.cfg.AWSRegion))
 	if err != nil {
-		slog.Warn("infra managed: AWS 客户端初始化失败(忽略本轮)", "err", err)
+		slog.Warn("infra managed: AWS 客户端初始化失败", "err", err)
+		rows := append(append(managedDiscoveryRows(bucket, "ECS/Fargate", false, 0), managedDiscoveryRows(bucket, "RDS", false, 0)...), managedDiscoveryRows(bucket, "ALB", false, 0)...)
+		if storeErr := m.upsertInfra(rows); storeErr != nil {
+			slog.Warn("infra managed: AWS 发现失败状态入库失败", "err", storeErr)
+		}
 		return
 	}
 	cw := cloudwatch.NewFromConfig(cfg)
@@ -128,21 +132,27 @@ func (m *Monitor) sampleManagedAWSInfra(ctx context.Context, bucket int64) {
 	resourceCount := 0
 
 	if ecsRows, count, collectErr := collectECSInfra(ctx, ecs.NewFromConfig(cfg), cw, bucket); collectErr != nil {
-		slog.Warn("infra managed: ECS/Fargate 自动发现失败(忽略本类)", "err", collectErr)
+		slog.Warn("infra managed: ECS/Fargate 自动发现失败", "err", collectErr)
+		rows = append(rows, managedDiscoveryRows(bucket, "ECS/Fargate", false, 0)...)
 	} else {
 		rows = append(rows, ecsRows...)
+		rows = append(rows, managedDiscoveryRows(bucket, "ECS/Fargate", true, count)...)
 		resourceCount += count
 	}
 	if rdsRows, count, collectErr := collectRDSInfra(ctx, rds.NewFromConfig(cfg), cw, bucket); collectErr != nil {
-		slog.Warn("infra managed: RDS 自动发现失败(忽略本类)", "err", collectErr)
+		slog.Warn("infra managed: RDS 自动发现失败", "err", collectErr)
+		rows = append(rows, managedDiscoveryRows(bucket, "RDS", false, 0)...)
 	} else {
 		rows = append(rows, rdsRows...)
+		rows = append(rows, managedDiscoveryRows(bucket, "RDS", true, count)...)
 		resourceCount += count
 	}
 	if albRows, count, collectErr := collectALBInfra(ctx, elasticloadbalancingv2.NewFromConfig(cfg), cw, bucket); collectErr != nil {
-		slog.Warn("infra managed: ALB 自动发现失败(忽略本类)", "err", collectErr)
+		slog.Warn("infra managed: ALB 自动发现失败", "err", collectErr)
+		rows = append(rows, managedDiscoveryRows(bucket, "ALB", false, 0)...)
 	} else {
 		rows = append(rows, albRows...)
+		rows = append(rows, managedDiscoveryRows(bucket, "ALB", true, count)...)
 		resourceCount += count
 	}
 
@@ -153,6 +163,18 @@ func (m *Monitor) sampleManagedAWSInfra(ctx context.Context, bucket int64) {
 	}
 	if resourceCount > 0 {
 		slog.Info("infra managed AWS 采样完成", "resources", resourceCount, "rows", len(rows))
+	}
+}
+
+func managedDiscoveryRows(bucket int64, class string, ok bool, count int) []InfraSample {
+	value := float64(0)
+	if ok {
+		value = 1
+	}
+	name := "AWS 资源发现/" + class
+	return []InfraSample{
+		{BucketTs: bucket, Resource: name, RType: "inventory", Metric: "discovery_ok", Value: value},
+		{BucketTs: bucket, Resource: name, RType: "inventory", Metric: "resource_count", Value: float64(count)},
 	}
 }
 
@@ -351,19 +373,19 @@ func albTargetHealth(ctx context.Context, client *elasticloadbalancingv2.Client,
 
 func appendCloudWatchMetrics(ctx context.Context, rows []InfraSample, client cloudWatchMetricAPI, bucket int64, resource, rtype, namespace string, dimensions []cwtypes.Dimension, specs []managedMetricSpec) []InfraSample {
 	for _, spec := range specs {
-		value, ok, err := latestCloudWatchMetric(ctx, client, namespace, spec.name, dimensions, spec.stat, spec.scale)
+		value, observedAt, ok, err := latestCloudWatchMetric(ctx, client, namespace, spec.name, dimensions, spec.stat, spec.scale)
 		if err != nil {
 			slog.Warn("infra managed: CloudWatch 指标读取失败(保留其他指标)", "resource", resource, "metric", spec.name, "err", err)
 			continue
 		}
 		if ok {
-			rows = append(rows, managedRow(bucket, resource, rtype, spec.key, value))
+			rows = append(rows, managedRow(observedAt, resource, rtype, spec.key, value))
 		}
 	}
 	return rows
 }
 
-func latestCloudWatchMetric(ctx context.Context, client cloudWatchMetricAPI, namespace, metric string, dimensions []cwtypes.Dimension, statistic cwtypes.Statistic, scale float64) (float64, bool, error) {
+func latestCloudWatchMetric(ctx context.Context, client cloudWatchMetricAPI, namespace, metric string, dimensions []cwtypes.Dimension, statistic cwtypes.Statistic, scale float64) (float64, int64, bool, error) {
 	end := time.Now()
 	start := end.Add(-30 * time.Minute)
 	out, err := client.GetMetricStatistics(ctx, &cloudwatch.GetMetricStatisticsInput{
@@ -371,7 +393,7 @@ func latestCloudWatchMetric(ctx context.Context, client cloudWatchMetricAPI, nam
 		StartTime: aws.Time(start), EndTime: aws.Time(end), Period: aws.Int32(300), Statistics: []cwtypes.Statistic{statistic},
 	})
 	if err != nil {
-		return 0, false, err
+		return 0, 0, false, err
 	}
 	var value float64
 	var latest time.Time
@@ -394,12 +416,12 @@ func latestCloudWatchMetric(ctx context.Context, client cloudWatchMetricAPI, nam
 		}
 	}
 	if !found {
-		return 0, false, nil
+		return 0, 0, false, nil
 	}
 	if scale <= 0 {
 		scale = 1
 	}
-	return value / scale, true, nil
+	return value / scale, latest.Unix() / 60 * 60, true, nil
 }
 
 func managedRow(bucket int64, resource, rtype, metric string, value float64) InfraSample {

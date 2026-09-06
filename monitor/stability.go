@@ -147,6 +147,7 @@ type StabilityStripPoint struct {
 	Requests  int64    `json:"requests"`
 	Problems  int64    `json:"problems"`
 	Stability *float64 `json:"stability"`
+	Coverage  string   `json:"coverage"` // complete_data / complete_zero / missing / provisional / legacy
 }
 
 type StabilityModel struct {
@@ -370,7 +371,7 @@ func (s stabilityScope) sqlWhere(alias string) (string, []any) {
 // 旧版小时事实。无旧事实的纯 v5 行仍可读，但覆盖状态依然由 complete
 // 台账决定。这使冷迁移期间仍能查看历史，又不会将新旧两版叠加。
 func stabilityEffectiveSampleSQL(alias string) string {
-	v := strconv.Itoa(userTrafficClassificationVersion)
+	v := strconv.Itoa(stabilityTrafficClassificationVersion)
 	return "((" + alias + ".traffic_class_version=" + v +
 		" AND (EXISTS (SELECT 1 FROM stability_hour_ingest_states v5hs WHERE v5hs.hour_ts=" + alias + ".hour_ts AND v5hs.status='complete' AND v5hs.traffic_class_version=" + v + ")" +
 		" OR NOT EXISTS (SELECT 1 FROM stability_hour_samples legacysh WHERE legacysh.hour_ts=" + alias + ".hour_ts AND COALESCE(legacysh.traffic_class_version,0)<>" + v + ")))" +
@@ -510,13 +511,82 @@ func stabilityBucketKeys(scope stabilityScope, step int64) []int64 {
 	return out
 }
 
-func buildTimeline(keys []int64, rows map[int64]stabilityCounts) []StabilityStripPoint {
+func buildTimeline(keys []int64, rows map[int64]stabilityCounts, coverage map[int64]string) []StabilityStripPoint {
 	out := make([]StabilityStripPoint, 0, len(keys))
 	for _, ts := range keys {
 		m := rows[ts].metrics()
-		out = append(out, StabilityStripPoint{Ts: ts, Requests: m.Requests, Problems: m.Problems, Stability: m.Stability})
+		state := coverage[ts]
+		if state == "complete" {
+			if m.Requests > 0 {
+				state = "complete_data"
+			} else {
+				state = "complete_zero"
+			}
+		}
+		if state == "" {
+			state = "missing"
+		}
+		out = append(out, StabilityStripPoint{Ts: ts, Requests: m.Requests, Problems: m.Problems, Stability: m.Stability, Coverage: state})
 	}
 	return out
+}
+
+// stabilityTimelineCoverage 把全局小时完整性台账压缩到时间窄条粒度。
+// 任一小时缺失时整桶标 missing；其次 provisional、legacy；只有每个小时
+// 都由当前分类版本签收，才允许前端将零请求解释为真实业务空闲。
+func (m *Monitor) stabilityTimelineCoverage(ctx context.Context, scope stabilityScope, step, now int64) (map[int64]string, error) {
+	var states []StabilityHourIngestState
+	if err := m.storeDB.WithContext(ctx).Where("hour_ts >= ? AND hour_ts < ?", scope.FromTs/3600*3600, scope.ToTs).
+		Order("hour_ts").Find(&states).Error; err != nil {
+		return nil, err
+	}
+	byHour := make(map[int64]StabilityHourIngestState, len(states))
+	for _, state := range states {
+		byHour[state.HourTs] = state
+	}
+	var validCurrentHours []int64
+	predicate := stabilityCompleteHourPredicateSQL("hs")
+	if err := m.storeDB.WithContext(ctx).Raw(`SELECT hs.hour_ts FROM stability_hour_ingest_states hs
+		WHERE hs.hour_ts >= ? AND hs.hour_ts < ? AND `+predicate,
+		scope.FromTs/3600*3600, scope.ToTs,
+		stabilityTrafficClassificationVersion, stabilityTrafficClassificationVersion).
+		Scan(&validCurrentHours).Error; err != nil {
+		return nil, err
+	}
+	validCurrent := make(map[int64]bool, len(validCurrentHours))
+	for _, hour := range validCurrentHours {
+		validCurrent[hour] = true
+	}
+	result := make(map[int64]string)
+	finalizedTo := finalizedStabilityHourTo(now)
+	for hour := scope.FromTs / 3600 * 3600; hour < scope.ToTs; hour += 3600 {
+		bucket := stabilityBucketStart(hour, step)
+		state := "missing"
+		if hour >= finalizedTo {
+			state = "provisional"
+		} else if row, ok := byHour[hour]; ok {
+			switch {
+			case row.Status == "complete" && row.TrafficClassVersion == stabilityTrafficClassificationVersion && validCurrent[hour]:
+				state = "complete"
+			case row.Status == "complete" && row.TrafficClassVersion == stabilityTrafficClassificationVersion:
+				state = "missing"
+			case row.Status == "complete":
+				state = "legacy"
+			case row.Status == "queued" || row.Status == "running":
+				state = "provisional"
+			}
+		}
+		result[bucket] = worseTimelineCoverage(result[bucket], state)
+	}
+	return result, nil
+}
+
+func worseTimelineCoverage(current, candidate string) string {
+	rank := map[string]int{"": 0, "complete": 1, "legacy": 2, "provisional": 3, "missing": 4}
+	if rank[candidate] > rank[current] {
+		return candidate
+	}
+	return current
 }
 
 func (m *Monitor) queryStabilityTimeline(ctx context.Context, scope stabilityScope, step int64, includeChannels bool, limit int) ([]stabilityTimelineRow, bool, error) {
@@ -815,6 +885,10 @@ func (m *Monitor) buildStabilityReportWithDetails(ctx context.Context, scope sta
 	if err != nil {
 		return nil, err
 	}
+	timelineCoverage, err := m.stabilityTimelineCoverage(ctx, scope, timelineStep, now)
+	if err != nil {
+		return nil, fmt.Errorf("读取稳定性时间桶覆盖状态失败: %w", err)
+	}
 	groupDaily := map[string]map[string]stabilityCounts{}
 	channelDaily := map[string]map[string]stabilityCounts{}
 	for _, row := range dailyRows {
@@ -877,12 +951,19 @@ func (m *Monitor) buildStabilityReportWithDetails(ctx context.Context, scope sta
 	keys := dateKeys(scope.FromTs, scope.ToTs)
 	timelineKeys := stabilityBucketKeys(scope, timelineStep)
 	totalMetrics, prevMetrics := total.metrics(), prevTotal.metrics()
+	comparisonCoverage := m.stabilityDataCoverage(ctx, previousScope.FromTs, previousScope.ToTs, now)
+	comparisonDelta := func(current, previous StabilityMetrics) *float64 {
+		if !comparisonCoverage.Complete {
+			return nil
+		}
+		return deltaPP(current, previous)
+	}
 	resultGroups := make([]StabilityGroup, 0, len(groups))
 	for _, gb := range groups {
 		gm := gb.Counts.metrics()
 		g := StabilityGroup{Name: gb.Name, Vendor: vendorLabel(gb.Vendors), StabilityMetrics: gm, ModelCount: len(gb.Models),
-			DeltaPP: deltaPP(gm, prevGroup[gb.Name].metrics()), Daily: buildDaily(keys, groupDaily[gb.Name]),
-			Timeline: buildTimeline(timelineKeys, groupTimeline[gb.Name])}
+			DeltaPP: comparisonDelta(gm, prevGroup[gb.Name].metrics()), Daily: buildDaily(keys, groupDaily[gb.Name]),
+			Timeline: buildTimeline(timelineKeys, groupTimeline[gb.Name], timelineCoverage)}
 		if totalMetrics.Requests > 0 {
 			g.SharePct = float64(g.Requests) / float64(totalMetrics.Requests) * 100
 		}
@@ -890,10 +971,10 @@ func (m *Monitor) buildStabilityReportWithDetails(ctx context.Context, scope sta
 			cm := cb.Counts.metrics()
 			channelKey := gb.Name + "\x00" + strconv.Itoa(cb.ID)
 			ch := StabilityChannel{ID: cb.ID, Name: cb.Name, Vendor: cb.Vendor, Status: cb.Status, Current: cb.Current, StabilityMetrics: cm, ModelCount: len(cb.Models),
-				DeltaPP: deltaPP(cm, prevChannel[channelKey].metrics())}
+				DeltaPP: comparisonDelta(cm, prevChannel[channelKey].metrics())}
 			if includeNested {
 				ch.Daily = buildDaily(keys, channelDaily[channelKey])
-				ch.Timeline = buildTimeline(timelineKeys, channelTimeline[channelKey])
+				ch.Timeline = buildTimeline(timelineKeys, channelTimeline[channelKey], timelineCoverage)
 			}
 			if g.Requests > 0 {
 				ch.SharePct = float64(ch.Requests) / float64(g.Requests) * 100
@@ -905,7 +986,7 @@ func (m *Monitor) buildStabilityReportWithDetails(ctx context.Context, scope sta
 				for name, counts := range cb.Models {
 					mm := counts.metrics()
 					model := StabilityModel{Name: name, StabilityMetrics: mm,
-						DeltaPP: deltaPP(mm, prevChannelModel[gb.Name+"\x00"+strconv.Itoa(cb.ID)+"\x00"+name].metrics())}
+						DeltaPP: comparisonDelta(mm, prevChannelModel[gb.Name+"\x00"+strconv.Itoa(cb.ID)+"\x00"+name].metrics())}
 					if ch.Requests > 0 {
 						model.SharePct = float64(model.Requests) / float64(ch.Requests) * 100
 					}
@@ -924,7 +1005,7 @@ func (m *Monitor) buildStabilityReportWithDetails(ctx context.Context, scope sta
 		if includeNested {
 			for name, counts := range gb.Models {
 				mm := counts.metrics()
-				model := StabilityModel{Name: name, StabilityMetrics: mm, DeltaPP: deltaPP(mm, prevGroupModel[gb.Name+"\x00"+name].metrics())}
+				model := StabilityModel{Name: name, StabilityMetrics: mm, DeltaPP: comparisonDelta(mm, prevGroupModel[gb.Name+"\x00"+name].metrics())}
 				if g.Requests > 0 {
 					model.SharePct = float64(model.Requests) / float64(g.Requests) * 100
 				}
@@ -944,7 +1025,7 @@ func (m *Monitor) buildStabilityReportWithDetails(ctx context.Context, scope sta
 	modelRanking := make([]StabilityRankItem, 0, len(modelTotals))
 	for name, counts := range modelTotals {
 		mm := counts.metrics()
-		r := StabilityRankItem{Name: name, StabilityMetrics: mm, DeltaPP: deltaPP(mm, prevModel[name].metrics())}
+		r := StabilityRankItem{Name: name, StabilityMetrics: mm, DeltaPP: comparisonDelta(mm, prevModel[name].metrics())}
 		if totalMetrics.Requests > 0 {
 			r.SharePct = float64(r.Requests) / float64(totalMetrics.Requests) * 100
 		}
@@ -960,7 +1041,7 @@ func (m *Monitor) buildStabilityReportWithDetails(ctx context.Context, scope sta
 	for _, cb := range channelTotals {
 		cm := cb.Counts.metrics()
 		ch := StabilityRankItem{ID: cb.ID, Name: cb.Name, Vendor: cb.Vendor,
-			StabilityMetrics: cm, DeltaPP: deltaPP(cm, prevChannelGlobal[cb.ID].metrics())}
+			StabilityMetrics: cm, DeltaPP: comparisonDelta(cm, prevChannelGlobal[cb.ID].metrics())}
 		if totalMetrics.Requests > 0 {
 			ch.SharePct = float64(ch.Requests) / float64(totalMetrics.Requests) * 100
 		}
@@ -978,7 +1059,6 @@ func (m *Monitor) buildStabilityReportWithDetails(ctx context.Context, scope sta
 	}
 
 	queryDays := m.cfg.stabilityQueryDays()
-	comparisonCoverage := m.stabilityDataCoverage(ctx, previousScope.FromTs, previousScope.ToTs, now)
 	meta := StabilityReportMeta{From: time.Unix(scope.FromTs, 0).In(cstLocation).Format("2006-01-02"), To: time.Unix(scope.ToTs-1, 0).In(cstLocation).Format("2006-01-02"), GeneratedAt: now, RetentionDays: queryDays, RowsTruncated: false, ComparisonAvailable: comparisonCoverage.Complete, ComparisonCoverage: comparisonCoverage, TimelineBucketSec: timelineStep}
 	meta.DataCoverage = m.stabilityDataCoverage(ctx, scope.FromTs, scope.ToTs, now)
 	var coverage struct{ Min, Max int64 }
@@ -995,10 +1075,10 @@ func (m *Monitor) buildStabilityReportWithDetails(ctx context.Context, scope sta
 	var problemLast struct{ Max int64 }
 	warnReadErr("stability problem freshness", m.storeDB.WithContext(ctx).Raw(
 		"SELECT COALESCE(MAX(last_ts),0) max FROM stability_problem_samples WHERE source='newapi' AND traffic_class_version=?",
-		userTrafficClassificationVersion).Scan(&problemLast))
+		stabilityTrafficClassificationVersion).Scan(&problemLast))
 	meta.Sources.ProblemLastTs = problemLast.Max
 	var problemLive StabilityProblemLiveCursor
-	if err := m.storeDB.WithContext(ctx).First(&problemLive, "id = ? AND traffic_class_version = ?", 1, userTrafficClassificationVersion).Error; err == nil {
+	if err := m.storeDB.WithContext(ctx).First(&problemLive, "id = ? AND traffic_class_version = ?", 1, stabilityTrafficClassificationVersion).Error; err == nil {
 		meta.Sources.ProblemCoverageTo = problemLive.NextTs
 		if problemLive.TargetThroughTs > problemLive.NextTs {
 			meta.Sources.ProblemPendingMinutes = (problemLive.TargetThroughTs - problemLive.NextTs + 59) / 60
@@ -1023,7 +1103,7 @@ func (m *Monitor) buildStabilityReportWithDetails(ctx context.Context, scope sta
 		}
 	}
 
-	return &StabilityReport{Enabled: true, Meta: meta, Filters: buildStabilityFilters(rows), Summary: totalMetrics, Previous: prevMetrics, DeltaPP: deltaPP(totalMetrics, prevMetrics), Groups: resultGroups, Rankings: StabilityRankings{Groups: groupRanking, Channels: channelRanking, Models: modelRanking}}, nil
+	return &StabilityReport{Enabled: true, Meta: meta, Filters: buildStabilityFilters(rows), Summary: totalMetrics, Previous: prevMetrics, DeltaPP: comparisonDelta(totalMetrics, prevMetrics), Groups: resultGroups, Rankings: StabilityRankings{Groups: groupRanking, Channels: channelRanking, Models: modelRanking}}, nil
 }
 
 func buildStabilityFilters(rows []stabilityDimRow) StabilityFilters {

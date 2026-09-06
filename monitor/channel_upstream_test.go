@@ -261,6 +261,27 @@ func TestSyncNewAPIBalanceUsesUserTokenAndPublishedUnit(t *testing.T) {
 	}
 }
 
+func TestSyncNewAPIBalancePreservesVerifiedUnitWhenStatusTemporarilyFails(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/api/user/self" {
+			_, _ = w.Write([]byte(`{"success":true,"data":{"quota":900000}}`))
+			return
+		}
+		http.Error(w, `{"message":"temporary"}`, http.StatusServiceUnavailable)
+	}))
+	defer server.Close()
+
+	row := ChannelUpstreamAccount{Provider: upstreamProviderNewAPI, BaseURL: server.URL, UserID: 23, BalanceUnit: 600000, UnitAssumed: false}
+	result, _, err := syncNewAPIBalance(context.Background(), newUpstreamHTTPClient(3*time.Second), row, newAPICredential{AccessToken: "token"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.BalanceUSD != 1.5 || result.BalanceUnit != 600000 || result.UnitAssumed {
+		t.Fatalf("temporary status failure replaced the verified unit: %+v", result)
+	}
+}
+
 func TestSyncAICodeWithBalanceUsesAPIKeyAndUSDResponse(t *testing.T) {
 	const apiKey = "sk-acw-balance-test-secret"
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -397,7 +418,7 @@ func TestMigrateAICodeWithContractLedgerUnitIsAtomicAndIdempotent(t *testing.T) 
 	if err := m.storeDB.Create(&row).Error; err != nil {
 		t.Fatal(err)
 	}
-	if err := m.storeDB.Create(&ChannelUpstreamUsageHour{Domain: row.Domain, HourTs: 1, CostUSD: 10, Quota: 70}).Error; err != nil {
+	if err := m.storeDB.Create(&ChannelUpstreamUsageHour{Domain: row.Domain, HourTs: 1, CostUSD: 10, Quota: 70, UnitPerUSD: 7}).Error; err != nil {
 		t.Fatal(err)
 	}
 	if err := m.storeDB.Create(&AICodeWithUsageStage{Domain: row.Domain, RoundID: "r1", SlotID: "acw_1", HourTs: 1, CostUSD: 5, Quota: 35}).Error; err != nil {
@@ -419,7 +440,7 @@ func TestMigrateAICodeWithContractLedgerUnitIsAtomicAndIdempotent(t *testing.T) 
 	if err := m.storeDB.First(&stage, "domain = ?", row.Domain).Error; err != nil {
 		t.Fatal(err)
 	}
-	if row.BalanceUSD != 700 || row.BalanceUnit != 1 || usage.CostUSD != 70 || stage.CostUSD != 35 {
+	if row.BalanceUSD != 700 || row.BalanceUnit != 1 || usage.CostUSD != 70 || usage.UnitPerUSD != 1 || stage.CostUSD != 35 {
 		t.Fatalf("unexpected migrated 1:1 ledger: row=%+v usage=%+v stage=%+v", row, usage, stage)
 	}
 }
@@ -1379,6 +1400,197 @@ func TestUpstreamIdentityAndUsageNamespaceChangeCommitAtomically(t *testing.T) {
 	var archivedRows int64
 	if err := m.storeDB.Model(&ChannelUpstreamUsageArchive{}).Where("domain = ?", domain).Count(&archivedRows).Error; err != nil || archivedRows != 0 {
 		t.Fatalf("failed identity transaction leaked archive rows: count=%d err=%v", archivedRows, err)
+	}
+}
+
+func TestUpstreamEconomicUnitChangePreservesHistoricalUsageAndFunds(t *testing.T) {
+	m := newChannelUpstreamTestMonitor(t)
+	const domain = "unit-change.example"
+	account := ChannelUpstreamAccount{
+		Domain: domain, Provider: upstreamProviderNewAPI, BaseURL: "https://" + domain,
+		Account: "7", UserID: 7, Enabled: true, Status: upstreamStatusOK,
+		BalanceUnit: 500000, BalanceRaw: 2500000, BalanceUSD: 5, BalanceKnown: true,
+	}
+	if err := m.persistSyncedUpstreamAccount(context.Background(), &account, newAPICredential{AccessToken: "old-token"}); err != nil {
+		t.Fatal(err)
+	}
+	epoch := newAPIUpstreamAccountEpoch(account)
+	usage := ChannelUpstreamUsageHour{
+		Domain: domain, HourTs: 3600, BucketSeconds: 3600, Provider: upstreamProviderNewAPI,
+		Requests: 3, Quota: 1000000, CostUSD: 2, UnitPerUSD: 500000,
+	}
+	if err := m.storeDB.Create(&usage).Error; err != nil {
+		t.Fatal(err)
+	}
+	const rawEvidence = `{"type":1,"created_at":3600,"content":"充值 1000000 额度"}`
+	fund := ChannelUpstreamFundEvent{
+		Domain: domain, AccountEpoch: epoch, EventKey: "fund-1", Provider: upstreamProviderNewAPI,
+		OccurredAt: 3600, ParserVersion: upstreamFundParserVersion, Kind: upstreamFundKindTopup,
+		Direction: "credit", AmountUSD: 2, AmountKnown: true, BeforeUSD: 1, BeforeKnown: true,
+		AfterUSD: 3, AfterKnown: true, RawJSON: rawEvidence, ObservedCount: 1,
+	}
+	if err := m.storeDB.Create(&fund).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	updated := account
+	updated.BalanceUnit, updated.BalanceUSD = 1000000, 2.5
+	if err := m.persistSyncedUpstreamAccount(context.Background(), &updated, newAPICredential{AccessToken: "old-token"}); err != nil {
+		t.Fatal(err)
+	}
+	var gotUsage ChannelUpstreamUsageHour
+	if err := m.storeDB.First(&gotUsage, "domain = ? AND hour_ts = ?", domain, usage.HourTs).Error; err != nil {
+		t.Fatal(err)
+	}
+	if math.Abs(gotUsage.CostUSD-2) > 1e-12 || gotUsage.UnitPerUSD != 500000 || gotUsage.Quota != usage.Quota {
+		t.Fatalf("historical usage evidence was rewritten: %+v", gotUsage)
+	}
+	var gotFund ChannelUpstreamFundEvent
+	if err := m.storeDB.First(&gotFund, "domain = ? AND account_epoch = ? AND event_key = ?", domain, epoch, fund.EventKey).Error; err != nil {
+		t.Fatal(err)
+	}
+	if gotFund.RawJSON != rawEvidence || gotFund.ParserVersion != upstreamFundParserVersion || !gotFund.AmountKnown || !gotFund.BeforeKnown || !gotFund.AfterKnown || gotFund.ReparseError != "" {
+		t.Fatalf("historical fund evidence was rewritten: %+v", gotFund)
+	}
+	var gotAccount ChannelUpstreamAccount
+	if err := m.storeDB.First(&gotAccount, "domain = ?", domain).Error; err != nil {
+		t.Fatal(err)
+	}
+	if gotAccount.BalanceUnit != updated.BalanceUnit {
+		t.Fatalf("account unit not committed with repricing: got=%v want=%v", gotAccount.BalanceUnit, updated.BalanceUnit)
+	}
+}
+
+func TestUpstreamUsageRefreshCannotRewriteHistoricalUnitEvidence(t *testing.T) {
+	m := newChannelUpstreamTestMonitor(t)
+	const domain = "immutable-unit.example"
+	old := ChannelUpstreamUsageHour{Domain: domain, HourTs: 3600, BucketSeconds: 3600, Provider: upstreamProviderTokenForce, Requests: 2, Quota: 72, CostUSD: 10, UnitPerUSD: 7.2}
+	if err := m.storeDB.Create(&old).Error; err != nil {
+		t.Fatal(err)
+	}
+	incoming := []ChannelUpstreamUsageHour{{Domain: domain, HourTs: 3600, BucketSeconds: 3600, Provider: upstreamProviderTokenForce, Requests: 3, Quota: 72, CostUSD: 9, UnitPerUSD: 8}}
+	if err := m.persistUpstreamUsageWindow(t.Context(), domain, 3600, 7200, incoming, 9999); err != nil {
+		t.Fatal(err)
+	}
+	var got ChannelUpstreamUsageHour
+	if err := m.storeDB.First(&got, "domain = ? AND hour_ts = ?", domain, int64(3600)).Error; err != nil {
+		t.Fatal(err)
+	}
+	if got.CostUSD != old.CostUSD || got.UnitPerUSD != old.UnitPerUSD || got.Requests != incoming[0].Requests {
+		t.Fatalf("refresh must preserve the historical unit without dropping newer facts: got=%+v old=%+v incoming=%+v", got, old, incoming[0])
+	}
+}
+
+func TestUpstreamEconomicUnitChangePinsOpenHourBeforeFirstUsageSample(t *testing.T) {
+	m := newChannelUpstreamTestMonitor(t)
+	const domain = "open-hour-unit.example"
+	const changedAt int64 = 7200 + 17
+	previous := ChannelUpstreamAccount{Domain: domain, Provider: upstreamProviderTokenForce, BalanceUnit: 7.2}
+	next := previous
+	next.BalanceUnit, next.UpdatedAt = 8, changedAt
+	if err := m.storeDB.Create(&previous).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := reconcileUpstreamEconomicUnitTx(m.storeDB, previous, &next); err != nil {
+		t.Fatal(err)
+	}
+	incoming := []ChannelUpstreamUsageHour{{Domain: domain, HourTs: 7200, BucketSeconds: 3600, Provider: upstreamProviderTokenForce, Requests: 4, Quota: 72, CostUSD: 9, UnitPerUSD: 8}}
+	if err := m.persistUpstreamUsageWindow(t.Context(), domain, 7200, 10800, incoming, changedAt+60); err != nil {
+		t.Fatal(err)
+	}
+	var got ChannelUpstreamUsageHour
+	if err := m.storeDB.First(&got, "domain = ? AND hour_ts = ?", domain, int64(7200)).Error; err != nil {
+		t.Fatal(err)
+	}
+	if got.UnitPerUSD != 7.2 || got.CostUSD != 10 || got.Requests != 4 {
+		t.Fatalf("open hour must retain old unit and all refreshed facts: %+v", got)
+	}
+}
+
+func TestUpstreamEconomicUnitMultipleEditsKeepOriginallyEffectiveOpenHourUnit(t *testing.T) {
+	m := newChannelUpstreamTestMonitor(t)
+	const domain = "multi-edit-unit.example"
+	first := ChannelUpstreamAccount{Domain: domain, Provider: upstreamProviderTokenForce, BalanceUnit: 7.2}
+	second := first
+	second.BalanceUnit, second.UpdatedAt = 8, 7200+10
+	if err := reconcileUpstreamEconomicUnitTx(m.storeDB, first, &second); err != nil {
+		t.Fatal(err)
+	}
+	third := second
+	third.BalanceUnit, third.UpdatedAt = 9, 7200+20
+	if err := reconcileUpstreamEconomicUnitTx(m.storeDB, second, &third); err != nil {
+		t.Fatal(err)
+	}
+	if third.BalanceUnitPrevious != 7.2 || third.BalanceUnitEffectiveAt != 10800 {
+		t.Fatalf("second edit inside open hour changed the effective predecessor: %+v", third)
+	}
+	if unit, ok := upstreamEconomicUnitAt(third, 7200+30); !ok || unit != 7.2 {
+		t.Fatalf("open-hour event used non-effective intermediate unit: unit=%v ok=%v", unit, ok)
+	}
+}
+
+func TestMigrateLegacyUpstreamEconomicUnitEvidenceUsesPublishedFacts(t *testing.T) {
+	m := newChannelUpstreamTestMonitor(t)
+	rows := []ChannelUpstreamUsageHour{
+		{Domain: "legacy.example", HourTs: 3600, Provider: upstreamProviderNewAPI, Quota: 1000000, CostUSD: 2},
+		{Domain: "ambiguous.example", HourTs: 3600, Provider: upstreamProviderNewAPI, Quota: 1000000, CostUSD: 0},
+	}
+	if err := m.storeDB.Create(&rows).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := migrateLegacyUpstreamEconomicUnitEvidence(m.storeDB); err != nil {
+		t.Fatal(err)
+	}
+	var migrated, ambiguous ChannelUpstreamUsageHour
+	if err := m.storeDB.First(&migrated, "domain = ?", "legacy.example").Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := m.storeDB.First(&ambiguous, "domain = ?", "ambiguous.example").Error; err != nil {
+		t.Fatal(err)
+	}
+	if migrated.UnitPerUSD != 500000 || migrated.CostUSD != 2 {
+		t.Fatalf("legacy conversion evidence was not recovered exactly: %+v", migrated)
+	}
+	if ambiguous.UnitPerUSD != 0 {
+		t.Fatalf("ambiguous legacy row must remain fail-closed: %+v", ambiguous)
+	}
+}
+
+func TestUpstreamEconomicUnitBoundaryFailureRollsBackAtomically(t *testing.T) {
+	m := newChannelUpstreamTestMonitor(t)
+	const domain = "unit-rollback.example"
+	account := ChannelUpstreamAccount{
+		Domain: domain, Provider: upstreamProviderNewAPI, BaseURL: "https://" + domain,
+		Account: "9", UserID: 9, Enabled: true, BalanceUnit: 500000,
+	}
+	if err := m.persistSyncedUpstreamAccount(context.Background(), &account, newAPICredential{AccessToken: "token"}); err != nil {
+		t.Fatal(err)
+	}
+	usage := ChannelUpstreamUsageHour{Domain: domain, HourTs: 3600, Provider: upstreamProviderNewAPI, Quota: 1000000, CostUSD: 2, UnitPerUSD: 0}
+	if err := m.storeDB.Create(&usage).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := m.storeDB.Exec(`CREATE TRIGGER reject_unit_boundary_marker
+		BEFORE INSERT ON channel_upstream_usage_hours
+		WHEN NEW.domain = 'unit-rollback.example'
+		BEGIN SELECT RAISE(ABORT, 'injected unit boundary failure'); END`).Error; err != nil {
+		t.Fatal(err)
+	}
+	updated := account
+	updated.BalanceUnit = 1000000
+	if err := m.persistSyncedUpstreamAccount(context.Background(), &updated, newAPICredential{AccessToken: "token"}); err == nil {
+		t.Fatal("injected unit boundary failure unexpectedly committed unit change")
+	}
+	var gotAccount ChannelUpstreamAccount
+	if err := m.storeDB.First(&gotAccount, "domain = ?", domain).Error; err != nil {
+		t.Fatal(err)
+	}
+	var gotUsage ChannelUpstreamUsageHour
+	if err := m.storeDB.First(&gotUsage, "domain = ? AND hour_ts = ?", domain, usage.HourTs).Error; err != nil {
+		t.Fatal(err)
+	}
+	if gotAccount.BalanceUnit != 500000 || gotUsage.CostUSD != 2 || gotUsage.UnitPerUSD != 0 {
+		t.Fatalf("economic unit transaction was only partly committed: account=%+v usage=%+v", gotAccount, gotUsage)
 	}
 }
 
