@@ -941,7 +941,6 @@ func (m *Monitor) syncSub2UpstreamFunds(ctx context.Context, row ChannelUpstream
 		var statusErr *upstreamHTTPError
 		if errors.As(err, &statusErr) && statusErr.Status == http.StatusUnauthorized {
 			if cred, err = refreshSub2API(ctx, m.channelUpstreamHTTPClient(), row, cred); err == nil {
-				refreshed = true
 				if err = m.persistSyncedUpstreamAccount(ctx, &row, cred); err == nil {
 					events, earliest, err = m.fetchSub2APIFundEvents(ctx, row, cred, now)
 				}

@@ -1613,10 +1613,6 @@ func dimColOK(dimCol string) bool {
 	return false
 }
 
-func (m *Monitor) storeDimSeries(dimCol string, since int64, windowMinutes int) (map[string][]TimePoint, error) {
-	return m.storeDimSeriesRange(dimCol, since, 0, windowMinutes)
-}
-
 func (m *Monitor) storeDimSeriesRange(dimCol string, since, until int64, windowMinutes int) (map[string][]TimePoint, error) {
 	if !dimColOK(dimCol) {
 		return nil, fmt.Errorf("非法维度列: %q", dimCol)
@@ -1871,14 +1867,6 @@ func (m *Monitor) storeHourSeries(sinceTs int64) []HourPoint {
 	return pts
 }
 
-func (m *Monitor) storeHourSeriesRange(sinceTs, untilTs int64) []HourPoint {
-	pts, err := m.storeHourSeriesRangeE(sinceTs, untilTs)
-	if err != nil {
-		slog.Warn("storeHourSeriesRange 失败", "err", err)
-	}
-	return pts
-}
-
 func (m *Monitor) storeHourSeriesRangeE(sinceTs, untilTs int64) ([]HourPoint, error) {
 	var pts []HourPoint
 	q := `SELECT hour_ts AS ts, success, anomaly, failed FROM hour_samples WHERE hour_ts >= ?`
@@ -1905,15 +1893,6 @@ func (m *Monitor) storeHourSeriesRangeE(sinceTs, untilTs int64) ([]HourPoint, er
 		pts = complete
 	}
 	return pts, nil
-}
-
-// periodStat 取 [fromTs,toTs) 的小时级汇总统计(同比环比用)。
-func (m *Monitor) periodStat(fromTs, toTs int64) PeriodStat {
-	stat, err := m.periodStatE(fromTs, toTs)
-	if err != nil {
-		slog.Warn("periodStat 失败", "err", err)
-	}
-	return stat
 }
 
 func (m *Monitor) periodStatE(fromTs, toTs int64) (PeriodStat, error) {

@@ -161,13 +161,6 @@ func (m *Monitor) sampleInfra(ctx context.Context) {
 	m.sampleManagedAWSInfra(cctx, time.Now().Unix()/60*60)
 }
 
-// infraTargets 将显式配置与自动发现取并集。显式项用于兜底，但不能阻止后来新增的
-// Lightsail 资源进入监控；需要排除的资源只能通过 MONITOR_INFRA_EXCLUDE_RESOURCES 表达。
-func (m *Monitor) infraTargets(ctx context.Context, cl *lightsail.Client) []infraTarget {
-	targets, _ := m.infraTargetsWithDiscovery(ctx, cl, time.Now().Unix()/60*60)
-	return targets
-}
-
 func (m *Monitor) infraTargetsWithDiscovery(ctx context.Context, cl *lightsail.Client, bucket int64) ([]infraTarget, []InfraSample) {
 	explicit := parseInfraTargets(m.cfg.InfraResources)
 	var discovered []infraTarget
