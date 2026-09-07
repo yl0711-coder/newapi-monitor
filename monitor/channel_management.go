@@ -590,6 +590,23 @@ func (m *Monitor) loadChannelUpstreamUsage(ctx context.Context, scope stabilityS
 		}
 		result[domain] = a.metrics
 	}
+	// A daily-only provider cannot supply a precise rolling-hour bill. Report
+	// that unsupported boundary even when no complete bucket fits the range;
+	// an empty selection is not evidence of zero consumption or failed capture.
+	for domain, account := range accounts {
+		granularity := account.UsageGranularity
+		if granularity == "" {
+			granularity = upstreamUsageGranularity(account.Provider, account.UsageAdapter)
+		}
+		if !account.UsageSyncEnabled || granularity != "day" ||
+			(scope.FromTs == cstDayStart(scope.FromTs) && scope.ToTs == cstDayStart(scope.ToTs)) {
+			continue
+		}
+		if _, found := result[domain]; !found {
+			result[domain] = ChannelUpstreamUsageMetrics{ExpectedHours: expected, Granularity: granularity,
+				IntegrityStatus: upstreamUsageIntegrityWindowMismatch}
+		}
+	}
 	return result, nil
 }
 

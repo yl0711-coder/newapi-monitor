@@ -565,6 +565,11 @@ func (m *Monitor) computeInfraSnapshot(nowUnix int64) InfraSnapshot {
 		if m.infraExcluded(r.Resource) || retired[r.Resource] || r.Metric == infraPresenceMetric {
 			continue
 		}
+		if r.RType == "lock" && !m.originLockConfigured(r.Resource) {
+			// Retain historical samples; removing a configured target retires it
+			// from the current dashboard and alert evaluation immediately.
+			continue
+		}
 		a := byRes[r.Resource]
 		if a == nil {
 			a = &acc{rtype: r.RType, metrics: map[string]float64{}, metricTs: map[string]int64{}}

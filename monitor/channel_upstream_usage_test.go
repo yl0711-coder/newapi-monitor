@@ -1223,6 +1223,23 @@ func TestAICodeWithTailPublishesFrozenRoundWatermark(t *testing.T) {
 	if row.UsageDataUntil != firstNow {
 		t.Fatalf("published watermark=%d want frozen window=%d (scheduler now=%d)", row.UsageDataUntil, firstNow, secondNow)
 	}
+	// Reuse the same deterministic multi-key fixture for a history round
+	// completed after midnight. The caller must not skip the newly closed day.
+	firstNow = time.Date(2026, 8, 20, 23, 55, 0, 0, cstLocation).Unix()
+	closedTo := cstDayStart(firstNow)
+	row.UsageBackfillCursor = closedTo - 86400
+	if err := m.syncStoredAICodeWithUsage(context.Background(), &row, normalized, firstNow, upstreamUsageLaneHistory); err != nil {
+		t.Fatal(err)
+	}
+	if row.UsageBackfillCursor != closedTo-86400 {
+		t.Fatal("incomplete multi-key history must not advance its cursor")
+	}
+	if err := m.syncStoredAICodeWithUsage(context.Background(), &row, normalized, firstNow+600, upstreamUsageLaneHistory); err != nil {
+		t.Fatal(err)
+	}
+	if row.UsageBackfillCursor != closedTo || row.UsageBackfillDone {
+		t.Fatalf("midnight must preserve the frozen history window: cursor=%d done=%v", row.UsageBackfillCursor, row.UsageBackfillDone)
+	}
 }
 
 func TestAICodeWithTransientFailureResumesWithoutRepeatingSuccessfulKeys(t *testing.T) {

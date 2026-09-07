@@ -750,8 +750,9 @@ func TestChannelManagementAICodeWithLivePartialDayIsVisible(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(usage) != 0 {
-		t.Fatalf("historical partial day must stay excluded: %+v", usage)
+	got = usage["aicodewith.com"]
+	if got.Available || got.CostUSD != 0 || got.Requests != 0 || got.IntegrityStatus != upstreamUsageIntegrityWindowMismatch {
+		t.Fatalf("historical partial day must stay excluded with an explicit boundary reason: %+v", usage)
 	}
 }
 

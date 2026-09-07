@@ -162,6 +162,7 @@ func TestProbeViaDrift(t *testing.T) {
 
 func TestLockSnapshot(t *testing.T) {
 	m := newTestMonitor(t)
+	m.cfg.OriginLockTargets = "172.26.0.20:80,172.26.10.97:80"
 	const bucket = 1_700_000_000 / 60 * 60
 	rows := []InfraSample{
 		// 源站 A:403 锁生效

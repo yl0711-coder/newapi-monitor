@@ -954,10 +954,11 @@ func (m *Monitor) readCapacityIngress(ctx context.Context, from, to, bucket, now
 	out := make([]capacityIngressPoint, 0, len(rows))
 	if err == nil {
 		for _, row := range rows {
-			mins := float64(bucket / 60)
-			if mins < 1 {
-				mins = 1
+			seconds := min(to, row.Ts+bucket) - max(from, row.Ts)
+			if seconds <= 0 {
+				continue
 			}
+			mins := float64(seconds) / 60
 			avg := float64(0)
 			avgUpstream := float64(0)
 			if row.Count > 0 {
@@ -966,7 +967,7 @@ func (m *Monitor) readCapacityIngress(ctx context.Context, from, to, bucket, now
 			if row.UpstreamTimeCount > 0 {
 				avgUpstream = float64(row.UpstreamTimeSumMS) / float64(row.UpstreamTimeCount)
 			}
-			windowMS := float64(bucket * 1000)
+			windowMS := float64(seconds * 1000)
 			latencyCoverage := float64(0)
 			if row.Count > 0 {
 				latencyCoverage = float64(row.LatencyCount) / float64(row.Count) * 100

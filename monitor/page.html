@@ -446,7 +446,6 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
     </div>
     <nav class="tabs monitor-nav">
       <div class="tab active" data-tab="usage" title="用户用量"><span class="monitor-nav-icon"><svg viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"/></svg></span><span class="monitor-nav-label">用户用量</span></div>
-      <div class="tab" data-tab="group-governance" title="分组治理"><span class="monitor-nav-icon"><svg viewBox="0 0 24 24"><circle cx="6" cy="6" r="2"/><circle cx="18" cy="6" r="2"/><circle cx="12" cy="18" r="2"/><path d="M8 7.2l3 8.2M16 7.2l-3 8.2M8 6h8"/></svg></span><span class="monitor-nav-label">分组治理</span></div>
       <div class="tab" data-tab="channels" title="渠道管理"><span class="monitor-nav-icon"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a15 15 0 0 1 0 18M12 3a15 15 0 0 0 0 18"/></svg></span><span class="monitor-nav-label">渠道管理</span></div>
       <div class="tab" data-tab="stability" title="稳定性报表"><span class="monitor-nav-icon"><svg viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="m9 12 2 2 4-4"/></svg></span><span class="monitor-nav-label">稳定性报表</span></div>
       <div class="tab" data-tab="model" title="模型监控"><span class="monitor-nav-icon"><svg viewBox="0 0 24 24"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg></span><span class="monitor-nav-label">模型监控</span></div>
@@ -454,6 +453,7 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
       <div class="tab" data-tab="capacity" title="容量规划"><span class="monitor-nav-icon"><svg viewBox="0 0 24 24"><path d="M4 19V9M10 19V5M16 19v-8M22 19V3"/><path d="M2 19h22"/></svg></span><span class="monitor-nav-label">容量规划</span></div>
       <div class="tab" data-tab="sync" title="数据同步状态"><span class="monitor-nav-icon"><svg viewBox="0 0 24 24"><path d="M20 7h-6V1"/><path d="M4 17h6v6"/><path d="M20 7a8 8 0 0 0-13.7-3.6L4 5.7M4 17a8 8 0 0 0 13.7 3.6l2.3-2.3"/></svg></span><span class="monitor-nav-label">数据同步状态</span></div>
       <div class="tab" data-tab="logchain" title="客户排障"><span class="monitor-nav-icon"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/><path d="M11 8v3"/><path d="M11 14h.01"/></svg></span><span class="monitor-nav-label">客户排障</span></div>
+      <div class="tab" data-tab="group-governance" title="分组治理（测试）"><span class="monitor-nav-icon"><svg viewBox="0 0 24 24"><circle cx="6" cy="6" r="2"/><circle cx="18" cy="6" r="2"/><circle cx="12" cy="18" r="2"/><path d="M8 7.2l3 8.2M16 7.2l-3 8.2M8 6h8"/></svg></span><span class="monitor-nav-label">分组治理</span></div>
     </nav>
     <button type="button" class="monitor-sidebar-toggle" id="monitorSidebarToggle" aria-expanded="true" aria-label="收起侧边栏" title="收起侧边栏">
       <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m15 18-6-6 6-6"/></svg><span>收起侧边栏</span>
@@ -472,13 +472,13 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
     <nav class="tabs monitor-mobile-tabs" aria-label="Monitor 导航">
       <div class="tab" data-tab="sync">同步状态</div>
       <div class="tab active" data-tab="usage">用户用量</div>
-      <div class="tab" data-tab="group-governance">分组治理</div>
       <div class="tab" data-tab="channels">渠道管理</div>
       <div class="tab" data-tab="stability">稳定性报表</div>
       <div class="tab" data-tab="model">模型监控</div>
       <div class="tab" data-tab="server">服务端监控</div>
       <div class="tab" data-tab="capacity">容量规划</div>
       <div class="tab" data-tab="logchain">客户排障</div>
+      <div class="tab" data-tab="group-governance">分组治理</div>
     </nav>
 
     <div class="monitor-content">
@@ -795,9 +795,9 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
         <label class="cm-upstream-sub2api"><span>认证方式</span><select id="cmUpstreamAuthMode"><option value="password">邮箱密码</option><option value="refresh_token">导入已登录会话</option></select></label>
         <label class="cm-upstream-sub2api cm-upstream-sub2-password wide"><span>登录密码</span><input id="cmUpstreamPassword" type="password" autocomplete="new-password" placeholder="已连接时留空表示沿用当前会话"><small>适用于没有验证码或 Turnstile 的站点；密码只用于本次换取令牌</small></label>
         <label class="cm-upstream-sub2api cm-upstream-sub2-refresh wide" hidden><span>Refresh Token</span><input id="cmUpstreamRefreshToken" type="password" autocomplete="new-password" placeholder="从上游浏览器已登录会话复制"><small>先在上游完成登录，再从浏览器开发者工具 → Application（应用）→ Local Storage → 当前站点复制 refresh_token；Monitor 只通过官方刷新接口验证，输入值不原样保存、不回显</small></label>
-        <label class="cm-upstream-tokenforce"><span>组织 ID（orgId）</span><input id="cmUpstreamOrgID" type="number" min="1" step="1" inputmode="numeric" placeholder="例如 123"><small>填写上游组织 ID，不是租户 tenantId、API Key 名称或本地令牌名</small></label>
+        <label class="cm-upstream-tokenforce"><span>组织 ID（orgId）</span><input id="cmUpstreamOrgID" type="number" min="1" step="1" inputmode="numeric" placeholder="例如 123"><small>登录上游 → 浏览器开发者工具 Network → 刷新余额页，在 /api/orgs/数字/balance 中取该数字，或查看 usages 请求的 orgId。不是 tenantId、API Key ID 或令牌名。</small></label>
         <label class="cm-upstream-tokenforce"><span>人民币结算换算</span><input id="cmUpstreamUnitPerUSD" type="number" min="0.000001" step="0.000001" inputmode="decimal" placeholder="每 1 USD 对应多少 CNY"><small>接口账面金额为 CNY；必须按结算口径配置 CNY/每 USD，不能把人民币直接当美元</small></label>
-        <label class="cm-upstream-tokenforce wide"><span>Refresh Token</span><input id="cmUpstreamTokenForceRefreshToken" type="password" autocomplete="new-password" placeholder="从上游已登录浏览器会话复制"><small>密码登录有阿里云人机验证，Monitor 不保存账号密码；这里只导入可轮换会话，输入值验证后不会原样回显</small></label>
+        <label class="cm-upstream-tokenforce wide"><span>Refresh Token</span><input id="cmUpstreamTokenForceRefreshToken" type="password" autocomplete="new-password" placeholder="从上游已登录浏览器会话复制"><small>登录前打开 Network，查看 /api/sys/login/password 或 /api/sys/login/refresh 的响应，复制 refreshToken（不是 accessToken 或模型 API Key）。直接填入这里，不要贴到聊天；优先使用专用只读账号，避免个人浏览器与 Monitor 互相轮换会话。</small></label>
         <section class="cm-upstream-aicodewith wide cm-upstream-key-field">
           <div class="cm-upstream-key-head"><span>AICodeWith API Keys</span><button type="button" id="cmUpstreamAddAPIKey">+添加 Key</button></div>
           <div class="cm-upstream-key-list" id="cmUpstreamAPIKeyList"></div>
@@ -848,7 +848,7 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
   <div class="card"><div class="card-header">⚖️ 负载均衡</div><div id="lbBody" style="padding:16px 20px"><span class="muted">加载中…</span></div></div>
 
   <!-- 6. 最近告警 -->
-  <div class="card"><div class="card-header">🔔 最近告警 <span class="muted" style="font-weight:400">· 服务端监控触发的告警(最近 20 条)</span></div>
+  <div class="card"><div class="card-header">🔔 历史告警 <span class="muted" style="font-weight:400">· 最近 20 条触发记录，不代表当前仍故障；关闭邮件不停止记录，当前状态以上方资源为准</span></div>
     <div id="infraAlerts" style="padding:14px 18px"><span class="muted">加载中…</span></div></div>
 </div>
 
@@ -2002,7 +2002,7 @@ function syncRenderRuntime(ready,stores){
   document.getElementById('syncRuntime').innerHTML=[
     syncKV('来源状态',source.worker_enabled?`${source.state||'未知'}${source.lease_held?' · 已持租约':''}`:'本机只读/未启用',source.last_failure_at?`最近失败：${syncTime(source.last_failure_at)}`:''),
     syncKV('来源最近成功',syncTime(source.last_success_at),source.failure_streak?`连续失败 ${source.failure_streak} 次`:'全局来源读取水位'),
-    syncKV('模型/令牌定稿',finalize.through_ts?syncTime(finalize.through_ts):'等待首次定稿',finalize.target_ts?`目标 ${syncTime(finalize.target_ts)}`:'来源 worker 启动后建立水位'),
+    syncKV('模型/令牌定稿',finalize.through_ts?syncTime(finalize.through_ts):'等待首次定稿',finalize.target_ts?`目标 ${syncTime(finalize.target_ts)} · 尚需追赶 ${usageFactsDuration(Math.max(0,(+finalize.target_ts||0)-(+finalize.through_ts||0)))}`:'来源 worker 启动后建立水位'),
     syncKV('定稿最近成功',syncTime(finalize.last_success_at),finalize.last_failure_at?`最近失败：${syncTime(finalize.last_failure_at)}`:'长请求迟到日志补全'),
     syncKV('主库完整性',main.integrity_ok?'通过':'未通过',main.integrity_checked_at?`检查于 ${syncTime(main.integrity_checked_at)}`:''),
     syncKV('事实库完整性',facts.integrity_ok?'通过':'未通过',facts.integrity_checked_at?`检查于 ${syncTime(facts.integrity_checked_at)}`:''),
@@ -2037,7 +2037,7 @@ async function syncLoadUsageWorkloads(state='all',offset=0){
 function syncMaintenanceRows(jobs){return (jobs||[]).map(x=>{const range=x.from_ts?`${syncTime(x.from_ts)} → ${syncTime(x.through_ts)}`:'—';const progress=+x.total_hours?`${fmtNum(x.completed_hours)}/${fmtNum(x.total_hours)} 小时`:'待定界';const actions=x.user_id?usageHistoryRetryHTML(x.user_id,x.job_id,x.status):'';return `<tr><td>${esc(usageFactsStageLabel(x.kind))}</td><td>${x.user_id?'#'+(+x.user_id):'全局'}</td><td>${esc(x.status||'—')}</td><td>${range}</td><td>${syncTime(x.next_hour)}</td><td>${progress}</td><td>${syncTime(x.next_retry_at)}</td><td class="history-error">${esc(x.last_error||x.reason||'—')}</td><td>${actions||'—'}</td></tr>`}).join('')}
 function syncRenderMaintenance(history,meta={}){
   const jobs=history.maintenance||[],target=document.getElementById('syncFactMaintenance'),state=meta.state||'attention',total=meta.total==null?jobs.length:+meta.total,allTotal=meta.all_total==null?jobs.length:+meta.all_total,offset=+meta.offset||0,limit=+meta.limit||50;
-  const controls=`<div class="sync-table-note">${state==='all'?'全部维护任务':'需要处理'} ${fmtNum(total)} 个 · 共 ${fmtNum(allTotal)} 个 <button class="btn" type="button" onclick="syncLoadMaintenance('${state==='all'?'attention':'all'}',0)">${state==='all'?'只看待处理':'查看全部维护任务'}</button></div>`;
+  const controls=`<div class="sync-table-note">${state==='all'?'全部维护任务':'待完成或需处理的维护任务'} ${fmtNum(total)} 个 · 共 ${fmtNum(allTotal)} 个。排队审计不等于数据缺失；异常以失败、暂停及校验差异为准。 <button class="btn" type="button" onclick="syncLoadMaintenance('${state==='all'?'attention':'all'}',0)">${state==='all'?'只看待处理':'查看全部维护任务'}</button></div>`;
   if(!jobs.length){target.innerHTML=controls+'<div class="sync-table-note">'+(state==='all'?'没有维护任务。':'没有暂停、失败或进行中的维护任务。')+'</div>';return}
   const prev=offset>0?`<button class="btn" type="button" onclick="syncLoadMaintenance('${state}',${Math.max(0,offset-limit)})">上一页</button>`:'',next=offset+jobs.length<total?`<button class="btn" type="button" onclick="syncLoadMaintenance('${state}',${offset+limit})">下一页</button>`:'';
   target.innerHTML=`<details class="usage-history-detail" open><summary>维护、审计与修复任务 · ${fmtNum(total)} 个</summary>${controls}<div class="monitor-table-scroll"><table><thead><tr><th>类型</th><th>用户</th><th>状态</th><th>范围</th><th>下一水位</th><th>进度</th><th>下次重试</th><th>原因/错误</th><th>操作</th></tr></thead><tbody>${syncMaintenanceRows(jobs)}</tbody></table></div><div class="sync-table-note">${prev} ${next}</div></details>`;
@@ -2068,9 +2068,9 @@ function syncRenderFacts(facts,history){
     syncKV('分页事实导入',h.raw_page_enabled?`${fmtNum(h.raw_page_complete_hours)}/${fmtNum(h.raw_page_hours)} 小时完成`:'未启用',h.raw_page_enabled?`${fmtNum(h.raw_page_pages)} 页 · ${fmtNum(h.raw_page_source_rows)} 条原始日志 · ${fmtNum(h.raw_page_active_members)} 个成员处理中`:'仍使用聚合导入'),
     syncKV('签收校验',h.total_hours?`${((+h.verified_hours||0)*100/(+h.total_hours||1)).toFixed(1)}%`:(f.semantic_audit_ok?'通过':'待校验'),h.estimate_status?usageFactsEstimateText(h):''),
     syncKV('服务范围',serving,'成员各自 floor 前的数据不会参与读取'),
-    syncKV('Tail 最新完成',syncTime(f.latest_complete_hour),f.last_fact_sync_at?`最近同步 ${syncAge(f.last_fact_sync_at)}前`:''),
+    syncKV('已签收小时',syncTime(f.latest_complete_hour),h.raw_page_enabled?'当前使用分页导入；同步进度以实时/近期水位为准':(f.last_fact_sync_at?`最近同步 ${syncAge(f.last_fact_sync_at)}前`:'')),
     syncKV('修复/审计',f.repair_active?'修复中':'无进行中修复',f.repair_last_error||''),
-    syncKV('维护任务',`${fmtNum(facts.maintenance_attention||0)} 个待处理`,`全部 ${fmtNum(facts.maintenance_total||0)} 个 · 进行中修复 ${fmtNum(h.active_repairs||0)} · 已暂停 ${fmtNum(h.paused_maintenance||0)}`),
+    syncKV('维护与复核',`${fmtNum(facts.maintenance_attention||0)} 个未结束/待处理`,`不是缺失用户数 · 进行中修复 ${fmtNum(h.active_repairs||0)} · 已暂停 ${fmtNum(h.paused_maintenance||0)}`),
     syncKV('历史来源',`${h.source_mode||'—'} · ${h.source_epoch||'—'}`,h.bulk_circuit_state&&h.bulk_circuit_state!=='closed'?`来源熔断：${h.bulk_circuit_state}`:'')
   ].join('');
   syncLastUsageHistory=h;
@@ -2178,7 +2178,7 @@ function syncRenderStability(health){
   const enabled=h.nginx_enabled!==undefined||h.checked_at!==undefined;
   const level=explicitlyDisabled?'neutral':(!enabled?'warn':(h.status==='ok'?'ok':'warn'));
   const hourlyDetail=hourly
-    ?`${(+hourly.progress_percent||0).toFixed(1)}% · ${fmtNum(hourly.completed_hours)}/${fmtNum(hourly.total_hours)} 小时 · 失败 ${fmtNum(hourly.failed_hours)}${hourly.estimated_remaining_seconds?` · ETA ${usageFactsDuration(hourly.estimated_remaining_seconds)}`:''}`
+    ?`${(+hourly.progress_percent||0).toFixed(1)}% · ${fmtNum(hourly.completed_hours)}/${fmtNum(hourly.total_hours)} 小时 · 失败 ${fmtNum(hourly.failed_hours)}${hourly.status==='paused'?' · 已暂停，不预计完成时间':(hourly.estimated_remaining_seconds?` · ETA ${usageFactsDuration(hourly.estimated_remaining_seconds)}`:'')}`
     :'无迁移任务';
   const problemDetail=migration.percent!=null
     ?`${(+migration.percent).toFixed(1)}% · 最近成功 ${syncTime(migration.last_success_at)} · ${migration.estimated_seconds==null?'暂无 ETA':`ETA ${usageFactsDuration(migration.estimated_seconds)}`}`
@@ -2193,7 +2193,7 @@ function syncRenderStability(health){
     syncKV('本地库',h.store_reachable?'可访问':'不可访问',h.store_bytes?`${fmtNum(h.store_bytes)} B（含 WAL）`:''),
     syncKV('Nginx 入口',h.nginx_enabled?`${fmtNum(h.nginx_source_count)} 个 access 来源`:'未启用',h.nginx_enabled?`access 异常 ${fmtNum(h.nginx_unhealthy_sources)} · error ${h.nginx_error_enabled?`${fmtNum(h.nginx_error_source_count)} 来源 / 异常 ${fmtNum(h.nginx_error_unhealthy_sources)}`:'未启用'} · backlog ${fmtNum(h.nginx_backlog_bytes)} B`:''),
     syncKV('请求证据',evidence.enabled?`${evidence.mode==='verified'?'已验证':'灰度验证'} · ${fmtNum(evidence.source_count)} 个来源`:'未启用',evidence.enabled?`异常 ${fmtNum(evidence.unhealthy_sources)} · 队列 ${fmtNum(evidence.outbox_batches)} 批 / ${fmtNum(evidence.outbox_bytes)} B · 本地库 ${fmtNum(evidence.store_bytes)} B`:''),
-    syncKV('证据完整性',evidence.enabled?`接收 ${fmtNum(evidence.accepted)} · 拒绝 ${fmtNum(evidence.rejected)} · 缺口 ${fmtNum(evidence.gap_count)}`:'—',evidence.enabled?`丢弃 ${fmtNum(evidence.dropped_events)} · NewAPI Request ID 缺失 ${fmtNum(evidence.missing_oneapi_id)} · 最近入库 ${syncTime(evidence.last_ingest_at)}`:''),
+    syncKV('证据累计计数',evidence.enabled?`接收 ${fmtNum(evidence.accepted)} · 拒绝 ${fmtNum(evidence.rejected)} · 缺口 ${fmtNum(evidence.gap_count)}`:'—',evidence.enabled?`历史累计，不是当前新增丢失数。丢弃 ${fmtNum(evidence.dropped_events)} · Request ID 缺失 ${fmtNum(evidence.missing_oneapi_id)} · 最近入库 ${syncTime(evidence.last_ingest_at)}`:''),
     syncKV('问题覆盖至',syncTime(h.problem_coverage_to),h.problem_live_target_to?`目标 ${syncTime(h.problem_live_target_to)}`:'')
   ].join('');
   return level;

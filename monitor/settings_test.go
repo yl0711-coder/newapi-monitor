@@ -19,8 +19,8 @@ func TestOriginLockTargetsAllowExplicitDisable(t *testing.T) {
 	if err := os.Unsetenv(key); err != nil {
 		t.Fatal(err)
 	}
-	if got := LoadSettings().OriginLockTargets; got != "172.26.0.20:80,172.26.10.97:80" {
-		t.Fatalf("unset compatibility default changed: %q", got)
+	if got := LoadSettings().OriginLockTargets; got != "" {
+		t.Fatalf("unset targets must not probe retired infrastructure: %q", got)
 	}
 }
 

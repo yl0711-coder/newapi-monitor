@@ -46,7 +46,8 @@ function renderHeader(){
   else if(!s.last_success_at){alert.hidden=false;alert.className='gg-alert bad';alert.textContent=s.last_error||'后台尚未完成首次同步，暂无可靠审计结果。'}
   else if(!s.complete){const errs=(r.source_errors||[]).map(esc).join('；');alert.hidden=false;alert.className='gg-alert';alert.innerHTML=`数据不完整，已保留可用快照：${errs||esc(s.last_error||'部分来源待核验')}。未知不会按 0 处理。`}
   else alert.hidden=true;
-  $('ggTotal').textContent=num(s.current_group_count);$('ggHigh').textContent=num(s.high_risk_count);$('ggNoChannelCount').textContent=num(s.no_enabled_channel_count);$('ggCleanup').textContent=num(s.cleanup_candidate_count);
+  const snapshotNumber=value=>s.last_success_at?num(value):'—';
+  $('ggTotal').textContent=snapshotNumber(s.current_group_count);$('ggHigh').textContent=snapshotNumber(s.high_risk_count);$('ggNoChannelCount').textContent=snapshotNumber(s.no_enabled_channel_count);$('ggCleanup').textContent=snapshotNumber(s.cleanup_candidate_count);
   const coverage=s.coverage_start_at?`历史覆盖 ${dt(s.coverage_start_at)} 至 ${dt(s.coverage_end_at)}${s.history_complete?'':'（不足 30 天）'}`:'历史覆盖尚未核验';$('ggCoverage').textContent=`${coverage} · 无法归属前置拒绝 7d/30d：${num(s.unattributed_rejections_7d)} / ${num(s.unattributed_rejections_30d)}`;
 }
 

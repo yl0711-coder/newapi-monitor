@@ -55,6 +55,9 @@ func TestSnapshotFinalizedWindowDoesNotDriftBetweenWorkerRuns(t *testing.T) {
 		if !s.DataComplete || s.WindowToTs != end || s.WindowFromTs != end-3600 || s.View != "finalized" {
 			t.Fatalf("signed window drifted at offset %d: %+v", offset, s)
 		}
+		if s.Summary.WindowMinutes != s.WindowMinutes {
+			t.Fatal("summary and snapshot must expose the same actual window")
+		}
 		if offset >= 600 && !s.FinalizationDelayed {
 			t.Fatal("old signed result must be labelled delayed")
 		}

@@ -17,8 +17,9 @@ function dashboard(fetchImpl = () => {throw Error('network forbidden in renderer
     },
     addEventListener() {},
   };
+  const chartOptions=[];
   const context = vm.createContext({document, window: {}, fetch: fetchImpl, AbortController, URLSearchParams,
-    setTimeout() {}, clearTimeout() {}, echarts: {init: () => ({clear() {}, setOption() {}, resize() {}})}});
+    setTimeout() {}, clearTimeout() {}, echarts: {init: () => ({clear() {}, setOption(option) {chartOptions.push(option)}, resize() {}})}});
   vm.runInContext(source('channel_data_status.js'), context);
   const channel = source('channel_management.js');
   const end = channel.lastIndexOf('})();');
@@ -40,9 +41,47 @@ function dashboard(fetchImpl = () => {throw Error('network forbidden in renderer
   const capacity = source('capacity.js');
   const capacityEnd = capacity.lastIndexOf('})();');
   assert.ok(capacityEnd > 0);
-  vm.runInContext(capacity.slice(0, capacityEnd) + '\nglobalThis.capacityTest={renderSources,renderKPIs,infraSeries,age,load,state};\n' + capacity.slice(capacityEnd), context);
-  return {context, element: id => document.getElementById(id), html: id => document.getElementById(id).innerHTML};
+  vm.runInContext(capacity.slice(0, capacityEnd) + '\nglobalThis.capacityTest={renderSources,renderKPIs,renderTraffic,infraSeries,age,load,state};\n' + capacity.slice(capacityEnd), context);
+  const governance=source('group_governance.js'),governanceEnd=governance.lastIndexOf('})();');
+  vm.runInContext(governance.slice(0,governanceEnd)+'\nglobalThis.governanceTest={renderHeader,state};\n'+governance.slice(governanceEnd),context);
+  return {context, chartOptions, element: id => document.getElementById(id), html: id => document.getElementById(id).innerHTML};
 }
+
+test('RPM, TPM and stability have independent axes and preserve null gaps',()=>{
+  const {context,chartOptions}=dashboard();
+  context.capacityTest.renderTraffic({series:[{ts:300,business_rpm:10,tpm:1000000,stability_pct:99},{ts:600,business_rpm:null,tpm:null}]});
+  const option=chartOptions.at(-1);
+  assert.equal(option.yAxis[0].name,'RPM');assert.equal(option.yAxis[1].name,'TPM');
+  assert.equal(option.series.find(x=>x.name==='TPM').yAxisIndex,1);
+  assert.equal(option.series.find(x=>x.name==='平台日志稳定率').yAxisIndex,2);
+  assert.equal(option.series[0].data[1][1],null);
+});
+
+test('governance has no fake zero before first snapshot and sits last in both menus',()=>{
+  const {context,element}=dashboard();
+  for(const enabled of [false,true]){
+    context.governanceTest.state.report={enabled,state:{current_group_count:0}};
+    context.governanceTest.renderHeader();
+    assert.equal(element('ggTotal').textContent,'—');
+  }
+  context.governanceTest.state.report={enabled:true,state:{last_success_at:1,current_group_count:0}};
+  context.governanceTest.renderHeader();assert.equal(element('ggTotal').textContent,'0');
+  for(const menu of source('page.html').matchAll(/<nav class="tabs[^]*?<\/nav>/g)){
+    const tabs=[...menu[0].matchAll(/data-tab="([^"]+)"/g)].map(m=>m[1]);
+    assert.equal(tabs.at(-1),'group-governance');
+  }
+});
+
+test('sync includes missing active accounts and explains unrepresentable daily windows',()=>{
+  const {context}=dashboard();
+  const rows=context.window.channelDataStatus.issues({meta:{data_coverage:{complete:true}},domains:[
+    {domain:'missing.example',enabled_channels:2,upstream:{configured:false}},
+    {domain:'daily.example',upstream:{configured:true,balance_usd:20,usage_sync_enabled:true},upstream_usage:{available:false,integrity_status:'window_mismatch'}}
+  ]});
+  assert.equal(rows.length,2);assert.match(rows[0].detail,/2 个启用渠道未配置/);
+  assert.match(rows[1].detail,/自然日账单无法精确拆分/);
+  assert.doesNotMatch(rows[1].detail,/暂无消费账单/);
+});
 
 test('local model preview never masquerades as a production sampler failure or active sampling', () => {
   const {context, html, element} = dashboard();

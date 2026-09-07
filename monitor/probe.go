@@ -43,6 +43,15 @@ type lockResult struct {
 	locked    bool // status==403 即认为锁生效
 }
 
+func (m *Monitor) originLockConfigured(target string) bool {
+	for _, current := range probeDomainList(m.cfg.OriginLockTargets) {
+		if current == target {
+			return true
+		}
+	}
+	return false
+}
+
 // startProbe 启动端到端探活的独立循环(独立于 infra/日志采样)。
 func (m *Monitor) startProbe(ctx context.Context) {
 	if !m.cfg.InfraEnabled {

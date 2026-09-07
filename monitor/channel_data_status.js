@@ -12,18 +12,22 @@ const integrityReasons={
 };
 function issues(report){
   const rows=[],coverage=report?.meta?.data_coverage;
-  if(!coverage||coverage.complete!==true){
+  if(!coverage||coverage.complete!==true||coverage.provisional_seconds>0){
     const detail=coverage?`已确认 ${coverage.completed_hours||0}/${coverage.expected_hours||0} 小时；缺少 ${coverage.missing_hours||0} 小时`:'覆盖状态未返回';
     const pending=coverage?.latest_hour_pending?`；最新小时 ${time(coverage.pending_hour_ts)} 尚在汇总，并非已确认丢失`:'';
     rows.push({scope:'用户侧用量',detail:detail+pending+'。请求数、Tokens、消费及占比按现有记录计算，可能低于最终值。'});
   }
   for(const domain of report?.domains||[]){
     const account=domain.upstream||{},usage=domain.upstream_usage||{},reasons=[];
-    if(!account.configured)continue;
+    if(!account.configured){
+      if(domain.enabled_channels>0)rows.push({scope:domain.domain||'未归并渠道',detail:`${domain.enabled_channels} 个启用渠道未配置上游账户，无法同步余额与账单。`});
+      continue;
+    }
+    if(domain.missing_rate_channels>0)reasons.push(`${domain.missing_rate_channels} 个启用渠道缺少倍率配置，不能据此核验渠道成本`);
     if(!known(account.balance_usd))reasons.push('余额未取得，未计入余额汇总');
     else if(['error','reconnect','stale'].includes(account.status))reasons.push('余额同步异常或已陈旧，当前展示最近一次已取得余额');
     if(account.usage_sync_enabled){
-      if(!usage.available)reasons.push('所选区间暂无消费账单，未计入消费汇总');
+      if(!usage.available)reasons.push(integrityReasons[usage.integrity_status]||'所选区间暂无消费账单，未计入消费汇总');
       else{
         const integrity=usage.integrity_status||'complete';
         if(integrity!=='complete')reasons.push(integrityReasons[integrity]||'账单校验未通过，金额未计入汇总');
@@ -35,6 +39,8 @@ function issues(report){
         }
       }
     }
+    else if(domain.enabled_channels>0)reasons.push('消费日志同步未开启，仅有余额不能核验成本');
+    if(account.usage_status==='reconnect')reasons.push('认证已失效，请在账户配置中重新连接；自动重试不能恢复失效凭证');
     if(reasons.length)rows.push({scope:domain.domain,detail:reasons.join('；')});
   }
   return rows;

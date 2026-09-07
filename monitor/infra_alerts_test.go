@@ -17,3 +17,22 @@ func TestRecentInfraAlertsUsesLiteralPrefix(t *testing.T) {
 		t.Fatalf("literal infra_ prefix query mismatch: %+v", got)
 	}
 }
+
+func TestRetiredOriginProbesDisappearWithoutDeletingHistory(t *testing.T) {
+	m := newTestMonitor(t)
+	const target = "retired.example:80"
+	const now = int64(1800000000)
+	if err := m.upsertInfra([]InfraSample{{BucketTs: now, Resource: target, RType: "lock", Metric: "locked", Value: 0}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.storeDB.Create(&AlertLog{Ts: now, Kind: "infra_origin_lock", Target: target, Detail: "historical"}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if got := m.computeInfraSnapshot(now); len(got.Locks) != 0 || len(got.Alerts) != 0 {
+		t.Fatalf("retired probes leaked into current monitoring: locks=%v alerts=%v", got.Locks, got.Alerts)
+	}
+	m.cfg.OriginLockTargets = target
+	if got := m.computeInfraSnapshot(now); len(got.Locks) != 1 || len(got.Alerts) != 1 {
+		t.Fatal("history was destroyed instead of being filtered from current monitoring")
+	}
+}

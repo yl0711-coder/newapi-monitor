@@ -71,7 +71,7 @@ func TestSyncStatusPageRendersBothStabilityMigrationsWithCorrectFields(t *testin
 		`migration.last_success_at`,
 		`'无迁移任务'`,
 		`syncKV('请求证据'`,
-		`syncKV('证据完整性'`,
+		`syncKV('证据累计计数'`,
 	} {
 		if !strings.Contains(pageHTML, want) {
 			t.Fatalf("稳定性双迁移进度缺少 %q", want)

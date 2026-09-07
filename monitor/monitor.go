@@ -1231,6 +1231,7 @@ func (m *Monitor) computeSnapshotForScope(windowMinutes int, nowUnix int64, obse
 			age = max(int64(0), nowUnix-(lastBucket+60))
 		}
 	}
+	sum.WindowMinutes = windowMinutes
 
 	return &Snapshot{
 		LocalSnapshotOnly: m.cfg.LocalSnapshotOnly,

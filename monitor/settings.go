@@ -259,7 +259,7 @@ type Settings struct {
 	// 源站锁完整性监控(F-5 看门狗):周期性直连各源站 nginx,不带 X-Origin-Verify 头,
 	// 期望被拦 403。一旦变 200 说明锁失效/被回滚(如重建容器漏了 env),立刻红告警。
 	// 走私网,只有部署到实例上才测得到;本地预览连不到私网会显示「无数据」(不误报)。
-	OriginLockTargets string // MONITOR_ORIGIN_LOCK_TARGETS,逗号分隔源站端点(host:port),默认两台 nginx 私网;留空=关闭
+	OriginLockTargets string // MONITOR_ORIGIN_LOCK_TARGETS,逗号分隔源站端点(host:port); 默认关闭，部署时显式配置现用源站
 	OriginLockHost    string // MONITOR_ORIGIN_LOCK_HOST,检查时带的 Host 头,默认 nexusapi.link
 	OriginLockPath    string // MONITOR_ORIGIN_LOCK_PATH,检查路径,默认 /(/ 无内网豁免,无头必 403;勿用 /api/status)
 
@@ -422,7 +422,7 @@ func LoadSettings() Settings {
 		ProbeCertBadDays:   envFloat("MONITOR_PROBE_CERT_BAD_DAYS", 7),
 		ProbeExpectCDN:     env("MONITOR_PROBE_EXPECT_CDN", "true") == "true",
 
-		OriginLockTargets: envAllowEmpty("MONITOR_ORIGIN_LOCK_TARGETS", "172.26.0.20:80,172.26.10.97:80"),
+		OriginLockTargets: envAllowEmpty("MONITOR_ORIGIN_LOCK_TARGETS", ""),
 		OriginLockHost:    env("MONITOR_ORIGIN_LOCK_HOST", "nexusapi.link"),
 		OriginLockPath:    env("MONITOR_ORIGIN_LOCK_PATH", "/"),
 

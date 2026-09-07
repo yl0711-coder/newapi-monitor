@@ -114,6 +114,8 @@ type StabilityDataCoverage struct {
 	LegacyFallbackHours   int64   `json:"legacy_fallback_hours"`
 	LatestHourPending     bool    `json:"latest_hour_pending"`
 	PendingHourTs         int64   `json:"pending_hour_ts,omitempty"`
+	RequestedToTs         int64   `json:"requested_to_ts,omitempty"`
+	ProvisionalSeconds    int64   `json:"provisional_seconds,omitempty"`
 }
 
 func finalizedStabilityHourTo(now int64) int64 {
@@ -154,17 +156,28 @@ func stabilityCompleteHourPredicateSQL(alias string) string {
 
 func (m *Monitor) stabilityDataCoverage(ctx context.Context, fromTs, toTs, now int64) StabilityDataCoverage {
 	fromTs = fromTs / 3600 * 3600
+	requestedTo := toTs
 	finalizedTo := finalizedStabilityHourTo(now)
 	if toTs > finalizedTo {
 		toTs = finalizedTo
 	}
 	toTs = toTs / 3600 * 3600
 	result := StabilityDataCoverage{FromTs: fromTs, ToTs: toTs}
+	// Percent/Complete describe only the finalized interval above. Expose the
+	// excluded live tail separately, even when that finalized interval is 100%.
+	if requestedTo > toTs {
+		result.RequestedToTs = requestedTo
+		result.ProvisionalSeconds = requestedTo - max(fromTs, toTs)
+	}
 	if toTs <= fromTs {
 		result.Complete = true
 		result.Percent = 100
 		result.EffectiveComplete = true
 		result.EffectivePercent = 100
+		result.LatestHourPending = result.ProvisionalSeconds > 0
+		if result.LatestHourPending {
+			result.PendingHourTs = max(fromTs, toTs)
+		}
 		return result
 	}
 	result.ExpectedHours = (toTs - fromTs) / 3600
@@ -185,6 +198,10 @@ func (m *Monitor) stabilityDataCoverage(ctx context.Context, fromTs, toTs, now i
 		result.Percent = float64(result.CompletedHours) / float64(result.ExpectedHours) * 100
 	}
 	result.Complete = result.MissingHours == 0
+	if result.Complete && result.ProvisionalSeconds > 0 {
+		result.LatestHourPending = true
+		result.PendingHourTs = toTs
+	}
 	// 报表读取可在 v5 尚未覆盖的小时回退到旧口径，但同一小时一旦有
 	// v5 事实或 v5 零流量签收就立即停止回退。这里单独暴露“可展示覆盖”
 	// 与严格 v5 覆盖；前者服务页面连续性，后者继续作为迁移/就绪门禁。

@@ -745,6 +745,11 @@ func (m *Monitor) buildStabilityReportWithDetails(ctx context.Context, scope sta
 		periodDays = 1
 	}
 	comparisonShift := int64(periodDays) * 86400
+	// A rolling window can touch two calendar dates without spanning two
+	// days. Compare it with the immediately preceding window of equal length.
+	if scope.RangeHours > 0 {
+		comparisonShift = scope.ToTs - scope.FromTs
+	}
 	previousScope := scope
 	previousScope.FromTs = scope.FromTs - comparisonShift
 	previousScope.ToTs = scope.ToTs - comparisonShift

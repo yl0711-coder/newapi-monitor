@@ -1093,6 +1093,13 @@ func decorateUpstreamUsageHealth(view *ChannelUpstreamAccountView, row ChannelUp
 	}
 	view.UsageTailPhase = view.UsageEffectiveStatus
 	view.UsageHistoryPhase = upstreamUsageHistoryPhase(row, s)
+	if row.Provider == upstreamProviderAICodeWith && row.UsageBackfillDone &&
+		row.UsageBackfillCursor > 0 && row.UsageBackfillCursor < cstDayStart(now) {
+		view.UsageBackfillDone = false
+		if view.UsageHistoryPhase == "complete" {
+			view.UsageHistoryPhase = "backfilling"
+		}
+	}
 }
 
 // upstreamUsageHistoryPhase is deliberately independent from the realtime

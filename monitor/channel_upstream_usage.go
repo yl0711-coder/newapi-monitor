@@ -2029,6 +2029,8 @@ func (m *Monitor) processAICodeWithRound(ctx context.Context, row *ChannelUpstre
 		// 尚未读取的几分钟虚报为已同步。
 		if kind == "tail" {
 			row.UsageDataUntil = round.WindowTo
+		} else if kind == "backfill" {
+			row.UsageBackfillCursor = round.WindowTo
 		}
 		row.UsageAdapter = upstreamUsageAdapterAICodeWith
 		return true, int64(round.TotalKeys), processed, nil
@@ -2176,6 +2178,10 @@ func (m *Monitor) syncStoredAICodeWithUsage(ctx context.Context, row *ChannelUps
 		row.UsageBackfillDone, row.UsageBackfillNextSyncAt = true, 0
 		return nil
 	}
+	// Completion is relative to the last closed day, not a permanent switch.
+	// Resume at the published cursor after midnight, retaining all per-key
+	// checkpoints and the existing bounded round/retry budget.
+	row.UsageBackfillDone = false
 	if budget <= 0 || (row.UsageBackfillNextSyncAt > now && row.UsageBackfillNextSyncAt != upstreamAccountIsolatedUntil) || row.UsageBackfillNextSyncAt == upstreamAccountIsolatedUntil {
 		return nil
 	}
@@ -2209,9 +2215,11 @@ func (m *Monitor) syncStoredAICodeWithUsage(ctx context.Context, row *ChannelUps
 		}
 		return nil
 	}
-	row.UsageBackfillCursor, row.UsageBackfillLastSuccessAt = to, now
+	// The round may have started before midnight; use its published cursor,
+	// not the newly computed target, or an entire day could be skipped.
+	row.UsageBackfillLastSuccessAt = now
 	row.UsageBackfillConsecutiveFails, row.UsageBackfillLastError = 0, ""
-	row.UsageBackfillDone = to >= today
+	row.UsageBackfillDone = row.UsageBackfillCursor >= today
 	if row.UsageBackfillDone {
 		row.UsageBackfillNextSyncAt = 0
 	} else {
@@ -2804,8 +2812,12 @@ func (m *Monitor) loadDueUpstreamUsageAccountsForLane(ctx context.Context, now i
 		(usage_backfill_done = ? AND (usage_backfill_next_sync_at = 0 OR usage_backfill_next_sync_at <= ?)
 			AND usage_status = ?)
 		OR (provider = ? AND usage_backfill_done = ? AND usage_backfill_last_error = ?)
+		OR (provider = ? AND usage_backfill_done = ? AND usage_backfill_cursor > 0
+			AND usage_backfill_cursor < ? AND usage_status = ?
+			AND (usage_backfill_next_sync_at = 0 OR usage_backfill_next_sync_at <= ?))
 	)`, true, true, false, now, upstreamStatusOK,
-		upstreamProviderNewAPI, false, legacyBudgetError).
+		upstreamProviderNewAPI, false, legacyBudgetError,
+		upstreamProviderAICodeWith, true, cstDayStart(now), upstreamStatusOK, now).
 		Order("usage_backfill_next_sync_at ASC, domain ASC").
 		Limit(limit).Find(&rows).Error
 	return rows, err

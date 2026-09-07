@@ -24,7 +24,7 @@ func (m *Monitor) recentInfraAlerts(nowUnix int64, limit int) []InfraAlert {
 	}
 	out := make([]InfraAlert, 0, len(logs))
 	for _, l := range logs {
-		if m.infraExcluded(l.Target) {
+		if m.infraExcluded(l.Target) || (strings.HasPrefix(l.Kind, "infra_origin_lock") && !m.originLockConfigured(l.Target)) {
 			continue
 		}
 		st := "bad"

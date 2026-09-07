@@ -63,3 +63,26 @@ func TestChannelDataStatusRejectsInvalidRangesAndReturnsDisabledExplicitly(t *te
 		t.Fatal("disabled diagnostic must not masquerade as complete")
 	}
 }
+
+func TestChannelDataStatusIncludesUnconfiguredActiveUpstreams(t *testing.T) {
+	m := newStabilityTestMonitor(t)
+	if err := m.storeDB.Exec(`INSERT INTO channel_snaps (id,status,base_domain,deleted_at)
+		VALUES (1,1,'missing.example',0),(2,2,'disabled.example',0),(3,1,'deleted.example',123)`).Error; err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 9, 7, 13, 0, 0, 0, cstLocation).Unix()
+	if err := m.storeDB.Exec("PRAGMA query_only = ON").Error; err != nil {
+		t.Fatal(err)
+	}
+	result, err := m.buildChannelDataStatus(context.Background(), stabilityScope{FromTs: now - 86400, ToTs: now - 7200}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Domains) != 1 || result.Domains[0].Domain != "missing.example" ||
+		result.Domains[0].Upstream.Configured || result.Domains[0].EnabledChannels != 1 || result.Domains[0].MissingRateChannels != 1 {
+		t.Fatalf("only active unconfigured upstream should need action: %+v", result.Domains)
+	}
+	if result.Meta.GeneratedAt != now || result.Meta.TimeZone != "Asia/Shanghai" {
+		t.Fatalf("diagnostic timestamp must be meaningful: %+v", result.Meta)
+	}
+}
