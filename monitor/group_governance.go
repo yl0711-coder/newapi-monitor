@@ -35,6 +35,7 @@ const (
 	groupGovernanceQueryTimeout  = 35 * time.Second
 	groupGovernanceHistoryDays   = 30
 	groupGovernanceUserPageLimit = 100
+	groupGovernanceMaxRetrySteps = 12 // 2^11 分钟已覆盖最长 24 小时同步周期。
 )
 
 const groupGovernanceTokenStatsSQL = "SELECT /*+ MAX_EXECUTION_TIME(8000) */ " +
@@ -197,23 +198,50 @@ func groupGovernanceInterval(minutes int) time.Duration {
 }
 
 func (m *Monitor) runGroupGovernanceLoop(ctx context.Context) {
-	run := func() {
-		if err := m.syncGroupGovernance(ctx); err != nil && ctx.Err() == nil {
-			// 错误只记录类别化摘要；SQL/DSN/数据内容不输出。
-			m.markGroupGovernanceFailure(err)
-		}
-	}
-	run()
-	ticker := time.NewTicker(groupGovernanceInterval(m.cfg.GroupGovernanceSyncMinutes))
-	defer ticker.Stop()
+	timer := time.NewTimer(0)
+	defer timer.Stop()
+	failures := 0
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
-			run()
+		case <-timer.C:
+			if ctx.Err() != nil {
+				return
+			}
+			err := m.syncGroupGovernance(ctx)
+			if ctx.Err() != nil {
+				return
+			}
+			if err != nil {
+				// 保留旧快照；排队或短暂失败不能让首次验收等完整同步周期。
+				m.markGroupGovernanceFailure(err)
+				if failures < groupGovernanceMaxRetrySteps {
+					failures++
+				}
+			} else {
+				failures = 0
+			}
+			timer.Reset(groupGovernanceRetryDelay(m.cfg.GroupGovernanceSyncMinutes, failures))
 		}
 	}
+}
+
+// 失败后按 1/2/4/... 分钟退避，封顶为正常同步间隔。
+// 查询仍走原低优先级泳道和 35 秒预算，不与上一次尝试重叠。
+func groupGovernanceRetryDelay(syncMinutes, failures int) time.Duration {
+	regular := groupGovernanceInterval(syncMinutes)
+	if failures <= 0 {
+		return regular
+	}
+	delay := time.Minute
+	for attempt := 1; attempt < failures && delay < regular; attempt++ {
+		delay *= 2
+	}
+	if delay > regular {
+		return regular
+	}
+	return delay
 }
 
 func (m *Monitor) syncGroupGovernance(parent context.Context) error {

@@ -321,6 +321,36 @@ func TestGroupGovernanceSettingsAndIntervalGuard(t *testing.T) {
 	}
 }
 
+func TestGroupGovernanceRetryDelayBoundedAndReset(t *testing.T) {
+	for _, tc := range []struct {
+		minutes, failures int
+		want              time.Duration
+	}{
+		{30, 0, 30 * time.Minute}, {30, 1, time.Minute},
+		{30, 2, 2 * time.Minute}, {30, 3, 4 * time.Minute},
+		{30, 6, 30 * time.Minute}, {30, 1000000, 30 * time.Minute},
+		{0, 5, 5 * time.Minute}, {2000, groupGovernanceMaxRetrySteps, 24 * time.Hour},
+		{30, -1, 30 * time.Minute},
+	} {
+		if got := groupGovernanceRetryDelay(tc.minutes, tc.failures); got != tc.want {
+			t.Fatalf("minutes=%d failures=%d delay=%v want=%v", tc.minutes, tc.failures, got, tc.want)
+		}
+	}
+}
+
+func TestGroupGovernanceLoopCancellationDoesNotQuery(t *testing.T) {
+	m := &Monitor{cfg: Settings{GroupGovernanceEnabled: true}, prodDB: &sql.DB{}}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	done := make(chan struct{})
+	go func() { m.runGroupGovernanceLoop(ctx); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("governance loop ignored source epoch cancellation")
+	}
+}
+
 func TestGroupGovernanceTokenAggregationIsOnlyFullGroupBySafe(t *testing.T) {
 	if strings.Contains(groupGovernanceTokenStatsSQL, "GROUP BY BINARY grp") {
 		t.Fatal("token aggregation must not group by an alias under ONLY_FULL_GROUP_BY")
