@@ -25,7 +25,7 @@ import (
 )
 
 const (
-	upstreamFundParserVersion = 3
+	upstreamFundParserVersion = 4
 	// Four log types, each at most four pages plus a first-page stability
 	// probe, require a ceiling of 20. Keep a small margin for compatibility.
 	upstreamFundMaxRequestsPerWindow = 24
@@ -332,7 +332,11 @@ func decodeUpstreamFundItem(row ChannelUpstreamAccount, logType int, itemJSON js
 		RequestID: boundedUpstreamErrorField(fundString(fields, "request_id", "requestId"), 128),
 		Raw:       raw, RawTruncated: truncated,
 	}
-	if unit, known := upstreamEconomicUnitAt(row, item.OccurredAt); known {
+	if row.EconomicUnitUnavailable {
+		// Legacy evidence may name a currency without preserving a quota unit.
+		// Parse that explicit amount, but never substitute today's/default unit.
+		row.BalanceUnit = 0
+	} else if unit, known := upstreamEconomicUnitAt(row, item.OccurredAt); known {
 		row.BalanceUnit = unit
 		item.UnitPerUSD = unit
 	} else if row.BalanceUnitEffectiveAt > 0 {
@@ -782,9 +786,11 @@ func (m *Monitor) persistUpstreamFundEvents(ctx context.Context, rows []ChannelU
 }
 
 func upstreamFundPreserveExistingUnitSQL() string {
+	// Treat legacy NULL as unknown. Unknown-to-unknown reparsing may recover
+	// explicit native currency, but neither a new unit nor loss of a known unit
+	// may rewrite historical monetary evidence during an overlap refresh.
 	return `channel_upstream_fund_events.provider = ? AND
-		(channel_upstream_fund_events.unit_per_usd = 0 OR
-		 (excluded.unit_per_usd > 0 AND ABS(channel_upstream_fund_events.unit_per_usd-excluded.unit_per_usd) > 0.000000000001))`
+		ABS(COALESCE(channel_upstream_fund_events.unit_per_usd,0)-COALESCE(excluded.unit_per_usd,0)) > 0.000000000001`
 }
 
 func upstreamFundMoneyAssignment(column string) clause.Expr {
@@ -826,15 +832,10 @@ func (m *Monitor) reparseStoredUpstreamFundEvents(ctx context.Context, row Chann
 		}
 		decodeRow := row
 		if old.Provider == upstreamProviderNewAPI {
-			if !validUpstreamEconomicUnit(old.UnitPerUSD) {
-				if err := quarantine(fmt.Errorf("历史资金流水缺少换算单位证据")); err != nil {
-					return err
-				}
-				continue
-			}
 			decodeRow.BalanceUnit = old.UnitPerUSD
 			decodeRow.BalanceUnitEffectiveAt = 0
 			decodeRow.BalanceUnitPrevious = 0
+			decodeRow.EconomicUnitUnavailable = !validUpstreamEconomicUnit(old.UnitPerUSD)
 		}
 		item, err := decodeUpstreamFundItem(decodeRow, old.SourceType, json.RawMessage(old.RawJSON))
 		if err != nil {

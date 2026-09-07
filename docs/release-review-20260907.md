@@ -10,6 +10,7 @@
 - Separate expected Nginx producers from ingestion authorization.
 - Retry rollback-safe local SQLite writes with bounded attempts and time; never repeat source queries as part of local retry.
 - Reparse legacy nullable parser versions without losing raw fund evidence or inventing currency conversions.
+- Recover explicit native-currency fund amounts even when a historical quota conversion unit is missing; keep quota-only amounts unknown and protect known/unknown units in both directions during overlapping refreshes.
 
 ## Local gates
 
