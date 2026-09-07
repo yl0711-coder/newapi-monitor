@@ -561,7 +561,7 @@ func reusePreMigrationPlanSnapshot(ctx context.Context, dir, mainPath, factsPath
 		if !ok || store.SourceFile != source.sourceFile {
 			return result, true, fmt.Errorf("迁移计划引用缺少当前 %s 数据库", source.role)
 		}
-		checked, err := preflightStoreIntegrity(source.path)
+		checked, err := preflightStartupStoreIntegrity(ctx, source.path)
 		if err != nil {
 			return result, true, fmt.Errorf("当前 %s SQLite 完整性检查失败: %w", source.role, err)
 		}

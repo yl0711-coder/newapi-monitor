@@ -26,7 +26,11 @@ import (
 )
 
 const (
-	storeIntegrityTimeout        = 60 * time.Second
+	storeIntegrityTimeout = 60 * time.Second
+	// Startup runs before serving traffic or acquiring a source lease. Cold
+	// local SQLite scans on small hosts need a separate bounded budget; retain
+	// the shorter budget for ordinary probes and never skip the full check.
+	storeStartupIntegrityTimeout = 3 * time.Minute
 	storeBackupTimeout           = 10 * time.Minute
 	storeBackupPrefix            = "monitor-"
 	usageFactsBackupPrefix       = "usage-facts-"
@@ -181,6 +185,21 @@ func sqliteQuickCheck(ctx context.Context, db *sql.DB) error {
 // preflightStoreIntegrity 对已存在文件使用只读连接，确保任何迁移前先挡住损坏库。
 // 返回 false 表示文件尚不存在，由 openStore 在创建连接后再检查。
 func preflightStoreIntegrity(path string) (bool, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), storeIntegrityTimeout)
+	defer cancel()
+	return preflightStoreIntegrityContext(ctx, path)
+}
+
+func preflightStartupStoreIntegrity(parent context.Context, path string) (bool, error) {
+	ctx, cancel := context.WithTimeout(parent, storeStartupIntegrityTimeout)
+	defer cancel()
+	return preflightStoreIntegrityContext(ctx, path)
+}
+
+func preflightStoreIntegrityContext(ctx context.Context, path string) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
 	if !storeUsesFile(path) {
 		return false, nil
 	}
@@ -199,8 +218,6 @@ func preflightStoreIntegrity(path string) (bool, error) {
 		return false, err
 	}
 	defer db.Close()
-	ctx, cancel := context.WithTimeout(context.Background(), storeIntegrityTimeout)
-	defer cancel()
 	return true, sqliteQuickCheck(ctx, db)
 }
 
