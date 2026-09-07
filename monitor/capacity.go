@@ -22,6 +22,7 @@ const capacityQueryTimeout = 5 * time.Second
 const capacityEmptyDimensionFilter = "\x00capacity-empty"
 
 type capacitySource struct {
+	CoverageComplete    *bool  `json:"coverage_complete,omitempty"`
 	Available           bool   `json:"available"`
 	Configured          bool   `json:"configured"`
 	Watermark           int64  `json:"watermark"`
@@ -80,8 +81,8 @@ type capacityBreakdown struct {
 	Requests         int64    `json:"requests"`
 	RejectedRequests int64    `json:"rejected_requests"`
 	Tokens           int64    `json:"tokens"`
-	AverageRPM       float64  `json:"average_rpm"`
-	AverageTPM       float64  `json:"average_tpm"`
+	AverageRPM       *float64 `json:"average_rpm"`
+	AverageTPM       *float64 `json:"average_tpm"`
 	StabilityPct     *float64 `json:"stability_pct"`
 	StabilityScope   string   `json:"stability_scope"`
 }
@@ -407,16 +408,7 @@ func (m *Monitor) buildCapacityReportFiltered(ctx context.Context, from, to, buc
 	report.Meta.Sources["pre_route_rejection"] = rejectionSource
 
 	report.Series, report.Summary = aggregateCapacitySeries(minuteRows, rejections, from, to, bucket)
-	// “当前值”严格指最近一个已经闭合、且采样器确认扫过的分钟。若当前筛选
-	// 在该分钟没有请求，RPM/TPM 是可信的 0，而不是沿用更早的活跃分钟。
-	if to == now/60*60 && m.LastSampleRun() >= to {
-		currentMinute := to - 60
-		if report.Summary.CurrentAt < currentMinute {
-			report.Summary.CurrentAt = currentMinute
-			report.Summary.CurrentBusinessRPM = capacityFloatPtr(0)
-			report.Summary.CurrentTPM = capacityFloatPtr(0)
-		}
-	}
+	report.Series = capacitySeriesWithGaps(report.Series, from, to, bucket)
 	if userID != 0 {
 		// 用户分钟事实故意不复制延迟直方图；不能把缺失的用户级延迟伪装成 0。
 		report.Summary.PeakConcurrency = nil
@@ -457,6 +449,15 @@ func (m *Monitor) buildCapacityReportFiltered(ctx context.Context, from, to, buc
 		}
 		report.Breakdowns["users"] = userBreakdowns
 		report.Options["users"] = userOptions
+	}
+	complete := metricSource.CoverageComplete != nil && *metricSource.CoverageComplete
+	userComplete := complete && m.capacityWindowComplete(ctx, from, to, true)
+	for kind, rows := range report.Breakdowns {
+		if !complete || (kind == "users" && !userComplete) || (kind != "users" && rejectionsIncluded) {
+			for i := range rows {
+				rows[i].AverageRPM, rows[i].AverageTPM = nil, nil
+			}
+		}
 	}
 
 	ingress, ingressSource := m.readCapacityIngress(ctx, from, to, bucket, now)
@@ -522,27 +523,18 @@ func (m *Monitor) readCapacityMetricsFiltered(ctx context.Context, from, to int6
 	if err := m.storeDB.WithContext(ctx).Raw(minuteSQL, args...).Scan(&rows).Error; err != nil {
 		return nil, nil, capacitySource{}, err
 	}
-	// 组合筛选经常出现长时间无请求。用同一事实表中“该分钟至少有任一流量”
-	// 作为覆盖证据补零，防止 ECharts 把相隔数小时的两个点直接连成持续流量。
-	// 用户维度只使用用户事实表自己的覆盖范围，不能拿旧 metric_samples 给尚未
-	// 建立用户事实的历史时段伪造零值。
-	if userID != 0 || channelID != 0 || group != "" || model != "" {
-		var covered []struct {
-			BucketTs int64 `gorm:"column:bucket_ts"`
-		}
-		if err := m.storeDB.WithContext(ctx).Raw(`SELECT DISTINCT bucket_ts FROM `+table+`
-			WHERE bucket_ts >= ? AND bucket_ts < ? AND traffic_class_version = ? ORDER BY bucket_ts`,
-			from, to, stabilityTrafficClassificationVersion).Scan(&covered).Error; err != nil {
-			return nil, nil, capacitySource{}, err
-		}
+	complete := m.capacityWindowComplete(ctx, from, to, userID != 0)
+	// 只有已定稿的完整区间才能补零；零散的其他用户请求不是覆盖证据。
+	if complete {
 		byMinute := make(map[int64]capacityMinuteRow, len(rows))
 		for _, row := range rows {
 			byMinute[row.Ts] = row
 		}
 		rows = rows[:0]
-		for _, minute := range covered {
-			rows = append(rows, byMinute[minute.BucketTs])
-			rows[len(rows)-1].Ts = minute.BucketTs
+		for ts := from; ts < to; ts += 60 {
+			row := byMinute[ts]
+			row.Ts = ts
+			rows = append(rows, row)
 		}
 	}
 	var dims []capacityDimensionRow
@@ -567,11 +559,11 @@ func (m *Monitor) readCapacityMetricsFiltered(ctx context.Context, from, to int6
 		WHERE traffic_class_version = ? AND bucket_ts < ?`, stabilityTrafficClassificationVersion, to).Scan(&globalWatermark).Error; err != nil {
 		return nil, nil, capacitySource{}, err
 	}
-	note := "Rows 为当前筛选可判定的已覆盖分钟数；已排除渠道内部测试，数据缺口不会伪造成零流量。"
+	note := "分钟事实为已观测结果；最新采集时间不代表区间完整。缺口不补零，完整性不足时不发布区间平均值。"
 	if userID != 0 {
 		note += " 用户筛选使用独立分钟事实；前置拒绝和延迟直方图没有可信用户维度，不参与该筛选。"
 	}
-	source := capacitySource{Available: globalWatermark > 0, Configured: true, Watermark: globalWatermark,
+	source := capacitySource{Available: len(rows) > 0 || complete, CoverageComplete: &complete, Configured: true, Watermark: globalWatermark,
 		AgeSec: capacityAge(now, globalWatermark), FilteredWatermark: filteredWatermark, FilteredAgeSec: capacityAge(now, filteredWatermark), Rows: int64(len(rows)),
 		Note: note}
 	return rows, dims, source, nil
@@ -611,7 +603,7 @@ func (m *Monitor) capacityUserBreakdowns(ctx context.Context, from, to int64, ch
 		}
 		logged := row.Success + row.Anomaly + row.Failed
 		item := capacityBreakdown{Key: key, Label: label, Requests: logged, Tokens: row.Tokens,
-			AverageRPM: float64(logged) / mins, AverageTPM: float64(row.Tokens) / mins, StabilityScope: "routed_log_only"}
+			AverageRPM: capacityFloatPtr(float64(logged) / mins), AverageTPM: capacityFloatPtr(float64(row.Tokens) / mins), StabilityScope: "routed_log_only"}
 		if logged > 0 {
 			item.StabilityPct = capacityFloatPtr(float64(row.Success) * 100 / float64(logged))
 		}
@@ -912,7 +904,7 @@ func (m *Monitor) capacityBreakdowns(rows []capacityDimensionRow, rejectionRows 
 				label = labels[key]
 			}
 			item := capacityBreakdown{Key: key, Label: label, Requests: requests, RejectedRequests: a.rejected, Tokens: a.tokens,
-				AverageRPM: float64(requests) / mins, AverageTPM: float64(a.tokens) / mins, StabilityScope: scope}
+				AverageRPM: capacityFloatPtr(float64(requests) / mins), AverageTPM: capacityFloatPtr(float64(a.tokens) / mins), StabilityScope: scope}
 			if logged > 0 {
 				item.StabilityPct = capacityFloatPtr(float64(a.success) * 100 / float64(logged))
 			}

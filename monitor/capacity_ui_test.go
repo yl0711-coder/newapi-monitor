@@ -9,7 +9,7 @@ func TestCapacityUIIsIsolatedAndRegistered(t *testing.T) {
 	for _, want := range []string{
 		`data-tab="capacity"`, `id="tab-capacity"`, `/capacity.css?v=2`, `/capacity.js?v=2`,
 		`window.capacityActivate`, `MONITOR_CAPACITY_ENABLED=true`, `id="capUser"`, `id="capSearch"`,
-		`id="capFrom"`, `id="capTo"`, `id="capApplyRange"`, `真实分钟峰值 TPM`,
+		`id="capFrom"`, `id="capTo"`, `id="capApplyRange"`, `已观测分钟峰值 TPM`,
 	} {
 		if !strings.Contains(pageHTML, want) && !strings.Contains(string(capacityJS), want) {
 			t.Fatalf("容量规划 UI 缺少 %q", want)

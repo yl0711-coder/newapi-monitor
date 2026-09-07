@@ -129,6 +129,8 @@ type ChannelManagementSummary struct {
 }
 
 type ChannelManagementMeta struct {
+	FromTs                 int64                 `json:"from_ts"`
+	ToTs                   int64                 `json:"to_ts"` // exclusive
 	From                   string                `json:"from"`
 	To                     string                `json:"to"`
 	GeneratedAt            int64                 `json:"generated_at"`
@@ -592,6 +594,10 @@ func (m *Monitor) loadChannelUpstreamUsage(ctx context.Context, scope stabilityS
 }
 
 func (m *Monitor) buildChannelManagementReport(ctx context.Context, scope stabilityScope, now int64) (*ChannelManagementReport, error) {
+	scope = channelFinalizedScope(scope, now)
+	if scope.FromTs >= scope.ToTs {
+		return nil, fmt.Errorf("所选范围尚无可定稿的完整小时，请稍后查询或选择更早的区间")
+	}
 	finance, err := m.loadChannelFinanceSnapshot(ctx)
 	if err != nil {
 		return nil, err
@@ -875,21 +881,16 @@ func (m *Monitor) buildChannelManagementReport(ctx context.Context, scope stabil
 	sort.Strings(filterVendors)
 	sort.Strings(filterGroups)
 
-	toTs := scope.ToTs
-	if toTs > scope.FromTs {
-		toTs--
-	}
-	fromFormat, toFormat := "2006-01-02", "2006-01-02"
-	if scope.RangeHours > 0 {
-		fromFormat, toFormat = "2006-01-02 15:04", "2006-01-02 15:04"
-	}
+	// Always expose the actual exclusive cutoff, including partial date ranges.
+	const rangeFormat = "2006-01-02 15:04"
 	return &ChannelManagementReport{
 		Enabled:       true,
 		Finance:       finance.settingsView(),
 		WebsiteGroups: websiteGroups, WebsiteGroupsSyncedAt: websiteGroupsSyncedAt,
 		Meta: ChannelManagementMeta{
-			From: time.Unix(scope.FromTs, 0).In(cstLocation).Format(fromFormat),
-			To:   time.Unix(toTs, 0).In(cstLocation).Format(toFormat), GeneratedAt: now,
+			FromTs: scope.FromTs, ToTs: scope.ToTs,
+			From: time.Unix(scope.FromTs, 0).In(cstLocation).Format(rangeFormat),
+			To:   time.Unix(scope.ToTs, 0).In(cstLocation).Format(rangeFormat), GeneratedAt: now,
 			DataUntil: dataUntil, LatestDataUntil: latestDataUntil, ChannelConfigUpdatedAt: configUpdatedAt,
 			TimeZone: "Asia/Shanghai", Source: "monitor_local_hourly_rollup",
 			DataCoverage: m.stabilityDataCoverage(ctx, scope.FromTs, scope.ToTs, now),
@@ -949,7 +950,15 @@ func (m *Monitor) serveChannelManagementReport(c *gin.Context) {
 func channelManagementRange(c *gin.Context, now time.Time, maxDays int) (stabilityScope, error) {
 	rawHours := strings.TrimSpace(c.Query("hours"))
 	if rawHours == "" {
-		return stabilityRange(c, now, maxDays)
+		scope, err := stabilityRange(c, now, maxDays)
+		if err != nil {
+			return stabilityScope{}, err
+		}
+		scope = channelFinalizedScope(scope, now.Unix())
+		if scope.FromTs >= scope.ToTs {
+			return stabilityScope{}, fmt.Errorf("所选范围尚无可定稿的完整小时，请稍后查询或选择更早的区间")
+		}
+		return scope, nil
 	}
 	if strings.TrimSpace(c.Query("from")) != "" || strings.TrimSpace(c.Query("to")) != "" || strings.TrimSpace(c.Query("days")) != "" {
 		return stabilityScope{}, fmt.Errorf("hours 不能与 days、from 或 to 同时提供")
@@ -964,8 +973,20 @@ func channelManagementRange(c *gin.Context, now time.Time, maxDays int) (stabili
 	if hours > maxDays*24 {
 		return stabilityScope{}, fmt.Errorf("查询范围不能超过 %d 天", maxDays)
 	}
-	now = now.In(cstLocation)
-	end := time.Date(now.Year(), now.Month(), now.Day(), now.Hour(), 0, 0, 0, cstLocation)
+	end := time.Unix(finalizedStabilityHourTo(now.Unix()), 0)
 	start := end.Add(-time.Duration(hours) * time.Hour)
 	return stabilityScope{FromTs: start.Unix(), ToTs: end.Unix(), RangeHours: hours}, nil
+}
+
+// Use the same closed-hour boundary for facts, upstream bills and coverage.
+// Rolling windows keep their full duration; date selections keep their start.
+func channelFinalizedScope(scope stabilityScope, now int64) stabilityScope {
+	scope.ToTs = min(scope.ToTs, finalizedStabilityHourTo(now)) / 3600 * 3600
+	if scope.RangeHours > 0 {
+		scope.FromTs = scope.ToTs - int64(scope.RangeHours)*3600
+	}
+	if scope.FromTs > scope.ToTs {
+		scope.FromTs = scope.ToTs
+	}
+	return scope
 }

@@ -77,7 +77,7 @@ func TestChannelManagementConfiguredGroupWithoutUsageStillIncludesFinance(t *tes
 
 func TestChannelManagementReportBypassesStaleBrowserCache(t *testing.T) {
 	js := string(channelManagementJS)
-	if !strings.Contains(js, `fetch('/channels/report?'+queryString(),{cache:'no-store'`) {
+	if !strings.Contains(js, `fetch('/channels/report?'+query,{cache:'no-store'`) {
 		t.Fatal("渠道报表请求必须绕过浏览器缓存")
 	}
 	if !strings.Contains(js, `fetch('/channels/upstream?domain='+encodeURIComponent(domain.domain),{cache:'no-store'`) {
@@ -202,7 +202,7 @@ func TestChannelManagementRangeUsesLast24CompletedHours(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantTo := time.Date(2026, 8, 12, 16, 0, 0, 0, cstLocation)
+	wantTo := time.Date(2026, 8, 12, 15, 0, 0, 0, cstLocation)
 	wantFrom := wantTo.Add(-24 * time.Hour)
 	if scope.FromTs != wantFrom.Unix() || scope.ToTs != wantTo.Unix() || scope.RangeHours != 24 {
 		t.Fatalf("range=[%v,%v], want [%v,%v]", time.Unix(scope.FromTs, 0), time.Unix(scope.ToTs, 0), wantFrom, wantTo)
@@ -259,8 +259,7 @@ func TestChannelManagementUpstreamSpendMetricKeepsAmountReadable(t *testing.T) {
 		`<small>上游当前余额</small>`,
 		`domain.upstream?.balance_usd`,
 		`cm-domain-metric-note`,
-		`小时日志`,
-		`补全中`,
+		`window.channelDataStatus.note(cm.report)`,
 		`.cm-domain-upstream-spend{padding-left:18px`,
 		`.cm-domain-metrics{grid-column:2/4;grid-row:2`,
 		`.cm-domain-requests,.cm-domain-tokens{display:none}`,
@@ -289,9 +288,7 @@ func TestChannelManagementShowsRawAndRechargeAdjustedUpstreamSpend(t *testing.T)
 		`upstreamUsage.adjusted_cost_available`,
 		`upstreamUsage.adjusted_cost_usd`,
 		`upstreamUsage.recharge_ratio`,
-		`upstreamUsage.adjusted_cost_status==='bucket_boundary_ambiguous'`,
 		`按历史充值比例版本修正`,
-		`缺少对应时段的充值比例版本`,
 		`上游修正消费汇总`,
 		`.cm-domain-upstream-adjusted b{color:`,
 	} {
@@ -326,13 +323,10 @@ func TestChannelManagementSummarizesUpstreamFinanceWithoutGroupDoubleCounting(t 
 		`upstreamBalanceDomains.reduce((sum,domain)=>sum+Number(domain.upstream.balance_usd),0)`,
 		`区间上游消费汇总`,
 		`上游当前余额汇总`,
-		`个账户账单完整`,
-		`仅显示已校验部分`,
 		`const trustedUsageDomains=upstreamUsageDomains.filter`,
-		`upstreamAccountComparable&&trustedUsageDomains.length?(upstreamSpendReady?upstreamSpendValue:`,
-		`upstreamAccountComparable&&adjustedUsageDomains.length?(adjustedSpendReady?adjustedUpstreamSpendValue:`,
-		`源账单含小时/自然日粒度，已统一按账户金额合计`,
-		`当前渠道/分组筛选下不作比较`,
+		`upstreamAccountComparable?upstreamSpendValue:'—'`,
+		`upstreamAccountComparable?adjustedUpstreamSpendValue:'—'`,
+		`上游账户金额不按渠道/分组拆分`,
 		`.cm-kpis article.upstream b{color:`,
 		`.cm-kpis article.balance b{color:`,
 	} {
@@ -907,7 +901,7 @@ func TestChannelManagementShowsOnlyUserRequestsAndHidesInternalChannelTests(t *t
 	}
 	report, err := m.buildChannelManagementReport(context.Background(), stabilityScope{
 		FromTs: hour, ToTs: hour + 3600,
-	}, hour+3600)
+	}, hour+7200)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -947,7 +941,7 @@ func TestChannelManagementRejectsLegacyMixedTrafficUntilReclassified(t *testing.
 	}
 	report, err := m.buildChannelManagementReport(context.Background(), stabilityScope{
 		FromTs: hour, ToTs: hour + 3600,
-	}, hour+3600)
+	}, hour+7200)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -966,7 +960,7 @@ func TestChannelManagementReportRejectsPartialDimensionResult(t *testing.T) {
 	if err := m.storeDB.CreateInBatches(rows, 200).Error; err != nil {
 		t.Fatal(err)
 	}
-	if _, err := m.buildChannelManagementReport(context.Background(), stabilityScope{FromTs: day, ToTs: day + 3600}, day+3600); err == nil {
+	if _, err := m.buildChannelManagementReport(context.Background(), stabilityScope{FromTs: day, ToTs: day + 3600}, day+7200); err == nil {
 		t.Fatal("维度超限时应拒绝返回部分结果")
 	}
 }
@@ -1018,7 +1012,7 @@ func TestChannelManagementReportSyncsRenameAndKeepsDeletedSnapshot(t *testing.T)
 	}).Error; err != nil {
 		t.Fatal(err)
 	}
-	report, err := m.buildChannelManagementReport(context.Background(), stabilityScope{FromTs: day, ToTs: day + 86400}, day+3600)
+	report, err := m.buildChannelManagementReport(context.Background(), stabilityScope{FromTs: day, ToTs: day + 86400}, day+7200)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -528,12 +528,16 @@ func TestManualStoreBackupIsAsyncSingleFlightAndKeepsStoresReadable(t *testing.T
 	if decoded, err := decodePricingCheckpointEvidence(restoredPricingCheckpoint); err != nil || len(decoded) != 1 {
 		t.Fatalf("恢复后计价分页断点不可续传: rows=%d err=%v", len(decoded), err)
 	}
-	if restoredUpstream.Credential == sealedUpstream {
-		t.Fatal("offline activation did not rotate the restored legacy upstream credential")
+	if restoredUpstream.Credential != sealedUpstream {
+		t.Fatal("offline activation must preserve the restored legacy upstream credential")
 	}
+	// Offline activation does not rotate credentials. Verify the preserved
+	// ciphertext independently with its original key; online rotation is covered
+	// by TestLegacyUpstreamCredentialsAreTransactionallyRotatedToDedicatedSecret.
+	legacyVerifier := &Monitor{cfg: Settings{SessionSecret: restoreLegacySessionSecret}}
 	var restoredCredential newAPICredential
-	if err := activated.openUpstreamCredential(restoredUpstream, &restoredCredential); err != nil || restoredCredential.AccessToken != "restored-access-token" {
-		t.Fatalf("offline activation cannot decrypt restored upstream credential: token=%q err=%v", restoredCredential.AccessToken, err)
+	if err := legacyVerifier.openUpstreamCredential(restoredUpstream, &restoredCredential); err != nil || restoredCredential.AccessToken != "restored-access-token" {
+		t.Fatalf("offline activation damaged restored upstream credential: %v", err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	activated.Start(ctx)

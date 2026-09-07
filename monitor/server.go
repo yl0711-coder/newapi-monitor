@@ -64,6 +64,9 @@ var logChainJS []byte // 客户排障页交互；只访问 /logchain/* 管理员
 //go:embed channel_management.js
 var channelManagementJS []byte // 渠道管理交互；只访问 Monitor 本地渠道汇总接口
 
+//go:embed channel_data_status.js
+var channelDataStatusJS []byte
+
 //go:embed capacity.css
 var capacityCSS []byte // 容量规划独立样式，不污染现有 Monitor/Usage 页
 
@@ -186,6 +189,10 @@ func (m *Monitor) RegisterRoutes(r *gin.Engine) {
 		c.Header("Cache-Control", "no-cache")
 		c.Data(http.StatusOK, "application/javascript; charset=utf-8", channelManagementJS)
 	})
+	r.GET("/channel-data-status.js", func(c *gin.Context) {
+		c.Header("Cache-Control", "no-cache")
+		c.Data(http.StatusOK, "application/javascript; charset=utf-8", channelDataStatusJS)
+	})
 	r.GET("/capacity.css", func(c *gin.Context) {
 		c.Header("Cache-Control", "no-cache")
 		c.Data(http.StatusOK, "text/css; charset=utf-8", capacityCSS)
@@ -240,6 +247,7 @@ func (m *Monitor) RegisterRoutes(r *gin.Engine) {
 		view.GET("/sync/overview", m.serveSyncOverview)                                   // 统一同步摘要:只读本地状态投影
 		view.GET("/sync/workloads", m.serveSyncWorkloads)                                 // 有界任务明细:默认仅异常成员,支持分页
 		view.GET("/channels/report", m.serveChannelManagementReport)                      // 渠道管理:主域名→厂商→渠道→服务分组的本地汇总
+		view.GET("/channels/data-status", m.serveChannelDataStatus)                       // 同口径的轻量只读诊断，不读取用量维度
 		view.GET("/channels/economics", m.serveChannelEconomicsReport)                    // 渠道成本:只读本地不可变经济账当前发布头
 		// 排障两个接口挂 noStoreSensitive：响应含客户标识、令牌名、渠道名/ID、
 		// 上游主域名与错误原文，属敏感诊断数据，不得被任何中间层缓存。
@@ -898,11 +906,18 @@ func (m *Monitor) serveLongTrend(c *gin.Context) {
 }
 
 func (m *Monitor) serveData(c *gin.Context) {
-	if !m.Enabled() {
+	// This endpoint reads local facts only. Offline acceptance must not need
+	// a production connection merely to render its saved model snapshot.
+	if !m.Enabled() && !m.cfg.LocalSnapshotOnly {
 		c.JSON(http.StatusOK, gin.H{"enabled": false})
 		return
 	}
-	snap, err := m.GetSnapshot(parseWindow(c), time.Now().Unix())
+	view := c.DefaultQuery("view", "finalized")
+	if view != "finalized" && view != "observed" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "view 必须为 finalized 或 observed"})
+		return
+	}
+	snap, err := m.getSnapshotView(parseWindow(c), time.Now().Unix(), view == "observed")
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"enabled": true, "error": err.Error()})
 		return

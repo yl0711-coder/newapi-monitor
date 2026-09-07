@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"math"
+	"net/http"
 	"sort"
 	"strings"
 	"time"
@@ -165,8 +167,16 @@ func (m *Monitor) infraTargetsWithDiscovery(ctx context.Context, cl *lightsail.C
 	explicit := parseInfraTargets(m.cfg.InfraResources)
 	var discovered []infraTarget
 	var discoveryRows []InfraSample
-	if r, err := cl.GetInstances(ctx, &lightsail.GetInstancesInput{}); err == nil {
-		for _, in := range r.Instances {
+	complete := map[string]bool{}
+	if instances, err := collectLightsailPages(ctx, func(token *string) ([]lstypes.Instance, *string, error) {
+		r, err := cl.GetInstances(ctx, &lightsail.GetInstancesInput{PageToken: token})
+		if err != nil {
+			return nil, nil, err
+		}
+		return r.Instances, r.NextPageToken, nil
+	}); err == nil {
+		complete["instance"] = true
+		for _, in := range instances {
 			if in.Name == nil {
 				continue
 			}
@@ -179,13 +189,20 @@ func (m *Monitor) infraTargetsWithDiscovery(ctx context.Context, cl *lightsail.C
 			}
 			discovered = append(discovered, t)
 		}
-		discoveryRows = append(discoveryRows, managedDiscoveryRows(bucket, "Lightsail/实例", true, len(r.Instances))...)
+		discoveryRows = append(discoveryRows, managedDiscoveryRows(bucket, "Lightsail/实例", true, len(instances))...)
 	} else {
 		slog.Warn("infra: 列实例失败", "err", err)
 		discoveryRows = append(discoveryRows, managedDiscoveryRows(bucket, "Lightsail/实例", false, 0)...)
 	}
-	if r, err := cl.GetRelationalDatabases(ctx, &lightsail.GetRelationalDatabasesInput{}); err == nil {
-		for _, d := range r.RelationalDatabases {
+	if databases, err := collectLightsailPages(ctx, func(token *string) ([]lstypes.RelationalDatabase, *string, error) {
+		r, err := cl.GetRelationalDatabases(ctx, &lightsail.GetRelationalDatabasesInput{PageToken: token})
+		if err != nil {
+			return nil, nil, err
+		}
+		return r.RelationalDatabases, r.NextPageToken, nil
+	}); err == nil {
+		complete["database"] = true
+		for _, d := range databases {
 			if d.Name == nil {
 				continue
 			}
@@ -200,23 +217,43 @@ func (m *Monitor) infraTargetsWithDiscovery(ctx context.Context, cl *lightsail.C
 			}
 			discovered = append(discovered, t)
 		}
-		discoveryRows = append(discoveryRows, managedDiscoveryRows(bucket, "Lightsail/数据库", true, len(r.RelationalDatabases))...)
+		discoveryRows = append(discoveryRows, managedDiscoveryRows(bucket, "Lightsail/数据库", true, len(databases))...)
 	} else {
 		slog.Warn("infra: 列数据库失败", "err", err)
 		discoveryRows = append(discoveryRows, managedDiscoveryRows(bucket, "Lightsail/数据库", false, 0)...)
 	}
-	if r, err := cl.GetLoadBalancers(ctx, &lightsail.GetLoadBalancersInput{}); err == nil {
-		for _, lb := range r.LoadBalancers {
+	if balancers, err := collectLightsailPages(ctx, func(token *string) ([]lstypes.LoadBalancer, *string, error) {
+		r, err := cl.GetLoadBalancers(ctx, &lightsail.GetLoadBalancersInput{PageToken: token})
+		if err != nil {
+			return nil, nil, err
+		}
+		return r.LoadBalancers, r.NextPageToken, nil
+	}); err == nil {
+		complete["lb"] = true
+		for _, lb := range balancers {
 			if lb.Name != nil {
 				discovered = append(discovered, infraTarget{name: *lb.Name, rtype: "lb"}) // LB 无内存/磁盘概念,跳过总量
 			}
 		}
-		discoveryRows = append(discoveryRows, managedDiscoveryRows(bucket, "Lightsail/负载均衡", true, len(r.LoadBalancers))...)
+		discoveryRows = append(discoveryRows, managedDiscoveryRows(bucket, "Lightsail/负载均衡", true, len(balancers))...)
 	} else {
 		slog.Warn("infra: 列负载均衡失败", "err", err)
 		discoveryRows = append(discoveryRows, managedDiscoveryRows(bucket, "Lightsail/负载均衡", false, 0)...)
 	}
-	return m.filterInfraTargets(mergeInfraTargets(explicit, discovered)), discoveryRows
+	lifecycleRows := lightsailPresenceRows(bucket, discovered, m.knownLightsailResources(ctx), complete)
+	discoveryRows = append(discoveryRows, lifecycleRows...)
+	retired := map[string]bool{}
+	for _, row := range lifecycleRows {
+		retired[row.Resource] = row.Value == 0
+	}
+	targets := m.filterInfraTargets(mergeInfraTargets(explicit, discovered))
+	active := targets[:0]
+	for _, target := range targets {
+		if !retired[target.name] {
+			active = append(active, target)
+		}
+	}
+	return active, discoveryRows
 }
 
 func parseInfraTargets(value string) []infraTarget {
@@ -452,7 +489,7 @@ type ProbeResource struct {
 // LockResource 是一个源站端点的锁完整性视图(直连不带头,期望 403)。
 type LockResource struct {
 	Target   string `json:"target"`    // 源站端点 host:port
-	Status   string `json:"status"`    // ok(=403,锁生效) / bad(非403,锁失效) / nosample(连不上)
+	Status   string `json:"status"`    // ok(403) / bad(非预期响应，需核验) / nosample(无有效响应)
 	Locked   bool   `json:"locked"`    // 是否 403
 	HTTPCode int    `json:"http_code"` // 实际返回码(期望 403)
 	AgeSec   int64  `json:"age_sec"`   // 数据新鲜度
@@ -468,7 +505,9 @@ type InfraOverview struct {
 	ProbesTotal    int    `json:"probes_total"`
 	ProbesOK       int    `json:"probes_ok"` // 端到端全通计数(status==ok)
 	LocksTotal     int    `json:"locks_total"`
-	LocksOK        int    `json:"locks_ok"` // 源站锁生效计数(403)
+	LocksOK        int    `json:"locks_ok"`      // 源站锁生效计数(403)
+	LocksBad       int    `json:"locks_bad"`     // 已收到非预期 HTTP 响应，需核验
+	LocksUnknown   int    `json:"locks_unknown"` // 无有效响应，不等于锁失效
 	DiscoveryTotal int    `json:"discovery_total"`
 	DiscoveryOK    int    `json:"discovery_ok"`
 }
@@ -514,6 +553,7 @@ type InfraSnapshot struct {
 // computeInfraSnapshot 从本地 infra_samples 聚合最新视图(零 AWS 调用,纯读本地)。
 func (m *Monitor) computeInfraSnapshot(nowUnix int64) InfraSnapshot {
 	latest := m.storeInfraLatest()
+	retired := retiredInfraResources(latest)
 	type acc struct {
 		rtype    string
 		metrics  map[string]float64
@@ -522,7 +562,7 @@ func (m *Monitor) computeInfraSnapshot(nowUnix int64) InfraSnapshot {
 	}
 	byRes := map[string]*acc{}
 	for _, r := range latest {
-		if m.infraExcluded(r.Resource) {
+		if m.infraExcluded(r.Resource) || retired[r.Resource] || r.Metric == infraPresenceMetric {
 			continue
 		}
 		a := byRes[r.Resource]
@@ -897,16 +937,17 @@ func (m *Monitor) buildProbe(domain string, mm map[string]float64, age int64) Pr
 // buildLock 把某源站端点的锁检查指标组装成 LockResource(403=ok,非403=bad)。
 func buildLock(target string, mm map[string]float64, age int64) LockResource {
 	l := LockResource{Target: target, AgeSec: age}
-	if len(mm) == 0 {
+	code, hasCode := mm["status_code"]
+	if !hasCode || code < 100 || code > 599 || math.IsNaN(code) || code != math.Trunc(code) {
 		l.Status = "nosample"
 		return l
 	}
-	l.HTTPCode = int(mm["status_code"])
-	l.Locked = mm["locked"] >= 1
+	l.HTTPCode = int(code)
+	l.Locked = l.HTTPCode == http.StatusForbidden
 	if l.Locked {
 		l.Status = "ok"
 	} else {
-		l.Status = "bad" // 拿到响应但不是 403 = 锁失效,最高优先
+		l.Status = "bad" // 非预期响应仍告警，但不是已确认可绕过的证据。
 	}
 	return l
 }
@@ -1015,8 +1056,13 @@ func buildOverview(snap InfraSnapshot) InfraOverview {
 	}
 	for _, l := range snap.Locks {
 		o.LocksTotal++
-		if l.Status == "ok" {
+		switch l.Status {
+		case "ok":
 			o.LocksOK++
+		case "bad":
+			o.LocksBad++
+		default:
+			o.LocksUnknown++
 		}
 		states = append(states, l.Status)
 	}
@@ -1389,11 +1435,11 @@ func (m *Monitor) evaluateInfraAlerts(now int64) {
 				fmt.Sprintf("域名 %s 的 TLS 证书仅剩 %.1f 天(阈值 %.0f 天),过期将导致全站 HTTPS 失败。", p.Domain, p.CertDays, m.cfg.ProbeCertBadDays), now)
 		}
 	}
-	// 源站锁失效:直连源站不带头本应 403,却返回非 403 = F-5 锁被回滚/失效,安全红线。
+	// 非预期响应必须告警并核验；无响应不算已确认失败，非 403 也不直接证明可绕过。
 	for _, l := range snap.Locks {
 		if l.Status == "bad" {
-			m.fire(c, "infra_origin_lock", l.Target, "源站锁失效(可绕过 CDN 直连)",
-				fmt.Sprintf("源站 %s 直连(不带 X-Origin-Verify)返回 HTTP %d(本应 403)。F-5 源站锁可能被回滚或失效,现在可绕过 CloudFront 直连后端,请立即排查 nginx 配置。", l.Target, l.HTTPCode), now)
+			m.fire(c, "infra_origin_lock", l.Target, "源站拦截响应异常（需核验）",
+				fmt.Sprintf("源站 %s 直连(不带 X-Origin-Verify)返回 HTTP %d(预期 403)。请立即核验当前访问边界和拦截配置；仅凭非 403 响应不能确认业务接口可被绕过访问。", l.Target, l.HTTPCode), now)
 		}
 	}
 }

@@ -1,9 +1,28 @@
 package monitor
 
 import (
+	"os"
 	"strings"
 	"testing"
 )
+
+func TestOriginLockTargetsAllowExplicitDisable(t *testing.T) {
+	const key = "MONITOR_ORIGIN_LOCK_TARGETS"
+	t.Setenv(key, "")
+	if got := LoadSettings().OriginLockTargets; got != "" {
+		t.Fatalf("explicit empty targets must disable probes, got %q", got)
+	}
+	t.Setenv(key, "current-origin.example:80")
+	if got := LoadSettings().OriginLockTargets; got != "current-origin.example:80" {
+		t.Fatalf("configured target was replaced: %q", got)
+	}
+	if err := os.Unsetenv(key); err != nil {
+		t.Fatal(err)
+	}
+	if got := LoadSettings().OriginLockTargets; got != "172.26.0.20:80,172.26.10.97:80" {
+		t.Fatalf("unset compatibility default changed: %q", got)
+	}
+}
 
 func TestLoadSettingsProbeDomainsExcludeRetiredRoutepath(t *testing.T) {
 	t.Setenv("MONITOR_PROBE_DOMAINS", "")

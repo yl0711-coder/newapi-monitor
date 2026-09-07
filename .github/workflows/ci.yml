@@ -37,6 +37,11 @@ jobs:
           docker exec "${{ job.services.redis.id }}" redis-cli CONFIG SET requirepass "$MONITOR_TEST_REDIS_PASSWORD"
           test "$(docker exec -e REDISCLI_AUTH="$MONITOR_TEST_REDIS_PASSWORD" "${{ job.services.redis.id }}" redis-cli ping)" = "PONG"
       - run: go vet ./...
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Test dashboard rendering states without network
+        run: node --test dev/tests/*.test.mjs
       # monitor 包的 1000+ 个测试由下方 race-monitor 作业分片执行。这里继续
       # 覆盖其余全部包，避免新增包静默逃离竞态检测。
       - name: Test non-monitor packages with race detector and real Redis

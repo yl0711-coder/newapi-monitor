@@ -279,7 +279,7 @@ func (m *Monitor) evaluateAlerts(nowUnix int64) {
 	}
 
 	snap, err := m.GetSnapshot(c.EvalWindowMin, nowUnix)
-	if err != nil {
+	if err != nil || !snap.DataComplete || snap.FinalizationDelayed {
 		return
 	}
 	rows := append(append([]Row{}, snap.ByChannel...), snap.ByModel...)

@@ -130,7 +130,7 @@ type Monitor struct {
 	chNames map[string]string // 渠道 id->name 映射缓存
 
 	snapMu    sync.Mutex
-	snapCache map[int]cachedSnap // 按窗口缓存快照(短 TTL),去重并发请求、给 slave 减负
+	snapCache map[snapshotCacheKey]cachedSnap // 按窗口和视图隔离缓存
 	// 基础设施最新快照与容量时序都会在本地 SQLite 上执行聚合。生产容器的
 	// /tmp 只有 16 MiB；把这两类管理页重查询串行化，避免并发临时表互相
 	// 挤占空间。它不参与采集/写入，也不改变任何业务或稳定性口径。
@@ -336,7 +336,7 @@ func New(s Settings) (*Monitor, error) {
 	m := &Monitor{
 		cfg:                          s,
 		chNames:                      map[string]string{},
-		snapCache:                    map[int]cachedSnap{},
+		snapCache:                    map[snapshotCacheKey]cachedSnap{},
 		usageCache:                   newUsageResultCache(s),
 		upstreamClient:               newUpstreamHTTPClient(upstreamSyncTimeout(s)),
 		upstreamCredentialPersistent: credentialSecretConfigured,
@@ -969,30 +969,40 @@ type CompareStat struct {
 
 // Snapshot 是一次完整看板快照:总览 + 分组 / 渠道 / 模型 / 令牌明细 + 趋势 + SLO + 同比环比。
 type Snapshot struct {
-	WindowMinutes    int            `json:"window_minutes"`
-	GeneratedAt      string         `json:"generated_at"`
-	SamplingActive   bool           `json:"sampling_active"`
-	DataAgeSec       int64          `json:"data_age_sec"`
-	DataComplete     bool           `json:"data_complete"`
-	CoverageFromTs   int64          `json:"coverage_from_ts,omitempty"`
-	CoverageToTs     int64          `json:"coverage_to_ts,omitempty"`
-	Summary          Summary        `json:"summary"`
-	ByGroup          []Row          `json:"by_group"`
-	ByChannel        []Row          `json:"by_channel"`
-	ByModel          []Row          `json:"by_model"`
-	ByToken          []TokenRow     `json:"by_token"`
-	Trend            []TimePoint    `json:"trend"`
-	SLO              SLOStatus      `json:"slo"`
-	Compare          CompareStat    `json:"compare"`
-	CompareAvailable bool           `json:"compare_available"`
-	Rejections       []RejectionRow `json:"rejections"`     // 前置拒绝(采集器旁路采集,logs 盲区)
-	RejectEnabled    bool           `json:"reject_enabled"` // 超管是否开启「被拒请求」面板
+	LocalSnapshotOnly   bool                      `json:"local_snapshot_only"`
+	View                string                    `json:"view"`
+	FinalizationDelayed bool                      `json:"finalization_delayed"`
+	WindowFromTs        int64                     `json:"window_from_ts"`
+	WindowToTs          int64                     `json:"window_to_ts"`
+	WindowMinutes       int                       `json:"window_minutes"`
+	GeneratedAt         string                    `json:"generated_at"`
+	SamplingActive      bool                      `json:"sampling_active"`
+	DataAgeSec          int64                     `json:"data_age_sec"`
+	DataComplete        bool                      `json:"data_complete"`
+	CoverageFromTs      int64                     `json:"coverage_from_ts,omitempty"`
+	CoverageToTs        int64                     `json:"coverage_to_ts,omitempty"`
+	Summary             Summary                   `json:"summary"`
+	ByGroup             []Row                     `json:"by_group"`
+	ByChannel           []Row                     `json:"by_channel"`
+	ByModel             []Row                     `json:"by_model"`
+	DimensionLimits     map[string]DimensionLimit `json:"dimension_limits,omitempty"`
+	ByToken             []TokenRow                `json:"by_token"`
+	Trend               []TimePoint               `json:"trend"`
+	SLO                 SLOStatus                 `json:"slo"`
+	Compare             CompareStat               `json:"compare"`
+	CompareAvailable    bool                      `json:"compare_available"`
+	Rejections          []RejectionRow            `json:"rejections"`     // 前置拒绝(采集器旁路采集,logs 盲区)
+	RejectEnabled       bool                      `json:"reject_enabled"` // 超管是否开启「被拒请求」面板
 }
 
 // attachSpark 给每行挂上对应维度取值的分钟桶时序。Spark 还用于
 // AnomalyBurst 健康升级，因此读取失败必须阻止快照声称完整。
 func (m *Monitor) attachSpark(rows []Row, dimCol string, since, until int64, windowMinutes int) error {
-	series, err := m.storeDimSeriesRange(dimCol, since, until, windowMinutes)
+	return m.attachSparkForScope(rows, dimCol, since, until, windowMinutes, metricCurrentRoutes)
+}
+
+func (m *Monitor) attachSparkForScope(rows []Row, dimCol string, since, until int64, windowMinutes int, scope metricReadScope) error {
+	series, err := m.storeDimSeriesRangeForScope(dimCol, since, until, windowMinutes, scope)
 	if err != nil {
 		return err
 	}
@@ -1050,45 +1060,80 @@ func rate(success, total int64) float64 {
 	return float64(success) / float64(total) * 100
 }
 
-// GetSnapshot 从本地库聚合一次完整看板数据(零生产负担)。
-// GetSnapshot 返回看板快照;带短 TTL 缓存(按窗口),去重并发请求、减少重复重算,给 slave 减负。
+type snapshotCacheKey struct {
+	Minutes  int
+	Observed bool
+	Scope    metricReadScope
+}
+
+// GetSnapshot retains the operational policy used by alerts. Dashboard reads
+// use getSnapshotView; scope and view are both isolated in the local cache.
 func (m *Monitor) GetSnapshot(windowMinutes int, nowUnix int64) (*Snapshot, error) {
+	return m.getSnapshotForScope(windowMinutes, nowUnix, false, metricCurrentRoutes)
+}
+
+func (m *Monitor) getSnapshotView(windowMinutes int, nowUnix int64, observed bool) (*Snapshot, error) {
+	return m.getSnapshotForScope(windowMinutes, nowUnix, observed, metricRecordedTraffic)
+}
+
+func (m *Monitor) getSnapshotForScope(windowMinutes int, nowUnix int64, observed bool, scope metricReadScope) (*Snapshot, error) {
 	if windowMinutes <= 0 {
 		windowMinutes = 60
 	}
 	m.snapMu.Lock()
 	defer m.snapMu.Unlock()
 	if m.snapCache == nil {
-		m.snapCache = map[int]cachedSnap{}
+		m.snapCache = map[snapshotCacheKey]cachedSnap{}
 	}
-	if c, ok := m.snapCache[windowMinutes]; ok && nowUnix-c.at < snapCacheTTL {
+	key := snapshotCacheKey{Minutes: windowMinutes, Observed: observed, Scope: scope}
+	if c, ok := m.snapCache[key]; ok && nowUnix-c.at < snapCacheTTL {
 		return c.snap, nil
 	}
-	snap, err := m.computeSnapshot(windowMinutes, nowUnix)
+	snap, err := m.computeSnapshotForScope(windowMinutes, nowUnix, observed, scope)
 	if err != nil {
 		return nil, err
 	}
-	m.snapCache[windowMinutes] = cachedSnap{snap: snap, at: nowUnix}
+	m.snapCache[key] = cachedSnap{snap: snap, at: nowUnix}
 	return snap, nil
 }
 
 func (m *Monitor) computeSnapshot(windowMinutes int, nowUnix int64) (*Snapshot, error) {
+	return m.computeSnapshotForScope(windowMinutes, nowUnix, false, metricCurrentRoutes)
+}
+
+func (m *Monitor) computeSnapshotForScope(windowMinutes int, nowUnix int64, observed bool, scope metricReadScope) (*Snapshot, error) {
 	if windowMinutes <= 0 {
 		windowMinutes = 60
 	}
-	// 快照与覆盖证据必须是同一个已完结区间。实时 lane
-	// 继续采样，但不与延迟签收数据混在一个“完整”快照中。
 	until := metricFinalizeTarget(nowUnix)
+	view := "finalized"
+	var coverage MetricFinalizeState
+	coverageErr := m.storeDB.First(&coverage, "id = ?", 1).Error
+	validCoverage := coverageErr == nil && coverage.SemanticsVersion == stabilityTrafficClassificationVersion && coverage.CoverageFromTs > 0
+	if observed {
+		view = "observed"
+		until = nowUnix / 60 * 60
+	} else if validCoverage && coverage.NextTs > coverage.CoverageFromTs {
+		// Publish the latest actually signed window, even between finalizer
+		// turns. A moving wall-clock deadline must not revoke a signed result.
+		until = min(until, coverage.NextTs/60*60)
+	}
 	since := until - int64(windowMinutes)*60
 	windowSec := float64(windowMinutes) * 60
-	coverageComplete, coverageFrom, coverageTo := m.metricWindowCoverage(since, nowUnix)
-	if !coverageComplete {
+	coverageComplete := validCoverage && coverage.CoverageFromTs <= since && coverage.NextTs >= until
+	coverageFrom, coverageTo := coverage.CoverageFromTs, min(coverage.NextTs, until)
+	if !validCoverage {
+		coverageFrom, coverageTo = 0, 0
+	}
+	if !coverageComplete && !observed {
 		lastBucket := m.storeFreshness()
 		age := int64(-1)
 		if lastBucket > 0 {
 			age = max(int64(0), nowUnix-(lastBucket+60))
 		}
 		return &Snapshot{
+			LocalSnapshotOnly: m.cfg.LocalSnapshotOnly,
+			View:              view, WindowFromTs: since, WindowToTs: until,
 			WindowMinutes: windowMinutes, GeneratedAt: time.Unix(nowUnix, 0).Format("2006-01-02 15:04:05"),
 			SamplingActive: age >= 0 && m.LastSampleRun() > nowUnix-int64(m.cfg.SampleSeconds)*3,
 			DataAgeSec:     age, DataComplete: false, CoverageFromTs: coverageFrom, CoverageToTs: coverageTo,
@@ -1105,15 +1150,15 @@ func (m *Monitor) computeSnapshot(windowMinutes int, nowUnix int64) (*Snapshot, 
 		}, nil
 	}
 
-	sum, err := m.storeSummaryRange(since, until, windowSec)
+	sum, err := m.storeSummaryRangeForScope(since, until, windowSec, scope)
 	if err != nil {
 		return nil, err
 	}
-	grp, err := m.storeDimRange("grp", since, until, windowSec)
+	grp, err := m.storeDimRangeForScope("grp", since, until, windowSec, scope)
 	if err != nil {
 		return nil, err
 	}
-	ch, err := m.storeDimRange("channel_id", since, until, windowSec)
+	ch, err := m.storeDimRangeForScope("channel_id", since, until, windowSec, scope)
 	if err != nil {
 		return nil, err
 	}
@@ -1125,22 +1170,29 @@ func (m *Monitor) computeSnapshot(windowMinutes int, nowUnix int64) (*Snapshot, 
 			ch[i].Label = "#" + ch[i].Key
 		}
 	}
-	md, err := m.storeDimRange("model_name", since, until, windowSec)
+	md, err := m.storeDimRangeForScope("model_name", since, until, windowSec, scope)
 	if err != nil {
 		return nil, err
 	}
-	trend, err := m.storeTrendRange(since, until, windowMinutes)
+	var dimensionLimits map[string]DimensionLimit
+	if scope == metricRecordedTraffic {
+		dimensionLimits = make(map[string]DimensionLimit, 3)
+		grp, dimensionLimits["group"] = limitModelDimension(grp)
+		ch, dimensionLimits["channel"] = limitModelDimension(ch)
+		md, dimensionLimits["model"] = limitModelDimension(md)
+	}
+	trend, err := m.storeTrendRangeForScope(since, until, windowMinutes, scope)
 	if err != nil {
 		return nil, err
 	}
 	// 给每行挂上迷你趋势(sparkline)序列
-	if err := m.attachSpark(grp, "grp", since, until, windowMinutes); err != nil {
+	if err := m.attachSparkForScope(grp, "grp", since, until, windowMinutes, scope); err != nil {
 		return nil, err
 	}
-	if err := m.attachSpark(ch, "channel_id", since, until, windowMinutes); err != nil {
+	if err := m.attachSparkForScope(ch, "channel_id", since, until, windowMinutes, scope); err != nil {
 		return nil, err
 	}
-	if err := m.attachSpark(md, "model_name", since, until, windowMinutes); err != nil {
+	if err := m.attachSparkForScope(md, "model_name", since, until, windowMinutes, scope); err != nil {
 		return nil, err
 	}
 
@@ -1149,9 +1201,13 @@ func (m *Monitor) computeSnapshot(windowMinutes int, nowUnix int64) (*Snapshot, 
 		return nil, terr
 	}
 	ac := m.loadAlertConfig()
-	slo := m.computeSLO(ac, nowUnix)
+	slo := SLOStatus{}
 	compareFrom, _ := metricCompareRange(nowUnix)
-	compareAvailable, _, _ := m.metricHourWindowCoverage(compareFrom, nowUnix)
+	compareAvailable := false
+	if !observed && until >= metricFinalizeTarget(nowUnix)-metricFinalizeRunEverySec {
+		slo = m.computeSLO(ac, nowUnix)
+		compareAvailable, _, _ = m.metricHourWindowCoverage(compareFrom, nowUnix)
+	}
 	compare := CompareStat{}
 	if compareAvailable {
 		compare, err = m.storeCompareE(nowUnix)
@@ -1169,21 +1225,31 @@ func (m *Monitor) computeSnapshot(windowMinutes int, nowUnix int64) (*Snapshot, 
 	// data_age_sec 表达这份签收快照的截止时间，不能用更新的
 	// provisional 采样冒充快照新鲜度。
 	age := max(int64(0), nowUnix-until)
+	if observed {
+		age = -1
+		if liveAvailable {
+			age = max(int64(0), nowUnix-(lastBucket+60))
+		}
+	}
 
 	return &Snapshot{
-		WindowMinutes: windowMinutes,
-		GeneratedAt:   time.Unix(nowUnix, 0).Format("2006-01-02 15:04:05"),
+		LocalSnapshotOnly: m.cfg.LocalSnapshotOnly,
+		View:              view, WindowFromTs: since, WindowToTs: until,
+		FinalizationDelayed: !observed && metricFinalizeTarget(nowUnix)-until > metricFinalizeRunEverySec,
+		WindowMinutes:       windowMinutes,
+		GeneratedAt:         time.Unix(nowUnix, 0).Format("2006-01-02 15:04:05"),
 		// 查询成功但本地从未形成过任何事实，不能向用户表达成“采样正常”。
 		// 这既覆盖新环境尚无流量，也能把迁库/权限错误造成的空结果显式暴露出来。
 		SamplingActive:   liveAvailable && m.LastSampleRun() > nowUnix-int64(m.cfg.SampleSeconds)*3,
 		DataAgeSec:       age,
-		DataComplete:     true,
-		CoverageFromTs:   since,
-		CoverageToTs:     until,
+		DataComplete:     coverageComplete && !observed,
+		CoverageFromTs:   coverageFrom,
+		CoverageToTs:     coverageTo,
 		Summary:          *sum,
 		ByGroup:          grp,
 		ByChannel:        ch,
 		ByModel:          md,
+		DimensionLimits:  dimensionLimits,
 		ByToken:          tokens,
 		Trend:            trend,
 		SLO:              slo,

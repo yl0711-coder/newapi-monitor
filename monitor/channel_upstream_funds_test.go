@@ -401,6 +401,11 @@ func TestReparseStoredUpstreamFundEventsUpgradesWithoutRefetch(t *testing.T) {
 	if err := db.Create(&old).Error; err != nil {
 		t.Fatal(err)
 	}
+	// Simulate columns added to a populated production database: NULL is not
+	// equivalent to a Go zero value in SQL predicates.
+	if err := db.Model(&old).Updates(map[string]any{"parser_version": nil, "upstream_amount_known": nil, "upstream_currency": nil}).Error; err != nil {
+		t.Fatal(err)
+	}
 	if err := m.reparseStoredUpstreamFundEvents(t.Context(), row, 1788552200); err != nil {
 		t.Fatal(err)
 	}
@@ -410,6 +415,19 @@ func TestReparseStoredUpstreamFundEventsUpgradesWithoutRefetch(t *testing.T) {
 	}
 	if got.ParserVersion != upstreamFundParserVersion || !got.UpstreamAmountKnown || got.UpstreamCurrency != "CNY" || got.UpstreamAmount != 1000 || got.AmountKnown || got.ObservedCount != 3 || got.FetchedAt != old.FetchedAt {
 		t.Fatalf("stored event was not upgraded safely: %+v", got)
+	}
+	if got.RawJSON != old.RawJSON || got.EventKey != old.EventKey {
+		t.Fatal("reparse must preserve original evidence and event identity")
+	}
+	if err := m.reparseStoredUpstreamFundEvents(t.Context(), row, 1788552300); err != nil {
+		t.Fatal(err)
+	}
+	var repeated ChannelUpstreamFundEvent
+	if err := db.First(&repeated).Error; err != nil {
+		t.Fatal(err)
+	}
+	if repeated != got {
+		t.Fatal("reparse must be idempotent")
 	}
 }
 
@@ -483,6 +501,9 @@ func TestUpstreamFundsSummaryIsNotLimitedByDetailPage(t *testing.T) {
 	if err := m.storeDB.CreateInBatches(events, 100).Error; err != nil {
 		t.Fatal(err)
 	}
+	if err := m.storeDB.Create(&UpstreamFundSyncState{Domain: account.Domain, AccountEpoch: epoch, CoverageFrom: 1788551900, TailSyncedUntil: 1788553000, BackfillDone: true}).Error; err != nil {
+		t.Fatal(err)
+	}
 	recorder := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(recorder)
 	c.Request = httptest.NewRequest("GET", "/channels/upstream/funds?domain=funds.example&from=1788551900&to=1788553000", nil)
@@ -491,16 +512,22 @@ func TestUpstreamFundsSummaryIsNotLimitedByDetailPage(t *testing.T) {
 		t.Fatalf("handler status=%d body=%s", recorder.Code, recorder.Body.String())
 	}
 	var response struct {
-		Limited    bool                    `json:"limited"`
-		Summary    upstreamFundSummary     `json:"summary"`
-		PaidTotals []upstreamFundPaidTotal `json:"paid_totals"`
-		Events     []json.RawMessage       `json:"events"`
+		Limited           bool                    `json:"limited"`
+		Summary           upstreamFundSummary     `json:"summary"`
+		PaidTotals        []upstreamFundPaidTotal `json:"paid_totals"`
+		Events            []json.RawMessage       `json:"events"`
+		QueryComplete     bool                    `json:"query_complete"`
+		AmountsComplete   bool                    `json:"amounts_complete"`
+		USDTotalsComplete bool                    `json:"usd_totals_complete"`
 	}
 	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
 		t.Fatal(err)
 	}
 	if !response.Limited || len(response.Events) != 500 || response.Summary.CreditedUSD != 501 || response.Summary.EventOccurrences != 501 {
 		t.Fatalf("summary was truncated with details: limited=%v rows=%d summary=%+v", response.Limited, len(response.Events), response.Summary)
+	}
+	if !response.QueryComplete || !response.AmountsComplete || !response.USDTotalsComplete {
+		t.Fatalf("complete USD evidence should remain publishable even when details are limited: %+v", response.Summary)
 	}
 	if len(response.PaidTotals) != 1 || response.PaidTotals[0].Currency != "CNY" || response.PaidTotals[0].Amount != 7.2 {
 		t.Fatalf("known paid currencies were not summarized separately: %+v", response.PaidTotals)
@@ -526,6 +553,19 @@ func TestUpstreamFundsSummarySeparatesNativeCurrencyFromUnknown(t *testing.T) {
 	if err := m.storeDB.Create(&events).Error; err != nil {
 		t.Fatal(err)
 	}
+	for key, fields := range map[string]map[string]any{
+		"native": {"amount_known": nil},
+		"unknown": {"amount_known": nil, "upstream_amount_known": nil, "upstream_currency": nil,
+			"paid_known": true, "paid_amount": 1000, "paid_currency": nil},
+		"unitless": {"upstream_currency": nil},
+	} {
+		if err := m.storeDB.Model(&ChannelUpstreamFundEvent{}).Where("domain = ? AND event_key = ?", account.Domain, key).Updates(fields).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := m.storeDB.Create(&UpstreamFundSyncState{Domain: account.Domain, AccountEpoch: epoch, Status: "ok", CoverageFrom: 1788551900, TailSyncedUntil: 1788553000, BackfillDone: true}).Error; err != nil {
+		t.Fatal(err)
+	}
 	recorder := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(recorder)
 	c.Request = httptest.NewRequest("GET", "/channels/upstream/funds?domain=native.example&from=1788551900&to=1788553000", nil)
@@ -534,14 +574,26 @@ func TestUpstreamFundsSummarySeparatesNativeCurrencyFromUnknown(t *testing.T) {
 		t.Fatalf("handler status=%d body=%s", recorder.Code, recorder.Body.String())
 	}
 	var response struct {
-		Summary        upstreamFundSummary         `json:"summary"`
-		UpstreamTotals []upstreamFundCurrencyTotal `json:"upstream_totals"`
+		Summary           upstreamFundSummary         `json:"summary"`
+		UpstreamTotals    []upstreamFundCurrencyTotal `json:"upstream_totals"`
+		QueryComplete     bool                        `json:"query_complete"`
+		AmountsComplete   bool                        `json:"amounts_complete"`
+		USDTotalsComplete bool                        `json:"usd_totals_complete"`
 	}
 	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
 		t.Fatal(err)
 	}
 	if response.Summary.UnknownAmountEvents != 2 {
 		t.Fatalf("native known amount must not count as unknown: %+v", response.Summary)
+	}
+	if response.Summary.PaidUnknownCurrencyEvents != 1 {
+		t.Fatalf("NULL paid currency must remain unknown: %+v", response.Summary)
+	}
+	if response.Summary.USDUnknownAmountEvents != 4 {
+		t.Fatalf("native currency and unknown events must not certify USD totals: %+v", response.Summary)
+	}
+	if !response.QueryComplete || response.AmountsComplete || response.USDTotalsComplete {
+		t.Fatalf("complete collection must not certify unknown money: %+v", response)
 	}
 	if response.Summary.CreditedUSD != 0 || response.Summary.QuarantinedEvents != 1 {
 		t.Fatalf("quarantined derived amounts must fail closed: %+v", response.Summary)

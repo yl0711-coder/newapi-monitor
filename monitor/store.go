@@ -998,14 +998,20 @@ func (m *Monitor) openStore(path string) error {
 		}
 	}
 	m.storeDB = db
-	if err := m.migrateLegacyUpstreamCredentialEncryption(); err != nil {
-		return fmt.Errorf("上游凭据加密密钥迁移失败: %w", err)
-	}
-	if err := m.migrateAICodeWithCredentialSlots(); err != nil {
-		return fmt.Errorf("AICodeWith Key 槽位迁移失败: %w", err)
-	}
-	if err := m.reconcileAICodeWithPublishedBackfillStates(); err != nil {
-		return fmt.Errorf("AICodeWith Key 历史完成状态修复失败: %w", err)
+	// Offline snapshots retain opaque credentials and diagnostic history as-is.
+	// Viewing saved facts must not require exporting production encryption keys
+	// or changing credential-dependent completion evidence. Online startup keeps
+	// its original fail-closed migration checks.
+	if !m.cfg.LocalSnapshotOnly {
+		if err := m.migrateLegacyUpstreamCredentialEncryption(); err != nil {
+			return fmt.Errorf("上游凭据加密密钥迁移失败: %w", err)
+		}
+		if err := m.migrateAICodeWithCredentialSlots(); err != nil {
+			return fmt.Errorf("AICodeWith Key 槽位迁移失败: %w", err)
+		}
+		if err := m.reconcileAICodeWithPublishedBackfillStates(); err != nil {
+			return fmt.Errorf("AICodeWith Key 历史完成状态修复失败: %w", err)
+		}
 	}
 	if err := m.migrateAICodeWithContractLedgerUnit(); err != nil {
 		return fmt.Errorf("AICodeWith 账面单位迁移失败: %w", err)
@@ -1573,6 +1579,10 @@ func (m *Monitor) storeSummary(since int64, windowSec float64) (*Summary, error)
 // windows. A zero until keeps the historical "from now backwards" behavior
 // used by the live dashboard.
 func (m *Monitor) storeSummaryRange(since, until int64, windowSec float64) (*Summary, error) {
+	return m.storeSummaryRangeForScope(since, until, windowSec, metricCurrentRoutes)
+}
+
+func (m *Monitor) storeSummaryRangeForScope(since, until int64, windowSec float64, scope metricReadScope) (*Summary, error) {
 	var a aggRow
 	query := `SELECT '' AS k, ` + aggCols + ` FROM metric_samples WHERE bucket_ts >= ?`
 	args := []any{since}
@@ -1580,7 +1590,7 @@ func (m *Monitor) storeSummaryRange(since, until int64, windowSec float64) (*Sum
 		query += ` AND bucket_ts < ?`
 		args = append(args, until)
 	}
-	query += currentMetricTrafficFilter + enabledChanFilter + selectableFilter
+	query += scope.filter("")
 	if err := m.storeDB.Raw(query, args...).Scan(&a).Error; err != nil {
 		return nil, fmt.Errorf("本地汇总失败: %w", err)
 	}
@@ -1613,7 +1623,7 @@ func dimColOK(dimCol string) bool {
 	return false
 }
 
-func (m *Monitor) storeDimSeriesRange(dimCol string, since, until int64, windowMinutes int) (map[string][]TimePoint, error) {
+func (m *Monitor) storeDimSeriesRangeForScope(dimCol string, since, until int64, windowMinutes int, scope metricReadScope) (map[string][]TimePoint, error) {
 	if !dimColOK(dimCol) {
 		return nil, fmt.Errorf("非法维度列: %q", dimCol)
 	}
@@ -1624,10 +1634,7 @@ func (m *Monitor) storeDimSeriesRange(dimCol string, since, until int64, windowM
 		Anomaly  int64
 		Failed   int64
 	}
-	f := currentMetricTrafficFilter + enabledChanFilter + selectableFilter
-	if dimCol == channelDim { // 按渠道明细不过滤,排障仍能看禁用渠道/误路由
-		f = currentMetricTrafficFilter
-	}
+	f := scope.filter(dimCol)
 	q := fmt.Sprintf(`SELECT %s AS k, bucket_ts, COALESCE(SUM(success),0) AS success,
 		COALESCE(SUM(anomaly),0) AS anomaly, COALESCE(SUM(failed),0) AS failed
 		FROM metric_samples WHERE bucket_ts >= ?`, dimCol)
@@ -1673,20 +1680,22 @@ func (m *Monitor) storeDim(dimCol string, since int64, windowSec float64) ([]Row
 }
 
 func (m *Monitor) storeDimRange(dimCol string, since, until int64, windowSec float64) ([]Row, error) {
+	return m.storeDimRangeForScope(dimCol, since, until, windowSec, metricCurrentRoutes)
+}
+
+func (m *Monitor) storeDimRangeForScope(dimCol string, since, until int64, windowSec float64, scope metricReadScope) ([]Row, error) {
 	if !dimColOK(dimCol) {
 		return nil, fmt.Errorf("非法维度列: %q", dimCol)
 	}
-	f := currentMetricTrafficFilter + enabledChanFilter + selectableFilter
-	if dimCol == channelDim { // 按渠道明细不过滤,排障仍能看禁用渠道/误路由
-		f = currentMetricTrafficFilter
-	}
+	f := scope.filter(dimCol)
 	q := fmt.Sprintf(`SELECT %s AS k, %s FROM metric_samples WHERE bucket_ts >= ?`, dimCol, aggCols)
 	args := []any{since}
 	if until > 0 {
 		q += ` AND bucket_ts < ?`
 		args = append(args, until)
 	}
-	q += fmt.Sprintf(`%s GROUP BY %s ORDER BY quota DESC, (success+anomaly+failed) DESC, k ASC LIMIT 200`, f, dimCol)
+	q += fmt.Sprintf(`%s GROUP BY %s ORDER BY quota DESC, (success+anomaly+failed) DESC, k ASC LIMIT ?`, f, dimCol)
+	args = append(args, scope.dimensionReadLimit())
 	var rows []aggRow
 	if err := m.storeDB.Raw(q, args...).Scan(&rows).Error; err != nil {
 		return nil, fmt.Errorf("本地维度聚合失败(%s): %w", dimCol, err)
@@ -1709,6 +1718,10 @@ func (m *Monitor) storeTrend(since int64, windowMinutes int) ([]TimePoint, error
 }
 
 func (m *Monitor) storeTrendRange(since, until int64, windowMinutes int) ([]TimePoint, error) {
+	return m.storeTrendRangeForScope(since, until, windowMinutes, metricCurrentRoutes)
+}
+
+func (m *Monitor) storeTrendRangeForScope(since, until int64, windowMinutes int, scope metricReadScope) ([]TimePoint, error) {
 	type minRow struct {
 		BucketTs int64
 		Success  int64
@@ -1724,7 +1737,7 @@ func (m *Monitor) storeTrendRange(since, until int64, windowMinutes int) ([]Time
 		q += ` AND bucket_ts < ?`
 		args = append(args, until)
 	}
-	q += currentMetricTrafficFilter + enabledChanFilter + selectableFilter + ` GROUP BY bucket_ts ORDER BY bucket_ts`
+	q += scope.filter("") + ` GROUP BY bucket_ts ORDER BY bucket_ts`
 	if err := m.storeDB.Raw(q, args...).
 		Scan(&rows).Error; err != nil {
 		return nil, fmt.Errorf("本地趋势失败: %w", err)

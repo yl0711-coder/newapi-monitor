@@ -64,6 +64,7 @@ type Settings struct {
 	NginxEnabled       bool     // MONITOR_NGINX_ENABLED,默认 false
 	NginxRetentionDays int      // MONITOR_NGINX_RETENTION_DAYS,默认 7
 	NginxAllowedNodes  []string // MONITOR_NGINX_ALLOWED_NODES,逗号分隔；启用 Nginx 采集时必填
+	NginxExpectedNodes []string // nil: inherit allowed; explicit empty: no active heartbeat expectations
 	NginxErrorEnabled  bool     // MONITOR_NGINX_ERROR_ENABLED，标准 error.log 的节点侧分类分钟聚合
 	// v2 是不可逆的逐 lane 连续性切换。总开关和逐节点白名单默认均关闭；
 	// 普通 Nginx ingest token 不能仅凭自身触发生产节点切换。
@@ -319,6 +320,7 @@ func LoadSettings() Settings {
 		NginxEnabled:                             env("MONITOR_NGINX_ENABLED", "false") == "true",
 		NginxRetentionDays:                       envInt("MONITOR_NGINX_RETENTION_DAYS", 7),
 		NginxAllowedNodes:                        envCSV("MONITOR_NGINX_ALLOWED_NODES"),
+		NginxExpectedNodes:                       envOptionalCSV("MONITOR_NGINX_EXPECTED_NODES"),
 		NginxErrorEnabled:                        env("MONITOR_NGINX_ERROR_ENABLED", "false") == "true",
 		NginxSourceV2Enabled:                     env("MONITOR_NGINX_SOURCE_V2_ENABLED", "false") == "true",
 		NginxSourceV2CutoverEnabled:              env("MONITOR_NGINX_SOURCE_V2_CUTOVER_ENABLED", "false") == "true",
@@ -420,7 +422,7 @@ func LoadSettings() Settings {
 		ProbeCertBadDays:   envFloat("MONITOR_PROBE_CERT_BAD_DAYS", 7),
 		ProbeExpectCDN:     env("MONITOR_PROBE_EXPECT_CDN", "true") == "true",
 
-		OriginLockTargets: env("MONITOR_ORIGIN_LOCK_TARGETS", "172.26.0.20:80,172.26.10.97:80"),
+		OriginLockTargets: envAllowEmpty("MONITOR_ORIGIN_LOCK_TARGETS", "172.26.0.20:80,172.26.10.97:80"),
 		OriginLockHost:    env("MONITOR_ORIGIN_LOCK_HOST", "nexusapi.link"),
 		OriginLockPath:    env("MONITOR_ORIGIN_LOCK_PATH", "/"),
 
@@ -451,6 +453,15 @@ func (s Settings) stabilityStorageDays() int {
 
 func env(k, def string) string {
 	if v := os.Getenv(k); v != "" {
+		return v
+	}
+	return def
+}
+
+// envAllowEmpty is only for options where an explicit empty value disables
+// the feature. Other settings retain their existing empty-as-default policy.
+func envAllowEmpty(k, def string) string {
+	if v, present := os.LookupEnv(k); present {
 		return v
 	}
 	return def

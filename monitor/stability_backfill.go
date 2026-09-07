@@ -595,6 +595,18 @@ func (m *Monitor) replaceStabilityHour(hourTs int64, rows []StabilityHourSample,
 }
 
 func (m *Monitor) replaceStabilityHourTraffic(hourTs int64, rows []StabilityHourSample, testRows []ChannelTestHourSample, state StabilityHourIngestState) error {
+	return m.replaceStabilityHourTrafficContext(m.taskContext(), hourTs, rows, testRows, state)
+}
+
+func (m *Monitor) replaceStabilityHourTrafficContext(ctx context.Context, hourTs int64, rows []StabilityHourSample, testRows []ChannelTestHourSample, state StabilityHourIngestState) error {
+	return retryStabilityLocalWrite(ctx, func(attemptCtx context.Context) error {
+		// GORM hooks and normalization mutate rows, so each attempt starts from
+		// the same immutable source result, not a partially modified attempt.
+		return m.replaceStabilityHourTrafficOnce(attemptCtx, hourTs, append([]StabilityHourSample(nil), rows...), append([]ChannelTestHourSample(nil), testRows...), state)
+	})
+}
+
+func (m *Monitor) replaceStabilityHourTrafficOnce(ctx context.Context, hourTs int64, rows []StabilityHourSample, testRows []ChannelTestHourSample, state StabilityHourIngestState) error {
 	for i := range testRows {
 		// Compatibility for callers/imported snapshots created before explicit
 		// success/failed columns existed. Fresh source rows always carry all three
@@ -621,7 +633,7 @@ func (m *Monitor) replaceStabilityHourTraffic(hourTs int64, rows []StabilityHour
 	for i := range rows {
 		rows[i].TrafficClassVersion = stabilityTrafficClassificationVersion
 	}
-	return m.storeDB.Transaction(func(tx *gorm.DB) error {
+	return m.storeDB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		if expectedRequests == 0 {
 			var minuteRequests int64
 			if err := tx.Raw(`SELECT COALESCE(SUM(success+anomaly+failed),0) FROM metric_samples
@@ -688,7 +700,17 @@ func (m *Monitor) replaceStabilityHourTraffic(hourTs int64, rows []StabilityHour
 
 func (m *Monitor) markStabilityHourAttempt(hourTs int64, jobID, status, lastError string) (StabilityHourIngestState, error) {
 	var state StabilityHourIngestState
-	if err := m.storeDB.First(&state, "hour_ts = ?", hourTs).Error; err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+	err := retryStabilityLocalWrite(m.taskContext(), func(ctx context.Context) error {
+		var err error
+		state, err = m.markStabilityHourAttemptOnce(ctx, hourTs, jobID, status, lastError)
+		return err
+	})
+	return state, err
+}
+
+func (m *Monitor) markStabilityHourAttemptOnce(ctx context.Context, hourTs int64, jobID, status, lastError string) (StabilityHourIngestState, error) {
+	var state StabilityHourIngestState
+	if err := m.storeDB.WithContext(ctx).First(&state, "hour_ts = ?", hourTs).Error; err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
 		return state, err
 	}
 	state.HourTs = hourTs
@@ -702,7 +724,7 @@ func (m *Monitor) markStabilityHourAttempt(hourTs int64, jobID, status, lastErro
 	if status != "complete" {
 		state.CompletedAt = 0
 	}
-	if err := m.storeDB.Save(&state).Error; err != nil {
+	if err := m.storeDB.WithContext(ctx).Save(&state).Error; err != nil {
 		return state, err
 	}
 	return state, nil
@@ -717,7 +739,7 @@ func (m *Monitor) backfillOneStabilityHour(ctx context.Context, hourTs int64, jo
 		}
 		traffic, err := m.fetchStabilityHour(ctx, hourTs)
 		if err == nil {
-			return m.replaceStabilityHourTraffic(hourTs, traffic.Users, traffic.InternalTests, state)
+			return m.replaceStabilityHourTrafficContext(ctx, hourTs, traffic.Users, traffic.InternalTests, state)
 		}
 		lastErr = err
 		if stabilityBackfillInterrupted(ctx, err) {
@@ -1030,7 +1052,7 @@ func (m *Monitor) runStabilityBackfillWithFetcher(ctx context.Context, jobID str
 				return
 			}
 			traffic := result.Hours[hour]
-			if err := m.replaceStabilityHourTraffic(hour, traffic.Users, traffic.InternalTests, state); err != nil {
+			if err := m.replaceStabilityHourTrafficContext(ctx, hour, traffic.Users, traffic.InternalTests, state); err != nil {
 				_, _ = m.markStabilityHourAttempt(hour, job.ID, "failed", err.Error())
 				job.Status, job.LastError, job.UpdatedAt = "paused", clip(err.Error(), 512), time.Now().Unix()
 				m.saveStabilityBackfillJob(&job, "本地原子写入失败")
@@ -1077,7 +1099,7 @@ func (m *Monitor) runStabilityBackfillWithFetcher(ctx context.Context, jobID str
 				return
 			}
 			traffic := result.Hours[hour]
-			if err := m.replaceStabilityHourTraffic(hour, traffic.Users, traffic.InternalTests, state); err != nil {
+			if err := m.replaceStabilityHourTrafficContext(ctx, hour, traffic.Users, traffic.InternalTests, state); err != nil {
 				_, _ = m.markStabilityHourAttempt(hour, job.ID, "failed", err.Error())
 				job.Status, job.LastError, job.UpdatedAt = "paused", clip(err.Error(), 512), time.Now().Unix()
 				m.saveStabilityBackfillJob(&job, "隔离小时复核写入失败")
@@ -1205,7 +1227,9 @@ func (m *Monitor) refreshStabilityJobProgress(job *StabilityBackfillJob, batchHo
 }
 
 func (m *Monitor) saveStabilityBackfillJob(job *StabilityBackfillJob, operation string) bool {
-	if err := m.storeDB.Save(job).Error; err != nil {
+	// Shutdown still needs a bounded opportunity to persist its queued cursor.
+	ctx := context.WithoutCancel(m.taskContext())
+	if err := retryStabilityLocalWrite(ctx, func(ctx context.Context) error { return m.storeDB.WithContext(ctx).Save(job).Error }); err != nil {
 		slog.Error("稳定性补数任务状态持久化失败", "operation", operation, "job_id", job.ID, "err", err)
 		return false
 	}

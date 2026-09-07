@@ -127,9 +127,8 @@ func TestSyncStatusPageSeparatesUpstreamBalanceTailAndHistory(t *testing.T) {
 	if !strings.Contains(pageHTML, `u.usage_sync_enabled&&u.usage_worker_enabled&&(usage.level==='warn'||history.level==='warn')`) {
 		t.Fatal("上游账户总状态必须分别读取当天 Tail 与历史补数状态")
 	}
-	managementJS := string(channelManagementJS)
-	if !strings.Contains(managementJS, `upstream.usage_sync_enabled&&upstream.usage_worker_enabled&&!upstream.usage_backfill_done`) {
-		t.Fatal("全局灰度关闭时，渠道摘要不得继续显示历史补全中")
+	if !strings.Contains(pageHTML, `id="syncChannelDataStatus"`) || !strings.Contains(pageHTML, `'/channels/data-status?'+query`) {
+		t.Fatal("渠道数据核验必须集中到同步状态页，并保留渠道页日期范围")
 	}
 }
 

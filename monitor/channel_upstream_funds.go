@@ -799,7 +799,7 @@ func (m *Monitor) reparseStoredUpstreamFundEvents(ctx context.Context, row Chann
 	epoch := newAPIUpstreamAccountEpoch(row)
 	var stored []ChannelUpstreamFundEvent
 	if err := m.storeDB.WithContext(ctx).
-		Where("domain = ? AND account_epoch = ? AND parser_version < ? AND raw_json <> ''", row.Domain, epoch, upstreamFundParserVersion).
+		Where("domain = ? AND account_epoch = ? AND COALESCE(parser_version, 0) < ? AND raw_json <> ''", row.Domain, epoch, upstreamFundParserVersion).
 		Order("occurred_at DESC,event_key DESC").Limit(200).Find(&stored).Error; err != nil {
 		return fmt.Errorf("读取待重解析资金流水失败: %w", err)
 	}
@@ -1165,6 +1165,7 @@ type upstreamFundSummary struct {
 	DebitedUSD                float64 `json:"debited_usd"`
 	RefundedUSD               float64 `json:"refunded_usd"`
 	UnknownAmountEvents       int64   `json:"unknown_amount_events"`
+	USDUnknownAmountEvents    int64   `json:"usd_unknown_amount_events"`
 	PaidUnknownCurrencyEvents int64   `json:"paid_unknown_currency_events"`
 	EventOccurrences          int64   `json:"event_occurrences"`
 	QuarantinedEvents         int64   `json:"quarantined_events"`
@@ -1256,8 +1257,9 @@ func (m *Monitor) getChannelUpstreamFundsHandler(c *gin.Context) {
 			COALESCE(SUM(CASE WHEN COALESCE(reparse_error,'') = '' AND amount_known AND kind <> ? AND direction = 'credit' THEN amount_usd * CASE WHEN observed_count > 0 THEN observed_count ELSE 1 END ELSE 0 END), 0) AS credited_usd,
 			COALESCE(SUM(CASE WHEN COALESCE(reparse_error,'') = '' AND amount_known AND kind <> ? AND direction = 'debit' THEN amount_usd * CASE WHEN observed_count > 0 THEN observed_count ELSE 1 END ELSE 0 END), 0) AS debited_usd,
 			COALESCE(SUM(CASE WHEN COALESCE(reparse_error,'') = '' AND amount_known AND kind = ? THEN amount_usd * CASE WHEN observed_count > 0 THEN observed_count ELSE 1 END ELSE 0 END), 0) AS refunded_usd,
-			COALESCE(SUM(CASE WHEN COALESCE(reparse_error,'') = '' AND NOT amount_known AND (NOT upstream_amount_known OR upstream_currency = '') THEN CASE WHEN observed_count > 0 THEN observed_count ELSE 1 END ELSE 0 END), 0) AS unknown_amount_events,
-			COALESCE(SUM(CASE WHEN COALESCE(reparse_error,'') = '' AND paid_known AND paid_currency = '' THEN CASE WHEN observed_count > 0 THEN observed_count ELSE 1 END ELSE 0 END), 0) AS paid_unknown_currency_events,
+			COALESCE(SUM(CASE WHEN COALESCE(reparse_error,'') = '' AND NOT COALESCE(amount_known,0) AND (NOT COALESCE(upstream_amount_known,0) OR COALESCE(upstream_currency,'') = '') THEN CASE WHEN observed_count > 0 THEN observed_count ELSE 1 END ELSE 0 END), 0) AS unknown_amount_events,
+			COALESCE(SUM(CASE WHEN COALESCE(reparse_error,'') = '' AND NOT COALESCE(amount_known,0) THEN CASE WHEN observed_count > 0 THEN observed_count ELSE 1 END ELSE 0 END), 0) AS usd_unknown_amount_events,
+			COALESCE(SUM(CASE WHEN COALESCE(reparse_error,'') = '' AND paid_known AND COALESCE(paid_currency,'') = '' THEN CASE WHEN observed_count > 0 THEN observed_count ELSE 1 END ELSE 0 END), 0) AS paid_unknown_currency_events,
 			COALESCE(SUM(CASE WHEN observed_count > 0 THEN observed_count ELSE 1 END), 0) AS event_occurrences,
 			COALESCE(SUM(CASE WHEN COALESCE(reparse_error,'') <> '' THEN CASE WHEN observed_count > 0 THEN observed_count ELSE 1 END ELSE 0 END), 0) AS quarantined_events`,
 			upstreamFundKindRefund, upstreamFundKindRefund, upstreamFundKindRefund).
@@ -1284,7 +1286,7 @@ func (m *Monitor) getChannelUpstreamFundsHandler(c *gin.Context) {
 			COALESCE(SUM(CASE WHEN kind <> ? AND direction = 'debit' THEN upstream_amount * CASE WHEN observed_count > 0 THEN observed_count ELSE 1 END ELSE 0 END), 0) AS debited,
 			COALESCE(SUM(CASE WHEN kind = ? THEN upstream_amount * CASE WHEN observed_count > 0 THEN observed_count ELSE 1 END ELSE 0 END), 0) AS refunded`,
 			upstreamFundKindRefund, upstreamFundKindRefund, upstreamFundKindRefund).
-		Where("domain = ? AND account_epoch = ? AND occurred_at >= ? AND occurred_at < ? AND upstream_amount_known = ? AND amount_known = ? AND upstream_currency <> '' AND COALESCE(reparse_error,'') = ''", domain, epoch, from, to, true, false).
+		Where("domain = ? AND account_epoch = ? AND occurred_at >= ? AND occurred_at < ? AND upstream_amount_known = ? AND COALESCE(amount_known,0) = ? AND upstream_currency <> '' AND COALESCE(reparse_error,'') = ''", domain, epoch, from, to, true, false).
 		Group("upstream_currency").Order("upstream_currency ASC").Scan(&upstreamTotals).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "汇总上游账面金额失败"})
 		return
@@ -1305,6 +1307,10 @@ func (m *Monitor) getChannelUpstreamFundsHandler(c *gin.Context) {
 		reason = "该主域名未加入资金流水白名单"
 	}
 	queryComplete := upstreamFundQueryComplete(capability, state, from, to)
+	// Collection coverage is not proof of monetary completeness. Known native
+	// currency is useful evidence, but must not certify a complete USD total.
+	amountsComplete := queryComplete && summary.UnknownAmountEvents == 0 && summary.QuarantinedEvents == 0
+	usdTotalsComplete := amountsComplete && summary.USDUnknownAmountEvents == 0
 	limitations := []string{}
 	if row.Provider == upstreamProviderNewAPI {
 		limitations = append(limitations, "NewAPI 普通用户的 self 日志可能看不到管理员记在操作人名下的额度调整；这类缺口必须继续保留人工记账或后续用余额快照对账发现。")
@@ -1313,7 +1319,7 @@ func (m *Monitor) getChannelUpstreamFundsHandler(c *gin.Context) {
 		limitations = append(limitations, "Sub2API 普通账户只提供近期活动快照，未验证到历史分页或时间范围参数；已采集记录会保留，但不能据此证明更早历史完整。")
 		limitations = append(limitations, "兑换码原文属于敏感凭据，入库前会删除 code 字段；并发、订阅等非金额变更不会计入资金汇总。")
 	}
-	c.JSON(http.StatusOK, gin.H{"domain": domain, "capability": capability, "capability_reason": reason, "limitations": limitations, "state": state, "from": from, "to": to, "query_complete": queryComplete, "limited": len(events) >= upstreamFundEventQueryLimit, "returned_events": len(events), "summary": summary, "paid_totals": paidTotals, "upstream_totals": upstreamTotals, "events": events})
+	c.JSON(http.StatusOK, gin.H{"domain": domain, "capability": capability, "capability_reason": reason, "limitations": limitations, "state": state, "from": from, "to": to, "query_complete": queryComplete, "amounts_complete": amountsComplete, "usd_totals_complete": usdTotalsComplete, "limited": len(events) >= upstreamFundEventQueryLimit, "returned_events": len(events), "summary": summary, "paid_totals": paidTotals, "upstream_totals": upstreamTotals, "events": events})
 }
 
 func (m *Monitor) syncChannelUpstreamFundsHandler(c *gin.Context) {

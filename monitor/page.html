@@ -493,6 +493,11 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
   <div class="sync-overview" id="syncOverview"><div class="sync-card"><small>同步状态</small><b>加载中…</b></div></div>
 
   <section class="sync-section card">
+    <div class="card-header">渠道管理数据核验 <span class="muted">用量覆盖、上游账单、充值比例与余额</span></div>
+    <div id="syncChannelDataStatus">加载中…</div>
+  </section>
+
+  <section class="sync-section card">
     <div class="card-header">⚙️ 采集服务与本地存储 <span class="muted">来源 worker、租约、SQLite 完整性和备份集</span></div>
     <div class="sync-kv" id="syncRuntime"><div>加载中…</div></div>
   </section>
@@ -526,6 +531,7 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
     <a data-w="15">15分钟</a><a data-w="30">30分钟</a><a data-w="60">1小时</a><a data-w="180">3小时</a><a data-w="360">6小时</a><a data-w="720">12小时</a><a data-w="1440">24小时</a>
   </div>
   <label class="muted" style="font-size:13px"><input type="checkbox" id="autoRefresh" checked> 自动刷新(30s)</label>
+  <select id="modelView" aria-label="模型统计视图"><option value="observed">实时观察（已采集）</option><option value="finalized">已定稿统计</option></select>
   <button class="btn" id="refreshNow">立即刷新</button>
   <a class="btn" href="/alert" id="alertLink" style="text-decoration:none;display:none">🔔 报警设置</a>
   <div class="meta" id="genAt">加载中…</div>
@@ -712,7 +718,8 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
   <div class="cm-sortbar">
     <div><b>排行口径</b><span>切换后主域名、厂商和实际渠道同步重排</span></div>
     <div class="cm-sort-switch">
-      <button type="button" class="active" data-cm-sort="cost">用户侧消费</button>
+      <button type="button" class="active" data-cm-sort="name">名称 A–Z</button>
+      <button type="button" data-cm-sort="cost">用户侧消费</button>
       <button type="button" data-cm-sort="requests">请求数</button>
       <button type="button" data-cm-sort="tokens">Tokens</button>
     </div>
@@ -825,7 +832,7 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
     <div class="monitor-table-scroll monitor-table-medium"><table><thead id="thProbe"></thead><tbody id="tbProbe"></tbody></table></div></div>
 
   <!-- 2b. 源站锁(F-5 看门狗) -->
-  <div class="card"><div class="card-header">🔒 源站锁 <span class="muted" style="font-weight:400">· 直连各源站不带密钥头应被拦 403;变 200 即锁失效(可绕 CDN 直连后端)</span></div>
+  <div class="card"><div class="card-header">🔒 源站锁 <span class="muted" style="font-weight:400">· 已配置端点预期返回 403；其他响应需核验访问边界，不可达或无数据不代表可绕过</span></div>
     <div class="monitor-table-scroll monitor-table-medium"><table><thead id="thLock"></thead><tbody id="tbLock"></tbody></table></div></div>
 
   <!-- 3. 数据库 -->
@@ -874,7 +881,7 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
 
   <section class="capacity-grid-two">
     <div class="capacity-card"><header><div><h2>全站入口节点负载</h2><p>POST 推理路由 RPM、入口总占用与代理上游占用；无业务维度，不随分组/渠道/模型筛选。</p></div></header><div class="capacity-chart small" id="capIngressChart"></div></div>
-    <div class="capacity-card"><header><div><h2>全站资源同轴观察</h2><p>不随业务筛选；用于相关性观察，不直接声称因果。</p></div></header><div class="capacity-chart small" id="capInfraChart"></div></div>
+    <div class="capacity-card"><header><div><h2>资源指标观察</h2><p>默认当前资源，同一图只显示同单位指标；历史资源可单独查看。不随业务筛选。</p></div></header><div><label>资源 <select id="capInfraResource"><option value="@current">全部当前资源</option><option value="@history">全部区间资源（含历史）</option></select></label> <label>指标 <select id="capInfraMetric"><option value="cpu">CPU（%）</option><option value="connections">连接数</option><option value="disk_queue">磁盘队列</option><option value="resp_ms">响应耗时（ms）</option></select></label></div><div class="capacity-chart small" id="capInfraChart"></div></div>
   </section>
 
   <section class="capacity-grid-two">
@@ -1096,7 +1103,8 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
 </div><!-- /monitor-shell -->
 
 <script src="/stability.js?v=3"></script>
-<script src="/channel-management.js?v=7"></script>
+<script src="/channel-data-status.js?v=1"></script>
+<script src="/channel-management.js?v=8"></script>
 <script src="/logchain.js?v=1"></script>
 <script src="/capacity.js?v=2"></script>
 <script src="/group-governance.js?v=1"></script>
@@ -1163,7 +1171,11 @@ function renderBanner(s){
   let cls,txt;
   // 主结论只由【错误】驱动(错误才需要立刻止损)。交付异常另起一段灰字追加,
   // 不参与 bad/warn 三态配色——口径见 文档 09 §5.1「B 类不驱动 health」。
-  if(s.data_complete===false){cls='warn';txt='<span class="dot dot-y"></span> 新统计口径历史数据补齐中，当前窗口暂不判定'}
+  if(s.local_snapshot_only){cls='warn';txt='<span class="dot dot-y"></span> 本机快照预览，未开启实时采集；数据不会自动更新'}
+  else if(s.view==='observed'&&!s.sampling_active){cls='bad';txt='<span class="dot dot-r"></span> 实时采样不可用或已停止；下方仅为已采集记录，不代表当前完整状态'}
+  else if(s.view==='observed'){cls='warn';txt='<span class="dot dot-y"></span> 实时观察：仅包含已采集请求，迟到记录可能补入；金额、成功率和趋势尚未定稿'}
+  else if(s.data_complete===false){cls='warn';txt='<span class="dot dot-y"></span> 新统计口径历史数据补齐中，当前窗口暂不判定'}
+  else if(s.finalization_delayed){cls='warn';txt='<span class="dot dot-y"></span> 展示历史已定稿窗口，最新时段仍在追平'}
   else if(!s.sampling_active){cls='bad';txt='<span class="dot dot-r"></span> 监控数据不可用或采样已停止'}
   else if((s.summary?.total||0)===0){cls='warn';txt='<span class="dot dot-y"></span> 当前窗口无请求，无法判断稳定性'}
   else if(bad.length){cls='bad';txt=`<span class="dot dot-r"></span> ${bad.length} 项错误`}
@@ -1175,7 +1187,7 @@ function renderBanner(s){
   if(flagged.length) txt+=`<span class="muted" style="font-weight:400;font-size:13px;margin-left:10px">· ${flagged.length} 项交付异常待观察</span>`;
   b.className='banner '+cls;m.innerHTML=txt;
   document.getElementById('freshness').textContent=fmtAge(s.data_age_sec);
-  document.getElementById('heartbeat').innerHTML=s.sampling_active?'<span class="dot dot-g dot-live"></span> 正常':'<span class="dot dot-r"></span> 异常(采样可能已停)';
+  document.getElementById('heartbeat').innerHTML=s.local_snapshot_only?'<span class="muted">快照预览（未采集）</span>':s.sampling_active?'<span class="dot dot-g dot-live"></span> 正常':'<span class="dot dot-r"></span> 异常(采样可能已停)';
   // 一切错误都算、都要关注;错误构成(errText)只用于诊断/跟上游沟通,不用来过滤。
   renderUndeliv(undelivWatch(s),new Set(flagged.map(r=>r.key)));
   // 传 s.summary 而不是 s:failed/anomaly/error_rate 这些计数在 summary 上,
@@ -1183,7 +1195,14 @@ function renderBanner(s){
   renderAttnStat(s.summary||{});
   const list=document.getElementById('attnList');
   const items=[...bad,...warn];
-  if(!items.length){list.innerHTML='<div class="attn-empty">✓ 当前窗口内无错误 / 波动的渠道或模型</div>';return}
+  if(!items.length){
+    let message;
+    if(!(s.summary?.total>0))message='暂无请求事实，无法判断错误或稳定性';
+    else if(s.view==='observed'||s.data_complete!==true)message='已采集记录中暂未发现达到关注阈值的错误或波动；不代表区间完整';
+    else if(s.finalization_delayed||!s.sampling_active)message='该历史窗口未发现达到关注阈值的错误或波动；不能判断当前状态';
+    else message='✓ 已定稿窗口未发现达到关注阈值的错误或波动';
+    list.innerHTML='<div class="attn-empty">'+message+'</div>';return;
+  }
   const row=r=>{
     const w=[];
     // 本区只讲错误;交付异常有独立区域,不在这里混着显示。
@@ -1275,7 +1294,10 @@ function problemDetail(spark){   // 展开:逐分钟桶 + 各自异常/错误次
     return `<span class="tb"><b>${clock(p.ts)}</b>${s}</span>`;
   }).join('');
 }
-function renderSummary(s){
+function renderSummary(s,complete=false){
+  s=s||{};
+  const hasRequests=Number.isFinite(s.total)&&s.total>0;
+  const unknown=!hasRequests&&!(complete&&s.total===0);
   const c=[['总请求',fmtNum(s.total),'#6366f1'],
     ['成功率',fmtRate(s.success_rate),s.success_rate>=99?'#10b981':(s.success_rate>=95?'#f59e0b':'#ef4444')],
     // 措辞是「交付异常」而非「断开」:用户主动断开且已拿到内容的那批已不计入(旧口径的误报),
@@ -1288,15 +1310,23 @@ function renderSummary(s){
     ['首字 TTFT p95',fmtTtft(s.ttft_p95),s.ttft_p95>=5?'#ef4444':(s.ttft_p95>=2?'#f59e0b':'#94a3b8')],
     ['出字速度',fmtTok(s.tok_per_sec),'#6366f1'],
     ['消费',fmtUSD(s.cost_usd),'#f59e0b']];
-  document.getElementById('summary').innerHTML=c.map(([l,v,col,sub])=>`<div class="stat-card"><div class="stat-label">${l}</div><div class="stat-value num" style="color:${col}">${v}</div>${sub?`<div class="stat-sub num">${sub}</div>`:''}</div>`).join('');
+  document.getElementById('summary').innerHTML=c.map(([l,v,col,sub])=>{
+    if(unknown){v='—';col='#94a3b8';sub='暂无请求事实，区间完整性未确认'}
+    else if(!hasRequests&&['成功率','首字 TTFT p95','出字速度'].includes(l)){v='—';col='#94a3b8';sub='区间已定稿，无请求样本'}
+    else if(!complete){sub=[sub,'仅已采集记录，区间尚未完整'].filter(Boolean).join(' · ')}
+    return `<div class="stat-card"><div class="stat-label">${l}</div><div class="stat-value num" style="color:${col}">${v}</div>${sub?`<div class="stat-sub num">${sub}</div>`:''}</div>`;
+  }).join('');
+}
+function dimensionLimitNotice(meta){
+  return meta?.truncated===true?`<tr><td colspan="9" class="muted" style="padding:12px">仅显示消费排序前 ${esc(meta.limit)} 项；总览与总趋势包含全部记录，当前明细不是完整合计。</td></tr>`:'';
 }
 const HEAD=`<tr><th>名称</th><th>趋势</th><th class="right">请求</th><th>稳定性</th><th class="right">首字p95</th><th class="right">出字</th><th class="right">延迟 p95/max</th><th>交付异常/错误</th><th class="right">消费</th></tr>`;
-function renderTable(th,tb,rows){
+function renderTable(th,tb,rows,meta){
   document.getElementById(th).innerHTML=HEAD;
   const e=document.getElementById(tb);
   if(!rows||!rows.length){e.innerHTML=`<tr><td colspan="9" class="muted" style="text-align:center;padding:24px">窗口内暂无数据</td></tr>`;return}
   const dimension=tb==='tbGroup'?'group':tb==='tbChannel'?'channel':tb==='tbModel'?'model':'';
-  e.innerHTML=rows.map(r=>{
+  e.innerHTML=dimensionLimitNotice(meta)+rows.map(r=>{
     const k=tb+'|'+r.label,open=drillOpen.has(k);
     return `<tr class="drillable" data-k="${esc(k)}" onclick="toggleDrill(this)">
     <td><span class="drill-arrow">${open?'▼':'▶'}</span> <span class="dot ${dotClass(r.health)}"></span> ${esc(r.label)}</td>
@@ -1445,6 +1475,7 @@ function barOption(labels,data,colors){
     series:[{type:'bar',barWidth:'62%',data:data.map((v,i)=>({value:v,itemStyle:{color:colors[i],borderRadius:[3,3,0,0]}}))}]};
 }
 function renderLatHist(sum){
+  sum=sum||{};
   const lat=sum.lat_hist||[],ttft=sum.ttft_hist||[];
   const card=document.getElementById('latCard');
   if(lat.reduce((a,b)=>a+b,0)+ttft.reduce((a,b)=>a+b,0)===0){card.style.display='none';return}
@@ -1491,14 +1522,16 @@ function drawTrend(points){
   });
 }
 function apply(s){
-  document.getElementById('genAt').textContent='生成于 '+s.generated_at+' · 统计截至 '+syncTime(s.coverage_to_ts)+'（延迟签收）· 窗口 '+s.window_minutes+' 分钟';
-  if(s.data_complete===false){
+  const observed=s.view==='observed';
+  document.getElementById('genAt').textContent='生成于 '+s.generated_at+' · '+(observed?'实时观察':'已定稿')+'区间 '+syncTime(s.window_from_ts)+' 至 '+syncTime(s.window_to_ts||s.coverage_to_ts)+' · 窗口 '+s.window_minutes+' 分钟';
+  if(s.data_complete===false&&!observed){
     renderBanner(s);
     document.getElementById('summary').innerHTML='<div class="card"><span class="muted">该时间窗口的新口径数据尚未形成连续覆盖，补齐前不展示部分金额、成功率或趋势。</span></div>';
     document.getElementById('attnList').innerHTML='<div class="attn-empty">数据补齐中，暂不判定错误与波动</div>';
     document.getElementById('undelivSec').style.display='none';
     document.getElementById('attnStat').innerHTML='';
     document.getElementById('sloCard').style.display='none';
+    document.getElementById('latCard').style.display='none';
     renderCompare(null);
     ['tbGroup','tbChannel','tbModel'].forEach(id=>{document.getElementById(id).innerHTML=''});
     document.getElementById('thToken').innerHTML=TOKHEAD;
@@ -1507,20 +1540,50 @@ function apply(s){
     lastTrend=[];drawTrend([]);
     return;
   }
-  renderBanner(s);renderSummary(s.summary);renderSLO(s.slo);renderCompare(s.compare_available?s.compare:null);renderLatHist(s.summary);lastTrend=s.trend||[];drawTrend(lastTrend);
-  renderTable('thGroup','tbGroup',s.by_group);renderTable('thChannel','tbChannel',s.by_channel);renderTable('thModel','tbModel',s.by_model);
+  renderBanner(s);renderSummary(s.summary,s.data_complete===true);renderSLO(s.slo);renderCompare(s.compare_available?s.compare:null);renderLatHist(s.summary);lastTrend=s.trend||[];drawTrend(lastTrend);
+  if(observed)document.getElementById('sloCard').style.display='none';
+  renderTable('thGroup','tbGroup',s.by_group,s.dimension_limits?.group);renderTable('thChannel','tbChannel',s.by_channel,s.dimension_limits?.channel);renderTable('thModel','tbModel',s.by_model,s.dimension_limits?.model);
   renderTokens(s.by_token);
   renderRejections(s.rejections, s.reject_enabled);
 }
+function clearModelResult(message){
+  document.getElementById('banner').className='banner warn';
+  document.getElementById('bannerMain').textContent=message;
+  document.getElementById('genAt').textContent=message;
+  document.getElementById('heartbeat').textContent='—';
+  document.getElementById('freshness').textContent='—';
+  renderSummary(null,false);renderCompare(null);
+  document.getElementById('sloCard').style.display='none';
+  document.getElementById('latCard').style.display='none';
+  document.getElementById('undelivSec').style.display='none';
+  document.getElementById('attnList').innerHTML='';
+  document.getElementById('attnStat').innerHTML='';
+  ['tbGroup','tbChannel','tbModel','tbToken'].forEach(id=>{document.getElementById(id).innerHTML=''});
+  renderRejections([],false);
+  lastTrend=[];
+  [trendChart,latChart,ttftChart,sloGauge].forEach(chart=>chart&&chart.clear());
+}
+let modelLoadSeq=0,modelAbort=null,modelQueryKey='';
 async function load(){
+  const seq=++modelLoadSeq,view=document.getElementById('modelView').value;
+  const query=String(WINDOW)+':'+view;
+  if(modelAbort)modelAbort.abort();
+  const controller=new AbortController();modelAbort=controller;
+  const timeout=setTimeout(()=>controller.abort(),15000);
+  if(query!==modelQueryKey){clearModelResult('正在读取所选区间…');modelQueryKey=query}
+  document.getElementById('errBox').innerHTML='';
   try{
-    const res=await fetch('/data?window='+WINDOW,{headers:{'Accept':'application/json'}});
+    const res=await fetch('/data?window='+WINDOW+'&view='+view,{headers:{'Accept':'application/json'},signal:controller.signal});
+    if(seq!==modelLoadSeq)return;
     if(res.status===401){location.href='/login';return}
-    const d=await res.json();const eb=document.getElementById('errBox');
-    if(d.enabled===false){eb.innerHTML='<div class="alert">⚠️ 未配置 <code>NEWAPI_LOG_DSN</code>(只读日志库),监控无数据来源。</div>';return}
-    if(d.error){eb.innerHTML='<div class="alert">查询出错:'+esc(d.error)+'</div>';return}
-    eb.innerHTML='';if(d.snapshot)apply(d.snapshot);
-  }catch(e){document.getElementById('errBox').innerHTML='<div class="alert">加载失败:'+esc(e.message)+'</div>'}
+    const d=await res.json();if(seq!==modelLoadSeq)return;
+    if(!res.ok||d.error)throw Error(d.error||'HTTP '+res.status);
+    if(d.enabled===false)throw Error('监控数据来源未启用');
+    if(!d.snapshot)throw Error('未返回模型监控快照');
+    apply(d.snapshot);
+  }catch(e){
+    if(seq===modelLoadSeq){clearModelResult('查询未完成，未展示旧区间结果');document.getElementById('errBox').innerHTML='<div class="alert">加载失败:'+esc(e.name==='AbortError'?'读取超时，请重试':e.message)+'</div>'}
+  }finally{clearTimeout(timeout);if(modelAbort===controller)modelAbort=null}
 }
 async function loadMe(){
   try{
@@ -1539,6 +1602,7 @@ async function loadMe(){
 }
 function schedule(){if(timer)clearInterval(timer);if(document.getElementById('autoRefresh').checked)timer=setInterval(load,30000)}
 document.getElementById('refreshNow').addEventListener('click',load);
+document.getElementById('modelView').addEventListener('change',load);
 document.getElementById('autoRefresh').addEventListener('change',schedule);
 window.addEventListener('resize',()=>{trendChart&&trendChart.resize();sloGauge&&sloGauge.resize();longChart&&longChart.resize();latChart&&latChart.resize();ttftChart&&ttftChart.resize();});
 // ===== 服务端监控(实例 / DB / LB)=====
@@ -1705,8 +1769,9 @@ function renderInfraOverview(s){
   }
   // 源站锁
   if(o.locks_total){
-    const lockSt=o.locks_ok===o.locks_total?'ok':'bad';
-    const lockTxt=o.locks_ok===o.locks_total?`源站锁 全生效(${o.locks_total})`:`源站锁 ${o.locks_total-o.locks_ok} 个失效/${o.locks_total}`;
+    const bad=Number(o.locks_bad)||0,unknown=Number(o.locks_unknown??Math.max(0,o.locks_total-o.locks_ok-bad));
+    const lockSt=bad?'bad':unknown?'nosample':'ok';
+    const lockTxt=`源站锁 ${o.locks_ok}/${o.locks_total} 生效${bad?` · ${bad} 个响应异常`:''}${unknown?` · ${unknown} 个未判定`:''}`;
     parts.push(countItem(lockSt, lockTxt));
   }
   if(o.discovery_total){
@@ -1736,8 +1801,9 @@ function renderLocks(s){
   const tb=document.getElementById('tbLock');
   if(!rows.length){tb.innerHTML='<tr><td colspan="5" class="muted" style="padding:16px">暂无源站锁数据(配置 MONITOR_ORIGIN_LOCK_TARGETS;走私网,仅部署到实例上可测,本地预览不可达属正常)</td></tr>';return}
   tb.innerHTML=rows.map(l=>{
-    const codeTxt=`<span style="${l.locked?'color:var(--green)':'color:var(--red)'}">${l.http_code||0}</span>`;
-    const verdict=l.locked?'<span style="color:var(--green)">锁生效</span>':'<span style="color:var(--red)">锁失效·可绕过</span>';
+    const known=(l.status==='ok'||l.status==='bad')&&Number(l.http_code)>=100&&Number(l.http_code)<=599;
+    const codeTxt=known?`<span style="${l.locked?'color:var(--green)':'color:var(--red)'}">${l.http_code}</span>`:'<span class="muted">—</span>';
+    const verdict=!known?'<span class="muted">未判定（无有效探测数据）</span>':l.locked?'<span style="color:var(--green)">锁生效</span>':'<span style="color:var(--red)">拦截响应异常（需核验）</span>';
     return `<tr><td><b>${esc(l.target)}</b></td><td>${infraBadge(l.status)}</td><td class="right num">${codeTxt}</td><td>${verdict}</td><td class="muted">${fmtAge(l.age_sec)}</td></tr>`;
   }).join('');
 }
@@ -1910,7 +1976,11 @@ function resizeModelCharts(){[trendChart,longChart,sloGauge,latChart,ttftChart].
 
 // ═══════════ 数据同步状态(tab-sync):所有请求只读 Monitor 本地状态，不触发来源查询 ═══════════
 let syncTimer=null,syncAbort=null,syncSeq=0,syncLoginRedirected=false,syncWorkloadAbort=null,syncWorkloadSeq=0,syncMaintenanceAbort=null,syncMaintenanceSeq=0,syncLastUsageHistory=null;
-function syncTime(ts){return +ts?new Date(+ts*1000).toLocaleString('zh-CN',{hour12:false,timeZone:'Asia/Shanghai'}):'—'}
+function syncTime(ts){
+  if(!ts||Number(ts)<=0)return '—';
+  const date=new Date(Number(ts)*1000);
+  return Number.isFinite(date.getTime())?date.toLocaleString('zh-CN',{hour12:false,timeZone:'Asia/Shanghai'}):'未安排';
+}
 function syncAge(ts){if(!+ts)return '—';return usageFactsDuration(Math.max(0,Date.now()/1000-(+ts)))}
 function syncStateClass(level){return level==='ok'?'ok':level==='bad'?'bad':level==='neutral'?'neutral':'warn'}
 function syncStateText(level){return level==='ok'?'正常':level==='bad'?'异常':level==='neutral'?'未启用':'需要关注'}
@@ -2160,11 +2230,23 @@ async function syncLoadStatus(force=false){
   if(syncAbort)syncAbort.abort();
   syncAbort=new AbortController();const controller=syncAbort,seq=++syncSeq;
   let timedOut=false;const timeout=setTimeout(()=>{timedOut=true;controller.abort()},7000);
+  const diagnostics=syncLoadChannelDataStatus(controller.signal,seq);
   try{
     const data=await syncFetchJSON('/sync/overview'+(force?'?refresh=1':''),controller.signal);
     if(seq===syncSeq&&!document.getElementById('tab-sync').hidden)syncRender(data);
   }catch(e){if(seq===syncSeq&&!document.getElementById('tab-sync').hidden&&(e.name!=='AbortError'||timedOut))document.getElementById('syncError').innerHTML=`<div class="usage-facts-state warn"><b>同步状态${timedOut?'加载超时':'加载失败'}</b><span>${timedOut?'本地状态在 7 秒内未返回，请稍后重试':esc(e.message)}</span></div>`}
-  finally{clearTimeout(timeout);if(syncAbort===controller)syncAbort=null;if(seq===syncSeq&&!document.getElementById('tab-sync').hidden)syncTimer=setTimeout(syncLoadStatus,30000)}
+  finally{await diagnostics;clearTimeout(timeout);if(syncAbort===controller)syncAbort=null;if(seq===syncSeq&&!document.getElementById('tab-sync').hidden)syncTimer=setTimeout(syncLoadStatus,30000)}
+}
+async function syncLoadChannelDataStatus(signal,seq){
+  const target=document.getElementById('syncChannelDataStatus');
+  target.innerHTML='<p class="muted">正在核验渠道管理当前日期范围…</p>';
+  try{
+    const query=window.channelManagementQuery?window.channelManagementQuery():'hours=24';
+    const report=await syncFetchJSON('/channels/data-status?'+query,signal);
+    if(seq===syncSeq&&!document.getElementById('tab-sync').hidden)target.innerHTML=window.channelDataStatus.render(report);
+  }catch(error){
+    if(seq===syncSeq&&!document.getElementById('tab-sync').hidden)target.innerHTML='<p class="sync-upstream-error">渠道数据核验未完成，请刷新重试；不能据此认定数据完整。</p>';
+  }
 }
 function syncActivate(){if(!syncTimer)syncLoadStatus()}
 function syncDeactivate(){if(syncTimer){clearTimeout(syncTimer);syncTimer=null}if(syncAbort)syncAbort.abort();syncAbort=null;syncInvalidateUsageWorkloads();syncSeq++}

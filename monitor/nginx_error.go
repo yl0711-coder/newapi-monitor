@@ -273,14 +273,15 @@ func (m *Monitor) nginxErrorSummary(ctx context.Context, from, to int64) []Nginx
 }
 
 func (m *Monitor) nginxErrorSources(ctx context.Context, now int64) []NginxErrorSource {
+	nodes := m.nginxExpectedNodes()
 	var states []NginxErrorSourceState
-	warnReadErr("nginx error sources", m.storeDB.WithContext(ctx).Where("node IN ?", m.cfg.NginxAllowedNodes).Find(&states))
+	warnReadErr("nginx error sources", m.storeDB.WithContext(ctx).Where("node IN ?", nodes).Find(&states))
 	byNode := make(map[string]NginxErrorSourceState, len(states))
 	for _, state := range states {
 		byNode[state.Node] = state
 	}
-	out := make([]NginxErrorSource, 0, len(m.cfg.NginxAllowedNodes))
-	for _, node := range m.cfg.NginxAllowedNodes {
+	out := make([]NginxErrorSource, 0, len(nodes))
+	for _, node := range nodes {
 		state, ok := byNode[node]
 		if !ok {
 			out = append(out, NginxErrorSource{Node: node, AgeSec: -1, Status: "bad", HealthReasons: []string{"source_missing"}})

@@ -180,7 +180,7 @@ func (m *Monitor) stabilityHealth(ctx context.Context, nowTime time.Time) stabil
 				result.NginxRecentDataLossSources++
 			}
 		}
-		if len(sources) != len(m.cfg.NginxAllowedNodes) || result.NginxUnhealthySources > 0 {
+		if len(sources) != len(m.nginxExpectedNodes()) || result.NginxUnhealthySources > 0 {
 			result.Status = "degraded"
 		}
 	}
@@ -192,7 +192,7 @@ func (m *Monitor) stabilityHealth(ctx context.Context, nowTime time.Time) stabil
 				result.NginxErrorUnhealthySources++
 			}
 		}
-		if len(errorSources) != len(m.cfg.NginxAllowedNodes) || result.NginxErrorUnhealthySources > 0 {
+		if len(errorSources) != len(m.nginxExpectedNodes()) || result.NginxErrorUnhealthySources > 0 {
 			result.Status = "degraded"
 		}
 	}

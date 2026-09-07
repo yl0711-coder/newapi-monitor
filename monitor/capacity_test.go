@@ -165,7 +165,7 @@ func TestCapacityUserFilterUsesMinuteFactsAndExcludesUnattributableRejections(t 
 	if report.Summary.LoggedRequests != 3 || report.Summary.RejectedRequests != 0 || report.Summary.Tokens != 900 {
 		t.Fatalf("用户组合筛选口径错误: %+v", report.Summary)
 	}
-	if report.Summary.PeakConcurrency != nil || len(report.Series) != 1 || report.Series[0].P95Seconds != nil {
+	if report.Summary.PeakConcurrency != nil || len(report.Series) != 2 || report.Series[1].P95Seconds != nil || report.Series[0].BusinessRPM != nil {
 		t.Fatalf("用户事实不能伪造延迟/并发: summary=%+v series=%+v", report.Summary, report.Series)
 	}
 	if got, ranking := report.Options["users"], report.Breakdowns["users"]; len(got) != 2 || len(ranking) != 1 || ranking[0].Label != "#7 alice" {
@@ -306,9 +306,9 @@ func TestCapacityHandlerExcludesCurrentMinuteAndOldTrafficVersion(t *testing.T) 
 		t.Fatalf("当前未完整分钟或旧口径混入容量事实: %+v", report.Summary)
 	}
 	source := report.Meta.Sources["business_log"]
-	if source.Watermark != currentMinute-60 || source.FilteredWatermark != currentMinute-60 || report.Summary.CurrentAt != currentMinute-60 ||
-		report.Summary.CurrentBusinessRPM == nil || *report.Summary.CurrentBusinessRPM != 0 {
-		t.Fatalf("筛选无流量的已覆盖分钟必须明确落到零值: source=%+v summary=%+v", source, report.Summary)
+	if source.Watermark != currentMinute-60 || source.FilteredWatermark != currentMinute-120 || report.Summary.CurrentAt != currentMinute-120 ||
+		report.Summary.CurrentBusinessRPM == nil || *report.Summary.CurrentBusinessRPM != 3 || source.CoverageComplete == nil || *source.CoverageComplete {
+		t.Fatalf("其他渠道的新样本不能为当前筛选伪造零值或完整性: source=%+v summary=%+v", source, report.Summary)
 	}
 }
 
