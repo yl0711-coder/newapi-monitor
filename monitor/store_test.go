@@ -16,6 +16,8 @@ func newTestMonitor(t *testing.T) *Monitor {
 		InfraCPUWarnPct:          70,
 		InfraCPUBadPct:           85,
 		InfraBurstWarnPct:        20,
+		InfraDBFreeMemWarnMB:     512,
+		InfraDBFreeMemBadMB:      256,
 		ProbeLatencyWarnMs:       500,
 		ProbeLatencyBadMs:        1500,
 		ProbeCertWarnDays:        30,
@@ -29,6 +31,18 @@ func newTestMonitor(t *testing.T) *Monitor {
 		t.Fatalf("openStore: %v", err)
 	}
 	return m
+}
+
+func TestAttachSparkPropagatesReadFailure(t *testing.T) {
+	m := newTestMonitor(t)
+	defer m.Close()
+	if err := m.storeDB.Migrator().DropTable(&MetricSample{}); err != nil {
+		t.Fatal(err)
+	}
+	rows := []Row{{Key: "model-a", Health: "good"}}
+	if err := m.attachSpark(rows, "model_name", 0, 60, 15); err == nil {
+		t.Fatal("spark read failure must prevent a snapshot from claiming complete anomaly-burst data")
+	}
 }
 
 func TestReplaceChannelSnapsKeepsDeletedLastSnapshot(t *testing.T) {
@@ -158,13 +172,26 @@ func TestStoreAggregation(t *testing.T) {
 		t.Errorf("分组聚合错: %+v", grp)
 	}
 
-	// —— 趋势:同一桶,成功 26 失败 3 ——
+	// —— 趋势:同一桶,成功 26、交付异常 1、失败 3，必须与汇总 30 对账 ——
 	trend, err := m.storeTrend(since, 15)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(trend) != 1 || trend[0].Success != 26 || trend[0].Failed != 3 {
-		t.Errorf("趋势错: %+v(应 1 桶 26/3)", trend)
+	if len(trend) != 1 || trend[0].Success != 26 || trend[0].Anomaly != 1 || trend[0].Failed != 3 {
+		t.Errorf("趋势错: %+v(应 1 桶 26/1/3)", trend)
+	}
+}
+
+func TestSnapshotWithoutFactsCannotReportSamplingActive(t *testing.T) {
+	m := newTestMonitor(t)
+	now := int64(1_800_000_000)
+	m.lastRun.Store(now)
+	snap, err := m.GetSnapshot(15, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snap.DataAgeSec != -1 || snap.SamplingActive {
+		t.Fatalf("empty store must not present a healthy sampler: %+v", snap)
 	}
 }
 

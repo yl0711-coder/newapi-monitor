@@ -27,12 +27,10 @@ const (
 	// Bump this ID whenever either AutoMigrate model set or a post-migration
 	// schema/data transform changes. Restarts of the same plan reuse its pinned
 	// original snapshot, so they cannot prune away the old-image rollback point.
-	// v29 在 v27 上增加上游账户身份切换的不可变消费/错误证据归档。新增
-	// AutoMigrate 表和触发器必须取得当前数据的新回滚点，不能复用 v27 快照。
-	preMigrationPlanID = "main-facts-schema-20260903-v29-upstream-errorlog-identity-archive"
-	// v30 是完整 source-v2 schema 与 v29 主库模型的组合目标。已有 v28
-	// source-v2 库升级时同样必须生成当前时点的新快照。
-	preMigrationCombinedPlanID       = "main-facts-schema-20260903-v30-nginx-source-v2-upstream-errorlog-identity-archive"
+	// v37 增加春秋逐条明细断点、去重索引及小时账单来源/核对状态；
+	// 保留此前小时覆盖水位和经济换算证据。AutoMigrate 前必须生成新快照。
+	preMigrationPlanID               = "main-facts-schema-20260907-v37-upstream-errorlog-identity-archive-metric-finalize-coverage-semantics-minute-hour-unit-evidence-aicodewith-records"
+	preMigrationCombinedPlanID       = "main-facts-schema-20260907-v37-upstream-errorlog-identity-archive-metric-finalize-coverage-semantics-minute-hour-unit-evidence-aicodewith-records-nginx-source-v2"
 	preMigrationSnapshotPrefix       = "pre-migrate-"
 	preMigrationReferencePrefix      = ".pre-migration-plan-"
 	preMigrationReferenceSuffix      = ".json"
@@ -562,7 +560,7 @@ func reusePreMigrationPlanSnapshot(ctx context.Context, dir, mainPath, factsPath
 		if !ok || store.SourceFile != source.sourceFile {
 			return result, true, fmt.Errorf("迁移计划引用缺少当前 %s 数据库", source.role)
 		}
-		checked, err := preflightStoreIntegrity(source.path)
+		checked, err := preflightStartupStoreIntegrity(ctx, source.path)
 		if err != nil {
 			return result, true, fmt.Errorf("当前 %s SQLite 完整性检查失败: %w", source.role, err)
 		}

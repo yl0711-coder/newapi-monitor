@@ -54,6 +54,8 @@ const (
 	upstreamUsageAdapterSub2Trend  = "sub2api_trend"
 	upstreamUsageAdapterSub2Stats  = "sub2api_stats"
 	upstreamUsageAdapterAICodeWith = "aicodewith_key"
+	upstreamUsageAdapterTokenForce = "tokenforce_detail"
+	upstreamUsageTailModeHourly    = "hourly"
 	// Tail 与历史补数是两条调度泳道。管理员手动同步仍走 auto，后台必须
 	// 显式选择一条，防止一个历史密集小时占满整轮而拖延其他账户的 Tail。
 	upstreamUsageLaneAuto    upstreamUsageLane = "auto"
@@ -191,7 +193,12 @@ func isUpstreamUsageTransientFailure(err error) bool {
 	return strings.Contains(message, "timeout") || strings.Contains(message, "deadline exceeded") ||
 		strings.Contains(message, "connection reset") || strings.Contains(message, "connection refused") ||
 		strings.Contains(message, "unexpected eof") || strings.Contains(message, "broken pipe") ||
-		strings.Contains(message, "no such host")
+		strings.Contains(message, "no such host") ||
+		// OFFSET 分页上游在扫描期间刚好写入一条日志时，total/首页指纹会变。
+		// 本轮已 fail-closed 且没有覆盖本地数据，这是短暂并发变化而非格式不兼容；
+		// 应在 2/5/15 分钟退避后重读，不能等完整的常规同步周期。
+		strings.Contains(message, "newapi 使用日志扫描期间 total 变化") ||
+		strings.Contains(message, "newapi 使用日志扫描期间首页已变化")
 }
 
 func upstreamUsageFailureRetryAt(s Settings, domain string, now int64, failures int, err error, scheduleKey string) int64 {
@@ -248,6 +255,332 @@ type newAPIUsagePage[T any] struct {
 	Items       []T
 	Total       int64
 	Fingerprint [32]byte
+}
+
+type tokenForceUsageItem struct {
+	RequestID    string
+	RequestAt    int64
+	InputTokens  int64
+	OutputTokens int64
+	CostCNY      float64
+}
+
+func tokenForceUsageNumber(raw json.RawMessage, field string, integer bool) (float64, error) {
+	value, err := rawJSONNumber(raw)
+	if err != nil || value < 0 || math.IsNaN(value) || math.IsInf(value, 0) ||
+		integer && (value != math.Trunc(value) || value > math.MaxInt64) {
+		return 0, fmt.Errorf("TokenForce 使用明细缺少有效 %s", field)
+	}
+	return value, nil
+}
+
+func tokenForceOptionalTokenCount(raw json.RawMessage, field string) (int64, error) {
+	if len(raw) == 0 || string(raw) == "null" {
+		return 0, nil
+	}
+	value, err := tokenForceUsageNumber(raw, field, true)
+	return int64(value), err
+}
+
+func parseTokenForceUsageTime(raw json.RawMessage) (int64, error) {
+	if value, err := rawJSONNumber(raw); err == nil {
+		if value > 1e12 {
+			value = math.Floor(value / 1000)
+		}
+		if value > 0 && value <= math.MaxInt64 {
+			return int64(value), nil
+		}
+	}
+	var text string
+	if json.Unmarshal(raw, &text) != nil {
+		return 0, fmt.Errorf("TokenForce 使用明细缺少有效 requestTime")
+	}
+	text = strings.TrimSpace(text)
+	for _, layout := range []string{time.RFC3339Nano, "2006-01-02 15:04:05", "2006-01-02 15:04:05.999999999"} {
+		var parsed time.Time
+		var err error
+		if strings.Contains(layout, "Z07") {
+			parsed, err = time.Parse(layout, text)
+		} else {
+			parsed, err = time.ParseInLocation(layout, text, cstLocation)
+		}
+		if err == nil {
+			return parsed.Unix(), nil
+		}
+	}
+	return 0, fmt.Errorf("TokenForce 使用明细 requestTime 格式无效")
+}
+
+func validateUniqueTokenForceUsageItems(items []tokenForceUsageItem, scope string) error {
+	seen := make(map[string]struct{}, len(items))
+	for _, item := range items {
+		if _, duplicate := seen[item.RequestID]; duplicate {
+			return fmt.Errorf("TokenForce 使用明细包含%s重复 requestId，窗口将重试", scope)
+		}
+		seen[item.RequestID] = struct{}{}
+	}
+	return nil
+}
+
+func decodeTokenForceUsageItem(raw json.RawMessage) (tokenForceUsageItem, error) {
+	var item struct {
+		RequestID    string          `json:"requestId"`
+		RequestTime  json.RawMessage `json:"requestTime"`
+		InputTokens  json.RawMessage `json:"inputTokens"`
+		OutputTokens json.RawMessage `json:"outputTokens"`
+		CostInCNY    json.RawMessage `json:"costInCny"`
+	}
+	if err := json.Unmarshal(raw, &item); err != nil {
+		return tokenForceUsageItem{}, fmt.Errorf("TokenForce 使用明细格式无效")
+	}
+	item.RequestID = strings.TrimSpace(item.RequestID)
+	if item.RequestID == "" || len(item.RequestID) > 512 {
+		return tokenForceUsageItem{}, fmt.Errorf("TokenForce 使用明细缺少有效 requestId")
+	}
+	requestAt, err := parseTokenForceUsageTime(item.RequestTime)
+	if err != nil {
+		return tokenForceUsageItem{}, err
+	}
+	input, err := tokenForceOptionalTokenCount(item.InputTokens, "inputTokens")
+	if err != nil {
+		return tokenForceUsageItem{}, err
+	}
+	output, err := tokenForceOptionalTokenCount(item.OutputTokens, "outputTokens")
+	if err != nil {
+		return tokenForceUsageItem{}, err
+	}
+	cost, err := tokenForceUsageNumber(item.CostInCNY, "costInCny", false)
+	if err != nil {
+		return tokenForceUsageItem{}, err
+	}
+	return tokenForceUsageItem{RequestID: item.RequestID, RequestAt: requestAt, InputTokens: input, OutputTokens: output, CostCNY: cost}, nil
+}
+
+func fetchTokenForceUsagePage(ctx context.Context, client *http.Client, row ChannelUpstreamAccount, cred tokenForceCredential, from, to int64, pageNumber int, pacer *upstreamUsageRequestPacer) (newAPIUsagePage[tokenForceUsageItem], error) {
+	if err := pacer.beforeRequest(ctx); err != nil {
+		return newAPIUsagePage[tokenForceUsageItem]{}, err
+	}
+	if pageNumber < 0 || row.UserID <= 0 {
+		return newAPIUsagePage[tokenForceUsageItem]{}, fmt.Errorf("TokenForce 使用日志查询参数无效")
+	}
+	query := url.Values{}
+	query.Set("orgId", strconv.FormatInt(row.UserID, 10))
+	query.Set("beginTime", time.Unix(from, 0).UTC().Format(time.RFC3339))
+	query.Set("endTime", time.Unix(to, 0).UTC().Format(time.RFC3339))
+	query.Set("page", strconv.Itoa(pageNumber))
+	query.Set("size", strconv.Itoa(upstreamUsagePageSize))
+	body, err := doUpstreamJSON(ctx, client, http.MethodGet, upstreamEndpoint(row.BaseURL, "/api/usages/detail")+"?"+query.Encode(), map[string]string{
+		"Authorization": "Bearer " + cred.AccessToken,
+	}, nil)
+	if err != nil {
+		var statusErr *upstreamHTTPError
+		if errors.As(err, &statusErr) && (statusErr.Status == http.StatusUnauthorized || statusErr.Status == http.StatusForbidden) {
+			return newAPIUsagePage[tokenForceUsageItem]{}, &upstreamAuthError{err: err}
+		}
+		return newAPIUsagePage[tokenForceUsageItem]{}, err
+	}
+	var data struct {
+		Content       []json.RawMessage `json:"content"`
+		TotalElements json.RawMessage   `json:"totalElements"`
+		Page          struct {
+			TotalElements json.RawMessage `json:"totalElements"`
+		} `json:"page"`
+	}
+	if err := decodeTokenForceData(body, &data); err != nil {
+		var apiErr *tokenForceAPIError
+		if errors.As(err, &apiErr) && apiErr.authenticationFailure() {
+			return newAPIUsagePage[tokenForceUsageItem]{}, &upstreamAuthError{err: err}
+		}
+		return newAPIUsagePage[tokenForceUsageItem]{}, err
+	}
+	totalRaw := data.TotalElements
+	if len(totalRaw) == 0 {
+		totalRaw = data.Page.TotalElements
+	}
+	total, err := tokenForceUsageNumber(totalRaw, "totalElements", true)
+	if err != nil {
+		return newAPIUsagePage[tokenForceUsageItem]{}, err
+	}
+	fingerprint, err := canonicalUsagePageFingerprint(data.Content)
+	if err != nil {
+		return newAPIUsagePage[tokenForceUsageItem]{}, fmt.Errorf("TokenForce 使用明细页无效: %w", err)
+	}
+	page := newAPIUsagePage[tokenForceUsageItem]{Items: make([]tokenForceUsageItem, 0, len(data.Content)), Total: int64(total), Fingerprint: fingerprint}
+	for _, raw := range data.Content {
+		item, decodeErr := decodeTokenForceUsageItem(raw)
+		if decodeErr != nil {
+			return newAPIUsagePage[tokenForceUsageItem]{}, decodeErr
+		}
+		page.Items = append(page.Items, item)
+	}
+	return page, nil
+}
+
+func fetchTokenForceUsageItems(ctx context.Context, client *http.Client, row ChannelUpstreamAccount, cred tokenForceCredential, from, to int64, pacer *upstreamUsageRequestPacer) ([]tokenForceUsageItem, error) {
+	first, err := fetchTokenForceUsagePage(ctx, client, row, cred, from, to, 0, pacer)
+	if err != nil {
+		return nil, err
+	}
+	if first.Total > int64(maxUpstreamUsagePages*upstreamUsagePageSize) {
+		return nil, &upstreamUsageWindowTooDense{total: first.Total}
+	}
+	expectedFirst := int(first.Total)
+	if expectedFirst > upstreamUsagePageSize {
+		expectedFirst = upstreamUsagePageSize
+	}
+	if len(first.Items) != expectedFirst {
+		return nil, fmt.Errorf("TokenForce 使用明细首页数量异常（got=%d want=%d）", len(first.Items), expectedFirst)
+	}
+	items := append(make([]tokenForceUsageItem, 0, first.Total), first.Items...)
+	pages := int((first.Total + upstreamUsagePageSize - 1) / upstreamUsagePageSize)
+	for pageNumber := 1; pageNumber < pages; pageNumber++ {
+		page, pageErr := fetchTokenForceUsagePage(ctx, client, row, cred, from, to, pageNumber, pacer)
+		if pageErr != nil {
+			return nil, pageErr
+		}
+		if page.Total != first.Total {
+			return nil, fmt.Errorf("TokenForce 使用明细扫描期间 total 变化（%d -> %d）", first.Total, page.Total)
+		}
+		expected := upstreamUsagePageSize
+		if pageNumber == pages-1 && first.Total%upstreamUsagePageSize != 0 {
+			expected = int(first.Total % upstreamUsagePageSize)
+		}
+		if len(page.Items) != expected {
+			return nil, fmt.Errorf("TokenForce 使用明细第 %d 页数量异常（got=%d want=%d）", pageNumber+1, len(page.Items), expected)
+		}
+		items = append(items, page.Items...)
+	}
+	if pages > 1 {
+		probe, probeErr := fetchTokenForceUsagePage(ctx, client, row, cred, from, to, 0, pacer)
+		if probeErr != nil {
+			return nil, probeErr
+		}
+		if probe.Total != first.Total || probe.Fingerprint != first.Fingerprint {
+			return nil, fmt.Errorf("TokenForce 使用明细扫描期间首页已变化，窗口将重试")
+		}
+	}
+	if err := validateUniqueTokenForceUsageItems(items, ""); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+func fetchTokenForceUsageItemsSplit(ctx context.Context, client *http.Client, row ChannelUpstreamAccount, cred tokenForceCredential, from, to int64, pacer *upstreamUsageRequestPacer) ([]tokenForceUsageItem, error) {
+	items, err := fetchTokenForceUsageItems(ctx, client, row, cred, from, to, pacer)
+	var dense *upstreamUsageWindowTooDense
+	if !errors.As(err, &dense) {
+		return items, err
+	}
+	if to-from <= 1 {
+		return nil, fmt.Errorf("TokenForce 单秒使用明细超过 %d 条，无法安全拆分", maxUpstreamUsagePages*upstreamUsagePageSize)
+	}
+	mid := from + (to-from)/2
+	left, err := fetchTokenForceUsageItemsSplit(ctx, client, row, cred, from, mid, pacer)
+	if err != nil {
+		return nil, err
+	}
+	right, err := fetchTokenForceUsageItemsSplit(ctx, client, row, cred, mid, to, pacer)
+	if err != nil {
+		return nil, err
+	}
+	return append(left, right...), nil
+}
+
+func fetchTokenForceUsageWindow(ctx context.Context, client *http.Client, row ChannelUpstreamAccount, cred tokenForceCredential, from, to int64, pacer *upstreamUsageRequestPacer) (upstreamUsageResult, error) {
+	if cred.AccessToken == "" {
+		return upstreamUsageResult{}, &upstreamAuthError{err: fmt.Errorf("TokenForce 访问令牌为空，请重新连接")}
+	}
+	if to <= from || to-from > 26*3600 {
+		return upstreamUsageResult{}, fmt.Errorf("TokenForce 使用明细同步窗口无效")
+	}
+	if row.BalanceUnit <= 0 || math.IsNaN(row.BalanceUnit) || math.IsInf(row.BalanceUnit, 0) {
+		return upstreamUsageResult{}, fmt.Errorf("TokenForce CNY/USD 换算值无效")
+	}
+	items, err := fetchTokenForceUsageItemsSplit(ctx, client, row, cred, from, to, pacer)
+	if err != nil {
+		return upstreamUsageResult{}, err
+	}
+	// Dense windows are recursively split. The API could still return the same
+	// boundary request in both half-open ranges, so re-check the combined result
+	// before aggregating. Silently double billing is never acceptable here.
+	if err := validateUniqueTokenForceUsageItems(items, "跨窗口"); err != nil {
+		return upstreamUsageResult{}, err
+	}
+	buckets := make(map[int64]*ChannelUpstreamUsageHour)
+	for _, item := range items {
+		if item.RequestAt < from || item.RequestAt >= to {
+			return upstreamUsageResult{}, fmt.Errorf("TokenForce 使用明细包含查询区间之外的 requestTime")
+		}
+		hour := item.RequestAt - item.RequestAt%3600
+		bucket := buckets[hour]
+		if bucket == nil {
+			bucket = &ChannelUpstreamUsageHour{Domain: row.Domain, HourTs: hour, Provider: row.Provider, UnitPerUSD: row.BalanceUnit}
+			buckets[hour] = bucket
+		}
+		if bucket.Requests == math.MaxInt64 || item.InputTokens > math.MaxInt64-item.OutputTokens ||
+			bucket.Tokens > math.MaxInt64-item.InputTokens-item.OutputTokens {
+			return upstreamUsageResult{}, fmt.Errorf("TokenForce 使用明细聚合计数溢出")
+		}
+		costUSD := item.CostCNY / row.BalanceUnit
+		if math.IsInf(bucket.Quota+item.CostCNY, 0) || math.IsNaN(bucket.Quota+item.CostCNY) ||
+			math.IsInf(bucket.CostUSD+costUSD, 0) || math.IsNaN(bucket.CostUSD+costUSD) {
+			return upstreamUsageResult{}, fmt.Errorf("TokenForce 使用明细聚合金额溢出")
+		}
+		bucket.Requests++
+		bucket.Tokens += item.InputTokens + item.OutputTokens
+		bucket.Quota += item.CostCNY
+		bucket.CostUSD += costUSD
+		bucket.UnitPerUSD = row.BalanceUnit
+	}
+	firstHour := from - from%3600
+	for hour := firstHour; hour < to; hour += 3600 {
+		bucket := buckets[hour]
+		if bucket == nil {
+			bucket = &ChannelUpstreamUsageHour{Domain: row.Domain, HourTs: hour, Provider: row.Provider, UnitPerUSD: row.BalanceUnit}
+			buckets[hour] = bucket
+		}
+		coveredFrom := hour
+		if coveredFrom < from {
+			coveredFrom = from
+		}
+		coveredTo := hour + 3600
+		if coveredTo > to {
+			coveredTo = to
+		}
+		bucket.BucketSeconds = coveredTo - coveredFrom
+	}
+	hours := make([]ChannelUpstreamUsageHour, 0, len(buckets))
+	for _, bucket := range buckets {
+		hours = append(hours, *bucket)
+	}
+	sort.Slice(hours, func(i, j int) bool { return hours[i].HourTs < hours[j].HourTs })
+	return upstreamUsageResult{Hours: hours, DataUntil: to, Adapter: upstreamUsageAdapterTokenForce}, nil
+}
+
+func syncTokenForceUsage(ctx context.Context, client *http.Client, row ChannelUpstreamAccount, cred tokenForceCredential, from, to int64, pacer *upstreamUsageRequestPacer) (upstreamUsageResult, tokenForceCredential, error) {
+	refreshed := false
+	if cred.AccessToken == "" || cred.ExpiresAt <= time.Now().Add(2*time.Minute).Unix() {
+		var err error
+		cred, err = refreshTokenForce(ctx, client, row, cred)
+		if err != nil {
+			return upstreamUsageResult{}, cred, err
+		}
+		refreshed = true
+	}
+	result, err := fetchTokenForceUsageWindow(ctx, client, row, cred, from, to, pacer)
+	if err == nil {
+		return result, cred, nil
+	}
+	var authErr *upstreamAuthError
+	if !refreshed && errors.As(err, &authErr) {
+		updated, refreshErr := refreshTokenForce(ctx, client, row, cred)
+		if refreshErr != nil {
+			return upstreamUsageResult{}, cred, refreshErr
+		}
+		cred = updated
+		result, err = fetchTokenForceUsageWindow(ctx, client, row, cred, from, to, pacer)
+	}
+	return result, cred, err
 }
 
 type upstreamUsageWindowTooDense struct {
@@ -541,6 +874,7 @@ func fetchNewAPIUsageWindowWithPacer(ctx context.Context, client *http.Client, r
 	out := make([]ChannelUpstreamUsageHour, 0, len(buckets))
 	for _, bucket := range buckets {
 		bucket.CostUSD = bucket.Quota / unit
+		bucket.UnitPerUSD = unit
 		out = append(out, *bucket)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].HourTs < out[j].HourTs })
@@ -719,7 +1053,7 @@ func (m *Monitor) syncNewAPIUsageBackfillWindowDirect(ctx context.Context, row C
 	hour := ChannelUpstreamUsageHour{
 		Domain: row.Domain, HourTs: from, BucketSeconds: to - from,
 		Requests: checkpoint.Requests, Tokens: checkpoint.Tokens, Quota: checkpoint.Quota,
-		CostUSD: checkpoint.Quota / unit, Provider: row.Provider,
+		CostUSD: checkpoint.Quota / unit, UnitPerUSD: unit, Provider: row.Provider,
 	}
 	return upstreamUsageResult{Hours: []ChannelUpstreamUsageHour{hour}, DataUntil: to, Adapter: upstreamUsageAdapterNewAPILog}, "", true, nil
 }
@@ -938,6 +1272,7 @@ func (m *Monitor) syncNewAPIUsageBackfillWindowSegmented(ctx context.Context, ro
 		unit = defaultNewAPIQuotaPerUSD
 	}
 	hour.CostUSD = hour.Quota / unit
+	hour.UnitPerUSD = unit
 	return upstreamUsageResult{Hours: []ChannelUpstreamUsageHour{hour}, DataUntil: to, Adapter: upstreamUsageAdapterNewAPILog}, "", true, nil
 }
 
@@ -1034,13 +1369,6 @@ func (m *Monitor) syncNewAPITailIncremental(ctx context.Context, row ChannelUpst
 		cursor = windowTo
 	}
 	return result, false, nil
-}
-
-func newAPITailNeedsIncrementalSync(row ChannelUpstreamAccount, now int64) bool {
-	if row.UsageLastError == legacyNewAPIBackfillBudgetError() {
-		return true
-	}
-	return row.UsageDataUntil > 0 && now-row.UsageDataUntil > int64(upstreamUsageTailOverlap/time.Second)
 }
 
 type sub2APIUsageMetric struct {
@@ -1360,11 +1688,9 @@ func fetchAICodeWithUsageWindow(ctx context.Context, client *http.Client, row Ch
 		return upstreamUsageResult{}, fmt.Errorf("AICodeWith 使用量分日合计与 summary 不一致")
 	}
 	hours := make([]ChannelUpstreamUsageHour, 0, days)
-	unit := row.BalanceUnit
-	if unit <= 0 {
-		// 已保存的春秋账户会从余额响应持久化真实换算单位。早期仅支持
-		// USD 的账户可能没有单位，继续按 1 兼容；新 CNY 账户不会走这里。
-		unit = 1
+	unit, err := aiCodeWithDailyUnit(row.BalanceUnit)
+	if err != nil {
+		return upstreamUsageResult{}, err
 	}
 	for day := from; day <= lastDay; day += 86400 {
 		bucketTo := day + 86400
@@ -1375,7 +1701,7 @@ func fetchAICodeWithUsageWindow(ctx context.Context, client *http.Client, row Ch
 		hours = append(hours, ChannelUpstreamUsageHour{
 			Domain: row.Domain, HourTs: day, BucketSeconds: bucketTo - day,
 			Requests: metric.Requests, Tokens: metric.Tokens, Quota: metric.Cost,
-			CostUSD: metric.Cost / unit, Provider: row.Provider,
+			CostUSD: metric.Cost / unit, UnitPerUSD: unit, Provider: row.Provider,
 		})
 	}
 	return upstreamUsageResult{Hours: hours, DataUntil: to, Adapter: upstreamUsageAdapterAICodeWith, SourceKeyID: envelope.Data.APIKeyID}, nil
@@ -1407,13 +1733,13 @@ func (m *Monitor) syncAICodeWithUsage(ctx context.Context, row ChannelUpstreamAc
 		seenKeyIDs[result.SourceKeyID] = true
 		for _, bucket := range result.Hours {
 			current, exists := combined[bucket.HourTs]
-			if exists && current.BucketSeconds != bucket.BucketSeconds {
+			if exists && (current.BucketSeconds != bucket.BucketSeconds || current.UnitPerUSD != bucket.UnitPerUSD) {
 				return upstreamUsageResult{}, fmt.Errorf("AICodeWith 多 Key 账单覆盖范围不一致")
 			}
 			if !exists {
 				current = ChannelUpstreamUsageHour{
 					Domain: row.Domain, HourTs: bucket.HourTs, BucketSeconds: bucket.BucketSeconds,
-					Provider: row.Provider,
+					Provider: row.Provider, UnitPerUSD: bucket.UnitPerUSD,
 				}
 			}
 			current.Requests += bucket.Requests
@@ -1437,9 +1763,14 @@ func newAICodeWithRoundID(domain, kind, version string, from, to int64) string {
 }
 
 func (m *Monitor) ensureAICodeWithUsageRound(ctx context.Context, row ChannelUpstreamAccount, version, kind string, from, to int64, total int, now int64) (AICodeWithUsageRound, error) {
+	unit := row.BalanceUnit
+	if unit <= 0 {
+		unit = 1
+	}
+	epoch := newAPIUpstreamAccountEpoch(row)
 	var round AICodeWithUsageRound
 	err := m.storeDB.WithContext(ctx).First(&round, "domain = ? AND kind = ?", row.Domain, kind).Error
-	if err == nil && round.CredentialSetVersion == version && round.Status == upstreamStatusPending {
+	if err == nil && round.CredentialSetVersion == version && round.Status == upstreamStatusPending && (!round.RecordMode || (round.UnitPerUSD == unit && round.SourceEpoch == epoch)) {
 		return round, nil
 	}
 	if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
@@ -1447,12 +1778,17 @@ func (m *Monitor) ensureAICodeWithUsageRound(ctx context.Context, row ChannelUps
 	}
 	oldRoundID := round.RoundID
 	round = AICodeWithUsageRound{
-		Domain: row.Domain, Kind: kind, RoundID: newAICodeWithRoundID(row.Domain, kind, version, from, to),
+		UnitPerUSD: unit, SourceEpoch: epoch,
+		RecordMode: m.cfg.UpstreamAICodeWithRecordsEnabled,
+		Domain:     row.Domain, Kind: kind, RoundID: newAICodeWithRoundID(row.Domain, kind, version, from, to),
 		CredentialSetVersion: version, WindowFrom: from, WindowTo: to, TotalKeys: total,
 		Status: upstreamStatusPending, CreatedAt: now, UpdatedAt: now,
 	}
 	err = m.storeDB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		if oldRoundID != "" {
+			if err := clearAICodeWithRecordCheckpoint(tx, row.Domain, oldRoundID, ""); err != nil {
+				return err
+			}
 			if err := tx.Where("domain = ? AND round_id = ?", row.Domain, oldRoundID).Delete(&AICodeWithUsageStage{}).Error; err != nil {
 				return err
 			}
@@ -1484,6 +1820,8 @@ func (m *Monitor) stageAICodeWithKeyResult(ctx context.Context, round AICodeWith
 		}
 		for _, bucket := range result.Hours {
 			stage := AICodeWithUsageStage{
+				SourceCostUnits: bucket.SourceCostUnits,
+				SourceKind:      bucket.SourceKind, Provisional: bucket.Provisional, UnitPerUSD: bucket.UnitPerUSD,
 				Domain: state.Domain, RoundID: round.RoundID, SlotID: state.SlotID,
 				HourTs: bucket.HourTs, CredentialSetVersion: round.CredentialSetVersion,
 				BucketSeconds: bucket.BucketSeconds, Requests: bucket.Requests, Tokens: bucket.Tokens,
@@ -1555,17 +1893,48 @@ func (m *Monitor) publishAICodeWithRound(ctx context.Context, row *ChannelUpstre
 		return false, err
 	}
 	aggregated := make(map[int64]ChannelUpstreamUsageHour)
+	if round.RecordMode && len(staged) != round.TotalKeys*int((round.WindowTo-round.WindowFrom)/3600) {
+		return false, fmt.Errorf("AICodeWith record 暂存小时不完整，拒绝发布")
+	}
 	for _, part := range staged {
+		if !round.RecordMode {
+			unit, err := aiCodeWithDailyStageUnit(part)
+			if err != nil {
+				return false, err
+			}
+			part.UnitPerUSD = unit
+		}
 		bucket := aggregated[part.HourTs]
 		if bucket.Domain == "" {
-			bucket = ChannelUpstreamUsageHour{Domain: row.Domain, HourTs: part.HourTs, BucketSeconds: part.BucketSeconds, Provider: upstreamProviderAICodeWith}
+			bucket = ChannelUpstreamUsageHour{Domain: row.Domain, HourTs: part.HourTs, BucketSeconds: part.BucketSeconds, Provider: upstreamProviderAICodeWith, SourceKind: part.SourceKind, UnitPerUSD: part.UnitPerUSD}
 		} else if bucket.BucketSeconds != part.BucketSeconds {
 			return false, fmt.Errorf("AICodeWith 多 Key 账单覆盖范围不一致")
 		}
-		bucket.Requests += part.Requests
-		bucket.Tokens += part.Tokens
+		if err := addPricingCounter(&bucket.Requests, part.Requests); err != nil {
+			return false, err
+		}
+		if err := addPricingCounter(&bucket.Tokens, part.Tokens); err != nil {
+			return false, err
+		}
 		bucket.Quota += part.Quota
 		bucket.CostUSD += part.CostUSD
+		if round.RecordMode {
+			if !validUpstreamEconomicUnit(round.UnitPerUSD) || part.UnitPerUSD != round.UnitPerUSD {
+				return false, fmt.Errorf("AICodeWith record 暂存换算单位无效")
+			}
+			if part.BucketSeconds != 3600 || part.HourTs < round.WindowFrom || part.HourTs >= round.WindowTo || part.HourTs%3600 != 0 || part.SourceKind != upstreamUsageAdapterAICodeWithRecord {
+				return false, fmt.Errorf("AICodeWith record 暂存小时边界无效")
+			}
+			if err := addPricingCounter(&bucket.SourceCostUnits, part.SourceCostUnits); err != nil {
+				return false, err
+			}
+			bucket.Quota = float64(bucket.SourceCostUnits) / float64(aiCodeWithRecordScale)
+			bucket.CostUSD = bucket.Quota / round.UnitPerUSD
+		}
+		bucket.Provisional = bucket.Provisional || part.Provisional
+		if bucket.SourceKind != part.SourceKind || bucket.UnitPerUSD != part.UnitPerUSD {
+			return false, fmt.Errorf("AICodeWith 多 Key 账单来源或换算单位不一致")
+		}
 		bucket.FetchedAt = now
 		aggregated[part.HourTs] = bucket
 	}
@@ -1576,6 +1945,14 @@ func (m *Monitor) publishAICodeWithRound(ctx context.Context, row *ChannelUpstre
 		}
 		if current.RoundID != round.RoundID || current.CredentialSetVersion != round.CredentialSetVersion {
 			return fmt.Errorf("AICodeWith 凭据集合已变更，拒绝发布旧批次")
+		}
+		if err := archiveAICodeWithRepresentationChange(tx, *row, round, now); err != nil {
+			return err
+		}
+		if round.RecordMode {
+			if err := preserveAICodeWithRecordUnits(tx, row.Domain, round, aggregated); err != nil {
+				return err
+			}
 		}
 		if err := tx.Where("domain = ? AND hour_ts >= ? AND hour_ts < ?", row.Domain, round.WindowFrom, round.WindowTo).Delete(&ChannelUpstreamUsageHour{}).Error; err != nil {
 			return err
@@ -1592,6 +1969,9 @@ func (m *Monitor) publishAICodeWithRound(ctx context.Context, row *ChannelUpstre
 			}
 		}
 		if err := tx.Where("domain = ? AND round_id = ?", row.Domain, round.RoundID).Delete(&AICodeWithUsageStage{}).Error; err != nil {
+			return err
+		}
+		if err := clearAICodeWithRecordCheckpoint(tx, row.Domain, round.RoundID, ""); err != nil {
 			return err
 		}
 		if err := tx.Where("domain = ? AND kind = ?", row.Domain, round.Kind).Delete(&AICodeWithUsageRound{}).Error; err != nil {
@@ -1625,6 +2005,9 @@ func (m *Monitor) processAICodeWithRound(ctx context.Context, row *ChannelUpstre
 	}
 	if len(states) != len(normalized.Slots) {
 		if err := m.storeDB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+			if err := clearAICodeWithRecordCheckpoint(tx, row.Domain, "", ""); err != nil {
+				return err
+			}
 			if err := tx.Where("domain = ?", row.Domain).Delete(&AICodeWithKeySyncState{}).Error; err != nil {
 				return err
 			}
@@ -1666,7 +2049,27 @@ func (m *Monitor) processAICodeWithRound(ctx context.Context, row *ChannelUpstre
 	roundPacer := newUpstreamUsageRequestPacer(max(1, budget), m.aiCodeWithRequestInterval())
 	for _, i := range selectAICodeWithKeyStatesForTurn(states, round, kind, now, budget) {
 		state := &states[i]
-		result, fetchErr := fetchAICodeWithUsageWindow(ctx, m.channelUpstreamHTTPClient(), *row, secretByID[state.SlotID], round.WindowFrom, round.WindowTo, roundPacer)
+		var result upstreamUsageResult
+		var fetchErr error
+		ready := true
+		if round.RecordMode {
+			result, ready, fetchErr = m.fetchAICodeWithRecordWindow(ctx, *row, secretByID[state.SlotID], round, state.SlotID, now, roundPacer)
+		} else {
+			result, fetchErr = fetchAICodeWithUsageWindow(ctx, m.channelUpstreamHTTPClient(), *row, secretByID[state.SlotID], round.WindowFrom, round.WindowTo, roundPacer)
+		}
+		if round.RecordMode && fetchErr == nil && !ready {
+			if kind == "tail" {
+				state.Status = upstreamStatusPending
+				state.NextSyncAt = now + aiCodeWithRecordResumeSeconds
+			} else {
+				state.BackfillNextSyncAt = now + aiCodeWithRecordResumeSeconds
+			}
+			state.UpdatedAt = now
+			if err := m.storeDB.WithContext(ctx).Save(state).Error; err != nil {
+				return false, 0, roundPacer.calls, err
+			}
+			break
+		}
 		if fetchErr == nil {
 			fetchErr = m.stageAICodeWithKeyResult(ctx, round, state, result, now)
 		}
@@ -1679,6 +2082,9 @@ func (m *Monitor) processAICodeWithRound(ctx context.Context, row *ChannelUpstre
 			}
 		}
 		processed++
+		if round.RecordMode && roundPacer.calls >= budget {
+			break
+		}
 		// 认证错误只隔离当前 Key，继续验证其他 Key；而限流、主机熔断、
 		// 超时和 5xx 属于账户/主机级信号，本轮立即止步，避免一个故障
 		// 被剩余 Key 放大为请求风暴。未处理 Key 保持 pending，下轮续跑。
@@ -1691,6 +2097,9 @@ func (m *Monitor) processAICodeWithRound(ctx context.Context, row *ChannelUpstre
 			break
 		}
 	}
+	if round.RecordMode {
+		processed = roundPacer.calls
+	}
 	published, err := m.publishAICodeWithRound(ctx, row, round, now)
 	if err != nil {
 		return false, 0, processed, err
@@ -1701,8 +2110,13 @@ func (m *Monitor) processAICodeWithRound(ctx context.Context, row *ChannelUpstre
 		// 尚未读取的几分钟虚报为已同步。
 		if kind == "tail" {
 			row.UsageDataUntil = round.WindowTo
+		} else if kind == "backfill" {
+			row.UsageBackfillCursor = round.WindowTo
 		}
 		row.UsageAdapter = upstreamUsageAdapterAICodeWith
+		if round.RecordMode {
+			row.UsageAdapter = upstreamUsageAdapterAICodeWithRecord
+		}
 		return true, int64(round.TotalKeys), processed, nil
 	}
 	var done int64
@@ -1806,8 +2220,22 @@ func (m *Monitor) syncStoredAICodeWithUsage(ctx context.Context, row *ChannelUps
 	total := len(normalized.Slots)
 	budget := aiCodeWithKeysPerTurn
 	today := cstDayStart(now)
+	if m.cfg.UpstreamAICodeWithRecordsEnabled && row.RecordsStartedAt == 0 {
+		row.RecordsStartedAt = now
+		row.UsageBackfillCursor = today - min(aiCodeWithRecordMigrationDays, int64(upstreamUsageBackfillDays(m.cfg)))*86400
+		row.UsageBackfillDone = false
+		row.UsageBackfillNextSyncAt = 0
+	}
 	if lane != upstreamUsageLaneHistory && (row.UsageNextSyncAt == 0 || row.UsageNextSyncAt <= now) {
-		published, done, used, roundErr := m.processAICodeWithRound(ctx, row, normalized, version, "tail", today, now, now, budget)
+		to := now
+		if m.cfg.UpstreamAICodeWithRecordsEnabled {
+			to = now / 3600 * 3600
+		}
+		if to <= today {
+			row.UsageNextSyncAt = today + 3600
+			return nil
+		}
+		published, done, used, roundErr := m.processAICodeWithRound(ctx, row, normalized, version, "tail", today, to, now, budget)
 		budget -= used
 		row.UsageLastAttemptAt = now
 		if roundErr != nil {
@@ -1832,6 +2260,9 @@ func (m *Monitor) syncStoredAICodeWithUsage(ctx context.Context, row *ChannelUps
 			if row.UsageNextSyncAt == 0 {
 				row.UsageNextSyncAt = now + 15
 			}
+			if m.cfg.UpstreamAICodeWithRecordsEnabled && row.UsageNextSyncAt < now+aiCodeWithRecordResumeSeconds {
+				row.UsageNextSyncAt = now + aiCodeWithRecordResumeSeconds
+			}
 			return nil
 		}
 		row.UsageStatus, row.UsageLastError = upstreamStatusOK, ""
@@ -1844,14 +2275,26 @@ func (m *Monitor) syncStoredAICodeWithUsage(ctx context.Context, row *ChannelUps
 	if row.UsageBackfillCursor == 0 {
 		row.UsageBackfillCursor = cstDayStart(now - int64(upstreamUsageBackfillDays(m.cfg))*86400)
 	}
+	// Reconcile the last two closed days again after rollover, catching late
+	// charges without restarting the full historical migration.
+	if m.cfg.UpstreamAICodeWithRecordsEnabled && row.UsageBackfillDone && row.UsageBackfillCursor < today {
+		row.UsageBackfillCursor = today - 2*86400
+	}
 	if row.UsageBackfillCursor >= today {
 		row.UsageBackfillDone, row.UsageBackfillNextSyncAt = true, 0
 		return nil
 	}
+	// Completion is relative to the last closed day, not a permanent switch.
+	// Resume at the published cursor after midnight, retaining all per-key
+	// checkpoints and the existing bounded round/retry budget.
+	row.UsageBackfillDone = false
 	if budget <= 0 || (row.UsageBackfillNextSyncAt > now && row.UsageBackfillNextSyncAt != upstreamAccountIsolatedUntil) || row.UsageBackfillNextSyncAt == upstreamAccountIsolatedUntil {
 		return nil
 	}
 	to := row.UsageBackfillCursor + aiCodeWithUsageMaxDays*86400
+	if m.cfg.UpstreamAICodeWithRecordsEnabled {
+		to = row.UsageBackfillCursor + 86400
+	}
 	if to > today {
 		to = today
 	}
@@ -1879,15 +2322,23 @@ func (m *Monitor) syncStoredAICodeWithUsage(ctx context.Context, row *ChannelUps
 		if row.UsageBackfillNextSyncAt == 0 {
 			row.UsageBackfillNextSyncAt = now + 15
 		}
+		if m.cfg.UpstreamAICodeWithRecordsEnabled && row.UsageBackfillNextSyncAt < now+aiCodeWithRecordResumeSeconds {
+			row.UsageBackfillNextSyncAt = now + aiCodeWithRecordResumeSeconds
+		}
 		return nil
 	}
-	row.UsageBackfillCursor, row.UsageBackfillLastSuccessAt = to, now
+	// The round may have started before midnight; use its published cursor,
+	// not the newly computed target, or an entire day could be skipped.
+	row.UsageBackfillLastSuccessAt = now
 	row.UsageBackfillConsecutiveFails, row.UsageBackfillLastError = 0, ""
-	row.UsageBackfillDone = to >= today
+	row.UsageBackfillDone = row.UsageBackfillCursor >= today
 	if row.UsageBackfillDone {
 		row.UsageBackfillNextSyncAt = 0
 	} else {
 		row.UsageBackfillNextSyncAt = now + 15
+		if m.cfg.UpstreamAICodeWithRecordsEnabled {
+			row.UsageBackfillNextSyncAt = now + aiCodeWithRecordResumeSeconds
+		}
 	}
 	return nil
 }
@@ -1901,6 +2352,49 @@ func (m *Monitor) persistUpstreamUsageWindow(ctx context.Context, domain string,
 }
 
 func persistUpstreamUsageWindowTx(tx *gorm.DB, domain string, from, to int64, hours []ChannelUpstreamUsageHour, now int64) error {
+	// A row with explicit conversion evidence is an immutable accounting fact.
+	// Tail overlap and later backfills may refresh requests/tokens, but a newly
+	// configured unit must not retroactively rewrite the bucket. When a unit is
+	// changed during an open hour, that hour therefore keeps its original unit
+	// while accepting the refreshed complete facts; the new unit starts with the
+	// next bucket. This avoids both historical repricing and dropped requests.
+	var existing []ChannelUpstreamUsageHour
+	if err := tx.Where("domain = ? AND hour_ts >= ? AND hour_ts < ? AND unit_per_usd > 0", domain, from, to).Find(&existing).Error; err != nil {
+		return err
+	}
+	existingUnit := make(map[int64]float64, len(existing))
+	for _, old := range existing {
+		existingUnit[old.HourTs] = old.UnitPerUSD
+	}
+	var account ChannelUpstreamAccount
+	accountErr := tx.First(&account, "domain = ?", domain).Error
+	if accountErr != nil && !errors.Is(accountErr, gorm.ErrRecordNotFound) {
+		return accountErr
+	}
+	for i := range hours {
+		oldUnit, present := existingUnit[hours[i].HourTs]
+		unit := hours[i].UnitPerUSD
+		if present && validUpstreamEconomicUnit(oldUnit) {
+			unit = oldUnit
+		} else if accountErr == nil && (account.Provider == upstreamProviderNewAPI || account.Provider == upstreamProviderTokenForce) {
+			var known bool
+			unit, known = upstreamEconomicUnitAt(account, hours[i].HourTs)
+			if !known {
+				// Retain requests/tokens/quota, but never guess a historical USD
+				// amount after the unit was changed.
+				hours[i].UnitPerUSD, hours[i].CostUSD = 0, 0
+				continue
+			}
+		}
+		if !validUpstreamEconomicUnit(unit) {
+			continue
+		}
+		hours[i].UnitPerUSD = unit
+		hours[i].CostUSD = hours[i].Quota / unit
+		if math.IsNaN(hours[i].CostUSD) || math.IsInf(hours[i].CostUSD, 0) {
+			return fmt.Errorf("按历史换算证据重算上游消费失败: domain=%s hour=%d", domain, hours[i].HourTs)
+		}
+	}
 	if err := tx.Where("domain = ? AND hour_ts >= ? AND hour_ts < ?", domain, from, to).Delete(&ChannelUpstreamUsageHour{}).Error; err != nil {
 		return err
 	}
@@ -2051,6 +2545,21 @@ func legacyNewAPIBackfillBudgetError() string {
 	return (&upstreamUsageRunBudgetExhausted{max: upstreamUsageMaxRequestsPerRun}).Error()
 }
 
+func newAPITailNeedsIncrementalSync(row ChannelUpstreamAccount, now int64) bool {
+	if row.UsageTailMode == upstreamUsageTailModeHourly || row.UsageLastError == legacyNewAPIBackfillBudgetError() {
+		return true
+	}
+	// A stale watermark needs forward-first hourly commits so one dense overlap
+	// cannot prevent the current edge from advancing. This alone does not pin the
+	// account to hourly mode; only an observed request-budget exhaustion does.
+	return row.UsageDataUntil > 0 && now-row.UsageDataUntil > int64(upstreamUsageTailOverlap/time.Second)
+}
+
+func upstreamUsageRunBudgetWasExhausted(err error) bool {
+	var exhausted *upstreamUsageRunBudgetExhausted
+	return errors.As(err, &exhausted)
+}
+
 func normalizeLegacyNewAPIBackfillBudgetState(row *ChannelUpstreamAccount, now int64) {
 	if row == nil || row.Provider != upstreamProviderNewAPI || row.UsageBackfillDone ||
 		row.UsageBackfillLastError != legacyNewAPIBackfillBudgetError() {
@@ -2111,7 +2620,7 @@ func (m *Monitor) syncStoredUpstreamUsageWithPriority(ctx context.Context, domai
 	}
 	now := time.Now().Unix()
 	normalizeLegacyNewAPIBackfillBudgetState(&row, now)
-	if row.Provider != upstreamProviderNewAPI && row.Provider != upstreamProviderSub2API && row.Provider != upstreamProviderAICodeWith {
+	if row.Provider != upstreamProviderNewAPI && row.Provider != upstreamProviderSub2API && row.Provider != upstreamProviderAICodeWith && row.Provider != upstreamProviderTokenForce {
 		err := fmt.Errorf("%s 暂未验证公开使用日志接口，未自动读取日志", upstreamProviderName(row.Provider))
 		row.UsageStatus = upstreamStatusUnsupported
 		row.UsageLastAttemptAt = now
@@ -2166,10 +2675,29 @@ func (m *Monitor) syncStoredUpstreamUsageWithPriority(ctx context.Context, domai
 			}
 			return result, syncErr
 		}
+	case tokenForceCredential:
+		if row.Provider != upstreamProviderTokenForce {
+			return row, fmt.Errorf("%s 凭据与供应商不匹配", upstreamProviderName(row.Provider))
+		}
+		current := cred
+		syncUsage = func(callCtx context.Context, from, to int64, pacer *upstreamUsageRequestPacer) (upstreamUsageResult, error) {
+			result, updated, syncErr := syncTokenForceUsage(callCtx, m.channelUpstreamHTTPClient(), row, current, from, to, pacer)
+			current = updated
+			credential = current
+			secrets = upstreamCredentialSecrets(current)
+			return result, syncErr
+		}
 	default:
 		return row, fmt.Errorf("%s 凭据格式无效", upstreamProviderName(row.Provider))
 	}
-	plan := planUpstreamUsageSyncForLane(row, now, upstreamUsageBackfillDays(m.cfg), lane)
+	backfillDays := upstreamUsageBackfillDays(m.cfg)
+	if row.Provider == upstreamProviderTokenForce && backfillDays > 7 {
+		// The console enforces a seven-day unfiltered query range. Until the
+		// provider publishes a stable API contract, do not silently probe older
+		// history or create a permanent retry loop.
+		backfillDays = 7
+	}
+	plan := planUpstreamUsageSyncForLane(row, now, backfillDays, lane)
 	requestBudget := upstreamUsageMaxRequestsPerRun
 	if lane == upstreamUsageLaneHistory {
 		requestBudget = upstreamUsageHistoryMaxRequestsPerRun
@@ -2177,7 +2705,7 @@ func (m *Monitor) syncStoredUpstreamUsageWithPriority(ctx context.Context, domai
 	pacer := newUpstreamUsageRequestPacer(requestBudget, upstreamUsageRequestInterval)
 	operationRetryAt := int64(0)
 	if row.UsageBackfillCursor == 0 {
-		row.UsageBackfillCursor = cstDayStart(now - int64(upstreamUsageBackfillDays(m.cfg))*86400)
+		row.UsageBackfillCursor = cstDayStart(now - int64(backfillDays)*86400)
 	}
 	// Tail is the primary freshness contract. When both lanes are due it runs
 	// first; only a successful, atomically persisted tail permits history.
@@ -2187,11 +2715,18 @@ func (m *Monitor) syncStoredUpstreamUsageWithPriority(ctx context.Context, domai
 	tailYielded := false
 	historyRan := false
 	if tailRan {
+		// NewAPI 先用单窗口查询保持低流量账户每轮只请求一次。仅当水位
+		// 已滞后，或该账户曾真实触发单轮请求上限，才按小时增量提交。
+		// 预算耗尽会持久切换到 hourly 模式，避免高流量账户每轮在
+		// 整段失败和增量恢复之间震荡。
 		if newAPICred, ok := credential.(newAPICredential); ok && row.Provider == upstreamProviderNewAPI && newAPITailNeedsIncrementalSync(row, now) {
 			result, tailYielded, err = m.syncNewAPITailIncremental(ctx, row, newAPICred, plan.tailFrom, plan.tailTo, now, pacer)
 			tailPersisted = err == nil
 		} else {
 			result, err = syncUsage(ctx, plan.tailFrom, plan.tailTo, pacer)
+			if row.Provider == upstreamProviderNewAPI && upstreamUsageRunBudgetWasExhausted(err) {
+				row.UsageTailMode = upstreamUsageTailModeHourly
+			}
 		}
 		if errors.Is(err, context.Canceled) {
 			return row, err
@@ -2291,7 +2826,7 @@ func (m *Monitor) syncStoredUpstreamUsageWithPriority(ctx context.Context, domai
 	persistCtx, persistCancel := upstreamUsageLocalCommitContext(ctx)
 	defer persistCancel()
 	var persistErr error
-	if row.Provider == upstreamProviderSub2API {
+	if row.Provider == upstreamProviderSub2API || row.Provider == upstreamProviderTokenForce {
 		// Sub2API rotates refresh tokens. Persist the newest token even when the
 		// subsequent usage query fails, otherwise the next run may replay a
 		// consumed refresh token and isolate an otherwise healthy account.
@@ -2392,8 +2927,12 @@ func (m *Monitor) loadDueUpstreamUsageAccountsForLane(ctx context.Context, now i
 		(usage_backfill_done = ? AND (usage_backfill_next_sync_at = 0 OR usage_backfill_next_sync_at <= ?)
 			AND usage_status = ?)
 		OR (provider = ? AND usage_backfill_done = ? AND usage_backfill_last_error = ?)
+		OR (provider = ? AND usage_backfill_done = ? AND usage_backfill_cursor > 0
+			AND usage_backfill_cursor < ? AND usage_status = ?
+			AND (usage_backfill_next_sync_at = 0 OR usage_backfill_next_sync_at <= ?))
 	)`, true, true, false, now, upstreamStatusOK,
-		upstreamProviderNewAPI, false, legacyBudgetError).
+		upstreamProviderNewAPI, false, legacyBudgetError,
+		upstreamProviderAICodeWith, true, cstDayStart(now), upstreamStatusOK, now).
 		Order("usage_backfill_next_sync_at ASC, domain ASC").
 		Limit(limit).Find(&rows).Error
 	return rows, err

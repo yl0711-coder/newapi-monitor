@@ -20,11 +20,16 @@ CREATE TABLE IF NOT EXISTS users (
   id BIGINT NOT NULL AUTO_INCREMENT,
   username VARCHAR(191),
   email VARCHAR(191),
+  display_name VARCHAR(191) DEFAULT '',
   -- Full-history discovery uses the registration boundary as the permanent
   -- source floor rather than inferring it only from the first retained log.
   created_at BIGINT DEFAULT 0,
   quota BIGINT DEFAULT 0,
   used_quota BIGINT DEFAULT 0,
+  status BIGINT DEFAULT 1,
+  role BIGINT DEFAULT 1,
+  `group` VARCHAR(191) DEFAULT 'default',
+  deleted_at DATETIME(3),
   PRIMARY KEY (id),
   UNIQUE KEY username (username),
   KEY idx_users_email (email)
@@ -37,6 +42,8 @@ CREATE TABLE IF NOT EXISTS tokens (
   name VARCHAR(191),
   used_quota BIGINT DEFAULT 0,
   `group` VARCHAR(191) DEFAULT '',
+  status BIGINT DEFAULT 1,
+  expired_time BIGINT DEFAULT 0,
   deleted_at DATETIME(3),
   PRIMARY KEY (id),
   UNIQUE KEY idx_tokens_key (`key`),
@@ -52,6 +59,14 @@ CREATE TABLE IF NOT EXISTS options (
   `key` VARCHAR(191) NOT NULL,
   `value` LONGTEXT,
   PRIMARY KEY (`key`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+
+CREATE TABLE IF NOT EXISTS subscription_plans (
+  id BIGINT NOT NULL AUTO_INCREMENT,
+  title VARCHAR(191) DEFAULT '',
+  enabled TINYINT(1) DEFAULT 1,
+  upgrade_group VARCHAR(191) DEFAULT '',
+  PRIMARY KEY (id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 
 CREATE TABLE IF NOT EXISTS logs (

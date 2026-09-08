@@ -25,20 +25,24 @@ const upstreamArchiveReasonIdentityChange = "account_identity_changed"
 // totals automatically; a later audit/export can select the old epoch without
 // risking cross-account double counting.
 type ChannelUpstreamUsageArchive struct {
-	ID             uint64  `gorm:"primaryKey;autoIncrement"`
-	ArchiveBatchID string  `gorm:"size:64;column:archive_batch_id;uniqueIndex:idx_upstream_usage_archive_batch_row,priority:1"`
-	Domain         string  `gorm:"size:253;column:domain;index:idx_upstream_usage_archive_domain_hour,priority:1"`
-	AccountEpoch   string  `gorm:"size:64;column:account_epoch;index"`
-	ArchivedAt     int64   `gorm:"column:archived_at;index"`
-	ArchiveReason  string  `gorm:"size:48;column:archive_reason"`
-	HourTs         int64   `gorm:"column:hour_ts;uniqueIndex:idx_upstream_usage_archive_batch_row,priority:2;index:idx_upstream_usage_archive_domain_hour,priority:2"`
-	BucketSeconds  int64   `gorm:"column:bucket_seconds"`
-	Requests       int64   `gorm:"column:requests"`
-	Tokens         int64   `gorm:"column:tokens"`
-	Quota          float64 `gorm:"column:quota"`
-	CostUSD        float64 `gorm:"column:cost_usd"`
-	FetchedAt      int64   `gorm:"column:fetched_at"`
-	Provider       string  `gorm:"size:24;column:provider;uniqueIndex:idx_upstream_usage_archive_batch_row,priority:3"`
+	SourceKind      string
+	Provisional     bool
+	SourceCostUnits int64
+	UnitPerUSD      float64
+	ID              uint64  `gorm:"primaryKey;autoIncrement"`
+	ArchiveBatchID  string  `gorm:"size:64;column:archive_batch_id;uniqueIndex:idx_upstream_usage_archive_batch_row,priority:1"`
+	Domain          string  `gorm:"size:253;column:domain;index:idx_upstream_usage_archive_domain_hour,priority:1"`
+	AccountEpoch    string  `gorm:"size:64;column:account_epoch;index"`
+	ArchivedAt      int64   `gorm:"column:archived_at;index"`
+	ArchiveReason   string  `gorm:"size:48;column:archive_reason"`
+	HourTs          int64   `gorm:"column:hour_ts;uniqueIndex:idx_upstream_usage_archive_batch_row,priority:2;index:idx_upstream_usage_archive_domain_hour,priority:2"`
+	BucketSeconds   int64   `gorm:"column:bucket_seconds"`
+	Requests        int64   `gorm:"column:requests"`
+	Tokens          int64   `gorm:"column:tokens"`
+	Quota           float64 `gorm:"column:quota"`
+	CostUSD         float64 `gorm:"column:cost_usd"`
+	FetchedAt       int64   `gorm:"column:fetched_at"`
+	Provider        string  `gorm:"size:24;column:provider;uniqueIndex:idx_upstream_usage_archive_batch_row,priority:3"`
 }
 
 func (*ChannelUpstreamUsageArchive) BeforeUpdate(_ *gorm.DB) error {
@@ -136,6 +140,7 @@ func archiveUpstreamIdentityDataTx(tx *gorm.DB, next ChannelUpstreamAccount, arc
 	usageArchive := make([]ChannelUpstreamUsageArchive, 0, len(usage))
 	for _, row := range usage {
 		usageArchive = append(usageArchive, ChannelUpstreamUsageArchive{
+			SourceKind: row.SourceKind, Provisional: row.Provisional, SourceCostUnits: row.SourceCostUnits, UnitPerUSD: row.UnitPerUSD,
 			ArchiveBatchID: batchID, Domain: row.Domain, AccountEpoch: epoch,
 			ArchivedAt: archivedAt, ArchiveReason: upstreamArchiveReasonIdentityChange,
 			HourTs: row.HourTs, BucketSeconds: row.BucketSeconds, Requests: row.Requests,

@@ -6,6 +6,7 @@
 ```bash
 go test ./...    # 单元测试
 go vet ./...     # 静态检查
+node --test dev/tests/*.test.mjs # Node 22+，执行真实前端渲染函数的离线状态测试
 gofmt -l .       # 检查格式(应无输出)
 go build .       # 构建二进制
 docker build -t newapi-monitor .   # 构建镜像

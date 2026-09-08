@@ -1,7 +1,9 @@
 package monitor
 
 import (
+	"encoding/json"
 	"math"
+	"strings"
 	"testing"
 )
 
@@ -24,6 +26,42 @@ func TestRate(t *testing.T) {
 	for _, c := range cases {
 		if got := rate(c.s, c.total); !approx(got, c.want) {
 			t.Errorf("rate(%d,%d)=%v want %v", c.s, c.total, got, c.want)
+		}
+	}
+}
+
+func TestIncompleteSnapshotKeepsCollectionJSONContract(t *testing.T) {
+	m := newTestMonitor(t)
+	snapshot, err := m.computeSnapshot(60, 1_800_000_000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.DataComplete {
+		t.Fatal("empty store unexpectedly reported complete coverage")
+	}
+	payload, err := json.Marshal(snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payloadText := string(payload)
+	for _, field := range []string{
+		`"by_group":[]`, `"by_channel":[]`, `"by_model":[]`,
+		`"by_token":[]`, `"trend":[]`, `"rejections":[]`,
+	} {
+		if !strings.Contains(payloadText, field) {
+			t.Fatalf("incomplete snapshot collection is not an array: missing %s in %s", field, payloadText)
+		}
+	}
+}
+
+func TestModelDashboardGuardsNullableSnapshotCollections(t *testing.T) {
+	page := pageHTML
+	for _, marker := range []string{
+		`Array.isArray(s.by_channel)?s.by_channel:[]`,
+		`Array.isArray(s.by_model)?s.by_model:[]`,
+	} {
+		if !strings.Contains(page, marker) {
+			t.Fatalf("model dashboard lacks nullable collection guard %q", marker)
 		}
 	}
 }

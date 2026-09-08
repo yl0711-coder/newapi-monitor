@@ -71,7 +71,7 @@ func TestSyncStatusPageRendersBothStabilityMigrationsWithCorrectFields(t *testin
 		`migration.last_success_at`,
 		`'无迁移任务'`,
 		`syncKV('请求证据'`,
-		`syncKV('证据完整性'`,
+		`syncKV('证据累计计数'`,
 	} {
 		if !strings.Contains(pageHTML, want) {
 			t.Fatalf("稳定性双迁移进度缺少 %q", want)
@@ -85,7 +85,7 @@ func TestSyncStatusPageRendersBothStabilityMigrationsWithCorrectFields(t *testin
 func TestSyncStatusPageAllowsHashNavigation(t *testing.T) {
 	// 白名单是完整字面量断言：新增 tab 时必须同步改这里。
 	// 这样既保证 #tab=sync 仍可直达，也能挡住"误删某个 tab 名"的回归。
-	if !strings.Contains(pageHTML, `/^(sync|model|server|capacity|usage|stability|channels|logchain)$/`) {
+	if !strings.Contains(pageHTML, `/^(sync|model|server|capacity|usage|stability|channels|logchain|group-governance)$/`) {
 		t.Fatal("同步状态页必须能由 #tab=sync 直接打开")
 	}
 	if !strings.Contains(string(stabilityJS), `sync:{title:'数据同步状态'`) {
@@ -127,9 +127,8 @@ func TestSyncStatusPageSeparatesUpstreamBalanceTailAndHistory(t *testing.T) {
 	if !strings.Contains(pageHTML, `u.usage_sync_enabled&&u.usage_worker_enabled&&(usage.level==='warn'||history.level==='warn')`) {
 		t.Fatal("上游账户总状态必须分别读取当天 Tail 与历史补数状态")
 	}
-	managementJS := string(channelManagementJS)
-	if !strings.Contains(managementJS, `upstream.usage_sync_enabled&&upstream.usage_worker_enabled&&!upstream.usage_backfill_done`) {
-		t.Fatal("全局灰度关闭时，渠道摘要不得继续显示历史补全中")
+	if !strings.Contains(pageHTML, `id="syncChannelDataStatus"`) || !strings.Contains(pageHTML, `'/channels/data-status?'+query`) {
+		t.Fatal("渠道数据核验必须集中到同步状态页，并保留渠道页日期范围")
 	}
 }
 

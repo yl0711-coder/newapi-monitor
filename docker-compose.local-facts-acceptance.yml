@@ -64,6 +64,13 @@ services:
       NEWAPI_LOG_DSN: monitor_ro:local-facts-read-only@tcp(local-newapi-mysql:3306)/newapi_local_acceptance?charset=utf8mb4&timeout=5s&readTimeout=20s
       MONITOR_NEWAPI_BASE_URL: ""
       MONITOR_LOCAL_SNAPSHOT_ONLY: "false"
+      MONITOR_LOCAL_AUTH_BYPASS: "false"
+      MONITOR_SOURCE_WORKER_ENABLED: "true"
+      MONITOR_SOURCE_LEASE_REQUIRED: "false"
+      # 联合验收容量规划的用户分钟事实和分组治理只读快照。
+      MONITOR_CAPACITY_ENABLED: "true"
+      MONITOR_GROUP_GOVERNANCE_ENABLED: "true"
+      MONITOR_GROUP_GOVERNANCE_SYNC_MINUTES: "5"
       MONITOR_USAGE_FACTS_LOCAL_READ_ONLY: "false"
       MONITOR_USAGE_FACTS_STORE_PATH: /data/usage-facts.db
       MONITOR_USAGE_FACTS_ENABLED: "true"

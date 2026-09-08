@@ -26,7 +26,8 @@ type Settings struct {
 	// LocalSnapshotOnly 只供本机验收使用：不建立任何 NewAPI 生产库连接，也不启动
 	// 采样、回填、上游轮询等后台任务。页面只能读取已复制到本地 SQLite 的快照。
 	// 生产环境必须保持 false；它不是“连接失败后的降级模式”。
-	LocalSnapshotOnly bool // MONITOR_LOCAL_SNAPSHOT_ONLY，默认 false
+	LocalSnapshotOnly               bool // MONITOR_LOCAL_SNAPSHOT_ONLY，默认 false
+	UpstreamDiagnosticsLocalEnabled bool // 本地快照中显式允许管理员点击发起只读检测；不启动同步任务
 	// LocalAuthBypass 只供完全离线的本机快照容器免登录验收。启动前会同时
 	// 校验本地快照、无生产 DSN、无主站地址、无上游/AWS/心跳与告警任务；
 	// 任意一项不满足都拒绝启动，生产默认永远关闭。
@@ -64,6 +65,7 @@ type Settings struct {
 	NginxEnabled       bool     // MONITOR_NGINX_ENABLED,默认 false
 	NginxRetentionDays int      // MONITOR_NGINX_RETENTION_DAYS,默认 7
 	NginxAllowedNodes  []string // MONITOR_NGINX_ALLOWED_NODES,逗号分隔；启用 Nginx 采集时必填
+	NginxExpectedNodes []string // nil: inherit allowed; explicit empty: no active heartbeat expectations
 	NginxErrorEnabled  bool     // MONITOR_NGINX_ERROR_ENABLED，标准 error.log 的节点侧分类分钟聚合
 	// v2 是不可逆的逐 lane 连续性切换。总开关和逐节点白名单默认均关闭；
 	// 普通 Nginx ingest token 不能仅凭自身触发生产节点切换。
@@ -95,9 +97,10 @@ type Settings struct {
 	UpstreamSyncTimeoutSec int  // MONITOR_UPSTREAM_SYNC_TIMEOUT_SECONDS,默认 15
 	// 上游使用日志与余额是两条独立同步链。日志全局开关默认关闭，
 	// 只有全局开关与账户开关同时开启才会后台读取。页面访问绝不会触发上游请求。
-	UpstreamUsageSyncEnabled  bool // MONITOR_UPSTREAM_USAGE_SYNC_ENABLED,默认 false；新功能灰度闸门
-	UpstreamUsageSyncMinutes  int  // MONITOR_UPSTREAM_USAGE_SYNC_MINUTES,默认 20，最小 15
-	UpstreamUsageBackfillDays int  // MONITOR_UPSTREAM_USAGE_BACKFILL_DAYS,默认 90，首次低频补齐范围
+	UpstreamUsageSyncEnabled         bool // MONITOR_UPSTREAM_USAGE_SYNC_ENABLED,默认 false；新功能灰度闸门
+	UpstreamAICodeWithRecordsEnabled bool // MONITOR_AICODEWITH_RECORDS_ENABLED; record-based hourly bills, within the existing usage gate
+	UpstreamUsageSyncMinutes         int  // MONITOR_UPSTREAM_USAGE_SYNC_MINUTES,默认 20，最小 15
+	UpstreamUsageBackfillDays        int  // MONITOR_UPSTREAM_USAGE_BACKFILL_DAYS,默认 90，首次低频补齐范围
 	// 默认 1 保持所有上游请求全局串行；生产观察达标后最多升到 2。
 	// 同一 host 仍由 upstreamHostGuard 强制单并发，不能被此开关绕过。
 	UpstreamMaxConcurrency int // MONITOR_UPSTREAM_MAX_CONCURRENCY,默认 1，范围 1～2
@@ -116,6 +119,11 @@ type Settings struct {
 	UpstreamErrorLogSyncEnabled bool
 	// 独立灰度白名单；总开关打开但列表为空时仍不访问任何上游。
 	UpstreamErrorLogDomains []string // MONITOR_UPSTREAM_ERRORLOG_DOMAINS，逗号分隔
+	// 上游资金流水（充值、兑换码、管理员额度调整、消费退款）是独立证据链。
+	// 默认关闭且空白名单；还必须同时开启账户的 UsageSyncEnabled，不绕过日志读取授权。
+	UpstreamFundsSyncEnabled  bool     // MONITOR_UPSTREAM_FUNDS_SYNC_ENABLED，默认 false
+	UpstreamFundsDomains      []string // MONITOR_UPSTREAM_FUNDS_DOMAINS，逗号分隔
+	UpstreamFundsBackfillDays int      // MONITOR_UPSTREAM_FUNDS_BACKFILL_DAYS，默认 90，范围 1～365
 	// 上游计价账本与既有消费汇总使用独立灰度闸门和域名白名单。
 	// 支持 NewAPI、Sub2API 和 AICodeWith；默认关闭且空白名单，迁移不会发起任何上游请求。
 	UpstreamPricingLedgerEnabled       bool     // MONITOR_UPSTREAM_PRICING_LEDGER_ENABLED，默认 false
@@ -135,15 +143,15 @@ type Settings struct {
 	// 留空 = 关闭(默认);如 ":8092"。
 	PortalAddr string // MONITOR_PORTAL_ADDR
 
-	// 客户端用量聚合结果的可选 Redis 缓存。留空地址时完全不连接 Redis，
-	// 自动退化为有严格容量上限的进程内短缓存；Redis 不参与鉴权，也不保存原始日志。
-	UsageRedisAddr     string // MONITOR_USAGE_REDIS_ADDR，如 172.26.4.11:6379
-	UsageRedisUsername string // MONITOR_USAGE_REDIS_USERNAME，生产建议使用仅限 nxmon:* 的 ACL 用户
-	UsageRedisPassword string // MONITOR_USAGE_REDIS_PASSWORD，只从环境变量读取
-	UsageRedisDB       int    // MONITOR_USAGE_REDIS_DB，默认 0；权限隔离仍以 ACL/key prefix 为准
-	UsageRedisPrefix   string // MONITOR_USAGE_REDIS_PREFIX，默认 nxmon:usage:v1
+	// 兼容旧部署的已弃用字段：仅地址用于启动提示，prefix 用于本机键命名。
+	// 不存在 Redis 网络客户端，账号/密码/DB 不再用于任何连接。
+	UsageRedisAddr     string // 已弃用，仅识别旧配置并提示；不创建连接
+	UsageRedisUsername string // 已弃用
+	UsageRedisPassword string // 已弃用
+	UsageRedisDB       int    // 已弃用
+	UsageRedisPrefix   string // 兼容本机缓存键前缀
 	// 用户用量事实层：采集阶段与页面切读阶段分开开关。上线时先只开采集，
-	// 等本地小时覆盖率校验通过后再开 ReadEnabled；Redis 仅加速，不是事实源。
+	// 等本地小时覆盖率校验通过后再开 ReadEnabled；缓存不是事实源。
 	UsageFactsStorePath   string // MONITOR_USAGE_FACTS_STORE_PATH，默认与主库同目录的 usage-facts.db
 	UsageFactsEnabled     bool   // MONITOR_USAGE_FACTS_ENABLED，默认 false
 	UsageFactsReadEnabled bool   // MONITOR_USAGE_FACTS_READ_ENABLED，默认 false；生产仅 FactsEnabled=true 时生效
@@ -199,12 +207,17 @@ type Settings struct {
 	// 留空 = 关闭接收接口(POST /internal/rejections 返回 503),不接受任何推送。
 	// 同一 token 也用于 POST /internal/host(各节点主机 agent 推送 OS 内存/磁盘)。
 	IngestToken string // MONITOR_INGEST_TOKEN
-	// 服务端健康监控(实例/数据库/负载均衡):基于 AWS Lightsail 指标接口拉取。
+	// 服务端健康监控(实例/数据库/负载均衡):自动发现 Lightsail、ECS/Fargate、
+	// RDS 与 ALB，并从各服务控制面和 CloudWatch 只读拉取。
 	// 默认【关】——关时完全不调 AWS、不影响模型监控与现网行为。
 	InfraEnabled bool // MONITOR_INFRA_ENABLED(=true 才启用主动采样/探测)
 	// CapacityEnabled 只开放容量规划的本地读取页。它不启动 worker、
 	// 不访问 NewAPI/MySQL/Nginx/AWS，只联合展示已落盘的脱敏事实。
 	CapacityEnabled bool // MONITOR_CAPACITY_ENABLED，默认 false
+	// 分组治理是独立灰度功能：后台低频读取 NewAPI 当前分组配置与引用，
+	// 只把脱敏快照写入 Monitor SQLite；页面请求绝不回源生产库。
+	GroupGovernanceEnabled     bool // MONITOR_GROUP_GOVERNANCE_ENABLED，默认 false
+	GroupGovernanceSyncMinutes int  // MONITOR_GROUP_GOVERNANCE_SYNC_MINUTES，默认 10，最小 5
 	// InfraSnapshotReadOnly 只开放已落入 Monitor SQLite 的服务端快照和曲线。
 	// 它不启动 AWS、域名、源站锁探测，也不评估/发送基础设施告警；
 	// 仅用于本机验收和其他只读快照场景。
@@ -214,6 +227,7 @@ type Settings struct {
 	InfraRetentionDays    int    // MONITOR_INFRA_RETENTION_DAYS,默认 7
 	// MONITOR_INFRA_RESOURCES:逗号分隔,显式指定要监控的资源,留空=自动发现。
 	// 格式 type:name,type∈ instance/database/lb,如 "instance:Master,database:DB-X,lb:LB-X"。
+	// 该显式列表只约束 Lightsail；ECS/RDS/ALB 始终自动发现，避免新部署漏监控。
 	InfraResources string
 	// MONITOR_INFRA_EXCLUDE_RESOURCES:逗号分隔的资源名。用于暂时下线某台实例的
 	// 监控：不再自动采样，也不在现有历史采样的快照、趋势或最近告警中展示。
@@ -227,6 +241,8 @@ type Settings struct {
 	InfraCPUWarnPct          float64 // MONITOR_INFRA_CPU_WARN_PCT,默认 70
 	InfraCPUBadPct           float64 // MONITOR_INFRA_CPU_BAD_PCT,默认 85
 	InfraBurstWarnPct        float64 // MONITOR_INFRA_BURST_WARN_PCT,默认 20
+	InfraDBFreeMemWarnMB     float64 // MONITOR_INFRA_DB_FREE_MEM_WARN_MB,RDS 无总内存指标时的可用内存黄线,默认 512
+	InfraDBFreeMemBadMB      float64 // MONITOR_INFRA_DB_FREE_MEM_BAD_MB,RDS 无总内存指标时的可用内存红线,默认 256
 	InfraDBConnWarn          float64 // MONITOR_INFRA_DB_CONN_WARN,数据库连接数「高于」即黄,默认 70
 	InfraDBDiskQueueWarn     float64 // MONITOR_INFRA_DB_DISK_QUEUE_WARN,数据库磁盘队列深度「高于」即黄,默认 5
 	InfraLBRespWarnMs        float64 // MONITOR_INFRA_LB_RESP_WARN_MS,负载均衡响应毫秒「高于」即黄,默认 2000
@@ -245,7 +261,7 @@ type Settings struct {
 	// 源站锁完整性监控(F-5 看门狗):周期性直连各源站 nginx,不带 X-Origin-Verify 头,
 	// 期望被拦 403。一旦变 200 说明锁失效/被回滚(如重建容器漏了 env),立刻红告警。
 	// 走私网,只有部署到实例上才测得到;本地预览连不到私网会显示「无数据」(不误报)。
-	OriginLockTargets string // MONITOR_ORIGIN_LOCK_TARGETS,逗号分隔源站端点(host:port),默认两台 nginx 私网;留空=关闭
+	OriginLockTargets string // MONITOR_ORIGIN_LOCK_TARGETS,逗号分隔源站端点(host:port); 默认关闭，部署时显式配置现用源站
 	OriginLockHost    string // MONITOR_ORIGIN_LOCK_HOST,检查时带的 Host 头,默认 nexusapi.link
 	OriginLockPath    string // MONITOR_ORIGIN_LOCK_PATH,检查路径,默认 /(/ 无内网豁免,无头必 403;勿用 /api/status)
 
@@ -282,6 +298,7 @@ func LoadSettings() Settings {
 		StoreBackupRetention:                     envInt("MONITOR_STORE_BACKUP_RETENTION", 7),
 		StoreMigrationBackupRetention:            envInt("MONITOR_STORE_MIGRATION_BACKUP_RETENTION", 3),
 		LocalSnapshotOnly:                        env("MONITOR_LOCAL_SNAPSHOT_ONLY", "false") == "true",
+		UpstreamDiagnosticsLocalEnabled:          env("MONITOR_UPSTREAM_DIAGNOSTICS_LOCAL_ENABLED", "false") == "true",
 		LocalAuthBypass:                          env("MONITOR_LOCAL_AUTH_BYPASS", "false") == "true",
 		SourceWorkerEnabled:                      env("MONITOR_SOURCE_WORKER_ENABLED", "true") == "true",
 		SourceLeaseRequired:                      env("MONITOR_SOURCE_LEASE_REQUIRED", "true") == "true",
@@ -306,6 +323,7 @@ func LoadSettings() Settings {
 		NginxEnabled:                             env("MONITOR_NGINX_ENABLED", "false") == "true",
 		NginxRetentionDays:                       envInt("MONITOR_NGINX_RETENTION_DAYS", 7),
 		NginxAllowedNodes:                        envCSV("MONITOR_NGINX_ALLOWED_NODES"),
+		NginxExpectedNodes:                       envOptionalCSV("MONITOR_NGINX_EXPECTED_NODES"),
 		NginxErrorEnabled:                        env("MONITOR_NGINX_ERROR_ENABLED", "false") == "true",
 		NginxSourceV2Enabled:                     env("MONITOR_NGINX_SOURCE_V2_ENABLED", "false") == "true",
 		NginxSourceV2CutoverEnabled:              env("MONITOR_NGINX_SOURCE_V2_CUTOVER_ENABLED", "false") == "true",
@@ -326,9 +344,13 @@ func LoadSettings() Settings {
 		UpstreamSyncMinutes:                      envInt("MONITOR_UPSTREAM_SYNC_MINUTES", 5),
 		UpstreamSyncTimeoutSec:                   envInt("MONITOR_UPSTREAM_SYNC_TIMEOUT_SECONDS", 15),
 		UpstreamUsageSyncEnabled:                 env("MONITOR_UPSTREAM_USAGE_SYNC_ENABLED", "false") == "true",
+		UpstreamAICodeWithRecordsEnabled:         env("MONITOR_AICODEWITH_RECORDS_ENABLED", "false") == "true",
 		UpstreamUsageSyncMinutes:                 envInt("MONITOR_UPSTREAM_USAGE_SYNC_MINUTES", 20),
 		UpstreamErrorLogSyncEnabled:              env("MONITOR_UPSTREAM_ERRORLOG_SYNC_ENABLED", "false") == "true",
 		UpstreamErrorLogDomains:                  envCSV("MONITOR_UPSTREAM_ERRORLOG_DOMAINS"),
+		UpstreamFundsSyncEnabled:                 env("MONITOR_UPSTREAM_FUNDS_SYNC_ENABLED", "false") == "true",
+		UpstreamFundsDomains:                     envCSV("MONITOR_UPSTREAM_FUNDS_DOMAINS"),
+		UpstreamFundsBackfillDays:                envInt("MONITOR_UPSTREAM_FUNDS_BACKFILL_DAYS", 90),
 		UpstreamUsageBackfillDays:                envInt("MONITOR_UPSTREAM_USAGE_BACKFILL_DAYS", 90),
 		UpstreamMaxConcurrency:                   envInt("MONITOR_UPSTREAM_MAX_CONCURRENCY", 1),
 		UpstreamPricingLedgerEnabled:             env("MONITOR_UPSTREAM_PRICING_LEDGER_ENABLED", "false") == "true",
@@ -373,6 +395,8 @@ func LoadSettings() Settings {
 		IngestToken:                              env("MONITOR_INGEST_TOKEN", ""),
 		InfraEnabled:                             env("MONITOR_INFRA_ENABLED", "") == "true",
 		CapacityEnabled:                          env("MONITOR_CAPACITY_ENABLED", "false") == "true",
+		GroupGovernanceEnabled:                   env("MONITOR_GROUP_GOVERNANCE_ENABLED", "false") == "true",
+		GroupGovernanceSyncMinutes:               envInt("MONITOR_GROUP_GOVERNANCE_SYNC_MINUTES", 10),
 		InfraSnapshotReadOnly:                    env("MONITOR_INFRA_SNAPSHOT_READ_ONLY", "false") == "true",
 		AWSRegion:                                env("AWS_REGION", "us-west-2"),
 		InfraSampleSeconds:                       envInt("MONITOR_INFRA_SAMPLE_SECONDS", 300),
@@ -387,11 +411,13 @@ func LoadSettings() Settings {
 		InfraCPUWarnPct:          envFloat("MONITOR_INFRA_CPU_WARN_PCT", 70),
 		InfraCPUBadPct:           envFloat("MONITOR_INFRA_CPU_BAD_PCT", 85),
 		InfraBurstWarnPct:        envFloat("MONITOR_INFRA_BURST_WARN_PCT", 20),
+		InfraDBFreeMemWarnMB:     envFloat("MONITOR_INFRA_DB_FREE_MEM_WARN_MB", 512),
+		InfraDBFreeMemBadMB:      envFloat("MONITOR_INFRA_DB_FREE_MEM_BAD_MB", 256),
 		InfraDBConnWarn:          envFloat("MONITOR_INFRA_DB_CONN_WARN", 70),
 		InfraDBDiskQueueWarn:     envFloat("MONITOR_INFRA_DB_DISK_QUEUE_WARN", 5),
 		InfraLBRespWarnMs:        envFloat("MONITOR_INFRA_LB_RESP_WARN_MS", 2000),
 
-		ProbeDomains:       env("MONITOR_PROBE_DOMAINS", "nexusapi.link,routepath.link,pathgo.link,us.nexusapi.link"),
+		ProbeDomains:       env("MONITOR_PROBE_DOMAINS", "nexusapi.link,pathgo.link,us.nexusapi.link"),
 		ProbePath:          env("MONITOR_PROBE_PATH", "/api/status"),
 		ProbeSeconds:       envInt("MONITOR_PROBE_SECONDS", 60),
 		ProbeLatencyWarnMs: envFloat("MONITOR_PROBE_LATENCY_WARN_MS", 500),
@@ -400,7 +426,7 @@ func LoadSettings() Settings {
 		ProbeCertBadDays:   envFloat("MONITOR_PROBE_CERT_BAD_DAYS", 7),
 		ProbeExpectCDN:     env("MONITOR_PROBE_EXPECT_CDN", "true") == "true",
 
-		OriginLockTargets: env("MONITOR_ORIGIN_LOCK_TARGETS", "172.26.0.20:80,172.26.10.97:80"),
+		OriginLockTargets: envAllowEmpty("MONITOR_ORIGIN_LOCK_TARGETS", ""),
 		OriginLockHost:    env("MONITOR_ORIGIN_LOCK_HOST", "nexusapi.link"),
 		OriginLockPath:    env("MONITOR_ORIGIN_LOCK_PATH", "/"),
 
@@ -431,6 +457,15 @@ func (s Settings) stabilityStorageDays() int {
 
 func env(k, def string) string {
 	if v := os.Getenv(k); v != "" {
+		return v
+	}
+	return def
+}
+
+// envAllowEmpty is only for options where an explicit empty value disables
+// the feature. Other settings retain their existing empty-as-default policy.
+func envAllowEmpty(k, def string) string {
+	if v, present := os.LookupEnv(k); present {
 		return v
 	}
 	return def

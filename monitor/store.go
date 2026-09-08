@@ -29,10 +29,16 @@ import (
 // 伪装成用户流量。
 const userTrafficClassificationVersion = trafficclass.Current
 
+// stabilityTrafficClassificationVersion versions delivery outcomes used by
+// model monitoring, stability, capacity and channel-cost projections. It is
+// deliberately independent from userTrafficClassificationVersion: changing a
+// zero-output/anomaly rule must not invalidate or republish user usage facts.
+const stabilityTrafficClassificationVersion = trafficclass.DeliveryCurrent
+
 var (
-	currentMetricTrafficFilter = fmt.Sprintf(" AND metric_samples.traffic_class_version = %d", userTrafficClassificationVersion)
-	currentTokenTrafficFilter  = fmt.Sprintf(" AND token_samples.traffic_class_version = %d", userTrafficClassificationVersion)
-	currentHourTrafficFilter   = fmt.Sprintf(" AND hour_samples.traffic_class_version = %d", userTrafficClassificationVersion)
+	currentMetricTrafficFilter = fmt.Sprintf(" AND metric_samples.traffic_class_version = %d", stabilityTrafficClassificationVersion)
+	currentTokenTrafficFilter  = fmt.Sprintf(" AND token_samples.traffic_class_version = %d", stabilityTrafficClassificationVersion)
+	currentHourTrafficFilter   = fmt.Sprintf(" AND hour_samples.traffic_class_version = %d", stabilityTrafficClassificationVersion)
 )
 
 // warnReadErr:读路径统一 fail-open——出错按"无数据"返回,页面显示空而不中断监控;
@@ -98,9 +104,33 @@ type MetricSample struct {
 	TtftMaxMs int   `gorm:"column:ttft_max_ms"` // 最大 frt(ms),用于分位末档收尾
 }
 
+// CapacityUserMinuteSample 是容量/RPM 查询专用的最小用户分钟事实。
+// 它与 MetricSample 由同一次来源查询生成，避免为用户筛选额外扫描生产 logs。
+// 只保留吞吐所需字段，不保存请求内容、Key、Request ID 或错误原文。
+type CapacityUserMinuteSample struct {
+	BucketTs            int64  `gorm:"primaryKey;autoIncrement:false;index:idx_capacity_user_minute_bucket;index:idx_capacity_user_minute_user_bucket,priority:2;index:idx_capacity_user_minute_channel_bucket,priority:2;index:idx_capacity_user_minute_model_bucket,priority:2;index:idx_capacity_user_minute_group_bucket,priority:2"`
+	UserID              int64  `gorm:"primaryKey;autoIncrement:false;index:idx_capacity_user_minute_user_bucket,priority:1;column:user_id"`
+	ChannelID           int    `gorm:"primaryKey;autoIncrement:false;index:idx_capacity_user_minute_channel_bucket,priority:1;column:channel_id"`
+	ModelName           string `gorm:"primaryKey;size:128;index:idx_capacity_user_minute_model_bucket,priority:1;column:model_name"`
+	Grp                 string `gorm:"primaryKey;size:64;index:idx_capacity_user_minute_group_bucket,priority:1;column:grp"`
+	Username            string `gorm:"size:255;column:username"`
+	TrafficClassVersion int    `gorm:"column:traffic_class_version;index"`
+	Success             int64  `gorm:"column:success"`
+	Anomaly             int64  `gorm:"column:anomaly"`
+	Failed              int64  `gorm:"column:failed"`
+	Tokens              int64  `gorm:"column:tokens"`
+}
+
+func (s *CapacityUserMinuteSample) BeforeCreate(_ *gorm.DB) error {
+	if s.TrafficClassVersion == 0 {
+		s.TrafficClassVersion = stabilityTrafficClassificationVersion
+	}
+	return nil
+}
+
 func (s *MetricSample) BeforeCreate(_ *gorm.DB) error {
 	if s.TrafficClassVersion == 0 {
-		s.TrafficClassVersion = userTrafficClassificationVersion
+		s.TrafficClassVersion = stabilityTrafficClassificationVersion
 	}
 	return nil
 }
@@ -118,9 +148,33 @@ type TokenSample struct {
 	TrafficClassVersion int `gorm:"column:traffic_class_version;index"`
 }
 
+// MetricFinalizeState is the durable cursor for the delayed metric/token
+// reconciliation lane. The realtime sampler intentionally reads only a tiny
+// recent window; requests that finish tens of minutes later can therefore be
+// inserted into NewAPI's logs after that window has moved on. This cursor lets
+// a low-frequency closed-window pass catch those late rows without widening
+// every realtime query or replaying a large range after each restart.
+type MetricFinalizeState struct {
+	ID                   uint   `gorm:"primaryKey;autoIncrement:false"`
+	NextTs               int64  `gorm:"column:next_ts"`
+	TargetThroughTs      int64  `gorm:"column:target_through_ts"`
+	CoverageFromTs       int64  `gorm:"column:coverage_from_ts"`
+	SemanticsVersion     int    `gorm:"column:semantics_version;index"`
+	HourCoverageFromTs   int64  `gorm:"column:hour_coverage_from_ts"`
+	HourCoverageToTs     int64  `gorm:"column:hour_coverage_to_ts"`
+	HourSemanticsVersion int    `gorm:"column:hour_semantics_version;index"`
+	Status               string `gorm:"size:24"`
+	Attempts             int
+	NextRetryAt          int64  `gorm:"column:next_retry_at"`
+	LastSuccessAt        int64  `gorm:"column:last_success_at"`
+	LastFailureAt        int64  `gorm:"column:last_failure_at"`
+	LastError            string `gorm:"size:512;column:last_error"`
+	UpdatedAt            int64  `gorm:"index;column:updated_at"`
+}
+
 func (s *TokenSample) BeforeCreate(_ *gorm.DB) error {
 	if s.TrafficClassVersion == 0 {
-		s.TrafficClassVersion = userTrafficClassificationVersion
+		s.TrafficClassVersion = stabilityTrafficClassificationVersion
 	}
 	return nil
 }
@@ -140,7 +194,7 @@ type HourSample struct {
 
 func (s *HourSample) BeforeCreate(_ *gorm.DB) error {
 	if s.TrafficClassVersion == 0 {
-		s.TrafficClassVersion = userTrafficClassificationVersion
+		s.TrafficClassVersion = stabilityTrafficClassificationVersion
 	}
 	return nil
 }
@@ -850,12 +904,13 @@ func (m *Monitor) openStore(path string) error {
 		return fmt.Errorf("上游错误日志事件键迁移失败: %w", err)
 	}
 	if err := db.AutoMigrate(
-		&MetricSample{}, &TokenSample{}, &HourSample{}, &ChannelSnap{}, &RejectionSample{}, &RejectionIngestBatch{}, &SelectablePair{},
+		&AICodeWithRecordCheckpoint{}, &AICodeWithRecordSeen{},
+		&MetricSample{}, &CapacityUserMinuteSample{}, &TokenSample{}, &MetricFinalizeState{}, &HourSample{}, &ChannelSnap{}, &RejectionSample{}, &RejectionIngestBatch{}, &SelectablePair{},
 		&StabilityHourSample{}, &ChannelTestHourSample{}, &StabilityRejectHour{}, &StabilityProblemSample{},
 		&StabilityProblemIngestState{}, &StabilityProblemStage{}, &StabilityProblemClassificationMigration{}, &StabilityProblemLiveCursor{},
 		&StabilityHourIngestState{}, &StabilityBackfillJob{},
 		&ChannelFinanceSetting{}, &ChannelSaleGroupRate{}, &WebsiteGroupCatalog{}, &ChannelDomainCost{}, &ChannelDomainGroupCost{}, &ChannelFinanceChannelCost{}, &ChannelFinanceVersion{},
-		&ChannelUpstreamAccount{}, &ChannelUpstreamUsageHour{}, &ChannelUpstreamUsageArchive{}, &ChannelUpstreamErrorLog{}, &ChannelUpstreamErrorLogArchive{}, &UpstreamErrorLogSyncState{}, &NewAPIUsageBackfillCheckpoint{}, &NewAPIUsageBackfillSegment{}, &AICodeWithKeySyncState{}, &AICodeWithUsageStage{}, &AICodeWithUsageRound{}, &UpstreamHostCircuit{},
+		&ChannelUpstreamAccount{}, &ChannelUpstreamUsageHour{}, &ChannelUpstreamUsageArchive{}, &ChannelUpstreamErrorLog{}, &ChannelUpstreamErrorLogArchive{}, &UpstreamErrorLogSyncState{}, &ChannelUpstreamFundEvent{}, &UpstreamFundSyncState{}, &NewAPIUsageBackfillCheckpoint{}, &NewAPIUsageBackfillSegment{}, &AICodeWithKeySyncState{}, &AICodeWithUsageStage{}, &AICodeWithUsageRound{}, &UpstreamHostCircuit{},
 		&ChannelUpstreamPricingHourEvidence{}, &ChannelUpstreamPricingHourState{}, &ChannelUpstreamPricingObservedState{}, &ChannelUpstreamPricingChangeEvent{}, &ChannelUpstreamPricingSyncState{}, &ChannelUpstreamPricingPageCheckpoint{}, &AICodeWithPricingCheckpoint{},
 		&ChannelUpstreamCostHourEvidence{}, &ChannelUpstreamCostHourState{}, &ChannelCostPageCheckpoint{}, &ChannelCostSourceBinding{}, &ChannelCostDirtyHour{}, &ChannelCostKeyRegistry{},
 		&ChannelPricingChangeProposal{}, &ChannelPricingProposalEvent{}, &ChannelFinanceActivation{}, &ChannelFinanceActivationSlot{}, &ChannelFinanceActivationEvent{},
@@ -863,8 +918,12 @@ func (m *Monitor) openStore(path string) error {
 		&InfraSample{}, &HostContainerSnapshot{}, &NginxMinuteSample{}, &NginxIngestBatch{}, &NginxSourceState{},
 		&NginxErrorMinuteSample{}, &NginxErrorIngestBatch{}, &NginxErrorSourceState{},
 		&AlertConfig{}, &AlertLog{}, &TrackedUser{}, &CustomerGroup{}, &UsageMemberControl{}, &UsageMemberAudit{}, &UsageMemberControlMigration{}, &FollowUpLog{}, &UsageSettings{},
+		&GroupGovernanceState{}, &GroupGovernanceGroup{}, &GroupGovernanceUser{},
 	); err != nil {
 		return fmt.Errorf("表迁移失败: %w", err)
+	}
+	if err := migrateLegacyUpstreamEconomicUnitEvidence(db); err != nil {
+		return fmt.Errorf("上游换算证据迁移失败: %w", err)
 	}
 	if m.cfg.NginxSourceV2Enabled {
 		if err := migrateNginxSourceV2Schema(db); err != nil {
@@ -940,14 +999,20 @@ func (m *Monitor) openStore(path string) error {
 		}
 	}
 	m.storeDB = db
-	if err := m.migrateLegacyUpstreamCredentialEncryption(); err != nil {
-		return fmt.Errorf("上游凭据加密密钥迁移失败: %w", err)
-	}
-	if err := m.migrateAICodeWithCredentialSlots(); err != nil {
-		return fmt.Errorf("AICodeWith Key 槽位迁移失败: %w", err)
-	}
-	if err := m.reconcileAICodeWithPublishedBackfillStates(); err != nil {
-		return fmt.Errorf("AICodeWith Key 历史完成状态修复失败: %w", err)
+	// Offline snapshots retain opaque credentials and diagnostic history as-is.
+	// Viewing saved facts must not require exporting production encryption keys
+	// or changing credential-dependent completion evidence. Online startup keeps
+	// its original fail-closed migration checks.
+	if !m.cfg.LocalSnapshotOnly {
+		if err := m.migrateLegacyUpstreamCredentialEncryption(); err != nil {
+			return fmt.Errorf("上游凭据加密密钥迁移失败: %w", err)
+		}
+		if err := m.migrateAICodeWithCredentialSlots(); err != nil {
+			return fmt.Errorf("AICodeWith Key 槽位迁移失败: %w", err)
+		}
+		if err := m.reconcileAICodeWithPublishedBackfillStates(); err != nil {
+			return fmt.Errorf("AICodeWith Key 历史完成状态修复失败: %w", err)
+		}
 	}
 	if err := m.migrateAICodeWithContractLedgerUnit(); err != nil {
 		return fmt.Errorf("AICodeWith 账面单位迁移失败: %w", err)
@@ -1129,12 +1194,28 @@ func (m *Monitor) openUsageFactsStore(path string, prechecked bool) error {
 }
 
 func (m *Monitor) upsertSamples(rows []MetricSample) error {
+	return upsertSamplesDB(m.storeDB, rows)
+}
+
+func upsertSamplesDB(db *gorm.DB, rows []MetricSample) error {
 	if len(rows) == 0 {
 		return nil
 	}
-	return m.storeDB.Clauses(clause.OnConflict{
+	return db.Clauses(clause.OnConflict{
 		Columns: []clause.Column{
 			{Name: "bucket_ts"}, {Name: "channel_id"}, {Name: "model_name"}, {Name: "grp"},
+		},
+		UpdateAll: true,
+	}).CreateInBatches(rows, 200).Error
+}
+
+func upsertCapacityUserMinuteSamplesDB(db *gorm.DB, rows []CapacityUserMinuteSample) error {
+	if len(rows) == 0 {
+		return nil
+	}
+	return db.Clauses(clause.OnConflict{
+		Columns: []clause.Column{
+			{Name: "bucket_ts"}, {Name: "user_id"}, {Name: "channel_id"}, {Name: "model_name"}, {Name: "grp"},
 		},
 		UpdateAll: true,
 	}).CreateInBatches(rows, 200).Error
@@ -1238,8 +1319,15 @@ func (m *Monitor) replaceSelectablePairs(pairs []SelectablePair) error {
 
 func (m *Monitor) pruneOlderThan(cutoffTs int64) (int64, error) {
 	r := m.storeDB.Where("bucket_ts < ?", cutoffTs).Delete(&MetricSample{})
-	m.storeDB.Where("bucket_ts < ?", cutoffTs).Delete(&TokenSample{}) // token 维度一并清理
-	return r.RowsAffected, r.Error
+	if r.Error != nil {
+		return r.RowsAffected, r.Error
+	}
+	users := m.storeDB.Where("bucket_ts < ?", cutoffTs).Delete(&CapacityUserMinuteSample{})
+	if users.Error != nil {
+		return r.RowsAffected, users.Error
+	}
+	tokens := m.storeDB.Where("bucket_ts < ?", cutoffTs).Delete(&TokenSample{}) // token 维度一并清理
+	return r.RowsAffected + users.RowsAffected + tokens.RowsAffected, tokens.Error
 }
 
 // upsertRejections 累加一个已经确认是“新批次”的拒绝计数。HTTP 重试幂等由
@@ -1319,10 +1407,20 @@ func (m *Monitor) ingestRejectionBatch(node, batchID string, rows []RejectionSam
 
 // storeRejections 取窗口内按 (原因 × 模型 × 分组) 聚合的拒绝计数,按次数降序(Top 100)。
 func (m *Monitor) storeRejections(since int64) []RejectionRow {
+	return m.storeRejectionsRange(since, 0)
+}
+
+func (m *Monitor) storeRejectionsRange(since, until int64) []RejectionRow {
 	var rows []RejectionRow
-	warnReadErr("storeRejections", m.storeDB.Raw(`SELECT reason, model, grp AS `+"`group`"+`, COALESCE(SUM(count),0) AS count
-		FROM rejection_samples WHERE bucket_ts >= ?
-		GROUP BY reason, model, grp ORDER BY count DESC LIMIT 100`, since).Scan(&rows))
+	q := `SELECT reason, model, grp AS ` + "`group`" + `, COALESCE(SUM(count),0) AS count
+		FROM rejection_samples WHERE bucket_ts >= ?`
+	args := []any{since}
+	if until > 0 {
+		q += ` AND bucket_ts < ?`
+		args = append(args, until)
+	}
+	q += ` GROUP BY reason, model, grp ORDER BY count DESC LIMIT 100`
+	warnReadErr("storeRejectionsRange", m.storeDB.Raw(q, args...).Scan(&rows))
 	return rows
 }
 
@@ -1475,9 +1573,26 @@ func percentile(hist []int64, edges []int, maxVal int, p float64) float64 {
 }
 
 func (m *Monitor) storeSummary(since int64, windowSec float64) (*Summary, error) {
+	return m.storeSummaryRange(since, 0, windowSec)
+}
+
+// storeSummaryRange is the bounded variant used by finalized accounting
+// windows. A zero until keeps the historical "from now backwards" behavior
+// used by the live dashboard.
+func (m *Monitor) storeSummaryRange(since, until int64, windowSec float64) (*Summary, error) {
+	return m.storeSummaryRangeForScope(since, until, windowSec, metricCurrentRoutes)
+}
+
+func (m *Monitor) storeSummaryRangeForScope(since, until int64, windowSec float64, scope metricReadScope) (*Summary, error) {
 	var a aggRow
-	if err := m.storeDB.Raw(`SELECT '' AS k, `+aggCols+` FROM metric_samples WHERE bucket_ts >= ?`+currentMetricTrafficFilter+enabledChanFilter+selectableFilter, since).
-		Scan(&a).Error; err != nil {
+	query := `SELECT '' AS k, ` + aggCols + ` FROM metric_samples WHERE bucket_ts >= ?`
+	args := []any{since}
+	if until > 0 {
+		query += ` AND bucket_ts < ?`
+		args = append(args, until)
+	}
+	query += scope.filter("")
+	if err := m.storeDB.Raw(query, args...).Scan(&a).Error; err != nil {
 		return nil, fmt.Errorf("本地汇总失败: %w", err)
 	}
 	var r Row
@@ -1509,7 +1624,7 @@ func dimColOK(dimCol string) bool {
 	return false
 }
 
-func (m *Monitor) storeDimSeries(dimCol string, since int64, windowMinutes int) (map[string][]TimePoint, error) {
+func (m *Monitor) storeDimSeriesRangeForScope(dimCol string, since, until int64, windowMinutes int, scope metricReadScope) (map[string][]TimePoint, error) {
 	if !dimColOK(dimCol) {
 		return nil, fmt.Errorf("非法维度列: %q", dimCol)
 	}
@@ -1520,15 +1635,18 @@ func (m *Monitor) storeDimSeries(dimCol string, since int64, windowMinutes int) 
 		Anomaly  int64
 		Failed   int64
 	}
-	f := currentMetricTrafficFilter + enabledChanFilter + selectableFilter
-	if dimCol == channelDim { // 按渠道明细不过滤,排障仍能看禁用渠道/误路由
-		f = currentMetricTrafficFilter
-	}
+	f := scope.filter(dimCol)
 	q := fmt.Sprintf(`SELECT %s AS k, bucket_ts, COALESCE(SUM(success),0) AS success,
 		COALESCE(SUM(anomaly),0) AS anomaly, COALESCE(SUM(failed),0) AS failed
-		FROM metric_samples WHERE bucket_ts >= ?%s GROUP BY k, bucket_ts ORDER BY k, bucket_ts`, dimCol, f)
+		FROM metric_samples WHERE bucket_ts >= ?`, dimCol)
+	args := []any{since}
+	if until > 0 {
+		q += ` AND bucket_ts < ?`
+		args = append(args, until)
+	}
+	q += f + ` GROUP BY k, bucket_ts ORDER BY k, bucket_ts`
 	var rows []row
-	if err := m.storeDB.Raw(q, since).Scan(&rows).Error; err != nil {
+	if err := m.storeDB.Raw(q, args...).Scan(&rows).Error; err != nil {
 		return nil, fmt.Errorf("本地维度时序失败(%s): %w", dimCol, err)
 	}
 	bucketSec := int64(60)
@@ -1559,18 +1677,28 @@ func (m *Monitor) storeDimSeries(dimCol string, since int64, windowMinutes int) 
 }
 
 func (m *Monitor) storeDim(dimCol string, since int64, windowSec float64) ([]Row, error) {
+	return m.storeDimRange(dimCol, since, 0, windowSec)
+}
+
+func (m *Monitor) storeDimRange(dimCol string, since, until int64, windowSec float64) ([]Row, error) {
+	return m.storeDimRangeForScope(dimCol, since, until, windowSec, metricCurrentRoutes)
+}
+
+func (m *Monitor) storeDimRangeForScope(dimCol string, since, until int64, windowSec float64, scope metricReadScope) ([]Row, error) {
 	if !dimColOK(dimCol) {
 		return nil, fmt.Errorf("非法维度列: %q", dimCol)
 	}
-	f := currentMetricTrafficFilter + enabledChanFilter + selectableFilter
-	if dimCol == channelDim { // 按渠道明细不过滤,排障仍能看禁用渠道/误路由
-		f = currentMetricTrafficFilter
+	f := scope.filter(dimCol)
+	q := fmt.Sprintf(`SELECT %s AS k, %s FROM metric_samples WHERE bucket_ts >= ?`, dimCol, aggCols)
+	args := []any{since}
+	if until > 0 {
+		q += ` AND bucket_ts < ?`
+		args = append(args, until)
 	}
-	q := fmt.Sprintf(`SELECT %s AS k, %s FROM metric_samples
-		WHERE bucket_ts >= ?%s GROUP BY %s
-		ORDER BY quota DESC, (success+anomaly+failed) DESC, k ASC LIMIT 200`, dimCol, aggCols, f, dimCol)
+	q += fmt.Sprintf(`%s GROUP BY %s ORDER BY quota DESC, (success+anomaly+failed) DESC, k ASC LIMIT ?`, f, dimCol)
+	args = append(args, scope.dimensionReadLimit())
 	var rows []aggRow
-	if err := m.storeDB.Raw(q, since).Scan(&rows).Error; err != nil {
+	if err := m.storeDB.Raw(q, args...).Scan(&rows).Error; err != nil {
 		return nil, fmt.Errorf("本地维度聚合失败(%s): %w", dimCol, err)
 	}
 	out := make([]Row, 0, len(rows))
@@ -1587,14 +1715,31 @@ func (m *Monitor) storeDim(dimCol string, since int64, windowSec float64) ([]Row
 }
 
 func (m *Monitor) storeTrend(since int64, windowMinutes int) ([]TimePoint, error) {
+	return m.storeTrendRange(since, 0, windowMinutes)
+}
+
+func (m *Monitor) storeTrendRange(since, until int64, windowMinutes int) ([]TimePoint, error) {
+	return m.storeTrendRangeForScope(since, until, windowMinutes, metricCurrentRoutes)
+}
+
+func (m *Monitor) storeTrendRangeForScope(since, until int64, windowMinutes int, scope metricReadScope) ([]TimePoint, error) {
 	type minRow struct {
 		BucketTs int64
 		Success  int64
+		Anomaly  int64
 		Failed   int64
 	}
 	var rows []minRow
-	if err := m.storeDB.Raw(`SELECT bucket_ts, COALESCE(SUM(success),0) AS success, COALESCE(SUM(failed),0) AS failed
-		FROM metric_samples WHERE bucket_ts >= ?`+currentMetricTrafficFilter+enabledChanFilter+selectableFilter+` GROUP BY bucket_ts ORDER BY bucket_ts`, since).
+	q := `SELECT bucket_ts, COALESCE(SUM(success),0) AS success,
+		COALESCE(SUM(anomaly),0) AS anomaly, COALESCE(SUM(failed),0) AS failed
+		FROM metric_samples WHERE bucket_ts >= ?`
+	args := []any{since}
+	if until > 0 {
+		q += ` AND bucket_ts < ?`
+		args = append(args, until)
+	}
+	q += scope.filter("") + ` GROUP BY bucket_ts ORDER BY bucket_ts`
+	if err := m.storeDB.Raw(q, args...).
 		Scan(&rows).Error; err != nil {
 		return nil, fmt.Errorf("本地趋势失败: %w", err)
 	}
@@ -1613,6 +1758,7 @@ func (m *Monitor) storeTrend(since int64, windowMinutes int) ([]TimePoint, error
 			order = append(order, b)
 		}
 		p.Success += mr.Success
+		p.Anomaly += mr.Anomaly
 		p.Failed += mr.Failed
 	}
 	out := make([]TimePoint, 0, len(order))
@@ -1625,6 +1771,10 @@ func (m *Monitor) storeTrend(since int64, windowMinutes int) ([]TimePoint, error
 // storeTokens 按令牌(API Key)聚合窗口内的成功/异常/失败/用量/成本，
 // 按用户侧消费→请求数→名称排序取 Top 100，与模型监控另外三个维度保持一致。
 func (m *Monitor) storeTokens(since int64, windowSec float64) ([]TokenRow, error) {
+	return m.storeTokensRange(since, 0, windowSec)
+}
+
+func (m *Monitor) storeTokensRange(since, until int64, windowSec float64) ([]TokenRow, error) {
 	type tr struct {
 		K       string
 		Success int64
@@ -1634,11 +1784,17 @@ func (m *Monitor) storeTokens(since int64, windowSec float64) ([]TokenRow, error
 		Quota   int64
 	}
 	var rows []tr
-	if err := m.storeDB.Raw(`SELECT token_name AS k,
+	q := `SELECT token_name AS k,
 		COALESCE(SUM(success),0) AS success, COALESCE(SUM(anomaly),0) AS anomaly,
 		COALESCE(SUM(failed),0) AS failed, COALESCE(SUM(tokens),0) AS tokens, COALESCE(SUM(quota),0) AS quota
-		FROM token_samples WHERE bucket_ts >= ?`+currentTokenTrafficFilter+` GROUP BY token_name
-		ORDER BY quota DESC, (success+anomaly+failed) DESC, k ASC LIMIT 100`, since).Scan(&rows).Error; err != nil {
+		FROM token_samples WHERE bucket_ts >= ?`
+	args := []any{since}
+	if until > 0 {
+		q += ` AND bucket_ts < ?`
+		args = append(args, until)
+	}
+	q += currentTokenTrafficFilter + ` GROUP BY token_name ORDER BY quota DESC, (success+anomaly+failed) DESC, k ASC LIMIT 100`
+	if err := m.storeDB.Raw(q, args...).Scan(&rows).Error; err != nil {
 		return nil, fmt.Errorf("本地 token 聚合失败: %w", err)
 	}
 	out := make([]TokenRow, 0, len(rows))
@@ -1661,16 +1817,54 @@ func (m *Monitor) storeTokens(since int64, windowSec float64) ([]TokenRow, error
 // rollupHours 把【还有分钟数据的近段时间】按小时汇总进 hour_samples(幂等 UPSERT)。
 // 关键:在分钟数据被清理前就已滚动写入小时表,故长期数据不丢失。
 func (m *Monitor) rollupHours(sinceTs int64) error {
-	return m.storeDB.Exec(`INSERT INTO hour_samples (hour_ts, success, anomaly, failed, tokens, quota, sum_use_time, traffic_class_version)
+	return m.rollupHourRange(sinceTs, 0)
+}
+
+// rollupHourRange materializes only the requested half-open range. Historical
+// backfill uses this bounded form so each source hour is durable before its
+// temporary high-cardinality minute rows are discarded.
+func (m *Monitor) rollupHourRange(fromTs, toTs int64) error {
+	query := `INSERT INTO hour_samples (hour_ts, success, anomaly, failed, tokens, quota, sum_use_time, traffic_class_version)
 		SELECT (bucket_ts/3600)*3600 AS hour_ts,
 		  SUM(success), SUM(anomaly), SUM(failed), SUM(tokens), SUM(quota), SUM(sum_use_time), ?
-		FROM metric_samples WHERE bucket_ts >= ? AND traffic_class_version = ?
+		FROM metric_samples WHERE bucket_ts >= ?`
+	args := []any{stabilityTrafficClassificationVersion, fromTs}
+	if toTs > 0 {
+		query += ` AND bucket_ts < ?`
+		args = append(args, toTs)
+	}
+	query += ` AND traffic_class_version = ?
 		GROUP BY hour_ts
 		ON CONFLICT(hour_ts) DO UPDATE SET
 		  success=excluded.success, anomaly=excluded.anomaly, failed=excluded.failed,
 		  tokens=excluded.tokens, quota=excluded.quota, sum_use_time=excluded.sum_use_time,
-		  traffic_class_version=excluded.traffic_class_version`,
-		userTrafficClassificationVersion, sinceTs, userTrafficClassificationVersion).Error
+		  traffic_class_version=excluded.traffic_class_version`
+	args = append(args, stabilityTrafficClassificationVersion)
+	if toTs <= 0 {
+		return m.storeDB.Exec(query, args...).Error
+	}
+	return m.storeDB.Transaction(func(tx *gorm.DB) error {
+		// A reclassification can turn a formerly non-empty hour into a proven
+		// zero-traffic hour. Delete+rebuild atomically so that stale legacy totals
+		// cannot survive an INSERT ... SELECT that now returns no row.
+		hourFrom := fromTs / 3600 * 3600
+		hourTo := ((toTs + 3599) / 3600) * 3600
+		if err := tx.Where("hour_ts >= ? AND hour_ts < ?", hourFrom, hourTo).Delete(&HourSample{}).Error; err != nil {
+			return err
+		}
+		return tx.Exec(query, args...).Error
+	})
+}
+
+func (m *Monitor) pruneMetricRange(fromTs, toTs int64) error {
+	return m.storeDB.Transaction(func(tx *gorm.DB) error {
+		for _, model := range []any{&MetricSample{}, &CapacityUserMinuteSample{}, &TokenSample{}} {
+			if err := tx.Where("bucket_ts >= ? AND bucket_ts < ?", fromTs, toTs).Delete(model).Error; err != nil {
+				return err
+			}
+		}
+		return nil
+	})
 }
 
 func (m *Monitor) pruneHoursOlderThan(cutoffTs int64) (int64, error) {
@@ -1680,34 +1874,87 @@ func (m *Monitor) pruneHoursOlderThan(cutoffTs int64) (int64, error) {
 
 // storeHourSeries 取小时级序列(长期趋势图用),按时间升序。
 func (m *Monitor) storeHourSeries(sinceTs int64) []HourPoint {
-	var pts []HourPoint
-	warnReadErr("storeHourSeries", m.storeDB.Raw(`SELECT hour_ts AS ts, success, anomaly, failed FROM hour_samples WHERE hour_ts >= ?`+currentHourTrafficFilter+` ORDER BY hour_ts`, sinceTs).Scan(&pts))
+	pts, err := m.storeHourSeriesRangeE(sinceTs, 0)
+	if err != nil {
+		slog.Warn("storeHourSeries 失败", "err", err)
+	}
 	return pts
 }
 
-// periodStat 取 [fromTs,toTs) 的小时级汇总统计(同比环比用)。
-func (m *Monitor) periodStat(fromTs, toTs int64) PeriodStat {
+func (m *Monitor) storeHourSeriesRangeE(sinceTs, untilTs int64) ([]HourPoint, error) {
+	var pts []HourPoint
+	q := `SELECT hour_ts AS ts, success, anomaly, failed FROM hour_samples WHERE hour_ts >= ?`
+	args := []any{sinceTs}
+	if untilTs > 0 {
+		q += ` AND hour_ts < ?`
+		args = append(args, untilTs)
+	}
+	q += currentHourTrafficFilter + ` ORDER BY hour_ts`
+	if err := m.storeDB.Raw(q, args...).Scan(&pts).Error; err != nil {
+		return nil, fmt.Errorf("读取小时趋势: %w", err)
+	}
+	if untilTs > sinceTs {
+		byHour := make(map[int64]HourPoint, len(pts))
+		for _, point := range pts {
+			byHour[point.Ts] = point
+		}
+		complete := make([]HourPoint, 0, (untilTs-sinceTs)/3600)
+		for ts := sinceTs; ts < untilTs; ts += 3600 {
+			point := byHour[ts]
+			point.Ts = ts
+			complete = append(complete, point)
+		}
+		pts = complete
+	}
+	return pts, nil
+}
+
+func (m *Monitor) periodStatE(fromTs, toTs int64) (PeriodStat, error) {
 	var r struct{ S, A, F, Q int64 }
-	warnReadErr("periodStat", m.storeDB.Raw(`SELECT COALESCE(SUM(success),0) s, COALESCE(SUM(anomaly),0) a, COALESCE(SUM(failed),0) f, COALESCE(SUM(quota),0) q
-		FROM hour_samples WHERE hour_ts >= ? AND hour_ts < ?`+currentHourTrafficFilter, fromTs, toTs).Scan(&r))
+	if err := m.storeDB.Raw(`SELECT COALESCE(SUM(success),0) s, COALESCE(SUM(anomaly),0) a, COALESCE(SUM(failed),0) f, COALESCE(SUM(quota),0) q
+		FROM hour_samples WHERE hour_ts >= ? AND hour_ts < ?`+currentHourTrafficFilter, fromTs, toTs).Scan(&r).Error; err != nil {
+		return PeriodStat{}, fmt.Errorf("读取对比区间: %w", err)
+	}
 	total := r.S + r.A + r.F
-	return PeriodStat{Total: total, Failed: r.F, SuccessRate: rate(r.S, total), CostUSD: float64(r.Q) / quotaPerUSD}
+	return PeriodStat{Total: total, Failed: r.F, SuccessRate: rate(r.S, total), CostUSD: float64(r.Q) / quotaPerUSD}, nil
+}
+
+func metricCompareRange(nowUnix int64) (from, end int64) {
+	const h = int64(3600)
+	end = metricFinalizeTarget(nowUnix) / h * h
+	return end - 192*h, end
 }
 
 // storeCompare 同比环比:近 24h vs 前 24h(环比) vs 上周同期(同比),取小时表(7 天前也有数据)。
 func (m *Monitor) storeCompare(nowUnix int64) CompareStat {
-	const h = int64(3600)
-	end := nowUnix / h * h // 对齐整点;小时表只含已完成的小时
-	return CompareStat{
-		Now:      m.periodStat(end-24*h, end),
-		Prev:     m.periodStat(end-48*h, end-24*h),
-		LastWeek: m.periodStat(end-192*h, end-168*h),
+	compare, err := m.storeCompareE(nowUnix)
+	if err != nil {
+		slog.Warn("storeCompare 失败", "err", err)
 	}
+	return compare
+}
+
+func (m *Monitor) storeCompareE(nowUnix int64) (CompareStat, error) {
+	const h = int64(3600)
+	_, end := metricCompareRange(nowUnix)
+	now, err := m.periodStatE(end-24*h, end)
+	if err != nil {
+		return CompareStat{}, err
+	}
+	prev, err := m.periodStatE(end-48*h, end-24*h)
+	if err != nil {
+		return CompareStat{}, err
+	}
+	lastWeek, err := m.periodStatE(end-192*h, end-168*h)
+	if err != nil {
+		return CompareStat{}, err
+	}
+	return CompareStat{Now: now, Prev: prev, LastWeek: lastWeek}, nil
 }
 
 func (m *Monitor) storeFreshness() (lastBucket int64) {
 	var v struct{ M int64 }
-	warnReadErr("storeFreshness", m.storeDB.Raw(`SELECT COALESCE(MAX(bucket_ts),0) AS m FROM metric_samples WHERE traffic_class_version = ?`, userTrafficClassificationVersion).Scan(&v))
+	warnReadErr("storeFreshness", m.storeDB.Raw(`SELECT COALESCE(MAX(bucket_ts),0) AS m FROM metric_samples WHERE traffic_class_version = ?`, stabilityTrafficClassificationVersion).Scan(&v))
 	return v.M
 }
 
@@ -1739,11 +1986,12 @@ func (m *Monitor) storeInfraLatest() []infraLatestRow {
 	defer m.infraAggregateMu.Unlock()
 
 	var rows []infraLatestRow
-	// 取每个 (resource,metric) 的最大 bucket_ts 对应行。
+	// 取每个 (resource,rtype,metric) 的最大 bucket_ts 对应行。rtype 必须
+	// 参与键，否则同名 AWS/Host 指标在相同时间可能产生不确定覆盖。
 	warnReadErr("storeInfraLatest", m.storeDB.Raw(`SELECT s.resource, s.rtype, s.metric, s.value, s.bucket_ts
 		FROM infra_samples s
-		JOIN (SELECT resource, metric, MAX(bucket_ts) AS mx FROM infra_samples GROUP BY resource, metric) t
-		  ON s.resource=t.resource AND s.metric=t.metric AND s.bucket_ts=t.mx`).Scan(&rows))
+		JOIN (SELECT resource, rtype, metric, MAX(bucket_ts) AS mx FROM infra_samples GROUP BY resource, rtype, metric) t
+		  ON s.resource=t.resource AND s.rtype=t.rtype AND s.metric=t.metric AND s.bucket_ts=t.mx`).Scan(&rows))
 	return rows
 }
 

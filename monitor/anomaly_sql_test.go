@@ -1,17 +1,23 @@
 package monitor
 
-import "strings"
-
-import "testing"
+import (
+	"context"
+	"errors"
+	"strings"
+	"testing"
+)
 
 // TestExpandAnomalyPredicates 守住三件事:
 //  1. 占位符全部被展开(SQL 里不留 {{}},否则打到生产库直接语法错);
 //  2. 列别名 anomaly_billed 等不被误伤(裸 ANOM 是它们的前缀);
-//  3. 判据用 completion_tokens 且排除天然无输出模型。
+//  3. 判据用 completion_tokens、请求路径和 quota，且排除天然无输出模型。
 func TestExpandAnomalyPredicates(t *testing.T) {
 	in := `SUM(type=2 AND {{ANOM}}) AS anomaly,
-SUM(type=2 AND {{ZERO}} AND prompt_tokens > 0) AS anomaly_billed,
-SUM(type=2 AND {{STREAMBAD}} AND NOT {{ZERO}}) AS anomaly_stream`
+SUM(type=2 AND {{ZERO}} AND quota > 0) AS anomaly_billed,
+SUM(type=2 AND {{STREAMBAD}} AND NOT {{ZERO}}) AS anomaly_stream,
+SUM(type=5 AND {{ERR4XX}}) AS err_4xx,
+SUM(type=5 AND {{ERR5XX}}) AS err_5xx,
+SUM(type=5 AND {{ERRTIMEOUT}}) AS err_timeout`
 	got := expandAnomalyPredicates(in)
 
 	if strings.Contains(got, "{{") || strings.Contains(got, "}}") {
@@ -29,8 +35,17 @@ SUM(type=2 AND {{STREAMBAD}} AND NOT {{ZERO}}) AS anomaly_stream`
 	if strings.Contains(got, "$.frt") {
 		t.Error("不得用 frt 判断是否交付")
 	}
-	if !strings.Contains(got, "embed|rerank") {
+	if !strings.Contains(got, "LOWER(COALESCE(model_name,'')) NOT LIKE '%embed%'") {
 		t.Error("必须排除天然无输出模型,否则 embedding 类会被整类误判成 B1")
+	}
+	if !strings.Contains(got, "$.request_path") || !strings.Contains(got, "/pg/chat/completions") {
+		t.Error("零输出异常必须以完整文本端点白名单为主判据")
+	}
+	if !strings.Contains(got, "quota > 0") || strings.Contains(got, "prompt_tokens > 0") {
+		t.Error("是否已扣费必须使用 quota，不能使用 prompt_tokens")
+	}
+	if !strings.Contains(got, "NOT (content REGEXP 'status_code=5') AND content REGEXP 'status_code=4'") {
+		t.Error("失败分类必须按 timeout > 5xx > 4xx 互斥")
 	}
 	// end_reason 必须走 JSON_EXTRACT:other 里的 end_error 自由文本可能含 panic 等词。
 	if !strings.Contains(got, "JSON_EXTRACT(other,'$.stream_status.end_reason')") {
@@ -61,6 +76,17 @@ func TestSampleWindowSQLPlaceholderCount(t *testing.T) {
 	if !strings.Contains(q, "type IN (2,5,6)") {
 		t.Error("来源聚合必须读取消费、错误和退款日志；退款只进入退款字段")
 	}
+	userQuery := sampleWindowUserSQL()
+	if n := strings.Count(userQuery, "?"); n != 2 {
+		t.Fatalf("用户分钟 SQL 应有 2 个区间参数，实际 %d 个", n)
+	}
+	if !strings.Contains(userQuery, "user_id, MAX(COALESCE(username,'')) AS username") ||
+		!strings.Contains(userQuery, "GROUP BY bucket, channel_id, model_name, grp, user_id") {
+		t.Error("单次来源扫描必须同时生成用户分钟事实，不能另起第二条全量聚合查询")
+	}
+	if strings.Contains(q, "MAX(COALESCE(username,''))") {
+		t.Error("容量规划关闭时必须保留低基数来源查询，不能产生用户维度额外开销")
+	}
 	if !strings.Contains(q, "type=6") || !strings.Contains(q, "refund_quota") || !strings.Contains(q, "refund_records") {
 		t.Error("退款日志必须独立聚合，不能混入成功/异常/失败请求数")
 	}
@@ -71,6 +97,19 @@ func TestSampleWindowSQLPlaceholderCount(t *testing.T) {
 		if !strings.Contains(q, marker) {
 			t.Errorf("用户流量 SQL 必须排除渠道测试标记 %q", marker)
 		}
+	}
+}
+
+func TestMergeMetricSamplePreservesOriginalAggregateSemantics(t *testing.T) {
+	dst := &MetricSample{BucketTs: 60, ChannelID: 9, ModelName: "m", Grp: "g", TrafficClassVersion: stabilityTrafficClassificationVersion}
+	mergeMetricSample(dst, MetricSample{Success: 2, Failed: 1, Tokens: 100, SumUseTime: 7, MaxUseTime: 7,
+		Err4xx: 1, Lat2: 2, CompletionTokens: 40, Ttft1k: 2, TtftMaxMs: 900})
+	mergeMetricSample(dst, MetricSample{Success: 3, Anomaly: 1, Tokens: 300, SumUseTime: 11, MaxUseTime: 9,
+		AnomalyBilled: 1, AnomalyQuota: 8, Lat5: 3, CompletionTokens: 70, Ttft2k: 3, TtftMaxMs: 1600})
+	if dst.Success != 5 || dst.Anomaly != 1 || dst.Failed != 1 || dst.Tokens != 400 || dst.SumUseTime != 18 ||
+		dst.MaxUseTime != 9 || dst.Err4xx != 1 || dst.AnomalyBilled != 1 || dst.AnomalyQuota != 8 ||
+		dst.Lat2 != 2 || dst.Lat5 != 3 || dst.CompletionTokens != 110 || dst.Ttft1k != 2 || dst.Ttft2k != 3 || dst.TtftMaxMs != 1600 {
+		t.Fatalf("按用户拆分后回聚合改变了原有 MetricSample 口径: %+v", dst)
 	}
 }
 
@@ -87,6 +126,138 @@ func TestSourceEpochStartupLookbackIsDurablyBounded(t *testing.T) {
 	}
 	if got := boundedSourceEpochStartupLookback(0, now, 0); got != 0 {
 		t.Fatalf("disabled startup catchup=%ds", got)
+	}
+}
+
+func TestMetricFinalizeCursorRetriesBothProjectionsWithoutSkipping(t *testing.T) {
+	path := t.TempDir() + "/metric-finalize.db"
+	m := &Monitor{cfg: Settings{SessionSecret: "metric-finalize-test"}, chNames: map[string]string{}}
+	if err := m.openStore(path); err != nil {
+		t.Fatal(err)
+	}
+	now := int64(2_000_000)
+	target := metricFinalizeTarget(now)
+	wantStart := (target - metricFinalizeInitialOverlapSec) / 60 * 60
+	metricCalls, tokenCalls := 0, 0
+	metric := func(_ context.Context, from, to int64) (int, error) {
+		metricCalls++
+		if metricCalls == 1 {
+			return 0, errors.New("temporary metric source failure")
+		}
+		if from != wantStart || to != wantStart+metricFinalizeSliceSec {
+			t.Fatalf("metric slice=[%d,%d) want=[%d,%d)", from, to, wantStart, wantStart+metricFinalizeSliceSec)
+		}
+		return 1, m.upsertSamples([]MetricSample{{
+			BucketTs: from, ChannelID: 7, ModelName: "late-model", Grp: "late-group", Success: 1,
+		}})
+	}
+	token := func(_ context.Context, from, to int64) error {
+		tokenCalls++
+		if tokenCalls == 1 {
+			return errors.New("temporary token source failure")
+		}
+		return m.upsertTokenSamples([]TokenSample{{BucketTs: from, TokenName: "late-token", Success: 1}})
+	}
+
+	if err := m.runMetricFinalizeTurnWith(context.Background(), now, metric, token); err == nil {
+		t.Fatal("metric failure unexpectedly succeeded")
+	}
+	var state MetricFinalizeState
+	if err := m.storeDB.First(&state, "id = ?", 1).Error; err != nil {
+		t.Fatal(err)
+	}
+	if state.NextTs != wantStart || state.Attempts != 1 || state.NextRetryAt <= now {
+		t.Fatalf("metric failure advanced or lost retry state: %+v", state)
+	}
+	if err := m.runMetricFinalizeTurnWith(context.Background(), state.NextRetryAt-1, metric, token); err != nil {
+		t.Fatal(err)
+	}
+	if metricCalls != 1 || tokenCalls != 0 {
+		t.Fatalf("backoff still contacted source: metric=%d token=%d", metricCalls, tokenCalls)
+	}
+
+	if err := m.runMetricFinalizeTurnWith(context.Background(), state.NextRetryAt, metric, token); err == nil {
+		t.Fatal("token failure unexpectedly succeeded")
+	}
+	if err := m.storeDB.First(&state, "id = ?", 1).Error; err != nil {
+		t.Fatal(err)
+	}
+	if state.NextTs != wantStart || state.Attempts != 2 {
+		t.Fatalf("partial metric write advanced cursor: %+v", state)
+	}
+	var partialMetric int64
+	if err := m.storeDB.Model(&MetricSample{}).Where("bucket_ts = ?", wantStart).Count(&partialMetric).Error; err != nil || partialMetric != 1 {
+		t.Fatalf("expected replayable partial metric write, count=%d err=%v", partialMetric, err)
+	}
+
+	if err := m.runMetricFinalizeTurnWith(context.Background(), state.NextRetryAt, metric, token); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.storeDB.First(&state, "id = ?", 1).Error; err != nil {
+		t.Fatal(err)
+	}
+	if state.NextTs != wantStart+metricFinalizeSliceSec || state.Attempts != 0 || state.LastSuccessAt == 0 {
+		t.Fatalf("successful dual projection did not advance exactly one slice: %+v", state)
+	}
+	var tokenRows int64
+	if err := m.storeDB.Model(&TokenSample{}).Where("bucket_ts = ?", wantStart).Count(&tokenRows).Error; err != nil || tokenRows != 1 {
+		t.Fatalf("token projection missing after commit, count=%d err=%v", tokenRows, err)
+	}
+
+	// A new Monitor instance must resume the persisted remainder instead of
+	// reinitializing at wall-clock time and skipping it.
+	m2 := &Monitor{cfg: Settings{SessionSecret: "metric-finalize-restart"}, chNames: map[string]string{}}
+	if err := m2.openStore(path); err != nil {
+		t.Fatal(err)
+	}
+	var resumedFrom int64
+	if err := m2.runMetricFinalizeTurnWith(context.Background(), now,
+		func(_ context.Context, from, _ int64) (int, error) { resumedFrom = from; return 0, nil },
+		func(context.Context, int64, int64) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if resumedFrom != wantStart+metricFinalizeSliceSec {
+		t.Fatalf("restart resumed at %d want %d", resumedFrom, wantStart+metricFinalizeSliceSec)
+	}
+}
+
+func TestMetricWindowCoverageFailsClosedAcrossSemanticsMigration(t *testing.T) {
+	m := newTestMonitor(t)
+	now := int64(2_000_000)
+	target := metricFinalizeTarget(now)
+	if err := m.storeDB.Create(&MetricSample{
+		BucketTs: target - 60, ChannelID: 1, ModelName: "legacy", Grp: "legacy",
+		Success: 1, TrafficClassVersion: stabilityTrafficClassificationVersion - 1,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	state, err := m.loadOrExtendMetricFinalizeState(now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantCoverageFrom := (target - metricMigrationLookbackSec) / 60 * 60
+	if state.CoverageFromTs != wantCoverageFrom || state.SemanticsVersion != stabilityTrafficClassificationVersion {
+		t.Fatalf("migration coverage state=%+v want_from=%d", state, wantCoverageFrom)
+	}
+	if complete, _, _ := m.metricWindowCoverage(now-6*3600, now); complete {
+		t.Fatal("partly migrated six-hour model window was presented as complete")
+	}
+	for _, minutes := range []int64{15, 30, 60} {
+		if complete, _, _ := m.metricWindowCoverage(target-minutes*60, now); complete {
+			t.Fatalf("partly migrated %d-minute model window was presented as complete", minutes)
+		}
+	}
+	if err := m.storeDB.Model(&MetricFinalizeState{}).Where("id = ?", state.ID).Updates(map[string]any{
+		"next_ts": target, "target_through_ts": target, "status": "caught_up",
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if complete, _, _ := m.metricWindowCoverage(now-6*3600, now); !complete {
+		t.Fatal("fully migrated six-hour model window remained unavailable")
+	}
+	compareFrom := now/3600*3600 - 192*3600
+	if complete, _, _ := m.metricWindowCoverage(compareFrom, now); complete {
+		t.Fatal("week-over-week comparison was enabled without historical v6 coverage")
 	}
 }
 

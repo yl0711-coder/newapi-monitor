@@ -77,7 +77,7 @@ func TestChannelManagementConfiguredGroupWithoutUsageStillIncludesFinance(t *tes
 
 func TestChannelManagementReportBypassesStaleBrowserCache(t *testing.T) {
 	js := string(channelManagementJS)
-	if !strings.Contains(js, `fetch('/channels/report?'+queryString(),{cache:'no-store'`) {
+	if !strings.Contains(js, `fetch('/channels/report?'+query,{cache:'no-store'`) {
 		t.Fatal("渠道报表请求必须绕过浏览器缓存")
 	}
 	if !strings.Contains(js, `fetch('/channels/upstream?domain='+encodeURIComponent(domain.domain),{cache:'no-store'`) {
@@ -202,7 +202,7 @@ func TestChannelManagementRangeUsesLast24CompletedHours(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantTo := time.Date(2026, 8, 12, 16, 0, 0, 0, cstLocation)
+	wantTo := time.Date(2026, 8, 12, 15, 0, 0, 0, cstLocation)
 	wantFrom := wantTo.Add(-24 * time.Hour)
 	if scope.FromTs != wantFrom.Unix() || scope.ToTs != wantTo.Unix() || scope.RangeHours != 24 {
 		t.Fatalf("range=[%v,%v], want [%v,%v]", time.Unix(scope.FromTs, 0), time.Unix(scope.ToTs, 0), wantFrom, wantTo)
@@ -259,8 +259,7 @@ func TestChannelManagementUpstreamSpendMetricKeepsAmountReadable(t *testing.T) {
 		`<small>上游当前余额</small>`,
 		`domain.upstream?.balance_usd`,
 		`cm-domain-metric-note`,
-		`小时日志`,
-		`补全中`,
+		`window.channelDataStatus.note(cm.report)`,
 		`.cm-domain-upstream-spend{padding-left:18px`,
 		`.cm-domain-metrics{grid-column:2/4;grid-row:2`,
 		`.cm-domain-requests,.cm-domain-tokens{display:none}`,
@@ -289,9 +288,7 @@ func TestChannelManagementShowsRawAndRechargeAdjustedUpstreamSpend(t *testing.T)
 		`upstreamUsage.adjusted_cost_available`,
 		`upstreamUsage.adjusted_cost_usd`,
 		`upstreamUsage.recharge_ratio`,
-		`upstreamUsage.adjusted_cost_status==='bucket_boundary_ambiguous'`,
 		`按历史充值比例版本修正`,
-		`缺少对应时段的充值比例版本`,
 		`上游修正消费汇总`,
 		`.cm-domain-upstream-adjusted b{color:`,
 	} {
@@ -299,8 +296,8 @@ func TestChannelManagementShowsRawAndRechargeAdjustedUpstreamSpend(t *testing.T)
 			t.Fatalf("上游修正消费缺少 %q", marker)
 		}
 	}
-	if !strings.Contains(js, `adjustedUsageDomains=upstreamUsageDomains.filter`) {
-		t.Fatal("汇总只能累加可按历史充值比例精确修正的账户")
+	if !strings.Contains(js, `adjustedUsageDomains=trustedUsageDomains.filter`) {
+		t.Fatal("汇总只能累加已通过完整性校验且可按历史充值比例精确修正的账户")
 	}
 }
 
@@ -309,7 +306,7 @@ func TestChannelManagementOmitsGroupShareColumn(t *testing.T) {
 	if strings.Contains(js, "本组占比") || strings.Contains(js, "metricCell(usage,group.usage)") {
 		t.Fatal("渠道明细不应重复展示本组占比列")
 	}
-	for _, marker := range []string{"请求数</span><span>Tokens</span><span>用户侧消费</span>", `${usd(usage.cost_usd)}</span>`} {
+	for _, marker := range []string{"请求数</span><span>Tokens</span><span>用户侧消费</span>", `${usageMetric(usage.cost_usd,usd)}</span>`} {
 		if !strings.Contains(js, marker) {
 			t.Fatalf("删除本组占比后缺少原有渠道指标 %q", marker)
 		}
@@ -322,20 +319,24 @@ func TestChannelManagementSummarizesUpstreamFinanceWithoutGroupDoubleCounting(t 
 	for _, marker := range []string{
 		`const upstreamConfiguredAccounts=domains.filter(domain=>domain.upstream?.configured)`,
 		`const upstreamAccounts=upstreamConfiguredAccounts.filter(domain=>domain.upstream?.usage_sync_enabled)`,
-		`upstreamAggregateLabel(upstreamUsageDomains,'cost_usd',upstreamUsageMixed)`,
+		`upstreamAggregateLabel(trustedUsageDomains,'cost_usd')`,
 		`upstreamBalanceDomains.reduce((sum,domain)=>sum+Number(domain.upstream.balance_usd),0)`,
 		`区间上游消费汇总`,
 		`上游当前余额汇总`,
-		`个账户账单完整`,
-		`部分数据`,
-		`小时账单与自然日账单分列，不合并`,
-		`当前渠道/分组筛选下不作比较`,
+		`const trustedUsageDomains=upstreamUsageDomains.filter`,
+		`upstreamAccountComparable?upstreamSpendValue:'—'`,
+		`upstreamAccountComparable?adjustedUpstreamSpendValue:'—'`,
+		`上游账户金额不按渠道/分组拆分`,
 		`.cm-kpis article.upstream b{color:`,
 		`.cm-kpis article.balance b{color:`,
 	} {
 		if !strings.Contains(js, marker) && !strings.Contains(css, marker) {
 			t.Fatalf("渠道财务汇总缺少 %q", marker)
 		}
+	}
+	if strings.Contains(js, `小时 ${hourly.length?usd(sum(hourly)):'—'} / 自然日`) ||
+		strings.Contains(js, `小时账单与自然日账单分列，不合并`) {
+		t.Fatal("顶部汇总每栏必须只展示一个统一金额")
 	}
 	if strings.Contains(js, `domain.vendors.flatMap`) && strings.Contains(js, `upstreamSpend=channels.reduce`) {
 		t.Fatal("上游消费汇总不应从渠道或分组明细反向求和")
@@ -531,6 +532,81 @@ func TestChannelManagementUpstreamUsageUsesLocalHourlyRowsOnly(t *testing.T) {
 	}
 }
 
+func TestChannelManagementUpstreamUsageFailsClosedOnOverlappingBuckets(t *testing.T) {
+	m := newStabilityTestMonitor(t)
+	from := time.Date(2026, 8, 8, 0, 0, 0, 0, cstLocation).Unix()
+	to := from + 24*3600
+	if err := m.storeDB.Create(&[]ChannelUpstreamUsageHour{
+		{Domain: "mixed.example", HourTs: from, BucketSeconds: 24 * 3600, Requests: 100, CostUSD: 10, Provider: upstreamProviderAICodeWith},
+		{Domain: "mixed.example", HourTs: from + 3600, BucketSeconds: 3600, Requests: 5, CostUSD: 2, Provider: upstreamProviderAICodeWith},
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	accounts := map[string]ChannelUpstreamAccountView{"mixed.example": {
+		Configured: true, Provider: upstreamProviderAICodeWith, UsageSyncEnabled: true,
+	}}
+	usage, err := m.loadChannelUpstreamUsage(context.Background(), stabilityScope{FromTs: from, ToTs: to}, to, accounts, channelFinanceSnapshot{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := usage["mixed.example"]
+	if !got.Available || got.IntegrityStatus != upstreamUsageIntegrityOverlap || got.Complete || got.CostUSD != 0 || got.Requests != 0 || got.AdjustedCostAvailable {
+		t.Fatalf("overlapping financial buckets must fail closed: %+v", got)
+	}
+}
+
+func TestChannelManagementUpstreamUsageIntegrityFailureIsIsolatedPerAccount(t *testing.T) {
+	m := newStabilityTestMonitor(t)
+	from := time.Date(2026, 8, 8, 0, 0, 0, 0, cstLocation).Unix()
+	to := from + 3600
+	if err := m.storeDB.Create(&[]ChannelUpstreamUsageHour{
+		{Domain: "invalid.example", HourTs: from, BucketSeconds: 3600, Requests: 10, CostUSD: -1, Provider: upstreamProviderAICodeWith},
+		{Domain: "healthy.example", HourTs: from, BucketSeconds: 3600, Requests: 20, CostUSD: 2, Provider: upstreamProviderNewAPI},
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	accounts := map[string]ChannelUpstreamAccountView{
+		"invalid.example": {Configured: true, Provider: upstreamProviderAICodeWith, UsageSyncEnabled: true},
+		"healthy.example": {Configured: true, Provider: upstreamProviderNewAPI, UsageSyncEnabled: true},
+	}
+	usage, err := m.loadChannelUpstreamUsage(context.Background(), stabilityScope{FromTs: from, ToTs: to}, to, accounts, channelFinanceSnapshot{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	invalid := usage["invalid.example"]
+	if !invalid.Available || invalid.IntegrityStatus != upstreamUsageIntegrityInvalidAmount || invalid.CostUSD != 0 || invalid.Complete {
+		t.Fatalf("invalid account must fail closed: %+v", invalid)
+	}
+	healthy := usage["healthy.example"]
+	if !healthy.Available || healthy.IntegrityStatus != upstreamUsageIntegrityComplete || healthy.CostUSD != 2 || healthy.Requests != 20 || !healthy.Complete {
+		t.Fatalf("healthy account must remain independently usable: %+v", healthy)
+	}
+}
+
+func TestChannelManagementUpstreamUsageRejectsInconsistentUnitEvidence(t *testing.T) {
+	m := newStabilityTestMonitor(t)
+	from := time.Date(2026, 8, 8, 0, 0, 0, 0, cstLocation).Unix()
+	to := from + 3600
+	row := ChannelUpstreamUsageHour{
+		Domain: "unit.example", HourTs: from, BucketSeconds: 3600, Requests: 10,
+		Quota: 1000000, CostUSD: 0, UnitPerUSD: 500000, Provider: upstreamProviderNewAPI,
+	}
+	if err := m.storeDB.Create(&row).Error; err != nil {
+		t.Fatal(err)
+	}
+	accounts := map[string]ChannelUpstreamAccountView{"unit.example": {
+		Configured: true, Provider: upstreamProviderNewAPI, UsageSyncEnabled: true,
+	}}
+	usage, err := m.loadChannelUpstreamUsage(context.Background(), stabilityScope{FromTs: from, ToTs: to}, to, accounts, channelFinanceSnapshot{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := usage["unit.example"]
+	if !got.Available || got.IntegrityStatus != upstreamUsageIntegrityInvalidAmount || got.CostUSD != 0 || got.Requests != 0 || got.Complete {
+		t.Fatalf("quota/cost/unit mismatch must fail closed: %+v", got)
+	}
+}
+
 func TestAdjustedUpstreamUsageCostUsesRechargePaidOverCredit(t *testing.T) {
 	tests := []struct {
 		name       string
@@ -638,7 +714,7 @@ func TestChannelManagementAICodeWithUsageKeepsNaturalDayGranularity(t *testing.T
 		t.Fatal(err)
 	}
 	got = usage["aicodewith.com"]
-	if got.Complete || got.Requests != 3 || math.Abs(got.CostUSD-2.3) > 1e-9 {
+	if got.Complete || got.Requests != 0 || got.CostUSD != 0 || got.IntegrityStatus != upstreamUsageIntegrityWindowMismatch {
 		t.Fatalf("partial-day range was reported as a complete daily bill: %+v", got)
 	}
 }
@@ -663,8 +739,8 @@ func TestChannelManagementAICodeWithLivePartialDayIsVisible(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := usage["aicodewith.com"]
-	if !got.Available || got.Complete || got.Granularity != "day" || got.Requests != 13475 || math.Abs(got.CostUSD-275.2466) > 1e-9 {
-		t.Fatalf("live natural-day partial bucket=%+v", got)
+	if !got.Available || got.Complete || got.Granularity != "day" || got.IntegrityStatus != upstreamUsageIntegrityWindowMismatch || got.Requests != 0 || got.CostUSD != 0 {
+		t.Fatalf("live natural-day bucket beyond the common cutoff must fail closed: %+v", got)
 	}
 
 	// The exception is strictly for the live current day. The same bucket must
@@ -674,8 +750,9 @@ func TestChannelManagementAICodeWithLivePartialDayIsVisible(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(usage) != 0 {
-		t.Fatalf("historical partial day must stay excluded: %+v", usage)
+	got = usage["aicodewith.com"]
+	if got.CostUSD != 0 || got.Requests != 0 || got.IntegrityStatus != upstreamUsageIntegrityWindowMismatch {
+		t.Fatalf("historical partial day must stay excluded with an explicit boundary reason: %+v", usage)
 	}
 }
 
@@ -825,7 +902,7 @@ func TestChannelManagementShowsOnlyUserRequestsAndHidesInternalChannelTests(t *t
 	}
 	report, err := m.buildChannelManagementReport(context.Background(), stabilityScope{
 		FromTs: hour, ToTs: hour + 3600,
-	}, hour+3600)
+	}, hour+7200)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -865,7 +942,7 @@ func TestChannelManagementRejectsLegacyMixedTrafficUntilReclassified(t *testing.
 	}
 	report, err := m.buildChannelManagementReport(context.Background(), stabilityScope{
 		FromTs: hour, ToTs: hour + 3600,
-	}, hour+3600)
+	}, hour+7200)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -884,7 +961,7 @@ func TestChannelManagementReportRejectsPartialDimensionResult(t *testing.T) {
 	if err := m.storeDB.CreateInBatches(rows, 200).Error; err != nil {
 		t.Fatal(err)
 	}
-	if _, err := m.buildChannelManagementReport(context.Background(), stabilityScope{FromTs: day, ToTs: day + 3600}, day+3600); err == nil {
+	if _, err := m.buildChannelManagementReport(context.Background(), stabilityScope{FromTs: day, ToTs: day + 3600}, day+7200); err == nil {
 		t.Fatal("维度超限时应拒绝返回部分结果")
 	}
 }
@@ -936,7 +1013,7 @@ func TestChannelManagementReportSyncsRenameAndKeepsDeletedSnapshot(t *testing.T)
 	}).Error; err != nil {
 		t.Fatal(err)
 	}
-	report, err := m.buildChannelManagementReport(context.Background(), stabilityScope{FromTs: day, ToTs: day + 86400}, day+3600)
+	report, err := m.buildChannelManagementReport(context.Background(), stabilityScope{FromTs: day, ToTs: day + 86400}, day+7200)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -975,5 +1052,36 @@ func TestChannelManagementStatusRankEnabledBeforeDisabledAndHistory(t *testing.T
 		if got := channelManagementStatusRank(&tc.channel); got != tc.want {
 			t.Fatalf("status rank(%+v)=%d want %d", tc.channel, got, tc.want)
 		}
+	}
+}
+
+func TestManagementRateConfigIncludesAutoDisabledChannels(t *testing.T) {
+	rate := ChannelFinanceChannelCost{ChannelID: 10, Grp: "codex", UpstreamGroupName: "gpt-codex", Multiplier: 1, DiscountFactor: 1}
+	autoRate := rate
+	autoRate.ChannelID = 11
+	finance := channelFinanceSnapshot{
+		channelCanonicalCost: map[int]ChannelFinanceChannelCost{10: rate, 11: autoRate},
+		channelCostConflict:  map[int]bool{},
+	}
+	domain := &channelDomainBuild{Domain: "example.com", Vendors: map[string]*channelVendorBuild{
+		"OpenAI": {Channels: []*channelManagementBuild{
+			{ID: 10, Current: true, Status: 1},
+			{ID: 11, Current: true, Status: 3},
+			{ID: 12, Current: true, Status: 2},
+			{ID: 13, Current: false, Status: 1},
+		}},
+	}}
+
+	view := managementRateConfig(domain, finance)
+	if view.EnabledChannels != 1 || view.ManagedChannels != 2 || view.ConfiguredChannels != 2 || !view.Complete {
+		t.Fatalf("auto-disabled channel was not governed: %+v", view)
+	}
+	delete(finance.channelCanonicalCost, 11)
+	view = managementRateConfig(domain, finance)
+	if view.ConfiguredChannels != 1 || view.Complete {
+		t.Fatalf("missing auto-disabled rate was hidden: %+v", view)
+	}
+	if !strings.Contains(string(channelManagementJS), `rates.managed_channels`) || !strings.Contains(string(channelManagementJS), `在用渠道倍率`) {
+		t.Fatal("前端未使用在用渠道口径")
 	}
 }

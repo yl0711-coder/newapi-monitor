@@ -122,6 +122,13 @@ func validateNginxSettings(s Settings) error {
 		}
 		seen[node] = struct{}{}
 	}
+	expectedSeen := map[string]bool{}
+	for _, node := range s.NginxExpectedNodes {
+		if _, ok := seen[node]; !ok || expectedSeen[node] {
+			return fmt.Errorf("MONITOR_NGINX_EXPECTED_NODES 必须是不重复的允许节点子集")
+		}
+		expectedSeen[node] = true
+	}
 	if s.NginxSourceV2Enabled {
 		if len(s.NginxSourceV2AllowedNodes) == 0 {
 			return fmt.Errorf("启用 Nginx source v2 时必须显式配置逐节点白名单")
@@ -827,17 +834,18 @@ const nginxAggregateColumns = `COALESCE(SUM(count),0) requests,
 	COALESCE(SUM(latency_over60s),0) latency_over60s`
 
 func (m *Monitor) nginxSources(ctx context.Context, now int64) []NginxEdgeSource {
-	if len(m.cfg.NginxAllowedNodes) == 0 {
+	nodes := m.nginxExpectedNodes()
+	if len(nodes) == 0 {
 		return nil
 	}
 	var states []NginxSourceState
-	warnReadErr("nginx source states", m.storeDB.WithContext(ctx).Where("node IN ?", m.cfg.NginxAllowedNodes).Order("node").Find(&states))
+	warnReadErr("nginx source states", m.storeDB.WithContext(ctx).Where("node IN ?", nodes).Order("node").Find(&states))
 	byNode := make(map[string]NginxSourceState, len(states))
 	for _, state := range states {
 		byNode[state.Node] = state
 	}
-	out := make([]NginxEdgeSource, 0, len(m.cfg.NginxAllowedNodes))
-	for _, node := range m.cfg.NginxAllowedNodes {
+	out := make([]NginxEdgeSource, 0, len(nodes))
+	for _, node := range nodes {
 		state, exists := byNode[node]
 		if !exists {
 			out = append(out, NginxEdgeSource{Node: node, AgeSec: -1, EventAgeSec: -1, Status: "bad", HealthReasons: []string{"source_missing"}})

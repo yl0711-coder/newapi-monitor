@@ -1004,20 +1004,16 @@ func TestLogChainAnomalyUnknownKindFailsClosed(t *testing.T) {
 	}
 }
 
-// TestLogChainDoesNotAlterStabilityPredicates 排障页不得改动 expandAnomalyPredicates。
-// 那套服务稳定性报表，**故意排除 client_gone**（客户断连不算我方故障，
-// 否则客户关标签页会拉低渠道评分）。改它会让历史稳定性数据的判定标准变化，
-// 属破坏既有功能。排障页用自己的组合，两者目标不同。
+// TestLogChainDoesNotAlterStabilityPredicates 稳定性与排障页共用一份
+// fail-safe 交付异常口径：明确排除正常结束和 client_gone，未知的
+// 非空结束原因则不得被静默当作成功。
 func TestLogChainDoesNotAlterStabilityPredicates(t *testing.T) {
 	got := expandAnomalyPredicates("SUM({{STREAMBAD}}) AS s")
-	if strings.Contains(got, "client_gone") {
-		t.Error("稳定性口径不得包含 client_gone：客户断连不是我方故障")
+	if !strings.Contains(got, "NOT IN ('','eof','done','client_gone')") {
+		t.Errorf("稳定性口径未明确排除正常/客户断连结束: %s", got)
 	}
-	// 反向确认它仍在用枚举法（与排障页的排除法不同，这是有意的差异）。
-	for _, want := range []string{"'timeout'", "'scanner_error'", "'panic'", "'ping_fail'"} {
-		if !strings.Contains(got, want) {
-			t.Errorf("稳定性口径缺少 %s，既有判定被改动了: %s", want, got)
-		}
+	if !strings.Contains(got, "error_count") || !strings.Contains(got, "> 0") {
+		t.Errorf("稳定性口径遗漏显式流式错误计数: %s", got)
 	}
 }
 

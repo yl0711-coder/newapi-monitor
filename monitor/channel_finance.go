@@ -383,13 +383,16 @@ func (m *Monitor) loadChannelFinanceSnapshot(ctx context.Context) (channelFinanc
 		}
 	}
 	var versions []ChannelFinanceVersion
-	if tx := m.storeDB.WithContext(ctx).Order("domain ASC, version DESC").Find(&versions); tx.Error != nil {
+	// 追加式版本表会永久增长；管理页只需要每个域名当前版本，不能每分钟
+	// 把全部历史载入 Go 内存后再丢弃。聚合子查询在 SQLite 内先收敛到 N 个域名。
+	if tx := m.storeDB.WithContext(ctx).Raw(`SELECT v.* FROM channel_finance_versions v
+		JOIN (SELECT domain, MAX(version) AS version FROM channel_finance_versions GROUP BY domain) latest
+		  ON latest.domain = v.domain AND latest.version = v.version
+		ORDER BY v.domain ASC`).Scan(&versions); tx.Error != nil {
 		return s, fmt.Errorf("读取渠道倍率版本: %w", tx.Error)
 	}
 	for _, version := range versions {
-		if _, exists := s.domainVersions[version.Domain]; !exists {
-			s.domainVersions[version.Domain] = version
-		}
+		s.domainVersions[version.Domain] = version
 	}
 	return s, nil
 }
@@ -846,7 +849,7 @@ func (m *Monitor) allowedChannelFinanceGroups(ctx context.Context, domain string
 	if tx := m.storeDB.WithContext(ctx).Raw(`SELECT DISTINCT s.grp FROM stability_hour_samples s
 		JOIN channel_snaps c ON c.id=s.channel_id
 		WHERE c.base_domain=? AND s.grp<>'' AND s.traffic_class_version=? LIMIT ?`,
-		domain, userTrafficClassificationVersion, maxChannelFinanceGroups+1).Scan(&history); tx.Error != nil {
+		domain, stabilityTrafficClassificationVersion, maxChannelFinanceGroups+1).Scan(&history); tx.Error != nil {
 		return nil, fmt.Errorf("核对历史服务分组: %w", tx.Error)
 	}
 	if len(history) > maxChannelFinanceGroups {

@@ -369,6 +369,7 @@ func TestUpstreamUsageFailureRetryPolicy(t *testing.T) {
 		{name: "first timeout", err: context.DeadlineExceeded, failures: 1, want: 2 * time.Minute},
 		{name: "second timeout", err: context.DeadlineExceeded, failures: 2, want: 5 * time.Minute},
 		{name: "connection refused", err: errors.New("dial tcp: connection refused"), failures: 1, want: 2 * time.Minute},
+		{name: "moving upstream page", err: errors.New("NewAPI 使用日志扫描期间 total 变化（334 -> 335）"), failures: 1, want: 2 * time.Minute},
 		{name: "sqlite busy", err: errors.New("database is locked"), failures: 1, want: 10 * time.Second},
 		{name: "sqlite busy repeated", err: errors.New("SQLITE_BUSY"), failures: 3, want: time.Minute},
 		{name: "rate limit default", err: &upstreamHTTPError{Status: http.StatusTooManyRequests}, failures: 1, want: upstreamRetryAfterDefault},
@@ -393,6 +394,26 @@ func TestAICodeWithTailKeepsThirtyMinuteMinimum(t *testing.T) {
 	}
 	if aicode < now+30*60 || aicode > now+30*60+45 {
 		t.Fatalf("AICodeWith next sync outside 30-minute window: %d", aicode-now)
+	}
+}
+
+func TestNewAPITailIncrementalModeRequiresStaleOrObservedDenseAccount(t *testing.T) {
+	now := int64(1_800_000_000)
+	if newAPITailNeedsIncrementalSync(ChannelUpstreamAccount{Provider: upstreamProviderNewAPI}, now) {
+		t.Fatal("new low-volume account must keep the one-window request path")
+	}
+	if !newAPITailNeedsIncrementalSync(ChannelUpstreamAccount{
+		Provider: upstreamProviderNewAPI, UsageDataUntil: now - int64(upstreamUsageTailOverlap/time.Second) - 1,
+	}, now) {
+		t.Fatal("stale watermark must use forward-first hourly recovery")
+	}
+	if !newAPITailNeedsIncrementalSync(ChannelUpstreamAccount{
+		Provider: upstreamProviderNewAPI, UsageDataUntil: now - 60, UsageTailMode: upstreamUsageTailModeHourly,
+	}, now) {
+		t.Fatal("learned dense account lost its durable hourly strategy")
+	}
+	if !upstreamUsageRunBudgetWasExhausted(&upstreamUsageRunBudgetExhausted{max: upstreamUsageMaxRequestsPerRun}) {
+		t.Fatal("request-budget exhaustion was not recognized")
 	}
 }
 
@@ -824,10 +845,10 @@ func TestFetchAICodeWithUsageWindowValidatesSummaryAndKeepsZeroDays(t *testing.T
 		t.Fatalf("unexpected AICodeWith result: %+v", result)
 	}
 	first, second := result.Hours[0], result.Hours[1]
-	if first.HourTs != from || first.BucketSeconds != 86400 || first.Requests != 11 || first.Tokens != 12852 || math.Abs(first.CostUSD-2.7168) > 1e-12 {
+	if first.UnitPerUSD != 1 || first.HourTs != from || first.BucketSeconds != 86400 || first.Requests != 11 || first.Tokens != 12852 || math.Abs(first.CostUSD-2.7168) > 1e-12 {
 		t.Fatalf("first day=%+v", first)
 	}
-	if second.HourTs != from+86400 || second.BucketSeconds != 86400 || second.Requests != 0 || second.Tokens != 0 || second.CostUSD != 0 {
+	if second.UnitPerUSD != 1 || second.HourTs != from+86400 || second.BucketSeconds != 86400 || second.Requests != 0 || second.Tokens != 0 || second.CostUSD != 0 {
 		t.Fatalf("zero-consumption day was not represented explicitly: %+v", second)
 	}
 }
@@ -952,6 +973,11 @@ func TestSyncStoredAICodeWithUsagePersistsTailAndHistoryAtomically(t *testing.T)
 	if len(buckets) != 2 || buckets[0].HourTs != today-86400 || buckets[0].BucketSeconds != 86400 || buckets[0].Requests != 3 || buckets[0].CostUSD != 3 ||
 		buckets[1].HourTs != today || buckets[1].BucketSeconds <= 0 || buckets[1].BucketSeconds > 86400 || buckets[1].Requests != 3 || buckets[1].CostUSD != 3 {
 		t.Fatalf("tail/history buckets=%+v", buckets)
+	}
+	for _, bucket := range buckets {
+		if bucket.UnitPerUSD != 1 || bucket.Quota != bucket.CostUSD {
+			t.Fatalf("daily fetch/stage/publish lost conversion evidence: %+v", bucket)
+		}
 	}
 }
 
@@ -1201,6 +1227,23 @@ func TestAICodeWithTailPublishesFrozenRoundWatermark(t *testing.T) {
 	}
 	if row.UsageDataUntil != firstNow {
 		t.Fatalf("published watermark=%d want frozen window=%d (scheduler now=%d)", row.UsageDataUntil, firstNow, secondNow)
+	}
+	// Reuse the same deterministic multi-key fixture for a history round
+	// completed after midnight. The caller must not skip the newly closed day.
+	firstNow = time.Date(2026, 8, 20, 23, 55, 0, 0, cstLocation).Unix()
+	closedTo := cstDayStart(firstNow)
+	row.UsageBackfillCursor = closedTo - 86400
+	if err := m.syncStoredAICodeWithUsage(context.Background(), &row, normalized, firstNow, upstreamUsageLaneHistory); err != nil {
+		t.Fatal(err)
+	}
+	if row.UsageBackfillCursor != closedTo-86400 {
+		t.Fatal("incomplete multi-key history must not advance its cursor")
+	}
+	if err := m.syncStoredAICodeWithUsage(context.Background(), &row, normalized, firstNow+600, upstreamUsageLaneHistory); err != nil {
+		t.Fatal(err)
+	}
+	if row.UsageBackfillCursor != closedTo || row.UsageBackfillDone {
+		t.Fatalf("midnight must preserve the frozen history window: cursor=%d done=%v", row.UsageBackfillCursor, row.UsageBackfillDone)
 	}
 }
 

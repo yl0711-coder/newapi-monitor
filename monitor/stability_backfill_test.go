@@ -36,6 +36,46 @@ func TestStabilityHourSQLUsesBoundedHalfOpenRangeAndSuccessOnlyUsage(t *testing.
 	}
 }
 
+func TestStabilityClassificationUsesPathQuotaAndExclusiveFailureBuckets(t *testing.T) {
+	m := newStabilityTestMonitor(t)
+	m.prodDB = newFakeProdDB(t)
+	m.usageDayExpr = usageDayExprSQLite
+	base := time.Date(2026, 9, 5, 10, 0, 0, 0, cstLocation).Unix()
+	rows := []struct {
+		id, typ, quota, prompt, completion int64
+		content, other                     string
+	}{
+		{1, 2, 0, 20, 0, "free zero output", `{"request_path":"/v1/chat/completions"}`},
+		{2, 2, 100, 0, 0, "billed zero output", `{"request_path":"/pg/chat/completions"}`},
+		{3, 2, 100, 10, 0, "image success", `{"request_path":"/v1/images/generations"}`},
+		{4, 5, 0, 0, 0, "status_code=400 wrapper; upstream status_code=503", `{}`},
+		{5, 5, 0, 0, 0, "status_code=503 request timeout", `{}`},
+	}
+	for _, row := range rows {
+		if _, err := m.prodDB.Exec(`INSERT INTO logs
+			(id,user_id,channel_id,created_at,type,model_name,quota,prompt_tokens,completion_tokens,use_time,`+"`group`"+`,token_id,token_name,content,other,request_id)
+			VALUES (?,2,9,?,?,?,?,?,?,1,'g',1,'customer',?,?,?)`,
+			row.id, base+row.id, row.typ, "classification-test", row.quota, row.prompt, row.completion,
+			row.content, row.other, "r"+strconv.FormatInt(row.id, 10)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := m.fetchStabilityHour(context.Background(), base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Users) != 1 {
+		t.Fatalf("unexpected classified rows: %+v", got.Users)
+	}
+	s := got.Users[0]
+	if s.Success != 1 || s.Anomaly != 2 || s.Failed != 2 || s.AnomalyBilled != 1 || s.AnomalyFree != 1 || s.AnomalyQuota != 100 {
+		t.Fatalf("delivery classification mismatch: %+v", s)
+	}
+	if s.Err4xx != 0 || s.Err5xx != 1 || s.ErrTimeout != 1 || s.ErrOther != 0 {
+		t.Fatalf("failure classes overlap or use wrong priority: %+v", s)
+	}
+}
+
 func TestStabilityRangeSQLHasHourBucketHardCapControlAndServerTimeout(t *testing.T) {
 	q := stabilityRangeSQL()
 	control := stabilityRangeControlSQL()
@@ -363,7 +403,7 @@ func TestReplaceStabilityHourSeparatesUserTrafficAndInternalTestCost(t *testing.
 	if err := m.storeDB.Raw(`SELECT COALESCE(SUM(success+anomaly+failed),0) requests,
 		COALESCE(SUM(tokens),0) tokens,COALESCE(SUM(quota),0) quota
 		FROM stability_hour_samples WHERE hour_ts=? AND traffic_class_version=?`,
-		hour, userTrafficClassificationVersion).Scan(&userTotal).Error; err != nil {
+		hour, stabilityTrafficClassificationVersion).Scan(&userTotal).Error; err != nil {
 		t.Fatal(err)
 	}
 	if err := m.storeDB.Raw(`SELECT COALESCE(SUM(requests),0) requests,
@@ -381,7 +421,7 @@ func TestReplaceStabilityHourSeparatesUserTrafficAndInternalTestCost(t *testing.
 	if err := m.storeDB.First(&state, "hour_ts=?", hour).Error; err != nil {
 		t.Fatal(err)
 	}
-	if state.Requests != 9 || state.InternalTestRequests != 6 || state.TrafficClassVersion != userTrafficClassificationVersion {
+	if state.Requests != 9 || state.InternalTestRequests != 6 || state.TrafficClassVersion != stabilityTrafficClassificationVersion {
 		t.Fatalf("小时控制台账未分别核验两类流量: %+v", state)
 	}
 }
@@ -413,6 +453,58 @@ func TestReplaceStabilityHourIsAtomicIdempotentAndMarksZeroTrafficComplete(t *te
 	}
 	if state.Status != "complete" || state.Rows != 0 || state.Requests != 0 {
 		t.Fatalf("零流量小时也必须有完整性凭证: %+v", state)
+	}
+}
+
+func TestReplaceStabilityHourRejectsContradictoryZeroTraffic(t *testing.T) {
+	m := newStabilityTestMonitor(t)
+	hour := time.Date(2026, 9, 4, 3, 0, 0, 0, time.UTC).Unix()
+	if err := m.storeDB.Create(&MetricSample{
+		BucketTs: hour + 60, ChannelID: 7, ModelName: "gpt", Grp: "codex", Success: 3,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	previous := StabilityHourSample{HourTs: hour, ChannelID: 7, ModelName: "gpt", Grp: "codex", Success: 3}
+	if err := m.storeDB.Create(&previous).Error; err != nil {
+		t.Fatal(err)
+	}
+	err := m.replaceStabilityHour(hour, nil, StabilityHourIngestState{JobID: "source-cutover"})
+	if !errors.Is(err, errStabilityZeroContradiction) {
+		t.Fatalf("positive minute facts must reject a signed zero source hour: %v", err)
+	}
+	var count int64
+	if err := m.storeDB.Model(&StabilityHourSample{}).Where("hour_ts = ?", hour).Count(&count).Error; err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("contradictory replacement must roll back existing facts, rows=%d", count)
+	}
+}
+
+func TestStabilityCoverageAndRepairMapRejectContradictoryZeroTraffic(t *testing.T) {
+	m := newStabilityTestMonitor(t)
+	from := time.Date(2026, 9, 4, 0, 0, 0, 0, time.UTC).Unix()
+	if err := m.storeDB.Create(&[]StabilityHourIngestState{
+		{HourTs: from, Status: "complete", Requests: 0},
+		{HourTs: from + 3600, Status: "complete", Requests: 0},
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := m.storeDB.Create(&MetricSample{
+		BucketTs: from + 60, ChannelID: 9, ModelName: "gpt", Grp: "codex", Success: 2,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	cov := m.stabilityDataCoverage(context.Background(), from, from+2*3600, from+4*3600)
+	if cov.CompletedHours != 1 || cov.MissingHours != 1 || cov.Complete {
+		t.Fatalf("contradictory signed zero must be a visible coverage gap: %+v", cov)
+	}
+	complete, err := m.completeStabilityHours(from, from+2*3600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if complete[from] || !complete[from+3600] {
+		t.Fatalf("automatic repair map did not isolate the contradictory hour: %+v", complete)
 	}
 }
 

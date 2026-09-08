@@ -317,7 +317,7 @@ func (h *handler) totals(since int64) map[string]agg {
 const enabledChanFilter = ` AND NOT EXISTS (SELECT 1 FROM channel_snaps c ` +
 	`WHERE c.id = metric_samples.channel_id AND (c.status <> 1 OR metric_samples.bucket_ts < c.enabled_since))`
 
-var currentUserTrafficFilter = fmt.Sprintf(` AND metric_samples.traffic_class_version = %d`, trafficclass.Current)
+var currentUserTrafficFilter = fmt.Sprintf(` AND metric_samples.traffic_class_version = %d`, trafficclass.DeliveryCurrent)
 
 type seriesPt struct {
 	Ts   int64

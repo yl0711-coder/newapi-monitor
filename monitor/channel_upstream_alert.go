@@ -81,7 +81,7 @@ func (m *Monitor) loadUpstreamBurnEstimates(ctx context.Context, now int64, poli
 		estimates[domain] = upstreamBurnEstimate{ExpectedHours: expectedSeconds / 3600}
 	}
 	var rows []ChannelUpstreamUsageHour
-	if err := m.storeDB.WithContext(ctx).Raw(`SELECT domain,hour_ts,bucket_seconds,requests,tokens,quota,cost_usd,fetched_at,provider
+	if err := m.storeDB.WithContext(ctx).Raw(`SELECT domain,hour_ts,bucket_seconds,requests,tokens,quota,cost_usd,fetched_at,provider,provisional
 		FROM channel_upstream_usage_hours
 		WHERE hour_ts>=? AND hour_ts+(CASE WHEN bucket_seconds>0 THEN bucket_seconds ELSE 3600 END)<=?
 		ORDER BY domain ASC,hour_ts ASC`, from, to).Scan(&rows).Error; err != nil {
@@ -98,7 +98,7 @@ func (m *Monitor) loadUpstreamBurnEstimates(ctx context.Context, now int64, poli
 	byDomain := make(map[string]*accumulator, len(accounts))
 	for _, row := range rows {
 		account, ok := accounts[row.Domain]
-		if !ok || row.Provider != account.Provider {
+		if !ok || row.Provider != account.Provider || row.Provisional {
 			continue
 		}
 		seconds := row.BucketSeconds

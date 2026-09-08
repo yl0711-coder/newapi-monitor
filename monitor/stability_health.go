@@ -78,7 +78,7 @@ func (m *Monitor) stabilityHealth(ctx context.Context, nowTime time.Time) stabil
 		result.Status = "degraded"
 	}
 	var liveCursor StabilityProblemLiveCursor
-	if err := m.storeDB.WithContext(ctx).First(&liveCursor, "id = ? AND traffic_class_version = ?", 1, userTrafficClassificationVersion).Error; err == nil {
+	if err := m.storeDB.WithContext(ctx).First(&liveCursor, "id = ? AND traffic_class_version = ?", 1, stabilityTrafficClassificationVersion).Error; err == nil {
 		result.ProblemCoverageTo = liveCursor.NextTs
 		result.ProblemLiveTargetTo = liveCursor.TargetThroughTs
 		result.ProblemLiveStatus = liveCursor.Status
@@ -118,7 +118,7 @@ func (m *Monitor) stabilityHealth(ctx context.Context, nowTime time.Time) stabil
 	var pending int64
 	if tx := m.storeDB.WithContext(ctx).Model(&StabilityProblemIngestState{}).
 		Where("bucket_ts >= ? AND bucket_ts < ? AND complete = ? AND traffic_class_version = ?",
-			problemLiveFrom, problemTargetTo, false, userTrafficClassificationVersion).Count(&pending); tx.Error == nil {
+			problemLiveFrom, problemTargetTo, false, stabilityTrafficClassificationVersion).Count(&pending); tx.Error == nil {
 		result.ProblemPendingMinutes = pending
 	} else {
 		result.Status = "degraded"
@@ -180,7 +180,7 @@ func (m *Monitor) stabilityHealth(ctx context.Context, nowTime time.Time) stabil
 				result.NginxRecentDataLossSources++
 			}
 		}
-		if len(sources) != len(m.cfg.NginxAllowedNodes) || result.NginxUnhealthySources > 0 {
+		if len(sources) != len(m.nginxExpectedNodes()) || result.NginxUnhealthySources > 0 {
 			result.Status = "degraded"
 		}
 	}
@@ -192,7 +192,7 @@ func (m *Monitor) stabilityHealth(ctx context.Context, nowTime time.Time) stabil
 				result.NginxErrorUnhealthySources++
 			}
 		}
-		if len(errorSources) != len(m.cfg.NginxAllowedNodes) || result.NginxErrorUnhealthySources > 0 {
+		if len(errorSources) != len(m.nginxExpectedNodes()) || result.NginxErrorUnhealthySources > 0 {
 			result.Status = "degraded"
 		}
 	}

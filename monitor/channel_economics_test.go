@@ -75,11 +75,11 @@ func TestChannelEconomicsPublishesImmutableRevisionsAndCorrectedProfit(t *testin
 	if err := db.Create(&ChannelSnap{ID: 59, BaseDomain: account.Domain}).Error; err != nil {
 		t.Fatal(err)
 	}
-	local := StabilityHourSample{HourTs: hour, ChannelID: 59, ModelName: "gpt-5.5", Grp: "codex-1.2x", TrafficClassVersion: userTrafficClassificationVersion, Success: 10, Quota: 1_000_000, RefundRecords: 1, RefundQuota: 100_000}
+	local := StabilityHourSample{HourTs: hour, ChannelID: 59, ModelName: "gpt-5.5", Grp: "codex-1.2x", TrafficClassVersion: stabilityTrafficClassificationVersion, Success: 10, Quota: 1_000_000, RefundRecords: 1, RefundQuota: 100_000}
 	if err := db.Create(&local).Error; err != nil {
 		t.Fatal(err)
 	}
-	if err := db.Create(&StabilityHourIngestState{HourTs: hour, Status: "complete", TrafficClassVersion: userTrafficClassificationVersion}).Error; err != nil {
+	if err := db.Create(&StabilityHourIngestState{HourTs: hour, Status: "complete", TrafficClassVersion: stabilityTrafficClassificationVersion}).Error; err != nil {
 		t.Fatal(err)
 	}
 	snapshot, err := json.Marshal(channelFinanceVersionSnapshot{Domain: account.Domain, UpstreamRechargePaid: 1, UpstreamRechargeCredit: 10})

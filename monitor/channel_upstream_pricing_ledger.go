@@ -849,6 +849,31 @@ func pricingSyncIntervalSeconds(s Settings) int64 {
 	return int64(minutes * 60)
 }
 
+// pricingLedgerSyncStateStale is a presentation-only health check. A pricing
+// account is stale only after work became due and the global single-worker
+// scheduler had a generous chance to visit every selected account. Historical
+// backfill itself is not an error while its next run is still in the future.
+func pricingLedgerSyncStateStale(state ChannelUpstreamPricingSyncState, now int64, selectedAccounts int) bool {
+	if now <= 0 || state.LastAttemptAt <= 0 || state.Status == upstreamStatusError || state.Status == upstreamStatusDisabled {
+		return false
+	}
+	due := state.TailNextSyncAt == 0 || state.TailNextSyncAt <= now
+	if !state.BackfillDone && (state.BackfillNextSyncAt == 0 || state.BackfillNextSyncAt <= now) {
+		due = true
+	}
+	if !due {
+		return false
+	}
+	if selectedAccounts < 1 {
+		selectedAccounts = 1
+	}
+	grace := int64(15 * 60)
+	if schedulerGrace := int64(selectedAccounts * 2 * 60); schedulerGrace > grace {
+		grace = schedulerGrace
+	}
+	return now-state.LastAttemptAt > grace
+}
+
 func pricingLedgerDomainAllowed(domains []string, domain string) bool {
 	domain = strings.ToLower(strings.TrimSpace(domain))
 	for _, configured := range domains {
@@ -1789,14 +1814,22 @@ func (m *Monitor) syncDueUpstreamPricing(ctx context.Context) {
 		return
 	}
 	candidates = sortUpstreamPricingDueAccounts(candidates)
-	syncCtx, cancel := context.WithTimeout(ctx, upstreamPricingOperationTimeout(m.cfg))
-	_, syncErr := m.syncStoredUpstreamPricing(syncCtx, candidates[0].Domain)
-	cancel()
-	if syncErr != nil {
-		// 影子账本故障只记录自身状态，绝不能污染既有消费汇总健康。
-		slog.Warn("上游计价账本同步失败", "domain", candidates[0].Domain, "err", sanitizeUpstreamError(syncErr))
+	// 每轮仍只实际访问一个上游，保持全局单并发和原有请求频率；但某个
+	// 账户正被余额/消费日志占用时只视为调度让行，继续尝试下一候选，不能
+	// 让一个热门账户浪费整轮倍率账本调度并长期饿死其他账户。
+	for _, candidate := range candidates {
+		syncCtx, cancel := context.WithTimeout(ctx, upstreamPricingOperationTimeout(m.cfg))
+		_, syncErr := m.syncStoredUpstreamPricing(syncCtx, candidate.Domain)
+		cancel()
+		if errors.Is(syncErr, errUpstreamAccountBusy) {
+			continue
+		}
+		if syncErr != nil {
+			// 影子账本故障只记录自身状态，绝不能污染既有消费汇总健康。
+			slog.Warn("上游计价账本同步失败", "domain", candidate.Domain, "err", sanitizeUpstreamError(syncErr))
+		}
+		return
 	}
-	// 首期保持全局单并发，但按到期时间和最近尝试排序，不让固定域名占满每一轮。
 }
 
 func (m *Monitor) syncStoredUpstreamPricing(ctx context.Context, domain string) (ChannelUpstreamPricingSyncState, error) {
@@ -1843,11 +1876,15 @@ type upstreamPricingDueAccount struct {
 
 func sortUpstreamPricingDueAccounts(accounts []upstreamPricingDueAccount) []upstreamPricingDueAccount {
 	sort.Slice(accounts, func(i, j int) bool {
-		if accounts[i].NextDueAt != accounts[j].NextDueAt {
-			return accounts[i].NextDueAt < accounts[j].NextDueAt
-		}
 		if accounts[i].LastAttemptAt != accounts[j].LastAttemptAt {
 			return accounts[i].LastAttemptAt < accounts[j].LastAttemptAt
+		}
+		// Every candidate is already due. Prefer the least recently attempted
+		// account before comparing its oldest sub-queue timestamp; otherwise one
+		// domain with a large historical cost-recovery backlog can remain "more
+		// overdue" forever and starve every other pricing account.
+		if accounts[i].NextDueAt != accounts[j].NextDueAt {
+			return accounts[i].NextDueAt < accounts[j].NextDueAt
 		}
 		return accounts[i].Domain < accounts[j].Domain
 	})

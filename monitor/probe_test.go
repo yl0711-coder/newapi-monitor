@@ -1,9 +1,36 @@
 package monitor
 
 import (
+	"math"
 	"net/http"
 	"testing"
 )
+
+func TestLockRequiresHTTPResponseEvidence(t *testing.T) {
+	for name, metrics := range map[string]map[string]float64{
+		"missing": {}, "flag only": {"locked": 1}, "unreachable": {"status_code": 0},
+		"invalid": {"status_code": 999}, "NaN": {"status_code": math.NaN()},
+		"fractional": {"status_code": 403.5},
+	} {
+		t.Run(name, func(t *testing.T) {
+			got := buildLock("test-origin", metrics, 10)
+			if got.Status != "nosample" || got.Locked || got.HTTPCode != 0 {
+				t.Fatalf("invalid response must remain unknown: %+v", got)
+			}
+		})
+	}
+	if got := buildLock("test-origin", map[string]float64{"status_code": 200, "locked": 1}, 10); got.Status != "bad" || got.Locked {
+		t.Fatalf("HTTP evidence must take precedence over a conflicting flag: %+v", got)
+	}
+	overview := buildOverview(InfraSnapshot{Locks: []LockResource{
+		buildLock("blocked", map[string]float64{"status_code": 403}, 10),
+		buildLock("unexpected", map[string]float64{"status_code": 500}, 10),
+		buildLock("unknown", nil, -1),
+	}})
+	if overview.LocksTotal != 3 || overview.LocksOK != 1 || overview.LocksBad != 1 || overview.LocksUnknown != 1 {
+		t.Fatalf("unknown locks must not count as failed locks: %+v", overview)
+	}
+}
 
 // probe_test.go:端到端探活的定级、域名解析、以及探活行进快照(总览/Probes)的聚合测试。
 
@@ -135,6 +162,7 @@ func TestProbeViaDrift(t *testing.T) {
 
 func TestLockSnapshot(t *testing.T) {
 	m := newTestMonitor(t)
+	m.cfg.OriginLockTargets = "172.26.0.20:80,172.26.10.97:80"
 	const bucket = 1_700_000_000 / 60 * 60
 	rows := []InfraSample{
 		// 源站 A:403 锁生效
@@ -192,6 +220,8 @@ func TestInfraOverviewWorstBubbles(t *testing.T) {
 	rows := []InfraSample{
 		{BucketTs: bucket, Resource: "Node-A", RType: "instance", Metric: "cpu", Value: 5},
 		{BucketTs: bucket, Resource: "Node-A", RType: "instance", Metric: "status_failed", Value: 0},
+		{BucketTs: bucket, Resource: "Node-A", RType: "instance", Metric: "mem_avail_mb", Value: 1024},
+		{BucketTs: bucket, Resource: "Node-A", RType: "instance", Metric: "disk_used_pct", Value: 20},
 		{BucketTs: bucket, Resource: "w.example", RType: "probe", Metric: "reachable", Value: 1},
 		{BucketTs: bucket, Resource: "w.example", RType: "probe", Metric: "status_code", Value: 200},
 		{BucketTs: bucket, Resource: "w.example", RType: "probe", Metric: "latency_ms", Value: 900},

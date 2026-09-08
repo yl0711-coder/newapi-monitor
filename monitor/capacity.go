@@ -22,6 +22,7 @@ const capacityQueryTimeout = 5 * time.Second
 const capacityEmptyDimensionFilter = "\x00capacity-empty"
 
 type capacitySource struct {
+	CoverageComplete    *bool  `json:"coverage_complete,omitempty"`
 	Available           bool   `json:"available"`
 	Configured          bool   `json:"configured"`
 	Watermark           int64  `json:"watermark"`
@@ -80,8 +81,8 @@ type capacityBreakdown struct {
 	Requests         int64    `json:"requests"`
 	RejectedRequests int64    `json:"rejected_requests"`
 	Tokens           int64    `json:"tokens"`
-	AverageRPM       float64  `json:"average_rpm"`
-	AverageTPM       float64  `json:"average_tpm"`
+	AverageRPM       *float64 `json:"average_rpm"`
+	AverageTPM       *float64 `json:"average_tpm"`
 	StabilityPct     *float64 `json:"stability_pct"`
 	StabilityScope   string   `json:"stability_scope"`
 }
@@ -160,6 +161,15 @@ type capacityDimensionRow struct {
 	Tokens    int64
 }
 
+type capacityUserDimensionRow struct {
+	UserID   int64  `gorm:"column:user_id"`
+	Username string `gorm:"column:username"`
+	Success  int64
+	Anomaly  int64
+	Failed   int64
+	Tokens   int64
+}
+
 type capacityRejectionRow struct {
 	Ts    int64 `gorm:"column:ts"`
 	Count int64
@@ -199,13 +209,19 @@ type capacityInfraRow struct {
 }
 
 func capacityBucketSeconds(hours int) int64 {
+	return capacityBucketSecondsForRange(int64(hours) * 3600)
+}
+
+func capacityBucketSecondsForRange(seconds int64) int64 {
 	switch {
-	case hours <= 6:
+	case seconds <= 6*3600:
 		return 60
-	case hours <= 24:
+	case seconds <= 24*3600:
 		return 300
+	case seconds <= 72*3600:
+		return 600
 	default:
-		return 900
+		return 1800
 	}
 }
 
@@ -272,6 +288,45 @@ func capacityActualChannelID(channelID int) int {
 	return channelID
 }
 
+func capacityActualUserID(userID int64) int64 {
+	if userID == -1 {
+		return 0
+	}
+	return userID
+}
+
+func capacityQueryRange(c *gin.Context, now int64, retentionDays int) (int64, int64, int64, error) {
+	currentMinute := now / 60 * 60
+	fromRaw, toRaw := strings.TrimSpace(c.Query("from")), strings.TrimSpace(c.Query("to"))
+	if fromRaw == "" && toRaw == "" {
+		hours := capacityHours(c.Query("hours"))
+		from := currentMinute - int64(hours)*3600
+		return from, currentMinute, capacityBucketSeconds(hours), nil
+	}
+	if fromRaw == "" || toRaw == "" {
+		return 0, 0, 0, fmt.Errorf("from 和 to 必须同时提供")
+	}
+	from, err := strconv.ParseInt(fromRaw, 10, 64)
+	if err != nil || from <= 0 || from%60 != 0 {
+		return 0, 0, 0, fmt.Errorf("from 必须是按分钟对齐的 Unix 秒")
+	}
+	to, err := strconv.ParseInt(toRaw, 10, 64)
+	if err != nil || to <= from || to%60 != 0 {
+		return 0, 0, 0, fmt.Errorf("to 必须晚于 from 且按分钟对齐")
+	}
+	if to > currentMinute {
+		return 0, 0, 0, fmt.Errorf("to 不能包含尚未闭合的当前分钟")
+	}
+	if retentionDays <= 0 {
+		retentionDays = 7
+	}
+	maxRange := int64(retentionDays) * 86400
+	if to-from > maxRange || from < currentMinute-maxRange {
+		return 0, 0, 0, fmt.Errorf("时间区间必须位于最近 %d 天分钟事实留存内", retentionDays)
+	}
+	return from, to, capacityBucketSecondsForRange(to - from), nil
+}
+
 func (m *Monitor) serveCapacityReport(c *gin.Context) {
 	if !m.cfg.CapacityEnabled {
 		c.JSON(http.StatusOK, gin.H{"enabled": false})
@@ -282,7 +337,12 @@ func (m *Monitor) serveCapacityReport(c *gin.Context) {
 		return
 	}
 
-	hours := capacityHours(c.Query("hours"))
+	now := time.Now().Unix()
+	from, to, bucket, rangeErr := capacityQueryRange(c, now, m.cfg.RetentionDays)
+	if rangeErr != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"enabled": true, "error": rangeErr.Error()})
+		return
+	}
 	channelID := 0
 	if raw := strings.TrimSpace(c.Query("channel")); raw != "" {
 		parsed, err := strconv.Atoi(raw)
@@ -293,6 +353,18 @@ func (m *Monitor) serveCapacityReport(c *gin.Context) {
 		channelID = parsed
 		if parsed == 0 {
 			channelID = -1 // -1 是内部筛选哨兵，真实查询值仍为 channel_id=0。
+		}
+	}
+	userID := int64(0)
+	if raw := strings.TrimSpace(c.Query("user")); raw != "" {
+		parsed, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil || parsed < 0 {
+			c.JSON(http.StatusBadRequest, gin.H{"enabled": true, "error": "user 必须是非负整数"})
+			return
+		}
+		userID = parsed
+		if parsed == 0 {
+			userID = -1
 		}
 	}
 	groupRaw, modelRaw := strings.TrimSpace(c.Query("group")), strings.TrimSpace(c.Query("model"))
@@ -306,14 +378,9 @@ func (m *Monitor) serveCapacityReport(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"enabled": true, "error": "model 筛选值无效"})
 		return
 	}
-	now := time.Now().Unix()
-	to := now / 60 * 60 // 当前分钟还在写入，永不进报表。
-	from := to - int64(hours)*3600
-	bucket := capacityBucketSeconds(hours)
-
 	ctx, cancel := context.WithTimeout(c.Request.Context(), capacityQueryTimeout)
 	defer cancel()
-	report, err := m.buildCapacityReport(ctx, from, to, bucket, channelID, group, model, now)
+	report, err := m.buildCapacityReportFiltered(ctx, from, to, bucket, channelID, userID, group, model, now)
 	if err != nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"enabled": true, "error": "本地容量事实暂时无法读取"})
 		return
@@ -322,23 +389,36 @@ func (m *Monitor) serveCapacityReport(c *gin.Context) {
 }
 
 func (m *Monitor) buildCapacityReport(ctx context.Context, from, to, bucket int64, channelID int, group, model string, now int64) (capacityReport, error) {
+	return m.buildCapacityReportFiltered(ctx, from, to, bucket, channelID, 0, group, model, now)
+}
+
+func (m *Monitor) buildCapacityReportFiltered(ctx context.Context, from, to, bucket int64, channelID int, userID int64, group, model string, now int64) (capacityReport, error) {
 	report := capacityReport{Enabled: true, Breakdowns: map[string][]capacityBreakdown{}, Options: map[string][]capacityOption{},
 		Economics: capacityEconomics{Available: false, Note: "待上游成本与利润模块完成后，再评估当前及扩容成本覆盖。"}}
 	report.Meta = capacityMeta{FromTs: from, ToTs: to, BucketSeconds: bucket, GeneratedAt: now,
-		Filters: map[string]any{"channel": capacityActualChannelID(channelID), "group": capacityRawDimensionValue(group), "model": capacityRawDimensionValue(model)}, Sources: map[string]capacitySource{}}
+		Filters: map[string]any{"channel": capacityActualChannelID(channelID), "user": capacityActualUserID(userID), "group": capacityRawDimensionValue(group), "model": capacityRawDimensionValue(model)}, Sources: map[string]capacitySource{}}
 
-	minuteRows, dimRows, metricSource, err := m.readCapacityMetrics(ctx, from, to, channelID, group, model, now)
+	minuteRows, dimRows, metricSource, err := m.readCapacityMetricsFiltered(ctx, from, to, channelID, userID, group, model, now)
 	if err != nil {
 		return report, err // 业务分钟事实是本页唯一必需源。
 	}
 	report.Meta.Sources["business_log"] = metricSource
 
-	rejections, rejectionSource := m.readCapacityRejections(ctx, from, to, channelID, group, model, now)
+	rejections, rejectionSource := m.readCapacityRejectionsFiltered(ctx, from, to, channelID, userID, group, model, now)
 	report.Meta.Sources["pre_route_rejection"] = rejectionSource
 
 	report.Series, report.Summary = aggregateCapacitySeries(minuteRows, rejections, from, to, bucket)
+	report.Series = capacitySeriesWithGaps(report.Series, from, to, bucket)
+	if userID != 0 {
+		// 用户分钟事实故意不复制延迟直方图；不能把缺失的用户级延迟伪装成 0。
+		report.Summary.PeakConcurrency = nil
+		for i := range report.Series {
+			report.Series[i].EstimatedConcurrency = nil
+			report.Series[i].P95Seconds = nil
+		}
+	}
 	var rejectionDims []capacityRejectionDimensionRow
-	rejectionsIncluded := channelID == 0 && rejectionSource.Available
+	rejectionsIncluded := channelID == 0 && userID == 0 && rejectionSource.Available
 	if rejectionsIncluded {
 		dimensionsAvailable := true
 		rejectionSource.DimensionsAvailable = &dimensionsAvailable
@@ -354,6 +434,31 @@ func (m *Monitor) buildCapacityReport(ctx context.Context, from, to, bucket int6
 		}
 	}
 	report.Breakdowns, report.Options = m.capacityBreakdowns(dimRows, rejectionDims, to-from, channelID, group, model, rejectionsIncluded)
+	userBreakdowns, userOptions, userErr := m.capacityUserBreakdowns(ctx, from, to, channelID, group, model)
+	if userErr == nil {
+		if userID != 0 {
+			selected := strconv.FormatInt(capacityActualUserID(userID), 10)
+			filtered := make([]capacityBreakdown, 0, 1)
+			for _, row := range userBreakdowns {
+				if row.Key == selected {
+					filtered = append(filtered, row)
+					break
+				}
+			}
+			userBreakdowns = filtered
+		}
+		report.Breakdowns["users"] = userBreakdowns
+		report.Options["users"] = userOptions
+	}
+	complete := metricSource.CoverageComplete != nil && *metricSource.CoverageComplete
+	userComplete := complete && m.capacityWindowComplete(ctx, from, to, true)
+	for kind, rows := range report.Breakdowns {
+		if !complete || (kind == "users" && !userComplete) || (kind != "users" && rejectionsIncluded) {
+			for i := range rows {
+				rows[i].AverageRPM, rows[i].AverageTPM = nil, nil
+			}
+		}
+	}
 
 	ingress, ingressSource := m.readCapacityIngress(ctx, from, to, bucket, now)
 	report.Ingress = ingress
@@ -365,21 +470,31 @@ func (m *Monitor) buildCapacityReport(ctx context.Context, from, to, bucket int6
 	if m.InfraEnabled() {
 		snap := m.computeInfraSnapshot(now)
 		report.Components = append(report.Components, snap.Instances...)
-		if snap.Database != nil {
+		if len(snap.Databases) > 0 {
+			report.Components = append(report.Components, snap.Databases...)
+		} else if snap.Database != nil {
 			report.Components = append(report.Components, *snap.Database)
 		}
-		if snap.LB != nil {
+		if len(snap.LoadBalancers) > 0 {
+			report.Components = append(report.Components, snap.LoadBalancers...)
+		} else if snap.LB != nil {
 			report.Components = append(report.Components, *snap.LB)
 		}
 	}
 	return report, nil
 }
 
-func (m *Monitor) readCapacityMetrics(ctx context.Context, from, to int64, channelID int, group, model string, now int64) ([]capacityMinuteRow, []capacityDimensionRow, capacitySource, error) {
+func (m *Monitor) readCapacityMetricsFiltered(ctx context.Context, from, to int64, channelID int, userID int64, group, model string, now int64) ([]capacityMinuteRow, []capacityDimensionRow, capacitySource, error) {
 	baseWhere := "bucket_ts >= ? AND bucket_ts < ? AND traffic_class_version = ?"
-	baseArgs := []any{from, to, userTrafficClassificationVersion}
+	baseArgs := []any{from, to, stabilityTrafficClassificationVersion}
 	where := baseWhere
 	args := append([]any{}, baseArgs...)
+	table := "metric_samples"
+	if userID != 0 {
+		table = "capacity_user_minute_samples"
+		where += " AND user_id = ?"
+		args = append(args, capacityActualUserID(userID))
+	}
 	if channelID > 0 {
 		channelID = capacityActualChannelID(channelID)
 		where += " AND channel_id = ?"
@@ -396,19 +511,43 @@ func (m *Monitor) readCapacityMetrics(ctx context.Context, from, to int64, chann
 		args = append(args, capacityRawDimensionValue(model))
 	}
 	var rows []capacityMinuteRow
-	minuteSQL := `SELECT bucket_ts ts, SUM(success) success, SUM(anomaly) anomaly, SUM(failed) failed,
-		SUM(tokens) tokens, SUM(sum_use_time) sum_use_time,
+	minuteColumns := `SUM(tokens) tokens, SUM(sum_use_time) sum_use_time,
 		SUM(lat_1) lat_1, SUM(lat_2) lat_2, SUM(lat_5) lat_5, SUM(lat_10) lat_10,
-		SUM(lat_30) lat_30, SUM(lat_60) lat_60, SUM(lat_inf) lat_inf
-		FROM metric_samples WHERE ` + where + ` GROUP BY bucket_ts ORDER BY bucket_ts`
+		SUM(lat_30) lat_30, SUM(lat_60) lat_60, SUM(lat_inf) lat_inf`
+	if userID != 0 {
+		minuteColumns = `SUM(tokens) tokens, 0 sum_use_time, 0 lat_1, 0 lat_2, 0 lat_5,
+			0 lat_10, 0 lat_30, 0 lat_60, 0 lat_inf`
+	}
+	minuteSQL := `SELECT bucket_ts ts, SUM(success) success, SUM(anomaly) anomaly, SUM(failed) failed, ` +
+		minuteColumns + ` FROM ` + table + ` WHERE ` + where + ` GROUP BY bucket_ts ORDER BY bucket_ts`
 	if err := m.storeDB.WithContext(ctx).Raw(minuteSQL, args...).Scan(&rows).Error; err != nil {
 		return nil, nil, capacitySource{}, err
 	}
+	complete := m.capacityWindowComplete(ctx, from, to, userID != 0)
+	// 只有已定稿的完整区间才能补零；零散的其他用户请求不是覆盖证据。
+	if complete {
+		byMinute := make(map[int64]capacityMinuteRow, len(rows))
+		for _, row := range rows {
+			byMinute[row.Ts] = row
+		}
+		rows = rows[:0]
+		for ts := from; ts < to; ts += 60 {
+			row := byMinute[ts]
+			row.Ts = ts
+			rows = append(rows, row)
+		}
+	}
 	var dims []capacityDimensionRow
+	dimWhere := baseWhere
+	dimArgs := append([]any{}, baseArgs...)
+	if userID != 0 {
+		dimWhere += " AND user_id = ?"
+		dimArgs = append(dimArgs, capacityActualUserID(userID))
+	}
 	dimSQL := `SELECT channel_id, model_name, grp, SUM(success) success, SUM(anomaly) anomaly,
-		SUM(failed) failed, SUM(tokens) tokens FROM metric_samples WHERE ` + baseWhere + `
+		SUM(failed) failed, SUM(tokens) tokens FROM ` + table + ` WHERE ` + dimWhere + `
 		GROUP BY channel_id, model_name, grp`
-	if err := m.storeDB.WithContext(ctx).Raw(dimSQL, baseArgs...).Scan(&dims).Error; err != nil {
+	if err := m.storeDB.WithContext(ctx).Raw(dimSQL, dimArgs...).Scan(&dims).Error; err != nil {
 		return nil, nil, capacitySource{}, err
 	}
 	var filteredWatermark int64
@@ -416,14 +555,65 @@ func (m *Monitor) readCapacityMetrics(ctx context.Context, from, to int64, chann
 		filteredWatermark = rows[len(rows)-1].Ts
 	}
 	var globalWatermark int64
-	if err := m.storeDB.WithContext(ctx).Raw(`SELECT COALESCE(MAX(bucket_ts),0) FROM metric_samples
-		WHERE traffic_class_version = ? AND bucket_ts < ?`, userTrafficClassificationVersion, to).Scan(&globalWatermark).Error; err != nil {
+	if err := m.storeDB.WithContext(ctx).Raw(`SELECT COALESCE(MAX(bucket_ts),0) FROM `+table+`
+		WHERE traffic_class_version = ? AND bucket_ts < ?`, stabilityTrafficClassificationVersion, to).Scan(&globalWatermark).Error; err != nil {
 		return nil, nil, capacitySource{}, err
 	}
-	source := capacitySource{Available: globalWatermark > 0, Configured: true, Watermark: globalWatermark,
+	note := "分钟事实为已观测结果；最新采集时间不代表区间完整。缺口不补零，完整性不足时不发布区间平均值。"
+	if userID != 0 {
+		note += " 用户筛选使用独立分钟事实；前置拒绝和延迟直方图没有可信用户维度，不参与该筛选。"
+	}
+	source := capacitySource{Available: len(rows) > 0 || complete, CoverageComplete: &complete, Configured: true, Watermark: globalWatermark,
 		AgeSec: capacityAge(now, globalWatermark), FilteredWatermark: filteredWatermark, FilteredAgeSec: capacityAge(now, filteredWatermark), Rows: int64(len(rows)),
-		Note: "Rows 为当前筛选的已观测分钟数；已排除渠道内部测试，空闲分钟不伪造为采样数据。"}
+		Note: note}
 	return rows, dims, source, nil
+}
+
+func (m *Monitor) capacityUserBreakdowns(ctx context.Context, from, to int64, channelID int, group, model string) ([]capacityBreakdown, []capacityOption, error) {
+	where := "bucket_ts >= ? AND bucket_ts < ? AND traffic_class_version = ?"
+	args := []any{from, to, stabilityTrafficClassificationVersion}
+	if channelID != 0 {
+		where += " AND channel_id = ?"
+		args = append(args, capacityActualChannelID(channelID))
+	}
+	if group != "" {
+		where += " AND grp = ?"
+		args = append(args, capacityRawDimensionValue(group))
+	}
+	if model != "" {
+		where += " AND model_name = ?"
+		args = append(args, capacityRawDimensionValue(model))
+	}
+	var rows []capacityUserDimensionRow
+	if err := m.storeDB.WithContext(ctx).Raw(`SELECT user_id, MAX(username) username,
+		SUM(success) success, SUM(anomaly) anomaly, SUM(failed) failed, SUM(tokens) tokens
+		FROM capacity_user_minute_samples WHERE `+where+` GROUP BY user_id ORDER BY SUM(success+anomaly+failed) DESC`, args...).Scan(&rows).Error; err != nil {
+		return nil, nil, err
+	}
+	mins := math.Max(1, float64(to-from)/60)
+	breakdowns := make([]capacityBreakdown, 0, min(20, len(rows)))
+	options := make([]capacityOption, 0, len(rows))
+	for _, row := range rows {
+		key := strconv.FormatInt(row.UserID, 10)
+		label := fmt.Sprintf("#%d", row.UserID)
+		if strings.TrimSpace(row.Username) != "" {
+			label += " " + row.Username
+		} else {
+			label += " 未识别用户"
+		}
+		logged := row.Success + row.Anomaly + row.Failed
+		item := capacityBreakdown{Key: key, Label: label, Requests: logged, Tokens: row.Tokens,
+			AverageRPM: capacityFloatPtr(float64(logged) / mins), AverageTPM: capacityFloatPtr(float64(row.Tokens) / mins), StabilityScope: "routed_log_only"}
+		if logged > 0 {
+			item.StabilityPct = capacityFloatPtr(float64(row.Success) * 100 / float64(logged))
+		}
+		if len(breakdowns) < 20 {
+			breakdowns = append(breakdowns, item)
+		}
+		options = append(options, capacityOption{Key: key, Label: label})
+	}
+	sort.Slice(options, func(i, j int) bool { return options[i].Label < options[j].Label })
+	return breakdowns, options, nil
 }
 
 func (m *Monitor) readCapacityRejectionDimensions(ctx context.Context, from, to int64) ([]capacityRejectionDimensionRow, error) {
@@ -433,8 +623,11 @@ func (m *Monitor) readCapacityRejectionDimensions(ctx context.Context, from, to 
 	return rows, err
 }
 
-func (m *Monitor) readCapacityRejections(ctx context.Context, from, to int64, channelID int, group, model string, now int64) (map[int64]int64, capacitySource) {
+func (m *Monitor) readCapacityRejectionsFiltered(ctx context.Context, from, to int64, channelID int, userID int64, group, model string, now int64) (map[int64]int64, capacitySource) {
 	configured := strings.TrimSpace(m.cfg.IngestToken) != ""
+	if userID != 0 {
+		return map[int64]int64{}, capacitySource{Configured: configured, Note: "按用户筛选时前置拒绝不参与计算：拒绝日志没有可信用户维度。"}
+	}
 	if channelID != 0 { // 前置拒绝没有渠道维度，不能伪归到某渠道。
 		return map[int64]int64{}, capacitySource{Configured: configured, Note: "按渠道筛选时前置拒绝不参与计算：拒绝发生在选渠道之前。"}
 	}
@@ -711,7 +904,7 @@ func (m *Monitor) capacityBreakdowns(rows []capacityDimensionRow, rejectionRows 
 				label = labels[key]
 			}
 			item := capacityBreakdown{Key: key, Label: label, Requests: requests, RejectedRequests: a.rejected, Tokens: a.tokens,
-				AverageRPM: float64(requests) / mins, AverageTPM: float64(a.tokens) / mins, StabilityScope: scope}
+				AverageRPM: capacityFloatPtr(float64(requests) / mins), AverageTPM: capacityFloatPtr(float64(a.tokens) / mins), StabilityScope: scope}
 			if logged > 0 {
 				item.StabilityPct = capacityFloatPtr(float64(a.success) * 100 / float64(logged))
 			}
@@ -761,10 +954,11 @@ func (m *Monitor) readCapacityIngress(ctx context.Context, from, to, bucket, now
 	out := make([]capacityIngressPoint, 0, len(rows))
 	if err == nil {
 		for _, row := range rows {
-			mins := float64(bucket / 60)
-			if mins < 1 {
-				mins = 1
+			seconds := min(to, row.Ts+bucket) - max(from, row.Ts)
+			if seconds <= 0 {
+				continue
 			}
+			mins := float64(seconds) / 60
 			avg := float64(0)
 			avgUpstream := float64(0)
 			if row.Count > 0 {
@@ -773,7 +967,7 @@ func (m *Monitor) readCapacityIngress(ctx context.Context, from, to, bucket, now
 			if row.UpstreamTimeCount > 0 {
 				avgUpstream = float64(row.UpstreamTimeSumMS) / float64(row.UpstreamTimeCount)
 			}
-			windowMS := float64(bucket * 1000)
+			windowMS := float64(seconds * 1000)
 			latencyCoverage := float64(0)
 			if row.Count > 0 {
 				latencyCoverage = float64(row.LatencyCount) / float64(row.Count) * 100

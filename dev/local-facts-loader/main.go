@@ -136,7 +136,7 @@ func run(opt options) error {
 	}
 
 	loadStarted := time.Now()
-	for _, table := range []string{"logs", "tokens", "users", "channels"} {
+	for _, table := range []string{"logs", "tokens", "users", "channels", "options", "subscription_plans"} {
 		if _, err := db.ExecContext(ctx, "TRUNCATE TABLE "+table); err != nil {
 			return fmt.Errorf("truncate local %s: %w", table, err)
 		}
@@ -150,8 +150,17 @@ func run(opt options) error {
 		return fmt.Errorf("drop stale local candidate index: %w", err)
 	}
 	if _, err := db.ExecContext(ctx, "INSERT INTO channels(id,type,status,name,`group`,models,base_url) VALUES "+
-		"(1,1,1,'local-channel-1','default','model-1,model-2','http://127.0.0.1'),"+
-		"(2,1,1,'local-channel-2','default','model-3,model-4','http://127.0.0.1')"); err != nil {
+		"(1,1,1,'local-channel-1','default,group-1','model-1,model-2','http://127.0.0.1'),"+
+		"(2,1,1,'local-channel-2','default,group-2','model-3,model-4','http://127.0.0.1')"); err != nil {
+		return err
+	}
+	if _, err := db.ExecContext(ctx, "INSERT INTO options(`key`,`value`) VALUES (?,?),(?,?),(?,?)",
+		"GroupRatio", `{"default":1,"group-1":1,"group-2":0.7,"unused-0.5x":0.5}`,
+		"UserUsableGroups", `{"default":"默认分组","group-1":"合成一组","group-2":"合成二组","unused-0.5x":"待治理样例"}`,
+		"AutoGroups", `["auto"]`); err != nil {
+		return err
+	}
+	if _, err := db.ExecContext(ctx, "INSERT INTO subscription_plans(id,title,enabled,upgrade_group) VALUES (1,'Local synthetic plan',1,'group-2')"); err != nil {
 		return err
 	}
 	end := time.Now().Add(-10 * time.Minute).Truncate(time.Hour).Unix()
@@ -261,19 +270,20 @@ func insertUsersAndTokens(ctx context.Context, db *sql.DB, users int, registered
 		last := min(first+1000, users+1)
 		var userSQL strings.Builder
 		var tokenSQL strings.Builder
-		userSQL.WriteString("INSERT INTO users(id,username,email,created_at,quota,used_quota) VALUES ")
-		tokenSQL.WriteString("INSERT INTO tokens(id,user_id,\u0060key\u0060,name,used_quota,\u0060group\u0060) VALUES ")
-		userArgs := make([]any, 0, (last-first)*6)
-		tokenArgs := make([]any, 0, (last-first)*6)
+		userSQL.WriteString("INSERT INTO users(id,username,email,display_name,created_at,quota,used_quota,status,role,\u0060group\u0060) VALUES ")
+		tokenSQL.WriteString("INSERT INTO tokens(id,user_id,\u0060key\u0060,name,used_quota,\u0060group\u0060,status,expired_time) VALUES ")
+		userArgs := make([]any, 0, (last-first)*10)
+		tokenArgs := make([]any, 0, (last-first)*8)
 		for id := first; id < last; id++ {
 			if id > first {
 				userSQL.WriteByte(',')
 				tokenSQL.WriteByte(',')
 			}
-			userSQL.WriteString("(?,?,?,?,?,?)")
-			tokenSQL.WriteString("(?,?,?,?,?,?)")
-			userArgs = append(userArgs, id, fmt.Sprintf("acceptance-user-%04d", id), fmt.Sprintf("user-%04d@local.test", id), registeredAt, 50_000_000, id*1000)
-			tokenArgs = append(tokenArgs, id, id, fmt.Sprintf("local-key-%08d", id), fmt.Sprintf("token-%d-1", id), id*100, "group-1")
+			userSQL.WriteString("(?,?,?,?,?,?,?,?,?,?)")
+			tokenSQL.WriteString("(?,?,?,?,?,?,?,?)")
+			group := fmt.Sprintf("group-%d", (id-1)%2+1)
+			userArgs = append(userArgs, id, fmt.Sprintf("acceptance-user-%04d", id), fmt.Sprintf("user-%04d@local.test", id), fmt.Sprintf("Synthetic User %d", id), registeredAt, 50_000_000, id*1000, 1, 1, group)
+			tokenArgs = append(tokenArgs, id, id, fmt.Sprintf("local-key-%08d", id), fmt.Sprintf("token-%d-1", id), id*100, group, 1, 0)
 		}
 		if _, err := db.ExecContext(ctx, userSQL.String(), userArgs...); err != nil {
 			return err
@@ -340,6 +350,16 @@ func insertSyntheticLogs(ctx context.Context, db *sql.DB, opt options, start, en
 					return inserted, err
 				}
 			}
+		}
+	}
+	// Always publish a small slice in the most recent completed window. This
+	// makes the isolated Docker acceptance deterministic for minute RPM/TPM
+	// without waiting for wall-clock time or relying on the daily distribution.
+	for userID := 1; userID <= opt.tracked; userID++ {
+		seq++
+		created := end - 300 - int64(userID%60)
+		if err := appendLog(userID, created, seq); err != nil {
+			return inserted, err
 		}
 	}
 	backgroundStart := end - int64(opt.backgroundDays)*86400

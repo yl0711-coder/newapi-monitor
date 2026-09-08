@@ -28,6 +28,8 @@ var modalityCases = []modalityCase{
 		"生产上量最大的端点(156547 行)，同样必须能识别真未交付"},
 	{"文本端点_anthropic", "/v1/messages", "claude-opus-5", true,
 		"Anthropic 端点也是文本，判据须一致"},
+	{"文本端点_pg", "/pg/chat/completions", "gpt-5.4", true,
+		"生产已有的 pg 文本端点不能从稳定性与排障分类中遗漏"},
 
 	// —— 以下全部是报告已动态复现的误报，修复后必须不命中 ——
 	{"图片_dall-e-3", "/v1/images/generations", "dall-e-3", false,

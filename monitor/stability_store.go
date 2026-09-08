@@ -44,7 +44,7 @@ type StabilityHourSample struct {
 
 func (s *StabilityHourSample) BeforeCreate(_ *gorm.DB) error {
 	if s.TrafficClassVersion == 0 {
-		s.TrafficClassVersion = userTrafficClassificationVersion
+		s.TrafficClassVersion = stabilityTrafficClassificationVersion
 	}
 	return nil
 }
@@ -75,7 +75,7 @@ type ChannelTestHourSample struct {
 
 func (s *ChannelTestHourSample) BeforeCreate(_ *gorm.DB) error {
 	if s.TrafficClassVersion == 0 {
-		s.TrafficClassVersion = userTrafficClassificationVersion
+		s.TrafficClassVersion = stabilityTrafficClassificationVersion
 	}
 	if s.CostBasis == "" {
 		s.CostBasis = "legacy_assumed_base"
@@ -125,7 +125,7 @@ type StabilityProblemSample struct {
 
 func (s *StabilityProblemSample) BeforeCreate(_ *gorm.DB) error {
 	if s.TrafficClassVersion == 0 {
-		s.TrafficClassVersion = userTrafficClassificationVersion
+		s.TrafficClassVersion = stabilityTrafficClassificationVersion
 	}
 	return nil
 }
@@ -187,7 +187,7 @@ type StabilityProblemLiveCursor struct {
 
 func (s *StabilityProblemIngestState) BeforeCreate(_ *gorm.DB) error {
 	if s.TrafficClassVersion == 0 {
-		s.TrafficClassVersion = userTrafficClassificationVersion
+		s.TrafficClassVersion = stabilityTrafficClassificationVersion
 	}
 	return nil
 }
@@ -214,7 +214,7 @@ type StabilityProblemStage struct {
 
 func (s *StabilityProblemStage) BeforeCreate(_ *gorm.DB) error {
 	if s.TrafficClassVersion == 0 {
-		s.TrafficClassVersion = userTrafficClassificationVersion
+		s.TrafficClassVersion = stabilityTrafficClassificationVersion
 	}
 	return nil
 }
@@ -298,7 +298,7 @@ func (m *Monitor) rollupStabilityHours(sinceTs int64) error {
 		  err_timeout=excluded.err_timeout, err_other=excluded.err_other,
 		  refund_records=excluded.refund_records, refund_quota=excluded.refund_quota,
 		  traffic_class_version=excluded.traffic_class_version`,
-			userTrafficClassificationVersion, sinceTs, userTrafficClassificationVersion, userTrafficClassificationVersion).Error; err != nil {
+			stabilityTrafficClassificationVersion, sinceTs, stabilityTrafficClassificationVersion, stabilityTrafficClassificationVersion).Error; err != nil {
 			return err
 		}
 		return m.enqueueChangedEconomicsLocalHoursTx(tx, sinceTs, time.Now().Unix(), 16)
@@ -370,7 +370,7 @@ func (m *Monitor) pruneStabilityOlderThan(cutoffTs int64) error {
 	}
 	// 补数任务只保留审计摘要，不随小时明细无限增长。正在执行/等待续跑的任务不能删。
 	jobCutoff := cutoffTs - 30*86400
-	if err := m.storeDB.Where("updated_at < ? AND status IN ?", jobCutoff, []string{"complete", "paused"}).Delete(&StabilityBackfillJob{}).Error; err != nil {
+	if err := m.storeDB.Where("updated_at < ? AND status = ?", jobCutoff, "complete").Delete(&StabilityBackfillJob{}).Error; err != nil {
 		return fmt.Errorf("清理稳定性补数任务: %w", err)
 	}
 	return nil

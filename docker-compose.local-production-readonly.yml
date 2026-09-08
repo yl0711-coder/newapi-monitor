@@ -3,10 +3,10 @@
 # 必须与 docker-compose.local-acceptance.yml 叠加使用，并通过
 # dev/run-local-production-readonly.sh 启动。它只允许把 NEWAPI_LOG_DSN
 # 指向宿主机 127.0.0.1 上的 SSH 隧道；数据库账号由启动脚本强制校验为
-# nexus_ro。严禁把生产写账号、RDS 公网地址或 NewAPI 管理 API 写入本文件。
+# monitor_ro。严禁把生产写账号、RDS 公网地址或 NewAPI 管理 API 写入本文件。
 #
 # 本模式不部署任何线上代码，也不写 NewAPI：
-# - MySQL 只通过 nexus_ro 执行 SELECT；
+# - MySQL 只通过 monitor_ro 执行 SELECT；
 # - 两份 SQLite 与 Redis 都在本机 Docker 数据卷；
 # - 登录使用与线上相同的 NewAPI 身份校验；邮件、基础设施探测、上游账户
 #   同步、自动修复和 Nginx 写入均关闭；
@@ -15,7 +15,7 @@
 services:
   monitor:
     environment:
-      NEWAPI_LOG_DSN: ${NEWAPI_LOG_DSN:?请通过受控 env-file 提供 nexus_ro 的本机隧道 DSN}
+      NEWAPI_LOG_DSN: ${NEWAPI_LOG_DSN:?请通过受控 env-file 提供 monitor_ro 的本机隧道 DSN}
       # 与线上 Monitor 相同：只用于管理员登录校验、品牌/公开分组读取；Monitor
       # 不持有 NewAPI 管理 Token，也不通过此地址执行管理写操作。
       MONITOR_NEWAPI_BASE_URL: ${MONITOR_PROD_READONLY_NEWAPI_BASE_URL:-https://nexusapi.link}
@@ -60,7 +60,7 @@ services:
       # 验收需要显式开启页面，线上默认开关仍不受影响。
       MONITOR_CAPACITY_ENABLED: "true"
       # 与拟上线读模型一致：页面始终读本地 SQLite，缺失小时由限速的单小时
-      # nexus_ro 查询补齐。只读、每次一个小时切片，不执行任何线上写操作。
+      # monitor_ro 查询补齐。只读、每次一个小时切片，不执行任何线上写操作。
       MONITOR_STABILITY_BACKFILL_ENABLED: "true"
       MONITOR_STABILITY_AUTO_REPAIR: "true"
       MONITOR_BACKGROUND_SOURCE_MIN_START_INTERVAL_MS: "2000"

@@ -393,7 +393,7 @@ func (m *Monitor) nginxEvidenceHealth(ctx context.Context, now time.Time) nginxE
 		}
 	}
 	var states []NginxEvidenceSourceState
-	if err := m.nginxEvidenceDB.WithContext(probeCtx).Limit(64).Find(&states).Error; err != nil {
+	if err := m.nginxEvidenceDB.WithContext(probeCtx).Where("node IN ?", m.nginxExpectedNodes()).Limit(64).Find(&states).Error; err != nil {
 		result.StoreReachable = false
 		return result
 	}
@@ -432,7 +432,7 @@ func (m *Monitor) nginxEvidenceHealth(ctx context.Context, now time.Time) nginxE
 			present[state.Node] = true
 		}
 	}
-	for _, node := range m.cfg.NginxAllowedNodes {
+	for _, node := range m.nginxExpectedNodes() {
 		if !present[node] {
 			result.UnhealthySources++
 		}

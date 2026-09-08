@@ -4,8 +4,7 @@
 # 不要把 WAL 模式数据库直接放在 macOS bind mount 上：宿主机与 Linux 容器
 # 同时访问时文件锁语义并不可靠，可能导致 database disk image is malformed。
 # ./\.local-data 只保存停库后取得的一致性备份，不直接承载运行库。
-# 首次启动或 Redis 容器不存在时先执行：
-#   docker compose -f docker-compose.local-acceptance.yml up -d redis
+# Monitor 仅使用本机缓存，不再依赖 Redis 容器。
 # 最终验收必须使用待交付的同一 SHA/digest 镜像，例如：
 #   MONITOR_ACCEPTANCE_IMAGE=ghcr.io/yl0711-coder/newapi-monitor:sha-<sha>@sha256:<digest> \
 #     docker compose -f docker-compose.local-acceptance.yml up -d --no-deps --force-recreate monitor
@@ -15,33 +14,6 @@
 # 不要使用 `down -v`，也不要删除 Docker 卷
 # newapi-monitor-local-data / newapi-monitor-local-backup。
 services:
-  redis:
-    image: redis:7-alpine
-    container_name: ${MONITOR_ACCEPTANCE_REDIS_CONTAINER:-newapi-monitor-local-redis}
-    command:
-      - redis-server
-      - --requirepass
-      - local-acceptance-cache-only
-      - --maxmemory
-      - 128mb
-      - --maxmemory-policy
-      - volatile-lru
-      - --save
-      - ""
-      - --appendonly
-      - "no"
-    ports:
-      # 只供本机真实 Redis 集成测试，绝不暴露到局域网。
-      - "127.0.0.1:${MONITOR_ACCEPTANCE_REDIS_PORT:-17379}:6379"
-    tmpfs:
-      - /data
-    mem_limit: 192m
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "redis-cli", "-a", "local-acceptance-cache-only", "ping"]
-      interval: 5s
-      timeout: 2s
-      retries: 10
 
   monitor:
     # 不允许静默回退到本地 build：最终验收必须显式指定 CI 产出的不可变镜像。
@@ -72,11 +44,7 @@ services:
       MONITOR_SOURCE_LEASE_NAME: newapi-monitor-source-worker-v1
       MONITOR_NEWAPI_BASE_URL: ${MONITOR_NEWAPI_BASE_URL:-}
       MONITOR_SESSION_SECRET: ${MONITOR_SESSION_SECRET:-local-acceptance-session-only}
-      # 与线上相同架构：Redis 只保存可重算聚合；活跃区间 60 秒、已闭合历史区间 10 分钟。
-      MONITOR_USAGE_REDIS_ADDR: redis:6379
-      MONITOR_USAGE_REDIS_PASSWORD: local-acceptance-cache-only
-      MONITOR_USAGE_REDIS_DB: "0"
-      MONITOR_USAGE_REDIS_PREFIX: nxmon:local:usage:v1
+      # 聚合结果只保存在有界本机内存；旧 Redis 环境变量即使残留也不会建立连接。
       # 本地验收硬性安全开关：不发邮件、不回填、不做 AWS/域名探测、不打外部心跳。
       # 服务端监控页仅读已同步到本机 SQLite 的快照，页面可验收，不会触发探测。
       MONITOR_ALERTS_DISABLED: "true"
@@ -98,8 +66,14 @@ services:
       MONITOR_UPSTREAM_USAGE_SYNC_ENABLED: "false"
       MONITOR_UPSTREAM_ERRORLOG_SYNC_ENABLED: "false"
       MONITOR_UPSTREAM_ERRORLOG_DOMAINS: ""
+      MONITOR_UPSTREAM_FUNDS_SYNC_ENABLED: "false"
+      MONITOR_UPSTREAM_FUNDS_DOMAINS: ""
       # 计价证据账本也必须显式关闭；本地免登录模式会在应用层再次 fail-closed 校验。
       MONITOR_UPSTREAM_PRICING_LEDGER_ENABLED: "false"
+      # 分组治理页面可在完全离线模式下做 UI 验收；默认关闭，开发时由
+      # run-local-dev.sh 的调用环境显式打开，不会因此启用任何生产来源查询。
+      MONITOR_GROUP_GOVERNANCE_ENABLED: ${MONITOR_GROUP_GOVERNANCE_ENABLED:-false}
+      MONITOR_GROUP_GOVERNANCE_SYNC_MINUTES: ${MONITOR_GROUP_GOVERNANCE_SYNC_MINUTES:-10}
       # 总开关关闭后，旧的 queued/running 任务也不会在本地重启续跑。
       MONITOR_STABILITY_BACKFILL_ENABLED: "false"
       MONITOR_STABILITY_AUTO_REPAIR: "false"
@@ -120,9 +94,6 @@ services:
     cap_drop:
       - ALL
     pids_limit: 128
-    depends_on:
-      redis:
-        condition: service_healthy
     mem_limit: 256m
     restart: unless-stopped
     stop_grace_period: 40s

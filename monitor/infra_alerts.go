@@ -1,6 +1,7 @@
 package monitor
 
 import (
+	"log/slog"
 	"strings"
 	"time"
 )
@@ -14,10 +15,16 @@ func (m *Monitor) recentInfraAlerts(nowUnix int64, limit int) []InfraAlert {
 		limit = 20
 	}
 	var logs []AlertLog
-	m.storeDB.Where("kind LIKE ?", "infra\\_%").Order("ts DESC").Limit(limit).Find(&logs)
+	// SQLite LIKE does not treat a backslash as an escape character unless an
+	// ESCAPE clause is supplied. Prefix matching with substr is explicit and
+	// cannot accidentally treat '_' as a wildcard.
+	if err := m.storeDB.Where("substr(kind,1,6) = ?", "infra_").Order("ts DESC").Limit(limit).Find(&logs).Error; err != nil {
+		slog.Warn("读取服务端近期告警失败", "err", err)
+		return nil
+	}
 	out := make([]InfraAlert, 0, len(logs))
 	for _, l := range logs {
-		if m.infraExcluded(l.Target) {
+		if m.infraExcluded(l.Target) || (strings.HasPrefix(l.Kind, "infra_origin_lock") && !m.originLockConfigured(l.Target)) {
 			continue
 		}
 		st := "bad"

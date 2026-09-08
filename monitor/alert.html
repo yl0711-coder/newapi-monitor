@@ -137,8 +137,8 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
   <table class="thr" style="margin-top:10px">
     <tr><td>目标成功率(%)</td><td><input type="number" id="slo_target_pct" step="0.1"> <span class="muted">建议 99</span></td></tr>
     <tr><td>SLO 窗口(天,≤ 留存天数)</td><td><input type="number" id="slo_window_days"> <span class="muted">建议 7</span></td></tr>
-    <tr><td><b>🔴 快烧</b>(紧急):窗口内燃烧 ≥ ? 倍</td><td><label class="ck"><input type="checkbox" id="burn_fast_enabled"> 启用</label>　窗口(分)<input type="number" id="burn_fast_window_min" style="width:72px">　倍数<input type="number" id="burn_fast_rate" style="width:72px"> <span class="muted">建议 60 / 14×</span></td></tr>
-    <tr><td><b>🟡 慢烧</b>(记单):窗口内燃烧 ≥ ? 倍</td><td><label class="ck"><input type="checkbox" id="burn_slow_enabled"> 启用</label>　窗口(分)<input type="number" id="burn_slow_window_min" style="width:72px">　倍数<input type="number" id="burn_slow_rate" style="width:72px"> <span class="muted">建议 360 / 3×</span></td></tr>
+    <tr><td><b>🔴 快烧</b>(紧急):窗口内燃烧 ≥ ? 倍</td><td><label class="ck"><input type="checkbox" id="burn_fast_enabled"> 启用</label>　窗口(分)<input type="number" id="burn_fast_window_min" min="60" step="60" style="width:72px">　倍数<input type="number" id="burn_fast_rate" style="width:72px"> <span class="muted">建议 60 / 14×，按整小时统计</span></td></tr>
+    <tr><td><b>🟡 慢烧</b>(记单):窗口内燃烧 ≥ ? 倍</td><td><label class="ck"><input type="checkbox" id="burn_slow_enabled"> 启用</label>　窗口(分)<input type="number" id="burn_slow_window_min" min="60" step="60" style="width:72px">　倍数<input type="number" id="burn_slow_rate" style="width:72px"> <span class="muted">建议 360 / 3×，按整小时统计</span></td></tr>
   </table>
 </div>
 

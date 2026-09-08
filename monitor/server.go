@@ -5,6 +5,7 @@ import (
 	"crypto/subtle"
 	_ "embed"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -63,11 +64,20 @@ var logChainJS []byte // 客户排障页交互；只访问 /logchain/* 管理员
 //go:embed channel_management.js
 var channelManagementJS []byte // 渠道管理交互；只访问 Monitor 本地渠道汇总接口
 
+//go:embed channel_data_status.js
+var channelDataStatusJS []byte
+
 //go:embed capacity.css
 var capacityCSS []byte // 容量规划独立样式，不污染现有 Monitor/Usage 页
 
 //go:embed capacity.js
 var capacityJS []byte // 只访问 /capacity/report 本地事实接口
+
+//go:embed group_governance.css
+var groupGovernanceCSS []byte // 分组治理独立样式，不污染其他 Monitor Tab
+
+//go:embed group_governance.js
+var groupGovernanceJS []byte // 只访问 Monitor 本地快照与 CSV 接口
 
 var allowedWindows = map[int]bool{15: true, 30: true, 60: true, 180: true, 360: true, 720: true, 1440: true}
 
@@ -179,6 +189,10 @@ func (m *Monitor) RegisterRoutes(r *gin.Engine) {
 		c.Header("Cache-Control", "no-cache")
 		c.Data(http.StatusOK, "application/javascript; charset=utf-8", channelManagementJS)
 	})
+	r.GET("/channel-data-status.js", func(c *gin.Context) {
+		c.Header("Cache-Control", "no-cache")
+		c.Data(http.StatusOK, "application/javascript; charset=utf-8", channelDataStatusJS)
+	})
 	r.GET("/capacity.css", func(c *gin.Context) {
 		c.Header("Cache-Control", "no-cache")
 		c.Data(http.StatusOK, "text/css; charset=utf-8", capacityCSS)
@@ -186,6 +200,14 @@ func (m *Monitor) RegisterRoutes(r *gin.Engine) {
 	r.GET("/capacity.js", func(c *gin.Context) {
 		c.Header("Cache-Control", "no-cache")
 		c.Data(http.StatusOK, "application/javascript; charset=utf-8", capacityJS)
+	})
+	r.GET("/group-governance.css", func(c *gin.Context) {
+		c.Header("Cache-Control", "no-cache")
+		c.Data(http.StatusOK, "text/css; charset=utf-8", groupGovernanceCSS)
+	})
+	r.GET("/group-governance.js", func(c *gin.Context) {
+		c.Header("Cache-Control", "no-cache")
+		c.Data(http.StatusOK, "application/javascript; charset=utf-8", groupGovernanceJS)
 	})
 	r.GET("/logchain.js", func(c *gin.Context) {
 		c.Header("Cache-Control", "no-cache")
@@ -225,16 +247,20 @@ func (m *Monitor) RegisterRoutes(r *gin.Engine) {
 		view.GET("/sync/overview", m.serveSyncOverview)                                   // 统一同步摘要:只读本地状态投影
 		view.GET("/sync/workloads", m.serveSyncWorkloads)                                 // 有界任务明细:默认仅异常成员,支持分页
 		view.GET("/channels/report", m.serveChannelManagementReport)                      // 渠道管理:主域名→厂商→渠道→服务分组的本地汇总
+		view.GET("/channels/data-status", m.serveChannelDataStatus)                       // 同口径的轻量只读诊断，不读取用量维度
 		view.GET("/channels/economics", m.serveChannelEconomicsReport)                    // 渠道成本:只读本地不可变经济账当前发布头
 		// 排障两个接口挂 noStoreSensitive：响应含客户标识、令牌名、渠道名/ID、
 		// 上游主域名与错误原文，属敏感诊断数据，不得被任何中间层缓存。
 		// 用中间件而非在 handler 里逐个 c.Header：handler 有多条提前 return
 		// 的错误分支（400/401/403/500），逐个加必然漏，而漏掉的恰好是错误响应。
-		view.GET("/logchain/requests", noStoreSensitive, m.serveLogChainRequests)          // 客户排障:逐条请求→渠道→上游主域名→错误原文(含 type=5,含渠道信息,仅管理员)
-		view.GET("/logchain/filters", noStoreSensitive, m.serveLogChainFilters)            // 客户排障:筛选下拉取值(服务分组/上游域名/渠道),只读本地快照
-		view.GET("/infra", m.serveInfra)                                                   // 服务端健康监控(实例/DB/LB)快照
-		view.GET("/infra/series", m.serveInfraSeries)                                      // 按需取某资源某些指标的近 N 小时序列(展开图用)
-		view.GET("/capacity/report", m.serveCapacityReport)                                // 容量规划:只读 Monitor 本地三类脱敏事实
+		view.GET("/logchain/requests", noStoreSensitive, m.serveLogChainRequests)            // 客户排障:逐条请求→渠道→上游主域名→错误原文(含 type=5,含渠道信息,仅管理员)
+		view.GET("/logchain/filters", noStoreSensitive, m.serveLogChainFilters)              // 客户排障:筛选下拉取值(服务分组/上游域名/渠道),只读本地快照
+		view.GET("/infra", m.serveInfra)                                                     // 服务端健康监控(实例/DB/LB)快照
+		view.GET("/infra/series", m.serveInfraSeries)                                        // 按需取某资源某些指标的近 N 小时序列(展开图用)
+		view.GET("/capacity/report", m.serveCapacityReport)                                  // 容量规划:只读 Monitor 本地三类脱敏事实
+		view.GET("/group-governance/report", noStoreSensitive, m.serveGroupGovernanceReport) // 分组治理:只读本地快照
+		view.GET("/group-governance/users", noStoreSensitive, m.serveGroupGovernanceUsers)   // 分组实际关联用户，本地分页
+		view.GET("/group-governance/export.csv", noStoreSensitive, m.exportGroupGovernanceCSV)
 		view.GET("/usage/users", m.listTrackedUsers)                                       // 用户用量:被盯名单(含分组)
 		view.GET("/usage/groups", m.listGroups)                                            // 用户用量:客户分组列表
 		view.GET("/usage/followups", m.usageAggregateAuthorizationGuard(m.serveFollowUps)) // 用户用量:待跟进清单
@@ -261,6 +287,7 @@ func (m *Monitor) RegisterRoutes(r *gin.Engine) {
 	// 仅超级管理员:用当前判据重算历史桶(判据变更后一次性执行)。
 	// 做成接口而非启动参数:不必重启、可重跑、可只补一段;放启动流程会每次重启都压一遍生产库。
 	r.POST("/admin/backfill", m.requireRole(roleRoot), m.backfillHandler)
+	r.GET("/admin/backfill", m.requireRole(roleRoot), m.backfillStatusHandler)
 	r.POST("/admin/stability/backfill", m.requireRole(roleRoot), m.startStabilityBackfillHandler)
 	r.POST("/admin/stability/backfill/retry", m.requireRole(roleRoot), m.retryStabilityBackfillHandler)
 	r.GET("/admin/stability/backfill", m.requireRole(roleRoot), m.stabilityBackfillStatusHandler)
@@ -295,9 +322,12 @@ func (m *Monitor) RegisterRoutes(r *gin.Engine) {
 		rootChannels.POST("/finance/channel", m.saveChannelFinanceChannelHandler)
 		rootChannels.POST("/finance/domain-rates", m.saveChannelFinanceDomainRatesHandler)
 		rootChannels.GET("/upstream", m.getChannelUpstreamHandler)
+		rootChannels.POST("/upstream/diagnose", m.diagnoseChannelUpstreamHandler)
 		rootChannels.POST("/upstream", m.saveChannelUpstreamHandler)
 		rootChannels.POST("/upstream/sync", m.syncChannelUpstreamHandler)
 		rootChannels.POST("/upstream/usage-sync", m.syncChannelUpstreamUsageHandler)
+		rootChannels.GET("/upstream/funds", m.getChannelUpstreamFundsHandler)
+		rootChannels.POST("/upstream/funds-sync", m.syncChannelUpstreamFundsHandler)
 		rootChannels.GET("/cost/sources", m.listChannelCostSourcesHandler)
 		rootChannels.POST("/cost/bindings", m.saveChannelCostBindingHandler)
 		rootChannels.GET("/cost/proposals", m.listChannelPricingProposalsHandler)
@@ -549,13 +579,15 @@ func (m *Monitor) serveInfra(c *gin.Context) {
 
 // serveInfraSeries 按需返回某资源(resource)若干指标(metrics 逗号分隔)近 N 小时(hours,默认6,封顶24)的时序。
 // 展开实例/切换指标组时前端才拉,避免快照一次性塞满所有图。结果:{series:{metric:[{ts,value}]}}。
+const maxInfraSeriesMetrics = 8
+
 func (m *Monitor) serveInfraSeries(c *gin.Context) {
 	if !m.InfraEnabled() {
 		c.JSON(http.StatusOK, gin.H{"enabled": false})
 		return
 	}
 	resource := strings.TrimSpace(c.Query("resource"))
-	if resource == "" {
+	if resource == "" || len(resource) > 253 {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "resource required"})
 		return
 	}
@@ -571,15 +603,40 @@ func (m *Monitor) serveInfraSeries(c *gin.Context) {
 		hours = 24
 	}
 	since := time.Now().Unix() - int64(hours)*3600
-	series := map[string][]InfraPoint{}
+	requested := make([]string, 0, maxInfraSeriesMetrics)
 	for _, met := range strings.Split(c.Query("metrics"), ",") {
 		met = strings.TrimSpace(met)
 		if met == "" {
 			continue
 		}
+		if !validInfraSeriesMetric(met) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid metric"})
+			return
+		}
+		requested = append(requested, met)
+		if len(requested) > maxInfraSeriesMetrics {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "too many metrics"})
+			return
+		}
+	}
+	series := map[string][]InfraPoint{}
+	for _, met := range requested {
 		series[met] = m.storeInfraSeries(resource, met, since)
 	}
 	c.JSON(http.StatusOK, gin.H{"enabled": true, "series": series})
+}
+
+func validInfraSeriesMetric(metric string) bool {
+	switch metric {
+	case "cpu", "status_failed", "net_out_kb", "net_in_kb", "burst",
+		"connections", "free_storage_gb", "disk_queue", "free_mem_mb", "swap_mb",
+		"mem_total_mb", "disk_total_gb", "healthy", "unhealthy", "err_5xx", "resp_ms",
+		"available", "desired", "running", "pending", "containers_total", "containers_up",
+		"unhealthy_containers", "health_checked", "mem_used_mb", "disk_used_gb", "restart_count",
+		"mem_avail_mb", "disk_used_pct", "load1", "load5", "load15":
+		return true
+	}
+	return false
 }
 
 // ingestHost 接收各节点主机 agent 推来的 OS 指标(内存/磁盘/load),写 infra_samples(rtype=host)。
@@ -623,11 +680,9 @@ func (m *Monitor) ingestHost(c *gin.Context) {
 		return
 	}
 	receivedAt := time.Now().Unix()
-	ts := in.Ts
-	if ts <= 0 {
-		ts = receivedAt
-	}
-	bucket := ts / 60 * 60
+	// 健康水位必须使用 Monitor 的接收时间。客户端时钟漂移（尤其未来时间）
+	// 不能让一台已断报主机永久显示为“刚更新”。客户端 ts 仅是传输元数据。
+	bucket := receivedAt / 60 * 60
 	var rows []InfraSample
 	addP := func(metric string, p *float64) {
 		if p != nil {
@@ -743,21 +798,49 @@ func (m *Monitor) saveAlertConfigHandler(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
 
-// backfillHandler 触发历史回填。同步执行(约 168 片 × 0.5s ≈ 数分钟),完成后返回统计。
-// 超时上限给足:回填按小时切片、片间有间隔,不能被请求超时半途掐断留下半新半旧的数据。
+// backfillHandler 启动低优先级后台回填。任务不绑定浏览器/ALB 请求生命周期，
+// 会在实时采样等高优先级来源请求前主动让路。GET 同路径可查运行结果。
 func (m *Monitor) backfillHandler(c *gin.Context) {
 	hours, _ := strconv.Atoi(c.Query("hours"))
 	if hours <= 0 {
-		hours = m.cfg.RetentionDays * 24 // 默认补满分钟级留存
+		hours = 30 * 24
+		if maxHours := m.cfg.HourRetentionDays * 24; maxHours > 0 && hours > maxHours {
+			hours = maxHours
+		}
 	}
-	ctx, cancel := context.WithTimeout(c.Request.Context(), 30*time.Minute)
-	defer cancel()
-	res, err := m.BackfillHours(ctx, hours)
-	if err != nil {
+	if err := m.validateMetricBackfill(hours); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	c.JSON(http.StatusOK, res)
+	if !backfillRunning.CompareAndSwap(false, true) {
+		c.JSON(http.StatusConflict, gin.H{"error": "已有回填正在进行", "job": m.getMetricBackfillStatus()})
+		return
+	}
+	startedAt := time.Now().Unix()
+	m.setMetricBackfillStatus(MetricBackfillStatus{Status: "running", Hours: hours, StartedAt: startedAt})
+	go func() {
+		ctx, cancel := context.WithTimeout(m.taskContext(), 6*time.Hour)
+		defer cancel()
+		result, err := m.backfillHoursLocked(ctx, hours, m.sampleRangeLow, m.sampleMetricRangeLow, m.sampleTokensRangeLow, m.rollupHourRange)
+		status := MetricBackfillStatus{Status: "complete", Hours: hours, StartedAt: startedAt, FinishedAt: time.Now().Unix(), Result: result}
+		if err != nil {
+			status.Status = "failed"
+			status.Error = clip(err.Error(), 512)
+		} else if result != nil && result.Failed > 0 {
+			status.Status = "failed"
+			status.Error = fmt.Sprintf("有 %d 个分片或完整性步骤失败，未发布完整覆盖", result.Failed)
+		}
+		m.setMetricBackfillStatus(status)
+	}()
+	c.JSON(http.StatusAccepted, gin.H{"accepted": true, "job": m.getMetricBackfillStatus()})
+}
+
+func (m *Monitor) backfillStatusHandler(c *gin.Context) {
+	status := m.getMetricBackfillStatus()
+	if status.Status == "" {
+		status.Status = "idle"
+	}
+	c.JSON(http.StatusOK, gin.H{"job": status})
 }
 
 func (m *Monitor) testAlertHandler(c *gin.Context) {
@@ -803,16 +886,39 @@ func (m *Monitor) serveLongTrend(c *gin.Context) {
 	if days < 1 || days > 365 {
 		days = 30
 	}
-	since := time.Now().Unix() - int64(days)*86400
-	c.JSON(http.StatusOK, gin.H{"series": m.storeHourSeries(since)})
+	now := time.Now().Unix()
+	hourlyUntil := metricFinalizeTarget(now) / 3600 * 3600
+	since := hourlyUntil - int64(days)*86400
+	complete, coverageFrom, coverageTo := m.metricHourWindowCoverage(since, now)
+	if !complete {
+		c.JSON(http.StatusOK, gin.H{
+			"series": []HourPoint{}, "data_complete": false,
+			"coverage_from_ts": coverageFrom, "coverage_to_ts": coverageTo,
+		})
+		return
+	}
+	hourlyUntil = min(hourlyUntil, coverageTo/3600*3600)
+	series, err := m.storeHourSeriesRangeE(since, hourlyUntil)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "读取长期趋势失败", "data_complete": false})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"series": series, "data_complete": true, "coverage_from_ts": coverageFrom, "coverage_to_ts": hourlyUntil})
 }
 
 func (m *Monitor) serveData(c *gin.Context) {
-	if !m.Enabled() {
+	// This endpoint reads local facts only. Offline acceptance must not need
+	// a production connection merely to render its saved model snapshot.
+	if !m.Enabled() && !m.cfg.LocalSnapshotOnly {
 		c.JSON(http.StatusOK, gin.H{"enabled": false})
 		return
 	}
-	snap, err := m.GetSnapshot(parseWindow(c), time.Now().Unix())
+	view := c.DefaultQuery("view", "finalized")
+	if view != "finalized" && view != "observed" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "view 必须为 finalized 或 observed"})
+		return
+	}
+	snap, err := m.getSnapshotView(parseWindow(c), time.Now().Unix(), view == "observed")
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"enabled": true, "error": err.Error()})
 		return

@@ -292,9 +292,17 @@ func (g *upstreamHostGuard) waitForStart(ctx context.Context, state *upstreamGua
 		}
 	}
 	started := g.clock.Now()
-	next := started.Add(g.minInterval + clampUpstreamGuardJitter(g.jitter()))
+	interval := g.minInterval
+	state.mu.Lock()
+	hostKey := state.circuit.HostKey
+	state.mu.Unlock()
+	if hostKey == "aicodewith.ai:443" || hostKey == "aicodewith.com:443" {
+		interval = max(interval, aiCodeWithUsageRequestInterval)
+	}
+	jitter := clampUpstreamGuardJitter(g.jitter())
+	next := started.Add(interval + jitter)
 	g.globalMu.Lock()
-	g.globalNext = next
+	g.globalNext = started.Add(g.minInterval + jitter)
 	g.globalMu.Unlock()
 	state.mu.Lock()
 	state.nextStart = next

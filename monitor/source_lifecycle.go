@@ -983,7 +983,7 @@ func (m *Monitor) probeLocalOperationalState(parent context.Context, now int64) 
 	var completed int64
 	err := m.storeDB.WithContext(ctx).Model(&StabilityHourIngestState{}).
 		Where("hour_ts >= ? AND hour_ts < ? AND status = ? AND traffic_class_version = ?",
-			from, to, "complete", userTrafficClassificationVersion).Count(&completed).Error
+			from, to, "complete", stabilityTrafficClassificationVersion).Count(&completed).Error
 	bps := int64(0)
 	if err == nil {
 		if expected <= 0 {
@@ -1009,7 +1009,7 @@ func (m *Monitor) probeLocalOperationalState(parent context.Context, now int64) 
 	}
 
 	var problem StabilityProblemLiveCursor
-	if tx := m.storeDB.WithContext(ctx).First(&problem, "id = ? AND traffic_class_version = ?", 1, userTrafficClassificationVersion); tx.Error == nil {
+	if tx := m.storeDB.WithContext(ctx).First(&problem, "id = ? AND traffic_class_version = ?", 1, stabilityTrafficClassificationVersion); tx.Error == nil {
 		m.stabilityProblemCoverageTo.Store(problem.NextTs)
 		if problem.NextTs < problem.TargetThroughTs || problem.Status != "caught_up" {
 			m.stabilityProblemPending.Store(1)
@@ -1023,7 +1023,7 @@ func (m *Monitor) probeLocalOperationalState(parent context.Context, now int64) 
 
 	var incompleteProblemMigrations int64
 	migrationQuery := m.storeDB.WithContext(ctx).Model(&StabilityProblemClassificationMigration{}).
-		Where("id = ? AND traffic_class_version = ? AND status NOT IN ?", 1, userTrafficClassificationVersion,
+		Where("id = ? AND traffic_class_version = ? AND status NOT IN ?", 1, stabilityTrafficClassificationVersion,
 			[]string{"complete", "not_required"}).Count(&incompleteProblemMigrations)
 	// A local read error is not evidence that the migration is complete. Keep
 	// readiness degraded until the next successful probe can prove otherwise.
@@ -1066,15 +1066,23 @@ type sourceReadyStatus struct {
 }
 
 type readyStatusResponse struct {
-	Status          string                   `json:"status"`
-	StartedAt       int64                    `json:"started_at"`
-	Store           lifecycleComponentStatus `json:"store"`
-	FactsStore      lifecycleComponentStatus `json:"facts_store"`
-	Source          sourceReadyStatus        `json:"source"`
-	SampledAt       int64                    `json:"sampled_at"`
-	FactsHeartbeat  int64                    `json:"facts_heartbeat_at"`
-	FactsDisk       factsDiskReadyStatus     `json:"facts_disk"`
-	DegradedReasons []string                 `json:"degraded_reasons,omitempty"`
+	Status          string                    `json:"status"`
+	StartedAt       int64                     `json:"started_at"`
+	Store           lifecycleComponentStatus  `json:"store"`
+	FactsStore      lifecycleComponentStatus  `json:"facts_store"`
+	Source          sourceReadyStatus         `json:"source"`
+	SampledAt       int64                     `json:"sampled_at"`
+	MetricFinalize  metricFinalizeReadyStatus `json:"metric_finalize"`
+	FactsHeartbeat  int64                     `json:"facts_heartbeat_at"`
+	FactsDisk       factsDiskReadyStatus      `json:"facts_disk"`
+	DegradedReasons []string                  `json:"degraded_reasons,omitempty"`
+}
+
+type metricFinalizeReadyStatus struct {
+	ThroughTs     int64 `json:"through_ts"`
+	TargetTs      int64 `json:"target_ts"`
+	LastSuccessAt int64 `json:"last_success_at"`
+	LastFailureAt int64 `json:"last_failure_at"`
 }
 
 type factsDiskReadyStatus struct {
@@ -1118,7 +1126,11 @@ func (m *Monitor) readyStatus(now time.Time) (readyStatusResponse, int) {
 			NextRetryAt:   m.sourceNextRetryAt.Load(),
 			FailureStreak: m.sourceFailureStreak.Load(),
 		},
-		SampledAt:      m.lastRun.Load(),
+		SampledAt: m.lastRun.Load(),
+		MetricFinalize: metricFinalizeReadyStatus{
+			ThroughTs: m.metricFinalizeThrough.Load(), TargetTs: m.metricFinalizeTarget.Load(),
+			LastSuccessAt: m.metricFinalizeLastSuccess.Load(), LastFailureAt: m.metricFinalizeLastFailure.Load(),
+		},
 		FactsHeartbeat: m.usageFactsLoopHeartbeat.Load(),
 		FactsDisk: factsDiskReadyStatus{
 			Pressure:    usageFactDiskPressureLevel(m.usageFactsHistoryDiskLevel.Load()).String(),
@@ -1157,6 +1169,16 @@ func (m *Monitor) readyStatus(now time.Time) (readyStatusResponse, int) {
 			if now.Unix()-last > int64(seconds*3+60) {
 				response.DegradedReasons = appendReason(response.DegradedReasons, "sampler_stale")
 			}
+		}
+		finalizeThrough := m.metricFinalizeThrough.Load()
+		finalizeTarget := metricFinalizeTarget(now.Unix())
+		if finalizeThrough == 0 {
+			response.DegradedReasons = appendReason(response.DegradedReasons, "metric_finalize_warming_up")
+		} else if finalizeTarget-finalizeThrough > 20*60 {
+			response.DegradedReasons = appendReason(response.DegradedReasons, "metric_finalize_lagging")
+		}
+		if m.metricFinalizeLastFailure.Load() > m.metricFinalizeLastSuccess.Load() {
+			response.DegradedReasons = appendReason(response.DegradedReasons, "metric_finalize_failed")
 		}
 	}
 	if m.cfg.UsageFactsEnabled {
