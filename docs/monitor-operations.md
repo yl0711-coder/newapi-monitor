@@ -9,7 +9,7 @@
 - `NEWAPI_LOG_DSN` 必须使用只读账号。
 - Monitor 只向自己的两份 SQLite 写入数据：`MONITOR_STORE_PATH` 保存配置/权限/稳定性等控制数据，`MONITOR_USAGE_FACTS_STORE_PATH` 独立保存高增长的用量事实和脱敏资料。未显式配置后者时，默认是主库同目录的 `usage-facts.db`。
 - 两份 SQLite 都应视为业务数据，并放在同一个持久化卷中；运行期 facts 同步失败可以只停用事实写入，但**启动/迁移前**是双库共同闸门：任一现有库损坏、无法锁定或无法生成成套快照时，整个新进程在主库任何 `AutoMigrate` 前退出。已经打开事实读时仍保持 fail-closed，防止静默回扫生产 `logs`。
-- Redis 只用于可选用量缓存；不可用时自动降级，不能作为恢复来源。
+- 用量缓存仅在进程内，不再连接 Redis。旧 `MONITOR_USAGE_REDIS_*` 被忽略；Redis 不能作为恢复来源。回收旧服务前仍须独立确认没有其他应用使用它。
 
 ## 来源生命周期与健康端点
 

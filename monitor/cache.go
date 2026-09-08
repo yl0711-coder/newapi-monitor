@@ -3,14 +3,13 @@ package monitor
 // cache.go:管理端与客户端用量聚合结果缓存。
 //
 // 设计边界:
-//   - Redis 是可选的主缓存，只保存可重新计算的 JSON 聚合结果，不参与鉴权；
-//   - 本机保留最多 60 秒、128 项/16 MiB 的有界新鲜缓存，Redis 故障时不低于旧版 60 秒缓存口径；
+//   - 生产只使用本机缓存，不创建 Redis 客户端；旧环境变量不会恢复远端访问；
+//   - 本机保留最多 60 秒、128 项/16 MiB 的有界新鲜缓存；
 //   - 核心报表可在源查询短暂失败时读取一份本机“最近成功结果”。该结果有独立、严格的
 //     过期时间，调用方必须显式标记为非新鲜数据；正常读取绝不会命中它；
-//   - 本机缓存始终受条目/字节硬上限约束；Redis 只保存新鲜结果，不参与陈旧结果兜底；
+//   - 本机缓存始终受条目/字节硬上限约束；
 //   - 同键并发由进程内 singleflight 合并，等待者取消不会影响正在执行的请求；
-//   - Redis 超时、断连、鉴权失败一律自动降级，绝不能让业务接口因缓存返回 500；
-//   - 所有远端键都带 TTL，删除只用精确键，禁止 KEYS/SCAN。
+//   - 旧远端抽象仅供缓存一致性回归测试注入内存替身，没有网络实现。
 
 import (
 	"container/list"
@@ -25,8 +24,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-
-	redis "github.com/redis/go-redis/v9"
 )
 
 const (
@@ -39,7 +36,6 @@ const (
 	usageCacheRemoteTimeout   = 150 * time.Millisecond
 	usageCacheRemoteBackoff   = 30 * time.Second
 	usageCacheWarnInterval    = time.Minute
-	usageCacheRedisPoolSize   = 8
 	usageCacheBypassMaxKeys   = 4096
 
 	// 包含今天的报表是一分钟级准实时；已结束的历史日期基本不再变化，
@@ -54,59 +50,13 @@ const (
 
 var errUsageCacheMiss = errors.New("usage cache miss")
 
-// byteCacheStore 是 Redis 的最小能力面。测试用内存替身实现同一接口，生产实现见下方。
+// byteCacheStore 保留用于旧缓存一致性回归测试；生产构造器不注入远端实现。
 type byteCacheStore interface {
 	Get(context.Context, string) ([]byte, error)
 	Set(context.Context, string, []byte, time.Duration) error
 	Delete(context.Context, ...string) error
 	Close() error
 }
-
-type redisByteCacheStore struct {
-	client *redis.Client
-}
-
-func newRedisByteCacheStore(s Settings) *redisByteCacheStore {
-	return &redisByteCacheStore{client: redis.NewClient(usageRedisOptions(s))}
-}
-
-// usageRedisOptions 集中约束 Redis 客户端资源。go-redis 的 MaxRetries=0
-// 表示使用默认重试次数；要由业务层在 150ms 内快速降级，必须显式设为 -1。
-func usageRedisOptions(s Settings) *redis.Options {
-	return &redis.Options{
-		Addr:           s.UsageRedisAddr,
-		Username:       s.UsageRedisUsername,
-		Password:       s.UsageRedisPassword,
-		DB:             s.UsageRedisDB,
-		DialTimeout:    usageCacheRemoteTimeout,
-		ReadTimeout:    usageCacheRemoteTimeout,
-		WriteTimeout:   usageCacheRemoteTimeout,
-		PoolSize:       usageCacheRedisPoolSize,
-		MaxActiveConns: usageCacheRedisPoolSize,
-		MaxRetries:     -1,
-	}
-}
-
-func (s *redisByteCacheStore) Get(ctx context.Context, key string) ([]byte, error) {
-	b, err := s.client.Get(ctx, key).Bytes()
-	if errors.Is(err, redis.Nil) {
-		return nil, errUsageCacheMiss
-	}
-	return b, err
-}
-
-func (s *redisByteCacheStore) Set(ctx context.Context, key string, value []byte, ttl time.Duration) error {
-	return s.client.Set(ctx, key, value, ttl).Err()
-}
-
-func (s *redisByteCacheStore) Delete(ctx context.Context, keys ...string) error {
-	if len(keys) == 0 {
-		return nil
-	}
-	return s.client.Del(ctx, keys...).Err()
-}
-
-func (s *redisByteCacheStore) Close() error { return s.client.Close() }
 
 type usageResultCache struct {
 	prefix string
@@ -203,8 +153,7 @@ func newUsageResultCache(s Settings) *usageResultCache {
 		logRemoteErrors: true,
 	}
 	if strings.TrimSpace(s.UsageRedisAddr) != "" {
-		c.remote = newRedisByteCacheStore(s)
-		slog.Info("用量 Redis 缓存已配置", "addr", s.UsageRedisAddr, "db", s.UsageRedisDB, "prefix", prefix)
+		slog.Info("用量缓存使用本机内存；旧 MONITOR_USAGE_REDIS_* 配置已忽略，不建立 Redis 连接")
 	}
 	return c
 }

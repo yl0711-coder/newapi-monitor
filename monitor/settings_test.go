@@ -6,6 +6,23 @@ import (
 	"testing"
 )
 
+func TestAICodeWithRecordsRequireExplicitOptIn(t *testing.T) {
+	const key = "MONITOR_AICODEWITH_RECORDS_ENABLED"
+	t.Setenv(key, "")
+	for _, value := range []string{"", "false", "true"} {
+		t.Setenv(key, value)
+		if got := LoadSettings().UpstreamAICodeWithRecordsEnabled; got != (value == "true") {
+			t.Fatalf("value=%q enabled=%v", value, got)
+		}
+	}
+	if err := os.Unsetenv(key); err != nil {
+		t.Fatal(err)
+	}
+	if LoadSettings().UpstreamAICodeWithRecordsEnabled {
+		t.Fatal("ordinary upgrade must not activate record backfill")
+	}
+}
+
 func TestOriginLockTargetsAllowExplicitDisable(t *testing.T) {
 	const key = "MONITOR_ORIGIN_LOCK_TARGETS"
 	t.Setenv(key, "")
@@ -120,6 +137,7 @@ func TestLocalAuthBypassIsExplicitAndFailsClosed(t *testing.T) {
 	}
 	invalid := []Settings{
 		{LocalAuthBypass: true, AlertsDisabled: true},
+		{LocalAuthBypass: true, LocalSnapshotOnly: true, UpstreamDiagnosticsLocalEnabled: true, AlertsDisabled: true},
 		{LocalAuthBypass: true, LocalSnapshotOnly: true, ProdDSN: "production", AlertsDisabled: true},
 		{LocalAuthBypass: true, LocalSnapshotOnly: true, NewAPIBaseURL: "https://example.com", AlertsDisabled: true},
 		{LocalAuthBypass: true, LocalSnapshotOnly: true, SourceWorkerEnabled: true, AlertsDisabled: true},

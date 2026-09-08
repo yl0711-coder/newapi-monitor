@@ -845,10 +845,10 @@ func TestFetchAICodeWithUsageWindowValidatesSummaryAndKeepsZeroDays(t *testing.T
 		t.Fatalf("unexpected AICodeWith result: %+v", result)
 	}
 	first, second := result.Hours[0], result.Hours[1]
-	if first.HourTs != from || first.BucketSeconds != 86400 || first.Requests != 11 || first.Tokens != 12852 || math.Abs(first.CostUSD-2.7168) > 1e-12 {
+	if first.UnitPerUSD != 1 || first.HourTs != from || first.BucketSeconds != 86400 || first.Requests != 11 || first.Tokens != 12852 || math.Abs(first.CostUSD-2.7168) > 1e-12 {
 		t.Fatalf("first day=%+v", first)
 	}
-	if second.HourTs != from+86400 || second.BucketSeconds != 86400 || second.Requests != 0 || second.Tokens != 0 || second.CostUSD != 0 {
+	if second.UnitPerUSD != 1 || second.HourTs != from+86400 || second.BucketSeconds != 86400 || second.Requests != 0 || second.Tokens != 0 || second.CostUSD != 0 {
 		t.Fatalf("zero-consumption day was not represented explicitly: %+v", second)
 	}
 }
@@ -973,6 +973,11 @@ func TestSyncStoredAICodeWithUsagePersistsTailAndHistoryAtomically(t *testing.T)
 	if len(buckets) != 2 || buckets[0].HourTs != today-86400 || buckets[0].BucketSeconds != 86400 || buckets[0].Requests != 3 || buckets[0].CostUSD != 3 ||
 		buckets[1].HourTs != today || buckets[1].BucketSeconds <= 0 || buckets[1].BucketSeconds > 86400 || buckets[1].Requests != 3 || buckets[1].CostUSD != 3 {
 		t.Fatalf("tail/history buckets=%+v", buckets)
+	}
+	for _, bucket := range buckets {
+		if bucket.UnitPerUSD != 1 || bucket.Quota != bucket.CostUSD {
+			t.Fatalf("daily fetch/stage/publish lost conversion evidence: %+v", bucket)
+		}
 	}
 }
 

@@ -370,7 +370,7 @@ func (m *Monitor) pruneStabilityOlderThan(cutoffTs int64) error {
 	}
 	// 补数任务只保留审计摘要，不随小时明细无限增长。正在执行/等待续跑的任务不能删。
 	jobCutoff := cutoffTs - 30*86400
-	if err := m.storeDB.Where("updated_at < ? AND status IN ?", jobCutoff, []string{"complete", "paused"}).Delete(&StabilityBackfillJob{}).Error; err != nil {
+	if err := m.storeDB.Where("updated_at < ? AND status = ?", jobCutoff, "complete").Delete(&StabilityBackfillJob{}).Error; err != nil {
 		return fmt.Errorf("清理稳定性补数任务: %w", err)
 	}
 	return nil

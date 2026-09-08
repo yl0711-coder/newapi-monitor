@@ -1688,11 +1688,9 @@ func fetchAICodeWithUsageWindow(ctx context.Context, client *http.Client, row Ch
 		return upstreamUsageResult{}, fmt.Errorf("AICodeWith 使用量分日合计与 summary 不一致")
 	}
 	hours := make([]ChannelUpstreamUsageHour, 0, days)
-	unit := row.BalanceUnit
-	if unit <= 0 {
-		// 已保存的春秋账户会从余额响应持久化真实换算单位。早期仅支持
-		// USD 的账户可能没有单位，继续按 1 兼容；新 CNY 账户不会走这里。
-		unit = 1
+	unit, err := aiCodeWithDailyUnit(row.BalanceUnit)
+	if err != nil {
+		return upstreamUsageResult{}, err
 	}
 	for day := from; day <= lastDay; day += 86400 {
 		bucketTo := day + 86400
@@ -1703,7 +1701,7 @@ func fetchAICodeWithUsageWindow(ctx context.Context, client *http.Client, row Ch
 		hours = append(hours, ChannelUpstreamUsageHour{
 			Domain: row.Domain, HourTs: day, BucketSeconds: bucketTo - day,
 			Requests: metric.Requests, Tokens: metric.Tokens, Quota: metric.Cost,
-			CostUSD: metric.Cost / unit, Provider: row.Provider,
+			CostUSD: metric.Cost / unit, UnitPerUSD: unit, Provider: row.Provider,
 		})
 	}
 	return upstreamUsageResult{Hours: hours, DataUntil: to, Adapter: upstreamUsageAdapterAICodeWith, SourceKeyID: envelope.Data.APIKeyID}, nil
@@ -1735,13 +1733,13 @@ func (m *Monitor) syncAICodeWithUsage(ctx context.Context, row ChannelUpstreamAc
 		seenKeyIDs[result.SourceKeyID] = true
 		for _, bucket := range result.Hours {
 			current, exists := combined[bucket.HourTs]
-			if exists && current.BucketSeconds != bucket.BucketSeconds {
+			if exists && (current.BucketSeconds != bucket.BucketSeconds || current.UnitPerUSD != bucket.UnitPerUSD) {
 				return upstreamUsageResult{}, fmt.Errorf("AICodeWith 多 Key 账单覆盖范围不一致")
 			}
 			if !exists {
 				current = ChannelUpstreamUsageHour{
 					Domain: row.Domain, HourTs: bucket.HourTs, BucketSeconds: bucket.BucketSeconds,
-					Provider: row.Provider,
+					Provider: row.Provider, UnitPerUSD: bucket.UnitPerUSD,
 				}
 			}
 			current.Requests += bucket.Requests
@@ -1765,9 +1763,14 @@ func newAICodeWithRoundID(domain, kind, version string, from, to int64) string {
 }
 
 func (m *Monitor) ensureAICodeWithUsageRound(ctx context.Context, row ChannelUpstreamAccount, version, kind string, from, to int64, total int, now int64) (AICodeWithUsageRound, error) {
+	unit := row.BalanceUnit
+	if unit <= 0 {
+		unit = 1
+	}
+	epoch := newAPIUpstreamAccountEpoch(row)
 	var round AICodeWithUsageRound
 	err := m.storeDB.WithContext(ctx).First(&round, "domain = ? AND kind = ?", row.Domain, kind).Error
-	if err == nil && round.CredentialSetVersion == version && round.Status == upstreamStatusPending {
+	if err == nil && round.CredentialSetVersion == version && round.Status == upstreamStatusPending && (!round.RecordMode || (round.UnitPerUSD == unit && round.SourceEpoch == epoch)) {
 		return round, nil
 	}
 	if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
@@ -1775,12 +1778,17 @@ func (m *Monitor) ensureAICodeWithUsageRound(ctx context.Context, row ChannelUps
 	}
 	oldRoundID := round.RoundID
 	round = AICodeWithUsageRound{
-		Domain: row.Domain, Kind: kind, RoundID: newAICodeWithRoundID(row.Domain, kind, version, from, to),
+		UnitPerUSD: unit, SourceEpoch: epoch,
+		RecordMode: m.cfg.UpstreamAICodeWithRecordsEnabled,
+		Domain:     row.Domain, Kind: kind, RoundID: newAICodeWithRoundID(row.Domain, kind, version, from, to),
 		CredentialSetVersion: version, WindowFrom: from, WindowTo: to, TotalKeys: total,
 		Status: upstreamStatusPending, CreatedAt: now, UpdatedAt: now,
 	}
 	err = m.storeDB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		if oldRoundID != "" {
+			if err := clearAICodeWithRecordCheckpoint(tx, row.Domain, oldRoundID, ""); err != nil {
+				return err
+			}
 			if err := tx.Where("domain = ? AND round_id = ?", row.Domain, oldRoundID).Delete(&AICodeWithUsageStage{}).Error; err != nil {
 				return err
 			}
@@ -1812,6 +1820,8 @@ func (m *Monitor) stageAICodeWithKeyResult(ctx context.Context, round AICodeWith
 		}
 		for _, bucket := range result.Hours {
 			stage := AICodeWithUsageStage{
+				SourceCostUnits: bucket.SourceCostUnits,
+				SourceKind:      bucket.SourceKind, Provisional: bucket.Provisional, UnitPerUSD: bucket.UnitPerUSD,
 				Domain: state.Domain, RoundID: round.RoundID, SlotID: state.SlotID,
 				HourTs: bucket.HourTs, CredentialSetVersion: round.CredentialSetVersion,
 				BucketSeconds: bucket.BucketSeconds, Requests: bucket.Requests, Tokens: bucket.Tokens,
@@ -1883,17 +1893,48 @@ func (m *Monitor) publishAICodeWithRound(ctx context.Context, row *ChannelUpstre
 		return false, err
 	}
 	aggregated := make(map[int64]ChannelUpstreamUsageHour)
+	if round.RecordMode && len(staged) != round.TotalKeys*int((round.WindowTo-round.WindowFrom)/3600) {
+		return false, fmt.Errorf("AICodeWith record 暂存小时不完整，拒绝发布")
+	}
 	for _, part := range staged {
+		if !round.RecordMode {
+			unit, err := aiCodeWithDailyStageUnit(part)
+			if err != nil {
+				return false, err
+			}
+			part.UnitPerUSD = unit
+		}
 		bucket := aggregated[part.HourTs]
 		if bucket.Domain == "" {
-			bucket = ChannelUpstreamUsageHour{Domain: row.Domain, HourTs: part.HourTs, BucketSeconds: part.BucketSeconds, Provider: upstreamProviderAICodeWith}
+			bucket = ChannelUpstreamUsageHour{Domain: row.Domain, HourTs: part.HourTs, BucketSeconds: part.BucketSeconds, Provider: upstreamProviderAICodeWith, SourceKind: part.SourceKind, UnitPerUSD: part.UnitPerUSD}
 		} else if bucket.BucketSeconds != part.BucketSeconds {
 			return false, fmt.Errorf("AICodeWith 多 Key 账单覆盖范围不一致")
 		}
-		bucket.Requests += part.Requests
-		bucket.Tokens += part.Tokens
+		if err := addPricingCounter(&bucket.Requests, part.Requests); err != nil {
+			return false, err
+		}
+		if err := addPricingCounter(&bucket.Tokens, part.Tokens); err != nil {
+			return false, err
+		}
 		bucket.Quota += part.Quota
 		bucket.CostUSD += part.CostUSD
+		if round.RecordMode {
+			if !validUpstreamEconomicUnit(round.UnitPerUSD) || part.UnitPerUSD != round.UnitPerUSD {
+				return false, fmt.Errorf("AICodeWith record 暂存换算单位无效")
+			}
+			if part.BucketSeconds != 3600 || part.HourTs < round.WindowFrom || part.HourTs >= round.WindowTo || part.HourTs%3600 != 0 || part.SourceKind != upstreamUsageAdapterAICodeWithRecord {
+				return false, fmt.Errorf("AICodeWith record 暂存小时边界无效")
+			}
+			if err := addPricingCounter(&bucket.SourceCostUnits, part.SourceCostUnits); err != nil {
+				return false, err
+			}
+			bucket.Quota = float64(bucket.SourceCostUnits) / float64(aiCodeWithRecordScale)
+			bucket.CostUSD = bucket.Quota / round.UnitPerUSD
+		}
+		bucket.Provisional = bucket.Provisional || part.Provisional
+		if bucket.SourceKind != part.SourceKind || bucket.UnitPerUSD != part.UnitPerUSD {
+			return false, fmt.Errorf("AICodeWith 多 Key 账单来源或换算单位不一致")
+		}
 		bucket.FetchedAt = now
 		aggregated[part.HourTs] = bucket
 	}
@@ -1904,6 +1945,14 @@ func (m *Monitor) publishAICodeWithRound(ctx context.Context, row *ChannelUpstre
 		}
 		if current.RoundID != round.RoundID || current.CredentialSetVersion != round.CredentialSetVersion {
 			return fmt.Errorf("AICodeWith 凭据集合已变更，拒绝发布旧批次")
+		}
+		if err := archiveAICodeWithRepresentationChange(tx, *row, round, now); err != nil {
+			return err
+		}
+		if round.RecordMode {
+			if err := preserveAICodeWithRecordUnits(tx, row.Domain, round, aggregated); err != nil {
+				return err
+			}
 		}
 		if err := tx.Where("domain = ? AND hour_ts >= ? AND hour_ts < ?", row.Domain, round.WindowFrom, round.WindowTo).Delete(&ChannelUpstreamUsageHour{}).Error; err != nil {
 			return err
@@ -1920,6 +1969,9 @@ func (m *Monitor) publishAICodeWithRound(ctx context.Context, row *ChannelUpstre
 			}
 		}
 		if err := tx.Where("domain = ? AND round_id = ?", row.Domain, round.RoundID).Delete(&AICodeWithUsageStage{}).Error; err != nil {
+			return err
+		}
+		if err := clearAICodeWithRecordCheckpoint(tx, row.Domain, round.RoundID, ""); err != nil {
 			return err
 		}
 		if err := tx.Where("domain = ? AND kind = ?", row.Domain, round.Kind).Delete(&AICodeWithUsageRound{}).Error; err != nil {
@@ -1953,6 +2005,9 @@ func (m *Monitor) processAICodeWithRound(ctx context.Context, row *ChannelUpstre
 	}
 	if len(states) != len(normalized.Slots) {
 		if err := m.storeDB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+			if err := clearAICodeWithRecordCheckpoint(tx, row.Domain, "", ""); err != nil {
+				return err
+			}
 			if err := tx.Where("domain = ?", row.Domain).Delete(&AICodeWithKeySyncState{}).Error; err != nil {
 				return err
 			}
@@ -1994,7 +2049,27 @@ func (m *Monitor) processAICodeWithRound(ctx context.Context, row *ChannelUpstre
 	roundPacer := newUpstreamUsageRequestPacer(max(1, budget), m.aiCodeWithRequestInterval())
 	for _, i := range selectAICodeWithKeyStatesForTurn(states, round, kind, now, budget) {
 		state := &states[i]
-		result, fetchErr := fetchAICodeWithUsageWindow(ctx, m.channelUpstreamHTTPClient(), *row, secretByID[state.SlotID], round.WindowFrom, round.WindowTo, roundPacer)
+		var result upstreamUsageResult
+		var fetchErr error
+		ready := true
+		if round.RecordMode {
+			result, ready, fetchErr = m.fetchAICodeWithRecordWindow(ctx, *row, secretByID[state.SlotID], round, state.SlotID, now, roundPacer)
+		} else {
+			result, fetchErr = fetchAICodeWithUsageWindow(ctx, m.channelUpstreamHTTPClient(), *row, secretByID[state.SlotID], round.WindowFrom, round.WindowTo, roundPacer)
+		}
+		if round.RecordMode && fetchErr == nil && !ready {
+			if kind == "tail" {
+				state.Status = upstreamStatusPending
+				state.NextSyncAt = now + aiCodeWithRecordResumeSeconds
+			} else {
+				state.BackfillNextSyncAt = now + aiCodeWithRecordResumeSeconds
+			}
+			state.UpdatedAt = now
+			if err := m.storeDB.WithContext(ctx).Save(state).Error; err != nil {
+				return false, 0, roundPacer.calls, err
+			}
+			break
+		}
 		if fetchErr == nil {
 			fetchErr = m.stageAICodeWithKeyResult(ctx, round, state, result, now)
 		}
@@ -2007,6 +2082,9 @@ func (m *Monitor) processAICodeWithRound(ctx context.Context, row *ChannelUpstre
 			}
 		}
 		processed++
+		if round.RecordMode && roundPacer.calls >= budget {
+			break
+		}
 		// 认证错误只隔离当前 Key，继续验证其他 Key；而限流、主机熔断、
 		// 超时和 5xx 属于账户/主机级信号，本轮立即止步，避免一个故障
 		// 被剩余 Key 放大为请求风暴。未处理 Key 保持 pending，下轮续跑。
@@ -2018,6 +2096,9 @@ func (m *Monitor) processAICodeWithRound(ctx context.Context, row *ChannelUpstre
 		if ctx.Err() != nil {
 			break
 		}
+	}
+	if round.RecordMode {
+		processed = roundPacer.calls
 	}
 	published, err := m.publishAICodeWithRound(ctx, row, round, now)
 	if err != nil {
@@ -2033,6 +2114,9 @@ func (m *Monitor) processAICodeWithRound(ctx context.Context, row *ChannelUpstre
 			row.UsageBackfillCursor = round.WindowTo
 		}
 		row.UsageAdapter = upstreamUsageAdapterAICodeWith
+		if round.RecordMode {
+			row.UsageAdapter = upstreamUsageAdapterAICodeWithRecord
+		}
 		return true, int64(round.TotalKeys), processed, nil
 	}
 	var done int64
@@ -2136,8 +2220,22 @@ func (m *Monitor) syncStoredAICodeWithUsage(ctx context.Context, row *ChannelUps
 	total := len(normalized.Slots)
 	budget := aiCodeWithKeysPerTurn
 	today := cstDayStart(now)
+	if m.cfg.UpstreamAICodeWithRecordsEnabled && row.RecordsStartedAt == 0 {
+		row.RecordsStartedAt = now
+		row.UsageBackfillCursor = today - min(aiCodeWithRecordMigrationDays, int64(upstreamUsageBackfillDays(m.cfg)))*86400
+		row.UsageBackfillDone = false
+		row.UsageBackfillNextSyncAt = 0
+	}
 	if lane != upstreamUsageLaneHistory && (row.UsageNextSyncAt == 0 || row.UsageNextSyncAt <= now) {
-		published, done, used, roundErr := m.processAICodeWithRound(ctx, row, normalized, version, "tail", today, now, now, budget)
+		to := now
+		if m.cfg.UpstreamAICodeWithRecordsEnabled {
+			to = now / 3600 * 3600
+		}
+		if to <= today {
+			row.UsageNextSyncAt = today + 3600
+			return nil
+		}
+		published, done, used, roundErr := m.processAICodeWithRound(ctx, row, normalized, version, "tail", today, to, now, budget)
 		budget -= used
 		row.UsageLastAttemptAt = now
 		if roundErr != nil {
@@ -2162,6 +2260,9 @@ func (m *Monitor) syncStoredAICodeWithUsage(ctx context.Context, row *ChannelUps
 			if row.UsageNextSyncAt == 0 {
 				row.UsageNextSyncAt = now + 15
 			}
+			if m.cfg.UpstreamAICodeWithRecordsEnabled && row.UsageNextSyncAt < now+aiCodeWithRecordResumeSeconds {
+				row.UsageNextSyncAt = now + aiCodeWithRecordResumeSeconds
+			}
 			return nil
 		}
 		row.UsageStatus, row.UsageLastError = upstreamStatusOK, ""
@@ -2173,6 +2274,11 @@ func (m *Monitor) syncStoredAICodeWithUsage(ctx context.Context, row *ChannelUps
 	}
 	if row.UsageBackfillCursor == 0 {
 		row.UsageBackfillCursor = cstDayStart(now - int64(upstreamUsageBackfillDays(m.cfg))*86400)
+	}
+	// Reconcile the last two closed days again after rollover, catching late
+	// charges without restarting the full historical migration.
+	if m.cfg.UpstreamAICodeWithRecordsEnabled && row.UsageBackfillDone && row.UsageBackfillCursor < today {
+		row.UsageBackfillCursor = today - 2*86400
 	}
 	if row.UsageBackfillCursor >= today {
 		row.UsageBackfillDone, row.UsageBackfillNextSyncAt = true, 0
@@ -2186,6 +2292,9 @@ func (m *Monitor) syncStoredAICodeWithUsage(ctx context.Context, row *ChannelUps
 		return nil
 	}
 	to := row.UsageBackfillCursor + aiCodeWithUsageMaxDays*86400
+	if m.cfg.UpstreamAICodeWithRecordsEnabled {
+		to = row.UsageBackfillCursor + 86400
+	}
 	if to > today {
 		to = today
 	}
@@ -2213,6 +2322,9 @@ func (m *Monitor) syncStoredAICodeWithUsage(ctx context.Context, row *ChannelUps
 		if row.UsageBackfillNextSyncAt == 0 {
 			row.UsageBackfillNextSyncAt = now + 15
 		}
+		if m.cfg.UpstreamAICodeWithRecordsEnabled && row.UsageBackfillNextSyncAt < now+aiCodeWithRecordResumeSeconds {
+			row.UsageBackfillNextSyncAt = now + aiCodeWithRecordResumeSeconds
+		}
 		return nil
 	}
 	// The round may have started before midnight; use its published cursor,
@@ -2224,6 +2336,9 @@ func (m *Monitor) syncStoredAICodeWithUsage(ctx context.Context, row *ChannelUps
 		row.UsageBackfillNextSyncAt = 0
 	} else {
 		row.UsageBackfillNextSyncAt = now + 15
+		if m.cfg.UpstreamAICodeWithRecordsEnabled {
+			row.UsageBackfillNextSyncAt = now + aiCodeWithRecordResumeSeconds
+		}
 	}
 	return nil
 }

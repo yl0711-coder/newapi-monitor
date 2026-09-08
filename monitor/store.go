@@ -904,6 +904,7 @@ func (m *Monitor) openStore(path string) error {
 		return fmt.Errorf("上游错误日志事件键迁移失败: %w", err)
 	}
 	if err := db.AutoMigrate(
+		&AICodeWithRecordCheckpoint{}, &AICodeWithRecordSeen{},
 		&MetricSample{}, &CapacityUserMinuteSample{}, &TokenSample{}, &MetricFinalizeState{}, &HourSample{}, &ChannelSnap{}, &RejectionSample{}, &RejectionIngestBatch{}, &SelectablePair{},
 		&StabilityHourSample{}, &ChannelTestHourSample{}, &StabilityRejectHour{}, &StabilityProblemSample{},
 		&StabilityProblemIngestState{}, &StabilityProblemStage{}, &StabilityProblemClassificationMigration{}, &StabilityProblemLiveCursor{},

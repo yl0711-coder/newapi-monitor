@@ -63,11 +63,7 @@ docker run -d --name newapi-monitor \
 | `MONITOR_UPSTREAM_ERRORLOG_DOMAINS` | 允许采集错误明细的 NewAPI 上游域名白名单（逗号分隔）；空值时即使总闸门开启也不出网 | 留空 |
 | `MONITOR_ADDR` | 监听地址 | `:8090` |
 | `MONITOR_PORTAL_ADDR` | 客户用量门户独立监听地址；留空则不启用 | 留空 |
-| `MONITOR_USAGE_REDIS_ADDR` | 客户用量聚合结果 Redis 私网地址；留空时自动使用有界本机短缓存 | 留空 |
-| `MONITOR_USAGE_REDIS_USERNAME` | Redis ACL 用户；生产建议仅允许 `nxmon:*` | 留空 |
-| `MONITOR_USAGE_REDIS_PASSWORD` | Redis 密码；只通过环境变量注入 | 留空 |
-| `MONITOR_USAGE_REDIS_DB` | Redis DB 编号；安全隔离仍依赖 ACL 与 key prefix | `0` |
-| `MONITOR_USAGE_REDIS_PREFIX` | 用量缓存键前缀 | `nxmon:usage:v1` |
+| `MONITOR_USAGE_REDIS_*` | 已退役的兼容环境变量；即使残留也不会创建 Redis 客户端 | 忽略 |
 | `MONITOR_TRUSTED_PROXIES` | 可提供真实客户端 IP 的可信反代 IP/CIDR，逗号分隔；留空则不信任转发头 | 留空 |
 | `MONITOR_STORE_PATH` | 本地采样库路径 | `/data/monitor.db` |
 | `MONITOR_USAGE_FACTS_STORE_PATH` | 独立用量事实库路径；与主库分文件，避免补数/WAL/损坏影响控制数据 | `<MONITOR_STORE_PATH 目录>/usage-facts.db` |
@@ -165,19 +161,17 @@ usage.example.com {
 不要直接将 `8090`、`8091` 映射到公网；客户账号需由超级管理员在「用户用量」中为分组开通。
 若 Caddy/Nginx 不在同一主机，需将其实际 IP/CIDR 配入 `MONITOR_TRUSTED_PROXIES`，否则登录限流会按反代地址计算。
 
-可选 Redis 只缓存矩阵、按日/分组/模型及令牌日志聚合：包含今天的区间 TTL 为 60 秒，
-已结束的历史区间 TTL 为 10 分钟，管理端重新选择日期时强制取新。用户名、邮箱、当前余额、
-令牌当前元数据、会话、原始日志和 CSV 不写入 Redis。Redis 断连/超时/鉴权失败时接口自动回退到
-最多 128 项、16 MiB 的本机最多 60 秒应急缓存，本机过期时间不会超过 Redis 记录的剩余 TTL。
-Redis 故障后会快速回源并退避 30 秒，使故障稳态的同键回源频率不高于旧版 60 秒本机缓存。
+用量聚合仅使用本机有界缓存，新鲜结果最多保留 60 秒，总上限为 128 项、16 MiB，
+管理端重新选择日期时强制取新，同键并发请求合并。仅核心报表可在查询短暂失败时
+显式使用有时限的最近成功结果，并标记非新鲜状态；正常读取不会使用该回退结果。
+用户名、邮箱、当前余额、令牌当前元数据、会话、原始日志和 CSV 不作为聚合缓存。
 每个聚合结果最多缓存 4 MiB；每日消费矩阵在“成员数×自然日数”超过 20,000 格时，
 服务端会在执行聚合和缓存填充前拒绝并提示缩小范围。事实层冷查询另有容量为 2 的本地并发闸门，
 避免不同缓存键同时读取大范围 SQLite 时放大 CPU 和内存。
-不能把 Redis 当作业务正确性的依赖。生产必须使用私网地址、
-独立 ACL 用户及带 TTL 的 `nxmon:*` 权限，禁止把 Redis 6379 直接暴露公网。
-管理员登录后可读取 `GET /usage/cache-stats` 查看命中、回源、远端错误、退避状态、本机容量及
+本版本不创建 Redis 网络客户端；旧 `MONITOR_USAGE_REDIS_*` 不会恢复远端访问。
+管理员登录后可读取 `GET /usage/cache-stats` 查看命中、回源、本机容量及
 `source_budget`/`facts_read_budget` 查询闸门计数；
-该接口不会主动探测 Redis，也不返回缓存键、筛选条件或客户数据。CSV 导出先做一次带快照的预检，
+为兼容保留的远端计数在生产为零，`remote_configured=false`；接口不返回缓存键、筛选条件或客户数据。CSV 导出先做一次带快照的预检，
 随后由浏览器直接流式写入文件；5 万行上限保持不变，页面内存不再随导出行数增长。
 
 ## 安全

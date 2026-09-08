@@ -1,11 +1,11 @@
 # 完全离线的本机 Smoke Test 覆盖文件。
 # 必须与 docker-compose.local-acceptance.yml 叠加使用；不连接 MySQL、主站或任何上游。
-# 适合验证镜像能否启动、SQLite 数据卷、Redis、/live 与 /ready。
+# 适合验证镜像能否启动、SQLite 数据卷、本机缓存、/live 与 /ready。
 #
 # 示例：
 #   MONITOR_ACCEPTANCE_IMAGE=newapi-monitor:local-snapshot \
 #     docker compose -f docker-compose.local-acceptance.yml \
-#       -f docker-compose.local-snapshot.yml up -d --build redis monitor
+#       -f docker-compose.local-snapshot.yml up -d --build monitor
 #
 # 该模式没有 NewAPI 登录来源，因此不能用于登录、用户用量或真实数据验收。
 services:

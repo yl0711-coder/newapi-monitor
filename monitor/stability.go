@@ -956,9 +956,12 @@ func (m *Monitor) buildStabilityReportWithDetails(ctx context.Context, scope sta
 	keys := dateKeys(scope.FromTs, scope.ToTs)
 	timelineKeys := stabilityBucketKeys(scope, timelineStep)
 	totalMetrics, prevMetrics := total.metrics(), prevTotal.metrics()
+	dataCoverage := m.stabilityDataCoverage(ctx, scope.FromTs, scope.ToTs, now)
 	comparisonCoverage := m.stabilityDataCoverage(ctx, previousScope.FromTs, previousScope.ToTs, now)
+	comparisonAvailable := dataCoverage.Complete && dataCoverage.ProvisionalSeconds == 0 &&
+		comparisonCoverage.Complete && comparisonCoverage.ProvisionalSeconds == 0
 	comparisonDelta := func(current, previous StabilityMetrics) *float64 {
-		if !comparisonCoverage.Complete {
+		if !comparisonAvailable {
 			return nil
 		}
 		return deltaPP(current, previous)
@@ -1064,8 +1067,8 @@ func (m *Monitor) buildStabilityReportWithDetails(ctx context.Context, scope sta
 	}
 
 	queryDays := m.cfg.stabilityQueryDays()
-	meta := StabilityReportMeta{From: time.Unix(scope.FromTs, 0).In(cstLocation).Format("2006-01-02"), To: time.Unix(scope.ToTs-1, 0).In(cstLocation).Format("2006-01-02"), GeneratedAt: now, RetentionDays: queryDays, RowsTruncated: false, ComparisonAvailable: comparisonCoverage.Complete, ComparisonCoverage: comparisonCoverage, TimelineBucketSec: timelineStep}
-	meta.DataCoverage = m.stabilityDataCoverage(ctx, scope.FromTs, scope.ToTs, now)
+	meta := StabilityReportMeta{From: time.Unix(scope.FromTs, 0).In(cstLocation).Format("2006-01-02"), To: time.Unix(scope.ToTs-1, 0).In(cstLocation).Format("2006-01-02"), GeneratedAt: now, RetentionDays: queryDays, RowsTruncated: false, ComparisonAvailable: comparisonAvailable, ComparisonCoverage: comparisonCoverage, TimelineBucketSec: timelineStep}
+	meta.DataCoverage = dataCoverage
 	var coverage struct{ Min, Max int64 }
 	warnReadErr("stability coverage", m.storeDB.WithContext(ctx).Raw(
 		"SELECT COALESCE(MIN(sh.hour_ts),0) min, COALESCE(MAX(sh.hour_ts),0) max FROM stability_hour_samples sh WHERE "+stabilityEffectiveSampleSQL("sh")).Scan(&coverage))

@@ -5,6 +5,49 @@ import vm from 'node:vm';
 
 const source = name => readFileSync(new URL(`../../monitor/${name}`, import.meta.url), 'utf8');
 
+test('upstream diagnostics renders safe instructions and tolerates missing checks',()=>{
+  const {context,element}=dashboard();
+  context.channelTest.renderUpstreamDiagnostic({provider:'tokenforce',confidence:'suspected',checks:[{name:'余额',status:'error',message:'<img src=x onerror=alert(1)>',action:'重新登录'}],instructions:['查找 orgId'],scope:'仅单页'});
+  const html=element('cmUpstreamDiagnostic').innerHTML;
+  assert.match(html,/仅疑似/);assert.match(html,/重新登录/);assert.match(html,/orgId/);assert.doesNotMatch(html,/<img/);
+  context.channelTest.renderUpstreamDiagnostic({provider:'unknown',checks:null,instructions:null});
+  assert.match(element('cmUpstreamDiagnostic').innerHTML,/尚未识别/);
+});
+
+test('upstream diagnostics sends only address and domain; ignores late response after reset',async()=>{
+  let finish,request;
+  let jsonStarted;
+  const ready=new Promise(resolve=>{jsonStarted=resolve});
+  const {context,element}=dashboard(async(url,options)=>{
+    request={url,...options};
+    return {ok:true,json:()=>new Promise(resolve=>{finish=resolve;jsonStarted()})};
+  });
+  const ui=context.channelTest;ui.cm.upstreamDomain={domain:'example.com'};ui.cm.upstreamConfig={provider:'newapi'};
+  element('cmUpstreamBaseURL').value='https://panel.example.com';
+  element('cmUpstreamAccessToken').value='DO-NOT-SEND';
+  const pending=ui.diagnoseUpstream();await ready;
+  assert.equal(request.url,'/channels/upstream/diagnose');
+  assert.deepEqual(JSON.parse(request.body),{domain:'example.com',base_url:'https://panel.example.com'});
+  ui.resetUpstreamDiagnostic();
+  finish({provider:'newapi',checks:[],instructions:[]});await pending;
+  assert.equal(element('cmUpstreamDiagnostic').hidden,true);
+  assert.equal(element('cmUpstreamDiagnostic').innerHTML,'');
+  assert.equal(request.signal.aborted,true);
+});
+
+test('diagnostic browser timeout leaves room for the server queue budget',async()=>{
+  const {context,element}=dashboard(async()=>({ok:true,json:async()=>({provider:'unknown',checks:[],instructions:[]})}));
+  let timeout;
+  context.setTimeout=(_callback,ms)=>{timeout=ms;return 1};
+  context.channelTest.cm.upstreamDomain={domain:'example.com'};
+  context.channelTest.cm.upstreamConfig={};
+  element('cmUpstreamBaseURL').value='https://example.com';
+  await context.channelTest.diagnoseUpstream();
+  const serverSeconds=Number(source('upstream_diagnostic_transport.go').match(/const diagnosticTimeout = (\d+) \* time.Second/)[1]);
+  assert.ok(timeout>=serverSeconds*1000+5000,'browser must allow the server to return timeout advice');
+  assert.equal(element('cmUpstreamDetect').disabled,false);
+});
+
 // Execute production renderers against a minimal DOM sink. No network, login,
 // timers or production data are used; assertions inspect the generated HTML.
 function dashboard(fetchImpl = () => {throw Error('network forbidden in renderer tests');}) {
@@ -12,7 +55,7 @@ function dashboard(fetchImpl = () => {throw Error('network forbidden in renderer
   const document = {
     getElementById(id) {
       if (!elements.has(id)) elements.set(id, {innerHTML: '', textContent: '', value: '', options: [], hidden: false, children: [], dataset: {}, style: {setProperty() {}}, setAttribute() {}, removeAttribute() {},
-        querySelector: selector => document.getElementById(id + selector)});
+        querySelectorAll: () => [], querySelector: selector => document.getElementById(id + selector)});
       return elements.get(id);
     },
     addEventListener() {},
@@ -24,10 +67,12 @@ function dashboard(fetchImpl = () => {throw Error('network forbidden in renderer
   const channel = source('channel_management.js');
   const end = channel.lastIndexOf('})();');
   assert.ok(end > 0, 'channel module closure must exist');
-  vm.runInContext(channel.slice(0, end) + '\nglobalThis.channelTest={loadReport,render,navigateDataStatus,usageMetric,renderUpstreamFunds,dateTime,shortDateTime,domainCard,freshness,cm,filteredDomains,domainSortDescription};\n' + channel.slice(end), context);
+  vm.runInContext(channel.slice(0, end) + '\nglobalThis.channelTest={loadReport,render,navigateDataStatus,usageMetric,renderUpstreamFunds,dateTime,shortDateTime,domainCard,freshness,cm,filteredDomains,domainSortDescription,renderUpstreamDiagnostic,diagnoseUpstream,resetUpstreamDiagnostic};\n' + channel.slice(end), context);
 
   const page = source('page.html');
-  for (const name of ['syncTime', 'renderLocks', 'renderInfraOverview', 'renderBanner', 'renderSummary', 'dimensionLimitNotice', 'clearModelResult']) {
+  vm.runInContext(page.match(/^function problemBuckets\(.*$/m)[0], context);
+  vm.runInContext(source('stability.js').match(/^function comparisonPendingText\([^]*?^}/m)[0], context);
+  for (const name of ['syncTime', 'renderLocks', 'renderInfraOverview', 'problemSpan', 'problemDetail', 'renderBanner', 'renderSummary', 'dimensionLimitNotice', 'clearModelResult']) {
     const declaration = page.match(new RegExp(`^function ${name}\\([^]*?^}`, 'm'));
     assert.ok(declaration, `production function ${name} must exist`);
     vm.runInContext(declaration[0], context);
@@ -95,6 +140,40 @@ test('local model preview never masquerades as a production sampler failure or a
   assert.equal(element('banner').className,'banner bad');
 });
 
+test('observed mode does not mask detected errors with a provisional-data notice', () => {
+  const {context, html, element} = dashboard();
+  for (const health of ['bad','warn']) {
+    context.renderBanner({view:'observed',sampling_active:true,data_complete:false,
+      summary:{total:10},by_channel:[{health}],by_model:null});
+    assert.equal(element('banner').className,'banner '+health);
+    assert.match(html('bannerMain'),health==='bad'?/1 项错误/:/1 项波动/);
+    assert.match(html('bannerMain'),/未定稿/);
+  }
+  context.renderBanner({view:'observed',sampling_active:true,summary:{total:10}});
+  assert.match(html('bannerMain'),/实时观察/);
+  assert.doesNotMatch(html('bannerMain'),/运行正常/);
+});
+
+test('complete historical bills cannot conceal stopped or failed usage synchronization', () => {
+  const {context} = dashboard();
+  for (const state of ['stale','error','reconnect','global_off']) {
+    const report={meta:{data_coverage:{complete:true}},domains:[{domain:'upstream.test',
+      upstream:{configured:true,balance_usd:10,status:'ok',usage_sync_enabled:true,usage_effective_status:state},
+      upstream_usage:{available:true,complete:true,cost_usd:5,adjusted_cost_available:true,adjusted_cost_usd:5}}]};
+    const issues=context.window.channelDataStatus.issues(report);
+    assert.equal(issues.length,1,state+' must remain visible despite a complete historical bill');
+    assert.match(issues[0].detail,/同步|认证/);
+  }
+});
+
+test('comparison pending explanation distinguishes current incompleteness from prior gaps', () => {
+  const {context} = dashboard();
+  const previous={complete:true,missing_hours:0};
+  assert.match(context.comparisonPendingText({comparison_coverage:previous,data_coverage:{complete:false,missing_hours:2}}),/当前区间.*2 小时/);
+  assert.match(context.comparisonPendingText({comparison_coverage:previous,data_coverage:{complete:true,provisional_seconds:3600}}),/当前区间仍在汇总/);
+  assert.match(context.comparisonPendingText({data_coverage:{complete:true},comparison_coverage:{complete:false,missing_hours:3}}),/上一周期小时待补 3 个/);
+});
+
 function modelDashboard(fetchImpl){
   const view=dashboard(fetchImpl), {context}=view;
   vm.runInContext(`let modelLoadSeq=0,modelAbort=null,modelQueryKey='',WINDOW=60;
@@ -107,6 +186,48 @@ function modelDashboard(fetchImpl){
   view.element('modelView').value='observed';
   return view;
 }
+
+function usageDashboard(fetchImpl, detail){
+  const view=dashboard(fetchImpl),{context}=view;
+  vm.runInContext(`let usageSeq=0,usageAbort=null,usageMxCache=null;
+    globalThis.usageDetail=null;globalThis.usageApplied=[];
+    function usageRangeParams(){return new URLSearchParams()}
+    function usageSetDataNotice(){} function usageSetMemberMatrixState(){}
+    function usageResetMemberMatrix(){} function renderUsageMemRank(){} function usageRenderMemberMatrix(){}
+    function renderUsageMatrix(mx){usageApplied.push(mx)}
+    function renderUsage(stats){usageApplied.push(stats)}`,context);
+  context.usageDetail=detail;
+  for(const name of ['usageBeginRequest','usageLoadMatrix','usageLoadDetail']){
+    const declaration=source('page.html').match(new RegExp(`^(?:async )?function ${name}\\([^]*?^}`,'m'));
+    assert.ok(declaration);vm.runInContext(declaration[0],context);
+  }
+  return view;
+}
+
+test('usage late JSON and malformed old responses cannot overwrite a newer customer or range', async()=>{
+  for(const detail of [null,{type:'user',id:1},{type:'token',id:3,uid:1},{type:'group',id:1}]){
+    for(const failOldBody of [false,true]){
+      const body=deferred(),parsing=deferred();let calls=0;
+      const {context}=usageDashboard(async()=>++calls===1
+        ?{ok:true,status:200,json:()=>{parsing.resolve();return body.promise;}}
+        :response({matrix:{cost:7},stats:{cost:7}}),detail);
+      const load=detail?context.usageLoadDetail:context.usageLoadMatrix;
+      const old=load();await parsing.promise;await load();
+      if(failOldBody)body.reject(Error('malformed old body'));else body.resolve({matrix:{cost:999},stats:{cost:999}});
+      await old;
+      assert.deepEqual(Array.from(context.usageApplied,x=>x.cost),[7]);
+    }
+  }
+});
+
+test('usage malformed current JSON is an error, never a successful empty financial result', async()=>{
+  for(const detail of [null,{type:'user',id:1}]){
+    const {context,html}=usageDashboard(async()=>({ok:true,status:200,json:async()=>{throw Error('invalid JSON')}}),detail);
+    await (detail?context.usageLoadDetail():context.usageLoadMatrix());
+    assert.equal(context.usageApplied.length,0);
+    assert.match(html('usageErr'),/加载失败/);
+  }
+});
 
 test('model query change clears stale values and failed responses cannot restore them', async () => {
   const pending=deferred();
@@ -349,6 +470,68 @@ test('natural-day mismatch is explained on sync page, not in business amount slo
   assert.match(status, /已结束的完整自然日/);
 });
 
+test('daily bill stays visible after refresh with scope, never contaminates hourly totals', () => {
+  const {context,html}=dashboard(),ui=context.channelTest;
+  const usage={requests:10,tokens:100,cost_usd:20};
+  const daily={key:'spring',domain:'aicodewith.com',configured:true,usage,vendors:[],
+    upstream:{configured:true,usage_sync_enabled:true,balance_usd:50,status:'ok',usage_status:'ok'},
+    upstream_usage:{available:true,integrity_status:'window_mismatch',granularity:'day',cost_usd:0},
+    natural_day_bill:{from_ts:1788624000,to_ts:1788776343,usage:{available:true,complete:true,cost_usd:770.3163,
+      adjusted_cost_available:true,adjusted_cost_usd:385.15815,recharge_ratio:2,integrity_status:'complete',data_until:1788776223}}};
+  const hourly={key:'hour',domain:'hour.example',configured:true,usage,vendors:[],
+    upstream:{configured:true,usage_sync_enabled:true,balance_usd:20},
+    upstream_usage:{available:true,complete:true,cost_usd:10,adjusted_cost_available:true,adjusted_cost_usd:5}};
+  for(const [index,domain] of [daily,hourly].entries())domain.vendors=[{name:'vendor',channels:[{id:index+1,name:'channel',current:true,status:1,usage,groups:[]}]}];
+  ui.cm.report={meta:{from:'2026-09-06',to:'2026-09-07',data_coverage:{complete:true}},summary:{usage},domains:[daily,hourly]};
+  for(const amount of [770.3163,780.3163]){
+    daily.natural_day_bill.usage.cost_usd=amount;
+    ui.render();
+    assert.match(html('cmBody'),new RegExp('\\$'+amount.toFixed(2).replace('.','\\.')));
+    assert.match(html('cmBody'),/\$385\.16/);
+    assert.match(html('cmBody'),/所涉自然日上游消费/);
+    assert.match(html('cmBody'),/18:17:03/);
+    assert.match(html('cmBody'),/非所选小时区间金额/);
+    assert.match(html('cmSummary'),/<b>\$10\.00<\/b>/);
+    assert.match(html('cmSummary'),/<b>\$5\.00<\/b>/);
+    assert.doesNotMatch(html('cmSummary'),/\$770|\$780|\$385/);
+    assert.match(html('cmSummary'),/1 个自然日账单另见下方，不计入本汇总/);
+  }
+  assert.equal(context.window.channelDataStatus.issues(ui.cm.report).length,0);
+  const status=context.window.channelDataStatus.render(ui.cm.report);
+  assert.doesNotMatch(status,/sync-status bad/);
+  assert.match(status,/不计入精确区间汇总/);
+  daily.upstream.usage_effective_status='reconnect';
+  assert.match(context.window.channelDataStatus.issues(ui.cm.report)[0].detail,/认证已失效/);
+  daily.natural_day_bill.usage.complete=false;
+  assert.match(ui.domainCard(daily,0,usage,false),/已取得账单合计/);
+});
+
+test('Spring observed hourly amount is numeric with a quiet reconciliation note',()=>{
+  const {context}=dashboard();
+  const domain={key:'spring',domain:'aicodewith.com',usage:{},vendors:[],
+    upstream:{configured:true,balance_usd:10,usage_sync_enabled:true},
+    upstream_usage:{available:true,complete:false,provisional:true,granularity:'hour',cost_usd:12.34,
+      adjusted_cost_available:true,adjusted_cost_usd:6.17,data_until:1788771600}};
+  const card=context.channelTest.domainCard(domain,0,{},false);
+  assert.match(card,/\$12\.34/);
+  assert.match(card,/日账单待核对/);
+  assert.doesNotMatch(card,/所涉自然日上游消费/);
+});
+
+test('daily source projection does not bypass invalid money or missing recharge evidence',()=>{
+  const {context}=dashboard(),quality=context.window.channelDataStatus;
+  const domain={key:'bad',domain:'bad.example',usage:{},vendors:[],upstream:{configured:true,balance_usd:10,usage_sync_enabled:true},
+    upstream_usage:{available:true,integrity_status:'invalid_amount'},
+    natural_day_bill:{from_ts:1788624000,to_ts:1788710400,usage:{available:true,complete:true,cost_usd:9000,integrity_status:'complete'}}};
+  assert.doesNotMatch(context.channelTest.domainCard(domain,0,{},false),/9,000/);
+  assert.equal(quality.billView(domain).daily,null);
+  domain.upstream_usage.integrity_status='window_mismatch';
+  assert.match(quality.issues({meta:{data_coverage:{complete:true}},domains:[domain]})[0].detail,/充值比例证据/);
+  domain.natural_day_bill.usage.integrity_status='overlapping_buckets';
+  assert.doesNotMatch(context.channelTest.domainCard(domain,0,{},false),/9,000/);
+  assert.match(quality.issues({meta:{data_coverage:{complete:true}},domains:[domain]})[0].detail,/时间桶重叠/);
+});
+
 test('partial channel records render numeric KPIs and shares with one quiet diagnostic link', () => {
   const {context, html} = dashboard(), api = context.channelTest;
   const usage = {requests: 1234, tokens: 5000, cost_usd: 12.34};
@@ -373,6 +556,61 @@ test('partial channel records render numeric KPIs and shares with one quiet diag
   assert.match(status, /example.test/);
   api.cm.expandedDomains.add('example.test');
   assert.doesNotThrow(() => api.render(), 'expanded groups must also render partial values');
+});
+
+test('upstream consumption freshness is a small note below both unchanged amounts', () => {
+  const {context}=dashboard(),api=context.channelTest;
+  const domain={key:'freshness',domain:'freshness.example',vendors:[],usage:{requests:1,tokens:2,cost_usd:3},
+    upstream:{configured:true,enabled:true,usage_sync_enabled:true,usage_worker_enabled:true,usage_fresh:false,usage_effective_status:'stale',usage_data_until:1788832800,balance_usd:40},
+    upstream_usage:{available:true,complete:true,cost_usd:12.34,adjusted_cost_available:true,adjusted_cost_usd:6.17,recharge_ratio:2}};
+  const html=api.domainCard(domain,0,domain.usage,false);
+  for(const [column,amount] of [['spend','12.34'],['adjusted','6.17']]){
+    const slot=html.match(new RegExp(`<span class="cm-domain-upstream-${column}"[^]*?</span>`))[0];
+    assert.ok(slot.includes(`<b>$${amount}</b><em class="cm-domain-metric-note neutral cm-bill-sync-note">`));
+    assert.match(slot,/消费同步延迟/);assert.match(slot,/消费截至/);assert.match(slot,/上游官网核对/);
+    assert.doesNotMatch(slot,/<b>[^<]*(同步|官网)/);
+  }
+  domain.upstream.usage_fresh=true;domain.upstream.usage_effective_status='ok';
+  assert.doesNotMatch(api.domainCard(domain,0,domain.usage,false),/cm-bill-sync-note/);
+});
+
+test('bill freshness respects synchronization, provisional and historical coverage separately', () => {
+  const {context}=dashboard(),note=context.window.channelDataStatus.billSyncNote;
+  const baseline=()=>({upstream:{configured:true,usage_sync_enabled:true,usage_worker_enabled:true,usage_fresh:true,usage_effective_status:'ok',usage_data_until:1788832800},
+    upstream_usage:{available:true,complete:true,cost_usd:0,integrity_status:'complete',data_until:1788710400}});
+  assert.equal(note(baseline()),'','zero cost and a completed historical selection are not stale');
+  for(const [state,expected] of [['error','同步失败'],['reconnect','需重新连接'],['global_off','已暂停'],['disabled','已停用'],['unsupported','不支持'],['queued','待更新'],['pending','待更新'],['stale','同步延迟']]){
+    const domain=baseline();domain.upstream.usage_effective_status=state;
+    assert.ok(note(domain).includes(expected),state);
+    assert.match(note(domain),/上游官网核对/);
+  }
+  const incomplete=baseline();incomplete.upstream_usage.complete=false;
+  assert.match(note(incomplete),/区间消费尚未同步完整/);
+  incomplete.upstream_usage.provisional=true;
+  assert.match(note(incomplete),/待日账单核对/);
+  incomplete.upstream_usage={available:false,integrity_status:'window_mismatch'};
+  incomplete.natural_day_bill={usage:{available:true,complete:true,cost_usd:2}};
+  assert.equal(note(incomplete),'','supported natural-day display must use its own coverage');
+  const missing=baseline();missing.upstream_usage.available=false;
+  assert.match(note(missing),/暂无区间消费账单/);
+  missing.upstream.usage_worker_enabled=false;
+  assert.match(note(missing),/已暂停/);
+  missing.upstream.usage_sync_enabled=false;
+  assert.match(note(missing),/未开启/);
+});
+
+test('consumption freshness never substitutes balance timestamps or the selected historical endpoint', () => {
+  const {context}=dashboard(),note=context.window.channelDataStatus.billSyncNote;
+  const domain={upstream:{configured:true,usage_fresh:false,usage_effective_status:'stale',last_success_at:1788832800},
+    upstream_usage:{available:true,complete:true,cost_usd:12,data_until:1788710400}};
+  assert.doesNotMatch(note(domain),/消费截至|最近同步|Invalid Date/);
+  domain.upstream.usage_data_until=1e99;
+  domain.upstream.usage_last_success_at=1788832800;
+  assert.match(note(domain),/最近同步/);assert.doesNotMatch(note(domain),/消费截至|Invalid Date/);
+  domain.upstream.usage_data_until=1788832800;
+  assert.match(note(domain),/消费截至/);assert.doesNotMatch(note(domain),/最近同步/);
+  domain.upstream.usage_effective_status='<img src=x onerror=alert(1)>';
+  assert.doesNotMatch(note(domain),/<img/);
 });
 
 test('diagnostic link activates the SPA tab and preserves modified native link clicks', () => {

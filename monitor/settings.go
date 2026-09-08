@@ -26,7 +26,8 @@ type Settings struct {
 	// LocalSnapshotOnly 只供本机验收使用：不建立任何 NewAPI 生产库连接，也不启动
 	// 采样、回填、上游轮询等后台任务。页面只能读取已复制到本地 SQLite 的快照。
 	// 生产环境必须保持 false；它不是“连接失败后的降级模式”。
-	LocalSnapshotOnly bool // MONITOR_LOCAL_SNAPSHOT_ONLY，默认 false
+	LocalSnapshotOnly               bool // MONITOR_LOCAL_SNAPSHOT_ONLY，默认 false
+	UpstreamDiagnosticsLocalEnabled bool // 本地快照中显式允许管理员点击发起只读检测；不启动同步任务
 	// LocalAuthBypass 只供完全离线的本机快照容器免登录验收。启动前会同时
 	// 校验本地快照、无生产 DSN、无主站地址、无上游/AWS/心跳与告警任务；
 	// 任意一项不满足都拒绝启动，生产默认永远关闭。
@@ -96,9 +97,10 @@ type Settings struct {
 	UpstreamSyncTimeoutSec int  // MONITOR_UPSTREAM_SYNC_TIMEOUT_SECONDS,默认 15
 	// 上游使用日志与余额是两条独立同步链。日志全局开关默认关闭，
 	// 只有全局开关与账户开关同时开启才会后台读取。页面访问绝不会触发上游请求。
-	UpstreamUsageSyncEnabled  bool // MONITOR_UPSTREAM_USAGE_SYNC_ENABLED,默认 false；新功能灰度闸门
-	UpstreamUsageSyncMinutes  int  // MONITOR_UPSTREAM_USAGE_SYNC_MINUTES,默认 20，最小 15
-	UpstreamUsageBackfillDays int  // MONITOR_UPSTREAM_USAGE_BACKFILL_DAYS,默认 90，首次低频补齐范围
+	UpstreamUsageSyncEnabled         bool // MONITOR_UPSTREAM_USAGE_SYNC_ENABLED,默认 false；新功能灰度闸门
+	UpstreamAICodeWithRecordsEnabled bool // MONITOR_AICODEWITH_RECORDS_ENABLED; record-based hourly bills, within the existing usage gate
+	UpstreamUsageSyncMinutes         int  // MONITOR_UPSTREAM_USAGE_SYNC_MINUTES,默认 20，最小 15
+	UpstreamUsageBackfillDays        int  // MONITOR_UPSTREAM_USAGE_BACKFILL_DAYS,默认 90，首次低频补齐范围
 	// 默认 1 保持所有上游请求全局串行；生产观察达标后最多升到 2。
 	// 同一 host 仍由 upstreamHostGuard 强制单并发，不能被此开关绕过。
 	UpstreamMaxConcurrency int // MONITOR_UPSTREAM_MAX_CONCURRENCY,默认 1，范围 1～2
@@ -141,15 +143,15 @@ type Settings struct {
 	// 留空 = 关闭(默认);如 ":8092"。
 	PortalAddr string // MONITOR_PORTAL_ADDR
 
-	// 客户端用量聚合结果的可选 Redis 缓存。留空地址时完全不连接 Redis，
-	// 自动退化为有严格容量上限的进程内短缓存；Redis 不参与鉴权，也不保存原始日志。
-	UsageRedisAddr     string // MONITOR_USAGE_REDIS_ADDR，如 172.26.4.11:6379
-	UsageRedisUsername string // MONITOR_USAGE_REDIS_USERNAME，生产建议使用仅限 nxmon:* 的 ACL 用户
-	UsageRedisPassword string // MONITOR_USAGE_REDIS_PASSWORD，只从环境变量读取
-	UsageRedisDB       int    // MONITOR_USAGE_REDIS_DB，默认 0；权限隔离仍以 ACL/key prefix 为准
-	UsageRedisPrefix   string // MONITOR_USAGE_REDIS_PREFIX，默认 nxmon:usage:v1
+	// 兼容旧部署的已弃用字段：仅地址用于启动提示，prefix 用于本机键命名。
+	// 不存在 Redis 网络客户端，账号/密码/DB 不再用于任何连接。
+	UsageRedisAddr     string // 已弃用，仅识别旧配置并提示；不创建连接
+	UsageRedisUsername string // 已弃用
+	UsageRedisPassword string // 已弃用
+	UsageRedisDB       int    // 已弃用
+	UsageRedisPrefix   string // 兼容本机缓存键前缀
 	// 用户用量事实层：采集阶段与页面切读阶段分开开关。上线时先只开采集，
-	// 等本地小时覆盖率校验通过后再开 ReadEnabled；Redis 仅加速，不是事实源。
+	// 等本地小时覆盖率校验通过后再开 ReadEnabled；缓存不是事实源。
 	UsageFactsStorePath   string // MONITOR_USAGE_FACTS_STORE_PATH，默认与主库同目录的 usage-facts.db
 	UsageFactsEnabled     bool   // MONITOR_USAGE_FACTS_ENABLED，默认 false
 	UsageFactsReadEnabled bool   // MONITOR_USAGE_FACTS_READ_ENABLED，默认 false；生产仅 FactsEnabled=true 时生效
@@ -296,6 +298,7 @@ func LoadSettings() Settings {
 		StoreBackupRetention:                     envInt("MONITOR_STORE_BACKUP_RETENTION", 7),
 		StoreMigrationBackupRetention:            envInt("MONITOR_STORE_MIGRATION_BACKUP_RETENTION", 3),
 		LocalSnapshotOnly:                        env("MONITOR_LOCAL_SNAPSHOT_ONLY", "false") == "true",
+		UpstreamDiagnosticsLocalEnabled:          env("MONITOR_UPSTREAM_DIAGNOSTICS_LOCAL_ENABLED", "false") == "true",
 		LocalAuthBypass:                          env("MONITOR_LOCAL_AUTH_BYPASS", "false") == "true",
 		SourceWorkerEnabled:                      env("MONITOR_SOURCE_WORKER_ENABLED", "true") == "true",
 		SourceLeaseRequired:                      env("MONITOR_SOURCE_LEASE_REQUIRED", "true") == "true",
@@ -341,6 +344,7 @@ func LoadSettings() Settings {
 		UpstreamSyncMinutes:                      envInt("MONITOR_UPSTREAM_SYNC_MINUTES", 5),
 		UpstreamSyncTimeoutSec:                   envInt("MONITOR_UPSTREAM_SYNC_TIMEOUT_SECONDS", 15),
 		UpstreamUsageSyncEnabled:                 env("MONITOR_UPSTREAM_USAGE_SYNC_ENABLED", "false") == "true",
+		UpstreamAICodeWithRecordsEnabled:         env("MONITOR_AICODEWITH_RECORDS_ENABLED", "false") == "true",
 		UpstreamUsageSyncMinutes:                 envInt("MONITOR_UPSTREAM_USAGE_SYNC_MINUTES", 20),
 		UpstreamErrorLogSyncEnabled:              env("MONITOR_UPSTREAM_ERRORLOG_SYNC_ENABLED", "false") == "true",
 		UpstreamErrorLogDomains:                  envCSV("MONITOR_UPSTREAM_ERRORLOG_DOMAINS"),

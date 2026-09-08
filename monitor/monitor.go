@@ -244,7 +244,7 @@ type Monitor struct {
 	usageFactsLoopHeartbeat      atomic.Int64
 	usageFactsRestarts           atomic.Int64
 
-	usageCache *usageResultCache // 用量昂贵聚合结果缓存：Redis 主缓存 + 有界本机应急缓存
+	usageCache *usageResultCache // 用量聚合结果的有界本机缓存，不连接 Redis
 	portalLim  *portalLimiter    // 客户端登录限流
 	adminLim   *portalLimiter    // 管理端登录限流(按来源 IP)
 	exportLim  *exportLimiter    // 客户端日志导出限流(每组织账号 1 次/5min,仅计成功下载)
@@ -385,6 +385,9 @@ func validateLocalAuthBypassSettings(s Settings) error {
 	}
 	if !s.LocalSnapshotOnly {
 		return errors.New("MONITOR_LOCAL_AUTH_BYPASS 只能与 MONITOR_LOCAL_SNAPSHOT_ONLY=true 一起使用")
+	}
+	if s.UpstreamDiagnosticsLocalEnabled {
+		return errors.New("本地免登录模式不允许开启外部上游检测；请使用有认证的验收环境")
 	}
 	if strings.TrimSpace(s.ProdDSN) != "" || strings.TrimSpace(s.NewAPIBaseURL) != "" {
 		return errors.New("本地免登录模式不允许配置生产 DSN 或 NewAPI 主站地址")

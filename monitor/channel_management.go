@@ -52,6 +52,7 @@ type ChannelManagementRateConfig struct {
 // 它们均按主域名账户归集，不能推断为
 // 某一条实际渠道的上游账单。
 type ChannelUpstreamUsageMetrics struct {
+	Provisional           bool    `json:"provisional,omitempty"`
 	Available             bool    `json:"available"`
 	Requests              int64   `json:"requests"`
 	Tokens                int64   `json:"tokens"`
@@ -100,17 +101,18 @@ type ChannelManagementVendor struct {
 }
 
 type ChannelManagementDomain struct {
-	Key           string                          `json:"key"`
-	Domain        string                          `json:"domain"`
-	Configured    bool                            `json:"configured"`
-	Usage         ChannelUsageMetrics             `json:"usage"`
-	Finance       ChannelDomainFinanceView        `json:"finance"`
-	Upstream      ChannelUpstreamAccountView      `json:"upstream"`
-	RateConfig    ChannelManagementRateConfig     `json:"rate_config"`
-	UpstreamUsage ChannelUpstreamUsageMetrics     `json:"upstream_usage"`
-	FinanceGroups []ChannelManagementFinanceGroup `json:"finance_groups"`
-	Groups        []ChannelManagementGroup        `json:"groups"`
-	Vendors       []ChannelManagementVendor       `json:"vendors"`
+	Key            string                          `json:"key"`
+	Domain         string                          `json:"domain"`
+	Configured     bool                            `json:"configured"`
+	Usage          ChannelUsageMetrics             `json:"usage"`
+	Finance        ChannelDomainFinanceView        `json:"finance"`
+	Upstream       ChannelUpstreamAccountView      `json:"upstream"`
+	RateConfig     ChannelManagementRateConfig     `json:"rate_config"`
+	UpstreamUsage  ChannelUpstreamUsageMetrics     `json:"upstream_usage"`
+	NaturalDayBill *ChannelUpstreamNaturalDayBill  `json:"natural_day_bill,omitempty"`
+	FinanceGroups  []ChannelManagementFinanceGroup `json:"finance_groups"`
+	Groups         []ChannelManagementGroup        `json:"groups"`
+	Vendors        []ChannelManagementVendor       `json:"vendors"`
 }
 
 type ChannelManagementFilters struct {
@@ -456,23 +458,30 @@ func (m *Monitor) loadChannelRechargeVersions(ctx context.Context, accounts map[
 }
 
 func (m *Monitor) loadChannelUpstreamUsage(ctx context.Context, scope stabilityScope, now int64, accounts map[string]ChannelUpstreamAccountView, finance channelFinanceSnapshot) (map[string]ChannelUpstreamUsageMetrics, error) {
-	var rows []ChannelUpstreamUsageHour
-	// Rolling-hour reports end at the latest completed local hour. Natural-day
-	// providers, however, continuously replace today's partial day bucket and
-	// its data-until timestamp can be a few minutes newer than that boundary.
-	// Admit only that live, current-day bucket; historical partial days and
-	// hourly buckets must still be fully contained in the requested interval.
-	liveDayStart := int64(-1)
-	if scope.ToTs <= now && now-scope.ToTs < 3600 {
-		current := time.Unix(now, 0).In(cstLocation)
-		liveDayStart = time.Date(current.Year(), current.Month(), current.Day(), 0, 0, 0, 0, cstLocation).Unix()
+	result, err := m.loadChannelUpstreamUsageWindow(ctx, scope, now, accounts, finance)
+	if err != nil {
+		return nil, err
 	}
-	if err := m.storeDB.WithContext(ctx).Raw(`SELECT domain,hour_ts,bucket_seconds,requests,tokens,quota,cost_usd,unit_per_usd,fetched_at,provider
+	for domain, metrics := range result {
+		// Even if one whole day fits, it is not the bill for a partial-day
+		// query. Keep such source bills in NaturalDayBill, outside exact totals.
+		if metrics.Granularity == "day" && (scope.FromTs != cstDayStart(scope.FromTs) || scope.ToTs != cstDayStart(scope.ToTs)) &&
+			(metrics.IntegrityStatus == "" || metrics.IntegrityStatus == upstreamUsageIntegrityComplete) {
+			result[domain] = ChannelUpstreamUsageMetrics{Available: metrics.Available, Granularity: "day", ExpectedHours: metrics.ExpectedHours,
+				IntegrityStatus: upstreamUsageIntegrityWindowMismatch, AdjustedCostStatus: upstreamUsageIntegrityWindowMismatch}
+		}
+	}
+	return result, nil
+}
+
+func (m *Monitor) loadChannelUpstreamUsageWindow(ctx context.Context, scope stabilityScope, now int64, accounts map[string]ChannelUpstreamAccountView, finance channelFinanceSnapshot) (map[string]ChannelUpstreamUsageMetrics, error) {
+	var rows []ChannelUpstreamUsageHour
+	// Include an overlapping daily bucket so a mixed day/hour migration cannot
+	// silently drop the first partial day and pass the remainder as exact.
+	if err := m.storeDB.WithContext(ctx).Raw(`SELECT domain,hour_ts,bucket_seconds,requests,tokens,quota,cost_usd,unit_per_usd,fetched_at,provider,source_kind,provisional
 		FROM channel_upstream_usage_hours
-		WHERE hour_ts >= ?
-		  AND (hour_ts+(CASE WHEN bucket_seconds>0 THEN bucket_seconds ELSE 3600 END) <= ?
-		       OR (hour_ts = ? AND hour_ts < ? AND bucket_seconds > 3600))
-		ORDER BY domain ASC,hour_ts ASC`, scope.FromTs, scope.ToTs, liveDayStart, scope.ToTs).Scan(&rows).Error; err != nil {
+		WHERE hour_ts >= ? AND hour_ts < ?
+		ORDER BY domain ASC,hour_ts ASC`, cstDayStart(scope.FromTs), scope.ToTs).Scan(&rows).Error; err != nil {
 		return nil, err
 	}
 	versions, err := m.loadChannelRechargeVersions(ctx, accounts, finance)
@@ -498,21 +507,33 @@ func (m *Monitor) loadChannelUpstreamUsage(ctx context.Context, scope stabilityS
 		if !configured || !account.UsageSyncEnabled || row.Provider != account.Provider {
 			continue
 		}
-		a := aggregates[row.Domain]
-		if a == nil {
-			granularity := account.UsageGranularity
-			if granularity == "" {
-				granularity = upstreamUsageGranularity(account.Provider, account.UsageAdapter)
-			}
-			a = &aggregate{metrics: ChannelUpstreamUsageMetrics{Available: true, ExpectedHours: expected, Granularity: granularity}, adjustedOK: true, adjustedStatus: upstreamAdjustedCostComplete, integrity: upstreamUsageIntegrityComplete}
-			aggregates[row.Domain] = a
-		}
 		seconds := row.BucketSeconds
 		if seconds <= 0 {
 			seconds = 3600
 		}
 		end := row.HourTs + seconds
-		if end > scope.ToTs {
+		granularity := account.UsageGranularity
+		if granularity == "" {
+			granularity = upstreamUsageGranularity(account.Provider, account.UsageAdapter)
+		}
+		if row.Provider == upstreamProviderAICodeWith {
+			if row.SourceKind == upstreamUsageAdapterAICodeWithRecord {
+				granularity = "hour"
+			} else {
+				granularity = "day"
+			}
+		}
+		if end <= scope.FromTs || (granularity == "hour" && (row.HourTs < scope.FromTs || end > scope.ToTs)) {
+			continue
+		}
+		a := aggregates[row.Domain]
+		if a == nil {
+			a = &aggregate{metrics: ChannelUpstreamUsageMetrics{Available: true, ExpectedHours: expected, Granularity: granularity}, adjustedOK: true, adjustedStatus: upstreamAdjustedCostComplete, integrity: upstreamUsageIntegrityComplete}
+			aggregates[row.Domain] = a
+		} else if a.metrics.Granularity != granularity {
+			a.metrics.Granularity = "mixed"
+		}
+		if end > scope.ToTs || row.HourTs < scope.FromTs {
 			a.integrity = upstreamUsageIntegrityWindowMismatch
 			continue
 		}
@@ -535,6 +556,7 @@ func (m *Monitor) loadChannelUpstreamUsage(ctx context.Context, scope stabilityS
 		a.metrics.Requests += row.Requests
 		a.metrics.Tokens += row.Tokens
 		a.metrics.CostUSD += row.CostUSD
+		a.metrics.Provisional = a.metrics.Provisional || row.Provisional
 		a.completed += seconds
 		if until := end; until > a.metrics.DataUntil {
 			a.metrics.DataUntil = until
@@ -578,7 +600,7 @@ func (m *Monitor) loadChannelUpstreamUsage(ctx context.Context, scope stabilityS
 			continue
 		}
 		a.metrics.CompletedHours = a.completed / 3600
-		a.metrics.Complete = expected == 0 || a.completed >= expected*3600
+		a.metrics.Complete = (expected == 0 || a.completed >= expected*3600) && !a.metrics.Provisional
 		a.metrics.AdjustedCostAvailable = a.adjustedOK && a.ratioSet
 		a.metrics.AdjustedCostStatus = a.adjustedStatus
 		if a.metrics.AdjustedCostAvailable {
@@ -598,13 +620,16 @@ func (m *Monitor) loadChannelUpstreamUsage(ctx context.Context, scope stabilityS
 		if granularity == "" {
 			granularity = upstreamUsageGranularity(account.Provider, account.UsageAdapter)
 		}
-		if !account.UsageSyncEnabled || granularity != "day" ||
-			(scope.FromTs == cstDayStart(scope.FromTs) && scope.ToTs == cstDayStart(scope.ToTs)) {
+		if !account.UsageSyncEnabled {
 			continue
 		}
 		if _, found := result[domain]; !found {
-			result[domain] = ChannelUpstreamUsageMetrics{ExpectedHours: expected, Granularity: granularity,
-				IntegrityStatus: upstreamUsageIntegrityWindowMismatch}
+			missing := ChannelUpstreamUsageMetrics{ExpectedHours: expected, Granularity: granularity}
+			if granularity == "day" && (scope.FromTs != cstDayStart(scope.FromTs) || scope.ToTs != cstDayStart(scope.ToTs)) {
+				missing.IntegrityStatus = upstreamUsageIntegrityWindowMismatch
+			}
+			// No rows means unknown consumption, not a zero-hour requested range.
+			result[domain] = missing
 		}
 	}
 	return result, nil
@@ -630,6 +655,10 @@ func (m *Monitor) buildChannelManagementReport(ctx context.Context, scope stabil
 	upstreamUsage, err := m.loadChannelUpstreamUsage(ctx, scope, now, upstreamAccounts, finance)
 	if err != nil {
 		return nil, fmt.Errorf("读取上游使用日志汇总: %w", err)
+	}
+	naturalDayBills, err := m.loadChannelUpstreamNaturalDayBills(ctx, scope, now, upstreamAccounts, finance)
+	if err != nil {
+		return nil, fmt.Errorf("读取自然日上游账单: %w", err)
 	}
 	assessments, assessmentErr := m.upstreamBalanceAssessments(ctx, now, upstreamAccounts, m.loadAlertConfig())
 	if assessmentErr != nil {
@@ -836,11 +865,12 @@ func (m *Monitor) buildChannelManagementReport(ctx context.Context, scope stabil
 		responseDomains = append(responseDomains, ChannelManagementDomain{
 			Key: domain.Key, Domain: domain.Domain, Configured: domain.Configured,
 			Usage: domain.Usage.metrics(), Finance: finance.domainView(domain.Domain),
-			Upstream:      upstream,
-			RateConfig:    managementRateConfig(domain, finance),
-			UpstreamUsage: upstreamUsage[domain.Domain],
-			FinanceGroups: managementFinanceGroups(domain.FinanceGroups, domain.Domain, finance),
-			Groups:        managementGroups(domain.Groups, nil, domain.Domain, 0, finance), Vendors: vendors,
+			Upstream:       upstream,
+			RateConfig:     managementRateConfig(domain, finance),
+			UpstreamUsage:  upstreamUsage[domain.Domain],
+			NaturalDayBill: naturalDayBills[domain.Domain],
+			FinanceGroups:  managementFinanceGroups(domain.FinanceGroups, domain.Domain, finance),
+			Groups:         managementGroups(domain.Groups, nil, domain.Domain, 0, finance), Vendors: vendors,
 		})
 	}
 	sort.Slice(responseDomains, func(i, j int) bool {

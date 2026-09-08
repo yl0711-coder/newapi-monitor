@@ -167,8 +167,8 @@ func TestStabilityRollupAndReportKeepsGroupChannelSemantics(t *testing.T) {
 	if len(codex.Channels) != 1 || codex.Channels[0].Requests != 100 || codex.Channels[0].Rejected != 0 {
 		t.Fatalf("channel must exclude pre-route rejection: %+v", codex.Channels)
 	}
-	if codex.DeltaPP == nil || *codex.DeltaPP <= 0 {
-		t.Fatalf("expected positive delta, got %v", codex.DeltaPP)
+	if codex.DeltaPP != nil {
+		t.Fatalf("unfinished current day must not publish a comparison, got %v", codex.DeltaPP)
 	}
 	if len(codex.Daily) != 1 || codex.Daily[0].Rejected != 5 || codex.Daily[0].Requests != 100 || codex.Daily[0].Problems != 10 {
 		t.Fatalf("daily rejection missing: %+v", codex.Daily)
@@ -1132,14 +1132,16 @@ func TestStabilityComparisonUsesSameClockTimeOnPreviousCalendarDay(t *testing.T)
 	if err := m.storeDB.Create(&rows).Error; err != nil {
 		t.Fatal(err)
 	}
-	states := make([]StabilityHourIngestState, 0, 12)
+	states := make([]StabilityHourIngestState, 0, 24)
 	for hour := int64(0); hour < 12; hour++ {
 		states = append(states, StabilityHourIngestState{HourTs: day - 86400 + hour*3600, Status: "complete"})
+		states = append(states, StabilityHourIngestState{HourTs: day + hour*3600, Status: "complete"})
 	}
 	if err := m.storeDB.Create(&states).Error; err != nil {
 		t.Fatal(err)
 	}
-	report, err := m.buildStabilityReport(context.Background(), stabilityScope{FromTs: day, ToTs: day + 12*3600}, day+12*3600)
+	// Both same-clock windows have completed, including the late-write allowance.
+	report, err := m.buildStabilityReport(context.Background(), stabilityScope{FromTs: day, ToTs: day + 12*3600}, day+14*3600)
 	if err != nil {
 		t.Fatal(err)
 	}

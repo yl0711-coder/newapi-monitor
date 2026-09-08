@@ -275,11 +275,18 @@ function renderSources(meta){
   const coverageTitle=!hasCoverage?'暂未获取小时数据状态':cov.latest_hour_pending?`最新小时${pendingTime} 正常汇总中`:effectiveMissing?'存在历史小时未覆盖，当前统计可能偏低':legacy?`已连续展示；其中 ${nfmt(legacy)} 小时使用升级前口径，v5 重签后将自动替换，不会重复累加`:'所选范围小时数据已完整';
   el.innerHTML=`<span><i></i>${esc(meta?.from||'—')}～${esc(meta?.to||'—')}</span><span title="${coverageTitle}"><i class="${coverageClass}"></i>${coverageLabel}</span><span title="NewAPI 本地采样新鲜度"><i class="${s.newapi_last_ts?'ok':'wait'}"></i>NewAPI ${s.newapi_last_ts?age(s.newapi_data_age_sec):'无数据'}</span><span title="原始错误采集完整覆盖时间；存在积压时问题排行暂不包含未完成分钟"><i class="${problemState}"></i>错误 ${problemLabel}</span>${migrationVisible?`<span title="${esc(migrationTitle)}"><i class="${migrationState}"></i>${esc(migrationLabel)}</span>`:''}<span title="Nginx 允许节点健康数 / 配置节点数"><i class="${nginxClass}"></i>Nginx ${nginxLabel}</span>`;
 }
-function renderKpis(d){const s=d.summary,p=d.previous,pc=d.meta?.comparison_coverage||{},canCompare=d.meta?.comparison_available===true;const k=$('stKpis');if(!k)return;k.innerHTML=[
+function comparisonPendingText(meta){
+  const current=meta?.data_coverage,previous=meta?.comparison_coverage;
+  if(current?.provisional_seconds>0)return '当前区间仍在汇总，暂不比较';
+  if(current?.complete!==true)return `当前区间覆盖待核验${current?.missing_hours>0?' · 缺少 '+current.missing_hours+' 小时':''}`;
+  if(previous?.provisional_seconds>0)return '上一周期仍在汇总，暂不比较';
+  return previous?.missing_hours>0?`上一周期小时待补 ${previous.missing_hours} 个`:'对比区间完整性待核验';
+}
+function renderKpis(d){const s=d.summary,p=d.previous,canCompare=d.meta?.comparison_available===true;const k=$('stKpis');if(!k)return;k.innerHTML=[
   ['历史日志推断稳定性',pct(s.stability),canCompare?delta(d.delta_pp):'环比待补齐',health(s)],
   ['历史日志请求',nfmt(s.requests),`日志推断成功 ${nfmt(s.success)} · 问题 ${nfmt(s.problems)}`,''],
   ['问题请求',nfmt(s.problems),`异常 ${nfmt(s.anomaly)} · 错误 ${nfmt(s.failed)}`,s.problems?'bad':'good'],
-  ['上一周期',d.meta.comparison_available?pct(p.stability):'—',d.meta.comparison_available?`${nfmt(p.requests)} 次请求`:`历史小时待补 ${nfmt(pc.missing_hours)} 个`,'']
+  ['上一周期',d.meta.comparison_available?pct(p.stability):'—',d.meta.comparison_available?`${nfmt(p.requests)} 次请求`:comparisonPendingText(d.meta),'']
 ].map(x=>`<article class="stability-kpi"><small>${x[0]}</small><b class="${x[3]||''}">${x[1]}</b><em>${x[2]}</em></article>`).join('')}
 function aggregateDaily(groups){const by={};for(const g of groups)for(const d of g.daily||[]){const v=by[d.date]||(by[d.date]={date:d.date,success:0,anomaly:0,failed:0,rejected:0,requests:0});v.success+=d.success||0;v.anomaly+=d.anomaly||0;v.failed+=d.failed||0;v.rejected+=d.rejected||0;v.requests+=d.requests||0}return Object.values(by).sort((a,b)=>a.date.localeCompare(b.date)).map(v=>({...v,stability:v.requests?v.success/v.requests*100:null}))}
 function renderTrend(groups){const el=$('stTrend');if(!el||!window.echarts)return;const rows=aggregateDaily(groups);if(st.chart)st.chart.dispose();st.chart=echarts.init(el);st.chart.setOption({animation:false,grid:{left:50,right:55,top:28,bottom:38},tooltip:{trigger:'axis',backgroundColor:'#151b27',borderColor:'#39445a',textStyle:{color:'#e5ebf5'},formatter:p=>{const r=rows[p[0]?.dataIndex];return r?`${esc(r.date)}<br>稳定性 ${pct(r.stability)}<br>已路由请求 ${nfmt(r.requests)}<br>问题 ${nfmt(r.anomaly+r.failed)}`:''}},xAxis:{type:'category',data:rows.map(r=>r.date.slice(5)),axisLabel:{color:'#7e8a9f'},axisLine:{lineStyle:{color:'#354055'}}},yAxis:[{type:'value',min:v=>Math.max(0,Math.floor(v.min-2)),max:100,axisLabel:{color:'#7e8a9f',formatter:'{value}%'},splitLine:{lineStyle:{color:'#283143'}}},{type:'value',axisLabel:{color:'#657188'},splitLine:{show:false}}],series:[{name:'稳定性',type:'line',connectNulls:false,smooth:.25,symbol:'circle',symbolSize:5,data:rows.map(r=>r.stability==null?null:+r.stability.toFixed(3)),lineStyle:{width:2,color:'#8177ff'},itemStyle:{color:'#8177ff'},areaStyle:{color:'rgba(129,119,255,.08)'}},{name:'请求量',type:'bar',yAxisIndex:1,data:rows.map(r=>r.requests),barMaxWidth:20,itemStyle:{color:'rgba(79,153,229,.28)',borderRadius:[3,3,0,0]}}]})}

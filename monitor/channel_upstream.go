@@ -121,6 +121,7 @@ type ChannelUpstreamAccount struct {
 	UsageBackfillCursor int64 `gorm:"column:usage_backfill_cursor"`
 	UsageBackfillDone   bool  `gorm:"column:usage_backfill_done"`
 	UsageDataUntil      int64 `gorm:"column:usage_data_until"`
+	RecordsStartedAt    int64 `gorm:"column:records_started_at"`
 }
 
 // ChannelUpstreamUsageHour 是上游账户账单的本地脱敏汇总。BucketSeconds=3600
@@ -130,13 +131,16 @@ type ChannelUpstreamAccount struct {
 // 仅查询这里，绝不因用户刷新而访问上游。按供应商真实粒度重算能处理延迟入账，
 // 又不依赖不可靠的跨版本日志 ID 去重。
 type ChannelUpstreamUsageHour struct {
-	Domain        string  `gorm:"primaryKey;size:253;column:domain"`
-	HourTs        int64   `gorm:"primaryKey;column:hour_ts"`
-	BucketSeconds int64   `gorm:"column:bucket_seconds"`
-	Requests      int64   `gorm:"column:requests"`
-	Tokens        int64   `gorm:"column:tokens"`
-	Quota         float64 `gorm:"column:quota"`
-	CostUSD       float64 `gorm:"column:cost_usd"`
+	SourceCostUnits int64   `gorm:"column:source_cost_units"`
+	SourceKind      string  `gorm:"size:24;column:source_kind"`
+	Provisional     bool    `gorm:"column:provisional"`
+	Domain          string  `gorm:"primaryKey;size:253;column:domain"`
+	HourTs          int64   `gorm:"primaryKey;column:hour_ts"`
+	BucketSeconds   int64   `gorm:"column:bucket_seconds"`
+	Requests        int64   `gorm:"column:requests"`
+	Tokens          int64   `gorm:"column:tokens"`
+	Quota           float64 `gorm:"column:quota"`
+	CostUSD         float64 `gorm:"column:cost_usd"`
 	// UnitPerUSD records the conversion evidence used to derive CostUSD from
 	// Quota. It is intentionally stored on every converted bucket so an account
 	// unit change cannot silently mix two monetary bases in one report.
@@ -214,6 +218,10 @@ type AICodeWithKeySyncState struct {
 // Public ChannelUpstreamUsageHour rows are replaced only after every key in
 // the frozen credential-set version has completed the same round.
 type AICodeWithUsageStage struct {
+	SourceCostUnits      int64
+	SourceKind           string
+	Provisional          bool
+	UnitPerUSD           float64
 	Domain               string  `gorm:"primaryKey;size:253;column:domain"`
 	RoundID              string  `gorm:"primaryKey;size:96;column:round_id"`
 	SlotID               string  `gorm:"primaryKey;size:96;column:slot_id"`
@@ -228,6 +236,9 @@ type AICodeWithUsageStage struct {
 }
 
 type AICodeWithUsageRound struct {
+	UnitPerUSD           float64
+	SourceEpoch          string
+	RecordMode           bool   `gorm:"column:record_mode"`
 	Domain               string `gorm:"primaryKey;size:253;column:domain"`
 	Kind                 string `gorm:"primaryKey;size:16;column:kind"`
 	RoundID              string `gorm:"size:96;column:round_id;uniqueIndex"`
@@ -475,6 +486,8 @@ func upstreamUsageAdapterName(provider, adapter string) string {
 		return "Sub2API 单日汇总（兼容模式）"
 	case upstreamUsageAdapterAICodeWith:
 		return "AICodeWith 按 Key 日账单"
+	case upstreamUsageAdapterAICodeWithRecord:
+		return "AICodeWith 分页明细小时汇总"
 	case upstreamUsageAdapterTokenForce:
 		return "TokenForce 分页调用明细"
 	}
@@ -493,6 +506,9 @@ func upstreamUsageAdapterName(provider, adapter string) string {
 }
 
 func upstreamUsageGranularity(provider, adapter string) string {
+	if adapter == upstreamUsageAdapterAICodeWithRecord {
+		return "hour"
+	}
 	if provider == upstreamProviderAICodeWith || adapter == upstreamUsageAdapterSub2Stats {
 		return "day"
 	}
@@ -2623,7 +2639,7 @@ func (m *Monitor) persistAICodeWithAccountChange(ctx context.Context, row *Chann
 		for i, slot := range normalized.Slots {
 			activeIDs = append(activeIDs, slot.SlotID)
 			state, exists := oldByID[slot.SlotID]
-			if !exists || versionChanged {
+			if !exists || versionChanged || clearUsage {
 				state = AICodeWithKeySyncState{Domain: row.Domain, SlotID: slot.SlotID, Status: upstreamStatusPending}
 			}
 			state.CredentialSetVersion, state.Ordinal, state.UpdatedAt = setVersion, i+1, now
@@ -2640,7 +2656,16 @@ func (m *Monitor) persistAICodeWithAccountChange(ctx context.Context, row *Chann
 		if err := deleteQuery.Delete(&AICodeWithKeySyncState{}).Error; err != nil {
 			return err
 		}
-		if versionChanged || len(oldStates) == 0 {
+		if versionChanged || clearUsage || len(oldStates) == 0 {
+			if err := clearAICodeWithRecordCheckpoint(tx, row.Domain, "", ""); err != nil {
+				return err
+			}
+			if versionChanged || clearUsage {
+				row.RecordsStartedAt = 0
+				if err := tx.Model(row).Update("records_started_at", 0).Error; err != nil {
+					return err
+				}
+			}
 			if err := tx.Where("domain = ?", row.Domain).Delete(&AICodeWithUsageStage{}).Error; err != nil {
 				return err
 			}

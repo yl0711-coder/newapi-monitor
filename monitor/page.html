@@ -780,6 +780,12 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
       <button type="button" id="cmUpstreamClose" aria-label="关闭">×</button>
     </header>
     <div class="cm-upstream-content">
+      <section class="cm-upstream-note">
+        <b>新上游或同步失败？</b>
+        <span>识别平台类型，检查已保存账号，并查看配置和修复指引。不会修改账单或自动更换类型。</span>
+        <button type="button" class="cm-upstream-sync" id="cmUpstreamDetect">检测类型 / 配置问题</button>
+      </section>
+      <section class="cm-upstream-note" id="cmUpstreamDiagnostic" aria-live="polite" hidden></section>
       <section class="cm-upstream-status" id="cmUpstreamStatus" hidden></section>
       <section class="cm-upstream-funds" id="cmUpstreamFunds" hidden></section>
       <section class="cm-upstream-note">
@@ -1173,7 +1179,13 @@ function renderBanner(s){
   // 不参与 bad/warn 三态配色——口径见 文档 09 §5.1「B 类不驱动 health」。
   if(s.local_snapshot_only){cls='warn';txt='<span class="dot dot-y"></span> 本机快照预览，未开启实时采集；数据不会自动更新'}
   else if(s.view==='observed'&&!s.sampling_active){cls='bad';txt='<span class="dot dot-r"></span> 实时采样不可用或已停止；下方仅为已采集记录，不代表当前完整状态'}
-  else if(s.view==='observed'){cls='warn';txt='<span class="dot dot-y"></span> 实时观察：仅包含已采集请求，迟到记录可能补入；金额、成功率和趋势尚未定稿'}
+  else if(s.view==='observed'){
+    // Provisional coverage must not hide errors already present in the facts.
+    cls=bad.length?'bad':warn.length?'warn':'neutral';
+    const dot=bad.length?'dot-r':warn.length?'dot-y':'';
+    const headline=bad.length?`${bad.length} 项错误`:warn.length?`${warn.length} 项波动`:'实时观察';
+    txt=`${dot?`<span class="dot ${dot}"></span>`:''} ${headline}<span class="muted" style="font-weight:400;font-size:13px">已采集记录 · 尚未定稿，迟到记录可能补入</span>`;
+  }
   else if(s.data_complete===false){cls='warn';txt='<span class="dot dot-y"></span> 新统计口径历史数据补齐中，当前窗口暂不判定'}
   else if(s.finalization_delayed){cls='warn';txt='<span class="dot dot-y"></span> 展示历史已定稿窗口，最新时段仍在追平'}
   else if(!s.sampling_active){cls='bad';txt='<span class="dot dot-r"></span> 监控数据不可用或采样已停止'}
@@ -2830,7 +2842,8 @@ async function usageLoadMatrix(forceFresh){
 		const res=await fetch('/usage/matrix?'+usageRangeParams(!!forceFresh),{headers:{'Accept':'application/json'},signal:req.signal});
     if(seq!==usageSeq)return; // 已有更新的查询在飞,丢弃本响应
     if(res.status===401){location.href='/login';return}
-    const d=await res.json().catch(()=>({}));
+    const d=await res.json();
+    if(seq!==usageSeq)return; // A newer selection can arrive while parsing JSON.
     if(!res.ok){eb.innerHTML='<div class="alert">'+esc(d.error||('查询失败 '+res.status))+'</div>';return}
     if(d.enabled===false){eb.innerHTML='<div class="alert">未连接主站数据库(NEWAPI_LOG_DSN),用户用量不可用。</div>';return}
     usageSetDataNotice(d);
@@ -3297,7 +3310,8 @@ async function usageLoadDetail(forceFresh){
     const res=await fetch('/usage/stats?'+q,{headers:{'Accept':'application/json'},signal:req.signal});
     if(seq!==usageSeq)return;
     if(res.status===401){location.href='/login';return}
-    const d=await res.json().catch(()=>({}));
+    const d=await res.json();
+    if(seq!==usageSeq)return;
     if(!res.ok){eb.innerHTML='<div class="alert">'+esc(d.error||('查询失败 '+res.status))+'</div>';return}
     if(d.enabled===false){eb.innerHTML='<div class="alert">未连接主站数据库(NEWAPI_LOG_DSN),用户用量不可用。</div>';return}
     usageSetDataNotice(d);

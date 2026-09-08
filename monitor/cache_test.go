@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -107,17 +106,6 @@ func (s *memoryByteCacheStore) putRaw(key string, value []byte, ttl time.Duratio
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.items[key] = memoryByteCacheItem{value: append([]byte(nil), value...), exp: time.Now().Add(ttl)}
-}
-
-func TestUsageRedisOptionsDisableRetriesAndCapConnections(t *testing.T) {
-	opts := usageRedisOptions(Settings{UsageRedisAddr: "redis.example:6379"})
-	if opts.MaxRetries != -1 {
-		t.Fatalf("MaxRetries=%d，必须为 -1 才是真正禁用 go-redis 内部重试", opts.MaxRetries)
-	}
-	if opts.PoolSize != usageCacheRedisPoolSize || opts.MaxActiveConns != usageCacheRedisPoolSize {
-		t.Fatalf("Redis 连接池没有硬限制: pool=%d active=%d want=%d",
-			opts.PoolSize, opts.MaxActiveConns, usageCacheRedisPoolSize)
-	}
 }
 
 func TestUsageCacheStatsExposeOnlyOperationalCounters(t *testing.T) {
@@ -882,76 +870,5 @@ func TestBoundedByteCacheEnforcesEntryAndByteLimits(t *testing.T) {
 	}
 	if _, ok := c.Get("a", now); ok {
 		t.Fatal("最旧项应被 LRU 淘汰")
-	}
-}
-
-// 本机 Docker Redis 集成测试。默认跳过；验收时显式传入独立测试 Redis，
-// 使用随机键且只精确删除自己的键，绝不 FLUSH 数据库。
-func TestUsageResultCacheRedisIntegration(t *testing.T) {
-	addr := os.Getenv("MONITOR_TEST_REDIS_ADDR")
-	if addr == "" {
-		t.Skip("MONITOR_TEST_REDIS_ADDR 未设置")
-	}
-	s := Settings{
-		UsageRedisAddr:     addr,
-		UsageRedisUsername: os.Getenv("MONITOR_TEST_REDIS_USERNAME"),
-		UsageRedisPassword: os.Getenv("MONITOR_TEST_REDIS_PASSWORD"),
-		UsageRedisPrefix:   "nxmon:test:integration:" + time.Now().Format("20060102150405.000000000"),
-	}
-	c1 := newUsageResultCache(s)
-	defer c1.Close()
-	c2 := newUsageResultCache(s)
-	defer c2.Close()
-
-	key := "roundtrip"
-	defer c1.Delete(context.Background(), key)
-	var fills atomic.Int32
-	fill := func() (any, error) {
-		fills.Add(1)
-		return map[string]int64{"requests": 123}, nil
-	}
-	var first, second map[string]int64
-	if err := c1.DoJSON(context.Background(), key, 5*time.Second, &first, fill); err != nil {
-		t.Fatal(err)
-	}
-	if err := c2.DoJSON(context.Background(), key, 5*time.Second, &second, fill); err != nil {
-		t.Fatal(err)
-	}
-	if first["requests"] != 123 || second["requests"] != 123 || fills.Load() != 1 || c2.remoteHits.Load() != 1 {
-		t.Fatalf("真实 Redis 往返失败: first=%v second=%v fills=%d hits=%d", first, second, fills.Load(), c2.remoteHits.Load())
-	}
-
-	// 错误凭据也只能让缓存降级，不能让页面失败。
-	badSettings := s
-	badSettings.UsageRedisPassword = "intentionally-wrong-password"
-	badSettings.UsageRedisPrefix += ":bad-auth"
-	bad := newUsageResultCache(badSettings)
-	bad.logRemoteErrors = false
-	defer bad.Close()
-	start := time.Now()
-	var fallback string
-	if err := bad.DoJSON(context.Background(), "fallback", time.Minute, &fallback, func() (any, error) { return "ok", nil }); err != nil {
-		t.Fatalf("Redis 鉴权失败不应传给业务: %v", err)
-	}
-	if fallback != "ok" || bad.remoteErrors.Load() == 0 || time.Since(start) > 500*time.Millisecond {
-		t.Fatalf("错误 Redis 凭据应快速降级: value=%q errors=%d elapsed=%s", fallback, bad.remoteErrors.Load(), time.Since(start))
-	}
-}
-
-func TestUsageResultCacheRedisUnavailableIntegration(t *testing.T) {
-	addr := os.Getenv("MONITOR_TEST_REDIS_UNAVAILABLE_ADDR")
-	if addr == "" {
-		t.Skip("MONITOR_TEST_REDIS_UNAVAILABLE_ADDR 未设置")
-	}
-	c := newUsageResultCache(Settings{UsageRedisAddr: addr, UsageRedisPrefix: "nxmon:test:unavailable"})
-	c.logRemoteErrors = false
-	defer c.Close()
-	start := time.Now()
-	var out string
-	if err := c.DoJSON(context.Background(), "fallback", time.Minute, &out, func() (any, error) { return "source-result", nil }); err != nil {
-		t.Fatal(err)
-	}
-	if out != "source-result" || c.remoteErrors.Load() == 0 || time.Since(start) > 500*time.Millisecond {
-		t.Fatalf("Redis 断连应快速回源: value=%q errors=%d elapsed=%s", out, c.remoteErrors.Load(), time.Since(start))
 	}
 }

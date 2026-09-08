@@ -322,6 +322,7 @@ func (m *Monitor) RegisterRoutes(r *gin.Engine) {
 		rootChannels.POST("/finance/channel", m.saveChannelFinanceChannelHandler)
 		rootChannels.POST("/finance/domain-rates", m.saveChannelFinanceDomainRatesHandler)
 		rootChannels.GET("/upstream", m.getChannelUpstreamHandler)
+		rootChannels.POST("/upstream/diagnose", m.diagnoseChannelUpstreamHandler)
 		rootChannels.POST("/upstream", m.saveChannelUpstreamHandler)
 		rootChannels.POST("/upstream/sync", m.syncChannelUpstreamHandler)
 		rootChannels.POST("/upstream/usage-sync", m.syncChannelUpstreamUsageHandler)

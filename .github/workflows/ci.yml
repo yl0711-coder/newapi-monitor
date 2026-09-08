@@ -11,16 +11,6 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
-    services:
-      redis:
-        image: redis:7-alpine
-        ports:
-          - 6379:6379
-        options: >-
-          --health-cmd "REDISCLI_AUTH=ci-only-redis-password redis-cli ping"
-          --health-interval 2s
-          --health-timeout 2s
-          --health-retries 15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -28,27 +18,17 @@ jobs:
           # 与候选镜像构建链对齐到已修补的 Go 版本。不使用模糊的
           # 1.25，否则 runner 可能解析到存在可达标准库漏洞的 1.25.12。
           go-version: '1.26.6'
-      # 集成测试既验证正常 Redis 往返，也验证错误密码时快速降级；因此测试
-      # Redis 必须真的启用认证。密码只用于这个一次性 CI 服务，不是业务凭据。
-      - name: Enable authentication on test Redis
-        env:
-          MONITOR_TEST_REDIS_PASSWORD: ci-only-redis-password
-        run: |
-          docker exec "${{ job.services.redis.id }}" redis-cli CONFIG SET requirepass "$MONITOR_TEST_REDIS_PASSWORD"
-          test "$(docker exec -e REDISCLI_AUTH="$MONITOR_TEST_REDIS_PASSWORD" "${{ job.services.redis.id }}" redis-cli ping)" = "PONG"
       - run: go vet ./...
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
       - name: Test dashboard rendering states without network
         run: node --test dev/tests/*.test.mjs
+      - name: Verify every monitor test belongs to exactly one race shard
+        run: go test -list . ./monitor | node dev/check-race-shards.mjs
       # monitor 包的 1000+ 个测试由下方 race-monitor 作业分片执行。这里继续
       # 覆盖其余全部包，避免新增包静默逃离竞态检测。
-      - name: Test non-monitor packages with race detector and real Redis
-        env:
-          MONITOR_TEST_REDIS_ADDR: 127.0.0.1:6379
-          MONITOR_TEST_REDIS_PASSWORD: ci-only-redis-password
-          MONITOR_TEST_REDIS_UNAVAILABLE_ADDR: 127.0.0.1:6390
+      - name: Test non-monitor packages with race detector
         run: |
           mapfile -t packages < <(go list ./... | grep -v '/monitor$')
           test "${#packages[@]}" -gt 0
@@ -135,41 +115,22 @@ jobs:
             pattern: '^Test[G-N]'
           - shard: o-s
             pattern: '^Test[O-S]'
-          - shard: t-w
-            pattern: '^Test[T-W]'
-    services:
-      redis:
-        image: redis:7-alpine
-        ports:
-          - 6379:6379
-        options: >-
-          --health-cmd "REDISCLI_AUTH=ci-only-redis-password redis-cli ping"
-          --health-interval 2s
-          --health-timeout 2s
-          --health-retries 15
+          - shard: t-z
+            pattern: '^(Test[T-Z]|Test[^A-Z]|Test$|Example|Fuzz)'
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
           go-version: '1.26.6'
-      - name: Enable authentication on test Redis
-        env:
-          MONITOR_TEST_REDIS_PASSWORD: ci-only-redis-password
-        run: |
-          docker exec "${{ job.services.redis.id }}" redis-cli CONFIG SET requirepass "$MONITOR_TEST_REDIS_PASSWORD"
-          test "$(docker exec -e REDISCLI_AUTH="$MONITOR_TEST_REDIS_PASSWORD" "${{ job.services.redis.id }}" redis-cli ping)" = "PONG"
       - name: Verify shard is non-empty
         env:
           TEST_PATTERN: ${{ matrix.pattern }}
         run: |
-          test_count="$(go test -list "$TEST_PATTERN" ./monitor | grep -c '^Test')"
+          test_count="$(go test -list "$TEST_PATTERN" ./monitor | grep -Ec '^(Test|Example|Fuzz)')"
           test "$test_count" -gt 0
           echo "monitor race shard ${{ matrix.shard }}: $test_count tests"
-      - name: Test monitor shard with race detector and real Redis
+      - name: Test monitor shard with race detector
         env:
-          MONITOR_TEST_REDIS_ADDR: 127.0.0.1:6379
-          MONITOR_TEST_REDIS_PASSWORD: ci-only-redis-password
-          MONITOR_TEST_REDIS_UNAVAILABLE_ADDR: 127.0.0.1:6390
           TEST_PATTERN: ${{ matrix.pattern }}
         run: go test -race -timeout 20m -run "$TEST_PATTERN" ./monitor
 

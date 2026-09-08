@@ -561,13 +561,13 @@ func TestChannelManagementUpstreamUsageIntegrityFailureIsIsolatedPerAccount(t *t
 	to := from + 3600
 	if err := m.storeDB.Create(&[]ChannelUpstreamUsageHour{
 		{Domain: "invalid.example", HourTs: from, BucketSeconds: 3600, Requests: 10, CostUSD: -1, Provider: upstreamProviderAICodeWith},
-		{Domain: "healthy.example", HourTs: from, BucketSeconds: 3600, Requests: 20, CostUSD: 2, Provider: upstreamProviderAICodeWith},
+		{Domain: "healthy.example", HourTs: from, BucketSeconds: 3600, Requests: 20, CostUSD: 2, Provider: upstreamProviderNewAPI},
 	}).Error; err != nil {
 		t.Fatal(err)
 	}
 	accounts := map[string]ChannelUpstreamAccountView{
 		"invalid.example": {Configured: true, Provider: upstreamProviderAICodeWith, UsageSyncEnabled: true},
-		"healthy.example": {Configured: true, Provider: upstreamProviderAICodeWith, UsageSyncEnabled: true},
+		"healthy.example": {Configured: true, Provider: upstreamProviderNewAPI, UsageSyncEnabled: true},
 	}
 	usage, err := m.loadChannelUpstreamUsage(context.Background(), stabilityScope{FromTs: from, ToTs: to}, to, accounts, channelFinanceSnapshot{})
 	if err != nil {
@@ -714,7 +714,7 @@ func TestChannelManagementAICodeWithUsageKeepsNaturalDayGranularity(t *testing.T
 		t.Fatal(err)
 	}
 	got = usage["aicodewith.com"]
-	if got.Complete || got.Requests != 3 || math.Abs(got.CostUSD-2.3) > 1e-9 {
+	if got.Complete || got.Requests != 0 || got.CostUSD != 0 || got.IntegrityStatus != upstreamUsageIntegrityWindowMismatch {
 		t.Fatalf("partial-day range was reported as a complete daily bill: %+v", got)
 	}
 }
@@ -751,7 +751,7 @@ func TestChannelManagementAICodeWithLivePartialDayIsVisible(t *testing.T) {
 		t.Fatal(err)
 	}
 	got = usage["aicodewith.com"]
-	if got.Available || got.CostUSD != 0 || got.Requests != 0 || got.IntegrityStatus != upstreamUsageIntegrityWindowMismatch {
+	if got.CostUSD != 0 || got.Requests != 0 || got.IntegrityStatus != upstreamUsageIntegrityWindowMismatch {
 		t.Fatalf("historical partial day must stay excluded with an explicit boundary reason: %+v", usage)
 	}
 }
