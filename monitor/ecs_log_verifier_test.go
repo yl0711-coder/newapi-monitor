@@ -111,7 +111,7 @@ func TestECSLogTaskVerifierRequiresAuthoritativeIdentity(t *testing.T) {
 	}
 }
 
-func TestECSLogProductionPolicyRequiresIndependentGateAndExactDefinition(t *testing.T) {
+func TestECSLogProductionPolicyRequiresOwnershipAndExactDefinition(t *testing.T) {
 	b, err := json.Marshal([]ECSLogPolicy{testECSLogPolicy()})
 	if err != nil {
 		t.Fatal(err)
@@ -127,10 +127,18 @@ func TestECSLogProductionPolicyRequiresIndependentGateAndExactDefinition(t *test
 	if err := validateECSArchiveSettings(valid); err != nil {
 		t.Fatal(err)
 	}
+	direct := valid
+	direct.ECSArchiveEnabled = false
+	direct.ECSArchiveBucket, direct.ECSArchivePrefix, direct.ECSArchiveAccount = "", "", ""
+	if _, err := parseECSLogPolicies(direct); err != nil {
+		t.Fatalf("production direct delivery rejected: %v", err)
+	}
+	if err := validateECSArchiveSettings(direct); err != nil {
+		t.Fatalf("disabled archive should not require archive configuration: %v", err)
+	}
 	for name, mutate := range map[string]func(*Settings){
 		"second-gate": func(s *Settings) { s.ECSLogProductionEnabled = false },
 		"ownership":   func(s *Settings) { s.ECSLogOwnershipEnabled = false },
-		"archive":     func(s *Settings) { s.ECSArchiveEnabled = false },
 		"archive-scope": func(s *Settings) {
 			s.ECSArchivePrefix = "isolated/"
 		},

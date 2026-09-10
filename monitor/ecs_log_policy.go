@@ -70,8 +70,8 @@ func parseECSLogPolicies(s Settings) ([]ECSLogPolicy, error) {
 	if s.ECSLogScope == ecsLogScopeIsolated && (strings.TrimSpace(s.ProdDSN) != "" || s.SourceWorkerEnabled) {
 		return nil, errors.New("isolated ECS acceptance requires a separate Monitor store with NEWAPI_LOG_DSN unset and MONITOR_SOURCE_WORKER_ENABLED=false")
 	}
-	if s.ECSLogScope == ecsLogScopeProduction && (!s.ECSLogOwnershipEnabled || !s.ECSArchiveEnabled) {
-		return nil, errors.New("production ECS logs require ownership and external archive gates")
+	if s.ECSLogScope == ecsLogScopeProduction && !s.ECSLogOwnershipEnabled {
+		return nil, errors.New("production ECS logs require ownership verification")
 	}
 	if decodeECSBoundedJSON(strings.NewReader(s.ECSLogPoliciesJSON), 64<<10, &policies) != nil || len(policies) == 0 || len(policies) > 32 {
 		return nil, errors.New("invalid bounded ECS log service policies")
