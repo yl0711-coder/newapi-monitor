@@ -1,0 +1,7 @@
+# Test-only wrapper. Build context is a private temp directory containing only
+# the cross-compiled test binary, never the repository, credentials or databases.
+ARG MONITOR_IMAGE
+FROM ${MONITOR_IMAGE}
+USER root
+COPY monitor.test /fixture.test
+ENTRYPOINT ["/fixture.test"]

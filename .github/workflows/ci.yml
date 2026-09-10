@@ -8,7 +8,33 @@ on:
     branches: [main, dev]
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
+  secrets:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.6'
+      # CLI is pinned and isolated from application dependencies. No action licence
+      # or production credentials required; never upload reports containing secrets.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install pinned secret scanner outside the application module
+        run: GOBIN="$RUNNER_TEMP/security-tools" go install github.com/zricethezav/gitleaks/v8@v8.30.0
+      - name: Verify secret policy positive and negative controls
+        run: node dev/check-secret-policy.mjs "$RUNNER_TEMP/security-tools/gitleaks"
+      - name: Scan repository history for secrets (redacted)
+        run: '"$RUNNER_TEMP/security-tools/gitleaks" git --config .gitleaks.toml --redact=100 --no-banner --ignore-gitleaks-allow --log-opts="--all" .'
+
   test:
     runs-on: ubuntu-latest
     steps:
@@ -19,11 +45,24 @@ jobs:
           # 1.25，否则 runner 可能解析到存在可达标准库漏洞的 1.25.12。
           go-version: '1.26.6'
       - run: go vet ./...
+      - name: Test isolated AWS IAM registration bridge without credentials
+        run: python3 -m unittest discover -s deploy/ecs-log-bridge -v
+      - name: Test offline ECS cutover and rollback guard without credentials
+        run: python3 -m unittest discover -s dev -p 'test_ecs_cutover_preflight.py' -v
+      - name: Test local image runner safety without Docker or credentials
+        run: python3 -m unittest discover -s dev -p 'test_ecs_image_acceptance.py' -v
+      - name: Test offline ECS task contract and isolated IAM template
+        run: |
+          python3 -m unittest discover -s dev -p 'test_ecs_task*.py' -v
+          python3 -m unittest discover -s dev -p 'test_ecs_acceptance*.py' -v
+          python3 -m unittest discover -s dev -p 'test_ecs_split*.py' -v
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
       - name: Test dashboard rendering states without network
         run: node --test dev/tests/*.test.mjs
+      - name: Reject unmaintained OpenPGP dependencies
+        run: node dev/check-dependency-policy.mjs
       - name: Verify every monitor test belongs to exactly one race shard
         run: go test -list . ./monitor | node dev/check-race-shards.mjs
       # monitor 包的 1000+ 个测试由下方 race-monitor 作业分片执行。这里继续
@@ -132,19 +171,19 @@ jobs:
       - name: Test monitor shard with race detector
         env:
           TEST_PATTERN: ${{ matrix.pattern }}
-        run: go test -race -timeout 20m -run "$TEST_PATTERN" ./monitor
+        run: |
+          go build -o "$RUNNER_TEMP/nginxcollector" ./cmd/nginxcollector
+          MONITOR_TEST_NGINX_COLLECTOR_BIN="$RUNNER_TEMP/nginxcollector" go test -race -timeout 20m -run "$TEST_PATTERN" ./monitor
 
-  # 用内置 GITHUB_TOKEN 推送,无需额外配置 secret。首次发布后,在 Packages 设置里把包可见性设为 Public。
-  # 测试通过后才构建并发布镜像到 GHCR(PR 不发布)。
-  # 三个镜像:monitor 主服务 + hostagent 主机采集器 + nginxcollector 入口采集器。
-  build-push:
-    needs: [test, race-monitor]
-    if: github.event_name != 'pull_request'
+  # PRs are scanned too. No registry write credentials in the build/scan job.
+  # All three images must pass before ANY image is published. Transfer the exact
+  # scanned image, not a rebuild with potentially different base packages.
+  image-security:
+    needs: [test, race-monitor, secrets]
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
+    timeout-minutes: 30
     strategy:
+      fail-fast: false
       matrix:
         include:
           - image: newapi-monitor
@@ -155,6 +194,80 @@ jobs:
             dockerfile: cmd/nginxcollector/Dockerfile
     steps:
       - uses: actions/checkout@v4
+      - name: Candidate image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}
+          tags: |
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=sha,format=short
+            type=raw,value=latest,enable={{is_default_branch}}
+      - name: Build local candidate only
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          # Reuse Go build cache, never yesterday's apk security-upgrade layer.
+          pull: true
+          no-cache-filters: runtime
+          load: true
+          push: false
+          tags: monitor-security:${{ matrix.image }}
+          labels: ${{ steps.meta.outputs.labels }}
+      - name: Block high and critical runtime OS vulnerabilities (including unfixed)
+        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # 0.35.0
+        with:
+          version: v0.74.0
+          image-ref: monitor-security:${{ matrix.image }}
+          scanners: vuln
+          vuln-type: os
+          severity: HIGH,CRITICAL
+          ignore-unfixed: false
+          exit-code: '1'
+          timeout: 10m
+      - name: Report remaining runtime OS advisories
+        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # 0.35.0
+        with:
+          version: v0.74.0
+          image-ref: monitor-security:${{ matrix.image }}
+          scanners: vuln
+          vuln-type: os
+          severity: UNKNOWN,LOW,MEDIUM
+          ignore-unfixed: false
+          exit-code: '0'
+          timeout: 10m
+      - name: Save scanned artifact
+        if: github.event_name != 'pull_request'
+        env:
+          IMAGE_NAME: ${{ matrix.image }}
+        run: docker save "monitor-security:$IMAGE_NAME" -o "$RUNNER_TEMP/scanned-image.tar"
+      - uses: actions/upload-artifact@v4
+        if: github.event_name != 'pull_request'
+        with:
+          name: scanned-${{ matrix.image }}
+          path: ${{ runner.temp }}/scanned-image.tar
+          if-no-files-found: error
+          retention-days: 1
+
+  build-push:
+    needs: [test, race-monitor, secrets, image-security]
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      matrix:
+        image: [newapi-monitor, newapi-monitor-hostagent, newapi-monitor-nginxcollector]
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: scanned-${{ matrix.image }}
+          path: ${{ runner.temp }}/scanned
+      - name: Load exact scanned image
+        run: docker load -i "$RUNNER_TEMP/scanned/scanned-image.tar"
 
       - name: Log in to GHCR
         uses: docker/login-action@v3
@@ -174,20 +287,23 @@ jobs:
             type=sha,format=short
             type=raw,value=latest,enable={{is_default_branch}}
 
-      - name: Build and push
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: ${{ matrix.dockerfile }}
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+      - name: Publish exact scanned image without rebuilding
+        env:
+          IMAGE_NAME: ${{ matrix.image }}
+          IMAGE_TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          test -n "$IMAGE_TAGS"
+          while IFS= read -r tag; do
+            test -n "$tag"
+            docker tag "monitor-security:$IMAGE_NAME" "$tag"
+            docker push "$tag"
+          done <<< "$IMAGE_TAGS"
 
   # Host-side safety tools are not container images. Build them on the same
   # tested Linux revision and publish checksums so production never receives
   # an untraceable binary built by hand on an operator laptop.
   build-nginx-ops-tools:
-    needs: [test, race-monitor]
+    needs: [test, race-monitor, secrets, image-security]
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     permissions:

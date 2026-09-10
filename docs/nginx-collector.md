@@ -1,5 +1,7 @@
 # Nginx 入口层旁路采集
 
+ECS 隔离适配新增 `ecslogagent` 包装器和 `NGINXCOLLECTOR_ECS_SOCKET` 私有传输，不修改 Lightsail 默认传输。source V2 不由此自动启用；配置、真实进程验收和剩余门槛见 [ECS 代理本机验收](ecs-log-agent-local-20260909.md)。不要仅手填 ECS node 绕过注册。
+
 该能力默认关闭。它用于补充“请求是否到达入口、HTTP 状态、入口与 upstream 耗时”这层客观事实，不替代 NewAPI 使用日志，也不自动判断责任方。
 
 ## 安全边界
@@ -68,6 +70,12 @@ log_format nexus_monitor_v2 escape=json '{'
 `request_id` 字段保留是为了原分钟汇总的存在率兼容；证据 lane 使用两个明确命名字段。先用 `pilot` 核对一批真实请求的响应头、Nginx HMAC 证据和 `logs.request_id`；覆盖率与值一致性达标前不得配成 `verified`，也不得在客户排障中宣称精确关联。
 
 ## 请求证据灰度开关
+
+本地验证中的心跳修复开关：`NGINXCOLLECTOR_EVIDENCE_FROZEN_HEARTBEAT=true`，默认关闭，仅允许与 `NGINXCOLLECTOR_EVIDENCE_MODE=pilot` 同时使用。这不是 ECS 自动注册开关，也不能用于宣称任务间来源已隔离；完整 ECS 来源授权与隔离验收前不要直接在生产启用。
+
+开启后，采集器在绝对路径 `NGINXCOLLECTOR_CURSOR_PATH` 旁保存 `.evidence-heartbeat.json` 与 `.lock`：首次生成独立随机批次命名空间，随后使用持久递增序号；先原子落盘完整心跳，再发送，只有精确 ACK 后清除待确认内容。超时、409、进程重启均重试同一编号和同一内容，不通过改编号绕过冲突。文件损坏或归属不符时停止该心跳发送并保留原件，不自动重置。状态文件不得复制到另一任务，也不得放进证据事件 outbox；必须保存在该采集器独享、能跨进程重启保留的卷中。ECS 临时卷被销毁仍会丢失本地待确认状态，此开关不提供任务销毁后的补传保证。
+
+关闭开关或回退旧镜像会恢复旧心跳路径，未确认的新心跳仍留在本地文件中，不能宣称已经补传；需保留原文件等待重新启用后按原内容重试。不要把回退旧算法当作多任务冲突的解决方案。访问／错误／证据事件批次协议与现有节点授权均未改变。采集器错误日志新增 `heartbeat delivery`／`event outbox delivery` 前缀，便于区分后续 409 来源；日志仍按原逻辑限频，并非每次失败的完整审计记录。
 
 Monitor 和节点必须使用相同、独立于登录与 ingest token 的 HMAC 密钥及 key id。默认全部 `off`：
 

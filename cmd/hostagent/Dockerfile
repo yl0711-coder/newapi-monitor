@@ -7,7 +7,7 @@
 # 见 docker-compose.hostagent.yml。
 
 # ---- 构建阶段 ----
-FROM golang:1.26-alpine3.23 AS builder
+FROM golang:1.26.6-alpine3.23 AS builder
 WORKDIR /build
 COPY go.mod go.sum ./
 RUN go mod download
@@ -15,7 +15,7 @@ COPY . .
 RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /app/hostagent ./cmd/hostagent
 
 # ---- 运行阶段(最小镜像)----
-FROM alpine:3.23
+FROM alpine:3.23 AS runtime
 RUN apk upgrade --no-cache \
     && apk add --no-cache ca-certificates tzdata \
     && adduser -D -u 1000 app
