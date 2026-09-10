@@ -28,6 +28,7 @@ import (
 )
 
 type config struct {
+	ecsSocket          string
 	node               string
 	logPath            string
 	cursorPath         string
@@ -44,11 +45,14 @@ type config struct {
 	evidenceOutboxPath string
 	evidenceOutboxMax  int64
 	evidenceFSMu       *sync.Mutex
-	errorEnabled       bool
-	errorLogPath       string
-	errorCursorPath    string
-	errorSinkURL       string
-	errorTimezone      string
+	// Opt-in pending ECS integration. This namespaces heartbeat batches only;
+	// it does not authorize a task or replace per-task source isolation.
+	evidenceFrozenHeartbeat bool
+	errorEnabled            bool
+	errorLogPath            string
+	errorCursorPath         string
+	errorSinkURL            string
+	errorTimezone           string
 	// sourceV2Prepare enables only the v1 boundary proof used before a v2
 	// cutover. It is default-off so a collector-only rolling upgrade remains
 	// byte-for-byte compatible with an older/default-off Monitor.
@@ -83,7 +87,8 @@ func loadConfig() (config, error) {
 		return config{}, err
 	}
 	c := config{
-		node: strings.TrimSpace(os.Getenv("NGINXCOLLECTOR_NODE")), logPath: env("NGINXCOLLECTOR_LOG_PATH", "/logs/nexusapi_access.jsonl"),
+		ecsSocket: strings.TrimSpace(os.Getenv("NGINXCOLLECTOR_ECS_SOCKET")),
+		node:      strings.TrimSpace(os.Getenv("NGINXCOLLECTOR_NODE")), logPath: env("NGINXCOLLECTOR_LOG_PATH", "/logs/nexusapi_access.jsonl"),
 		cursorPath: env("NGINXCOLLECTOR_CURSOR_PATH", "/data/cursor.json"), sinkURL: strings.TrimSpace(os.Getenv("NGINXCOLLECTOR_SINK_URL")),
 		token: os.Getenv("NGINXCOLLECTOR_TOKEN"), interval: time.Duration(intervalSeconds) * time.Second,
 		maxLines: maxLines, retentionDays: retentionDays,
@@ -117,8 +122,23 @@ func loadConfig() (config, error) {
 		lanes[lane] = true
 	}
 	c.sourceV2Access, c.sourceV2Error = lanes["access"], lanes["error"]
+	if raw := strings.TrimSpace(os.Getenv("NGINXCOLLECTOR_EVIDENCE_FROZEN_HEARTBEAT")); raw != "" {
+		c.evidenceFrozenHeartbeat, err = strconv.ParseBool(raw)
+		if err != nil {
+			return config{}, errors.New("NGINXCOLLECTOR_EVIDENCE_FROZEN_HEARTBEAT must be a boolean")
+		}
+	}
+	if c.evidenceFrozenHeartbeat && !filepath.IsAbs(c.cursorPath) {
+		return config{}, errors.New("frozen evidence heartbeat requires an absolute cursor path")
+	}
+	if c.evidenceFrozenHeartbeat && c.evidenceMode != "pilot" {
+		return config{}, errors.New("frozen evidence heartbeat is limited to pilot pending task-source isolation")
+	}
 	if c.node == "" || c.sinkURL == "" || c.token == "" {
 		return config{}, fmt.Errorf("NGINXCOLLECTOR_NODE, NGINXCOLLECTOR_SINK_URL and NGINXCOLLECTOR_TOKEN are required")
+	}
+	if c.ecsSocket != "" && (!filepath.IsAbs(c.ecsSocket) || c.allowHTTP || !strings.HasPrefix(c.node, "ecs-") || len(c.node) != 52 || c.sourceV2Access || c.sourceV2Error) {
+		return config{}, errors.New("ECS socket requires isolated source identity, HTTPS and legacy source protocol pending V2 acceptance")
 	}
 	if !validNodeName(c.node) {
 		return config{}, fmt.Errorf("NGINXCOLLECTOR_NODE must match [A-Za-z0-9][A-Za-z0-9._-]{0,63}")
@@ -985,7 +1005,8 @@ func postBatch(ctx context.Context, c config, payload batch) error {
 	req.Header.Set("Authorization", "Bearer "+c.token)
 	req.Header.Set("Content-Type", "application/json")
 	client := &http.Client{
-		Timeout: 10 * time.Second,
+		Transport: collectorTransport(c),
+		Timeout:   10 * time.Second,
 		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
 			return fmt.Errorf("collector sink redirect refused")
 		},
@@ -995,11 +1016,14 @@ func postBatch(ctx context.Context, c config, payload batch) error {
 		return err
 	}
 	defer resp.Body.Close()
-	data, readErr := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
+	data, readErr := io.ReadAll(io.LimitReader(resp.Body, (4<<10)+1))
 	if readErr != nil {
 		return readErr
 	}
 	if resp.StatusCode != http.StatusOK {
+		if resp.StatusCode == http.StatusAccepted && payload.SourceBoundary == nil {
+			return validateArchiveReceipt(c, "access", payload.Node, payload.BatchID, body, data)
+		}
 		return fmt.Errorf("monitor returned HTTP %d", resp.StatusCode)
 	}
 	if payload.SourceBoundary != nil {
@@ -1211,6 +1235,11 @@ func runOnce(ctx context.Context, c config) error {
 // changing LastAcked* beside an unfinished frozen range would make the next
 // recovery fail its exact cursor/journal match.
 func runLegacyHeartbeatOnce(ctx context.Context, c config, now time.Time) (bool, error) {
+	if c.ecsSocket != "" {
+		// The ECS agent owns authenticated liveness. Do not archive a mutable
+		// legacy minute-keyed heartbeat beside frozen request batches.
+		return false, nil
+	}
 	if _, err := os.Stat(accessInflightPathV1(c)); err == nil {
 		return false, nil
 	} else if !errors.Is(err, os.ErrNotExist) {
@@ -1261,17 +1290,27 @@ func main() {
 		}
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
+	err = runCollector(ctx, c, sourceV2Client)
+	stop()
+	if err != nil {
+		log.Fatal(err)
+	}
+}
+
+func runCollector(ctx context.Context, c config, sourceV2Client *sourceV2HTTPClient) error {
 	ticker := time.NewTicker(c.interval)
 	defer ticker.Stop()
+	var workers sync.WaitGroup
 	if c.evidenceMode != "off" {
-		go runEvidenceWorker(ctx, c)
+		workers.Add(1)
+		go func() { defer workers.Done(); runEvidenceWorker(ctx, c) }()
 	}
 	if c.errorEnabled {
+		workers.Add(1)
 		if c.sourceV2Error {
-			go runErrorSourceV2Worker(ctx, c, sourceV2Client)
+			go func() { defer workers.Done(); runErrorSourceV2Worker(ctx, c, sourceV2Client) }()
 		} else {
-			go runErrorWorker(ctx, c)
+			go func() { defer workers.Done(); runErrorWorker(ctx, c) }()
 		}
 	}
 	var nextHeartbeat time.Time
@@ -1304,7 +1343,10 @@ func main() {
 		}
 		select {
 		case <-ctx.Done():
-			return
+			if c.ecsSocket != "" {
+				return shutdownECSCollector(c, &workers)
+			}
+			return nil
 		case <-ticker.C:
 		}
 	}

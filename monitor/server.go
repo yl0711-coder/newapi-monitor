@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"gorm.io/gorm"
 
 	"github.com/yl0711-coder/newapi-monitor/monitor/public"
 )
@@ -21,6 +22,12 @@ import (
 
 //go:embed page.html
 var pageHTML string
+
+//go:embed infra_assets.js
+var infraAssetsJS string
+
+//go:embed ecs_log_sources.js
+var ecsLogSourcesJS string
 
 //go:embed alert.html
 var alertPageHTML string
@@ -213,8 +220,20 @@ func (m *Monitor) RegisterRoutes(r *gin.Engine) {
 		c.Header("Cache-Control", "no-cache")
 		c.Data(http.StatusOK, "application/javascript; charset=utf-8", logChainJS)
 	})
-	r.GET("/api/brand", m.brandHandler)                          // 公开:站点名,供前端设置页面标题
-	r.POST("/internal/rejections", m.ingestRejections)           // 机器对机器:接收采集器推送的前置拒绝(token 鉴权)
+	r.GET("/api/brand", m.brandHandler) // 公开:站点名,供前端设置页面标题
+	r.GET("/infra-assets.js", func(c *gin.Context) {
+		c.Header("Cache-Control", "no-cache")
+		c.Data(http.StatusOK, "application/javascript; charset=utf-8", []byte(infraAssetsJS))
+	})
+	r.GET("/ecs-log-sources.js", func(c *gin.Context) {
+		c.Header("Cache-Control", "no-cache")
+		c.Data(http.StatusOK, "application/javascript; charset=utf-8", []byte(ecsLogSourcesJS))
+	})
+	r.POST("/internal/rejections", m.ingestRejections)      // 机器对机器:接收采集器推送的前置拒绝(token 鉴权)
+	r.POST("/internal/rejections/v2", m.ingestRejectionsV2) // Durable collector: strict, full-payload ACK; legacy route unchanged.
+	r.POST("/internal/ecs/v1/register", m.registerECSLogHTTP)
+	r.POST("/internal/ecs/v1/ingest/:lane", m.ingestECSLogHTTP)
+	r.POST("/internal/ecs/v1/heartbeat/:lane", m.heartbeatECSLogHTTP)
 	r.POST("/internal/host", m.ingestHost)                       // 机器对机器:接收各节点主机 agent 推送的 OS 内存/磁盘(token 鉴权)
 	r.POST("/internal/nginx", m.ingestNginx)                     // 机器对机器:接收已脱敏的 Nginx 分钟聚合(token 鉴权,默认关闭)
 	r.POST("/internal/nginx-errors", m.ingestNginxErrors)        // 机器对机器:error.log 节点侧分类分钟计数，不接收原文
@@ -253,9 +272,11 @@ func (m *Monitor) RegisterRoutes(r *gin.Engine) {
 		// 上游主域名与错误原文，属敏感诊断数据，不得被任何中间层缓存。
 		// 用中间件而非在 handler 里逐个 c.Header：handler 有多条提前 return
 		// 的错误分支（400/401/403/500），逐个加必然漏，而漏掉的恰好是错误响应。
-		view.GET("/logchain/requests", noStoreSensitive, m.serveLogChainRequests)            // 客户排障:逐条请求→渠道→上游主域名→错误原文(含 type=5,含渠道信息,仅管理员)
-		view.GET("/logchain/filters", noStoreSensitive, m.serveLogChainFilters)              // 客户排障:筛选下拉取值(服务分组/上游域名/渠道),只读本地快照
-		view.GET("/infra", m.serveInfra)                                                     // 服务端健康监控(实例/DB/LB)快照
+		view.GET("/logchain/requests", noStoreSensitive, m.serveLogChainRequests) // 客户排障:逐条请求→渠道→上游主域名→错误原文(含 type=5,含渠道信息,仅管理员)
+		view.GET("/logchain/filters", noStoreSensitive, m.serveLogChainFilters)   // 客户排障:筛选下拉取值(服务分组/上游域名/渠道),只读本地快照
+		view.GET("/infra", m.serveInfra)                                          // 服务端健康监控(实例/DB/LB)快照
+		view.GET("/infra/assets", noStoreSensitive, m.serveInfraAssets)
+		view.GET("/infra/ecs-log-sources", noStoreSensitive, m.serveECSLogSources)
 		view.GET("/infra/series", m.serveInfraSeries)                                        // 按需取某资源某些指标的近 N 小时序列(展开图用)
 		view.GET("/capacity/report", m.serveCapacityReport)                                  // 容量规划:只读 Monitor 本地三类脱敏事实
 		view.GET("/group-governance/report", noStoreSensitive, m.serveGroupGovernanceReport) // 分组治理:只读本地快照
@@ -275,6 +296,7 @@ func (m *Monitor) RegisterRoutes(r *gin.Engine) {
 	}
 
 	// 仅超级管理员:报警配置(看 + 改)
+	r.POST("/infra/assets/action", m.requireRole(roleRoot), m.serveInfraAssetAction)
 	root := r.Group("/alert", m.requireRole(roleRoot))
 	{
 		root.GET("", func(c *gin.Context) { c.Data(http.StatusOK, "text/html; charset=utf-8", []byte(alertPageHTML)) })
@@ -477,6 +499,16 @@ func (m *Monitor) requestUsageFactHistoryDayRepairHandler(c *gin.Context) {
 // 未配置则接口关闭(503);不匹配 401(常数时间比较)。所有 ingest 端点共用这一道闸,
 // 返回 false 时响应已写好,调用方直接 return。
 func (m *Monitor) checkIngest(c *gin.Context) bool {
+	if _, ok := verifiedECSLog(c); ok {
+		return true
+	}
+	// The isolated receiver must not mix legacy bearer-token samples with
+	// task-authenticated evidence, even if general routes are mounted by mistake.
+	// Normal Monitor/Lightsail ingestion is unchanged while ECS is disabled.
+	if m.cfg.ECSLogEnabled && m.cfg.ECSLogScope == "isolated" {
+		c.JSON(http.StatusForbidden, gin.H{"error": "isolated ECS receiver requires task-authenticated ingestion"})
+		return false
+	}
 	want := m.cfg.IngestToken
 	if want == "" {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "ingest disabled"})
@@ -515,6 +547,10 @@ func (m *Monitor) ingestRejections(c *gin.Context) {
 		return
 	}
 	node := clip(strings.TrimSpace(in.Node), 64)
+	if ecsLogNodePattern.MatchString(node) {
+		c.JSON(http.StatusForbidden, gin.H{"error": "ECS sources require signed ECS ingestion"})
+		return
+	}
 	batchID := strings.TrimSpace(in.BatchID)
 	if node == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "node required"})
@@ -595,6 +631,16 @@ func (m *Monitor) serveInfraSeries(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "resource is not monitored"})
 		return
 	}
+	assets, incarnations, registryErr := m.infraAssetProjection()
+	if registryErr != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "resource registry unavailable"})
+		return
+	}
+	asset, managed := assets[resource]
+	if !visibleInfraAsset(asset, managed) {
+		c.JSON(http.StatusNotFound, gin.H{"error": "resource is archived or removed"})
+		return
+	}
 	hours := 6
 	if v, err := strconv.Atoi(c.Query("hours")); err == nil && v > 0 {
 		hours = v
@@ -603,6 +649,9 @@ func (m *Monitor) serveInfraSeries(c *gin.Context) {
 		hours = 24
 	}
 	since := time.Now().Unix() - int64(hours)*3600
+	if incarnations[resource] > 1 {
+		since = max(since, infraGenerationStart(asset.FirstSeen))
+	}
 	requested := make([]string, 0, maxInfraSeriesMetrics)
 	for _, met := range strings.Split(c.Query("metrics"), ",") {
 		met = strings.TrimSpace(met)
@@ -731,28 +780,31 @@ func (m *Monitor) ingestHost(c *gin.Context) {
 			})
 		}
 	}
-	// 所有输入通过校验后再写入，避免错误的容器明细请求留下半套指标。
-	if len(rows) > 0 {
-		if err := m.upsertInfra(rows); err != nil {
-			slog.Warn("主机指标入库失败", "err", err)
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "store failed"})
-			return
-		}
-	}
-	containerStored := 0
-	if in.Containers != nil {
-		if err := m.replaceHostContainerSnapshots(node, snapshots); err != nil {
-			slog.Warn("主机容器明细入库失败", "node", node, "err", err)
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "container snapshot store failed"})
-			return
-		}
-		containerStored = len(snapshots)
-	}
 	if len(rows) == 0 && in.Containers == nil {
 		c.JSON(http.StatusOK, gin.H{"ok": true, "stored": 0, "containers_stored": 0})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"ok": true, "stored": len(rows), "containers_stored": containerStored})
+	// Bind the identity before writing any metrics; retry only the entire local
+	// transaction. A late old-generation sample must not update current charts.
+	err := m.acceptInfraHostReport(c.Request.Context(), node, receivedAt, in.Ts, func(tx *gorm.DB) error {
+		if err := upsertInfraWithDB(tx, rows); err != nil {
+			return err
+		}
+		if in.Containers != nil {
+			return replaceHostContainerSnapshotsWithDB(tx, node, snapshots)
+		}
+		return nil
+	})
+	if errors.Is(err, errInfraHostGeneration) {
+		c.JSON(http.StatusConflict, gin.H{"error": "host generation or sample time is ambiguous; send a fresh sample"})
+		return
+	}
+	if err != nil {
+		slog.Warn("主机资源及指标入库失败", "err", err)
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "resource registration failed; retry report"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"ok": true, "stored": len(rows), "containers_stored": len(snapshots)})
 }
 
 // clip 截断字符串到 n 字节,防御异常长输入。

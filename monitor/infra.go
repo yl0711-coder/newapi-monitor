@@ -168,6 +168,7 @@ func (m *Monitor) infraTargetsWithDiscovery(ctx context.Context, cl *lightsail.C
 	var discovered []infraTarget
 	var discoveryRows []InfraSample
 	complete := map[string]bool{}
+	assetInventories := map[string][]infraAssetObservation{}
 	if instances, err := collectLightsailPages(ctx, func(token *string) ([]lstypes.Instance, *string, error) {
 		r, err := cl.GetInstances(ctx, &lightsail.GetInstancesInput{PageToken: token})
 		if err != nil {
@@ -181,6 +182,13 @@ func (m *Monitor) infraTargetsWithDiscovery(ctx context.Context, cl *lightsail.C
 				continue
 			}
 			t := infraTarget{name: *in.Name, rtype: "instance"}
+			if in.Arn != nil {
+				state := "unknown"
+				if in.State != nil {
+					state = strings.ToLower(aws.ToString(in.State.Name))
+				}
+				assetInventories["instance"] = append(assetInventories["instance"], infraAssetObservation{Identity: aws.ToString(in.Arn), Resource: *in.Name, Kind: "instance", Platform: "Lightsail", CloudState: state})
+			}
 			if h := in.Hardware; h != nil {
 				if h.RamSizeInGb != nil {
 					t.memTotalMB = float64(*h.RamSizeInGb) * 1024
@@ -240,7 +248,17 @@ func (m *Monitor) infraTargetsWithDiscovery(ctx context.Context, cl *lightsail.C
 		slog.Warn("infra: 列负载均衡失败", "err", err)
 		discoveryRows = append(discoveryRows, managedDiscoveryRows(bucket, "Lightsail/负载均衡", false, 0)...)
 	}
-	lifecycleRows := lightsailPresenceRows(bucket, discovered, m.knownLightsailResources(ctx), complete)
+	previous := m.knownLightsailResources(ctx)
+	// The persistent registry retains missing hosts for manual archiving;
+	// unlike inventory_present, these rows do not disappear on a later poll.
+	if complete["instance"] {
+		if err := m.observeInfraAssets(ctx, "lightsail:"+m.cfg.AWSRegion+":instance", assetInventories["instance"], time.Now().Unix()); err != nil {
+			slog.Warn("infra: Lightsail 资源目录更新失败", "err", err)
+		} else if err := m.retainMissingLightsailAssets(ctx, previous, discovered, time.Now().Unix()); err != nil {
+			slog.Warn("infra: 历史下线实例保留失败", "err", err)
+		}
+	}
+	lifecycleRows := lightsailPresenceRows(bucket, discovered, previous, complete)
 	discoveryRows = append(discoveryRows, lifecycleRows...)
 	retired := map[string]bool{}
 	for _, row := range lifecycleRows {
@@ -534,6 +552,7 @@ type InfraAlert struct {
 
 // InfraSnapshot 是服务端监控一次快照:总览 + 端到端探活 + 实例 + 数据库 + 负载均衡 + 趋势 + 最近告警。
 type InfraSnapshot struct {
+	RegistryError string               `json:"registry_error,omitempty"`
 	GeneratedAt   string               `json:"generated_at"`
 	DataAgeSec    int64                `json:"data_age_sec"`
 	Overview      InfraOverview        `json:"overview"`
@@ -554,6 +573,7 @@ type InfraSnapshot struct {
 func (m *Monitor) computeInfraSnapshot(nowUnix int64) InfraSnapshot {
 	latest := m.storeInfraLatest()
 	retired := retiredInfraResources(latest)
+	assets, incarnations, registryErr := m.infraAssetProjection()
 	type acc struct {
 		rtype    string
 		metrics  map[string]float64
@@ -562,7 +582,11 @@ func (m *Monitor) computeInfraSnapshot(nowUnix int64) InfraSnapshot {
 	}
 	byRes := map[string]*acc{}
 	for _, r := range latest {
-		if m.infraExcluded(r.Resource) || retired[r.Resource] || r.Metric == infraPresenceMetric {
+		asset, managed := assets[r.Resource]
+		if m.infraExcluded(r.Resource) || !visibleInfraAsset(asset, managed) || retired[r.Resource] && !managed || r.Metric == infraPresenceMetric {
+			continue
+		}
+		if incarnations[r.Resource] > 1 && r.BucketTs < infraGenerationStart(asset.FirstSeen) {
 			continue
 		}
 		if r.RType == "lock" && !m.originLockConfigured(r.Resource) {
@@ -587,6 +611,9 @@ func (m *Monitor) computeInfraSnapshot(nowUnix int64) InfraSnapshot {
 	}
 
 	var snap InfraSnapshot
+	if registryErr != nil {
+		snap.RegistryError = "资源目录暂不可用，归档状态无法核验"
+	}
 	snap.GeneratedAt = time.Unix(nowUnix, 0).Format("2006-01-02 15:04:05")
 	var oldest int64
 	for name, a := range byRes {
@@ -640,7 +667,11 @@ func (m *Monitor) computeInfraSnapshot(nowUnix int64) InfraSnapshot {
 			Platform: infraPlatform(name, a.rtype), Group: infraResourceGroup(name), AgeSec: age, Metrics: a.metrics, StaleMetrics: staleMetrics}
 		res.MissingMetrics = missingMetrics
 		res.CoverageComplete = len(missingMetrics) == 0
-		res.Containers = m.hostContainerSnapshot(name, nowUnix)
+		if incarnations[name] > 1 {
+			res.Containers = m.hostContainerSnapshot(name, nowUnix, assets[name].FirstSeen+1)
+		} else {
+			res.Containers = m.hostContainerSnapshot(name, nowUnix)
+		}
 		addDerivedPct(&res) // 派生百分比键(前端直接用),需在算 status 前完成
 		res.Status = m.infraStatus(res)
 		if (len(missingMetrics) > 0 || len(criticalStaleMetrics(staleMetrics)) > 0) && res.Status == "ok" {
@@ -666,6 +697,20 @@ func (m *Monitor) computeInfraSnapshot(nowUnix int64) InfraSnapshot {
 	} else {
 		snap.DataAgeSec = -1
 	}
+	// Keep discovered/missing resources visible even before their first
+	// sample or after time-series retention. Their manual membership persists.
+	for name, a := range assets {
+		if a.State != "active" || m.infraExcluded(name) {
+			continue
+		}
+		if _, exists := byRes[name]; exists {
+			continue
+		}
+		if a.Kind != "instance" && a.Kind != "host" && a.Kind != "ecs_service" {
+			continue
+		}
+		snap.Instances = append(snap.Instances, InfraResource{Name: name, DisplayName: infraDisplayName(name), Platform: a.Platform, Type: rtypeOrInstance(a.Kind), Group: infraResourceGroup(name), Status: "nosample", AgeSec: -1, Metrics: map[string]float64{}})
+	}
 	// 实例按名稳定排序,避免每次刷新行序跳动。
 	sortInstances(snap.Instances)
 	sortInfraResources(snap.Databases)
@@ -684,6 +729,20 @@ func (m *Monitor) computeInfraSnapshot(nowUnix int64) InfraSnapshot {
 	// 各资源的指标趋势改为前端按需拉(GET /infra/series),不在快照里预算。
 	snap.Overview = buildOverview(snap)
 	snap.Alerts = m.recentInfraAlerts(nowUnix, 20)
+	visibleAlerts := snap.Alerts[:0]
+	for _, alert := range snap.Alerts {
+		hidden := false
+		for resource, asset := range assets {
+			if asset.State != "active" && (alert.Target == resource || strings.HasPrefix(alert.Target, resource+"/")) {
+				hidden = true
+				break
+			}
+		}
+		if !hidden {
+			visibleAlerts = append(visibleAlerts, alert)
+		}
+	}
+	snap.Alerts = visibleAlerts
 	return snap
 }
 
@@ -890,19 +949,27 @@ func safeContainerHealth(value string) string {
 
 func (m *Monitor) replaceHostContainerSnapshots(node string, rows []HostContainerSnapshot) error {
 	return m.storeDB.Transaction(func(tx *gorm.DB) error {
-		if err := tx.Where("node = ?", node).Delete(&HostContainerSnapshot{}).Error; err != nil {
-			return err
-		}
-		if len(rows) == 0 {
-			return nil
-		}
-		return tx.CreateInBatches(rows, 100).Error
+		return replaceHostContainerSnapshotsWithDB(tx, node, rows)
 	})
 }
 
-func (m *Monitor) hostContainerSnapshot(node string, now int64) []InfraContainer {
+func replaceHostContainerSnapshotsWithDB(tx *gorm.DB, node string, rows []HostContainerSnapshot) error {
+	if err := tx.Where("node = ?", node).Delete(&HostContainerSnapshot{}).Error; err != nil {
+		return err
+	}
+	if len(rows) == 0 {
+		return nil
+	}
+	return tx.CreateInBatches(rows, 100).Error
+}
+
+func (m *Monitor) hostContainerSnapshot(node string, now int64, since ...int64) []InfraContainer {
 	var rows []HostContainerSnapshot
-	warnReadErr("host container snapshot", m.storeDB.Where("node = ?", node).Order("name").Find(&rows))
+	query := m.storeDB.Where("node = ?", node)
+	if len(since) > 0 {
+		query = query.Where("last_seen >= ?", since[0])
+	}
+	warnReadErr("host container snapshot", query.Order("name").Find(&rows))
 	out := make([]InfraContainer, 0, len(rows))
 	for _, row := range rows {
 		age := now - row.LastSeen
@@ -1332,6 +1399,14 @@ func (m *Monitor) infraStatus(r InfraResource) string {
 		if containerState == "warn" {
 			return "warn"
 		}
+		if r.Type == "ecs_service" {
+			if v, ok := has("registry_write_ok"); ok && v < 1 {
+				return "warn"
+			}
+			if v, ok := has("task_discovery_ok"); ok && v < 1 {
+				return "warn"
+			}
+		}
 		return "ok"
 	}
 }
@@ -1346,6 +1421,13 @@ func (m *Monitor) evaluateInfraAlerts(now int64) {
 		return
 	}
 	snap := m.computeInfraSnapshot(now)
+	if snap.RegistryError != "" {
+		m.fire(c, "infra_registry_failed", "resource-registry", "资源目录不可用", snap.RegistryError, now)
+		// Only host/ECS membership depends on the registry. Do not silence
+		// independent DB, LB, discovery, probe or certificate alarms merely
+		// because archive state cannot be read. Never alarm archived hosts.
+		snap.Instances = nil
+	}
 	databases := snap.Databases
 	if len(databases) == 0 && snap.Database != nil {
 		databases = []InfraResource{*snap.Database}

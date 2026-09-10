@@ -77,7 +77,7 @@ function dashboard(fetchImpl = () => {throw Error('network forbidden in renderer
     assert.ok(declaration, `production function ${name} must exist`);
     vm.runInContext(declaration[0], context);
   }
-  for (const name of ['esc', 'fmtAge', 'infraBadge', 'infraDot', 'countItem', 'fmtNum', 'fmtRate', 'fmtUSD', 'fmtTtft', 'fmtTok', 'fmtLat', 'clock']) {
+  for (const name of ['esc', 'fmtAge', 'infraBadge', 'infraDot', 'countItem', 'fmtNum', 'fmtRate', 'fmtUSD', 'fmtTtft', 'fmtTok', 'fmtLat', 'infraCoverageNote', 'clock']) {
     const declaration = page.match(new RegExp(`^const ${name}=.*$`, 'm'));
     assert.ok(declaration, `production formatter ${name} must exist`);
     vm.runInContext(declaration[0], context);
@@ -91,6 +91,17 @@ function dashboard(fetchImpl = () => {throw Error('network forbidden in renderer
   vm.runInContext(governance.slice(0,governanceEnd)+'\nglobalThis.governanceTest={renderHeader,state};\n'+governance.slice(governanceEnd),context);
   return {context, chartOptions, element: id => document.getElementById(id), html: id => document.getElementById(id).innerHTML};
 }
+
+test('ECS incomplete discovery is visible and does not change legacy coverage notes',()=>{
+  const {context}=dashboard();
+  const render=value=>{context.coverageResource=value;return vm.runInContext('infraCoverageNote(coverageResource)',context)};
+  assert.match(render({type:'ecs_service',metrics:{task_discovery_ok:0}}),/任务发现异常/);
+  assert.equal(render({type:'ecs_service',metrics:{task_discovery_ok:1}}),'');
+  assert.equal(render({type:'instance',metrics:{task_discovery_ok:0}}),'');
+  assert.equal(render({type:'ecs_service'}),'');
+  const text=render({type:'ecs_service',metrics:{task_discovery_ok:0},missing_metrics:['<img src=x>']});
+  assert.match(text,/采集不完整/);assert.match(text,/任务发现异常/);assert.doesNotMatch(text,/<img/);
+});
 
 test('RPM, TPM and stability have independent axes and preserve null gaps',()=>{
   const {context,chartOptions}=dashboard();

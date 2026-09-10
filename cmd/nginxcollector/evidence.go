@@ -791,7 +791,7 @@ func postEvidence(ctx context.Context, c config, payload evidenceBatch) (evidenc
 	}
 	req.Header.Set("Authorization", "Bearer "+c.token)
 	req.Header.Set("Content-Type", "application/json")
-	client := &http.Client{Timeout: 10 * time.Second, CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return errors.New("evidence redirect refused") }}
+	client := &http.Client{Transport: collectorTransport(c), Timeout: 10 * time.Second, CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return errors.New("evidence redirect refused") }}
 	resp, err := client.Do(req)
 	if err != nil {
 		return evidenceAck{}, 0, err
@@ -802,6 +802,9 @@ func postEvidence(ctx context.Context, c config, payload evidenceBatch) (evidenc
 		return evidenceAck{}, resp.StatusCode, readErr
 	}
 	if resp.StatusCode != http.StatusOK {
+		if resp.StatusCode == http.StatusAccepted {
+			return evidenceAck{}, resp.StatusCode, validateArchiveReceipt(c, "evidence", payload.Node, payload.BatchID, body, data)
+		}
 		if reason := evidenceResponseReason(data); reason != "" {
 			return evidenceAck{}, resp.StatusCode, fmt.Errorf("monitor evidence returned HTTP %d: %s", resp.StatusCode, reason)
 		}
@@ -889,8 +892,13 @@ func drainEvidenceOnce(ctx context.Context, c config) error {
 	if remainingBytes < 0 {
 		remainingBytes = 0
 	}
-	payload.Telemetry = evidenceTelemetry{OutboxBytes: remainingBytes, OutboxBatches: max(batches-1, int64(0)), RejectedBytes: rejectedBytes, RejectedBatches: rejectedBatches,
-		DroppedEvents: gap.DroppedEvents, UnknownDroppedBatches: gap.UnknownDroppedBatches, GapCount: gap.GapCount, LastGapFromMS: gap.LastGapFromMS, LastGapToMS: gap.LastGapToMS}
+	// ECS archives sign the complete wire body, including telemetry. Keep the
+	// frozen file's telemetry across retries; changing it would create another
+	// archive object for the same batch after an acknowledgement was lost.
+	if c.ecsSocket == "" {
+		payload.Telemetry = evidenceTelemetry{OutboxBytes: remainingBytes, OutboxBatches: max(batches-1, int64(0)), RejectedBytes: rejectedBytes, RejectedBatches: rejectedBatches,
+			DroppedEvents: gap.DroppedEvents, UnknownDroppedBatches: gap.UnknownDroppedBatches, GapCount: gap.GapCount, LastGapFromMS: gap.LastGapFromMS, LastGapToMS: gap.LastGapToMS}
+	}
 	if c.evidenceFSMu != nil {
 		c.evidenceFSMu.Unlock()
 	}
@@ -968,7 +976,7 @@ func runEvidenceWorker(ctx context.Context, c config) {
 		if !now.Before(nextDrain) {
 			if err := drainEvidenceOnce(ctx, c); err != nil {
 				failureStreak++
-				logEvidenceDeliveryError(err)
+				logEvidenceDeliveryError(fmt.Errorf("event outbox delivery: %w", err))
 				nextDrain = now.Add(evidenceRetryDelay(c.node, failureStreak))
 			} else {
 				failureStreak = 0
@@ -976,16 +984,8 @@ func runEvidenceWorker(ctx context.Context, c config) {
 			}
 		}
 		if !now.Before(nextHeartbeat) {
-			current, err := loadCursor(c.cursorPath)
-			if err == nil {
-				var heartbeat evidenceBatch
-				heartbeat, err = evidenceHeartbeatBatch(c, now, current)
-				if err == nil {
-					_, _, err = postEvidence(ctx, c, heartbeat)
-				}
-			}
-			if err != nil {
-				logEvidenceDeliveryError(err)
+			if err := deliverEvidenceHeartbeat(ctx, c, now); err != nil {
+				logEvidenceDeliveryError(fmt.Errorf("heartbeat delivery: %w", err))
 			}
 			nextHeartbeat = now.Add(time.Minute)
 		}
