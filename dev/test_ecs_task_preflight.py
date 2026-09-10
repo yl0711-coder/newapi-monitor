@@ -59,11 +59,15 @@ class TaskPreflightTest(unittest.TestCase):
                 self.assertEqual(code, 1)
                 self.assertFalse(output["static_checks_passed"])
 
-    def test_production_scope_is_not_opened(self):
-        collector = next(c for c in self.after["ContainerDefinitions"] if c["Name"] in PAIRS)
-        next(e for e in collector["Environment"] if e["Name"] == "ECSLOG_SCOPE")["Value"] = "production"
+    def test_production_scope_requires_matching_proposal_and_never_authorizes(self):
+        for collector in (c for c in self.after["ContainerDefinitions"] if c["Name"] in PAIRS):
+            next(e for e in collector["Environment"] if e["Name"] == "ECSLOG_SCOPE")["Value"] = "production"
         with self.assertRaisesRegex(ValueError, "contract mismatch"):
             check_plan(self.before, self.after)
+        report = check_plan(self.before, self.after, scope="production")
+        self.assertEqual(report["contract_scope"], "production")
+        self.assertFalse(report["production_ready"])
+        self.assertFalse(report["deployment_authorized"])
 
 
 if __name__ == "__main__":

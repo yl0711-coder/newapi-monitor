@@ -185,6 +185,7 @@ func testECSLogDiscoveryScaleAndFailure(t *testing.T, ownership bool) {
 func TestECSLogMissingIsNotStoppedAndRollingRevisionsCoexist(t *testing.T) {
 	m := newECSLogTestMonitor(t)
 	p := testECSLogPolicy()
+	p.TaskDefinitionARNs = append(p.TaskDefinitionARNs, "arn:aws:ecs:us-west-2:123456789012:task-definition/fixture:2")
 	now := time.Now().Unix()
 	tasks := ecsLogTestTasks(2)
 	tasks[1].TaskDefinitionArn = aws.String("arn:aws:ecs:us-west-2:123456789012:task-definition/fixture:2")
@@ -209,6 +210,20 @@ func TestECSLogMissingIsNotStoppedAndRollingRevisionsCoexist(t *testing.T) {
 	}
 	if err := m.storeDB.Model(&ECSLogSource{}).Where("public_key <> ''").Count(&count).Error; err != nil || count != 0 {
 		t.Fatal("discovery authorized container without registration")
+	}
+}
+
+func TestECSLogDiscoveryDoesNotExpectUnauthorizedTaskDefinition(t *testing.T) {
+	m := newECSLogTestMonitor(t)
+	p := testECSLogPolicy()
+	task := ecsLogTestTasks(1)[0]
+	task.TaskDefinitionArn = aws.String("arn:aws:ecs:us-west-2:123456789012:task-definition/fixture:2")
+	if err := m.observeECSLogTasks(context.Background(), p, []types.Task{task}, time.Now().Unix()); err != nil {
+		t.Fatal(err)
+	}
+	var count int64
+	if err := m.storeDB.Model(&ECSLogSource{}).Count(&count).Error; err != nil || count != 0 {
+		t.Fatalf("unauthorized rolling task became an expected source: %d %v", count, err)
 	}
 }
 

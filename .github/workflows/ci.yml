@@ -192,6 +192,10 @@ jobs:
             dockerfile: cmd/hostagent/Dockerfile
           - image: newapi-monitor-nginxcollector
             dockerfile: cmd/nginxcollector/Dockerfile
+          - image: newapi-monitor-ecslogagent
+            dockerfile: cmd/ecslogagent/Dockerfile
+          - image: newapi-monitor-nginxcollector-ecs
+            dockerfile: cmd/nginxcollector/Dockerfile.ecs-isolated
     steps:
       - uses: actions/checkout@v4
       - name: Candidate image metadata
@@ -260,7 +264,7 @@ jobs:
       packages: write
     strategy:
       matrix:
-        image: [newapi-monitor, newapi-monitor-hostagent, newapi-monitor-nginxcollector]
+        image: [newapi-monitor, newapi-monitor-hostagent, newapi-monitor-nginxcollector, newapi-monitor-ecslogagent, newapi-monitor-nginxcollector-ecs]
     steps:
       - uses: actions/download-artifact@v4
         with:

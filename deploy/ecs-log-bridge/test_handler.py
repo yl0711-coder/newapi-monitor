@@ -24,6 +24,15 @@ class BridgeTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             handler.trusted_registration(self.event, self.settings)
 
+    def test_production_stage_requires_matching_explicit_scope(self):
+        settings = dict(self.settings, ECS_LOG_SCOPE="production", ECS_LOG_STAGE="production")
+        event = copy.deepcopy(self.event)
+        event["requestContext"]["stage"] = "production"
+        self.assertEqual(handler.trusted_registration(event, settings)["caller_arn"], self.caller)
+        event["requestContext"]["stage"] = "isolated"
+        with self.assertRaises(PermissionError):
+            handler.trusted_registration(event, settings)
+
     def test_base64_and_strict_json(self):
         self.event["isBase64Encoded"] = True
         self.event["body"] = base64.b64encode(json.dumps(self.body).encode()).decode()

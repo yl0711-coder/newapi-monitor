@@ -385,7 +385,7 @@ func New(s Settings) (*Monitor, error) {
 	// parseECSLogPolicies has already rejected a DSN or source worker in this
 	// explicitly isolated mode. Real acceptance must not need a fake business
 	// database connection merely to start the authenticated collector receiver.
-	if s.ECSLogEnabled && s.ECSLogScope == "isolated" {
+	if s.ECSLogEnabled && s.ECSLogScope == ecsLogScopeIsolated {
 		m.cfg.sourceLifecycleConfigured = true
 		m.setSourceState(sourceStateDisabled)
 		initialized = true
@@ -592,7 +592,7 @@ func (m *Monitor) Start(ctx context.Context) {
 	if m.cfg.InfraEnabled {
 		go m.startInfra(ctx)
 	}
-	if m.cfg.ECSLogEnabled {
+	if ecsLogRuntimeEnabled(m.cfg) {
 		go m.startECSLogDiscovery(ctx)
 		if m.cfg.ECSArchiveEnabled {
 			go m.startECSArchiveRecovery(ctx)

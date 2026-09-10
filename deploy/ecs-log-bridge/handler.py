@@ -1,4 +1,4 @@
-"""Isolated REST API Gateway AWS_IAM registration bridge; not a public login API.
+"""Scoped REST API Gateway AWS_IAM registration bridge; not a public login API.
 
 The Lambda resource policy must allow ONLY the configured Gateway method ARN.
 Never distribute its Secrets Manager credential or allow task roles InvokeFunction.
@@ -35,12 +35,13 @@ def reply(code, body):
 
 
 def trusted_registration(event, settings):
-    if settings.get("ECS_LOG_SCOPE") != "isolated":
+    scope = settings.get("ECS_LOG_SCOPE")
+    if scope not in ("isolated", "production"):
         raise ValueError("bridge disabled")
     context = event.get("requestContext") or {}
     identity = context.get("identity") or {}
     caller = identity.get("userArn", "")
-    if (not settings.get("ECS_LOG_API_ID") or settings.get("ECS_LOG_STAGE") != "isolated"
+    if (not settings.get("ECS_LOG_API_ID") or settings.get("ECS_LOG_STAGE") != scope
             or not re.fullmatch(r"[0-9]{12}", settings.get("ECS_LOG_ACCOUNT_ID", ""))
             or context.get("apiId") != settings["ECS_LOG_API_ID"]
             or context.get("stage") != settings["ECS_LOG_STAGE"]
@@ -117,7 +118,7 @@ def handler(event, _context):
     except PermissionError:
         return reply(403, {"error": "trusted AWS_IAM context required"})
     except (ValueError, TypeError, AttributeError, UnicodeError):
-        return reply(400, {"error": "invalid isolated registration"})
+        return reply(400, {"error": "invalid scoped registration"})
     try:
         return forward(registration, os.environ)
     except Exception:

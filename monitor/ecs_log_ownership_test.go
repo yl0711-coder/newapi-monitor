@@ -219,6 +219,31 @@ func TestECSLogOwnershipCannotAdoptExistingReceiver(t *testing.T) {
 	}
 }
 
+func TestECSLogProductionOwnershipKeepsLegacyFactsWithoutAdoptingThem(t *testing.T) {
+	m := newECSLogTestMonitor(t)
+	if err := m.storeDB.Create(&MetricSample{BucketTs: 60, ChannelID: 1, ModelName: "fixture", Grp: "default"}).Error; err != nil {
+		t.Fatal(err)
+	}
+	m.cfg.ECSLogScope = ecsLogScopeProduction
+	m.cfg.ECSLogProductionEnabled = true
+	m.cfg.ECSLogOwnershipEnabled = true
+	if err := m.initECSLogOwnership(m.storeDB); err != nil {
+		t.Fatal(err)
+	}
+	var binding ECSLogOwnershipBinding
+	if err := m.storeDB.First(&binding, "id = 1").Error; err != nil || binding.Purpose != "production-v1" {
+		t.Fatalf("production binding: %+v %v", binding, err)
+	}
+	var facts int64
+	if err := m.storeDB.Model(&MetricSample{}).Count(&facts).Error; err != nil || facts != 1 {
+		t.Fatalf("legacy fact changed: %d %v", facts, err)
+	}
+	var owners int64
+	if err := m.storeDB.Model(&ECSLogOwnership{}).Count(&owners).Error; err != nil || owners != 0 {
+		t.Fatalf("legacy fact was adopted as ECS ownership: %d %v", owners, err)
+	}
+}
+
 func TestECSLogOwnershipAcceptanceConstructor(t *testing.T) {
 	c := acceptanceFixtureConfig()
 	c.OwnershipEnabled = true
