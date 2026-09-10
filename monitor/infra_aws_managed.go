@@ -2,8 +2,8 @@ package monitor
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
-	"strconv"
 	"strings"
 	"time"
 
@@ -12,7 +12,6 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/cloudwatch"
 	cwtypes "github.com/aws/aws-sdk-go-v2/service/cloudwatch/types"
 	"github.com/aws/aws-sdk-go-v2/service/ecs"
-	ecstypes "github.com/aws/aws-sdk-go-v2/service/ecs/types"
 	"github.com/aws/aws-sdk-go-v2/service/elasticloadbalancingv2"
 	elbtypes "github.com/aws/aws-sdk-go-v2/service/elasticloadbalancingv2/types"
 	"github.com/aws/aws-sdk-go-v2/service/rds"
@@ -68,53 +67,11 @@ func ecsContainerInsightsSpecs() []managedMetricSpec {
 // both cheaper and authoritative for the current state. UNKNOWN is deliberately
 // not treated as healthy: it means no task-definition health check is present.
 func ecsServiceTaskState(ctx context.Context, client ecsTaskHealthAPI, clusterARN, serviceName string) (snapshot ecsServiceTaskSnapshot, err error) {
-	var token *string
-	for {
-		listed, listErr := client.ListTasks(ctx, &ecs.ListTasksInput{
-			Cluster: aws.String(clusterARN), ServiceName: aws.String(serviceName),
-			DesiredStatus: ecstypes.DesiredStatusRunning, NextToken: token,
-		})
-		if listErr != nil {
-			return snapshot, listErr
-		}
-		for start := 0; start < len(listed.TaskArns); start += 100 {
-			end := start + 100
-			if end > len(listed.TaskArns) {
-				end = len(listed.TaskArns)
-			}
-			described, describeErr := client.DescribeTasks(ctx, &ecs.DescribeTasksInput{
-				Cluster: aws.String(clusterARN), Tasks: listed.TaskArns[start:end],
-			})
-			if describeErr != nil {
-				return snapshot, describeErr
-			}
-			for _, task := range described.Tasks {
-				if task.LastStatus != nil && aws.ToString(task.LastStatus) != "RUNNING" {
-					continue
-				}
-				if memory, parseErr := strconv.ParseFloat(strings.TrimSpace(aws.ToString(task.Memory)), 64); parseErr == nil && memory > 0 {
-					snapshot.MemoryReservedMB += memory
-				}
-				if task.EphemeralStorage != nil && task.EphemeralStorage.SizeInGiB > 0 {
-					snapshot.EphemeralReservedGB += float64(task.EphemeralStorage.SizeInGiB)
-				}
-				for _, container := range task.Containers {
-					switch container.HealthStatus {
-					case ecstypes.HealthStatusHealthy:
-						snapshot.HealthChecked++
-					case ecstypes.HealthStatusUnhealthy:
-						snapshot.HealthChecked++
-						snapshot.Unhealthy++
-					}
-				}
-			}
-		}
-		if listed.NextToken == nil || strings.TrimSpace(aws.ToString(listed.NextToken)) == "" {
-			break
-		}
-		token = listed.NextToken
+	tasks, err := collectECSTaskInventory(ctx, client, clusterARN, serviceName)
+	if err != nil {
+		return snapshot, err
 	}
-	return snapshot, nil
+	return summarizeECSTasks(tasks), nil
 }
 
 func (m *Monitor) sampleManagedAWSInfra(ctx context.Context, bucket int64) {
@@ -131,7 +88,10 @@ func (m *Monitor) sampleManagedAWSInfra(ctx context.Context, bucket int64) {
 	rows := make([]InfraSample, 0, 64)
 	resourceCount := 0
 
-	if ecsRows, count, collectErr := collectECSInfra(ctx, ecs.NewFromConfig(cfg), cw, bucket); collectErr != nil {
+	observe := func(scope string, observations []infraAssetObservation) error {
+		return m.observeInfraAssets(ctx, scope, observations, time.Now().Unix())
+	}
+	if ecsRows, count, collectErr := collectECSInfra(ctx, ecs.NewFromConfig(cfg), cw, bucket, observe); collectErr != nil {
 		slog.Warn("infra managed: ECS/Fargate 自动发现失败", "err", collectErr)
 		rows = append(rows, managedDiscoveryRows(bucket, "ECS/Fargate", false, 0)...)
 	} else {
@@ -188,7 +148,7 @@ func (m *Monitor) filterManagedInfraRows(rows []InfraSample) []InfraSample {
 	return out
 }
 
-func collectECSInfra(ctx context.Context, client *ecs.Client, cw cloudWatchMetricAPI, bucket int64) ([]InfraSample, int, error) {
+func collectECSInfra(ctx context.Context, client *ecs.Client, cw cloudWatchMetricAPI, bucket int64, observers ...func(string, []infraAssetObservation) error) ([]InfraSample, int, error) {
 	var rows []InfraSample
 	count := 0
 	clusters := ecs.NewListClustersPaginator(client, &ecs.ListClustersInput{})
@@ -216,6 +176,9 @@ func collectECSInfra(ctx context.Context, client *ecs.Client, cw cloudWatchMetri
 					if err != nil {
 						return rows, count, err
 					}
+					if described == nil || len(described.Failures) > 0 || len(described.Services) != end-start {
+						return rows, count, fmt.Errorf("ECS service inventory returned an incomplete description")
+					}
 					for _, service := range described.Services {
 						serviceName := aws.ToString(service.ServiceName)
 						if serviceName == "" {
@@ -240,10 +203,21 @@ func collectECSInfra(ctx context.Context, client *ecs.Client, cw cloudWatchMetri
 						// datapoints are ignored metric-by-metric and never downgrade the
 						// standard service health collected above.
 						rows = appendCloudWatchMetrics(ctx, rows, cw, bucket, resource, "ecs_service", "ECS/ContainerInsights", dims, ecsContainerInsightsSpecs())
-						taskState, taskErr := ecsServiceTaskState(ctx, client, clusterARN, serviceName)
+						tasks, taskErr := collectECSTaskInventory(ctx, client, clusterARN, serviceName)
+						taskState := summarizeECSTasks(tasks)
+						rows = append(rows, managedRow(bucket, resource, "ecs_service", "task_discovery_ok", boolFloat(taskErr == nil)))
 						if taskErr != nil {
 							slog.Warn("infra managed: ECS 任务状态读取失败(保留服务指标)", "resource", resource, "err", taskErr)
 						} else {
+							observations := ecsAssetObservations(resource, aws.ToString(service.ServiceArn), tasks)
+							registryOK := true
+							for _, observe := range observers {
+								if err := observe("ecs-service:"+aws.ToString(service.ServiceArn), observations); err != nil {
+									registryOK = false
+									slog.Warn("infra managed: ECS 资源目录写入失败(保留 AWS 指标)", "resource", resource, "err", err)
+								}
+							}
+							rows = append(rows, managedRow(bucket, resource, "ecs_service", "registry_write_ok", boolFloat(registryOK)))
 							if taskState.HealthChecked > 0 {
 								rows = append(rows,
 									managedRow(bucket, resource, "ecs_service", "health_checked", float64(taskState.HealthChecked)),

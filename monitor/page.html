@@ -549,17 +549,17 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
 </div>
 
 <!-- 需要关注:错误与交付异常合成一块,内部分两组。
-     两者性质不同(错误=上游明确拒绝、已自动切流;交付异常=上游没报错但用户没拿到、需人工判断降权),
+     两者性质不同(错误=请求失败线索;交付异常=用户侧中断等线索),
      故分组标题分开写死,不要再合并成一个列表。 -->
 <div class="attn">
   <h3>⚠️ 需要关注<span class="muted" style="font-weight:400;font-size:12px">· 错误要处理,交付异常要观察</span></h3>
   <div id="attnStat" class="attn-stat"></div>
   <div class="attn-sec">
-    <div class="attn-sec-h"><span class="dot dot-r"></span> 错误 · 需处理<span class="muted">上游明确报错,自动禁用/切流已介入</span></div>
+    <div class="attn-sec-h"><span class="dot dot-r"></span> 错误 · 需处理<span class="muted">请求错误记录；需核查原因，本页不执行禁用或切流</span></div>
     <div class="attn-list" id="attnList"></div>
   </div>
   <div class="attn-sec" id="undelivSec" style="display:none">
-    <div class="attn-sec-h"><span class="dot dot-y"></span> 交付异常 · 需观察<span class="muted">上游没报错但用户没拿到;不自动禁用,供调权重参考</span></div>
+    <div class="attn-sec-h"><span class="dot dot-y"></span> 交付异常 · 需观察<span class="muted">日志中的交付异常线索，需结合请求核查；不自动禁用</span></div>
     <div class="attn-list" id="undelivList"></div>
   </div>
 </div>
@@ -825,6 +825,8 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
     <div class="meta" id="infraGenAt">—</div>
   </div>
   <div id="infraErr"></div>
+  <section class="card"><div class="card-header">资源管理 <span class="muted" style="font-weight:400">· 自动发现；失联不自动归档；移除不删除历史业务统计</span></div><div id="infraAssets" style="padding:14px 18px">加载中…</div></section>
+  <section class="card"><div class="card-header">ECS 日志采集 <span class="muted" style="font-weight:400">· 按服务汇总；展开查看具体任务</span></div><div id="ecsLogSources" style="padding:14px 18px">加载中…</div></section>
 
   <!-- 1. 顶部总览条 -->
   <div class="banner" id="infraBanner">
@@ -1114,6 +1116,8 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
 <script src="/logchain.js?v=1"></script>
 <script src="/capacity.js?v=2"></script>
 <script src="/group-governance.js?v=1"></script>
+<script src="/infra-assets.js?v=1"></script>
+<script src="/ecs-log-sources.js?v=1"></script>
 <script>
 const params=new URLSearchParams(location.search);
 let WINDOW=parseInt(params.get('window')||'60',10);
@@ -1171,7 +1175,8 @@ function renderBanner(s){
   // migration is running. Treat a non-array value as an empty collection so
   // one incomplete snapshot cannot take down the whole model dashboard.
   const channels=Array.isArray(s.by_channel)?s.by_channel:[],models=Array.isArray(s.by_model)?s.by_model:[];
-  const probs=[...channels.map(r=>({...r,kind:'渠道'})),...models.map(r=>({...r,kind:'模型'}))];
+  const probs=[...channels.map(r=>({...r,kind:'渠道'})),...models.map(r=>({...r,kind:'模型'}))]
+    .map(r=>({...r,health:r.error_health||(r.failed===0?'good':r.health)}));
   const bad=probs.filter(r=>r.health==='bad'),warn=probs.filter(r=>r.health==='warn');
   const b=document.getElementById('banner'),m=document.getElementById('bannerMain');
   let cls,txt;
@@ -1220,13 +1225,14 @@ function renderBanner(s){
     // 本区只讲错误;交付异常有独立区域,不在这里混着显示。
     if(r.failed>0) w.push(`<b style="color:var(--red)">错误 ${r.failed}/${r.total}</b>${errText(r)?'('+errText(r)+')':''}`);
     w.push(`p95 ${fmtLat(r.p95)}`);
-    const span=problemSpan(r.spark); if(span) w.push(span);
+    const errorSpark=(r.spark||[]).map(p=>({...p,anomaly:0}));
+    const span=problemSpan(errorSpark); if(span) w.push(span);
     const dotc=r.health==='bad'?'dot-r':'dot-y', bc=r.health==='bad'?'badge-red':'badge-yellow';
     const summary=`<span class="dot ${dotc}"></span>
       <span class="who">${r.kind} ${esc(r.label)}</span>
       <span class="badge ${bc}">成功 ${fmtRate(r.success_rate)}</span>
       <span class="why">${w.join(' · ')}</span>`;
-    const detail=problemDetail(r.spark);
+    const detail=problemDetail(errorSpark);
     if(!detail) return `<div class="attn-item">${summary}</div>`;
     return `<details class="attn-item" data-k="${esc(r.label)}"${expanded.has(r.label)?' open':''}><summary>${summary}</summary><div class="attn-detail">${detail}</div></details>`;
   };
@@ -1627,7 +1633,7 @@ const infraBadge=st=>{const m={ok:['badge-green','正常'],warn:['badge-yellow',
 const fx=(v,n=0)=>v==null?'—':(+v).toFixed(n);
 const kv=(label,val)=>`<span style="display:inline-block;min-width:160px;margin:2px 16px 2px 0"><span class="muted">${label}:</span> <b>${val}</b></span>`;
 const PLACEHOLDER='<span class="muted">待主机 agent</span>';
-const infraCoverageNote=res=>(res.missing_metrics||[]).length?`<span style="color:var(--yellow)">· 采集不完整：${esc(res.missing_metrics.join(', '))}</span>`:'';
+const infraCoverageNote=res=>[(res.missing_metrics||[]).length?`<span style="color:var(--yellow)">· 采集不完整：${esc(res.missing_metrics.join(', '))}</span>`:'',res.type==='ecs_service'&&res.metrics?.task_discovery_ok===0?'<span style="color:var(--yellow)">· 任务发现异常，当前任务清单未确认</span>':'',res.type==='ecs_service'&&res.metrics?.registry_write_ok===0?'<span style="color:var(--yellow)">· Monitor 资源目录保存失败；已采 AWS 指标仍保留</span>':''].filter(Boolean).join(' ');
 const cssAttr=s=>String(s).replace(/["\\]/g,'\\$&'); // 属性选择器里安全转义资源名
 // 前端上色用阈值(与后端 Settings 默认一致;权威判级仍以 snapshot 的 status 为准)。
 const infraCpuWarn=70,infraCpuBad=85,infraBurstWarn=20,infraStorageWarn=25,infraStorageBad=15;
@@ -1892,13 +1898,13 @@ function renderInfra(s){
   const tbInst=document.getElementById('tbInst');
   if(!insts.length){tbInst.innerHTML='<tr><td colspan="11" class="muted" style="padding:16px">无实例数据</td></tr>';}
   else{tbInst.innerHTML=insts.map((r,idx)=>{const me=r.metrics||{};
-    // CPU / 突发额度 来自 AWS,一定有;内存/磁盘/load 需 host-agent,缺失显占位。
-    const cpuHtml=me.cpu!=null?`<span style="${colUsed(me.cpu,infraCpuWarn,infraCpuBad)}">${fx(me.cpu,1)}%</span>`:PLACEHOLDER;
     const isECS=r.type==='ecs_service'||r.platform==='ECS/Fargate';
+    const missingMetric=isECS?'<span class="muted">暂无云监控数据</span>':PLACEHOLDER;
+    const cpuHtml=me.cpu!=null?`<span style="${colUsed(me.cpu,infraCpuWarn,infraCpuBad)}">${fx(me.cpu,1)}%</span>`:missingMetric;
     const managedNA='<span class="muted">云托管·不适用</span>';
     const burstHtml=me.burst!=null?`<span style="${me.burst<infraBurstWarn?'color:var(--yellow)':'color:var(--green)'}">${fx(me.burst)}%</span>`:(isECS?managedNA:PLACEHOLDER);
     // 内存:已用/总(可用率上色);仅当 host-agent 推过 mem_avail_mb
-    let memHtml=PLACEHOLDER;
+    let memHtml=missingMetric;
     if(me.mem_avail_mb!=null){
       const total=me.mem_total_mb, used=total!=null?(total-me.mem_avail_mb):null;
       const usedPct=me.mem_used_pct, availPct=usedPct!=null?100-usedPct:null;
@@ -1909,16 +1915,16 @@ function renderInfra(s){
     }else if(me.mem_used_pct!=null){
       memHtml=`<b style="${colUsed(me.mem_used_pct)}">${fx(me.mem_used_pct,1)}% 已用</b>`;
     }
-    const diskHtml=me.disk_used_pct!=null?`<span style="${colUsed(me.disk_used_pct,100-infraStorageWarn,100-infraStorageBad)}">${fx(me.disk_used_pct)}%</span>`:(isECS?managedNA:PLACEHOLDER);
+    const diskHtml=me.disk_used_pct!=null?`<span style="${colUsed(me.disk_used_pct,100-infraStorageWarn,100-infraStorageBad)}">${fx(me.disk_used_pct)}%</span>`:missingMetric;
     const loadHtml=me.load1!=null?`<b>${fx(me.load1,2)}</b>`:(isECS?managedNA:PLACEHOLDER);
     // 容器存活:host-agent 接入后填(containers_up/containers_total);缺数据显占位,行始终渲染。
-    let contHtml=PLACEHOLDER;
+    let contHtml=missingMetric;
     if(me.containers_total!=null){const up=me.containers_up!=null?me.containers_up:0,tot=me.containers_total;contHtml=`<span style="${up<tot?'color:var(--red)':'color:var(--green)'}">${isECS?'任务 ':''}${fx(up)}/${fx(tot)}</span>`;}
     const open=instExpanded.has(r.name);
     const caret=`<span style="display:inline-block;width:14px;color:#888;transition:transform .15s;${open?'transform:rotate(90deg)':''}">▶</span>`;
     const groupHeader=idx===0||insts[idx-1].group!==r.group?`<tr><td colspan="11" style="background:#171b25;padding:9px 14px;color:#aeb8d0"><b>${esc(r.group||'其他资源')}</b></td></tr>`:'';
     return groupHeader+`<tr class="inst-row" data-name="${esc(r.name)}" style="cursor:pointer">`
-      +`<td>${caret}</td><td><b>${esc(r.display_name||r.name)}</b><div class="muted" style="font-size:11px">${esc(r.platform||'Lightsail')} ${infraCoverageNote(r)}</div></td><td>${infraBadge(r.status)}</td><td>${cpuHtml}</td><td>${burstHtml}</td><td>${memHtml}</td><td>${diskHtml}</td><td>${loadHtml}</td><td>${contHtml}</td><td>${me.net_out_kb!=null?fx(me.net_out_kb)+' KB/s':(isECS?managedNA:PLACEHOLDER)}</td><td class="muted">${fmtAge(r.age_sec)}</td></tr>`
+      +`<td>${caret}</td><td><b>${esc(r.display_name||r.name)}</b><div class="muted" style="font-size:11px">${esc(r.platform||'Lightsail')} ${infraCoverageNote(r)}</div></td><td>${infraBadge(r.status)}</td><td>${cpuHtml}</td><td>${burstHtml}</td><td>${memHtml}</td><td>${diskHtml}</td><td>${loadHtml}</td><td>${contHtml}</td><td>${me.net_out_kb!=null?fx(me.net_out_kb)+' KB/s':missingMetric}</td><td class="muted">${fmtAge(r.age_sec)}</td></tr>`
       +`<tr class="inst-exp" data-name="${esc(r.name)}"${open?'':' style="display:none"'}><td colspan="11" style="background:#15171c;padding:8px 20px 14px"><div class="inst-zone"></div></td></tr>`;
   }).join('');
     // 绑定点击展开 + 还原已展开行的图
@@ -1942,12 +1948,15 @@ function renderInfra(s){
   }).join('');}
 }
 async function loadInfra(){
+  // Independent status requests: a cloud metric failure must not hide logs.
+  if(window.MonitorECSLogSources)void window.MonitorECSLogSources.load();
   try{
     const res=await fetch('/infra',{headers:{'Accept':'application/json'}});
     if(res.status===401){location.href='/login';return}
     const d=await res.json();const eb=document.getElementById('infraErr');
     if(d.enabled===false){eb.innerHTML='<div class="alert">服务端监控未启用:设置 <code>MONITOR_INFRA_ENABLED=true</code> + AWS 只读凭证后生效。</div>';return}
-    eb.innerHTML='';if(d.snapshot)renderInfra(d.snapshot);
+    eb.innerHTML='';if(d.snapshot){renderInfra(d.snapshot);if(d.snapshot.registry_error)eb.innerHTML='<div class="alert">'+esc(d.snapshot.registry_error)+'</div>';}
+    if(window.MonitorInfraAssets)await window.MonitorInfraAssets.load();
   }catch(e){document.getElementById('infraErr').innerHTML='<div class="alert">加载失败:'+esc(e.message)+'</div>'}
 }
 function infraSchedule(){if(infraTimer)clearInterval(infraTimer);if(document.getElementById('infraAuto').checked)infraTimer=setInterval(loadInfra,60000)}
@@ -2186,7 +2195,7 @@ function syncRenderCostClosure(report){
 }
 function syncRenderStability(health){
   const h=health||{},migration=h.problem_migration||{},hourly=h.hourly_migration||null,evidence=h.nginx_evidence||{};
-  const explicitlyDisabled=h.enabled===false&&!h.nginx_enabled;
+  const explicitlyDisabled=h.enabled===false&&!h.nginx_enabled&&!h.ecs_logs?.enabled;
   const enabled=h.nginx_enabled!==undefined||h.checked_at!==undefined;
   const level=explicitlyDisabled?'neutral':(!enabled?'warn':(h.status==='ok'?'ok':'warn'));
   const hourlyDetail=hourly
@@ -2205,6 +2214,7 @@ function syncRenderStability(health){
     syncKV('本地库',h.store_reachable?'可访问':'不可访问',h.store_bytes?`${fmtNum(h.store_bytes)} B（含 WAL）`:''),
     syncKV('Nginx 入口',h.nginx_enabled?`${fmtNum(h.nginx_source_count)} 个 access 来源`:'未启用',h.nginx_enabled?`access 异常 ${fmtNum(h.nginx_unhealthy_sources)} · error ${h.nginx_error_enabled?`${fmtNum(h.nginx_error_source_count)} 来源 / 异常 ${fmtNum(h.nginx_error_unhealthy_sources)}`:'未启用'} · backlog ${fmtNum(h.nginx_backlog_bytes)} B`:''),
     syncKV('请求证据',evidence.enabled?`${evidence.mode==='verified'?'已验证':'灰度验证'} · ${fmtNum(evidence.source_count)} 个来源`:'未启用',evidence.enabled?`异常 ${fmtNum(evidence.unhealthy_sources)} · 队列 ${fmtNum(evidence.outbox_batches)} 批 / ${fmtNum(evidence.outbox_bytes)} B · 本地库 ${fmtNum(evidence.store_bytes)} B`:''),
+    ...(h.ecs_logs?.enabled?[`<div><small>ECS 动态采集</small><b style="color:var(--${h.ecs_logs.available&&h.ecs_logs.status==='ok'?'green':'red'})">${h.ecs_logs.available?`${h.ecs_logs.status==='ok'?'近期上报在线':'需检查'} · ${esc(fmtNum(h.ecs_logs.active_sources))} 条运行链路`:'状态不可用'}</b><small>采集异常 ${esc(fmtNum(h.ecs_logs.unhealthy_sources))} · 发现异常 ${esc(fmtNum(h.ecs_logs.discovery_issues))} · 停止待交付 ${esc(fmtNum(h.ecs_logs.stopped_pending))} · 缺口待核实 ${esc(fmtNum(h.ecs_logs.delivery_gaps))}；心跳不代表覆盖完整，任务明细见服务端监控。</small></div>`]:[]),
     syncKV('证据累计计数',evidence.enabled?`接收 ${fmtNum(evidence.accepted)} · 拒绝 ${fmtNum(evidence.rejected)} · 缺口 ${fmtNum(evidence.gap_count)}`:'—',evidence.enabled?`历史累计，不是当前新增丢失数。丢弃 ${fmtNum(evidence.dropped_events)} · Request ID 缺失 ${fmtNum(evidence.missing_oneapi_id)} · 最近入库 ${syncTime(evidence.last_ingest_at)}`:''),
     syncKV('问题覆盖至',syncTime(h.problem_coverage_to),h.problem_live_target_to?`目标 ${syncTime(h.problem_live_target_to)}`:'')
   ].join('');

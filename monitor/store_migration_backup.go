@@ -27,10 +27,10 @@ const (
 	// Bump this ID whenever either AutoMigrate model set or a post-migration
 	// schema/data transform changes. Restarts of the same plan reuse its pinned
 	// original snapshot, so they cannot prune away the old-image rollback point.
-	// v37 增加春秋逐条明细断点、去重索引及小时账单来源/核对状态；
-	// 保留此前小时覆盖水位和经济换算证据。AutoMigrate 前必须生成新快照。
-	preMigrationPlanID               = "main-facts-schema-20260907-v37-upstream-errorlog-identity-archive-metric-finalize-coverage-semantics-minute-hour-unit-evidence-aicodewith-records"
-	preMigrationCombinedPlanID       = "main-facts-schema-20260907-v37-upstream-errorlog-identity-archive-metric-finalize-coverage-semantics-minute-hour-unit-evidence-aicodewith-records-nginx-source-v2"
+	// v40 增加 ECS 日志来源注册表；保留资源生命周期、上游身份归档及小时覆盖水位
+	// 和经济换算证据。AutoMigrate 前必须生成新快照。
+	preMigrationPlanID               = "main-facts-schema-20260909-v41-upstream-errorlog-identity-archive-infra-resource-lifecycle-ecs-log-archive"
+	preMigrationCombinedPlanID       = "main-facts-schema-20260909-v41-upstream-errorlog-identity-archive-infra-resource-lifecycle-ecs-log-archive-nginx-source-v2"
 	preMigrationSnapshotPrefix       = "pre-migrate-"
 	preMigrationReferencePrefix      = ".pre-migration-plan-"
 	preMigrationReferenceSuffix      = ".json"

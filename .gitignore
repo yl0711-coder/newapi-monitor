@@ -23,6 +23,8 @@ secrets/
 /newapi-monitor
 monitor-bin
 *.exe
+__pycache__/
+*.py[cod]
 
 # —— OS / 编辑器 ——
 .DS_Store

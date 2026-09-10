@@ -56,6 +56,7 @@ type stabilityHealthResponse struct {
 	NginxErrorSourceCount      int                               `json:"nginx_error_source_count"`
 	NginxErrorUnhealthySources int                               `json:"nginx_error_unhealthy_sources"`
 	NginxEvidence              nginxEvidenceHealth               `json:"nginx_evidence"`
+	ECSLogs                    *ecsLogHealth                     `json:"ecs_logs,omitempty"`
 }
 
 // stabilityHealth 只检查 Monitor 自身和本地采集状态，不主动查询 NewAPI
@@ -197,6 +198,13 @@ func (m *Monitor) stabilityHealth(ctx context.Context, nowTime time.Time) stabil
 		}
 	}
 	result.NginxEvidence = m.nginxEvidenceHealth(ctx, nowTime)
+	if m.cfg.ECSLogEnabled {
+		health := m.ecsLogHealth(ctx, now)
+		result.ECSLogs = &health
+		if !health.Available || health.Status != "ok" {
+			result.Status = "degraded"
+		}
+	}
 	// pilot 只做覆盖率与兼容性验证，不改变现有稳定性结论。
 	// verified 是已承诺的排障证据源，此时缺节点、积压或缺口必须显式降级。
 	if result.NginxEvidence.Mode == "verified" && (!result.NginxEvidence.StoreReachable || result.NginxEvidence.UnhealthySources > 0) {

@@ -1,0 +1,21 @@
+FROM golang:1.26.6-alpine3.23 AS agent
+WORKDIR /src
+COPY go.mod go.sum ./
+COPY internal/ecslogagent/*.go ./internal/ecslogagent/
+COPY internal/ecsarchive/*.go ./internal/ecsarchive/
+COPY cmd/ecslogagent/*.go ./cmd/ecslogagent/
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/ecslogagent ./cmd/ecslogagent
+
+FROM golang:1.26.6-alpine3.23 AS collector
+WORKDIR /src
+COPY cmd/nginxcollector/*.go ./
+RUN GO111MODULE=off CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/nginxcollector .
+
+FROM alpine:3.23 AS runtime
+RUN apk upgrade --no-cache && apk add --no-cache ca-certificates \
+    && addgroup -S collector && adduser -S -G collector collector \
+    && mkdir -p /data/ecs && chown collector:collector /data/ecs && chmod 700 /data/ecs
+COPY --from=agent /out/ecslogagent /usr/local/bin/ecslogagent
+COPY --from=collector /out/nginxcollector /usr/local/bin/nginxcollector
+USER collector
+ENTRYPOINT ["/usr/local/bin/ecslogagent", "--", "/usr/local/bin/nginxcollector"]

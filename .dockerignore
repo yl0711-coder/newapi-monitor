@@ -23,6 +23,12 @@ internal/**
 !internal/trafficclass/
 internal/trafficclass/**
 !internal/trafficclass/*.go
+!internal/ecslogagent/
+internal/ecslogagent/**
+!internal/ecslogagent/*.go
+!internal/ecsarchive/
+internal/ecsarchive/**
+!internal/ecsarchive/*.go
 !cmd/
 cmd/**
 !cmd/hostagent/
@@ -31,6 +37,12 @@ cmd/hostagent/**
 !cmd/nginxcollector/
 cmd/nginxcollector/**
 !cmd/nginxcollector/*.go
+!cmd/ecslogagent/
+cmd/ecslogagent/**
+!cmd/ecslogagent/*.go
+!cmd/ecssynthetic/
+cmd/ecssynthetic/**
+!cmd/ecssynthetic/*.go
 
 # 测试源码不参与生产镜像编译；CI 在宿主工作树中单独执行测试。
 **/*_test.go

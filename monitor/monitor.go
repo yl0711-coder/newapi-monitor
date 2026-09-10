@@ -40,9 +40,14 @@ const minSample = 20
 // Monitor 是一个监控实例:持有配置、生产库只读连接、本地采样库与采样心跳。
 // 用 New 创建,Start 启动后台采样,RegisterRoutes 挂载页面与接口。零包级全局,可多实例、易测。
 type Monitor struct {
-	cfg     Settings
-	prodDB  *sql.DB  // new-api 生产库【只读】连接(采样器周期查询 + 用户用量按需查询);nil = 未连接
-	storeDB *gorm.DB // 本地采样库
+	ecsLogPolicies        []ECSLogPolicy
+	ecsLogOwnershipActive atomic.Bool
+	ecsLogVerify          func(context.Context, ecsLogRegistration, ECSLogPolicy) (ECSLogSource, error)
+	ecsLogVerifications   atomic.Int32
+	ecsLogRequests        atomic.Int32
+	cfg                   Settings
+	prodDB                *sql.DB  // new-api 生产库【只读】连接(采样器周期查询 + 用户用量按需查询);nil = 未连接
+	storeDB               *gorm.DB // 本地采样库
 	// usageFactsDB 独立承载高增长的用量小时/日事实、同步水位和资料快照。
 	// 生产通过 New 创建时默认与 storeDB 分文件，避免补数、WAL 膨胀、损坏或
 	// 写锁把告警配置、渠道配置和其他 Monitor 页面一起拖垮。测试直接调用
@@ -303,6 +308,13 @@ const snapCacheTTL = 15
 // New 创建监控实例:打开本地采样库;若配置了生产 DSN,则连库并校验连通。
 // 不自动启动采样器——需调用 Start 才开始后台采样。
 func New(s Settings) (*Monitor, error) {
+	if err := validateECSArchiveSettings(s); err != nil {
+		return nil, err
+	}
+	ecsPolicies, err := parseECSLogPolicies(s)
+	if err != nil {
+		return nil, err
+	}
 	if strings.TrimSpace(s.UsageFactsStorePath) == "" && storeUsesFile(s.StorePath) {
 		s.UsageFactsStorePath = filepath.Join(filepath.Dir(s.StorePath), "usage-facts.db")
 	}
@@ -334,6 +346,7 @@ func New(s Settings) (*Monitor, error) {
 	}
 
 	m := &Monitor{
+		ecsLogPolicies:               ecsPolicies,
 		cfg:                          s,
 		chNames:                      map[string]string{},
 		snapCache:                    map[snapshotCacheKey]cachedSnap{},
@@ -366,6 +379,15 @@ func New(s Settings) (*Monitor, error) {
 	if s.LocalSnapshotOnly {
 		m.setSourceState(sourceStateDisabled)
 		slog.Info("本地快照只读模式已启用，已隔离生产日志库和后台采集")
+		initialized = true
+		return m, nil
+	}
+	// parseECSLogPolicies has already rejected a DSN or source worker in this
+	// explicitly isolated mode. Real acceptance must not need a fake business
+	// database connection merely to start the authenticated collector receiver.
+	if s.ECSLogEnabled && s.ECSLogScope == "isolated" {
+		m.cfg.sourceLifecycleConfigured = true
+		m.setSourceState(sourceStateDisabled)
 		initialized = true
 		return m, nil
 	}
@@ -569,6 +591,12 @@ func (m *Monitor) Start(ctx context.Context) {
 	}
 	if m.cfg.InfraEnabled {
 		go m.startInfra(ctx)
+	}
+	if m.cfg.ECSLogEnabled {
+		go m.startECSLogDiscovery(ctx)
+		if m.cfg.ECSArchiveEnabled {
+			go m.startECSArchiveRecovery(ctx)
+		}
 	}
 	m.startSourceSupervisor(ctx)
 }
@@ -910,6 +938,7 @@ type Row struct {
 	ErrTimeout     int64       `json:"err_timeout"`
 	ErrOther       int64       `json:"err_other"`
 	Health         string      `json:"health"`
+	ErrorHealth    string      `json:"error_health"`  // 仅请求错误判级；Health 仍兼容异常成簇提示。
 	AnomalyBurst   bool        `json:"anomaly_burst"` // 异常成簇(连续/突增),需要关注
 	Spark          []TimePoint `json:"spark"`         // 该维度最近若干分钟桶的成功/异常/失败,供迷你趋势
 }

@@ -1,0 +1,44 @@
+title = "Monitor secret scanning: defaults plus individually reviewed fixtures"
+
+[extend]
+useDefault = true
+
+# Only exact non-secret values in the named files are exempt. Never exclude an
+# entire test/docs directory or a commit: real credentials must still be detected.
+[[rules]]
+id = "generic-api-key"
+
+[[rules.allowlists]]
+description = "Deterministic HMAC key/rotation vectors in isolated SQLite tests"
+condition = "AND"
+paths = ['''(^|/)monitor/(channel_cost_contract|channel_cost_decision|channel_upstream_pricing_ledger|settings)_test\.go$''']
+regexTarget = "secret"
+regexes = ['''^(0123456789abcdef0123456789abcdef|abcdef0123456789abcdef0123456789)$''']
+
+[[rules.allowlists]]
+description = "Local fake upstream credential-encryption test key"
+condition = "AND"
+paths = ['''(^|/)monitor/channel_upstream_pricing_adapters_test\.go$''']
+regexTarget = "secret"
+regexes = ['''^sub2-pricing-test-secret$''']
+
+[[rules.allowlists]]
+description = "Request correlation ID, not an authentication credential"
+condition = "AND"
+paths = ['''(^|/)monitor/logchain_correlate_test\.go$''']
+regexTarget = "secret"
+regexes = ['''^req_1787652519221_1a03fa99$''']
+
+[[rules.allowlists]]
+description = "Alphabet/number token fixtures in in-memory usage databases"
+condition = "AND"
+paths = ['''(^|/)monitor/(usage|usage_facts)_test\.go$''']
+regexTarget = "secret"
+regexes = ['''^(qrstuvwxyz012345|abcd1234567890wxyz)$''']
+
+[[rules.allowlists]]
+description = "Documented local Docker image tag, not an API key"
+condition = "AND"
+paths = ['''(^|/)docs/channel-bill-freshness-20260908\.md$''']
+regexTarget = "secret"
+regexes = ['''^bill-freshness-20260908$''']

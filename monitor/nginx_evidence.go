@@ -639,7 +639,7 @@ func (m *Monitor) ingestNginxEvidence(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid evidence payload"})
 		return
 	}
-	if in.SchemaVersion != nginxEvidenceSchemaVersion || in.LogSchema < 0 || in.LogSchema > 2 || len(in.Events) > 0 && in.LogSchema != 2 || !nginxNodeNamePattern.MatchString(in.Node) || !m.nginxNodeAllowed(in.Node) ||
+	if in.SchemaVersion != nginxEvidenceSchemaVersion || in.LogSchema < 0 || in.LogSchema > 2 || len(in.Events) > 0 && in.LogSchema != 2 || !nginxNodeNamePattern.MatchString(in.Node) || !m.nginxRequestNodeAllowed(c, in.Node, "evidence") ||
 		!validIngestBatchID(in.BatchID) || len(in.Events) > 1000 || !m.nginxEvidenceKeyAllowed(in.HMACKeyID) ||
 		!nginxEvidenceHex64Pattern.MatchString(in.PayloadHash) || !validNginxEvidenceSource(in.Source, len(in.Events)) ||
 		in.Telemetry.OutboxBytes < 0 || in.Telemetry.OutboxBytes > 1<<40 || in.Telemetry.OutboxBatches < 0 || in.Telemetry.OutboxBatches > 1_000_000 ||
@@ -788,6 +788,11 @@ func (m *Monitor) ingestNginxEvidence(c *gin.Context) {
 			}
 		}
 		if len(acceptedRows) > 0 {
+			if _, ecsSource := verifiedECSLog(c); ecsSource {
+				if err := validateECSEvidenceEventOwnership(tx, in.Node, acceptedRows); err != nil {
+					return err
+				}
+			}
 			if err := tx.Clauses(clause.OnConflict{DoNothing: true}).CreateInBatches(acceptedRows, 200).Error; err != nil {
 				return err
 			}

@@ -111,7 +111,7 @@ func (m *Monitor) ingestNginxErrors(c *gin.Context) {
 		return
 	}
 	in.Node = strings.TrimSpace(in.Node)
-	if !nginxNodeNamePattern.MatchString(in.Node) || !m.nginxNodeAllowed(in.Node) || !safeBatchID(in.BatchID) || len(in.Samples) > 2000 {
+	if !nginxNodeNamePattern.MatchString(in.Node) || !m.nginxRequestNodeAllowed(c, in.Node, "error") || !safeBatchID(in.BatchID) || len(in.Samples) > 2000 {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid source envelope"})
 		return
 	}

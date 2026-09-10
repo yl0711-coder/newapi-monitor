@@ -206,7 +206,7 @@ func postErrorBatch(ctx context.Context, c config, payload errorBatch) error {
 	}
 	req.Header.Set("Authorization", "Bearer "+c.token)
 	req.Header.Set("Content-Type", "application/json")
-	client := &http.Client{Timeout: 10 * time.Second, CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+	client := &http.Client{Transport: collectorTransport(c), Timeout: 10 * time.Second, CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
 		return errors.New("collector error sink redirect refused")
 	}}
 	resp, err := client.Do(req)
@@ -214,11 +214,14 @@ func postErrorBatch(ctx context.Context, c config, payload errorBatch) error {
 		return err
 	}
 	defer resp.Body.Close()
-	data, readErr := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
+	data, readErr := io.ReadAll(io.LimitReader(resp.Body, (4<<10)+1))
 	if readErr != nil {
 		return readErr
 	}
 	if resp.StatusCode != http.StatusOK {
+		if resp.StatusCode == http.StatusAccepted && payload.SourceBoundary == nil {
+			return validateArchiveReceipt(c, "error", payload.Node, payload.BatchID, body, data)
+		}
 		return fmt.Errorf("monitor error sink returned HTTP %d", resp.StatusCode)
 	}
 	if payload.SourceBoundary != nil {
@@ -234,6 +237,9 @@ func postErrorBatch(ctx context.Context, c config, payload errorBatch) error {
 }
 
 func runErrorOnce(ctx context.Context, c config) error {
+	if c.ecsSocket != "" {
+		return runECSErrorOnce(ctx, c)
+	}
 	current, err := loadCursor(c.errorCursorPath)
 	if err != nil {
 		return err
@@ -287,7 +293,9 @@ func runErrorWorker(ctx context.Context, c config) {
 			log.Printf("nginxcollector error lane: 本轮未推进独立游标，将自动重试: %v", err)
 		}
 		now := time.Now()
-		if !now.Before(nextHeartbeat) && ctx.Err() == nil {
+		// ECS liveness is signed by the agent independently of data batches.
+		// Legacy minute-keyed heartbeats must not enter its immutable archive.
+		if c.ecsSocket == "" && !now.Before(nextHeartbeat) && ctx.Err() == nil {
 			current, cursorErr := loadCursor(c.errorCursorPath)
 			if cursorErr != nil {
 				log.Printf("nginxcollector error lane: 独立游标无法安全读取，已停止心跳: %v", cursorErr)

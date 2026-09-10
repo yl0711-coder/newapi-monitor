@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -107,8 +108,14 @@ func TestRunInspectPreMigrationPlanCommandIsReadOnly(t *testing.T) {
 	if err := runInspectPreMigrationPlanCommand([]string{"--store", store}, &output); err != nil {
 		t.Fatalf("read-only plan inspection failed: %v", err)
 	}
-	if !strings.Contains(output.String(), "metric-finalize-coverage-semantics") {
-		t.Fatalf("unexpected migration plan: %q", output.String())
+	// The CLI must return the exact plan selected by the migration inspector,
+	// not a historical descriptive fragment that changes with schema versions.
+	want, err := monitor.InspectPreMigrationPlan(context.Background(), store, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want == "" || output.String() != want+"\n" {
+		t.Fatalf("unexpected migration plan: got %q want %q", output.String(), want+"\n")
 	}
 	after, err := os.Stat(store)
 	if err != nil {

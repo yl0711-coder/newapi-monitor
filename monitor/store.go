@@ -904,6 +904,7 @@ func (m *Monitor) openStore(path string) error {
 		return fmt.Errorf("上游错误日志事件键迁移失败: %w", err)
 	}
 	if err := db.AutoMigrate(
+		&ECSLogSource{}, &ECSLogDiscovery{}, &ECSLogLeaseWindow{}, &ECSLogArchiveReceipt{}, &ECSLogArchiveScan{},
 		&AICodeWithRecordCheckpoint{}, &AICodeWithRecordSeen{},
 		&MetricSample{}, &CapacityUserMinuteSample{}, &TokenSample{}, &MetricFinalizeState{}, &HourSample{}, &ChannelSnap{}, &RejectionSample{}, &RejectionIngestBatch{}, &SelectablePair{},
 		&StabilityHourSample{}, &ChannelTestHourSample{}, &StabilityRejectHour{}, &StabilityProblemSample{},
@@ -915,12 +916,15 @@ func (m *Monitor) openStore(path string) error {
 		&ChannelUpstreamCostHourEvidence{}, &ChannelUpstreamCostHourState{}, &ChannelCostPageCheckpoint{}, &ChannelCostSourceBinding{}, &ChannelCostDirtyHour{}, &ChannelCostKeyRegistry{},
 		&ChannelPricingChangeProposal{}, &ChannelPricingProposalEvent{}, &ChannelFinanceActivation{}, &ChannelFinanceActivationSlot{}, &ChannelFinanceActivationEvent{},
 		&ChannelEconomicsHourPublication{}, &ChannelEconomicsHourCurrent{}, &ChannelEconomicsHourManifestPublication{}, &ChannelEconomicsHourManifestCurrent{}, &ChannelEconomicsGlobalHourFact{}, &ChannelEconomicsDirtyHour{},
-		&InfraSample{}, &HostContainerSnapshot{}, &NginxMinuteSample{}, &NginxIngestBatch{}, &NginxSourceState{},
+		&InfraSample{}, &HostContainerSnapshot{}, &InfraAsset{}, &InfraAssetAudit{}, &InfraAssetScope{}, &NginxMinuteSample{}, &NginxIngestBatch{}, &NginxSourceState{},
 		&NginxErrorMinuteSample{}, &NginxErrorIngestBatch{}, &NginxErrorSourceState{},
 		&AlertConfig{}, &AlertLog{}, &TrackedUser{}, &CustomerGroup{}, &UsageMemberControl{}, &UsageMemberAudit{}, &UsageMemberControlMigration{}, &FollowUpLog{}, &UsageSettings{},
 		&GroupGovernanceState{}, &GroupGovernanceGroup{}, &GroupGovernanceUser{},
 	); err != nil {
 		return fmt.Errorf("表迁移失败: %w", err)
+	}
+	if err := m.initECSLogOwnership(db); err != nil {
+		return fmt.Errorf("ECS 采集责任初始化失败: %w", err)
 	}
 	if err := migrateLegacyUpstreamEconomicUnitEvidence(db); err != nil {
 		return fmt.Errorf("上游换算证据迁移失败: %w", err)
@@ -1379,6 +1383,12 @@ func rejectionBatchPayloadHash(rows []RejectionSample) string {
 // 返回 duplicate=true 表示服务端已经完整接收过同一批，调用方可安全丢弃重试。
 func (m *Monitor) ingestRejectionBatch(node, batchID string, rows []RejectionSample, receivedAt int64) (duplicate bool, err error) {
 	hash := rejectionBatchPayloadHash(rows)
+	return m.ingestRejectionBatchWithHash(node, batchID, rows, receivedAt, hash)
+}
+
+// v1 retains its canonical-row hash; v2 binds the complete frozen wire payload.
+// Both protocols commit facts and their receipt in the same transaction.
+func (m *Monitor) ingestRejectionBatchWithHash(node, batchID string, rows []RejectionSample, receivedAt int64, hash string) (duplicate bool, err error) {
 	var total int64
 	for _, row := range rows {
 		total += row.Count
@@ -1432,7 +1442,10 @@ func (m *Monitor) pruneRejectionsOlderThan(cutoffTs int64) (int64, error) {
 			return r.Error
 		}
 		deleted = r.RowsAffected
-		return tx.Where("received_at < ?", cutoffTs).Delete(&RejectionIngestBatch{}).Error
+		// A 1-day fact retention must not prune receipts while a v2 frozen
+		// batch is still replayable, including the permitted clock skew.
+		receiptCutoff := min(cutoffTs, time.Now().Unix()-rejectionReceiptMinimumSeconds)
+		return tx.Where("received_at < ?", receiptCutoff).Delete(&RejectionIngestBatch{}).Error
 	})
 	return deleted, err
 }
@@ -1538,10 +1551,12 @@ func (a aggRow) fill(r *Row, windowSec float64) {
 	// 健康由【错误(type=5)】驱动——错误是重点,每条都关注。
 	// 异常(client_gone 等)不在此驱动色标;其"成簇"判定在 GetSnapshot 里按时间序列另行升级为关注。
 	r.Health = health(total, rate(typ2, total)) // 非错误率 = (成功+异常)/总
+	r.ErrorHealth = r.Health                    // 保留纯错误判级，后续异常成簇不得覆盖它。
 }
 
 // percentile 从直方图近似分位数。hist 各档非累计计数,档上界为 edges(长度比 hist 少 1),
-// 末档以观测到的 maxVal 收尾;桶内线性插值。单位由调用方决定(秒或毫秒)。
+// 所有桶均受观测 maxVal 约束，避免有限桶上界制造 P95 > MAX。
+// 桶内线性插值仍是近似值。单位由调用方决定(秒或毫秒)。
 func percentile(hist []int64, edges []int, maxVal int, p float64) float64 {
 	var total int64
 	for _, c := range hist {
@@ -1555,7 +1570,7 @@ func percentile(hist []int64, edges []int, maxVal int, p float64) float64 {
 	for i, c := range hist {
 		upper := float64(maxVal)
 		if i < len(edges) {
-			upper = float64(edges[i])
+			upper = min(float64(edges[i]), float64(maxVal))
 		}
 		if upper < lower {
 			upper = lower
@@ -1962,10 +1977,14 @@ func (m *Monitor) storeFreshness() (lastBucket int64) {
 
 // upsertInfra 幂等写入一批 infra 采样(同键覆盖)。
 func (m *Monitor) upsertInfra(rows []InfraSample) error {
+	return upsertInfraWithDB(m.storeDB, rows)
+}
+
+func upsertInfraWithDB(db *gorm.DB, rows []InfraSample) error {
 	if len(rows) == 0 {
 		return nil
 	}
-	return m.storeDB.Clauses(clause.OnConflict{
+	return db.Clauses(clause.OnConflict{
 		Columns:   []clause.Column{{Name: "bucket_ts"}, {Name: "resource"}, {Name: "rtype"}, {Name: "metric"}},
 		UpdateAll: true,
 	}).CreateInBatches(rows, 200).Error

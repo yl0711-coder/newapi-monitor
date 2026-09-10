@@ -104,7 +104,7 @@ func TestECSStandardMemoryPercentDerivesAbsoluteUsage(t *testing.T) {
 func TestECSServiceContainerHealthDoesNotCallUnknownHealthy(t *testing.T) {
 	fake := &fakeECSTaskHealthClient{
 		listOutputs: []*ecs.ListTasksOutput{{TaskArns: []string{"task-1"}}},
-		describeOutputs: []*ecs.DescribeTasksOutput{{Tasks: []ecstypes.Task{{LastStatus: aws.String("RUNNING"), Memory: aws.String("4096"), EphemeralStorage: &ecstypes.EphemeralStorage{SizeInGiB: 20}, Containers: []ecstypes.Container{
+		describeOutputs: []*ecs.DescribeTasksOutput{{Tasks: []ecstypes.Task{{TaskArn: aws.String("task-1"), LastStatus: aws.String("RUNNING"), Memory: aws.String("4096"), EphemeralStorage: &ecstypes.EphemeralStorage{SizeInGiB: 20}, Containers: []ecstypes.Container{
 			{HealthStatus: ecstypes.HealthStatusHealthy},
 			{HealthStatus: ecstypes.HealthStatusUnhealthy},
 			{HealthStatus: ecstypes.HealthStatusUnknown},

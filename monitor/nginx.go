@@ -243,6 +243,9 @@ func safeBatchID(value string) bool {
 }
 
 func (m *Monitor) nginxNodeAllowed(node string) bool {
+	if ecsLogNodePattern.MatchString(node) {
+		return false
+	}
 	if len(m.cfg.NginxAllowedNodes) == 0 {
 		return false
 	}
@@ -400,7 +403,7 @@ func (m *Monitor) ingestNginx(c *gin.Context) {
 	in.Node = strings.TrimSpace(in.Node)
 	// 节点名是采集状态与样本的归属键，必须完整校验后再和白名单比较。
 	// 不能先截断：否则“合法白名单名 + 任意后缀”会被截成同一个节点名。
-	if !nginxNodeNamePattern.MatchString(in.Node) || !m.nginxNodeAllowed(in.Node) {
+	if !nginxNodeNamePattern.MatchString(in.Node) || !m.nginxRequestNodeAllowed(c, in.Node, "access") {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "node not allowed"})
 		return
 	}

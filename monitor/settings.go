@@ -11,9 +11,19 @@ import (
 
 // Settings 是监控服务的独立配置,全部从环境变量读取——不依赖任何外部 config 包。
 type Settings struct {
-	Addr      string // 监听地址,默认 :8090
-	ProdDSN   string // NEWAPI_LOG_DSN:new-api 生产库【只读】DSN
-	StorePath string // 本地采样库(sqlite)路径,默认 monitor.db
+	ECSLogEnabled          bool // Default-off, isolated collection acceptance only.
+	ECSLogOwnershipEnabled bool // Explicit opt-in for a fresh isolated responsibility ledger.
+	ECSLogScope            string
+	ECSLogAudience         string
+	ECSLogBridgeToken      string
+	ECSLogPoliciesJSON     string
+	ECSArchiveEnabled      bool
+	ECSArchiveBucket       string
+	ECSArchivePrefix       string
+	ECSArchiveAccount      string
+	Addr                   string // 监听地址,默认 :8090
+	ProdDSN                string // NEWAPI_LOG_DSN:new-api 生产库【只读】DSN
+	StorePath              string // 本地采样库(sqlite)路径,默认 monitor.db
 	// Monitor 本地 SQLite 是用量事实和运维历史的事实源。启动时始终
 	// 先做 quick_check；在线备份使用 SQLite 一致性快照，不直接拷贝 WAL 运行库。
 	StoreBackupEnabled       bool   // MONITOR_STORE_BACKUP_ENABLED，默认 true
@@ -289,6 +299,16 @@ type Settings struct {
 // LoadSettings 从环境变量装载配置(可配合 .env)。
 func LoadSettings() Settings {
 	return Settings{
+		ECSLogEnabled:                            env("MONITOR_ECS_LOG_ENABLED", "false") == "true",
+		ECSLogOwnershipEnabled:                   env("MONITOR_ECS_LOG_OWNERSHIP_ENABLED", "false") == "true",
+		ECSLogScope:                              env("MONITOR_ECS_LOG_SCOPE", ""),
+		ECSLogAudience:                           env("MONITOR_ECS_LOG_AUDIENCE", ""),
+		ECSLogBridgeToken:                        env("MONITOR_ECS_LOG_BRIDGE_TOKEN", ""),
+		ECSLogPoliciesJSON:                       env("MONITOR_ECS_LOG_POLICIES_JSON", ""),
+		ECSArchiveEnabled:                        env("MONITOR_ECS_ARCHIVE_ENABLED", "false") == "true",
+		ECSArchiveBucket:                         env("MONITOR_ECS_ARCHIVE_BUCKET", ""),
+		ECSArchivePrefix:                         env("MONITOR_ECS_ARCHIVE_PREFIX", ""),
+		ECSArchiveAccount:                        env("MONITOR_ECS_ARCHIVE_ACCOUNT", ""),
 		Addr:                                     env("MONITOR_ADDR", ":8090"),
 		ProdDSN:                                  env("NEWAPI_LOG_DSN", ""),
 		StorePath:                                env("MONITOR_STORE_PATH", "monitor.db"),
