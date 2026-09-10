@@ -75,7 +75,7 @@ func (m *Monitor) ecsLogSnapshot(ctx context.Context) ([]ECSLogSource, []ECSLogD
 }
 
 func (m *Monitor) ecsLogHealth(ctx context.Context, now int64) ecsLogHealth {
-	if !m.cfg.ECSLogEnabled {
+	if !ecsLogRuntimeEnabled(m.cfg) {
 		return ecsLogHealth{Status: "disabled", Available: true, CheckedAt: now, Services: []ecsLogServiceHealth{}, CoverageStatus: "not_evaluated"}
 	}
 	sources, discoveries, err := m.ecsLogSnapshot(ctx)
@@ -88,7 +88,7 @@ func (m *Monitor) ecsLogHealth(ctx context.Context, now int64) ecsLogHealth {
 }
 
 func (m *Monitor) projectECSLogHealth(sources []ECSLogSource, discoveries []ECSLogDiscovery, now int64) ecsLogHealth {
-	result := ecsLogHealth{Enabled: m.cfg.ECSLogEnabled, Available: true, Status: "ok", CheckedAt: now, Services: []ecsLogServiceHealth{}, CoverageStatus: "unverified"}
+	result := ecsLogHealth{Enabled: ecsLogRuntimeEnabled(m.cfg), Available: true, Status: "ok", CheckedAt: now, Services: []ecsLogServiceHealth{}, CoverageStatus: "unverified"}
 	groups := map[string]*ecsLogServiceHealth{}
 	tasks, activeTasks := map[string]map[string]bool{}, map[string]map[string]bool{}
 	ensure := func(service string) *ecsLogServiceHealth {

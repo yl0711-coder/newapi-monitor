@@ -1,4 +1,4 @@
-# Isolated agent artifact. Never replaces the production Monitor image.
+# Scoped agent artifact. It is a collector sidecar, never the Monitor image.
 FROM golang:1.26.6-alpine3.23 AS build
 WORKDIR /src
 COPY go.mod go.sum ./

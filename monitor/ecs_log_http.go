@@ -41,7 +41,7 @@ func decodeECSBoundedJSON(body io.Reader, limit int, out any) error {
 
 func (m *Monitor) registerECSLogHTTP(c *gin.Context) {
 	c.Header("Cache-Control", "no-store")
-	if !m.cfg.ECSLogEnabled || m.cfg.ECSLogScope != "isolated" || len(m.cfg.ECSLogBridgeToken) < 32 {
+	if !ecsLogRuntimeEnabled(m.cfg) || len(m.cfg.ECSLogBridgeToken) < 32 {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "ECS registration disabled"})
 		return
 	}
@@ -84,7 +84,7 @@ func (m *Monitor) registerECSLogHTTP(c *gin.Context) {
 		c.JSON(503, gin.H{"error": "source registry unavailable"})
 		return
 	}
-	finalEnabled := m.cfg.ECSArchiveEnabled && m.cfg.ECSLogScope == "isolated"
+	finalEnabled := m.cfg.ECSArchiveEnabled && ecsLogRuntimeEnabled(m.cfg)
 	c.JSON(200, gin.H{"ok": true, "version": 1, "node": source.Node, "lane": source.Lane, "audience": m.cfg.ECSLogAudience, "lease_until": source.LeaseUntil, "archive_closure_v2": finalEnabled, "final_boundary_v1": finalEnabled, "final_newapi_files_v1": finalEnabled})
 }
 
@@ -104,7 +104,7 @@ func (m *Monitor) heartbeatECSLogHTTP(c *gin.Context) {
 }
 
 func (m *Monitor) acceptECSLogHTTP(c *gin.Context, heartbeat bool) {
-	if !m.cfg.ECSLogEnabled || m.cfg.ECSLogScope != "isolated" {
+	if !ecsLogRuntimeEnabled(m.cfg) {
 		c.JSON(503, gin.H{"error": "ECS log ingest disabled"})
 		return
 	}
@@ -134,7 +134,7 @@ func (m *Monitor) acceptECSLogHTTP(c *gin.Context, heartbeat bool) {
 		return
 	}
 	policy, allowed := m.ecsLogPolicy(source.ServiceARN, source.Container, lane)
-	if !allowed || source.TaskRoleARN != policy.TaskRoleARN || source.Revoked || source.LeaseUntil <= now || source.StoppedAt > 0 && now > source.StoppedAt+ecsLogReplaySeconds {
+	if !allowed || !ecsLogTaskDefinitionAllowed(policy, source.TaskDefinitionARN) || source.TaskRoleARN != policy.TaskRoleARN || source.Revoked || source.LeaseUntil <= now || source.StoppedAt > 0 && now > source.StoppedAt+ecsLogReplaySeconds {
 		c.JSON(401, gin.H{"error": "ECS source lease expired or revoked"})
 		return
 	}

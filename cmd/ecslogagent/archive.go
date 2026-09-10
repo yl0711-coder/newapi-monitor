@@ -30,6 +30,9 @@ func configureArchive(ctx context.Context, agent *ecslogagent.Agent, c ecslogage
 	if err := archiveCfg.Validate(); err != nil {
 		return err
 	}
+	if archiveCfg.Prefix != c.Scope+"/" {
+		return errors.New("archive prefix must match the ECS collector scope")
+	}
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	transport := http.DefaultTransport.(*http.Transport).Clone()

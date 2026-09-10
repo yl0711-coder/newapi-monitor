@@ -14,7 +14,7 @@ const ecsLogDiscoveryInterval = 30 * time.Second
 // Separate from CloudWatch resource sampling. This loop performs control-plane
 // reads only; it never changes ECS desiredCount, task definitions or traffic.
 func (m *Monitor) startECSLogDiscovery(parent context.Context) {
-	if !m.cfg.ECSLogEnabled || m.cfg.ECSLogScope != "isolated" || m.cfg.LocalSnapshotOnly {
+	if !ecsLogRuntimeEnabled(m.cfg) || m.cfg.LocalSnapshotOnly {
 		return
 	}
 	ctx, cancel := context.WithCancel(parent)

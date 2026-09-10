@@ -57,7 +57,7 @@ func verifyECSLogTask(ctx context.Context, client ecsLogTaskAPI, in ecsLogRegist
 	if err != nil {
 		return ECSLogSource{}, err
 	}
-	if definition == nil || definition.TaskDefinition == nil || aws.ToString(definition.TaskDefinition.TaskDefinitionArn) != aws.ToString(task.TaskDefinitionArn) || aws.ToString(definition.TaskDefinition.TaskRoleArn) != p.TaskRoleARN {
+	if definition == nil || definition.TaskDefinition == nil || aws.ToString(definition.TaskDefinition.TaskDefinitionArn) != aws.ToString(task.TaskDefinitionArn) || !ecsLogTaskDefinitionAllowed(p, aws.ToString(task.TaskDefinitionArn)) || aws.ToString(definition.TaskDefinition.TaskRoleArn) != p.TaskRoleARN {
 		return ECSLogSource{}, errors.New("task definition role verification failed")
 	}
 	for _, container := range task.Containers {

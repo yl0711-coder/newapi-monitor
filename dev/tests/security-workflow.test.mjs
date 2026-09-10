@@ -28,7 +28,8 @@ test('image scanner blocks unfixed high/critical findings before artifact upload
   assert.ok(scan.indexOf("if: github.event_name != 'pull_request'") > scan.indexOf('Report remaining'));
   assert.doesNotMatch(scan, /packages: write|continue-on-error|docker push/);
   assert.equal((scan.match(/uses: aquasecurity\/trivy-action@[a-f0-9]{40}/g) ?? []).length, 2);
-  for (const image of ['newapi-monitor', 'newapi-monitor-hostagent', 'newapi-monitor-nginxcollector']) {
+  for (const image of ['newapi-monitor', 'newapi-monitor-hostagent', 'newapi-monitor-nginxcollector',
+    'newapi-monitor-ecslogagent', 'newapi-monitor-nginxcollector-ecs']) {
     assert.ok(scan.includes(`image: ${image}\n`));
   }
 });
@@ -43,7 +44,8 @@ test('publisher loads the scanned artifact and cannot rebuild or push unrelated 
 });
 
 test('all production images use the same patched Go build version as CI', () => {
-  for (const file of ['Dockerfile', 'cmd/hostagent/Dockerfile', 'cmd/nginxcollector/Dockerfile']) {
+  for (const file of ['Dockerfile', 'cmd/hostagent/Dockerfile', 'cmd/nginxcollector/Dockerfile',
+    'cmd/ecslogagent/Dockerfile', 'cmd/nginxcollector/Dockerfile.ecs-isolated']) {
     const dockerfile = readFileSync(new URL(`../../${file}`, import.meta.url), 'utf8');
     assert.match(dockerfile, /golang:1\.26\.6-alpine3\.23/);
     assert.match(dockerfile, /FROM .* AS runtime/);

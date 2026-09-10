@@ -19,11 +19,14 @@ func validateECSArchiveSettings(s Settings) error {
 	if !s.ECSArchiveEnabled {
 		return nil
 	}
-	if !s.ECSLogEnabled || s.ECSLogScope != "isolated" || s.LocalSnapshotOnly || s.LocalAuthBypass {
-		return errors.New("archive recovery requires isolated ECS receiver")
+	if !ecsLogRuntimeEnabled(s) || s.LocalSnapshotOnly || s.LocalAuthBypass {
+		return errors.New("archive recovery requires an authenticated ECS receiver")
 	}
 	if err := ecsArchiveConfig(s).Validate(); err != nil {
 		return err
+	}
+	if s.ECSArchivePrefix != s.ECSLogScope+"/" {
+		return errors.New("archive prefix must be dedicated to the authenticated ECS scope")
 	}
 	if s.NginxRetentionDays > 0 && s.NginxRetentionDays < 2 {
 		return errors.New("archive replay requires at least 48 hours of nginx receipts")
