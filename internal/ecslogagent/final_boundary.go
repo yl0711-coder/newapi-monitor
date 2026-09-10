@@ -65,7 +65,16 @@ func snapshotFinalFileWithin(ctx context.Context, path string, budget int64) (ec
 	if err != nil || !os.SameFile(before, after) || after.Size() != size || before.Size() != size || !before.ModTime().Equal(after.ModTime()) {
 		return result, errors.New("source changed during final snapshot")
 	}
-	return ecsarchive.FinalFile{Name: filepath.Base(path), Device: uint64(stat.Dev), Inode: stat.Ino, Size: size, Offset: size, SHA256: hex.EncodeToString(h.Sum(nil))}, nil
+	return ecsarchive.FinalFile{
+		Name: filepath.Base(path),
+		// syscall.Stat_t.Dev is uint64 on Linux but int32 on Darwin, so the
+		// conversion is required for the supported cross-platform build.
+		Device: uint64(stat.Dev), //nolint:unconvert
+		Inode:  stat.Ino,
+		Size:   size,
+		Offset: size,
+		SHA256: hex.EncodeToString(h.Sum(nil)),
+	}, nil
 }
 
 func (a *Agent) finishBoundaries(ctx context.Context, before map[string]ecsarchive.FinalFile) (map[string]*ecsarchive.FinalBoundary, error) {
