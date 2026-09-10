@@ -17,6 +17,15 @@ class SplitTemplateTest(unittest.TestCase):
         self.assertTrue(result["static_checks_passed"])
         self.assertFalse(result["production_ready"])
 
+    def test_initializer_keeps_only_the_reviewed_chown_capability(self):
+        containers = self.r["TaskDefinition"]["Properties"]["ContainerDefinitions"]
+        initializer = next(c for c in containers if c["Name"] == "nginxcollector-init")
+        self.assertEqual(initializer["User"], "0")
+        self.assertTrue(initializer["ReadonlyRootFilesystem"])
+        self.assertNotIn("LinuxParameters", initializer)
+        self.assertFalse(initializer.get("Environment"))
+        self.assertFalse(initializer.get("Secrets"))
+
     def test_no_tasks_before_explicit_gate_and_three_registry_digests(self):
         self.assertEqual(self.t["Parameters"]["EnableTestDefinition"]["Default"], "no")
         condition = self.t["Conditions"]["TestDefinitionEnabled"]["Fn::And"]

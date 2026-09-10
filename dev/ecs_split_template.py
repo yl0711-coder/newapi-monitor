@@ -52,7 +52,7 @@ def split_template(name):
     task = resources["TaskDefinition"]["Properties"]
     previous = {c["Name"]: c for c in task["ContainerDefinitions"]}
     init = copy.deepcopy(previous["init"])
-    init.update(Name=INIT, Image=sub("${Repository.RepositoryUri}@${SyntheticImageDigest}"),
+    init.update(Name=INIT, Image=sub("${Repository.RepositoryUri}@${SyntheticImageDigest}"), User="0",
                 MountPoints=[mount("NginxLogs", "/logs"), mount("RejectLogs", "/app/logs"),
                              mount("NginxState", "/state-nginx"), mount("RejectState", "/state-reject")],
                 Command=["chown 100:101 /logs /app/logs /state-nginx /state-reject; "

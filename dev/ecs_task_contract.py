@@ -7,6 +7,7 @@ import hashlib
 import json
 import re
 from pathlib import PurePosixPath
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 PAIRS = {"nginxcollector": "nginx", "reject-collector": "new-api"}
 INIT = "nginxcollector-init"
@@ -97,12 +98,24 @@ def check_collector(name, producer, containers, graph, all_mounts, scope):
     else:
         expected.update(ECSLOG_KIND="reject", COLLECTOR_LOG_GLOB="/app/logs/oneapi-*.log")
     require(all(env.get(k) == v for k, v in expected.items()), "collector file/producer/archive contract mismatch")
+    if producer == "new-api":
+        try:
+            ZoneInfo(env.get("COLLECTOR_LOG_TIMEZONE", ""))
+        except (ZoneInfoNotFoundError, ValueError):
+            raise ValueError("reject collector requires an explicit valid source log timezone")
     own = all_mounts[name]
     require(set(own) == {log_path, "/data/ecs"}, "collector requires only log and private state mounts")
     require(own[log_path].get("ReadOnly") is True, "collector log mount must be read-only")
-    source = all_mounts[producer].get(log_path, {})
-    require(source.get("SourceVolume") == own[log_path]["SourceVolume"] and
-            source.get("ReadOnly", False) is False, "producer and collector must share the actual log volume")
+    # Producer and collector may intentionally use different paths inside
+    # their own containers (for example nginx writes under
+    # /var/log/nexusapi-monitor while the collector reads the same task-local
+    # volume at /logs).  The security/correctness invariant is the unique,
+    # writable producer mount of the exact volume, not equal container paths.
+    producer_sources = [mount for mount in all_mounts[producer].values()
+                        if mount.get("SourceVolume") == own[log_path]["SourceVolume"]]
+    require(len(producer_sources) == 1 and producer_sources[0].get("ReadOnly", False) is False,
+            "producer and collector must share the actual log volume")
+    source = producer_sources[0]
     log_owners = {c for c, points in all_mounts.items()
                   if any(m["SourceVolume"] == source["SourceVolume"] for m in points.values())}
     require(log_owners <= {name, producer, INIT}, "producer log volumes must be isolated")
@@ -123,7 +136,12 @@ def check_task(task, *, scope="isolated"):
             "Fargate awsvpc task required")
     containers = indexed(task.get("ContainerDefinitions"), "Name", "containers")
     require(set(containers) == set(PAIRS) | set(PAIRS.values()) | {INIT}, "reviewed five-container layout required")
-    require(containers[INIT].get("Essential") is False, "init must be nonessential")
+    initializer = containers[INIT]
+    require(initializer.get("Essential") is False, "init must be nonessential")
+    require(initializer.get("User") == "0" and initializer.get("ReadonlyRootFilesystem") is True and
+            not initializer.get("Privileged") and not initializer.get("LinuxParameters") and
+            not initializer.get("Secrets") and not initializer.get("Environment"),
+            "initializer must be reviewed root CHOWN-only bootstrap without secrets or dropped CHOWN capability")
     volumes = indexed(task.get("Volumes", []), "Name", "volumes")
     require(all(set(v) == {"Name"} for v in volumes.values()), "only task-local volumes are supported")
     graph = dependencies(containers)

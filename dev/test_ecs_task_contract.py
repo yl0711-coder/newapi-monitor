@@ -14,7 +14,8 @@ def dep(name, condition="START"):
 
 
 def fixture():
-    containers = [{"Name": INIT, "Essential": False, "MountPoints": []}]
+    containers = [{"Name": INIT, "Essential": False, "User": "0", "ReadonlyRootFilesystem": True,
+                   "MountPoints": []}]
     for collector, producer in PAIRS.items():
         kind = "nginx" if producer == "nginx" else "reject"
         root = "/logs" if kind == "nginx" else "/app/logs"
@@ -28,6 +29,7 @@ def fixture():
                        NGINXCOLLECTOR_ERROR_LOG_PATH=root + "/error.log")
         else:
             env["COLLECTOR_LOG_GLOB"] = root + "/oneapi-*.log"
+            env["COLLECTOR_LOG_TIMEZONE"] = "UTC"
         containers.append({"Name": collector, "Essential": False, "Image": "fixture-collector",
                            "ReadonlyRootFilesystem": True, "User": "100:101", "StopTimeout": 60,
                            "LinuxParameters": {"Capabilities": {"Drop": ["ALL"]}},
@@ -63,6 +65,17 @@ class TaskContractTest(unittest.TestCase):
         self.assertFalse(result["production_ready"])
         self.assertFalse(result["aws_verified"])
 
+    def test_producer_and_collector_paths_may_differ_on_same_volume(self):
+        nginx = self.c["nginx"]
+        nginx["MountPoints"][0]["ContainerPath"] = "/var/log/nexusapi-monitor"
+        result = check_task(self.task)
+        self.assertTrue(result["static_checks_passed"])
+
+    def test_duplicate_producer_mount_of_log_volume_is_rejected(self):
+        self.c["nginx"]["MountPoints"].append(mount("nginx-logs", "/duplicate"))
+        with self.assertRaisesRegex(ValueError, "actual log volume"):
+            check_task(self.task)
+
     def test_production_contract_is_explicit_and_still_not_approval(self):
         for name in PAIRS:
             collector = self.c[name]
@@ -91,6 +104,17 @@ class TaskContractTest(unittest.TestCase):
 
     def test_init_must_not_be_essential(self):
         self.reject(lambda: self.c[INIT].update(Essential=True), "init must be nonessential")
+
+    def test_init_must_retain_chown_and_hold_no_secrets(self):
+        for field, value in (("LinuxParameters", {"Capabilities": {"Drop": ["ALL"]}}),
+                             ("Secrets", [{"Name": "WRONG", "ValueFrom": "fixture"}]),
+                             ("Environment", [{"Name": "WRONG", "Value": "fixture"}]),
+                             ("ReadonlyRootFilesystem", False)):
+            with self.subTest(field=field):
+                candidate = fixture()
+                next(c for c in candidate["ContainerDefinitions"] if c["Name"] == INIT)[field] = value
+                with self.assertRaisesRegex(ValueError, "initializer must be reviewed"):
+                    check_task(candidate)
 
     def test_no_collector_health_gating(self):
         self.c["nginxcollector"]["HealthCheck"] = {"Command": ["CMD", "true"]}
@@ -122,6 +146,19 @@ class TaskContractTest(unittest.TestCase):
     def test_duplicate_environment(self):
         env = self.c["nginxcollector"]["Environment"]
         self.reject(lambda: env.append(copy.deepcopy(env[0])), "duplicate")
+
+    def test_reject_source_timezone_must_be_explicit_and_valid(self):
+        for value in (None, "", "Local", "Asia/Not_A_Zone"):
+            with self.subTest(value=value):
+                candidate = fixture()
+                collector = next(c for c in candidate["ContainerDefinitions"] if c["Name"] == "reject-collector")
+                row = next(e for e in collector["Environment"] if e["Name"] == "COLLECTOR_LOG_TIMEZONE")
+                if value is None:
+                    collector["Environment"].remove(row)
+                else:
+                    row["Value"] = value
+                with self.assertRaisesRegex(ValueError, "source log timezone"):
+                    check_task(candidate)
 
     def test_readonly_log_volume(self):
         self.reject(lambda: self.c["nginxcollector"]["MountPoints"][0].update(ReadOnly=False), "log mount must be read-only")
