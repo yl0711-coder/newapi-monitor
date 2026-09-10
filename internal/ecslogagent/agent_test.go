@@ -59,6 +59,12 @@ func TestConfigAndMetadataFailClosed(t *testing.T) {
 	if err := c.Validate(); err != nil {
 		t.Fatal(err)
 	}
+	production := c
+	production.Scope = "production"
+	production.RegisterURL = strings.Replace(c.RegisterURL, "/isolated/", "/production/", 1)
+	if err := production.Validate(); err != nil {
+		t.Fatalf("production scope with matching AWS_IAM stage: %v", err)
+	}
 	for name, mutate := range map[string]func(*Config){"production": func(c *Config) { c.Scope = "production" }, "http": func(c *Config) { c.MonitorURL = "http://monitor.example" }, "redirect-principal": func(c *Config) { c.RegisterURL = "https://evil.example/isolated/register" }, "gateway-stage": func(c *Config) { c.RegisterURL = strings.ReplaceAll(c.RegisterURL, "/isolated/", "/prod/") }, "audience": func(c *Config) { c.Audience = "" }, "root": func(c *Config) { c.StateRoot = "/" }} {
 		t.Run(name, func(t *testing.T) {
 			bad := c

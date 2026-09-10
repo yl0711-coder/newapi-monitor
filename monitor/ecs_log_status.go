@@ -77,5 +77,5 @@ func (m *Monitor) serveECSLogSources(c *gin.Context) {
 	for _, discovery := range discoveries[:min(len(discoveries), ecsLogSourceLimit)] {
 		discoveryViews = append(discoveryViews, ecsLogDiscoveryView{discovery, ecsLogDiscoveryStatus(discovery, now)})
 	}
-	c.JSON(200, gin.H{"enabled": m.cfg.ECSLogEnabled, "scope": m.cfg.ECSLogScope, "production_ready": false, "sources": views, "total": total, "page": page, "page_size": pageSize, "has_more": page*pageSize < total, "phase": phase, "discoveries": discoveryViews, "discoveries_truncated": false, "health": health})
+	c.JSON(200, gin.H{"enabled": ecsLogRuntimeEnabled(m.cfg), "scope": m.cfg.ECSLogScope, "production_active": m.cfg.ECSLogScope == ecsLogScopeProduction && ecsLogRuntimeEnabled(m.cfg), "production_ready": false, "sources": views, "total": total, "page": page, "page_size": pageSize, "has_more": page*pageSize < total, "phase": phase, "discoveries": discoveryViews, "discoveries_truncated": false, "health": health})
 }

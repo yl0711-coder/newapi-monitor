@@ -22,15 +22,17 @@ const (
 // supplied by an unauthenticated collector. Task IAM is the security boundary;
 // containers in one task share that role and are not mutually isolated tenants.
 type ECSLogPolicy struct {
-	ClusterARN  string              `json:"cluster_arn"`
-	ServiceARN  string              `json:"service_arn"`
-	TaskRoleARN string              `json:"task_role_arn"`
-	Containers  map[string][]string `json:"containers"`
+	ClusterARN         string              `json:"cluster_arn"`
+	ServiceARN         string              `json:"service_arn"`
+	TaskRoleARN        string              `json:"task_role_arn"`
+	TaskDefinitionARNs []string            `json:"task_definition_arns,omitempty"`
+	Containers         map[string][]string `json:"containers"`
 }
 
 var ecsLogARNPattern = regexp.MustCompile(`^arn:aws:ecs:([a-z]{2}-[a-z]+-[0-9]):([0-9]{12}):(cluster|service|task)/([A-Za-z0-9_-]+)(?:/([A-Za-z0-9_-]+))?$`)
 var ecsTaskIDPattern = regexp.MustCompile(`^[a-f0-9]{32}$`)
 var ecsRoleARNPattern = regexp.MustCompile(`^arn:aws:iam::[0-9]{12}:role/[A-Za-z0-9_+=,.@/-]+$`)
+var ecsTaskDefinitionARNPattern = regexp.MustCompile(`^arn:aws:ecs:([a-z]{2}-[a-z]+-[0-9]):([0-9]{12}):task-definition/[A-Za-z0-9_-]+:[1-9][0-9]*$`)
 var ecsLogNodePattern = regexp.MustCompile(`^ecs-[a-f0-9]{48}$`)
 var ecsLogAudiencePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9:./_-]{7,127}$`)
 
@@ -43,8 +45,11 @@ func ecsLogLane(lane string) bool {
 }
 
 func parseECSLogPolicies(s Settings) ([]ECSLogPolicy, error) {
-	if s.ECSLogOwnershipEnabled && (!s.ECSLogEnabled || s.ECSLogScope != "isolated") {
-		return nil, errors.New("ECS ownership ledger requires an enabled isolated receiver; production gate remains closed")
+	if s.ECSLogProductionEnabled && (!s.ECSLogEnabled || s.ECSLogScope != ecsLogScopeProduction) {
+		return nil, errors.New("ECS production gate requires enabled production scope")
+	}
+	if s.ECSLogOwnershipEnabled && !ecsLogRuntimeEnabled(s) {
+		return nil, errors.New("ECS ownership ledger requires an enabled authenticated receiver")
 	}
 	if !s.ECSLogEnabled {
 		return nil, nil
@@ -58,14 +63,15 @@ func parseECSLogPolicies(s Settings) ([]ECSLogPolicy, error) {
 	if len(s.ECSLogBridgeToken) < 32 || s.ECSLogBridgeToken == s.IngestToken || s.ECSLogBridgeToken == s.SessionSecret || s.ECSLogBridgeToken == s.UpstreamCredentialSecret {
 		return nil, errors.New("ECS registration requires an independent bridge credential of at least 32 bytes")
 	}
-	// First release is explicitly isolated. Production scope stays closed until
-	// the external archive/final-boundary and report-coverage gates pass.
-	if s.ECSLogScope != "isolated" {
-		return nil, errors.New("ECS logs currently require MONITOR_ECS_LOG_SCOPE=isolated; production gate is closed")
+	if !ecsLogRuntimeEnabled(s) {
+		return nil, errors.New("ECS logs require isolated scope or the explicit production gate")
 	}
 	var policies []ECSLogPolicy
-	if strings.TrimSpace(s.ProdDSN) != "" || s.SourceWorkerEnabled {
+	if s.ECSLogScope == ecsLogScopeIsolated && (strings.TrimSpace(s.ProdDSN) != "" || s.SourceWorkerEnabled) {
 		return nil, errors.New("isolated ECS acceptance requires a separate Monitor store with NEWAPI_LOG_DSN unset and MONITOR_SOURCE_WORKER_ENABLED=false")
+	}
+	if s.ECSLogScope == ecsLogScopeProduction && (!s.ECSLogOwnershipEnabled || !s.ECSArchiveEnabled) {
+		return nil, errors.New("production ECS logs require ownership and external archive gates")
 	}
 	if decodeECSBoundedJSON(strings.NewReader(s.ECSLogPoliciesJSON), 64<<10, &policies) != nil || len(policies) == 0 || len(policies) > 32 {
 		return nil, errors.New("invalid bounded ECS log service policies")
@@ -77,6 +83,17 @@ func parseECSLogPolicies(s Settings) ([]ECSLogPolicy, error) {
 			return nil, errors.New("ECS policy must name a unique same-account region/cluster/service/task-role")
 		}
 		seen[p.ServiceARN] = true
+		definitionSeen := map[string]bool{}
+		if s.ECSLogScope == ecsLogScopeProduction && (len(p.TaskDefinitionARNs) == 0 || len(p.TaskDefinitionARNs) > 16) {
+			return nil, errors.New("production ECS policy requires a bounded exact task-definition allowlist")
+		}
+		for _, definition := range p.TaskDefinitionARNs {
+			parts := ecsTaskDefinitionARNPattern.FindStringSubmatch(definition)
+			if len(parts) == 0 || parts[1] != cluster[1] || parts[2] != cluster[2] || definitionSeen[definition] {
+				return nil, errors.New("invalid, duplicate or cross-account ECS task-definition allowlist entry")
+			}
+			definitionSeen[definition] = true
+		}
 		for container, lanes := range p.Containers {
 			if !nginxNodeNamePattern.MatchString(container) || len(lanes) == 0 || len(lanes) > 4 {
 				return nil, errors.New("invalid ECS policy container/lanes")
@@ -94,6 +111,18 @@ func parseECSLogPolicies(s Settings) ([]ECSLogPolicy, error) {
 		}
 	}
 	return policies, nil
+}
+
+func ecsLogTaskDefinitionAllowed(p ECSLogPolicy, arn string) bool {
+	if len(p.TaskDefinitionARNs) == 0 {
+		return true // isolated fixtures and the first isolated protocol remain compatible.
+	}
+	for _, allowed := range p.TaskDefinitionARNs {
+		if arn == allowed {
+			return true
+		}
+	}
+	return false
 }
 
 func (m *Monitor) ecsLogPolicy(service, container, lane string) (ECSLogPolicy, bool) {

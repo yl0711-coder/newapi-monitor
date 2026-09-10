@@ -1,4 +1,4 @@
-// Package ecslogagent provides the default-off, isolated ECS identity adapter.
+// Package ecslogagent provides the default-off, scoped ECS identity adapter.
 // It transports frozen collector payloads; it never parses/recounts log records.
 package ecslogagent
 
@@ -41,16 +41,16 @@ func (c Config) Validate() error {
 		return errors.New("collector closure requires deferred archive delivery")
 	}
 	p := servicePattern.FindStringSubmatch(c.ServiceARN)
-	if c.Scope != "isolated" || (c.Kind != "nginx" && c.Kind != "reject") || len(p) == 0 || !namePattern.MatchString(c.Container) || !audiencePattern.MatchString(c.Audience) || !filepath.IsAbs(c.StateRoot) || filepath.Clean(c.StateRoot) == "/" {
-		return errors.New("invalid isolated ECS agent configuration")
+	if (c.Scope != "isolated" && c.Scope != "production") || (c.Kind != "nginx" && c.Kind != "reject") || len(p) == 0 || !namePattern.MatchString(c.Container) || !audiencePattern.MatchString(c.Audience) || !filepath.IsAbs(c.StateRoot) || filepath.Clean(c.StateRoot) == "/" {
+		return errors.New("invalid ECS agent configuration")
 	}
 	monitor, err := strictHTTPS(c.MonitorURL)
 	if err != nil || (monitor.Path != "" && monitor.Path != "/") {
 		return errors.New("Monitor URL must be a fixed HTTPS origin")
 	}
 	registration, err := strictHTTPS(c.RegisterURL)
-	if err != nil || !strings.HasSuffix(registration.Hostname(), ".execute-api."+p[1]+".amazonaws.com") || registration.Port() != "" || registration.Path != "/isolated/register" {
-		return errors.New("registration requires the regional AWS_IAM Gateway isolated/register endpoint")
+	if err != nil || !strings.HasSuffix(registration.Hostname(), ".execute-api."+p[1]+".amazonaws.com") || registration.Port() != "" || registration.Path != "/"+c.Scope+"/register" {
+		return errors.New("registration requires the matching regional AWS_IAM Gateway endpoint")
 	}
 	return nil
 }

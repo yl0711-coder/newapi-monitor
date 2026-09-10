@@ -68,7 +68,7 @@ def mounts(container, volumes):
     return result
 
 
-def check_collector(name, producer, containers, graph, all_mounts):
+def check_collector(name, producer, containers, graph, all_mounts, scope):
     collector = containers[name]
     require(collector.get("Essential") is False, "collector must be nonessential")
     require(collector.get("ReadonlyRootFilesystem") is True, "collector root must be read-only")
@@ -88,7 +88,7 @@ def check_collector(name, producer, containers, graph, all_mounts):
                 "ECSLOG_FINAL_FILE_CONTRACT": "newapi-files-v1",
                 "ECSLOG_STATE_ROOT": "/data/ecs", "ECSLOG_ARCHIVE_ENABLED": "true",
                 "ECSLOG_ARCHIVE_CLOSURE": "true", "ECSLOG_DEFERRED_ARCHIVE_ACK": "true",
-                "ECSLOG_SCOPE": "isolated"}
+                "ECSLOG_SCOPE": scope}
     log_path = "/logs" if producer == "nginx" else "/app/logs"
     expected["ECSLOG_FINAL_LOG_ROOT"] = log_path
     if producer == "nginx":
@@ -116,8 +116,9 @@ def check_collector(name, producer, containers, graph, all_mounts):
     return volume
 
 
-def check_task(task):
+def check_task(task, *, scope="isolated"):
     require(isinstance(task, dict), "task object required")
+    require(scope in ("isolated", "production"), "reviewed ECS scope required")
     require(task.get("NetworkMode") == "awsvpc" and task.get("RequiresCompatibilities") == ["FARGATE"],
             "Fargate awsvpc task required")
     containers = indexed(task.get("ContainerDefinitions"), "Name", "containers")
@@ -127,7 +128,7 @@ def check_task(task):
     require(all(set(v) == {"Name"} for v in volumes.values()), "only task-local volumes are supported")
     graph = dependencies(containers)
     all_mounts = {n: mounts(c, volumes) for n, c in containers.items()}
-    states = [check_collector(n, p, containers, graph, all_mounts) for n, p in PAIRS.items()]
+    states = [check_collector(n, p, containers, graph, all_mounts, scope) for n, p in PAIRS.items()]
     require(len(set(states)) == len(states), "collectors must not share state")
     return {"static_checks_passed": True, "production_ready": False,
             "aws_verified": False, "checked_collectors": sorted(PAIRS)}
@@ -150,7 +151,7 @@ def check_initializer_transition(old, new, reviewed_digest):
     return changed
 
 
-def check_business_unchanged(before, after, *, reviewed_initializer_sha256=None):
+def check_business_unchanged(before, after, *, reviewed_initializer_sha256=None, scope="isolated"):
     """Only producer START dependencies may be added; never edit business config.
 
     A newly added/changed initializer needs an explicit separate fingerprint;
@@ -158,7 +159,7 @@ def check_business_unchanged(before, after, *, reviewed_initializer_sha256=None)
     Does not authorize collector/role changes. Both documents must be complete
     reviewed definitions; redacted snapshots cannot prove secret equality.
     """
-    check_task(after)
+    check_task(after, scope=scope)
     old = indexed(before.get("ContainerDefinitions"), "Name", "baseline containers")
     new = indexed(after.get("ContainerDefinitions"), "Name", "candidate containers")
     initializer_changed = check_initializer_transition(old, new, reviewed_initializer_sha256)

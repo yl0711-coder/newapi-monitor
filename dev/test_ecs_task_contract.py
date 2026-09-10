@@ -63,6 +63,16 @@ class TaskContractTest(unittest.TestCase):
         self.assertFalse(result["production_ready"])
         self.assertFalse(result["aws_verified"])
 
+    def test_production_contract_is_explicit_and_still_not_approval(self):
+        for name in PAIRS:
+            collector = self.c[name]
+            next(e for e in collector["Environment"] if e["Name"] == "ECSLOG_SCOPE")["Value"] = "production"
+        result = check_task(self.task, scope="production")
+        self.assertTrue(result["static_checks_passed"])
+        self.assertFalse(result["production_ready"])
+        with self.assertRaisesRegex(ValueError, "contract mismatch"):
+            check_task(self.task)
+
     def test_historical_wrong_stop_order(self):
         self.c["nginx"]["DependsOn"] = [dep("new-api", "HEALTHY")]
         self.reject(lambda: self.c["nginxcollector"].update(DependsOn=[dep("nginx")]), "only on successful")

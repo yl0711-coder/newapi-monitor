@@ -139,6 +139,13 @@ func observeECSLogTask(tx *gorm.DB, p ECSLogPolicy, task types.Task, now int64) 
 	if aws.ToString(task.LastStatus) != "RUNNING" {
 		return nil
 	}
+	// A service can contain old and candidate task definitions during a rolling
+	// deployment. Only definitions explicitly authorized by the same policy as
+	// registration become expected log sources; otherwise healthy legacy tasks
+	// would be misreported as missing collectors during the overlap window.
+	if !ecsLogTaskDefinitionAllowed(p, aws.ToString(task.TaskDefinitionArn)) {
+		return nil
+	}
 	for _, container := range task.Containers {
 		name, runtimeID := aws.ToString(container.Name), aws.ToString(container.RuntimeId)
 		if runtimeID == "" || len(runtimeID) > 256 || aws.ToString(container.LastStatus) != "RUNNING" {

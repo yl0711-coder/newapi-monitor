@@ -52,8 +52,8 @@ func (m *Monitor) initECSLogOwnership(db *gorm.DB) error {
 	if !hasBinding && !hasOwners && !m.cfg.ECSLogOwnershipEnabled {
 		return nil
 	}
-	if !m.cfg.ECSLogOwnershipEnabled || !m.cfg.ECSLogEnabled || m.cfg.ECSLogScope != "isolated" || !ecsLogAudiencePattern.MatchString(m.cfg.ECSLogAudience) {
-		return errors.New("ownership store cannot disable its gate, change purpose or become a production store")
+	if !m.cfg.ECSLogOwnershipEnabled || !ecsLogRuntimeEnabled(m.cfg) || !ecsLogAudiencePattern.MatchString(m.cfg.ECSLogAudience) {
+		return errors.New("ownership store cannot disable its gate or change receiver identity")
 	}
 	if hasBinding != hasOwners {
 		return errors.New("incomplete ownership schema; recovery required")
@@ -67,29 +67,35 @@ func (m *Monitor) initECSLogOwnership(db *gorm.DB) error {
 			if count != 0 {
 				return errors.New("ownership requires a fresh receiver; existing sources cannot be silently adopted")
 			}
-			for _, model := range []any{&NginxIngestBatch{}, &NginxErrorIngestBatch{}, &RejectionIngestBatch{}, &MetricSample{}, &UsageHourFact{}, &UsageDailyFact{}, &ChannelUpstreamUsageHour{}, &ECSLogArchiveReceipt{}} {
-				if !tx.Migrator().HasTable(model) {
-					continue
-				}
-				var present []int
-				if err := tx.Model(model).Select("1").Limit(1).Scan(&present).Error; err != nil {
-					return err
-				}
-				if len(present) > 0 {
-					return errors.New("ownership cannot adopt existing business or collection facts")
+			// Isolated acceptance must start with an empty receiver so its result
+			// cannot be confused with old facts. Production deliberately keeps
+			// existing Lightsail facts: ownership applies only to newly verified
+			// ECS sources and never adopts legacy batches.
+			if m.cfg.ECSLogScope == ecsLogScopeIsolated {
+				for _, model := range []any{&NginxIngestBatch{}, &NginxErrorIngestBatch{}, &RejectionIngestBatch{}, &MetricSample{}, &UsageHourFact{}, &UsageDailyFact{}, &ChannelUpstreamUsageHour{}, &ECSLogArchiveReceipt{}} {
+					if !tx.Migrator().HasTable(model) {
+						continue
+					}
+					var present []int
+					if err := tx.Model(model).Select("1").Limit(1).Scan(&present).Error; err != nil {
+						return err
+					}
+					if len(present) > 0 {
+						return errors.New("isolated ownership cannot adopt existing business or collection facts")
+					}
 				}
 			}
 			if err := tx.AutoMigrate(&ECSLogOwnership{}, &ECSLogOwnershipBinding{}); err != nil {
 				return err
 			}
-			binding := ECSLogOwnershipBinding{ID: 1, Version: 1, Audience: m.cfg.ECSLogAudience, Purpose: ecsLogCandidatePurpose}
+			binding := ECSLogOwnershipBinding{ID: 1, Version: 1, Audience: m.cfg.ECSLogAudience, Purpose: ecsLogPurpose(m.cfg)}
 			return tx.Create(&binding).Error
 		}
 		var rows []ECSLogOwnershipBinding
 		if err := tx.Limit(2).Find(&rows).Error; err != nil {
 			return err
 		}
-		if len(rows) != 1 || rows[0].ID != 1 || rows[0].Version != 1 || rows[0].Audience != m.cfg.ECSLogAudience || rows[0].Purpose != ecsLogCandidatePurpose {
+		if len(rows) != 1 || rows[0].ID != 1 || rows[0].Version != 1 || rows[0].Audience != m.cfg.ECSLogAudience || rows[0].Purpose != ecsLogPurpose(m.cfg) {
 			return errors.New("ownership store identity changed or missing")
 		}
 		return nil
@@ -100,11 +106,11 @@ func (m *Monitor) initECSLogOwnership(db *gorm.DB) error {
 	return err
 }
 
-func ecsLogOwnershipFor(source ECSLogSource, audience, publicKey string) ECSLogOwnership {
+func ecsLogOwnershipFor(source ECSLogSource, audience, publicKey, purpose string) ECSLogOwnership {
 	hash := sha256.Sum256([]byte(publicKey))
 	return ECSLogOwnership{TaskARN: source.TaskARN, Container: source.Container, Lane: source.Lane, ServiceARN: source.ServiceARN, TaskDefinitionARN: source.TaskDefinitionARN,
 		TaskRoleARN: source.TaskRoleARN, RuntimeID: source.RuntimeID, Node: source.Node, Audience: audience,
-		PublicKeyHash: hex.EncodeToString(hash[:]), Purpose: ecsLogCandidatePurpose}
+		PublicKeyHash: hex.EncodeToString(hash[:]), Purpose: purpose}
 }
 
 func sameECSLogOwnership(a, b ECSLogOwnership) bool {
@@ -127,7 +133,7 @@ func (m *Monitor) claimECSLogOwnership(tx *gorm.DB, source ECSLogSource, publicK
 	if source.TaskDefinitionARN == "" {
 		return errors.New("verified task definition required for responsibility assignment")
 	}
-	want := ecsLogOwnershipFor(source, m.cfg.ECSLogAudience, publicKey)
+	want := ecsLogOwnershipFor(source, m.cfg.ECSLogAudience, publicKey, ecsLogPurpose(m.cfg))
 	owner, err := findECSLogOwnership(tx, source)
 	if err == nil {
 		if !sameECSLogOwnership(owner, want) {
@@ -168,7 +174,7 @@ func (m *Monitor) checkECSLogOwnership(ctx context.Context, source ECSLogSource)
 	if err != nil {
 		return err
 	}
-	if !sameECSLogOwnership(owner, ecsLogOwnershipFor(source, m.cfg.ECSLogAudience, source.PublicKey)) {
+	if !sameECSLogOwnership(owner, ecsLogOwnershipFor(source, m.cfg.ECSLogAudience, source.PublicKey, ecsLogPurpose(m.cfg))) {
 		return errECSLogResponsibilityMissing
 	}
 	return nil

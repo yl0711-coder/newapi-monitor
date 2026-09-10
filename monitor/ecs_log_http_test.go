@@ -219,6 +219,30 @@ func TestECSLogFourLanesMultiTaskRetryAndConflict(t *testing.T) {
 	}
 }
 
+func TestECSLogProductionScopeKeepsLegacyLightsailAndSeparatesTaskIdentity(t *testing.T) {
+	m := newECSLogTestMonitor(t)
+	m.cfg.ECSLogScope = ecsLogScopeProduction
+	m.cfg.ECSLogProductionEnabled = true
+	m.cfg.NginxAllowedNodes = []string{"legacy-lightsail"}
+	legacy := ecsLaneTestBody(t, "legacy-lightsail", "access", 1)
+	if w := postNginx(t, m, string(legacy), m.cfg.IngestToken); w.Code != 200 {
+		t.Fatalf("legacy Lightsail ingest changed: %d %s", w.Code, w.Body.String())
+	}
+	for _, task := range []string{strings.Repeat("a", 32), strings.Repeat("b", 32)} {
+		source, key := registerECSTestSource(t, m, task, "access")
+		if source.Node == "legacy-lightsail" {
+			t.Fatal("verified ECS identity overlapped static node")
+		}
+		if w := postSignedECS(m, source, key, ecsLaneTestBody(t, source.Node, "access", 1), nil); w.Code != 200 {
+			t.Fatalf("verified ECS ingest: %d %s", w.Code, w.Body.String())
+		}
+	}
+	var batches int64
+	if err := m.storeDB.Model(&NginxIngestBatch{}).Count(&batches).Error; err != nil || batches != 3 {
+		t.Fatalf("mixed source batches: %d %v", batches, err)
+	}
+}
+
 func TestECSLogSignatureFailClosed(t *testing.T) {
 	m := newECSLogTestMonitor(t)
 	source, key := registerECSTestSource(t, m, strings.Repeat("a", 32), "reject")

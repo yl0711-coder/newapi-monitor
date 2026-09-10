@@ -505,7 +505,7 @@ func (m *Monitor) checkIngest(c *gin.Context) bool {
 	// The isolated receiver must not mix legacy bearer-token samples with
 	// task-authenticated evidence, even if general routes are mounted by mistake.
 	// Normal Monitor/Lightsail ingestion is unchanged while ECS is disabled.
-	if m.cfg.ECSLogEnabled && m.cfg.ECSLogScope == "isolated" {
+	if m.cfg.ECSLogEnabled && m.cfg.ECSLogScope == ecsLogScopeIsolated {
 		c.JSON(http.StatusForbidden, gin.H{"error": "isolated ECS receiver requires task-authenticated ingestion"})
 		return false
 	}

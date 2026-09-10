@@ -44,7 +44,7 @@ func newECSArchiveReplayer(m *Monitor, prefix string) *ecsArchiveReplayer {
 // lease expiry, but cannot resurrect, renew, or declare a source complete.
 func (r *ecsArchiveReplayer) validate(ctx context.Context, o ecsarchive.Object, now time.Time) (ECSLogSource, ecsarchive.Envelope, int) {
 	var source ECSLogSource
-	if !r.m.cfg.ECSLogEnabled || r.m.cfg.ECSLogScope != "isolated" {
+	if !ecsLogRuntimeEnabled(r.m.cfg) {
 		return source, ecsarchive.Envelope{}, 503
 	}
 	owner, node, lane, hash, err := ecsarchive.ParseKey(r.prefix, o.Key)
@@ -62,7 +62,7 @@ func (r *ecsArchiveReplayer) validate(ctx context.Context, o ecsarchive.Object, 
 	policy, allowed := r.m.ecsLogPolicy(source.ServiceARN, source.Container, lane)
 	key, keyErr := base64.StdEncoding.DecodeString(source.PublicKey)
 	task := source.TaskARN[strings.LastIndex(source.TaskARN, "/")+1:]
-	if !allowed || source.TaskRoleARN != policy.TaskRoleARN || source.Revoked || ecsarchive.OwnerTask(owner) != task || keyErr != nil || !e.Verify(ed25519.PublicKey(key)) {
+	if !allowed || !ecsLogTaskDefinitionAllowed(policy, source.TaskDefinitionARN) || source.TaskRoleARN != policy.TaskRoleARN || source.Revoked || ecsarchive.OwnerTask(owner) != task || keyErr != nil || !e.Verify(ed25519.PublicKey(key)) {
 		return source, e, 403
 	}
 	if err := r.m.checkECSLogOwnership(ctx, source); err != nil {

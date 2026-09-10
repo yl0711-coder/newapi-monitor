@@ -11,19 +11,20 @@ import (
 
 // Settings 是监控服务的独立配置,全部从环境变量读取——不依赖任何外部 config 包。
 type Settings struct {
-	ECSLogEnabled          bool // Default-off, isolated collection acceptance only.
-	ECSLogOwnershipEnabled bool // Explicit opt-in for a fresh isolated responsibility ledger.
-	ECSLogScope            string
-	ECSLogAudience         string
-	ECSLogBridgeToken      string
-	ECSLogPoliciesJSON     string
-	ECSArchiveEnabled      bool
-	ECSArchiveBucket       string
-	ECSArchivePrefix       string
-	ECSArchiveAccount      string
-	Addr                   string // 监听地址,默认 :8090
-	ProdDSN                string // NEWAPI_LOG_DSN:new-api 生产库【只读】DSN
-	StorePath              string // 本地采样库(sqlite)路径,默认 monitor.db
+	ECSLogEnabled           bool // Default-off authenticated ECS collection receiver.
+	ECSLogProductionEnabled bool // Second, explicit gate required when ECSLogScope=production.
+	ECSLogOwnershipEnabled  bool // Explicit opt-in for the task/container/lane responsibility ledger.
+	ECSLogScope             string
+	ECSLogAudience          string
+	ECSLogBridgeToken       string
+	ECSLogPoliciesJSON      string
+	ECSArchiveEnabled       bool
+	ECSArchiveBucket        string
+	ECSArchivePrefix        string
+	ECSArchiveAccount       string
+	Addr                    string // 监听地址,默认 :8090
+	ProdDSN                 string // NEWAPI_LOG_DSN:new-api 生产库【只读】DSN
+	StorePath               string // 本地采样库(sqlite)路径,默认 monitor.db
 	// Monitor 本地 SQLite 是用量事实和运维历史的事实源。启动时始终
 	// 先做 quick_check；在线备份使用 SQLite 一致性快照，不直接拷贝 WAL 运行库。
 	StoreBackupEnabled       bool   // MONITOR_STORE_BACKUP_ENABLED，默认 true
@@ -300,6 +301,7 @@ type Settings struct {
 func LoadSettings() Settings {
 	return Settings{
 		ECSLogEnabled:                            env("MONITOR_ECS_LOG_ENABLED", "false") == "true",
+		ECSLogProductionEnabled:                  env("MONITOR_ECS_LOG_PRODUCTION_ENABLED", "false") == "true",
 		ECSLogOwnershipEnabled:                   env("MONITOR_ECS_LOG_OWNERSHIP_ENABLED", "false") == "true",
 		ECSLogScope:                              env("MONITOR_ECS_LOG_SCOPE", ""),
 		ECSLogAudience:                           env("MONITOR_ECS_LOG_AUDIENCE", ""),

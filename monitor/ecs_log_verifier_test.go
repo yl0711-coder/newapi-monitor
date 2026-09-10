@@ -14,10 +14,11 @@ import (
 
 func testECSLogPolicy() ECSLogPolicy {
 	return ECSLogPolicy{
-		ClusterARN:  "arn:aws:ecs:us-west-2:123456789012:cluster/fixture",
-		ServiceARN:  "arn:aws:ecs:us-west-2:123456789012:service/fixture/worker",
-		TaskRoleARN: "arn:aws:iam::123456789012:role/fixture-task",
-		Containers:  map[string][]string{"nginx": {"access", "error", "evidence", "reject"}},
+		ClusterARN:         "arn:aws:ecs:us-west-2:123456789012:cluster/fixture",
+		ServiceARN:         "arn:aws:ecs:us-west-2:123456789012:service/fixture/worker",
+		TaskRoleARN:        "arn:aws:iam::123456789012:role/fixture-task",
+		TaskDefinitionARNs: []string{"arn:aws:ecs:us-west-2:123456789012:task-definition/fixture:1"},
+		Containers:         map[string][]string{"nginx": {"access", "error", "evidence", "reject"}},
 	}
 }
 
@@ -88,6 +89,11 @@ func TestECSLogTaskVerifierRequiresAuthoritativeIdentity(t *testing.T) {
 		"definition-identity": func(f *ecsLogTaskFixture, _ *ecsLogRegistration) {
 			f.definition.TaskDefinition.TaskDefinitionArn = aws.String("other")
 		},
+		"definition-not-allowed": func(f *ecsLogTaskFixture, _ *ecsLogRegistration) {
+			arn := "arn:aws:ecs:us-west-2:123456789012:task-definition/fixture:2"
+			f.tasks.Tasks[0].TaskDefinitionArn = aws.String(arn)
+			f.definition.TaskDefinition.TaskDefinitionArn = aws.String(arn)
+		},
 		"empty": func(f *ecsLogTaskFixture, _ *ecsLogRegistration) { f.tasks = nil },
 		"partial": func(f *ecsLogTaskFixture, _ *ecsLogRegistration) {
 			f.tasks.Failures = []types.Failure{{Reason: aws.String("MISSING")}}
@@ -102,6 +108,61 @@ func TestECSLogTaskVerifierRequiresAuthoritativeIdentity(t *testing.T) {
 				t.Fatal("unverified identity accepted")
 			}
 		})
+	}
+}
+
+func TestECSLogProductionPolicyRequiresIndependentGateAndExactDefinition(t *testing.T) {
+	b, err := json.Marshal([]ECSLogPolicy{testECSLogPolicy()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	valid := Settings{ECSLogEnabled: true, ECSLogProductionEnabled: true, ECSLogOwnershipEnabled: true,
+		ECSLogScope: ecsLogScopeProduction, ECSLogAudience: "fixture-production-monitor",
+		ECSLogBridgeToken: strings.Repeat("b", 32), ECSLogPoliciesJSON: string(b), ECSArchiveEnabled: true,
+		ECSArchiveBucket: "fixture-production-archive", ECSArchivePrefix: "production/", ECSArchiveAccount: "123456789012",
+		AWSRegion: "us-west-2", NginxEnabled: true, NginxErrorEnabled: true, NginxEvidenceMode: "pilot"}
+	if _, err := parseECSLogPolicies(valid); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateECSArchiveSettings(valid); err != nil {
+		t.Fatal(err)
+	}
+	for name, mutate := range map[string]func(*Settings){
+		"second-gate": func(s *Settings) { s.ECSLogProductionEnabled = false },
+		"ownership":   func(s *Settings) { s.ECSLogOwnershipEnabled = false },
+		"archive":     func(s *Settings) { s.ECSArchiveEnabled = false },
+		"archive-scope": func(s *Settings) {
+			s.ECSArchivePrefix = "isolated/"
+		},
+		"allowlist": func(s *Settings) {
+			p := testECSLogPolicy()
+			p.TaskDefinitionARNs = nil
+			body, _ := json.Marshal([]ECSLogPolicy{p})
+			s.ECSLogPoliciesJSON = string(body)
+		},
+		"cross-account-definition": func(s *Settings) {
+			p := testECSLogPolicy()
+			p.TaskDefinitionARNs[0] = strings.Replace(p.TaskDefinitionARNs[0], "123456789012", "210987654321", 1)
+			body, _ := json.Marshal([]ECSLogPolicy{p})
+			s.ECSLogPoliciesJSON = string(body)
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			candidate := valid
+			mutate(&candidate)
+			policyErr := func() error {
+				if _, err := parseECSLogPolicies(candidate); err != nil {
+					return err
+				}
+				return validateECSArchiveSettings(candidate)
+			}()
+			if policyErr == nil {
+				t.Fatal("unsafe production policy/archive accepted")
+			}
+		})
+	}
+	if _, err := parseECSLogPolicies(Settings{ECSLogProductionEnabled: true}); err == nil {
+		t.Fatal("detached production gate accepted")
 	}
 }
 

@@ -72,6 +72,6 @@ func run() error {
 	if len(argv) > 0 && argv[0] == "--" {
 		argv = argv[1:]
 	}
-	slog.Info("isolated ECS collector agent started", "node", agent.Node(), "kind", c.Kind)
+	slog.Info("ECS collector agent started", "scope", c.Scope, "node", agent.Node(), "kind", c.Kind)
 	return agent.RunChild(ctx, argv)
 }

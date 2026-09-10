@@ -67,6 +67,7 @@ func TestECSLogHealthStoreFailureAndDisabledIsolation(t *testing.T) {
 		t.Fatalf("disabled path queried a missing store: %+v", h)
 	}
 	m.cfg.ECSLogEnabled = true
+	m.cfg.ECSLogScope = ecsLogScopeIsolated
 	if h := m.ecsLogHealth(context.Background(), now); h.Available || h.Status != "unavailable" {
 		t.Fatalf("registry failure converted into empty healthy list: %+v", h)
 	}

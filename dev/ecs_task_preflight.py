@@ -2,7 +2,7 @@
 
 Inputs must be complete CloudFormation Properties, NOT redacted snapshots or
 lower-camel-case DescribeTaskDefinition responses. No input values are printed.
-This verifies the isolated collector contract only; production scope stays shut.
+Production checks validate a proposal only; they do not enable or deploy it.
 """
 import argparse
 import json
@@ -11,13 +11,14 @@ from ecs_cutover_preflight import InvalidPlan, load_manifest, manifest_digest
 from ecs_task_contract import check_business_unchanged
 
 
-def check_plan(before, after, reviewed_initializer_sha256=None):
+def check_plan(before, after, reviewed_initializer_sha256=None, scope="isolated"):
     if type(before) is not dict or type(after) is not dict:
         raise ValueError("complete TaskDefinition Properties objects required")
     if "ContainerDefinitions" not in before or "ContainerDefinitions" not in after:
         raise ValueError("CloudFormation Properties required; AWS response conversion must be reviewed separately")
-    result = check_business_unchanged(before, after, reviewed_initializer_sha256=reviewed_initializer_sha256)
-    return {**result, "static_checks_passed": True, "contract_scope": "isolated",
+    result = check_business_unchanged(before, after, reviewed_initializer_sha256=reviewed_initializer_sha256,
+                                      scope=scope)
+    return {**result, "static_checks_passed": True, "contract_scope": scope,
             "authorization_verified": False, "baseline_sha256": manifest_digest(before),
             "proposal_sha256": manifest_digest(after),
             "remaining_gates": ["complete_current_source_definitions", "initializer_image_and_command_review",
@@ -31,9 +32,11 @@ def main(argv=None):
     parser.add_argument("--proposal", required=True)
     parser.add_argument("--reviewed-initializer-sha256",
                         help="fingerprint supplied from separate review, not calculated as implicit approval")
+    parser.add_argument("--scope", choices=("isolated", "production"), default="isolated")
     args = parser.parse_args(argv)
     try:
-        result = check_plan(load_manifest(args.baseline), load_manifest(args.proposal), args.reviewed_initializer_sha256)
+        result = check_plan(load_manifest(args.baseline), load_manifest(args.proposal),
+                            args.reviewed_initializer_sha256, args.scope)
     except (InvalidPlan, ValueError, TypeError, KeyError, OSError, RecursionError):
         # Configuration keys and values can contain credentials. Never echo an
         # exception raised while inspecting input, file paths, or either source.
