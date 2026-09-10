@@ -77,7 +77,7 @@ function dashboard(fetchImpl = () => {throw Error('network forbidden in renderer
     assert.ok(declaration, `production function ${name} must exist`);
     vm.runInContext(declaration[0], context);
   }
-  for (const name of ['esc', 'fmtAge', 'infraBadge', 'infraDot', 'countItem', 'fmtNum', 'fmtRate', 'fmtUSD', 'fmtTtft', 'fmtTok', 'fmtLat']) {
+  for (const name of ['esc', 'fmtAge', 'infraBadge', 'infraDot', 'countItem', 'fmtNum', 'fmtRate', 'fmtUSD', 'fmtTtft', 'fmtTok', 'fmtLat', 'clock']) {
     const declaration = page.match(new RegExp(`^const ${name}=.*$`, 'm'));
     assert.ok(declaration, `production formatter ${name} must exist`);
     vm.runInContext(declaration[0], context);
@@ -152,6 +152,38 @@ test('observed mode does not mask detected errors with a provisional-data notice
   context.renderBanner({view:'observed',sampling_active:true,summary:{total:10}});
   assert.match(html('bannerMain'),/实时观察/);
   assert.doesNotMatch(html('bannerMain'),/运行正常/);
+});
+
+test('model error attention does not relabel delivery-only warnings as request failures',()=>{
+  const {context,html}=dashboard();
+  for(const error_health of ['good',undefined]){
+    context.renderBanner({view:'observed',sampling_active:true,summary:{total:300},by_channel:[{
+      key:'1',label:'delivery-only',health:'warn',error_health,failed:0,anomaly:3,total:300
+    }]});
+    assert.doesNotMatch(html('bannerMain'),/1 项波动|1 项错误/);
+    assert.doesNotMatch(html('attnList'),/delivery-only/);
+  }
+  assert.doesNotMatch(source('page.html'),/自动禁用\/切流已介入/);
+});
+
+test('model error attention excludes anomaly minutes but retains real failures',()=>{
+  const {context,html}=dashboard();
+  vm.runInContext("const errText=()=>''; const expanded=new Set();",context);
+  context.renderBanner({view:'observed',sampling_active:true,summary:{total:100},by_channel:[{
+    key:'1',label:'actual-errors',health:'warn',error_health:'bad',failed:20,anomaly:1,total:100,
+    spark:[{ts:1800000000,success:0,failed:0,anomaly:1}]
+  }]});
+  assert.match(html('bannerMain'),/1 项错误/);
+  assert.match(html('attnList'),/actual-errors/);
+  assert.match(html('attnList'),/错误 20\/100/);
+  assert.doesNotMatch(html('attnList'),/<details/);
+  context.renderBanner({view:'observed',sampling_active:true,summary:{total:100},by_channel:[{
+    key:'1',label:'actual-errors',health:'warn',error_health:'bad',failed:20,anomaly:1,total:100,
+    spark:[{ts:1800000000,success:0,failed:0,anomaly:1},{ts:1800000060,success:0,failed:20,anomaly:0}]
+  }]});
+  assert.match(html('attnList'),/<details/);
+  assert.match(html('attnList'),/错误×20/);
+  assert.doesNotMatch(html('attnList'),/交付异常×/);
 });
 
 test('complete historical bills cannot conceal stopped or failed usage synchronization', () => {

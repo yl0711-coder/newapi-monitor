@@ -910,6 +910,7 @@ type Row struct {
 	ErrTimeout     int64       `json:"err_timeout"`
 	ErrOther       int64       `json:"err_other"`
 	Health         string      `json:"health"`
+	ErrorHealth    string      `json:"error_health"`  // 仅请求错误判级；Health 仍兼容异常成簇提示。
 	AnomalyBurst   bool        `json:"anomaly_burst"` // 异常成簇(连续/突增),需要关注
 	Spark          []TimePoint `json:"spark"`         // 该维度最近若干分钟桶的成功/异常/失败,供迷你趋势
 }

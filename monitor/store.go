@@ -1538,10 +1538,12 @@ func (a aggRow) fill(r *Row, windowSec float64) {
 	// 健康由【错误(type=5)】驱动——错误是重点,每条都关注。
 	// 异常(client_gone 等)不在此驱动色标;其"成簇"判定在 GetSnapshot 里按时间序列另行升级为关注。
 	r.Health = health(total, rate(typ2, total)) // 非错误率 = (成功+异常)/总
+	r.ErrorHealth = r.Health                    // 保留纯错误判级，后续异常成簇不得覆盖它。
 }
 
 // percentile 从直方图近似分位数。hist 各档非累计计数,档上界为 edges(长度比 hist 少 1),
-// 末档以观测到的 maxVal 收尾;桶内线性插值。单位由调用方决定(秒或毫秒)。
+// 所有桶均受观测 maxVal 约束，避免有限桶上界制造 P95 > MAX。
+// 桶内线性插值仍是近似值。单位由调用方决定(秒或毫秒)。
 func percentile(hist []int64, edges []int, maxVal int, p float64) float64 {
 	var total int64
 	for _, c := range hist {
@@ -1555,7 +1557,7 @@ func percentile(hist []int64, edges []int, maxVal int, p float64) float64 {
 	for i, c := range hist {
 		upper := float64(maxVal)
 		if i < len(edges) {
-			upper = float64(edges[i])
+			upper = min(float64(edges[i]), float64(maxVal))
 		}
 		if upper < lower {
 			upper = lower

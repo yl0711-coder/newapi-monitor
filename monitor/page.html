@@ -549,17 +549,17 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
 </div>
 
 <!-- 需要关注:错误与交付异常合成一块,内部分两组。
-     两者性质不同(错误=上游明确拒绝、已自动切流;交付异常=上游没报错但用户没拿到、需人工判断降权),
+     两者性质不同(错误=请求失败线索;交付异常=用户侧中断等线索),
      故分组标题分开写死,不要再合并成一个列表。 -->
 <div class="attn">
   <h3>⚠️ 需要关注<span class="muted" style="font-weight:400;font-size:12px">· 错误要处理,交付异常要观察</span></h3>
   <div id="attnStat" class="attn-stat"></div>
   <div class="attn-sec">
-    <div class="attn-sec-h"><span class="dot dot-r"></span> 错误 · 需处理<span class="muted">上游明确报错,自动禁用/切流已介入</span></div>
+    <div class="attn-sec-h"><span class="dot dot-r"></span> 错误 · 需处理<span class="muted">请求错误记录；需核查原因，本页不执行禁用或切流</span></div>
     <div class="attn-list" id="attnList"></div>
   </div>
   <div class="attn-sec" id="undelivSec" style="display:none">
-    <div class="attn-sec-h"><span class="dot dot-y"></span> 交付异常 · 需观察<span class="muted">上游没报错但用户没拿到;不自动禁用,供调权重参考</span></div>
+    <div class="attn-sec-h"><span class="dot dot-y"></span> 交付异常 · 需观察<span class="muted">日志中的交付异常线索，需结合请求核查；不自动禁用</span></div>
     <div class="attn-list" id="undelivList"></div>
   </div>
 </div>
@@ -1171,7 +1171,8 @@ function renderBanner(s){
   // migration is running. Treat a non-array value as an empty collection so
   // one incomplete snapshot cannot take down the whole model dashboard.
   const channels=Array.isArray(s.by_channel)?s.by_channel:[],models=Array.isArray(s.by_model)?s.by_model:[];
-  const probs=[...channels.map(r=>({...r,kind:'渠道'})),...models.map(r=>({...r,kind:'模型'}))];
+  const probs=[...channels.map(r=>({...r,kind:'渠道'})),...models.map(r=>({...r,kind:'模型'}))]
+    .map(r=>({...r,health:r.error_health||(r.failed===0?'good':r.health)}));
   const bad=probs.filter(r=>r.health==='bad'),warn=probs.filter(r=>r.health==='warn');
   const b=document.getElementById('banner'),m=document.getElementById('bannerMain');
   let cls,txt;
@@ -1220,13 +1221,14 @@ function renderBanner(s){
     // 本区只讲错误;交付异常有独立区域,不在这里混着显示。
     if(r.failed>0) w.push(`<b style="color:var(--red)">错误 ${r.failed}/${r.total}</b>${errText(r)?'('+errText(r)+')':''}`);
     w.push(`p95 ${fmtLat(r.p95)}`);
-    const span=problemSpan(r.spark); if(span) w.push(span);
+    const errorSpark=(r.spark||[]).map(p=>({...p,anomaly:0}));
+    const span=problemSpan(errorSpark); if(span) w.push(span);
     const dotc=r.health==='bad'?'dot-r':'dot-y', bc=r.health==='bad'?'badge-red':'badge-yellow';
     const summary=`<span class="dot ${dotc}"></span>
       <span class="who">${r.kind} ${esc(r.label)}</span>
       <span class="badge ${bc}">成功 ${fmtRate(r.success_rate)}</span>
       <span class="why">${w.join(' · ')}</span>`;
-    const detail=problemDetail(r.spark);
+    const detail=problemDetail(errorSpark);
     if(!detail) return `<div class="attn-item">${summary}</div>`;
     return `<details class="attn-item" data-k="${esc(r.label)}"${expanded.has(r.label)?' open':''}><summary>${summary}</summary><div class="attn-detail">${detail}</div></details>`;
   };
