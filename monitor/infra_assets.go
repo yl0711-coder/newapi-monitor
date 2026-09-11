@@ -167,15 +167,6 @@ func (m *Monitor) infraAssets(ctx context.Context) ([]InfraAsset, error) {
 	if len(assets) > infraAssetLimit {
 		return nil, errors.New("resource registry exceeds bounded view; administrative pagination required")
 	}
-	if m.cfg.InfraManagedAWSDisabled {
-		visible := assets[:0]
-		for _, asset := range assets {
-			if !managedAWSInfraResource(asset.Resource, asset.Kind, asset.Platform) {
-				visible = append(visible, asset)
-			}
-		}
-		assets = visible
-	}
 	return assets, nil
 }
 

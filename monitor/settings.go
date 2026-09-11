@@ -222,10 +222,6 @@ type Settings struct {
 	// RDS 与 ALB，并从各服务控制面和 CloudWatch 只读拉取。
 	// 默认【关】——关时完全不调 AWS、不影响模型监控与现网行为。
 	InfraEnabled bool // MONITOR_INFRA_ENABLED(=true 才启用主动采样/探测)
-	// InfraManagedAWSDisabled 将 ECS/Fargate、RDS 与 ALB 的基础设施监控
-	// 交给 CloudWatch。使用反向布尔值是为了让旧配置和测试中的零值继续
-	// 保持原行为；仅当 MONITOR_INFRA_MANAGED_AWS_ENABLED=false 时关闭。
-	InfraManagedAWSDisabled bool
 	// CapacityEnabled 只开放容量规划的本地读取页。它不启动 worker、
 	// 不访问 NewAPI/MySQL/Nginx/AWS，只联合展示已落盘的脱敏事实。
 	CapacityEnabled bool // MONITOR_CAPACITY_ENABLED，默认 false
@@ -420,7 +416,6 @@ func LoadSettings() Settings {
 		SiteName:                                 env("MONITOR_SITE_NAME", ""),
 		IngestToken:                              env("MONITOR_INGEST_TOKEN", ""),
 		InfraEnabled:                             env("MONITOR_INFRA_ENABLED", "") == "true",
-		InfraManagedAWSDisabled:                  env("MONITOR_INFRA_MANAGED_AWS_ENABLED", "true") == "false",
 		CapacityEnabled:                          env("MONITOR_CAPACITY_ENABLED", "false") == "true",
 		GroupGovernanceEnabled:                   env("MONITOR_GROUP_GOVERNANCE_ENABLED", "false") == "true",
 		GroupGovernanceSyncMinutes:               envInt("MONITOR_GROUP_GOVERNANCE_SYNC_MINUTES", 10),

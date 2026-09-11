@@ -158,20 +158,9 @@ func (m *Monitor) sampleInfra(ctx context.Context) {
 			slog.Info("infra Lightsail 采样完成", "targets", len(targets), "rows", len(rows))
 		}
 	}
-	// ECS/Fargate、RDS、ALB 可统一交给 CloudWatch。关闭托管资源采样时
-	// 仍保留 Lightsail、域名探活与源站锁检查，不改变业务采集链路。
-	if !m.cfg.InfraManagedAWSDisabled {
-		m.sampleManagedAWSInfra(cctx, time.Now().Unix()/60*60)
-	}
-}
-
-func managedAWSInfraResource(name, rtype, platform string) bool {
-	return strings.HasPrefix(name, "ecs/") || strings.HasPrefix(name, "rds/") ||
-		strings.HasPrefix(name, "alb/") ||
-		(strings.HasPrefix(name, "AWS 资源发现/") &&
-			!strings.Contains(name, "Lightsail/")) ||
-		rtype == "ecs_service" || platform == "ECS/Fargate" ||
-		platform == "RDS" || platform == "ALB"
+	// ECS/Fargate、RDS、ALB 使用 AWS 原生控制面/CloudWatch，无需在
+	// Fargate 任务里安装主机 agent；权限尚未补齐时只记录本轮失败。
+	m.sampleManagedAWSInfra(cctx, time.Now().Unix()/60*60)
 }
 
 func (m *Monitor) infraTargetsWithDiscovery(ctx context.Context, cl *lightsail.Client, bucket int64) ([]infraTarget, []InfraSample) {
@@ -593,9 +582,6 @@ func (m *Monitor) computeInfraSnapshot(nowUnix int64) InfraSnapshot {
 	}
 	byRes := map[string]*acc{}
 	for _, r := range latest {
-		if m.cfg.InfraManagedAWSDisabled && managedAWSInfraResource(r.Resource, r.RType, "") {
-			continue
-		}
 		asset, managed := assets[r.Resource]
 		if m.infraExcluded(r.Resource) || !visibleInfraAsset(asset, managed) || retired[r.Resource] && !managed || r.Metric == infraPresenceMetric {
 			continue
@@ -714,9 +700,6 @@ func (m *Monitor) computeInfraSnapshot(nowUnix int64) InfraSnapshot {
 	// Keep discovered/missing resources visible even before their first
 	// sample or after time-series retention. Their manual membership persists.
 	for name, a := range assets {
-		if m.cfg.InfraManagedAWSDisabled && managedAWSInfraResource(name, a.Kind, a.Platform) {
-			continue
-		}
 		if a.State != "active" || m.infraExcluded(name) {
 			continue
 		}
@@ -748,9 +731,6 @@ func (m *Monitor) computeInfraSnapshot(nowUnix int64) InfraSnapshot {
 	snap.Alerts = m.recentInfraAlerts(nowUnix, 20)
 	visibleAlerts := snap.Alerts[:0]
 	for _, alert := range snap.Alerts {
-		if m.cfg.InfraManagedAWSDisabled && managedAWSInfraResource(alert.Target, "", "") {
-			continue
-		}
 		hidden := false
 		for resource, asset := range assets {
 			if asset.State != "active" && (alert.Target == resource || strings.HasPrefix(alert.Target, resource+"/")) {

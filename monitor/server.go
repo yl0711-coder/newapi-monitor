@@ -627,10 +627,6 @@ func (m *Monitor) serveInfraSeries(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "resource required"})
 		return
 	}
-	if m.cfg.InfraManagedAWSDisabled && managedAWSInfraResource(resource, "", "") {
-		c.JSON(http.StatusNotFound, gin.H{"error": "resource is monitored in CloudWatch"})
-		return
-	}
 	if m.infraExcluded(resource) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "resource is not monitored"})
 		return
