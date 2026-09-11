@@ -18,7 +18,8 @@ func (m *Monitor) recentInfraAlerts(nowUnix int64, limit int) []InfraAlert {
 	// SQLite LIKE does not treat a backslash as an escape character unless an
 	// ESCAPE clause is supplied. Prefix matching with substr is explicit and
 	// cannot accidentally treat '_' as a wildcard.
-	if err := m.storeDB.Where("substr(kind,1,6) = ?", "infra_").Order("ts DESC").Limit(limit).Find(&logs).Error; err != nil {
+	query := m.monitorOwnedInfraAlertsQuery(m.storeDB)
+	if err := query.Where("substr(kind,1,6) = ?", "infra_").Order("ts DESC").Limit(limit).Find(&logs).Error; err != nil {
 		slog.Warn("读取服务端近期告警失败", "err", err)
 		return nil
 	}

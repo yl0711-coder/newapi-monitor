@@ -158,9 +158,11 @@ func (m *Monitor) sampleInfra(ctx context.Context) {
 			slog.Info("infra Lightsail 采样完成", "targets", len(targets), "rows", len(rows))
 		}
 	}
-	// ECS/Fargate、RDS、ALB 使用 AWS 原生控制面/CloudWatch，无需在
-	// Fargate 任务里安装主机 agent；权限尚未补齐时只记录本轮失败。
-	m.sampleManagedAWSInfra(cctx, time.Now().Unix()/60*60)
+	// ECS/Fargate、RDS、ALB 可统一交给 CloudWatch。关闭托管资源采样时
+	// 仍保留 Lightsail、域名探活与源站锁检查，不改变 ECS 日志链路。
+	if !m.cfg.InfraManagedAWSDisabled {
+		m.sampleManagedAWSInfra(cctx, time.Now().Unix()/60*60)
+	}
 }
 
 func (m *Monitor) infraTargetsWithDiscovery(ctx context.Context, cl *lightsail.Client, bucket int64) ([]infraTarget, []InfraSample) {
@@ -564,9 +566,10 @@ type InfraSnapshot struct {
 	LoadBalancers []InfraResource      `json:"load_balancers,omitempty"`
 	Groups        []InfraResourceGroup `json:"groups,omitempty"`
 	// Database/LB 保留给容量规划和旧前端；新代码应读取复数集合。
-	Database *InfraResource `json:"database"`
-	LB       *InfraResource `json:"lb"`
-	Alerts   []InfraAlert   `json:"alerts"`
+	Database   *InfraResource      `json:"database"`
+	LB         *InfraResource      `json:"lb"`
+	Alerts     []InfraAlert        `json:"alerts"`
+	ManagedAWS infraManagedAWSView `json:"managed_aws"`
 }
 
 // computeInfraSnapshot 从本地 infra_samples 聚合最新视图(零 AWS 调用,纯读本地)。
@@ -582,6 +585,9 @@ func (m *Monitor) computeInfraSnapshot(nowUnix int64) InfraSnapshot {
 	}
 	byRes := map[string]*acc{}
 	for _, r := range latest {
+		if !m.monitorOwnsInfraResource(r.Resource, r.RType, "") {
+			continue
+		}
 		asset, managed := assets[r.Resource]
 		if m.infraExcluded(r.Resource) || !visibleInfraAsset(asset, managed) || retired[r.Resource] && !managed || r.Metric == infraPresenceMetric {
 			continue
@@ -610,7 +616,7 @@ func (m *Monitor) computeInfraSnapshot(nowUnix int64) InfraSnapshot {
 		}
 	}
 
-	var snap InfraSnapshot
+	snap := InfraSnapshot{ManagedAWS: m.managedAWSInfraView()}
 	if registryErr != nil {
 		snap.RegistryError = "资源目录暂不可用，归档状态无法核验"
 	}
@@ -700,6 +706,9 @@ func (m *Monitor) computeInfraSnapshot(nowUnix int64) InfraSnapshot {
 	// Keep discovered/missing resources visible even before their first
 	// sample or after time-series retention. Their manual membership persists.
 	for name, a := range assets {
+		if !m.monitorOwnsInfraResource(name, a.Kind, a.Platform) {
+			continue
+		}
 		if a.State != "active" || m.infraExcluded(name) {
 			continue
 		}
@@ -731,6 +740,9 @@ func (m *Monitor) computeInfraSnapshot(nowUnix int64) InfraSnapshot {
 	snap.Alerts = m.recentInfraAlerts(nowUnix, 20)
 	visibleAlerts := snap.Alerts[:0]
 	for _, alert := range snap.Alerts {
+		if !m.monitorOwnsInfraResource(alert.Target, "", "") {
+			continue
+		}
 		hidden := false
 		for resource, asset := range assets {
 			if asset.State != "active" && (alert.Target == resource || strings.HasPrefix(alert.Target, resource+"/")) {

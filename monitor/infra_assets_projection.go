@@ -29,7 +29,8 @@ func (m *Monitor) infraAssetProjection() (map[string]InfraAsset, map[string]int,
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	var assets []InfraAsset
-	err := m.storeDB.WithContext(ctx).Where("kind <> ? AND state <> ?", "ecs_task", "linked").Order("first_seen DESC, id").Limit(infraAssetLimit + 1).Find(&assets).Error
+	query := m.monitorOwnedInfraAssetsQuery(m.storeDB.WithContext(ctx))
+	err := query.Where("kind <> ? AND state <> ?", "ecs_task", "linked").Order("first_seen DESC, id").Limit(infraAssetLimit + 1).Find(&assets).Error
 	if err != nil {
 		return nil, nil, err
 	}

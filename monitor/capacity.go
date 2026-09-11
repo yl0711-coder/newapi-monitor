@@ -1007,13 +1007,20 @@ func (m *Monitor) readCapacityInfra(ctx context.Context, from, to, bucket, now i
 	// 当前值由 components 快照提供。这个白名单把 7 天响应体限制在可预期范围。
 	allowed := []string{"cpu", "connections", "disk_queue", "resp_ms"}
 	marks := strings.TrimRight(strings.Repeat("?,", len(allowed)), ",")
+	managedFilter := ""
+	if m.cfg.InfraManagedAWSDisabled {
+		managedFilter = ` AND rtype <> 'ecs_service'
+			AND resource NOT LIKE 'ecs/%'
+			AND resource NOT LIKE 'rds/%'
+			AND resource NOT LIKE 'alb/%'`
+	}
 	args := []any{bucket, bucket, from, to}
 	for _, v := range allowed {
 		args = append(args, v)
 	}
 	var rows []capacityInfraRow
 	err := m.storeDB.WithContext(ctx).Raw(`SELECT (bucket_ts / ?) * ? ts, resource, rtype, metric, AVG(value) value
-		FROM infra_samples WHERE bucket_ts >= ? AND bucket_ts < ? AND metric IN (`+marks+`)
+		FROM infra_samples WHERE bucket_ts >= ? AND bucket_ts < ? AND metric IN (`+marks+`)`+managedFilter+`
 		GROUP BY ts,resource,rtype,metric ORDER BY ts,resource,metric`, args...).Scan(&rows).Error
 	var watermark int64
 	out := make([]capacityInfraPoint, 0, len(rows))
@@ -1026,9 +1033,12 @@ func (m *Monitor) readCapacityInfra(ctx context.Context, from, to, bucket, now i
 			watermarkArgs = append(watermarkArgs, v)
 		}
 		_ = m.storeDB.WithContext(ctx).Raw(`SELECT COALESCE(MAX(bucket_ts),0) FROM infra_samples
-			WHERE bucket_ts >= ? AND bucket_ts < ? AND metric IN (`+marks+`)`, watermarkArgs...).Scan(&watermark).Error
+			WHERE bucket_ts >= ? AND bucket_ts < ? AND metric IN (`+marks+`)`+managedFilter, watermarkArgs...).Scan(&watermark).Error
 	}
 	note := "资源曲线与流量同轴用于相关性观察，不声称因果；日志事实暂无服务节点维度。"
+	if m.cfg.InfraManagedAWSDisabled {
+		note = "仅展示 Monitor 负责的 Lightsail 资源曲线；AWS 托管资源由 CloudWatch 统一监控。"
+	}
 	if err != nil {
 		note = "基础设施本地事实不可用；不影响业务 RPM/TPM。"
 	}

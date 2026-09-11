@@ -631,6 +631,15 @@ func (m *Monitor) serveInfraSeries(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "resource is not monitored"})
 		return
 	}
+	delegated, err := m.delegatedManagedAWSResource(c.Request.Context(), resource)
+	if err != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "resource registry unavailable"})
+		return
+	}
+	if delegated {
+		c.JSON(http.StatusGone, gin.H{"error": "managed AWS resource metrics are delegated to CloudWatch", "managed_aws": m.managedAWSInfraView()})
+		return
+	}
 	assets, incarnations, registryErr := m.infraAssetProjection()
 	if registryErr != nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "resource registry unavailable"})
