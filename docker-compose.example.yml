@@ -91,6 +91,10 @@ services:
       - MONITOR_STABILITY_AUTO_REPAIR=true
       # 数千小时的分类迁移只能在完成 2h/24h 维护窗 pilot 后显式开启。
       - MONITOR_STABILITY_CLASSIFICATION_MIGRATION_ENABLED=false
+      # 首次发布保持 true；CloudWatch 验收后改 false，只停止 ECS/RDS/ALB 指标与告警。
+      # Lightsail、域名探活和独立 ECS 日志采集链路不受影响。
+      - MONITOR_INFRA_MANAGED_AWS_ENABLED=${MONITOR_INFRA_MANAGED_AWS_ENABLED:-true}
+      - MONITOR_INFRA_MANAGED_AWS_DASHBOARD_URL=${MONITOR_INFRA_MANAGED_AWS_DASHBOARD_URL:-}
       # 可选:
       # Nginx 入口旁路默认保持关闭；两个节点的脱敏日志和采集器验收后再同时取消下列注释。
       # - MONITOR_INGEST_TOKEN=${MONITOR_INGEST_TOKEN:?set in .env}
