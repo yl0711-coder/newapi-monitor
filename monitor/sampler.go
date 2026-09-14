@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -169,6 +170,7 @@ func (m *Monitor) loop(ctx context.Context, interval time.Duration) {
 	var nextProblemSample int64
 	var nextStabilityRollup int64
 	var nextMetricFinalize int64
+	var nextUserDirectorySync int64
 	for {
 		select {
 		case <-ctx.Done():
@@ -187,6 +189,12 @@ func (m *Monitor) loop(ctx context.Context, interval time.Duration) {
 				}
 				_ = m.refreshChannelsContext(ctx) // 每周期同步渠道开关；与来源 epoch 一起取消
 				m.refreshSelectable()             // 每周期重算"可选(分组,模型)对",监控只统计用户能选到的模型
+				// 用户名缓存只是展示增强：每 10 分钟异步走低优先来源槽，
+				// 不阻塞主采样，也不与既有后台来源任务并发。
+				if now >= nextUserDirectorySync {
+					m.startUserDirectorySync(ctx)
+					nextUserDirectorySync = now + 600
+				}
 			}
 			if m.cfg.StabilityEnabled {
 				// 稳定性是历史报表而非秒级看板：每 5 分钟重算最近两小时已足够
@@ -1070,6 +1078,42 @@ GROUP BY bucket, token_name`
 // refreshChannels 刷新渠道 id->name 映射,并把渠道健康快照(类型/状态/分组/模型)写入本地库,
 // 供对外看板派生"无可用渠道"。低频、失败保留旧值。仅读非密字段(无 key/凭证)。
 func (m *Monitor) refreshChannels() { _ = m.refreshChannelsContext(context.Background()) }
+
+func (m *Monitor) logChainChannelSyncEvery() time.Duration {
+	if m.cfg.logChainChannelSyncInterval > 0 {
+		return m.cfg.logChainChannelSyncInterval
+	}
+	return 10 * time.Minute
+}
+
+// startLogChainChannelSync 是最小权限客户排障模式唯一的后台来源任务。
+// 只复用 channels 查询刷新本地快照，不启动 logs 聚合、用户/令牌同步或 Usage Facts。
+func (m *Monitor) startLogChainChannelSync(ctx context.Context) {
+	syncNow := func() bool {
+		if err := m.refreshChannelsContext(ctx); err != nil {
+			if ctx.Err() == nil && !errors.Is(err, errSourceNotReady) {
+				slog.Warn("客户排障渠道快照同步失败", "err", err)
+			}
+			return false
+		}
+		return true
+	}
+	if !syncNow() && ctx.Err() != nil {
+		return
+	}
+	ticker := time.NewTicker(m.logChainChannelSyncEvery())
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if !syncNow() && ctx.Err() != nil {
+				return
+			}
+		}
+	}
+}
 
 func (m *Monitor) refreshChannelsContext(parent context.Context) error {
 	if m.prodDB == nil {

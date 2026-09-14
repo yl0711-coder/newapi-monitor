@@ -46,7 +46,12 @@ type Settings struct {
 	// 来源 worker 与 Web 进程分离：MySQL 短暂不可达时仍可从
 	// SQLite 服务已发布数据。生产默认开启 worker，并通过 MySQL
 	// advisory lock 保证同一来源只有一个实例采集。
-	SourceWorkerEnabled bool   // MONITOR_SOURCE_WORKER_ENABLED，默认 true
+	SourceWorkerEnabled bool // MONITOR_SOURCE_WORKER_ENABLED，默认 true
+	// LogChainOnlySource 仅供 8204 这类客户排障验收环境：来源账号只需读取
+	// logs/channels，不启动完整采样、用户/令牌同步或 Usage Facts；仅低频刷新
+	// channels 快照供客户排障补全渠道名和上游域名。
+	// 生产环境默认 false，仍执行完整五表预检。
+	LogChainOnlySource  bool   // MONITOR_LOGCHAIN_ONLY_SOURCE，默认 false
 	SourceLeaseRequired bool   // MONITOR_SOURCE_LEASE_REQUIRED，默认 true
 	SourceLeaseName     string // MONITOR_SOURCE_LEASE_NAME，默认 newapi-monitor-source-worker-v1
 	SampleSeconds       int    // 采样间隔秒,默认 60
@@ -59,6 +64,10 @@ type Settings struct {
 	StabilityQueryMaxDays     int  // MONITOR_STABILITY_QUERY_MAX_DAYS,默认 90,页面最大查询范围
 	StabilityRetentionDays    int  // MONITOR_STABILITY_RETENTION_DAYS,默认 181,至少覆盖两个最大查询周期
 	StabilityProblemSampleSec int  // MONITOR_STABILITY_PROBLEM_SAMPLE_SECONDS,默认 300
+	// StabilityProblemSourceEnabled 是 logchain-only 验收环境的独立只读 lane。
+	// 它只读取生产 logs(type=5) 并写 Monitor 本地 SQLite，不会开启完整 source worker。
+	StabilityProblemSourceEnabled       bool // MONITOR_STABILITY_PROBLEM_SOURCE_ENABLED，默认 false
+	StabilityProblemSourceLookbackHours int  // MONITOR_STABILITY_PROBLEM_SOURCE_LOOKBACK_HOURS，默认 24，范围 1～168
 	// 长期小时数据补数直接聚合生产 logs 的单个小时，不写分钟表。查询始终串行，
 	// 片间延迟和来源占用率共同给主站数据库让路。分类规则升级产生的大范围
 	// 缺口只能通过显式 migration 开关自动创建持久任务，不能随普通修洞静默启动。
@@ -290,16 +299,17 @@ type Settings struct {
 	// 以下字段只用于包内单元测试注入可控时钟/连接。
 	// LoadSettings 会显式标记 lifecycle 已配置；直接 Settings{}
 	// 保持历史测试语义（worker 开、lease 关）。
-	sourceLifecycleConfigured bool
-	sourceOpen                func(string) (*sql.DB, error)
-	sourceProbe               func(context.Context, *sql.DB) error
-	sourceAcquireLease        func(context.Context, *sql.DB, string) (sourceLeaseHandle, bool, error)
-	sourceRetryDelay          func(int) time.Duration
-	sourceCheckInterval       time.Duration
-	sourcePreflightInterval   time.Duration
-	sourceDrainTimeout        time.Duration
-	localProbeInterval        time.Duration
-	sourceWorkerStart         func(context.Context, *Monitor)
+	sourceLifecycleConfigured   bool
+	sourceOpen                  func(string) (*sql.DB, error)
+	sourceProbe                 func(context.Context, *sql.DB) error
+	sourceAcquireLease          func(context.Context, *sql.DB, string) (sourceLeaseHandle, bool, error)
+	sourceRetryDelay            func(int) time.Duration
+	sourceCheckInterval         time.Duration
+	sourcePreflightInterval     time.Duration
+	sourceDrainTimeout          time.Duration
+	localProbeInterval          time.Duration
+	logChainChannelSyncInterval time.Duration
+	sourceWorkerStart           func(context.Context, *Monitor)
 }
 
 // LoadSettings 从环境变量装载配置(可配合 .env)。
@@ -328,6 +338,7 @@ func LoadSettings() Settings {
 		UpstreamDiagnosticsLocalEnabled:          env("MONITOR_UPSTREAM_DIAGNOSTICS_LOCAL_ENABLED", "false") == "true",
 		LocalAuthBypass:                          env("MONITOR_LOCAL_AUTH_BYPASS", "false") == "true",
 		SourceWorkerEnabled:                      env("MONITOR_SOURCE_WORKER_ENABLED", "true") == "true",
+		LogChainOnlySource:                       env("MONITOR_LOGCHAIN_ONLY_SOURCE", "false") == "true",
 		SourceLeaseRequired:                      env("MONITOR_SOURCE_LEASE_REQUIRED", "true") == "true",
 		SourceLeaseName:                          strings.TrimSpace(env("MONITOR_SOURCE_LEASE_NAME", "newapi-monitor-source-worker-v1")),
 		sourceLifecycleConfigured:                true,
@@ -339,6 +350,8 @@ func LoadSettings() Settings {
 		StabilityQueryMaxDays:                    envInt("MONITOR_STABILITY_QUERY_MAX_DAYS", 90),
 		StabilityRetentionDays:                   envInt("MONITOR_STABILITY_RETENTION_DAYS", 181),
 		StabilityProblemSampleSec:                envInt("MONITOR_STABILITY_PROBLEM_SAMPLE_SECONDS", 300),
+		StabilityProblemSourceEnabled:            env("MONITOR_STABILITY_PROBLEM_SOURCE_ENABLED", "false") == "true",
+		StabilityProblemSourceLookbackHours:      envInt("MONITOR_STABILITY_PROBLEM_SOURCE_LOOKBACK_HOURS", 24),
 		BackgroundSourceMinStartIntervalMS:       envInt("MONITOR_BACKGROUND_SOURCE_MIN_START_INTERVAL_MS", 2000),
 		StabilityBackfillDelayMS:                 envInt("MONITOR_STABILITY_BACKFILL_DELAY_MS", 2000),
 		StabilityBackfillTimeoutSec:              envInt("MONITOR_STABILITY_BACKFILL_TIMEOUT_SECONDS", 20),

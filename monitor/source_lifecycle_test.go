@@ -538,6 +538,125 @@ func TestSourcePreflightRequiresUserRegistrationTime(t *testing.T) {
 	t.Fatal("users preflight query missing")
 }
 
+func TestSourcePreflightLogChainOnlyUsesGrantedTables(t *testing.T) {
+	queries := sourcePreflightQueriesForSettings(Settings{LogChainOnlySource: true})
+	if len(queries) != 2 || !strings.Contains(queries[0], "FROM logs") || !strings.Contains(queries[1], "FROM channels") {
+		t.Fatalf("logchain-only preflight=%v, want logs/channels only", queries)
+	}
+	for _, query := range queries {
+		for _, forbidden := range []string{"FROM users", "FROM tokens", "FROM options"} {
+			if strings.Contains(query, forbidden) {
+				t.Fatalf("logchain-only preflight still requires %s: %s", forbidden, query)
+			}
+		}
+	}
+	cfg := Settings{LogChainOnlySource: true, SourceWorkerEnabled: true, sourceLifecycleConfigured: true}
+	if cfg.sourceWorkerIsEnabled() {
+		t.Fatal("logchain-only mode started full background source worker")
+	}
+	if cfg.StabilityProblemSourceEnabled {
+		t.Fatal("problem source lane must remain opt-in")
+	}
+	cfg.StabilityEnabled = true
+	cfg.StabilityProblemSourceEnabled = true
+	cfg.StabilityProblemSourceLookbackHours = 24
+	if cfg.sourceWorkerIsEnabled() || cfg.sourceLeaseIsRequired() {
+		t.Fatal("problem source lane must not re-enable full worker or lease")
+	}
+	if err := validateStabilityProblemSourceSettings(cfg); err != nil {
+		t.Fatalf("valid logchain-only problem lane rejected: %v", err)
+	}
+	if !cfg.sourceSupervisorIsEnabled() {
+		t.Fatal("logchain-only mode must supervise the source connection for channel refresh")
+	}
+	if cfg.sourceLeaseIsRequired() {
+		t.Fatal("logchain-only channel refresh must not claim the full source-worker lease")
+	}
+}
+
+func TestLogChainOnlyChannelSyncRefreshesAuthoritativeSnapshot(t *testing.T) {
+	m := newTestMonitor(t)
+	prod, err := sql.Open("sqlite", filepath.Join(t.TempDir(), "prod.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer prod.Close()
+	if _, err := prod.Exec(`CREATE TABLE channels (id INTEGER PRIMARY KEY, name TEXT, type INTEGER, status INTEGER, "group" TEXT, models TEXT, base_url TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := prod.Exec(`INSERT INTO channels VALUES (43,'route-old',1,1,'default','gpt-5','https://api.example.com/v1')`); err != nil {
+		t.Fatal(err)
+	}
+	m.prodDB = prod
+	m.cfg.LogChainOnlySource = true
+	m.cfg.sourceLifecycleConfigured = true
+	m.cfg.logChainChannelSyncInterval = 20 * time.Millisecond
+	m.sourceLifecycleInitialized.Store(true)
+	m.setSourceState(sourceStateReady)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); m.startLogChainChannelSync(ctx) }()
+	waitSnap := func(want string, deleted bool) {
+		t.Helper()
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) {
+			var snap ChannelSnap
+			err := m.storeDB.First(&snap, "id = ?", 43).Error
+			if err == nil && snap.Name == want && (snap.DeletedAt > 0) == deleted {
+				return
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		t.Fatalf("channel 43 did not reach name=%q deleted=%v", want, deleted)
+	}
+	waitSnap("route-old", false)
+	if _, err := prod.Exec(`UPDATE channels SET name='route-new' WHERE id=43`); err != nil {
+		t.Fatal(err)
+	}
+	waitSnap("route-new", false)
+	if _, err := prod.Exec(`DELETE FROM channels WHERE id=43`); err != nil {
+		t.Fatal(err)
+	}
+	waitSnap("route-new", true)
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("channel-only worker did not stop after cancellation")
+	}
+}
+
+func TestLogChainOnlyProblemSourceEpochRunsWithoutFullWorker(t *testing.T) {
+	m := newStabilityTestMonitor(t)
+	m.prodDB = newFakeProdDB(t)
+	m.cfg.LogChainOnlySource = true
+	m.cfg.StabilityProblemSourceEnabled = true
+	m.cfg.StabilityProblemSourceLookbackHours = 24
+	m.cfg.StabilityProblemSampleSec = 60
+	m.cfg.BackgroundSourceMinStartIntervalMS = -1
+	m.cfg.StabilityBackfillDelayMS = -1
+	m.cfg.StabilityBackfillSourceDutyPercent = 100
+	m.cfg.logChainChannelSyncInterval = time.Hour
+	m.sourceLifecycleInitialized.Store(true)
+	m.setSourceState(sourceStateReady)
+
+	ctx, cancel, group := newSourceEpoch(context.Background())
+	m.startSourceEpoch(ctx, group)
+	lifecycleEventually(t, 2*time.Second, m.problemSourceRunning.Load, "problem source lane did not start")
+	ready, _ := m.readyStatus(time.Now())
+	status := ready.Source
+	if !status.ProblemSourceEnabled || !status.ProblemSourceRunning || status.WorkerEnabled || status.WorkerRunning {
+		t.Fatalf("problem lane was confused with full worker: %+v", status)
+	}
+	cancel()
+	if drained, _ := group.SealAndWait(2 * time.Second); !drained {
+		t.Fatal("logchain-only problem source lane did not drain")
+	}
+	if m.problemSourceRunning.Load() {
+		t.Fatal("problem source running state survived epoch cancellation")
+	}
+}
+
 func TestSourcePreflightRequiresFullHistoryBoundaryIndexOnlyForOnlineWorker(t *testing.T) {
 	base := sourcePreflightQueriesForSettings(Settings{})
 	for _, query := range base {

@@ -99,6 +99,8 @@ type StabilityRejectHour struct {
 	Reason string `gorm:"primaryKey;size:64"`
 	Model  string `gorm:"primaryKey;size:128;index:idx_stability_reject_model_hour,priority:1"`
 	Grp    string `gorm:"primaryKey;size:64;column:grp;index:idx_stability_reject_group_hour,priority:1"`
+	// UserID 同分钟表:必须进主键,否则同小时多客户会被并成一行。
+	UserID int64 `gorm:"primaryKey;autoIncrement:false;column:user_id"`
 	Count  int64
 }
 
@@ -306,11 +308,11 @@ func (m *Monitor) rollupStabilityHours(sinceTs int64) error {
 }
 
 func (m *Monitor) rollupStabilityRejections(sinceTs int64) error {
-	return m.storeDB.Exec(`INSERT INTO stability_reject_hours (hour_ts, node, reason, model, grp, count)
-		SELECT (bucket_ts/3600)*3600 AS hour_ts, node, reason, model, grp, SUM(count)
+	return m.storeDB.Exec(`INSERT INTO stability_reject_hours (hour_ts, node, reason, model, grp, user_id, count)
+		SELECT (bucket_ts/3600)*3600 AS hour_ts, node, reason, model, grp, user_id, SUM(count)
 		FROM rejection_samples WHERE bucket_ts >= ?
-		GROUP BY hour_ts, node, reason, model, grp
-		ON CONFLICT(hour_ts, node, reason, model, grp) DO UPDATE SET count=excluded.count`, sinceTs).Error
+		GROUP BY hour_ts, node, reason, model, grp, user_id
+		ON CONFLICT(hour_ts, node, reason, model, grp, user_id) DO UPDATE SET count=excluded.count`, sinceTs).Error
 }
 
 func (m *Monitor) upsertStabilityProblems(rows []StabilityProblemSample) error {

@@ -265,7 +265,12 @@ type RejectionSample struct {
 	Reason   string `gorm:"primaryKey;size:64"`  // no_available_channel 等
 	Model    string `gorm:"primaryKey;size:128"` // 被拒模型
 	Grp      string `gorm:"primaryKey;size:64;column:grp"`
-	Count    int64
+	// UserID 是被拒客户。★ 必须进主键 ★
+	// 入库是按主键累加(count + excluded.count)。不进主键时,
+	// 同一分钟同一错误的多个客户会被并成一行,user_id 只剩最后写入的那个,
+	// 错误就会对应到错的客户。0 = 采集器未上报或未鉴权(无效令牌)。
+	UserID int64 `gorm:"primaryKey;autoIncrement:false;column:user_id"`
+	Count  int64
 }
 
 // RejectionIngestBatch 是前置拒绝采集的幂等台账。同一节点的同一批次只会
@@ -903,6 +908,11 @@ func (m *Monitor) openStore(path string) error {
 	if err := migrateChannelUpstreamErrorLogEventKey(db); err != nil {
 		return fmt.Errorf("上游错误日志事件键迁移失败: %w", err)
 	}
+	// 同上：前置拒绝两张表把 user_id 加进主键，AutoMigrate 不会重建旧表的
+	// 主键约束，不先重建则第一次前置拒绝入库就报 ON CONFLICT 无匹配约束。
+	if err := migrateRejectionUserIDPrimaryKey(db); err != nil {
+		return err
+	}
 	if err := db.AutoMigrate(
 		&ECSLogSource{}, &ECSLogDiscovery{}, &ECSLogLeaseWindow{}, &ECSLogArchiveReceipt{}, &ECSLogArchiveScan{},
 		&AICodeWithRecordCheckpoint{}, &AICodeWithRecordSeen{},
@@ -918,7 +928,7 @@ func (m *Monitor) openStore(path string) error {
 		&ChannelEconomicsHourPublication{}, &ChannelEconomicsHourCurrent{}, &ChannelEconomicsHourManifestPublication{}, &ChannelEconomicsHourManifestCurrent{}, &ChannelEconomicsGlobalHourFact{}, &ChannelEconomicsDirtyHour{},
 		&InfraSample{}, &HostContainerSnapshot{}, &InfraAsset{}, &InfraAssetAudit{}, &InfraAssetScope{}, &NginxMinuteSample{}, &NginxIngestBatch{}, &NginxSourceState{},
 		&NginxErrorMinuteSample{}, &NginxErrorIngestBatch{}, &NginxErrorSourceState{},
-		&AlertConfig{}, &AlertLog{}, &TrackedUser{}, &CustomerGroup{}, &UsageMemberControl{}, &UsageMemberAudit{}, &UsageMemberControlMigration{}, &FollowUpLog{}, &UsageSettings{},
+		&AlertConfig{}, &AlertLog{}, &TrackedUser{}, &CustomerGroup{}, &UsageMemberControl{}, &UsageMemberAudit{}, &UsageMemberControlMigration{}, &FollowUpLog{}, &UsageSettings{}, &UserDirectoryEntry{},
 		&GroupGovernanceState{}, &GroupGovernanceGroup{}, &GroupGovernanceUser{},
 	); err != nil {
 		return fmt.Errorf("表迁移失败: %w", err)
@@ -1346,7 +1356,7 @@ func upsertRejectionsDB(db *gorm.DB, rows []RejectionSample) error {
 	}
 	return db.Clauses(clause.OnConflict{
 		Columns: []clause.Column{
-			{Name: "bucket_ts"}, {Name: "node"}, {Name: "reason"}, {Name: "model"}, {Name: "grp"},
+			{Name: "bucket_ts"}, {Name: "node"}, {Name: "reason"}, {Name: "model"}, {Name: "grp"}, {Name: "user_id"},
 		},
 		DoUpdates: clause.Assignments(map[string]interface{}{
 			"count": gorm.Expr("rejection_samples.count + excluded.count"),
@@ -1363,6 +1373,9 @@ func rejectionBatchPayloadHash(rows []RejectionSample) string {
 		if a.BucketTs != b.BucketTs {
 			return a.BucketTs < b.BucketTs
 		}
+		if a.Node != b.Node {
+			return a.Node < b.Node
+		}
 		if a.Reason != b.Reason {
 			return a.Reason < b.Reason
 		}
@@ -1371,6 +1384,9 @@ func rejectionBatchPayloadHash(rows []RejectionSample) string {
 		}
 		if a.Grp != b.Grp {
 			return a.Grp < b.Grp
+		}
+		if a.UserID != b.UserID {
+			return a.UserID < b.UserID
 		}
 		return a.Count < b.Count
 	})

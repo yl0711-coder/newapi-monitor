@@ -2,6 +2,7 @@ package monitor
 
 import (
 	"bytes"
+	"encoding/json"
 	"encoding/pem"
 	"io"
 	"net/http"
@@ -99,9 +100,17 @@ func TestRejectCollectorProcessRestartAgainstRealMonitor(t *testing.T) {
 	if len(attempts) != 2 || !bytes.Equal(attempts[0], attempts[1]) {
 		t.Fatalf("process retry changed payload: %d attempts", len(attempts))
 	}
+	var payload rejectionV2Request
+	if err := json.Unmarshal(attempts[0], &payload); err != nil || len(payload.Samples) != 1 || payload.Samples[0].UserID != 7 {
+		t.Fatalf("collector dropped parsed user identity: payload=%+v err=%v", payload, err)
+	}
 	rows := m.storeRejections(time.Now().Unix() - 120)
 	if len(rows) != 1 || rows[0].Count != 1 {
 		t.Fatalf("real Monitor double counted: %+v", rows)
+	}
+	var stored RejectionSample
+	if err := m.storeDB.First(&stored).Error; err != nil || stored.UserID != 7 {
+		t.Fatalf("real Monitor lost collector identity: row=%+v err=%v", stored, err)
 	}
 	checkpoint, err := os.ReadFile(filepath.Join(dir, "state", "checkpoint.json"))
 	if err != nil || strings.Contains(string(checkpoint), "local-process-fixture") {
