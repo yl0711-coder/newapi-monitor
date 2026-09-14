@@ -234,14 +234,25 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
   .lc-toolbar{display:flex;justify-content:space-between;align-items:flex-end;gap:16px;flex-wrap:wrap;margin-bottom:14px}
   .lc-toolbar h2{margin:0 0 4px;font-size:18px}
   .lc-toolbar p{margin:0;color:var(--text-muted);font-size:13px}
-  .lc-daybar{display:flex;align-items:center;gap:6px}
+  .lc-daybar{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
   .lc-daybar button,.lc-filterbar button{background:var(--surface);color:var(--text);border:1px solid var(--border);border-radius:7px;padding:6px 11px;font-size:13px;cursor:pointer}
   .lc-daybar button:hover:not(:disabled),.lc-filterbar button:hover:not(:disabled){border-color:var(--accent)}
   .lc-daybar button:disabled{opacity:.4;cursor:not-allowed}
-  .lc-daybar input[type=date]{background:var(--surface);color:var(--text);border:1px solid var(--border);border-radius:7px;padding:6px 9px;font-size:13px}
+  .lc-daybar input[type=date],.lc-daybar input[type=time]{background:var(--surface);color:var(--text);border:1px solid var(--border);border-radius:7px;padding:6px 9px;font-size:13px}
+  .lc-daybar input[type=date]{width:142px;color:#0f172a;background:#f8fafc;border:2px solid #60a5fa;font-weight:700;color-scheme:light}
+  .lc-daybar input[type=date]:focus{outline:2px solid #93c5fd;outline-offset:2px;border-color:#2563eb}
+  .lc-daybar input[type=date]::-webkit-calendar-picker-indicator{opacity:1;cursor:pointer}
+  .lc-time-range{display:flex;align-items:center;gap:6px;color:#bfdbfe;font-size:12px;background:rgba(37,99,235,.18);border:1px solid #3b82f6;border-radius:9px;padding:4px 7px;box-shadow:0 0 0 1px rgba(59,130,246,.12)}
+  .lc-time-range label{font-weight:700;color:#dbeafe}
+  .lc-time-range input[type=time]{width:112px;color:#0f172a;background:#f8fafc;border:2px solid #60a5fa;font-weight:700;color-scheme:light}
+  .lc-time-range input[type=time]:focus{outline:2px solid #93c5fd;outline-offset:2px;border-color:#2563eb}
+  .lc-time-range input[type=time]::-webkit-calendar-picker-indicator{opacity:1;cursor:pointer}
+  .lc-time-range.pending{background:rgba(217,119,6,.2);border-color:#f59e0b;box-shadow:0 0 0 1px rgba(245,158,11,.16)}
+  .lc-time-hint{color:#fbbf24;font-size:12px;font-weight:600;white-space:nowrap}
   .lc-daylabel{color:var(--text-muted);font-size:13px;margin-left:4px}
   .lc-filterbar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:12px}
   .lc-filterbar select,.lc-filterbar input[type=text],.lc-filterbar input:not([type]){background:var(--surface);color:var(--text);border:1px solid var(--border);border-radius:7px;padding:6px 9px;font-size:13px;max-width:190px}
+  .lc-filterbar input.lc-request-id{max-width:280px;min-width:220px}
   .lc-filterbar .lc-primary{background:var(--accent);border-color:var(--accent);color:#fff}
   .lc-check{display:flex;align-items:center;gap:6px;font-size:13px;background:var(--surface);border:1px solid var(--border);border-radius:7px;padding:6px 10px;cursor:pointer;user-select:none}
   .lc-counter{font-size:13px;color:var(--text-muted)}
@@ -263,6 +274,9 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
   .lc-blind-head:hover{color:#fbbf24}
   .lc-blind-details:focus-visible .lc-blind-head{outline:2px solid var(--yellow);outline-offset:2px;border-radius:4px}
   .lc-blind-list{margin:8px 0 2px;padding-left:18px;font-size:12px;color:var(--text-muted);line-height:1.65}
+  .lc-blind-actions{display:flex;justify-content:flex-end;margin:8px 0 2px}
+  .lc-blind-actions button{background:var(--surface);color:var(--text);border:1px solid var(--border);border-radius:7px;padding:6px 11px;font-size:12px;cursor:pointer}
+  .lc-blind-actions button:hover{border-color:var(--accent)}
   /* 影响面判读:蓝色区分于盲区的黄色——盲区是警告(查不到),影响面是结论(集中在谁身上)。
      同样默认收起但标题常驻:形状结论本身就是最该先看见的一行。 */
   .lc-radius{background:rgba(59,130,246,.08);border:1px solid rgba(59,130,246,.3);border-radius:9px;padding:9px 14px;margin-bottom:14px}
@@ -276,6 +290,14 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
      统计范围看不见时,单页结论会被当成全窗口结论 */
   .lc-radius-sub{font-weight:400;color:var(--text-muted);margin-left:8px;font-size:11.5px}
   .lc-radius-why{margin:8px 0 4px;font-size:12px;color:var(--text-muted);line-height:1.65}
+  .lc-radius-section{margin-top:12px;padding-top:10px;border-top:1px solid rgba(148,163,184,.16)}
+  .lc-radius-section h4{margin:0 0 7px;font-size:12px;color:var(--text);font-weight:650}
+  .lc-radius-context{margin:0 0 4px;font-size:12px;line-height:1.6;color:var(--text)}
+  .lc-radius-section>small,.lc-radius-faults small{display:block;color:var(--text-muted);font-size:11px;line-height:1.55}
+  .lc-radius-reasons{max-width:100%}
+  .lc-radius-faults{display:flex;flex-wrap:wrap;align-items:center;gap:7px;margin-top:8px;font-size:11.5px;color:var(--text-muted)}
+  .lc-radius-fault{padding:2px 7px;border:1px solid rgba(148,163,184,.22);border-radius:999px;color:var(--text)}
+  .lc-radius-faults small{flex-basis:100%}
   .lc-radius-dims{display:flex;flex-wrap:wrap;gap:14px;margin-top:8px}
   .lc-radius-dim{flex:1 1 260px;min-width:230px}
   .lc-radius-table{width:100%;border-collapse:collapse;font-size:11.5px}
@@ -369,10 +391,22 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
   .lc-fault-dim{opacity:.6;border-style:dashed}
   .lc-fault-q{margin-left:2px;font-weight:700}
   .lc-tag-unpaid{background:rgba(239,68,68,.16);color:var(--red)}
+  .lc-tag-unbilled{background:rgba(245,158,11,.18);color:var(--yellow)}
   .lc-tag-free{background:rgba(99,102,241,.18);color:var(--accent)}
   /* end_reason 原值:等宽字体,让 client_gone 这类枚举值一眼可辨 */
   .lc-endreason{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px;color:var(--text-muted)}
   .lc-endreason.bad{color:var(--yellow)}
+  /* 请求视图：组头是“这些日志属于同一个用户请求”的归属说明，不替代逐条记录。
+     用左侧竖条 + 浅底与明细行区分，避免被当成又一条日志。 */
+  .lc-reqhead td{background:rgba(148,163,184,.10);border-left:3px solid var(--accent);padding:5px 10px;font-size:11.5px}
+  .lc-req-user{font-weight:700;color:var(--text)}
+  .lc-req-meta{margin-left:10px;color:var(--text-muted)}
+  .lc-req-outcome{margin-left:10px;font-weight:650}
+  .lc-req-ok{color:var(--green,#34d399)}
+  .lc-req-warn{color:var(--yellow)}
+  .lc-req-bad{color:var(--red,#f87171)}
+  .lc-req-noid{color:var(--text-muted);font-style:italic}
+  .lc-req-partial{margin-left:10px;color:var(--yellow)}
   .lc-table tr.lc-open td{background:rgba(99,102,241,.1)}
   .lc-sub{font-size:11px;color:var(--text-muted);margin-top:2px}
   .lc-arrow{font-size:12px;color:var(--text-muted);margin-top:3px}
@@ -454,6 +488,7 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
       <div class="tab" data-tab="sync" title="数据同步状态"><span class="monitor-nav-icon"><svg viewBox="0 0 24 24"><path d="M20 7h-6V1"/><path d="M4 17h6v6"/><path d="M20 7a8 8 0 0 0-13.7-3.6L4 5.7M4 17a8 8 0 0 0 13.7 3.6l2.3-2.3"/></svg></span><span class="monitor-nav-label">数据同步状态</span></div>
       <div class="tab" data-tab="logchain" title="客户排障"><span class="monitor-nav-icon"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/><path d="M11 8v3"/><path d="M11 14h.01"/></svg></span><span class="monitor-nav-label">客户排障</span></div>
       <div class="tab" data-tab="group-governance" title="分组治理（测试）"><span class="monitor-nav-icon"><svg viewBox="0 0 24 24"><circle cx="6" cy="6" r="2"/><circle cx="18" cy="6" r="2"/><circle cx="12" cy="18" r="2"/><path d="M8 7.2l3 8.2M16 7.2l-3 8.2M8 6h8"/></svg></span><span class="monitor-nav-label">分组治理</span></div>
+      <div class="tab" data-tab="alerts" title="问题预警"><span class="monitor-nav-icon"><svg viewBox="0 0 24 24"><path d="M12 9v4"/><path d="M12 17h.01"/><path d="M10.3 3.9 2 18a2 2 0 0 0 1.7 3h16.6a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/></svg></span><span class="monitor-nav-label">问题预警</span></div>
     </nav>
     <button type="button" class="monitor-sidebar-toggle" id="monitorSidebarToggle" aria-expanded="true" aria-label="收起侧边栏" title="收起侧边栏">
       <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m15 18-6-6 6-6"/></svg><span>收起侧边栏</span>
@@ -479,6 +514,7 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
       <div class="tab" data-tab="capacity">容量规划</div>
       <div class="tab" data-tab="logchain">客户排障</div>
       <div class="tab" data-tab="group-governance">分组治理</div>
+      <div class="tab" data-tab="alerts">问题预警</div>
     </nav>
 
     <div class="monitor-content">
@@ -910,33 +946,55 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
       <p>客户报"AI 用不了/报错"时，定位这条请求走了哪个上游、上游返回了什么。</p>
     </div>
     <div class="lc-daybar">
-      <button type="button" id="lcPrevDay" title="前一天">‹</button>
-      <input id="lcDate" type="date" aria-label="选择日期">
-      <button type="button" id="lcNextDay" title="后一天">›</button>
+      <button type="button" id="lcPrevDay" title="整段范围前移一天">‹</button>
+      <button type="button" id="lcNextDay" title="整段范围后移一天">›</button>
       <button type="button" id="lcToday">今天</button>
+      <span class="lc-time-range" id="lcTimeRange" title="起止日期与分钟均包含在内；修改后点击查询才生效">
+        <label for="lcDate">从</label>
+        <input id="lcDate" type="date" aria-label="开始日期">
+        <input id="lcFromTime" type="time" step="60" value="00:00" aria-label="开始时间">
+        <label for="lcToDate">到</label>
+        <input id="lcToDate" type="date" aria-label="结束日期">
+        <input id="lcToTime" type="time" step="60" value="23:59" aria-label="结束时间">
+      </span>
+      <span id="lcTimeHint" class="lc-time-hint" hidden></span>
       <span class="lc-daylabel" id="lcDateLabel"></span>
     </div>
   </div>
 
   <div class="lc-filterbar">
     <span class="lc-scopebar" role="group" aria-label="查看范围">
-      <button type="button" data-lc-scope="error" class="active" title="上游返回错误的请求(type=5)">错误</button>
+      <button type="button" data-lc-scope="error" title="上游返回错误的请求(type=5)">错误</button>
       <button type="button" data-lc-scope="stream" title="流传输真的出故障：timeout / scanner_error / panic / ping_fail，以及没见过的新取值。原值直接显示，不归类。不含客户端断连——那是单独一档">流故障</button>
       <button type="button" data-lc-scope="client_gone" title="下游客户端主动断开连接。多数不是故障（实测约 92% 已经交付了内容），单独成一档以免淹掉真正的流故障。耗时长的断连可能是上游拖慢把客户等跑了，请一并看耗时">客户端断连</button>
-      <button type="button" data-lc-scope="billing" title="扣了钱没交付，或交付了没扣钱">消费异常</button>
+      <button type="button" data-lc-scope="billing" title="扣费未交付、未交付且未扣费，或交付未扣费">消费异常</button>
       <button type="button" data-lc-scope="anomaly_all" title="流故障 + 客户端断连 + 消费异常">全部异常</button>
-      <button type="button" data-lc-scope="err_anom" title="错误 + 全部异常，即本页能查到的全部问题">错误+异常</button>
+      <button type="button" data-lc-scope="err_anom" class="active" title="错误 + 全部异常，即本页能查到的全部问题">错误+异常</button>
     </span>
     <select id="lcGroup" aria-label="服务分组"><option value="">全部服务分组</option></select>
     <select id="lcDomain" aria-label="上游主域名"><option value="">全部上游主域名</option></select>
     <select id="lcChannel" aria-label="渠道"><option value="">全部渠道</option></select>
     <input id="lcModel" list="lcModelList" placeholder="模型名(精确)" aria-label="模型名">
     <datalist id="lcModelList"></datalist>
-    <input id="lcUser" placeholder="客户 ID 或令牌名" aria-label="客户 ID 或令牌名" title="纯数字按用户 ID 精确查；其它按令牌名模糊查">
-    <!-- 事前提示比事后警告重要:人在输入时就该知道口径被限定,
-         而不是查完才发现消费行没被搜。由 TestLogChainKeywordHintStatesErrorScope 钉住。 -->
-    <input id="lcKeyword" placeholder="错误原文关键词" aria-label="错误原文关键词"
-      title="按错误原文模糊匹配，只搜错误行（type=5）。消费行的错误原文为空，纳入搜索只会拖慢查询并挤占客户查自己日志的通道。与 type / 异常筛选同时使用会被拒绝。">
+    <input id="lcUserID" inputmode="numeric" placeholder="客户 ID（精确）" aria-label="客户 ID" title="按 new-api 用户 ID 精确匹配，只接受正整数">
+    <input id="lcUsername" placeholder="客户名（精确）" aria-label="客户名" title="按日志中显示在客户 ID 上方的用户名精确匹配，使用 username 索引；可与客户 ID、令牌名取交集">
+    <input id="lcTokenName" placeholder="令牌名（模糊）" aria-label="令牌名" title="按令牌名模糊匹配；可输入纯数字令牌名。与客户 ID、客户名同时填写时取交集">
+    <input id="lcTokenID" inputmode="numeric" placeholder="令牌 ID（精确）" aria-label="令牌 ID" title="按 logs.token_id 精确匹配。令牌名可重复、可改名，排查同一把 key 时用 ID 更稳定">
+    <input id="lcEndpoint" list="lcEndpointList" placeholder="请求端点（精确）" aria-label="请求端点" title="按日志 other.request_path 精确匹配，例如 /v1/chat/completions。该字段无索引，多日查询请配合客户、渠道或令牌 ID">
+    <datalist id="lcEndpointList">
+      <option value="/v1/chat/completions"></option>
+      <option value="/v1/responses"></option>
+      <option value="/v1/messages"></option>
+      <option value="/pg/chat/completions"></option>
+      <option value="/v1/embeddings"></option>
+      <option value="/v1/images/generations"></option>
+    </datalist>
+    <select id="lcStream" aria-label="流式类型" title="按 logs.is_stream 筛选；历史行缺该值时按非流式处理">
+      <option value="">全部流式类型</option>
+      <option value="true">仅流式</option>
+      <option value="false">仅非流式</option>
+    </select>
+    <input id="lcRequestID" class="lc-request-id" placeholder="Request ID（精确）" aria-label="Request ID" title="按 new-api logs.request_id 精确匹配，使用独立索引">
     <button type="button" id="lcApply" class="lc-primary">查询</button>
     <button type="button" id="lcReset">重置</button>
     <span class="lc-sortbar" role="group" aria-label="时间排序">
@@ -948,9 +1006,8 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
   </div>
 
   <div id="lcNotes" class="lc-notes" hidden></div>
-  <!-- 影响面判读（「看范围」层）。由 logchain.js 的 renderRadius 填充，
-       内容只覆盖单页，翻页后改显失效提示。放在盲区提示之前：
-       先看范围，再看这个范围里查不到什么。 -->
+  <!-- 默认无筛选时展示通用影响面；存在筛选条件时展示筛选结果原因。
+       两者都只复用当前页结果，不增加生产查询；翻页后改显失效提示。 -->
   <div id="lcRadius" class="lc-radius" hidden></div>
   <div id="lcBlind" class="lc-blind" hidden></div>
 
@@ -982,6 +1039,50 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
     <div class="lc-more"><button type="button" id="lcMore" hidden>加载更早的记录</button></div>
   </div>
   <div class="lc-toast" id="lcToast" hidden></div>
+</div>
+<div class="tabpane logchain-page" id="tab-alerts" hidden>
+  <div class="lc-toolbar">
+    <div>
+      <h2>问题预警</h2>
+      <p>没到达任何渠道就被拒的请求：令牌配错、请求不存在的模型、额度不足等。客户已经用不了，但不计入渠道稳定率。</p>
+    </div>
+    <div class="lc-daybar">
+      <button type="button" id="alPrev" title="前一天">‹</button>
+      <input id="alDate" type="date" aria-label="选择日期">
+      <button type="button" id="alNext" title="后一天">›</button>
+      <button type="button" id="alToday">今天</button>
+      <span class="lc-daylabel" id="alDateLabel"></span>
+    </div>
+  </div>
+
+  <div class="lc-filterbar">
+    <select id="alReason" aria-label="错误原因"><option value="">全部错误原因</option></select>
+    <input id="alUser" placeholder="客户 ID" aria-label="客户 ID" title="按 new-api 用户 ID 精确筛">
+    <button type="button" id="alApply">查询</button>
+    <button type="button" id="alReset">重置</button>
+    <span class="lc-counter" id="alCounter"></span>
+    <span class="lc-status" id="alStatus"></span>
+  </div>
+
+  <!-- 采集覆盖提示：0 条既可能是没问题，也可能是采集器没跑，必须说清是哪种。 -->
+  <div id="alNotes" class="lc-notes" hidden></div>
+
+  <div class="card lc-card">
+    <div class="lc-tablewrap">
+      <table class="lc-table" id="alTable">
+        <thead><tr>
+          <th style="width:13%"><span class="lc-th">时间</span><span class="lc-th-sub">CST · 分钟</span></th>
+          <th style="width:20%"><span class="lc-th">客户</span><span class="lc-th-sub">用户名 · ID</span></th>
+          <th style="width:14%"><span class="lc-th">分组</span><span class="lc-th-sub">服务分组</span></th>
+          <th style="width:20%"><span class="lc-th">模型</span><span class="lc-th-sub">请求的模型</span></th>
+          <th style="width:23%"><span class="lc-th">错误原因</span><span class="lc-th-sub">为什么被拒</span></th>
+          <th style="width:10%" class="right"><span class="lc-th">次数</span><span class="lc-th-sub">该分钟内</span></th>
+        </tr></thead>
+        <tbody id="alTableBody"><tr><td colspan="6" class="lc-empty">加载中…</td></tr></tbody>
+      </table>
+    </div>
+    <div class="lc-more"><button type="button" id="alMore" hidden>加载更多</button></div>
+  </div>
 </div>
 
 <!-- ═══════════ Tab 3:用户用量(盯指定用户,按需查生产库 logs 聚合) ═══════════ -->
@@ -1110,10 +1211,11 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
   </main>
 </div><!-- /monitor-shell -->
 
-<script src="/stability.js?v=3"></script>
+<script src="/stability.js?v=5"></script>
 <script src="/channel-data-status.js?v=1"></script>
 <script src="/channel-management.js?v=8"></script>
-<script src="/logchain.js?v=1"></script>
+<script src="/logchain.js?v=12"></script>
+<script src="/alerts.js?v=1"></script>
 <script src="/capacity.js?v=2"></script>
 <script src="/group-governance.js?v=1"></script>
 <script src="/infra-assets.js?v=1"></script>
@@ -1978,6 +2080,7 @@ function switchTab(name,preserveHash){
   document.getElementById('tab-usage').hidden=(name!=='usage');
   document.getElementById('tab-group-governance').hidden=(name!=='group-governance');
   document.getElementById('tab-logchain').hidden=(name!=='logchain');
+document.getElementById('tab-alerts').hidden=(name!=='alerts');
   if(window.monitorShellSetTab)window.monitorShellSetTab(name);
   if(name==='server'){loadInfra();infraSchedule();setTimeout(resizeInfraCharts,80);}
   else if(infraTimer){clearInterval(infraTimer);}
@@ -1986,9 +2089,12 @@ function switchTab(name,preserveHash){
   if(name==='group-governance'&&window.groupGovernanceActivate)window.groupGovernanceActivate();
   else if(window.groupGovernanceDeactivate)window.groupGovernanceDeactivate();
   if(name==='stability'&&window.stabilityActivate)window.stabilityActivate();
+  else if(window.stabilityDeactivate)window.stabilityDeactivate();
   if(name==='channels'&&window.channelManagementActivate)window.channelManagementActivate();
   else if(window.channelManagementDeactivate)window.channelManagementDeactivate();
   if(name==='logchain'&&window.logChainActivate)window.logChainActivate();
+  else if(window.logChainDeactivate)window.logChainDeactivate();
+if(name==='alerts'&&window.alertsActivate)window.alertsActivate();
   if(name==='capacity'&&window.capacityActivate)window.capacityActivate();
   if(name!=='capacity'&&window.capacityDeactivate)window.capacityDeactivate();
   if(name==='model')setTimeout(resizeModelCharts,60); // 模型 tab 非默认可见,切回时按可见宽度重排图表
@@ -3564,7 +3670,7 @@ setSeg();const _mePromise=loadMe();load();schedule();
 document.querySelectorAll('#longSeg a').forEach(a=>{a.href='javascript:void 0';a.classList.toggle('active',+a.dataset.d===longDays);a.addEventListener('click',e=>{e.preventDefault();longDays=+a.dataset.d;document.querySelectorAll('#longSeg a').forEach(x=>x.classList.toggle('active',x===a));loadLongTrend();});});
 loadLongTrend();
 // 默认落在「用户用量」;URL hash 带 tab(从报警设置返回/手动刷新)则恢复到该 tab。等 IS_ROOT 就位再渲染,模型/服务端数据后台预载
-_mePromise.finally(()=>{const q=monitorHashParams(),tab=q.get('tab');const target=/^(sync|model|server|capacity|usage|stability|channels|logchain|group-governance)$/.test(tab||'')?tab:'usage';switchTab(target,true);window.dispatchEvent(new CustomEvent('monitor:navigate',{detail:{tab:target,context:window.monitorNavigationContext()}}))});
+_mePromise.finally(()=>{const q=monitorHashParams(),tab=q.get('tab');const target=/^(sync|model|server|capacity|usage|stability|channels|logchain|group-governance)$/.test(tab||'')?tab:(tab==='alerts'?'alerts':'usage');switchTab(target,true);window.dispatchEvent(new CustomEvent('monitor:navigate',{detail:{tab:target,context:window.monitorNavigationContext()}}))});
 </script>
 </body>
 </html>

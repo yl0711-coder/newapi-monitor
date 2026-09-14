@@ -28,9 +28,13 @@ type StabilityProblem struct {
 }
 
 type StabilityProblemsResponse struct {
-	Enabled          bool               `json:"enabled"`
-	From             string             `json:"from"`
-	To               string             `json:"to"`
+	Enabled bool   `json:"enabled"`
+	From    string `json:"from"`
+	To      string `json:"to"`
+	// FromTs / ToTs 是本次已校验的精确查询窗口，ToTs 为左闭右开的排他上界。
+	// 日期字符串保留用于展示；跨页排障必须使用这两个时间戳，不能从日期反推丢失小时。
+	FromTs           int64              `json:"from_ts"`
+	ToTs             int64              `json:"to_ts"`
 	GeneratedAt      int64              `json:"generated_at"`
 	CoverageFrom     int64              `json:"coverage_from"`
 	CoverageTo       int64              `json:"coverage_to"`
@@ -175,7 +179,22 @@ func (m *Monitor) queryStabilityProblems(ctx context.Context, scope stabilitySco
 		coverageTo = coverage.Max + 60
 	}
 	coverageComplete := expectedMinutes > 0 && coverage.Pending == 0 && coverage.Complete == expectedMinutes
-	return &StabilityProblemsResponse{Enabled: true, From: time.Unix(scope.FromTs, 0).In(cstLocation).Format("2006-01-02"), To: time.Unix(scope.ToTs-1, 0).In(cstLocation).Format("2006-01-02"), GeneratedAt: now, CoverageFrom: coverage.Min, CoverageTo: coverageTo, PendingMinutes: coverage.Pending, UncoveredMinutes: uncoveredMinutes, CoverageComplete: coverageComplete, CapturedTotal: total, Truncated: truncated, Problems: out}, nil
+	return &StabilityProblemsResponse{
+		Enabled:          true,
+		From:             time.Unix(scope.FromTs, 0).In(cstLocation).Format("2006-01-02"),
+		To:               time.Unix(scope.ToTs-1, 0).In(cstLocation).Format("2006-01-02"),
+		FromTs:           scope.FromTs,
+		ToTs:             scope.ToTs,
+		GeneratedAt:      now,
+		CoverageFrom:     coverage.Min,
+		CoverageTo:       coverageTo,
+		PendingMinutes:   coverage.Pending,
+		UncoveredMinutes: uncoveredMinutes,
+		CoverageComplete: coverageComplete,
+		CapturedTotal:    total,
+		Truncated:        truncated,
+		Problems:         out,
+	}, nil
 }
 
 func (m *Monitor) serveStabilityProblems(c *gin.Context) {

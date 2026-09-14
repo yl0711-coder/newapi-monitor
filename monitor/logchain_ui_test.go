@@ -56,7 +56,7 @@ func TestLogChainJSAvoidsChangeOnTextInputs(t *testing.T) {
 	//
 	// 也不能整串字面量乱搜：syncControls() 里回填控件值的列表本来就该含 lcModel
 	// （重置要清空模型框），搜整串会把它误判成违规。
-	textInputs := []string{"lcModel", "lcUser", "lcKeyword"}
+	textInputs := []string{"lcModel", "lcUserID", "lcUsername", "lcTokenName", "lcTokenID", "lcEndpoint", "lcRequestID"}
 	found := 0
 	for _, ln := range strings.Split(stripJSLineComments(js), "\n") {
 		if !strings.Contains(ln, `addEventListener('change'`) {
@@ -73,8 +73,22 @@ func TestLogChainJSAvoidsChangeOnTextInputs(t *testing.T) {
 	if found == 0 {
 		t.Fatal("找不到任何 change 绑定")
 	}
-	if !strings.Contains(js, `['lcModel','lcUser','lcKeyword'].forEach`) {
-		t.Error("lcModel 应与其它文本框一起走回车/查询按钮")
+	if !strings.Contains(js, `['lcModel','lcUserID','lcUsername','lcTokenName','lcTokenID','lcEndpoint','lcRequestID'].forEach`) {
+		t.Error("排障文本框应统一走回车或查询按钮")
+	}
+}
+
+func TestLogChainKeywordFilterIsNotExposed(t *testing.T) {
+	js := stripJSLineComments(string(logChainJS))
+	for _, forbidden := range []string{`id="lcKeyword"`, `placeholder="错误原文关键词"`} {
+		if strings.Contains(pageHTML, forbidden) {
+			t.Errorf("客户排障页面仍暴露关键词筛选 %q", forbidden)
+		}
+	}
+	for _, forbidden := range []string{"filters.keyword", "$('lcKeyword')", "q.set('keyword'"} {
+		if strings.Contains(js, forbidden) {
+			t.Errorf("客户排障前端仍保留关键词筛选接线 %q", forbidden)
+		}
 	}
 }
 
@@ -93,10 +107,543 @@ func TestLogChainJSUsesGenerationGuard(t *testing.T) {
 	}
 }
 
+func TestLogChainMinuteRangeUIWiring(t *testing.T) {
+	js := stripJSLineComments(string(logChainJS))
+	for _, want := range []string{
+		`id="lcTimeRange"`,
+		`id="lcFromTime" type="time" step="60" value="00:00"`,
+		`id="lcToTime" type="time" step="60" value="23:59"`,
+		`aria-label="开始时间"`, `aria-label="结束时间"`,
+		`id="lcTimeHint" class="lc-time-hint" hidden`,
+		`.lc-daybar{display:flex;align-items:center;gap:6px;flex-wrap:wrap}`,
+		`background:#f8fafc`, `border:2px solid #60a5fa`, `color-scheme:light`,
+	} {
+		if !strings.Contains(pageHTML, want) {
+			t.Errorf("分钟范围控件或高对比样式缺少 %q", want)
+		}
+	}
+	for _, want := range []string{
+		"fromTime:'00:00'", "toTime:'23:59'", "timeDirty:false",
+		"q.set('from_time',lc.fromTime)", "q.set('to_time',lc.toTime)",
+		"$('lcFromTime').value=lc.fromTime", "$('lcToTime').value=lc.toTime",
+		"$('lcFromTime')?.addEventListener('input',markTimeDirty)",
+		"$('lcToTime')?.addEventListener('input',markTimeDirty)",
+		"范围已修改，点查询生效",
+		"lc.fromTime='00:00';lc.toTime='23:59';lc.timeDirty=false",
+		"const fromTime=(c.from_time||'').trim(),toTime=(c.to_time||'').trim()",
+	} {
+		if !strings.Contains(js, want) {
+			t.Errorf("分钟范围前端接线缺少 %q", want)
+		}
+	}
+
+	// 起止日期必须都能选，且查询范围两端由各自日期决定，不再固定成同一天。
+	for _, want := range []string{`id="lcDate"`, `id="lcToDate"`, `aria-label="开始日期"`, `aria-label="结束日期"`} {
+		if !strings.Contains(pageHTML, want) {
+			t.Errorf("起止日期控件缺少 %q", want)
+		}
+	}
+	for _, want := range []string{
+		"toDate:''", "function rangeEnd()", "q.set('to',rangeEnd())",
+		"$('lcDate')?.addEventListener('input',markTimeDirty)",
+		"$('lcToDate')?.addEventListener('input',markTimeDirty)",
+		"$('lcToDate').value=rangeEnd()",
+		"function shiftRange(delta)",
+		"const toDate=(c.to_date||'').trim()",
+	} {
+		if !strings.Contains(js, want) {
+			t.Errorf("起止日期前端接线缺少 %q", want)
+		}
+	}
+	if strings.Contains(js, "q.set('to',lc.date)") {
+		t.Error("结束日期不得再固定为开始日期，跨日范围会被截成单日")
+	}
+
+	// 选择时间只更新草稿标记，不得直接查询，也不得改写已应用的查询范围。
+	start := strings.Index(js, "const markTimeDirty=()=>{")
+	if start < 0 {
+		t.Fatal("找不到 markTimeDirty")
+	}
+	draft := js[start:]
+	if end := strings.Index(draft, "\n  };"); end >= 0 {
+		draft = draft[:end]
+	}
+	if strings.Contains(draft, "load(") || strings.Contains(draft, "lc.fromTime=from") ||
+		strings.Contains(draft, "lc.toTime=to") {
+		t.Error("选择时间只能标记待查询，不得立即查询或覆盖已应用范围")
+	}
+	// 草稿判断必须覆盖起止日期与起止时间四者，缺一项就会出现“改了但没提示待查询”。
+	if !strings.Contains(draft, "lc.timeDirty=from!==lc.date||to!==rangeEnd()||fromTime!==lc.fromTime||toTime!==lc.toTime") ||
+		!strings.Contains(draft, "classList.toggle('pending',lc.timeDirty)") {
+		t.Error("范围草稿应覆盖起止日期与时间，并显示明确的待查询提示和高亮状态")
+	}
+
+	// 前后翻页按钮整段平移起止日期，并保留已应用的分钟范围。
+	if !strings.Contains(js, "if(!shiftRange(-1))return;") || !strings.Contains(js, "if(!shiftRange(1))return;") {
+		t.Error("前后翻页应整段平移起止日期，而不是只改开始日期")
+	}
+	for _, forbidden := range []string{
+		"lc.date=shiftDate(lc.date,-1);lc.fromTime=",
+		"lc.date=shiftDate(lc.date,1);lc.fromTime=",
+	} {
+		if strings.Contains(js, forbidden) {
+			t.Errorf("日期切换不应重置分钟范围：仍含 %q", forbidden)
+		}
+	}
+	if !strings.Contains(js, "lc.date=cstToday();lc.toDate=cstToday();syncControls();load()") {
+		t.Error("点击今天应把范围收回今天并保留已应用分钟范围")
+	}
+	if !strings.Contains(js, "lc.date=cstToday();lc.toDate=cstToday();lc.fromTime='00:00';lc.toTime='23:59';lc.timeDirty=false") {
+		t.Error("只有重置按钮应同时恢复今天全天")
+	}
+
+	// 只有查询动作读取并应用时间；非法值不得发请求，合法值必须加载第一页。
+	applyStart := strings.Index(js, "const applyText=()=>{")
+	if applyStart < 0 {
+		t.Fatal("找不到 applyText")
+	}
+	apply := js[applyStart:]
+	if end := strings.Index(apply, "\n  };"); end >= 0 {
+		apply = apply[:end]
+	}
+	if !strings.Contains(apply, "if(!fromDate||!toDate)") || !strings.Contains(apply, "if(!from||!to)") ||
+		!strings.Contains(apply, "if(fromDate>toDate)") ||
+		!strings.Contains(apply, "if(fromDate===toDate&&from>to)") ||
+		!strings.Contains(apply, "if(fromDate>today||toDate>today)") {
+		t.Error("查询时必须校验起止日期与时间成对、顺序合法且不含未来日期")
+	}
+	if !strings.Contains(apply, "lc.date=fromDate;lc.toDate=toDate;lc.fromTime=from;lc.toTime=to;lc.timeDirty=false") ||
+		!strings.Contains(apply, "load();") {
+		t.Error("点击查询后必须应用整个范围并重新加载第一页")
+	}
+	if strings.Contains(apply, "load(true)") {
+		t.Error("查询按钮不得按追加分页执行，必须清空旧游标")
+	}
+}
+
+func TestLogChainDatePickerMatchesTimeStyleWithoutChangingBehavior(t *testing.T) {
+	js := stripJSLineComments(string(logChainJS))
+	for _, want := range []string{
+		`.lc-daybar input[type=date]{width:142px;color:#0f172a;background:#f8fafc;border:2px solid #60a5fa;font-weight:700;color-scheme:light}`,
+		`.lc-daybar input[type=date]:focus{outline:2px solid #93c5fd;outline-offset:2px;border-color:#2563eb}`,
+		`.lc-daybar input[type=date]::-webkit-calendar-picker-indicator{opacity:1;cursor:pointer}`,
+	} {
+		if !strings.Contains(pageHTML, want) {
+			t.Errorf("日期选择器高对比样式缺少 %q", want)
+		}
+	}
+	// 支持跨日范围后，改日期只能记草稿：只改一端时另一端还没确定，
+	// 立即查询会发出中间态的错范围，还白占一次共享查询通道。
+	if strings.Contains(js, "$('lcDate')?.addEventListener('change'") {
+		t.Error("日期不得再绑 change 立即查询：跨日范围需两端确定后再查")
+	}
+	if !strings.Contains(js, "$('lcDate')?.addEventListener('input',markTimeDirty)") ||
+		!strings.Contains(js, "$('lcToDate')?.addEventListener('input',markTimeDirty)") {
+		t.Error("起止日期都应只标记待查询")
+	}
+	// 未来日期必须在应用范围时拒绝，不能靠控件属性单独兜底。
+	if !strings.Contains(js, "不能选择未来日期") {
+		t.Error("应用范围时必须拒绝未来日期")
+	}
+	if !strings.Contains(js, "$('lcDate').max=cstToday()") || !strings.Contains(js, "$('lcToDate').max=cstToday()") {
+		t.Error("起止日期控件都应限制不可选未来")
+	}
+}
+
+func TestLogChainRequestIDFilterWiring(t *testing.T) {
+	js := stripJSLineComments(string(logChainJS))
+	for _, want := range []string{
+		`id="lcRequestID"`,
+		`placeholder="Request ID（精确）"`,
+	} {
+		if !strings.Contains(pageHTML, want) {
+			t.Errorf("Request ID 查询入口缺少 %q", want)
+		}
+	}
+	for _, want := range []string{
+		"request_id:''",
+		"lc.filters.request_id=($('lcRequestID')?.value||'').trim()",
+		"q.set('request_id',lc.filters.request_id)",
+		"$('lcRequestID').value=lc.filters.request_id",
+		"const requestID=(c.request_id||'').trim()",
+	} {
+		if !strings.Contains(js, want) {
+			t.Errorf("Request ID 前端接线缺少 %q", want)
+		}
+	}
+	// Request ID 是独立索引上的精确条件；前端不得把它塞进 keyword 或 token_name。
+	if strings.Contains(js, "q.set('keyword',lc.filters.request_id)") ||
+		strings.Contains(js, "q.set('token_name',lc.filters.request_id)") {
+		t.Error("Request ID 必须只传 request_id 精确参数")
+	}
+}
+
+func TestLogChainUserAndTokenFiltersAreSeparate(t *testing.T) {
+	js := stripJSLineComments(string(logChainJS))
+	for _, want := range []string{
+		`id="lcUserID"`, `placeholder="客户 ID（精确）"`,
+		`id="lcTokenName"`, `placeholder="令牌名（模糊）"`,
+	} {
+		if !strings.Contains(pageHTML, want) {
+			t.Errorf("客户/令牌筛选拆分缺少 %q", want)
+		}
+	}
+	for _, want := range []string{
+		"user_id:''", "token_name:''",
+		"lc.filters.user_id=($('lcUserID')?.value||'').trim()",
+		"lc.filters.token_name=($('lcTokenName')?.value||'').trim()",
+		"q.set('user_id',lc.filters.user_id)",
+		"q.set('token_name',lc.filters.token_name)",
+		"$('lcUserID').value=lc.filters.user_id",
+		"$('lcTokenName').value=lc.filters.token_name",
+		"const tokenName=(c.token_name||'').trim()",
+	} {
+		if !strings.Contains(js, want) {
+			t.Errorf("客户/令牌筛选接线缺少 %q", want)
+		}
+	}
+	// 不得恢复“纯数字猜客户 ID、其它猜令牌名”的旧行为：它让纯数字令牌名永远查不到。
+	for _, forbidden := range []string{
+		"if(/^\\d+$/.test(", "const u=lc.filters.user", "lc.filters.user=",
+	} {
+		if strings.Contains(js, forbidden) {
+			t.Errorf("客户 ID 与令牌名必须使用独立状态，不得按字符形状猜测：仍含 %q", forbidden)
+		}
+	}
+}
+
+func TestLogChainUndeliveredUnbilledUIIsExplicit(t *testing.T) {
+	js := string(logChainJS)
+	for _, want := range []string{
+		"undelivered_unbilled:{t:'未交付·未扣费'", "文本请求未交付且未扣费",
+		"消费异常记录（logs.content）", "r.content||'文本请求未交付且未扣费'",
+	} {
+		if !strings.Contains(js, want) {
+			t.Errorf("未交付·未扣费展示缺少 %q", want)
+		}
+	}
+	if !strings.Contains(pageHTML, ".lc-tag-unbilled") {
+		t.Error("未交付·未扣费标签缺少独立样式")
+	}
+}
+
+// TestLogChainRequestViewGroupsByRequestIDOnly 请求视图的归并约束。
+//
+// 最要紧的三条：只按 Request ID 归并、尝试次数不等于日志条数、最终结果取最晚记录。
+// 任一条写错都会让页面上的数字比原来更容易误读。
+// TestLogChainEdgeTimingNamesObservationDirection 入口计时必须点明观察方向。
+//
+// Nginx 视角的 "upstream" 是 NewAPI 进程本身，不是模型供应商。写成“上游耗时”
+// 会被读成“我方访问供应商用了多久”，据此判断供应商慢是错的。
+func TestLogChainEdgeTimingNamesObservationDirection(t *testing.T) {
+	js := stripJSLineComments(string(logChainJS))
+	for _, want := range []string{
+		"'入口观察总耗时'", "'Nginx 等待 NewAPI 耗时'", "'Nginx→NewAPI 状态序列'",
+		"'NewAPI→供应商网络分段','未采集'", "'客户端 DNS/TLS/上传','未采集'",
+		"不是模型供应商",
+	} {
+		if !strings.Contains(js, want) {
+			t.Errorf("入口计时说明缺少 %q", want)
+		}
+	}
+	if strings.Contains(js, "['上游耗时'") {
+		t.Error("不得再把 Nginx→NewAPI 的等待时间标成“上游耗时”")
+	}
+}
+
+// TestLogChainConsumeAnomalyOutcomeAvoidsBilledClaim “已记账”会被读成一定扣了钱，
+// 但这些异常里包含未交付且未扣费（quota=0）。摘要不能替日志下这个结论。
+func TestLogChainConsumeAnomalyOutcomeAvoidsBilledClaim(t *testing.T) {
+	js := stripJSLineComments(string(logChainJS))
+	if strings.Contains(js, "最终已记账但有异常") {
+		t.Error("不得使用“已记账”：未交付·未扣费并没有扣费")
+	}
+	if !strings.Contains(js, "最终写入消费日志，但有交付/计费异常") {
+		t.Error("消费异常摘要应如实描述为写入消费日志但有交付/计费异常")
+	}
+}
+
+// TestLogChainEmptyAndFailureStatesAreDistinguished 查不到、被收窄、失败必须分开说。
+//
+// 三者混同时，最危险的读法是把一次超时或一次被收窄的查询当成“这段时间很正常”。
+func TestLogChainEmptyAndFailureStatesAreDistinguished(t *testing.T) {
+	js := stripJSLineComments(string(logChainJS))
+	for _, want := range []string{
+		"实际查询范围：",
+		"未覆盖到的时间段没有被查询",
+		"请求可能尚未写入日志",
+		"渠道信息补全失败，按渠道或上游域名筛选的结果可能不完整",
+		"上游错误证据关联暂不可用，这不代表上游没有报错",
+		"这不代表没有客户遇到问题",
+	} {
+		if !strings.Contains(js, want) {
+			t.Errorf("空结果分档缺少 %q", want)
+		}
+	}
+	// 查询失败必须明确“无法判断有没有问题”，不能与空结果同义。
+	for _, want := range []string{
+		"无法判断这段时间有没有问题",
+		"这不等于该范围内没有问题",
+	} {
+		if !strings.Contains(js, want) {
+			t.Errorf("查询失败提示缺少 %q", want)
+		}
+	}
+}
+
+func TestLogChainRequestViewGroupsByRequestIDOnly(t *testing.T) {
+	js := stripJSLineComments(string(logChainJS))
+	for _, want := range []string{
+		"function groupRequests(rows)",
+		"function requestAttempts(g)",
+		"function requestOutcome(g)",
+		"function requestGroupHTML(g,isLastGroup)",
+		"个用户请求 /",
+		"次渠道尝试 ·",
+		"该请求可能不完整",
+		"无 Request ID · 不可关联",
+	} {
+		if !strings.Contains(js, want) {
+			t.Errorf("请求视图缺少 %q", want)
+		}
+	}
+	// 无 Request ID 必须独立成组，绝不按时间/客户/模型猜同一请求。
+	if !strings.Contains(js, "unlinkable:true") {
+		t.Error("无 Request ID 的记录必须标为不可关联并独立成组")
+	}
+	for _, forbidden := range []string{"created_at+'@'+r.member", "r.member+'@'", "byTime.set("} {
+		if strings.Contains(js, forbidden) {
+			t.Errorf("不得按时间或客户猜测归并：仍含 %q", forbidden)
+		}
+	}
+	// 尝试次数按渠道去重，不能直接用日志条数——同一次尝试可能写两条日志。
+	if !strings.Contains(js, "seen.add(ch+'@'+(r.created_at||0))") {
+		t.Error("尝试次数必须按渠道+时间去重，不能等于日志条数")
+	}
+	// 最终结果取时间最晚那条：取第一条会把首次 429 当成最终结果。
+	if !strings.Contains(js, "(+b.created_at||0)>=(+a.created_at||0)?b:a") {
+		t.Error("最终结果必须取组内时间最晚的记录")
+	}
+	// 组内每条日志仍独立渲染，折叠的是归属而不是原因。
+	if !strings.Contains(js, "g.rows.map(rowHTML).join('')") {
+		t.Error("组内必须逐条渲染原始记录，不得把多个原因合成一条")
+	}
+	// 归属行不再展示 Request ID 明文与“用户请求”前缀，只从客户名开始。
+	for _, forbidden := range []string{"lc-req-id", "lc-req-label", "'用户请求'", "esc(g.requestID)"} {
+		if strings.Contains(js, forbidden) {
+			t.Errorf("请求归属行不得展示 Request ID 明文或“用户请求”前缀：仍含 %q", forbidden)
+		}
+	}
+	// 但归并依据必须仍然只有 Request ID，展示上的精简不能动判读逻辑。
+	if !strings.Contains(js, "requestID:rid") || !strings.Contains(js, "requestID:''") {
+		t.Error("归并仍必须以 Request ID 为唯一依据")
+	}
+	for _, want := range []string{".lc-reqhead td", ".lc-req-outcome", ".lc-req-partial"} {
+		if !strings.Contains(pageHTML, want) {
+			t.Errorf("请求组样式缺少 %q", want)
+		}
+	}
+}
+
+func TestLogChainTokenIDEndpointStreamFilterWiring(t *testing.T) {
+	js := stripJSLineComments(string(logChainJS))
+	for _, want := range []string{
+		`id="lcTokenID"`, `placeholder="令牌 ID（精确）"`,
+		`id="lcEndpoint"`, `placeholder="请求端点（精确）"`, `id="lcEndpointList"`,
+		`id="lcStream"`, `<option value="true">仅流式</option>`, `<option value="false">仅非流式</option>`,
+	} {
+		if !strings.Contains(pageHTML, want) {
+			t.Errorf("新增筛选入口缺少 %q", want)
+		}
+	}
+	for _, want := range []string{
+		"token_id:''", "endpoint:''", "stream:''",
+		"lc.filters.token_id=($('lcTokenID')?.value||'').trim()",
+		"lc.filters.endpoint=($('lcEndpoint')?.value||'').trim()",
+		"q.set('token_id',lc.filters.token_id)",
+		"q.set('endpoint',lc.filters.endpoint)",
+		"q.set('stream',lc.filters.stream)",
+		"$('lcTokenID').value=lc.filters.token_id",
+		"$('lcEndpoint').value=lc.filters.endpoint",
+		"$('lcStream').value=lc.filters.stream",
+		"lcStream:'stream'",
+	} {
+		if !strings.Contains(js, want) {
+			t.Errorf("新增筛选接线缺少 %q", want)
+		}
+	}
+	// 令牌 ID 与端点是文本框，绑 change 会在失焦时多发一次查询（占用共享通道）。
+	for _, ln := range strings.Split(js, "\n") {
+		if !strings.Contains(ln, "addEventListener('change'") {
+			continue
+		}
+		for _, id := range []string{"lcTokenID", "lcEndpoint"} {
+			if strings.Contains(ln, id) {
+				t.Errorf("%s 是文本框，不得绑 change：%s", id, strings.TrimSpace(ln))
+			}
+		}
+	}
+}
+
+func TestLogChainAmbiguousUsernameOffersChoice(t *testing.T) {
+	js := stripJSLineComments(string(logChainJS))
+	for _, want := range []string{
+		"data.username_ambiguous",
+		"function showUsernameChoices(",
+		"data-lc-pick-user",
+		"lc.filters.user_id=btn.dataset.lcPickUser",
+	} {
+		if !strings.Contains(js, want) {
+			t.Errorf("同名客户选择入口缺少 %q", want)
+		}
+	}
+	// 同名冲突时必须清空旧结果：留着上一次的行会让人以为那就是该客户的请求。
+	if !strings.Contains(js, "lc.rows=[];lc.hasMore=false;lc.nextBeforeTs=0;lc.nextBeforeID=0;lc.radius=null;lc.radiusStale=false;\n      showUsernameChoices(") {
+		t.Error("同名冲突时应清空旧结果与影响面后再要求选择")
+	}
+	// 不得由前端自动挑一个客户，那等于把“选错客户”的风险藏起来。
+	for _, forbidden := range []string{"candidates[0].user_id", "candidates.find("} {
+		if strings.Contains(js, forbidden) {
+			t.Errorf("前端不得自动选择同名客户：仍含 %q", forbidden)
+		}
+	}
+}
+
+func TestLogChainUsernameFilterWiring(t *testing.T) {
+	js := stripJSLineComments(string(logChainJS))
+	for _, want := range []string{
+		`id="lcUsername"`, `placeholder="客户名（精确）"`, `aria-label="客户名"`,
+	} {
+		if !strings.Contains(pageHTML, want) {
+			t.Errorf("客户名筛选入口缺少 %q", want)
+		}
+	}
+	for _, want := range []string{
+		"username:''", "lc.filters.username=($('lcUsername')?.value||'').trim()",
+		"q.set('username',lc.filters.username)", "$('lcUsername').value=lc.filters.username",
+		"const username=(c.username||'').trim()", "lc.filters.username!==username",
+	} {
+		if !strings.Contains(js, want) {
+			t.Errorf("客户名筛选接线缺少 %q", want)
+		}
+	}
+	if strings.Contains(js, "q.set('username','%") || strings.Contains(js, "lc.filters.username.includes") {
+		t.Error("客户名必须走后端精确等值，不得在前端改成模糊匹配")
+	}
+}
+
+func TestLogChainFocusedReasonUIWiring(t *testing.T) {
+	js := stripJSLineComments(string(logChainJS))
+	for _, want := range []string{
+		"br?.mode==='focused'", "REASON_SHAPE_LABEL", "br.reason_shape", "br.reason_why",
+		"筛选结果原因", "筛选结果主要原因", "筛选结果涉及范围",
+		"这些维度仅说明筛选结果涉及谁，不参与主要原因判定",
+		"br.page_has_more?'仅当前页':'已返回全部'",
+	} {
+		if !strings.Contains(js, want) {
+			t.Errorf("筛选原因模式前端接线缺少 %q", want)
+		}
+	}
+	if !strings.Contains(pageHTML, `<script src="/logchain.js?v=12"></script>`) {
+		t.Error("logchain.js 行为已变化但缓存版本未提升到 v12")
+	}
+}
+
+func TestLogChainDiagnosisContextIsFlatValidatedAndCleared(t *testing.T) {
+	stJS := stripJSLineComments(string(stabilityJS))
+	lcJS := stripJSLineComments(string(logChainJS))
+	for _, want := range []string{
+		"stability_from_ts:from", "stability_to_ts:to", "stability_requests:",
+		"stability_problems:", "stability_anomaly:", "stability_failed:", "stability_rate:",
+	} {
+		if !strings.Contains(stJS, want) {
+			t.Errorf("稳定性跳转缺扁平原范围指标 %q", want)
+		}
+	}
+	if strings.Contains(stJS, "stability_context:") {
+		t.Error("monitorNavigate 只支持一级标量，嵌套 stability_context 会被写成 [object Object]")
+	}
+	for _, want := range []string{
+		"const finite=v=>v!==''", "const count=v=>", "fromTs>0&&toTs>fromTs",
+		"problems===anomaly+failed", "problems<=requests", "stability>=0&&stability<=100",
+		"lc.diagnosisContext=validContext?", "function clearDiagnosisContext()",
+		"clearDiagnosisContext();lc.date=cstToday()", "clearDiagnosisContext();lc.scope=",
+		"const markTimeDirty=()=>{\n    clearDiagnosisContext();",
+		"if(more){lc.radiusStale=true}", "稳定性原范围", "下方原因分析只覆盖客户排障本次返回结果",
+	} {
+		if !strings.Contains(lcJS, want) {
+			t.Errorf("渠道诊断上下文校验/失效/展示缺少 %q", want)
+		}
+	}
+}
+
+func TestLogChainChannelDiagnosisPresetClearsStaleFilters(t *testing.T) {
+	js := stripJSLineComments(string(logChainJS))
+	for _, want := range []string{
+		"c.preset==='channel_diagnosis'",
+		"channel_id:diagnosisChannel",
+		"model:''", "user_id:''", "username:''", "token_name:''", "request_id:''",
+		"if(lc.scope!=='err_anom')",
+		"if(lc.asc)",
+		"if(lc.timeDirty)",
+	} {
+		if !strings.Contains(js, want) {
+			t.Errorf("渠道诊断预设缺少 %q", want)
+		}
+	}
+	if !strings.Contains(js, "^\\d+$") || !strings.Contains(js, "+diagnosisChannel>0") {
+		t.Error("渠道诊断预设必须拒绝非法/非正整数渠道 ID")
+	}
+}
+
+func TestAlertsUseServerFilteringCursorAndGeneration(t *testing.T) {
+	js := stripJSLineComments(string(alertsJS))
+	for _, want := range []string{
+		"++generation", "AbortController", "gen!==generation", `q.set("reason",fReason)`,
+		`q.set("user_id",fUser)`, `q.set("cursor",nextCursor)`, "d.row_total", "d.has_more",
+	} {
+		if !strings.Contains(js, want) {
+			t.Errorf("问题预警缺服务端分页/竞态保护 %q", want)
+		}
+	}
+	if strings.Contains(js, "lastRows.filter(") {
+		t.Error("问题预警仍在截断结果上做前端筛选，会漏掉第 2000 行后的匹配项")
+	}
+}
+
+func TestLogChainRenderDoesNotClearQueryError(t *testing.T) {
+	js := string(logChainJS)
+	start := strings.Index(js, "function render(){")
+	if start < 0 {
+		t.Fatal("找不到 render")
+	}
+	end := strings.Index(js[start:], "\n}")
+	if end < 0 {
+		t.Fatal("找不到 render 结尾")
+	}
+	if strings.Contains(js[start:start+end], "clearError()") {
+		t.Error("纯重绘不得清除查询失败提示")
+	}
+	notOK := strings.Index(js, "if(!r.ok)throw")
+	if notOK < 0 {
+		t.Fatal("找不到 HTTP 错误分支")
+	}
+	success := js[notOK:]
+	clear := strings.Index(success, "clearError()")
+	assign := strings.Index(success, "lc.rows=")
+	catch := strings.Index(success, "}catch(e){")
+	if clear < 0 || assign < 0 || catch < 0 || clear > assign || clear > catch {
+		t.Error("查询错误只能在最新成功响应分支、写入新 rows 之前清除")
+	}
+}
+
 // stripJSLineComments 去掉 // 行注释，只保留可执行代码。
 // 用于"某写法不得出现"这类断言——注释里为解释而引用该写法是正常的，不该判为违规。
 // 只处理行注释即可：本文件不用块注释，且不需要处理字符串里的 // （无此用法）。
 func stripJSLineComments(js string) string {
+	// Windows 工作区以 CRLF 签出，go:embed 会原样保留；先统一行尾，
+	// 否则多行行为断言只在 Linux checkout 通过，Windows 交叉编译会误报缺线。
+	js = strings.ReplaceAll(js, "\r\n", "\n")
 	lines := strings.Split(js, "\n")
 	out := make([]string, 0, len(lines))
 	for _, ln := range lines {
@@ -198,9 +745,18 @@ func TestLogChainScopeBarHasNoAllRequests(t *testing.T) {
 	if strings.Contains(js, `'err_anom','all'`) || strings.Contains(js, `,'all']`) {
 		t.Error("SCOPES 里不得残留 all")
 	}
-	// 默认必须落在 error，与本页定位一致（当天故障清单）。
-	if !strings.Contains(js, "scope:'error'") {
-		t.Error("默认范围应为 error")
+	// 默认必须落在 err_anom，让错误日志与消费异常都不会因默认口径而漏掉。
+	if !strings.Contains(js, "scope:'err_anom'") {
+		t.Error("默认范围应为 err_anom")
+	}
+	if !strings.Contains(js, "lc.scope='err_anom'") {
+		t.Error("重置后应恢复为 err_anom")
+	}
+	if !strings.Contains(pageHTML, `data-lc-scope="err_anom" class="active"`) {
+		t.Error("页面初始高亮应为错误+异常")
+	}
+	if strings.Contains(pageHTML, `data-lc-scope="error" class="active"`) {
+		t.Error("错误按钮不应保留默认高亮")
 	}
 }
 
@@ -359,12 +915,23 @@ func TestLogChainBlindSpotsDropsBodyCapture(t *testing.T) {
 			t.Error("第三条应已删除")
 		}
 	}
-	// 前两条必须留：前置拒绝不写 logs、重试链无法归并，都仍然成立。
+	// 两条能力边界必须留：前置拒绝不写 logs、重试链无法归并，都仍然成立。
 	joined := strings.Join(spots, "\n")
-	// 按实际措辞断言，不按我脑子里的叫法："未打到渠道即被拒"才是文案原文。
-	for _, want := range []string{"未打到渠道即被拒", "user_id", "归并"} {
+	for _, want := range []string{"未到达渠道即被拒", "问题预警", "客户 ID", "归并"} {
 		if !strings.Contains(joined, want) {
-			t.Errorf("盲区缺少关键说明 %q: %v", want, spots)
+			t.Errorf("能力边界缺少关键说明 %q: %v", want, spots)
+		}
+	}
+	// 问题预警已有分钟明细与 user_id，旧事实不得回归。
+	for _, stale := range []string{"stability_reject_hours", "该表无 user_id", "无法定位到具体客户"} {
+		if strings.Contains(joined, stale) {
+			t.Errorf("能力边界仍有过时事实 %q: %v", stale, spots)
+		}
+	}
+	js := string(logChainJS)
+	for _, want := range []string{"本页能力边界", "前往问题预警", "monitorNavigate('alerts')"} {
+		if !strings.Contains(js, want) {
+			t.Errorf("能力边界前端缺少 %q", want)
 		}
 	}
 }

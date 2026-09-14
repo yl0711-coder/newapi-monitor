@@ -1,8 +1,9 @@
 package monitor
 
 // source_lifecycle.go 把 NewAPI MySQL 的可用性与 Monitor 进程、本地
-// SQLite 解耦。来源短暂断开时页面仍能读已发布事实；后台
-// worker 只在来源就绪且持有单例 lease 的 epoch 中运行。
+// SQLite 解耦。来源短暂断开时页面仍能读已发布事实；完整来源
+// worker 只在来源就绪且持有单例 lease 的 epoch 中运行，logchain-only
+// 最小权限模式则只在就绪 epoch 中刷新 channels，不申请完整 worker lease。
 
 import (
 	"context"
@@ -70,7 +71,7 @@ const (
 )
 
 func (s Settings) sourceWorkerIsEnabled() bool {
-	if s.LocalSnapshotOnly {
+	if s.LocalSnapshotOnly || s.LogChainOnlySource {
 		return false
 	}
 	if !s.sourceLifecycleConfigured {
@@ -79,6 +80,13 @@ func (s Settings) sourceWorkerIsEnabled() bool {
 		return true
 	}
 	return s.SourceWorkerEnabled
+}
+
+func (s Settings) sourceSupervisorIsEnabled() bool {
+	if s.LocalSnapshotOnly {
+		return false
+	}
+	return s.LogChainOnlySource || s.sourceWorkerIsEnabled()
 }
 
 func (s Settings) sourceLeaseIsRequired() bool {
@@ -127,7 +135,7 @@ func (m *Monitor) sourceAccessAllowed() bool {
 		// 在开放任何路由前一定会将 lifecycleInitialized 置 true。
 		return true
 	}
-	if !m.cfg.sourceWorkerIsEnabled() || m.currentSourceState() != sourceStateReady {
+	if !m.cfg.sourceSupervisorIsEnabled() || m.currentSourceState() != sourceStateReady {
 		return false
 	}
 	return !m.cfg.sourceLeaseIsRequired() || m.sourceLeaseHeld.Load()
@@ -188,7 +196,7 @@ func (m *Monitor) initializeSource() error {
 		return nil
 	}
 	m.recordSourceSuccess()
-	if !m.cfg.sourceWorkerIsEnabled() {
+	if !m.cfg.sourceSupervisorIsEnabled() {
 		m.setSourceState(sourceStateDisabled)
 	} else if m.cfg.sourceLeaseIsRequired() {
 		m.setSourceState(sourceStateConnecting)
@@ -209,6 +217,11 @@ var sourcePreflightQueries = []string{
 const usageFactFullHistoryIndexPreflightQuery = "SELECT id FROM logs FORCE INDEX (idx_user_created_type) WHERE 1=0"
 
 func sourcePreflightQueriesForSettings(cfg Settings) []string {
+	// 客户排障验收环境只需要直查 logs，并用 channels 补渠道名/上游域名。
+	// 显式模式之外一律保持原来的完整权限校验，不能让生产因少授权而假健康。
+	if cfg.LogChainOnlySource {
+		return append([]string(nil), sourcePreflightQueries[:2]...)
+	}
 	queries := append([]string(nil), sourcePreflightQueries...)
 	// Full-history boundary discovery deliberately forces this production index.
 	// Probe it before an epoch becomes ready so a restored or newly provisioned
@@ -647,7 +660,7 @@ func waitSourceLifecycle(ctx context.Context, delay time.Duration) bool {
 }
 
 func (m *Monitor) startSourceSupervisor(parent context.Context) {
-	if !m.cfg.sourceWorkerIsEnabled() || m.prodDB == nil {
+	if !m.cfg.sourceSupervisorIsEnabled() || m.prodDB == nil {
 		m.setSourceState(sourceStateDisabled)
 		return
 	}
@@ -842,6 +855,13 @@ func (m *Monitor) superviseSource(ctx context.Context) {
 }
 
 func (m *Monitor) startSourceEpoch(ctx context.Context, group *sourceEpochGroup) {
+	if m.cfg.LogChainOnlySource {
+		group.Go(ctx, func(workerCtx context.Context) { m.startLogChainChannelSync(workerCtx) })
+		if m.cfg.StabilityProblemSourceEnabled {
+			group.Go(ctx, func(workerCtx context.Context) { m.startStabilityProblemSource(workerCtx) })
+		}
+		return
+	}
 	if m.cfg.sourceWorkerStart != nil {
 		group.Go(ctx, func(workerCtx context.Context) { m.cfg.sourceWorkerStart(workerCtx, m) })
 		return
@@ -1054,15 +1074,18 @@ type lifecycleComponentStatus struct {
 }
 
 type sourceReadyStatus struct {
-	State         string `json:"state"`
-	WorkerEnabled bool   `json:"worker_enabled"`
-	WorkerRunning bool   `json:"worker_running"`
-	LeaseRequired bool   `json:"lease_required"`
-	LeaseHeld     bool   `json:"lease_held"`
-	LastSuccessAt int64  `json:"last_success_at"`
-	LastFailureAt int64  `json:"last_failure_at"`
-	NextRetryAt   int64  `json:"next_retry_at"`
-	FailureStreak int64  `json:"failure_streak"`
+	State                string `json:"state"`
+	SupervisorEnabled    bool   `json:"supervisor_enabled"`
+	WorkerEnabled        bool   `json:"worker_enabled"`
+	WorkerRunning        bool   `json:"worker_running"`
+	ProblemSourceEnabled bool   `json:"problem_source_enabled"`
+	ProblemSourceRunning bool   `json:"problem_source_running"`
+	LeaseRequired        bool   `json:"lease_required"`
+	LeaseHeld            bool   `json:"lease_held"`
+	LastSuccessAt        int64  `json:"last_success_at"`
+	LastFailureAt        int64  `json:"last_failure_at"`
+	NextRetryAt          int64  `json:"next_retry_at"`
+	FailureStreak        int64  `json:"failure_streak"`
 }
 
 type readyStatusResponse struct {
@@ -1116,15 +1139,18 @@ func (m *Monitor) readyStatus(now time.Time) (readyStatusResponse, int) {
 			OK: factsOK, CheckedAt: m.localFactsProbeAt.Load(),
 		},
 		Source: sourceReadyStatus{
-			State:         m.currentSourceState().String(),
-			WorkerEnabled: m.cfg.sourceWorkerIsEnabled(),
-			WorkerRunning: m.sourceWorkerRunning.Load(),
-			LeaseRequired: m.cfg.sourceLeaseIsRequired(),
-			LeaseHeld:     m.sourceLeaseHeld.Load(),
-			LastSuccessAt: m.sourceLastSuccessAt.Load(),
-			LastFailureAt: m.sourceLastFailureAt.Load(),
-			NextRetryAt:   m.sourceNextRetryAt.Load(),
-			FailureStreak: m.sourceFailureStreak.Load(),
+			State:                m.currentSourceState().String(),
+			SupervisorEnabled:    m.cfg.sourceSupervisorIsEnabled(),
+			WorkerEnabled:        m.cfg.sourceWorkerIsEnabled(),
+			WorkerRunning:        m.cfg.sourceWorkerIsEnabled() && m.sourceWorkerRunning.Load(),
+			ProblemSourceEnabled: m.cfg.StabilityProblemSourceEnabled,
+			ProblemSourceRunning: m.problemSourceRunning.Load(),
+			LeaseRequired:        m.cfg.sourceLeaseIsRequired(),
+			LeaseHeld:            m.sourceLeaseHeld.Load(),
+			LastSuccessAt:        m.sourceLastSuccessAt.Load(),
+			LastFailureAt:        m.sourceLastFailureAt.Load(),
+			NextRetryAt:          m.sourceNextRetryAt.Load(),
+			FailureStreak:        m.sourceFailureStreak.Load(),
 		},
 		SampledAt: m.lastRun.Load(),
 		MetricFinalize: metricFinalizeReadyStatus{
@@ -1152,12 +1178,14 @@ func (m *Monitor) readyStatus(now time.Time) (readyStatusResponse, int) {
 		return response, http.StatusServiceUnavailable
 	}
 
-	if m.cfg.sourceWorkerIsEnabled() {
+	if m.cfg.sourceSupervisorIsEnabled() {
 		if m.currentSourceState() != sourceStateReady {
 			response.DegradedReasons = appendReason(response.DegradedReasons, "source_"+m.currentSourceState().String())
 		} else if !m.sourceWorkerRunning.Load() {
 			response.DegradedReasons = appendReason(response.DegradedReasons, "source_worker_warming_up")
 		}
+	}
+	if m.cfg.sourceWorkerIsEnabled() {
 		last := m.lastRun.Load()
 		if last == 0 {
 			response.DegradedReasons = appendReason(response.DegradedReasons, "sampler_warming_up")

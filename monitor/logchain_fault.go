@@ -382,7 +382,15 @@ func logChainAttributeFault(r LogChainRow, tags []string) logChainFault {
 				Why: "流传输异常结束（end_reason=" + r.EndReason + "），通常为上游侧流故障"}
 		}
 	}
-	// 只有消费异常、没有流问题：扣费与交付不一致，但责任方无从判断。
+	// 未交付且未扣费只有“上游未返回可计费用量”这一事实，不能把日志中的“可能超时”
+	// 升格为确定根因。保持待判，同时把人工核对需要的事实说完整。
+	for _, t := range tags {
+		if t == anomalyUndeliveredUnbilled {
+			return logChainFault{Fault: faultUnknown, Confidence: faultConfNone,
+				Why: "文本请求未交付且未扣费，上游未返回可计费用量；可能超时，但需结合流状态与日志原文核对"}
+		}
+	}
+	// 只有其它消费异常、没有流问题：扣费与交付不一致，但责任方无从判断。
 	// 这类需要人工核对计费口径，规则不该猜。
 	return logChainFault{Fault: faultUnknown, Confidence: faultConfNone,
 		Why: "计费与交付不一致，但无流中断等旁证，责任方需人工核对"}

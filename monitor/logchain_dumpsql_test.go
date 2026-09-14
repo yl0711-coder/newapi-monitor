@@ -31,7 +31,7 @@ func TestDumpLogChainSQL(t *testing.T) {
 	// 逐个 anomaly 取值导出完整查询：判据组合各不相同，任一分支单独写错都不会被别的覆盖。
 	for _, kind := range []string{
 		"", anomalyStream, anomalyBilling, anomalyBillingUnpaid,
-		anomalyBillingFree, anomalyAll, anomalyErrAnom,
+		anomalyUndeliveredUnbilled, anomalyBillingFree, anomalyAll, anomalyErrAnom,
 	} {
 		scope := logChainScope{FromTs: 1000, ToTs: 100000, Limit: 50, Anomaly: kind}
 		where, args := logChainWhere(scope, nil)

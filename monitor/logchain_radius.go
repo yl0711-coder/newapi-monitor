@@ -21,6 +21,7 @@ package monitor
 import (
 	"sort"
 	"strconv"
+	"strings"
 )
 
 // 本文件大量拼接依据文本，包内没有现成的短别名，就地定义两个，
@@ -63,24 +64,59 @@ type logChainRadiusDim struct {
 	OtherCount int `json:"other_count,omitempty"`
 }
 
-// logChainBlastRadius 影响面汇总。
-type logChainBlastRadius struct {
-	// Rows 是本次统计覆盖的行数。**它等于当前页行数，不是窗口内总数**——
-	// 拿不到真总数（那需要额外一次 COUNT，会再占一次生产库查询与闸门）。
-	Rows int `json:"rows"`
-
-	ByChannel  logChainRadiusDim `json:"by_channel"`
-	ByCustomer logChainRadiusDim `json:"by_customer"`
-	ByDomain   logChainRadiusDim `json:"by_domain"`
-	ByModel    logChainRadiusDim `json:"by_model"`
-
-	// Shape 是形状判读结论：single_channel / single_customer / single_domain /
-	// single_model / widespread / insufficient。
-	Shape string `json:"shape"`
-	// ShapeWhy 是判读依据，必须能让人复核。与 fault_why 同一原则：
-	// 只给结论不给依据，人就无法判断该不该相信它。
-	ShapeWhy string `json:"shape_why"`
+// logChainReasonItem 是当前页一个互斥主原因。每条问题只进入一个原因，
+// 因此所有原因 Count（含 other_count）之和必须等于 blast_radius.rows。
+type logChainReasonItem struct {
+	Reason    string `json:"reason"`
+	Count     int    `json:"count"`
+	Customers int    `json:"customers"`
+	Channels  int    `json:"channels"`
 }
+
+type logChainReasonSummary struct {
+	Items      []logChainReasonItem `json:"items,omitempty"`
+	OtherItems int                  `json:"other_items,omitempty"`
+	OtherCount int                  `json:"other_count,omitempty"`
+}
+
+// logChainFaultCount 聚合已有逐行责任推断。Fault=unknown 包含无依据和待判；
+// 页面必须继续写“疑似责任方”，不能把该分布当成事实。
+type logChainFaultCount struct {
+	Fault string `json:"fault"`
+	Count int    `json:"count"`
+}
+
+// logChainBlastRadius 影响面/筛选原因汇总。
+type logChainBlastRadius struct {
+	// Mode 由后端根据已校验的实际 scope 推导：overview 看跨维度集中度，
+	// focused 看筛选结果的原因构成。前端不得自行声明模式。
+	Mode string `json:"mode"`
+	// Rows 是本次统计覆盖的问题行数。它等于当前页问题行数，不是窗口内总数。
+	Rows int `json:"rows"`
+	// PageHasMore=true 表示筛选范围内还有未进入本页的记录；此时任何原因结论
+	// 都只能描述当前页，不能冒充整个筛选范围。
+	PageHasMore bool `json:"page_has_more"`
+
+	ByChannel  logChainRadiusDim     `json:"by_channel"`
+	ByCustomer logChainRadiusDim     `json:"by_customer"`
+	ByDomain   logChainRadiusDim     `json:"by_domain"`
+	ByModel    logChainRadiusDim     `json:"by_model"`
+	Reasons    logChainReasonSummary `json:"reasons"`
+	Faults     []logChainFaultCount  `json:"faults,omitempty"`
+
+	// Shape / ShapeWhy 只供 overview 的通用影响面判读。
+	Shape    string `json:"shape"`
+	ShapeWhy string `json:"shape_why"`
+	// ReasonShape / ReasonWhy 只供 focused 的筛选原因判读。它描述当前返回记录
+	// 的表现，不把日志现象自动升级为已经证实的根因。
+	ReasonShape string `json:"reason_shape,omitempty"`
+	ReasonWhy   string `json:"reason_why,omitempty"`
+}
+
+const (
+	logChainRadiusModeOverview = "overview"
+	logChainRadiusModeFocused  = "focused"
+)
 
 // logChainRadiusShape 取值。
 const (
@@ -90,6 +126,11 @@ const (
 	radiusSingleModel    = "single_model"
 	radiusWidespread     = "widespread"
 	radiusInsufficient   = "insufficient"
+
+	reasonShapeSmall       = "small_sample"
+	reasonShapeDominant    = "dominant"
+	reasonShapeDual        = "dual"
+	reasonShapeDistributed = "distributed"
 )
 
 // logChainRadiusMinRows 少于这个行数不做形状判读：两三条数据上的「集中度」
@@ -100,19 +141,88 @@ const logChainRadiusMinRows = 5
 // 取 70% 而非 50%：过半只说明它最多，谈不上集中。
 const logChainRadiusDominantPct = 70
 
-// computeLogChainBlastRadius 统计影响面。
-//
-// 只统计**有问题的行**（type=5 错误，或带异常标签的消费行）：把正常请求
-// 算进去会稀释集中度，让所有形状都看起来像 widespread。
+// logChainPrimaryReason 为每条问题生成唯一主原因，保证原因分布互斥且可加总。
+// 错误摘要复用稳定性问题签名的脱敏/规范化边界，不把凭据或长标识扩散进汇总。
+func logChainPrimaryReason(r LogChainRow) string {
+	if r.Type == 5 {
+		code := strings.TrimSpace(r.UpstreamErrorCode)
+		if code == "" && r.UpstreamStatusCode > 0 {
+			code = "HTTP " + strconv.Itoa(r.UpstreamStatusCode)
+		}
+		if code == "" {
+			code = stabilityProblemCode(r.Content)
+			if code != "" {
+				code = "HTTP " + code
+			}
+		}
+		if code == "" {
+			code = "无明确错误码"
+		}
+		message, _ := stabilityProblemText(r.Content)
+		if message == "" {
+			message = "无错误原文"
+		}
+		return code + " · " + message
+	}
+	labels := make([]string, 0, len(r.AnomalyTags))
+	for _, tag := range r.AnomalyTags {
+		switch tag {
+		case "stream":
+			value := strings.TrimSpace(r.EndReason)
+			if value == "" {
+				value = "error_count>0"
+			}
+			labels = append(labels, "流故障("+value+")")
+		case logChainClientGoneEndReason:
+			labels = append(labels, "客户端断连")
+		case "billing_unpaid":
+			labels = append(labels, "扣费未交付")
+		case anomalyUndeliveredUnbilled:
+			labels = append(labels, "未交付·未扣费")
+		case "billing_free":
+			labels = append(labels, "交付未扣费")
+		default:
+			labels = append(labels, tag)
+		}
+	}
+	if len(labels) == 0 {
+		return "未分类问题"
+	}
+	return strings.Join(labels, " + ")
+}
+
+// computeLogChainBlastRadius 保留既有默认行为，供纯计算测试和其它包内调用使用。
+// HTTP handler 会走 computeLogChainBlastRadiusForScope，由实际生效的筛选决定模式。
 func computeLogChainBlastRadius(rows []LogChainRow) logChainBlastRadius {
+	return computeLogChainBlastRadiusMode(rows, logChainRadiusModeOverview, false)
+}
+
+func computeLogChainBlastRadiusForScope(rows []LogChainRow, scope logChainScope, hasMore bool) logChainBlastRadius {
+	mode := logChainRadiusModeOverview
+	if logChainScopeIsFocused(scope) {
+		mode = logChainRadiusModeFocused
+	}
+	return computeLogChainBlastRadiusMode(rows, mode, hasMore)
+}
+
+// computeLogChainBlastRadiusMode 只统计有问题的行（type=5 错误，或带异常标签的消费行）。
+// 把正常请求算进去会稀释集中度和原因占比。
+func computeLogChainBlastRadiusMode(rows []LogChainRow, mode string, hasMore bool) logChainBlastRadius {
 	type bucket struct {
 		count  int
 		spread map[string]struct{}
+	}
+	type reasonBucket struct {
+		count     int
+		customers map[string]struct{}
+		channels  map[string]struct{}
 	}
 	chans := map[string]*bucket{}
 	users := map[string]*bucket{}
 	domains := map[string]*bucket{}
 	models := map[string]*bucket{}
+	reasons := map[string]*reasonBucket{}
+	faults := map[string]int{}
 
 	add := func(m map[string]*bucket, key, spreadKey string) {
 		if key == "" {
@@ -141,6 +251,27 @@ func computeLogChainBlastRadius(rows []LogChainRow) logChainBlastRadius {
 		add(users, userKey, chanKey)
 		add(domains, r.UpstreamDomain, userKey)
 		add(models, r.ModelName, userKey)
+
+		reason := logChainPrimaryReason(r)
+		rb := reasons[reason]
+		if rb == nil {
+			rb = &reasonBucket{customers: map[string]struct{}{}, channels: map[string]struct{}{}}
+			reasons[reason] = rb
+		}
+		rb.count++
+		if userKey != "" {
+			rb.customers[userKey] = struct{}{}
+		}
+		if chanKey != "" {
+			rb.channels[chanKey] = struct{}{}
+		}
+		fault := r.Fault
+		switch fault {
+		case faultUpstream, faultOurs, faultDownstream, faultUnknown:
+		default:
+			fault = faultUnknown
+		}
+		faults[fault]++
 	}
 
 	top := func(m map[string]*bucket) logChainRadiusDim {
@@ -167,15 +298,85 @@ func computeLogChainBlastRadius(rows []LogChainRow) logChainBlastRadius {
 		return dim
 	}
 
-	br := logChainBlastRadius{
-		Rows:       problem,
-		ByChannel:  top(chans),
-		ByCustomer: top(users),
-		ByDomain:   top(domains),
-		ByModel:    top(models),
+	reasonItems := make([]logChainReasonItem, 0, len(reasons))
+	for reason, b := range reasons {
+		reasonItems = append(reasonItems, logChainReasonItem{
+			Reason: reason, Count: b.count, Customers: len(b.customers), Channels: len(b.channels),
+		})
 	}
-	br.Shape, br.ShapeWhy = logChainRadiusShapeOf(problem, len(chans), len(users), br)
+	sort.Slice(reasonItems, func(i, j int) bool {
+		if reasonItems[i].Count != reasonItems[j].Count {
+			return reasonItems[i].Count > reasonItems[j].Count
+		}
+		return reasonItems[i].Reason < reasonItems[j].Reason
+	})
+	reasonSummary := logChainReasonSummary{Items: reasonItems}
+	if len(reasonItems) > logChainRadiusMaxItems {
+		for _, it := range reasonItems[logChainRadiusMaxItems:] {
+			reasonSummary.OtherCount += it.Count
+		}
+		reasonSummary.OtherItems = len(reasonItems) - logChainRadiusMaxItems
+		reasonSummary.Items = reasonItems[:logChainRadiusMaxItems]
+	}
+	faultSummary := make([]logChainFaultCount, 0, 4)
+	for _, fault := range []string{faultUpstream, faultOurs, faultDownstream, faultUnknown} {
+		if count := faults[fault]; count > 0 {
+			faultSummary = append(faultSummary, logChainFaultCount{Fault: fault, Count: count})
+		}
+	}
+
+	br := logChainBlastRadius{
+		Mode:        mode,
+		Rows:        problem,
+		PageHasMore: hasMore,
+		ByChannel:   top(chans),
+		ByCustomer:  top(users),
+		ByDomain:    top(domains),
+		ByModel:     top(models),
+		Reasons:     reasonSummary,
+		Faults:      faultSummary,
+	}
+	if mode == logChainRadiusModeFocused {
+		br.ReasonShape, br.ReasonWhy = logChainFocusedReasonOf(problem, reasonItems, hasMore)
+	} else {
+		br.Shape, br.ShapeWhy = logChainRadiusShapeOf(problem, len(chans), len(users), br)
+	}
 	return br
+}
+
+// logChainFocusedReasonOf 分析已经被筛选条件缩小后的问题原因构成。
+// 这里分析的是本次查询已经返回的记录，不额外查询生产库；hasMore 为真时必须
+// 明说后面还有记录，不能把当前页比例冒充整个筛选范围。
+func logChainFocusedReasonOf(rows int, reasons []logChainReasonItem, hasMore bool) (string, string) {
+	coverage := "当前筛选结果已全部返回"
+	if hasMore {
+		coverage = "仅分析当前页 " + lcNum(rows) + " 条问题，筛选结果仍有更多记录"
+	}
+	if rows == 0 || len(reasons) == 0 {
+		return reasonShapeSmall, "当前返回结果中没有可归类的问题记录；" + coverage
+	}
+	pct := func(n int) int { return n * 100 / rows }
+	first := reasons[0]
+	firstText := first.Reason + "（" + lcNum(first.Count) + " 条，占 " + lcNum(pct(first.Count)) + "%）"
+	if rows < logChainRadiusMinRows {
+		return reasonShapeSmall, "当前记录较少，主要表现为 " + firstText +
+			"；这里只描述已返回记录，不外推长期主因；" + coverage
+	}
+	if first.Count*100 >= rows*50 {
+		return reasonShapeDominant, "当前返回问题以 " + firstText +
+			" 为主要表现；这是日志原因构成，不代表根因已经证实；" + coverage
+	}
+	if len(reasons) >= 2 {
+		second := reasons[1]
+		combined := first.Count + second.Count
+		if combined*100 >= rows*70 {
+			return reasonShapeDual, "当前返回问题主要由两类表现构成：" + firstText + "；" +
+				second.Reason + "（" + lcNum(second.Count) + " 条，占 " + lcNum(pct(second.Count)) + "%）" +
+				"；两类合计占 " + lcNum(pct(combined)) + "%；这不是已经证实的根因；" + coverage
+		}
+	}
+	return reasonShapeDistributed, "当前返回问题的原因较分散，最高项为 " + firstText +
+		"，未形成明确主因；请结合下方原因分布和逐行证据复核；" + coverage
 }
 
 // logChainRadiusChannelKey 渠道标识。带上名字便于人直接读懂，

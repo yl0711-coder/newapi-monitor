@@ -638,7 +638,161 @@ func (m *Monitor) recordStabilityProblemLiveFailure(cursor *StabilityProblemLive
 // sampleStabilityProblems is the recent/live lane. A classification migration
 // must never redirect this call to a 181-day-old cursor or lower its source
 // priority. Its own durable cursor extends the target but never skips a gap.
+func stabilityProblemSourceInitialRange(now int64, lookbackHours int) (int64, int64) {
+	to := (now - stabilityProblemFinalizeDelaySec) / 60 * 60
+	if lookbackHours < 1 {
+		lookbackHours = 24
+	}
+	if lookbackHours > 168 {
+		lookbackHours = 168
+	}
+	from := to - int64(lookbackHours)*3600
+	if from < 0 {
+		from = 0
+	}
+	return from, to
+}
+
+func (m *Monitor) stabilityProblemSourceRetryDelay() time.Duration {
+	var cursor StabilityProblemLiveCursor
+	if err := m.storeDB.First(&cursor, "id = ? AND traffic_class_version = ?", 1, stabilityTrafficClassificationVersion).Error; err == nil && cursor.NextRetryAt > 0 {
+		delay := time.Until(time.Unix(cursor.NextRetryAt, 0))
+		if delay > 0 {
+			return min(delay, 30*time.Second)
+		}
+	}
+	return 5 * time.Second
+}
+
+// startStabilityProblemSource runs only in the explicit logchain-only pilot.
+// It reads type=5 logs through the protected low lane and writes only local
+// SQLite. It never starts the ordinary sampler, Usage facts or user/token sync.
+func (m *Monitor) startStabilityProblemSource(ctx context.Context) {
+	if !m.cfg.StabilityProblemSourceEnabled || m.prodDB == nil {
+		return
+	}
+	m.problemSourceRunning.Store(true)
+	defer m.problemSourceRunning.Store(false)
+	from, target := stabilityProblemSourceInitialRange(time.Now().Unix(), m.cfg.StabilityProblemSourceLookbackHours)
+	// The pilot has an explicit 24-hour source boundary. Apply the one-time local
+	// cutover before the all-history classification gate; otherwise legacy NULL
+	// versions outside the approved window would incorrectly demand a 181-day
+	// migration and the pilot could never start.
+	if err := m.ensureStabilityProblemSourceCursor(from, target, time.Now().Unix()); err != nil {
+		m.problemLastFailure.Store(time.Now().Unix())
+		slog.Error("初始化问题签名独立采集水位失败", "err", err)
+		return
+	}
+	if err := m.resetStaleStabilityProblemClassification(); err != nil {
+		m.problemLastFailure.Store(time.Now().Unix())
+		slog.Error("问题签名独立采集因分类版本不一致停止", "err", err)
+		return
+	}
+
+	spanMinutes, healthyWindows := 12, 0
+	for {
+		if err := ctx.Err(); err != nil {
+			return
+		}
+		_, target = stabilityProblemSourceInitialRange(time.Now().Unix(), m.cfg.StabilityProblemSourceLookbackHours)
+		_, err := m.sampleStabilityProblemsTurn(ctx, from, target, int64(spanMinutes)*60, 1, true)
+		delay := stabilityProblemMigrationPollEvery
+		switch {
+		case err == nil:
+			healthyWindows++
+			if healthyWindows >= 10 {
+				spanMinutes = largerStabilityProblemMigrationSpan(spanMinutes)
+				healthyWindows = 0
+			}
+			var cursor StabilityProblemLiveCursor
+			if tx := m.storeDB.First(&cursor, "id = ? AND traffic_class_version = ?", 1, stabilityTrafficClassificationVersion); tx.Error == nil && cursor.NextTs >= target {
+				delay = time.Duration(stabilityProblemIntervalSeconds(m.cfg.StabilityProblemSampleSec)) * time.Second
+			}
+		case errors.Is(err, context.Canceled):
+			return
+		case errors.Is(err, errSourceNotReady):
+			return
+		case errors.Is(err, errStabilityProblemSourceGateWait):
+			delay = stabilityProblemMigrationGateYieldDelay
+		case errors.Is(err, errStabilityProblemLiveBackoff):
+			delay = m.stabilityProblemSourceRetryDelay()
+		default:
+			spanMinutes = smallerStabilityProblemMigrationSpan(spanMinutes)
+			healthyWindows = 0
+			delay = m.stabilityProblemSourceRetryDelay()
+			slog.Warn("问题签名独立采集失败(保留水位重试)", "span_minutes", spanMinutes, "err", err)
+		}
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
+		}
+	}
+}
+
+const stabilityProblemSourceCutoverCursorID = uint(2)
+
+func (m *Monitor) ensureStabilityProblemSourceCursor(fromTs, toTs, now int64) error {
+	fromTs, toTs = fromTs/60*60, toTs/60*60
+	if toTs <= fromTs {
+		return nil
+	}
+	return m.storeDB.Transaction(func(tx *gorm.DB) error {
+		var marker StabilityProblemLiveCursor
+		markerErr := tx.First(&marker, "id = ? AND traffic_class_version = ?",
+			stabilityProblemSourceCutoverCursorID, stabilityTrafficClassificationVersion).Error
+		if markerErr == nil {
+			// The dedicated lane has already cut over. ID=1 is now its durable
+			// acknowledged gap and must never be moved forward on restart.
+			return nil
+		}
+		if !errors.Is(markerErr, gorm.ErrRecordNotFound) {
+			return markerErr
+		}
+
+		// First activation deliberately replaces a historical full-worker cursor
+		// with the operator-approved finite lookback. Commit cursor+marker atomically;
+		// after this point all restarts resume ID=1 without another cutover.
+		// Remove all derived raw-problem rows before the approved end. Window rows
+		// may contain legacy NULL/old classification versions, so keeping them would
+		// fail the classification gate and could mix incompatible signatures. New
+		// rows are rebuilt from the read-only source. Future rows are left untouched.
+		for _, model := range []any{&StabilityProblemSample{}, &StabilityProblemStage{}, &StabilityProblemIngestState{}} {
+			if err := tx.Where("bucket_ts < ?", toTs).Delete(model).Error; err != nil {
+				return err
+			}
+		}
+		// A historical 181-day classification migration is no longer applicable to
+		// this explicitly bounded pilot; remove only its local derived cursor.
+		if err := tx.Where("id = ?", 1).Delete(&StabilityProblemClassificationMigration{}).Error; err != nil {
+			return err
+		}
+		cursor := StabilityProblemLiveCursor{
+			ID: 1, TrafficClassVersion: stabilityTrafficClassificationVersion,
+			NextTs: fromTs, TargetThroughTs: toTs, Status: "running", UpdatedAt: now,
+		}
+		if err := tx.Save(&cursor).Error; err != nil {
+			return err
+		}
+		marker = StabilityProblemLiveCursor{
+			ID: stabilityProblemSourceCutoverCursorID, TrafficClassVersion: stabilityTrafficClassificationVersion,
+			NextTs: fromTs, TargetThroughTs: toTs, Status: "caught_up", LastSuccessAt: now, UpdatedAt: now,
+		}
+		return tx.Create(&marker).Error
+	})
+}
+
 func (m *Monitor) sampleStabilityProblems(ctx context.Context, fromTs, toTs int64) (int, error) {
+	return m.sampleStabilityProblemsTurn(ctx, fromTs, toTs, 60, stabilityProblemLiveWindowsPerTurn, false)
+}
+
+// sampleStabilityProblemsTurn advances the same durable live cursor with a
+// caller-selected bounded window. The production sampler keeps the historical
+// 1-minute/high-priority behavior; the logchain-only pilot uses one adaptive
+// low-priority window per turn so it cannot monopolize the source.
+func (m *Monitor) sampleStabilityProblemsTurn(ctx context.Context, fromTs, toTs, span int64, maxWindows int, lowPriority bool) (int, error) {
 	if m.prodDB == nil || !m.cfg.StabilityEnabled {
 		return 0, nil
 	}
@@ -646,6 +800,13 @@ func (m *Monitor) sampleStabilityProblems(ctx context.Context, fromTs, toTs int6
 	requestedTo := toTs / 60 * 60
 	if requestedTo <= requestedFrom {
 		return 0, nil
+	}
+	if span < 60 {
+		span = 60
+	}
+	span = span / 60 * 60
+	if maxWindows < 1 {
+		maxWindows = 1
 	}
 	now := time.Now().Unix()
 	cursor, err := m.loadOrExtendStabilityProblemLiveCursor(requestedFrom, requestedTo, now)
@@ -655,29 +816,28 @@ func (m *Monitor) sampleStabilityProblems(ctx context.Context, fromTs, toTs int6
 	if cursor.NextRetryAt > now {
 		return 0, fmt.Errorf("%w: retry_at=%d", errStabilityProblemLiveBackoff, cursor.NextRetryAt)
 	}
-	const liveSpan = int64(60)
 	total := 0
-	for turn := 0; turn < stabilityProblemLiveWindowsPerTurn; turn++ {
+	for turn := 0; turn < maxWindows; turn++ {
 		turnNow := time.Now().Unix()
-		if err := m.advanceStabilityProblemLiveCursor(cursor, liveSpan, turnNow, false); err != nil {
+		if err := m.advanceStabilityProblemLiveCursor(cursor, span, turnNow, false); err != nil {
 			m.recordStabilityProblemLiveFailure(cursor, err, turnNow)
 			return total, err
 		}
 		if cursor.NextTs >= cursor.TargetThroughTs {
-			if err := m.advanceStabilityProblemLiveCursor(cursor, liveSpan, turnNow, true); err != nil {
+			if err := m.advanceStabilityProblemLiveCursor(cursor, span, turnNow, true); err != nil {
 				return total, err
 			}
 			return total, nil
 		}
 
-		windowTo := min(cursor.NextTs+liveSpan, cursor.TargetThroughTs)
-		count, err := m.sampleStabilityProblemWindow(ctx, cursor.NextTs, windowTo, false)
+		windowTo := min(cursor.NextTs+span, cursor.TargetThroughTs)
+		count, err := m.sampleStabilityProblemWindow(ctx, cursor.NextTs, windowTo, lowPriority)
 		total += count
 		if err != nil {
 			m.recordStabilityProblemLiveFailure(cursor, err, time.Now().Unix())
 			return total, err
 		}
-		if err := m.advanceStabilityProblemLiveCursor(cursor, liveSpan, time.Now().Unix(), true); err != nil {
+		if err := m.advanceStabilityProblemLiveCursor(cursor, span, time.Now().Unix(), true); err != nil {
 			return total, err
 		}
 	}
