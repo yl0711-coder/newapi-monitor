@@ -298,17 +298,6 @@ func TestInfraSnapshotReadOnlyIsOffByDefault(t *testing.T) {
 	}
 }
 
-func TestLoadSettingsManagedAWSInfraCanBeDelegatedToCloudWatch(t *testing.T) {
-	t.Setenv("MONITOR_INFRA_MANAGED_AWS_ENABLED", "")
-	if LoadSettings().InfraManagedAWSDisabled {
-		t.Fatal("managed AWS infra monitoring must stay enabled for legacy configurations")
-	}
-	t.Setenv("MONITOR_INFRA_MANAGED_AWS_ENABLED", "false")
-	if !LoadSettings().InfraManagedAWSDisabled {
-		t.Fatal("explicit false must delegate ECS/RDS/ALB monitoring to CloudWatch")
-	}
-}
-
 func TestValidateStabilityProblemSourceSettings(t *testing.T) {
 	valid := Settings{
 		StabilityEnabled: true, LogChainOnlySource: true,

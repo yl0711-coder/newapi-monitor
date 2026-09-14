@@ -160,21 +160,13 @@ func (m *Monitor) infraAssets(ctx context.Context) ([]InfraAsset, error) {
 	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
 	var assets []InfraAsset
-	err := m.storeDB.WithContext(ctx).Where("state NOT IN ?", []string{"removed", "linked"}).Order("first_seen DESC, id").Limit(infraAssetLimit + 1).Find(&assets).Error
+	query := m.monitorOwnedInfraAssetsQuery(m.storeDB.WithContext(ctx))
+	err := query.Where("state NOT IN ?", []string{"removed", "linked"}).Order("first_seen DESC, id").Limit(infraAssetLimit + 1).Find(&assets).Error
 	if err != nil {
 		return nil, err
 	}
 	if len(assets) > infraAssetLimit {
 		return nil, errors.New("resource registry exceeds bounded view; administrative pagination required")
-	}
-	if m.cfg.InfraManagedAWSDisabled {
-		visible := assets[:0]
-		for _, asset := range assets {
-			if !managedAWSInfraResource(asset.Resource, asset.Kind, asset.Platform) {
-				visible = append(visible, asset)
-			}
-		}
-		assets = visible
 	}
 	return assets, nil
 }

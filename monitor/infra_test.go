@@ -263,30 +263,3 @@ func TestInfraExcludedResourceIsNotShown(t *testing.T) {
 		t.Fatalf("自动发现目标应排除 Redis，得 %+v", got)
 	}
 }
-
-func TestManagedAWSInfraCanBeHiddenWhileLightsailRemains(t *testing.T) {
-	m := newTestMonitor(t)
-	m.cfg.InfraManagedAWSDisabled = true
-	const bucket = 1_700_000_000 / 60 * 60
-	if err := m.upsertInfra([]InfraSample{
-		{BucketTs: bucket, Resource: "Ubuntu-1", RType: "instance", Metric: "cpu", Value: 5},
-		{BucketTs: bucket, Resource: "ecs/nexusapi-prod-cluster/nexusapi-prod-worker-canary", RType: "ecs_service", Metric: "cpu", Value: 10},
-		{BucketTs: bucket, Resource: "rds/nexusapi-mysql-prod", RType: "database", Metric: "cpu", Value: 10},
-		{BucketTs: bucket, Resource: "alb/nexusapi-alb", RType: "lb", Metric: "healthy", Value: 1},
-		{BucketTs: bucket, Resource: "AWS 资源发现/ECS/Fargate", RType: "inventory", Metric: "discovery_ok", Value: 1},
-		{BucketTs: bucket, Resource: "AWS 资源发现/Lightsail/实例", RType: "inventory", Metric: "discovery_ok", Value: 1},
-	}); err != nil {
-		t.Fatal(err)
-	}
-
-	snap := m.computeInfraSnapshot(bucket + 30)
-	if len(snap.Instances) != 1 || snap.Instances[0].Name != "Ubuntu-1" {
-		t.Fatalf("only Lightsail host should remain, got %+v", snap.Instances)
-	}
-	if len(snap.Databases) != 0 || len(snap.LoadBalancers) != 0 {
-		t.Fatalf("managed databases/load balancers leaked into snapshot: %+v", snap)
-	}
-	if len(snap.Discoveries) != 1 || snap.Discoveries[0].Name != "AWS 资源发现/Lightsail/实例" {
-		t.Fatalf("managed discovery rows leaked into snapshot: %+v", snap.Discoveries)
-	}
-}

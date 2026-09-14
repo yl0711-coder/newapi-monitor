@@ -23,7 +23,8 @@ func (m *Monitor) infraAssetPage(ctx context.Context, activeAfter, archivedAfter
 	err := m.storeDB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		read := func(state, after string) ([]InfraAsset, string, error) {
 			var rows []InfraAsset
-			if err := tx.Where("state = ? AND id > ?", state, after).Order("id").Limit(infraAssetPageSize + 1).Find(&rows).Error; err != nil {
+			query := m.monitorOwnedInfraAssetsQuery(tx)
+			if err := query.Where("state = ? AND id > ?", state, after).Order("id").Limit(infraAssetPageSize + 1).Find(&rows).Error; err != nil {
 				return nil, "", err
 			}
 			next := ""
