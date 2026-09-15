@@ -133,6 +133,66 @@ func TestNewapiAuth(t *testing.T) {
 	}
 }
 
+func TestNewapiAuthRC26NestedUser(t *testing.T) {
+	selfCalled := false
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/user/login", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"success": true,
+			"data": map[string]any{
+				"access_token": "rc26-access-token",
+				"user": map[string]any{
+					"username":     "root",
+					"display_name": "RC26 管理员",
+					"role":         100,
+				},
+			},
+		})
+	})
+	mux.HandleFunc("/api/user/self", func(w http.ResponseWriter, r *http.Request) {
+		selfCalled = true
+		w.WriteHeader(http.StatusUnauthorized)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	m := &Monitor{cfg: Settings{NewAPIBaseURL: srv.URL}}
+	role, name, err := m.newapiAuth("root", "good")
+	if err != nil || role != 100 || name != "RC26 管理员" {
+		t.Fatalf("RC26 登录: role=%d name=%q err=%v", role, name, err)
+	}
+	if selfCalled {
+		t.Fatal("RC26 登录响应已带用户角色，不应再请求 /api/user/self")
+	}
+}
+
+func TestNewapiAuthBearerFallback(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/user/login", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"success": true,
+			"data":    map[string]any{"access_token": "fallback-access-token"},
+		})
+	})
+	mux.HandleFunc("/api/user/self", func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != "Bearer fallback-access-token" {
+			t.Fatalf("Authorization=%q", got)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"success": true,
+			"data":    map[string]any{"username": "admin", "role": 10},
+		})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	m := &Monitor{cfg: Settings{NewAPIBaseURL: srv.URL}}
+	role, name, err := m.newapiAuth("admin", "good")
+	if err != nil || role != 10 || name != "admin" {
+		t.Fatalf("Bearer fallback: role=%d name=%q err=%v", role, name, err)
+	}
+}
+
 func TestSession(t *testing.T) {
 	m := &Monitor{cfg: Settings{SessionSecret: "secret-a"}}
 	now := time.Now().Unix()
