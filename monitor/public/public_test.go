@@ -56,16 +56,35 @@ type channelSnap struct {
 
 func (channelSnap) TableName() string { return "channel_snaps" }
 
+type selectablePair struct {
+	Grp   string `gorm:"primaryKey;column:grp"`
+	Model string `gorm:"primaryKey;column:model"`
+}
+
+func (selectablePair) TableName() string { return "selectable_pairs" }
+
 func testDB(t *testing.T) *gorm.DB {
 	t.Helper()
 	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
-	if err := db.AutoMigrate(&metricSample{}, &channelSnap{}); err != nil {
+	if err := db.AutoMigrate(&metricSample{}, &channelSnap{}, &selectablePair{}); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
 	return db
+}
+
+func TestVisibleGroupsUseLocalSelectablePairs(t *testing.T) {
+	db := testDB(t)
+	if err := db.Create(&[]selectablePair{{Grp: "vip", Model: "m1"}, {Grp: "default", Model: "m2"}}).Error; err != nil {
+		t.Fatal(err)
+	}
+	h := &handler{db: db, cfg: Config{NewAPIBaseURL: "http://127.0.0.1:1"}}
+	groups := h.fetchUsableGroups()
+	if len(groups) != 2 || groups[0].Key != "default" || groups[1].Key != "vip" {
+		t.Fatalf("groups = %+v, want default,vip from local selectable pairs", groups)
+	}
 }
 
 func TestComputeTopologyAndTraffic(t *testing.T) {
