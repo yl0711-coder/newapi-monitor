@@ -24,11 +24,55 @@ import (
 )
 
 const (
+	websiteGroupUsableOption  = "UserUsableGroups"
 	websiteGroupSpecialOption = "group_ratio_setting.group_special_usable_group"
 	websiteGroupRatioOption   = "GroupRatio"
 	maxWebsiteGroupSources    = 500
-	maxWebsiteGroupPayload    = 2 << 20
 )
+
+// fetchConfiguredWebsiteGroups reads the same authoritative option used by
+// NewAPI's /api/pricing handler.  RC26 can require dashboard authentication
+// for that HTTP route, while Monitor already has a read-only production DB
+// connection.  Reading the option directly keeps this projection read-only
+// and independent from website navigation/authentication policy.
+func (m *Monitor) fetchConfiguredWebsiteGroups(ctx context.Context) ([]string, error) {
+	if m.prodDB == nil {
+		return nil, errors.New("生产库只读连接未配置")
+	}
+	var raw sql.NullString
+	err := m.prodDB.QueryRowContext(ctx, "SELECT `value` FROM options WHERE `key` = ? LIMIT 1", websiteGroupUsableOption).Scan(&raw)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, errors.New("NewAPI 未返回 UserUsableGroups 配置")
+	}
+	if err != nil {
+		return nil, fmt.Errorf("读取 NewAPI 可选分组配置失败: %w", err)
+	}
+	if !raw.Valid || strings.TrimSpace(raw.String) == "" {
+		return nil, errors.New("NewAPI UserUsableGroups 配置为空")
+	}
+	var configured map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(raw.String), &configured); err != nil {
+		return nil, fmt.Errorf("解析 NewAPI 可选分组配置失败: %w", err)
+	}
+	groups := make([]string, 0, len(configured))
+	seen := make(map[string]struct{}, len(configured))
+	for name := range configured {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		if _, ok := seen[name]; ok {
+			continue
+		}
+		seen[name] = struct{}{}
+		groups = append(groups, name)
+	}
+	sort.Strings(groups)
+	if len(groups) == 0 {
+		return nil, errors.New("NewAPI UserUsableGroups 没有有效分组")
+	}
+	return groups, nil
+}
 
 // WebsiteGroupCatalog 是 NewAPI 当前可用分组的本地目录快照。
 // Active=false 的记录不删除，以便历史倍率版本仍能解释旧数据。
@@ -57,7 +101,7 @@ type websiteGroupSource struct {
 }
 
 // collectWebsiteGroupSources 合并三类当前权威来源：
-//   - /api/pricing 的普通用户可选分组；
+//   - UserUsableGroups 中的普通用户可选分组；
 //   - options 中按用户分组追加的“特殊可用分组”；
 //   - 当前有效用户的默认分组和有效令牌显式指定的分组。
 //
@@ -187,11 +231,9 @@ func parseWebsiteGroupRatio(raw json.RawMessage) (float64, error) {
 	return value, nil
 }
 
-// mergeWebsiteGroupRatios combines the public pricing view with NewAPI's
-// authoritative GroupRatio option.  /api/pricing intentionally omits groups
-// hidden from ordinary users, while those groups can still be assigned through
-// group_special_usable_group.  The option therefore wins on duplicate names
-// and supplies ratios for special-only/configured-channel groups.
+// mergeWebsiteGroupRatios combines an optional pricing view with NewAPI's
+// authoritative GroupRatio option.  The option wins on duplicate names and
+// supplies ratios for special-only/configured-channel groups.
 func mergeWebsiteGroupRatios(public map[string]json.RawMessage, optionRaw string) (map[string]float64, error) {
 	ratios := make(map[string]float64, len(public))
 	merge := func(values map[string]json.RawMessage) {
@@ -216,39 +258,13 @@ func mergeWebsiteGroupRatios(public map[string]json.RawMessage, optionRaw string
 	return ratios, nil
 }
 
-type websiteGroupPricingResponse struct {
-	UsableGroup map[string]json.RawMessage `json:"usable_group"`
-	GroupRatio  map[string]json.RawMessage `json:"group_ratio"`
-}
-
 func (m *Monitor) fetchWebsiteGroupSources(ctx context.Context) ([]websiteGroupSource, int, error) {
 	if m.prodDB == nil {
 		return nil, 0, errors.New("生产库只读连接未配置")
 	}
-	base := strings.TrimRight(strings.TrimSpace(m.cfg.NewAPIBaseURL), "/")
-	if base == "" {
-		return nil, 0, errors.New("NewAPI 地址未配置")
-	}
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, base+"/api/pricing", nil)
+	usable, err := m.fetchConfiguredWebsiteGroups(ctx)
 	if err != nil {
-		return nil, 0, fmt.Errorf("构造分组目录请求失败: %w", err)
-	}
-	client := &http.Client{Timeout: 8 * time.Second}
-	response, err := client.Do(request)
-	if err != nil {
-		return nil, 0, fmt.Errorf("读取 NewAPI 可选分组失败: %w", err)
-	}
-	defer response.Body.Close()
-	if response.StatusCode != http.StatusOK {
-		return nil, 0, fmt.Errorf("读取 NewAPI 可选分组失败: HTTP %d", response.StatusCode)
-	}
-	var pricing websiteGroupPricingResponse
-	if err := json.NewDecoder(io.LimitReader(response.Body, maxWebsiteGroupPayload)).Decode(&pricing); err != nil {
-		return nil, 0, fmt.Errorf("解析 NewAPI 分组目录失败: %w", err)
-	}
-	usable := make([]string, 0, len(pricing.UsableGroup))
-	for name := range pricing.UsableGroup {
-		usable = append(usable, name)
+		return nil, 0, err
 	}
 	special := map[string]map[string]string{}
 	var groupRatioRaw string
@@ -281,7 +297,7 @@ func (m *Monitor) fetchWebsiteGroupSources(ctx context.Context) ([]websiteGroupS
 		return nil, 0, fmt.Errorf("读取 NewAPI 分组配置失败: %w", err)
 	}
 	rows.Close()
-	ratios, err := mergeWebsiteGroupRatios(pricing.GroupRatio, groupRatioRaw)
+	ratios, err := mergeWebsiteGroupRatios(nil, groupRatioRaw)
 	if err != nil {
 		return nil, 0, err
 	}

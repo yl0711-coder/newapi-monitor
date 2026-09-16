@@ -229,7 +229,7 @@ const enabledChanFilter = ` AND NOT EXISTS (SELECT 1 FROM channel_snaps c ` +
 // channelDim 是"按渠道"维度的列名;该维度不施加 enabledChanFilter / selectableFilter。
 const channelDim = "channel_id"
 
-// SelectablePair 是"用户真能选到"的 (分组, 模型) 对:该分组在 /api/pricing 可见,且有启用渠道配置了它。
+// SelectablePair 是"用户真能选到"的 (分组, 模型) 对:该分组在 UserUsableGroups 中,且有启用渠道配置了它。
 // 采样器每周期重算(可见分组 ∩ 启用渠道配置)。监控的稳定性聚合只统计在此表里的对——
 // 不可选的(误路由 / 全禁用 / 只在不可选分组)不计入监控与报警("都不能选了报什么警")。
 type SelectablePair struct {
@@ -238,7 +238,7 @@ type SelectablePair struct {
 }
 
 // selectableFilter 把"不可选的 (分组,模型)"排除出监控聚合;
-// 表为空(未拉到 /api/pricing / 新部署首刷前)时 fail-open 不过滤,避免空窗。
+// 表为空(未读到 UserUsableGroups / 新部署首刷前)时 fail-open 不过滤,避免空窗。
 // 仅用于跨(分组/模型)聚合(总览/分组/模型/趋势);按渠道明细不加,排障仍能看误路由等异常。
 const selectableFilter = ` AND (NOT EXISTS (SELECT 1 FROM selectable_pairs) OR ` +
 	`EXISTS (SELECT 1 FROM selectable_pairs sp WHERE sp.grp = metric_samples.grp AND sp.model = metric_samples.model_name))`

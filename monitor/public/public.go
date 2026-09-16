@@ -2,13 +2,12 @@
 //   - 独立包,绝不 import 内部 monitor 的任何结构(Snapshot/Row/TokenRow…),
 //     输出全部用本包自己的脱敏结构体从零拼,编译层杜绝内部数据外泄;
 //   - 只读本地采样库(metric_samples 流量 + channel_snaps 渠道健康),不碰生产库;
-//   - 维度 = 线路(分组)× 模型,渠道对用户透明;可见分组取自 new-api /api/pricing 的 usable_group。
+//   - 维度 = 线路(分组)× 模型,渠道对用户透明;可见分组取自 Monitor 本地 selectable_pairs。
 //
 // 公开面【绝不输出】:渠道名/ID/IP、成本/配额、令牌/用户、请求量/QPS、错误详情。
 package public
 
 import (
-	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -51,7 +50,7 @@ const (
 
 // Config 是看板所需的最小配置(由 monitor 注入)。
 type Config struct {
-	NewAPIBaseURL string // 用于匿名拉取 /api/pricing 的可见分组;为空则退回"有流量的分组"
+	NewAPIBaseURL string // 保留为兼容配置；可见分组由 Monitor 本地 selectable_pairs 提供
 	SiteName      string // 站点名:部署时从主站 system_name 同步;为空则前端显通用名(不硬编码)
 	Logo          string // 站点 logo 绝对 URL:从主站同步,供前端做 favicon;可空
 }
@@ -346,7 +345,9 @@ func (h *handler) series(since int64) map[string][]seriesPt {
 	return out
 }
 
-// visibleGroups 拉取 new-api 可见分组(令牌可选);失败则退回"近窗有流量的分组"。带缓存。
+// visibleGroups 从 Monitor 已维护的 selectable_pairs 读取可见分组；失败则
+// 退回"近窗有流量的分组"。这样不依赖 RC26 可被设为登录后可见的
+// /api/pricing，同时保持公开看板只读取本地事实库。带缓存。
 func (h *handler) visibleGroups(now int64, totals map[string]agg) []vgroup {
 	h.grpMu.Lock()
 	if h.groups != nil && now-h.grpAt < groupsTTL {
@@ -376,32 +377,18 @@ func (h *handler) visibleGroups(now int64, totals map[string]agg) []vgroup {
 }
 
 func (h *handler) fetchUsableGroups() []vgroup {
-	if h.cfg.NewAPIBaseURL == "" {
+	var rows []struct {
+		Grp string `gorm:"column:grp"`
+	}
+	if err := h.db.Raw("SELECT DISTINCT grp FROM selectable_pairs WHERE TRIM(grp) <> '' ORDER BY grp").Scan(&rows).Error; err != nil {
 		return nil
 	}
-	cl := &http.Client{Timeout: 5 * time.Second}
-	resp, err := cl.Get(strings.TrimRight(h.cfg.NewAPIBaseURL, "/") + "/api/pricing")
-	if err != nil {
-		return nil
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
-		return nil
-	}
-	var body struct {
-		UsableGroup map[string]string `json:"usable_group"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
-		return nil
-	}
-	var vgs []vgroup
-	for k := range body.UsableGroup {
-		if k == "" {
-			continue
+	vgs := make([]vgroup, 0, len(rows))
+	for _, row := range rows {
+		name := strings.TrimSpace(row.Grp)
+		if name != "" {
+			vgs = append(vgs, vgroup{Key: name, Name: name})
 		}
-		// 显示名直接用分组 key(= 用户建令牌所选,如 codex-1.2x);
-		// usable_group 的描述(desc)可能含"逆向/openclaw/折扣"等敏感字样,不对外。
-		vgs = append(vgs, vgroup{Key: k, Name: k})
 	}
 	return vgs
 }

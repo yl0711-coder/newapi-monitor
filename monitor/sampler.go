@@ -3,7 +3,6 @@ package monitor
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -1173,37 +1172,20 @@ func (m *Monitor) refreshChannelsContext(parent context.Context) error {
 	return nil
 }
 
-// fetchUsableGroups 从 new-api 的 /api/pricing(匿名可读)取可见分组(用户创建令牌时能选的分组)。
+// fetchUsableGroups 从 NewAPI 的 UserUsableGroups 配置读取用户可选分组。
+// RC26 可将 /api/pricing 设置为登录后可见，因此不能再依赖匿名 HTTP。
 func (m *Monitor) fetchUsableGroups() []string {
-	base := strings.TrimRight(m.cfg.NewAPIBaseURL, "/")
-	if base == "" {
-		return nil
-	}
-	cl := &http.Client{Timeout: 5 * time.Second}
-	resp, err := cl.Get(base + "/api/pricing")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	groups, err := m.fetchConfiguredWebsiteGroups(ctx)
 	if err != nil {
+		slog.Warn("读取 NewAPI 可选分组配置失败，保留上一版可选模型快照", "err", err)
 		return nil
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
-		return nil
-	}
-	var body struct {
-		UsableGroup map[string]string `json:"usable_group"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
-		return nil
-	}
-	out := make([]string, 0, len(body.UsableGroup))
-	for k := range body.UsableGroup {
-		if k != "" {
-			out = append(out, k)
-		}
-	}
-	return out
+	return groups
 }
 
-// refreshSelectable 重算"可选 (分组,模型) 对" = 可见分组(/api/pricing) ∩ 启用渠道配置(channel_snaps),
+// refreshSelectable 重算"可选 (分组,模型) 对" = 可见分组(UserUsableGroups) ∩ 启用渠道配置(channel_snaps),
 // 写入 selectable_pairs。拉不到可见分组则不动旧表(避免误清空导致监控全过滤为空)。
 func (m *Monitor) refreshSelectable() {
 	groups := m.fetchUsableGroups()
