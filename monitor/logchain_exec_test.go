@@ -165,6 +165,15 @@ func logChainAnomalyFixture() []logChainSeedRow {
 		{ID: 12, CreatedAt: 1012, Type: 2, UserID: 8, Username: "bob", ChannelID: 4,
 			ModelName: "gpt-4o", Quota: 400, CompletionTokens: 0, UseTime: 61,
 			Other: `{"stream_status":{"end_reason":"client_gone"},"request_path":"/v1/chat/completions"}`},
+
+		// —— 消费异常：未交付且未扣费（稳定性 B2）——
+		{ID: 14, CreatedAt: 1014, Type: 2, UserID: 8, Username: "bob", ChannelID: 4,
+			ModelName: "gpt-5.6-terra", Quota: 0, PromptTokens: 0, CompletionTokens: 0,
+			Content: "上游没有返回计费信息，无法扣费（可能是上游超时）", Other: eof},
+		// 非文本端点零输出零费用属正常，不能因补 B2 而误报。
+		{ID: 15, CreatedAt: 1015, Type: 2, UserID: 8, Username: "bob", ChannelID: 4,
+			ModelName: "dall-e-3", Quota: 0, CompletionTokens: 0,
+			Other: `{"request_path":"/v1/images/generations"}`},
 	}
 }
 
@@ -186,10 +195,12 @@ func anomalyKindAcceptsTags(kind string, row LogChainRow) bool {
 		return has(logChainClientGoneEndReason)
 	case anomalyBillingUnpaid:
 		return has("billing_unpaid")
+	case anomalyUndeliveredUnbilled:
+		return has(anomalyUndeliveredUnbilled)
 	case anomalyBillingFree:
 		return has("billing_free")
 	case anomalyBilling:
-		return has("billing_unpaid") || has("billing_free")
+		return has("billing_unpaid") || has(anomalyUndeliveredUnbilled) || has("billing_free")
 	case anomalyAll:
 		return len(row.AnomalyTags) > 0
 	case anomalyErrAnom:
@@ -218,13 +229,13 @@ func TestLogChainAnomalySQLMatchesTagsOnRealRows(t *testing.T) {
 	if err != nil {
 		t.Fatalf("基准查询失败: %v", err)
 	}
-	if len(baseRows) != 13 {
-		t.Fatalf("fixture 应有 13 行落在默认 type IN (2,5) 内，got=%d", len(baseRows))
+	if len(baseRows) != 15 {
+		t.Fatalf("fixture 应有 15 行落在默认 type IN (2,5) 内，got=%d", len(baseRows))
 	}
 
 	for _, kind := range []string{
-		anomalyStream, anomalyClientGone, anomalyBillingUnpaid, anomalyBillingFree,
-		anomalyBilling, anomalyAll, anomalyErrAnom,
+		anomalyStream, anomalyClientGone, anomalyBillingUnpaid, anomalyUndeliveredUnbilled,
+		anomalyBillingFree, anomalyBilling, anomalyAll, anomalyErrAnom,
 	} {
 		t.Run(kind, func(t *testing.T) {
 			scope := all
@@ -338,6 +349,21 @@ func TestLogChainAnomalyExclusionsHoldOnRealRows(t *testing.T) {
 		for _, want := range []int64{3, 4, 5, 12} {
 			if !got[want] {
 				t.Errorf("id=%d 应出现在「全部异常」里（拆档后 all 必须是三档并集）", want)
+			}
+		}
+	})
+
+	t.Run("未交付且未扣费纳入B2_非文本端点不误报", func(t *testing.T) {
+		got := pick(t, anomalyUndeliveredUnbilled)
+		if !got[14] {
+			t.Error("id=14 是文本端点零输出零费用，应判为未交付·未扣费（稳定性 B2）")
+		}
+		if got[15] {
+			t.Error("id=15 是图片端点，零文本输出属正常，不得误报为未交付·未扣费")
+		}
+		for _, kind := range []string{anomalyBilling, anomalyAll, anomalyErrAnom} {
+			if !pick(t, kind)[14] {
+				t.Errorf("id=14 应被 %s 并集纳入", kind)
 			}
 		}
 	})
@@ -551,6 +577,8 @@ func TestLogChainFiltersSelectExpectedRowsOnRealRows(t *testing.T) {
 		want  []int64
 	}{
 		{"按客户 ID", logChainScope{UserID: 7}, []int64{3, 1}},
+		{"按客户名(精确)", logChainScope{Username: "alice"}, []int64{3, 1}},
+		{"客户名与客户 ID 取交集", logChainScope{Username: "alice", UserID: 7}, []int64{3, 1}},
 		{"按渠道", logChainScope{ChannelID: 4}, []int64{3, 2}},
 		{"按模型(精确)", logChainScope{Model: "gpt-4o"}, []int64{3, 1}},
 		{"按分组", logChainScope{Group: "vip"}, []int64{3, 1}},
@@ -731,7 +759,7 @@ func TestLogChainAnomalySQLRunsForEveryKind(t *testing.T) {
 	})
 	for _, kind := range []string{
 		anomalyStream, anomalyClientGone, anomalyBilling, anomalyBillingUnpaid,
-		anomalyBillingFree, anomalyAll, anomalyErrAnom,
+		anomalyUndeliveredUnbilled, anomalyBillingFree, anomalyAll, anomalyErrAnom,
 	} {
 		t.Run(kind, func(t *testing.T) {
 			scope := logChainScope{FromTs: 0, ToTs: 9999, Limit: 50, Anomaly: kind}

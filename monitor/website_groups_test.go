@@ -90,6 +90,73 @@ func TestFetchEffectiveWebsiteGroupsUsesOnlyActiveUsersAndTokens(t *testing.T) {
 	}
 }
 
+func TestFetchConfiguredWebsiteGroupsReadsAuthoritativeOption(t *testing.T) {
+	db, err := sql.Open("sqlite", t.TempDir()+"/configured-groups.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	if _, err := db.Exec("CREATE TABLE options (`key` TEXT PRIMARY KEY, `value` TEXT)"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec("INSERT INTO options(`key`,`value`) VALUES (?,?)", websiteGroupUsableOption, `{" vip ":"VIP","default":"默认","":"忽略"}`); err != nil {
+		t.Fatal(err)
+	}
+	m := &Monitor{prodDB: db}
+	groups, err := m.fetchConfiguredWebsiteGroups(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"default", "vip"}; !reflect.DeepEqual(groups, want) {
+		t.Fatalf("configured groups = %v, want %v", groups, want)
+	}
+}
+
+func TestFetchWebsiteGroupSourcesDoesNotDependOnPricingHTTP(t *testing.T) {
+	db, err := sql.Open("sqlite", t.TempDir()+"/website-group-sources.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	for _, statement := range []string{
+		"CREATE TABLE options (`key` TEXT PRIMARY KEY, `value` TEXT)",
+		"CREATE TABLE users (id INTEGER PRIMARY KEY, status INTEGER, deleted_at TIMESTAMP, `group` TEXT)",
+		"CREATE TABLE tokens (id INTEGER PRIMARY KEY, user_id INTEGER, status INTEGER, deleted_at TIMESTAMP, `group` TEXT)",
+		`INSERT INTO users(id,status,deleted_at,"group") VALUES (1,1,NULL,'hidden-live')`,
+		`INSERT INTO tokens(id,user_id,status,deleted_at,"group") VALUES (1,1,1,NULL,'')`,
+	} {
+		if _, err := db.Exec(statement); err != nil {
+			t.Fatalf("schema/fixture: %v", err)
+		}
+	}
+	options := map[string]string{
+		websiteGroupUsableOption:  `{"default":"默认分组"}`,
+		websiteGroupRatioOption:   `{"default":1,"hidden-live":0.7,"special":1.2}`,
+		websiteGroupSpecialOption: `{"default":{"+:special":"特殊分组"}}`,
+	}
+	for key, value := range options {
+		if _, err := db.Exec("INSERT INTO options(`key`,`value`) VALUES (?,?)", key, value); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// BaseURL 故意不可用：RC26 可保护 /api/pricing，本功能仍应完全依靠只读数据库成功。
+	m := &Monitor{prodDB: db, cfg: Settings{NewAPIBaseURL: "http://127.0.0.1:1"}}
+	sources, skipped, err := m.fetchWebsiteGroupSources(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if skipped != 0 {
+		t.Fatalf("skipped = %d, want 0", skipped)
+	}
+	got := make([]string, 0, len(sources))
+	for _, source := range sources {
+		got = append(got, source.Name)
+	}
+	if want := []string{"default", "hidden-live", "special"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("sources = %v, want %v", got, want)
+	}
+}
+
 func TestParseWebsiteGroupRatio(t *testing.T) {
 	for _, test := range []struct {
 		name string

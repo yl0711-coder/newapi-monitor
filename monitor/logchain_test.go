@@ -8,6 +8,8 @@ package monitor
 
 import (
 	"context"
+	"encoding/json"
+	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strconv"
@@ -88,6 +90,452 @@ func TestParseLogChainScopeRejectsContradictions(t *testing.T) {
 	// error_only + type=5 不矛盾,应放行。
 	if _, err := parseLogChainScope(newLogChainCtx("error_only=true&type=5"), now); err != nil {
 		t.Fatalf("error_only=true&type=5 应放行: %v", err)
+	}
+}
+
+func TestParseLogChainScopeStrictUserID(t *testing.T) {
+	now := time.Date(2026, 8, 19, 12, 0, 0, 0, cstLocation)
+	for _, query := range []string{
+		"user_id=", "user_id=0", "user_id=-1", "user_id=abc",
+		"user_id=9223372036854775808", "user_id=1&user_id=2",
+	} {
+		t.Run(query, func(t *testing.T) {
+			_, err := parseLogChainScope(newLogChainCtx(query), now)
+			if err == nil || !strings.Contains(err.Error(), "user_id") {
+				t.Fatalf("非法 user_id 不得静默退化为未筛选: err=%v", err)
+			}
+		})
+	}
+
+	s, err := parseLogChainScope(newLogChainCtx("user_id=102&token_name=123456"), now)
+	if err != nil {
+		t.Fatalf("合法客户 ID 与纯数字令牌名应可同时使用: %v", err)
+	}
+	if s.UserID != 102 || s.TokenName != "123456" {
+		t.Fatalf("筛选解析错误: user_id=%d token_name=%q", s.UserID, s.TokenName)
+	}
+	where, args := logChainWhere(s, nil)
+	if !strings.Contains(where, "user_id = ? AND token_name LIKE ?") {
+		t.Fatalf("同时填写时应按交集查询: %s", where)
+	}
+	if len(args) < 4 || args[2] != int64(102) || args[3] != "%123456%" {
+		t.Fatalf("客户/令牌参数不正确: %#v", args)
+	}
+}
+
+// TestParseLogChainScopeTokenIDEndpointStream 令牌 ID / 端点 / 流式三项筛选。
+//
+// 同样遵守“出现即必须合法”：静默忽略会让人以为按令牌、端点或流式筛过了，
+// 实际拿到的是未筛结果，据此得出的结论会覆盖到不相关的请求上。
+func TestParseLogChainScopeTokenIDEndpointStream(t *testing.T) {
+	now := time.Date(2026, 9, 9, 12, 0, 0, 0, cstLocation)
+	for _, tc := range []struct{ query, field string }{
+		{"token_id=", "token_id"},
+		{"token_id=abc", "token_id"},
+		{"token_id=0", "token_id"},
+		{"token_id=-1", "token_id"},
+		{"token_id=1&token_id=2", "token_id"},
+		{"endpoint=", "endpoint"},
+		{"endpoint=%20", "endpoint"},
+		{"endpoint=/a&endpoint=/b", "endpoint"},
+		{"stream=", "stream"},
+		{"stream=yes", "stream"},
+		{"stream=1", "stream"},
+		{"stream=true&stream=false", "stream"},
+	} {
+		t.Run(tc.query, func(t *testing.T) {
+			if _, err := parseLogChainScope(newLogChainCtx(tc.query), now); err == nil ||
+				!strings.Contains(err.Error(), tc.field) {
+				t.Fatalf("非法 %s 不得静默退化为未筛选: err=%v", tc.field, err)
+			}
+		})
+	}
+
+	s, err := parseLogChainScope(newLogChainCtx(
+		"token_id=77&endpoint=%2Fv1%2Fchat%2Fcompletions&stream=true"), now)
+	if err != nil {
+		t.Fatalf("合法参数应放行: %v", err)
+	}
+	if s.TokenID != 77 || s.Endpoint != "/v1/chat/completions" || s.Stream != "true" {
+		t.Fatalf("解析结果不正确: %#v", s)
+	}
+	where, args := logChainWhere(s, nil)
+	if !strings.Contains(where, "token_id = ?") {
+		t.Errorf("令牌 ID 条件未进入 SQL: %s", where)
+	}
+	if !strings.Contains(where, "$.request_path") {
+		t.Errorf("端点必须读 other.request_path: %s", where)
+	}
+	if !strings.Contains(where, "COALESCE(is_stream,0) = 1") {
+		t.Errorf("流式条件未进入 SQL: %s", where)
+	}
+	if !containsArg(args, "/v1/chat/completions") || !containsArg(args, int64(77)) {
+		t.Errorf("筛选值必须参数化: %#v", args)
+	}
+
+	// 非流式必须把历史 NULL 当作非流式，否则这些行会整片漏掉。
+	nonStream, err := parseLogChainScope(newLogChainCtx("stream=false"), now)
+	if err != nil {
+		t.Fatalf("stream=false 应放行: %v", err)
+	}
+	if w, _ := logChainWhere(nonStream, nil); !strings.Contains(w, "COALESCE(is_stream,0) = 0") {
+		t.Errorf("非流式应把 NULL 视为非流式: %s", w)
+	}
+
+	// 端点/流式选择性太低且端点无索引，不能当作可收窄条件放行多日查询。
+	if logChainHasNarrowingFilter(logChainScope{Endpoint: "/v1/chat/completions"}, nil) {
+		t.Error("端点读 JSON 且无索引，不得算作可收窄筛选")
+	}
+	if logChainHasNarrowingFilter(logChainScope{Stream: "true"}, nil) {
+		t.Error("流式只有两个取值，不得算作可收窄筛选")
+	}
+	if !logChainHasNarrowingFilter(logChainScope{TokenID: 77}, nil) {
+		t.Error("token_id 是有索引的真实列，应算作可收窄筛选")
+	}
+
+	// 回显必须带上这三项，否则页面无法显示实际生效的筛选。
+	echo := logChainScopeEcho(s)
+	if echo["token_id"] != int64(77) || echo["endpoint"] != "/v1/chat/completions" || echo["stream"] != "true" {
+		t.Fatalf("scope 回显缺少新增筛选: %#v", echo)
+	}
+}
+
+func containsArg(args []any, want any) bool {
+	for _, a := range args {
+		if a == want {
+			return true
+		}
+	}
+	return false
+}
+
+// TestParseLogChainScopeStrictChannelTypeLimit 非法 channel_id / type / limit 必须拒绝。
+//
+// 静默忽略的后果不是“少一个筛选”，而是**查询范围被悄悄放大**：
+// channel_id 落成 0 会返回全部渠道，type 落空会退回默认口径，
+// limit 落回默认会让调用方以为自己拿到了指定条数。
+// TestLogChainScopeEchoDisplaysInclusiveEnd 页面显示的结束时间必须是包含式的。
+//
+// SQL 上界排他是对的，但把它直接显示出来会变成「选到 10:15 却提示 10:16」、
+// 「选到 23:59 却提示次日 00:00」，读的人会以为多查了一分钟。
+// TestParseLogChainScopeAcceptsCrossDayMinuteRange 起止日期 + 起止分钟必须支持跨日。
+//
+// 客户报障常给“昨晚 22:40 到今早 09:15”这种跨零点窗口。以前只允许 from=to，
+// 运维得拆成两天分别查、自己拼结果，跨零点那几分钟最容易漏。
+func TestParseLogChainScopeAcceptsCrossDayMinuteRange(t *testing.T) {
+	now := time.Date(2026, 9, 9, 12, 0, 0, 0, cstLocation)
+	unix := func(text string) int64 {
+		tm, err := time.ParseInLocation("2006-01-02 15:04:05", text, cstLocation)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return tm.Unix()
+	}
+
+	s, err := parseLogChainScope(newLogChainCtx(
+		"from=2026-09-07&to=2026-09-08&from_time=22%3A40&to_time=09%3A15&user_id=102"), now)
+	if err != nil {
+		t.Fatalf("跨日分钟范围应放行: %v", err)
+	}
+	if s.FromTs != unix("2026-09-07 22:40:00") || s.ToTs != unix("2026-09-08 09:16:00") {
+		t.Fatalf("跨日范围错误: from=%d to=%d", s.FromTs, s.ToTs)
+	}
+	if s.FromTime != "22:40" || s.ToTime != "09:15" {
+		t.Fatalf("规范化分钟未保留: from=%q to=%q", s.FromTime, s.ToTime)
+	}
+	echo := logChainScopeEcho(s)
+	if echo["display_to"] != "2026-09-08 09:15:59" {
+		t.Fatalf("跨日结束时间应按包含式显示: %v", echo["display_to"])
+	}
+	where, args := logChainWhere(s, nil)
+	if !strings.Contains(where, "created_at >= ? AND created_at < ?") ||
+		len(args) < 2 || args[0] != s.FromTs || args[1] != s.ToTs {
+		t.Fatalf("SQL 未使用跨日范围: where=%s args=%#v", where, args)
+	}
+
+	// 单日仍与原行为一致。
+	sameDay, err := parseLogChainScope(newLogChainCtx(
+		"from=2026-09-08&to=2026-09-08&from_time=09%3A30&to_time=10%3A15"), now)
+	if err != nil {
+		t.Fatalf("单日分钟范围应继续可用: %v", err)
+	}
+	if sameDay.FromTs != unix("2026-09-08 09:30:00") || sameDay.ToTs != unix("2026-09-08 10:16:00") {
+		t.Fatalf("单日范围回归: from=%d to=%d", sameDay.FromTs, sameDay.ToTs)
+	}
+
+	// 结束早于开始必须拒绝，不能静默查出空集让人以为“这段没问题”。
+	for _, query := range []string{
+		"from=2026-09-08&to=2026-09-07&from_time=00%3A00&to_time=23%3A59",
+		"from=2026-09-08&to=2026-09-08&from_time=11%3A00&to_time=10%3A00",
+	} {
+		if _, err := parseLogChainScope(newLogChainCtx(query), now); err == nil {
+			t.Errorf("非法跨日范围应拒绝: %s", query)
+		}
+	}
+
+	// 跨日 + 分钟范围也不得突破跨度上限，且收窄必须回显。
+	wide, err := parseLogChainScope(newLogChainCtx(
+		"from=2026-06-01&to=2026-09-08&from_time=00%3A00&to_time=23%3A59&user_id=102"), now)
+	if err != nil {
+		t.Fatalf("超长跨日范围应收窄而非报错: %v", err)
+	}
+	if span := wide.ToTs - wide.FromTs; span > int64(logChainMaxDays)*86400 {
+		t.Fatalf("跨日分钟范围突破跨度上限: span=%d", span)
+	}
+	if !wide.SpanCap.capped() {
+		t.Fatal("跨度收窄必须回显，否则人会以为查了完整范围")
+	}
+}
+
+func TestLogChainScopeEchoDisplaysInclusiveEnd(t *testing.T) {
+	now := time.Date(2026, 9, 9, 12, 0, 0, 0, cstLocation)
+	for _, tc := range []struct{ query, wantFrom, wantDisplayTo, wantSQLTo string }{
+		{"from=2026-09-08&to=2026-09-08&from_time=10%3A00&to_time=10%3A15",
+			"2026-09-08 10:00:00", "2026-09-08 10:15:59", "2026-09-08 10:16:00"},
+		{"from=2026-09-08&to=2026-09-08&from_time=00%3A00&to_time=23%3A59",
+			"2026-09-08 00:00:00", "2026-09-08 23:59:59", "2026-09-09 00:00:00"},
+	} {
+		t.Run(tc.query, func(t *testing.T) {
+			s, err := parseLogChainScope(newLogChainCtx(tc.query), now)
+			if err != nil {
+				t.Fatalf("parseLogChainScope: %v", err)
+			}
+			echo := logChainScopeEcho(s)
+			if got := echo["from"]; got != tc.wantFrom {
+				t.Errorf("from=%v want %v", got, tc.wantFrom)
+			}
+			if got := echo["display_to"]; got != tc.wantDisplayTo {
+				t.Errorf("display_to=%v want %v（页面必须显示包含式结束时间）", got, tc.wantDisplayTo)
+			}
+			// SQL 边界不得被展示需求改写，否则查询范围会真的少一分钟。
+			if got := echo["to"]; got != tc.wantSQLTo {
+				t.Errorf("to=%v want %v（SQL 仍须使用排他上界）", got, tc.wantSQLTo)
+			}
+		})
+	}
+
+	js := string(logChainJS)
+	if !strings.Contains(js, "lc.scopeEcho.display_to") {
+		t.Error("前端未读 display_to：仍会显示排他上界")
+	}
+	if !strings.Contains(js, "含结束秒") {
+		t.Error("前端未说明结束时间为包含式")
+	}
+}
+
+func TestParseLogChainScopeStrictChannelTypeLimit(t *testing.T) {
+	now := time.Date(2026, 9, 9, 12, 0, 0, 0, cstLocation)
+	for _, tc := range []struct{ query, field string }{
+		{"channel_id=", "channel_id"},
+		{"channel_id=abc", "channel_id"},
+		{"channel_id=0", "channel_id"},
+		{"channel_id=-1", "channel_id"},
+		{"channel_id=1&channel_id=2", "channel_id"},
+		{"type=", "type"},
+		{"type=abc", "type"},
+		{"type=0", "type"},
+		{"type=7", "type"},
+		{"type=2&type=5", "type"},
+		{"limit=", "limit"},
+		{"limit=abc", "limit"},
+		{"limit=0", "limit"},
+		{"limit=-1", "limit"},
+		{"limit=50&limit=100", "limit"},
+	} {
+		t.Run(tc.query, func(t *testing.T) {
+			_, err := parseLogChainScope(newLogChainCtx(tc.query), now)
+			if err == nil || !strings.Contains(err.Error(), tc.field) {
+				t.Fatalf("非法 %s 不得静默扩大查询范围: err=%v", tc.field, err)
+			}
+		})
+	}
+
+	// 合法值仍必须生效，且 limit 超上限继续按既有契约收敛而不是报错。
+	s, err := parseLogChainScope(newLogChainCtx("channel_id=52&type=2&limit=99999"), now)
+	if err != nil {
+		t.Fatalf("合法参数应放行: %v", err)
+	}
+	if s.ChannelID != 52 || s.LogType != 2 || s.Limit != logChainMaxLimit {
+		t.Fatalf("合法参数解析错误: %#v", s)
+	}
+	where, _ := logChainWhere(s, nil)
+	if !strings.Contains(where, "channel_id = ?") {
+		t.Fatalf("渠道条件未进入 SQL: %s", where)
+	}
+}
+
+func TestParseLogChainScopeStrictUsername(t *testing.T) {
+	now := time.Date(2026, 9, 9, 12, 0, 0, 0, cstLocation)
+	for _, query := range []string{"username=", "username=%20%20", "username=alice&username=bob"} {
+		if _, err := parseLogChainScope(newLogChainCtx(query), now); err == nil || !strings.Contains(err.Error(), "username") {
+			t.Errorf("非法 username 不得静默退化为未筛选: query=%q err=%v", query, err)
+		}
+	}
+	s, err := parseLogChainScope(newLogChainCtx("username=%E5%AE%A2%E6%88%B7%E7%94%B2&user_id=102&token_name=prod"), now)
+	if err != nil {
+		t.Fatalf("Unicode 客户名与其它条件应可取交集: %v", err)
+	}
+	if s.Username != "客户甲" || s.UserID != 102 || s.TokenName != "prod" {
+		t.Fatalf("客户名筛选解析错误: %#v", s)
+	}
+	where, args := logChainWhere(s, nil)
+	if !strings.Contains(where, "user_id = ? AND username = ? AND token_name LIKE ?") {
+		t.Fatalf("客户 ID / 客户名 / 令牌应按交集查询: %s", where)
+	}
+	if len(args) < 5 || args[2] != int64(102) || args[3] != "客户甲" || args[4] != "%prod%" {
+		t.Fatalf("客户名交集参数不正确: %#v", args)
+	}
+	if got := logChainScopeEcho(s)["username"]; got != "客户甲" {
+		t.Fatalf("scope 未回显客户名: %#v", got)
+	}
+}
+
+func TestLogChainScopeFocusedModeUsesActualFilters(t *testing.T) {
+	base := logChainScope{Anomaly: anomalyErrAnom, FromTime: "00:00", ToTime: "23:59"}
+	if logChainScopeIsFocused(base) {
+		t.Fatal("默认整日错误+异常不得误判为聚焦筛选")
+	}
+	withoutProblemScope := base
+	withoutProblemScope.Anomaly = ""
+	if logChainScopeIsFocused(withoutProblemScope) {
+		t.Fatal("兼容旧调用的空问题范围不得误判为聚焦筛选")
+	}
+
+	cases := []struct {
+		name string
+		edit func(*logChainScope)
+	}{
+		{"渠道", func(s *logChainScope) { s.ChannelID = 12 }},
+		{"上游域名", func(s *logChainScope) { s.Domain = "up.example" }},
+		{"客户", func(s *logChainScope) { s.UserID = 7 }},
+		{"客户名", func(s *logChainScope) { s.Username = "客户甲" }},
+		{"模型", func(s *logChainScope) { s.Model = "gpt-test" }},
+		{"分组", func(s *logChainScope) { s.Group = "default" }},
+		{"令牌", func(s *logChainScope) { s.TokenName = "prod" }},
+		{"Request ID", func(s *logChainScope) { s.RequestID = "req-1" }},
+		{"关键词", func(s *logChainScope) { s.Keyword = "timeout" }},
+		{"仅错误范围", func(s *logChainScope) { s.Anomaly = ""; s.ErrorOnly = true }},
+		{"单独异常范围", func(s *logChainScope) { s.Anomaly = anomalyStream }},
+		{"显式类型", func(s *logChainScope) { s.LogType = 5 }},
+		{"分钟范围", func(s *logChainScope) { s.FromTime = "09:30"; s.ToTime = "10:15" }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := base
+			tc.edit(&s)
+			if !logChainScopeIsFocused(s) {
+				t.Fatalf("%s 生效后应进入筛选原因模式: %#v", tc.name, s)
+			}
+		})
+	}
+
+	// 日期、排序和分页仅改变窗口/顺序，不是业务筛选条件。
+	windowOnly := base
+	windowOnly.FromTs, windowOnly.ToTs = 1, 999999
+	windowOnly.Asc = true
+	windowOnly.BeforeTs, windowOnly.BeforeID = 123, 456
+	if logChainScopeIsFocused(windowOnly) {
+		t.Fatal("日期、排序或分页本身不得切换为筛选原因模式")
+	}
+}
+
+func TestLogChainScopeFocusedModeMatchesStabilityPreset(t *testing.T) {
+	s := logChainScope{ChannelID: 52, Anomaly: anomalyErrAnom, Limit: 100}
+	br := computeLogChainBlastRadiusForScope(focusedReasonRows(6, 2), s, true)
+	if br.Mode != logChainRadiusModeFocused || br.ReasonShape != reasonShapeDominant {
+		t.Fatalf("稳定性跳转的 channel_id + err_anom 必须进入原因模式: %+v", br)
+	}
+	if br.Shape != "" || !br.PageHasMore {
+		t.Fatalf("原因模式不得套通用 shape，且须保留 has_more: %+v", br)
+	}
+}
+
+func TestParseLogChainScopeMinuteRange(t *testing.T) {
+	now := time.Date(2026, 9, 9, 12, 0, 0, 0, cstLocation)
+	parse := func(t *testing.T, query string) logChainScope {
+		t.Helper()
+		s, err := parseLogChainScope(newLogChainCtx(query), now)
+		if err != nil {
+			t.Fatalf("parseLogChainScope: %v", err)
+		}
+		return s
+	}
+	unix := func(text string) int64 {
+		tm, err := time.ParseInLocation("2006-01-02 15:04:05", text, cstLocation)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return tm.Unix()
+	}
+
+	t.Run("普通范围包含结束分钟", func(t *testing.T) {
+		s := parse(t, "from=2026-09-08&to=2026-09-08&from_time=09%3A30&to_time=10%3A15")
+		if s.FromTs != unix("2026-09-08 09:30:00") || s.ToTs != unix("2026-09-08 10:16:00") {
+			t.Fatalf("分钟范围错误: from=%d to=%d", s.FromTs, s.ToTs)
+		}
+		if s.FromTime != "09:30" || s.ToTime != "10:15" {
+			t.Fatalf("规范化时间未保留: from=%q to=%q", s.FromTime, s.ToTime)
+		}
+		where, args := logChainWhere(s, nil)
+		if !strings.Contains(where, "created_at >= ? AND created_at < ?") ||
+			len(args) < 2 || args[0] != s.FromTs || args[1] != s.ToTs {
+			t.Fatalf("SQL 未使用收敛后的时间范围: where=%s args=%#v", where, args)
+		}
+		echo := logChainScopeEcho(s)
+		if echo["from_time"] != "09:30" || echo["to_time"] != "10:15" {
+			t.Fatalf("scope 未回显分钟范围: %#v", echo)
+		}
+	})
+
+	t.Run("同一分钟", func(t *testing.T) {
+		s := parse(t, "from=2026-09-08&to=2026-09-08&from_time=09%3A30&to_time=09%3A30")
+		if s.ToTs-s.FromTs != 60 {
+			t.Fatalf("同一分钟应覆盖完整 60 秒: %d", s.ToTs-s.FromTs)
+		}
+	})
+
+	t.Run("全天与旧单日等价", func(t *testing.T) {
+		old := parse(t, "from=2026-09-08&to=2026-09-08")
+		minute := parse(t, "from=2026-09-08&to=2026-09-08&from_time=00%3A00&to_time=23%3A59")
+		if old.FromTs != minute.FromTs || old.ToTs != minute.ToTs {
+			t.Fatalf("全天分钟范围应与旧单日一致: old=%d..%d minute=%d..%d",
+				old.FromTs, old.ToTs, minute.FromTs, minute.ToTs)
+		}
+		oldEcho := logChainScopeEcho(old)
+		if _, ok := oldEcho["from_time"]; ok {
+			t.Fatalf("旧调用未传分钟参数时不得新增虚假回显: %#v", oldEcho)
+		}
+	})
+}
+
+func TestParseLogChainScopeRejectsInvalidMinuteRange(t *testing.T) {
+	now := time.Date(2026, 9, 9, 12, 0, 0, 0, cstLocation)
+	cases := []string{
+		"from=2026-09-08&to=2026-09-08&from_time=09%3A30",
+		"from=2026-09-08&to=2026-09-08&to_time=10%3A15",
+		"from_time=09%3A30&to_time=10%3A15",
+		// 跨日范围本身已被允许（见 TestParseLogChainScopeAcceptsCrossDayMinuteRange），
+		// 但结束早于开始仍必须拒绝，无论是否跨日。
+		"from=2026-09-08&to=2026-09-07&from_time=09%3A30&to_time=10%3A15",
+		"from=2026-09-08&to=2026-09-08&from_time=10%3A16&to_time=10%3A15",
+		"from=2026-09-08&to=2026-09-08&from_time=9%3A30&to_time=10%3A15",
+		"from=2026-09-08&to=2026-09-08&from_time=09%3A30%3A00&to_time=10%3A15",
+		"from=2026-09-08&to=2026-09-08&from_time=24%3A00&to_time=10%3A15",
+		"from=2026-09-08&to=2026-09-08&from_time=09%3A60&to_time=10%3A15",
+		"from=2026-09-08&to=2026-09-08&from_time=%2009%3A30&to_time=10%3A15",
+		"from=2026-09-08&to=2026-09-08&from_time=09%3A30&from_time=09%3A31&to_time=10%3A15",
+		"from=2026-09-08&to=2026-09-08&from_time=09%3A30&to_time=10%3A15&to_time=10%3A16",
+	}
+	for _, query := range cases {
+		t.Run(query, func(t *testing.T) {
+			_, err := parseLogChainScope(newLogChainCtx(query), now)
+			if err == nil {
+				t.Fatal("非法分钟范围不得静默退化为全天查询")
+			}
+			if !strings.Contains(err.Error(), "time") && !strings.Contains(err.Error(), "分钟范围") {
+				t.Fatalf("错误应明确指出时间范围问题: %v", err)
+			}
+		})
 	}
 }
 
@@ -450,6 +898,7 @@ func TestLogChainSourceClauseForcesIndexOnlyWithoutFilter(t *testing.T) {
 		{"anomaly", func(s *logChainScope) { s.Anomaly = anomalyAll }, nil},
 		{"keyword", func(s *logChainScope) { s.Keyword = "kw" }, nil},
 		{"user_id", func(s *logChainScope) { s.UserID = 130 }, nil},
+		{"username", func(s *logChainScope) { s.Username = "客户甲" }, nil},
 		{"channel_id", func(s *logChainScope) { s.ChannelID = 32 }, nil},
 		{"domain", func(s *logChainScope) { s.Domain = "example.com" }, nil},
 		{"model", func(s *logChainScope) { s.Model = "gpt-4o" }, nil},
@@ -535,6 +984,7 @@ func TestLogChainGuardAndSourceClauseShareOneFilterJudgement(t *testing.T) {
 		{"无筛选", func(s *logChainScope) {}},
 		{"error_only", func(s *logChainScope) { s.ErrorOnly = true }},
 		{"channel_id", func(s *logChainScope) { s.ChannelID = 32 }},
+		{"username", func(s *logChainScope) { s.Username = "客户甲" }},
 		{"model", func(s *logChainScope) { s.Model = "m" }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -650,22 +1100,6 @@ func TestLogChainGuardAllowsShortSpanAndFilteredQueries(t *testing.T) {
 				t.Errorf("这个查法当前可用，闸门不得拦: %v", err)
 			}
 		})
-	}
-}
-
-// TestLogChainKeywordHintStatesErrorScope page.html 的事前提示必须说明口径限定。
-//
-// 事前提示比事后警告重要：人在输入时就该知道消费行不会被搜，
-// 而不是查完才发现——那时他已经据此得出"消费行里没有匹配的"这个错结论了。
-func TestLogChainKeywordHintStatesErrorScope(t *testing.T) {
-	for _, want := range []string{"只搜错误行", "type=5"} {
-		if !strings.Contains(pageHTML, want) {
-			t.Errorf("关键词输入框的事前提示应含 %q", want)
-		}
-	}
-	// 必须说明与 type / 异常筛选互斥，否则人撞上 400 才知道。
-	if !strings.Contains(pageHTML, "会被拒绝") {
-		t.Error("事前提示未说明与 type / 异常筛选互斥")
 	}
 }
 
@@ -947,14 +1381,19 @@ func TestLogChainNormalEndReasonsSharedBySQLAndTags(t *testing.T) {
 	}
 }
 
-// TestLogChainBillingAnomalyBothDirections 消费异常两个方向都要，且各有必须的排除项。
-func TestLogChainBillingAnomalyBothDirections(t *testing.T) {
+// TestLogChainBillingAnomalyThreeDirections 消费异常三个方向都要，且各有必须的排除项。
+func TestLogChainBillingAnomalyThreeDirections(t *testing.T) {
 	unpaid := logChainAnomalySQL(anomalyBillingUnpaid)
+	undeliveredUnbilled := logChainAnomalySQL(anomalyUndeliveredUnbilled)
 	free := logChainAnomalySQL(anomalyBillingFree)
 
 	// 扣费未交付：客户付了钱没拿到内容。
 	if !strings.Contains(unpaid, "quota > 0") || !strings.Contains(unpaid, "completion_tokens = 0") {
 		t.Errorf("扣费未交付判据错: %s", unpaid)
+	}
+	// 未交付未扣费：稳定性 B2，文本请求没有任何输出，也没有产生费用。
+	if !strings.Contains(undeliveredUnbilled, "quota = 0") || !strings.Contains(undeliveredUnbilled, "completion_tokens = 0") {
+		t.Errorf("未交付未扣费判据错: %s", undeliveredUnbilled)
 	}
 	// 交付未扣费：方向相反，亏的是我方。
 	if !strings.Contains(free, "quota = 0") || !strings.Contains(free, "completion_tokens > 0") {
@@ -964,7 +1403,9 @@ func TestLogChainBillingAnomalyBothDirections(t *testing.T) {
 	// 按名单里的关键词逐个查，而不是断言某种拼接写法——SQL 从 REGEXP 改成
 	// LOWER(...) NOT LIKE 链（为了能在 SQLite 假生产源上真执行）时，
 	// 断言写法的测试会红而行为并未改变，那属于测试过度绑定字面量。
-	for name, sql := range map[string]string{"扣费未交付": unpaid, "交付未扣费": free} {
+	for name, sql := range map[string]string{
+		"扣费未交付": unpaid, "未交付未扣费": undeliveredUnbilled, "交付未扣费": free,
+	} {
 		for _, kw := range logChainNoOutputModelKeywords {
 			if !strings.Contains(sql, kw) {
 				t.Errorf("%s 未排除天然无输出模型 %q: %s", name, kw, sql)
@@ -975,10 +1416,11 @@ func TestLogChainBillingAnomalyBothDirections(t *testing.T) {
 	if !strings.Contains(free, "billing_source") || !strings.Contains(free, "<> 'subscription'") {
 		t.Errorf("交付未扣费必须排除订阅计费: %s", free)
 	}
-	// billing 聚合必须真的把两个方向都包含进去。
+	// billing 聚合必须真的把三个方向都包含进去。
 	both := logChainAnomalySQL(anomalyBilling)
-	if !strings.Contains(both, "quota > 0") || !strings.Contains(both, "quota = 0") {
-		t.Errorf("billing 应含两个方向: %s", both)
+	if !strings.Contains(both, "quota > 0") || !strings.Contains(both, "quota = 0") ||
+		!strings.Contains(both, "completion_tokens = 0") || !strings.Contains(both, "completion_tokens > 0") {
+		t.Errorf("billing 应含三个方向: %s", both)
 	}
 	// 判"是否真交付"只能用 completion_tokens：frt 只证明上游开口（任何 data: 行都置位）。
 	if strings.Contains(both, "$.frt") {
@@ -989,7 +1431,9 @@ func TestLogChainBillingAnomalyBothDirections(t *testing.T) {
 // TestLogChainAnomalyNeverReadsEndError end_error 是自由文本，可能含 "panic" 等词，
 // 参与判定会误命中。它只能出现在展示路径，不能进任何判定 SQL。
 func TestLogChainAnomalyNeverReadsEndError(t *testing.T) {
-	for _, kind := range []string{anomalyStream, anomalyBilling, anomalyBillingUnpaid, anomalyBillingFree, anomalyAll} {
+	for _, kind := range []string{
+		anomalyStream, anomalyBilling, anomalyBillingUnpaid, anomalyUndeliveredUnbilled, anomalyBillingFree, anomalyAll,
+	} {
 		if strings.Contains(logChainAnomalySQL(kind), "end_error") {
 			t.Errorf("%s 的判定 SQL 不得读 end_error（自由文本会误命中）", kind)
 		}
@@ -1183,6 +1627,83 @@ func TestLogChainGateTimeoutDoesNotStarveExistingFeatures(t *testing.T) {
 	if time.Duration(logChainQueryTimeoutMS)*time.Millisecond >= logChainGateTimeout {
 		t.Errorf("MAX_EXECUTION_TIME(%dms) 应小于闸门超时(%v)",
 			logChainQueryTimeoutMS, logChainGateTimeout)
+	}
+}
+
+func TestServeLogChainRequestsRejectsInvalidMinuteRangeBeforeProdQuery(t *testing.T) {
+	m := newTestMonitor(t)
+	m.cfg.LocalSnapshotOnly = true // prodDB=nil；若解析没先拦，会返回“生产库未连接”而不是 400 时间错误。
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest("GET",
+		"/logchain/requests?from=2026-09-08&to=2026-09-08&from_time=10%3A30&to_time=09%3A30", nil)
+
+	m.serveLogChainRequests(c)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("非法分钟范围应在接触生产库前返回 400: code=%d body=%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "from_time") {
+		t.Fatalf("400 应明确指出分钟范围错误: %s", w.Body.String())
+	}
+	if strings.Contains(w.Body.String(), "生产库未连接") {
+		t.Fatalf("非法输入不应进入生产查询路径: %s", w.Body.String())
+	}
+}
+
+// TestServeLogChainRequestsRequiresPickingAmbiguousUsername 同名客户必须由人选择。
+//
+// 主站不保证 username 唯一。把多个同名客户的请求混成一份时，页面看起来像
+// “这一个客户的问题”，据此得出的结论会落到错的客户身上。
+func TestServeLogChainRequestsRequiresPickingAmbiguousUsername(t *testing.T) {
+	m := newTestMonitor(t)
+	m.cfg.LocalSnapshotOnly = true // prodDB=nil：若没先拦，会返回“生产库未连接”而不是同名冲突。
+	if err := m.storeDB.Create(&[]UserDirectoryEntry{
+		{UserID: 101, Username: "同名客户", Grp: "default", SyncedAt: 1},
+		{UserID: 205, Username: "同名客户", Grp: "vip", SyncedAt: 1},
+		{UserID: 310, Username: "唯一客户", Grp: "default", SyncedAt: 1},
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	do := func(query string) *httptest.ResponseRecorder {
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		c.Request = httptest.NewRequest("GET", "/logchain/requests?"+query, nil)
+		m.serveLogChainRequests(c)
+		return w
+	}
+
+	w := do("username=" + url.QueryEscape("同名客户"))
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("同名客户必须要求选择: code=%d body=%s", w.Code, w.Body.String())
+	}
+	var got struct {
+		UsernameAmbiguous bool `json:"username_ambiguous"`
+		Candidates        []struct {
+			UserID   int64  `json:"user_id"`
+			Username string `json:"username"`
+		} `json:"candidates"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatalf("响应不可解析: %v", err)
+	}
+	if !got.UsernameAmbiguous || len(got.Candidates) != 2 ||
+		got.Candidates[0].UserID != 101 || got.Candidates[1].UserID != 205 {
+		t.Fatalf("必须交出全部候选客户 ID: %s", w.Body.String())
+	}
+	if strings.Contains(w.Body.String(), "生产库未连接") {
+		t.Fatalf("同名冲突不应进入生产查询路径: %s", w.Body.String())
+	}
+
+	// 指定客户 ID 后不再拦截：身份已经明确。
+	if w := do("username=" + url.QueryEscape("同名客户") + "&user_id=101"); strings.Contains(w.Body.String(), "username_ambiguous") {
+		t.Fatalf("已指定客户 ID 不应再要求选择: %s", w.Body.String())
+	}
+	// 唯一同名客户照常查询，不得因为这道校验多一步点击。
+	if w := do("username=" + url.QueryEscape("唯一客户")); strings.Contains(w.Body.String(), "username_ambiguous") {
+		t.Fatalf("唯一客户名不应要求选择: %s", w.Body.String())
 	}
 }
 

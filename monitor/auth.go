@@ -63,6 +63,12 @@ func (m *Monitor) newapiAuth(username, password string) (role int, name string, 
 			Username    string `json:"username"`
 			DisplayName string `json:"display_name"`
 			Role        int    `json:"role"`
+			AccessToken string `json:"access_token"`
+			User        struct {
+				Username    string `json:"username"`
+				DisplayName string `json:"display_name"`
+				Role        int    `json:"role"`
+			} `json:"user"`
 		} `json:"data"`
 	}
 	_ = json.NewDecoder(resp.Body).Decode(&lr)
@@ -74,21 +80,33 @@ func (m *Monitor) newapiAuth(username, password string) (role int, name string, 
 		return 0, "", fmt.Errorf("%s", lr.Message)
 	}
 
-	// new-api 登录响应已直接带回用户信息(含 role),优先用它——避免再打 /api/user/self。
+	// RC4 将用户信息直接放在 data 下，RC26 改为 data.user，并在 data 中
+	// 返回 access_token。两种结构都直接取登录响应中的角色，避免再打 /api/user/self。
 	// /self 依赖会话 cookie:内网明文下 Secure cookie 不回发、经 CloudFront 时 Set-Cookie 可能被剥离,均会 401。
-	if lr.Data.Role > 0 {
-		n := lr.Data.DisplayName
+	loginRole := lr.Data.Role
+	loginUsername := lr.Data.Username
+	loginDisplayName := lr.Data.DisplayName
+	if lr.Data.User.Role > 0 {
+		loginRole = lr.Data.User.Role
+		loginUsername = lr.Data.User.Username
+		loginDisplayName = lr.Data.User.DisplayName
+	}
+	if loginRole > 0 {
+		n := loginDisplayName
 		if n == "" {
-			n = lr.Data.Username
+			n = loginUsername
 		}
 		if n == "" {
 			n = username
 		}
-		return lr.Data.Role, n, nil
+		return loginRole, n, nil
 	}
 
 	// 2) 兜底:登录响应未带角色时,再用会话取自身信息(含 role)
 	req, _ := http.NewRequest(http.MethodGet, base+"/api/user/self", nil)
+	if lr.Data.AccessToken != "" {
+		req.Header.Set("Authorization", "Bearer "+lr.Data.AccessToken)
+	}
 	resp2, err := cl.Do(req)
 	if err != nil {
 		return 0, "", fmt.Errorf("获取用户信息失败: %w", err)

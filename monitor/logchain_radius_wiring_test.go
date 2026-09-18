@@ -55,13 +55,15 @@ func TestLogChainRadiusDimKeysMatchJSONTags(t *testing.T) {
 		OtherItems: 2, OtherCount: 3,
 	}
 	data, err := json.Marshal(logChainBlastRadius{
-		Rows:       1,
-		ByChannel:  dim,
-		ByCustomer: dim,
-		ByDomain:   dim,
-		ByModel:    dim,
-		Shape:      radiusWidespread,
-		ShapeWhy:   "why",
+		Mode:        logChainRadiusModeOverview,
+		Rows:        1,
+		PageHasMore: true,
+		ByChannel:   dim,
+		ByCustomer:  dim,
+		ByDomain:    dim,
+		ByModel:     dim,
+		Shape:       radiusWidespread,
+		ShapeWhy:    "why",
 	})
 	if err != nil {
 		t.Fatalf("序列化失败: %v", err)
@@ -79,14 +81,16 @@ func TestLogChainRadiusDimKeysMatchJSONTags(t *testing.T) {
 			t.Errorf("前端 RADIUS_DIM 未引用 %q，该维度不会显示", key)
 		}
 	}
-	// shape 与 shape_why 前端都要读：只给结论不给依据，人无法复核。
-	for _, key := range []string{"shape", "shape_why", "rows"} {
+	// shape 与 shape_why 供默认模式；mode / page_has_more 决定筛选模式与覆盖说明。
+	for _, key := range []string{"mode", "page_has_more", "shape", "shape_why", "rows"} {
 		if _, ok := got[key]; !ok {
 			t.Errorf("结构体缺 JSON 标签 %q", key)
 		}
 	}
-	if !strings.Contains(js, "shape_why") {
-		t.Error("前端未读 shape_why：只显示结论不显示依据，人无法判断该不该相信它")
+	for _, key := range []string{"shape_why", "reason_shape", "reason_why", "page_has_more"} {
+		if !strings.Contains(js, key) {
+			t.Errorf("前端未读判读字段 %q", key)
+		}
 	}
 
 	// 维度内层三个键：items 是明细，other_items / other_count 是被截断部分。
@@ -140,26 +144,25 @@ func TestLogChainRadiusHiddenAfterPaging(t *testing.T) {
 	}
 }
 
-// TestLogChainRadiusStatesScopeIsSinglePage 「仅本页」字样必须在收起状态可见。
-//
-// 统计范围看不见时，单页结论会被当成整个筛选范围的结论——
-// 那会让人以为"这个渠道占了全部问题的 80%"，而实际只是本页 50 条里的 80%。
-func TestLogChainRadiusStatesScopeIsSinglePage(t *testing.T) {
+// TestLogChainRadiusStatesCoverageInSummary 统计覆盖必须在收起状态可见。
+func TestLogChainRadiusStatesCoverageInSummary(t *testing.T) {
 	js := string(logChainJS)
-	if !strings.Contains(js, "仅本页") {
-		t.Error("影响面未标注统计范围仅本页")
+	for _, want := range []string{"仅当前页", "已返回全部"} {
+		if !strings.Contains(js, want) {
+			t.Errorf("分析未标注覆盖范围 %q", want)
+		}
 	}
-	// 必须在 summary（收起时可见）里，不能只写在展开区。
+	// 必须在 summary（收起时可见）附近，不能只写在展开区。
 	head := js
-	if i := strings.Index(js, "lc-radius-head"); i >= 0 {
-		end := i + 400
+	if i := strings.Index(js, "const coverage="); i >= 0 {
+		end := i + 500
 		if end > len(js) {
 			end = len(js)
 		}
 		head = js[i:end]
 	}
-	if !strings.Contains(head, "仅本页") {
-		t.Error("「仅本页」不在 summary 内：收起状态看不到统计范围")
+	if !strings.Contains(head, "lc-radius-sub") || !strings.Contains(head, "coverage") {
+		t.Error("覆盖范围不在 summary 内：收起状态无法判断是否只分析当前页")
 	}
 }
 

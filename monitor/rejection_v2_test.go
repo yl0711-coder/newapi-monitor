@@ -15,7 +15,7 @@ import (
 
 func rejectV2Body(t *testing.T, node string, now int64) string {
 	t.Helper()
-	b, err := json.Marshal(map[string]any{"node": node, "batch_id": "reject-v2-test-0001", "created_at": now, "samples": []map[string]any{{"bucket_ts": now / 60 * 60, "reason": "no_available_channel", "model": "fixture", "group": "fixture-group", "count": 1}}})
+	b, err := json.Marshal(map[string]any{"node": node, "batch_id": "reject-v2-test-0001", "created_at": now, "samples": []map[string]any{{"bucket_ts": now / 60 * 60, "reason": "no_available_channel", "model": "fixture", "group": "fixture-group", "count": 1, "user_id": 7}}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -70,6 +70,10 @@ func TestRejectV2FullACKIsolationAndConflict(t *testing.T) {
 	if len(rows) != 1 || rows[0].Count != 2 {
 		t.Fatalf("duplicate or cross-source collision: %+v", rows)
 	}
+	var identityRows int64
+	if err := m.storeDB.Model(&RejectionSample{}).Where("user_id = ? AND count = ?", 7, 1).Count(&identityRows).Error; err != nil || identityRows != 2 {
+		t.Fatalf("v2 user identity lost: rows=%d err=%v", identityRows, err)
+	}
 }
 
 func TestRejectV2RejectsPartialInvalidOversizeAndExpired(t *testing.T) {
@@ -79,6 +83,7 @@ func TestRejectV2RejectsPartialInvalidOversizeAndExpired(t *testing.T) {
 	body := rejectV2Body(t, "task-a", now)
 	for name, bad := range map[string]string{
 		"invalid-row":   strings.Replace(body, `"count":1`, `"count":0`, 1),
+		"negative-user": strings.Replace(body, `"user_id":7`, `"user_id":-1`, 1),
 		"clip-model":    strings.Replace(body, `"model":"fixture"`, `"model":"`+strings.Repeat("m", 129)+`"`, 1),
 		"invalid-node":  rejectV2Body(t, "task/a", now),
 		"expired":       rejectV2Body(t, "task-a", now-rejectionV2ReplaySeconds-1),
@@ -97,6 +102,20 @@ func TestRejectV2RejectsPartialInvalidOversizeAndExpired(t *testing.T) {
 	}
 	if rows := m.storeRejections(now - 60); len(rows) != 0 {
 		t.Fatal("invalid batches partially committed")
+	}
+}
+
+func TestRejectV2KeepsLegacyPayloadsAtUnknownCustomer(t *testing.T) {
+	m := newTestMonitor(t)
+	m.cfg.IngestToken = "fixture"
+	now := time.Now().Unix()
+	body := strings.Replace(rejectV2Body(t, "task-a", now), `,"user_id":7`, "", 1)
+	if w := postRejectV2(m, body, true); w.Code != http.StatusOK {
+		t.Fatalf("legacy payload: %d %s", w.Code, w.Body.String())
+	}
+	var row RejectionSample
+	if err := m.storeDB.First(&row).Error; err != nil || row.UserID != 0 {
+		t.Fatalf("legacy user identity must remain unknown: row=%+v err=%v", row, err)
 	}
 }
 

@@ -27,6 +27,10 @@ type rejectionV2Request struct {
 		Model    string `json:"model"`
 		Group    string `json:"group"`
 		Count    int64  `json:"count"`
+		// UserID is optional for legacy collectors. A parsed authenticated user
+		// must survive v2 transport; otherwise the alert page silently degrades
+		// every customer to unknown even though RejectionSample keys by user_id.
+		UserID int64 `json:"user_id"`
 	} `json:"samples"`
 }
 
@@ -42,10 +46,10 @@ func validateRejectionV2(in rejectionV2Request, now int64, retentionDays int) ([
 	oldest := now - int64(retentionDays)*86400
 	rows := make([]RejectionSample, 0, len(in.Samples))
 	for _, s := range in.Samples {
-		if s.BucketTs < oldest || s.BucketTs > now+60 || s.BucketTs%60 != 0 || s.Reason == "" || len(s.Reason) > 64 || s.Model == "" || len(s.Model) > 128 || len(s.Group) > 64 || s.Count < 1 || s.Count > 1000000 {
+		if s.BucketTs < oldest || s.BucketTs > now+60 || s.BucketTs%60 != 0 || s.Reason == "" || len(s.Reason) > 64 || s.Model == "" || len(s.Model) > 128 || len(s.Group) > 64 || s.Count < 1 || s.Count > 1000000 || s.UserID < 0 {
 			return nil, false // Never silently drop/clip fields and ACK success.
 		}
-		rows = append(rows, RejectionSample{Node: in.Node, BucketTs: s.BucketTs, Reason: s.Reason, Model: s.Model, Grp: s.Group, Count: s.Count})
+		rows = append(rows, RejectionSample{Node: in.Node, BucketTs: s.BucketTs, Reason: s.Reason, Model: s.Model, Grp: s.Group, UserID: s.UserID, Count: s.Count})
 	}
 	return rows, true
 }

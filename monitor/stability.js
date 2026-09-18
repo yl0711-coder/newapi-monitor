@@ -13,7 +13,8 @@ const ST_HEADERS={
   capacity:{title:'容量规划',subtitle:'RPM / TPM · 日志稳定率 · 分组与渠道负载 · 服务资源同轴观察',icon:'capacity'},
   // 缺这条会走第 22 行的 ||ST_HEADERS.usage 兜底，顶部标题错显成"用户用量"。
   // 新增 tab 时必须同步加，否则页面标题静默串台。
-  logchain:{title:'客户排障',subtitle:'逐条请求 · 客户 / 令牌 / 分组 / 模型 · 渠道 → 上游主域名 · 上游返回原文',icon:'search'}
+  logchain:{title:'客户排障',subtitle:'逐条请求 · 客户 / 令牌 / 分组 / 模型 · 渠道 → 上游主域名 · 上游返回原文',icon:'search'},
+  alerts:{title:'问题预警',subtitle:'未到达任何渠道的请求 · 哪个客户、请求什么、为什么被拒',icon:'alert'}
 };
 const ST_ICONS={
   sync:'<svg viewBox="0 0 24 24"><path d="M20 7h-6V1"/><path d="M4 17h6v6"/><path d="M20 7a8 8 0 0 0-13.7-3.6L4 5.7M4 17a8 8 0 0 0 13.7 3.6l2.3-2.3"/></svg>',
@@ -25,7 +26,8 @@ const ST_ICONS={
   activity:'<svg viewBox="0 0 24 24"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>',
   chart:'<svg viewBox="0 0 24 24"><path d="M3 3v18h18"/><path d="m7 16 4-5 4 3 5-7"/></svg>',
   capacity:'<svg viewBox="0 0 24 24"><path d="M4 19V9M10 19V5M16 19v-8M22 19V3"/><path d="M2 19h22"/></svg>',
-  search:'<svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/><path d="M11 8v3"/><path d="M11 14h.01"/></svg>'
+  search:'<svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/><path d="M11 8v3"/><path d="M11 14h.01"/></svg>',
+  alert:'<svg viewBox="0 0 24 24"><path d="M12 9v4"/><path d="M12 17h.01"/><path d="M10.3 3.9 2 18a2 2 0 0 0 1.7 3h16.6a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/></svg>'
 };
 
 window.monitorShellSetTab=function(name){
@@ -69,7 +71,7 @@ window.monitorShellSetTab=function(name){
   button.addEventListener('click',()=>apply(!shell.classList.contains('sidebar-collapsed')));
 })();
 
-const st={inited:false,loaded:false,view:'history',layer:'delivery',hours:0,days:7,custom:null,preset:'',filters:{vendor:'',group:'',channel:'',model:''},allFilters:null,report:null,abort:null,problemAbort:null,drawerAbort:null,edgeAbort:null,edgeReport:null,generation:0,detailPromises:new Map(),detailControllers:new Map(),detailLoading:new Set(),expanded:new Set(),chart:null,drawerChart:null,edgeChart:null,drawer:null,drawerTab:'run',lastFocus:null};
+const st={inited:false,loaded:false,view:'history',layer:'delivery',hours:0,days:7,custom:null,preset:'',filters:{vendor:'',group:'',channel:'',model:''},allFilters:null,report:null,reportKey:'',abort:null,reportPromise:null,reportPromiseKey:'',problemAbort:null,drawerAbort:null,edgeAbort:null,edgeReport:null,generation:0,detailPromises:new Map(),detailControllers:new Map(),detailLoading:new Set(),expanded:new Set(),chart:null,drawerChart:null,edgeChart:null,drawer:null,drawerTab:'run',lastFocus:null};
 const $=id=>document.getElementById(id);
 const esc=s=>String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const nfmt=n=>(+n||0).toLocaleString('zh-CN');
@@ -113,6 +115,9 @@ window.stabilityActivate=function(){
   probeEdge();
   setTimeout(resize,80);
 };
+// 抽屉打开时会锁住 body 滚动。跨页导航不会经过抽屉的关闭按钮，因此离开稳定性页
+// 必须主动收尾；否则目标页虽然已经显示，document.body 仍保持 overflow:hidden。
+window.stabilityDeactivate=function(){if(st.drawer)closeDrawer(false)};
 window.stabilityOpen=function(context){window.monitorNavigate?.('stability',context||{})};
 function applyNavigationContext(){
   const c=window.monitorNavigationContext?.()||{};let changed=false;
@@ -135,8 +140,8 @@ function init(){
   $('stCustomToggle')?.addEventListener('click',()=>{$('stCustomRange')?.classList.toggle('show')});
   $('stCustomApply')?.addEventListener('click',()=>{const from=$('stCustomFrom')?.value,to=$('stCustomTo')?.value;if(!from||!to||from>to){alert('请选择正确的开始和结束日期');return}st.hours=0;st.custom={from,to};st.preset='custom';syncRange();reloadActiveLayer()});
   document.querySelectorAll('[data-stability-layer]').forEach(b=>b.addEventListener('click',()=>setLayer(b.dataset.stabilityLayer)));
-  for(const id of ['stVendor','stGroup','stChannel','stModel'])$(id)?.addEventListener('change',()=>{readFilters();loadReport()});
-  $('stFilterReset')?.addEventListener('click',()=>{st.filters={vendor:'',group:'',channel:'',model:''};renderFilterOptions();loadReport()});
+  for(const id of ['stVendor','stGroup','stChannel','stModel'])$(id)?.addEventListener('change',()=>{readFilters();reloadActiveLayer()});
+  $('stFilterReset')?.addEventListener('click',()=>{st.filters={vendor:'',group:'',channel:'',model:''};renderFilterOptions();reloadActiveLayer()});
   $('stRefresh')?.addEventListener('click',loadReport);
   $('stProblemRefresh')?.addEventListener('click',loadProblems);
   // 分组列表由 renderReport 动态创建，事件必须委托到稳定存在的父容器。
@@ -168,7 +173,7 @@ function setLayer(layer){
 }
 function syncRange(){document.querySelectorAll('[data-stability-hours]').forEach(b=>b.classList.toggle('active',!st.custom&&+b.dataset.stabilityHours===st.hours));document.querySelectorAll('[data-stability-days]').forEach(b=>b.classList.toggle('active',!st.custom&&!st.hours&&+b.dataset.stabilityDays===st.days));document.querySelectorAll('[data-stability-preset]').forEach(b=>b.classList.toggle('active',b.dataset.stabilityPreset===st.preset));$('stCustomToggle')?.classList.toggle('active',st.preset==='custom')}
 function readFilters(){st.filters={vendor:$('stVendor')?.value||'',group:$('stGroup')?.value||'',channel:$('stChannel')?.value||'',model:$('stModel')?.value||''}}
-function reloadActiveLayer(){if(st.layer==='edge')loadEdge();else loadReport()}
+function reloadActiveLayer(){if(st.view==='problems')loadProblems();else if(st.layer==='edge')loadEdge();else loadReport()}
 
 async function probeEdge(){
   const button=document.querySelector('[data-stability-layer="edge"]');if(!button)return;
@@ -210,25 +215,30 @@ function renderEdge(d){
   st.edgeChart.setOption({animation:false,grid:{left:50,right:55,top:28,bottom:38},tooltip:{trigger:'axis'},xAxis:{type:'category',data:rows.map(x=>x.date.slice(5)),axisLabel:{color:'#7e8a9f'},axisLine:{lineStyle:{color:'#354055'}}},yAxis:[{type:'value',axisLabel:{color:'#7e8a9f',formatter:'{value}%'},splitLine:{lineStyle:{color:'#283143'}}},{type:'value',axisLabel:{color:'#657188'},splitLine:{show:false}}],series:[{name:'5xx占比',type:'line',smooth:.2,data:rows.map(x=>x.requests?+(x.status_5xx/x.requests*100).toFixed(3):null),lineStyle:{width:2,color:'#e45b69'},itemStyle:{color:'#e45b69'}},{name:'请求量',type:'bar',yAxisIndex:1,data:rows.map(x=>x.requests),barMaxWidth:20,itemStyle:{color:'rgba(79,153,229,.28)'}}]});
 }
 
-async function loadReport(){
-  if(st.drawer)closeDrawer();
-  const generation=++st.generation;
-  for(const controller of st.detailControllers.values())controller.abort();
-  st.detailControllers.clear();st.detailPromises.clear();st.detailLoading.clear();
-  if(st.abort)st.abort.abort();st.abort=new AbortController();loading($('stDeliveryBody'));
-  try{
-    const res=await fetch('/stability/report?'+queryParams(),{headers:{Accept:'application/json'},signal:st.abort.signal});
-    if(res.status===401){location.href='/login';return}
-    const d=await res.json();if(!res.ok)throw new Error(d.error||`HTTP ${res.status}`);
-    if(d.enabled===false){errorBox($('stDeliveryBody'),'稳定性报表已关闭（MONITOR_STABILITY_ENABLED=false）。');return}
-    if(generation!==st.generation)return;
-    st.report=d;st.loaded=true;
-    // 未筛选响应才能作为完整候选集；切换 7/30/90 天时同步更新，
-    // 避免只在新日期范围出现的渠道/模型永久无法选中。
-    if(!Object.values(st.filters).some(Boolean))st.allFilters=d.filters;
-    if(!st.allFilters)st.allFilters=d.filters;
-    renderReport();
-  }catch(e){if(e.name!=='AbortError'&&generation===st.generation)errorBox($('stDeliveryBody'),e.message)}
+function loadReport(){
+  const reportKey=queryParams().toString();
+  const promise=(async()=>{
+    if(st.drawer)closeDrawer();
+    const generation=++st.generation;
+    for(const controller of st.detailControllers.values())controller.abort();
+    st.detailControllers.clear();st.detailPromises.clear();st.detailLoading.clear();
+    if(st.abort)st.abort.abort();st.abort=new AbortController();loading($('stDeliveryBody'));
+    try{
+      const res=await fetch('/stability/report?'+queryParams(),{headers:{Accept:'application/json'},signal:st.abort.signal});
+      if(res.status===401){location.href='/login';return}
+      const d=await res.json();if(!res.ok)throw new Error(d.error||`HTTP ${res.status}`);
+      if(d.enabled===false){errorBox($('stDeliveryBody'),'稳定性报表已关闭（MONITOR_STABILITY_ENABLED=false）。');return}
+      if(generation!==st.generation)return;
+      st.report=d;st.reportKey=reportKey;st.loaded=true;
+      // 未筛选响应才能作为完整候选集；切换 7/30/90 天时同步更新，
+      // 避免只在新日期范围出现的渠道/模型永久无法选中。
+      if(!Object.values(st.filters).some(Boolean))st.allFilters=d.filters;
+      if(!st.allFilters)st.allFilters=d.filters;
+      renderReport();
+    }catch(e){if(e.name!=='AbortError'&&generation===st.generation)errorBox($('stDeliveryBody'),e.message)}
+  })();
+  st.reportPromise=promise;st.reportPromiseKey=reportKey;
+  return promise.finally(()=>{if(st.reportPromise===promise){st.reportPromise=null;st.reportPromiseKey=''}});
 }
 
 function renderFilterOptions(){
@@ -305,14 +315,75 @@ function renderRankings(){const r=st.report?.rankings||{};$('stUsageRank').inner
 
 function findEntity(groupName,channelID){const g=(st.report?.groups||[]).find(x=>x.name===groupName);if(!g)return null;if(channelID)return {kind:'channel',group:g,entity:(g.channels||[]).find(x=>x.id===channelID)};return {kind:'group',group:g,entity:g}}
 async function openDrawer(groupName,channelID){try{await ensureGroupDetail(groupName)}catch(error){if(error.name==='AbortError')return;alert(error.message||'详情加载失败');return}const found=findEntity(groupName,channelID);if(!found?.entity)return;st.lastFocus=document.activeElement;st.drawer=found;st.drawerTab='run';$('stDrawerMask')?.classList.add('open');$('stDrawer')?.classList.add('open');$('stDrawer')?.setAttribute('aria-hidden','false');document.body.style.overflow='hidden';renderDrawer();$('stDrawerClose')?.focus()}
-function closeDrawer(){if(st.drawerAbort){st.drawerAbort.abort();st.drawerAbort=null}st.drawer=null;$('stDrawerMask')?.classList.remove('open');$('stDrawer')?.classList.remove('open');$('stDrawer')?.setAttribute('aria-hidden','true');document.body.style.overflow='';if(st.drawerChart){st.drawerChart.dispose();st.drawerChart=null}if(st.lastFocus?.focus)st.lastFocus.focus();st.lastFocus=null}
+function closeDrawer(restoreFocus=true){if(st.drawerAbort){st.drawerAbort.abort();st.drawerAbort=null}st.drawer=null;$('stDrawerMask')?.classList.remove('open');$('stDrawer')?.classList.remove('open');$('stDrawer')?.setAttribute('aria-hidden','true');document.body.style.overflow='';if(st.drawerChart){st.drawerChart.dispose();st.drawerChart=null}if(restoreFocus&&st.lastFocus?.focus)st.lastFocus.focus();st.lastFocus=null}
 function renderDrawer(){if(!st.drawer)return;const x=st.drawer.entity;const title=st.drawer.kind==='channel'?`#${x.id} ${x.name}`:x.name;$('stDrawerTitle').textContent=title;$('stDrawerSubtitle').textContent=`${st.drawer.kind==='channel'?'上游渠道 · '+st.drawer.group.name:'服务分组'} · ${st.report.meta.from} 至 ${st.report.meta.to}`;document.querySelectorAll('[data-st-drawer-tab]').forEach(b=>{b.classList.toggle('active',b.dataset.stDrawerTab===st.drawerTab);b.hidden=b.dataset.stDrawerTab==='timeline'});const body=$('stDrawerBody');if(st.drawerTab==='problems'){renderDrawerProblems();return}const nav={days:st.days,group:st.drawer.group.name};if(st.custom){nav.from=st.custom.from;nav.to=st.custom.to;delete nav.days}if(st.drawer.kind==='channel')nav.channel=x.id;const finance=st.drawer.kind==='channel'?`<div class="monitor-cross-actions"><button type="button" onclick="monitorOpenEncoded('channels','${encodeNav(nav)}')">查看使用与倍率配置 →</button></div>`:'';body.innerHTML=`${finance}<section class="stability-drawer-kpis"><div><small>历史日志推断稳定性</small><b>${pct(x.stability)}</b></div><div><small>历史日志请求</small><b>${nfmt(x.requests)}</b></div><div><small>问题请求</small><b>${nfmt(x.problems)}</b></div><div><small>环比变化</small><b class="${deltaClass(x.delta_pp)}">${x.delta_pp==null?'—':(x.delta_pp>=0?'+':'')+x.delta_pp.toFixed(2)+' pp'}</b></div></section><section class="stability-panel-head" style="border:1px solid #30394b;border-bottom:0;border-radius:10px 10px 0 0"><div><h3>每日稳定性曲线</h3><p>仅还原当前所选对象的历史日志推断</p></div></section><div id="stDrawerChart" class="stability-chart"></div><section class="stability-model-list"><div class="stability-panel-head"><div><h3>${st.drawer.kind==='group'?'模型表现':'承载模型'}</h3><p>按历史日志请求量排序</p></div></div>${(x.models||[]).map(m=>`<div class="stability-model-row"><b>${esc(m.name)}</b><span>${pct(m.stability)}</span><small>${nfmt(m.requests)} 请求</small><small>${nfmt(m.problems)} 问题</small></div>`).join('')||'<div class="stability-empty"><p>当前范围无模型数据</p></div>'}</section>`;renderDrawerChart(x.daily||[])}
 
 function renderDrawerChart(days){const el=$('stDrawerChart');if(!el||!window.echarts)return;if(st.drawerChart)st.drawerChart.dispose();st.drawerChart=echarts.init(el);st.drawerChart.setOption({animation:false,grid:{left:48,right:22,top:26,bottom:35},tooltip:{trigger:'axis'},xAxis:{type:'category',data:days.map(d=>d.date.slice(5)),axisLabel:{color:'#778399'},axisLine:{lineStyle:{color:'#354055'}}},yAxis:{type:'value',min:v=>Math.max(0,Math.floor(v.min-2)),max:100,axisLabel:{color:'#778399',formatter:'{value}%'},splitLine:{lineStyle:{color:'#283143'}}},series:[{type:'line',smooth:.25,connectNulls:false,data:days.map(d=>d.stability),lineStyle:{color:'#8177ff',width:2},itemStyle:{color:'#8177ff'},areaStyle:{color:'rgba(129,119,255,.08)'}}]})}
 async function renderDrawerProblems(){const body=$('stDrawerBody');if(!st.drawer)return;if(st.drawerAbort)st.drawerAbort.abort();st.drawerAbort=new AbortController();const current=st.drawer;loading(body,'正在读取该对象的原始错误分布…');const extra={group:current.group.name};if(current.kind==='channel')extra.channel=current.entity.id;try{const res=await fetch('/stability/problems?'+queryParams(extra),{headers:{Accept:'application/json'},signal:st.drawerAbort.signal});const d=await res.json();if(!res.ok)throw new Error(d.error||`HTTP ${res.status}`);if(st.drawer===current)body.innerHTML=problemTable(d,true)}catch(e){if(e.name!=='AbortError'&&st.drawer===current)errorBox(body,e.message)}}
 
-async function loadProblems(){if(st.view!=='problems')return;if(st.problemAbort)st.problemAbort.abort();st.problemAbort=new AbortController();loading($('stProblemBody'),'正在汇总问题与证据…');try{const res=await fetch('/stability/problems?'+queryParams(),{headers:{Accept:'application/json'},signal:st.problemAbort.signal});if(res.status===401){location.href='/login';return}const data=await res.json();if(!res.ok)throw new Error(data.error||`HTTP ${res.status}`);$('stProblemBody').innerHTML=problemTable(data,false)}catch(e){if(e.name!=='AbortError')errorBox($('stProblemBody'),e.message)}}
-function problemTable(d,compactMode){const rows=d.problems||[];let coverage='';if(+d.pending_minutes>0)coverage+=`<div class="alert">历史日志错误采集仍有 ${nfmt(d.pending_minutes)} 个分钟待处理；下列排行只包含已完整采集的分钟，不会把部分数据当成完整结果。</div>`;if(+d.uncovered_minutes>0)coverage+=`<div class="alert">当前日期范围有 ${nfmt(d.uncovered_minutes)} 个分钟尚无历史日志错误覆盖；不能据此判断未覆盖时段没有错误。</div>`;if(!rows.length)return `${coverage}<div class="stability-empty"><b>当前范围没有已采集的历史日志问题</b><p>这不表示用户侧或未覆盖时段一定没有问题。</p></div>`;return `${coverage}${!compactMode?`<div class="stability-advice-pending"><b>口径边界：</b>以下只统计已经进入服务链路并形成脱敏问题签名的请求；未归属请求只在分组详情保留计数。</div>`:''}<div class="stability-problem-list"><div class="stability-problem-head"><span>来源 / error code</span><span>脱敏问题签名</span><span>影响范围</span><span style="text-align:right">数量</span><span>最后出现</span></div>${rows.map(p=>`<div class="stability-problem-row"><span><b class="code">${esc(p.code||'无明确 code')}</b><small>${esc(p.source)}</small></span><code>${esc(p.message||'(空)')}${p.truncated?' …（已截断）':''}</code><span><small>${esc((p.groups||[]).slice(0,3).join('、')||'—')}<br>${(p.channel_ids||[]).slice(0,4).map(id=>'#'+id).join('、')||'未归属渠道'}</small></span><span class="count">${nfmt(p.count)}</span><small>${dateTime(p.last_ts)}</small></div>`).join('')}</div>${d.truncated?'<div class="alert">问题类型超过接口安全上限，仅显示数量最高的部分。</div>':''}`}
+async function loadProblems(){
+  if(st.view!=='problems')return;
+  if(st.problemAbort)st.problemAbort.abort();
+  const controller=new AbortController();
+  st.problemAbort=controller;
+  const key=queryParams().toString();
+  // 低于 95% 的入口复用同范围主报表 health，避免前端复制阈值。若报表正在加载，
+  // 直接等待同一个 promise；没有同范围报表时与问题请求并行发起一次正常报表请求。
+  const reportWait=st.reportKey===key?Promise.resolve():
+    (st.reportPromise&&st.reportPromiseKey===key?st.reportPromise:loadReport());
+  loading($('stProblemBody'),'正在汇总问题与证据…');
+  try{
+    const res=await fetch('/stability/problems?'+key,{headers:{Accept:'application/json'},signal:controller.signal});
+    if(res.status===401){location.href='/login';return}
+    const data=await res.json();
+    if(!res.ok)throw new Error(data.error||`HTTP ${res.status}`);
+    await reportWait;
+    // 问题响应可能先返回、随后等待同范围主报表。等待期间若用户改了范围，旧请求
+    // 即使 fetch 已结束也必须失去写 DOM 的资格。
+    if(st.problemAbort!==controller||controller.signal.aborted||queryParams().toString()!==key)return;
+    $('stProblemBody').innerHTML=problemTable(data,false);
+  }catch(e){if(e.name!=='AbortError'&&st.problemAbort===controller)errorBox($('stProblemBody'),e.message)}
+}
+const cstHHMM=ts=>{const p=new Intl.DateTimeFormat('en-GB',{timeZone:'Asia/Shanghai',hour:'2-digit',minute:'2-digit',hourCycle:'h23'}).formatToParts(new Date(ts*1000));const v=t=>p.find(x=>x.type===t)?.value||'00';return `${v('hour')}:${v('minute')}`};
+function problemDiagnosisContext(d,p,channelID,ch){
+  const from=+d.from_ts||0,to=+d.to_ts||0,valid=from>0&&to>from;
+  // monitorNavigate 只把一级标量写入 URL hash；不能传嵌套对象，否则会变成
+  // "[object Object]"。用带前缀的扁平字段明确标识它们属于稳定性原范围。
+  const base={
+    preset:'channel_diagnosis',channel_id:channelID,scope:'err_anom',
+    stability_from_ts:from,stability_to_ts:to,
+    stability_requests:+ch?.requests||0,stability_problems:+ch?.problems||0,
+    stability_anomaly:+ch?.anomaly||0,stability_failed:+ch?.failed||0,
+    stability_rate:ch?.stability==null?'':+ch.stability
+  };
+  const sameDay=valid&&cstDate(from)===cstDate(to-1);
+  if(sameDay)return {...base,date:cstDate(from),from_time:cstHHMM(from),to_time:cstHHMM(to-1)};
+  let last=+p.last_ts||0;
+  if(valid)last=Math.min(Math.max(last||from,from),to-1);
+  return {...base,date:cstDate(last||Math.floor(Date.now()/1000)),from_time:'00:00',to_time:'23:59'};
+}
+function problemChannelState(channelID,compactMode){
+  if(compactMode&&st.drawer){
+    if(st.drawer.kind==='channel'&&+st.drawer.entity?.id===+channelID)return st.drawer.entity;
+    const channel=(st.drawer.group?.channels||[]).find(ch=>+ch.id===+channelID);
+    return channel||null;
+  }
+  // 主问题表只能使用同一 query key 的报表；加载失败时宁可显示“待核验”，
+  // 也不能拿上一时间范围的 health 误开“低于 95%”入口。
+  if(st.reportKey!==queryParams().toString())return null;
+  return (st.report?.rankings?.channels||[]).find(ch=>+ch.id===+channelID)||null;
+}
+function problemChannelActions(d,p,compactMode){
+  const ids=[...new Set((p.channel_ids||[]).map(Number).filter(id=>Number.isInteger(id)&&id>0))];
+  if(!ids.length)return '<small>未归属渠道</small>';
+  return `<div class="stability-problem-channels">${ids.map(id=>{
+    const ch=problemChannelState(id,compactMode),name=ch?.name?` ${esc(ch.name)}`:'';
+    if(ch?.health==='bad')return `<button type="button" class="stability-problem-diagnose" onclick="monitorOpenEncoded('logchain','${encodeNav(problemDiagnosisContext(d,p,id,ch))}')"><b>#${id}${name}</b> 查看不稳定原因</button>`;
+    const state=ch?.health==='nosample'?'样本不足':ch?.stability==null?'稳定性待核验':`${pct(ch.stability)} · ${ch.health==='warn'?'关注':'正常'}`;
+    return `<span class="stability-problem-channel" title="当前范围未达到低于 95% 的不稳定入口条件"><b>#${id}${name}</b><small>${esc(state)}</small></span>`;
+  }).join('')}</div>`;
+}
+function problemTable(d,compactMode){const rows=d.problems||[];let coverage='';if(+d.pending_minutes>0)coverage+=`<div class="alert">历史日志错误采集仍有 ${nfmt(d.pending_minutes)} 个分钟待处理；下列排行只包含已完整采集的分钟，不会把部分数据当成完整结果。</div>`;if(+d.uncovered_minutes>0)coverage+=`<div class="alert">当前日期范围有 ${nfmt(d.uncovered_minutes)} 个分钟尚无历史日志错误覆盖；不能据此判断未覆盖时段没有错误。</div>`;if(!rows.length)return `${coverage}<div class="stability-empty"><b>当前范围没有已采集的历史日志问题</b><p>这不表示用户侧或未覆盖时段一定没有问题。</p></div>`;return `${coverage}${!compactMode?`<div class="stability-advice-pending"><b>口径边界：</b>以下只统计已经进入服务链路并形成脱敏问题签名的请求；未归属请求只在分组详情保留计数。</div>`:''}<div class="stability-problem-list"><div class="stability-problem-head"><span>来源 / error code</span><span>脱敏问题签名</span><span>影响范围</span><span style="text-align:right">数量</span><span>最后出现</span></div>${rows.map(p=>`<div class="stability-problem-row"><span><b class="code">${esc(p.code||'无明确 code')}</b><small>${esc(p.source)}</small></span><code>${esc(p.message||'(空)')}${p.truncated?' …（已截断）':''}</code><span><small>${esc((p.groups||[]).slice(0,3).join('、')||'—')}</small>${problemChannelActions(d,p,compactMode)}</span><span class="count">${nfmt(p.count)}</span><small>${dateTime(p.last_ts)}</small></div>`).join('')}</div>${d.truncated?'<div class="alert">问题类型超过接口安全上限，仅显示数量最高的部分。</div>':''}`}
 
 document.addEventListener('DOMContentLoaded',()=>{if($('tab-stability')&&!st.inited)init()});
 })();

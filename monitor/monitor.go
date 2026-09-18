@@ -77,6 +77,7 @@ type Monitor struct {
 	problemLastSuccess        atomic.Int64 // 原始错误采集器最近一次成功执行
 	problemLastFailure        atomic.Int64 // 原始错误采集器最近一次失败
 	problemLiveThrough        atomic.Int64 // 原始错误实时 lane 已确认到的分钟右水位
+	problemSourceRunning      atomic.Bool  // logchain-only 独立问题签名只读 lane 是否正在运行
 	stabilityBackfillRunning  atomic.Bool  // 长期小时补数串行闸门；人工任务与自动修洞共用
 	metricBackfillMu          sync.RWMutex
 	metricBackfillStatus      MetricBackfillStatus
@@ -171,6 +172,8 @@ type Monitor struct {
 	backgroundSourceLowWaiters  int
 	backgroundSourceLastStart   atomic.Int64
 	backgroundSourceStarts      atomic.Uint64
+	// 用户名缓存只是展示增强；异步走低优先来源槽且禁止重叠，不能延迟主采样。
+	userDirectorySyncing atomic.Bool
 	// 正在等待任一来源库泳道/预算的交互请求数；后台事实采集见到后主动让路。
 	usageInteractiveWaiters atomic.Int64
 	usageAggregateMetrics   usageQueryLaneMetrics
@@ -336,6 +339,9 @@ func New(s Settings) (*Monitor, error) {
 	if err := validateLocalAuthBypassSettings(s); err != nil {
 		return nil, err
 	}
+	if err := validateStabilityProblemSourceSettings(s); err != nil {
+		return nil, err
+	}
 	credentialSecretConfigured := strings.TrimSpace(s.UpstreamCredentialSecret) != "" || strings.TrimSpace(s.SessionSecret) != ""
 	if err := validateNginxSettings(s); err != nil {
 		return nil, err
@@ -399,6 +405,25 @@ func New(s Settings) (*Monitor, error) {
 	}
 	initialized = true
 	return m, nil
+}
+
+func validateStabilityProblemSourceSettings(s Settings) error {
+	if !s.StabilityProblemSourceEnabled {
+		return nil
+	}
+	if s.LocalSnapshotOnly {
+		return errors.New("问题签名来源采集不能在本地快照只读模式开启")
+	}
+	if !s.LogChainOnlySource {
+		return errors.New("MONITOR_STABILITY_PROBLEM_SOURCE_ENABLED 只允许与 MONITOR_LOGCHAIN_ONLY_SOURCE=true 一起使用")
+	}
+	if !s.StabilityEnabled {
+		return errors.New("问题签名来源采集必须同时开启 MONITOR_STABILITY_ENABLED")
+	}
+	if s.StabilityProblemSourceLookbackHours < 1 || s.StabilityProblemSourceLookbackHours > 168 {
+		return errors.New("MONITOR_STABILITY_PROBLEM_SOURCE_LOOKBACK_HOURS 必须在 1～168 之间")
+	}
+	return nil
 }
 
 // validateLocalAuthBypassSettings 让“免登录”只能存在于完全离线的本机快照。

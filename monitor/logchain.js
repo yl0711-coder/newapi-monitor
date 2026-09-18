@@ -7,17 +7,23 @@
 //   GET /logchain/requests  逐条明细（查生产 logs，含 type=5）
 //   GET /logchain/filters   下拉取值（只读本地 channel_snaps）
 //
-// 默认只看错误（error_only=true）：本页定位是"当天故障清单"，不是全量请求流水。
-// 可切换成显示全部请求，届时错误行仍标红底，并给出"N 条中 M 条错误"计数。
+// 默认看错误 + 全部异常（anomaly=err_anom）：本页定位是“问题清单”，不是全量请求流水。
+// 错误、流故障、客户端断连和交付/计费异常都应默认可见；需要单看某类时再切换范围。
 
 const lc={
   inited:false,
-  date:'',            // YYYY-MM-DD（CST），空=今天
-  // scope 查看范围，互斥单选。默认 error，与本页定位一致（当天故障清单）。
+  // 已应用的查询范围：起止日期 + 起止分钟，四者都包含在内。
+  // date/toDate 相同即单日；不同即跨日（客户常给“昨晚 22:40 到今早 09:15”）。
+  date:'',            // 开始日期 YYYY-MM-DD（CST），空=今天
+  toDate:'',          // 结束日期 YYYY-MM-DD（CST），空=跟随 date
+  fromTime:'00:00',    // 已应用的开始分钟（包含）
+  toTime:'23:59',      // 已应用的结束分钟（包含）
+  timeDirty:false,     // 控件里有尚未点“查询”应用的范围草稿
+  // scope 查看范围，互斥单选。默认 err_anom，避免只看 type=5 而漏掉消费异常。
   //   error        上游返回错误（type=5）
   //   stream       流真的出故障：timeout / scanner_error / panic / ping_fail 及未见过的新取值
   //   client_gone  下游客户端主动断连，**独立一档**
-  //   billing      扣费未交付，或交付未扣费
+  //   billing      扣费未交付、未交付未扣费，或交付未扣费
   //   anomaly_all  流故障 + 客户断连 + 消费异常
   //   err_anom     错误 + 全部异常（本页能查到的全部问题）
   //
@@ -27,11 +33,11 @@ const lc={
   //
   // 没有"全部请求"这一档：本页定位是问题清单，正常请求不看。
   // 要看全量流水去「用户用量」，那才是它的职责。
-  scope:'error',
+  scope:'err_anom',
   // asc=false 为时间倒序（最新在上，默认）。排障最常看"刚刚发生了什么"。
   // 切换方向后必须重新从第一页取：游标是沿方向前进的，沿用旧游标会翻到反方向。
   asc:false,
-  filters:{group:'',domain:'',channel_id:'',model:'',user:'',keyword:''},
+  filters:{group:'',domain:'',channel_id:'',model:'',user_id:'',username:'',token_name:'',token_id:'',endpoint:'',stream:'',request_id:''},
   rows:[],hasMore:false,nextBeforeTs:0,nextBeforeID:0,
   // scopeEcho 是后端回显的生效范围（时间窗、limit 等），与上面的 scope（查看范围）
   // 是两件事。曾经两者同名，后者静默覆盖前者，默认查看范围直接丢失。
@@ -45,6 +51,9 @@ const lc={
   // 也不让后端算全筛选范围：那需要另发一条聚合 SQL，多占一次 usageDetailGate
   // （容量 1，与客户 Portal 日志查询共用），排障是内部功能不得挤占客户功能。
   radius:null,radiusStale:false,
+  // 仅稳定性渠道诊断跳转携带。它描述稳定性原范围，不参与当前页计数；
+  // 用户手动改变任何查询条件后立即清除，避免旧指标冒充新范围。
+  diagnosisContext:null,
   opts:null,           // /logchain/filters 结果，只取一次
   loading:false,abort:null,generation:0,
   expanded:new Set()
@@ -85,6 +94,17 @@ window.logChainActivate=function(){
   if(!lc.rows.length||changed||!lc.scopeEcho)load();
 };
 
+// 离开页面时立即释放正在等待/占用的共享查询槽位。generation 先递增，保证 abort
+// 触发的旧请求即使稍后进入 catch/finally，也无权改写当前页面状态。
+window.logChainDeactivate=function(){
+  if(!lc.inited)return;
+  ++lc.generation;
+  lc.abort?.abort();
+  lc.abort=null;
+  lc.loading=false;
+  render();
+};
+
 // logChainOpen 供其它页跳进来用（如用户用量的客户详情 → 排障）。
 window.logChainOpen=function(context){window.monitorNavigate?.('logchain',context||{})};
 
@@ -92,13 +112,65 @@ function applyNavigationContext(){
   const c=window.monitorNavigationContext?.()||{};
   if(!Object.keys(c).length)return false;
   let changed=false;
-  // 跨页带 user_id 进来时按客户筛；带 date 时切到那天。
-  const user=c.user_id?String(c.user_id):'';
-  if(user&&lc.filters.user!==user){lc.filters.user=user;changed=true}
+  // 稳定性“查看不稳定原因”必须得到一张干净的渠道问题清单，不能继承上一次
+  // 客户/令牌/模型等筛选。只接受正整数渠道，避免坏链接扩大成全渠道查询。
+  const diagnosisChannel=String(c.channel_id||'');
+  const channelDiagnosis=c.preset==='channel_diagnosis'&&/^\d+$/.test(diagnosisChannel)&&+diagnosisChannel>0;
+  if(!channelDiagnosis)lc.diagnosisContext=null;
+  if(channelDiagnosis){
+    const desired={group:'',domain:'',channel_id:diagnosisChannel,model:'',user_id:'',username:'',token_name:'',token_id:'',endpoint:'',stream:'',request_id:''};
+    for(const [key,value] of Object.entries(desired)){
+      if(lc.filters[key]!==value){lc.filters[key]=value;changed=true}
+    }
+    const finite=v=>v!==''&&v!=null&&Number.isFinite(+v)&&+v>=0?+v:null;
+    const count=v=>{const n=finite(v);return n!=null&&Number.isInteger(n)?n:null};
+    const fromTs=count(c.stability_from_ts),toTs=count(c.stability_to_ts),
+      requests=count(c.stability_requests),problems=count(c.stability_problems),
+      anomaly=count(c.stability_anomaly),failed=count(c.stability_failed),
+      stability=finite(c.stability_rate);
+    const validContext=fromTs>0&&toTs>fromTs&&requests!=null&&problems!=null&&anomaly!=null&&failed!=null&&
+      problems===anomaly+failed&&problems<=requests&&
+      (stability==null||(stability>=0&&stability<=100));
+    lc.diagnosisContext=validContext?{from_ts:fromTs,to_ts:toTs,requests,problems,anomaly,failed,stability}:null;
+    // 即使目标渠道和日期与现页相同，也要刷新原因列表并渲染新的原范围指标。
+    changed=true;
+    if(lc.scope!=='err_anom'){lc.scope='err_anom'}
+    if(lc.asc){lc.asc=false;changed=true}
+    if(lc.timeDirty){lc.timeDirty=false;changed=true}
+  }
+  // 跨页带 user_id / username / token_name 进来时按各自字段筛；带 date 时切到那天。
+  const userID=c.user_id?String(c.user_id):'';
+  if(userID&&lc.filters.user_id!==userID){lc.filters.user_id=userID;changed=true}
+  const username=(c.username||'').trim();
+  if(username&&lc.filters.username!==username){lc.filters.username=username;changed=true}
+  const tokenName=(c.token_name||'').trim();
+  if(tokenName&&lc.filters.token_name!==tokenName){lc.filters.token_name=tokenName;changed=true}
+  // 跨页可以只给 date（单日），也可以给 date + to_date（跨日范围）。
+  // 只给 date 时结束日期必须跟随它，否则会沿用上一次的结束日期、把范围悄悄放大。
   if(c.date&&lc.date!==c.date){lc.date=c.date;changed=true}
+  const toDate=(c.to_date||'').trim();
+  if(c.date||toDate){
+    const desiredEnd=toDate||c.date||rangeEnd();
+    if(rangeEnd()!==desiredEnd){lc.toDate=desiredEnd;changed=true}
+  }
+  // 分钟范围必须成对接收；只有一半时不污染当前状态，后端也会 fail-closed。
+  const fromTime=(c.from_time||'').trim(),toTime=(c.to_time||'').trim();
+  if(fromTime&&toTime){
+    if(lc.fromTime!==fromTime||lc.timeDirty){lc.fromTime=fromTime;changed=true}
+    if(lc.toTime!==toTime){lc.toTime=toTime;changed=true}
+    lc.timeDirty=false;
+  }
   if(c.domain&&lc.filters.domain!==c.domain){lc.filters.domain=c.domain;changed=true}
   if(c.group&&lc.filters.group!==c.group){lc.filters.group=c.group;changed=true}
   if(c.channel_id&&lc.filters.channel_id!==String(c.channel_id)){lc.filters.channel_id=String(c.channel_id);changed=true}
+  const tokenID=c.token_id?String(c.token_id):'';
+  if(tokenID&&lc.filters.token_id!==tokenID){lc.filters.token_id=tokenID;changed=true}
+  const endpoint=(c.endpoint||'').trim();
+  if(endpoint&&lc.filters.endpoint!==endpoint){lc.filters.endpoint=endpoint;changed=true}
+  const stream=String(c.stream||'').trim();
+  if((stream==='true'||stream==='false')&&lc.filters.stream!==stream){lc.filters.stream=stream;changed=true}
+  const requestID=(c.request_id||'').trim();
+  if(requestID&&lc.filters.request_id!==requestID){lc.filters.request_id=requestID;changed=true}
   // 跨页进来时可指定范围，显式传才覆盖默认。
   if(c.scope&&SCOPES.includes(c.scope)&&lc.scope!==c.scope){lc.scope=c.scope;changed=true}
   else if(c.error_only!=null){ // 兼容旧链接
@@ -111,27 +183,56 @@ function applyNavigationContext(){
   return changed;
 }
 
+function clearDiagnosisContext(){lc.diagnosisContext=null}
+
+// rangeEnd 已应用的结束日期。空值按单日处理，避免旧上下文缺字段时查出空集。
+function rangeEnd(){return lc.toDate||lc.date}
+
+// shiftRange 整段平移：起止日期同时移动，保留已应用的分钟范围。
+// 不允许把结束日期推到未来——那段还没发生，查了只会得到空结果。
+function shiftRange(delta){
+  const from=shiftDate(lc.date,delta),to=shiftDate(rangeEnd(),delta);
+  if(to>cstToday())return false;
+  lc.date=from;lc.toDate=to;
+  return true;
+}
+
 function init(){
   lc.inited=true;
   lc.date=lc.date||cstToday();
+  lc.toDate=lc.toDate||lc.date;
 
-  $('lcPrevDay')?.addEventListener('click',()=>{lc.date=shiftDate(lc.date,-1);syncControls();load()});
+  $('lcPrevDay')?.addEventListener('click',()=>{
+    clearDiagnosisContext();
+    if(!shiftRange(-1))return;
+    syncControls();load();
+  });
   $('lcNextDay')?.addEventListener('click',()=>{
-    if(lc.date>=cstToday())return; // 不允许翻到未来
-    lc.date=shiftDate(lc.date,1);syncControls();load();
+    clearDiagnosisContext();
+    if(!shiftRange(1))return; // 结束日期已到今天，不允许翻到未来
+    syncControls();load();
   });
-  $('lcToday')?.addEventListener('click',()=>{lc.date=cstToday();syncControls();load()});
-  $('lcDate')?.addEventListener('change',()=>{
-    const v=$('lcDate').value;
-    if(!v)return;
-    if(v>cstToday()){showError('不能选择未来日期。');syncControls();return}
-    lc.date=v;load();
-  });
+  $('lcToday')?.addEventListener('click',()=>{clearDiagnosisContext();lc.date=cstToday();lc.toDate=cstToday();syncControls();load()});
+  // 日期与时间一律只记草稿：跨日范围要两个日期加两个时间同时确定，
+  // 边改边查会发出中间态的错范围查询，还会占共享查询通道。
+  const markTimeDirty=()=>{
+    clearDiagnosisContext();
+    const from=$('lcDate')?.value||'',to=$('lcToDate')?.value||'',
+      fromTime=$('lcFromTime')?.value||'',toTime=$('lcToTime')?.value||'';
+    lc.timeDirty=from!==lc.date||to!==rangeEnd()||fromTime!==lc.fromTime||toTime!==lc.toTime;
+    const hint=$('lcTimeHint');
+    if(hint){hint.hidden=!lc.timeDirty;hint.textContent=lc.timeDirty?'范围已修改，点查询生效':''}
+    $('lcTimeRange')?.classList.toggle('pending',lc.timeDirty);
+  };
+  $('lcDate')?.addEventListener('input',markTimeDirty);
+  $('lcToDate')?.addEventListener('input',markTimeDirty);
+  $('lcFromTime')?.addEventListener('input',markTimeDirty);
+  $('lcToTime')?.addEventListener('input',markTimeDirty);
 
   document.querySelectorAll('[data-lc-scope]').forEach(btn=>btn.addEventListener('click',()=>{
     const v=btn.dataset.lcScope;
     if(lc.scope===v)return; // 点当前项不重复查库（该泳道与客户 Portal 共用）
-    lc.scope=v;
+    clearDiagnosisContext();lc.scope=v;
     syncControls();
     load();
   }));
@@ -152,26 +253,43 @@ function init(){
   // 文本框绝不能绑 change：它在失焦时触发，用户输入后点"查询"会先 blur 再 click，
   // 于是发两次相同查询。detail 泳道容量只有 1 且与客户 Portal 共用，
   // 白发一次就是让客户多排一次队。文本框统一走回车 / 查询按钮。
-  ['lcGroup','lcDomain','lcChannel'].forEach(id=>$(id)?.addEventListener('change',()=>{
-    const key={lcGroup:'group',lcDomain:'domain',lcChannel:'channel_id'}[id];
-    lc.filters[key]=$(id).value||'';
+  ['lcGroup','lcDomain','lcChannel','lcStream'].forEach(id=>$(id)?.addEventListener('change',()=>{
+    const key={lcGroup:'group',lcDomain:'domain',lcChannel:'channel_id',lcStream:'stream'}[id];
+    clearDiagnosisContext();lc.filters[key]=$(id).value||'';
     // 选了具体渠道就不该再受域名约束（渠道更精确），避免两者冲突筛出空集。
     if(key==='channel_id'&&lc.filters.channel_id){lc.filters.domain='';syncControls()}
     load();
   }));
 
   const applyText=()=>{
+    const fromDate=$('lcDate')?.value||'',toDate=$('lcToDate')?.value||'',
+      from=$('lcFromTime')?.value||'',to=$('lcToTime')?.value||'';
+    if(!fromDate||!toDate){showError('开始日期和结束日期必须同时填写。');return}
+    if(!from||!to){showError('开始时间和结束时间必须同时填写。');return}
+    const today=cstToday();
+    if(fromDate>today||toDate>today){showError('不能选择未来日期。');return}
+    if(fromDate>toDate){showError('开始日期不能晚于结束日期。');return}
+    if(fromDate===toDate&&from>to){showError('同一天内开始时间不能晚于结束时间。');return}
+    clearDiagnosisContext();
+    lc.date=fromDate;lc.toDate=toDate;lc.fromTime=from;lc.toTime=to;lc.timeDirty=false;
+    const hint=$('lcTimeHint');if(hint)hint.hidden=true;
+    $('lcTimeRange')?.classList.remove('pending');
     lc.filters.model=($('lcModel')?.value||'').trim();
-    lc.filters.user=($('lcUser')?.value||'').trim();
-    lc.filters.keyword=($('lcKeyword')?.value||'').trim();
+    lc.filters.user_id=($('lcUserID')?.value||'').trim();
+    lc.filters.username=($('lcUsername')?.value||'').trim();
+    lc.filters.token_name=($('lcTokenName')?.value||'').trim();
+    lc.filters.token_id=($('lcTokenID')?.value||'').trim();
+    lc.filters.endpoint=($('lcEndpoint')?.value||'').trim();
+    lc.filters.request_id=($('lcRequestID')?.value||'').trim();
     load();
   };
   $('lcApply')?.addEventListener('click',applyText);
-  ['lcModel','lcUser','lcKeyword'].forEach(id=>$(id)?.addEventListener('keydown',e=>{if(e.key==='Enter')applyText()}));
+  ['lcModel','lcUserID','lcUsername','lcTokenName','lcTokenID','lcEndpoint','lcRequestID'].forEach(id=>$(id)?.addEventListener('keydown',e=>{if(e.key==='Enter')applyText()}));
 
   $('lcReset')?.addEventListener('click',()=>{
-    lc.filters={group:'',domain:'',channel_id:'',model:'',user:'',keyword:''};
-    lc.scope='error';lc.date=cstToday();lc.asc=false;
+    clearDiagnosisContext();
+    lc.filters={group:'',domain:'',channel_id:'',model:'',user_id:'',username:'',token_name:'',token_id:'',endpoint:'',stream:'',request_id:''};
+    lc.scope='err_anom';lc.date=cstToday();lc.toDate=cstToday();lc.fromTime='00:00';lc.toTime='23:59';lc.timeDirty=false;lc.asc=false;
     syncControls();load();
   });
 
@@ -233,20 +351,44 @@ function setOrder(asc){
 }
 
 function syncControls(){
-  if($('lcDate')){$('lcDate').value=lc.date;$('lcDate').max=cstToday()}
+  // 用户改了范围但尚未点“查询”时保留全部草稿；其它自动查询仍沿用已应用范围。
+  if(!lc.timeDirty){
+    if($('lcDate'))$('lcDate').value=lc.date;
+    if($('lcToDate'))$('lcToDate').value=rangeEnd();
+    if($('lcFromTime'))$('lcFromTime').value=lc.fromTime;
+    if($('lcToTime'))$('lcToTime').value=lc.toTime;
+  }
+  if($('lcDate'))$('lcDate').max=cstToday();
+  if($('lcToDate'))$('lcToDate').max=cstToday();
+  const timeHint=$('lcTimeHint');
+  if(timeHint){timeHint.hidden=!lc.timeDirty;timeHint.textContent=lc.timeDirty?'范围已修改，点查询生效':''}
+  $('lcTimeRange')?.classList.toggle('pending',lc.timeDirty);
   document.querySelectorAll('[data-lc-scope]').forEach(btn=>{
     btn.classList.toggle('active',btn.dataset.lcScope===lc.scope);
   });
-  if($('lcUser'))$('lcUser').value=lc.filters.user;
-  if($('lcKeyword'))$('lcKeyword').value=lc.filters.keyword;
+  if($('lcUserID'))$('lcUserID').value=lc.filters.user_id;
+  if($('lcUsername'))$('lcUsername').value=lc.filters.username;
+  if($('lcTokenName'))$('lcTokenName').value=lc.filters.token_name;
+  if($('lcTokenID'))$('lcTokenID').value=lc.filters.token_id;
+  if($('lcEndpoint'))$('lcEndpoint').value=lc.filters.endpoint;
+  if($('lcStream'))$('lcStream').value=lc.filters.stream;
+  if($('lcRequestID'))$('lcRequestID').value=lc.filters.request_id;
   ['lcGroup','lcDomain','lcChannel','lcModel'].forEach(id=>{
     const key={lcGroup:'group',lcDomain:'domain',lcChannel:'channel_id',lcModel:'model'}[id];
     if($(id))$(id).value=lc.filters[key]||'';
   });
+  // 整段平移的上界看结束日期：结束日已到今天就不能再往后推。
   const nextBtn=$('lcNextDay');
-  if(nextBtn){const atToday=lc.date>=cstToday();nextBtn.disabled=atToday;nextBtn.title=atToday?'已是今天':'后一天'}
+  if(nextBtn){const atToday=rangeEnd()>=cstToday();nextBtn.disabled=atToday;nextBtn.title=atToday?'结束日期已是今天':'整段范围后移一天'}
+  // 标签显示已应用范围本身，跨日时必须两端都写出来，避免看成单日。
   const label=$('lcDateLabel');
-  if(label)label.textContent=lc.date===cstToday()?'今天':lc.date;
+  if(label){
+    const end=rangeEnd();
+    const single=lc.date===end;
+    label.textContent=single
+      ?(lc.date===cstToday()?`今天 ${lc.fromTime}–${lc.toTime}`:`${lc.date} ${lc.fromTime}–${lc.toTime}`)
+      :`${lc.date} ${lc.fromTime} → ${end} ${lc.toTime}`;
+  }
   syncDetailHeader();
   // 排序三处显示保持一致：按钮组高亮、表头箭头、表头副说明。
   document.querySelectorAll('[data-lc-order]').forEach(btn=>{
@@ -294,8 +436,9 @@ function setOptions(id,items,current,placeholder){
 
 function buildQuery(more){
   const q=new URLSearchParams();
-  // 单日：from=to=当天，后端会把 to 当天整日纳入（左闭右开）。
-  q.set('from',lc.date);q.set('to',lc.date);
+  // 单日：from=to=当天；分钟范围结束值也包含整分钟，由后端转成下一分钟排他上界。
+  q.set('from',lc.date);q.set('to',rangeEnd());
+  q.set('from_time',lc.fromTime);q.set('to_time',lc.toTime);
   // 查看范围 → 后端参数。error_only 与 anomaly 互斥（后端会拒），只能设其一。
   // err_anom 也走后端（anomaly=err_anom），不在前端滤：
   // 前端过滤会让 limit/has_more/计数三者失准。
@@ -309,10 +452,13 @@ function buildQuery(more){
   if(lc.filters.domain)q.set('domain',lc.filters.domain);
   if(lc.filters.channel_id)q.set('channel_id',lc.filters.channel_id);
   if(lc.filters.model)q.set('model',lc.filters.model);
-  if(lc.filters.keyword)q.set('keyword',lc.filters.keyword);
-  // 客户输入：纯数字按 user_id，否则按令牌名模糊查（后端 token_name LIKE）。
-  const u=lc.filters.user;
-  if(u){ if(/^\d+$/.test(u))q.set('user_id',u); else q.set('token_name',u); }
+  if(lc.filters.user_id)q.set('user_id',lc.filters.user_id);
+  if(lc.filters.username)q.set('username',lc.filters.username);
+  if(lc.filters.token_name)q.set('token_name',lc.filters.token_name);
+  if(lc.filters.token_id)q.set('token_id',lc.filters.token_id);
+  if(lc.filters.endpoint)q.set('endpoint',lc.filters.endpoint);
+  if(lc.filters.stream)q.set('stream',lc.filters.stream);
+  if(lc.filters.request_id)q.set('request_id',lc.filters.request_id);
   if(lc.asc)q.set('order','asc'); // 后端只认 "asc"，缺省即倒序
   q.set('limit','100');
   // 游标必须成对传：排序键是 (created_at, id)，只给 id 定位不到续查位置，
@@ -326,15 +472,25 @@ function buildQuery(more){
 
 // load 取一页数据。
 //
-// 不能用 "if(lc.loading)return" 做互斥:那样在请求进行中改筛选条件会被静默丢弃,
-// 表格停在旧结果上,用户以为筛选没生效。改用世代计数——新请求直接中止旧请求,
-// 且只有最新世代有权写状态,避免被中止的旧请求把新请求的 loading 标记清掉。
+// 不能用 "if(lc.loading)return" 拦所有请求：那样在请求进行中改筛选条件会被静默丢弃，
+// 表格停在旧结果上，用户以为筛选没生效。这里只拦重复分页；新的首屏查询仍会递增
+// 世代并中止旧请求。这样既允许筛选抢占旧请求，又避免双击“加载更多”重复占共享泳道。
 async function load(more){
+  if(more&&(lc.loading||!lc.hasMore||!lc.nextBeforeTs||!lc.nextBeforeID))return;
   const gen=++lc.generation;
   lc.loading=true;
+  clearError();
   lc.abort?.abort();
   const ac=new AbortController();lc.abort=ac;
-  if(!more){lc.rows=[];lc.expanded.clear();lc.nextBeforeTs=0;lc.nextBeforeID=0}
+  if(!more){
+    lc.rows=[];lc.expanded.clear();
+    // 新筛选一开始就废弃旧页的分页能力。否则旧按钮在新响应回来前仍可点击，
+    // 会中止新筛选并拿旧游标发一次 append 查询。
+    lc.hasMore=false;lc.nextBeforeTs=0;lc.nextBeforeID=0;
+  }
+  // 状态必须在 fetch 前同步反映到 DOM：事件处理器返回前封住第二次点击。
+  const moreBtn=$('lcMore');
+  if(moreBtn){moreBtn.disabled=true;if(!more)moreBtn.hidden=true}
   renderStatus(more?'加载更多…':'加载中…');
   try{
     // 同上（RB-03）。这个接口的敏感度更高：含客户标识、令牌名与上游错误原文。
@@ -344,7 +500,15 @@ async function load(more){
     if(gen!==lc.generation)return; // 已被更新的请求取代,丢弃本次结果
     let data={};
     try{data=JSON.parse(text)}catch(e){throw new Error(`响应不是 JSON（HTTP ${r.status}）：${text.slice(0,200)}`)}
+    // 同名客户：后端不猜，交出候选让人选。这里必须给出可点选项，
+    // 否则用户只看到一句“请选择具体客户”却无从下手。
+    if(!r.ok&&data.username_ambiguous&&Array.isArray(data.candidates)&&data.candidates.length){
+      lc.rows=[];lc.hasMore=false;lc.nextBeforeTs=0;lc.nextBeforeID=0;lc.radius=null;lc.radiusStale=false;
+      showUsernameChoices(data.username||lc.filters.username,data.candidates,data.error||'');
+      return;
+    }
     if(!r.ok)throw new Error(data.error||`HTTP ${r.status}`);
+    clearError();
     lc.rows=more?lc.rows.concat(data.rows||[]):(data.rows||[]);
     lc.hasMore=!!data.has_more;
     lc.nextBeforeTs=+data.next_before_ts||0;
@@ -361,25 +525,62 @@ async function load(more){
     lc.correlationError=data.upstream_correlation_error||'';
     lc.evidenceMode=data.nginx_evidence_mode||'off';
     lc.evidenceVerified=!!data.nginx_evidence_verified;
-    render();
+    // 必须由 finally 在 render() 之前解锁：render() 里 moreBtn.disabled=lc.loading，
+    // 顺序反了会让按钮永久停在 disabled。
   }catch(e){
     if(e.name==='AbortError'||gen!==lc.generation)return;
     lc.rows=more?lc.rows:[];
-    render();
     showError(e.message||String(e));
   }finally{
-    // 只有最新世代能解锁,否则被中止的旧请求会提前放开 loading。
-    // 解锁后必须重绘，否则成功响应在 loading=true 时把“加载更多”按钮禁用，
-    // finally 只改内存状态会让按钮一直不可点击。
-    if(gen===lc.generation){lc.loading=false;render()}
+    // 只有最新世代能解锁和重绘。旧请求被新筛选或离页动作中止后，不能提前
+    // 放开 loading，也不能用旧状态覆盖当前页面。成功和失败都统一只重绘一次。
+    if(gen===lc.generation){
+      if(lc.abort===ac)lc.abort=null;
+      lc.loading=false;
+      render();
+    }
   }
 }
 
+// showError 查询失败。
+//
+// 必须与“查到 0 条”明确区分：失败意味着**这次没查成，不知道有没有问题**，
+// 而空结果意味着查成了但没匹配。两者混同会让人把一次超时当成"这段时间很正常"。
 function showError(msg){
   const el=$('lcError');
   if(!el)return;
+  const text=String(msg||'');
+  // 超时/预算类失败给出可操作建议：缩小范围比反复重试更有效。
+  const timeoutLike=/超时|timeout|MAX_EXECUTION_TIME|deadline/i.test(text);
+  const advice=timeoutLike
+    ? '<div class="lc-sub" style="margin-top:4px">这次查询没有完成，因此<b>无法判断这段时间有没有问题</b>。请缩小时间范围，或加上客户、渠道、Request ID 等条件后重试。</div>'
+    : '<div class="lc-sub" style="margin-top:4px">这次查询没有完成，结果不可用；这不等于该范围内没有问题。</div>';
   el.hidden=false;
-  el.innerHTML=`<b>查询失败</b><div style="margin-top:4px">${esc(msg)}</div>`;
+  el.innerHTML=`<b>查询失败</b><div style="margin-top:4px">${esc(text)}</div>`+advice;
+}
+
+// showUsernameChoices 同名客户的选择入口。
+//
+// 不自动选第一个，也不并成一份结果：多个客户的请求混在一起时，页面看起来像
+// “这一个客户的问题”，据此得出的结论会落到错的客户身上。选中后按客户 ID 精确查，
+// 客户名同时保留以便看出当初是按哪个名字找到的。
+function showUsernameChoices(username,candidates,reason){
+  const el=$('lcError');
+  if(!el)return;
+  el.hidden=false;
+  el.innerHTML=`<b>客户名「${esc(username)}」对应多个客户</b>`+
+    `<div style="margin-top:4px">${esc(reason||'请选择具体客户后再查询。')}</div>`+
+    `<div class="lc-username-choices" style="margin-top:6px;display:flex;gap:6px;flex-wrap:wrap">`+
+    candidates.map(x=>`<button type="button" data-lc-pick-user="${esc(x.user_id)}">`+
+      `#${esc(x.user_id)} ${esc(x.username||username)}${x.group?' · '+esc(x.group):''}</button>`).join('')+
+    `</div>`;
+  el.querySelectorAll('[data-lc-pick-user]').forEach(btn=>btn.addEventListener('click',()=>{
+    clearDiagnosisContext();
+    lc.filters.user_id=btn.dataset.lcPickUser;
+    lc.filters.username=username;
+    syncControls();
+    load();
+  }));
 }
 function clearError(){const el=$('lcError');if(el)el.hidden=true}
 
@@ -437,9 +638,9 @@ function modelCell(r){
 // "错误+异常"混排时同一列里两种行并存，各自显示对自己有意义的东西。
 //
 // 错误行(type=5)：content 是上游返回的错误原文，直接显示。
-// 异常行(type=2 且有标签)：content 是计费摘要（"模型倍率 3.00..."），
-//   对排障毫无用处；真正的诊断信息是 end_reason / end_error。
-//   计费摘要退到展开区（核对计价时才有用），不占主列。
+// 异常行(type=2 且有标签)：多数 content 是计费摘要；“未交付·未扣费”例外，
+//   其 content 是 new-api 写下的异常事实，应直接展示。其它异常的真正诊断信息仍是
+//   end_reason / end_error，计费摘要退到展开区（核对计价时才有用）。
 // faultCell 疑似责任方。
 //
 // ★ 这一列是**推断**，与其它列性质不同 ★
@@ -527,8 +728,12 @@ function contentCell(r){
     if(er==='eof'&&r.stream_error_count>0){
       return `<div class="lc-content">流内出错 ${nfmt(r.stream_error_count)} 次（最终正常结束）</div>`;
     }
-    // 纯消费异常（没有流问题）：没有可显示的诊断文本，说清事实即可，
-    // 不要把计费摘要摆上来冒充诊断信息。
+    // 纯消费异常（没有流问题）：优先展示后端事实标签；特别是“未交付·未扣费”，
+    // 不能再用笼统的“计费不一致”把稳定性 B2 隐藏掉。
+    const tags=r.anomaly_tags||[];
+    if(tags.includes('undelivered_unbilled')){
+      return `<div class="lc-content">${esc(r.content||'文本请求未交付且未扣费')}</div>`;
+    }
     return `<div class="lc-sub">计费与交付不一致，详见标签</div>`;
   }
   const c=r.content||'';
@@ -545,6 +750,7 @@ const TAG_LABEL={
   client_gone:{t:'客户端断连',c:'lc-tag-gone'},
   stream:{t:'流未正常结束',c:'lc-tag-stream'},
   billing_unpaid:{t:'扣费未交付',c:'lc-tag-unpaid'},
+  undelivered_unbilled:{t:'未交付·未扣费',c:'lc-tag-unbilled'},
   billing_free:{t:'交付未扣费',c:'lc-tag-free'}
 };
 function anomalyTagsHTML(r){
@@ -576,6 +782,92 @@ function endReasonHTML(r){
       : '';
   }
   return `<div class="lc-endreason bad" title="流结束原因原值（未归类）">${esc(er)}</div>`;
+}
+
+// ═══════════ 请求视图 ═══════════
+//
+// 一个用户请求可能落多条日志：换渠道重试各写一条 type=5，最终还可能写一条
+// type=2 消费日志。按日志条数看会把“1 个请求失败 3 次”读成“3 个请求出问题”，
+// 影响面被放大。
+//
+// ★ 只按 Request ID 归并 ★
+// 没有 Request ID 时绝不按时间/客户/模型猜同一请求——猜错会把不同客户的
+// 请求并成一条，比不合并更糟。这类记录各自独立成组并标注无法关联。
+//
+// ★ 折叠的是归属，不是原因 ★
+// 同一请求的多次尝试原因常常不同（429 → 503 → 524）。组内每条记录仍独立成行、
+// 保留各自渠道与原文；摘要只说“几次尝试 + 最终结果”，不把多个原因合成一个。
+function groupRequests(rows){
+  const groups=[];
+  const byID=new Map();
+  rows.forEach(r=>{
+    const rid=(r.request_id||'').trim();
+    if(!rid){
+      groups.push({key:'noid:'+r.id,requestID:'',rows:[r],unlinkable:true});
+      return;
+    }
+    let g=byID.get(rid);
+    if(!g){g={key:'rid:'+rid,requestID:rid,rows:[],unlinkable:false};byID.set(rid,g);groups.push(g)}
+    g.rows.push(r);
+  });
+  return groups;
+}
+
+// requestAttempts 尝试次数。**按渠道尝试算，不按日志条数算**：
+// 同一次尝试可能既写错误日志又写消费日志，那是同一次尝试的两个侧面。
+// 以 (channel_id, 秒级时间) 去重；取不到渠道时退化为按记录计数。
+function requestAttempts(g){
+  const seen=new Set();
+  let extra=0;
+  g.rows.forEach(r=>{
+    const ch=+r.channel_id||0;
+    if(ch>0)seen.add(ch+'@'+(r.created_at||0));
+    else extra++;
+  });
+  return seen.size+extra;
+}
+
+// requestOutcome 最终结果。取组内**时间最晚**那条记录，不是第一条：
+// 摘要写“最终失败 524”才有意义；写第一次的 429 会让人以为最后是限流失败。
+function requestOutcome(g){
+  const last=g.rows.reduce((a,b)=>((+b.created_at||0)>=(+a.created_at||0)?b:a),g.rows[0]);
+  if(!last)return {text:'—',cls:''};
+  if(last.type===5){
+    const code=+last.upstream_status_code||0;
+    return {text:'最终失败'+(code?' · HTTP '+code:''),cls:'lc-req-bad'};
+  }
+  const tags=last.anomaly_tags||[];
+  if(tags.length){
+    // 不写“已记账”：这些异常里既有扣费未交付，也有未交付且未扣费（quota=0），
+    // 说成已记账会让人以为一定扣了钱。只说“写了消费日志但有异常”，具体看标签。
+    return {text:'最终写入消费日志，但有交付/计费异常 · '+tags.map(t=>(TAG_LABEL[t]&&TAG_LABEL[t].t)||t).join(' + '),cls:'lc-req-warn'};
+  }
+  return {text:'最终成功',cls:'lc-req-ok'};
+}
+
+// requestGroupHTML 请求组的归属说明行。它不替代逐条记录，只说明这些记录属于同一请求。
+function requestGroupHTML(g,isLastGroup){
+  const attempts=requestAttempts(g);
+  const outcome=requestOutcome(g);
+  const first=g.rows.reduce((a,b)=>((+b.created_at||0)<=(+a.created_at||0)?b:a),g.rows[0]);
+  const member=(first&&(first.member||first.user_id))||'—';
+  // 分页可能把同一请求切成两半：最后一组且还有更多时必须说清，
+  // 否则会被读成“这个请求只重试了这么多次”。
+  const partial=lc.hasMore&&isLastGroup;
+  // Request ID 明文不在归属行展示：它对判读没有帮助，还会把这一行挤长。
+  // 归并依据仍然只有 Request ID（见 groupRequests），逐条记录里也照旧能查到原值。
+  // 但“这条根本没有 Request ID、无法关联”是判读事实，必须保留提示，
+  // 否则一条独立成组的记录会被误读成“这个请求只发生过一次”。
+  const idText=g.unlinkable
+    ? '<span class="lc-req-noid" title="该记录没有 Request ID，无法与其它记录关联为同一请求；不按时间或客户猜测归并">无 Request ID · 不可关联</span>'
+    : '';
+  return '<tr class="lc-reqhead"><td colspan="8">'+
+    '<span class="lc-req-user">'+esc(String(member))+'</span>'+
+    '<span class="lc-req-meta">'+nfmt(attempts)+' 次渠道尝试 · '+nfmt(g.rows.length)+' 条日志</span>'+
+    (idText?'<span class="lc-req-meta">'+idText+'</span>':'')+
+    '<span class="lc-req-outcome '+outcome.cls+'">'+esc(outcome.text)+'</span>'+
+    (partial?'<span class="lc-req-partial" title="本页已到上限，该请求可能还有未取回的记录">该请求可能不完整</span>':'')+
+    '</td></tr>';
 }
 
 function rowHTML(r){
@@ -703,22 +995,35 @@ function detailHTML(r){
     const verified=!!r.edge_evidence_verified;
     const label=verified?'已验证入口证据':'灰度入口证据（关联未验收）';
     const statuses=(()=>{try{return JSON.parse(edge.upstream_statuses||'[]').join(' → ')}catch(_){return ''}})();
+    // ★ 这里的 "upstream" 是 Nginx 视角的上游，也就是 NewAPI 进程本身，
+    // **不是模型供应商**。原先写成"上游耗时"会被读成"我方访问供应商用了多久"，
+    // 据此判断供应商慢是错的。标签必须点明观察方向。
+    //
+    // 也不做任何相减：入口总耗时减去等待 NewAPI 的时间既不等于客户网络耗时
+    // （客户端上传、TLS 都不在这段里），也不等于供应商处理时间。
     const rows=[
-      ['节点',edge.node||'—'],['入口状态',String(edge.status||'—')],
-      ['上游状态序列',statuses||String(edge.upstream_status||'—')],
-      ['入口总耗时',(edge.request_ms||0)+'ms'],['上游耗时',edge.upstream_present?(edge.upstream_ms||0)+'ms':'—'],
-      ['连接/首包',(edge.connect_ms||0)+'ms / '+(edge.header_ms||0)+'ms'],
-      ['边缘交付',edge.completion||'—']
+      ['入口节点',edge.node||'—'],['入口返回状态',String(edge.status||'—')],
+      ['Nginx→NewAPI 状态序列',statuses||String(edge.upstream_status||'—')],
+      ['入口观察总耗时',(edge.request_ms||0)+'ms'],
+      ['Nginx 等待 NewAPI 耗时',edge.upstream_present?(edge.upstream_ms||0)+'ms':'—'],
+      ['Nginx→NewAPI 连接/首包',(edge.connect_ms||0)+'ms / '+(edge.header_ms||0)+'ms'],
+      ['入口交付完成情况',edge.completion||'—'],
+      ['NewAPI→供应商网络分段','未采集'],
+      ['客户端 DNS/TLS/上传','未采集']
     ];
     edgeBlock=`<section class="lc-edge ${verified?'verified':'pilot'}"><div class="lc-raw-head"><span>${esc(label)}</span></div>`+
       `<div class="lc-kvs">${rows.map(x=>`<div class="lc-kv"><span>${esc(x[0])}</span><b>${esc(x[1])}</b></div>`).join('')}</div>`+
+      `<div class="lc-sub">这些计时来自 Nginx 入口视角，其中「NewAPI」即本站应用进程，不是模型供应商；`+
+      `不可据此推断供应商处理时长或客户网络延迟。</div>`+
       `${verified?'':'<div class="lc-sub">pilot 仅用于核对 Request ID 覆盖率，不能据此自动改变责任归因。</div>'}</section>`;
   }
 
   const raw=r.content||'';
-  // 标题按行的性质给：type=2 的 content 是计费摘要，不是上游返回。
-  // 主列已让位给诊断信息，这里如实说明它是什么，避免被误读成上游报错。
-  const rawTitle=r.type===2?'计费摘要（logs.content，非上游返回）':'上游返回原文（未做任何改写）';
+  // 标题按行的性质给：大多数 type=2 content 是计费摘要；B2 的 content 则是
+  // new-api 写下的异常事实，必须如实标成异常记录而不是“计费摘要”。
+  const rawTitle=r.type===2
+    ? ((r.anomaly_tags||[]).includes('undelivered_unbilled')?'消费异常记录（logs.content）':'计费摘要（logs.content，非上游返回）')
+    : '上游返回原文（未做任何改写）';
   const rawBlock=raw
     ? `<div class="lc-raw-head">
          <span>${esc(rawTitle)}</span>
@@ -780,7 +1085,6 @@ function detailHTML(r){
 }
 
 function render(){
-  clearError();
   const body=$('lcTableBody');
   if(!body)return;
 
@@ -795,10 +1099,16 @@ function render(){
   const LABEL={error:'错误',stream:'流故障',client_gone:'客户端断连',billing:'消费异常',anomaly_all:'异常'};
   if(counter){
     if(!rows.length)counter.textContent='';
-    else if(lc.scope==='err_anom')counter.innerHTML=`本页 <b>${nfmt(rows.length)}</b> 条问题：`+
-      `<b class="lc-errnum">${nfmt(errs)}</b> 条错误、`+
-      `<b style="color:var(--yellow)">${nfmt(anoms)}</b> 条异常${more}`;
-    else counter.innerHTML=`本页 <b>${nfmt(rows.length)}</b> 条${LABEL[lc.scope]||'记录'}${more}`;
+    else{
+      // 请求数与日志条数都要给：一个请求重试 3 次会写 3 条日志，
+      // 只报条数会把影响面放大，只报请求数又看不出失败密度。
+      const reqCount=groupRequests(rows).length;
+      const reqText='<b>'+nfmt(reqCount)+'</b> 个用户请求 / <b>'+nfmt(rows.length)+'</b> 条日志';
+      if(lc.scope==='err_anom')counter.innerHTML='本页 '+reqText+'：'+
+        '<b class="lc-errnum">'+nfmt(errs)+'</b> 条错误、'+
+        '<b style="color:var(--yellow)">'+nfmt(anoms)+'</b> 条异常'+more;
+      else counter.innerHTML='本页 '+reqText+'（'+(LABEL[lc.scope]||'记录')+'）'+more;
+    }
   }
 
   if(!rows.length){
@@ -806,7 +1116,12 @@ function render(){
   }else{
     // 顺序完全由后端 ORDER BY 决定（created_at 为首要键），前端不再排一遍：
     // 两处各排一次一旦口径不一致，翻页拼接就会出现看不懂的乱序。
-    body.innerHTML=rows.map(rowHTML).join('');
+    // 一行仍是一条日志，但按 Request ID 归入所属请求，组前加一行归属说明。
+    // 顺序仍由后端 ORDER BY 决定，前端不重排。
+    const groups=groupRequests(rows);
+    body.innerHTML=groups.map((g,i)=>
+      requestGroupHTML(g,i===groups.length-1)+g.rows.map(rowHTML).join('')
+    ).join('');
   }
 
   const moreBtn=$('lcMore');
@@ -824,9 +1139,18 @@ function render(){
   renderStatus('');
 }
 
+// emptyText 查不到时的说明。
+//
+// ★ “查不到”绝不能只写成“没有记录” ★
+// 它至少有五种互不相同的原因：条件确实无匹配、范围被收窄后没覆盖到、
+// 刚发生的请求还没落库、辅助数据缺失导致部分维度不可用、以及前置拒绝压根不写 logs。
+// 混成一句话时，人会把“我们没查到”读成“客户没遇到问题”。
+//
+// 这里只使用后端已经给出的信号（scope 回显、span_capped、各 *_error、时间范围），
+// 不在前端凭空推断查询失败原因——那属于编造。
 function emptyText(){
   const day=lc.date===cstToday()?'今天':lc.date;
-  const filtered=!!(lc.filters.group||lc.filters.domain||lc.filters.channel_id||lc.filters.model||lc.filters.user||lc.filters.keyword);
+  const filtered=!!(lc.filters.group||lc.filters.domain||lc.filters.channel_id||lc.filters.model||lc.filters.user_id||lc.filters.username||lc.filters.token_name||lc.filters.token_id||lc.filters.endpoint||lc.filters.stream||lc.filters.request_id);
   const what={
     error:'错误请求',
     stream:'流故障请求',
@@ -835,22 +1159,44 @@ function emptyText(){
     anomaly_all:'异常请求',
     err_anom:'错误或异常请求'
   }[lc.scope]||'记录';
-  const hint=filtered
-    ? '<div class="lc-sub" style="margin-top:6px">当前有筛选条件，可点"重置"清掉。</div>'
-    : '';
+  const notes=[];
+  // 实际生效范围来自后端回显，而不是控件上的值：跨度可能被收窄过。
+  const echo=lc.scopeEcho||null;
+  const rangeText=echo&&echo.from&&(echo.display_to||echo.to)
+    ? `${echo.from} ～ ${echo.display_to||echo.to}（CST，含结束秒）`
+    : `${lc.date} ${lc.fromTime} ～ ${rangeEnd()} ${lc.toTime}`;
+  notes.push(`实际查询范围：${esc(rangeText)}。`);
+  if(filtered)notes.push('当前有筛选条件，可点"重置"清掉后再看这段时间的全部问题。');
+  // 跨度被收窄：这一格最容易造成"那几天没问题"的错误结论。
+  if(echo&&echo.span_capped){
+    const cap=echo.span_capped;
+    notes.push(`<span class="lc-note-warn">查询跨度已从 ${nfmt(cap.requested_days)} 天收窄至 ${nfmt(cap.effective_days)} 天，`+
+      `未覆盖到的时间段没有被查询。</span>`);
+  }
+  // 刚发生的请求可能还没落库：结束时间贴近当前时间时必须说明，
+  // 否则客户刚报的问题会被判成"查不到，客户在瞎说"。
+  if(rangeEnd()>=cstToday()&&lc.toTime>='23:00'){
+    notes.push('若客户刚刚才报障，请求可能尚未写入日志，可稍后重查。');
+  }
+  // 辅助数据缺失：不是"没有问题"，而是"这次的部分信息不可用"。
+  if(lc.enrichError)notes.push('<span class="lc-note-warn">渠道信息补全失败，按渠道或上游域名筛选的结果可能不完整。</span>');
+  if(lc.correlationError)notes.push('上游错误证据关联暂不可用，这不代表上游没有报错。');
+  if(lc.note)notes.push(esc(lc.note));
   // 查不到最容易被读成"没发生过"，而前置拒绝根本不写 logs。
   // 本页只有问题清单（没有"全部请求"档），所以任何范围下都该提示。
-  const blindHint='<div class="lc-sub" style="margin-top:6px">注意：这不代表没有客户遇到问题 —— 限流/无可用渠道这类前置拒绝不写日志，见下方说明。</div>';
-  return `<b>${esc(day)}没有查到${what}。</b>`+hint+blindHint;
+  notes.push('注意：这不代表没有客户遇到问题 —— 限流/无可用渠道这类前置拒绝不写日志，见下方说明。');
+  return `<b>${esc(day)}没有查到${what}。</b>`+
+    notes.map(n=>`<div class="lc-sub" style="margin-top:6px">${n}</div>`).join('');
 }
 
-// renderBlindSpots 盲区提示。默认收起（自用系统，展开占地方不顺眼），
+// renderBlindSpots 能力边界提示。默认收起（自用系统，展开占地方不顺眼），
 // 但**标题始终可见**——它的价值在于"你没主动去看时也知道它存在"。
 // 展开状态记在 localStorage，不必每次点开。
 //
 // 用 <details> 而非自己写折叠：原生元素自带键盘可达性与 aria 语义。
 // 这个功能最可能造成的实际损害是：客户说"我请求根本发不出去"，
-// 你在这里查不到，于是判断他在瞎说。所以这段话必须一直在眼前。
+// 你在这里查不到，于是判断他在瞎说。所以边界必须一直在眼前；
+// 现在已有「问题预警」承接这类请求，展开后可直接跳转。
 const BLIND_OPEN_KEY='nexusapi-monitor-logchain-blind-open';
 
 // SHAPE_LABEL 形状取值的中文说明。取值与 logchain_radius.go 的常量一一对应，
@@ -863,6 +1209,12 @@ const SHAPE_LABEL={
   widespread:'分散，无明显集中',
   insufficient:'样本不足，不做判读'
 };
+const REASON_SHAPE_LABEL={
+  small_sample:'记录较少，描述当前表现',
+  dominant:'存在单一主要原因',
+  dual:'两类原因共同主导',
+  distributed:'原因分散，无明确主因'
+};
 
 // RADIUS_DIM 四个维度的表头。顺序即展示顺序：渠道和客户在前，
 // 因为排障最常问的是"是这个渠道坏了，还是这个客户在做异常请求"。
@@ -873,19 +1225,49 @@ const RADIUS_DIM=[
   ['by_model','模型','受影响客户数']
 ];
 
+const RADIUS_FAULT_LABEL={upstream:'上游',ours:'我方',downstream:'下游',unknown:'待判'};
+
+function diagnosisContextHTML(){
+  const d=lc.diagnosisContext;
+  if(!d)return '';
+  const stability=d.stability==null?'待核验':`${(+d.stability).toFixed(2)}%`;
+  return `<section class="lc-radius-section"><h4>稳定性原范围</h4>`+
+    `<p class="lc-radius-context">${esc(fullTime(d.from_ts))} 至 ${esc(fullTime(d.to_ts-1))} · `+
+    `稳定性 <b>${esc(stability)}</b> · 请求 ${nfmt(d.requests)} · 问题 ${nfmt(d.problems)} `+
+    `（异常 ${nfmt(d.anomaly)} / 错误 ${nfmt(d.failed)}）</p>`+
+    `<small>这些数字来自跳转前的稳定性时间范围；下方原因分析只覆盖客户排障本次返回结果，二者不混算。</small></section>`;
+}
+
+function radiusReasonsHTML(br,focused){
+  const summary=br.reasons||{},items=summary.items||[];
+  if(!items.length)return '';
+  let rows=items.map(it=>`<tr><td class="lc-radius-key">${esc(it.reason)}</td>`+
+    `<td class="lc-radius-num">${nfmt(it.count)}</td><td class="lc-radius-num">${nfmt(it.customers)}</td>`+
+    `<td class="lc-radius-num">${nfmt(it.channels)}</td></tr>`).join('');
+  if(summary.other_items>0)rows+=`<tr class="lc-radius-other"><td class="lc-radius-key">其余 ${nfmt(summary.other_items)} 类</td>`+
+    `<td class="lc-radius-num">${nfmt(summary.other_count)}</td><td class="lc-radius-num">—</td><td class="lc-radius-num">—</td></tr>`;
+  const faults=(br.faults||[]).map(it=>`<span class="lc-radius-fault">${esc(RADIUS_FAULT_LABEL[it.fault]||it.fault)} <b>${nfmt(it.count)}</b></span>`).join('');
+  return `<section class="lc-radius-section"><h4>${focused?'筛选结果主要原因':'当前页主要原因'}</h4>`+
+    `<table class="lc-radius-table lc-radius-reasons"><thead><tr><th>原因</th><th>问题数</th><th>客户数</th><th>渠道数</th></tr></thead>`+
+    `<tbody>${rows}</tbody></table>`+
+    `<div class="lc-radius-faults"><b>疑似责任方：</b>${faults||'待判'}`+
+    `<small>责任方是逐行规则推断，不是确定根因；请结合原文与上游证据复核。</small></div></section>`;
+}
+
 function renderRadius(){
   const el=$('lcRadius');
   if(!el)return;
-  // 翻页后隐藏：radius 只覆盖最后一页，表格是累积的，两者对不上。
-  // 明确告知而不是静默留空——静默会让人以为"这次没算出影响面"。
+  // 翻页后隐藏：分析只覆盖最后一页，表格是累积的，两者对不上。
+  // 明确告知而不是静默留空——静默会让人以为这次没有计算。
   if(lc.radiusStale){
     el.hidden=false;
-    el.innerHTML=`<div class="lc-radius-stale">已加载更早的记录，影响面判读仅覆盖单页，`+
-      `与当前表格行数不一致，故不展示。重新查询可再次判读。</div>`;
+    el.innerHTML=`<div class="lc-radius-stale">已加载更多记录，单页分析与当前累积表格行数不一致，`+
+      `故不展示。重新查询可再次分析。</div>`;
     return;
   }
   const br=lc.radius;
-  if(!br||!br.shape){el.hidden=true;return}
+  const focused=br?.mode==='focused';
+  if(!br||(focused?!br.reason_shape:!br.shape)){el.hidden=true;return}
   el.hidden=false;
 
   const dims=RADIUS_DIM.map(([key,dimName,spreadName])=>{
@@ -912,12 +1294,20 @@ function renderRadius(){
       `</tr></thead><tbody>${rows}</tbody></table></div>`;
   }).join('');
 
-  const label=SHAPE_LABEL[br.shape]||br.shape;
+  const label=focused
+    ? (REASON_SHAPE_LABEL[br.reason_shape]||br.reason_shape)
+    : (SHAPE_LABEL[br.shape]||br.shape);
+  const title=focused?'筛选结果原因':'影响面';
+  const coverage=br.page_has_more?'仅当前页':'已返回全部';
+  const why=focused?br.reason_why:br.shape_why;
   el.innerHTML=`<details class="lc-radius-details">`+
-    `<summary class="lc-radius-head">影响面：<b>${esc(label)}</b>`+
-    `<span class="lc-radius-sub">仅本页 ${nfmt(br.rows)} 条问题</span></summary>`+
-    `<div class="lc-radius-why">${esc(br.shape_why||'')}</div>`+
-    `<div class="lc-radius-dims">${dims}</div>`+
+    `<summary class="lc-radius-head">${esc(title)}：<b>${esc(label)}</b>`+
+    `<span class="lc-radius-sub">${esc(coverage)} ${nfmt(br.rows)} 条问题</span></summary>`+
+    `${diagnosisContextHTML()}`+
+    `<div class="lc-radius-why">${esc(why||'')}</div>`+
+    `${radiusReasonsHTML(br,focused)}`+
+    `<section class="lc-radius-section"><h4>${focused?'筛选结果涉及范围':'当前页影响范围'}</h4><div class="lc-radius-dims">${dims}</div>`+
+    `${focused?'<small>这些维度仅说明筛选结果涉及谁，不参与主要原因判定。</small>':''}</section>`+
     `</details>`;
 }
 
@@ -929,9 +1319,13 @@ function renderBlindSpots(){
   let open=false;
   try{open=localStorage.getItem(BLIND_OPEN_KEY)==='1'}catch(e){}
   el.innerHTML=`<details class="lc-blind-details"${open?' open':''}>`+
-    `<summary class="lc-blind-head">这个页面查不到的情况（${lc.blindSpots.length} 项）</summary>`+
+    `<summary class="lc-blind-head">本页能力边界（${lc.blindSpots.length} 项）</summary>`+
     `<ul class="lc-blind-list">${lc.blindSpots.map(s=>`<li>${esc(s)}</li>`).join('')}</ul>`+
+    `<div class="lc-blind-actions"><button type="button" id="lcOpenAlerts">前往问题预警</button></div>`+
     `</details>`;
+  el.querySelector('#lcOpenAlerts')?.addEventListener('click',()=>{
+    if(window.monitorNavigate)window.monitorNavigate('alerts');
+  });
   el.querySelector('details')?.addEventListener('toggle',e=>{
     try{localStorage.setItem(BLIND_OPEN_KEY,e.target.open?'1':'0')}catch(err){}
   });
@@ -947,7 +1341,12 @@ function renderNotes(){
   if(lc.correlationError)notes.push(`上游错误证据关联暂不可用（不代表没有上游错误）：${esc(lc.correlationError)}`);
   if(lc.evidenceMode==='pilot')notes.push('Nginx 请求证据处于 pilot：只核对关联覆盖率，尚不作为责任结论。');
   // 后端可能收敛了范围（跨度截断/limit 上限），回显出来，避免以为筛选原样生效。
-  if(lc.scopeEcho&&lc.scopeEcho.from&&lc.scopeEcho.to)notes.push(`查询范围：${esc(lc.scopeEcho.from)} ～ ${esc(lc.scopeEcho.to)}（CST）`);
+  // 结束时间必须显示成**包含式**：SQL 用的是排他上界，直接显示会变成
+  // “选到 23:59 却写次日 00:00”，让人以为多查了一分钟。display_to 由后端给出，
+  // 老响应没有该字段时回退到 to，不让提示整条消失。
+  if(lc.scopeEcho&&lc.scopeEcho.from&&(lc.scopeEcho.display_to||lc.scopeEcho.to)){
+    notes.push(`查询范围：${esc(lc.scopeEcho.from)} ～ ${esc(lc.scopeEcho.display_to||lc.scopeEcho.to)}（CST，含结束秒）`);
+  }
   // 跨度被收窄。警告级：不说清的话，人会以为"这段时间里就这些"，
   // 据此得出"那几天没有请求"的错误结论。
   //

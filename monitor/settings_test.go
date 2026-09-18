@@ -298,6 +298,52 @@ func TestInfraSnapshotReadOnlyIsOffByDefault(t *testing.T) {
 	}
 }
 
+func TestValidateStabilityProblemSourceSettings(t *testing.T) {
+	valid := Settings{
+		StabilityEnabled: true, LogChainOnlySource: true,
+		StabilityProblemSourceEnabled: true, StabilityProblemSourceLookbackHours: 24,
+	}
+	if err := validateStabilityProblemSourceSettings(valid); err != nil {
+		t.Fatalf("valid problem source settings: %v", err)
+	}
+	for _, tt := range []struct {
+		name string
+		edit func(*Settings)
+	}{
+		{name: "offline", edit: func(s *Settings) { s.LocalSnapshotOnly = true }},
+		{name: "not logchain only", edit: func(s *Settings) { s.LogChainOnlySource = false }},
+		{name: "stability disabled", edit: func(s *Settings) { s.StabilityEnabled = false }},
+		{name: "zero lookback", edit: func(s *Settings) { s.StabilityProblemSourceLookbackHours = 0 }},
+		{name: "oversized lookback", edit: func(s *Settings) { s.StabilityProblemSourceLookbackHours = 169 }},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := valid
+			tt.edit(&cfg)
+			if err := validateStabilityProblemSourceSettings(cfg); err == nil {
+				t.Fatal("unsafe problem source settings must fail closed")
+			}
+		})
+	}
+	if err := validateStabilityProblemSourceSettings(Settings{}); err != nil {
+		t.Fatalf("disabled lane must preserve existing configurations: %v", err)
+	}
+}
+
+func TestLoadSettingsStabilityProblemSourceDefaultsAndOverrides(t *testing.T) {
+	t.Setenv("MONITOR_STABILITY_PROBLEM_SOURCE_ENABLED", "")
+	t.Setenv("MONITOR_STABILITY_PROBLEM_SOURCE_LOOKBACK_HOURS", "")
+	s := LoadSettings()
+	if s.StabilityProblemSourceEnabled || s.StabilityProblemSourceLookbackHours != 24 {
+		t.Fatalf("problem source defaults=%+v", s)
+	}
+	t.Setenv("MONITOR_STABILITY_PROBLEM_SOURCE_ENABLED", "true")
+	t.Setenv("MONITOR_STABILITY_PROBLEM_SOURCE_LOOKBACK_HOURS", "48")
+	s = LoadSettings()
+	if !s.StabilityProblemSourceEnabled || s.StabilityProblemSourceLookbackHours != 48 {
+		t.Fatalf("problem source overrides not honored: %+v", s)
+	}
+}
+
 func TestLoadSettingsUsageFactsStorePath(t *testing.T) {
 	t.Setenv("MONITOR_USAGE_FACTS_STORE_PATH", "/data/usage-facts.db")
 	if got := LoadSettings().UsageFactsStorePath; got != "/data/usage-facts.db" {

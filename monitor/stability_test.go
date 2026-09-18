@@ -260,6 +260,57 @@ func TestStabilityProblemTextAndRawGrouping(t *testing.T) {
 	}
 }
 
+func TestStabilityProblemsResponseKeepsExactQueryRange(t *testing.T) {
+	m := newStabilityTestMonitor(t)
+	from := time.Date(2026, 8, 5, 10, 17, 23, 0, cstLocation).Unix()
+	to := from + 2*3600 + 47
+	result, err := m.queryStabilityProblems(context.Background(), stabilityScope{FromTs: from, ToTs: to}, 50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.FromTs != from || result.ToTs != to {
+		t.Fatalf("精确查询窗口不得被日期化或取整: got=%d..%d want=%d..%d",
+			result.FromTs, result.ToTs, from, to)
+	}
+	if result.From != "2026-08-05" || result.To != "2026-08-05" {
+		t.Fatalf("日期展示字段应保留: from=%q to=%q", result.From, result.To)
+	}
+	body, err := json.Marshal(result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal(body, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if int64(decoded["from_ts"].(float64)) != from || int64(decoded["to_ts"].(float64)) != to {
+		t.Fatalf("JSON 契约缺少精确时间戳: %s", body)
+	}
+}
+
+func TestServeStabilityProblemsReturnsExactHourlyRange(t *testing.T) {
+	m := newStabilityTestMonitor(t)
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodGet, "/stability/problems?hours=6", nil)
+
+	m.serveStabilityProblems(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", w.Code, w.Body.String())
+	}
+	var result StabilityProblemsResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+	if !result.Enabled || result.FromTs <= 0 || result.ToTs-result.FromTs != 6*3600 {
+		t.Fatalf("HTTP 响应未保留 6 小时精确窗口: %+v", result)
+	}
+	if result.FromTs%3600 != 0 || result.ToTs%3600 != 0 {
+		t.Fatalf("hours 范围应按 CST 整点边界: %d..%d", result.FromTs, result.ToTs)
+	}
+}
+
 func TestStabilityProblemTextRedactsSensitiveValuesBeforeStorage(t *testing.T) {
 	raw := "upstream 10.8.0.12:443 user@example.com Authorization: Bearer sk-secret-1234567890 request 550e8400-e29b-41d4-a716-446655440000 api_key=abcdefghijklmnopqrstuvwxyz012345"
 	message, truncated := stabilityProblemText(raw)
@@ -273,6 +324,145 @@ func TestStabilityProblemTextRedactsSensitiveValuesBeforeStorage(t *testing.T) {
 	}
 	if !strings.Contains(message, "<ip>") || !strings.Contains(message, "<email>") || !strings.Contains(message, "<redacted>") {
 		t.Fatalf("missing redaction markers: %q", message)
+	}
+}
+
+func TestStabilityProblemSourceInitialRangeIsFinalizedAndBounded(t *testing.T) {
+	now := time.Date(2026, 9, 9, 15, 7, 47, 0, cstLocation).Unix()
+	from, to := stabilityProblemSourceInitialRange(now, 24)
+	wantTo := (now - stabilityProblemFinalizeDelaySec) / 60 * 60
+	if to != wantTo || to-from != 24*3600 || from%60 != 0 || to%60 != 0 {
+		t.Fatalf("initial range=%d..%d want 24h through %d", from, to, wantTo)
+	}
+	clampedFrom, clampedTo := stabilityProblemSourceInitialRange(now, 999)
+	if clampedTo-clampedFrom != 168*3600 {
+		t.Fatalf("oversized lookback not clamped: %d", clampedTo-clampedFrom)
+	}
+}
+
+func TestStabilityProblemSourceCursorCutsOverOnceThenResumesGap(t *testing.T) {
+	m := newStabilityTestMonitor(t)
+	base := time.Date(2026, 9, 8, 12, 0, 0, 0, cstLocation).Unix()
+	if err := m.storeDB.Create(&StabilityProblemIngestState{
+		BucketTs: base - 7*86400, TrafficClassVersion: stabilityTrafficClassificationVersion, Complete: true,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := m.storeDB.Create(&StabilityProblemSample{
+		BucketTs: base - 7*86400, TrafficClassVersion: stabilityTrafficClassificationVersion,
+		Source: "newapi", SignatureHash: "old-island", ChannelID: 76, ModelName: "old", Grp: "old",
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := m.storeDB.Create(&StabilityProblemIngestState{
+		BucketTs: base + 60, TrafficClassVersion: 0, Complete: true,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := m.storeDB.Create(&StabilityProblemSample{
+		BucketTs: base + 60, TrafficClassVersion: 0,
+		Source: "newapi", SignatureHash: "legacy-window", ChannelID: 76, ModelName: "old", Grp: "old",
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := m.storeDB.Create(&StabilityProblemIngestState{
+		BucketTs: base + 25*3600, TrafficClassVersion: stabilityTrafficClassificationVersion, Complete: true,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := m.storeDB.Create(&StabilityProblemClassificationMigration{
+		ID: 1, TrafficClassVersion: stabilityTrafficClassificationVersion,
+		FromTs: base - 7*86400, ThroughTs: base, NextTs: base - 7*86400, Status: "queued",
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	// Simulate the v64 volume: an old full-worker live cursor predates the
+	// operator-approved 24-hour pilot range and has no dedicated cutover marker.
+	if err := m.storeDB.Create(&StabilityProblemLiveCursor{
+		ID: 1, TrafficClassVersion: stabilityTrafficClassificationVersion,
+		NextTs: base - 20*86400, TargetThroughTs: base - 86400, Status: "running",
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := m.ensureStabilityProblemSourceCursor(base, base+24*3600, base+24*3600); err != nil {
+		t.Fatal(err)
+	}
+	var cursor, marker StabilityProblemLiveCursor
+	if err := m.storeDB.First(&cursor, 1).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := m.storeDB.First(&marker, stabilityProblemSourceCutoverCursorID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if cursor.NextTs != base || cursor.TargetThroughTs != base+24*3600 || marker.NextTs != base {
+		t.Fatalf("first pilot did not cut over to explicit lookback: cursor=%+v marker=%+v", cursor, marker)
+	}
+	var oldRows, windowRows, futureRows, migrations int64
+	if err := m.storeDB.Model(&StabilityProblemIngestState{}).Where("bucket_ts < ?", base).Count(&oldRows).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := m.storeDB.Model(&StabilityProblemIngestState{}).Where("bucket_ts = ?", base+60).Count(&windowRows).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := m.storeDB.Model(&StabilityProblemIngestState{}).Where("bucket_ts = ?", base+25*3600).Count(&futureRows).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := m.storeDB.Model(&StabilityProblemClassificationMigration{}).Count(&migrations).Error; err != nil {
+		t.Fatal(err)
+	}
+	if oldRows != 0 || windowRows != 0 || futureRows != 1 || migrations != 0 {
+		t.Fatalf("first cutover cleanup mismatch: old=%d window=%d future=%d migrations=%d", oldRows, windowRows, futureRows, migrations)
+	}
+	if err := m.resetStaleStabilityProblemClassification(); err != nil {
+		t.Fatalf("classification gate still blocked after bounded cutover: %v", err)
+	}
+	cursor.NextTs = base + 12*60
+	if err := m.storeDB.Save(&cursor).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := m.ensureStabilityProblemSourceCursor(base+3600, base+25*3600, base+25*3600); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.storeDB.First(&cursor, 1).Error; err != nil {
+		t.Fatal(err)
+	}
+	if cursor.NextTs != base+12*60 || cursor.TargetThroughTs != base+24*3600 {
+		t.Fatalf("restart skipped or rewrote durable gap after cutover: %+v", cursor)
+	}
+}
+
+func TestStabilityProblemSourceTurnUsesBoundedLowPriorityWindow(t *testing.T) {
+	m := newStabilityTestMonitor(t)
+	m.prodDB = newFakeProdDB(t)
+	m.cfg.BackgroundSourceMinStartIntervalMS = -1
+	m.cfg.StabilityBackfillDelayMS = -1
+	m.cfg.StabilityBackfillSourceDutyPercent = 100
+	base := time.Date(2026, 9, 8, 12, 0, 0, 0, cstLocation).Unix()
+	for _, at := range []int64{base + 5, base + 11*60 + 5, base + 12*60 + 5} {
+		if _, err := m.prodDB.Exec(`INSERT INTO logs
+			(user_id,created_at,type,model_name,`+"`group`"+`,channel_id,content,request_id)
+			VALUES (1,?,5,'gpt-test','codex',76,'status_code=503 source pilot','request')`, at); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := m.sampleStabilityProblemsTurn(context.Background(), base, base+24*60, 12*60, 1, true); err != nil {
+		t.Fatal(err)
+	}
+	var cursor StabilityProblemLiveCursor
+	if err := m.storeDB.First(&cursor, 1).Error; err != nil {
+		t.Fatal(err)
+	}
+	if cursor.NextTs != base+12*60 || cursor.TargetThroughTs != base+24*60 {
+		t.Fatalf("pilot turn exceeded one 12-minute window: %+v", cursor)
+	}
+	var first, future int64
+	m.storeDB.Model(&StabilityProblemSample{}).Where("bucket_ts >= ? AND bucket_ts < ?", base, base+12*60).Count(&first)
+	m.storeDB.Model(&StabilityProblemSample{}).Where("bucket_ts >= ?", base+12*60).Count(&future)
+	if first != 2 || future != 0 {
+		t.Fatalf("pilot published wrong windows: first=%d future=%d", first, future)
+	}
+	if starts := m.backgroundSourceStarts.Load(); starts != 1 {
+		t.Fatalf("pilot source queries=%d want one low-priority claim", starts)
 	}
 }
 
@@ -1372,6 +1562,70 @@ func TestWithdrawnClientEvidenceFeatureIsNotExposed(t *testing.T) {
 	for _, route := range router.Routes() {
 		if strings.Contains(route.Path, "client-outcomes") || strings.Contains(route.Path, "delivery-evidence") || strings.Contains(route.Path, "delivery-timeline") || strings.Contains(route.Path, "delivery-issues") {
 			t.Fatalf("已撤回的客户端证据路由仍存在: %s %s", route.Method, route.Path)
+		}
+	}
+}
+
+func TestStabilityProblemChannelDiagnosisWiring(t *testing.T) {
+	js := string(stabilityJS)
+	for _, want := range []string{
+		"查看不稳定原因",
+		"ch?.health==='bad'",
+		"problemDiagnosisContext(d,p,id,ch)",
+		"problemChannelActions(d,p,compactMode)",
+		"st.reportKey!==queryParams().toString()",
+		"st.drawer.kind==='channel'",
+		"preset:'channel_diagnosis'",
+		"scope:'err_anom'",
+		"cstDate(to-1)",
+		"last=+p.last_ts||0",
+		"from_time:'00:00',to_time:'23:59'",
+		"monitorOpenEncoded('logchain'",
+		"stability-problem-diagnose",
+	} {
+		if !strings.Contains(js, want) && !strings.Contains(string(stabilityCSS), want) {
+			t.Errorf("渠道不稳定原因入口缺少 %q", want)
+		}
+	}
+	if strings.Contains(js, "keyword:p.message") || strings.Contains(js, "keyword:p.code") {
+		t.Error("不得把脱敏问题签名当关键词传入排障，否则会漏掉非 type=5 异常")
+	}
+	if strings.Contains(js, "ch.stability<95") || strings.Contains(js, "ch.stability < 95") {
+		t.Error("前端不得复制 95% 阈值，应复用后端 health=bad")
+	}
+}
+
+func TestStabilityDrawerReleasesScrollLockWhenNavigatingAway(t *testing.T) {
+	js := string(stabilityJS)
+	for _, want := range []string{
+		"window.stabilityDeactivate=function(){if(st.drawer)closeDrawer(false)}",
+		"function closeDrawer(restoreFocus=true)",
+		"if(restoreFocus&&st.lastFocus?.focus)",
+		"document.body.style.overflow=''",
+	} {
+		if !strings.Contains(js, want) {
+			t.Errorf("稳定性抽屉离页清理缺少 %q", want)
+		}
+	}
+	if !strings.Contains(pageHTML, "else if(window.stabilityDeactivate)window.stabilityDeactivate();") {
+		t.Error("页面切换未调用稳定性离页清理，抽屉的 body 滚动锁会泄漏到客户排障")
+	}
+	if !strings.Contains(pageHTML, `<script src="/stability.js?v=5"></script>`) {
+		t.Error("修复后必须更新 stability.js 缓存版本，避免浏览器继续使用旧脚本")
+	}
+}
+
+func TestStabilityProblemViewReloadsSafelyWithRange(t *testing.T) {
+	js := string(stabilityJS)
+	for _, want := range []string{
+		"if(st.view==='problems')loadProblems()",
+		"reportPromiseKey===key",
+		"await reportWait",
+		"st.problemAbort!==controller",
+		"queryParams().toString()!==key",
+	} {
+		if !strings.Contains(js, want) {
+			t.Errorf("问题视图范围刷新/竞态保护缺少 %q", want)
 		}
 	}
 }

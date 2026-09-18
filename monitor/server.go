@@ -68,6 +68,9 @@ var stabilityJS []byte // 稳定性报表交互；页面请求只访问 /stabili
 //go:embed logchain.js
 var logChainJS []byte // 客户排障页交互；只访问 /logchain/* 管理员接口
 
+//go:embed alerts.js
+var alertsJS []byte // 问题预警页交互；只访问 /alerts/rejections
+
 //go:embed channel_management.js
 var channelManagementJS []byte // 渠道管理交互；只访问 Monitor 本地渠道汇总接口
 
@@ -230,6 +233,10 @@ func (m *Monitor) RegisterRoutes(r *gin.Engine) {
 		c.Header("Cache-Control", "no-cache")
 		c.Data(http.StatusOK, "application/javascript; charset=utf-8", financeJS)
 	})
+	r.GET("/alerts.js", func(c *gin.Context) {
+		c.Header("Cache-Control", "no-cache")
+		c.Data(http.StatusOK, "application/javascript; charset=utf-8", alertsJS)
+	})
 	r.GET("/logchain.js", func(c *gin.Context) {
 		c.Header("Cache-Control", "no-cache")
 		c.Data(http.StatusOK, "application/javascript; charset=utf-8", logChainJS)
@@ -271,9 +278,10 @@ func (m *Monitor) RegisterRoutes(r *gin.Engine) {
 		view.GET("/data", m.serveData)
 		view.GET("/monitor/data", m.serveData)
 		view.GET("/trend/long", m.serveLongTrend)
-		view.GET("/stability/report", m.serveStabilityReport)                             // 历史稳定性:只读 Monitor 本地 SQLite
-		view.GET("/stability/detail", m.serveStabilityDetail)                             // 单分组详情:按需加载渠道时间条/模型
-		view.GET("/stability/problems", m.serveStabilityProblems)                         // 原始错误签名:只读本地问题样本
+		view.GET("/stability/report", m.serveStabilityReport) // 历史稳定性:只读 Monitor 本地 SQLite
+		view.GET("/stability/detail", m.serveStabilityDetail) // 单分组详情:按需加载渠道时间条/模型
+		view.GET("/stability/problems", m.serveStabilityProblems)
+		view.GET("/alerts/rejections", noStoreSensitive, m.getRejectAlertsHandler)
 		view.GET("/stability/health", m.serveStabilityHealth)                             // 采集新鲜度/覆盖/积压:不查生产库
 		view.GET("/stability/edge", m.serveNginxEdge)                                     // Nginx 入口层:只读本地脱敏分钟汇总
 		view.POST("/nginx/evidence/lookup", noStoreSensitive, m.serveNginxEvidenceLookup) // 精确 Request ID 证据查询：只读独立本地库
@@ -554,6 +562,7 @@ func (m *Monitor) ingestRejections(c *gin.Context) {
 			Model    string `json:"model"`
 			Group    string `json:"group"`
 			Count    int64  `json:"count"`
+			UserID   int64  `json:"user_id"`
 		} `json:"samples"`
 	}
 	if err := c.ShouldBindJSON(&in); err != nil {
@@ -590,6 +599,7 @@ func (m *Monitor) ingestRejections(c *gin.Context) {
 			Model:    clip(s.Model, 128),
 			Grp:      clip(s.Group, 64),
 			Count:    s.Count,
+			UserID:   s.UserID,
 		})
 	}
 	duplicate, err := m.ingestRejectionBatch(node, batchID, rows, time.Now().Unix())

@@ -12,9 +12,9 @@ package monitor
 // 排除了错误日志。channel_id → base_domain 的补全查本地 channel_snaps（生产库与本地库
 // 是两个连接，无法在单条 SQL 里 join，因此分两步）。
 //
-// 已知盲区（见 serveLogChainRequests 返回的 blind_spots，不要在 UI 上假装没有）：
-//  1. 未打到渠道即被拒的请求（限流/无可用渠道/分组无权限）不在 logs 里，
-//     只在 stability_reject_hours 的小时聚合中，且该表无 user_id，定位不到具体客户。
+// 已知能力边界（见 serveLogChainRequests 返回的 blind_spots，不要在 UI 上假装没有）：
+//  1. 未到达渠道即被拒的请求不写 logs，因此不在本页展示；这类请求改由「问题预警」承接。
+//     问题预警已有分钟级时间与 user_id；仅未鉴权或采集器没上报 user_id 时无法定位客户。
 //  2. new-api 换渠道重试会落多条 type=5，本层无法把它们归并成一次客户请求。
 
 import (
@@ -150,9 +150,10 @@ const (
 	// 那种根因在上游。数据上无法区分主动取消与被拖走，只能并排给出耗时让人判断。
 	anomalyClientGone = "client_gone"
 
-	anomalyBilling       = "billing"        // 消费异常（两个方向）
-	anomalyBillingUnpaid = "billing_unpaid" // 扣费未交付（客户亏）
-	anomalyBillingFree   = "billing_free"   // 交付未扣费（我方亏）
+	anomalyBilling             = "billing"              // 消费异常（三个方向）
+	anomalyBillingUnpaid       = "billing_unpaid"       // 扣费未交付（客户亏）
+	anomalyUndeliveredUnbilled = "undelivered_unbilled" // 未交付且未扣费（稳定性 B2）
+	anomalyBillingFree         = "billing_free"         // 交付未扣费（我方亏）
 	// anomalyAll 全部异常：流故障 + 客户断连 + 消费异常。分档后它仍是三者的并集，
 	// 否则"全部异常"会漏掉刚拆出去的 client_gone。
 	anomalyAll = "all"
@@ -315,9 +316,14 @@ func logChainNoOutputModelSQL() string {
 func logChainBillingUnpaidSQL() string {
 	// 端点白名单是主判据（RB-02）：非文本端点的 completion_tokens=0 属正常，
 	// 图片/视频/音频请求本来就不产出文本 token，绝不能判为未交付。
-	return "(type = 2 AND quota > 0 AND completion_tokens = 0 AND " +
-		logChainTextCompletionPathSQL() + " AND " +
-		logChainNoOutputModelSQL() + ")"
+	return "(type = 2 AND quota > 0 AND " + deliveryZeroOutputSQL() + ")"
+}
+
+// logChainUndeliveredUnbilledSQL 未交付且未扣费：文本请求既没有输出，也没有产生费用。
+// 这是稳定性事实层早已使用的 B2 anomaly_free；客户排障过去只接住 quota>0 的 B1，
+// 导致稳定性判为异常的请求跳过来却查不到。复用 deliveryZeroOutputSQL 保证两页同口径。
+func logChainUndeliveredUnbilledSQL() string {
+	return "(type = 2 AND quota = 0 AND " + deliveryZeroOutputSQL() + ")"
 }
 
 // logChainBillingFreeSQL 交付未扣费：内容给了，钱没收。方向相反，亏的是我方。
@@ -373,6 +379,8 @@ func logChainAnomalyTags(r LogChainRow, quota int64) []string {
 		// 即已产出文本，端点必然是文本端点，加了是冗余且会与 SQL 侧不一致。
 		case quota > 0 && r.CompletionTokens == 0 && logChainIsTextCompletionPath(r.RequestPath):
 			tags = append(tags, "billing_unpaid") // 客户付了钱没拿到内容
+		case quota == 0 && r.CompletionTokens == 0 && logChainIsTextCompletionPath(r.RequestPath):
+			tags = append(tags, anomalyUndeliveredUnbilled) // 未交付也未扣费（稳定性 B2）
 		case quota == 0 && r.CompletionTokens > 0:
 			// 订阅计费的 quota 恒为 0，属正常，不算漏计费。
 			// 这里无法从 LogChainRow 读 billing_source，故由调用方保证：
@@ -417,19 +425,24 @@ func logChainAnomalySQL(kind string) string {
 		return clientGoneWithType
 	case anomalyBillingUnpaid:
 		return logChainBillingUnpaidSQL()
+	case anomalyUndeliveredUnbilled:
+		return logChainUndeliveredUnbilledSQL()
 	case anomalyBillingFree:
 		return logChainBillingFreeSQL()
 	case anomalyBilling:
-		return "(" + logChainBillingUnpaidSQL() + " OR " + logChainBillingFreeSQL() + ")"
+		return "(" + logChainBillingUnpaidSQL() + " OR " +
+			logChainUndeliveredUnbilledSQL() + " OR " + logChainBillingFreeSQL() + ")"
 	case anomalyAll:
 		// 拆档后 all 必须显式含 client_gone，否则"全部异常"会漏掉刚分出去的那一档。
 		return "(" + streamWithType + " OR " + clientGoneWithType + " OR " +
-			logChainBillingUnpaidSQL() + " OR " + logChainBillingFreeSQL() + ")"
+			logChainBillingUnpaidSQL() + " OR " + logChainUndeliveredUnbilledSQL() +
+			" OR " + logChainBillingFreeSQL() + ")"
 	case anomalyErrAnom:
 		// 唯一跨 type 的取值：错误(type=5) + 全部异常(type=2 里的问题请求)。
 		// 在 SQL 层做而非前端滤，否则 limit/has_more/计数三者会全部失准。
 		return "(type = 5 OR " + streamWithType + " OR " + clientGoneWithType + " OR " +
-			logChainBillingUnpaidSQL() + " OR " + logChainBillingFreeSQL() + ")"
+			logChainBillingUnpaidSQL() + " OR " + logChainUndeliveredUnbilledSQL() +
+			" OR " + logChainBillingFreeSQL() + ")"
 	}
 	// 走不到：kind 已在解析阶段校验。返回恒假而不是恒真——
 	// 万一将来有人绕过校验调进来，宁可查不到也不要把全部请求当异常吐出去。
@@ -549,15 +562,29 @@ type LogChainEdgeEvidence struct {
 
 // logChainScope 已校验的查询范围。所有字段都来自用户输入但已收敛到安全区间。
 type logChainScope struct {
-	FromTs    int64
-	ToTs      int64
+	FromTs int64
+	ToTs   int64
+	// FromTime / ToTime 仅在显式分钟范围生效时保存规范化 HH:mm，供 scope 回显。
+	// SQL 仍只使用已收敛的 FromTs / ToTs，避免时间口径出现两套实现。
+	FromTime  string
+	ToTime    string
 	UserID    int64
+	Username  string
 	ChannelID int64
 	Domain    string
 	Model     string
 	Group     string
 	TokenName string
 	RequestID string
+	// TokenID 是 logs.token_id 上的精确条件。令牌名可以重复、可以改名，
+	// 排查“同一把 key”时只有 ID 是稳定标识。0=未筛。
+	TokenID int64
+	// Endpoint 是 other.request_path 上的精确条件（生产实测填充率 100%）。
+	// 用于区分 /v1/chat/completions、/v1/responses、图片/音频等不同端点的问题。
+	Endpoint string
+	// Stream 取值 ""=未筛、"true"=只看流式、"false"=只看非流式。
+	// 用字符串而非 *bool：解析层能直接区分“没传”和“传了非法值”。
+	Stream    string
 	Keyword   string
 	ErrorOnly bool
 	// Anomaly 异常筛选，取值见 anomalyStream 等常量；空=不按异常筛。
@@ -584,6 +611,26 @@ type logChainScope struct {
 	// 是噪声。用途是回显给前端，静默收窄会让人以为"消费行里没有匹配的"，
 	// 而实际是压根没查。
 	KeywordScopedToErrors bool
+}
+
+// logChainScopeIsFocused 决定影响面是回答“问题集中在哪里”，还是回答
+// “筛选出的这些问题主要是什么原因”。它只看已经校验并实际用于 SQL 的 scope，
+// 不接受前端另传模式，避免展示语义与真实查询条件脱节。
+//
+// 日期范围和排序只是观察窗口/顺序，不算聚焦筛选；分页游标也不算。前端每天都会
+// 显式发送 00:00～23:59，这仍是完整自然日，不能因此把默认页误判为 focused。
+func logChainScopeIsFocused(s logChainScope) bool {
+	if s.UserID > 0 || s.Username != "" || s.ChannelID > 0 || s.Domain != "" ||
+		s.Model != "" || s.Group != "" || s.TokenName != "" || s.RequestID != "" ||
+		s.TokenID > 0 || s.Endpoint != "" || s.Stream != "" || s.Keyword != "" {
+		return true
+	}
+	// 默认问题范围是 err_anom；它和完全未指定问题类型都不算聚焦筛选。
+	// 用户显式切到“错误”或其它单独异常档，才是在缩小问题类型。
+	if s.ErrorOnly || s.LogType != 0 || (s.Anomaly != "" && s.Anomaly != anomalyErrAnom) {
+		return true
+	}
+	return s.FromTime != "" && (s.FromTime != "00:00" || s.ToTime != "23:59")
 }
 
 // logChainSpanCap 跨度收窄的记录。
@@ -617,8 +664,25 @@ func (sc *logChainSpanCap) noteSpanCap(requestedDays int, reason string) {
 // capped 是否发生过收窄。
 func (sc logChainSpanCap) capped() bool { return len(sc.Reasons) > 0 }
 
-// parseLogChainScope 解析并收敛查询参数。时间窗按 CST 自然日左闭右开，与事实层口径一致。
-// 任何越界值都收敛而非报错，只有语义矛盾（from/to 只给一个、日期格式错）才拒绝。
+// parseLogChainMinute 解析严格 HH:mm，返回当天第几分钟和规范化原值。
+// 不接受 strings.TrimSpace 后再解析：请求里的前后空格也属于非法输入，必须 fail-closed，
+// 否则页面显示的筛选条件与服务端实际生效条件可能不一致。
+func parseLogChainMinute(raw string) (int, string, error) {
+	if len(raw) != 5 || raw[2] != ':' || raw[0] < '0' || raw[0] > '9' ||
+		raw[1] < '0' || raw[1] > '9' || raw[3] < '0' || raw[3] > '9' ||
+		raw[4] < '0' || raw[4] > '9' {
+		return 0, "", errors.New("格式应为 HH:mm")
+	}
+	hour := int(raw[0]-'0')*10 + int(raw[1]-'0')
+	minute := int(raw[3]-'0')*10 + int(raw[4]-'0')
+	if hour > 23 || minute > 59 {
+		return 0, "", errors.New("必须在 00:00 到 23:59 之间")
+	}
+	return hour*60 + minute, raw, nil
+}
+
+// parseLogChainScope 解析并收敛查询参数。时间窗按 CST 左闭右开，与事实层口径一致。
+// 天数/limit 越界按既有规则收敛；语义矛盾、日期错误和显式分钟范围非法则 fail-closed。
 func parseLogChainScope(c *gin.Context, now time.Time) (logChainScope, error) {
 	now = now.In(cstLocation)
 	s := logChainScope{Limit: logChainDefaultLimit}
@@ -662,19 +726,141 @@ func parseLogChainScope(c *gin.Context, now time.Time) (logChainScope, error) {
 		}
 		from, to = f, t
 	}
+
+	// 分钟范围必须配合显式 from / to 日期，但允许 from < to 的跨日范围：
+	// 客户报障常给“昨晚 22:40 到今早 09:15”这种跨零点的窗口，强行拆成两天查
+	// 会让人自己拼结果，也容易漏掉跨零点的那几分钟。
+	//
+	// 跨日时 from_time 属于 from 那天、to_time 属于 to 那天；同一天时行为与之前完全一致。
+	// 跨度上限、无筛选闸门和排他上界都在下面沿用，不因为放开跨日而松掉。
+	fromTimeValues, fromTimePresent := c.Request.URL.Query()["from_time"]
+	toTimeValues, toTimePresent := c.Request.URL.Query()["to_time"]
+	if fromTimePresent != toTimePresent {
+		return logChainScope{}, errors.New("from_time 和 to_time 必须同时提供")
+	}
+	if fromTimePresent {
+		if len(fromTimeValues) != 1 || len(toTimeValues) != 1 {
+			return logChainScope{}, errors.New("from_time 和 to_time 只能各提供一次")
+		}
+		if fromText == "" || toText == "" {
+			return logChainScope{}, errors.New("分钟范围必须同时提供 from 与 to 日期")
+		}
+		fromMinute, normalizedFrom, err := parseLogChainMinute(fromTimeValues[0])
+		if err != nil {
+			return logChainScope{}, fmt.Errorf("from_time %w", err)
+		}
+		toMinute, normalizedTo, err := parseLogChainMinute(toTimeValues[0])
+		if err != nil {
+			return logChainScope{}, fmt.Errorf("to_time %w", err)
+		}
+		fromDay, _ := time.ParseInLocation("2006-01-02", fromText, cstLocation)
+		toDay, _ := time.ParseInLocation("2006-01-02", toText, cstLocation)
+		start := fromDay.Add(time.Duration(fromMinute) * time.Minute)
+		// 结束分钟包含整分钟，SQL 仍使用左闭右开：[start, end+1min)。
+		end := toDay.Add(time.Duration(toMinute+1) * time.Minute)
+		if !end.After(start) {
+			return logChainScope{}, errors.New("from_time / to_time 与日期组合非法：结束时间不能早于开始时间")
+		}
+		// 跨度上限对带分钟范围的跨日查询同样适用：这里按实际起止时刻判断，
+		// 而不是只看自然日，否则 31 天 + 23:59 会突破上面按天算出的边界。
+		if span := end.Sub(start); span > time.Duration(logChainMaxDays)*24*time.Hour {
+			s.SpanCap.noteSpanCap(int((span+24*time.Hour-time.Second)/(24*time.Hour)),
+				"单次查询跨度上限 "+strconv.Itoa(logChainMaxDays)+" 天（防全表扫）")
+			start = end.Add(-time.Duration(logChainMaxDays) * 24 * time.Hour)
+		}
+		from, to = start, end
+		s.FromTime, s.ToTime = normalizedFrom, normalizedTo
+	}
 	s.FromTs, s.ToTs = from.Unix(), to.Unix()
 
-	s.UserID, _ = strconv.ParseInt(strings.TrimSpace(c.Query("user_id")), 10, 64)
-	s.ChannelID, _ = strconv.ParseInt(strings.TrimSpace(c.Query("channel_id")), 10, 64)
+	// user_id 是精确筛选。只要参数出现，就必须是正整数；解析失败不能静默
+	// 落成 0，因为 logChainWhere 会把 0 当成“未筛客户”，反而返回所有客户的数据。
+	if values, present := c.Request.URL.Query()["user_id"]; present {
+		if len(values) != 1 {
+			return logChainScope{}, errors.New("user_id 只能提供一次")
+		}
+		text := strings.TrimSpace(values[0])
+		userID, err := strconv.ParseInt(text, 10, 64)
+		if err != nil || userID <= 0 {
+			return logChainScope{}, errors.New("user_id 必须为正整数")
+		}
+		s.UserID = userID
+	}
+	// username 是 logs.username 上的精确条件。只允许一个非空值：空参数若静默退化成
+	// 未筛选，会在管理员以为自己只看某客户时返回其他客户日志。
+	if values, present := c.Request.URL.Query()["username"]; present {
+		if len(values) != 1 {
+			return logChainScope{}, errors.New("username 只能提供一次")
+		}
+		s.Username = strings.TrimSpace(values[0])
+		if s.Username == "" {
+			return logChainScope{}, errors.New("username 不能为空")
+		}
+	}
+	// channel_id 与 user_id 同理：出现即必须是正整数。解析失败若静默落成 0，
+	// logChainWhere 会把 0 当成“未筛渠道”，于是页面显示按渠道筛、实际返回全渠道。
+	if values, present := c.Request.URL.Query()["channel_id"]; present {
+		if len(values) != 1 {
+			return logChainScope{}, errors.New("channel_id 只能提供一次")
+		}
+		channelID, err := strconv.ParseInt(strings.TrimSpace(values[0]), 10, 64)
+		if err != nil || channelID <= 0 {
+			return logChainScope{}, errors.New("channel_id 必须为正整数")
+		}
+		s.ChannelID = channelID
+	}
 	s.Domain = strings.ToLower(strings.TrimSpace(c.Query("domain")))
 	s.Model = strings.TrimSpace(c.Query("model"))
 	s.Group = strings.TrimSpace(c.Query("group"))
 	s.TokenName = strings.TrimSpace(c.Query("token_name"))
 	s.RequestID = strings.TrimSpace(c.Query("request_id"))
+	// token_id / endpoint / stream 与其它筛选同一原则：出现即必须合法。
+	// 静默忽略会让人以为按令牌、端点或流式筛过了，实际拿到的是未筛结果。
+	if values, present := c.Request.URL.Query()["token_id"]; present {
+		if len(values) != 1 {
+			return logChainScope{}, errors.New("token_id 只能提供一次")
+		}
+		tokenID, err := strconv.ParseInt(strings.TrimSpace(values[0]), 10, 64)
+		if err != nil || tokenID <= 0 {
+			return logChainScope{}, errors.New("token_id 必须为正整数")
+		}
+		s.TokenID = tokenID
+	}
+	if values, present := c.Request.URL.Query()["endpoint"]; present {
+		if len(values) != 1 {
+			return logChainScope{}, errors.New("endpoint 只能提供一次")
+		}
+		s.Endpoint = strings.TrimSpace(values[0])
+		if s.Endpoint == "" {
+			return logChainScope{}, errors.New("endpoint 不能为空")
+		}
+	}
+	if values, present := c.Request.URL.Query()["stream"]; present {
+		if len(values) != 1 {
+			return logChainScope{}, errors.New("stream 只能提供一次")
+		}
+		switch strings.ToLower(strings.TrimSpace(values[0])) {
+		case "true":
+			s.Stream = "true"
+		case "false":
+			s.Stream = "false"
+		default:
+			return logChainScope{}, errors.New("stream 只能是 true 或 false")
+		}
+	}
 	s.Keyword = strings.TrimSpace(c.Query("keyword"))
 	s.ErrorOnly = c.Query("error_only") == "true"
-	if t, err := strconv.Atoi(strings.TrimSpace(c.Query("type"))); err == nil && t >= 1 && t <= 6 {
-		s.LogType = t
+	// type 同样不能静默忽略：拼错时会退回默认口径（type IN (2,5)），
+	// 而人以为自己只在看某一类日志。
+	if values, present := c.Request.URL.Query()["type"]; present {
+		if len(values) != 1 {
+			return logChainScope{}, errors.New("type 只能提供一次")
+		}
+		logType, err := strconv.Atoi(strings.TrimSpace(values[0]))
+		if err != nil || logType < 1 || logType > 6 {
+			return logChainScope{}, errors.New("type 必须为 1～6 的整数")
+		}
+		s.LogType = logType
 	}
 	if s.ErrorOnly && s.LogType != 0 && s.LogType != 5 {
 		return logChainScope{}, errors.New("error_only 与 type 冲突：error_only=true 时 type 只能为 5")
@@ -686,12 +872,12 @@ func parseLogChainScope(c *gin.Context, now time.Time) (logChainScope, error) {
 	if a := strings.TrimSpace(c.Query("anomaly")); a != "" {
 		switch a {
 		case anomalyStream, anomalyClientGone, anomalyBilling, anomalyBillingUnpaid,
-			anomalyBillingFree, anomalyAll, anomalyErrAnom:
+			anomalyUndeliveredUnbilled, anomalyBillingFree, anomalyAll, anomalyErrAnom:
 			s.Anomaly = a
 		default:
-			return logChainScope{}, fmt.Errorf("anomaly 取值无效：只支持 %s / %s / %s / %s / %s / %s / %s",
+			return logChainScope{}, fmt.Errorf("anomaly 取值无效：只支持 %s / %s / %s / %s / %s / %s / %s / %s",
 				anomalyStream, anomalyClientGone, anomalyBilling, anomalyBillingUnpaid,
-				anomalyBillingFree, anomalyAll, anomalyErrAnom)
+				anomalyUndeliveredUnbilled, anomalyBillingFree, anomalyAll, anomalyErrAnom)
 		}
 		if s.ErrorOnly {
 			return logChainScope{}, errors.New("anomaly 与 error_only 互斥：错误是 type=5，异常是 type=2 里的问题请求，交集为空")
@@ -722,8 +908,17 @@ func parseLogChainScope(c *gin.Context, now time.Time) (logChainScope, error) {
 	// 排序方向。只认 "asc"，其余一律按默认倒序——排障最常看"刚刚发生了什么"。
 	// 不把用户字符串带进 SQL，只转成 bool，无注入面。
 	s.Asc = strings.EqualFold(strings.TrimSpace(c.Query("order")), "asc")
-	if l, err := strconv.Atoi(strings.TrimSpace(c.Query("limit"))); err == nil && l > 0 {
-		s.Limit = l
+	// limit 非法值必须拒绝：静默退回默认 50 会让调用方以为自己取到了指定条数，
+	// 据此判断“只有这么多问题”。超过上限仍按既有契约收敛到上限并保持可用。
+	if values, present := c.Request.URL.Query()["limit"]; present {
+		if len(values) != 1 {
+			return logChainScope{}, errors.New("limit 只能提供一次")
+		}
+		limit, err := strconv.Atoi(strings.TrimSpace(values[0]))
+		if err != nil || limit <= 0 {
+			return logChainScope{}, errors.New("limit 必须为正整数")
+		}
+		s.Limit = limit
 	}
 	if s.Limit > logChainMaxLimit {
 		s.Limit = logChainMaxLimit
@@ -739,6 +934,56 @@ func parseLogChainScope(c *gin.Context, now time.Time) (logChainScope, error) {
 		return logChainScope{}, err
 	}
 	return s, nil
+}
+
+// logChainCanSplit 报告当前生产库驱动是否支持拆分用的 UNION ALL 形态。
+//
+// ★ SQLite 不认「带 ORDER BY / LIMIT 的括号子查询参与 UNION」★
+// 单元测试的假生产库（newFakeProdDB）是 SQLite，直接拼进去会让所有
+// err_anom 用例报 `near "UNION": syntax error`。与 logChainSourceClause
+// 的 FORCE INDEX 是同一道门。
+//
+// SQLite 上不拆也没关系：这个拆分针对的是 MySQL 优化器在 OR 谓词下
+// 放弃索引第二列的行为，而 SQLite 的测试 fixture 只有几十行。
+func (m *Monitor) logChainCanSplit() bool {
+	if m.prodDB == nil {
+		return false
+	}
+	return strings.Contains(strings.ToLower(fmt.Sprintf("%T", m.prodDB.Driver())), "mysql")
+}
+
+// logChainSplitErrAnom 为 err_anom 生成「第二半」的 WHERE，第三个返回值指示是否该拆。
+//
+// ★★ 为什么要拆：OR 起来比两半分别查慢 3.5 倍 ★★
+//
+// 2026-08-31 生产实测（08-26，139,439 行）：
+//
+//	error_only=true（只 type=5）  1.60s
+//	anomaly=all（只 type=2 异常）  2.38s
+//	err_anom（两者 OR）           8.41s → 500 超时
+//
+// 根因：err_anom 的 type=5 分支**没有其它条件**，OR 之后优化器无法把 type
+// 约束推进 idx_created_at_type 形成单一区间，只能扫遍窗口内全部行并对每行
+// 跑一次 JSON_VALID+JSON_EXTRACT（异常判据全建在 other 上，见 anomalyEndReasonSQL）。
+// 两半单独查时各自都能用上索引第二列，所以都快。
+//
+// 试过但无效的做法：在 OR 外层加 type IN (2,5) 前置条件。实测 2571ms → 2582ms，
+// EXPLAIN 的执行计划完全相同（同一索引、同样 187,524 行），只有 filtered 估算变了。
+//
+// ★ 语义等价性 ★
+// err_anom 的定义就是 type=5 OR anomalyAll（见 logChainAnomalySQL 的两个 case），
+// 所以两半分别用 ErrorOnly 与 anomalyAll 走**同一个 logChainWhere**，
+// 不新增任何谓词逻辑——这是刻意的：异常判据有来源门、type 限定等多处易错细节，
+// 复制一份必然漂。
+func logChainSplitErrAnom(s logChainScope, domainChans []int64) (string, []any, bool) {
+	if s.Anomaly != anomalyErrAnom {
+		return "", nil, false
+	}
+	// 第二半：只要 type=2 里的异常。第一半（type=5）由调用方用 ErrorOnly 生成。
+	half := s
+	half.Anomaly = anomalyAll
+	where, args := logChainWhere(half, domainChans)
+	return where, args, true
 }
 
 // logChainDaysSpanned 时间窗覆盖几个 CST 自然日。
@@ -783,7 +1028,7 @@ func (s *logChainScope) guardWideSpanWithoutFilter() error {
 		"（已知缺陷，见开发说明书 18.7）：会让生产库放弃索引改走全表扫，"+
 		"跑满 %d 秒预算后失败，期间还占用与客户日志查询共用的通道。"+
 		"请任选一项后重试：只看错误 / 指定 type / 指定异常档 / 关键词 / "+
-		"渠道 / 客户 ID / 模型 / 分组 / Request ID / 上游域名；"+
+		"渠道 / 客户 ID / 客户名 / 模型 / 分组 / Request ID / 上游域名；"+
 		"或把跨度缩到 %d 天以内",
 		days, logChainQueryTimeoutMS/1000, logChainWideSpanMinDays)
 }
@@ -871,6 +1116,10 @@ func logChainWhere(s logChainScope, domainChans []int64) (string, []any) {
 		where += " AND user_id = ?"
 		args = append(args, s.UserID)
 	}
+	if s.Username != "" {
+		where += " AND username = ?"
+		args = append(args, s.Username)
+	}
 	if s.ChannelID > 0 {
 		where += " AND channel_id = ?"
 		args = append(args, s.ChannelID)
@@ -895,6 +1144,24 @@ func logChainWhere(s logChainScope, domainChans []int64) (string, []any) {
 	if s.RequestID != "" { // logs.request_id 有独立索引 idx_logs_request_id
 		where += " AND request_id = ?"
 		args = append(args, s.RequestID)
+	}
+	if s.TokenID > 0 {
+		where += " AND token_id = ?"
+		args = append(args, s.TokenID)
+	}
+	// 端点走 other.request_path，复用与稳定性事实层同一套 JSON 读取表达式，
+	// 避免两处各写一份、迟早漂成不同判据。
+	if s.Endpoint != "" {
+		where += " AND " + channelTestJSONEnumSQL("$.request_path") + " = ?"
+		args = append(args, s.Endpoint)
+	}
+	// is_stream 是真实列，但历史行可能为 NULL：NULL 视为非流式，
+	// 否则“只看非流式”会把这些行整片漏掉。
+	switch s.Stream {
+	case "true":
+		where += " AND COALESCE(is_stream,0) = 1"
+	case "false":
+		where += " AND COALESCE(is_stream,0) = 0"
 	}
 	if s.Keyword != "" {
 		where += " AND content LIKE ? ESCAPE '!'"
@@ -1019,10 +1286,18 @@ func mysqlLogChainSourceClause(s logChainScope, domainChans []int64) string {
 // **同一个参数、不同取值，行为差一个数量级**，而解析阶段无从知道哪个是高频的。
 // 按跨度拦会把 user_id=130 这类好用的查法一起砍掉，属于「妨碍既有功能」。
 // 所以这一格不拦，留作已知缺口（见开发说明书 18.7）。
+// ★ Endpoint / Stream 为什么不算收窄 ★
+//
+// Endpoint 读的是 other.request_path（JSON 表达式，无索引可用，只能逐行解析）；
+// Stream 只有两个取值，实测端点与流式在生产上都覆盖绝大多数行，选择性接近于无。
+// 把它们算成「有筛选」会同时坏两件事：FROM 不再强制 created_at_type 索引，
+// 闸门也放行多日查询——与 TokenName 当年那个错误完全同形。
+//
+// TokenID 相反：它是真实列且有索引，选择性与 user_id 同级，故算收窄。
 func logChainHasNarrowingFilter(s logChainScope, domainChans []int64) bool {
 	return s.ErrorOnly || s.LogType > 0 || s.Anomaly != "" || s.Keyword != "" ||
-		s.UserID > 0 || s.ChannelID > 0 || s.Domain != "" ||
-		s.Model != "" || s.Group != "" || s.RequestID != "" ||
+		s.UserID > 0 || s.Username != "" || s.ChannelID > 0 || s.Domain != "" ||
+		s.Model != "" || s.Group != "" || s.RequestID != "" || s.TokenID > 0 ||
 		len(domainChans) > 0
 }
 
@@ -1041,16 +1316,44 @@ func (m *Monitor) queryLogChain(ctx context.Context, s logChainScope, domainChan
 	}
 	defer m.releaseUsageDetailGate()
 
-	where, args := logChainWhere(s, domainChans)
+	// err_anom 走 UNION ALL 拆分，见 logChainSplitErrAnom 的说明。
+	splitWhere2, splitArgs2, split := logChainSplitErrAnom(s, domainChans)
+	split = split && m.logChainCanSplit()
+	first := s
+	if split {
+		// 第一半只要 type=5。清掉 Anomaly 让 logChainWhere 走 ErrorOnly 分支。
+		first.Anomaly = ""
+		first.ErrorOnly = true
+	}
+	where, args := logChainWhere(first, domainChans)
 	// COALESCE 全列：历史版本与迁移数据可能留 NULL，直接 Scan 进 int64 会让整页返回 500。
-	q := "SELECT /*+ MAX_EXECUTION_TIME(" + strconv.Itoa(logChainQueryTimeoutMS) + ") */" +
-		" id, created_at, COALESCE(type,0), COALESCE(user_id,0), COALESCE(username,'')," +
-		" COALESCE(`group`,''), COALESCE(token_name,''), COALESCE(channel_id,0)," +
-		" COALESCE(model_name,''), COALESCE(prompt_tokens,0), COALESCE(completion_tokens,0)," +
-		" COALESCE(use_time,0), COALESCE(is_stream,0), COALESCE(quota,0)," +
-		" COALESCE(content,''), COALESCE(other,''), COALESCE(request_id,'')" +
-		" FROM " + m.logChainSourceClause(s, domainChans) + " WHERE " + where +
-		" " + logChainOrderBySQL(s.Asc) + " LIMIT " + strconv.Itoa(s.Limit+1)
+	// 列必须带别名：拆分时外层要按 created_at / id 排序，而
+	// COALESCE(...) 未命名时列名就是整个表达式，外层引用不到。
+	cols := " id, created_at, COALESCE(type,0) AS c_type, COALESCE(user_id,0) AS c_uid," +
+		" COALESCE(username,'') AS c_uname, COALESCE(`group`,'') AS c_group," +
+		" COALESCE(token_name,'') AS c_token, COALESCE(channel_id,0) AS c_chid," +
+		" COALESCE(model_name,'') AS c_model, COALESCE(prompt_tokens,0) AS c_pt," +
+		" COALESCE(completion_tokens,0) AS c_ct, COALESCE(use_time,0) AS c_ut," +
+		" COALESCE(is_stream,0) AS c_stream, COALESCE(quota,0) AS c_quota," +
+		" COALESCE(content,'') AS c_content, COALESCE(other,'') AS c_other," +
+		" COALESCE(request_id,'') AS c_reqid"
+	hint := "/*+ MAX_EXECUTION_TIME(" + strconv.Itoa(logChainQueryTimeoutMS) + ") */"
+	src := m.logChainSourceClause(s, domainChans)
+	order := logChainOrderBySQL(s.Asc)
+	lim := " LIMIT " + strconv.Itoa(s.Limit+1)
+
+	var q string
+	if split {
+		// 两半各取 top n+1，外层归并再取 top n+1。全局前 n+1 必落在两半的
+		// 前 n+1 之内，故结果与单条 OR 查询完全一致。
+		q = "SELECT " + hint + " * FROM ((SELECT" + cols + " FROM " + src +
+			" WHERE " + where + " " + order + lim + ") UNION ALL (SELECT" + cols +
+			" FROM " + src + " WHERE " + splitWhere2 + " " + order + lim +
+			")) u " + order + lim
+		args = append(args, splitArgs2...)
+	} else {
+		q = "SELECT " + hint + cols + " FROM " + src + " WHERE " + where + " " + order + lim
+	}
 
 	rows, err := m.prodDB.QueryContext(cctx, q, args...)
 	if err != nil {
@@ -1316,9 +1619,9 @@ func (m *Monitor) serveLogChainFilters(c *gin.Context) {
 // 排障工具最危险的失效方式是"查不到"被读成"没发生过"。
 func logChainBlindSpots() []string {
 	return []string{
-		"未打到渠道即被拒的请求（限流/无可用渠道/分组无权限）不在本结果内：这类记录不写 logs，" +
-			"只在 stability_reject_hours 的小时聚合里，且该表无 user_id，无法定位到具体客户。" +
-			"客户报“请求根本发不出去”时，本接口查不到属预期，不代表没发生。",
+		"未到达渠道即被拒的请求（无可用渠道、无效令牌、额度不足等）不写入 logs，因此不在客户排障中展示；" +
+			"请前往「问题预警」查看。问题预警可按时间、客户、分组、模型和错误原因定位；" +
+			"未鉴权或采集器未上报客户 ID 的记录仍无法关联具体客户。",
 		"new-api 换渠道重试会落多条 type=5：本接口按条列出，但无法归并成一次客户请求，" +
 			"看到 N 条错误不等于失败 N 次。",
 		// 原第三条"从不采集请求/响应正文"已删：加入 end_reason / end_error 后，
@@ -1336,6 +1639,34 @@ func (m *Monitor) serveLogChainRequests(c *gin.Context) {
 		return
 	}
 	ctx := c.Request.Context()
+
+	// 只给客户名、没给客户 ID 时先确认这个名字指向唯一客户。
+	//
+	// 主站不保证 username 唯一。按名字直查 logs 会把多个同名客户的请求混成一份，
+	// 页面上看起来却像“这一个客户的问题”——排障据此得出的结论会落到错的客户身上。
+	// 因此同名时拒绝查询并交出候选 ID，由人明确选择；绝不自动取第一个或静默合并。
+	// 查的是本地用户名缓存，不额外打生产库。
+	if scope.Username != "" && scope.UserID == 0 {
+		candidates, lookupErr := lookupUsersByName(m.storeDB, scope.Username)
+		if lookupErr != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "客户名解析失败：" + lookupErr.Error()})
+			return
+		}
+		if len(candidates) > 1 {
+			options := make([]gin.H, 0, len(candidates))
+			for _, cand := range candidates {
+				options = append(options, gin.H{"user_id": cand.UserID, "username": cand.Username, "group": cand.Grp})
+			}
+			c.JSON(http.StatusBadRequest, gin.H{
+				"error": fmt.Sprintf("客户名「%s」对应 %d 个客户 ID，请选择具体客户后再查询："+
+					"同名客户的请求混在一起会把结论落到错的客户身上", scope.Username, len(candidates)),
+				"username_ambiguous": true,
+				"username":           scope.Username,
+				"candidates":         options,
+			})
+			return
+		}
+	}
 
 	// 按域名筛：先本地反查渠道 ID。域名无对应渠道时直接返回空集，不去打生产库。
 	var domainChans []int64
@@ -1397,7 +1728,7 @@ func (m *Monitor) serveLogChainRequests(c *gin.Context) {
 	// 影响面只描述当前页，不额外查生产库。渠道补全失败时
 	// 维度不可信，宁可不给结论，也不返回假的 blast radius。
 	if channelEnrichErr == nil {
-		resp["blast_radius"] = computeLogChainBlastRadius(rows)
+		resp["blast_radius"] = computeLogChainBlastRadiusForScope(rows, scope, hasMore)
 	}
 	if hasMore && len(rows) > 0 {
 		// 游标必须成对返回：排序键是 (created_at, id)，只给 id 无法定位续查位置。
@@ -1416,15 +1747,23 @@ func (m *Monitor) serveLogChainRequests(c *gin.Context) {
 // logChainScopeEcho 回显生效范围。用户传的值可能被收敛过（跨度截断、limit 上限），
 // 不回显的话前端会以为筛选条件按原样生效了。
 func logChainScopeEcho(s logChainScope) gin.H {
+	// from/to 是 SQL 实际使用的左闭右开边界，保持原样以便核对查询本身。
+	// display_to 是给人看的**包含式**结束时间：SQL 上界要排他，但页面直接显示
+	// 那个值会变成「选到 10:15 却显示 10:16」「选到 23:59 却显示次日 00:00」，
+	// 让人以为多查了一分钟。两者并存，不互相改写。
 	h := gin.H{
-		"from_ts": s.FromTs,
-		"to_ts":   s.ToTs,
-		"from":    time.Unix(s.FromTs, 0).In(cstLocation).Format("2006-01-02 15:04:05"),
-		"to":      time.Unix(s.ToTs, 0).In(cstLocation).Format("2006-01-02 15:04:05"),
-		"limit":   s.Limit,
+		"from_ts":    s.FromTs,
+		"to_ts":      s.ToTs,
+		"from":       time.Unix(s.FromTs, 0).In(cstLocation).Format("2006-01-02 15:04:05"),
+		"to":         time.Unix(s.ToTs, 0).In(cstLocation).Format("2006-01-02 15:04:05"),
+		"display_to": time.Unix(s.ToTs-1, 0).In(cstLocation).Format("2006-01-02 15:04:05"),
+		"limit":      s.Limit,
 	}
 	if s.UserID > 0 {
 		h["user_id"] = s.UserID
+	}
+	if s.Username != "" {
+		h["username"] = s.Username
 	}
 	if s.ChannelID > 0 {
 		h["channel_id"] = s.ChannelID
@@ -1443,6 +1782,19 @@ func logChainScopeEcho(s logChainScope) gin.H {
 	}
 	if s.RequestID != "" {
 		h["request_id"] = s.RequestID
+	}
+	if s.TokenID > 0 {
+		h["token_id"] = s.TokenID
+	}
+	if s.Endpoint != "" {
+		h["endpoint"] = s.Endpoint
+	}
+	if s.Stream != "" {
+		h["stream"] = s.Stream
+	}
+	if s.FromTime != "" {
+		h["from_time"] = s.FromTime
+		h["to_time"] = s.ToTime
 	}
 	if s.Keyword != "" {
 		h["keyword"] = s.Keyword

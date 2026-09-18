@@ -127,6 +127,17 @@ func TestRejectionBatchHashIgnoresSampleOrder(t *testing.T) {
 	}
 }
 
+func TestRejectionBatchHashOrdersCustomerIdentity(t *testing.T) {
+	rows := []RejectionSample{
+		{BucketTs: 120, Node: "n", Reason: "r", Model: "m", Grp: "g", UserID: 7, Count: 1},
+		{BucketTs: 120, Node: "n", Reason: "r", Model: "m", Grp: "g", UserID: 3, Count: 1},
+	}
+	reversed := []RejectionSample{rows[1], rows[0]}
+	if rejectionBatchPayloadHash(rows) != rejectionBatchPayloadHash(reversed) {
+		t.Fatal("同一批多客户样本仅顺序变化时不应被误判为冲突")
+	}
+}
+
 func TestConcurrentRejectionBatchRetriesAccumulateExactlyOnce(t *testing.T) {
 	m := newTestMonitor(t)
 	rows := []RejectionSample{{BucketTs: 120, Node: "master", Reason: "no_available_channel", Model: "m", Grp: "g", Count: 3}}

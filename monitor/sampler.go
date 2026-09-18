@@ -3,7 +3,7 @@ package monitor
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -169,6 +169,7 @@ func (m *Monitor) loop(ctx context.Context, interval time.Duration) {
 	var nextProblemSample int64
 	var nextStabilityRollup int64
 	var nextMetricFinalize int64
+	var nextUserDirectorySync int64
 	for {
 		select {
 		case <-ctx.Done():
@@ -187,6 +188,12 @@ func (m *Monitor) loop(ctx context.Context, interval time.Duration) {
 				}
 				_ = m.refreshChannelsContext(ctx) // 每周期同步渠道开关；与来源 epoch 一起取消
 				m.refreshSelectable()             // 每周期重算"可选(分组,模型)对",监控只统计用户能选到的模型
+				// 用户名缓存只是展示增强：每 10 分钟异步走低优先来源槽，
+				// 不阻塞主采样，也不与既有后台来源任务并发。
+				if now >= nextUserDirectorySync {
+					m.startUserDirectorySync(ctx)
+					nextUserDirectorySync = now + 600
+				}
 			}
 			if m.cfg.StabilityEnabled {
 				// 稳定性是历史报表而非秒级看板：每 5 分钟重算最近两小时已足够
@@ -1071,6 +1078,42 @@ GROUP BY bucket, token_name`
 // 供对外看板派生"无可用渠道"。低频、失败保留旧值。仅读非密字段(无 key/凭证)。
 func (m *Monitor) refreshChannels() { _ = m.refreshChannelsContext(context.Background()) }
 
+func (m *Monitor) logChainChannelSyncEvery() time.Duration {
+	if m.cfg.logChainChannelSyncInterval > 0 {
+		return m.cfg.logChainChannelSyncInterval
+	}
+	return 10 * time.Minute
+}
+
+// startLogChainChannelSync 是最小权限客户排障模式唯一的后台来源任务。
+// 只复用 channels 查询刷新本地快照，不启动 logs 聚合、用户/令牌同步或 Usage Facts。
+func (m *Monitor) startLogChainChannelSync(ctx context.Context) {
+	syncNow := func() bool {
+		if err := m.refreshChannelsContext(ctx); err != nil {
+			if ctx.Err() == nil && !errors.Is(err, errSourceNotReady) {
+				slog.Warn("客户排障渠道快照同步失败", "err", err)
+			}
+			return false
+		}
+		return true
+	}
+	if !syncNow() && ctx.Err() != nil {
+		return
+	}
+	ticker := time.NewTicker(m.logChainChannelSyncEvery())
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if !syncNow() && ctx.Err() != nil {
+				return
+			}
+		}
+	}
+}
+
 func (m *Monitor) refreshChannelsContext(parent context.Context) error {
 	if m.prodDB == nil {
 		return errSourceNotReady
@@ -1129,37 +1172,20 @@ func (m *Monitor) refreshChannelsContext(parent context.Context) error {
 	return nil
 }
 
-// fetchUsableGroups 从 new-api 的 /api/pricing(匿名可读)取可见分组(用户创建令牌时能选的分组)。
+// fetchUsableGroups 从 NewAPI 的 UserUsableGroups 配置读取用户可选分组。
+// RC26 可将 /api/pricing 设置为登录后可见，因此不能再依赖匿名 HTTP。
 func (m *Monitor) fetchUsableGroups() []string {
-	base := strings.TrimRight(m.cfg.NewAPIBaseURL, "/")
-	if base == "" {
-		return nil
-	}
-	cl := &http.Client{Timeout: 5 * time.Second}
-	resp, err := cl.Get(base + "/api/pricing")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	groups, err := m.fetchConfiguredWebsiteGroups(ctx)
 	if err != nil {
+		slog.Warn("读取 NewAPI 可选分组配置失败，保留上一版可选模型快照", "err", err)
 		return nil
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
-		return nil
-	}
-	var body struct {
-		UsableGroup map[string]string `json:"usable_group"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
-		return nil
-	}
-	out := make([]string, 0, len(body.UsableGroup))
-	for k := range body.UsableGroup {
-		if k != "" {
-			out = append(out, k)
-		}
-	}
-	return out
+	return groups
 }
 
-// refreshSelectable 重算"可选 (分组,模型) 对" = 可见分组(/api/pricing) ∩ 启用渠道配置(channel_snaps),
+// refreshSelectable 重算"可选 (分组,模型) 对" = 可见分组(UserUsableGroups) ∩ 启用渠道配置(channel_snaps),
 // 写入 selectable_pairs。拉不到可见分组则不动旧表(避免误清空导致监控全过滤为空)。
 func (m *Monitor) refreshSelectable() {
 	groups := m.fetchUsableGroups()
