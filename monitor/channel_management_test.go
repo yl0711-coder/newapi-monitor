@@ -55,6 +55,31 @@ func TestChannelManagementPageIncludesBusinessDateShortcuts(t *testing.T) {
 	}
 }
 
+func TestChannelManagementFlattensLegacyVendorTypeLayer(t *testing.T) {
+	js := string(channelManagementJS)
+	for _, marker := range []string{
+		`function domainServiceGroups(domain)`,
+		`domain.vendors.flatMap(vendor=>vendor.channels||[])`,
+		`展开后直接查看服务分组及实际渠道`,
+		`${channels.length} 个实际渠道 · ${enabled} 个启用 · ${groups.length} 个服务分组`,
+	} {
+		if !strings.Contains(js, marker) {
+			t.Fatalf("渠道管理缺少扁平化渠道展示标记 %q", marker)
+		}
+	}
+	for _, forbidden := range []string{
+		`id="cmVendor"`,
+		`data-cm-vendor-toggle`,
+		`function vendorSection(`,
+		`逐级展开厂商类型`,
+		`个厂商 ·`,
+	} {
+		if strings.Contains(pageHTML, forbidden) || strings.Contains(js, forbidden) {
+			t.Fatalf("渠道管理仍暴露 RC26 后不可靠的厂商类型层级 %q", forbidden)
+		}
+	}
+}
+
 func TestChannelManagementConfiguredGroupWithoutUsageStillIncludesFinance(t *testing.T) {
 	rate := ChannelFinanceChannelCost{
 		ChannelID: 80, Grp: "codex-1.2x", UpstreamGroupName: "gpt-pro-max",

@@ -824,7 +824,7 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
   </div>
 
   <div class="cm-sortbar">
-    <div><b>排行口径</b><span>切换后主域名、厂商和实际渠道同步重排</span></div>
+    <div><b>排行口径</b><span>切换后主域名、服务分组和实际渠道同步重排</span></div>
     <div class="cm-sort-switch">
       <button type="button" class="active" data-cm-sort="name">名称 A–Z</button>
       <button type="button" data-cm-sort="cost">用户侧消费</button>
@@ -838,7 +838,6 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
   <div class="cm-filters" id="cmFilters">
     <label class="cm-search"><span>搜索</span><input id="cmSearch" type="search" placeholder="主域名、具体域名、渠道名或渠道 ID" autocomplete="off"></label>
     <label><span>主域名</span><select id="cmDomain"><option value="">全部主域名</option></select></label>
-    <label><span>厂商类型</span><select id="cmVendor"><option value="">全部厂商类型</option></select></label>
     <label><span>服务分组</span><select id="cmGroup"><option value="">全部服务分组</option></select></label>
     <label><span>状态</span><select id="cmStatus"><option value="">全部状态</option><option value="enabled">当前启用</option><option value="disabled">当前停用</option><option value="historical">历史渠道</option></select></label>
     <button type="button" class="cm-reset" id="cmReset">重置</button>

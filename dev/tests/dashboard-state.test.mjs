@@ -372,6 +372,26 @@ test('upstreams default to name order with unconfigured inactive domains last', 
   assert.equal(cm.report.domains[0].sortAtEnd, undefined, 'source snapshot must remain unchanged');
 });
 
+test('channel management flattens RC26 type buckets and exposes actual channels directly', () => {
+  const {context} = dashboard(), api = context.channelTest;
+  const usage = {requests: 3, tokens: 30, cost_usd: 1.2};
+  const group = name => ({name, usage, finance: {}});
+  const domain = {key: 'domain:flat.example', domain: 'flat.example', configured: true,
+    usage: {requests: 6, tokens: 60, cost_usd: 2.4},
+    vendors: [
+      {name: '未标记', channels: [{id: 1, name: 'custom-one', current: true, status: 1, model_count: 2,
+        usage, configured_groups: ['codex'], groups: [group('codex')]}]},
+      {name: 'OpenAI', channels: [{id: 2, name: 'custom-two', current: true, status: 1, model_count: 3,
+        usage, configured_groups: ['claude'], groups: [group('claude')]}]},
+    ], rate_config: {managed_channels: 2, configured_channels: 0}, finance: {}, upstream: {}};
+  api.cm.report = {meta: {data_coverage: {complete: true}}, finance: {}, domains: [domain]};
+  api.cm.expandedDomains.add(domain.key);
+  const html = api.domainCard(domain, 0, domain.usage, false);
+  assert.match(html, /#1 custom-one/); assert.match(html, /#2 custom-two/);
+  assert.match(html, /codex/); assert.match(html, /claude/);
+  assert.doesNotMatch(html, /data-cm-vendor-toggle|<b>未标记<\/b>|<b>OpenAI<\/b>/);
+});
+
 test('filtering out a usable channel cannot reclassify its upstream as unused', () => {
   const {context} = dashboard();
   const api = context.channelTest;
