@@ -11,7 +11,7 @@ id = "generic-api-key"
 [[rules.allowlists]]
 description = "Deterministic HMAC key/rotation vectors in isolated SQLite tests"
 condition = "AND"
-paths = ['''(^|/)monitor/(channel_cost_contract|channel_cost_decision|channel_upstream_pricing_ledger|settings)_test\.go$''']
+paths = ['''(^|/)monitor/(channel_cost_contract|channel_cost_decision|channel_cost_ownership|channel_upstream_pricing_ledger|settings)_test\.go$''']
 regexTarget = "secret"
 regexes = ['''^(0123456789abcdef0123456789abcdef|abcdef0123456789abcdef0123456789)$''']
 

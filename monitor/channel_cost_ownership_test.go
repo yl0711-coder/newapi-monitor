@@ -57,7 +57,7 @@ func TestInspectChannelCostOwnershipMatchesOnlyExactKeysWithoutPersistingSecrets
 	defer server.Close()
 
 	m := newChannelUpstreamTestMonitor(t)
-	m.cfg.ChannelCostHMACKey = "0123456789abcdef0123456789abcdef"
+	m.cfg.ChannelCostHMACKey = strings.Repeat("unit-test-hmac-", 3)
 	m.cfg.ChannelCostHMACKeyID = "key-v1"
 	account := ChannelUpstreamAccount{Domain: normalizeChannelBaseDomain(server.URL), Provider: upstreamProviderNewAPI, BaseURL: server.URL, UserID: 7}
 	epoch := newAPIUpstreamAccountEpoch(account)
