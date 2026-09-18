@@ -81,11 +81,11 @@ func openExistingStabilityBackfillStore(path string) (*gorm.DB, error) {
 			return closeOnError(fmt.Errorf("stability backfill required table is missing: %T", model))
 		}
 	}
-	if sqlDB, err := db.DB(); err != nil {
+	sqlDB, err := db.DB()
+	if err != nil {
 		return closeOnError(err)
-	} else {
-		sqlDB.SetMaxOpenConns(1)
-		sqlDB.SetMaxIdleConns(1)
 	}
+	sqlDB.SetMaxOpenConns(1)
+	sqlDB.SetMaxIdleConns(1)
 	return db, nil
 }
