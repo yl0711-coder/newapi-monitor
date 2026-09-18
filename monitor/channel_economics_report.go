@@ -39,6 +39,8 @@ type channelEconomicsTotalsView struct {
 	KnownCorrectedCost      channelEconomicsMoneyView  `json:"known_corrected_cost"`
 	Profit                  *channelEconomicsMoneyView `json:"profit"`
 	KnownProfit             channelEconomicsMoneyView  `json:"known_profit"`
+	PairedRevenue           channelEconomicsMoneyView  `json:"paired_revenue"`
+	PairedCorrectedCost     channelEconomicsMoneyView  `json:"paired_corrected_cost"`
 	MarginPercent           *string                    `json:"margin_percent"`
 	MarginDisplay           string                     `json:"margin_display"`
 	CorrectedCostKnown      bool                       `json:"corrected_cost_known"`
@@ -50,6 +52,7 @@ type channelEconomicsTotalsView struct {
 	LocalRefundRecords      int64                      `json:"local_refund_records"`
 	UpstreamChargeUnits     int64                      `json:"upstream_charge_units"`
 	IncludedPublicationRows int64                      `json:"included_publication_rows"`
+	PairedPublicationRows   int64                      `json:"paired_publication_rows"`
 }
 
 type channelEconomicsCoverageView struct {
@@ -73,6 +76,12 @@ type channelEconomicsChannelView struct {
 
 type channelEconomicsHourView struct {
 	HourTs   int64                        `json:"hour_ts"`
+	Totals   channelEconomicsTotalsView   `json:"totals"`
+	Coverage channelEconomicsCoverageView `json:"coverage"`
+}
+
+type channelEconomicsDayView struct {
+	DayTs    int64                        `json:"day_ts"`
 	Totals   channelEconomicsTotalsView   `json:"totals"`
 	Coverage channelEconomicsCoverageView `json:"coverage"`
 }
@@ -106,6 +115,7 @@ type channelEconomicsReport struct {
 	Coverage         channelEconomicsCoverageView     `json:"coverage"`
 	GlobalRefund     channelEconomicsGlobalRefundView `json:"global_unallocated_refund"`
 	Domains          []channelEconomicsDomainView     `json:"domains"`
+	Daily            []channelEconomicsDayView        `json:"daily,omitempty"`
 }
 
 type channelEconomicsReportRow struct {
@@ -132,11 +142,14 @@ type channelEconomicsAgg struct {
 	upstreamCost        int64
 	knownCorrectedCost  int64
 	knownProfit         int64
+	pairedRevenue       int64
+	pairedCorrectedCost int64
 	localRequests       int64
 	upstreamRequests    int64
 	localRefundRecords  int64
 	upstreamChargeUnits int64
 	publicationRows     int64
+	pairedRows          int64
 	correctedKnown      bool
 	profitKnown         bool
 }
@@ -168,6 +181,13 @@ func (a *channelEconomicsAgg) addRow(row channelEconomicsReportRow) error {
 		}
 	}
 	if row.ProfitKnown {
+		a.pairedRows++
+		if err := addEconomicsInt64(&a.pairedRevenue, row.RevenueMicroUSD); err != nil {
+			return err
+		}
+		if err := addEconomicsInt64(&a.pairedCorrectedCost, row.CorrectedCostMicroUSD); err != nil {
+			return err
+		}
 		if err := addEconomicsInt64(&a.knownProfit, row.ProfitMicroUSD); err != nil {
 			return err
 		}
@@ -225,9 +245,11 @@ func (a channelEconomicsAgg) view(coverage channelEconomicsCoverageView, profitB
 	view := channelEconomicsTotalsView{
 		KnownRevenue: economicsMoney(a.revenue), KnownUpstreamCost: economicsMoney(a.upstreamCost),
 		KnownCorrectedCost: economicsMoney(a.knownCorrectedCost), KnownProfit: economicsMoney(a.knownProfit),
+		PairedRevenue: economicsMoney(a.pairedRevenue), PairedCorrectedCost: economicsMoney(a.pairedCorrectedCost),
 		LocalRequests: a.localRequests, UpstreamRequests: a.upstreamRequests,
 		LocalRefundRecords: a.localRefundRecords, UpstreamChargeUnits: a.upstreamChargeUnits,
 		IncludedPublicationRows: a.publicationRows,
+		PairedPublicationRows:   a.pairedRows,
 	}
 	manifestBaseKnown := coverage.MissingHours == 0 && coverage.AmbiguousEpochHours == 0 &&
 		!coverageHasStatus(coverage, "manifest_children_mismatch", "manifest_status_unknown")
@@ -293,16 +315,43 @@ func (m *Monitor) channelEconomicsDomains(ctx context.Context, requested string)
 }
 
 func (m *Monitor) buildChannelEconomicsReport(ctx context.Context, scope stabilityScope, requestedDomain string) (*channelEconomicsReport, error) {
+	return m.buildChannelEconomicsReportMode(ctx, scope, requestedDomain, false)
+}
+
+// buildChannelEconomicsReportMode 在 financeMode 下只读已发布的当前 manifest，
+// 不依赖当前上游白名单。这能保证历史关账不会因账户停用/删除而改口径。
+// 普通渠道管理报表仍保持原有白名单行为。
+func (m *Monitor) buildChannelEconomicsReportMode(ctx context.Context, scope stabilityScope, requestedDomain string, financeMode bool) (*channelEconomicsReport, error) {
 	now := time.Now().Unix()
+	enabled := m.cfg.ChannelCostClosureEnabled && m.cfg.ChannelEconomicsReportEnabled
+	if financeMode {
+		enabled = m.cfg.FinanceEnabled
+	}
 	report := &channelEconomicsReport{
-		Enabled: m.cfg.ChannelCostClosureEnabled && m.cfg.ChannelEconomicsReportEnabled, SemanticsVersion: channelEconomicsSemanticsVersion,
+		Enabled: enabled, SemanticsVersion: channelEconomicsSemanticsVersion,
 		GeneratedAt: now, From: scope.FromTs, To: scope.ToTs, TimeZone: "Asia/Shanghai",
 		Source: "monitor_local_immutable_economics_current", DomainFilter: strings.ToLower(strings.TrimSpace(requestedDomain)),
 	}
 	if !report.Enabled {
 		return report, nil
 	}
-	domains, err := m.channelEconomicsDomains(ctx, requestedDomain)
+	var domains []string
+	var err error
+	if financeMode {
+		requested := strings.ToLower(strings.TrimSpace(requestedDomain))
+		query := m.storeDB.WithContext(ctx).Model(&ChannelEconomicsHourManifestCurrent{}).
+			Distinct("domain").Where("semantics_version = ? AND hour_ts >= ? AND hour_ts < ?", channelEconomicsSemanticsVersion, scope.FromTs, scope.ToTs)
+		if requested != "" {
+			query = query.Where("domain = ?", requested)
+		}
+		err = query.Order("domain").Pluck("domain", &domains).Error
+		domains = sortedUnique(domains)
+		if err == nil && requested != "" && len(domains) == 0 {
+			err = gorm.ErrRecordNotFound
+		}
+	} else {
+		domains, err = m.channelEconomicsDomains(ctx, requestedDomain)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -390,6 +439,20 @@ func (m *Monitor) buildChannelEconomicsReport(ctx context.Context, scope stabili
 
 	var siteAgg channelEconomicsAgg
 	siteAgg.correctedKnown, siteAgg.profitKnown = true, true
+	dailyAggs := map[int64]*channelEconomicsAgg{}
+	dailyCoverages := map[int64]*channelEconomicsCoverageView{}
+	if financeMode {
+		for hour := scope.FromTs; hour < scope.ToTs; hour += 3600 {
+			day := cstDayStart(hour)
+			coverage := dailyCoverages[day]
+			if coverage == nil {
+				coverage = &channelEconomicsCoverageView{StatusCounts: map[string]int64{}}
+				dailyCoverages[day] = coverage
+				dailyAggs[day] = &channelEconomicsAgg{correctedKnown: true, profitKnown: true}
+			}
+			coverage.ExpectedHours += int64(len(domains))
+		}
+	}
 	report.Coverage = channelEconomicsCoverageView{ExpectedHours: expectedHours * int64(len(domains)), StatusCounts: map[string]int64{}}
 	for _, domain := range domains {
 		domainAgg := channelEconomicsAgg{correctedKnown: true, profitKnown: true}
@@ -491,6 +554,29 @@ func (m *Monitor) buildChannelEconomicsReport(ctx context.Context, scope stabili
 				coverage.UnknownHours++
 				hourCoverage.UnknownHours = 1
 			}
+			day := cstDayStart(hour)
+			dayCoverage := dailyCoverages[day]
+			dayAgg := dailyAggs[day]
+			if dayCoverage != nil && dayAgg != nil {
+				dayCoverage.PublishedHours++
+				if hour+3600 > dayCoverage.DataUntil {
+					dayCoverage.DataUntil = hour + 3600
+				}
+				for status, count := range hourCoverage.StatusCounts {
+					dayCoverage.StatusCounts[status] += count
+				}
+				if hourVerified {
+					dayCoverage.VerifiedHours++
+					for _, row := range epochRows {
+						if err := dayAgg.addRow(row); err != nil {
+							return nil, err
+						}
+					}
+				} else {
+					dayCoverage.UnknownHours++
+					dayAgg.correctedKnown, dayAgg.profitKnown = false, false
+				}
+			}
 			hourCoverage.Complete = hourVerified
 			if report.DomainFilter != "" {
 				hasRefund := globalRefundHours[hour]
@@ -566,6 +652,12 @@ func (m *Monitor) buildChannelEconomicsReport(ctx context.Context, scope stabili
 		if err := addEconomicsInt64(&siteAgg.knownProfit, domainAgg.knownProfit); err != nil {
 			return nil, err
 		}
+		if err := addEconomicsInt64(&siteAgg.pairedRevenue, domainAgg.pairedRevenue); err != nil {
+			return nil, err
+		}
+		if err := addEconomicsInt64(&siteAgg.pairedCorrectedCost, domainAgg.pairedCorrectedCost); err != nil {
+			return nil, err
+		}
 		if err := addEconomicsInt64(&siteAgg.localRequests, domainAgg.localRequests); err != nil {
 			return nil, err
 		}
@@ -579,6 +671,7 @@ func (m *Monitor) buildChannelEconomicsReport(ctx context.Context, scope stabili
 			return nil, err
 		}
 		siteAgg.publicationRows += domainAgg.publicationRows
+		siteAgg.pairedRows += domainAgg.pairedRows
 		siteAgg.correctedKnown = siteAgg.correctedKnown && domainAgg.correctedKnown
 		siteAgg.profitKnown = siteAgg.profitKnown && domainAgg.profitKnown
 	}
@@ -591,6 +684,32 @@ func (m *Monitor) buildChannelEconomicsReport(ctx context.Context, scope stabili
 		}
 	}
 	report.Coverage.Complete = report.Coverage.MissingHours == 0 && report.Coverage.UnknownHours == 0 && report.Coverage.AmbiguousEpochHours == 0 && len(globalRefundHours) == 0
+	if financeMode {
+		dayKeys := make([]int64, 0, len(dailyCoverages))
+		for day := range dailyCoverages {
+			dayKeys = append(dayKeys, day)
+		}
+		sort.Slice(dayKeys, func(i, j int) bool { return dayKeys[i] < dayKeys[j] })
+		report.Daily = make([]channelEconomicsDayView, 0, len(dayKeys))
+		for _, day := range dayKeys {
+			coverage := *dailyCoverages[day]
+			coverage.MissingHours = max(int64(0), coverage.ExpectedHours-coverage.PublishedHours)
+			if coverage.MissingHours > 0 {
+				coverage.StatusCounts["publication_missing"] += coverage.MissingHours
+			}
+			coverage.Complete = coverage.MissingHours == 0 && coverage.UnknownHours == 0 && coverage.AmbiguousEpochHours == 0
+			hasRefund := false
+			for hour := max(scope.FromTs, day); hour < min(scope.ToTs, day+86400); hour += 3600 {
+				if globalRefundHours[hour] {
+					hasRefund = true
+					break
+				}
+			}
+			report.Daily = append(report.Daily, channelEconomicsDayView{
+				DayTs: day, Totals: dailyAggs[day].view(coverage, hasRefund, hasRefund), Coverage: coverage,
+			})
+		}
+	}
 	hasRefund := len(globalRefundHours) > 0
 	report.Totals = siteAgg.view(report.Coverage, hasRefund, hasRefund && report.DomainFilter != "")
 	return report, nil

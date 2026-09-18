@@ -224,7 +224,6 @@ start_monitor() {
     fail "required external volume is missing: $volume_name"
   docker volume inspect "$backup_volume_name" >/dev/null 2>&1 || \
     fail "required external backup volume is missing: $backup_volume_name"
-  compose up -d redis
   compose up -d --no-deps --force-recreate monitor
   local expected_image_id actual_image_id monitor_id
   monitor_id="$(compose ps -q monitor)"

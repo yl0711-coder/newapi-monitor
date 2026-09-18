@@ -20,7 +20,7 @@ func newChannelCostTestStore(t *testing.T) *gorm.DB {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := db.AutoMigrate(&ChannelUpstreamCostHourEvidence{}, &ChannelUpstreamCostHourState{}, &ChannelCostPageCheckpoint{}, &ChannelCostSourceBinding{}, &ChannelCostDirtyHour{}, &ChannelCostKeyRegistry{}, &ChannelPricingChangeProposal{}, &ChannelPricingProposalEvent{}, &ChannelFinanceActivation{}, &ChannelFinanceActivationSlot{}, &ChannelFinanceActivationEvent{}, &ChannelEconomicsHourPublication{}, &ChannelEconomicsHourCurrent{}, &ChannelEconomicsHourManifestPublication{}, &ChannelEconomicsHourManifestCurrent{}, &ChannelEconomicsGlobalHourFact{}, &ChannelEconomicsDirtyHour{}); err != nil {
+	if err := db.AutoMigrate(&ChannelUpstreamCostHourEvidence{}, &ChannelUpstreamCostHourState{}, &ChannelCostPageCheckpoint{}, &ChannelCostSourceBinding{}, &ChannelCostDirtyHour{}, &ChannelCostKeyRegistry{}, &ChannelPricingChangeProposal{}, &ChannelPricingProposalEvent{}, &ChannelFinanceActivation{}, &ChannelFinanceActivationSlot{}, &ChannelFinanceActivationEvent{}, &ChannelEconomicsHourPublication{}, &ChannelEconomicsHourCurrent{}, &ChannelEconomicsHourManifestPublication{}, &ChannelEconomicsHourManifestCurrent{}, &ChannelEconomicsGlobalHourFact{}, &ChannelEconomicsDirtyHour{}, &ChannelTestHourSample{}); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
@@ -184,6 +184,51 @@ func TestCostSourceMappingIntervalsFailClosed(t *testing.T) {
 	shared.AllocationMode, shared.LocalChannelID = "shared", 0
 	if err := m.saveCostSourceBinding(context.Background(), shared); err != nil {
 		t.Fatalf("explicit shared source should remain stored but unallocated: %v", err)
+	}
+}
+
+func TestCostSourceBindingEnqueuesOnlyVerifiedMatchedHours(t *testing.T) {
+	db := newChannelCostTestStore(t)
+	m := &Monitor{storeDB: db, cfg: Settings{
+		ChannelCostClosureEnabled: true,
+		ChannelCostClosureDomains: []string{"4sapi.com"},
+	}}
+	epoch, source := strings.Repeat("a", 64), strings.Repeat("b", 64)
+	verifiedHour, observedHour := int64(3600), int64(7200)
+	for i, hour := range []int64{verifiedHour, observedHour} {
+		row := ChannelUpstreamCostHourEvidence{
+			Domain: "4sapi.com", AccountEpoch: epoch, HourTs: hour,
+			SemanticsVersion: channelCostEvidenceSemanticsVersion,
+			SourceRef:        source, DimensionHash: strings.Repeat(string(rune('c'+i)), 64),
+			Provider: upstreamProviderNewAPI, SourceRefKind: channelCostSourceKindNewAPIToken,
+			HMACKeyID: "v1", ChargeUnits: 100, ChargeUnit: channelCostChargeUnitNewAPIQuota,
+		}
+		if err := db.Create(&row).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	states := []ChannelUpstreamCostHourState{
+		{Domain: "4sapi.com", AccountEpoch: epoch, HourTs: verifiedHour, SemanticsVersion: channelCostEvidenceSemanticsVersion, Provider: upstreamProviderNewAPI, Status: "verified", ReconcileStatus: "matched"},
+		{Domain: "4sapi.com", AccountEpoch: epoch, HourTs: observedHour, SemanticsVersion: channelCostEvidenceSemanticsVersion, Provider: upstreamProviderNewAPI, Status: "observed", ReconcileStatus: "matched"},
+	}
+	if err := db.Create(&states).Error; err != nil {
+		t.Fatal(err)
+	}
+	binding := ChannelCostSourceBinding{
+		Domain: "4sapi.com", AccountEpoch: epoch, SourceRef: source,
+		Provider: upstreamProviderNewAPI, SourceRefKind: channelCostSourceKindNewAPIToken,
+		HMACKeyID: "v1", LocalChannelID: 59, ValidFrom: verifiedHour,
+		Status: "confirmed", AllocationMode: "allocated", MappingSource: "manual",
+	}
+	if err := m.saveCostSourceBinding(context.Background(), binding); err != nil {
+		t.Fatal(err)
+	}
+	var dirty []ChannelEconomicsDirtyHour
+	if err := db.Order("hour_ts").Find(&dirty).Error; err != nil {
+		t.Fatal(err)
+	}
+	if len(dirty) != 1 || dirty[0].HourTs != verifiedHour {
+		t.Fatalf("binding queued ineligible cost hours: %+v", dirty)
 	}
 }
 

@@ -330,6 +330,9 @@ func New(s Settings) (*Monitor, error) {
 	if err := validateChannelCostClosureSettings(s); err != nil {
 		return nil, err
 	}
+	if err := validateFinanceSettings(s); err != nil {
+		return nil, err
+	}
 	if err := validateLocalAuthBypassSettings(s); err != nil {
 		return nil, err
 	}

@@ -74,6 +74,14 @@ services:
       # run-local-dev.sh 的调用环境显式打开，不会因此启用任何生产来源查询。
       MONITOR_GROUP_GOVERNANCE_ENABLED: ${MONITOR_GROUP_GOVERNANCE_ENABLED:-false}
       MONITOR_GROUP_GOVERNANCE_SYNC_MINUTES: ${MONITOR_GROUP_GOVERNANCE_SYNC_MINUTES:-10}
+      # 经营核算首阶段只读已复制到本机的不可变经济事实。
+      MONITOR_FINANCE_ENABLED: ${MONITOR_FINANCE_ENABLED:-false}
+      MONITOR_FINANCE_START_DATE: ${MONITOR_FINANCE_START_DATE:-2026-05-01}
+      MONITOR_FINANCE_FACTS_SYNC_ENABLED: "false"
+      # 离线生成、哈希自校验后的 CUR 核算产物；文件放在本机验收数据卷，
+      # 页面只读，不访问 AWS/S3。默认关闭，普通验收行为不变。
+      MONITOR_FINANCE_CUR_ARTIFACT_ENABLED: ${MONITOR_FINANCE_CUR_ARTIFACT_ENABLED:-false}
+      MONITOR_FINANCE_CUR_ARTIFACT_PATH: ${MONITOR_FINANCE_CUR_ARTIFACT_PATH:-/data/finance-cur-artifact.json}
       # 总开关关闭后，旧的 queued/running 任务也不会在本地重启续跑。
       MONITOR_STABILITY_BACKFILL_ENABLED: "false"
       MONITOR_STABILITY_AUTO_REPAIR: "false"

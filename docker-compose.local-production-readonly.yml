@@ -7,7 +7,7 @@
 #
 # 本模式不部署任何线上代码，也不写 NewAPI：
 # - MySQL 只通过 monitor_ro 执行 SELECT；
-# - 两份 SQLite 与 Redis 都在本机 Docker 数据卷；
+# - 两份 SQLite 都在本机 Docker 数据卷；
 # - 登录使用与线上相同的 NewAPI 身份校验；邮件、基础设施探测、上游账户
 #   同步、自动修复和 Nginx 写入均关闭；
 # - 管理端/Portal 只绑定 127.0.0.1:8100/8101。
@@ -47,6 +47,11 @@ services:
       MONITOR_USAGE_FACTS_SYNC_MINUTES: "5"
       MONITOR_USAGE_FACTS_PROFILE_SYNC_MINUTES: "5"
       MONITOR_USAGE_FACTS_RECONCILE_MINUTES: "30"
+
+      # 经营核算回填只能在本受控只读模式中显式开启。
+      # 默认仍关闭，避免普通验收意外发起历史扫描。
+      MONITOR_FINANCE_ENABLED: ${MONITOR_FINANCE_ENABLED:-true}
+      MONITOR_FINANCE_FACTS_SYNC_ENABLED: ${MONITOR_FINANCE_FACTS_SYNC_ENABLED:-false}
       # 与拟上线安全值一致，不使用合成验收的 5 秒加速配置。
       MONITOR_USAGE_FACTS_BACKFILL_DELAY_MS: "15000"
       MONITOR_USAGE_FACTS_QUERY_TIMEOUT_SECONDS: "20"
@@ -81,7 +86,5 @@ services:
       MONITOR_NGINX_ENABLED: "false"
       MONITOR_HEARTBEAT_URL: ""
 
-      # 与其他本地/线上实例隔离缓存命名空间，Redis 仍使用真实实现与相同 TTL。
-      MONITOR_USAGE_REDIS_PREFIX: nxmon:local:prod-readonly:usage:v1
     extra_hosts:
       - "host.docker.internal:host-gateway"

@@ -281,6 +281,69 @@ func TestSyncNewAPIBalancePreservesVerifiedUnitWhenStatusTemporarilyFails(t *tes
 	}
 }
 
+func TestSyncNewAPIBalanceRefreshesShortLivedBrowserSession(t *testing.T) {
+	var refreshCalls atomic.Int64
+	expiresAt := time.Now().Add(time.Hour).Unix()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/api/user/self":
+			if r.Header.Get("New-Api-User") != "23" {
+				http.Error(w, `{"message":"bad user"}`, http.StatusUnauthorized)
+				return
+			}
+			if r.Header.Get("Authorization") != "Bearer access-new" {
+				http.Error(w, `{"message":"expired"}`, http.StatusUnauthorized)
+				return
+			}
+			_, _ = w.Write([]byte(`{"success":true,"data":{"quota":1000000}}`))
+		case "/api/user/auth/refresh":
+			refreshCalls.Add(1)
+			if r.Method != http.MethodPost || r.Header.Get("X-Auth-Session") != "sid-old" {
+				http.Error(w, `{"message":"bad session"}`, http.StatusUnauthorized)
+				return
+			}
+			_, _ = fmt.Fprintf(w, `{"success":true,"data":{"access_token":"access-new","access_expires_at":%d,"session":{"sid":"sid-new"}}}`, expiresAt*1000)
+		case "/api/status":
+			_, _ = w.Write([]byte(`{"success":true,"data":{"quota_per_unit":500000}}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	row := ChannelUpstreamAccount{Provider: upstreamProviderNewAPI, BaseURL: server.URL, UserID: 23}
+	result, credential, err := syncNewAPIBalance(context.Background(), newUpstreamHTTPClient(3*time.Second), row, newAPICredential{AccessToken: "access-old", SessionID: "sid-old"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.BalanceUSD != 2 || credential.AccessToken != "access-new" || credential.SessionID != "sid-new" || credential.ExpiresAt != expiresAt || refreshCalls.Load() != 1 {
+		t.Fatalf("browser session refresh mismatch: result=%+v credential=%+v refreshes=%d", result, credential, refreshCalls.Load())
+	}
+	protected := upstreamCredentialSecrets(credential)
+	if len(protected) != 2 || protected[0] != "access-new" || protected[1] != "sid-new" {
+		t.Fatalf("rotated credential secrets are not protected: %+v", protected)
+	}
+}
+
+func TestNormalizeNewAPISessionIDAcceptsSIDOrSessionJSON(t *testing.T) {
+	for input, want := range map[string]string{
+		"sid-direct":           "sid-direct",
+		`{"sid":"sid-json"}`:   "sid-json",
+		`{"session_id":"sid"}`: "sid",
+	} {
+		got, err := normalizeNewAPISessionID(input)
+		if err != nil || got != want {
+			t.Fatalf("normalize session %q = %q, %v; want %q", input, got, err, want)
+		}
+	}
+	for _, input := range []string{"{}", "{bad", "sid\nnewline"} {
+		if _, err := normalizeNewAPISessionID(input); err == nil {
+			t.Fatalf("invalid session accepted: %q", input)
+		}
+	}
+}
+
 func TestSyncAICodeWithBalanceUsesAPIKeyAndUSDResponse(t *testing.T) {
 	const apiKey = "sk-acw-balance-test-secret"
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -712,29 +775,29 @@ func TestChannelUpstreamNewAPIHandlersProtectSecretsAndPreserveLastBalance(t *te
 	router.GET("/channels/upstream", m.requireRole(roleRoot), m.getChannelUpstreamHandler)
 	router.POST("/channels/upstream", m.requireRole(roleRoot), m.saveChannelUpstreamHandler)
 	router.POST("/channels/upstream/sync", m.requireRole(roleRoot), m.syncChannelUpstreamHandler)
-	payload := channelUpstreamSaveInput{Domain: domain, Provider: upstreamProviderNewAPI, BaseURL: server.URL, UserID: 9, AccessToken: "handler-secret-token"}
+	payload := channelUpstreamSaveInput{Domain: domain, Provider: upstreamProviderNewAPI, BaseURL: server.URL, UserID: 9, AccessToken: "handler-secret-token", SessionID: `{"sid":"handler-session"}`}
 
 	if w := upstreamRouteRequest(t, m, router, roleAdmin, http.MethodPost, "/channels/upstream", payload); w.Code != http.StatusForbidden {
 		t.Fatalf("admin must not edit upstream credentials: status=%d body=%s", w.Code, w.Body.String())
 	}
 	w := upstreamRouteRequest(t, m, router, roleRoot, http.MethodPost, "/channels/upstream", payload)
-	if w.Code != http.StatusOK || strings.Contains(w.Body.String(), "handler-secret-token") || !strings.Contains(w.Body.String(), `"balance_usd":5`) {
+	if w.Code != http.StatusOK || strings.Contains(w.Body.String(), "handler-secret-token") || strings.Contains(w.Body.String(), "handler-session") || !strings.Contains(w.Body.String(), `"balance_usd":5`) {
 		t.Fatalf("save response leaked secret or has wrong balance: status=%d body=%s", w.Code, w.Body.String())
 	}
 	var row ChannelUpstreamAccount
 	if err := m.storeDB.First(&row, "domain = ?", domain).Error; err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(row.Credential, "handler-secret-token") || !row.BalanceKnown || row.BalanceUSD != 5 {
+	if strings.Contains(row.Credential, "handler-secret-token") || strings.Contains(row.Credential, "handler-session") || !row.BalanceKnown || row.BalanceUSD != 5 {
 		t.Fatalf("invalid stored upstream state: %+v", row)
 	}
 	var credential newAPICredential
-	if err := m.openUpstreamCredential(row, &credential); err != nil || credential.AccessToken != "handler-secret-token" {
+	if err := m.openUpstreamCredential(row, &credential); err != nil || credential.AccessToken != "handler-secret-token" || credential.SessionID != "handler-session" {
 		t.Fatalf("stored token not recoverable: credential=%+v err=%v", credential, err)
 	}
 
 	get := upstreamRouteRequest(t, m, router, roleRoot, http.MethodGet, "/channels/upstream?domain="+domain, nil)
-	if get.Code != http.StatusOK || strings.Contains(get.Body.String(), "handler-secret-token") || !strings.Contains(get.Body.String(), `"user_id":9`) {
+	if get.Code != http.StatusOK || strings.Contains(get.Body.String(), "handler-secret-token") || strings.Contains(get.Body.String(), "handler-session") || !strings.Contains(get.Body.String(), `"user_id":9`) {
 		t.Fatalf("config GET leaked secret or omitted account: status=%d body=%s", get.Code, get.Body.String())
 	}
 	if get.Header().Get("Cache-Control") != "no-store" {

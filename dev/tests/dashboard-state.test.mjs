@@ -113,7 +113,7 @@ test('RPM, TPM and stability have independent axes and preserve null gaps',()=>{
   assert.equal(option.series[0].data[1][1],null);
 });
 
-test('governance has no fake zero before first snapshot and sits last in both menus',()=>{
+test('governance has no fake zero before first snapshot and finance sits last in both menus',()=>{
   const {context,element}=dashboard();
   for(const enabled of [false,true]){
     context.governanceTest.state.report={enabled,state:{current_group_count:0}};
@@ -124,7 +124,8 @@ test('governance has no fake zero before first snapshot and sits last in both me
   context.governanceTest.renderHeader();assert.equal(element('ggTotal').textContent,'0');
   for(const menu of source('page.html').matchAll(/<nav class="tabs[^]*?<\/nav>/g)){
     const tabs=[...menu[0].matchAll(/data-tab="([^"]+)"/g)].map(m=>m[1]);
-    assert.equal(tabs.at(-1),'group-governance');
+    assert.equal(tabs.at(-1),'finance');
+    assert.ok(tabs.indexOf('group-governance')<tabs.indexOf('finance'));
   }
 });
 
@@ -361,7 +362,7 @@ test('upstreams default to name order with unconfigured inactive domains last', 
   const names = () => Array.from(api.filteredDomains(), d => d.domain);
   assert.equal(cm.sort, 'name');
   assert.deepEqual(names(), ['a-rates.test', 'b-account.test', 'z-active.test', 'aaa-history.test', 'aaa-unused.test']);
-  assert.match(api.domainSortDescription(), /名称 A–Z.*置底/);
+  assert.match(api.domainSortDescription(), /名称 A–Z.*置后.*最后/);
   cm.sort = 'cost';
   assert.deepEqual(names(), ['z-active.test', 'b-account.test', 'a-rates.test', 'aaa-unused.test', 'aaa-history.test']);
   cm.report.meta.data_coverage.complete = false;
@@ -379,7 +380,7 @@ test('filtering out a usable channel cannot reclassify its upstream as unused', 
   api.cm.filters.status = 'disabled';
   const rows = api.filteredDomains();
   assert.equal(rows[0].vendors[0].channels.length, 1);
-  assert.equal(rows[0].sortAtEnd, false);
+  assert.equal(rows[0].sortRank, 0);
 });
 
 // Deferred responses reproduce races even if the transport ignores abort.

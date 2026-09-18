@@ -86,6 +86,12 @@ var groupGovernanceCSS []byte // 分组治理独立样式，不污染其他 Moni
 //go:embed group_governance.js
 var groupGovernanceJS []byte // 只访问 Monitor 本地快照与 CSV 接口
 
+//go:embed finance.css
+var financeCSS []byte // 经营核算独立样式，不污染其他 Monitor Tab
+
+//go:embed finance.js
+var financeJS []byte // 只读 /finance/report，不触发任何外部同步
+
 var allowedWindows = map[int]bool{15: true, 30: true, 60: true, 180: true, 360: true, 720: true, 1440: true}
 
 const maxJSONRequestBody = 4 << 20   // 4 MiB:足以覆盖节点批量上报，同时拒绝异常大请求体
@@ -216,6 +222,14 @@ func (m *Monitor) RegisterRoutes(r *gin.Engine) {
 		c.Header("Cache-Control", "no-cache")
 		c.Data(http.StatusOK, "application/javascript; charset=utf-8", groupGovernanceJS)
 	})
+	r.GET("/finance.css", func(c *gin.Context) {
+		c.Header("Cache-Control", "no-cache")
+		c.Data(http.StatusOK, "text/css; charset=utf-8", financeCSS)
+	})
+	r.GET("/finance.js", func(c *gin.Context) {
+		c.Header("Cache-Control", "no-cache")
+		c.Data(http.StatusOK, "application/javascript; charset=utf-8", financeJS)
+	})
 	r.GET("/logchain.js", func(c *gin.Context) {
 		c.Header("Cache-Control", "no-cache")
 		c.Data(http.StatusOK, "application/javascript; charset=utf-8", logChainJS)
@@ -268,6 +282,7 @@ func (m *Monitor) RegisterRoutes(r *gin.Engine) {
 		view.GET("/channels/report", m.serveChannelManagementReport)                      // 渠道管理:主域名→厂商→渠道→服务分组的本地汇总
 		view.GET("/channels/data-status", m.serveChannelDataStatus)                       // 同口径的轻量只读诊断，不读取用量维度
 		view.GET("/channels/economics", m.serveChannelEconomicsReport)                    // 渠道成本:只读本地不可变经济账当前发布头
+		view.GET("/finance/report", m.serveFinanceOperatingReport)                        // 经营核算:只读已发布渠道经济事实
 		// 排障两个接口挂 noStoreSensitive：响应含客户标识、令牌名、渠道名/ID、
 		// 上游主域名与错误原文，属敏感诊断数据，不得被任何中间层缓存。
 		// 用中间件而非在 handler 里逐个 c.Header：handler 有多条提前 return
@@ -351,7 +366,10 @@ func (m *Monitor) RegisterRoutes(r *gin.Engine) {
 		rootChannels.GET("/upstream/funds", m.getChannelUpstreamFundsHandler)
 		rootChannels.POST("/upstream/funds-sync", m.syncChannelUpstreamFundsHandler)
 		rootChannels.GET("/cost/sources", m.listChannelCostSourcesHandler)
+		rootChannels.POST("/cost/source-ownership/inspect", m.inspectChannelCostOwnershipHandler)
 		rootChannels.POST("/cost/bindings", m.saveChannelCostBindingHandler)
+		rootChannels.POST("/cost/historical-bindings/preview", m.previewChannelCostHistoricalBindingHandler)
+		rootChannels.POST("/cost/historical-bindings", m.saveChannelCostHistoricalBindingHandler)
 		rootChannels.GET("/cost/proposals", m.listChannelPricingProposalsHandler)
 		rootChannels.GET("/cost/proposals/:proposal_key/impact", m.getChannelPricingProposalImpactHandler)
 		rootChannels.POST("/cost/proposals/:proposal_key/decisions", m.decideChannelPricingProposalHandler)

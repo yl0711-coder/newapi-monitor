@@ -1362,9 +1362,14 @@ func (m *Monitor) enqueueEconomicsForBindingTx(tx *gorm.DB, row ChannelCostSourc
 		return nil
 	}
 	var affected []int64
-	if err := tx.Model(&ChannelUpstreamCostHourEvidence{}).Distinct("hour_ts").
-		Where("domain = ? AND account_epoch = ? AND source_ref = ? AND hour_ts >= ?", row.Domain, row.AccountEpoch, row.SourceRef, row.ValidFrom).
-		Where("? = 0 OR hour_ts < ?", row.ValidTo, row.ValidTo).Order("hour_ts").Scan(&affected).Error; err != nil {
+	if err := tx.Table("channel_upstream_cost_hour_evidence e").Distinct("e.hour_ts").
+		Joins(`JOIN channel_upstream_cost_hour_states s
+			ON s.domain=e.domain AND s.account_epoch=e.account_epoch AND s.hour_ts=e.hour_ts
+			AND s.semantics_version=e.semantics_version`).
+		Where("e.domain = ? AND e.account_epoch = ? AND e.source_ref = ? AND e.hour_ts >= ?", row.Domain, row.AccountEpoch, row.SourceRef, row.ValidFrom).
+		Where("? = 0 OR e.hour_ts < ?", row.ValidTo, row.ValidTo).
+		Where("s.status = 'verified' AND s.reconcile_status = 'matched'").
+		Order("e.hour_ts").Scan(&affected).Error; err != nil {
 		return err
 	}
 	now := time.Now().Unix()

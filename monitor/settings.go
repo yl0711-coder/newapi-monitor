@@ -150,6 +150,16 @@ type Settings struct {
 	// 再显式开启页面，避免把部分数据误当成精确利润。
 	ChannelEconomicsReportEnabled bool // MONITOR_CHANNEL_ECONOMICS_REPORT_ENABLED，默认 false
 
+	// 经营核算第一阶段只是已发布渠道经济事实的只读投影：
+	// 不建财务流程、不写 NewAPI、不在页面请求中抓取上游或 AWS。
+	FinanceEnabled          bool   // MONITOR_FINANCE_ENABLED，默认 false
+	FinanceStartDate        string // MONITOR_FINANCE_START_DATE，北京时间 YYYY-MM-DD
+	FinanceFactsSyncEnabled bool   // MONITOR_FINANCE_FACTS_SYNC_ENABLED，默认 false；仅后台只读采集
+	// CUR 核算产物由离线命令生成并完成哈希自校验。Monitor 只读本地文件，
+	// 不访问 AWS/S3；独立开关默认关闭，路径必须为绝对路径。
+	FinanceCURArtifactEnabled bool   // MONITOR_FINANCE_CUR_ARTIFACT_ENABLED，默认 false
+	FinanceCURArtifactPath    string // MONITOR_FINANCE_CUR_ARTIFACT_PATH
+
 	// 客户端「用量报表」独立监听(portal.go):客户域名只指这个端口,上面不存在任何管理端路由。
 	// 留空 = 关闭(默认);如 ":8092"。
 	PortalAddr string // MONITOR_PORTAL_ADDR
@@ -388,6 +398,11 @@ func LoadSettings() Settings {
 		ChannelCostHMACKey:                       env("MONITOR_CHANNEL_COST_HMAC_KEY", ""),
 		ChannelCostHMACKeyID:                     strings.TrimSpace(env("MONITOR_CHANNEL_COST_HMAC_KEY_ID", "")),
 		ChannelEconomicsReportEnabled:            env("MONITOR_CHANNEL_ECONOMICS_REPORT_ENABLED", "false") == "true",
+		FinanceEnabled:                           env("MONITOR_FINANCE_ENABLED", "false") == "true",
+		FinanceStartDate:                         strings.TrimSpace(env("MONITOR_FINANCE_START_DATE", "2026-05-01")),
+		FinanceFactsSyncEnabled:                  env("MONITOR_FINANCE_FACTS_SYNC_ENABLED", "false") == "true",
+		FinanceCURArtifactEnabled:                env("MONITOR_FINANCE_CUR_ARTIFACT_ENABLED", "false") == "true",
+		FinanceCURArtifactPath:                   strings.TrimSpace(env("MONITOR_FINANCE_CUR_ARTIFACT_PATH", "")),
 		PortalAddr:                               env("MONITOR_PORTAL_ADDR", ""),
 		UsageRedisAddr:                           strings.TrimSpace(env("MONITOR_USAGE_REDIS_ADDR", "")),
 		UsageRedisUsername:                       strings.TrimSpace(env("MONITOR_USAGE_REDIS_USERNAME", "")),

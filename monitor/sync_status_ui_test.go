@@ -39,6 +39,11 @@ func TestSyncStatusPageUsesLocalStatusEndpoints(t *testing.T) {
 		"syncRenderCostClosure",
 		"profit_known_hours",
 		"unallocated_sources",
+		`id="syncFinanceFacts"`,
+		"经营核算事实",
+		"syncRenderFinanceFacts",
+		"financeFacts.completed_hours",
+		"失败不会跳过小时",
 	} {
 		if !strings.Contains(pageHTML, want) {
 			t.Fatalf("同步状态页缺少 %q", want)
@@ -85,7 +90,7 @@ func TestSyncStatusPageRendersBothStabilityMigrationsWithCorrectFields(t *testin
 func TestSyncStatusPageAllowsHashNavigation(t *testing.T) {
 	// 白名单是完整字面量断言：新增 tab 时必须同步改这里。
 	// 这样既保证 #tab=sync 仍可直达，也能挡住"误删某个 tab 名"的回归。
-	if !strings.Contains(pageHTML, `/^(sync|model|server|capacity|usage|stability|channels|logchain|group-governance)$/`) {
+	if !strings.Contains(pageHTML, `/^(sync|model|server|capacity|usage|stability|channels|finance|logchain|group-governance)$/`) {
 		t.Fatal("同步状态页必须能由 #tab=sync 直接打开")
 	}
 	if !strings.Contains(string(stabilityJS), `sync:{title:'数据同步状态'`) {

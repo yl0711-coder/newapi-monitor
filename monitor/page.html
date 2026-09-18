@@ -433,9 +433,10 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
   .tabs .tab.active{color:var(--text);border-bottom-color:var(--accent);font-weight:600}
   .tabpane[hidden]{display:none}
 </style>
-<link rel="stylesheet" href="/stability.css?v=8">
+<link rel="stylesheet" href="/stability.css?v=13">
 <link rel="stylesheet" href="/capacity.css?v=2">
 <link rel="stylesheet" href="/group-governance.css?v=1">
+  <link rel="stylesheet" href="/finance.css?v=13">
 </head>
 <body theme-mode="dark">
 <div class="monitor-shell">
@@ -454,6 +455,7 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
       <div class="tab" data-tab="sync" title="数据同步状态"><span class="monitor-nav-icon"><svg viewBox="0 0 24 24"><path d="M20 7h-6V1"/><path d="M4 17h6v6"/><path d="M20 7a8 8 0 0 0-13.7-3.6L4 5.7M4 17a8 8 0 0 0 13.7 3.6l2.3-2.3"/></svg></span><span class="monitor-nav-label">数据同步状态</span></div>
       <div class="tab" data-tab="logchain" title="客户排障"><span class="monitor-nav-icon"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/><path d="M11 8v3"/><path d="M11 14h.01"/></svg></span><span class="monitor-nav-label">客户排障</span></div>
       <div class="tab" data-tab="group-governance" title="分组治理（测试）"><span class="monitor-nav-icon"><svg viewBox="0 0 24 24"><circle cx="6" cy="6" r="2"/><circle cx="18" cy="6" r="2"/><circle cx="12" cy="18" r="2"/><path d="M8 7.2l3 8.2M16 7.2l-3 8.2M8 6h8"/></svg></span><span class="monitor-nav-label">分组治理</span></div>
+      <div class="tab" data-tab="finance" title="经营核算"><span class="monitor-nav-icon"><svg viewBox="0 0 24 24"><path d="M4 3h16v18H4z"/><path d="M8 7h8M8 11h2M14 11h2M8 15h2M14 15h2M8 19h2M14 19h2"/></svg></span><span class="monitor-nav-label">经营核算</span></div>
     </nav>
     <button type="button" class="monitor-sidebar-toggle" id="monitorSidebarToggle" aria-expanded="true" aria-label="收起侧边栏" title="收起侧边栏">
       <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m15 18-6-6 6-6"/></svg><span>收起侧边栏</span>
@@ -479,6 +481,7 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
       <div class="tab" data-tab="capacity">容量规划</div>
       <div class="tab" data-tab="logchain">客户排障</div>
       <div class="tab" data-tab="group-governance">分组治理</div>
+      <div class="tab" data-tab="finance">经营核算</div>
     </nav>
 
     <div class="monitor-content">
@@ -517,6 +520,11 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
   <section class="sync-section card">
     <div class="card-header">🧾 渠道成本与利润证据 <span class="muted">计价证据、来源归属、经济账发布和倍率生效任务</span></div>
     <div class="sync-kv" id="syncCostClosure"><div>加载中…</div></div>
+  </section>
+
+  <section class="sync-section card">
+    <div class="card-header">📊 经营核算事实 <span class="muted">全站消费、额度调整与注册赠送的小时级回填水位</span></div>
+    <div class="sync-kv" id="syncFinanceFacts"><div>加载中…</div></div>
   </section>
 
   <section class="sync-section card">
@@ -688,6 +696,70 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
   <div class="gg-table-wrap"><table class="gg-table"><thead><tr><th>状态</th><th>分组标识</th><th>展示说明</th><th>倍率</th><th>渠道 启/禁</th><th>用户</th><th>显式令牌</th><th>请求 7d/30d</th><th>主要问题</th><th>建议</th></tr></thead><tbody id="ggRows"><tr><td colspan="10" class="gg-empty">进入页面后加载本地快照</td></tr></tbody></table></div>
 </div><!-- /tab-group-governance -->
 
+<div class="tabpane finance-page" id="tab-finance" hidden>
+  <section class="fin-toolbar">
+    <div><h2>经营核算概览</h2><p>完整展示已有用量和上游证据；未覆盖的成本绝不按 0 计入。</p></div>
+    <div class="fin-actions"><button class="fin-btn" id="finSinceLaunch" type="button">上线以来</button><button class="fin-btn" id="finLastMonth" type="button">上月</button><button class="fin-btn" id="finThisMonth" type="button">本月</button><label>开始日期<input id="finFrom" type="date"></label><label>结束日期<input id="finTo" type="date"></label><button class="fin-btn primary" id="finRefresh" type="button">刷新</button></div>
+  </section>
+  <div class="fin-status" id="finStatus"><i></i><div><b>尚未读取</b><br>进入页面后只读 Monitor 本地已发布事实。</div></div>
+  <section class="fin-kpis">
+    <article class="fin-kpi revenue"><small>平台计费消耗（已知）</small><b id="finConsumption">—</b><span id="finConsumptionNote">待读取</span></article>
+    <article class="fin-kpi billed"><small>上游账单原值（对账参考）</small><b id="finBilled">—</b><span id="finBilledNote">待读取</span></article>
+    <article class="fin-kpi cost"><small>可核验上游成本（已知）</small><b id="finUpstream">—</b><span id="finUpstreamNote">待读取</span></article>
+    <article class="fin-kpi profit"><small>已配对计费贡献（赠送前）</small><b id="finContribution">—</b><span id="finContributionNote">非最终经营毛利</span></article>
+  </section>
+  <section class="fin-decision" id="finDecision">
+    <div><small>当前核算结论</small><b id="finDecisionTitle">待读取</b><p id="finDecisionText">加载后判断当前区间是否具备利润发布条件。</p></div>
+    <span id="finDecisionBadge">未判断</span>
+  </section>
+  <section class="fin-evidence" aria-label="核算证据覆盖">
+    <article id="finUserEvidence"><small>用户用量小时覆盖</small><b>—</b><span>待读取</span></article>
+    <article id="finGiftEvidence"><small>注册赠送核算覆盖</small><b>—</b><span>待读取</span></article>
+    <article id="finBillEvidence"><small>上游账单覆盖</small><b>—</b><span>待读取</span></article>
+    <article id="finCorrectionEvidence"><small>充值修正覆盖</small><b>—</b><span>待读取</span></article>
+    <article id="finPairingEvidence"><small>收入成本同窗配对</small><b>—</b><span>待读取</span></article>
+    <article id="finCUREvidence"><small>AWS 成本归属覆盖</small><b>—</b><span>待读取</span></article>
+  </section>
+  <article class="fin-card fin-bridge-card">
+    <header><div><h3>经营损益桥</h3><p>从平台计费消耗逐项调整为可发布经营毛利；缺少证据的项目保持空值</p></div><span>USD · 当前查询区间</span></header>
+    <div class="fin-bridge">
+      <div class="fin-bridge-row base"><span><b>平台净计费消耗</b><small>消费扣额减退还；内部测试已从用户口径分离</small></span><strong id="finBridgeConsumption">—</strong><em id="finBridgeConsumptionState">待读取</em></div>
+      <div class="fin-bridge-row deduction"><span><b>减：注册赠送实际消耗</b><small>只扣已识别赠送额度中被用户实际消耗的部分</small></span><strong id="finBridgeGift">—</strong><em id="finBridgeGiftState">未接入</em></div>
+      <div class="fin-bridge-row subtotal"><span><b>可发布经营收入</b><small>不是充值额；赠送扣减完整后才能发布</small></span><strong id="finBridgeRevenue">—</strong><em id="finBridgeRevenueState">待核验</em></div>
+      <div class="fin-bridge-row deduction"><span><b>减：修正上游总成本</b><small>包含客户流量、内部测试及其它已识别的上游消耗</small></span><strong id="finBridgeUpstream">—</strong><em id="finBridgeUpstreamState">待读取</em></div>
+      <div class="fin-bridge-row reference"><span><b>其中：内部测试上游成本（已含）</b><small>该金额已包含在上游总成本中，仅作分析，不重复扣减</small></span><strong id="finBridgeInternalTestCost">—</strong><em id="finBridgeInternalTestCostState">待读取</em></div>
+      <div class="fin-bridge-row deduction"><span><b>减：AWS 基础设施成本</b><small>CUR 账单按 NexusAPI 资源和期间归集</small></span><strong id="finBridgeAWS">—</strong><em id="finBridgeAWSState">未接入</em></div>
+      <div class="fin-bridge-row total"><span><b>可发布经营毛利</b><small>经营收入减修正上游成本和 AWS 成本</small></span><strong id="finBridgeProfit">—</strong><em id="finBridgeProfitState">待核验</em></div>
+    </div>
+    <footer id="finBridgeFootnote">内部测试及其它未归属成本单独列示；混合流量不做比例估算，也不会静默计为 0。</footer>
+  </article>
+  <article class="fin-card">
+    <header><div><h3>AWS 基础设施成本明细</h3><p>按 CUR 原始 Product Code 归类；不按比例估算，各行与当前区间 AWS 总成本严格对平</p></div><span>USD · 已闭合自然日</span></header>
+    <div class="fin-table-wrap"><table class="fin-table"><thead><tr><th>服务分类</th><th>CUR Product Code</th><th class="num">已知成本</th><th class="num">成本占比</th><th class="num">含该服务成本日</th><th>状态</th></tr></thead><tbody id="finCURProductRows"><tr><td colspan="6" class="fin-empty">进入页面后加载</td></tr></tbody></table></div>
+  </article>
+  <section class="fin-grid">
+    <article class="fin-card"><header><div><h3>月度趋势</h3><p>仅绘制当前查询区间的真实已发布值</p></div><span>北京时间 · USD</span></header><div class="fin-chart" id="finChart"></div></article>
+    <article class="fin-card"><header><div><h3>数据源状态</h3><p>未接入、缺失和待核对分开显示</p></div></header><div class="fin-source-list" id="finSources"><div class="fin-empty">待读取</div></div></article>
+  </section>
+  <article class="fin-card"><header><div><h3>月度核算明细</h3><p>经营收入 = 净计费消耗 - 注册赠送实际消耗；证据不完整时保持空值</p></div></header><div class="fin-table-wrap"><table class="fin-table fin-period-table"><thead><tr><th>期间</th><th class="num">净计费消耗</th><th class="num">注册赠送消耗</th><th class="num">经营收入</th><th class="num">上游账单</th><th class="num">修正上游总成本</th><th class="num">内部测试上游成本</th><th class="num">AWS 成本</th><th class="num">已配对计费贡献（赠送前）</th><th>用量覆盖</th><th>成本覆盖</th><th>状态</th></tr></thead><tbody id="finPeriodRows"><tr><td colspan="12" class="fin-empty">进入页面后加载</td></tr></tbody></table></div></article>
+  <details class="fin-disclosure">
+    <summary><span><b>核算缺口与待归属成本</b><small>财务或研发核对使用；不影响老板查看已核验结论</small></span><em id="finPairingSummary">待读取</em></summary>
+    <div class="fin-disclosure-body">
+      <article class="fin-card"><header><div><h3>历史成本补证计划</h3><p>只读本地估算，不会创建同步任务或访问上游；“能补倍率证据”不等于“能闭合渠道成本”</p></div><span id="finEvidenceRolloutSummary">待读取</span></header><div class="fin-closure-overview" id="finEvidenceRollout"><span><small>补证计划</small><b>待读取</b></span></div><div class="fin-table-wrap"><table class="fin-table fin-rollout-table"><thead><tr><th>上游主域名</th><th>平台</th><th>补采粒度</th><th class="num">已知修正成本</th><th class="num">估算读取 / 轮次</th><th>对闭环的作用</th><th>状态与边界</th></tr></thead><tbody id="finEvidenceRolloutRows"><tr><td colspan="7" class="fin-empty">进入页面后加载</td></tr></tbody></table></div></article>
+      <article class="fin-card"><header><div><h3>核算缺口审计</h3><p>只列出阻止毛利发布的真实原因；已有收入与未归属成本不会强行相减</p></div></header><div class="fin-pairing-coverage" id="finPairingCoverage"><span><small>配对账本范围</small><b>待读取</b></span></div><div class="fin-closure-overview" id="finClosureReadiness"><span><small>成本闭环准入</small><b>待读取</b></span></div><div class="fin-table-wrap"><table class="fin-table fin-gap-table"><thead><tr><th>阻断原因</th><th class="num">受影响行</th><th>上游主域名</th><th class="num">待配对收入</th><th class="num">待归属修正成本</th><th>说明</th></tr></thead><tbody id="finPairingRows"><tr><td colspan="6" class="fin-empty">进入页面后加载</td></tr></tbody></table></div></article>
+      <article class="fin-card"><header><div><h3>待归属上游成本来源</h3><p>来源标识已匿名化；分组名称候选不是令牌归属证据，不会自动绑定或改变核算金额</p></div><span id="finUnallocatedSourceSummary">待读取</span></header><div class="fin-table-wrap fin-source-detail-wrap"><table class="fin-table fin-source-detail-table"><thead><tr><th>上游主域名</th><th>匿名来源</th><th>上游分组</th><th>模型</th><th>分组名称候选（非归属证据）</th><th>证据时段</th><th class="num">小时</th><th class="num">请求</th><th class="num">账单原值</th></tr></thead><tbody id="finUnallocatedSourceRows"><tr><td colspan="9" class="fin-empty">进入页面后加载</td></tr></tbody></table></div></article>
+    </div>
+  </details>
+  <details class="fin-disclosure">
+    <summary><span><b>逐日事实与渠道归属证据</b><small>用于追溯某一天、某个上游的原始核算依据</small></span><em>展开查看明细</em></summary>
+    <div class="fin-disclosure-body">
+      <article class="fin-card"><header><div><h3>每日经营事实</h3><p>按北京时间自然日展示；当日未闭合小时会单独标识</p></div></header><div class="fin-table-wrap fin-daily-wrap"><table class="fin-table fin-daily-table"><thead><tr><th>日期</th><th class="num">消费扣额</th><th class="num">退还额度</th><th class="num">净计费消耗</th><th class="num">注册赠送消耗</th><th class="num">经营收入</th><th class="num">内部测试用量</th><th class="num">内部测试上游成本</th><th class="num">AWS 成本</th><th class="num">已配对计费扣额</th><th class="num">已配对客户成本</th><th class="num">计费贡献（赠送前）</th><th>用量覆盖</th><th>配对证据</th><th>状态</th></tr></thead><tbody id="finDailyRows"><tr><td colspan="15" class="fin-empty">进入页面后加载</td></tr></tbody></table></div></article>
+      <article class="fin-card"><header><div><h3>上游成本与渠道归属明细</h3><p>“已配对”三项使用同一批不可变小时事实，可直接核对；账单状态、配对状态及安全准入步骤分别判断</p></div></header><div class="fin-table-wrap"><table class="fin-table fin-cost-table"><thead><tr><th>上游主域名</th><th class="num">用户请求</th><th class="num">净计费消耗</th><th class="num">上游请求</th><th class="num">账单原值</th><th class="num">修正成本</th><th class="num">已配对计费扣额</th><th class="num">已配对成本</th><th class="num">计费贡献（赠送前）</th><th>账单口径</th><th>修正依据</th><th>账单覆盖</th><th>账单状态</th><th>收入成本配对</th><th>成本闭环下一步</th></tr></thead><tbody id="finCostRows"><tr><td colspan="15" class="fin-empty">进入页面后加载</td></tr></tbody></table></div></article>
+    </div>
+  </details>
+  <div class="fin-footnote" id="finFootnote">经营核算口径待读取。</div>
+</div><!-- /tab-finance -->
+
 <div class="tabpane channel-management-page" id="tab-channels" hidden>
   <div class="cm-toolbar">
     <div>
@@ -797,6 +869,7 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
         <label class="wide"><span>站点地址</span><input id="cmUpstreamBaseURL" type="url" placeholder="https://example.com" autocomplete="url"><small>填写站点根地址，不要追加 API 路径</small></label>
         <label class="cm-upstream-newapi"><span>用户 ID</span><input id="cmUpstreamUserID" type="number" min="1" step="1" inputmode="numeric" placeholder="例如 123"></label>
         <label class="cm-upstream-newapi wide"><span>用户访问令牌</span><input id="cmUpstreamAccessToken" type="password" autocomplete="new-password" placeholder="已配置时留空表示保持不变"><small>个人设置中的系统访问令牌，不是模型调用 Key</small></label>
+        <label class="cm-upstream-newapi wide"><span>会话 SID（可选）</span><input id="cmUpstreamSessionID" type="password" autocomplete="new-password" placeholder="长期令牌站点留空；短期令牌站点填写"><small>仅用于访问令牌自动续期。可填 Application → Local Storage 中 auth_session 的 sid，也可直接粘贴完整 auth_session JSON；勿填模型 API Key。</small></label>
         <label class="cm-upstream-sub2api"><span>登录邮箱</span><input id="cmUpstreamEmail" type="email" autocomplete="username" placeholder="name@example.com"></label>
         <label class="cm-upstream-sub2api"><span>认证方式</span><select id="cmUpstreamAuthMode"><option value="password">邮箱密码</option><option value="refresh_token">导入已登录会话</option></select></label>
         <label class="cm-upstream-sub2api cm-upstream-sub2-password wide"><span>登录密码</span><input id="cmUpstreamPassword" type="password" autocomplete="new-password" placeholder="已连接时留空表示沿用当前会话"><small>适用于没有验证码或 Turnstile 的站点；密码只用于本次换取令牌</small></label>
@@ -1113,10 +1186,11 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
 
 <script src="/stability.js?v=3"></script>
 <script src="/channel-data-status.js?v=1"></script>
-<script src="/channel-management.js?v=8"></script>
+<script src="/channel-management.js?v=13"></script>
 <script src="/logchain.js?v=1"></script>
 <script src="/capacity.js?v=2"></script>
 <script src="/group-governance.js?v=1"></script>
+<script src="/finance.js?v=36"></script>
 <script src="/infra-assets.js?v=1"></script>
 <script src="/ecs-log-sources.js?v=1"></script>
 <script>
@@ -1983,6 +2057,7 @@ function switchTab(name,preserveHash){
   document.getElementById('tab-capacity').hidden=(name!=='capacity');
   document.getElementById('tab-usage').hidden=(name!=='usage');
   document.getElementById('tab-group-governance').hidden=(name!=='group-governance');
+  document.getElementById('tab-finance').hidden=(name!=='finance');
   document.getElementById('tab-logchain').hidden=(name!=='logchain');
   if(window.monitorShellSetTab)window.monitorShellSetTab(name);
   if(name==='server'){loadInfra();infraSchedule();setTimeout(resizeInfraCharts,80);}
@@ -1991,6 +2066,8 @@ function switchTab(name,preserveHash){
   if(name==='usage')usageInit();
   if(name==='group-governance'&&window.groupGovernanceActivate)window.groupGovernanceActivate();
   else if(window.groupGovernanceDeactivate)window.groupGovernanceDeactivate();
+  if(name==='finance'&&window.financeActivate)window.financeActivate();
+  else if(window.financeDeactivate)window.financeDeactivate();
   if(name==='stability'&&window.stabilityActivate)window.stabilityActivate();
   if(name==='channels'&&window.channelManagementActivate)window.channelManagementActivate();
   else if(window.channelManagementDeactivate)window.channelManagementDeactivate();
@@ -2199,6 +2276,24 @@ function syncRenderCostClosure(report){
   ].join('');
   return level;
 }
+function syncRenderFinanceFacts(report){
+  const r=report||{},target=document.getElementById('syncFinanceFacts');
+  const statusMap={disabled:'未启用',waiting:'等待首次同步',backfilling:'历史回填中',caught_up:'已追平',error:'同步受阻',source_changed:'来源版本已变更',start_changed:'核算起点已变更'};
+  const level=!r.enabled?'neutral':r.status==='caught_up'?'ok':(r.status==='error'||r.status==='source_changed'||r.status==='start_changed'?'bad':'warn');
+  const expected=+r.expected_hours||0,completed=+r.completed_hours||0,percent=expected?Math.min(100,completed*100/expected):0;
+  target.innerHTML=[
+    syncKV('采集闸门',r.enabled?'已开启':'未启用',r.enabled?'只读来源库，顺序按小时回填':'不会访问 NewAPI 来源库'),
+    syncKV('报表展示',r.report_enabled?'已开启':'未开放','采集与展示独立，可先补数验收再开放'),
+    syncKV('当前状态',statusMap[r.status]||r.status||'未知',r.failure_streak?`连续失败 ${fmtNum(r.failure_streak)} 次`:'游标只在整小时证据原子发布后前进'),
+    syncKV('历史覆盖',expected?`${fmtNum(completed)}/${fmtNum(expected)} 小时 · ${percent.toFixed(1)}%`:'尚无应回填小时',`起点 ${syncTime(r.start_hour)} · 安全定稿至 ${syncTime(r.finalized_through)}`),
+    syncKV('下一回填小时',syncTime(r.next_hour),r.last_completed_hour?`最近完成 ${syncTime(r.last_completed_hour)}`:'尚未完成首个小时'),
+    syncKV('注册赠送用户',`${fmtNum(r.gift_recipients)} 人`,'仅这些用户保留精确消费/退款顺序，不保存 Prompt 和 API Key'),
+    syncKV('最近成功',syncTime(r.last_success_at),r.last_attempt_at?`最近尝试 ${syncTime(r.last_attempt_at)}`:'尚未尝试'),
+    syncKV('来源版本',r.source_epoch||'—','来源保留/路由口径改变后会从起点重新签收'),
+    syncKV('最近错误',r.last_error||'无',r.last_error||'失败不会跳过小时，也不会发布半成品')
+  ].join('');
+  return level;
+}
 function syncRenderStability(health){
   const h=health||{},migration=h.problem_migration||{},hourly=h.hourly_migration||null,evidence=h.nginx_evidence||{};
   const explicitlyDisabled=h.enabled===false&&!h.nginx_enabled&&!h.ecs_logs?.enabled;
@@ -2234,12 +2329,13 @@ function syncSectionError(section,label,target){
   return true;
 }
 function syncRender(data){
-  const runtime=data.runtime||{},usage=data.usage||{},stability=data.stability||{},upstream=data.upstream||{},costClosure=data.cost_closure||{};
-  const ready=runtime.data||{},facts=usage.data||{},history=facts.history||{},health=stability.data||{},channels=upstream.data||{},cost=costClosure.data||{};
+  const runtime=data.runtime||{},usage=data.usage||{},stability=data.stability||{},upstream=data.upstream||{},costClosure=data.cost_closure||{},finance=data.finance||{};
+  const ready=runtime.data||{},facts=usage.data||{},history=facts.history||{},health=stability.data||{},channels=upstream.data||{},cost=costClosure.data||{},financeFacts=finance.data||{};
   const runtimeLevel=syncSectionError(runtime,'采集服务与本地存储','syncRuntime')?'warn':syncRenderRuntime(ready,facts);
   const factsLevel=syncSectionError(usage,'用户用量事实','syncFacts')?'warn':syncRenderFacts(facts,history);
   const channelsLevel=syncSectionError(upstream,'上游账户同步','syncChannels')?'warn':syncRenderChannels(channels);
   const costLevel=syncSectionError(costClosure,'渠道成本闭环','syncCostClosure')?'warn':syncRenderCostClosure(cost);
+  const financeLevel=syncSectionError(finance,'经营核算事实','syncFinanceFacts')?'warn':syncRenderFinanceFacts(financeFacts);
   const stabilityLevel=syncSectionError(stability,'稳定性采样','syncStability')?'warn':syncRenderStability(health);
   const readiness=ready.status==='ready'&&!(ready.degraded_reasons||[]).length?'ok':(ready.status==='not_ready'?'bad':'warn');
   document.getElementById('syncOverview').innerHTML=[
@@ -2247,9 +2343,10 @@ function syncRender(data){
     syncCard(factsLevel,'用户用量事实',factsLevel==='neutral'?'未启用':(facts.facts&&facts.facts.read_active?`${fmtNum(history.published_members||0)}/${fmtNum(history.total_members||0)} 成员可用`:'近期窗口同步中'),factsLevel==='neutral'?'本地已有事实保持不变':`全历史归档 ${(+history.coverage_percent||0).toFixed(1)}% · ${fmtNum(history.live_ready_members||0)}/${fmtNum(history.total_members||0)} 实时追平`),
     syncCard(channelsLevel,'上游账户同步',channels.enabled?`${(channels.domains||[]).filter(x=>x.upstream&&x.upstream.configured).length} 个账户`:'未启用',channels.enabled?'余额、当天消费水位和历史补数独立展示':'当前不会访问任何上游'),
     syncCard(costLevel,'渠道成本与利润',cost.enabled?`${fmtNum(cost.profit_known_hours||0)}/${fmtNum(cost.manifest_hours||0)} 小时可判定`:'未启用',cost.enabled?`未归属来源 ${fmtNum(cost.unallocated_sources||0)} · 重算 ${fmtNum((+cost.cost_dirty||0)+(+cost.economics_dirty||0))}`:'采集与报表均保持关闭'),
+    syncCard(financeLevel,'经营核算事实',financeFacts.enabled?`${(+financeFacts.progress_percent||0).toFixed(1)}%`:'未启用',financeFacts.enabled?`${fmtNum(financeFacts.completed_hours||0)}/${fmtNum(financeFacts.expected_hours||0)} 小时 · ${syncTime(financeFacts.next_hour)} 起待补`:'不会访问来源库'),
     syncCard(stabilityLevel,'稳定性采样',stabilityLevel==='neutral'?'未启用':(health.status||'未启用'),stabilityLevel==='neutral'?'当前没有稳定性采集任务':(health.problem_live_lag_sec?`问题 Tail 延迟 ${usageFactsDuration(health.problem_live_lag_sec)}`:'历史日志采样状态已检查'))
   ].join('');
-  const sectionErrors=[runtime,usage,stability,upstream,costClosure].filter(x=>!x.available).map(x=>x.error||'状态暂不可用');
+  const sectionErrors=[runtime,usage,stability,upstream,costClosure,finance].filter(x=>!x.available).map(x=>x.error||'状态暂不可用');
   document.getElementById('syncError').innerHTML=sectionErrors.length?`<div class="usage-facts-state warn"><b>部分状态暂不可用</b><span>${sectionErrors.map(esc).join('；')}</span></div>`:'';
   document.getElementById('syncUpdated').textContent='本地状态快照：'+syncTime(data.snapshot_at);
 }
@@ -3570,7 +3667,7 @@ setSeg();const _mePromise=loadMe();load();schedule();
 document.querySelectorAll('#longSeg a').forEach(a=>{a.href='javascript:void 0';a.classList.toggle('active',+a.dataset.d===longDays);a.addEventListener('click',e=>{e.preventDefault();longDays=+a.dataset.d;document.querySelectorAll('#longSeg a').forEach(x=>x.classList.toggle('active',x===a));loadLongTrend();});});
 loadLongTrend();
 // 默认落在「用户用量」;URL hash 带 tab(从报警设置返回/手动刷新)则恢复到该 tab。等 IS_ROOT 就位再渲染,模型/服务端数据后台预载
-_mePromise.finally(()=>{const q=monitorHashParams(),tab=q.get('tab');const target=/^(sync|model|server|capacity|usage|stability|channels|logchain|group-governance)$/.test(tab||'')?tab:'usage';switchTab(target,true);window.dispatchEvent(new CustomEvent('monitor:navigate',{detail:{tab:target,context:window.monitorNavigationContext()}}))});
+_mePromise.finally(()=>{const q=monitorHashParams(),tab=q.get('tab');const target=/^(sync|model|server|capacity|usage|stability|channels|finance|logchain|group-governance)$/.test(tab||'')?tab:'usage';switchTab(target,true);window.dispatchEvent(new CustomEvent('monitor:navigate',{detail:{tab:target,context:window.monitorNavigationContext()}}))});
 </script>
 </body>
 </html>

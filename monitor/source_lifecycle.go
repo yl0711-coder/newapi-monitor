@@ -852,6 +852,9 @@ func (m *Monitor) startSourceEpoch(ctx context.Context, group *sourceEpochGroup)
 		if m.usageFactsFullHistoryEnabled() {
 			group.Go(ctx, func(workerCtx context.Context) { m.superviseUsageFactHistoryWorker(workerCtx) })
 		}
+		if m.financeFactsSyncEnabled() {
+			group.Go(ctx, func(workerCtx context.Context) { m.runFinanceFactsSync(workerCtx) })
+		}
 	}
 	// 上游账户 worker 同样只在持 lease 的 epoch 中运行，避免
 	// 多 Monitor 实例重复轮询触发上游风控。其内部 goroutine 在

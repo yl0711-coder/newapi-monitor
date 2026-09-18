@@ -14,7 +14,7 @@ export function checkDependencyListing(listing) {
 export function checkDependencies(run = spawnSync) {
   // Include transitive and test dependencies. Match the supported production target,
   // not the developer laptop's OS. Never inspect partial output from a failed go list.
-  const result = run('go', ['list', '-mod=readonly', '-deps', '-test', '-f', '{{.ImportPath}}', './...'], {
+  const result = run('go', ['list', '-buildvcs=false', '-mod=readonly', '-deps', '-test', '-f', '{{.ImportPath}}', './...'], {
     encoding: 'utf8', maxBuffer: 16 * 1024 * 1024,
     env: { ...process.env, GOOS: 'linux', GOARCH: 'amd64', CGO_ENABLED: '0' },
   });

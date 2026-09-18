@@ -8,6 +8,8 @@
 !go.sum
 !main.go
 !restore_command.go
+!finance_backfill_command.go
+!stability_backfill_command.go
 !monitor/
 monitor/**
 !monitor/*.go
@@ -23,6 +25,12 @@ internal/**
 !internal/trafficclass/
 internal/trafficclass/**
 !internal/trafficclass/*.go
+!internal/financecredit/
+internal/financecredit/**
+!internal/financecredit/*.go
+!internal/financecur/
+internal/financecur/**
+!internal/financecur/*.go
 !internal/ecslogagent/
 internal/ecslogagent/**
 !internal/ecslogagent/*.go

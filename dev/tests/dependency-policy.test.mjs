@@ -17,6 +17,7 @@ test('OpenPGP gate fails closed when Go is missing or inventory is partial', () 
   assert.equal(checkDependencies((command, args, options) => {
     assert.equal(command, 'go');
     assert.ok(args.includes('-deps') && args.includes('-test') && args.includes('-mod=readonly'));
+    assert.ok(args.includes('-buildvcs=false'));
     assert.equal(options.env.GOOS, 'linux');
     assert.equal(options.env.GOARCH, 'amd64');
     return { status: 0, stdout: 'fmt\n' };

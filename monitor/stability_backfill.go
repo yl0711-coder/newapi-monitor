@@ -98,6 +98,66 @@ type StabilityBackfillJob struct {
 	LastError                 string  `gorm:"size:512;column:last_error" json:"last_error,omitempty"`
 }
 
+// RunBoundedStabilityBackfill synchronously reuses the production stability
+// repair algorithm for a small, explicit maintenance range. It starts no HTTP
+// listener or background worker and still requires the configured source
+// lease, so it is safe for an isolated local acceptance container.
+func (m *Monitor) RunBoundedStabilityBackfill(ctx context.Context, fromTs, toTs int64) (StabilityBackfillJob, error) {
+	var result StabilityBackfillJob
+	if m == nil || !m.cfg.StabilityBackfillEnabled {
+		return result, errStabilityBackfillDisabled
+	}
+	fromTs, toTs = fromTs/3600*3600, toTs/3600*3600
+	if fromTs < 0 || toTs <= fromTs || toTs-fromTs > 72*3600 {
+		return result, errors.New("稳定性维护补数范围必须是 1～72 个完整小时")
+	}
+	if err := m.pingSource(ctx); err != nil {
+		return result, fmt.Errorf("稳定性来源探测: %w", err)
+	}
+	lease, acquired, err := m.acquireSourceLease(ctx)
+	if err != nil {
+		return result, fmt.Errorf("获取稳定性来源租约: %w", err)
+	}
+	if !acquired {
+		return result, errors.New("稳定性来源租约已被占用")
+	}
+	m.setSourceState(sourceStateReady)
+	m.sourceLeaseHeld.Store(m.cfg.sourceLeaseIsRequired())
+	defer func() {
+		m.sourceLeaseHeld.Store(false)
+		m.setSourceState(sourceStateDisabled)
+	}()
+	if lease != nil {
+		defer func() { _ = lease.Release() }()
+	}
+	if !m.stabilityBackfillRunning.CompareAndSwap(false, true) {
+		return result, errors.New("已有稳定性历史补数正在执行")
+	}
+	id, err := newStabilityBackfillID()
+	if err != nil {
+		m.stabilityBackfillRunning.Store(false)
+		return result, err
+	}
+	now := time.Now().Unix()
+	result = StabilityBackfillJob{
+		ID: id, Kind: stabilityManualJobKind, FromTs: fromTs, ToTs: toTs, Status: "queued",
+		TotalHours: int((toTs - fromTs) / 3600), CurrentBatchHours: 2, UpdatedAt: now,
+	}
+	m.refreshStabilityJobProgress(&result, 2, now)
+	if err := m.storeDB.WithContext(ctx).Create(&result).Error; err != nil {
+		m.stabilityBackfillRunning.Store(false)
+		return result, err
+	}
+	m.runStabilityBackfillWithFetcher(ctx, result.ID, m.fetchStabilityRange)
+	if err := m.storeDB.WithContext(ctx).First(&result, "id = ?", result.ID).Error; err != nil {
+		return result, err
+	}
+	if result.Status != "complete" {
+		return result, fmt.Errorf("稳定性维护补数结束状态为 %s: %s", result.Status, result.LastError)
+	}
+	return result, nil
+}
+
 // StabilityDataCoverage 是报表口径的数据完整率，不是“筛选结果占全量”的比例。
 type StabilityDataCoverage struct {
 	FromTs                int64   `json:"from_ts"`
@@ -149,7 +209,10 @@ func stabilityRetentionCutoff(now int64, days int) int64 {
 func stabilityCompleteHourPredicateSQL(alias string) string {
 	return alias + `.status = 'complete' AND ` + alias + `.traffic_class_version = ? AND NOT (` +
 		alias + `.requests = 0 AND EXISTS (` +
-		`SELECT 1 FROM metric_samples ms WHERE ms.bucket_ts >= ` + alias + `.hour_ts ` +
+		// SQLite otherwise prefers the low-selectivity traffic-class index and
+		// re-scans the entire minute fact table for every zero-traffic hour. The
+		// bucket index is the selective key for this correlated hour lookup.
+		`SELECT 1 FROM metric_samples ms INDEXED BY idx_metric_bucket WHERE ms.bucket_ts >= ` + alias + `.hour_ts ` +
 		`AND ms.bucket_ts < ` + alias + `.hour_ts + 3600 AND ms.traffic_class_version = ? ` +
 		`AND (ms.success + ms.anomaly + ms.failed) > 0))`
 }
@@ -215,7 +278,7 @@ func (m *Monitor) stabilityDataCoverage(ctx context.Context, fromTs, toTs, now i
 	FROM stability_hour_ingest_states hs
 	WHERE hs.hour_ts >= ? AND hs.hour_ts < ? AND hs.status = 'complete'
 		AND ((hs.traffic_class_version = ? AND NOT (hs.requests = 0 AND EXISTS (
-			SELECT 1 FROM metric_samples ms WHERE ms.bucket_ts >= hs.hour_ts AND ms.bucket_ts < hs.hour_ts + 3600
+			SELECT 1 FROM metric_samples ms INDEXED BY idx_metric_bucket WHERE ms.bucket_ts >= hs.hour_ts AND ms.bucket_ts < hs.hour_ts + 3600
 				AND ms.traffic_class_version = ? AND (ms.success + ms.anomaly + ms.failed) > 0))) OR (
 			COALESCE(hs.traffic_class_version,0) <> ?
 			AND NOT EXISTS (SELECT 1 FROM stability_hour_ingest_states v5hs

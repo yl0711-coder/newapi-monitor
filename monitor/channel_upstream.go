@@ -301,39 +301,45 @@ type ChannelUpstreamAccountView struct {
 	UsageAdapterName              string                            `json:"usage_adapter_name,omitempty"`
 	UsageTailMode                 string                            `json:"usage_tail_mode,omitempty"`
 	UsageGranularity              string                            `json:"usage_granularity,omitempty"`
-	PricingLedgerWorkerEnabled    bool                              `json:"pricing_ledger_worker_enabled"`
-	PricingLedgerEligible         bool                              `json:"pricing_ledger_eligible"`
-	PricingLedgerCapability       string                            `json:"pricing_ledger_capability,omitempty"`
-	PricingLedgerStatus           string                            `json:"pricing_ledger_status,omitempty"`
-	PricingTailThroughHour        int64                             `json:"pricing_tail_through_hour,omitempty"`
-	PricingBackfillStartHour      int64                             `json:"pricing_backfill_start_hour,omitempty"`
-	PricingBackfillNextHour       int64                             `json:"pricing_backfill_next_hour,omitempty"`
-	PricingBackfillTargetHour     int64                             `json:"pricing_backfill_target_hour,omitempty"`
-	PricingBackfillTotalHours     int64                             `json:"pricing_backfill_total_hours,omitempty"`
-	PricingBackfillDone           bool                              `json:"pricing_backfill_done,omitempty"`
-	PricingTailNextSyncAt         int64                             `json:"pricing_tail_next_sync_at,omitempty"`
-	PricingBackfillNextSyncAt     int64                             `json:"pricing_backfill_next_sync_at,omitempty"`
-	PricingLastAttemptAt          int64                             `json:"pricing_last_attempt_at,omitempty"`
-	PricingLastSuccessAt          int64                             `json:"pricing_last_success_at,omitempty"`
-	PricingLastError              string                            `json:"pricing_last_error,omitempty"`
-	PricingProgress               string                            `json:"pricing_progress,omitempty"`
-	PricingVerifiedHours          int64                             `json:"pricing_verified_hours,omitempty"`
-	PricingPendingHours           int64                             `json:"pricing_pending_hours,omitempty"`
-	PricingMismatchHours          int64                             `json:"pricing_mismatch_hours,omitempty"`
-	ErrorLogWorkerEnabled         bool                              `json:"error_log_worker_enabled"`
-	ErrorLogSelected              bool                              `json:"error_log_selected"`
-	ErrorLogStatus                string                            `json:"error_log_status,omitempty"`
-	ErrorLogLastAttemptAt         int64                             `json:"error_log_last_attempt_at,omitempty"`
-	ErrorLogLastSuccessAt         int64                             `json:"error_log_last_success_at,omitempty"`
-	ErrorLogNextSyncAt            int64                             `json:"error_log_next_sync_at,omitempty"`
-	ErrorLogCoverageFrom          int64                             `json:"error_log_coverage_from,omitempty"`
-	ErrorLogSyncedUntil           int64                             `json:"error_log_synced_until,omitempty"`
-	ErrorLogWindowFrom            int64                             `json:"error_log_window_from,omitempty"`
-	ErrorLogWindowTo              int64                             `json:"error_log_window_to,omitempty"`
-	ErrorLogRowsTotal             int64                             `json:"error_log_rows_total,omitempty"`
-	ErrorLogConsecutiveFails      int                               `json:"error_log_consecutive_fails,omitempty"`
-	ErrorLogLastError             string                            `json:"error_log_last_error,omitempty"`
-	ErrorLogUnresolvedFields      string                            `json:"error_log_unresolved_fields,omitempty"`
+	// FinanceRequiredFrom is an internal, report-scoped lower bound. Channel
+	// management leaves it zero and therefore continues to verify the exact
+	// operator-requested window. Finance sets it to the first local customer,
+	// internal-test, or non-zero upstream activity so an unused account does not
+	// create a fictional pre-activation gap. It is never persisted or exposed.
+	FinanceRequiredFrom        int64  `json:"-"`
+	PricingLedgerWorkerEnabled bool   `json:"pricing_ledger_worker_enabled"`
+	PricingLedgerEligible      bool   `json:"pricing_ledger_eligible"`
+	PricingLedgerCapability    string `json:"pricing_ledger_capability,omitempty"`
+	PricingLedgerStatus        string `json:"pricing_ledger_status,omitempty"`
+	PricingTailThroughHour     int64  `json:"pricing_tail_through_hour,omitempty"`
+	PricingBackfillStartHour   int64  `json:"pricing_backfill_start_hour,omitempty"`
+	PricingBackfillNextHour    int64  `json:"pricing_backfill_next_hour,omitempty"`
+	PricingBackfillTargetHour  int64  `json:"pricing_backfill_target_hour,omitempty"`
+	PricingBackfillTotalHours  int64  `json:"pricing_backfill_total_hours,omitempty"`
+	PricingBackfillDone        bool   `json:"pricing_backfill_done,omitempty"`
+	PricingTailNextSyncAt      int64  `json:"pricing_tail_next_sync_at,omitempty"`
+	PricingBackfillNextSyncAt  int64  `json:"pricing_backfill_next_sync_at,omitempty"`
+	PricingLastAttemptAt       int64  `json:"pricing_last_attempt_at,omitempty"`
+	PricingLastSuccessAt       int64  `json:"pricing_last_success_at,omitempty"`
+	PricingLastError           string `json:"pricing_last_error,omitempty"`
+	PricingProgress            string `json:"pricing_progress,omitempty"`
+	PricingVerifiedHours       int64  `json:"pricing_verified_hours,omitempty"`
+	PricingPendingHours        int64  `json:"pricing_pending_hours,omitempty"`
+	PricingMismatchHours       int64  `json:"pricing_mismatch_hours,omitempty"`
+	ErrorLogWorkerEnabled      bool   `json:"error_log_worker_enabled"`
+	ErrorLogSelected           bool   `json:"error_log_selected"`
+	ErrorLogStatus             string `json:"error_log_status,omitempty"`
+	ErrorLogLastAttemptAt      int64  `json:"error_log_last_attempt_at,omitempty"`
+	ErrorLogLastSuccessAt      int64  `json:"error_log_last_success_at,omitempty"`
+	ErrorLogNextSyncAt         int64  `json:"error_log_next_sync_at,omitempty"`
+	ErrorLogCoverageFrom       int64  `json:"error_log_coverage_from,omitempty"`
+	ErrorLogSyncedUntil        int64  `json:"error_log_synced_until,omitempty"`
+	ErrorLogWindowFrom         int64  `json:"error_log_window_from,omitempty"`
+	ErrorLogWindowTo           int64  `json:"error_log_window_to,omitempty"`
+	ErrorLogRowsTotal          int64  `json:"error_log_rows_total,omitempty"`
+	ErrorLogConsecutiveFails   int    `json:"error_log_consecutive_fails,omitempty"`
+	ErrorLogLastError          string `json:"error_log_last_error,omitempty"`
+	ErrorLogUnresolvedFields   string `json:"error_log_unresolved_fields,omitempty"`
 }
 
 // AICodeWithKeySlotView is the non-secret identity of one configured key.
@@ -362,6 +368,7 @@ type channelUpstreamSaveInput struct {
 	Enabled           *bool                        `json:"enabled"`
 	UserID            int64                        `json:"user_id"`
 	AccessToken       string                       `json:"access_token"`
+	SessionID         string                       `json:"session_id"`
 	APIKey            string                       `json:"api_key"`
 	APIKeys           []string                     `json:"api_keys"`
 	AddAPIKeys        []string                     `json:"add_api_keys"`
@@ -393,6 +400,8 @@ type channelUpstreamConfigView struct {
 
 type newAPICredential struct {
 	AccessToken string `json:"access_token"`
+	SessionID   string `json:"session_id,omitempty"`
+	ExpiresAt   int64  `json:"expires_at,omitempty"`
 }
 
 type sub2APICredential struct {
@@ -864,10 +873,10 @@ func applyAICodeWithSlotChanges(existing aiCodeWithCredential, additions []aicod
 func upstreamCredentialSecrets(credential any) []string {
 	switch cred := credential.(type) {
 	case newAPICredential:
-		return []string{cred.AccessToken}
+		return []string{cred.AccessToken, cred.SessionID}
 	case *newAPICredential:
 		if cred != nil {
-			return []string{cred.AccessToken}
+			return []string{cred.AccessToken, cred.SessionID}
 		}
 	case sub2APICredential:
 		return []string{cred.AccessToken, cred.RefreshToken}
@@ -1749,9 +1758,35 @@ func decodeNewAPIData(body []byte, out any) error {
 }
 
 func syncNewAPIBalance(ctx context.Context, client *http.Client, row ChannelUpstreamAccount, cred newAPICredential) (upstreamBalanceResult, newAPICredential, error) {
-	if strings.TrimSpace(cred.AccessToken) == "" {
-		return upstreamBalanceResult{}, cred, &upstreamAuthError{err: fmt.Errorf("NewAPI 访问令牌为空，请重新连接")}
+	refreshed := false
+	if strings.TrimSpace(cred.AccessToken) == "" || (cred.ExpiresAt > 0 && cred.ExpiresAt <= time.Now().Add(2*time.Minute).Unix()) {
+		if strings.TrimSpace(cred.SessionID) == "" {
+			return upstreamBalanceResult{}, cred, &upstreamAuthError{err: fmt.Errorf("NewAPI 访问令牌为空或已过期，请重新连接")}
+		}
+		updated, err := refreshNewAPICredential(ctx, client, row, cred)
+		if err != nil {
+			return upstreamBalanceResult{}, cred, err
+		}
+		cred, refreshed = updated, true
 	}
+	result, err := fetchNewAPIBalance(ctx, client, row, cred)
+	if err == nil {
+		return result, cred, nil
+	}
+	var authErr *upstreamAuthError
+	if refreshed || strings.TrimSpace(cred.SessionID) == "" || !errors.As(err, &authErr) {
+		return upstreamBalanceResult{}, cred, err
+	}
+	updated, refreshErr := refreshNewAPICredential(ctx, client, row, cred)
+	if refreshErr != nil {
+		return upstreamBalanceResult{}, cred, refreshErr
+	}
+	cred = updated
+	result, err = fetchNewAPIBalance(ctx, client, row, cred)
+	return result, cred, err
+}
+
+func fetchNewAPIBalance(ctx context.Context, client *http.Client, row ChannelUpstreamAccount, cred newAPICredential) (upstreamBalanceResult, error) {
 	headers := map[string]string{
 		"Authorization": "Bearer " + cred.AccessToken,
 		"New-Api-User":  strconv.FormatInt(row.UserID, 10),
@@ -1760,19 +1795,19 @@ func syncNewAPIBalance(ctx context.Context, client *http.Client, row ChannelUpst
 	if err != nil {
 		var statusErr *upstreamHTTPError
 		if errors.As(err, &statusErr) && (statusErr.Status == http.StatusUnauthorized || statusErr.Status == http.StatusForbidden) {
-			return upstreamBalanceResult{}, cred, &upstreamAuthError{err: err}
+			return upstreamBalanceResult{}, &upstreamAuthError{err: err}
 		}
-		return upstreamBalanceResult{}, cred, err
+		return upstreamBalanceResult{}, err
 	}
 	var profile struct {
 		Quota json.RawMessage `json:"quota"`
 	}
 	if err := decodeNewAPIData(body, &profile); err != nil {
-		return upstreamBalanceResult{}, cred, err
+		return upstreamBalanceResult{}, err
 	}
 	quota, err := rawJSONNumber(profile.Quota)
 	if err != nil {
-		return upstreamBalanceResult{}, cred, fmt.Errorf("NewAPI 未返回有效账户余额")
+		return upstreamBalanceResult{}, fmt.Errorf("NewAPI 未返回有效账户余额")
 	}
 	// A transient /api/status failure must not replace a previously verified
 	// conversion unit with the fallback. Mixing units across adjacent usage
@@ -1792,9 +1827,79 @@ func syncNewAPIBalance(ctx context.Context, client *http.Client, row ChannelUpst
 		}
 	}
 	if unit <= 0 {
-		return upstreamBalanceResult{}, cred, fmt.Errorf("NewAPI 额度换算单位无效")
+		return upstreamBalanceResult{}, fmt.Errorf("NewAPI 额度换算单位无效")
 	}
-	return upstreamBalanceResult{BalanceUSD: quota / unit, BalanceRaw: quota, BalanceUnit: unit, UnitAssumed: assumed}, cred, nil
+	return upstreamBalanceResult{BalanceUSD: quota / unit, BalanceRaw: quota, BalanceUnit: unit, UnitAssumed: assumed}, nil
+}
+
+func newAPIAccessExpiry(raw json.RawMessage) int64 {
+	value, err := rawJSONNumber(raw)
+	if err != nil || value <= 0 || value > math.MaxInt64 {
+		return 0
+	}
+	expires := int64(value)
+	// Browser stores commonly expose epoch milliseconds; Monitor stores seconds.
+	if expires > 10_000_000_000 {
+		expires /= 1000
+	}
+	return expires
+}
+
+func newAPIRefreshSessionID(raw json.RawMessage, fallback string) string {
+	if len(raw) == 0 || string(raw) == "null" {
+		return fallback
+	}
+	var session string
+	if raw[0] == '"' {
+		if json.Unmarshal(raw, &session) == nil && strings.TrimSpace(session) != "" {
+			return strings.TrimSpace(session)
+		}
+		return fallback
+	}
+	var value struct {
+		SID       string `json:"sid"`
+		SessionID string `json:"session_id"`
+	}
+	if json.Unmarshal(raw, &value) != nil {
+		return fallback
+	}
+	if session = strings.TrimSpace(value.SID); session != "" {
+		return session
+	}
+	if session = strings.TrimSpace(value.SessionID); session != "" {
+		return session
+	}
+	return fallback
+}
+
+func refreshNewAPICredential(ctx context.Context, client *http.Client, row ChannelUpstreamAccount, cred newAPICredential) (newAPICredential, error) {
+	if strings.TrimSpace(cred.SessionID) == "" {
+		return cred, &upstreamAuthError{err: fmt.Errorf("NewAPI 站点未配置可续期会话，请重新连接")}
+	}
+	body, err := doUpstreamJSON(ctx, client, http.MethodPost, upstreamEndpoint(row.BaseURL, "/api/user/auth/refresh"), map[string]string{
+		"X-Auth-Session": cred.SessionID,
+	}, nil)
+	if err != nil {
+		return cred, &upstreamAuthError{err: err}
+	}
+	var refreshed struct {
+		AccessToken     string          `json:"access_token"`
+		AccessExpiresAt json.RawMessage `json:"access_expires_at"`
+		Session         json.RawMessage `json:"session"`
+	}
+	if err := decodeNewAPIData(body, &refreshed); err != nil {
+		return cred, &upstreamAuthError{err: err}
+	}
+	refreshed.AccessToken = strings.TrimSpace(refreshed.AccessToken)
+	if refreshed.AccessToken == "" {
+		return cred, &upstreamAuthError{err: fmt.Errorf("NewAPI 续期接口未返回访问令牌")}
+	}
+	updated := newAPICredential{
+		AccessToken: refreshed.AccessToken,
+		SessionID:   newAPIRefreshSessionID(refreshed.Session, cred.SessionID),
+		ExpiresAt:   newAPIAccessExpiry(refreshed.AccessExpiresAt),
+	}
+	return updated, nil
 }
 
 func decodeAICodeWithBalance(body []byte) (float64, string, error) {
@@ -2797,8 +2902,16 @@ func validateChannelUpstreamInput(in *channelUpstreamSaveInput) error {
 	in.Provider = strings.ToLower(strings.TrimSpace(in.Provider))
 	in.Email = strings.TrimSpace(in.Email)
 	in.AccessToken = strings.TrimSpace(in.AccessToken)
+	var err error
+	in.SessionID, err = normalizeNewAPISessionID(in.SessionID)
+	if err != nil {
+		return err
+	}
 	in.APIKey = strings.TrimSpace(in.APIKey)
 	in.RefreshToken = strings.TrimSpace(in.RefreshToken)
+	if in.Provider != upstreamProviderNewAPI && in.SessionID != "" {
+		return fmt.Errorf("NewAPI 会话 SID 不适用于当前中转站类型")
+	}
 	if in.Domain == "" || len(in.Domain) > 253 || normalizeChannelBaseDomain(in.Domain) != in.Domain {
 		return fmt.Errorf("主域名无效")
 	}
@@ -2881,6 +2994,30 @@ func validateChannelUpstreamInput(in *channelUpstreamSaveInput) error {
 	return nil
 }
 
+func normalizeNewAPISessionID(raw string) (string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", nil
+	}
+	if strings.HasPrefix(raw, "{") {
+		var session struct {
+			SID       string `json:"sid"`
+			SessionID string `json:"session_id"`
+		}
+		if err := json.Unmarshal([]byte(raw), &session); err != nil {
+			return "", fmt.Errorf("NewAPI 会话 JSON 无效")
+		}
+		raw = strings.TrimSpace(session.SID)
+		if raw == "" {
+			raw = strings.TrimSpace(session.SessionID)
+		}
+	}
+	if raw == "" || len(raw) > 2048 || strings.IndexFunc(raw, unicode.IsControl) >= 0 {
+		return "", fmt.Errorf("NewAPI 会话 SID 无效")
+	}
+	return raw, nil
+}
+
 func (m *Monitor) channelDomainExists(ctx context.Context, domain string) (bool, error) {
 	var count int64
 	err := m.storeDB.WithContext(ctx).Model(&ChannelSnap{}).Where("base_domain = ?", domain).Count(&count).Error
@@ -2941,7 +3078,7 @@ func (m *Monitor) saveChannelUpstreamHandler(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	requestSecrets := []string{in.AccessToken, in.APIKey, in.Password, in.RefreshToken}
+	requestSecrets := []string{in.AccessToken, in.SessionID, in.APIKey, in.Password, in.RefreshToken}
 	requestSecrets = append(requestSecrets, in.APIKeys...)
 	requestSecrets = append(requestSecrets, in.AddAPIKeys...)
 	for _, addition := range in.AddAPIKeySlots {
@@ -3001,7 +3138,7 @@ func (m *Monitor) saveChannelUpstreamHandler(c *gin.Context) {
 	var existingAICodeWithCredential *aiCodeWithCredential
 	preserveSealedCredential := false
 	economicUnitChanged := false
-	credentialUpdated := in.AccessToken != "" || len(in.APIKeys) > 0 || len(in.AddAPIKeys) > 0 || len(in.AddAPIKeySlots) > 0 || len(in.RemoveAPIKeyIDs) > 0 || in.Password != "" || in.RefreshToken != ""
+	credentialUpdated := in.AccessToken != "" || in.SessionID != "" || len(in.APIKeys) > 0 || len(in.AddAPIKeys) > 0 || len(in.AddAPIKeySlots) > 0 || len(in.RemoveAPIKeyIDs) > 0 || in.Password != "" || in.RefreshToken != ""
 	credentialMetadataChanged := len(in.RenameAPIKeySlots) > 0
 	sameIdentity := existingErr == nil && existing.Provider == in.Provider && existing.BaseURL == in.BaseURL
 	credentialSetChanged := false
@@ -3010,8 +3147,20 @@ func (m *Monitor) saveChannelUpstreamHandler(c *gin.Context) {
 		row.UserID = in.UserID
 		row.Account = strconv.FormatInt(in.UserID, 10)
 		sameIdentity = sameIdentity && existing.UserID == in.UserID
-		if in.AccessToken != "" {
-			credential = newAPICredential{AccessToken: in.AccessToken}
+		if in.AccessToken != "" || in.SessionID != "" {
+			current := newAPICredential{}
+			if sameIdentity {
+				if loaded, loadErr := m.credentialForAccount(existing); loadErr == nil {
+					current, _ = loaded.(newAPICredential)
+				}
+			}
+			if in.AccessToken != "" {
+				current.AccessToken, current.ExpiresAt = in.AccessToken, 0
+			}
+			if in.SessionID != "" {
+				current.SessionID = in.SessionID
+			}
+			credential = current
 		} else if sameIdentity && !row.Enabled {
 			row.Credential, row.CredentialVersion = existing.Credential, existing.CredentialVersion
 			preserveSealedCredential = true
@@ -3165,6 +3314,7 @@ func (m *Monitor) saveChannelUpstreamHandler(c *gin.Context) {
 	in.Password = ""
 	in.RefreshToken = ""
 	in.AccessToken = ""
+	in.SessionID = ""
 	in.APIKey = ""
 	in.APIKeys = nil
 	in.AddAPIKeys = nil

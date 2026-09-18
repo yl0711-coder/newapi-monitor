@@ -89,6 +89,17 @@ func TestChannelEconomicsReportUsesManifestAuthoritativeEpoch(t *testing.T) {
 	if len(report.Domains) != 1 || len(report.Domains[0].Channels) != 1 || report.Domains[0].Channels[0].ChannelID != 60 {
 		t.Fatalf("stale epoch leaked into report: %+v", report.Domains)
 	}
+	if len(report.Daily) != 0 {
+		t.Fatalf("regular channel report unexpectedly included finance-only daily payload: %+v", report.Daily)
+	}
+	m.cfg.FinanceEnabled = true
+	financeReport, err := m.buildChannelEconomicsReportMode(context.Background(), stabilityScope{FromTs: hour, ToTs: hour + 3600}, "", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(financeReport.Daily) != 1 || !financeReport.Daily[0].Coverage.Complete || financeReport.Daily[0].Totals.PairedRevenue.MicroUSD != "2000000" || financeReport.Daily[0].Totals.PairedCorrectedCost.MicroUSD != "1000000" {
+		t.Fatalf("daily immutable economics projection mismatch: %+v", financeReport.Daily)
+	}
 }
 
 func TestChannelEconomicsReportManifestProvesZeroHour(t *testing.T) {

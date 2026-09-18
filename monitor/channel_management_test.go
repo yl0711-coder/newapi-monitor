@@ -150,11 +150,25 @@ func TestChannelManagementPricingEvidenceWorkflowIsOperable(t *testing.T) {
 		`fetch('/channels/cost/sources?'`,
 		`fetch('/channels/cost/proposals?'`,
 		`fetch('/channels/cost/bindings'`,
+		`fetch('/channels/cost/historical-bindings/preview'`,
+		`fetch('/channels/cost/historical-bindings'`,
+		`fetch('/channels/cost/source-ownership/inspect?`,
+		`精确核对令牌归属`,
+		`已作为候选预填，回填前仍会校验历史时段证据`,
+		`const suggestedChannelID=!binding&&candidateAvailable`,
+		`cmUpstreamSessionID`,
+		`payload.session_id=`,
+		`window.channelManagementOpenCostSource`,
+		`prepareCostLedgerNavigation()`,
+		`focusNavigatedCostSource()`,
+		`.cm-cost-source.navigation-focus`,
+		`核对结果仅供人工确认，不会自动写入`,
 		`'/decisions'`,
 		`'/cancel'`,
 		`审批并排期`,
 		`排期回滚`,
 		`自动发现只生成候选`,
+		`回填影响预演`,
 		`costClosureAllowed(domain)`,
 		`costClosureRecoveryAllowed(domain)`,
 		`capability?.recovery_domains`,
@@ -178,6 +192,7 @@ func TestChannelManagementPricingEvidenceWorkflowIsOperable(t *testing.T) {
 		`.cm-cost-ledger`,
 		`.cm-pricing-proposal`,
 		`.cm-finance-version`,
+		`.cm-cost-ownership`,
 	} {
 		if !strings.Contains(js, marker) && !strings.Contains(css, marker) {
 			t.Fatalf("渠道计价证据闭环缺少 %q", marker)
@@ -836,6 +851,9 @@ func TestBuildChannelManagementReportGroupsDomainVendorChannelAndServiceGroup(t 
 	if last == nil || !hasUnconfigured || !hasHistorical {
 		t.Fatalf("domains=%+v", report.Domains)
 	}
+	if got := report.Domains[len(report.Domains)-1]; got.Domain != "other.ai" || !got.ManuallyDisabled {
+		t.Fatalf("全手动禁用上游未在报表末尾标记: %+v", got)
+	}
 	if last.Usage.Requests != 17 || len(last.Vendors) != 2 || len(last.Groups) != 2 {
 		t.Fatalf("last domain=%+v", last)
 	}
@@ -1051,6 +1069,45 @@ func TestChannelManagementStatusRankEnabledBeforeDisabledAndHistory(t *testing.T
 	for _, tc := range cases {
 		if got := channelManagementStatusRank(&tc.channel); got != tc.want {
 			t.Fatalf("status rank(%+v)=%d want %d", tc.channel, got, tc.want)
+		}
+	}
+}
+
+func TestChannelDomainManuallyDisabledRequiresOnlyCurrentManualDisables(t *testing.T) {
+	tests := []struct {
+		name     string
+		channels []*channelManagementBuild
+		want     bool
+	}{
+		{name: "all manual", channels: []*channelManagementBuild{{Current: true, Status: 2}, {Current: true, Status: 2}}, want: true},
+		{name: "contains enabled", channels: []*channelManagementBuild{{Current: true, Status: 2}, {Current: true, Status: 1}}, want: false},
+		{name: "contains auto disabled", channels: []*channelManagementBuild{{Current: true, Status: 2}, {Current: true, Status: 3}}, want: false},
+		{name: "history ignored", channels: []*channelManagementBuild{{Current: true, Status: 2}, {Current: false, Status: 1}}, want: true},
+		{name: "history only", channels: []*channelManagementBuild{{Current: false, Status: 2}}, want: false},
+		{name: "none", channels: nil, want: false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			domain := &channelDomainBuild{Vendors: map[string]*channelVendorBuild{"vendor": {Channels: tc.channels}}}
+			if got := channelDomainManuallyDisabled(domain); got != tc.want {
+				t.Fatalf("channelDomainManuallyDisabled()=%v want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestChannelManagementManualDisabledUpstreamPresentation(t *testing.T) {
+	js := string(channelManagementJS)
+	css := string(stabilityCSS)
+	for _, marker := range []string{
+		`if(domain.manually_disabled)return 2`,
+		`Number(a.sortRank)-Number(b.sortRank)`,
+		`cm-upstream-disabled`,
+		`已禁用`,
+		`.cm-domain-card.manually-disabled`,
+	} {
+		if !strings.Contains(js, marker) && !strings.Contains(css, marker) {
+			t.Fatalf("全渠道手动禁用上游展示缺少 %q", marker)
 		}
 	}
 }

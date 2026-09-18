@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"math"
 	"net/http"
 	"sort"
 	"strconv"
@@ -15,6 +17,9 @@ import (
 )
 
 const channelCostSourceListLimit = 500
+const channelCostHistoricalBindingMaxHours = 24 * 90
+const channelCostHistoricalWeakOverlap = 0.1
+const channelCostHistoricalStrongOverlap = 0.8
 
 func (m *Monitor) channelCostAPIAllowed(domain string) bool {
 	return m.cfg.ChannelCostClosureEnabled && channelCostDomainAllowed(m.cfg.ChannelCostClosureDomains, domain)
@@ -48,6 +53,9 @@ type channelCostSourceView struct {
 	CurrentBinding          *ChannelCostSourceBinding `json:"current_binding,omitempty" gorm:"-"`
 	CurrentBindingSignature string                    `json:"current_binding_signature,omitempty" gorm:"-"`
 	AttributionState        string                    `json:"attribution_state"`
+	HistoricalBindingCount  int                       `json:"historical_binding_count" gorm:"-"`
+	HistoricalBoundFrom     int64                     `json:"historical_bound_from,omitempty" gorm:"-"`
+	HistoricalBoundTo       int64                     `json:"historical_bound_to,omitempty" gorm:"-"`
 }
 
 type channelCostSourceDimensionRow struct {
@@ -71,6 +79,54 @@ type channelCostBindingInput struct {
 	// existing binding must echo its valid_from to prevent stale-page writes.
 	ExpectedCurrentValidFrom *int64 `json:"expected_current_valid_from"`
 	ExpectedCurrentSignature string `json:"expected_current_signature"`
+}
+
+type channelCostHistoricalBindingInput struct {
+	Domain         string `json:"domain" binding:"required"`
+	AccountEpoch   string `json:"account_epoch" binding:"required"`
+	SourceRef      string `json:"source_ref" binding:"required"`
+	LocalChannelID int    `json:"local_channel_id" binding:"required"`
+	Reason         string `json:"reason" binding:"required"`
+}
+
+type channelCostHistoricalBindingPlan struct {
+	Binding                  ChannelCostSourceBinding  `json:"binding"`
+	ChannelName              string                    `json:"channel_name"`
+	EvidenceHours            int64                     `json:"evidence_hours"`
+	EvidenceRequests         int64                     `json:"evidence_requests"`
+	EvidenceBilledCost       channelEconomicsMoneyView `json:"evidence_billed_cost"`
+	LocalActiveHours         int64                     `json:"local_active_hours"`
+	LocalRequests            int64                     `json:"local_requests"`
+	LocalTestActiveHours     int64                     `json:"local_test_active_hours"`
+	LocalTestRequests        int64                     `json:"local_test_requests"`
+	ActiveEvidenceRequests   int64                     `json:"active_evidence_requests"`
+	InactiveEvidenceRequests int64                     `json:"inactive_evidence_requests"`
+	ActiveBilledCost         channelEconomicsMoneyView `json:"active_billed_cost"`
+	InactiveBilledCost       channelEconomicsMoneyView `json:"inactive_billed_cost"`
+	WillQueueHours           int64                     `json:"will_queue_hours"`
+	HasLocalActivity         bool                      `json:"has_local_activity"`
+	ActivityCoverage         float64                   `json:"activity_coverage"`
+	TestActivityCoverage     float64                   `json:"test_activity_coverage"`
+	CostActivityCoverage     float64                   `json:"cost_activity_coverage"`
+	TemporalOverlapQuality   string                    `json:"temporal_overlap_quality"`
+	RiskWarnings             []string                  `json:"risk_warnings"`
+}
+
+func historicalBindingEvidenceQuality(evidenceHours, localActiveHours int64) (float64, string, []string) {
+	if evidenceHours <= 0 {
+		return 0, "invalid", []string{"上游证据小时数无效"}
+	}
+	coverage := float64(localActiveHours) / float64(evidenceHours)
+	switch {
+	case localActiveHours == 0:
+		return coverage, "no_activity", []string{"所选本地渠道在上游证据时段内没有同小时请求，不能仅凭当前配置确认历史归属"}
+	case coverage < channelCostHistoricalWeakOverlap:
+		return coverage, "weak", []string{"本地渠道同小时活动覆盖低于 10%，历史归属证据弱，需额外核对上游令牌或账户记录"}
+	case coverage < channelCostHistoricalStrongOverlap:
+		return coverage, "review", []string{"本地渠道同小时活动覆盖不足 80%，请核对缺失时段的采集覆盖或渠道变更记录"}
+	default:
+		return coverage, "strong", nil
+	}
 }
 
 type channelFinanceActivationView struct {
@@ -297,7 +353,10 @@ func (m *Monitor) listChannelCostSourcesHandler(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "domain 无效"})
 		return
 	}
-	if !m.channelCostAPIAllowed(domain) {
+	// A local snapshot may inspect already-copied evidence and run the read-only
+	// historical preview without enabling the production rollout. All binding
+	// save handlers remain fail-closed in LocalSnapshotOnly mode.
+	if !m.cfg.LocalSnapshotOnly && !m.channelCostAPIAllowed(domain) {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "该域名的渠道成本闭环未进入灰度"})
 		return
 	}
@@ -377,6 +436,34 @@ func (m *Monitor) listChannelCostSourcesHandler(c *gin.Context) {
 				views[i].UpstreamModel = views[i].UpstreamModels[0]
 			}
 		}
+		var bindings []ChannelCostSourceBinding
+		if err := m.storeDB.WithContext(c.Request.Context()).Where(
+			"domain = ? AND account_epoch = ? AND source_ref IN ? AND status = 'confirmed'",
+			domain, epoch, refs,
+		).Order("source_ref, valid_from").Find(&bindings).Error; err != nil {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "读取历史来源映射失败"})
+			return
+		}
+		for _, binding := range bindings {
+			view := byRef[binding.SourceRef]
+			if view == nil {
+				continue
+			}
+			evidenceTo := view.LastHour + 3600
+			bindingTo := costIntervalEnd(binding.ValidTo)
+			if binding.ValidFrom >= evidenceTo || bindingTo <= view.FirstHour {
+				continue
+			}
+			view.HistoricalBindingCount++
+			left := max(binding.ValidFrom, view.FirstHour)
+			right := min(bindingTo, evidenceTo)
+			if view.HistoricalBoundFrom == 0 || left < view.HistoricalBoundFrom {
+				view.HistoricalBoundFrom = left
+			}
+			if right > view.HistoricalBoundTo {
+				view.HistoricalBoundTo = right
+			}
+		}
 	}
 	// Manual mappings are scheduled for the next whole hour. Resolve the
 	// upcoming effective binding so a successful save is immediately visible
@@ -400,6 +487,274 @@ func (m *Monitor) listChannelCostSourcesHandler(c *gin.Context) {
 		"domain": domain, "account_epoch": epoch, "enabled": m.channelCostEnabledFor(account),
 		"sources": views, "truncated": sourcesTruncated,
 	})
+}
+
+func normalizeChannelCostHistoricalBindingInput(in *channelCostHistoricalBindingInput) error {
+	in.Domain = strings.ToLower(strings.TrimSpace(in.Domain))
+	in.AccountEpoch = strings.TrimSpace(in.AccountEpoch)
+	in.SourceRef = strings.TrimSpace(in.SourceRef)
+	in.Reason = strings.TrimSpace(in.Reason)
+	if in.Domain == "" || len(in.Domain) > 253 {
+		return errors.New("domain 无效")
+	}
+	if !validSHA256Hex(in.AccountEpoch) || !validSHA256Hex(in.SourceRef) {
+		return errors.New("历史来源身份无效")
+	}
+	if in.Reason == "" || len(in.Reason) > 512 {
+		return errors.New("必须填写 1-512 字符的历史归属审计原因")
+	}
+	return nil
+}
+
+// planChannelCostHistoricalBinding validates the exact finite interval and
+// gathers same-hour local activity for operator review. It never writes.
+func (m *Monitor) planChannelCostHistoricalBinding(ctx context.Context, in channelCostHistoricalBindingInput, createdBy string) (channelCostHistoricalBindingPlan, int, error) {
+	var plan channelCostHistoricalBindingPlan
+	if err := normalizeChannelCostHistoricalBindingInput(&in); err != nil {
+		return plan, http.StatusBadRequest, err
+	}
+	var channel ChannelSnap
+	if err := m.storeDB.WithContext(ctx).Where("id = ?", in.LocalChannelID).First(&channel).Error; err != nil {
+		return plan, http.StatusBadRequest, errors.New("本地渠道不存在")
+	}
+	if strings.ToLower(strings.TrimSpace(channel.BaseDomain)) != in.Domain {
+		return plan, http.StatusBadRequest, errors.New("本地渠道不属于该上游主域名")
+	}
+	var evidence struct {
+		Provider           string
+		SourceRefKind      string
+		HMACKeyID          string
+		ProviderCount      int64
+		SourceRefKindCount int64
+		HMACKeyIDCount     int64
+		FirstHour          int64
+		LastHour           int64
+		Hours              int64
+		Requests           int64
+	}
+	if err := m.storeDB.WithContext(ctx).Model(&ChannelUpstreamCostHourEvidence{}).
+		Select(`MAX(provider) provider, MAX(source_ref_kind) source_ref_kind, MAX(hmac_key_id) hmac_key_id,
+			COUNT(DISTINCT provider) provider_count, COUNT(DISTINCT source_ref_kind) source_ref_kind_count,
+			COUNT(DISTINCT hmac_key_id) hmac_key_id_count, MIN(hour_ts) first_hour, MAX(hour_ts) last_hour,
+			COUNT(DISTINCT hour_ts) hours, COALESCE(SUM(requests), 0) requests`).
+		Where("domain = ? AND account_epoch = ? AND source_ref = ? AND semantics_version = ?", in.Domain, in.AccountEpoch, in.SourceRef, channelCostEvidenceSemanticsVersion).
+		Scan(&evidence).Error; err != nil {
+		return plan, http.StatusServiceUnavailable, errors.New("读取历史计价证据失败")
+	}
+	if evidence.Hours == 0 {
+		return plan, http.StatusBadRequest, errors.New("来源未在该账户代际的核验证据中出现")
+	}
+	if evidence.ProviderCount != 1 || evidence.SourceRefKindCount != 1 || evidence.HMACKeyIDCount != 1 ||
+		strings.TrimSpace(evidence.Provider) == "" || strings.TrimSpace(evidence.SourceRefKind) == "" || strings.TrimSpace(evidence.HMACKeyID) == "" {
+		return plan, http.StatusConflict, errors.New("历史来源元数据不一致，禁止自动归属")
+	}
+	if evidence.Hours > channelCostHistoricalBindingMaxHours {
+		return plan, http.StatusRequestEntityTooLarge, errors.New("历史来源跨度超过单次安全回填上限，需分段审计")
+	}
+	if evidence.FirstHour < 0 || evidence.FirstHour%3600 != 0 || evidence.LastHour < evidence.FirstHour || evidence.LastHour%3600 != 0 || evidence.LastHour > math.MaxInt64-3600 {
+		return plan, http.StatusConflict, errors.New("历史证据时间范围无效")
+	}
+	validTo := evidence.LastHour + 3600
+	if validTo-evidence.FirstHour > int64(channelCostHistoricalBindingMaxHours)*3600 {
+		return plan, http.StatusRequestEntityTooLarge, errors.New("历史来源跨度超过单次安全回填上限，需分段审计")
+	}
+	closedHour := time.Now().Unix() / 3600 * 3600
+	if validTo <= evidence.FirstHour || validTo > closedHour {
+		return plan, http.StatusConflict, errors.New("历史证据时间范围尚未闭合，请等待当前小时完成后重试")
+	}
+	var queueable struct {
+		Hours int64
+	}
+	if err := m.storeDB.WithContext(ctx).Table("channel_upstream_cost_hour_evidence e").
+		Select("COUNT(DISTINCT e.hour_ts) hours").
+		Joins(`JOIN channel_upstream_cost_hour_states s
+			ON s.domain=e.domain AND s.account_epoch=e.account_epoch AND s.hour_ts=e.hour_ts
+			AND s.semantics_version=e.semantics_version`).
+		Where("e.domain = ? AND e.account_epoch = ? AND e.source_ref = ? AND e.semantics_version = ?", in.Domain, in.AccountEpoch, in.SourceRef, channelCostEvidenceSemanticsVersion).
+		Where("s.status = 'verified' AND s.reconcile_status = 'matched'").
+		Scan(&queueable).Error; err != nil {
+		return plan, http.StatusServiceUnavailable, errors.New("读取可发布历史计价证据失败")
+	}
+	var overlaps int64
+	if err := m.storeDB.WithContext(ctx).Model(&ChannelCostSourceBinding{}).
+		Where("domain = ? AND account_epoch = ? AND source_ref = ? AND status = 'confirmed'", in.Domain, in.AccountEpoch, in.SourceRef).
+		Where("valid_from < ? AND (valid_to = 0 OR valid_to > ?)", validTo, evidence.FirstHour).Count(&overlaps).Error; err != nil {
+		return plan, http.StatusServiceUnavailable, errors.New("核验已有历史映射失败")
+	}
+	if overlaps > 0 {
+		return plan, http.StatusConflict, errors.New("同一来源存在重叠的已确认映射")
+	}
+	type localActivityHour struct {
+		HourTs   int64
+		Requests int64
+	}
+	var activityHours []localActivityHour
+	if err := m.storeDB.WithContext(ctx).Model(&StabilityHourSample{}).
+		Select("hour_ts, COALESCE(SUM(success + anomaly + failed), 0) requests").
+		Where("channel_id = ?", in.LocalChannelID).
+		Where(`EXISTS (SELECT 1 FROM channel_upstream_cost_hour_evidence e
+			WHERE e.domain = ? AND e.account_epoch = ? AND e.source_ref = ?
+			AND e.semantics_version = ? AND e.hour_ts = stability_hour_samples.hour_ts)`,
+			in.Domain, in.AccountEpoch, in.SourceRef, channelCostEvidenceSemanticsVersion).
+		Group("hour_ts").Order("hour_ts").Scan(&activityHours).Error; err != nil {
+		return plan, http.StatusServiceUnavailable, errors.New("读取本地渠道同时段活动失败")
+	}
+	activeHours := make(map[int64]bool, len(activityHours))
+	var localRequests int64
+	for _, activity := range activityHours {
+		activeHours[activity.HourTs] = true
+		if err := addEconomicsInt64(&localRequests, activity.Requests); err != nil {
+			return plan, http.StatusConflict, errors.New("本地渠道同时段请求数超出安全范围")
+		}
+	}
+	type localTestActivityHour struct {
+		HourTs   int64
+		Requests int64
+	}
+	var testActivityHours []localTestActivityHour
+	if err := m.storeDB.WithContext(ctx).Model(&ChannelTestHourSample{}).
+		Select("hour_ts, COALESCE(SUM(requests), 0) requests").
+		Where("channel_id = ? AND traffic_class_version = ?", in.LocalChannelID, stabilityTrafficClassificationVersion).
+		Where(`EXISTS (SELECT 1 FROM channel_upstream_cost_hour_evidence e
+			WHERE e.domain = ? AND e.account_epoch = ? AND e.source_ref = ?
+			AND e.semantics_version = ? AND e.hour_ts = channel_test_hour_samples.hour_ts)`,
+			in.Domain, in.AccountEpoch, in.SourceRef, channelCostEvidenceSemanticsVersion).
+		Group("hour_ts").Order("hour_ts").Scan(&testActivityHours).Error; err != nil {
+		return plan, http.StatusServiceUnavailable, errors.New("读取本地渠道内部测试活动失败")
+	}
+	var localTestRequests int64
+	for _, activity := range testActivityHours {
+		if err := addEconomicsInt64(&localTestRequests, activity.Requests); err != nil {
+			return plan, http.StatusConflict, errors.New("本地渠道内部测试请求数超出安全范围")
+		}
+	}
+	type evidenceCostHour struct {
+		HourTs            int64
+		ChargeUnits       int64
+		ChargeUnitsPerUSD string
+		Requests          int64
+	}
+	var costHours []evidenceCostHour
+	if err := m.storeDB.WithContext(ctx).Model(&ChannelUpstreamCostHourEvidence{}).
+		Select("hour_ts, charge_units_per_usd, COALESCE(SUM(charge_units), 0) charge_units, COALESCE(SUM(requests), 0) requests").
+		Where("domain = ? AND account_epoch = ? AND source_ref = ? AND semantics_version = ?", in.Domain, in.AccountEpoch, in.SourceRef, channelCostEvidenceSemanticsVersion).
+		Group("hour_ts, charge_units_per_usd").Order("hour_ts").Scan(&costHours).Error; err != nil {
+		return plan, http.StatusServiceUnavailable, errors.New("读取历史来源金额证据失败")
+	}
+	var evidenceCost, activeCost, activeEvidenceRequests int64
+	for _, costHour := range costHours {
+		cost, err := unitsToMicroUSDCanonical(costHour.ChargeUnits, costHour.ChargeUnitsPerUSD)
+		if err != nil {
+			return plan, http.StatusConflict, errors.New("历史来源包含无效计费单位，禁止回填")
+		}
+		if err := addEconomicsInt64(&evidenceCost, cost); err != nil {
+			return plan, http.StatusConflict, errors.New("历史来源金额超出安全范围")
+		}
+		if activeHours[costHour.HourTs] {
+			if err := addEconomicsInt64(&activeCost, cost); err != nil {
+				return plan, http.StatusConflict, errors.New("同时段金额超出安全范围")
+			}
+			if err := addEconomicsInt64(&activeEvidenceRequests, costHour.Requests); err != nil {
+				return plan, http.StatusConflict, errors.New("同时段上游请求数超出安全范围")
+			}
+		}
+	}
+	inactiveCost := evidenceCost - activeCost
+	inactiveEvidenceRequests := evidence.Requests - activeEvidenceRequests
+	if inactiveCost < 0 || inactiveEvidenceRequests < 0 {
+		return plan, http.StatusConflict, errors.New("历史来源金额或请求数校验失败")
+	}
+	costCoverage := float64(0)
+	if evidenceCost > 0 {
+		costCoverage = float64(activeCost) / float64(evidenceCost)
+	}
+	row := ChannelCostSourceBinding{
+		Domain: in.Domain, AccountEpoch: in.AccountEpoch, SourceRef: in.SourceRef,
+		Provider: evidence.Provider, SourceRefKind: evidence.SourceRefKind, HMACKeyID: evidence.HMACKeyID,
+		LocalChannelID: in.LocalChannelID, ValidFrom: evidence.FirstHour, ValidTo: validTo,
+		Status: "confirmed", AllocationMode: "allocated", MappingSource: "manual_history",
+		Reason: in.Reason, CreatedBy: createdBy, CreatedAt: time.Now().Unix(),
+	}
+	coverage, quality, warnings := historicalBindingEvidenceQuality(evidence.Hours, int64(len(activityHours)))
+	testCoverage := float64(0)
+	if evidence.Hours > 0 {
+		testCoverage = float64(len(testActivityHours)) / float64(evidence.Hours)
+	}
+	if localTestRequests > 0 {
+		if localRequests == 0 {
+			warnings = append(warnings, "该来源时段仅发现内部测试活动，不得将该成本当作客户流量成本发布")
+		} else {
+			warnings = append(warnings, "该来源时段同时存在客户流量与内部测试，后续需单独拆分内部测试成本")
+		}
+	}
+	if queueable.Hours < evidence.Hours {
+		warnings = append(warnings, fmt.Sprintf("%d 个小时尚未核验对平，本次仅将 %d 个小时加入重算队列", evidence.Hours-queueable.Hours, queueable.Hours))
+	}
+	plan = channelCostHistoricalBindingPlan{
+		Binding: row, ChannelName: channel.Name, EvidenceHours: evidence.Hours,
+		EvidenceRequests: evidence.Requests, EvidenceBilledCost: economicsMoney(evidenceCost),
+		LocalActiveHours: int64(len(activityHours)), LocalRequests: localRequests,
+		LocalTestActiveHours: int64(len(testActivityHours)), LocalTestRequests: localTestRequests,
+		ActiveEvidenceRequests: activeEvidenceRequests, InactiveEvidenceRequests: inactiveEvidenceRequests,
+		ActiveBilledCost: economicsMoney(activeCost), InactiveBilledCost: economicsMoney(inactiveCost),
+		WillQueueHours: queueable.Hours, HasLocalActivity: len(activityHours) > 0,
+		ActivityCoverage: coverage, TestActivityCoverage: testCoverage, CostActivityCoverage: costCoverage,
+		TemporalOverlapQuality: quality, RiskWarnings: warnings,
+	}
+	return plan, http.StatusOK, nil
+}
+
+func (m *Monitor) previewChannelCostHistoricalBindingHandler(c *gin.Context) {
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 16<<10)
+	var in channelCostHistoricalBindingInput
+	if err := c.ShouldBindJSON(&in); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "历史来源映射参数无效"})
+		return
+	}
+	domain := strings.ToLower(strings.TrimSpace(in.Domain))
+	if !m.cfg.LocalSnapshotOnly && !m.channelCostAPIAllowed(domain) {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "该域名的渠道成本闭环未进入灰度"})
+		return
+	}
+	plan, status, err := m.planChannelCostHistoricalBinding(c.Request.Context(), in, c.GetString("uname"))
+	if err != nil {
+		c.JSON(status, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, plan)
+}
+
+// saveChannelCostHistoricalBindingHandler attributes one observed source for
+// exactly its currently recorded evidence lifetime. It is intentionally a
+// separate endpoint from next-hour switching: historical writes are finite,
+// auditable and cannot silently change future routing or pricing.
+func (m *Monitor) saveChannelCostHistoricalBindingHandler(c *gin.Context) {
+	if m.cfg.LocalSnapshotOnly {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "本地快照模式禁止写入历史来源映射"})
+		return
+	}
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 16<<10)
+	var in channelCostHistoricalBindingInput
+	if err := c.ShouldBindJSON(&in); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "历史来源映射参数无效"})
+		return
+	}
+	domain := strings.ToLower(strings.TrimSpace(in.Domain))
+	if !m.channelCostAPIAllowed(domain) {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "该域名的渠道成本闭环未进入灰度"})
+		return
+	}
+	plan, status, err := m.planChannelCostHistoricalBinding(c.Request.Context(), in, c.GetString("uname"))
+	if err != nil {
+		c.JSON(status, gin.H{"error": err.Error()})
+		return
+	}
+	row := plan.Binding
+	if err := m.saveCostSourceBinding(c.Request.Context(), row); err != nil {
+		c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"ok": true, "binding": row, "evidence_hours": plan.EvidenceHours})
 }
 
 func (m *Monitor) saveChannelCostBindingHandler(c *gin.Context) {

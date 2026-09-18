@@ -26,6 +26,7 @@ usage() {
   print -- '  dev/ai-production-readonly-access.sh usage <USER_IDS> <UTC_FROM_UNIX> <UTC_TO_UNIX>'
   print -- '  dev/ai-production-readonly-access.sh raw-user <USER_ID> <UTC_HOUR_UNIX>'
   print -- '  dev/ai-production-readonly-access.sh raw-email <EMAIL> <UTC_HOUR_UNIX>'
+	print -- '  dev/ai-production-readonly-access.sh finance-credit <UTC_FROM_UNIX> <UTC_TO_UNIX>'
   print
   print -- 'start leaves the loopback-only tunnel running; stop closes it.'
   print -- 'All query/probe commands open, verify, use, and then close the tunnel automatically.'
@@ -114,6 +115,10 @@ case "$action" in
     require_arg_count 2 "${@:2}"
     run_bounded_query -raw-page-email "$2" -raw-page-hour "$3"
     ;;
+	finance-credit)
+		require_arg_count 2 "${@:2}"
+		run_bounded_query -finance-credit-from "$2" -finance-credit-to "$3"
+		;;
   help|-h|--help)
     usage
     ;;

@@ -28,6 +28,199 @@ func postChannelCostBinding(t *testing.T, m *Monitor, body any) *httptest.Respon
 	return response
 }
 
+func postChannelCostHistoricalBinding(t *testing.T, m *Monitor, body any) *httptest.ResponseRecorder {
+	t.Helper()
+	encoded, err := json.Marshal(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	router := gin.New()
+	router.POST("/channels/cost/historical-bindings", m.saveChannelCostHistoricalBindingHandler)
+	req := httptest.NewRequest(http.MethodPost, "/channels/cost/historical-bindings", bytes.NewReader(encoded))
+	req.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, req)
+	return response
+}
+
+func previewChannelCostHistoricalBinding(t *testing.T, m *Monitor, body any) *httptest.ResponseRecorder {
+	t.Helper()
+	encoded, err := json.Marshal(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	router := gin.New()
+	router.POST("/channels/cost/historical-bindings/preview", m.previewChannelCostHistoricalBindingHandler)
+	req := httptest.NewRequest(http.MethodPost, "/channels/cost/historical-bindings/preview", bytes.NewReader(encoded))
+	req.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, req)
+	return response
+}
+
+func TestHistoricalCostBindingIsFiniteAuditedAndQueuesOnlyVerifiedHours(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	db := newChannelCostTestStore(t)
+	if err := db.AutoMigrate(&ChannelSnap{}, &StabilityHourSample{}); err != nil {
+		t.Fatal(err)
+	}
+	domain, epoch, source := "4sapi.com", strings.Repeat("a", 64), strings.Repeat("b", 64)
+	for index, hour := range []int64{3600, 10800} {
+		if err := db.Create(&ChannelUpstreamCostHourEvidence{
+			Domain: domain, AccountEpoch: epoch, HourTs: hour, SemanticsVersion: channelCostEvidenceSemanticsVersion,
+			SourceRef: source, DimensionHash: strings.Repeat(fmt.Sprintf("%x", index+1), 64), Provider: upstreamProviderNewAPI,
+			SourceRefKind: channelCostSourceKindNewAPIToken, HMACKeyID: "key-v1", ChargeUnits: 500_000,
+			ChargeUnitsPerUSD: "500000", Requests: int64(index + 2),
+		}).Error; err != nil {
+			t.Fatal(err)
+		}
+		status := "observed"
+		if hour == 3600 {
+			status = "verified"
+		}
+		if err := db.Create(&ChannelUpstreamCostHourState{
+			Domain: domain, AccountEpoch: epoch, HourTs: hour, SemanticsVersion: channelCostEvidenceSemanticsVersion,
+			Provider: upstreamProviderNewAPI, Status: status, ReconcileStatus: "matched",
+		}).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := db.Create(&ChannelSnap{ID: 59, Name: "4sapi_Gpt-codex", BaseDomain: domain, DeletedAt: time.Now().Unix()}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Create(&ChannelSnap{ID: 60, BaseDomain: "other.example"}).Error; err != nil {
+		t.Fatal(err)
+	}
+	body := map[string]any{"domain": domain, "account_epoch": epoch, "source_ref": source, "local_channel_id": 59, "reason": "confirmed from upstream token ownership record"}
+	localOnly := &Monitor{storeDB: db, cfg: Settings{LocalSnapshotOnly: true, ChannelCostClosureEnabled: true, ChannelCostClosureDomains: []string{domain}}}
+	if err := db.Create(&StabilityHourSample{HourTs: 3600, ChannelID: 59, ModelName: "gpt-5.6-sol", Grp: "codex-1.2x", Success: 7, Failed: 1}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Create(&ChannelTestHourSample{HourTs: 10800, ChannelID: 59, ModelName: "gpt-5.6-sol", Grp: "internal", Origin: "scheduled", TrafficClassVersion: stabilityTrafficClassificationVersion, Requests: 3}).Error; err != nil {
+		t.Fatal(err)
+	}
+	previewResponse := previewChannelCostHistoricalBinding(t, localOnly, body)
+	if previewResponse.Code != http.StatusOK {
+		t.Fatalf("local snapshot preview rejected: status=%d body=%s", previewResponse.Code, previewResponse.Body.String())
+	}
+	var preview channelCostHistoricalBindingPlan
+	if err := json.Unmarshal(previewResponse.Body.Bytes(), &preview); err != nil {
+		t.Fatal(err)
+	}
+	if preview.ChannelName != "4sapi_Gpt-codex" || preview.EvidenceHours != 2 || preview.WillQueueHours != 1 || preview.LocalActiveHours != 1 || preview.LocalRequests != 8 || !preview.HasLocalActivity {
+		t.Fatalf("historical preview mismatch: %+v", preview)
+	}
+	if preview.ActivityCoverage != 0.5 || preview.TestActivityCoverage != 0.5 || preview.LocalTestActiveHours != 1 || preview.LocalTestRequests != 3 || preview.TemporalOverlapQuality != "review" || len(preview.RiskWarnings) != 3 {
+		t.Fatalf("historical preview evidence quality mismatch: %+v", preview)
+	}
+	if preview.EvidenceBilledCost.MicroUSD != "2000000" || preview.ActiveBilledCost.MicroUSD != "1000000" || preview.InactiveBilledCost.MicroUSD != "1000000" || preview.CostActivityCoverage != 0.5 || preview.ActiveEvidenceRequests != 2 || preview.InactiveEvidenceRequests != 3 {
+		t.Fatalf("historical preview economic overlap mismatch: %+v", preview)
+	}
+	var beforeBindings, beforeDirty int64
+	if err := db.Model(&ChannelCostSourceBinding{}).Count(&beforeBindings).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Model(&ChannelEconomicsDirtyHour{}).Count(&beforeDirty).Error; err != nil {
+		t.Fatal(err)
+	}
+	if beforeBindings != 0 || beforeDirty != 0 {
+		t.Fatalf("preview performed writes: bindings=%d dirty=%d", beforeBindings, beforeDirty)
+	}
+	if response := postChannelCostHistoricalBinding(t, localOnly, body); response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("local snapshot accepted historical write: status=%d body=%s", response.Code, response.Body.String())
+	}
+	m := &Monitor{storeDB: db, cfg: Settings{ChannelCostClosureEnabled: true, ChannelCostClosureDomains: []string{domain}}}
+	wrong := map[string]any{"domain": domain, "account_epoch": epoch, "source_ref": source, "local_channel_id": 60, "reason": "wrong domain"}
+	if response := postChannelCostHistoricalBinding(t, m, wrong); response.Code != http.StatusBadRequest {
+		t.Fatalf("cross-domain historical mapping accepted: status=%d body=%s", response.Code, response.Body.String())
+	}
+	response := postChannelCostHistoricalBinding(t, m, body)
+	if response.Code != http.StatusOK {
+		t.Fatalf("valid historical binding rejected: status=%d body=%s", response.Code, response.Body.String())
+	}
+	var binding ChannelCostSourceBinding
+	if err := db.First(&binding, "domain = ? AND account_epoch = ? AND source_ref = ?", domain, epoch, source).Error; err != nil {
+		t.Fatal(err)
+	}
+	if binding.ValidFrom != 3600 || binding.ValidTo != 14400 || binding.LocalChannelID != 59 || binding.MappingSource != "manual_history" || binding.Status != "confirmed" {
+		t.Fatalf("historical binding contract mismatch: %+v", binding)
+	}
+	var dirty []ChannelEconomicsDirtyHour
+	if err := db.Order("hour_ts").Find(&dirty).Error; err != nil {
+		t.Fatal(err)
+	}
+	if len(dirty) != 1 || dirty[0].HourTs != 3600 {
+		t.Fatalf("historical binding queued wrong hours: %+v", dirty)
+	}
+	if duplicate := postChannelCostHistoricalBinding(t, m, body); duplicate.Code != http.StatusConflict {
+		t.Fatalf("overlapping historical replay accepted: status=%d body=%s", duplicate.Code, duplicate.Body.String())
+	}
+}
+
+func TestHistoricalBindingEvidenceQuality(t *testing.T) {
+	tests := []struct {
+		name             string
+		evidenceHours    int64
+		localActiveHours int64
+		wantCoverage     float64
+		wantQuality      string
+		wantWarnings     int
+	}{
+		{name: "invalid", evidenceHours: 0, wantQuality: "invalid", wantWarnings: 1},
+		{name: "no activity", evidenceHours: 100, wantQuality: "no_activity", wantWarnings: 1},
+		{name: "weak", evidenceHours: 100, localActiveHours: 9, wantCoverage: 0.09, wantQuality: "weak", wantWarnings: 1},
+		{name: "review", evidenceHours: 100, localActiveHours: 79, wantCoverage: 0.79, wantQuality: "review", wantWarnings: 1},
+		{name: "strong", evidenceHours: 100, localActiveHours: 80, wantCoverage: 0.8, wantQuality: "strong"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			coverage, quality, warnings := historicalBindingEvidenceQuality(test.evidenceHours, test.localActiveHours)
+			if coverage != test.wantCoverage || quality != test.wantQuality || len(warnings) != test.wantWarnings {
+				t.Fatalf("quality mismatch: coverage=%v quality=%q warnings=%v", coverage, quality, warnings)
+			}
+		})
+	}
+}
+
+func TestHistoricalCostBindingRejectsSparseWideOrMixedEvidence(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	db := newChannelCostTestStore(t)
+	if err := db.AutoMigrate(&ChannelSnap{}); err != nil {
+		t.Fatal(err)
+	}
+	domain, epoch := "4sapi.com", strings.Repeat("a", 64)
+	if err := db.Create(&ChannelSnap{ID: 59, BaseDomain: domain}).Error; err != nil {
+		t.Fatal(err)
+	}
+	m := &Monitor{storeDB: db, cfg: Settings{ChannelCostClosureEnabled: true, ChannelCostClosureDomains: []string{domain}}}
+	createEvidence := func(source, dimension, provider, key string, hour int64) {
+		t.Helper()
+		if err := db.Create(&ChannelUpstreamCostHourEvidence{
+			Domain: domain, AccountEpoch: epoch, HourTs: hour, SemanticsVersion: channelCostEvidenceSemanticsVersion,
+			SourceRef: source, DimensionHash: dimension, Provider: provider,
+			SourceRefKind: channelCostSourceKindNewAPIToken, HMACKeyID: key,
+		}).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	wideSource := strings.Repeat("b", 64)
+	createEvidence(wideSource, strings.Repeat("1", 64), upstreamProviderNewAPI, "key-v1", 3600)
+	createEvidence(wideSource, strings.Repeat("2", 64), upstreamProviderNewAPI, "key-v1", 3600+int64(channelCostHistoricalBindingMaxHours)*3600)
+	body := map[string]any{"domain": domain, "account_epoch": epoch, "source_ref": wideSource, "local_channel_id": 59, "reason": "wide sparse evidence"}
+	if response := postChannelCostHistoricalBinding(t, m, body); response.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("wide sparse evidence accepted: status=%d body=%s", response.Code, response.Body.String())
+	}
+
+	mixedSource := strings.Repeat("c", 64)
+	createEvidence(mixedSource, strings.Repeat("3", 64), upstreamProviderNewAPI, "key-v1", 3600)
+	createEvidence(mixedSource, strings.Repeat("4", 64), "unexpected-provider", "key-v2", 3600)
+	body["source_ref"] = mixedSource
+	body["reason"] = "mixed metadata"
+	if response := postChannelCostHistoricalBinding(t, m, body); response.Code != http.StatusConflict {
+		t.Fatalf("mixed source metadata accepted: status=%d body=%s", response.Code, response.Body.String())
+	}
+}
+
 func TestChannelCostBindingAPIFailsClosedAndValidatesChannelDomain(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	db := newChannelCostTestStore(t)
@@ -67,6 +260,20 @@ func TestChannelCostBindingAPIFailsClosedAndValidatesChannelDomain(t *testing.T)
 	disabled := &Monitor{storeDB: db}
 	if response := postChannelCostBinding(t, disabled, body); response.Code != http.StatusServiceUnavailable {
 		t.Fatalf("disabled API status=%d body=%s", response.Code, response.Body.String())
+	}
+	snapshotListRouter := gin.New()
+	snapshotListRouter.GET("/channels/cost/sources", (&Monitor{storeDB: db, cfg: Settings{LocalSnapshotOnly: true}}).listChannelCostSourcesHandler)
+	snapshotListResponse := httptest.NewRecorder()
+	snapshotListRouter.ServeHTTP(snapshotListResponse, httptest.NewRequest(http.MethodGet, "/channels/cost/sources?domain="+account.Domain, nil))
+	if snapshotListResponse.Code != http.StatusOK {
+		t.Fatalf("local snapshot read-only source list rejected: status=%d body=%s", snapshotListResponse.Code, snapshotListResponse.Body.String())
+	}
+	disabledListRouter := gin.New()
+	disabledListRouter.GET("/channels/cost/sources", disabled.listChannelCostSourcesHandler)
+	disabledListResponse := httptest.NewRecorder()
+	disabledListRouter.ServeHTTP(disabledListResponse, httptest.NewRequest(http.MethodGet, "/channels/cost/sources?domain="+account.Domain, nil))
+	if disabledListResponse.Code != http.StatusServiceUnavailable {
+		t.Fatalf("production source list bypassed rollout gate: status=%d body=%s", disabledListResponse.Code, disabledListResponse.Body.String())
 	}
 	m := &Monitor{storeDB: db, cfg: Settings{ChannelCostClosureEnabled: true, ChannelCostClosureDomains: []string{account.Domain}}}
 	wrong := make(map[string]any, len(body))

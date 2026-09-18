@@ -60,6 +60,7 @@ type syncOverviewResponse struct {
 	Stability   syncStatusSection[stabilityHealthResponse] `json:"stability"`
 	Upstream    syncStatusSection[syncUpstreamStatus]      `json:"upstream"`
 	CostClosure syncStatusSection[syncChannelCostStatus]   `json:"cost_closure"`
+	Finance     syncStatusSection[syncFinanceStatus]       `json:"finance"`
 }
 
 type syncStatusSnapshot struct {
@@ -78,6 +79,7 @@ type syncStatusReaders struct {
 	Stability   func(context.Context) (stabilityHealthResponse, error)
 	Upstream    func(context.Context) (map[string]ChannelUpstreamAccountView, error)
 	CostClosure func(context.Context) (syncChannelCostStatus, error)
+	Finance     func(context.Context) (syncFinanceStatus, error)
 }
 
 type syncStatusReadResult[T any] struct {
@@ -166,6 +168,9 @@ func (m *Monitor) defaultSyncStatusReaders(now time.Time) syncStatusReaders {
 		},
 		Upstream:    m.loadChannelUpstreamViews,
 		CostClosure: m.channelCostSyncStatus,
+		Finance: func(ctx context.Context) (syncFinanceStatus, error) {
+			return m.financeFactSyncStatus(ctx, now)
+		},
 	}
 }
 
@@ -183,7 +188,7 @@ func (m *Monitor) buildSyncStatusSnapshotWith(ctx context.Context, now time.Time
 		},
 	}
 
-	// 四个业务分区并行读本地状态；某一分区超时不阻断其他分区返回。
+	// 五个业务分区并行读本地状态；某一分区超时不阻断其他分区返回。
 	overallCtx, overallCancel := context.WithTimeout(ctx, 5*time.Second)
 	defer overallCancel()
 	usageCtx, usageCancel := context.WithTimeout(overallCtx, 4*time.Second)
@@ -194,6 +199,8 @@ func (m *Monitor) buildSyncStatusSnapshotWith(ctx context.Context, now time.Time
 	defer upstreamCancel()
 	costCtx, costCancel := context.WithTimeout(overallCtx, 2*time.Second)
 	defer costCancel()
+	financeCtx, financeCancel := context.WithTimeout(overallCtx, 2*time.Second)
+	defer financeCancel()
 	usageCh := launchSyncStatusRead(usageCtx, "用量事实", readers.Usage)
 	stabilityCh := launchSyncStatusRead(stabilityCtx, "稳定性", readers.Stability)
 	upstreamCh := launchSyncStatusRead(upstreamCtx, "上游账户", readers.Upstream)
@@ -202,11 +209,17 @@ func (m *Monitor) buildSyncStatusSnapshotWith(ctx context.Context, now time.Time
 		costRead = func(context.Context) (syncChannelCostStatus, error) { return syncChannelCostStatus{}, nil }
 	}
 	costCh := launchSyncStatusRead(costCtx, "渠道成本闭环", costRead)
+	financeRead := readers.Finance
+	if financeRead == nil {
+		financeRead = func(context.Context) (syncFinanceStatus, error) { return syncFinanceStatus{}, nil }
+	}
+	financeCh := launchSyncStatusRead(financeCtx, "经营核算事实", financeRead)
 
 	usageResult := awaitSyncStatusRead(overallCtx, usageCh)
 	stabilityResult := awaitSyncStatusRead(overallCtx, stabilityCh)
 	upstreamResult := awaitSyncStatusRead(overallCtx, upstreamCh)
 	costResult := awaitSyncStatusRead(overallCtx, costCh)
+	financeResult := awaitSyncStatusRead(overallCtx, financeCh)
 
 	usage := syncUsageStatus{Store: usageResult.Data.Store, FactsStore: usageResult.Data.FactsStore}
 	if usageResult.Err != nil {
@@ -266,6 +279,11 @@ func (m *Monitor) buildSyncStatusSnapshotWith(ctx context.Context, now time.Time
 		snapshot.Overview.CostClosure = syncStatusSection[syncChannelCostStatus]{Available: false, CheckedAt: nowUnix, Error: "读取本地渠道成本闭环状态失败"}
 	} else {
 		snapshot.Overview.CostClosure = syncStatusSection[syncChannelCostStatus]{Available: true, CheckedAt: nowUnix, Data: costResult.Data}
+	}
+	if financeResult.Err != nil {
+		snapshot.Overview.Finance = syncStatusSection[syncFinanceStatus]{Available: false, CheckedAt: nowUnix, Error: "读取本地经营核算事实状态失败"}
+	} else {
+		snapshot.Overview.Finance = syncStatusSection[syncFinanceStatus]{Available: true, CheckedAt: nowUnix, Data: financeResult.Data}
 	}
 	return snapshot
 }

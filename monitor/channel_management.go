@@ -101,18 +101,19 @@ type ChannelManagementVendor struct {
 }
 
 type ChannelManagementDomain struct {
-	Key            string                          `json:"key"`
-	Domain         string                          `json:"domain"`
-	Configured     bool                            `json:"configured"`
-	Usage          ChannelUsageMetrics             `json:"usage"`
-	Finance        ChannelDomainFinanceView        `json:"finance"`
-	Upstream       ChannelUpstreamAccountView      `json:"upstream"`
-	RateConfig     ChannelManagementRateConfig     `json:"rate_config"`
-	UpstreamUsage  ChannelUpstreamUsageMetrics     `json:"upstream_usage"`
-	NaturalDayBill *ChannelUpstreamNaturalDayBill  `json:"natural_day_bill,omitempty"`
-	FinanceGroups  []ChannelManagementFinanceGroup `json:"finance_groups"`
-	Groups         []ChannelManagementGroup        `json:"groups"`
-	Vendors        []ChannelManagementVendor       `json:"vendors"`
+	Key              string                          `json:"key"`
+	Domain           string                          `json:"domain"`
+	Configured       bool                            `json:"configured"`
+	ManuallyDisabled bool                            `json:"manually_disabled"`
+	Usage            ChannelUsageMetrics             `json:"usage"`
+	Finance          ChannelDomainFinanceView        `json:"finance"`
+	Upstream         ChannelUpstreamAccountView      `json:"upstream"`
+	RateConfig       ChannelManagementRateConfig     `json:"rate_config"`
+	UpstreamUsage    ChannelUpstreamUsageMetrics     `json:"upstream_usage"`
+	NaturalDayBill   *ChannelUpstreamNaturalDayBill  `json:"natural_day_bill,omitempty"`
+	FinanceGroups    []ChannelManagementFinanceGroup `json:"finance_groups"`
+	Groups           []ChannelManagementGroup        `json:"groups"`
+	Vendors          []ChannelManagementVendor       `json:"vendors"`
 }
 
 type ChannelManagementFilters struct {
@@ -245,6 +246,29 @@ type channelDomainBuild struct {
 	Groups        map[string]*channelUsageAgg
 	FinanceGroups map[string]bool
 	Vendors       map[string]*channelVendorBuild
+}
+
+// channelDomainManuallyDisabled only marks an upstream when it still has at
+// least one current local channel and every current channel was explicitly
+// disabled by an operator (NewAPI status=2). Auto-disabled channels remain
+// recoverable and therefore keep the upstream in the normal ordering.
+func channelDomainManuallyDisabled(domain *channelDomainBuild) bool {
+	if domain == nil {
+		return false
+	}
+	current := 0
+	for _, vendor := range domain.Vendors {
+		for _, channel := range vendor.Channels {
+			if channel == nil || !channel.Current {
+				continue
+			}
+			current++
+			if channel.Status != 2 {
+				return false
+			}
+		}
+	}
+	return current > 0
 }
 
 func sortedUnique(items []string) []string {
@@ -475,20 +499,34 @@ func (m *Monitor) loadChannelUpstreamUsage(ctx context.Context, scope stabilityS
 }
 
 func (m *Monitor) loadChannelUpstreamUsageWindow(ctx context.Context, scope stabilityScope, now int64, accounts map[string]ChannelUpstreamAccountView, finance channelFinanceSnapshot) (map[string]ChannelUpstreamUsageMetrics, error) {
-	var rows []ChannelUpstreamUsageHour
 	// Include an overlapping daily bucket so a mixed day/hour migration cannot
 	// silently drop the first partial day and pass the remainder as exact.
-	if err := m.storeDB.WithContext(ctx).Raw(`SELECT domain,hour_ts,bucket_seconds,requests,tokens,quota,cost_usd,unit_per_usd,fetched_at,provider,source_kind,provisional
+	dbRows, err := m.storeDB.WithContext(ctx).Raw(`SELECT COALESCE(domain,''),COALESCE(hour_ts,0),COALESCE(bucket_seconds,0),
+		COALESCE(requests,0),COALESCE(tokens,0),COALESCE(quota,0),COALESCE(cost_usd,0),COALESCE(unit_per_usd,0),
+		COALESCE(fetched_at,0),COALESCE(provider,''),COALESCE(source_kind,''),COALESCE(provisional,0)
 		FROM channel_upstream_usage_hours
 		WHERE hour_ts >= ? AND hour_ts < ?
-		ORDER BY domain ASC,hour_ts ASC`, cstDayStart(scope.FromTs), scope.ToTs).Scan(&rows).Error; err != nil {
+		ORDER BY domain ASC,hour_ts ASC`, cstDayStart(scope.FromTs), scope.ToTs).Rows()
+	if err != nil {
+		return nil, err
+	}
+	defer dbRows.Close()
+	rows := make([]ChannelUpstreamUsageHour, 0, 4096)
+	for dbRows.Next() {
+		var row ChannelUpstreamUsageHour
+		if err := dbRows.Scan(&row.Domain, &row.HourTs, &row.BucketSeconds, &row.Requests, &row.Tokens, &row.Quota,
+			&row.CostUSD, &row.UnitPerUSD, &row.FetchedAt, &row.Provider, &row.SourceKind, &row.Provisional); err != nil {
+			return nil, err
+		}
+		rows = append(rows, row)
+	}
+	if err := dbRows.Err(); err != nil {
 		return nil, err
 	}
 	versions, err := m.loadChannelRechargeVersions(ctx, accounts, finance)
 	if err != nil {
 		return nil, err
 	}
-	expected := expectedUpstreamUsageHours(scope, now)
 	type aggregate struct {
 		metrics        ChannelUpstreamUsageMetrics
 		completed      int64
@@ -507,6 +545,11 @@ func (m *Monitor) loadChannelUpstreamUsageWindow(ctx context.Context, scope stab
 		if !configured || !account.UsageSyncEnabled || row.Provider != account.Provider {
 			continue
 		}
+		accountFrom := scope.FromTs
+		if account.FinanceRequiredFrom > accountFrom {
+			accountFrom = account.FinanceRequiredFrom
+		}
+		expected := expectedUpstreamUsageHours(stabilityScope{FromTs: accountFrom, ToTs: scope.ToTs}, now)
 		seconds := row.BucketSeconds
 		if seconds <= 0 {
 			seconds = 3600
@@ -523,7 +566,7 @@ func (m *Monitor) loadChannelUpstreamUsageWindow(ctx context.Context, scope stab
 				granularity = "day"
 			}
 		}
-		if end <= scope.FromTs || (granularity == "hour" && (row.HourTs < scope.FromTs || end > scope.ToTs)) {
+		if end <= accountFrom || (granularity == "hour" && (row.HourTs < accountFrom || end > scope.ToTs)) {
 			continue
 		}
 		a := aggregates[row.Domain]
@@ -533,7 +576,7 @@ func (m *Monitor) loadChannelUpstreamUsageWindow(ctx context.Context, scope stab
 		} else if a.metrics.Granularity != granularity {
 			a.metrics.Granularity = "mixed"
 		}
-		if end > scope.ToTs || row.HourTs < scope.FromTs {
+		if end > scope.ToTs || row.HourTs < accountFrom {
 			a.integrity = upstreamUsageIntegrityWindowMismatch
 			continue
 		}
@@ -600,7 +643,7 @@ func (m *Monitor) loadChannelUpstreamUsageWindow(ctx context.Context, scope stab
 			continue
 		}
 		a.metrics.CompletedHours = a.completed / 3600
-		a.metrics.Complete = (expected == 0 || a.completed >= expected*3600) && !a.metrics.Provisional
+		a.metrics.Complete = (a.metrics.ExpectedHours == 0 || a.completed >= a.metrics.ExpectedHours*3600) && !a.metrics.Provisional
 		a.metrics.AdjustedCostAvailable = a.adjustedOK && a.ratioSet
 		a.metrics.AdjustedCostStatus = a.adjustedStatus
 		if a.metrics.AdjustedCostAvailable {
@@ -624,6 +667,11 @@ func (m *Monitor) loadChannelUpstreamUsageWindow(ctx context.Context, scope stab
 			continue
 		}
 		if _, found := result[domain]; !found {
+			accountFrom := scope.FromTs
+			if account.FinanceRequiredFrom > accountFrom {
+				accountFrom = account.FinanceRequiredFrom
+			}
+			expected := expectedUpstreamUsageHours(stabilityScope{FromTs: accountFrom, ToTs: scope.ToTs}, now)
 			missing := ChannelUpstreamUsageMetrics{ExpectedHours: expected, Granularity: granularity}
 			if granularity == "day" && (scope.FromTs != cstDayStart(scope.FromTs) || scope.ToTs != cstDayStart(scope.ToTs)) {
 				missing.IntegrityStatus = upstreamUsageIntegrityWindowMismatch
@@ -863,7 +911,7 @@ func (m *Monitor) buildChannelManagementReport(ctx context.Context, scope stabil
 			upstream.Assessment = &assessment
 		}
 		responseDomains = append(responseDomains, ChannelManagementDomain{
-			Key: domain.Key, Domain: domain.Domain, Configured: domain.Configured,
+			Key: domain.Key, Domain: domain.Domain, Configured: domain.Configured, ManuallyDisabled: channelDomainManuallyDisabled(domain),
 			Usage: domain.Usage.metrics(), Finance: finance.domainView(domain.Domain),
 			Upstream:       upstream,
 			RateConfig:     managementRateConfig(domain, finance),
@@ -874,6 +922,9 @@ func (m *Monitor) buildChannelManagementReport(ctx context.Context, scope stabil
 		})
 	}
 	sort.Slice(responseDomains, func(i, j int) bool {
+		if responseDomains[i].ManuallyDisabled != responseDomains[j].ManuallyDisabled {
+			return !responseDomains[i].ManuallyDisabled
+		}
 		if responseDomains[i].Configured != responseDomains[j].Configured {
 			return responseDomains[i].Configured
 		}

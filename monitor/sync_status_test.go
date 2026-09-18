@@ -50,11 +50,17 @@ func TestSyncOverviewSectionsRunConcurrentlyAndIsolateFailure(t *testing.T) {
 			}
 			return syncChannelCostStatus{}, errors.New("injected cost closure failure")
 		},
+		Finance: func(ctx context.Context) (syncFinanceStatus, error) {
+			if err := pause(ctx); err != nil {
+				return syncFinanceStatus{}, err
+			}
+			return syncFinanceStatus{}, errors.New("injected finance failure")
+		},
 	})
 	if elapsed := time.Since(started); elapsed >= 450*time.Millisecond {
 		t.Fatalf("sections were not collected concurrently: %s", elapsed)
 	}
-	if snapshot.Overview.Usage.Available || !snapshot.Overview.Stability.Available || !snapshot.Overview.Upstream.Available || snapshot.Overview.CostClosure.Available {
+	if snapshot.Overview.Usage.Available || !snapshot.Overview.Stability.Available || !snapshot.Overview.Upstream.Available || snapshot.Overview.CostClosure.Available || snapshot.Overview.Finance.Available {
 		t.Fatalf("section failure was not isolated: %+v", snapshot.Overview)
 	}
 }
