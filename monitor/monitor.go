@@ -149,6 +149,12 @@ type Monitor struct {
 	syncStatusMu       sync.Mutex
 	syncStatusCachedAt time.Time
 	syncStatusCached   *syncStatusSnapshot
+	// 经营核算会同时扫描多个月、每日明细和渠道证据。结果只来自本地已发布事实，
+	// 因此按日期区间做短时、有界缓存，避免同一小时内每次打开页面都重复扫描
+	// SQLite。缓存只保存序列化后的只读响应；手动刷新可以显式绕过。
+	financeReportCacheOnce sync.Once
+	financeReportCache     *boundedByteCache
+	financeReportFlight    cacheFlightGroup
 
 	usageGateOnce         sync.Once // 聚合/后台来源查询泳道，容量 1
 	usageGate             chan struct{}

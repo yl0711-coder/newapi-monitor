@@ -296,7 +296,7 @@
 
   function init() {
     state.inited = true;
-    $('finRefresh')?.addEventListener('click', load);
+    $('finRefresh')?.addEventListener('click', () => load(true));
     $('finSinceLaunch')?.addEventListener('click', () => {
       $('finFrom').value = '';
       $('finTo').value = '';
@@ -330,7 +330,7 @@
     load();
   }
 
-  async function load() {
+  async function load(forceFresh = false) {
     if (state.abort) state.abort.abort();
     state.abort = new AbortController();
     const button = $('finRefresh');
@@ -338,6 +338,7 @@
     const query = new URLSearchParams();
     if ($('finFrom')?.value) query.set('from', $('finFrom').value);
     if ($('finTo')?.value) query.set('to', $('finTo').value);
+    if (forceFresh) query.set('fresh', '1');
     try {
       const response = await fetch(`/finance/report${query.size ? `?${query}` : ''}`, {
         headers: { Accept: 'application/json' }, signal: state.abort.signal,
@@ -345,6 +346,7 @@
       if (response.status === 401) { location.href = '/login'; return; }
       const data = await response.json();
       if (!response.ok) throw new Error(data.detail || data.error || `HTTP ${response.status}`);
+      data._cache_status = response.headers.get('X-Monitor-Finance-Cache') || '';
       state.loaded = true;
       render(data);
     } catch (error) {
@@ -368,7 +370,9 @@
           : data.user_coverage?.complete ? '用户用量完整，部分上游成本仍待补证'
           : '已展示现有用量，部分小时与上游成本仍待补证';
     const snapshotNote=data.data_as_of?` · 快照截至 ${dateTime(data.data_as_of)}`:'';
-    status.innerHTML = `<i></i><div><b>${summary}</b><br>${enabled ? `区间 ${date(data.from)} 至 ${date(data.to)} · 用量 ${userCoverage(data.user_coverage)} · 成本 ${upstreamCoverage(data.upstream_coverage)}${snapshotNote}` : '配置 MONITOR_FINANCE_ENABLED=true 后，只读展示已有事实。'}</div>`;
+    const generatedNote=data.generated_at?` · 生成于 ${dateTime(data.generated_at)}`:'';
+    const refreshingNote=data._cache_status==='stale-refreshing'?' · 后台更新中':'';
+    status.innerHTML = `<i></i><div><b>${summary}</b><br>${enabled ? `区间 ${date(data.from)} 至 ${date(data.to)} · 用量 ${userCoverage(data.user_coverage)} · 成本 ${upstreamCoverage(data.upstream_coverage)}${snapshotNote}${generatedNote}${refreshingNote}` : '配置 MONITOR_FINANCE_ENABLED=true 后，只读展示已有事实。'}</div>`;
 
     setMoney('finConsumption', statement.user_consumption, statement.known_user_consumption,
       `消费扣额 ${money(statement.gross_user_consumption)} - 退还 ${money(statement.user_refunds)}；内部测试另列 ${money(statement.internal_test_consumption)}`,

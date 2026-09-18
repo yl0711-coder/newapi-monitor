@@ -2875,18 +2875,12 @@ func (m *Monitor) serveFinanceOperatingReport(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "查询范围晚于本地快照截止时间"})
 		return
 	}
-	report, err := m.buildFinanceOperatingReport(ctx, from, to)
+	request := financeReportRequest{from: from, to: to, snapshotAsOf: snapshotAsOf, snapshotClamped: snapshotClamped}
+	payload, cacheStatus, err := m.financeReportPayload(ctx, request, c.Query("fresh") == "1")
 	if err != nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "经营核算报表暂不可用", "detail": err.Error()})
 		return
 	}
-	if snapshotAsOf > 0 {
-		report.DataAsOf = snapshotAsOf
-	}
-	if snapshotClamped {
-		loc, _ := time.LoadLocation("Asia/Shanghai")
-		notice := fmt.Sprintf("本机预览使用静态快照，数据截至 %s；查询结束时间已限制在快照边界。", time.Unix(snapshotAsOf, 0).In(loc).Format("2006-01-02 15:04"))
-		report.Notices = append([]string{notice}, report.Notices...)
-	}
-	c.JSON(http.StatusOK, report)
+	c.Header("X-Monitor-Finance-Cache", cacheStatus)
+	c.Data(http.StatusOK, "application/json; charset=utf-8", payload)
 }
