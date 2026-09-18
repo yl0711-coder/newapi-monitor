@@ -67,7 +67,9 @@ func (m *Monitor) stabilityHealth(ctx context.Context, nowTime time.Time) stabil
 	result := stabilityHealthResponse{
 		Enabled: m.cfg.StabilityEnabled, Status: "ok", CheckedAt: now, MainSamplerLastSuccess: m.lastRun.Load(),
 		ProblemSamplerLastSuccess: m.problemLastSuccess.Load(), ProblemSamplerLastFailure: m.problemLastFailure.Load(),
-		ProblemMigration: m.stabilityProblemMigrationProgress(), NginxEnabled: m.cfg.NginxEnabled, NginxErrorEnabled: m.cfg.NginxErrorEnabled,
+		ProblemMigration:  m.stabilityProblemMigrationProgress(),
+		NginxEnabled:      m.cfg.NginxEnabled && m.cfg.StabilityLegacyCollectorHealthEnabled,
+		NginxErrorEnabled: m.cfg.NginxErrorEnabled && m.cfg.StabilityLegacyCollectorHealthEnabled,
 	}
 	var hourlyMigration stabilityHourlyMigrationProgress
 	if err := m.storeDB.WithContext(ctx).Model(&StabilityBackfillJob{}).
@@ -152,7 +154,7 @@ func (m *Monitor) stabilityHealth(ctx context.Context, nowTime time.Time) stabil
 		// are signed, while operators can see that recent Tail is still fresh.
 		result.Status = "degraded"
 	}
-	if m.cfg.NginxEnabled {
+	if result.NginxEnabled {
 		sources := m.nginxSources(ctx, now)
 		result.NginxSourceCount = len(sources)
 		for _, source := range sources {
@@ -185,7 +187,7 @@ func (m *Monitor) stabilityHealth(ctx context.Context, nowTime time.Time) stabil
 			result.Status = "degraded"
 		}
 	}
-	if m.cfg.NginxErrorEnabled {
+	if result.NginxErrorEnabled {
 		errorSources := m.nginxErrorSources(ctx, now)
 		result.NginxErrorSourceCount = len(errorSources)
 		for _, source := range errorSources {
@@ -197,8 +199,10 @@ func (m *Monitor) stabilityHealth(ctx context.Context, nowTime time.Time) stabil
 			result.Status = "degraded"
 		}
 	}
-	result.NginxEvidence = m.nginxEvidenceHealth(ctx, nowTime)
-	if m.cfg.ECSLogEnabled {
+	if m.cfg.StabilityLegacyCollectorHealthEnabled {
+		result.NginxEvidence = m.nginxEvidenceHealth(ctx, nowTime)
+	}
+	if m.cfg.ECSLogEnabled && m.cfg.StabilityLegacyCollectorHealthEnabled {
 		health := m.ecsLogHealth(ctx, now)
 		result.ECSLogs = &health
 		if !health.Available || health.Status != "ok" {

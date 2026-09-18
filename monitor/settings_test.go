@@ -23,6 +23,18 @@ func TestAICodeWithRecordsRequireExplicitOptIn(t *testing.T) {
 	}
 }
 
+func TestLegacyCollectorHealthDefaultsOnAndAllowsExplicitDisable(t *testing.T) {
+	const key = "MONITOR_STABILITY_LEGACY_COLLECTOR_HEALTH_ENABLED"
+	t.Setenv(key, "")
+	if !LoadSettings().StabilityLegacyCollectorHealthEnabled {
+		t.Fatal("ordinary upgrade must preserve legacy collector health evaluation")
+	}
+	t.Setenv(key, "false")
+	if LoadSettings().StabilityLegacyCollectorHealthEnabled {
+		t.Fatal("explicit false must exclude migrated legacy collectors from stability health")
+	}
+}
+
 func TestOriginLockTargetsAllowExplicitDisable(t *testing.T) {
 	const key = "MONITOR_ORIGIN_LOCK_TARGETS"
 	t.Setenv(key, "")

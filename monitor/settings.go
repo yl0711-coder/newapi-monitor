@@ -68,6 +68,9 @@ type Settings struct {
 	// 它只读取生产 logs(type=5) 并写 Monitor 本地 SQLite，不会开启完整 source worker。
 	StabilityProblemSourceEnabled       bool // MONITOR_STABILITY_PROBLEM_SOURCE_ENABLED，默认 false
 	StabilityProblemSourceLookbackHours int  // MONITOR_STABILITY_PROBLEM_SOURCE_LOOKBACK_HOURS，默认 24，范围 1～168
+	// 只控制旧 Nginx/ECS 采集链路是否参与稳定性健康判定。关闭时不停止
+	// 接收器、不改变 ownership 账本、不删除历史数据，用于日志职责迁至 CloudWatch 的过渡期。
+	StabilityLegacyCollectorHealthEnabled bool // MONITOR_STABILITY_LEGACY_COLLECTOR_HEALTH_ENABLED，默认 true
 	// 长期小时数据补数直接聚合生产 logs 的单个小时，不写分钟表。查询始终串行，
 	// 片间延迟和来源占用率共同给主站数据库让路。分类规则升级产生的大范围
 	// 缺口只能通过显式 migration 开关自动创建持久任务，不能随普通修洞静默启动。
@@ -362,6 +365,7 @@ func LoadSettings() Settings {
 		StabilityProblemSampleSec:                envInt("MONITOR_STABILITY_PROBLEM_SAMPLE_SECONDS", 300),
 		StabilityProblemSourceEnabled:            env("MONITOR_STABILITY_PROBLEM_SOURCE_ENABLED", "false") == "true",
 		StabilityProblemSourceLookbackHours:      envInt("MONITOR_STABILITY_PROBLEM_SOURCE_LOOKBACK_HOURS", 24),
+		StabilityLegacyCollectorHealthEnabled:    env("MONITOR_STABILITY_LEGACY_COLLECTOR_HEALTH_ENABLED", "true") == "true",
 		BackgroundSourceMinStartIntervalMS:       envInt("MONITOR_BACKGROUND_SOURCE_MIN_START_INTERVAL_MS", 2000),
 		StabilityBackfillDelayMS:                 envInt("MONITOR_STABILITY_BACKFILL_DELAY_MS", 2000),
 		StabilityBackfillTimeoutSec:              envInt("MONITOR_STABILITY_BACKFILL_TIMEOUT_SECONDS", 20),

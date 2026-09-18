@@ -128,6 +128,7 @@ func TestECSLogStatusSnapshotFilteringAndSummary(t *testing.T) {
 
 func TestECSLogHealthIncludedInUnifiedStabilityHealth(t *testing.T) {
 	m := newECSLogTestMonitor(t)
+	m.cfg.StabilityLegacyCollectorHealthEnabled = true
 	h := m.stabilityHealth(context.Background(), time.Now())
 	if h.ECSLogs == nil || h.ECSLogs.DiscoveryIssues != 1 || h.Status != "degraded" {
 		t.Fatalf("dynamic discovery missing from unified sync state: %+v", h.ECSLogs)
@@ -136,5 +137,18 @@ func TestECSLogHealthIncludedInUnifiedStabilityHealth(t *testing.T) {
 	h = m.stabilityHealth(context.Background(), time.Now())
 	if h.ECSLogs != nil {
 		t.Fatal("legacy health contract changed while ECS is disabled")
+	}
+}
+
+func TestMigratedLegacyCollectorsDoNotDegradeStabilityHealth(t *testing.T) {
+	m := newECSLogTestMonitor(t)
+	m.cfg.StabilityLegacyCollectorHealthEnabled = false
+	m.cfg.NginxEnabled = true
+	m.cfg.NginxErrorEnabled = true
+	now := time.Now()
+	m.lastRun.Store(now.Unix())
+	h := m.stabilityHealth(context.Background(), now)
+	if h.Status != "ok" || h.NginxEnabled || h.NginxErrorEnabled || h.ECSLogs != nil || h.NginxEvidence.Enabled {
+		t.Fatalf("migrated collector transport leaked into stability health: %+v", h)
 	}
 }

@@ -1100,11 +1100,11 @@ func (m *Monitor) buildStabilityReportWithDetails(ctx context.Context, scope sta
 	if meta.Sources.NewAPILastTs > meta.Sources.ProblemCoverageTo && meta.Sources.ProblemCoverageTo > 0 {
 		meta.Sources.ProblemCoverageLagSec = meta.Sources.NewAPILastTs - meta.Sources.ProblemCoverageTo
 	}
-	meta.Sources.NginxEnabled = m.cfg.NginxEnabled
-	meta.Sources.NginxConnected, meta.Sources.NginxHealthySources, meta.Sources.NginxSourceCount,
-		meta.Sources.NginxLastTs, meta.Sources.RequestIDCoverage = m.nginxSourceSummary(ctx, now)
+	meta.Sources.NginxEnabled = m.cfg.NginxEnabled && m.cfg.StabilityLegacyCollectorHealthEnabled
 	meta.Sources.NginxStatus = "disabled"
 	if meta.Sources.NginxEnabled {
+		meta.Sources.NginxConnected, meta.Sources.NginxHealthySources, meta.Sources.NginxSourceCount,
+			meta.Sources.NginxLastTs, meta.Sources.RequestIDCoverage = m.nginxSourceSummary(ctx, now)
 		meta.Sources.NginxStatus = "degraded"
 		if meta.Sources.NginxConnected {
 			meta.Sources.NginxStatus = "ok"

@@ -1237,6 +1237,7 @@ func TestStabilityHealthIncludesNginxCollectorState(t *testing.T) {
 	m.cfg.StabilityEnabled = false
 	m.cfg.SampleSeconds = 60
 	m.cfg.NginxEnabled = true
+	m.cfg.StabilityLegacyCollectorHealthEnabled = true
 	m.cfg.NginxAllowedNodes = []string{"master", "slave"}
 	now := time.Now().Unix()
 	m.lastRun.Store(now)
