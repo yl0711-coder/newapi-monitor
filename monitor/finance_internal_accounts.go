@@ -245,6 +245,10 @@ func (m *Monitor) saveFinanceInternalAccounts(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "保存内部账号失败", "detail": err.Error()})
 		return
 	}
+	// 账号名单会改变经营口径，不应等待常规的分钟级轮询。
+	// 唤醒信号是有界的，不会增加生产库并发查询数。
+	m.financeFactsPreferInternal.Store(true)
+	m.notifyFinanceFactsSync()
 	// 配置改变后旧报表缓存不得继续命中。缓存键另含配置
 	// 哈希，这里无需删除原始事实或重启 Monitor。
 	c.JSON(http.StatusOK, gin.H{"ok": true, "accounts": rows, "config_hash": audit.AfterHash})

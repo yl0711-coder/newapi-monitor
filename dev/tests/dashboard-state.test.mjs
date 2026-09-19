@@ -582,6 +582,29 @@ test('Spring observed hourly amount is numeric with a quiet reconciliation note'
   assert.doesNotMatch(card,/所涉自然日上游消费/);
 });
 
+test('internal-account backfill keeps raw upstream amounts visible and clearly provisional',()=>{
+  const {context,html}=dashboard(),ui=context.channelTest;
+  const usage={requests:10,tokens:100,cost_usd:20};
+  const domain={key:'pending',domain:'pending.example',configured:true,usage,
+    vendors:[{name:'vendor',channels:[{id:1,name:'channel',current:true,status:1,usage,groups:[]}]}],
+    upstream:{configured:true,usage_sync_enabled:true,balance_usd:100,status:'ok',assessment:{available:true,status:'healthy',estimated_runway_days:5,
+      required_balance_usd:20,average_daily_cost_usd:20,lookback_days:7,threshold_days:1,coverage_pct:100}},
+    upstream_usage:{available:true,integrity_status:'complete',cost_usd:70,adjusted_cost_available:true,adjusted_cost_usd:35,
+      business_cost_available:false,business_adjusted_cost_available:false,business_cost_usd:0,business_adjusted_cost_usd:0,
+      internal_filter_status:'backfilling',recharge_ratio:2}};
+  const card=ui.domainCard(domain,0,usage,false);
+  assert.match(card,/\$70\.00/);
+  assert.match(card,/\$35\.00/);
+  assert.match(card,/暂显示原账单 · 内部过滤补齐中/);
+  assert.match(card,/暂含内部用量 · 内部过滤补齐中/);
+  assert.match(card,/按近 7 日原始账单日均 \$20\.00 估算/);
+  ui.cm.report={meta:{from:'2026-09-18',to:'2026-09-19',data_coverage:{complete:true}},summary:{usage},domains:[domain]};
+  ui.render();
+  assert.match(html('cmSummary'),/<b>\$70\.00<\/b>/);
+  assert.match(html('cmSummary'),/<b>\$35\.00<\/b>/);
+  assert.match(html('cmSummary'),/1 个账户暂含内部用量/);
+});
+
 test('daily source projection does not bypass invalid money or missing recharge evidence',()=>{
   const {context}=dashboard(),quality=context.window.channelDataStatus;
   const domain={key:'bad',domain:'bad.example',usage:{},vendors:[],upstream:{configured:true,balance_usd:10,usage_sync_enabled:true},

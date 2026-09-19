@@ -245,7 +245,18 @@ func (m *Monitor) financeInternalFactState(ctx context.Context, accounts []Finan
 	}
 	now := time.Now().Unix()
 	err = db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		if err := tx.Session(&gorm.Session{AllowGlobalUpdate: true}).Delete(&FinanceInternalAccountHourFact{}).Error; err != nil {
+		// 保留仍在名单中的派生事实，重建时再按时间桶原子替换。
+		// 这样配置变更或进程异常不会先清空全部历史。
+		ids := make([]int64, 0, len(accounts))
+		for _, account := range accounts {
+			ids = append(ids, account.UserID)
+		}
+		query := tx.Model(&FinanceInternalAccountHourFact{})
+		if len(ids) == 0 {
+			if err := query.Session(&gorm.Session{AllowGlobalUpdate: true}).Delete(&FinanceInternalAccountHourFact{}).Error; err != nil {
+				return err
+			}
+		} else if err := query.Where("user_id NOT IN ?", ids).Delete(&FinanceInternalAccountHourFact{}).Error; err != nil {
 			return err
 		}
 		state = FinanceInternalAccountFactState{ID: financeInternalFactStateID, ConfigHash: hash, SourceEpoch: sourceEpoch, StartHourTs: start, NextHourTs: start, Status: "pending", UpdatedAt: now}

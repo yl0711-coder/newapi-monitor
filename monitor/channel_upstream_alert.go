@@ -46,6 +46,25 @@ type upstreamBalancePolicy struct {
 	MinCoverage float64
 }
 
+func (m *Monitor) manuallyDisabledUpstreamDomains(ctx context.Context) (map[string]bool, error) {
+	var rows []struct {
+		Domain string
+	}
+	err := m.storeDB.WithContext(ctx).Raw(`SELECT LOWER(TRIM(base_domain)) domain
+		FROM channel_snaps
+		WHERE deleted_at=0 AND TRIM(COALESCE(base_domain,''))<>''
+		GROUP BY LOWER(TRIM(base_domain))
+		HAVING SUM(CASE WHEN status<>2 THEN 1 ELSE 0 END)=0`).Scan(&rows).Error
+	if err != nil {
+		return nil, err
+	}
+	result := make(map[string]bool, len(rows))
+	for _, row := range rows {
+		result[row.Domain] = true
+	}
+	return result, nil
+}
+
 func upstreamBalancePolicyFor(c AlertConfig) upstreamBalancePolicy {
 	p := upstreamBalancePolicy{
 		RunwayDays: c.UpstreamBalanceRunwayDays, Lookback: c.UpstreamBalanceLookbackDays,
@@ -253,7 +272,16 @@ func (m *Monitor) evaluateUpstreamBalanceAlerts(c AlertConfig, now int64) {
 		slog.Warn("计算渠道余额可用天数失败，跳过动态余额预警", "err", err)
 		return
 	}
+	manuallyDisabled, err := m.manuallyDisabledUpstreamDomains(ctx)
+	if err != nil {
+		// 无法确认渠道生命周期时不猜测，保持原有告警行为。
+		slog.Warn("读取手动禁用渠道状态失败", "err", err)
+		manuallyDisabled = map[string]bool{}
+	}
 	for domain, assessment := range assessments {
+		if manuallyDisabled[domain] {
+			continue
+		}
 		if (assessment.Status != "warning" && assessment.Status != "critical") || assessment.EstimatedRunwayDays == nil {
 			continue
 		}

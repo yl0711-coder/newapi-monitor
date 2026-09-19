@@ -166,6 +166,60 @@ func TestInternalCostEvidenceFailureIsIsolatedByDomain(t *testing.T) {
 	}
 }
 
+func TestFinanceFactWakeInterruptsIdleWait(t *testing.T) {
+	m := &Monitor{}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	done := make(chan bool, 1)
+	go func() { done <- m.waitFinanceFactsSync(ctx, time.Hour) }()
+	m.notifyFinanceFactsSync()
+	select {
+	case ok := <-done:
+		if !ok {
+			t.Fatal("wake should resume the finance worker")
+		}
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("finance worker did not wake promptly")
+	}
+}
+
+func TestFinanceInternalFactConfigChangeKeepsCurrentAccountsUntilAtomicReplacement(t *testing.T) {
+	m := newStabilityTestMonitor(t)
+	m.cfg.FinanceStartDate = "2026-05-01"
+	m.cfg.UsageFactsHistorySourceEpoch = "epoch-a"
+	start, err := financeStartHour(m.cfg.FinanceStartDate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldAccounts := []FinanceInternalAccount{{UserID: 1}, {UserID: 2}}
+	if err := m.usageFactsStore().Create(&FinanceInternalAccountFactState{
+		ID: financeInternalFactStateID, ConfigHash: financeInternalAccountHash(oldAccounts), SourceEpoch: "epoch-a",
+		StartHourTs: start, NextHourTs: start + 86400, Status: "running",
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := m.usageFactsStore().Create(&[]FinanceInternalAccountHourFact{
+		{HourTs: start, UserID: 1, ChannelID: 10, Grp: "paid", Requests: 1},
+		{HourTs: start, UserID: 2, ChannelID: 20, Grp: "paid", Requests: 1},
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	state, err := m.financeInternalFactState(context.Background(), []FinanceInternalAccount{{UserID: 1}}, "epoch-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.NextHourTs != start || state.Status != "pending" {
+		t.Fatalf("state was not reset for rebuild: %+v", state)
+	}
+	var rows []FinanceInternalAccountHourFact
+	if err := m.usageFactsStore().Order("user_id").Find(&rows).Error; err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0].UserID != 1 {
+		t.Fatalf("current-account facts should remain while removed accounts are pruned: %+v", rows)
+	}
+}
+
 func TestConfiguredAccountCostEvidenceDoesNotDependOnAutomaticProbePairs(t *testing.T) {
 	m := newFinanceReportTestMonitor(t, "example.test")
 	hour := int64(1_788_195_600)

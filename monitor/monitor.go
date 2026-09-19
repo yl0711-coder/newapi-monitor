@@ -257,6 +257,9 @@ type Monitor struct {
 	storeBackupSetVerified       atomic.Bool
 	usageFactsLoopHeartbeat      atomic.Int64
 	usageFactsRestarts           atomic.Int64
+	financeFactsWakeOnce         sync.Once
+	financeFactsWake             chan struct{}
+	financeFactsPreferInternal   atomic.Bool
 
 	usageCache *usageResultCache // 用量聚合结果的有界本机缓存，不连接 Redis
 	portalLim  *portalLimiter    // 客户端登录限流

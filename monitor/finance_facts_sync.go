@@ -594,21 +594,60 @@ func (m *Monitor) populateFinanceFactBackfillEvidence(ctx context.Context, resul
 		Count(&result.BoundaryEvents).Error
 }
 
-// runFinanceFactsSync is intentionally single-hour and single-threaded. It
-// shares the usage source gate, so foreground diagnostics and existing facts
-// work remain higher priority than finance backfill.
+func (m *Monitor) financeFactsWakeChannel() <-chan struct{} {
+	m.financeFactsWakeOnce.Do(func() { m.financeFactsWake = make(chan struct{}, 1) })
+	return m.financeFactsWake
+}
+
+func (m *Monitor) notifyFinanceFactsSync() {
+	_ = m.financeFactsWakeChannel()
+	select {
+	case m.financeFactsWake <- struct{}{}:
+	default:
+	}
+}
+
+func (m *Monitor) waitFinanceFactsSync(ctx context.Context, delay time.Duration) bool {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-m.financeFactsWakeChannel():
+		return true
+	case <-timer.C:
+		return true
+	}
+}
+
+// runFinanceFactsSync is intentionally single-threaded and alternates the two
+// backfill lanes while both have work. A long main-ledger backlog therefore
+// cannot starve an internal-account configuration rebuild, and saving a new
+// account list wakes this worker immediately without increasing source-query
+// concurrency.
 func (m *Monitor) runFinanceFactsSync(ctx context.Context) {
 	for {
-		progressed, err := m.syncNextFinanceFactHour(ctx)
-		if err == nil && !progressed {
+		preferInternal := m.financeFactsPreferInternal.Load()
+		var progressed bool
+		var err error
+		if preferInternal {
 			progressed, err = m.syncNextFinanceInternalAccountBatch(ctx)
+			if err == nil && !progressed {
+				progressed, err = m.syncNextFinanceFactHour(ctx)
+			}
+		} else {
+			progressed, err = m.syncNextFinanceFactHour(ctx)
+			if err == nil && !progressed {
+				progressed, err = m.syncNextFinanceInternalAccountBatch(ctx)
+			}
 		}
+		m.financeFactsPreferInternal.Store(!preferInternal)
 		if ctx.Err() != nil {
 			return
 		}
 		delay := m.usageFactBackfillDelay()
 		if err != nil {
-			slog.Warn("经营核算事实同步暂停在当前小时", "err", err)
+			slog.Warn("经营核算事实同步暂停", "err", err)
 			delay = time.Minute
 		} else if !progressed {
 			delay = time.Duration(m.cfg.UsageFactsSyncMinutes) * time.Minute
@@ -616,7 +655,7 @@ func (m *Monitor) runFinanceFactsSync(ctx context.Context) {
 				delay = time.Minute
 			}
 		}
-		if !waitUsageFact(ctx, delay) {
+		if !m.waitFinanceFactsSync(ctx, delay) {
 			return
 		}
 	}

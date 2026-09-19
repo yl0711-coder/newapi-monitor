@@ -222,3 +222,52 @@ func TestUpstreamBalanceAlertEvaluationIsNoMoreFrequentThanBalanceSync(t *testin
 		t.Fatalf("到达同步间隔后应重新评估，得到 %d", got)
 	}
 }
+
+func TestManuallyDisabledUpstreamDomainsRequireEveryCurrentChannelDisabled(t *testing.T) {
+	m := newStabilityTestMonitor(t)
+	rows := []ChannelSnap{
+		{ID: 1, BaseDomain: "disabled.example", Status: 2},
+		{ID: 2, BaseDomain: "disabled.example", Status: 2},
+		{ID: 3, BaseDomain: "active.example", Status: 2},
+		{ID: 4, BaseDomain: "active.example", Status: 1},
+		{ID: 5, BaseDomain: "auto.example", Status: 3},
+		{ID: 6, BaseDomain: "deleted.example", Status: 2, DeletedAt: 1},
+	}
+	if err := m.storeDB.Create(&rows).Error; err != nil {
+		t.Fatal(err)
+	}
+	disabled, err := m.manuallyDisabledUpstreamDomains(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !disabled["disabled.example"] || disabled["active.example"] || disabled["auto.example"] || disabled["deleted.example"] {
+		t.Fatalf("unexpected manually-disabled domains: %+v", disabled)
+	}
+}
+
+func TestUpstreamBalanceAlertSkipsFullyManuallyDisabledDomain(t *testing.T) {
+	m := newStabilityTestMonitor(t)
+	now := time.Date(2026, 8, 8, 12, 0, 0, 0, cstLocation).Unix()
+	domain := "disabled.example"
+	account := seededUpstreamBalanceAccount(now, 10)
+	seedUpstreamLedger(t, m, domain, account.Provider, now, 7, 50, 3600)
+	if err := m.storeDB.Create(&ChannelUpstreamAccount{
+		Domain: domain, Provider: account.Provider, Enabled: true, Status: upstreamStatusOK,
+		BalanceUSD: *account.BalanceUSD, BalanceKnown: true, LastSuccessAt: now, UsageSyncEnabled: true,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := m.storeDB.Create(&ChannelSnap{ID: 1, BaseDomain: domain, Status: 2}).Error; err != nil {
+		t.Fatal(err)
+	}
+	cfg := defaultAlertConfig()
+	cfg.UpstreamBalanceAlertsEnabled = true
+	m.evaluateUpstreamBalanceAlerts(cfg, now)
+	var count int64
+	if err := m.storeDB.Model(&AlertLog{}).Where("kind LIKE ? AND target=?", "upstream_balance_low%", domain).Count(&count).Error; err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("fully manually-disabled upstream emitted %d low-balance alerts", count)
+	}
+}
