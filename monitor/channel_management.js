@@ -711,6 +711,14 @@ async function loadEconomicsDomain(key){
     cm.economicsHourly.set(key,{from:0,to:0,domains:[],error:error.message||'小时曲线读取失败'});render();
   }
 }
+function businessCostAvailable(usage){
+  return typeof usage?.business_cost_available==='boolean'?usage.business_cost_available:!!usage?.available;
+}
+function businessAdjustedCostAvailable(usage){
+  return typeof usage?.business_adjusted_cost_available==='boolean'?usage.business_adjusted_cost_available:!!usage?.adjusted_cost_available;
+}
+function businessCostValue(usage){return usage?.business_cost_usd??usage?.cost_usd}
+function businessAdjustedCostValue(usage){return usage?.business_adjusted_cost_usd??usage?.adjusted_cost_usd}
 function domainCard(domain,index,total,filtered){
   const channels=domain.vendors.flatMap(v=>v.channels),enabled=channels.filter(ch=>ch.current&&+ch.status===1).length;
   const groups=domainServiceGroups(domain);
@@ -727,15 +735,11 @@ function domainCard(domain,index,total,filtered){
   const upstreamBalance=window.channelDataStatus.known(domain.upstream?.balance_usd)?usd(domain.upstream.balance_usd):'—';
   const upstreamRunwayView=upstreamRunway(domain.upstream);
 	const upstreamIntegrity=upstreamUsage.integrity_status||'complete',upstreamTrusted=upstreamIntegrity==='complete';
-	const businessCostAvailable=typeof upstreamUsage.business_cost_available==='boolean'?upstreamUsage.business_cost_available:upstreamUsage.available;
-	const businessCost=upstreamUsage.business_cost_usd??upstreamUsage.cost_usd;
-  const upstreamSpend=businessCostAvailable&&upstreamTrusted&&window.channelDataStatus.known(businessCost)?usd(businessCost):'—';
+	const upstreamSpend=businessCostAvailable(upstreamUsage)&&upstreamTrusted&&window.channelDataStatus.known(businessCostValue(upstreamUsage))?usd(businessCostValue(upstreamUsage)):'—';
 	const observedRatio=Number(upstreamUsage.recharge_ratio),ratio=Number.isFinite(observedRatio)&&observedRatio>0?observedRatio:0;
 	let ratioLabel='';
-	const businessAdjustedAvailable=typeof upstreamUsage.business_adjusted_cost_available==='boolean'?upstreamUsage.business_adjusted_cost_available:upstreamUsage.adjusted_cost_available;
-	const businessAdjustedCost=upstreamUsage.business_adjusted_cost_usd??upstreamUsage.adjusted_cost_usd;
-	if(businessAdjustedAvailable)ratioLabel=upstreamUsage.recharge_ratio_varies?'按历史充值比例版本修正':`到账/支付 ${ratio.toLocaleString(undefined,{maximumFractionDigits:4})}×`;
-	const adjustedSpend=upstreamTrusted&&businessAdjustedAvailable&&window.channelDataStatus.known(businessAdjustedCost)?usd(businessAdjustedCost):'—';
+	if(businessAdjustedCostAvailable(upstreamUsage))ratioLabel=upstreamUsage.recharge_ratio_varies?'按历史充值比例版本修正':`到账/支付 ${ratio.toLocaleString(undefined,{maximumFractionDigits:4})}×`;
+	const adjustedSpend=upstreamTrusted&&businessAdjustedCostAvailable(upstreamUsage)&&window.channelDataStatus.known(businessAdjustedCostValue(upstreamUsage))?usd(businessAdjustedCostValue(upstreamUsage)):'—';
 	const internalStatus=upstreamUsage.internal_filter_status||'not_configured';
 	const internalExcluded=Number(upstreamUsage.internal_excluded_cost_usd||0),internalNote=internalStatus==='complete'?(internalExcluded>0?`已排除内部账号 ${usd(internalExcluded)}`:'内部账号已核验'):internalStatus==='not_configured'?'':internalStatus==='inconsistent'?'内部成本与原账单不一致':'内部账号用量补齐中';
   const upstreamSpendLabel=billView.daily?'所涉自然日业务上游消费':upstreamUsage.granularity==='day'?'自然日业务上游消费':'区间业务上游消费';
@@ -757,7 +761,11 @@ function upstreamAggregateLabel(rows,field){
   // 小时/自然日是上游源账单的采集粒度，不是两种货币或销售单位。
   // 后端已按同一查询区间为每个账户返回 cost_usd；顶部只展示这些
   // 账户的单一金额合计。数据不完整由覆盖说明明示，不再把金额拆成两个。
-  return rows.length?usd(rows.reduce((total,domain)=>total+(+domain.upstream_usage?.[field]||0),0)):'—';
+  return rows.length?usd(rows.reduce((total,domain)=>{
+    const usage=domain.upstream_usage||{};
+    const value=field==='business_cost_usd'?businessCostValue(usage):field==='business_adjusted_cost_usd'?businessAdjustedCostValue(usage):usage[field];
+    return total+(+value||0);
+  },0)):'—';
 }
 function freshness(meta){
   const coverage=meta?.data_coverage||{},hasCoverage=typeof coverage.complete==='boolean',expected=+coverage.expected_hours||0,completed=+coverage.completed_hours||0,missing=+coverage.missing_hours||0;
@@ -1318,8 +1326,8 @@ function render(){
   const upstreamConfiguredAccounts=domains.filter(domain=>domain.upstream?.configured);
   const upstreamAccounts=upstreamConfiguredAccounts.filter(domain=>domain.upstream?.usage_sync_enabled);
   const upstreamUsageDomains=upstreamAccounts.filter(domain=>domain.upstream_usage?.available);
-	const trustedUsageDomains=upstreamUsageDomains.filter(domain=>(domain.upstream_usage.integrity_status||'complete')==='complete'&&domain.upstream_usage.business_cost_available&&window.channelDataStatus.known(domain.upstream_usage.business_cost_usd));
-	const adjustedUsageDomains=trustedUsageDomains.filter(domain=>domain.upstream_usage.business_adjusted_cost_available&&window.channelDataStatus.known(domain.upstream_usage.business_adjusted_cost_usd));
+	const trustedUsageDomains=upstreamUsageDomains.filter(domain=>(domain.upstream_usage.integrity_status||'complete')==='complete'&&businessCostAvailable(domain.upstream_usage)&&window.channelDataStatus.known(businessCostValue(domain.upstream_usage)));
+	const adjustedUsageDomains=trustedUsageDomains.filter(domain=>businessAdjustedCostAvailable(domain.upstream_usage)&&window.channelDataStatus.known(businessAdjustedCostValue(domain.upstream_usage)));
   const upstreamBalanceDomains=upstreamConfiguredAccounts.filter(domain=>domain.upstream.balance_usd!=null&&Number.isFinite(Number(domain.upstream.balance_usd)));
   const upstreamBalance=upstreamBalanceDomains.reduce((sum,domain)=>sum+Number(domain.upstream.balance_usd),0);
   const upstreamSpendValue=upstreamAggregateLabel(trustedUsageDomains,'business_cost_usd');

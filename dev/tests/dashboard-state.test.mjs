@@ -552,7 +552,7 @@ test('daily bill stays visible after refresh with scope, never contaminates hour
     ui.render();
     assert.match(html('cmBody'),new RegExp('\\$'+amount.toFixed(2).replace('.','\\.')));
     assert.match(html('cmBody'),/\$385\.16/);
-    assert.match(html('cmBody'),/所涉自然日上游消费/);
+    assert.match(html('cmBody'),/所涉自然日业务上游消费/);
     assert.match(html('cmBody'),/18:17:03/);
     assert.match(html('cmBody'),/非所选小时区间金额/);
     assert.match(html('cmSummary'),/<b>\$10\.00<\/b>/);
