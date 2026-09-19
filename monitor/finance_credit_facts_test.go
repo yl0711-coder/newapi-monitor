@@ -58,6 +58,27 @@ func TestFetchFinanceCreditHourClassifiesGiftEvidence(t *testing.T) {
 	}
 }
 
+func TestFetchFinanceCreditHourAcceptsRC26NegativeBalanceOverride(t *testing.T) {
+	source := financeCreditTestSource(t)
+	if _, err := source.Exec(`INSERT INTO users(id,created_at) VALUES(7,100);
+		INSERT INTO logs(id,user_id,created_at,type,content,other) VALUES(3337476,1,200,3,
+		'Overrode user quota from ＄-0.955357 额度 to ＄9.044643 额度',
+		'{"admin_info":{"admin_id":1,"admin_role":100,"admin_username":"operator","auth_method":"session"},"op":{"action":"user.quota_override","params":{"from":"＄-0.955357 额度","target_user_id":7,"to":"＄9.044643 额度"}}}')`); err != nil {
+		t.Fatal(err)
+	}
+	fetched, err := fetchFinanceCreditHour(context.Background(), source, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fetched.SourceRows != 1 || fetched.IgnoredRows != 0 || len(fetched.Events) != 1 {
+		t.Fatalf("fetch=%+v", fetched)
+	}
+	event := fetched.Events[0]
+	if event.SourceLogID != 3337476 || event.TargetUserID != 7 || event.BeforeMicro != -955_357 || event.AfterMicro != 9_044_643 || event.NetChangeMicro != 10_000_000 || event.EligibleTrial {
+		t.Fatalf("RC26 negative-balance override=%+v", event)
+	}
+}
+
 func TestFetchFinanceCreditHourFailsOnChangedQuotaFormat(t *testing.T) {
 	source := financeCreditTestSource(t)
 	if _, err := source.Exec(`INSERT INTO users(id,created_at) VALUES(7,100);

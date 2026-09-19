@@ -39,8 +39,8 @@ type StructuredAdjustment struct {
 
 var (
 	deltaPattern     = regexp.MustCompile(`^管理员(增加|减少)用户额度 ([^0-9+-]*)([0-9]+(?:\.[0-9]+)?) (额度|点额度)$`)
-	overridePattern  = regexp.MustCompile(`^管理员覆盖用户额度从 ([^0-9+-]*)([0-9]+(?:\.[0-9]+)?) (?:额度|点额度) 为 ([^0-9+-]*)([0-9]+(?:\.[0-9]+)?) (额度|点额度)$`)
-	displayedPattern = regexp.MustCompile(`^([^0-9+-]*)([0-9]+(?:\.[0-9]+)?) (额度|点额度)$`)
+	overridePattern  = regexp.MustCompile(`^管理员覆盖用户额度从 ([^0-9+-]*)([+-]?[0-9]+(?:\.[0-9]+)?) (?:额度|点额度) 为 ([^0-9+-]*)([+-]?[0-9]+(?:\.[0-9]+)?) (额度|点额度)$`)
+	displayedPattern = regexp.MustCompile(`^([^0-9+-]*)([+-]?[0-9]+(?:\.[0-9]+)?) (额度|点额度)$`)
 )
 
 func ParseLegacyAdjustment(content string) (Adjustment, bool) {
@@ -87,7 +87,9 @@ func ParseStructuredAdjustment(other string) (StructuredAdjustment, bool) {
 	switch envelope.Op.Action {
 	case "user.quota_add", "user.quota_subtract":
 		unit, value, ok := ParseDisplayedQuota(jsonString(envelope.Op.Params["quota"]))
-		if !ok {
+		// add/subtract encode the operation direction in Action; accepting a
+		// negative operand here would silently invert its financial meaning.
+		if !ok || value < 0 {
 			return StructuredAdjustment{}, false
 		}
 		action := ActionAdd
@@ -223,6 +225,14 @@ func NormalizeUnit(symbol, suffix string) string {
 }
 
 func parseFixedSix(raw string) (int64, error) {
+	raw = strings.TrimSpace(raw)
+	sign := int64(1)
+	if strings.HasPrefix(raw, "-") {
+		sign = -1
+		raw = strings.TrimPrefix(raw, "-")
+	} else if strings.HasPrefix(raw, "+") {
+		raw = strings.TrimPrefix(raw, "+")
+	}
 	parts := strings.Split(raw, ".")
 	if len(parts) > 2 || parts[0] == "" {
 		return 0, errors.New("invalid fixed decimal")
@@ -248,5 +258,9 @@ func parseFixedSix(raw string) (int64, error) {
 			return 0, errors.New("invalid fixed decimal fraction")
 		}
 	}
-	return whole*1_000_000 + fractionValue, nil
+	magnitude := whole*1_000_000 + fractionValue
+	if magnitude < 0 || (whole == math.MaxInt64/1_000_000 && fractionValue > math.MaxInt64%1_000_000) {
+		return 0, errors.New("fixed decimal out of range")
+	}
+	return sign * magnitude, nil
 }
