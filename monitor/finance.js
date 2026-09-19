@@ -283,7 +283,7 @@
     setBridgeValue('finBridgeProfit', statement.operating_profit, statement.known_operating_profit,
       '可发布', '仅已知部分', '收入或成本未闭合');
     const footnote = $('finBridgeFootnote');
-    if (footnote) footnote.textContent = `修正上游总成本包含客户流量、内部测试和其它已识别成本，最终毛利只扣一次。已配对客户成本 ${money(statement.paired_corrected_upstream_cost)}；内部测试 ${money(statement.internal_test_consumption)}（${Number(statement.internal_test_requests || 0).toLocaleString('zh-CN')} 请求）不计客户收入，已严格识别其上游成本 ${money(statement.known_internal_test_upstream_cost)}。${Number(statement.internal_test_mixed_rows || 0).toLocaleString('zh-CN')} 个混合流量小时、${Number(statement.internal_test_unverified_pairs || 0).toLocaleString('zh-CN')} 个未核验对不做估算。`;
+    if (footnote) footnote.textContent = `修正业务上游成本已扣除可严格识别的内部测试成本，上游账单原值仍完整保留用于对账。已配对客户成本 ${money(statement.paired_corrected_upstream_cost)}；内部测试 ${money(statement.internal_test_consumption)}（${Number(statement.internal_test_requests || 0).toLocaleString('zh-CN')} 请求）不计客户收入，已严格识别其上游成本 ${money(statement.known_internal_test_upstream_cost)}。${Number(statement.internal_test_mixed_rows || 0).toLocaleString('zh-CN')} 个混合流量小时、${Number(statement.internal_test_unverified_pairs || 0).toLocaleString('zh-CN')} 个未核验对不做估算。`;
   }
 
   window.financeActivate = function () {
@@ -304,6 +304,8 @@
     });
     $('finThisMonth')?.addEventListener('click', () => setMonth(0));
     $('finLastMonth')?.addEventListener('click', () => setMonth(-1));
+    $('finInternalSave')?.addEventListener('click', saveInternalAccounts);
+    loadInternalAccounts();
     $('finUnallocatedSourceRows')?.addEventListener('click', (event) => {
       const button = event.target.closest('[data-fin-cost-source]');
       if (!button) return;
@@ -313,6 +315,52 @@
       else if (window.channelManagementOpen) window.channelManagementOpen({ domain });
     });
     window.addEventListener('resize', () => state.chart?.resize());
+  }
+
+  function internalSyncText(sync) {
+    const status = String(sync?.status || 'not_configured');
+    if (status === 'not_configured') return '未配置';
+    if (status === 'caught_up') return '历史事实已补齐';
+    if (status === 'error') return `同步异常：${sync?.last_error || '未知错误'}`;
+    return `历史事实回填中 ${Number(sync?.progress_percent || 0).toFixed(1)}%`;
+  }
+
+  async function loadInternalAccounts() {
+    const summary = $('finInternalSummary');
+    const note = $('finInternalState');
+    try {
+      const response = await fetch('/finance/internal-accounts', { headers: { Accept: 'application/json' } });
+      if (response.status === 401) { location.href = '/login'; return; }
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
+      const rows = Array.isArray(data.accounts) ? data.accounts : [];
+      if ($('finInternalAccounts')) $('finInternalAccounts').value = rows.map((row) => `${row.user_id}${row.username ? ` # ${row.username}` : ''}`).join('\n');
+      if (summary) summary.textContent = `${rows.length} 个账号 · ${internalSyncText(data.sync)}`;
+      if (note) note.textContent = rows.length ? `已按 user_id 固定身份；${internalSyncText(data.sync)}。混合流量小时不按请求数硬摊成本。` : '配置只保存在 Monitor，不修改 NewAPI 账号或原始日志。';
+    } catch (error) {
+      if (summary) summary.textContent = '配置读取失败';
+      if (note) note.textContent = error.message;
+    }
+  }
+
+  async function saveInternalAccounts() {
+    const button = $('finInternalSave');
+    const note = $('finInternalState');
+    if (button) { button.disabled = true; button.textContent = '保存中'; }
+    try {
+      const raw = ($('finInternalAccounts')?.value || '').split(/\r?\n|,|，|;|；/).map((part) => part.trim()).filter(Boolean).map((part) => /^\d+\s+#\s+/.test(part) ? part.split(/\s+/)[0] : part).join('\n');
+      const response = await fetch('/finance/internal-accounts', { method: 'POST', headers: { Accept: 'application/json', 'Content-Type': 'application/json' }, body: JSON.stringify({ accounts: raw }) });
+      if (response.status === 401) { location.href = '/login'; return; }
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.detail || data.error || `HTTP ${response.status}`);
+      if (note) note.textContent = data.unchanged ? '配置未变更。' : '已保存；历史用量将在后台以只读方式回填，未补齐前报表不会假装成本已完整。';
+      await loadInternalAccounts();
+      await load(true);
+    } catch (error) {
+      if (note) note.textContent = `保存失败：${error.message}`;
+    } finally {
+      if (button) { button.disabled = false; button.textContent = '保存配置'; }
+    }
   }
 
   function isoLocal(value) {

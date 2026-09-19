@@ -552,12 +552,17 @@ func TestLayeredChannelFinanceRoutesKeepScopesSeparate(t *testing.T) {
 		return w
 	}
 
+	businessIncluded := false
 	site := channelFinanceSiteSaveInput{
 		FXBenchmark: 7, SiteRechargePaid: 1, SiteRechargeCredit: 1,
-		Groups: []channelFinanceSiteGroupInput{{Group: "codex-1.2x", SiteMultiplier: financeFloatPtr(1.2)}},
+		Groups: []channelFinanceSiteGroupInput{{Group: "codex-1.2x", SiteMultiplier: financeFloatPtr(1.2), BusinessIncluded: &businessIncluded}},
 	}
 	if w := request("/site", site); w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"updated_domains":2`) {
 		t.Fatalf("site config status=%d body=%s", w.Code, w.Body.String())
+	}
+	var businessPolicy ChannelBusinessGroupPolicy
+	if err := m.storeDB.First(&businessPolicy, "grp = ?", "codex-1.2x").Error; err != nil || businessPolicy.Included {
+		t.Fatalf("取消勾选的业务统计范围未保存: policy=%+v err=%v", businessPolicy, err)
 	}
 
 	domain := channelFinanceDomainSaveInput{Domain: "last-api.ai", UpstreamRechargePaid: 2, UpstreamRechargeCredit: 1}

@@ -600,6 +600,9 @@ func (m *Monitor) populateFinanceFactBackfillEvidence(ctx context.Context, resul
 func (m *Monitor) runFinanceFactsSync(ctx context.Context) {
 	for {
 		progressed, err := m.syncNextFinanceFactHour(ctx)
+		if err == nil && !progressed {
+			progressed, err = m.syncNextFinanceInternalAccountBatch(ctx)
+		}
 		if ctx.Err() != nil {
 			return
 		}

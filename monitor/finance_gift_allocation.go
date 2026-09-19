@@ -243,6 +243,37 @@ func financeGiftSubrange(result financeGiftAllocationResult, from, to int64) (fi
 	return subrange, nil
 }
 
+// excludeFinanceGiftUsers 在全部赠送证据通过后，从经营收入口径中
+// 移除已配置的内部账号。这只改变本次内存中的分配账本，不改原始
+// 额度调整事件或小时事实。
+func excludeFinanceGiftUsers(result financeGiftAllocationResult, excluded map[int64]bool) (financeGiftAllocationResult, error) {
+	if !result.Coverage.Complete || len(excluded) == 0 {
+		return result, nil
+	}
+	ledger := make([]financecredit.LedgerEvent, 0, len(result.ledger))
+	grantUsers := map[int64]bool{}
+	var grants int64
+	for _, event := range result.ledger {
+		if excluded[event.UserID] {
+			continue
+		}
+		ledger = append(ledger, event)
+		if event.Kind == financecredit.EventTrialGiftGrant {
+			grants++
+			grantUsers[event.UserID] = true
+		}
+	}
+	allocation, err := financecredit.AllocateTrialGiftConsumption(ledger, result.Coverage.FromTs, result.Coverage.ToTs)
+	if err != nil {
+		return result, err
+	}
+	result.ledger = ledger
+	result.Allocation = allocation
+	result.Coverage.EligibleGrants = grants
+	result.Coverage.GiftUsers = int64(len(grantUsers))
+	return result, nil
+}
+
 func loadFinanceGiftUserFacts(ctx context.Context, db *gorm.DB, from, to int64, users []int64) ([]FinanceUserHourFact, error) {
 	var result []FinanceUserHourFact
 	for start := 0; start < len(users); start += financeGiftUserQueryChunk {

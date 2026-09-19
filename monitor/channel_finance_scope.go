@@ -21,8 +21,13 @@ import (
 )
 
 type channelFinanceSiteGroupInput struct {
-	Group          string   `json:"group"`
-	SiteMultiplier *float64 `json:"site_multiplier"`
+	Group            string   `json:"group"`
+	SiteMultiplier   *float64 `json:"site_multiplier"`
+	BusinessIncluded *bool    `json:"business_included,omitempty"`
+}
+
+func (g channelFinanceSiteGroupInput) businessIncluded() bool {
+	return g.BusinessIncluded == nil || *g.BusinessIncluded
 }
 
 type channelFinanceSiteSaveInput struct {
@@ -178,8 +183,19 @@ func (m *Monitor) saveChannelFinanceSiteHandler(c *gin.Context) {
 		for _, row := range oldGroups {
 			old[row.Grp] = row.Multiplier
 		}
+		var oldPolicies []ChannelBusinessGroupPolicy
+		if err := tx.Find(&oldPolicies).Error; err != nil {
+			return err
+		}
+		policyByGroup := make(map[string]bool, len(oldPolicies))
+		for _, row := range oldPolicies {
+			policyByGroup[row.Grp] = row.Included
+		}
 		for _, group := range in.Groups {
 			if value, exists := old[group.Group]; !exists || value != *group.SiteMultiplier {
+				changed = true
+			}
+			if value, exists := policyByGroup[group.Group]; (exists && value != group.businessIncluded()) || (!exists && !group.businessIncluded()) {
 				changed = true
 			}
 		}
@@ -201,6 +217,10 @@ func (m *Monitor) saveChannelFinanceSiteHandler(c *gin.Context) {
 		for _, group := range in.Groups {
 			row := ChannelSaleGroupRate{Grp: group.Group, Multiplier: *group.SiteMultiplier, EffectiveAt: now, UpdatedAt: now, UpdatedBy: updatedBy}
 			if err := tx.Clauses(clause.OnConflict{Columns: []clause.Column{{Name: "grp"}}, UpdateAll: true}).Create(&row).Error; err != nil {
+				return err
+			}
+			policy := ChannelBusinessGroupPolicy{Grp: group.Group, Included: group.businessIncluded(), UpdatedAt: now, UpdatedBy: updatedBy}
+			if err := tx.Clauses(clause.OnConflict{Columns: []clause.Column{{Name: "grp"}}, UpdateAll: true}).Create(&policy).Error; err != nil {
 				return err
 			}
 		}

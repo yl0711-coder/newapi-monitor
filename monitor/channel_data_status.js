@@ -64,6 +64,11 @@ const usageSyncReasons={
 };
 function issues(report){
   const rows=[],coverage=report?.meta?.data_coverage;
+	const internal=report?.internal_accounts||{};
+	if(internal.enabled&&internal.status!=='caught_up'){
+		const progress=Number(internal.progress_percent||0).toFixed(1),detail=internal.status==='error'?`内部账号用量同步异常：${internal.last_error||'未知错误'}`:`内部账号历史用量补齐中 ${progress}%`;
+		rows.push({scope:'内部账号过滤',detail:detail+'；补齐前渠道管理不发布排除后的业务上游成本。'});
+	}
   if(!coverage||coverage.complete!==true||coverage.provisional_seconds>0){
     const detail=coverage?`已确认 ${coverage.completed_hours||0}/${coverage.expected_hours||0} 小时；缺少 ${coverage.missing_hours||0} 小时`:'覆盖状态未返回';
     const pending=coverage?.latest_hour_pending?`；最新小时 ${time(coverage.pending_hour_ts)} 尚在汇总，并非已确认丢失`:'';
@@ -89,6 +94,7 @@ function issues(report){
           if(!usage.complete&&(!usage.provisional||usage.completed_hours<usage.expected_hours))reasons.push(`账单已覆盖 ${usage.completed_hours||0}/${usage.expected_hours||0} 小时，汇总仅含已校验金额`);
           if(!usage.adjusted_cost_available)reasons.push(usage.adjusted_cost_status==='bucket_boundary_ambiguous'?'充值比例在账单桶中途变化，修正消费无法精确拆分':'缺少对应时段充值比例证据，未计入修正消费汇总');
           else if(!known(usage.adjusted_cost_usd))reasons.push('修正消费金额未返回，未计入修正消费汇总');
+			if(usage.internal_filter_status&&usage.internal_filter_status!=='not_configured'&&usage.internal_filter_status!=='complete')reasons.push(usage.internal_filter_status==='inconsistent'?'内部账号成本大于同口径上游原账单，业务成本已停止发布':'内部账号成本尚未全部核验，业务成本已停止发布');
         }
       }
     }

@@ -16,6 +16,7 @@ func TestParseLegacyAdjustment(t *testing.T) {
 		{name: "add", content: "管理员增加用户额度 ＄100.000000 额度", action: ActionAdd, unit: UnitUSD, value: 100_000_000, ok: true},
 		{name: "subtract", content: "管理员减少用户额度 ￥10.500000 额度", action: ActionSubtract, unit: UnitCNY, value: 10_500_000, ok: true},
 		{name: "override", content: "管理员覆盖用户额度从 ＄1.000000 额度 为 ＄201.000000 额度", action: ActionOverride, unit: UnitUSD, before: 1_000_000, after: 201_000_000, ok: true},
+		{name: "override negative balance", content: "管理员覆盖用户额度从 ＄-0.955357 额度 为 ＄9.044643 额度", action: ActionOverride, unit: UnitUSD, before: -955_357, after: 9_044_643, ok: true},
 		{name: "points", content: "管理员增加用户额度 500 点额度", action: ActionAdd, unit: UnitPoints, value: 500_000_000, ok: true},
 		{name: "too precise", content: "管理员增加用户额度 ＄1.0000001 额度", ok: false},
 		{name: "other", content: "admin cleared github binding", ok: false},
@@ -58,9 +59,14 @@ func TestParseStructuredAdjustment(t *testing.T) {
 	if !ok || override.Action != ActionOverride || override.BeforeMicro != 1_000_000 || override.AfterMicro != 201_000_000 || override.TargetUserID != 43 {
 		t.Fatalf("structured override=%+v ok=%v", override, ok)
 	}
+	negativeBefore, ok := ParseStructuredAdjustment(`{"op":{"action":"user.quota_override","params":{"from":"＄-0.955357 额度","to":"＄9.044643 额度","target_user_id":44}}}`)
+	if !ok || negativeBefore.Action != ActionOverride || negativeBefore.BeforeMicro != -955_357 || negativeBefore.AfterMicro != 9_044_643 || negativeBefore.NetChangeMicro() != 10_000_000 || negativeBefore.TargetUserID != 44 {
+		t.Fatalf("structured negative-balance override=%+v ok=%v", negativeBefore, ok)
+	}
 	for _, raw := range []string{
 		`{"op":{"action":"channel.update","params":{"quota":"＄100.000000 额度"}}}`,
 		`{"op":{"action":"user.quota_add","params":{"quota":"not money"}}}`,
+		`{"op":{"action":"user.quota_add","params":{"quota":"＄-100.000000 额度","target_user_id":42}}}`,
 		`not-json`,
 	} {
 		if _, ok := ParseStructuredAdjustment(raw); ok {

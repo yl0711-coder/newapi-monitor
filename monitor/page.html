@@ -738,10 +738,18 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
     <div class="fin-actions"><button class="fin-btn" id="finSinceLaunch" type="button">上线以来</button><button class="fin-btn" id="finLastMonth" type="button">上月</button><button class="fin-btn" id="finThisMonth" type="button">本月</button><label>开始日期<input id="finFrom" type="date"></label><label>结束日期<input id="finTo" type="date"></label><button class="fin-btn primary" id="finRefresh" type="button">刷新</button></div>
   </section>
   <div class="fin-status" id="finStatus"><i></i><div><b>尚未读取</b><br>进入页面后只读 Monitor 本地已发布事实。</div></div>
+  <details class="fin-internal-config" id="finInternalConfig">
+    <summary><span><b>内部测试账号</b><small>不计客户收入，且从可核验的业务上游成本中分离</small></span><em id="finInternalSummary">待读取</em></summary>
+    <div class="fin-internal-body">
+      <label for="finInternalAccounts">账号用户名或 user_id（多个用换行或逗号分隔）</label>
+      <textarea id="finInternalAccounts" rows="4" placeholder="例如：&#10;102&#10;internal-test"></textarea>
+      <div class="fin-internal-actions"><small id="finInternalState">配置只保存在 Monitor，不修改 NewAPI 账号或原始日志。</small><button class="fin-btn primary" id="finInternalSave" type="button">保存配置</button></div>
+    </div>
+  </details>
   <section class="fin-kpis">
     <article class="fin-kpi revenue"><small>平台计费消耗（已知）</small><b id="finConsumption">—</b><span id="finConsumptionNote">待读取</span></article>
     <article class="fin-kpi billed"><small>上游账单原值（对账参考）</small><b id="finBilled">—</b><span id="finBilledNote">待读取</span></article>
-    <article class="fin-kpi cost"><small>可核验上游成本（已知）</small><b id="finUpstream">—</b><span id="finUpstreamNote">待读取</span></article>
+    <article class="fin-kpi cost"><small>可核验业务上游成本（已知）</small><b id="finUpstream">—</b><span id="finUpstreamNote">待读取</span></article>
     <article class="fin-kpi profit"><small>已配对计费贡献（赠送前）</small><b id="finContribution">—</b><span id="finContributionNote">非最终经营毛利</span></article>
   </section>
   <section class="fin-decision" id="finDecision">
@@ -762,8 +770,8 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
       <div class="fin-bridge-row base"><span><b>平台净计费消耗</b><small>消费扣额减退还；内部测试已从用户口径分离</small></span><strong id="finBridgeConsumption">—</strong><em id="finBridgeConsumptionState">待读取</em></div>
       <div class="fin-bridge-row deduction"><span><b>减：注册赠送实际消耗</b><small>只扣已识别赠送额度中被用户实际消耗的部分</small></span><strong id="finBridgeGift">—</strong><em id="finBridgeGiftState">未接入</em></div>
       <div class="fin-bridge-row subtotal"><span><b>可发布经营收入</b><small>不是充值额；赠送扣减完整后才能发布</small></span><strong id="finBridgeRevenue">—</strong><em id="finBridgeRevenueState">待核验</em></div>
-      <div class="fin-bridge-row deduction"><span><b>减：修正上游总成本</b><small>包含客户流量、内部测试及其它已识别的上游消耗</small></span><strong id="finBridgeUpstream">—</strong><em id="finBridgeUpstreamState">待读取</em></div>
-      <div class="fin-bridge-row reference"><span><b>其中：内部测试上游成本（已含）</b><small>该金额已包含在上游总成本中，仅作分析，不重复扣减</small></span><strong id="finBridgeInternalTestCost">—</strong><em id="finBridgeInternalTestCostState">待读取</em></div>
+      <div class="fin-bridge-row deduction"><span><b>减：修正业务上游成本</b><small>已从上游实际账单中分离可严格识别的内部测试成本</small></span><strong id="finBridgeUpstream">—</strong><em id="finBridgeUpstreamState">待读取</em></div>
+      <div class="fin-bridge-row reference"><span><b>另列：内部测试上游成本</b><small>保留用于上游账单对账，不计入客户业务上游成本</small></span><strong id="finBridgeInternalTestCost">—</strong><em id="finBridgeInternalTestCostState">待读取</em></div>
       <div class="fin-bridge-row deduction"><span><b>减：AWS 基础设施成本</b><small>CUR 账单按 NexusAPI 资源和期间归集</small></span><strong id="finBridgeAWS">—</strong><em id="finBridgeAWSState">未接入</em></div>
       <div class="fin-bridge-row total"><span><b>可发布经营毛利</b><small>经营收入减修正上游成本和 AWS 成本</small></span><strong id="finBridgeProfit">—</strong><em id="finBridgeProfitState">待核验</em></div>
     </div>
@@ -868,8 +876,8 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
         <label><span>上游充值到账</span><input id="cmFinanceUpCredit" type="number" min="0.000001" step="0.0001" inputmode="decimal"><small>按实际到账额度填写</small></label>
       </section>
       <section class="cm-finance-groups" id="cmFinanceGlobalGroups" hidden>
-        <div class="cm-finance-group-title"><div><h3>网站分组倍率</h3><p>列出 NewAPI 中用户可选、特殊可用或当前用户/令牌实际使用的分组；仅在历史日志出现过的分组不会进入这里。</p><small id="cmFinanceGroupSource">尚未同步中转站分组</small></div><div class="cm-finance-group-actions"><span id="cmFinanceConfiguredCount"></span><button type="button" id="cmFinanceSyncGroups">一键同步 NewAPI 分组</button></div></div>
-        <div class="cm-finance-group-head"><span>服务分组</span><span>NewAPI 当前倍率</span><span>网站分组倍率</span></div>
+        <div class="cm-finance-group-title"><div><h3>网站分组倍率</h3><p>列出 NewAPI 中用户可选、特殊可用或当前用户/令牌实际使用的分组。取消“计入用户侧消费”后，该测试分组不在渠道管理中展示，也不计入请求数、Tokens 和用户侧消费；原始日志与历史数据仍保留。</p><small id="cmFinanceGroupSource">尚未同步中转站分组</small></div><div class="cm-finance-group-actions"><span id="cmFinanceConfiguredCount"></span><button type="button" id="cmFinanceSyncGroups">一键同步 NewAPI 分组</button></div></div>
+        <div class="cm-finance-group-head"><span>服务分组</span><span>NewAPI 当前倍率</span><span>网站分组倍率</span><span>渠道管理统计</span></div>
         <div id="cmFinanceGroupRows"></div>
       </section>
       <section class="cm-finance-domain-channels" id="cmFinanceDomainChannels" hidden>

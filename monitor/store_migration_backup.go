@@ -30,8 +30,8 @@ const (
 	// v42 合并 main v41 的资源生命周期/ECS 日志来源与归档模型，及本地 v38 的
 	// 前置拒绝 user_id 主键重建和 user_directory_entries。合并后的 schema
 	// 不等于任一侧，普通与 source-v2 组合计划都必须生成新的回滚快照。
-	preMigrationPlanID               = "main-facts-schema-20260911-v42-upstream-errorlog-identity-archive-infra-resource-lifecycle-ecs-log-archive-rejection-user-id-pk-user-directory"
-	preMigrationCombinedPlanID       = "main-facts-schema-20260911-v42-upstream-errorlog-identity-archive-infra-resource-lifecycle-ecs-log-archive-rejection-user-id-pk-user-directory-nginx-source-v2"
+	preMigrationPlanID               = "main-facts-schema-20260919-v43-upstream-errorlog-identity-archive-infra-resource-lifecycle-ecs-log-archive-rejection-user-id-pk-user-directory-finance-internal-accounts-business-groups"
+	preMigrationCombinedPlanID       = "main-facts-schema-20260919-v43-upstream-errorlog-identity-archive-infra-resource-lifecycle-ecs-log-archive-rejection-user-id-pk-user-directory-finance-internal-accounts-business-groups-nginx-source-v2"
 	preMigrationSnapshotPrefix       = "pre-migrate-"
 	preMigrationReferencePrefix      = ".pre-migration-plan-"
 	preMigrationReferenceSuffix      = ".json"

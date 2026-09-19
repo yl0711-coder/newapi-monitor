@@ -55,6 +55,22 @@ func TestChannelManagementPageIncludesBusinessDateShortcuts(t *testing.T) {
 	}
 }
 
+func TestChannelManagementPageExposesBusinessGroupScope(t *testing.T) {
+	js := string(channelManagementJS)
+	for _, marker := range []string{
+		`data-cm-finance-business`,
+		`business_included:financeGroupBusinessIncluded(index)`,
+		`计入用户侧消费`,
+	} {
+		if !strings.Contains(js, marker) && !strings.Contains(pageHTML, marker) {
+			t.Fatalf("网站计价基准缺少业务分组范围标记 %q", marker)
+		}
+	}
+	if !strings.Contains(pageHTML, "原始日志与历史数据仍保留") {
+		t.Fatal("页面必须明确取消勾选不会删除原始数据")
+	}
+}
+
 func TestChannelManagementFlattensLegacyVendorTypeLayer(t *testing.T) {
 	js := string(channelManagementJS)
 	for _, marker := range []string{
@@ -294,8 +310,8 @@ func TestChannelManagementUpstreamSpendMetricKeepsAmountReadable(t *testing.T) {
 	js := string(channelManagementJS)
 	css := string(stabilityCSS)
 	for _, marker := range []string{
-		`区间上游消费`,
-		`自然日上游消费`,
+		`区间业务上游消费`,
+		`自然日业务上游消费`,
 		`<small>上游当前余额</small>`,
 		`domain.upstream?.balance_usd`,
 		`cm-domain-metric-note`,
@@ -321,15 +337,15 @@ func TestChannelManagementShowsRawAndRechargeAdjustedUpstreamSpend(t *testing.T)
 	js := string(channelManagementJS)
 	css := string(stabilityCSS)
 	for _, marker := range []string{
-		`区间上游消费`,
-		`自然日上游消费`,
-		`<small>上游修正消费</small>`,
+		`区间业务上游消费`,
+		`自然日业务上游消费`,
+		`<small>业务上游修正消费</small>`,
 		`上游修正消费 = 账面消费 × 充值支付 ÷ 充值到账`,
 		`upstreamUsage.adjusted_cost_available`,
 		`upstreamUsage.adjusted_cost_usd`,
 		`upstreamUsage.recharge_ratio`,
 		`按历史充值比例版本修正`,
-		`上游修正消费汇总`,
+		`业务上游修正消费汇总`,
 		`.cm-domain-upstream-adjusted b{color:`,
 	} {
 		if !strings.Contains(js, marker) && !strings.Contains(css, marker) {
@@ -359,9 +375,9 @@ func TestChannelManagementSummarizesUpstreamFinanceWithoutGroupDoubleCounting(t 
 	for _, marker := range []string{
 		`const upstreamConfiguredAccounts=domains.filter(domain=>domain.upstream?.configured)`,
 		`const upstreamAccounts=upstreamConfiguredAccounts.filter(domain=>domain.upstream?.usage_sync_enabled)`,
-		`upstreamAggregateLabel(trustedUsageDomains,'cost_usd')`,
+		`upstreamAggregateLabel(trustedUsageDomains,'business_cost_usd')`,
 		`upstreamBalanceDomains.reduce((sum,domain)=>sum+Number(domain.upstream.balance_usd),0)`,
-		`区间上游消费汇总`,
+		`区间业务上游消费汇总`,
 		`上游当前余额汇总`,
 		`const trustedUsageDomains=upstreamUsageDomains.filter`,
 		`upstreamAccountComparable?upstreamSpendValue:'—'`,
@@ -920,6 +936,46 @@ func TestBuildChannelManagementReportGroupsDomainVendorChannelAndServiceGroup(t 
 	}
 	if report.Meta.DataUntil != day+3600 || report.Meta.LatestDataUntil != day+3600 || report.Meta.ChannelConfigUpdatedAt != day+60 {
 		t.Fatalf("meta=%+v", report.Meta)
+	}
+}
+
+func TestChannelManagementExcludesUncheckedTestGroupsWithoutDeletingRawData(t *testing.T) {
+	m := newStabilityTestMonitor(t)
+	hour := time.Date(2026, 9, 18, 10, 0, 0, 0, cstLocation).Unix()
+	if err := m.storeDB.Create(&[]ChannelSnap{
+		{ID: 201, Name: "business", Vendor: "OpenAI", BaseDomain: "business.example", Status: 1, Groups: "codex-0.7x", UpdatedAt: hour},
+		{ID: 202, Name: "test-only", Vendor: "OpenAI", BaseDomain: "test.example", Status: 1, Groups: "internal-test", UpdatedAt: hour},
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := m.storeDB.Create(&ChannelBusinessGroupPolicy{Grp: "internal-test", Included: false, UpdatedAt: hour}).Error; err != nil {
+		t.Fatal(err)
+	}
+	rows := []StabilityHourSample{
+		{HourTs: hour, ChannelID: 201, ModelName: "gpt-6", Grp: "codex-0.7x", Success: 3, Tokens: 300, Quota: 3000},
+		{HourTs: hour, ChannelID: 202, ModelName: "gpt-6", Grp: "internal-test", Success: 7, Tokens: 700, Quota: 7000},
+	}
+	if err := m.storeDB.Create(&rows).Error; err != nil {
+		t.Fatal(err)
+	}
+	report, err := m.buildChannelManagementReport(context.Background(), stabilityScope{FromTs: hour, ToTs: hour + 3600}, hour+7200)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Summary.Usage.Requests != 3 || report.Summary.Usage.Tokens != 300 || math.Abs(report.Summary.Usage.CostUSD-float64(3000)/quotaPerUSD) > 1e-12 {
+		t.Fatalf("取消勾选的测试分组仍进入用户侧消费: %+v", report.Summary.Usage)
+	}
+	if report.Summary.CurrentChannels != 1 || len(report.Domains) != 1 || report.Domains[0].Domain != "business.example" {
+		t.Fatalf("纯测试分组渠道仍在业务视图显示: summary=%+v domains=%+v", report.Summary, report.Domains)
+	}
+	for _, group := range report.Filters.Groups {
+		if group == "internal-test" {
+			t.Fatalf("测试分组仍出现在筛选项: %+v", report.Filters.Groups)
+		}
+	}
+	var stored int64
+	if err := m.storeDB.Model(&StabilityHourSample{}).Where("grp = ?", "internal-test").Count(&stored).Error; err != nil || stored != 1 {
+		t.Fatalf("过滤不应删除原始小时汇总: count=%d err=%v", stored, err)
 	}
 }
 

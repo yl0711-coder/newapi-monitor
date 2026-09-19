@@ -19,14 +19,15 @@ const (
 )
 
 type financeReportRequest struct {
-	from            time.Time
-	to              time.Time
-	snapshotAsOf    int64
-	snapshotClamped bool
+	from              time.Time
+	to                time.Time
+	snapshotAsOf      int64
+	snapshotClamped   bool
+	configurationHash string
 }
 
 func (r financeReportRequest) cacheKey() string {
-	return fmt.Sprintf("%d:%d:%d:%t", r.from.Unix(), r.to.Unix(), r.snapshotAsOf, r.snapshotClamped)
+	return fmt.Sprintf("%d:%d:%d:%t:%s", r.from.Unix(), r.to.Unix(), r.snapshotAsOf, r.snapshotClamped, r.configurationHash)
 }
 
 func (m *Monitor) getFinanceReportCache() *boundedByteCache {
@@ -40,6 +41,17 @@ func (m *Monitor) buildFinanceReportPayload(ctx context.Context, request finance
 	report, err := m.buildFinanceOperatingReport(ctx, request.from, request.to)
 	if err != nil {
 		return nil, err
+	}
+	// 管理员可能在报表读取期间修改内部账号或业务分组。
+	// 不得把新旧口径混合的结果写入任一配置的缓存键。
+	if request.configurationHash != "" {
+		currentHash, hashErr := m.financeReportConfigurationHash(ctx)
+		if hashErr != nil {
+			return nil, fmt.Errorf("复核经营核算配置: %w", hashErr)
+		}
+		if currentHash != request.configurationHash {
+			return nil, fmt.Errorf("经营核算配置在报表生成期间已变更，请重试")
+		}
 	}
 	if request.snapshotAsOf > 0 {
 		report.DataAsOf = request.snapshotAsOf

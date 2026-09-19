@@ -229,3 +229,28 @@ func TestWebsiteGroupCatalogChanged(t *testing.T) {
 		t.Fatal("stale site group should be detected")
 	}
 }
+
+func TestWebsiteGroupBusinessScopeDefaultsIncludedAndPersistsExclusion(t *testing.T) {
+	m := newStabilityTestMonitor(t)
+	if err := m.storeDB.Create(&WebsiteGroupCatalog{Grp: "internal-test", Source: "newapi", SourceMultiplier: 1, Active: true, SyncedAt: 100}).Error; err != nil {
+		t.Fatal(err)
+	}
+	finance := channelFinanceSnapshot{siteGroups: map[string]ChannelSaleGroupRate{"internal-test": {Grp: "internal-test", Multiplier: 1}}}
+	views, _, err := m.loadWebsiteGroupRates(context.Background(), finance)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(views) != 1 || !views[0].BusinessIncluded {
+		t.Fatalf("无配置的老分组必须默认勾选: %+v", views)
+	}
+	if err := m.storeDB.Create(&ChannelBusinessGroupPolicy{Grp: "internal-test", Included: false, UpdatedAt: 101}).Error; err != nil {
+		t.Fatal(err)
+	}
+	views, _, err = m.loadWebsiteGroupRates(context.Background(), finance)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(views) != 1 || views[0].BusinessIncluded {
+		t.Fatalf("显式取消勾选后必须返回 false: %+v", views)
+	}
+}

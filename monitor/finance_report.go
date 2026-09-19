@@ -52,6 +52,8 @@ type financeStatementView struct {
 	InternalTestUnverifiedPairs      int64                      `json:"internal_test_unverified_pairs"`
 	UpstreamBilledCost               *channelEconomicsMoneyView `json:"upstream_billed_cost"`
 	KnownUpstreamBilledCost          channelEconomicsMoneyView  `json:"known_upstream_billed_cost"`
+	RawCorrectedUpstreamCost         *channelEconomicsMoneyView `json:"raw_corrected_upstream_cost"`
+	KnownRawCorrectedUpstreamCost    channelEconomicsMoneyView  `json:"known_raw_corrected_upstream_cost"`
 	CorrectedUpstreamCost            *channelEconomicsMoneyView `json:"corrected_upstream_cost"`
 	KnownCorrectedUpstreamCost       channelEconomicsMoneyView  `json:"known_corrected_upstream_cost"`
 	PairedUserConsumption            channelEconomicsMoneyView  `json:"paired_user_consumption"`
@@ -164,6 +166,7 @@ type financeUpstreamCoverageView struct {
 // customer/test hours are counted as unresolved and are never ratio-allocated.
 type financeInternalTestCostFact struct {
 	RevenueMicroUSD       int64
+	UpstreamCostMicroUSD  int64
 	CorrectedCostMicroUSD int64
 	ProfitMicroUSD        int64
 	Rows                  int64
@@ -180,6 +183,7 @@ type financeInternalTestCostEvidence struct {
 	MixedPairs      int64
 	UnverifiedPairs int64
 	Complete        bool
+	SourceComplete  bool
 	Events          []financeInternalTestCostEvent
 }
 
@@ -241,6 +245,7 @@ type financeOperatingReport struct {
 	PairingAudit     financePairingAuditView     `json:"pairing_audit"`
 	CURCost          financeCURCostView          `json:"cur_cost"`
 	CURProducts      []financeCURProductCostView `json:"cur_products"`
+	InternalAccounts financeInternalFactStatus   `json:"internal_accounts"`
 	Sources          []financeSourceView         `json:"sources"`
 	Notices          []string                    `json:"notices"`
 	SemanticsNote    string                      `json:"semantics_note"`
@@ -1384,17 +1389,18 @@ func financeDailyStatus(user financeDailyCoverageView, economics channelEconomic
 // range. It deliberately does not call stabilityDataCoverage once per day:
 // doing so would multiply the expensive zero-hour contradiction query by the
 // number of displayed days.
-func (m *Monitor) loadFinanceDailyUserFacts(ctx context.Context, scope stabilityScope, now int64) (map[int64]financeDailyUserFact, map[int64]financeDailyCoverageView, error) {
+func (m *Monitor) loadFinanceDailyUserFacts(ctx context.Context, scope stabilityScope, now int64, internalAccounts financeConfiguredInternalEvidence, businessGroups map[string]bool) (map[int64]financeDailyUserFact, map[int64]financeDailyCoverageView, error) {
 	const cstDaySQL = "((hour_ts + 28800) / 86400) * 86400 - 28800"
 	var usageRows []struct {
 		DayTs        int64
+		Grp          string
 		ConsumeQuota int64
 		RefundQuota  int64
 	}
-	usageSQL := `SELECT ` + cstDaySQL + ` day_ts,
+	usageSQL := `SELECT ` + cstDaySQL + ` day_ts,grp,
 		COALESCE(SUM(quota),0) consume_quota, COALESCE(SUM(refund_quota),0) refund_quota
 		FROM stability_hour_samples
-		WHERE hour_ts>=? AND hour_ts<? AND traffic_class_version=? GROUP BY day_ts ORDER BY day_ts`
+		WHERE hour_ts>=? AND hour_ts<? AND traffic_class_version=? GROUP BY day_ts,grp ORDER BY day_ts`
 	if err := m.storeDB.WithContext(ctx).Raw(usageSQL, scope.FromTs, scope.ToTs, stabilityTrafficClassificationVersion).Scan(&usageRows).Error; err != nil {
 		return nil, nil, fmt.Errorf("读取每日用户用量事实: %w", err)
 	}
@@ -1412,12 +1418,44 @@ func (m *Monitor) loadFinanceDailyUserFacts(ctx context.Context, scope stability
 
 	facts := make(map[int64]financeDailyUserFact, len(usageRows)+len(testRows))
 	for _, row := range usageRows {
-		facts[row.DayTs] = financeDailyUserFact{DayTs: row.DayTs, ConsumeQuota: row.ConsumeQuota, RefundQuota: row.RefundQuota}
+		if !channelBusinessGroupIncluded(businessGroups, row.Grp) {
+			continue
+		}
+		fact := facts[row.DayTs]
+		fact.DayTs = row.DayTs
+		if err := addEconomicsInt64(&fact.ConsumeQuota, row.ConsumeQuota); err != nil {
+			return nil, nil, err
+		}
+		if err := addEconomicsInt64(&fact.RefundQuota, row.RefundQuota); err != nil {
+			return nil, nil, err
+		}
+		facts[row.DayTs] = fact
 	}
 	for _, row := range testRows {
 		fact := facts[row.DayTs]
 		fact.DayTs, fact.TestRequests, fact.TestQuota = row.DayTs, row.Requests, row.Quota
 		facts[row.DayTs] = fact
+	}
+	for _, row := range internalAccounts.Rows {
+		day := cstDayStart(row.HourTs)
+		fact := facts[day]
+		fact.DayTs = day
+		if err := addEconomicsInt64(&fact.ConsumeQuota, -row.ConsumeQuota); err != nil {
+			return nil, nil, err
+		}
+		if err := addEconomicsInt64(&fact.RefundQuota, -row.RefundQuota); err != nil {
+			return nil, nil, err
+		}
+		if err := addEconomicsInt64(&fact.TestQuota, row.ConsumeQuota-row.RefundQuota); err != nil {
+			return nil, nil, err
+		}
+		if err := addEconomicsInt64(&fact.TestRequests, row.Requests); err != nil {
+			return nil, nil, err
+		}
+		if fact.ConsumeQuota < 0 || fact.RefundQuota < 0 {
+			return nil, nil, errors.New("每日内部账号用量超过同口径用量")
+		}
+		facts[day] = fact
 	}
 
 	finalizedTo := min(scope.ToTs, finalizedStabilityHourTo(now))
@@ -1456,13 +1494,16 @@ func (m *Monitor) loadFinanceDailyUserFacts(ctx context.Context, scope stability
 			coverage.LatestHourPending = true
 			coverage.PendingHourTs = max(left, closedRight)
 		}
+		if !internalAccounts.Complete {
+			coverage.Complete = false
+		}
 		coverages[day] = coverage
 	}
 	return facts, coverages, nil
 }
 
-func (m *Monitor) buildFinanceDailyViews(ctx context.Context, scope stabilityScope, now int64, internalTestCost financeInternalTestCostEvidence) ([]financeDailyView, error) {
-	facts, coverages, err := m.loadFinanceDailyUserFacts(ctx, scope, now)
+func (m *Monitor) buildFinanceDailyViews(ctx context.Context, scope stabilityScope, now int64, internalTestCost financeInternalTestCostEvidence, internalAccounts financeConfiguredInternalEvidence, businessGroups map[string]bool) ([]financeDailyView, error) {
+	facts, coverages, err := m.loadFinanceDailyUserFacts(ctx, scope, now, internalAccounts, businessGroups)
 	if err != nil {
 		return nil, err
 	}
@@ -1499,7 +1540,10 @@ func (m *Monitor) buildFinanceDailyViews(ctx context.Context, scope stabilitySco
 			GrossUserConsumption: gross, UserRefunds: refunds, KnownUserConsumption: net,
 			InternalTestConsumption: internal, InternalTestRequests: fact.TestRequests,
 		}
-		if userCoverage.Complete {
+		if internalAccounts.Accounts > 0 && !internalAccounts.Complete {
+			statement.KnownUserConsumption = channelEconomicsMoneyView{}
+		}
+		if userCoverage.Complete && internalAccounts.Complete {
 			statement.UserConsumption = financeMoneyPointer(net)
 		}
 		if economics.Totals.IncludedPublicationRows > 0 {
@@ -1524,6 +1568,19 @@ func (m *Monitor) buildFinanceDailyViews(ctx context.Context, scope stabilitySco
 		}
 		dayInternalCost := internalTestCost.ByDay[day]
 		applyFinanceInternalTestCost(&statement, dayInternalCost, 0, 0, false)
+		statement.KnownRawCorrectedUpstreamCost = statement.KnownCorrectedUpstreamCost
+		statement.RawCorrectedUpstreamCost = statement.CorrectedUpstreamCost
+		if dayInternalCost.Rows > 0 {
+			adjusted, subtractErr := financeSubtract(statement.KnownCorrectedUpstreamCost, statement.KnownInternalTestUpstreamCost)
+			if subtractErr != nil {
+				return nil, fmt.Errorf("扣除 %s 内部测试上游成本: %w", time.Unix(day, 0).In(loc).Format("2006-01-02"), subtractErr)
+			}
+			statement.KnownCorrectedUpstreamCost = adjusted
+			statement.CorrectedUpstreamCost = nil
+		}
+		if internalAccounts.Complete && internalTestCost.MixedPairs == 0 && internalTestCost.UnverifiedPairs == 0 && statement.RawCorrectedUpstreamCost != nil {
+			statement.CorrectedUpstreamCost = financeMoneyPointer(statement.KnownCorrectedUpstreamCost)
+		}
 		if err := subtractFinanceInternalTestFromContribution(&statement, internalTestCost.ExcludeByDay[day], economics.Totals.PairedPublicationRows); err != nil {
 			return nil, fmt.Errorf("从 %s 客户贡献中分离内部测试成本: %w", time.Unix(day, 0).In(loc).Format("2006-01-02"), err)
 		}
@@ -1546,7 +1603,7 @@ func (m *Monitor) buildFinanceDailyViews(ctx context.Context, scope stabilitySco
 	return views, nil
 }
 
-func (m *Monitor) loadFinanceUserFacts(ctx context.Context, scope stabilityScope, now int64) (financeStatementView, StabilityDataCoverage, map[string]financeDomainUserFact, error) {
+func (m *Monitor) loadFinanceUserFacts(ctx context.Context, scope stabilityScope, now int64, internalAccounts financeConfiguredInternalEvidence, businessGroups map[string]bool) (financeStatementView, StabilityDataCoverage, map[string]financeDomainUserFact, error) {
 	// The stability fact table is large. Aggregate it once by channel and resolve
 	// the domain from the small snapshot table in memory. A LEFT JOIN followed by
 	// a domain GROUP BY made the full-history finance view repeatedly scan and
@@ -1554,16 +1611,17 @@ func (m *Monitor) loadFinanceUserFacts(ctx context.Context, scope stabilityScope
 	// read deadline while background collection is active.
 	var rows []struct {
 		ChannelID    int
+		Grp          string
 		Requests     int64
 		ConsumeQuota int64
 		RefundQuota  int64
 	}
-	if err := m.storeDB.WithContext(ctx).Raw(`SELECT channel_id,
+	if err := m.storeDB.WithContext(ctx).Raw(`SELECT channel_id,grp,
 		COALESCE(SUM(success+anomaly+failed),0) requests,
 		COALESCE(SUM(quota),0) consume_quota,
 		COALESCE(SUM(refund_quota),0) refund_quota
 		FROM stability_hour_samples WHERE hour_ts>=? AND hour_ts<? AND traffic_class_version=?
-		GROUP BY channel_id`, scope.FromTs, scope.ToTs, stabilityTrafficClassificationVersion).Scan(&rows).Error; err != nil {
+		GROUP BY channel_id,grp`, scope.FromTs, scope.ToTs, stabilityTrafficClassificationVersion).Scan(&rows).Error; err != nil {
 		return financeStatementView{}, StabilityDataCoverage{}, nil, fmt.Errorf("读取全站用户用量事实: %w", err)
 	}
 	var snaps []ChannelSnap
@@ -1581,6 +1639,9 @@ func (m *Monitor) loadFinanceUserFacts(ctx context.Context, scope stabilityScope
 	domains := make(map[string]financeDomainUserFact, len(rows))
 	var totalConsumeQuota, totalRefundQuota int64
 	for _, row := range rows {
+		if !channelBusinessGroupIncluded(businessGroups, row.Grp) {
+			continue
+		}
 		domain := domainByChannel[row.ChannelID]
 		if domain == "" {
 			domain = "未配置/历史"
@@ -1601,6 +1662,37 @@ func (m *Monitor) loadFinanceUserFacts(ctx context.Context, scope stabilityScope
 		if err := addEconomicsInt64(&totalRefundQuota, row.RefundQuota); err != nil {
 			return financeStatementView{}, StabilityDataCoverage{}, nil, err
 		}
+	}
+	// 配置的内部账号已包含在 stability_hour_samples 的用户流量中，
+	// 因此在这里按同一个渠道和业务分组口径精确扣除。内部账号事实
+	// 未补齐时加载器不会返回部分行，后面也会把 UserConsumption 保持为未发布。
+	for _, row := range internalAccounts.Rows {
+		domain := domainByChannel[row.ChannelID]
+		if domain == "" {
+			domain = "未配置/历史"
+		}
+		fact := domains[domain]
+		fact.Domain = domain
+		fact.Requests -= row.Requests
+		if err := addEconomicsInt64(&fact.ConsumeQuota, -row.ConsumeQuota); err != nil {
+			return financeStatementView{}, StabilityDataCoverage{}, nil, err
+		}
+		if err := addEconomicsInt64(&fact.RefundQuota, -row.RefundQuota); err != nil {
+			return financeStatementView{}, StabilityDataCoverage{}, nil, err
+		}
+		if fact.Requests < 0 || fact.ConsumeQuota < 0 || fact.RefundQuota < 0 {
+			return financeStatementView{}, StabilityDataCoverage{}, nil, errors.New("内部账号用量超过同口径渠道用量")
+		}
+		domains[domain] = fact
+		if err := addEconomicsInt64(&totalConsumeQuota, -row.ConsumeQuota); err != nil {
+			return financeStatementView{}, StabilityDataCoverage{}, nil, err
+		}
+		if err := addEconomicsInt64(&totalRefundQuota, -row.RefundQuota); err != nil {
+			return financeStatementView{}, StabilityDataCoverage{}, nil, err
+		}
+	}
+	if totalConsumeQuota < 0 || totalRefundQuota < 0 {
+		return financeStatementView{}, StabilityDataCoverage{}, nil, errors.New("内部账号用量超过全站同口径用量")
 	}
 	var internal struct {
 		Requests int64
@@ -1623,16 +1715,25 @@ func (m *Monitor) loadFinanceUserFacts(ctx context.Context, scope stabilityScope
 	if err != nil {
 		return financeStatementView{}, StabilityDataCoverage{}, nil, err
 	}
-	internalMoney, err := financeMoneyFromQuota(internal.Quota)
+	configuredInternalNet := internalAccounts.NetQuota
+	if err := addEconomicsInt64(&configuredInternalNet, internal.Quota); err != nil {
+		return financeStatementView{}, StabilityDataCoverage{}, nil, err
+	}
+	internalMoney, err := financeMoneyFromQuota(configuredInternalNet)
 	if err != nil {
 		return financeStatementView{}, StabilityDataCoverage{}, nil, err
 	}
 	coverage := m.stabilityDataCoverage(ctx, scope.FromTs, scope.ToTs, now)
+	coverage.Complete = coverage.Complete && internalAccounts.Complete
 	statement := financeStatementView{
 		GrossUserConsumption: grossMoney, UserRefunds: refundMoney,
-		KnownUserConsumption: userMoney, InternalTestConsumption: internalMoney, InternalTestRequests: internal.Requests,
+		KnownUserConsumption: userMoney, InternalTestConsumption: internalMoney, InternalTestRequests: internal.Requests + internalAccounts.Requests,
 	}
-	if coverage.Complete {
+	if internalAccounts.Accounts > 0 && !internalAccounts.Complete {
+		statement.KnownUserConsumption = channelEconomicsMoneyView{}
+		domains = map[string]financeDomainUserFact{}
+	}
+	if coverage.Complete && internalAccounts.Complete {
 		statement.UserConsumption = financeMoneyPointer(userMoney)
 	}
 	return statement, coverage, domains, nil
@@ -1694,30 +1795,87 @@ type financeManifestHourKey struct {
 // channel-hours from already-published immutable economics facts. A mixed
 // customer/test hour is deliberately left unresolved: request counts are not a
 // defensible allocation key for model cost.
-func (m *Monitor) loadFinanceInternalTestCostEvidence(ctx context.Context, scope stabilityScope) (financeInternalTestCostEvidence, error) {
+func (m *Monitor) loadFinanceInternalTestCostEvidence(ctx context.Context, scope stabilityScope, configured financeConfiguredInternalEvidence) (financeInternalTestCostEvidence, error) {
+	return m.loadFinanceInternalCostEvidence(ctx, scope, configured, true)
+}
+
+// loadFinanceConfiguredAccountCostEvidence is the narrower channel-management
+// view: it filters only the administrator-configured user IDs. Automatic probe
+// traffic remains part of the finance report's separate internal-test policy,
+// but must not make an otherwise valid configured-account filter unavailable.
+func (m *Monitor) loadFinanceConfiguredAccountCostEvidence(ctx context.Context, scope stabilityScope, configured financeConfiguredInternalEvidence) (financeInternalTestCostEvidence, error) {
+	return m.loadFinanceInternalCostEvidence(ctx, scope, configured, false)
+}
+
+func (m *Monitor) loadFinanceInternalCostEvidence(ctx context.Context, scope stabilityScope, configured financeConfiguredInternalEvidence, includeAutomaticTests bool) (financeInternalTestCostEvidence, error) {
 	result := financeInternalTestCostEvidence{
 		ByDomain:        map[string]financeInternalTestCostFact{},
 		ByDay:           map[int64]financeInternalTestCostFact{},
 		ExcludeByDomain: map[string]financeInternalTestCostFact{},
 		ExcludeByDay:    map[int64]financeInternalTestCostFact{},
+		SourceComplete:  configured.Complete,
 	}
 	if scope.ToTs <= scope.FromTs {
 		return result, nil
 	}
-	var testPairs []struct {
-		HourTs    int64
-		ChannelID int
-		Requests  int64
+	type testPairRow struct {
+		HourTs                       int64
+		ChannelID                    int
+		Requests                     int64
+		LocalInternalRequests        int64
+		LocalInternalRevenueMicroUSD int64
 	}
-	if err := m.storeDB.WithContext(ctx).Raw(`SELECT hour_ts,channel_id,COALESCE(SUM(requests),0) requests
+	var automaticPairs []testPairRow
+	if includeAutomaticTests {
+		if err := m.storeDB.WithContext(ctx).Raw(`SELECT hour_ts,channel_id,COALESCE(SUM(requests),0) requests
 		FROM channel_test_hour_samples
 		WHERE hour_ts>=? AND hour_ts<? AND traffic_class_version=?
 		GROUP BY hour_ts,channel_id HAVING COALESCE(SUM(requests),0)>0`,
-		scope.FromTs, scope.ToTs, stabilityTrafficClassificationVersion).Scan(&testPairs).Error; err != nil {
-		return result, fmt.Errorf("读取内部测试小时事实: %w", err)
+			scope.FromTs, scope.ToTs, stabilityTrafficClassificationVersion).Scan(&automaticPairs).Error; err != nil {
+			return result, fmt.Errorf("读取内部测试小时事实: %w", err)
+		}
 	}
+	pairMap := make(map[financeTestPairKey]testPairRow, len(automaticPairs)+len(configured.Rows))
+	for _, row := range automaticPairs {
+		key := financeTestPairKey{HourTs: row.HourTs, ChannelID: row.ChannelID}
+		pairMap[key] = row
+	}
+	for _, row := range configured.Rows {
+		if row.Requests <= 0 || row.ChannelID <= 0 {
+			continue
+		}
+		key := financeTestPairKey{HourTs: row.HourTs, ChannelID: row.ChannelID}
+		pair := pairMap[key]
+		pair.HourTs, pair.ChannelID = row.HourTs, row.ChannelID
+		if err := addEconomicsInt64(&pair.Requests, row.Requests); err != nil {
+			return result, err
+		}
+		if err := addEconomicsInt64(&pair.LocalInternalRequests, row.Requests); err != nil {
+			return result, err
+		}
+		netQuota := row.ConsumeQuota - row.RefundQuota
+		micro, conversionErr := signedUnitsToMicroUSDCanonical(netQuota, strconv.FormatInt(int64(quotaPerUSD), 10))
+		if conversionErr != nil {
+			return result, conversionErr
+		}
+		if err := addEconomicsInt64(&pair.LocalInternalRevenueMicroUSD, micro); err != nil {
+			return result, err
+		}
+		pairMap[key] = pair
+	}
+	testPairs := make([]testPairRow, 0, len(pairMap))
+	for _, row := range pairMap {
+		testPairs = append(testPairs, row)
+	}
+	sort.Slice(testPairs, func(i, j int) bool {
+		if testPairs[i].HourTs != testPairs[j].HourTs {
+			return testPairs[i].HourTs < testPairs[j].HourTs
+		}
+		return testPairs[i].ChannelID < testPairs[j].ChannelID
+	})
 	result.TestPairs = int64(len(testPairs))
 	if len(testPairs) == 0 {
+		result.Complete = configured.Complete
 		return result, nil
 	}
 
@@ -1764,13 +1922,20 @@ func (m *Monitor) loadFinanceInternalTestCostEvidence(ctx context.Context, scope
 			manifest.RowCount == int64(len(rows)) && manifest.PublicationSetHash == hex.EncodeToString(digest[:])
 	}
 	validByPair := make(map[financeTestPairKey][]channelEconomicsReportRow)
+	domainByPair := make(map[financeTestPairKey]string)
 	for _, row := range publications {
+		pair := financeTestPairKey{HourTs: row.HourTs, ChannelID: row.LocalChannelID}
+		domain := strings.ToLower(strings.TrimSpace(row.Domain))
+		if previous, found := domainByPair[pair]; !found {
+			domainByPair[pair] = domain
+		} else if previous != domain {
+			domainByPair[pair] = ""
+		}
 		hourKey := financeManifestHourKey{Domain: row.Domain, HourTs: row.HourTs}
 		if !validHour[hourKey] || row.LocalChannelID <= 0 || row.CoverageStatus != "verified_complete" ||
 			!row.CorrectedCostKnown || !row.ProfitKnown {
 			continue
 		}
-		pair := financeTestPairKey{HourTs: row.HourTs, ChannelID: row.LocalChannelID}
 		validByPair[pair] = append(validByPair[pair], row)
 	}
 
@@ -1779,18 +1944,22 @@ func (m *Monitor) loadFinanceInternalTestCostEvidence(ctx context.Context, scope
 		rows := validByPair[pair]
 		if len(rows) != 1 {
 			result.UnverifiedPairs++
-			result.Events = append(result.Events, financeInternalTestCostEvent{HourTs: test.HourTs, State: "unverified"})
+			result.Events = append(result.Events, financeInternalTestCostEvent{HourTs: test.HourTs, Domain: domainByPair[pair], State: "unverified"})
 			continue
 		}
 		row := rows[0]
 		exclusionFact := financeInternalTestCostFact{
 			RevenueMicroUSD:       row.RevenueMicroUSD,
+			UpstreamCostMicroUSD:  row.UpstreamCostMicroUSD,
 			CorrectedCostMicroUSD: row.CorrectedCostMicroUSD,
 			ProfitMicroUSD:        row.ProfitMicroUSD,
 			Rows:                  1,
 		}
 		excludedDomain := result.ExcludeByDomain[row.Domain]
 		if err := addEconomicsInt64(&excludedDomain.RevenueMicroUSD, exclusionFact.RevenueMicroUSD); err != nil {
+			return result, err
+		}
+		if err := addEconomicsInt64(&excludedDomain.UpstreamCostMicroUSD, exclusionFact.UpstreamCostMicroUSD); err != nil {
 			return result, err
 		}
 		if err := addEconomicsInt64(&excludedDomain.CorrectedCostMicroUSD, exclusionFact.CorrectedCostMicroUSD); err != nil {
@@ -1806,6 +1975,9 @@ func (m *Monitor) loadFinanceInternalTestCostEvidence(ctx context.Context, scope
 		if err := addEconomicsInt64(&excludedDay.RevenueMicroUSD, exclusionFact.RevenueMicroUSD); err != nil {
 			return result, err
 		}
+		if err := addEconomicsInt64(&excludedDay.UpstreamCostMicroUSD, exclusionFact.UpstreamCostMicroUSD); err != nil {
+			return result, err
+		}
 		if err := addEconomicsInt64(&excludedDay.CorrectedCostMicroUSD, exclusionFact.CorrectedCostMicroUSD); err != nil {
 			return result, err
 		}
@@ -1814,17 +1986,22 @@ func (m *Monitor) loadFinanceInternalTestCostEvidence(ctx context.Context, scope
 		}
 		excludedDay.Rows++
 		result.ExcludeByDay[day] = excludedDay
-		if row.LocalRequests != 0 || row.RevenueMicroUSD != 0 {
+		if row.LocalRequests != test.LocalInternalRequests || row.RevenueMicroUSD != test.LocalInternalRevenueMicroUSD {
 			result.MixedPairs++
 			result.Events = append(result.Events, financeInternalTestCostEvent{HourTs: row.HourTs, Domain: row.Domain, State: "mixed", Fact: exclusionFact})
 			continue
 		}
 		fact := financeInternalTestCostFact{
+			RevenueMicroUSD:       row.RevenueMicroUSD,
+			UpstreamCostMicroUSD:  row.UpstreamCostMicroUSD,
 			CorrectedCostMicroUSD: row.CorrectedCostMicroUSD,
 			ProfitMicroUSD:        row.ProfitMicroUSD,
 			Rows:                  1,
 		}
 		for _, target := range []*financeInternalTestCostFact{&result.Total} {
+			if err := addEconomicsInt64(&target.UpstreamCostMicroUSD, fact.UpstreamCostMicroUSD); err != nil {
+				return result, err
+			}
 			if err := addEconomicsInt64(&target.CorrectedCostMicroUSD, fact.CorrectedCostMicroUSD); err != nil {
 				return result, err
 			}
@@ -1834,6 +2011,9 @@ func (m *Monitor) loadFinanceInternalTestCostEvidence(ctx context.Context, scope
 			target.Rows++
 		}
 		domainFact := result.ByDomain[row.Domain]
+		if err := addEconomicsInt64(&domainFact.UpstreamCostMicroUSD, fact.UpstreamCostMicroUSD); err != nil {
+			return result, err
+		}
 		if err := addEconomicsInt64(&domainFact.CorrectedCostMicroUSD, fact.CorrectedCostMicroUSD); err != nil {
 			return result, err
 		}
@@ -1843,6 +2023,9 @@ func (m *Monitor) loadFinanceInternalTestCostEvidence(ctx context.Context, scope
 		domainFact.Rows++
 		result.ByDomain[row.Domain] = domainFact
 		dayFact := result.ByDay[day]
+		if err := addEconomicsInt64(&dayFact.UpstreamCostMicroUSD, fact.UpstreamCostMicroUSD); err != nil {
+			return result, err
+		}
 		if err := addEconomicsInt64(&dayFact.CorrectedCostMicroUSD, fact.CorrectedCostMicroUSD); err != nil {
 			return result, err
 		}
@@ -1854,7 +2037,7 @@ func (m *Monitor) loadFinanceInternalTestCostEvidence(ctx context.Context, scope
 		result.StrictPairs++
 		result.Events = append(result.Events, financeInternalTestCostEvent{HourTs: row.HourTs, Domain: row.Domain, State: "strict", Fact: fact})
 	}
-	result.Complete = result.TestPairs > 0 && result.StrictPairs == result.TestPairs && result.MixedPairs == 0 && result.UnverifiedPairs == 0
+	result.Complete = configured.Complete && result.StrictPairs == result.TestPairs && result.MixedPairs == 0 && result.UnverifiedPairs == 0
 	return result, nil
 }
 
@@ -1863,6 +2046,9 @@ func addFinanceInternalTestFact(dst *financeInternalTestCostFact, fact financeIn
 		return err
 	}
 	if err := addEconomicsInt64(&dst.CorrectedCostMicroUSD, fact.CorrectedCostMicroUSD); err != nil {
+		return err
+	}
+	if err := addEconomicsInt64(&dst.UpstreamCostMicroUSD, fact.UpstreamCostMicroUSD); err != nil {
 		return err
 	}
 	if err := addEconomicsInt64(&dst.ProfitMicroUSD, fact.ProfitMicroUSD); err != nil {
@@ -1881,6 +2067,7 @@ func financeInternalTestCostSubrange(source financeInternalTestCostEvidence, sco
 		ByDay:           map[int64]financeInternalTestCostFact{},
 		ExcludeByDomain: map[string]financeInternalTestCostFact{},
 		ExcludeByDay:    map[int64]financeInternalTestCostFact{},
+		SourceComplete:  source.SourceComplete,
 	}
 	for _, event := range source.Events {
 		if event.HourTs < scope.FromTs || event.HourTs >= scope.ToTs {
@@ -2260,8 +2447,8 @@ func (m *Monitor) loadFinanceUpstreamFacts(ctx context.Context, scope stabilityS
 	return knownBilledMoney, billedExact, knownCorrectedMoney, correctedExact, coverage, details, nil
 }
 
-func (m *Monitor) buildFinancePeriod(ctx context.Context, scope stabilityScope, now int64, accounts map[string]ChannelUpstreamAccountView, finance channelFinanceSnapshot, internalTestCost financeInternalTestCostEvidence) (financeStatementView, StabilityDataCoverage, financeUpstreamCoverageView, []financeCostDetailView, error) {
-	statement, userCoverage, userByDomain, err := m.loadFinanceUserFacts(ctx, scope, now)
+func (m *Monitor) buildFinancePeriod(ctx context.Context, scope stabilityScope, now int64, accounts map[string]ChannelUpstreamAccountView, finance channelFinanceSnapshot, internalTestCost financeInternalTestCostEvidence, internalAccounts financeConfiguredInternalEvidence, businessGroups map[string]bool) (financeStatementView, StabilityDataCoverage, financeUpstreamCoverageView, []financeCostDetailView, error) {
+	statement, userCoverage, userByDomain, err := m.loadFinanceUserFacts(ctx, scope, now, internalAccounts, businessGroups)
 	if err != nil {
 		return financeStatementView{}, StabilityDataCoverage{}, financeUpstreamCoverageView{}, nil, err
 	}
@@ -2277,13 +2464,26 @@ func (m *Monitor) buildFinancePeriod(ctx context.Context, scope stabilityScope, 
 	}
 	applyFinanceInternalTestCost(&statement, internalTestCost.Total, internalTestCost.MixedPairs, internalTestCost.UnverifiedPairs, internalTestCost.Complete)
 	statement.KnownUpstreamBilledCost, statement.UpstreamBilledCost = knownBilled, billed
-	statement.KnownCorrectedUpstreamCost, statement.CorrectedUpstreamCost = knownCorrected, corrected
+	statement.KnownRawCorrectedUpstreamCost, statement.RawCorrectedUpstreamCost = knownCorrected, corrected
+	statement.KnownCorrectedUpstreamCost = knownCorrected
+	if internalTestCost.Total.Rows > 0 {
+		adjusted, subtractErr := financeSubtract(knownCorrected, statement.KnownInternalTestUpstreamCost)
+		if subtractErr != nil {
+			return financeStatementView{}, StabilityDataCoverage{}, financeUpstreamCoverageView{}, nil, fmt.Errorf("扣除内部测试上游成本: %w", subtractErr)
+		}
+		statement.KnownCorrectedUpstreamCost = adjusted
+	}
+	if corrected != nil && internalTestCost.Complete {
+		statement.CorrectedUpstreamCost = financeMoneyPointer(statement.KnownCorrectedUpstreamCost)
+	}
 	// Zero is a valid amount only when there is evidence for at least one domain.
 	// With no bill/correction evidence, keep the value absent so the UI cannot
 	// accidentally present "unknown" as "$0.00".
 	if upstreamCoverage.AvailableDomains == 0 {
 		statement.KnownUpstreamBilledCost = channelEconomicsMoneyView{}
 		statement.UpstreamBilledCost = nil
+		statement.KnownRawCorrectedUpstreamCost = channelEconomicsMoneyView{}
+		statement.RawCorrectedUpstreamCost = nil
 	}
 	if upstreamCoverage.CorrectedDomains == 0 {
 		statement.KnownCorrectedUpstreamCost = channelEconomicsMoneyView{}
@@ -2500,9 +2700,10 @@ func mergeFinanceCostDetails(periodDetails [][]financeCostDetailView, accounts m
 
 func aggregateFinancePeriods(periods []financePeriodView, userCoverage StabilityDataCoverage, upstreamCoverage financeUpstreamCoverageView) (financeStatementView, error) {
 	statement := financeStatementView{}
-	var grossMicro, refundMicro, userMicro, internalMicro, internalCostMicro, billedMicro, correctedMicro int64
+	var grossMicro, refundMicro, userMicro, internalMicro, internalCostMicro, billedMicro, rawCorrectedMicro, correctedMicro int64
 	var pairedRevenueMicro, pairedCostMicro, contributionMicro int64
-	var billedSeen, correctedSeen, contributionSeen, internalCostSeen bool
+	var billedSeen, rawCorrectedSeen, correctedSeen, contributionSeen, internalCostSeen bool
+	allUserKnown := true
 	allInternalCostExact := true
 	for _, period := range periods {
 		if _, err := financeAddMoney(&grossMicro, period.Statement.GrossUserConsumption); err != nil {
@@ -2511,9 +2712,11 @@ func aggregateFinancePeriods(periods []financePeriodView, userCoverage Stability
 		if _, err := financeAddMoney(&refundMicro, period.Statement.UserRefunds); err != nil {
 			return statement, err
 		}
-		if _, err := financeAddMoney(&userMicro, period.Statement.KnownUserConsumption); err != nil {
+		seenUser, err := financeAddMoney(&userMicro, period.Statement.KnownUserConsumption)
+		if err != nil {
 			return statement, err
 		}
+		allUserKnown = allUserKnown && seenUser
 		if _, err := financeAddMoney(&internalMicro, period.Statement.InternalTestConsumption); err != nil {
 			return statement, err
 		}
@@ -2534,6 +2737,11 @@ func aggregateFinancePeriods(periods []financePeriodView, userCoverage Stability
 			return statement, err
 		}
 		billedSeen = billedSeen || seen
+		seen, err = financeAddMoney(&rawCorrectedMicro, period.Statement.KnownRawCorrectedUpstreamCost)
+		if err != nil {
+			return statement, err
+		}
+		rawCorrectedSeen = rawCorrectedSeen || (seen && period.UpstreamCoverage.CorrectedDomains > 0)
 		seen, err = financeAddMoney(&correctedMicro, period.Statement.KnownCorrectedUpstreamCost)
 		if err != nil {
 			return statement, err
@@ -2553,7 +2761,9 @@ func aggregateFinancePeriods(periods []financePeriodView, userCoverage Stability
 	}
 	statement.GrossUserConsumption = economicsMoney(grossMicro)
 	statement.UserRefunds = economicsMoney(refundMicro)
-	statement.KnownUserConsumption = economicsMoney(userMicro)
+	if allUserKnown {
+		statement.KnownUserConsumption = economicsMoney(userMicro)
+	}
 	statement.InternalTestConsumption = economicsMoney(internalMicro)
 	if internalCostSeen {
 		statement.KnownInternalTestUpstreamCost = economicsMoney(internalCostMicro)
@@ -2574,6 +2784,12 @@ func aggregateFinancePeriods(periods []financePeriodView, userCoverage Stability
 		statement.KnownCorrectedUpstreamCost = economicsMoney(correctedMicro)
 		if upstreamCoverage.Complete {
 			statement.CorrectedUpstreamCost = financeMoneyPointer(statement.KnownCorrectedUpstreamCost)
+		}
+	}
+	if rawCorrectedSeen {
+		statement.KnownRawCorrectedUpstreamCost = economicsMoney(rawCorrectedMicro)
+		if upstreamCoverage.Complete {
+			statement.RawCorrectedUpstreamCost = financeMoneyPointer(statement.KnownRawCorrectedUpstreamCost)
 		}
 	}
 	if contributionSeen {
@@ -2597,7 +2813,7 @@ func (m *Monitor) buildFinanceOperatingReport(ctx context.Context, from, to time
 		Enabled: m.cfg.FinanceEnabled, Stage: "read_only_preview", GeneratedAt: time.Now().Unix(),
 		From: from.Unix(), To: to.Unix(), TimeZone: "Asia/Shanghai",
 		Periods: []financePeriodView{}, Days: []financeDailyView{}, CostDetails: []financeCostDetailView{},
-		SemanticsNote: "用户净计费消耗 = 消费扣额 - 退还额度，内部/自动测试另行列示且不算客户收入。注册赠送只在用户用量、额度调整和赠送用户逐笔金额顺序全部闭合后扣减。已配对计费贡献只来自同一小时内计费扣额、上游成本、渠道映射和倍率版本同时核验的不可变配对事实，并已剔除可严格识别的纯内部测试小时成本。因注册赠送尚未按渠道归属，该贡献是赠送扣减前的计费口径，不是经营毛利。混合流量小时不做比例估算；内部测试上游成本和 AWS 成本尚未全部闭合。",
+		SemanticsNote: "用户净计费消耗 = 消费扣额 - 退还额度，自动测试和人工配置的内部账号另行列示，不算客户收入。注册赠送只在用户用量、额度调整和赠送用户逐笔金额顺序全部闭合后扣减，内部账号不参与赠送消耗扣减。修正业务上游成本已分离可严格识别的内部测试成本，上游账单原值仍完整保留用于对账。已配对计费贡献只来自同一小时内计费扣额、上游成本、渠道映射和倍率版本同时核验的不可变配对事实。混合流量小时不做比例估算，未闭合部分不会被当作 0。",
 		Notices: []string{
 			"本页只读 Monitor 本地用户用量事实、上游账单和不可变经济事实，刷新不会访问生产库或上游。",
 			"注册赠送事实覆盖不完整时经营收入保持空值；内部测试上游成本仅发布严格识别部分，混合流量和 AWS CUR 尚未闭合，因此最终经营毛利保持空值。",
@@ -2617,18 +2833,31 @@ func (m *Monitor) buildFinanceOperatingReport(ctx context.Context, from, to time
 		return nil, fmt.Errorf("读取上游账户状态: %w", err)
 	}
 	fullScope := stabilityScope{FromTs: from.Unix(), ToTs: to.Unix()}
-	internalTestCost, err := m.loadFinanceInternalTestCostEvidence(ctx, fullScope)
+	businessGroups, err := loadChannelBusinessGroupPolicies(ctx, m.storeDB)
+	if err != nil {
+		return nil, fmt.Errorf("读取经营核算分组范围: %w", err)
+	}
+	configuredInternal, err := m.loadFinanceConfiguredInternalEvidence(ctx, fullScope, businessGroups)
+	if err != nil {
+		return nil, fmt.Errorf("读取内部账号核算事实: %w", err)
+	}
+	report.InternalAccounts = configuredInternal.SyncState
+	internalTestCost, err := m.loadFinanceInternalTestCostEvidence(ctx, fullScope, configuredInternal)
 	if err != nil {
 		return nil, err
 	}
 	periodDetails := make([][]financeCostDetailView, 0, 24)
 	for _, monthRange := range financeMonthRanges(from, to) {
 		monthScope := stabilityScope{FromTs: monthRange[0].Unix(), ToTs: monthRange[1].Unix()}
+		monthInternalAccounts, sliceErr := financeConfiguredInternalSubrange(configuredInternal, monthScope)
+		if sliceErr != nil {
+			return nil, fmt.Errorf("汇总 %s 内部账号用量: %w", monthRange[0].Format("2006-01"), sliceErr)
+		}
 		monthInternalTestCost, sliceErr := financeInternalTestCostSubrange(internalTestCost, monthScope)
 		if sliceErr != nil {
 			return nil, fmt.Errorf("汇总 %s 内部测试成本: %w", monthRange[0].Format("2006-01"), sliceErr)
 		}
-		statement, userCoverage, upstreamCoverage, details, err := m.buildFinancePeriod(ctx, monthScope, report.GeneratedAt, accounts, finance, monthInternalTestCost)
+		statement, userCoverage, upstreamCoverage, details, err := m.buildFinancePeriod(ctx, monthScope, report.GeneratedAt, accounts, finance, monthInternalTestCost, monthInternalAccounts, businessGroups)
 		if err != nil {
 			return nil, fmt.Errorf("读取 %s 月度经济事实: %w", monthRange[0].Format("2006-01"), err)
 		}
@@ -2640,6 +2869,7 @@ func (m *Monitor) buildFinanceOperatingReport(ctx context.Context, from, to time
 		periodDetails = append(periodDetails, details)
 	}
 	report.UserCoverage = m.stabilityDataCoverage(ctx, from.Unix(), to.Unix(), report.GeneratedAt)
+	report.UserCoverage.Complete = report.UserCoverage.Complete && configuredInternal.Complete
 	report.UpstreamCoverage, report.CostDetails, err = mergeFinanceCostDetails(periodDetails, accounts)
 	if err != nil {
 		return nil, fmt.Errorf("汇总上游成本明细: %w", err)
@@ -2666,6 +2896,14 @@ func (m *Monitor) buildFinanceOperatingReport(ctx context.Context, from, to time
 		if giftErr != nil {
 			return nil, fmt.Errorf("核验注册赠送实际消耗: %w", giftErr)
 		}
+		excludedGiftUsers := make(map[int64]bool)
+		for _, userID := range configuredInternal.AccountIDs {
+			excludedGiftUsers[userID] = true
+		}
+		giftResult, giftErr = excludeFinanceGiftUsers(giftResult, excludedGiftUsers)
+		if giftErr != nil {
+			return nil, fmt.Errorf("从赠送消耗中分离内部账号: %w", giftErr)
+		}
 		giftResult.Coverage.RequestedToTs = to.Unix()
 		if giftTo < to.Unix() {
 			giftResult.Coverage.LatestHourPending = true
@@ -2691,7 +2929,7 @@ func (m *Monitor) buildFinanceOperatingReport(ctx context.Context, from, to time
 			report.GiftCoverage.ProvisionalSeconds = to.Unix() - giftTo
 		}
 	}
-	report.Days, err = m.buildFinanceDailyViews(ctx, fullScope, report.GeneratedAt, internalTestCost)
+	report.Days, err = m.buildFinanceDailyViews(ctx, fullScope, report.GeneratedAt, internalTestCost, configuredInternal, businessGroups)
 	if err != nil {
 		return nil, fmt.Errorf("汇总每日经营事实: %w", err)
 	}
@@ -2875,7 +3113,12 @@ func (m *Monitor) serveFinanceOperatingReport(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "查询范围晚于本地快照截止时间"})
 		return
 	}
-	request := financeReportRequest{from: from, to: to, snapshotAsOf: snapshotAsOf, snapshotClamped: snapshotClamped}
+	configurationHash, configErr := m.financeReportConfigurationHash(ctx)
+	if configErr != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "经营核算报表暂不可用", "detail": configErr.Error()})
+		return
+	}
+	request := financeReportRequest{from: from, to: to, snapshotAsOf: snapshotAsOf, snapshotClamped: snapshotClamped, configurationHash: configurationHash}
 	payload, cacheStatus, err := m.financeReportPayload(ctx, request, c.Query("fresh") == "1")
 	if err != nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "经营核算报表暂不可用", "detail": err.Error()})
