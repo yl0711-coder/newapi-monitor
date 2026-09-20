@@ -1248,10 +1248,11 @@ func (m *Monitor) fetchNewAPIPricingHour(ctx context.Context, account ChannelUps
 		// scans must reset content verification, not rewrite old money semantics.
 		priorErr := m.storeDB.WithContext(ctx).Where("domain = ? AND account_epoch = ? AND semantics_version = ? AND hour_ts = ? AND status IN ?", account.Domain, epoch, channelCostEvidenceSemanticsVersion, hourTs, []string{"observed", "verified"}).First(&priorCostState).Error
 		if priorErr == nil {
-			if !validPositiveCanonicalRat(priorCostState.ChargeUnitsPerUSD) {
-				return nil, ChannelUpstreamPricingHourState{}, "", false, errors.New("既有渠道成本小时的历史计费单位无效")
+			var unitErr error
+			frozenCostUnitsPerUSD, unitErr = channelCostFrozenUnit(priorCostState)
+			if unitErr != nil {
+				return nil, ChannelUpstreamPricingHourState{}, "", false, unitErr
 			}
-			frozenCostUnitsPerUSD = priorCostState.ChargeUnitsPerUSD
 		} else if !errors.Is(priorErr, gorm.ErrRecordNotFound) {
 			return nil, ChannelUpstreamPricingHourState{}, "", false, priorErr
 		}

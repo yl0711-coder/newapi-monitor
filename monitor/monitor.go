@@ -155,6 +155,9 @@ type Monitor struct {
 	financeReportCacheOnce sync.Once
 	financeReportCache     *boundedByteCache
 	financeReportFlight    cacheFlightGroup
+	financeSnapshotWriteMu sync.RWMutex
+	financePeriodCacheOnce sync.Once
+	financePeriodCache     *boundedByteCache
 
 	usageGateOnce         sync.Once // 聚合/后台来源查询泳道，容量 1
 	usageGate             chan struct{}

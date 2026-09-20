@@ -722,6 +722,20 @@ func validPositiveCanonicalRat(value string) bool {
 	return ok && rat.Sign() > 0 && rat.RatString() == value && len(value) <= 80
 }
 
+// An empty observation has no money whose conversion unit can be frozen.
+// Older versions persisted an empty unit for these hours. Allow them to be
+// re-observed, but never relax validation for a nonempty historical hour.
+func channelCostFrozenUnit(state ChannelUpstreamCostHourState) (string, error) {
+	if state.Requests == 0 && state.EvidenceRows == 0 && state.ControlChargeUnits == 0 &&
+		state.EvidenceChargeUnits == 0 && state.ReconcileDelta == 0 && state.ReconcileStatus == "matched" {
+		return "", nil
+	}
+	if !validPositiveCanonicalRat(state.ChargeUnitsPerUSD) {
+		return "", errors.New("既有渠道成本小时的历史计费单位无效")
+	}
+	return state.ChargeUnitsPerUSD, nil
+}
+
 func (m *Monitor) channelCostEnabledFor(account ChannelUpstreamAccount) bool {
 	return m.cfg.ChannelCostClosureEnabled && account.Provider == upstreamProviderNewAPI && channelCostDomainAllowed(m.cfg.ChannelCostClosureDomains, account.Domain)
 }
@@ -823,6 +837,20 @@ func (m *Monitor) publishChannelCostHourFromCheckpoint(ctx context.Context, acco
 		SemanticsVersion: channelCostEvidenceSemanticsVersion, Provider: account.Provider,
 		Status: "observed", ControlChargeUnits: pricingState.FinalQuota,
 		EvidenceRows: int64(len(rows)), ContentHash: channelCostEvidenceContentHash(rows), CompletedAt: now, UpdatedAt: now,
+	}
+	if len(rows) == 0 {
+		if checkpoint.Total != 0 || pricingState.FinalQuota != 0 {
+			return errors.New("空渠道成本证据与上游控制总额不一致")
+		}
+		// Zero is invariant under conversion. Populate the usual validated unit
+		// for consumers, but channelCostFrozenUnit never carries it into a later
+		// nonempty observation of this hour.
+		_, empty, unitErr := buildNewAPICostHourEvidence(account, nil, pricingState.HourTs, now,
+			[]byte(m.cfg.ChannelCostHMACKey), m.cfg.ChannelCostHMACKeyID)
+		if unitErr != nil {
+			return unitErr
+		}
+		state.ChargeUnitsPerUSD = empty.ChargeUnitsPerUSD
 	}
 	for _, row := range rows {
 		if !validPositiveCanonicalRat(row.ChargeUnitsPerUSD) {

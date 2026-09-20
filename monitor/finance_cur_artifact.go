@@ -132,13 +132,25 @@ func projectFinanceCURBuckets(statement financecur.Statement, buckets []financec
 	view.ConflictCost = economicsMoney(conflictMicro)
 	var knownNano int64
 	allIncludedComplete := true
-	for _, bucket := range buckets {
+	coveredThrough := fromUnix
+	contiguous := true
+	ordered := append([]financecur.TimeBucket(nil), buckets...)
+	sort.Slice(ordered, func(i, j int) bool { return ordered[i].FromUnix < ordered[j].FromUnix })
+	for _, bucket := range ordered {
+		if bucket.ToUnix <= bucket.FromUnix {
+			return financeCURCostView{}, fmt.Errorf("AWS 成本时间桶无效")
+		}
 		// Daily CUR amounts cannot be safely split again. Only include a bucket
 		// fully contained by the requested range; partial boundary days remain
 		// unknown rather than being prorated.
 		if bucket.FromUnix < fromUnix || bucket.ToUnix > toUnix {
 			continue
 		}
+		if bucket.FromUnix < coveredThrough {
+			return financeCURCostView{}, fmt.Errorf("AWS 成本时间桶重叠")
+		}
+		contiguous = contiguous && bucket.FromUnix == coveredThrough
+		coveredThrough = bucket.ToUnix
 		if (bucket.NexusAPINanoUSD > 0 && knownNano > math.MaxInt64-bucket.NexusAPINanoUSD) ||
 			(bucket.NexusAPINanoUSD < 0 && knownNano < math.MinInt64-bucket.NexusAPINanoUSD) {
 			return financeCURCostView{}, fmt.Errorf("AWS 成本金额超出安全范围")
@@ -157,7 +169,7 @@ func projectFinanceCURBuckets(statement financecur.Statement, buckets []financec
 	}
 	view.RangeComplete = statement.Status == financecur.StatementStatusPublishable &&
 		fromUnix >= statement.FirstUsageUnix && toUnix <= statement.LastUsageThroughUnix &&
-		view.IncludedDays > 0 && allIncludedComplete
+		view.IncludedDays > 0 && allIncludedComplete && contiguous && coveredThrough == toUnix
 	if view.RangeComplete {
 		view.Status = "verified"
 		view.ExactCost = financeMoneyPointer(view.KnownCost)

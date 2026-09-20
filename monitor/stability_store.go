@@ -349,10 +349,14 @@ func upsertStabilityProblemStages(tx *gorm.DB, rows []StabilityProblemStage) err
 }
 
 func (m *Monitor) pruneStabilityOlderThan(cutoffTs int64) error {
-	if err := m.storeDB.Where("hour_ts < ?", cutoffTs).Delete(&StabilityHourSample{}).Error; err != nil {
+	financeCutoff, err := m.financeProtectedAggregateCutoff(cutoffTs)
+	if err != nil {
+		return err
+	}
+	if err := m.storeDB.Where("hour_ts < ?", financeCutoff).Delete(&StabilityHourSample{}).Error; err != nil {
 		return fmt.Errorf("清理稳定性小时汇总: %w", err)
 	}
-	if err := m.storeDB.Where("hour_ts < ?", cutoffTs).Delete(&ChannelTestHourSample{}).Error; err != nil {
+	if err := m.storeDB.Where("hour_ts < ?", financeCutoff).Delete(&ChannelTestHourSample{}).Error; err != nil {
 		return fmt.Errorf("清理渠道内部测试小时汇总: %w", err)
 	}
 	if err := m.storeDB.Where("hour_ts < ?", cutoffTs).Delete(&StabilityRejectHour{}).Error; err != nil {
@@ -367,7 +371,7 @@ func (m *Monitor) pruneStabilityOlderThan(cutoffTs int64) error {
 	if err := m.storeDB.Where("bucket_ts < ?", cutoffTs).Delete(&StabilityProblemIngestState{}).Error; err != nil {
 		return fmt.Errorf("清理稳定性问题采集状态: %w", err)
 	}
-	if err := m.storeDB.Where("hour_ts < ?", cutoffTs).Delete(&StabilityHourIngestState{}).Error; err != nil {
+	if err := m.storeDB.Where("hour_ts < ?", financeCutoff).Delete(&StabilityHourIngestState{}).Error; err != nil {
 		return fmt.Errorf("清理稳定性小时覆盖状态: %w", err)
 	}
 	// 补数任务只保留审计摘要，不随小时明细无限增长。正在执行/等待续跑的任务不能删。

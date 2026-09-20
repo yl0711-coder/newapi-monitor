@@ -470,7 +470,7 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
 <link rel="stylesheet" href="/stability.css?v=13">
 <link rel="stylesheet" href="/capacity.css?v=2">
 <link rel="stylesheet" href="/group-governance.css?v=1">
-  <link rel="stylesheet" href="/finance.css?v=13">
+  <link rel="stylesheet" href="/finance.css?v=14">
 </head>
 <body theme-mode="dark">
 <div class="monitor-shell">
@@ -652,11 +652,11 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
     <div class="stability-toolbar">
       <div><h2>稳定性总览</h2><p>基于中转站历史日志还原请求稳定性；该口径不等同于用户侧最终感知。</p></div>
       <div class="stability-range">
-        <button type="button" data-stability-hours="24">近 24 小时</button>
+        <button type="button" class="active" data-stability-hours="24">近 24 小时</button>
         <button type="button" data-stability-preset="today">今天</button>
         <button type="button" data-stability-preset="yesterday">昨天</button>
         <button type="button" data-stability-preset="week">本周</button>
-        <button type="button" class="active" data-stability-days="7">近 7 天</button>
+        <button type="button" data-stability-days="7">近 7 天</button>
         <button type="button" data-stability-days="15">近 15 天</button>
         <button type="button" data-stability-days="30">近 30 天</button>
         <button type="button" data-stability-days="90">近 90 天</button>
@@ -1292,14 +1292,14 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
   </main>
 </div><!-- /monitor-shell -->
 
-<script src="/stability.js?v=5"></script>
+<script src="/stability.js?v=6"></script>
 <script src="/channel-data-status.js?v=1"></script>
 <script src="/channel-management.js?v=13"></script>
 <script src="/logchain.js?v=12"></script>
 <script src="/alerts.js?v=1"></script>
 <script src="/capacity.js?v=2"></script>
 <script src="/group-governance.js?v=1"></script>
-<script src="/finance.js?v=37"></script>
+<script src="/finance.js?v=42"></script>
 <script src="/infra-assets.js?v=1"></script>
 <script src="/ecs-log-sources.js?v=1"></script>
 <script>

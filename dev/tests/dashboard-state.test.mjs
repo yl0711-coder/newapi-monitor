@@ -5,6 +5,41 @@ import vm from 'node:vm';
 
 const source = name => readFileSync(new URL(`../../monitor/${name}`, import.meta.url), 'utf8');
 
+function stabilityRangeFixture() {
+  const context=vm.createContext({URLSearchParams,window:{},syncRange(){}});
+  const js=source('stability.js');
+  const state=js.match(/^const st=.*$/m);
+  assert.ok(state,'stability initial state exists');
+  vm.runInContext(state[0],context);
+  for(const name of ['queryParams','applyNavigationContext']) {
+    const fn=js.match(new RegExp(`^function ${name}\\([^]*?^}`, 'm'));
+    assert.ok(fn,`${name} exists`);
+    vm.runInContext(fn[0],context);
+  }
+  return {context,...vm.runInContext('({st,queryParams,applyNavigationContext})',context)};
+}
+
+test('stability initially selects and requests the last 24 hours, not seven days',()=>{
+  const {queryParams}=stabilityRangeFixture();
+  assert.equal(queryParams().toString(),'hours=24');
+  const page=source('page.html');
+  assert.match(page,/<button type="button" class="active" data-stability-hours="24">/);
+  assert.doesNotMatch(page,/<button[^>]*class="active"[^>]*data-stability-days="7"/);
+});
+
+test('stability explicit navigation ranges still override the 24 hour default',()=>{
+  const {context,queryParams,applyNavigationContext}=stabilityRangeFixture();
+  context.window.monitorNavigationContext=()=>({days:7,group:'test-group'});
+  assert.equal(applyNavigationContext(),true);
+  assert.equal(queryParams().toString(),'days=7&group=test-group');
+  context.window.monitorNavigationContext=()=>({from:'2026-09-01',to:'2026-09-03'});
+  assert.equal(applyNavigationContext(),true);
+  assert.equal(queryParams().toString(),'from=2026-09-01&to=2026-09-03');
+  context.window.monitorNavigationContext=()=>({hours:24});
+  assert.equal(applyNavigationContext(),true);
+  assert.equal(queryParams().toString(),'hours=24');
+});
+
 test('upstream diagnostics renders safe instructions and tolerates missing checks',()=>{
   const {context,element}=dashboard();
   context.channelTest.renderUpstreamDiagnostic({provider:'tokenforce',confidence:'suspected',checks:[{name:'余额',status:'error',message:'<img src=x onerror=alert(1)>',action:'重新登录'}],instructions:['查找 orgId'],scope:'仅单页'});

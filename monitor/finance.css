@@ -21,3 +21,4 @@
 .fin-chip.bill_not_connected{background:rgba(239,114,121,.12);color:#ef8b90}.fin-closure-action{min-width:300px;white-space:normal!important}.fin-closure-action small{max-width:360px;white-space:normal;line-height:1.45}
 .fin-backfill{display:block;margin-top:8px;padding-top:7px;border-top:1px dashed #343d50}.fin-backfill>small{display:block;margin-top:4px;color:#7f8a9e;line-height:1.4;white-space:normal}
 .fin-rollout-table{min-width:1120px}.fin-rollout-table td:last-child{min-width:310px;white-space:normal}.fin-rollout-table td:last-child small{display:block;margin-top:5px;color:#7f8a9e;line-height:1.45;white-space:normal}.fin-pilot{display:inline-block!important;margin:5px 0 0!important;padding:2px 6px;border-radius:999px;background:rgba(89,201,146,.13);color:var(--fin-green)!important;font-size:9px}
+.fin-chip.not_configured,.fin-chip.not_required{color:#8e99ab}

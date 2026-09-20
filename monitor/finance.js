@@ -1,7 +1,10 @@
 (function () {
   'use strict';
 
-  const state = { inited: false, loaded: false, abort: null, chart: null };
+  const state = {
+    inited: false, loaded: false, abort: null, chart: null,
+    stale: false, refreshTimer: null, refreshAttempts: 0,
+  };
   const $ = (id) => document.getElementById(id);
   const esc = (value) => String(value == null ? '' : value).replace(/[&<>"']/g, (char) => ({
     '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
@@ -9,14 +12,14 @@
   const statusText = {
     verified: '已核验', incomplete: '覆盖不完整', no_data: '暂无数据',
     paired_verified: '配对已核验', partially_paired: '部分配对',
-    binding_required: '待完成来源归属', not_enrolled: '未进入配对账本',
+    binding_required: '待完成来源归属', not_enrolled: '未进入配对账本', not_required: '暂不纳入',
     in_progress: '闭环进行中', bill_not_connected: '账单未接入',
     bill_missing: '账单证据缺失', correction_missing: '缺修正依据', source_binding_required: '成本来源待归属',
     cost_evidence_missing: '成本证据未采集', cost_evidence_incomplete: '成本证据未补齐', finance_history_missing: '历史财务版本缺失', ledger_backfill_required: '待试算配对账本',
     local_estimate_ready: '可闭合的本地估算', pricing_evidence_only: '仅倍率/费用证据', adapter_probe_required: '需适配器探测', range_exceeds_limit: '超过安全历史范围',
     account_missing: '账户配置缺失', account_disabled: '账户同步未启用', no_local_activity: '无本地活动依据', granularity_unsupported: '粒度不兼容', estimate_unavailable: '暂无估算',
     precheck_required: '待灰度前核对',
-    not_connected: '未接入', disabled: '未开启',
+    not_connected: '未接入', not_configured: '未配置（不纳入）', disabled: '未开启',
   };
   const curProductNames = {
     AmazonECS: 'ECS / Fargate', AmazonRDS: 'RDS', AmazonCloudFront: 'CloudFront',
@@ -57,7 +60,9 @@
     const relevant = Number(value?.relevant_domains || 0);
     const available = Number(value?.available_domains || 0);
     const corrected = Number(value?.corrected_domains || 0);
-    return relevant ? `账单 ${available}/${relevant}·修正 ${corrected}/${relevant}` : '—';
+    const unconfigured = Number(value?.unconfigured_domains || 0);
+    const configured = relevant ? `账单 ${available}/${relevant}·修正 ${corrected}/${relevant}` : '无已配置上游';
+    return unconfigured ? `${configured}·${unconfigured} 个未配置暂不纳入` : configured;
   }
 
   function domainHourCoverage(row) {
@@ -193,9 +198,11 @@
       const details = Array.isArray(data.cost_details) ? data.cost_details : [];
       const billMissing = details.filter((row) => row.closure_readiness === 'bill_not_connected' || row.closure_readiness === 'bill_missing').length;
       const correctionMissing = details.filter((row) => row.closure_readiness === 'correction_missing').length;
+      const unconfigured = Number(coverage.unconfigured_domains || 0);
       const reasons = [];
       if (billMissing) reasons.push(`${billMissing} 个上游账单未接入/缺失`);
       if (correctionMissing) reasons.push(`${correctionMissing} 个缺历史充值修正依据`);
+      if (unconfigured) reasons.push(`${unconfigured} 个未配置来源暂不纳入正式毛利`);
       const coverageText = relevant ? `账单 ${available}/${relevant}、修正 ${corrected}/${relevant}` : '无可核验上游';
       blockers.push(`修正上游总成本未闭合（${coverageText}${reasons.length ? `；${reasons.join('、')}` : ''}）`);
     }
@@ -288,11 +295,30 @@
 
   window.financeActivate = function () {
     if (!state.inited) init();
-    if (!state.loaded) load();
+    if (!state.loaded || state.stale) load();
   };
   window.financeDeactivate = function () {
     if (state.abort) state.abort.abort();
+    clearRefreshTimer();
   };
+
+  function clearRefreshTimer() {
+    if (state.refreshTimer) clearTimeout(state.refreshTimer);
+    state.refreshTimer = null;
+  }
+
+  function scheduleStaleRefresh() {
+    clearRefreshTimer();
+    if (!state.stale || $('tab-finance')?.hidden) return;
+    if (state.refreshAttempts >= 5) {
+      const note = $('finCacheUpdate');
+      if (note) note.textContent = ' · 更新尚未完成，已保留上次结果；请稍后刷新';
+      return;
+    }
+    const delay = Math.min(16000, 1000 * (2 ** state.refreshAttempts));
+    state.refreshAttempts += 1;
+    state.refreshTimer = setTimeout(() => load(false, true), delay);
+  }
 
   function init() {
     state.inited = true;
@@ -378,11 +404,13 @@
     load();
   }
 
-  async function load(forceFresh = false) {
+  async function load(forceFresh = false, background = false) {
+    clearRefreshTimer();
+    if (!background) state.refreshAttempts = 0;
     if (state.abort) state.abort.abort();
     state.abort = new AbortController();
     const button = $('finRefresh');
-    if (button) { button.disabled = true; button.textContent = '读取中'; }
+    if (button && !background) { button.disabled = true; button.textContent = '读取中'; }
     const query = new URLSearchParams();
     if ($('finFrom')?.value) query.set('from', $('finFrom').value);
     if ($('finTo')?.value) query.set('to', $('finTo').value);
@@ -396,11 +424,21 @@
       if (!response.ok) throw new Error(data.detail || data.error || `HTTP ${response.status}`);
       data._cache_status = response.headers.get('X-Monitor-Finance-Cache') || '';
       state.loaded = true;
+      state.stale = String(data._cache_status).includes('stale');
+      if (!state.stale) state.refreshAttempts = 0;
       render(data);
+      scheduleStaleRefresh();
     } catch (error) {
-      if (error.name !== 'AbortError') renderError(error.message);
+      if (error.name !== 'AbortError') {
+        if (background && state.stale) {
+          const note = $('finCacheUpdate');
+          if (note) note.textContent = ` · 更新失败，已保留上次结果：${String(error.message).slice(0, 160)}`;
+          scheduleStaleRefresh();
+        }
+        else renderError(error.message);
+      }
     } finally {
-      if (button) { button.disabled = false; button.textContent = '刷新'; }
+      if (button && !background) { button.disabled = false; button.textContent = '刷新'; }
     }
   }
 
@@ -419,7 +457,7 @@
           : '已展示现有用量，部分小时与上游成本仍待补证';
     const snapshotNote=data.data_as_of?` · 快照截至 ${dateTime(data.data_as_of)}`:'';
     const generatedNote=data.generated_at?` · 生成于 ${dateTime(data.generated_at)}`:'';
-    const refreshingNote=data._cache_status==='stale-refreshing'?' · 后台更新中':'';
+    const refreshingNote=String(data._cache_status || '').includes('stale')?'<span id="finCacheUpdate"> · 后台更新中</span>':'';
     status.innerHTML = `<i></i><div><b>${summary}</b><br>${enabled ? `区间 ${date(data.from)} 至 ${date(data.to)} · 用量 ${userCoverage(data.user_coverage)} · 成本 ${upstreamCoverage(data.upstream_coverage)}${snapshotNote}${generatedNote}${refreshingNote}` : '配置 MONITOR_FINANCE_ENABLED=true 后，只读展示已有事实。'}</div>`;
 
     setMoney('finConsumption', statement.user_consumption, statement.known_user_consumption,
@@ -508,6 +546,7 @@
       return result;
     }, {});
     const groups = [
+      ['not_required', '暂不纳入', '未配置上游账户，不进入覆盖率和利润'],
       ['precheck_required', '待灰度前核对', '已有账单与修正证据'],
       ['correction_missing', '缺修正依据', '先补充值比例或审计证据'],
       ['bill_missing', '缺账单证据', '先补齐上游账单记录'],

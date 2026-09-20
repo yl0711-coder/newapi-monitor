@@ -65,17 +65,26 @@ type financeInternalFactStatus struct {
 }
 
 type financeConfiguredInternalEvidence struct {
-	Rows       []FinanceInternalAccountHourFact
-	Complete   bool
-	Accounts   int64
-	AccountIDs []int64
-	Requests   int64
-	Tokens     int64
-	NetQuota   int64
-	SyncState  financeInternalFactStatus
+	Rows     []FinanceInternalAccountHourFact
+	Complete bool
+	// VerifiedScope bounds the rows actually loaded under the current account
+	// configuration. An incomplete tail must not invalidate a closed subrange.
+	VerifiedScope stabilityScope
+	Accounts      int64
+	AccountIDs    []int64
+	Requests      int64
+	Tokens        int64
+	NetQuota      int64
+	SyncState     financeInternalFactStatus
 }
 
 func (m *Monitor) loadFinanceConfiguredInternalEvidence(ctx context.Context, scope stabilityScope, policies map[string]bool) (financeConfiguredInternalEvidence, error) {
+	return m.loadFinanceInternalEvidence(ctx, scope, policies, false)
+}
+
+// Finance may retain a verified prefix for independent monthly/daily reports.
+// Other consumers keep the existing all-or-nothing loading contract.
+func (m *Monitor) loadFinanceInternalEvidence(ctx context.Context, scope stabilityScope, policies map[string]bool, allowPartial bool) (financeConfiguredInternalEvidence, error) {
 	var result financeConfiguredInternalEvidence
 	accounts, err := m.loadFinanceInternalAccounts(ctx)
 	if err != nil {
@@ -101,7 +110,12 @@ func (m *Monitor) loadFinanceConfiguredInternalEvidence(ctx context.Context, sco
 	if status.Status == "configuration_changed" {
 		return result, nil
 	}
-	if !result.Complete {
+	if !result.Complete && (!allowPartial || (status.Status != "caught_up" && status.Status != "backfilling")) {
+		return result, nil
+	}
+	result.VerifiedScope = stabilityScope{FromTs: max(scope.FromTs, status.StartHour), ToTs: min(scope.ToTs, status.NextHour)}
+	if result.VerifiedScope.ToTs <= result.VerifiedScope.FromTs {
+		result.VerifiedScope = stabilityScope{}
 		return result, nil
 	}
 	db := m.usageFactsStore()
@@ -109,7 +123,7 @@ func (m *Monitor) loadFinanceConfiguredInternalEvidence(ctx context.Context, sco
 		return result, errors.New("finance facts store unavailable")
 	}
 	var rows []FinanceInternalAccountHourFact
-	if err := db.WithContext(ctx).Where("hour_ts>=? AND hour_ts<?", scope.FromTs, scope.ToTs).
+	if err := db.WithContext(ctx).Where("hour_ts>=? AND hour_ts<?", result.VerifiedScope.FromTs, result.VerifiedScope.ToTs).
 		Order("hour_ts,user_id,channel_id,grp").Find(&rows).Error; err != nil {
 		return result, err
 	}
@@ -136,7 +150,11 @@ func (m *Monitor) loadFinanceConfiguredInternalEvidence(ctx context.Context, sco
 }
 
 func financeConfiguredInternalSubrange(source financeConfiguredInternalEvidence, scope stabilityScope) (financeConfiguredInternalEvidence, error) {
-	result := financeConfiguredInternalEvidence{Complete: source.Complete, Accounts: source.Accounts, AccountIDs: append([]int64(nil), source.AccountIDs...), SyncState: source.SyncState}
+	result := financeConfiguredInternalEvidence{
+		Complete:      financeEvidenceScopeComplete(source.Complete, source.VerifiedScope, scope),
+		VerifiedScope: financeEvidenceScopeIntersection(source.VerifiedScope, scope),
+		Accounts:      source.Accounts, AccountIDs: append([]int64(nil), source.AccountIDs...), SyncState: source.SyncState,
+	}
 	for _, row := range source.Rows {
 		if row.HourTs < scope.FromTs || row.HourTs >= scope.ToTs {
 			continue
@@ -156,6 +174,24 @@ func financeConfiguredInternalSubrange(source financeConfiguredInternalEvidence,
 		}
 	}
 	return result, nil
+}
+
+func financeEvidenceScopeComplete(complete bool, verified, requested stabilityScope) bool {
+	if requested.ToTs <= requested.FromTs {
+		return false
+	}
+	if verified.ToTs > verified.FromTs {
+		return verified.FromTs <= requested.FromTs && verified.ToTs >= requested.ToTs
+	}
+	return complete
+}
+
+func financeEvidenceScopeIntersection(verified, requested stabilityScope) stabilityScope {
+	result := stabilityScope{FromTs: max(verified.FromTs, requested.FromTs), ToTs: min(verified.ToTs, requested.ToTs)}
+	if result.ToTs <= result.FromTs {
+		return stabilityScope{}
+	}
+	return result
 }
 
 func financeInternalAccountHourSQL(ids []int64) (string, []any) {

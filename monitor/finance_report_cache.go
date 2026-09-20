@@ -3,7 +3,9 @@ package monitor
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"log/slog"
 	"time"
 )
 
@@ -16,6 +18,7 @@ const (
 	financeReportCacheMaxEntries = 16
 	financeReportCacheMaxBytes   = 12 << 20
 	financeReportBuildTimeout    = 12 * time.Second
+	financeReportPersistentStale = 24 * time.Hour
 )
 
 type financeReportRequest struct {
@@ -24,10 +27,25 @@ type financeReportRequest struct {
 	snapshotAsOf      int64
 	snapshotClamped   bool
 	configurationHash string
+	sourceFingerprint string
+}
+
+// Explicit user refresh bypasses both layers; ordinary background revalidation
+// still reuses unaffected historical months.
+type financeForceRebuildKey struct{}
+
+var errFinanceFactsChanged = errors.New("经营核算事实在报表生成期间已变更，请重试")
+
+func (r financeReportRequest) lastGoodKey() string {
+	return "last-good:" + r.logicalKey()
+}
+
+func (r financeReportRequest) logicalKey() string {
+	return fmt.Sprintf("%d:%d:%d:%t:%s", r.from.Unix(), r.to.Unix(), r.snapshotAsOf, r.snapshotClamped, r.configurationHash)
 }
 
 func (r financeReportRequest) cacheKey() string {
-	return fmt.Sprintf("%d:%d:%d:%t:%s", r.from.Unix(), r.to.Unix(), r.snapshotAsOf, r.snapshotClamped, r.configurationHash)
+	return r.logicalKey() + ":" + r.sourceFingerprint
 }
 
 func (m *Monitor) getFinanceReportCache() *boundedByteCache {
@@ -53,6 +71,15 @@ func (m *Monitor) buildFinanceReportPayload(ctx context.Context, request finance
 			return nil, fmt.Errorf("经营核算配置在报表生成期间已变更，请重试")
 		}
 	}
+	if request.sourceFingerprint != "" {
+		currentFingerprint, fingerprintErr := m.financeReportSourceFingerprint(ctx, request.from.Unix(), request.to.Unix())
+		if fingerprintErr != nil {
+			return nil, fmt.Errorf("复核经营核算事实版本: %w", fingerprintErr)
+		}
+		if currentFingerprint != request.sourceFingerprint {
+			return nil, errFinanceFactsChanged
+		}
+	}
 	if request.snapshotAsOf > 0 {
 		report.DataAsOf = request.snapshotAsOf
 	}
@@ -69,11 +96,52 @@ func (m *Monitor) buildFinanceReportPayload(ctx context.Context, request finance
 	return payload, nil
 }
 
+// Retry only a publication race, at most once and under the original deadline.
+// The accepted version is returned separately so it can never be stored under
+// the fingerprint of the rejected attempt. Configuration changes still fail.
+func (m *Monitor) buildFinanceReportWithRetry(ctx context.Context, request financeReportRequest) ([]byte, financeReportRequest, error) {
+	if request.sourceFingerprint == "" && m.cfg.FinanceEnabled {
+		fingerprint, err := m.financeReportSourceFingerprint(ctx, request.from.Unix(), request.to.Unix())
+		if err != nil {
+			return nil, request, err
+		}
+		request.sourceFingerprint = fingerprint
+	}
+	for attempt := 0; attempt < 2; attempt++ {
+		payload, err := m.buildFinanceReportPayload(ctx, request)
+		if !errors.Is(err, errFinanceFactsChanged) || attempt == 1 || ctx.Err() != nil {
+			return payload, request, err
+		}
+		fingerprint, err := m.financeReportSourceFingerprint(ctx, request.from.Unix(), request.to.Unix())
+		if err != nil {
+			return nil, request, err
+		}
+		request.sourceFingerprint = fingerprint
+		// Do not reuse components from the rejected attempt.
+		ctx = context.WithValue(ctx, financeForceRebuildKey{}, true)
+	}
+	return nil, request, errFinanceFactsChanged
+}
+
+func (m *Monitor) rememberFinanceReport(request financeReportRequest, payload []byte, now time.Time) {
+	cache := m.getFinanceReportCache()
+	cache.PutWithStale(request.cacheKey(), payload, financeReportCacheTTL, financeReportCacheStaleGrace, now)
+	// Both keys share the existing byte/entry budget; no unbounded stale store.
+	cache.PutWithStale(request.lastGoodKey(), payload, financeReportCacheTTL, financeReportCacheStaleGrace, now)
+}
+
 // financeReportPayload returns a bounded in-process cache result. It never
 // writes SQLite and never calls NewAPI/upstream/AWS. Stale results are served
 // only inside the short grace window while one coalesced background refresh
 // rebuilds the exact same range.
 func (m *Monitor) financeReportPayload(ctx context.Context, request financeReportRequest, forceFresh bool) ([]byte, string, error) {
+	if request.sourceFingerprint == "" && m.cfg.FinanceEnabled {
+		// Resolve a missing version before lookup as well as before building,
+		// so a successfully retried probe uses the same cache key on later reads.
+		if fingerprint, err := m.financeReportSourceFingerprint(ctx, request.from.Unix(), request.to.Unix()); err == nil {
+			request.sourceFingerprint = fingerprint
+		}
+	}
 	cache := m.getFinanceReportCache()
 	key := request.cacheKey()
 	now := time.Now()
@@ -85,9 +153,31 @@ func (m *Monitor) financeReportPayload(ctx context.Context, request financeRepor
 			m.refreshFinanceReportAsync(request)
 			return payload, "stale-refreshing", nil
 		}
+		if payload, ok := cache.GetStale(request.lastGoodKey(), now); ok {
+			m.refreshFinanceReportAsync(request)
+			return payload, "stale-refreshing", nil
+		}
+		payload, _, snapshotState, ok, snapshotErr := m.loadFinanceReportSnapshot(request, now)
+		if snapshotErr != nil {
+			slog.Warn("经营核算持久快照读取失败，回退实时计算", "err", snapshotErr)
+		} else if ok {
+			if snapshotState == "fresh" {
+				// The matching source fingerprint proves this payload still reflects
+				// the current local facts. Warm L1 from now instead of inheriting an
+				// already elapsed file-age deadline.
+				m.rememberFinanceReport(request, payload, now)
+				return payload, "persistent-hit", nil
+			}
+			m.refreshFinanceReportAsync(request)
+			return payload, "persistent-stale-refreshing", nil
+		}
 	}
 
-	payload, err := m.financeReportFlight.Do(ctx, key, func() ([]byte, error) {
+	flightKey := key
+	if force, _ := ctx.Value(financeForceRebuildKey{}).(bool); force {
+		flightKey += ":force-rebuild"
+	}
+	payload, err := m.financeReportFlight.Do(ctx, flightKey, func() ([]byte, error) {
 		// A concurrent request may have completed between the first lookup and
 		// winning the flight. Normal reads reuse it; explicit refreshes rebuild.
 		if !forceFresh {
@@ -95,14 +185,24 @@ func (m *Monitor) financeReportPayload(ctx context.Context, request financeRepor
 				return cached, nil
 			}
 		}
-		built, buildErr := m.buildFinanceReportPayload(ctx, request)
+		built, accepted, buildErr := m.buildFinanceReportWithRetry(ctx, request)
 		if buildErr != nil {
 			return nil, buildErr
 		}
-		cache.PutWithStale(key, built, financeReportCacheTTL, financeReportCacheStaleGrace, time.Now())
+		m.rememberFinanceReport(accepted, built, time.Now())
+		m.persistFinanceReportSnapshotShadowAsync(accepted, built)
 		return built, nil
 	})
 	if err != nil {
+		if errors.Is(err, errFinanceFactsChanged) || errors.Is(err, context.DeadlineExceeded) {
+			slog.Warn("经营核算更新暂未完成，尝试保留已校验结果", "from", request.from.Unix(), "to", request.to.Unix(), "err", err)
+			if previous, ok := cache.GetStale(request.lastGoodKey(), time.Now()); ok {
+				return previous, "stale-retry", nil
+			}
+			if previous, _, _, ok, readErr := m.loadFinanceReportSnapshot(request, time.Now()); readErr == nil && ok {
+				return previous, "persistent-stale-retry", nil
+			}
+		}
 		return nil, "miss", err
 	}
 	if forceFresh {
@@ -111,10 +211,35 @@ func (m *Monitor) financeReportPayload(ctx context.Context, request financeRepor
 	return payload, "miss", nil
 }
 
+func (m *Monitor) persistFinanceReportSnapshotShadowAsync(request financeReportRequest, payload []byte) {
+	if !m.cfg.FinanceReportSnapshotShadowEnabled {
+		return
+	}
+	payload = append([]byte(nil), payload...)
+	go func() {
+		m.financeSnapshotWriteMu.Lock()
+		defer m.financeSnapshotWriteMu.Unlock()
+		if err := m.persistFinanceReportSnapshotShadow(request.logicalKey(), request.sourceFingerprint, payload, time.Now()); err != nil {
+			slog.Warn("经营核算持久快照影子写入失败，继续使用现有内存缓存", "err", err)
+		}
+	}()
+}
+
 func (m *Monitor) refreshFinanceReportAsync(request financeReportRequest) {
 	go func() {
 		ctx, cancel := context.WithTimeout(m.taskContext(), financeReportBuildTimeout)
 		defer cancel()
-		_, _, _ = m.financeReportPayload(ctx, request, true)
+		m.refreshFinanceReport(ctx, request)
 	}()
+}
+
+// A failed refresh never replaces a usable cached report. Keep the failure
+// observable without adding any writes to the accounting database.
+func (m *Monitor) refreshFinanceReport(ctx context.Context, request financeReportRequest) {
+	started := time.Now()
+	_, _, err := m.financeReportPayload(ctx, request, true)
+	if err != nil && !errors.Is(err, context.Canceled) {
+		slog.Warn("经营核算后台刷新失败，保留上次结果", "from", request.from.Unix(), "to", request.to.Unix(),
+			"elapsed_ms", time.Since(started).Milliseconds(), "err", err)
+	}
 }
