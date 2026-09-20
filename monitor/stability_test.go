@@ -1643,7 +1643,7 @@ func TestStabilityPageIncludesBusinessDateShortcuts(t *testing.T) {
 		}
 	}
 	js := string(stabilityJS)
-	for _, marker := range []string{`data-stability-hours`, `q.set('hours',String(st.hours))`, `data-stability-preset`, `stPresetRange`, `timeZone:'Asia/Shanghai'`, `hours:0,days:7`} {
+	for _, marker := range []string{`data-stability-hours`, `q.set('hours',String(st.hours))`, `data-stability-preset`, `stPresetRange`, `timeZone:'Asia/Shanghai'`, `hours:24,days:7`} {
 		if !strings.Contains(js, marker) {
 			t.Fatalf("稳定性报表快捷日期交互缺少 %q", marker)
 		}
@@ -1651,8 +1651,8 @@ func TestStabilityPageIncludesBusinessDateShortcuts(t *testing.T) {
 	if strings.Contains(portalHTML, "data-stability-preset") {
 		t.Fatal("Usage Portal 不应接入 Monitor 稳定性报表日期快捷项")
 	}
-	if !strings.Contains(pageHTML, `class="active" data-stability-days="7">近 7 天`) {
-		t.Fatal("稳定性报表默认时间窗口必须是近 7 天")
+	if !strings.Contains(pageHTML, `class="active" data-stability-hours="24">近 24 小时`) {
+		t.Fatal("稳定性报表默认时间窗口必须是近 24 小时")
 	}
 }
 

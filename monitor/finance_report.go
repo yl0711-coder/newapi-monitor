@@ -1768,6 +1768,16 @@ func (m *Monitor) loadFinanceUserFacts(ctx context.Context, scope stabilityScope
 }
 
 func financeMonthRanges(from, to time.Time) [][2]time.Time {
+	// 财务月按产品口径的北京时间切分，不能依赖容器或 CI runner 的本地时区。
+	// HTTP 参数及 SQLite 事实均是 Unix 时间；先转换时区不会改变边界瞬间，
+	// 但能保证 UTC 环境和 Asia/Shanghai 环境得到同一组自然月。
+	loc, err := time.LoadLocation("Asia/Shanghai")
+	if err != nil {
+		// Go 运行时通常包含该时区；极端精简运行时仍要保持 UTC+8 财务边界。
+		loc = time.FixedZone("CST", 8*60*60)
+	}
+	from = from.In(loc)
+	to = to.In(loc)
 	if !from.Before(to) {
 		return nil
 	}

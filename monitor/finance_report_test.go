@@ -86,6 +86,26 @@ func TestFinanceLocalSnapshotRangeClampsOnlyAbsentTail(t *testing.T) {
 	}
 }
 
+func TestFinanceMonthRangesAlwaysUseShanghaiCalendar(t *testing.T) {
+	loc, err := time.LoadLocation("Asia/Shanghai")
+	if err != nil {
+		t.Fatal(err)
+	}
+	from := time.Date(2026, 5, 1, 0, 0, 0, 0, loc)
+	to := time.Date(2026, 6, 3, 0, 0, 0, 0, loc)
+
+	// Simulate an Ubuntu CI runner: time.Unix creates a UTC-located value.
+	got := financeMonthRanges(time.Unix(from.Unix(), 0), time.Unix(to.Unix(), 0))
+	if len(got) != 2 || got[0][0].Unix() != from.Unix() || got[0][1].Unix() != time.Date(2026, 6, 1, 0, 0, 0, 0, loc).Unix() || got[1][1].Unix() != to.Unix() {
+		t.Fatalf("finance months depend on process timezone: %+v", got)
+	}
+	for _, period := range got {
+		if period[0].Location().String() != "Asia/Shanghai" || period[1].Location().String() != "Asia/Shanghai" {
+			t.Fatalf("finance month did not retain Shanghai calendar: %+v", period)
+		}
+	}
+}
+
 func newFinanceReportTestMonitor(t *testing.T, domain string) *Monitor {
 	t.Helper()
 	m := newStabilityTestMonitor(t)
