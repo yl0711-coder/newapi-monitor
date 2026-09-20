@@ -4,10 +4,10 @@ import test from 'node:test';
 import { verifyRaceShards } from '../check-race-shards.mjs';
 
 const workflow = readFileSync(new URL('../../.github/workflows/ci.yml', import.meta.url), 'utf8');
-const names = ['TestAlpha', 'TestGroup', 'TestOperations', 'TestZulu', 'Test_Regression', 'Test2026', 'Test', 'Test中文', 'Example', 'ExampleMonitor', 'FuzzDecode'];
+const names = ['TestAlpha', 'TestDelta', 'TestGroup', 'TestOperations', 'TestZulu', 'Test_Regression', 'Test2026', 'Test', 'Test中文', 'Example', 'ExampleMonitor', 'FuzzDecode'];
 
 test('actual CI matrix covers ordinary and non-letter tests, examples and fuzz seeds', () => {
-  assert.deepEqual(verifyRaceShards(workflow, names.concat('BenchmarkRead', 'ok example/monitor 0.01s').join('\n')), { tests: 11, counts: [1, 1, 1, 8] });
+  assert.deepEqual(verifyRaceShards(workflow, names.concat('BenchmarkRead', 'ok example/monitor 0.01s').join('\n')), { tests: 12, counts: [1, 1, 1, 1, 8] });
 });
 
 test('shard gate rejects missing, duplicate, overlapping and empty coverage', () => {
