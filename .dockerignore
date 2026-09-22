@@ -31,6 +31,9 @@ internal/financecredit/**
 !internal/financecur/
 internal/financecur/**
 !internal/financecur/*.go
+!internal/financegiftexport/
+internal/financegiftexport/**
+!internal/financegiftexport/*.go
 !internal/ecslogagent/
 internal/ecslogagent/**
 !internal/ecslogagent/*.go
