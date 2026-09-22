@@ -100,7 +100,7 @@ func Export(parent context.Context, db *sql.DB, user, hour int64, path string, e
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 	query := giftScopeExportSQLWithLimit(limit)
 	args := []any{user, hour, hour + 3600}
 	plan, err := tx.QueryContext(ctx, "EXPLAIN "+query, args...)
