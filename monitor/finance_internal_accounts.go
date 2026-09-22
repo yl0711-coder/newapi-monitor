@@ -88,7 +88,7 @@ func (m *Monitor) financeReportConfigurationHash(ctx context.Context) (string, e
 	}
 	sort.Strings(groups)
 	h := sha256.New()
-	_, _ = fmt.Fprintf(h, "finance-semantics-v4|%t|%t|%t|%s|%s\n",
+	_, _ = fmt.Fprintf(h, "finance-semantics-v6|%t|%t|%t|%s|%s\n",
 		m.cfg.FinanceEnabled, m.cfg.ChannelEconomicsReportEnabled, m.cfg.FinanceCURArtifactEnabled,
 		m.cfg.FinanceStartDate, m.cfg.FinanceCURArtifactPath)
 	_, _ = h.Write([]byte(financeInternalAccountHash(accounts)))

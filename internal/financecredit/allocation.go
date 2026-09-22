@@ -21,6 +21,10 @@ type LedgerEvent struct {
 	Sequence       int64
 	Kind           string
 	AmountMicroUSD int64
+	// Excluded usage still depletes the user's wallet but is not reported as
+	// business gift consumption. Scope isolates refund attribution by business scope.
+	Scope    string
+	Excluded bool
 }
 
 // GiftAllocation is the conservative gift-first allocation for [From, To).
@@ -49,10 +53,42 @@ type AllocationRange struct {
 type giftAllocationState struct {
 	balance  int64
 	consumed int64
+	byScope  map[string]int64
+}
+
+// apply retains one wallet per user. Gift-funded refunds are capped by that
+// scope's previously consumed gift; excluded scopes cannot reverse a
+// customer's business gift deduction. An empty scope preserves legacy use.
+func (s *giftAllocationState) apply(event LedgerEvent) error {
+	if event.Kind == EventTrialGiftGrant {
+		return checkedAdd(&s.balance, event.AmountMicroUSD)
+	}
+	if s.byScope == nil {
+		s.byScope = make(map[string]int64)
+	}
+	var delta int64
+	if event.AmountMicroUSD > 0 {
+		delta = min64(s.balance, event.AmountMicroUSD)
+	} else if event.AmountMicroUSD < 0 {
+		delta = -min64(s.byScope[event.Scope], -event.AmountMicroUSD)
+	}
+	if err := checkedAdd(&s.balance, -delta); err != nil {
+		return err
+	}
+	spent := s.byScope[event.Scope]
+	if err := checkedAdd(&spent, delta); err != nil {
+		return err
+	}
+	s.byScope[event.Scope] = spent
+	if !event.Excluded {
+		return checkedAdd(&s.consumed, delta)
+	}
+	return nil
 }
 
 func orderedLedgerEvents(events []LedgerEvent) ([]LedgerEvent, error) {
 	ordered := append([]LedgerEvent(nil), events...)
+	scopeExclusions := make(map[string]bool)
 	for _, event := range ordered {
 		if event.UserID <= 0 || event.At < 0 || event.Sequence < 0 {
 			return nil, errors.New("invalid finance event identity")
@@ -63,6 +99,10 @@ func orderedLedgerEvents(events []LedgerEvent) ([]LedgerEvent, error) {
 				return nil, errors.New("gift grant must be positive")
 			}
 		case EventNetUsage:
+			if excluded, ok := scopeExclusions[event.Scope]; ok && excluded != event.Excluded {
+				return nil, errors.New("inconsistent finance scope policy")
+			}
+			scopeExclusions[event.Scope] = event.Excluded
 			if event.AmountMicroUSD == math.MinInt64 {
 				return nil, errors.New("net usage is out of range")
 			}
@@ -143,23 +183,13 @@ func AllocateTrialGiftConsumption(events []LedgerEvent, from, to int64) (GiftAll
 				}
 			}
 		case EventNetUsage:
-			if event.At >= from {
+			if event.At >= from && !event.Excluded {
 				if err := checkedAdd(&result.PeriodNetUsageMicroUSD, event.AmountMicroUSD); err != nil {
 					return result, err
 				}
 			}
-			if event.AmountMicroUSD > 0 {
-				allocated := min64(state.balance, event.AmountMicroUSD)
-				state.balance -= allocated
-				if err := checkedAdd(&state.consumed, allocated); err != nil {
-					return result, err
-				}
-			} else if event.AmountMicroUSD < 0 {
-				restored := min64(state.consumed, -event.AmountMicroUSD)
-				state.consumed -= restored
-				if err := checkedAdd(&state.balance, restored); err != nil {
-					return result, err
-				}
+			if err := state.apply(event); err != nil {
+				return result, err
 			}
 		}
 		states[event.UserID] = state
@@ -209,25 +239,8 @@ func AllocateTrialGiftConsumptionSeries(events []LedgerEvent, ranges []Allocatio
 	apply := func(event LedgerEvent) error {
 		state := states[event.UserID]
 		oldBalance, oldConsumed := state.balance, state.consumed
-		switch event.Kind {
-		case EventTrialGiftGrant:
-			if err := checkedAdd(&state.balance, event.AmountMicroUSD); err != nil {
-				return err
-			}
-		case EventNetUsage:
-			if event.AmountMicroUSD > 0 {
-				allocated := min64(state.balance, event.AmountMicroUSD)
-				state.balance -= allocated
-				if err := checkedAdd(&state.consumed, allocated); err != nil {
-					return err
-				}
-			} else if event.AmountMicroUSD < 0 {
-				restored := min64(state.consumed, -event.AmountMicroUSD)
-				state.consumed -= restored
-				if err := checkedAdd(&state.balance, restored); err != nil {
-					return err
-				}
-			}
+		if err := state.apply(event); err != nil {
+			return err
 		}
 		states[event.UserID] = state
 		if err := checkedAdd(&totalBalance, state.balance-oldBalance); err != nil {
@@ -262,8 +275,10 @@ func AllocateTrialGiftConsumptionSeries(events []LedgerEvent, ranges []Allocatio
 					return nil, err
 				}
 			case EventNetUsage:
-				if err := checkedAdd(&result.PeriodNetUsageMicroUSD, event.AmountMicroUSD); err != nil {
-					return nil, err
+				if !event.Excluded {
+					if err := checkedAdd(&result.PeriodNetUsageMicroUSD, event.AmountMicroUSD); err != nil {
+						return nil, err
+					}
 				}
 			}
 			if err := apply(event); err != nil {

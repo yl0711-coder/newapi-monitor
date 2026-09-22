@@ -116,10 +116,17 @@ type channelEconomicsReport struct {
 	GlobalRefund     channelEconomicsGlobalRefundView `json:"global_unallocated_refund"`
 	Domains          []channelEconomicsDomainView     `json:"domains"`
 	Daily            []channelEconomicsDayView        `json:"daily,omitempty"`
+	// Finance-only in-memory proof for internal-cost deductions. Kept out of
+	// the public payload and built from the same verified rows as Daily.
+	dailyCorrectedCosts map[int64]map[string]int64
+	// Separate from verified/paired daily costs: the month-level known ledger
+	// cost also includes cost-known rows whose revenue is not yet paired.
+	dailyPublishedCosts map[int64]map[string]int64
 }
 
 type channelEconomicsReportRow struct {
 	PublicationID         string
+	FinanceVersion        int64
 	Domain                string
 	AccountEpoch          string
 	HourTs                int64
@@ -442,6 +449,8 @@ func (m *Monitor) buildChannelEconomicsReportMode(ctx context.Context, scope sta
 	dailyAggs := map[int64]*channelEconomicsAgg{}
 	dailyCoverages := map[int64]*channelEconomicsCoverageView{}
 	if financeMode {
+		report.dailyCorrectedCosts = map[int64]map[string]int64{}
+		report.dailyPublishedCosts = map[int64]map[string]int64{}
 		for hour := scope.FromTs; hour < scope.ToTs; hour += 3600 {
 			day := cstDayStart(hour)
 			coverage := dailyCoverages[day]
@@ -474,6 +483,7 @@ func (m *Monitor) buildChannelEconomicsReportMode(ctx context.Context, scope sta
 			}
 			epochRows := byDomain[domain][hour]
 			hourAgg := channelEconomicsAgg{correctedKnown: true, profitKnown: true}
+			hasKnownCostRow := false
 			hourCoverage := channelEconomicsCoverageView{ExpectedHours: 1, PublishedHours: 1, StatusCounts: map[string]int64{}, DataUntil: hour + 3600}
 			hourVerified := manifest.CoverageStatus == "verified_complete" && manifest.ProfitKnown
 			publicationIDs := make([]string, 0, len(epochRows))
@@ -497,6 +507,7 @@ func (m *Monitor) buildChannelEconomicsReportMode(ctx context.Context, scope sta
 			}
 			for _, row := range epochRows {
 				status := strings.TrimSpace(row.CoverageStatus)
+				hasKnownCostRow = hasKnownCostRow || row.CorrectedCostKnown
 				if status == "" {
 					status = "unknown"
 				}
@@ -555,6 +566,16 @@ func (m *Monitor) buildChannelEconomicsReportMode(ctx context.Context, scope sta
 				hourCoverage.UnknownHours = 1
 			}
 			day := cstDayStart(hour)
+			if financeMode && (hasKnownCostRow || (len(epochRows) == 0 && hourVerified)) {
+				if report.dailyPublishedCosts[day] == nil {
+					report.dailyPublishedCosts[day] = map[string]int64{}
+				}
+				cost := report.dailyPublishedCosts[day][domain]
+				if err := addEconomicsInt64(&cost, hourAgg.knownCorrectedCost); err != nil {
+					return nil, err
+				}
+				report.dailyPublishedCosts[day][domain] = cost
+			}
 			dayCoverage := dailyCoverages[day]
 			dayAgg := dailyAggs[day]
 			if dayCoverage != nil && dayAgg != nil {
@@ -567,11 +588,21 @@ func (m *Monitor) buildChannelEconomicsReportMode(ctx context.Context, scope sta
 				}
 				if hourVerified {
 					dayCoverage.VerifiedHours++
+					if report.dailyCorrectedCosts[day] == nil {
+						report.dailyCorrectedCosts[day] = map[string]int64{}
+					}
+					domainCost := report.dailyCorrectedCosts[day][domain]
 					for _, row := range epochRows {
 						if err := dayAgg.addRow(row); err != nil {
 							return nil, err
 						}
+						if row.CorrectedCostKnown {
+							if err := addEconomicsInt64(&domainCost, row.CorrectedCostMicroUSD); err != nil {
+								return nil, err
+							}
+						}
 					}
+					report.dailyCorrectedCosts[day][domain] = domainCost
 				} else {
 					dayCoverage.UnknownHours++
 					dayAgg.correctedKnown, dayAgg.profitKnown = false, false

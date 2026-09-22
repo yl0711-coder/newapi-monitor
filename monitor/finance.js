@@ -46,7 +46,11 @@
     }
   }
 
-  const chartValue = (value) => value?.micro_usd != null ? Number(value.micro_usd) / 1000000 : null;
+  function chartValue(value) {
+    if (!value || value.micro_usd == null || value.micro_usd === '') return null;
+    const numeric = Number(value.micro_usd);
+    return Number.isFinite(numeric) ? numeric / 1000000 : null;
+  }
   const date = (ts) => ts ? new Date(ts * 1000).toLocaleDateString('zh-CN', { timeZone: 'Asia/Shanghai' }) : '—';
   const dateTime = (ts) => ts ? new Date(ts * 1000).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false }) : '—';
 
@@ -111,6 +115,16 @@
     return '—';
   }
 
+  function internalCostDeductionNote(statement) {
+    return statement?.internal_cost_deduction_status
+      ? '内部测试成本与已取得的上游成本尚未对齐；原成本保留，扣减后金额暂不发布'
+      : '';
+  }
+
+  function grossCorrectedCost(statement) {
+    return statement?.raw_corrected_upstream_cost || statement?.known_raw_corrected_upstream_cost || null;
+  }
+
   function setMoney(id, exact, known, exactNote, partialNote, missingNote) {
     const element = $(id);
     if (!element) return;
@@ -154,13 +168,15 @@
     element.classList.add(complete ? 'ready' : percent == null ? 'missing' : 'warn');
     const amount = element.querySelector('b');
     const note = element.querySelector('span');
-    if (amount) amount.textContent = percent == null ? '—' : `${percent.toFixed(1)}%`;
+    // Hour coverage alone does not prove gift allocation and historical scope are complete.
+    if (amount) amount.textContent = complete ? '已完成' : percent == null ? '—' : '待补齐';
     if (note) {
       const giftUsers = Number(value?.gift_users || 0);
       const sequence = boundaryExpected > 0 ? ` · 顺序 ${boundaryCompleted}/${boundaryExpected}` : '';
       const pending = value?.latest_hour_pending ? ' · 当前小时待闭合' : '';
+      const scopePending = Number(value?.scope_unknown_events || 0) > 0 ? ` · ${Number(value.scope_unknown_events)} 条历史分组依据待补` : '';
       note.textContent = expected > 0
-        ? `${completed}/${expected} 小时 · 赠送用户 ${giftUsers}${sequence}${pending}`
+        ? `小时覆盖 ${percent.toFixed(1)}% · ${completed}/${expected} 小时 · 赠送用户 ${giftUsers}${sequence}${pending}${scopePending}`
         : '当前区间没有可核验证据';
     }
   }
@@ -190,7 +206,7 @@
     if (!hasMoney(statement.operating_revenue)) {
       blockers.push(data.gift_coverage?.complete === true ? '经营收入未发布' : '注册赠送消耗证据未闭合');
     }
-    if (!hasMoney(statement.corrected_upstream_cost)) {
+    if (!hasMoney(statement.raw_corrected_upstream_cost)) {
       const coverage = data.upstream_coverage || {};
       const relevant = Number(coverage.relevant_domains || 0);
       const available = Number(coverage.available_domains || 0);
@@ -275,13 +291,20 @@
   }
 
   function renderProfitBridge(data, statement) {
+    // Gross/refund fields are known amounts, not proof of complete coverage.
+    // The backend's publishable net consumption supplies the completeness gate.
+    const consumptionComplete=hasMoney(statement.user_consumption);
+    for(const [id,field] of [['finBridgeGross','gross_user_consumption'],['finBridgeRefund','user_refunds']]) {
+      setBridgeValue(id,consumptionComplete?statement[field]:null,statement[field],
+        '完整','已知部分','无可核验金额');
+    }
     setBridgeValue('finBridgeConsumption', statement.user_consumption, statement.known_user_consumption,
       '完整', '已知部分', '无可核验用量');
     setBridgeValue('finBridgeGift', statement.registration_gift_consumption, statement.known_registration_gift_consumption,
       '完整', '已知部分', '覆盖待补齐');
     setBridgeValue('finBridgeRevenue', statement.operating_revenue, statement.known_operating_revenue,
       '可发布', '仅已知部分', '待赠送扣减');
-    setBridgeValue('finBridgeUpstream', statement.corrected_upstream_cost, statement.known_corrected_upstream_cost,
+    setBridgeValue('finBridgeUpstream', statement.raw_corrected_upstream_cost, statement.known_raw_corrected_upstream_cost,
       '完整', '已知部分', '上游成本未闭合');
     setBridgeValue('finBridgeInternalTestCost', statement.internal_test_upstream_cost, statement.known_internal_test_upstream_cost,
       '完整', `严格识别 ${Number(statement.internal_test_cost_rows || 0).toLocaleString('zh-CN')} 小时`, '暂无可严格识别成本');
@@ -290,7 +313,7 @@
     setBridgeValue('finBridgeProfit', statement.operating_profit, statement.known_operating_profit,
       '可发布', '仅已知部分', '收入或成本未闭合');
     const footnote = $('finBridgeFootnote');
-    if (footnote) footnote.textContent = `修正业务上游成本已扣除可严格识别的内部测试成本，上游账单原值仍完整保留用于对账。已配对客户成本 ${money(statement.paired_corrected_upstream_cost)}；内部测试 ${money(statement.internal_test_consumption)}（${Number(statement.internal_test_requests || 0).toLocaleString('zh-CN')} 请求）不计客户收入，已严格识别其上游成本 ${money(statement.known_internal_test_upstream_cost)}。${Number(statement.internal_test_mixed_rows || 0).toLocaleString('zh-CN')} 个混合流量小时、${Number(statement.internal_test_unverified_pairs || 0).toLocaleString('zh-CN')} 个未核验对不做估算。`;
+    if (footnote) footnote.textContent = `平台经营结果扣除修正上游总成本（含内部测试支出），其中的内部账号、自动测试及非业务分组成本仅另列，不重复扣除。已配对客户成本 ${money(statement.paired_corrected_upstream_cost)}；内部账号与自动测试消费 ${money(statement.internal_test_consumption)}（${Number(statement.internal_test_requests || 0).toLocaleString('zh-CN')} 请求）不计客户收入。已严格识别非业务上游成本 ${money(statement.known_internal_test_upstream_cost)}；${Number(statement.internal_test_mixed_rows || 0).toLocaleString('zh-CN')} 个混合流量小时、${Number(statement.internal_test_unverified_pairs || 0).toLocaleString('zh-CN')} 个未核验对不做估算。`;
   }
 
   window.financeActivate = function () {
@@ -469,7 +492,7 @@
       '当前区间没有可发布的上游账单');
     setMoney('finUpstream', statement.corrected_upstream_cost, statement.known_corrected_upstream_cost,
       '使用当期充值到账/支付比例修正', `已知部分 · ${upstreamCoverage(data.upstream_coverage)}`,
-      '当前区间没有可发布的修正上游成本');
+      internalCostDeductionNote(statement) || '当前区间没有可发布的修正上游成本');
     setMoney('finContribution', statement.contribution_profit, statement.known_contribution_profit,
       `配对计费扣额 ${money(statement.paired_user_consumption)} - 配对成本 ${money(statement.paired_corrected_upstream_cost)}${statement.paired_contribution_margin_percent ? ` · ${statement.paired_contribution_margin_percent}%` : ''}；未扣注册赠送`,
       `已核验配对：${money(statement.paired_user_consumption)} - ${money(statement.paired_corrected_upstream_cost)}${statement.paired_contribution_margin_percent ? ` · ${statement.paired_contribution_margin_percent}%` : ''}；赠送前、非全站最终毛利`,
@@ -605,12 +628,43 @@
         + `<td class="num">${knownValue(statement.registration_gift_consumption, statement.known_registration_gift_consumption)}</td>`
         + `<td class="num">${knownValue(statement.operating_revenue, statement.known_operating_revenue)}</td>`
         + `<td class="num">${knownValue(statement.upstream_billed_cost, statement.known_upstream_billed_cost)}</td>`
-        + `<td class="num">${knownValue(statement.corrected_upstream_cost, statement.known_corrected_upstream_cost)}</td>`
+        + `<td class="num" title="含内部测试实际支出；右侧内部测试成本为其中项，不重复扣除">${knownValue(statement.raw_corrected_upstream_cost, statement.known_raw_corrected_upstream_cost)}</td>`
         + `<td class="num">${knownValue(statement.internal_test_upstream_cost, statement.known_internal_test_upstream_cost, '已识别')}</td>`
         + `<td class="num">${knownValue(statement.aws_infrastructure_cost, statement.known_aws_infrastructure_cost)}</td>`
         + `<td class="num">${knownValue(statement.contribution_profit, statement.known_contribution_profit, '已配对')}<small>${money(statement.paired_user_consumption)} - ${money(statement.paired_corrected_upstream_cost)}${statement.paired_contribution_margin_percent ? ` · ${statement.paired_contribution_margin_percent}%` : ''}</small></td>`
         + `<td>${userCoverage(row.user_coverage)}</td><td>${upstreamCoverage(row.upstream_coverage)}</td><td>${chip(row.status)}</td></tr>`;
     }).join('') : '<tr><td colspan="12" class="fin-empty">当前区间没有已发布的经营事实</td></tr>';
+  }
+
+  function dailyCorrectedCost(row) {
+    const reconciliation = row.cost_reconciliation;
+    const total = reconciliation?.status === 'reconciled' ? knownValue(null, reconciliation.known_total, '已取得') : '—';
+    const note = reconciliation?.status === 'source_mismatch' || row.ledger_correction?.status === 'source_mismatch'
+      ? '<small>日/月来源待核对</small>' : '';
+    return `${total}${note}<small>充值 ${money(row.recharge_correction?.known_cost)} · 账本 ${money(row.ledger_correction?.known_cost)}</small>`;
+  }
+
+  function dailyInternalCost(row) {
+    const statement = row.statement || {};
+    const amount = knownValue(statement.internal_test_upstream_cost, statement.known_internal_test_upstream_cost, '已识别');
+    const mixed = Number(statement.internal_test_mixed_rows || 0);
+    const unverified = Number(statement.internal_test_unverified_pairs || 0);
+    const notes = [];
+    if (mixed > 0) notes.push(`混用待拆分 ${mixed.toLocaleString('zh-CN')} 项`);
+    if (unverified > 0) notes.push(`未核验 ${unverified.toLocaleString('zh-CN')} 项`);
+    const reasons = row.internal_cost_unverified_reasons || {};
+    const labels = {
+      channel_cost_not_published: '尚无渠道成本发布', upstream_cost_missing: '渠道上游成本缺失',
+      hour_manifest_unverified: '小时账本未通过校验', cost_publication_unverified: '成本记录未通过校验',
+      ambiguous_publication: '存在多份可用成本记录', unspecified: '历史原因待核对',
+    };
+    for (const [reason, count] of Object.entries(reasons).sort(([a], [b]) => a.localeCompare(b))) {
+      if (Number(count) > 0) notes.push(`${labels[reason] || '其他原因待核对'} ${Number(count).toLocaleString('zh-CN')} 项`);
+    }
+    if (row.internal_cost_complete === false && !notes.length) notes.push('内部成本证据待补');
+    if (row.internal_cost_complete === true && !hasMoney(statement.known_internal_test_upstream_cost)) notes.push('已核验，未发现内部测试成本');
+    if (statement.internal_cost_deduction_status) notes.push('配对账本扣减待核对');
+    return amount + (notes.length ? `<small>${notes.map(esc).join(' · ')}</small>` : '');
   }
 
   function renderDays(rows) {
@@ -622,14 +676,16 @@
         + `<td class="num">${knownValue(statement.user_consumption, statement.known_user_consumption)}</td>`
         + `<td class="num">${knownValue(statement.registration_gift_consumption, statement.known_registration_gift_consumption)}</td>`
         + `<td class="num">${knownValue(statement.operating_revenue, statement.known_operating_revenue)}</td>`
+        + `<td class="num" title="上游账户原始账单，包含内部测试；不是已配对客户成本">${row.bill_coverage ? knownValue(statement.upstream_billed_cost, statement.known_upstream_billed_cost) : '—'}</td>`
+        + `<td class="num" title="同月逐供应商核对后的已取得修正成本；账本与充值修正不重复，含内部测试，不代表全部成本或已配对客户成本">${dailyCorrectedCost(row)}</td>`
         + `<td class="num">${money(statement.internal_test_consumption)}<small>${Number(statement.internal_test_requests || 0).toLocaleString('zh-CN')} 请求</small></td>`
-        + `<td class="num">${knownValue(statement.internal_test_upstream_cost, statement.known_internal_test_upstream_cost, '已识别')}</td>`
+        + `<td class="num" title="内部成本单独核验；不能直接从旁边的账户成本相减，配对账本扣减仍需同源依据">${dailyInternalCost(row)}</td>`
         + `<td class="num">${knownValue(statement.aws_infrastructure_cost, statement.known_aws_infrastructure_cost)}</td>`
         + `<td class="num">${money(statement.paired_user_consumption)}</td>`
         + `<td class="num">${money(statement.paired_corrected_upstream_cost)}</td>`
         + `<td class="num">${knownValue(statement.contribution_profit, statement.known_contribution_profit, '已配对')}<small>${statement.paired_contribution_margin_percent ? `${statement.paired_contribution_margin_percent}%` : '—'}</small></td>`
         + `<td>${userCoverage(row.user_coverage)}</td><td>${economicsCoverage(row.economics_coverage)}</td><td>${chip(row.status)}</td></tr>`;
-    }).join('') : '<tr><td colspan="15" class="fin-empty">当前区间没有每日经营事实</td></tr>';
+    }).join('') : '<tr><td colspan="17" class="fin-empty">当前区间没有每日经营事实</td></tr>';
   }
 
   function renderCosts(rows) {
@@ -702,21 +758,21 @@
     const pick = (statement, exact, known) => statement?.[exact] || statement?.[known];
     const consumption = rows.map((row) => chartValue(pick(row.statement, 'user_consumption', 'known_user_consumption')));
     const billed = rows.map((row) => chartValue(pick(row.statement, 'upstream_billed_cost', 'known_upstream_billed_cost')));
-    const corrected = rows.map((row) => chartValue(pick(row.statement, 'corrected_upstream_cost', 'known_corrected_upstream_cost')));
+    const corrected = rows.map((row) => chartValue(grossCorrectedCost(row.statement)));
     const contribution = rows.map((row) => chartValue(pick(row.statement, 'contribution_profit', 'known_contribution_profit')));
     const hasData = [...consumption, ...billed, ...corrected, ...contribution].some((value) => value != null);
     state.chart.setOption({
       backgroundColor: 'transparent', animationDuration: 250,
       grid: { left: 62, right: 20, top: 34, bottom: 42 },
       tooltip: { trigger: 'axis', valueFormatter: (value) => value == null ? '—' : `$${Number(value).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` },
-      legend: { top: 1, textStyle: { color: '#9aa5b8', fontSize: 10 }, data: ['净计费消耗', '账单原值', '修正成本', '已配对计费贡献（赠送前）'] },
+      legend: { top: 1, textStyle: { color: '#9aa5b8', fontSize: 10 }, data: ['净计费消耗', '账单原值', '修正上游总成本', '已配对计费贡献（赠送前）'] },
       xAxis: { type: 'category', data: periods, axisLine: { lineStyle: { color: '#394153' } }, axisLabel: { color: '#8f9aac' } },
       yAxis: { type: 'value', axisLine: { show: false }, splitLine: { lineStyle: { color: '#2a3140' } }, axisLabel: { color: '#8f9aac', formatter: (value) => `$${value}` } },
       graphic: hasData ? [] : [{ type: 'text', left: 'center', top: '47%', style: { text: '当前区间暂无已发布金额', fill: '#7f8a9e', font: '12px sans-serif', textAlign: 'center' } }],
       series: [
         { name: '净计费消耗', type: 'bar', data: consumption, itemStyle: { color: '#d99b42' }, barMaxWidth: 21 },
         { name: '账单原值', type: 'bar', data: billed, itemStyle: { color: '#77859d' }, barMaxWidth: 21 },
-        { name: '修正成本', type: 'bar', data: corrected, itemStyle: { color: '#55b995' }, barMaxWidth: 21 },
+        { name: '修正上游总成本', type: 'bar', data: corrected, itemStyle: { color: '#55b995' }, barMaxWidth: 21 },
         { name: '已配对计费贡献（赠送前）', type: 'line', data: contribution, connectNulls: false, symbolSize: 6, lineStyle: { width: 2, color: '#72a8fa', type: 'dashed' }, itemStyle: { color: '#72a8fa' } },
       ],
     });
@@ -728,7 +784,7 @@
     status.className = 'fin-status bad';
     status.innerHTML = `<i></i><div><b>经营核算读取失败</b><br>${esc(message)}</div>`;
     $('finPeriodRows').innerHTML = '<tr><td colspan="12" class="fin-empty">请稍后刷新；失败不会被解释为 0</td></tr>';
-    $('finDailyRows').innerHTML = '<tr><td colspan="15" class="fin-empty">请稍后刷新；失败不会被解释为 0</td></tr>';
+    $('finDailyRows').innerHTML = '<tr><td colspan="17" class="fin-empty">请稍后刷新；失败不会被解释为 0</td></tr>';
     $('finPairingRows').innerHTML = '<tr><td colspan="6" class="fin-empty">请稍后刷新；缺口不会被忽略</td></tr>';
     $('finCURProductRows').innerHTML = '<tr><td colspan="6" class="fin-empty">请稍后刷新；AWS 成本不会被解释为 0</td></tr>';
   }

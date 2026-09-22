@@ -48,8 +48,8 @@ func TestFinanceCURProjectionVerifiedCanCloseExactRange(t *testing.T) {
 		t.Fatalf("verified CUR state mismatch: %+v", view)
 	}
 	statement := financeStatementView{
-		OperatingRevenue:      financeMoneyPointer(economicsMoney(5_000_000)),
-		CorrectedUpstreamCost: financeMoneyPointer(economicsMoney(2_000_000)),
+		OperatingRevenue:         financeMoneyPointer(economicsMoney(5_000_000)),
+		RawCorrectedUpstreamCost: financeMoneyPointer(economicsMoney(2_000_000)),
 	}
 	applyFinanceCURCost(&statement, view)
 	if statement.OperatingProfit == nil || statement.OperatingProfit.MicroUSD != "2000000" {

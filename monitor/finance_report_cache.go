@@ -41,7 +41,9 @@ func (r financeReportRequest) lastGoodKey() string {
 }
 
 func (r financeReportRequest) logicalKey() string {
-	return fmt.Sprintf("%d:%d:%d:%t:%s", r.from.Unix(), r.to.Unix(), r.snapshotAsOf, r.snapshotClamped, r.configurationHash)
+	// Version the report projection separately from source facts. Changes to
+	// month arithmetic must also bump financePeriodCacheSchema.
+	return fmt.Sprintf("daily-internal-diagnostics-v1:%d:%d:%d:%t:%s", r.from.Unix(), r.to.Unix(), r.snapshotAsOf, r.snapshotClamped, r.configurationHash)
 }
 
 func (r financeReportRequest) cacheKey() string {

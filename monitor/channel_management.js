@@ -711,24 +711,35 @@ async function loadEconomicsDomain(key){
     cm.economicsHourly.set(key,{from:0,to:0,domains:[],error:error.message||'小时曲线读取失败'});render();
   }
 }
-function businessCostAvailable(usage){
-  return typeof usage?.business_cost_available==='boolean'?usage.business_cost_available:!!usage?.available;
+function costValueKnown(value){return window.channelDataStatus.known(value)&&Number(value)>=0}
+function verifiedBusinessCost(usage,adjusted){
+  return usage?.internal_filter_status==='complete'&&
+    (adjusted?usage.business_adjusted_cost_available===true:usage.business_cost_available===true)&&
+    costValueKnown(adjusted?usage.business_adjusted_cost_usd:usage.business_cost_usd);
 }
-function businessAdjustedCostAvailable(usage){
-  return typeof usage?.business_adjusted_cost_available==='boolean'?usage.business_adjusted_cost_available:!!usage?.adjusted_cost_available;
+// Choose once per visible column. Never sum verified net costs and raw fallbacks.
+// Missing legacy status cannot prove that configured internal accounts were excluded.
+function upstreamCostBases(domains){
+  const usages=domains.filter(d=>d.upstream?.configured||window.channelDataStatus.billView(d).usage.available)
+    .map(d=>window.channelDataStatus.billView(d).usage);
+  const basis=adjusted=>usages.length&&usages.every(u=>(u.integrity_status||'complete')==='complete'&&verifiedBusinessCost(u,adjusted))?'business':'raw';
+  return {cost:basis(false),adjusted:basis(true)};
 }
-function businessCostValue(usage){return usage?.business_cost_usd??usage?.cost_usd}
-function businessAdjustedCostValue(usage){return usage?.business_adjusted_cost_usd??usage?.adjusted_cost_usd}
-function presentedBusinessCost(usage,adjusted=false){
-  const businessAvailable=adjusted?businessAdjustedCostAvailable(usage):businessCostAvailable(usage);
-  const businessValue=adjusted?businessAdjustedCostValue(usage):businessCostValue(usage);
-  if(businessAvailable&&window.channelDataStatus.known(businessValue))return {available:true,value:Number(businessValue),provisional:false};
-  const rawAvailable=adjusted?!!usage?.adjusted_cost_available:!!usage?.available;
-  const rawValue=adjusted?usage?.adjusted_cost_usd:usage?.cost_usd;
-  if(rawAvailable&&window.channelDataStatus.known(rawValue))return {available:true,value:Number(rawValue),provisional:true};
-  return {available:false,value:0,provisional:false};
+function presentedBusinessCost(usage,adjusted=false,basis='raw'){
+  if((usage?.integrity_status||'complete')!=='complete')return {available:false,value:null};
+  const business=basis==='business';
+  const available=business?verifiedBusinessCost(usage,adjusted):(adjusted?usage?.adjusted_cost_available:usage?.available);
+  const value=business?(adjusted?usage.business_adjusted_cost_usd:usage.business_cost_usd):(adjusted?usage?.adjusted_cost_usd:usage?.cost_usd);
+  return {available:!!available&&costValueKnown(value),value:available&&costValueKnown(value)?Number(value):null};
 }
-function domainCard(domain,index,total,filtered){
+function upstreamCostNote(usage,basis,adjusted=false){
+  if(basis==='business')return '已扣配置内部账号；不代表全部测试成本已排除';
+  const included=adjusted?'含内部测试成本':'含内部测试用量';
+  const status=usage?.internal_filter_status;
+  return included+(status==='complete'?' · 统一账单口径':status==='not_configured'?' · 未配置内部账号':
+    status==='inconsistent'?' · 内部扣除核验异常':status?' · 内部扣除尚未核验':' · 核验状态待确认');
+}
+function domainCard(domain,index,total,filtered,costBases=upstreamCostBases([domain])){
   const channels=domain.vendors.flatMap(v=>v.channels),enabled=channels.filter(ch=>ch.current&&+ch.status===1).length;
   const groups=domainServiceGroups(domain);
   const open=cm.expandedDomains.has(domain.key),share=metric(total)>0?metric(domain.usage)/metric(total)*100:0;
@@ -744,18 +755,15 @@ function domainCard(domain,index,total,filtered){
   const upstreamBalance=window.channelDataStatus.known(domain.upstream?.balance_usd)?usd(domain.upstream.balance_usd):'—';
   const upstreamRunwayView=upstreamRunway(domain.upstream);
 	const upstreamIntegrity=upstreamUsage.integrity_status||'complete',upstreamTrusted=upstreamIntegrity==='complete';
-	const upstreamCostView=presentedBusinessCost(upstreamUsage),adjustedCostView=presentedBusinessCost(upstreamUsage,true);
+	const upstreamCostView=presentedBusinessCost(upstreamUsage,false,costBases.cost),adjustedCostView=presentedBusinessCost(upstreamUsage,true,costBases.adjusted);
 	const upstreamSpend=upstreamCostView.available&&upstreamTrusted?usd(upstreamCostView.value):'—';
 	const observedRatio=Number(upstreamUsage.recharge_ratio),ratio=Number.isFinite(observedRatio)&&observedRatio>0?observedRatio:0;
 	let ratioLabel='';
-	if(businessAdjustedCostAvailable(upstreamUsage)||adjustedCostView.available)ratioLabel=upstreamUsage.recharge_ratio_varies?'按历史充值比例版本修正':`到账/支付 ${ratio.toLocaleString(undefined,{maximumFractionDigits:4})}×`;
+	if(adjustedCostView.available)ratioLabel=upstreamUsage.recharge_ratio_varies?'按历史充值比例版本修正':ratio>0?`到账/支付 ${ratio.toLocaleString(undefined,{maximumFractionDigits:4})}×`:'按历史充值比例修正';
 	const adjustedSpend=upstreamTrusted&&adjustedCostView.available?usd(adjustedCostView.value):'—';
-	const internalStatus=upstreamUsage.internal_filter_status||'not_configured';
-	const internalExcluded=Number(upstreamUsage.internal_excluded_cost_usd||0);
-	const internalNote=internalStatus==='complete'?(internalExcluded>0?`已排除内部账号 ${usd(internalExcluded)}`:'内部账号已核验'):internalStatus==='not_configured'?'':internalStatus==='inconsistent'?'暂显示原账单 · 内部扣除异常':'暂显示原账单 · 内部过滤补齐中';
-	const adjustedInternalNote=internalStatus==='complete'?internalNote:internalStatus==='not_configured'?'':internalStatus==='inconsistent'?'暂含内部用量 · 内部扣除异常':'暂含内部用量 · 内部过滤补齐中';
-  const upstreamSpendLabel=billView.daily?'所涉自然日业务上游消费':upstreamUsage.granularity==='day'?'自然日业务上游消费':'区间业务上游消费';
-  const upstreamMetrics=domain.upstream?.configured||upstreamUsage.available?`<span class="cm-domain-upstream-spend" title="业务消费按上游账户（主域名）汇总，原账单仍保留用于对账"><small>${upstreamSpendLabel}</small><b>${upstreamSpend}</b>${billSyncHint}<em class="cm-domain-metric-note neutral">${esc([billRangeNote,internalNote].filter(Boolean).join(' · '))}</em></span><span class="cm-domain-upstream-adjusted" title="业务上游修正消费 = 账面消费 × 充值支付 ÷ 充值到账，并排除已核验内部账号成本；${esc(billRangeNote)}"><small>业务上游修正消费</small><b>${adjustedSpend}</b>${billSyncHint}<em class="cm-domain-metric-note neutral">${esc([ratioLabel,adjustedInternalNote].filter(Boolean).join(' · '))}${billView.daily?' · 同左侧账单范围':''}</em></span><span class="cm-domain-upstream-balance"><small>上游当前余额</small><b>${upstreamBalance}</b><em class="cm-domain-metric-note ${upstreamRunwayView.cls}" title="${esc(upstreamRunwayView.title)}">${esc(upstreamRunwayView.text)}</em>${upstreamRunwayView.basis?`<em class="cm-domain-metric-note neutral">${esc(upstreamRunwayView.basis)}</em>`:''}</span>`:'';
+	const internalNote=upstreamCostNote(upstreamUsage,costBases.cost),adjustedInternalNote=upstreamCostNote(upstreamUsage,costBases.adjusted,true);
+  const upstreamSpendLabel=(billView.daily?'所涉自然日':upstreamUsage.granularity==='day'?'自然日':'区间')+(costBases.cost==='business'?'上游消费':'上游账单消费');
+  const upstreamMetrics=domain.upstream?.configured||upstreamUsage.available?`<span class="cm-domain-upstream-spend" title="金额按上游账户（主域名）汇总，不拆分到筛选的渠道或分组"><small>${upstreamSpendLabel}</small><b>${upstreamSpend}</b>${billSyncHint}<em class="cm-domain-metric-note neutral">${esc([billRangeNote,internalNote].filter(Boolean).join(' · '))}</em></span><span class="cm-domain-upstream-adjusted" title="修正成本 = 账面消费 × 历史充值支付 ÷ 历史充值到账；内部账号扣除口径见金额下方；${esc(billRangeNote)}"><small>上游修正成本</small><b>${adjustedSpend}</b>${billSyncHint}<em class="cm-domain-metric-note neutral">${esc([ratioLabel,adjustedInternalNote].filter(Boolean).join(' · '))}${billView.daily?' · 同左侧账单范围':''}</em></span><span class="cm-domain-upstream-balance"><small>上游当前余额</small><b>${upstreamBalance}</b><em class="cm-domain-metric-note ${upstreamRunwayView.cls}" title="${esc(upstreamRunwayView.title)}">${esc(upstreamRunwayView.text)}</em>${upstreamRunwayView.basis?`<em class="cm-domain-metric-note neutral">${esc(upstreamRunwayView.basis)}</em>`:''}</span>`:'';
   const financeButton=cm.report?.finance?.can_edit&&domain.configured?`<button type="button" class="cm-finance-open" data-cm-finance="${esc(domain.key)}">倍率配置</button>`:'';
   const upstreamButton=cm.report?.finance?.can_edit&&domain.configured?`<button type="button" class="cm-upstream-open" data-cm-upstream="${esc(domain.key)}">账户配置</button>`:'';
   return `<article class="cm-domain-card${open?' open':''}${domain.manually_disabled?' manually-disabled':''}"><div class="cm-domain-head" role="button" tabindex="0" data-cm-domain-toggle="${esc(domain.key)}">
@@ -769,13 +777,13 @@ function domainCard(domain,index,total,filtered){
 
 function filtersActive(){return !!(cm.filters.search||cm.filters.domain||cm.filters.group||cm.filters.status)}
 function upstreamAccountScopeComparable(){return !(cm.filters.search||cm.filters.group||cm.filters.status)}
-function upstreamAggregateLabel(rows,field){
+function upstreamAggregateLabel(rows,adjusted,basis){
   // 小时/自然日是上游源账单的采集粒度，不是两种货币或销售单位。
   // 后端已按同一查询区间为每个账户返回 cost_usd；顶部只展示这些
   // 账户的单一金额合计。数据不完整由覆盖说明明示，不再把金额拆成两个。
   return rows.length?usd(rows.reduce((total,domain)=>{
     const usage=domain.upstream_usage||{};
-    const value=field==='business_cost_usd'?presentedBusinessCost(usage).value:field==='business_adjusted_cost_usd'?presentedBusinessCost(usage,true).value:usage[field];
+    const value=presentedBusinessCost(usage,adjusted,basis).value;
     return total+(+value||0);
   },0)):'—';
 }
@@ -1337,18 +1345,18 @@ function render(){
   const upstreamAccountComparable=upstreamAccountScopeComparable();
   const upstreamConfiguredAccounts=domains.filter(domain=>domain.upstream?.configured);
   const upstreamAccounts=upstreamConfiguredAccounts.filter(domain=>domain.upstream?.usage_sync_enabled);
+  const costBases=upstreamCostBases(domains);
   const upstreamUsageDomains=upstreamAccounts.filter(domain=>domain.upstream_usage?.available);
-	const trustedUsageDomains=upstreamUsageDomains.filter(domain=>(domain.upstream_usage.integrity_status||'complete')==='complete'&&presentedBusinessCost(domain.upstream_usage).available);
-	const adjustedUsageDomains=trustedUsageDomains.filter(domain=>presentedBusinessCost(domain.upstream_usage,true).available);
-	const provisionalCostDomains=trustedUsageDomains.filter(domain=>presentedBusinessCost(domain.upstream_usage).provisional||presentedBusinessCost(domain.upstream_usage,true).provisional).length;
+	const trustedUsageDomains=upstreamUsageDomains.filter(domain=>presentedBusinessCost(domain.upstream_usage,false,costBases.cost).available);
+	const adjustedUsageDomains=upstreamUsageDomains.filter(domain=>presentedBusinessCost(domain.upstream_usage,true,costBases.adjusted).available);
   const upstreamBalanceDomains=upstreamConfiguredAccounts.filter(domain=>domain.upstream.balance_usd!=null&&Number.isFinite(Number(domain.upstream.balance_usd)));
   const upstreamBalance=upstreamBalanceDomains.reduce((sum,domain)=>sum+Number(domain.upstream.balance_usd),0);
-  const upstreamSpendValue=upstreamAggregateLabel(trustedUsageDomains,'business_cost_usd');
-  const adjustedUpstreamSpendValue=upstreamAggregateLabel(adjustedUsageDomains,'business_adjusted_cost_usd');
+  const upstreamSpendValue=upstreamAggregateLabel(trustedUsageDomains,false,costBases.cost);
+  const adjustedUpstreamSpendValue=upstreamAggregateLabel(adjustedUsageDomains,true,costBases.adjusted);
   const upstreamSpendLabel=upstreamAccountComparable?upstreamSpendValue:'—';
   const adjustedUpstreamSpendLabel=upstreamAccountComparable?adjustedUpstreamSpendValue:'—';
   const dailyBillCount=upstreamAccounts.filter(domain=>window.channelDataStatus.billView(domain).daily).length;
-	const upstreamScopeLabel=upstreamAccountComparable?`当前查询区间 · ${trustedUsageDomains.length}/${upstreamAccounts.length} 个账户${provisionalCostDomains?` · ${provisionalCostDomains} 个暂含内部用量`:''}${dailyBillCount?` · ${dailyBillCount} 个自然日账单另见下方，不计入本汇总`:''}`:'上游账户金额不按渠道/分组拆分';
+	const upstreamScopeLabel=upstreamAccountComparable?`当前查询区间 · 已取得 ${trustedUsageDomains.length}/${upstreamAccounts.length} 个账户 · ${costBases.cost==='business'?'已扣配置内部账号':'账单口径，含内部测试用量'}${dailyBillCount?` · ${dailyBillCount} 个自然日账单另见下方，不计入本汇总`:''}`:'上游账户金额不按渠道/分组拆分';
   const exact=cm.economics?.totals||null,exactCoverage=cm.economics?.coverage||null;
   const exactKPIs=exact?`<article class="economics"><small>精确修正成本</small><b>${economicsMoneyLabel(exact.corrected_cost,exact.corrected_cost_known)}</b><span>${esc(economicsCoverageLabel(exactCoverage))}</span></article><article class="economics ${exact.profit_known?'':'warn'}"><small>精确毛利润</small><b>${economicsMoneyLabel(exact.profit,exact.profit_known)}</b><span>白名单域名 · 不随前端筛选重算</span></article><article class="economics ${exact.profit_known?'':'warn'}"><small>精确毛利率</small><b>${exact.profit_known?esc(exact.margin_display||'不可判定'):'不可判定'}</b><span>${exact.profit_known?'证据已闭合':esc(economicsReason(exact.unknown_reason))}</span></article>`:'';
   const summary=$('cmSummary');
@@ -1359,8 +1367,8 @@ function render(){
 	<article><small>渠道请求数</small><b>${usageMetric(filteredUsage.requests,nfmt)}</b><span>${esc(cm.report.meta.from)} 至 ${esc(cm.report.meta.to)}</span></article>
 	<article><small>区间 Tokens</small><b>${usageMetric(filteredUsage.tokens,compact)}</b><span>prompt + completion</span></article>
 	<article class="accent"><small>用户侧消费</small><b>${usageMetric(filteredUsage.cost_usd,usd)}</b><span>当前查询区间 · 用户消费金额</span></article>
-    <article class="upstream"><small>区间业务上游消费汇总</small><b>${upstreamSpendLabel}</b><span>${esc(upstreamScopeLabel)}</span></article>
-		<article class="adjusted"><small>业务上游修正消费汇总</small><b>${adjustedUpstreamSpendLabel}</b><span>${provisionalCostDomains?`${provisionalCostDomains} 个账户暂含内部用量 · `:''}按历史充值比例修正</span></article>
+    <article class="upstream"><small>${costBases.cost==='business'?'区间上游消费汇总':'区间上游账单消费汇总'}</small><b>${upstreamSpendLabel}</b><span>${esc(upstreamScopeLabel)}</span></article>
+		<article class="adjusted"><small>上游修正成本汇总</small><b>${adjustedUpstreamSpendLabel}</b><span>已取得 ${adjustedUsageDomains.length}/${upstreamAccounts.length} 个账户 · ${costBases.adjusted==='business'?'已扣配置内部账号':'账单口径，含内部测试成本'} · 按历史充值比例修正</span></article>
     <article class="balance"><small>上游当前余额汇总</small><b>${upstreamBalanceDomains.length?usd(upstreamBalance):'—'}</b><span>上游账户余额合计</span></article>
     ${exactKPIs}
     ${filtered?`<article><small>筛选${esc(metricLabel())}占比</small><b>${metric(allUsage)>0?share.toFixed(1)+'%':'—'}</b><span>相对当前日期全部渠道</span></article>`:''}
@@ -1373,7 +1381,7 @@ function render(){
     }
     summary.removeAttribute('aria-busy')}
   $('cmBody').innerHTML=`<section class="cm-list-head"><div><h3>渠道列表</h3><p>共 ${nfmt(domains.length)} 个归并项 · ${esc(domainSortDescription())}，展开后直接查看服务分组及实际渠道。</p></div><div class="cm-fresh"><small>数据截至 ${esc(shortDateTime(cm.report.meta.data_until))}</small></div></section>
-  <div class="cm-domain-list">${domains.map((domain,index)=>domainCard(domain,index,filteredUsage,filtered)).join('')||'<div class="cm-empty"><b>当前筛选没有匹配渠道</b><p>请重置筛选条件或更换日期范围。</p></div>'}</div>`;
+  <div class="cm-domain-list">${domains.map((domain,index)=>domainCard(domain,index,filteredUsage,filtered,costBases)).join('')||'<div class="cm-empty"><b>当前筛选没有匹配渠道</b><p>请重置筛选条件或更换日期范围。</p></div>'}</div>`;
 }
 
 document.addEventListener('DOMContentLoaded',()=>{if($('tab-channels')&&!cm.inited)init()});

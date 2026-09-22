@@ -15,7 +15,7 @@ func financeSyncSource(t *testing.T) *sql.DB {
 	}
 	if _, err := db.Exec(`CREATE TABLE logs(
 		id INTEGER PRIMARY KEY,user_id INTEGER,created_at INTEGER,type INTEGER,quota INTEGER,
-		token_id INTEGER,token_name TEXT,request_id TEXT,content TEXT,other TEXT);
+		token_id INTEGER,token_name TEXT,request_id TEXT,content TEXT,other TEXT,"group" TEXT DEFAULT '');
 		CREATE TABLE users(id INTEGER PRIMARY KEY,created_at INTEGER);`); err != nil {
 		t.Fatal(err)
 	}

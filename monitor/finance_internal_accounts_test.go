@@ -3,6 +3,7 @@ package monitor
 import (
 	"context"
 	"database/sql"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -289,6 +290,36 @@ func TestChannelManagementReportExcludesConfiguredInternalAccountUsage(t *testin
 	}
 	if report.InternalAccounts.Status != "caught_up" {
 		t.Fatalf("unexpected internal-account status: %+v", report.InternalAccounts)
+	}
+	// A closed historical range remains complete while the global tail is still
+	// backfilling. The sync projection must retain the same scope contract.
+	if err := m.usageFactsStore().Model(&FinanceInternalAccountFactState{}).Where("id=?", financeInternalFactStateID).
+		Update("next_hour_ts", hour+3600).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := m.storeDB.Create(&ChannelUpstreamAccount{Domain: "example.test", Provider: upstreamProviderNewAPI, Enabled: true, UsageSyncEnabled: true}).Error; err != nil {
+		t.Fatal(err)
+	}
+	scope := stabilityScope{FromTs: hour, ToTs: hour + 3600}
+	report, err = m.buildChannelManagementReport(context.Background(), scope, hour+7200)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.storeDB.Exec("PRAGMA query_only=ON").Error; err != nil {
+		t.Fatal(err)
+	}
+	status, err := m.buildChannelDataStatus(context.Background(), scope, hour+7200)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !report.InternalScopeComplete || !status.InternalScopeComplete || status.InternalAccounts.Status != "backfilling" {
+		t.Fatalf("historical range mislabeled: %+v", status.InternalAccounts)
+	}
+	if len(report.Domains) != 1 || len(status.Domains) != 1 || !reflect.DeepEqual(report.Domains[0].UpstreamUsage, status.Domains[0].UpstreamUsage) {
+		t.Fatal("sync and channel cost evidence differ")
+	}
+	if !reflect.DeepEqual(status.Domains[0].UpstreamUsage.InternalFilterReasons, []string{channelInternalPairingUnverified, channelInternalOwnershipUnknown}) {
+		t.Fatal("unverified historical ownership not reported")
 	}
 }
 

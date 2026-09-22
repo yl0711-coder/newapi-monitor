@@ -20,7 +20,7 @@ const (
 	financePeriodCacheMaxBytes   = 32 << 20
 	financePeriodCacheTTL        = 7 * 24 * time.Hour
 	financePeriodSnapshotDirName = "finance-period-cache"
-	financePeriodCacheSchema     = 4
+	financePeriodCacheSchema     = 16
 )
 
 // financePeriodComponent is the expensive, independently reproducible part of
@@ -137,6 +137,27 @@ func (m *Monitor) buildFinancePeriodComponent(
 		if err != nil {
 			return financePeriodComponent{}, err
 		}
+		correctionDomains := map[string]bool{}
+		for _, detail := range details {
+			if detail.CorrectionSource == "充值版本" {
+				correctionDomains[detail.Domain] = true
+			}
+		}
+		bills, err := m.loadFinanceDailyBills(ctx, scope, now, accounts, finance, correctionDomains)
+		if err != nil {
+			return financePeriodComponent{}, fmt.Errorf("读取每日上游账户账单: %w", err)
+		}
+		for index := range days {
+			bill := bills[cstDayStart(days[index].From)]
+			days[index].Statement.KnownUpstreamBilledCost = bill.Known
+			days[index].Statement.UpstreamBilledCost = bill.Exact
+			days[index].BillCoverage = bill.Coverage
+			days[index].RechargeCorrection = bill.RechargeCorrection
+		}
+		if err := applyFinanceDailyLedgerCorrection(days, details); err != nil {
+			return financePeriodComponent{}, err
+		}
+		applyFinanceDailyCostReconciliation(days, bills, details, statement.KnownRawCorrectedUpstreamCost)
 		return financePeriodComponent{
 			Statement: statement, UserCoverage: userCoverage, UpstreamCoverage: upstreamCoverage,
 			CostDetails: details, Days: days,

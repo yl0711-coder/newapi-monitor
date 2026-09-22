@@ -236,7 +236,48 @@ func (m *Monitor) financeReportSourceFingerprintForScope(ctx context.Context, fr
 			},
 		}
 		for _, aggregate := range factsAggregates {
+			// Gift allocation is applied AFTER the immutable monthly component
+			// is loaded. Scope-only boundary repairs must invalidate the full
+			// report, not rebuild unchanged base usage/cost/day aggregates.
+			if !includeCUR && aggregate.label == "finance-gift-boundaries" {
+				continue
+			}
 			if err := writeAggregate(factsDB, aggregate.label, aggregate.query, aggregate.args...); err != nil {
+				return "", err
+			}
+		}
+		if includeCUR {
+			// A selected month's opening gift balance depends on the entire
+			// earlier ledger. Monthly base components do not contain gift
+			// allocation and deliberately keep their narrower dependencies.
+			seed, err := financeStartHour(m.cfg.FinanceStartDate)
+			if err != nil {
+				return "", err
+			}
+			rows, err := factsDB.WithContext(ctx).Raw(`
+				SELECT 'user' kind,hour_ts,0 user_id,source_epoch,status,content_hash,semantics_version
+				FROM finance_user_hour_states WHERE hour_ts>=? AND hour_ts<?
+				UNION ALL SELECT 'credit',hour_ts,0,source_epoch,status,content_hash,semantics_version
+				FROM finance_credit_hour_states WHERE hour_ts>=? AND hour_ts<?
+				UNION ALL SELECT 'boundary',hour_ts,user_id,source_epoch,status,content_hash,0
+				FROM finance_gift_boundary_states WHERE hour_ts>=? AND hour_ts<?
+				ORDER BY kind,hour_ts,user_id,source_epoch`,
+				min(seed, from), to, min(seed, from), to, min(seed, from), to).Rows()
+			if err != nil {
+				return "", fmt.Errorf("读取赠送期初依据版本: %w", err)
+			}
+			for rows.Next() {
+				var kind, epoch, status, content string
+				var hour, user, version int64
+				if err := rows.Scan(&kind, &hour, &user, &epoch, &status, &content, &version); err != nil {
+					_ = rows.Close()
+					return "", err
+				}
+				_, _ = fmt.Fprintf(hash, "gift-proof|%q|%d|%d|%q|%q|%q|%d\n", kind, hour, user, epoch, status, content, version)
+			}
+			err = rows.Err()
+			_ = rows.Close()
+			if err != nil {
 				return "", err
 			}
 		}

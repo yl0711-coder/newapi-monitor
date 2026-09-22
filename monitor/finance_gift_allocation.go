@@ -33,6 +33,7 @@ type financeGiftCoverageView struct {
 	ExpectedBoundaryUserHours  int64 `json:"expected_boundary_user_hours"`
 	CompletedBoundaryUserHours int64 `json:"completed_boundary_user_hours"`
 	Complete                   bool  `json:"complete"`
+	ScopeUnknownEvents         int64 `json:"scope_unknown_events,omitempty"`
 }
 
 type financeGiftAllocationResult struct {
@@ -41,6 +42,9 @@ type financeGiftAllocationResult struct {
 	// ledger is retained only in memory for deriving month/day subranges from
 	// the already verified overall evidence. It is never serialized to clients.
 	ledger []financecredit.LedgerEvent
+	// Only set after all monetary/hour proofs passed and a later scope gap was
+	// found. It is a closed-hour prefix, never a replacement for overall coverage.
+	verifiedPrefix *financeGiftAllocationResult
 }
 
 type financeGiftUserHourKey struct {
@@ -56,6 +60,11 @@ func validFinanceGiftRange(seedFrom, from, to int64) bool {
 // access NewAPI. Exact request/refund ordering is required for every monetary
 // hour of every eligible gift recipient from their first grant onward.
 func (m *Monitor) loadFinanceGiftAllocation(ctx context.Context, seedFrom, from, to int64) (financeGiftAllocationResult, error) {
+	return m.loadFinanceGiftAllocationForScope(ctx, seedFrom, from, to, nil, nil)
+}
+
+func (m *Monitor) loadFinanceGiftAllocationForScope(ctx context.Context, seedFrom, from, to int64, policies map[string]bool, excludedUsers map[int64]bool) (financeGiftAllocationResult, error) {
+	hasExcludedGroups := channelBusinessGroupsExcluded(policies)
 	result := financeGiftAllocationResult{Coverage: financeGiftCoverageView{
 		SeedFromTs: seedFrom, FromTs: from, ToTs: to,
 	}}
@@ -202,12 +211,21 @@ func (m *Monitor) loadFinanceGiftAllocation(ctx context.Context, seedFrom, from,
 		}
 		eventsByKey[key] = append(eventsByKey[key], event)
 	}
+	firstScopeGap := to
 	for key, state := range stateByKey {
 		hourEvents := eventsByKey[key]
 		if financeGiftBoundaryContentHash(hourEvents) != state.ContentHash || int64(len(hourEvents)) != state.Rows {
 			return result, fmt.Errorf("gift boundary content failed verification for user %d hour %d", key.UserID, key.HourTs)
 		}
 		for _, event := range hourEvents {
+			if excludedUsers[event.UserID] {
+				continue
+			}
+			if hasExcludedGroups && !event.GroupKnown && event.Quota != 0 {
+				result.Coverage.ScopeUnknownEvents++
+				firstScopeGap = min(firstScopeGap, key.HourTs)
+				continue
+			}
 			amount, conversionErr := signedUnitsToMicroUSDCanonical(event.Quota, strconv.FormatInt(int64(quotaPerUSD), 10))
 			if conversionErr != nil {
 				return result, conversionErr
@@ -215,11 +233,38 @@ func (m *Monitor) loadFinanceGiftAllocation(ctx context.Context, seedFrom, from,
 			if event.Kind == "refund" {
 				amount = -amount
 			}
+			excluded := !channelBusinessGroupIncluded(policies, event.Group)
+			scope := "business"
+			if excluded {
+				scope = "excluded"
+			}
 			ledger = append(ledger, financecredit.LedgerEvent{
 				UserID: event.UserID, At: event.EventAt, Sequence: event.SourceLogID,
 				Kind: financecredit.EventNetUsage, AmountMicroUSD: amount,
+				Scope: scope, Excluded: excluded,
 			})
 		}
+	}
+	if result.Coverage.ScopeUnknownEvents > 0 {
+		// All preceding proof/hash checks succeeded. Unknown events can affect
+		// later wallet balances, so never skip a gap or publish its partial hour.
+		if firstScopeGap > from {
+			prefixLedger := make([]financecredit.LedgerEvent, 0, len(ledger))
+			for _, event := range ledger {
+				if event.At < firstScopeGap {
+					prefixLedger = append(prefixLedger, event)
+				}
+			}
+			allocation, err := financecredit.AllocateTrialGiftConsumption(prefixLedger, from, firstScopeGap)
+			if err != nil {
+				return result, err
+			}
+			result.verifiedPrefix = &financeGiftAllocationResult{
+				Allocation: allocation, ledger: prefixLedger,
+				Coverage: financeGiftCoverageView{SeedFromTs: seedFrom, FromTs: from, ToTs: firstScopeGap, Complete: true},
+			}
+		}
+		return result, nil
 	}
 	allocation, err := financecredit.AllocateTrialGiftConsumption(ledger, from, to)
 	if err != nil {
@@ -247,6 +292,13 @@ func financeGiftSubrange(result financeGiftAllocationResult, from, to int64) (fi
 // 移除已配置的内部账号。这只改变本次内存中的分配账本，不改原始
 // 额度调整事件或小时事实。
 func excludeFinanceGiftUsers(result financeGiftAllocationResult, excluded map[int64]bool) (financeGiftAllocationResult, error) {
+	if result.verifiedPrefix != nil && len(excluded) > 0 {
+		prefix, err := excludeFinanceGiftUsers(*result.verifiedPrefix, excluded)
+		if err != nil {
+			return result, err
+		}
+		result.verifiedPrefix = &prefix
+	}
 	if !result.Coverage.Complete || len(excluded) == 0 {
 		return result, nil
 	}

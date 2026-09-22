@@ -36,3 +36,12 @@ func channelBusinessGroupIncluded(policies map[string]bool, group string) bool {
 	included, configured := policies[strings.TrimSpace(group)]
 	return !configured || included
 }
+
+func channelBusinessGroupsExcluded(policies map[string]bool) bool {
+	for _, included := range policies {
+		if !included {
+			return true
+		}
+	}
+	return false
+}

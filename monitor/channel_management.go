@@ -52,29 +52,30 @@ type ChannelManagementRateConfig struct {
 // 它们均按主域名账户归集，不能推断为
 // 某一条实际渠道的上游账单。
 type ChannelUpstreamUsageMetrics struct {
-	Provisional                   bool    `json:"provisional,omitempty"`
-	Available                     bool    `json:"available"`
-	Requests                      int64   `json:"requests"`
-	Tokens                        int64   `json:"tokens"`
-	CostUSD                       float64 `json:"cost_usd"`
-	AdjustedCostAvailable         bool    `json:"adjusted_cost_available"`
-	AdjustedCostUSD               float64 `json:"adjusted_cost_usd"`
-	AdjustedCostStatus            string  `json:"adjusted_cost_status,omitempty"`
-	RechargeRatio                 float64 `json:"recharge_ratio"`
-	RechargeRatioVaries           bool    `json:"recharge_ratio_varies,omitempty"`
-	ExpectedHours                 int64   `json:"expected_hours"`
-	CompletedHours                int64   `json:"completed_hours"`
-	Complete                      bool    `json:"complete"`
-	DataUntil                     int64   `json:"data_until"`
-	Granularity                   string  `json:"granularity,omitempty"`
-	IntegrityStatus               string  `json:"integrity_status,omitempty"` // complete / overlapping_buckets / invalid_amount / window_mismatch
-	BusinessCostAvailable         bool    `json:"business_cost_available"`
-	BusinessCostUSD               float64 `json:"business_cost_usd"`
-	BusinessAdjustedCostAvailable bool    `json:"business_adjusted_cost_available"`
-	BusinessAdjustedCostUSD       float64 `json:"business_adjusted_cost_usd"`
-	InternalExcludedCostUSD       float64 `json:"internal_excluded_cost_usd,omitempty"`
-	InternalExcludedAdjustedUSD   float64 `json:"internal_excluded_adjusted_usd,omitempty"`
-	InternalFilterStatus          string  `json:"internal_filter_status,omitempty"`
+	Provisional                   bool     `json:"provisional,omitempty"`
+	Available                     bool     `json:"available"`
+	Requests                      int64    `json:"requests"`
+	Tokens                        int64    `json:"tokens"`
+	CostUSD                       float64  `json:"cost_usd"`
+	AdjustedCostAvailable         bool     `json:"adjusted_cost_available"`
+	AdjustedCostUSD               float64  `json:"adjusted_cost_usd"`
+	AdjustedCostStatus            string   `json:"adjusted_cost_status,omitempty"`
+	RechargeRatio                 float64  `json:"recharge_ratio"`
+	RechargeRatioVaries           bool     `json:"recharge_ratio_varies,omitempty"`
+	ExpectedHours                 int64    `json:"expected_hours"`
+	CompletedHours                int64    `json:"completed_hours"`
+	Complete                      bool     `json:"complete"`
+	DataUntil                     int64    `json:"data_until"`
+	Granularity                   string   `json:"granularity,omitempty"`
+	IntegrityStatus               string   `json:"integrity_status,omitempty"` // complete / overlapping_buckets / invalid_amount / window_mismatch
+	BusinessCostAvailable         bool     `json:"business_cost_available"`
+	BusinessCostUSD               float64  `json:"business_cost_usd"`
+	BusinessAdjustedCostAvailable bool     `json:"business_adjusted_cost_available"`
+	BusinessAdjustedCostUSD       float64  `json:"business_adjusted_cost_usd"`
+	InternalExcludedCostUSD       float64  `json:"internal_excluded_cost_usd,omitempty"`
+	InternalExcludedAdjustedUSD   float64  `json:"internal_excluded_adjusted_usd,omitempty"`
+	InternalFilterStatus          string   `json:"internal_filter_status,omitempty"`
+	InternalFilterReasons         []string `json:"internal_filter_reasons,omitempty"`
 }
 
 const (
@@ -163,6 +164,7 @@ type ChannelManagementReport struct {
 	Filters               ChannelManagementFilters      `json:"filters"`
 	Domains               []ChannelManagementDomain     `json:"domains"`
 	InternalAccounts      financeInternalFactStatus     `json:"internal_accounts"`
+	InternalScopeComplete bool                          `json:"internal_scope_complete"`
 }
 
 // ChannelCostClosureCapability is an explicit, read-only UI capability. The
@@ -506,6 +508,11 @@ func (m *Monitor) loadChannelUpstreamUsage(ctx context.Context, scope stabilityS
 	if err != nil {
 		return nil, err
 	}
+	restrictUpstreamUsageToWholeDays(result, scope)
+	return result, nil
+}
+
+func restrictUpstreamUsageToWholeDays(result map[string]ChannelUpstreamUsageMetrics, scope stabilityScope) {
 	for domain, metrics := range result {
 		// Even if one whole day fits, it is not the bill for a partial-day
 		// query. Keep such source bills in NaturalDayBill, outside exact totals.
@@ -515,10 +522,9 @@ func (m *Monitor) loadChannelUpstreamUsage(ctx context.Context, scope stabilityS
 				IntegrityStatus: upstreamUsageIntegrityWindowMismatch, AdjustedCostStatus: upstreamUsageIntegrityWindowMismatch}
 		}
 	}
-	return result, nil
 }
 
-func (m *Monitor) loadChannelUpstreamUsageWindow(ctx context.Context, scope stabilityScope, now int64, accounts map[string]ChannelUpstreamAccountView, finance channelFinanceSnapshot) (map[string]ChannelUpstreamUsageMetrics, error) {
+func (m *Monitor) loadChannelUpstreamUsageRows(ctx context.Context, scope stabilityScope) ([]ChannelUpstreamUsageHour, error) {
 	// Include an overlapping daily bucket so a mixed day/hour migration cannot
 	// silently drop the first partial day and pass the remainder as exact.
 	dbRows, err := m.storeDB.WithContext(ctx).Raw(`SELECT COALESCE(domain,''),COALESCE(hour_ts,0),COALESCE(bucket_seconds,0),
@@ -543,10 +549,30 @@ func (m *Monitor) loadChannelUpstreamUsageWindow(ctx context.Context, scope stab
 	if err := dbRows.Err(); err != nil {
 		return nil, err
 	}
+	return rows, nil
+}
+
+func (m *Monitor) loadChannelUpstreamUsageWindow(ctx context.Context, scope stabilityScope, now int64, accounts map[string]ChannelUpstreamAccountView, finance channelFinanceSnapshot) (map[string]ChannelUpstreamUsageMetrics, error) {
+	rows, err := m.loadChannelUpstreamUsageRows(ctx, scope)
+	if err != nil {
+		return nil, err
+	}
 	versions, err := m.loadChannelRechargeVersions(ctx, accounts, finance)
 	if err != nil {
 		return nil, err
 	}
+	return projectChannelUpstreamUsageWindow(rows, scope, now, accounts, versions)
+}
+
+// The same bucket validation is used by channel totals and daily finance bills.
+// Callers provide rows in domain/hour order; this projection performs no I/O.
+func projectChannelUpstreamUsageWindow(rows []ChannelUpstreamUsageHour, scope stabilityScope, now int64, accounts map[string]ChannelUpstreamAccountView, versions map[string][]channelRechargeVersion) (map[string]ChannelUpstreamUsageMetrics, error) {
+	return projectUpstreamUsageBuckets(rows, scope, now, accounts, versions, nil)
+}
+
+// accepted observes only validated buckets. Callers must still check the final
+// domain integrity: a later overlap or invalid bucket invalidates its total.
+func projectUpstreamUsageBuckets(rows []ChannelUpstreamUsageHour, scope stabilityScope, now int64, accounts map[string]ChannelUpstreamAccountView, versions map[string][]channelRechargeVersion, accepted func(ChannelUpstreamUsageHour)) (map[string]ChannelUpstreamUsageMetrics, error) {
 	type aggregate struct {
 		metrics        ChannelUpstreamUsageMetrics
 		completed      int64
@@ -619,6 +645,9 @@ func (m *Monitor) loadChannelUpstreamUsageWindow(ctx context.Context, scope stab
 		a.metrics.Requests += row.Requests
 		a.metrics.Tokens += row.Tokens
 		a.metrics.CostUSD += row.CostUSD
+		if accepted != nil {
+			accepted(row)
+		}
 		a.metrics.Provisional = a.metrics.Provisional || row.Provisional
 		a.completed += seconds
 		if until := end; until > a.metrics.DataUntil {
@@ -728,10 +757,6 @@ func (m *Monitor) buildChannelManagementReport(ctx context.Context, scope stabil
 	if err != nil {
 		return nil, fmt.Errorf("汇总内部账号渠道用量: %w", err)
 	}
-	internalCosts, err := m.loadFinanceConfiguredAccountCostEvidence(ctx, scope, internalAccounts)
-	if err != nil {
-		return nil, fmt.Errorf("核验内部账号上游成本: %w", err)
-	}
 	upstreamAccounts, err := m.loadChannelUpstreamViews(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("读取上游账户状态: %w", err)
@@ -740,28 +765,12 @@ func (m *Monitor) buildChannelManagementReport(ctx context.Context, scope stabil
 	if err != nil {
 		return nil, fmt.Errorf("读取上游使用日志汇总: %w", err)
 	}
-	for domain, metrics := range upstreamUsage {
-		upstreamUsage[domain] = applyChannelInternalCostFilter(metrics, internalCosts.ByDomain[domain], internalAccounts.Accounts, financeInternalCostDomainComplete(internalCosts, domain))
-	}
 	naturalDayBills, err := m.loadChannelUpstreamNaturalDayBills(ctx, scope, now, upstreamAccounts, finance)
 	if err != nil {
 		return nil, fmt.Errorf("读取自然日上游账单: %w", err)
 	}
-	if internalAccounts.Accounts > 0 && len(naturalDayBills) > 0 {
-		billScope := naturalDayBillingScope(scope, now)
-		dailyInternal, dailyErr := m.loadFinanceConfiguredInternalEvidence(ctx, billScope, businessGroupPolicies)
-		if dailyErr != nil {
-			return nil, fmt.Errorf("读取内部账号自然日事实: %w", dailyErr)
-		}
-		dailyCosts, dailyErr := m.loadFinanceConfiguredAccountCostEvidence(ctx, billScope, dailyInternal)
-		if dailyErr != nil {
-			return nil, fmt.Errorf("核验内部账号自然日成本: %w", dailyErr)
-		}
-		for domain, bill := range naturalDayBills {
-			if bill != nil {
-				bill.Usage = applyChannelInternalCostFilter(bill.Usage, dailyCosts.ByDomain[domain], dailyInternal.Accounts, financeInternalCostDomainComplete(dailyCosts, domain))
-			}
-		}
+	if err := m.applyChannelInternalCostViews(ctx, scope, now, businessGroupPolicies, internalAccounts, upstreamUsage, naturalDayBills); err != nil {
+		return nil, err
 	}
 	assessments, assessmentErr := m.upstreamBalanceAssessments(ctx, now, upstreamAccounts, m.loadAlertConfig())
 	if assessmentErr != nil {
@@ -1067,7 +1076,7 @@ func (m *Monitor) buildChannelManagementReport(ctx context.Context, scope stabil
 			HistoricalChannels: historicalChannels, Usage: total.metrics(),
 		},
 		Filters: ChannelManagementFilters{Domains: filterDomains, Vendors: filterVendors, Groups: filterGroups},
-		Domains: responseDomains, InternalAccounts: internalAccounts.SyncState,
+		Domains: responseDomains, InternalAccounts: internalAccounts.SyncState, InternalScopeComplete: internalAccounts.Complete,
 	}, nil
 }
 

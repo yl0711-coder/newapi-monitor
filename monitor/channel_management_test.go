@@ -310,8 +310,8 @@ func TestChannelManagementUpstreamSpendMetricKeepsAmountReadable(t *testing.T) {
 	js := string(channelManagementJS)
 	css := string(stabilityCSS)
 	for _, marker := range []string{
-		`区间业务上游消费`,
-		`自然日业务上游消费`,
+		`区间上游账单消费汇总`,
+		`所涉自然日`,
 		`<small>上游当前余额</small>`,
 		`domain.upstream?.balance_usd`,
 		`cm-domain-metric-note`,
@@ -337,21 +337,21 @@ func TestChannelManagementShowsRawAndRechargeAdjustedUpstreamSpend(t *testing.T)
 	js := string(channelManagementJS)
 	css := string(stabilityCSS)
 	for _, marker := range []string{
-		`区间业务上游消费`,
-		`自然日业务上游消费`,
-		`<small>业务上游修正消费</small>`,
-		`上游修正消费 = 账面消费 × 充值支付 ÷ 充值到账`,
-		`presentedBusinessCost(upstreamUsage,true)`,
+		`区间上游账单消费汇总`,
+		`所涉自然日`,
+		`<small>上游修正成本</small>`,
+		`修正成本 = 账面消费 × 历史充值支付 ÷ 历史充值到账`,
+		`presentedBusinessCost(upstreamUsage,true,costBases.adjusted)`,
 		`upstreamUsage.recharge_ratio`,
 		`按历史充值比例版本修正`,
-		`业务上游修正消费汇总`,
+		`上游修正成本汇总`,
 		`.cm-domain-upstream-adjusted b{color:`,
 	} {
 		if !strings.Contains(js, marker) && !strings.Contains(css, marker) {
 			t.Fatalf("上游修正消费缺少 %q", marker)
 		}
 	}
-	if !strings.Contains(js, `adjustedUsageDomains=trustedUsageDomains.filter`) {
+	if !strings.Contains(js, `adjustedUsageDomains=upstreamUsageDomains.filter(domain=>presentedBusinessCost(domain.upstream_usage,true,costBases.adjusted).available)`) {
 		t.Fatal("汇总只能累加已通过完整性校验且可按历史充值比例精确修正的账户")
 	}
 }
@@ -374,9 +374,9 @@ func TestChannelManagementSummarizesUpstreamFinanceWithoutGroupDoubleCounting(t 
 	for _, marker := range []string{
 		`const upstreamConfiguredAccounts=domains.filter(domain=>domain.upstream?.configured)`,
 		`const upstreamAccounts=upstreamConfiguredAccounts.filter(domain=>domain.upstream?.usage_sync_enabled)`,
-		`upstreamAggregateLabel(trustedUsageDomains,'business_cost_usd')`,
+		`upstreamAggregateLabel(trustedUsageDomains,false,costBases.cost)`,
 		`upstreamBalanceDomains.reduce((sum,domain)=>sum+Number(domain.upstream.balance_usd),0)`,
-		`区间业务上游消费汇总`,
+		`区间上游账单消费汇总`,
 		`上游当前余额汇总`,
 		`const trustedUsageDomains=upstreamUsageDomains.filter`,
 		`upstreamAccountComparable?upstreamSpendValue:'—'`,

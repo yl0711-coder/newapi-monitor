@@ -238,6 +238,11 @@ func TestFinanceReportUsesFullUserFactsAndVerifiedUpstreamCost(t *testing.T) {
 	if report.Statement.InternalTestConsumption.MicroUSD != "0" || report.Statement.InternalTestRequests != 0 {
 		t.Fatalf("unexpected internal test usage: %+v", report.Statement)
 	}
+	if !strings.Contains(report.SemanticsNote, "修正上游总成本包含内部测试实际支出") ||
+		!strings.Contains(report.SemanticsNote, "平台经营结果全额扣除") ||
+		!strings.Contains(report.SemanticsNote, "不重复扣除") {
+		t.Fatalf("finance semantics no longer distinguishes gross platform cost from business cost: %q", report.SemanticsNote)
+	}
 	if len(report.Periods) != 1 || report.Periods[0].Status != "verified" || len(report.CostDetails) != 1 {
 		t.Fatalf("unexpected period/detail projection: %+v %+v", report.Periods, report.CostDetails)
 	}
@@ -318,6 +323,9 @@ func TestFinanceReportSeparatesStrictInternalTestCostAndExcludesMixedHoursFromCu
 	}
 	if len(report.Days) != 1 || report.Days[0].Statement.KnownInternalTestUpstreamCost.MicroUSD != "4000000" || report.Days[0].Statement.KnownContributionProfit.MicroUSD != "7000000" {
 		t.Fatalf("daily internal-test separation mismatch: %+v", report.Days)
+	}
+	if report.Days[0].InternalCostComplete || report.Days[0].Statement.InternalTestMixedRows != 1 || report.Days[0].Statement.InternalTestUpstreamCost != nil {
+		t.Fatal("daily response concealed unresolved mixed cost")
 	}
 }
 
@@ -872,7 +880,7 @@ func TestFinancePageAndNavigationAreWired(t *testing.T) {
 		`id="finEvidenceRollout"`, `id="finEvidenceRolloutRows"`, `id="finEvidenceRolloutSummary"`, `历史成本补证计划`, `仅改善上游证据`, `建议首个灰度`,
 		`function operatingProfitBlockers`, `上游账单未接入/缺失`, `缺历史充值修正依据`, `AWS 当期未封账`,
 		`id="finCURProductRows"`, `AWS 基础设施成本明细`, `renderCURProducts`,
-		`id="finGiftEvidence"`, `注册赠送消耗`, `经营收入`, `已配对计费贡献（赠送前）`, `减：修正业务上游成本`, `另列：内部测试上游成本`, `id="finInternalAccounts"`, `分组名称候选（非归属证据）`, `不会自动绑定或改变核算金额`, `仅分组名称得到一个候选；不代表令牌归属`, `去渠道管理精确核对`, `window.channelManagementOpenCostSource`, `当前区间没有可发布的上游账单`, `当前区间没有同时核验的收入与成本`, `缺账单证据`,
+		`id="finGiftEvidence"`, `注册赠送消耗`, `经营收入`, `已配对计费贡献（赠送前）`, `减：修正上游总成本`, `其中：内部测试上游成本`, `id="finInternalAccounts"`, `分组名称候选（非归属证据）`, `不会自动绑定或改变核算金额`, `仅分组名称得到一个候选；不代表令牌归属`, `去渠道管理精确核对`, `window.channelManagementOpenCostSource`, `当前区间没有可发布的上游账单`, `当前区间没有同时核验的收入与成本`, `缺账单证据`,
 		`load(true)`, `query.set('fresh', '1')`, `X-Monitor-Finance-Cache`, `生成于`, `后台更新中`,
 		`function scheduleStaleRefresh`, `state.refreshAttempts >= 5`, `load(false, true)`,
 	} {

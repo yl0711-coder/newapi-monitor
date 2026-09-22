@@ -399,15 +399,22 @@ func nanoUSDToRoundedMicroUSD(nano int64) (int64, error) {
 }
 
 func applyFinanceCURCost(statement *financeStatementView, cur financeCURCostView) {
-	if statement == nil || !cur.Loaded || cur.IncludedDays == 0 {
+	if statement == nil {
+		return
+	}
+	statement.OperatingProfit = nil
+	statement.KnownOperatingProfit = channelEconomicsMoneyView{}
+	if !cur.Loaded || cur.IncludedDays == 0 {
 		return
 	}
 	statement.KnownAWSInfrastructureCost = cur.KnownCost
 	statement.AWSInfrastructureCost = cur.ExactCost
-	if statement.OperatingRevenue == nil || statement.CorrectedUpstreamCost == nil || statement.AWSInfrastructureCost == nil {
+	// Platform expenditure includes internal testing. The business-only cost
+	// belongs to the customer contribution view, not the operating result.
+	if statement.OperatingRevenue == nil || statement.RawCorrectedUpstreamCost == nil || statement.AWSInfrastructureCost == nil {
 		return
 	}
-	profit, err := financeSubtract(*statement.OperatingRevenue, *statement.CorrectedUpstreamCost)
+	profit, err := financeSubtract(*statement.OperatingRevenue, *statement.RawCorrectedUpstreamCost)
 	if err != nil {
 		return
 	}

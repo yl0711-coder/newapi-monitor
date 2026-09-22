@@ -467,7 +467,7 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
   .tabs .tab.active{color:var(--text);border-bottom-color:var(--accent);font-weight:600}
   .tabpane[hidden]{display:none}
 </style>
-<link rel="stylesheet" href="/stability.css?v=13">
+<link rel="stylesheet" href="/stability.css?v=14">
 <link rel="stylesheet" href="/capacity.css?v=2">
 <link rel="stylesheet" href="/group-governance.css?v=1">
   <link rel="stylesheet" href="/finance.css?v=14">
@@ -758,7 +758,7 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
   </section>
   <section class="fin-evidence" aria-label="核算证据覆盖">
     <article id="finUserEvidence"><small>用户用量小时覆盖</small><b>—</b><span>待读取</span></article>
-    <article id="finGiftEvidence"><small>注册赠送核算覆盖</small><b>—</b><span>待读取</span></article>
+    <article id="finGiftEvidence"><small>注册赠送核算状态</small><b>—</b><span>待读取</span></article>
     <article id="finBillEvidence"><small>上游账单覆盖</small><b>—</b><span>待读取</span></article>
     <article id="finCorrectionEvidence"><small>充值修正覆盖</small><b>—</b><span>待读取</span></article>
     <article id="finPairingEvidence"><small>收入成本同窗配对</small><b>—</b><span>待读取</span></article>
@@ -768,12 +768,16 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
     <header><div><h3>经营损益桥</h3><p>从平台计费消耗逐项调整为可发布经营毛利；缺少证据的项目保持空值</p></div><span>USD · 当前查询区间</span></header>
     <div class="fin-bridge">
       <div class="fin-bridge-row base"><span><b>平台净计费消耗</b><small>消费扣额减退还；内部测试已从用户口径分离</small></span><strong id="finBridgeConsumption">—</strong><em id="finBridgeConsumptionState">待读取</em></div>
+      <details class="fin-consumption-breakdown"><summary>查看扣款与退款明细</summary>
+        <div class="fin-bridge-row reference"><span><b>用户扣款总额</b><small>核验完整时对应同范围渠道管理的用户侧消费；未核验时仅列已知记录</small></span><strong id="finBridgeGross">—</strong><em id="finBridgeGrossState">待读取</em></div>
+        <div class="fin-bridge-row reference"><span><b>减：用户退款</b><small>与上述扣款相同统计范围；扣款减退款为净消费，不是最终收入</small></span><strong id="finBridgeRefund">—</strong><em id="finBridgeRefundState">待读取</em></div>
+      </details>
       <div class="fin-bridge-row deduction"><span><b>减：注册赠送实际消耗</b><small>只扣已识别赠送额度中被用户实际消耗的部分</small></span><strong id="finBridgeGift">—</strong><em id="finBridgeGiftState">未接入</em></div>
       <div class="fin-bridge-row subtotal"><span><b>可发布经营收入</b><small>不是充值额；赠送扣减完整后才能发布</small></span><strong id="finBridgeRevenue">—</strong><em id="finBridgeRevenueState">待核验</em></div>
-      <div class="fin-bridge-row deduction"><span><b>减：修正业务上游成本</b><small>已从上游实际账单中分离可严格识别的内部测试成本</small></span><strong id="finBridgeUpstream">—</strong><em id="finBridgeUpstreamState">待读取</em></div>
-      <div class="fin-bridge-row reference"><span><b>另列：内部测试上游成本</b><small>保留用于上游账单对账，不计入客户业务上游成本</small></span><strong id="finBridgeInternalTestCost">—</strong><em id="finBridgeInternalTestCostState">待读取</em></div>
+      <div class="fin-bridge-row deduction"><span><b>减：修正上游总成本</b><small>包含内部测试实际支出；缺失成本不按零计算</small></span><strong id="finBridgeUpstream">—</strong><em id="finBridgeUpstreamState">待读取</em></div>
+      <div class="fin-bridge-row reference"><span><b>其中：内部测试上游成本</b><small>已包含在上游总成本中，不重复扣除；不计客户收入</small></span><strong id="finBridgeInternalTestCost">—</strong><em id="finBridgeInternalTestCostState">待读取</em></div>
       <div class="fin-bridge-row deduction"><span><b>减：AWS 基础设施成本</b><small>CUR 账单按 NexusAPI 资源和期间归集</small></span><strong id="finBridgeAWS">—</strong><em id="finBridgeAWSState">未接入</em></div>
-      <div class="fin-bridge-row total"><span><b>可发布经营毛利</b><small>经营收入减修正上游成本和 AWS 成本</small></span><strong id="finBridgeProfit">—</strong><em id="finBridgeProfitState">待核验</em></div>
+      <div class="fin-bridge-row total"><span><b>可发布经营毛利</b><small>经营收入减修正上游总成本（含内部测试）和 AWS 成本</small></span><strong id="finBridgeProfit">—</strong><em id="finBridgeProfitState">待核验</em></div>
     </div>
     <footer id="finBridgeFootnote">内部测试及其它未归属成本单独列示；混合流量不做比例估算，也不会静默计为 0。</footer>
   </article>
@@ -797,7 +801,7 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
   <details class="fin-disclosure">
     <summary><span><b>逐日事实与渠道归属证据</b><small>用于追溯某一天、某个上游的原始核算依据</small></span><em>展开查看明细</em></summary>
     <div class="fin-disclosure-body">
-      <article class="fin-card"><header><div><h3>每日经营事实</h3><p>按北京时间自然日展示；当日未闭合小时会单独标识</p></div></header><div class="fin-table-wrap fin-daily-wrap"><table class="fin-table fin-daily-table"><thead><tr><th>日期</th><th class="num">消费扣额</th><th class="num">退还额度</th><th class="num">净计费消耗</th><th class="num">注册赠送消耗</th><th class="num">经营收入</th><th class="num">内部测试用量</th><th class="num">内部测试上游成本</th><th class="num">AWS 成本</th><th class="num">已配对计费扣额</th><th class="num">已配对客户成本</th><th class="num">计费贡献（赠送前）</th><th>用量覆盖</th><th>配对证据</th><th>状态</th></tr></thead><tbody id="finDailyRows"><tr><td colspan="15" class="fin-empty">进入页面后加载</td></tr></tbody></table></div></article>
+      <article class="fin-card"><header><div><h3>每日经营事实</h3><p>按北京时间自然日展示。修正成本合计逐供应商与所属月核对，小字列出充值修正与账本回退来源，均含内部测试；对账通过不代表全部成本或利润已完整。</p></div></header><div class="fin-table-wrap fin-daily-wrap"><table class="fin-table fin-daily-table"><thead><tr><th>日期</th><th class="num">消费扣额</th><th class="num">退还额度</th><th class="num">净计费消耗</th><th class="num">注册赠送消耗</th><th class="num">经营收入</th><th class="num">上游账单原值</th><th class="num">修正成本合计（含内部）</th><th class="num">内部测试用量</th><th class="num">内部测试上游成本</th><th class="num">AWS 成本</th><th class="num">已配对计费扣额</th><th class="num">已配对客户成本</th><th class="num">计费贡献（赠送前）</th><th>用量覆盖</th><th>配对证据</th><th>状态</th></tr></thead><tbody id="finDailyRows"><tr><td colspan="17" class="fin-empty">进入页面后加载</td></tr></tbody></table></div></article>
       <article class="fin-card"><header><div><h3>上游成本与渠道归属明细</h3><p>“已配对”三项使用同一批不可变小时事实，可直接核对；账单状态、配对状态及安全准入步骤分别判断</p></div></header><div class="fin-table-wrap"><table class="fin-table fin-cost-table"><thead><tr><th>上游主域名</th><th class="num">用户请求</th><th class="num">净计费消耗</th><th class="num">上游请求</th><th class="num">账单原值</th><th class="num">修正成本</th><th class="num">已配对计费扣额</th><th class="num">已配对成本</th><th class="num">计费贡献（赠送前）</th><th>账单口径</th><th>修正依据</th><th>账单覆盖</th><th>账单状态</th><th>收入成本配对</th><th>成本闭环下一步</th></tr></thead><tbody id="finCostRows"><tr><td colspan="15" class="fin-empty">进入页面后加载</td></tr></tbody></table></div></article>
     </div>
   </details>
@@ -1293,13 +1297,13 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
 </div><!-- /monitor-shell -->
 
 <script src="/stability.js?v=6"></script>
-<script src="/channel-data-status.js?v=1"></script>
-<script src="/channel-management.js?v=13"></script>
+<script src="/channel-data-status.js?v=2"></script>
+<script src="/channel-management.js?v=14"></script>
 <script src="/logchain.js?v=12"></script>
 <script src="/alerts.js?v=1"></script>
 <script src="/capacity.js?v=2"></script>
 <script src="/group-governance.js?v=1"></script>
-<script src="/finance.js?v=42"></script>
+<script src="/finance.js?v=53"></script>
 <script src="/infra-assets.js?v=1"></script>
 <script src="/ecs-log-sources.js?v=1"></script>
 <script>

@@ -27,6 +27,8 @@ type FinanceGiftBoundaryEvent struct {
 	EventAt      int64  `gorm:"column:event_at"`
 	Kind         string `gorm:"size:16;column:kind"`
 	Quota        int64  `gorm:"column:quota"`
+	Group        string `gorm:"column:grp"`
+	GroupKnown   bool   `gorm:"column:group_known"`
 	EvidenceHash string `gorm:"size:64;column:evidence_hash"`
 }
 
@@ -50,7 +52,7 @@ func financeGiftBoundarySQL(userCount int) (string, error) {
 		return "", errors.New("invalid gift boundary user count")
 	}
 	placeholders := strings.TrimSuffix(strings.Repeat("?,", userCount), ",")
-	return fmt.Sprintf(`SELECT id,user_id,created_at,type,quota
+	return fmt.Sprintf("SELECT id,user_id,created_at,type,quota,COALESCE(`group`,'')\n"+`
 FROM logs WHERE created_at>=? AND created_at<? AND type IN (2,6)
   AND user_id IN (%s) AND NOT (%s)
 ORDER BY created_at,id LIMIT %d`, placeholders, channelTestLogPredicateSQL(), financeGiftBoundaryMaxRows+1), nil
@@ -90,7 +92,7 @@ func fetchFinanceGiftBoundaryEvents(ctx context.Context, source financeSourceQue
 		}
 		var event FinanceGiftBoundaryEvent
 		var sourceType int
-		if err := rows.Scan(&event.SourceLogID, &event.UserID, &event.EventAt, &sourceType, &event.Quota); err != nil {
+		if err := rows.Scan(&event.SourceLogID, &event.UserID, &event.EventAt, &sourceType, &event.Quota, &event.Group); err != nil {
 			return nil, err
 		}
 		if event.SourceLogID <= 0 || event.EventAt < hourTs || event.EventAt >= hourTs+3600 || event.Quota < 0 {
@@ -100,6 +102,7 @@ func fetchFinanceGiftBoundaryEvents(ctx context.Context, source financeSourceQue
 			return nil, errors.New("gift boundary source returned another user")
 		}
 		event.HourTs = hourTs
+		event.GroupKnown = true
 		switch sourceType {
 		case 2:
 			event.Kind = "usage"
@@ -120,6 +123,11 @@ func fetchFinanceGiftBoundaryEvents(ctx context.Context, source financeSourceQue
 func financeGiftBoundaryEventHash(event FinanceGiftBoundaryEvent) string {
 	values := []string{strconv.FormatInt(event.SourceLogID, 10), strconv.FormatInt(event.HourTs, 10),
 		strconv.FormatInt(event.UserID, 10), strconv.FormatInt(event.EventAt, 10), event.Kind, strconv.FormatInt(event.Quota, 10)}
+	// Preserve legacy hashes. An empty group from a new source read is known;
+	// a legacy row with no group column is not assumed to be the default group.
+	if event.GroupKnown {
+		values = append(values, "group-v1", event.Group)
+	}
 	sum := sha256.Sum256([]byte(strings.Join(values, "\x00")))
 	return hex.EncodeToString(sum[:])
 }
