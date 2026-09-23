@@ -1633,11 +1633,11 @@ func (m *Monitor) buildFinanceDailyViews(ctx context.Context, scope stabilitySco
 		if err := subtractFinanceInternalTestFromContribution(&statement, internalTestCost.ExcludeByDay[day], economics.Totals.PairedPublicationRows); err != nil {
 			return nil, fmt.Errorf("从 %s 客户贡献中分离内部测试成本: %w", time.Unix(day, 0).In(loc).Format("2006-01-02"), err)
 		}
-		// Exact all-site contribution requires the immutable ledger's exact net
-		// revenue to equal the independently aggregated all-site net usage. This
-		// prevents a complete-looking subset of upstream domains from being
-		// published as the whole day's profit.
-		ledgerRevenue, ledgerRevenueOK := financeMoneyInt64(economics.Totals.KnownRevenue)
+		// Compare customer-only revenue on both sides. The immutable ledger's
+		// raw revenue still includes strictly identified internal-test traffic;
+		// its paired revenue above has already had that traffic and cost removed.
+		// Equality still fails closed for non-business groups or missing domains.
+		ledgerRevenue, ledgerRevenueOK := financeMoneyInt64(statement.PairedUserConsumption)
 		netRevenue, _ := financeMoneyInt64(net)
 		if userCoverage.Complete && dayCostEvidence.Complete && economics.Totals.ProfitKnown && economics.Totals.RevenueKnown && ledgerRevenueOK && ledgerRevenue == netRevenue && statement.KnownContributionProfit.MicroUSD != "" {
 			statement.ContributionProfit = financeMoneyPointer(statement.KnownContributionProfit)

@@ -447,6 +447,76 @@ func TestChannelCostCheckpointAndPublicationAreIndependent(t *testing.T) {
 	}
 }
 
+func TestChannelCostRecoveryPreservesPartialPairAndResetsBrokenPair(t *testing.T) {
+	db := newChannelCostTestStore(t)
+	if err := db.AutoMigrate(&ChannelUpstreamPricingPageCheckpoint{}, &ChannelUpstreamPricingHourState{}); err != nil {
+		t.Fatal(err)
+	}
+	m := &Monitor{storeDB: db, cfg: Settings{
+		ChannelCostClosureEnabled: true, ChannelCostClosureDomains: []string{"4sapi.com"},
+		ChannelCostHMACKey: "0123456789abcdef0123456789abcdef", ChannelCostHMACKeyID: "cost-source-v1",
+	}}
+	hour := int64(1787623200 - 1787623200%3600)
+	account := ChannelUpstreamAccount{Domain: "4sapi.com", Provider: upstreamProviderNewAPI, BaseURL: "https://4sapi.com", UserID: 147426, Account: "billing@example.com"}
+	item := newAPIPricingUsageItem{
+		CreatedAt: hour + 1, QuotaExact: 16, QuotaExactKnown: true, PromptTokens: 24, CompletionTokens: 5, TokensExactKnown: true,
+		Pricing: newAPIPricingAttributes{GroupName: "Gpt-codex", ModelName: "gpt-5.5", TokenID: 75, BillingMode: "token", GroupRatio: "1", GroupRatioState: pricingRatioValid, GroupRatioCanonical: "1", UserGroupRatioState: pricingRatioMissing, DiscountRatioState: pricingRatioMissing, EffectiveRatioSource: "group_ratio", EffectiveRatio: "1", EvidenceCapability: "full_rate", OtherValid: true},
+	}
+	pricingRows, _, err := buildNewAPIPricingHour(account, []newAPIPricingUsageItem{item}, hour, hour+3600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	costRows, _, err := buildNewAPICostHourEvidence(account, []newAPIPricingUsageItem{item}, hour, hour+3600, []byte(m.cfg.ChannelCostHMACKey), m.cfg.ChannelCostHMACKeyID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pricingMap := map[string]*ChannelUpstreamPricingHourEvidence{pricingRows[0].DimensionHash: &pricingRows[0]}
+	costMap := map[string]*ChannelUpstreamCostHourEvidence{costRows[0].DimensionHash: &costRows[0]}
+	checkpoint := ChannelUpstreamPricingPageCheckpoint{
+		Domain: account.Domain, AccountEpoch: newAPIUpstreamAccountEpoch(account), SemanticsVersion: upstreamPricingSemanticsVersion,
+		HourTs: hour, Provider: account.Provider, WindowSeconds: 3600, NextPage: 21, Total: 2500, SourceRows: 1,
+		FirstPageFingerprint: strings.Repeat("f", 64),
+	}
+	if err := m.saveNewAPIPricingAndCostCheckpoint(context.Background(), &checkpoint, pricingMap, costMap); err != nil {
+		t.Fatal(err)
+	}
+	var savedCost ChannelCostPageCheckpoint
+	if err := db.First(&savedCost, "domain = ? AND hour_ts = ?", account.Domain, hour).Error; err != nil {
+		t.Fatal(err)
+	}
+	if _, err := decodeChannelCostCheckpoint(savedCost, account.Provider, m.cfg.ChannelCostHMACKeyID); err != nil {
+		t.Fatalf("fixture cost checkpoint invalid: %v", err)
+	}
+	if _, err := decodePricingCheckpointEvidence(checkpoint); err != nil {
+		t.Fatalf("fixture pricing checkpoint invalid: %v", err)
+	}
+	if err := db.Create(&ChannelUpstreamPricingHourState{Domain: account.Domain, AccountEpoch: checkpoint.AccountEpoch, HourTs: hour, SemanticsVersion: upstreamPricingSemanticsVersion, Status: "verified", ReconcileStatus: "matched"}).Error; err != nil {
+		t.Fatal(err)
+	}
+	ready, err := m.prepareChannelCostRecovery(context.Background(), account, hour)
+	if err != nil || ready {
+		t.Fatalf("valid partial pair must resume: ready=%v err=%v", ready, err)
+	}
+	var retained ChannelCostPageCheckpoint
+	if err := db.First(&retained, "domain = ? AND hour_ts = ?", account.Domain, hour).Error; err != nil || retained.NextPage != 21 {
+		t.Fatalf("partial cost cursor was lost: %+v err=%v", retained, err)
+	}
+	if err := db.Delete(&ChannelCostPageCheckpoint{}, "domain = ? AND hour_ts = ?", account.Domain, hour).Error; err != nil {
+		t.Fatal(err)
+	}
+	ready, err = m.prepareChannelCostRecovery(context.Background(), account, hour)
+	if err != nil || ready {
+		t.Fatalf("broken pair must restart bounded reread: ready=%v err=%v", ready, err)
+	}
+	var count int64
+	if err := db.Model(&ChannelUpstreamPricingPageCheckpoint{}).Where("domain = ? AND hour_ts = ?", account.Domain, hour).Count(&count).Error; err != nil || count != 0 {
+		t.Fatalf("orphan pricing cursor survived: count=%d err=%v", count, err)
+	}
+	if err := db.Model(&ChannelUpstreamPricingHourState{}).Where("domain = ? AND hour_ts = ?", account.Domain, hour).Count(&count).Error; err != nil || count != 1 {
+		t.Fatalf("published pricing was removed: count=%d err=%v", count, err)
+	}
+}
+
 func TestChannelCostDisabledWritesNoCheckpoint(t *testing.T) {
 	db := newChannelCostTestStore(t)
 	if err := db.AutoMigrate(&ChannelUpstreamPricingPageCheckpoint{}); err != nil {

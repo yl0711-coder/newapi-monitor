@@ -3,8 +3,78 @@ package monitor
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
 )
+
+func TestFinanceDailyExactProfitExcludesStrictInternalAccount(t *testing.T) {
+	m := newFinanceReportTestMonitor(t, "daily-internal.example")
+	first := int64(1_788_195_600)
+	scope := stabilityScope{FromTs: first, ToTs: first + 7200}
+	epoch := strings.Repeat("d", 64)
+	for index, sample := range []struct {
+		channel int
+		group   string
+		quota   int64
+		revenue int64
+		cost    int64
+	}{
+		{channel: 69, group: "internal", quota: 1_000_000, revenue: 2_000_000, cost: 1_000_000},
+		{channel: 70, group: "paid", quota: 5_000_000, revenue: 10_000_000, cost: 3_000_000},
+	} {
+		hour := first + int64(index)*3600
+		if err := m.storeDB.Create(&ChannelSnap{ID: sample.channel, BaseDomain: "daily-internal.example", Status: 1}).Error; err != nil {
+			t.Fatal(err)
+		}
+		if err := m.storeDB.Create(&StabilityHourSample{HourTs: hour, ChannelID: sample.channel, Grp: sample.group, Success: 1,
+			Quota: sample.quota, TrafficClassVersion: stabilityTrafficClassificationVersion}).Error; err != nil {
+			t.Fatal(err)
+		}
+		if err := m.storeDB.Create(&StabilityHourIngestState{HourTs: hour, Status: "complete", Requests: 1,
+			TrafficClassVersion: stabilityTrafficClassificationVersion}).Error; err != nil {
+			t.Fatal(err)
+		}
+		publication := insertEconomicsReportHour(t, m, "daily-internal.example", epoch, hour, sample.channel,
+			sample.revenue, sample.cost, sample.cost, sample.revenue-sample.cost)
+		insertEconomicsReportManifest(t, m, "daily-internal.example", epoch, hour, publication)
+	}
+	internalFact := financeInternalTestCostFact{RevenueMicroUSD: 2_000_000, CorrectedCostMicroUSD: 1_000_000,
+		UpstreamCostMicroUSD: 1_000_000, ProfitMicroUSD: 1_000_000, Rows: 1}
+	evidence := financeInternalTestCostEvidence{SourceComplete: true, SourceScope: scope,
+		ExcludeByDay: map[int64]financeInternalTestCostFact{cstDayStart(first): internalFact},
+		Events:       []financeInternalTestCostEvent{{HourTs: first, Domain: "daily-internal.example", State: "strict", Fact: internalFact}}}
+	accounts := financeConfiguredInternalEvidence{Complete: true, VerifiedScope: scope, Accounts: 1,
+		Rows: []FinanceInternalAccountHourFact{{HourTs: first, UserID: 7, ChannelID: 69, Grp: "internal", Requests: 1, ConsumeQuota: 1_000_000}}}
+	days, err := m.buildFinanceDailyViews(context.Background(), scope, scope.ToTs+86400, evidence, accounts, nil)
+	if err != nil || len(days) != 1 {
+		t.Fatalf("daily exact profit: days=%d err=%v", len(days), err)
+	}
+	s := days[0].Statement
+	if s.KnownUserConsumption.MicroUSD != "10000000" || s.PairedUserConsumption.MicroUSD != "10000000" ||
+		s.KnownContributionProfit.MicroUSD != "7000000" || s.ContributionProfit == nil || s.ContributionProfit.MicroUSD != "7000000" {
+		t.Fatalf("strict internal traffic incorrectly blocked exact customer profit: %+v", s)
+	}
+	// The new customer-only equality must still reject a ledger that contains
+	// revenue from a group explicitly excluded from business reporting.
+	excluded, err := m.buildFinanceDailyViews(context.Background(), scope, scope.ToTs+86400, evidence, accounts, map[string]bool{"paid": false})
+	if err != nil || len(excluded) != 1 || excluded[0].Statement.ContributionProfit != nil {
+		t.Fatalf("non-business group was published as exact profit: days=%+v err=%v", excluded, err)
+	}
+	partial := evidence
+	partial.SourceComplete = false
+	partial.SourceScope = stabilityScope{}
+	missingCost, err := m.buildFinanceDailyViews(context.Background(), scope, scope.ToTs+86400, partial, accounts, nil)
+	if err != nil || len(missingCost) != 1 || missingCost[0].Statement.ContributionProfit != nil {
+		t.Fatalf("incomplete internal-cost evidence was published as exact profit: days=%+v err=%v", missingCost, err)
+	}
+	if err := m.storeDB.Delete(&StabilityHourIngestState{}, "hour_ts = ?", first+3600).Error; err != nil {
+		t.Fatal(err)
+	}
+	missingUsage, err := m.buildFinanceDailyViews(context.Background(), scope, scope.ToTs+86400, evidence, accounts, nil)
+	if err != nil || len(missingUsage) != 1 || missingUsage[0].Statement.ContributionProfit != nil {
+		t.Fatalf("incomplete user coverage was published as exact profit: days=%+v err=%v", missingUsage, err)
+	}
+}
 
 func TestFinanceDailyInternalCostPreservesEvidenceState(t *testing.T) {
 	for _, mode := range []string{"strict", "mixed", "unverified", "source_gap", "account_gap", "verified_prefix", "zero", "no_events"} {
