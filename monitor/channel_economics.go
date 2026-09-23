@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math"
 	"math/big"
 	"sort"
@@ -561,10 +562,10 @@ func (m *Monitor) enqueueMissingChannelEconomicsHours(ctx context.Context, accou
 		  AND c.status='verified' AND c.reconcile_status='matched'
 		  AND NOT EXISTS (
 		    SELECT 1
-		    FROM channel_economics_hour_current cur
-		    JOIN channel_economics_hour_publications p ON p.publication_id=cur.publication_id
-		    WHERE p.domain=c.domain AND p.account_epoch=c.account_epoch AND p.hour_ts=c.hour_ts
-		      AND p.semantics_version=?
+		    FROM channel_economics_hour_manifest_current cur
+		    JOIN channel_economics_hour_manifest_publications p ON p.manifest_id=cur.manifest_id
+		    WHERE cur.domain=c.domain AND cur.hour_ts=c.hour_ts AND cur.semantics_version=?
+		      AND p.authoritative_epoch=c.account_epoch
 		  )
 		  AND NOT EXISTS (
 		    SELECT 1 FROM channel_economics_dirty_hours d
@@ -754,9 +755,88 @@ func (m *Monitor) markChannelEconomicsDirtyHour(ctx context.Context, account Cha
 	return upsertChannelEconomicsDirtyTx(m.storeDB.WithContext(ctx), row)
 }
 
+const (
+	channelEconomicsEnqueuePerTick = 4
+	channelEconomicsPublishPerTick = 8
+	channelEconomicsTickTimeout    = 8 * time.Second
+)
+
+// Economic publication has no upstream I/O. Keep its recovery independent of
+// pricing verification, which can wait on pagination, reconciliation, or an
+// account gate for many turns. One selected domain gets at most eight local
+// publications per minute; each scan introduces at most four missing hours.
+func (m *Monitor) syncDueChannelEconomics(ctx context.Context) {
+	if m == nil || m.storeDB == nil || !m.cfg.ChannelCostClosureEnabled || len(m.cfg.ChannelCostClosureDomains) == 0 {
+		return
+	}
+	ctx, cancel := context.WithTimeout(ctx, channelEconomicsTickTimeout)
+	defer cancel()
+	now := time.Now().Unix()
+	domains := m.cfg.ChannelCostClosureDomains
+	// Rotate the first candidate so one noisy supplier cannot starve others.
+	start := int((now / 60) % int64(len(domains)))
+	for i := range domains {
+		domain := strings.ToLower(strings.TrimSpace(domains[(start+i)%len(domains)]))
+		if domain == "" {
+			continue
+		}
+		var account ChannelUpstreamAccount
+		if err := m.storeDB.WithContext(ctx).First(&account, "domain = ?", domain).Error; err != nil {
+			if !errors.Is(err, gorm.ErrRecordNotFound) {
+				slog.Warn("读取渠道经济账账户失败", "domain", domain, "err", err)
+			}
+			continue
+		}
+		if !m.channelCostEnabledFor(account) {
+			continue
+		}
+		if err := m.enqueueMissingChannelEconomicsHours(ctx, account, channelEconomicsEnqueuePerTick); err != nil {
+			slog.Warn("扫描缺失渠道经济账小时失败", "domain", domain, "err", err)
+			continue
+		}
+		var due int64
+		if err := m.storeDB.WithContext(ctx).Model(&ChannelEconomicsDirtyHour{}).
+			Where("domain = ? AND account_epoch = ? AND status = 'pending' AND next_attempt_at <= ?", account.Domain, newAPIUpstreamAccountEpoch(account), now).
+			Limit(1).Count(&due).Error; err != nil {
+			slog.Warn("读取渠道经济账待办失败", "domain", domain, "err", err)
+			continue
+		}
+		if due == 0 {
+			continue
+		}
+		if err := m.publishDueChannelEconomicsBatch(ctx, account, now); err != nil {
+			slog.Warn("渠道小时经济账发布待重试", "domain", domain, "err", err)
+		}
+		return
+	}
+}
+
+// Keep the newest hour responsive while draining old dirty hours as well.
+// These publications read local SQLite facts only; they never call an upstream.
+// A bounded batch avoids turning a pricing sync into an unbounded write job.
+func (m *Monitor) publishDueChannelEconomicsBatch(ctx context.Context, account ChannelUpstreamAccount, now int64) error {
+	for i := 0; i < channelEconomicsPublishPerTick; i++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := m.publishOneDueChannelEconomicsHourOrdered(ctx, account, now, i > 0); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (m *Monitor) publishOneDueChannelEconomicsHour(ctx context.Context, account ChannelUpstreamAccount, now int64) error {
+	return m.publishOneDueChannelEconomicsHourOrdered(ctx, account, now, false)
+}
+
+func (m *Monitor) publishOneDueChannelEconomicsHourOrdered(ctx context.Context, account ChannelUpstreamAccount, now int64, oldestFirst bool) error {
 	var dirty ChannelEconomicsDirtyHour
-	err := m.storeDB.WithContext(ctx).Where("domain = ? AND account_epoch = ? AND status = 'pending' AND next_attempt_at <= ?", account.Domain, newAPIUpstreamAccountEpoch(account), now).Order("hour_ts DESC, created_at ASC").First(&dirty).Error
+	order := "hour_ts DESC, created_at ASC"
+	if oldestFirst {
+		order = "hour_ts ASC, created_at ASC"
+	}
+	err := m.storeDB.WithContext(ctx).Where("domain = ? AND account_epoch = ? AND status = 'pending' AND next_attempt_at <= ?", account.Domain, newAPIUpstreamAccountEpoch(account), now).Order(order).First(&dirty).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		return nil
 	}

@@ -1735,12 +1735,6 @@ func (m *Monitor) syncStoredNewAPIPricing(ctx context.Context, domain string) (C
 		} else if !errors.Is(dirtyErr, gorm.ErrRecordNotFound) {
 			slog.Warn("读取渠道成本恢复任务失败", "domain", account.Domain, "err", dirtyErr)
 		}
-		if economicsQueueErr := m.enqueueMissingChannelEconomicsHours(ctx, account, 8); economicsQueueErr != nil {
-			slog.Warn("扫描缺失渠道经济账小时失败", "domain", account.Domain, "err", economicsQueueErr)
-		}
-		if economicsErr := m.publishOneDueChannelEconomicsHour(ctx, account, now); economicsErr != nil {
-			slog.Warn("渠道小时经济账发布待重试", "domain", account.Domain, "err", economicsErr)
-		}
 	}
 	if err == nil && !blocked {
 		state.LastError, state.Progress, state.ConsecutiveFailures = "", "", 0
@@ -1804,20 +1798,13 @@ func (m *Monitor) syncDueUpstreamPricing(ctx context.Context) {
 			due = state.TailNextSyncAt == 0 || state.TailNextSyncAt <= now ||
 				(!state.BackfillDone && (state.BackfillNextSyncAt == 0 || state.BackfillNextSyncAt <= now))
 		}
-		var costRecoveryDueAt, economicsDueAt int64
+		var costRecoveryDueAt int64
 		if m.channelCostEnabledFor(account) {
 			_ = m.storeDB.WithContext(ctx).Model(&ChannelCostDirtyHour{}).
 				Select("COALESCE(MIN(next_attempt_at),0)").
 				Where("domain = ? AND account_epoch = ? AND status = 'pending'", account.Domain, epoch).
 				Scan(&costRecoveryDueAt).Error
 			if costRecoveryDueAt > 0 && costRecoveryDueAt <= now {
-				due = true
-			}
-			_ = m.storeDB.WithContext(ctx).Model(&ChannelEconomicsDirtyHour{}).
-				Select("COALESCE(MIN(next_attempt_at),0)").
-				Where("domain = ? AND account_epoch = ? AND status = 'pending'", account.Domain, epoch).
-				Scan(&economicsDueAt).Error
-			if economicsDueAt > 0 && economicsDueAt <= now {
 				due = true
 			}
 		}
@@ -1831,9 +1818,6 @@ func (m *Monitor) syncDueUpstreamPricing(ctx context.Context) {
 			}
 			if costRecoveryDueAt > 0 && (nextDue == 0 || costRecoveryDueAt < nextDue) {
 				nextDue = costRecoveryDueAt
-			}
-			if economicsDueAt > 0 && (nextDue == 0 || economicsDueAt < nextDue) {
-				nextDue = economicsDueAt
 			}
 			candidates = append(candidates, upstreamPricingDueAccount{Domain: domain, NextDueAt: nextDue, LastAttemptAt: state.LastAttemptAt})
 		}
