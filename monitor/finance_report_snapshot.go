@@ -54,8 +54,8 @@ func (m *Monitor) loadFinanceReportSnapshot(request financeReportRequest, now ti
 	if err != nil {
 		return nil, time.Time{}, "", false, err
 	}
-	m.financeSnapshotWriteMu.RLock()
-	defer m.financeSnapshotWriteMu.RUnlock()
+	// Writers publish with rename. Readers may see either complete version;
+	// they must not wait for a writer's file sync or cache pruning.
 	info, err := os.Stat(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, time.Time{}, "", false, nil

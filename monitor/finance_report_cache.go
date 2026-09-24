@@ -15,7 +15,7 @@ import (
 const (
 	// 经营核算是按闭合小时生成的管理报表，不需要像实时监控一样每次请求重算。
 	// 五分钟新鲜期减少重复 SQLite 扫描；其后的十分钟只用于“立即展示旧结果、
-	// 后台更新”，页面会显示 report.generated_at，手动刷新始终绕过缓存。
+	// 后台更新”，页面会显示 report.generated_at；仅旧读取模式手动刷新绕过缓存。
 	financeReportCacheTTL        = 5 * time.Minute
 	financeReportCacheStaleGrace = 10 * time.Minute
 	financeReportCacheMaxEntries = 16
@@ -78,8 +78,8 @@ func (m *Monitor) logFinanceBuildTiming(started time.Time, mainBefore, factsBefo
 		"finance_read_pool_in_use", readAfter.InUse, "finance_read_pool_open", readAfter.OpenConnections)
 }
 
-// Explicit user refresh bypasses both layers; ordinary background revalidation
-// still reuses unaffected historical months.
+// Legacy explicit refresh bypasses both layers. The async queue revalidates
+// source versions and keeps unaffected historical month components reusable.
 type financeForceRebuildKey struct{}
 
 var errFinanceFactsChanged = errors.New("经营核算事实在报表生成期间已变更，请重试")
@@ -167,8 +167,11 @@ func (m *Monitor) buildFinanceReportWithRetry(ctx context.Context, request finan
 			return nil, request, err
 		}
 		request.sourceFingerprint = fingerprint
-		// Do not reuse components from the rejected attempt.
-		ctx = context.WithValue(ctx, financeForceRebuildKey{}, true)
+		// Each component checks its own source version. The async read lane
+		// can reuse unchanged months after a publication race.
+		if !m.cfg.FinanceFastSnapshotEnabled {
+			ctx = context.WithValue(ctx, financeForceRebuildKey{}, true)
+		}
 	}
 	return nil, request, errFinanceFactsChanged
 }

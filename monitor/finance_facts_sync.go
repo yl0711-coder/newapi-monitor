@@ -54,23 +54,24 @@ type financeHourSnapshot struct {
 }
 
 type syncFinanceStatus struct {
-	Enabled           bool    `json:"enabled"`
-	ReportEnabled     bool    `json:"report_enabled"`
-	Status            string  `json:"status"`
-	SourceEpoch       string  `json:"source_epoch,omitempty"`
-	StartHour         int64   `json:"start_hour"`
-	FinalizedThrough  int64   `json:"finalized_through"`
-	NextHour          int64   `json:"next_hour"`
-	LastCompletedHour int64   `json:"last_completed_hour"`
-	ExpectedHours     int64   `json:"expected_hours"`
-	CompletedHours    int64   `json:"completed_hours"`
-	ProgressPercent   float64 `json:"progress_percent"`
-	GiftRecipients    int64   `json:"gift_recipients"`
-	FailureStreak     int64   `json:"failure_streak"`
-	LastError         string  `json:"last_error,omitempty"`
-	LastAttemptAt     int64   `json:"last_attempt_at"`
-	LastSuccessAt     int64   `json:"last_success_at"`
-	UpdatedAt         int64   `json:"updated_at"`
+	ReportRefresh     financeReportQueueStats `json:"report_refresh"`
+	Enabled           bool                    `json:"enabled"`
+	ReportEnabled     bool                    `json:"report_enabled"`
+	Status            string                  `json:"status"`
+	SourceEpoch       string                  `json:"source_epoch,omitempty"`
+	StartHour         int64                   `json:"start_hour"`
+	FinalizedThrough  int64                   `json:"finalized_through"`
+	NextHour          int64                   `json:"next_hour"`
+	LastCompletedHour int64                   `json:"last_completed_hour"`
+	ExpectedHours     int64                   `json:"expected_hours"`
+	CompletedHours    int64                   `json:"completed_hours"`
+	ProgressPercent   float64                 `json:"progress_percent"`
+	GiftRecipients    int64                   `json:"gift_recipients"`
+	FailureStreak     int64                   `json:"failure_streak"`
+	LastError         string                  `json:"last_error,omitempty"`
+	LastAttemptAt     int64                   `json:"last_attempt_at"`
+	LastSuccessAt     int64                   `json:"last_success_at"`
+	UpdatedAt         int64                   `json:"updated_at"`
 }
 
 // FinanceFactBackfillResult is the bounded maintenance-command result. It
@@ -174,7 +175,8 @@ func (m *Monitor) financeFactsSyncEnabled() bool {
 // Reading it never claims a source lease, advances the cursor or queries
 // NewAPI.
 func (m *Monitor) financeFactSyncStatus(ctx context.Context, now time.Time) (syncFinanceStatus, error) {
-	status := syncFinanceStatus{Enabled: m.cfg.FinanceFactsSyncEnabled, ReportEnabled: m.cfg.FinanceEnabled}
+	status := syncFinanceStatus{Enabled: m.cfg.FinanceFactsSyncEnabled, ReportEnabled: m.cfg.FinanceEnabled, ReportRefresh: m.financeAsyncQueue.stats()}
+	status.ReportRefresh.Enabled = m.cfg.FinanceFastSnapshotEnabled
 	startDate := strings.TrimSpace(m.cfg.FinanceStartDate)
 	if startDate == "" {
 		startDate = "2026-05-01"

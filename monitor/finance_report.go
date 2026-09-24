@@ -3264,7 +3264,7 @@ func (m *Monitor) serveFinanceOperatingReport(c *gin.Context) {
 		c.JSON(http.StatusOK, report)
 		return
 	}
-	if c.Query("fresh") == "1" {
+	if c.Query("fresh") == "1" && !m.cfg.FinanceFastSnapshotEnabled {
 		ctx = context.WithValue(ctx, financeForceRebuildKey{}, true)
 	}
 	to, snapshotAsOf, snapshotClamped, err := m.clampFinanceRangeToLocalSnapshot(ctx, to)
@@ -3283,13 +3283,10 @@ func (m *Monitor) serveFinanceOperatingReport(c *gin.Context) {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "经营核算报表暂不可用", "detail": configErr.Error()})
 		return
 	}
-	if c.Query("fresh") != "1" {
+	if m.cfg.FinanceFastSnapshotEnabled {
 		fastRequest := financeReportRequest{from: from, to: to, snapshotAsOf: snapshotAsOf, snapshotClamped: snapshotClamped, configurationHash: configurationHash}
-		if payload, status, ok := m.financeFastSnapshotPayload(fastRequest, time.Now()); ok {
-			c.Header("X-Monitor-Finance-Cache", status)
-			c.Data(http.StatusOK, "application/json; charset=utf-8", payload)
-			return
-		}
+		m.serveFinanceQueuedReport(c, fastRequest)
+		return
 	}
 	fingerprintStarted := time.Now()
 	sourceFingerprint, fingerprintErr := m.financeReportSourceFingerprint(ctx, from.Unix(), to.Unix())

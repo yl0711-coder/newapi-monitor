@@ -127,7 +127,45 @@ test('fast finance snapshot is visibly provisional and polls at low frequency',(
   for(let n=0;n<3;n++)api.scheduleStaleRefresh();
   assert.deepEqual(timers.map(t=>t.delay),[30000,30000,30000]);
   assert.equal(api.state.refreshAttempts,0);
-  assert.match(api.financeCacheRefreshNote({_cache_status:'fast-snapshot-stale'}),/已核验快照.*核对事实版本/);
+  assert.match(api.financeCacheRefreshNote({_cache_status:'fast-snapshot-stale'}),/正在后台更新/);
+  assert.match(api.financeCacheRefreshNote({_cache_status:'fast-snapshot-stale',_update_state:'failed'}),/更新失败.*保留上次结果/);
+});
+
+test('queued response hides earlier money and retries without rendering zero values',async()=>{
+  const {api,element,timers}=fixture(async()=>({status:202,ok:true,json:async()=>({status:'queued',message:'报表正在后台生成'})}));
+  element('finPeriodRows').innerHTML='old month';
+  api.state.loaded=true;api.state.renderedQuery='from=2026-05-01';
+  element('finFrom').value='2026-06-01';
+  await api.load();
+  assert.equal(element('finReportContent').hidden,true);
+  assert.equal(api.state.loaded,false);
+  assert.equal(api.state.pending,true);
+  assert.match(element('finStatus').innerHTML,/后台生成/);
+  assert.equal(timers[0].delay,5000);
+  assert.equal(element('finPeriodRows').innerHTML,'old month'); // hidden, not relabeled as the new month
+});
+
+test('late JSON from an older date query cannot overwrite current pending state',async()=>{
+  let resolveOld;
+  let entered;
+  const firstJSON = new Promise(resolve=>{entered=resolve;});
+  let calls=0;
+  const {api,element}=fixture(async()=>({status:202,ok:true,json:()=>++calls===1?new Promise(resolve=>{resolveOld=resolve;entered();}):Promise.resolve({message:'new range'})}));
+  const old=api.load();
+  await firstJSON;
+  element('finFrom').value='2026-06-01';
+  await api.load();
+  resolveOld({message:'old range'});
+  await old;
+  assert.match(element('finStatus').innerHTML,/new range/);
+  assert.doesNotMatch(element('finStatus').innerHTML,/old range/);
+});
+
+test('failed fast snapshot refreshes have a bounded retry budget',()=>{
+  const {api,timers}=fixture();
+  api.state.stale=true;api.state.cacheStatus='fast-snapshot-stale';api.state.updateState='failed';
+  for(let i=0;i<10;i++)api.scheduleStaleRefresh();
+  assert.equal(timers.length,5);
 });
 
 test('prior-range finance snapshot is never presented as the current interval',()=>{

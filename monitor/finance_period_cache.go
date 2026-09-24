@@ -235,8 +235,7 @@ func (m *Monitor) loadFinancePeriodSnapshot(logicalKey, fingerprint string) ([]b
 	if err != nil {
 		return nil, false, err
 	}
-	m.financeSnapshotWriteMu.RLock()
-	defer m.financeSnapshotWriteMu.RUnlock()
+	// Atomic rename publishes a complete envelope; do not wait for file sync.
 	info, err := os.Stat(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, false, nil

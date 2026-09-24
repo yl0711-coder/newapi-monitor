@@ -162,7 +162,7 @@ type Monitor struct {
 	// A moving source fingerprint must not spawn concurrent full-report scans
 	// while stale snapshots are being polled by multiple browsers.
 	financeReportRefreshRunning atomic.Bool
-	financeFastRefreshAfter     atomic.Int64 // UnixNano; limits exact-fingerprint rebuilds caused by repeated snapshot reads
+	financeAsyncQueue           financeReportQueue
 	financeSnapshotWriteMu      sync.RWMutex
 	financePeriodCacheOnce      sync.Once
 	financePeriodCache          *boundedByteCache
@@ -865,6 +865,13 @@ func (m *Monitor) Close() {
 	m.closeOnce.Do(func() {
 		m.shuttingDown.Store(true)
 		close(m.shutdownSignal())
+		financeStopCtx, financeStopCancel := context.WithTimeout(context.Background(), financeReportBuildTimeout+5*time.Second)
+		financeStopped := m.financeAsyncQueue.shutdown(financeStopCtx)
+		financeStopCancel()
+		if !financeStopped {
+			slog.Error("经营核算任务未按时退出，保留数据库连接等待进程退出")
+			return
+		}
 		if !m.stopAndWaitSource() {
 			// 有缺陷的 worker 忽略 cancel 时，不关闭它仍可能读写的
 			// DB/HTTP 对象，也不释放 lease。容器将在 stop grace 内退出，

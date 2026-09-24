@@ -4,6 +4,7 @@
   const state = {
     inited: false, loaded: false, abort: null, chart: null,
     stale: false, refreshTimer: null, refreshAttempts: 0,
+    pending: false, requestSequence: 0, renderedQuery: null, updateState: '', refreshFailures: 0,
   };
   const $ = (id) => document.getElementById(id);
   const esc = (value) => String(value == null ? '' : value).replace(/[&<>"']/g, (char) => ({
@@ -335,7 +336,16 @@
     if (!state.stale || $('tab-finance')?.hidden) return;
     // Fast snapshots intentionally skip the expensive fingerprint on this
     // request. Poll gently while the server verifies it in the background.
-    if (String(state.cacheStatus || '').startsWith('fast-snapshot-')) {
+    if (state.pending) {
+      if (state.refreshAttempts >= 12) {
+        $('finStatus').textContent = '报表尚未生成完成，已停止自动等待；请稍后点击刷新。详情见数据同步状态。';
+        return;
+      }
+      state.refreshAttempts += 1;
+      state.refreshTimer = setTimeout(() => load(false, true), Math.min(30000, 5000 * state.refreshAttempts));
+      return;
+    }
+    if (String(state.cacheStatus || '').startsWith('fast-snapshot-') && state.updateState !== 'failed' && !state.refreshFailures) {
       state.refreshTimer = setTimeout(() => load(false, true), 30000);
       return;
     }
@@ -410,6 +420,7 @@
       if (!response.ok) throw new Error(data.detail || data.error || `HTTP ${response.status}`);
       if (note) note.textContent = data.unchanged ? '配置未变更。' : '已保存；历史用量将在后台以只读方式回填，未补齐前报表不会假装成本已完整。';
       await loadInternalAccounts();
+      state.renderedQuery = null;
       await load(true);
     } catch (error) {
       if (note) note.textContent = `保存失败：${error.message}`;
@@ -438,37 +449,66 @@
     if (!background) state.refreshAttempts = 0;
     if (state.abort) state.abort.abort();
     state.abort = new AbortController();
+    const controller = state.abort;
+    const sequence = ++state.requestSequence;
     const button = $('finRefresh');
     if (button && !background) { button.disabled = true; button.textContent = '读取中'; }
     const query = new URLSearchParams();
     if ($('finFrom')?.value) query.set('from', $('finFrom').value);
     if ($('finTo')?.value) query.set('to', $('finTo').value);
+    const queryKey = query.toString();
+    const hasPrevious = state.loaded && state.renderedQuery === queryKey;
+    if (!hasPrevious && $('finReportContent')) $('finReportContent').hidden = true;
     if (forceFresh) query.set('fresh', '1');
     try {
       const response = await fetch(`/finance/report${query.size ? `?${query}` : ''}`, {
-        headers: { Accept: 'application/json' }, signal: state.abort.signal,
+        headers: { Accept: 'application/json' }, signal: controller.signal,
       });
+      if (sequence !== state.requestSequence || controller.signal.aborted) return;
       if (response.status === 401) { location.href = '/login'; return; }
       const data = await response.json();
+      if (sequence !== state.requestSequence || controller.signal.aborted) return;
+      if (response.status === 202) {
+        state.pending = true;
+        state.stale = true;
+        state.loaded = false;
+        if ($('finReportContent')) $('finReportContent').hidden = true;
+        const status = $('finStatus');
+        status.className = 'fin-status';
+        status.innerHTML = `<i></i><div><b>${esc(data.message || '报表正在生成')}</b><br>完成后自动显示，尚未生成的金额不会显示为 0。</div>`;
+        scheduleStaleRefresh();
+        return;
+      }
       if (!response.ok) throw new Error(data.detail || data.error || `HTTP ${response.status}`);
+      if (!data || typeof data !== 'object' || typeof data.enabled !== 'boolean') throw new Error('报表响应无效，请稍后重试');
       data._cache_status = response.headers.get('X-Monitor-Finance-Cache') || '';
+      data._update_state = response.headers.get('X-Monitor-Finance-Update') || '';
+      state.updateState = data._update_state;
+      state.pending = false;
+      state.refreshFailures = 0;
+      state.renderedQuery = queryKey;
       state.cacheStatus = data._cache_status;
       state.loaded = true;
       state.stale = String(data._cache_status).includes('stale');
       if (!state.stale) state.refreshAttempts = 0;
       render(data);
+      if ($('finReportContent')) $('finReportContent').hidden = false;
       scheduleStaleRefresh();
     } catch (error) {
+      if (sequence !== state.requestSequence || controller.signal.aborted) return;
       if (error.name !== 'AbortError') {
-        if (background && state.stale) {
+        state.refreshFailures += 1;
+        if ((background && state.stale && !state.pending) || hasPrevious) {
+          state.stale = true;
           const note = $('finCacheUpdate');
           if (note) note.textContent = ` · 更新失败，已保留上次结果：${String(error.message).slice(0, 160)}`;
+          else { $('finStatus').className = 'fin-status'; $('finStatus').textContent = '更新失败，已保留上次结果；请稍后刷新。'; }
           scheduleStaleRefresh();
         }
         else renderError(error.message);
       }
     } finally {
-      if (button && !background) { button.disabled = false; button.textContent = '刷新'; }
+      if (button && !background && sequence === state.requestSequence) { button.disabled = false; button.textContent = '刷新'; }
     }
   }
 
@@ -479,7 +519,10 @@
   function financeCacheRefreshNote(data) {
     const status=String(data._cache_status || '');
     if (status.startsWith('fast-snapshot-')) {
-      return '<span id="finCacheUpdate"> · 已核验快照；页面打开期间约每分钟核对事实版本，可点“刷新”立即核验</span>';
+      const note = data._update_state === 'failed' ? '更新失败，已保留上次结果；详情见数据同步状态'
+        : data._update_state === 'succeeded' ? '最近核验完成'
+          : data._update_state === 'busy' ? '更新任务繁忙，已保留上次结果' : '正在后台更新';
+      return `<span id="finCacheUpdate"> · ${note}</span>`;
     }
     if (financeIsPriorStale(data)) {
       return `<span id="finCacheUpdate"> · 仅显示截至 ${dateTime(data.to)} 的较早区间，当前区间后台补算中；请勿当作当前结果</span>`;
@@ -498,7 +541,7 @@
     status.className = `fin-status ${!enabled ? 'bad' : !state.stale && complete ? 'ok' : ''}`;
     const summary = !enabled ? '经营核算功能尚未开启'
       : priorStale ? '较早区间快照，当前区间正在补算'
-        : state.stale ? '已核验快照，正在核对最新事实'
+        : state.stale ? (data._update_state === 'succeeded' ? '已核验报表，金额按下方数据时间展示' : '已核验快照，正在核对最新事实')
         : complete ? '当前区间经营收入与上游成本证据完整'
         : baseComplete ? '用量与上游成本完整，注册赠送证据仍待补齐'
           : data.user_coverage?.complete ? '用户用量完整，部分上游成本仍待补证'
