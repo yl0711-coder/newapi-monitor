@@ -198,18 +198,18 @@ func (m *Monitor) loadFinanceGiftAllocationForScope(ctx context.Context, seedFro
 		return result, nil
 	}
 
-	events, err := loadFinanceGiftBoundaryEvents(ctx, db, seedFrom, to, users)
-	if err != nil {
-		return result, err
-	}
 	eventsByKey := make(map[financeGiftUserHourKey][]FinanceGiftBoundaryEvent, len(required))
-	for _, event := range events {
+	err = walkFinanceGiftBoundaryEvents(ctx, db, seedFrom, to, users, func(event FinanceGiftBoundaryEvent) error {
 		key := financeGiftUserHourKey{HourTs: event.HourTs, UserID: event.UserID}
 		state, needed := stateByKey[key]
 		if !needed || event.SourceEpoch != state.SourceEpoch || event.EvidenceHash != financeGiftBoundaryEventHash(event) {
-			continue
+			return nil
 		}
 		eventsByKey[key] = append(eventsByKey[key], event)
+		return nil
+	})
+	if err != nil {
+		return result, err
 	}
 	firstScopeGap := to
 	for key, state := range stateByKey {
@@ -348,24 +348,6 @@ func loadFinanceGiftBoundaryStates(ctx context.Context, db *gorm.DB, from, to in
 		if err := db.WithContext(ctx).Where("hour_ts>=? AND hour_ts<? AND user_id IN ?", from, to, users[start:end]).
 			Order("hour_ts,user_id").Find(&rows).Error; err != nil {
 			return nil, fmt.Errorf("read gift boundary proofs: %w", err)
-		}
-		result = append(result, rows...)
-	}
-	return result, nil
-}
-
-func loadFinanceGiftBoundaryEvents(ctx context.Context, db *gorm.DB, from, to int64, users []int64) ([]FinanceGiftBoundaryEvent, error) {
-	var result []FinanceGiftBoundaryEvent
-	for start := 0; start < len(users); start += financeGiftUserQueryChunk {
-		end := min(len(users), start+financeGiftUserQueryChunk)
-		var rows []FinanceGiftBoundaryEvent
-		// The proof hash sorts events within each user-hour and the allocator
-		// sorts its ledger independently. A global event-time ORDER BY does not
-		// affect either result, but forces SQLite to materialize and sort the
-		// entire historical gift-event set before the report can proceed.
-		if err := db.WithContext(ctx).Where("hour_ts>=? AND hour_ts<? AND user_id IN ?", from, to, users[start:end]).
-			Find(&rows).Error; err != nil {
-			return nil, fmt.Errorf("read gift boundary events: %w", err)
 		}
 		result = append(result, rows...)
 	}

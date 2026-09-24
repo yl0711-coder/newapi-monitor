@@ -92,12 +92,12 @@ func TestFinancePricingProofSurvivesSubrangeAndInvalidatesCache(t *testing.T) {
 	if err != nil || len(part.Events) != 1 || part.Events[0].FinanceVersion != 7 {
 		t.Fatalf("lost historical pricing: %+v %v", part.Events, err)
 	}
-	before, err := financePeriodInputFingerprint(nil, channelFinanceSnapshot{}, financeConfiguredInternalEvidence{}, part, nil)
+	before, err := financePeriodInputFingerprint(nil, channelFinanceSnapshot{}, financeConfiguredInternalEvidence{}, part, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	part.Events[0].FinanceVersion++
-	after, err := financePeriodInputFingerprint(nil, channelFinanceSnapshot{}, financeConfiguredInternalEvidence{}, part, nil)
+	after, err := financePeriodInputFingerprint(nil, channelFinanceSnapshot{}, financeConfiguredInternalEvidence{}, part, nil, nil)
 	if err != nil || before == after {
 		t.Fatal("changed publication pricing reused cached input")
 	}

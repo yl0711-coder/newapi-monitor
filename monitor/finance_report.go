@@ -1555,11 +1555,15 @@ func (m *Monitor) loadFinanceDailyUserFacts(ctx context.Context, scope stability
 }
 
 func (m *Monitor) buildFinanceDailyViews(ctx context.Context, scope stabilityScope, now int64, internalTestCost financeInternalTestCostEvidence, internalAccounts financeConfiguredInternalEvidence, businessGroups map[string]bool) ([]financeDailyView, error) {
+	return m.buildFinanceDailyViewsWithLedger(ctx, scope, now, internalTestCost, internalAccounts, businessGroups, nil)
+}
+
+func (m *Monitor) buildFinanceDailyViewsWithLedger(ctx context.Context, scope stabilityScope, now int64, internalTestCost financeInternalTestCostEvidence, internalAccounts financeConfiguredInternalEvidence, businessGroups map[string]bool, sharedLedger *channelEconomicsReport) ([]financeDailyView, error) {
 	facts, coverages, err := m.loadFinanceDailyUserFacts(ctx, scope, now, internalAccounts, businessGroups)
 	if err != nil {
 		return nil, err
 	}
-	ledger, err := m.buildChannelEconomicsReportMode(ctx, scope, "", true)
+	ledger, err := m.financePeriodLedger(ctx, scope, sharedLedger)
 	if err != nil {
 		return nil, fmt.Errorf("读取每日已发布经济事实: %w", err)
 	}
@@ -2301,32 +2305,9 @@ func subtractFinanceInternalTestFromDetail(detail *financeCostDetailView, fact f
 // report permanently incomplete. Conversely, local activity before the first
 // upstream bucket remains an explicit, blocking coverage gap.
 func (m *Monitor) financeRelevantUpstreamAccounts(ctx context.Context, scope stabilityScope, accounts map[string]ChannelUpstreamAccountView) (map[string]ChannelUpstreamAccountView, error) {
-	type activityStart struct {
-		Domain  string
-		FirstTs int64
-	}
-	var starts []activityStart
-	query := `SELECT domain, MIN(hour_ts) first_ts FROM (
-		SELECT LOWER(COALESCE(NULLIF(TRIM(c.base_domain),''),'未配置/历史')) domain, s.hour_ts
-		FROM stability_hour_samples s JOIN channel_snaps c ON c.id=s.channel_id
-		WHERE s.traffic_class_version=? AND (s.success+s.anomaly+s.failed<>0 OR s.quota<>0 OR s.refund_quota<>0)
-		UNION ALL
-		SELECT LOWER(COALESCE(NULLIF(TRIM(c.base_domain),''),'未配置/历史')) domain, t.hour_ts
-		FROM channel_test_hour_samples t JOIN channel_snaps c ON c.id=t.channel_id
-		WHERE t.traffic_class_version=? AND (t.requests<>0 OR t.quota<>0)
-		UNION ALL
-		SELECT LOWER(TRIM(domain)) domain, hour_ts FROM channel_upstream_usage_hours
-		WHERE requests<>0 OR tokens<>0 OR quota<>0 OR cost_usd<>0
-	) activity WHERE hour_ts<? GROUP BY domain`
-	if err := m.storeDB.WithContext(ctx).Raw(query, stabilityTrafficClassificationVersion, stabilityTrafficClassificationVersion, scope.ToTs).Scan(&starts).Error; err != nil {
-		return nil, fmt.Errorf("读取上游经营生效边界: %w", err)
-	}
-	firstByDomain := make(map[string]int64, len(starts))
-	for _, row := range starts {
-		domain := strings.ToLower(strings.TrimSpace(row.Domain))
-		if domain != "" && row.FirstTs >= 0 {
-			firstByDomain[domain] = row.FirstTs
-		}
+	firstByDomain, err := m.loadFinanceUpstreamActivityStarts(ctx, scope.ToTs)
+	if err != nil {
+		return nil, err
 	}
 	relevant := make(map[string]ChannelUpstreamAccountView, len(accounts))
 	for domain, account := range accounts {
@@ -2353,11 +2334,16 @@ func (m *Monitor) financeRelevantUpstreamAccounts(ctx context.Context, scope sta
 }
 
 func (m *Monitor) loadFinanceUpstreamFacts(ctx context.Context, scope stabilityScope, now int64, accounts map[string]ChannelUpstreamAccountView, finance channelFinanceSnapshot, userByDomain map[string]financeDomainUserFact) (channelEconomicsMoneyView, *channelEconomicsMoneyView, channelEconomicsMoneyView, *channelEconomicsMoneyView, financeUpstreamCoverageView, []financeCostDetailView, error) {
-	financeAccounts, err := m.financeRelevantUpstreamAccounts(ctx, scope, accounts)
+	return m.loadFinanceUpstreamFactsWithSources(ctx, scope, now, accounts, finance, userByDomain, financePeriodSources{})
+}
+
+func (m *Monitor) loadFinanceUpstreamFactsWithSources(ctx context.Context, scope stabilityScope, now int64, accounts map[string]ChannelUpstreamAccountView, finance channelFinanceSnapshot, userByDomain map[string]financeDomainUserFact, sources financePeriodSources) (channelEconomicsMoneyView, *channelEconomicsMoneyView, channelEconomicsMoneyView, *channelEconomicsMoneyView, financeUpstreamCoverageView, []financeCostDetailView, error) {
+	inputs, err := m.financePeriodBills(ctx, scope, accounts, finance, sources.bills)
 	if err != nil {
 		return channelEconomicsMoneyView{}, nil, channelEconomicsMoneyView{}, nil, financeUpstreamCoverageView{}, nil, err
 	}
-	usage, rawBills, err := m.loadFinanceBillWindow(ctx, scope, now, financeAccounts, finance)
+	financeAccounts := inputs.accounts
+	usage, rawBills, err := inputs.window(scope, now, financeAccounts)
 	if err != nil {
 		return channelEconomicsMoneyView{}, nil, channelEconomicsMoneyView{}, nil, financeUpstreamCoverageView{}, nil, fmt.Errorf("读取上游账单小时事实: %w", err)
 	}
@@ -2380,7 +2366,7 @@ func (m *Monitor) loadFinanceUpstreamFacts(ctx context.Context, scope stabilityS
 	closedDayScope := financeClosedNaturalDayScope(scope, now)
 	if len(dailyAccounts) > 0 && closedDayScope.FromTs < closedDayScope.ToTs &&
 		(closedDayScope.FromTs != scope.FromTs || closedDayScope.ToTs != scope.ToTs) {
-		dailyUsage, dailyBills, dailyErr := m.loadFinanceBillWindow(ctx, closedDayScope, now, dailyAccounts, finance)
+		dailyUsage, dailyBills, dailyErr := inputs.window(closedDayScope, now, dailyAccounts)
 		if dailyErr != nil {
 			return channelEconomicsMoneyView{}, nil, channelEconomicsMoneyView{}, nil, financeUpstreamCoverageView{}, nil, fmt.Errorf("读取上游自然日账单事实: %w", dailyErr)
 		}
@@ -2395,7 +2381,7 @@ func (m *Monitor) loadFinanceUpstreamFacts(ctx context.Context, scope stabilityS
 			}
 		}
 	}
-	ledger, err := m.buildChannelEconomicsReportMode(ctx, scope, "", true)
+	ledger, err := m.financePeriodLedger(ctx, scope, sources.ledger)
 	if err != nil {
 		return channelEconomicsMoneyView{}, nil, channelEconomicsMoneyView{}, nil, financeUpstreamCoverageView{}, nil, fmt.Errorf("读取已发布经济事实: %w", err)
 	}
@@ -2556,11 +2542,15 @@ func (m *Monitor) loadFinanceUpstreamFacts(ctx context.Context, scope stabilityS
 }
 
 func (m *Monitor) buildFinancePeriod(ctx context.Context, scope stabilityScope, now int64, accounts map[string]ChannelUpstreamAccountView, finance channelFinanceSnapshot, internalTestCost financeInternalTestCostEvidence, internalAccounts financeConfiguredInternalEvidence, businessGroups map[string]bool) (financeStatementView, StabilityDataCoverage, financeUpstreamCoverageView, []financeCostDetailView, error) {
+	return m.buildFinancePeriodWithSources(ctx, scope, now, accounts, finance, internalTestCost, internalAccounts, businessGroups, financePeriodSources{})
+}
+
+func (m *Monitor) buildFinancePeriodWithSources(ctx context.Context, scope stabilityScope, now int64, accounts map[string]ChannelUpstreamAccountView, finance channelFinanceSnapshot, internalTestCost financeInternalTestCostEvidence, internalAccounts financeConfiguredInternalEvidence, businessGroups map[string]bool, sources financePeriodSources) (financeStatementView, StabilityDataCoverage, financeUpstreamCoverageView, []financeCostDetailView, error) {
 	statement, userCoverage, userByDomain, err := m.loadFinanceUserFacts(ctx, scope, now, internalAccounts, businessGroups)
 	if err != nil {
 		return financeStatementView{}, StabilityDataCoverage{}, financeUpstreamCoverageView{}, nil, err
 	}
-	knownBilled, billed, knownCorrected, corrected, upstreamCoverage, details, err := m.loadFinanceUpstreamFacts(ctx, scope, now, accounts, finance, userByDomain)
+	knownBilled, billed, knownCorrected, corrected, upstreamCoverage, details, err := m.loadFinanceUpstreamFactsWithSources(ctx, scope, now, accounts, finance, userByDomain, sources)
 	if err != nil {
 		return financeStatementView{}, StabilityDataCoverage{}, financeUpstreamCoverageView{}, nil, err
 	}

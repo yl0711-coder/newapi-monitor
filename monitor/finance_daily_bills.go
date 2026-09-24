@@ -35,11 +35,11 @@ type financeDailyRechargeCorrection struct {
 }
 
 func (m *Monitor) loadFinanceDailyBills(ctx context.Context, scope stabilityScope, now int64, accounts map[string]ChannelUpstreamAccountView, finance channelFinanceSnapshot, correctionDomains map[string]bool) (map[int64]financeDailyBill, error) {
-	relevant, err := m.financeRelevantUpstreamAccounts(ctx, scope, accounts)
-	if err != nil {
-		return nil, err
-	}
-	rows, err := m.loadChannelUpstreamUsageRows(ctx, scope)
+	return m.loadFinanceDailyBillsWithInputs(ctx, scope, now, accounts, finance, correctionDomains, nil)
+}
+
+func (m *Monitor) loadFinanceDailyBillsWithInputs(ctx context.Context, scope stabilityScope, now int64, accounts map[string]ChannelUpstreamAccountView, finance channelFinanceSnapshot, correctionDomains map[string]bool, shared *financeBillInputs) (map[int64]financeDailyBill, error) {
+	inputs, err := m.financePeriodBills(ctx, scope, accounts, finance, shared)
 	if err != nil {
 		return nil, err
 	}
@@ -47,11 +47,7 @@ func (m *Monitor) loadFinanceDailyBills(ctx context.Context, scope stabilityScop
 	if err != nil {
 		return nil, err
 	}
-	versions, err := m.loadChannelRechargeVersions(ctx, relevant, finance)
-	if err != nil {
-		return nil, err
-	}
-	return projectFinanceDailyBills(rows, scope, now, relevant, unavailable, versions, correctionDomains)
+	return projectFinanceDailyBills(inputs.rows, scope, now, inputs.accounts, unavailable, inputs.versions, correctionDomains)
 }
 
 func (m *Monitor) loadFinanceDailyUnconfiguredActivity(ctx context.Context, scope stabilityScope, accounts map[string]ChannelUpstreamAccountView) (map[int64]map[string]bool, error) {

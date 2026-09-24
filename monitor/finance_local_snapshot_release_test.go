@@ -7,12 +7,49 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/glebarez/sqlite"
 	"gorm.io/gorm"
+	"gorm.io/gorm/logger"
 )
+
+// Counts statements without logging SQL text or private accounting values.
+type financeAcceptanceSQLCounter struct {
+	logger.Interface
+	queries       atomic.Int64
+	ledgerScans   atomic.Int64
+	billScans     atomic.Int64
+	activityScans atomic.Int64
+	rechargeReads atomic.Int64
+	elapsedNanos  atomic.Int64
+	activityNanos atomic.Int64
+	billNanos     atomic.Int64
+}
+
+func (c *financeAcceptanceSQLCounter) Trace(_ context.Context, started time.Time, query func() (string, int64), _ error) {
+	c.queries.Add(1)
+	elapsed := time.Since(started).Nanoseconds()
+	c.elapsedNanos.Add(elapsed)
+	sql, _ := query()
+	if strings.Contains(sql, "SELECT p.publication_id,p.domain,p.account_epoch,p.hour_ts") {
+		c.ledgerScans.Add(1)
+	}
+	if strings.Contains(sql, "ORDER BY domain ASC,hour_ts ASC") {
+		c.billScans.Add(1)
+		c.billNanos.Add(elapsed)
+	}
+	if strings.Contains(sql, "SELECT domain, MIN(hour_ts) first_ts") {
+		c.activityScans.Add(1)
+		c.activityNanos.Add(elapsed)
+	}
+	if strings.Contains(sql, "FROM `channel_finance_versions`") && strings.Contains(sql, "domain IN") {
+		c.rechargeReads.Add(1)
+	}
+}
 
 // Opt-in release acceptance against a copied, closed production snapshot.
 // Both SQLite handles are immutable/read-only; this test never connects to
@@ -118,6 +155,7 @@ func TestFinanceLocalSnapshotColdBuild(t *testing.T) {
 	if mainPath == "" || factsPath == "" {
 		t.Skip("requires closed local SQLite snapshots")
 	}
+	counter := &financeAcceptanceSQLCounter{Interface: logger.Default.LogMode(logger.Silent)}
 	openReadOnly := func(path string) *gorm.DB {
 		t.Helper()
 		path, err := filepath.Abs(path)
@@ -125,7 +163,10 @@ func TestFinanceLocalSnapshotColdBuild(t *testing.T) {
 			t.Fatal(err)
 		}
 		uri := (&url.URL{Scheme: "file", Path: path, RawQuery: "mode=ro&immutable=1"}).String()
-		db, err := gorm.Open(sqlite.Open(uri), &gorm.Config{})
+		if info, statErr := os.Stat(path + "-wal"); statErr == nil && info.Size() > 0 {
+			t.Fatal("requires a closed snapshot without nonempty WAL")
+		}
+		db, err := gorm.Open(sqlite.Open(uri), &gorm.Config{Logger: counter})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -163,11 +204,62 @@ func TestFinanceLocalSnapshotColdBuild(t *testing.T) {
 	}
 	t.Logf("local immutable finance source fingerprint: %s", time.Since(fingerprintStarted))
 	started := time.Now()
+	counter.queries.Store(0)
+	counter.ledgerScans.Store(0)
+	counter.billScans.Store(0)
+	counter.activityScans.Store(0)
+	counter.rechargeReads.Store(0)
+	counter.elapsedNanos.Store(0)
+	counter.activityNanos.Store(0)
+	counter.billNanos.Store(0)
 	report, err := m.buildFinanceOperatingReport(ctx, from, to)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Logf("local immutable finance cold build: %s; days=%d months=%d gift_unknown=%d", time.Since(started), len(report.Days), len(report.Periods), report.GiftCoverage.ScopeUnknownEvents)
+	t.Logf("cold build queries=%d ledger_scans=%d", counter.queries.Load(), counter.ledgerScans.Load())
+	t.Logf("cold build bill_scans=%d activity_checks=%d recharge_reads=%d", counter.billScans.Load(), counter.activityScans.Load(), counter.rechargeReads.Load())
+	t.Logf("cold build SQL trace elapsed=%s activity_elapsed=%s bill_open_elapsed=%s (Scan includes decoding; Rows excludes later cursor consumption)",
+		time.Duration(counter.elapsedNanos.Load()), time.Duration(counter.activityNanos.Load()), time.Duration(counter.billNanos.Load()))
+	if path := os.Getenv("MONITOR_FINANCE_COLD_BASELINE"); path != "" {
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var before financeOperatingReport
+		if err := json.Unmarshal(raw, &before); err != nil {
+			t.Fatal(err)
+		}
+		// Generation wall time is not a financial change. Compare all public
+		// fields, including missing amounts, costs and coverage, after JSON round-trip.
+		before.GeneratedAt = report.GeneratedAt
+		afterRaw, err := json.Marshal(report)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var after financeOperatingReport
+		if err := json.Unmarshal(afterRaw, &after); err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(before, after) {
+			t.Fatal("cold report differs from prior revision")
+		}
+	}
+	if path := os.Getenv("MONITOR_FINANCE_COLD_BASELINE_OUTPUT"); path != "" {
+		raw, err := json.Marshal(report)
+		if err != nil {
+			t.Fatal(err)
+		}
+		f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, writeErr := f.Write(raw)
+		closeErr := f.Close()
+		if writeErr != nil || closeErr != nil {
+			t.Fatalf("save local baseline: %v %v", writeErr, closeErr)
+		}
+	}
 	// The only writes in this opt-in test go to a new temporary snapshot cache,
 	// never to the immutable source databases. Compare the complete real-sized
 	// payload byte-for-byte after taking the fast display path.

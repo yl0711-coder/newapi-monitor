@@ -38,7 +38,11 @@ func TestFinanceGiftBoundaryReadPreservesOrderIndependentProof(t *testing.T) {
 	if err := db.Create(&events).Error; err != nil {
 		t.Fatal(err)
 	}
-	loaded, err := loadFinanceGiftBoundaryEvents(context.Background(), db, 3600, 7200, []int64{7})
+	var loaded []FinanceGiftBoundaryEvent
+	err := walkFinanceGiftBoundaryEvents(context.Background(), db, 3600, 7200, []int64{7}, func(event FinanceGiftBoundaryEvent) error {
+		loaded = append(loaded, event)
+		return nil
+	})
 	if err != nil {
 		t.Fatal(err)
 	}

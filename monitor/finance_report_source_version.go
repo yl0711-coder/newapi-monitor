@@ -92,6 +92,19 @@ func (m *Monitor) financeReportSourceFingerprintForScope(ctx context.Context, fr
 			_, _ = fmt.Fprintf(hash, "channel-domain|%d|%q\n", row.ID, row.BaseDomain)
 		}
 	}
+	if includeCUR {
+		// Coverage in a selected month also depends on whether each upstream
+		// was active BEFORE that month. Without this dependency an unchanged
+		// full-report cache can hide a gap revealed by historical backfill.
+		starts, err := m.loadFinanceUpstreamActivityStarts(ctx, to)
+		if err != nil {
+			return "", err
+		}
+		_, _ = hash.Write([]byte("upstream-activity-starts|"))
+		if err := json.NewEncoder(hash).Encode(starts); err != nil {
+			return "", err
+		}
+	}
 
 	mainAggregates := []struct {
 		label string

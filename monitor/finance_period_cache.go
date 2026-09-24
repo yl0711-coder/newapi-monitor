@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"os"
 	"path/filepath"
 	"sort"
@@ -53,6 +54,7 @@ func financePeriodInputFingerprint(
 	internalAccounts financeConfiguredInternalEvidence,
 	internalCost financeInternalTestCostEvidence,
 	businessGroups map[string]bool,
+	accountBoundaries map[string]int64,
 ) (string, error) {
 	accountRows := make([]financePeriodAccountInput, 0, len(accounts))
 	for domain, account := range accounts {
@@ -81,6 +83,7 @@ func financePeriodInputFingerprint(
 		InternalRows       []FinanceInternalAccountHourFact             `json:"internal_rows"`
 		InternalCost       financeInternalTestCostEvidence              `json:"internal_cost"`
 		BusinessGroups     map[string]bool                              `json:"business_groups"`
+		AccountBoundaries  map[string]int64                             `json:"account_boundaries"`
 	}{
 		Accounts: accountRows, Settings: finance.settings, HasSettings: finance.hasSettings,
 		SiteGroups: finance.siteGroups, DomainCosts: finance.domainCosts,
@@ -88,8 +91,9 @@ func financePeriodInputFingerprint(
 		ChannelCanonical: finance.channelCanonicalCost, ChannelConflicts: finance.channelCostConflict,
 		DomainVersions: finance.domainVersions, InternalAccountIDs: append([]int64(nil), internalAccounts.AccountIDs...),
 		InternalComplete: internalAccounts.Complete, InternalRows: internalAccounts.Rows, InternalCost: internalCost,
-		InternalScope:  internalAccounts.VerifiedScope,
-		BusinessGroups: businessGroups,
+		InternalScope:     internalAccounts.VerifiedScope,
+		BusinessGroups:    businessGroups,
+		AccountBoundaries: accountBoundaries,
 	}
 	sort.Slice(input.InternalAccountIDs, func(i, j int) bool { return input.InternalAccountIDs[i] < input.InternalAccountIDs[j] })
 	payload, err := json.Marshal(input)
@@ -115,6 +119,23 @@ func financePeriodLogicalKey(scope stabilityScope, configurationHash string) str
 	return fmt.Sprintf("v%d:%d:%d:%s", financePeriodCacheSchema, scope.FromTs, scope.ToTs, configurationHash)
 }
 
+// Reuse only within a single month build, never across requests or retries.
+// Both projections treat this report and its maps as read-only. Source-version
+// fences around the component and full report remain responsible for changes
+// committed while that build runs; reuse must not bypass those checks.
+func (m *Monitor) financePeriodLedger(ctx context.Context, scope stabilityScope, shared *channelEconomicsReport) (*channelEconomicsReport, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if shared == nil {
+		return m.buildChannelEconomicsReportMode(ctx, scope, "", true)
+	}
+	if shared.From != scope.FromTs || shared.To != scope.ToTs || shared.DomainFilter != "" || shared.SemanticsVersion != channelEconomicsSemanticsVersion {
+		return nil, errors.New("经营核算月度经济事实范围或版本不匹配")
+	}
+	return shared, nil
+}
+
 func (m *Monitor) buildFinancePeriodComponent(
 	ctx context.Context,
 	scope stabilityScope,
@@ -126,14 +147,30 @@ func (m *Monitor) buildFinancePeriodComponent(
 	internalAccounts financeConfiguredInternalEvidence,
 	businessGroups map[string]bool,
 ) (financePeriodComponent, bool, error) {
+	// A prior-month backfill may move an account's first activity earlier and
+	// reveal missing hours here without changing any in-range bucket. Resolve
+	// this dependency before a cache hit, and recheck it before publication.
+	relevant, err := m.financeRelevantUpstreamAccounts(ctx, scope, accounts)
+	if err != nil {
+		return financePeriodComponent{}, false, err
+	}
+	boundaries := financeBillAccountBoundaries(relevant)
 	build := func() (financePeriodComponent, error) {
-		statement, userCoverage, upstreamCoverage, details, err := m.buildFinancePeriod(
-			ctx, scope, now, accounts, finance, internalTestCost, internalAccounts, businessGroups,
+		ledger, err := m.financePeriodLedger(ctx, scope, nil)
+		if err != nil {
+			return financePeriodComponent{}, fmt.Errorf("读取月度已发布经济事实: %w", err)
+		}
+		billInputs, err := m.loadFinanceBillInputs(ctx, scope, relevant, finance)
+		if err != nil {
+			return financePeriodComponent{}, fmt.Errorf("读取月度上游账单输入: %w", err)
+		}
+		statement, userCoverage, upstreamCoverage, details, err := m.buildFinancePeriodWithSources(
+			ctx, scope, now, accounts, finance, internalTestCost, internalAccounts, businessGroups, financePeriodSources{ledger: ledger, bills: billInputs},
 		)
 		if err != nil {
 			return financePeriodComponent{}, err
 		}
-		days, err := m.buildFinanceDailyViews(ctx, scope, now, internalTestCost, internalAccounts, businessGroups)
+		days, err := m.buildFinanceDailyViewsWithLedger(ctx, scope, now, internalTestCost, internalAccounts, businessGroups, ledger)
 		if err != nil {
 			return financePeriodComponent{}, err
 		}
@@ -143,7 +180,7 @@ func (m *Monitor) buildFinancePeriodComponent(
 				correctionDomains[detail.Domain] = true
 			}
 		}
-		bills, err := m.loadFinanceDailyBills(ctx, scope, now, accounts, finance, correctionDomains)
+		bills, err := m.loadFinanceDailyBillsWithInputs(ctx, scope, now, accounts, finance, correctionDomains, billInputs)
 		if err != nil {
 			return financePeriodComponent{}, fmt.Errorf("读取每日上游账户账单: %w", err)
 		}
@@ -171,7 +208,7 @@ func (m *Monitor) buildFinancePeriodComponent(
 		component, buildErr := build()
 		return component, false, buildErr
 	}
-	inputFingerprint, err := financePeriodInputFingerprint(accounts, finance, internalAccounts, internalTestCost, businessGroups)
+	inputFingerprint, err := financePeriodInputFingerprint(accounts, finance, internalAccounts, internalTestCost, businessGroups, boundaries)
 	if err != nil {
 		component, buildErr := build()
 		return component, false, buildErr
@@ -206,6 +243,13 @@ func (m *Monitor) buildFinancePeriodComponent(
 		return financePeriodComponent{}, false, err
 	}
 	if currentFingerprint != fingerprint {
+		return financePeriodComponent{}, false, errFinanceFactsChanged
+	}
+	currentRelevant, err := m.financeRelevantUpstreamAccounts(ctx, scope, accounts)
+	if err != nil {
+		return financePeriodComponent{}, false, err
+	}
+	if !maps.Equal(boundaries, financeBillAccountBoundaries(currentRelevant)) {
 		return financePeriodComponent{}, false, errFinanceFactsChanged
 	}
 	payload, err := json.Marshal(component)
