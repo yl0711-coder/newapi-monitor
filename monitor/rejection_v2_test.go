@@ -86,6 +86,7 @@ func TestRejectV2RejectsPartialInvalidOversizeAndExpired(t *testing.T) {
 		"negative-user": strings.Replace(body, `"user_id":7`, `"user_id":-1`, 1),
 		"clip-model":    strings.Replace(body, `"model":"fixture"`, `"model":"`+strings.Repeat("m", 129)+`"`, 1),
 		"invalid-node":  rejectV2Body(t, "task/a", now),
+		"reserved-node": rejectV2Body(t, "cloudwatch-direct", now),
 		"expired":       rejectV2Body(t, "task-a", now-rejectionV2ReplaySeconds-1),
 		"future":        rejectV2Body(t, "task-a", now+300),
 		"trailing-json": body + `{}`,

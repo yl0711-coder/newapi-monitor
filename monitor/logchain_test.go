@@ -1375,9 +1375,35 @@ func TestLogChainNormalEndReasonsSharedBySQLAndTags(t *testing.T) {
 	if logChainIsNormalEndReason("brand_new_reason_v9") {
 		t.Error("未知取值必须算异常，否则 new-api 新增取值会被静默吞掉")
 	}
-	// client_gone 不在正常名单里：排障页要看它（客户的实际体验是"回答没出来"）。
+	// client_gone 不能塞进只看 end_reason 的正常名单：它还要结合输出量、耗时和
+	// error_count 判断。单独的枚举值既不等于正常，也不等于异常。
 	if logChainIsNormalEndReason("client_gone") {
-		t.Error("client_gone 必须算异常——排障页要的恰恰是它")
+		t.Error("client_gone 必须走带输出量和 3 秒边界的专用判据")
+	}
+}
+
+func TestLogChainClientGoneThreeSecondBoundary(t *testing.T) {
+	cases := []struct {
+		name       string
+		row        LogChainRow
+		benign     bool
+		actionable bool
+	}{
+		{"已有输出不论耗时都正常", LogChainRow{EndReason: "client_gone", CompletionTokens: 1, UseTime: 60}, true, false},
+		{"零输出恰好三秒正常", LogChainRow{EndReason: "client_gone", UseTime: 3}, true, false},
+		{"零输出超过三秒异常", LogChainRow{EndReason: "client_gone", UseTime: 4}, false, true},
+		{"非法负耗时不冒充快速取消", LogChainRow{EndReason: "client_gone", UseTime: -1}, false, true},
+		{"流内真错误优先", LogChainRow{EndReason: "client_gone", CompletionTokens: 1, UseTime: 1, StreamErrorCount: 1}, false, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := logChainIsBenignClientGone(tc.row); got != tc.benign {
+				t.Errorf("benign=%v want=%v", got, tc.benign)
+			}
+			if got := logChainIsActionableClientGone(tc.row); got != tc.actionable {
+				t.Errorf("actionable=%v want=%v", got, tc.actionable)
+			}
+		})
 	}
 }
 
@@ -1473,10 +1499,8 @@ func TestLogChainAnomalyTagsMatchSQL(t *testing.T) {
 	}{
 		{"正常结束不打标签", LogChainRow{Type: 2, ModelName: "gpt-4o", EndReason: "eof", CompletionTokens: 10}, 100, nil},
 		{"非流式无 stream_status", LogChainRow{Type: 2, ModelName: "gpt-4o", EndReason: "", CompletionTokens: 10}, 100, nil},
-		// 客户断连独立成档，标签是 client_gone 而非 stream。
-		// 2026-08-24 实测：当天 1594 条 client_gone 里 92% 已真交付内容，
-		// 与 timeout/panic 混在一档会让 25 条真故障被淹掉。
-		{"客户端断连独立成档", LogChainRow{Type: 2, ModelName: "gpt-4o", EndReason: "client_gone", CompletionTokens: 5}, 100, []string{"client_gone"}},
+		{"客户端断连已有输出算正常", LogChainRow{Type: 2, ModelName: "gpt-4o", EndReason: "client_gone", CompletionTokens: 5, UseTime: 60}, 100, nil},
+		{"客户端断连零输出三秒内算正常", LogChainRow{Type: 2, ModelName: "gpt-4o", EndReason: "client_gone", CompletionTokens: 0, UseTime: 3, RequestPath: "/v1/chat/completions"}, 100, nil},
 		// 断连且流内有错误计数 → 按流故障处理（真出过错比"客户走了"更要紧）。
 		{"断连但流内出过错按故障算", LogChainRow{Type: 2, ModelName: "gpt-4o", EndReason: "client_gone", StreamErrorCount: 1, CompletionTokens: 5}, 100, []string{"stream"}},
 		{"未见过的新取值也算流故障", LogChainRow{Type: 2, ModelName: "gpt-4o", EndReason: "brand_new_reason", CompletionTokens: 5}, 100, []string{"stream"}},
@@ -1488,7 +1512,7 @@ func TestLogChainAnomalyTagsMatchSQL(t *testing.T) {
 		{"订阅计费不算漏收", LogChainRow{Type: 2, ModelName: "gpt-4o", EndReason: "eof", CompletionTokens: 8, BillingSource: "subscription"}, 0, nil},
 		{"embedding 天然无输出不算异常", LogChainRow{Type: 2, ModelName: "text-embedding-3-small", EndReason: "eof", CompletionTokens: 0}, 100, nil},
 		{"rerank 同理", LogChainRow{Type: 2, ModelName: "bge-reranker-v2", EndReason: "eof", CompletionTokens: 0}, 100, nil},
-		{"可同时命中两类", LogChainRow{Type: 2, ModelName: "gpt-4o", EndReason: "client_gone", CompletionTokens: 0, RequestPath: "/v1/chat/completions"}, 100, []string{"client_gone", "billing_unpaid"}},
+		{"超过三秒可同时命中两类", LogChainRow{Type: 2, ModelName: "gpt-4o", EndReason: "client_gone", CompletionTokens: 0, UseTime: 4, RequestPath: "/v1/chat/completions"}, 100, []string{"client_gone", "billing_unpaid"}},
 		{"错误日志不打异常标签", LogChainRow{Type: 5, ModelName: "gpt-4o", EndReason: "client_gone"}, 0, nil},
 	}
 	for _, tc := range cases {

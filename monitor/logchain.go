@@ -139,23 +139,22 @@ const (
 	// 以及任何没见过的新取值。**不含 client_gone**——见 anomalyClientGone。
 	anomalyStream = "stream"
 
-	// anomalyClientGone 下游客户端主动断连，单独一档。
+	// anomalyClientGone 等待超过宽限时间、仍然零输出的下游断连，单独一档。
 	//
 	// 为什么从流异常里分出来：2026-08-24 生产实测当天 1594 条 client_gone 里
 	// **92%（1465 条）已经真交付了内容**（平均 324 输出 token）——客户拿到部分回答
 	// 后自己断开，这是下游行为，多数不是故障。把它和 timeout/panic 混在一档，
 	// 真正的流故障会被它淹掉（1594 : 25 的量级差）。
 	//
-	// 但它也不能直接丢掉：耗时长的 client_gone 可能是上游拖慢把客户等跑了，
-	// 那种根因在上游。数据上无法区分主动取消与被拖走，只能并排给出耗时让人判断。
+	// 2026-09-17 用户进一步明确：已经有输出，或零输出但 3 秒内主动取消，均按
+	// 正常请求处理；只有零输出且等待超过 3 秒的纯断连才进入异常排查。
 	anomalyClientGone = "client_gone"
 
 	anomalyBilling             = "billing"              // 消费异常（三个方向）
 	anomalyBillingUnpaid       = "billing_unpaid"       // 扣费未交付（客户亏）
 	anomalyUndeliveredUnbilled = "undelivered_unbilled" // 未交付且未扣费（稳定性 B2）
 	anomalyBillingFree         = "billing_free"         // 交付未扣费（我方亏）
-	// anomalyAll 全部异常：流故障 + 客户断连 + 消费异常。分档后它仍是三者的并集，
-	// 否则"全部异常"会漏掉刚拆出去的 client_gone。
+	// anomalyAll 全部异常：流故障 + 零输出慢断连 + 消费异常。
 	anomalyAll = "all"
 	// anomalyErrAnom = 错误(type=5) + 流异常 + 消费异常，即本页能查到的全部问题。
 	// 这是唯一跨 type 的取值，所以它不受"异常判据限定 type=2"那条冲突校验约束。
@@ -166,8 +165,7 @@ const (
 )
 
 // 排障页的异常判据。**不复用 expandAnomalyPredicates**：那套服务稳定性报表，
-// 故意排除了 client_gone（客户断连不算我方故障，否则客户关标签页会拉低渠道评分）。
-// 排障页要的恰恰是 client_gone——客户的实际体验是"回答没出来"。
+// 流故障故意排除了 client_gone；断连再结合输出量与 3 秒边界单独判断。
 // 改那套会让历史稳定性数据的判定标准变化，属破坏既有功能。
 //
 // 但**复用它的取值 SQL**（anomalyEndReasonSQL / anomalyErrCountSQL），
@@ -216,12 +214,44 @@ func logChainIsNormalEndReason(endReason string) bool {
 // 排除逻辑三处都要用它，散写会漂移。
 const logChainClientGoneEndReason = "client_gone"
 
-// logChainClientGoneSQL 客户断连判据。独立一档，不混进流故障。
+// logChainClientGoneNormalMaxSec 是零输出客户主动取消的正常宽限时间。
+// use_time 来自 NewAPI logs，单位为整秒。用户口径是“3 秒内正常、超过 3 秒异常”，
+// 所以边界值 3 必须属于正常侧。
+const logChainClientGoneNormalMaxSec int64 = 3
+
+// logChainClientGoneSQL 只判断原始结束原因；是否异常还要叠加输出量与 3 秒边界。
 //
 // 注意它**不看 error_count**：客户断连时流内可能没有任何错误，
 // 而 error_count > 0 属于真的流故障，归 logChainStreamAnomalySQL。
 func logChainClientGoneSQL() string {
 	return "(" + anomalyEndReasonSQL + " = '" + logChainClientGoneEndReason + "')"
+}
+
+// logChainBenignClientGoneSQL 返回不属于异常的纯客户取消：流内没有真实错误，且
+// 已经产出内容，或尚未产出但在 3 秒宽限内断开。后者还必须从零输出/计费异常中
+// 排除，否则会从“客户端断连”档移走后又以“未交付”标签绕回异常列表。
+func logChainBenignClientGoneSQL() string {
+	return "(" + logChainClientGoneSQL() + " AND " + anomalyErrCountSQL + " = 0 AND " +
+		"(completion_tokens > 0 OR (completion_tokens = 0 AND COALESCE(use_time,0) >= 0 AND COALESCE(use_time,0) <= " +
+		strconv.FormatInt(logChainClientGoneNormalMaxSec, 10) + ")))"
+}
+
+// logChainActionableClientGoneSQL 是排障页唯一保留的纯断连异常：零输出、无流内
+// 错误，且客户等待超过 3 秒后才断开。带 error_count 的行归真正的 stream 故障。
+func logChainActionableClientGoneSQL() string {
+	return "(" + logChainClientGoneSQL() + " AND " + anomalyErrCountSQL + " = 0 AND " +
+		"completion_tokens = 0 AND (COALESCE(use_time,0) < 0 OR COALESCE(use_time,0) > " +
+		strconv.FormatInt(logChainClientGoneNormalMaxSec, 10) + "))"
+}
+
+func logChainIsBenignClientGone(r LogChainRow) bool {
+	return r.EndReason == logChainClientGoneEndReason && r.StreamErrorCount == 0 &&
+		(r.CompletionTokens > 0 || (r.UseTime >= 0 && r.UseTime <= logChainClientGoneNormalMaxSec))
+}
+
+func logChainIsActionableClientGone(r LogChainRow) bool {
+	return r.EndReason == logChainClientGoneEndReason && r.StreamErrorCount == 0 &&
+		r.CompletionTokens == 0 && (r.UseTime < 0 || r.UseTime > logChainClientGoneNormalMaxSec)
 }
 
 // logChainStreamAnomalySQL 流**真的出故障**的判据：timeout / scanner_error / panic /
@@ -341,7 +371,7 @@ func logChainBillingFreeSQL() string {
 }
 
 // logChainAnomalyTags 标注这一行为什么被判为异常，可同时命中多类
-// （如 client_gone 且扣费未交付）。让每行自证，而不是让人对着结果猜口径。
+// （如零输出慢断连且扣费未交付）。让每行自证，而不是让人对着结果猜口径。
 //
 // 判据必须与 SQL 侧保持一致，否则会出现"筛出来了但没标签"或反之的矛盾结果。
 // 两处各写一份是有意的：SQL 在库里筛（不能把全部行捞回来再过滤），
@@ -352,13 +382,16 @@ func logChainAnomalyTags(r LogChainRow, quota int64) []string {
 	var tags []string
 	if r.Type == 2 {
 		switch {
-		// 客户断连单独一档。判定顺序：先认 client_gone，再判流故障——
+		// 零输出慢断连单独一档。判定顺序：先认 client_gone，再判流故障——
 		// 否则它会被下面那条排除法当成"未知取值"重新算进 stream，等于没拆。
 		//
 		// error_count > 0 时按流故障处理：那说明流内真的出过错，
 		// 不只是客户走了（一行可同时是断连与故障，此时以故障为准更要紧）。
-		case r.EndReason == logChainClientGoneEndReason && r.StreamErrorCount == 0:
+		case logChainIsActionableClientGone(r):
 			tags = append(tags, logChainClientGoneEndReason)
+		// 已有输出，或零输出但在 3 秒内断开的纯 client_gone 是正常取消。
+		// 必须显式接住；否则会落入下一条“未知 end_reason”排除法，被重新打成 stream。
+		case logChainIsBenignClientGone(r):
 		// 流真的出故障：正常名单与 client_gone 之外的取值，或流内有错误计数。
 		// 排除法保持不变——没见过的新取值仍落在这里。
 		case !logChainIsNormalEndReason(r.EndReason) || r.StreamErrorCount > 0:
@@ -377,9 +410,11 @@ func logChainAnomalyTags(r LogChainRow, quota int64) []string {
 		//
 		// billing_free 分支**不加**路径条件：它要求 completion_tokens > 0，
 		// 即已产出文本，端点必然是文本端点，加了是冗余且会与 SQL 侧不一致。
-		case quota > 0 && r.CompletionTokens == 0 && logChainIsTextCompletionPath(r.RequestPath):
+		case quota > 0 && r.CompletionTokens == 0 && logChainIsTextCompletionPath(r.RequestPath) &&
+			!logChainIsBenignClientGone(r):
 			tags = append(tags, "billing_unpaid") // 客户付了钱没拿到内容
-		case quota == 0 && r.CompletionTokens == 0 && logChainIsTextCompletionPath(r.RequestPath):
+		case quota == 0 && r.CompletionTokens == 0 && logChainIsTextCompletionPath(r.RequestPath) &&
+			!logChainIsBenignClientGone(r):
 			tags = append(tags, anomalyUndeliveredUnbilled) // 未交付也未扣费（稳定性 B2）
 		case quota == 0 && r.CompletionTokens > 0:
 			// 订阅计费的 quota 恒为 0，属正常，不算漏计费。
@@ -416,8 +451,7 @@ func logChainAnomalySQL(kind string) string {
 	streamWithType := "(type = 2 AND " + logChainStreamAnomalySQL() + ")"
 	// 客户断连同样限定 type=2：流结束状态只在消费日志上有意义。
 	// 且必须排除 error_count>0 的行——那些归流故障，否则两档会重叠、双重计数。
-	clientGoneWithType := "(type = 2 AND " + logChainClientGoneSQL() +
-		" AND " + anomalyErrCountSQL + " = 0)"
+	clientGoneWithType := "(type = 2 AND " + logChainActionableClientGoneSQL() + ")"
 	switch kind {
 	case anomalyStream:
 		return streamWithType
@@ -433,7 +467,7 @@ func logChainAnomalySQL(kind string) string {
 		return "(" + logChainBillingUnpaidSQL() + " OR " +
 			logChainUndeliveredUnbilledSQL() + " OR " + logChainBillingFreeSQL() + ")"
 	case anomalyAll:
-		// 拆档后 all 必须显式含 client_gone，否则"全部异常"会漏掉刚分出去的那一档。
+		// all 必须显式含零输出慢断连，否则“全部异常”会漏掉这一档。
 		return "(" + streamWithType + " OR " + clientGoneWithType + " OR " +
 			logChainBillingUnpaidSQL() + " OR " + logChainUndeliveredUnbilledSQL() +
 			" OR " + logChainBillingFreeSQL() + ")"
@@ -534,6 +568,7 @@ type LogChainRow struct {
 	Fault           string `json:"fault,omitempty"`
 	FaultConfidence string `json:"fault_confidence,omitempty"`
 	FaultWhy        string `json:"fault_why,omitempty"`
+	FaultReason     string `json:"fault_reason,omitempty"` // 给人直接看的大白话原因；原文和 FaultWhy 仍保留供复核
 
 	// EdgeEvidence 是 Nginx 入口层的短期旁路事实。它只通过本行已经存在的
 	// NewAPI Request ID 在内存中做 HMAC 后查询，不保存或再次回传任何 HMAC。
@@ -1315,6 +1350,82 @@ func (m *Monitor) queryLogChain(ctx context.Context, s logChainScope, domainChan
 		return nil, false, fmt.Errorf("等待日志查询槽位失败: %w", err)
 	}
 	defer m.releaseUsageDetailGate()
+	// 高频账号的长跨度查询若一次性命中大量 user_id 索引行，仍会在 filesort 上
+	// 跑满 8 秒。按 CST 自然日沿排序方向分片，取够一页立即停止；Request ID 已有
+	// 精确索引，不需要分片。整个过程仍只占同一个闸门且受原 15 秒总预算约束。
+	if logChainShouldSliceByDay(s) {
+		return m.queryLogChainByDay(cctx, s, domainChans)
+	}
+	return m.queryLogChainPage(cctx, s, domainChans)
+}
+
+func logChainShouldSliceByDay(s logChainScope) bool {
+	return s.UserID > 0 && s.RequestID == "" && logChainDaysSpanned(s.FromTs, s.ToTs) > 1
+}
+
+func (m *Monitor) queryLogChainByDay(ctx context.Context, s logChainScope, domainChans []int64) ([]LogChainRow, bool, error) {
+	slices := logChainDailySlices(s)
+	goal := s.Limit + 1
+	out := make([]LogChainRow, 0, goal)
+	for _, part := range slices {
+		need := goal - len(out)
+		if need <= 0 {
+			break
+		}
+		part.Limit = need
+		rows, partMore, err := m.queryLogChainPage(ctx, part, domainChans)
+		if err != nil {
+			return nil, false, err
+		}
+		out = append(out, rows...)
+		if partMore {
+			// 当前自然日内已经超过整页需要的数量，后续日期无需再查。
+			if len(out) > s.Limit {
+				return out[:s.Limit], true, nil
+			}
+			return out, true, nil
+		}
+	}
+	hasMore := len(out) > s.Limit
+	if hasMore {
+		out = out[:s.Limit]
+	}
+	return out, hasMore, nil
+}
+
+// logChainDailySlices 把范围切成互不重叠的 CST 自然日，并保持与页面排序同向。
+func logChainDailySlices(s logChainScope) []logChainScope {
+	if s.ToTs <= s.FromTs {
+		return nil
+	}
+	floorDay := func(ts int64) time.Time {
+		t := time.Unix(ts, 0).In(cstLocation)
+		return time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, cstLocation)
+	}
+	first, last := floorDay(s.FromTs), floorDay(s.ToTs-1)
+	var days []time.Time
+	for day := first; !day.After(last); day = day.AddDate(0, 0, 1) {
+		days = append(days, day)
+	}
+	if !s.Asc {
+		for i, j := 0, len(days)-1; i < j; i, j = i+1, j-1 {
+			days[i], days[j] = days[j], days[i]
+		}
+	}
+	parts := make([]logChainScope, 0, len(days))
+	for _, day := range days {
+		part := s
+		part.FromTs = max(s.FromTs, day.Unix())
+		part.ToTs = min(s.ToTs, day.AddDate(0, 0, 1).Unix())
+		if part.ToTs > part.FromTs {
+			parts = append(parts, part)
+		}
+	}
+	return parts
+}
+
+// queryLogChainPage 执行一个已经收窄的时间片；调用方负责闸门与总超时。
+func (m *Monitor) queryLogChainPage(ctx context.Context, s logChainScope, domainChans []int64) ([]LogChainRow, bool, error) {
 
 	// err_anom 走 UNION ALL 拆分，见 logChainSplitErrAnom 的说明。
 	splitWhere2, splitArgs2, split := logChainSplitErrAnom(s, domainChans)
@@ -1355,7 +1466,7 @@ func (m *Monitor) queryLogChain(ctx context.Context, s logChainScope, domainChan
 		q = "SELECT " + hint + cols + " FROM " + src + " WHERE " + where + " " + order + lim
 	}
 
-	rows, err := m.prodDB.QueryContext(cctx, q, args...)
+	rows, err := m.prodDB.QueryContext(ctx, q, args...)
 	if err != nil {
 		return nil, false, fmt.Errorf("排障日志查询失败: %w", err)
 	}
@@ -1409,8 +1520,8 @@ func (m *Monitor) queryLogChain(ctx context.Context, s logChainScope, domainChan
 		r.AnomalyTags = logChainAnomalyTags(r, quota)
 		// 归因必须在标签算完之后：异常行的责任方依赖标签种类
 		// （client_gone 与 stream 的归因逻辑完全不同）。
-		if f := logChainAttributeFault(r, r.AnomalyTags); f.Fault != "" {
-			r.Fault, r.FaultConfidence, r.FaultWhy = f.Fault, f.Confidence, f.Why
+		if f := logChainAttributeFaultWithEvidence(r, r.AnomalyTags); f.Fault != "" {
+			r.Fault, r.FaultConfidence, r.FaultWhy, r.FaultReason = f.Fault, f.Confidence, f.Why, f.Reason
 		}
 		out = append(out, r)
 	}
@@ -1526,8 +1637,21 @@ func (m *Monitor) attachNginxEvidence(ctx context.Context, rows []LogChainRow) e
 	if !hasClause {
 		return nil
 	}
+	// Keep only the newest row for each (key_id, oneapi_id_hmac) pair in SQL.
+	// A global LIMIT is unsafe: one request with repeated retries could consume
+	// the limit and hide the evidence for every later request on the page.
+	// The correlated NOT EXISTS uses the same indexed identity columns and makes
+	// the result bound equal to the number of requested hashes, not duplicate
+	// evidence rows.
+	query = query.Where(`NOT EXISTS (
+		SELECT 1 FROM nginx_request_evidences newer
+		WHERE newer.hmac_key_id = nginx_request_evidences.hmac_key_id
+		  AND newer.oneapi_id_hmac = nginx_request_evidences.oneapi_id_hmac
+		  AND (newer.event_ms > nginx_request_evidences.event_ms OR
+		       (newer.event_ms = nginx_request_evidences.event_ms AND newer.event_id > nginx_request_evidences.event_id))
+	)`)
 	var evidence []NginxRequestEvidence
-	if err := query.Order("event_ms DESC").Limit(len(rows) * len(sets) * 2).Find(&evidence).Error; err != nil {
+	if err := query.Order("event_ms DESC, event_id DESC").Limit(len(seen)).Find(&evidence).Error; err != nil {
 		return err
 	}
 	byKey := make(map[string]NginxRequestEvidence, len(evidence))
@@ -1617,16 +1741,36 @@ func (m *Monitor) serveLogChainFilters(c *gin.Context) {
 
 // logChainBlindSpots 是本接口结构性答不了的问题。随响应一起返回，让前端必须显式面对：
 // 排障工具最危险的失效方式是"查不到"被读成"没发生过"。
-func logChainBlindSpots() []string {
+// logChainBlindSpots 说明这一页答不了什么。
+//
+// ★ 第一条随 CloudWatch 按需证据开关变化 ★
+// 关闭时前置拒绝只能去「问题预警」看。
+//
+// 开启后必须说清一件事：按需证据查的是**当前这一行自己的** Request ID
+// （见 logchain.js 的 data-lc-cw 取 r.request_id），而行只来自生产 logs
+// （见 queryLogChain）。前置拒绝不写 logs，就没有对应的行，也就没有按钮可点。
+//
+// 曾经写成"展开任意一条有 Request ID 的请求即可查到该次路由前拒绝"，这是错的：
+// 展开 A 请求只会得到 A 自己的证据，不会因此找到某个被前置拒绝的 B 请求。
+// 那句话会让人以为不必再去问题预警，从而漏掉真正被拒的请求。
+func logChainBlindSpots(cloudWatchEnabled bool) []string {
+	preRoute := "未到达渠道即被拒的请求（无可用渠道、无效令牌、额度不足等）不写入 logs，因此不在客户排障中展示；" +
+		"请前往「问题预警」查看。问题预警可按时间、客户、分组、模型和错误原因定位；" +
+		"未鉴权或采集器未上报客户 ID 的记录仍无法关联具体客户。"
+	if cloudWatchEnabled {
+		preRoute = "未到达渠道即被拒的请求（无可用渠道、无效令牌、额度不足等）不写入 logs，本页列表里不会出现，" +
+			"也无法在本页按需查到：「查 CloudWatch 入口证据」查的是所展开那一条请求自己的 Request ID，" +
+			"只能补齐它在入口层与应用层的证据，不能用来发现另一条被前置拒绝的请求。" +
+			"要找被拒请求请前往「问题预警」，可按时间、客户、分组、模型和错误原因定位；" +
+			"未鉴权或采集器未上报客户 ID 的记录仍无法关联具体客户。" +
+			"按需证据是单条请求的证据，不是统计：拒绝量与趋势同样看「问题预警」。"
+	}
 	return []string{
-		"未到达渠道即被拒的请求（无可用渠道、无效令牌、额度不足等）不写入 logs，因此不在客户排障中展示；" +
-			"请前往「问题预警」查看。问题预警可按时间、客户、分组、模型和错误原因定位；" +
-			"未鉴权或采集器未上报客户 ID 的记录仍无法关联具体客户。",
+		preRoute,
 		"new-api 换渠道重试会落多条 type=5：本接口按条列出，但无法归并成一次客户请求，" +
 			"看到 N 条错误不等于失败 N 次。",
 		// 原第三条"从不采集请求/响应正文"已删：加入 end_reason / end_error 后，
-		// "回答只出一半就断了"这类已能回答（看 client_gone + 耗时）。
-		// 剩下真正答不了的是"内容写得不对"，那属内容审查、不是排障范畴，写在这里是跑题。
+		// 已产出内容的客户主动取消按正常请求处理，不再进入本页问题清单。
 	}
 }
 
@@ -1680,8 +1824,9 @@ func (m *Monitor) serveLogChainRequests(c *gin.Context) {
 		if len(domainChans) == 0 {
 			c.JSON(http.StatusOK, gin.H{
 				"ok": true, "rows": []LogChainRow{}, "has_more": false,
-				"scope": logChainScopeEcho(scope), "blind_spots": logChainBlindSpots(),
-				"note": "该上游主域名在本地渠道快照中没有对应渠道",
+				"scope": logChainScopeEcho(scope), "blind_spots": logChainBlindSpots(m.cloudWatchEvidenceAvailable()),
+				"cloudwatch_enabled": m.cloudWatchEvidenceAvailable(),
+				"note":               "该上游主域名在本地渠道快照中没有对应渠道",
 			})
 			return
 		}
@@ -1709,11 +1854,28 @@ func (m *Monitor) serveLogChainRequests(c *gin.Context) {
 			}
 		}
 	}
+	// 归因必须在上游关联和已验证入口证据补齐后再刷新；否则主表会把
+	// “确实找到上游对应请求”的记录错误地留在待判。
+	logChainRefreshFaults(rows)
 	resp := gin.H{
 		"ok": true, "rows": rows, "has_more": hasMore,
-		"scope": logChainScopeEcho(scope), "blind_spots": logChainBlindSpots(),
+		"attribution": logChainAttributionSummaryForRows(rows),
+		"scope":       logChainScopeEcho(scope), "blind_spots": logChainBlindSpots(m.cloudWatchEvidenceAvailable()),
 		"nginx_evidence_mode":     nginxEvidenceMode(m.cfg.NginxEvidenceMode),
 		"nginx_evidence_verified": nginxEvidenceMode(m.cfg.NginxEvidenceMode) == "verified",
+		"nginx_evidence_coverage": gin.H{
+			"from_ts":    m.cloudWatchNginxEvidenceFrom.Load(),
+			"through_ts": m.cloudWatchNginxEvidenceThrough.Load(),
+			"target_ts": func() int64 {
+				_, target := cloudWatchNginxEvidenceRange(time.Now(), m.cfg.NginxEvidenceRetentionHours)
+				return target
+			}(),
+			"last_success_at": m.cloudWatchNginxEvidenceLastSuccess.Load(),
+			"last_failure_at": m.cloudWatchNginxEvidenceLastFailure.Load(),
+		},
+		// 只回传一个布尔：前端据此决定是否显示按需查询按钮。
+		// 不在这里预取任何 CloudWatch 数据，避免每次翻页都产生 AWS 调用。
+		"cloudwatch_enabled": m.cloudWatchEvidenceAvailable(),
 	}
 	// 两类本地补全都只能降级，不能吞掉已经从生产 logs 取回的明细。
 	if channelEnrichErr != nil {

@@ -6,6 +6,7 @@
 monitor.env
 secrets/
 1.env
+2.env
 
 # —— 运行时数据 ——
 /data/
@@ -41,3 +42,6 @@ __pycache__/
 # 本机连生产只读库时生成的临时凭据目录（my.cnf 含明文密码）
 .tmp-env/
 .tmp-q/
+.tmp-qa/
+.tmp-go-cache/
+.tmp-monitor.test

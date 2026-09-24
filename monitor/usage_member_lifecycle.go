@@ -611,132 +611,197 @@ func (m *Monitor) addUsageMember(ctx context.Context, resolved TrackedUser, grou
 	defer usageMemberMutationMu.Unlock()
 	var result usageMemberMutationResult
 	err = m.storeDB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var err error
+		result, err = addUsageMemberTx(tx, resolved, groupID, meta)
+		return err
+	})
+	return result, err
+}
+
+// addUsageMemberTx 是成员加入的唯一事务内实现。普通添加自己开事务；
+// “创建公司并加入首个成员”在创建公司后调用它，使两步一起提交或一起回滚。
+func addUsageMemberTx(tx *gorm.DB, resolved TrackedUser, groupID int64, meta usageMemberMutationMeta) (usageMemberMutationResult, error) {
+	var result usageMemberMutationResult
+	if existingAudit, found, err := loadUsageMemberAudit(tx, meta.RequestID); err != nil {
+		return result, err
+	} else if found {
+		if !auditMatchesUser(existingAudit, resolved.UserID, groupID, "add", "rejoin") {
+			return result, errUsageMemberRequestConflict
+		}
+		result = mutationResultFromAudit(existingAudit)
+		return result, nil
+	}
+	if groupID > 0 {
+		var count int64
+		if err := tx.Model(&CustomerGroup{}).Where("id = ?", groupID).Count(&count).Error; err != nil {
+			return result, err
+		}
+		if count == 0 {
+			return result, errors.New("所选公司不存在")
+		}
+	}
+
+	var current TrackedUser
+	trackedErr := tx.First(&current, "user_id = ?", resolved.UserID).Error
+	trackedExists := trackedErr == nil
+	if trackedErr != nil && !errors.Is(trackedErr, gorm.ErrRecordNotFound) {
+		return result, trackedErr
+	}
+	control, controlExists, err := currentUsageMemberControl(tx, resolved.UserID)
+	if err != nil {
+		return result, err
+	}
+	if !controlExists {
+		var lifecycleRows int64
+		if err := tx.Model(&UsageMemberAudit{}).Where("user_id = ?", resolved.UserID).Count(&lifecycleRows).Error; err != nil {
+			return result, err
+		}
+		if lifecycleRows > 0 {
+			return result, fmt.Errorf("%w: user_id=%d lifecycle exists but control is missing", errUsageMemberControlIntegrity, resolved.UserID)
+		}
+	}
+	now := time.Now().Unix()
+	action := "add"
+	beforeActive, beforeGroup, beforeRevision := false, int64(0), int64(0)
+
+	switch {
+	case trackedExists:
+		if !controlExists || !control.Active || control.TrackedRevision < 1 || control.CurrentGroupID != current.GroupID {
+			return result, fmt.Errorf("%w: user_id=%d", errUsageMemberControlIntegrity, resolved.UserID)
+		}
+		if current.GroupID != groupID {
+			return result, errUsageMemberDifferentCompany
+		}
+		beforeActive, beforeGroup, beforeRevision = true, current.GroupID, control.TrackedRevision
+		// Idempotent same-company add refreshes only source-owned profile fields.
+		if err := tx.Model(&TrackedUser{}).Where("user_id = ?", resolved.UserID).
+			Updates(map[string]any{"username": resolved.Username, "email": resolved.Email}).Error; err != nil {
+			return result, err
+		}
+		// Return the refreshed values while retaining AddedAt/Note/GroupID.
+		if err := tx.First(&resolved, "user_id = ?", current.UserID).Error; err != nil {
+			return result, err
+		}
+		result = usageMemberMutationResult{User: resolved, Action: action, TrackedRevision: control.TrackedRevision, Active: true, GroupID: groupID, AddedAt: current.AddedAt}
+
+	case controlExists:
+		if control.Active || control.TrackedRevision < 1 {
+			return result, fmt.Errorf("%w: user_id=%d orphan active control", errUsageMemberControlIntegrity, resolved.UserID)
+		}
+		var count int64
+		if err := tx.Model(&TrackedUser{}).Count(&count).Error; err != nil {
+			return result, err
+		}
+		if count >= maxTrackedUsers {
+			return result, fmt.Errorf("名单已达上限 %d 个", maxTrackedUsers)
+		}
+		action = "rejoin"
+		beforeGroup, beforeRevision = control.CurrentGroupID, control.TrackedRevision
+		control.Active = true
+		control.TrackedRevision++
+		control.CurrentGroupID = groupID
+		control.LastActivatedAt = now
+		control.UpdatedAt = now
+		if control.FirstAddedAt <= 0 {
+			control.FirstAddedAt = now
+		}
+		resolved.GroupID, resolved.AddedAt = groupID, control.FirstAddedAt
+		if err := tx.Save(&control).Error; err != nil {
+			return result, err
+		}
+		if err := tx.Create(&resolved).Error; err != nil {
+			return result, err
+		}
+		result = usageMemberMutationResult{User: resolved, Action: action, TrackedRevision: control.TrackedRevision, Active: true, GroupID: groupID, AddedAt: resolved.AddedAt}
+
+	default:
+		var count int64
+		if err := tx.Model(&TrackedUser{}).Count(&count).Error; err != nil {
+			return result, err
+		}
+		if count >= maxTrackedUsers {
+			return result, fmt.Errorf("名单已达上限 %d 个", maxTrackedUsers)
+		}
+		resolved.GroupID, resolved.AddedAt = groupID, now
+		control = UsageMemberControl{
+			UserID: resolved.UserID, Active: true, TrackedRevision: 1,
+			CurrentGroupID: groupID, FirstAddedAt: now, LastActivatedAt: now, UpdatedAt: now,
+		}
+		if err := tx.Create(&control).Error; err != nil {
+			return result, err
+		}
+		if err := tx.Create(&resolved).Error; err != nil {
+			return result, err
+		}
+		result = usageMemberMutationResult{User: resolved, Action: action, TrackedRevision: 1, Active: true, GroupID: groupID, AddedAt: now}
+	}
+
+	audit := UsageMemberAudit{
+		RequestID: meta.RequestID, Action: action, UserID: usageMemberAuditUserID(resolved.UserID),
+		BeforeGroupID: beforeGroup, AfterGroupID: groupID,
+		BeforeActive: beforeActive, AfterActive: true,
+		BeforeTrackedRevision: beforeRevision, AfterTrackedRevision: result.TrackedRevision,
+		ResultAddedAt: result.AddedAt, ResultUsername: result.User.Username,
+		ResultEmail: result.User.Email, ResultNote: result.User.Note,
+		Actor: meta.Actor, Reason: meta.Reason, CreatedAt: now,
+	}
+	if err := tx.Create(&audit).Error; err != nil {
+		return result, err
+	}
+	return result, nil
+}
+
+// addCustomerWithFirstMember atomically reuses/creates a company and adds the
+// resolved NewAPI user. A failed member transition rolls a newly-created empty
+// company back in the same SQLite transaction.
+func (m *Monitor) addCustomerWithFirstMember(ctx context.Context, company string, resolved TrackedUser, meta usageMemberMutationMeta) (CustomerGroup, usageMemberMutationResult, error) {
+	meta, err := normalizeUsageMemberMutationMeta(meta)
+	if err != nil {
+		return CustomerGroup{}, usageMemberMutationResult{}, err
+	}
+	usageMemberMutationMu.Lock()
+	defer usageMemberMutationMu.Unlock()
+	var group CustomerGroup
+	var result usageMemberMutationResult
+	err = m.storeDB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		if existingAudit, found, err := loadUsageMemberAudit(tx, meta.RequestID); err != nil {
 			return err
 		} else if found {
-			if !auditMatchesUser(existingAudit, resolved.UserID, groupID, "add", "rejoin") {
+			if existingAudit.UserID == nil || *existingAudit.UserID != resolved.UserID ||
+				(existingAudit.Action != "add" && existingAudit.Action != "rejoin") {
+				return errUsageMemberRequestConflict
+			}
+			if err := tx.First(&group, existingAudit.AfterGroupID).Error; err != nil {
+				return errUsageMemberRequestConflict
+			}
+			if group.Name != company {
 				return errUsageMemberRequestConflict
 			}
 			result = mutationResultFromAudit(existingAudit)
 			return nil
 		}
-		if groupID > 0 {
+
+		findErr := tx.Where("name = ?", company).First(&group).Error
+		if errors.Is(findErr, gorm.ErrRecordNotFound) {
 			var count int64
-			if err := tx.Model(&CustomerGroup{}).Where("id = ?", groupID).Count(&count).Error; err != nil {
+			if err := tx.Model(&CustomerGroup{}).Count(&count).Error; err != nil {
 				return err
 			}
-			if count == 0 {
-				return errors.New("所选公司不存在")
+			if count >= maxCustomerGroups {
+				return fmt.Errorf("分组已达上限 %d 个", maxCustomerGroups)
 			}
+			group = CustomerGroup{Name: company, Stage: "active", CreatedAt: time.Now().Unix()}
+			if err := tx.Create(&group).Error; err != nil {
+				return err
+			}
+		} else if findErr != nil {
+			return findErr
 		}
-
-		var current TrackedUser
-		trackedErr := tx.First(&current, "user_id = ?", resolved.UserID).Error
-		trackedExists := trackedErr == nil
-		if trackedErr != nil && !errors.Is(trackedErr, gorm.ErrRecordNotFound) {
-			return trackedErr
-		}
-		control, controlExists, err := currentUsageMemberControl(tx, resolved.UserID)
-		if err != nil {
-			return err
-		}
-		if !controlExists {
-			var lifecycleRows int64
-			if err := tx.Model(&UsageMemberAudit{}).Where("user_id = ?", resolved.UserID).Count(&lifecycleRows).Error; err != nil {
-				return err
-			}
-			if lifecycleRows > 0 {
-				return fmt.Errorf("%w: user_id=%d lifecycle exists but control is missing", errUsageMemberControlIntegrity, resolved.UserID)
-			}
-		}
-		now := time.Now().Unix()
-		action := "add"
-		beforeActive, beforeGroup, beforeRevision := false, int64(0), int64(0)
-
-		switch {
-		case trackedExists:
-			if !controlExists || !control.Active || control.TrackedRevision < 1 || control.CurrentGroupID != current.GroupID {
-				return fmt.Errorf("%w: user_id=%d", errUsageMemberControlIntegrity, resolved.UserID)
-			}
-			if current.GroupID != groupID {
-				return errUsageMemberDifferentCompany
-			}
-			beforeActive, beforeGroup, beforeRevision = true, current.GroupID, control.TrackedRevision
-			// Idempotent same-company add refreshes only source-owned profile fields.
-			if err := tx.Model(&TrackedUser{}).Where("user_id = ?", resolved.UserID).
-				Updates(map[string]any{"username": resolved.Username, "email": resolved.Email}).Error; err != nil {
-				return err
-			}
-			// Return the refreshed values while retaining AddedAt/Note/GroupID.
-			if err := tx.First(&resolved, "user_id = ?", current.UserID).Error; err != nil {
-				return err
-			}
-			result = usageMemberMutationResult{User: resolved, Action: action, TrackedRevision: control.TrackedRevision, Active: true, GroupID: groupID, AddedAt: current.AddedAt}
-
-		case controlExists:
-			if control.Active || control.TrackedRevision < 1 {
-				return fmt.Errorf("%w: user_id=%d orphan active control", errUsageMemberControlIntegrity, resolved.UserID)
-			}
-			var count int64
-			if err := tx.Model(&TrackedUser{}).Count(&count).Error; err != nil {
-				return err
-			}
-			if count >= maxTrackedUsers {
-				return fmt.Errorf("名单已达上限 %d 个", maxTrackedUsers)
-			}
-			action = "rejoin"
-			beforeGroup, beforeRevision = control.CurrentGroupID, control.TrackedRevision
-			control.Active = true
-			control.TrackedRevision++
-			control.CurrentGroupID = groupID
-			control.LastActivatedAt = now
-			control.UpdatedAt = now
-			if control.FirstAddedAt <= 0 {
-				control.FirstAddedAt = now
-			}
-			resolved.GroupID, resolved.AddedAt = groupID, control.FirstAddedAt
-			if err := tx.Save(&control).Error; err != nil {
-				return err
-			}
-			if err := tx.Create(&resolved).Error; err != nil {
-				return err
-			}
-			result = usageMemberMutationResult{User: resolved, Action: action, TrackedRevision: control.TrackedRevision, Active: true, GroupID: groupID, AddedAt: resolved.AddedAt}
-
-		default:
-			var count int64
-			if err := tx.Model(&TrackedUser{}).Count(&count).Error; err != nil {
-				return err
-			}
-			if count >= maxTrackedUsers {
-				return fmt.Errorf("名单已达上限 %d 个", maxTrackedUsers)
-			}
-			resolved.GroupID, resolved.AddedAt = groupID, now
-			control = UsageMemberControl{
-				UserID: resolved.UserID, Active: true, TrackedRevision: 1,
-				CurrentGroupID: groupID, FirstAddedAt: now, LastActivatedAt: now, UpdatedAt: now,
-			}
-			if err := tx.Create(&control).Error; err != nil {
-				return err
-			}
-			if err := tx.Create(&resolved).Error; err != nil {
-				return err
-			}
-			result = usageMemberMutationResult{User: resolved, Action: action, TrackedRevision: 1, Active: true, GroupID: groupID, AddedAt: now}
-		}
-
-		audit := UsageMemberAudit{
-			RequestID: meta.RequestID, Action: action, UserID: usageMemberAuditUserID(resolved.UserID),
-			BeforeGroupID: beforeGroup, AfterGroupID: groupID,
-			BeforeActive: beforeActive, AfterActive: true,
-			BeforeTrackedRevision: beforeRevision, AfterTrackedRevision: result.TrackedRevision,
-			ResultAddedAt: result.AddedAt, ResultUsername: result.User.Username,
-			ResultEmail: result.User.Email, ResultNote: result.User.Note,
-			Actor: meta.Actor, Reason: meta.Reason, CreatedAt: now,
-		}
-		return tx.Create(&audit).Error
+		var err error
+		result, err = addUsageMemberTx(tx, resolved, group.ID, meta)
+		return err
 	})
-	return result, err
+	return group, result, err
 }
 
 func (m *Monitor) removeUsageMember(ctx context.Context, userID int64, meta usageMemberMutationMeta) (usageMemberMutationResult, error) {
@@ -748,54 +813,69 @@ func (m *Monitor) removeUsageMember(ctx context.Context, userID int64, meta usag
 	defer usageMemberMutationMu.Unlock()
 	var result usageMemberMutationResult
 	err = m.storeDB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		if existingAudit, found, err := loadUsageMemberAudit(tx, meta.RequestID); err != nil {
-			return err
-		} else if found {
-			if !auditMatchesUser(existingAudit, userID, existingAudit.AfterGroupID, "remove") {
-				return errUsageMemberRequestConflict
-			}
-			result = mutationResultFromAudit(existingAudit)
-			return nil
-		}
-		var current TrackedUser
-		if err := tx.First(&current, "user_id = ?", userID).Error; errors.Is(err, gorm.ErrRecordNotFound) {
-			return errUsageMemberNotActive
-		} else if err != nil {
-			return err
-		}
-		control, found, err := currentUsageMemberControl(tx, userID)
-		if err != nil {
-			return err
-		}
-		if !found || !control.Active || control.TrackedRevision < 1 || control.CurrentGroupID != current.GroupID {
-			return fmt.Errorf("%w: user_id=%d", errUsageMemberControlIntegrity, userID)
-		}
-		now := time.Now().Unix()
-		beforeRevision := control.TrackedRevision
-		control.Active = false
-		control.TrackedRevision++
-		control.LastDeactivatedAt = now
-		control.UpdatedAt = now
-		if err := tx.Save(&control).Error; err != nil {
-			return err
-		}
-		if err := tx.Delete(&TrackedUser{}, "user_id = ?", userID).Error; err != nil {
-			return err
-		}
-		result = usageMemberMutationResult{Action: "remove", TrackedRevision: control.TrackedRevision, Active: false, GroupID: current.GroupID, AddedAt: current.AddedAt}
-		result.User = current
-		audit := UsageMemberAudit{
-			RequestID: meta.RequestID, Action: "remove", UserID: usageMemberAuditUserID(userID),
-			BeforeGroupID: current.GroupID, AfterGroupID: current.GroupID,
-			BeforeActive: true, AfterActive: false,
-			BeforeTrackedRevision: beforeRevision, AfterTrackedRevision: control.TrackedRevision,
-			ResultAddedAt: current.AddedAt, ResultUsername: current.Username,
-			ResultEmail: current.Email, ResultNote: current.Note,
-			Actor: meta.Actor, Reason: meta.Reason, CreatedAt: now,
-		}
-		return tx.Create(&audit).Error
+		var err error
+		result, err = removeUsageMemberTx(tx, userID, meta)
+		return err
 	})
 	return result, err
+}
+
+// removeUsageMemberTx is the one transactional implementation of a member
+// removal. Standalone removal owns its transaction above; company dissolution
+// calls this helper repeatedly inside the same transaction so controls,
+// revisions, the tracked projection and every audit either all commit or all
+// roll back together.
+func removeUsageMemberTx(tx *gorm.DB, userID int64, meta usageMemberMutationMeta) (usageMemberMutationResult, error) {
+	if existingAudit, found, err := loadUsageMemberAudit(tx, meta.RequestID); err != nil {
+		return usageMemberMutationResult{}, err
+	} else if found {
+		if !auditMatchesUser(existingAudit, userID, existingAudit.AfterGroupID, "remove") {
+			return usageMemberMutationResult{}, errUsageMemberRequestConflict
+		}
+		return mutationResultFromAudit(existingAudit), nil
+	}
+	var current TrackedUser
+	if err := tx.First(&current, "user_id = ?", userID).Error; errors.Is(err, gorm.ErrRecordNotFound) {
+		return usageMemberMutationResult{}, errUsageMemberNotActive
+	} else if err != nil {
+		return usageMemberMutationResult{}, err
+	}
+	control, found, err := currentUsageMemberControl(tx, userID)
+	if err != nil {
+		return usageMemberMutationResult{}, err
+	}
+	if !found || !control.Active || control.TrackedRevision < 1 || control.CurrentGroupID != current.GroupID {
+		return usageMemberMutationResult{}, fmt.Errorf("%w: user_id=%d", errUsageMemberControlIntegrity, userID)
+	}
+	now := time.Now().Unix()
+	beforeRevision := control.TrackedRevision
+	control.Active = false
+	control.TrackedRevision++
+	control.LastDeactivatedAt = now
+	control.UpdatedAt = now
+	if err := tx.Save(&control).Error; err != nil {
+		return usageMemberMutationResult{}, err
+	}
+	if err := tx.Delete(&TrackedUser{}, "user_id = ?", userID).Error; err != nil {
+		return usageMemberMutationResult{}, err
+	}
+	result := usageMemberMutationResult{
+		User: current, Action: "remove", TrackedRevision: control.TrackedRevision,
+		Active: false, GroupID: current.GroupID, AddedAt: current.AddedAt,
+	}
+	audit := UsageMemberAudit{
+		RequestID: meta.RequestID, Action: "remove", UserID: usageMemberAuditUserID(userID),
+		BeforeGroupID: current.GroupID, AfterGroupID: current.GroupID,
+		BeforeActive: true, AfterActive: false,
+		BeforeTrackedRevision: beforeRevision, AfterTrackedRevision: control.TrackedRevision,
+		ResultAddedAt: current.AddedAt, ResultUsername: current.Username,
+		ResultEmail: current.Email, ResultNote: current.Note,
+		Actor: meta.Actor, Reason: meta.Reason, CreatedAt: now,
+	}
+	if err := tx.Create(&audit).Error; err != nil {
+		return usageMemberMutationResult{}, err
+	}
+	return result, nil
 }
 
 func (m *Monitor) correctUsageMemberCompany(ctx context.Context, userID, groupID int64, meta usageMemberMutationMeta) (usageMemberMutationResult, error) {
@@ -907,6 +987,83 @@ func (m *Monitor) removeCustomerGroup(ctx context.Context, groupID int64, meta u
 			Actor: meta.Actor, Reason: meta.Reason, CreatedAt: now,
 		}
 		return tx.Create(&audit).Error
+	})
+	return replayed, err
+}
+
+func usageMemberDissolveChildMeta(parent usageMemberMutationMeta, groupID, userID int64) usageMemberMutationMeta {
+	// RequestID is capped at 96 bytes, so appending a user ID to an arbitrary
+	// parent key is unsafe. A fixed-size digest gives every member a stable,
+	// retry-safe audit key while Reason keeps the human-readable parent link.
+	sum := sha256.Sum256([]byte(parent.RequestID + "\x00group_dissolve\x00" + strconv.FormatInt(groupID, 10) + "\x00" + strconv.FormatInt(userID, 10)))
+	parentLink := "公司解散父请求 " + parent.RequestID
+	reason := parentLink
+	if detail := strings.TrimSpace(parent.Reason); detail != "" {
+		reason += "；" + detail
+	}
+	if len(reason) > 500 {
+		reason = reason[:500]
+	}
+	return usageMemberMutationMeta{
+		RequestID: "dissolve-" + hex.EncodeToString(sum[:]),
+		Actor:     parent.Actor,
+		Reason:    reason,
+	}
+}
+
+// dissolveCustomerGroup removes every tracked member and the company in one
+// SQLite transaction. It does not touch NewAPI accounts, usage facts or request
+// logs. Portal credentials are checked before the first member transition so a
+// rejected dissolve cannot leave an empty or partially removed company.
+func (m *Monitor) dissolveCustomerGroup(ctx context.Context, groupID int64, meta usageMemberMutationMeta) (bool, error) {
+	meta, err := normalizeUsageMemberMutationMeta(meta)
+	if err != nil {
+		return false, err
+	}
+	usageMemberMutationMu.Lock()
+	defer usageMemberMutationMu.Unlock()
+	replayed := false
+	err = m.storeDB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if existingAudit, found, err := loadUsageMemberAudit(tx, meta.RequestID); err != nil {
+			return err
+		} else if found {
+			if existingAudit.Action != "group_dissolve" || existingAudit.BeforeGroupID != groupID || existingAudit.UserID != nil {
+				return errUsageMemberRequestConflict
+			}
+			replayed = true
+			return nil
+		}
+
+		var group CustomerGroup
+		if err := tx.First(&group, groupID).Error; err != nil {
+			return err
+		}
+		if strings.TrimSpace(group.PortalEmail) != "" || group.PortalPwAdmin != "" || group.PortalPwUser != "" {
+			return errCustomerGroupPortalEnabled
+		}
+
+		var members []TrackedUser
+		if err := tx.Where("group_id = ?", groupID).Order("user_id").Find(&members).Error; err != nil {
+			return err
+		}
+		for _, member := range members {
+			childMeta := usageMemberDissolveChildMeta(meta, groupID, member.UserID)
+			if _, err := removeUsageMemberTx(tx, member.UserID, childMeta); err != nil {
+				return err
+			}
+		}
+		if result := tx.Delete(&CustomerGroup{}, groupID); result.Error != nil {
+			return result.Error
+		} else if result.RowsAffected != 1 {
+			return gorm.ErrRecordNotFound
+		}
+		now := time.Now().Unix()
+		return tx.Create(&UsageMemberAudit{
+			RequestID: meta.RequestID, Action: "group_dissolve",
+			BeforeGroupID: groupID, AfterGroupID: 0,
+			BeforeActive: true, AfterActive: false,
+			Actor: meta.Actor, Reason: meta.Reason, CreatedAt: now,
+		}).Error
 	})
 	return replayed, err
 }

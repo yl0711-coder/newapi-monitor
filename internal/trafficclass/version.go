@@ -14,7 +14,7 @@ const Current = 5
 // DeliveryCurrent versions model/stability delivery outcomes. It is separate
 // from Current because anomaly and zero-output rules may change without
 // changing which source rows belong to real users.
-const DeliveryCurrent = 6
+const DeliveryCurrent = 7
 
 // SourceExclusionPredicateSQL is the portable SQL boundary for traffic that
 // an unmodified NewAPI emits while testing channels internally. Both the

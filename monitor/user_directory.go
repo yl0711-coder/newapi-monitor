@@ -122,20 +122,52 @@ func lookupUsersByName(db *gorm.DB, username string) ([]UserDirectoryEntry, erro
 }
 
 // lookupUserNames 批量取用户名。只读本地缓存，不碰生产库。
-// 返回 map 里没有的 ID 表示缓存里没有——调用方必须显示 ID 本身，不能显示空白。
+//
+// user_directory_entries 是全量（或最近一次成功同步的）主站目录，优先使用；
+// tracked_users 是本地客户维护名单，在 logchain-only / 最小权限部署中通常是
+// 唯一可用的身份缓存。对目录缺失的 ID 使用后者兜底，既不扩大生产库权限，
+// 也不会把未纳入本地名单的客户猜成某个名字。
+// 返回 map 里仍没有的 ID 表示两份本地缓存都没有——调用方必须显示 ID 本身，
+// 不能显示空白。
 func lookupUserNames(db *gorm.DB, ids []int64) map[int64]string {
 	out := map[int64]string{}
-	if len(ids) == 0 {
+	if db == nil || len(ids) == 0 {
 		return out
 	}
 	var rows []UserDirectoryEntry
 	if err := db.Where("user_id IN ?", ids).Find(&rows).Error; err != nil {
 		slog.Warn("读取用户名缓存失败，页面将只显示用户 ID", "err", err)
+	} else {
+		for _, r := range rows {
+			if name := strings.TrimSpace(r.Username); name != "" {
+				out[r.UserID] = name
+			}
+		}
+	}
+	// Only query the small local maintenance projection for IDs that the
+	// directory did not provide.  This fallback must remain local-only: in a
+	// logchain-only deployment the production account deliberately cannot read
+	// users/tokens/options, and a failed directory read must not trigger a new
+	// production query from a page handler.
+	missing := make([]int64, 0, len(ids)-len(out))
+	for _, id := range ids {
+		if id > 0 {
+			if _, ok := out[id]; !ok {
+				missing = append(missing, id)
+			}
+		}
+	}
+	if len(missing) == 0 {
 		return out
 	}
-	for _, r := range rows {
-		if r.Username != "" {
-			out[r.UserID] = r.Username
+	var tracked []TrackedUser
+	if err := db.Select("user_id", "username").Where("user_id IN ?", missing).Find(&tracked).Error; err != nil {
+		slog.Warn("读取本地客户名单失败，页面将只显示用户 ID", "err", err)
+		return out
+	}
+	for _, user := range tracked {
+		if name := strings.TrimSpace(user.Username); name != "" {
+			out[user.UserID] = name
 		}
 	}
 	return out

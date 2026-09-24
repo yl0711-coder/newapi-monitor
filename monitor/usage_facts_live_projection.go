@@ -30,6 +30,16 @@ type usageLiveProjection struct {
 	TodayNetByUser   map[int64]int64
 }
 
+// usageLiveProjectionBatch 是同一 SQLite 快照中逐成员判定后的结果。
+// map 缺 key 表示该成员未通过完整性/新鲜度/锚点校验；调用方可以按公司分别
+// fail-closed，不必因为另一家公司有一个未就绪成员而让整页金额都不可知。
+type usageLiveProjectionBatch struct {
+	DayTs            int64
+	FinalizedThrough int64
+	TodayNetByUser   map[int64]int64
+	ThroughByUser    map[int64]int64
+}
+
 // loadUsageLiveProjection 从本地 SQLite 计算“今日已封口小时事实 + 当前累计
 // used_quota - 封口后最近累计锚点”。它不要求终身累计与全部历史事实永久相等；
 // 只有所有所选成员都满足完整性、锚点和新鲜度条件时才返回，避免公司合计混入
@@ -75,11 +85,81 @@ func (m *Monitor) loadUsageLiveProjection(ctx context.Context, ids []int64, from
 	return projection, err
 }
 
+// loadUsageLiveProjectionBatch 与 loadUsageLiveProjection 使用完全相同的判据，
+// 但返回逐成员结果，供客户维护一次读完所有公司后分别判断完整性。
+func (m *Monitor) loadUsageLiveProjectionBatch(ctx context.Context, ids []int64, fromTs, toTs int64, now time.Time) (*usageLiveProjectionBatch, error) {
+	if m == nil || !m.usageFactsReadEnabled() || len(ids) == 0 || toTs <= fromTs {
+		return nil, nil
+	}
+	dayTs := usageFactDayStart(now.Unix())
+	if fromTs > dayTs || toTs <= dayTs {
+		return nil, nil
+	}
+	finalizedThrough := m.usageFactsReadyThrough.Load()
+	if finalizedThrough < dayTs || finalizedThrough > now.Unix()+usageFactHourSeconds {
+		return nil, nil
+	}
+	unique := make(map[int64]struct{}, len(ids))
+	ordered := make([]int64, 0, len(ids))
+	for _, id := range ids {
+		if id <= 0 {
+			continue
+		}
+		if _, exists := unique[id]; exists {
+			continue
+		}
+		unique[id] = struct{}{}
+		ordered = append(ordered, id)
+	}
+	if len(ordered) == 0 {
+		return nil, nil
+	}
+	sort.Slice(ordered, func(i, j int) bool { return ordered[i] < ordered[j] })
+
+	qctx, cancel := usageFactQueryContext(ctx)
+	defer cancel()
+	var batch *usageLiveProjectionBatch
+	err := m.usageFactsStore().WithContext(qctx).Transaction(func(tx *gorm.DB) error {
+		var err error
+		batch, err = m.loadUsageLiveProjectionBatchTx(tx, ordered, dayTs, finalizedThrough, now)
+		return err
+	})
+	return batch, err
+}
+
 // loadUsageLiveProjectionTx deliberately reads publication, member proof,
 // profile watermarks and the historical baseline from one SQLite snapshot.
 // Without this transaction a fact publication between two SELECTs could pair
 // a new baseline with an old cumulative snapshot (or the reverse).
 func (m *Monitor) loadUsageLiveProjectionTx(db *gorm.DB, ordered []int64, dayTs, finalizedThrough int64, now time.Time) (*usageLiveProjection, error) {
+	batch, err := m.loadUsageLiveProjectionBatchTx(db, ordered, dayTs, finalizedThrough, now)
+	if err != nil || batch == nil {
+		return nil, err
+	}
+	if len(batch.TodayNetByUser) != len(ordered) {
+		return nil, nil
+	}
+	through := now.Unix()
+	today := make(map[int64]int64, len(ordered))
+	for _, id := range ordered {
+		net, okNet := batch.TodayNetByUser[id]
+		memberThrough, okThrough := batch.ThroughByUser[id]
+		if !okNet || !okThrough {
+			return nil, nil
+		}
+		today[id] = net
+		if memberThrough < through {
+			through = memberThrough
+		}
+	}
+	return &usageLiveProjection{DayTs: dayTs, Through: through, FinalizedThrough: finalizedThrough, TodayNetByUser: today}, nil
+}
+
+// loadUsageLiveProjectionBatchTx performs all reads once and evaluates the
+// existing fail-closed rules per member. It must stay in one read transaction:
+// mixing publication from one generation with quota watermarks from another
+// would manufacture a plausible but false live delta.
+func (m *Monitor) loadUsageLiveProjectionBatchTx(db *gorm.DB, ordered []int64, dayTs, finalizedThrough int64, now time.Time) (*usageLiveProjectionBatch, error) {
 	var published []UsageFactPublishedMember
 	if err := db.Where("user_id IN ?", ordered).Find(&published).Error; err != nil {
 		return nil, err
@@ -87,9 +167,6 @@ func (m *Monitor) loadUsageLiveProjectionTx(db *gorm.DB, ordered []int64, dayTs,
 	var states []UsageFactMemberState
 	if err := db.Where("user_id IN ?", ordered).Find(&states).Error; err != nil {
 		return nil, err
-	}
-	if len(published) != len(ordered) || len(states) != len(ordered) {
-		return nil, nil
 	}
 	publishedByID := make(map[int64]UsageFactPublishedMember, len(published))
 	for _, row := range published {
@@ -99,69 +176,21 @@ func (m *Monitor) loadUsageLiveProjectionTx(db *gorm.DB, ordered []int64, dayTs,
 	for _, row := range states {
 		stateByID[row.UserID] = row
 	}
-	for _, id := range ordered {
-		publishedRow, publishedOK := publishedByID[id]
-		state, stateOK := stateByID[id]
-		revisionCompatible := publishedRow.TrackedRevision == state.TrackedRevision ||
-			(publishedRow.TrackedRevision == 0 && state.TrackedRevision == 1)
-		if !publishedOK || !stateOK || !state.Active || publishedRow.PublishedAt <= 0 || publishedRow.SourceFloorHour <= 0 ||
-			publishedRow.SourceEpoch != m.cfg.UsageFactsHistorySourceEpoch || state.SourceEpoch != publishedRow.SourceEpoch ||
-			publishedRow.ClassificationVersion != userTrafficClassificationVersion || state.ClassificationVersion != publishedRow.ClassificationVersion ||
-			publishedRow.QuerySemanticsVersion != usageFactQuerySemanticsVersion || state.QuerySemanticsVersion != publishedRow.QuerySemanticsVersion ||
-			!revisionCompatible || state.SourceFloorHour == nil || *state.SourceFloorHour != publishedRow.SourceFloorHour ||
-			(state.SourceHistoryStatus != "complete_hot" && state.SourceHistoryStatus != "no_history") || state.CoverageStatus != "ready" ||
-			state.VerificationStatus != "complete" || state.CoverageThroughHour == nil || *state.CoverageThroughHour < dayTs {
-			return nil, nil
-		}
-	}
-
 	var snapshots []UsageUserSnapshot
 	if err := db.Where("user_id IN ?", ordered).Find(&snapshots).Error; err != nil {
 		return nil, err
 	}
-	if len(snapshots) != len(ordered) {
-		return nil, nil
-	}
 	snapshotByID := make(map[int64]UsageUserSnapshot, len(snapshots))
-	through := now.Unix()
 	oldestAllowed := now.Add(-usageLiveProjectionMaxAge).Unix()
 	for _, snap := range snapshots {
-		if !snap.Exists || snap.CapturedAt < oldestAllowed || snap.CapturedAt > now.Unix()+60 {
-			return nil, nil
-		}
 		snapshotByID[snap.UserID] = snap
-		if snap.CapturedAt < through {
-			through = snap.CapturedAt
-		}
-	}
-	if len(snapshotByID) != len(ordered) || through <= finalizedThrough {
-		return nil, nil
 	}
 
 	finalizedToday := make(map[int64]int64, len(ordered))
 	if finalizedThrough > dayTs {
-		hourIn, hourArgs := usageIn("user_id", ordered)
-		query := `SELECT user_id,COALESCE(SUM(consume_quota),0)-COALESCE(SUM(refund_quota),0)
-FROM usage_hour_facts
-WHERE hour_ts >= ? AND hour_ts < ? AND ` + hourIn + ` GROUP BY user_id`
-		args := append([]any{dayTs, finalizedThrough}, hourArgs...)
-		rows, err := db.Raw(query, args...).Rows()
+		var err error
+		finalizedToday, err = usageFactsTodayFinalizedNetByUser(db, ordered, dayTs, finalizedThrough)
 		if err != nil {
-			return nil, err
-		}
-		for rows.Next() {
-			var id, net int64
-			if err := rows.Scan(&id, &net); err != nil {
-				_ = rows.Close()
-				return nil, err
-			}
-			finalizedToday[id] = net
-		}
-		if err := rows.Err(); err != nil {
-			_ = rows.Close()
-			return nil, err
-		}
-		if err := rows.Close(); err != nil {
 			return nil, err
 		}
 	}
@@ -192,35 +221,94 @@ JOIN picked p ON p.user_id=w.user_id AND p.captured_at=w.captured_at`
 	for _, anchor := range anchorRows {
 		anchors[anchor.UserID] = anchor
 	}
-	if len(anchors) != len(ordered) {
-		return nil, nil
+	batch := &usageLiveProjectionBatch{
+		DayTs: dayTs, FinalizedThrough: finalizedThrough,
+		TodayNetByUser: map[int64]int64{}, ThroughByUser: map[int64]int64{},
 	}
-
-	today := make(map[int64]int64, len(ordered))
 	for _, id := range ordered {
+		publishedRow, publishedOK := publishedByID[id]
+		state, stateOK := stateByID[id]
+		revisionCompatible := publishedOK && stateOK && (publishedRow.TrackedRevision == state.TrackedRevision ||
+			(publishedRow.TrackedRevision == 0 && state.TrackedRevision == 1))
+		if !publishedOK || !stateOK || !state.Active || publishedRow.PublishedAt <= 0 || publishedRow.SourceFloorHour <= 0 ||
+			publishedRow.SourceEpoch != m.cfg.UsageFactsHistorySourceEpoch || state.SourceEpoch != publishedRow.SourceEpoch ||
+			publishedRow.ClassificationVersion != userTrafficClassificationVersion || state.ClassificationVersion != publishedRow.ClassificationVersion ||
+			publishedRow.QuerySemanticsVersion != usageFactQuerySemanticsVersion || state.QuerySemanticsVersion != publishedRow.QuerySemanticsVersion ||
+			!revisionCompatible || state.SourceFloorHour == nil || *state.SourceFloorHour != publishedRow.SourceFloorHour ||
+			(state.SourceHistoryStatus != "complete_hot" && state.SourceHistoryStatus != "no_history") || state.CoverageStatus != "ready" ||
+			state.VerificationStatus != "complete" || state.CoverageThroughHour == nil || *state.CoverageThroughHour < dayTs {
+			continue
+		}
 		snap, ok := snapshotByID[id]
 		anchor, anchorOK := anchors[id]
-		if !ok || !anchorOK || anchor.CapturedAt < finalizedThrough ||
+		if !ok || !snap.Exists || snap.CapturedAt < oldestAllowed || snap.CapturedAt > now.Unix()+60 ||
+			snap.CapturedAt <= finalizedThrough || !anchorOK || anchor.CapturedAt < finalizedThrough ||
 			anchor.CapturedAt > finalizedThrough+int64(usageLiveProjectionAnchorMaxGap/time.Second) ||
 			snap.CapturedAt < anchor.CapturedAt {
-			return nil, nil
+			continue
 		}
 		// A published no-history member is safe only while its cumulative source
 		// watermark is still zero. The first non-zero quota may precede the Tail
 		// invalidation by one scheduling turn, so suppress the whole projection
 		// until that member is rediscovered and verified.
 		if stateByID[id].SourceHistoryStatus == "no_history" && snap.UsedQuota != 0 {
-			return nil, nil
+			continue
 		}
 		delta := snap.UsedQuota - anchor.UsedQuota
 		// 负值说明累计水位在锚点之后发生了回退（例如人工重置）。此时宁可
 		// 继续显示已封口事实，也不能把差异伪装成当前退款。
 		if delta < 0 {
-			return nil, nil
+			continue
 		}
-		today[id] = finalizedToday[id] + delta
+		batch.TodayNetByUser[id] = finalizedToday[id] + delta
+		batch.ThroughByUser[id] = snap.CapturedAt
 	}
-	return &usageLiveProjection{DayTs: dayTs, Through: through, FinalizedThrough: finalizedThrough, TodayNetByUser: today}, nil
+	return batch, nil
+}
+
+// usageFactsTodayFinalizedNetByUser 读 [dayTs, finalizedThrough) 区间内每个用户
+// 的已封口净消费（消费 - 退款，单位 quota）。
+//
+// ★ 这是"今日已封口金额"的唯一实现 ★
+// 调用方有两处：本文件的实时投影（用它当基数再加累计差额），以及客户维护页
+// 在实时投影 fail-closed 时的退路。两处若各写一份 SQL，同一家公司在两个页面
+// 上会显示不同金额，而且是那种"看起来都合理"的差异，极难发现。
+// TestCustomerHealthSpendSharesFinalizedNetFormula 钉住这一点。
+//
+// 返回 map 只含区间内有事实行的用户；没有的用户不出现。事实表是稀疏表，
+// 因此调用方不能只凭缺 key 判断数据缺失：需要用已发布成员证明来区分合法的
+// 零消费与尚未发布。实时投影已先验证全部成员；客户维护的 finalized 退路会
+// 对已发布成员预填 0，再用本函数的实际聚合覆盖。
+func usageFactsTodayFinalizedNetByUser(db *gorm.DB, ids []int64, dayTs, finalizedThrough int64) (map[int64]int64, error) {
+	out := make(map[int64]int64, len(ids))
+	if len(ids) == 0 || finalizedThrough <= dayTs {
+		return out, nil
+	}
+	hourIn, hourArgs := usageIn("user_id", ids)
+	query := `SELECT user_id,COALESCE(SUM(consume_quota),0)-COALESCE(SUM(refund_quota),0)
+FROM usage_hour_facts
+WHERE hour_ts >= ? AND hour_ts < ? AND ` + hourIn + ` GROUP BY user_id`
+	args := append([]any{dayTs, finalizedThrough}, hourArgs...)
+	rows, err := db.Raw(query, args...).Rows()
+	if err != nil {
+		return nil, err
+	}
+	for rows.Next() {
+		var id, net int64
+		if err := rows.Scan(&id, &net); err != nil {
+			_ = rows.Close()
+			return nil, err
+		}
+		out[id] = net
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 func applyUsageBillingNetFloor(b *UsageBilling, targetNet int64) bool {

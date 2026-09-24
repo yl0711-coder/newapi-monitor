@@ -939,7 +939,7 @@ func (m *Monitor) capacityBreakdowns(rows []capacityDimensionRow, rejectionRows 
 
 func (m *Monitor) readCapacityIngress(ctx context.Context, from, to, bucket, now int64) ([]capacityIngressPoint, capacitySource) {
 	var rows []capacityIngressRow
-	err := m.storeDB.WithContext(ctx).Raw(`SELECT (bucket_ts / ?) * ? ts, node, SUM(count) count,
+	err := m.storeDB.WithContext(ctx).Raw(`SELECT (n.bucket_ts / ?) * ? ts, n.node, SUM(n.count) count,
 		SUM(CASE WHEN status >= 500 THEN count ELSE 0 END) error_5xx,
 		SUM(CASE WHEN upstream_status >= 500 THEN count ELSE 0 END) upstream_error_5xx,
 		SUM(request_time_sum_ms) request_time_sum_ms, MAX(request_time_max_ms) request_time_max_ms,
@@ -947,9 +947,10 @@ func (m *Monitor) readCapacityIngress(ctx context.Context, from, to, bucket, now
 		SUM(latency_count) latency_count, SUM(latency0_to1s) latency0_to1s, SUM(latency1_to5s) latency1_to5s,
 		SUM(latency5_to15s) latency5_to15s, SUM(latency15_to30s) latency15_to30s,
 		SUM(latency30_to60s) latency30_to60s, SUM(latency_over60s) latency_over60s
-		FROM nginx_minute_samples WHERE bucket_ts >= ? AND bucket_ts < ? AND method='POST'
-		AND route IN ('/v1/chat/completions','/v1/responses','/v1/messages','/v1/*')
-		GROUP BY ts,node ORDER BY ts,node`, bucket, bucket, from, to).Scan(&rows).Error
+		FROM nginx_minute_samples n WHERE n.bucket_ts >= ? AND n.bucket_ts < ? AND n.method='POST'
+		AND n.route IN ('/v1/chat/completions','/v1/responses','/v1/messages','/v1/*')
+		AND `+nginxPreferredAccessClause+`
+		GROUP BY ts,n.node ORDER BY ts,n.node`, bucket, bucket, from, to, cloudWatchNginxNode, cloudWatchNginxNode).Scan(&rows).Error
 	var watermark, total int64
 	out := make([]capacityIngressPoint, 0, len(rows))
 	if err == nil {
@@ -987,9 +988,10 @@ func (m *Monitor) readCapacityIngress(ctx context.Context, from, to, bucket, now
 				EstimatedUpstreamInflight: float64(row.UpstreamTimeSumMS) / windowMS})
 			total += row.Count
 		}
-		_ = m.storeDB.WithContext(ctx).Raw(`SELECT COALESCE(MAX(bucket_ts),0) FROM nginx_minute_samples
-			WHERE bucket_ts >= ? AND bucket_ts < ? AND method='POST'
-			AND route IN ('/v1/chat/completions','/v1/responses','/v1/messages','/v1/*')`, from, to).Scan(&watermark).Error
+		_ = m.storeDB.WithContext(ctx).Raw(`SELECT COALESCE(MAX(n.bucket_ts),0) FROM nginx_minute_samples n
+			WHERE n.bucket_ts >= ? AND n.bucket_ts < ? AND n.method='POST'
+			AND n.route IN ('/v1/chat/completions','/v1/responses','/v1/messages','/v1/*')
+			AND `+nginxPreferredAccessClause, from, to, cloudWatchNginxNode, cloudWatchNginxNode).Scan(&watermark).Error
 	}
 	configured := m.cfg.NginxEnabled
 	note := "入口 RPM 只包含 POST 推理路由；与日志 RPM 是两套独立证据。"

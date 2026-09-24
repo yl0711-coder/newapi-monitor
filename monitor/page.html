@@ -250,6 +250,8 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
   .lc-time-range.pending{background:rgba(217,119,6,.2);border-color:#f59e0b;box-shadow:0 0 0 1px rgba(245,158,11,.16)}
   .lc-time-hint{color:#fbbf24;font-size:12px;font-weight:600;white-space:nowrap}
   .lc-daylabel{color:var(--text-muted);font-size:13px;margin-left:4px}
+  /* 客户排障摘要最长是跨日范围；固定占位避免文字长度变化把整组日期控件左右推移。 */
+  #lcDateLabel{display:inline-block;width:310px;font-variant-numeric:tabular-nums;white-space:nowrap}
   .lc-filterbar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:12px}
   .lc-filterbar select,.lc-filterbar input[type=text],.lc-filterbar input:not([type]){background:var(--surface);color:var(--text);border:1px solid var(--border);border-radius:7px;padding:6px 9px;font-size:13px;max-width:190px}
   .lc-filterbar input.lc-request-id{max-width:280px;min-width:220px}
@@ -376,12 +378,13 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
   /* 异常标签:说明这行为什么被判为异常,可同时多个 */
   .lc-tag{display:inline-block;margin:2px 4px 0 0;padding:1px 6px;border-radius:5px;font-size:10.5px;font-weight:500;white-space:nowrap}
   .lc-tag-stream{background:rgba(245,158,11,.16);color:var(--yellow)}
-  /* 客户端断连用中性灰，不用告警色：实测约 92% 已真交付内容，多数不是故障。
-     用红/黄会让人以为出了问题，而真正该警觉的是 lc-tag-stream（流故障）。 */
-  .lc-tag-gone{background:rgba(148,163,184,.16);color:var(--text-muted)}
+  /* 这里只会出现零输出且等待超过 3 秒的断连；正常取消已被后端排除。 */
+  .lc-tag-gone{background:rgba(245,158,11,.16);color:var(--yellow)}
   /* 归因列。用描边而非实心底色，与左侧那些「事实」标签在视觉上区分开——
      它是推断，不该和事实拥有同等的视觉确定性。 */
   .lc-fault{white-space:nowrap;vertical-align:middle}
+  .lc-fault-reason{white-space:normal;line-height:1.45;margin-top:3px;max-width:30ch}
+  .lc-attribution-summary{margin-top:4px}
   .lc-fault-tag{display:inline-block;padding:2px 7px;border-radius:5px;font-size:11px;font-weight:500;border:1px solid;background:transparent;cursor:help}
   .lc-fault-up{border-color:rgba(239,68,68,.5);color:var(--red)}
   .lc-fault-ours{border-color:rgba(245,158,11,.55);color:var(--yellow)}
@@ -428,6 +431,107 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
   .lc-copy:hover,.lc-jump:hover{border-color:var(--accent)}
   /* 原文不折行不美化:要能原样拿去问上游客服 */
   .lc-raw{margin:0;padding:11px 13px;background:var(--bg);border:1px solid var(--border);border-radius:8px;font-size:12px;line-height:1.6;overflow-x:auto;white-space:pre;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+  /* CloudWatch 按需证据块。状态色只区分三档语义：
+     found=已找到；empty=查了没有（中性，不能标成错误，否则会被读成故障）；
+     其余=查不了（告警色）。empty 与 unavailable 必须视觉可分。 */
+  .lc-cw{margin-top:12px;padding-top:10px;border-top:1px dashed var(--border)}
+  .lc-cw b.cw-found{color:var(--ok,#4ea672)}
+  .lc-cw b.cw-empty{color:var(--text-muted)}
+  .lc-cw b.cw-unavailable,.lc-cw b.cw-access_denied,.lc-cw b.cw-throttled,
+  .lc-cw b.cw-timeout,.lc-cw b.cw-invalid,.lc-cw b.cw-cancelled{color:var(--warn,#c9a227)}
+  .lc-cw-err{font-size:12px;color:var(--danger,#c0564f);margin:6px 0}
+  .lc-cw-summary{margin:8px 0;padding:9px 11px;border:1px solid var(--border);border-radius:8px;background:rgba(148,163,184,.05)}
+  .lc-cw-summary>b{font-size:13px;font-weight:600}
+  /* 全链路排障默认只展示原因和位置；来源/时间线收进可选详情，避免一点击就铺满原始信息。 */
+  .lc-cw-diagnosis{margin:8px 0;padding:10px 12px;border:1px solid var(--border);border-radius:8px;background:rgba(148,163,184,.06)}
+  .lc-cw-diagnosis-title{font-size:12px;color:var(--text-muted);margin-bottom:7px}
+  .lc-cw-diagnosis-grid{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:10px}
+  .lc-cw-diagnosis-grid>div{display:flex;flex-direction:column;gap:3px;min-width:0}
+  .lc-cw-diagnosis-grid span{font-size:11px;color:var(--text-muted)}
+  .lc-cw-diagnosis-grid b{font-size:13px;line-height:1.45}
+  .lc-cw-diagnosis-note{margin-top:8px;padding-top:7px;border-top:1px dashed var(--border);font-size:12px;color:var(--text-muted)}
+  .lc-cw-technical{margin:8px 0;border:1px solid var(--border);border-radius:8px;padding:7px 10px}
+  .lc-cw-technical>summary{cursor:pointer;font-size:12px;color:var(--text-muted)}
+  .lc-cw-timeline{display:flex;flex-direction:column;gap:6px;margin:7px 0 10px;padding-left:10px;border-left:2px solid var(--border)}
+  .lc-cw-event{display:grid;grid-template-columns:150px minmax(130px,180px) 1fr auto;gap:8px;align-items:baseline;font-size:12px}
+  .lc-cw-event time,.lc-cw-event small{color:var(--text-muted)}
+  .lc-cw-evidence{margin:8px 0;border:1px solid var(--border);border-radius:8px;padding:7px 10px}
+  .lc-cw-evidence summary{cursor:pointer;font-size:12px;color:var(--text-muted)}
+  .lc-cw-proof{display:flex;flex-direction:column;gap:2px;padding:6px 0;border-top:1px dashed var(--border);font-size:12px}
+  .lc-cw-proof small{color:var(--text-muted);word-break:break-all}
+  @media(max-width:900px){.lc-cw-event{grid-template-columns:1fr}.lc-cw-event time{order:-1}.lc-cw-diagnosis-grid{grid-template-columns:1fr}}
+  /* ── 客户维护(tab-customer-health) ──
+     沿用客户排障的变量与配色，不引入新色板。
+     ch-bad 标红只用于"有稳定率且低于阈值"；今天没有请求的行不标红——
+     那是缺数据，标红会被读成故障。 */
+  .ch-bar{display:flex;align-items:center;gap:10px}
+  .ch-meta{font-size:12px;color:var(--text-muted)}
+  .ch-bar button,.ch-add button{background:var(--surface);color:var(--text);border:1px solid var(--border);border-radius:7px;padding:6px 14px;font-size:13px;cursor:pointer}
+  .ch-bar button:hover,.ch-add button:hover{border-color:var(--accent)}
+  .ch-add{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:12px 0;padding:12px;background:var(--surface);border:1px solid var(--border);border-radius:9px}
+  .ch-add label{font-size:13px;color:var(--text-muted)}
+  .ch-add input{background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:7px;padding:6px 10px;font-size:13px;min-width:190px}
+  .ch-add input:focus{outline:none;border-color:var(--accent)}
+  .ch-formerr{font-size:12px;color:var(--danger,#c0564f)}
+  /* 表格本体复用 .lc-table（见客户排障那一段），这里只加本页特有的格样式。
+     标红沿用 .lc-table tr.lc-err td 的红底：与客户排障"错误行"同一视觉语言，
+     不另造一套颜色。 */
+  /* 整行可点。.lc-table 那条 cursor 规则绑的是 [data-lc-id]，本页行用
+     data-ch-row，所以要自己写一条，否则鼠标停在行上没有"可点"的提示。 */
+  .ch-table tbody tr[data-ch-row]{cursor:pointer}
+  .ch-table tbody tr[data-ch-row]:hover td{background:rgba(148,163,184,.07)}
+  .ch-table tr.lc-err:hover td{background:rgba(239,68,68,.12)}
+  .ch-company{font-weight:500}
+  .ch-company .ch-arrow{color:var(--text-muted);font-size:11px;margin-right:5px}
+  .ch-mix span{font-size:11px;padding:1px 5px;border-radius:4px;margin-right:3px;white-space:nowrap}
+  .ch-mix .ok{background:rgba(16,185,129,.13);color:var(--green,#34d399)}
+  .ch-mix .anom{background:rgba(245,158,11,.16);color:var(--yellow)}
+  .ch-mix .fail{background:rgba(239,68,68,.16);color:var(--red)}
+  .ch-impact{display:block;margin-top:4px;font-size:10.5px;color:var(--text-muted);line-height:1.4}
+  .ch-primary-model{display:flex;flex-direction:column;gap:2px;min-width:0}
+  .ch-primary-model b{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12.5px}
+  .ch-primary-model span{font-size:10.5px;color:var(--text-muted)}
+  .ch-primary-model.ch-none b{font-weight:400;color:var(--text-muted)}
+  .ch-stability{white-space:nowrap;font-variant-numeric:tabular-nums}
+  .ch-stability b{font-size:14px}
+  .ch-table tr.lc-err .ch-stability b{color:var(--red)}
+  /* 金额列：等宽数字，右对齐，便于竖着比大小。
+     取不到时显示「—」并带 title 说明，绝不显示 $0.00。 */
+  .ch-spend{text-align:right;white-space:nowrap;font-variant-numeric:tabular-nums}
+  .ch-spend b{font-size:13.5px}
+  .ch-spend .ch-spend-state{display:block;margin-top:2px;font-size:10.5px;color:var(--text-muted)}
+  .ch-spend .ch-unknown{color:var(--text-muted);font-weight:400}
+  /* 展开区：与客户排障的 .lc-detail 同构（整行 td colspan 承载）。
+     内边距由 .lc-detail td 提供，这里不再加，否则双重留白。 */
+  .ch-detail{padding:0}
+  .ch-detail-note{font-size:11.5px;color:var(--text-muted);line-height:1.6;margin-bottom:10px}
+  .ch-stats{display:flex;gap:22px;flex-wrap:wrap;padding-bottom:12px}
+  .ch-stats div{display:flex;flex-direction:column;gap:2px}
+  .ch-stats b{font-size:16px}
+  .ch-stats span{font-size:11px;color:var(--text-muted)}
+  .ch-reason{padding:10px 0;border-top:1px dashed var(--border)}
+  .ch-reason-line{display:flex;align-items:center;gap:8px;margin:6px 0}
+  .ch-tag{font-size:12px;color:var(--text-muted);min-width:96px}
+  .ch-conf{font-size:11px;color:var(--text-muted)}
+  .ch-none{color:var(--text-muted)}
+  .ch-reason-why{font-size:12px;color:var(--text-muted);line-height:1.6;margin-left:104px}
+  .ch-scope{font-size:12px;padding:2px 8px;border-radius:6px;background:rgba(128,128,128,.12)}
+  .ch-scope-only_this_customer{background:rgba(192,86,79,.15);color:var(--danger,#c0564f)}
+  .ch-scope-all_customers{background:rgba(245,158,11,.15);color:var(--yellow,#c9a227)}
+  .ch-scope-no_problem{background:rgba(16,185,129,.13);color:var(--green,#4ea672)}
+  .ch-list{padding:10px 0;border-top:1px dashed var(--border)}
+  .ch-member{display:flex;align-items:center;gap:10px;padding:4px 0;font-size:13px}
+  .ch-mid{color:var(--text-muted);font-size:12px;min-width:52px}
+  .ch-mname{flex:1}
+  .ch-mini{background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:3px 10px;font-size:12px;cursor:pointer}
+  .ch-mini:hover{border-color:var(--accent)}
+  .ch-mini.ch-danger{color:var(--danger,#c0564f)}
+  .ch-mini.ch-danger:hover{border-color:var(--danger,#c0564f)}
+  .ch-edit{display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:10px 0;border-top:1px dashed var(--border)}
+  .ch-edit label{font-size:12px;color:var(--text-muted);display:flex;align-items:center;gap:6px}
+  .ch-edit input{background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:5px 9px;font-size:13px;min-width:170px}
+  .ch-actions{display:flex;align-items:center;gap:8px;padding-top:10px;border-top:1px dashed var(--border)}
+  .ch-hint{font-size:11px;color:var(--text-muted);margin-left:auto}
   .lc-more{padding:12px;text-align:center;border-top:1px solid var(--border)}
   .lc-more button{background:var(--surface);color:var(--text);border:1px solid var(--border);border-radius:7px;padding:7px 16px;font-size:13px;cursor:pointer}
   .lc-more button:hover{border-color:var(--accent)}
@@ -470,7 +574,8 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
 <link rel="stylesheet" href="/stability.css?v=13">
 <link rel="stylesheet" href="/capacity.css?v=2">
 <link rel="stylesheet" href="/group-governance.css?v=1">
-  <link rel="stylesheet" href="/finance.css?v=13">
+<link rel="stylesheet" href="/finance.css?v=13">
+<link rel="stylesheet" href="/model-statistics.css?v=2">
 </head>
 <body theme-mode="dark">
 <div class="monitor-shell">
@@ -486,9 +591,11 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
       <div class="tab" data-tab="model" title="模型监控"><span class="monitor-nav-icon"><svg viewBox="0 0 24 24"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg></span><span class="monitor-nav-label">模型监控</span></div>
       <div class="tab" data-tab="server" title="服务端监控"><span class="monitor-nav-icon"><svg viewBox="0 0 24 24"><path d="M3 3v18h18"/><path d="m7 16 4-5 4 3 5-7"/></svg></span><span class="monitor-nav-label">服务端监控</span></div>
       <div class="tab" data-tab="capacity" title="容量规划"><span class="monitor-nav-icon"><svg viewBox="0 0 24 24"><path d="M4 19V9M10 19V5M16 19v-8M22 19V3"/><path d="M2 19h22"/></svg></span><span class="monitor-nav-label">容量规划</span></div>
+      <div class="tab" data-tab="model-statistics" title="模型统计"><span class="monitor-nav-icon"><svg viewBox="0 0 24 24"><path d="M4 19V5M4 19h17"/><path d="m7 15 3-4 3 2 5-6"/></svg></span><span class="monitor-nav-label">模型统计</span></div>
       <div class="tab" data-tab="sync" title="数据同步状态"><span class="monitor-nav-icon"><svg viewBox="0 0 24 24"><path d="M20 7h-6V1"/><path d="M4 17h6v6"/><path d="M20 7a8 8 0 0 0-13.7-3.6L4 5.7M4 17a8 8 0 0 0 13.7 3.6l2.3-2.3"/></svg></span><span class="monitor-nav-label">数据同步状态</span></div>
       <div class="tab" data-tab="logchain" title="客户排障"><span class="monitor-nav-icon"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/><path d="M11 8v3"/><path d="M11 14h.01"/></svg></span><span class="monitor-nav-label">客户排障</span></div>
       <div class="tab" data-tab="alerts" title="问题预警"><span class="monitor-nav-icon"><svg viewBox="0 0 24 24"><path d="M12 9v4"/><path d="M12 17h.01"/><path d="M10.3 3.9 2 18a2 2 0 0 0 1.7 3h16.6a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/></svg></span><span class="monitor-nav-label">问题预警</span></div>
+      <div class="tab" data-tab="customer-health" title="客户维护"><span class="monitor-nav-icon"><svg viewBox="0 0 24 24"><path d="M20.8 4.6a5.5 5.5 0 0 0-7.8 0L12 5.7l-1-1.1a5.5 5.5 0 0 0-7.8 7.8L12 21l8.8-8.6a5.5 5.5 0 0 0 0-7.8z"/></svg></span><span class="monitor-nav-label">客户维护</span></div>
       <div class="tab" data-tab="group-governance" title="分组治理（测试）"><span class="monitor-nav-icon"><svg viewBox="0 0 24 24"><circle cx="6" cy="6" r="2"/><circle cx="18" cy="6" r="2"/><circle cx="12" cy="18" r="2"/><path d="M8 7.2l3 8.2M16 7.2l-3 8.2M8 6h8"/></svg></span><span class="monitor-nav-label">分组治理</span></div>
       <div class="tab" data-tab="finance" title="经营核算"><span class="monitor-nav-icon"><svg viewBox="0 0 24 24"><path d="M4 3h16v18H4z"/><path d="M8 7h8M8 11h2M14 11h2M8 15h2M14 15h2M8 19h2M14 19h2"/></svg></span><span class="monitor-nav-label">经营核算</span></div>
     </nav>
@@ -514,8 +621,12 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
       <div class="tab" data-tab="model">模型监控</div>
       <div class="tab" data-tab="server">服务端监控</div>
       <div class="tab" data-tab="capacity">容量规划</div>
+      <div class="tab" data-tab="model-statistics">模型统计</div>
       <div class="tab" data-tab="logchain">客户排障</div>
       <div class="tab" data-tab="alerts">问题预警</div>
+      <!-- 顺序与侧栏一致（alerts 之后、group-governance 之前）。
+           小屏会隐藏侧栏，这里漏一项就等于该页在移动端完全进不去。 -->
+      <div class="tab" data-tab="customer-health">客户维护</div>
       <div class="tab" data-tab="group-governance">分组治理</div>
       <div class="tab" data-tab="finance">经营核算</div>
     </nav>
@@ -796,6 +907,22 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
   <div class="fin-footnote" id="finFootnote">经营核算口径待读取。</div>
 </div><!-- /tab-finance -->
 
+<div class="tabpane model-statistics-page" id="tab-model-statistics" hidden>
+  <div class="ms-toolbar">
+    <div><h2>模型统计</h2><p>按模型请求次数排行；展开模型查看分组，再点分组查看客户请求次数和占比；无可用渠道的模型请求也会计入。</p></div>
+    <div class="ms-range" role="group" aria-label="模型统计时间范围">
+      <button type="button" data-ms-window="24h" class="active">近24小时</button>
+      <button type="button" data-ms-window="3d">近3天</button>
+      <button type="button" data-ms-window="7d">近7天</button>
+    </div>
+    <span class="ms-status" id="msStatus">尚未加载</span>
+  </div>
+  <div class="ms-error" id="msError" hidden></div>
+  <div class="ms-summary" id="msSummary"></div>
+  <div class="ms-note" id="msCoverage">数据来自 Monitor 本地模型事实。</div>
+  <div id="msModels"><div class="ms-empty">进入页面后加载本地模型统计。</div></div>
+</div><!-- /tab-model-statistics -->
+
 <div class="tabpane channel-management-page" id="tab-channels" hidden>
   <div class="cm-toolbar">
     <div>
@@ -1040,9 +1167,9 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
     <span class="lc-scopebar" role="group" aria-label="查看范围">
       <button type="button" data-lc-scope="error" title="上游返回错误的请求(type=5)">错误</button>
       <button type="button" data-lc-scope="stream" title="流传输真的出故障：timeout / scanner_error / panic / ping_fail，以及没见过的新取值。原值直接显示，不归类。不含客户端断连——那是单独一档">流故障</button>
-      <button type="button" data-lc-scope="client_gone" title="下游客户端主动断开连接。多数不是故障（实测约 92% 已经交付了内容），单独成一档以免淹掉真正的流故障。耗时长的断连可能是上游拖慢把客户等跑了，请一并看耗时">客户端断连</button>
+      <button type="button" data-lc-scope="client_gone" title="只看零输出且等待超过 3 秒后断开的请求。已经产生输出，或零输出但在 3 秒内取消，均按正常处理，不进入异常日志。">等待超时后断连</button>
       <button type="button" data-lc-scope="billing" title="扣费未交付、未交付且未扣费，或交付未扣费">消费异常</button>
-      <button type="button" data-lc-scope="anomaly_all" title="流故障 + 客户端断连 + 消费异常">全部异常</button>
+      <button type="button" data-lc-scope="anomaly_all" title="流故障 + 零输出且超过 3 秒的断连 + 消费异常">全部异常</button>
       <button type="button" data-lc-scope="err_anom" class="active" title="错误 + 全部异常，即本页能查到的全部问题">错误+异常</button>
     </span>
     <select id="lcGroup" aria-label="服务分组"><option value="">全部服务分组</option></select>
@@ -1114,6 +1241,50 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
   </div>
   <div class="lc-toast" id="lcToast" hidden></div>
 </div>
+<div class="tabpane logchain-page" id="tab-customer-health" hidden>
+  <div class="lc-toolbar">
+    <div>
+      <h2>客户维护</h2>
+      <p>盯住重点客户今天用得顺不顺。只看日志记录稳定性与大致责任方，不列请求日志——具体内容去「客户排障」。</p>
+    </div>
+    <div class="ch-bar">
+      <span class="ch-meta" id="chMeta"></span>
+      <button type="button" id="chRefresh">刷新</button>
+    </div>
+  </div>
+
+  <form class="ch-add" id="chAddForm">
+    <label for="chUsername">用户名</label>
+    <input id="chUsername" type="text" placeholder="用户ID或已同步用户名" autocomplete="off">
+    <label for="chCompany">公司名</label>
+    <input id="chCompany" type="text" maxlength="64" placeholder="该客户所属公司" autocomplete="off">
+    <button type="submit" id="chConfirm">确认</button>
+    <span class="ch-formerr" id="chFormError"></span>
+  </form>
+
+  <!-- 表格样式复用客户排障的 .lc-table 一套（用户明确要求：用客户排障展示日志那种样式）。
+       不另写一份 .ch-table：两份样式迟早漂移，同一个系统里两个页面会长得不一样。
+       .ch-* 只保留本页特有的东西（新增表单、成员行、金额格）。 -->
+  <div class="card lc-card">
+    <div class="lc-tablewrap">
+      <table class="lc-table ch-table">
+        <thead><tr>
+          <th style="width:17%"><span class="lc-th">公司</span><span class="lc-th-sub">点行展开 · 成员与操作</span></th>
+          <th style="width:7%"><span class="lc-th">用户数</span><span class="lc-th-sub">名单内账号</span></th>
+          <th style="width:17%"><span class="lc-th">今日日志记录</span><span class="lc-th-sub">正常 / 异常 / 错误记录</span></th>
+          <th style="width:11%"><span class="lc-th">记录稳定率</span><span class="lc-th-sub">日志条数口径 · 按责任方筛选</span></th>
+          <th style="width:14%"><span class="lc-th">主要模型</span><span class="lc-th-sub">最多模型 · 两个均超 40% 时都显示</span></th>
+          <th style="width:12%"><span class="lc-th">今日消耗</span><span class="lc-th-sub">已扣退款 · 取不到显示「—」</span></th>
+          <th><span class="lc-th">疑似责任方</span><span class="lc-th-sub">渠道级推断 · 非逐条判定</span></th>
+        </tr></thead>
+        <!-- colspan 必须等于表头列数（当前 7：公司/用户数/日志记录/记录稳定率/主要模型/今日消耗/疑似责任方）。
+             加列时这里、customer_health.js 的空状态与 rowHTML 的 td 数三处必须同改。 -->
+        <tbody id="chRows"><tr><td colspan="7" class="lc-empty">加载中…</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
 <div class="tabpane logchain-page" id="tab-alerts" hidden>
   <div class="lc-toolbar">
     <div>
@@ -1288,11 +1459,13 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
 <script src="/stability.js?v=5"></script>
 <script src="/channel-data-status.js?v=1"></script>
 <script src="/channel-management.js?v=13"></script>
-<script src="/logchain.js?v=12"></script>
+<script src="/logchain.js?v=15"></script>
+<script src="/customer-health.js?v=3"></script>
 <script src="/alerts.js?v=1"></script>
 <script src="/capacity.js?v=2"></script>
 <script src="/group-governance.js?v=1"></script>
 <script src="/finance.js?v=36"></script>
+<script src="/model-statistics.js?v=2"></script>
 <script src="/infra-assets.js?v=1"></script>
 <script src="/ecs-log-sources.js?v=1"></script>
 <script>
@@ -2157,11 +2330,13 @@ function switchTab(name,preserveHash){
   document.getElementById('tab-channels').hidden=(name!=='channels');
   document.getElementById('tab-server').hidden=(name!=='server');
   document.getElementById('tab-capacity').hidden=(name!=='capacity');
+  document.getElementById('tab-model-statistics').hidden=(name!=='model-statistics');
   document.getElementById('tab-usage').hidden=(name!=='usage');
   document.getElementById('tab-group-governance').hidden=(name!=='group-governance');
   document.getElementById('tab-finance').hidden=(name!=='finance');
   document.getElementById('tab-logchain').hidden=(name!=='logchain');
 document.getElementById('tab-alerts').hidden=(name!=='alerts');
+  document.getElementById('tab-customer-health').hidden=(name!=='customer-health');
   if(window.monitorShellSetTab)window.monitorShellSetTab(name);
   if(name==='server'){loadInfra();infraSchedule();setTimeout(resizeInfraCharts,80);}
   else if(infraTimer){clearInterval(infraTimer);}
@@ -2177,9 +2352,13 @@ document.getElementById('tab-alerts').hidden=(name!=='alerts');
   else if(window.channelManagementDeactivate)window.channelManagementDeactivate();
   if(name==='logchain'&&window.logChainActivate)window.logChainActivate();
   else if(window.logChainDeactivate)window.logChainDeactivate();
+  if(name==='customer-health'&&window.customerHealthActivate)window.customerHealthActivate();
+  else if(window.customerHealthDeactivate)window.customerHealthDeactivate();
 if(name==='alerts'&&window.alertsActivate)window.alertsActivate();
   if(name==='capacity'&&window.capacityActivate)window.capacityActivate();
   if(name!=='capacity'&&window.capacityDeactivate)window.capacityDeactivate();
+  if(name==='model-statistics'&&window.modelStatisticsActivate)window.modelStatisticsActivate();
+  else if(window.modelStatisticsDeactivate)window.modelStatisticsDeactivate();
   if(name==='model')setTimeout(resizeModelCharts,60); // 模型 tab 非默认可见,切回时按可见宽度重排图表
 }
 function resizeModelCharts(){[trendChart,longChart,sloGauge,latChart,ttftChart].forEach(c=>c&&c.resize());}
@@ -2925,6 +3104,9 @@ async function usageMutationPost(path,payload,actionKey){
     throw err;
   }
 }
+// 暴露给外置页面级 JS（customer_health.js）复用，保持幂等键与释放语义只有一份实现。
+// 各页自己再写一遍 fetch，会出现有的带幂等键有的不带，重试语义随页面而异。
+window.usageMutationPost=usageMutationPost;
 async function usageAddUser(){
   const inp=document.getElementById('usrInput'),msg=document.getElementById('usrMsg');
   const v=(inp.value||'').trim(); if(!v)return;
@@ -3773,7 +3955,7 @@ setSeg();const _mePromise=loadMe();load();schedule();
 document.querySelectorAll('#longSeg a').forEach(a=>{a.href='javascript:void 0';a.classList.toggle('active',+a.dataset.d===longDays);a.addEventListener('click',e=>{e.preventDefault();longDays=+a.dataset.d;document.querySelectorAll('#longSeg a').forEach(x=>x.classList.toggle('active',x===a));loadLongTrend();});});
 loadLongTrend();
 // 默认落在「用户用量」;URL hash 带 tab(从报警设置返回/手动刷新)则恢复到该 tab。等 IS_ROOT 就位再渲染,模型/服务端数据后台预载
-_mePromise.finally(()=>{const q=monitorHashParams(),tab=q.get('tab');const target=/^(sync|model|server|capacity|usage|stability|channels|finance|logchain|alerts|group-governance)$/.test(tab||'')?tab:'usage';switchTab(target,true);window.dispatchEvent(new CustomEvent('monitor:navigate',{detail:{tab:target,context:window.monitorNavigationContext()}}))});
+_mePromise.finally(()=>{const q=monitorHashParams(),tab=q.get('tab');const target=/^(sync|model|server|capacity|model-statistics|usage|stability|channels|finance|logchain|alerts|group-governance|customer-health)$/.test(tab||'')?tab:'usage';switchTab(target,true);window.dispatchEvent(new CustomEvent('monitor:navigate',{detail:{tab:target,context:window.monitorNavigationContext()}}))});
 </script>
 </body>
 </html>

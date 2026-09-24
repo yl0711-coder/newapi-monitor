@@ -146,6 +146,12 @@ func (m *Monitor) startSampler(ctx context.Context) {
 	// lastRun/dead-man 只能由一次真实成功的来源采样更新。
 	// 启动、持有 lease 或本地回填完成都不能伪装新鲜度。
 	goSourceEpoch(ctx, func(loopCtx context.Context) { m.loop(loopCtx, interval) })
+	if m.cfg.CapacityEnabled {
+		// 客户维护责任方口径有独立版本。部署新口径时，普通来源采样器只回放
+		// 最近一小时不足以改写今天更早的旧分钟事实；后台低优先级补齐当天，
+		// 完成前报表由 policyReady fail-closed，不混用两套口径。
+		goSourceEpoch(ctx, m.backfillCustomerHealthPolicyToday)
+	}
 	slog.Info("采样器已启动", "interval", interval.String(), "note", "生产库仅执行有界小窗口只读查询")
 	if m.cfg.StabilityEnabled {
 		m.startStabilityBackfillMaintenance(ctx)
@@ -592,6 +598,17 @@ func (m *Monitor) sampleMetricRangeLow(ctx context.Context, fromTs, toTs int64) 
 }
 
 func (m *Monitor) sampleRangeWithPriority(ctx context.Context, fromTs, toTs int64, lowPriority, includeCapacity bool) (int, error) {
+	return m.sampleRangeWithPriorityOptions(ctx, fromTs, toTs, lowPriority, includeCapacity, true)
+}
+
+// sampleCustomerHealthRangeLow 复用同一条用户聚合 SQL 和扫描口径，但只落客户维护
+// 需要的用户分钟事实。logchain-only 没有主采样/封口链，顺带写 MetricSample 既没人消费，
+// 又会制造“普通采样器曾运行”的假象和冗余磁盘写入。
+func (m *Monitor) sampleCustomerHealthRangeLow(ctx context.Context, fromTs, toTs int64) (int, error) {
+	return m.sampleRangeWithPriorityOptions(ctx, fromTs, toTs, true, true, false)
+}
+
+func (m *Monitor) sampleRangeWithPriorityOptions(ctx context.Context, fromTs, toTs int64, lowPriority, includeCapacity, includeMetrics bool) (int, error) {
 	gateCtx := ctx
 	var cctx context.Context
 	var cancel context.CancelFunc
@@ -649,7 +666,12 @@ func (m *Monitor) sampleRangeWithPriority(ctx context.Context, fromTs, toTs int6
 		if includeCapacity {
 			scanArgs = append(scanArgs, &userID, &username)
 		}
-		scanArgs = append(scanArgs, &s.Success, &s.Anomaly, &s.Failed,
+		scanArgs = append(scanArgs, &s.Success, &s.Anomaly, &s.Failed)
+		var customerHealthAnomaly, customerHealthFailed int64
+		if includeCapacity {
+			scanArgs = append(scanArgs, &customerHealthAnomaly, &customerHealthFailed)
+		}
+		scanArgs = append(scanArgs,
 			&s.AnomalyBilled, &s.AnomalyFree, &s.AnomalyStream, &s.AnomalyQuota, &s.AnomalySumTime,
 			&s.SumUseTime, &s.MaxUseTime, &s.Tokens, &s.Quota, &s.RefundRecords, &s.RefundQuota,
 			&e4, &e5, &eto,
@@ -665,19 +687,24 @@ func (m *Monitor) sampleRangeWithPriority(ctx context.Context, fromTs, toTs int6
 		if other := s.Failed - e4 - e5 - eto; other > 0 {
 			s.ErrOther = other
 		}
-		key := metricKey{bucketTs: s.BucketTs, channelID: s.ChannelID, modelName: s.ModelName, grp: s.Grp}
-		aggregated := metricByKey[key]
-		if aggregated == nil {
-			aggregated = &MetricSample{BucketTs: s.BucketTs, ChannelID: s.ChannelID, ModelName: s.ModelName,
-				Grp: s.Grp, TrafficClassVersion: stabilityTrafficClassificationVersion}
-			metricByKey[key] = aggregated
+		if includeMetrics {
+			key := metricKey{bucketTs: s.BucketTs, channelID: s.ChannelID, modelName: s.ModelName, grp: s.Grp}
+			aggregated := metricByKey[key]
+			if aggregated == nil {
+				aggregated = &MetricSample{BucketTs: s.BucketTs, ChannelID: s.ChannelID, ModelName: s.ModelName,
+					Grp: s.Grp, TrafficClassVersion: stabilityTrafficClassificationVersion}
+				metricByKey[key] = aggregated
+			}
+			mergeMetricSample(aggregated, s)
 		}
-		mergeMetricSample(aggregated, s)
-		if includeCapacity && (s.Success+s.Anomaly+s.Failed > 0 || s.Tokens > 0) {
+		if includeCapacity && (s.Success+s.Anomaly+s.Failed > 0 || s.Tokens > 0 || s.Quota != 0 || s.RefundQuota != 0) {
 			userBatch = append(userBatch, CapacityUserMinuteSample{
 				BucketTs: s.BucketTs, UserID: userID, Username: username.String, ChannelID: s.ChannelID,
 				ModelName: s.ModelName, Grp: s.Grp, TrafficClassVersion: stabilityTrafficClassificationVersion,
-				Success: s.Success, Anomaly: s.Anomaly, Failed: s.Failed, Tokens: s.Tokens,
+				Success: s.Success, Anomaly: s.Anomaly, Failed: s.Failed,
+				CustomerHealthAnomaly: customerHealthAnomaly, CustomerHealthFailed: customerHealthFailed,
+				CustomerHealthVersion: customerHealthStabilityPolicyVersion, Tokens: s.Tokens,
+				Quota: s.Quota, RefundQuota: s.RefundQuota,
 			})
 		}
 	}
@@ -690,14 +717,19 @@ func (m *Monitor) sampleRangeWithPriority(ctx context.Context, fromTs, toTs int6
 		batch = append(batch, *sample)
 	}
 	if err := m.storeDB.Transaction(func(tx *gorm.DB) error {
-		if err := upsertSamplesDB(tx, batch); err != nil {
-			return err
+		if includeMetrics {
+			if err := upsertSamplesDB(tx, batch); err != nil {
+				return err
+			}
 		}
 		return upsertCapacityUserMinuteSamplesDB(tx, userBatch)
 	}); err != nil {
 		return 0, err
 	}
-	return len(batch), nil
+	if includeMetrics {
+		return len(batch), nil
+	}
+	return len(userBatch), nil
 }
 
 func mergeMetricSample(dst *MetricSample, src MetricSample) {
@@ -754,9 +786,12 @@ func sampleWindowSQLWithUser(includeUser bool) string {
 	//
 	// 交付异常判据见 expandAnomalyPredicates。
 	const frt = "(CASE WHEN JSON_VALID(other) THEN CAST(JSON_EXTRACT(other,'$.frt') AS SIGNED) ELSE 0 END)"
-	userColumns, userGroup := "", ""
+	userColumns, userHealthColumns, userGroup := "", "", ""
 	if includeUser {
 		userColumns = "  user_id, MAX(COALESCE(username,'')) AS username,\n"
+		userHealthColumns =
+			"  CAST(COALESCE(SUM(type=2 AND {{HEALTHANOM}}),0) AS SIGNED) AS customer_health_anomaly,\n" +
+				"  CAST(COALESCE(SUM(type=5 AND NOT " + customerHealthDownstreamErrorSQL() + "),0) AS SIGNED) AS customer_health_failed,\n"
 		userGroup = ", user_id"
 	}
 	q := `
@@ -767,6 +802,7 @@ SELECT /*+ MAX_EXECUTION_TIME(8000) */
   CAST(COALESCE(SUM(type=2 AND NOT {{ANOM}}),0) AS SIGNED) AS success,
   CAST(COALESCE(SUM(type=2 AND {{ANOM}}),0) AS SIGNED) AS anomaly,
   CAST(COALESCE(SUM(type=5),0) AS SIGNED) AS failed,
+` + userHealthColumns + `
   CAST(COALESCE(SUM(type=2 AND {{ZERO}} AND quota > 0),0) AS SIGNED) AS anomaly_billed,
   CAST(COALESCE(SUM(type=2 AND {{ZERO}} AND quota = 0),0) AS SIGNED) AS anomaly_free,
   CAST(COALESCE(SUM(type=2 AND {{STREAMBAD}} AND NOT {{ZERO}}),0) AS SIGNED) AS anomaly_stream,

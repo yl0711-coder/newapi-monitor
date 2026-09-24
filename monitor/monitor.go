@@ -56,6 +56,39 @@ type Monitor struct {
 	// nginxEvidenceDB 是短期、高基数的入口请求证据库。它与主库、用量事实库
 	// 分离；损坏、锁或满盘只会关闭 evidence lane，不影响现有 Monitor 页面。
 	nginxEvidenceDB *gorm.DB
+	// cloudWatchLogs 是独立、惰性初始化的只读证据 lane。默认关闭且不从
+	// New/Start/现有路由触发；它不复用生产 MySQL 或 Usage 的查询闸门。
+	cloudWatchLogs *cloudWatchLogsRuntime
+	// Shadow 每次最多运行一个有界窗口，避免 AWS 查询慢时叠加后台任务。
+	shadowRunInProgress atomic.Bool
+	// CloudWatch 前置拒绝连续采集与 Shadow 分离，只把已完整覆盖的分钟窗口
+	// 发布到 rejection_samples，供模型统计读取。
+	cloudWatchPreRouteRunning     atomic.Bool
+	cloudWatchPreRouteFrom        atomic.Int64
+	cloudWatchPreRouteThrough     atomic.Int64
+	cloudWatchPreRouteLastSuccess atomic.Int64
+	cloudWatchPreRouteLastFailure atomic.Int64
+	// CloudWatch Nginx 连续来源使用独立水位；任何查询、解析或发布失败都不
+	// 推进水位。页面只读已经原子发布的分钟事实。
+	cloudWatchNginxRunning     atomic.Bool
+	cloudWatchNginxFrom        atomic.Int64
+	cloudWatchNginxThrough     atomic.Int64
+	cloudWatchNginxLastSuccess atomic.Int64
+	cloudWatchNginxLastFailure atomic.Int64
+	// 请求级 Nginx evidence 的覆盖水位独立于分钟聚合水位。它用于让
+	// /ready 和排障页面明确知道“入口证据还在补扫”，而不是把未关联
+	// 误报成“请求没有到达”。
+	cloudWatchNginxEvidenceFrom        atomic.Int64
+	cloudWatchNginxEvidenceThrough     atomic.Int64
+	cloudWatchNginxEvidenceLastSuccess atomic.Int64
+	cloudWatchNginxEvidenceLastFailure atomic.Int64
+	// CloudWatch 排障任务只在管理员明确创建后运行。任务结果与短缓存留在内存，
+	// 本地 SQLite 仅保存不含原始 Request ID/IP 的追加式审计摘要。
+	investigationMu      sync.Mutex
+	investigationTasks   map[string]*logChainInvestigationTask
+	investigationCache   map[string]logChainInvestigationCacheEntry
+	investigationByOwner map[string]string
+	investigationWG      sync.WaitGroup
 	// nginxSourceV2SchemaReady records whether the isolated v2 ledger exists.
 	// It stays true after a persisted cutover even if the rollout flag is later
 	// turned off, so a restart can never reopen the legacy writer by accident.
@@ -69,27 +102,32 @@ type Monitor struct {
 	// without querying SQLite from the health endpoint.
 	nginxSourceV2RuntimeConfigOK atomic.Bool
 
-	lastRun                   atomic.Int64 // 采样心跳:最近一次成功采样的 Unix 秒(0=从未)
-	metricFinalizeThrough     atomic.Int64 // 模型/token 迟到日志已定稿到的右水位
-	metricFinalizeTarget      atomic.Int64 // 当前延迟定稿目标水位
-	metricFinalizeLastSuccess atomic.Int64
-	metricFinalizeLastFailure atomic.Int64
-	problemLastSuccess        atomic.Int64 // 原始错误采集器最近一次成功执行
-	problemLastFailure        atomic.Int64 // 原始错误采集器最近一次失败
-	problemLiveThrough        atomic.Int64 // 原始错误实时 lane 已确认到的分钟右水位
-	problemSourceRunning      atomic.Bool  // logchain-only 独立问题签名只读 lane 是否正在运行
-	stabilityBackfillRunning  atomic.Bool  // 长期小时补数串行闸门；人工任务与自动修洞共用
-	metricBackfillMu          sync.RWMutex
-	metricBackfillStatus      MetricBackfillStatus
-	usageFactsHistoryRestarts atomic.Int64 // 全历史持久 worker panic/意外退出后的守护重启次数
-	ctxMu                     sync.RWMutex
-	backgroundCtx             context.Context // Start 注入；后台任务不绑定浏览器请求生命周期
-	shutdownInitOnce          sync.Once
-	closeOnce                 sync.Once
-	portalGCOnce              sync.Once
-	shutdown                  chan struct{}
-	processStartedAt          atomic.Int64
-	shuttingDown              atomic.Bool
+	lastRun                         atomic.Int64 // 采样心跳:最近一次成功采样的 Unix 秒(0=从未)
+	metricFinalizeThrough           atomic.Int64 // 模型/token 迟到日志已定稿到的右水位
+	metricFinalizeTarget            atomic.Int64 // 当前延迟定稿目标水位
+	metricFinalizeLastSuccess       atomic.Int64
+	metricFinalizeLastFailure       atomic.Int64
+	problemLastSuccess              atomic.Int64 // 原始错误采集器最近一次成功执行
+	problemLastFailure              atomic.Int64 // 原始错误采集器最近一次失败
+	problemLiveThrough              atomic.Int64 // 原始错误实时 lane 已确认到的分钟右水位
+	problemSourceRunning            atomic.Bool  // logchain-only 独立问题签名只读 lane 是否正在运行
+	customerHealthSourceRunning     atomic.Bool  // logchain-only 客户维护只读 lane 是否正在运行
+	customerHealthSourceFrom        atomic.Int64 // 当天连续覆盖左水位（CST 日起点）
+	customerHealthSourceThrough     atomic.Int64 // 当天连续覆盖右水位（不含）
+	customerHealthSourceLastSuccess atomic.Int64
+	customerHealthSourceLastFailure atomic.Int64
+	stabilityBackfillRunning        atomic.Bool // 长期小时补数串行闸门；人工任务与自动修洞共用
+	metricBackfillMu                sync.RWMutex
+	metricBackfillStatus            MetricBackfillStatus
+	usageFactsHistoryRestarts       atomic.Int64 // 全历史持久 worker panic/意外退出后的守护重启次数
+	ctxMu                           sync.RWMutex
+	backgroundCtx                   context.Context // Start 注入；后台任务不绑定浏览器请求生命周期
+	shutdownInitOnce                sync.Once
+	closeOnce                       sync.Once
+	portalGCOnce                    sync.Once
+	shutdown                        chan struct{}
+	processStartedAt                atomic.Int64
+	shuttingDown                    atomic.Bool
 	// 来源库生命周期与 Web/SQLite 服务解耦。这些状态只由
 	// supervisor 写、健康接口原子读，绝不在 /ready 请求中探测 MySQL。
 	sourceLifecycleInitialized atomic.Bool
@@ -342,6 +380,21 @@ func New(s Settings) (*Monitor, error) {
 	if err := validateStabilityProblemSourceSettings(s); err != nil {
 		return nil, err
 	}
+	if err := validateCustomerHealthSourceSettings(s); err != nil {
+		return nil, err
+	}
+	if err := validateCloudWatchLogsSettings(s); err != nil {
+		return nil, err
+	}
+	if err := validateCloudWatchShadowSettings(s); err != nil {
+		return nil, err
+	}
+	if err := validateCloudWatchPreRouteSettings(s); err != nil {
+		return nil, err
+	}
+	if err := validateCloudWatchNginxSettings(s); err != nil {
+		return nil, err
+	}
 	credentialSecretConfigured := strings.TrimSpace(s.UpstreamCredentialSecret) != "" || strings.TrimSpace(s.SessionSecret) != ""
 	if err := validateNginxSettings(s); err != nil {
 		return nil, err
@@ -361,6 +414,7 @@ func New(s Settings) (*Monitor, error) {
 		snapCache:                    map[snapshotCacheKey]cachedSnap{},
 		usageCache:                   newUsageResultCache(s),
 		upstreamClient:               newUpstreamHTTPClient(upstreamSyncTimeout(s)),
+		cloudWatchLogs:               newCloudWatchLogsRuntime(s.CloudWatchLogsEnabled, nil),
 		upstreamCredentialPersistent: credentialSecretConfigured,
 		sourceFailureNotify:          make(chan struct{}, 1),
 	}
@@ -426,6 +480,67 @@ func validateStabilityProblemSourceSettings(s Settings) error {
 	return nil
 }
 
+func validateCustomerHealthSourceSettings(s Settings) error {
+	if !s.CustomerHealthSourceEnabled {
+		return nil
+	}
+	if s.LocalSnapshotOnly {
+		return errors.New("客户维护来源采集不能在本地快照只读模式开启")
+	}
+	if !s.LogChainOnlySource {
+		return errors.New("MONITOR_CUSTOMER_HEALTH_SOURCE_ENABLED 只允许与 MONITOR_LOGCHAIN_ONLY_SOURCE=true 一起使用")
+	}
+	return nil
+}
+
+func validateCloudWatchPreRouteSettings(s Settings) error {
+	if !s.CloudWatchPreRouteEnabled {
+		return nil
+	}
+	if !s.CloudWatchLogsEnabled {
+		return errors.New("MONITOR_CLOUDWATCH_PREROUTE_ENABLED 必须同时开启 MONITOR_CLOUDWATCH_LOGS_ENABLED")
+	}
+	if s.LocalSnapshotOnly {
+		return errors.New("CloudWatch 前置拒绝采集不能在本地快照只读模式开启")
+	}
+	if s.CloudWatchPreRoutePollSeconds < 60 || s.CloudWatchPreRoutePollSeconds > 900 {
+		return errors.New("MONITOR_CLOUDWATCH_PREROUTE_POLL_SECONDS 必须在 60～900 之间")
+	}
+	if s.CloudWatchPreRouteLookbackHours < 1 || s.CloudWatchPreRouteLookbackHours > 168 {
+		return errors.New("MONITOR_CLOUDWATCH_PREROUTE_LOOKBACK_HOURS 必须在 1～168 之间")
+	}
+	return nil
+}
+
+func validateCloudWatchNginxSettings(s Settings) error {
+	if !s.CloudWatchNginxEnabled {
+		return nil
+	}
+	if !s.CloudWatchLogsEnabled {
+		return errors.New("MONITOR_CLOUDWATCH_NGINX_ENABLED 必须同时开启 MONITOR_CLOUDWATCH_LOGS_ENABLED")
+	}
+	if !s.NginxEnabled {
+		return errors.New("MONITOR_CLOUDWATCH_NGINX_ENABLED 必须同时开启 MONITOR_NGINX_ENABLED")
+	}
+	if s.LocalSnapshotOnly {
+		return errors.New("CloudWatch Nginx 持续采集不能在本地快照只读模式开启")
+	}
+	if s.CloudWatchNginxPollSeconds < 60 || s.CloudWatchNginxPollSeconds > 900 {
+		return errors.New("MONITOR_CLOUDWATCH_NGINX_POLL_SECONDS 必须在 60～900 之间")
+	}
+	if s.CloudWatchNginxLookbackHours < 1 || s.CloudWatchNginxLookbackHours > 168 {
+		return errors.New("MONITOR_CLOUDWATCH_NGINX_LOOKBACK_HOURS 必须在 1～168 之间")
+	}
+	retentionDays := s.NginxRetentionDays
+	if retentionDays < 1 || retentionDays > 90 {
+		retentionDays = 7
+	}
+	if s.CloudWatchNginxLookbackHours > retentionDays*24 {
+		return errors.New("MONITOR_CLOUDWATCH_NGINX_LOOKBACK_HOURS 不能超过 Nginx 本地事实保留期")
+	}
+	return nil
+}
+
 // validateLocalAuthBypassSettings 让“免登录”只能存在于完全离线的本机快照。
 // 它不依赖部署人员记得关开关：只要配置中仍有任何生产或外部主动连接，
 // 进程就 fail closed，不会带着免登录界面启动。
@@ -445,8 +560,8 @@ func validateLocalAuthBypassSettings(s Settings) error {
 	if s.SourceWorkerEnabled || s.SourceLeaseRequired || s.UpstreamSyncEnabled || s.UpstreamUsageSyncEnabled || s.UpstreamPricingLedgerEnabled || s.UpstreamErrorLogSyncEnabled || s.UpstreamFundsSyncEnabled || s.ChannelCostClosureEnabled {
 		return errors.New("本地免登录模式要求关闭来源 worker、来源租约和全部上游同步")
 	}
-	if s.NginxEnabled || s.InfraEnabled || strings.TrimSpace(s.HeartbeatURL) != "" || !s.AlertsDisabled {
-		return errors.New("本地免登录模式要求关闭 Nginx/AWS 主动采集、外部心跳和所有告警")
+	if s.NginxEnabled || s.InfraEnabled || s.CloudWatchLogsEnabled || strings.TrimSpace(s.HeartbeatURL) != "" || !s.AlertsDisabled {
+		return errors.New("本地免登录模式要求关闭 Nginx/AWS 主动采集、CloudWatch Logs 读取、外部心跳和所有告警")
 	}
 	return nil
 }
@@ -620,6 +735,11 @@ func (m *Monitor) Start(ctx context.Context) {
 	if m.cfg.InfraEnabled {
 		go m.startInfra(ctx)
 	}
+	// 阶段四 Shadow 只有在 CloudWatch 与 Nginx 结构化日志契约均显式
+	// 准入后才会启动；默认配置不会创建后台任务或访问 AWS。
+	m.startCloudWatchPreRoute(ctx)
+	m.startCloudWatchNginx(ctx)
+	m.startCloudWatchShadow(ctx)
 	if ecsLogRuntimeEnabled(m.cfg) {
 		go m.startECSLogDiscovery(ctx)
 		if m.cfg.ECSArchiveEnabled {
@@ -845,6 +965,14 @@ func (m *Monitor) Close() {
 	m.closeOnce.Do(func() {
 		m.shuttingDown.Store(true)
 		close(m.shutdownSignal())
+		m.investigationMu.Lock()
+		for _, task := range m.investigationTasks {
+			if task != nil && task.Cancel != nil && (task.Status == "queued" || task.Status == "running" || task.Status == "pending_delivery") {
+				task.Cancel()
+			}
+		}
+		m.investigationMu.Unlock()
+		m.investigationWG.Wait()
 		if !m.stopAndWaitSource() {
 			// 有缺陷的 worker 忽略 cancel 时，不关闭它仍可能读写的
 			// DB/HTTP 对象，也不释放 lease。容器将在 stop grace 内退出，

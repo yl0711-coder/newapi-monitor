@@ -71,6 +71,10 @@ type Settings struct {
 	// 只控制旧 Nginx/ECS 采集链路是否参与稳定性健康判定。关闭时不停止
 	// 接收器、不改变 ownership 账本、不删除历史数据，用于日志职责迁至 CloudWatch 的过渡期。
 	StabilityLegacyCollectorHealthEnabled bool // MONITOR_STABILITY_LEGACY_COLLECTOR_HEALTH_ENABLED，默认 true
+	// CustomerHealthSourceEnabled 是 logchain-only 验收环境的客户维护独立只读 lane。
+	// 它只读取生产 logs(type=2/5/6)，把当天的用户分钟统计与净 quota 写入本地 SQLite；
+	// 不读取 users/tokens/options，不启动 Usage Facts，也不写 NewAPI。
+	CustomerHealthSourceEnabled bool // MONITOR_CUSTOMER_HEALTH_SOURCE_ENABLED，默认 false
 	// 长期小时数据补数直接聚合生产 logs 的单个小时，不写分钟表。查询始终串行，
 	// 片间延迟和来源占用率共同给主站数据库让路。分类规则升级产生的大范围
 	// 缺口只能通过显式 migration 开关自动创建持久任务，不能随普通修洞静默启动。
@@ -240,6 +244,39 @@ type Settings struct {
 	// 留空 = 关闭接收接口(POST /internal/rejections 返回 503),不接受任何推送。
 	// 同一 token 也用于 POST /internal/host(各节点主机 agent 推送 OS 内存/磁盘)。
 	IngestToken string // MONITOR_INGEST_TOKEN
+	// CloudWatch Logs 只读排障底座。默认关闭；阶段 1 只允许内部固定查询，
+	// 不注册页面/API、不启动后台任务，也不接受任意区域、日志组或查询语句。
+	CloudWatchLogsEnabled bool // MONITOR_CLOUDWATCH_LOGS_ENABLED
+	// CloudWatch 结构化证据的脱敏密钥。Request ID、客户 IP 与慢查询 SQL 只以
+	// 分域 HMAC 形式出现在响应里，绝不回传原值，因此这把密钥是必需项而非可选。
+	//
+	// 运维建议与 MONITOR_NGINX_EVIDENCE_HMAC_KEY 配成同值：这样 CloudWatch 与
+	// 现有采集器对同一请求产出相同 oneapi_id_hmac，阶段 4 Shadow 对账才能逐条比对。
+	CloudWatchEvidenceHMACKey   string // MONITOR_CLOUDWATCH_EVIDENCE_HMAC_KEY
+	CloudWatchEvidenceHMACKeyID string // MONITOR_CLOUDWATCH_EVIDENCE_HMAC_KEY_ID
+	// 阶段四 Shadow 只定义配置契约；默认关闭，开发准备阶段不会启动
+	// 调度器或开始 7 天计时。开启前必须先完成 CloudWatch Nginx access
+	// 日志投递验收，并保留旧采集器作为对照侧。
+	CloudWatchShadowEnabled bool // MONITOR_CLOUDWATCH_SHADOW_ENABLED，默认 false
+	// 这是一个人为确认的生产准入闸门，不会自动由“查到日志”推断。
+	// 未完成 schema 2 JSONL/结构化字段投递验收时必须保持 false，避免把
+	// 纯文本 access 日志的 0 条结果误当成对账一致。
+	CloudWatchShadowNginxContractReady bool // MONITOR_CLOUDWATCH_SHADOW_NGINX_CONTRACT_READY，默认 false
+	CloudWatchShadowIntervalMinutes    int  // MONITOR_CLOUDWATCH_SHADOW_INTERVAL_MINUTES，默认 15
+	CloudWatchShadowLookbackMinutes    int  // MONITOR_CLOUDWATCH_SHADOW_LOOKBACK_MINUTES，默认 15
+	CloudWatchShadowRetentionDays      int  // MONITOR_CLOUDWATCH_SHADOW_RETENTION_DAYS，默认 14
+	// CloudWatchPreRouteEnabled 启用前置拒绝的连续只读采集。它与 Shadow 完全
+	// 分离：采集结果写入 rejection_samples，供模型统计消费；不会生成对账记录，
+	// 也不会打开 Nginx Shadow。
+	CloudWatchPreRouteEnabled       bool // MONITOR_CLOUDWATCH_PREROUTE_ENABLED，默认 false
+	CloudWatchPreRoutePollSeconds   int  // MONITOR_CLOUDWATCH_PREROUTE_POLL_SECONDS，默认 300
+	CloudWatchPreRouteLookbackHours int  // MONITOR_CLOUDWATCH_PREROUTE_LOOKBACK_HOURS，默认 168
+	// CloudWatchNginxEnabled 让 Monitor 持续读取结构化 Nginx access/error，
+	// 按分钟聚合后写入现有 Nginx 本地事实表。它是旧 nginxcollector 的替代
+	// 来源，不保存原始日志，也不改变人工按需排障的查询路径。
+	CloudWatchNginxEnabled       bool // MONITOR_CLOUDWATCH_NGINX_ENABLED，默认 false
+	CloudWatchNginxPollSeconds   int  // MONITOR_CLOUDWATCH_NGINX_POLL_SECONDS，默认 300
+	CloudWatchNginxLookbackHours int  // MONITOR_CLOUDWATCH_NGINX_LOOKBACK_HOURS，默认 168
 	// 服务端健康监控(实例/数据库/负载均衡):自动发现 Lightsail、ECS/Fargate、
 	// RDS 与 ALB，并从各服务控制面和 CloudWatch 只读拉取。
 	// 默认【关】——关时完全不调 AWS、不影响模型监控与现网行为。
@@ -260,7 +297,7 @@ type Settings struct {
 	// 它不启动 AWS、域名、源站锁探测，也不评估/发送基础设施告警；
 	// 仅用于本机验收和其他只读快照场景。
 	InfraSnapshotReadOnly bool   // MONITOR_INFRA_SNAPSHOT_READ_ONLY，默认 false
-	AWSRegion             string // AWS_REGION,如 us-west-2;AWS 凭证用 SDK 默认链(AWS_ACCESS_KEY_ID/_SECRET)
+	AWSRegion             string // AWS_REGION,如 us-west-2；凭证使用 SDK 默认链（ECS 生产用 Task Role）
 	InfraSampleSeconds    int    // MONITOR_INFRA_SAMPLE_SECONDS,默认 300(AWS 指标本就 5min 分辨率)
 	InfraRetentionDays    int    // MONITOR_INFRA_RETENTION_DAYS,默认 7
 	// MONITOR_INFRA_RESOURCES:逗号分隔,显式指定要监控的资源,留空=自动发现。
@@ -366,6 +403,7 @@ func LoadSettings() Settings {
 		StabilityProblemSourceEnabled:            env("MONITOR_STABILITY_PROBLEM_SOURCE_ENABLED", "false") == "true",
 		StabilityProblemSourceLookbackHours:      envInt("MONITOR_STABILITY_PROBLEM_SOURCE_LOOKBACK_HOURS", 24),
 		StabilityLegacyCollectorHealthEnabled:    env("MONITOR_STABILITY_LEGACY_COLLECTOR_HEALTH_ENABLED", "true") == "true",
+		CustomerHealthSourceEnabled:              env("MONITOR_CUSTOMER_HEALTH_SOURCE_ENABLED", "false") == "true",
 		BackgroundSourceMinStartIntervalMS:       envInt("MONITOR_BACKGROUND_SOURCE_MIN_START_INTERVAL_MS", 2000),
 		StabilityBackfillDelayMS:                 envInt("MONITOR_STABILITY_BACKFILL_DELAY_MS", 2000),
 		StabilityBackfillTimeoutSec:              envInt("MONITOR_STABILITY_BACKFILL_TIMEOUT_SECONDS", 20),
@@ -452,6 +490,20 @@ func LoadSettings() Settings {
 		HeartbeatURL:                             env("MONITOR_HEARTBEAT_URL", ""),
 		SiteName:                                 env("MONITOR_SITE_NAME", ""),
 		IngestToken:                              env("MONITOR_INGEST_TOKEN", ""),
+		CloudWatchLogsEnabled:                    env("MONITOR_CLOUDWATCH_LOGS_ENABLED", "false") == "true",
+		CloudWatchEvidenceHMACKey:                env("MONITOR_CLOUDWATCH_EVIDENCE_HMAC_KEY", ""),
+		CloudWatchEvidenceHMACKeyID:              strings.TrimSpace(env("MONITOR_CLOUDWATCH_EVIDENCE_HMAC_KEY_ID", "")),
+		CloudWatchShadowEnabled:                  env("MONITOR_CLOUDWATCH_SHADOW_ENABLED", "false") == "true",
+		CloudWatchShadowNginxContractReady:       env("MONITOR_CLOUDWATCH_SHADOW_NGINX_CONTRACT_READY", "false") == "true",
+		CloudWatchShadowIntervalMinutes:          envInt("MONITOR_CLOUDWATCH_SHADOW_INTERVAL_MINUTES", 15),
+		CloudWatchShadowLookbackMinutes:          envInt("MONITOR_CLOUDWATCH_SHADOW_LOOKBACK_MINUTES", 15),
+		CloudWatchShadowRetentionDays:            envInt("MONITOR_CLOUDWATCH_SHADOW_RETENTION_DAYS", 14),
+		CloudWatchPreRouteEnabled:                env("MONITOR_CLOUDWATCH_PREROUTE_ENABLED", "false") == "true",
+		CloudWatchPreRoutePollSeconds:            envInt("MONITOR_CLOUDWATCH_PREROUTE_POLL_SECONDS", 300),
+		CloudWatchPreRouteLookbackHours:          envInt("MONITOR_CLOUDWATCH_PREROUTE_LOOKBACK_HOURS", 168),
+		CloudWatchNginxEnabled:                   env("MONITOR_CLOUDWATCH_NGINX_ENABLED", "false") == "true",
+		CloudWatchNginxPollSeconds:               envInt("MONITOR_CLOUDWATCH_NGINX_POLL_SECONDS", 300),
+		CloudWatchNginxLookbackHours:             envInt("MONITOR_CLOUDWATCH_NGINX_LOOKBACK_HOURS", 168),
 		InfraEnabled:                             env("MONITOR_INFRA_ENABLED", "") == "true",
 		InfraManagedAWSDisabled:                  env("MONITOR_INFRA_MANAGED_AWS_ENABLED", "true") == "false",
 		InfraManagedAWSDashboardURL:              safeInfraManagedAWSDashboardURL(env("MONITOR_INFRA_MANAGED_AWS_DASHBOARD_URL", "")),

@@ -118,12 +118,34 @@ type CapacityUserMinuteSample struct {
 	Success             int64  `gorm:"column:success"`
 	Anomaly             int64  `gorm:"column:anomaly"`
 	Failed              int64  `gorm:"column:failed"`
-	Tokens              int64  `gorm:"column:tokens"`
+	// CustomerHealthAnomaly / CustomerHealthFailed are policy-filtered counts
+	// used only by customer maintenance. Raw Anomaly/Failed remain unchanged for
+	// capacity reporting and forensic display.
+	CustomerHealthAnomaly int64 `gorm:"column:customer_health_anomaly"`
+	CustomerHealthFailed  int64 `gorm:"column:customer_health_failed"`
+	CustomerHealthVersion int   `gorm:"column:customer_health_version"`
+	Tokens                int64 `gorm:"column:tokens"`
+	Quota                 int64 `gorm:"column:quota"`
+	RefundQuota           int64 `gorm:"column:refund_quota"`
+}
+
+// CustomerHealthSourceCursor 是客户维护责任方口径回算的本地持久水位。
+// 只有对应范围的用户分钟事实已成功提交后才推进；进程/隧道重连后从这里回放
+// 最近窗口，而不是重新扫描当天全部生产日志。
+type CustomerHealthSourceCursor struct {
+	ID               uint  `gorm:"primaryKey;autoIncrement:false"`
+	DayTs            int64 `gorm:"column:day_ts"`
+	ThroughTs        int64 `gorm:"column:through_ts"`
+	SemanticsVersion int   `gorm:"column:semantics_version"`
+	UpdatedAt        int64 `gorm:"column:updated_at"`
 }
 
 func (s *CapacityUserMinuteSample) BeforeCreate(_ *gorm.DB) error {
 	if s.TrafficClassVersion == 0 {
 		s.TrafficClassVersion = stabilityTrafficClassificationVersion
+	}
+	if s.CustomerHealthVersion == 0 {
+		s.CustomerHealthVersion = customerHealthStabilityPolicyVersion
 	}
 	return nil
 }
@@ -859,7 +881,7 @@ func (m *Monitor) openStore(path string) error {
 		}
 	}
 	// busy_timeout:采样写入与页面读取并发时,等锁而非立刻报 SQLITE_BUSY;WAL:提升读写并发。
-	dsn := path + "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)"
+	dsn := path + "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=temp_store(2)"
 	db, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{
 		Logger: logger.Default.LogMode(logger.Silent),
 	})
@@ -916,7 +938,7 @@ func (m *Monitor) openStore(path string) error {
 	if err := db.AutoMigrate(
 		&ECSLogSource{}, &ECSLogDiscovery{}, &ECSLogLeaseWindow{}, &ECSLogArchiveReceipt{}, &ECSLogArchiveScan{},
 		&AICodeWithRecordCheckpoint{}, &AICodeWithRecordSeen{},
-		&MetricSample{}, &CapacityUserMinuteSample{}, &TokenSample{}, &MetricFinalizeState{}, &HourSample{}, &ChannelSnap{}, &RejectionSample{}, &RejectionIngestBatch{}, &SelectablePair{},
+		&MetricSample{}, &CapacityUserMinuteSample{}, &CustomerHealthSourceCursor{}, &TokenSample{}, &MetricFinalizeState{}, &HourSample{}, &ChannelSnap{}, &RejectionSample{}, &RejectionIngestBatch{}, &SelectablePair{},
 		&StabilityHourSample{}, &ChannelTestHourSample{}, &StabilityRejectHour{}, &StabilityProblemSample{},
 		&StabilityProblemIngestState{}, &StabilityProblemStage{}, &StabilityProblemClassificationMigration{}, &StabilityProblemLiveCursor{},
 		&StabilityHourIngestState{}, &StabilityBackfillJob{},
@@ -928,10 +950,14 @@ func (m *Monitor) openStore(path string) error {
 		&ChannelEconomicsHourPublication{}, &ChannelEconomicsHourCurrent{}, &ChannelEconomicsHourManifestPublication{}, &ChannelEconomicsHourManifestCurrent{}, &ChannelEconomicsGlobalHourFact{}, &ChannelEconomicsDirtyHour{},
 		&InfraSample{}, &HostContainerSnapshot{}, &InfraAsset{}, &InfraAssetAudit{}, &InfraAssetScope{}, &NginxMinuteSample{}, &NginxIngestBatch{}, &NginxSourceState{},
 		&NginxErrorMinuteSample{}, &NginxErrorIngestBatch{}, &NginxErrorSourceState{},
-		&AlertConfig{}, &AlertLog{}, &TrackedUser{}, &CustomerGroup{}, &UsageMemberControl{}, &UsageMemberAudit{}, &UsageMemberControlMigration{}, &FollowUpLog{}, &UsageSettings{}, &UserDirectoryEntry{},
+		&AlertConfig{}, &AlertLog{}, &TrackedUser{}, &CustomerGroup{}, &CustomerHealthGroup{}, &CustomerHealthMember{}, &CustomerHealthMigrationState{}, &UsageMemberControl{}, &UsageMemberAudit{}, &UsageMemberControlMigration{}, &FollowUpLog{}, &UsageSettings{}, &UserDirectoryEntry{},
+		&CloudWatchInvestigationAudit{}, &CloudWatchShadowReconciliationRun{}, &CloudWatchShadowReconciliationDiff{}, &CloudWatchPreRouteCursor{}, &CloudWatchNginxCursor{},
 		&GroupGovernanceState{}, &GroupGovernanceGroup{}, &GroupGovernanceUser{},
 	); err != nil {
 		return fmt.Errorf("表迁移失败: %w", err)
+	}
+	if err := migrateLegacyCustomerHealthTables(db); err != nil {
+		return fmt.Errorf("客户维护名单迁移失败: %w", err)
 	}
 	if err := m.initECSLogOwnership(db); err != nil {
 		return fmt.Errorf("ECS 采集责任初始化失败: %w", err)
@@ -1090,7 +1116,7 @@ func (m *Monitor) openUsageFactsStore(path string, prechecked bool) error {
 				return errors.New("迁移闸门后用量事实库才出现，疑似仍有旧进程运行；拒绝未备份迁移")
 			}
 		}
-		dsn := path + "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)"
+		dsn := path + "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=temp_store(2)"
 		db, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})
 		if err != nil {
 			m.usageFactsIntegrityOK.Store(false)

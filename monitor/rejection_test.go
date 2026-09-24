@@ -114,6 +114,24 @@ func TestIngestRejectionsHandler(t *testing.T) {
 	if w := post(m, "Bearer secret123", missingID); w.Code != http.StatusBadRequest {
 		t.Fatalf("缺batch_id应400,得%d: %s", w.Code, w.Body.String())
 	}
+	reservedNode := strings.Replace(body, `"node":"slave"`, `"node":"cloudwatch-direct"`, 1)
+	if w := post(m, "Bearer secret123", reservedNode); w.Code != http.StatusForbidden {
+		t.Fatalf("legacy 推送不得伪造 CloudWatch 内部来源, 得%d: %s", w.Code, w.Body.String())
+	}
+	// 负 user_id 不是有效的客户身份；legacy 接口沿用“丢弃残缺项”语义，
+	// 不能把它写入后在预警页渲染成一个虚假的客户。
+	negativeUser := strings.Replace(body, "batch-0001", "batch-neg-user", 1)
+	negativeUser = strings.Replace(negativeUser, `"count":3`, `"count":3,"user_id":-1`, 1)
+	if w := post(m, "Bearer secret123", negativeUser); w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"stored":0`) {
+		t.Fatalf("负 user_id 应被丢弃且不应报存储成功: %d %s", w.Code, w.Body.String())
+	}
+	var negativeRows int64
+	if err := m.storeDB.Model(&RejectionSample{}).Where("user_id < 0").Count(&negativeRows).Error; err != nil {
+		t.Fatal(err)
+	}
+	if negativeRows != 0 {
+		t.Fatalf("负 user_id 不得入库: %d", negativeRows)
+	}
 }
 
 func TestRejectionBatchHashIgnoresSampleOrder(t *testing.T) {

@@ -631,6 +631,7 @@ func TestLogChainOnlyProblemSourceEpochRunsWithoutFullWorker(t *testing.T) {
 	m.prodDB = newFakeProdDB(t)
 	m.cfg.LogChainOnlySource = true
 	m.cfg.StabilityProblemSourceEnabled = true
+	m.cfg.CustomerHealthSourceEnabled = true
 	m.cfg.StabilityProblemSourceLookbackHours = 24
 	m.cfg.StabilityProblemSampleSec = 60
 	m.cfg.BackgroundSourceMinStartIntervalMS = -1
@@ -643,6 +644,15 @@ func TestLogChainOnlyProblemSourceEpochRunsWithoutFullWorker(t *testing.T) {
 	ctx, cancel, group := newSourceEpoch(context.Background())
 	m.startSourceEpoch(ctx, group)
 	lifecycleEventually(t, 2*time.Second, m.problemSourceRunning.Load, "problem source lane did not start")
+	lifecycleEventually(t, 2*time.Second, m.customerHealthSourceRunning.Load, "customer-health source lane did not start")
+	// Both lanes initialize against the same SQLite at startup. If customer
+	// health briefly wins the write lock, the problem lane must retry rather
+	// than remain only momentarily "running" and then silently exit.
+	lifecycleEventually(t, 4*time.Second, func() bool {
+		var marker StabilityProblemLiveCursor
+		return m.storeDB.First(&marker, stabilityProblemSourceCutoverCursorID).Error == nil &&
+			marker.TrafficClassVersion == stabilityTrafficClassificationVersion
+	}, "problem source lane did not recover from startup store contention")
 	ready, _ := m.readyStatus(time.Now())
 	status := ready.Source
 	if !status.ProblemSourceEnabled || !status.ProblemSourceRunning || status.WorkerEnabled || status.WorkerRunning {
@@ -654,6 +664,9 @@ func TestLogChainOnlyProblemSourceEpochRunsWithoutFullWorker(t *testing.T) {
 	}
 	if m.problemSourceRunning.Load() {
 		t.Fatal("problem source running state survived epoch cancellation")
+	}
+	if m.customerHealthSourceRunning.Load() {
+		t.Fatal("customer-health source running state survived epoch cancellation")
 	}
 }
 

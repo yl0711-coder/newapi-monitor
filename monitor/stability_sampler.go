@@ -678,15 +678,31 @@ func (m *Monitor) startStabilityProblemSource(ctx context.Context) {
 	// cutover before the all-history classification gate; otherwise legacy NULL
 	// versions outside the approved window would incorrectly demand a 181-day
 	// migration and the pilot could never start.
-	if err := m.ensureStabilityProblemSourceCursor(from, target, time.Now().Unix()); err != nil {
+	for {
+		phase := "初始化水位"
+		err := m.ensureStabilityProblemSourceCursor(from, target, time.Now().Unix())
+		if err == nil {
+			phase = "重置旧分类"
+			err = m.resetStaleStabilityProblemClassification()
+		}
+		if err == nil {
+			break
+		}
 		m.problemLastFailure.Store(time.Now().Unix())
-		slog.Error("初始化问题签名独立采集水位失败", "err", err)
-		return
-	}
-	if err := m.resetStaleStabilityProblemClassification(); err != nil {
-		m.problemLastFailure.Store(time.Now().Unix())
-		slog.Error("问题签名独立采集因分类版本不一致停止", "err", err)
-		return
+		if !usageFactLocalStoreBusy(err) {
+			slog.Error("问题签名独立采集初始化失败", "phase", phase, "err", err)
+			return
+		}
+		// 启动时客户维护回算、迁移快照等本地写入可能短暂占住 SQLite。
+		// 这是可恢复的本地竞争，不能让整条问题签名 lane 永久退出到下次重启。
+		slog.Warn("问题签名独立采集初始化遇到本地库忙，稍后重试", "phase", phase, "err", err)
+		timer := time.NewTimer(time.Second)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
+		}
 	}
 
 	spanMinutes, healthyWindows := 12, 0
@@ -780,7 +796,12 @@ func (m *Monitor) ensureStabilityProblemSourceCursor(fromTs, toTs, now int64) er
 			ID: stabilityProblemSourceCutoverCursorID, TrafficClassVersion: stabilityTrafficClassificationVersion,
 			NextTs: fromTs, TargetThroughTs: toTs, Status: "caught_up", LastSuccessAt: now, UpdatedAt: now,
 		}
-		return tx.Create(&marker).Error
+		// ID is the table's only primary key. A classification-version upgrade
+		// deliberately re-enters this cutover path, so the previous version's
+		// marker may already occupy ID=2. Save atomically replaces that marker;
+		// Create would fail with a UNIQUE constraint and permanently stop the
+		// logchain-only problem-source lane after every semantics bump.
+		return tx.Save(&marker).Error
 	})
 }
 

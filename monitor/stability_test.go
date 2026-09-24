@@ -431,6 +431,48 @@ func TestStabilityProblemSourceCursorCutsOverOnceThenResumesGap(t *testing.T) {
 	}
 }
 
+func TestStabilityProblemSourceCursorReplacesOldVersionMarker(t *testing.T) {
+	m := newStabilityTestMonitor(t)
+	base := time.Date(2026, 9, 17, 0, 0, 0, 0, cstLocation).Unix()
+	oldVersion := stabilityTrafficClassificationVersion - 1
+	if oldVersion < 1 {
+		t.Fatal("test requires a prior classification version")
+	}
+	for _, cursor := range []StabilityProblemLiveCursor{
+		{ID: 1, TrafficClassVersion: oldVersion, NextTs: base - 12*3600, TargetThroughTs: base, Status: "running"},
+		{ID: stabilityProblemSourceCutoverCursorID, TrafficClassVersion: oldVersion, NextTs: base - 24*3600, TargetThroughTs: base, Status: "caught_up"},
+	} {
+		if err := m.storeDB.Create(&cursor).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	from, to, now := base, base+24*3600, base+24*3600
+	if err := m.ensureStabilityProblemSourceCursor(from, to, now); err != nil {
+		t.Fatalf("classification upgrade cutover failed: %v", err)
+	}
+	var cursor, marker StabilityProblemLiveCursor
+	if err := m.storeDB.First(&cursor, 1).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := m.storeDB.First(&marker, stabilityProblemSourceCutoverCursorID).Error; err != nil {
+		t.Fatal(err)
+	}
+	for name, got := range map[string]StabilityProblemLiveCursor{"cursor": cursor, "marker": marker} {
+		if got.TrafficClassVersion != stabilityTrafficClassificationVersion || got.NextTs != from || got.TargetThroughTs != to {
+			t.Fatalf("%s was not atomically replaced for current classification: %+v", name, got)
+		}
+	}
+	var markers int64
+	if err := m.storeDB.Model(&StabilityProblemLiveCursor{}).
+		Where("id = ?", stabilityProblemSourceCutoverCursorID).Count(&markers).Error; err != nil {
+		t.Fatal(err)
+	}
+	if markers != 1 {
+		t.Fatalf("cutover marker count=%d want 1", markers)
+	}
+}
+
 func TestStabilityProblemSourceTurnUsesBoundedLowPriorityWindow(t *testing.T) {
 	m := newStabilityTestMonitor(t)
 	m.prodDB = newFakeProdDB(t)
@@ -1707,6 +1749,9 @@ func TestMonitorResponsiveShellAndWideTablesStayAdminOnly(t *testing.T) {
 		`.monitor-shell.sidebar-collapsed{grid-template-columns:76px minmax(0,1fr)}`,
 		`.monitor-shell.sidebar-collapsed .monitor-nav.tabs .tab::after`,
 		`transition-delay:1s,1s,1s`,
+		`.monitor-nav.tabs{display:flex;flex:1 1 auto;min-height:0`,
+		`overflow-x:hidden;overflow-y:auto;overscroll-behavior:contain;scrollbar-gutter:stable`,
+		`.monitor-sidebar-toggle{display:flex;align-items:center;justify-content:center;gap:8px;flex:none`,
 		`.monitor-table-scroll{width:100%;max-width:100%;overflow-x:auto`,
 		`.monitor-table-model>table{min-width:1120px}`,
 		`.monitor-table-server>table{min-width:1180px}`,
@@ -1718,6 +1763,11 @@ func TestMonitorResponsiveShellAndWideTablesStayAdminOnly(t *testing.T) {
 	}
 	if !strings.Contains(string(stabilityJS), `nexusapi-monitor-sidebar-collapsed`) {
 		t.Fatal("侧栏收起状态没有持久化，刷新后会跳回展开态")
+	}
+	for _, marker := range []string{`if(collapsed&&tooltip)item.setAttribute('title',tooltip)`, `else item.removeAttribute('title')`} {
+		if !strings.Contains(string(stabilityJS), marker) {
+			t.Fatalf("可滚动侧栏收起后缺少原生文字提示 %q", marker)
+		}
 	}
 	for _, marker := range []string{`item.dataset.navTooltip=text`, `item.removeAttribute('title')`, `item.setAttribute('aria-label',text)`} {
 		if !strings.Contains(string(stabilityJS), marker) {

@@ -2,6 +2,15 @@ package monitor
 
 import "os"
 
+func appendUniqueString(values []string, value string) []string {
+	for _, existing := range values {
+		if existing == value {
+			return values
+		}
+	}
+	return append(values, value)
+}
+
 // A nil setting preserves legacy expectations. An explicit empty value stops
 // heartbeat expectations without revoking authenticated historical ingestion.
 func envOptionalCSV(key string) []string {

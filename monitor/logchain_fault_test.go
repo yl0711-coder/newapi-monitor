@@ -267,11 +267,12 @@ func TestLogChainFaultClientGoneUsesRealDistribution(t *testing.T) {
 		wantFault string
 	}{
 		// —— 上游一字未回（无首字延迟），实测 66 条 ——
-		// 实测 49/66 在 5 秒内：客户在上游来得及响应前就取消了。
+		// 当前产品边界：3 秒内客户在上游来得及响应前取消，按正常客户行为。
 		// 这一条是我最初判反的地方：无首字 + 耗时短指向**下游**，不是上游。
 		{"无首字_2秒断开_客户抢先取消", 2, 0, 0, faultDownstream},
-		{"无首字_4秒断开_仍算抢先取消", 4, 0, 0, faultDownstream},
-		// 实测 17/66：等了 5 秒以上上游仍一字未回。
+		{"无首字_3秒断开_仍算抢先取消", 3, 0, 0, faultDownstream},
+		{"无首字_4秒断开_进入异常", 4, 0, 0, faultUpstream},
+		// 超过 3 秒上游仍一字未回。
 		{"无首字_15秒仍无响应_判上游", 15, 0, 0, faultUpstream},
 		{"无首字_60秒仍无响应_判上游", 60, 0, 0, faultUpstream},
 
@@ -360,5 +361,50 @@ func TestLogChainFaultBillingOnlyIsUnknown(t *testing.T) {
 	}, []string{"billing_unpaid"})
 	if got.Fault != faultUnknown {
 		t.Errorf("纯消费异常应判待判，got=%s（依据: %s）", got.Fault, got.Why)
+	}
+}
+
+func TestLogChainHumanFaultReasonHighlightsHighFirstByteWithoutAssigningBlame(t *testing.T) {
+	row := LogChainRow{
+		Type: 2, EndReason: "eof", FirstByteMs: 8000, CompletionTokens: 0,
+		AnomalyTags: []string{"undelivered_unbilled"},
+	}
+	got := logChainAttributeFaultWithEvidence(row, row.AnomalyTags)
+	if got.Fault != faultUnknown {
+		t.Fatalf("首字延迟不能单独定责，got fault=%s", got.Fault)
+	}
+	if !strings.Contains(got.Reason, "等了 8 秒") ||
+		!strings.Contains(got.Reason, "没有交付回答") ||
+		!strings.Contains(got.Reason, "没有发生扣费") ||
+		!strings.Contains(got.Reason, "缺少入口或上游流日志") {
+		t.Fatalf("高首字延迟应说明已知事实和缺失证据，reason=%q", got.Reason)
+	}
+
+	short := LogChainRow{
+		Type: 2, EndReason: "eof", FirstByteMs: 2000, CompletionTokens: 0,
+		AnomalyTags: []string{"undelivered_unbilled"},
+	}
+	shortFault := logChainAttributeFaultWithEvidence(short, short.AnomalyTags)
+	if strings.Contains(shortFault.Reason, "首字延迟") {
+		t.Fatalf("低于阈值不应给出高首字延迟提示: %q", shortFault.Reason)
+	}
+}
+
+func TestLogChainHumanFaultReasonExplainsMissingEvidence(t *testing.T) {
+	got := logChainAttributeFaultWithEvidence(LogChainRow{
+		Type: 5, Content: "status_code=401, bad response status code 401",
+	}, nil)
+	if got.Fault != faultUnknown {
+		t.Fatalf("401 without discriminating text must stay unknown: %+v", got)
+	}
+	if !strings.Contains(got.Reason, "可能是我方密钥无效") || !strings.Contains(got.Reason, "上游封禁") {
+		t.Fatalf("reason must explain both possibilities in plain language: %q", got.Reason)
+	}
+
+	anomaly := logChainAttributeFaultWithEvidence(LogChainRow{
+		Type: 2, EndReason: logChainClientGoneEndReason, FirstByteMs: 1000, UseTime: 7,
+	}, []string{logChainClientGoneEndReason})
+	if anomaly.Fault != faultUnknown || !strings.Contains(anomaly.Reason, "入口日志或上游流日志") {
+		t.Fatalf("client_gone ambiguity must name missing evidence: %+v", anomaly)
 	}
 }

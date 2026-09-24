@@ -23,6 +23,7 @@ package monitor
 import (
 	"context"
 	"testing"
+	"time"
 )
 
 // logChainSeedRow 一条待塞入假生产库的 logs 行。字段名与 logs 表列名对齐，
@@ -174,6 +175,11 @@ func logChainAnomalyFixture() []logChainSeedRow {
 		{ID: 15, CreatedAt: 1015, Type: 2, UserID: 8, Username: "bob", ChannelID: 4,
 			ModelName: "dall-e-3", Quota: 0, CompletionTokens: 0,
 			Other: `{"request_path":"/v1/images/generations"}`},
+
+		// —— 3 秒宽限边界：零输出但客户很快主动取消，按正常请求处理 ——
+		{ID: 16, CreatedAt: 1016, Type: 2, UserID: 8, Username: "bob", ChannelID: 4,
+			ModelName: "gpt-4o", Quota: 400, CompletionTokens: 0, UseTime: 3,
+			Other: `{"stream_status":{"end_reason":"client_gone"},"request_path":"/v1/chat/completions"}`},
 	}
 }
 
@@ -229,8 +235,8 @@ func TestLogChainAnomalySQLMatchesTagsOnRealRows(t *testing.T) {
 	if err != nil {
 		t.Fatalf("基准查询失败: %v", err)
 	}
-	if len(baseRows) != 15 {
-		t.Fatalf("fixture 应有 15 行落在默认 type IN (2,5) 内，got=%d", len(baseRows))
+	if len(baseRows) != 16 {
+		t.Fatalf("fixture 应有 16 行落在默认 type IN (2,5) 内，got=%d", len(baseRows))
 	}
 
 	for _, kind := range []string{
@@ -301,8 +307,8 @@ func TestLogChainAnomalyExclusionsHoldOnRealRows(t *testing.T) {
 		if !got[4] {
 			t.Error("未见过的 end_reason 被静默吞掉了——退回枚举法了？排障最怕这个")
 		}
-		// client_gone 已独立成档，不再算流故障（id=3 纯断连、id=12 断连+扣费未交付）。
-		for _, notWant := range []int64{3, 12} {
+		// client_gone 不混进流故障（id=3 已产出、id=12 慢断连、id=16 三秒内取消）。
+		for _, notWant := range []int64{3, 12, 16} {
 			if got[notWant] {
 				t.Errorf("id=%d 是 client_gone，已独立成档，不该出现在流故障里——"+
 					"混在一起会让真故障被大量客户断连淹掉（实测 1594:25）", notWant)
@@ -321,12 +327,14 @@ func TestLogChainAnomalyExclusionsHoldOnRealRows(t *testing.T) {
 		}
 	})
 
-	t.Run("客户断连独立成档", func(t *testing.T) {
+	t.Run("只保留零输出且超过三秒的断连", func(t *testing.T) {
 		got := pick(t, anomalyClientGone)
-		// id=3 纯断连、id=12 断连且扣费未交付 → 都该在这一档。
-		for _, want := range []int64{3, 12} {
-			if !got[want] {
-				t.Errorf("id=%d 是 client_gone，应出现在该档", want)
+		if !got[12] {
+			t.Error("id=12 零输出且 61 秒后断连，应出现在异常断连档")
+		}
+		for _, notWant := range []int64{3, 16} {
+			if got[notWant] {
+				t.Errorf("id=%d 属正常客户取消，不应出现在异常断连档", notWant)
 			}
 		}
 		// 真流故障不该混进来。
@@ -346,9 +354,14 @@ func TestLogChainAnomalyExclusionsHoldOnRealRows(t *testing.T) {
 	t.Run("全部异常仍须含客户断连", func(t *testing.T) {
 		got := pick(t, anomalyAll)
 		// 拆档后 all 若漏掉 client_gone，"全部异常"就名不副实。
-		for _, want := range []int64{3, 4, 5, 12} {
+		for _, want := range []int64{4, 5, 12} {
 			if !got[want] {
 				t.Errorf("id=%d 应出现在「全部异常」里（拆档后 all 必须是三档并集）", want)
+			}
+		}
+		for _, notWant := range []int64{3, 16} {
+			if got[notWant] {
+				t.Errorf("id=%d 已产出或在 3 秒内取消，应从全部异常移除", notWant)
 			}
 		}
 	})
@@ -390,6 +403,9 @@ func TestLogChainAnomalyExclusionsHoldOnRealRows(t *testing.T) {
 		}
 		if !got[6] || !got[12] {
 			t.Error("id=6/12 是真的扣费未交付，应被筛出")
+		}
+		if got[16] {
+			t.Error("id=16 是零输出但 3 秒内主动取消，不得绕回扣费未交付异常")
 		}
 	})
 
@@ -544,6 +560,76 @@ func TestLogChainCursorPagesWithoutGapOrDuplicateOnRealRows(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// 高频账号的多日查询会按 CST 自然日切片，但对外仍必须像一条完整查询：
+// 两个方向的顺序、has_more 和复合游标翻页都不能因切片而漏行或重复。
+func TestLogChainLongUserRangeSlicesWithoutChangingPagination(t *testing.T) {
+	day := time.Date(2026, 9, 13, 0, 0, 0, 0, cstLocation)
+	seed := make([]logChainSeedRow, 0, 6)
+	for d := 0; d < 3; d++ {
+		ts := day.AddDate(0, 0, d).Add(time.Hour).Unix()
+		seed = append(seed,
+			logChainSeedRow{ID: int64(d*2 + 1), CreatedAt: ts, Type: 5, UserID: 7, ModelName: "gpt-4o", Content: "err"},
+			logChainSeedRow{ID: int64(d*2 + 2), CreatedAt: ts, Type: 5, UserID: 7, ModelName: "gpt-4o", Content: "err"},
+		)
+	}
+	m := newLogChainExecMonitor(t, seed)
+	for _, tc := range []struct {
+		name string
+		asc  bool
+		want []int64
+	}{
+		{"倒序", false, []int64{6, 5, 4, 3, 2, 1}},
+		{"正序", true, []int64{1, 2, 3, 4, 5, 6}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			scope := logChainScope{FromTs: day.Unix(), ToTs: day.AddDate(0, 0, 3).Unix(), UserID: 7, Limit: 2, Asc: tc.asc}
+			var got []int64
+			for page := 0; page < 10; page++ {
+				rows, more, err := m.queryLogChain(context.Background(), scope, nil)
+				if err != nil {
+					t.Fatalf("page %d: %v", page+1, err)
+				}
+				for _, row := range rows {
+					got = append(got, row.ID)
+				}
+				if !more {
+					break
+				}
+				if len(rows) == 0 {
+					t.Fatal("has_more=true 但当前页为空")
+				}
+				last := rows[len(rows)-1]
+				scope.BeforeTs, scope.BeforeID = last.CreatedAt, last.ID
+			}
+			if len(got) != len(tc.want) {
+				t.Fatalf("got=%v want=%v", got, tc.want)
+			}
+			for i := range tc.want {
+				if got[i] != tc.want[i] {
+					t.Fatalf("got=%v want=%v", got, tc.want)
+				}
+			}
+		})
+	}
+}
+
+func TestLogChainDailySliceGateSkipsExactRequestID(t *testing.T) {
+	day := time.Date(2026, 9, 13, 0, 0, 0, 0, cstLocation).Unix()
+	base := logChainScope{FromTs: day, ToTs: day + 3*86400, UserID: 7, Limit: 50}
+	if !logChainShouldSliceByDay(base) {
+		t.Fatal("多日 user_id 查询应按自然日切片")
+	}
+	base.RequestID = "exact-request"
+	if logChainShouldSliceByDay(base) {
+		t.Fatal("精确 Request ID 查询已有高选择性，不应再切片")
+	}
+	base.RequestID = ""
+	base.UserID = 0
+	if logChainShouldSliceByDay(base) {
+		t.Fatal("没有 user_id 的查询不属于高频账号切片路径")
 	}
 }
 

@@ -72,7 +72,8 @@ func specsFor(rtype string) []metricSpec {
 	return nil
 }
 
-// lightsailClient 用 SDK 默认凭证链(AWS_ACCESS_KEY_ID/_SECRET 环境变量)创建客户端。
+// lightsailClient 用 AWS SDK 默认凭证链创建客户端：本机可用临时环境凭证，
+// ECS 生产环境由 Task Role 自动提供临时凭证。
 func (m *Monitor) lightsailClient(ctx context.Context) (*lightsail.Client, error) {
 	cfg, err := awsconfig.LoadDefaultConfig(ctx, awsconfig.WithRegion(m.cfg.AWSRegion))
 	if err != nil {

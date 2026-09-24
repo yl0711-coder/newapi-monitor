@@ -7,6 +7,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -215,6 +216,64 @@ func TestUsageMemberIdempotencyIsDeterministicUnderConcurrency(t *testing.T) {
 	}
 }
 
+func TestAddCustomerWithFirstMemberIsAtomicReusableAndIdempotent(t *testing.T) {
+	m := newTestMonitor(t)
+	ctx := context.Background()
+
+	group, first, err := m.addCustomerWithFirstMember(ctx, "原子公司",
+		TrackedUser{UserID: 101, Username: "first"}, usageMemberMutationMeta{RequestID: "customer-atomic-first"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if group.ID <= 0 || first.User.UserID != 101 || first.Replayed {
+		t.Fatalf("首次创建结果异常: group=%+v result=%+v", group, first)
+	}
+	replayedGroup, replayed, err := m.addCustomerWithFirstMember(ctx, "原子公司",
+		TrackedUser{UserID: 101, Username: "first"}, usageMemberMutationMeta{RequestID: "customer-atomic-first"})
+	if err != nil || replayedGroup.ID != group.ID || !replayed.Replayed {
+		t.Fatalf("同幂等键必须重放原结果: group=%+v result=%+v err=%v", replayedGroup, replayed, err)
+	}
+
+	reused, second, err := m.addCustomerWithFirstMember(ctx, "原子公司",
+		TrackedUser{UserID: 102, Username: "second"}, usageMemberMutationMeta{RequestID: "customer-atomic-second"})
+	if err != nil || reused.ID != group.ID || second.User.UserID != 102 {
+		t.Fatalf("已有公司应复用后加入成员: group=%+v result=%+v err=%v", reused, second, err)
+	}
+	var groups, members int64
+	if err := m.storeDB.Model(&CustomerGroup{}).Where("name = ?", "原子公司").Count(&groups).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := m.storeDB.Model(&TrackedUser{}).Where("group_id = ?", group.ID).Count(&members).Error; err != nil {
+		t.Fatal(err)
+	}
+	if groups != 1 || members != 2 {
+		t.Fatalf("公司复用后应为 1 个公司 2 个成员: groups=%d members=%d", groups, members)
+	}
+	if _, _, err := m.addCustomerWithFirstMember(ctx, "另一家公司",
+		TrackedUser{UserID: 101, Username: "first"}, usageMemberMutationMeta{RequestID: "customer-atomic-first"}); !errors.Is(err, errUsageMemberRequestConflict) {
+		t.Fatalf("同键不同参数必须冲突: %v", err)
+	}
+
+	base := CustomerGroup{Name: "原归属"}
+	if err := m.storeDB.Create(&base).Error; err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.addUsageMember(ctx, TrackedUser{UserID: 303, Username: "owned"}, base.ID,
+		usageMemberMutationMeta{RequestID: "customer-rollback-setup"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := m.addCustomerWithFirstMember(ctx, "不应残留的空公司",
+		TrackedUser{UserID: 303, Username: "owned"}, usageMemberMutationMeta{RequestID: "customer-rollback"}); !errors.Is(err, errUsageMemberDifferentCompany) {
+		t.Fatalf("成员加入失败应返回归属冲突: %v", err)
+	}
+	if err := m.storeDB.Model(&CustomerGroup{}).Where("name = ?", "不应残留的空公司").Count(&groups).Error; err != nil {
+		t.Fatal(err)
+	}
+	if groups != 0 {
+		t.Fatalf("成员失败后新公司必须随事务回滚，实际残留 %d 行", groups)
+	}
+}
+
 func lifecycleAdminDo(r http.Handler, method, path, body, key string, cookie *http.Cookie) *httptest.ResponseRecorder {
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest(method, path, strings.NewReader(body))
@@ -265,6 +324,34 @@ func TestUsageMemberHTTPIdempotencyRemoveAndRejoin(t *testing.T) {
 	}
 	if audits != 3 {
 		t.Fatalf("HTTP retries must not advance revision twice, audits=%d", audits)
+	}
+}
+
+func TestUsageMemberHTTPDissolveRouteKeepsAuthAndReplays(t *testing.T) {
+	m, admin, _ := newPortalTestMonitor(t)
+	group := CustomerGroup{Name: "http-dissolve-company"}
+	if err := m.storeDB.Create(&group).Error; err != nil {
+		t.Fatal(err)
+	}
+	addUsageMemberDissolveFixture(t, m, group.ID, 32, 33)
+	body := `{"id":` + jsonNumber(group.ID) + `}`
+	normal := &http.Cookie{Name: sessionCookie, Value: m.signSession("admin", roleAdmin, time.Now().Unix())}
+	if w := lifecycleAdminDo(admin, http.MethodPost, "/usage/groups/dissolve", body, "http-dissolve-key", normal); w.Code != http.StatusForbidden {
+		t.Fatalf("non-root dissolve must remain forbidden: %d %s", w.Code, w.Body.String())
+	}
+	var tracked int64
+	if err := m.storeDB.Model(&TrackedUser{}).Where("group_id = ?", group.ID).Count(&tracked).Error; err != nil || tracked != 2 {
+		t.Fatalf("forbidden request changed members: tracked=%d err=%v", tracked, err)
+	}
+
+	root := &http.Cookie{Name: sessionCookie, Value: m.signSession("root", roleRoot, time.Now().Unix())}
+	first := lifecycleAdminDo(admin, http.MethodPost, "/usage/groups/dissolve", body, "http-dissolve-key", root)
+	if first.Code != http.StatusOK || !strings.Contains(first.Body.String(), `"replayed":false`) {
+		t.Fatalf("first HTTP dissolve failed: %d %s", first.Code, first.Body.String())
+	}
+	second := lifecycleAdminDo(admin, http.MethodPost, "/usage/groups/dissolve", body, "http-dissolve-key", root)
+	if second.Code != http.StatusOK || !strings.Contains(second.Body.String(), `"replayed":true`) {
+		t.Fatalf("HTTP dissolve retry did not replay: %d %s", second.Code, second.Body.String())
 	}
 }
 
@@ -426,6 +513,213 @@ func TestUsageMemberGroupDeleteGuardsAndAuditIsAppendOnly(t *testing.T) {
 	}
 	if err := m.storeDB.Exec("DELETE FROM usage_member_audits WHERE id = ?", audit.ID).Error; err == nil {
 		t.Fatal("database trigger must reject audit delete")
+	}
+}
+
+func addUsageMemberDissolveFixture(t *testing.T, m *Monitor, groupID int64, userIDs ...int64) {
+	t.Helper()
+	for _, userID := range userIDs {
+		if _, err := m.addUsageMember(context.Background(), TrackedUser{
+			UserID: userID, Username: "dissolve-user-" + strconv.FormatInt(userID, 10),
+		}, groupID, usageMemberMutationMeta{RequestID: "dissolve-add-" + strconv.FormatInt(userID, 10)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestUsageMemberDissolveGroupIsAtomicAuditedAndPreservesFacts(t *testing.T) {
+	m := newTestMonitor(t)
+	group := CustomerGroup{Name: "dissolve-company"}
+	if err := m.storeDB.Create(&group).Error; err != nil {
+		t.Fatal(err)
+	}
+	addUsageMemberDissolveFixture(t, m, group.ID, 81, 82)
+	facts := []UsageHourFact{
+		{HourTs: 3600, DayTs: 0, UserID: 81, ChannelID: 1, Grp: "g", ModelName: "m", TokenID: 1, ConsumeQuota: 100},
+		{HourTs: 3600, DayTs: 0, UserID: 82, ChannelID: 1, Grp: "g", ModelName: "m", TokenID: 1, ConsumeQuota: 200},
+	}
+	if err := m.usageFactsStore().Create(&facts).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	replayed, err := m.dissolveCustomerGroup(context.Background(), group.ID, usageMemberMutationMeta{
+		RequestID: "dissolve-company-request", Actor: "admin", Reason: "不再维护该客户",
+	})
+	if err != nil || replayed {
+		t.Fatalf("first dissolve failed: replayed=%t err=%v", replayed, err)
+	}
+	var groups, tracked int64
+	if err := m.storeDB.Model(&CustomerGroup{}).Where("id = ?", group.ID).Count(&groups).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := m.storeDB.Model(&TrackedUser{}).Where("group_id = ?", group.ID).Count(&tracked).Error; err != nil {
+		t.Fatal(err)
+	}
+	if groups != 0 || tracked != 0 {
+		t.Fatalf("company and members must disappear together: groups=%d tracked=%d", groups, tracked)
+	}
+	for _, userID := range []int64{81, 82} {
+		var control UsageMemberControl
+		if err := m.storeDB.First(&control, "user_id = ?", userID).Error; err != nil {
+			t.Fatal(err)
+		}
+		if control.Active || control.TrackedRevision != 2 || control.CurrentGroupID != group.ID {
+			t.Fatalf("member lifecycle not advanced exactly once: user=%d control=%+v", userID, control)
+		}
+		var audits []UsageMemberAudit
+		if err := m.storeDB.Where("user_id = ? AND action = ?", userID, "remove").Find(&audits).Error; err != nil {
+			t.Fatal(err)
+		}
+		if len(audits) != 1 || !strings.Contains(audits[0].Reason, "dissolve-company-request") {
+			t.Fatalf("member removal must have one audit linked to the parent request: user=%d audits=%+v", userID, audits)
+		}
+	}
+	var parentAudits int64
+	if err := m.storeDB.Model(&UsageMemberAudit{}).
+		Where("request_id = ? AND action = ?", "dissolve-company-request", "group_dissolve").Count(&parentAudits).Error; err != nil {
+		t.Fatal(err)
+	}
+	var factCount int64
+	if err := m.usageFactsStore().Model(&UsageHourFact{}).Where("user_id IN ?", []int64{81, 82}).Count(&factCount).Error; err != nil {
+		t.Fatal(err)
+	}
+	if parentAudits != 1 || factCount != 2 {
+		t.Fatalf("dissolve audit/fact retention mismatch: parent_audits=%d facts=%d", parentAudits, factCount)
+	}
+
+	if replayed, err = m.dissolveCustomerGroup(context.Background(), group.ID, usageMemberMutationMeta{
+		RequestID: "dissolve-company-request", Actor: "admin", Reason: "不再维护该客户",
+	}); err != nil || !replayed {
+		t.Fatalf("same request must replay after company is gone: replayed=%t err=%v", replayed, err)
+	}
+	var removalAudits int64
+	if err := m.storeDB.Model(&UsageMemberAudit{}).Where("action = ? AND before_group_id = ?", "remove", group.ID).Count(&removalAudits).Error; err != nil {
+		t.Fatal(err)
+	}
+	if removalAudits != 2 {
+		t.Fatalf("replay must not duplicate member audits: %d", removalAudits)
+	}
+}
+
+func TestUsageMemberDissolveGroupRollsBackOnMemberFailure(t *testing.T) {
+	m := newTestMonitor(t)
+	group := CustomerGroup{Name: "dissolve-rollback"}
+	if err := m.storeDB.Create(&group).Error; err != nil {
+		t.Fatal(err)
+	}
+	addUsageMemberDissolveFixture(t, m, group.ID, 91, 92)
+	if err := m.storeDB.Exec(`CREATE TRIGGER fail_second_dissolve_member
+BEFORE DELETE ON tracked_users WHEN OLD.user_id = 92
+BEGIN SELECT RAISE(ABORT, 'forced member delete failure'); END`).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	if replayed, err := m.dissolveCustomerGroup(context.Background(), group.ID,
+		usageMemberMutationMeta{RequestID: "dissolve-rollback-request"}); err == nil || replayed {
+		t.Fatalf("injected member failure must abort dissolve: replayed=%t err=%v", replayed, err)
+	}
+	var groups, tracked, dissolveAudits int64
+	if err := m.storeDB.Model(&CustomerGroup{}).Where("id = ?", group.ID).Count(&groups).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := m.storeDB.Model(&TrackedUser{}).Where("group_id = ?", group.ID).Count(&tracked).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := m.storeDB.Model(&UsageMemberAudit{}).
+		Where("action IN ? AND before_group_id = ?", []string{"remove", "group_dissolve"}, group.ID).
+		Count(&dissolveAudits).Error; err != nil {
+		t.Fatal(err)
+	}
+	if groups != 1 || tracked != 2 || dissolveAudits != 0 {
+		t.Fatalf("failed dissolve left partial state: groups=%d tracked=%d audits=%d", groups, tracked, dissolveAudits)
+	}
+	for _, userID := range []int64{91, 92} {
+		var control UsageMemberControl
+		if err := m.storeDB.First(&control, "user_id = ?", userID).Error; err != nil {
+			t.Fatal(err)
+		}
+		if !control.Active || control.TrackedRevision != 1 {
+			t.Fatalf("rollback did not restore control: user=%d control=%+v", userID, control)
+		}
+	}
+}
+
+func TestUsageMemberDissolveGroupRejectsPortalBeforeMemberChanges(t *testing.T) {
+	m := newTestMonitor(t)
+	group := CustomerGroup{Name: "dissolve-portal", PortalEmail: "portal@example.test", PortalPwAdmin: "hash"}
+	if err := m.storeDB.Create(&group).Error; err != nil {
+		t.Fatal(err)
+	}
+	addUsageMemberDissolveFixture(t, m, group.ID, 101)
+
+	if _, err := m.dissolveCustomerGroup(context.Background(), group.ID,
+		usageMemberMutationMeta{RequestID: "dissolve-portal-request"}); !errors.Is(err, errCustomerGroupPortalEnabled) {
+		t.Fatalf("Portal-enabled company must be rejected before mutation: %v", err)
+	}
+	var tracked, removalAudits int64
+	if err := m.storeDB.Model(&TrackedUser{}).Where("user_id = ?", 101).Count(&tracked).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := m.storeDB.Model(&UsageMemberAudit{}).Where("user_id = ? AND action = ?", 101, "remove").Count(&removalAudits).Error; err != nil {
+		t.Fatal(err)
+	}
+	var control UsageMemberControl
+	if err := m.storeDB.First(&control, "user_id = ?", 101).Error; err != nil {
+		t.Fatal(err)
+	}
+	if tracked != 1 || removalAudits != 0 || !control.Active || control.TrackedRevision != 1 {
+		t.Fatalf("Portal rejection changed member state: tracked=%d audits=%d control=%+v", tracked, removalAudits, control)
+	}
+}
+
+func TestUsageMemberDissolveIdempotencyIsDeterministicUnderConcurrency(t *testing.T) {
+	m := newTestMonitor(t)
+	group := CustomerGroup{Name: "dissolve-concurrent"}
+	if err := m.storeDB.Create(&group).Error; err != nil {
+		t.Fatal(err)
+	}
+	addUsageMemberDissolveFixture(t, m, group.ID, 111, 112)
+
+	const workers = 12
+	var wg sync.WaitGroup
+	replays := make(chan bool, workers)
+	errs := make(chan error, workers)
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			replayed, err := m.dissolveCustomerGroup(context.Background(), group.ID,
+				usageMemberMutationMeta{RequestID: "dissolve-concurrent-request"})
+			replays <- replayed
+			errs <- err
+		}()
+	}
+	wg.Wait()
+	close(replays)
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("concurrent dissolve failed: %v", err)
+		}
+	}
+	firstResponses := 0
+	for replayed := range replays {
+		if !replayed {
+			firstResponses++
+		}
+	}
+	if firstResponses != 1 {
+		t.Fatalf("exactly one concurrent request should commit, got %d", firstResponses)
+	}
+	var removalAudits, parentAudits int64
+	if err := m.storeDB.Model(&UsageMemberAudit{}).Where("action = ? AND before_group_id = ?", "remove", group.ID).Count(&removalAudits).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := m.storeDB.Model(&UsageMemberAudit{}).Where("request_id = ?", "dissolve-concurrent-request").Count(&parentAudits).Error; err != nil {
+		t.Fatal(err)
+	}
+	if removalAudits != 2 || parentAudits != 1 {
+		t.Fatalf("concurrent replay duplicated work: removals=%d parents=%d", removalAudits, parentAudits)
 	}
 }
 

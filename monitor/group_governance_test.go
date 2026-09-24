@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -363,10 +364,34 @@ func TestGroupGovernanceTokenAggregationIsOnlyFullGroupBySafe(t *testing.T) {
 func TestGroupGovernanceTabWiring(t *testing.T) {
 	for _, want := range []string{
 		`data-tab="group-governance"`, `id="tab-group-governance"`, `/group-governance.js?v=1`,
-		`window.groupGovernanceActivate`, `group-governance)$`,
+		`window.groupGovernanceActivate`,
 	} {
 		if !strings.Contains(pageHTML, want) {
 			t.Fatalf("page.html missing group-governance wiring %q", want)
 		}
 	}
+	// hash 白名单：只断言"在名单里"，不断言它排在末位。
+	//
+	// 原断言写的是 `group-governance)$`，等于要求它必须是白名单最后一项——
+	// 那不是任何行为要求，只是当时的书写顺序。2026-09-16 新增 customer-health
+	// 追加在其后时这条就红了，而 #tab=group-governance 的行为完全没变。
+	if !hashWhitelistContains(pageHTML, "group-governance") {
+		t.Fatal("group-governance 必须在 hash 恢复白名单内，否则刷新会跳回默认页")
+	}
+}
+
+// hashWhitelistContains 从 page.html 里取出 hash 恢复白名单并判断是否含某个 tab。
+// 抽成函数是为了让各页的同类断言共用一份解析，不再各自绑字面量。
+func hashWhitelistContains(html, tab string) bool {
+	re := regexp.MustCompile(`/\^\(([a-z|\-]+)\)\$/\.test\(tab\|\|''\)`)
+	m := re.FindStringSubmatch(html)
+	if m == nil {
+		return false
+	}
+	for _, name := range strings.Split(m[1], "|") {
+		if name == tab {
+			return true
+		}
+	}
+	return false
 }

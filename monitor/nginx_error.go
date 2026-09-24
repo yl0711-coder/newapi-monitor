@@ -17,6 +17,11 @@ import (
 	"gorm.io/gorm/clause"
 )
 
+const nginxPreferredErrorClause = `(e.node = ? OR NOT EXISTS (
+	SELECT 1 FROM nginx_error_minute_samples cw
+	WHERE cw.bucket_ts = e.bucket_ts AND cw.node = ?
+))`
+
 var nginxErrorCategories = map[string]bool{
 	"upstream_timeout": true, "upstream_connect_failed": true, "upstream_closed": true,
 	"upstream_tls": true, "client_closed": true, "worker_capacity": true, "resolver": true,
@@ -268,12 +273,17 @@ func (m *Monitor) ingestNginxErrors(c *gin.Context) {
 
 func (m *Monitor) nginxErrorSummary(ctx context.Context, from, to int64) []NginxErrorSummary {
 	var rows []NginxErrorSummary
-	warnReadErr("nginx error summary", m.storeDB.WithContext(ctx).Raw(`SELECT category, severity, COALESCE(SUM(count),0) count FROM nginx_error_minute_samples WHERE bucket_ts >= ? AND bucket_ts < ? GROUP BY category, severity ORDER BY count DESC`, from, to).Scan(&rows))
+	warnReadErr("nginx error summary", m.storeDB.WithContext(ctx).Raw(`SELECT e.category, e.severity, COALESCE(SUM(e.count),0) count
+		FROM nginx_error_minute_samples e WHERE e.bucket_ts >= ? AND e.bucket_ts < ? AND `+nginxPreferredErrorClause+`
+		GROUP BY e.category, e.severity ORDER BY count DESC`, from, to, cloudWatchNginxNode, cloudWatchNginxNode).Scan(&rows))
 	return rows
 }
 
 func (m *Monitor) nginxErrorSources(ctx context.Context, now int64) []NginxErrorSource {
-	nodes := m.nginxExpectedNodes()
+	nodes := append([]string{}, m.nginxExpectedNodes()...)
+	if m.cfg.CloudWatchNginxEnabled {
+		nodes = appendUniqueString(nodes, cloudWatchNginxNode)
+	}
 	var states []NginxErrorSourceState
 	warnReadErr("nginx error sources", m.storeDB.WithContext(ctx).Where("node IN ?", nodes).Find(&states))
 	byNode := make(map[string]NginxErrorSourceState, len(states))
@@ -296,11 +306,16 @@ func (m *Monitor) nginxErrorSources(ctx context.Context, now int64) []NginxError
 			status = "warn"
 			reasons = append(reasons, "log_or_backlog_unreadable")
 		}
-		if age > 180 {
+		heartbeatWarn, heartbeatBad := int64(180), int64(900)
+		if node == cloudWatchNginxNode && m.cfg.CloudWatchNginxEnabled {
+			poll := int64(m.cfg.CloudWatchNginxPollSeconds)
+			heartbeatWarn, heartbeatBad = poll+60, poll*3+60
+		}
+		if age > heartbeatWarn {
 			status = "warn"
 			reasons = append(reasons, "heartbeat_stale")
 		}
-		if age > 900 {
+		if age > heartbeatBad {
 			status = "bad"
 		}
 		if state.BacklogKnown && state.BacklogBytes >= nginxBacklogWarnBytes {

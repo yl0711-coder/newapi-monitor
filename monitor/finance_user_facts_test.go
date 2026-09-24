@@ -58,6 +58,17 @@ func TestFetchFinanceUserHourFactsUsesAllUsersAndExcludesInternalTests(t *testin
 	}
 }
 
+func TestFinanceFactsSchemaHasDedicatedMigrationPlan(t *testing.T) {
+	for name, plan := range map[string]string{
+		"base":     preMigrationPlanID,
+		"combined": preMigrationCombinedPlanID,
+	} {
+		if !strings.Contains(plan, "v52") || !strings.Contains(plan, "finance-user-credit-gift-facts-v1") {
+			t.Fatalf("%s migration plan does not protect the finance facts schema: %s", name, plan)
+		}
+	}
+}
+
 func TestReplaceFinanceUserHourFactsIsAtomicAndIdempotent(t *testing.T) {
 	db, err := gorm.Open(sqlite.Open("file:finance-user-facts?mode=memory&cache=shared"), &gorm.Config{})
 	if err != nil {

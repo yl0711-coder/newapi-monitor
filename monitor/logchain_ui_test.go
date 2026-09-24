@@ -148,7 +148,7 @@ func TestLogChainMinuteRangeUIWiring(t *testing.T) {
 		"$('lcDate')?.addEventListener('input',markTimeDirty)",
 		"$('lcToDate')?.addEventListener('input',markTimeDirty)",
 		"$('lcToDate').value=rangeEnd()",
-		"function shiftRange(delta)",
+		"function shiftRangeDraft(delta)",
 		"const toDate=(c.to_date||'').trim()",
 	} {
 		if !strings.Contains(js, want) {
@@ -174,13 +174,19 @@ func TestLogChainMinuteRangeUIWiring(t *testing.T) {
 	}
 	// 草稿判断必须覆盖起止日期与起止时间四者，缺一项就会出现“改了但没提示待查询”。
 	if !strings.Contains(draft, "lc.timeDirty=from!==lc.date||to!==rangeEnd()||fromTime!==lc.fromTime||toTime!==lc.toTime") ||
-		!strings.Contains(draft, "classList.toggle('pending',lc.timeDirty)") {
-		t.Error("范围草稿应覆盖起止日期与时间，并显示明确的待查询提示和高亮状态")
+		!strings.Contains(draft, "syncTimeDraftUI()") {
+		t.Error("范围草稿应覆盖起止日期与时间，并同步待查询提示、按钮和高亮状态")
 	}
 
-	// 前后翻页按钮整段平移起止日期，并保留已应用的分钟范围。
-	if !strings.Contains(js, "if(!shiftRange(-1))return;") || !strings.Contains(js, "if(!shiftRange(1))return;") {
-		t.Error("前后翻页应整段平移起止日期，而不是只改开始日期")
+	// 前后翻页按钮先应用当前草稿，再整段平移起止日期；不能用旧范围覆盖用户刚选的日期。
+	if !strings.Contains(js, "if(!shiftRangeDraft(-1))return;") || !strings.Contains(js, "if(!shiftRangeDraft(1))return;") {
+		t.Error("前后翻页应从当前草稿整段平移起止日期，而不是从旧范围平移")
+	}
+	if !strings.Contains(js, "function readTimeDraft()") || !strings.Contains(js, "function applyTimeDraft(") {
+		t.Error("日期查询和平移应共用同一套草稿读取与应用逻辑")
+	}
+	if !strings.Contains(js, "const visibleEnd=lc.timeDirty?($('lcToDate')?.value||rangeEnd()):rangeEnd()") {
+		t.Error("后移按钮可用性必须跟随草稿结束日期，不能停留在旧查询范围")
 	}
 	for _, forbidden := range []string{
 		"lc.date=shiftDate(lc.date,-1);lc.fromTime=",
@@ -190,14 +196,30 @@ func TestLogChainMinuteRangeUIWiring(t *testing.T) {
 			t.Errorf("日期切换不应重置分钟范围：仍含 %q", forbidden)
 		}
 	}
-	if !strings.Contains(js, "lc.date=cstToday();lc.toDate=cstToday();syncControls();load()") {
-		t.Error("点击今天应把范围收回今天并保留已应用分钟范围")
+	if !strings.Contains(js, "lc.date=cstToday();lc.toDate=cstToday();lc.timeDirty=false;syncControls();load()") {
+		t.Error("点击今天应把范围收回今天、保留已应用分钟范围并清除旧草稿")
 	}
 	if !strings.Contains(js, "lc.date=cstToday();lc.toDate=cstToday();lc.fromTime='00:00';lc.toTime='23:59';lc.timeDirty=false") {
 		t.Error("只有重置按钮应同时恢复今天全天")
 	}
 
-	// 只有查询动作读取并应用时间；非法值不得发请求，合法值必须加载第一页。
+	// 查询与前后移必须共用同一套范围校验；非法值不得发请求，合法值先同步 UI 再加载第一页。
+	validateStart := strings.Index(js, "function validateTimeDraft(draft){")
+	if validateStart < 0 {
+		t.Fatal("找不到 validateTimeDraft")
+	}
+	validate := js[validateStart:]
+	if end := strings.Index(validate, "\n}"); end >= 0 {
+		validate = validate[:end]
+	}
+	for _, want := range []string{
+		"if(!fromDate||!toDate)", "if(!fromTime||!toTime)", "if(fromDate>toDate)",
+		"if(fromDate===toDate&&fromTime>toTime)", "if(fromDate>today||toDate>today)",
+	} {
+		if !strings.Contains(validate, want) {
+			t.Errorf("统一范围校验缺少 %q", want)
+		}
+	}
 	applyStart := strings.Index(js, "const applyText=()=>{")
 	if applyStart < 0 {
 		t.Fatal("找不到 applyText")
@@ -206,18 +228,25 @@ func TestLogChainMinuteRangeUIWiring(t *testing.T) {
 	if end := strings.Index(apply, "\n  };"); end >= 0 {
 		apply = apply[:end]
 	}
-	if !strings.Contains(apply, "if(!fromDate||!toDate)") || !strings.Contains(apply, "if(!from||!to)") ||
-		!strings.Contains(apply, "if(fromDate>toDate)") ||
-		!strings.Contains(apply, "if(fromDate===toDate&&from>to)") ||
-		!strings.Contains(apply, "if(fromDate>today||toDate>today)") {
-		t.Error("查询时必须校验起止日期与时间成对、顺序合法且不含未来日期")
+	if !strings.Contains(apply, "const invalid=validateTimeDraft(draft)") {
+		t.Error("查询必须复用统一范围校验")
 	}
-	if !strings.Contains(apply, "lc.date=fromDate;lc.toDate=toDate;lc.fromTime=from;lc.toTime=to;lc.timeDirty=false") ||
-		!strings.Contains(apply, "load();") {
-		t.Error("点击查询后必须应用整个范围并重新加载第一页")
+	applyRange := strings.Index(apply, "applyTimeDraft(draft);")
+	applyFilters := strings.Index(apply, "lc.filters.request_id=")
+	applySync := strings.Index(apply, "syncControls();")
+	applyLoad := strings.Index(apply, "load();")
+	if applyRange < 0 || applyFilters <= applyRange || applySync <= applyFilters || applyLoad <= applySync {
+		t.Error("点击查询后必须先应用日期和全部筛选，再同步控件，最后重新加载第一页")
 	}
 	if strings.Contains(apply, "load(true)") {
 		t.Error("查询按钮不得按追加分页执行，必须清空旧游标")
+	}
+}
+
+func TestLogChainDateSummaryKeepsToolbarControlsStable(t *testing.T) {
+	const want = `#lcDateLabel{display:inline-block;width:310px;font-variant-numeric:tabular-nums;white-space:nowrap}`
+	if !strings.Contains(pageHTML, want) {
+		t.Errorf("客户排障日期摘要缺少固定占位样式 %q", want)
 	}
 }
 
@@ -420,9 +449,11 @@ func TestLogChainRequestViewGroupsByRequestIDOnly(t *testing.T) {
 	if !strings.Contains(js, "seen.add(ch+'@'+(r.created_at||0))") {
 		t.Error("尝试次数必须按渠道+时间去重，不能等于日志条数")
 	}
-	// 最终结果取时间最晚那条：取第一条会把首次 429 当成最终结果。
-	if !strings.Contains(js, "(+b.created_at||0)>=(+a.created_at||0)?b:a") {
-		t.Error("最终结果必须取组内时间最晚的记录")
+	// 最终结果取 (created_at,id) 最大那条：同秒重试只比时间会把旧结果当最终结果。
+	for _, want := range []string{"function compareRequestRows(a,b)", "if(at!==bt)return at-bt", "(+a?.id||0)-(+b?.id||0)", "compareRequestRows(b,a)>0"} {
+		if !strings.Contains(js, want) {
+			t.Errorf("同秒最终结果复合排序缺少 %q", want)
+		}
 	}
 	// 组内每条日志仍独立渲染，折叠的是归属而不是原因。
 	if !strings.Contains(js, "g.rows.map(rowHTML).join('')") {
@@ -441,6 +472,22 @@ func TestLogChainRequestViewGroupsByRequestIDOnly(t *testing.T) {
 	for _, want := range []string{".lc-reqhead td", ".lc-req-outcome", ".lc-req-partial"} {
 		if !strings.Contains(pageHTML, want) {
 			t.Errorf("请求组样式缺少 %q", want)
+		}
+	}
+}
+
+func TestLogChainFilterOptionsUseShortRefreshableCache(t *testing.T) {
+	js := stripJSLineComments(string(logChainJS))
+	for _, want := range []string{
+		"opts:null,optsLoadedAt:0,optsLoading:false",
+		"loadFilterOptions();",
+		"Date.now()-lc.optsLoadedAt<60000",
+		"if(lc.optsLoading)return",
+		"lc.optsLoadedAt=Date.now()",
+		"cache:'no-store'",
+	} {
+		if !strings.Contains(js, want) {
+			t.Errorf("排障筛选项短缓存契约缺少 %q", want)
 		}
 	}
 }
@@ -544,8 +591,8 @@ func TestLogChainFocusedReasonUIWiring(t *testing.T) {
 			t.Errorf("筛选原因模式前端接线缺少 %q", want)
 		}
 	}
-	if !strings.Contains(pageHTML, `<script src="/logchain.js?v=12"></script>`) {
-		t.Error("logchain.js 行为已变化但缓存版本未提升到 v12")
+	if !strings.Contains(pageHTML, `<script src="/logchain.js?v=15"></script>`) {
+		t.Error("logchain.js 行为已变化但缓存版本未提升到 v14")
 	}
 }
 
@@ -596,6 +643,26 @@ func TestLogChainChannelDiagnosisPresetClearsStaleFilters(t *testing.T) {
 	}
 }
 
+func TestLogChainCustomerDiagnosisPresetClearsStaleFiltersAndForcesReload(t *testing.T) {
+	js := stripJSLineComments(string(logChainJS))
+	for _, want := range []string{
+		"c.preset==='customer_diagnosis'",
+		"user_id:diagnosisUser",
+		"group:''", "domain:''", "channel_id:''", "model:''", "username:''",
+		"token_name:''", "token_id:''", "endpoint:''", "stream:''", "request_id:''",
+		"lc.scope='err_anom'", "lc.date=today", "lc.toDate=today",
+		"lc.fromTime='00:00'", "lc.toTime='23:59'", "lc.timeDirty=false", "lc.asc=false",
+		"syncControls();\n    return true;",
+	} {
+		if !strings.Contains(js, want) {
+			t.Errorf("客户维护去排障预设缺少 %q", want)
+		}
+	}
+	if !strings.Contains(js, "^\\d+$") || !strings.Contains(js, "+diagnosisUser>0") {
+		t.Error("客户维护去排障预设必须拒绝非法/非正整数用户 ID")
+	}
+}
+
 func TestAlertsUseServerFilteringCursorAndGeneration(t *testing.T) {
 	js := stripJSLineComments(string(alertsJS))
 	for _, want := range []string{
@@ -623,6 +690,14 @@ func TestLogChainRenderDoesNotClearQueryError(t *testing.T) {
 	}
 	if strings.Contains(js[start:start+end], "clearError()") {
 		t.Error("纯重绘不得清除查询失败提示")
+	}
+	loadStart := strings.Index(js, "async function load(more){")
+	fetchAt := strings.Index(js[loadStart:], "await fetch('/logchain/requests?")
+	if loadStart < 0 || fetchAt < 0 {
+		t.Fatal("找不到 load/fetch")
+	}
+	if strings.Contains(js[loadStart:loadStart+fetchAt], "clearError()") {
+		t.Error("新查询开始时不得清除旧错误并折叠提示框；只能在最新成功响应后清除")
 	}
 	notOK := strings.Index(js, "if(!r.ok)throw")
 	if notOK < 0 {
@@ -760,10 +835,7 @@ func TestLogChainScopeBarHasNoAllRequests(t *testing.T) {
 	}
 }
 
-// TestLogChainClientGoneIsSeparateScope 客户端断连必须是独立的查看范围。
-//
-// 2026-08-24 生产实测：当天 1594 条 client_gone 里 92% 已真交付内容，
-// 而真正的流故障只有 25 条。混在同一档时后者会被彻底淹掉。
+// TestLogChainClientGoneIsSeparateScope 零输出慢断连必须是独立的查看范围。
 func TestLogChainClientGoneIsSeparateScope(t *testing.T) {
 	js := string(logChainJS)
 	page := pageHTML
@@ -779,6 +851,9 @@ func TestLogChainClientGoneIsSeparateScope(t *testing.T) {
 	if !strings.Contains(page, `data-lc-scope="client_gone"`) {
 		t.Error("page.html 缺客户端断连的范围按钮")
 	}
+	if !strings.Contains(page, "等待超时后断连") || !strings.Contains(page, "3 秒内取消") {
+		t.Error("断连范围必须向用户说明只保留零输出超过 3 秒的异常")
+	}
 	// 「流故障」按钮的说明必须写明不含客户端断连——否则用户以为流故障档已覆盖它。
 	streamBtnIdx := strings.Index(page, `data-lc-scope="stream"`)
 	if streamBtnIdx < 0 {
@@ -792,14 +867,14 @@ func TestLogChainClientGoneIsSeparateScope(t *testing.T) {
 		t.Error("流故障按钮的 title 应说明不含客户端断连，否则用户以为它已覆盖")
 	}
 
-	// 只带 client_gone 的行不得标黄底：黄底是"要核查"的信号，
-	// 而客户断连多数是客户自己的正常行为，全标黄会淹掉真需要核查的行。
-	if !strings.Contains(js, "onlyClientGone") {
-		t.Error("只带 client_gone 标签的行不应标异常黄底，缺少该判断")
+	// 现在能拿到 client_gone 标签的只剩零输出慢断连，必须按异常高亮；正常
+	// 断连已由后端排除，前端不应再特殊降级。
+	if strings.Contains(js, "onlyClientGone") {
+		t.Error("异常断连不应继续被前端降级为正常样式")
 	}
-	// 标签用中性色而非告警色。
+	// 仍保留独立标签样式，便于与普通流故障区分。
 	if !strings.Contains(js, "lc-tag-gone") || !strings.Contains(page, ".lc-tag-gone") {
-		t.Error("client_gone 标签应有独立的中性色样式（lc-tag-gone），不与告警色混用")
+		t.Error("client_gone 标签应有独立样式（lc-tag-gone）")
 	}
 }
 
@@ -902,11 +977,109 @@ func TestLogChainBlindSpotsCollapsible(t *testing.T) {
 	}
 }
 
+// CloudWatch 按需证据的前端契约。
+//
+// 核心是"不点不查"：一旦前端在渲染或加载时自动请求该接口，每次翻页都会
+// 产生 AWS 调用与费用，而这一点在页面上看不出来，只会出现在账单里。
+func TestLogChainCloudWatchIsOnDemandOnly(t *testing.T) {
+	js := string(logChainJS)
+	if !strings.Contains(js, "'/logchain/investigations'") {
+		t.Fatal("前端缺少异步排障任务创建接口调用")
+	}
+	// 必须是 POST：Request ID 不能进 URL、浏览器历史与 access log。
+	if !strings.Contains(js, "method:'POST'") {
+		t.Error("按需证据必须用 POST，避免 Request ID 进入 URL 与日志")
+	}
+	if strings.Contains(js, "/logchain/investigations?") {
+		t.Error("不得把参数拼进 query")
+	}
+	for _, want := range []string{"pollCloudWatchInvestigation", "/cancel", "pending_delivery", "source_status", "timeline", "bytes_scanned", "audit_recorded", "candidate_truncated"} {
+		if !strings.Contains(js, want) {
+			t.Errorf("完整阶段三前端接线缺少 %q", want)
+		}
+	}
+	// 只能由点击触发。load()/render() 里出现该调用即视为自动预取。
+	idx := strings.Index(js, "loadCloudWatchEvidence")
+	if idx < 0 {
+		t.Fatal("缺少按需查询函数")
+	}
+	if !strings.Contains(js, "data-lc-cw") {
+		t.Error("按需查询必须走既有 data-lc-* 事件委托约定")
+	}
+	// 结果必须按行独立保存，否则展开多行会互相覆盖。
+	if !strings.Contains(js, "cwState") {
+		t.Error("按需证据结果必须按行 id 独立保存")
+	}
+	// 换筛选条件后必须清空：行集整体替换时若沿用旧结果，相同行 id 会把
+	// 上一次查询的证据显示在新一次查询的行下面，页面上完全看不出来。
+	if !strings.Contains(js, "lc.cwState.clear()") {
+		t.Error("重新查询时必须清空按需证据结果，避免跨查询错配")
+	}
+	// 竞态与防连点：迟到响应不得覆盖更新的一次查询。
+	if !strings.Contains(js, "cur.seq!==seq") {
+		t.Error("缺少按需查询的响应竞态防护")
+	}
+	// empty 与 unavailable 必须给出不同文案，不能都写成"无数据"。
+	for _, want := range []string{"不代表请求没有发生", "数据源不可用", "无权限读取", "被 AWS 限流"} {
+		if !strings.Contains(js, want) {
+			t.Errorf("缺少来源状态文案 %q", want)
+		}
+	}
+	// 候选关联不得被写成确定结论。
+	if !strings.Contains(js, "不能据此定责") {
+		t.Error("候选关联必须显式声明不能据此定责")
+	}
+	// 状态色必须让 empty 与故障可分。
+	if !strings.Contains(pageHTML, ".lc-cw b.cw-empty") || !strings.Contains(pageHTML, ".lc-cw b.cw-unavailable") {
+		t.Error("缺少区分 empty 与不可用的状态样式")
+	}
+}
+
+// TestLogChainCloudWatchRequestUsesRequestIDOnly 单条日志已有精确 Request ID 时，
+// 不应把历史业务分组/模型再次当作 CloudWatch 过滤条件发送。生产 logs 允许的分组名
+// 比 CloudWatch 业务标签闭集更宽，原样转发会让点击排障无故得到“group 不合法”；
+// Request ID 查询会在服务端重新取回候选并补齐这些字段。
+func TestLogChainCloudWatchRequestUsesRequestIDOnly(t *testing.T) {
+	js := string(logChainJS)
+	if !strings.Contains(js, "newapi_request_id:row.request_id") {
+		t.Fatal("按单条记录排障必须携带精确 Request ID")
+	}
+	for _, forbidden := range []string{"group:row.group", "model:row.model_name", "user_id:+row.user_id"} {
+		if strings.Contains(js, forbidden) {
+			t.Fatalf("精确 Request ID 排障不应转发冗余业务筛选 %q", forbidden)
+		}
+	}
+	if !strings.Contains(js, "safePath") {
+		t.Fatal("入口查询路径必须经过边界校验后再发送")
+	}
+	if !strings.Contains(js, "lc-cw-diagnosis") || !strings.Contains(js, "查看证据与查询详情") {
+		t.Fatal("全链路结果必须默认展示原因/位置，并将原始证据收进折叠详情")
+	}
+}
+
+// TestLogChainCloudWatchDetailReceivesRowID 阶段三状态按日志行 ID 隔离。
+// detailHTML 最初直接读取 rowHTML 的局部变量 id，浏览器只有在点击展开行时才会
+// 抛 ReferenceError，静态编译和后端测试都发现不了；结果是整个详情区都无法打开。
+// 必须显式把 id 作为参数传入，既用于 cwState，也用于 data-lc-cw 事件委托。
+func TestLogChainCloudWatchDetailReceivesRowID(t *testing.T) {
+	js := stripJSLineComments(string(logChainJS))
+	if !strings.Contains(js, "if(open)html+=detailHTML(r,id)") {
+		t.Error("rowHTML 必须把当前行 ID 显式传给 detailHTML")
+	}
+	if !strings.Contains(js, "function detailHTML(r,id){") {
+		t.Error("detailHTML 必须显式接收行 ID，不能读取调用方局部变量")
+	}
+	if strings.Contains(js, "if(open)html+=detailHTML(r);") || strings.Contains(js, "function detailHTML(r){") {
+		t.Error("detailHTML 仍保留会在浏览器展开时报 ReferenceError 的旧签名")
+	}
+}
+
 // TestLogChainBlindSpotsDropsBodyCapture 第三条"从不采集请求/响应正文"已删。
 // 加入 end_reason / end_error 后，"回答只出一半就断了"已能回答；
 // 剩下真正答不了的是"内容写得不对"，那属内容审查、不是排障范畴。
 func TestLogChainBlindSpotsDropsBodyCapture(t *testing.T) {
-	spots := logChainBlindSpots()
+	// 关闭 CloudWatch 按需证据时的口径：前置拒绝仍只在问题预警可见。
+	spots := logChainBlindSpots(false)
 	if len(spots) != 2 {
 		t.Fatalf("盲区应为 2 条，实际 %d 条: %v", len(spots), spots)
 	}

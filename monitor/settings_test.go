@@ -6,6 +6,29 @@ import (
 	"testing"
 )
 
+func TestCloudWatchLogsRequireExplicitOptInAndRejectOfflineModes(t *testing.T) {
+	const key = "MONITOR_CLOUDWATCH_LOGS_ENABLED"
+	t.Setenv(key, "")
+	if LoadSettings().CloudWatchLogsEnabled {
+		t.Fatal("普通升级不得开启 CloudWatch Logs")
+	}
+	t.Setenv(key, "true")
+	if !LoadSettings().CloudWatchLogsEnabled {
+		t.Fatal("显式开关未加载")
+	}
+	if err := validateCloudWatchLogsSettings(Settings{CloudWatchLogsEnabled: true, LocalSnapshotOnly: true}); err == nil {
+		t.Fatal("本地快照模式不得读取 CloudWatch Logs")
+	}
+	if err := validateCloudWatchLogsSettings(Settings{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateLocalAuthBypassSettings(Settings{
+		LocalAuthBypass: true, LocalSnapshotOnly: true, AlertsDisabled: true, CloudWatchLogsEnabled: true,
+	}); err == nil {
+		t.Fatal("免登录模式不得读取 CloudWatch Logs")
+	}
+}
+
 func TestAICodeWithRecordsRequireExplicitOptIn(t *testing.T) {
 	const key = "MONITOR_AICODEWITH_RECORDS_ENABLED"
 	t.Setenv(key, "")
@@ -353,6 +376,42 @@ func TestLoadSettingsStabilityProblemSourceDefaultsAndOverrides(t *testing.T) {
 	s = LoadSettings()
 	if !s.StabilityProblemSourceEnabled || s.StabilityProblemSourceLookbackHours != 48 {
 		t.Fatalf("problem source overrides not honored: %+v", s)
+	}
+}
+
+func TestValidateCustomerHealthSourceSettings(t *testing.T) {
+	valid := Settings{LogChainOnlySource: true, CustomerHealthSourceEnabled: true}
+	if err := validateCustomerHealthSourceSettings(valid); err != nil {
+		t.Fatalf("valid customer-health source settings: %v", err)
+	}
+	for _, tt := range []struct {
+		name string
+		edit func(*Settings)
+	}{
+		{name: "offline", edit: func(s *Settings) { s.LocalSnapshotOnly = true }},
+		{name: "not logchain only", edit: func(s *Settings) { s.LogChainOnlySource = false }},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := valid
+			tt.edit(&cfg)
+			if err := validateCustomerHealthSourceSettings(cfg); err == nil {
+				t.Fatal("unsafe customer-health source settings must fail closed")
+			}
+		})
+	}
+	if err := validateCustomerHealthSourceSettings(Settings{}); err != nil {
+		t.Fatalf("disabled lane must preserve existing configurations: %v", err)
+	}
+}
+
+func TestLoadSettingsCustomerHealthSourceDefaultsAndOverride(t *testing.T) {
+	t.Setenv("MONITOR_CUSTOMER_HEALTH_SOURCE_ENABLED", "")
+	if LoadSettings().CustomerHealthSourceEnabled {
+		t.Fatal("customer-health source must stay opt-in")
+	}
+	t.Setenv("MONITOR_CUSTOMER_HEALTH_SOURCE_ENABLED", "true")
+	if !LoadSettings().CustomerHealthSourceEnabled {
+		t.Fatal("customer-health source override not honored")
 	}
 }
 

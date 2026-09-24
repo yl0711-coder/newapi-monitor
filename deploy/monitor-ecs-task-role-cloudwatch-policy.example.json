@@ -1,0 +1,34 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ReadNexusAPICloudWatchLogs",
+      "Effect": "Allow",
+      "Action": [
+        "logs:FilterLogEvents",
+        "logs:StartQuery",
+        "logs:GetQueryResults"
+      ],
+      "Resource": [
+        "arn:aws:logs:us-east-1:842806122225:log-group:nexusapi-cloudfront-access:*",
+        "arn:aws:logs:us-east-1:842806122225:log-group:nexusapi-cloudfront-client-diagnostic:*",
+        "arn:aws:logs:us-west-2:842806122225:log-group:/ecs/nexusapi-prod-worker:*",
+        "arn:aws:logs:us-west-2:842806122225:log-group:/ecs/nexusapi-prod-master:*",
+        "arn:aws:logs:us-west-2:842806122225:log-group:/aws/rds/instance/nexusapi-mysql-prod/error:*",
+        "arn:aws:logs:us-west-2:842806122225:log-group:/aws/rds/instance/nexusapi-mysql-prod/slowquery:*"
+      ]
+    },
+    {
+      "Sid": "StopOwnCloudWatchQueries",
+      "Effect": "Allow",
+      "Action": "logs:StopQuery",
+      "Resource": "*"
+    },
+    {
+      "Sid": "DenyUnmask",
+      "Effect": "Deny",
+      "Action": "logs:Unmask",
+      "Resource": "*"
+    }
+  ]
+}

@@ -860,6 +860,9 @@ func (m *Monitor) startSourceEpoch(ctx context.Context, group *sourceEpochGroup)
 		if m.cfg.StabilityProblemSourceEnabled {
 			group.Go(ctx, func(workerCtx context.Context) { m.startStabilityProblemSource(workerCtx) })
 		}
+		if m.cfg.CustomerHealthSourceEnabled {
+			group.Go(ctx, func(workerCtx context.Context) { m.startCustomerHealthSource(workerCtx) })
+		}
 		return
 	}
 	if m.cfg.sourceWorkerStart != nil {
@@ -1092,16 +1095,42 @@ type sourceReadyStatus struct {
 }
 
 type readyStatusResponse struct {
-	Status          string                    `json:"status"`
-	StartedAt       int64                     `json:"started_at"`
-	Store           lifecycleComponentStatus  `json:"store"`
-	FactsStore      lifecycleComponentStatus  `json:"facts_store"`
-	Source          sourceReadyStatus         `json:"source"`
-	SampledAt       int64                     `json:"sampled_at"`
-	MetricFinalize  metricFinalizeReadyStatus `json:"metric_finalize"`
-	FactsHeartbeat  int64                     `json:"facts_heartbeat_at"`
-	FactsDisk       factsDiskReadyStatus      `json:"facts_disk"`
-	DegradedReasons []string                  `json:"degraded_reasons,omitempty"`
+	Status          string                     `json:"status"`
+	StartedAt       int64                      `json:"started_at"`
+	Store           lifecycleComponentStatus   `json:"store"`
+	FactsStore      lifecycleComponentStatus   `json:"facts_store"`
+	Source          sourceReadyStatus          `json:"source"`
+	SampledAt       int64                      `json:"sampled_at"`
+	MetricFinalize  metricFinalizeReadyStatus  `json:"metric_finalize"`
+	FactsHeartbeat  int64                      `json:"facts_heartbeat_at"`
+	FactsDisk       factsDiskReadyStatus       `json:"facts_disk"`
+	CloudWatchPreRoute cloudWatchPreRouteReadyStatus `json:"cloudwatch_pre_route"`
+	CloudWatchNginx cloudWatchNginxReadyStatus `json:"cloudwatch_nginx"`
+	DegradedReasons []string                   `json:"degraded_reasons,omitempty"`
+}
+
+type cloudWatchPreRouteReadyStatus struct {
+	Enabled        bool  `json:"enabled"`
+	Running        bool  `json:"running"`
+	CoverageFrom   int64 `json:"coverage_from_ts"`
+	ThroughTs      int64 `json:"through_ts"`
+	TargetTs       int64 `json:"target_ts"`
+	LastSuccessAt  int64 `json:"last_success_at"`
+	LastFailureAt  int64 `json:"last_failure_at"`
+}
+
+type cloudWatchNginxReadyStatus struct {
+	Enabled               bool  `json:"enabled"`
+	Running               bool  `json:"running"`
+	CoverageFrom          int64 `json:"coverage_from_ts"`
+	ThroughTs             int64 `json:"through_ts"`
+	TargetTs              int64 `json:"target_ts"`
+	LastSuccessAt         int64 `json:"last_success_at"`
+	LastFailureAt         int64 `json:"last_failure_at"`
+	EvidenceCoverageFrom  int64 `json:"evidence_coverage_from_ts"`
+	EvidenceThroughTs     int64 `json:"evidence_through_ts"`
+	EvidenceLastSuccessAt int64 `json:"evidence_last_success_at"`
+	EvidenceLastFailureAt int64 `json:"evidence_last_failure_at"`
 }
 
 type metricFinalizeReadyStatus struct {
@@ -1131,6 +1160,14 @@ func (m *Monitor) readyStatus(now time.Time) (readyStatusResponse, int) {
 	factsOK := m.localFactsProbeOK.Load()
 	if m.factsStoreRequired() {
 		factsOK = factsOK && m.usageFactsIntegrityOK.Load()
+	}
+	cloudWatchNginxTarget := int64(0)
+	if m.cfg.CloudWatchNginxEnabled {
+		_, cloudWatchNginxTarget = cloudWatchNginxRange(now, m.cfg.CloudWatchNginxLookbackHours)
+	}
+	cloudWatchPreRouteTarget := int64(0)
+	if m.cfg.CloudWatchPreRouteEnabled {
+		_, cloudWatchPreRouteTarget = cloudWatchPreRouteRange(now, m.cfg.CloudWatchPreRouteLookbackHours)
 	}
 	response := readyStatusResponse{
 		Status:    "ready",
@@ -1165,6 +1202,22 @@ func (m *Monitor) readyStatus(now time.Time) (readyStatusResponse, int) {
 			Pressure:    usageFactDiskPressureLevel(m.usageFactsHistoryDiskLevel.Load()).String(),
 			FreeBytes:   m.usageFactsHistoryDiskFreeBytes.Load(),
 			UsedPercent: float64(m.usageFactsHistoryDiskUsedBPS.Load()) / 100,
+		},
+		CloudWatchPreRoute: cloudWatchPreRouteReadyStatus{
+			Enabled: m.cfg.CloudWatchPreRouteEnabled, Running: m.cloudWatchPreRouteRunning.Load(),
+			CoverageFrom: m.cloudWatchPreRouteFrom.Load(), ThroughTs: m.cloudWatchPreRouteThrough.Load(),
+			TargetTs: cloudWatchPreRouteTarget, LastSuccessAt: m.cloudWatchPreRouteLastSuccess.Load(),
+			LastFailureAt: m.cloudWatchPreRouteLastFailure.Load(),
+		},
+		CloudWatchNginx: cloudWatchNginxReadyStatus{
+			Enabled: m.cfg.CloudWatchNginxEnabled, Running: m.cloudWatchNginxRunning.Load(),
+			CoverageFrom: m.cloudWatchNginxFrom.Load(), ThroughTs: m.cloudWatchNginxThrough.Load(),
+			TargetTs: cloudWatchNginxTarget, LastSuccessAt: m.cloudWatchNginxLastSuccess.Load(),
+			LastFailureAt:         m.cloudWatchNginxLastFailure.Load(),
+			EvidenceCoverageFrom:  m.cloudWatchNginxEvidenceFrom.Load(),
+			EvidenceThroughTs:     m.cloudWatchNginxEvidenceThrough.Load(),
+			EvidenceLastSuccessAt: m.cloudWatchNginxEvidenceLastSuccess.Load(),
+			EvidenceLastFailureAt: m.cloudWatchNginxEvidenceLastFailure.Load(),
 		},
 	}
 	if m.shuttingDown.Load() || !mainOK || (m.factsStoreRequired() && !factsOK) {
@@ -1244,6 +1297,41 @@ func (m *Monitor) readyStatus(now time.Time) (readyStatusResponse, int) {
 	}
 	if m.nginxSourceV2Active.Load() && !m.nginxSourceV2RuntimeConfigOK.Load() {
 		response.DegradedReasons = appendReason(response.DegradedReasons, "nginx_source_v2_runtime_config_mismatch")
+	}
+	if m.cfg.CloudWatchNginxEnabled {
+		if !m.cloudWatchNginxRunning.Load() {
+			response.DegradedReasons = appendReason(response.DegradedReasons, "cloudwatch_nginx_not_running")
+		}
+		lastSuccess, lastFailure := m.cloudWatchNginxLastSuccess.Load(), m.cloudWatchNginxLastFailure.Load()
+		if lastFailure > lastSuccess {
+			response.DegradedReasons = appendReason(response.DegradedReasons, "cloudwatch_nginx_failed")
+		}
+		through := m.cloudWatchNginxThrough.Load()
+		if through == 0 || cloudWatchNginxTarget-through > 20*60 {
+			response.DegradedReasons = appendReason(response.DegradedReasons, "cloudwatch_nginx_coverage_incomplete")
+		}
+		if nginxEvidenceMode(m.cfg.NginxEvidenceMode) == "verified" {
+			evidenceThrough := m.cloudWatchNginxEvidenceThrough.Load()
+			if evidenceThrough == 0 || cloudWatchNginxTarget-evidenceThrough > 20*60 {
+				response.DegradedReasons = appendReason(response.DegradedReasons, "cloudwatch_nginx_evidence_coverage_incomplete")
+			}
+			if m.cloudWatchNginxEvidenceLastFailure.Load() > m.cloudWatchNginxEvidenceLastSuccess.Load() {
+				response.DegradedReasons = appendReason(response.DegradedReasons, "cloudwatch_nginx_evidence_failed")
+			}
+		}
+	}
+	if m.cfg.CloudWatchPreRouteEnabled {
+		if !m.cloudWatchPreRouteRunning.Load() {
+			response.DegradedReasons = appendReason(response.DegradedReasons, "cloudwatch_pre_route_not_running")
+		}
+		lastSuccess, lastFailure := m.cloudWatchPreRouteLastSuccess.Load(), m.cloudWatchPreRouteLastFailure.Load()
+		if lastFailure > lastSuccess {
+			response.DegradedReasons = appendReason(response.DegradedReasons, "cloudwatch_pre_route_failed")
+		}
+		through := m.cloudWatchPreRouteThrough.Load()
+		if through == 0 || cloudWatchPreRouteTarget-through > 20*60 {
+			response.DegradedReasons = appendReason(response.DegradedReasons, "cloudwatch_pre_route_coverage_incomplete")
+		}
 	}
 	if m.cfg.StabilityEnabled && !m.cfg.LocalSnapshotOnly {
 		if m.stabilityCoverageCheckedAt.Load() == 0 || m.stabilityCoverageBPS.Load() < 10000 {

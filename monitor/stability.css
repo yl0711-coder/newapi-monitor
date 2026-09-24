@@ -5,20 +5,23 @@
 body{max-width:none!important;margin:0!important;padding:0!important;overflow-x:hidden}
 .monitor-shell{width:100%;min-height:100vh;display:grid;grid-template-columns:212px minmax(0,1fr);background:var(--bg);transition:grid-template-columns .18s ease}
 .monitor-sidebar{position:sticky;top:0;height:100vh;padding:24px 12px 18px;border-right:1px solid var(--border);background:#11141d;z-index:20;display:flex;flex-direction:column;overflow:hidden}
-.monitor-brand{display:flex;align-items:center;gap:12px;padding:0 7px 26px;white-space:nowrap}
+.monitor-brand{display:flex;align-items:center;gap:12px;flex:none;padding:0 7px 26px;white-space:nowrap}
 .monitor-brand-mark{width:46px;height:46px;border-radius:14px;display:grid;place-items:center;background:linear-gradient(145deg,#7779ff,#5457e9);color:white;box-shadow:0 10px 28px rgba(87,89,231,.26)}
 .monitor-brand-mark svg{width:25px;height:25px}
 .monitor-brand-copy{min-width:0}
 .monitor-brand b{display:block;font-size:19px;line-height:1.2;letter-spacing:.01em}
 .monitor-brand small{display:block;color:var(--text-muted);font-size:13px;margin-top:4px}
-.monitor-nav.tabs{display:flex;flex-direction:column;gap:8px;margin:0;border:0}
+.monitor-nav.tabs{display:flex;flex:1 1 auto;min-height:0;flex-direction:column;gap:8px;margin:0;padding:0 3px 8px 0;border:0;overflow-x:hidden;overflow-y:auto;overscroll-behavior:contain;scrollbar-gutter:stable}
+.monitor-nav.tabs::-webkit-scrollbar{width:7px}
+.monitor-nav.tabs::-webkit-scrollbar-thumb{background:#394155;border-radius:999px;border:2px solid #11141d}
+.monitor-nav.tabs::-webkit-scrollbar-track{background:transparent}
 .monitor-nav.tabs .tab{position:relative;display:flex;align-items:center;gap:12px;width:100%;padding:14px 13px;border:1px solid transparent;border-radius:12px;color:#98a3b8;font-size:16px;line-height:1;border-bottom:1px solid transparent;white-space:nowrap}
 .monitor-nav.tabs .tab:hover{color:var(--text);background:rgba(255,255,255,.025)}
 .monitor-nav.tabs .tab.active{color:#dedbff;background:rgba(99,102,241,.18);border-color:rgba(120,113,255,.1);font-weight:600}
 .monitor-nav-icon{width:23px;height:23px;display:grid;place-items:center;flex:none}
 .monitor-nav-icon svg{width:22px;height:22px;stroke:currentColor;fill:none;stroke-width:1.8}
 .monitor-nav-label,.monitor-brand-copy{opacity:1;transition:opacity .12s ease}
-.monitor-sidebar-toggle{display:flex;align-items:center;justify-content:center;gap:8px;width:100%;min-height:40px;margin-top:auto;border:1px solid #30384a;border-radius:10px;background:#151925;color:#98a3b8;font:inherit;font-size:12px;cursor:pointer;white-space:nowrap}
+.monitor-sidebar-toggle{display:flex;align-items:center;justify-content:center;gap:8px;flex:none;width:100%;min-height:40px;margin-top:12px;border:1px solid #30384a;border-radius:10px;background:#151925;color:#98a3b8;font:inherit;font-size:12px;cursor:pointer;white-space:nowrap}
 .monitor-sidebar-toggle:hover{color:#dedbff;border-color:#56507b;background:#181d2a}
 .monitor-sidebar-toggle:focus-visible{outline:2px solid #8076ff;outline-offset:2px}
 .monitor-sidebar-toggle svg{width:18px;height:18px;stroke:currentColor;fill:none;stroke-width:2;transition:transform .18s ease;flex:none}
@@ -30,6 +33,8 @@ body{max-width:none!important;margin:0!important;padding:0!important;overflow-x:
 .monitor-shell.sidebar-collapsed .monitor-nav.tabs .tab{justify-content:center;gap:0;padding-left:10px;padding-right:10px}
 .monitor-shell.sidebar-collapsed .monitor-nav.tabs .tab::after{content:attr(data-nav-tooltip);position:absolute;left:calc(100% + 12px);top:50%;z-index:50;transform:translateY(-50%) translateX(-3px);padding:8px 10px;border:1px solid #343c50;border-radius:8px;background:#1b2030;box-shadow:0 8px 24px rgba(0,0,0,.32);color:#e5e7eb;font-size:12px;font-weight:500;line-height:1;white-space:nowrap;pointer-events:none;opacity:0;visibility:hidden;transition:opacity .12s ease 0s,transform .12s ease 0s,visibility 0s linear .12s}
 .monitor-shell.sidebar-collapsed .monitor-nav.tabs .tab:hover::after{opacity:1;visibility:visible;transform:translateY(-50%) translateX(0);transition-delay:1s,1s,1s}
+/* 可滚动容器会裁切横向伪元素；收起时改由 JS 写回原生 title 提示。 */
+.monitor-shell.sidebar-collapsed .monitor-nav.tabs .tab::after{display:none}
 .monitor-shell.sidebar-collapsed .monitor-sidebar-toggle svg{transform:rotate(180deg)}
 .monitor-workspace{min-width:0;width:100%;padding:0 24px 44px}
 .monitor-page-head{min-height:112px;display:flex;align-items:center;justify-content:space-between;gap:24px;border-bottom:1px solid var(--border);padding:23px 2px 20px;margin-bottom:20px}

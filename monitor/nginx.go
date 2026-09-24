@@ -94,12 +94,31 @@ func validateNginxSettings(s Settings) error {
 		if s.NginxEvidenceHMACKey == s.IngestToken || s.NginxEvidenceHMACKey == s.SessionSecret || s.NginxEvidenceHMACKey == s.UpstreamCredentialSecret {
 			return fmt.Errorf("Nginx evidence HMAC 密钥必须独立于登录、ingest 和上游凭据")
 		}
+		if s.CloudWatchNginxEnabled && (s.NginxEvidenceHMACKey != s.CloudWatchEvidenceHMACKey ||
+			s.NginxEvidenceHMACKeyID != s.CloudWatchEvidenceHMACKeyID) {
+			return fmt.Errorf("CloudWatch Nginx 直采的 evidence HMAC 密钥和 key id 必须与 Nginx evidence 配置一致")
+		}
 		prevKey, prevID := s.NginxEvidencePreviousHMACKey, s.NginxEvidencePreviousHMACKeyID
 		if (prevKey == "") != (prevID == "") || prevKey != "" && (len(prevKey) < 32 || !nginxEvidenceKeyIDPattern.MatchString(prevID) || prevID == s.NginxEvidenceHMACKeyID || prevKey == s.NginxEvidenceHMACKey) {
 			return fmt.Errorf("Nginx evidence 上一把 HMAC 密钥和 key id 必须成对、合法且不同于当前密钥")
 		}
 	}
 	if !s.NginxEnabled {
+		return nil
+	}
+	// CloudWatch 直采只复用 Nginx 本地事实、报表和清理生命周期，不开放
+	// /internal/nginx* 接收口。IngestToken 留空时 checkIngest 会继续返回 503；
+	// 只有旧采集器接收模式才要求 token 和节点白名单。
+	// CloudWatch direct collection may also publish request-level HMAC evidence
+	// into the local evidence DB.  That lane has no collector to authenticate,
+	// so it must be allowed to run without an ingest token or node allow-list
+	// just like the minute-aggregate-only mode.
+	cloudWatchOnly := s.CloudWatchNginxEnabled && strings.TrimSpace(s.IngestToken) == "" &&
+		len(s.NginxAllowedNodes) == 0 && !s.NginxSourceV2Enabled
+	if cloudWatchOnly {
+		if len(s.NginxExpectedNodes) > 0 {
+			return fmt.Errorf("CloudWatch Nginx 直采模式不能继续期待旧采集器节点")
+		}
 		return nil
 	}
 	if strings.TrimSpace(s.IngestToken) == "" {
@@ -753,6 +772,14 @@ const (
 	nginxBacklogWarnBytes        = int64(16 << 20)
 )
 
+// 同一分钟同时存在旧采集器与 CloudWatch 事实时，只读取 CloudWatch 行；
+// 若该分钟尚未被 CloudWatch 捕获，则保留旧历史作为回退。这样既不破坏
+// 切换日前的历史，也不会在短暂重叠期重复计数。
+const nginxPreferredAccessClause = `(n.node = ? OR NOT EXISTS (
+	SELECT 1 FROM nginx_minute_samples cw
+	WHERE cw.bucket_ts = n.bucket_ts AND cw.node = ?
+))`
+
 type NginxEdgeReport struct {
 	Enabled       bool                 `json:"enabled"`
 	RetentionDays int                  `json:"retention_days,omitempty"`
@@ -837,7 +864,10 @@ const nginxAggregateColumns = `COALESCE(SUM(count),0) requests,
 	COALESCE(SUM(latency_over60s),0) latency_over60s`
 
 func (m *Monitor) nginxSources(ctx context.Context, now int64) []NginxEdgeSource {
-	nodes := m.nginxExpectedNodes()
+	nodes := append([]string{}, m.nginxExpectedNodes()...)
+	if m.cfg.CloudWatchNginxEnabled {
+		nodes = appendUniqueString(nodes, cloudWatchNginxNode)
+	}
 	if len(nodes) == 0 {
 		return nil
 	}
@@ -868,11 +898,19 @@ func (m *Monitor) nginxSources(ctx context.Context, now int64) []NginxEdgeSource
 			status = "warn"
 			reasons = append(reasons, "log_or_backlog_unreadable")
 		}
-		if age > 180 {
+		heartbeatWarn, heartbeatBad := int64(180), int64(900)
+		eventWarn, eventBad := nginxEventLagWarnSec, nginxEventLagBadSec
+		if node == cloudWatchNginxNode && m.cfg.CloudWatchNginxEnabled {
+			poll := int64(m.cfg.CloudWatchNginxPollSeconds)
+			heartbeatWarn, heartbeatBad = poll+60, poll*3+60
+			eventWarn = poll + int64(cloudWatchNginxFinalizeDelay/time.Second) + 60
+			eventBad = poll*3 + int64(cloudWatchNginxFinalizeDelay/time.Second) + 60
+		}
+		if age > heartbeatWarn {
 			status = "warn"
 			reasons = append(reasons, "heartbeat_stale")
 		}
-		if age > 900 {
+		if age > heartbeatBad {
 			status = "bad"
 		}
 		// The load balancer probes every active node, so an access lane with
@@ -884,8 +922,8 @@ func (m *Monitor) nginxSources(ctx context.Context, now int64) []NginxEdgeSource
 				status = "warn"
 			}
 			reasons = append(reasons, "event_stream_empty")
-		} else if eventAge > nginxEventLagWarnSec {
-			if eventAge > nginxEventLagBadSec {
+		} else if eventAge > eventWarn {
+			if eventAge > eventBad {
 				status = "bad"
 			} else if status != "bad" {
 				status = "warn"
@@ -898,7 +936,7 @@ func (m *Monitor) nginxSources(ctx context.Context, now int64) []NginxEdgeSource
 			}
 			reasons = append(reasons, "backlog_large")
 		}
-		if state.BacklogKnown && state.BacklogBytes > 0 && state.LastEventTs > 0 && eventAge > nginxEventLagWarnSec {
+		if state.BacklogKnown && state.BacklogBytes > 0 && state.LastEventTs > 0 && eventAge > eventWarn {
 			if status != "bad" {
 				status = "warn"
 			}
@@ -953,7 +991,9 @@ func (m *Monitor) nginxSourceSummary(ctx context.Context, now int64) (connected 
 		}
 	}
 	var row struct{ Requests, Present int64 }
-	warnReadErr("nginx request id coverage", m.storeDB.WithContext(ctx).Raw(`SELECT COALESCE(SUM(count),0) requests, COALESCE(SUM(request_id_present),0) present FROM nginx_minute_samples WHERE bucket_ts >= ?`, now-86400).Scan(&row))
+	warnReadErr("nginx request id coverage", m.storeDB.WithContext(ctx).Raw(`SELECT COALESCE(SUM(n.count),0) requests, COALESCE(SUM(n.request_id_present),0) present
+		FROM nginx_minute_samples n WHERE n.bucket_ts >= ? AND `+nginxPreferredAccessClause,
+		now-86400, cloudWatchNginxNode, cloudWatchNginxNode).Scan(&row))
 	if row.Requests > 0 {
 		v := float64(row.Present) / float64(row.Requests) * 100
 		requestIDCoverage = &v
@@ -977,9 +1017,10 @@ func (m *Monitor) serveNginxEdge(c *gin.Context) {
 	defer cancel()
 	report := NginxEdgeReport{Enabled: true, RetentionDays: retentionDays, GeneratedAt: now.Unix(), From: time.Unix(scope.FromTs, 0).In(cstLocation).Format("2006-01-02"), To: time.Unix(scope.ToTs-1, 0).In(cstLocation).Format("2006-01-02")}
 	queryToTs := nginxQueryToTs(scope, now.Unix())
-	whereArgs := []any{scope.FromTs, queryToTs}
+	whereArgs := []any{scope.FromTs, queryToTs, cloudWatchNginxNode, cloudWatchNginxNode}
 	var total NginxEdgeAggregate
-	if err := m.storeDB.WithContext(ctx).Raw(`SELECT `+nginxAggregateColumns+` FROM nginx_minute_samples WHERE bucket_ts >= ? AND bucket_ts < ?`, whereArgs...).Scan(&total).Error; err != nil {
+	if err := m.storeDB.WithContext(ctx).Raw(`SELECT `+nginxAggregateColumns+` FROM nginx_minute_samples n
+		WHERE n.bucket_ts >= ? AND n.bucket_ts < ? AND `+nginxPreferredAccessClause, whereArgs...).Scan(&total).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "读取入口聚合失败"})
 		return
 	}
@@ -988,7 +1029,8 @@ func (m *Monitor) serveNginxEdge(c *gin.Context) {
 		Date string
 		NginxEdgeAggregate
 	}
-	if err := m.storeDB.WithContext(ctx).Raw(`SELECT strftime('%Y-%m-%d', bucket_ts, 'unixepoch', '+8 hours') date, `+nginxAggregateColumns+` FROM nginx_minute_samples WHERE bucket_ts >= ? AND bucket_ts < ? GROUP BY date ORDER BY date`, whereArgs...).Scan(&daily).Error; err != nil {
+	if err := m.storeDB.WithContext(ctx).Raw(`SELECT strftime('%Y-%m-%d', n.bucket_ts, 'unixepoch', '+8 hours') date, `+nginxAggregateColumns+` FROM nginx_minute_samples n
+		WHERE n.bucket_ts >= ? AND n.bucket_ts < ? AND `+nginxPreferredAccessClause+` GROUP BY date ORDER BY date`, whereArgs...).Scan(&daily).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "读取入口日趋势失败"})
 		return
 	}
@@ -1001,11 +1043,15 @@ func (m *Monitor) serveNginxEdge(c *gin.Context) {
 			Requests, Status4xx, Status5xx int64
 			SumMS                          int64
 		}
-		q := `SELECT ` + column + ` name, COALESCE(SUM(count),0) requests,
+		if column != "route" && column != "node" {
+			return nil, fmt.Errorf("unsupported nginx breakdown")
+		}
+		qualified := "n." + column
+		q := `SELECT ` + qualified + ` name, COALESCE(SUM(count),0) requests,
 			COALESCE(SUM(CASE WHEN status BETWEEN 400 AND 499 THEN count ELSE 0 END),0) status4xx,
 			COALESCE(SUM(CASE WHEN status BETWEEN 500 AND 599 THEN count ELSE 0 END),0) status5xx,
-			COALESCE(SUM(request_time_sum_ms),0) sum_ms FROM nginx_minute_samples
-			WHERE bucket_ts >= ? AND bucket_ts < ? GROUP BY ` + column + ` ORDER BY requests DESC LIMIT 50`
+			COALESCE(SUM(request_time_sum_ms),0) sum_ms FROM nginx_minute_samples n
+			WHERE n.bucket_ts >= ? AND n.bucket_ts < ? AND ` + nginxPreferredAccessClause + ` GROUP BY ` + qualified + ` ORDER BY requests DESC LIMIT 50`
 		if err := m.storeDB.WithContext(ctx).Raw(q, whereArgs...).Scan(&rows).Error; err != nil {
 			return nil, err
 		}

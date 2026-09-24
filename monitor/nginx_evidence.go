@@ -256,7 +256,10 @@ func (m *Monitor) openNginxEvidenceStore() error {
 	if len(m.cfg.NginxEvidenceHMACKey) < 32 || !nginxEvidenceKeyIDPattern.MatchString(m.cfg.NginxEvidenceHMACKeyID) {
 		return errors.New("evidence HMAC key must be at least 32 bytes and key id must be valid")
 	}
-	dsn := path + "?_pragma=busy_timeout(3000)&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)"
+	// Keep SQLite's transient sort/index work in memory. The container's /tmp
+	// is deliberately bounded; spilling a large evidence replacement there
+	// can surface as SQLITE_FULL even while the evidence volume has space.
+	dsn := path + "?_pragma=busy_timeout(3000)&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=temp_store(2)"
 	db, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})
 	if err != nil {
 		return fmt.Errorf("open evidence store: %w", err)

@@ -3,17 +3,71 @@ package monitor
 // alerts_page.go：「问题预警」——统计未到达任何渠道的请求。
 //
 // 这类请求（令牌配错、请求不存在的模型等）从未到达渠道，不进渠道稳定率。
-// 数据源是 stability_reject_hours，由旁路采集器读 Nginx 文件日志推来。
+// 页面读取本地 rejection_samples 分钟事实；事实可由 CloudWatch 直采或兼容
+// 的旁路采集器写入，页面刷新不直接访问 AWS/生产数据库。
 
 import (
+	"net/http"
 	"time"
 
 	"github.com/gin-gonic/gin"
 )
 
-// alertsNoDataNote：0 条不等于「没有问题」。这类数据靠旁路采集器推送，
-// 采集器没跑时表就是空的。把两者说成一回事会让人误以为一切正常。
-const alertsNoDataNote = "无数据。这类请求靠旁路采集器读 Nginx 文件日志推送，请先确认采集器在运行——0 条不代表没有问题。"
+// alertsNoDataNote：0 条不等于「没有问题」。前置拒绝事实来自本地分钟
+// rejection_samples，可能由 CloudWatch 直采或兼容的旁路采集器写入；
+// 对应来源未运行、失败或尚未追平时，表同样可能为空。
+const alertsNoDataNote = "无数据。前置拒绝来自本地分钟事实（CloudWatch 直采或兼容采集器），请先确认对应采集水位与采集器状态——0 条不代表没有问题。"
+
+// alertsCoverageNote 在直采尚未覆盖完请求日期时给出 fail-closed 提示。
+// 问题预警可以同时包含历史旁路采集器和 CloudWatch 直采事实；即使已经有
+// 几行结果，也不能把尚未追平的窗口展示成完整统计。日期完全早于直采的
+// 保留起点时不提示，避免把历史兼容来源误报成当前缺口。
+func (m *Monitor) alertsCoverageNote(scope stabilityScope, now time.Time) string {
+	if m == nil || !m.cfg.CloudWatchPreRouteEnabled {
+		return ""
+	}
+	targetFrom, target := cloudWatchPreRouteRange(now, m.cfg.CloudWatchPreRouteLookbackHours)
+	if target <= 0 || scope.ToTs <= 0 {
+		return ""
+	}
+	coverageFrom := m.cloudWatchPreRouteFrom.Load()
+	// Before the durable cursor is restored, use the configured lookback start
+	// as the conservative lower bound. A date wholly before that bound is not a
+	// missing CloudWatch window; it is outside this direct lane's responsibility
+	// and may legitimately be served by the compatibility collector.
+	if coverageFrom <= 0 {
+		coverageFrom = targetFrom
+	}
+	// No direct-lane interval intersects this range when it ends before the
+	// retained lookback starts, or when it begins after the current closed
+	// target.  A range that crosses coverageFrom is only partly owned by the
+	// direct lane and must be called out as dependent on the compatibility
+	// collector rather than silently presented as complete.
+	if scope.ToTs <= coverageFrom || scope.FromTs >= target {
+		return ""
+	}
+	requiredThrough := scope.ToTs
+	if requiredThrough > target {
+		requiredThrough = target
+	}
+	lastSuccess := m.cloudWatchPreRouteLastSuccess.Load()
+	lastFailure := m.cloudWatchPreRouteLastFailure.Load()
+	through := m.cloudWatchPreRouteThrough.Load()
+	// This page is an incident/evidence view, so any unpublished closed
+	// minute must be called out.  The readiness endpoint intentionally keeps a
+	// 20-minute noise budget for normal polling jitter, but silently accepting
+	// that gap here can make a real recent rejection look absent.
+	coverageIncomplete := through <= 0 || through < requiredThrough
+	legacyPrefixRisk := scope.FromTs < coverageFrom && scope.ToTs > coverageFrom
+	// A later failed poll must not taint a historical range whose requested end
+	// is already behind the durable watermark. It matters only when the failure
+	// leaves part of this particular range unpublished.
+	failureAffectsScope := lastFailure > lastSuccess && through < requiredThrough
+	if coverageIncomplete || failureAffectsScope || legacyPrefixRisk {
+		return "CloudWatch 前置拒绝直采覆盖范围不完整或最近采集失败，当前结果可能只覆盖已发布窗口或兼容采集器已覆盖的部分；请同时核对采集水位与兼容采集器状态。"
+	}
+	return ""
+}
 
 // AlertRejectRow 是一条按分钟聚合的前置拒绝明细，供表格逐行展示。
 //
@@ -46,7 +100,8 @@ type AlertRejectStats struct {
 	UnknownUserQuotaCount     int64 // 客户未知：用户额度不足
 	UnknownPreConsumeCount    int64 // 客户未知：预扣费失败
 	UnknownTokenQuotaCount    int64 // 客户未知：令牌额度不足
-	UnknownCustomerOtherCount int64 // 客户未知：除上述三种外的新原因
+	UnknownQuotaAccountCount  int64 // 客户未知：CloudWatch 账户或额度不足
+	UnknownCustomerOtherCount int64 // 客户未知：除上述额度类外的新原因
 }
 
 // AlertsResponse 是问题预警接口的返回。
@@ -55,8 +110,8 @@ type AlertsResponse struct {
 	From    string `json:"from"`
 	To      string `json:"to"`
 	Total   int64  `json:"total"`
-	// CoverageNote 说明这批数据靠旁路采集器；采集器没跑时这里为空且 total=0，
-	// 页面必须把这种情况说成「未采集」，不能说成「没有问题」。
+	// CoverageNote 说明这批数据靠旁路采集器，以及直采水位是否完整；
+	// 空结果也必须明确提示「未采集」或覆盖风险，不能说成「没有问题」。
 	CoverageNote string `json:"coverage_note,omitempty"`
 	// Rows 是逐分钟明细。RowsTruncated 为真表示超出上限被截断，
 	// 页面必须说明「还有更多」，不能让人以为这就是全部。
@@ -72,6 +127,7 @@ type AlertsResponse struct {
 	UnknownUserQuotaCount     int64 `json:"unknown_user_quota_count,omitempty"`
 	UnknownPreConsumeCount    int64 `json:"unknown_pre_consume_count,omitempty"`
 	UnknownTokenQuotaCount    int64 `json:"unknown_token_quota_count,omitempty"`
+	UnknownQuotaAccountCount  int64 `json:"unknown_quota_account_count,omitempty"`
 	UnknownCustomerOtherCount int64 `json:"unknown_customer_other_count,omitempty"`
 }
 
@@ -80,6 +136,10 @@ type AlertsResponse struct {
 func (m *Monitor) getRejectAlertsHandler(c *gin.Context) {
 	if !m.cfg.StabilityEnabled {
 		c.JSON(200, AlertsResponse{Enabled: false})
+		return
+	}
+	if m.storeDB == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "本地事实库未就绪，无法读取问题预警"})
 		return
 	}
 	scope, err := stabilityRange(c, time.Now(), m.cfg.stabilityQueryDays())
@@ -92,9 +152,15 @@ func (m *Monitor) getRejectAlertsHandler(c *gin.Context) {
 		c.JSON(400, gin.H{"error": err.Error()})
 		return
 	}
-	if err := validateAlertRejectCursor(scope, filter); err != nil {
+	// Today's range ends at the current second.  A continuation cursor is a
+	// snapshot of the first request, so allow the live upper bound to advance
+	// and then query that cursor snapshot consistently for the remaining pages.
+	if err := validateAlertRejectCursorForContinuation(scope, filter); err != nil {
 		c.JSON(400, gin.H{"error": err.Error()})
 		return
+	}
+	if cursor := filter.Cursor; cursor != nil {
+		scope.FromTs, scope.ToTs = cursor.FromTs, cursor.ToTs
 	}
 	rows, hasMore, nextCursor, stats, err := m.queryRejectPage(scope, filter)
 	if err != nil {
@@ -120,9 +186,12 @@ func (m *Monitor) getRejectAlertsHandler(c *gin.Context) {
 		UnknownUserQuotaCount:     stats.UnknownUserQuotaCount,
 		UnknownPreConsumeCount:    stats.UnknownPreConsumeCount,
 		UnknownTokenQuotaCount:    stats.UnknownTokenQuotaCount,
+		UnknownQuotaAccountCount:  stats.UnknownQuotaAccountCount,
 		UnknownCustomerOtherCount: stats.UnknownCustomerOtherCount,
 	}
-	if len(rows) == 0 && filter.Reason == "" && filter.UserID == nil {
+	if note := m.alertsCoverageNote(scope, time.Now()); note != "" {
+		resp.CoverageNote = note
+	} else if len(rows) == 0 && filter.Reason == "" && filter.UserID == nil {
 		resp.CoverageNote = alertsNoDataNote
 	}
 	resp.From = time.Unix(scope.FromTs, 0).In(cstLocation).Format("2006-01-02")

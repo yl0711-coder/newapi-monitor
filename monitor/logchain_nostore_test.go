@@ -56,28 +56,33 @@ func TestNoStoreSensitiveSetsHeadersBeforeHandler(t *testing.T) {
 	}
 }
 
-// TestLogChainRoutesUseNoStore 两个排障路由必须挂上中间件，前端也要声明 no-store。
+// TestLogChainRoutesUseNoStore 所有排障路由必须挂上中间件，前端也要声明 no-store。
 //
 // 路由注册用字符串断言：漏挂中间件不会让任何现有测试失败，
 // 而它的后果（敏感诊断数据被中间层缓存）在功能测试里看不出来。
 func TestLogChainRoutesUseNoStore(t *testing.T) {
 	src := serverGoSource(t)
-	for _, route := range []string{"/logchain/requests", "/logchain/filters"} {
-		idx := strings.Index(src, `view.GET("`+route+`"`)
+	for _, item := range []struct{ method, route string }{
+		{"GET", "/logchain/requests"}, {"GET", "/logchain/filters"},
+		{"POST", "/logchain/cloudwatch/evidence"},
+		{"POST", "/logchain/investigations"}, {"GET", "/logchain/investigations/:id"},
+		{"POST", "/logchain/investigations/:id/cancel"},
+	} {
+		idx := strings.Index(src, `view.`+item.method+`("`+item.route+`"`)
 		if idx < 0 {
-			t.Fatalf("找不到路由注册: %s", route)
+			t.Fatalf("找不到路由注册: %s %s", item.method, item.route)
 		}
 		line := src[idx:]
 		if end := strings.Index(line, "\n"); end > 0 {
 			line = line[:end]
 		}
 		if !strings.Contains(line, "noStoreSensitive") {
-			t.Errorf("%s 未挂 noStoreSensitive 中间件：敏感诊断数据可能被中间层缓存\n注册行: %s", route, line)
+			t.Errorf("%s 未挂 noStoreSensitive 中间件：敏感诊断数据可能被中间层缓存\n注册行: %s", item.route, line)
 		}
 	}
 
 	js := string(logChainJS)
 	if strings.Count(js, `cache:'no-store'`) < 2 {
-		t.Error("两个 logchain fetch 都必须声明 cache:'no-store'")
+		t.Error("logchain 敏感请求必须声明 cache:'no-store'")
 	}
 }

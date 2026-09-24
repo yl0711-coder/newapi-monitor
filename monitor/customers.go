@@ -191,7 +191,7 @@ func (m *Monitor) listTrackedUsers(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"users": m.trackedViews(rows)})
 }
 
-// ---- 客户分组 CRUD(name 唯一;只允许删除无成员且 Portal 未启用的误建公司) ----
+// ---- 客户分组 CRUD(name 唯一;空公司删除与带成员的原子解散是两个显式动作) ----
 
 // listGroups GET /usage/groups(管理员):分组列表+人数。
 func (m *Monitor) listGroups(c *gin.Context) {
@@ -264,6 +264,57 @@ func (m *Monitor) createGroup(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"ok": true, "group": g})
 }
 
+// createCustomer POST /usage/customers：原子复用/创建公司并加入首个成员。
+// 这是客户维护新增表单的唯一入口；任何一步失败都不会留下空公司。
+func (m *Monitor) createCustomer(c *gin.Context) {
+	if !m.Enabled() {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "未连接主站数据库,无法解析用户"})
+		return
+	}
+	var in struct {
+		Company   string `json:"company"`
+		Input     string `json:"input"`
+		RequestID string `json:"request_id"`
+		Reason    string `json:"reason"`
+	}
+	if err := c.ShouldBindJSON(&in); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	company, _, err := normalizeGroupInput(in.Company, "")
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	resolved, err := m.resolveNewAPIUser(c.Request.Context(), in.Input)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	meta, err := usageMemberMutationMetaFromGin(c, in.RequestID, in.Reason)
+	var group CustomerGroup
+	var result usageMemberMutationResult
+	if err == nil {
+		group, result, err = m.addCustomerWithFirstMember(c.Request.Context(), company, *resolved, meta)
+	}
+	if err != nil {
+		status := http.StatusInternalServerError
+		switch {
+		case errors.Is(err, errUsageMemberDifferentCompany), errors.Is(err, errUsageMemberRequestConflict):
+			status = http.StatusConflict
+		case errors.Is(err, errUsageMemberControlIntegrity):
+			status = http.StatusServiceUnavailable
+		case strings.Contains(err.Error(), "不存在"), strings.Contains(err.Error(), "上限"), strings.Contains(err.Error(), "幂等键"):
+			status = http.StatusBadRequest
+		}
+		c.JSON(status, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"ok": true, "group": group, "user": result.User,
+		"action": result.Action, "active": result.Active, "tracked_revision": result.TrackedRevision,
+		"replayed": result.Replayed})
+}
+
 // updateGroup POST /usage/groups/update(仅超管):{id, name, note}。
 func (m *Monitor) updateGroup(c *gin.Context) {
 	var in struct {
@@ -319,6 +370,39 @@ func (m *Monitor) deleteGroup(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"ok": true})
+}
+
+// dissolveGroup POST /usage/groups/dissolve(仅超管):原子移出全部名单成员并删除公司。
+// 只修改 Monitor 本地控制数据；主站账号、历史 facts 和请求日志全部保留。
+func (m *Monitor) dissolveGroup(c *gin.Context) {
+	var in struct {
+		ID        int64  `json:"id"`
+		RequestID string `json:"request_id"`
+		Reason    string `json:"reason"`
+	}
+	if err := c.ShouldBindJSON(&in); err != nil || in.ID <= 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "id required"})
+		return
+	}
+	meta, err := usageMemberMutationMetaFromGin(c, in.RequestID, in.Reason)
+	replayed := false
+	if err == nil {
+		replayed, err = m.dissolveCustomerGroup(c.Request.Context(), in.ID, meta)
+	}
+	if err != nil {
+		status := http.StatusInternalServerError
+		switch {
+		case errors.Is(err, errCustomerGroupPortalEnabled), errors.Is(err, errUsageMemberRequestConflict):
+			status = http.StatusConflict
+		case errors.Is(err, errUsageMemberControlIntegrity):
+			status = http.StatusServiceUnavailable
+		case errors.Is(err, errUsageMemberNotActive), errors.Is(err, gorm.ErrRecordNotFound), strings.Contains(err.Error(), "幂等键"):
+			status = http.StatusBadRequest
+		}
+		c.JSON(status, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"ok": true, "replayed": replayed})
 }
 
 // setUserNote POST /usage/users/note(仅超管):{user_id, note};清空 note 传空串。

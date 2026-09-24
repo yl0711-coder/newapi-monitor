@@ -58,3 +58,29 @@ func TestStartUserDirectorySyncUsesOneLowPriorityTask(t *testing.T) {
 		t.Fatalf("用户名缓存同步结果错误: rows=%+v err=%v", rows, err)
 	}
 }
+
+func TestLookupUserNamesFallsBackToTrackedUsers(t *testing.T) {
+	m := newTestMonitor(t)
+	if err := m.storeDB.Create(&TrackedUser{UserID: 7, Username: "名单中的 Alice"}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := m.storeDB.Create(&TrackedUser{UserID: 8, Username: "名单中的 Bob"}).Error; err != nil {
+		t.Fatal(err)
+	}
+	// A synchronized directory entry is authoritative when both projections
+	// contain the same ID; the tracked-user fallback must not overwrite it.
+	if err := m.storeDB.Create(&UserDirectoryEntry{UserID: 7, Username: "目录中的 Alice", SyncedAt: 1}).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	got := lookupUserNames(m.storeDB, []int64{7, 8, 9})
+	if got[7] != "目录中的 Alice" {
+		t.Fatalf("directory name should win, got=%q", got[7])
+	}
+	if got[8] != "名单中的 Bob" {
+		t.Fatalf("tracked-user fallback missing, got=%q", got[8])
+	}
+	if _, ok := got[9]; ok {
+		t.Fatalf("unknown ID must remain absent, got=%q", got[9])
+	}
+}

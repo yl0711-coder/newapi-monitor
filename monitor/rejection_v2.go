@@ -35,7 +35,7 @@ type rejectionV2Request struct {
 }
 
 func validateRejectionV2(in rejectionV2Request, now int64, retentionDays int) ([]RejectionSample, bool) {
-	if !nginxNodeNamePattern.MatchString(in.Node) || !validIngestBatchID(in.BatchID) || in.CreatedAt <= 0 || in.CreatedAt < now-rejectionV2ReplaySeconds || in.CreatedAt > now+60 || len(in.Samples) == 0 || len(in.Samples) > 1000 {
+	if !nginxNodeNamePattern.MatchString(in.Node) || in.Node == cloudWatchPreRouteNode || !validIngestBatchID(in.BatchID) || in.CreatedAt <= 0 || in.CreatedAt < now-rejectionV2ReplaySeconds || in.CreatedAt > now+60 || len(in.Samples) == 0 || len(in.Samples) > 1000 {
 		return nil, false
 	}
 	// The receipt ledger has a 48h minimum, longer than the 24h replay window

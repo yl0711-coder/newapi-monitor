@@ -31,6 +31,9 @@ SUM(type=5 AND {{ERRTIMEOUT}}) AS err_timeout`
 	if !strings.Contains(got, "completion_tokens = 0") {
 		t.Error("交付判据必须基于 completion_tokens")
 	}
+	if !strings.Contains(got, "COALESCE(use_time,0) <= 3") || !strings.Contains(got, "client_gone") {
+		t.Error("零输出异常必须排除 3 秒内的客户主动取消")
+	}
 	// frt 只证明上游开口(任何 data: 行都会置位),不能当交付凭证。
 	if strings.Contains(got, "$.frt") {
 		t.Error("不得用 frt 判断是否交付")
@@ -257,7 +260,7 @@ func TestMetricWindowCoverageFailsClosedAcrossSemanticsMigration(t *testing.T) {
 	}
 	compareFrom := now/3600*3600 - 192*3600
 	if complete, _, _ := m.metricWindowCoverage(compareFrom, now); complete {
-		t.Fatal("week-over-week comparison was enabled without historical v6 coverage")
+		t.Fatal("week-over-week comparison was enabled without historical current-version coverage")
 	}
 }
 

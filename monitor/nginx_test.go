@@ -72,6 +72,25 @@ func TestValidateNginxSettingsFailsClosed(t *testing.T) {
 	if err := validateNginxSettings(Settings{NginxEnabled: true, IngestToken: "secret", NginxAllowedNodes: []string{"master", "slave"}}); err != nil {
 		t.Fatalf("完整配置应通过: %v", err)
 	}
+	direct := Settings{NginxEnabled: true, NginxErrorEnabled: true, CloudWatchNginxEnabled: true}
+	if err := validateNginxSettings(direct); err != nil {
+		t.Fatalf("CloudWatch 直采不应要求旧采集器 token/白名单: %v", err)
+	}
+	direct.NginxExpectedNodes = []string{"legacy-worker"}
+	if err := validateNginxSettings(direct); err == nil {
+		t.Fatal("CloudWatch 直采不能把已停用的旧节点继续标为期望来源")
+	}
+	directEvidence := Settings{NginxEnabled: true, CloudWatchNginxEnabled: true,
+		CloudWatchEvidenceHMACKey: strings.Repeat("c", 32), CloudWatchEvidenceHMACKeyID: "cw-1",
+		NginxEvidenceMode: "verified", NginxEvidenceStorePath: "evidence.db", NginxEvidenceRetentionHours: 168,
+		NginxEvidenceHMACKey: strings.Repeat("c", 32), NginxEvidenceHMACKeyID: "cw-1", NginxEvidenceMaxMiB: 512}
+	if err := validateNginxSettings(directEvidence); err != nil {
+		t.Fatalf("CloudWatch 直采的 verified evidence 不应要求旧采集器 token/白名单: %v", err)
+	}
+	directEvidence.NginxEvidenceHMACKeyID = "other"
+	if err := validateNginxSettings(directEvidence); err == nil {
+		t.Fatal("CloudWatch 与 evidence key id 不一致必须拒绝启动")
+	}
 	baseV2 := Settings{NginxEnabled: true, IngestToken: "secret", NginxAllowedNodes: []string{"master"}, NginxSourceV2Enabled: true, NginxSourceV2AllowedNodes: []string{"master"}}
 	if err := validateNginxSettings(baseV2); err == nil {
 		t.Fatal("v2 必须要求显式的逐 lane 白名单")

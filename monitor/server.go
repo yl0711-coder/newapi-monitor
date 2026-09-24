@@ -95,6 +95,15 @@ var financeCSS []byte // 经营核算独立样式，不污染其他 Monitor Tab
 //go:embed finance.js
 var financeJS []byte // 只读 /finance/report，不触发任何外部同步
 
+//go:embed customer_health.js
+var customerHealthJS []byte // 客户维护页交互；只访问 /customer-health/report 与独立写接口
+
+//go:embed model_statistics.js
+var modelStatisticsJS []byte // 模型统计页交互；只访问 /model-statistics/report 本地事实接口
+
+//go:embed model_statistics.css
+var modelStatisticsCSS []byte // 模型统计页独立样式，不污染其他 Monitor Tab
+
 var allowedWindows = map[int]bool{15: true, 30: true, 60: true, 180: true, 360: true, 720: true, 1440: true}
 
 const maxJSONRequestBody = 4 << 20   // 4 MiB:足以覆盖节点批量上报，同时拒绝异常大请求体
@@ -241,6 +250,18 @@ func (m *Monitor) RegisterRoutes(r *gin.Engine) {
 		c.Header("Cache-Control", "no-cache")
 		c.Data(http.StatusOK, "application/javascript; charset=utf-8", logChainJS)
 	})
+	r.GET("/customer-health.js", func(c *gin.Context) {
+		c.Header("Cache-Control", "no-cache")
+		c.Data(http.StatusOK, "application/javascript; charset=utf-8", customerHealthJS)
+	})
+	r.GET("/model-statistics.js", func(c *gin.Context) {
+		c.Header("Cache-Control", "no-cache")
+		c.Data(http.StatusOK, "application/javascript; charset=utf-8", modelStatisticsJS)
+	})
+	r.GET("/model-statistics.css", func(c *gin.Context) {
+		c.Header("Cache-Control", "no-cache")
+		c.Data(http.StatusOK, "text/css; charset=utf-8", modelStatisticsCSS)
+	})
 	r.GET("/api/brand", m.brandHandler) // 公开:站点名,供前端设置页面标题
 	r.GET("/infra-assets.js", func(c *gin.Context) {
 		c.Header("Cache-Control", "no-cache")
@@ -297,7 +318,16 @@ func (m *Monitor) RegisterRoutes(r *gin.Engine) {
 		// 的错误分支（400/401/403/500），逐个加必然漏，而漏掉的恰好是错误响应。
 		view.GET("/logchain/requests", noStoreSensitive, m.serveLogChainRequests) // 客户排障:逐条请求→渠道→上游主域名→错误原文(含 type=5,含渠道信息,仅管理员)
 		view.GET("/logchain/filters", noStoreSensitive, m.serveLogChainFilters)   // 客户排障:筛选下拉取值(服务分组/上游域名/渠道),只读本地快照
-		view.GET("/infra", m.serveInfra)                                          // 服务端健康监控(实例/DB/LB)快照
+		// 按需 CloudWatch 证据：仅在人工展开某条请求并点击时触发，一次只查一个
+		// Request ID 的窄窗口。用 POST 是为了不让 Request ID 进 URL/浏览器历史/
+		// access log；只用 FilterLogEvents，不触发按扫描量计费的 Logs Insights。
+		view.POST("/logchain/cloudwatch/evidence", noStoreSensitive, m.serveLogChainCloudWatchEvidence)
+		// 完整阶段三：异步任务不绑定浏览器连接；创建条件走 POST，任务编号可安全
+		// 用于轮询和取消。三个响应都可能含客户排障证据，因此统一禁止缓存。
+		view.POST("/logchain/investigations", noStoreSensitive, m.serveCreateLogChainInvestigation)
+		view.GET("/logchain/investigations/:id", noStoreSensitive, m.serveGetLogChainInvestigation)
+		view.POST("/logchain/investigations/:id/cancel", noStoreSensitive, m.serveCancelLogChainInvestigation)
+		view.GET("/infra", m.serveInfra) // 服务端健康监控(实例/DB/LB)快照
 		view.GET("/infra/assets", noStoreSensitive, m.serveInfraAssets)
 		view.GET("/infra/ecs-log-sources", noStoreSensitive, m.serveECSLogSources)
 		view.GET("/infra/series", m.serveInfraSeries)                                        // 按需取某资源某些指标的近 N 小时序列(展开图用)
@@ -305,16 +335,22 @@ func (m *Monitor) RegisterRoutes(r *gin.Engine) {
 		view.GET("/group-governance/report", noStoreSensitive, m.serveGroupGovernanceReport) // 分组治理:只读本地快照
 		view.GET("/group-governance/users", noStoreSensitive, m.serveGroupGovernanceUsers)   // 分组实际关联用户，本地分页
 		view.GET("/group-governance/export.csv", noStoreSensitive, m.exportGroupGovernanceCSV)
-		view.GET("/usage/users", m.listTrackedUsers)                                       // 用户用量:被盯名单(含分组)
-		view.GET("/usage/groups", m.listGroups)                                            // 用户用量:客户分组列表
-		view.GET("/usage/followups", m.usageAggregateAuthorizationGuard(m.serveFollowUps)) // 用户用量:待跟进清单
-		view.GET("/usage/followups/log", m.listFollowLogs)                                 // 用户用量:某客户跟进记录
-		view.GET("/usage/settings", m.getUsageSettings)                                    // 用户用量:跟进阈值(读)
-		view.GET("/usage/matrix", m.usageAggregateAuthorizationGuard(m.serveUsageMatrix))  // 用户用量:列表页矩阵(前端渲染 行=用户×列=日期,格=当日费用)
-		view.GET("/usage/stats", m.usageAggregateAuthorizationGuard(m.serveUsageStats))    // 用户用量:单用户详情聚合(每日/分组/模型/费用)
-		view.GET("/usage/cache-stats", m.serveUsageCacheStats)                             // 用户用量缓存:无敏感信息的运维计数
-		view.GET("/usage/facts-status", m.serveUsageFactsStatus)                           // 用户用量本地事实层:覆盖率/同步状态(只读 Monitor SQLite)
-		view.GET("/usage/facts-history", m.serveUsageFactHistoryStatus)                    // 全历史逐成员阶段/水位/失败原因(只读本地)
+		// noStoreSensitive 必须挂：响应含公司名、用户名、user_id、消耗金额与故障归因，
+		// 属客户可识别信息，不得进浏览器磁盘缓存或任何中间缓存。
+		view.GET("/customer-health/report", noStoreSensitive, m.serveCustomerHealthReport)   // 客户维护:名单内公司今日稳定性(只读本地事实)
+		view.GET("/customer-health/groups", noStoreSensitive, m.listCustomerHealthGroups)    // 客户维护:独立公司名单
+		view.GET("/customer-health/members", noStoreSensitive, m.listCustomerHealthMembers)  // 客户维护:独立成员名单
+		view.GET("/model-statistics/report", noStoreSensitive, m.serveModelStatisticsReport) // 模型统计:分组模型请求次数(只读本地事实)
+		view.GET("/usage/users", m.listTrackedUsers)                                         // 用户用量:被盯名单(含分组)
+		view.GET("/usage/groups", m.listGroups)                                              // 用户用量:客户分组列表
+		view.GET("/usage/followups", m.usageAggregateAuthorizationGuard(m.serveFollowUps))   // 用户用量:待跟进清单
+		view.GET("/usage/followups/log", m.listFollowLogs)                                   // 用户用量:某客户跟进记录
+		view.GET("/usage/settings", m.getUsageSettings)                                      // 用户用量:跟进阈值(读)
+		view.GET("/usage/matrix", m.usageAggregateAuthorizationGuard(m.serveUsageMatrix))    // 用户用量:列表页矩阵(前端渲染 行=用户×列=日期,格=当日费用)
+		view.GET("/usage/stats", m.usageAggregateAuthorizationGuard(m.serveUsageStats))      // 用户用量:单用户详情聚合(每日/分组/模型/费用)
+		view.GET("/usage/cache-stats", m.serveUsageCacheStats)                               // 用户用量缓存:无敏感信息的运维计数
+		view.GET("/usage/facts-status", m.serveUsageFactsStatus)                             // 用户用量本地事实层:覆盖率/同步状态(只读 Monitor SQLite)
+		view.GET("/usage/facts-history", m.serveUsageFactHistoryStatus)                      // 全历史逐成员阶段/水位/失败原因(只读本地)
 		view.GET("/me", me)
 	}
 
@@ -341,19 +377,38 @@ func (m *Monitor) RegisterRoutes(r *gin.Engine) {
 	// 仅超级管理员:用户用量名单增删(看名单/看统计在上面 view 组,管理员即可)
 	rootUsage := r.Group("/usage", m.requireRole(roleRoot))
 	{
+		rootUsage.POST("/customers", m.createCustomer) // 用户用量:原子建公司并加入首个成员
 		rootUsage.POST("/users", m.addTrackedUser)
 		rootUsage.POST("/users/delete", m.deleteTrackedUser)
 		rootUsage.POST("/users/group", m.setUserGroup)                    // 改用户归属分组
 		rootUsage.POST("/users/note", m.setUserNote)                      // 改用户备注
 		rootUsage.POST("/groups", m.createGroup)                          // 客户分组:新建
 		rootUsage.POST("/groups/update", m.updateGroup)                   // 客户分组:编辑
-		rootUsage.POST("/groups/delete", m.deleteGroup)                   // 客户分组:解散(成员回未分组)
+		rootUsage.POST("/groups/delete", m.deleteGroup)                   // 删除空公司
+		rootUsage.POST("/groups/dissolve", m.dissolveGroup)               // 原子移出成员并解散公司
 		rootUsage.POST("/groups/portal", m.setGroupPortal)                // 客户分组:客户端账号(开通/更新/重置/关闭)
 		rootUsage.POST("/followups/log", m.addFollowLog)                  // 跟进记录:追加
 		rootUsage.POST("/settings", m.saveUsageSettings)                  // 跟进阈值:保存
 		rootUsage.POST("/facts-repair", m.requestUsageFactsRepairHandler) // 历史晚到/旧库 proof 受控补数
 		rootUsage.POST("/facts-history/retry", m.retryUsageFactHistoryHandler)
 		rootUsage.POST("/facts-history/repair", m.requestUsageFactHistoryDayRepairHandler)
+	}
+
+	// 仅超级管理员:客户维护独立名单 CRUD。它与 /usage 下的用户用量名单
+	// 共存，避免客户维护的成员变更意外改变用量、门户或跟进数据。
+	rootCustomerHealth := r.Group("/customer-health", m.requireRole(roleRoot))
+	{
+		rootCustomerHealth.POST("/customers", m.createCustomerHealthCustomer)
+		rootCustomerHealth.POST("/groups", m.createCustomerHealthGroup)
+		rootCustomerHealth.POST("/groups/update", m.updateCustomerHealthGroup)
+		rootCustomerHealth.POST("/groups/delete", m.deleteCustomerHealthGroup)
+		rootCustomerHealth.POST("/groups/dissolve", m.dissolveCustomerHealthGroup)
+		rootCustomerHealth.POST("/members", m.addCustomerHealthMember)
+		rootCustomerHealth.POST("/users", m.addCustomerHealthMember)
+		rootCustomerHealth.POST("/members/update", m.updateCustomerHealthMember)
+		rootCustomerHealth.POST("/members/note", m.updateCustomerHealthMember)
+		rootCustomerHealth.POST("/members/delete", m.removeCustomerHealthMember)
+		rootCustomerHealth.POST("/users/delete", m.removeCustomerHealthMember)
 	}
 
 	// 仅超级管理员:维护渠道毛利率的本地计价配置。接口只写 Monitor SQLite，
@@ -583,14 +638,22 @@ func (m *Monitor) ingestRejections(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "node required"})
 		return
 	}
+	// cloudwatch-direct is an internal source owned by the direct lane.  Letting
+	// an authenticated legacy collector claim that name would mix externally
+	// pushed rows into the lane that the cursor/reconciliation logic treats as
+	// the authoritative CloudWatch snapshot.
+	if node == cloudWatchPreRouteNode {
+		c.JSON(http.StatusForbidden, gin.H{"error": "reserved rejection source node"})
+		return
+	}
 	if !validIngestBatchID(batchID) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "valid batch_id required"})
 		return
 	}
 	rows := make([]RejectionSample, 0, len(in.Samples))
 	for _, s := range in.Samples {
-		if s.Model == "" || s.Reason == "" || s.Count <= 0 || s.BucketTs <= 0 {
-			continue // 丢弃残缺项
+		if s.Model == "" || s.Reason == "" || s.Count <= 0 || s.BucketTs <= 0 || s.UserID < 0 {
+			continue // 丢弃残缺项或非法的负 user_id
 		}
 		rows = append(rows, RejectionSample{
 			BucketTs: s.BucketTs / 60 * 60,
