@@ -114,6 +114,7 @@ jobs:
             test -e /context/cmd/nginxcollector/main.go &&
             test ! -e /context/.local-data &&
             test ! -e /context/tools &&
+            test ! -e /context/dev/ecs_acceptance_run.py &&
             test ! -e /context/data &&
             test ! -e /context/secrets &&
             test ! -e /context/.env &&
