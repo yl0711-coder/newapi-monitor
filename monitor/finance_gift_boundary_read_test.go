@@ -31,13 +31,11 @@ func TestFinanceGiftBoundaryStreamMatchesMaterializedRead(t *testing.T) {
 		}
 	}
 	// A reader must preserve the exact half-open interval and requested users.
-	for _, e := range []FinanceGiftBoundaryEvent{
+	events = append(events, []FinanceGiftBoundaryEvent{
 		{SourceEpoch: "extra", SourceLogID: 10001, HourTs: 0, UserID: 1},
 		{SourceEpoch: "extra", SourceLogID: 10002, HourTs: 7200, UserID: 1},
 		{SourceEpoch: "extra", SourceLogID: 10003, HourTs: 3600, UserID: 9999},
-	} {
-		events = append(events, e)
-	}
+	}...)
 	if err := db.CreateInBatches(events, 50).Error; err != nil {
 		t.Fatal(err)
 	}

@@ -1643,6 +1643,9 @@ func TestChannelCostRecoveryFirstPageYieldsAfterSharedTwentyRequestBudget(t *tes
 		t.Fatal(err)
 	}
 	syncState := newPricingSyncState(account, now, 1)
+	// Keep the archive cursor complete if this paced fixture crosses an hour
+	// boundary before syncStoredNewAPIPricing reads the wall clock again.
+	syncState.BackfillTargetHour = closedThrough + 3600
 	syncState.BackfillDone = true
 	syncState.BackfillNextHour = syncState.BackfillTargetHour
 	if err := m.storeDB.Create(&syncState).Error; err != nil {
