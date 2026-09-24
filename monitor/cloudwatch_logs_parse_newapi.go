@@ -105,7 +105,10 @@ func (p *cloudWatchEvidenceParser) parseNewAPI(in cloudWatchEvidenceInput) (clou
 	// status_code/429/rate_limit token; prioritize this fact before the generic
 	// upstream-5xx fallback so an access row cannot be mislabeled as an error.
 	trimmedLower := strings.TrimSpace(lower)
-	rule, ok := cwNewAPIClassRule{}, false
+	var (
+		rule cwNewAPIClassRule
+		ok   bool
+	)
 	if strings.HasPrefix(trimmedLower, "[gin]") {
 		rule, ok = cwNewAPIRequestCompletedRule, true
 	} else {

@@ -204,16 +204,16 @@ func parseLogChainInvestigationInput(in logChainInvestigationCreateRequest, now 
 	// customer-owned names such as `Claude max (distributor)` or `foo#bar` (and
 	// names containing the word "secret").  Reusing it made clicking a single
 	// row fail with "group 不合法" even though the row came from our own logs.
-	if value, ok := cwInvestigationScopeLabel(out.Model, 128); !ok {
+	model, ok := cwInvestigationScopeLabel(out.Model, 128)
+	if !ok {
 		return out, errors.New("model 不合法")
-	} else {
-		out.Model = value
 	}
-	if value, ok := cwInvestigationScopeLabel(out.Group, 64); !ok {
+	out.Model = model
+	group, ok := cwInvestigationScopeLabel(out.Group, 64)
+	if !ok {
 		return out, errors.New("group 不合法")
-	} else {
-		out.Group = value
 	}
+	out.Group = group
 	if out.Path != "" && (!strings.HasPrefix(out.Path, "/") || len(out.Path) > 1024 || !utf8.ValidString(out.Path) || hasControlRune(out.Path)) {
 		return out, errors.New("path 必须是合法的绝对 API 路径")
 	}

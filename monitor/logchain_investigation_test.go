@@ -3,6 +3,7 @@ package monitor
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -258,9 +259,13 @@ func TestInvestigationRejectsConcurrentTaskForSameOperator(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("first task did not start")
 	}
-	if _, err := m.createLogChainInvestigation("owner", input); err == nil {
+	_, err = m.createLogChainInvestigation("owner", input)
+	if err == nil {
 		t.Fatal("same operator was allowed to start a second active task")
-	} else if active, ok := err.(*logChainInvestigationActiveError); !ok || active.Status != "running" {
+	}
+	// errors.As 而非类型断言：包装过的并发错误也必须能认出来。
+	var active *logChainInvestigationActiveError
+	if !errors.As(err, &active) || active.Status != "running" {
 		t.Fatalf("unexpected concurrent-task error: %+v", err)
 	}
 	if _, ok := m.cancelLogChainInvestigation("owner", first.InvestigationID); !ok {

@@ -4,6 +4,7 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -228,7 +229,10 @@ func cwBoundedOpaque(raw string, maximum int) (string, bool) {
 }
 
 func cwParseErrorKind(err error) cloudWatchEvidenceParseErrorKind {
-	if parsed, ok := err.(*cloudWatchEvidenceParseError); ok {
+	// errors.As 而非类型断言：包装过的解析错误同样必须识别出原本的 kind，
+	// 否则被 fmt.Errorf("%w") 包一层就会退化成 malformed。
+	var parsed *cloudWatchEvidenceParseError
+	if errors.As(err, &parsed) {
 		return parsed.Kind
 	}
 	return cwParseMalformed

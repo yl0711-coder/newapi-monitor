@@ -89,7 +89,7 @@ func (m *Monitor) queryCloudWatchShadowRange(ctx context.Context, parser *cloudW
 	query, err := m.cloudWatchLogs.insights(ctx, cloudWatchInsightsRequest{
 		Kind: kind, From: from, To: to, Limit: cloudWatchShadowQueryLimit,
 	})
-	if query.BytesScanned <= uint64(^uint64(0)>>1) {
+	if query.BytesScanned <= ^uint64(0)>>1 {
 		*bytes += int64(query.BytesScanned)
 	}
 	if err != nil {

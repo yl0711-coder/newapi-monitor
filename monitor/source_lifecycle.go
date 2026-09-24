@@ -1095,28 +1095,28 @@ type sourceReadyStatus struct {
 }
 
 type readyStatusResponse struct {
-	Status          string                     `json:"status"`
-	StartedAt       int64                      `json:"started_at"`
-	Store           lifecycleComponentStatus   `json:"store"`
-	FactsStore      lifecycleComponentStatus   `json:"facts_store"`
-	Source          sourceReadyStatus          `json:"source"`
-	SampledAt       int64                      `json:"sampled_at"`
-	MetricFinalize  metricFinalizeReadyStatus  `json:"metric_finalize"`
-	FactsHeartbeat  int64                      `json:"facts_heartbeat_at"`
-	FactsDisk       factsDiskReadyStatus       `json:"facts_disk"`
+	Status             string                        `json:"status"`
+	StartedAt          int64                         `json:"started_at"`
+	Store              lifecycleComponentStatus      `json:"store"`
+	FactsStore         lifecycleComponentStatus      `json:"facts_store"`
+	Source             sourceReadyStatus             `json:"source"`
+	SampledAt          int64                         `json:"sampled_at"`
+	MetricFinalize     metricFinalizeReadyStatus     `json:"metric_finalize"`
+	FactsHeartbeat     int64                         `json:"facts_heartbeat_at"`
+	FactsDisk          factsDiskReadyStatus          `json:"facts_disk"`
 	CloudWatchPreRoute cloudWatchPreRouteReadyStatus `json:"cloudwatch_pre_route"`
-	CloudWatchNginx cloudWatchNginxReadyStatus `json:"cloudwatch_nginx"`
-	DegradedReasons []string                   `json:"degraded_reasons,omitempty"`
+	CloudWatchNginx    cloudWatchNginxReadyStatus    `json:"cloudwatch_nginx"`
+	DegradedReasons    []string                      `json:"degraded_reasons,omitempty"`
 }
 
 type cloudWatchPreRouteReadyStatus struct {
-	Enabled        bool  `json:"enabled"`
-	Running        bool  `json:"running"`
-	CoverageFrom   int64 `json:"coverage_from_ts"`
-	ThroughTs      int64 `json:"through_ts"`
-	TargetTs       int64 `json:"target_ts"`
-	LastSuccessAt  int64 `json:"last_success_at"`
-	LastFailureAt  int64 `json:"last_failure_at"`
+	Enabled       bool  `json:"enabled"`
+	Running       bool  `json:"running"`
+	CoverageFrom  int64 `json:"coverage_from_ts"`
+	ThroughTs     int64 `json:"through_ts"`
+	TargetTs      int64 `json:"target_ts"`
+	LastSuccessAt int64 `json:"last_success_at"`
+	LastFailureAt int64 `json:"last_failure_at"`
 }
 
 type cloudWatchNginxReadyStatus struct {

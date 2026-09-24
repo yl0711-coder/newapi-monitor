@@ -112,19 +112,6 @@ func cwBusinessLabel(raw string, maximum int) (string, bool) {
 	return value, true
 }
 
-func cwBoundedLabel(raw string, maximum int) string {
-	value := strings.TrimSpace(raw)
-	if value == "" || len(value) > maximum || !utf8.ValidString(value) {
-		return ""
-	}
-	for _, r := range value {
-		if r < 0x20 || r == 0x7f || r == '|' {
-			return ""
-		}
-	}
-	return value
-}
-
 func cwCompletion(raw string) string {
 	switch strings.TrimSpace(raw) {
 	case "OK":
