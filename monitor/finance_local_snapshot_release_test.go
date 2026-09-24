@@ -109,3 +109,57 @@ func TestFinanceLocalSnapshotReadOnlyParity(t *testing.T) {
 		}
 	}
 }
+
+// Opt-in cold-build diagnostic. It uses only immutable local copies and keeps
+// the timing separate from source collection or production request latency.
+func TestFinanceLocalSnapshotColdBuild(t *testing.T) {
+	mainPath := os.Getenv("MONITOR_FINANCE_ACCEPTANCE_MAIN_SNAPSHOT")
+	factsPath := os.Getenv("MONITOR_FINANCE_ACCEPTANCE_FACTS_SNAPSHOT")
+	if mainPath == "" || factsPath == "" {
+		t.Skip("requires closed local SQLite snapshots")
+	}
+	openReadOnly := func(path string) *gorm.DB {
+		t.Helper()
+		path, err := filepath.Abs(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		uri := (&url.URL{Scheme: "file", Path: path, RawQuery: "mode=ro&immutable=1"}).String()
+		db, err := gorm.Open(sqlite.Open(uri), &gorm.Config{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		conn, err := db.DB()
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = conn.Close() })
+		return db
+	}
+	loc, err := time.LoadLocation("Asia/Shanghai")
+	if err != nil {
+		t.Fatal(err)
+	}
+	from, err := time.ParseInLocation("2006-01-02", "2026-05-01", loc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A closed range within this snapshot; it never contacts the live source.
+	to, err := time.ParseInLocation("2006-01-02 15:04", "2026-09-20 16:00", loc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := &Monitor{storeDB: openReadOnly(mainPath), usageFactsDB: openReadOnly(factsPath), cfg: Settings{
+		FinanceEnabled: true, FinanceStartDate: "2026-05-01", ChannelEconomicsReportEnabled: true,
+		UsageFactsReadEnabled: true, UsageFactsHistorySourceMode: "complete",
+		UsageFactsHistorySourceEpoch: "newapi-hotlogs-complete-20260817-v1",
+	}}
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	started := time.Now()
+	report, err := m.buildFinanceOperatingReport(ctx, from, to)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("local immutable finance cold build: %s; days=%d months=%d gift_unknown=%d", time.Since(started), len(report.Days), len(report.Periods), report.GiftCoverage.ScopeUnknownEvents)
+}

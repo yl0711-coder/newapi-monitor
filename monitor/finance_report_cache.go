@@ -2,11 +2,14 @@ package monitor
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"time"
+
+	"gorm.io/gorm"
 )
 
 const (
@@ -31,6 +34,44 @@ type financeReportRequest struct {
 	snapshotClamped   bool
 	configurationHash string
 	sourceFingerprint string
+}
+
+func financeDBPoolStats(db *gorm.DB) sql.DBStats {
+	if db == nil {
+		return sql.DBStats{}
+	}
+	pool, err := db.DB()
+	if err != nil {
+		return sql.DBStats{}
+	}
+	return pool.Stats()
+}
+
+func logFinanceReadStageTiming(stage string, started time.Time, err error) {
+	elapsed := time.Since(started)
+	if elapsed < 2*time.Second && err == nil {
+		return
+	}
+	slog.Warn("经营核算读取阶段耗时诊断", "stage", stage, "elapsed_ms", elapsed.Milliseconds(), "failed", err != nil)
+}
+
+// A slow report may spend most of its deadline waiting for the single facts
+// SQLite connection rather than executing its query. Emit only aggregate pool
+// counters, never SQL parameters, account IDs or report amounts.
+func (m *Monitor) logFinanceBuildTiming(started time.Time, mainBefore, factsBefore sql.DBStats, err error) {
+	elapsed := time.Since(started)
+	if elapsed < 5*time.Second && err == nil {
+		return
+	}
+	mainAfter := financeDBPoolStats(m.storeDB)
+	factsAfter := financeDBPoolStats(m.usageFactsDB)
+	slog.Warn("经营核算构建耗时诊断",
+		"elapsed_ms", elapsed.Milliseconds(), "failed", err != nil,
+		"main_pool_wait_count", mainAfter.WaitCount-mainBefore.WaitCount,
+		"main_pool_wait_ms", (mainAfter.WaitDuration - mainBefore.WaitDuration).Milliseconds(),
+		"facts_pool_wait_count", factsAfter.WaitCount-factsBefore.WaitCount,
+		"facts_pool_wait_ms", (factsAfter.WaitDuration - factsBefore.WaitDuration).Milliseconds(),
+		"facts_pool_in_use", factsAfter.InUse, "facts_pool_open", factsAfter.OpenConnections)
 }
 
 // Explicit user refresh bypasses both layers; ordinary background revalidation
@@ -200,7 +241,11 @@ func (m *Monitor) financeReportPayload(ctx context.Context, request financeRepor
 				return cached, nil
 			}
 		}
+		started := time.Now()
+		mainBefore := financeDBPoolStats(m.storeDB)
+		factsBefore := financeDBPoolStats(m.usageFactsDB)
 		built, accepted, buildErr := m.buildFinanceReportWithRetry(ctx, request)
+		m.logFinanceBuildTiming(started, mainBefore, factsBefore, buildErr)
 		if buildErr != nil {
 			return nil, buildErr
 		}

@@ -21,10 +21,13 @@ func (p *paths) String() string     { return fmt.Sprint([]string(*p)) }
 func (p *paths) Set(s string) error { *p = append(*p, s); return nil }
 
 func main() {
-	action := flag.String("action", "plan", "plan (isolated copy), run (also resume), status, candidates, or read-plan (freeze local suggestion, no source reads)")
+	action := flag.String("action", "plan", "plan (isolated copy), run (also resume), status, candidates, read-plan, or advance (verified local handoff)")
 	backup := flag.String("backup", "", "closed local usage-facts.db backup; plan only")
 	dir := flag.String("job-dir", "", "new private directory for plan; existing directory for all other actions")
 	confirm := flag.String("confirm-plan", "", "exact existing job plan SHA256 required except for plan")
+	exportDir := flag.String("export-dir", "", "completed private source export directory; advance only")
+	nextDir := flag.String("next-job-dir", "", "new private offline job directory; advance only")
+	confirmRead := flag.String("confirm-read-plan", "", "confirmed source read plan SHA256; advance only")
 	var evidence paths
 	flag.Var(&evidence, "evidence", "local filtered original evidence JSON; repeat at most 10 times; plan only")
 	flag.Parse()
@@ -37,7 +40,7 @@ func main() {
 	var err error
 	switch *action {
 	case "plan":
-		if *backup == "" || len(evidence) == 0 || *confirm != "" {
+		if *backup == "" || len(evidence) == 0 || *confirm != "" || *exportDir != "" || *nextDir != "" || *confirmRead != "" {
 			fail(fmt.Errorf("plan requires -backup and -evidence; do not pass -confirm-plan"))
 		}
 		plan, digest, planErr := monitor.PrepareFinanceGiftLocalJob(ctx, *backup, *dir, evidence)
@@ -47,11 +50,22 @@ func main() {
 			Plan   monitor.FinanceGiftLocalPlan `json:"plan"`
 			SHA256 string                       `json:"confirm_plan_sha256"`
 		}{"offline_preview_no_repair", plan, digest}
-	case "run", "status", "candidates", "read-plan":
+	case "run", "status", "candidates", "read-plan", "advance":
 		if *backup != "" || len(evidence) != 0 || *confirm == "" {
-			fail(fmt.Errorf("this action accepts only -job-dir and -confirm-plan; original inputs cannot be replaced"))
+			fail(fmt.Errorf("this action requires -job-dir and -confirm-plan; original backup/evidence inputs cannot be replaced"))
 		}
-		if *action == "read-plan" {
+		if *action == "advance" {
+			if *exportDir == "" || *nextDir == "" || *confirmRead == "" {
+				fail(fmt.Errorf("advance requires -export-dir, -next-job-dir and -confirm-read-plan"))
+			}
+			plan, digest, advanceErr := monitor.PrepareFinanceGiftLocalContinuation(ctx, *dir, *confirm, *exportDir, *confirmRead, *nextDir)
+			err = advanceErr
+			if err == nil {
+				output = map[string]any{"mode": "offline_next_plan_no_repair", "plan": plan, "confirm_plan_sha256": digest}
+			}
+		} else if *exportDir != "" || *nextDir != "" || *confirmRead != "" {
+			fail(fmt.Errorf("export and continuation flags are accepted only by advance"))
+		} else if *action == "read-plan" {
 			plan, digest, planErr := monitor.PrepareFinanceGiftReadPlan(ctx, *dir, *confirm)
 			err = planErr
 			if err == nil {

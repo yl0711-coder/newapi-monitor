@@ -3270,12 +3270,16 @@ func (m *Monitor) serveFinanceOperatingReport(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "查询范围晚于本地快照截止时间"})
 		return
 	}
+	configStarted := time.Now()
 	configurationHash, configErr := m.financeReportConfigurationHash(ctx)
+	logFinanceReadStageTiming("configuration", configStarted, configErr)
 	if configErr != nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "经营核算报表暂不可用", "detail": configErr.Error()})
 		return
 	}
+	fingerprintStarted := time.Now()
 	sourceFingerprint, fingerprintErr := m.financeReportSourceFingerprint(ctx, from.Unix(), to.Unix())
+	logFinanceReadStageTiming("source_fingerprint", fingerprintStarted, fingerprintErr)
 	if fingerprintErr != nil {
 		// A validated prior snapshot can still be displayed as stale. A new
 		// build must establish a source version again; never skip consistency

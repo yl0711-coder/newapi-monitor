@@ -23,7 +23,7 @@ function fixture(fetchImpl = async()=>{throw new Error('offline');}) {
   const source=readFileSync(new URL('../../monitor/finance.js',import.meta.url),'utf8');
   const end=source.lastIndexOf('}());');
   assert.ok(end>0,'finance module closure not found');
-  vm.runInContext(source.slice(0,end)+'\nglobalThis.fixture={state,scheduleStaleRefresh,load,financeCacheRefreshNote,renderProfitBridge,operatingProfitBlockers,setGiftEvidence,renderPeriods,renderDays,internalCostDeductionNote,grossCorrectedCost,chartValue};\n'+source.slice(end),context);
+  vm.runInContext(source.slice(0,end)+'\nglobalThis.fixture={state,scheduleStaleRefresh,load,financeIsPriorStale,financeCacheRefreshNote,renderProfitBridge,operatingProfitBlockers,setGiftEvidence,renderPeriods,renderDays,internalCostDeductionNote,grossCorrectedCost,chartValue};\n'+source.slice(end),context);
   return {api:context.fixture,element,timers};
 }
 
@@ -122,6 +122,8 @@ test('finance polling stops honestly after bounded attempts, preserving report',
 
 test('prior-range finance snapshot is never presented as the current interval',()=>{
   const {api}=fixture();
+  assert.equal(api.financeIsPriorStale({_cache_status:'persistent-prior-stale-refreshing'}),true);
+  assert.equal(api.financeIsPriorStale({_cache_status:'persistent-hit'}),false);
   const note=api.financeCacheRefreshNote({_cache_status:'persistent-prior-stale-refreshing',to:1789959600});
   assert.match(note,/仅显示截至.*较早区间/);
   assert.match(note,/请勿当作当前结果/);

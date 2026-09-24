@@ -465,9 +465,13 @@
     }
   }
 
+  function financeIsPriorStale(data) {
+    return String(data._cache_status || '').includes('prior-stale');
+  }
+
   function financeCacheRefreshNote(data) {
     const status=String(data._cache_status || '');
-    if (status.includes('prior-stale')) {
+    if (financeIsPriorStale(data)) {
       return `<span id="finCacheUpdate"> · 仅显示截至 ${dateTime(data.to)} 的较早区间，当前区间后台补算中；请勿当作当前结果</span>`;
     }
     return status.includes('stale')?'<span id="finCacheUpdate"> · 后台更新中</span>':'';
@@ -479,10 +483,12 @@
     const baseComplete = data.user_coverage?.complete && data.upstream_coverage?.complete;
     const giftComplete = data.gift_coverage?.complete === true;
     const complete = baseComplete && giftComplete;
+    const priorStale = financeIsPriorStale(data);
     const status = $('finStatus');
-    status.className = `fin-status ${!enabled ? 'bad' : complete ? 'ok' : ''}`;
+    status.className = `fin-status ${!enabled ? 'bad' : !priorStale && complete ? 'ok' : ''}`;
     const summary = !enabled ? '经营核算功能尚未开启'
-      : complete ? '当前区间经营收入与上游成本证据完整'
+      : priorStale ? '较早区间快照，当前区间正在补算'
+        : complete ? '当前区间经营收入与上游成本证据完整'
         : baseComplete ? '用量与上游成本完整，注册赠送证据仍待补齐'
           : data.user_coverage?.complete ? '用户用量完整，部分上游成本仍待补证'
           : '已展示现有用量，部分小时与上游成本仍待补证';
