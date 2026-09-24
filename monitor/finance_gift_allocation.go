@@ -359,8 +359,12 @@ func loadFinanceGiftBoundaryEvents(ctx context.Context, db *gorm.DB, from, to in
 	for start := 0; start < len(users); start += financeGiftUserQueryChunk {
 		end := min(len(users), start+financeGiftUserQueryChunk)
 		var rows []FinanceGiftBoundaryEvent
+		// The proof hash sorts events within each user-hour and the allocator
+		// sorts its ledger independently. A global event-time ORDER BY does not
+		// affect either result, but forces SQLite to materialize and sort the
+		// entire historical gift-event set before the report can proceed.
 		if err := db.WithContext(ctx).Where("hour_ts>=? AND hour_ts<? AND user_id IN ?", from, to, users[start:end]).
-			Order("event_at,source_log_id").Find(&rows).Error; err != nil {
+			Find(&rows).Error; err != nil {
 			return nil, fmt.Errorf("read gift boundary events: %w", err)
 		}
 		result = append(result, rows...)
