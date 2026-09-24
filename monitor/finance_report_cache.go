@@ -17,7 +17,7 @@ const (
 	financeReportCacheStaleGrace = 10 * time.Minute
 	financeReportCacheMaxEntries = 16
 	financeReportCacheMaxBytes   = 12 << 20
-	financeReportBuildTimeout    = 12 * time.Second
+	financeReportBuildTimeout    = 30 * time.Second
 	financeReportPersistentStale = 24 * time.Hour
 )
 

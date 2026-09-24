@@ -3251,7 +3251,7 @@ func (m *Monitor) serveFinanceOperatingReport(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	ctx, cancel := context.WithTimeout(c.Request.Context(), 12*time.Second)
+	ctx, cancel := context.WithTimeout(c.Request.Context(), financeReportBuildTimeout)
 	defer cancel()
 	if !m.cfg.FinanceEnabled {
 		report, _ := m.buildFinanceOperatingReport(ctx, from, to)
