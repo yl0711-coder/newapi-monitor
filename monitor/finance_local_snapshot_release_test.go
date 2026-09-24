@@ -156,10 +156,37 @@ func TestFinanceLocalSnapshotColdBuild(t *testing.T) {
 	}}
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
+	fingerprintStarted := time.Now()
+	fingerprint, err := m.financeReportSourceFingerprint(ctx, from.Unix(), to.Unix())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("local immutable finance source fingerprint: %s", time.Since(fingerprintStarted))
 	started := time.Now()
 	report, err := m.buildFinanceOperatingReport(ctx, from, to)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Logf("local immutable finance cold build: %s; days=%d months=%d gift_unknown=%d", time.Since(started), len(report.Days), len(report.Periods), report.GiftCoverage.ScopeUnknownEvents)
+	// The only writes in this opt-in test go to a new temporary snapshot cache,
+	// never to the immutable source databases. Compare the complete real-sized
+	// payload byte-for-byte after taking the fast display path.
+	payload, err := json.Marshal(report)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.cfg.StorePath = filepath.Join(t.TempDir(), "cache-only.db")
+	m.cfg.FinanceReportSnapshotShadowEnabled = true
+	m.cfg.FinanceReportSnapshotReadEnabled = true
+	m.cfg.FinanceFastSnapshotEnabled = true
+	request := financeReportRequest{from: from, to: to, configurationHash: "immutable-acceptance"}
+	if err := m.persistFinanceReportSnapshotShadow(request.logicalKey(), fingerprint, payload, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	fastStarted := time.Now()
+	got, status, ok := m.financeFastSnapshotPayload(request, time.Now())
+	if !ok || status != "fast-snapshot-stale" || !reflect.DeepEqual(got, payload) {
+		t.Fatalf("fast snapshot changed report or lost its visible stale status: ok=%t status=%q", ok, status)
+	}
+	t.Logf("local immutable finance fast read: %s; payload_bytes=%d", time.Since(fastStarted), len(payload))
 }

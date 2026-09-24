@@ -53,6 +53,10 @@ type Monitor struct {
 	// 写锁把告警配置、渠道配置和其他 Monitor 页面一起拖垮。测试直接调用
 	// openStore 且未配置路径时仍可共用 storeDB，保持轻量构造兼容。
 	usageFactsDB *gorm.DB
+	// Only long-running finance fact reads use this optional, single-connection
+	// read-only WAL handle. It cannot write or consume the facts writer's pool.
+	financeFactsReadDB   atomic.Pointer[gorm.DB]
+	financeFactsReadOnce sync.Once
 	// nginxEvidenceDB 是短期、高基数的入口请求证据库。它与主库、用量事实库
 	// 分离；损坏、锁或满盘只会关闭 evidence lane，不影响现有 Monitor 页面。
 	nginxEvidenceDB *gorm.DB
@@ -158,6 +162,7 @@ type Monitor struct {
 	// A moving source fingerprint must not spawn concurrent full-report scans
 	// while stale snapshots are being polled by multiple browsers.
 	financeReportRefreshRunning atomic.Bool
+	financeFastRefreshAfter     atomic.Int64 // UnixNano; limits exact-fingerprint rebuilds caused by repeated snapshot reads
 	financeSnapshotWriteMu      sync.RWMutex
 	financePeriodCacheOnce      sync.Once
 	financePeriodCache          *boundedByteCache
@@ -882,6 +887,11 @@ func (m *Monitor) Close() {
 			_ = m.prodDB.Close()
 		}
 		if m.usageFactsDB != nil && m.usageFactsDB != m.storeDB {
+			if financeReader := m.financeFactsReadDB.Load(); financeReader != nil {
+				if readDB, err := financeReader.DB(); err == nil {
+					_ = readDB.Close()
+				}
+			}
 			if db, err := m.usageFactsDB.DB(); err == nil {
 				_ = db.Close()
 			}

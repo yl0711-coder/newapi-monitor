@@ -1178,6 +1178,12 @@ func applyFinanceClosureReadiness(detail *financeCostDetailView) {
 }
 
 func validateFinanceSettings(s Settings) error {
+	if s.FinanceFastSnapshotEnabled && (!s.FinanceEnabled || !s.FinanceReportSnapshotReadEnabled || !s.FinanceReportSnapshotShadowEnabled) {
+		return errors.New("经营核算快速快照需要同时开启经营核算、快照影子写入和快照读取")
+	}
+	if s.FinanceFactsReadIsolationEnabled && !s.FinanceEnabled {
+		return errors.New("经营核算事实只读隔离需要 MONITOR_FINANCE_ENABLED=true")
+	}
 	if !s.FinanceEnabled && !s.FinanceFactsSyncEnabled && !s.FinanceCURArtifactEnabled {
 		return nil
 	}
@@ -3276,6 +3282,14 @@ func (m *Monitor) serveFinanceOperatingReport(c *gin.Context) {
 	if configErr != nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "经营核算报表暂不可用", "detail": configErr.Error()})
 		return
+	}
+	if c.Query("fresh") != "1" {
+		fastRequest := financeReportRequest{from: from, to: to, snapshotAsOf: snapshotAsOf, snapshotClamped: snapshotClamped, configurationHash: configurationHash}
+		if payload, status, ok := m.financeFastSnapshotPayload(fastRequest, time.Now()); ok {
+			c.Header("X-Monitor-Finance-Cache", status)
+			c.Data(http.StatusOK, "application/json; charset=utf-8", payload)
+			return
+		}
 	}
 	fingerprintStarted := time.Now()
 	sourceFingerprint, fingerprintErr := m.financeReportSourceFingerprint(ctx, from.Unix(), to.Unix())

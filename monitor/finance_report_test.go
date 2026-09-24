@@ -16,7 +16,7 @@ func TestFinanceSettingsDefaultOffAndValidateDate(t *testing.T) {
 	t.Setenv("MONITOR_FINANCE_FACTS_SYNC_ENABLED", "")
 	t.Setenv("MONITOR_FINANCE_START_DATE", "")
 	defaults := LoadSettings()
-	if defaults.FinanceEnabled || defaults.FinanceFactsSyncEnabled || defaults.FinanceStartDate != "2026-05-01" {
+	if defaults.FinanceEnabled || defaults.FinanceFactsSyncEnabled || defaults.FinanceFastSnapshotEnabled || defaults.FinanceFactsReadIsolationEnabled || defaults.FinanceStartDate != "2026-05-01" {
 		t.Fatalf("unsafe finance defaults: enabled=%v sync=%v start=%q", defaults.FinanceEnabled, defaults.FinanceFactsSyncEnabled, defaults.FinanceStartDate)
 	}
 	if err := validateFinanceSettings(Settings{FinanceEnabled: true, FinanceStartDate: "not-a-date"}); err == nil {

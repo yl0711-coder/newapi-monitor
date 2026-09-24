@@ -71,7 +71,7 @@ func (m *Monitor) loadFinanceGiftAllocationForScope(ctx context.Context, seedFro
 	if m == nil || !validFinanceGiftRange(seedFrom, from, to) {
 		return result, errors.New("invalid finance gift allocation range")
 	}
-	db := m.usageFactsStore()
+	db := m.financeFactsReadStore()
 	if db == nil {
 		return result, errors.New("finance gift facts store is unavailable")
 	}

@@ -155,7 +155,7 @@ func (m *Monitor) financeReportSourceFingerprintForScope(ctx context.Context, fr
 		}
 	}
 
-	factsDB := m.usageFactsStore()
+	factsDB := m.financeFactsReadStore()
 	if factsDB == nil {
 		_, _ = hash.Write([]byte("usage-facts|unavailable\n"))
 	} else {

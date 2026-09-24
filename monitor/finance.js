@@ -333,6 +333,12 @@
   function scheduleStaleRefresh() {
     clearRefreshTimer();
     if (!state.stale || $('tab-finance')?.hidden) return;
+    // Fast snapshots intentionally skip the expensive fingerprint on this
+    // request. Poll gently while the server verifies it in the background.
+    if (String(state.cacheStatus || '').startsWith('fast-snapshot-')) {
+      state.refreshTimer = setTimeout(() => load(false, true), 30000);
+      return;
+    }
     if (state.refreshAttempts >= 5) {
       const note = $('finCacheUpdate');
       if (note) note.textContent = ' · 更新尚未完成，已保留上次结果；请稍后刷新';
@@ -446,6 +452,7 @@
       const data = await response.json();
       if (!response.ok) throw new Error(data.detail || data.error || `HTTP ${response.status}`);
       data._cache_status = response.headers.get('X-Monitor-Finance-Cache') || '';
+      state.cacheStatus = data._cache_status;
       state.loaded = true;
       state.stale = String(data._cache_status).includes('stale');
       if (!state.stale) state.refreshAttempts = 0;
@@ -471,6 +478,9 @@
 
   function financeCacheRefreshNote(data) {
     const status=String(data._cache_status || '');
+    if (status.startsWith('fast-snapshot-')) {
+      return '<span id="finCacheUpdate"> · 已核验快照；页面打开期间约每分钟核对事实版本，可点“刷新”立即核验</span>';
+    }
     if (financeIsPriorStale(data)) {
       return `<span id="finCacheUpdate"> · 仅显示截至 ${dateTime(data.to)} 的较早区间，当前区间后台补算中；请勿当作当前结果</span>`;
     }
@@ -485,9 +495,10 @@
     const complete = baseComplete && giftComplete;
     const priorStale = financeIsPriorStale(data);
     const status = $('finStatus');
-    status.className = `fin-status ${!enabled ? 'bad' : !priorStale && complete ? 'ok' : ''}`;
+    status.className = `fin-status ${!enabled ? 'bad' : !state.stale && complete ? 'ok' : ''}`;
     const summary = !enabled ? '经营核算功能尚未开启'
       : priorStale ? '较早区间快照，当前区间正在补算'
+        : state.stale ? '已核验快照，正在核对最新事实'
         : complete ? '当前区间经营收入与上游成本证据完整'
         : baseComplete ? '用量与上游成本完整，注册赠送证据仍待补齐'
           : data.user_coverage?.complete ? '用户用量完整，部分上游成本仍待补证'

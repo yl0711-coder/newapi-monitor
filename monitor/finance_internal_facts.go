@@ -118,7 +118,7 @@ func (m *Monitor) loadFinanceInternalEvidence(ctx context.Context, scope stabili
 		result.VerifiedScope = stabilityScope{}
 		return result, nil
 	}
-	db := m.usageFactsStore()
+	db := m.financeFactsReadStore()
 	if db == nil {
 		return result, errors.New("finance facts store unavailable")
 	}
@@ -385,7 +385,7 @@ func (m *Monitor) financeInternalFactSyncStatus(ctx context.Context) (financeInt
 		result.ExpectedHours = (finalized - start) / 3600
 	}
 	var state FinanceInternalAccountFactState
-	err = m.usageFactsStore().WithContext(ctx).First(&state, financeInternalFactStateID).Error
+	err = m.financeFactsReadStore().WithContext(ctx).First(&state, financeInternalFactStateID).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		return result, nil
 	}

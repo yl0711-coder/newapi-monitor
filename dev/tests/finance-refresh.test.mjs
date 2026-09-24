@@ -120,6 +120,16 @@ test('finance polling stops honestly after bounded attempts, preserving report',
   assert.equal(element('finPeriodRows').innerHTML,'previous verified data');
 });
 
+test('fast finance snapshot is visibly provisional and polls at low frequency',()=>{
+  const {api,timers}=fixture();
+  api.state.stale=true;
+  api.state.cacheStatus='fast-snapshot-stale';
+  for(let n=0;n<3;n++)api.scheduleStaleRefresh();
+  assert.deepEqual(timers.map(t=>t.delay),[30000,30000,30000]);
+  assert.equal(api.state.refreshAttempts,0);
+  assert.match(api.financeCacheRefreshNote({_cache_status:'fast-snapshot-stale'}),/已核验快照.*核对事实版本/);
+});
+
 test('prior-range finance snapshot is never presented as the current interval',()=>{
   const {api}=fixture();
   assert.equal(api.financeIsPriorStale({_cache_status:'persistent-prior-stale-refreshing'}),true);

@@ -58,20 +58,24 @@ func logFinanceReadStageTiming(stage string, started time.Time, err error) {
 // A slow report may spend most of its deadline waiting for the single facts
 // SQLite connection rather than executing its query. Emit only aggregate pool
 // counters, never SQL parameters, account IDs or report amounts.
-func (m *Monitor) logFinanceBuildTiming(started time.Time, mainBefore, factsBefore sql.DBStats, err error) {
+func (m *Monitor) logFinanceBuildTiming(started time.Time, mainBefore, factsBefore, readBefore sql.DBStats, err error) {
 	elapsed := time.Since(started)
 	if elapsed < 5*time.Second && err == nil {
 		return
 	}
 	mainAfter := financeDBPoolStats(m.storeDB)
 	factsAfter := financeDBPoolStats(m.usageFactsDB)
+	readAfter := financeDBPoolStats(m.financeFactsReadDB.Load())
 	slog.Warn("经营核算构建耗时诊断",
 		"elapsed_ms", elapsed.Milliseconds(), "failed", err != nil,
 		"main_pool_wait_count", mainAfter.WaitCount-mainBefore.WaitCount,
 		"main_pool_wait_ms", (mainAfter.WaitDuration - mainBefore.WaitDuration).Milliseconds(),
 		"facts_pool_wait_count", factsAfter.WaitCount-factsBefore.WaitCount,
 		"facts_pool_wait_ms", (factsAfter.WaitDuration - factsBefore.WaitDuration).Milliseconds(),
-		"facts_pool_in_use", factsAfter.InUse, "facts_pool_open", factsAfter.OpenConnections)
+		"facts_pool_in_use", factsAfter.InUse, "facts_pool_open", factsAfter.OpenConnections,
+		"finance_read_pool_wait_count", readAfter.WaitCount-readBefore.WaitCount,
+		"finance_read_pool_wait_ms", (readAfter.WaitDuration - readBefore.WaitDuration).Milliseconds(),
+		"finance_read_pool_in_use", readAfter.InUse, "finance_read_pool_open", readAfter.OpenConnections)
 }
 
 // Explicit user refresh bypasses both layers; ordinary background revalidation
@@ -244,8 +248,9 @@ func (m *Monitor) financeReportPayload(ctx context.Context, request financeRepor
 		started := time.Now()
 		mainBefore := financeDBPoolStats(m.storeDB)
 		factsBefore := financeDBPoolStats(m.usageFactsDB)
+		readBefore := financeDBPoolStats(m.financeFactsReadDB.Load())
 		built, accepted, buildErr := m.buildFinanceReportWithRetry(ctx, request)
-		m.logFinanceBuildTiming(started, mainBefore, factsBefore, buildErr)
+		m.logFinanceBuildTiming(started, mainBefore, factsBefore, readBefore, buildErr)
 		if buildErr != nil {
 			return nil, buildErr
 		}

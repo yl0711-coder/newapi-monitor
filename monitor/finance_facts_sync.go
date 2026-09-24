@@ -98,7 +98,7 @@ func (m *Monitor) financeFactPublishedThrough(ctx context.Context, startHour int
 	if m == nil || startHour < 0 || startHour%usageFactHourSeconds != 0 {
 		return startHour, errors.New("invalid finance fact publication boundary")
 	}
-	db := m.usageFactsStore()
+	db := m.financeFactsReadStore()
 	if db == nil {
 		return startHour, errors.New("finance facts store unavailable")
 	}
