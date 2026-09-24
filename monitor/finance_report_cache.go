@@ -18,7 +18,10 @@ const (
 	financeReportCacheMaxEntries = 16
 	financeReportCacheMaxBytes   = 12 << 20
 	financeReportBuildTimeout    = 30 * time.Second
-	financeReportPersistentStale = 24 * time.Hour
+	// A full-range report changes its cache key every closed hour. Keep a
+	// verified prior-range snapshot long enough to cover a quiet day or a
+	// restart, but never present it as current-period data.
+	financeReportPersistentStale = 48 * time.Hour
 )
 
 type financeReportRequest struct {
@@ -173,6 +176,16 @@ func (m *Monitor) financeReportPayload(ctx context.Context, request financeRepor
 			m.refreshFinanceReportAsync(request)
 			return payload, "persistent-stale-refreshing", nil
 		}
+		// The default "since launch" range advances hourly. After a restart,
+		// there may be no snapshot for this exact hour even though the last
+		// completed report is still available. Its own, earlier range remains
+		// in the payload and the UI must label it as an old interval.
+		if previous, ok, priorErr := m.loadPriorFinanceReportSnapshot(request, now); priorErr != nil {
+			slog.Warn("经营核算上一区间快照读取失败，回退实时计算", "err", priorErr)
+		} else if ok {
+			m.refreshFinanceReportAsync(request)
+			return previous, "persistent-prior-stale-refreshing", nil
+		}
 	}
 
 	flightKey := key
@@ -204,6 +217,9 @@ func (m *Monitor) financeReportPayload(ctx context.Context, request financeRepor
 			if previous, _, _, ok, readErr := m.loadFinanceReportSnapshot(request, time.Now()); readErr == nil && ok {
 				return previous, "persistent-stale-retry", nil
 			}
+			if previous, ok, readErr := m.loadPriorFinanceReportSnapshot(request, time.Now()); readErr == nil && ok {
+				return previous, "persistent-prior-stale-retry", nil
+			}
 		}
 		return nil, "miss", err
 	}
@@ -228,7 +244,11 @@ func (m *Monitor) persistFinanceReportSnapshotShadowAsync(request financeReportR
 }
 
 func (m *Monitor) refreshFinanceReportAsync(request financeReportRequest) {
+	if m.taskContext().Err() != nil || !m.financeReportRefreshRunning.CompareAndSwap(false, true) {
+		return
+	}
 	go func() {
+		defer m.financeReportRefreshRunning.Store(false)
 		ctx, cancel := context.WithTimeout(m.taskContext(), financeReportBuildTimeout)
 		defer cancel()
 		m.refreshFinanceReport(ctx, request)

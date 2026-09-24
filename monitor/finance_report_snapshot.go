@@ -102,6 +102,42 @@ func (m *Monitor) loadFinanceReportSnapshot(request financeReportRequest, now ti
 	return append([]byte(nil), envelope.Payload...), storedAt, state, true, nil
 }
 
+// A prior closed-hour snapshot is only a display fallback while the requested
+// range is recomputed. It is never written under the requested range's cache
+// key, and its payload keeps the original end time so no stale amount can be
+// mistaken for the current hour's result.
+func (m *Monitor) loadPriorFinanceReportSnapshot(request financeReportRequest, now time.Time) ([]byte, bool, error) {
+	if !m.cfg.FinanceReportSnapshotReadEnabled || request.snapshotAsOf != 0 || request.snapshotClamped {
+		return nil, false, nil
+	}
+	for hours := time.Duration(1); hours <= financeReportPersistentStale/time.Hour; hours++ {
+		candidate := request
+		candidate.to = request.to.Add(-hours * time.Hour)
+		candidate.sourceFingerprint = ""
+		if !candidate.from.Before(candidate.to) {
+			break
+		}
+		payload, _, _, ok, err := m.loadFinanceReportSnapshot(candidate, now)
+		if err != nil {
+			return nil, false, err
+		}
+		if !ok {
+			continue
+		}
+		var bounds struct {
+			From        int64 `json:"from"`
+			To          int64 `json:"to"`
+			GeneratedAt int64 `json:"generated_at"`
+		}
+		if err := json.Unmarshal(payload, &bounds); err != nil || bounds.From != candidate.from.Unix() ||
+			bounds.To != candidate.to.Unix() || bounds.GeneratedAt <= 0 {
+			return nil, false, errors.New("经营核算上一区间快照范围无效")
+		}
+		return payload, true, nil
+	}
+	return nil, false, nil
+}
+
 // persistFinanceReportSnapshotShadow stores only a rebuildable, bounded cache
 // artifact beside Monitor's local database. Reading remains behind a separate
 // rollout gate, so shadow writes can be validated before serving them.

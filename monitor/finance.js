@@ -465,6 +465,14 @@
     }
   }
 
+  function financeCacheRefreshNote(data) {
+    const status=String(data._cache_status || '');
+    if (status.includes('prior-stale')) {
+      return `<span id="finCacheUpdate"> · 仅显示截至 ${dateTime(data.to)} 的较早区间，当前区间后台补算中；请勿当作当前结果</span>`;
+    }
+    return status.includes('stale')?'<span id="finCacheUpdate"> · 后台更新中</span>':'';
+  }
+
   function render(data) {
     const enabled = data.enabled !== false;
     const statement = data.statement || {};
@@ -480,7 +488,7 @@
           : '已展示现有用量，部分小时与上游成本仍待补证';
     const snapshotNote=data.data_as_of?` · 快照截至 ${dateTime(data.data_as_of)}`:'';
     const generatedNote=data.generated_at?` · 生成于 ${dateTime(data.generated_at)}`:'';
-    const refreshingNote=String(data._cache_status || '').includes('stale')?'<span id="finCacheUpdate"> · 后台更新中</span>':'';
+    const refreshingNote=financeCacheRefreshNote(data);
     status.innerHTML = `<i></i><div><b>${summary}</b><br>${enabled ? `区间 ${date(data.from)} 至 ${date(data.to)} · 用量 ${userCoverage(data.user_coverage)} · 成本 ${upstreamCoverage(data.upstream_coverage)}${snapshotNote}${generatedNote}${refreshingNote}` : '配置 MONITOR_FINANCE_ENABLED=true 后，只读展示已有事实。'}</div>`;
 
     setMoney('finConsumption', statement.user_consumption, statement.known_user_consumption,

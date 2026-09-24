@@ -345,3 +345,93 @@ func TestFinanceReportSnapshotMatchingFingerprintSurvivesShortTTL(t *testing.T) 
 		t.Fatalf("matching source fingerprint should keep snapshot fresh: state=%q ok=%v payload=%s err=%v", state, ok, got, err)
 	}
 }
+
+func TestFinancePriorRangeSnapshotIsExplicitAndBounded(t *testing.T) {
+	dir := t.TempDir()
+	m := &Monitor{cfg: Settings{
+		StorePath:                          filepath.Join(dir, "monitor.db"),
+		FinanceReportSnapshotShadowEnabled: true,
+		FinanceReportSnapshotReadEnabled:   true,
+	}}
+	now := time.Now().Truncate(time.Second)
+	request := financeReportRequest{
+		from: time.Unix(3600, 0), to: time.Unix(3600, 0).Add(50 * time.Hour),
+		configurationHash: "same-config", sourceFingerprint: "current-source",
+	}
+	prior := request
+	prior.to = request.to.Add(-28 * time.Hour)
+	payload := []byte(fmt.Sprintf(`{"enabled":true,"from":%d,"to":%d,"generated_at":%d}`,
+		prior.from.Unix(), prior.to.Unix(), now.Add(-28*time.Hour).Unix()))
+	if err := m.persistFinanceReportSnapshotShadow(prior.logicalKey(), "old-source", payload, now.Add(-28*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	got, ok, err := m.loadPriorFinanceReportSnapshot(request, now)
+	if err != nil || !ok || !bytes.Equal(got, payload) {
+		t.Fatalf("prior interval not recovered: ok=%t payload=%s err=%v", ok, got, err)
+	}
+	changedConfig := request
+	changedConfig.configurationHash = "changed-config"
+	if _, ok, err := m.loadPriorFinanceReportSnapshot(changedConfig, now); err != nil || ok {
+		t.Fatalf("snapshot crossed configuration boundary: ok=%t err=%v", ok, err)
+	}
+	localSnapshot := request
+	localSnapshot.snapshotAsOf = prior.to.Unix()
+	if _, ok, err := m.loadPriorFinanceReportSnapshot(localSnapshot, now); err != nil || ok {
+		t.Fatalf("static local snapshot used prior-range fallback: ok=%t err=%v", ok, err)
+	}
+	if _, _, _, ok, err := m.loadFinanceReportSnapshot(prior, now.Add(financeReportPersistentStale)); err != nil || ok {
+		t.Fatalf("expired snapshot remained readable: ok=%t err=%v", ok, err)
+	}
+}
+
+func TestFinancePriorRangeSnapshotRejectsMismatchedPayloadBounds(t *testing.T) {
+	dir := t.TempDir()
+	m := &Monitor{cfg: Settings{
+		StorePath:                          filepath.Join(dir, "monitor.db"),
+		FinanceReportSnapshotShadowEnabled: true,
+		FinanceReportSnapshotReadEnabled:   true,
+	}}
+	now := time.Now().Truncate(time.Second)
+	request := financeReportRequest{from: time.Unix(3600, 0), to: time.Unix(10800, 0), configurationHash: "config"}
+	prior := request
+	prior.to = prior.to.Add(-time.Hour)
+	bad := []byte(fmt.Sprintf(`{"enabled":true,"from":%d,"to":%d,"generated_at":%d}`,
+		prior.from.Unix(), request.to.Unix(), now.Unix()))
+	if err := m.persistFinanceReportSnapshotShadow(prior.logicalKey(), "old-source", bad, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, err := m.loadPriorFinanceReportSnapshot(request, now); err == nil || ok {
+		t.Fatalf("mismatched snapshot interval accepted: ok=%t err=%v", ok, err)
+	}
+}
+
+func TestFinanceReportPayloadServesPriorRangeWithoutLiveDatabase(t *testing.T) {
+	dir := t.TempDir()
+	m := &Monitor{cfg: Settings{
+		StorePath:                          filepath.Join(dir, "monitor.db"),
+		FinanceReportSnapshotShadowEnabled: true,
+		FinanceReportSnapshotReadEnabled:   true,
+	}}
+	stopped, cancel := context.WithCancel(context.Background())
+	cancel() // A stale display must not need a running background worker.
+	m.backgroundCtx = stopped
+	now := time.Now().Truncate(time.Second)
+	request := financeReportRequest{
+		from: time.Unix(3600, 0), to: time.Unix(3600, 0).Add(30 * time.Hour),
+		configurationHash: "config", sourceFingerprint: "latest-source",
+	}
+	prior := request
+	prior.to = prior.to.Add(-28 * time.Hour)
+	payload := []byte(fmt.Sprintf(`{"enabled":true,"from":%d,"to":%d,"generated_at":%d}`,
+		prior.from.Unix(), prior.to.Unix(), now.Add(-28*time.Hour).Unix()))
+	if err := m.persistFinanceReportSnapshotShadow(prior.logicalKey(), "old-source", payload, now.Add(-28*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	got, status, err := m.financeReportPayload(context.Background(), request, false)
+	if err != nil || status != "persistent-prior-stale-refreshing" || !bytes.Equal(got, payload) {
+		t.Fatalf("prior-range display failed closed or rewrote the interval: status=%s payload=%s err=%v", status, got, err)
+	}
+	if _, ok := m.getFinanceReportCache().Get(request.cacheKey(), time.Now()); ok {
+		t.Fatal("prior-range payload was cached under the current range")
+	}
+}
