@@ -244,6 +244,12 @@ func (m *Monitor) upstreamBalanceAssessments(ctx context.Context, now int64, acc
 	return out, nil
 }
 
+func upstreamBalanceAlertEligible(domain string, assessment ChannelUpstreamBalanceAssessment, manuallyDisabled map[string]bool, retirements map[string]ChannelUpstreamRetirement) bool {
+	return !manuallyDisabled[domain] && !retirements[domain].Retiring &&
+		(assessment.Status == "warning" || assessment.Status == "critical") &&
+		assessment.EstimatedRunwayDays != nil && assessment.RequiredBalanceUSD != nil
+}
+
 func (m *Monitor) evaluateUpstreamBalanceAlerts(c AlertConfig, now int64) {
 	if !c.UpstreamBalanceAlertsEnabled {
 		return
@@ -278,11 +284,15 @@ func (m *Monitor) evaluateUpstreamBalanceAlerts(c AlertConfig, now int64) {
 		slog.Warn("读取手动禁用渠道状态失败", "err", err)
 		manuallyDisabled = map[string]bool{}
 	}
+	retirements, err := m.loadChannelUpstreamRetirements(ctx)
+	if err != nil {
+		// An unreadable operator decision must not silently suppress a real
+		// low-balance alert. Keep the old behavior and surface the read failure.
+		slog.Warn("读取渠道停止使用标记失败，保留余额预警", "err", err)
+		retirements = map[string]ChannelUpstreamRetirement{}
+	}
 	for domain, assessment := range assessments {
-		if manuallyDisabled[domain] {
-			continue
-		}
-		if (assessment.Status != "warning" && assessment.Status != "critical") || assessment.EstimatedRunwayDays == nil {
+		if !upstreamBalanceAlertEligible(domain, assessment, manuallyDisabled, retirements) {
 			continue
 		}
 		account := accounts[domain]

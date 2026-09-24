@@ -109,19 +109,21 @@ type ChannelManagementVendor struct {
 }
 
 type ChannelManagementDomain struct {
-	Key              string                          `json:"key"`
-	Domain           string                          `json:"domain"`
-	Configured       bool                            `json:"configured"`
-	ManuallyDisabled bool                            `json:"manually_disabled"`
-	Usage            ChannelUsageMetrics             `json:"usage"`
-	Finance          ChannelDomainFinanceView        `json:"finance"`
-	Upstream         ChannelUpstreamAccountView      `json:"upstream"`
-	RateConfig       ChannelManagementRateConfig     `json:"rate_config"`
-	UpstreamUsage    ChannelUpstreamUsageMetrics     `json:"upstream_usage"`
-	NaturalDayBill   *ChannelUpstreamNaturalDayBill  `json:"natural_day_bill,omitempty"`
-	FinanceGroups    []ChannelManagementFinanceGroup `json:"finance_groups"`
-	Groups           []ChannelManagementGroup        `json:"groups"`
-	Vendors          []ChannelManagementVendor       `json:"vendors"`
+	Key               string                          `json:"key"`
+	Domain            string                          `json:"domain"`
+	Configured        bool                            `json:"configured"`
+	ManuallyDisabled  bool                            `json:"manually_disabled"`
+	Retiring          bool                            `json:"retiring"`
+	RetiringUpdatedAt int64                           `json:"retiring_updated_at,omitempty"`
+	Usage             ChannelUsageMetrics             `json:"usage"`
+	Finance           ChannelDomainFinanceView        `json:"finance"`
+	Upstream          ChannelUpstreamAccountView      `json:"upstream"`
+	RateConfig        ChannelManagementRateConfig     `json:"rate_config"`
+	UpstreamUsage     ChannelUpstreamUsageMetrics     `json:"upstream_usage"`
+	NaturalDayBill    *ChannelUpstreamNaturalDayBill  `json:"natural_day_bill,omitempty"`
+	FinanceGroups     []ChannelManagementFinanceGroup `json:"finance_groups"`
+	Groups            []ChannelManagementGroup        `json:"groups"`
+	Vendors           []ChannelManagementVendor       `json:"vendors"`
 }
 
 type ChannelManagementFilters struct {
@@ -761,6 +763,10 @@ func (m *Monitor) buildChannelManagementReport(ctx context.Context, scope stabil
 	if err != nil {
 		return nil, fmt.Errorf("读取上游账户状态: %w", err)
 	}
+	retirements, err := m.loadChannelUpstreamRetirements(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("读取停止使用标记: %w", err)
+	}
 	upstreamUsage, err := m.loadChannelUpstreamUsage(ctx, scope, now, upstreamAccounts, finance)
 	if err != nil {
 		return nil, fmt.Errorf("读取上游使用日志汇总: %w", err)
@@ -989,6 +995,7 @@ func (m *Monitor) buildChannelManagementReport(ctx context.Context, scope stabil
 		}
 		responseDomains = append(responseDomains, ChannelManagementDomain{
 			Key: domain.Key, Domain: domain.Domain, Configured: domain.Configured, ManuallyDisabled: channelDomainManuallyDisabled(domain),
+			Retiring: retirements[domain.Domain].Retiring, RetiringUpdatedAt: retirements[domain.Domain].UpdatedAt,
 			Usage: domain.Usage.metrics(), Finance: finance.domainView(domain.Domain),
 			Upstream:       upstream,
 			RateConfig:     managementRateConfig(domain, finance),

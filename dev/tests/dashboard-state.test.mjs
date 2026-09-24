@@ -438,6 +438,26 @@ test('channel management flattens RC26 type buckets and exposes actual channels 
   assert.doesNotMatch(html, /data-cm-vendor-toggle|<b>未标记<\/b>|<b>OpenAI<\/b>/);
 });
 
+test('retiring supplier remains visible with a reversible label and unchanged channel', () => {
+  const {context} = dashboard(), api = context.channelTest;
+  const domain = {key: 'domain:retiring.example', domain: 'retiring.example', configured: true, retiring: true,
+    usage: {requests: 2, tokens: 20, cost_usd: 1}, rate_config: {}, finance: {},
+    upstream: {configured: true, balance_usd: 20}, upstream_usage: {},
+    vendors: [{name: 'provider', channels: [{id: 81, name: 'remaining-balance', current: true, status: 1,
+      usage: {requests: 2}, groups: []}]}]};
+  api.cm.report = {finance: {can_edit: true}, domains: [domain]};
+  const retiring = api.domainCard(domain, 0, domain.usage, false);
+  assert.match(retiring, /cm-upstream-retiring[^>]*>停止使用/);
+  assert.match(retiring, /data-cm-retiring="domain:retiring\.example"[^>]*>取消停止使用/);
+  assert.match(retiring, /不再充值 · 余量消耗中/);
+  assert.match(retiring, /1 个启用/);
+  domain.retiring = false;
+  const restored = api.domainCard(domain, 0, domain.usage, false);
+  assert.doesNotMatch(restored, /cm-upstream-retiring/);
+  assert.match(restored, /标记停止使用/);
+  assert.match(restored, /1 个启用/);
+});
+
 test('filtering out a usable channel cannot reclassify its upstream as unused', () => {
   const {context} = dashboard();
   const api = context.channelTest;
