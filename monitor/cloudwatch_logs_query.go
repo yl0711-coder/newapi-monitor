@@ -50,7 +50,15 @@ type cloudWatchInsightsResult struct {
 // Keep this list in sync with the parser's rejection rules below. The
 // case-insensitive flag covers the production `Invalid token`/`invalid token`
 // split.
-const cloudWatchPreRouteRejectPattern = `(?i)(?:no available channel|no available channels|without available channel|no channel available|无可用渠道|没有可用渠道|无可用的渠道|没有可用的渠道|invalid token|token is invalid|unauthorized token|token invalid|无效令牌|无效的令牌|令牌无效|token disabled|token is disabled|令牌已禁用|令牌已被禁用|令牌被禁用|token model forbidden|model forbidden|model is not allowed|model not allowed|无权访问模型|无权限访问模型|模型无权限|模型权限不足|model not found|model does not exist|unknown model|模型不存在|模型未找到|找不到模型|未知模型|quota insufficient|insufficient quota|insufficient user quota|insufficient token quota|user quota insufficient|user quota is insufficient|user quota is not enough|token quota insufficient|token quota is insufficient|token quota is not enough|quota is insufficient|quota is not enough|not enough quota|pre consume failed|pre-consume failed|pre consume quota failed|pre-consume quota failed|too little quota|用户额度不足|账户额度不足|余额不足|额度不足|令牌额度不足|预扣费失败|预扣费额度失败|rate limit|rate_limit|rate limited|too many requests|concurrency limited|限流|请求过于频繁|超过速率限制|并发限制|并发数超限)`
+//
+// ★ 长短语必须排在它的子串之前 ★ 正则交替是最左优先：把「该令牌无权访问模型」
+// 放在「无权访问模型」之后，前者永远匹配不到，词表看着有、实际是死条目。
+// 这里保留生产原话「该令牌无权访问模型」，它是 NewAPI 实际写出的措辞。
+//
+// 另有一类语序把模型名夹在措辞中间（`model gpt-5 is forbidden`、`模型 gpt-5 不存在`），
+// 紧邻式词条匹配不到，因此单列带界定符的变体。模型名段用 [^\s|,，;；()（）]{1,80}
+// 限长并排除分隔符，避免跨字段吞掉整行把上游错误也捞进这条拒绝车道。
+const cloudWatchPreRouteRejectPattern = `(?i)(?:no available channel|no available channels|without available channel|no channel available|无可用渠道|没有可用渠道|无可用的渠道|没有可用的渠道|invalid token|token is invalid|unauthorized token|token invalid|无效令牌|无效的令牌|令牌无效|token disabled|token is disabled|令牌已禁用|令牌已被禁用|令牌被禁用|token model forbidden|model forbidden|model is not allowed|model not allowed|该令牌无权访问模型|该令牌无权限访问模型|无权访问模型|无权限访问模型|模型无权限|模型权限不足|model\s+[^\s|,，;；()（）]{1,80}\s+is\s+(?:forbidden|not\s+allowed)|模型\s*[^\s|,，;；()（）]{1,80}\s*(?:无权限|无权访问|权限不足)|model not found|model does not exist|unknown model|模型不存在|模型未找到|找不到模型|未知模型|model\s+[^\s|,，;；()（）]{1,80}\s+is\s+not\s+found|model\s+[^\s|,，;；()（）]{1,80}\s+does\s+not\s+exist|模型\s*[^\s|,，;；()（）]{1,80}\s*(?:不存在|未找到)|quota insufficient|insufficient quota|insufficient user quota|insufficient token quota|user quota insufficient|user quota is insufficient|user quota is not enough|token quota insufficient|token quota is insufficient|token quota is not enough|quota is insufficient|quota is not enough|not enough quota|pre consume failed|pre-consume failed|pre consume quota failed|pre-consume quota failed|too little quota|用户额度不足|账户额度不足|余额不足|额度不足|令牌额度不足|预扣费失败|预扣费额度失败|rate limit|rate_limit|rate limited|too many requests|concurrency limited|限流|请求过于频繁|超过速率限制|并发限制|并发数超限)`
 
 // These markers identify an error returned by a selected upstream/channel,
 // rather than a request rejected before routing. They are intentionally

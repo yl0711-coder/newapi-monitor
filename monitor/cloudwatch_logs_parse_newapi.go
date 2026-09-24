@@ -45,14 +45,21 @@ type cwNewAPIClassRule struct {
 	summary  string
 	all      []string
 	any      []string
+	// anyRe 覆盖子串表达不了的语序，典型是模型名夹在措辞中间
+	// （`model gpt-5 is forbidden`、`模型 gpt-5 不存在`）。这里直接复用下方
+	// 模型名提取用的同一批正则，避免「分类认不出但提取认得出」的两套判据漂移。
+	// 与 any 是或关系：任一命中即归该类。
+	anyRe []*regexp.Regexp
 }
 
 var cwNewAPIClassRules = []cwNewAPIClassRule{
 	{category: "route_no_channel", fault: "route_no_channel", summary: "NewAPI 没有可用渠道", any: []string{"no available channel", "no available channels", "without available channel", "no channel available", "无可用渠道", "没有可用渠道", "无可用的渠道", "没有可用的渠道"}},
 	{category: "invalid_token", fault: "auth_quota_account", summary: "NewAPI 拒绝了无效凭证", any: []string{"invalid token", "token is invalid", "token invalid", "unauthorized token", "无效令牌", "无效的令牌", "令牌无效"}},
 	{category: "token_disabled", fault: "auth_quota_account", summary: "NewAPI 拒绝了已禁用凭证", any: []string{"token is disabled", "token disabled", "令牌已禁用", "令牌已被禁用", "令牌被禁用"}},
-	{category: "model_forbidden", fault: "model_not_found", summary: "NewAPI 拒绝了无权限模型", any: []string{"token model forbidden", "model forbidden", "model is not allowed", "model not allowed", "无权访问模型", "无权限访问模型", "模型无权限", "模型权限不足"}},
-	{category: "model_not_found", fault: "model_not_found", summary: "NewAPI 未找到请求模型", any: []string{"model not found", "model does not exist", "unknown model", "模型不存在", "模型未找到", "找不到模型", "未知模型"}},
+	{category: "model_forbidden", fault: "model_not_found", summary: "NewAPI 拒绝了无权限模型", any: []string{"token model forbidden", "model forbidden", "model is not allowed", "model not allowed", "无权访问模型", "无权限访问模型", "模型无权限", "模型权限不足"},
+		anyRe: []*regexp.Regexp{cwModelForbiddenAfter, cwModelForbiddenAfterZH}},
+	{category: "model_not_found", fault: "model_not_found", summary: "NewAPI 未找到请求模型", any: []string{"model not found", "model does not exist", "unknown model", "模型不存在", "模型未找到", "找不到模型", "未知模型"},
+		anyRe: []*regexp.Regexp{cwModelNotFoundAfter, cwModelNotFoundAfterZH}},
 	{category: "quota_account", fault: "auth_quota_account", summary: "NewAPI 因账户或额度拒绝请求", any: []string{"quota insufficient", "insufficient quota", "insufficient user quota", "insufficient token quota", "user quota insufficient", "user quota is insufficient", "user quota is not enough", "token quota insufficient", "token quota is insufficient", "token quota is not enough", "quota is insufficient", "quota is not enough", "not enough quota", "pre consume failed", "pre-consume failed", "pre consume quota failed", "pre-consume quota failed", "too little quota", "用户额度不足", "账户额度不足", "余额不足", "额度不足", "令牌额度不足", "预扣费失败", "预扣费额度失败"}},
 	{category: "rate_limited", fault: "rate_limit_capacity", summary: "NewAPI 记录到限流或容量不足", any: []string{"rate limit", "rate_limit", "rate limited", "too many requests", "concurrency limited", "限流", "请求过于频繁", "超过速率限制", "并发限制", "并发数超限"}},
 	{category: "database_error", fault: "unknown", summary: "NewAPI 记录到数据库异常", any: []string{"database error", "sql error", "too many connections", "deadlock", "server has gone away", "lost connection to mysql"}},
@@ -159,12 +166,20 @@ func cwMatchNewAPIRule(lower string) (cwNewAPIClassRule, bool) {
 		if !matched {
 			continue
 		}
-		if len(rule.any) > 0 {
+		if len(rule.any) > 0 || len(rule.anyRe) > 0 {
 			matched = false
 			for _, fragment := range rule.any {
 				if strings.Contains(lower, fragment) {
 					matched = true
 					break
+				}
+			}
+			if !matched {
+				for _, re := range rule.anyRe {
+					if re.MatchString(lower) {
+						matched = true
+						break
+					}
 				}
 			}
 		}

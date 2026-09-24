@@ -13,6 +13,7 @@ import (
 	"time"
 
 	glebarezsqlite "github.com/glebarez/go-sqlite"
+	"gorm.io/gorm/clause"
 )
 
 func init() {
@@ -37,6 +38,14 @@ func init() {
 func chTestNow() time.Time { return time.Date(2026, 9, 15, 14, 30, 0, 0, cstLocation) }
 
 // chSeedCompany 建一家公司并挂上成员。
+// chSeedCompany 建一家客户维护公司及其成员。
+//
+// 同时建 TrackedUser：今日消耗的「已发布成员」判定读的是 TrackedUser 投影
+// （loadUsageMemberControlSnapshot → currentPublishedUsageMembership），而不是
+// CustomerHealthMember。只建后者会让已发布成员集为空，finalized 金额被误判成
+// partial——那是 fixture 没造出真实世界，不是实现的问题。
+// TrackedUser 的 AfterCreate 会补出 Active/TrackedRevision=1 的 UsageMemberControl，
+// 因此这里不手写 control，避免与生产不变量漂移。
 func chSeedCompany(t *testing.T, m *Monitor, name string, userIDs ...int64) int64 {
 	t.Helper()
 	g := CustomerHealthGroup{Name: name, CreatedAt: 1}
@@ -46,6 +55,10 @@ func chSeedCompany(t *testing.T, m *Monitor, name string, userIDs ...int64) int6
 	for _, id := range userIDs {
 		u := CustomerHealthMember{UserID: id, Username: name + "-u", GroupID: g.ID, AddedAt: 1}
 		if err := m.storeDB.Create(&u).Error; err != nil {
+			t.Fatal(err)
+		}
+		tracked := TrackedUser{UserID: id, Username: name + "-u", GroupID: g.ID, AddedAt: 1}
+		if err := m.storeDB.Clauses(clause.OnConflict{DoNothing: true}).Create(&tracked).Error; err != nil {
 			t.Fatal(err)
 		}
 	}

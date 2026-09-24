@@ -7,6 +7,31 @@ import (
 	"time"
 )
 
+// cwTestEventID 把用例名/日志原文压成合法的 CloudWatch EventID。
+//
+// 真实 EventID 是不透明标识符，cwBoundedOpaque 因此拒绝空格与控制字符
+// （见 cloudwatch_logs_evidence.go 的 r < 0x21 检查）。测试若直接把带空格的
+// 用例名或整条日志塞进 EventID，parse 会在入口就判 unsafe，于是"解析器认不认得
+// 生产措辞"这件事根本没被测到。这里只规范化标识符，不改任何被解析的 Message。
+func cwTestEventID(raw string) string {
+	var b strings.Builder
+	for _, r := range raw {
+		if r > 0x20 && r != 0x7f {
+			b.WriteRune(r)
+			continue
+		}
+		b.WriteByte('-')
+	}
+	id := b.String()
+	if len(id) > 2048 {
+		id = id[:2048]
+	}
+	if strings.TrimSpace(id) == "" {
+		return "cw-test-event"
+	}
+	return id
+}
+
 func TestCloudWatchPreRouteParserRecognizesProductionPhrases(t *testing.T) {
 	parser := newCloudWatchParserForTest(t, false)
 	rid := "202609220000001234"
@@ -63,7 +88,7 @@ func TestCloudWatchPreRouteParserRecognizesProductionPhrases(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			evidence, err := parser.parse(cloudWatchEvidenceInput{
-				Source: cwSourceWorkerNewAPI, EventID: tc.name, TimestampMS: time.Now().UnixMilli(), Message: tc.message,
+				Source: cwSourceWorkerNewAPI, EventID: cwTestEventID(tc.name), TimestampMS: time.Now().UnixMilli(), Message: tc.message,
 			})
 			if err != nil {
 				t.Fatalf("parse err=%v", err)
@@ -91,7 +116,7 @@ func TestCloudWatchPreRouteDoesNotMatchPositiveQuotaText(t *testing.T) {
 			t.Fatalf("positive quota message matched pre-route query vocabulary: %q", message)
 		}
 		if _, err := parser.parse(cloudWatchEvidenceInput{
-			Source: cwSourceWorkerNewAPI, EventID: message, TimestampMS: time.Now().UnixMilli(), Message: message,
+			Source: cwSourceWorkerNewAPI, EventID: cwTestEventID(message), TimestampMS: time.Now().UnixMilli(), Message: message,
 		}); cwParseErrorKind(err) != cwParseUnsupported {
 			t.Fatalf("positive quota message was classified as pre-route evidence: %q err=%v", message, err)
 		}
@@ -168,7 +193,7 @@ func TestCloudWatchPreRouteParserExtractsAlternateModelAndGroupContexts(t *testi
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			evidence, err := parser.parse(cloudWatchEvidenceInput{
-				Source: cwSourceWorkerNewAPI, EventID: tc.name, TimestampMS: time.Now().UnixMilli(), Message: tc.message,
+				Source: cwSourceWorkerNewAPI, EventID: cwTestEventID(tc.name), TimestampMS: time.Now().UnixMilli(), Message: tc.message,
 			})
 			if err != nil {
 				t.Fatalf("parse err=%v", err)
@@ -193,8 +218,19 @@ func TestCloudWatchPreRouteQueryContainsProductionVocabularyAndSourceGuard(t *te
 			t.Errorf("query missing production phrase %q: %s", phrase, query)
 		}
 	}
-	if !strings.Contains(query, "not like") || !strings.Contains(query, "status_code") || !strings.Contains(query, "upstream") || !strings.Contains(query, `^\s*\[gin\]`) {
+	// status code 的排除项在 pattern 里写成正则 `status[_ ]?code`（同时覆盖
+	// status_code 与 status code 两种生产写法），因此这里断言正则形式而不是
+	// 字面 "status_code"；用字面子串会漏掉这个等价且更宽的实现。
+	if !strings.Contains(query, "not like") || !strings.Contains(query, `status[_ ]?code`) || !strings.Contains(query, "upstream") || !strings.Contains(query, `^\s*\[gin\]`) {
 		t.Fatalf("query lacks explicit upstream exclusion: %s", query)
+	}
+	// 反向确认：排除项必须真的能匹配到生产里的 status_code/status code 两种写法，
+	// 否则上面的断言会退化成"只要源码里有这串字符就算过"。
+	upstreamMarker := regexp.MustCompile(cloudWatchPreRouteUpstreamMarkerPattern)
+	for _, marker := range []string{"status_code=429", "status code: 500", "upstream returned 502"} {
+		if !upstreamMarker.MatchString(marker) {
+			t.Errorf("upstream marker pattern 未能匹配生产写法 %q", marker)
+		}
 	}
 	for _, field := range []string{"user_id", "userId", "uid", "model", "model_name", "group", "grp"} {
 		if !strings.Contains(query, field) {
@@ -216,7 +252,7 @@ func TestCloudWatchPreRouteParserExcludesExplicitUpstreamErrors(t *testing.T) {
 		"[GIN] 2026/09/01 - 00:00:00 | relay | 202609220000001234 | 429 | rate_limit=true | POST /v1/responses",
 	}
 	for _, message := range cases {
-		evidence, err := parser.parse(cloudWatchEvidenceInput{Source: cwSourceWorkerNewAPI, EventID: message, TimestampMS: time.Now().UnixMilli(), Message: message})
+		evidence, err := parser.parse(cloudWatchEvidenceInput{Source: cwSourceWorkerNewAPI, EventID: cwTestEventID(message), TimestampMS: time.Now().UnixMilli(), Message: message})
 		if err != nil {
 			t.Fatalf("upstream line should remain parseable: %q err=%v", message, err)
 		}
