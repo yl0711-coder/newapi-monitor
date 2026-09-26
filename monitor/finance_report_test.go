@@ -16,13 +16,19 @@ func TestFinanceSettingsDefaultOffAndValidateDate(t *testing.T) {
 	t.Setenv("MONITOR_FINANCE_FACTS_SYNC_ENABLED", "")
 	t.Setenv("MONITOR_FINANCE_START_DATE", "")
 	defaults := LoadSettings()
-	if defaults.FinanceEnabled || defaults.FinanceFactsSyncEnabled || defaults.FinanceStartDate != "2026-05-01" {
+	if defaults.FinanceEnabled || defaults.FinanceFactsSyncEnabled || defaults.FinanceFastSnapshotEnabled || defaults.FinanceFactsReadIsolationEnabled || defaults.FinanceStartDate != "2026-05-01" {
 		t.Fatalf("unsafe finance defaults: enabled=%v sync=%v start=%q", defaults.FinanceEnabled, defaults.FinanceFactsSyncEnabled, defaults.FinanceStartDate)
 	}
 	if err := validateFinanceSettings(Settings{FinanceEnabled: true, FinanceStartDate: "not-a-date"}); err == nil {
 		t.Fatal("invalid finance start date accepted")
 	}
 	if err := validateFinanceSettings(Settings{FinanceEnabled: true, FinanceStartDate: "2026-05-01"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateFinanceSettings(Settings{FinanceEnabled: true, FinanceStartDate: "2026-05-01", FinanceReportSnapshotReadEnabled: true}); err == nil {
+		t.Fatal("经营核算快照只读不写的失效配置被接受")
+	}
+	if err := validateFinanceSettings(Settings{FinanceEnabled: true, FinanceStartDate: "2026-05-01", FinanceReportSnapshotReadEnabled: true, FinanceReportSnapshotShadowEnabled: true}); err != nil {
 		t.Fatal(err)
 	}
 	validSync := Settings{FinanceFactsSyncEnabled: true, FinanceStartDate: "2026-05-01",
@@ -77,6 +83,26 @@ func TestFinanceLocalSnapshotRangeClampsOnlyAbsentTail(t *testing.T) {
 	}
 	if changed || asOf != 0 || !unchanged.Equal(wanted) {
 		t.Fatalf("production range was changed: to=%d asOf=%d changed=%v", unchanged.Unix(), asOf, changed)
+	}
+}
+
+func TestFinanceMonthRangesAlwaysUseShanghaiCalendar(t *testing.T) {
+	loc, err := time.LoadLocation("Asia/Shanghai")
+	if err != nil {
+		t.Fatal(err)
+	}
+	from := time.Date(2026, 5, 1, 0, 0, 0, 0, loc)
+	to := time.Date(2026, 6, 3, 0, 0, 0, 0, loc)
+
+	// Simulate an Ubuntu CI runner: time.Unix creates a UTC-located value.
+	got := financeMonthRanges(time.Unix(from.Unix(), 0), time.Unix(to.Unix(), 0))
+	if len(got) != 2 || got[0][0].Unix() != from.Unix() || got[0][1].Unix() != time.Date(2026, 6, 1, 0, 0, 0, 0, loc).Unix() || got[1][1].Unix() != to.Unix() {
+		t.Fatalf("finance months depend on process timezone: %+v", got)
+	}
+	for _, period := range got {
+		if period[0].Location().String() != "Asia/Shanghai" || period[1].Location().String() != "Asia/Shanghai" {
+			t.Fatalf("finance month did not retain Shanghai calendar: %+v", period)
+		}
 	}
 }
 
@@ -212,6 +238,11 @@ func TestFinanceReportUsesFullUserFactsAndVerifiedUpstreamCost(t *testing.T) {
 	if report.Statement.InternalTestConsumption.MicroUSD != "0" || report.Statement.InternalTestRequests != 0 {
 		t.Fatalf("unexpected internal test usage: %+v", report.Statement)
 	}
+	if !strings.Contains(report.SemanticsNote, "修正上游总成本包含内部测试实际支出") ||
+		!strings.Contains(report.SemanticsNote, "平台经营结果全额扣除") ||
+		!strings.Contains(report.SemanticsNote, "不重复扣除") {
+		t.Fatalf("finance semantics no longer distinguishes gross platform cost from business cost: %q", report.SemanticsNote)
+	}
 	if len(report.Periods) != 1 || report.Periods[0].Status != "verified" || len(report.CostDetails) != 1 {
 		t.Fatalf("unexpected period/detail projection: %+v %+v", report.Periods, report.CostDetails)
 	}
@@ -293,6 +324,9 @@ func TestFinanceReportSeparatesStrictInternalTestCostAndExcludesMixedHoursFromCu
 	if len(report.Days) != 1 || report.Days[0].Statement.KnownInternalTestUpstreamCost.MicroUSD != "4000000" || report.Days[0].Statement.KnownContributionProfit.MicroUSD != "7000000" {
 		t.Fatalf("daily internal-test separation mismatch: %+v", report.Days)
 	}
+	if report.Days[0].InternalCostComplete || report.Days[0].Statement.InternalTestMixedRows != 1 || report.Days[0].Statement.InternalTestUpstreamCost != nil {
+		t.Fatal("daily response concealed unresolved mixed cost")
+	}
 }
 
 func TestApplyFinancePairingDomainCoverageListsUnenrolledDomains(t *testing.T) {
@@ -302,10 +336,75 @@ func TestApplyFinancePairingDomainCoverageListsUnenrolledDomains(t *testing.T) {
 		{Domain: "covered.example"},
 		{Domain: "missing-a.example"},
 		{Domain: "missing-a.example"},
+		{Domain: "ignored.example", Status: "not_configured"},
 	}
 	applyFinancePairingDomainCoverage(&audit, details)
 	if audit.RelevantDomains != 3 || !reflect.DeepEqual(audit.UnenrolledDomains, []string{"missing-a.example", "missing-b.example"}) {
 		t.Fatalf("unexpected pairing domain coverage: %+v", audit)
+	}
+}
+
+func TestFinanceCoverageExcludesUnconfiguredWithoutTreatingItsCostAsZero(t *testing.T) {
+	configuredBilled := economicsMoney(2_000_000)
+	configuredCorrected := economicsMoney(1_500_000)
+	configuredContribution := economicsMoney(3_500_000)
+	periodDetails := [][]financeCostDetailView{{
+		{
+			Domain: "configured.example", UserRequests: 10, UserConsumption: economicsMoney(5_000_000),
+			KnownBilledCost: configuredBilled, BilledCost: &configuredBilled,
+			KnownCorrectedCost: configuredCorrected, CorrectedCost: &configuredCorrected,
+			PairedRevenue: economicsMoney(5_000_000), PairedCost: configuredCorrected,
+			KnownContribution: configuredContribution, Contribution: &configuredContribution,
+			ExpectedHours: 2, CompletedHours: 2, Status: "verified",
+		},
+		{
+			Domain: "unconfigured.example", UserRequests: 4, UserConsumption: economicsMoney(900_000),
+			Status: "not_configured",
+		},
+	}}
+	accounts := map[string]ChannelUpstreamAccountView{
+		"configured.example": {Configured: true, UsageSyncEnabled: true},
+	}
+
+	coverage, details, err := mergeFinanceCostDetails(periodDetails, accounts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !coverage.Complete || coverage.RelevantDomains != 1 || coverage.AvailableDomains != 1 ||
+		coverage.CorrectedDomains != 1 || coverage.UnconfiguredDomains != 1 ||
+		coverage.UnconfiguredUserRequests != 4 || coverage.UnconfiguredUserConsumption.MicroUSD != "900000" {
+		t.Fatalf("configured coverage or excluded-domain disclosure mismatch: %+v", coverage)
+	}
+	if len(details) != 2 || details[1].Domain != "unconfigured.example" || details[1].Status != "not_configured" ||
+		details[1].KnownBilledCost.MicroUSD != "" || details[1].KnownCorrectedCost.MicroUSD != "" ||
+		details[1].KnownContribution.MicroUSD != "" {
+		t.Fatalf("unconfigured domain was hidden or treated as known zero cost: %+v", details)
+	}
+
+	audit := financePairingAuditView{LedgerDomains: []string{"configured.example"}}
+	applyFinancePairingDomainCoverage(&audit, details)
+	applyFinanceCostPairingStatuses(details, audit)
+	if audit.RelevantDomains != 1 || len(audit.UnenrolledDomains) != 0 {
+		t.Fatalf("unconfigured domain polluted pairing coverage: %+v", audit)
+	}
+	if details[1].PairingStatus != "not_required" || details[1].ClosureReadiness != "not_required" {
+		t.Fatalf("unconfigured domain was turned into remediation work: %+v", details[1])
+	}
+
+	periodCost := economicsMoney(1_500_000)
+	statement, err := aggregateFinancePeriods([]financePeriodView{{
+		Statement: financeStatementView{
+			KnownUserConsumption:       economicsMoney(5_900_000),
+			KnownCorrectedUpstreamCost: periodCost,
+			CorrectedUpstreamCost:      &periodCost,
+		},
+		UpstreamCoverage: coverage,
+	}}, StabilityDataCoverage{Complete: true}, coverage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if statement.KnownCorrectedUpstreamCost.MicroUSD != "1500000" || statement.CorrectedUpstreamCost != nil || statement.OperatingProfit != nil {
+		t.Fatalf("unconfigured traffic was implicitly assigned zero upstream cost: %+v", statement)
 	}
 }
 
@@ -386,6 +485,7 @@ func TestApplyFinanceCostPairingStatusesKeepsBillAndPairingIndependent(t *testin
 
 func TestApplyFinanceClosureReadinessFailsClosedByEvidenceStage(t *testing.T) {
 	details := []financeCostDetailView{
+		{Status: "not_configured", PairingStatus: "not_required"},
 		{Status: "not_connected", PairingStatus: "not_enrolled"},
 		{Status: "no_data", PairingStatus: "not_enrolled"},
 		{Status: "incomplete", PairingStatus: "not_enrolled", KnownBilledCost: economicsMoney(1_000_000)},
@@ -397,7 +497,7 @@ func TestApplyFinanceClosureReadinessFailsClosedByEvidenceStage(t *testing.T) {
 		{Status: "incomplete", PairingStatus: "partially_paired", KnownBilledCost: economicsMoney(1_000_000), KnownCorrectedCost: economicsMoney(900_000)},
 		{Status: "verified", PairingStatus: "paired_verified", KnownBilledCost: economicsMoney(1_000_000), KnownCorrectedCost: economicsMoney(900_000)},
 	}
-	want := []string{"bill_not_connected", "bill_missing", "correction_missing", "cost_evidence_missing", "cost_evidence_incomplete", "finance_history_missing", "source_binding_required", "ledger_backfill_required", "in_progress", "verified"}
+	want := []string{"not_required", "bill_not_connected", "bill_missing", "correction_missing", "cost_evidence_missing", "cost_evidence_incomplete", "finance_history_missing", "source_binding_required", "ledger_backfill_required", "in_progress", "verified"}
 	for index := range details {
 		applyFinanceClosureReadiness(&details[index])
 		if details[index].ClosureReadiness != want[index] || details[index].ClosureNextAction == "" {
@@ -682,7 +782,7 @@ func TestFinanceUserFactsSubtractRefundsAndKeepGross(t *testing.T) {
 	if err := m.storeDB.Create(&StabilityHourIngestState{HourTs: hour, Status: "complete", Requests: 2, TrafficClassVersion: stabilityTrafficClassificationVersion}).Error; err != nil {
 		t.Fatal(err)
 	}
-	statement, coverage, domains, err := m.loadFinanceUserFacts(context.Background(), stabilityScope{FromTs: hour, ToTs: hour + 3600}, hour+86400)
+	statement, coverage, domains, err := m.loadFinanceUserFacts(context.Background(), stabilityScope{FromTs: hour, ToTs: hour + 3600}, hour+86400, financeConfiguredInternalEvidence{Complete: true}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -775,12 +875,14 @@ func TestFinanceReportDoesNotTreatMissingUpstreamEvidenceAsZero(t *testing.T) {
 
 func TestFinancePageAndNavigationAreWired(t *testing.T) {
 	for _, required := range []string{
-		`data-tab="finance"`, `id="tab-finance"`, `/finance.css?v=13`, `/finance.js?v=36`,
+		`data-tab="finance"`, `id="tab-finance"`, `/finance.css?v=14`, `/finance.js?v=`,
 		`id="finPeriodRows"`, `id="finDailyRows"`, `id="finCostRows"`, `id="finPairingRows"`, `id="finPairingCoverage"`, `id="finClosureReadiness"`, `id="finUnallocatedSourceRows"`, `id="finBridgeRevenue"`, `id="finBridgeProfit"`, `window.financeActivate`,
 		`id="finEvidenceRollout"`, `id="finEvidenceRolloutRows"`, `id="finEvidenceRolloutSummary"`, `历史成本补证计划`, `仅改善上游证据`, `建议首个灰度`,
 		`function operatingProfitBlockers`, `上游账单未接入/缺失`, `缺历史充值修正依据`, `AWS 当期未封账`,
 		`id="finCURProductRows"`, `AWS 基础设施成本明细`, `renderCURProducts`,
-		`id="finGiftEvidence"`, `注册赠送消耗`, `经营收入`, `已配对计费贡献（赠送前）`, `减：修正上游总成本`, `其中：内部测试上游成本（已含）`, `分组名称候选（非归属证据）`, `不会自动绑定或改变核算金额`, `仅分组名称得到一个候选；不代表令牌归属`, `去渠道管理精确核对`, `window.channelManagementOpenCostSource`, `当前区间没有可发布的上游账单`, `当前区间没有同时核验的收入与成本`, `缺账单证据`,
+		`id="finGiftEvidence"`, `注册赠送消耗`, `经营收入`, `已配对计费贡献（赠送前）`, `减：修正上游总成本`, `其中：内部测试上游成本`, `id="finInternalAccounts"`, `分组名称候选（非归属证据）`, `不会自动绑定或改变核算金额`, `仅分组名称得到一个候选；不代表令牌归属`, `去渠道管理精确核对`, `window.channelManagementOpenCostSource`, `当前区间没有可发布的上游账单`, `当前区间没有同时核验的收入与成本`, `缺账单证据`,
+		`load(true)`, `query.set('fresh', '1')`, `X-Monitor-Finance-Cache`, `生成于`, `后台更新中`,
+		`function scheduleStaleRefresh`, `state.refreshAttempts >= 5`, `load(false, true)`,
 	} {
 		if !strings.Contains(pageHTML+string(financeJS), required) {
 			t.Fatalf("finance page wiring missing %q", required)

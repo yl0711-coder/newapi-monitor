@@ -1248,10 +1248,11 @@ func (m *Monitor) fetchNewAPIPricingHour(ctx context.Context, account ChannelUps
 		// scans must reset content verification, not rewrite old money semantics.
 		priorErr := m.storeDB.WithContext(ctx).Where("domain = ? AND account_epoch = ? AND semantics_version = ? AND hour_ts = ? AND status IN ?", account.Domain, epoch, channelCostEvidenceSemanticsVersion, hourTs, []string{"observed", "verified"}).First(&priorCostState).Error
 		if priorErr == nil {
-			if !validPositiveCanonicalRat(priorCostState.ChargeUnitsPerUSD) {
-				return nil, ChannelUpstreamPricingHourState{}, "", false, errors.New("既有渠道成本小时的历史计费单位无效")
+			var unitErr error
+			frozenCostUnitsPerUSD, unitErr = channelCostFrozenUnit(priorCostState)
+			if unitErr != nil {
+				return nil, ChannelUpstreamPricingHourState{}, "", false, unitErr
 			}
-			frozenCostUnitsPerUSD = priorCostState.ChargeUnitsPerUSD
 		} else if !errors.Is(priorErr, gorm.ErrRecordNotFound) {
 			return nil, ChannelUpstreamPricingHourState{}, "", false, priorErr
 		}
@@ -1260,6 +1261,10 @@ func (m *Monitor) fetchNewAPIPricingHour(ctx context.Context, account ChannelUps
 		if !firstLoaded {
 			page, err := fetchNewAPIPricingPage(ctx, client, account, credential, hourTs, hourTs+3600, 1, pacer)
 			if err != nil {
+				var exhausted *upstreamUsageRunBudgetExhausted
+				if errors.As(err, &exhausted) {
+					return nil, ChannelUpstreamPricingHourState{}, "首页待读取；本轮请求预算耗尽", false, nil
+				}
 				return nil, ChannelUpstreamPricingHourState{}, "", false, err
 			}
 			first = page
@@ -1535,31 +1540,33 @@ func (m *Monitor) syncStoredNewAPIPricing(ctx context.Context, domain string) (C
 	}
 	state.LastAttemptAt = now
 	pacer := newUpstreamUsageRequestPacer(upstreamPricingMaxRequestsPerRun, upstreamUsageRequestInterval)
-	runHour := func(hourTs int64) (ChannelUpstreamPricingHourState, string, bool, error) {
+	runHour := func(hourTs int64) (ChannelUpstreamPricingHourState, string, bool, error, error) {
 		evidence, hourState, progress, complete, fetchErr := m.fetchNewAPIPricingHour(ctx, account, credential, hourTs, pacer, now)
 		if fetchErr != nil {
-			return ChannelUpstreamPricingHourState{}, "", false, fetchErr
+			return ChannelUpstreamPricingHourState{}, "", false, fetchErr, nil
 		}
 		if !complete {
-			return ChannelUpstreamPricingHourState{}, progress, false, nil
+			return ChannelUpstreamPricingHourState{}, progress, false, nil, nil
 		}
 		if persistErr := m.persistNewAPIPricingHour(ctx, account, hourTs, evidence, hourState, now); persistErr != nil {
-			return ChannelUpstreamPricingHourState{}, "", false, persistErr
+			return ChannelUpstreamPricingHourState{}, "", false, persistErr, nil
 		}
 		var published ChannelUpstreamPricingHourState
 		queryErr := m.storeDB.WithContext(ctx).Where("domain = ? AND account_epoch = ? AND hour_ts = ? AND semantics_version = ?",
 			account.Domain, newAPIUpstreamAccountEpoch(account), hourTs, upstreamPricingSemanticsVersion).First(&published).Error
+		var shadowErr error
 		if queryErr == nil && m.channelCostEnabledFor(account) {
 			// Cost publication is an independent shadow transaction. Its failure
 			// must never roll back or stall the established pricing cursor.
 			if costErr := m.publishChannelCostHourFromCheckpoint(ctx, account, published, now); costErr != nil {
+				shadowErr = costErr
 				if dirtyErr := m.markChannelCostDirtyHour(ctx, account, hourTs, "publish_failure", costErr); dirtyErr != nil {
 					slog.Warn("记录渠道成本恢复任务失败", "domain", account.Domain, "hour", hourTs, "err", dirtyErr)
 				}
 				slog.Warn("NewAPI 渠道成本影子小时尚未发布，旧计价账本继续", "domain", account.Domain, "hour", hourTs, "err", costErr)
 			}
 		}
-		return published, "", true, queryErr
+		return published, "", true, queryErr, shadowErr
 	}
 	previousFailures := state.ConsecutiveFailures
 	completedRead := false
@@ -1572,7 +1579,7 @@ func (m *Monitor) syncStoredNewAPIPricing(ctx context.Context, domain string) (C
 			var published ChannelUpstreamPricingHourState
 			var progress string
 			var complete bool
-			published, progress, complete, err = runHour(tailHour)
+			published, progress, complete, err, _ = runHour(tailHour)
 			if err == nil && !complete {
 				state.Status, state.Progress, state.LastError = "paging", progress, ""
 				state.TailNextSyncAt, state.BackfillNextSyncAt = now+60, now+60
@@ -1621,7 +1628,7 @@ func (m *Monitor) syncStoredNewAPIPricing(ctx context.Context, domain string) (C
 				err = alreadyErr
 				break
 			}
-			published, progress, complete, runErr := runHour(state.BackfillNextHour)
+			published, progress, complete, runErr, _ := runHour(state.BackfillNextHour)
 			if runErr != nil {
 				err = runErr
 				break
@@ -1668,19 +1675,31 @@ func (m *Monitor) syncStoredNewAPIPricing(ctx context.Context, domain string) (C
 			pricingErr := m.storeDB.WithContext(ctx).Where("domain = ? AND account_epoch = ? AND hour_ts = ? AND semantics_version = ?",
 				account.Domain, newAPIUpstreamAccountEpoch(account), dirty.HourTs, upstreamPricingSemanticsVersion).First(&pricingState).Error
 			recoveryErr := pricingErr
+			recoveryPending := false
+			needsRead := pricingErr == nil || errors.Is(pricingErr, gorm.ErrRecordNotFound)
 			if pricingErr == nil && pricingState.Status == "verified" && pricingState.ReconcileStatus == "matched" {
-				// Prefer a complete local checkpoint: this path performs no upstream
-				// I/O. A missing/invalid checkpoint falls back to a bounded reread.
-				recoveryErr = m.publishChannelCostHourFromCheckpoint(ctx, account, pricingState, now)
+				var publishReady bool
+				publishReady, recoveryErr = m.prepareChannelCostRecovery(ctx, account, dirty.HourTs)
+				needsRead = recoveryErr == nil && !publishReady
+				if recoveryErr == nil && publishReady {
+					// A complete checkpoint can be published without upstream I/O.
+					recoveryErr = m.publishChannelCostHourFromCheckpoint(ctx, account, pricingState, now)
+				}
 			}
-			if recoveryErr != nil {
-				m.deleteChannelCostCheckpoint(ctx, account, dirty.HourTs)
-				_, progress, complete, runErr := runHour(dirty.HourTs)
+			if needsRead {
+				_, _, complete, runErr, shadowErr := runHour(dirty.HourTs)
 				switch {
 				case runErr != nil:
 					recoveryErr = runErr
+				case shadowErr != nil:
+					recoveryErr = shadowErr
 				case !complete:
-					recoveryErr = fmt.Errorf("渠道成本恢复分页未完成: %s", progress)
+					// A normal page/budget yield is not a failure. If the
+					// pricing cursor advanced without its paired cost cursor,
+					// however, the shadow capture failed and must retain its
+					// failure backoff rather than masquerade as progress.
+					recoveryErr = m.channelCostPartialCheckpointError(ctx, account, dirty.HourTs)
+					recoveryPending = recoveryErr == nil
 				default:
 					recoveryErr = nil
 				}
@@ -1693,25 +1712,28 @@ func (m *Monitor) syncStoredNewAPIPricing(ctx context.Context, domain string) (C
 					slog.Warn("渠道成本恢复完成但清理任务失败", "domain", account.Domain, "hour", dirty.HourTs, "err", clearErr)
 				}
 			} else {
-				if recoveryErr == nil {
-					if costErr != nil {
-						recoveryErr = costErr
-					} else {
-						recoveryErr = errors.New("渠道成本小时等待第二次一致性复核")
-					}
+				if recoveryErr == nil && costErr == nil && costState.Status == "observed" && costState.ReconcileStatus == "matched" {
+					recoveryPending = true
 				}
-				if deferErr := m.deferChannelCostDirtyHour(ctx, account, dirty.HourTs, now, recoveryErr); deferErr != nil {
-					slog.Warn("更新渠道成本恢复任务失败", "domain", account.Domain, "hour", dirty.HourTs, "err", deferErr)
+				if recoveryPending && (costErr == nil || errors.Is(costErr, gorm.ErrRecordNotFound)) {
+					if scheduleErr := m.scheduleChannelCostDirtyHour(ctx, account, dirty.HourTs, now); scheduleErr != nil {
+						slog.Warn("安排渠道成本恢复下一轮失败", "domain", account.Domain, "hour", dirty.HourTs, "err", scheduleErr)
+					}
+				} else {
+					if recoveryErr == nil {
+						if costErr != nil {
+							recoveryErr = costErr
+						} else {
+							recoveryErr = errors.New("渠道成本小时等待第二次一致性复核")
+						}
+					}
+					if deferErr := m.deferChannelCostDirtyHour(ctx, account, dirty.HourTs, now, recoveryErr); deferErr != nil {
+						slog.Warn("更新渠道成本恢复任务失败", "domain", account.Domain, "hour", dirty.HourTs, "err", deferErr)
+					}
 				}
 			}
 		} else if !errors.Is(dirtyErr, gorm.ErrRecordNotFound) {
 			slog.Warn("读取渠道成本恢复任务失败", "domain", account.Domain, "err", dirtyErr)
-		}
-		if economicsQueueErr := m.enqueueMissingChannelEconomicsHours(ctx, account, 8); economicsQueueErr != nil {
-			slog.Warn("扫描缺失渠道经济账小时失败", "domain", account.Domain, "err", economicsQueueErr)
-		}
-		if economicsErr := m.publishOneDueChannelEconomicsHour(ctx, account, now); economicsErr != nil {
-			slog.Warn("渠道小时经济账发布待重试", "domain", account.Domain, "err", economicsErr)
 		}
 	}
 	if err == nil && !blocked {
@@ -1776,20 +1798,13 @@ func (m *Monitor) syncDueUpstreamPricing(ctx context.Context) {
 			due = state.TailNextSyncAt == 0 || state.TailNextSyncAt <= now ||
 				(!state.BackfillDone && (state.BackfillNextSyncAt == 0 || state.BackfillNextSyncAt <= now))
 		}
-		var costRecoveryDueAt, economicsDueAt int64
+		var costRecoveryDueAt int64
 		if m.channelCostEnabledFor(account) {
 			_ = m.storeDB.WithContext(ctx).Model(&ChannelCostDirtyHour{}).
 				Select("COALESCE(MIN(next_attempt_at),0)").
 				Where("domain = ? AND account_epoch = ? AND status = 'pending'", account.Domain, epoch).
 				Scan(&costRecoveryDueAt).Error
 			if costRecoveryDueAt > 0 && costRecoveryDueAt <= now {
-				due = true
-			}
-			_ = m.storeDB.WithContext(ctx).Model(&ChannelEconomicsDirtyHour{}).
-				Select("COALESCE(MIN(next_attempt_at),0)").
-				Where("domain = ? AND account_epoch = ? AND status = 'pending'", account.Domain, epoch).
-				Scan(&economicsDueAt).Error
-			if economicsDueAt > 0 && economicsDueAt <= now {
 				due = true
 			}
 		}
@@ -1803,9 +1818,6 @@ func (m *Monitor) syncDueUpstreamPricing(ctx context.Context) {
 			}
 			if costRecoveryDueAt > 0 && (nextDue == 0 || costRecoveryDueAt < nextDue) {
 				nextDue = costRecoveryDueAt
-			}
-			if economicsDueAt > 0 && (nextDue == 0 || economicsDueAt < nextDue) {
-				nextDue = economicsDueAt
 			}
 			candidates = append(candidates, upstreamPricingDueAccount{Domain: domain, NextDueAt: nextDue, LastAttemptAt: state.LastAttemptAt})
 		}

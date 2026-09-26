@@ -5,6 +5,50 @@ import vm from 'node:vm';
 
 const source = name => readFileSync(new URL(`../../monitor/${name}`, import.meta.url), 'utf8');
 
+test('upstream KPI scope notes wrap instead of hiding the internal-test basis',()=>{
+  const css=source('stability.css');
+  const rule=css.match(/\.cm-kpis article\.upstream span,\s*\.cm-kpis article\.adjusted span\s*\{([^}]+)\}/);
+  assert.ok(rule,'cost scope has a targeted wrapping rule');
+  for(const property of ['white-space:normal','overflow:visible','text-overflow:clip','overflow-wrap:anywhere']){
+    assert.ok(rule[1].includes(property),property);
+  }
+});
+
+function stabilityRangeFixture() {
+  const context=vm.createContext({URLSearchParams,window:{},syncRange(){}});
+  const js=source('stability.js');
+  const state=js.match(/^const st=.*$/m);
+  assert.ok(state,'stability initial state exists');
+  vm.runInContext(state[0],context);
+  for(const name of ['queryParams','applyNavigationContext']) {
+    const fn=js.match(new RegExp(`^function ${name}\\([^]*?^}`, 'm'));
+    assert.ok(fn,`${name} exists`);
+    vm.runInContext(fn[0],context);
+  }
+  return {context,...vm.runInContext('({st,queryParams,applyNavigationContext})',context)};
+}
+
+test('stability initially selects and requests the last 24 hours, not seven days',()=>{
+  const {queryParams}=stabilityRangeFixture();
+  assert.equal(queryParams().toString(),'hours=24');
+  const page=source('page.html');
+  assert.match(page,/<button type="button" class="active" data-stability-hours="24">/);
+  assert.doesNotMatch(page,/<button[^>]*class="active"[^>]*data-stability-days="7"/);
+});
+
+test('stability explicit navigation ranges still override the 24 hour default',()=>{
+  const {context,queryParams,applyNavigationContext}=stabilityRangeFixture();
+  context.window.monitorNavigationContext=()=>({days:7,group:'test-group'});
+  assert.equal(applyNavigationContext(),true);
+  assert.equal(queryParams().toString(),'days=7&group=test-group');
+  context.window.monitorNavigationContext=()=>({from:'2026-09-01',to:'2026-09-03'});
+  assert.equal(applyNavigationContext(),true);
+  assert.equal(queryParams().toString(),'from=2026-09-01&to=2026-09-03');
+  context.window.monitorNavigationContext=()=>({hours:24});
+  assert.equal(applyNavigationContext(),true);
+  assert.equal(queryParams().toString(),'hours=24');
+});
+
 test('upstream diagnostics renders safe instructions and tolerates missing checks',()=>{
   const {context,element}=dashboard();
   context.channelTest.renderUpstreamDiagnostic({provider:'tokenforce',confidence:'suspected',checks:[{name:'余额',status:'error',message:'<img src=x onerror=alert(1)>',action:'重新登录'}],instructions:['查找 orgId'],scope:'仅单页'});
@@ -129,15 +173,17 @@ test('governance has no fake zero before first snapshot and finance sits last in
   }
 });
 
-test('sync includes missing active accounts and explains unrepresentable daily windows',()=>{
+test('sync separates unconfigured accounts from failures and explains daily windows',()=>{
   const {context}=dashboard();
-  const rows=context.window.channelDataStatus.issues({meta:{data_coverage:{complete:true}},domains:[
+  const report={meta:{data_coverage:{complete:true}},domains:[
     {domain:'missing.example',enabled_channels:2,upstream:{configured:false}},
     {domain:'daily.example',upstream:{configured:true,balance_usd:20,usage_sync_enabled:true},upstream_usage:{available:false,integrity_status:'window_mismatch'}}
-  ]});
-  assert.equal(rows.length,2);assert.match(rows[0].detail,/2 个启用渠道未配置/);
-  assert.match(rows[1].detail,/自然日账单无法精确拆分/);
-  assert.doesNotMatch(rows[1].detail,/暂无消费账单/);
+  ]};
+  const rows=context.window.channelDataStatus.issues(report);
+  assert.equal(rows.length,1);
+  assert.match(rows[0].detail,/自然日账单无法精确拆分/);
+  assert.doesNotMatch(rows[0].detail,/暂无消费账单/);
+  assert.match(context.window.channelDataStatus.render(report),/1 个上游未配置，暂不采集，不作为同步故障/);
 });
 
 test('local model preview never masquerades as a production sampler failure or active sampling', () => {
@@ -372,6 +418,46 @@ test('upstreams default to name order with unconfigured inactive domains last', 
   assert.equal(cm.report.domains[0].sortAtEnd, undefined, 'source snapshot must remain unchanged');
 });
 
+test('channel management flattens RC26 type buckets and exposes actual channels directly', () => {
+  const {context} = dashboard(), api = context.channelTest;
+  const usage = {requests: 3, tokens: 30, cost_usd: 1.2};
+  const group = name => ({name, usage, finance: {}});
+  const domain = {key: 'domain:flat.example', domain: 'flat.example', configured: true,
+    usage: {requests: 6, tokens: 60, cost_usd: 2.4},
+    vendors: [
+      {name: '未标记', channels: [{id: 1, name: 'custom-one', current: true, status: 1, model_count: 2,
+        usage, configured_groups: ['codex'], groups: [group('codex')]}]},
+      {name: 'OpenAI', channels: [{id: 2, name: 'custom-two', current: true, status: 1, model_count: 3,
+        usage, configured_groups: ['claude'], groups: [group('claude')]}]},
+    ], rate_config: {managed_channels: 2, configured_channels: 0}, finance: {}, upstream: {}};
+  api.cm.report = {meta: {data_coverage: {complete: true}}, finance: {}, domains: [domain]};
+  api.cm.expandedDomains.add(domain.key);
+  const html = api.domainCard(domain, 0, domain.usage, false);
+  assert.match(html, /#1 custom-one/); assert.match(html, /#2 custom-two/);
+  assert.match(html, /codex/); assert.match(html, /claude/);
+  assert.doesNotMatch(html, /data-cm-vendor-toggle|<b>未标记<\/b>|<b>OpenAI<\/b>/);
+});
+
+test('retiring supplier remains visible with a reversible label and unchanged channel', () => {
+  const {context} = dashboard(), api = context.channelTest;
+  const domain = {key: 'domain:retiring.example', domain: 'retiring.example', configured: true, retiring: true,
+    usage: {requests: 2, tokens: 20, cost_usd: 1}, rate_config: {}, finance: {},
+    upstream: {configured: true, balance_usd: 20}, upstream_usage: {},
+    vendors: [{name: 'provider', channels: [{id: 81, name: 'remaining-balance', current: true, status: 1,
+      usage: {requests: 2}, groups: []}]}]};
+  api.cm.report = {finance: {can_edit: true}, domains: [domain]};
+  const retiring = api.domainCard(domain, 0, domain.usage, false);
+  assert.match(retiring, /cm-upstream-retiring[^>]*>停止使用/);
+  assert.match(retiring, /data-cm-retiring="domain:retiring\.example"[^>]*>取消停止使用/);
+  assert.match(retiring, /不再充值 · 余量消耗中/);
+  assert.match(retiring, /1 个启用/);
+  domain.retiring = false;
+  const restored = api.domainCard(domain, 0, domain.usage, false);
+  assert.doesNotMatch(restored, /cm-upstream-retiring/);
+  assert.match(restored, /标记停止使用/);
+  assert.match(restored, /1 个启用/);
+});
+
 test('filtering out a usable channel cannot reclassify its upstream as unused', () => {
   const {context} = dashboard();
   const api = context.channelTest;
@@ -521,10 +607,10 @@ test('daily bill stays visible after refresh with scope, never contaminates hour
     upstream:{configured:true,usage_sync_enabled:true,balance_usd:50,status:'ok',usage_status:'ok'},
     upstream_usage:{available:true,integrity_status:'window_mismatch',granularity:'day',cost_usd:0},
     natural_day_bill:{from_ts:1788624000,to_ts:1788776343,usage:{available:true,complete:true,cost_usd:770.3163,
-      adjusted_cost_available:true,adjusted_cost_usd:385.15815,recharge_ratio:2,integrity_status:'complete',data_until:1788776223}}};
+      adjusted_cost_available:true,adjusted_cost_usd:385.15815,recharge_ratio:2,integrity_status:'complete',data_until:1788776223,internal_filter_status:'not_configured'}}};
   const hourly={key:'hour',domain:'hour.example',configured:true,usage,vendors:[],
     upstream:{configured:true,usage_sync_enabled:true,balance_usd:20},
-    upstream_usage:{available:true,complete:true,cost_usd:10,adjusted_cost_available:true,adjusted_cost_usd:5}};
+    upstream_usage:{available:true,complete:true,cost_usd:10,adjusted_cost_available:true,adjusted_cost_usd:5,internal_filter_status:'not_configured'}};
   for(const [index,domain] of [daily,hourly].entries())domain.vendors=[{name:'vendor',channels:[{id:index+1,name:'channel',current:true,status:1,usage,groups:[]}]}];
   ui.cm.report={meta:{from:'2026-09-06',to:'2026-09-07',data_coverage:{complete:true}},summary:{usage},domains:[daily,hourly]};
   for(const amount of [770.3163,780.3163]){
@@ -532,7 +618,7 @@ test('daily bill stays visible after refresh with scope, never contaminates hour
     ui.render();
     assert.match(html('cmBody'),new RegExp('\\$'+amount.toFixed(2).replace('.','\\.')));
     assert.match(html('cmBody'),/\$385\.16/);
-    assert.match(html('cmBody'),/所涉自然日上游消费/);
+    assert.match(html('cmBody'),/所涉自然日上游账单消费/);
     assert.match(html('cmBody'),/18:17:03/);
     assert.match(html('cmBody'),/非所选小时区间金额/);
     assert.match(html('cmSummary'),/<b>\$10\.00<\/b>/);
@@ -560,6 +646,90 @@ test('Spring observed hourly amount is numeric with a quiet reconciliation note'
   assert.match(card,/\$12\.34/);
   assert.match(card,/日账单待核对/);
   assert.doesNotMatch(card,/所涉自然日上游消费/);
+});
+
+test('internal-account backfill keeps raw upstream amounts visible and clearly provisional',()=>{
+  const {context,html}=dashboard(),ui=context.channelTest;
+  const usage={requests:10,tokens:100,cost_usd:20};
+  const domain={key:'pending',domain:'pending.example',configured:true,usage,
+    vendors:[{name:'vendor',channels:[{id:1,name:'channel',current:true,status:1,usage,groups:[]}]}],
+    upstream:{configured:true,usage_sync_enabled:true,balance_usd:100,status:'ok',assessment:{available:true,status:'healthy',estimated_runway_days:5,
+      required_balance_usd:20,average_daily_cost_usd:20,lookback_days:7,threshold_days:1,coverage_pct:100}},
+    upstream_usage:{available:true,integrity_status:'complete',cost_usd:70,adjusted_cost_available:true,adjusted_cost_usd:35,
+      business_cost_available:false,business_adjusted_cost_available:false,business_cost_usd:0,business_adjusted_cost_usd:0,
+      internal_filter_status:'backfilling',recharge_ratio:2}};
+  const card=ui.domainCard(domain,0,usage,false);
+  assert.match(card,/\$70\.00/);
+  assert.match(card,/\$35\.00/);
+  assert.match(card,/上游账单消费/);
+  assert.match(card,/含内部测试用量/);
+  assert.doesNotMatch(card,/业务上游修正消费/);
+  assert.match(card,/按近 7 日原始账单日均 \$20\.00 估算/);
+  ui.cm.report={meta:{from:'2026-09-18',to:'2026-09-19',data_coverage:{complete:true}},summary:{usage},domains:[domain]};
+  ui.render();
+  assert.match(html('cmSummary'),/<b>\$70\.00<\/b>/);
+  assert.match(html('cmSummary'),/<b>\$35\.00<\/b>/);
+  assert.match(html('cmSummary'),/含内部测试/);
+});
+
+test('one unverified account selects raw basis for both totals and every visible card',()=>{
+  const {context,html}=dashboard(),ui=context.channelTest;
+  const make=(name,raw,net,complete)=>({key:name,domain:name,configured:true,usage:{requests:1,tokens:1,cost_usd:1},
+    vendors:[{name:'vendor',channels:[{id:name,name,current:true,status:1,usage:{requests:1,tokens:1,cost_usd:1},groups:[]}]}],
+    upstream:{configured:true,usage_sync_enabled:true},upstream_usage:{available:true,integrity_status:'complete',cost_usd:raw,
+      adjusted_cost_available:true,adjusted_cost_usd:raw/2,business_cost_available:complete,business_cost_usd:net,
+      business_adjusted_cost_available:complete,business_adjusted_cost_usd:net/2,internal_filter_status:complete?'complete':'backfilling'}});
+  const a=make('a.example',100,80,true),b=make('b.example',200,0,false);
+  ui.cm.report={meta:{from:'start',to:'end',data_coverage:{complete:true}},summary:{usage:{}},domains:[a,b]};
+  ui.render();
+  assert.match(html('cmSummary'),/<b>\$300\.00<\/b>/);
+  assert.match(html('cmSummary'),/<b>\$150\.00<\/b>/);
+  assert.doesNotMatch(html('cmSummary'),/\$280\.00|业务上游/);
+  // Inspect the actual list render, not an independently rendered single card.
+  assert.match(html('cmBody'),/<b>\$100\.00<\/b>/);
+  assert.doesNotMatch(html('cmBody'),/<b>\$80\.00<\/b>/);
+  b.upstream_usage.business_cost_available=true;b.upstream_usage.business_cost_usd=180;
+  b.upstream_usage.business_adjusted_cost_available=true;b.upstream_usage.business_adjusted_cost_usd=90;
+  b.upstream_usage.internal_filter_status='complete';
+  ui.render();
+  assert.match(html('cmSummary'),/<b>\$260\.00<\/b>/);
+  assert.match(html('cmSummary'),/已扣配置内部账号/);
+});
+
+test('cost display preserves zero, rejects invalid amounts and does not trust legacy net flags',()=>{
+  const {context}=dashboard(),ui=context.channelTest;
+  const domain={key:'a',domain:'a',configured:true,usage:{},vendors:[],upstream:{configured:true},
+    upstream_usage:{available:true,cost_usd:100,adjusted_cost_available:true,adjusted_cost_usd:50,
+      business_cost_available:true,business_cost_usd:80,business_adjusted_cost_available:true,business_adjusted_cost_usd:40}};
+  let card=ui.domainCard(domain,0,{},false);
+  assert.match(card,/<b>\$100\.00<\/b>/);assert.doesNotMatch(card,/<b>\$80\.00<\/b>/);
+  assert.match(card,/核验状态待确认/);
+  for(const value of [null,undefined,'',NaN,Infinity,-1]){
+    domain.upstream_usage.cost_usd=value;domain.upstream_usage.adjusted_cost_usd=value;
+    card=ui.domainCard(domain,0,{},false);
+    assert.match(card,/cm-domain-upstream-spend[^]*?<b>—<\/b>/);
+    assert.match(card,/cm-domain-upstream-adjusted[^]*?<b>—<\/b>/);
+  }
+  domain.upstream_usage.cost_usd=0;domain.upstream_usage.adjusted_cost_usd=0;
+  assert.match(ui.domainCard(domain,0,{},false),/cm-domain-upstream-spend[^]*?<b>\$0\.00<\/b>/);
+});
+
+test('sync reasons distinguish mixed costs from pending collection and respect selected range',()=>{
+  const {context}=dashboard(),quality=context.window.channelDataStatus;
+  const usage={available:true,complete:true,cost_usd:100,adjusted_cost_available:true,adjusted_cost_usd:50,
+    internal_filter_status:'backfilling',internal_filter_reasons:['mixed_usage','pairing_unverified','mixed_usage']};
+  const report={meta:{data_coverage:{complete:true}},internal_accounts:{enabled:true,status:'backfilling'},internal_scope_complete:true,
+    domains:[{domain:'a',upstream:{configured:true,balance_usd:10,usage_sync_enabled:true},upstream_usage:usage}]};
+  const rows=quality.issues(report);
+  assert.equal(rows.length,1);assert.equal(rows[0].scope,'a');
+  assert.match(rows[0].detail,/混合用量，暂不能精确拆分/);assert.match(rows[0].detail,/配对尚未核验/);
+  assert.doesNotMatch(rows[0].detail,/历史用量补齐中|补齐前/);
+  assert.equal(rows[0].detail.split('混合用量').length,2);
+  usage.internal_filter_reasons=['source_incomplete','ownership_unknown'];report.internal_scope_complete=false;
+  assert.equal(quality.issues(report).length,2);
+  assert.match(quality.issues(report)[1].detail,/历史上游归属/);
+  usage.internal_filter_reasons=['<img src=x onerror=alert(1)>'];
+  assert.doesNotMatch(quality.render(report),/<img/);
 });
 
 test('daily source projection does not bypass invalid money or missing recharge evidence',()=>{

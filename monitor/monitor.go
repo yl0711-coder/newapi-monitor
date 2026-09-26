@@ -53,6 +53,10 @@ type Monitor struct {
 	// 写锁把告警配置、渠道配置和其他 Monitor 页面一起拖垮。测试直接调用
 	// openStore 且未配置路径时仍可共用 storeDB，保持轻量构造兼容。
 	usageFactsDB *gorm.DB
+	// Only long-running finance fact reads use this optional, single-connection
+	// read-only WAL handle. It cannot write or consume the facts writer's pool.
+	financeFactsReadDB   atomic.Pointer[gorm.DB]
+	financeFactsReadOnce sync.Once
 	// nginxEvidenceDB 是短期、高基数的入口请求证据库。它与主库、用量事实库
 	// 分离；损坏、锁或满盘只会关闭 evidence lane，不影响现有 Monitor 页面。
 	nginxEvidenceDB *gorm.DB
@@ -187,6 +191,19 @@ type Monitor struct {
 	syncStatusMu       sync.Mutex
 	syncStatusCachedAt time.Time
 	syncStatusCached   *syncStatusSnapshot
+	// 经营核算会同时扫描多个月、每日明细和渠道证据。结果只来自本地已发布事实，
+	// 因此按日期区间做短时、有界缓存，避免同一小时内每次打开页面都重复扫描
+	// SQLite。缓存只保存序列化后的只读响应；手动刷新可以显式绕过。
+	financeReportCacheOnce sync.Once
+	financeReportCache     *boundedByteCache
+	financeReportFlight    cacheFlightGroup
+	// A moving source fingerprint must not spawn concurrent full-report scans
+	// while stale snapshots are being polled by multiple browsers.
+	financeReportRefreshRunning atomic.Bool
+	financeAsyncQueue           financeReportQueue
+	financeSnapshotWriteMu      sync.RWMutex
+	financePeriodCacheOnce      sync.Once
+	financePeriodCache          *boundedByteCache
 
 	usageGateOnce         sync.Once // 聚合/后台来源查询泳道，容量 1
 	usageGate             chan struct{}
@@ -289,6 +306,9 @@ type Monitor struct {
 	storeBackupSetVerified       atomic.Bool
 	usageFactsLoopHeartbeat      atomic.Int64
 	usageFactsRestarts           atomic.Int64
+	financeFactsWakeOnce         sync.Once
+	financeFactsWake             chan struct{}
+	financeFactsPreferInternal   atomic.Bool
 
 	usageCache *usageResultCache // 用量聚合结果的有界本机缓存，不连接 Redis
 	portalLim  *portalLimiter    // 客户端登录限流
@@ -973,6 +993,13 @@ func (m *Monitor) Close() {
 		}
 		m.investigationMu.Unlock()
 		m.investigationWG.Wait()
+		financeStopCtx, financeStopCancel := context.WithTimeout(context.Background(), financeReportBuildTimeout+5*time.Second)
+		financeStopped := m.financeAsyncQueue.shutdown(financeStopCtx)
+		financeStopCancel()
+		if !financeStopped {
+			slog.Error("经营核算任务未按时退出，保留数据库连接等待进程退出")
+			return
+		}
 		if !m.stopAndWaitSource() {
 			// 有缺陷的 worker 忽略 cancel 时，不关闭它仍可能读写的
 			// DB/HTTP 对象，也不释放 lease。容器将在 stop grace 内退出，
@@ -995,6 +1022,11 @@ func (m *Monitor) Close() {
 			_ = m.prodDB.Close()
 		}
 		if m.usageFactsDB != nil && m.usageFactsDB != m.storeDB {
+			if financeReader := m.financeFactsReadDB.Load(); financeReader != nil {
+				if readDB, err := financeReader.DB(); err == nil {
+					_ = readDB.Close()
+				}
+			}
 			if db, err := m.usageFactsDB.DB(); err == nil {
 				_ = db.Close()
 			}

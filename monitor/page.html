@@ -571,10 +571,10 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
   .tabs .tab.active{color:var(--text);border-bottom-color:var(--accent);font-weight:600}
   .tabpane[hidden]{display:none}
 </style>
-<link rel="stylesheet" href="/stability.css?v=13">
+<link rel="stylesheet" href="/stability.css?v=15">
 <link rel="stylesheet" href="/capacity.css?v=2">
 <link rel="stylesheet" href="/group-governance.css?v=1">
-<link rel="stylesheet" href="/finance.css?v=13">
+<link rel="stylesheet" href="/finance.css?v=14">
 <link rel="stylesheet" href="/model-statistics.css?v=2">
 </head>
 <body theme-mode="dark">
@@ -763,11 +763,11 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
     <div class="stability-toolbar">
       <div><h2>稳定性总览</h2><p>基于中转站历史日志还原请求稳定性；该口径不等同于用户侧最终感知。</p></div>
       <div class="stability-range">
-        <button type="button" data-stability-hours="24">近 24 小时</button>
+        <button type="button" class="active" data-stability-hours="24">近 24 小时</button>
         <button type="button" data-stability-preset="today">今天</button>
         <button type="button" data-stability-preset="yesterday">昨天</button>
         <button type="button" data-stability-preset="week">本周</button>
-        <button type="button" class="active" data-stability-days="7">近 7 天</button>
+        <button type="button" data-stability-days="7">近 7 天</button>
         <button type="button" data-stability-days="15">近 15 天</button>
         <button type="button" data-stability-days="30">近 30 天</button>
         <button type="button" data-stability-days="90">近 90 天</button>
@@ -849,10 +849,19 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
     <div class="fin-actions"><button class="fin-btn" id="finSinceLaunch" type="button">上线以来</button><button class="fin-btn" id="finLastMonth" type="button">上月</button><button class="fin-btn" id="finThisMonth" type="button">本月</button><label>开始日期<input id="finFrom" type="date"></label><label>结束日期<input id="finTo" type="date"></label><button class="fin-btn primary" id="finRefresh" type="button">刷新</button></div>
   </section>
   <div class="fin-status" id="finStatus"><i></i><div><b>尚未读取</b><br>进入页面后只读 Monitor 本地已发布事实。</div></div>
+  <details class="fin-internal-config" id="finInternalConfig">
+    <summary><span><b>内部测试账号</b><small>不计客户收入，且从可核验的业务上游成本中分离</small></span><em id="finInternalSummary">待读取</em></summary>
+    <div class="fin-internal-body">
+      <label for="finInternalAccounts">账号用户名或 user_id（多个用换行或逗号分隔）</label>
+      <textarea id="finInternalAccounts" rows="4" placeholder="例如：&#10;102&#10;internal-test"></textarea>
+      <div class="fin-internal-actions"><small id="finInternalState">配置只保存在 Monitor，不修改 NewAPI 账号或原始日志。</small><button class="fin-btn primary" id="finInternalSave" type="button">保存配置</button></div>
+    </div>
+  </details>
+  <div class="fin-report-content" id="finReportContent">
   <section class="fin-kpis">
     <article class="fin-kpi revenue"><small>平台计费消耗（已知）</small><b id="finConsumption">—</b><span id="finConsumptionNote">待读取</span></article>
     <article class="fin-kpi billed"><small>上游账单原值（对账参考）</small><b id="finBilled">—</b><span id="finBilledNote">待读取</span></article>
-    <article class="fin-kpi cost"><small>可核验上游成本（已知）</small><b id="finUpstream">—</b><span id="finUpstreamNote">待读取</span></article>
+    <article class="fin-kpi cost"><small>可核验业务上游成本（已知）</small><b id="finUpstream">—</b><span id="finUpstreamNote">待读取</span></article>
     <article class="fin-kpi profit"><small>已配对计费贡献（赠送前）</small><b id="finContribution">—</b><span id="finContributionNote">非最终经营毛利</span></article>
   </section>
   <section class="fin-decision" id="finDecision">
@@ -861,7 +870,7 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
   </section>
   <section class="fin-evidence" aria-label="核算证据覆盖">
     <article id="finUserEvidence"><small>用户用量小时覆盖</small><b>—</b><span>待读取</span></article>
-    <article id="finGiftEvidence"><small>注册赠送核算覆盖</small><b>—</b><span>待读取</span></article>
+    <article id="finGiftEvidence"><small>注册赠送核算状态</small><b>—</b><span>待读取</span></article>
     <article id="finBillEvidence"><small>上游账单覆盖</small><b>—</b><span>待读取</span></article>
     <article id="finCorrectionEvidence"><small>充值修正覆盖</small><b>—</b><span>待读取</span></article>
     <article id="finPairingEvidence"><small>收入成本同窗配对</small><b>—</b><span>待读取</span></article>
@@ -871,12 +880,16 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
     <header><div><h3>经营损益桥</h3><p>从平台计费消耗逐项调整为可发布经营毛利；缺少证据的项目保持空值</p></div><span>USD · 当前查询区间</span></header>
     <div class="fin-bridge">
       <div class="fin-bridge-row base"><span><b>平台净计费消耗</b><small>消费扣额减退还；内部测试已从用户口径分离</small></span><strong id="finBridgeConsumption">—</strong><em id="finBridgeConsumptionState">待读取</em></div>
+      <details class="fin-consumption-breakdown"><summary>查看扣款与退款明细</summary>
+        <div class="fin-bridge-row reference"><span><b>用户扣款总额</b><small>核验完整时对应同范围渠道管理的用户侧消费；未核验时仅列已知记录</small></span><strong id="finBridgeGross">—</strong><em id="finBridgeGrossState">待读取</em></div>
+        <div class="fin-bridge-row reference"><span><b>减：用户退款</b><small>与上述扣款相同统计范围；扣款减退款为净消费，不是最终收入</small></span><strong id="finBridgeRefund">—</strong><em id="finBridgeRefundState">待读取</em></div>
+      </details>
       <div class="fin-bridge-row deduction"><span><b>减：注册赠送实际消耗</b><small>只扣已识别赠送额度中被用户实际消耗的部分</small></span><strong id="finBridgeGift">—</strong><em id="finBridgeGiftState">未接入</em></div>
       <div class="fin-bridge-row subtotal"><span><b>可发布经营收入</b><small>不是充值额；赠送扣减完整后才能发布</small></span><strong id="finBridgeRevenue">—</strong><em id="finBridgeRevenueState">待核验</em></div>
-      <div class="fin-bridge-row deduction"><span><b>减：修正上游总成本</b><small>包含客户流量、内部测试及其它已识别的上游消耗</small></span><strong id="finBridgeUpstream">—</strong><em id="finBridgeUpstreamState">待读取</em></div>
-      <div class="fin-bridge-row reference"><span><b>其中：内部测试上游成本（已含）</b><small>该金额已包含在上游总成本中，仅作分析，不重复扣减</small></span><strong id="finBridgeInternalTestCost">—</strong><em id="finBridgeInternalTestCostState">待读取</em></div>
+      <div class="fin-bridge-row deduction"><span><b>减：修正上游总成本</b><small>包含内部测试实际支出；缺失成本不按零计算</small></span><strong id="finBridgeUpstream">—</strong><em id="finBridgeUpstreamState">待读取</em></div>
+      <div class="fin-bridge-row reference"><span><b>其中：内部测试上游成本</b><small>已包含在上游总成本中，不重复扣除；不计客户收入</small></span><strong id="finBridgeInternalTestCost">—</strong><em id="finBridgeInternalTestCostState">待读取</em></div>
       <div class="fin-bridge-row deduction"><span><b>减：AWS 基础设施成本</b><small>CUR 账单按 NexusAPI 资源和期间归集</small></span><strong id="finBridgeAWS">—</strong><em id="finBridgeAWSState">未接入</em></div>
-      <div class="fin-bridge-row total"><span><b>可发布经营毛利</b><small>经营收入减修正上游成本和 AWS 成本</small></span><strong id="finBridgeProfit">—</strong><em id="finBridgeProfitState">待核验</em></div>
+      <div class="fin-bridge-row total"><span><b>可发布经营毛利</b><small>经营收入减修正上游总成本（含内部测试）和 AWS 成本</small></span><strong id="finBridgeProfit">—</strong><em id="finBridgeProfitState">待核验</em></div>
     </div>
     <footer id="finBridgeFootnote">内部测试及其它未归属成本单独列示；混合流量不做比例估算，也不会静默计为 0。</footer>
   </article>
@@ -900,11 +913,12 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
   <details class="fin-disclosure">
     <summary><span><b>逐日事实与渠道归属证据</b><small>用于追溯某一天、某个上游的原始核算依据</small></span><em>展开查看明细</em></summary>
     <div class="fin-disclosure-body">
-      <article class="fin-card"><header><div><h3>每日经营事实</h3><p>按北京时间自然日展示；当日未闭合小时会单独标识</p></div></header><div class="fin-table-wrap fin-daily-wrap"><table class="fin-table fin-daily-table"><thead><tr><th>日期</th><th class="num">消费扣额</th><th class="num">退还额度</th><th class="num">净计费消耗</th><th class="num">注册赠送消耗</th><th class="num">经营收入</th><th class="num">内部测试用量</th><th class="num">内部测试上游成本</th><th class="num">AWS 成本</th><th class="num">已配对计费扣额</th><th class="num">已配对客户成本</th><th class="num">计费贡献（赠送前）</th><th>用量覆盖</th><th>配对证据</th><th>状态</th></tr></thead><tbody id="finDailyRows"><tr><td colspan="15" class="fin-empty">进入页面后加载</td></tr></tbody></table></div></article>
+      <article class="fin-card"><header><div><h3>每日经营事实</h3><p>按北京时间自然日展示。修正成本合计逐供应商与所属月核对，小字列出充值修正与账本回退来源，均含内部测试；对账通过不代表全部成本或利润已完整。</p></div></header><div class="fin-table-wrap fin-daily-wrap"><table class="fin-table fin-daily-table"><thead><tr><th>日期</th><th class="num">消费扣额</th><th class="num">退还额度</th><th class="num">净计费消耗</th><th class="num">注册赠送消耗</th><th class="num">经营收入</th><th class="num">上游账单原值</th><th class="num">修正成本合计（含内部）</th><th class="num">内部测试用量</th><th class="num">内部测试上游成本</th><th class="num">AWS 成本</th><th class="num">已配对计费扣额</th><th class="num">已配对客户成本</th><th class="num">计费贡献（赠送前）</th><th>用量覆盖</th><th>配对证据</th><th>状态</th></tr></thead><tbody id="finDailyRows"><tr><td colspan="17" class="fin-empty">进入页面后加载</td></tr></tbody></table></div></article>
       <article class="fin-card"><header><div><h3>上游成本与渠道归属明细</h3><p>“已配对”三项使用同一批不可变小时事实，可直接核对；账单状态、配对状态及安全准入步骤分别判断</p></div></header><div class="fin-table-wrap"><table class="fin-table fin-cost-table"><thead><tr><th>上游主域名</th><th class="num">用户请求</th><th class="num">净计费消耗</th><th class="num">上游请求</th><th class="num">账单原值</th><th class="num">修正成本</th><th class="num">已配对计费扣额</th><th class="num">已配对成本</th><th class="num">计费贡献（赠送前）</th><th>账单口径</th><th>修正依据</th><th>账单覆盖</th><th>账单状态</th><th>收入成本配对</th><th>成本闭环下一步</th></tr></thead><tbody id="finCostRows"><tr><td colspan="15" class="fin-empty">进入页面后加载</td></tr></tbody></table></div></article>
     </div>
   </details>
   <div class="fin-footnote" id="finFootnote">经营核算口径待读取。</div>
+  </div><!-- /finReportContent -->
 </div><!-- /tab-finance -->
 
 <div class="tabpane model-statistics-page" id="tab-model-statistics" hidden>
@@ -951,7 +965,7 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
   </div>
 
   <div class="cm-sortbar">
-    <div><b>排行口径</b><span>切换后主域名、厂商和实际渠道同步重排</span></div>
+    <div><b>排行口径</b><span>切换后主域名、服务分组和实际渠道同步重排</span></div>
     <div class="cm-sort-switch">
       <button type="button" class="active" data-cm-sort="name">名称 A–Z</button>
       <button type="button" data-cm-sort="cost">用户侧消费</button>
@@ -965,7 +979,6 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
   <div class="cm-filters" id="cmFilters">
     <label class="cm-search"><span>搜索</span><input id="cmSearch" type="search" placeholder="主域名、具体域名、渠道名或渠道 ID" autocomplete="off"></label>
     <label><span>主域名</span><select id="cmDomain"><option value="">全部主域名</option></select></label>
-    <label><span>厂商类型</span><select id="cmVendor"><option value="">全部厂商类型</option></select></label>
     <label><span>服务分组</span><select id="cmGroup"><option value="">全部服务分组</option></select></label>
     <label><span>状态</span><select id="cmStatus"><option value="">全部状态</option><option value="enabled">当前启用</option><option value="disabled">当前停用</option><option value="historical">历史渠道</option></select></label>
     <button type="button" class="cm-reset" id="cmReset">重置</button>
@@ -996,8 +1009,8 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
         <label><span>上游充值到账</span><input id="cmFinanceUpCredit" type="number" min="0.000001" step="0.0001" inputmode="decimal"><small>按实际到账额度填写</small></label>
       </section>
       <section class="cm-finance-groups" id="cmFinanceGlobalGroups" hidden>
-        <div class="cm-finance-group-title"><div><h3>网站分组倍率</h3><p>列出 NewAPI 中用户可选、特殊可用或当前用户/令牌实际使用的分组；仅在历史日志出现过的分组不会进入这里。</p><small id="cmFinanceGroupSource">尚未同步中转站分组</small></div><div class="cm-finance-group-actions"><span id="cmFinanceConfiguredCount"></span><button type="button" id="cmFinanceSyncGroups">一键同步 NewAPI 分组</button></div></div>
-        <div class="cm-finance-group-head"><span>服务分组</span><span>NewAPI 当前倍率</span><span>网站分组倍率</span></div>
+        <div class="cm-finance-group-title"><div><h3>网站分组倍率</h3><p>列出 NewAPI 中用户可选、特殊可用或当前用户/令牌实际使用的分组。取消“计入用户侧消费”后，该测试分组不在渠道管理中展示，也不计入请求数、Tokens 和用户侧消费；原始日志与历史数据仍保留。</p><small id="cmFinanceGroupSource">尚未同步中转站分组</small></div><div class="cm-finance-group-actions"><span id="cmFinanceConfiguredCount"></span><button type="button" id="cmFinanceSyncGroups">一键同步 NewAPI 分组</button></div></div>
+        <div class="cm-finance-group-head"><span>服务分组</span><span>NewAPI 当前倍率</span><span>网站分组倍率</span><span>渠道管理统计</span></div>
         <div id="cmFinanceGroupRows"></div>
       </section>
       <section class="cm-finance-domain-channels" id="cmFinanceDomainChannels" hidden>
@@ -1456,15 +1469,15 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
   </main>
 </div><!-- /monitor-shell -->
 
-<script src="/stability.js?v=5"></script>
-<script src="/channel-data-status.js?v=1"></script>
-<script src="/channel-management.js?v=13"></script>
+<script src="/stability.js?v=6"></script>
+<script src="/channel-data-status.js?v=2"></script>
+<script src="/channel-management.js?v=15"></script>
 <script src="/logchain.js?v=15"></script>
 <script src="/customer-health.js?v=3"></script>
 <script src="/alerts.js?v=1"></script>
 <script src="/capacity.js?v=2"></script>
 <script src="/group-governance.js?v=1"></script>
-<script src="/finance.js?v=36"></script>
+<script src="/finance.js?v=53"></script>
 <script src="/model-statistics.js?v=2"></script>
 <script src="/infra-assets.js?v=1"></script>
 <script src="/ecs-log-sources.js?v=1"></script>
@@ -2564,11 +2577,13 @@ function syncRenderCostClosure(report){
 function syncRenderFinanceFacts(report){
   const r=report||{},target=document.getElementById('syncFinanceFacts');
   const statusMap={disabled:'未启用',waiting:'等待首次同步',backfilling:'历史回填中',caught_up:'已追平',error:'同步受阻',source_changed:'来源版本已变更',start_changed:'核算起点已变更'};
-  const level=!r.enabled?'neutral':r.status==='caught_up'?'ok':(r.status==='error'||r.status==='source_changed'||r.status==='start_changed'?'bad':'warn');
+  const refresh=r.report_refresh||{};
+  const level=refresh.recent_failures?'bad':!r.enabled?'neutral':r.status==='caught_up'?'ok':(r.status==='error'||r.status==='source_changed'||r.status==='start_changed'?'bad':'warn');
   const expected=+r.expected_hours||0,completed=+r.completed_hours||0,percent=expected?Math.min(100,completed*100/expected):0;
   target.innerHTML=[
     syncKV('采集闸门',r.enabled?'已开启':'未启用',r.enabled?'只读来源库，顺序按小时回填':'不会访问 NewAPI 来源库'),
     syncKV('报表展示',r.report_enabled?'已开启':'未开放','采集与展示独立，可先补数验收再开放'),
+    syncKV('报表更新',refresh.enabled?`运行 ${fmtNum(refresh.running)} · 排队 ${fmtNum(refresh.pending)}`:'按原读取方式',refresh.recent_failures?`近 5 分钟更新失败 ${fmtNum(refresh.recent_failures)} 个区间，旧结果保留；详细原因见服务日志`:'报表更新与来源回填分别计数，更新不表示缺失账单已补齐'),
     syncKV('当前状态',statusMap[r.status]||r.status||'未知',r.failure_streak?`连续失败 ${fmtNum(r.failure_streak)} 次`:'游标只在整小时证据原子发布后前进'),
     syncKV('历史覆盖',expected?`${fmtNum(completed)}/${fmtNum(expected)} 小时 · ${percent.toFixed(1)}%`:'尚无应回填小时',`起点 ${syncTime(r.start_hour)} · 安全定稿至 ${syncTime(r.finalized_through)}`),
     syncKV('下一回填小时',syncTime(r.next_hour),r.last_completed_hour?`最近完成 ${syncTime(r.last_completed_hour)}`:'尚未完成首个小时'),

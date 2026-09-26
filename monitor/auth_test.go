@@ -2,9 +2,12 @@ package monitor
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -135,12 +138,23 @@ func TestNewapiAuth(t *testing.T) {
 
 func TestNewapiAuthRC26NestedUser(t *testing.T) {
 	selfCalled := false
+	type requestSnapshot struct {
+		Method        string
+		Path          string
+		Authorization string
+		UserAgent     string
+	}
+	revoked := make(chan requestSnapshot, 1)
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/user/login", func(w http.ResponseWriter, r *http.Request) {
+		if got := r.UserAgent(); got != newAPIAuthUserAgent {
+			t.Errorf("login User-Agent=%q", got)
+		}
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"success": true,
 			"data": map[string]any{
 				"access_token": "rc26-access-token",
+				"session":      map[string]any{"sid": "rc26-session-id"},
 				"user": map[string]any{
 					"username":     "root",
 					"display_name": "RC26 管理员",
@@ -153,6 +167,15 @@ func TestNewapiAuthRC26NestedUser(t *testing.T) {
 		selfCalled = true
 		w.WriteHeader(http.StatusUnauthorized)
 	})
+	mux.HandleFunc("/api/user/sessions/rc26-session-id", func(w http.ResponseWriter, r *http.Request) {
+		revoked <- requestSnapshot{
+			Method:        r.Method,
+			Path:          r.URL.Path,
+			Authorization: r.Header.Get("Authorization"),
+			UserAgent:     r.UserAgent(),
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"success": true})
+	})
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
 
@@ -164,14 +187,32 @@ func TestNewapiAuthRC26NestedUser(t *testing.T) {
 	if selfCalled {
 		t.Fatal("RC26 登录响应已带用户角色，不应再请求 /api/user/self")
 	}
+	select {
+	case got := <-revoked:
+		if got.Method != http.MethodDelete || got.Path != "/api/user/sessions/rc26-session-id" {
+			t.Fatalf("临时会话回收请求=%s %s", got.Method, got.Path)
+		}
+		if got.Authorization != "Bearer rc26-access-token" {
+			t.Fatalf("临时会话回收 Authorization=%q", got.Authorization)
+		}
+		if got.UserAgent != newAPIAuthUserAgent {
+			t.Fatalf("临时会话回收 User-Agent=%q", got.UserAgent)
+		}
+	default:
+		t.Fatal("RC26 登录成功后未回收本次临时会话")
+	}
 }
 
 func TestNewapiAuthBearerFallback(t *testing.T) {
+	var revokeCalls atomic.Int32
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/user/login", func(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"success": true,
-			"data":    map[string]any{"access_token": "fallback-access-token"},
+			"data": map[string]any{
+				"access_token": "fallback-access-token",
+				"session":      map[string]any{"sid": "fallback-session-id"},
+			},
 		})
 	})
 	mux.HandleFunc("/api/user/self", func(w http.ResponseWriter, r *http.Request) {
@@ -183,6 +224,13 @@ func TestNewapiAuthBearerFallback(t *testing.T) {
 			"data":    map[string]any{"username": "admin", "role": 10},
 		})
 	})
+	mux.HandleFunc("/api/user/sessions/fallback-session-id", func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != "Bearer fallback-access-token" {
+			t.Errorf("revoke Authorization=%q", got)
+		}
+		revokeCalls.Add(1)
+		_ = json.NewEncoder(w).Encode(map[string]any{"success": true})
+	})
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
 
@@ -190,6 +238,200 @@ func TestNewapiAuthBearerFallback(t *testing.T) {
 	role, name, err := m.newapiAuth("admin", "good")
 	if err != nil || role != 10 || name != "admin" {
 		t.Fatalf("Bearer fallback: role=%d name=%q err=%v", role, name, err)
+	}
+	if got := revokeCalls.Load(); got != 1 {
+		t.Fatalf("fallback 会话回收次数=%d", got)
+	}
+}
+
+func TestNewapiAuthRC26CleanupFailureDoesNotRejectValidLogin(t *testing.T) {
+	var revokeCalls atomic.Int32
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/user/login", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"success": true,
+			"data": map[string]any{
+				"access_token": "valid-access-token",
+				"session":      map[string]any{"sid": "temporary-session-id"},
+				"user":         map[string]any{"username": "root", "role": 100},
+			},
+		})
+	})
+	mux.HandleFunc("/api/user/sessions/temporary-session-id", func(w http.ResponseWriter, _ *http.Request) {
+		revokeCalls.Add(1)
+		http.Error(w, "temporary failure", http.StatusServiceUnavailable)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	m := &Monitor{cfg: Settings{NewAPIBaseURL: srv.URL}}
+	role, name, err := m.newapiAuth("root", "good")
+	if err != nil || role != 100 || name != "root" {
+		t.Fatalf("回收失败不应否定已校验的登录: role=%d name=%q err=%v", role, name, err)
+	}
+	if got := revokeCalls.Load(); got != 1 {
+		t.Fatalf("回收失败时不应自动重试，调用次数=%d", got)
+	}
+}
+
+func TestRevokeTemporaryNewAPISessionDoesNotExposeSIDOnTransportError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	base := srv.URL
+	srv.Close()
+
+	const sid = "secret-session-id-must-not-be-logged"
+	err := revokeTemporaryNewAPISession(&http.Client{Timeout: time.Second}, base, "secret-token", sid)
+	if err == nil {
+		t.Fatal("已关闭的服务端应返回传输错误")
+	}
+	if strings.Contains(err.Error(), sid) || strings.Contains(err.Error(), "secret-token") {
+		t.Fatalf("回收错误泄露了认证材料: %q", err)
+	}
+}
+
+func TestLoginFlowRC26UnauthorizedRoleStillRevokesTemporarySession(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	var revokeCalls atomic.Int32
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/user/login", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"success": true,
+			"data": map[string]any{
+				"access_token": "ordinary-user-token",
+				"session":      map[string]any{"sid": "ordinary-user-session"},
+				"user":         map[string]any{"username": "ordinary", "role": 1},
+			},
+		})
+	})
+	mux.HandleFunc("/api/user/sessions/ordinary-user-session", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodDelete || r.Header.Get("Authorization") != "Bearer ordinary-user-token" {
+			http.Error(w, "invalid revoke", http.StatusBadRequest)
+			return
+		}
+		revokeCalls.Add(1)
+		_ = json.NewEncoder(w).Encode(map[string]any{"success": true})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	m := &Monitor{cfg: Settings{NewAPIBaseURL: srv.URL, SessionSecret: "unauthorized-secret"}, chNames: map[string]string{}}
+	r := gin.New()
+	m.RegisterRoutes(r)
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/login", strings.NewReader(`{"username":"ordinary","password":"good"}`))
+	req.Header.Set("Content-Type", "application/json")
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("普通用户登录 Monitor 应返回 403，实际=%d", w.Code)
+	}
+	if got := revokeCalls.Load(); got != 1 {
+		t.Fatalf("无权用户的 NewAPI 临时会话也必须回收，实际=%d", got)
+	}
+	for _, cookie := range w.Result().Cookies() {
+		if cookie.Name == sessionCookie && cookie.Value != "" {
+			t.Fatal("无权用户不应获得 Monitor 会话")
+		}
+	}
+}
+
+func TestNewapiAuthRC4DoesNotCallSessionEndpoint(t *testing.T) {
+	var sessionCalls atomic.Int32
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/user/login", func(w http.ResponseWriter, r *http.Request) {
+		http.SetCookie(w, &http.Cookie{Name: "session", Value: "root", Path: "/"})
+		_ = json.NewEncoder(w).Encode(map[string]any{"success": true})
+	})
+	mux.HandleFunc("/api/user/self", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"success": true,
+			"data":    map[string]any{"username": "root", "role": 100},
+		})
+	})
+	mux.HandleFunc("/api/user/sessions/", func(w http.ResponseWriter, _ *http.Request) {
+		sessionCalls.Add(1)
+		http.Error(w, "unexpected", http.StatusInternalServerError)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	m := &Monitor{cfg: Settings{NewAPIBaseURL: srv.URL}}
+	role, name, err := m.newapiAuth("root", "good")
+	if err != nil || role != 100 || name != "root" {
+		t.Fatalf("RC4 登录: role=%d name=%q err=%v", role, name, err)
+	}
+	if got := sessionCalls.Load(); got != 0 {
+		t.Fatalf("RC4 不应调用会话回收接口，实际=%d", got)
+	}
+}
+
+func TestNewapiAuthRC26ConcurrentSessionsAreRevokedExactly(t *testing.T) {
+	const workers = 24
+	var issued atomic.Int64
+	var mu sync.Mutex
+	revoked := make(map[string]int, workers)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/user/login", func(w http.ResponseWriter, _ *http.Request) {
+		id := issued.Add(1)
+		sid := fmt.Sprintf("session-%d", id)
+		token := fmt.Sprintf("token-%d", id)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"success": true,
+			"data": map[string]any{
+				"access_token": token,
+				"session":      map[string]any{"sid": sid},
+				"user":         map[string]any{"username": "root", "role": 100},
+			},
+		})
+	})
+	mux.HandleFunc("/api/user/sessions/", func(w http.ResponseWriter, r *http.Request) {
+		sid := strings.TrimPrefix(r.URL.Path, "/api/user/sessions/")
+		wantToken := "Bearer " + strings.Replace(sid, "session-", "token-", 1)
+		if r.Method != http.MethodDelete || r.Header.Get("Authorization") != wantToken {
+			http.Error(w, "mismatched session", http.StatusBadRequest)
+			return
+		}
+		mu.Lock()
+		revoked[sid]++
+		mu.Unlock()
+		_ = json.NewEncoder(w).Encode(map[string]any{"success": true})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	m := &Monitor{cfg: Settings{NewAPIBaseURL: srv.URL}}
+	errCh := make(chan error, workers)
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			role, _, err := m.newapiAuth("root", "good")
+			if err != nil {
+				errCh <- fmt.Errorf("并发登录失败: %w", err)
+				return
+			}
+			if role != 100 {
+				errCh <- fmt.Errorf("并发登录角色=%d，期望=100", role)
+			}
+		}()
+	}
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		t.Error(err)
+	}
+	if got := issued.Load(); got != workers {
+		t.Fatalf("创建会话数=%d，期望=%d", got, workers)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(revoked) != workers {
+		t.Fatalf("精确回收会话数=%d，期望=%d", len(revoked), workers)
+	}
+	for sid, count := range revoked {
+		if count != 1 {
+			t.Errorf("会话 %s 回收次数=%d", sid, count)
+		}
 	}
 }
 

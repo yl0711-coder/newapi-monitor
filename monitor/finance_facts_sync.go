@@ -54,23 +54,24 @@ type financeHourSnapshot struct {
 }
 
 type syncFinanceStatus struct {
-	Enabled           bool    `json:"enabled"`
-	ReportEnabled     bool    `json:"report_enabled"`
-	Status            string  `json:"status"`
-	SourceEpoch       string  `json:"source_epoch,omitempty"`
-	StartHour         int64   `json:"start_hour"`
-	FinalizedThrough  int64   `json:"finalized_through"`
-	NextHour          int64   `json:"next_hour"`
-	LastCompletedHour int64   `json:"last_completed_hour"`
-	ExpectedHours     int64   `json:"expected_hours"`
-	CompletedHours    int64   `json:"completed_hours"`
-	ProgressPercent   float64 `json:"progress_percent"`
-	GiftRecipients    int64   `json:"gift_recipients"`
-	FailureStreak     int64   `json:"failure_streak"`
-	LastError         string  `json:"last_error,omitempty"`
-	LastAttemptAt     int64   `json:"last_attempt_at"`
-	LastSuccessAt     int64   `json:"last_success_at"`
-	UpdatedAt         int64   `json:"updated_at"`
+	ReportRefresh     financeReportQueueStats `json:"report_refresh"`
+	Enabled           bool                    `json:"enabled"`
+	ReportEnabled     bool                    `json:"report_enabled"`
+	Status            string                  `json:"status"`
+	SourceEpoch       string                  `json:"source_epoch,omitempty"`
+	StartHour         int64                   `json:"start_hour"`
+	FinalizedThrough  int64                   `json:"finalized_through"`
+	NextHour          int64                   `json:"next_hour"`
+	LastCompletedHour int64                   `json:"last_completed_hour"`
+	ExpectedHours     int64                   `json:"expected_hours"`
+	CompletedHours    int64                   `json:"completed_hours"`
+	ProgressPercent   float64                 `json:"progress_percent"`
+	GiftRecipients    int64                   `json:"gift_recipients"`
+	FailureStreak     int64                   `json:"failure_streak"`
+	LastError         string                  `json:"last_error,omitempty"`
+	LastAttemptAt     int64                   `json:"last_attempt_at"`
+	LastSuccessAt     int64                   `json:"last_success_at"`
+	UpdatedAt         int64                   `json:"updated_at"`
 }
 
 // FinanceFactBackfillResult is the bounded maintenance-command result. It
@@ -98,7 +99,7 @@ func (m *Monitor) financeFactPublishedThrough(ctx context.Context, startHour int
 	if m == nil || startHour < 0 || startHour%usageFactHourSeconds != 0 {
 		return startHour, errors.New("invalid finance fact publication boundary")
 	}
-	db := m.usageFactsStore()
+	db := m.financeFactsReadStore()
 	if db == nil {
 		return startHour, errors.New("finance facts store unavailable")
 	}
@@ -174,7 +175,8 @@ func (m *Monitor) financeFactsSyncEnabled() bool {
 // Reading it never claims a source lease, advances the cursor or queries
 // NewAPI.
 func (m *Monitor) financeFactSyncStatus(ctx context.Context, now time.Time) (syncFinanceStatus, error) {
-	status := syncFinanceStatus{Enabled: m.cfg.FinanceFactsSyncEnabled, ReportEnabled: m.cfg.FinanceEnabled}
+	status := syncFinanceStatus{Enabled: m.cfg.FinanceFactsSyncEnabled, ReportEnabled: m.cfg.FinanceEnabled, ReportRefresh: m.financeAsyncQueue.stats()}
+	status.ReportRefresh.Enabled = m.cfg.FinanceFastSnapshotEnabled
 	startDate := strings.TrimSpace(m.cfg.FinanceStartDate)
 	if startDate == "" {
 		startDate = "2026-05-01"
@@ -594,18 +596,60 @@ func (m *Monitor) populateFinanceFactBackfillEvidence(ctx context.Context, resul
 		Count(&result.BoundaryEvents).Error
 }
 
-// runFinanceFactsSync is intentionally single-hour and single-threaded. It
-// shares the usage source gate, so foreground diagnostics and existing facts
-// work remain higher priority than finance backfill.
+func (m *Monitor) financeFactsWakeChannel() <-chan struct{} {
+	m.financeFactsWakeOnce.Do(func() { m.financeFactsWake = make(chan struct{}, 1) })
+	return m.financeFactsWake
+}
+
+func (m *Monitor) notifyFinanceFactsSync() {
+	_ = m.financeFactsWakeChannel()
+	select {
+	case m.financeFactsWake <- struct{}{}:
+	default:
+	}
+}
+
+func (m *Monitor) waitFinanceFactsSync(ctx context.Context, delay time.Duration) bool {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-m.financeFactsWakeChannel():
+		return true
+	case <-timer.C:
+		return true
+	}
+}
+
+// runFinanceFactsSync is intentionally single-threaded and alternates the two
+// backfill lanes while both have work. A long main-ledger backlog therefore
+// cannot starve an internal-account configuration rebuild, and saving a new
+// account list wakes this worker immediately without increasing source-query
+// concurrency.
 func (m *Monitor) runFinanceFactsSync(ctx context.Context) {
 	for {
-		progressed, err := m.syncNextFinanceFactHour(ctx)
+		preferInternal := m.financeFactsPreferInternal.Load()
+		var progressed bool
+		var err error
+		if preferInternal {
+			progressed, err = m.syncNextFinanceInternalAccountBatch(ctx)
+			if err == nil && !progressed {
+				progressed, err = m.syncNextFinanceFactHour(ctx)
+			}
+		} else {
+			progressed, err = m.syncNextFinanceFactHour(ctx)
+			if err == nil && !progressed {
+				progressed, err = m.syncNextFinanceInternalAccountBatch(ctx)
+			}
+		}
+		m.financeFactsPreferInternal.Store(!preferInternal)
 		if ctx.Err() != nil {
 			return
 		}
 		delay := m.usageFactBackfillDelay()
 		if err != nil {
-			slog.Warn("经营核算事实同步暂停在当前小时", "err", err)
+			slog.Warn("经营核算事实同步暂停", "err", err)
 			delay = time.Minute
 		} else if !progressed {
 			delay = time.Duration(m.cfg.UsageFactsSyncMinutes) * time.Minute
@@ -613,7 +657,7 @@ func (m *Monitor) runFinanceFactsSync(ctx context.Context) {
 				delay = time.Minute
 			}
 		}
-		if !waitUsageFact(ctx, delay) {
+		if !m.waitFinanceFactsSync(ctx, delay) {
 			return
 		}
 	}

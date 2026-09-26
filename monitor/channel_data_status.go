@@ -10,7 +10,7 @@ import (
 )
 
 // This diagnostic projection shares the report's window and accounting checks,
-// but never loads channel/user dimensions or contacts a production source.
+// including internal-account attribution, without contacting a production source.
 type channelDataStatusDomain struct {
 	Domain              string                         `json:"domain"`
 	Upstream            ChannelUpstreamAccountView     `json:"upstream"`
@@ -21,8 +21,10 @@ type channelDataStatusDomain struct {
 }
 
 type channelDataStatusResponse struct {
-	Meta    ChannelManagementMeta     `json:"meta"`
-	Domains []channelDataStatusDomain `json:"domains"`
+	Meta                  ChannelManagementMeta     `json:"meta"`
+	Domains               []channelDataStatusDomain `json:"domains"`
+	InternalAccounts      financeInternalFactStatus `json:"internal_accounts"`
+	InternalScopeComplete bool                      `json:"internal_scope_complete"`
 }
 
 func (m *Monitor) buildChannelDataStatus(ctx context.Context, scope stabilityScope, now int64) (*channelDataStatusResponse, error) {
@@ -43,7 +45,19 @@ func (m *Monitor) buildChannelDataStatus(ctx context.Context, scope stabilitySco
 	if err != nil {
 		return nil, err
 	}
+	policies, err := loadChannelBusinessGroupPolicies(ctx, m.storeDB)
+	if err != nil {
+		return nil, err
+	}
+	internal, err := m.loadFinanceConfiguredInternalEvidence(ctx, scope, policies)
+	if err != nil {
+		return nil, err
+	}
+	if err := m.applyChannelInternalCostViews(ctx, scope, now, policies, internal, usage, naturalDayBills); err != nil {
+		return nil, err
+	}
 	result := &channelDataStatusResponse{
+		InternalAccounts: internal.SyncState, InternalScopeComplete: internal.Complete,
 		Meta: ChannelManagementMeta{FromTs: scope.FromTs, ToTs: scope.ToTs, GeneratedAt: now, TimeZone: "Asia/Shanghai",
 			DataCoverage: m.stabilityDataCoverage(ctx, scope.FromTs, scope.ToTs, now)},
 		Domains: make([]channelDataStatusDomain, 0, len(accounts)),

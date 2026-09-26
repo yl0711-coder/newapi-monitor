@@ -18,7 +18,7 @@ func financeGiftBoundarySource(t *testing.T) *sql.DB {
 	}
 	if _, err := db.Exec(`CREATE TABLE logs(
 		id INTEGER PRIMARY KEY,user_id INTEGER,created_at INTEGER,type INTEGER,quota INTEGER,
-		token_id INTEGER,token_name TEXT,request_id TEXT,content TEXT,other TEXT)`); err != nil {
+		token_id INTEGER,token_name TEXT,request_id TEXT,content TEXT,other TEXT, "group" TEXT DEFAULT '')`); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = db.Close() })
@@ -38,7 +38,7 @@ func TestFetchFinanceGiftBoundaryEventsKeepsOnlyMonetaryOrdering(t *testing.T) {
 		{5, 7, 3600, 2, 999_999, 1, "next-hour", "req-3", "next"},
 	}
 	for _, row := range rows {
-		if _, err := source.Exec(`INSERT INTO logs VALUES(?,?,?,?,?,?,?,?,?,?)`, row.id, row.user, row.at, row.kind, row.quota, row.token, row.tokenName, row.requestID, row.content, ""); err != nil {
+		if _, err := source.Exec(`INSERT INTO logs(id,user_id,created_at,type,quota,token_id,token_name,request_id,content,other) VALUES(?,?,?,?,?,?,?,?,?,?)`, row.id, row.user, row.at, row.kind, row.quota, row.token, row.tokenName, row.requestID, row.content, ""); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -50,7 +50,7 @@ func TestFetchFinanceGiftBoundaryEventsKeepsOnlyMonetaryOrdering(t *testing.T) {
 		t.Fatalf("events=%+v", events)
 	}
 	for _, event := range events {
-		if event.EvidenceHash == "" || event.SourceEpoch != "" || event.UserID != 7 {
+		if event.EvidenceHash == "" || event.SourceEpoch != "" || event.UserID != 7 || !event.GroupKnown {
 			t.Fatalf("normalized event=%+v", event)
 		}
 	}
@@ -59,6 +59,19 @@ func TestFetchFinanceGiftBoundaryEventsKeepsOnlyMonetaryOrdering(t *testing.T) {
 		if strings.Contains(strings.ToLower(selectList), forbidden) {
 			t.Fatalf("gift boundary query retains forbidden request data: %s", forbidden)
 		}
+	}
+}
+
+func TestFinanceGiftBoundaryGroupParticipatesInEvidenceHash(t *testing.T) {
+	event := FinanceGiftBoundaryEvent{SourceLogID: 1, UserID: 1, Kind: "usage", Quota: 500_000, Group: "test", GroupKnown: true}
+	before := financeGiftBoundaryEventHash(event)
+	event.Group = "business"
+	if before == financeGiftBoundaryEventHash(event) {
+		t.Fatal("group tampering did not invalidate evidence")
+	}
+	event.GroupKnown = false
+	if before == financeGiftBoundaryEventHash(event) {
+		t.Fatal("legacy/known scope ambiguity")
 	}
 }
 

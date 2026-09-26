@@ -1498,6 +1498,263 @@ func TestPricingLedgerProductionWorkerBudgetResumesAcrossRestart(t *testing.T) {
 	m2.Close()
 }
 
+func TestChannelCostDirtyRecoveryResumesAfterTwentyPages(t *testing.T) {
+	hour := time.Now().Unix()
+	hour = hour - hour%3600 - 7200
+	rows := usageFixtureRows(4500, hour, 3600)
+	for i := range rows {
+		rows[i].Group = "codex-1.2x"
+		rows[i].ModelName = "gpt-5.5"
+		rows[i].TokenID = 75
+		rows[i].Other = map[string]any{"group_ratio": 1.2, "billing_mode": "token"}
+	}
+	server, calls := newUpstreamUsageFixtureServer(t, rows, nil)
+	m := openRestartablePricingTestMonitor(t, t.TempDir()+"/cost-dirty-budget.db")
+	defer m.Close()
+	account := ChannelUpstreamAccount{
+		Domain: server.Listener.Addr().String(), Provider: upstreamProviderNewAPI,
+		BaseURL: server.URL, Account: "31", UserID: 31, BalanceUnit: 500000,
+		Enabled: true, UsageSyncEnabled: true,
+	}
+	m.cfg.UpstreamUsageSyncEnabled = true
+	m.cfg.UpstreamPricingLedgerEnabled = true
+	m.cfg.UpstreamPricingLedgerDomains = []string{account.Domain}
+	m.cfg.ChannelCostClosureEnabled = true
+	m.cfg.ChannelCostClosureDomains = []string{account.Domain}
+	m.cfg.ChannelCostHMACKey = "0123456789abcdef0123456789abcdef"
+	m.cfg.ChannelCostHMACKeyID = "cost-source-v1"
+	if err := m.persistSyncedUpstreamAccount(context.Background(), &account, newAPICredential{AccessToken: "usage-token"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.storeDB.Create(&ChannelUpstreamUsageHour{Domain: account.Domain, HourTs: hour, BucketSeconds: 3600, Provider: account.Provider,
+		Requests: 4500, Tokens: 13500, Quota: 2250000000, CostUSD: 4500}).Error; err != nil {
+		t.Fatal(err)
+	}
+	epoch := newAPIUpstreamAccountEpoch(account)
+	if err := m.storeDB.Create(&ChannelUpstreamPricingHourState{Domain: account.Domain, AccountEpoch: epoch, HourTs: hour,
+		SemanticsVersion: upstreamPricingSemanticsVersion, Status: "verified", ReconcileStatus: "matched", FinalQuota: 2250000000}).Error; err != nil {
+		t.Fatal(err)
+	}
+	state := newPricingSyncState(account, time.Now().Unix(), 1)
+	state.BackfillDone = true
+	state.BackfillNextHour = state.BackfillTargetHour
+	state.TailNextSyncAt = time.Now().Unix() + 3600
+	if err := m.storeDB.Create(&state).Error; err != nil {
+		t.Fatal(err)
+	}
+	if _, _, progress, complete, err := m.fetchNewAPIPricingHour(context.Background(), account, newAPICredential{AccessToken: "usage-token"}, hour,
+		newUpstreamUsageRequestPacer(20, 0), time.Now().Unix()); err != nil || complete || progress == "" {
+		t.Fatalf("expected bounded initial checkpoint: complete=%v progress=%q err=%v", complete, progress, err)
+	}
+	if err := m.markChannelCostDirtyHour(context.Background(), account, hour, "missing_cost", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.storeDB.Model(&ChannelCostDirtyHour{}).Where("domain = ? AND hour_ts = ?", account.Domain, hour).Update("attempts", 500).Error; err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.syncStoredNewAPIPricing(context.Background(), account.Domain); err != nil {
+		t.Fatal(err)
+	}
+	var checkpoint ChannelUpstreamPricingPageCheckpoint
+	if err := m.storeDB.First(&checkpoint, "domain = ? AND hour_ts = ?", account.Domain, hour).Error; err != nil || checkpoint.NextPage != 40 {
+		t.Fatalf("second bounded turn lost page progress: %+v err=%v", checkpoint, err)
+	}
+	var dirty ChannelCostDirtyHour
+	if err := m.storeDB.First(&dirty, "domain = ? AND hour_ts = ?", account.Domain, hour).Error; err != nil || dirty.Attempts != 0 || dirty.NextAttemptAt > time.Now().Unix()+61 {
+		t.Fatalf("normal page yield retained old failure backoff: %+v err=%v", dirty, err)
+	}
+	if err := m.storeDB.Model(&ChannelCostDirtyHour{}).Where("domain = ? AND hour_ts = ?", account.Domain, hour).Update("next_attempt_at", 0).Error; err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.syncStoredNewAPIPricing(context.Background(), account.Domain); err != nil {
+		t.Fatal(err)
+	}
+	if calls.Load() != 47 {
+		t.Fatalf("recovery restarted from page one: upstream requests=%d, want 47", calls.Load())
+	}
+	var costState ChannelUpstreamCostHourState
+	if err := m.storeDB.First(&costState, "domain = ? AND hour_ts = ?", account.Domain, hour).Error; err != nil {
+		t.Fatal(err)
+	}
+	if costState.Requests != 4500 || costState.EvidenceChargeUnits != 2250000000 || costState.ReconcileStatus != "matched" {
+		t.Fatalf("resumed cost hour=%+v", costState)
+	}
+}
+
+func TestPricingFirstPageBudgetYieldIsNotFailure(t *testing.T) {
+	m := openRestartablePricingTestMonitor(t, t.TempDir()+"/first-page-budget.db")
+	defer m.Close()
+	account := ChannelUpstreamAccount{Domain: "budget.example", Provider: upstreamProviderNewAPI, BaseURL: "http://127.0.0.1:1", UserID: 31}
+	pacer := newUpstreamUsageRequestPacer(upstreamPricingMaxRequestsPerRun, 0)
+	pacer.calls = upstreamPricingMaxRequestsPerRun
+	hour := time.Now().Unix()/3600*3600 - 7200
+	_, _, progress, complete, err := m.fetchNewAPIPricingHour(context.Background(), account, newAPICredential{}, hour, pacer, time.Now().Unix())
+	if err != nil || complete || progress == "" || pacer.calls != upstreamPricingMaxRequestsPerRun {
+		t.Fatalf("first-page budget yield became a failure: complete=%v progress=%q calls=%d err=%v", complete, progress, pacer.calls, err)
+	}
+}
+
+func TestChannelCostRecoveryFirstPageYieldsAfterSharedTwentyRequestBudget(t *testing.T) {
+	now := time.Now().Unix()
+	closedThrough := now - now%3600
+	tailHour, recoveryHour := closedThrough-3600, closedThrough-4*3600
+	rows := usageFixtureRows(1901, tailHour, 3600)
+	for i := range rows {
+		rows[i].Group, rows[i].ModelName, rows[i].TokenID = "codex-1.2x", "gpt-5.5", 75
+		rows[i].Other = map[string]any{"group_ratio": 1.2, "billing_mode": "token"}
+	}
+	server, calls := newUpstreamUsageFixtureServer(t, rows, nil)
+	m := openRestartablePricingTestMonitor(t, t.TempDir()+"/shared-budget.db")
+	defer m.Close()
+	account := ChannelUpstreamAccount{Domain: server.Listener.Addr().String(), Provider: upstreamProviderNewAPI,
+		BaseURL: server.URL, Account: "31", UserID: 31, BalanceUnit: 500000, Enabled: true, UsageSyncEnabled: true}
+	m.cfg.UpstreamUsageSyncEnabled = true
+	m.cfg.UpstreamPricingLedgerEnabled = true
+	m.cfg.UpstreamPricingLedgerDomains = []string{account.Domain}
+	m.cfg.ChannelCostHMACKey = "0123456789abcdef0123456789abcdef"
+	m.cfg.ChannelCostHMACKeyID = "cost-source-v1"
+	if err := m.persistSyncedUpstreamAccount(context.Background(), &account, newAPICredential{AccessToken: "usage-token"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.storeDB.Create(&ChannelUpstreamUsageHour{Domain: account.Domain, HourTs: tailHour, BucketSeconds: 3600,
+		Provider: account.Provider, Requests: 1901, Tokens: 5703, Quota: 950500000, CostUSD: 1901}).Error; err != nil {
+		t.Fatal(err)
+	}
+	// Seed one complete pricing observation. A dense 20-page hour needs one
+	// additional first-page probe on its first scan, then a durable first-page
+	// checkpoint makes the verification scan consume exactly 20 requests.
+	evidence, state, _, complete, err := m.fetchNewAPIPricingHour(context.Background(), account,
+		newAPICredential{AccessToken: "usage-token"}, tailHour, newUpstreamUsageRequestPacer(21, 0), now)
+	if err != nil || !complete {
+		t.Fatalf("seed pricing observation: complete=%v err=%v", complete, err)
+	}
+	if err := m.persistNewAPIPricingHour(context.Background(), account, tailHour, evidence, state, now); err != nil {
+		t.Fatal(err)
+	}
+	m.cfg.ChannelCostClosureEnabled = true
+	m.cfg.ChannelCostClosureDomains = []string{account.Domain}
+	if _, _, progress, complete, err := m.fetchNewAPIPricingHour(context.Background(), account,
+		newAPICredential{AccessToken: "usage-token"}, tailHour, newUpstreamUsageRequestPacer(1, 0), now); err != nil || complete || progress == "" {
+		t.Fatalf("seed paired page-one checkpoint: complete=%v progress=%q err=%v", complete, progress, err)
+	}
+	epoch := newAPIUpstreamAccountEpoch(account)
+	if err := m.storeDB.Create(&ChannelUpstreamPricingHourState{Domain: account.Domain, AccountEpoch: epoch,
+		HourTs: recoveryHour, SemanticsVersion: upstreamPricingSemanticsVersion, Status: "verified", ReconcileStatus: "matched"}).Error; err != nil {
+		t.Fatal(err)
+	}
+	syncState := newPricingSyncState(account, now, 1)
+	// Keep the archive cursor complete if this paced fixture crosses an hour
+	// boundary before syncStoredNewAPIPricing reads the wall clock again.
+	syncState.BackfillTargetHour = closedThrough + 3600
+	syncState.BackfillDone = true
+	syncState.BackfillNextHour = syncState.BackfillTargetHour
+	if err := m.storeDB.Create(&syncState).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := m.markChannelCostDirtyHour(context.Background(), account, recoveryHour, "missing_cost", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.storeDB.Model(&ChannelCostDirtyHour{}).Where("domain = ? AND hour_ts = ?", account.Domain, recoveryHour).
+		Update("attempts", 500).Error; err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.syncStoredNewAPIPricing(context.Background(), account.Domain); err != nil {
+		t.Fatal(err)
+	}
+	if calls.Load() != 42 {
+		t.Fatalf("shared budget must prevent the recovery page-one request: calls=%d want=42", calls.Load())
+	}
+	var dirty ChannelCostDirtyHour
+	if err := m.storeDB.First(&dirty, "domain = ? AND hour_ts = ?", account.Domain, recoveryHour).Error; err != nil {
+		t.Fatal(err)
+	}
+	if dirty.Attempts != 0 || dirty.LastError != "" || dirty.NextAttemptAt > time.Now().Unix()+61 {
+		t.Fatalf("budget yield retained failure backoff: %+v", dirty)
+	}
+	var tail ChannelUpstreamPricingHourState
+	if err := m.storeDB.First(&tail, "domain = ? AND hour_ts = ?", account.Domain, tailHour).Error; err != nil || tail.Status != "verified" || tail.ReconcileStatus != "matched" {
+		t.Fatalf("tail verification did not complete before recovery: %+v err=%v", tail, err)
+	}
+}
+
+func TestChannelCostRecoveryDoesNotMaskShadowFailureAsProgress(t *testing.T) {
+	for _, count := range []int{1, 4500} {
+		name := "complete"
+		if count > upstreamPricingMaxRequestsPerRun*upstreamUsagePageSize {
+			name = "partial"
+		}
+		t.Run(name, func(t *testing.T) {
+			hour := time.Now().Unix()
+			hour = hour - hour%3600 - 7200
+			rows := usageFixtureRows(count, hour, 3600)
+			for i := range rows {
+				rows[i].Group, rows[i].ModelName, rows[i].TokenID = "codex-1.2x", "gpt-5.5", 75
+				rows[i].Other = map[string]any{"group_ratio": 1.2, "billing_mode": "token"}
+			}
+			server, _ := newUpstreamUsageFixtureServer(t, rows, nil)
+			m := openRestartablePricingTestMonitor(t, t.TempDir()+"/shadow-failure.db")
+			defer m.Close()
+			account := ChannelUpstreamAccount{Domain: server.Listener.Addr().String(), Provider: upstreamProviderNewAPI,
+				BaseURL: server.URL, Account: "31", UserID: 31, BalanceUnit: 500000, Enabled: true, UsageSyncEnabled: true}
+			m.cfg.UpstreamUsageSyncEnabled = true
+			m.cfg.UpstreamPricingLedgerEnabled = true
+			m.cfg.UpstreamPricingLedgerDomains = []string{account.Domain}
+			m.cfg.ChannelCostClosureEnabled = true
+			m.cfg.ChannelCostClosureDomains = []string{account.Domain}
+			m.cfg.ChannelCostHMACKey = "0123456789abcdef0123456789abcdef"
+			// A failed shadow capture must not be treated as normal progress just
+			// because an older observed cost state still exists.
+			m.cfg.ChannelCostHMACKeyID = ""
+			if err := m.persistSyncedUpstreamAccount(context.Background(), &account, newAPICredential{AccessToken: "usage-token"}); err != nil {
+				t.Fatal(err)
+			}
+			if err := m.storeDB.Create(&ChannelUpstreamUsageHour{Domain: account.Domain, HourTs: hour, BucketSeconds: 3600,
+				Provider: account.Provider, Requests: int64(count), Tokens: int64(count) * 3,
+				Quota: float64(count) * 500000, CostUSD: float64(count)}).Error; err != nil {
+				t.Fatal(err)
+			}
+			epoch := newAPIUpstreamAccountEpoch(account)
+			if err := m.storeDB.Create(&ChannelUpstreamPricingHourState{Domain: account.Domain, AccountEpoch: epoch, HourTs: hour,
+				SemanticsVersion: upstreamPricingSemanticsVersion, Status: "verified", ReconcileStatus: "matched", FinalQuota: int64(count) * 500000}).Error; err != nil {
+				t.Fatal(err)
+			}
+			if err := m.storeDB.Create(&ChannelUpstreamCostHourState{Domain: account.Domain, AccountEpoch: epoch, HourTs: hour,
+				SemanticsVersion: channelCostEvidenceSemanticsVersion, Status: "observed", ReconcileStatus: "matched"}).Error; err != nil {
+				t.Fatal(err)
+			}
+			state := newPricingSyncState(account, time.Now().Unix(), 1)
+			state.BackfillDone = true
+			state.BackfillNextHour = state.BackfillTargetHour
+			state.TailNextSyncAt = time.Now().Unix() + 3600
+			if err := m.storeDB.Create(&state).Error; err != nil {
+				t.Fatal(err)
+			}
+			if err := m.markChannelCostDirtyHour(context.Background(), account, hour, "missing_cost", nil); err != nil {
+				t.Fatal(err)
+			}
+			if err := m.storeDB.Model(&ChannelCostDirtyHour{}).Where("domain = ? AND hour_ts = ?", account.Domain, hour).Update("attempts", 500).Error; err != nil {
+				t.Fatal(err)
+			}
+			if _, err := m.syncStoredNewAPIPricing(context.Background(), account.Domain); err != nil {
+				t.Fatal(err)
+			}
+			var dirty ChannelCostDirtyHour
+			if err := m.storeDB.First(&dirty, "domain = ? AND hour_ts = ?", account.Domain, hour).Error; err != nil {
+				t.Fatal(err)
+			}
+			if dirty.Attempts <= 500 || dirty.LastError == "" || dirty.NextAttemptAt <= time.Now().Unix()+60 {
+				t.Fatalf("shadow failure was treated as normal progress: %+v", dirty)
+			}
+			if name == "partial" {
+				var checkpoint ChannelUpstreamPricingPageCheckpoint
+				if err := m.storeDB.First(&checkpoint, "domain = ? AND hour_ts = ?", account.Domain, hour).Error; err != nil || checkpoint.NextPage != 21 {
+					t.Fatalf("pricing partial cursor did not survive shadow failure: %+v err=%v", checkpoint, err)
+				}
+			}
+		})
+	}
+}
+
 func TestPricingLedgerDenseCheckpointContinuesAfterPairedStoreRestore(t *testing.T) {
 	hour := time.Now().Unix()
 	hour = hour - hour%3600 - 3600

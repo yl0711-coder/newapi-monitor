@@ -1,7 +1,11 @@
 (function () {
   'use strict';
 
-  const state = { inited: false, loaded: false, abort: null, chart: null };
+  const state = {
+    inited: false, loaded: false, abort: null, chart: null,
+    stale: false, refreshTimer: null, refreshAttempts: 0,
+    pending: false, requestSequence: 0, renderedQuery: null, updateState: '', refreshFailures: 0,
+  };
   const $ = (id) => document.getElementById(id);
   const esc = (value) => String(value == null ? '' : value).replace(/[&<>"']/g, (char) => ({
     '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
@@ -9,14 +13,14 @@
   const statusText = {
     verified: '已核验', incomplete: '覆盖不完整', no_data: '暂无数据',
     paired_verified: '配对已核验', partially_paired: '部分配对',
-    binding_required: '待完成来源归属', not_enrolled: '未进入配对账本',
+    binding_required: '待完成来源归属', not_enrolled: '未进入配对账本', not_required: '暂不纳入',
     in_progress: '闭环进行中', bill_not_connected: '账单未接入',
     bill_missing: '账单证据缺失', correction_missing: '缺修正依据', source_binding_required: '成本来源待归属',
     cost_evidence_missing: '成本证据未采集', cost_evidence_incomplete: '成本证据未补齐', finance_history_missing: '历史财务版本缺失', ledger_backfill_required: '待试算配对账本',
     local_estimate_ready: '可闭合的本地估算', pricing_evidence_only: '仅倍率/费用证据', adapter_probe_required: '需适配器探测', range_exceeds_limit: '超过安全历史范围',
     account_missing: '账户配置缺失', account_disabled: '账户同步未启用', no_local_activity: '无本地活动依据', granularity_unsupported: '粒度不兼容', estimate_unavailable: '暂无估算',
     precheck_required: '待灰度前核对',
-    not_connected: '未接入', disabled: '未开启',
+    not_connected: '未接入', not_configured: '未配置（不纳入）', disabled: '未开启',
   };
   const curProductNames = {
     AmazonECS: 'ECS / Fargate', AmazonRDS: 'RDS', AmazonCloudFront: 'CloudFront',
@@ -43,7 +47,11 @@
     }
   }
 
-  const chartValue = (value) => value?.micro_usd != null ? Number(value.micro_usd) / 1000000 : null;
+  function chartValue(value) {
+    if (!value || value.micro_usd == null || value.micro_usd === '') return null;
+    const numeric = Number(value.micro_usd);
+    return Number.isFinite(numeric) ? numeric / 1000000 : null;
+  }
   const date = (ts) => ts ? new Date(ts * 1000).toLocaleDateString('zh-CN', { timeZone: 'Asia/Shanghai' }) : '—';
   const dateTime = (ts) => ts ? new Date(ts * 1000).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false }) : '—';
 
@@ -57,7 +65,9 @@
     const relevant = Number(value?.relevant_domains || 0);
     const available = Number(value?.available_domains || 0);
     const corrected = Number(value?.corrected_domains || 0);
-    return relevant ? `账单 ${available}/${relevant}·修正 ${corrected}/${relevant}` : '—';
+    const unconfigured = Number(value?.unconfigured_domains || 0);
+    const configured = relevant ? `账单 ${available}/${relevant}·修正 ${corrected}/${relevant}` : '无已配置上游';
+    return unconfigured ? `${configured}·${unconfigured} 个未配置暂不纳入` : configured;
   }
 
   function domainHourCoverage(row) {
@@ -106,6 +116,16 @@
     return '—';
   }
 
+  function internalCostDeductionNote(statement) {
+    return statement?.internal_cost_deduction_status
+      ? '内部测试成本与已取得的上游成本尚未对齐；原成本保留，扣减后金额暂不发布'
+      : '';
+  }
+
+  function grossCorrectedCost(statement) {
+    return statement?.raw_corrected_upstream_cost || statement?.known_raw_corrected_upstream_cost || null;
+  }
+
   function setMoney(id, exact, known, exactNote, partialNote, missingNote) {
     const element = $(id);
     if (!element) return;
@@ -149,13 +169,15 @@
     element.classList.add(complete ? 'ready' : percent == null ? 'missing' : 'warn');
     const amount = element.querySelector('b');
     const note = element.querySelector('span');
-    if (amount) amount.textContent = percent == null ? '—' : `${percent.toFixed(1)}%`;
+    // Hour coverage alone does not prove gift allocation and historical scope are complete.
+    if (amount) amount.textContent = complete ? '已完成' : percent == null ? '—' : '待补齐';
     if (note) {
       const giftUsers = Number(value?.gift_users || 0);
       const sequence = boundaryExpected > 0 ? ` · 顺序 ${boundaryCompleted}/${boundaryExpected}` : '';
       const pending = value?.latest_hour_pending ? ' · 当前小时待闭合' : '';
+      const scopePending = Number(value?.scope_unknown_events || 0) > 0 ? ` · ${Number(value.scope_unknown_events)} 条历史分组依据待补` : '';
       note.textContent = expected > 0
-        ? `${completed}/${expected} 小时 · 赠送用户 ${giftUsers}${sequence}${pending}`
+        ? `小时覆盖 ${percent.toFixed(1)}% · ${completed}/${expected} 小时 · 赠送用户 ${giftUsers}${sequence}${pending}${scopePending}`
         : '当前区间没有可核验证据';
     }
   }
@@ -185,7 +207,7 @@
     if (!hasMoney(statement.operating_revenue)) {
       blockers.push(data.gift_coverage?.complete === true ? '经营收入未发布' : '注册赠送消耗证据未闭合');
     }
-    if (!hasMoney(statement.corrected_upstream_cost)) {
+    if (!hasMoney(statement.raw_corrected_upstream_cost)) {
       const coverage = data.upstream_coverage || {};
       const relevant = Number(coverage.relevant_domains || 0);
       const available = Number(coverage.available_domains || 0);
@@ -193,9 +215,11 @@
       const details = Array.isArray(data.cost_details) ? data.cost_details : [];
       const billMissing = details.filter((row) => row.closure_readiness === 'bill_not_connected' || row.closure_readiness === 'bill_missing').length;
       const correctionMissing = details.filter((row) => row.closure_readiness === 'correction_missing').length;
+      const unconfigured = Number(coverage.unconfigured_domains || 0);
       const reasons = [];
       if (billMissing) reasons.push(`${billMissing} 个上游账单未接入/缺失`);
       if (correctionMissing) reasons.push(`${correctionMissing} 个缺历史充值修正依据`);
+      if (unconfigured) reasons.push(`${unconfigured} 个未配置来源暂不纳入正式毛利`);
       const coverageText = relevant ? `账单 ${available}/${relevant}、修正 ${corrected}/${relevant}` : '无可核验上游';
       blockers.push(`修正上游总成本未闭合（${coverageText}${reasons.length ? `；${reasons.join('、')}` : ''}）`);
     }
@@ -268,13 +292,20 @@
   }
 
   function renderProfitBridge(data, statement) {
+    // Gross/refund fields are known amounts, not proof of complete coverage.
+    // The backend's publishable net consumption supplies the completeness gate.
+    const consumptionComplete=hasMoney(statement.user_consumption);
+    for(const [id,field] of [['finBridgeGross','gross_user_consumption'],['finBridgeRefund','user_refunds']]) {
+      setBridgeValue(id,consumptionComplete?statement[field]:null,statement[field],
+        '完整','已知部分','无可核验金额');
+    }
     setBridgeValue('finBridgeConsumption', statement.user_consumption, statement.known_user_consumption,
       '完整', '已知部分', '无可核验用量');
     setBridgeValue('finBridgeGift', statement.registration_gift_consumption, statement.known_registration_gift_consumption,
       '完整', '已知部分', '覆盖待补齐');
     setBridgeValue('finBridgeRevenue', statement.operating_revenue, statement.known_operating_revenue,
       '可发布', '仅已知部分', '待赠送扣减');
-    setBridgeValue('finBridgeUpstream', statement.corrected_upstream_cost, statement.known_corrected_upstream_cost,
+    setBridgeValue('finBridgeUpstream', statement.raw_corrected_upstream_cost, statement.known_raw_corrected_upstream_cost,
       '完整', '已知部分', '上游成本未闭合');
     setBridgeValue('finBridgeInternalTestCost', statement.internal_test_upstream_cost, statement.known_internal_test_upstream_cost,
       '完整', `严格识别 ${Number(statement.internal_test_cost_rows || 0).toLocaleString('zh-CN')} 小时`, '暂无可严格识别成本');
@@ -283,20 +314,54 @@
     setBridgeValue('finBridgeProfit', statement.operating_profit, statement.known_operating_profit,
       '可发布', '仅已知部分', '收入或成本未闭合');
     const footnote = $('finBridgeFootnote');
-    if (footnote) footnote.textContent = `修正上游总成本包含客户流量、内部测试和其它已识别成本，最终毛利只扣一次。已配对客户成本 ${money(statement.paired_corrected_upstream_cost)}；内部测试 ${money(statement.internal_test_consumption)}（${Number(statement.internal_test_requests || 0).toLocaleString('zh-CN')} 请求）不计客户收入，已严格识别其上游成本 ${money(statement.known_internal_test_upstream_cost)}。${Number(statement.internal_test_mixed_rows || 0).toLocaleString('zh-CN')} 个混合流量小时、${Number(statement.internal_test_unverified_pairs || 0).toLocaleString('zh-CN')} 个未核验对不做估算。`;
+    if (footnote) footnote.textContent = `平台经营结果扣除修正上游总成本（含内部测试支出），其中的内部账号、自动测试及非业务分组成本仅另列，不重复扣除。已配对客户成本 ${money(statement.paired_corrected_upstream_cost)}；内部账号与自动测试消费 ${money(statement.internal_test_consumption)}（${Number(statement.internal_test_requests || 0).toLocaleString('zh-CN')} 请求）不计客户收入。已严格识别非业务上游成本 ${money(statement.known_internal_test_upstream_cost)}；${Number(statement.internal_test_mixed_rows || 0).toLocaleString('zh-CN')} 个混合流量小时、${Number(statement.internal_test_unverified_pairs || 0).toLocaleString('zh-CN')} 个未核验对不做估算。`;
   }
 
   window.financeActivate = function () {
     if (!state.inited) init();
-    if (!state.loaded) load();
+    if (!state.loaded || state.stale) load();
   };
   window.financeDeactivate = function () {
     if (state.abort) state.abort.abort();
+    clearRefreshTimer();
   };
+
+  function clearRefreshTimer() {
+    if (state.refreshTimer) clearTimeout(state.refreshTimer);
+    state.refreshTimer = null;
+  }
+
+  function scheduleStaleRefresh() {
+    clearRefreshTimer();
+    if (!state.stale || $('tab-finance')?.hidden) return;
+    // Fast snapshots intentionally skip the expensive fingerprint on this
+    // request. Poll gently while the server verifies it in the background.
+    if (state.pending) {
+      if (state.refreshAttempts >= 12) {
+        $('finStatus').textContent = '报表尚未生成完成，已停止自动等待；请稍后点击刷新。详情见数据同步状态。';
+        return;
+      }
+      state.refreshAttempts += 1;
+      state.refreshTimer = setTimeout(() => load(false, true), Math.min(30000, 5000 * state.refreshAttempts));
+      return;
+    }
+    if (String(state.cacheStatus || '').startsWith('fast-snapshot-') && state.updateState !== 'failed' && !state.refreshFailures) {
+      state.refreshTimer = setTimeout(() => load(false, true), 30000);
+      return;
+    }
+    if (state.refreshAttempts >= 5) {
+      const note = $('finCacheUpdate');
+      if (note) note.textContent = ' · 更新尚未完成，已保留上次结果；请稍后刷新';
+      return;
+    }
+    const delay = Math.min(16000, 1000 * (2 ** state.refreshAttempts));
+    state.refreshAttempts += 1;
+    state.refreshTimer = setTimeout(() => load(false, true), delay);
+  }
 
   function init() {
     state.inited = true;
-    $('finRefresh')?.addEventListener('click', load);
+    $('finRefresh')?.addEventListener('click', () => load(true));
     $('finSinceLaunch')?.addEventListener('click', () => {
       $('finFrom').value = '';
       $('finTo').value = '';
@@ -304,6 +369,8 @@
     });
     $('finThisMonth')?.addEventListener('click', () => setMonth(0));
     $('finLastMonth')?.addEventListener('click', () => setMonth(-1));
+    $('finInternalSave')?.addEventListener('click', saveInternalAccounts);
+    loadInternalAccounts();
     $('finUnallocatedSourceRows')?.addEventListener('click', (event) => {
       const button = event.target.closest('[data-fin-cost-source]');
       if (!button) return;
@@ -313,6 +380,53 @@
       else if (window.channelManagementOpen) window.channelManagementOpen({ domain });
     });
     window.addEventListener('resize', () => state.chart?.resize());
+  }
+
+  function internalSyncText(sync) {
+    const status = String(sync?.status || 'not_configured');
+    if (status === 'not_configured') return '未配置';
+    if (status === 'caught_up') return '历史事实已补齐';
+    if (status === 'error') return `同步异常：${sync?.last_error || '未知错误'}`;
+    return `历史事实回填中 ${Number(sync?.progress_percent || 0).toFixed(1)}%`;
+  }
+
+  async function loadInternalAccounts() {
+    const summary = $('finInternalSummary');
+    const note = $('finInternalState');
+    try {
+      const response = await fetch('/finance/internal-accounts', { headers: { Accept: 'application/json' } });
+      if (response.status === 401) { location.href = '/login'; return; }
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
+      const rows = Array.isArray(data.accounts) ? data.accounts : [];
+      if ($('finInternalAccounts')) $('finInternalAccounts').value = rows.map((row) => `${row.user_id}${row.username ? ` # ${row.username}` : ''}`).join('\n');
+      if (summary) summary.textContent = `${rows.length} 个账号 · ${internalSyncText(data.sync)}`;
+      if (note) note.textContent = rows.length ? `已按 user_id 固定身份；${internalSyncText(data.sync)}。混合流量小时不按请求数硬摊成本。` : '配置只保存在 Monitor，不修改 NewAPI 账号或原始日志。';
+    } catch (error) {
+      if (summary) summary.textContent = '配置读取失败';
+      if (note) note.textContent = error.message;
+    }
+  }
+
+  async function saveInternalAccounts() {
+    const button = $('finInternalSave');
+    const note = $('finInternalState');
+    if (button) { button.disabled = true; button.textContent = '保存中'; }
+    try {
+      const raw = ($('finInternalAccounts')?.value || '').split(/\r?\n|,|，|;|；/).map((part) => part.trim()).filter(Boolean).map((part) => /^\d+\s+#\s+/.test(part) ? part.split(/\s+/)[0] : part).join('\n');
+      const response = await fetch('/finance/internal-accounts', { method: 'POST', headers: { Accept: 'application/json', 'Content-Type': 'application/json' }, body: JSON.stringify({ accounts: raw }) });
+      if (response.status === 401) { location.href = '/login'; return; }
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.detail || data.error || `HTTP ${response.status}`);
+      if (note) note.textContent = data.unchanged ? '配置未变更。' : '已保存；历史用量将在后台以只读方式回填，未补齐前报表不会假装成本已完整。';
+      await loadInternalAccounts();
+      state.renderedQuery = null;
+      await load(true);
+    } catch (error) {
+      if (note) note.textContent = `保存失败：${error.message}`;
+    } finally {
+      if (button) { button.disabled = false; button.textContent = '保存配置'; }
+    }
   }
 
   function isoLocal(value) {
@@ -330,28 +444,90 @@
     load();
   }
 
-  async function load() {
+  async function load(forceFresh = false, background = false) {
+    clearRefreshTimer();
+    if (!background) state.refreshAttempts = 0;
     if (state.abort) state.abort.abort();
     state.abort = new AbortController();
+    const controller = state.abort;
+    const sequence = ++state.requestSequence;
     const button = $('finRefresh');
-    if (button) { button.disabled = true; button.textContent = '读取中'; }
+    if (button && !background) { button.disabled = true; button.textContent = '读取中'; }
     const query = new URLSearchParams();
     if ($('finFrom')?.value) query.set('from', $('finFrom').value);
     if ($('finTo')?.value) query.set('to', $('finTo').value);
+    const queryKey = query.toString();
+    const hasPrevious = state.loaded && state.renderedQuery === queryKey;
+    if (!hasPrevious && $('finReportContent')) $('finReportContent').hidden = true;
+    if (forceFresh) query.set('fresh', '1');
     try {
       const response = await fetch(`/finance/report${query.size ? `?${query}` : ''}`, {
-        headers: { Accept: 'application/json' }, signal: state.abort.signal,
+        headers: { Accept: 'application/json' }, signal: controller.signal,
       });
+      if (sequence !== state.requestSequence || controller.signal.aborted) return;
       if (response.status === 401) { location.href = '/login'; return; }
       const data = await response.json();
+      if (sequence !== state.requestSequence || controller.signal.aborted) return;
+      if (response.status === 202) {
+        state.pending = true;
+        state.stale = true;
+        state.loaded = false;
+        if ($('finReportContent')) $('finReportContent').hidden = true;
+        const status = $('finStatus');
+        status.className = 'fin-status';
+        status.innerHTML = `<i></i><div><b>${esc(data.message || '报表正在生成')}</b><br>完成后自动显示，尚未生成的金额不会显示为 0。</div>`;
+        scheduleStaleRefresh();
+        return;
+      }
       if (!response.ok) throw new Error(data.detail || data.error || `HTTP ${response.status}`);
+      if (!data || typeof data !== 'object' || typeof data.enabled !== 'boolean') throw new Error('报表响应无效，请稍后重试');
+      data._cache_status = response.headers.get('X-Monitor-Finance-Cache') || '';
+      data._update_state = response.headers.get('X-Monitor-Finance-Update') || '';
+      state.updateState = data._update_state;
+      state.pending = false;
+      state.refreshFailures = 0;
+      state.renderedQuery = queryKey;
+      state.cacheStatus = data._cache_status;
       state.loaded = true;
+      state.stale = String(data._cache_status).includes('stale');
+      if (!state.stale) state.refreshAttempts = 0;
       render(data);
+      if ($('finReportContent')) $('finReportContent').hidden = false;
+      scheduleStaleRefresh();
     } catch (error) {
-      if (error.name !== 'AbortError') renderError(error.message);
+      if (sequence !== state.requestSequence || controller.signal.aborted) return;
+      if (error.name !== 'AbortError') {
+        state.refreshFailures += 1;
+        if ((background && state.stale && !state.pending) || hasPrevious) {
+          state.stale = true;
+          const note = $('finCacheUpdate');
+          if (note) note.textContent = ` · 更新失败，已保留上次结果：${String(error.message).slice(0, 160)}`;
+          else { $('finStatus').className = 'fin-status'; $('finStatus').textContent = '更新失败，已保留上次结果；请稍后刷新。'; }
+          scheduleStaleRefresh();
+        }
+        else renderError(error.message);
+      }
     } finally {
-      if (button) { button.disabled = false; button.textContent = '刷新'; }
+      if (button && !background && sequence === state.requestSequence) { button.disabled = false; button.textContent = '刷新'; }
     }
+  }
+
+  function financeIsPriorStale(data) {
+    return String(data._cache_status || '').includes('prior-stale');
+  }
+
+  function financeCacheRefreshNote(data) {
+    const status=String(data._cache_status || '');
+    if (status.startsWith('fast-snapshot-')) {
+      const note = data._update_state === 'failed' ? '更新失败，已保留上次结果；详情见数据同步状态'
+        : data._update_state === 'succeeded' ? '最近核验完成'
+          : data._update_state === 'busy' ? '更新任务繁忙，已保留上次结果' : '正在后台更新';
+      return `<span id="finCacheUpdate"> · ${note}</span>`;
+    }
+    if (financeIsPriorStale(data)) {
+      return `<span id="finCacheUpdate"> · 仅显示截至 ${dateTime(data.to)} 的较早区间，当前区间后台补算中；请勿当作当前结果</span>`;
+    }
+    return status.includes('stale')?'<span id="finCacheUpdate"> · 后台更新中</span>':'';
   }
 
   function render(data) {
@@ -360,15 +536,20 @@
     const baseComplete = data.user_coverage?.complete && data.upstream_coverage?.complete;
     const giftComplete = data.gift_coverage?.complete === true;
     const complete = baseComplete && giftComplete;
+    const priorStale = financeIsPriorStale(data);
     const status = $('finStatus');
-    status.className = `fin-status ${!enabled ? 'bad' : complete ? 'ok' : ''}`;
+    status.className = `fin-status ${!enabled ? 'bad' : !state.stale && complete ? 'ok' : ''}`;
     const summary = !enabled ? '经营核算功能尚未开启'
-      : complete ? '当前区间经营收入与上游成本证据完整'
+      : priorStale ? '较早区间快照，当前区间正在补算'
+        : state.stale ? (data._update_state === 'succeeded' ? '已核验报表，金额按下方数据时间展示' : '已核验快照，正在核对最新事实')
+        : complete ? '当前区间经营收入与上游成本证据完整'
         : baseComplete ? '用量与上游成本完整，注册赠送证据仍待补齐'
           : data.user_coverage?.complete ? '用户用量完整，部分上游成本仍待补证'
           : '已展示现有用量，部分小时与上游成本仍待补证';
     const snapshotNote=data.data_as_of?` · 快照截至 ${dateTime(data.data_as_of)}`:'';
-    status.innerHTML = `<i></i><div><b>${summary}</b><br>${enabled ? `区间 ${date(data.from)} 至 ${date(data.to)} · 用量 ${userCoverage(data.user_coverage)} · 成本 ${upstreamCoverage(data.upstream_coverage)}${snapshotNote}` : '配置 MONITOR_FINANCE_ENABLED=true 后，只读展示已有事实。'}</div>`;
+    const generatedNote=data.generated_at?` · 生成于 ${dateTime(data.generated_at)}`:'';
+    const refreshingNote=financeCacheRefreshNote(data);
+    status.innerHTML = `<i></i><div><b>${summary}</b><br>${enabled ? `区间 ${date(data.from)} 至 ${date(data.to)} · 用量 ${userCoverage(data.user_coverage)} · 成本 ${upstreamCoverage(data.upstream_coverage)}${snapshotNote}${generatedNote}${refreshingNote}` : '配置 MONITOR_FINANCE_ENABLED=true 后，只读展示已有事实。'}</div>`;
 
     setMoney('finConsumption', statement.user_consumption, statement.known_user_consumption,
       `消费扣额 ${money(statement.gross_user_consumption)} - 退还 ${money(statement.user_refunds)}；内部测试另列 ${money(statement.internal_test_consumption)}`,
@@ -379,7 +560,7 @@
       '当前区间没有可发布的上游账单');
     setMoney('finUpstream', statement.corrected_upstream_cost, statement.known_corrected_upstream_cost,
       '使用当期充值到账/支付比例修正', `已知部分 · ${upstreamCoverage(data.upstream_coverage)}`,
-      '当前区间没有可发布的修正上游成本');
+      internalCostDeductionNote(statement) || '当前区间没有可发布的修正上游成本');
     setMoney('finContribution', statement.contribution_profit, statement.known_contribution_profit,
       `配对计费扣额 ${money(statement.paired_user_consumption)} - 配对成本 ${money(statement.paired_corrected_upstream_cost)}${statement.paired_contribution_margin_percent ? ` · ${statement.paired_contribution_margin_percent}%` : ''}；未扣注册赠送`,
       `已核验配对：${money(statement.paired_user_consumption)} - ${money(statement.paired_corrected_upstream_cost)}${statement.paired_contribution_margin_percent ? ` · ${statement.paired_contribution_margin_percent}%` : ''}；赠送前、非全站最终毛利`,
@@ -456,6 +637,7 @@
       return result;
     }, {});
     const groups = [
+      ['not_required', '暂不纳入', '未配置上游账户，不进入覆盖率和利润'],
       ['precheck_required', '待灰度前核对', '已有账单与修正证据'],
       ['correction_missing', '缺修正依据', '先补充值比例或审计证据'],
       ['bill_missing', '缺账单证据', '先补齐上游账单记录'],
@@ -514,12 +696,43 @@
         + `<td class="num">${knownValue(statement.registration_gift_consumption, statement.known_registration_gift_consumption)}</td>`
         + `<td class="num">${knownValue(statement.operating_revenue, statement.known_operating_revenue)}</td>`
         + `<td class="num">${knownValue(statement.upstream_billed_cost, statement.known_upstream_billed_cost)}</td>`
-        + `<td class="num">${knownValue(statement.corrected_upstream_cost, statement.known_corrected_upstream_cost)}</td>`
+        + `<td class="num" title="含内部测试实际支出；右侧内部测试成本为其中项，不重复扣除">${knownValue(statement.raw_corrected_upstream_cost, statement.known_raw_corrected_upstream_cost)}</td>`
         + `<td class="num">${knownValue(statement.internal_test_upstream_cost, statement.known_internal_test_upstream_cost, '已识别')}</td>`
         + `<td class="num">${knownValue(statement.aws_infrastructure_cost, statement.known_aws_infrastructure_cost)}</td>`
         + `<td class="num">${knownValue(statement.contribution_profit, statement.known_contribution_profit, '已配对')}<small>${money(statement.paired_user_consumption)} - ${money(statement.paired_corrected_upstream_cost)}${statement.paired_contribution_margin_percent ? ` · ${statement.paired_contribution_margin_percent}%` : ''}</small></td>`
         + `<td>${userCoverage(row.user_coverage)}</td><td>${upstreamCoverage(row.upstream_coverage)}</td><td>${chip(row.status)}</td></tr>`;
     }).join('') : '<tr><td colspan="12" class="fin-empty">当前区间没有已发布的经营事实</td></tr>';
+  }
+
+  function dailyCorrectedCost(row) {
+    const reconciliation = row.cost_reconciliation;
+    const total = reconciliation?.status === 'reconciled' ? knownValue(null, reconciliation.known_total, '已取得') : '—';
+    const note = reconciliation?.status === 'source_mismatch' || row.ledger_correction?.status === 'source_mismatch'
+      ? '<small>日/月来源待核对</small>' : '';
+    return `${total}${note}<small>充值 ${money(row.recharge_correction?.known_cost)} · 账本 ${money(row.ledger_correction?.known_cost)}</small>`;
+  }
+
+  function dailyInternalCost(row) {
+    const statement = row.statement || {};
+    const amount = knownValue(statement.internal_test_upstream_cost, statement.known_internal_test_upstream_cost, '已识别');
+    const mixed = Number(statement.internal_test_mixed_rows || 0);
+    const unverified = Number(statement.internal_test_unverified_pairs || 0);
+    const notes = [];
+    if (mixed > 0) notes.push(`混用待拆分 ${mixed.toLocaleString('zh-CN')} 项`);
+    if (unverified > 0) notes.push(`未核验 ${unverified.toLocaleString('zh-CN')} 项`);
+    const reasons = row.internal_cost_unverified_reasons || {};
+    const labels = {
+      channel_cost_not_published: '尚无渠道成本发布', upstream_cost_missing: '渠道上游成本缺失',
+      hour_manifest_unverified: '小时账本未通过校验', cost_publication_unverified: '成本记录未通过校验',
+      ambiguous_publication: '存在多份可用成本记录', unspecified: '历史原因待核对',
+    };
+    for (const [reason, count] of Object.entries(reasons).sort(([a], [b]) => a.localeCompare(b))) {
+      if (Number(count) > 0) notes.push(`${labels[reason] || '其他原因待核对'} ${Number(count).toLocaleString('zh-CN')} 项`);
+    }
+    if (row.internal_cost_complete === false && !notes.length) notes.push('内部成本证据待补');
+    if (row.internal_cost_complete === true && !hasMoney(statement.known_internal_test_upstream_cost)) notes.push('已核验，未发现内部测试成本');
+    if (statement.internal_cost_deduction_status) notes.push('配对账本扣减待核对');
+    return amount + (notes.length ? `<small>${notes.map(esc).join(' · ')}</small>` : '');
   }
 
   function renderDays(rows) {
@@ -531,14 +744,16 @@
         + `<td class="num">${knownValue(statement.user_consumption, statement.known_user_consumption)}</td>`
         + `<td class="num">${knownValue(statement.registration_gift_consumption, statement.known_registration_gift_consumption)}</td>`
         + `<td class="num">${knownValue(statement.operating_revenue, statement.known_operating_revenue)}</td>`
+        + `<td class="num" title="上游账户原始账单，包含内部测试；不是已配对客户成本">${row.bill_coverage ? knownValue(statement.upstream_billed_cost, statement.known_upstream_billed_cost) : '—'}</td>`
+        + `<td class="num" title="同月逐供应商核对后的已取得修正成本；账本与充值修正不重复，含内部测试，不代表全部成本或已配对客户成本">${dailyCorrectedCost(row)}</td>`
         + `<td class="num">${money(statement.internal_test_consumption)}<small>${Number(statement.internal_test_requests || 0).toLocaleString('zh-CN')} 请求</small></td>`
-        + `<td class="num">${knownValue(statement.internal_test_upstream_cost, statement.known_internal_test_upstream_cost, '已识别')}</td>`
+        + `<td class="num" title="内部成本单独核验；不能直接从旁边的账户成本相减，配对账本扣减仍需同源依据">${dailyInternalCost(row)}</td>`
         + `<td class="num">${knownValue(statement.aws_infrastructure_cost, statement.known_aws_infrastructure_cost)}</td>`
         + `<td class="num">${money(statement.paired_user_consumption)}</td>`
         + `<td class="num">${money(statement.paired_corrected_upstream_cost)}</td>`
         + `<td class="num">${knownValue(statement.contribution_profit, statement.known_contribution_profit, '已配对')}<small>${statement.paired_contribution_margin_percent ? `${statement.paired_contribution_margin_percent}%` : '—'}</small></td>`
         + `<td>${userCoverage(row.user_coverage)}</td><td>${economicsCoverage(row.economics_coverage)}</td><td>${chip(row.status)}</td></tr>`;
-    }).join('') : '<tr><td colspan="15" class="fin-empty">当前区间没有每日经营事实</td></tr>';
+    }).join('') : '<tr><td colspan="17" class="fin-empty">当前区间没有每日经营事实</td></tr>';
   }
 
   function renderCosts(rows) {
@@ -611,21 +826,21 @@
     const pick = (statement, exact, known) => statement?.[exact] || statement?.[known];
     const consumption = rows.map((row) => chartValue(pick(row.statement, 'user_consumption', 'known_user_consumption')));
     const billed = rows.map((row) => chartValue(pick(row.statement, 'upstream_billed_cost', 'known_upstream_billed_cost')));
-    const corrected = rows.map((row) => chartValue(pick(row.statement, 'corrected_upstream_cost', 'known_corrected_upstream_cost')));
+    const corrected = rows.map((row) => chartValue(grossCorrectedCost(row.statement)));
     const contribution = rows.map((row) => chartValue(pick(row.statement, 'contribution_profit', 'known_contribution_profit')));
     const hasData = [...consumption, ...billed, ...corrected, ...contribution].some((value) => value != null);
     state.chart.setOption({
       backgroundColor: 'transparent', animationDuration: 250,
       grid: { left: 62, right: 20, top: 34, bottom: 42 },
       tooltip: { trigger: 'axis', valueFormatter: (value) => value == null ? '—' : `$${Number(value).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` },
-      legend: { top: 1, textStyle: { color: '#9aa5b8', fontSize: 10 }, data: ['净计费消耗', '账单原值', '修正成本', '已配对计费贡献（赠送前）'] },
+      legend: { top: 1, textStyle: { color: '#9aa5b8', fontSize: 10 }, data: ['净计费消耗', '账单原值', '修正上游总成本', '已配对计费贡献（赠送前）'] },
       xAxis: { type: 'category', data: periods, axisLine: { lineStyle: { color: '#394153' } }, axisLabel: { color: '#8f9aac' } },
       yAxis: { type: 'value', axisLine: { show: false }, splitLine: { lineStyle: { color: '#2a3140' } }, axisLabel: { color: '#8f9aac', formatter: (value) => `$${value}` } },
       graphic: hasData ? [] : [{ type: 'text', left: 'center', top: '47%', style: { text: '当前区间暂无已发布金额', fill: '#7f8a9e', font: '12px sans-serif', textAlign: 'center' } }],
       series: [
         { name: '净计费消耗', type: 'bar', data: consumption, itemStyle: { color: '#d99b42' }, barMaxWidth: 21 },
         { name: '账单原值', type: 'bar', data: billed, itemStyle: { color: '#77859d' }, barMaxWidth: 21 },
-        { name: '修正成本', type: 'bar', data: corrected, itemStyle: { color: '#55b995' }, barMaxWidth: 21 },
+        { name: '修正上游总成本', type: 'bar', data: corrected, itemStyle: { color: '#55b995' }, barMaxWidth: 21 },
         { name: '已配对计费贡献（赠送前）', type: 'line', data: contribution, connectNulls: false, symbolSize: 6, lineStyle: { width: 2, color: '#72a8fa', type: 'dashed' }, itemStyle: { color: '#72a8fa' } },
       ],
     });
@@ -637,7 +852,7 @@
     status.className = 'fin-status bad';
     status.innerHTML = `<i></i><div><b>经营核算读取失败</b><br>${esc(message)}</div>`;
     $('finPeriodRows').innerHTML = '<tr><td colspan="12" class="fin-empty">请稍后刷新；失败不会被解释为 0</td></tr>';
-    $('finDailyRows').innerHTML = '<tr><td colspan="15" class="fin-empty">请稍后刷新；失败不会被解释为 0</td></tr>';
+    $('finDailyRows').innerHTML = '<tr><td colspan="17" class="fin-empty">请稍后刷新；失败不会被解释为 0</td></tr>';
     $('finPairingRows').innerHTML = '<tr><td colspan="6" class="fin-empty">请稍后刷新；缺口不会被忽略</td></tr>';
     $('finCURProductRows').innerHTML = '<tr><td colspan="6" class="fin-empty">请稍后刷新；AWS 成本不会被解释为 0</td></tr>';
   }

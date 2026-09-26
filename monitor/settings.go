@@ -171,6 +171,11 @@ type Settings struct {
 	FinanceEnabled          bool   // MONITOR_FINANCE_ENABLED，默认 false
 	FinanceStartDate        string // MONITOR_FINANCE_START_DATE，北京时间 YYYY-MM-DD
 	FinanceFactsSyncEnabled bool   // MONITOR_FINANCE_FACTS_SYNC_ENABLED，默认 false；仅后台只读采集
+	// 持久化报表快照先只做影子写入：默认关闭，不参与读取、不改变页面结果。
+	FinanceReportSnapshotShadowEnabled bool // MONITOR_FINANCE_REPORT_SNAPSHOT_SHADOW_ENABLED，默认 false
+	FinanceReportSnapshotReadEnabled   bool // MONITOR_FINANCE_REPORT_SNAPSHOT_READ_ENABLED，默认 false；独立灰度读取闸门
+	FinanceFastSnapshotEnabled         bool // MONITOR_FINANCE_FAST_SNAPSHOT_ENABLED，默认 false；有界快照先返回，统一队列后台核验/生成
+	FinanceFactsReadIsolationEnabled   bool // MONITOR_FINANCE_FACTS_READ_ISOLATION_ENABLED，默认 false；经营核算事实使用单独只读 SQLite 连接
 	// CUR 核算产物由离线命令生成并完成哈希自校验。Monitor 只读本地文件，
 	// 不访问 AWS/S3；独立开关默认关闭，路径必须为绝对路径。
 	FinanceCURArtifactEnabled bool   // MONITOR_FINANCE_CUR_ARTIFACT_ENABLED，默认 false
@@ -456,6 +461,10 @@ func LoadSettings() Settings {
 		FinanceEnabled:                           env("MONITOR_FINANCE_ENABLED", "false") == "true",
 		FinanceStartDate:                         strings.TrimSpace(env("MONITOR_FINANCE_START_DATE", "2026-05-01")),
 		FinanceFactsSyncEnabled:                  env("MONITOR_FINANCE_FACTS_SYNC_ENABLED", "false") == "true",
+		FinanceReportSnapshotShadowEnabled:       env("MONITOR_FINANCE_REPORT_SNAPSHOT_SHADOW_ENABLED", "false") == "true",
+		FinanceReportSnapshotReadEnabled:         env("MONITOR_FINANCE_REPORT_SNAPSHOT_READ_ENABLED", "false") == "true",
+		FinanceFastSnapshotEnabled:               env("MONITOR_FINANCE_FAST_SNAPSHOT_ENABLED", "false") == "true",
+		FinanceFactsReadIsolationEnabled:         env("MONITOR_FINANCE_FACTS_READ_ISOLATION_ENABLED", "false") == "true",
 		FinanceCURArtifactEnabled:                env("MONITOR_FINANCE_CUR_ARTIFACT_ENABLED", "false") == "true",
 		FinanceCURArtifactPath:                   strings.TrimSpace(env("MONITOR_FINANCE_CUR_ARTIFACT_PATH", "")),
 		PortalAddr:                               env("MONITOR_PORTAL_ADDR", ""),

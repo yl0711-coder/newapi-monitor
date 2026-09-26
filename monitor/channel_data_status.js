@@ -62,8 +62,27 @@ const usageSyncReasons={
   disabled:'该账户消费同步已停用，当前仅有历史数据',
   unsupported:'当前上游接口不支持消费同步',
 };
+const internalReasonLabels={
+  source_incomplete:'所选区间内部账号用量依据未齐，请查看采集进度',
+  mixed_usage:'客户与内部账号存在混合用量，暂不能精确拆分；不会按请求数估算',
+  pairing_unverified:'内部账号成本配对尚未核验，需要检查配对依据',
+  ownership_unknown:'部分未核验成本缺少历史上游归属，暂不能限定影响账户',
+  amount_inconsistent:'内部账号成本大于同口径上游原账单，扣除结果停止发布',
+};
+function internalCostReasons(usage){
+  if(['complete','not_configured'].includes(usage.internal_filter_status))return [];
+  const codes=Array.isArray(usage.internal_filter_reasons)?usage.internal_filter_reasons:[];
+  if(codes.length)return [...new Set(codes)].map(code=>internalReasonLabels[code]||'内部账号成本核验状态待确认');
+  if(usage.internal_filter_status==='inconsistent')return [internalReasonLabels.amount_inconsistent];
+  return ['内部账号成本核验状态待确认；不代表普通回填完成即可恢复'];
+}
 function issues(report){
   const rows=[],coverage=report?.meta?.data_coverage;
+	const internal=report?.internal_accounts||{};
+	if(internal.enabled&&report.internal_scope_complete!==true){
+		const detail=report.internal_scope_complete===false?'所选区间内部账号用量依据未齐':'所选区间内部账号覆盖状态待确认';
+		rows.push({scope:'内部账号过滤',detail:detail+'；全局同步进度不代表所选区间的成本已核验。'});
+	}
   if(!coverage||coverage.complete!==true||coverage.provisional_seconds>0){
     const detail=coverage?`已确认 ${coverage.completed_hours||0}/${coverage.expected_hours||0} 小时；缺少 ${coverage.missing_hours||0} 小时`:'覆盖状态未返回';
     const pending=coverage?.latest_hour_pending?`；最新小时 ${time(coverage.pending_hour_ts)} 尚在汇总，并非已确认丢失`:'';
@@ -72,7 +91,6 @@ function issues(report){
   for(const domain of report?.domains||[]){
     const account=domain.upstream||{},usage=billView(domain).usage,reasons=[];
     if(!account.configured){
-      if(domain.enabled_channels>0)rows.push({scope:domain.domain||'未归并渠道',detail:`${domain.enabled_channels} 个启用渠道未配置上游账户，无法同步余额与账单。`});
       continue;
     }
     if(domain.missing_rate_channels>0)reasons.push(`${domain.missing_rate_channels} 个启用渠道缺少倍率配置，不能据此核验渠道成本`);
@@ -89,6 +107,7 @@ function issues(report){
           if(!usage.complete&&(!usage.provisional||usage.completed_hours<usage.expected_hours))reasons.push(`账单已覆盖 ${usage.completed_hours||0}/${usage.expected_hours||0} 小时，汇总仅含已校验金额`);
           if(!usage.adjusted_cost_available)reasons.push(usage.adjusted_cost_status==='bucket_boundary_ambiguous'?'充值比例在账单桶中途变化，修正消费无法精确拆分':'缺少对应时段充值比例证据，未计入修正消费汇总');
           else if(!known(usage.adjusted_cost_usd))reasons.push('修正消费金额未返回，未计入修正消费汇总');
+          reasons.push(...internalCostReasons(usage));
         }
       }
     }
@@ -108,9 +127,11 @@ function note(report){
 function render(report){
   if(report?.enabled===false)return '<p class="muted">渠道用量未启用，无法核验区间覆盖。</p>';
   const rows=issues(report),meta=report?.meta||{};
+  const unconfigured=(report?.domains||[]).filter(d=>!d.upstream?.configured&&d.enabled_channels>0);
+  const configurationNote=unconfigured.length?`<p class="muted">${unconfigured.length} 个上游未配置，暂不采集，不作为同步故障；有消费而成本未知的部分不能按零成本核算。</p>`:'';
   const dailyNotes=(report?.domains||[]).filter(domain=>billView(domain).daily).map(domain=>`<p class="muted">${esc(domain.domain)}：${esc(billRangeNote(billView(domain).daily))}。上游按自然日出账，渠道卡片单独展示，不计入精确区间汇总。</p>`).join('');
   return `<p class="muted">渠道管理当前日期范围（全部账户）：${esc(time(meta.from_ts))} → ${esc(time(meta.to_ts))}（结束时间不含）。仅检查本地数据，不触发补数。</p>`+
-    (rows.length?`<div class="sync-status bad">${rows.length} 项数据异常 / 待核验</div><div class="sync-upstream-list">${rows.map(row=>`<article class="sync-upstream-account"><b class="sync-upstream-error">${esc(row.scope)}</b><p class="sync-upstream-error">${esc(row.detail)}</p></article>`).join('')}</div>`:'<span class="sync-status ok">用量覆盖与可用账单校验通过</span>')+dailyNotes;
+    (rows.length?`<div class="sync-status bad">${rows.length} 项数据异常 / 待核验</div><div class="sync-upstream-list">${rows.map(row=>`<article class="sync-upstream-account"><b class="sync-upstream-error">${esc(row.scope)}</b><p class="sync-upstream-error">${esc(row.detail)}</p></article>`).join('')}</div>`:'<span class="sync-status ok">用量覆盖与可用账单校验通过</span>')+configurationNote+dailyNotes;
 }
 window.channelDataStatus={issues,note,render,known,billView,billRangeNote,billSyncNote};
 })();

@@ -312,6 +312,7 @@ func (m *Monitor) RegisterRoutes(r *gin.Engine) {
 		view.GET("/channels/data-status", m.serveChannelDataStatus)                       // 同口径的轻量只读诊断，不读取用量维度
 		view.GET("/channels/economics", m.serveChannelEconomicsReport)                    // 渠道成本:只读本地不可变经济账当前发布头
 		view.GET("/finance/report", m.serveFinanceOperatingReport)                        // 经营核算:只读已发布渠道经济事实
+		view.GET("/finance/internal-accounts", m.serveFinanceInternalAccounts)            // 经营核算:内部测试账号本地配置
 		// 排障两个接口挂 noStoreSensitive：响应含客户标识、令牌名、渠道名/ID、
 		// 上游主域名与错误原文，属敏感诊断数据，不得被任何中间层缓存。
 		// 用中间件而非在 handler 里逐个 c.Header：handler 有多条提前 return
@@ -424,6 +425,7 @@ func (m *Monitor) RegisterRoutes(r *gin.Engine) {
 		rootChannels.GET("/upstream", m.getChannelUpstreamHandler)
 		rootChannels.POST("/upstream/diagnose", m.diagnoseChannelUpstreamHandler)
 		rootChannels.POST("/upstream", m.saveChannelUpstreamHandler)
+		rootChannels.POST("/upstream/retirement", m.saveChannelUpstreamRetirementHandler)
 		rootChannels.POST("/upstream/sync", m.syncChannelUpstreamHandler)
 		rootChannels.POST("/upstream/usage-sync", m.syncChannelUpstreamUsageHandler)
 		rootChannels.GET("/upstream/funds", m.getChannelUpstreamFundsHandler)
@@ -438,6 +440,7 @@ func (m *Monitor) RegisterRoutes(r *gin.Engine) {
 		rootChannels.POST("/cost/proposals/:proposal_key/decisions", m.decideChannelPricingProposalHandler)
 		rootChannels.POST("/cost/activations/:activation_id/cancel", m.cancelChannelFinanceActivationHandler)
 	}
+	r.POST("/finance/internal-accounts", m.requireRole(roleRoot), m.saveFinanceInternalAccounts)
 }
 
 func (m *Monitor) triggerStoreBackupHandler(c *gin.Context) {

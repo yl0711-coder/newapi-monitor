@@ -555,10 +555,15 @@ func channelFinanceGlobalRevision(tx *gorm.DB) (string, error) {
 	if err := tx.Order("grp ASC").Find(&groups).Error; err != nil {
 		return "", err
 	}
+	var policies []ChannelBusinessGroupPolicy
+	if err := tx.Order("grp ASC").Find(&policies).Error; err != nil {
+		return "", err
+	}
 	raw, err := json.Marshal(struct {
 		FXBenchmark, SiteRechargePaid, SiteRechargeCredit float64
 		Groups                                            []ChannelSaleGroupRate
-	}{setting.FXBenchmark, setting.SiteRechargePaid, setting.SiteRechargeCredit, groups})
+		Policies                                          []ChannelBusinessGroupPolicy
+	}{setting.FXBenchmark, setting.SiteRechargePaid, setting.SiteRechargeCredit, groups, policies})
 	if err != nil {
 		return "", err
 	}

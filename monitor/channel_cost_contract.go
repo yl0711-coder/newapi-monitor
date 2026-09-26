@@ -722,6 +722,20 @@ func validPositiveCanonicalRat(value string) bool {
 	return ok && rat.Sign() > 0 && rat.RatString() == value && len(value) <= 80
 }
 
+// An empty observation has no money whose conversion unit can be frozen.
+// Older versions persisted an empty unit for these hours. Allow them to be
+// re-observed, but never relax validation for a nonempty historical hour.
+func channelCostFrozenUnit(state ChannelUpstreamCostHourState) (string, error) {
+	if state.Requests == 0 && state.EvidenceRows == 0 && state.ControlChargeUnits == 0 &&
+		state.EvidenceChargeUnits == 0 && state.ReconcileDelta == 0 && state.ReconcileStatus == "matched" {
+		return "", nil
+	}
+	if !validPositiveCanonicalRat(state.ChargeUnitsPerUSD) {
+		return "", errors.New("既有渠道成本小时的历史计费单位无效")
+	}
+	return state.ChargeUnitsPerUSD, nil
+}
+
 func (m *Monitor) channelCostEnabledFor(account ChannelUpstreamAccount) bool {
 	return m.cfg.ChannelCostClosureEnabled && account.Provider == upstreamProviderNewAPI && channelCostDomainAllowed(m.cfg.ChannelCostClosureDomains, account.Domain)
 }
@@ -802,6 +816,72 @@ func (m *Monitor) loadChannelCostCheckpoint(ctx context.Context, account Channel
 	return decodeChannelCostCheckpoint(checkpoint, account.Provider, m.cfg.ChannelCostHMACKeyID)
 }
 
+// A yielded recovery run may have no checkpoint when the shared request budget
+// was exhausted before page one. Once pricing has a partial checkpoint, its
+// cost shadow must have the same cursor; otherwise the yield is a cost failure.
+func (m *Monitor) channelCostPartialCheckpointError(ctx context.Context, account ChannelUpstreamAccount, hourTs int64) error {
+	var pricing ChannelUpstreamPricingPageCheckpoint
+	err := m.storeDB.WithContext(ctx).Where("domain = ? AND account_epoch = ? AND semantics_version = ? AND hour_ts = ?",
+		account.Domain, newAPIUpstreamAccountEpoch(account), upstreamPricingSemanticsVersion, hourTs).First(&pricing).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if _, err := m.loadChannelCostCheckpoint(ctx, account, pricing); err != nil {
+		return fmt.Errorf("渠道成本断点未与计价断点同步: %w", err)
+	}
+	return nil
+}
+
+// prepareChannelCostRecovery keeps a valid partial pair of page checkpoints so
+// the next bounded run can resume. If one side of the pair is missing or
+// corrupt, discard both staging cursors together and reread this hour from
+// page one. Published pricing, usage and cost evidence are never removed.
+func (m *Monitor) prepareChannelCostRecovery(ctx context.Context, account ChannelUpstreamAccount, hourTs int64) (bool, error) {
+	epoch := newAPIUpstreamAccountEpoch(account)
+	query := m.storeDB.WithContext(ctx).Where("domain = ? AND account_epoch = ? AND semantics_version = ? AND hour_ts = ?", account.Domain, epoch, upstreamPricingSemanticsVersion, hourTs)
+	var pricing ChannelUpstreamPricingPageCheckpoint
+	pricingErr := query.First(&pricing).Error
+	if pricingErr != nil && !errors.Is(pricingErr, gorm.ErrRecordNotFound) {
+		return false, pricingErr
+	}
+	var cost ChannelCostPageCheckpoint
+	costErr := m.storeDB.WithContext(ctx).Where("domain = ? AND account_epoch = ? AND semantics_version = ? AND hour_ts = ?", account.Domain, epoch, channelCostEvidenceSemanticsVersion, hourTs).First(&cost).Error
+	if costErr != nil && !errors.Is(costErr, gorm.ErrRecordNotFound) {
+		return false, costErr
+	}
+	hasPricing, hasCost := pricingErr == nil, costErr == nil
+	if hasCost {
+		_, costErr = decodeChannelCostCheckpoint(cost, account.Provider, m.cfg.ChannelCostHMACKeyID)
+	}
+	if hasPricing && hasCost && costErr == nil {
+		if pricing.NextPage != cost.NextPage || pricing.Total != cost.Total || pricing.SourceRows != cost.SourceRows {
+			costErr = errors.New("渠道成本断点与计价断点不同步")
+		} else if _, err := decodePricingCheckpointEvidence(pricing); err != nil {
+			costErr = err
+		}
+	}
+	if hasPricing && hasCost && costErr == nil {
+		return cost.SourceRows == cost.Total, nil
+	}
+	if !hasPricing && hasCost && costErr == nil && cost.SourceRows == cost.Total {
+		return true, nil
+	}
+	if hasPricing || hasCost {
+		if err := m.storeDB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+			if err := tx.Where("domain = ? AND account_epoch = ? AND semantics_version = ? AND hour_ts = ?", account.Domain, epoch, upstreamPricingSemanticsVersion, hourTs).Delete(&ChannelUpstreamPricingPageCheckpoint{}).Error; err != nil {
+				return err
+			}
+			return tx.Where("domain = ? AND account_epoch = ? AND semantics_version = ? AND hour_ts = ?", account.Domain, epoch, channelCostEvidenceSemanticsVersion, hourTs).Delete(&ChannelCostPageCheckpoint{}).Error
+		}); err != nil {
+			return false, err
+		}
+	}
+	return false, nil
+}
+
 func (m *Monitor) publishChannelCostHourFromCheckpoint(ctx context.Context, account ChannelUpstreamAccount, pricingState ChannelUpstreamPricingHourState, now int64) error {
 	if !m.channelCostEnabledFor(account) {
 		return nil
@@ -823,6 +903,20 @@ func (m *Monitor) publishChannelCostHourFromCheckpoint(ctx context.Context, acco
 		SemanticsVersion: channelCostEvidenceSemanticsVersion, Provider: account.Provider,
 		Status: "observed", ControlChargeUnits: pricingState.FinalQuota,
 		EvidenceRows: int64(len(rows)), ContentHash: channelCostEvidenceContentHash(rows), CompletedAt: now, UpdatedAt: now,
+	}
+	if len(rows) == 0 {
+		if checkpoint.Total != 0 || pricingState.FinalQuota != 0 {
+			return errors.New("空渠道成本证据与上游控制总额不一致")
+		}
+		// Zero is invariant under conversion. Populate the usual validated unit
+		// for consumers, but channelCostFrozenUnit never carries it into a later
+		// nonempty observation of this hour.
+		_, empty, unitErr := buildNewAPICostHourEvidence(account, nil, pricingState.HourTs, now,
+			[]byte(m.cfg.ChannelCostHMACKey), m.cfg.ChannelCostHMACKeyID)
+		if unitErr != nil {
+			return unitErr
+		}
+		state.ChargeUnitsPerUSD = empty.ChargeUnitsPerUSD
 	}
 	for _, row := range rows {
 		if !validPositiveCanonicalRat(row.ChargeUnitsPerUSD) {
@@ -977,6 +1071,15 @@ func (m *Monitor) nextChannelCostDirtyHour(ctx context.Context, account ChannelU
 		Where("domain = ? AND account_epoch = ? AND status = 'pending' AND next_attempt_at <= ?", account.Domain, newAPIUpstreamAccountEpoch(account), now).
 		Order("hour_ts DESC, created_at ASC").First(&row).Error
 	return row, err
+}
+
+// A bounded page yield or first consistent observation is progress, not a
+// failed recovery attempt. Clear the old failure backoff so historical tasks
+// can continue on the next scheduler turn without an hour-long delay.
+func (m *Monitor) scheduleChannelCostDirtyHour(ctx context.Context, account ChannelUpstreamAccount, hourTs, now int64) error {
+	return m.storeDB.WithContext(ctx).Model(&ChannelCostDirtyHour{}).
+		Where("domain = ? AND account_epoch = ? AND hour_ts = ?", account.Domain, newAPIUpstreamAccountEpoch(account), hourTs).
+		Updates(map[string]any{"status": "pending", "attempts": 0, "next_attempt_at": now + 60, "last_error": "", "updated_at": now}).Error
 }
 
 func (m *Monitor) deferChannelCostDirtyHour(ctx context.Context, account ChannelUpstreamAccount, hourTs, now int64, cause error) error {

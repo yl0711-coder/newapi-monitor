@@ -3471,6 +3471,14 @@ func (m *Monitor) startChannelUpstreamSync(ctx context.Context) {
 	// 这条 lane 只读写 Monitor SQLite，无上游 I/O，因此先于余额、日志和
 	// 计价采集闸门启动；上游全部停采时也不会丢失已排程任务。
 	m.startChannelFinanceActivationLane(ctx, 7*time.Second)
+	if m.cfg.ChannelCostClosureEnabled {
+		// Only local verified facts are used. A stalled or disabled upstream
+		// pricing lane must not prevent the already queued economic ledger from
+		// draining; no provider credentials or network calls are made here.
+		goSourceEpoch(ctx, func(laneCtx context.Context) {
+			runUpstreamPeriodicLane(laneCtx, 20*time.Second, time.Minute, m.syncDueChannelEconomics)
+		})
+	}
 	if !m.cfg.UpstreamSyncEnabled && !m.cfg.UpstreamUsageSyncEnabled && !m.cfg.UpstreamPricingLedgerEnabled && !m.cfg.UpstreamErrorLogSyncEnabled && !m.cfg.UpstreamFundsSyncEnabled {
 		slog.Info("上游余额、消费账单、计价证据、错误日志与资金流水采集均已关闭")
 		return

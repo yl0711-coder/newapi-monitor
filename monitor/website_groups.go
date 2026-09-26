@@ -93,6 +93,7 @@ type ChannelWebsiteGroupRateView struct {
 	SyncedAt         int64   `json:"synced_at"`
 	SiteConfigured   bool    `json:"site_configured"`
 	SiteMultiplier   float64 `json:"site_multiplier"`
+	BusinessIncluded bool    `json:"business_included"`
 }
 
 type websiteGroupSource struct {
@@ -320,10 +321,14 @@ func (m *Monitor) loadWebsiteGroupRates(ctx context.Context, finance channelFina
 	if err := m.storeDB.WithContext(ctx).Where("active = ?", true).Order("grp ASC").Find(&rows).Error; err != nil {
 		return nil, 0, fmt.Errorf("读取网站分组目录: %w", err)
 	}
+	policies, err := loadChannelBusinessGroupPolicies(ctx, m.storeDB)
+	if err != nil {
+		return nil, 0, fmt.Errorf("读取分组业务统计范围: %w", err)
+	}
 	views := make([]ChannelWebsiteGroupRateView, 0, len(rows))
 	var syncedAt int64
 	for _, row := range rows {
-		view := ChannelWebsiteGroupRateView{Name: row.Grp, Source: row.Source, SourceMultiplier: row.SourceMultiplier, Active: row.Active, SyncedAt: row.SyncedAt}
+		view := ChannelWebsiteGroupRateView{Name: row.Grp, Source: row.Source, SourceMultiplier: row.SourceMultiplier, Active: row.Active, SyncedAt: row.SyncedAt, BusinessIncluded: channelBusinessGroupIncluded(policies, row.Grp)}
 		if row.SyncedAt > syncedAt {
 			syncedAt = row.SyncedAt
 		}

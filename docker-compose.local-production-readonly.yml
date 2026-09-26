@@ -19,6 +19,9 @@ services:
       # 与线上 Monitor 相同：只用于管理员登录校验、品牌/公开分组读取；Monitor
       # 不持有 NewAPI 管理 Token，也不通过此地址执行管理写操作。
       MONITOR_NEWAPI_BASE_URL: ${MONITOR_PROD_READONLY_NEWAPI_BASE_URL:-https://nexusapi.link}
+      # 恢复最新线上 SQLite 快照时，启动迁移需要校验已加密的上游凭据。
+      # 只允许通过不入库的受控 env-file 注入；本模式的上游同步仍强制关闭。
+      MONITOR_UPSTREAM_CREDENTIAL_SECRET: ${MONITOR_UPSTREAM_CREDENTIAL_SECRET:?恢复线上快照需要通过受控 env-file 提供上游凭据解密密钥}
       MONITOR_LOCAL_SNAPSHOT_ONLY: "false"
       MONITOR_LOCAL_AUTH_BYPASS: "false"
       # 8204 使用 logchain-only 最小只读来源；完整来源 worker 会读取
@@ -56,6 +59,8 @@ services:
       # 默认仍关闭，避免普通验收意外发起历史扫描。
       MONITOR_FINANCE_ENABLED: ${MONITOR_FINANCE_ENABLED:-true}
       MONITOR_FINANCE_FACTS_SYNC_ENABLED: ${MONITOR_FINANCE_FACTS_SYNC_ENABLED:-false}
+      MONITOR_FINANCE_REPORT_SNAPSHOT_SHADOW_ENABLED: ${MONITOR_FINANCE_REPORT_SNAPSHOT_SHADOW_ENABLED:-true}
+      MONITOR_FINANCE_REPORT_SNAPSHOT_READ_ENABLED: ${MONITOR_FINANCE_REPORT_SNAPSHOT_READ_ENABLED:-true}
       # 与拟上线安全值一致，不使用合成验收的 5 秒加速配置。
       MONITOR_USAGE_FACTS_BACKFILL_DELAY_MS: "15000"
       MONITOR_USAGE_FACTS_QUERY_TIMEOUT_SECONDS: "20"

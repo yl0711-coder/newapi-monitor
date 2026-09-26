@@ -46,6 +46,25 @@ type upstreamBalancePolicy struct {
 	MinCoverage float64
 }
 
+func (m *Monitor) manuallyDisabledUpstreamDomains(ctx context.Context) (map[string]bool, error) {
+	var rows []struct {
+		Domain string
+	}
+	err := m.storeDB.WithContext(ctx).Raw(`SELECT LOWER(TRIM(base_domain)) domain
+		FROM channel_snaps
+		WHERE deleted_at=0 AND TRIM(COALESCE(base_domain,''))<>''
+		GROUP BY LOWER(TRIM(base_domain))
+		HAVING SUM(CASE WHEN status<>2 THEN 1 ELSE 0 END)=0`).Scan(&rows).Error
+	if err != nil {
+		return nil, err
+	}
+	result := make(map[string]bool, len(rows))
+	for _, row := range rows {
+		result[row.Domain] = true
+	}
+	return result, nil
+}
+
 func upstreamBalancePolicyFor(c AlertConfig) upstreamBalancePolicy {
 	p := upstreamBalancePolicy{
 		RunwayDays: c.UpstreamBalanceRunwayDays, Lookback: c.UpstreamBalanceLookbackDays,
@@ -225,6 +244,12 @@ func (m *Monitor) upstreamBalanceAssessments(ctx context.Context, now int64, acc
 	return out, nil
 }
 
+func upstreamBalanceAlertEligible(domain string, assessment ChannelUpstreamBalanceAssessment, manuallyDisabled map[string]bool, retirements map[string]ChannelUpstreamRetirement) bool {
+	return !manuallyDisabled[domain] && !retirements[domain].Retiring &&
+		(assessment.Status == "warning" || assessment.Status == "critical") &&
+		assessment.EstimatedRunwayDays != nil && assessment.RequiredBalanceUSD != nil
+}
+
 func (m *Monitor) evaluateUpstreamBalanceAlerts(c AlertConfig, now int64) {
 	if !c.UpstreamBalanceAlertsEnabled {
 		return
@@ -253,8 +278,21 @@ func (m *Monitor) evaluateUpstreamBalanceAlerts(c AlertConfig, now int64) {
 		slog.Warn("计算渠道余额可用天数失败，跳过动态余额预警", "err", err)
 		return
 	}
+	manuallyDisabled, err := m.manuallyDisabledUpstreamDomains(ctx)
+	if err != nil {
+		// 无法确认渠道生命周期时不猜测，保持原有告警行为。
+		slog.Warn("读取手动禁用渠道状态失败", "err", err)
+		manuallyDisabled = map[string]bool{}
+	}
+	retirements, err := m.loadChannelUpstreamRetirements(ctx)
+	if err != nil {
+		// An unreadable operator decision must not silently suppress a real
+		// low-balance alert. Keep the old behavior and surface the read failure.
+		slog.Warn("读取渠道停止使用标记失败，保留余额预警", "err", err)
+		retirements = map[string]ChannelUpstreamRetirement{}
+	}
 	for domain, assessment := range assessments {
-		if (assessment.Status != "warning" && assessment.Status != "critical") || assessment.EstimatedRunwayDays == nil {
+		if !upstreamBalanceAlertEligible(domain, assessment, manuallyDisabled, retirements) {
 			continue
 		}
 		account := accounts[domain]

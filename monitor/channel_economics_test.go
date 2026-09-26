@@ -145,3 +145,92 @@ func TestChannelEconomicsPublishesImmutableRevisionsAndCorrectedProfit(t *testin
 		t.Fatalf("unchanged authoritative replace created duplicate revision: count=%d err=%v", count, err)
 	}
 }
+
+func TestChannelEconomicsBatchKeepsRecentHourAndDrainsOldBacklog(t *testing.T) {
+	db := newChannelCostTestStore(t)
+	if err := db.AutoMigrate(&StabilityHourSample{}, &StabilityHourIngestState{}, &ChannelSnap{}, &ChannelFinanceVersion{}); err != nil {
+		t.Fatal(err)
+	}
+	account := ChannelUpstreamAccount{Domain: "4sapi.com", Provider: upstreamProviderNewAPI, BaseURL: "https://4sapi.com", UserID: 1, BalanceUnit: quotaPerUSD}
+	m := &Monitor{storeDB: db, cfg: Settings{ChannelCostClosureEnabled: true, ChannelCostClosureDomains: []string{account.Domain}}}
+	epoch := newAPIUpstreamAccountEpoch(account)
+	const now int64 = 60_000
+	for hour := int64(3_600); hour <= 36_000; hour += 3_600 {
+		state := ChannelUpstreamCostHourState{
+			Domain: account.Domain, AccountEpoch: epoch, HourTs: hour,
+			SemanticsVersion: channelCostEvidenceSemanticsVersion, Provider: account.Provider,
+			Status: "verified", ReconcileStatus: "matched", ChargeUnitsPerUSD: "500000",
+			ContentHash: strings.Repeat("a", 64),
+		}
+		if err := db.Create(&state).Error; err != nil {
+			t.Fatal(err)
+		}
+		dirty := ChannelEconomicsDirtyHour{Domain: account.Domain, AccountEpoch: epoch, HourTs: hour,
+			Reason: "test", Generation: 1, Status: "pending", NextAttemptAt: now,
+			CreatedAt: now, UpdatedAt: now}
+		if err := db.Create(&dirty).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := m.publishDueChannelEconomicsBatch(context.Background(), account, now); err != nil {
+		t.Fatal(err)
+	}
+	var remaining []ChannelEconomicsDirtyHour
+	if err := db.Order("hour_ts").Find(&remaining).Error; err != nil {
+		t.Fatal(err)
+	}
+	if len(remaining) != 2 || remaining[0].HourTs != 28_800 || remaining[1].HourTs != 32_400 {
+		t.Fatalf("batch must publish newest and seven oldest hours, remaining=%+v", remaining)
+	}
+	var manifests int64
+	if err := db.Model(&ChannelEconomicsHourManifestCurrent{}).Count(&manifests).Error; err != nil || manifests != channelEconomicsPublishPerTick {
+		t.Fatalf("verified zero hours must publish one immutable manifest each: count=%d err=%v", manifests, err)
+	}
+}
+
+func TestChannelEconomicsLocalLaneDrainsWithoutUpstreamPricing(t *testing.T) {
+	db := newChannelCostTestStore(t)
+	if err := db.AutoMigrate(&ChannelUpstreamAccount{}, &StabilityHourSample{}, &StabilityHourIngestState{}, &ChannelSnap{}, &ChannelFinanceVersion{}); err != nil {
+		t.Fatal(err)
+	}
+	account := ChannelUpstreamAccount{Domain: "4sapi.com", Provider: upstreamProviderNewAPI, BaseURL: "https://4sapi.com", UserID: 1, BalanceUnit: quotaPerUSD}
+	if err := db.Create(&account).Error; err != nil {
+		t.Fatal(err)
+	}
+	m := &Monitor{storeDB: db, cfg: Settings{ChannelCostClosureEnabled: true, ChannelCostClosureDomains: []string{account.Domain}}}
+	epoch := newAPIUpstreamAccountEpoch(account)
+	for i := int64(1); i <= 16; i++ {
+		hour := i * 3600
+		state := ChannelUpstreamCostHourState{
+			Domain: account.Domain, AccountEpoch: epoch, HourTs: hour,
+			SemanticsVersion: channelCostEvidenceSemanticsVersion, Provider: account.Provider,
+			Status: "verified", ReconcileStatus: "matched", ChargeUnitsPerUSD: "500000",
+			ContentHash: strings.Repeat("a", 64),
+		}
+		if err := db.Create(&state).Error; err != nil {
+			t.Fatal(err)
+		}
+		if i <= 12 {
+			dirty := ChannelEconomicsDirtyHour{Domain: account.Domain, AccountEpoch: epoch, HourTs: hour,
+				Reason: "test", Generation: 1, Status: "pending", NextAttemptAt: 1}
+			if err := db.Create(&dirty).Error; err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	// The account is disabled and the pricing ledger flag is off. These are
+	// still verified local facts; no upstream request is needed to drain them.
+	m.syncDueChannelEconomics(context.Background())
+	var remaining int64
+	if err := db.Model(&ChannelEconomicsDirtyHour{}).Count(&remaining).Error; err != nil || remaining != 8 {
+		t.Fatalf("first bounded local turn should reduce 12+4 jobs to 8: remaining=%d err=%v", remaining, err)
+	}
+	m.syncDueChannelEconomics(context.Background())
+	if err := db.Model(&ChannelEconomicsDirtyHour{}).Count(&remaining).Error; err != nil || remaining != 0 {
+		t.Fatalf("second local turn should empty the backlog: remaining=%d err=%v", remaining, err)
+	}
+	var published int64
+	if err := db.Model(&ChannelEconomicsHourManifestCurrent{}).Count(&published).Error; err != nil || published != 16 {
+		t.Fatalf("all verified hours should be published once: count=%d err=%v", published, err)
+	}
+}

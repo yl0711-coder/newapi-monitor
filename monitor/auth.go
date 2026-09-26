@@ -2,15 +2,20 @@ package monitor
 
 import (
 	"bytes"
+	"context"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"net/http"
 	"net/http/cookiejar"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -19,7 +24,8 @@ import (
 )
 
 // auth.go:登录鉴权与角色分权。复用 new-api 用户身份——账密提交给 new-api 验证,
-// 取回角色后由监控签发自己的会话。全程不改 new-api、不写主站,只调其只读接口。
+// 取回角色后由监控签发自己的会话。不改 new-api 业务数据；RC26 鉴权成功后会
+// 精确撤销本次临时登录会话，避免占用主站活跃会话名额。
 //
 // new-api 角色:1=普通用户 10=管理员 100=超级管理员(root)。
 // 规则:仅 >=10 可登录;100 可改配置,10 仅看监控,<10 提示无权限。
@@ -32,12 +38,81 @@ const (
 const sessionCookie = "newapi_monitor_session"
 const sessionTTL = 12 * time.Hour
 
+const (
+	newAPIAuthUserAgent      = "NexusAPI-Monitor/auth"
+	newAPIAuthRequestTimeout = 10 * time.Second
+	newAPISessionRevokeLimit = 3 * time.Second
+)
+
+type newAPILoginResponse struct {
+	Success bool   `json:"success"`
+	Message string `json:"message"`
+	Data    struct {
+		Username    string `json:"username"`
+		DisplayName string `json:"display_name"`
+		Role        int    `json:"role"`
+		AccessToken string `json:"access_token"`
+		Session     struct {
+			SID string `json:"sid"`
+		} `json:"session"`
+		User struct {
+			Username    string `json:"username"`
+			DisplayName string `json:"display_name"`
+			Role        int    `json:"role"`
+		} `json:"user"`
+	} `json:"data"`
+}
+
 func randomSecret() string {
 	b := make([]byte, 32)
 	if _, err := rand.Read(b); err != nil {
 		return "insecure-default-change-me"
 	}
 	return hex.EncodeToString(b)
+}
+
+func newAPIAuthRequest(ctx context.Context, method, target string, body io.Reader) (*http.Request, error) {
+	req, err := http.NewRequestWithContext(ctx, method, target, body)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", newAPIAuthUserAgent)
+	return req, nil
+}
+
+// revokeTemporaryNewAPISession closes only the RC26 dashboard session created
+// by the immediately preceding credential check. It deliberately uses the
+// session-specific endpoint rather than revoke-others, so browser sessions and
+// API keys cannot be affected.
+func revokeTemporaryNewAPISession(cl *http.Client, base, accessToken, sid string) error {
+	accessToken = strings.TrimSpace(accessToken)
+	sid = strings.TrimSpace(sid)
+	if accessToken == "" || sid == "" {
+		return nil // RC4 and older login responses have no server-side session bundle.
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), newAPISessionRevokeLimit)
+	defer cancel()
+	req, err := newAPIAuthRequest(ctx, http.MethodDelete, base+"/api/user/sessions/"+url.PathEscape(sid), nil)
+	if err != nil {
+		return errors.New("build temporary session revoke request failed")
+	}
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	resp, err := cl.Do(req)
+	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return fmt.Errorf("revoke temporary session timed out: %w", ctxErr)
+		}
+		// A net/http transport error normally embeds the full request URL. That
+		// URL contains the session SID, so do not wrap or log the raw error.
+		return errors.New("revoke temporary session request failed")
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return fmt.Errorf("revoke temporary session: HTTP %d", resp.StatusCode)
+	}
+	return nil
 }
 
 // newapiAuth 用 new-api 账号密码验证身份,返回角色与显示名。
@@ -48,36 +123,41 @@ func (m *Monitor) newapiAuth(username, password string) (role int, name string, 
 		return 0, "", fmt.Errorf("未配置主站地址(MONITOR_NEWAPI_BASE_URL)")
 	}
 	jar, _ := cookiejar.New(nil)
-	cl := &http.Client{Timeout: 10 * time.Second, Jar: jar}
+	cl := &http.Client{Timeout: newAPIAuthRequestTimeout, Jar: jar}
 
 	// 1) 登录(new-api 校验账密并下发会话 cookie)
 	payload, _ := json.Marshal(map[string]string{"username": username, "password": password})
-	resp, err := cl.Post(base+"/api/user/login", "application/json", bytes.NewReader(payload))
+	req, err := newAPIAuthRequest(context.Background(), http.MethodPost, base+"/api/user/login", bytes.NewReader(payload))
+	if err != nil {
+		return 0, "", fmt.Errorf("构造主站登录请求失败: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := cl.Do(req)
 	if err != nil {
 		return 0, "", fmt.Errorf("连接主站失败: %w", err)
 	}
-	var lr struct {
-		Success bool   `json:"success"`
-		Message string `json:"message"`
-		Data    struct {
-			Username    string `json:"username"`
-			DisplayName string `json:"display_name"`
-			Role        int    `json:"role"`
-			AccessToken string `json:"access_token"`
-			User        struct {
-				Username    string `json:"username"`
-				DisplayName string `json:"display_name"`
-				Role        int    `json:"role"`
-			} `json:"user"`
-		} `json:"data"`
-	}
-	_ = json.NewDecoder(resp.Body).Decode(&lr)
+	var lr newAPILoginResponse
+	decodeErr := json.NewDecoder(resp.Body).Decode(&lr)
 	resp.Body.Close()
+	if decodeErr != nil {
+		return 0, "", fmt.Errorf("解析主站登录响应失败: %w", decodeErr)
+	}
 	if !lr.Success {
 		if lr.Message == "" {
 			lr.Message = "用户名或密码错误"
 		}
 		return 0, "", fmt.Errorf("%s", lr.Message)
+	}
+	// RC26 creates a 30-day dashboard session for every successful login. The
+	// monitor only needs the returned role, so close that exact session before
+	// returning. Cleanup failure is observable but must not turn a valid login
+	// into a retry loop that creates still more sessions.
+	if lr.Data.AccessToken != "" && lr.Data.Session.SID != "" {
+		defer func() {
+			if cleanupErr := revokeTemporaryNewAPISession(cl, base, lr.Data.AccessToken, lr.Data.Session.SID); cleanupErr != nil {
+				slog.Warn("NewAPI 临时登录会话回收失败", "err", cleanupErr)
+			}
+		}()
 	}
 
 	// RC4 将用户信息直接放在 data 下，RC26 改为 data.user，并在 data 中
@@ -103,7 +183,10 @@ func (m *Monitor) newapiAuth(username, password string) (role int, name string, 
 	}
 
 	// 2) 兜底:登录响应未带角色时,再用会话取自身信息(含 role)
-	req, _ := http.NewRequest(http.MethodGet, base+"/api/user/self", nil)
+	req, err = newAPIAuthRequest(context.Background(), http.MethodGet, base+"/api/user/self", nil)
+	if err != nil {
+		return 0, "", fmt.Errorf("构造用户信息请求失败: %w", err)
+	}
 	if lr.Data.AccessToken != "" {
 		req.Header.Set("Authorization", "Bearer "+lr.Data.AccessToken)
 	}

@@ -942,8 +942,9 @@ func (m *Monitor) openStore(path string) error {
 		&StabilityHourSample{}, &ChannelTestHourSample{}, &StabilityRejectHour{}, &StabilityProblemSample{},
 		&StabilityProblemIngestState{}, &StabilityProblemStage{}, &StabilityProblemClassificationMigration{}, &StabilityProblemLiveCursor{},
 		&StabilityHourIngestState{}, &StabilityBackfillJob{},
-		&ChannelFinanceSetting{}, &ChannelSaleGroupRate{}, &WebsiteGroupCatalog{}, &ChannelDomainCost{}, &ChannelDomainGroupCost{}, &ChannelFinanceChannelCost{}, &ChannelFinanceVersion{},
-		&ChannelUpstreamAccount{}, &ChannelUpstreamUsageHour{}, &ChannelUpstreamUsageArchive{}, &ChannelUpstreamErrorLog{}, &ChannelUpstreamErrorLogArchive{}, &UpstreamErrorLogSyncState{}, &ChannelUpstreamFundEvent{}, &UpstreamFundSyncState{}, &NewAPIUsageBackfillCheckpoint{}, &NewAPIUsageBackfillSegment{}, &AICodeWithKeySyncState{}, &AICodeWithUsageStage{}, &AICodeWithUsageRound{}, &UpstreamHostCircuit{},
+		&ChannelFinanceSetting{}, &ChannelSaleGroupRate{}, &ChannelBusinessGroupPolicy{}, &WebsiteGroupCatalog{}, &ChannelDomainCost{}, &ChannelDomainGroupCost{}, &ChannelFinanceChannelCost{}, &ChannelFinanceVersion{},
+		&FinanceInternalAccount{}, &FinanceInternalAccountAudit{},
+		&ChannelUpstreamAccount{}, &ChannelUpstreamRetirement{}, &ChannelUpstreamUsageHour{}, &ChannelUpstreamUsageArchive{}, &ChannelUpstreamErrorLog{}, &ChannelUpstreamErrorLogArchive{}, &UpstreamErrorLogSyncState{}, &ChannelUpstreamFundEvent{}, &UpstreamFundSyncState{}, &NewAPIUsageBackfillCheckpoint{}, &NewAPIUsageBackfillSegment{}, &AICodeWithKeySyncState{}, &AICodeWithUsageStage{}, &AICodeWithUsageRound{}, &UpstreamHostCircuit{},
 		&ChannelUpstreamPricingHourEvidence{}, &ChannelUpstreamPricingHourState{}, &ChannelUpstreamPricingObservedState{}, &ChannelUpstreamPricingChangeEvent{}, &ChannelUpstreamPricingSyncState{}, &ChannelUpstreamPricingPageCheckpoint{}, &AICodeWithPricingCheckpoint{},
 		&ChannelUpstreamCostHourEvidence{}, &ChannelUpstreamCostHourState{}, &ChannelCostPageCheckpoint{}, &ChannelCostSourceBinding{}, &ChannelCostDirtyHour{}, &ChannelCostKeyRegistry{},
 		&ChannelPricingChangeProposal{}, &ChannelPricingProposalEvent{}, &ChannelFinanceActivation{}, &ChannelFinanceActivationSlot{}, &ChannelFinanceActivationEvent{},
@@ -1166,6 +1167,7 @@ func (m *Monitor) openUsageFactsStore(path string, prechecked bool) error {
 		&UsageTokenSnapshot{}, &UsageFactPublishedMember{}, &UsageFactRepairMember{}, &UsageFactJob{}, &UsageFactRepairRequest{}, &UsageFactSyncState{},
 		&FinanceUserHourFact{}, &FinanceUserHourState{}, &FinanceCreditEvent{}, &FinanceCreditHourState{},
 		&FinanceGiftBoundaryEvent{}, &FinanceGiftBoundaryState{}, &FinanceGiftRecipient{}, &FinanceFactSyncState{},
+		&FinanceInternalAccountHourFact{}, &FinanceInternalAccountFactState{},
 	); err != nil {
 		return fmt.Errorf("用量事实表迁移失败: %w", err)
 	}

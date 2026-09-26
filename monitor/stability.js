@@ -80,7 +80,7 @@ window.monitorShellSetTab=function(name){
   button.addEventListener('click',()=>apply(!shell.classList.contains('sidebar-collapsed')));
 })();
 
-const st={inited:false,loaded:false,view:'history',layer:'delivery',hours:0,days:7,custom:null,preset:'',filters:{vendor:'',group:'',channel:'',model:''},allFilters:null,report:null,reportKey:'',abort:null,reportPromise:null,reportPromiseKey:'',problemAbort:null,drawerAbort:null,edgeAbort:null,edgeReport:null,generation:0,detailPromises:new Map(),detailControllers:new Map(),detailLoading:new Set(),expanded:new Set(),chart:null,drawerChart:null,edgeChart:null,drawer:null,drawerTab:'run',lastFocus:null};
+const st={inited:false,loaded:false,view:'history',layer:'delivery',hours:24,days:7,custom:null,preset:'',filters:{vendor:'',group:'',channel:'',model:''},allFilters:null,report:null,reportKey:'',abort:null,reportPromise:null,reportPromiseKey:'',problemAbort:null,drawerAbort:null,edgeAbort:null,edgeReport:null,generation:0,detailPromises:new Map(),detailControllers:new Map(),detailLoading:new Set(),expanded:new Set(),chart:null,drawerChart:null,edgeChart:null,drawer:null,drawerTab:'run',lastFocus:null};
 const $=id=>document.getElementById(id);
 const esc=s=>String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const nfmt=n=>(+n||0).toLocaleString('zh-CN');

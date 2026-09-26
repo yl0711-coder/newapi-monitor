@@ -31,6 +31,9 @@ internal/financecredit/**
 !internal/financecur/
 internal/financecur/**
 !internal/financecur/*.go
+!internal/financegiftexport/
+internal/financegiftexport/**
+!internal/financegiftexport/*.go
 !internal/ecslogagent/
 internal/ecslogagent/**
 !internal/ecslogagent/*.go
@@ -88,3 +91,6 @@ secrets/
 tools/
 .run/
 **/.run/
+
+# ECS 云端验收脚本只允许留在源码/CI，不进入生产构建上下文。
+dev/

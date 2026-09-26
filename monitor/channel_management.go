@@ -52,22 +52,30 @@ type ChannelManagementRateConfig struct {
 // 它们均按主域名账户归集，不能推断为
 // 某一条实际渠道的上游账单。
 type ChannelUpstreamUsageMetrics struct {
-	Provisional           bool    `json:"provisional,omitempty"`
-	Available             bool    `json:"available"`
-	Requests              int64   `json:"requests"`
-	Tokens                int64   `json:"tokens"`
-	CostUSD               float64 `json:"cost_usd"`
-	AdjustedCostAvailable bool    `json:"adjusted_cost_available"`
-	AdjustedCostUSD       float64 `json:"adjusted_cost_usd"`
-	AdjustedCostStatus    string  `json:"adjusted_cost_status,omitempty"`
-	RechargeRatio         float64 `json:"recharge_ratio"`
-	RechargeRatioVaries   bool    `json:"recharge_ratio_varies,omitempty"`
-	ExpectedHours         int64   `json:"expected_hours"`
-	CompletedHours        int64   `json:"completed_hours"`
-	Complete              bool    `json:"complete"`
-	DataUntil             int64   `json:"data_until"`
-	Granularity           string  `json:"granularity,omitempty"`
-	IntegrityStatus       string  `json:"integrity_status,omitempty"` // complete / overlapping_buckets / invalid_amount / window_mismatch
+	Provisional                   bool     `json:"provisional,omitempty"`
+	Available                     bool     `json:"available"`
+	Requests                      int64    `json:"requests"`
+	Tokens                        int64    `json:"tokens"`
+	CostUSD                       float64  `json:"cost_usd"`
+	AdjustedCostAvailable         bool     `json:"adjusted_cost_available"`
+	AdjustedCostUSD               float64  `json:"adjusted_cost_usd"`
+	AdjustedCostStatus            string   `json:"adjusted_cost_status,omitempty"`
+	RechargeRatio                 float64  `json:"recharge_ratio"`
+	RechargeRatioVaries           bool     `json:"recharge_ratio_varies,omitempty"`
+	ExpectedHours                 int64    `json:"expected_hours"`
+	CompletedHours                int64    `json:"completed_hours"`
+	Complete                      bool     `json:"complete"`
+	DataUntil                     int64    `json:"data_until"`
+	Granularity                   string   `json:"granularity,omitempty"`
+	IntegrityStatus               string   `json:"integrity_status,omitempty"` // complete / overlapping_buckets / invalid_amount / window_mismatch
+	BusinessCostAvailable         bool     `json:"business_cost_available"`
+	BusinessCostUSD               float64  `json:"business_cost_usd"`
+	BusinessAdjustedCostAvailable bool     `json:"business_adjusted_cost_available"`
+	BusinessAdjustedCostUSD       float64  `json:"business_adjusted_cost_usd"`
+	InternalExcludedCostUSD       float64  `json:"internal_excluded_cost_usd,omitempty"`
+	InternalExcludedAdjustedUSD   float64  `json:"internal_excluded_adjusted_usd,omitempty"`
+	InternalFilterStatus          string   `json:"internal_filter_status,omitempty"`
+	InternalFilterReasons         []string `json:"internal_filter_reasons,omitempty"`
 }
 
 const (
@@ -101,19 +109,21 @@ type ChannelManagementVendor struct {
 }
 
 type ChannelManagementDomain struct {
-	Key              string                          `json:"key"`
-	Domain           string                          `json:"domain"`
-	Configured       bool                            `json:"configured"`
-	ManuallyDisabled bool                            `json:"manually_disabled"`
-	Usage            ChannelUsageMetrics             `json:"usage"`
-	Finance          ChannelDomainFinanceView        `json:"finance"`
-	Upstream         ChannelUpstreamAccountView      `json:"upstream"`
-	RateConfig       ChannelManagementRateConfig     `json:"rate_config"`
-	UpstreamUsage    ChannelUpstreamUsageMetrics     `json:"upstream_usage"`
-	NaturalDayBill   *ChannelUpstreamNaturalDayBill  `json:"natural_day_bill,omitempty"`
-	FinanceGroups    []ChannelManagementFinanceGroup `json:"finance_groups"`
-	Groups           []ChannelManagementGroup        `json:"groups"`
-	Vendors          []ChannelManagementVendor       `json:"vendors"`
+	Key               string                          `json:"key"`
+	Domain            string                          `json:"domain"`
+	Configured        bool                            `json:"configured"`
+	ManuallyDisabled  bool                            `json:"manually_disabled"`
+	Retiring          bool                            `json:"retiring"`
+	RetiringUpdatedAt int64                           `json:"retiring_updated_at,omitempty"`
+	Usage             ChannelUsageMetrics             `json:"usage"`
+	Finance           ChannelDomainFinanceView        `json:"finance"`
+	Upstream          ChannelUpstreamAccountView      `json:"upstream"`
+	RateConfig        ChannelManagementRateConfig     `json:"rate_config"`
+	UpstreamUsage     ChannelUpstreamUsageMetrics     `json:"upstream_usage"`
+	NaturalDayBill    *ChannelUpstreamNaturalDayBill  `json:"natural_day_bill,omitempty"`
+	FinanceGroups     []ChannelManagementFinanceGroup `json:"finance_groups"`
+	Groups            []ChannelManagementGroup        `json:"groups"`
+	Vendors           []ChannelManagementVendor       `json:"vendors"`
 }
 
 type ChannelManagementFilters struct {
@@ -155,6 +165,8 @@ type ChannelManagementReport struct {
 	Summary               ChannelManagementSummary      `json:"summary"`
 	Filters               ChannelManagementFilters      `json:"filters"`
 	Domains               []ChannelManagementDomain     `json:"domains"`
+	InternalAccounts      financeInternalFactStatus     `json:"internal_accounts"`
+	InternalScopeComplete bool                          `json:"internal_scope_complete"`
 }
 
 // ChannelCostClosureCapability is an explicit, read-only UI capability. The
@@ -173,6 +185,17 @@ type channelUsageAgg struct {
 	failed           int64
 	tokens           int64
 	quota            int64
+}
+
+type channelManagementUsageRow struct {
+	ChannelID int
+	Grp       string
+	Requests  int64
+	Success   int64
+	Anomaly   int64
+	Failed    int64
+	Tokens    int64
+	Quota     int64
 }
 
 func (a *channelUsageAgg) add(other channelUsageAgg) {
@@ -198,17 +221,18 @@ func (a channelUsageAgg) stability() *float64 {
 }
 
 type channelManagementBuild struct {
-	ID               int
-	Name             string
-	Vendor           string
-	Status           int
-	Current          bool
-	BaseDomain       string
-	BaseHost         string
-	ConfiguredGroups []string
-	ModelCount       int
-	Usage            channelUsageAgg
-	Groups           map[string]*channelUsageAgg
+	ID                int
+	Name              string
+	Vendor            string
+	Status            int
+	Current           bool
+	BaseDomain        string
+	BaseHost          string
+	ConfiguredGroups  []string
+	BusinessGroupOnly bool
+	ModelCount        int
+	Usage             channelUsageAgg
+	Groups            map[string]*channelUsageAgg
 }
 
 type channelVendorBuild struct {
@@ -486,6 +510,11 @@ func (m *Monitor) loadChannelUpstreamUsage(ctx context.Context, scope stabilityS
 	if err != nil {
 		return nil, err
 	}
+	restrictUpstreamUsageToWholeDays(result, scope)
+	return result, nil
+}
+
+func restrictUpstreamUsageToWholeDays(result map[string]ChannelUpstreamUsageMetrics, scope stabilityScope) {
 	for domain, metrics := range result {
 		// Even if one whole day fits, it is not the bill for a partial-day
 		// query. Keep such source bills in NaturalDayBill, outside exact totals.
@@ -495,10 +524,9 @@ func (m *Monitor) loadChannelUpstreamUsage(ctx context.Context, scope stabilityS
 				IntegrityStatus: upstreamUsageIntegrityWindowMismatch, AdjustedCostStatus: upstreamUsageIntegrityWindowMismatch}
 		}
 	}
-	return result, nil
 }
 
-func (m *Monitor) loadChannelUpstreamUsageWindow(ctx context.Context, scope stabilityScope, now int64, accounts map[string]ChannelUpstreamAccountView, finance channelFinanceSnapshot) (map[string]ChannelUpstreamUsageMetrics, error) {
+func (m *Monitor) loadChannelUpstreamUsageRows(ctx context.Context, scope stabilityScope) ([]ChannelUpstreamUsageHour, error) {
 	// Include an overlapping daily bucket so a mixed day/hour migration cannot
 	// silently drop the first partial day and pass the remainder as exact.
 	dbRows, err := m.storeDB.WithContext(ctx).Raw(`SELECT COALESCE(domain,''),COALESCE(hour_ts,0),COALESCE(bucket_seconds,0),
@@ -523,10 +551,30 @@ func (m *Monitor) loadChannelUpstreamUsageWindow(ctx context.Context, scope stab
 	if err := dbRows.Err(); err != nil {
 		return nil, err
 	}
+	return rows, nil
+}
+
+func (m *Monitor) loadChannelUpstreamUsageWindow(ctx context.Context, scope stabilityScope, now int64, accounts map[string]ChannelUpstreamAccountView, finance channelFinanceSnapshot) (map[string]ChannelUpstreamUsageMetrics, error) {
+	rows, err := m.loadChannelUpstreamUsageRows(ctx, scope)
+	if err != nil {
+		return nil, err
+	}
 	versions, err := m.loadChannelRechargeVersions(ctx, accounts, finance)
 	if err != nil {
 		return nil, err
 	}
+	return projectChannelUpstreamUsageWindow(rows, scope, now, accounts, versions)
+}
+
+// The same bucket validation is used by channel totals and daily finance bills.
+// Callers provide rows in domain/hour order; this projection performs no I/O.
+func projectChannelUpstreamUsageWindow(rows []ChannelUpstreamUsageHour, scope stabilityScope, now int64, accounts map[string]ChannelUpstreamAccountView, versions map[string][]channelRechargeVersion) (map[string]ChannelUpstreamUsageMetrics, error) {
+	return projectUpstreamUsageBuckets(rows, scope, now, accounts, versions, nil)
+}
+
+// accepted observes only validated buckets. Callers must still check the final
+// domain integrity: a later overlap or invalid bucket invalidates its total.
+func projectUpstreamUsageBuckets(rows []ChannelUpstreamUsageHour, scope stabilityScope, now int64, accounts map[string]ChannelUpstreamAccountView, versions map[string][]channelRechargeVersion, accepted func(ChannelUpstreamUsageHour)) (map[string]ChannelUpstreamUsageMetrics, error) {
 	type aggregate struct {
 		metrics        ChannelUpstreamUsageMetrics
 		completed      int64
@@ -599,6 +647,9 @@ func (m *Monitor) loadChannelUpstreamUsageWindow(ctx context.Context, scope stab
 		a.metrics.Requests += row.Requests
 		a.metrics.Tokens += row.Tokens
 		a.metrics.CostUSD += row.CostUSD
+		if accepted != nil {
+			accepted(row)
+		}
 		a.metrics.Provisional = a.metrics.Provisional || row.Provisional
 		a.completed += seconds
 		if until := end; until > a.metrics.DataUntil {
@@ -696,9 +747,25 @@ func (m *Monitor) buildChannelManagementReport(ctx context.Context, scope stabil
 	if err != nil {
 		return nil, err
 	}
+	businessGroupPolicies, err := loadChannelBusinessGroupPolicies(ctx, m.storeDB)
+	if err != nil {
+		return nil, fmt.Errorf("读取分组业务统计范围: %w", err)
+	}
+	internalAccounts, err := m.loadFinanceConfiguredInternalEvidence(ctx, scope, businessGroupPolicies)
+	if err != nil {
+		return nil, fmt.Errorf("读取内部账号渠道事实: %w", err)
+	}
+	internalUsage, err := channelInternalUsageByChannelGroup(internalAccounts)
+	if err != nil {
+		return nil, fmt.Errorf("汇总内部账号渠道用量: %w", err)
+	}
 	upstreamAccounts, err := m.loadChannelUpstreamViews(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("读取上游账户状态: %w", err)
+	}
+	retirements, err := m.loadChannelUpstreamRetirements(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("读取停止使用标记: %w", err)
 	}
 	upstreamUsage, err := m.loadChannelUpstreamUsage(ctx, scope, now, upstreamAccounts, finance)
 	if err != nil {
@@ -707,6 +774,9 @@ func (m *Monitor) buildChannelManagementReport(ctx context.Context, scope stabil
 	naturalDayBills, err := m.loadChannelUpstreamNaturalDayBills(ctx, scope, now, upstreamAccounts, finance)
 	if err != nil {
 		return nil, fmt.Errorf("读取自然日上游账单: %w", err)
+	}
+	if err := m.applyChannelInternalCostViews(ctx, scope, now, businessGroupPolicies, internalAccounts, upstreamUsage, naturalDayBills); err != nil {
+		return nil, err
 	}
 	assessments, assessmentErr := m.upstreamBalanceAssessments(ctx, now, upstreamAccounts, m.loadAlertConfig())
 	if assessmentErr != nil {
@@ -753,44 +823,26 @@ func (m *Monitor) buildChannelManagementReport(ctx context.Context, scope stabil
 		if name == "" {
 			name = fmt.Sprintf("渠道 #%d", snap.ID)
 		}
-		configuredGroups := sortedUnique(splitList(snap.Groups))
+		allConfiguredGroups := sortedUnique(splitList(snap.Groups))
+		configuredGroups := make([]string, 0, len(allConfiguredGroups))
+		for _, group := range allConfiguredGroups {
+			if channelBusinessGroupIncluded(businessGroupPolicies, group) {
+				configuredGroups = append(configuredGroups, group)
+			}
+		}
 		current := snap.DeletedAt == 0
 		channels[snap.ID] = &channelManagementBuild{
 			ID: snap.ID, Name: name, Vendor: vendor, Status: snap.Status, Current: current,
 			BaseDomain: strings.TrimSpace(snap.BaseDomain), BaseHost: strings.TrimSpace(snap.BaseHost),
-			ConfiguredGroups: configuredGroups,
-			ModelCount:       len(sortedUnique(splitList(snap.Models))), Groups: map[string]*channelUsageAgg{},
-		}
-		if current {
-			currentChannels++
-			if snap.Status == 1 {
-				enabledChannels++
-			}
-			if snap.BaseDomain != "" {
-				configuredDomainSet[snap.BaseDomain] = true
-			} else {
-				unconfiguredChannels++
-			}
-		}
-		vendorSet[vendor] = true
-		for _, group := range configuredGroups {
-			groupSet[group] = true
+			ConfiguredGroups: configuredGroups, BusinessGroupOnly: len(allConfiguredGroups) > 0 && len(configuredGroups) == 0,
+			ModelCount: len(sortedUnique(splitList(snap.Models))), Groups: map[string]*channelUsageAgg{},
 		}
 		if snap.UpdatedAt > configUpdatedAt {
 			configUpdatedAt = snap.UpdatedAt
 		}
 	}
 
-	var usageRows []struct {
-		ChannelID int
-		Grp       string
-		Requests  int64
-		Success   int64
-		Anomaly   int64
-		Failed    int64
-		Tokens    int64
-		Quota     int64
-	}
+	var usageRows []channelManagementUsageRow
 	tx = m.storeDB.WithContext(ctx).Raw(`SELECT channel_id,COALESCE(grp,'') grp,
 		COALESCE(SUM(success+anomaly+failed),0) requests,
 		COALESCE(SUM(success),0) success,COALESCE(SUM(anomaly),0) anomaly,
@@ -805,6 +857,15 @@ func (m *Monitor) buildChannelManagementReport(ctx context.Context, scope stabil
 		return nil, fmt.Errorf("渠道×服务分组维度超过安全上限 %d，为保证准确性已拒绝返回部分结果", maxChannelManagementRows)
 	}
 	for _, row := range usageRows {
+		groupName := strings.TrimSpace(row.Grp)
+		if groupName != "" && !channelBusinessGroupIncluded(businessGroupPolicies, groupName) {
+			continue
+		}
+		if fact, ok := internalUsage[channelInternalUsageKey{ChannelID: row.ChannelID, Group: groupName}]; ok {
+			if err := subtractChannelInternalUsage(&row, fact); err != nil {
+				return nil, err
+			}
+		}
 		ch := channels[row.ChannelID]
 		if ch == nil {
 			// 小时汇总可能仍保留已删除渠道的历史使用量。为保证总数守恒，
@@ -817,7 +878,6 @@ func (m *Monitor) buildChannelManagementReport(ctx context.Context, scope stabil
 		}
 		usage := channelUsageAgg{requests: row.Requests, success: row.Success, anomaly: row.Anomaly, failed: row.Failed, tokens: row.Tokens, quota: row.Quota}
 		ch.Usage.add(usage)
-		groupName := strings.TrimSpace(row.Grp)
 		if groupName == "" {
 			groupName = "未标记服务分组"
 		}
@@ -832,6 +892,29 @@ func (m *Monitor) buildChannelManagementReport(ctx context.Context, scope stabil
 	var total channelUsageAgg
 	historicalChannels := 0
 	for _, ch := range channels {
+		// 当前渠道只关联了明确排除的测试分组，且没有其他业务
+		// 分组用量时，不进入渠道管理的面向经营视图。原始快照和日志仍保留。
+		if ch.BusinessGroupOnly && len(ch.Groups) == 0 {
+			continue
+		}
+		vendorSet[ch.Vendor] = true
+		for _, group := range ch.ConfiguredGroups {
+			groupSet[group] = true
+		}
+		for group := range ch.Groups {
+			groupSet[group] = true
+		}
+		if ch.Current {
+			currentChannels++
+			if ch.Status == 1 {
+				enabledChannels++
+			}
+			if ch.BaseDomain != "" {
+				configuredDomainSet[ch.BaseDomain] = true
+			} else {
+				unconfiguredChannels++
+			}
+		}
 		key, label, configured := "domain:"+ch.BaseDomain, ch.BaseDomain, ch.BaseDomain != ""
 		if !ch.Current {
 			historicalChannels++
@@ -912,6 +995,7 @@ func (m *Monitor) buildChannelManagementReport(ctx context.Context, scope stabil
 		}
 		responseDomains = append(responseDomains, ChannelManagementDomain{
 			Key: domain.Key, Domain: domain.Domain, Configured: domain.Configured, ManuallyDisabled: channelDomainManuallyDisabled(domain),
+			Retiring: retirements[domain.Domain].Retiring, RetiringUpdatedAt: retirements[domain.Domain].UpdatedAt,
 			Usage: domain.Usage.metrics(), Finance: finance.domainView(domain.Domain),
 			Upstream:       upstream,
 			RateConfig:     managementRateConfig(domain, finance),
@@ -999,7 +1083,7 @@ func (m *Monitor) buildChannelManagementReport(ctx context.Context, scope stabil
 			HistoricalChannels: historicalChannels, Usage: total.metrics(),
 		},
 		Filters: ChannelManagementFilters{Domains: filterDomains, Vendors: filterVendors, Groups: filterGroups},
-		Domains: responseDomains,
+		Domains: responseDomains, InternalAccounts: internalAccounts.SyncState, InternalScopeComplete: internalAccounts.Complete,
 	}, nil
 }
 

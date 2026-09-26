@@ -25,6 +25,32 @@ func publishFinanceGiftTestHour(t *testing.T, m *Monitor, hour int64, userID int
 	}
 }
 
+func TestFinanceGiftBoundaryReadPreservesOrderIndependentProof(t *testing.T) {
+	m := newFinanceReportTestMonitor(t, "gift-order.example")
+	db := m.usageFactsStore()
+	events := []FinanceGiftBoundaryEvent{
+		{SourceEpoch: "epoch-1", SourceLogID: 9, HourTs: 3600, UserID: 7, EventAt: 3700, Kind: "usage", Quota: 500_000},
+		{SourceEpoch: "epoch-1", SourceLogID: 8, HourTs: 3600, UserID: 7, EventAt: 3650, Kind: "refund", Quota: 100_000},
+	}
+	for i := range events {
+		events[i].EvidenceHash = financeGiftBoundaryEventHash(events[i])
+	}
+	if err := db.Create(&events).Error; err != nil {
+		t.Fatal(err)
+	}
+	var loaded []FinanceGiftBoundaryEvent
+	err := walkFinanceGiftBoundaryEvents(context.Background(), db, 3600, 7200, []int64{7}, func(event FinanceGiftBoundaryEvent) error {
+		loaded = append(loaded, event)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(loaded) != len(events) || financeGiftBoundaryContentHash(loaded) != financeGiftBoundaryContentHash(events) {
+		t.Fatalf("gift boundary proof changed with database row order: loaded=%+v", loaded)
+	}
+}
+
 func TestLoadFinanceGiftAllocationUsesOpeningBalanceAndExactBoundaries(t *testing.T) {
 	m := newFinanceReportTestMonitor(t, "gift.example")
 	db := m.usageFactsStore()
