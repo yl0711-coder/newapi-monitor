@@ -853,8 +853,8 @@ func (m *Monitor) allowedChannelFinanceGroups(ctx context.Context, domain string
 	var history []struct{ Grp string }
 	if tx := m.storeDB.WithContext(ctx).Raw(`SELECT DISTINCT s.grp FROM stability_hour_samples s
 		JOIN channel_snaps c ON c.id=s.channel_id
-		WHERE c.base_domain=? AND s.grp<>'' AND s.traffic_class_version=? LIMIT ?`,
-		domain, stabilityTrafficClassificationVersion, maxChannelFinanceGroups+1).Scan(&history); tx.Error != nil {
+		WHERE c.base_domain=? AND s.grp<>'' AND s.traffic_class_version IN ? LIMIT ?`,
+		domain, accountingTrafficVersions(), maxChannelFinanceGroups+1).Scan(&history); tx.Error != nil {
 		return nil, fmt.Errorf("核对历史服务分组: %w", tx.Error)
 	}
 	if len(history) > maxChannelFinanceGroups {

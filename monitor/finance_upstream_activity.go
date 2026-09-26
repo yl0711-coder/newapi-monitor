@@ -15,14 +15,14 @@ import (
 const financeUpstreamActivityQuery = `SELECT domain, MIN(hour_ts) first_ts FROM (
 	SELECT LOWER(COALESCE(NULLIF(TRIM(c.base_domain),''),'未配置/历史')) domain,
 		(SELECT s.hour_ts FROM stability_hour_samples s
-		 WHERE s.channel_id=c.id AND s.hour_ts<? AND s.traffic_class_version=?
+		 WHERE s.channel_id=c.id AND s.hour_ts<? AND s.traffic_class_version IN ?
 		 AND (s.success+s.anomaly+s.failed<>0 OR s.quota<>0 OR s.refund_quota<>0)
 		 ORDER BY s.hour_ts LIMIT 1) hour_ts
 	FROM channel_snaps c
 	UNION ALL
 	SELECT LOWER(COALESCE(NULLIF(TRIM(c.base_domain),''),'未配置/历史')) domain,
 		(SELECT t.hour_ts FROM channel_test_hour_samples t
-		 WHERE t.channel_id=c.id AND t.hour_ts<? AND t.traffic_class_version=?
+		 WHERE t.channel_id=c.id AND t.hour_ts<? AND t.traffic_class_version IN ?
 		 AND (t.requests<>0 OR t.quota<>0)
 		 ORDER BY t.hour_ts LIMIT 1) hour_ts
 	FROM channel_snaps c
@@ -34,7 +34,7 @@ const financeUpstreamActivityQuery = `SELECT domain, MIN(hour_ts) first_ts FROM 
 ) activity GROUP BY domain HAVING MIN(hour_ts) IS NOT NULL`
 
 func financeUpstreamActivityArgs(to int64) []any {
-	return []any{to, stabilityTrafficClassificationVersion, to, stabilityTrafficClassificationVersion, to}
+	return []any{to, accountingTrafficVersions(), to, accountingTrafficVersions(), to}
 }
 
 func (m *Monitor) loadFinanceUpstreamActivityStarts(ctx context.Context, to int64) (map[string]int64, error) {

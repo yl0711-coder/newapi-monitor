@@ -61,8 +61,8 @@ func TestFinanceActivityStartsPreserveEligibility(t *testing.T) {
 		{ID: 13, BaseDomain: "epoch-zero.example"},
 	}
 	users := []StabilityHourSample{
-		{ChannelID: 1, HourTs: 10, Success: 1, TrafficClassVersion: stabilityTrafficClassificationVersion - 1},
-		{ChannelID: 1, HourTs: 20, Tokens: 1}, // Tokens alone were not activity.
+		{ChannelID: 1, HourTs: 10, Success: 1, TrafficClassVersion: 5}, // Pre-v6 monetary facts are not compatible.
+		{ChannelID: 1, HourTs: 20, Tokens: 1},                          // Tokens alone were not activity.
 		{ChannelID: 1, HourTs: 300, Success: 1},
 		{ChannelID: 2, HourTs: 50, Quota: 1}, // Disabled/deleted still has history.
 		{ChannelID: 3, HourTs: 400, Anomaly: 1},
@@ -77,7 +77,7 @@ func TestFinanceActivityStartsPreserveEligibility(t *testing.T) {
 		{ChannelID: 13, HourTs: 0, Success: 1},  // A real zero hour is not NULL.
 	}
 	tests := []ChannelTestHourSample{
-		{ChannelID: 3, HourTs: 10, Requests: 1, TrafficClassVersion: stabilityTrafficClassificationVersion - 1},
+		{ChannelID: 3, HourTs: 10, Requests: 1, TrafficClassVersion: 5},
 		{ChannelID: 3, HourTs: 20, Tokens: 1},
 		{ChannelID: 3, HourTs: 120, Requests: 1},
 		{ChannelID: 11, HourTs: 140, Quota: -1},

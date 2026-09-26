@@ -98,6 +98,7 @@ type ChannelManagementChannel struct {
 	ConfiguredGroups []string                 `json:"configured_groups"`
 	ModelCount       int                      `json:"model_count"`
 	Stability        *float64                 `json:"stability"`
+	StabilityBasis   string                   `json:"stability_basis,omitempty"`
 	Usage            ChannelUsageMetrics      `json:"usage"`
 	Groups           []ChannelManagementGroup `json:"groups"`
 }
@@ -185,17 +186,21 @@ type channelUsageAgg struct {
 	failed           int64
 	tokens           int64
 	quota            int64
+	deliveryMin      int
+	deliveryMax      int
 }
 
 type channelManagementUsageRow struct {
-	ChannelID int
-	Grp       string
-	Requests  int64
-	Success   int64
-	Anomaly   int64
-	Failed    int64
-	Tokens    int64
-	Quota     int64
+	ChannelID   int
+	Grp         string
+	Requests    int64
+	Success     int64
+	Anomaly     int64
+	Failed      int64
+	Tokens      int64
+	Quota       int64
+	DeliveryMin int
+	DeliveryMax int
 }
 
 func (a *channelUsageAgg) add(other channelUsageAgg) {
@@ -205,6 +210,10 @@ func (a *channelUsageAgg) add(other channelUsageAgg) {
 	a.failed += other.failed
 	a.tokens += other.tokens
 	a.quota += other.quota
+	if other.deliveryMin > 0 && (a.deliveryMin == 0 || other.deliveryMin < a.deliveryMin) {
+		a.deliveryMin = other.deliveryMin
+	}
+	a.deliveryMax = max(a.deliveryMax, other.deliveryMax)
 }
 
 func (a channelUsageAgg) metrics() ChannelUsageMetrics {
@@ -212,12 +221,25 @@ func (a channelUsageAgg) metrics() ChannelUsageMetrics {
 }
 
 func (a channelUsageAgg) stability() *float64 {
+	if a.stabilityBasis() == "mixed" {
+		return nil
+	}
 	total := a.success + a.anomaly + a.failed
 	if total == 0 {
 		return nil
 	}
 	value := rate(a.success, total)
 	return &value
+}
+
+func (a channelUsageAgg) stabilityBasis() string {
+	if a.deliveryMin != a.deliveryMax {
+		return "mixed"
+	}
+	if a.deliveryMin == 6 {
+		return "legacy"
+	}
+	return ""
 }
 
 type channelManagementBuild struct {
@@ -844,12 +866,13 @@ func (m *Monitor) buildChannelManagementReport(ctx context.Context, scope stabil
 
 	var usageRows []channelManagementUsageRow
 	tx = m.storeDB.WithContext(ctx).Raw(`SELECT channel_id,COALESCE(grp,'') grp,
+		MIN(traffic_class_version) delivery_min, MAX(traffic_class_version) delivery_max,
 		COALESCE(SUM(success+anomaly+failed),0) requests,
 		COALESCE(SUM(success),0) success,COALESCE(SUM(anomaly),0) anomaly,
 		COALESCE(SUM(failed),0) failed,
 		COALESCE(SUM(tokens),0) tokens,COALESCE(SUM(quota),0) quota
-		FROM stability_hour_samples WHERE hour_ts>=? AND hour_ts<? AND traffic_class_version=?
-		GROUP BY channel_id,grp LIMIT ?`, scope.FromTs, scope.ToTs, stabilityTrafficClassificationVersion, maxChannelManagementRows+1).Scan(&usageRows)
+		FROM stability_hour_samples WHERE hour_ts>=? AND hour_ts<? AND traffic_class_version IN ?
+		GROUP BY channel_id,grp LIMIT ?`, scope.FromTs, scope.ToTs, accountingTrafficVersions(), maxChannelManagementRows+1).Scan(&usageRows)
 	if tx.Error != nil {
 		return nil, fmt.Errorf("读取渠道用量汇总: %w", tx.Error)
 	}
@@ -876,7 +899,8 @@ func (m *Monitor) buildChannelManagementReport(ctx context.Context, scope stabil
 			}
 			channels[row.ChannelID] = ch
 		}
-		usage := channelUsageAgg{requests: row.Requests, success: row.Success, anomaly: row.Anomaly, failed: row.Failed, tokens: row.Tokens, quota: row.Quota}
+		usage := channelUsageAgg{requests: row.Requests, success: row.Success, anomaly: row.Anomaly, failed: row.Failed, tokens: row.Tokens, quota: row.Quota,
+			deliveryMin: row.DeliveryMin, deliveryMax: row.DeliveryMax}
 		ch.Usage.add(usage)
 		if groupName == "" {
 			groupName = "未标记服务分组"
@@ -973,7 +997,7 @@ func (m *Monitor) buildChannelManagementReport(ctx context.Context, scope stabil
 				outChannels = append(outChannels, ChannelManagementChannel{
 					ID: ch.ID, Name: ch.Name, Host: ch.BaseHost, Vendor: ch.Vendor, Status: ch.Status, Current: ch.Current,
 					ConfiguredGroups: ch.ConfiguredGroups, ModelCount: ch.ModelCount,
-					Stability: ch.Usage.stability(), Usage: ch.Usage.metrics(), Groups: managementGroups(ch.Groups, ch.ConfiguredGroups, ch.BaseDomain, ch.ID, finance),
+					Stability: ch.Usage.stability(), StabilityBasis: ch.Usage.stabilityBasis(), Usage: ch.Usage.metrics(), Groups: managementGroups(ch.Groups, ch.ConfiguredGroups, ch.BaseDomain, ch.ID, finance),
 				})
 			}
 			vendors = append(vendors, ChannelManagementVendor{Name: vendor.Name, Usage: vendor.Usage.metrics(), Channels: outChannels})
@@ -1023,8 +1047,8 @@ func (m *Monitor) buildChannelManagementReport(ctx context.Context, scope stabil
 	})
 
 	var coverage struct{ Max int64 }
-	if tx := m.storeDB.WithContext(ctx).Raw("SELECT COALESCE(MAX(hour_ts),0) max FROM stability_hour_samples WHERE hour_ts>=? AND hour_ts<? AND traffic_class_version=?",
-		scope.FromTs, scope.ToTs, stabilityTrafficClassificationVersion).Scan(&coverage); tx.Error != nil {
+	if tx := m.storeDB.WithContext(ctx).Raw("SELECT COALESCE(MAX(hour_ts),0) max FROM stability_hour_samples WHERE hour_ts>=? AND hour_ts<? AND traffic_class_version IN ?",
+		scope.FromTs, scope.ToTs, accountingTrafficVersions()).Scan(&coverage); tx.Error != nil {
 		return nil, fmt.Errorf("读取渠道用量新鲜度: %w", tx.Error)
 	}
 	dataUntil := coverage.Max
@@ -1035,8 +1059,8 @@ func (m *Monitor) buildChannelManagementReport(ctx context.Context, scope stabil
 		}
 	}
 	var latestCoverage struct{ Max int64 }
-	if tx := m.storeDB.WithContext(ctx).Raw("SELECT COALESCE(MAX(hour_ts),0) max FROM stability_hour_samples WHERE traffic_class_version=?",
-		stabilityTrafficClassificationVersion).Scan(&latestCoverage); tx.Error != nil {
+	if tx := m.storeDB.WithContext(ctx).Raw("SELECT COALESCE(MAX(hour_ts),0) max FROM stability_hour_samples WHERE traffic_class_version IN ?",
+		accountingTrafficVersions()).Scan(&latestCoverage); tx.Error != nil {
 		return nil, fmt.Errorf("读取渠道用量全局新鲜度: %w", tx.Error)
 	}
 	latestDataUntil := latestCoverage.Max
@@ -1075,7 +1099,7 @@ func (m *Monitor) buildChannelManagementReport(ctx context.Context, scope stabil
 			To:   time.Unix(scope.ToTs, 0).In(cstLocation).Format(rangeFormat), GeneratedAt: now,
 			DataUntil: dataUntil, LatestDataUntil: latestDataUntil, ChannelConfigUpdatedAt: configUpdatedAt,
 			TimeZone: "Asia/Shanghai", Source: "monitor_local_hourly_rollup",
-			DataCoverage: m.stabilityDataCoverage(ctx, scope.FromTs, scope.ToTs, now),
+			DataCoverage: m.accountingDataCoverage(ctx, scope.FromTs, scope.ToTs, now),
 		},
 		Summary: ChannelManagementSummary{
 			ConfiguredDomains: len(configuredDomainSet), CurrentChannels: currentChannels,

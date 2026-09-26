@@ -61,14 +61,14 @@ func (m *Monitor) loadFinanceDailyUnconfiguredActivity(ctx context.Context, scop
 	err := m.storeDB.WithContext(ctx).Raw(`SELECT DISTINCT ((s.hour_ts+28800)/86400)*86400-28800 day_ts,
 		LOWER(COALESCE(NULLIF(TRIM(c.base_domain),''),'未配置/历史')) domain
 		FROM stability_hour_samples s LEFT JOIN channel_snaps c ON c.id=s.channel_id
-		WHERE s.hour_ts>=? AND s.hour_ts<? AND s.traffic_class_version=?
+		WHERE s.hour_ts>=? AND s.hour_ts<? AND s.traffic_class_version IN ?
 		AND (s.success+s.anomaly+s.failed<>0 OR s.quota<>0 OR s.refund_quota<>0)
 		UNION
 		SELECT DISTINCT ((t.hour_ts+28800)/86400)*86400-28800 day_ts,
 		LOWER(COALESCE(NULLIF(TRIM(c.base_domain),''),'未配置/历史')) domain
 		FROM channel_test_hour_samples t LEFT JOIN channel_snaps c ON c.id=t.channel_id
-		WHERE t.hour_ts>=? AND t.hour_ts<? AND t.traffic_class_version=? AND (t.requests<>0 OR t.quota<>0)`,
-		scope.FromTs, scope.ToTs, stabilityTrafficClassificationVersion, scope.FromTs, scope.ToTs, stabilityTrafficClassificationVersion).Scan(&activity).Error
+		WHERE t.hour_ts>=? AND t.hour_ts<? AND t.traffic_class_version IN ? AND (t.requests<>0 OR t.quota<>0)`,
+		scope.FromTs, scope.ToTs, accountingTrafficVersions(), scope.FromTs, scope.ToTs, accountingTrafficVersions()).Scan(&activity).Error
 	if err != nil {
 		return nil, fmt.Errorf("读取每日账单覆盖范围: %w", err)
 	}

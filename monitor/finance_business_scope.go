@@ -39,9 +39,9 @@ func (m *Monitor) financeCostExclusions(ctx context.Context, scope stabilityScop
 		COALESCE(SUM(refund_records),0) refund_records,
 		COALESCE(SUM(quota),0) consume_quota,COALESCE(SUM(refund_quota),0) refund_quota
 		FROM stability_hour_samples WHERE hour_ts>=? AND hour_ts<?
-		AND traffic_class_version=? AND TRIM(grp) IN ?
+		AND traffic_class_version IN ? AND TRIM(grp) IN ?
 		GROUP BY hour_ts,channel_id,grp LIMIT ?`, scope.FromTs, scope.ToTs,
-		stabilityTrafficClassificationVersion, groups, maxChannelEconomicsReportRows+1).Scan(&rows).Error
+		accountingTrafficVersions(), groups, maxChannelEconomicsReportRows+1).Scan(&rows).Error
 	if err != nil {
 		return configured, fmt.Errorf("读取非业务分组成本排除依据: %w", err)
 	}

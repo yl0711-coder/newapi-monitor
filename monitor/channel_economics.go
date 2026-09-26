@@ -49,7 +49,7 @@ func loadChannelEconomicsUnallocatedRefundTx(tx *gorm.DB, hourTs int64) (channel
 	err := tx.Raw(`SELECT COALESCE(SUM(refund_records),0) records,
 		COALESCE(SUM(refund_quota),0) quota
 		FROM stability_hour_samples
-		WHERE hour_ts=? AND traffic_class_version=? AND channel_id<=0`, hourTs, stabilityTrafficClassificationVersion).Scan(&fact).Error
+		WHERE hour_ts=? AND traffic_class_version IN ? AND channel_id<=0`, hourTs, accountingTrafficVersions()).Scan(&fact).Error
 	if err != nil {
 		return fact, err
 	}
@@ -407,8 +407,8 @@ func (m *Monitor) publishChannelEconomicsHour(ctx context.Context, account Chann
 			COALESCE(SUM(s.refund_quota),0) refund_quota
 			FROM stability_hour_samples s
 			JOIN channel_snaps c ON c.id=s.channel_id
-			WHERE s.hour_ts=? AND s.traffic_class_version=? AND c.base_domain=?
-			GROUP BY s.channel_id`, hourTs, stabilityTrafficClassificationVersion, account.Domain).Scan(&localRows).Error; err != nil {
+			WHERE s.hour_ts=? AND s.traffic_class_version IN ? AND c.base_domain=?
+			GROUP BY s.channel_id`, hourTs, accountingTrafficVersions(), account.Domain).Scan(&localRows).Error; err != nil {
 			return err
 		}
 		for _, local := range localRows {
@@ -432,7 +432,7 @@ func (m *Monitor) publishChannelEconomicsHour(ctx context.Context, account Chann
 		}
 		localFactStatus := "observed"
 		var ingest StabilityHourIngestState
-		if err := tx.First(&ingest, "hour_ts = ?", hourTs).Error; err == nil && ingest.Status == "complete" && ingest.TrafficClassVersion == stabilityTrafficClassificationVersion {
+		if err := tx.First(&ingest, "hour_ts = ?", hourTs).Error; err == nil && ingest.Status == "complete" && accountingTrafficVersionSupported(ingest.TrafficClassVersion) {
 			localFactStatus = "verified"
 		} else if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
 			return err
@@ -653,7 +653,7 @@ func (m *Monitor) enqueueChangedEconomicsLocalHoursTx(tx *gorm.DB, sinceTs, now 
 	if err := tx.Raw(`WITH source AS (
 		SELECT hour_ts, SUM(refund_records) records, SUM(refund_quota) quota
 		FROM stability_hour_samples
-		WHERE hour_ts>=? AND traffic_class_version=? AND channel_id<=0
+		WHERE hour_ts>=? AND traffic_class_version IN ? AND channel_id<=0
 		GROUP BY hour_ts
 	), hours AS (
 		SELECT hour_ts FROM source
@@ -665,7 +665,7 @@ func (m *Monitor) enqueueChangedEconomicsLocalHoursTx(tx *gorm.DB, sinceTs, now 
 	LEFT JOIN channel_economics_global_hour_facts g ON g.hour_ts=h.hour_ts AND g.semantics_version=?
 	WHERE COALESCE(s.records,0)<>COALESCE(g.unallocated_refund_records,0)
 	   OR COALESCE(s.quota,0)<>COALESCE(g.unallocated_refund_quota,0)
-	ORDER BY h.hour_ts DESC LIMIT ?`, sinceTs, stabilityTrafficClassificationVersion, sinceTs, channelEconomicsSemanticsVersion, channelEconomicsSemanticsVersion, limit).
+	ORDER BY h.hour_ts DESC LIMIT ?`, sinceTs, accountingTrafficVersions(), sinceTs, channelEconomicsSemanticsVersion, channelEconomicsSemanticsVersion, limit).
 		Scan(&globalChangedHours).Error; err != nil {
 		return err
 	}
@@ -699,7 +699,7 @@ func (m *Monitor) enqueueChangedEconomicsLocalHoursTx(tx *gorm.DB, sinceTs, now 
 		       SUM(sh.quota) consume_quota, SUM(sh.refund_quota) refund_quota
 		FROM stability_hour_samples sh
 		JOIN channel_snaps cs ON cs.id=sh.channel_id
-		WHERE sh.hour_ts>=? AND sh.traffic_class_version=? AND cs.base_domain IN ?
+		WHERE sh.hour_ts>=? AND sh.traffic_class_version IN ? AND cs.base_domain IN ?
 		GROUP BY cs.base_domain, sh.hour_ts, sh.channel_id
 	), current_pub AS (
 		SELECT p.* FROM channel_economics_hour_current cur
@@ -721,7 +721,7 @@ func (m *Monitor) enqueueChangedEconomicsLocalHoursTx(tx *gorm.DB, sinceTs, now 
 	        AND NOT EXISTS (SELECT 1 FROM local l WHERE l.domain=p.domain AND l.hour_ts=p.hour_ts AND l.channel_id=p.local_channel_id))
 	  )
 	ORDER BY c.hour_ts DESC LIMIT ?`,
-		sinceTs, stabilityTrafficClassificationVersion, m.cfg.ChannelCostClosureDomains,
+		sinceTs, accountingTrafficVersions(), m.cfg.ChannelCostClosureDomains,
 		sinceTs, channelCostEvidenceSemanticsVersion, m.cfg.ChannelCostClosureDomains,
 		channelEconomicsSemanticsVersion, channelEconomicsSemanticsVersion, limit).Scan(&changed).Error
 	if err != nil {

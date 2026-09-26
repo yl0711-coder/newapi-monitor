@@ -378,7 +378,7 @@ function channelGroupRows(domain,group){
       <div class="cm-group-gap"><b>${gap}</b></div>
       <div class="cm-group-models"><b>${nfmt(channel.model_count)} 个模型</b></div>
       <div>${statusLabel(channel)}</div>
-      <div class="cm-group-stability"><b>${channelUsageComplete()?stabilityText(channel.stability):'—'}</b></div>
+      <div class="cm-group-stability"><b>${channelUsageComplete()?stabilityText(channel.stability):'—'}</b>${channel.stability_basis==='legacy'?'<small title="历史成功率按原统计口径计算；金额与用量不受影响">历史口径</small>':channel.stability_basis==='mixed'?'<small title="区间包含不同成功率口径，待统一后显示；金额与用量正常统计">口径更新中</small>':''}</div>
 	  <span class="cm-number">${usageMetric(usage.requests,nfmt)}</span>
 	  <span class="cm-number">${usageMetric(usage.tokens,compact)}</span>
 	  <span class="cm-number">${usageMetric(usage.cost_usd,usd)}</span>

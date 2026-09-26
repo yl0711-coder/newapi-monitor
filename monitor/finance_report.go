@@ -1324,7 +1324,7 @@ func (m *Monitor) applyFinanceVerifiedPrefixRevenue(ctx context.Context, stateme
 	}
 	var laterFactRows int64
 	if err := m.storeDB.WithContext(ctx).Model(&StabilityHourSample{}).
-		Where("hour_ts >= ? AND hour_ts < ? AND traffic_class_version = ?", verifiedTo, requestedTo, stabilityTrafficClassificationVersion).
+		Where("hour_ts >= ? AND hour_ts < ? AND traffic_class_version IN ?", verifiedTo, requestedTo, accountingTrafficVersions()).
 		Count(&laterFactRows).Error; err != nil {
 		return err
 	}
@@ -1452,8 +1452,8 @@ func (m *Monitor) loadFinanceDailyUserFacts(ctx context.Context, scope stability
 	usageSQL := `SELECT ` + cstDaySQL + ` day_ts,grp,
 		COALESCE(SUM(quota),0) consume_quota, COALESCE(SUM(refund_quota),0) refund_quota
 		FROM stability_hour_samples
-		WHERE hour_ts>=? AND hour_ts<? AND traffic_class_version=? GROUP BY day_ts,grp ORDER BY day_ts`
-	if err := m.storeDB.WithContext(ctx).Raw(usageSQL, scope.FromTs, scope.ToTs, stabilityTrafficClassificationVersion).Scan(&usageRows).Error; err != nil {
+		WHERE hour_ts>=? AND hour_ts<? AND traffic_class_version IN ? GROUP BY day_ts,grp ORDER BY day_ts`
+	if err := m.storeDB.WithContext(ctx).Raw(usageSQL, scope.FromTs, scope.ToTs, accountingTrafficVersions()).Scan(&usageRows).Error; err != nil {
 		return nil, nil, fmt.Errorf("读取每日用户用量事实: %w", err)
 	}
 	var testRows []struct {
@@ -1463,8 +1463,8 @@ func (m *Monitor) loadFinanceDailyUserFacts(ctx context.Context, scope stability
 	}
 	testSQL := `SELECT ` + cstDaySQL + ` day_ts,
 		COALESCE(SUM(requests),0) requests, COALESCE(SUM(quota),0) quota
-		FROM channel_test_hour_samples WHERE hour_ts>=? AND hour_ts<? AND traffic_class_version=? GROUP BY day_ts ORDER BY day_ts`
-	if err := m.storeDB.WithContext(ctx).Raw(testSQL, scope.FromTs, scope.ToTs, stabilityTrafficClassificationVersion).Scan(&testRows).Error; err != nil {
+		FROM channel_test_hour_samples WHERE hour_ts>=? AND hour_ts<? AND traffic_class_version IN ? GROUP BY day_ts ORDER BY day_ts`
+	if err := m.storeDB.WithContext(ctx).Raw(testSQL, scope.FromTs, scope.ToTs, accountingTrafficVersions()).Scan(&testRows).Error; err != nil {
 		return nil, nil, fmt.Errorf("读取每日内部测试用量事实: %w", err)
 	}
 
@@ -1515,9 +1515,9 @@ func (m *Monitor) loadFinanceDailyUserFacts(ctx context.Context, scope stability
 	if finalizedTo > scope.FromTs {
 		var completeHours []int64
 		strictSQL := `SELECT hs.hour_ts FROM stability_hour_ingest_states hs WHERE hs.hour_ts>=? AND hs.hour_ts<? AND ` +
-			stabilityCompleteHourPredicateSQL("hs")
+			accountingCompleteHourPredicateSQL("hs")
 		if err := m.storeDB.WithContext(ctx).Raw(strictSQL, scope.FromTs, finalizedTo,
-			stabilityTrafficClassificationVersion, stabilityTrafficClassificationVersion).Scan(&completeHours).Error; err != nil {
+			accountingTrafficVersions(), accountingTrafficVersions()).Scan(&completeHours).Error; err != nil {
 			return nil, nil, fmt.Errorf("读取每日用量覆盖台账: %w", err)
 		}
 		for _, hour := range completeHours {
@@ -1682,8 +1682,8 @@ func (m *Monitor) loadFinanceUserFacts(ctx context.Context, scope stabilityScope
 		COALESCE(SUM(success+anomaly+failed),0) requests,
 		COALESCE(SUM(quota),0) consume_quota,
 		COALESCE(SUM(refund_quota),0) refund_quota
-		FROM stability_hour_samples WHERE hour_ts>=? AND hour_ts<? AND traffic_class_version=?
-		GROUP BY channel_id,grp`, scope.FromTs, scope.ToTs, stabilityTrafficClassificationVersion).Scan(&rows).Error; err != nil {
+		FROM stability_hour_samples WHERE hour_ts>=? AND hour_ts<? AND traffic_class_version IN ?
+		GROUP BY channel_id,grp`, scope.FromTs, scope.ToTs, accountingTrafficVersions()).Scan(&rows).Error; err != nil {
 		return financeStatementView{}, StabilityDataCoverage{}, nil, fmt.Errorf("读取全站用户用量事实: %w", err)
 	}
 	var snaps []ChannelSnap
@@ -1761,8 +1761,8 @@ func (m *Monitor) loadFinanceUserFacts(ctx context.Context, scope stabilityScope
 		Quota    int64
 	}
 	if err := m.storeDB.WithContext(ctx).Raw(`SELECT COALESCE(SUM(requests),0) requests,COALESCE(SUM(quota),0) quota
-		FROM channel_test_hour_samples WHERE hour_ts>=? AND hour_ts<? AND traffic_class_version=?`,
-		scope.FromTs, scope.ToTs, stabilityTrafficClassificationVersion).Scan(&internal).Error; err != nil {
+		FROM channel_test_hour_samples WHERE hour_ts>=? AND hour_ts<? AND traffic_class_version IN ?`,
+		scope.FromTs, scope.ToTs, accountingTrafficVersions()).Scan(&internal).Error; err != nil {
 		return financeStatementView{}, StabilityDataCoverage{}, nil, fmt.Errorf("读取内部测试用量事实: %w", err)
 	}
 	grossMoney, err := financeMoneyFromQuota(totalConsumeQuota)
@@ -1785,7 +1785,7 @@ func (m *Monitor) loadFinanceUserFacts(ctx context.Context, scope stabilityScope
 	if err != nil {
 		return financeStatementView{}, StabilityDataCoverage{}, nil, err
 	}
-	coverage := m.stabilityDataCoverage(ctx, scope.FromTs, scope.ToTs, now)
+	coverage := m.accountingDataCoverage(ctx, scope.FromTs, scope.ToTs, now)
 	coverage.Complete = coverage.Complete && internalAccounts.Complete
 	statement := financeStatementView{
 		GrossUserConsumption: grossMoney, UserRefunds: refundMoney,
@@ -1907,9 +1907,9 @@ func (m *Monitor) loadFinanceInternalCostEvidence(ctx context.Context, scope sta
 	if includeAutomaticTests {
 		if err := m.storeDB.WithContext(ctx).Raw(`SELECT hour_ts,channel_id,COALESCE(SUM(requests),0) requests
 		FROM channel_test_hour_samples
-		WHERE hour_ts>=? AND hour_ts<? AND traffic_class_version=?
+		WHERE hour_ts>=? AND hour_ts<? AND traffic_class_version IN ?
 		GROUP BY hour_ts,channel_id HAVING COALESCE(SUM(requests),0)>0`,
-			scope.FromTs, scope.ToTs, stabilityTrafficClassificationVersion).Scan(&automaticPairs).Error; err != nil {
+			scope.FromTs, scope.ToTs, accountingTrafficVersions()).Scan(&automaticPairs).Error; err != nil {
 			return result, fmt.Errorf("读取内部测试小时事实: %w", err)
 		}
 	}
@@ -3010,7 +3010,7 @@ func (m *Monitor) buildFinanceOperatingReport(ctx context.Context, from, to time
 		periodDetails = append(periodDetails, component.CostDetails)
 		report.Days = append(report.Days, component.Days...)
 	}
-	report.UserCoverage = m.stabilityDataCoverage(ctx, from.Unix(), to.Unix(), report.GeneratedAt)
+	report.UserCoverage = m.accountingDataCoverage(ctx, from.Unix(), to.Unix(), report.GeneratedAt)
 	report.UserCoverage.Complete = report.UserCoverage.Complete && configuredInternal.Complete
 	report.UpstreamCoverage, report.CostDetails, err = mergeFinanceCostDetails(periodDetails, accounts)
 	if err != nil {
@@ -3224,10 +3224,10 @@ func (m *Monitor) clampFinanceRangeToLocalSnapshot(ctx context.Context, to time.
 	var latest struct {
 		HourTs int64
 	}
-	predicate := stabilityCompleteHourPredicateSQL("hs")
+	predicate := accountingCompleteHourPredicateSQL("hs")
 	if tx := m.storeDB.WithContext(ctx).Raw(`SELECT COALESCE(MAX(hs.hour_ts),0) hour_ts
 		FROM stability_hour_ingest_states hs WHERE `+predicate,
-		stabilityTrafficClassificationVersion, stabilityTrafficClassificationVersion).Scan(&latest); tx.Error != nil {
+		accountingTrafficVersions(), accountingTrafficVersions()).Scan(&latest); tx.Error != nil {
 		return to, 0, false, fmt.Errorf("读取本地快照截止时间: %w", tx.Error)
 	}
 	if latest.HourTs <= 0 || latest.HourTs > math.MaxInt64-3600 {
