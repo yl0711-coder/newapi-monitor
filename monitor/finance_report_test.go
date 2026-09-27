@@ -109,6 +109,7 @@ func TestFinanceMonthRangesAlwaysUseShanghaiCalendar(t *testing.T) {
 func newFinanceReportTestMonitor(t *testing.T, domain string) *Monitor {
 	t.Helper()
 	m := newStabilityTestMonitor(t)
+	t.Cleanup(m.Close)
 	m.cfg.FinanceEnabled = true
 	m.cfg.FinanceStartDate = "2026-05-01"
 	m.cfg.ChannelEconomicsReportEnabled = true

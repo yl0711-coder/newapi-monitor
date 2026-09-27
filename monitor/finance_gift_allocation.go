@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"sort"
-	"strconv"
 
 	"github.com/yl0711-coder/newapi-monitor/internal/financecredit"
 	"gorm.io/gorm"
@@ -64,7 +63,6 @@ func (m *Monitor) loadFinanceGiftAllocation(ctx context.Context, seedFrom, from,
 }
 
 func (m *Monitor) loadFinanceGiftAllocationForScope(ctx context.Context, seedFrom, from, to int64, policies map[string]bool, excludedUsers map[int64]bool) (financeGiftAllocationResult, error) {
-	hasExcludedGroups := channelBusinessGroupsExcluded(policies)
 	result := financeGiftAllocationResult{Coverage: financeGiftCoverageView{
 		SeedFromTs: seedFrom, FromTs: from, ToTs: to,
 	}}
@@ -198,52 +196,16 @@ func (m *Monitor) loadFinanceGiftAllocationForScope(ctx context.Context, seedFro
 		return result, nil
 	}
 
-	eventsByKey := make(map[financeGiftUserHourKey][]FinanceGiftBoundaryEvent, len(required))
-	err = walkFinanceGiftBoundaryEvents(ctx, db, seedFrom, to, users, func(event FinanceGiftBoundaryEvent) error {
-		key := financeGiftUserHourKey{HourTs: event.HourTs, UserID: event.UserID}
-		state, needed := stateByKey[key]
-		if !needed || event.SourceEpoch != state.SourceEpoch || event.EvidenceHash != financeGiftBoundaryEventHash(event) {
-			return nil
+	firstScopeGap := to
+	err = m.walkFinanceGiftHourEvidence(ctx, db, stateByKey, policies, excludedUsers, func(key financeGiftUserHourKey, evidence financeGiftHourEvidence) {
+		ledger = append(ledger, evidence.Ledger...)
+		result.Coverage.ScopeUnknownEvents += evidence.UnknownScopeEvents
+		if evidence.UnknownScopeEvents > 0 {
+			firstScopeGap = min(firstScopeGap, key.HourTs)
 		}
-		eventsByKey[key] = append(eventsByKey[key], event)
-		return nil
 	})
 	if err != nil {
 		return result, err
-	}
-	firstScopeGap := to
-	for key, state := range stateByKey {
-		hourEvents := eventsByKey[key]
-		if financeGiftBoundaryContentHash(hourEvents) != state.ContentHash || int64(len(hourEvents)) != state.Rows {
-			return result, fmt.Errorf("gift boundary content failed verification for user %d hour %d", key.UserID, key.HourTs)
-		}
-		for _, event := range hourEvents {
-			if excludedUsers[event.UserID] {
-				continue
-			}
-			if hasExcludedGroups && !event.GroupKnown && event.Quota != 0 {
-				result.Coverage.ScopeUnknownEvents++
-				firstScopeGap = min(firstScopeGap, key.HourTs)
-				continue
-			}
-			amount, conversionErr := signedUnitsToMicroUSDCanonical(event.Quota, strconv.FormatInt(int64(quotaPerUSD), 10))
-			if conversionErr != nil {
-				return result, conversionErr
-			}
-			if event.Kind == "refund" {
-				amount = -amount
-			}
-			excluded := !channelBusinessGroupIncluded(policies, event.Group)
-			scope := "business"
-			if excluded {
-				scope = "excluded"
-			}
-			ledger = append(ledger, financecredit.LedgerEvent{
-				UserID: event.UserID, At: event.EventAt, Sequence: event.SourceLogID,
-				Kind: financecredit.EventNetUsage, AmountMicroUSD: amount,
-				Scope: scope, Excluded: excluded,
-			})
-		}
 	}
 	if result.Coverage.ScopeUnknownEvents > 0 {
 		// All preceding proof/hash checks succeeded. Unknown events can affect

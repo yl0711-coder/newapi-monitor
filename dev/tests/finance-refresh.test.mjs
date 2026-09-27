@@ -27,6 +27,18 @@ function fixture(fetchImpl = async()=>{throw new Error('offline');}) {
   return {api:context.fixture,element,timers};
 }
 
+test('upgrade snapshot preserves old date and never conceals failed recomputation',()=>{
+  const {api}=fixture();
+  const data={_cache_status:'persistent-upgrade-prior-stale-queued',_update_state:'failed',to:1789959600};
+  assert.equal(api.financeIsPriorStale(data),true);
+  const note=api.financeCacheRefreshNote(data);
+  assert.match(note,/升级前快照.*数据截至/);
+  assert.match(note,/新版重算尚未成功.*请勿当作当前结果/);
+  assert.doesNotMatch(note,/正在后台核验/);
+  assert.match(api.financeCacheRefreshNote({...data,_update_state:'running'}),/新版正在后台核验/);
+  assert.match(api.financeCacheRefreshNote({...data,_cache_status:'persistent-prior-stale-queued'}),/当前区间更新失败/);
+});
+
 test('daily account bills remain distinct from paired cost and legacy responses',()=>{
   const {api,element}=fixture();
   const money=value=>({micro_usd:String(value*1000000)});

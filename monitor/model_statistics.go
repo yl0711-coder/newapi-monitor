@@ -76,13 +76,16 @@ type ModelStatisticsCustomer struct {
 type ModelStatisticsSource struct {
 	RoutedFact      string `json:"routed_fact"`
 	UnavailableFact string `json:"unavailable_channel_fact"`
-	// FactsComplete is true only when the local user-minute fact lane has
-	// proved continuous coverage for the requested window.  Counts are still
+	// FactsComplete requires BOTH source lanes to prove the entire window.
+	// A normally pending live tail is exposed separately. Counts are still
 	// returned while it is false so the page remains useful during catch-up,
 	// but callers must not present them as a complete ranking.
-	FactsComplete     bool  `json:"facts_complete"`
-	CoverageFromTs    int64 `json:"coverage_from_ts"`
-	CoverageThroughTs int64 `json:"coverage_through_ts"`
+	FactsComplete       bool                    `json:"facts_complete"`
+	CoverageFromTs      int64                   `json:"coverage_from_ts"`
+	CoverageThroughTs   int64                   `json:"coverage_through_ts"`
+	CoverageStatus      string                  `json:"coverage_status"`
+	RoutedCoverage      ModelStatisticsCoverage `json:"routed_coverage"`
+	UnavailableCoverage ModelStatisticsCoverage `json:"unavailable_coverage"`
 	// False because unknown user_id=0 rows are intentionally retained from
 	// both sources when their request identity cannot be proven equal.
 	RequestsAreUnique bool   `json:"requests_are_unique"`
@@ -274,7 +277,9 @@ func (m *Monitor) buildModelStatisticsReport(ctx context.Context, windowKey stri
 	if err := m.storeDB.WithContext(ctx).Raw(query, args...).Scan(&rows).Error; err != nil {
 		return ModelStatisticsReport{}, err
 	}
-	factsComplete, coveredFrom, coveredThrough, factsNote := m.modelStatisticsFactsCoverage(ctx, from, to)
+	routedCoverage := m.modelStatisticsRoutedCoverage(ctx, from, to, now)
+	rejectionCoverage := m.modelStatisticsRejectionCoverage(ctx, from, to, now)
+	coverageStatus := modelStatisticsCombinedCoverage(routedCoverage, rejectionCoverage)
 
 	groups := make(map[string]map[string]*modelStatisticsAggregate)
 	usernames := make(map[int64]string)
@@ -323,17 +328,16 @@ func (m *Monitor) buildModelStatisticsReport(ctx context.Context, windowKey stri
 	}
 
 	sourceNote := "无可用渠道请求不会进入 NewAPI logs/metric_samples；已知客户维度按直采优先去重，普通前置拒绝不计入模型需求。user_id=0 无法证明跨来源是同一请求，为避免漏报会保守保留，可能重复计数（数量取决于未知身份重叠）。"
-	sourceNote += " " + factsNote
-	if coverageNote := m.alertsCoverageNote(stabilityScope{FromTs: from, ToTs: to}, now); coverageNote != "" {
-		sourceNote += " " + coverageNote
-	}
+	sourceNote += " " + routedCoverage.Note + " " + rejectionCoverage.Note
 	report := ModelStatisticsReport{
 		Window: window.Key, WindowLabel: window.Label, FromTs: from, ToTs: to, GeneratedAt: now.Unix(),
 		GroupCount: len(groups), Models: make([]ModelStatisticsModel, 0),
 		Source: ModelStatisticsSource{
 			RoutedFact:      "capacity_user_minute_samples：复用客户维护采集的已进入渠道用户请求（成功、交付异常、错误均计一次）",
 			UnavailableFact: "rejection_samples：选渠道前无可用渠道的模型请求",
-			FactsComplete:   factsComplete, CoverageFromTs: coveredFrom, CoverageThroughTs: coveredThrough,
+			FactsComplete:   coverageStatus == modelCoverageComplete,
+			CoverageFromTs:  routedCoverage.FromTs, CoverageThroughTs: routedCoverage.ThroughTs,
+			CoverageStatus: coverageStatus, RoutedCoverage: routedCoverage, UnavailableCoverage: rejectionCoverage,
 			// Known positive user IDs are reconciled across the direct and
 			// legacy rejection lanes.  user_id=0 is deliberately fail-open:
 			// two rows with no identity cannot be proven to describe the same

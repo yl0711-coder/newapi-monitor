@@ -20,6 +20,9 @@ type financeReportJob struct {
 	finished time.Time
 	parent   context.Context
 	run      func(context.Context) error
+	// Retain failure through a retry; only a successful run of this key clears
+	// it. The bounded in-memory history is diagnostic state, not durable proof.
+	unresolvedFailure bool
 }
 
 // Queue metadata is bounded independently of the byte-bounded report cache.
@@ -43,7 +46,9 @@ func (q *financeReportQueue) submit(parent context.Context, key string, manual b
 	if q.jobs == nil {
 		q.jobs = make(map[string]*financeReportJob)
 	}
+	unresolvedFailure := false
 	if job := q.jobs[key]; job != nil {
+		unresolvedFailure = job.unresolvedFailure
 		if job.state == "queued" || job.state == "running" {
 			return job.state
 		}
@@ -71,7 +76,7 @@ func (q *financeReportQueue) submit(parent context.Context, key string, manual b
 			delete(q.jobs, oldest.key)
 		}
 	}
-	job := &financeReportJob{key: key, state: "queued", parent: parent, run: run}
+	job := &financeReportJob{key: key, state: "queued", parent: parent, run: run, unresolvedFailure: unresolvedFailure}
 	q.jobs[key] = job
 	q.pending = append(q.pending, job)
 	if q.done == nil {
@@ -105,10 +110,15 @@ func (q *financeReportQueue) drain() {
 		cancel()
 		q.mu.Lock()
 		job.state = "succeeded"
+		if err == nil {
+			job.unresolvedFailure = false
+		}
 		if err != nil {
 			job.state = "failed"
 			if errors.Is(err, context.Canceled) {
 				job.state = "stopped"
+			} else {
+				job.unresolvedFailure = true
 			}
 		}
 		job.finished = time.Now()
@@ -130,11 +140,12 @@ func (q *financeReportQueue) forgetMissingResult(key string) {
 }
 
 type financeReportQueueStats struct {
-	Enabled        bool `json:"enabled"`
-	Running        int  `json:"running"`
-	Pending        int  `json:"pending"`
-	RecentFailures int  `json:"recent_failures"`
-	Capacity       int  `json:"capacity"`
+	Enabled            bool `json:"enabled"`
+	Running            int  `json:"running"`
+	Pending            int  `json:"pending"`
+	RecentFailures     int  `json:"recent_failures"`
+	UnresolvedFailures int  `json:"unresolved_failures"`
+	Capacity           int  `json:"capacity"`
 }
 
 func (q *financeReportQueue) stats() financeReportQueueStats {
@@ -142,6 +153,9 @@ func (q *financeReportQueue) stats() financeReportQueueStats {
 	defer q.mu.Unlock()
 	stats := financeReportQueueStats{Pending: len(q.pending), Capacity: financeReportQueueCapacity}
 	for _, job := range q.jobs {
+		if job.unresolvedFailure {
+			stats.UnresolvedFailures++
+		}
 		if job.state == "running" {
 			stats.Running++
 		}

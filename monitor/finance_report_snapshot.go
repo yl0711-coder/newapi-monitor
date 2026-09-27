@@ -50,6 +50,13 @@ func (m *Monitor) loadFinanceReportSnapshot(request financeReportRequest, now ti
 		return nil, time.Time{}, "", false, nil
 	}
 	key := request.logicalKey()
+	return m.loadFinanceReportSnapshotKey(request, key, now)
+}
+
+// Keep key selection outside the verified reader. Normal report/cache reads
+// only use the current key; the explicitly dated upgrade fallback below is
+// the sole caller allowed to select the previous projection.
+func (m *Monitor) loadFinanceReportSnapshotKey(request financeReportRequest, key string, now time.Time) ([]byte, time.Time, string, bool, error) {
 	path, err := financeReportSnapshotPath(m.cfg.StorePath, key)
 	if err != nil {
 		return nil, time.Time{}, "", false, err
