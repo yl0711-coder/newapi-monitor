@@ -86,6 +86,17 @@ func (p *cloudWatchEvidenceParser) optionalOpaqueHMAC(domain, raw string) (strin
 }
 
 func cwBusinessLabel(raw string, maximum int) (string, bool) {
+	return cwBusinessLabelWithSpaces(raw, maximum, false)
+}
+
+// Group names are user-facing labels and can contain ordinary spaces (for
+// example, "codex 企业分组"). Keep model IDs strict and retain the same
+// sensitive-content and control-character checks for both kinds of label.
+func cwBusinessGroupLabel(raw string, maximum int) (string, bool) {
+	return cwBusinessLabelWithSpaces(raw, maximum, true)
+}
+
+func cwBusinessLabelWithSpaces(raw string, maximum int, allowSpaces bool) (string, bool) {
 	value := strings.TrimSpace(raw)
 	if value == "" {
 		return "", true
@@ -94,6 +105,9 @@ func cwBusinessLabel(raw string, maximum int) (string, bool) {
 		return "", false
 	}
 	for _, r := range value {
+		if allowSpaces && r == ' ' {
+			continue
+		}
 		if r < 0x21 || r == 0x7f || strings.ContainsRune("|?&=#'\"`\\<>[]{}()", r) {
 			return "", false
 		}

@@ -138,6 +138,51 @@ func TestCloudWatchPreRouteParserUsesStructuredIdentityFields(t *testing.T) {
 	}
 }
 
+func TestCloudWatchPreRouteParserPreservesSpacedGroupNames(t *testing.T) {
+	parser := newCloudWatchParserForTest(t, false)
+	for _, message := range []string{
+		"分组 codex 企业分组 下模型 gpt-5.6-sol 无可用渠道",
+		"模型 gpt-5.6-sol 在分组 codex 企业分组 下无可用渠道",
+		"No available channel for model gpt-5.6-sol under group codex 企业分组",
+		"No available channel under group codex 企业分组 for model gpt-5.6-sol",
+	} {
+		t.Run(message, func(t *testing.T) {
+			evidence, err := parser.parse(cloudWatchEvidenceInput{
+				Source: cwSourceWorkerNewAPI, EventID: cwTestEventID(message), TimestampMS: time.Now().UnixMilli(),
+				Message: "[ERR] 2026/09/21 - 13:06:56 | 202609210506560000 | user 7 | " + message,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if evidence.Category != "route_no_channel" || evidence.Group != "codex 企业分组" || evidence.Model != "gpt-5.6-sol" {
+				t.Fatalf("group must not be rejected or truncated: %+v", evidence)
+			}
+		})
+	}
+	fields := map[string]string{"@message": "Invalid token", "group": "OpenAI 企业分组", "model": "gpt-5.6-sol"}
+	evidence, err := parser.parse(cloudWatchEvidenceInput{
+		Source: cwSourceWorkerNewAPI, EventID: "structured-spaced-group", TimestampMS: time.Now().UnixMilli(), Fields: fields,
+	})
+	if err != nil || evidence.Group != fields["group"] {
+		t.Fatalf("structured group must be preserved: group=%q err=%v", evidence.Group, err)
+	}
+}
+
+func TestCloudWatchPreRouteSpacedGroupsRetainLabelSafetyChecks(t *testing.T) {
+	for _, value := range []string{
+		"codex\tenterprise", "codex\nenterprise", "codex\renterprise", "codex\x00enterprise",
+		"codex\x7fenterprise", "codex <script>", "codex ?api_key=value", "codex bearer value",
+		"sk-private value", strings.Repeat("a", 65), string([]byte{'a', 0xff}),
+	} {
+		if _, ok := cwBusinessGroupLabel(value, 64); ok {
+			t.Fatalf("unsafe group accepted: %q", value)
+		}
+	}
+	if _, ok := cwBusinessLabel("gpt model", 128); ok {
+		t.Fatal("allowing spaces in groups must not relax model identifiers")
+	}
+}
+
 func TestCloudWatchPreRouteParserTreatsMissingStructuredUserAsUnknown(t *testing.T) {
 	parser := newCloudWatchParserForTest(t, false)
 	evidence, err := parser.parse(cloudWatchEvidenceInput{
