@@ -15,12 +15,12 @@
     paired_verified: '配对已核验', partially_paired: '部分配对',
     binding_required: '待完成来源归属', not_enrolled: '未进入配对账本', not_required: '暂不纳入',
     in_progress: '闭环进行中', bill_not_connected: '账单未接入',
-    bill_missing: '账单证据缺失', correction_missing: '缺修正依据', source_binding_required: '成本来源待归属',
+    bill_missing: '账单证据缺失', correction_missing: '缺修正依据', correction_ambiguous: '账单桶内比例变化', source_binding_required: '成本来源待归属',
     cost_evidence_missing: '成本证据未采集', cost_evidence_incomplete: '成本证据未补齐', finance_history_missing: '历史财务版本缺失', ledger_backfill_required: '待试算配对账本',
     local_estimate_ready: '可闭合的本地估算', pricing_evidence_only: '仅倍率/费用证据', adapter_probe_required: '需适配器探测', range_exceeds_limit: '超过安全历史范围',
     account_missing: '账户配置缺失', account_disabled: '账户同步未启用', no_local_activity: '无本地活动依据', granularity_unsupported: '粒度不兼容', estimate_unavailable: '暂无估算',
     precheck_required: '待灰度前核对',
-    not_connected: '未接入', not_configured: '未配置（不纳入）', disabled: '未开启',
+    not_connected: '未接入', not_configured: '未配置（成本未知）', disabled: '未开启',
   };
   const curProductNames = {
     AmazonECS: 'ECS / Fargate', AmazonRDS: 'RDS', AmazonCloudFront: 'CloudFront',
@@ -63,11 +63,37 @@
 
   function upstreamCoverage(value) {
     const relevant = Number(value?.relevant_domains || 0);
-    const available = Number(value?.available_domains || 0);
-    const corrected = Number(value?.corrected_domains || 0);
+    const billed = completeDomains(value, 'complete_domains');
+    const corrected = completeDomains(value, 'corrected_complete_domains');
     const unconfigured = Number(value?.unconfigured_domains || 0);
-    const configured = relevant ? `账单 ${available}/${relevant}·修正 ${corrected}/${relevant}` : '无已配置上游';
-    return unconfigured ? `${configured}·${unconfigured} 个未配置暂不纳入` : configured;
+    const configured = relevant ? `完整账单 ${billed ?? '—'}/${relevant}·完整修正 ${corrected ?? '—'}/${relevant}` : '无已配置上游';
+    return unconfigured ? `${configured}·${unconfigured} 个未配置成本未知` : configured;
+  }
+
+  // Older snapshots only counted suppliers with ANY corrected money. That
+  // count must never be used as proof of complete correction coverage.
+  function completeDomains(value, field) {
+    const count = value?.[field];
+    return Number.isInteger(count) && count >= 0 && count <= Number(value?.relevant_domains || 0) ? count : null;
+  }
+
+  function setUpstreamEvidence(id, coverage, completeField, availableField) {
+    const done = completeDomains(coverage, completeField);
+    const total = Number(coverage?.relevant_domains || 0);
+    setEvidence(id, done, total, '上游区间完整');
+    const element = $(id);
+    if (!element) return;
+    const note = element.querySelector('span');
+    if (done == null) {
+      element.classList.remove('ready', 'warn', 'missing');
+      element.classList.add('missing');
+      const value = element.querySelector('b');
+      if (value) value.textContent = '—';
+      if (note) note.textContent = '旧快照未提供完整覆盖统计，待重新核验';
+    } else if (note && total > 0) {
+      const partial = Math.max(0, Number(coverage?.[availableField] || 0) - done);
+      note.textContent += ` · ${partial} 个仅取得部分金额；不代表同步任务进度`;
+    }
   }
 
   function domainHourCoverage(row) {
@@ -210,17 +236,14 @@
     if (!hasMoney(statement.raw_corrected_upstream_cost)) {
       const coverage = data.upstream_coverage || {};
       const relevant = Number(coverage.relevant_domains || 0);
-      const available = Number(coverage.available_domains || 0);
-      const corrected = Number(coverage.corrected_domains || 0);
-      const details = Array.isArray(data.cost_details) ? data.cost_details : [];
-      const billMissing = details.filter((row) => row.closure_readiness === 'bill_not_connected' || row.closure_readiness === 'bill_missing').length;
-      const correctionMissing = details.filter((row) => row.closure_readiness === 'correction_missing').length;
+      const billed = completeDomains(coverage, 'complete_domains');
+      const corrected = completeDomains(coverage, 'corrected_complete_domains');
       const unconfigured = Number(coverage.unconfigured_domains || 0);
       const reasons = [];
-      if (billMissing) reasons.push(`${billMissing} 个上游账单未接入/缺失`);
-      if (correctionMissing) reasons.push(`${correctionMissing} 个缺历史充值修正依据`);
-      if (unconfigured) reasons.push(`${unconfigured} 个未配置来源暂不纳入正式毛利`);
-      const coverageText = relevant ? `账单 ${available}/${relevant}、修正 ${corrected}/${relevant}` : '无可核验上游';
+      if (billed != null && billed < relevant) reasons.push(`${relevant - billed} 个上游账单区间不完整`);
+      if (corrected != null && corrected < relevant) reasons.push(`${relevant - corrected} 个上游修正成本区间不完整`);
+      if (unconfigured) reasons.push(`${unconfigured} 个未配置来源成本未知，已核验部分不能代表全站`);
+      const coverageText = upstreamCoverage(coverage);
       blockers.push(`修正上游总成本未闭合（${coverageText}${reasons.length ? `；${reasons.join('、')}` : ''}）`);
     }
     if (!hasMoney(statement.aws_infrastructure_cost)) {
@@ -238,8 +261,8 @@
     const audit = data.pairing_audit || {};
     setEvidence('finUserEvidence', data.user_coverage?.completed_hours, data.user_coverage?.expected_hours, '小时');
     setGiftEvidence(data.gift_coverage);
-    setEvidence('finBillEvidence', data.upstream_coverage?.available_domains, data.upstream_coverage?.relevant_domains, '上游');
-    setEvidence('finCorrectionEvidence', data.upstream_coverage?.corrected_domains, data.upstream_coverage?.relevant_domains, '上游');
+    setUpstreamEvidence('finBillEvidence', data.upstream_coverage, 'complete_domains', 'available_domains');
+    setUpstreamEvidence('finCorrectionEvidence', data.upstream_coverage, 'corrected_complete_domains', 'corrected_domains');
     setEvidence('finPairingEvidence', audit.paired_rows, audit.publication_rows, '核算行');
 	setCUREvidence(data.cur_cost);
 
@@ -647,6 +670,7 @@
       ['not_required', '暂不纳入', '未配置上游账户，不进入覆盖率和利润'],
       ['precheck_required', '待灰度前核对', '已有账单与修正证据'],
       ['correction_missing', '缺修正依据', '先补充值比例或审计证据'],
+      ['correction_ambiguous', '账单桶内比例变化', '需更细账单或可审计分段依据'],
       ['bill_missing', '缺账单证据', '先补齐上游账单记录'],
       ['bill_not_connected', '账单未接入', '不能按零成本处理'],
       ['cost_evidence_missing', '成本证据未采集', '汇总账单不等于可配对小时证据'],
@@ -777,10 +801,19 @@
       + `<td>${esc(billBasis(row.bill_basis))}</td>`
       + `<td>${esc(row.correction_source || '—')}</td>`
       + `<td>${domainHourCoverage(row)}${row.data_until ? `<small>截至 ${date(row.data_until)}</small>` : ''}</td>`
-      + `<td>${chip(row.status)}</td>`
+      + `<td>${chip(row.status)}<small>${esc(costEvidenceSummary(row))}</small></td>`
       + `<td>${chip(row.pairing_status || 'not_enrolled')}</td>`
       + `<td class="fin-closure-action">${chip(row.closure_readiness || 'precheck_required')}<small>${esc(row.closure_next_action || '尚未完成准入判断')}</small>${evidenceBackfill(row)}</td></tr>`).join('')
       : '<tr><td colspan="15" class="fin-empty">暂无可核对的上游成本明细</td></tr>';
+  }
+
+  function costEvidenceSummary(row) {
+    if (row.status === 'not_configured') return '未配置，不自动补采；成本未知，不按零计入全站利润';
+    const bill = hasMoney(row.billed_cost) ? '账单区间完整'
+      : hasMoney(row.known_billed_cost) ? '账单区间不完整' : '暂无可核验账单';
+    const corrected = hasMoney(row.corrected_cost) ? '修正成本区间完整'
+      : hasMoney(row.known_corrected_cost) ? '修正成本仅有部分' : '缺可核验修正依据';
+    return `${bill}；${corrected}。这是核算状态，不代表补采正在运行`;
   }
 
   function renderEvidenceRollout(rows) {

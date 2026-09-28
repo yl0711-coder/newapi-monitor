@@ -43,8 +43,9 @@ func PrepareFinanceGiftLocalContinuation(ctx context.Context, priorDir, priorCon
 		return empty, "", err
 	}
 	defer lock.Close()
-	if _, err := os.Lstat(filepath.Join(priorDir, "continuation-intent.json")); !os.IsNotExist(err) {
-		return empty, "", errors.New("previous offline job already has a continuation intent; inspect it before proceeding")
+	_, intentErr := os.Lstat(filepath.Join(priorDir, "continuation-intent.json"))
+	if intentErr != nil && !os.IsNotExist(intentErr) {
+		return empty, "", intentErr
 	}
 	priorPlan, priorEvidence, err := giftLocalLoadConfirmedInputs(priorDir, priorConfirmation)
 	if err != nil {
@@ -123,6 +124,9 @@ func PrepareFinanceGiftLocalContinuation(ctx context.Context, priorDir, priorCon
 		}
 		evidencePaths[i] = path
 	}
+	if intentErr == nil {
+		return resumeFinanceGiftPreparedContinuation(ctx, priorDir, nextDir, readPlan, readConfirmation, giftLocalDigest(resultBytes), result)
+	}
 	if _, err := os.Lstat(nextDir); !os.IsNotExist(err) {
 		return empty, "", errors.New("next offline job directory already exists or cannot be checked")
 	}
@@ -136,8 +140,8 @@ func PrepareFinanceGiftLocalContinuation(ctx context.Context, priorDir, priorCon
 		return empty, "", err
 	}
 	// This durable, no-clobber intent prevents two child jobs from silently
-	// forking the same verified predecessor. An interrupted handoff remains
-	// blocked for explicit inspection rather than guessing which child to use.
+	// forking the same verified predecessor. Only a fully prepared, untouched
+	// matching child can resume; incomplete/ambiguous handoffs remain blocked.
 	if err := giftLocalWriteNew(filepath.Join(priorDir, "continuation-intent.json"), intent); err != nil {
 		return empty, "", err
 	}

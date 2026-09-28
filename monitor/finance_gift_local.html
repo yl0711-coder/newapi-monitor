@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>本地赠送证据修复验收</title>
+<style>
+body{font:16px/1.6 system-ui,sans-serif;background:#141722;color:#e5e7ef;max-width:960px;margin:40px auto;padding:0 20px}section{background:#202432;border:1px solid #363d50;border-radius:10px;padding:20px;margin:18px 0}h1{font-size:25px}h2{font-size:18px}button,input{font:inherit;padding:8px 12px;border-radius:6px;border:1px solid #677194;margin:4px;background:#2e3550;color:inherit}button{cursor:pointer}button:disabled{opacity:.45;cursor:default}input{width:min(90%,680px)}pre{white-space:pre-wrap;overflow-wrap:anywhere;font-size:13px}small,.note{color:#b2bbd1}#error{color:#ffada8;white-space:pre-wrap}a{color:#a7b8ff}
+</style></head><body>
+<a href="/#tab=finance">返回经营核算</a><h1>本地赠送证据修复验收</h1>
+<p class="note">仅操作隔离副本，不连接生产。每次默认最多 2 个用户小时，不是整段历史回填。停止保留已提交数据；续跑必须手动确认。页面关闭不会停止任务。</p>
+<div id="error" role="alert"></div>
+<section><h2>1. 核验与有限授权</h2><p id="source">正在读取本地配置…</p>
+<button id="preview">只读核验</button><button id="authorize" disabled>确认授权（最多 2 个用户小时）</button>
+<p id="cooldown" class="note" role="status"></p>
+<pre id="evidence">尚未核验</pre></section>
+<section><h2>2. 启动、停止与续跑</h2><label>授权任务 ID <input id="task" autocomplete="off" placeholder="创建授权后自动填入，也可粘贴旧任务 ID 查询"></label><br>
+<button id="refresh">刷新状态</button><button id="start" disabled>启动 / 显式续跑</button><button id="stop" disabled>停止本次执行</button><button id="revoke" disabled>撤销后续执行授权</button>
+<p id="authorization">授权状态：尚未查询</p><p id="runtime">执行状态：尚未查询</p><p id="progress">持久提交进度：尚未查询</p>
+<small>提交进度不等于整个经营核算已完整；“全部提交记录已保存”也不替代当前事实核验。服务重启后执行状态需重新观察，历史提交仍可查询。</small>
+<pre id="scope"></pre></section>
+<script>
+(() => {
+  'use strict';
+  const base='/finance/gift-handoff', $=id=>document.getElementById(id);
+  let config=null, control=null, busy=false, timer=null, previewReady=false, approvalNonce=null;
+  let cooldownUntil=0, cooldownTimer=null;
+  const cooldownSeconds=()=>Math.max(0,Math.ceil((cooldownUntil-Date.now())/1000));
+  function setCooldown(seconds){
+    const value=Number(seconds);
+    if(!Number.isFinite(value)||value<=0)return;
+    cooldownUntil=Math.max(cooldownUntil,Date.now()+Math.ceil(value)*1000);
+    tickCooldown();
+  }
+  function tickCooldown(){
+    clearTimeout(cooldownTimer);
+    const seconds=cooldownSeconds();
+    $('cooldown').textContent=seconds?`核验冷却中，${seconds} 秒后可再次核验或确认授权；不会自动执行。`:'';
+    buttons();
+    if(seconds&&!document.hidden)cooldownTimer=setTimeout(tickCooldown,1000);
+  }
+  const runtimeNames={idle:'本进程未启动任务',running:'执行中',stopping:'正在停止',stopped:'已停止，可核验后显式续跑',complete:'本次授权目标已核验完成',partial:'部分完成',failed:'核验或执行失败，未自动重试',timed_out:'已达到时间预算，未自动重试'};
+  const authNames={awaiting_execution:'有效（不代表已执行）',expired:'已过期',configuration_changed:'配置已变化',revoked:'已撤销'};
+  const nonce=()=>Array.from(crypto.getRandomValues(new Uint8Array(16)),v=>v.toString(16).padStart(2,'0')).join('');
+  const task=()=>{const id=$('task').value.trim();if(!/^[a-f0-9]{64}$/.test(id))throw Error('请输入有效的授权任务 ID');return id;};
+  const active=()=>control && ['running','stopping'].includes(control.status);
+  let authorizationValid=false;
+  function buttons(){
+    $('task').disabled=busy;
+    $('preview').disabled=busy||!config||active()||cooldownSeconds()>0;
+    $('authorize').disabled=busy||!previewReady||active()||cooldownSeconds()>0;
+    $('refresh').disabled=busy||!config;
+    $('start').disabled=busy||!authorizationValid||!control||active();
+    $('stop').disabled=busy||!active()||control.task_id!==$('task').value.trim();
+    $('revoke').disabled=busy||!authorizationValid;
+  }
+  async function api(path, body){
+    const options={credentials:'same-origin',cache:'no-store',headers:{Accept:'application/json'}};
+    if(body!==undefined){options.method='POST';options.headers['Content-Type']='application/json';options.body=JSON.stringify(body);}
+    const abort=new AbortController(), timeout=setTimeout(()=>abort.abort(),15000);options.signal=abort.signal;
+    try{const response=await fetch(base+path,options);
+      if(path==='/preview'||path==='/authorizations'){
+        setCooldown(response.headers.get('X-Finance-Gift-Cooldown-Seconds'));
+        if(response.status===429)setCooldown(response.headers.get('Retry-After'));
+      }
+      const data=await response.json().catch(()=>({error:'服务返回了非 JSON 响应，请确认登录状态'}));
+      if(!response.ok){const err=Error(data.error||`请求失败 (${response.status})`);err.code=data.error_code;throw err;}
+      return data;
+    }finally{clearTimeout(timeout);}
+  }
+  function schedule(){clearTimeout(timer);if(active()&&!document.hidden)timer=setTimeout(()=>action(refresh),5000);}
+  async function refresh(){
+    authorizationValid=false;buttons();
+    config=await api('/local/control');control=config.control;
+    setCooldown(config.preview_retry_after_seconds);
+    $('source').textContent=`固定证据计划：${config.confirmation}；仅本机执行`;
+    if(!$('task').value&&control.task_id)$('task').value=control.task_id;
+    $('runtime').textContent=`执行状态：${runtimeNames[control.status]||control.status}${control.task_id&&control.task_id!==$('task').value.trim()?'（另一个任务）':''}`;
+    if(!$('task').value.trim()){schedule();return;}
+    const id=task();try{sessionStorage.setItem('financeGiftLocalTask',id);}catch(_){}
+    const auth=await api(`/authorizations/${id}`);
+    $('authorization').textContent=`授权状态：${authNames[auth.status]||auth.status}`;
+    $('scope').textContent=JSON.stringify(auth.authorization.targets,null,2);
+    authorizationValid=auth.status==='awaiting_execution';
+    try{
+      const data=await api(`/authorizations/${id}/progress`), p=data.progress;
+      $('progress').textContent=p?`持久提交进度：${p.committed_targets}/${p.authorized_targets} 个用户小时，累计修复 ${p.rows_updated} 条；${p.status==='all_commits_recorded'?'全部授权目标有提交记录':'仅统计本任务提交'}`:'持久提交进度暂不可核验';
+    }catch(err){
+      $('progress').textContent=err.code==='ledger_missing'
+        ?'提交台账尚未建立：首次本机执行时会初始化；当前进度未知（不是 0）。若此前已执行，请先排查台账缺失，不能据此认定从未执行。'
+        :`持久提交进度读取失败：${err.message}；暂不可核验（不是 0），请刷新重试。`;
+    }
+    schedule();
+  }
+  async function action(fn){if(busy)return;busy=true;clearTimeout(timer);$('error').textContent='';buttons();try{await fn();}catch(err){$('error').textContent=err.message;}finally{busy=false;buttons();schedule();}}
+  $('preview').onclick=()=>action(async()=>{
+    if(cooldownSeconds()>0)return;
+    previewReady=false;
+    const data=await api('/preview',{confirmation:config.confirmation});
+    $('evidence').textContent=JSON.stringify(data.preview,null,2);
+    previewReady=data.preview.blocked_targets===0&&data.preview.ready_targets>0;
+    approvalNonce=null;
+  });
+  $('authorize').onclick=()=>action(async()=>{
+    if(cooldownSeconds()>0)return;
+    if(!confirm('仅授权本机副本中前 2 个待修复用户小时，不会立即执行。继续？'))return;
+    approvalNonce=approvalNonce||nonce();
+    const data=await api('/authorizations',{
+      confirmation:config.confirmation,request_id:approvalNonce,max_hours:2,
+    });
+    $('task').value=data.task_id;
+    await refresh();
+  });
+  $('refresh').onclick=()=>action(refresh);
+  $('start').onclick=()=>action(async()=>{
+    const id=task();
+    if(!confirm('启动本机有限修复？不自动续跑，不修改金额；已提交结果会保留。'))return;
+    await api(`/authorizations/${id}/start`,{
+      instance:control.instance,revision:control.revision,request_id:nonce(),
+    });
+    await refresh();
+  });
+  $('stop').onclick=()=>action(async()=>{
+    await api(`/authorizations/${task()}/stop`,{
+      instance:control.instance,revision:control.revision,request_id:control.request_id,
+    });
+    await refresh();
+  });
+  $('revoke').onclick=()=>action(async()=>{
+    if(!confirm('撤销后禁止继续使用此授权；已提交数据不回滚。在途单笔事务可能完成。继续？'))return;
+    await api(`/authorizations/${task()}/revoke`,{});
+    await refresh();
+  });
+  $('task').oninput=()=>{authorizationValid=false;buttons();};
+  document.addEventListener('visibilitychange',()=>{clearTimeout(timer);clearTimeout(cooldownTimer);if(!document.hidden){tickCooldown();action(refresh);}});
+  window.addEventListener('pagehide',()=>{clearTimeout(timer);clearTimeout(cooldownTimer);});
+  try{$('task').value=sessionStorage.getItem('financeGiftLocalTask')||'';}catch(_){}
+  action(refresh);
+})();
+</script></body></html>

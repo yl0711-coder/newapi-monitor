@@ -17,6 +17,11 @@ func PrepareFinanceGiftReadPlan(ctx context.Context, dir, confirmation string) (
 	if err != nil {
 		return plan, "", err
 	}
+	return giftScopeReadPlanFromCandidates(suggestion)
+}
+
+func giftScopeReadPlanFromCandidates(suggestion FinanceGiftLocalCandidates) (financegiftexport.BatchPlan, string, error) {
+	var plan financegiftexport.BatchPlan
 	if suggestion.Status != "ready" || len(suggestion.Entries) == 0 {
 		return plan, "", errors.New("read plan requires a nonempty verified, unblocked suggestion")
 	}

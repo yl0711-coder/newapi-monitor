@@ -94,8 +94,14 @@ func mergeFinanceGiftScopeEvidence(prior, fetched []FinanceGiftBoundaryEvent) ([
 }
 
 func repairFinanceGiftBoundaryScope(ctx context.Context, db *gorm.DB, source financeSourceQuerier, epoch string, hour, user, now int64) (financeGiftScopeRepairResult, error) {
+	return repairFinanceGiftBoundaryScopeWithGate(ctx, db, source, epoch, hour, user, func() int64 { return now }, nil)
+}
+
+// The gate runs only when verified local evidence still needs a source read.
+// Wait outside both SQLite transactions and the bounded source query timeout.
+func repairFinanceGiftBoundaryScopeWithGate(ctx context.Context, db *gorm.DB, source financeSourceQuerier, epoch string, hour, user int64, now func() int64, beforeSource func(context.Context) error) (financeGiftScopeRepairResult, error) {
 	var result financeGiftScopeRepairResult
-	if db == nil || epoch == "" || strings.TrimSpace(epoch) != epoch || len(epoch) > 64 || hour < 0 || hour%3600 != 0 || user <= 0 || now <= hour+3600 {
+	if db == nil || epoch == "" || strings.TrimSpace(epoch) != epoch || len(epoch) > 64 || hour < 0 || hour%3600 != 0 || user <= 0 || now == nil || now() <= hour+3600 {
 		return result, errors.New("invalid gift scope repair target")
 	}
 	prior, err := loadFinanceGiftScopeSnapshot(ctx, db, epoch, hour, user)
@@ -112,6 +118,11 @@ func repairFinanceGiftBoundaryScope(ctx context.Context, db *gorm.DB, source fin
 	}
 	if source == nil {
 		return result, errors.New("gift scope repair original source unavailable")
+	}
+	if beforeSource != nil {
+		if err := beforeSource(ctx); err != nil {
+			return result, err
+		}
 	}
 	// Never hold a local write transaction open while waiting for the source.
 	queryCtx, cancel := context.WithTimeout(ctx, financeGiftScopeSourceTimeout)
@@ -134,7 +145,7 @@ func repairFinanceGiftBoundaryScope(ctx context.Context, db *gorm.DB, source fin
 		}
 		// Existing publication also reconciles requests, refunds and quota with
 		// the user-hour aggregate. Both detail and hash commit in one transaction.
-		state, err := replaceFinanceGiftBoundaryUserHour(ctx, tx, hour, user, max(now, prior.State.UpdatedAt+1), epoch, merged)
+		state, err := replaceFinanceGiftBoundaryUserHour(ctx, tx, hour, user, max(now(), prior.State.UpdatedAt+1), epoch, merged)
 		if err != nil {
 			return err
 		}

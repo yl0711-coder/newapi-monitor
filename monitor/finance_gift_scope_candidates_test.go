@@ -67,6 +67,7 @@ func TestFinanceGiftScopeCandidatesBudgets(t *testing.T) {
 		{"do_not_skip_next_hour", []int{1500, 1501, 1}, 0, 1, 1500, "ready", "row_budget"},
 		{"target_limit", []int{1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1}, 0, 10, 10, "ready", "target_limit"},
 		{"oversize_first", []int{3001, 1}, 1, 0, 0, "blocked", "whole_hour_exceeds_row_limit"},
+		{"ready_prefix_before_oversize", []int{2, 3001, 1}, 0, 1, 2, "ready", "whole_hour_exceeds_row_limit"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			backup, paths := giftLargeLocalFixture(t, tc.counts...)
@@ -82,6 +83,18 @@ func TestFinanceGiftScopeCandidatesBudgets(t *testing.T) {
 			}
 			if tc.status == "blocked" && (got.Blocked == nil || got.Blocked.UserID != 7) {
 				t.Fatal("oversize target not identified")
+			}
+			if tc.name == "ready_prefix_before_oversize" && (got.Blocked == nil || got.Blocked.UserID != 8) {
+				t.Fatal("next oversized hour must remain explicitly blocked")
+			}
+			if tc.name == "ready_prefix_before_oversize" {
+				if _, err := runFinanceGiftLocalJob(context.Background(), dir, hash, func(ctx context.Context, _ time.Duration) error { return ctx.Err() }); err != nil {
+					t.Fatal(err)
+				}
+				after := giftReadCandidates(t, dir, hash)
+				if after.Status != "blocked" || len(after.Entries) != 0 || after.Blocked == nil || after.Blocked.UserID != 8 {
+					t.Fatalf("must stop at oversized hour, never skip to later small target: %+v", after)
+				}
 			}
 		})
 	}

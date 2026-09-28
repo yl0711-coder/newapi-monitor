@@ -3,6 +3,7 @@ package monitor
 import (
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -52,7 +53,7 @@ func financeGiftBoundarySQL(userCount int) (string, error) {
 		return "", errors.New("invalid gift boundary user count")
 	}
 	placeholders := strings.TrimSuffix(strings.Repeat("?,", userCount), ",")
-	return fmt.Sprintf("SELECT id,user_id,created_at,type,quota,COALESCE(`group`,'')\n"+`
+	return fmt.Sprintf("SELECT id,user_id,created_at,type,quota,`group`\n"+`
 FROM logs WHERE created_at>=? AND created_at<? AND type IN (2,6)
   AND user_id IN (%s) AND NOT (%s)
 ORDER BY created_at,id LIMIT %d`, placeholders, channelTestLogPredicateSQL(), financeGiftBoundaryMaxRows+1), nil
@@ -92,7 +93,8 @@ func fetchFinanceGiftBoundaryEvents(ctx context.Context, source financeSourceQue
 		}
 		var event FinanceGiftBoundaryEvent
 		var sourceType int
-		if err := rows.Scan(&event.SourceLogID, &event.UserID, &event.EventAt, &sourceType, &event.Quota, &event.Group); err != nil {
+		var sourceGroup sql.NullString
+		if err := rows.Scan(&event.SourceLogID, &event.UserID, &event.EventAt, &sourceType, &event.Quota, &sourceGroup); err != nil {
 			return nil, err
 		}
 		if event.SourceLogID <= 0 || event.EventAt < hourTs || event.EventAt >= hourTs+3600 || event.Quota < 0 {
@@ -102,7 +104,9 @@ func fetchFinanceGiftBoundaryEvents(ctx context.Context, source financeSourceQue
 			return nil, errors.New("gift boundary source returned another user")
 		}
 		event.HourTs = hourTs
-		event.GroupKnown = true
+		// Keep monetary ordering even when historical scope is unavailable.
+		// SQL NULL is not proof of the explicitly empty/default group.
+		event.Group, event.GroupKnown = sourceGroup.String, sourceGroup.Valid
 		switch sourceType {
 		case 2:
 			event.Kind = "usage"

@@ -143,6 +143,13 @@ func TestGiftScopeExportFailsClosed(t *testing.T) {
 	}
 }
 
+func TestGiftScopeExportSQLDoesNotInventGroupEvidence(t *testing.T) {
+	query := strings.Split(strings.ToLower(giftScopeExportSQL()), " from logs")[0]
+	if strings.Contains(query, "coalesce") || !strings.Contains(query, "quota,`group`") {
+		t.Fatal("source NULL must reach the scanner, not become an explicit empty group")
+	}
+}
+
 func TestGiftScopeEvidencePublicationDoesNotOverwrite(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "evidence.json")
 	if err := os.WriteFile(path, []byte("previous"), 0600); err != nil {

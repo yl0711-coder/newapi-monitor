@@ -51,6 +51,7 @@ func (m *Monitor) loadFinanceBillWindow(ctx context.Context, scope stabilityScop
 func projectFinanceBillWindow(rows []ChannelUpstreamUsageHour, scope stabilityScope, now int64, accounts map[string]ChannelUpstreamAccountView, versions map[string][]channelRechargeVersion) (map[string]ChannelUpstreamUsageMetrics, map[string]financeAccountBillAmounts, error) {
 	type amount struct {
 		raw, corrected financeBillSum
+		correctedSeen  bool
 	}
 	totals := map[string]amount{}
 	metrics, err := projectUpstreamUsageBuckets(rows, scope, now, accounts, versions, func(row ChannelUpstreamUsageHour) {
@@ -64,6 +65,7 @@ func projectFinanceBillWindow(rows []ChannelUpstreamUsageHour, scope stabilitySc
 		if status == upstreamAdjustedCostComplete {
 			if cost, _, ok := adjustedUpstreamUsageCost(row.CostUSD, ChannelDomainCost{RechargePaid: paid, RechargeCredit: credit}, true); ok {
 				a.corrected.addUSD(cost)
+				a.correctedSeen = true
 			}
 		}
 		totals[row.Domain] = a
@@ -84,7 +86,10 @@ func projectFinanceBillWindow(rows []ChannelUpstreamUsageHour, scope stabilitySc
 			return nil, nil, fmt.Errorf("上游 %s 账单精度计算失败: %w", domain, a.raw.err)
 		}
 		value := financeAccountBillAmounts{Raw: economicsMoney(a.raw.micro)}
-		if metric.AdjustedCostAvailable {
+		// Preserve verified buckets even when other buckets lack historical
+		// terms. The shared metric remains the authority for whole-window
+		// completeness; an absent amount must not become a fabricated zero.
+		if a.correctedSeen {
 			if a.corrected.err != nil {
 				return nil, nil, fmt.Errorf("上游 %s 修正账单精度计算失败: %w", domain, a.corrected.err)
 			}

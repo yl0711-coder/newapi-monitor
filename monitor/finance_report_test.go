@@ -879,7 +879,7 @@ func TestFinancePageAndNavigationAreWired(t *testing.T) {
 		`data-tab="finance"`, `id="tab-finance"`, `/finance.css?v=14`, `/finance.js?v=`,
 		`id="finPeriodRows"`, `id="finDailyRows"`, `id="finCostRows"`, `id="finPairingRows"`, `id="finPairingCoverage"`, `id="finClosureReadiness"`, `id="finUnallocatedSourceRows"`, `id="finBridgeRevenue"`, `id="finBridgeProfit"`, `window.financeActivate`,
 		`id="finEvidenceRollout"`, `id="finEvidenceRolloutRows"`, `id="finEvidenceRolloutSummary"`, `历史成本补证计划`, `仅改善上游证据`, `建议首个灰度`,
-		`function operatingProfitBlockers`, `上游账单未接入/缺失`, `缺历史充值修正依据`, `AWS 当期未封账`,
+		`function operatingProfitBlockers`, `上游账单区间不完整`, `上游修正成本区间不完整`, `AWS 当期未封账`,
 		`id="finCURProductRows"`, `AWS 基础设施成本明细`, `renderCURProducts`,
 		`id="finGiftEvidence"`, `注册赠送消耗`, `经营收入`, `已配对计费贡献（赠送前）`, `减：修正上游总成本`, `其中：内部测试上游成本`, `id="finInternalAccounts"`, `分组名称候选（非归属证据）`, `不会自动绑定或改变核算金额`, `仅分组名称得到一个候选；不代表令牌归属`, `去渠道管理精确核对`, `window.channelManagementOpenCostSource`, `当前区间没有可发布的上游账单`, `当前区间没有同时核验的收入与成本`, `缺账单证据`,
 		`load(true)`, `query.set('fresh', '1')`, `X-Monitor-Finance-Cache`, `生成于`, `后台更新中`,

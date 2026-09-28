@@ -99,6 +99,7 @@ type financeCostDetailView struct {
 	CompletedHours                 int64                      `json:"completed_hours"`
 	DataUntil                      int64                      `json:"data_until"`
 	CorrectionSource               string                     `json:"correction_source"`
+	RechargeHistoryStatus          string                     `json:"recharge_history_status,omitempty"`
 	BillBasis                      string                     `json:"bill_basis"`
 	Status                         string                     `json:"status"`
 	PairingStatus                  string                     `json:"pairing_status"`
@@ -164,6 +165,7 @@ type financeUpstreamCoverageView struct {
 	AvailableDomains            int                       `json:"available_domains"`
 	CompleteDomains             int                       `json:"complete_domains"`
 	CorrectedDomains            int                       `json:"corrected_domains"`
+	CorrectedCompleteDomains    int                       `json:"corrected_complete_domains"`
 	ExpectedDomainHours         int64                     `json:"expected_domain_hours"`
 	CompletedDomainHours        int64                     `json:"completed_domain_hours"`
 	UnconfiguredDomains         int                       `json:"unconfigured_domains"`
@@ -1137,13 +1139,19 @@ func applyFinanceClosureReadiness(detail *financeCostDetailView) {
 		detail.ClosureNextAction = "当前区间收入、修正成本与渠道归属已经同窗核验。"
 	case detail.Status == "not_configured":
 		detail.ClosureReadiness = "not_required"
-		detail.ClosureNextAction = "未配置上游账户，暂不进入账单覆盖率和正式毛利；配置后再补采并纳入核算。"
+		detail.ClosureNextAction = "未配置上游账户，不安排自动补采；此来源成本未知，已核验部分不能代表全站利润。配置后再核对历史范围。"
 	case detail.Status == "not_connected":
 		detail.ClosureReadiness = "bill_not_connected"
 		detail.ClosureNextAction = "先配置并验证上游账单同步，不能按零成本处理。"
 	case detail.KnownBilledCost.MicroUSD == "":
 		detail.ClosureReadiness = "bill_missing"
 		detail.ClosureNextAction = "先补齐上游账单证据，再评估成本闭环。"
+	case detail.CorrectedCost == nil && detail.RechargeHistoryStatus == upstreamAdjustedCostBucketAmbiguous:
+		detail.ClosureReadiness = "correction_ambiguous"
+		detail.ClosureNextAction = "账单桶内充值比例发生变化，不能按单一比例修正；需更细账单或可审计的分段依据，已核验部分不代表完整成本。"
+	case detail.CorrectedCost == nil && detail.RechargeHistoryStatus == upstreamAdjustedCostMissingHistory:
+		detail.ClosureReadiness = "finance_history_missing"
+		detail.ClosureNextAction = "部分账单缺少当时有效的充值比例；需核对历史生效范围，不能用当前配置覆盖历史。已核验部分不代表完整成本。"
 	case detail.KnownCorrectedCost.MicroUSD == "":
 		detail.ClosureReadiness = "correction_missing"
 		detail.ClosureNextAction = "先补充值到账/支付比例或其它可审计修正依据。"
@@ -1178,6 +1186,9 @@ func applyFinanceClosureReadiness(detail *financeCostDetailView) {
 }
 
 func validateFinanceSettings(s Settings) error {
+	if err := validateFinanceGiftPreviewSettings(s); err != nil {
+		return err
+	}
 	if s.FinanceFastSnapshotEnabled && (!s.FinanceEnabled || !s.FinanceReportSnapshotReadEnabled || !s.FinanceReportSnapshotShadowEnabled) {
 		return errors.New("经营核算快速快照需要同时开启经营核算、快照影子写入和快照读取")
 	}
@@ -2438,6 +2449,9 @@ func (m *Monitor) loadFinanceUpstreamFactsWithSources(ctx context.Context, scope
 		}
 		validUsage := configured && account.UsageSyncEnabled && usageFound && metrics.Available && (metrics.IntegrityStatus == "" || metrics.IntegrityStatus == upstreamUsageIntegrityComplete)
 		if validUsage {
+			if !metrics.AdjustedCostAvailable {
+				detail.RechargeHistoryStatus = metrics.AdjustedCostStatus
+			}
 			coverage.AvailableDomains++
 			coverage.ExpectedDomainHours += metrics.ExpectedHours
 			coverage.CompletedDomainHours += metrics.CompletedHours
@@ -2472,6 +2486,18 @@ func (m *Monitor) loadFinanceUpstreamFactsWithSources(ctx context.Context, scope
 				correctedKnown = true
 				correctedExact = economic.Totals.CorrectedCostKnown && economic.Coverage.Complete
 				detail.CorrectionSource = "经济事实账"
+				// Account-bill terms do not describe gaps in the selected
+				// immutable ledger. Its own pairing blockers remain authoritative.
+				detail.RechargeHistoryStatus = ""
+			}
+		}
+		// Keep the existing complete-recharge / ledger source precedence.
+		// A partial recharge source is a fallback, never added to the ledger
+		// (their overlapping hours would otherwise be counted twice).
+		if !correctedKnown && validUsage {
+			if value, ok := financeMoneyInt64(rawBills[domain].RechargeCorrected); ok {
+				corrected = economicsMoney(value)
+				correctedKnown, detail.CorrectionSource = true, "充值版本"
 			}
 		}
 		if correctedKnown {
@@ -2518,6 +2544,13 @@ func (m *Monitor) loadFinanceUpstreamFactsWithSources(ctx context.Context, scope
 		coverage.UnconfiguredUserConsumption = economicsMoney(unconfiguredUserConsumption)
 	}
 	knownBilledMoney, knownCorrectedMoney := economicsMoney(knownBilled), economicsMoney(knownCorrected)
+	if coverage.AvailableDomains == 0 {
+		knownBilledMoney = channelEconomicsMoneyView{}
+	}
+	if coverage.CorrectedDomains == 0 {
+		knownCorrectedMoney = channelEconomicsMoneyView{}
+	}
+	coverage.CorrectedCompleteDomains = correctedCompleteDomains
 	allRaw := coverage.RelevantDomains > 0 && coverage.UsageEnabledDomains == coverage.RelevantDomains && coverage.CompleteDomains == coverage.RelevantDomains
 	coverage.Complete = allRaw && correctedCompleteDomains == coverage.RelevantDomains
 	var billedExact, correctedExact *channelEconomicsMoneyView
@@ -2707,6 +2740,10 @@ func mergeFinanceCostDetails(periodDetails [][]financeCostDetailView, accounts m
 			accumulator.contributionExact = accumulator.contributionExact && detail.Contribution != nil
 			accumulator.view.ExpectedHours += detail.ExpectedHours
 			accumulator.view.CompletedHours += detail.CompletedHours
+			if status := detail.RechargeHistoryStatus; status != "" &&
+				(accumulator.view.RechargeHistoryStatus == "" || status == upstreamAdjustedCostBucketAmbiguous) {
+				accumulator.view.RechargeHistoryStatus = status
+			}
 			if detail.DataUntil > accumulator.view.DataUntil {
 				accumulator.view.DataUntil = detail.DataUntil
 			}
@@ -2805,6 +2842,7 @@ func mergeFinanceCostDetails(periodDetails [][]financeCostDetailView, accounts m
 	if coverage.UnconfiguredDomains > 0 {
 		coverage.UnconfiguredUserConsumption = economicsMoney(unconfiguredUserConsumption)
 	}
+	coverage.CorrectedCompleteDomains = correctedCompleteDomains
 	coverage.Complete = coverage.RelevantDomains > 0 && coverage.UsageEnabledDomains == coverage.RelevantDomains &&
 		coverage.CompleteDomains == coverage.RelevantDomains && correctedCompleteDomains == coverage.RelevantDomains
 	sort.SliceStable(details, func(i, j int) bool {
@@ -3124,9 +3162,11 @@ func financeSourceViews(user StabilityDataCoverage, upstream financeUpstreamCove
 	} else if upstream.Complete {
 		upstreamStatus = "verified"
 	}
-	upstreamDescription := fmt.Sprintf("%d / %d 个已配置域名取得账单，%d 个具备可用修正证据", upstream.AvailableDomains, upstream.RelevantDomains, upstream.CorrectedDomains)
+	upstreamDescription := fmt.Sprintf("账单区间完整 %d/%d（取得金额 %d）；修正成本区间完整 %d/%d（取得金额 %d）；采集进度不等于核算完成",
+		upstream.CompleteDomains, upstream.RelevantDomains, upstream.AvailableDomains,
+		upstream.CorrectedCompleteDomains, upstream.RelevantDomains, upstream.CorrectedDomains)
 	if upstream.UnconfiguredDomains > 0 {
-		upstreamDescription += fmt.Sprintf("；另有 %d 个未配置来源、%s 用户消费暂不纳入正式毛利", upstream.UnconfiguredDomains, upstream.UnconfiguredUserConsumption.Display)
+		upstreamDescription += fmt.Sprintf("；另有 %d 个未配置来源、%s 用户消费的成本未知，不安排自动补采；已核验部分不能代表全站利润", upstream.UnconfiguredDomains, upstream.UnconfiguredUserConsumption.Display)
 	}
 	pairedStatus := "no_data"
 	pairedDescription := "当前未找到收入、成本、渠道映射和倍率版本同时核验的发布事实"
@@ -3144,6 +3184,9 @@ func financeSourceViews(user StabilityDataCoverage, upstream financeUpstreamCove
 	giftDescription := fmt.Sprintf("用户小时 %d/%d、额度小时 %d/%d、赠送用户明细 %d/%d",
 		gift.UserCompletedHours, gift.ExpectedHours, gift.CreditCompletedHours, gift.ExpectedHours,
 		gift.CompletedBoundaryUserHours, gift.ExpectedBoundaryUserHours)
+	if gift.ScopeUnknownEvents > 0 {
+		giftDescription += fmt.Sprintf("；%d 条历史事件缺分组依据，小时采集完成不代表赠送核算完成", gift.ScopeUnknownEvents)
+	}
 	if gift.ExpectedHours == 0 {
 		giftStatus = "no_data"
 		giftDescription = "当前查询区间不在经营核算事实范围内"

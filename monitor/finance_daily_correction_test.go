@@ -104,25 +104,25 @@ func TestFinanceDailyRechargeCorrectionBoundaries(t *testing.T) {
 func TestFinanceDailyRechargeCorrectionUsesPeriodSources(t *testing.T) {
 	m, scope, accounts := dailyBillFixture(t)
 	createChannelRechargeVersion(t, m, "hour.example", 1, scope.FromTs, 1, 2)
-	// Only day 2 has evidence for this domain: the whole-period recharge
-	// source is unavailable, so its daily drilldown must not inflate the sum.
+	// Only day 2 has evidence for this domain. Retain that known part in
+	// both parent and daily drilldown without certifying the whole period.
 	createChannelRechargeVersion(t, m, "day.example", 1, scope.FromTs+86400, 1, 2)
 	component, _, err := m.buildFinancePeriodComponent(context.Background(), scope, scope.ToTs+86400, "period-sources", accounts, channelFinanceSnapshot{}, financeInternalTestCostEvidence{}, financeConfiguredInternalEvidence{Complete: true}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if component.Statement.KnownRawCorrectedUpstreamCost.MicroUSD != "1500000" {
-		t.Fatal("partial recharge source entered the period")
+	if component.Statement.KnownRawCorrectedUpstreamCost.MicroUSD != "11500000" || component.Statement.RawCorrectedUpstreamCost != nil {
+		t.Fatal("partial recharge source missing or promoted to exact")
 	}
 	var sum int64
-	for _, day := range component.Days {
+	for i, day := range component.Days {
 		value, ok := financeMoneyInt64(day.RechargeCorrection.KnownCost)
-		if !ok || day.RechargeCorrection.Cost != nil || day.RechargeCorrection.AvailableDomains != 1 {
+		if !ok || (day.RechargeCorrection.Cost != nil) != (i == 1) || day.RechargeCorrection.AvailableDomains != i+1 {
 			t.Fatal("daily source scope differs from parent period")
 		}
 		sum += value
 	}
-	if sum != 1_500_000 {
+	if sum != 11_500_000 {
 		t.Fatal("daily recharge cost includes extra domains")
 	}
 }

@@ -23,9 +23,92 @@ function fixture(fetchImpl = async()=>{throw new Error('offline');}) {
   const source=readFileSync(new URL('../../monitor/finance.js',import.meta.url),'utf8');
   const end=source.lastIndexOf('}());');
   assert.ok(end>0,'finance module closure not found');
-  vm.runInContext(source.slice(0,end)+'\nglobalThis.fixture={state,scheduleStaleRefresh,load,financeIsPriorStale,financeCacheRefreshNote,renderProfitBridge,operatingProfitBlockers,setGiftEvidence,renderPeriods,renderDays,internalCostDeductionNote,grossCorrectedCost,chartValue};\n'+source.slice(end),context);
+  vm.runInContext(source.slice(0,end)+'\nglobalThis.fixture={state,scheduleStaleRefresh,load,financeIsPriorStale,financeCacheRefreshNote,renderProfitBridge,operatingProfitBlockers,setGiftEvidence,renderPeriods,renderDays,internalCostDeductionNote,grossCorrectedCost,chartValue,renderExecutive,upstreamCoverage,renderCosts};\n'+source.slice(end),context);
   return {api:context.fixture,element,timers};
 }
+
+test('coverage cards distinguish any money from complete period evidence',()=>{
+  const {api,element}=fixture();
+  const upstream={relevant_domains:39,available_domains:39,complete_domains:37,corrected_domains:15,corrected_complete_domains:0};
+  api.renderExecutive({upstream_coverage:upstream},{});
+  assert.equal(element('finBillEvidence:b').textContent,'94.9%');
+  assert.equal(element('finCorrectionEvidence:b').textContent,'0.0%');
+  assert.equal(element('finCorrectionEvidence').classList.contains('ready'),false);
+  assert.match(element('finCorrectionEvidence:span').textContent,/15.*部分/);
+  assert.match(api.upstreamCoverage(upstream),/完整账单 37\/39/);
+  assert.match(api.upstreamCoverage(upstream),/完整修正 0\/39/);
+});
+
+test('profit blockers explain partial bills and correction without assuming active backfill',()=>{
+  const {api}=fixture();
+  const money={micro_usd:'0'};
+  const data={gift_coverage:{complete:true},upstream_coverage:{relevant_domains:2,available_domains:2,complete_domains:1,corrected_domains:2,corrected_complete_domains:0,unconfigured_domains:1},cost_details:[]};
+  const note=api.operatingProfitBlockers(data,{operating_revenue:money,aws_infrastructure_cost:money}).join('；');
+  assert.match(note,/1 个上游账单区间不完整/);
+  assert.match(note,/2 个上游修正成本区间不完整/);
+  assert.match(note,/不能代表全站/);
+  assert.doesNotMatch(note,/正在回填|正在同步/);
+});
+
+test('legacy cached coverage cannot promote partial correction to complete',()=>{
+  const {api,element}=fixture();
+  api.renderExecutive({upstream_coverage:{relevant_domains:1,available_domains:1,corrected_domains:1}},{});
+  assert.equal(element('finCorrectionEvidence').classList.contains('ready'),false);
+  assert.equal(element('finCorrectionEvidence:b').textContent,'—');
+  assert.match(element('finCorrectionEvidence:span').textContent,/旧快照.*完整覆盖/);
+});
+
+test('supplier evidence preserves verified zero and unrelated money without suggesting running jobs',()=>{
+  const {api,element}=fixture();
+  const zero={micro_usd:'0'};
+  api.renderCosts([{domain:'zero.example',billed_cost:zero,known_billed_cost:zero,corrected_cost:zero,known_corrected_cost:zero,status:'verified'}]);
+  let html=element('finCostRows').innerHTML;
+  assert.match(html,/\$0\.00/);
+  assert.match(html,/账单区间完整；修正成本区间完整/);
+  api.renderCosts([{domain:'partial.example',known_billed_cost:{micro_usd:'42000000'},status:'incomplete',pairing_status:'not_enrolled'},
+    {domain:'unconfigured.example',status:'not_configured'}]);
+  html=element('finCostRows').innerHTML;
+  assert.match(html,/\$42\.00<small>已知部分/);
+  assert.doesNotMatch(html,/\$0\.00/);
+  assert.match(html,/账单区间不完整；缺可核验修正依据/);
+  assert.match(html,/不自动补采/);
+  assert.match(html,/不代表补采正在运行/);
+});
+
+test('offline production snapshot renders completeness from actual supplier evidence',
+  {skip:!process.env.MONITOR_FINANCE_SEMANTICS_REPORT&&'requires offline snapshot report'},()=>{
+  const data=JSON.parse(readFileSync(process.env.MONITOR_FINANCE_SEMANTICS_REPORT,'utf8'));
+  const {api,element}=fixture();
+  const hasMoney=value=>value?.micro_usd!=null&&value.micro_usd!=='';
+  const details=data.cost_details.filter(row=>row.status!=='not_configured');
+  const bills=details.filter(row=>hasMoney(row.billed_cost)).length;
+  const corrected=details.filter(row=>hasMoney(row.corrected_cost)).length;
+  assert.equal(data.upstream_coverage.complete_domains,bills);
+  assert.equal(data.upstream_coverage.corrected_complete_domains,corrected);
+  api.renderExecutive(data,data.statement);
+  assert.equal(element('finBillEvidence:b').textContent,`${(bills*100/details.length).toFixed(1)}%`);
+  assert.equal(element('finCorrectionEvidence:b').textContent,`${(corrected*100/details.length).toFixed(1)}%`);
+  assert.notEqual(element('finDecisionBadge').textContent,'可发布');
+  api.renderCosts(data.cost_details);
+  assert.match(element('finCostRows').innerHTML,/不代表补采正在运行/);
+  // No exact operating result may be synthesized by presenting partial costs.
+  assert.equal(data.statement.operating_profit,null);
+});
+
+test('partial correction shows known money and historical repair action without profit',()=>{
+  const {api,element}=fixture();
+  api.renderCosts([{domain:'partial.example',known_billed_cost:{micro_usd:'12000000'},billed_cost:{micro_usd:'12000000'},
+    known_corrected_cost:{micro_usd:'3000000'},corrected_cost:null,status:'incomplete',pairing_status:'not_enrolled',
+    closure_readiness:'finance_history_missing',closure_next_action:'缺少当时有效的充值比例；不能用当前配置覆盖历史。'},
+    {domain:'ambiguous.example',known_billed_cost:{micro_usd:'1000000'},closure_readiness:'correction_ambiguous',
+      closure_next_action:'需更细账单或可审计分段依据。'}]);
+  const html=element('finCostRows').innerHTML;
+  assert.match(html,/\$3\.00<small>已知部分/);
+  assert.match(html,/修正成本仅有部分/);
+  assert.match(html,/不能用当前配置覆盖历史/);
+  assert.match(html,/账单桶内比例变化/);
+  assert.doesNotMatch(html,/\$0\.00/);
+});
 
 test('upgrade snapshot preserves old date and never conceals failed recomputation',()=>{
   const {api}=fixture();

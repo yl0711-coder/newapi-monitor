@@ -102,7 +102,14 @@ func TestFinanceGiftScopeLocalMixedHoursAndRecovery(t *testing.T) {
 					}
 					return ctx.Err()
 				})
-				if err != nil || result.Status != "complete" || result.Remaining != 0 || len(result.Entries) != 4 || waits != 4 {
+				wantWaits := 4 // Startup cooldown plus intervals between four pending targets.
+				if alreadyUpdated > 0 {
+					wantWaits = 3
+				}
+				if attempt == 1 {
+					wantWaits = 1
+				} // Fully verified replay retains startup protection only.
+				if err != nil || result.Status != "complete" || result.Remaining != 0 || len(result.Entries) != 4 || waits != wantWaits {
 					t.Fatalf("result=%+v waits=%d %v", result, waits, err)
 				}
 				updated := 0

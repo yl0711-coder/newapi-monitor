@@ -34,7 +34,7 @@ func giftScopeExportSQL() string {
 }
 
 func giftScopeExportSQLWithLimit(limit int) string {
-	return fmt.Sprintf("SELECT /*+ MAX_EXECUTION_TIME(2000) */ id,user_id,created_at,type,quota,COALESCE(`group`,'') FROM logs WHERE user_id=? AND created_at>=? AND created_at<? AND type IN (2,6) AND NOT (%s) ORDER BY created_at,id LIMIT %d", trafficclass.SourceExclusionPredicateSQL, limit+1)
+	return fmt.Sprintf("SELECT /*+ MAX_EXECUTION_TIME(2000) */ id,user_id,created_at,type,quota,`group` FROM logs WHERE user_id=? AND created_at>=? AND created_at<? AND type IN (2,6) AND NOT (%s) ORDER BY created_at,id LIMIT %d", trafficclass.SourceExclusionPredicateSQL, limit+1)
 }
 
 // Reject scans before executing the data SELECT. EXPLAIN is not EXPLAIN ANALYZE.

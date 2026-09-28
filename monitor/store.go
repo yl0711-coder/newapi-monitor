@@ -1039,6 +1039,11 @@ func (m *Monitor) openStore(path string) error {
 			return fmt.Errorf("初始化上游余额报警配置失败: %w", err)
 		}
 	}
+	if m.cfg.FinanceGiftHandoffApprovalEnabled {
+		if err := db.AutoMigrate(&financeGiftHandoffAuthorization{}); err != nil {
+			return fmt.Errorf("交接授权记录初始化失败: %w", err)
+		}
+	}
 	m.storeDB = db
 	// Offline snapshots retain opaque credentials and diagnostic history as-is.
 	// Viewing saved facts must not require exporting production encryption keys

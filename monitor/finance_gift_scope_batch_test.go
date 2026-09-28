@@ -55,8 +55,77 @@ func TestFinanceGiftScopeBatchLimitsCooldownAndResume(t *testing.T) {
 			t.Fatal("retry changed facts", entry)
 		}
 	}
-	if len(*delays) != 3 {
-		t.Fatal("cooldown bypassed across batches", *delays)
+	if len(*delays) != 1 {
+		t.Fatal("verified replay should not repeat source cooldown", *delays)
+	}
+}
+
+func TestFinanceGiftScopeBatchResumeWaitsOnlyForPendingSource(t *testing.T) {
+	r, plan, delays, calls := giftScopeBatchFixture(t)
+	// Align the pending fixture's publication with the injected clock. GORM's
+	// automatic UpdatedAt otherwise uses wall time and wins the monotonic guard,
+	// masking whether completion was stamped before or after the simulated wait.
+	if err := r.db.Model(&FinanceGiftBoundaryState{}).
+		Where("source_epoch=? AND hour_ts=? AND user_id=?", plan[1].SourceEpoch, plan[1].HourTs, plan[1].UserID).
+		UpdateColumn("updated_at", r.now().Unix()-1).Error; err != nil {
+		t.Fatal(err)
+	}
+	audit := func(financeGiftScopeBatchEntry) error { return nil }
+	if _, err := r.run(context.Background(), plan[:1], audit); err != nil {
+		t.Fatal(err)
+	}
+	nextAttempt := r.nextAttempt
+	if _, err := r.run(context.Background(), plan[:1], audit); err != nil {
+		t.Fatal(err)
+	}
+	if *calls != 1 || len(*delays) != 0 || !r.nextAttempt.Equal(nextAttempt) {
+		t.Fatal("verified replay changed source cooldown", *delays, *calls)
+	}
+	result, err := r.run(context.Background(), plan, audit)
+	if err != nil || result.Status != "complete" || *calls != 2 || !reflect.DeepEqual(*delays, []time.Duration{financeGiftScopeBatchInterval}) {
+		t.Fatalf("pending source must still wait exactly one cooldown: %+v %v delays=%v calls=%d", result, err, *delays, *calls)
+	}
+	proof, err := loadFinanceGiftScopeSnapshot(context.Background(), r.db, plan[1].SourceEpoch, plan[1].HourTs, plan[1].UserID)
+	if err != nil || proof.State.CompletedAt != r.now().Unix() {
+		t.Fatalf("completion timestamp must be after cooldown: got=%d want=%d err=%v", proof.State.CompletedAt, r.now().Unix(), err)
+	}
+}
+
+func TestFinanceGiftScopeBatchFailedSourceStillConsumesCooldown(t *testing.T) {
+	r, plan, delays, calls := giftScopeBatchFixture(t)
+	original := r.source.(giftScopeHookSource)
+	// A failed, incomplete source response must not permit a hot retry.
+	if _, err := original.db.Exec("DELETE FROM logs WHERE id=2"); err != nil {
+		t.Fatal(err)
+	}
+	audit := func(financeGiftScopeBatchEntry) error { return nil }
+	for attempt := 0; attempt < 2; attempt++ {
+		result, err := r.run(context.Background(), plan[:1], audit)
+		if err == nil || result.Status != "failed" || result.Remaining != 1 {
+			t.Fatalf("expected unchanged failed target: %+v %v", result, err)
+		}
+	}
+	if *calls != 2 || !reflect.DeepEqual(*delays, []time.Duration{financeGiftScopeBatchInterval}) {
+		t.Fatal("failed source retry bypassed cooldown", *calls, *delays)
+	}
+}
+
+func TestFinanceGiftScopeBatchVerifiedProofCorruptionIsNotSkipped(t *testing.T) {
+	r, plan, _, calls := giftScopeBatchFixture(t)
+	audit := func(financeGiftScopeBatchEntry) error { return nil }
+	if _, err := r.run(context.Background(), plan[:1], audit); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.db.Model(&FinanceGiftBoundaryEvent{}).Where("user_id=?", plan[0].UserID).Update("quota", 999).Error; err != nil {
+		t.Fatal(err)
+	}
+	r.wait = func(context.Context, time.Duration) error {
+		t.Fatal("corrupt local evidence reached source gate")
+		return nil
+	}
+	result, err := r.run(context.Background(), plan[:1], audit)
+	if err == nil || result.Status != "failed" || *calls != 1 {
+		t.Fatalf("corrupted completed proof skipped: %+v %v", result, err)
 	}
 }
 

@@ -202,6 +202,9 @@ type Monitor struct {
 	financeReportRefreshRunning  atomic.Bool
 	financeAsyncQueue            financeReportQueue
 	financeSnapshotWriteMu       sync.RWMutex
+	financeGiftPreviewMu         sync.Mutex
+	financeGiftTask              financeGiftTaskControl
+	financeGiftPreviewNextAt     time.Time
 	financePeriodCacheOnce       sync.Once
 	financePeriodCache           *boundedByteCache
 	financeGiftEvidenceCacheOnce sync.Once
@@ -988,6 +991,13 @@ func (m *Monitor) Close() {
 	m.closeOnce.Do(func() {
 		m.shuttingDown.Store(true)
 		close(m.shutdownSignal())
+		giftStopCtx, giftStopCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		giftStopped := m.financeGiftTask.shutdown(giftStopCtx)
+		giftStopCancel()
+		if !giftStopped {
+			slog.Error("本地赠送交接任务未按时退出，保留数据库连接等待进程退出")
+			return
+		}
 		m.investigationMu.Lock()
 		for _, task := range m.investigationTasks {
 			if task != nil && task.Cancel != nil && (task.Status == "queued" || task.Status == "running" || task.Status == "pending_delivery") {

@@ -47,6 +47,24 @@ func TestFinanceUpgradeSnapshotDisplayOnlyNeverPromotesMoney(t *testing.T) {
 	}
 }
 
+func TestFinanceUpgradeSnapshotRetainsDeployedProjectionFallback(t *testing.T) {
+	m, request, now, payload := newFinanceUpgradeSnapshotFixture(t)
+	// A distinct range has only the already-supported deployed projection.
+	request.from = time.Unix(0, 0)
+	payload = bytes.Replace(payload, []byte(`"from":3600`), []byte(`"from":0`), 1)
+	key := financeUpgradeProjectionKey(request, "accounting-delivery-compat-v1")
+	if err := m.persistFinanceReportSnapshotShadow(key, "legacy", payload, now); err != nil {
+		t.Fatal(err)
+	}
+	got, ok, err := m.loadFinanceUpgradeSnapshot(request, now)
+	if err != nil || !ok || !bytes.Equal(got, payload) {
+		t.Fatalf("deployed fallback: ok=%t err=%v", ok, err)
+	}
+	if _, _, _, ok, err := m.loadFinanceReportSnapshot(request, now); err != nil || ok {
+		t.Fatal("legacy promoted to current", err)
+	}
+}
+
 func TestFinanceUpgradeSnapshotIsolationAndExpiry(t *testing.T) {
 	for _, scenario := range []string{"config", "start", "earlier-end", "too-distant", "expired", "missing-config", "local-snapshot", "clamped", "disabled", "read-disabled", "future-generated", "bounds", "checksum", "unsupported-projection"} {
 		t.Run(scenario, func(t *testing.T) {
@@ -100,7 +118,7 @@ func TestFinanceUpgradeSnapshotIsolationAndExpiry(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				raw = bytes.Replace(raw, []byte("daily-internal-diagnostics-v1"), []byte("daily-internal-diagnostics-v0"), 1)
+				raw = bytes.Replace(raw, []byte("accounting-amount-evidence-v2"), []byte("unsupported-accounting-v0"), 1)
 				if err := os.WriteFile(path, raw, 0600); err != nil {
 					t.Fatal(err)
 				}

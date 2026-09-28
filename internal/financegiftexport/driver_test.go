@@ -24,6 +24,9 @@ type giftExportDB struct {
 	commitErr, readErr    error
 	committed, rolledBack bool
 	waitForCancel         bool
+	activeTx              bool
+	transactions          int
+	sourceUUID            string
 }
 
 type giftExportDriver struct{ db *giftExportDB }
@@ -40,7 +43,7 @@ var giftExportDriverID atomic.Int64
 
 func giftExportTestDB(t *testing.T, data [][]driver.Value) (*sql.DB, *giftExportDB) {
 	t.Helper()
-	state := &giftExportDB{data: data, planType: "range", planRows: "3000"}
+	state := &giftExportDB{data: data, planType: "range", planRows: "3000", sourceUUID: "synthetic-uuid"}
 	name := fmt.Sprintf("gift-export-test-%d", giftExportDriverID.Add(1))
 	sql.Register(name, &giftExportDriver{state})
 	db, err := sql.Open(name, "")
@@ -62,10 +65,20 @@ func (c *giftExportConn) Begin() (driver.Tx, error) {
 }
 func (c *giftExportConn) BeginTx(_ context.Context, options driver.TxOptions) (driver.Tx, error) {
 	c.db.options = options
+	c.db.activeTx = true
+	c.db.transactions++
 	return &giftExportTx{c.db}, nil
 }
 func (c *giftExportConn) QueryContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
-	if _, ok := ctx.Deadline(); !ok || len(args) != 3 {
+	if query == "SELECT @@server_uuid, DATABASE(), CURRENT_USER()" {
+		if _, ok := ctx.Deadline(); !ok || len(args) != 0 {
+			return nil, errors.New("unbounded source identity query")
+		}
+		c.db.queries = append(c.db.queries, query)
+		return &giftExportRows{columns: []string{"uuid", "database", "user"}, data: [][]driver.Value{{c.db.sourceUUID, "fixture", "monitor_ro@localhost"}}}, nil
+	}
+	largePage := strings.Contains(query, " AND id IN (")
+	if _, ok := ctx.Deadline(); !ok || (!largePage && len(args) != 3) || (largePage && (len(args) <= 3 || len(args) > largeHourPageRows+3)) {
 		return nil, errors.New("missing bounded query context or unexpected target")
 	}
 	user, userOK := args[0].Value.(int64)
@@ -94,13 +107,35 @@ func (c *giftExportConn) QueryContext(ctx context.Context, query string, args []
 		<-ctx.Done()
 		return nil, ctx.Err()
 	}
+	if largePage {
+		ids := make(map[int64]bool)
+		for _, arg := range args[3:] {
+			id, ok := arg.Value.(int64)
+			if !ok || ids[id] {
+				return nil, errors.New("invalid pinned page IDs")
+			}
+			ids[id] = true
+		}
+		var filtered [][]driver.Value
+		for _, row := range data {
+			if ids[row[0].(int64)] {
+				filtered = append(filtered, row)
+			}
+		}
+		data = filtered
+	}
 	return &giftExportRows{columns: []string{"id", "user_id", "created_at", "type", "quota", "group"}, data: data, err: c.db.readErr}, nil
 }
 func (t *giftExportTx) Commit() error {
+	t.db.activeTx = false
 	t.db.committed = t.db.commitErr == nil
 	return t.db.commitErr
 }
-func (t *giftExportTx) Rollback() error     { t.db.rolledBack = true; return nil }
+func (t *giftExportTx) Rollback() error {
+	t.db.activeTx = false
+	t.db.rolledBack = true
+	return nil
+}
 func (r *giftExportRows) Columns() []string { return r.columns }
 func (r *giftExportRows) Close() error      { return nil }
 func (r *giftExportRows) Next(dest []driver.Value) error {
