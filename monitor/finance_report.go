@@ -1966,13 +1966,10 @@ func (m *Monitor) loadFinanceInternalCostEvidence(ctx context.Context, scope sta
 		return result, fmt.Errorf("读取内部测试成本发布头: %w", err)
 	}
 	var publications []channelEconomicsReportRow
-	if err := m.storeDB.WithContext(ctx).Table("channel_economics_hour_manifest_current mc").
+	if err := currentEconomicsPublicationQuery(m.storeDB.WithContext(ctx)).
 		Select(`p.publication_id,p.finance_version,p.domain,p.account_epoch,p.hour_ts,p.local_channel_id,p.local_requests,p.upstream_requests,
 			p.local_refund_records,p.revenue_micro_usd,p.upstream_charge_units,p.upstream_cost_micro_usd,
 			p.corrected_cost_micro_usd,p.profit_micro_usd,p.corrected_cost_known,p.profit_known,p.coverage_status`).
-		Joins("JOIN channel_economics_hour_manifest_publications mp ON mp.manifest_id=mc.manifest_id").
-		Joins("JOIN channel_economics_hour_publications p ON p.domain=mp.domain AND p.hour_ts=mp.hour_ts AND p.account_epoch=mp.authoritative_epoch AND p.semantics_version=mp.semantics_version").
-		Joins("JOIN channel_economics_hour_current c ON c.publication_id=p.publication_id").
 		Where("p.semantics_version=? AND p.hour_ts>=? AND p.hour_ts<?", channelEconomicsSemanticsVersion, scope.FromTs, scope.ToTs).
 		Limit(maxChannelEconomicsReportRows + 1).Scan(&publications).Error; err != nil {
 		return result, fmt.Errorf("读取内部测试成本发布事实: %w", err)
@@ -2985,6 +2982,7 @@ func (m *Monitor) buildFinanceOperatingReport(ctx context.Context, from, to time
 		return nil, fmt.Errorf("读取月度经营核算配置版本: %w", err)
 	}
 	periodDetails := make([][]financeCostDetailView, 0, 24)
+	periodStarted := time.Now()
 	for _, monthRange := range financeMonthRanges(from, to) {
 		monthScope := stabilityScope{FromTs: monthRange[0].Unix(), ToTs: monthRange[1].Unix()}
 		monthInternalAccounts, sliceErr := financeConfiguredInternalSubrange(configuredInternal, monthScope)
@@ -3000,6 +2998,7 @@ func (m *Monitor) buildFinanceOperatingReport(ctx context.Context, from, to time
 			monthInternalTestCost, monthInternalAccounts, businessGroups,
 		)
 		if err != nil {
+			logFinanceReadStageTiming("month-components", periodStarted, err)
 			return nil, fmt.Errorf("读取 %s 月度经济事实: %w", monthRange[0].Format("2006-01"), err)
 		}
 		report.Periods = append(report.Periods, financePeriodView{
@@ -3010,6 +3009,7 @@ func (m *Monitor) buildFinanceOperatingReport(ctx context.Context, from, to time
 		periodDetails = append(periodDetails, component.CostDetails)
 		report.Days = append(report.Days, component.Days...)
 	}
+	logFinanceReadStageTiming("month-components", periodStarted, nil)
 	report.UserCoverage = m.accountingDataCoverage(ctx, from.Unix(), to.Unix(), report.GeneratedAt)
 	report.UserCoverage.Complete = report.UserCoverage.Complete && configuredInternal.Complete
 	report.UpstreamCoverage, report.CostDetails, err = mergeFinanceCostDetails(periodDetails, accounts)
@@ -3038,7 +3038,9 @@ func (m *Monitor) buildFinanceOperatingReport(ctx context.Context, from, to time
 		for _, userID := range configuredInternal.AccountIDs {
 			excludedGiftUsers[userID] = true
 		}
+		giftStarted := time.Now()
 		giftResult, giftErr = m.loadFinanceGiftAllocationForScope(ctx, financeSeed.Unix(), from.Unix(), giftTo, businessGroups, excludedGiftUsers)
+		logFinanceReadStageTiming("gift-allocation", giftStarted, giftErr)
 		if giftErr != nil {
 			return nil, fmt.Errorf("核验注册赠送实际消耗: %w", giftErr)
 		}

@@ -1354,6 +1354,13 @@ async function syncUpstreamFundsNow(){
   catch(error){showUpstreamMessage(error.message||'资金流水同步失败。',true);await loadUpstreamFunds(domain)}finally{button.disabled=false;$('cmUpstreamSave').disabled=false;$('cmUpstreamSync').disabled=false;$('cmUpstreamUsageSync').disabled=false}
 }
 
+function upstreamBalanceSummary(accounts){
+  const excluded=accounts.filter(domain=>domain.upstream?.exclude_from_balance_summary===true);
+  const included=accounts.filter(domain=>domain.upstream?.exclude_from_balance_summary!==true);
+  const known=included.filter(domain=>domain.upstream.balance_usd!=null&&Number.isFinite(Number(domain.upstream.balance_usd)));
+  return {known,excluded,total:known.reduce((sum,domain)=>sum+Number(domain.upstream.balance_usd),0)};
+}
+
 function render(){
   if(!cm.report)return;
   const domains=filteredDomains();
@@ -1373,8 +1380,8 @@ function render(){
   const upstreamUsageDomains=upstreamAccounts.filter(domain=>domain.upstream_usage?.available);
 	const trustedUsageDomains=upstreamUsageDomains.filter(domain=>presentedBusinessCost(domain.upstream_usage,false,costBases.cost).available);
 	const adjustedUsageDomains=upstreamUsageDomains.filter(domain=>presentedBusinessCost(domain.upstream_usage,true,costBases.adjusted).available);
-  const upstreamBalanceDomains=upstreamConfiguredAccounts.filter(domain=>domain.upstream.balance_usd!=null&&Number.isFinite(Number(domain.upstream.balance_usd)));
-  const upstreamBalance=upstreamBalanceDomains.reduce((sum,domain)=>sum+Number(domain.upstream.balance_usd),0);
+  const balanceSummary=upstreamBalanceSummary(upstreamConfiguredAccounts);
+  const upstreamBalanceDomains=balanceSummary.known,upstreamBalance=balanceSummary.total;
   const upstreamSpendValue=upstreamAggregateLabel(trustedUsageDomains,false,costBases.cost);
   const adjustedUpstreamSpendValue=upstreamAggregateLabel(adjustedUsageDomains,true,costBases.adjusted);
   const upstreamSpendLabel=upstreamAccountComparable?upstreamSpendValue:'—';
@@ -1393,7 +1400,7 @@ function render(){
 	<article class="accent"><small>用户侧消费</small><b>${usageMetric(filteredUsage.cost_usd,usd)}</b><span>当前查询区间 · 用户消费金额</span></article>
     <article class="upstream"><small>${costBases.cost==='business'?'区间上游消费汇总':'区间上游账单消费汇总'}</small><b>${upstreamSpendLabel}</b><span>${esc(upstreamScopeLabel)}</span></article>
 		<article class="adjusted"><small>上游修正成本汇总</small><b>${adjustedUpstreamSpendLabel}</b><span>已取得 ${adjustedUsageDomains.length}/${upstreamAccounts.length} 个账户 · ${costBases.adjusted==='business'?'已扣配置内部账号':'账单口径，含内部测试成本'} · 按历史充值比例修正</span></article>
-    <article class="balance"><small>上游当前余额汇总</small><b>${upstreamBalanceDomains.length?usd(upstreamBalance):'—'}</b><span>上游账户余额合计</span></article>
+    <article class="balance"><small>上游当前余额汇总</small><b>${upstreamBalanceDomains.length?usd(upstreamBalance):'—'}</b><span>上游账户余额合计${balanceSummary.excluded.length?' · 自有站点余额不计入':''}</span></article>
     ${exactKPIs}
     ${filtered?`<article><small>筛选${esc(metricLabel())}占比</small><b>${metric(allUsage)>0?share.toFixed(1)+'%':'—'}</b><span>相对当前日期全部渠道</span></article>`:''}
   </section>${window.channelDataStatus.note(cm.report)}`;

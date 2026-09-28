@@ -139,3 +139,35 @@ func TestFinanceQueueMissingPayloadCanRebuildWithoutSuccessCooldown(t *testing.T
 		t.Fatal("missing payload bypassed failure backoff")
 	}
 }
+
+func TestFinanceQueueUnresolvedFailureSurvivesAgeAndRetryUntilSuccess(t *testing.T) {
+	var q financeReportQueue
+	defer q.shutdown(context.Background())
+	q.submit(context.Background(), "report", false, func(context.Context) error { return context.DeadlineExceeded })
+	waitFinanceQueue(t, &q)
+	q.mu.Lock()
+	q.jobs["report"].finished = time.Now().Add(-6 * time.Minute)
+	q.mu.Unlock()
+	if got := q.stats(); got.RecentFailures != 0 || got.UnresolvedFailures != 1 {
+		t.Fatalf("old failure silently disappeared: %+v", got)
+	}
+	started, release := make(chan struct{}), make(chan struct{})
+	q.submit(context.Background(), "report", false, func(ctx context.Context) error {
+		close(started)
+		select {
+		case <-release:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	})
+	<-started
+	if got := q.stats(); got.Running != 1 || got.UnresolvedFailures != 1 {
+		t.Fatalf("retry incorrectly declared recovery: %+v", got)
+	}
+	close(release)
+	waitFinanceQueue(t, &q)
+	if got := q.stats(); got.UnresolvedFailures != 0 || got.Running != 0 {
+		t.Fatalf("success did not clear failure: %+v", got)
+	}
+}

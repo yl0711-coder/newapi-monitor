@@ -13,6 +13,7 @@ import (
 )
 
 const (
+	financeReportProjection = "accounting-delivery-compat-v1"
 	// 经营核算是按闭合小时生成的管理报表，不需要像实时监控一样每次请求重算。
 	// 五分钟新鲜期减少重复 SQLite 扫描；其后的十分钟只用于“立即展示旧结果、
 	// 后台更新”，页面会显示 report.generated_at；仅旧读取模式手动刷新绕过缓存。
@@ -91,7 +92,7 @@ func (r financeReportRequest) lastGoodKey() string {
 func (r financeReportRequest) logicalKey() string {
 	// Version the report projection separately from source facts. Changes to
 	// month arithmetic must also bump financePeriodCacheSchema.
-	return fmt.Sprintf("accounting-delivery-compat-v1:%d:%d:%d:%t:%s", r.from.Unix(), r.to.Unix(), r.snapshotAsOf, r.snapshotClamped, r.configurationHash)
+	return fmt.Sprintf("%s:%d:%d:%d:%t:%s", financeReportProjection, r.from.Unix(), r.to.Unix(), r.snapshotAsOf, r.snapshotClamped, r.configurationHash)
 }
 
 func (r financeReportRequest) cacheKey() string {

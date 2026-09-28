@@ -100,9 +100,16 @@ function render(report){
   ].join('');
   if($('msCoverage')){
     const complete=report.source?.facts_complete===true;
+    const pending=!complete&&report.source?.coverage_status==='pending';
     const note=report.source?.note||'已路由请求与前置无可用渠道请求按互斥事实合并统计。';
-    $('msCoverage').textContent=(complete?'数据覆盖已确认：':'数据覆盖未确认：')+note;
-    $('msCoverage').classList.toggle('incomplete',!complete);
+    const boundary=coverage=>{
+      if(!coverage?.through_ts)return '';
+      return new Date(Number(coverage.through_ts)*1000).toLocaleString('zh-CN',{hour12:false,timeZone:'Asia/Shanghai'});
+    };
+    const routed=boundary(report.source?.routed_coverage),rejected=boundary(report.source?.unavailable_coverage);
+    const watermarks=[routed?'已路由水位 '+routed:'',rejected?'拒绝日志水位 '+rejected:''].filter(Boolean).join('；');
+    $('msCoverage').textContent=(complete?'数据覆盖已确认：':pending?'历史覆盖已核验，实时尾段待定稿：':'历史覆盖尚未全部确认：')+note+(watermarks?' '+watermarks:'');
+    $('msCoverage').classList.toggle('incomplete',!complete&&!pending);
   }
   if(!$('msModels'))return;
   $('msModels').innerHTML=models.length?renderModels(models):'<div class="ms-empty">当前时间范围没有可用的模型请求记录。</div>';

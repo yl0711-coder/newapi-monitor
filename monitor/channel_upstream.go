@@ -263,6 +263,7 @@ type ChannelUpstreamAccountView struct {
 	APIKeyCount                   int                               `json:"api_key_count,omitempty"`
 	APIKeySlots                   []AICodeWithKeySlotView           `json:"api_key_slots,omitempty"`
 	BalanceUSD                    *float64                          `json:"balance_usd,omitempty"`
+	ExcludeFromBalanceSummary     bool                              `json:"exclude_from_balance_summary"`
 	BalanceRaw                    *float64                          `json:"balance_raw,omitempty"`
 	Currency                      string                            `json:"currency,omitempty"`
 	NativeCurrency                string                            `json:"native_currency,omitempty"`
@@ -1043,7 +1044,10 @@ func (m *Monitor) aicodeWithSlotViewsFromStates(row ChannelUpstreamAccount, stat
 
 func upstreamAccountView(row ChannelUpstreamAccount) ChannelUpstreamAccountView {
 	view := ChannelUpstreamAccountView{
-		Configured: true, Enabled: row.Enabled, Provider: row.Provider,
+		// Owned test platform credit is not money held by an external supplier.
+		// Keep its actual balance/details intact; only exclude the summary.
+		ExcludeFromBalanceSummary: normalizeChannelBaseDomain(row.Domain) == "modelapi.link",
+		Configured:                true, Enabled: row.Enabled, Provider: row.Provider,
 		ProviderName: upstreamProviderName(row.Provider), BaseURL: row.BaseURL,
 		AccountMasked: maskUpstreamAccount(row.Provider, row.Account, row.UserID),
 		Currency:      "USD", UnitAssumed: row.UnitAssumed, Status: row.Status,

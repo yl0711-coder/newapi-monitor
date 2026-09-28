@@ -518,6 +518,11 @@
 
   function financeCacheRefreshNote(data) {
     const status=String(data._cache_status || '');
+    if (status.includes('upgrade-prior-stale')) {
+      const update = data._update_state === 'failed' || data._update_state === 'stopped'
+        ? '新版重算尚未成功，详情见数据同步状态' : '新版正在后台核验';
+      return `<span id="finCacheUpdate"> · 升级前快照，数据截至 ${dateTime(data.to)}；${update}，请勿当作当前结果</span>`;
+    }
     if (status.startsWith('fast-snapshot-')) {
       const note = data._update_state === 'failed' ? '更新失败，已保留上次结果；详情见数据同步状态'
         : data._update_state === 'succeeded' ? '最近核验完成'
@@ -525,7 +530,9 @@
       return `<span id="finCacheUpdate"> · ${note}</span>`;
     }
     if (financeIsPriorStale(data)) {
-      return `<span id="finCacheUpdate"> · 仅显示截至 ${dateTime(data.to)} 的较早区间，当前区间后台补算中；请勿当作当前结果</span>`;
+      const update = data._update_state === 'failed' || data._update_state === 'stopped'
+        ? '当前区间更新失败，详情见数据同步状态' : '当前区间后台补算中';
+      return `<span id="finCacheUpdate"> · 仅显示截至 ${dateTime(data.to)} 的较早区间，${update}；请勿当作当前结果</span>`;
     }
     return status.includes('stale')?'<span id="finCacheUpdate"> · 后台更新中</span>':'';
   }
@@ -540,7 +547,7 @@
     const status = $('finStatus');
     status.className = `fin-status ${!enabled ? 'bad' : !state.stale && complete ? 'ok' : ''}`;
     const summary = !enabled ? '经营核算功能尚未开启'
-      : priorStale ? '较早区间快照，当前区间正在补算'
+      : priorStale ? (String(data._cache_status).includes('upgrade-prior-stale') ? '升级前报表快照，新版结果尚未发布' : '较早区间快照，非当前区间结果')
         : state.stale ? (data._update_state === 'succeeded' ? '已核验报表，金额按下方数据时间展示' : '已核验快照，正在核对最新事实')
         : complete ? '当前区间经营收入与上游成本证据完整'
         : baseComplete ? '用量与上游成本完整，注册赠送证据仍待补齐'

@@ -99,6 +99,19 @@ func TestSyncStatusPageAllowsHashNavigation(t *testing.T) {
 	}
 }
 
+func TestSyncStatusFinanceDistinguishesUnresolvedReportsFromFactCatchup(t *testing.T) {
+	for _, want := range []string{
+		`refresh.unresolved_failures??refresh.recent_failures??0`,
+		`const level=reportFailures?'bad'`,
+		`本进程保留的任务记录中`,
+		`无失败记录不代表报表已生成或缺失账单已补齐`,
+	} {
+		if !strings.Contains(pageHTML, want) {
+			t.Fatalf("finance report failures must remain visible independently of fact catchup: missing %q", want)
+		}
+	}
+}
+
 func TestSyncStatusPageSeparatesUpstreamBalanceTailAndHistory(t *testing.T) {
 	for _, marker := range []string{
 		`sync-upstream-summary`,

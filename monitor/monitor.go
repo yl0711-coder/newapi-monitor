@@ -199,11 +199,14 @@ type Monitor struct {
 	financeReportFlight    cacheFlightGroup
 	// A moving source fingerprint must not spawn concurrent full-report scans
 	// while stale snapshots are being polled by multiple browsers.
-	financeReportRefreshRunning atomic.Bool
-	financeAsyncQueue           financeReportQueue
-	financeSnapshotWriteMu      sync.RWMutex
-	financePeriodCacheOnce      sync.Once
-	financePeriodCache          *boundedByteCache
+	financeReportRefreshRunning  atomic.Bool
+	financeAsyncQueue            financeReportQueue
+	financeSnapshotWriteMu       sync.RWMutex
+	financePeriodCacheOnce       sync.Once
+	financePeriodCache           *boundedByteCache
+	financeGiftEvidenceCacheOnce sync.Once
+	financeGiftEvidenceCache     *boundedByteCache
+	financeGiftEvidenceGuard     financeGiftCacheGuard
 
 	usageGateOnce         sync.Once // 聚合/后台来源查询泳道，容量 1
 	usageGate             chan struct{}
@@ -1021,6 +1024,7 @@ func (m *Monitor) Close() {
 		if m.prodDB != nil {
 			_ = m.prodDB.Close()
 		}
+		m.financeGiftEvidenceGuard.close()
 		if m.usageFactsDB != nil && m.usageFactsDB != m.storeDB {
 			if financeReader := m.financeFactsReadDB.Load(); financeReader != nil {
 				if readDB, err := financeReader.DB(); err == nil {

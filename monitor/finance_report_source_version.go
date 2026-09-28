@@ -112,16 +112,6 @@ func (m *Monitor) financeReportSourceFingerprintForScope(ctx context.Context, fr
 		args  []any
 	}{
 		{
-			label: "stability-hour-ledger",
-			query: `SELECT COUNT(*) rows, COALESCE(MAX(updated_at),0) max_updated,
-				COALESCE(SUM(rows),0) metric_a, COALESCE(SUM(requests),0) metric_b,
-				COALESCE(SUM(tokens),0) metric_c, COALESCE(SUM(quota),0) metric_d,
-				COALESCE(SUM(internal_test_requests),0) metric_e,
-				COALESCE(SUM(internal_test_quota),0) metric_f
-				FROM stability_hour_ingest_states WHERE hour_ts>=? AND hour_ts<?`,
-			args: []any{from, to},
-		},
-		{
 			label: "upstream-usage-ledger",
 			query: `SELECT COUNT(*) rows, COALESCE(MAX(fetched_at),0) max_updated,
 				COALESCE(SUM(requests),0) metric_a, COALESCE(SUM(tokens),0) metric_b,
@@ -161,6 +151,9 @@ func (m *Monitor) financeReportSourceFingerprintForScope(ctx context.Context, fr
 				FROM channel_finance_versions WHERE effective_at<?`,
 			args: []any{to},
 		},
+	}
+	if err := m.hashFinanceHourlyProofs(ctx, hash, from, to); err != nil {
+		return "", err
 	}
 	for _, aggregate := range mainAggregates {
 		if err := writeAggregate(m.storeDB, aggregate.label, aggregate.query, aggregate.args...); err != nil {

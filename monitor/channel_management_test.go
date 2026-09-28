@@ -375,7 +375,7 @@ func TestChannelManagementSummarizesUpstreamFinanceWithoutGroupDoubleCounting(t 
 		`const upstreamConfiguredAccounts=domains.filter(domain=>domain.upstream?.configured)`,
 		`const upstreamAccounts=upstreamConfiguredAccounts.filter(domain=>domain.upstream?.usage_sync_enabled)`,
 		`upstreamAggregateLabel(trustedUsageDomains,false,costBases.cost)`,
-		`upstreamBalanceDomains.reduce((sum,domain)=>sum+Number(domain.upstream.balance_usd),0)`,
+		`balanceSummary=upstreamBalanceSummary(upstreamConfiguredAccounts)`,
 		`区间上游账单消费汇总`,
 		`上游当前余额汇总`,
 		`const trustedUsageDomains=upstreamUsageDomains.filter`,

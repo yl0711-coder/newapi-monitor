@@ -376,13 +376,10 @@ func (m *Monitor) buildChannelEconomicsReportMode(ctx context.Context, scope sta
 		return nil, fmt.Errorf("读取经济账小时发布头: %w", err)
 	}
 	var rows []channelEconomicsReportRow
-	query := m.storeDB.WithContext(ctx).Table("channel_economics_hour_manifest_current mc").
+	query := currentEconomicsPublicationQuery(m.storeDB.WithContext(ctx)).
 		Select(`p.publication_id,p.domain,p.account_epoch,p.hour_ts,p.local_channel_id,p.local_requests,p.upstream_requests,
 			p.local_refund_records,p.revenue_micro_usd,p.upstream_charge_units,p.upstream_cost_micro_usd,
 			p.corrected_cost_micro_usd,p.profit_micro_usd,p.corrected_cost_known,p.profit_known,p.coverage_status`).
-		Joins("JOIN channel_economics_hour_manifest_publications mp ON mp.manifest_id=mc.manifest_id").
-		Joins("JOIN channel_economics_hour_publications p ON p.domain=mp.domain AND p.hour_ts=mp.hour_ts AND p.account_epoch=mp.authoritative_epoch AND p.semantics_version=mp.semantics_version").
-		Joins("JOIN channel_economics_hour_current c ON c.publication_id=p.publication_id").
 		Where("p.semantics_version = ? AND p.hour_ts >= ? AND p.hour_ts < ? AND p.domain IN ?", channelEconomicsSemanticsVersion, scope.FromTs, scope.ToTs, domains).
 		Order("p.domain,p.hour_ts,p.account_epoch,p.local_channel_id").Limit(maxChannelEconomicsReportRows + 1)
 	if err := query.Scan(&rows).Error; err != nil {
