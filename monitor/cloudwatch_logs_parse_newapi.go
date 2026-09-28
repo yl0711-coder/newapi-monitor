@@ -23,8 +23,8 @@ var (
 	cwNewAPIRequestIDSeg     = regexp.MustCompile(`^[A-Za-z0-9]{16,128}$`)
 	cwNewAPIUserSeg          = regexp.MustCompile(`(?i)^(?:user|用户)\s*[:=：]?\s*([0-9]{1,18})$`)
 	cwNewAPIUserKV           = regexp.MustCompile(`(?i)(?:^|[\s|,，;；])(?:user(?:[_ ]?id)?|uid)\s*[:=：]?\s*([0-9]{1,18})(?:$|[\s|,，;；])`)
-	cwNoChannelContext       = regexp.MustCompile(`(?i)No\s+(?:available\s+channel(?:s)?|channel\s+available)\s+for\s+(?:the\s+)?model\s+([^\s|,，;；()（）]+)\s+(?:under|in)\s+(?:the\s+)?(?:current\s+)?group\s+([^\s|,，;；()（）]+)`)
-	cwNoChannelContextAlt    = regexp.MustCompile(`(?i)No\s+(?:available\s+channel(?:s)?|channel\s+available)\s+(?:under|in)\s+(?:the\s+)?(?:current\s+)?group\s+([^\s|,，;；()（）]+)\s+for\s+(?:the\s+)?model\s+([^\s|,，;；()（）]+)`)
+	cwNoChannelContext       = regexp.MustCompile(`(?i)No\s+(?:available\s+channel(?:s)?|channel\s+available)\s+for\s+(?:the\s+)?model\s+([^\s|,，;；()（）]+)\s+(?:under|in)\s+(?:the\s+)?(?:current\s+)?group\s+([^\t\r\n|,，;；()（）]+)`)
+	cwNoChannelContextAlt    = regexp.MustCompile(`(?i)No\s+(?:available\s+channel(?:s)?|channel\s+available)\s+(?:under|in)\s+(?:the\s+)?(?:current\s+)?group\s+([^\t\r\n|,，;；()（）]+?)\s+for\s+(?:the\s+)?model\s+([^\s|,，;；()（）]+)`)
 	cwNoChannelContextZH     = regexp.MustCompile(`分组\s*(.+?)\s*下(?:的)?模型\s*(.+?)\s*(?:无|没有)可用(?:的)?渠道`)
 	cwNoChannelContextZHAlt  = regexp.MustCompile(`模型\s*(.+?)\s*(?:在|于)\s*分组\s*(.+?)\s*(?:下|中)\s*(?:无|没有)可用(?:的)?渠道`)
 	cwModelForbiddenContext  = regexp.MustCompile(`(?i)(?:token\s+model\s+forbidden|model\s+forbidden|model\s+is\s+not\s+allowed|model\s+not\s+allowed|无权访问模型|无权限访问模型|模型无权限|模型权限不足)\s*[:：]?\s*([^\s|,，;；()（）]+)`)
@@ -298,7 +298,7 @@ func (p *cloudWatchEvidenceParser) addNewAPIContext(out *cloudWatchStructuredEvi
 	if !ok {
 		return newCloudWatchEvidenceParseError(cwParseMalformed, out.Source)
 	}
-	out.Group, ok = cwBusinessLabel(group, 64)
+	out.Group, ok = cwBusinessGroupLabel(group, 64)
 	if !ok {
 		return newCloudWatchEvidenceParseError(cwParseMalformed, out.Source)
 	}

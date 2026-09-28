@@ -115,7 +115,7 @@ func TestCloudWatchPreRouteWindowQueriesParsesAndPublishes(t *testing.T) {
 			{Field: aws.String("@timestamp"), Value: aws.String("2026-09-20 00:01:00.000")},
 			{Field: aws.String("@ptr"), Value: aws.String("event-1")},
 			{Field: aws.String("@logStream"), Value: aws.String("new-api/task")},
-			{Field: aws.String("@message"), Value: aws.String("[ERR] 2026/09/20 - 00:01:00 | ABCDEF1234567890 | user 7 | No available channel for model gpt-5 under group paid")},
+			{Field: aws.String("@message"), Value: aws.String("[ERR] 2026/09/20 - 00:01:00 | ABCDEF1234567890 | user 7 | 分组 codex 企业分组 下模型 gpt-5 无可用渠道")},
 		}}, Statistics: &cwlogtypes.QueryStatistics{RecordsMatched: 1}}, nil
 	}}
 	m.cloudWatchLogs = newCloudWatchLogsRuntime(true, func(context.Context, string) (cloudWatchLogsAPI, error) { return client, nil })
@@ -123,7 +123,17 @@ func TestCloudWatchPreRouteWindowQueriesParsesAndPublishes(t *testing.T) {
 	m.cfg.CloudWatchEvidenceHMACKey = strings.Repeat("k", 32)
 	m.cfg.CloudWatchEvidenceHMACKeyID = "fixture-v1"
 	state := CloudWatchPreRouteCursor{ID: cloudWatchPreRouteCursorID, CoverageFromTs: from.Unix(),
-		NextTs: from.Unix(), ThroughTs: from.Unix(), TargetThroughTs: from.Add(time.Hour).Unix(), SemanticsVersion: cloudWatchPreRouteVersion}
+		NextTs: from.Unix(), ThroughTs: from.Unix(), TargetThroughTs: from.Add(time.Hour).Unix(), SemanticsVersion: cloudWatchPreRouteVersion,
+		Status: "degraded", LastFailureAt: from.Unix(), LastError: "parse_failed"}
+	if err := m.storeDB.Create(&state).Error; err != nil {
+		t.Fatal(err)
+	}
+	// A fixed release must resume the durable failed window without resetting
+	// its coverage or discarding previously published facts.
+	state, err := m.loadCloudWatchPreRouteCursor(from.Add(time.Hour))
+	if err != nil || state.NextTs != from.Unix() {
+		t.Fatalf("resume state=%+v err=%v", state, err)
+	}
 	queries, err := m.runCloudWatchPreRouteWindow(context.Background(), &state, from.Unix(), from.Add(time.Hour).Unix(), from.Add(time.Hour).Unix())
 	if err != nil {
 		t.Fatal(err)
@@ -135,8 +145,22 @@ func TestCloudWatchPreRouteWindowQueriesParsesAndPublishes(t *testing.T) {
 	if err := m.storeDB.First(&row, "node = ?", cloudWatchPreRouteNode).Error; err != nil {
 		t.Fatal(err)
 	}
-	if row.Reason != "route_no_channel" || row.Model != "gpt-5" || row.Grp != "paid" || row.UserID != 7 || row.Count != 1 {
+	if row.Reason != "route_no_channel" || row.Model != "gpt-5" || row.Grp != "codex 企业分组" || row.UserID != 7 || row.Count != 1 {
 		t.Fatalf("row=%+v", row)
+	}
+	var persisted CloudWatchPreRouteCursor
+	if err := m.storeDB.First(&persisted, "id = ?", state.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if persisted.Status != "caught_up" || persisted.LastError != "" || persisted.ThroughTs != from.Add(time.Hour).Unix() {
+		t.Fatalf("failed window did not recover: %+v", persisted)
+	}
+	if _, err := m.runCloudWatchPreRouteWindow(context.Background(), &state, from.Unix(), from.Add(time.Hour).Unix(), from.Add(time.Hour).Unix()); err != nil {
+		t.Fatal(err)
+	}
+	var total int64
+	if err := m.storeDB.Model(&RejectionSample{}).Where("node = ?", cloudWatchPreRouteNode).Select("SUM(count)").Scan(&total).Error; err != nil || total != 1 {
+		t.Fatalf("replay duplicated rejections: total=%d err=%v", total, err)
 	}
 }
 

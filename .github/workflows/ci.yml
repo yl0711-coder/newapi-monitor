@@ -141,8 +141,8 @@ jobs:
           '
 
   # monitor 是单个 Go 包，go test 无法在包内自动并行分片。按测试名称首字母
-  # 划分成五个互斥且完整的集合。A-F 已增长到 500+ 个测试并在 runner 上耗尽
-  # 20 分钟总时限，因此拆成 A-C / D-F；每个分片仍保留独立的卡死保护。
+  # 划分成六个互斥且完整的集合。D-F 分片在 v1.18.6 CI 中累计运行超过
+  # 20 分钟，因此再拆成 D-E / F；不跳过测试，每个分片仍保留独立的卡死保护。
   race-monitor:
     runs-on: ubuntu-latest
     strategy:
@@ -151,8 +151,10 @@ jobs:
         include:
           - shard: a-c
             pattern: '^Test[A-C]'
-          - shard: d-f
-            pattern: '^Test[D-F]'
+          - shard: d-e
+            pattern: '^Test[D-E]'
+          - shard: f
+            pattern: '^TestF'
           - shard: g-n
             pattern: '^Test[G-N]'
           - shard: o-s
