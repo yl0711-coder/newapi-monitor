@@ -140,7 +140,7 @@ jobs:
             test ! -e /context/monitor/ci-local-config.json
           '
 
-  # 保留全部竞态检测。财务测试按职责细分，避免新增赠送用例挤满 TestF。
+  # 保留全部竞态检测。按实际耗时拆分财务、渠道和稳定性等重分片。
   # skip 仅用于互斥分配；check-race-shards 必须证明每项测试恰好属于一组。
   race-monitor:
     runs-on: ubuntu-latest
@@ -149,8 +149,13 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - shard: a-c
-            pattern: '^Test[A-C]'
+          - shard: a-b
+            pattern: '^Test[A-B]'
+          - shard: c-channel
+            pattern: '^TestChannel'
+          - shard: c-other
+            pattern: '^TestC'
+            skip: '^TestChannel'
           - shard: d-e
             pattern: '^Test[D-E]'
           - shard: f-other
@@ -165,8 +170,10 @@ jobs:
             pattern: '^TestFinanceGiftScope'
           - shard: g-n
             pattern: '^Test[G-N]'
-          - shard: o-s
-            pattern: '^Test[O-S]'
+          - shard: o-r
+            pattern: '^Test[O-R]'
+          - shard: s
+            pattern: '^TestS'
           - shard: t-z
             pattern: '^(Test[T-Z]|Test[^A-Z]|Test$|Example|Fuzz)'
     steps:

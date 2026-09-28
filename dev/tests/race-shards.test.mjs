@@ -4,10 +4,10 @@ import test from 'node:test';
 import { readRaceShards, verifyRaceShards } from '../check-race-shards.mjs';
 
 const workflow = readFileSync(new URL('../../.github/workflows/ci.yml', import.meta.url), 'utf8');
-const names = ['TestAlpha', 'TestDelta', 'TestEcho', 'TestFinance', 'TestFinanceGiftNewFeature', 'TestFinanceGiftHandoffNewFeature', 'TestFinanceGiftScopeNewFeature', 'TestGroup', 'TestOperations', 'TestZulu', 'Test_Regression', 'Test2026', 'Test', 'Test中文', 'Example', 'ExampleMonitor', 'FuzzDecode'];
+const names = ['TestAlpha', 'TestChannel', 'TestCloudWatch', 'TestDelta', 'TestEcho', 'TestFinance', 'TestFinanceGiftNewFeature', 'TestFinanceGiftHandoffNewFeature', 'TestFinanceGiftScopeNewFeature', 'TestGroup', 'TestOperations', 'TestStability', 'TestZulu', 'Test_Regression', 'Test2026', 'Test', 'Test中文', 'Example', 'ExampleMonitor', 'FuzzDecode'];
 
 test('actual CI matrix covers ordinary and non-letter tests, examples and fuzz seeds', () => {
-  assert.deepEqual(verifyRaceShards(workflow, names.concat('BenchmarkRead', 'ok example/monitor 0.01s').join('\n')), { tests: 17, counts: [1, 2, 1, 1, 1, 1, 1, 1, 8] });
+  assert.deepEqual(verifyRaceShards(workflow, names.concat('BenchmarkRead', 'ok example/monitor 0.01s').join('\n')), { tests: 20, counts: [1, 1, 1, 2, 1, 1, 1, 1, 1, 1, 1, 8] });
 });
 
 test('finance exclusions route tests to another shard rather than omit coverage', () => {
@@ -23,9 +23,18 @@ test('finance exclusions route tests to another shard rather than omit coverage'
 });
 
 test('invalid shard identifiers and subtest routing fail closed', () => {
-  assert.throws(() => readRaceShards(workflow.replace('shard: f-other', 'shard: a-c')), /Duplicate/);
+  assert.throws(() => readRaceShards(workflow.replace('shard: f-other', 'shard: a-b')), /Duplicate/);
   assert.throws(() => readRaceShards(workflow.replace("pattern: '^TestF'", "pattern: '^TestF/case'")), /Subtest/);
   assert.throws(() => readRaceShards(workflow.replace("pattern: '^TestF'", "missing: '^TestF'")), /Missing pattern/);
+});
+
+test('channel and stability splits keep old A-C and O-S coverage without overlaps', () => {
+  assert.throws(() => verifyRaceShards(workflow.replace("            skip: '^TestChannel'\n", ''), names.join('\n')), /belongs to 2/);
+  assert.throws(() => verifyRaceShards(workflow.replace("pattern: '^TestS'", "pattern: '^TestMissingStability'"), names.join('\n')), /belongs to 0/);
+  const shards = readRaceShards(workflow);
+  for (const name of ['TestA', 'TestB', 'TestC', 'TestChannel', 'TestChannelFuture', 'TestCloudWatch', 'TestCustomer', 'TestO', 'TestP', 'TestQ', 'TestR', 'TestS', 'TestStabilityFuture']) {
+    assert.equal(shards.filter(s => s.pattern.test(name) && !s.skip?.test(name)).length, 1, name);
+  }
 });
 
 test('CI keeps race detection, bounded execution and a failing pipeline on test errors', () => {
