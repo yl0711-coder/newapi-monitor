@@ -35,6 +35,7 @@ type financeReportRequest struct {
 	snapshotClamped   bool
 	configurationHash string
 	sourceFingerprint string
+	sourceTrace       financeSourceTrace
 }
 
 func financeDBPoolStats(db *gorm.DB) sql.DBStats {
@@ -123,12 +124,13 @@ func (m *Monitor) buildFinanceReportPayload(ctx context.Context, request finance
 		}
 	}
 	if request.sourceFingerprint != "" {
-		currentFingerprint, fingerprintErr := m.financeReportSourceFingerprint(ctx, request.from.Unix(), request.to.Unix())
+		trace := make(financeSourceTrace)
+		currentFingerprint, fingerprintErr := m.financeReportSourceFingerprint(context.WithValue(ctx, financeSourceTraceKey{}, trace), request.from.Unix(), request.to.Unix())
 		if fingerprintErr != nil {
 			return nil, fmt.Errorf("复核经营核算事实版本: %w", fingerprintErr)
 		}
 		if currentFingerprint != request.sourceFingerprint {
-			return nil, errFinanceFactsChanged
+			return nil, financeFactChange("report-publication", financeChangedSources(request.sourceTrace, trace))
 		}
 	}
 	if request.snapshotAsOf > 0 {
@@ -152,7 +154,8 @@ func (m *Monitor) buildFinanceReportPayload(ctx context.Context, request finance
 // the fingerprint of the rejected attempt. Configuration changes still fail.
 func (m *Monitor) buildFinanceReportWithRetry(ctx context.Context, request financeReportRequest) ([]byte, financeReportRequest, error) {
 	if request.sourceFingerprint == "" && m.cfg.FinanceEnabled {
-		fingerprint, err := m.financeReportSourceFingerprint(ctx, request.from.Unix(), request.to.Unix())
+		request.sourceTrace = make(financeSourceTrace)
+		fingerprint, err := m.financeReportSourceFingerprint(context.WithValue(ctx, financeSourceTraceKey{}, request.sourceTrace), request.from.Unix(), request.to.Unix())
 		if err != nil {
 			return nil, request, err
 		}
@@ -163,7 +166,8 @@ func (m *Monitor) buildFinanceReportWithRetry(ctx context.Context, request finan
 		if !errors.Is(err, errFinanceFactsChanged) || attempt == 1 || ctx.Err() != nil {
 			return payload, request, err
 		}
-		fingerprint, err := m.financeReportSourceFingerprint(ctx, request.from.Unix(), request.to.Unix())
+		request.sourceTrace = make(financeSourceTrace)
+		fingerprint, err := m.financeReportSourceFingerprint(context.WithValue(ctx, financeSourceTraceKey{}, request.sourceTrace), request.from.Unix(), request.to.Unix())
 		if err != nil {
 			return nil, request, err
 		}

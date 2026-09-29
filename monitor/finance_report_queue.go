@@ -12,6 +12,8 @@ const (
 	financeReportQueueHistory   = 32
 	financeReportVerifyInterval = time.Minute
 	financeReportManualInterval = 5 * time.Second
+	financeReportRaceInterval   = 15 * time.Second
+	financeReportRaceLimit      = 3
 )
 
 type financeReportJob struct {
@@ -23,6 +25,7 @@ type financeReportJob struct {
 	// Retain failure through a retry; only a successful run of this key clears
 	// it. The bounded in-memory history is diagnostic state, not durable proof.
 	unresolvedFailure bool
+	publicationRaces  int
 }
 
 // Queue metadata is bounded independently of the byte-bounded report cache.
@@ -47,12 +50,17 @@ func (q *financeReportQueue) submit(parent context.Context, key string, manual b
 		q.jobs = make(map[string]*financeReportJob)
 	}
 	unresolvedFailure := false
+	publicationRaces := 0
 	if job := q.jobs[key]; job != nil {
 		unresolvedFailure = job.unresolvedFailure
+		publicationRaces = job.publicationRaces
 		if job.state == "queued" || job.state == "running" {
 			return job.state
 		}
 		interval := financeReportVerifyInterval
+		if job.state == "retrying" {
+			interval = financeReportRaceInterval * time.Duration(job.publicationRaces)
+		}
 		if manual && job.state == "succeeded" {
 			interval = financeReportManualInterval
 		}
@@ -76,7 +84,7 @@ func (q *financeReportQueue) submit(parent context.Context, key string, manual b
 			delete(q.jobs, oldest.key)
 		}
 	}
-	job := &financeReportJob{key: key, state: "queued", parent: parent, run: run, unresolvedFailure: unresolvedFailure}
+	job := &financeReportJob{key: key, state: "queued", parent: parent, run: run, unresolvedFailure: unresolvedFailure, publicationRaces: publicationRaces}
 	q.jobs[key] = job
 	q.pending = append(q.pending, job)
 	if q.done == nil {
@@ -112,11 +120,20 @@ func (q *financeReportQueue) drain() {
 		job.state = "succeeded"
 		if err == nil {
 			job.unresolvedFailure = false
+			job.publicationRaces = 0
 		}
 		if err != nil {
 			job.state = "failed"
 			if errors.Is(err, context.Canceled) {
 				job.state = "stopped"
+			} else if errors.Is(err, errFinanceFactsChanged) {
+				job.publicationRaces = min(job.publicationRaces+1, financeReportRaceLimit)
+				if job.publicationRaces < financeReportRaceLimit && !job.unresolvedFailure {
+					job.state = "retrying"
+				} else {
+					// Never hide persistent churn behind an endless updating label.
+					job.unresolvedFailure = true
+				}
 			} else {
 				job.unresolvedFailure = true
 			}
@@ -140,6 +157,7 @@ func (q *financeReportQueue) forgetMissingResult(key string) {
 }
 
 type financeReportQueueStats struct {
+	Retrying           int  `json:"retrying"`
 	Enabled            bool `json:"enabled"`
 	Running            int  `json:"running"`
 	Pending            int  `json:"pending"`
@@ -153,6 +171,9 @@ func (q *financeReportQueue) stats() financeReportQueueStats {
 	defer q.mu.Unlock()
 	stats := financeReportQueueStats{Pending: len(q.pending), Capacity: financeReportQueueCapacity}
 	for _, job := range q.jobs {
+		if job.state == "retrying" {
+			stats.Retrying++
+		}
 		if job.unresolvedFailure {
 			stats.UnresolvedFailures++
 		}

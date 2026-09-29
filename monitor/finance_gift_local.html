@@ -6,7 +6,7 @@ body{font:16px/1.6 system-ui,sans-serif;background:#141722;color:#e5e7ef;max-wid
 <a href="/#tab=finance">返回经营核算</a><h1>本地赠送证据修复验收</h1>
 <p class="note">仅操作隔离副本，不连接生产。每次默认最多 2 个用户小时，不是整段历史回填。停止保留已提交数据；续跑必须手动确认。页面关闭不会停止任务。</p>
 <div id="error" role="alert"></div>
-<section><h2>1. 核验与有限授权</h2><p id="source">正在读取本地配置…</p>
+<section><h2>1. 核验与有限授权</h2><p id="source">正在读取执行配置…</p>
 <button id="preview">只读核验</button><button id="authorize" disabled>确认授权（最多 2 个用户小时）</button>
 <p id="cooldown" class="note" role="status"></p>
 <pre id="evidence">尚未核验</pre></section>
@@ -18,6 +18,10 @@ body{font:16px/1.6 system-ui,sans-serif;background:#141722;color:#e5e7ef;max-wid
 <script>
 (() => {
   'use strict';
+  const executionMode='local_snapshot_only';
+  const live=executionMode==='live_finite_handoff';
+  const controlPath=live?'/live/control':'/local/control';
+  const storageKey=live?'financeGiftLiveTask':'financeGiftLocalTask';
   const base='/finance/gift-handoff', $=id=>document.getElementById(id);
   let config=null, control=null, busy=false, timer=null, previewReady=false, approvalNonce=null;
   let cooldownUntil=0, cooldownTimer=null;
@@ -67,13 +71,15 @@ body{font:16px/1.6 system-ui,sans-serif;background:#141722;color:#e5e7ef;max-wid
   function schedule(){clearTimeout(timer);if(active()&&!document.hidden)timer=setTimeout(()=>action(refresh),5000);}
   async function refresh(){
     authorizationValid=false;buttons();
-    config=await api('/local/control');control=config.control;
+    const next=await api(controlPath);
+    if(next.mode!==executionMode||next.execution_enabled!==true){config=null;control=null;previewReady=false;throw Error('执行环境已变化，请重新打开对应操作页');}
+    config=next;control=config.control;
     setCooldown(config.preview_retry_after_seconds);
-    $('source').textContent=`固定证据计划：${config.confirmation}；仅本机执行`;
+    $('source').textContent=`固定证据计划：${config.confirmation}；${live?'当前 Monitor 事实库，有限增量修复':'仅本机执行'}`;
     if(!$('task').value&&control.task_id)$('task').value=control.task_id;
     $('runtime').textContent=`执行状态：${runtimeNames[control.status]||control.status}${control.task_id&&control.task_id!==$('task').value.trim()?'（另一个任务）':''}`;
     if(!$('task').value.trim()){schedule();return;}
-    const id=task();try{sessionStorage.setItem('financeGiftLocalTask',id);}catch(_){}
+    const id=task();try{sessionStorage.setItem(storageKey,id);}catch(_){}
     const auth=await api(`/authorizations/${id}`);
     $('authorization').textContent=`授权状态：${authNames[auth.status]||auth.status}`;
     $('scope').textContent=JSON.stringify(auth.authorization.targets,null,2);
@@ -83,7 +89,7 @@ body{font:16px/1.6 system-ui,sans-serif;background:#141722;color:#e5e7ef;max-wid
       $('progress').textContent=p?`持久提交进度：${p.committed_targets}/${p.authorized_targets} 个用户小时，累计修复 ${p.rows_updated} 条；${p.status==='all_commits_recorded'?'全部授权目标有提交记录':'仅统计本任务提交'}`:'持久提交进度暂不可核验';
     }catch(err){
       $('progress').textContent=err.code==='ledger_missing'
-        ?'提交台账尚未建立：首次本机执行时会初始化；当前进度未知（不是 0）。若此前已执行，请先排查台账缺失，不能据此认定从未执行。'
+        ?`提交台账尚未建立：首次${live?'授权执行':'本机执行'}时会初始化；当前进度未知（不是 0）。若此前已执行，请先排查台账缺失，不能据此认定从未执行。`
         :`持久提交进度读取失败：${err.message}；暂不可核验（不是 0），请刷新重试。`;
     }
     schedule();
@@ -99,7 +105,7 @@ body{font:16px/1.6 system-ui,sans-serif;background:#141722;color:#e5e7ef;max-wid
   });
   $('authorize').onclick=()=>action(async()=>{
     if(cooldownSeconds()>0)return;
-    if(!confirm('仅授权本机副本中前 2 个待修复用户小时，不会立即执行。继续？'))return;
+    if(!confirm(live?'仅授权当前 Monitor 事实库中前 2 个待修复用户小时，不会立即执行。不修改 NewAPI 数据库。继续？':'仅授权本机副本中前 2 个待修复用户小时，不会立即执行。继续？'))return;
     approvalNonce=approvalNonce||nonce();
     const data=await api('/authorizations',{
       confirmation:config.confirmation,request_id:approvalNonce,max_hours:2,
@@ -110,7 +116,7 @@ body{font:16px/1.6 system-ui,sans-serif;background:#141722;color:#e5e7ef;max-wid
   $('refresh').onclick=()=>action(refresh);
   $('start').onclick=()=>action(async()=>{
     const id=task();
-    if(!confirm('启动本机有限修复？不自动续跑，不修改金额；已提交结果会保留。'))return;
+    if(!confirm(live?'启动当前 Monitor 事实库的有限增量修复？仅处理已授权范围，不修改金额和 NewAPI 数据库，不自动续跑；已提交结果会保留。':'启动本机有限修复？不自动续跑，不修改金额；已提交结果会保留。'))return;
     await api(`/authorizations/${id}/start`,{
       instance:control.instance,revision:control.revision,request_id:nonce(),
     });
@@ -130,7 +136,7 @@ body{font:16px/1.6 system-ui,sans-serif;background:#141722;color:#e5e7ef;max-wid
   $('task').oninput=()=>{authorizationValid=false;buttons();};
   document.addEventListener('visibilitychange',()=>{clearTimeout(timer);clearTimeout(cooldownTimer);if(!document.hidden){tickCooldown();action(refresh);}});
   window.addEventListener('pagehide',()=>{clearTimeout(timer);clearTimeout(cooldownTimer);});
-  try{$('task').value=sessionStorage.getItem('financeGiftLocalTask')||'';}catch(_){}
+  try{$('task').value=sessionStorage.getItem(storageKey)||'';}catch(_){}
   action(refresh);
 })();
 </script></body></html>

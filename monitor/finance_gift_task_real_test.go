@@ -12,6 +12,15 @@ import (
 )
 
 func TestFinanceGiftTaskRealHTTPExecution(t *testing.T) {
+	testFinanceGiftTaskRealHTTPExecution(t, false)
+}
+
+func TestFinanceGiftLiveRealHTTPExecution(t *testing.T) {
+	testFinanceGiftTaskRealHTTPExecution(t, true)
+}
+
+func testFinanceGiftTaskRealHTTPExecution(t *testing.T, live bool) {
+	t.Helper()
 	job, digest, backup := os.Getenv("MONITOR_GIFT_HTTP_SOURCE_JOB"), os.Getenv("MONITOR_GIFT_HTTP_SOURCE_SHA256"), os.Getenv("MONITOR_GIFT_HTTP_RECEIVER")
 	if job == "" || digest == "" || backup == "" {
 		t.Skip("requires closed private local snapshots")
@@ -22,8 +31,12 @@ func TestFinanceGiftTaskRealHTTPExecution(t *testing.T) {
 	}
 	m, r, _ := giftPreviewHTTPMonitor(t, job, digest, backup, plan.Targets[0].SourceEpoch)
 	attachGiftAuthorizationStore(t, m)
-	m.cfg.LocalSnapshotOnly = true
-	m.cfg.FinanceGiftHandoffLocalExecutionEnabled = true
+	m.cfg.LocalSnapshotOnly = !live
+	m.cfg.FinanceGiftHandoffLocalExecutionEnabled = !live
+	m.cfg.FinanceGiftHandoffLiveExecutionEnabled = live
+	if live {
+		m.cfg.ProdDSN, m.cfg.NewAPIBaseURL = "must-not-connect", "https://invalid.example"
+	}
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
@@ -69,5 +82,5 @@ func TestFinanceGiftTaskRealHTTPExecution(t *testing.T) {
 	if money != giftMixedMonetarySnapshot(t, m.usageFactsDB) || beforeSource != giftLocalFileHash(t, filepath.Join(job, "usage-facts.db")) || beforeBackup != giftLocalFileHash(t, backup) {
 		t.Fatal("money or original input changed")
 	}
-	t.Logf("real HTTP task completed %d authorized user-hours / %d rows in %s, including normal cooldowns; original inputs and money unchanged", progress.Progress.CommittedTargets, progress.Progress.RowsUpdated, time.Since(started))
+	t.Logf("live=%t real HTTP task completed %d authorized user-hours / %d rows in %s, including normal cooldowns; original inputs and money unchanged", live, progress.Progress.CommittedTargets, progress.Progress.RowsUpdated, time.Since(started))
 }

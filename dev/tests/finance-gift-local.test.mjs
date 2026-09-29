@@ -6,20 +6,20 @@ import {webcrypto} from 'node:crypto';
 
 const id='a'.repeat(64), digest='b'.repeat(64);
 const flush=async()=>{for(let i=0;i<10;i++)await new Promise(resolve=>setImmediate(resolve));};
-function fixture({progressFailure=false,progressCode='',authStatus='awaiting_execution',serverCooldown=0,previewStatus=200}={}){
-  const elements=new Map(), calls=[],timers=new Map(),listeners=new Map();let timerID=0;
+function fixture({progressFailure=false,progressCode='',authStatus='awaiting_execution',serverCooldown=0,previewStatus=200,live=false,wrongMode=false}={}){
+  const elements=new Map(), calls=[],timers=new Map(),listeners=new Map(),confirms=[],storage=[];let timerID=0;
   let now=0;
   const el=key=>{if(!elements.has(key))elements.set(key,{value:'',textContent:'',disabled:false});return elements.get(key);};
   let control={instance:'process-1',revision:0,status:'idle',task_id:'',request_id:''};
-  const context=vm.createContext({AbortController,crypto:webcrypto,Uint8Array,Date:{now:()=>now},confirm:()=>true,
+  const context=vm.createContext({AbortController,crypto:webcrypto,Uint8Array,Date:{now:()=>now},confirm:message=>{confirms.push(message);return true;},
     document:{hidden:false,getElementById:el,addEventListener:(name,fn)=>listeners.set(name,fn)},
     window:{addEventListener:(name,fn)=>listeners.set(name,fn)},
-    sessionStorage:{getItem:()=>'',setItem(){}},
+    sessionStorage:{getItem:key=>{storage.push(key);return '';},setItem:key=>storage.push(key)},
     setTimeout:(fn,delay)=>{const key=++timerID;timers.set(key,{fn,delay});return key;},clearTimeout:key=>timers.delete(key),
     fetch:async(path,options)=>{
       const body=options.body?JSON.parse(options.body):null;calls.push({path,body,options});
       let result={},status=200;const headers=new Map();
-      if(path.endsWith('/local/control'))result={control:{...control},confirmation:digest,execution_enabled:true,preview_retry_after_seconds:serverCooldown};
+      if(path.endsWith(live?'/live/control':'/local/control'))result={control:{...control},confirmation:digest,execution_enabled:true,mode:wrongMode?'unexpected':live?'live_finite_handoff':'local_snapshot_only',preview_retry_after_seconds:serverCooldown};
       else if(path.endsWith('/preview')){status=previewStatus;headers.set(status===429?'Retry-After':'X-Finance-Gift-Cooldown-Seconds','10');result={preview:{blocked_targets:0,ready_targets:3,entries:[]},error:'核验冷却中'};}
       else if(path.endsWith('/authorizations')){headers.set('X-Finance-Gift-Cooldown-Seconds','10');result={task_id:id};}
       else if(path.endsWith('/start')){control={...control,task_id:id,status:'running',request_id:body.request_id,revision:control.revision+1};result={control};}
@@ -33,10 +33,34 @@ function fixture({progressFailure=false,progressCode='',authStatus='awaiting_exe
       return {ok:status<400,status,headers,json:async()=>result};
     },
   });
-  const html=readFileSync(new URL('../../monitor/finance_gift_local.html',import.meta.url),'utf8');
+  let html=readFileSync(new URL('../../monitor/finance_gift_local.html',import.meta.url),'utf8');
+  if(live)html=html.replace("const executionMode='local_snapshot_only';","const executionMode='live_finite_handoff';");
   vm.runInContext(html.match(/<script>([\s\S]*?)<\/script>/)[1],context);
-  return {el,calls,timers,listeners,context,advance:async(ms)=>{now+=ms;const due=[...timers.entries()].filter(([,t])=>t.delay===1000);for(const [key,t] of due){timers.delete(key);t.fn();}await flush();}};
+  return {el,calls,timers,listeners,context,confirms,storage,advance:async(ms)=>{now+=ms;const due=[...timers.entries()].filter(([,t])=>t.delay===1000);for(const [key,t] of due){timers.delete(key);t.fn();}await flush();}};
 }
+
+test('live page is read-only on load, distinguishes current facts and requires explicit confirmation',async()=>{
+  const f=fixture({live:true});await flush();
+  assert.deepEqual(f.calls.map(c=>c.path),['/finance/gift-handoff/live/control']);
+  assert.match(f.el('source').textContent,/当前 Monitor 事实库/);
+  assert.deepEqual(f.storage,['financeGiftLiveTask']);
+  await f.el('preview').onclick();await f.advance(10000);await f.el('authorize').onclick();
+  assert.equal(f.calls.some(c=>c.path.endsWith('/start')),false);
+  await f.el('start').onclick();
+  assert.equal(f.calls.filter(c=>c.path.endsWith('/start')).length,1);
+  assert.match(f.confirms[0],/不会立即执行.*不修改 NewAPI/);
+  assert.match(f.confirms[1],/当前 Monitor 事实库.*不自动续跑/);
+  assert.ok(f.storage.every(key=>key==='financeGiftLiveTask'));
+});
+
+test('environment mismatch disables action without starting or authorizing',async()=>{
+  for(const live of [false,true]){
+    const f=fixture({live,wrongMode:true});await flush();
+    assert.match(f.el('error').textContent,/执行环境已变化/);
+    assert.equal(f.el('start').disabled,true);assert.equal(f.el('preview').disabled,true);
+    assert.equal(f.el('authorize').disabled,true);assert.equal(f.calls.length,1);
+  }
+});
 
 test('page load is read-only; preview and approval never start execution',async()=>{
   const f=fixture();await flush();

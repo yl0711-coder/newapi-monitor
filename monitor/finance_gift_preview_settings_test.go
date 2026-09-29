@@ -11,8 +11,9 @@ func TestFinanceGiftPreviewSettingsDefaultAndBounds(t *testing.T) {
 	t.Setenv("MONITOR_FINANCE_GIFT_HANDOFF_PREVIEW_SHA256", "")
 	t.Setenv("MONITOR_FINANCE_GIFT_HANDOFF_APPROVAL_ENABLED", "")
 	t.Setenv("MONITOR_FINANCE_GIFT_HANDOFF_LOCAL_EXECUTION_ENABLED", "")
+	t.Setenv("MONITOR_FINANCE_GIFT_HANDOFF_LIVE_EXECUTION_ENABLED", "")
 	s := LoadSettings()
-	if s.FinanceGiftHandoffPreviewDir != "" || s.FinanceGiftHandoffPreviewSHA256 != "" || s.FinanceGiftHandoffApprovalEnabled || s.FinanceGiftHandoffLocalExecutionEnabled {
+	if s.FinanceGiftHandoffPreviewDir != "" || s.FinanceGiftHandoffPreviewSHA256 != "" || s.FinanceGiftHandoffApprovalEnabled || s.FinanceGiftHandoffLocalExecutionEnabled || s.FinanceGiftHandoffLiveExecutionEnabled {
 		t.Fatal("preview default enabled")
 	}
 	if err := validateFinanceGiftPreviewSettings(Settings{}); err != nil {
@@ -31,6 +32,28 @@ func TestFinanceGiftPreviewSettingsDefaultAndBounds(t *testing.T) {
 		mutate(&invalid)
 		if err := validateFinanceSettings(invalid); err == nil {
 			t.Fatal("invalid preview accepted")
+		}
+	}
+}
+
+func TestFinanceGiftLiveExecutionSettings(t *testing.T) {
+	valid := Settings{FinanceEnabled: true, FinanceFactsReadIsolationEnabled: true, UsageFactsHistorySourceEpoch: "test",
+		FinanceGiftHandoffPreviewDir: filepath.Join(t.TempDir(), "job"), FinanceGiftHandoffPreviewSHA256: strings.Repeat("a", 64),
+		FinanceGiftHandoffApprovalEnabled: true, FinanceGiftHandoffLiveExecutionEnabled: true,
+		SessionSecret: "test", StorePath: "/private/main.db", UsageFactsStorePath: "/private/facts.db",
+		ProdDSN: "unused-external-source", NewAPIBaseURL: "https://invalid.example"}
+	if err := validateFinanceGiftPreviewSettings(valid); err != nil {
+		t.Fatal(err)
+	}
+	for _, change := range []func(*Settings){
+		func(s *Settings) { s.LocalSnapshotOnly = true }, func(s *Settings) { s.FinanceGiftHandoffLocalExecutionEnabled = true },
+		func(s *Settings) { s.FinanceGiftHandoffApprovalEnabled = false }, func(s *Settings) { s.LocalAuthBypass = true },
+		func(s *Settings) { s.FinanceFactsReadIsolationEnabled = false }, func(s *Settings) { s.SessionSecret = "" },
+	} {
+		s := valid
+		change(&s)
+		if validateFinanceGiftPreviewSettings(s) == nil {
+			t.Fatal("unsafe live settings accepted")
 		}
 	}
 }

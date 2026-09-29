@@ -448,6 +448,8 @@ func (m *Monitor) RegisterRoutes(r *gin.Engine) {
 	r.POST("/finance/gift-handoff/authorizations/:id/revoke", noStoreSensitive, m.requireRole(roleRoot), m.serveFinanceGiftHandoffRevoke)
 	r.GET("/finance/gift-handoff/local", noStoreSensitive, m.requireRole(roleRoot), m.serveFinanceGiftLocalPage)
 	r.GET("/finance/gift-handoff/local/control", noStoreSensitive, m.requireRole(roleRoot), m.serveFinanceGiftLocalControl)
+	r.GET("/finance/gift-handoff/live", noStoreSensitive, m.requireRole(roleRoot), m.serveFinanceGiftLivePage)
+	r.GET("/finance/gift-handoff/live/control", noStoreSensitive, m.requireRole(roleRoot), m.serveFinanceGiftLiveControl)
 	r.POST("/finance/gift-handoff/authorizations/:id/start", noStoreSensitive, m.requireRole(roleRoot), m.serveFinanceGiftLocalStart)
 	r.POST("/finance/gift-handoff/authorizations/:id/stop", noStoreSensitive, m.requireRole(roleRoot), m.serveFinanceGiftLocalStop)
 }

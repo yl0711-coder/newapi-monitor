@@ -489,11 +489,22 @@
       });
       if (sequence !== state.requestSequence || controller.signal.aborted) return;
       if (response.status === 401) { location.href = '/login'; return; }
-      const data = await response.json();
+      const data = await response.json().catch(() => {
+        throw new Error(response.ok ? '报表响应格式异常，请稍后重试' : `报表服务暂不可用（HTTP ${response.status}），请稍后重试`);
+      });
       if (sequence !== state.requestSequence || controller.signal.aborted) return;
       if (response.status === 202) {
         state.pending = true;
         state.stale = true;
+        const config = response.headers?.get?.('X-Monitor-Finance-Configuration') || '';
+        if (hasPrevious && config && config === state.renderedConfiguration) {
+          // A cold server cache or concurrent eviction must not erase an
+          // already displayed report for this exact query. Keep its date.
+          const note = $('finCacheUpdate');
+          if (note) note.textContent = ' · 后台正在生成新结果，保留上次已核验数据';
+          scheduleStaleRefresh();
+          return;
+        }
         state.loaded = false;
         if ($('finReportContent')) $('finReportContent').hidden = true;
         const status = $('finStatus');
@@ -507,6 +518,7 @@
       data._cache_status = response.headers.get('X-Monitor-Finance-Cache') || '';
       data._update_state = response.headers.get('X-Monitor-Finance-Update') || '';
       state.updateState = data._update_state;
+      state.renderedConfiguration = response.headers.get('X-Monitor-Finance-Configuration') || '';
       state.pending = false;
       state.refreshFailures = 0;
       state.renderedQuery = queryKey;
@@ -549,6 +561,7 @@
     if (status.startsWith('fast-snapshot-')) {
       const note = data._update_state === 'failed' ? '更新失败，已保留上次结果；详情见数据同步状态'
         : data._update_state === 'succeeded' ? '最近核验完成'
+          : data._update_state === 'retrying' ? '数据正在更新，后台重新核验中；保留上次结果'
           : data._update_state === 'busy' ? '更新任务繁忙，已保留上次结果' : '正在后台更新';
       return `<span id="finCacheUpdate"> · ${note}</span>`;
     }
@@ -851,7 +864,7 @@
         + `<td>${esc(row.provider_name || row.provider || '—')}</td><td>${esc(granularity)}</td>`
         + `<td class="num">${impact}</td><td class="num">${esc(work)}</td><td>${esc(result)}</td>`
         + `<td>${chip(row.evidence_backfill_status)}<small>${esc(row.evidence_backfill_note || '')}</small></td></tr>`;
-    }).join('') : '<tr><td colspan="7" class="fin-empty">当前没有需要补采的历史成本证据</td></tr>';
+    }).join('') : '<tr><td colspan="7" class="fin-empty">当前没有可展示的历史补证计划；不代表成本证据已完整，请结合下方核算缺口核对。</td></tr>';
   }
 
   function renderSources(rows) {

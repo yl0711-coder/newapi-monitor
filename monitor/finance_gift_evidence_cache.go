@@ -34,6 +34,8 @@ type financeGiftHourEvidence struct {
 	Rows               int64
 	Ledger             []financecredit.LedgerEvent
 	UnknownScopeEvents int64
+	// Validation hint, not monetary evidence. Never part of the cache key.
+	ValidatedVersion string `json:",omitempty"`
 }
 
 func (m *Monitor) getFinanceGiftEvidenceCache() *boundedByteCache {
@@ -63,7 +65,7 @@ func financeGiftEvidenceKey(state FinanceGiftBoundaryState, scope string) string
 func projectFinanceGiftHourEvidence(state FinanceGiftBoundaryState, events []FinanceGiftBoundaryEvent, policies map[string]bool, excluded map[int64]bool) (financeGiftHourEvidence, error) {
 	result := financeGiftHourEvidence{Version: 1, Rows: state.Rows}
 	if int64(len(events)) != state.Rows || financeGiftBoundaryContentHash(events) != state.ContentHash {
-		return result, fmt.Errorf("gift boundary content failed verification for user %d hour %d", state.UserID, state.HourTs)
+		return result, financeFactChange("gift-evidence", "proof-content")
 	}
 	hasExcludedGroups := channelBusinessGroupsExcluded(policies)
 	for _, event := range events {
@@ -102,16 +104,18 @@ func (m *Monitor) walkFinanceGiftHourEvidence(ctx context.Context, db *gorm.DB, 
 	defer func() { logFinanceReadStageTiming("gift-boundary-events", started, err) }()
 	cache := m.getFinanceGiftEvidenceCache()
 	version, reuse := m.financeGiftEvidenceGuard.version(ctx, db)
-	usedCache := false
+	usedCache := make([]financeGiftUserHourKey, 0, len(states))
 	defer func() {
-		if err == nil && usedCache {
+		if err == nil && len(usedCache) > 0 {
 			current, ok := m.financeGiftEvidenceGuard.version(ctx, db)
 			if !ok || current != version {
-				err = errFinanceFactsChanged
+				// Unrelated writes do not invalidate financial evidence. Still
+				// verify raw rows, including edits without a proof update.
+				err = validateFinanceGiftCachedHours(ctx, db, usedCache, states, policies, excluded)
 			}
 		}
 	}()
-	scope := version + "|" + financeGiftEvidenceScopeKey(policies, excluded)
+	scope := financeGiftEvidenceScopeKey(policies, excluded)
 	keys := make([]financeGiftUserHourKey, 0, len(states))
 	for key := range states {
 		keys = append(keys, key)
@@ -138,6 +142,7 @@ func (m *Monitor) walkFinanceGiftHourEvidence(ctx context.Context, db *gorm.DB, 
 			}
 			state := states[key]
 			value := batch[key]
+			value.ValidatedVersion = version
 			payload, err := json.Marshal(value)
 			if err != nil {
 				return err
@@ -158,12 +163,13 @@ func (m *Monitor) walkFinanceGiftHourEvidence(ctx context.Context, db *gorm.DB, 
 		cacheKey := financeGiftEvidenceKey(states[key], scope)
 		if payload, ok := cache.Get(cacheKey, time.Now()); reuse && ok {
 			var value financeGiftHourEvidence
-			if json.Unmarshal(payload, &value) == nil && value.Version == 1 && value.Rows == states[key].Rows && value.UnknownScopeEvents >= 0 {
-				usedCache = true
+			if json.Unmarshal(payload, &value) == nil && value.Version == 1 && value.Rows == states[key].Rows && value.UnknownScopeEvents >= 0 && value.ValidatedVersion == version {
+				usedCache = append(usedCache, key)
 				visit(key, value)
 				continue
 			}
-			cache.Delete(cacheKey)
+			// Revalidate stale hints through the bounded miss path; replace the
+			// same per-hour entry rather than accumulating DB-version copies.
 		}
 		if len(missing) > 0 && pendingRows+states[key].Rows > financeGiftEvidenceQueryRows {
 			if err := flush(); err != nil {

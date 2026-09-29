@@ -1477,7 +1477,7 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
 <script src="/alerts.js?v=1"></script>
 <script src="/capacity.js?v=2"></script>
 <script src="/group-governance.js?v=1"></script>
-<script src="/finance.js?v=55"></script>
+<script src="/finance.js?v=56"></script>
 <script src="/model-statistics.js?v=3"></script>
 <script src="/infra-assets.js?v=1"></script>
 <script src="/ecs-log-sources.js?v=1"></script>
@@ -2584,7 +2584,7 @@ function syncRenderFinanceFacts(report){
   target.innerHTML=[
     syncKV('采集闸门',r.enabled?'已开启':'未启用',r.enabled?'只读来源库，顺序按小时回填':'不会访问 NewAPI 来源库'),
     syncKV('报表展示',r.report_enabled?'已开启':'未开放','采集与展示独立，可先补数验收再开放'),
-    syncKV('报表更新',refresh.enabled?`运行 ${fmtNum(refresh.running)} · 排队 ${fmtNum(refresh.pending)}`:'按原读取方式',reportFailures?`本进程保留的任务记录中 ${fmtNum(reportFailures)} 个区间更新失败尚未恢复；有旧结果时保留显示，详细原因见服务日志`:'报表更新与来源回填分别计数；无失败记录不代表报表已生成或缺失账单已补齐'),
+    syncKV('报表更新',refresh.enabled?`运行 ${fmtNum(refresh.running)} · 排队 ${fmtNum(refresh.pending)} · 待重新核验 ${fmtNum(refresh.retrying||0)}`:'按原读取方式',reportFailures?`本进程保留的任务记录中 ${fmtNum(reportFailures)} 个区间更新失败尚未恢复；有旧结果时保留显示，详细原因见服务日志`:'数据变化会有限重试；持续失败标记异常。报表更新与来源回填分别计数；无失败记录不代表报表已生成或缺失账单已补齐'),
     syncKV('当前状态',statusMap[r.status]||r.status||'未知',r.failure_streak?`连续失败 ${fmtNum(r.failure_streak)} 次`:'游标只在整小时证据原子发布后前进'),
     syncKV('历史覆盖',expected?`${fmtNum(completed)}/${fmtNum(expected)} 小时 · ${percent.toFixed(1)}%`:'尚无应回填小时',`起点 ${syncTime(r.start_hour)} · 安全定稿至 ${syncTime(r.finalized_through)}`),
     syncKV('下一回填小时',syncTime(r.next_hour),r.last_completed_hour?`最近完成 ${syncTime(r.last_completed_hour)}`:'尚未完成首个小时'),

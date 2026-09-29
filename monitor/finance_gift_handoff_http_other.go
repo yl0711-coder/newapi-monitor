@@ -20,6 +20,8 @@ func (m *Monitor) serveFinanceGiftHandoffAuthorizationStatus(c *gin.Context) {
 func (m *Monitor) serveFinanceGiftHandoffRevoke(c *gin.Context) { m.serveFinanceGiftHandoffPreview(c) }
 func (m *Monitor) serveFinanceGiftLocalPage(c *gin.Context)     { m.serveFinanceGiftHandoffPreview(c) }
 func (m *Monitor) serveFinanceGiftLocalControl(c *gin.Context)  { m.serveFinanceGiftHandoffPreview(c) }
+func (m *Monitor) serveFinanceGiftLivePage(c *gin.Context)      { m.serveFinanceGiftHandoffPreview(c) }
+func (m *Monitor) serveFinanceGiftLiveControl(c *gin.Context)   { m.serveFinanceGiftHandoffPreview(c) }
 func (m *Monitor) serveFinanceGiftLocalStart(c *gin.Context)    { m.serveFinanceGiftHandoffPreview(c) }
 func (m *Monitor) serveFinanceGiftLocalStop(c *gin.Context)     { m.serveFinanceGiftHandoffPreview(c) }
 func (m *Monitor) serveFinanceGiftHandoffProgress(c *gin.Context) {

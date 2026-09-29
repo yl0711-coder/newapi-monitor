@@ -15,6 +15,20 @@ import (
 // Cooldown and external audit I/O are outside these transactions.
 const financeGiftHandoffWriteBudget = 2 * time.Second
 
+// Establish a read snapshot before schema writes. Direct CREATE TABLE waits
+// for SQLite's connection busy_timeout (5s), which may outlive ctx. Upgrading
+// this read transaction instead yields SQLITE_BUSY to a competing writer;
+// schema changes roll back together. Do not change a shared connection's PRAGMA.
+func ensureFinanceGiftHandoffLedger(ctx context.Context, db *gorm.DB) error {
+	return db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var exists int
+		if err := tx.Raw("SELECT EXISTS(SELECT 1 FROM main.sqlite_master WHERE name=?)", (financeGiftHandoffCommit{}).TableName()).Scan(&exists).Error; err != nil {
+			return err
+		}
+		return tx.AutoMigrate(&financeGiftHandoffCommit{})
+	})
+}
+
 func inspectFinanceGiftHandoffWithBudget(parent context.Context, db *gorm.DB, target financeGiftScopeTarget, evidence []FinanceGiftBoundaryEvent) (financeGiftHandoffCandidate, error) {
 	ctx, cancel := context.WithTimeout(parent, financeGiftHandoffWriteBudget)
 	defer cancel()

@@ -12,6 +12,15 @@ import (
 )
 
 func TestFinanceGiftAuthorizedLocalRealSnapshot(t *testing.T) {
+	testFinanceGiftAuthorizedRealSnapshot(t, false)
+}
+
+func TestFinanceGiftLiveRealSnapshot(t *testing.T) {
+	testFinanceGiftAuthorizedRealSnapshot(t, true)
+}
+
+func testFinanceGiftAuthorizedRealSnapshot(t *testing.T, live bool) {
+	t.Helper()
 	job, digest, backup := os.Getenv("MONITOR_GIFT_HTTP_SOURCE_JOB"), os.Getenv("MONITOR_GIFT_HTTP_SOURCE_SHA256"), os.Getenv("MONITOR_GIFT_HTTP_RECEIVER")
 	if job == "" || digest == "" || backup == "" {
 		t.Skip("requires private closed local source job and receiver snapshot")
@@ -27,9 +36,16 @@ func TestFinanceGiftAuthorizedLocalRealSnapshot(t *testing.T) {
 	}
 	m, r, _ := giftPreviewHTTPMonitor(t, job, digest, backup, plan.Targets[0].SourceEpoch)
 	attachGiftAuthorizationStore(t, m)
-	m.cfg.LocalSnapshotOnly = true
-	if err := m.usageFactsDB.AutoMigrate(&financeGiftHandoffCommit{}); err != nil {
-		t.Fatal(err)
+	m.cfg.LocalSnapshotOnly = !live
+	run := m.runFinanceGiftAuthorizedLocal
+	if live {
+		m.cfg.FinanceGiftHandoffLiveExecutionEnabled = true
+		m.cfg.ProdDSN, m.cfg.NewAPIBaseURL = "must-not-connect", "https://invalid.example"
+		run = m.runFinanceGiftAuthorizedLive
+	} else {
+		if err := m.usageFactsDB.AutoMigrate(&financeGiftHandoffCommit{}); err != nil {
+			t.Fatal(err)
+		}
 	}
 	body := `{"confirmation":"` + digest + `","request_id":"` + giftAuthorizationNonce + `"}`
 	a := giftAuthorizationDecode(t, giftAuthorizationRequestHTTP(m, r, "POST", giftAuthorizationURL, body, "local-root", roleRoot))
@@ -42,7 +58,7 @@ func TestFinanceGiftAuthorizedLocalRealSnapshot(t *testing.T) {
 		before[target] = proof
 	}
 	money := giftMixedMonetarySnapshot(t, m.usageFactsDB)
-	result, err := m.runFinanceGiftAuthorizedLocal(context.Background(), a.TaskID, handoffNoWait)
+	result, err := run(context.Background(), a.TaskID, handoffNoWait)
 	wantRows := 0
 	for _, target := range a.Authorization.Targets {
 		wantRows += target.RowsToUpdate
@@ -51,11 +67,18 @@ func TestFinanceGiftAuthorizedLocalRealSnapshot(t *testing.T) {
 		t.Fatal(result, err)
 	}
 	progressStart := time.Now()
-	progress := giftGetProgress(t, m, r, a.TaskID, 200)
-	if progress.Progress == nil || progress.Progress.CommittedTargets != result.CommittedTargets || progress.Progress.RowsUpdated != result.RowsUpdated {
-		t.Fatal("HTTP receipt progress differs from execution", progress)
+	if live {
+		progress, err := readFinanceGiftCommitProgress(context.Background(), m.financeFactsReadStore(), a.TaskID, a.Authorization)
+		if err != nil || progress.CommittedTargets != result.CommittedTargets || progress.RowsUpdated != result.RowsUpdated {
+			t.Fatal("durable receipt progress differs from execution", progress, err)
+		}
+	} else {
+		progress := giftGetProgress(t, m, r, a.TaskID, 200)
+		if progress.Progress == nil || progress.Progress.CommittedTargets != result.CommittedTargets || progress.Progress.RowsUpdated != result.RowsUpdated {
+			t.Fatal("HTTP receipt progress differs from execution", progress)
+		}
 	}
-	t.Logf("local HTTP durable receipt query: %s (no source hashing)", time.Since(progressStart))
+	t.Logf("live=%t durable receipt query: %s (no source hashing)", live, time.Since(progressStart))
 	for _, target := range plan.Targets {
 		approved := false
 		for _, scope := range a.Authorization.Targets {
@@ -71,7 +94,7 @@ func TestFinanceGiftAuthorizedLocalRealSnapshot(t *testing.T) {
 			t.Fatal("unapproved real target changed", err)
 		}
 	}
-	repeat, err := m.runFinanceGiftAuthorizedLocal(context.Background(), a.TaskID, handoffNoWait)
+	repeat, err := run(context.Background(), a.TaskID, handoffNoWait)
 	if err != nil || repeat != result || money != giftMixedMonetarySnapshot(t, m.usageFactsDB) {
 		t.Fatal("replay or monetary invariant failed", repeat, err)
 	}

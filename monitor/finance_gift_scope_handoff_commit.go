@@ -12,7 +12,9 @@ import (
 	"gorm.io/gorm"
 )
 
-// Local-only outbox: never registered with Monitor's schema migrations.
+// Handoff receipt ledger: never registered with general schema migrations.
+// The historical table name is retained for compatibility; explicit finite
+// execution may provision it in the receiver, but ordinary startup may not.
 // One immutable successful mutation per confirmed job/target, in the same
 // transaction as the facts. JSONL is a recoverable projection of these commits.
 type financeGiftHandoffCommit struct {

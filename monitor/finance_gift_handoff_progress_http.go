@@ -76,10 +76,11 @@ func decodeFinanceGiftAuthorizedCommit(commit financeGiftHandoffCommit, p financ
 }
 
 func (m *Monitor) serveFinanceGiftHandoffProgress(c *gin.Context) {
-	// Local acceptance only, as with execution. Do not expose a production
-	// progress API for a ledger that production does not yet maintain.
-	if !m.cfg.LocalSnapshotOnly || m.cfg.ProdDSN != "" || m.cfg.NewAPIBaseURL != "" {
-		c.JSON(http.StatusNotFound, gin.H{"error": "本地交接进度未启用"})
+	// Live queries require explicit enablement; local inspection stays compatible.
+	// Progress reads never provision a missing ledger or start/resume a task.
+	live := m.cfg.FinanceGiftHandoffLiveExecutionEnabled
+	if !live && (!m.cfg.LocalSnapshotOnly || m.cfg.ProdDSN != "" || m.cfg.NewAPIBaseURL != "") {
+		c.JSON(http.StatusNotFound, gin.H{"error": "交接进度未启用"})
 		return
 	}
 	row, p, ok := m.giftAuthorizationReadRequest(c)
@@ -88,6 +89,8 @@ func (m *Monitor) serveFinanceGiftHandoffProgress(c *gin.Context) {
 	}
 	reply := gin.H{"task_id": row.ID, "authorization_status": giftAuthorizationState(row, p, m.cfg, time.Now().Unix()),
 		"execution_enabled": false, "requires_revalidation": true, "execution_state": "not_observed", "progress": nil}
+	// This is a receipt query, not a current-facts or worker health assertion.
+	// The separate control endpoint owns the current process attempt status.
 	if reply["authorization_status"] == "awaiting_execution" {
 		reply["authorization_status"] = "valid"
 	}

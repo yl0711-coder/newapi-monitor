@@ -10,8 +10,8 @@ import (
 	"gorm.io/gorm"
 )
 
-// Local acceptance bridge only. Explicitly gated local task routes may call it;
-// there are no source connections, production migrations or automatic resume.
+// Shared progress for finite authorized handoff. Execution entry points perform
+// separate local/live validation; neither connects to an external data source.
 type financeGiftAuthorizedProgress struct {
 	TaskID            string
 	Status            string
@@ -62,10 +62,16 @@ func selectFinanceGiftAuthorizedEvidence(p financeGiftAuthorizationPayload, inpu
 }
 
 func (m *Monitor) runFinanceGiftAuthorizedLocal(parent context.Context, id string, wait func(context.Context, time.Duration) error) (financeGiftAuthorizedProgress, error) {
-	result := financeGiftAuthorizedProgress{TaskID: id, Status: "rejected"}
 	if err := m.validateGiftLocalExecution(); err != nil {
-		return result, err
+		return financeGiftAuthorizedProgress{TaskID: id, Status: "rejected"}, err
 	}
+	return m.runFinanceGiftAuthorized(parent, id, wait, m.cfg.FinanceGiftHandoffLocalExecutionEnabled)
+}
+
+// Only validated entry points may call this core. Provisioning is scoped to an
+// explicit execution attempt, never a preview, status read or normal startup.
+func (m *Monitor) runFinanceGiftAuthorized(parent context.Context, id string, wait func(context.Context, time.Duration) error, provisionLedger bool) (financeGiftAuthorizedProgress, error) {
+	result := financeGiftAuthorizedProgress{TaskID: id, Status: "rejected"}
 	if !m.financeGiftPreviewMu.TryLock() {
 		return result, errors.New("handoff already in use")
 	}
@@ -83,16 +89,6 @@ func (m *Monitor) runFinanceGiftAuthorizedLocal(parent context.Context, id strin
 		return result, err
 	}
 	defer lock.Close()
-	// Provision only in an explicitly enabled local receiver, under its lock.
-	// Existing offline callers retain their missing-ledger rejection.
-	if m.cfg.FinanceGiftHandoffLocalExecutionEnabled {
-		setupCtx, setupCancel := context.WithTimeout(ctx, financeGiftHandoffWriteBudget)
-		err := m.usageFactsStore().WithContext(setupCtx).AutoMigrate(&financeGiftHandoffCommit{})
-		setupCancel()
-		if err != nil {
-			return result, err
-		}
-	}
 	input, err := loadFinanceGiftConfiguredEvidence(ctx, m.cfg)
 	if err != nil {
 		return result, err
@@ -100,6 +96,16 @@ func (m *Monitor) runFinanceGiftAuthorizedLocal(parent context.Context, id strin
 	targets, verified, err := selectFinanceGiftAuthorizedEvidence(p, input)
 	if err != nil {
 		return result, err
+	}
+	// Never provision before the fixed authorization and evidence are verified.
+	// Existing offline callers retain their missing-ledger rejection.
+	if provisionLedger {
+		setupCtx, setupCancel := context.WithTimeout(ctx, financeGiftHandoffWriteBudget)
+		err := ensureFinanceGiftHandoffLedger(setupCtx, m.usageFactsStore())
+		setupCancel()
+		if err != nil {
+			return result, err
+		}
 	}
 	// Check all authorized targets and previous commit proofs before writing any.
 	result, err = inspectFinanceGiftAuthorizedProgress(ctx, m.usageFactsStore(), id, p, targets, verified)

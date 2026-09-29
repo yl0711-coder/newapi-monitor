@@ -8,6 +8,9 @@ import (
 )
 
 func validateFinanceGiftPreviewSettings(s Settings) error {
+	if s.FinanceGiftHandoffLiveExecutionEnabled && (s.LocalSnapshotOnly || s.FinanceGiftHandoffLocalExecutionEnabled || !s.FinanceGiftHandoffApprovalEnabled) {
+		return errors.New("在线交接内核需要独立启用授权，不能与本地快照执行混用")
+	}
 	if s.FinanceGiftHandoffLocalExecutionEnabled && (!s.LocalSnapshotOnly || !s.FinanceGiftHandoffApprovalEnabled || s.ProdDSN != "" || s.NewAPIBaseURL != "") {
 		return errors.New("交接执行仅允许无外部来源的本地隔离快照，且必须先启用授权")
 	}

@@ -154,8 +154,7 @@ func TestFinanceGiftEvidenceCacheBoundsAndConcurrentReaders(t *testing.T) {
 	if err := m.usageFactsStore().First(&state, "hour_ts=?", 0).Error; err != nil {
 		t.Fatal(err)
 	}
-	version, _ := m.financeGiftEvidenceGuard.version(context.Background(), m.financeFactsReadStore())
-	key := financeGiftEvidenceKey(state, version+"|"+financeGiftEvidenceScopeKey(nil, nil))
+	key := financeGiftEvidenceKey(state, financeGiftEvidenceScopeKey(nil, nil))
 	for _, payload := range []string{`broken`, `null`, `{}`} {
 		cache.Put(key, []byte(payload), time.Hour, time.Now())
 		r, err := m.loadFinanceGiftAllocation(context.Background(), 0, 0, 10800)

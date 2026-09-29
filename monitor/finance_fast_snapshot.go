@@ -56,6 +56,7 @@ func validFinanceSnapshotBounds(payload []byte, request financeReportRequest, ve
 
 // This path never computes source fingerprints on the HTTP goroutine.
 func (m *Monitor) serveFinanceQueuedReport(c *gin.Context, request financeReportRequest) {
+	c.Header("X-Monitor-Finance-Configuration", request.configurationHash)
 	payload, status, available := m.financeFastSnapshotPayload(request, time.Now())
 	if !available {
 		m.financeAsyncQueue.forgetMissingResult(request.logicalKey())
@@ -88,6 +89,9 @@ func (m *Monitor) serveFinanceQueuedReport(c *gin.Context, request financeReport
 	c.Header("Retry-After", "5")
 	code := http.StatusAccepted
 	message := "报表正在后台生成，请稍后查看"
+	if state == "retrying" {
+		message = "数据正在更新，后台将自动重新核验"
+	}
 	if state == "failed" || state == "stopped" {
 		code = http.StatusServiceUnavailable
 		message = "报表更新暂未完成，请稍后重试；详情见数据同步状态"
@@ -113,7 +117,8 @@ func (m *Monitor) refreshFinanceFastSnapshot(ctx context.Context, request financ
 	if config != request.configurationHash {
 		return fmt.Errorf("经营核算配置已变化，跳过旧配置任务")
 	}
-	fingerprint, err := m.financeReportSourceFingerprint(ctx, request.from.Unix(), request.to.Unix())
+	request.sourceTrace = make(financeSourceTrace)
+	fingerprint, err := m.financeReportSourceFingerprint(context.WithValue(ctx, financeSourceTraceKey{}, request.sourceTrace), request.from.Unix(), request.to.Unix())
 	if err != nil {
 		return err
 	}

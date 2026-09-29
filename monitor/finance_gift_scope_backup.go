@@ -23,6 +23,7 @@ type FinanceGiftBackupInspection struct {
 	UserHours     int64                        `json:"unknown_user_hours"`
 	OversizeHours int64                        `json:"user_hours_over_row_limit"`
 	MissingStates int64                        `json:"user_hours_missing_state"`
+	Months        []FinanceGiftScopeMonthGap   `json:"months"`
 	Candidates    FinanceGiftLocalCandidates   `json:"candidates" gorm:"-"`
 	ReadPlan      *financegiftexport.BatchPlan `json:"read_plan,omitempty" gorm:"-"`
 	Confirmation  string                       `json:"confirm_read_plan_sha256,omitempty"`
@@ -64,18 +65,16 @@ func InspectFinanceGiftScopeBackup(parent context.Context, path, epoch string) (
 	if epochs == 0 {
 		return empty, errors.New("source epoch not found in backup; do not assume no gaps")
 	}
-	err = db.WithContext(ctx).Raw(`SELECT COALESCE(SUM(e.n),0) AS unknown_rows,
-COALESCE(SUM(e.monetary),0) AS monetary_rows, COUNT(*) AS user_hours,
-COALESCE(SUM(CASE WHEN s.rows>? THEN 1 ELSE 0 END),0) AS oversize_hours,
-COALESCE(SUM(CASE WHEN s.source_epoch IS NULL THEN 1 ELSE 0 END),0) AS missing_states
-FROM (SELECT source_epoch,hour_ts,user_id,COUNT(*) AS n,
-SUM(CASE WHEN quota<>0 THEN 1 ELSE 0 END) AS monetary
-FROM finance_gift_boundary_events WHERE source_epoch=? AND COALESCE(group_known,0)=0
-GROUP BY source_epoch,hour_ts,user_id) e
-LEFT JOIN finance_gift_boundary_states s ON s.source_epoch=e.source_epoch AND s.hour_ts=e.hour_ts AND s.user_id=e.user_id`,
-		financeGiftLocalMaxRows, epoch).Scan(&result).Error
+	result.Months, err = inspectFinanceGiftScopeMonths(ctx, db, epoch)
 	if err != nil {
 		return empty, err
+	}
+	for _, month := range result.Months {
+		result.UnknownRows += month.UnknownRows
+		result.MonetaryRows += month.MonetaryRows
+		result.UserHours += month.UserHours
+		result.OversizeHours += month.OversizeHours
+		result.MissingStates += month.MissingStates
 	}
 	result.Mode, result.SourceEpoch = "offline_backup_inspection_no_source_access", epoch
 	if result.MissingStates > 0 {

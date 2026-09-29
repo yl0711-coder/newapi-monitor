@@ -2,7 +2,6 @@ package monitor
 
 import (
 	"context"
-	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -32,8 +31,9 @@ func (m *Monitor) financeReportSourceFingerprintForScope(ctx context.Context, fr
 	if from < 0 || to <= from {
 		return "", fmt.Errorf("经营核算事实版本区间无效")
 	}
-	hash := sha256.New()
+	hash := newFinanceSourceHasher(ctx)
 	writeAggregate := func(db *gorm.DB, label, query string, args ...any) error {
+		hash.section = label
 		var row financeReportSourceAggregate
 		if err := db.WithContext(ctx).Raw(query, args...).Scan(&row).Error; err != nil {
 			return fmt.Errorf("读取%s版本: %w", label, err)
@@ -69,6 +69,7 @@ func (m *Monitor) financeReportSourceFingerprintForScope(ctx context.Context, fr
 			row.UsageAdapter, row.UsageTailMode, row.BalanceUnit, row.BalanceUnitPrevious,
 			row.BalanceUnitEffectiveAt, row.CredentialVersion)
 	}
+	hash.section = "channel-directory"
 	var channelRows []struct {
 		ID           int
 		BaseDomain   string
@@ -93,6 +94,7 @@ func (m *Monitor) financeReportSourceFingerprintForScope(ctx context.Context, fr
 		}
 	}
 	if includeCUR {
+		hash.section = "upstream-activity-starts"
 		// Coverage in a selected month also depends on whether each upstream
 		// was active BEFORE that month. Without this dependency an unchanged
 		// full-report cache can hide a gap revealed by historical backfill.
@@ -152,6 +154,7 @@ func (m *Monitor) financeReportSourceFingerprintForScope(ctx context.Context, fr
 			args: []any{to},
 		},
 	}
+	hash.section = "hourly-coverage-proofs"
 	if err := m.hashFinanceHourlyProofs(ctx, hash, from, to); err != nil {
 		return "", err
 	}
@@ -161,6 +164,7 @@ func (m *Monitor) financeReportSourceFingerprintForScope(ctx context.Context, fr
 		}
 	}
 
+	hash.section = "internal-account-facts"
 	factsDB := m.financeFactsReadStore()
 	if factsDB == nil {
 		_, _ = hash.Write([]byte("usage-facts|unavailable\n"))
@@ -253,6 +257,7 @@ func (m *Monitor) financeReportSourceFingerprintForScope(ctx context.Context, fr
 			}
 		}
 		if includeCUR {
+			hash.section = "gift-opening-proofs"
 			// A selected month's opening gift balance depends on the entire
 			// earlier ledger. Monthly base components do not contain gift
 			// allocation and deliberately keep their narrower dependencies.
@@ -289,6 +294,7 @@ func (m *Monitor) financeReportSourceFingerprintForScope(ctx context.Context, fr
 		}
 	}
 
+	hash.section = "cur-artifact"
 	if includeCUR && m.cfg.FinanceCURArtifactEnabled {
 		path := strings.TrimSpace(m.cfg.FinanceCURArtifactPath)
 		info, err := os.Stat(path)

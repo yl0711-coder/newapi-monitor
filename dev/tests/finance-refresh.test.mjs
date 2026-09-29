@@ -23,9 +23,69 @@ function fixture(fetchImpl = async()=>{throw new Error('offline');}) {
   const source=readFileSync(new URL('../../monitor/finance.js',import.meta.url),'utf8');
   const end=source.lastIndexOf('}());');
   assert.ok(end>0,'finance module closure not found');
-  vm.runInContext(source.slice(0,end)+'\nglobalThis.fixture={state,scheduleStaleRefresh,load,financeIsPriorStale,financeCacheRefreshNote,renderProfitBridge,operatingProfitBlockers,setGiftEvidence,renderPeriods,renderDays,internalCostDeductionNote,grossCorrectedCost,chartValue,renderExecutive,upstreamCoverage,renderCosts};\n'+source.slice(end),context);
+  vm.runInContext(source.slice(0,end)+'\nglobalThis.fixture={state,scheduleStaleRefresh,load,financeIsPriorStale,financeCacheRefreshNote,renderProfitBridge,operatingProfitBlockers,setGiftEvidence,renderPeriods,renderDays,internalCostDeductionNote,grossCorrectedCost,chartValue,renderExecutive,upstreamCoverage,renderCosts,renderEvidenceRollout};\n'+source.slice(end),context);
   return {api:context.fixture,element,timers};
 }
+
+test('cold server response preserves already visible same-query money',async()=>{
+  const {api,element,timers}=fixture(async()=>({status:202,ok:true,headers:{get:()=> 'same-config'},json:async()=>({status:'retrying'})}));
+  api.state.loaded=true;api.state.renderedQuery='';
+  api.state.renderedConfiguration='same-config';
+  element('finReportContent').hidden=false;
+  await api.load(false,true);
+  assert.equal(api.state.loaded,true);
+  assert.equal(element('finReportContent').hidden,false);
+  assert.match(element('finCacheUpdate').textContent,/保留上次/);
+  assert.ok(timers.length>0);
+});
+
+test('configuration change cannot retain same-query prior money on 202',async()=>{
+  const {api,element}=fixture(async()=>({status:202,ok:true,headers:{get:()=> 'new-config'},json:async()=>({status:'queued'})}));
+  api.state.loaded=true;api.state.renderedQuery='';api.state.renderedConfiguration='old-config';
+  await api.load(false,true);
+  assert.equal(api.state.loaded,false);
+  assert.equal(element('finReportContent').hidden,true);
+});
+
+test('non-JSON proxy failure retains money and shows a safe HTTP error',async()=>{
+  const {api,element}=fixture(async()=>({status:504,ok:false,json:async()=>{throw new SyntaxError('Unexpected token < in private proxy response');}}));
+  api.state.loaded=true;api.state.renderedQuery='';
+  await api.load(true);
+  assert.equal(element('finReportContent').hidden,false);
+  assert.match(element('finCacheUpdate').textContent,/更新失败.*保留上次结果.*HTTP 504/);
+  assert.doesNotMatch(element('finCacheUpdate').textContent,/Unexpected|private proxy/);
+  assert.equal(element('finRefresh').disabled,false);
+});
+
+test('malformed successful response is not rendered as new report',async()=>{
+  const {api,element}=fixture(async()=>({status:200,ok:true,json:async()=>{throw new SyntaxError('invalid JSON');}}));
+  api.state.loaded=true;api.state.renderedQuery='';
+  await api.load(true);
+  assert.match(element('finCacheUpdate').textContent,/保留上次结果.*报表响应格式异常/);
+  assert.equal(element('finReportContent').hidden,false);
+});
+
+test('publication race is distinguished from persistent refresh failure',()=>{
+  const {api}=fixture();
+  const note=api.financeCacheRefreshNote({_cache_status:'fast-snapshot-stale',_update_state:'retrying'});
+  assert.match(note,/重新核验/);
+  assert.doesNotMatch(note,/更新失败/);
+  assert.match(api.financeCacheRefreshNote({_cache_status:'fast-snapshot-stale',_update_state:'failed'}),/更新失败/);
+});
+
+test('missing historical plan cannot imply that cost evidence is complete',()=>{
+  const {api,element}=fixture();
+  for (const rows of [[],[{domain:'partial.example',status:'incomplete',pairing_status:'not_enrolled'}]]) {
+    api.renderEvidenceRollout(rows);
+    const html=element('finEvidenceRolloutRows').innerHTML;
+    assert.match(html,/没有可展示的历史补证计划/);
+    assert.match(html,/不代表成本证据已完整/);
+    assert.doesNotMatch(html,/没有需要补采/);
+  }
+  api.renderEvidenceRollout([{domain:'ready.example',evidence_backfill_status:'local_estimate_ready',evidence_backfill_closes_cost:true,evidence_backfill_estimated_calls:2,evidence_backfill_estimated_runs:1}]);
+  assert.match(element('finEvidenceRolloutRows').innerHTML,/ready\.example/);
+  assert.doesNotMatch(element('finEvidenceRolloutRows').innerHTML,/没有可展示/);
+});
 
 test('coverage cards distinguish any money from complete period evidence',()=>{
   const {api,element}=fixture();

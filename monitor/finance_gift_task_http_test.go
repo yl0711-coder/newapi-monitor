@@ -15,9 +15,17 @@ import (
 )
 
 func giftTaskFixture(t *testing.T) (*Monitor, *gin.Engine, giftAuthorizationResponse) {
+	return giftTaskFixtureForMode(t, false)
+}
+
+func giftTaskFixtureForMode(t *testing.T, live bool) (*Monitor, *gin.Engine, giftAuthorizationResponse) {
 	t.Helper()
-	m, r, a := giftAuthorizedLocalFixture(t)
-	m.cfg.FinanceGiftHandoffLocalExecutionEnabled = true
+	fixture := giftAuthorizedLocalFixture
+	if live {
+		fixture = giftLiveFixture
+	}
+	m, r, a := fixture(t)
+	m.cfg.FinanceGiftHandoffLocalExecutionEnabled = !live
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
@@ -29,7 +37,12 @@ func giftTaskFixture(t *testing.T) (*Monitor, *gin.Engine, giftAuthorizationResp
 }
 
 func TestFinanceGiftTaskHTTPRejectsStaleAndCrossSiteRequests(t *testing.T) {
-	m, r, a := giftTaskFixture(t)
+	testFinanceGiftTaskHTTPRejectsStaleAndCrossSiteRequests(t, false)
+}
+
+func testFinanceGiftTaskHTTPRejectsStaleAndCrossSiteRequests(t *testing.T, live bool) {
+	t.Helper()
+	m, r, a := giftTaskFixtureForMode(t, live)
 	v := giftHTTPControl(t, m, r)
 	v.RequestID = strings.Repeat("a", 32)
 	path := giftAuthorizationURL + "/" + a.TaskID + "/start"
@@ -76,7 +89,11 @@ func TestFinanceGiftTaskHTTPRejectsStaleAndCrossSiteRequests(t *testing.T) {
 
 func giftHTTPControl(t *testing.T, m *Monitor, r *gin.Engine) financeGiftTaskView {
 	t.Helper()
-	w := giftAuthorizationRequestHTTP(m, r, "GET", "/finance/gift-handoff/local/control", "", "local-root", roleRoot)
+	path := "/finance/gift-handoff/local/control"
+	if m.cfg.FinanceGiftHandoffLiveExecutionEnabled {
+		path = "/finance/gift-handoff/live/control"
+	}
+	w := giftAuthorizationRequestHTTP(m, r, "GET", path, "", "local-root", roleRoot)
 	var response struct {
 		Control financeGiftTaskView `json:"control"`
 	}
@@ -115,7 +132,12 @@ func TestFinanceGiftTaskHTTPPreviewCooldownHint(t *testing.T) {
 }
 
 func TestFinanceGiftTaskHTTPStartStopAndRetry(t *testing.T) {
-	m, r, a := giftTaskFixture(t)
+	testFinanceGiftTaskHTTPStartStopAndRetry(t, false)
+}
+
+func testFinanceGiftTaskHTTPStartStopAndRetry(t *testing.T, live bool) {
+	t.Helper()
+	m, r, a := giftTaskFixtureForMode(t, live)
 	v := giftHTTPControl(t, m, r)
 	v.RequestID = strings.Repeat("a", 32)
 	path := giftAuthorizationURL + "/" + a.TaskID
@@ -147,9 +169,18 @@ func TestFinanceGiftTaskHTTPStartStopAndRetry(t *testing.T) {
 }
 
 func TestFinanceGiftTaskHTTPCompletedAndClose(t *testing.T) {
-	m, r, a := giftTaskFixture(t)
+	testFinanceGiftTaskHTTPCompletedAndClose(t, false)
+}
+
+func testFinanceGiftTaskHTTPCompletedAndClose(t *testing.T, live bool) {
+	t.Helper()
+	m, r, a := giftTaskFixtureForMode(t, live)
 	// Complete only the approved subset, then verify HTTP resume is a no-op.
-	if _, err := m.runFinanceGiftAuthorizedLocal(context.Background(), a.TaskID, handoffNoWait); err != nil {
+	run := m.runFinanceGiftAuthorizedLocal
+	if live {
+		run = m.runFinanceGiftAuthorizedLive
+	}
+	if _, err := run(context.Background(), a.TaskID, handoffNoWait); err != nil {
 		t.Fatal(err)
 	}
 	before := giftBoundaryFingerprint(t, m.usageFactsDB)

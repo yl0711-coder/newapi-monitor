@@ -181,6 +181,7 @@ type Settings struct {
 	FinanceGiftHandoffPreviewSHA256         string // MONITOR_FINANCE_GIFT_HANDOFF_PREVIEW_SHA256
 	FinanceGiftHandoffApprovalEnabled       bool   // MONITOR_FINANCE_GIFT_HANDOFF_APPROVAL_ENABLED; records authorization only, default false
 	FinanceGiftHandoffLocalExecutionEnabled bool   // MONITOR_FINANCE_GIFT_HANDOFF_LOCAL_EXECUTION_ENABLED; local snapshot only, default false
+	FinanceGiftHandoffLiveExecutionEnabled  bool   // MONITOR_FINANCE_GIFT_HANDOFF_LIVE_EXECUTION_ENABLED; explicit finite execution core, default false; no auto-start
 	// CUR 核算产物由离线命令生成并完成哈希自校验。Monitor 只读本地文件，
 	// 不访问 AWS/S3；独立开关默认关闭，路径必须为绝对路径。
 	FinanceCURArtifactEnabled bool   // MONITOR_FINANCE_CUR_ARTIFACT_ENABLED，默认 false
@@ -474,6 +475,7 @@ func LoadSettings() Settings {
 		FinanceGiftHandoffPreviewSHA256:          strings.TrimSpace(env("MONITOR_FINANCE_GIFT_HANDOFF_PREVIEW_SHA256", "")),
 		FinanceGiftHandoffApprovalEnabled:        env("MONITOR_FINANCE_GIFT_HANDOFF_APPROVAL_ENABLED", "false") == "true",
 		FinanceGiftHandoffLocalExecutionEnabled:  env("MONITOR_FINANCE_GIFT_HANDOFF_LOCAL_EXECUTION_ENABLED", "false") == "true",
+		FinanceGiftHandoffLiveExecutionEnabled:   env("MONITOR_FINANCE_GIFT_HANDOFF_LIVE_EXECUTION_ENABLED", "false") == "true",
 		FinanceCURArtifactEnabled:                env("MONITOR_FINANCE_CUR_ARTIFACT_ENABLED", "false") == "true",
 		FinanceCURArtifactPath:                   strings.TrimSpace(env("MONITOR_FINANCE_CUR_ARTIFACT_PATH", "")),
 		PortalAddr:                               env("MONITOR_PORTAL_ADDR", ""),
