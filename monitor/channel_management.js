@@ -812,6 +812,8 @@ function domainCard(domain,index,total,filtered,costBases=upstreamCostBases([dom
   // 上游日志只按账户（归并主域名）汇总；没有可靠的远端渠道 ID 映射时，
   // 绝不能伪装成某一条本地渠道的上游账单。
   const upstreamBalance=window.channelDataStatus.known(domain.upstream?.balance_usd)?usd(domain.upstream.balance_usd):'—';
+  const balanceNote=domain.upstream?.configured?window.channelDataStatus.balanceSnapshot(domain.upstream).note:'';
+  const balanceHint=balanceNote?`<em class="cm-domain-metric-note neutral cm-balance-sync-note">${esc(balanceNote)}</em>`:'';
   const upstreamRunwayView=upstreamRunway(domain.upstream);
 	const upstreamIntegrity=upstreamUsage.integrity_status||'complete',upstreamTrusted=upstreamIntegrity==='complete';
 	const upstreamCostView=presentedBusinessCost(upstreamUsage,false,costBases.cost),adjustedCostView=presentedBusinessCost(upstreamUsage,true,costBases.adjusted);
@@ -822,7 +824,10 @@ function domainCard(domain,index,total,filtered,costBases=upstreamCostBases([dom
 	const adjustedSpend=upstreamTrusted&&adjustedCostView.available?usd(adjustedCostView.value):'—';
 	const internalNote=upstreamCostNote(upstreamUsage,costBases.cost),adjustedInternalNote=upstreamCostNote(upstreamUsage,costBases.adjusted,true);
   const upstreamSpendLabel=domain.upstream?.provider==='openox'?'账面用量（含订阅抵扣）':(billView.daily?'所涉自然日':upstreamUsage.granularity==='day'?'自然日':'区间')+(costBases.cost==='business'?'上游消费':'上游账单消费');
-  const upstreamMetrics=domain.upstream?.configured||upstreamUsage.available?`<span class="cm-domain-upstream-spend" title="金额按上游账户（主域名）汇总，不拆分到筛选的渠道或分组"><small>${upstreamSpendLabel}</small><b>${upstreamSpend}</b>${billSyncHint}<em class="cm-domain-metric-note neutral">${esc([billRangeNote,internalNote].filter(Boolean).join(' · '))}</em></span><span class="cm-domain-upstream-adjusted" title="修正成本 = 账面消费 × 历史充值支付 ÷ 历史充值到账；内部账号扣除口径见金额下方；${esc(billRangeNote)}"><small>上游修正成本</small><b>${adjustedSpend}</b>${billSyncHint}<em class="cm-domain-metric-note neutral">${esc([ratioLabel,adjustedInternalNote].filter(Boolean).join(' · '))}${billView.daily?' · 同左侧账单范围':''}</em></span><span class="cm-domain-upstream-balance"><small>上游当前余额</small><b>${upstreamBalance}</b>${domain.retiring?'<em class="cm-domain-metric-note retiring">不再充值 · 余量消耗中</em>':''}<em class="cm-domain-metric-note ${upstreamRunwayView.cls}" title="${esc(upstreamRunwayView.title)}">${esc(upstreamRunwayView.text)}</em>${upstreamRunwayView.basis?`<em class="cm-domain-metric-note neutral">${esc(upstreamRunwayView.basis)}</em>`:''}</span>`:'';
+  const upstreamMetrics=domain.upstream?.configured||upstreamUsage.available?`
+    <span class="cm-domain-upstream-spend" title="金额按上游账户（主域名）汇总，不拆分到筛选的渠道或分组"><small>${upstreamSpendLabel}</small><b>${upstreamSpend}</b>${billSyncHint}<em class="cm-domain-metric-note neutral">${esc([billRangeNote,internalNote].filter(Boolean).join(' · '))}</em></span>
+    <span class="cm-domain-upstream-adjusted" title="修正成本 = 账面消费 × 历史充值支付 ÷ 历史充值到账；内部账号扣除口径见金额下方；${esc(billRangeNote)}"><small>上游修正成本</small><b>${adjustedSpend}</b>${billSyncHint}<em class="cm-domain-metric-note neutral">${esc([ratioLabel,adjustedInternalNote].filter(Boolean).join(' · '))}${billView.daily?' · 同左侧账单范围':''}</em></span>
+    <span class="cm-domain-upstream-balance"><small>上游当前余额</small><b>${upstreamBalance}</b>${balanceHint}${domain.retiring?'<em class="cm-domain-metric-note retiring">不再充值 · 余量消耗中</em>':''}<em class="cm-domain-metric-note ${upstreamRunwayView.cls}" title="${esc(upstreamRunwayView.title)}">${esc(upstreamRunwayView.text)}</em>${upstreamRunwayView.basis?`<em class="cm-domain-metric-note neutral">${esc(upstreamRunwayView.basis)}</em>`:''}</span>`:'';
   const financeButton=cm.report?.finance?.can_edit&&domain.configured?`<button type="button" class="cm-finance-open" data-cm-finance="${esc(domain.key)}">倍率配置</button>`:'';
   const upstreamButton=cm.report?.finance?.can_edit&&domain.configured?`<button type="button" class="cm-upstream-open" data-cm-upstream="${esc(domain.key)}">账户配置</button>`:'';
 	const retiringButton=cm.report?.finance?.can_edit&&domain.configured?`<button type="button" class="cm-retiring-toggle${domain.retiring?' active':''}" aria-pressed="${domain.retiring?'true':'false'}" data-cm-retiring="${esc(domain.key)}">${domain.retiring?'取消停止使用':'标记停止使用'}</button>`:'';
@@ -1192,7 +1197,7 @@ function upstreamState(status,enabled=true){
   if(!enabled)return {label:'已停用',level:'neutral'};
   if(status==='ok')return {label:'正常',level:'ok'};
   if(status==='error')return {label:'异常',level:'bad'};
-  if(status==='reconnect')return {label:'已暂停，待检测',level:'bad'};
+  if(status==='reconnect'||status==='paused')return {label:'已暂停，待检测',level:'bad'};
   if(status==='unsupported')return {label:'待适配',level:'bad'};
   if(status==='stale')return {label:'数据陈旧',level:'warn'};
   if(status==='global_off')return {label:'灰度关闭',level:'neutral'};
@@ -1208,15 +1213,16 @@ function renderUpstreamStatus(account){
   renderUpstreamRecoveryOptions(account);
   const el=$('cmUpstreamStatus');if(!el)return;
   if(!account?.configured){el.hidden=true;el.innerHTML='';return}
-  const balanceState=upstreamState(account.status,account.enabled);
+  const balanceState=upstreamState(account.balance_effective_status||account.status,account.enabled);
+  const balanceSnapshot=window.channelDataStatus.balanceSnapshot(account);
   const usageState=account.usage_sync_enabled?upstreamState(account.usage_tail_phase||account.usage_effective_status||account.usage_status,account.enabled):{label:'未开启',level:'neutral'};
   const historyState=account.usage_sync_enabled?upstreamState(account.usage_history_phase,account.enabled):{label:'未开启',level:'neutral'};
-  const balance=account.balance_usd==null?'尚未取得余额':`当前余额 ${usd(account.balance_usd)}`;
+  const balance=!balanceSnapshot.known?'尚未取得余额':`${balanceSnapshot.verified?'当前余额':'最近余额快照'} ${usd(account.balance_usd)}`;
   const nativeBalance=account.native_currency==='CNY'&&account.balance_raw!=null&&account.unit_per_usd>0
     ?`<em>上游原始余额 ¥${Number(account.balance_raw).toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2})} · 按 ${Number(account.unit_per_usd).toLocaleString(undefined,{maximumFractionDigits:6})} CNY/USD 归一</em>`:'';
   const adapter=account.usage_adapter_name||'尚未确定同步适配器';
   const granularity=account.usage_granularity==='day'?'按天汇总':'按小时汇总';
-  const backfill=account.usage_history_phase==='complete'?'历史补数已完成':account.usage_history_phase==='queued'?'历史补数等待首次调度':account.usage_history_phase==='retry'?'历史补数退避重试':account.usage_history_phase==='blocked'?'历史补数受阻':account.usage_backfill_progress?'历史补数断点续传':'历史补数中';
+  const backfill=account.usage_history_phase==='paused'?'历史补数已暂停，请检测并恢复':account.usage_history_phase==='complete'?'历史补数已完成':account.usage_history_phase==='queued'?'历史补数等待首次调度':account.usage_history_phase==='retry'?'历史补数退避重试':account.usage_history_phase==='blocked'?'历史补数受阻':account.usage_backfill_progress?'历史补数断点续传':'历史补数中';
   const balanceError=account.last_error?`<em class="cm-upstream-status-error">余额错误：${esc(account.last_error)}</em>`:'';
   const usageError=account.usage_last_error?`<em class="cm-upstream-status-error">当天追平：${esc(account.usage_last_error)}</em>`:'';
   const historyError=account.usage_backfill_last_error?`<em class="cm-upstream-status-error">历史补数：${esc(account.usage_backfill_last_error)}</em>`:'';
@@ -1455,6 +1461,7 @@ async function recoverUpstreamTask(){
   showUpstreamMessage('正在检测所选接口；通过后恢复排期，不会清空历史数据…');
   try{
     const response=await fetch('/channels/upstream/recover',{method:'POST',headers:{Accept:'application/json','Content-Type':'application/json'},signal:controller.signal,body:JSON.stringify({domain,task})});
+    if(seq!==upstreamRecoverySeq||cm.upstreamDomain?.domain!==domain)return;
     if(response.status===401){location.href='/login';return}
     const data=await response.json();
     if(seq!==upstreamRecoverySeq||cm.upstreamDomain?.domain!==domain)return;
@@ -1462,7 +1469,23 @@ async function recoverUpstreamTask(){
     const known=['queued','waiting','blocked','not_needed'].includes(data.status);
     const retry=Number(data.retry_at),validRetry=retry>0&&Number.isFinite(new Date(retry*1000).getTime());
     showUpstreamMessage((known?data.message:'未取得有效恢复结果，请查看数据同步状态。')+(validRetry?` 下次可检测：${dateTime(retry)}`:''),!known||data.status==='blocked');
-    if(data.status==='queued')cm.loaded=false;
+    if(data.status==='queued'){
+      cm.loaded=false;
+      // Re-read local status only: do not repeat synchronization or reopen the
+      // form, which would discard unsaved credential/configuration edits.
+      try{
+        const latest=await fetch(`/channels/upstream?domain=${encodeURIComponent(domain)}`,{headers:{Accept:'application/json'},cache:'no-store',signal:controller.signal});
+        if(seq!==upstreamRecoverySeq||cm.upstreamDomain?.domain!==domain)return;
+        if(latest.status===401){location.href='/login';return}
+        const refreshed=await latest.json();
+        if(seq!==upstreamRecoverySeq||cm.upstreamDomain?.domain!==domain)return;
+        if(!latest.ok||refreshed?.account?.configured!==true)throw Error('local status unavailable');
+        cm.upstreamConfig={...cm.upstreamConfig,account:refreshed.account};
+        renderUpstreamStatus(refreshed.account);
+      }catch(error){
+        if(seq===upstreamRecoverySeq&&cm.upstreamDomain?.domain===domain)showUpstreamMessage('已恢复排期，但状态刷新失败；请重新打开账户配置查看。尚不代表数据已更新。',true);
+      }
+    }
   }catch(error){
     if(seq===upstreamRecoverySeq&&cm.upstreamDomain?.domain===domain)showUpstreamMessage(error.name==='AbortError'?'检测超时，请查看同步状态后再试；未清空历史数据。':error.message,true);
   }finally{
@@ -1474,8 +1497,9 @@ async function recoverUpstreamTask(){
 function upstreamBalanceSummary(accounts){
   const excluded=accounts.filter(domain=>domain.upstream?.exclude_from_balance_summary===true);
   const included=accounts.filter(domain=>domain.upstream?.exclude_from_balance_summary!==true);
-  const known=included.filter(domain=>domain.upstream.balance_usd!=null&&Number.isFinite(Number(domain.upstream.balance_usd)));
-  return {known,excluded,total:known.reduce((sum,domain)=>sum+Number(domain.upstream.balance_usd),0)};
+  const known=included.filter(domain=>window.channelDataStatus.balanceSnapshot(domain.upstream).known);
+  const unverified=known.filter(domain=>!window.channelDataStatus.balanceSnapshot(domain.upstream).verified);
+  return {known,excluded,unverified,missing:included.length-known.length,total:known.reduce((sum,domain)=>sum+Number(domain.upstream.balance_usd),0)};
 }
 
 function render(){
@@ -1517,7 +1541,7 @@ function render(){
 	<article class="accent"><small>用户侧消费</small><b>${usageMetric(filteredUsage.cost_usd,usd)}</b><span>当前查询区间 · 用户消费金额</span></article>
     <article class="upstream"><small>${costBases.cost==='business'?'区间上游消费汇总':'区间上游账单消费汇总'}</small><b>${upstreamSpendLabel}</b><span>${esc(upstreamScopeLabel)}</span></article>
 		<article class="adjusted"><small>上游修正成本汇总</small><b>${adjustedUpstreamSpendLabel}</b><span>已取得 ${adjustedUsageDomains.length}/${upstreamAccounts.length} 个账户 · ${costBases.adjusted==='business'?'已扣配置内部账号':'账单口径，含内部测试成本'} · 按历史充值比例修正</span></article>
-    <article class="balance"><small>上游当前余额汇总</small><b>${upstreamBalanceDomains.length?usd(upstreamBalance):'—'}</b><span>上游账户余额合计${balanceSummary.excluded.length?' · 自有站点余额不计入':''}</span></article>
+    <article class="balance"><small>上游当前余额汇总</small><b>${upstreamBalanceDomains.length?usd(upstreamBalance):'—'}</b><span>最近余额快照合计${balanceSummary.unverified.length?` · ${balanceSummary.unverified.length} 个待更新/核验`:''}${balanceSummary.missing?` · ${balanceSummary.missing} 个未取得`:''}${balanceSummary.excluded.length?' · 自有站点余额不计入':''}</span></article>
     ${exactKPIs}
     ${filtered?`<article><small>筛选${esc(metricLabel())}占比</small><b>${metric(allUsage)>0?share.toFixed(1)+'%':'—'}</b><span>相对当前日期全部渠道</span></article>`:''}
   </section>${window.channelDataStatus.note(cm.report)}`;

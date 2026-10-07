@@ -359,9 +359,10 @@ body{max-width:none!important;margin:0!important;padding:0!important;overflow-x:
 #cmUpstreamDetect{grid-column:1/-1;padding:9px 14px;border:1px solid #5869b1;border-radius:8px;background:#212944;color:#dfe6ff;cursor:pointer}
 #cmUpstreamDetect:disabled{opacity:.5;cursor:wait}
 
-/* Cost scope must stay readable, including whether internal test usage is included. */
+/* Cost scope and balance freshness must stay readable below unchanged amounts. */
 .cm-kpis article.upstream span,
-.cm-kpis article.adjusted span {
+.cm-kpis article.adjusted span,
+.cm-kpis article.balance span {
   white-space:normal;
   overflow:visible;
   text-overflow:clip;

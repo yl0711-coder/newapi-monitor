@@ -58,10 +58,16 @@
   const date = (ts) => ts ? new Date(ts * 1000).toLocaleDateString('zh-CN', { timeZone: 'Asia/Shanghai' }) : '—';
   const dateTime = (ts) => ts ? new Date(ts * 1000).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false }) : '—';
 
+  function coveragePercent(completed, expected) {
+    if (!Number.isFinite(completed) || !Number.isFinite(expected) || completed < 0 || expected <= 0) return '—';
+    // A rounded display must not turn an outstanding hour into "100%".
+    return `${Math.min(completed < expected ? 99.9 : 100, completed * 100 / expected).toFixed(1)}%`;
+  }
+
   function userCoverage(value) {
     const expected = Number(value?.expected_hours || 0);
     const completed = Number(value?.completed_hours || 0);
-    return expected ? `${completed}/${expected} 小时·${(completed * 100 / expected).toFixed(1)}%` : '—';
+    return expected ? `${completed}/${expected} 小时·${coveragePercent(completed, expected)}` : '—';
   }
 
   function upstreamCoverage(value) {
@@ -102,7 +108,7 @@
   function domainHourCoverage(row) {
     const expected = Number(row?.expected_hours || 0);
     const completed = Number(row?.completed_hours || 0);
-    return expected ? `${completed}/${expected} 小时·${(completed * 100 / expected).toFixed(1)}%` : '—';
+    return expected ? `${completed}/${expected} 小时·${coveragePercent(completed, expected)}` : '—';
   }
 
   function economicsCoverage(value) {
@@ -177,7 +183,7 @@
     const note = element.querySelector('span');
     element.classList.remove('ready', 'warn', 'missing');
     element.classList.add(percent == null ? 'missing' : done >= total ? 'ready' : 'warn');
-    if (value) value.textContent = percent == null ? '—' : `${percent.toFixed(1)}%`;
+    if (value) value.textContent = coveragePercent(done, total);
     if (note) note.textContent = total > 0
       ? `${done.toLocaleString('zh-CN')} / ${total.toLocaleString('zh-CN')} ${unit}`
       : '当前区间没有可核验证据';
@@ -207,7 +213,7 @@
       const scopePending = Number(value?.scope_unknown_events || 0) > 0 ? ` · ${Number(value.scope_unknown_events)} 条历史分组依据待补` : '';
       const scopeIndependent = Number(value?.scope_independent_user_hours || 0) > 0 ? ` · ${Number(value.scope_independent_user_hours)} 个后续用户小时已证明不影响赠送扣减` : '';
       note.textContent = expected > 0
-        ? `小时覆盖 ${percent.toFixed(1)}% · ${completed}/${expected} 小时 · 赠送用户 ${giftUsers}${sequence}${pending}${scopePending}${scopeIndependent}`
+        ? `小时覆盖 ${coveragePercent(completed, expected)} · ${completed}/${expected} 小时 · 赠送用户 ${giftUsers}${sequence}${pending}${scopePending}${scopeIndependent}`
         : '当前区间没有可核验证据';
     }
   }

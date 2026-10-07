@@ -263,6 +263,10 @@ type ChannelUpstreamAccountView struct {
 	APIKeyCount                   int                               `json:"api_key_count,omitempty"`
 	APIKeySlots                   []AICodeWithKeySlotView           `json:"api_key_slots,omitempty"`
 	BalanceUSD                    *float64                          `json:"balance_usd,omitempty"`
+	BalanceWorkerEnabled          bool                              `json:"balance_worker_enabled"`
+	BalanceEffectiveStatus        string                            `json:"balance_effective_status,omitempty"`
+	BalanceFresh                  bool                              `json:"balance_fresh"`
+	BalanceFreshnessLimitSeconds  int64                             `json:"balance_freshness_limit_seconds,omitempty"`
 	ExcludeFromBalanceSummary     bool                              `json:"exclude_from_balance_summary"`
 	BalanceRaw                    *float64                          `json:"balance_raw,omitempty"`
 	Currency                      string                            `json:"currency,omitempty"`
@@ -356,6 +360,7 @@ type AICodeWithKeySlotView struct {
 	NextSyncAt               int64  `json:"next_sync_at,omitempty"`
 	ConsecutiveFails         int    `json:"consecutive_fails,omitempty"`
 	BackfillDone             bool   `json:"backfill_done,omitempty"`
+	BackfillPaused           bool   `json:"backfill_paused,omitempty"`
 	BackfillLastError        string `json:"backfill_last_error,omitempty"`
 	BackfillLastSuccessAt    int64  `json:"backfill_last_success_at,omitempty"`
 	BackfillNextSyncAt       int64  `json:"backfill_next_sync_at,omitempty"`
@@ -1048,6 +1053,7 @@ func (m *Monitor) aicodeWithSlotViewsFromStates(row ChannelUpstreamAccount, stat
 			SlotID: slot.SlotID, Name: slot.Name, Label: label, Status: state.Status,
 			LastError: state.LastError, LastSuccessAt: state.LastSuccessAt, NextSyncAt: state.NextSyncAt,
 			ConsecutiveFails: state.ConsecutiveFails, BackfillDone: backfillDone,
+			BackfillPaused:    !backfillDone && backfillNextSyncAt == upstreamAccountIsolatedUntil,
 			BackfillLastError: backfillLastError, BackfillLastSuccessAt: state.BackfillLastSuccessAt,
 			BackfillNextSyncAt: backfillNextSyncAt, BackfillConsecutiveFails: backfillConsecutiveFails,
 		})
@@ -1161,6 +1167,8 @@ func upstreamUsageHistoryPhase(row ChannelUpstreamAccount, s Settings) string {
 		return "blocked"
 	case row.UsageBackfillDone:
 		return "complete"
+	case row.UsageBackfillNextSyncAt == upstreamAccountIsolatedUntil:
+		return "paused"
 	case row.UsageBackfillLastError != "":
 		return "retry"
 	case row.UsageBackfillLastAttemptAt == 0 && row.UsageBackfillLastSuccessAt == 0:
@@ -1174,7 +1182,9 @@ func upstreamUsageHistoryPhase(row ChannelUpstreamAccount, s Settings) string {
 
 func (m *Monitor) channelUpstreamAccountView(row ChannelUpstreamAccount) ChannelUpstreamAccountView {
 	view := upstreamAccountView(row)
-	decorateUpstreamUsageHealth(&view, row, m.cfg, time.Now().Unix())
+	now := time.Now().Unix()
+	decorateUpstreamBalanceHealth(&view, row, m.cfg, now)
+	decorateUpstreamUsageHealth(&view, row, m.cfg, now)
 	return view
 }
 

@@ -7,7 +7,7 @@ const source = name => readFileSync(new URL(`../../monitor/${name}`, import.meta
 
 test('upstream KPI scope notes wrap instead of hiding the internal-test basis',()=>{
   const css=source('stability.css');
-  const rule=css.match(/\.cm-kpis article\.upstream span,\s*\.cm-kpis article\.adjusted span\s*\{([^}]+)\}/);
+  const rule=css.match(/\.cm-kpis article\.upstream span,\s*\.cm-kpis article\.adjusted span,\s*\.cm-kpis article\.balance span\s*\{([^}]+)\}/);
   assert.ok(rule,'cost scope has a targeted wrapping rule');
   for(const property of ['white-space:normal','overflow:visible','text-overflow:clip','overflow-wrap:anywhere']){
     assert.ok(rule[1].includes(property),property);
@@ -604,12 +604,12 @@ test('daily bill stays visible after refresh with scope, never contaminates hour
   const {context,html}=dashboard(),ui=context.channelTest;
   const usage={requests:10,tokens:100,cost_usd:20};
   const daily={key:'spring',domain:'aicodewith.com',configured:true,usage,vendors:[],
-    upstream:{configured:true,usage_sync_enabled:true,balance_usd:50,status:'ok',usage_status:'ok'},
+    upstream:{configured:true,usage_sync_enabled:true,balance_usd:50,status:'ok',balance_fresh:true,balance_effective_status:'ok',usage_status:'ok'},
     upstream_usage:{available:true,integrity_status:'window_mismatch',granularity:'day',cost_usd:0},
     natural_day_bill:{from_ts:1788624000,to_ts:1788776343,usage:{available:true,complete:true,cost_usd:770.3163,
       adjusted_cost_available:true,adjusted_cost_usd:385.15815,recharge_ratio:2,integrity_status:'complete',data_until:1788776223,internal_filter_status:'not_configured'}}};
   const hourly={key:'hour',domain:'hour.example',configured:true,usage,vendors:[],
-    upstream:{configured:true,usage_sync_enabled:true,balance_usd:20},
+    upstream:{configured:true,usage_sync_enabled:true,balance_usd:20,status:'ok',balance_fresh:true,balance_effective_status:'ok'},
     upstream_usage:{available:true,complete:true,cost_usd:10,adjusted_cost_available:true,adjusted_cost_usd:5,internal_filter_status:'not_configured'}};
   for(const [index,domain] of [daily,hourly].entries())domain.vendors=[{name:'vendor',channels:[{id:index+1,name:'channel',current:true,status:1,usage,groups:[]}]}];
   ui.cm.report={meta:{from:'2026-09-06',to:'2026-09-07',data_coverage:{complete:true}},summary:{usage},domains:[daily,hourly]};

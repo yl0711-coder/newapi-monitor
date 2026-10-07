@@ -98,6 +98,8 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
   .usage-summary .us-v{font-size:19px;line-height:32px;font-weight:700;color:#cbd5e1;font-variant-numeric:tabular-nums;letter-spacing:-.01em} /* 固定行高:不同字号的列等高,标签对齐+数值底部对齐 */
   .usage-summary .us-v.amber{color:#fbbf24;font-size:28px} /* 头条主数 */
   .usage-summary .us-v.green{color:#34d399}
+  .usage-profile-note{display:block;font-size:11px;font-weight:400;line-height:1.5;color:var(--text-muted)}
+  .grpcard .usage-profile-value{display:inline-block;vertical-align:top}
   .usage-summary .us-sep{width:1px;align-self:stretch;background:var(--border);margin:3px 0}
   /* 管理表分页条 */
   .pager{display:flex;align-items:center;gap:14px;justify-content:flex-end;padding:10px 14px 0;margin-top:10px;border-top:1px solid var(--border);font-size:13px;color:var(--text-muted)} /* 作为卡片标准页脚 */
@@ -2501,7 +2503,7 @@ function syncRenderChannels(report){
     if(!enabled)return {label:'已停用',level:'neutral'};
     if(status==='ok')return {label:'正常',level:'ok'};
     if(status==='error')return {label:'异常',level:'bad'};
-    if(status==='reconnect')return {label:'需重新连接',level:'bad'};
+    if(status==='reconnect'||status==='paused')return {label:'已暂停，待检测',level:'bad'};
     if(status==='unsupported')return {label:'待适配',level:'bad'};
     if(status==='stale')return {label:'数据陈旧',level:'warn'};
     if(status==='global_off')return {label:'灰度关闭',level:'neutral'};
@@ -2518,11 +2520,11 @@ function syncRenderChannels(report){
     if(status==='backfilling')return {label:'历史补全',level:'warn'};
     return {label:'等待同步',level:'warn'};
   };
-  let level='ok',enabledAccounts=0,balanceHealthy=0,usageEnabled=0,usageHealthy=0,historyComplete=0,historyRetry=0;
+  let level='ok',enabledAccounts=0,balanceHealthy=0,usageEnabled=0,usageHealthy=0,historyComplete=0,historyRetry=0,historyPaused=0;
   const cards=domains.map(x=>{
-    const u=x.upstream||{},balance=statusInfo(u.status,u.enabled),usage=u.usage_sync_enabled?statusInfo(u.usage_tail_phase||u.usage_effective_status||u.usage_status,u.enabled):{label:'未开启',level:'neutral'},history=u.usage_sync_enabled?statusInfo(u.usage_history_phase,u.enabled):{label:'未开启',level:'neutral'},pricingStatus=statusInfo(u.pricing_ledger_status,u.enabled),errorLog=statusInfo(u.error_log_status,u.enabled);
+    const u=x.upstream||{},balance=statusInfo(u.balance_effective_status||u.status,u.enabled),usage=u.usage_sync_enabled?statusInfo(u.usage_tail_phase||u.usage_effective_status||u.usage_status,u.enabled):{label:'未开启',level:'neutral'},history=u.usage_sync_enabled?statusInfo(u.usage_history_phase,u.enabled):{label:'未开启',level:'neutral'},pricingStatus=statusInfo(u.pricing_ledger_status,u.enabled),errorLog=statusInfo(u.error_log_status,u.enabled);
     if(u.enabled){enabledAccounts++;if(balance.level==='ok')balanceHealthy++}
-    if(u.enabled&&u.usage_sync_enabled&&u.usage_worker_enabled){usageEnabled++;if(usage.level==='ok')usageHealthy++;if(history.level==='ok')historyComplete++;if(u.usage_history_phase==='retry')historyRetry++}
+    if(u.enabled&&u.usage_sync_enabled&&u.usage_worker_enabled){usageEnabled++;if(usage.level==='ok')usageHealthy++;if(history.level==='ok')historyComplete++;if(u.usage_history_phase==='retry')historyRetry++;if(u.usage_history_phase==='paused')historyPaused++}
     let accountLevel='ok';
     if(u.enabled&&(balance.level==='bad'||(u.usage_sync_enabled&&u.usage_worker_enabled&&(usage.level==='bad'||history.level==='bad'))||(u.pricing_ledger_worker_enabled&&u.pricing_ledger_eligible&&pricingStatus.level==='bad')||(u.error_log_worker_enabled&&u.error_log_selected&&errorLog.level==='bad')))accountLevel='bad';
     else if(u.enabled&&(balance.level==='warn'||(u.usage_sync_enabled&&u.usage_worker_enabled&&(usage.level==='warn'||history.level==='warn'))||(u.pricing_ledger_worker_enabled&&u.pricing_ledger_eligible&&pricingStatus.level==='warn')||(u.error_log_worker_enabled&&u.error_log_selected&&errorLog.level==='warn')))accountLevel='warn';
@@ -2532,12 +2534,12 @@ function syncRenderChannels(report){
     const adapter=u.usage_adapter_name||'尚未确定同步适配器',granularity=u.usage_granularity==='day'?'单日汇总':'小时汇总';
     const lag=u.usage_data_until?usageFactsDuration(Math.max(0,now-(+u.usage_data_until))):'—';
     const historyLabel=history.label;
-    const historyDetail=u.usage_history_phase==='complete'?`最近成功 ${syncTime(u.usage_backfill_last_success_at)}`:u.usage_history_phase==='queued'?`尚未执行历史任务 · 首次计划 ${syncTime(u.usage_backfill_next_sync_at)}`:u.usage_history_phase==='retry'?`下次重试 ${syncTime(u.usage_backfill_next_sync_at)}`:`下一待补时段 ${syncTime(u.usage_backfill_cursor)} · 下次 ${syncTime(u.usage_backfill_next_sync_at)}`;
+    const historyDetail=u.usage_history_phase==='paused'?'自动重试已暂停，请在账户配置中检测并恢复':u.usage_history_phase==='complete'?`最近成功 ${syncTime(u.usage_backfill_last_success_at)}`:u.usage_history_phase==='queued'?`尚未执行历史任务 · 首次计划 ${syncTime(u.usage_backfill_next_sync_at)}`:u.usage_history_phase==='retry'?`下次重试 ${syncTime(u.usage_backfill_next_sync_at)}`:`下一待补时段 ${syncTime(u.usage_backfill_cursor)} · 下次 ${syncTime(u.usage_backfill_next_sync_at)}`;
     const balanceError=u.last_error?`<p class="sync-upstream-error">余额错误：${esc(u.last_error)}</p>`:'';
     const usageErrors=[u.usage_last_error?`当天追平：${u.usage_last_error}`:'',u.usage_backfill_last_error?`历史补数：${u.usage_backfill_last_error}`:''].filter(Boolean).map(message=>`<p class="sync-upstream-error">${esc(message)}</p>`).join('');
     const usageProgress=u.usage_backfill_progress?`<p class="sync-upstream-note">历史补数：${esc(u.usage_backfill_progress)}</p>`:'';
     const keySlots=Array.isArray(u.api_key_slots)?u.api_key_slots:[];
-    const keyContent=keySlots.length?`<details class="sync-upstream-keys" open><summary>AICodeWith Key 同步 · ${fmtNum(keySlots.length)} 把</summary>${keySlots.map(slot=>{const state=statusInfo(slot.status||'queued',u.enabled),slotHistory=slot.backfill_done?'历史已完成':slot.backfill_last_error?'历史退避重试':slot.status?'历史补数中':'等待首次同步',error=slot.last_error||slot.backfill_last_error||'';return `<div class="sync-upstream-key"><b>${esc(slot.label||'未命名 Key')}</b><span class="sync-status ${syncStateClass(state.level)}">${esc(state.label)}</span><small>${esc(slotHistory)}${slot.last_success_at?` · 最近 ${syncTime(slot.last_success_at)}`:''}${error?`<br><span class="history-error">${esc(error)}</span>`:''}</small></div>`}).join('')}</details>`:'';
+    const keyContent=keySlots.length?`<details class="sync-upstream-keys" open><summary>AICodeWith Key 同步 · ${fmtNum(keySlots.length)} 把</summary>${keySlots.map(slot=>{const state=statusInfo(slot.status||'queued',u.enabled),slotHistory=slot.backfill_done?'历史已完成':slot.backfill_paused?'历史任务已暂停':slot.backfill_last_error?'历史退避重试':slot.status?'历史补数中':'等待首次同步',error=slot.last_error||slot.backfill_last_error||'';return `<div class="sync-upstream-key"><b>${esc(slot.label||'未命名 Key')}</b><span class="sync-status ${syncStateClass(state.level)}">${esc(state.label)}</span><small>${esc(slotHistory)}${slot.last_success_at?` · 最近 ${syncTime(slot.last_success_at)}`:''}${error?`<br><span class="history-error">${esc(error)}</span>`:''}</small></div>`}).join('')}</details>`:'';
     const pricingTotal=+u.pricing_backfill_total_hours||0;
     const pricingPercent=pricingTotal?Math.min(100,(+u.pricing_verified_hours||0)*100/pricingTotal):0;
     const pricingContent=!u.pricing_ledger_worker_enabled
@@ -2561,7 +2563,7 @@ function syncRenderChannels(report){
 	  <section class="sync-upstream-lane" style="grid-column:1/-1"><header><b>上游错误证据</b><span class="sync-status ${errorLog.level}">${esc(errorLog.label)}</span></header>${errorLogContent}</section>
     </div></article>`;
   }).join('');
-  el.innerHTML=`<div class="sync-upstream-summary"><div><small>已配置账户</small><b>${fmtNum(domains.length)}</b></div><div><small>余额同步正常</small><b>${fmtNum(balanceHealthy)}/${fmtNum(enabledAccounts)}</b></div><div><small>已开启消费同步</small><b>${fmtNum(usageEnabled)}</b></div><div><small>当天 Tail 正常</small><b>${fmtNum(usageHealthy)}/${fmtNum(usageEnabled)}</b></div><div><small>历史补数完成</small><b>${fmtNum(historyComplete)}/${fmtNum(usageEnabled)}</b></div><div><small>历史任务退避</small><b>${fmtNum(historyRetry)}</b></div></div><div class="sync-upstream-list">${cards}</div>`;
+  el.innerHTML=`<div class="sync-upstream-summary"><div><small>已配置账户</small><b>${fmtNum(domains.length)}</b></div><div><small>余额同步正常</small><b>${fmtNum(balanceHealthy)}/${fmtNum(enabledAccounts)}</b></div><div><small>已开启消费同步</small><b>${fmtNum(usageEnabled)}</b></div><div><small>当天 Tail 正常</small><b>${fmtNum(usageHealthy)}/${fmtNum(usageEnabled)}</b></div><div><small>历史补数完成</small><b>${fmtNum(historyComplete)}/${fmtNum(usageEnabled)}</b></div><div><small>历史任务退避</small><b>${fmtNum(historyRetry)}</b></div><div><small>历史任务已暂停</small><b>${fmtNum(historyPaused)}</b></div></div><div class="sync-upstream-list">${cards}</div>`;
   return level;
 }
 function syncRenderCostClosure(report){
@@ -3507,6 +3509,15 @@ function renderGrpPick(q){
   menu.innerHTML=items.map(it=>`<div data-pick="${it.gid}" class="${String(it.gid)===cur?'on':''}">${esc(it.name)}<span class="pm-sub">${it.n} 人</span></div>`).join('');
   menu.hidden=false;
 }
+// Only finite profile values count as known; a missing profile is not a zero balance.
+function usageAccumulateProfile(total,user){
+  if(Number.isFinite(user.total_used_usd)){total.used+=user.total_used_usd;total.usedKnown++}
+  if(Number.isFinite(user.balance_usd)){total.bal+=user.balance_usd;total.balKnown++}
+}
+function usageProfileAmount(amount,known,total){
+  const value=known>0?fmtCost(amount):'—';
+  return value+(known<total?`<small class="usage-profile-note">已取得 ${known}/${total} 人</small>`:'');
+}
 // 分组汇总卡条:全部 | 各公司(按累计总消耗降序,稳定) | 未分组;卡=人数/消耗/余额,点选筛选,「详情」进公司页
 function renderGrpCards(){
   const box=document.getElementById('usageGrpCards');
@@ -3514,12 +3525,11 @@ function renderGrpCards(){
   if(!all.length){box.innerHTML='';return}
   const matrixAvailable=!usageMxCache||usageMxCache._matrixAvailable!==false;
   const rangePartial=!!(usageMxCache&&usageMxCache._rangePartial);
-  const agg=new Map(); // gid -> {name, n, total, bal, balKnown}
+  const agg=new Map(); // gid -> usage totals and independent profile coverage
   for(const u of all){
     const gid=+u.group_id||0;
-    const a=agg.get(gid)||{name:gid===0?'未分组':(u.group_name||('#'+gid)),n:0,total:0,used:0,bal:0,balKnown:false};
-    a.n++; a.total+=(+u.total_usd||0); a.used+=(+u.total_used_usd||0);
-    if(u.balance_usd!=null){a.bal+=(+u.balance_usd);a.balKnown=true}
+    const a=agg.get(gid)||{name:gid===0?'未分组':(u.group_name||('#'+gid)),n:0,total:0,used:0,usedKnown:0,bal:0,balKnown:0};
+    a.n++; a.total+=(+u.total_usd||0);usageAccumulateProfile(a,u);
     agg.set(gid,a);
   }
   let groups=[...agg.entries()].filter(([gid])=>gid!==0).sort((x,y)=>y[1].used-x[1].used); // 按累计总消耗降序,与日期区间无关、顺序稳定
@@ -3540,8 +3550,8 @@ function renderGrpCards(){
   const card=(gid,a)=>{
     return `<div class="grpcard${usageFilterGid===gid?' active':''}" data-gid="${gid}">
       <div class="g-top"><span class="g-ico">${gid===0?'📂':'🏢'}</span><span class="g-nm" title="${esc(a.name)}">${esc(a.name)}</span><a href="javascript:void 0" class="g-link" data-gdetail="${gid}" data-glabel="${esc(a.name)}">详情 →</a></div>
-      <div class="g-sub">${a.n} 人 · 总消耗 <b style="color:#fbbf24">${fmtCost(a.used)}</b></div>
-      <div class="g-sub">余额 ${a.balKnown?`<span style="color:#34d399">${fmtCost(a.bal)}</span>`:'—'} · ${rangePartial?'已展示范围':'范围'} ${matrixAvailable?fmtCost(a.total):'—'}</div>
+      <div class="g-sub">${a.n} 人 · 总消耗 <b class="usage-profile-value" style="color:#fbbf24">${usageProfileAmount(a.used,a.usedKnown,a.n)}</b></div>
+      <div class="g-sub">余额 <span class="usage-profile-value" style="color:#34d399">${usageProfileAmount(a.bal,a.balKnown,a.n)}</span> · ${rangePartial?'已展示范围':'范围'} ${matrixAvailable?fmtCost(a.total):'—'}</div>
     </div>`;};
   const allCard=`<div class="grpcard g-all${usageFilterGid===null?' active':''}" data-gid="">
       <div class="g-top"><span class="g-ico">👥</span><span class="g-nm">全部用户</span></div>
@@ -3574,11 +3584,11 @@ function renderUsageSummary(){
   if(!users.length){el.innerHTML='';return}
   const matrixAvailable=!usageMxCache||usageMxCache._matrixAvailable!==false;
   const rangePartial=!!(usageMxCache&&usageMxCache._rangePartial);
-  let used=0,range=0,bal=0,balKnown=false;
-  for(const u of users){used+=(+u.total_used_usd||0);range+=(+u.total_usd||0);if(u.balance_usd!=null){bal+=(+u.balance_usd);balKnown=true}}
-  el.innerHTML=`<span class="us-item"><span class="us-l">关注客户累计总消耗</span><span class="us-v amber" title="当前关注名单的终身累计，不受日期范围影响">${fmtCost(used)}</span></span>`
+  const profile={used:0,usedKnown:0,bal:0,balKnown:0};let range=0;
+  for(const u of users){usageAccumulateProfile(profile,u);range+=(+u.total_usd||0)}
+  el.innerHTML=`<span class="us-item"><span class="us-l">关注客户累计总消耗</span><span class="us-v amber" title="当前关注名单的终身累计，不受日期范围影响">${usageProfileAmount(profile.used,profile.usedKnown,users.length)}</span></span>`
     +`<span class="us-sep"></span><span class="us-item"><span class="us-l">${rangePartial?'已展示范围消费':'范围消费'}</span><span class="us-v" title="${matrixAvailable?(rangePartial?'当前已展示日期范围内消费合计':'所选日期范围内消费合计'):'每日消费明细暂不可用'}">${matrixAvailable?fmtCost(range):'—'}</span></span>`
-    +`<span class="us-sep"></span><span class="us-item"><span class="us-l">当前总余额</span><span class="us-v green">${balKnown?fmtCost(bal):'—'}</span></span>`
+    +`<span class="us-sep"></span><span class="us-item"><span class="us-l">当前总余额</span><span class="us-v green">${usageProfileAmount(profile.bal,profile.balKnown,users.length)}</span></span>`
     +`<span class="us-sep"></span><span class="us-item"><span class="us-l">关注客户数</span><span class="us-v">${fmtNum(users.length)}</span></span>`;
 }
 // 消费矩阵渲染:行=用户 × 列=日期(格=当日消耗)+ 余额/累计总消耗/范围 + 合计行,含热力与越权前的用户链接。

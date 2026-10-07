@@ -1209,6 +1209,19 @@ func TestAICodeWithSlotViewsUsePublishedAccountBackfillCompletion(t *testing.T) 
 	if len(views) != 1 || views[0].BackfillDone || views[0].BackfillLastError != "legacy timeout" || views[0].BackfillNextSyncAt != 99 || views[0].BackfillConsecutiveFails != 2 {
 		t.Fatalf("genuinely incomplete credential set was hidden by compatibility projection: %+v", views)
 	}
+	if views[0].BackfillPaused {
+		t.Fatal("scheduled per-key retry must not be presented as paused")
+	}
+	states[0].BackfillNextSyncAt = upstreamAccountIsolatedUntil
+	views = m.aicodeWithSlotViewsFromStates(row, states)
+	if !views[0].BackfillPaused || views[0].BackfillDone {
+		t.Fatal("isolated per-key history must be presented as paused")
+	}
+	row.UsageBackfillDone = true
+	views = m.aicodeWithSlotViewsFromStates(row, states)
+	if views[0].BackfillPaused || !views[0].BackfillDone {
+		t.Fatal("published completion must supersede a legacy per-key pause")
+	}
 }
 
 func TestReconcileAICodeWithPublishedBackfillStatesOnlyRepairsCurrentCredentialSet(t *testing.T) {

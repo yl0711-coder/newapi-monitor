@@ -27,6 +27,21 @@ function billSyncTime(value){
   if(!Number.isFinite(ts)||ts<=0||!Number.isFinite(date.getTime()))return '';
   return date.toLocaleString('zh-CN',{timeZone:'Asia/Shanghai',year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',hour12:false});
 }
+// Freshness is supplied by the backend using the same limit as balance alerts.
+// Never hide a known old balance, or mistake a disabled/failed worker for current data.
+function balanceSnapshot(account={}){
+  const hasBalance=known(account.balance_usd),phase=account.balance_effective_status||account.status;
+  const verified=hasBalance&&account.balance_fresh===true&&phase==='ok'&&account.enabled!==false&&account.balance_worker_enabled!==false;
+  if(verified)return {known:true,verified:true,note:''};
+  let label='余额时效待确认';
+  if(!hasBalance)label='余额尚未取得';
+  else if(account.enabled===false||phase==='disabled')label='余额同步已停用';
+  else if(['paused','reconnect','global_off'].includes(phase)||account.balance_worker_enabled===false)label='余额同步已暂停';
+  else if(phase==='error')label='余额同步失败';
+  else if(account.balance_fresh===false||phase==='stale'||phase==='pending'||phase==='queued')label='余额待更新';
+  const synced=billSyncTime(account.last_success_at);
+  return {known:hasBalance,verified:false,note:[label,hasBalance&&synced?`最近同步 ${synced}（北京）`:'','近期余额请到上游官网核对'].filter(Boolean).join(' · ')};
+}
 function billSyncNote(domain){
   const account=domain.upstream||{},usage=billView(domain).usage;
   if(!account.configured&&!usage.available)return '';
@@ -94,8 +109,9 @@ function issues(report){
       continue;
     }
     if(domain.missing_rate_channels>0)reasons.push(`${domain.missing_rate_channels} 个启用渠道缺少倍率配置，不能据此核验渠道成本`);
-    if(!known(account.balance_usd))reasons.push('余额未取得，未计入余额汇总');
-    else if(['error','reconnect','stale'].includes(account.status))reasons.push('余额同步异常或已陈旧，当前展示最近一次已取得余额');
+    const balance=balanceSnapshot(account);
+    if(!balance.known)reasons.push('余额未取得，未计入余额汇总');
+    else if(!balance.verified)reasons.push(balance.note+'；当前展示最近一次已取得余额');
     if(account.usage_sync_enabled){
       if(!usage.available)reasons.push(integrityReasons[usage.integrity_status]||'所选区间暂无消费账单，未计入消费汇总');
       else{
@@ -133,5 +149,5 @@ function render(report){
   return `<p class="muted">渠道管理当前日期范围（全部账户）：${esc(time(meta.from_ts))} → ${esc(time(meta.to_ts))}（结束时间不含）。仅检查本地数据，不触发补数。</p>`+
     (rows.length?`<div class="sync-status bad">${rows.length} 项数据异常 / 待核验</div><div class="sync-upstream-list">${rows.map(row=>`<article class="sync-upstream-account"><b class="sync-upstream-error">${esc(row.scope)}</b><p class="sync-upstream-error">${esc(row.detail)}</p></article>`).join('')}</div>`:'<span class="sync-status ok">用量覆盖与可用账单校验通过</span>')+configurationNote+dailyNotes;
 }
-window.channelDataStatus={issues,note,render,known,billView,billRangeNote,billSyncNote};
+window.channelDataStatus={issues,note,render,known,billView,billRangeNote,billSyncNote,balanceSnapshot};
 })();

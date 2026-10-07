@@ -9,13 +9,15 @@ function fixture(file, exports) {
     if(!elements.has(id)){
       const classes=new Set();
       elements.set(id,{textContent:'',innerHTML:'',hidden:false,
-        classList:{toggle(name,on){if(on)classes.add(name);else classes.delete(name)},contains(name){return classes.has(name)}}});
+        querySelector(selector){return element(`${id}:${selector}`)},
+        classList:{add(...names){names.forEach(name=>classes.add(name))},remove(...names){names.forEach(name=>classes.delete(name))},toggle(name,on){if(on)classes.add(name);else classes.delete(name)},contains(name){return classes.has(name)}}});
     }
     return elements.get(id);
   };
   const context=vm.createContext({document:{getElementById:element,addEventListener(){}},window:{}});
+  if(file==='channel_management.js')vm.runInContext(readFileSync(new URL('../../monitor/channel_data_status.js',import.meta.url),'utf8'),context);
   const source=readFileSync(new URL(`../../monitor/${file}`,import.meta.url),'utf8');
-  const end=source.lastIndexOf('})();');
+  const end=Math.max(source.lastIndexOf('})();'),source.lastIndexOf('}());'));
   assert.ok(end>0);
   vm.runInContext(source.slice(0,end)+`\nglobalThis.fixture={${exports}};\n`+source.slice(end),context);
   return {api:context.fixture,element};
@@ -30,9 +32,26 @@ test('balance excludes owned credit only, preserving stopped suppliers, zeros an
   assert.equal(result.total,130);
   assert.equal(result.known.length,3);
   assert.equal(result.excluded.length,1);
+  assert.equal(result.unverified.length,3);
+  assert.equal(result.missing,2);
   assert.equal(own.upstream.balance_usd,1000000);
   assert.equal(api.upstreamBalanceSummary([own]).known.length,0);
   assert.equal(api.upstreamBalanceSummary([account(0)]).known.length,1);
+});
+
+test('finance incomplete coverage never rounds up to complete coverage',()=>{
+  const {api,element}=fixture('finance.js','setEvidence,userCoverage,domainHourCoverage,setGiftEvidence');
+  for(const [done,total,label] of [[3834,3835,'99.9%'],[1,3,'33.3%'],[0,24,'0.0%'],[24,24,'100.0%'],[0,0,'—']]){
+    api.setEvidence('coverage',done,total,'小时');
+    assert.equal(element('coverage:b').textContent,label);
+    assert.equal(element('coverage').classList.contains('ready'),total>0&&done===total);
+    const coverage={completed_hours:done,expected_hours:total};
+    assert.ok(api.userCoverage(coverage).endsWith(label));
+    assert.ok(api.domainHourCoverage(coverage).endsWith(label));
+  }
+  api.setGiftEvidence({expected_hours:3835,user_completed_hours:3834,credit_completed_hours:3835,complete:false});
+  assert.match(element('finGiftEvidence:span').textContent,/99\.9%/);
+  assert.equal(element('finGiftEvidence:b').textContent,'待补齐');
 });
 
 test('model coverage UI distinguishes real-time tail, unknown history and complete proof',()=>{

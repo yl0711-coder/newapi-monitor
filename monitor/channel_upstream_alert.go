@@ -195,11 +195,7 @@ func assessUpstreamBalance(account ChannelUpstreamAccountView, estimate upstream
 		assessment.Reason = "余额同步状态异常，暂不使用旧余额判断"
 		return assessment
 	}
-	maxBalanceAge := int64(syncMinutes * 3 * 60)
-	if maxBalanceAge < 30*60 {
-		maxBalanceAge = 30 * 60
-	}
-	if account.LastSuccessAt <= 0 || now-account.LastSuccessAt > maxBalanceAge {
+	if !upstreamBalanceFresh(account.LastSuccessAt, now, syncMinutes) {
 		assessment.Reason = "余额数据已过期"
 		return assessment
 	}

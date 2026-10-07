@@ -300,26 +300,29 @@ func (m *Monitor) RegisterRoutes(r *gin.Engine) {
 
 	// 需登录(管理员及以上):看监控
 	view := r.Group("/", m.requireRole(roleAdmin))
+	// 四个业务报表的 HTTP 响应禁止缓存，且覆盖鉴权提前返回。
+	// 不关闭服务端计算缓存/SQLite 快照，不改变其他模块的路由和鉴权。
+	reports := r.Group("/", noStoreSensitive, m.requireRole(roleAdmin))
 	{
 		view.GET("/", m.servePage)
 		view.GET("/monitor", m.servePage)
 		view.GET("/data", m.serveData)
 		view.GET("/monitor/data", m.serveData)
 		view.GET("/trend/long", m.serveLongTrend)
-		view.GET("/stability/report", m.serveStabilityReport) // 历史稳定性:只读 Monitor 本地 SQLite
-		view.GET("/stability/detail", m.serveStabilityDetail) // 单分组详情:按需加载渠道时间条/模型
-		view.GET("/stability/problems", m.serveStabilityProblems)
+		reports.GET("/stability/report", m.serveStabilityReport) // 历史稳定性:只读 Monitor 本地 SQLite
+		reports.GET("/stability/detail", m.serveStabilityDetail) // 单分组详情:按需加载渠道时间条/模型
+		reports.GET("/stability/problems", m.serveStabilityProblems)
 		view.GET("/alerts/rejections", noStoreSensitive, m.getRejectAlertsHandler)
 		view.GET("/stability/health", m.serveStabilityHealth)                             // 采集新鲜度/覆盖/积压:不查生产库
 		view.GET("/stability/edge", m.serveNginxEdge)                                     // Nginx 入口层:只读本地脱敏分钟汇总
 		view.POST("/nginx/evidence/lookup", noStoreSensitive, m.serveNginxEvidenceLookup) // 精确 Request ID 证据查询：只读独立本地库
 		view.GET("/sync/overview", m.serveSyncOverview)                                   // 统一同步摘要:只读本地状态投影
 		view.GET("/sync/workloads", m.serveSyncWorkloads)                                 // 有界任务明细:默认仅异常成员,支持分页
-		view.GET("/channels/report", m.serveChannelManagementReport)                      // 渠道管理:主域名→厂商→渠道→服务分组的本地汇总
-		view.GET("/channels/data-status", m.serveChannelDataStatus)                       // 同口径的轻量只读诊断，不读取用量维度
-		view.GET("/channels/economics", m.serveChannelEconomicsReport)                    // 渠道成本:只读本地不可变经济账当前发布头
-		view.GET("/finance/report", m.serveFinanceOperatingReport)                        // 经营核算:只读已发布渠道经济事实
-		view.GET("/finance/internal-accounts", m.serveFinanceInternalAccounts)            // 经营核算:内部测试账号本地配置
+		reports.GET("/channels/report", m.serveChannelManagementReport)                   // 渠道管理:主域名→渠道→服务分组的本地汇总
+		reports.GET("/channels/data-status", m.serveChannelDataStatus)                    // 同口径的轻量只读诊断，不读取用量维度
+		reports.GET("/channels/economics", m.serveChannelEconomicsReport)                 // 渠道成本:只读本地不可变经济账当前发布头
+		reports.GET("/finance/report", m.serveFinanceOperatingReport)                     // 经营核算:只读已发布渠道经济事实
+		reports.GET("/finance/internal-accounts", m.serveFinanceInternalAccounts)         // 经营核算:内部测试账号本地配置
 		// 排障两个接口挂 noStoreSensitive：响应含客户标识、令牌名、渠道名/ID、
 		// 上游主域名与错误原文，属敏感诊断数据，不得被任何中间层缓存。
 		// 用中间件而非在 handler 里逐个 c.Header：handler 有多条提前 return
@@ -345,20 +348,20 @@ func (m *Monitor) RegisterRoutes(r *gin.Engine) {
 		view.GET("/group-governance/export.csv", noStoreSensitive, m.exportGroupGovernanceCSV)
 		// noStoreSensitive 必须挂：响应含公司名、用户名、user_id、消耗金额与故障归因，
 		// 属客户可识别信息，不得进浏览器磁盘缓存或任何中间缓存。
-		view.GET("/customer-health/report", noStoreSensitive, m.serveCustomerHealthReport)   // 客户维护:名单内公司今日稳定性(只读本地事实)
-		view.GET("/customer-health/groups", noStoreSensitive, m.listCustomerHealthGroups)    // 客户维护:独立公司名单
-		view.GET("/customer-health/members", noStoreSensitive, m.listCustomerHealthMembers)  // 客户维护:独立成员名单
-		view.GET("/model-statistics/report", noStoreSensitive, m.serveModelStatisticsReport) // 模型统计:分组模型请求次数(只读本地事实)
-		view.GET("/usage/users", m.listTrackedUsers)                                         // 用户用量:被盯名单(含分组)
-		view.GET("/usage/groups", m.listGroups)                                              // 用户用量:客户分组列表
-		view.GET("/usage/followups", m.usageAggregateAuthorizationGuard(m.serveFollowUps))   // 用户用量:待跟进清单
-		view.GET("/usage/followups/log", m.listFollowLogs)                                   // 用户用量:某客户跟进记录
-		view.GET("/usage/settings", m.getUsageSettings)                                      // 用户用量:跟进阈值(读)
-		view.GET("/usage/matrix", m.usageAggregateAuthorizationGuard(m.serveUsageMatrix))    // 用户用量:列表页矩阵(前端渲染 行=用户×列=日期,格=当日费用)
-		view.GET("/usage/stats", m.usageAggregateAuthorizationGuard(m.serveUsageStats))      // 用户用量:单用户详情聚合(每日/分组/模型/费用)
-		view.GET("/usage/cache-stats", m.serveUsageCacheStats)                               // 用户用量缓存:无敏感信息的运维计数
-		view.GET("/usage/facts-status", m.serveUsageFactsStatus)                             // 用户用量本地事实层:覆盖率/同步状态(只读 Monitor SQLite)
-		view.GET("/usage/facts-history", m.serveUsageFactHistoryStatus)                      // 全历史逐成员阶段/水位/失败原因(只读本地)
+		view.GET("/customer-health/report", noStoreSensitive, m.serveCustomerHealthReport)    // 客户维护:名单内公司今日稳定性(只读本地事实)
+		view.GET("/customer-health/groups", noStoreSensitive, m.listCustomerHealthGroups)     // 客户维护:独立公司名单
+		view.GET("/customer-health/members", noStoreSensitive, m.listCustomerHealthMembers)   // 客户维护:独立成员名单
+		view.GET("/model-statistics/report", noStoreSensitive, m.serveModelStatisticsReport)  // 模型统计:分组模型请求次数(只读本地事实)
+		reports.GET("/usage/users", m.listTrackedUsers)                                       // 用户用量:被盯名单(含分组)
+		reports.GET("/usage/groups", m.listGroups)                                            // 用户用量:客户分组列表
+		reports.GET("/usage/followups", m.usageAggregateAuthorizationGuard(m.serveFollowUps)) // 用户用量:待跟进清单
+		reports.GET("/usage/followups/log", m.listFollowLogs)                                 // 用户用量:某客户跟进记录
+		reports.GET("/usage/settings", m.getUsageSettings)                                    // 用户用量:跟进阈值(读)
+		reports.GET("/usage/matrix", m.usageAggregateAuthorizationGuard(m.serveUsageMatrix))  // 用户用量:列表页矩阵(前端渲染 行=用户×列=日期,格=当日费用)
+		reports.GET("/usage/stats", m.usageAggregateAuthorizationGuard(m.serveUsageStats))    // 用户用量:单用户详情聚合(每日/分组/模型/费用)
+		view.GET("/usage/cache-stats", m.serveUsageCacheStats)                                // 用户用量缓存:无敏感信息的运维计数
+		view.GET("/usage/facts-status", m.serveUsageFactsStatus)                              // 用户用量本地事实层:覆盖率/同步状态(只读 Monitor SQLite)
+		view.GET("/usage/facts-history", m.serveUsageFactHistoryStatus)                       // 全历史逐成员阶段/水位/失败原因(只读本地)
 		view.GET("/me", me)
 	}
 
