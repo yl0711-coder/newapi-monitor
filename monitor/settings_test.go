@@ -270,6 +270,20 @@ func TestLoadSettingsUpstreamUsageSyncDefaultsToGrayOff(t *testing.T) {
 	}
 }
 
+func TestLoadSettingsHistoricalUsageRepairDefaultsToGrayOff(t *testing.T) {
+	t.Setenv("MONITOR_UPSTREAM_USAGE_HISTORY_REPAIR_ENABLED", "")
+	t.Setenv("MONITOR_UPSTREAM_USAGE_HISTORY_REPAIR_DOMAINS", "")
+	if LoadSettings().UpstreamUsageHistoryRepairEnabled {
+		t.Fatal("historical usage repair must stay disabled unless explicitly enabled")
+	}
+	t.Setenv("MONITOR_UPSTREAM_USAGE_HISTORY_REPAIR_ENABLED", "true")
+	t.Setenv("MONITOR_UPSTREAM_USAGE_HISTORY_REPAIR_DOMAINS", "taoken.ai")
+	settings := LoadSettings()
+	if !settings.UpstreamUsageHistoryRepairEnabled || len(settings.UpstreamUsageHistoryRepairDomains) != 1 || settings.UpstreamUsageHistoryRepairDomains[0] != "taoken.ai" {
+		t.Fatal("explicit repair gate was ignored")
+	}
+}
+
 func TestLoadSettingsUpstreamPricingLedgerDefaultsToFailClosed(t *testing.T) {
 	t.Setenv("MONITOR_UPSTREAM_PRICING_LEDGER_ENABLED", "")
 	t.Setenv("MONITOR_UPSTREAM_PRICING_LEDGER_DOMAINS", "")

@@ -943,8 +943,8 @@ func (m *Monitor) openStore(path string) error {
 		&StabilityProblemIngestState{}, &StabilityProblemStage{}, &StabilityProblemClassificationMigration{}, &StabilityProblemLiveCursor{},
 		&StabilityHourIngestState{}, &StabilityBackfillJob{},
 		&ChannelFinanceSetting{}, &ChannelSaleGroupRate{}, &ChannelBusinessGroupPolicy{}, &WebsiteGroupCatalog{}, &ChannelDomainCost{}, &ChannelDomainGroupCost{}, &ChannelFinanceChannelCost{}, &ChannelFinanceVersion{},
-		&FinanceInternalAccount{}, &FinanceInternalAccountAudit{},
-		&ChannelUpstreamAccount{}, &ChannelUpstreamRetirement{}, &ChannelUpstreamUsageHour{}, &ChannelUpstreamUsageArchive{}, &ChannelUpstreamErrorLog{}, &ChannelUpstreamErrorLogArchive{}, &UpstreamErrorLogSyncState{}, &ChannelUpstreamFundEvent{}, &UpstreamFundSyncState{}, &NewAPIUsageBackfillCheckpoint{}, &NewAPIUsageBackfillSegment{}, &AICodeWithKeySyncState{}, &AICodeWithUsageStage{}, &AICodeWithUsageRound{}, &UpstreamHostCircuit{},
+		&FinanceInternalAccount{}, &FinanceInternalAccountAudit{}, &FinanceChannelDomainPeriod{},
+		&ChannelUpstreamAccount{}, &ChannelUpstreamRetirement{}, &ChannelUpstreamUsageHour{}, &ChannelUpstreamUsageArchive{}, &ChannelUpstreamHistoricalRepair{}, &ChannelUpstreamErrorLog{}, &ChannelUpstreamErrorLogArchive{}, &UpstreamErrorLogSyncState{}, &ChannelUpstreamFundEvent{}, &UpstreamFundSyncState{}, &NewAPIUsageBackfillCheckpoint{}, &NewAPIUsageBackfillSegment{}, &AICodeWithKeySyncState{}, &AICodeWithUsageStage{}, &AICodeWithUsageRound{}, &UpstreamHostCircuit{},
 		&ChannelUpstreamPricingHourEvidence{}, &ChannelUpstreamPricingHourState{}, &ChannelUpstreamPricingObservedState{}, &ChannelUpstreamPricingChangeEvent{}, &ChannelUpstreamPricingSyncState{}, &ChannelUpstreamPricingPageCheckpoint{}, &AICodeWithPricingCheckpoint{},
 		&ChannelUpstreamCostHourEvidence{}, &ChannelUpstreamCostHourState{}, &ChannelCostPageCheckpoint{}, &ChannelCostSourceBinding{}, &ChannelCostDirtyHour{}, &ChannelCostKeyRegistry{},
 		&ChannelPricingChangeProposal{}, &ChannelPricingProposalEvent{}, &ChannelFinanceActivation{}, &ChannelFinanceActivationSlot{}, &ChannelFinanceActivationEvent{},
@@ -1340,7 +1340,12 @@ func (m *Monitor) replaceChannelSnapsAuthoritative(rows []ChannelSnap, now int64
 	}
 	return m.storeDB.Transaction(func(tx *gorm.DB) error {
 		if len(rows) > 0 {
-			if err := tx.Clauses(clause.OnConflict{
+			if err := recordFinanceChannelDomains(tx, rows, now); err != nil {
+				return err
+			}
+			// GORM otherwise replaces UpdatedAt with its own wall clock during
+			// upsert. Keep the authoritative observation time for change windows.
+			if err := tx.Session(&gorm.Session{NowFunc: func() time.Time { return time.Unix(now, 0) }}).Clauses(clause.OnConflict{
 				Columns:   []clause.Column{{Name: "id"}},
 				UpdateAll: true,
 			}).CreateInBatches(rows, 200).Error; err != nil {
@@ -2052,17 +2057,32 @@ type infraLatestRow struct {
 
 // storeInfraLatest 返回每个 (资源,指标) 的最新一条取值。
 func (m *Monitor) storeInfraLatest() []infraLatestRow {
-	m.infraAggregateMu.Lock()
+	rows, err := m.storeInfraLatestContext(context.Background())
+	if err != nil {
+		slog.Warn("读取基础设施最新指标失败", "err", err)
+	}
+	return rows
+}
+
+func (m *Monitor) storeInfraLatestContext(ctx context.Context) ([]infraLatestRow, error) {
+	ctx, cancel := context.WithTimeout(ctx, infraReadTimeout)
+	defer cancel()
+	if err := m.lockInfraAggregate(ctx); err != nil {
+		return nil, err
+	}
 	defer m.infraAggregateMu.Unlock()
 
 	var rows []infraLatestRow
 	// 取每个 (resource,rtype,metric) 的最大 bucket_ts 对应行。rtype 必须
 	// 参与键，否则同名 AWS/Host 指标在相同时间可能产生不确定覆盖。
-	warnReadErr("storeInfraLatest", m.storeDB.Raw(`SELECT s.resource, s.rtype, s.metric, s.value, s.bucket_ts
+	err := m.storeDB.WithContext(ctx).Raw(`SELECT s.resource, s.rtype, s.metric, s.value, s.bucket_ts
 		FROM infra_samples s
 		JOIN (SELECT resource, rtype, metric, MAX(bucket_ts) AS mx FROM infra_samples GROUP BY resource, rtype, metric) t
-		  ON s.resource=t.resource AND s.rtype=t.rtype AND s.metric=t.metric AND s.bucket_ts=t.mx`).Scan(&rows))
-	return rows
+		  ON s.resource=t.resource AND s.rtype=t.rtype AND s.metric=t.metric AND s.bucket_ts=t.mx`).Scan(&rows).Error
+	if err != nil {
+		return nil, err
+	}
+	return rows, nil
 }
 
 // InfraPoint 是 infra 指标的一个时间点(供趋势小图)。
@@ -2073,10 +2093,23 @@ type InfraPoint struct {
 
 // storeInfraSeries 返回某资源某指标自 since 起的时序(升序),供趋势小图(如 DB 内存/swap)。
 func (m *Monitor) storeInfraSeries(resource, metric string, since int64) []InfraPoint {
-	var pts []InfraPoint
-	warnReadErr("storeInfraSeries", m.storeDB.Raw(`SELECT bucket_ts AS ts, value FROM infra_samples
-		WHERE resource=? AND metric=? AND bucket_ts >= ? ORDER BY bucket_ts`, resource, metric, since).Scan(&pts))
+	pts, err := m.storeInfraSeriesContext(context.Background(), resource, metric, since)
+	if err != nil {
+		slog.Warn("读取基础设施趋势失败", "err", err)
+	}
 	return pts
+}
+
+func (m *Monitor) storeInfraSeriesContext(ctx context.Context, resource, metric string, since int64) ([]InfraPoint, error) {
+	ctx, cancel := context.WithTimeout(ctx, infraReadTimeout)
+	defer cancel()
+	var pts []InfraPoint
+	err := m.storeDB.WithContext(ctx).Raw(`SELECT bucket_ts AS ts, value FROM infra_samples
+		WHERE resource=? AND metric=? AND bucket_ts >= ? ORDER BY bucket_ts`, resource, metric, since).Scan(&pts).Error
+	if err != nil {
+		return nil, err
+	}
+	return pts, nil
 }
 
 func (m *Monitor) pruneInfraOlderThan(cutoffTs int64) (int64, error) {

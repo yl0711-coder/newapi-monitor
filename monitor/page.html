@@ -906,7 +906,7 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
     <summary><span><b>核算缺口与待归属成本</b><small>财务或研发核对使用；不影响老板查看已核验结论</small></span><em id="finPairingSummary">待读取</em></summary>
     <div class="fin-disclosure-body">
       <article class="fin-card"><header><div><h3>历史成本补证计划</h3><p>只读本地估算，不会创建同步任务或访问上游；“能补倍率证据”不等于“能闭合渠道成本”</p></div><span id="finEvidenceRolloutSummary">待读取</span></header><div class="fin-closure-overview" id="finEvidenceRollout"><span><small>补证计划</small><b>待读取</b></span></div><div class="fin-table-wrap"><table class="fin-table fin-rollout-table"><thead><tr><th>上游主域名</th><th>平台</th><th>补采粒度</th><th class="num">已知修正成本</th><th class="num">估算读取 / 轮次</th><th>对闭环的作用</th><th>状态与边界</th></tr></thead><tbody id="finEvidenceRolloutRows"><tr><td colspan="7" class="fin-empty">进入页面后加载</td></tr></tbody></table></div></article>
-      <article class="fin-card"><header><div><h3>核算缺口审计</h3><p>只列出阻止毛利发布的真实原因；已有收入与未归属成本不会强行相减</p></div></header><div class="fin-pairing-coverage" id="finPairingCoverage"><span><small>配对账本范围</small><b>待读取</b></span></div><div class="fin-closure-overview" id="finClosureReadiness"><span><small>成本闭环准入</small><b>待读取</b></span></div><div class="fin-table-wrap"><table class="fin-table fin-gap-table"><thead><tr><th>阻断原因</th><th class="num">受影响行</th><th>上游主域名</th><th class="num">待配对收入</th><th class="num">待归属修正成本</th><th>说明</th></tr></thead><tbody id="finPairingRows"><tr><td colspan="6" class="fin-empty">进入页面后加载</td></tr></tbody></table></div></article>
+      <article class="fin-card"><header><div><h3>核算缺口审计</h3><p>只列出阻止毛利发布的真实原因；已有收入与未归属成本不会强行相减</p></div></header><div class="fin-pairing-coverage" id="finPairingCoverage"><span><small>配对账本范围</small><b>待读取</b></span></div><div class="fin-pairing-hours" id="finPairingHours"></div><div class="fin-closure-overview" id="finClosureReadiness"><span><small>成本闭环准入</small><b>待读取</b></span></div><div class="fin-table-wrap"><table class="fin-table fin-gap-table"><thead><tr><th>阻断原因</th><th class="num">受影响行</th><th>上游主域名</th><th class="num">待配对收入</th><th class="num">待归属修正成本</th><th>说明</th></tr></thead><tbody id="finPairingRows"><tr><td colspan="6" class="fin-empty">进入页面后加载</td></tr></tbody></table></div></article>
       <article class="fin-card"><header><div><h3>待归属上游成本来源</h3><p>来源标识已匿名化；分组名称候选不是令牌归属证据，不会自动绑定或改变核算金额</p></div><span id="finUnallocatedSourceSummary">待读取</span></header><div class="fin-table-wrap fin-source-detail-wrap"><table class="fin-table fin-source-detail-table"><thead><tr><th>上游主域名</th><th>匿名来源</th><th>上游分组</th><th>模型</th><th>分组名称候选（非归属证据）</th><th>证据时段</th><th class="num">小时</th><th class="num">请求</th><th class="num">账单原值</th></tr></thead><tbody id="finUnallocatedSourceRows"><tr><td colspan="9" class="fin-empty">进入页面后加载</td></tr></tbody></table></div></article>
     </div>
   </details>
@@ -1041,7 +1041,8 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
         <span>余额默认每 5 分钟同步；使用数据仅在显式开启后低频汇总到 Monitor 本地，页面查询不会访问上游。</span>
       </section>
       <section class="cm-upstream-fields">
-        <label><span>中转站类型</span><select id="cmUpstreamProvider"><option value="newapi">NewAPI</option><option value="sub2api">Sub2API</option><option value="aicodewith">AICodeWith（春秋）</option><option value="tokenforce">海南海纳（TokenForce MaaS）</option></select></label>
+        <label><span>中转站类型</span><select id="cmUpstreamProvider"><option value="newapi">NewAPI</option><option value="sub2api">Sub2API</option><option value="aicodewith">AICodeWith（春秋）</option><option value="tokenforce">海南海纳（TokenForce MaaS）</option><option value="openox">OpenOx</option></select></label>
+        <label class="cm-upstream-openox wide" hidden><span>OpenOx 后台令牌</span><input id="cmUpstreamOpenOxToken" type="password" autocomplete="new-password" placeholder="已配置时留空保持原连接"><small>登录 https://api.openox.net → 开发者工具 → Application → Local Storage → 当前站点 → auth_token。不是模型 Key；到期需重新登录并导入。余额仅指可用钱包，不含订阅额度；用量包含订阅抵扣，暂不计算现金修正成本和可用天数。订阅订单及退款暂不作为充值流水导入。</small></label>
         <label class="wide"><span>站点地址</span><input id="cmUpstreamBaseURL" type="url" placeholder="https://example.com" autocomplete="url"><small>填写站点根地址，不要追加 API 路径</small></label>
         <label class="cm-upstream-newapi"><span>用户 ID</span><input id="cmUpstreamUserID" type="number" min="1" step="1" inputmode="numeric" placeholder="例如 123"></label>
         <label class="cm-upstream-newapi wide"><span>用户访问令牌</span><input id="cmUpstreamAccessToken" type="password" autocomplete="new-password" placeholder="已配置时留空表示保持不变"><small>个人设置中的系统访问令牌，不是模型调用 Key</small></label>
@@ -1051,7 +1052,7 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
         <label class="cm-upstream-sub2api cm-upstream-sub2-password wide"><span>登录密码</span><input id="cmUpstreamPassword" type="password" autocomplete="new-password" placeholder="已连接时留空表示沿用当前会话"><small>适用于没有验证码或 Turnstile 的站点；密码只用于本次换取令牌</small></label>
         <label class="cm-upstream-sub2api cm-upstream-sub2-refresh wide" hidden><span>Refresh Token</span><input id="cmUpstreamRefreshToken" type="password" autocomplete="new-password" placeholder="从上游浏览器已登录会话复制"><small>先在上游完成登录，再从浏览器开发者工具 → Application（应用）→ Local Storage → 当前站点复制 refresh_token；Monitor 只通过官方刷新接口验证，输入值不原样保存、不回显</small></label>
         <label class="cm-upstream-tokenforce"><span>组织 ID（orgId）</span><input id="cmUpstreamOrgID" type="number" min="1" step="1" inputmode="numeric" placeholder="例如 123"><small>登录上游 → 浏览器开发者工具 Network → 刷新余额页，在 /api/orgs/数字/balance 中取该数字，或查看 usages 请求的 orgId。不是 tenantId、API Key ID 或令牌名。</small></label>
-        <label class="cm-upstream-tokenforce"><span>人民币结算换算</span><input id="cmUpstreamUnitPerUSD" type="number" min="0.000001" step="0.000001" inputmode="decimal" placeholder="每 1 USD 对应多少 CNY"><small>接口账面金额为 CNY；必须按结算口径配置 CNY/每 USD，不能把人民币直接当美元</small></label>
+        <label class="cm-upstream-tokenforce"><span>账面单位（固定 1:1）</span><input id="cmUpstreamUnitPerUSD" type="number" value="1" readonly tabindex="-1"><small>余额与消费按接口账面数值展示；成本仅按倍率配置中的“该主域名的上游充值比例”换算，不额外换汇。美元为平台统一展示口径。</small></label>
         <label class="cm-upstream-tokenforce wide"><span>Refresh Token</span><input id="cmUpstreamTokenForceRefreshToken" type="password" autocomplete="new-password" placeholder="从上游已登录浏览器会话复制"><small>登录前打开 Network，查看 /api/sys/login/password 或 /api/sys/login/refresh 的响应，复制 refreshToken（不是 accessToken 或模型 API Key）。直接填入这里，不要贴到聊天；优先使用专用只读账号，避免个人浏览器与 Monitor 互相轮换会话。</small></label>
         <section class="cm-upstream-aicodewith wide cm-upstream-key-field">
           <div class="cm-upstream-key-head"><span>AICodeWith API Keys</span><button type="button" id="cmUpstreamAddAPIKey">+添加 Key</button></div>
@@ -1063,6 +1064,12 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
       <label class="cm-upstream-enabled cm-upstream-usage-option"><input id="cmUpstreamUsageEnabled" type="checkbox"><span><b id="cmUpstreamUsageLabel">同步上游消费账单</b><small id="cmUpstreamUsageHelp">默认每 30 分钟串行汇总一次；当天水位和历史补数独立运行，不保存上游原始内容</small></span></label>
       <section class="cm-upstream-security"><b>凭据安全</b><span>访问令牌、Refresh Token 与 AICodeWith API Key 在本地 SQLite 中经 AES-256-GCM 加密；页面和接口只返回脱敏账户信息。Sub2API 与 TokenForce 的 refresh token 轮换会原子更新。</span></section>
     </div>
+    <section class="cm-upstream-note" id="cmUpstreamRecovery" hidden>
+      <label for="cmUpstreamRecoveryTask">恢复失败的同步任务</label>
+      <select id="cmUpstreamRecoveryTask"><option value="balance">余额</option><option value="usage">消费同步</option><option value="usage_history">历史消费补采</option><option value="funds">充值及额度调整</option><option value="pricing">计价明细</option><option value="error_logs">错误日志</option></select>
+      <button type="button" class="cm-upstream-sync" id="cmUpstreamRecover">检测并恢复</button>
+      <small>仅使用已保存配置；遵守冷却时间，不开启已关闭任务，不清空历史数据。检测通过后等待后台实际同步。</small>
+    </section>
     <footer><span id="cmUpstreamMessage"></span><div><button type="button" class="cm-upstream-cancel" id="cmUpstreamCancel">取消</button><button type="button" class="cm-upstream-sync" id="cmUpstreamSync" hidden>同步余额</button><button type="button" class="cm-upstream-sync" id="cmUpstreamUsageSync" hidden>同步消费</button><button type="button" class="cm-upstream-sync" id="cmUpstreamFundsSync" hidden>同步资金流水</button><button type="button" class="cm-upstream-save" id="cmUpstreamSave">保存并验证</button></div></footer>
   </aside>
 </div>
@@ -1471,13 +1478,14 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
 
 <script src="/stability.js?v=6"></script>
 <script src="/channel-data-status.js?v=2"></script>
+<script src="/channel-pricing-observations.js?v=1"></script>
 <script src="/channel-management.js?v=17"></script>
 <script src="/logchain.js?v=15"></script>
 <script src="/customer-health.js?v=3"></script>
 <script src="/alerts.js?v=1"></script>
 <script src="/capacity.js?v=2"></script>
 <script src="/group-governance.js?v=1"></script>
-<script src="/finance.js?v=56"></script>
+<script src="/finance.js?v=57"></script>
 <script src="/model-statistics.js?v=3"></script>
 <script src="/infra-assets.js?v=1"></script>
 <script src="/ecs-log-sources.js?v=1"></script>
@@ -2102,13 +2110,16 @@ async function drawGroup(host,res,g){
   const wrap=host.querySelector('.mc-charts');if(!wrap||!g)return;
   const me=res.metrics||{};
   const items=g.combined?[{combined:true}]:g.metrics;
-  wrap.innerHTML=items.map((it,i)=>{
+  const chartHTML=items.map((it,i)=>{
     const head=g.combined?`<span class="muted">${g.label}</span> <span class="muted" style="font-weight:400">· 近6h</span>`:metricHead(it,me);
     return `<div style="flex:1;min-width:300px"><div style="font-size:12px;margin-bottom:6px">${head}</div><div class="mc-c" data-i="${i}" style="width:100%;height:180px"></div></div>`;
   }).join('');
   let series={};
   try{const r=await fetch('/infra/series?resource='+encodeURIComponent(res.name)+'&metrics='+encodeURIComponent(g.metrics.map(mm=>mm.m).join(','))+'&hours=6');
-    if(r.ok){const d=await r.json();series=d.series||{};}}catch(e){}
+    if(r.status===401){location.href='/login';return}
+    const d=await r.json();if(!r.ok||!d.series)throw new Error(d.error||'趋势数据暂不可用');series=d.series;
+  }catch(e){const previous=wrap.querySelector('[data-series-error]');if(previous)previous.remove();wrap.insertAdjacentHTML('afterbegin','<div data-series-error class="alert">趋势刷新失败:'+esc(e.message)+'；如已有曲线，则为上次成功结果。</div>');return;}
+  wrap.innerHTML=chartHTML;
   if(typeof echarts==='undefined')return;
   const cdivs=wrap.querySelectorAll('.mc-c');
   const waiting='<div class="muted" style="height:48px;display:flex;align-items:center">历史数据积累中（至少需要 2 个采样点）</div>';
@@ -2322,10 +2333,11 @@ async function loadInfra(){
     const res=await fetch('/infra',{headers:{'Accept':'application/json'}});
     if(res.status===401){location.href='/login';return}
     const d=await res.json();const eb=document.getElementById('infraErr');
+    if(!res.ok)throw new Error(d.error||'服务端监控暂不可用');
     if(d.enabled===false){eb.innerHTML='<div class="alert">服务端监控未启用:设置 <code>MONITOR_INFRA_ENABLED=true</code> + AWS 只读凭证后生效。</div>';return}
     eb.innerHTML='';if(d.snapshot){renderInfra(d.snapshot);if(d.snapshot.registry_error)eb.innerHTML='<div class="alert">'+esc(d.snapshot.registry_error)+'</div>';}
     if(window.MonitorInfraAssets)await window.MonitorInfraAssets.load();
-  }catch(e){document.getElementById('infraErr').innerHTML='<div class="alert">加载失败:'+esc(e.message)+'</div>'}
+  }catch(e){document.getElementById('infraErr').innerHTML='<div class="alert">刷新失败:'+esc(e.message)+'；如已有展示，则为上次成功结果，本次未更新。</div>'}
 }
 function infraSchedule(){if(infraTimer)clearInterval(infraTimer);if(document.getElementById('infraAuto').checked)infraTimer=setInterval(loadInfra,60000)}
 function monitorHashParams(){return new URLSearchParams(location.hash.replace(/^#/,''))}
@@ -2576,7 +2588,7 @@ function syncRenderCostClosure(report){
 }
 function syncRenderFinanceFacts(report){
   const r=report||{},target=document.getElementById('syncFinanceFacts');
-  const statusMap={disabled:'未启用',waiting:'等待首次同步',backfilling:'历史回填中',caught_up:'已追平',error:'同步受阻',source_changed:'来源版本已变更',start_changed:'核算起点已变更'};
+  const statusMap={disabled:'未启用',waiting:'等待首次同步',backfilling:'历史小时采集中',caught_up:'小时采集已追平',error:'同步受阻',source_changed:'来源版本已变更',start_changed:'核算起点已变更'};
   const refresh=r.report_refresh||{};
   const reportFailures=refresh.unresolved_failures??refresh.recent_failures??0;
   const level=reportFailures?'bad':!r.enabled?'neutral':r.status==='caught_up'?'ok':(r.status==='error'||r.status==='source_changed'||r.status==='start_changed'?'bad':'warn');
@@ -2585,8 +2597,9 @@ function syncRenderFinanceFacts(report){
     syncKV('采集闸门',r.enabled?'已开启':'未启用',r.enabled?'只读来源库，顺序按小时回填':'不会访问 NewAPI 来源库'),
     syncKV('报表展示',r.report_enabled?'已开启':'未开放','采集与展示独立，可先补数验收再开放'),
     syncKV('报表更新',refresh.enabled?`运行 ${fmtNum(refresh.running)} · 排队 ${fmtNum(refresh.pending)} · 待重新核验 ${fmtNum(refresh.retrying||0)}`:'按原读取方式',reportFailures?`本进程保留的任务记录中 ${fmtNum(reportFailures)} 个区间更新失败尚未恢复；有旧结果时保留显示，详细原因见服务日志`:'数据变化会有限重试；持续失败标记异常。报表更新与来源回填分别计数；无失败记录不代表报表已生成或缺失账单已补齐'),
-    syncKV('当前状态',statusMap[r.status]||r.status||'未知',r.failure_streak?`连续失败 ${fmtNum(r.failure_streak)} 次`:'游标只在整小时证据原子发布后前进'),
-    syncKV('历史覆盖',expected?`${fmtNum(completed)}/${fmtNum(expected)} 小时 · ${percent.toFixed(1)}%`:'尚无应回填小时',`起点 ${syncTime(r.start_hour)} · 安全定稿至 ${syncTime(r.finalized_through)}`),
+    syncKV('采集状态',statusMap[r.status]||r.status||'未知',r.failure_streak?`连续失败 ${fmtNum(r.failure_streak)} 次`:'游标只在整小时证据原子发布后前进'),
+    syncKV('小时采集覆盖',expected?`${fmtNum(completed)}/${fmtNum(expected)} 小时 · ${percent.toFixed(1)}%`:'尚无应回填小时',`起点 ${syncTime(r.start_hour)} · 闭合小时边界 ${syncTime(r.finalized_through)}`),
+    syncKV('报表完整性','另见经营核算页','小时采集 100% 不代表收入和利润已可发布；还需核验历史赠送分组、上游修正依据、收入成本配对和 AWS 成本。此处不触发报表重算'),
     syncKV('下一回填小时',syncTime(r.next_hour),r.last_completed_hour?`最近完成 ${syncTime(r.last_completed_hour)}`:'尚未完成首个小时'),
     syncKV('注册赠送用户',`${fmtNum(r.gift_recipients)} 人`,'仅这些用户保留精确消费/退款顺序，不保存 Prompt 和 API Key'),
     syncKV('最近成功',syncTime(r.last_success_at),r.last_attempt_at?`最近尝试 ${syncTime(r.last_attempt_at)}`:'尚未尝试'),

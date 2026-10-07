@@ -13,9 +13,8 @@ import (
 
 // financeReportSourceFingerprint is deliberately built from local publication
 // ledgers and sync-control rows. It never reads production NewAPI, an upstream
-// provider, or AWS. The aggregate queries are substantially cheaper than
-// rebuilding the report while still changing whenever a published finance
-// input, its coverage proof, or its configuration changes.
+// provider, or AWS. Small per-hour/per-bucket content proofs also catch
+// same-total corrections; interval sums alone cannot identify those changes.
 func (m *Monitor) financeReportSourceFingerprint(ctx context.Context, from, to int64) (string, error) {
 	return m.financeReportSourceFingerprintForScope(ctx, from, to, true)
 }
@@ -70,6 +69,10 @@ func (m *Monitor) financeReportSourceFingerprintForScope(ctx context.Context, fr
 			row.BalanceUnitEffectiveAt, row.CredentialVersion)
 	}
 	hash.section = "channel-directory"
+	attribution, err := loadFinanceChannelDomains(ctx, m.storeDB)
+	if err != nil {
+		return "", fmt.Errorf("读取渠道历史归属版本: %w", err)
+	}
 	var channelRows []struct {
 		ID           int
 		BaseDomain   string
@@ -87,10 +90,16 @@ func (m *Monitor) financeReportSourceFingerprintForScope(ctx context.Context, fr
 		if includeCUR {
 			_, _ = fmt.Fprintf(hash, "channel|%d|%q|%d|%q|%q|%d|%d\n",
 				row.ID, row.BaseDomain, row.Status, row.Groups, row.Models, row.EnabledSince, row.DeletedAt)
-		} else {
-			// Monthly accounting only resolves immutable channel IDs to domains.
-			// Runtime enable/disable changes must not invalidate every closed month.
-			_, _ = fmt.Fprintf(hash, "channel-domain|%d|%q\n", row.ID, row.BaseDomain)
+		}
+		// A later retarget must not invalidate a pinned closed month. Runtime
+		// enable/disable changes likewise do not change historical money.
+		_, _ = fmt.Fprintf(hash, "channel-domain|%d|%q\n", row.ID, attribution.at(row.ID, from))
+		// Only boundaries that can change attribution inside this interval are
+		// material to its cached amounts; future observations are irrelevant.
+		for _, period := range attribution.periods[row.ID] {
+			if period.FromHourTs > from && period.FromHourTs < to {
+				_, _ = fmt.Fprintf(hash, "channel-domain-boundary|%d|%d|%q\n", row.ID, period.FromHourTs, financeDomain(period.Domain))
+			}
 		}
 	}
 	if includeCUR {
@@ -114,17 +123,6 @@ func (m *Monitor) financeReportSourceFingerprintForScope(ctx context.Context, fr
 		args  []any
 	}{
 		{
-			label: "upstream-usage-ledger",
-			query: `SELECT COUNT(*) rows, COALESCE(MAX(fetched_at),0) max_updated,
-				COALESCE(SUM(requests),0) metric_a, COALESCE(SUM(tokens),0) metric_b,
-				COALESCE(SUM(CAST(ROUND(cost_usd * 1000000) AS INTEGER)),0) metric_c,
-				COALESCE(SUM(CAST(ROUND(quota * 1000) AS INTEGER)),0) metric_d,
-				COALESCE(SUM(bucket_seconds),0) metric_e,
-				COALESCE(SUM(CASE WHEN provisional THEN 1 ELSE 0 END),0) metric_f
-				FROM channel_upstream_usage_hours WHERE hour_ts>=? AND hour_ts<?`,
-			args: []any{from, to},
-		},
-		{
 			label: "economics-manifest-ledger",
 			query: `SELECT COUNT(*) rows, COALESCE(MAX(updated_at),0) max_updated,
 				COALESCE(SUM(revision),0) metric_a,
@@ -143,19 +141,17 @@ func (m *Monitor) financeReportSourceFingerprintForScope(ctx context.Context, fr
 				FROM channel_economics_global_hour_facts WHERE hour_ts>=? AND hour_ts<?`,
 			args: []any{from, to},
 		},
-		{
-			label: "finance-version-ledger",
-			query: `SELECT COUNT(*) rows, COALESCE(MAX(created_at),0) max_updated,
-				COALESCE(MAX(id),0) metric_a, COALESCE(SUM(version),0) metric_b,
-				COALESCE(SUM(effective_at),0) metric_c,
-				COALESCE(SUM(LENGTH(snapshot_json)),0) metric_d,
-				0 metric_e, 0 metric_f
-				FROM channel_finance_versions WHERE effective_at<?`,
-			args: []any{to},
-		},
 	}
 	hash.section = "hourly-coverage-proofs"
 	if err := m.hashFinanceHourlyProofs(ctx, hash, from, to); err != nil {
+		return "", err
+	}
+	hash.section = "upstream-usage-ledger"
+	if err := m.hashFinanceUpstreamBillBuckets(ctx, hash, from, to); err != nil {
+		return "", err
+	}
+	hash.section = "finance-version-ledger"
+	if err := m.hashFinanceRechargeVersions(ctx, hash, to); err != nil {
 		return "", err
 	}
 	for _, aggregate := range mainAggregates {

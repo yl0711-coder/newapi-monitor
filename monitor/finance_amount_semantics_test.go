@@ -21,6 +21,16 @@ func TestFinanceLedgerCostDistinguishesUnknownAndObservedZero(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			m, scope, accounts := dailyBillFixture(t)
+			if !tc.known {
+				// The fixture also contains verified empty hours. For the
+				// unknown case, use tiny positive bills instead: rounding
+				// them to zero must not manufacture a known corrected cost.
+				if err := m.storeDB.Model(&ChannelUpstreamUsageHour{}).
+					Where("cost_usd = 0 AND quota = 0").
+					Updates(map[string]any{"cost_usd": 1e-7, "quota": quotaPerUSD * 1e-7, "unit_per_usd": quotaPerUSD}).Error; err != nil {
+					t.Fatal(err)
+				}
+			}
 			pub := insertEconomicsReportHour(t, m, "hour.example", "epoch", scope.FromTs, 1, 0, 2_000_000, tc.amount, 0)
 			if err := m.storeDB.Model(&ChannelEconomicsHourPublication{}).Where("publication_id=?", pub.PublicationID).
 				Updates(map[string]any{"corrected_cost_known": tc.known, "profit_known": false, "coverage_status": "finance_version_missing"}).Error; err != nil {

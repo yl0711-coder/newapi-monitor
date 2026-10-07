@@ -13,7 +13,7 @@ import (
 )
 
 const (
-	financeReportProjection = "accounting-partial-correction-v3"
+	financeReportProjection = "accounting-pairing-hour-diagnostics-v8"
 	// 经营核算是按闭合小时生成的管理报表，不需要像实时监控一样每次请求重算。
 	// 五分钟新鲜期减少重复 SQLite 扫描；其后的十分钟只用于“立即展示旧结果、
 	// 后台更新”，页面会显示 report.generated_at；仅旧读取模式手动刷新绕过缓存。

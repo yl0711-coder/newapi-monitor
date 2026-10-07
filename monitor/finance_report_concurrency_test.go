@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -120,24 +121,38 @@ func TestFinanceRetryDoesNotHideConfigurationChange(t *testing.T) {
 }
 
 func TestFinanceMonthlyPublicationRaceDoesNotCacheMixedComponent(t *testing.T) {
-	m, request := financePublicationRaceFixture(t)
-	var changed atomic.Bool
-	name := "test:finance_monthly_publication_race"
-	if err := m.storeDB.Callback().Query().Before("gorm:query").Register(name, func(tx *gorm.DB) {
-		if tx.Statement.Table == "channel_snaps" && changed.CompareAndSwap(false, true) {
-			if err := m.storeDB.Exec("UPDATE channel_snaps SET base_domain='new.example' WHERE id=41").Error; err != nil {
-				_ = tx.AddError(err)
+	for _, source := range []string{"live_directory", "historical_ownership"} {
+		t.Run(source, func(t *testing.T) {
+			m, request := financePublicationRaceFixture(t)
+			update := "UPDATE channel_snaps SET base_domain='new.example' WHERE id=41"
+			if source == "historical_ownership" {
+				if err := m.storeDB.Create(&FinanceChannelDomainPeriod{ChannelID: 41, Domain: "race.example"}).Error; err != nil {
+					t.Fatal(err)
+				}
+				update = "UPDATE finance_channel_domain_periods SET domain='new.example' WHERE channel_id=41 AND from_hour_ts=0"
 			}
-		}
-	}); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = m.storeDB.Callback().Query().Remove(name) })
-	_, _, err := m.buildFinancePeriodComponent(context.Background(), stabilityScope{FromTs: request.from.Unix(), ToTs: request.to.Unix()}, time.Now().Unix(), request.configurationHash, nil, channelFinanceSnapshot{}, financeInternalTestCostEvidence{SourceComplete: true, Complete: true}, financeConfiguredInternalEvidence{Complete: true}, nil)
-	if !changed.Load() || !errors.Is(err, errFinanceFactsChanged) {
-		t.Fatalf("monthly race not detected: changed=%t err=%v", changed.Load(), err)
-	}
-	if entries, _ := m.getFinancePeriodCache().size(); entries != 0 {
-		t.Fatalf("mixed monthly cache published: %d", entries)
+			var changed atomic.Bool
+			name := "test:finance_monthly_publication_race"
+			// Inject during the actual user-fact read, AFTER the version probe.
+			// Directory reads also belong to the probe now; changing before them
+			// is a consistent new version, not a mixed report to reject.
+			if err := m.storeDB.Callback().Row().Before("gorm:row").Register(name, func(tx *gorm.DB) {
+				if strings.Contains(tx.Statement.SQL.String(), "GROUP BY channel_id,grp") && changed.CompareAndSwap(false, true) {
+					if err := m.storeDB.Exec(update).Error; err != nil {
+						_ = tx.AddError(err)
+					}
+				}
+			}); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = m.storeDB.Callback().Row().Remove(name) })
+			_, _, err := m.buildFinancePeriodComponent(context.Background(), stabilityScope{FromTs: request.from.Unix(), ToTs: request.to.Unix()}, time.Now().Unix(), request.configurationHash, nil, channelFinanceSnapshot{}, financeInternalTestCostEvidence{SourceComplete: true, Complete: true}, financeConfiguredInternalEvidence{Complete: true}, nil)
+			if !changed.Load() || !errors.Is(err, errFinanceFactsChanged) {
+				t.Fatalf("monthly race not detected: changed=%t err=%v", changed.Load(), err)
+			}
+			if entries, _ := m.getFinancePeriodCache().size(); entries != 0 {
+				t.Fatalf("mixed monthly cache published: %d", entries)
+			}
+		})
 	}
 }

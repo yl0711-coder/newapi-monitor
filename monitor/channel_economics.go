@@ -335,7 +335,7 @@ func (m *Monitor) publishChannelEconomicsHour(ctx context.Context, account Chann
 		if err := tx.Where("domain = ? AND account_epoch = ? AND hour_ts = ? AND semantics_version = ?", account.Domain, epoch, hourTs, channelCostEvidenceSemanticsVersion).Order("dimension_hash").Find(&costRows).Error; err != nil {
 			return err
 		}
-		financeVersion, rechargePaid, rechargeCredit, financeKnown, err := economicsFinanceAt(tx, account.Domain, hourTs)
+		financeVersion, rechargePaid, rechargeCredit, financeKnown, err := economicsFinanceForHour(tx, account.Domain, hourTs)
 		if err != nil {
 			return err
 		}
@@ -400,6 +400,10 @@ func (m *Monitor) publishChannelEconomicsHour(ctx context.Context, account Chann
 			ConsumeQuota  int64
 			RefundQuota   int64
 		}
+		domainSQL, err := financeChannelDomainSQL(tx, "c", "s.hour_ts")
+		if err != nil {
+			return err
+		}
 		if err := tx.Raw(`SELECT s.channel_id,
 			COALESCE(SUM(s.success+s.anomaly+s.failed),0) requests,
 			COALESCE(SUM(s.refund_records),0) refund_records,
@@ -407,7 +411,7 @@ func (m *Monitor) publishChannelEconomicsHour(ctx context.Context, account Chann
 			COALESCE(SUM(s.refund_quota),0) refund_quota
 			FROM stability_hour_samples s
 			JOIN channel_snaps c ON c.id=s.channel_id
-			WHERE s.hour_ts=? AND s.traffic_class_version IN ? AND c.base_domain=?
+			WHERE s.hour_ts=? AND s.traffic_class_version IN ? AND `+domainSQL+`=?
 			GROUP BY s.channel_id`, hourTs, accountingTrafficVersions(), account.Domain).Scan(&localRows).Error; err != nil {
 			return err
 		}
@@ -692,15 +696,19 @@ func (m *Monitor) enqueueChangedEconomicsLocalHoursTx(tx *gorm.DB, sinceTs, now 
 		}
 	}
 	var changed []changedHour
-	err := tx.Raw(`WITH local AS (
-		SELECT cs.base_domain domain, sh.hour_ts, sh.channel_id,
+	domainSQL, err := financeChannelDomainSQL(tx, "cs", "sh.hour_ts")
+	if err != nil {
+		return err
+	}
+	err = tx.Raw(`WITH local AS (
+		SELECT `+domainSQL+` domain, sh.hour_ts, sh.channel_id,
 		       SUM(sh.success+sh.anomaly+sh.failed) requests,
 		       SUM(sh.refund_records) refund_records,
 		       SUM(sh.quota) consume_quota, SUM(sh.refund_quota) refund_quota
 		FROM stability_hour_samples sh
 		JOIN channel_snaps cs ON cs.id=sh.channel_id
-		WHERE sh.hour_ts>=? AND sh.traffic_class_version IN ? AND cs.base_domain IN ?
-		GROUP BY cs.base_domain, sh.hour_ts, sh.channel_id
+		WHERE sh.hour_ts>=? AND sh.traffic_class_version IN ? AND `+domainSQL+` IN ?
+		GROUP BY domain, sh.hour_ts, sh.channel_id
 	), current_pub AS (
 		SELECT p.* FROM channel_economics_hour_current cur
 		JOIN channel_economics_hour_publications p ON p.publication_id=cur.publication_id

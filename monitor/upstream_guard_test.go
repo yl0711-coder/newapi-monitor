@@ -555,8 +555,8 @@ func TestUpstreamRetryAfterBoundsAndUsageBudget(t *testing.T) {
 	if got := parseUpstreamRetryAfter("1", now); !got.Equal(now.Add(upstreamRetryAfterMin)) {
 		t.Fatalf("minimum Retry-After=%s", got)
 	}
-	if got := parseUpstreamRetryAfter("999999", now); !got.Equal(now.Add(upstreamRetryAfterMax)) {
-		t.Fatalf("maximum Retry-After=%s", got)
+	if got := parseUpstreamRetryAfter("999999", now); !got.Equal(now.Add(999999 * time.Second)) {
+		t.Fatalf("long Retry-After was shortened: %s", got)
 	}
 	if got := parseUpstreamRetryAfter("invalid", now); !got.Equal(now.Add(upstreamRetryAfterDefault)) {
 		t.Fatalf("default Retry-After=%s", got)

@@ -21,7 +21,7 @@ const (
 	financePeriodCacheMaxBytes   = 32 << 20
 	financePeriodCacheTTL        = 7 * 24 * time.Hour
 	financePeriodSnapshotDirName = "finance-period-cache"
-	financePeriodCacheSchema     = 19
+	financePeriodCacheSchema     = 22
 )
 
 // financePeriodComponent is the expensive, independently reproducible part of

@@ -1019,6 +1019,9 @@ func (m *Monitor) syncOneUpstreamErrorLog(ctx context.Context, row ChannelUpstre
 	if state.NextSyncAt > now {
 		return nil
 	}
+	if probeErr := upstreamProbeBeforeRetry(ctx, m, row, "error_logs", state.Status, state.ConsecutiveFails); probeErr != nil {
+		return m.failUpstreamErrorLogState(ctx, &state, now, probeErr)
+	}
 
 	cred, err := m.credentialForAccount(row)
 	if err != nil {
@@ -1156,6 +1159,9 @@ func (m *Monitor) saveUpstreamErrorLogState(ctx context.Context, state *Upstream
 //
 // **不推进水位**：失败那段必须留给下一轮重试，否则会永久漏掉。
 func (m *Monitor) failUpstreamErrorLogState(ctx context.Context, state *UpstreamErrorLogSyncState, now int64, cause error) error {
+	if errors.Is(cause, context.Canceled) {
+		return cause
+	}
 	state.Status = upstreamStatusError
 	state.LastAttemptAt = now
 	state.ConsecutiveFails++
@@ -1174,7 +1180,10 @@ func (m *Monitor) failUpstreamErrorLogState(ctx context.Context, state *Upstream
 			state.NextSyncAt = retryAt
 		}
 	}
-	if err := m.saveUpstreamErrorLogState(ctx, state, now); err != nil {
+	boundUpstreamFailure(cause, now, &state.ConsecutiveFails, &state.Status, &state.NextSyncAt)
+	commitCtx, cancel := upstreamUsageLocalCommitContext(ctx)
+	defer cancel()
+	if err := m.saveUpstreamErrorLogState(commitCtx, state, now); err != nil {
 		return errors.Join(cause, err)
 	}
 	slog.Warn("上游错误日志采集失败", "domain", state.Domain,

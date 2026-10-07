@@ -13,6 +13,7 @@ const cm={
   removedAICodeWithKeyIDs:new Set()
 };
 let upstreamDiagnosticSeq=0,upstreamDiagnosticAbort=null;
+let upstreamRecoverySeq=0,upstreamRecoveryAbort=null;
 const $=id=>document.getElementById(id);
 const esc=s=>String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const zero=()=>({requests:0,tokens:0,cost_usd:0});
@@ -59,7 +60,7 @@ function scheduleReportRefresh(){
     cm.refreshTimer=null;
     // 编辑弹窗或计价台账打开时不在后台替换其依赖的报表，
     // 避免自动刷新打断人工配置和审批。
-    if(!$('tab-channels')?.hidden&&!cm.financeMode&&!cm.upstreamDomain&&!cm.costLedgerOpen.size&&!cm.pricingOps.size)await loadReport({quiet:true});
+    if(!$('tab-channels')?.hidden&&!cm.financeMode&&!cm.upstreamDomain&&!cm.costLedgerOpen.size&&!cm.pricingOps.size&&!window.channelPricingObservations?.hasOpen())await loadReport({quiet:true});
     scheduleReportRefresh();
   },60000);
 }
@@ -118,6 +119,8 @@ function init(){
     render();
   }));
   $('cmBody')?.addEventListener('click',event=>{
+    const pricing=event.target.closest('[data-cm-pricing-toggle],[data-cm-pricing-refresh]');
+    if(pricing){event.stopPropagation();const domain=reportDomain(pricing.dataset.cmPricingToggle||pricing.dataset.cmPricingRefresh);if(domain&&cm.report?.finance?.can_edit)window.channelPricingObservations?.[pricing.hasAttribute('data-cm-pricing-refresh')?'load':'toggle'](domain,render);return}
     const ledger=event.target.closest('[data-cm-cost-ledger]');
     if(ledger){event.stopPropagation();toggleCostLedger(ledger.dataset.cmCostLedger);return}
     const ownership=event.target.closest('[data-cm-cost-ownership]');
@@ -183,6 +186,7 @@ function init(){
   $('cmUpstreamProvider')?.addEventListener('change',resetUpstreamDiagnostic);
   $('cmUpstreamSync')?.addEventListener('click',syncUpstreamNow);
   $('cmUpstreamUsageSync')?.addEventListener('click',syncUpstreamUsageNow);
+  $('cmUpstreamRecover')?.addEventListener('click',recoverUpstreamTask);
   $('cmUpstreamFundsSync')?.addEventListener('click',syncUpstreamFundsNow);
   document.addEventListener('keydown',event=>{if(event.key==='Escape'){if(cm.upstreamDomain)closeUpstream();else if(cm.financeMode)closeFinance()}});
   window.addEventListener('monitor:navigate',event=>{if(event.detail?.tab==='channels'&&applyNavigationContext())loadReport()});
@@ -219,6 +223,7 @@ function showError(message){
 }
 async function loadReport({quiet=false}={}){
   if(quiet&&cm.loading)return;
+  window.channelPricingObservations?.reset();
   if(cm.abort)cm.abort.abort();
   cm.abort=new AbortController();const controller=cm.abort,signal=controller.signal,seq=++cm.economicsSeq;cm.loading=true;
   if(!quiet){cm.report=null;cm.loaded=false;cm.economics=null;cm.economicsError='';cm.economicsHourly.clear();cm.economicsHourlySeq.clear();cm.costLedger.clear();cm.costLedgerSeq.clear();loading()}
@@ -498,6 +503,29 @@ function domainChannels(domain){
   for(const vendor of domain?.vendors||[])for(const channel of vendor.channels||[])if(channel.current)byID.set(+channel.id,channel);
   return [...byID.values()].sort((a,b)=>+a.id-+b.id);
 }
+function costHistoricalChannels(domain,data){
+  // Old servers retain their current options. Ownership responses alone never
+  // create a selectable channel: it must exist in the local domain directory.
+  const rows=Array.isArray(data.historicalChannels)?data.historicalChannels:domainChannels(domain);
+  return rows.filter(channel=>channel&&Number.isSafeInteger(+channel.id)&&+channel.id>0);
+}
+function costHistoryHourInput(ts){
+  if(!Number.isSafeInteger(ts)||ts<0||ts%3600)return '';
+  const date=new Date((ts+8*3600)*1000);
+  return Number.isFinite(date.getTime())?date.toISOString().slice(0,16):'';
+}
+function parseCostHistoryHour(value){
+  if(!/^\d{4}-\d{2}-\d{2}T\d{2}:00$/.test(String(value||'')))return NaN;
+  const ts=Date.parse(`${value}:00+08:00`)/1000;
+  return costHistoryHourInput(ts)===value?ts:NaN;
+}
+function costHistoryBindingFields(domain,data,source,index,exactCandidateID){
+  const channels=costHistoricalChannels(domain,data),binding=source.current_binding;
+  const candidateAvailable=channels.some(channel=>+channel.id===exactCandidateID);
+  const channelID=+(proposalValue(binding,'local_channel_id','LocalChannelID')||(!binding&&candidateAvailable?exactCandidateID:0));
+  const options=channels.map(channel=>`<option value="${+channel.id}" ${channelID===+channel.id?'selected':''}>#${+channel.id} ${esc(channel.name)}${channel.current===false?'（已删除，仅历史）':''}</option>`).join('');
+  return `<div class="cm-cost-history"><label><span>历史回填渠道 · 与未来配置分开</span><select data-cost-history-channel><option value="0">请选择历史归属渠道</option>${options}</select></label><label><span>开始时间 · 北京时间</span><input type="datetime-local" step="3600" data-cost-history-from value="${costHistoryHourInput(+source.first_hour)}"></label><label><span>结束时间 · 不含此小时</span><input type="datetime-local" step="3600" data-cost-history-to value="${costHistoryHourInput(+source.last_hour+3600)}"></label><button type="button" data-cm-cost-history-binding="${esc(String(domain.key||domain.domain))}" data-source-index="${index}" ${!channels.length?'disabled':''}>预演并回填所选时段</button><small>单次最多 90 天；可分段补齐，不能与已确认归属重叠。仅处理所选范围内已有证据的小时。</small></div>`;
+}
 function costLedgerStatus(status){
   return ({pending:'待审批',scheduled:'待生效',applied:'已生效',rejected:'已驳回',rollback_scheduled:'回滚待生效',rolled_back:'已回滚',conflict:'冲突',cancelled:'已取消'})[status]||status||'未知';
 }
@@ -536,17 +564,18 @@ function costSourceRows(domain,data){
     const channelID=+(proposalValue(binding,'local_channel_id','LocalChannelID')||suggestedChannelID||0);
     const channelOptions=channels.map(channel=>`<option value="${+channel.id}" ${channelID===+channel.id?'selected':''}>#${+channel.id} ${esc(channel.name)}</option>`).join('');
     const groups=(source.source_groups||[]).slice(0,3),models=(source.upstream_models||[]).slice(0,3),identity=String(source.source_ref||'').slice(-8);
-    const historyCount=Number(source.historical_binding_count||0),historyNote=historyCount?`已有 ${nfmt(historyCount)} 段历史归属`:'将已采集时段按当前选择回填';
+    const historyCount=Number(source.historical_binding_count||0),historyNote=historyCount?`已有 ${nfmt(historyCount)} 段历史归属`:'历史回填使用下方独立选择，不改变未来配置';
     let ownershipNote='';
-    if(ownership?.state==='exact_unique')ownershipNote=`密钥精确匹配：#${nfmt(exactCandidateID)} ${exactCandidate?.name||''}${candidateAvailable?'；已作为候选预填，回填前仍会校验历史时段证据':'；该渠道已不在当前可选列表，需人工复核'}`;
+    if(ownership?.state==='exact_unique')ownershipNote=`密钥精确匹配：#${nfmt(exactCandidateID)} ${exactCandidate?.name||''}${candidateAvailable?'；已作为候选预填，回填前仍会校验历史时段证据':costHistoricalChannels(domain,data).some(channel=>+channel.id===exactCandidateID)?'；已作为历史回填候选，未来配置保持不变，历史归属仍需人工核实':'；本地渠道目录中不可选，需核对快照与主域名'}`;
     else if(ownership?.state==='exact_shared')ownershipNote=`同一上游 Key 被 ${nfmt(ownership.candidates?.length||0)} 个本地渠道共用，不能自动归属`;
     else if(ownership?.state==='unmatched')ownershipNote='当前令牌 Key 未匹配本地渠道';
     else if(ownership?.state==='token_unavailable')ownershipNote='历史或已删除令牌，无法在线精确核对';
     const focusClass=cm.navigationCostSourceRef===String(source.source_ref||'')?' navigation-focus':'';
-    return `<article class="cm-cost-source${focusClass}"><div><b>${esc(groups.join(' / ')||'未命名分组')} · ${esc(models.join(' / ')||'未知模型')}</b><small>来源 …${esc(identity)} · ${nfmt(source.dimension_count)} 个计价维度 · ${nfmt(source.requests)} 请求 · ${shortDateTime(source.first_hour)} 至 ${shortDateTime(source.last_hour)}</small><small>${esc(historyNote)}</small>${ownershipNote?`<small class="cm-cost-ownership ${esc(ownership.state)}">${esc(ownershipNote)}</small>`:''}</div><label><span>归属方式</span><select data-cost-mode>${['allocated','shared','unallocated'].map(value=>`<option value="${value}" ${mode===value?'selected':''}>${value==='allocated'?'指定本地渠道':value==='shared'?'共享/无法拆分':'暂不归属'}</option>`).join('')}</select></label><label><span>本地渠道</span><select data-cost-channel ${mode!=='allocated'?'disabled':''}><option value="0">请选择</option>${channelOptions}</select></label><span class="cm-cost-source-actions"><button type="button" data-cm-cost-binding="${esc(String(domain.key||domain.domain))}" data-source-index="${index}">下个整点生效</button><button type="button" data-cm-cost-history-binding="${esc(String(domain.key||domain.domain))}" data-source-index="${index}" ${historyCount?'disabled':''}>回填已采集历史</button></span></article>`;
+    return `<article class="cm-cost-source${focusClass}"><div><b>${esc(groups.join(' / ')||'未命名分组')} · ${esc(models.join(' / ')||'未知模型')}</b><small>来源 …${esc(identity)} · ${nfmt(source.dimension_count)} 个计价维度 · ${nfmt(source.requests)} 请求 · ${shortDateTime(source.first_hour)} 至 ${shortDateTime(source.last_hour)}</small><small>${esc(historyNote)}</small>${ownershipNote?`<small class="cm-cost-ownership ${esc(ownership.state)}">${esc(ownershipNote)}</small>`:''}</div><label><span>未来归属方式</span><select data-cost-mode>${['allocated','shared','unallocated'].map(value=>`<option value="${value}" ${mode===value?'selected':''}>${value==='allocated'?'指定本地渠道':value==='shared'?'共享/无法拆分':'暂不归属'}</option>`).join('')}</select></label><label><span>未来本地渠道</span><select data-cost-channel ${mode!=='allocated'?'disabled':''}><option value="0">请选择</option>${channelOptions}</select></label><span class="cm-cost-source-actions"><button type="button" data-cm-cost-binding="${esc(String(domain.key||domain.domain))}" data-source-index="${index}">下个整点生效</button></span>${costHistoryBindingFields(domain,data,source,index,exactCandidateID)}</article>`;
   }).join('');
   const ownershipSummary=data.ownership?`<p class="cm-cost-ownership-summary">精确唯一 ${nfmt(data.ownership.exact_unique)} · 共用 ${nfmt(data.ownership.exact_shared)} · 未匹配 ${nfmt(data.ownership.unmatched)} · 历史令牌不可用 ${nfmt(data.ownership.token_unavailable)}；核对结果仅供人工确认，不会自动写入。</p>`:'';
-  return `<div class="cm-cost-ledger-block"><h4>上游计价来源映射 <small>${nfmt(sources.length)} 个</small></h4>${ownershipSummary}${data.sourcesTruncated?'<p class="cm-cost-limit">来源超过安全展示上限，当前仅显示最近 500 个；未展示来源不会被自动归属。</p>':''}${rows||'<p class="cm-cost-empty">当前账户代际还没有已核验的上游计价来源。</p>'}</div>`;
+  const directoryNote=data.historicalChannelsTruncated?'<p class="cm-cost-limit">历史渠道目录超过展示上限，仅显示前 500 个；未展示渠道不会被自动归属。</p>':!Array.isArray(data.historicalChannels)?'<p class="cm-cost-limit">历史渠道目录暂不可用，目前仅保留经营视图中的当前渠道选项。</p>':'';
+  return `<div class="cm-cost-ledger-block"><h4>上游计价来源映射 <small>${nfmt(sources.length)} 个</small></h4>${ownershipSummary}${directoryNote}${data.sourcesTruncated?'<p class="cm-cost-limit">来源超过安全展示上限，当前仅显示最近 500 个；未展示来源不会被自动归属。</p>':''}${rows||'<p class="cm-cost-empty">当前账户代际还没有已核验的上游计价来源。</p>'}</div>`;
 }
 function pricingProposalRows(domain,data){
   const proposals=data.proposals||[];
@@ -594,7 +623,7 @@ async function loadCostLedger(key){
     if(!proposalRes.ok)throw new Error(proposalData.error||`台账 HTTP ${proposalRes.status}`);
     if(generation!==cm.economicsSeq||cm.costLedgerSeq.get(key)!==seq)return;
 	for(const row of proposalData.proposals||[]){const proposalKey=String(proposalValue(row,'proposal_key','ProposalKey')||''),status=String(proposalValue(row,'status','Status')||'');if(status!=='pending'){cm.pricingOps.delete(proposalKey+':approve');cm.pricingOps.delete(proposalKey+':reject')}if(status!=='applied')cm.pricingOps.delete(proposalKey+':rollback')}
-    cm.costLedger.set(key,{loading:false,accountEpoch:sourceData.account_epoch,sources:sourceData.sources||[],sourcesTruncated:!!sourceData.truncated,proposals:proposalData.proposals||[],proposalsTruncated:!!proposalData.proposals_truncated,actionableTruncated:!!proposalData.actionable_truncated,versions:proposalData.versions||[],versionsTruncated:!!proposalData.versions_truncated,ownership});render();focusNavigatedCostSource();
+    cm.costLedger.set(key,{loading:false,accountEpoch:sourceData.account_epoch,sources:sourceData.sources||[],sourcesTruncated:!!sourceData.truncated,historicalChannels:sourceData.historical_channels,historicalChannelsTruncated:!!sourceData.historical_channels_truncated,proposals:proposalData.proposals||[],proposalsTruncated:!!proposalData.proposals_truncated,actionableTruncated:!!proposalData.actionable_truncated,versions:proposalData.versions||[],versionsTruncated:!!proposalData.versions_truncated,ownership});render();focusNavigatedCostSource();
   }catch(error){if(error.name==='AbortError'||generation!==cm.economicsSeq||cm.costLedgerSeq.get(key)!==seq)return;cm.costLedger.set(key,{loading:false,error:error.message||'计价台账读取失败',sources:[],proposals:[],ownership});render()}
 }
 async function inspectCostOwnership(key){
@@ -626,27 +655,34 @@ async function saveCostBinding(key,index){
 async function saveHistoricalCostBinding(key,index){
   const domain=reportDomain(key),data=cm.costLedger.get(key),source=data?.sources?.[index];if(!domain||!source)return;
   const button=document.querySelector(`[data-cm-cost-history-binding="${CSS.escape(key)}"][data-source-index="${index}"]`),row=button?.closest('.cm-cost-source');
-  const mode=row?.querySelector('[data-cost-mode]')?.value||'unallocated',channelID=+(row?.querySelector('[data-cost-channel]')?.value||0);
-  if(mode!=='allocated'||!channelID){alert('历史回填必须先选择“指定本地渠道”和对应渠道。');return}
+  const channelID=+(row?.querySelector('[data-cost-history-channel]')?.value||0);
+  if(!channelID||!costHistoricalChannels(domain,data).some(channel=>+channel.id===channelID)){alert('历史回填请先选择目录中的历史归属渠道。');return}
+  const selectedFrom=parseCostHistoryHour(row?.querySelector('[data-cost-history-from]')?.value),selectedTo=parseCostHistoryHour(row?.querySelector('[data-cost-history-to]')?.value);
+  if(!Number.isSafeInteger(selectedFrom)||!Number.isSafeInteger(selectedTo)||selectedTo<=selectedFrom){alert('请选择有效的北京时间整小时时段，结束时间不包含在内。');return}
   const reason=window.prompt(`将来源 …${String(source.source_ref||'').slice(-8)} 的已采集历史归属到渠道 #${channelID}。\n请填写可追溯的核对依据：`,'已核对上游令牌来源与本地渠道历史归属');
   if(!reason?.trim())return;
-  const body={domain:domain.domain,account_epoch:data.accountEpoch,source_ref:source.source_ref,local_channel_id:channelID,reason:reason.trim()};
+  const body={domain:domain.domain,account_epoch:data.accountEpoch,source_ref:source.source_ref,local_channel_id:channelID,reason:reason.trim(),valid_from:selectedFrom,valid_to:selectedTo};
   button.disabled=true;
   try{
     const previewRes=await fetch('/channels/cost/historical-bindings/preview',{method:'POST',headers:{Accept:'application/json','Content-Type':'application/json'},body:JSON.stringify(body)}),preview=await previewRes.json();
     if(!previewRes.ok)throw new Error(preview.error||`预演 HTTP ${previewRes.status}`);
-    const binding=preview.binding||{},from=shortDateTime(+binding.ValidFrom||+binding.valid_from),to=shortDateTime(+binding.ValidTo||+binding.valid_to);
+    const binding=preview.binding||{},plannedFrom=Number(proposalValue(binding,'valid_from','ValidFrom')),plannedTo=Number(proposalValue(binding,'valid_to','ValidTo'));
+    if(!Number.isSafeInteger(plannedFrom)||!Number.isSafeInteger(plannedTo)||plannedFrom%3600||plannedTo%3600||plannedFrom<selectedFrom||plannedTo>selectedTo||plannedTo<=plannedFrom)throw new Error('预演范围与所选时段不一致，请刷新页面后重新预演。');
+    const from=costHistoryHourInput(plannedFrom).replace('T',' '),to=costHistoryHourInput(plannedTo).replace('T',' ');
     const activity=preview.has_local_activity?`所选渠道在其中 ${nfmt(preview.local_active_hours)} 个小时有活动，共 ${nfmt(preview.local_requests)} 个请求。`:'⚠ 所选渠道在这些小时没有本地请求，请重点核对归属。';
     const testActivity=Number(preview.local_test_requests||0)>0?`内部测试：${nfmt(preview.local_test_active_hours)} 个小时 / ${nfmt(preview.local_test_requests)} 请求（时段覆盖 ${(Math.max(0,Math.min(1,Number(preview.test_activity_coverage)||0))*100).toFixed(1)}%）。`:'内部测试：未发现同时段请求。';
     const coverage=Math.max(0,Math.min(1,Number(preview.activity_coverage)||0)),costCoverage=Math.max(0,Math.min(1,Number(preview.cost_activity_coverage)||0)),quality=String(preview.temporal_overlap_quality||'review'),warnings=Array.isArray(preview.risk_warnings)?preview.risk_warnings.filter(Boolean):[];
     const qualityLabel={strong:'较强',review:'需复核',weak:'弱',no_activity:'无同时段活动',invalid:'无效'}[quality]||'需复核';
     const warningText=warnings.length?`\n风险提示：\n- ${warnings.join('\n- ')}`:'';
-    const costEvidence=`上游金额：${money(preview.evidence_billed_cost)}；其中本地有活动的同小时 ${money(preview.active_billed_cost)}（${(costCoverage*100).toFixed(1)}%），无同小时活动 ${money(preview.inactive_billed_cost)} / ${nfmt(preview.inactive_evidence_requests)} 请求。`;
+    const costEvidence=`上游金额：${economicsMoneyLabel(preview.evidence_billed_cost)}；其中本地有活动的同小时 ${economicsMoneyLabel(preview.active_billed_cost)}（${(costCoverage*100).toFixed(1)}%），无同小时活动 ${economicsMoneyLabel(preview.inactive_billed_cost)} / ${nfmt(preview.inactive_evidence_requests)} 请求。`;
     if(!window.confirm(`回填影响预演\n来源：…${String(source.source_ref||'').slice(-8)}\n渠道：#${channelID} ${preview.channel_name||''}\n时段：${from} 至 ${to}\n上游证据：${nfmt(preview.evidence_hours)} 小时 / ${nfmt(preview.evidence_requests)} 请求\n${activity}\n${testActivity}\n客户流量同小时覆盖：${(coverage*100).toFixed(1)}% （时段证据${qualityLabel}）\n${costEvidence}${warningText}\n注：时段和金额重叠只是复核证据，不等于上游令牌归属证明；内部测试成本不得混入客户毛利。\n\n确认写入审计映射并排队重算？\n不会修改 NewAPI 渠道或未来路由。`))return;
     if(quality!=='strong'&&!window.confirm(`该映射的历史归属证据为“${qualityLabel}”。\n已人工核对上游令牌、账户或变更记录，仍要继续吗？`))return;
-    const res=await fetch('/channels/cost/historical-bindings',{method:'POST',headers:{Accept:'application/json','Content-Type':'application/json'},body:JSON.stringify(body)}),result=await res.json();
+    // Freeze the observed interval before confirmation; later evidence must
+    // not silently extend this operation to hours the operator did not see.
+    const savedBody={...body,valid_from:plannedFrom,valid_to:plannedTo};
+    const res=await fetch('/channels/cost/historical-bindings',{method:'POST',headers:{Accept:'application/json','Content-Type':'application/json'},body:JSON.stringify(savedBody)}),result=await res.json();
     if(!res.ok)throw new Error(result.error||`HTTP ${res.status}`);
-    alert(`历史归属已记账，${nfmt(result.evidence_hours||0)} 个证据小时已进入重算队列。`);await loadCostLedger(key)
+    alert(`历史归属已记账，共 ${nfmt(result.evidence_hours||0)} 个证据小时。已核验小时由后台排队重算，其余等待证据核验。`);await loadCostLedger(key)
   }catch(error){alert(error.message||'历史来源回填失败');await loadCostLedger(key)}finally{button.disabled=false}
 }
 function proposalAt(key,index){return cm.costLedger.get(key)?.proposals?.[index]||null}
@@ -770,7 +806,7 @@ function domainCard(domain,index,total,filtered,costBases=upstreamCostBases([dom
   const rates=domain.rate_config||{},rateConfigured=+rates.configured_channels||0,rateManaged=Number.isFinite(+rates.managed_channels)?+rates.managed_channels:(+rates.enabled_channels||0);
   const financeLabel=rateManaged>0&&rates.complete?`在用渠道倍率已配置 · ${rateConfigured}/${rateManaged}`:`在用渠道倍率待配置 · ${rateConfigured}/${rateManaged}`;
   const billView=window.channelDataStatus.billView(domain),upstreamUsage=billView.usage;
-  const billRangeNote=window.channelDataStatus.billRangeNote(billView.daily)||(upstreamUsage.provisional?'截至 '+shortDateTime(upstreamUsage.data_until)+' · 日账单待核对':'');
+  const billRangeNote=window.channelDataStatus.billRangeNote(billView.daily)||(upstreamUsage.provisional?'截至 '+shortDateTime(upstreamUsage.data_until)+(domain.upstream?.provider==='openox'?' · 上游估算待结算':' · 日账单待核对'):'');
   const billSyncNote=window.channelDataStatus.billSyncNote(domain);
   const billSyncHint=billSyncNote?`<em class="cm-domain-metric-note neutral cm-bill-sync-note">${esc(billSyncNote)}</em>`:'';
   // 上游日志只按账户（归并主域名）汇总；没有可靠的远端渠道 ID 映射时，
@@ -781,11 +817,11 @@ function domainCard(domain,index,total,filtered,costBases=upstreamCostBases([dom
 	const upstreamCostView=presentedBusinessCost(upstreamUsage,false,costBases.cost),adjustedCostView=presentedBusinessCost(upstreamUsage,true,costBases.adjusted);
 	const upstreamSpend=upstreamCostView.available&&upstreamTrusted?usd(upstreamCostView.value):'—';
 	const observedRatio=Number(upstreamUsage.recharge_ratio),ratio=Number.isFinite(observedRatio)&&observedRatio>0?observedRatio:0;
-	let ratioLabel='';
-	if(adjustedCostView.available)ratioLabel=upstreamUsage.recharge_ratio_varies?'按历史充值比例版本修正':ratio>0?`到账/支付 ${ratio.toLocaleString(undefined,{maximumFractionDigits:4})}×`:'按历史充值比例修正';
+	let ratioLabel=domain.upstream?.provider==='openox'?'订阅成本待分摊，暂不折算现金成本':'';
+	if(adjustedCostView.available)ratioLabel=upstreamUsage.recharge_ratio_varies?'按历史充值比例版本修正':ratio>0?`到账/支付 ${ratio.toLocaleString(undefined,{maximumFractionDigits:4})}×`:upstreamCostView.available&&upstreamCostView.value===0&&adjustedCostView.value===0?'已核验零消费':'按历史充值比例修正';
 	const adjustedSpend=upstreamTrusted&&adjustedCostView.available?usd(adjustedCostView.value):'—';
 	const internalNote=upstreamCostNote(upstreamUsage,costBases.cost),adjustedInternalNote=upstreamCostNote(upstreamUsage,costBases.adjusted,true);
-  const upstreamSpendLabel=(billView.daily?'所涉自然日':upstreamUsage.granularity==='day'?'自然日':'区间')+(costBases.cost==='business'?'上游消费':'上游账单消费');
+  const upstreamSpendLabel=domain.upstream?.provider==='openox'?'账面用量（含订阅抵扣）':(billView.daily?'所涉自然日':upstreamUsage.granularity==='day'?'自然日':'区间')+(costBases.cost==='business'?'上游消费':'上游账单消费');
   const upstreamMetrics=domain.upstream?.configured||upstreamUsage.available?`<span class="cm-domain-upstream-spend" title="金额按上游账户（主域名）汇总，不拆分到筛选的渠道或分组"><small>${upstreamSpendLabel}</small><b>${upstreamSpend}</b>${billSyncHint}<em class="cm-domain-metric-note neutral">${esc([billRangeNote,internalNote].filter(Boolean).join(' · '))}</em></span><span class="cm-domain-upstream-adjusted" title="修正成本 = 账面消费 × 历史充值支付 ÷ 历史充值到账；内部账号扣除口径见金额下方；${esc(billRangeNote)}"><small>上游修正成本</small><b>${adjustedSpend}</b>${billSyncHint}<em class="cm-domain-metric-note neutral">${esc([ratioLabel,adjustedInternalNote].filter(Boolean).join(' · '))}${billView.daily?' · 同左侧账单范围':''}</em></span><span class="cm-domain-upstream-balance"><small>上游当前余额</small><b>${upstreamBalance}</b>${domain.retiring?'<em class="cm-domain-metric-note retiring">不再充值 · 余量消耗中</em>':''}<em class="cm-domain-metric-note ${upstreamRunwayView.cls}" title="${esc(upstreamRunwayView.title)}">${esc(upstreamRunwayView.text)}</em>${upstreamRunwayView.basis?`<em class="cm-domain-metric-note neutral">${esc(upstreamRunwayView.basis)}</em>`:''}</span>`:'';
   const financeButton=cm.report?.finance?.can_edit&&domain.configured?`<button type="button" class="cm-finance-open" data-cm-finance="${esc(domain.key)}">倍率配置</button>`:'';
   const upstreamButton=cm.report?.finance?.can_edit&&domain.configured?`<button type="button" class="cm-upstream-open" data-cm-upstream="${esc(domain.key)}">账户配置</button>`:'';
@@ -796,7 +832,7 @@ function domainCard(domain,index,total,filtered,costBases=upstreamCostBases([dom
 	<div class="cm-share"><div><b>${metric(total)>0?share.toFixed(1)+'%':'—'}</b><small>${(filtered?'筛选内':'全站')+esc(metricLabel())}</small></div><i><em style="width:${Math.max(share&&2,share)}%"></em></i></div>
 	<div class="cm-domain-metrics"><span class="cm-domain-requests"><small>渠道请求数</small><b>${usageMetric(domain.usage.requests,nfmt)}</b></span><span class="cm-domain-tokens"><small>Tokens</small><b>${usageMetric(domain.usage.tokens,compact)}</b></span><span class="cm-domain-user-spend"><small>用户侧消费</small><b>${usageMetric(domain.usage.cost_usd,usd)}</b><em class="cm-domain-metric-note neutral">当前查询区间</em></span>${upstreamMetrics}</div>
     <span class="cm-chevron">${open?'−':'+'}</span>
-  </div>${open?`<div class="cm-domain-body">${economicsStrip(domain)}${costLedgerPanel(domain)}${groups.map((group,index)=>groupSection(domain,group,index,domain.usage)).join('')}</div>`:''}</article>`;
+  </div>${open?`<div class="cm-domain-body">${economicsStrip(domain)}${window.channelPricingObservations?.render(domain,cm.report?.finance?.can_edit)||''}${costLedgerPanel(domain)}${groups.map((group,index)=>groupSection(domain,group,index,domain.usage)).join('')}</div>`:''}</article>`;
 }
 
 function filtersActive(){return !!(cm.filters.search||cm.filters.domain||cm.filters.group||cm.filters.status)}
@@ -1021,7 +1057,11 @@ function showUpstreamMessage(message,error=false){
   const el=$('cmUpstreamMessage');if(!el)return;
   el.textContent=message||'';el.classList.toggle('error',!!error);
 }
-function resetUpstreamDiagnostic(){
+function resetUpstreamDiagnostic(clearRecovery=true){
+  upstreamRecoverySeq++;
+  upstreamRecoveryAbort?.abort();upstreamRecoveryAbort=null;
+  if($('cmUpstreamRecover'))$('cmUpstreamRecover').disabled=false;
+  if(clearRecovery&&$('cmUpstreamRecovery'))$('cmUpstreamRecovery').hidden=true;
   upstreamDiagnosticSeq++;
   upstreamDiagnosticAbort?.abort();upstreamDiagnosticAbort=null;
   const box=$('cmUpstreamDiagnostic');if(box){box.hidden=true;box.innerHTML=''}
@@ -1030,7 +1070,7 @@ function resetUpstreamDiagnostic(){
 function renderUpstreamDiagnostic(data){
   const box=$('cmUpstreamDiagnostic');if(!box)return;
   const labels={ok:'通过',warning:'需确认',error:'异常',skipped:'未检测'};
-  const providers={newapi:'NewAPI',sub2api:'Sub2API',aicodewith:'AICodeWith（春秋）',tokenforce:'海南海纳（TokenForce MaaS）',unknown:'尚未识别'};
+  const providers={newapi:'NewAPI',sub2api:'Sub2API',aicodewith:'AICodeWith（春秋）',tokenforce:'海南海纳（TokenForce MaaS）',openox:'OpenOx',unknown:'尚未识别'};
   const confidence={configured:'按已保存类型测试',compatible:'兼容接口特征',suspected:'仅疑似，需确认',unknown:'信息不足'};
   box.hidden=false;
   box.innerHTML=`<h3>检测结果：${esc(providers[data.provider]||'尚未识别')}</h3><small>${esc(confidence[data.confidence]||'信息不足')}</small>
@@ -1040,7 +1080,7 @@ function renderUpstreamDiagnostic(data){
 }
 async function diagnoseUpstream(){
   if(!cm.upstreamDomain||!cm.upstreamConfig)return;
-  resetUpstreamDiagnostic();
+  resetUpstreamDiagnostic(false);
   const seq=upstreamDiagnosticSeq,domain=cm.upstreamDomain.domain;
   const controller=new AbortController();upstreamDiagnosticAbort=controller;
   // Allow the server's 55s queue + probe budget to return actionable results.
@@ -1126,10 +1166,12 @@ function syncUpstreamFields(){
   document.querySelectorAll('.cm-upstream-sub2api').forEach(el=>el.hidden=provider!=='sub2api');
   document.querySelectorAll('.cm-upstream-aicodewith').forEach(el=>el.hidden=provider!=='aicodewith');
   document.querySelectorAll('.cm-upstream-tokenforce').forEach(el=>el.hidden=provider!=='tokenforce');
+  if(provider==='tokenforce'&&$('cmUpstreamUnitPerUSD'))$('cmUpstreamUnitPerUSD').value='1';
+  document.querySelectorAll('.cm-upstream-openox').forEach(el=>el.hidden=provider!=='openox');
   const sub2AuthMode=$('cmUpstreamAuthMode')?.value||'password';
   document.querySelectorAll('.cm-upstream-sub2-password').forEach(el=>el.hidden=provider!=='sub2api'||sub2AuthMode!=='password');
   document.querySelectorAll('.cm-upstream-sub2-refresh').forEach(el=>el.hidden=provider!=='sub2api'||sub2AuthMode!=='refresh_token');
-  const usageSupported=provider==='newapi'||provider==='sub2api'||provider==='aicodewith'||provider==='tokenforce';
+  const usageSupported=provider==='newapi'||provider==='sub2api'||provider==='aicodewith'||provider==='tokenforce'||provider==='openox';
   const usageOption=document.querySelector('.cm-upstream-usage-option');
   if(usageOption)usageOption.hidden=!usageSupported;
   if($('cmUpstreamUsageLabel'))$('cmUpstreamUsageLabel').textContent=provider==='aicodewith'?'同步按 Key 消费账单':provider==='sub2api'?'同步消费汇总（Sub2API）':provider==='tokenforce'?'同步调用明细（TokenForce）':'同步消费日志（NewAPI）';
@@ -1141,12 +1183,16 @@ function syncUpstreamFields(){
       ?'优先使用小时汇总接口，旧版站点自动降级为单日汇总；当天追平与历史补数独立，不保存原始日志'
       :'默认每 30 分钟分页串行汇总；完整取得时间窗口后才原子替换本地汇总，不保存上游原始内容';
   if(provider==='aicodewith'&&!document.querySelector('.cm-upstream-api-key'))resetAICodeWithKeyInputs();
+  if(provider==='openox'){
+    if($('cmUpstreamUsageLabel'))$('cmUpstreamUsageLabel').textContent='同步 OpenOx 账面用量（含订阅抵扣）';
+    if($('cmUpstreamUsageHelp'))$('cmUpstreamUsageHelp').textContent='按中国自然日分页读取，再汇总为小时；估算记录保留暂定标记，不重建费用。不代表钱包实际扣款或现金成本。';
+  }
 }
 function upstreamState(status,enabled=true){
   if(!enabled)return {label:'已停用',level:'neutral'};
   if(status==='ok')return {label:'正常',level:'ok'};
   if(status==='error')return {label:'异常',level:'bad'};
-  if(status==='reconnect')return {label:'需重新连接',level:'bad'};
+  if(status==='reconnect')return {label:'已暂停，待检测',level:'bad'};
   if(status==='unsupported')return {label:'待适配',level:'bad'};
   if(status==='stale')return {label:'数据陈旧',level:'warn'};
   if(status==='global_off')return {label:'灰度关闭',level:'neutral'};
@@ -1159,6 +1205,7 @@ function upstreamState(status,enabled=true){
   return {label:'等待同步',level:'warn'};
 }
 function renderUpstreamStatus(account){
+  renderUpstreamRecoveryOptions(account);
   const el=$('cmUpstreamStatus');if(!el)return;
   if(!account?.configured){el.hidden=true;el.innerHTML='';return}
   const balanceState=upstreamState(account.status,account.enabled);
@@ -1249,6 +1296,7 @@ async function openUpstream(domainKey){
   const domain=(cm.report.domains||[]).find(item=>item.key===domainKey&&item.configured);
   if(!domain)return;
   cm.upstreamDomain=domain;cm.upstreamConfig=null;cm.upstreamFunds=null;
+  $('cmUpstreamOpenOxToken').value='';
   resetUpstreamDiagnostic();$('cmUpstreamDetect').disabled=true;
   $('cmUpstreamTitle').textContent=`${domain.domain} · 余额自动同步`;
   $('cmUpstreamSubtitle').textContent='正在读取当前配置…';
@@ -1278,6 +1326,7 @@ async function openUpstream(domainKey){
   }catch(error){showUpstreamMessage(error.message||'读取配置失败。',true)}
 }
 function closeUpstream(){
+  $('cmUpstreamOpenOxToken').value='';
   resetUpstreamDiagnostic();
   if(!cm.upstreamDomain)return;
   cm.upstreamDomain=null;cm.upstreamConfig=null;cm.upstreamFunds=null;renderUpstreamFunds(null);
@@ -1290,11 +1339,14 @@ async function saveUpstream(){
   if(!cm.upstreamDomain||!cm.report?.finance?.can_edit)return;
   const provider=$('cmUpstreamProvider').value,baseURL=$('cmUpstreamBaseURL').value.trim();
   if(!baseURL){showUpstreamMessage('请填写站点地址。',true);return}
-  const usageSupported=provider==='newapi'||provider==='sub2api'||provider==='aicodewith'||provider==='tokenforce';
+  const usageSupported=provider==='newapi'||provider==='sub2api'||provider==='aicodewith'||provider==='tokenforce'||provider==='openox';
   const payload={domain:cm.upstreamDomain.domain,provider,base_url:baseURL,enabled:$('cmUpstreamEnabled').checked,usage_sync_enabled:usageSupported&&$('cmUpstreamUsageEnabled').checked};
   if(provider==='newapi'){
     payload.user_id=Number($('cmUpstreamUserID').value);payload.access_token=$('cmUpstreamAccessToken').value.trim();payload.session_id=$('cmUpstreamSessionID').value.trim();
     if(!Number.isInteger(payload.user_id)||payload.user_id<=0){showUpstreamMessage('请填写有效的 NewAPI 用户 ID。',true);return}
+  }else if(provider==='openox'){
+    payload.access_token=$('cmUpstreamOpenOxToken').value.trim();
+    if(!payload.access_token&&cm.upstreamConfig?.provider!=='openox'){showUpstreamMessage('首次连接请填写 OpenOx 后台 auth_token。',true);return}
   }else if(provider==='sub2api'){
     const authMode=$('cmUpstreamAuthMode').value;payload.email=$('cmUpstreamEmail').value.trim();
     if(authMode==='refresh_token')payload.refresh_token=$('cmUpstreamRefreshToken').value.trim();else payload.password=$('cmUpstreamPassword').value;
@@ -1305,14 +1357,14 @@ async function saveUpstream(){
     if(payload.add_api_key_slots.some(item=>!item.api_key)){showUpstreamMessage('填写 Key 名称后，还需要填写对应的 AICodeWith API Key。',true);return}
     if(payload.add_api_key_slots.some(item=>!item.api_key.startsWith('sk-acw-'))){showUpstreamMessage('AICodeWith API Key 格式应为 sk-acw-...，请每把 Key 单独填写一行。',true);return}
   }else{
-    payload.user_id=Number($('cmUpstreamOrgID').value);payload.unit_per_usd=Number($('cmUpstreamUnitPerUSD').value);payload.refresh_token=$('cmUpstreamTokenForceRefreshToken').value.trim();
+    payload.user_id=Number($('cmUpstreamOrgID').value);payload.unit_per_usd=1;payload.refresh_token=$('cmUpstreamTokenForceRefreshToken').value.trim();
     if(!Number.isInteger(payload.user_id)||payload.user_id<=0){showUpstreamMessage('请填写有效的 TokenForce 组织 ID（orgId）。',true);return}
-    if(!Number.isFinite(payload.unit_per_usd)||payload.unit_per_usd<=0){showUpstreamMessage('请填写有效的 CNY/每 USD 结算换算值。',true);return}
     if(!payload.refresh_token&&!cm.upstreamConfig?.account?.configured){showUpstreamMessage('首次连接时请填写上游浏览器会话中的 Refresh Token。',true);return}
   }
   const button=$('cmUpstreamSave');button.disabled=true;$('cmUpstreamSync').disabled=true;$('cmUpstreamUsageSync').disabled=true;showUpstreamMessage(payload.enabled?'正在安全连接并读取余额…':'正在停用自动同步…');
   try{
     const res=await fetch('/channels/upstream',{method:'POST',headers:{Accept:'application/json','Content-Type':'application/json'},body:JSON.stringify(payload)});
+    $('cmUpstreamOpenOxToken').value='';
     $('cmUpstreamAccessToken').value='';$('cmUpstreamSessionID').value='';$('cmUpstreamPassword').value='';$('cmUpstreamRefreshToken').value='';$('cmUpstreamTokenForceRefreshToken').value='';payload.access_token='';payload.session_id='';payload.password='';payload.refresh_token='';payload.add_api_key_slots=[];payload.rename_api_key_slots=[];payload.remove_api_key_ids=[];
     if(res.status===401){location.href='/login';return}
     const data=await res.json();if(!res.ok)throw new Error(data.error||`HTTP ${res.status}`);
@@ -1322,7 +1374,7 @@ async function saveUpstream(){
     cm.loaded=false;await loadReport();
     if(data.sync_error){showUpstreamMessage(`配置已保存，但本次同步失败：${data.sync_error}`,true);return}
     closeUpstream();
-  }catch(error){$('cmUpstreamAccessToken').value='';$('cmUpstreamSessionID').value='';$('cmUpstreamPassword').value='';$('cmUpstreamRefreshToken').value='';$('cmUpstreamTokenForceRefreshToken').value='';if(provider==='aicodewith')renderAICodeWithKeySlots(cm.upstreamConfig?.account?.api_key_slots||[]);showUpstreamMessage(error.message||'保存失败，请稍后重试。',true)}finally{button.disabled=false;$('cmUpstreamSync').disabled=false;$('cmUpstreamUsageSync').disabled=false}
+  }catch(error){$('cmUpstreamAccessToken').value='';$('cmUpstreamSessionID').value='';$('cmUpstreamPassword').value='';$('cmUpstreamRefreshToken').value='';$('cmUpstreamTokenForceRefreshToken').value='';if(provider==='aicodewith')renderAICodeWithKeySlots(cm.upstreamConfig?.account?.api_key_slots||[]);showUpstreamMessage(error.message||'保存失败，请稍后重试。',true)}finally{$('cmUpstreamOpenOxToken').value='';payload.access_token='';button.disabled=false;$('cmUpstreamSync').disabled=false;$('cmUpstreamUsageSync').disabled=false}
 }
 async function syncUpstreamNow(){
   if(!cm.upstreamDomain)return;
@@ -1336,15 +1388,39 @@ async function syncUpstreamNow(){
   }catch(error){showUpstreamMessage(error.message||'同步失败，请稍后重试。',true)}finally{button.disabled=false;$('cmUpstreamSave').disabled=false;$('cmUpstreamUsageSync').disabled=false}
 }
 
+function upstreamUsageSyncFeedback(data){
+  const account=data?.account;
+  const until=Number(account?.usage_data_until);
+  const coverage=Number.isFinite(until)&&until>0?`已采集账单截至 ${shortDateTime(until)}。`:'尚无可确认的账单水位。';
+  if(data?.sync_skipped){
+    const retry=Number(data.retry_at);
+    const retryText=Number.isFinite(retry)&&retry>0&&Number.isFinite(new Date(retry*1000).getTime())?`下次计划 ${shortDateTime(retry)}。`:'';
+    return {message:`${data.sync_error||'本次未执行消费同步。'}${retryText}${coverage}`,warning:data.sync_warning!==false};
+  }
+  if(data?.sync_error)return {message:`消费同步未完成：${data.sync_error}。${coverage}`,warning:true};
+  // Also fail closed against an older server returning HTTP 200 for an isolated
+  // no-op, or a provider yielding midway through its current-day collection.
+  if(!account)return {message:'未取得消费同步结果，请刷新后查看数据同步状态。',warning:true};
+  const state=account.usage_status;
+  if(state==='reconnect')return {message:`消费同步已暂停：日志认证或权限异常，请先检测日志权限，必要时更新凭据。${coverage}`,warning:true};
+  if(state==='error')return {message:`消费同步未完成：${account.usage_last_error||'请查看数据同步状态'}。${coverage}`,warning:true};
+  if(state!=='ok'||!Number.isFinite(until)||until<=0)return {message:`消费同步尚未完成，请查看数据同步状态。${coverage}`,warning:true};
+  // A successful history batch need not refresh today's watermark. State the
+  // actual published boundary instead of claiming that today's data advanced.
+  const history=account.usage_backfill_last_error?'历史补数仍有异常，请查看数据同步状态。'
+    :account.usage_backfill_done?'':'历史补数尚未完成。';
+  return {message:`消费同步检查完成。${coverage}${history}`,warning:!!account.usage_backfill_last_error};
+}
+
 async function syncUpstreamUsageNow(){
   if(!cm.upstreamDomain)return;
-  const button=$('cmUpstreamUsageSync');button.disabled=true;$('cmUpstreamSave').disabled=true;$('cmUpstreamSync').disabled=true;showUpstreamMessage('正在同步当天消费水位，并推进一个历史批次…');
+  const button=$('cmUpstreamUsageSync');button.disabled=true;$('cmUpstreamSave').disabled=true;$('cmUpstreamSync').disabled=true;showUpstreamMessage('正在检查消费同步任务；暂停或重试等待中的任务不会绕过保护…');
   try{
     const res=await fetch('/channels/upstream/usage-sync',{method:'POST',headers:{Accept:'application/json','Content-Type':'application/json'},body:JSON.stringify({domain:cm.upstreamDomain.domain})});
     if(res.status===401){location.href='/login';return}
     const data=await res.json();if(!res.ok)throw new Error(data.error||`HTTP ${res.status}`);
     renderUpstreamStatus(data.account);cm.loaded=false;await loadReport();
-    showUpstreamMessage(data.sync_error?`消费同步未完成：${data.sync_error}`:'当天水位已更新，历史补数按保护频率继续。',!!data.sync_error);
+    const feedback=upstreamUsageSyncFeedback(data);showUpstreamMessage(feedback.message,feedback.warning);
   }catch(error){showUpstreamMessage(error.message||'消费同步失败，请稍后重试。',true)}finally{button.disabled=false;$('cmUpstreamSave').disabled=false;$('cmUpstreamSync').disabled=false}
 }
 
@@ -1352,6 +1428,47 @@ async function syncUpstreamFundsNow(){
   if(!cm.upstreamDomain)return;const domain=cm.upstreamDomain.domain,button=$('cmUpstreamFundsSync');button.disabled=true;$('cmUpstreamSave').disabled=true;$('cmUpstreamSync').disabled=true;$('cmUpstreamUsageSync').disabled=true;showUpstreamMessage('正在同步资金流水并校验分页…');
   try{const res=await fetch('/channels/upstream/funds-sync',{method:'POST',headers:{Accept:'application/json','Content-Type':'application/json'},body:JSON.stringify({domain})});if(res.status===401){location.href='/login';return}const data=await res.json();if(!res.ok)throw new Error(data.error||`HTTP ${res.status}`);await loadUpstreamFunds(domain);showUpstreamMessage('资金流水已更新，历史范围会按保护频率继续补全。')}
   catch(error){showUpstreamMessage(error.message||'资金流水同步失败。',true);await loadUpstreamFunds(domain)}finally{button.disabled=false;$('cmUpstreamSave').disabled=false;$('cmUpstreamSync').disabled=false;$('cmUpstreamUsageSync').disabled=false}
+}
+
+function renderUpstreamRecoveryOptions(account){
+  const box=$('cmUpstreamRecovery'),select=$('cmUpstreamRecoveryTask');
+  if(!box||!select)return;
+  box.hidden=!account?.configured||!account.enabled;
+  const provider=account?.provider,logs=!!account?.usage_sync_enabled;
+  const tasks=new Set(['balance']);
+  if(logs){
+    tasks.add('usage');tasks.add('usage_history');
+    if(['newapi','sub2api'].includes(provider))tasks.add('funds');
+    if(['newapi','sub2api','aicodewith'].includes(provider))tasks.add('pricing');
+    if(provider==='newapi')tasks.add('error_logs');
+  }
+  [...select.options].forEach(option=>{option.disabled=!tasks.has(option.value)});
+  if(!tasks.has(select.value))select.value='balance';
+}
+
+async function recoverUpstreamTask(){
+  if(!cm.upstreamDomain||upstreamRecoveryAbort)return;
+  const domain=cm.upstreamDomain.domain,task=$('cmUpstreamRecoveryTask').value,seq=++upstreamRecoverySeq;
+  const controller=new AbortController();upstreamRecoveryAbort=controller;
+  const button=$('cmUpstreamRecover');button.disabled=true;
+  const timeout=setTimeout(()=>controller.abort(),60000);
+  showUpstreamMessage('正在检测所选接口；通过后恢复排期，不会清空历史数据…');
+  try{
+    const response=await fetch('/channels/upstream/recover',{method:'POST',headers:{Accept:'application/json','Content-Type':'application/json'},signal:controller.signal,body:JSON.stringify({domain,task})});
+    if(response.status===401){location.href='/login';return}
+    const data=await response.json();
+    if(seq!==upstreamRecoverySeq||cm.upstreamDomain?.domain!==domain)return;
+    if(!response.ok)throw Error(data.error||`HTTP ${response.status}`);
+    const known=['queued','waiting','blocked','not_needed'].includes(data.status);
+    const retry=Number(data.retry_at),validRetry=retry>0&&Number.isFinite(new Date(retry*1000).getTime());
+    showUpstreamMessage((known?data.message:'未取得有效恢复结果，请查看数据同步状态。')+(validRetry?` 下次可检测：${dateTime(retry)}`:''),!known||data.status==='blocked');
+    if(data.status==='queued')cm.loaded=false;
+  }catch(error){
+    if(seq===upstreamRecoverySeq&&cm.upstreamDomain?.domain===domain)showUpstreamMessage(error.name==='AbortError'?'检测超时，请查看同步状态后再试；未清空历史数据。':error.message,true);
+  }finally{
+    clearTimeout(timeout);
+    if(seq===upstreamRecoverySeq){button.disabled=false;upstreamRecoveryAbort=null}
+  }
 }
 
 function upstreamBalanceSummary(accounts){

@@ -100,7 +100,8 @@ func (m *Monitor) loadUpstreamBurnEstimates(ctx context.Context, now int64, poli
 		estimates[domain] = upstreamBurnEstimate{ExpectedHours: expectedSeconds / 3600}
 	}
 	var rows []ChannelUpstreamUsageHour
-	if err := m.storeDB.WithContext(ctx).Raw(`SELECT domain,hour_ts,bucket_seconds,requests,tokens,quota,cost_usd,fetched_at,provider,provisional
+	if err := m.storeDB.WithContext(ctx).Raw(`SELECT domain,hour_ts,bucket_seconds,requests,tokens,quota,cost_usd,
+		COALESCE(unit_per_usd,0) unit_per_usd,fetched_at,provider,provisional
 		FROM channel_upstream_usage_hours
 		WHERE hour_ts>=? AND hour_ts+(CASE WHEN bucket_seconds>0 THEN bucket_seconds ELSE 3600 END)<=?
 		ORDER BY domain ASC,hour_ts ASC`, from, to).Scan(&rows).Error; err != nil {
@@ -133,6 +134,14 @@ func (m *Monitor) loadUpstreamBurnEstimates(ctx context.Context, now int64, poli
 		if a.lastEnd > row.HourTs {
 			a.overlap = true
 			continue
+		}
+		if row.Provider == upstreamProviderTokenForce {
+			var valid bool
+			row, valid = tokenForceBillFaceValue(row)
+			if !valid {
+				a.invalidCost = true
+				continue
+			}
 		}
 		if math.IsNaN(row.CostUSD) || math.IsInf(row.CostUSD, 0) || row.CostUSD < 0 {
 			a.invalidCost = true
@@ -172,6 +181,10 @@ func assessUpstreamBalance(account ChannelUpstreamAccountView, estimate upstream
 	}
 	if !account.Configured {
 		assessment.Reason = "尚未配置余额同步"
+		return assessment
+	}
+	if account.Provider == upstreamProviderOpenOx {
+		assessment.Reason = "OpenOx 钱包与订阅额度分开，暂不按账面用量推算可用天数"
 		return assessment
 	}
 	if !account.Enabled {

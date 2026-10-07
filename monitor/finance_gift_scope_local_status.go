@@ -104,6 +104,13 @@ func InspectFinanceGiftLocalJob(ctx context.Context, dir, confirmation string) (
 // Immutable is safe only for a closed, exclusively locked offline job with
 // no pending journal. It avoids creating WAL/SHM files during inspection.
 func giftLocalReadonlyDatabase(path string) (*gorm.DB, func(), error) {
+	// A relative URL path is not a relative SQLite filename. Resolve it
+	// before constructing the file URI; keep mode and filesystem guards intact.
+	var err error
+	path, err = filepath.Abs(path)
+	if err != nil {
+		return nil, nil, err
+	}
 	if err := giftLocalClosedBackup(path); err != nil {
 		return nil, nil, err
 	}

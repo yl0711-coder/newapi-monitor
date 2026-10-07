@@ -14,6 +14,7 @@ package monitor
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"strings"
 	"time"
@@ -36,7 +37,11 @@ type UserDirectoryEntry struct {
 
 // userDirectorySyncMax 是一次同步接受的上限。生产实测 150 行；
 // 留出余量但仍设上限，避免主站用户量意外暴涨时把整表拉进本地。
-const userDirectorySyncMax = 5000
+const (
+	userDirectorySyncMax      = 5000
+	userDirectoryQueryTimeout = 10 * time.Second
+	userDirectoryWriteTimeout = 10 * time.Second
+)
 
 // startUserDirectorySync 把展示缓存放到低优先来源槽异步执行。它不能阻塞主采样，
 // 也不能因连续 ticker 重叠创建多个等待者去挤占 stability/facts 等既有任务。
@@ -58,18 +63,44 @@ func (m *Monitor) syncUserDirectory(ctx context.Context) error {
 	if m.prodDB == nil {
 		return nil // 未连生产库（快照环境）：沿用本地已有缓存。
 	}
-	cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
-	release, err := m.acquireBackgroundSourceLow(cctx)
+	var out []UserDirectoryEntry
+	timing, err := m.withBackgroundSourceLowRead(ctx, backgroundSourceLowWaitTimeout, userDirectoryQueryTimeout, func(queryCtx context.Context) error {
+		var readErr error
+		out, readErr = m.readUserDirectory(queryCtx)
+		return readErr
+	})
+	writeStarted := time.Now()
+	defer func() {
+		// Fixed phase names and timings only: never log usernames or SQL data.
+		if err != nil || timing.Wait >= 2*time.Second || timing.Query >= 2*time.Second || time.Since(writeStarted) >= 2*time.Second {
+			slog.Info("用户名目录同步阶段耗时", "wait_ms", timing.Wait.Milliseconds(), "query_ms", timing.Query.Milliseconds(),
+				"local_phase_ms", time.Since(writeStarted).Milliseconds(), "failed", err != nil)
+		}
+	}()
 	if err != nil {
 		return err
 	}
-	defer release()
-	rows, err := m.prodDB.QueryContext(cctx,
+	if len(out) == 0 {
+		return nil // Empty source response must not erase the previous directory.
+	}
+	writeCtx, cancelWrite := context.WithTimeout(ctx, userDirectoryWriteTimeout)
+	defer cancelWrite()
+	err = m.storeDB.WithContext(writeCtx).Clauses(clause.OnConflict{
+		Columns:   []clause.Column{{Name: "user_id"}},
+		DoUpdates: clause.AssignmentColumns([]string{"username", "grp", "synced_at"}),
+	}).CreateInBatches(out, 200).Error
+	if err != nil {
+		return fmt.Errorf("local directory write: %w", err)
+	}
+	return nil
+}
+
+func (m *Monitor) readUserDirectory(ctx context.Context) ([]UserDirectoryEntry, error) {
+	rows, err := m.prodDB.QueryContext(ctx,
 		"SELECT id, COALESCE(username,''), COALESCE(`group`,'') FROM users ORDER BY id LIMIT ?",
 		userDirectorySyncMax+1)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer rows.Close()
 	now := time.Now().Unix()
@@ -77,7 +108,7 @@ func (m *Monitor) syncUserDirectory(ctx context.Context) error {
 	for rows.Next() {
 		var e UserDirectoryEntry
 		if err := rows.Scan(&e.UserID, &e.Username, &e.Grp); err != nil {
-			return err
+			return nil, err
 		}
 		e.Username = clip(strings.TrimSpace(e.Username), 128)
 		e.Grp = clip(strings.TrimSpace(e.Grp), 64)
@@ -85,20 +116,14 @@ func (m *Monitor) syncUserDirectory(ctx context.Context) error {
 		out = append(out, e)
 	}
 	if err := rows.Err(); err != nil {
-		return err
+		return nil, err
 	}
 	if len(out) > userDirectorySyncMax {
 		// 超限只警告并截断，不静默丢弃：宁可名字缓存不全，也不要把本地库撑爆。
 		slog.Warn("主站用户数超过用户名缓存上限，已截断", "limit", userDirectorySyncMax, "got", len(out))
 		out = out[:userDirectorySyncMax]
 	}
-	if len(out) == 0 {
-		return nil // 一行都没读到：当作本次未获得新值，不清空既有缓存。
-	}
-	return m.storeDB.WithContext(ctx).Clauses(clause.OnConflict{
-		Columns:   []clause.Column{{Name: "user_id"}},
-		DoUpdates: clause.AssignmentColumns([]string{"username", "grp", "synced_at"}),
-	}).CreateInBatches(out, 200).Error
+	return out, nil
 }
 
 // lookupUsersByName 按用户名精确查本地缓存里的客户 ID 候选。

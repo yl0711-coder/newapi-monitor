@@ -53,6 +53,17 @@ func financeRechargeRatio(paid, credit float64) *big.Rat {
 	return p.Quo(p, c)
 }
 
+func sameFinanceRechargeRatio(paid, credit, otherPaid, otherCredit float64) bool {
+	if !validChannelFinanceNumber(otherPaid) || !validChannelFinanceNumber(otherCredit) {
+		return false
+	}
+	if paid == otherPaid && credit == otherCredit {
+		return true
+	}
+	left, right := financeRechargeRatio(paid, credit), financeRechargeRatio(otherPaid, otherCredit)
+	return left != nil && right != nil && left.Cmp(right) == 0
+}
+
 func financeRechargeDeductionStatus(events []financeInternalTestCostEvent, expected financeInternalTestCostFact, versions []channelRechargeVersion) string {
 	byVersion := make(map[int64]channelRechargeVersion, len(versions))
 	for _, version := range versions {
@@ -75,14 +86,8 @@ func financeRechargeDeductionStatus(events []financeInternalTestCostEvent, expec
 		if oldRatio == nil || billRatio == nil || oldRatio.Cmp(billRatio) != 0 {
 			return "cost_pricing_basis_mismatch"
 		}
-		for _, version := range versions {
-			if version.EffectiveAt > event.HourTs && version.EffectiveAt < event.HourTs+3600 {
-				ratio := financeRechargeRatio(version.Paid, version.Credit)
-				if !version.Valid || ratio == nil || ratio.Cmp(billRatio) != 0 {
-					return "cost_pricing_window_incomplete"
-				}
-			}
-		}
+		// rechargeTermsForBucket checks exact decimal ratios across the whole
+		// hour, resolving same-instant replacement versions consistently.
 		// Reproduce the publication's integer rounding, not float arithmetic on
 		// the aggregate. Matching version numbers alone does not prove amounts.
 		amount, err := correctedCostMicroUSD(event.Fact.UpstreamCostMicroUSD, historical.Paid, historical.Credit)

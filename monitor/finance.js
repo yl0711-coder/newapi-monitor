@@ -15,7 +15,7 @@
     paired_verified: '配对已核验', partially_paired: '部分配对',
     binding_required: '待完成来源归属', not_enrolled: '未进入配对账本', not_required: '暂不纳入',
     in_progress: '闭环进行中', bill_not_connected: '账单未接入',
-    bill_missing: '账单证据缺失', correction_missing: '缺修正依据', correction_ambiguous: '账单桶内比例变化', source_binding_required: '成本来源待归属',
+    bill_missing: '账单证据缺失', correction_missing: '缺修正依据', correction_ambiguous: '历史比例边界待核对', source_binding_required: '成本来源待归属',
     cost_evidence_missing: '成本证据未采集', cost_evidence_incomplete: '成本证据未补齐', finance_history_missing: '历史财务版本缺失', ledger_backfill_required: '待试算配对账本',
     local_estimate_ready: '可闭合的本地估算', pricing_evidence_only: '仅倍率/费用证据', adapter_probe_required: '需适配器探测', range_exceeds_limit: '超过安全历史范围',
     account_missing: '账户配置缺失', account_disabled: '账户同步未启用', no_local_activity: '无本地活动依据', granularity_unsupported: '粒度不兼容', estimate_unavailable: '暂无估算',
@@ -37,10 +37,13 @@
     if (!value || value.micro_usd == null || value.micro_usd === '') return '—';
     try {
       let micro = BigInt(String(value.micro_usd));
-      const sign = micro < 0n ? '-' : '';
-      if (micro < 0n) micro = -micro;
-      const whole = (micro / 1000000n).toString().replace(/\B(?=(\d{3})+(?!\d))/g, ',');
-      const fraction = (micro % 1000000n).toString().padStart(6, '0').slice(0, 2);
+      const negative = micro < 0n;
+      if (negative) micro = -micro;
+      // Round display cents half-up using integers; retain backend micro precision.
+      const cents = (micro + 5000n) / 10000n;
+      const sign = negative && cents !== 0n ? '-' : '';
+      const whole = (cents / 100n).toString().replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+      const fraction = (cents % 100n).toString().padStart(2, '0');
       return `${sign}$${whole}.${fraction}`;
     } catch (_) {
       return '—';
@@ -202,8 +205,9 @@
       const sequence = boundaryExpected > 0 ? ` · 顺序 ${boundaryCompleted}/${boundaryExpected}` : '';
       const pending = value?.latest_hour_pending ? ' · 当前小时待闭合' : '';
       const scopePending = Number(value?.scope_unknown_events || 0) > 0 ? ` · ${Number(value.scope_unknown_events)} 条历史分组依据待补` : '';
+      const scopeIndependent = Number(value?.scope_independent_user_hours || 0) > 0 ? ` · ${Number(value.scope_independent_user_hours)} 个后续用户小时已证明不影响赠送扣减` : '';
       note.textContent = expected > 0
-        ? `小时覆盖 ${percent.toFixed(1)}% · ${completed}/${expected} 小时 · 赠送用户 ${giftUsers}${sequence}${pending}${scopePending}`
+        ? `小时覆盖 ${percent.toFixed(1)}% · ${completed}/${expected} 小时 · 赠送用户 ${giftUsers}${sequence}${pending}${scopePending}${scopeIndependent}`
         : '当前区间没有可核验证据';
     }
   }
@@ -651,6 +655,7 @@
     if (coverage) coverage.innerHTML = `<span><small>已进入不可变配对账本</small><b>${ledgerDomains.length ? ledgerDomains.map(esc).join('、') : '—'}</b></span>`
       + `<span class="${unenrolledDomains.length ? 'warn' : 'ready'}"><small>尚未进入配对账本</small><b title="${esc(unenrolledDomains.join('、'))}">${unenrolledDomains.length ? `${unenrolledDomains.length} 个：${unenrolledDomains.slice(0, 6).map(esc).join('、')}${unenrolledDomains.length > 6 ? '…' : ''}` : '无'}</b></span>`
       + `<span><small>待归属成本来源</small><b>${Number(audit.unallocated_sources || 0).toLocaleString('zh-CN')} 个</b></span>`;
+    renderPairingHours(audit.hours);
     $('finPairingRows').innerHTML = rows.length ? rows.map((row) => {
       const domains = Array.isArray(row.domain_names) ? row.domain_names.filter(Boolean) : [];
       const domainCell = domains.length
@@ -671,6 +676,25 @@
     renderPairingSources(audit);
   }
 
+  function renderPairingHours(rows) {
+    const target = $('finPairingHours');
+    if (!target) return;
+    if (!Array.isArray(rows)) {
+      target.textContent = '当前快照尚未提供小时诊断；不能据此判断业务已配对完成。';
+      return;
+    }
+    if (!rows.length) {
+      target.textContent = '当前区间没有已发布的小时诊断；不代表没有业务或成本缺口。';
+      return;
+    }
+    const count = (value) => Number.isSafeInteger(value) && value >= 0 ? value.toLocaleString('zh-CN') : '—';
+    target.innerHTML = rows.map((row) => `<p><b>${esc(row.domain || '未知上游')}</b> · 已发布 ${count(row.published_hours)} 小时`
+      + `<br>有业务且已配对 ${count(row.paired_activity_hours)} · 已核验空小时 ${count(row.verified_empty_hours)}`
+      + ` · 成本已采到待归属 ${count(row.unallocated_cost_hours)} · 本地有业务但上游零记录 ${count(row.upstream_zero_check_hours)}`
+      + ` · 其他待核对 ${count(row.other_incomplete_hours)}</p>`).join('')
+      + '<p>以上均为小时数，不是请求数。空小时不计作业务配对成功；待归属需核对令牌与渠道的历史关系。上游零记录也可能对应本站未扣费的失败请求，不直接认定丢日志或零成本，需核对账号及同窗日志。重复重算不会自动补齐这两类依据。</p>';
+  }
+
   function renderClosureReadiness(rows) {
     const target = $('finClosureReadiness');
     if (!target) return;
@@ -683,7 +707,7 @@
       ['not_required', '暂不纳入', '未配置上游账户，不进入覆盖率和利润'],
       ['precheck_required', '待灰度前核对', '已有账单与修正证据'],
       ['correction_missing', '缺修正依据', '先补充值比例或审计证据'],
-      ['correction_ambiguous', '账单桶内比例变化', '需更细账单或可审计分段依据'],
+      ['correction_ambiguous', '历史比例边界待核对', '区分配置录入纠正与真实比例变化'],
       ['bill_missing', '缺账单证据', '先补齐上游账单记录'],
       ['bill_not_connected', '账单未接入', '不能按零成本处理'],
       ['cost_evidence_missing', '成本证据未采集', '汇总账单不等于可配对小时证据'],
@@ -816,8 +840,18 @@
       + `<td>${domainHourCoverage(row)}${row.data_until ? `<small>截至 ${date(row.data_until)}</small>` : ''}</td>`
       + `<td>${chip(row.status)}<small>${esc(costEvidenceSummary(row))}</small></td>`
       + `<td>${chip(row.pairing_status || 'not_enrolled')}</td>`
-      + `<td class="fin-closure-action">${chip(row.closure_readiness || 'precheck_required')}<small>${esc(row.closure_next_action || '尚未完成准入判断')}</small>${evidenceBackfill(row)}</td></tr>`).join('')
+      + `<td class="fin-closure-action">${chip(row.closure_readiness || 'precheck_required')}<small>${esc(closureAction(row))}</small>${evidenceBackfill(row)}</td></tr>`).join('')
       : '<tr><td colspan="15" class="fin-empty">暂无可核对的上游成本明细</td></tr>';
+  }
+
+  function closureAction(row) {
+    // Old persistent snapshots may still contain the former claim that a
+    // recorded rate boundary proves a real payment-rate change. Correct the
+    // explanation without invalidating cached amounts or rebuilding history.
+    if (row.closure_readiness === 'correction_ambiguous') {
+      return '账单时间段内记录了不同充值比例；先核对是配置录入纠正还是真实比例变化。真实变化需更细账单或可审计的分段依据，确认前不发布完整成本。';
+    }
+    return row.closure_next_action || '尚未完成准入判断';
   }
 
   function costEvidenceSummary(row) {

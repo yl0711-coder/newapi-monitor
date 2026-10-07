@@ -124,10 +124,12 @@ type Settings struct {
 	UpstreamSyncTimeoutSec int  // MONITOR_UPSTREAM_SYNC_TIMEOUT_SECONDS,默认 15
 	// 上游使用日志与余额是两条独立同步链。日志全局开关默认关闭，
 	// 只有全局开关与账户开关同时开启才会后台读取。页面访问绝不会触发上游请求。
-	UpstreamUsageSyncEnabled         bool // MONITOR_UPSTREAM_USAGE_SYNC_ENABLED,默认 false；新功能灰度闸门
-	UpstreamAICodeWithRecordsEnabled bool // MONITOR_AICODEWITH_RECORDS_ENABLED; record-based hourly bills, within the existing usage gate
-	UpstreamUsageSyncMinutes         int  // MONITOR_UPSTREAM_USAGE_SYNC_MINUTES,默认 20，最小 15
-	UpstreamUsageBackfillDays        int  // MONITOR_UPSTREAM_USAGE_BACKFILL_DAYS,默认 90，首次低频补齐范围
+	UpstreamUsageSyncEnabled          bool     // MONITOR_UPSTREAM_USAGE_SYNC_ENABLED,默认 false；新功能灰度闸门
+	UpstreamUsageHistoryRepairEnabled bool     // MONITOR_UPSTREAM_USAGE_HISTORY_REPAIR_ENABLED,默认 false；仅管理员单日历史前缀修复
+	UpstreamUsageHistoryRepairDomains []string // MONITOR_UPSTREAM_USAGE_HISTORY_REPAIR_DOMAINS,只允许显式列出的主域名
+	UpstreamAICodeWithRecordsEnabled  bool     // MONITOR_AICODEWITH_RECORDS_ENABLED; record-based hourly bills, within the existing usage gate
+	UpstreamUsageSyncMinutes          int      // MONITOR_UPSTREAM_USAGE_SYNC_MINUTES,默认 20，最小 15
+	UpstreamUsageBackfillDays         int      // MONITOR_UPSTREAM_USAGE_BACKFILL_DAYS,默认 90，首次低频补齐范围
 	// 默认 1 保持所有上游请求全局串行；生产观察达标后最多升到 2。
 	// 同一 host 仍由 upstreamHostGuard 强制单并发，不能被此开关绕过。
 	UpstreamMaxConcurrency int // MONITOR_UPSTREAM_MAX_CONCURRENCY,默认 1，范围 1～2
@@ -447,6 +449,8 @@ func LoadSettings() Settings {
 		UpstreamSyncMinutes:                      envInt("MONITOR_UPSTREAM_SYNC_MINUTES", 5),
 		UpstreamSyncTimeoutSec:                   envInt("MONITOR_UPSTREAM_SYNC_TIMEOUT_SECONDS", 15),
 		UpstreamUsageSyncEnabled:                 env("MONITOR_UPSTREAM_USAGE_SYNC_ENABLED", "false") == "true",
+		UpstreamUsageHistoryRepairEnabled:        env("MONITOR_UPSTREAM_USAGE_HISTORY_REPAIR_ENABLED", "false") == "true",
+		UpstreamUsageHistoryRepairDomains:        envCSV("MONITOR_UPSTREAM_USAGE_HISTORY_REPAIR_DOMAINS"),
 		UpstreamAICodeWithRecordsEnabled:         env("MONITOR_AICODEWITH_RECORDS_ENABLED", "false") == "true",
 		UpstreamUsageSyncMinutes:                 envInt("MONITOR_UPSTREAM_USAGE_SYNC_MINUTES", 20),
 		UpstreamErrorLogSyncEnabled:              env("MONITOR_UPSTREAM_ERRORLOG_SYNC_ENABLED", "false") == "true",

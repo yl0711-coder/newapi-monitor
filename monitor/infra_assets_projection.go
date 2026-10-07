@@ -25,8 +25,8 @@ func currentInfraAssets(assets []InfraAsset) (map[string]InfraAsset, map[string]
 	return current, counts
 }
 
-func (m *Monitor) infraAssetProjection() (map[string]InfraAsset, map[string]int, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+func (m *Monitor) infraAssetProjectionContext(ctx context.Context) (map[string]InfraAsset, map[string]int, error) {
+	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
 	var assets []InfraAsset
 	query := m.monitorOwnedInfraAssetsQuery(m.storeDB.WithContext(ctx))

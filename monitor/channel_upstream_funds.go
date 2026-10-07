@@ -619,7 +619,11 @@ func decodeSub2APIFundItem(itemJSON json.RawMessage) (upstreamFundItem, error) {
 }
 
 func (m *Monitor) fetchSub2APIFundEvents(ctx context.Context, row ChannelUpstreamAccount, cred sub2APICredential, now int64) ([]ChannelUpstreamFundEvent, int64, error) {
-	body, err := doUpstreamJSON(ctx, m.channelUpstreamHTTPClient(), http.MethodGet, upstreamEndpoint(row.BaseURL, "/api/v1/redeem/history"), sub2APIUsageHeaders(cred), nil)
+	return fetchSub2APIFundEvents(ctx, m.channelUpstreamHTTPClient(), row, cred, now)
+}
+
+func fetchSub2APIFundEvents(ctx context.Context, client *http.Client, row ChannelUpstreamAccount, cred sub2APICredential, now int64) ([]ChannelUpstreamFundEvent, int64, error) {
+	body, err := doUpstreamJSON(ctx, client, http.MethodGet, upstreamEndpoint(row.BaseURL, "/api/v1/redeem/history"), sub2APIUsageHeaders(cred), nil)
 	if err != nil {
 		var statusErr *upstreamHTTPError
 		if errors.As(err, &statusErr) && (statusErr.Status == http.StatusUnauthorized || statusErr.Status == http.StatusForbidden) {
@@ -886,6 +890,9 @@ func (m *Monitor) saveFundState(ctx context.Context, state *UpstreamFundSyncStat
 }
 
 func (m *Monitor) failFundState(ctx context.Context, state *UpstreamFundSyncState, now int64, cause error) error {
+	if errors.Is(cause, context.Canceled) {
+		return cause
+	}
 	state.Status = upstreamStatusError
 	state.LastAttemptAt = now
 	state.ConsecutiveFails++
@@ -904,7 +911,10 @@ func (m *Monitor) failFundState(ctx context.Context, state *UpstreamFundSyncStat
 			state.NextSyncAt = retry
 		}
 	}
-	if err := m.saveFundState(ctx, state, now); err != nil {
+	boundUpstreamFailure(cause, now, &state.ConsecutiveFails, &state.Status, &state.NextSyncAt)
+	commitCtx, cancel := upstreamUsageLocalCommitContext(ctx)
+	defer cancel()
+	if err := m.saveFundState(commitCtx, state, now); err != nil {
 		return errors.Join(cause, err)
 	}
 	return cause
@@ -1014,6 +1024,12 @@ func (m *Monitor) syncOneUpstreamFunds(ctx context.Context, domain string, backg
 		state.NextSyncAt = 0
 		state.LastError = upstreamProviderName(row.Provider) + "资金明细接口尚未完成契约验证，未进行猜测采集"
 		return state, m.saveFundState(ctx, &state, now)
+	}
+	if (state.Status == upstreamStatusError || state.Status == upstreamStatusReconnect) && state.NextSyncAt > now {
+		return state, &upstreamStoredSyncError{message: "资金流水同步处于冷却或暂停状态，请等待或使用检测并恢复"}
+	}
+	if probeErr := upstreamProbeBeforeRetry(ctx, m, row, "funds", state.Status, state.ConsecutiveFails); probeErr != nil {
+		return state, m.failFundState(ctx, &state, now, probeErr)
 	}
 	if row.Provider == upstreamProviderSub2API {
 		return m.syncSub2UpstreamFunds(ctx, row, state, now)

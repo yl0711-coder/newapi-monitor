@@ -71,19 +71,19 @@ func (m *Monitor) serveFinanceQueuedReport(c *gin.Context, request financeReport
 	c.Header("X-Monitor-Finance-Update", state)
 	if available {
 		c.Header("X-Monitor-Finance-Cache", status)
-		c.Data(http.StatusOK, "application/json; charset=utf-8", payload)
+		writeFinanceReportJSON(c, payload)
 		return
 	}
 	if payload, ok, err := m.loadPriorFinanceReportSnapshot(request, time.Now()); err == nil && ok {
 		c.Header("X-Monitor-Finance-Cache", "persistent-prior-stale-queued")
-		c.Data(http.StatusOK, "application/json; charset=utf-8", payload)
+		writeFinanceReportJSON(c, payload)
 		return
 	}
 	if payload, ok, err := m.loadFinanceUpgradeSnapshot(request, time.Now()); err != nil {
 		slog.Warn("经营核算升级前快照不可用，继续后台重建", "err", err)
 	} else if ok {
 		c.Header("X-Monitor-Finance-Cache", "persistent-upgrade-prior-stale-queued")
-		c.Data(http.StatusOK, "application/json; charset=utf-8", payload)
+		writeFinanceReportJSON(c, payload)
 		return
 	}
 	c.Header("Retry-After", "5")

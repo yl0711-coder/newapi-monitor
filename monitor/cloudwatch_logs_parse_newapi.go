@@ -286,13 +286,13 @@ func (p *cloudWatchEvidenceParser) addNewAPIContext(out *cloudWatchStructuredEvi
 	}
 	model, group := cwField(fields, "model", "model_name"), cwField(fields, "group", "grp")
 	if parsedModel, parsedGroup, matched := cwNewAPINoChannelContext(message); matched {
-		model, group = parsedModel, parsedGroup
+		model, group = cwUnquoteLogModel(parsedModel), parsedGroup
 	} else if parsedModel := cwNewAPIModelContext(message); parsedModel != "" {
 		// Error text is the authoritative request context when fields are
 		// absent (the usual CloudWatch Insights shape for these rows).  Keep a
 		// structured field only as a fallback for formats that omit the model
 		// from the message.
-		model = parsedModel
+		model = cwUnquoteLogModel(parsedModel)
 	}
 	out.Model, ok = cwBusinessLabel(model, 128)
 	if !ok {
@@ -303,6 +303,16 @@ func (p *cloudWatchEvidenceParser) addNewAPIContext(out *cloudWatchStructuredEvi
 		return newCloudWatchEvidenceParseError(cwParseMalformed, out.Source)
 	}
 	return nil
+}
+
+// Some NewAPI error messages wrap a model ID in matching quotes. Remove only
+// that log formatting, not quotes inside the ID or arbitrary punctuation.
+// Structured fields and the downstream sensitive-content validator stay strict.
+func cwUnquoteLogModel(model string) string {
+	if len(model) >= 2 && (model[0] == '\'' || model[0] == '"') && model[len(model)-1] == model[0] {
+		return model[1 : len(model)-1]
+	}
+	return model
 }
 
 func cwNewAPINoChannelContext(message string) (model, group string, ok bool) {

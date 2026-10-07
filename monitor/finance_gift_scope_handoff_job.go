@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"path/filepath"
 )
 
@@ -52,7 +53,7 @@ func PrepareFinanceGiftLocalHandoff(ctx context.Context, sourceJob, sourceConfir
 	}
 	local, digest, err := PrepareFinanceGiftLocalJob(ctx, receiver, newJob, paths)
 	if err != nil {
-		return empty, "", err
+		return empty, "", fmt.Errorf("prepare handoff receiver: %w", err)
 	}
 	if local.BackupSHA256 != preview.ReceiverSHA256 || len(local.Targets) != len(plan.Targets) {
 		return empty, "", errors.New("handoff receiver changed during preparation; retain incomplete job for inspection")
@@ -65,12 +66,12 @@ func PrepareFinanceGiftLocalHandoff(ctx context.Context, sourceJob, sourceConfir
 	// Only this newly created offline copy receives the commit ledger.
 	db, closeDB, err := giftLocalDatabase(filepath.Join(newJob, "usage-facts.db"))
 	if err != nil {
-		return empty, "", err
+		return empty, "", fmt.Errorf("reopen handoff receiver: %w", err)
 	}
 	err = db.WithContext(ctx).AutoMigrate(&financeGiftHandoffCommit{})
 	closeDB()
 	if err != nil {
-		return empty, "", err
+		return empty, "", fmt.Errorf("prepare handoff ledger: %w", err)
 	}
 	receipt := FinanceGiftHandoffReceipt{2, "offline_receiver_copy_only", digest, sourceConfirmation, preview.SourceSHA256, preview.ReceiverSHA256}
 	data, err := json.MarshalIndent(receipt, "", "  ")

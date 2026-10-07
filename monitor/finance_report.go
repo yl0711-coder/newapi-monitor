@@ -232,6 +232,7 @@ type financePairingAuditView struct {
 	StatusCounts        map[string]int64            `json:"status_counts"`
 	Blockers            []financePairingBlockerView `json:"blockers"`
 	Sources             []financePairingSourceView  `json:"sources"`
+	Hours               []financePairingHourView    `json:"hours"`
 }
 
 type financePairingBlockerView struct {
@@ -647,6 +648,10 @@ func (m *Monitor) loadFinancePairingAudit(ctx context.Context, scope stabilitySc
 	}
 	var err error
 	audit.Sources, audit.SourcesTruncated, err = m.loadFinancePairingSources(ctx, scope, audit.UnallocatedSources)
+	if err != nil {
+		return audit, err
+	}
+	audit.Hours, err = loadFinancePairingHours(ctx, m.storeDB, scope)
 	if err != nil {
 		return audit, err
 	}
@@ -1148,7 +1153,7 @@ func applyFinanceClosureReadiness(detail *financeCostDetailView) {
 		detail.ClosureNextAction = "先补齐上游账单证据，再评估成本闭环。"
 	case detail.CorrectedCost == nil && detail.RechargeHistoryStatus == upstreamAdjustedCostBucketAmbiguous:
 		detail.ClosureReadiness = "correction_ambiguous"
-		detail.ClosureNextAction = "账单桶内充值比例发生变化，不能按单一比例修正；需更细账单或可审计的分段依据，已核验部分不代表完整成本。"
+		detail.ClosureNextAction = "账单时间段内记录了不同充值比例；先核对是配置录入纠正还是真实比例变化。真实变化需更细账单或可审计的分段依据，确认前不发布完整成本。"
 	case detail.CorrectedCost == nil && detail.RechargeHistoryStatus == upstreamAdjustedCostMissingHistory:
 		detail.ClosureReadiness = "finance_history_missing"
 		detail.ClosureNextAction = "部分账单缺少当时有效的充值比例；需核对历史生效范围，不能用当前配置覆盖历史。已核验部分不代表完整成本。"
@@ -1677,37 +1682,9 @@ func (m *Monitor) buildFinanceDailyViewsWithLedger(ctx context.Context, scope st
 }
 
 func (m *Monitor) loadFinanceUserFacts(ctx context.Context, scope stabilityScope, now int64, internalAccounts financeConfiguredInternalEvidence, businessGroups map[string]bool) (financeStatementView, StabilityDataCoverage, map[string]financeDomainUserFact, error) {
-	// The stability fact table is large. Aggregate it once by channel and resolve
-	// the domain from the small snapshot table in memory. A LEFT JOIN followed by
-	// a domain GROUP BY made the full-history finance view repeatedly scan and
-	// sort the large table, which is both slower and more likely to hit SQLite's
-	// read deadline while background collection is active.
-	var rows []struct {
-		ChannelID    int
-		Grp          string
-		Requests     int64
-		ConsumeQuota int64
-		RefundQuota  int64
-	}
-	if err := m.storeDB.WithContext(ctx).Raw(`SELECT channel_id,grp,
-		COALESCE(SUM(success+anomaly+failed),0) requests,
-		COALESCE(SUM(quota),0) consume_quota,
-		COALESCE(SUM(refund_quota),0) refund_quota
-		FROM stability_hour_samples WHERE hour_ts>=? AND hour_ts<? AND traffic_class_version IN ?
-		GROUP BY channel_id,grp`, scope.FromTs, scope.ToTs, accountingTrafficVersions()).Scan(&rows).Error; err != nil {
-		return financeStatementView{}, StabilityDataCoverage{}, nil, fmt.Errorf("读取全站用户用量事实: %w", err)
-	}
-	var snaps []ChannelSnap
-	if err := m.storeDB.WithContext(ctx).Select("id", "base_domain").Find(&snaps).Error; err != nil {
-		return financeStatementView{}, StabilityDataCoverage{}, nil, fmt.Errorf("读取渠道域名归属: %w", err)
-	}
-	domainByChannel := make(map[int]string, len(snaps))
-	for _, snap := range snaps {
-		domain := strings.ToLower(strings.TrimSpace(snap.BaseDomain))
-		if domain == "" {
-			domain = "未配置/历史"
-		}
-		domainByChannel[snap.ID] = domain
+	rows, attribution, err := m.loadFinanceChannelUserFacts(ctx, scope)
+	if err != nil {
+		return financeStatementView{}, StabilityDataCoverage{}, nil, err
 	}
 	domains := make(map[string]financeDomainUserFact, len(rows))
 	var totalConsumeQuota, totalRefundQuota int64
@@ -1715,10 +1692,7 @@ func (m *Monitor) loadFinanceUserFacts(ctx context.Context, scope stabilityScope
 		if !channelBusinessGroupIncluded(businessGroups, row.Grp) {
 			continue
 		}
-		domain := domainByChannel[row.ChannelID]
-		if domain == "" {
-			domain = "未配置/历史"
-		}
+		domain := attribution.at(row.ChannelID, row.HourTs)
 		fact := domains[domain]
 		fact.Domain = domain
 		fact.Requests += row.Requests
@@ -1740,10 +1714,7 @@ func (m *Monitor) loadFinanceUserFacts(ctx context.Context, scope stabilityScope
 	// 因此在这里按同一个渠道和业务分组口径精确扣除。内部账号事实
 	// 未补齐时加载器不会返回部分行，后面也会把 UserConsumption 保持为未发布。
 	for _, row := range internalAccounts.Rows {
-		domain := domainByChannel[row.ChannelID]
-		if domain == "" {
-			domain = "未配置/历史"
-		}
+		domain := attribution.at(row.ChannelID, row.HourTs)
 		fact := domains[domain]
 		fact.Domain = domain
 		fact.Requests -= row.Requests
@@ -2271,6 +2242,10 @@ func subtractFinanceInternalTestFromContribution(statement *financeStatementView
 	if statement.ContributionProfit != nil {
 		statement.ContributionProfit = financeMoneyPointer(statement.KnownContributionProfit)
 	}
+	// Removing internal/test-bearing rows can leave zero revenue or a net
+	// refund. Neither has a meaningful positive-revenue margin denominator.
+	statement.PairedContributionMargin = nil
+	statement.ContributionMargin = nil
 	if pairedRevenue > 0 {
 		margin := strconv.FormatFloat(float64(profit)*100/float64(pairedRevenue), 'f', 2, 64)
 		statement.PairedContributionMargin = &margin
@@ -2627,13 +2602,23 @@ func (m *Monitor) buildFinancePeriodWithSources(ctx context.Context, scope stabi
 	// usage and a correction-backed upstream cost are present.
 	var pairedRevenue, pairedCost, knownContribution int64
 	knownContributionDomains := 0
+	allContributionExact := internalTestCost.Complete && upstreamCoverage.UnconfiguredDomains == 0
 	for i := range details {
 		detail := &details[i]
 		if detail.Status == "not_configured" {
 			continue
 		}
 		if detail.KnownContribution.MicroUSD == "" {
+			allContributionExact = false
 			continue
+		}
+		// Complete account bills are independent of channel/hour pairing.
+		// A domain may have a complete bill but only a partial paired ledger;
+		// equal domain counts (or equal interval totals) cannot certify it.
+		localRevenue, localOK := financeMoneyInt64(detail.UserConsumption)
+		domainRevenue, pairedOK := financeMoneyInt64(detail.PairedRevenue)
+		if detail.Contribution == nil || !localOK || !pairedOK || localRevenue != domainRevenue {
+			allContributionExact = false
 		}
 		if _, err := financeAddMoney(&pairedRevenue, detail.PairedRevenue); err != nil {
 			return financeStatementView{}, StabilityDataCoverage{}, financeUpstreamCoverageView{}, nil, err
@@ -2659,7 +2644,8 @@ func (m *Monitor) buildFinancePeriodWithSources(ctx context.Context, scope stabi
 			statement.PairedContributionMargin = &margin
 		}
 	}
-	if userCoverage.Complete && upstreamCoverage.Complete && knownContributionDomains == upstreamCoverage.RelevantDomains {
+	if userCoverage.Complete && upstreamCoverage.Complete && allContributionExact &&
+		knownContributionDomains > 0 && knownContributionDomains == upstreamCoverage.RelevantDomains {
 		statement.ContributionProfit = financeMoneyPointer(statement.KnownContributionProfit)
 		statement.ContributionMargin = statement.PairedContributionMargin
 	}
@@ -3194,6 +3180,9 @@ func financeSourceViews(user StabilityDataCoverage, upstream financeUpstreamCove
 		giftStatus = "verified"
 		giftDescription = fmt.Sprintf("%d 笔候选注册赠送、%d 个用户已完成逐笔消耗分摊", gift.EligibleGrants, gift.GiftUsers)
 	}
+	if gift.ScopeIndependentUserHours > 0 {
+		giftDescription += fmt.Sprintf("；%d 个后续用户小时已证明赠送耗尽且无退款，不需要重取历史分组，不代表原始分组已补齐", gift.ScopeIndependentUserHours)
+	}
 	internalTestStatus := "no_data"
 	internalTestDescription := "当前区间没有内部测试请求"
 	if statement.InternalTestRequests > 0 {
@@ -3339,5 +3328,5 @@ func (m *Monitor) serveFinanceOperatingReport(c *gin.Context) {
 		return
 	}
 	c.Header("X-Monitor-Finance-Cache", cacheStatus)
-	c.Data(http.StatusOK, "application/json; charset=utf-8", payload)
+	writeFinanceReportJSON(c, payload)
 }

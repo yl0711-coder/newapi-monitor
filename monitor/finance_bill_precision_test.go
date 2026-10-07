@@ -67,6 +67,45 @@ func TestFinanceBillPrecisionRejectsOverflow(t *testing.T) {
 	}
 }
 
+func TestFinanceBillPrecisionCorrectsBeforeRoundingAndFailsClosed(t *testing.T) {
+	var small financeBillSum
+	small.addCorrectedUSD(0.0000001, 7, 1)
+	if small.err != nil || small.micro != 1 {
+		t.Fatalf("source rounded before correction: %+v", small)
+	}
+	for _, tc := range []struct {
+		name              string
+		raw, paid, credit float64
+	}{
+		{"negative_source", -1, 1, 1}, {"nan_source", math.NaN(), 1, 1},
+		{"infinite_source", math.Inf(1), 1, 1}, {"zero_paid", 1, 0, 1},
+		{"negative_paid", 1, -1, 1}, {"nan_paid", 1, math.NaN(), 1},
+		{"zero_credit", 1, 1, 0}, {"negative_credit", 1, 1, -1},
+		{"infinite_credit", 1, 1, math.Inf(1)}, {"corrected_overflow", 5e12, 7, 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var amount financeBillSum
+			amount.addCorrectedUSD(tc.raw, tc.paid, tc.credit)
+			if amount.err == nil {
+				t.Fatal("invalid corrected source accepted")
+			}
+			amount.addCorrectedUSD(1, 1, 1)
+			if amount.err == nil || amount.micro != 0 {
+				t.Fatal("later valid bill cleared an earlier failure")
+			}
+		})
+	}
+	var total financeBillSum
+	total.addCorrectedUSD(5e12, 1, 1)
+	if total.err != nil {
+		t.Fatal(total.err)
+	}
+	total.addCorrectedUSD(5e12, 1, 1)
+	if total.err == nil {
+		t.Fatal("corrected aggregate overflow accepted")
+	}
+}
+
 func TestFinanceBillPrecisionClosedDayFallback(t *testing.T) {
 	m, scope, accounts := dailyBillFixture(t)
 	scope.ToTs -= 3600

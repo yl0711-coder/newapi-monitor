@@ -3,6 +3,7 @@ package monitor
 import (
 	"context"
 	"fmt"
+	"math/big"
 )
 
 // Finance bills round each accepted source bucket once, then sum integer
@@ -36,6 +37,39 @@ func (a *financeBillSum) addUSD(usd float64) {
 	a.err = addEconomicsInt64(&a.micro, value)
 }
 
+// Keep the source's decimal face value until after paid/credit correction.
+// Multiplying binary floats first can move an exact half-micro boundary below
+// the half-up rounding line; rounding the raw bill first also loses small cost.
+func (a *financeBillSum) addCorrectedUSD(raw, paid, credit float64) {
+	if a.err != nil {
+		return
+	}
+	value, err := nonnegativeFloatRat(raw)
+	if err != nil {
+		a.err = err
+		return
+	}
+	paidRat, err := nonnegativeFloatRat(paid)
+	if err != nil || paidRat.Sign() <= 0 {
+		a.err = fmt.Errorf("充值支付金额无效")
+		return
+	}
+	creditRat, err := nonnegativeFloatRat(credit)
+	if err != nil || creditRat.Sign() <= 0 {
+		a.err = fmt.Errorf("充值到账金额无效")
+		return
+	}
+	value.Mul(value, paidRat)
+	value.Quo(value, creditRat)
+	value.Mul(value, big.NewRat(1_000_000, 1))
+	micro, err := roundedNonnegativeRatInt64(value)
+	if err != nil {
+		a.err = err
+		return
+	}
+	a.err = addEconomicsInt64(&a.micro, micro)
+}
+
 func (m *Monitor) loadFinanceBillWindow(ctx context.Context, scope stabilityScope, now int64, accounts map[string]ChannelUpstreamAccountView, finance channelFinanceSnapshot) (map[string]ChannelUpstreamUsageMetrics, map[string]financeAccountBillAmounts, error) {
 	rows, err := m.loadChannelUpstreamUsageRows(ctx, scope)
 	if err != nil {
@@ -57,14 +91,24 @@ func projectFinanceBillWindow(rows []ChannelUpstreamUsageHour, scope stabilitySc
 	metrics, err := projectUpstreamUsageBuckets(rows, scope, now, accounts, versions, func(row ChannelUpstreamUsageHour) {
 		a := totals[row.Domain]
 		a.raw.addUSD(row.CostUSD)
+		if row.Provider == upstreamProviderOpenOx {
+			totals[row.Domain] = a
+			return // Subscription credits have no verified cash-cost allocation.
+		}
+		if upstreamBillHasZeroFaceValue(row) {
+			a.corrected.addUSD(0)
+			a.correctedSeen = true
+			totals[row.Domain] = a
+			return
+		}
 		seconds := row.BucketSeconds
 		if seconds <= 0 {
 			seconds = 3600
 		}
 		paid, credit, status := rechargeTermsForBucket(versions[row.Domain], row.HourTs, row.HourTs+seconds)
 		if status == upstreamAdjustedCostComplete {
-			if cost, _, ok := adjustedUpstreamUsageCost(row.CostUSD, ChannelDomainCost{RechargePaid: paid, RechargeCredit: credit}, true); ok {
-				a.corrected.addUSD(cost)
+			if _, _, ok := adjustedUpstreamUsageCost(row.CostUSD, ChannelDomainCost{RechargePaid: paid, RechargeCredit: credit}, true); ok {
+				a.corrected.addCorrectedUSD(row.CostUSD, paid, credit)
 				a.correctedSeen = true
 			}
 		}

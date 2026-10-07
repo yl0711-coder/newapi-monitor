@@ -87,6 +87,8 @@ type channelCostHistoricalBindingInput struct {
 	SourceRef      string `json:"source_ref" binding:"required"`
 	LocalChannelID int    `json:"local_channel_id" binding:"required"`
 	Reason         string `json:"reason" binding:"required"`
+	ValidFrom      *int64 `json:"valid_from,omitempty"`
+	ValidTo        *int64 `json:"valid_to,omitempty"`
 }
 
 type channelCostHistoricalBindingPlan struct {
@@ -483,9 +485,15 @@ func (m *Monitor) listChannelCostSourcesHandler(c *gin.Context) {
 			views[i].AttributionState = binding.AllocationMode
 		}
 	}
+	historicalChannels, historicalChannelsTruncated, err := loadChannelCostHistoricalChannels(c.Request.Context(), m.storeDB, domain)
+	if err != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "读取历史归属渠道目录失败"})
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{
 		"domain": domain, "account_epoch": epoch, "enabled": m.channelCostEnabledFor(account),
 		"sources": views, "truncated": sourcesTruncated,
+		"historical_channels": historicalChannels, "historical_channels_truncated": historicalChannelsTruncated,
 	})
 }
 
@@ -503,7 +511,7 @@ func normalizeChannelCostHistoricalBindingInput(in *channelCostHistoricalBinding
 	if in.Reason == "" || len(in.Reason) > 512 {
 		return errors.New("必须填写 1-512 字符的历史归属审计原因")
 	}
-	return nil
+	return validateChannelCostHistoricalRange(*in, time.Now().Unix()/3600*3600)
 }
 
 // planChannelCostHistoricalBinding validates the exact finite interval and
@@ -538,6 +546,7 @@ func (m *Monitor) planChannelCostHistoricalBinding(ctx context.Context, in chann
 			COUNT(DISTINCT hmac_key_id) hmac_key_id_count, MIN(hour_ts) first_hour, MAX(hour_ts) last_hour,
 			COUNT(DISTINCT hour_ts) hours, COALESCE(SUM(requests), 0) requests`).
 		Where("domain = ? AND account_epoch = ? AND source_ref = ? AND semantics_version = ?", in.Domain, in.AccountEpoch, in.SourceRef, channelCostEvidenceSemanticsVersion).
+		Scopes(channelCostHistoricalRangeScope(in, "hour_ts")).
 		Scan(&evidence).Error; err != nil {
 		return plan, http.StatusServiceUnavailable, errors.New("读取历史计价证据失败")
 	}
@@ -571,6 +580,7 @@ func (m *Monitor) planChannelCostHistoricalBinding(ctx context.Context, in chann
 			ON s.domain=e.domain AND s.account_epoch=e.account_epoch AND s.hour_ts=e.hour_ts
 			AND s.semantics_version=e.semantics_version`).
 		Where("e.domain = ? AND e.account_epoch = ? AND e.source_ref = ? AND e.semantics_version = ?", in.Domain, in.AccountEpoch, in.SourceRef, channelCostEvidenceSemanticsVersion).
+		Scopes(channelCostHistoricalRangeScope(in, "e.hour_ts")).
 		Where("s.status = 'verified' AND s.reconcile_status = 'matched'").
 		Scan(&queueable).Error; err != nil {
 		return plan, http.StatusServiceUnavailable, errors.New("读取可发布历史计价证据失败")
@@ -592,6 +602,7 @@ func (m *Monitor) planChannelCostHistoricalBinding(ctx context.Context, in chann
 	if err := m.storeDB.WithContext(ctx).Model(&StabilityHourSample{}).
 		Select("hour_ts, COALESCE(SUM(success + anomaly + failed), 0) requests").
 		Where("channel_id = ?", in.LocalChannelID).
+		Scopes(channelCostHistoricalRangeScope(in, "stability_hour_samples.hour_ts")).
 		Where(`EXISTS (SELECT 1 FROM channel_upstream_cost_hour_evidence e
 			WHERE e.domain = ? AND e.account_epoch = ? AND e.source_ref = ?
 			AND e.semantics_version = ? AND e.hour_ts = stability_hour_samples.hour_ts)`,
@@ -615,6 +626,7 @@ func (m *Monitor) planChannelCostHistoricalBinding(ctx context.Context, in chann
 	if err := m.storeDB.WithContext(ctx).Model(&ChannelTestHourSample{}).
 		Select("hour_ts, COALESCE(SUM(requests), 0) requests").
 		Where("channel_id = ? AND traffic_class_version = ?", in.LocalChannelID, stabilityTrafficClassificationVersion).
+		Scopes(channelCostHistoricalRangeScope(in, "channel_test_hour_samples.hour_ts")).
 		Where(`EXISTS (SELECT 1 FROM channel_upstream_cost_hour_evidence e
 			WHERE e.domain = ? AND e.account_epoch = ? AND e.source_ref = ?
 			AND e.semantics_version = ? AND e.hour_ts = channel_test_hour_samples.hour_ts)`,
@@ -638,6 +650,7 @@ func (m *Monitor) planChannelCostHistoricalBinding(ctx context.Context, in chann
 	if err := m.storeDB.WithContext(ctx).Model(&ChannelUpstreamCostHourEvidence{}).
 		Select("hour_ts, charge_units_per_usd, COALESCE(SUM(charge_units), 0) charge_units, COALESCE(SUM(requests), 0) requests").
 		Where("domain = ? AND account_epoch = ? AND source_ref = ? AND semantics_version = ?", in.Domain, in.AccountEpoch, in.SourceRef, channelCostEvidenceSemanticsVersion).
+		Scopes(channelCostHistoricalRangeScope(in, "hour_ts")).
 		Group("hour_ts, charge_units_per_usd").Order("hour_ts").Scan(&costHours).Error; err != nil {
 		return plan, http.StatusServiceUnavailable, errors.New("读取历史来源金额证据失败")
 	}
@@ -725,7 +738,8 @@ func (m *Monitor) previewChannelCostHistoricalBindingHandler(c *gin.Context) {
 }
 
 // saveChannelCostHistoricalBindingHandler attributes one observed source for
-// exactly its currently recorded evidence lifetime. It is intentionally a
+// its observed evidence within the selected finite range (or the complete
+// recorded lifetime for legacy callers that omit both bounds). It is a
 // separate endpoint from next-hour switching: historical writes are finite,
 // auditable and cannot silently change future routing or pricing.
 func (m *Monitor) saveChannelCostHistoricalBindingHandler(c *gin.Context) {
@@ -758,6 +772,10 @@ func (m *Monitor) saveChannelCostHistoricalBindingHandler(c *gin.Context) {
 }
 
 func (m *Monitor) saveChannelCostBindingHandler(c *gin.Context) {
+	if m.cfg.LocalSnapshotOnly {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "本地快照模式禁止写入未来来源映射"})
+		return
+	}
 	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 16<<10)
 	var in channelCostBindingInput
 	if err := c.ShouldBindJSON(&in); err != nil {

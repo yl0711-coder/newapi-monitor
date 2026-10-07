@@ -74,6 +74,9 @@ var alertsJS []byte // 问题预警页交互；只访问 /alerts/rejections
 //go:embed channel_management.js
 var channelManagementJS []byte // 渠道管理交互；只访问 Monitor 本地渠道汇总接口
 
+//go:embed channel_pricing_observations.js
+var channelPricingObservationsJS []byte
+
 //go:embed channel_data_status.js
 var channelDataStatusJS []byte
 
@@ -213,6 +216,10 @@ func (m *Monitor) RegisterRoutes(r *gin.Engine) {
 	r.GET("/channel-management.js", func(c *gin.Context) {
 		c.Header("Cache-Control", "no-cache")
 		c.Data(http.StatusOK, "application/javascript; charset=utf-8", channelManagementJS)
+	})
+	r.GET("/channel-pricing-observations.js", func(c *gin.Context) {
+		c.Header("Cache-Control", "no-cache")
+		c.Data(http.StatusOK, "application/javascript; charset=utf-8", channelPricingObservationsJS)
 	})
 	r.GET("/channel-data-status.js", func(c *gin.Context) {
 		c.Header("Cache-Control", "no-cache")
@@ -423,11 +430,15 @@ func (m *Monitor) RegisterRoutes(r *gin.Engine) {
 		rootChannels.POST("/finance/channel", m.saveChannelFinanceChannelHandler)
 		rootChannels.POST("/finance/domain-rates", m.saveChannelFinanceDomainRatesHandler)
 		rootChannels.GET("/upstream", m.getChannelUpstreamHandler)
+		rootChannels.GET("/upstream/pricing-observations", m.getChannelPricingObservationsHandler)
 		rootChannels.POST("/upstream/diagnose", m.diagnoseChannelUpstreamHandler)
+		rootChannels.POST("/upstream/recover", m.recoverChannelUpstreamHandler)
 		rootChannels.POST("/upstream", m.saveChannelUpstreamHandler)
 		rootChannels.POST("/upstream/retirement", m.saveChannelUpstreamRetirementHandler)
 		rootChannels.POST("/upstream/sync", m.syncChannelUpstreamHandler)
 		rootChannels.POST("/upstream/usage-sync", m.syncChannelUpstreamUsageHandler)
+		rootChannels.POST("/upstream/usage-history/preview", m.previewSub2HistoricalDayHandler)
+		rootChannels.POST("/upstream/usage-history/apply", m.applySub2HistoricalDayHandler)
 		rootChannels.GET("/upstream/funds", m.getChannelUpstreamFundsHandler)
 		rootChannels.POST("/upstream/funds-sync", m.syncChannelUpstreamFundsHandler)
 		rootChannels.GET("/cost/sources", m.listChannelCostSourcesHandler)
@@ -715,7 +726,12 @@ func (m *Monitor) serveInfra(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"enabled": false})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"enabled": true, "snapshot": m.computeInfraSnapshot(time.Now().Unix())})
+	snap, err := m.computeInfraSnapshotContext(c.Request.Context(), time.Now().Unix())
+	if err != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"enabled": true, "error": "基础设施本地数据读取失败或超时，请稍后重试"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"enabled": true, "snapshot": snap})
 }
 
 // serveInfraSeries 按需返回某资源(resource)若干指标(metrics 逗号分隔)近 N 小时(hours,默认6,封顶24)的时序。
@@ -727,6 +743,8 @@ func (m *Monitor) serveInfraSeries(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"enabled": false})
 		return
 	}
+	ctx, cancel := context.WithTimeout(c.Request.Context(), infraReadTimeout)
+	defer cancel()
 	resource := strings.TrimSpace(c.Query("resource"))
 	if resource == "" || len(resource) > 253 {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "resource required"})
@@ -736,7 +754,7 @@ func (m *Monitor) serveInfraSeries(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "resource is not monitored"})
 		return
 	}
-	delegated, err := m.delegatedManagedAWSResource(c.Request.Context(), resource)
+	delegated, err := m.delegatedManagedAWSResource(ctx, resource)
 	if err != nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "resource registry unavailable"})
 		return
@@ -745,7 +763,7 @@ func (m *Monitor) serveInfraSeries(c *gin.Context) {
 		c.JSON(http.StatusGone, gin.H{"error": "managed AWS resource metrics are delegated to CloudWatch", "managed_aws": m.managedAWSInfraView()})
 		return
 	}
-	assets, incarnations, registryErr := m.infraAssetProjection()
+	assets, incarnations, registryErr := m.infraAssetProjectionContext(ctx)
 	if registryErr != nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "resource registry unavailable"})
 		return
@@ -784,7 +802,12 @@ func (m *Monitor) serveInfraSeries(c *gin.Context) {
 	}
 	series := map[string][]InfraPoint{}
 	for _, met := range requested {
-		series[met] = m.storeInfraSeries(resource, met, since)
+		points, err := m.storeInfraSeriesContext(ctx, resource, met, since)
+		if err != nil {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "基础设施趋势读取失败或超时，请稍后重试"})
+			return
+		}
+		series[met] = points
 	}
 	c.JSON(http.StatusOK, gin.H{"enabled": true, "series": series})
 }

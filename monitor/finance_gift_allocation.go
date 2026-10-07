@@ -33,14 +33,22 @@ type financeGiftCoverageView struct {
 	CompletedBoundaryUserHours int64 `json:"completed_boundary_user_hours"`
 	Complete                   bool  `json:"complete"`
 	ScopeUnknownEvents         int64 `json:"scope_unknown_events,omitempty"`
+	ScopeIndependentUserHours  int64 `json:"scope_independent_user_hours,omitempty"`
+	ScopeIndependentRows       int64 `json:"scope_independent_rows,omitempty"`
 }
 
 type financeGiftAllocationResult struct {
 	Allocation financecredit.GiftAllocation
 	Coverage   financeGiftCoverageView
-	// ledger is retained only in memory for deriving month/day subranges from
-	// the already verified overall evidence. It is never serialized to clients.
+	// ledger is retained only for deriving month/day gift subranges. A proven
+	// refund-free, exhausted wallet may omit its later events; user consumption
+	// must always come from the separate complete business usage facts, never
+	// Allocation.PeriodNetUsageMicroUSD. It is never serialized to clients.
 	ledger []financecredit.LedgerEvent
+	// Verified, still gift-relevant scope gaps only. Kept in memory for bounded
+	// offline read planning, never exposed as repaired raw history or queued work.
+	scopeGapStates    []FinanceGiftBoundaryState
+	scopeGapUserHours int64
 	// Only set after all monetary/hour proofs passed and a later scope gap was
 	// found. It is a closed-hour prefix, never a replacement for overall coverage.
 	verifiedPrefix *financeGiftAllocationResult
@@ -195,6 +203,28 @@ func (m *Monitor) loadFinanceGiftAllocationForScope(ctx context.Context, seedFro
 	if result.Coverage.CompletedBoundaryUserHours != result.Coverage.ExpectedBoundaryUserHours {
 		return result, nil
 	}
+	// Keep the full monetary/hour proof checks above. Only historical scope
+	// detail reads become unnecessary after a proven, irreversible depletion.
+	if channelBusinessGroupsExcluded(policies) {
+		horizons, err := financeGiftScopeHorizons(ctx, facts, ledger)
+		if err != nil {
+			return result, fmt.Errorf("verify gift scope horizon: %w", err)
+		}
+		if len(horizons) > 0 {
+			if err := verifyFinanceGiftHorizonFacts(ctx, db, seedFrom, to, userByHour, facts, firstGrantHour); err != nil {
+				return result, err
+			}
+		}
+		for key, state := range stateByKey {
+			if horizon, ok := horizons[key.UserID]; ok && key.HourTs >= horizon {
+				delete(stateByKey, key)
+				result.Coverage.ScopeIndependentUserHours++
+				if err := addEconomicsInt64(&result.Coverage.ScopeIndependentRows, state.Rows); err != nil {
+					return result, err
+				}
+			}
+		}
+	}
 
 	firstScopeGap := to
 	err = m.walkFinanceGiftHourEvidence(ctx, db, stateByKey, policies, excludedUsers, func(key financeGiftUserHourKey, evidence financeGiftHourEvidence) {
@@ -202,6 +232,8 @@ func (m *Monitor) loadFinanceGiftAllocationForScope(ctx context.Context, seedFro
 		result.Coverage.ScopeUnknownEvents += evidence.UnknownScopeEvents
 		if evidence.UnknownScopeEvents > 0 {
 			firstScopeGap = min(firstScopeGap, key.HourTs)
+			result.scopeGapUserHours++
+			result.scopeGapStates = retainEarliestFinanceGiftScopeGap(result.scopeGapStates, stateByKey[key])
 		}
 	})
 	if err != nil {

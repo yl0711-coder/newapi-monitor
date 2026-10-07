@@ -2,7 +2,8 @@ package monitor
 
 // Approval metadata lives in Monitor's main store, not in the facts store.
 // Its table is only migrated when the separate approval flag is enabled.
-// No worker consumes these rows yet. Never treat their existence as execution.
+// Explicit finite tasks consume these rows only after execution gates and
+// revalidation pass. Authorization alone never starts a task.
 type financeGiftHandoffAuthorization struct {
 	ID          string `gorm:"primaryKey;size:64"`
 	Payload     string

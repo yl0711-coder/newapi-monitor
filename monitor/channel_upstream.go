@@ -473,6 +473,8 @@ func (e *upstreamAuthError) Unwrap() error { return e.err }
 
 func upstreamProviderName(provider string) string {
 	switch provider {
+	case upstreamProviderOpenOx:
+		return "OpenOx"
 	case upstreamProviderNewAPI:
 		return "NewAPI"
 	case upstreamProviderSub2API:
@@ -487,6 +489,9 @@ func upstreamProviderName(provider string) string {
 }
 
 func upstreamUsageAdapterName(provider, adapter string) string {
+	if provider == upstreamProviderOpenOx {
+		return "OpenOx 账面用量（含订阅抵扣，非现金成本）"
+	}
 	switch adapter {
 	case upstreamUsageAdapterNewAPILog:
 		return "NewAPI 分页日志"
@@ -873,6 +878,12 @@ func applyAICodeWithSlotChanges(existing aiCodeWithCredential, additions []aicod
 
 func upstreamCredentialSecrets(credential any) []string {
 	switch cred := credential.(type) {
+	case openOxCredential:
+		return []string{cred.AccessToken}
+	case *openOxCredential:
+		if cred != nil {
+			return []string{cred.AccessToken}
+		}
 	case newAPICredential:
 		return []string{cred.AccessToken, cred.SessionID}
 	case *newAPICredential:
@@ -905,6 +916,8 @@ func upstreamCredentialSecrets(credential any) []string {
 
 func maskUpstreamAccount(provider, account string, userID int64) string {
 	switch provider {
+	case upstreamProviderOpenOx:
+		return fmt.Sprintf("用户 ID %d · 可用钱包（不含订阅额度）", userID)
 	case upstreamProviderNewAPI:
 		if userID > 0 {
 			return fmt.Sprintf("用户 ID %d", userID)
@@ -1076,6 +1089,9 @@ func upstreamAccountView(row ChannelUpstreamAccount) ChannelUpstreamAccountView 
 	}
 	if row.BalanceKnown {
 		balance := row.BalanceUSD
+		if row.Provider == upstreamProviderTokenForce {
+			balance = row.BalanceRaw
+		}
 		view.BalanceUSD = &balance
 		if row.Provider == upstreamProviderTokenForce {
 			raw := row.BalanceRaw
@@ -1084,7 +1100,7 @@ func upstreamAccountView(row ChannelUpstreamAccount) ChannelUpstreamAccountView 
 	}
 	if row.Provider == upstreamProviderTokenForce {
 		view.NativeCurrency = "CNY"
-		view.UnitPerUSD = row.BalanceUnit
+		view.UnitPerUSD = tokenForceLedgerUnit
 	}
 	return view
 }
@@ -1777,8 +1793,7 @@ func syncNewAPIBalance(ctx context.Context, client *http.Client, row ChannelUpst
 	if err == nil {
 		return result, cred, nil
 	}
-	var authErr *upstreamAuthError
-	if refreshed || strings.TrimSpace(cred.SessionID) == "" || !errors.As(err, &authErr) {
+	if refreshed || strings.TrimSpace(cred.SessionID) == "" || !upstreamProvenAuthenticationFailure(err) {
 		return upstreamBalanceResult{}, cred, err
 	}
 	updated, refreshErr := refreshNewAPICredential(ctx, client, row, cred)
@@ -1884,7 +1899,7 @@ func refreshNewAPICredential(ctx context.Context, client *http.Client, row Chann
 		"X-Auth-Session": cred.SessionID,
 	}, nil)
 	if err != nil {
-		return cred, &upstreamAuthError{err: err}
+		return cred, upstreamRefreshFailure(err)
 	}
 	var refreshed struct {
 		AccessToken     string          `json:"access_token"`
@@ -1892,11 +1907,11 @@ func refreshNewAPICredential(ctx context.Context, client *http.Client, row Chann
 		Session         json.RawMessage `json:"session"`
 	}
 	if err := decodeNewAPIData(body, &refreshed); err != nil {
-		return cred, &upstreamAuthError{err: err}
+		return cred, err
 	}
 	refreshed.AccessToken = strings.TrimSpace(refreshed.AccessToken)
 	if refreshed.AccessToken == "" {
-		return cred, &upstreamAuthError{err: fmt.Errorf("NewAPI 续期接口未返回访问令牌")}
+		return cred, fmt.Errorf("NewAPI 续期接口未返回访问令牌")
 	}
 	updated := newAPICredential{
 		AccessToken: refreshed.AccessToken,
@@ -2112,11 +2127,7 @@ func refreshSub2API(ctx context.Context, client *http.Client, row ChannelUpstrea
 		"refresh_token": cred.RefreshToken,
 	})
 	if err != nil {
-		var statusErr *upstreamHTTPError
-		if errors.As(err, &statusErr) && statusErr.Status >= 400 && statusErr.Status < 500 {
-			return cred, &upstreamAuthError{err: err}
-		}
-		return cred, err
+		return cred, upstreamRefreshFailure(err)
 	}
 	var auth struct {
 		AccessToken  string          `json:"access_token"`
@@ -2321,11 +2332,7 @@ func refreshTokenForce(ctx context.Context, client *http.Client, row ChannelUpst
 		"refreshToken": cred.RefreshToken,
 	})
 	if err != nil {
-		var statusErr *upstreamHTTPError
-		if errors.As(err, &statusErr) && statusErr.Status >= 400 && statusErr.Status < 500 {
-			return cred, &upstreamAuthError{err: err}
-		}
-		return cred, err
+		return cred, upstreamRefreshFailure(err)
 	}
 	var auth struct {
 		Token        string          `json:"token"`
@@ -2373,9 +2380,6 @@ func tokenForceBalance(ctx context.Context, client *http.Client, row ChannelUpst
 	if row.UserID <= 0 {
 		return upstreamBalanceResult{}, fmt.Errorf("TokenForce 组织 ID 无效")
 	}
-	if row.BalanceUnit <= 0 || math.IsNaN(row.BalanceUnit) || math.IsInf(row.BalanceUnit, 0) {
-		return upstreamBalanceResult{}, fmt.Errorf("TokenForce CNY/USD 换算值无效")
-	}
 	body, err := doUpstreamJSON(ctx, client, http.MethodGet,
 		upstreamEndpoint(row.BaseURL, fmt.Sprintf("/api/orgs/%d/balance", row.UserID)),
 		map[string]string{"Authorization": "Bearer " + cred.AccessToken}, nil)
@@ -2396,7 +2400,7 @@ func tokenForceBalance(ctx context.Context, client *http.Client, row ChannelUpst
 	if err != nil || math.IsNaN(raw) || math.IsInf(raw, 0) {
 		return upstreamBalanceResult{}, fmt.Errorf("TokenForce 未返回有效 currentBalance")
 	}
-	return upstreamBalanceResult{BalanceUSD: raw / row.BalanceUnit, BalanceRaw: raw, BalanceUnit: row.BalanceUnit}, nil
+	return upstreamBalanceResult{BalanceUSD: raw, BalanceRaw: raw, BalanceUnit: tokenForceLedgerUnit}, nil
 }
 
 func syncTokenForceBalance(ctx context.Context, client *http.Client, row ChannelUpstreamAccount, cred tokenForceCredential) (upstreamBalanceResult, tokenForceCredential, error) {
@@ -2438,6 +2442,13 @@ func syncTokenForceBalance(ctx context.Context, client *http.Client, row Channel
 func (m *Monitor) syncUpstreamCredential(ctx context.Context, row ChannelUpstreamAccount, credential any) (upstreamBalanceResult, any, error) {
 	client := m.channelUpstreamHTTPClient()
 	switch row.Provider {
+	case upstreamProviderOpenOx:
+		cred, ok := credential.(openOxCredential)
+		if !ok {
+			return upstreamBalanceResult{}, credential, fmt.Errorf("OpenOx 凭据格式无效")
+		}
+		result, _, err := readOpenOxProfile(ctx, client, row, cred)
+		return result, cred, err
 	case upstreamProviderNewAPI:
 		cred, ok := credential.(newAPICredential)
 		if !ok {
@@ -2514,6 +2525,9 @@ func upstreamBalanceFailureRetryAt(s Settings, domain string, now int64, failure
 }
 
 func applyUpstreamSyncResult(row *ChannelUpstreamAccount, result upstreamBalanceResult, err error, now int64, s Settings, secrets ...string) {
+	if errors.Is(err, context.Canceled) {
+		return
+	}
 	row.LastAttemptAt = now
 	if err == nil {
 		row.BalanceUSD = result.BalanceUSD
@@ -2538,10 +2552,14 @@ func applyUpstreamSyncResult(row *ChannelUpstreamAccount, result upstreamBalance
 		row.Status = upstreamStatusError
 		row.NextSyncAt = upstreamBalanceFailureRetryAt(s, row.Domain, now, row.ConsecutiveFails, err)
 	}
+	boundUpstreamFailure(err, now, &row.ConsecutiveFails, &row.Status, &row.NextSyncAt)
 }
 
 func (m *Monitor) credentialForAccount(row ChannelUpstreamAccount) (any, error) {
 	switch row.Provider {
+	case upstreamProviderOpenOx:
+		var cred openOxCredential
+		return cred, m.openUpstreamCredential(row, &cred)
 	case upstreamProviderNewAPI:
 		var cred newAPICredential
 		return cred, m.openUpstreamCredential(row, &cred)
@@ -2611,7 +2629,7 @@ func reconcileUpstreamEconomicUnitTx(tx *gorm.DB, previous ChannelUpstreamAccoun
 	if next == nil || previous.Provider != next.Provider || newAPIUpstreamAccountEpoch(previous) != newAPIUpstreamAccountEpoch(*next) {
 		return nil
 	}
-	if next.Provider != upstreamProviderNewAPI && next.Provider != upstreamProviderTokenForce {
+	if next.Provider != upstreamProviderNewAPI {
 		return nil
 	}
 	if !validUpstreamEconomicUnit(previous.BalanceUnit) || !validUpstreamEconomicUnit(next.BalanceUnit) ||
@@ -2650,6 +2668,9 @@ func reconcileUpstreamEconomicUnitTx(tx *gorm.DB, previous ChannelUpstreamAccoun
 }
 
 func upstreamEconomicUnitAt(row ChannelUpstreamAccount, ts int64) (float64, bool) {
+	if row.Provider == upstreamProviderTokenForce {
+		return tokenForceLedgerUnit, true
+	}
 	if !validUpstreamEconomicUnit(row.BalanceUnit) {
 		return 0, false
 	}
@@ -2705,7 +2726,13 @@ func (m *Monitor) persistUpstreamAccountIdentityChange(ctx context.Context, row 
 				return err
 			}
 		}
-		return reconcileUpstreamErrorLogAccountChange(tx, row.Domain, clearUsage, recoverErrorLogAuth, row.UpdatedAt)
+		if err := reconcileUpstreamErrorLogAccountChange(tx, row.Domain, clearUsage, recoverErrorLogAuth, row.UpdatedAt); err != nil {
+			return err
+		}
+		if recoverErrorLogAuth && !clearUsage {
+			return reactivateUpstreamAuxiliaryTasks(tx, *row)
+		}
+		return nil
 	})
 }
 
@@ -2870,20 +2897,26 @@ func (m *Monitor) syncStoredUpstreamAccountWithPriority(ctx context.Context, dom
 	if !row.Enabled {
 		return row, fmt.Errorf("该上游账户已停用自动同步")
 	}
+	observed := row
 	credential, err := m.credentialForAccount(row)
 	now := time.Now().Unix()
 	if err != nil {
 		err = &upstreamAuthError{err: err}
 		applyUpstreamSyncResult(&row, upstreamBalanceResult{}, err, now, m.cfg)
 		// 解密失败时保留原密文，避免临时密钥配置错误把可恢复凭据覆盖成空值。
-		if persistErr := m.persistUpstreamAccount(ctx, &row); persistErr != nil {
+		if persistErr := m.persistUpstreamBalanceResult(ctx, observed, &row); persistErr != nil {
 			return row, persistErr
 		}
 		return row, &upstreamStoredSyncError{message: row.LastError}
 	}
+	if (row.Status == upstreamStatusError || row.Status == upstreamStatusReconnect) && row.NextSyncAt > now {
+		return row, &upstreamStoredSyncError{message: "余额同步处于冷却或暂停状态，请等待或使用检测并恢复"}
+	}
 	originalSecrets := upstreamCredentialSecrets(credential)
 	var result upstreamBalanceResult
-	if cred, ok := credential.(aiCodeWithCredential); ok && row.Provider == upstreamProviderAICodeWith {
+	if probeErr := upstreamProbeBeforeRetry(ctx, m, row, "balance", row.Status, row.ConsecutiveFails); probeErr != nil {
+		err = probeErr
+	} else if cred, ok := credential.(aiCodeWithCredential); ok && row.Provider == upstreamProviderAICodeWith {
 		// 保存配置时已逐把验证；周期余额是账户级快照，只需一把 Key。
 		result, credential, err = syncAICodeWithBalanceSnapshot(ctx, m.channelUpstreamHTTPClient(), row, cred)
 	} else {
@@ -2892,7 +2925,12 @@ func (m *Monitor) syncStoredUpstreamAccountWithPriority(ctx context.Context, dom
 	allSecrets := append([]string{}, originalSecrets...)
 	allSecrets = append(allSecrets, upstreamCredentialSecrets(credential)...)
 	applyUpstreamSyncResult(&row, result, err, now, m.cfg, allSecrets...)
-	if persistErr := m.persistSyncedUpstreamAccount(ctx, &row, credential); persistErr != nil {
+	if sealErr := m.sealUpstreamAccountCredential(&row, credential); sealErr != nil {
+		return row, sealErr
+	}
+	commitCtx, commitCancel := upstreamUsageLocalCommitContext(ctx)
+	defer commitCancel()
+	if persistErr := m.persistUpstreamBalanceResult(commitCtx, observed, &row); persistErr != nil {
 		return row, persistErr
 	}
 	if err != nil {
@@ -2929,6 +2967,8 @@ func validateChannelUpstreamInput(in *channelUpstreamSaveInput) error {
 		return fmt.Errorf("站点地址必须属于所配置的主域名")
 	}
 	switch in.Provider {
+	case upstreamProviderOpenOx:
+		return validateOpenOxInput(in)
 	case upstreamProviderNewAPI:
 		if in.UserID <= 0 {
 			return fmt.Errorf("NewAPI 用户 ID 必须大于 0")
@@ -2989,11 +3029,11 @@ func validateChannelUpstreamInput(in *channelUpstreamSaveInput) error {
 		if len(in.RefreshToken) > 16<<10 {
 			return fmt.Errorf("TokenForce Refresh Token 过长")
 		}
-		if in.UnitPerUSD <= 0 || in.UnitPerUSD > 1_000_000 || math.IsNaN(in.UnitPerUSD) || math.IsInf(in.UnitPerUSD, 0) {
-			return fmt.Errorf("TokenForce CNY/每 USD 换算值必须大于 0")
-		}
+		// Accept old clients' field for compatibility, but it is no longer an
+		// independent FX setting. Cost correction belongs to paid/credit terms.
+		in.UnitPerUSD = tokenForceLedgerUnit
 	default:
-		return fmt.Errorf("当前只支持 NewAPI、Sub2API、AICodeWith 和 TokenForce MaaS")
+		return fmt.Errorf("当前只支持 NewAPI、Sub2API、AICodeWith、TokenForce MaaS 和 OpenOx")
 	}
 	return nil
 }
@@ -3054,7 +3094,7 @@ func (m *Monitor) getChannelUpstreamHandler(c *gin.Context) {
 		UsageSyncEnabled: row.UsageSyncEnabled, UserID: row.UserID, Account: m.channelUpstreamAccountView(row),
 	}
 	if row.Provider == upstreamProviderTokenForce {
-		view.UnitPerUSD = row.BalanceUnit
+		view.UnitPerUSD = tokenForceLedgerUnit
 	}
 	view.Account.APIKeySlots = m.aicodeWithSlotViews(ctx, row)
 	if row.Provider == upstreamProviderSub2API {
@@ -3141,12 +3181,33 @@ func (m *Monitor) saveChannelUpstreamHandler(c *gin.Context) {
 	var credential any
 	var existingAICodeWithCredential *aiCodeWithCredential
 	preserveSealedCredential := false
-	economicUnitChanged := false
 	credentialUpdated := in.AccessToken != "" || in.SessionID != "" || len(in.APIKeys) > 0 || len(in.AddAPIKeys) > 0 || len(in.AddAPIKeySlots) > 0 || len(in.RemoveAPIKeyIDs) > 0 || in.Password != "" || in.RefreshToken != ""
 	credentialMetadataChanged := len(in.RenameAPIKeySlots) > 0
 	sameIdentity := existingErr == nil && existing.Provider == in.Provider && existing.BaseURL == in.BaseURL
 	credentialSetChanged := false
 	switch in.Provider {
+	case upstreamProviderOpenOx:
+		if in.AccessToken != "" {
+			cred := openOxCredential{AccessToken: in.AccessToken}
+			// Validate identity before retaining any old cursor or balance. The
+			// supplied user_id is intentionally ignored; /profile is authoritative.
+			var userID int64
+			_, userID, err = readOpenOxProfile(ctx, m.channelUpstreamHTTPClient(), row, cred)
+			row.UserID = userID
+			credential = cred
+			sameIdentity = sameIdentity && userID == existing.UserID
+		} else if sameIdentity {
+			row.UserID = existing.UserID
+			if !row.Enabled {
+				row.Credential, row.CredentialVersion = existing.Credential, existing.CredentialVersion
+				preserveSealedCredential = true
+			} else {
+				credential, err = m.credentialForAccount(existing)
+			}
+		} else {
+			err = fmt.Errorf("首次连接或变更 OpenOx 站点时必须填写后台 auth_token")
+		}
+		row.Account = strconv.FormatInt(row.UserID, 10)
 	case upstreamProviderNewAPI:
 		row.UserID = in.UserID
 		row.Account = strconv.FormatInt(in.UserID, 10)
@@ -3245,9 +3306,6 @@ func (m *Monitor) saveChannelUpstreamHandler(c *gin.Context) {
 		row.Account = "org:" + strconv.FormatInt(in.UserID, 10)
 		row.BalanceUnit = in.UnitPerUSD
 		sameIdentity = sameIdentity && existing.UserID == in.UserID
-		if sameIdentity {
-			economicUnitChanged = math.Abs(existing.BalanceUnit-in.UnitPerUSD) > 1e-12
-		}
 		if in.RefreshToken != "" {
 			credential, err = importTokenForceSession(ctx, m.channelUpstreamHTTPClient(), row, in.RefreshToken)
 		} else if sameIdentity && !row.Enabled {
@@ -3273,34 +3331,13 @@ func (m *Monitor) saveChannelUpstreamHandler(c *gin.Context) {
 		row.UsageBackfillNextSyncAt, row.UsageBackfillConsecutiveFails = existing.UsageBackfillNextSyncAt, existing.UsageBackfillConsecutiveFails
 		row.UsageBackfillLastError = existing.UsageBackfillLastError
 		row.UsageBackfillProgress = existing.UsageBackfillProgress
-		// A 401/403 deliberately isolates automatic usage requests until an
-		// administrator supplies credentials again. Saving a replacement secret
-		// for the same account is that explicit recovery action: retain all local
-		// usage/cursor state, but make tail and history eligible to run again.
-		usageAuthIsolated := existing.UsageStatus == upstreamStatusReconnect ||
-			existing.UsageNextSyncAt == upstreamAccountIsolatedUntil ||
-			existing.UsageBackfillNextSyncAt == upstreamAccountIsolatedUntil
-		if credentialUpdated && usageAuthIsolated {
-			row.UsageStatus, row.UsageLastError = upstreamStatusPending, ""
-			row.UsageNextSyncAt, row.UsageConsecutiveFails = 0, 0
-			row.UsageBackfillNextSyncAt, row.UsageBackfillConsecutiveFails = 0, 0
-			row.UsageBackfillLastError = ""
-			row.UsageBackfillProgress = ""
-		}
 	}
 	if row.Provider == upstreamProviderTokenForce {
-		// BalanceUnit is an explicit settlement conversion, not a value learned
-		// from the upstream. Preserve the new form value after the common state
-		// copy above. Existing raw balance can be re-normalized even while the
-		// account is temporarily disabled.
-		row.BalanceUnit, row.UnitAssumed = in.UnitPerUSD, false
-		if row.BalanceKnown && row.BalanceUnit > 0 {
-			row.BalanceUSD = row.BalanceRaw / row.BalanceUnit
-		}
-		if economicUnitChanged {
-			// 新换算单位仅对之后新采集的窗口生效。保留历史水位，
-			// 否则重跑回填会用今天的单位渐进重写过去的成本。
-			row.UsageNextSyncAt, row.UsageConsecutiveFails = 0, 0
+		// Keep account identity, credentials and all usage/cursor history.
+		// The source's CNY label is metadata, not an additional conversion.
+		row.BalanceUnit, row.UnitAssumed = tokenForceLedgerUnit, false
+		if row.BalanceKnown {
+			row.BalanceUSD = row.BalanceRaw
 		}
 	}
 	if credentialSetChanged {
@@ -3358,7 +3395,7 @@ func (m *Monitor) saveChannelUpstreamHandler(c *gin.Context) {
 		}
 		clearUsage := existingErr == nil && !sameIdentity && !(in.Provider == upstreamProviderAICodeWith && existing.Provider == upstreamProviderAICodeWith && existing.BaseURL == in.BaseURL)
 		var persistErr error
-		recoverErrorLogAuth := row.Provider == upstreamProviderNewAPI && sameIdentity && credentialUpdated
+		recoverErrorLogAuth := false // Disabling never activates a paused task.
 		if cred, ok := credential.(aiCodeWithCredential); ok && row.Provider == upstreamProviderAICodeWith && !preserveSealedCredential {
 			persistErr = m.persistAICodeWithAccountChange(ctx, &row, cred, clearUsage, false)
 		} else {
@@ -3405,13 +3442,27 @@ func (m *Monitor) saveChannelUpstreamHandler(c *gin.Context) {
 		return
 	}
 	applyUpstreamSyncResult(&row, result, syncErr, now, m.cfg, credentialSecrets...)
+	// Only a successfully verified replacement credential reopens existing
+	// task schedules. Preserve facts and checkpoints; failed saves must not
+	// start another retry series with the same invalid credentials.
+	recoverCredentialTasks := sameIdentity && credentialUpdated && syncErr == nil
+	if recoverCredentialTasks && (row.UsageStatus == upstreamStatusReconnect || row.UsageStatus == upstreamStatusError || row.UsageNextSyncAt == upstreamAccountIsolatedUntil || row.UsageBackfillNextSyncAt == upstreamAccountIsolatedUntil) {
+		row.UsageStatus, row.UsageLastError = upstreamStatusPending, ""
+		if !row.UsageSyncEnabled {
+			row.UsageStatus = upstreamStatusDisabled
+		}
+		row.UsageNextSyncAt, row.UsageConsecutiveFails = 0, 0
+		row.UsageBackfillNextSyncAt, row.UsageBackfillConsecutiveFails = 0, 0
+		row.UsageBackfillLastError = ""
+		row.UsageBackfillProgress = ""
+	}
 	if err := m.sealUpstreamAccountCredential(&row, credential); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "保存上游配置失败"})
 		return
 	}
 	clearUsage := existingErr == nil && !sameIdentity && !(in.Provider == upstreamProviderAICodeWith && existing.Provider == upstreamProviderAICodeWith && existing.BaseURL == in.BaseURL)
 	var persistErr error
-	recoverErrorLogAuth := row.Provider == upstreamProviderNewAPI && sameIdentity && credentialUpdated
+	recoverErrorLogAuth := recoverCredentialTasks
 	if cred, ok := credential.(aiCodeWithCredential); ok && row.Provider == upstreamProviderAICodeWith {
 		persistErr = m.persistAICodeWithAccountChange(ctx, &row, cred, clearUsage, false)
 	} else {
@@ -3456,8 +3507,23 @@ func (m *Monitor) serveChannelUpstreamSync(c *gin.Context, timeout time.Duration
 		return
 	}
 	response := gin.H{"account": m.channelUpstreamAccountView(row)}
-	if err != nil {
-		response["sync_error"] = lastError(row)
+	var deferred *upstreamUsageDeferredError
+	if errors.As(err, &deferred) {
+		response["sync_skipped"] = true
+		response["sync_warning"] = deferred.warning
+		// Older clients also must not interpret an unexecuted check as success.
+		response["sync_error"] = deferred.Error()
+		if deferred.retryAt > 0 {
+			response["retry_at"] = deferred.retryAt
+		}
+	} else if err != nil {
+		message := strings.TrimSpace(lastError(row))
+		if message == "" {
+			// Local failures (for example, a busy account gate) may not have a
+			// persisted provider error. Never send an empty, falsy sync_error.
+			message = emptyResultError
+		}
+		response["sync_error"] = message
 		if retryAt := upstreamRetryAt(err); retryAt > 0 {
 			response["retry_at"] = retryAt
 		}

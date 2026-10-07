@@ -76,6 +76,13 @@ func validateFinanceGiftLocalRowBudget(rows []int) error {
 }
 
 func giftLocalDatabase(path string) (*gorm.DB, func(), error) {
+	// A relative URL path is not a relative SQLite filename. Resolve it
+	// before constructing the file URI; keep mode and filesystem guards intact.
+	var err error
+	path, err = filepath.Abs(path)
+	if err != nil {
+		return nil, nil, err
+	}
 	f, err := giftLocalOpenRegular(path, os.O_RDWR)
 	if err != nil {
 		return nil, nil, err
