@@ -30,6 +30,14 @@ func newTestMonitor(t *testing.T) *Monitor {
 	if err := m.openStore(t.TempDir() + "/t.db"); err != nil {
 		t.Fatalf("openStore: %v", err)
 	}
+	// Own only the local connection created here. Tests may later install
+	// sentinel source DBs or exercise Monitor shutdown themselves; the fixture
+	// must not close those unrelated resources via Monitor.Close.
+	localDB, err := m.storeDB.DB()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = localDB.Close() })
 	return m
 }
 

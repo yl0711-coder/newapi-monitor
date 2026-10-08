@@ -67,7 +67,7 @@ func (m *Monitor) stabilityHealth(ctx context.Context, nowTime time.Time) stabil
 	result := stabilityHealthResponse{
 		Enabled: m.cfg.StabilityEnabled, Status: "ok", CheckedAt: now, MainSamplerLastSuccess: m.lastRun.Load(),
 		ProblemSamplerLastSuccess: m.problemLastSuccess.Load(), ProblemSamplerLastFailure: m.problemLastFailure.Load(),
-		ProblemMigration:  m.stabilityProblemMigrationProgress(),
+		ProblemMigration:  m.stabilityProblemMigrationProgress(ctx),
 		NginxEnabled:      m.cfg.NginxEnabled && m.cfg.StabilityLegacyCollectorHealthEnabled,
 		NginxErrorEnabled: m.cfg.NginxErrorEnabled && m.cfg.StabilityLegacyCollectorHealthEnabled,
 	}

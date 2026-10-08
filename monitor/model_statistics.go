@@ -323,8 +323,11 @@ func (m *Monitor) buildModelStatisticsReport(ctx context.Context, windowKey stri
 	}
 	// user_directory_entries 是后台同步的全量展示缓存，能覆盖只有前置拒绝、
 	// 从未进入渠道的客户；查询失败或尚未同步时仍保留上面的日志内用户名。
-	for userID, username := range lookupUserNames(m.storeDB, userIDs) {
+	for userID, username := range lookupUserNames(m.storeDB.WithContext(ctx), userIDs) {
 		usernames[userID] = username
+	}
+	if err := ctx.Err(); err != nil {
+		return ModelStatisticsReport{}, err
 	}
 
 	sourceNote := "无可用渠道请求不会进入 NewAPI logs/metric_samples；已知客户维度按直采优先去重，普通前置拒绝不计入模型需求。user_id=0 无法证明跨来源是同一请求，为避免漏报会保守保留，可能重复计数（数量取决于未知身份重叠）。"

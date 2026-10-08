@@ -7,7 +7,7 @@ const source = name => readFileSync(new URL(`../../monitor/${name}`, import.meta
 
 test('upstream KPI scope notes wrap instead of hiding the internal-test basis',()=>{
   const css=source('stability.css');
-  const rule=css.match(/\.cm-kpis article\.upstream span,\s*\.cm-kpis article\.adjusted span\s*\{([^}]+)\}/);
+  const rule=css.match(/\.cm-kpis article\.upstream span,\s*\.cm-kpis article\.adjusted span,\s*\.cm-kpis article\.balance span\s*\{([^}]+)\}/);
   assert.ok(rule,'cost scope has a targeted wrapping rule');
   for(const property of ['white-space:normal','overflow:visible','text-overflow:clip','overflow-wrap:anywhere']){
     assert.ok(rule[1].includes(property),property);
@@ -604,12 +604,12 @@ test('daily bill stays visible after refresh with scope, never contaminates hour
   const {context,html}=dashboard(),ui=context.channelTest;
   const usage={requests:10,tokens:100,cost_usd:20};
   const daily={key:'spring',domain:'aicodewith.com',configured:true,usage,vendors:[],
-    upstream:{configured:true,usage_sync_enabled:true,balance_usd:50,status:'ok',usage_status:'ok'},
+    upstream:{configured:true,usage_sync_enabled:true,balance_usd:50,status:'ok',balance_fresh:true,balance_effective_status:'ok',usage_status:'ok'},
     upstream_usage:{available:true,integrity_status:'window_mismatch',granularity:'day',cost_usd:0},
     natural_day_bill:{from_ts:1788624000,to_ts:1788776343,usage:{available:true,complete:true,cost_usd:770.3163,
       adjusted_cost_available:true,adjusted_cost_usd:385.15815,recharge_ratio:2,integrity_status:'complete',data_until:1788776223,internal_filter_status:'not_configured'}}};
   const hourly={key:'hour',domain:'hour.example',configured:true,usage,vendors:[],
-    upstream:{configured:true,usage_sync_enabled:true,balance_usd:20},
+    upstream:{configured:true,usage_sync_enabled:true,balance_usd:20,status:'ok',balance_fresh:true,balance_effective_status:'ok'},
     upstream_usage:{available:true,complete:true,cost_usd:10,adjusted_cost_available:true,adjusted_cost_usd:5,internal_filter_status:'not_configured'}};
   for(const [index,domain] of [daily,hourly].entries())domain.vendors=[{name:'vendor',channels:[{id:index+1,name:'channel',current:true,status:1,usage,groups:[]}]}];
   ui.cm.report={meta:{from:'2026-09-06',to:'2026-09-07',data_coverage:{complete:true}},summary:{usage},domains:[daily,hourly]};
@@ -631,7 +631,7 @@ test('daily bill stays visible after refresh with scope, never contaminates hour
   assert.doesNotMatch(status,/sync-status bad/);
   assert.match(status,/不计入精确区间汇总/);
   daily.upstream.usage_effective_status='reconnect';
-  assert.match(context.window.channelDataStatus.issues(ui.cm.report)[0].detail,/认证已失效/);
+  assert.match(context.window.channelDataStatus.issues(ui.cm.report)[0].detail,/认证或权限异常.*检测并恢复/);
   daily.natural_day_bill.usage.complete=false;
   assert.match(ui.domainCard(daily,0,usage,false),/已取得账单合计/);
 });
@@ -711,7 +711,12 @@ test('cost display preserves zero, rejects invalid amounts and does not trust le
     assert.match(card,/cm-domain-upstream-adjusted[^]*?<b>—<\/b>/);
   }
   domain.upstream_usage.cost_usd=0;domain.upstream_usage.adjusted_cost_usd=0;
-  assert.match(ui.domainCard(domain,0,{},false),/cm-domain-upstream-spend[^]*?<b>\$0\.00<\/b>/);
+  card=ui.domainCard(domain,0,{},false);
+  assert.match(card,/cm-domain-upstream-spend[^]*?<b>\$0\.00<\/b>/);
+  assert.match(card,/已核验零消费/);
+  assert.doesNotMatch(card,/按历史充值比例修正/);
+  domain.upstream_usage.cost_usd=100;
+  assert.doesNotMatch(ui.domainCard(domain,0,{},false),/已核验零消费/);
 });
 
 test('sync reasons distinguish mixed costs from pending collection and respect selected range',()=>{
@@ -793,7 +798,7 @@ test('bill freshness respects synchronization, provisional and historical covera
   const baseline=()=>({upstream:{configured:true,usage_sync_enabled:true,usage_worker_enabled:true,usage_fresh:true,usage_effective_status:'ok',usage_data_until:1788832800},
     upstream_usage:{available:true,complete:true,cost_usd:0,integrity_status:'complete',data_until:1788710400}});
   assert.equal(note(baseline()),'','zero cost and a completed historical selection are not stale');
-  for(const [state,expected] of [['error','同步失败'],['reconnect','需重新连接'],['global_off','已暂停'],['disabled','已停用'],['unsupported','不支持'],['queued','待更新'],['pending','待更新'],['stale','同步延迟']]){
+  for(const [state,expected] of [['error','同步失败'],['reconnect','已暂停'],['global_off','已暂停'],['disabled','已停用'],['unsupported','不支持'],['queued','待更新'],['pending','待更新'],['stale','同步延迟']]){
     const domain=baseline();domain.upstream.usage_effective_status=state;
     assert.ok(note(domain).includes(expected),state);
     assert.match(note(domain),/上游官网核对/);
@@ -909,7 +914,7 @@ test('amount warnings do not hide a failed sync or quarantined evidence', () => 
     amounts_complete: false, usd_totals_complete: false, summary: {quarantined_events: 1},
     events: [{kind: 'topup', amount_known: true, amount_usd: 999, reparse_error: 'bad evidence'}]}));
   assert.match(html('cmUpstreamFunds'), /chip bad/);
-  assert.match(html('cmUpstreamFunds'), /需重新连接 · 金额待核验/);
+  assert.match(html('cmUpstreamFunds'), /已暂停，待检测 · 金额待核验/);
   assert.match(html('cmUpstreamFunds'), /已隔离（不计入汇总）/);
   assert.doesNotMatch(html('cmUpstreamFunds'), /\$999/);
 });

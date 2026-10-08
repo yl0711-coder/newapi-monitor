@@ -1209,6 +1209,19 @@ func TestAICodeWithSlotViewsUsePublishedAccountBackfillCompletion(t *testing.T) 
 	if len(views) != 1 || views[0].BackfillDone || views[0].BackfillLastError != "legacy timeout" || views[0].BackfillNextSyncAt != 99 || views[0].BackfillConsecutiveFails != 2 {
 		t.Fatalf("genuinely incomplete credential set was hidden by compatibility projection: %+v", views)
 	}
+	if views[0].BackfillPaused {
+		t.Fatal("scheduled per-key retry must not be presented as paused")
+	}
+	states[0].BackfillNextSyncAt = upstreamAccountIsolatedUntil
+	views = m.aicodeWithSlotViewsFromStates(row, states)
+	if !views[0].BackfillPaused || views[0].BackfillDone {
+		t.Fatal("isolated per-key history must be presented as paused")
+	}
+	row.UsageBackfillDone = true
+	views = m.aicodeWithSlotViewsFromStates(row, states)
+	if views[0].BackfillPaused || !views[0].BackfillDone {
+		t.Fatal("published completion must supersede a legacy per-key pause")
+	}
 }
 
 func TestReconcileAICodeWithPublishedBackfillStatesOnlyRepairsCurrentCredentialSet(t *testing.T) {
@@ -1547,7 +1560,7 @@ func TestUpstreamEconomicUnitChangePinsOpenHourBeforeFirstUsageSample(t *testing
 	m := newChannelUpstreamTestMonitor(t)
 	const domain = "open-hour-unit.example"
 	const changedAt int64 = 7200 + 17
-	previous := ChannelUpstreamAccount{Domain: domain, Provider: upstreamProviderTokenForce, BalanceUnit: 7.2}
+	previous := ChannelUpstreamAccount{Domain: domain, Provider: upstreamProviderNewAPI, BalanceUnit: 7.2}
 	next := previous
 	next.BalanceUnit, next.UpdatedAt = 8, changedAt
 	if err := m.storeDB.Create(&previous).Error; err != nil {
@@ -1556,7 +1569,7 @@ func TestUpstreamEconomicUnitChangePinsOpenHourBeforeFirstUsageSample(t *testing
 	if err := reconcileUpstreamEconomicUnitTx(m.storeDB, previous, &next); err != nil {
 		t.Fatal(err)
 	}
-	incoming := []ChannelUpstreamUsageHour{{Domain: domain, HourTs: 7200, BucketSeconds: 3600, Provider: upstreamProviderTokenForce, Requests: 4, Quota: 72, CostUSD: 9, UnitPerUSD: 8}}
+	incoming := []ChannelUpstreamUsageHour{{Domain: domain, HourTs: 7200, BucketSeconds: 3600, Provider: upstreamProviderNewAPI, Requests: 4, Quota: 72, CostUSD: 9, UnitPerUSD: 8}}
 	if err := m.persistUpstreamUsageWindow(t.Context(), domain, 7200, 10800, incoming, changedAt+60); err != nil {
 		t.Fatal(err)
 	}
@@ -1572,7 +1585,7 @@ func TestUpstreamEconomicUnitChangePinsOpenHourBeforeFirstUsageSample(t *testing
 func TestUpstreamEconomicUnitMultipleEditsKeepOriginallyEffectiveOpenHourUnit(t *testing.T) {
 	m := newChannelUpstreamTestMonitor(t)
 	const domain = "multi-edit-unit.example"
-	first := ChannelUpstreamAccount{Domain: domain, Provider: upstreamProviderTokenForce, BalanceUnit: 7.2}
+	first := ChannelUpstreamAccount{Domain: domain, Provider: upstreamProviderNewAPI, BalanceUnit: 7.2}
 	second := first
 	second.BalanceUnit, second.UpdatedAt = 8, 7200+10
 	if err := reconcileUpstreamEconomicUnitTx(m.storeDB, first, &second); err != nil {

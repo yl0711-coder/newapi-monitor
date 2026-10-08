@@ -103,16 +103,15 @@ func (r *financeGiftScopeBatchRunner) run(ctx context.Context, targets []finance
 		return result, err
 	}
 	for _, target := range plan {
-		if err := r.wait(ctx, r.nextAttempt.Sub(r.now())); err != nil {
-			result.Status = "paused"
-			return result, err
-		}
 		if err := ctx.Err(); err != nil {
 			result.Status = "paused"
 			return result, err
 		}
-		repair, repairErr := repairFinanceGiftBoundaryScope(ctx, r.db, r.source, target.SourceEpoch, target.HourTs, target.UserID, r.now().Unix())
-		r.nextAttempt = r.now().Add(financeGiftScopeBatchInterval)
+		repair, repairErr, paused := r.repairTarget(ctx, target)
+		if paused {
+			result.Status = "paused"
+			return result, repairErr
+		}
 		entry := financeGiftScopeBatchEntry{financeGiftScopeTarget: target, RowsChecked: repair.RowsChecked, RowsUpdated: repair.RowsUpdated, ContentHash: repair.ContentHash, FinishedAt: r.now().Unix(), Status: "unchanged"}
 		if repair.RowsUpdated > 0 {
 			entry.Status = "repaired"
@@ -142,4 +141,23 @@ func (r *financeGiftScopeBatchRunner) run(ctx context.Context, targets []finance
 	}
 	result.Status = "complete"
 	return result, nil
+}
+
+// Completed targets still undergo local proof verification and auditing, but
+// neither wait on nor advance the source cooldown. Failed source attempts do.
+func (r *financeGiftScopeBatchRunner) repairTarget(ctx context.Context, target financeGiftScopeTarget) (financeGiftScopeRepairResult, error, bool) {
+	var waitErr error
+	attempted := false
+	repair, err := repairFinanceGiftBoundaryScopeWithGate(ctx, r.db, r.source, target.SourceEpoch, target.HourTs, target.UserID, func() int64 { return r.now().Unix() }, func(ctx context.Context) error {
+		waitErr = r.wait(ctx, r.nextAttempt.Sub(r.now()))
+		if waitErr == nil {
+			waitErr = ctx.Err()
+		}
+		attempted = waitErr == nil
+		return waitErr
+	})
+	if attempted {
+		r.nextAttempt = r.now().Add(financeGiftScopeBatchInterval)
+	}
+	return repair, err, waitErr != nil
 }

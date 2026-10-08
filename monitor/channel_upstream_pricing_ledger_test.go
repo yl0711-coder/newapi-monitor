@@ -46,7 +46,7 @@ func TestRetryUpstreamPricingLocalStoreWaitsForShortWriterWithoutRefetch(t *test
 		released <- commitErr
 	}()
 	attempts := 0
-	err = retryUpstreamPricingLocalStore(context.Background(), func() error {
+	err = retryUpstreamLocalStore(context.Background(), func() error {
 		attempts++
 		return m.storeDB.Transaction(func(tx *gorm.DB) error {
 			var count int64

@@ -418,7 +418,13 @@ func (m *Monitor) sampleStabilityProblemWindow(ctx context.Context, fromTs, toTs
 	if toTs <= fromTs {
 		return 0, nil
 	}
-	gateCtx, gateCancel := context.WithTimeout(ctx, 12*time.Second)
+	gateBudget := 12 * time.Second
+	if lowPriority {
+		// Survive an ordinary source-duty cooldown; this changes only queue
+		// patience. The source query still has its own 9s deadline below.
+		gateBudget = backgroundSourceLowWaitTimeout
+	}
+	gateCtx, gateCancel := context.WithTimeout(ctx, gateBudget)
 	var release func()
 	var err error
 	if lowPriority {
@@ -877,8 +883,12 @@ func truncateStabilityProblemMigrationError(err error) string {
 }
 
 func (m *Monitor) loadStabilityProblemMigration() (*StabilityProblemClassificationMigration, error) {
+	return m.loadStabilityProblemMigrationContext(context.Background())
+}
+
+func (m *Monitor) loadStabilityProblemMigrationContext(ctx context.Context) (*StabilityProblemClassificationMigration, error) {
 	var state StabilityProblemClassificationMigration
-	err := m.storeDB.First(&state, "id = ? AND traffic_class_version = ?", 1, stabilityTrafficClassificationVersion).Error
+	err := m.storeDB.WithContext(ctx).First(&state, "id = ? AND traffic_class_version = ?", 1, stabilityTrafficClassificationVersion).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		return nil, nil
 	}
@@ -942,9 +952,9 @@ func stabilityProblemMigrationEstimate(state StabilityProblemClassificationMigra
 	return &seconds, "observed", rateSecondsPerSecond / 60, elapsed
 }
 
-func (m *Monitor) stabilityProblemMigrationProgress() stabilityProblemMigrationProgress {
+func (m *Monitor) stabilityProblemMigrationProgress(ctx context.Context) stabilityProblemMigrationProgress {
 	result := stabilityProblemMigrationProgress{Enabled: m.cfg.StabilityClassificationMigrationEnabled, Status: "disabled"}
-	state, err := m.loadStabilityProblemMigration()
+	state, err := m.loadStabilityProblemMigrationContext(ctx)
 	if err != nil {
 		result.Status = "error"
 		result.LastError = truncateStabilityProblemMigrationError(err)

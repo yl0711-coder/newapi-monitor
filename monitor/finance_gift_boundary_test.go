@@ -75,6 +75,22 @@ func TestFinanceGiftBoundaryGroupParticipatesInEvidenceHash(t *testing.T) {
 	}
 }
 
+func TestFetchFinanceGiftBoundaryPreservesUnknownSourceGroup(t *testing.T) {
+	source := financeGiftBoundarySource(t)
+	for i, group := range []any{nil, "", "business"} {
+		if _, err := source.Exec("INSERT INTO logs(id,user_id,created_at,type,quota,token_id,`group`) VALUES(?,7,100,2,10,1,?)", i+1, group); err != nil {
+			t.Fatal(err)
+		}
+	}
+	events, err := fetchFinanceGiftBoundaryEvents(context.Background(), source, 0, []int64{7})
+	if err != nil || len(events) != 3 {
+		t.Fatalf("fetch: %v, events=%+v", err, events)
+	}
+	if events[0].GroupKnown || !events[1].GroupKnown || !events[2].GroupKnown || events[2].Group != "business" {
+		t.Fatalf("NULL must remain unknown; explicit empty is known: %+v", events)
+	}
+}
+
 func mustFinanceGiftBoundarySQL(t *testing.T, users int) string {
 	t.Helper()
 	query, err := financeGiftBoundarySQL(users)

@@ -124,10 +124,12 @@ type Settings struct {
 	UpstreamSyncTimeoutSec int  // MONITOR_UPSTREAM_SYNC_TIMEOUT_SECONDS,默认 15
 	// 上游使用日志与余额是两条独立同步链。日志全局开关默认关闭，
 	// 只有全局开关与账户开关同时开启才会后台读取。页面访问绝不会触发上游请求。
-	UpstreamUsageSyncEnabled         bool // MONITOR_UPSTREAM_USAGE_SYNC_ENABLED,默认 false；新功能灰度闸门
-	UpstreamAICodeWithRecordsEnabled bool // MONITOR_AICODEWITH_RECORDS_ENABLED; record-based hourly bills, within the existing usage gate
-	UpstreamUsageSyncMinutes         int  // MONITOR_UPSTREAM_USAGE_SYNC_MINUTES,默认 20，最小 15
-	UpstreamUsageBackfillDays        int  // MONITOR_UPSTREAM_USAGE_BACKFILL_DAYS,默认 90，首次低频补齐范围
+	UpstreamUsageSyncEnabled          bool     // MONITOR_UPSTREAM_USAGE_SYNC_ENABLED,默认 false；新功能灰度闸门
+	UpstreamUsageHistoryRepairEnabled bool     // MONITOR_UPSTREAM_USAGE_HISTORY_REPAIR_ENABLED,默认 false；仅管理员单日历史前缀修复
+	UpstreamUsageHistoryRepairDomains []string // MONITOR_UPSTREAM_USAGE_HISTORY_REPAIR_DOMAINS,只允许显式列出的主域名
+	UpstreamAICodeWithRecordsEnabled  bool     // MONITOR_AICODEWITH_RECORDS_ENABLED; record-based hourly bills, within the existing usage gate
+	UpstreamUsageSyncMinutes          int      // MONITOR_UPSTREAM_USAGE_SYNC_MINUTES,默认 20，最小 15
+	UpstreamUsageBackfillDays         int      // MONITOR_UPSTREAM_USAGE_BACKFILL_DAYS,默认 90，首次低频补齐范围
 	// 默认 1 保持所有上游请求全局串行；生产观察达标后最多升到 2。
 	// 同一 host 仍由 upstreamHostGuard 强制单并发，不能被此开关绕过。
 	UpstreamMaxConcurrency int // MONITOR_UPSTREAM_MAX_CONCURRENCY,默认 1，范围 1～2
@@ -176,6 +178,12 @@ type Settings struct {
 	FinanceReportSnapshotReadEnabled   bool // MONITOR_FINANCE_REPORT_SNAPSHOT_READ_ENABLED，默认 false；独立灰度读取闸门
 	FinanceFastSnapshotEnabled         bool // MONITOR_FINANCE_FAST_SNAPSHOT_ENABLED，默认 false；有界快照先返回，统一队列后台核验/生成
 	FinanceFactsReadIsolationEnabled   bool // MONITOR_FINANCE_FACTS_READ_ISOLATION_ENABLED，默认 false；经营核算事实使用单独只读 SQLite 连接
+	// Optional root-only readonly handoff preview. Both empty means disabled.
+	FinanceGiftHandoffPreviewDir            string // MONITOR_FINANCE_GIFT_HANDOFF_PREVIEW_DIR
+	FinanceGiftHandoffPreviewSHA256         string // MONITOR_FINANCE_GIFT_HANDOFF_PREVIEW_SHA256
+	FinanceGiftHandoffApprovalEnabled       bool   // MONITOR_FINANCE_GIFT_HANDOFF_APPROVAL_ENABLED; records authorization only, default false
+	FinanceGiftHandoffLocalExecutionEnabled bool   // MONITOR_FINANCE_GIFT_HANDOFF_LOCAL_EXECUTION_ENABLED; local snapshot only, default false
+	FinanceGiftHandoffLiveExecutionEnabled  bool   // MONITOR_FINANCE_GIFT_HANDOFF_LIVE_EXECUTION_ENABLED; explicit finite execution core, default false; no auto-start
 	// CUR 核算产物由离线命令生成并完成哈希自校验。Monitor 只读本地文件，
 	// 不访问 AWS/S3；独立开关默认关闭，路径必须为绝对路径。
 	FinanceCURArtifactEnabled bool   // MONITOR_FINANCE_CUR_ARTIFACT_ENABLED，默认 false
@@ -441,6 +449,8 @@ func LoadSettings() Settings {
 		UpstreamSyncMinutes:                      envInt("MONITOR_UPSTREAM_SYNC_MINUTES", 5),
 		UpstreamSyncTimeoutSec:                   envInt("MONITOR_UPSTREAM_SYNC_TIMEOUT_SECONDS", 15),
 		UpstreamUsageSyncEnabled:                 env("MONITOR_UPSTREAM_USAGE_SYNC_ENABLED", "false") == "true",
+		UpstreamUsageHistoryRepairEnabled:        env("MONITOR_UPSTREAM_USAGE_HISTORY_REPAIR_ENABLED", "false") == "true",
+		UpstreamUsageHistoryRepairDomains:        envCSV("MONITOR_UPSTREAM_USAGE_HISTORY_REPAIR_DOMAINS"),
 		UpstreamAICodeWithRecordsEnabled:         env("MONITOR_AICODEWITH_RECORDS_ENABLED", "false") == "true",
 		UpstreamUsageSyncMinutes:                 envInt("MONITOR_UPSTREAM_USAGE_SYNC_MINUTES", 20),
 		UpstreamErrorLogSyncEnabled:              env("MONITOR_UPSTREAM_ERRORLOG_SYNC_ENABLED", "false") == "true",
@@ -465,6 +475,11 @@ func LoadSettings() Settings {
 		FinanceReportSnapshotReadEnabled:         env("MONITOR_FINANCE_REPORT_SNAPSHOT_READ_ENABLED", "false") == "true",
 		FinanceFastSnapshotEnabled:               env("MONITOR_FINANCE_FAST_SNAPSHOT_ENABLED", "false") == "true",
 		FinanceFactsReadIsolationEnabled:         env("MONITOR_FINANCE_FACTS_READ_ISOLATION_ENABLED", "false") == "true",
+		FinanceGiftHandoffPreviewDir:             strings.TrimSpace(env("MONITOR_FINANCE_GIFT_HANDOFF_PREVIEW_DIR", "")),
+		FinanceGiftHandoffPreviewSHA256:          strings.TrimSpace(env("MONITOR_FINANCE_GIFT_HANDOFF_PREVIEW_SHA256", "")),
+		FinanceGiftHandoffApprovalEnabled:        env("MONITOR_FINANCE_GIFT_HANDOFF_APPROVAL_ENABLED", "false") == "true",
+		FinanceGiftHandoffLocalExecutionEnabled:  env("MONITOR_FINANCE_GIFT_HANDOFF_LOCAL_EXECUTION_ENABLED", "false") == "true",
+		FinanceGiftHandoffLiveExecutionEnabled:   env("MONITOR_FINANCE_GIFT_HANDOFF_LIVE_EXECUTION_ENABLED", "false") == "true",
 		FinanceCURArtifactEnabled:                env("MONITOR_FINANCE_CUR_ARTIFACT_ENABLED", "false") == "true",
 		FinanceCURArtifactPath:                   strings.TrimSpace(env("MONITOR_FINANCE_CUR_ARTIFACT_PATH", "")),
 		PortalAddr:                               env("MONITOR_PORTAL_ADDR", ""),

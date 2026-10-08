@@ -21,7 +21,7 @@ const (
 	financePeriodCacheMaxBytes   = 32 << 20
 	financePeriodCacheTTL        = 7 * 24 * time.Hour
 	financePeriodSnapshotDirName = "finance-period-cache"
-	financePeriodCacheSchema     = 17
+	financePeriodCacheSchema     = 22
 )
 
 // financePeriodComponent is the expensive, independently reproducible part of
@@ -243,14 +243,14 @@ func (m *Monitor) buildFinancePeriodComponent(
 		return financePeriodComponent{}, false, err
 	}
 	if currentFingerprint != fingerprint {
-		return financePeriodComponent{}, false, errFinanceFactsChanged
+		return financePeriodComponent{}, false, financeFactChange("month-publication", "source-fingerprint")
 	}
 	currentRelevant, err := m.financeRelevantUpstreamAccounts(ctx, scope, accounts)
 	if err != nil {
 		return financePeriodComponent{}, false, err
 	}
 	if !maps.Equal(boundaries, financeBillAccountBoundaries(currentRelevant)) {
-		return financePeriodComponent{}, false, errFinanceFactsChanged
+		return financePeriodComponent{}, false, financeFactChange("month-publication", "account-boundary")
 	}
 	payload, err := json.Marshal(component)
 	if err != nil {

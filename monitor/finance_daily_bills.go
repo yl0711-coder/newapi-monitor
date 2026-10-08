@@ -134,7 +134,7 @@ func projectFinanceDailyBills(rows []ChannelUpstreamUsageHour, scope stabilitySc
 			// The daily drilldown follows the parent period's chosen source.
 			// Otherwise a domain with a historical gap may contribute on some
 			// days although the monthly statement excludes its recharge source.
-			if metric.AdjustedCostAvailable && correctionDomains[domain] {
+			if amounts[domain].RechargeCorrected.MicroUSD != "" && correctionDomains[domain] {
 				corrected, ok := financeMoneyInt64(amounts[domain].RechargeCorrected)
 				if !ok {
 					return nil, fmt.Errorf("每日修正账单金额无效")
@@ -144,7 +144,7 @@ func projectFinanceDailyBills(rows []ChannelUpstreamUsageHour, scope stabilitySc
 				}
 				bill.RechargeCorrection.AvailableDomains++
 				bill.CorrectionByDomain[domain] = corrected
-				if metric.Complete {
+				if metric.Complete && metric.AdjustedCostAvailable {
 					bill.RechargeCorrection.CompleteDomains++
 				}
 			}

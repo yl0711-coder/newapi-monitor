@@ -575,9 +575,33 @@ type InfraSnapshot struct {
 
 // computeInfraSnapshot 从本地 infra_samples 聚合最新视图(零 AWS 调用,纯读本地)。
 func (m *Monitor) computeInfraSnapshot(nowUnix int64) InfraSnapshot {
-	latest := m.storeInfraLatest()
+	snap, err := m.computeInfraSnapshotContext(context.Background(), nowUnix)
+	if err != nil {
+		slog.Warn("基础设施快照读取失败", "err", err)
+		return InfraSnapshot{RegistryError: "基础设施本地数据暂不可用", DataAgeSec: -1}
+	}
+	return snap
+}
+
+func (m *Monitor) computeInfraSnapshotContext(ctx context.Context, nowUnix int64) (InfraSnapshot, error) {
+	return m.buildInfraSnapshotContext(ctx, nowUnix, true)
+}
+
+// Alert evaluation needs current resource facts, not its own display history.
+// Keeping that optional avoids making an alert-history read failure suppress
+// otherwise valid resource alerts.
+func (m *Monitor) buildInfraSnapshotContext(ctx context.Context, nowUnix int64, includeAlertHistory bool) (InfraSnapshot, error) {
+	ctx, cancel := context.WithTimeout(ctx, infraReadTimeout)
+	defer cancel()
+	latest, err := m.storeInfraLatestContext(ctx)
+	if err != nil {
+		return InfraSnapshot{}, fmt.Errorf("infra metrics: %w", err)
+	}
 	retired := retiredInfraResources(latest)
-	assets, incarnations, registryErr := m.infraAssetProjection()
+	assets, incarnations, registryErr := m.infraAssetProjectionContext(ctx)
+	if err := ctx.Err(); err != nil {
+		return InfraSnapshot{}, err
+	}
 	type acc struct {
 		rtype    string
 		metrics  map[string]float64
@@ -675,9 +699,12 @@ func (m *Monitor) computeInfraSnapshot(nowUnix int64) InfraSnapshot {
 		res.MissingMetrics = missingMetrics
 		res.CoverageComplete = len(missingMetrics) == 0
 		if incarnations[name] > 1 {
-			res.Containers = m.hostContainerSnapshot(name, nowUnix, assets[name].FirstSeen+1)
+			res.Containers, err = m.hostContainerSnapshotContext(ctx, name, nowUnix, assets[name].FirstSeen+1)
 		} else {
-			res.Containers = m.hostContainerSnapshot(name, nowUnix)
+			res.Containers, err = m.hostContainerSnapshotContext(ctx, name, nowUnix)
+		}
+		if err != nil {
+			return InfraSnapshot{}, fmt.Errorf("infra containers: %w", err)
 		}
 		addDerivedPct(&res) // 派生百分比键(前端直接用),需在算 status 前完成
 		res.Status = m.infraStatus(res)
@@ -738,7 +765,12 @@ func (m *Monitor) computeInfraSnapshot(nowUnix int64) InfraSnapshot {
 	snap.Groups = buildInfraGroups(snap.Instances, snap.Databases, snap.LoadBalancers)
 	// 各资源的指标趋势改为前端按需拉(GET /infra/series),不在快照里预算。
 	snap.Overview = buildOverview(snap)
-	snap.Alerts = m.recentInfraAlerts(nowUnix, 20)
+	if includeAlertHistory {
+		snap.Alerts, err = m.recentInfraAlertsContext(ctx, nowUnix, 20)
+		if err != nil {
+			return InfraSnapshot{}, fmt.Errorf("infra recent alerts: %w", err)
+		}
+	}
 	visibleAlerts := snap.Alerts[:0]
 	for _, alert := range snap.Alerts {
 		if !m.monitorOwnsInfraResource(alert.Target, "", "") {
@@ -756,7 +788,10 @@ func (m *Monitor) computeInfraSnapshot(nowUnix int64) InfraSnapshot {
 		}
 	}
 	snap.Alerts = visibleAlerts
-	return snap
+	if err := ctx.Err(); err != nil {
+		return InfraSnapshot{}, err
+	}
+	return snap, nil
 }
 
 // requiredInfraMetrics defines the minimum evidence needed before a resource
@@ -977,12 +1012,24 @@ func replaceHostContainerSnapshotsWithDB(tx *gorm.DB, node string, rows []HostCo
 }
 
 func (m *Monitor) hostContainerSnapshot(node string, now int64, since ...int64) []InfraContainer {
+	containers, err := m.hostContainerSnapshotContext(context.Background(), node, now, since...)
+	if err != nil {
+		slog.Warn("读取主机容器状态失败", "err", err)
+	}
+	return containers
+}
+
+func (m *Monitor) hostContainerSnapshotContext(ctx context.Context, node string, now int64, since ...int64) ([]InfraContainer, error) {
+	ctx, cancel := context.WithTimeout(ctx, infraReadTimeout)
+	defer cancel()
 	var rows []HostContainerSnapshot
-	query := m.storeDB.Where("node = ?", node)
+	query := m.storeDB.WithContext(ctx).Where("node = ?", node)
 	if len(since) > 0 {
 		query = query.Where("last_seen >= ?", since[0])
 	}
-	warnReadErr("host container snapshot", query.Order("name").Find(&rows))
+	if err := query.Order("name").Find(&rows).Error; err != nil {
+		return nil, err
+	}
 	out := make([]InfraContainer, 0, len(rows))
 	for _, row := range rows {
 		age := now - row.LastSeen
@@ -997,7 +1044,7 @@ func (m *Monitor) hostContainerSnapshot(node string, now int64, since ...int64) 
 		out = append(out, InfraContainer{Name: row.Name, State: row.State, Health: row.Health,
 			RestartCount: row.RestartCount, AgeSec: age, Status: status})
 	}
-	return out
+	return out, nil
 }
 
 // buildProbe 把某域名的探活指标组装成 ProbeResource 并按阈值定级。
@@ -1433,7 +1480,13 @@ func (m *Monitor) evaluateInfraAlerts(now int64) {
 	if !c.Enabled || c.SMTPHost == "" || c.Recipients == "" {
 		return
 	}
-	snap := m.computeInfraSnapshot(now)
+	snap, err := m.buildInfraSnapshotContext(context.Background(), now, false)
+	if err != nil {
+		// Local read failure is not evidence of an unhealthy monitored host.
+		// Do not emit resource alarms from an empty or partial snapshot.
+		slog.Warn("跳过基础设施告警评估:本地快照读取失败", "err", err)
+		return
+	}
 	if snap.RegistryError != "" {
 		m.fire(c, "infra_registry_failed", "resource-registry", "资源目录不可用", snap.RegistryError, now)
 		// Only host/ECS membership depends on the registry. Do not silence

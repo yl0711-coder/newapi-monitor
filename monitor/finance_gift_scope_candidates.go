@@ -93,7 +93,10 @@ WHERE e.source_epoch=s.source_epoch AND e.hour_ts=s.hour_ts AND e.user_id=s.user
 			return result, err
 		}
 		if state.Rows > financeGiftLocalMaxRows {
-			result.Status, result.StopReason, result.Blocked = "blocked", "whole_hour_exceeds_row_limit", &target
+			result.StopReason, result.Blocked = "whole_hour_exceeds_row_limit", &target
+			if len(result.Entries) == 0 {
+				result.Status = "blocked"
+			}
 			break // Never split an hour or skip it to make progress look better.
 		}
 		if state.Rows > int64(financeGiftLocalMaxRows-result.Rows) {

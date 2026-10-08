@@ -1529,24 +1529,26 @@ func (m *Monitor) retryStabilityBackfillHandler(c *gin.Context) {
 }
 
 func (m *Monitor) stabilityBackfillStatusHandler(c *gin.Context) {
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 2*time.Second)
+	defer cancel()
 	var job StabilityBackfillJob
-	if err := m.storeDB.Order("updated_at DESC").First(&job).Error; err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+	if err := m.storeDB.WithContext(ctx).Order("updated_at DESC").First(&job).Error; err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
 	retention := m.cfg.stabilityStorageDays()
 	to := finalizedStabilityHourTo(time.Now().Unix())
-	coverage := m.stabilityDataCoverage(c.Request.Context(), to-int64(retention)*86400, to, time.Now().Unix())
+	coverage := m.stabilityDataCoverage(ctx, to-int64(retention)*86400, to, time.Now().Unix())
 	m.backgroundSourceScheduleMu.Lock()
 	notBefore := int64(0)
 	if !m.stabilitySourceNotBefore.IsZero() {
 		notBefore = m.stabilitySourceNotBefore.UnixMilli()
 	}
 	m.backgroundSourceScheduleMu.Unlock()
-	problemMigration := m.stabilityProblemMigrationProgress()
+	problemMigration := m.stabilityProblemMigrationProgress(ctx)
 	hourlyMigrationStatus := "not_required"
 	var hourlyMigration StabilityBackfillJob
-	if err := m.storeDB.Where("kind = ?", stabilityMigrationJobKind).Order("updated_at DESC").First(&hourlyMigration).Error; err == nil {
+	if err := m.storeDB.WithContext(ctx).Where("kind = ?", stabilityMigrationJobKind).Order("updated_at DESC").First(&hourlyMigration).Error; err == nil {
 		hourlyMigrationStatus = hourlyMigration.Status
 	} else if !errors.Is(err, gorm.ErrRecordNotFound) {
 		hourlyMigrationStatus = "error"

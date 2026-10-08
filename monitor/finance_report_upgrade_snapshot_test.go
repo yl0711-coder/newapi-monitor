@@ -3,6 +3,7 @@ package monitor
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -44,6 +45,73 @@ func TestFinanceUpgradeSnapshotDisplayOnlyNeverPromotesMoney(t *testing.T) {
 		if _, _, ok := m.financeFastSnapshotPayload(candidate, now); ok {
 			t.Fatal("old snapshot promoted into current in-memory key")
 		}
+	}
+}
+
+func TestFinanceUpgradeSnapshotRetainsDeployedProjectionFallback(t *testing.T) {
+	m, request, now, payload := newFinanceUpgradeSnapshotFixture(t)
+	// A distinct range has only the already-supported deployed projection.
+	request.from = time.Unix(0, 0)
+	payload = bytes.Replace(payload, []byte(`"from":3600`), []byte(`"from":0`), 1)
+	key := financeUpgradeProjectionKey(request, "accounting-delivery-compat-v1")
+	if err := m.persistFinanceReportSnapshotShadow(key, "legacy", payload, now); err != nil {
+		t.Fatal(err)
+	}
+	got, ok, err := m.loadFinanceUpgradeSnapshot(request, now)
+	if err != nil || !ok || !bytes.Equal(got, payload) {
+		t.Fatalf("deployed fallback: ok=%t err=%v", ok, err)
+	}
+	if _, _, _, ok, err := m.loadFinanceReportSnapshot(request, now); err != nil || ok {
+		t.Fatal("legacy promoted to current", err)
+	}
+}
+
+func TestFinanceUpgradeHourDiagnosticsPreservesV7MoneyWithoutPromotion(t *testing.T) {
+	m, request, now, _ := newFinanceUpgradeSnapshotFixture(t)
+	payload := []byte(fmt.Sprintf(`{"enabled":true,"from":3600,"to":10800,"generated_at":%d,"statement":{"contribution_profit":{"micro_usd":"42"},"contribution_margin_percent":"1.2"},"cost_details":[{"provider":"tokenforce"}],"pairing_audit":{"paired_rows":3}}`, now.Unix()))
+	key := financeUpgradeProjectionKey(request, "accounting-recharge-zero-proof-v7")
+	if err := m.persistFinanceReportSnapshotShadow(key, "v7-source", payload, now); err != nil {
+		t.Fatal(err)
+	}
+	got, ok, err := m.loadFinanceUpgradeSnapshot(request, now)
+	if err != nil || !ok || !bytes.Equal(got, payload) {
+		t.Fatalf("display-only diagnostic upgrade changed amounts: ok=%t err=%v", ok, err)
+	}
+	if _, _, _, ok, err := m.loadFinanceReportSnapshot(request, now); err != nil || ok {
+		t.Fatal("v7 without hour diagnosis promoted to current v8 report", err)
+	}
+}
+
+func TestFinanceUpgradeSnapshotV3PreservesKnownMoneyButNotOldExactContribution(t *testing.T) {
+	m, request, now, _ := newFinanceUpgradeSnapshotFixture(t)
+	statement := `{"known_user_consumption":{"micro_usd":"24000000"},"known_contribution_profit":{"micro_usd":"8000000"},"contribution_profit":{"micro_usd":"8000000"},"contribution_margin_percent":"66.67","paired_contribution_margin_percent":"66.67"}`
+	payload := []byte(fmt.Sprintf(`{"enabled":true,"from":3600,"to":10800,"generated_at":%d,"unknown_extension":9007199254740993,"statement":%s,"periods":[{"period":"2026-05","statement":%s}],"days":[{"date":"2026-05-01","statement":%s}]}`, now.Unix(), statement, statement, statement))
+	key := financeUpgradeProjectionKey(request, "accounting-partial-correction-v3")
+	if err := m.persistFinanceReportSnapshotShadow(key, "old-source", payload, now); err != nil {
+		t.Fatal(err)
+	}
+	got, ok, err := m.loadFinanceUpgradeSnapshot(request, now)
+	if err != nil || !ok {
+		t.Fatalf("v3 known amounts lost during upgrade: %v", err)
+	}
+	var report financeOperatingReport
+	if err := json.Unmarshal(got, &report); err != nil {
+		t.Fatal(err)
+	}
+	for _, s := range []financeStatementView{report.Statement, report.Periods[0].Statement, report.Days[0].Statement} {
+		if s.ContributionProfit != nil || s.ContributionMargin != nil || s.KnownContributionProfit.MicroUSD != "8000000" || s.KnownUserConsumption.MicroUSD != "24000000" || s.PairedContributionMargin == nil {
+			t.Fatalf("old exact claim reused or known amounts removed: %+v", s)
+		}
+	}
+	if !bytes.Contains(got, []byte(`"unknown_extension":9007199254740993`)) {
+		t.Fatal("upgrade lost an extension or its integer precision")
+	}
+	if _, _, _, ok, err := m.loadFinanceReportSnapshot(request, now); err != nil || ok {
+		t.Fatal("sanitized prior snapshot became current proof", err)
+	}
+	stored, _, _, ok, err := m.loadFinanceReportSnapshotKey(request, key, now)
+	if err != nil || !ok || !bytes.Equal(stored, payload) {
+		t.Fatal("upgrade mutated the stored historical snapshot", err)
 	}
 }
 
@@ -100,7 +168,7 @@ func TestFinanceUpgradeSnapshotIsolationAndExpiry(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				raw = bytes.Replace(raw, []byte("daily-internal-diagnostics-v1"), []byte("daily-internal-diagnostics-v0"), 1)
+				raw = bytes.Replace(raw, []byte("accounting-amount-evidence-v2"), []byte("unsupported-accounting-v0"), 1)
 				if err := os.WriteFile(path, raw, 0600); err != nil {
 					t.Fatal(err)
 				}

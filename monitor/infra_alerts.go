@@ -1,6 +1,7 @@
 package monitor
 
 import (
+	"context"
 	"log/slog"
 	"strings"
 	"time"
@@ -11,6 +12,16 @@ import (
 // recentInfraAlerts 取最近 N 条【服务端监控】告警(kind 前缀 infra_),按时间倒序。
 // 复用既有 alert_log 表(fire 触发时已写入);_FAILED 记为 warn,其余记 bad。
 func (m *Monitor) recentInfraAlerts(nowUnix int64, limit int) []InfraAlert {
+	alerts, err := m.recentInfraAlertsContext(context.Background(), nowUnix, limit)
+	if err != nil {
+		slog.Warn("读取服务端近期告警失败", "err", err)
+	}
+	return alerts
+}
+
+func (m *Monitor) recentInfraAlertsContext(ctx context.Context, nowUnix int64, limit int) ([]InfraAlert, error) {
+	ctx, cancel := context.WithTimeout(ctx, infraReadTimeout)
+	defer cancel()
 	if limit <= 0 {
 		limit = 20
 	}
@@ -18,10 +29,9 @@ func (m *Monitor) recentInfraAlerts(nowUnix int64, limit int) []InfraAlert {
 	// SQLite LIKE does not treat a backslash as an escape character unless an
 	// ESCAPE clause is supplied. Prefix matching with substr is explicit and
 	// cannot accidentally treat '_' as a wildcard.
-	query := m.monitorOwnedInfraAlertsQuery(m.storeDB)
+	query := m.monitorOwnedInfraAlertsQuery(m.storeDB.WithContext(ctx))
 	if err := query.Where("substr(kind,1,6) = ?", "infra_").Order("ts DESC").Limit(limit).Find(&logs).Error; err != nil {
-		slog.Warn("读取服务端近期告警失败", "err", err)
-		return nil
+		return nil, err
 	}
 	out := make([]InfraAlert, 0, len(logs))
 	for _, l := range logs {
@@ -43,5 +53,5 @@ func (m *Monitor) recentInfraAlerts(nowUnix int64, limit int) []InfraAlert {
 			Status: st,
 		})
 	}
-	return out
+	return out, nil
 }

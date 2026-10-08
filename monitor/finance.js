@@ -15,12 +15,12 @@
     paired_verified: '配对已核验', partially_paired: '部分配对',
     binding_required: '待完成来源归属', not_enrolled: '未进入配对账本', not_required: '暂不纳入',
     in_progress: '闭环进行中', bill_not_connected: '账单未接入',
-    bill_missing: '账单证据缺失', correction_missing: '缺修正依据', source_binding_required: '成本来源待归属',
+    bill_missing: '账单证据缺失', correction_missing: '缺修正依据', correction_ambiguous: '历史比例边界待核对', source_binding_required: '成本来源待归属',
     cost_evidence_missing: '成本证据未采集', cost_evidence_incomplete: '成本证据未补齐', finance_history_missing: '历史财务版本缺失', ledger_backfill_required: '待试算配对账本',
     local_estimate_ready: '可闭合的本地估算', pricing_evidence_only: '仅倍率/费用证据', adapter_probe_required: '需适配器探测', range_exceeds_limit: '超过安全历史范围',
     account_missing: '账户配置缺失', account_disabled: '账户同步未启用', no_local_activity: '无本地活动依据', granularity_unsupported: '粒度不兼容', estimate_unavailable: '暂无估算',
     precheck_required: '待灰度前核对',
-    not_connected: '未接入', not_configured: '未配置（不纳入）', disabled: '未开启',
+    not_connected: '未接入', not_configured: '未配置（成本未知）', disabled: '未开启',
   };
   const curProductNames = {
     AmazonECS: 'ECS / Fargate', AmazonRDS: 'RDS', AmazonCloudFront: 'CloudFront',
@@ -37,10 +37,13 @@
     if (!value || value.micro_usd == null || value.micro_usd === '') return '—';
     try {
       let micro = BigInt(String(value.micro_usd));
-      const sign = micro < 0n ? '-' : '';
-      if (micro < 0n) micro = -micro;
-      const whole = (micro / 1000000n).toString().replace(/\B(?=(\d{3})+(?!\d))/g, ',');
-      const fraction = (micro % 1000000n).toString().padStart(6, '0').slice(0, 2);
+      const negative = micro < 0n;
+      if (negative) micro = -micro;
+      // Round display cents half-up using integers; retain backend micro precision.
+      const cents = (micro + 5000n) / 10000n;
+      const sign = negative && cents !== 0n ? '-' : '';
+      const whole = (cents / 100n).toString().replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+      const fraction = (cents % 100n).toString().padStart(2, '0');
       return `${sign}$${whole}.${fraction}`;
     } catch (_) {
       return '—';
@@ -55,25 +58,57 @@
   const date = (ts) => ts ? new Date(ts * 1000).toLocaleDateString('zh-CN', { timeZone: 'Asia/Shanghai' }) : '—';
   const dateTime = (ts) => ts ? new Date(ts * 1000).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false }) : '—';
 
+  function coveragePercent(completed, expected) {
+    if (!Number.isFinite(completed) || !Number.isFinite(expected) || completed < 0 || expected <= 0) return '—';
+    // A rounded display must not turn an outstanding hour into "100%".
+    return `${Math.min(completed < expected ? 99.9 : 100, completed * 100 / expected).toFixed(1)}%`;
+  }
+
   function userCoverage(value) {
     const expected = Number(value?.expected_hours || 0);
     const completed = Number(value?.completed_hours || 0);
-    return expected ? `${completed}/${expected} 小时·${(completed * 100 / expected).toFixed(1)}%` : '—';
+    return expected ? `${completed}/${expected} 小时·${coveragePercent(completed, expected)}` : '—';
   }
 
   function upstreamCoverage(value) {
     const relevant = Number(value?.relevant_domains || 0);
-    const available = Number(value?.available_domains || 0);
-    const corrected = Number(value?.corrected_domains || 0);
+    const billed = completeDomains(value, 'complete_domains');
+    const corrected = completeDomains(value, 'corrected_complete_domains');
     const unconfigured = Number(value?.unconfigured_domains || 0);
-    const configured = relevant ? `账单 ${available}/${relevant}·修正 ${corrected}/${relevant}` : '无已配置上游';
-    return unconfigured ? `${configured}·${unconfigured} 个未配置暂不纳入` : configured;
+    const configured = relevant ? `完整账单 ${billed ?? '—'}/${relevant}·完整修正 ${corrected ?? '—'}/${relevant}` : '无已配置上游';
+    return unconfigured ? `${configured}·${unconfigured} 个未配置成本未知` : configured;
+  }
+
+  // Older snapshots only counted suppliers with ANY corrected money. That
+  // count must never be used as proof of complete correction coverage.
+  function completeDomains(value, field) {
+    const count = value?.[field];
+    return Number.isInteger(count) && count >= 0 && count <= Number(value?.relevant_domains || 0) ? count : null;
+  }
+
+  function setUpstreamEvidence(id, coverage, completeField, availableField) {
+    const done = completeDomains(coverage, completeField);
+    const total = Number(coverage?.relevant_domains || 0);
+    setEvidence(id, done, total, '上游区间完整');
+    const element = $(id);
+    if (!element) return;
+    const note = element.querySelector('span');
+    if (done == null) {
+      element.classList.remove('ready', 'warn', 'missing');
+      element.classList.add('missing');
+      const value = element.querySelector('b');
+      if (value) value.textContent = '—';
+      if (note) note.textContent = '旧快照未提供完整覆盖统计，待重新核验';
+    } else if (note && total > 0) {
+      const partial = Math.max(0, Number(coverage?.[availableField] || 0) - done);
+      note.textContent += ` · ${partial} 个仅取得部分金额；不代表同步任务进度`;
+    }
   }
 
   function domainHourCoverage(row) {
     const expected = Number(row?.expected_hours || 0);
     const completed = Number(row?.completed_hours || 0);
-    return expected ? `${completed}/${expected} 小时·${(completed * 100 / expected).toFixed(1)}%` : '—';
+    return expected ? `${completed}/${expected} 小时·${coveragePercent(completed, expected)}` : '—';
   }
 
   function economicsCoverage(value) {
@@ -148,7 +183,7 @@
     const note = element.querySelector('span');
     element.classList.remove('ready', 'warn', 'missing');
     element.classList.add(percent == null ? 'missing' : done >= total ? 'ready' : 'warn');
-    if (value) value.textContent = percent == null ? '—' : `${percent.toFixed(1)}%`;
+    if (value) value.textContent = coveragePercent(done, total);
     if (note) note.textContent = total > 0
       ? `${done.toLocaleString('zh-CN')} / ${total.toLocaleString('zh-CN')} ${unit}`
       : '当前区间没有可核验证据';
@@ -176,8 +211,9 @@
       const sequence = boundaryExpected > 0 ? ` · 顺序 ${boundaryCompleted}/${boundaryExpected}` : '';
       const pending = value?.latest_hour_pending ? ' · 当前小时待闭合' : '';
       const scopePending = Number(value?.scope_unknown_events || 0) > 0 ? ` · ${Number(value.scope_unknown_events)} 条历史分组依据待补` : '';
+      const scopeIndependent = Number(value?.scope_independent_user_hours || 0) > 0 ? ` · ${Number(value.scope_independent_user_hours)} 个后续用户小时已证明不影响赠送扣减` : '';
       note.textContent = expected > 0
-        ? `小时覆盖 ${percent.toFixed(1)}% · ${completed}/${expected} 小时 · 赠送用户 ${giftUsers}${sequence}${pending}${scopePending}`
+        ? `小时覆盖 ${coveragePercent(completed, expected)} · ${completed}/${expected} 小时 · 赠送用户 ${giftUsers}${sequence}${pending}${scopePending}${scopeIndependent}`
         : '当前区间没有可核验证据';
     }
   }
@@ -210,17 +246,14 @@
     if (!hasMoney(statement.raw_corrected_upstream_cost)) {
       const coverage = data.upstream_coverage || {};
       const relevant = Number(coverage.relevant_domains || 0);
-      const available = Number(coverage.available_domains || 0);
-      const corrected = Number(coverage.corrected_domains || 0);
-      const details = Array.isArray(data.cost_details) ? data.cost_details : [];
-      const billMissing = details.filter((row) => row.closure_readiness === 'bill_not_connected' || row.closure_readiness === 'bill_missing').length;
-      const correctionMissing = details.filter((row) => row.closure_readiness === 'correction_missing').length;
+      const billed = completeDomains(coverage, 'complete_domains');
+      const corrected = completeDomains(coverage, 'corrected_complete_domains');
       const unconfigured = Number(coverage.unconfigured_domains || 0);
       const reasons = [];
-      if (billMissing) reasons.push(`${billMissing} 个上游账单未接入/缺失`);
-      if (correctionMissing) reasons.push(`${correctionMissing} 个缺历史充值修正依据`);
-      if (unconfigured) reasons.push(`${unconfigured} 个未配置来源暂不纳入正式毛利`);
-      const coverageText = relevant ? `账单 ${available}/${relevant}、修正 ${corrected}/${relevant}` : '无可核验上游';
+      if (billed != null && billed < relevant) reasons.push(`${relevant - billed} 个上游账单区间不完整`);
+      if (corrected != null && corrected < relevant) reasons.push(`${relevant - corrected} 个上游修正成本区间不完整`);
+      if (unconfigured) reasons.push(`${unconfigured} 个未配置来源成本未知，已核验部分不能代表全站`);
+      const coverageText = upstreamCoverage(coverage);
       blockers.push(`修正上游总成本未闭合（${coverageText}${reasons.length ? `；${reasons.join('、')}` : ''}）`);
     }
     if (!hasMoney(statement.aws_infrastructure_cost)) {
@@ -238,8 +271,8 @@
     const audit = data.pairing_audit || {};
     setEvidence('finUserEvidence', data.user_coverage?.completed_hours, data.user_coverage?.expected_hours, '小时');
     setGiftEvidence(data.gift_coverage);
-    setEvidence('finBillEvidence', data.upstream_coverage?.available_domains, data.upstream_coverage?.relevant_domains, '上游');
-    setEvidence('finCorrectionEvidence', data.upstream_coverage?.corrected_domains, data.upstream_coverage?.relevant_domains, '上游');
+    setUpstreamEvidence('finBillEvidence', data.upstream_coverage, 'complete_domains', 'available_domains');
+    setUpstreamEvidence('finCorrectionEvidence', data.upstream_coverage, 'corrected_complete_domains', 'corrected_domains');
     setEvidence('finPairingEvidence', audit.paired_rows, audit.publication_rows, '核算行');
 	setCUREvidence(data.cur_cost);
 
@@ -466,11 +499,22 @@
       });
       if (sequence !== state.requestSequence || controller.signal.aborted) return;
       if (response.status === 401) { location.href = '/login'; return; }
-      const data = await response.json();
+      const data = await response.json().catch(() => {
+        throw new Error(response.ok ? '报表响应格式异常，请稍后重试' : `报表服务暂不可用（HTTP ${response.status}），请稍后重试`);
+      });
       if (sequence !== state.requestSequence || controller.signal.aborted) return;
       if (response.status === 202) {
         state.pending = true;
         state.stale = true;
+        const config = response.headers?.get?.('X-Monitor-Finance-Configuration') || '';
+        if (hasPrevious && config && config === state.renderedConfiguration) {
+          // A cold server cache or concurrent eviction must not erase an
+          // already displayed report for this exact query. Keep its date.
+          const note = $('finCacheUpdate');
+          if (note) note.textContent = ' · 后台正在生成新结果，保留上次已核验数据';
+          scheduleStaleRefresh();
+          return;
+        }
         state.loaded = false;
         if ($('finReportContent')) $('finReportContent').hidden = true;
         const status = $('finStatus');
@@ -484,6 +528,7 @@
       data._cache_status = response.headers.get('X-Monitor-Finance-Cache') || '';
       data._update_state = response.headers.get('X-Monitor-Finance-Update') || '';
       state.updateState = data._update_state;
+      state.renderedConfiguration = response.headers.get('X-Monitor-Finance-Configuration') || '';
       state.pending = false;
       state.refreshFailures = 0;
       state.renderedQuery = queryKey;
@@ -526,6 +571,7 @@
     if (status.startsWith('fast-snapshot-')) {
       const note = data._update_state === 'failed' ? '更新失败，已保留上次结果；详情见数据同步状态'
         : data._update_state === 'succeeded' ? '最近核验完成'
+          : data._update_state === 'retrying' ? '数据正在更新，后台重新核验中；保留上次结果'
           : data._update_state === 'busy' ? '更新任务繁忙，已保留上次结果' : '正在后台更新';
       return `<span id="finCacheUpdate"> · ${note}</span>`;
     }
@@ -615,6 +661,7 @@
     if (coverage) coverage.innerHTML = `<span><small>已进入不可变配对账本</small><b>${ledgerDomains.length ? ledgerDomains.map(esc).join('、') : '—'}</b></span>`
       + `<span class="${unenrolledDomains.length ? 'warn' : 'ready'}"><small>尚未进入配对账本</small><b title="${esc(unenrolledDomains.join('、'))}">${unenrolledDomains.length ? `${unenrolledDomains.length} 个：${unenrolledDomains.slice(0, 6).map(esc).join('、')}${unenrolledDomains.length > 6 ? '…' : ''}` : '无'}</b></span>`
       + `<span><small>待归属成本来源</small><b>${Number(audit.unallocated_sources || 0).toLocaleString('zh-CN')} 个</b></span>`;
+    renderPairingHours(audit.hours);
     $('finPairingRows').innerHTML = rows.length ? rows.map((row) => {
       const domains = Array.isArray(row.domain_names) ? row.domain_names.filter(Boolean) : [];
       const domainCell = domains.length
@@ -635,6 +682,25 @@
     renderPairingSources(audit);
   }
 
+  function renderPairingHours(rows) {
+    const target = $('finPairingHours');
+    if (!target) return;
+    if (!Array.isArray(rows)) {
+      target.textContent = '当前快照尚未提供小时诊断；不能据此判断业务已配对完成。';
+      return;
+    }
+    if (!rows.length) {
+      target.textContent = '当前区间没有已发布的小时诊断；不代表没有业务或成本缺口。';
+      return;
+    }
+    const count = (value) => Number.isSafeInteger(value) && value >= 0 ? value.toLocaleString('zh-CN') : '—';
+    target.innerHTML = rows.map((row) => `<p><b>${esc(row.domain || '未知上游')}</b> · 已发布 ${count(row.published_hours)} 小时`
+      + `<br>有业务且已配对 ${count(row.paired_activity_hours)} · 已核验空小时 ${count(row.verified_empty_hours)}`
+      + ` · 成本已采到待归属 ${count(row.unallocated_cost_hours)} · 本地有业务但上游零记录 ${count(row.upstream_zero_check_hours)}`
+      + ` · 其他待核对 ${count(row.other_incomplete_hours)}</p>`).join('')
+      + '<p>以上均为小时数，不是请求数。空小时不计作业务配对成功；待归属需核对令牌与渠道的历史关系。上游零记录也可能对应本站未扣费的失败请求，不直接认定丢日志或零成本，需核对账号及同窗日志。重复重算不会自动补齐这两类依据。</p>';
+  }
+
   function renderClosureReadiness(rows) {
     const target = $('finClosureReadiness');
     if (!target) return;
@@ -647,6 +713,7 @@
       ['not_required', '暂不纳入', '未配置上游账户，不进入覆盖率和利润'],
       ['precheck_required', '待灰度前核对', '已有账单与修正证据'],
       ['correction_missing', '缺修正依据', '先补充值比例或审计证据'],
+      ['correction_ambiguous', '历史比例边界待核对', '区分配置录入纠正与真实比例变化'],
       ['bill_missing', '缺账单证据', '先补齐上游账单记录'],
       ['bill_not_connected', '账单未接入', '不能按零成本处理'],
       ['cost_evidence_missing', '成本证据未采集', '汇总账单不等于可配对小时证据'],
@@ -777,10 +844,29 @@
       + `<td>${esc(billBasis(row.bill_basis))}</td>`
       + `<td>${esc(row.correction_source || '—')}</td>`
       + `<td>${domainHourCoverage(row)}${row.data_until ? `<small>截至 ${date(row.data_until)}</small>` : ''}</td>`
-      + `<td>${chip(row.status)}</td>`
+      + `<td>${chip(row.status)}<small>${esc(costEvidenceSummary(row))}</small></td>`
       + `<td>${chip(row.pairing_status || 'not_enrolled')}</td>`
-      + `<td class="fin-closure-action">${chip(row.closure_readiness || 'precheck_required')}<small>${esc(row.closure_next_action || '尚未完成准入判断')}</small>${evidenceBackfill(row)}</td></tr>`).join('')
+      + `<td class="fin-closure-action">${chip(row.closure_readiness || 'precheck_required')}<small>${esc(closureAction(row))}</small>${evidenceBackfill(row)}</td></tr>`).join('')
       : '<tr><td colspan="15" class="fin-empty">暂无可核对的上游成本明细</td></tr>';
+  }
+
+  function closureAction(row) {
+    // Old persistent snapshots may still contain the former claim that a
+    // recorded rate boundary proves a real payment-rate change. Correct the
+    // explanation without invalidating cached amounts or rebuilding history.
+    if (row.closure_readiness === 'correction_ambiguous') {
+      return '账单时间段内记录了不同充值比例；先核对是配置录入纠正还是真实比例变化。真实变化需更细账单或可审计的分段依据，确认前不发布完整成本。';
+    }
+    return row.closure_next_action || '尚未完成准入判断';
+  }
+
+  function costEvidenceSummary(row) {
+    if (row.status === 'not_configured') return '未配置，不自动补采；成本未知，不按零计入全站利润';
+    const bill = hasMoney(row.billed_cost) ? '账单区间完整'
+      : hasMoney(row.known_billed_cost) ? '账单区间不完整' : '暂无可核验账单';
+    const corrected = hasMoney(row.corrected_cost) ? '修正成本区间完整'
+      : hasMoney(row.known_corrected_cost) ? '修正成本仅有部分' : '缺可核验修正依据';
+    return `${bill}；${corrected}。这是核算状态，不代表补采正在运行`;
   }
 
   function renderEvidenceRollout(rows) {
@@ -818,7 +904,7 @@
         + `<td>${esc(row.provider_name || row.provider || '—')}</td><td>${esc(granularity)}</td>`
         + `<td class="num">${impact}</td><td class="num">${esc(work)}</td><td>${esc(result)}</td>`
         + `<td>${chip(row.evidence_backfill_status)}<small>${esc(row.evidence_backfill_note || '')}</small></td></tr>`;
-    }).join('') : '<tr><td colspan="7" class="fin-empty">当前没有需要补采的历史成本证据</td></tr>';
+    }).join('') : '<tr><td colspan="7" class="fin-empty">当前没有可展示的历史补证计划；不代表成本证据已完整，请结合下方核算缺口核对。</td></tr>';
   }
 
   function renderSources(rows) {

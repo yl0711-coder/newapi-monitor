@@ -717,26 +717,6 @@ func pricingQuotaReconciled(provider string, delta, eligibleRequests int64) bool
 	return delta <= maxRoundingDrift
 }
 
-var upstreamPricingLocalStoreRetryDelays = [...]time.Duration{
-	50 * time.Millisecond, 150 * time.Millisecond, 500 * time.Millisecond,
-}
-
-func retryUpstreamPricingLocalStore(ctx context.Context, operation func() error) error {
-	for attempt := 0; ; attempt++ {
-		err := operation()
-		if err == nil || !isUpstreamUsageLocalStoreBusy(err) || attempt >= len(upstreamPricingLocalStoreRetryDelays) {
-			return err
-		}
-		timer := time.NewTimer(upstreamPricingLocalStoreRetryDelays[attempt])
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			return ctx.Err()
-		case <-timer.C:
-		}
-	}
-}
-
 // persistNewAPIPricingHour atomically replaces one complete shadow hour,
 // records its reconciliation proof, advances no cursor itself, and never
 // changes ChannelUpstreamUsageHour. A DEFERRED SQLite transaction that reads
@@ -744,7 +724,7 @@ func retryUpstreamPricingLocalStore(ctx context.Context, operation func() error)
 // retry only this idempotent local transaction so no upstream page is reread.
 func (m *Monitor) persistNewAPIPricingHour(ctx context.Context, account ChannelUpstreamAccount, hourTs int64, evidence []ChannelUpstreamPricingHourEvidence, state ChannelUpstreamPricingHourState, now int64) error {
 	baseEvidence := append([]ChannelUpstreamPricingHourEvidence(nil), evidence...)
-	return retryUpstreamPricingLocalStore(ctx, func() error {
+	return retryUpstreamLocalStore(ctx, func() error {
 		return m.persistNewAPIPricingHourOnce(ctx, account, hourTs, append([]ChannelUpstreamPricingHourEvidence(nil), baseEvidence...), state, now)
 	})
 }
@@ -1793,6 +1773,14 @@ func (m *Monitor) syncDueUpstreamPricing(ctx context.Context) {
 		epoch := newAPIUpstreamAccountEpoch(account)
 		var state ChannelUpstreamPricingSyncState
 		err := m.storeDB.WithContext(ctx).Where("domain = ? AND account_epoch = ? AND semantics_version = ?", domain, epoch, upstreamPricingSemanticsVersion).First(&state).Error
+		if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+			continue
+		}
+		// A dirty local cost bucket must not bypass an upstream cooldown or
+		// keep selecting a paused account ahead of other healthy providers.
+		if err == nil && upstreamPricingRetryDeferred(state, now) {
+			continue
+		}
 		due := errors.Is(err, gorm.ErrRecordNotFound)
 		if err == nil {
 			due = state.TailNextSyncAt == 0 || state.TailNextSyncAt <= now ||
@@ -1844,6 +1832,11 @@ func (m *Monitor) syncDueUpstreamPricing(ctx context.Context) {
 	}
 }
 
+func upstreamPricingRetryDeferred(state ChannelUpstreamPricingSyncState, now int64) bool {
+	return (state.Status == upstreamStatusError || state.Status == upstreamStatusReconnect) &&
+		state.TailNextSyncAt > now && (state.BackfillDone || state.BackfillNextSyncAt > now)
+}
+
 func (m *Monitor) syncStoredUpstreamPricing(ctx context.Context, domain string) (ChannelUpstreamPricingSyncState, error) {
 	release, err := m.tryAcquireUpstreamAccountBackground(domain)
 	if err != nil {
@@ -1851,19 +1844,57 @@ func (m *Monitor) syncStoredUpstreamPricing(ctx context.Context, domain string) 
 	}
 	defer release()
 	var account ChannelUpstreamAccount
-	if err := m.storeDB.WithContext(ctx).Select("domain", "provider").First(&account, "domain = ?", domain).Error; err != nil {
+	if err := m.storeDB.WithContext(ctx).First(&account, "domain = ?", domain).Error; err != nil {
 		return ChannelUpstreamPricingSyncState{}, err
 	}
-	switch account.Provider {
-	case upstreamProviderNewAPI:
-		return m.syncStoredNewAPIPricing(ctx, domain)
-	case upstreamProviderSub2API:
-		return m.syncStoredSub2Pricing(ctx, domain)
-	case upstreamProviderAICodeWith:
-		return m.syncStoredAICodeWithPricing(ctx, domain)
-	default:
-		return ChannelUpstreamPricingSyncState{}, fmt.Errorf("上游类型 %s 不支持计价证据", upstreamProviderName(account.Provider))
+	if !upstreamRecoveryTaskAllowed(m.cfg, account, "pricing") {
+		return ChannelUpstreamPricingSyncState{}, fmt.Errorf("该上游计价明细未启用或不支持")
 	}
+	now := time.Now().Unix()
+	previous, err := m.loadOrCreatePricingSyncState(ctx, account, now)
+	if err != nil {
+		return previous, err
+	}
+	if upstreamPricingRetryDeferred(previous, now) {
+		return previous, &upstreamStoredSyncError{message: "计价明细处于冷却或暂停状态，请等待或使用检测并恢复"}
+	}
+	state := previous
+	err = upstreamProbeBeforeRetry(ctx, m, account, "pricing", previous.Status, previous.ConsecutiveFailures)
+	if err == nil {
+		switch account.Provider {
+		case upstreamProviderNewAPI:
+			state, err = m.syncStoredNewAPIPricing(ctx, domain)
+		case upstreamProviderSub2API:
+			state, err = m.syncStoredSub2Pricing(ctx, domain)
+		case upstreamProviderAICodeWith:
+			state, err = m.syncStoredAICodeWithPricing(ctx, domain)
+		default:
+			return ChannelUpstreamPricingSyncState{}, fmt.Errorf("上游类型 %s 不支持计价证据", upstreamProviderName(account.Provider))
+		}
+	}
+	if err == nil || errors.Is(err, context.Canceled) {
+		return state, err
+	}
+	// Early refresh/credential errors used to escape before a pricing state
+	// was saved, leaving the same account due on every scheduler tick.
+	if state.Domain == "" {
+		state = previous
+	}
+	state.Status, state.ConsecutiveFailures = upstreamStatusError, previous.ConsecutiveFailures+1
+	state.LastAttemptAt = now
+	state.LastError = diagnosticFailure("计价同步", err).Message
+	retryAt := pricingSyncRetryAt(now, state.ConsecutiveFailures)
+	if at := upstreamRetryAt(err); at > retryAt {
+		retryAt = at
+	}
+	boundUpstreamFailure(err, now, &state.ConsecutiveFailures, &state.Status, &retryAt)
+	state.TailNextSyncAt, state.BackfillNextSyncAt = retryAt, retryAt
+	commitCtx, cancel := upstreamUsageLocalCommitContext(ctx)
+	defer cancel()
+	if saveErr := m.savePricingSyncState(commitCtx, &state); saveErr != nil {
+		return state, errors.Join(err, saveErr)
+	}
+	return state, err
 }
 
 func upstreamPricingOperationTimeout(s Settings) time.Duration {

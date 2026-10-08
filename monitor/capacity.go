@@ -468,7 +468,15 @@ func (m *Monitor) buildCapacityReportFiltered(ctx context.Context, from, to, buc
 	report.Infra = infra
 	report.Meta.Sources["infrastructure"] = infraSource
 	if m.InfraEnabled() {
-		snap := m.computeInfraSnapshot(now)
+		snap, err := m.computeInfraSnapshotContext(ctx, now)
+		if err != nil {
+			// Infrastructure is optional context, not the RPM/TPM source.
+			// Keep business facts, but never present failed components as healthy.
+			infraSource.Available = false
+			infraSource.Note = "基础设施当前快照暂不可用；业务 RPM/TPM 仍按已采集事实展示。"
+			report.Meta.Sources["infrastructure"] = infraSource
+			return report, nil
+		}
 		report.Components = append(report.Components, snap.Instances...)
 		if len(snap.Databases) > 0 {
 			report.Components = append(report.Components, snap.Databases...)
@@ -1002,7 +1010,11 @@ func (m *Monitor) readCapacityIngress(ctx context.Context, from, to, bucket, now
 }
 
 func (m *Monitor) readCapacityInfra(ctx context.Context, from, to, bucket, now int64) ([]capacityInfraPoint, capacitySource) {
-	m.infraAggregateMu.Lock()
+	ctx, cancel := context.WithTimeout(ctx, infraReadTimeout)
+	defer cancel()
+	if err := m.lockInfraAggregate(ctx); err != nil {
+		return nil, capacitySource{Configured: m.InfraEnabled(), Note: "基础设施读取等待超时或已取消；不影响业务 RPM/TPM。"}
+	}
 	defer m.infraAggregateMu.Unlock()
 
 	// 页面首版只返回用于判断容量瓶颈的四条时序；内存/存储/容器等
@@ -1034,7 +1046,7 @@ func (m *Monitor) readCapacityInfra(ctx context.Context, from, to, bucket, now i
 		for _, v := range allowed {
 			watermarkArgs = append(watermarkArgs, v)
 		}
-		_ = m.storeDB.WithContext(ctx).Raw(`SELECT COALESCE(MAX(bucket_ts),0) FROM infra_samples
+		err = m.storeDB.WithContext(ctx).Raw(`SELECT COALESCE(MAX(bucket_ts),0) FROM infra_samples
 			WHERE bucket_ts >= ? AND bucket_ts < ? AND metric IN (`+marks+`)`+managedFilter, watermarkArgs...).Scan(&watermark).Error
 	}
 	note := "资源曲线与流量同轴用于相关性观察，不声称因果；日志事实暂无服务节点维度。"
@@ -1042,6 +1054,7 @@ func (m *Monitor) readCapacityInfra(ctx context.Context, from, to, bucket, now i
 		note = "仅展示 Monitor 负责的 Lightsail 资源曲线；AWS 托管资源由 CloudWatch 统一监控。"
 	}
 	if err != nil {
+		out, rows, watermark = nil, nil, 0
 		note = "基础设施本地事实不可用；不影响业务 RPM/TPM。"
 	}
 	return out, capacitySource{Available: err == nil && watermark > 0, Configured: m.InfraEnabled(), Watermark: watermark, AgeSec: capacityAge(now, watermark), Rows: int64(len(rows)), Note: note}

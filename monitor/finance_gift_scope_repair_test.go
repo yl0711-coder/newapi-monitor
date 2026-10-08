@@ -63,6 +63,25 @@ func giftScopeRepairFixture(t *testing.T) (*Monitor, *sql.DB, int64) {
 	return m, source, hour
 }
 
+func TestFinanceGiftScopeRepairRejectsNullSourceGroupWithoutMutation(t *testing.T) {
+	m, source, hour := giftScopeRepairFixture(t)
+	db, ctx := m.usageFactsStore(), context.Background()
+	before, err := loadFinanceGiftScopeSnapshot(ctx, db, "v1", hour, 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := source.Exec("UPDATE logs SET `group`=NULL WHERE id=2"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repairFinanceGiftBoundaryScope(ctx, db, source, "v1", hour, 7, hour+8000); err == nil {
+		t.Fatal("missing source group incorrectly accepted as verified evidence")
+	}
+	after, err := loadFinanceGiftScopeSnapshot(ctx, db, "v1", hour, 7)
+	if err != nil || !reflect.DeepEqual(before, after) {
+		t.Fatal("failed repair changed existing evidence", err)
+	}
+}
+
 func TestFinanceGiftScopeRepairPreservesMoneyAndUnlocksOnlyVerifiedAllocation(t *testing.T) {
 	m, source, hour := giftScopeRepairFixture(t)
 	db, ctx := m.usageFactsStore(), context.Background()

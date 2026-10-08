@@ -20,12 +20,32 @@ func (m *Monitor) probeSavedUpstream(ctx context.Context, client *http.Client, r
 	var usage func() error
 	scope := "消费接口单页抽查"
 	switch row.Provider {
-	case upstreamProviderNewAPI:
-		var cred newAPICredential
-		if m.openUpstreamCredential(row, &cred) != nil || cred.AccessToken == "" || row.UserID <= 0 {
+	case upstreamProviderOpenOx:
+		var cred openOxCredential
+		if m.openUpstreamCredential(row, &cred) != nil {
 			return fmt.Errorf("凭据无效")
 		}
-		balance = func() error { _, _, err := syncNewAPIBalance(ctx, client, row, cred); return err }
+		balance = func() error { _, _, err := readOpenOxProfile(ctx, client, row, cred); return err }
+		usage = func() error {
+			page, err := fetchOpenOxUsagePage(ctx, client, row, cred, dayFrom, dayTo, 1, pacer)
+			if err != nil {
+				return err
+			}
+			_, err = aggregateOpenOxUsage(row, page.Items, dayFrom, dayTo)
+			return err
+		}
+		report.Checks = append(report.Checks, upstreamDiagnosticCheck{Name: "金额口径", Status: "warning", Code: "subscription_cost_unallocated", Message: "钱包与订阅分开，用量不是现金成本", Action: "订阅成本尚未分摊，不套充值倍率；令牌失效需重新导入 auth_token。"})
+	case upstreamProviderNewAPI:
+		var cred newAPICredential
+		if m.openUpstreamCredential(row, &cred) != nil || row.UserID <= 0 {
+			return fmt.Errorf("凭据无效")
+		}
+		// Static NewAPI management tokens may have no declared expiry. Do not
+		// treat those as expired, but never rotate an expiring browser session.
+		if (cred.AccessToken == "" || cred.ExpiresAt > 0) && diagnosticSessionUnavailable(cred.AccessToken, cred.ExpiresAt, report) {
+			return nil
+		}
+		balance = func() error { _, err := fetchNewAPIBalance(ctx, client, row, cred); return err }
 		usage = func() error { _, err := fetchNewAPIUsagePage(ctx, client, row, cred, from, to, 1, pacer); return err }
 	case upstreamProviderSub2API:
 		var cred sub2APICredential
@@ -54,7 +74,7 @@ func (m *Monitor) probeSavedUpstream(ctx context.Context, client *http.Client, r
 			_, err := fetchTokenForceUsagePage(ctx, client, row, cred, from, to, 0, pacer)
 			return err
 		}
-		report.Checks = append(report.Checks, upstreamDiagnosticCheck{Name: "金额口径", Status: "warning", Code: "currency_confirmation", Message: "接口检测不验证您填写的 CNY/USD 结算比例", Action: "按实际结算合同确认换算单位，不要默认认为人民币与美元 1:1。"})
+		report.Checks = append(report.Checks, upstreamDiagnosticCheck{Name: "金额口径", Status: "ok", Code: "configured_recharge_ratio", Message: "按接口账面数值采集，不额外换汇", Action: "在倍率配置中维护该主域名的上游充值比例；成本 = 账面消费 × 充值支付 ÷ 充值到账。检测不证明历史比例完整。"})
 	case upstreamProviderAICodeWith:
 		var cred aiCodeWithCredential
 		if m.openUpstreamCredential(row, &cred) != nil {

@@ -148,6 +148,7 @@ type channelEconomicsAgg struct {
 	revenue             int64
 	upstreamCost        int64
 	knownCorrectedCost  int64
+	hasCorrectedCost    bool
 	knownProfit         int64
 	pairedRevenue       int64
 	pairedCorrectedCost int64
@@ -183,6 +184,7 @@ func (a *channelEconomicsAgg) addRow(row channelEconomicsReportRow) error {
 		}
 	}
 	if row.CorrectedCostKnown {
+		a.hasCorrectedCost = true
 		if err := addEconomicsInt64(&a.knownCorrectedCost, row.CorrectedCostMicroUSD); err != nil {
 			return err
 		}
@@ -251,7 +253,7 @@ func coverageHasStatus(coverage channelEconomicsCoverageView, statuses ...string
 func (a channelEconomicsAgg) view(coverage channelEconomicsCoverageView, profitBlocked, revenueBlocked bool) channelEconomicsTotalsView {
 	view := channelEconomicsTotalsView{
 		KnownRevenue: economicsMoney(a.revenue), KnownUpstreamCost: economicsMoney(a.upstreamCost),
-		KnownCorrectedCost: economicsMoney(a.knownCorrectedCost), KnownProfit: economicsMoney(a.knownProfit),
+		KnownProfit:   economicsMoney(a.knownProfit),
 		PairedRevenue: economicsMoney(a.pairedRevenue), PairedCorrectedCost: economicsMoney(a.pairedCorrectedCost),
 		LocalRequests: a.localRequests, UpstreamRequests: a.upstreamRequests,
 		LocalRefundRecords: a.localRefundRecords, UpstreamChargeUnits: a.upstreamChargeUnits,
@@ -265,6 +267,11 @@ func (a channelEconomicsAgg) view(coverage channelEconomicsCoverageView, profitB
 	view.UpstreamCostKnown = manifestBaseKnown && !coverageHasStatus(coverage, "upstream_cost_missing")
 	view.CorrectedCostKnown = a.correctedKnown && manifestBaseKnown &&
 		!coverageHasStatus(coverage, "finance_version_conflict")
+	// A zero accumulator is not evidence of zero cost. Preserve observed zero
+	// rows and authoritative empty manifests, but not wholly unknown costs.
+	if a.hasCorrectedCost || view.CorrectedCostKnown {
+		view.KnownCorrectedCost = economicsMoney(a.knownCorrectedCost)
+	}
 	view.ProfitKnown = a.profitKnown && view.RevenueKnown && view.CorrectedCostKnown && coverage.UnknownHours == 0 && !profitBlocked
 	view.Partial = !view.ProfitKnown
 	view.UnknownReason = economicsUnknownReason(coverage, profitBlocked)
@@ -556,6 +563,8 @@ func (m *Monitor) buildChannelEconomicsReportMode(ctx context.Context, scope sta
 				hourCoverage.StatusCounts["refund_unallocated"]++
 			}
 			if hourVerified {
+				domainAgg.hasCorrectedCost = true
+				hourAgg.hasCorrectedCost = true
 				coverage.VerifiedHours++
 				hourCoverage.VerifiedHours = 1
 			} else {
@@ -584,6 +593,7 @@ func (m *Monitor) buildChannelEconomicsReportMode(ctx context.Context, scope sta
 					dayCoverage.StatusCounts[status] += count
 				}
 				if hourVerified {
+					dayAgg.hasCorrectedCost = true
 					dayCoverage.VerifiedHours++
 					if report.dailyCorrectedCosts[day] == nil {
 						report.dailyCorrectedCosts[day] = map[string]int64{}
@@ -699,6 +709,7 @@ func (m *Monitor) buildChannelEconomicsReportMode(ctx context.Context, scope sta
 			return nil, err
 		}
 		siteAgg.publicationRows += domainAgg.publicationRows
+		siteAgg.hasCorrectedCost = siteAgg.hasCorrectedCost || domainAgg.hasCorrectedCost
 		siteAgg.pairedRows += domainAgg.pairedRows
 		siteAgg.correctedKnown = siteAgg.correctedKnown && domainAgg.correctedKnown
 		siteAgg.profitKnown = siteAgg.profitKnown && domainAgg.profitKnown

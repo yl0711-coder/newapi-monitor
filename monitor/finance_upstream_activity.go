@@ -37,12 +37,52 @@ func financeUpstreamActivityArgs(to int64) []any {
 	return []any{to, accountingTrafficVersions(), to, accountingTrafficVersions(), to}
 }
 
+// A channel can contribute activity to multiple historical upstreams. Seek the
+// first eligible hour inside each ownership interval instead of attributing its
+// entire history to the current directory entry. Empty/unobserved change
+// windows stay in the unattributed bucket, never in either supplier's totals.
+const financeHistoricalUpstreamActivityQuery = `WITH owners AS (
+	SELECT c.id channel_id,
+		LOWER(COALESCE(NULLIF(TRIM(COALESCE(d.domain,c.base_domain)),''),'未配置/历史')) domain,
+		d.from_hour_ts from_ts,
+		(SELECT MIN(n.from_hour_ts) FROM finance_channel_domain_periods n
+		 WHERE n.channel_id=c.id AND n.from_hour_ts>d.from_hour_ts) to_ts
+	FROM channel_snaps c LEFT JOIN finance_channel_domain_periods d ON d.channel_id=c.id
+) SELECT domain, MIN(hour_ts) first_ts FROM (
+	SELECT o.domain,
+		(SELECT s.hour_ts FROM stability_hour_samples s
+		 WHERE s.channel_id=o.channel_id AND s.hour_ts<? AND s.traffic_class_version IN ?
+		 AND (o.from_ts IS NULL OR s.hour_ts>=o.from_ts) AND (o.to_ts IS NULL OR s.hour_ts<o.to_ts)
+		 AND (s.success+s.anomaly+s.failed<>0 OR s.quota<>0 OR s.refund_quota<>0)
+		 ORDER BY s.hour_ts LIMIT 1) hour_ts FROM owners o
+	UNION ALL
+	SELECT o.domain,
+		(SELECT t.hour_ts FROM channel_test_hour_samples t
+		 WHERE t.channel_id=o.channel_id AND t.hour_ts<? AND t.traffic_class_version IN ?
+		 AND (o.from_ts IS NULL OR t.hour_ts>=o.from_ts) AND (o.to_ts IS NULL OR t.hour_ts<o.to_ts)
+		 AND (t.requests<>0 OR t.quota<>0)
+		 ORDER BY t.hour_ts LIMIT 1) hour_ts FROM owners o
+	UNION ALL
+	SELECT LOWER(TRIM(domain)) domain, MIN(hour_ts) hour_ts
+	FROM channel_upstream_usage_hours
+	WHERE hour_ts<? AND (requests<>0 OR tokens<>0 OR quota<>0 OR cost_usd<>0)
+	GROUP BY LOWER(TRIM(domain))
+) activity GROUP BY domain HAVING MIN(hour_ts) IS NOT NULL`
+
 func (m *Monitor) loadFinanceUpstreamActivityStarts(ctx context.Context, to int64) (map[string]int64, error) {
 	var starts []struct {
 		Domain  string
 		FirstTs int64
 	}
-	if err := m.storeDB.WithContext(ctx).Raw(financeUpstreamActivityQuery, financeUpstreamActivityArgs(to)...).Scan(&starts).Error; err != nil {
+	query := financeUpstreamActivityQuery
+	exists, err := financeChannelDomainTableExists(m.storeDB.WithContext(ctx))
+	if err != nil {
+		return nil, fmt.Errorf("读取渠道历史归属状态: %w", err)
+	}
+	if exists {
+		query = financeHistoricalUpstreamActivityQuery
+	}
+	if err := m.storeDB.WithContext(ctx).Raw(query, financeUpstreamActivityArgs(to)...).Scan(&starts).Error; err != nil {
 		return nil, fmt.Errorf("读取上游经营生效边界: %w", err)
 	}
 	firstByDomain := make(map[string]int64, len(starts))

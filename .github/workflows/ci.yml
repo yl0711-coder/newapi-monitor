@@ -140,25 +140,40 @@ jobs:
             test ! -e /context/monitor/ci-local-config.json
           '
 
-  # monitor 是单个 Go 包，go test 无法在包内自动并行分片。按测试名称首字母
-  # 划分成六个互斥且完整的集合。D-F 分片在 v1.18.6 CI 中累计运行超过
-  # 20 分钟，因此再拆成 D-E / F；不跳过测试，每个分片仍保留独立的卡死保护。
+  # 保留全部竞态检测。按实际耗时拆分财务、渠道和稳定性等重分片。
+  # skip 仅用于互斥分配；check-race-shards 必须证明每项测试恰好属于一组。
   race-monitor:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
         include:
-          - shard: a-c
-            pattern: '^Test[A-C]'
+          - shard: a-b
+            pattern: '^Test[A-B]'
+          - shard: c-channel
+            pattern: '^TestChannel'
+          - shard: c-other
+            pattern: '^TestC'
+            skip: '^TestChannel'
           - shard: d-e
             pattern: '^Test[D-E]'
-          - shard: f
+          - shard: f-other
             pattern: '^TestF'
+            skip: '^TestFinanceGift'
+          - shard: f-gift-other
+            pattern: '^TestFinanceGift'
+            skip: '^TestFinanceGift(Scope|Handoff)'
+          - shard: f-gift-handoff
+            pattern: '^TestFinanceGiftHandoff'
+          - shard: f-gift-scope
+            pattern: '^TestFinanceGiftScope'
           - shard: g-n
             pattern: '^Test[G-N]'
-          - shard: o-s
-            pattern: '^Test[O-S]'
+          - shard: o-r
+            pattern: '^Test[O-R]'
+          - shard: s
+            pattern: '^TestS'
           - shard: t-z
             pattern: '^(Test[T-Z]|Test[^A-Z]|Test$|Example|Fuzz)'
     steps:
@@ -166,19 +181,40 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: '1.26.6'
-      - name: Verify shard is non-empty
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Verify complete coverage and selected shard
         env:
-          TEST_PATTERN: ${{ matrix.pattern }}
+          TEST_SHARD: ${{ matrix.shard }}
         run: |
-          test_count="$(go test -list "$TEST_PATTERN" ./monitor | grep -Ec '^(Test|Example|Fuzz)')"
-          test "$test_count" -gt 0
-          echo "monitor race shard ${{ matrix.shard }}: $test_count tests"
+          go test -list . ./monitor | node dev/check-race-shards.mjs "$TEST_SHARD"
       - name: Test monitor shard with race detector
         env:
           TEST_PATTERN: ${{ matrix.pattern }}
+          TEST_SKIP: ${{ matrix.skip || '' }}
+          TEST_SHARD: ${{ matrix.shard }}
         run: |
+          set -o pipefail
           go build -o "$RUNNER_TEMP/nginxcollector" ./cmd/nginxcollector
-          MONITOR_TEST_NGINX_COLLECTOR_BIN="$RUNNER_TEMP/nginxcollector" go test -race -timeout 20m -run "$TEST_PATTERN" ./monitor
+          MONITOR_TEST_NGINX_COLLECTOR_BIN="$RUNNER_TEMP/nginxcollector" go test -race -count=1 -json -timeout 20m -run "$TEST_PATTERN" -skip "$TEST_SKIP" ./monitor | tee "$RUNNER_TEMP/monitor-race-$TEST_SHARD.jsonl"
+      - name: Summarize slow tests even on failure
+        if: always()
+        env:
+          TEST_SHARD: ${{ matrix.shard }}
+        run: |
+          report="$RUNNER_TEMP/monitor-race-$TEST_SHARD.jsonl"
+          if test -s "$report"; then
+            node dev/summarize-race-tests.mjs "$report" "$TEST_SHARD" >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Preserve timing evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: monitor-race-${{ matrix.shard }}
+          path: ${{ runner.temp }}/monitor-race-${{ matrix.shard }}.jsonl
+          if-no-files-found: ignore
+          retention-days: 7
 
   # PRs are scanned too. No registry write credentials in the build/scan job.
   # All three images must pass before ANY image is published. Transfer the exact

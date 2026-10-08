@@ -150,7 +150,7 @@ func TestResetStaleStabilityProblemClassificationRequiresExplicitNonDestructiveM
 	if err := m.resetStaleStabilityProblemClassification(); !errors.Is(err, errStabilityProblemClassificationMigrationRequired) {
 		t.Fatalf("ordinary startup must fail closed before classification migration: %v", err)
 	}
-	if progress := m.stabilityProblemMigrationProgress(); progress.Status != "paused_disabled" || progress.NextTs <= 0 {
+	if progress := m.stabilityProblemMigrationProgress(context.Background()); progress.Status != "paused_disabled" || progress.NextTs <= 0 {
 		t.Fatalf("disabled migration must remain durably visible instead of disappearing: %+v", progress)
 	}
 	m.cfg.StabilityClassificationMigrationEnabled = true

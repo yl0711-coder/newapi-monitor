@@ -23,9 +23,246 @@ function fixture(fetchImpl = async()=>{throw new Error('offline');}) {
   const source=readFileSync(new URL('../../monitor/finance.js',import.meta.url),'utf8');
   const end=source.lastIndexOf('}());');
   assert.ok(end>0,'finance module closure not found');
-  vm.runInContext(source.slice(0,end)+'\nglobalThis.fixture={state,scheduleStaleRefresh,load,financeIsPriorStale,financeCacheRefreshNote,renderProfitBridge,operatingProfitBlockers,setGiftEvidence,renderPeriods,renderDays,internalCostDeductionNote,grossCorrectedCost,chartValue};\n'+source.slice(end),context);
+  vm.runInContext(source.slice(0,end)+'\nglobalThis.fixture={state,scheduleStaleRefresh,load,financeIsPriorStale,financeCacheRefreshNote,renderProfitBridge,operatingProfitBlockers,setGiftEvidence,renderPeriods,renderDays,internalCostDeductionNote,grossCorrectedCost,chartValue,renderExecutive,upstreamCoverage,renderCosts,renderEvidenceRollout,renderPairingHours,renderPairingAudit};\n'+source.slice(end),context);
   return {api:context.fixture,element,timers};
 }
+
+test('pairing hours distinguish empty verification from business progress and missing attribution',()=>{
+  const {api,element}=fixture();
+  const row={domain:'4sapi.com',published_hours:305,paired_activity_hours:0,verified_empty_hours:142,
+    unallocated_cost_hours:156,upstream_zero_check_hours:7,other_incomplete_hours:0};
+  const original=JSON.stringify(row);
+  api.renderPairingAudit({hours:[row]});
+  const html=element('finPairingHours').innerHTML;
+  assert.match(html,/有业务且已配对 0/);
+  assert.match(html,/已核验空小时 142/);
+  assert.match(html,/成本已采到待归属 156/);
+  assert.match(html,/本地有业务但上游零记录 7/);
+  assert.match(html,/重复重算不会自动补齐/);
+  assert.equal(JSON.stringify(row),original);
+  assert.doesNotMatch(html,/正在回填|正在同步|46\.6%|\$0\.00/);
+});
+
+test('legacy or absent hourly diagnosis cannot turn unknown coverage into zero',()=>{
+  const {api,element}=fixture();
+  api.renderPairingHours(undefined);
+  assert.match(element('finPairingHours').textContent,/尚未提供小时诊断/);
+  api.renderPairingHours([]);
+  assert.match(element('finPairingHours').textContent,/不代表没有业务或成本缺口/);
+  api.renderPairingHours([{domain:'<img src=x onerror=alert(1)>',published_hours:Infinity,paired_activity_hours:-1}]);
+  const html=element('finPairingHours').innerHTML;
+  assert.match(html,/&lt;img/);
+  assert.match(html,/已发布 — 小时/);
+  assert.match(html,/有业务且已配对 —/);
+  assert.doesNotMatch(html,/<img|Infinity|NaN|undefined|已配对 0/);
+});
+
+test('real Docker hour diagnosis renders verified empty hours separately without changing amounts',
+  {skip:!process.env.MONITOR_PAIRING_HOURS_REPORT&&'requires local Docker hourly diagnosis'},()=>{
+  const data=JSON.parse(readFileSync(process.env.MONITOR_PAIRING_HOURS_REPORT,'utf8'));
+  const {api,element}=fixture();
+  const original=JSON.stringify(data);
+  api.renderPairingAudit(data.pairing_audit);
+  const html=element('finPairingHours').innerHTML;
+  for(const row of data.pairing_audit.hours) {
+    assert.equal(row.published_hours,row.paired_activity_hours+row.verified_empty_hours+
+      row.unallocated_cost_hours+row.upstream_zero_check_hours+row.other_incomplete_hours);
+    assert.ok(html.includes(`有业务且已配对 ${row.paired_activity_hours.toLocaleString('zh-CN')}`));
+    assert.ok(html.includes(`已核验空小时 ${row.verified_empty_hours.toLocaleString('zh-CN')}`));
+  }
+  assert.equal(JSON.stringify(data),original);
+});
+
+test('finance money display rounds integer cents half-up without negative zero or precision loss',()=>{
+  const {api,element}=fixture();
+  for(const [micro,expected] of [
+    ['0','$0.00'],['4999','$0.00'],['5000','$0.01'],['5001','$0.01'],
+    ['1004999','$1.00'],['1005000','$1.01'],['999995000','$1,000.00'],
+    ['-4999','$0.00'],['-5000','-$0.01'],['-1005000','-$1.01'],
+    ['9223372036854775807','$9,223,372,036,854.78'],
+    ['-9223372036854775808','-$9,223,372,036,854.78'],
+    ['', '—'],['invalid','—'],['1.5','—'],
+  ]) {
+    api.renderProfitBridge({}, {operating_revenue:{micro_usd:micro}});
+    assert.equal(element('finBridgeRevenue').textContent,expected,`micro amount ${micro}`);
+  }
+  api.renderProfitBridge({}, {operating_revenue:null});
+  assert.equal(element('finBridgeRevenue').textContent,'—');
+});
+
+test('cold server response preserves already visible same-query money',async()=>{
+  const {api,element,timers}=fixture(async()=>({status:202,ok:true,headers:{get:()=> 'same-config'},json:async()=>({status:'retrying'})}));
+  api.state.loaded=true;api.state.renderedQuery='';
+  api.state.renderedConfiguration='same-config';
+  element('finReportContent').hidden=false;
+  await api.load(false,true);
+  assert.equal(api.state.loaded,true);
+  assert.equal(element('finReportContent').hidden,false);
+  assert.match(element('finCacheUpdate').textContent,/保留上次/);
+  assert.ok(timers.length>0);
+});
+
+test('configuration change cannot retain same-query prior money on 202',async()=>{
+  const {api,element}=fixture(async()=>({status:202,ok:true,headers:{get:()=> 'new-config'},json:async()=>({status:'queued'})}));
+  api.state.loaded=true;api.state.renderedQuery='';api.state.renderedConfiguration='old-config';
+  await api.load(false,true);
+  assert.equal(api.state.loaded,false);
+  assert.equal(element('finReportContent').hidden,true);
+});
+
+test('non-JSON proxy failure retains money and shows a safe HTTP error',async()=>{
+  const {api,element}=fixture(async()=>({status:504,ok:false,json:async()=>{throw new SyntaxError('Unexpected token < in private proxy response');}}));
+  api.state.loaded=true;api.state.renderedQuery='';
+  await api.load(true);
+  assert.equal(element('finReportContent').hidden,false);
+  assert.match(element('finCacheUpdate').textContent,/更新失败.*保留上次结果.*HTTP 504/);
+  assert.doesNotMatch(element('finCacheUpdate').textContent,/Unexpected|private proxy/);
+  assert.equal(element('finRefresh').disabled,false);
+});
+
+test('malformed successful response is not rendered as new report',async()=>{
+  const {api,element}=fixture(async()=>({status:200,ok:true,json:async()=>{throw new SyntaxError('invalid JSON');}}));
+  api.state.loaded=true;api.state.renderedQuery='';
+  await api.load(true);
+  assert.match(element('finCacheUpdate').textContent,/保留上次结果.*报表响应格式异常/);
+  assert.equal(element('finReportContent').hidden,false);
+});
+
+test('publication race is distinguished from persistent refresh failure',()=>{
+  const {api}=fixture();
+  const note=api.financeCacheRefreshNote({_cache_status:'fast-snapshot-stale',_update_state:'retrying'});
+  assert.match(note,/重新核验/);
+  assert.doesNotMatch(note,/更新失败/);
+  assert.match(api.financeCacheRefreshNote({_cache_status:'fast-snapshot-stale',_update_state:'failed'}),/更新失败/);
+});
+
+test('missing historical plan cannot imply that cost evidence is complete',()=>{
+  const {api,element}=fixture();
+  for (const rows of [[],[{domain:'partial.example',status:'incomplete',pairing_status:'not_enrolled'}]]) {
+    api.renderEvidenceRollout(rows);
+    const html=element('finEvidenceRolloutRows').innerHTML;
+    assert.match(html,/没有可展示的历史补证计划/);
+    assert.match(html,/不代表成本证据已完整/);
+    assert.doesNotMatch(html,/没有需要补采/);
+  }
+  api.renderEvidenceRollout([{domain:'ready.example',evidence_backfill_status:'local_estimate_ready',evidence_backfill_closes_cost:true,evidence_backfill_estimated_calls:2,evidence_backfill_estimated_runs:1}]);
+  assert.match(element('finEvidenceRolloutRows').innerHTML,/ready\.example/);
+  assert.doesNotMatch(element('finEvidenceRolloutRows').innerHTML,/没有可展示/);
+});
+
+test('coverage cards distinguish any money from complete period evidence',()=>{
+  const {api,element}=fixture();
+  const upstream={relevant_domains:39,available_domains:39,complete_domains:37,corrected_domains:15,corrected_complete_domains:0};
+  api.renderExecutive({upstream_coverage:upstream},{});
+  assert.equal(element('finBillEvidence:b').textContent,'94.9%');
+  assert.equal(element('finCorrectionEvidence:b').textContent,'0.0%');
+  assert.equal(element('finCorrectionEvidence').classList.contains('ready'),false);
+  assert.match(element('finCorrectionEvidence:span').textContent,/15.*部分/);
+  assert.match(api.upstreamCoverage(upstream),/完整账单 37\/39/);
+  assert.match(api.upstreamCoverage(upstream),/完整修正 0\/39/);
+});
+
+test('profit blockers explain partial bills and correction without assuming active backfill',()=>{
+  const {api}=fixture();
+  const money={micro_usd:'0'};
+  const data={gift_coverage:{complete:true},upstream_coverage:{relevant_domains:2,available_domains:2,complete_domains:1,corrected_domains:2,corrected_complete_domains:0,unconfigured_domains:1},cost_details:[]};
+  const note=api.operatingProfitBlockers(data,{operating_revenue:money,aws_infrastructure_cost:money}).join('；');
+  assert.match(note,/1 个上游账单区间不完整/);
+  assert.match(note,/2 个上游修正成本区间不完整/);
+  assert.match(note,/不能代表全站/);
+  assert.doesNotMatch(note,/正在回填|正在同步/);
+});
+
+test('legacy cached coverage cannot promote partial correction to complete',()=>{
+  const {api,element}=fixture();
+  api.renderExecutive({upstream_coverage:{relevant_domains:1,available_domains:1,corrected_domains:1}},{});
+  assert.equal(element('finCorrectionEvidence').classList.contains('ready'),false);
+  assert.equal(element('finCorrectionEvidence:b').textContent,'—');
+  assert.match(element('finCorrectionEvidence:span').textContent,/旧快照.*完整覆盖/);
+});
+
+test('gift scope horizon is not presented as repaired historical groups',()=>{
+  const {api,element}=fixture();
+  const proof={expected_hours:24,user_completed_hours:24,credit_completed_hours:24,complete:false,
+    scope_unknown_events:10,scope_independent_user_hours:120};
+  api.setGiftEvidence(proof);
+  assert.equal(element('finGiftEvidence:b').textContent,'待补齐');
+  assert.match(element('finGiftEvidence:span').textContent,/10 条历史分组依据待补/);
+  assert.match(element('finGiftEvidence:span').textContent,/120 个后续用户小时已证明不影响赠送扣减/);
+  assert.doesNotMatch(element('finGiftEvidence:span').textContent,/已补齐|已修复/);
+  api.setGiftEvidence({...proof,complete:true,scope_unknown_events:0});
+  assert.equal(element('finGiftEvidence:b').textContent,'已完成');
+  assert.doesNotMatch(element('finGiftEvidence:span').textContent,/分组依据待补/);
+});
+
+test('supplier evidence preserves verified zero and unrelated money without suggesting running jobs',()=>{
+  const {api,element}=fixture();
+  const zero={micro_usd:'0'};
+  api.renderCosts([{domain:'zero.example',billed_cost:zero,known_billed_cost:zero,corrected_cost:zero,known_corrected_cost:zero,status:'verified'}]);
+  let html=element('finCostRows').innerHTML;
+  assert.match(html,/\$0\.00/);
+  assert.match(html,/账单区间完整；修正成本区间完整/);
+  api.renderCosts([{domain:'partial.example',known_billed_cost:{micro_usd:'42000000'},status:'incomplete',pairing_status:'not_enrolled'},
+    {domain:'unconfigured.example',status:'not_configured'}]);
+  html=element('finCostRows').innerHTML;
+  assert.match(html,/\$42\.00<small>已知部分/);
+  assert.doesNotMatch(html,/\$0\.00/);
+  assert.match(html,/账单区间不完整；缺可核验修正依据/);
+  assert.match(html,/不自动补采/);
+  assert.match(html,/不代表补采正在运行/);
+});
+
+test('offline production snapshot renders completeness from actual supplier evidence',
+  {skip:!process.env.MONITOR_FINANCE_SEMANTICS_REPORT&&'requires offline snapshot report'},()=>{
+  const data=JSON.parse(readFileSync(process.env.MONITOR_FINANCE_SEMANTICS_REPORT,'utf8'));
+  const {api,element}=fixture();
+  const hasMoney=value=>value?.micro_usd!=null&&value.micro_usd!=='';
+  const details=data.cost_details.filter(row=>row.status!=='not_configured');
+  const bills=details.filter(row=>hasMoney(row.billed_cost)).length;
+  const corrected=details.filter(row=>hasMoney(row.corrected_cost)).length;
+  assert.equal(data.upstream_coverage.complete_domains,bills);
+  assert.equal(data.upstream_coverage.corrected_complete_domains,corrected);
+  api.renderExecutive(data,data.statement);
+  assert.equal(element('finBillEvidence:b').textContent,`${(bills*100/details.length).toFixed(1)}%`);
+  assert.equal(element('finCorrectionEvidence:b').textContent,`${(corrected*100/details.length).toFixed(1)}%`);
+  assert.notEqual(element('finDecisionBadge').textContent,'可发布');
+  api.renderCosts(data.cost_details);
+  assert.match(element('finCostRows').innerHTML,/不代表补采正在运行/);
+  // No exact operating result may be synthesized by presenting partial costs.
+  assert.equal(data.statement.operating_profit,null);
+});
+
+test('partial correction shows known money and historical repair action without profit',()=>{
+  const {api,element}=fixture();
+  api.renderCosts([{domain:'partial.example',known_billed_cost:{micro_usd:'12000000'},billed_cost:{micro_usd:'12000000'},
+    known_corrected_cost:{micro_usd:'3000000'},corrected_cost:null,status:'incomplete',pairing_status:'not_enrolled',
+    closure_readiness:'finance_history_missing',closure_next_action:'缺少当时有效的充值比例；不能用当前配置覆盖历史。'},
+    {domain:'ambiguous.example',known_billed_cost:{micro_usd:'1000000'},closure_readiness:'correction_ambiguous',
+      closure_next_action:'需更细账单或可审计分段依据。'}]);
+  const html=element('finCostRows').innerHTML;
+  assert.match(html,/\$3\.00<small>已知部分/);
+  assert.match(html,/修正成本仅有部分/);
+  assert.match(html,/不能用当前配置覆盖历史/);
+  assert.match(html,/历史比例边界待核对/);
+  assert.match(html,/配置录入纠正还是真实比例变化/);
+  assert.match(html,/确认前不发布完整成本/);
+  assert.doesNotMatch(html,/\$0\.00/);
+});
+
+test('cached rate-boundary explanation is corrected without changing verified money',()=>{
+  const {api,element}=fixture();
+  const row={domain:'cached.example',known_billed_cost:{micro_usd:'12000000'},billed_cost:{micro_usd:'12000000'},
+    known_corrected_cost:{micro_usd:'3000000'},corrected_cost:null,status:'incomplete',pairing_status:'not_enrolled',
+    closure_readiness:'correction_ambiguous',closure_next_action:'账单桶内充值比例发生变化，不能按单一比例修正。'};
+  const before=JSON.stringify(row);
+  api.renderCosts([row]);
+  const html=element('finCostRows').innerHTML;
+  assert.match(html,/\$12\.00/);
+  assert.match(html,/\$3\.00<small>已知部分/);
+  assert.match(html,/配置录入纠正还是真实比例变化/);
+  assert.doesNotMatch(html,/账单桶内充值比例发生变化/);
+  assert.equal(JSON.stringify(row),before);
+});
 
 test('upgrade snapshot preserves old date and never conceals failed recomputation',()=>{
   const {api}=fixture();
@@ -330,4 +567,32 @@ test('real local report responses refresh gift coverage and all visible statemen
     assert.match(element('finCostRows').innerHTML,/165\.00/);
   }
   assert.equal(queue.length,0);
+});
+
+test('real recharge correction replaces cached costs without changing revenue or inventing profit',
+  {skip: !process.env.MONITOR_RECHARGE_REPORT_ACCEPTANCE_DIR && 'requires local Docker recharge acceptance artifacts'}, async()=>{
+  const root=process.env.MONITOR_RECHARGE_REPORT_ACCEPTANCE_DIR;
+  const read=name=>JSON.parse(readFileSync(`${root}/${name}.json`,'utf8'));
+  const stages=['docker-repaired-first','docker-repaired-report','docker-restart-report'];
+  const snapshots=stages.map(read);
+  let next=0;
+  const {api,element}=fixture(async()=>{
+    const index=next++;
+    assert.ok(index<snapshots.length);
+    return {ok:true,status:200,headers:{get:name=>name==='X-Monitor-Finance-Cache'?'fast-snapshot-stale'
+      :name==='X-Monitor-Finance-Update'?(index===0?'running':'succeeded'):null},
+    json:async()=>structuredClone(snapshots[index])};
+  });
+  let revenue;
+  for(let i=0;i<snapshots.length;i++) {
+    await api.load(false,i>0);
+    assert.equal(api.state.loaded,true);
+    assert.equal(element('finReportContent').hidden,false);
+    if(i===0) revenue=element('finBridgeRevenue').textContent;
+    assert.equal(element('finBridgeRevenue').textContent,revenue);
+    assert.equal(element('finBridgeProfit').textContent,'—');
+    assert.match(element('finCostRows').innerHTML,i===0?/18,276\.93/:/19,956\.05/);
+    assert.match(element('finStatus').innerHTML,i===0?/正在后台更新/:/最近核验完成/);
+    assert.notEqual(element('finDecisionBadge').textContent,'可发布');
+  }
 });

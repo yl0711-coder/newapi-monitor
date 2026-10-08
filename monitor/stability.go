@@ -1096,7 +1096,7 @@ func (m *Monitor) buildStabilityReportWithDetails(ctx context.Context, scope sta
 	}
 	meta.Sources.ProblemSamplerLastSuccess = m.problemLastSuccess.Load()
 	meta.Sources.ProblemSamplerLastFailure = m.problemLastFailure.Load()
-	meta.Sources.ProblemMigration = m.stabilityProblemMigrationProgress()
+	meta.Sources.ProblemMigration = m.stabilityProblemMigrationProgress(ctx)
 	if meta.Sources.NewAPILastTs > meta.Sources.ProblemCoverageTo && meta.Sources.ProblemCoverageTo > 0 {
 		meta.Sources.ProblemCoverageLagSec = meta.Sources.NewAPILastTs - meta.Sources.ProblemCoverageTo
 	}

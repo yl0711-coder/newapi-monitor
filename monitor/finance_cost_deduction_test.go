@@ -2,8 +2,55 @@ package monitor
 
 import (
 	"context"
+	"fmt"
 	"testing"
 )
+
+func TestFinanceInternalExclusionClearsNonpositiveRevenueMargin(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		excluded  int64
+		remaining int64
+		margin    string
+	}{
+		{"zero_revenue", 3_000_000, 0, ""},
+		{"net_refund", 4_000_000, -1_000_000, ""},
+		{"positive_revenue", 1_000_000, 2_000_000, "60.00"},
+	} {
+		for _, exact := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/exact=%t", tc.name, exact), func(t *testing.T) {
+				oldMargin := "66.67"
+				statement := financeStatementView{
+					PairedUserConsumption: economicsMoney(3_000_000), PairedCorrectedCost: economicsMoney(1_000_000),
+					KnownContributionProfit: economicsMoney(2_000_000), PairedContributionMargin: &oldMargin,
+				}
+				if exact {
+					statement.ContributionProfit = financeMoneyPointer(statement.KnownContributionProfit)
+					statement.ContributionMargin = &oldMargin
+				}
+				fact := financeInternalTestCostFact{Rows: 1, RevenueMicroUSD: tc.excluded, CorrectedCostMicroUSD: 200_000, ProfitMicroUSD: tc.excluded - 200_000}
+				if err := subtractFinanceInternalTestFromContribution(&statement, fact, 2); err != nil {
+					t.Fatal(err)
+				}
+				if statement.PairedUserConsumption != economicsMoney(tc.remaining) || statement.PairedCorrectedCost != economicsMoney(800_000) ||
+					statement.KnownContributionProfit != economicsMoney(tc.remaining-800_000) {
+					t.Fatal("margin projection changed the contribution amounts")
+				}
+				if tc.margin == "" {
+					if statement.PairedContributionMargin != nil || statement.ContributionMargin != nil {
+						t.Fatal("nonpositive remaining revenue retained a stale percentage")
+					}
+				} else if statement.PairedContributionMargin == nil || *statement.PairedContributionMargin != tc.margin ||
+					(exact && (statement.ContributionMargin == nil || *statement.ContributionMargin != tc.margin)) {
+					t.Fatal("positive-revenue margin was not recomputed")
+				}
+				if !exact && (statement.ContributionProfit != nil || statement.ContributionMargin != nil) {
+					t.Fatal("partial contribution was promoted to exact")
+				}
+			})
+		}
+	}
+}
 
 func TestFinancePeriodInternalCostCannotDeductOtherDomain(t *testing.T) {
 	m, scope, accounts := dailyBillFixture(t)

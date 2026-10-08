@@ -437,12 +437,19 @@ func expectedUpstreamUsageHours(scope stabilityScope, now int64) int64 {
 	return (end - scope.FromTs) / 3600
 }
 
+// Only call after the shared source-bucket validation. An observed zero has
+// zero corrected cost under every valid recharge ratio; it does not prove a
+// historical ratio, and must not turn an absent/provisional bill into proof.
+func upstreamBillHasZeroFaceValue(row ChannelUpstreamUsageHour) bool {
+	return row.CostUSD == 0 && row.Quota == 0
+}
+
 func adjustedUpstreamUsageCost(cost float64, domainCost ChannelDomainCost, configured bool) (float64, float64, bool) {
 	if !configured || cost < 0 || !validChannelFinanceNumber(domainCost.RechargePaid) || !validChannelFinanceNumber(domainCost.RechargeCredit) {
 		return 0, 0, false
 	}
-	// 充值比例 = 充值到账 ÷ 充值支付。上游账面扣费除以该比例，
-	// 才是实际资金成本；例如 1:10 时账面消费 100，修正成本为 10。
+	// 平台成本只按配置的“充值支付 ÷ 充值到账”换算，不根据上游
+	// 的币种标签额外换汇。例如 1:10 时账面消费 100，修正成本为 10。
 	ratio := domainCost.RechargeCredit / domainCost.RechargePaid
 	adjusted := cost * domainCost.RechargePaid / domainCost.RechargeCredit
 	if math.IsNaN(adjusted) || math.IsInf(adjusted, 0) || adjusted < 0 || math.IsNaN(ratio) || math.IsInf(ratio, 0) || ratio <= 0 {
@@ -471,12 +478,20 @@ func rechargeTermsForBucket(versions []channelRechargeVersion, start, end int64)
 		return 0, 0, upstreamAdjustedCostMissingHistory
 	}
 	paid, credit := versions[selected].Paid, versions[selected].Credit
-	correction := paid / credit
+	if !validChannelFinanceNumber(paid) || !validChannelFinanceNumber(credit) {
+		return 0, 0, upstreamAdjustedCostMissingHistory
+	}
 	for i := selected + 1; i < len(versions) && versions[i].EffectiveAt < end; i++ {
 		if versions[i].EffectiveAt <= start {
 			continue
 		}
-		if !versions[i].Valid || math.Abs(versions[i].Paid/versions[i].Credit-correction) > 1e-12 {
+		// History is ordered by effective time, then version. Only the last
+		// version at an instant takes effect; older entries remain as audit
+		// evidence and for immutable publications that reference their IDs.
+		if i+1 < len(versions) && versions[i+1].EffectiveAt == versions[i].EffectiveAt {
+			continue
+		}
+		if !versions[i].Valid || !sameFinanceRechargeRatio(paid, credit, versions[i].Paid, versions[i].Credit) {
 			// 上游账单表只保留小时/自然日聚合。充值比例在桶中途变化时，
 			// 无法把该桶的账面消费精确拆到变化前后，因此必须停止修正而不是猜测。
 			return 0, 0, upstreamAdjustedCostBucketAmbiguous
@@ -655,6 +670,14 @@ func projectUpstreamUsageBuckets(rows []ChannelUpstreamUsageHour, scope stabilit
 			continue
 		}
 		a.lastEnd = end
+		if row.Provider == upstreamProviderTokenForce {
+			var valid bool
+			row, valid = tokenForceBillFaceValue(row)
+			if !valid {
+				a.integrity = upstreamUsageIntegrityInvalidAmount
+				continue
+			}
+		}
 		unitBased := row.Provider == upstreamProviderNewAPI || row.Provider == upstreamProviderTokenForce
 		expectedCost := 0.0
 		if unitBased && validUpstreamEconomicUnit(row.UnitPerUSD) {
@@ -676,6 +699,13 @@ func projectUpstreamUsageBuckets(rows []ChannelUpstreamUsageHour, scope stabilit
 		a.completed += seconds
 		if until := end; until > a.metrics.DataUntil {
 			a.metrics.DataUntil = until
+		}
+		if row.Provider == upstreamProviderOpenOx {
+			a.adjustedOK, a.adjustedStatus = false, openOxSubscriptionCostUnknown
+			continue
+		}
+		if upstreamBillHasZeroFaceValue(row) {
+			continue // No fabricated paid:credit terms or displayed ratio.
 		}
 		paid, credit, status := rechargeTermsForBucket(versions[row.Domain], row.HourTs, row.HourTs+seconds)
 		if status != upstreamAdjustedCostComplete {
@@ -717,7 +747,7 @@ func projectUpstreamUsageBuckets(rows []ChannelUpstreamUsageHour, scope stabilit
 		}
 		a.metrics.CompletedHours = a.completed / 3600
 		a.metrics.Complete = (a.metrics.ExpectedHours == 0 || a.completed >= a.metrics.ExpectedHours*3600) && !a.metrics.Provisional
-		a.metrics.AdjustedCostAvailable = a.adjustedOK && a.ratioSet
+		a.metrics.AdjustedCostAvailable = a.adjustedOK && (a.ratioSet || a.metrics.CostUSD == 0)
 		a.metrics.AdjustedCostStatus = a.adjustedStatus
 		if a.metrics.AdjustedCostAvailable {
 			a.metrics.AdjustedCostUSD = a.adjusted

@@ -2,10 +2,72 @@ package monitor
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"strings"
 	"testing"
 	"time"
+
+	"gorm.io/gorm"
 )
+
+func TestModelStatisticsDirectoryReadHonorsCancellation(t *testing.T) {
+	m := newTestMonitor(t)
+	defer m.Close()
+	m.cfg.RetentionDays = 7
+	now := time.Now()
+	minute := now.Unix() / 60 * 60
+	if err := m.storeDB.Create(&CapacityUserMinuteSample{
+		BucketTs: minute - 60, UserID: 7, ChannelID: 1, ModelName: "fixture",
+		Grp: "fixture", Success: 1, TrafficClassVersion: stabilityTrafficClassificationVersion,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	pool, err := m.storeDB.DB()
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool.SetMaxOpenConns(1)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	acquired := make(chan *sql.Conn, 1)
+	if err := m.storeDB.Callback().Query().Before("gorm:query").Register("model-statistics-directory-block", func(tx *gorm.DB) {
+		if tx.Statement.Table != "user_directory_entries" {
+			return
+		}
+		conn, acquireErr := pool.Conn(context.Background())
+		if acquireErr != nil {
+			_ = tx.AddError(acquireErr)
+			return
+		}
+		acquired <- conn
+	}); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, reportErr := m.buildModelStatisticsReport(ctx, "24h", now)
+		done <- reportErr
+	}()
+	var conn *sql.Conn
+	select {
+	case conn = <-acquired:
+	case err = <-done:
+		t.Fatalf("did not reach directory read: %v", err)
+	case <-time.After(time.Second):
+		t.Fatal("directory read not reached")
+	}
+	defer conn.Close()
+	cancel()
+	select {
+	case err = <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("cancelled report returned %v", err)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("cancelled report still waits for the occupied SQLite connection")
+	}
+}
 
 func TestModelStatisticsMergesRoutedAndUnavailableChannelRequests(t *testing.T) {
 	m := newTestMonitor(t)

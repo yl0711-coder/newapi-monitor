@@ -314,6 +314,8 @@ func TestCapacityHandlerExcludesCurrentMinuteAndOldTrafficVersion(t *testing.T) 
 
 func TestCapacityOptionalSourcesFailOpenButBusinessSourceIsRequired(t *testing.T) {
 	m := newTestMonitor(t)
+	t.Cleanup(m.Close)
+	m.cfg.InfraEnabled = true
 	if err := m.storeDB.Create(&MetricSample{BucketTs: 120, ChannelID: 1, ModelName: "m", Grp: "g", Success: 1}).Error; err != nil {
 		t.Fatal(err)
 	}
@@ -328,6 +330,9 @@ func TestCapacityOptionalSourcesFailOpenButBusinessSourceIsRequired(t *testing.T
 	}
 	if report.Meta.Sources["pre_route_rejection"].Available || report.Meta.Sources["nginx_ingress"].Available || report.Meta.Sources["infrastructure"].Available {
 		t.Fatalf("缺失源不得伪报可用: %+v", report.Meta.Sources)
+	}
+	if len(report.Components) != 0 {
+		t.Fatal("失败的基础设施快照不能生成正常组件")
 	}
 	if err := m.storeDB.Migrator().DropTable("metric_samples"); err != nil {
 		t.Fatal(err)

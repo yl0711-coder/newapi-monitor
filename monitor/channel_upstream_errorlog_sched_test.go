@@ -166,8 +166,8 @@ func TestFailUpstreamErrorLogStateDoesNotAdvanceWatermark(t *testing.T) {
 	}
 }
 
-// TestFailUpstreamErrorLogStateBacksOffExponentially 连续失败要指数退避并有上限。
-// 不退避会让上游挂掉时每 5 分钟撞一次；无上限则会退到几天后、恢复了也不拉。
+// Continuous errors first back off, then allow bounded recovery probes, then
+// pause for an explicit recovery. The old policy retried forever every 2h.
 func TestFailUpstreamErrorLogStateBacksOffExponentially(t *testing.T) {
 	m := newTestMonitor(t)
 	state := UpstreamErrorLogSyncState{Domain: "d.example"}
@@ -180,14 +180,13 @@ func TestFailUpstreamErrorLogStateBacksOffExponentially(t *testing.T) {
 		if i > 1 && gap < prev {
 			t.Errorf("第 %d 次退避比上次短了: %d < %d", i, gap, prev)
 		}
-		if gap > int64(upstreamErrorLogBackoffMax.Seconds()) {
+		if i < upstreamRecoveryProbeThreshold && gap > int64(upstreamErrorLogBackoffMax.Seconds()) {
 			t.Errorf("第 %d 次退避超过上限: %ds > %v", i, gap, upstreamErrorLogBackoffMax)
 		}
 		prev = gap
 	}
-	// 末尾应已顶到上限，否则说明上限没生效。
-	if prev != int64(upstreamErrorLogBackoffMax.Seconds()) {
-		t.Errorf("多次失败后应顶到上限 %v，got=%ds", upstreamErrorLogBackoffMax, prev)
+	if prev != upstreamAccountIsolatedUntil {
+		t.Errorf("bounded probes exhausted but task was not paused: %d", prev)
 	}
 }
 

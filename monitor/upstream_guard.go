@@ -25,7 +25,6 @@ const (
 	upstreamGuardFailureThreshold = 3
 	upstreamRetryAfterDefault     = 15 * time.Minute
 	upstreamRetryAfterMin         = 30 * time.Second
-	upstreamRetryAfterMax         = 6 * time.Hour
 	// An authentication failure belongs to one configured account, not to the
 	// shared host. Keep it out of automatic due scans until an administrator
 	// explicitly reconnects/saves or manually retries that account.
@@ -324,13 +323,11 @@ func parseUpstreamRetryAfter(value string, now time.Time) time.Time {
 		retryAt = now.Add(upstreamRetryAfterDefault)
 	}
 	minimum := now.Add(upstreamRetryAfterMin)
-	maximum := now.Add(upstreamRetryAfterMax)
 	if retryAt.Before(minimum) {
 		return minimum
 	}
-	if retryAt.After(maximum) {
-		return maximum
-	}
+	// Never shorten a valid upstream cooldown. A long Retry-After is not an
+	// invitation to retry at our former six-hour cap.
 	return retryAt
 }
 

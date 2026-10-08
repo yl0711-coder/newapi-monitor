@@ -15,7 +15,7 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-func TestTokenForceRefreshAndBalanceNormalizeCNY(t *testing.T) {
+func TestTokenForceRefreshAndBalanceKeepAccountFaceValue(t *testing.T) {
 	now := time.Now().Unix()
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -43,7 +43,7 @@ func TestTokenForceRefreshAndBalanceNormalizeCNY(t *testing.T) {
 		t.Fatalf("credential=%+v err=%v", credential, err)
 	}
 	result, updated, err := syncTokenForceBalance(context.Background(), server.Client(), row, credential)
-	if err != nil || updated.RefreshToken != "refresh-new" || result.BalanceRaw != 720 || math.Abs(result.BalanceUSD-100) > 1e-9 || result.BalanceUnit != 7.2 {
+	if err != nil || updated.RefreshToken != "refresh-new" || result.BalanceRaw != 720 || result.BalanceUSD != 720 || result.BalanceUnit != tokenForceLedgerUnit {
 		t.Fatalf("result=%+v updated=%+v err=%v", result, updated, err)
 	}
 }
@@ -60,7 +60,7 @@ func TestTokenForceRefreshAcceptsWhiteLabelAccessTokenField(t *testing.T) {
 	}
 }
 
-func TestTokenForceUsageWindowStrictlyAggregatesAndNormalizes(t *testing.T) {
+func TestTokenForceUsageWindowStrictlyAggregatesFaceValue(t *testing.T) {
 	from := time.Date(2026, 9, 3, 20, 0, 0, 0, cstLocation).Unix()
 	to := from + 3600
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -85,8 +85,28 @@ func TestTokenForceUsageWindowStrictlyAggregatesAndNormalizes(t *testing.T) {
 		t.Fatalf("result=%+v err=%v", result, err)
 	}
 	hour := result.Hours[0]
-	if hour.HourTs != from || hour.BucketSeconds != 3600 || hour.Requests != 2 || hour.Tokens != 165 || math.Abs(hour.Quota-21.6) > 1e-9 || math.Abs(hour.CostUSD-3) > 1e-9 {
+	if hour.HourTs != from || hour.BucketSeconds != 3600 || hour.Requests != 2 || hour.Tokens != 165 || math.Abs(hour.Quota-21.6) > 1e-9 || math.Abs(hour.CostUSD-21.6) > 1e-9 || hour.UnitPerUSD != tokenForceLedgerUnit {
 		t.Fatalf("unexpected hour: %+v", hour)
+	}
+	// A refreshed native bill may overlap a legacy converted bucket. Preserve
+	// its recorded unit in storage, but never expose that conversion as cost.
+	m := newChannelUpstreamTestMonitor(t)
+	legacy := ChannelUpstreamUsageHour{Domain: row.Domain, Provider: row.Provider, HourTs: from, BucketSeconds: 3600, Quota: 21.6, CostUSD: 3, UnitPerUSD: 7.2}
+	if err := m.storeDB.Create(&legacy).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := m.persistUpstreamUsageWindow(t.Context(), row.Domain, from, to, result.Hours, to); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := m.loadChannelUpstreamUsageRows(t.Context(), stabilityScope{FromTs: from, ToTs: to})
+	if err != nil || len(stored) != 1 || stored[0].UnitPerUSD != legacy.UnitPerUSD || math.Abs(stored[0].CostUSD-legacy.CostUSD) > 1e-9 {
+		t.Fatal("refresh changed historical conversion evidence", stored, err)
+	}
+	accounts := map[string]ChannelUpstreamAccountView{row.Domain: {Configured: true, Provider: row.Provider, UsageSyncEnabled: true}}
+	versions := map[string][]channelRechargeVersion{row.Domain: {{Version: 1, EffectiveAt: from, Paid: 1, Credit: 10, Valid: true}}}
+	metrics, amounts, err := projectFinanceBillWindow(stored, stabilityScope{FromTs: from, ToTs: to}, to, accounts, versions)
+	if err != nil || !metrics[row.Domain].Complete || amounts[row.Domain].Raw.MicroUSD != "21600000" || amounts[row.Domain].RechargeCorrected.MicroUSD != "2160000" {
+		t.Fatal("fetch/store/report path applied currency conversion a second time", metrics, amounts, err)
 	}
 }
 
@@ -159,18 +179,16 @@ func TestTokenForceBusinessAuthErrorIsIsolated(t *testing.T) {
 	}
 }
 
-func TestValidateTokenForceConfigurationRequiresOrgRefreshAndCurrencyUnit(t *testing.T) {
-	in := channelUpstreamSaveInput{Domain: "hainahn.com", Provider: upstreamProviderTokenForce, BaseURL: "https://maas.hainahn.com", UserID: 123, RefreshToken: "refresh", UnitPerUSD: 7.2}
-	if err := validateChannelUpstreamInput(&in); err != nil {
-		t.Fatalf("valid TokenForce configuration rejected: %v", err)
-	}
-	in.UnitPerUSD = 0
-	if err := validateChannelUpstreamInput(&in); err == nil {
-		t.Fatal("missing CNY/USD conversion must be rejected")
+func TestValidateTokenForceConfigurationUsesFixedLedgerUnit(t *testing.T) {
+	for _, unit := range []float64{0, 1, 7.2, 8} {
+		in := channelUpstreamSaveInput{Domain: "hainahn.com", Provider: upstreamProviderTokenForce, BaseURL: "https://maas.hainahn.com", UserID: 123, RefreshToken: "refresh", UnitPerUSD: unit}
+		if err := validateChannelUpstreamInput(&in); err != nil || in.UnitPerUSD != tokenForceLedgerUnit {
+			t.Fatalf("legacy unit=%v must normalize to 1, not another FX step: %+v %v", unit, in, err)
+		}
 	}
 }
 
-func TestTokenForceCurrencyUnitChangePreservesHistoricalUsage(t *testing.T) {
+func TestTokenForceLegacyCurrencyInputPreservesHistoricalUsageAndCursors(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	now := time.Now().Unix()
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -200,6 +218,11 @@ func TestTokenForceCurrencyUnitChangePreservesHistoricalUsage(t *testing.T) {
 	if err := m.storeDB.Create(&ChannelUpstreamUsageHour{Domain: domain, HourTs: 3600, BucketSeconds: 3600, Requests: 1, Quota: 72, CostUSD: 10, UnitPerUSD: 7.2, Provider: upstreamProviderTokenForce}).Error; err != nil {
 		t.Fatal(err)
 	}
+	if err := m.storeDB.Model(&ChannelUpstreamAccount{}).Where("domain = ?", domain).Updates(map[string]any{
+		"usage_backfill_done": true, "usage_data_until": int64(7200), "usage_backfill_cursor": int64(3600),
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
 	changed := initial
 	changed.RefreshToken = ""
 	changed.UnitPerUSD = 8
@@ -210,7 +233,7 @@ func TestTokenForceCurrencyUnitChangePreservesHistoricalUsage(t *testing.T) {
 	if err := m.storeDB.First(&row, "domain = ?", domain).Error; err != nil {
 		t.Fatal(err)
 	}
-	if row.BalanceUnit != 8 || row.BalanceRaw != 720 || row.BalanceUSD != 90 || row.UsageBackfillDone || row.UsageDataUntil != 0 {
+	if row.BalanceUnit != tokenForceLedgerUnit || row.BalanceRaw != 720 || row.BalanceUSD != 720 || !row.UsageBackfillDone || row.UsageDataUntil != 7200 || row.UsageBackfillCursor != 3600 {
 		t.Fatalf("unexpected account after unit change: %+v", row)
 	}
 	var liveCount, archiveCount int64
@@ -220,7 +243,7 @@ func TestTokenForceCurrencyUnitChangePreservesHistoricalUsage(t *testing.T) {
 	if err := m.storeDB.Model(&ChannelUpstreamUsageArchive{}).Where("domain = ?", domain).Count(&archiveCount).Error; err != nil {
 		t.Fatal(err)
 	}
-	if liveCount != 2 || archiveCount != 0 {
+	if liveCount != 1 || archiveCount != 0 {
 		t.Fatalf("unit change discarded immutable usage evidence: live=%d archive=%d", liveCount, archiveCount)
 	}
 	var usage ChannelUpstreamUsageHour
@@ -252,5 +275,9 @@ func TestTokenForceConfigurationUIExposesOnlyRequiredNonPasswordFields(t *testin
 	}
 	if strings.Contains(page, `cm-upstream-tokenforce"><span>密码`) {
 		t.Fatal("TokenForce must not ask Monitor to retain an interactive-login password")
+	}
+	if !strings.Contains(page, `value="1" readonly`) || !strings.Contains(js, "payload.unit_per_usd=1") ||
+		strings.Contains(page, "每 1 USD 对应多少 CNY") || strings.Contains(js, "请填写有效的 CNY/每 USD") {
+		t.Fatal("TokenForce configuration must not require or allow an additional FX input")
 	}
 }
