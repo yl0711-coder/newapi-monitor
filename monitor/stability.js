@@ -231,6 +231,8 @@ function loadReport(){
     const generation=++st.generation;
     for(const controller of st.detailControllers.values())controller.abort();
     st.detailControllers.clear();st.detailPromises.clear();st.detailLoading.clear();
+    // 新报表不携带分组详情，同步收起旧展开项，避免留下无法自动加载的空展开状态。
+    st.expanded.clear();
     if(st.abort)st.abort.abort();st.abort=new AbortController();loading($('stDeliveryBody'));
     try{
       const res=await fetch('/stability/report?'+queryParams(),{headers:{Accept:'application/json'},signal:st.abort.signal});

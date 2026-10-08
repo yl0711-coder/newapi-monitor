@@ -319,9 +319,16 @@ type stabilityDimRow struct {
 	AnomalyBilled, AnomalyFree, AnomalyStream, AnomalyQuota int64
 	SumUseTime, Tokens, Quota                               int64
 	MaxUseTime                                              int
-	Err4xx, Err5xx, ErrTimeout, ErrOther                    int64
-	Ttft500, Ttft1k, Ttft2k, Ttft5k, Ttft10k, TtftInf       int64
-	TtftMaxMs, TtftObserved, TtftOver3s                     int64
+	Err4xx                                                  int64 `gorm:"column:err_4xx"`
+	Err5xx                                                  int64 `gorm:"column:err_5xx"`
+	ErrTimeout, ErrOther                                    int64
+	Ttft500                                                 int64 `gorm:"column:ttft_500"`
+	Ttft1k                                                  int64 `gorm:"column:ttft_1k"`
+	Ttft2k                                                  int64 `gorm:"column:ttft_2k"`
+	Ttft5k                                                  int64 `gorm:"column:ttft_5k"`
+	Ttft10k                                                 int64 `gorm:"column:ttft_10k"`
+	TtftInf, TtftMaxMs, TtftObserved                        int64
+	TtftOver3s                                              int64 `gorm:"column:ttft_over_3s"`
 }
 
 func (r stabilityDimRow) counts() stabilityCounts {
@@ -348,9 +355,16 @@ type stabilityDailyRow struct {
 	AnomalyBilled, AnomalyFree, AnomalyStream, AnomalyQuota int64
 	SumUseTime, Tokens, Quota                               int64
 	MaxUseTime                                              int
-	Err4xx, Err5xx, ErrTimeout, ErrOther                    int64
-	Ttft500, Ttft1k, Ttft2k, Ttft5k, Ttft10k, TtftInf       int64
-	TtftMaxMs, TtftObserved, TtftOver3s                     int64
+	Err4xx                                                  int64 `gorm:"column:err_4xx"`
+	Err5xx                                                  int64 `gorm:"column:err_5xx"`
+	ErrTimeout, ErrOther                                    int64
+	Ttft500                                                 int64 `gorm:"column:ttft_500"`
+	Ttft1k                                                  int64 `gorm:"column:ttft_1k"`
+	Ttft2k                                                  int64 `gorm:"column:ttft_2k"`
+	Ttft5k                                                  int64 `gorm:"column:ttft_5k"`
+	Ttft10k                                                 int64 `gorm:"column:ttft_10k"`
+	TtftInf, TtftMaxMs, TtftObserved                        int64
+	TtftOver3s                                              int64 `gorm:"column:ttft_over_3s"`
 }
 
 type stabilityTimelineRow struct {
@@ -361,9 +375,16 @@ type stabilityTimelineRow struct {
 	AnomalyBilled, AnomalyFree, AnomalyStream, AnomalyQuota int64
 	SumUseTime, Tokens, Quota                               int64
 	MaxUseTime                                              int
-	Err4xx, Err5xx, ErrTimeout, ErrOther                    int64
-	Ttft500, Ttft1k, Ttft2k, Ttft5k, Ttft10k, TtftInf       int64
-	TtftMaxMs, TtftObserved, TtftOver3s                     int64
+	Err4xx                                                  int64 `gorm:"column:err_4xx"`
+	Err5xx                                                  int64 `gorm:"column:err_5xx"`
+	ErrTimeout, ErrOther                                    int64
+	Ttft500                                                 int64 `gorm:"column:ttft_500"`
+	Ttft1k                                                  int64 `gorm:"column:ttft_1k"`
+	Ttft2k                                                  int64 `gorm:"column:ttft_2k"`
+	Ttft5k                                                  int64 `gorm:"column:ttft_5k"`
+	Ttft10k                                                 int64 `gorm:"column:ttft_10k"`
+	TtftInf, TtftMaxMs, TtftObserved                        int64
+	TtftOver3s                                              int64 `gorm:"column:ttft_over_3s"`
 }
 
 func (r stabilityTimelineRow) counts() stabilityCounts {

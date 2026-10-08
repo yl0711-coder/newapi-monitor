@@ -682,7 +682,18 @@ func (m *Monitor) recordMetricFRTReplayFailure(stateID uint, now int64, cause er
 }
 
 func (m *Monitor) runMetricFinalizeTurn(ctx context.Context, now int64) error {
-	return m.runMetricFinalizeTurnWith(ctx, now, m.sampleRange, m.sampleTokensRange)
+	if err := m.runMetricFinalizeTurnWith(ctx, now, m.sampleRange, m.sampleTokensRange); err != nil {
+		return err
+	}
+	// Historical FRT replay updates minute facts, not the sealed stability
+	// ledger. Reconcile at most one already-proven local hour; no source query.
+	// A local projection failure must not revoke successful request sampling.
+	if m.cfg.StabilityEnabled {
+		if err := m.repairOneStabilityFRTFromMinutes(ctx, now); err != nil {
+			slog.Warn("稳定性 FRT 本地小时核验未完成，保留原统计", "err", err)
+		}
+	}
+	return nil
 }
 
 // channelTestJSONEnumSQL extracts a closed-enum string from logs.other using

@@ -139,7 +139,8 @@ type Monitor struct {
 	// the policy backfill can both publish overlapping windows; without this
 	// lock a stale read could overwrite a newer TTFT watermark.
 	customerHealthCursorMu    sync.Mutex
-	stabilityBackfillRunning  atomic.Bool // 长期小时补数串行闸门；人工任务与自动修洞共用
+	stabilityBackfillRunning  atomic.Bool  // 长期小时补数串行闸门；人工任务与自动修洞共用
+	stabilityFRTRepairAfter   atomic.Int64 // 本地 FRT 修复轮转游标；重启只会重复核验，不会重复计数
 	metricBackfillMu          sync.RWMutex
 	metricBackfillStatus      MetricBackfillStatus
 	usageFactsHistoryRestarts atomic.Int64 // 全历史持久 worker panic/意外退出后的守护重启次数

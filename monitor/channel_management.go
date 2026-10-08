@@ -52,30 +52,41 @@ type ChannelManagementRateConfig struct {
 // 它们均按主域名账户归集，不能推断为
 // 某一条实际渠道的上游账单。
 type ChannelUpstreamUsageMetrics struct {
-	Provisional                   bool     `json:"provisional,omitempty"`
-	Available                     bool     `json:"available"`
-	Requests                      int64    `json:"requests"`
-	Tokens                        int64    `json:"tokens"`
-	CostUSD                       float64  `json:"cost_usd"`
-	AdjustedCostAvailable         bool     `json:"adjusted_cost_available"`
-	AdjustedCostUSD               float64  `json:"adjusted_cost_usd"`
-	AdjustedCostStatus            string   `json:"adjusted_cost_status,omitempty"`
-	RechargeRatio                 float64  `json:"recharge_ratio"`
-	RechargeRatioVaries           bool     `json:"recharge_ratio_varies,omitempty"`
-	ExpectedHours                 int64    `json:"expected_hours"`
-	CompletedHours                int64    `json:"completed_hours"`
-	Complete                      bool     `json:"complete"`
-	DataUntil                     int64    `json:"data_until"`
-	Granularity                   string   `json:"granularity,omitempty"`
-	IntegrityStatus               string   `json:"integrity_status,omitempty"` // complete / overlapping_buckets / invalid_amount / window_mismatch
-	BusinessCostAvailable         bool     `json:"business_cost_available"`
-	BusinessCostUSD               float64  `json:"business_cost_usd"`
-	BusinessAdjustedCostAvailable bool     `json:"business_adjusted_cost_available"`
-	BusinessAdjustedCostUSD       float64  `json:"business_adjusted_cost_usd"`
-	InternalExcludedCostUSD       float64  `json:"internal_excluded_cost_usd,omitempty"`
-	InternalExcludedAdjustedUSD   float64  `json:"internal_excluded_adjusted_usd,omitempty"`
-	InternalFilterStatus          string   `json:"internal_filter_status,omitempty"`
-	InternalFilterReasons         []string `json:"internal_filter_reasons,omitempty"`
+	Provisional                   bool                          `json:"provisional,omitempty"`
+	Available                     bool                          `json:"available"`
+	Requests                      int64                         `json:"requests"`
+	Tokens                        int64                         `json:"tokens"`
+	CostUSD                       float64                       `json:"cost_usd"`
+	AdjustedCostAvailable         bool                          `json:"adjusted_cost_available"`
+	AdjustedCostUSD               float64                       `json:"adjusted_cost_usd"`
+	AdjustedCostStatus            string                        `json:"adjusted_cost_status,omitempty"`
+	AdjustedCostBreakdown         *ChannelAdjustedCostBreakdown `json:"adjusted_cost_breakdown,omitempty"`
+	RechargeRatio                 float64                       `json:"recharge_ratio"`
+	RechargeRatioVaries           bool                          `json:"recharge_ratio_varies,omitempty"`
+	ExpectedHours                 int64                         `json:"expected_hours"`
+	CompletedHours                int64                         `json:"completed_hours"`
+	Complete                      bool                          `json:"complete"`
+	DataUntil                     int64                         `json:"data_until"`
+	Granularity                   string                        `json:"granularity,omitempty"`
+	IntegrityStatus               string                        `json:"integrity_status,omitempty"` // complete / overlapping_buckets / invalid_amount / window_mismatch
+	BusinessCostAvailable         bool                          `json:"business_cost_available"`
+	BusinessCostUSD               float64                       `json:"business_cost_usd"`
+	BusinessAdjustedCostAvailable bool                          `json:"business_adjusted_cost_available"`
+	BusinessAdjustedCostUSD       float64                       `json:"business_adjusted_cost_usd"`
+	InternalExcludedCostUSD       float64                       `json:"internal_excluded_cost_usd,omitempty"`
+	InternalExcludedAdjustedUSD   float64                       `json:"internal_excluded_adjusted_usd,omitempty"`
+	InternalFilterStatus          string                        `json:"internal_filter_status,omitempty"`
+	InternalFilterReasons         []string                      `json:"internal_filter_reasons,omitempty"`
+}
+
+// ChannelAdjustedCostBreakdown is presentation-only evidence for accepted bill
+// buckets, not a replacement for AdjustedCostAvailable or complete time coverage.
+// Unknown bill face value cannot be added to corrected cost without valid terms.
+type ChannelAdjustedCostBreakdown struct {
+	KnownCostUSD      float64 `json:"known_cost_usd"`
+	UnresolvedBillUSD float64 `json:"unresolved_bill_usd"`
+	KnownBuckets      int64   `json:"known_buckets"`
+	UnresolvedBuckets int64   `json:"unresolved_buckets"`
 }
 
 const (
@@ -623,6 +634,7 @@ func projectUpstreamUsageBuckets(rows []ChannelUpstreamUsageHour, scope stabilit
 		ratioVaries    bool
 		lastEnd        int64
 		integrity      string
+		breakdown      ChannelAdjustedCostBreakdown
 	}
 	aggregates := make(map[string]*aggregate)
 	for _, row := range rows {
@@ -705,10 +717,13 @@ func projectUpstreamUsageBuckets(rows []ChannelUpstreamUsageHour, scope stabilit
 			continue
 		}
 		if upstreamBillHasZeroFaceValue(row) {
+			a.breakdown.KnownBuckets++
 			continue // No fabricated paid:credit terms or displayed ratio.
 		}
 		paid, credit, status := rechargeTermsForBucket(versions[row.Domain], row.HourTs, row.HourTs+seconds)
 		if status != upstreamAdjustedCostComplete {
+			a.breakdown.UnresolvedBuckets++
+			a.breakdown.UnresolvedBillUSD += row.CostUSD
 			a.adjustedOK = false
 			if a.adjustedStatus == upstreamAdjustedCostComplete || status == upstreamAdjustedCostBucketAmbiguous {
 				a.adjustedStatus = status
@@ -717,11 +732,14 @@ func projectUpstreamUsageBuckets(rows []ChannelUpstreamUsageHour, scope stabilit
 		}
 		adjusted, ratio, ok := adjustedUpstreamUsageCost(row.CostUSD, ChannelDomainCost{RechargePaid: paid, RechargeCredit: credit}, true)
 		if !ok {
+			a.breakdown.UnresolvedBuckets++
+			a.breakdown.UnresolvedBillUSD += row.CostUSD
 			a.adjustedOK = false
 			a.adjustedStatus = upstreamAdjustedCostMissingHistory
 			continue
 		}
 		a.adjusted += adjusted
+		a.breakdown.KnownBuckets++
 		if !a.ratioSet {
 			a.ratio, a.ratioSet = ratio, true
 		} else if math.Abs(a.ratio-ratio) > 1e-12 {
@@ -749,6 +767,14 @@ func projectUpstreamUsageBuckets(rows []ChannelUpstreamUsageHour, scope stabilit
 		a.metrics.Complete = (a.metrics.ExpectedHours == 0 || a.completed >= a.metrics.ExpectedHours*3600) && !a.metrics.Provisional
 		a.metrics.AdjustedCostAvailable = a.adjustedOK && (a.ratioSet || a.metrics.CostUSD == 0)
 		a.metrics.AdjustedCostStatus = a.adjustedStatus
+		// Publish a separate subtotal only after whole-domain integrity checks.
+		// Do not make subscription usage look like a partially known cash cost.
+		if accounts[domain].Provider != upstreamProviderOpenOx &&
+			!math.IsNaN(a.adjusted) && !math.IsInf(a.adjusted, 0) &&
+			!math.IsNaN(a.breakdown.UnresolvedBillUSD) && !math.IsInf(a.breakdown.UnresolvedBillUSD, 0) {
+			a.breakdown.KnownCostUSD = a.adjusted
+			a.metrics.AdjustedCostBreakdown = &a.breakdown
+		}
 		if a.metrics.AdjustedCostAvailable {
 			a.metrics.AdjustedCostUSD = a.adjusted
 			a.metrics.RechargeRatioVaries = a.ratioVaries

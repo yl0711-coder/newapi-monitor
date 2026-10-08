@@ -768,7 +768,42 @@ function presentedBusinessCost(usage,adjusted=false,basis='raw'){
   const business=basis==='business';
   const available=business?verifiedBusinessCost(usage,adjusted):(adjusted?usage?.adjusted_cost_available:usage?.available);
   const value=business?(adjusted?usage.business_adjusted_cost_usd:usage.business_cost_usd):(adjusted?usage?.adjusted_cost_usd:usage?.cost_usd);
-  return {available:!!available&&costValueKnown(value),value:available&&costValueKnown(value)?Number(value):null};
+  if(available&&costValueKnown(value))return {available:true,value:Number(value),partial:usage?.complete!==true};
+  // Display-only raw subtotal: never promote it to verified business cost or
+  // feed it into the independent economics/profit publication path.
+  const part=adjusted&&!business?adjustedCostBreakdown(usage):null;
+  if(part&&part.known_buckets>0&&part.unresolved_buckets>0)return {available:true,value:Number(part.known_cost_usd),partial:true};
+  return {available:false,value:null};
+}
+function adjustedCostBreakdown(usage){
+  const part=usage?.adjusted_cost_breakdown;
+  if(!usage?.available||(usage.integrity_status||'complete')!=='complete'||!part)return null;
+  if(!['complete','missing_history','bucket_boundary_ambiguous'].includes(usage.adjusted_cost_status))return null;
+  if(!costValueKnown(part.known_cost_usd)||!costValueKnown(part.unresolved_bill_usd))return null;
+  if(!Number.isSafeInteger(part.known_buckets)||part.known_buckets<0||!Number.isSafeInteger(part.unresolved_buckets)||part.unresolved_buckets<0)return null;
+  return part;
+}
+function adjustedCostCoverageNote(usage,basis){
+  const view=presentedBusinessCost(usage,true,basis),part=basis==='raw'?adjustedCostBreakdown(usage):null;
+  const notes=[];
+  if(view.available&&view.partial)notes.push('已知部分，非完整成本');
+  if(part?.unresolved_buckets>0)notes.push(`另有账面消费 ${usd(part.unresolved_bill_usd)} 未折算（${usage.adjusted_cost_status==='bucket_boundary_ambiguous'?'含时段内比例变更':'历史比例缺失'}）`);
+  if(usage?.available&&usage.complete===false)notes.push('账单时段尚未齐全或未定稿');
+  return notes.join(' · ');
+}
+function adjustedCostSummary(accounts,basis){
+  let known=0,complete=0,unresolvedBill=0,unresolvedAccounts=0;
+  for(const domain of accounts){
+    const usage=domain.upstream_usage||{},view=presentedBusinessCost(usage,true,basis);
+    if(view.available){known++;if(!view.partial)complete++}
+    const part=basis==='raw'?adjustedCostBreakdown(usage):null;
+    if(part?.unresolved_buckets>0){unresolvedAccounts++;unresolvedBill+=Number(part.unresolved_bill_usd)}
+  }
+  const partial=known>0&&complete<accounts.length;
+  const notes=[`可显示 ${known}/${accounts.length} 个账户 · 完整 ${complete}/${accounts.length} 个账户`];
+  if(partial)notes.push('已知部分，非完整成本');
+  if(unresolvedAccounts)notes.push(`${unresolvedAccounts} 个账户另有账面消费 ${usd(unresolvedBill)} 未折算`);
+  return notes.join(' · ');
 }
 function upstreamCostNote(usage,basis,adjusted=false){
   if(basis==='business')return '已扣配置内部账号；不代表全部测试成本已排除';
@@ -820,9 +855,9 @@ function domainCard(domain,index,total,filtered,costBases=upstreamCostBases([dom
 	const upstreamSpend=upstreamCostView.available&&upstreamTrusted?usd(upstreamCostView.value):'—';
 	const observedRatio=Number(upstreamUsage.recharge_ratio),ratio=Number.isFinite(observedRatio)&&observedRatio>0?observedRatio:0;
 	let ratioLabel=domain.upstream?.provider==='openox'?'订阅成本待分摊，暂不折算现金成本':'';
-	if(adjustedCostView.available)ratioLabel=upstreamUsage.recharge_ratio_varies?'按历史充值比例版本修正':ratio>0?`到账/支付 ${ratio.toLocaleString(undefined,{maximumFractionDigits:4})}×`:upstreamCostView.available&&upstreamCostView.value===0&&adjustedCostView.value===0?'已核验零消费':'按历史充值比例修正';
+	if(adjustedCostView.available)ratioLabel=upstreamCostView.available&&upstreamCostView.value===0&&adjustedCostView.value===0?'已核验零消费':adjustedCostView.partial?'已知时段按历史充值比例修正':upstreamUsage.recharge_ratio_varies?'按历史充值比例版本修正':ratio>0?`到账/支付 ${ratio.toLocaleString(undefined,{maximumFractionDigits:4})}×`:'按历史充值比例修正';
 	const adjustedSpend=upstreamTrusted&&adjustedCostView.available?usd(adjustedCostView.value):'—';
-	const internalNote=upstreamCostNote(upstreamUsage,costBases.cost),adjustedInternalNote=upstreamCostNote(upstreamUsage,costBases.adjusted,true);
+	const internalNote=upstreamCostNote(upstreamUsage,costBases.cost),adjustedInternalNote=[adjustedCostCoverageNote(upstreamUsage,costBases.adjusted),upstreamCostNote(upstreamUsage,costBases.adjusted,true)].filter(Boolean).join(' · ');
   const upstreamSpendLabel=domain.upstream?.provider==='openox'?'账面用量（含订阅抵扣）':(billView.daily?'所涉自然日':upstreamUsage.granularity==='day'?'自然日':'区间')+(costBases.cost==='business'?'上游消费':'上游账单消费');
   const upstreamMetrics=domain.upstream?.configured||upstreamUsage.available?`
     <span class="cm-domain-upstream-spend" title="金额按上游账户（主域名）汇总，不拆分到筛选的渠道或分组"><small>${upstreamSpendLabel}</small><b>${upstreamSpend}</b>${billSyncHint}<em class="cm-domain-metric-note neutral">${esc([billRangeNote,internalNote].filter(Boolean).join(' · '))}</em></span>
@@ -1540,7 +1575,7 @@ function render(){
 	<article><small>区间 Tokens</small><b>${usageMetric(filteredUsage.tokens,compact)}</b><span>prompt + completion</span></article>
 	<article class="accent"><small>用户侧消费</small><b>${usageMetric(filteredUsage.cost_usd,usd)}</b><span>当前查询区间 · 用户消费金额</span></article>
     <article class="upstream"><small>${costBases.cost==='business'?'区间上游消费汇总':'区间上游账单消费汇总'}</small><b>${upstreamSpendLabel}</b><span>${esc(upstreamScopeLabel)}</span></article>
-		<article class="adjusted"><small>上游修正成本汇总</small><b>${adjustedUpstreamSpendLabel}</b><span>已取得 ${adjustedUsageDomains.length}/${upstreamAccounts.length} 个账户 · ${costBases.adjusted==='business'?'已扣配置内部账号':'账单口径，含内部测试成本'} · 按历史充值比例修正</span></article>
+		<article class="adjusted"><small>上游修正成本汇总</small><b>${adjustedUpstreamSpendLabel}</b><span>${esc(upstreamAccountComparable?adjustedCostSummary(upstreamAccounts,costBases.adjusted):'上游账户金额不按渠道/分组拆分')} · ${costBases.adjusted==='business'?'已扣配置内部账号':'账单口径，含内部测试成本'} · 按历史充值比例修正</span></article>
     <article class="balance"><small>上游当前余额汇总</small><b>${upstreamBalanceDomains.length?usd(upstreamBalance):'—'}</b><span>最近余额快照合计${balanceSummary.unverified.length?` · ${balanceSummary.unverified.length} 个待更新/核验`:''}${balanceSummary.missing?` · ${balanceSummary.missing} 个未取得`:''}${balanceSummary.excluded.length?' · 自有站点余额不计入':''}</span></article>
     ${exactKPIs}
     ${filtered?`<article><small>筛选${esc(metricLabel())}占比</small><b>${metric(allUsage)>0?share.toFixed(1)+'%':'—'}</b><span>相对当前日期全部渠道</span></article>`:''}
