@@ -91,6 +91,198 @@ func lifecycleRequest(t *testing.T, m *Monitor, path string) (*httptest.Response
 	return w, status
 }
 
+func TestReadyExposesBuildConfigAndCollectorWatermarks(t *testing.T) {
+	m := newStabilityTestMonitor(t)
+	defer m.Close()
+	now := time.Date(2026, 9, 29, 12, 0, 0, 0, time.UTC).Unix()
+	oldSHA, oldImage := BuildGitSHA, BuildImageVersion
+	BuildGitSHA, BuildImageVersion = "sha-test", "newapi-monitor:test"
+	defer func() { BuildGitSHA, BuildImageVersion = oldSHA, oldImage }()
+	m.localStoreProbeOK.Store(true)
+	m.storeIntegrityOK.Store(true)
+	m.localFactsProbeOK.Store(true)
+	m.processStartedAt.Store(now - 60)
+	m.sourceWorkerCoverageFrom.Store(now - 3600)
+	m.sourceWorkerCoverageThrough.Store(now - 60)
+	m.sourceWorkerCoverageTarget.Store(now)
+	m.customerHealthSourceFrom.Store(now - 86400)
+	m.customerHealthSourceThrough.Store(now - 120)
+	m.customerHealthSourceTarget.Store(now)
+	if err := m.storeDB.Create(&MetricFinalizeState{
+		ID: 1, NextTs: now - 3600, TargetThroughTs: now - 3600,
+		CoverageFromTs: now - 8*86400, SemanticsVersion: stabilityTrafficClassificationVersion,
+		TTFTSemanticsVersion: ttftCoverageSemanticsVersion,
+		TTFTCoverageFromTs:   now - 7*86400, TTFTCoverageThroughTs: now - 5*86400,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	status, code := m.readyStatus(time.Unix(now, 0))
+	if code != http.StatusOK || status.GitSHA != "sha-test" || status.ImageVersion != "newapi-monitor:test" {
+		t.Fatalf("build metadata missing: code=%d status=%+v", code, status)
+	}
+	if !status.Config.StabilityEnabled || !status.Config.SourceWorkerEnabled {
+		// Settings constructed directly in unit tests preserve the historical
+		// source-worker default (the production DB itself is still absent).
+		t.Fatalf("effective config mismatch: %+v", status.Config)
+	}
+	for _, name := range []string{"source_worker", "customer_health", "customer_health_history_requests", "customer_health_history_frt", "problem_source", "metric_finalize", "frt_replay", "cloudwatch_pre_route", "cloudwatch_nginx", "nginx_evidence"} {
+		if _, ok := status.Collectors[name]; !ok {
+			t.Fatalf("collector watermark %q missing: %+v", name, status.Collectors)
+		}
+	}
+	got := status.Collectors["source_worker"]
+	if got.FromTs != now-3600 || got.ThroughTs != now-60 || got.TargetTs != now {
+		t.Fatalf("source worker watermark mismatch: %+v", got)
+	}
+	frt := status.Collectors["frt_replay"]
+	if frt.FromTs != now-7*86400 || frt.ThroughTs != now-5*86400 || frt.TargetTs != now-3600 {
+		t.Fatalf("FRT replay watermark must be independent of request finalizer: %+v", frt)
+	}
+}
+
+func TestReadyProblemSourceSeparatesRequestedWindowFromDurableCoverage(t *testing.T) {
+	m := newStabilityTestMonitor(t)
+	defer m.Close()
+	m.cfg.StabilityProblemSourceEnabled = true
+	now := time.Date(2026, 9, 30, 5, 14, 0, 0, time.UTC)
+	target := now.Unix()
+	requestedFrom := target - 24*3600
+	cutoverFrom := target - 10*24*3600
+	oldThrough := cutoverFrom + 24*3600
+	m.problemSourceFrom.Store(requestedFrom)
+	m.problemSourceTarget.Store(target)
+	m.problemLiveThrough.Store(oldThrough)
+	for _, cursor := range []StabilityProblemLiveCursor{
+		{ID: 1, TrafficClassVersion: stabilityTrafficClassificationVersion,
+			NextTs: oldThrough, TargetThroughTs: target, Status: "running"},
+		{ID: stabilityProblemSourceCutoverCursorID, TrafficClassVersion: stabilityTrafficClassificationVersion,
+			NextTs: cutoverFrom, TargetThroughTs: oldThrough, Status: "caught_up"},
+	} {
+		if err := m.storeDB.Create(&cursor).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	ready, _ := m.readyStatus(now)
+	got := ready.Collectors["problem_source"]
+	if got.FromTs != 0 || got.ThroughTs != 0 || got.TargetTs != target ||
+		got.RequestedFromTs != requestedFrom || got.ProgressThroughTs != oldThrough || got.CoverageStatus != "unknown" {
+		t.Fatalf("old durable gap was incorrectly certified from the cutover marker: %+v", got)
+	}
+
+	// The ID=2 marker survives even if ID=1 is lost. Recreating ID=1 at the
+	// rolling lookback skips the gap; neither row pair proves continuity.
+	if err := m.storeDB.Delete(&StabilityProblemLiveCursor{}, 1).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := m.storeDB.Create(&StabilityProblemLiveCursor{
+		ID: 1, TrafficClassVersion: stabilityTrafficClassificationVersion,
+		NextTs: requestedFrom, TargetThroughTs: target, Status: "running",
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	ready, _ = m.readyStatus(now)
+	got = ready.Collectors["problem_source"]
+	if got.FromTs != 0 || got.ThroughTs != 0 || got.CoverageStatus != "unknown" ||
+		got.RequestedFromTs != requestedFrom || got.ProgressThroughTs != requestedFrom || got.TargetTs != target {
+		t.Fatalf("recreated live cursor falsely certified the skipped gap: %+v", got)
+	}
+	m.problemSourceTarget.Store(0)
+	ready, _ = m.readyStatus(now)
+	if got = ready.Collectors["problem_source"]; got.TargetTs != 0 || got.CoverageStatus != "unknown" {
+		t.Fatalf("uninitialized target was replaced with the current minute: %+v", got)
+	}
+}
+
+func TestReadyProblemSourceWithoutMonitorHasUnknownCoverage(t *testing.T) {
+	var m *Monitor
+	got := m.problemSourceReadyCoverage()
+	if got.FromTs != 0 || got.ThroughTs != 0 || got.CoverageStatus != "unknown" {
+		t.Fatalf("nil monitor reported coverage: %+v", got)
+	}
+}
+
+func TestReadyCustomerHealthUsesDurableTodayCursorAndCurrentTarget(t *testing.T) {
+	m := newStabilityTestMonitor(t)
+	defer m.Close()
+	m.cfg.CapacityEnabled = true
+	now := time.Date(2026, 9, 29, 12, 0, 0, 0, cstLocation)
+	dayStart, target := customerHealthSourceRange(now)
+	// A process-local watermark from another day or an uncommitted sample is
+	// not a proof of today's continuous coverage.
+	m.customerHealthSourceFrom.Store(dayStart)
+	m.customerHealthSourceThrough.Store(target + 3600)
+	m.customerHealthSourceTarget.Store(target + 3600)
+	status, _ := m.readyStatus(now)
+	if got := status.Collectors["customer_health"]; got.FromTs != 0 || got.ThroughTs != 0 || got.TargetTs != target {
+		t.Fatalf("missing durable cursor must not inherit atomics: %+v", got)
+	}
+	through := dayStart + 3*3600
+	if err := m.storeDB.Create(&CustomerHealthSourceCursor{
+		ID: 1, DayTs: dayStart, ThroughTs: through,
+		SemanticsVersion: customerHealthStabilityPolicyVersion,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	status, _ = m.readyStatus(now)
+	if got := status.Collectors["customer_health"]; got.FromTs != dayStart || got.ThroughTs != through || got.TargetTs != target {
+		t.Fatalf("ready must expose durable request prefix: %+v", got)
+	}
+	// The target is calculated from this /ready request's clock, not an old
+	// source-loop atomic value that can stay unchanged after collection stalls.
+	later := now.Add(30 * time.Minute)
+	status, _ = m.readyStatus(later)
+	_, laterTarget := customerHealthSourceRange(later)
+	if got := status.Collectors["customer_health"]; got.TargetTs != laterTarget || got.ThroughTs != through {
+		t.Fatalf("ready target did not advance independently of stale atomics: %+v", got)
+	}
+}
+
+func TestReadyIndependentCustomerHealthHistorySeparatesRequestsAndFRT(t *testing.T) {
+	m := newStabilityTestMonitor(t)
+	defer m.Close()
+	m.cfg.CustomerHealthSourceEnabled = true
+	m.cfg.CapacityEnabled = true
+	now := time.Date(2026, 9, 29, 12, 0, 0, 0, cstLocation)
+	today, target := customerHealthSourceRange(now)
+	from := target - customerHealthHistoryDays*24*3600
+	firstDay := customerHealthDayStart(from)
+	for day := firstDay; day < today; day += 24 * 3600 {
+		row := CustomerHealthDayCoverage{
+			DayTs: day, ThroughTs: day + 24*3600,
+			SemanticsVersion:     customerHealthStabilityPolicyVersion,
+			TTFTSemanticsVersion: ttftCoverageSemanticsVersion,
+			TTFTCoverageFromTs:   day, TTFTCoverageThroughTs: day + 24*3600,
+		}
+		if err := m.storeDB.Create(&row).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := m.storeDB.Create(&CustomerHealthSourceCursor{
+		ID: 1, DayTs: today, ThroughTs: target,
+		SemanticsVersion:     customerHealthStabilityPolicyVersion,
+		TTFTSemanticsVersion: ttftCoverageSemanticsVersion,
+		TTFTCoverageFromTs:   today, TTFTCoverageThroughTs: today + 3600,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	status, _ := m.readyStatus(now)
+	requests := status.Collectors["customer_health_history_requests"]
+	frt := status.Collectors["customer_health_history_frt"]
+	if requests.FromTs != from || requests.ThroughTs != target || requests.TargetTs != target {
+		t.Fatalf("seven-day request proof wrong: %+v", requests)
+	}
+	if frt.FromTs != from || frt.ThroughTs != today+3600 || frt.TargetTs != target {
+		t.Fatalf("FRT replay gap must remain visible separately: %+v", frt)
+	}
+	m.cfg.CustomerHealthSourceEnabled = false
+	status, _ = m.readyStatus(now)
+	if got := status.Collectors["customer_health_history_requests"]; got != (readyCoverageStatus{}) {
+		t.Fatalf("standard source must not report independent history proof: %+v", got)
+	}
+}
+
 func TestNewTransientSourceFailureKeepsSQLiteAndRecoversWithoutEpochOverlap(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	var sourceDown atomic.Bool

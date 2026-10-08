@@ -55,6 +55,7 @@ type StabilityHourIngestState struct {
 	InternalTestTokens   int64  `gorm:"column:internal_test_tokens" json:"internal_test_tokens"`
 	InternalTestQuota    int64  `gorm:"column:internal_test_quota" json:"internal_test_quota"`
 	TrafficClassVersion  int    `gorm:"column:traffic_class_version;index" json:"traffic_class_version"`
+	TTFTSemanticsVersion int    `gorm:"column:ttft_semantics_version;index" json:"ttft_semantics_version"`
 	Attempts             int    `json:"attempts"`
 	JobID                string `gorm:"size:40;column:job_id;index" json:"job_id,omitempty"`
 	UpdatedAt            int64  `gorm:"index" json:"updated_at"`
@@ -65,6 +66,9 @@ type StabilityHourIngestState struct {
 func (s *StabilityHourIngestState) BeforeCreate(_ *gorm.DB) error {
 	if s.TrafficClassVersion == 0 {
 		s.TrafficClassVersion = stabilityTrafficClassificationVersion
+	}
+	if s.TTFTSemanticsVersion == 0 {
+		s.TTFTSemanticsVersion = ttftCoverageSemanticsVersion
 	}
 	return nil
 }
@@ -172,10 +176,21 @@ type StabilityDataCoverage struct {
 	EffectivePercent      float64 `json:"effective_percent"`
 	EffectiveComplete     bool    `json:"effective_complete"`
 	LegacyFallbackHours   int64   `json:"legacy_fallback_hours"`
-	LatestHourPending     bool    `json:"latest_hour_pending"`
-	PendingHourTs         int64   `json:"pending_hour_ts,omitempty"`
-	RequestedToTs         int64   `json:"requested_to_ts,omitempty"`
-	ProvisionalSeconds    int64   `json:"provisional_seconds,omitempty"`
+	TTFTExpectedHours     int64   `json:"ttft_expected_hours"`
+	TTFTCompletedHours    int64   `json:"ttft_completed_hours"`
+	TTFTMissingHours      int64   `json:"ttft_missing_hours"`
+	TTFTPercent           float64 `json:"ttft_percent"`
+	TTFTComplete          bool    `json:"ttft_complete"`
+	// Canonical FRT coverage aliases; ttft_* keys remain for compatibility.
+	FRTExpectedHours   int64   `json:"frt_expected_hours"`
+	FRTCompletedHours  int64   `json:"frt_completed_hours"`
+	FRTMissingHours    int64   `json:"frt_missing_hours"`
+	FRTPercent         float64 `json:"frt_percent"`
+	FRTComplete        bool    `json:"frt_complete"`
+	LatestHourPending  bool    `json:"latest_hour_pending"`
+	PendingHourTs      int64   `json:"pending_hour_ts,omitempty"`
+	RequestedToTs      int64   `json:"requested_to_ts,omitempty"`
+	ProvisionalSeconds int64   `json:"provisional_seconds,omitempty"`
 }
 
 func finalizedStabilityHourTo(now int64) int64 {
@@ -237,11 +252,13 @@ func (m *Monitor) stabilityDataCoverage(ctx context.Context, fromTs, toTs, now i
 		result.Percent = 100
 		result.EffectiveComplete = true
 		result.EffectivePercent = 100
+		result.TTFTComplete = true
+		result.TTFTPercent = 100
 		result.LatestHourPending = result.ProvisionalSeconds > 0
 		if result.LatestHourPending {
 			result.PendingHourTs = max(fromTs, toTs)
 		}
-		return result
+		return syncStabilityCoverageFRTAliases(result)
 	}
 	result.ExpectedHours = (toTs - fromTs) / 3600
 	var count int64
@@ -250,7 +267,7 @@ func (m *Monitor) stabilityDataCoverage(ctx context.Context, fromTs, toTs, now i
 	if tx := m.storeDB.WithContext(ctx).Raw(strictSQL, fromTs, toTs,
 		stabilityTrafficClassificationVersion, stabilityTrafficClassificationVersion).Scan(&count); tx.Error != nil {
 		slog.Warn("读取稳定性小时覆盖台账失败", "err", tx.Error)
-		return result
+		return syncStabilityCoverageFRTAliases(result)
 	}
 	result.CompletedHours = count
 	result.MissingHours = result.ExpectedHours - count
@@ -300,6 +317,28 @@ func (m *Monitor) stabilityDataCoverage(ctx context.Context, fromTs, toTs, now i
 		result.EffectivePercent = float64(result.EffectiveHours) / float64(result.ExpectedHours) * 100
 	}
 	result.EffectiveComplete = result.EffectiveMissingHours == 0
+	// TTFT coverage is deliberately independent from request coverage. Rows
+	// written before the exact FRT projection have zero-valued counters and
+	// must remain visibly incomplete instead of looking like fast requests.
+	result.TTFTExpectedHours = result.ExpectedHours
+	var ttftCount int64
+	ttftSQL := `SELECT COUNT(*) FROM stability_hour_ingest_states hs WHERE hs.hour_ts >= ? AND hs.hour_ts < ? AND ` +
+		stabilityCompleteHourPredicateSQL("hs") + ` AND hs.ttft_semantics_version = ?`
+	if tx := m.storeDB.WithContext(ctx).Raw(ttftSQL, fromTs, toTs,
+		stabilityTrafficClassificationVersion, stabilityTrafficClassificationVersion,
+		ttftCoverageSemanticsVersion).Scan(&ttftCount); tx.Error != nil {
+		slog.Warn("读取稳定性小时 TTFT 覆盖台账失败", "err", tx.Error)
+	} else {
+		result.TTFTCompletedHours = ttftCount
+		result.TTFTMissingHours = result.TTFTExpectedHours - ttftCount
+		if result.TTFTMissingHours < 0 {
+			result.TTFTMissingHours = 0
+		}
+		if result.TTFTExpectedHours > 0 {
+			result.TTFTPercent = float64(result.TTFTCompletedHours) / float64(result.TTFTExpectedHours) * 100
+		}
+		result.TTFTComplete = result.TTFTMissingHours == 0
+	}
 	// 仅当查询范围追到当前最新可归档小时，且唯一缺口正好是
 	// 最后一小时时，才标记为正常的尾部汇总延迟。历史中间缺口或已失败
 	// 的最新小时仍是真实的数据完整性问题，不能被页面降级隐藏。
@@ -315,7 +354,13 @@ func (m *Monitor) stabilityDataCoverage(ctx context.Context, fromTs, toTs, now i
 			slog.Warn("读取最新稳定性小时状态失败", "hour", latestHourTs, "err", tx.Error)
 		}
 	}
-	return result
+	return syncStabilityCoverageFRTAliases(result)
+}
+
+func syncStabilityCoverageFRTAliases(c StabilityDataCoverage) StabilityDataCoverage {
+	c.FRTExpectedHours, c.FRTCompletedHours, c.FRTMissingHours = c.TTFTExpectedHours, c.TTFTCompletedHours, c.TTFTMissingHours
+	c.FRTPercent, c.FRTComplete = c.TTFTPercent, c.TTFTComplete
+	return c
 }
 
 func stabilityHourSQL() string {
@@ -324,6 +369,12 @@ func stabilityHourSQL() string {
 	testScope := channelTestScopeSQL(testPredicate)
 	testResult := channelTestResultSQL(testPredicate)
 	testCostBasis := channelTestCostBasisSQL(testPredicate)
+	// NewAPI stores the observed first-data delay in other.frt (milliseconds).
+	// Keep this source-side projection identical to the minute sampler: it is a
+	// timing observation (FRT), not proof that a valid model token was delivered.
+	// Only streaming requests participate; a non-streaming row carrying a stale
+	// frt field must not be presented as a first-data timing sample.
+	frt := "(CASE WHEN JSON_VALID(other) THEN CAST(JSON_EXTRACT(other,'$.frt') AS SIGNED) ELSE 0 END)"
 	q := `
 SELECT channel_id, model_name, ` + "`group`" + ` AS grp,
   CASE WHEN ` + testPredicate + ` THEN 1 ELSE 0 END AS is_channel_test,
@@ -345,11 +396,20 @@ SELECT channel_id, model_name, ` + "`group`" + ` AS grp,
   CAST(COALESCE(SUM(CASE WHEN type=6 THEN quota END),0) AS SIGNED) AS refund_quota,
   CAST(COALESCE(SUM(type=5 AND {{ERR4XX}}),0) AS SIGNED) AS err_4xx,
   CAST(COALESCE(SUM(type=5 AND {{ERR5XX}}),0) AS SIGNED) AS err_5xx,
-  CAST(COALESCE(SUM(type=5 AND {{ERRTIMEOUT}}),0) AS SIGNED) AS err_timeout
+  CAST(COALESCE(SUM(type=5 AND {{ERRTIMEOUT}}),0) AS SIGNED) AS err_timeout,
+  CAST(COALESCE(SUM(type=2 AND COALESCE(is_stream,0)=1 AND FRT>0 AND FRT<=500),0) AS SIGNED) AS ttft_500,
+  CAST(COALESCE(SUM(type=2 AND COALESCE(is_stream,0)=1 AND FRT>500 AND FRT<=1000),0) AS SIGNED) AS ttft_1k,
+  CAST(COALESCE(SUM(type=2 AND COALESCE(is_stream,0)=1 AND FRT>1000 AND FRT<=2000),0) AS SIGNED) AS ttft_2k,
+  CAST(COALESCE(SUM(type=2 AND COALESCE(is_stream,0)=1 AND FRT>2000 AND FRT<=5000),0) AS SIGNED) AS ttft_5k,
+  CAST(COALESCE(SUM(type=2 AND COALESCE(is_stream,0)=1 AND FRT>5000 AND FRT<=10000),0) AS SIGNED) AS ttft_10k,
+  CAST(COALESCE(SUM(type=2 AND COALESCE(is_stream,0)=1 AND FRT>10000),0) AS SIGNED) AS ttft_inf,
+  CAST(COALESCE(MAX(CASE WHEN type=2 AND COALESCE(is_stream,0)=1 AND FRT>0 THEN FRT END),0) AS SIGNED) AS ttft_max_ms,
+  CAST(COALESCE(SUM(type=2 AND COALESCE(is_stream,0)=1 AND FRT>0),0) AS SIGNED) AS ttft_observed,
+  CAST(COALESCE(SUM(type=2 AND COALESCE(is_stream,0)=1 AND FRT>0 AND FRT>3000),0) AS SIGNED) AS ttft_over_3s
 FROM logs
 WHERE created_at >= ? AND created_at < ? AND type IN (2,5,6)
 GROUP BY channel_id, model_name, grp, is_channel_test, channel_test_origin, channel_test_scope, channel_test_cost_basis`
-	return expandAnomalyPredicates(q)
+	return strings.ReplaceAll(expandAnomalyPredicates(q), "FRT", frt)
 }
 
 // stabilityRangeSQL keeps exactly the same business dimensions as the
@@ -531,7 +591,9 @@ func (m *Monitor) fetchStabilityRange(ctx context.Context, fromTs, toTs int64) (
 				&row.Success, &row.Anomaly, &row.Failed,
 				&row.AnomalyBilled, &row.AnomalyFree, &row.AnomalyStream, &row.AnomalyQuota,
 				&row.SumUseTime, &row.MaxUseTime, &row.Tokens, &row.Quota, &row.RefundRecords, &row.RefundQuota,
-				&err4xx, &err5xx, &errTimeout); err != nil {
+				&err4xx, &err5xx, &errTimeout,
+				&row.Ttft500, &row.Ttft1k, &row.Ttft2k, &row.Ttft5k, &row.Ttft10k, &row.TtftInf,
+				&row.TtftMaxMs, &row.TtftObserved, &row.TtftOver3s); err != nil {
 				return err
 			}
 			if hourTs < fromTs || hourTs >= toTs || hourTs%3600 != 0 {
@@ -543,6 +605,7 @@ func (m *Monitor) fetchStabilityRange(ctx context.Context, fromTs, toTs int64) (
 				traffic.InternalTests = make([]ChannelTestHourSample, 0, 16)
 			}
 			row.HourTs, row.Grp, row.TrafficClassVersion = hourTs, group.String, stabilityTrafficClassificationVersion
+			row.TTFTSemanticsVersion = ttftCoverageSemanticsVersion
 			row.Err4xx, row.Err5xx, row.ErrTimeout = err4xx, err5xx, errTimeout
 			if other := row.Failed - err4xx - err5xx - errTimeout; other > 0 {
 				row.ErrOther = other
@@ -712,6 +775,7 @@ func (m *Monitor) replaceStabilityHourTrafficOnce(ctx context.Context, hourTs in
 	expectedTestRequests, expectedTestTokens, expectedTestQuota := channelTestHourTotals(testRows)
 	for i := range rows {
 		rows[i].TrafficClassVersion = stabilityTrafficClassificationVersion
+		rows[i].TTFTSemanticsVersion = ttftCoverageSemanticsVersion
 	}
 	return m.storeDB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		if expectedRequests == 0 {
@@ -769,6 +833,7 @@ func (m *Monitor) replaceStabilityHourTrafficOnce(ctx context.Context, hourTs in
 		state.InternalTestRows = int64(len(testRows))
 		state.InternalTestRequests, state.InternalTestTokens, state.InternalTestQuota = expectedTestRequests, expectedTestTokens, expectedTestQuota
 		state.TrafficClassVersion = stabilityTrafficClassificationVersion
+		state.TTFTSemanticsVersion = ttftCoverageSemanticsVersion
 		now := time.Now().Unix()
 		state.CompletedAt, state.UpdatedAt, state.LastError = now, now, ""
 		if err := tx.Save(&state).Error; err != nil {

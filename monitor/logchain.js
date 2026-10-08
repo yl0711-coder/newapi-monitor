@@ -863,7 +863,7 @@ function endReasonHTML(r){
 //
 // ★ 折叠的是归属，不是原因 ★
 // 同一请求的多次尝试原因常常不同（429 → 503 → 524）。组内每条记录仍独立成行、
-// 保留各自渠道与原文；摘要只说“几次尝试 + 最终结果”，不把多个原因合成一个。
+// 保留各自渠道与原文；摘要只说“可见尝试 + 可见日志最后状态”，不把多个原因合成一个。
 function groupRequests(rows){
   const groups=[];
   const byID=new Map();
@@ -902,33 +902,37 @@ function compareRequestRows(a,b){
   return (+a?.id||0)-(+b?.id||0);
 }
 
-// requestOutcome 最终结果。取组内**时间最晚、同秒 id 最大**那条记录，不是第一条：
-// 摘要写“最终失败 524”才有意义；写第一次的 429 会让人以为最后是限流失败。
+// requestOutcome 只描述当前可见日志，不判断请求最终结果。
+// /logchain/requests 会按异常类型、时间、渠道等筛选并分页；即使 has_more=false
+// 或指定了 Request ID，也不能证明重试成功的消费日志已取全。CloudWatch 证据齐全
+// 同样不代表 NewAPI 日志链路完整。取得独立的完整链路证明之前不能写“最终成功/失败”。
+// 可见记录仍按 (created_at,id) 取最后一条，保证同秒重试不会取到旧状态。
 function requestOutcome(g){
   const last=g.rows.reduce((a,b)=>(compareRequestRows(b,a)>0?b:a),g.rows[0]);
   if(!last)return {text:'—',cls:''};
+  const prefix='当前可见日志的最后状态：';
   if(last.type===5){
     const code=+last.upstream_status_code||0;
-    return {text:'最终失败'+(code?' · HTTP '+code:''),cls:'lc-req-bad'};
+    return {text:prefix+'错误'+(code?' · HTTP '+code:''),cls:'lc-req-bad'};
   }
   const tags=last.anomaly_tags||[];
   if(tags.length){
     // 不写“已记账”：这些异常里既有扣费未交付，也有未交付且未扣费（quota=0），
     // 说成已记账会让人以为一定扣了钱。只说“写了消费日志但有异常”，具体看标签。
-    return {text:'最终写入消费日志，但有交付/计费异常 · '+tags.map(t=>(TAG_LABEL[t]&&TAG_LABEL[t].t)||t).join(' + '),cls:'lc-req-warn'};
+    return {text:prefix+'写入消费日志，但有交付/计费异常 · '+tags.map(t=>(TAG_LABEL[t]&&TAG_LABEL[t].t)||t).join(' + '),cls:'lc-req-warn'};
   }
-  return {text:'最终成功',cls:'lc-req-ok'};
+  return {text:prefix+'正常',cls:'lc-req-ok'};
 }
 
 // requestGroupHTML 请求组的归属说明行。它不替代逐条记录，只说明这些记录属于同一请求。
-function requestGroupHTML(g,isLastGroup){
+function requestGroupHTML(g){
   const attempts=requestAttempts(g);
   const outcome=requestOutcome(g);
   const first=g.rows.reduce((a,b)=>(compareRequestRows(b,a)<0?b:a),g.rows[0]);
   const member=(first&&(first.member||first.user_id))||'—';
-  // 分页可能把同一请求切成两半：最后一组且还有更多时必须说清，
-  // 否则会被读成“这个请求只重试了这么多次”。
-  const partial=lc.hasMore&&isLastGroup;
+  // 不同 Request ID 的日志可能交错，任意组都可能跨页，不只是最后一组。
+  // 即使没有更多页，筛选仍可能排除成功日志；这不是完整链路证明。
+  const partial=lc.hasMore;
   // Request ID 明文不在归属行展示：它对判读没有帮助，还会把这一行挤长。
   // 归并依据仍然只有 Request ID（见 groupRequests），逐条记录里也照旧能查到原值。
   // 但“这条根本没有 Request ID、无法关联”是判读事实，必须保留提示，
@@ -940,7 +944,7 @@ function requestGroupHTML(g,isLastGroup){
     '<span class="lc-req-user">'+esc(String(member))+'</span>'+
     '<span class="lc-req-meta">'+nfmt(attempts)+' 次渠道尝试 · '+nfmt(g.rows.length)+' 条日志</span>'+
     (idText?'<span class="lc-req-meta">'+idText+'</span>':'')+
-    '<span class="lc-req-outcome '+outcome.cls+'">'+esc(outcome.text)+'</span>'+
+    '<span class="lc-req-outcome '+outcome.cls+'" title="只包含当前筛选和已加载的日志；成功记录可能被过滤，未取得完整请求链路">'+esc(outcome.text)+'</span>'+
     (partial?'<span class="lc-req-partial" title="本页已到上限，该请求可能还有未取回的记录">该请求可能不完整</span>':'')+
     '</td></tr>';
 }
@@ -1443,8 +1447,8 @@ function render(){
     // 一行仍是一条日志，但按 Request ID 归入所属请求，组前加一行归属说明。
     // 顺序仍由后端 ORDER BY 决定，前端不重排。
     const groups=groupRequests(rows);
-    body.innerHTML=groups.map((g,i)=>
-      requestGroupHTML(g,i===groups.length-1)+g.rows.map(rowHTML).join('')
+    body.innerHTML=groups.map(g=>
+      requestGroupHTML(g)+g.rows.map(rowHTML).join('')
     ).join('');
   }
 

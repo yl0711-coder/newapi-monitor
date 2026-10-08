@@ -45,6 +45,11 @@ func TestCloudWatchPreRouteParserRecognizesProductionPhrases(t *testing.T) {
 			category: "route_no_channel", model: "claude-haiku-4-5-20251001", group: "claude-3.5x", userID: cloudWatchPtrInt64(16),
 		},
 		{
+			name:     "Chinese no channel with spaced group",
+			message:  "[ERR] 2026/09/01 - 09:09:57 | " + rid + " | user 16 | 分组 group 中文分组 下模型 gpt-5-luna 无可用渠道",
+			category: "route_no_channel", model: "gpt-5-luna", group: "group 中文分组", userID: cloudWatchPtrInt64(16),
+		},
+		{
 			name:     "Chinese invalid token",
 			message:  "[ERR] 2026/09/02 - 16:44:45 | " + rid + " | user 0 | 无效的令牌",
 			category: "invalid_token",
@@ -98,6 +103,29 @@ func TestCloudWatchPreRouteParserRecognizesProductionPhrases(t *testing.T) {
 			}
 			if (evidence.UserID == nil) != (tc.userID == nil) || tc.userID != nil && *evidence.UserID != *tc.userID {
 				t.Fatalf("user_id=%v, want %v", evidence.UserID, tc.userID)
+			}
+		})
+	}
+}
+
+func TestCloudWatchBusinessGroupLabelAllowsOnlyOrdinaryInternalSpaces(t *testing.T) {
+	for _, tc := range []struct {
+		name, raw, want string
+		ok              bool
+	}{
+		{name: "spaced Unicode", raw: "group 中文分组", want: "group 中文分组", ok: true},
+		{name: "leading and trailing spaces", raw: " group 中文分组 ", want: "group 中文分组", ok: true},
+		{name: "tab", raw: "group\t中文分组"},
+		{name: "newline", raw: "group\n中文分组"},
+		{name: "leading newline", raw: "\ngroup 中文分组"},
+		{name: "nonbreaking space", raw: "group\u00a0中文分组"},
+		{name: "separator", raw: "group | 中文分组"},
+		{name: "secret marker", raw: "access token"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := cwBusinessGroupLabel(tc.raw, 64)
+			if got != tc.want || ok != tc.ok {
+				t.Fatalf("cwBusinessGroupLabel(%q) = (%q, %t), want (%q, %t)", tc.raw, got, ok, tc.want, tc.ok)
 			}
 		})
 	}
@@ -245,6 +273,36 @@ func TestCloudWatchPreRouteParserExtractsAlternateModelAndGroupContexts(t *testi
 			}
 			if evidence.Category != tc.category || evidence.Model != tc.model || evidence.Group != tc.group {
 				t.Fatalf("evidence=%+v, want category=%q model=%q group=%q", evidence, tc.category, tc.model, tc.group)
+			}
+		})
+	}
+}
+
+func TestCloudWatchPreRouteQuotedModelContextKeepsStrictLabelValidation(t *testing.T) {
+	parser := newCloudWatchParserForTest(t, false)
+	prefix := "[ERR] 2026/09/28 - 12:00:00 | 202609281200001234 | user 17 | model "
+	for _, tc := range []struct {
+		name, model, category string
+		wantMalformed         bool
+	}{
+		{name: "balanced outer quotes", model: "'gpt-5'", category: "model_not_found"},
+		{name: "unpaired quote", model: "'gpt-5", wantMalformed: true},
+		{name: "internal quote", model: "gpt-'5", wantMalformed: true},
+		{name: "secret-looking model", model: "'sk-sensitive'", wantMalformed: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			evidence, err := parser.parse(cloudWatchEvidenceInput{
+				Source: cwSourceWorkerNewAPI, EventID: cwTestEventID(tc.name),
+				TimestampMS: time.Now().UnixMilli(), Message: prefix + tc.model + " does not exist",
+			})
+			if tc.wantMalformed {
+				if err == nil || cwParseErrorKind(err) != cwParseMalformed {
+					t.Fatalf("unsafe model was not rejected: err=%v", err)
+				}
+				return
+			}
+			if err != nil || evidence.Category != tc.category || evidence.Model != "gpt-5" {
+				t.Fatalf("quoted model was not parsed: category=%q model=%q err=%v", evidence.Category, evidence.Model, err)
 			}
 		})
 	}

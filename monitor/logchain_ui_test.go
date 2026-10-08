@@ -358,7 +358,7 @@ func TestLogChainUndeliveredUnbilledUIIsExplicit(t *testing.T) {
 
 // TestLogChainRequestViewGroupsByRequestIDOnly 请求视图的归并约束。
 //
-// 最要紧的三条：只按 Request ID 归并、尝试次数不等于日志条数、最终结果取最晚记录。
+// 最要紧的三条：只按 Request ID 归并、尝试次数不等于日志条数、可见状态取最晚记录。
 // 任一条写错都会让页面上的数字比原来更容易误读。
 // TestLogChainEdgeTimingNamesObservationDirection 入口计时必须点明观察方向。
 //
@@ -387,7 +387,7 @@ func TestLogChainConsumeAnomalyOutcomeAvoidsBilledClaim(t *testing.T) {
 	if strings.Contains(js, "最终已记账但有异常") {
 		t.Error("不得使用“已记账”：未交付·未扣费并没有扣费")
 	}
-	if !strings.Contains(js, "最终写入消费日志，但有交付/计费异常") {
+	if !strings.Contains(js, "写入消费日志，但有交付/计费异常") {
 		t.Error("消费异常摘要应如实描述为写入消费日志但有交付/计费异常")
 	}
 }
@@ -426,7 +426,9 @@ func TestLogChainRequestViewGroupsByRequestIDOnly(t *testing.T) {
 		"function groupRequests(rows)",
 		"function requestAttempts(g)",
 		"function requestOutcome(g)",
-		"function requestGroupHTML(g,isLastGroup)",
+		"function requestGroupHTML(g)",
+		"当前可见日志的最后状态：",
+		"成功记录可能被过滤，未取得完整请求链路",
 		"个用户请求 /",
 		"次渠道尝试 ·",
 		"该请求可能不完整",
@@ -449,10 +451,10 @@ func TestLogChainRequestViewGroupsByRequestIDOnly(t *testing.T) {
 	if !strings.Contains(js, "seen.add(ch+'@'+(r.created_at||0))") {
 		t.Error("尝试次数必须按渠道+时间去重，不能等于日志条数")
 	}
-	// 最终结果取 (created_at,id) 最大那条：同秒重试只比时间会把旧结果当最终结果。
+	// 可见状态取 (created_at,id) 最大那条：同秒重试只比时间会取到旧状态。
 	for _, want := range []string{"function compareRequestRows(a,b)", "if(at!==bt)return at-bt", "(+a?.id||0)-(+b?.id||0)", "compareRequestRows(b,a)>0"} {
 		if !strings.Contains(js, want) {
-			t.Errorf("同秒最终结果复合排序缺少 %q", want)
+			t.Errorf("同秒可见状态复合排序缺少 %q", want)
 		}
 	}
 	// 组内每条日志仍独立渲染，折叠的是归属而不是原因。
@@ -591,8 +593,8 @@ func TestLogChainFocusedReasonUIWiring(t *testing.T) {
 			t.Errorf("筛选原因模式前端接线缺少 %q", want)
 		}
 	}
-	if !strings.Contains(pageHTML, `<script src="/logchain.js?v=15"></script>`) {
-		t.Error("logchain.js 行为已变化但缓存版本未提升到 v14")
+	if !strings.Contains(pageHTML, `<script src="/logchain.js?v=16"></script>`) {
+		t.Error("logchain.js 行为已变化但缓存版本未提升到 v16")
 	}
 }
 

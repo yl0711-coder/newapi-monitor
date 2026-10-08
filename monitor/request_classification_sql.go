@@ -33,7 +33,7 @@ func streamDeliveryFailureSQL() string {
 // It is used only for the customer-maintenance stability responsibility count;
 // it is not used as proof that a valid model token reached the customer.
 func customerHealthFirstByteDelaySQL() string {
-	return "(CASE WHEN JSON_VALID(other) THEN CAST(JSON_EXTRACT(other,'$.frt') AS SIGNED) ELSE 0 END)"
+	return "(CASE WHEN COALESCE(is_stream,0)=1 AND JSON_VALID(other) THEN CAST(JSON_EXTRACT(other,'$.frt') AS SIGNED) ELSE 0 END)"
 }
 
 func deliveryAnomalySQL() string {

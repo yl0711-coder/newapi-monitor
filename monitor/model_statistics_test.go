@@ -12,11 +12,20 @@ import (
 )
 
 func TestModelStatisticsDirectoryReadHonorsCancellation(t *testing.T) {
+	testModelStatisticsReadHonorsCancellation(t, "user_directory_entries")
+}
+
+func TestModelStatisticsChannelNamesReadHonorsCancellation(t *testing.T) {
+	testModelStatisticsReadHonorsCancellation(t, "channel_snaps")
+}
+
+func testModelStatisticsReadHonorsCancellation(t *testing.T, table string) {
+	t.Helper()
 	m := newTestMonitor(t)
 	defer m.Close()
 	m.cfg.RetentionDays = 7
 	now := time.Now()
-	minute := now.Unix() / 60 * 60
+	minute := metricFinalizeTarget(now.Unix())
 	if err := m.storeDB.Create(&CapacityUserMinuteSample{
 		BucketTs: minute - 60, UserID: 7, ChannelID: 1, ModelName: "fixture",
 		Grp: "fixture", Success: 1, TrafficClassVersion: stabilityTrafficClassificationVersion,
@@ -32,7 +41,7 @@ func TestModelStatisticsDirectoryReadHonorsCancellation(t *testing.T) {
 	defer cancel()
 	acquired := make(chan *sql.Conn, 1)
 	if err := m.storeDB.Callback().Query().Before("gorm:query").Register("model-statistics-directory-block", func(tx *gorm.DB) {
-		if tx.Statement.Table != "user_directory_entries" {
+		if tx.Statement.Table != table {
 			return
 		}
 		conn, acquireErr := pool.Conn(context.Background())
@@ -53,9 +62,9 @@ func TestModelStatisticsDirectoryReadHonorsCancellation(t *testing.T) {
 	select {
 	case conn = <-acquired:
 	case err = <-done:
-		t.Fatalf("did not reach directory read: %v", err)
+		t.Fatalf("did not reach %s read: %v", table, err)
 	case <-time.After(time.Second):
-		t.Fatal("directory read not reached")
+		t.Fatalf("%s read not reached", table)
 	}
 	defer conn.Close()
 	cancel()
@@ -74,7 +83,7 @@ func TestModelStatisticsMergesRoutedAndUnavailableChannelRequests(t *testing.T) 
 	defer m.Close()
 	m.cfg.RetentionDays = 7
 	now := time.Unix(1_800_000_123, 0)
-	to := now.Unix() / 60 * 60
+	to := metricFinalizeTarget(now.Unix())
 	if err := m.storeDB.Create([]CapacityUserMinuteSample{
 		{BucketTs: to - 60, UserID: 1, Username: "old-alice", ChannelID: 1, ModelName: "gpt-main", Grp: "group-a", TrafficClassVersion: stabilityTrafficClassificationVersion, Success: 10, Failed: 2},
 		{BucketTs: to - 60, UserID: 2, ChannelID: 2, ModelName: "gpt-other", Grp: "group-a", TrafficClassVersion: stabilityTrafficClassificationVersion, Success: 5},
@@ -185,6 +194,141 @@ func TestModelStatisticsMergesRoutedAndUnavailableChannelRequests(t *testing.T) 
 	}
 }
 
+func TestModelStatisticsReportsTTFTByChannelAndGroup(t *testing.T) {
+	m := newTestMonitor(t)
+	defer m.Close()
+	m.cfg.RetentionDays = 7
+	now := time.Unix(1_800_000_123, 0)
+	to := metricFinalizeTarget(now.Unix())
+	if err := m.storeDB.Create([]ChannelSnap{
+		{ID: 11, Name: "fast-route", Status: 1},
+		{ID: 12, Name: "slow-route", Status: 1},
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	rows := []CapacityUserMinuteSample{
+		{BucketTs: to - 60, UserID: 1, ChannelID: 11, ModelName: "gpt-ttft", Grp: "paid", TrafficClassVersion: stabilityTrafficClassificationVersion,
+			Success: 3, Ttft500: 2, Ttft2k: 1, TtftObserved: 3, TtftMaxMs: 1800},
+		{BucketTs: to - 60, UserID: 2, ChannelID: 12, ModelName: "gpt-ttft", Grp: "paid", TrafficClassVersion: stabilityTrafficClassificationVersion,
+			Success: 2, Ttft5k: 1, Ttft10k: 1, TtftObserved: 2, TtftOver3s: 2, TtftMaxMs: 8200},
+	}
+	if err := m.storeDB.Create(&rows).Error; err != nil {
+		t.Fatal(err)
+	}
+	report, err := m.buildModelStatisticsReport(context.Background(), "24h", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(report.Models) != 1 || len(report.Models[0].Groups) != 1 {
+		t.Fatalf("TTFT model/group hierarchy missing: %+v", report)
+	}
+	model := report.Models[0]
+	if model.TTFTObserved != 5 || model.TTFTOver3s != 2 || model.TTFTOver3sPct != 40 {
+		t.Fatalf("model TTFT aggregate wrong: %+v", model)
+	}
+	if model.FRTObserved != model.TTFTObserved || model.FRTP95Ms != model.TTFTP95Ms || model.FRTOver3s != model.TTFTOver3s {
+		t.Fatalf("canonical FRT aliases must match legacy ttft fields: %+v", model)
+	}
+	if model.TTFTP95Ms <= 3000 || model.TTFTP99Ms < model.TTFTP95Ms || model.TTFTP50Ms <= 0 || model.TTFTMaxMs != 8200 {
+		t.Fatalf("model TTFT percentiles/max wrong: %+v", model)
+	}
+	group := model.Groups[0]
+	if group.TTFTObserved != 5 || group.TTFTOver3s != 2 || len(group.Channels) != 2 {
+		t.Fatalf("group TTFT/channel detail wrong: %+v", group)
+	}
+	if group.FRTObserved != group.TTFTObserved || group.FRTP99Ms != group.TTFTP99Ms {
+		t.Fatalf("group FRT aliases must match legacy ttft fields: %+v", group)
+	}
+	if group.Channels[0].ChannelID != 11 || group.Channels[0].ChannelName != "fast-route" || group.Channels[0].TTFTObserved != 3 {
+		t.Fatalf("channels should be request-count sorted and named: %+v", group.Channels)
+	}
+	if group.Channels[0].FRTObserved != group.Channels[0].TTFTObserved || group.Channels[0].FRTP50Ms != group.Channels[0].TTFTP50Ms {
+		t.Fatalf("channel FRT aliases must match legacy ttft fields: %+v", group.Channels[0])
+	}
+	if group.Channels[1].ChannelID != 12 || group.Channels[1].ChannelName != "slow-route" || group.Channels[1].TTFTOver3s != 2 || group.Channels[1].TTFTOver3sPct != 100 {
+		t.Fatalf("slow channel TTFT detail wrong: %+v", group.Channels[1])
+	}
+	if group.Channels[1].TTFTP95Ms <= 3000 {
+		t.Fatalf("slow channel should expose P95 over 3s: %+v", group.Channels[1])
+	}
+	if group.Channels[1].TTFTP99Ms < group.Channels[1].TTFTP95Ms {
+		t.Fatalf("slow channel should expose monotonic P99: %+v", group.Channels[1])
+	}
+	if err := m.storeDB.Create(&RejectionSample{BucketTs: to - 60, Node: "legacy", Reason: "no_channel", Model: "gpt-ttft", Grp: "paid", UserID: 3, Count: 4}).Error; err != nil {
+		t.Fatal(err)
+	}
+	report, err = m.buildModelStatisticsReport(context.Background(), "24h", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	group = report.Models[0].Groups[0]
+	var unavailable ModelStatisticsChannel
+	foundUnavailable := false
+	for _, channel := range group.Channels {
+		if channel.IsUnavailable {
+			unavailable, foundUnavailable = channel, true
+			break
+		}
+	}
+	if len(group.Channels) != 3 || !foundUnavailable || unavailable.ChannelID != modelStatisticsUnavailableChannelKey || unavailable.ChannelKind != "unavailable" || !unavailable.IsUnavailable || unavailable.ChannelName != "无可用渠道" || unavailable.TTFTObserved != 0 {
+		t.Fatalf("unavailable-channel row should have empty TTFT: %+v", group.Channels)
+	}
+}
+
+func TestModelStatisticsTTFTP95UsesExactThreeSecondSplit(t *testing.T) {
+	// The durable histogram has a compatible 2-5s bucket, while over3s is an
+	// exact source counter. Ninety-nine 2-3s observations and one 3-5s
+	// observation must keep P95 below the 3s slow-row threshold.
+	_, _, p95, _, over3s, overPct := modelStatisticsTTFTView(modelStatisticsTTFTAggregate{
+		ttft5k: 100, observed: 100, over3s: 1, maxMs: 5000,
+	})
+	if p95 >= 3000 || over3s != 1 || overPct != 1 {
+		t.Fatalf("P95 must use exact >3s split: p95=%v over=%d pct=%v", p95, over3s, overPct)
+	}
+}
+
+func TestModelStatisticsSeparatesUnknownRoutedChannelFromUnavailable(t *testing.T) {
+	rows := modelStatisticsChannels(map[int]*modelStatisticsChannelAggregate{
+		modelStatisticsUnavailableChannelKey: {requests: 2},
+		0:                                    {requests: 3},
+	}, nil)
+	if len(rows) != 2 {
+		t.Fatalf("channel drill-down should retain both facts: %+v", rows)
+	}
+	var unavailable, unknown bool
+	for _, row := range rows {
+		switch row.ChannelKind {
+		case "unavailable":
+			unavailable = row.ChannelID == modelStatisticsUnavailableChannelKey && row.IsUnavailable && row.Requests == 2
+		case "routed_unknown":
+			unknown = row.ChannelID == 0 && !row.IsUnavailable && row.Requests == 3
+		}
+	}
+	if !unavailable || !unknown {
+		t.Fatalf("unknown channel and pre-route rejection were merged: %+v", rows)
+	}
+}
+
+func TestModelStatisticsChannelOrderingUsesStructuredIdentity(t *testing.T) {
+	rows := modelStatisticsChannels(map[int]*modelStatisticsChannelAggregate{
+		0:                                    {requests: 4},
+		modelStatisticsUnavailableChannelKey: {requests: 4},
+		7:                                    {requests: 4},
+	}, nil)
+	if len(rows) != 3 {
+		t.Fatalf("expected all channel facts: %+v", rows)
+	}
+	// Equal request counts must not depend on map iteration or localized names.
+	// The reserved -1 row sorts before unknown routed 0, then concrete IDs.
+	wantIDs := []int{modelStatisticsUnavailableChannelKey, 0, 7}
+	wantKinds := []string{"unavailable", "routed_unknown", "routed"}
+	for i, row := range rows {
+		if row.ChannelID != wantIDs[i] || row.ChannelKind != wantKinds[i] {
+			t.Fatalf("channel ordering is not stable by structured identity: got %+v", rows)
+		}
+	}
+}
+
 func TestModelStatisticsRejectsUnsupportedWindowAndRetentionOverflow(t *testing.T) {
 	if _, err := modelStatisticsWindowFor("30d"); err == nil {
 		t.Fatal("不支持的时间范围必须拒绝")
@@ -203,7 +347,7 @@ func TestModelStatisticsMarksUnprovenFactCoverage(t *testing.T) {
 	m.cfg.RetentionDays = 7
 	m.cfg.CapacityEnabled = true
 	now := time.Unix(1_800_000_123, 0)
-	to := now.Unix() / 60 * 60
+	to := metricFinalizeTarget(now.Unix())
 	if err := m.storeDB.Create(&CapacityUserMinuteSample{
 		BucketTs: to - 60, UserID: 1, ChannelID: 1, ModelName: "gpt-main", Grp: "group-a",
 		TrafficClassVersion: stabilityTrafficClassificationVersion, Success: 1,
@@ -231,7 +375,7 @@ func TestModelStatisticsCloudWatchPrecedenceRequiresMatchingDimensions(t *testin
 	m.cfg.RetentionDays = 7
 	m.cfg.CloudWatchPreRouteEnabled = true
 	now := time.Unix(1_800_000_123, 0)
-	to := now.Unix() / 60 * 60
+	to := metricFinalizeTarget(now.Unix())
 	from := to - 120
 	if err := m.storeDB.Create(&CloudWatchPreRouteCursor{
 		ID: cloudWatchPreRouteCursorID, CoverageFromTs: from, NextTs: to,
@@ -286,7 +430,7 @@ func TestModelStatisticsKeepsLegacyWhenCloudWatchLaneDisabled(t *testing.T) {
 	// Deliberately leave CloudWatchPreRouteEnabled false while retaining a
 	// cursor from an earlier run.  The stale cursor must be ignored.
 	now := time.Unix(1_800_000_123, 0)
-	to := now.Unix() / 60 * 60
+	to := metricFinalizeTarget(now.Unix())
 	if err := m.storeDB.Create(&CloudWatchPreRouteCursor{
 		ID: cloudWatchPreRouteCursorID, CoverageFromTs: to - 60, NextTs: to,
 		ThroughTs: to, TargetThroughTs: to, SemanticsVersion: cloudWatchPreRouteVersion,
@@ -320,7 +464,7 @@ func TestModelStatisticsFallsBackWhenCloudWatchCursorTableMissing(t *testing.T) 
 	m.cfg.RetentionDays = 7
 	m.cfg.CloudWatchPreRouteEnabled = true
 	now := time.Unix(1_800_000_123, 0)
-	to := now.Unix() / 60 * 60
+	to := metricFinalizeTarget(now.Unix())
 	if err := m.storeDB.Migrator().DropTable(&CloudWatchPreRouteCursor{}); err != nil {
 		t.Fatal(err)
 	}
@@ -347,7 +491,7 @@ func TestModelStatisticsDeduplicatesResidualDirectWhenDisabled(t *testing.T) {
 	m.cfg.RetentionDays = 7
 	m.cfg.CloudWatchPreRouteEnabled = false
 	now := time.Unix(1_800_000_123, 0)
-	to := now.Unix() / 60 * 60
+	to := metricFinalizeTarget(now.Unix())
 	from := to - 60
 	if err := m.storeDB.Migrator().DropTable(&CloudWatchPreRouteCursor{}); err != nil {
 		t.Fatal(err)
@@ -417,7 +561,7 @@ func TestModelStatisticsKeepsUnknownIdentityOverlap(t *testing.T) {
 	m.cfg.RetentionDays = 7
 	m.cfg.CloudWatchPreRouteEnabled = true
 	now := time.Unix(1_800_000_123, 0)
-	to := now.Unix() / 60 * 60
+	to := metricFinalizeTarget(now.Unix())
 	from := to - 60
 	if err := m.storeDB.Create(&CloudWatchPreRouteCursor{
 		ID: cloudWatchPreRouteCursorID, CoverageFromTs: from, NextTs: to,
@@ -446,7 +590,7 @@ func TestModelStatisticsKeepsUnknownIdentityOverlap(t *testing.T) {
 
 func TestModelStatisticsCustomerDrilldownUIContract(t *testing.T) {
 	js := string(modelStatisticsJS)
-	for _, want := range []string{"data-ms-group-key", "ms-group-row", "customer_id", "customer_name", "客户 ID", "客户名", "占该分组", "ms-model-row-high-unavailable", "unavailable_channel_requests", ">0.4"} {
+	for _, want := range []string{"data-ms-group-key", "ms-group-row", "group.channels", "ttft_p95_ms", "ttft_over_3s", "ms-ttft-row-slow", "customer_id", "customer_name", "客户 ID", "客户名", "占该分组", "ms-model-row-high-unavailable", "unavailable_channel_requests", "channel_kind", "is_unavailable", "data-ms-channel-key", "data-ms-channel-kind", "data-ms-channel-id", ">0.4"} {
 		if !strings.Contains(js, want) {
 			t.Errorf("模型统计客户下钻展示缺少 %q", want)
 		}

@@ -79,6 +79,22 @@ func TestSampleWindowSQLPlaceholderCount(t *testing.T) {
 	if !strings.Contains(q, "type IN (2,5,6)") {
 		t.Error("来源聚合必须读取消费、错误和退款日志；退款只进入退款字段")
 	}
+	for _, marker := range []string{
+		"AS ttft_observed",
+		"SUM(type=2 AND COALESCE(is_stream,0)=1 AND (CASE WHEN JSON_VALID(other)",
+		"AS ttft_over_3s",
+		"COALESCE(is_stream,0)=1",
+	} {
+		if !strings.Contains(q, marker) {
+			t.Errorf("来源聚合必须直接生成首字有效样本和严格超过3秒计数 %q", marker)
+		}
+	}
+	if !strings.Contains(q, ">3000") || strings.Contains(q, ">=3000") {
+		t.Error("首字慢判定必须严格使用 FRT > 3000ms，恰好 3000ms 不应计入")
+	}
+	if !strings.Contains(q, "type=2 AND COALESCE(is_stream,0)=1 AND (CASE WHEN JSON_VALID(other)") {
+		t.Error("FRT 聚合必须只统计流式请求")
+	}
 	userQuery := sampleWindowUserSQL()
 	if n := strings.Count(userQuery, "?"); n != 2 {
 		t.Fatalf("用户分钟 SQL 应有 2 个区间参数，实际 %d 个", n)
@@ -108,10 +124,10 @@ func TestMergeMetricSamplePreservesOriginalAggregateSemantics(t *testing.T) {
 	mergeMetricSample(dst, MetricSample{Success: 2, Failed: 1, Tokens: 100, SumUseTime: 7, MaxUseTime: 7,
 		Err4xx: 1, Lat2: 2, CompletionTokens: 40, Ttft1k: 2, TtftMaxMs: 900})
 	mergeMetricSample(dst, MetricSample{Success: 3, Anomaly: 1, Tokens: 300, SumUseTime: 11, MaxUseTime: 9,
-		AnomalyBilled: 1, AnomalyQuota: 8, Lat5: 3, CompletionTokens: 70, Ttft2k: 3, TtftMaxMs: 1600})
+		AnomalyBilled: 1, AnomalyQuota: 8, Lat5: 3, CompletionTokens: 70, Ttft2k: 3, TtftObserved: 3, TtftOver3s: 1, TtftMaxMs: 1600})
 	if dst.Success != 5 || dst.Anomaly != 1 || dst.Failed != 1 || dst.Tokens != 400 || dst.SumUseTime != 18 ||
 		dst.MaxUseTime != 9 || dst.Err4xx != 1 || dst.AnomalyBilled != 1 || dst.AnomalyQuota != 8 ||
-		dst.Lat2 != 2 || dst.Lat5 != 3 || dst.CompletionTokens != 110 || dst.Ttft1k != 2 || dst.Ttft2k != 3 || dst.TtftMaxMs != 1600 {
+		dst.Lat2 != 2 || dst.Lat5 != 3 || dst.CompletionTokens != 110 || dst.Ttft1k != 2 || dst.Ttft2k != 3 || dst.TtftObserved != 3 || dst.TtftOver3s != 1 || dst.TtftMaxMs != 1600 {
 		t.Fatalf("按用户拆分后回聚合改变了原有 MetricSample 口径: %+v", dst)
 	}
 }
@@ -252,6 +268,7 @@ func TestMetricWindowCoverageFailsClosedAcrossSemanticsMigration(t *testing.T) {
 	}
 	if err := m.storeDB.Model(&MetricFinalizeState{}).Where("id = ?", state.ID).Updates(map[string]any{
 		"next_ts": target, "target_through_ts": target, "status": "caught_up",
+		"ttft_coverage_from_ts": state.CoverageFromTs, "ttft_coverage_through_ts": target,
 	}).Error; err != nil {
 		t.Fatal(err)
 	}
@@ -261,6 +278,50 @@ func TestMetricWindowCoverageFailsClosedAcrossSemanticsMigration(t *testing.T) {
 	compareFrom := now/3600*3600 - 192*3600
 	if complete, _, _ := m.metricWindowCoverage(compareFrom, now); complete {
 		t.Fatal("week-over-week comparison was enabled without historical current-version coverage")
+	}
+}
+
+func TestSourceWorkerSampleBoundsCoverWholeStartBucketWithoutPublishingOpenTail(t *testing.T) {
+	minuteStart := int64(1_800_000_000)
+	now := minuteStart + 45
+	lookback := int64(4 * 60)
+	from, to, closedThrough := sourceWorkerSampleBounds(now, lookback)
+	if from != minuteStart-lookback || to != minuteStart+60 || closedThrough != minuteStart {
+		t.Fatalf("sample bounds=(%d,%d) closed=%d, want=(%d,%d) closed=%d",
+			from, to, closedThrough, minuteStart-lookback, minuteStart+60, minuteStart)
+	}
+	// The old unaligned lower bound would miss this early log but still
+	// replace the entire grouped minute bucket via UPSERT.
+	earlyInFirstBucket := from + 1
+	if earlyInFirstBucket >= now-lookback || earlyInFirstBucket < from || earlyInFirstBucket >= to {
+		t.Fatalf("whole first minute was not included: event=%d bounds=[%d,%d)", earlyInFirstBucket, from, to)
+	}
+	if now >= to || to%60 != 0 || from%60 != 0 || closedThrough%60 != 0 {
+		t.Fatalf("SQL half-open boundaries must be minute-aligned and include the live minute: [%d,%d), closed=%d", from, to, closedThrough)
+	}
+	m := newTestMonitor(t)
+	m.publishSourceWorkerCoverage(from, closedThrough, closedThrough)
+	if got := m.sourceWorkerCoverageThrough.Load(); got != closedThrough || got >= to {
+		t.Fatalf("/ready source worker published unclosed tail: through=%d bounds=[%d,%d)", got, from, to)
+	}
+	if got := m.sourceWorkerCoverageTarget.Load(); got != closedThrough {
+		t.Fatalf("source worker target must be the last closed minute: %d", got)
+	}
+}
+
+func TestMetricMinuteRetentionCutoffPreservesFullFinalizedWindow(t *testing.T) {
+	now := int64(1_800_000_045)
+	want := metricFinalizeTarget(now) - 7*86400
+	got := metricMinuteRetentionCutoff(now, 7)
+	if got != want || got%60 != 0 {
+		t.Fatalf("minute retention cutoff=%d, want finalized-window start %d", got, want)
+	}
+	wallClockCutoff := now - 7*86400
+	if got >= wallClockCutoff || wallClockCutoff-got < metricFinalizeDelaySec {
+		t.Fatalf("wall-clock pruning would erase finalized window head: got=%d wall=%d", got, wallClockCutoff)
+	}
+	if metricMinuteRetentionCutoff(now, 0) != 0 || metricMinuteRetentionCutoff(10, 7) != 0 {
+		t.Fatal("disabled retention or pre-epoch time must not produce a negative cutoff")
 	}
 }
 

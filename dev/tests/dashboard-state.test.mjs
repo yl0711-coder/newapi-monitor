@@ -49,6 +49,15 @@ test('stability explicit navigation ranges still override the 24 hour default',(
   assert.equal(queryParams().toString(),'hours=24');
 });
 
+test('dashboard FRT styling uses an independent strict three-second threshold',()=>{
+  const page=source('page.html');
+  assert.ok(page.includes("const frtClass=s=>{const v=Number(s);return Number.isFinite(v)&&v>3?'lat-bad':''};"));
+  assert.ok(page.includes("${ttftComplete?frtClass(frtField(r,'p95')):''}"));
+  assert.ok(page.includes('FRT P95 ${ttftComplete?`<span class="${frtClass(frtField(r,\'p95\'))}">'));
+  assert.ok(page.includes('首个数据事件延迟（FRT）P95'));
+  assert.ok(!page.includes("${ttftComplete?latClass(r.ttft_p95):''}"));
+});
+
 test('upstream diagnostics renders safe instructions and tolerates missing checks',()=>{
   const {context,element}=dashboard();
   context.channelTest.renderUpstreamDiagnostic({provider:'tokenforce',confidence:'suspected',checks:[{name:'余额',status:'error',message:'<img src=x onerror=alert(1)>',action:'重新登录'}],instructions:['查找 orgId'],scope:'仅单页'});
@@ -121,7 +130,7 @@ function dashboard(fetchImpl = () => {throw Error('network forbidden in renderer
     assert.ok(declaration, `production function ${name} must exist`);
     vm.runInContext(declaration[0], context);
   }
-  for (const name of ['esc', 'fmtAge', 'infraBadge', 'infraDot', 'countItem', 'fmtNum', 'fmtRate', 'fmtUSD', 'fmtTtft', 'fmtTok', 'fmtLat', 'infraCoverageNote', 'clock']) {
+  for (const name of ['esc', 'fmtAge', 'infraBadge', 'infraDot', 'countItem', 'fmtNum', 'fmtRate', 'fmtUSD', 'fmtTtft', 'fmtTok', 'fmtLat', 'frtClass', 'frtColor', 'frtField', 'infraCoverageNote', 'clock']) {
     const declaration = page.match(new RegExp(`^const ${name}=.*$`, 'm'));
     assert.ok(declaration, `production formatter ${name} must exist`);
     vm.runInContext(declaration[0], context);

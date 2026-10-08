@@ -113,6 +113,121 @@ func TestRecipientList(t *testing.T) {
 	}
 }
 
+func TestAlertBodyDoesNotExposeIncompleteTTFT(t *testing.T) {
+	r := Row{Label: "模型 m", TtftObserved: 12, TtftP95: 12.345}
+	c := AlertConfig{EvalWindowMin: 15}
+	if body := alertBody(r, c, "告警", false); !strings.Contains(body, "FRT p95:未完整") {
+		t.Fatalf("TTFT 未完整时邮件必须明确标记未完整: %s", body)
+	} else if strings.Contains(body, "12.3s") {
+		t.Fatalf("TTFT 未完整时不能泄露看似准确的 P95: %s", body)
+	}
+	if body := alertBody(r, c, "告警", true); !strings.Contains(body, "FRT p95:12.3s") {
+		t.Fatalf("TTFT 完整时应显示 P95: %s", body)
+	}
+	if body := alertBody(Row{Label: "无样本", TtftP95: 9}, c, "告警", true); !strings.Contains(body, "FRT p95:—") {
+		t.Fatalf("TTFT 无有效样本时应显示未知: %s", body)
+	}
+}
+
+func TestAlertsContinueWhenTTFTCoverageIsIncomplete(t *testing.T) {
+	m := newTestMonitor(t)
+	defer m.Close()
+	const now = int64(1_800_000_000)
+	end := metricFinalizeTarget(now)
+	if err := m.storeDB.Create(&MetricFinalizeState{
+		ID: 1, CoverageFromTs: end - 3600, NextTs: end,
+		SemanticsVersion: stabilityTrafficClassificationVersion,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := m.upsertSamples([]MetricSample{{
+		BucketTs: end - 60, ChannelID: 1, ModelName: "m", Grp: "g", Failed: 3,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	// Request facts are complete, but this row predates the exact TTFT
+	// projection.  Error alerts must still be evaluated while TTFT is being
+	// backfilled; only the TTFT line in the email is marked incomplete.
+	if err := m.storeDB.Model(&MetricSample{}).Where("bucket_ts = ?", end-60).
+		Update("ttft_semantics_version", 0).Error; err != nil {
+		t.Fatal(err)
+	}
+	snap, err := m.GetSnapshot(60, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !snap.RequestsComplete || snap.TTFTComplete || snap.DataComplete {
+		t.Fatalf("请求事实应完整而 TTFT 明确未完整: %+v", snap)
+	}
+	if err := m.saveAlertConfig(AlertConfig{
+		ID: 1, Enabled: true, SMTPHost: "unused.invalid", Recipients: "test@example.invalid",
+		EvalWindowMin: 60, ErrBurstCount: 1, ModelAlertsEnabled: false,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	m.evaluateAlerts(now)
+	var count int64
+	if err := m.storeDB.Model(&AlertLog{}).Count(&count).Error; err != nil {
+		t.Fatal(err)
+	}
+	if count == 0 {
+		t.Fatal("请求事实完整但 TTFT 未完整时，错误告警不应被整体关闭")
+	}
+}
+
+func TestAlertsContinueWhileHistoricalFRTMigrates(t *testing.T) {
+	m := newTestMonitor(t)
+	defer m.Close()
+	m.cfg.RetentionDays = 7
+	const now = int64(2_000_000_000)
+	end := metricFinalizeTarget(now)
+	if err := m.storeDB.Create(&MetricFinalizeState{
+		ID: 1, CoverageFromTs: end - 3600, NextTs: end,
+		TargetThroughTs: end, SemanticsVersion: stabilityTrafficClassificationVersion,
+		TTFTSemanticsVersion: ttftCoverageSemanticsVersion,
+		TTFTCoverageFromTs:   end - 3600, TTFTCoverageThroughTs: end,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := m.upsertSamples([]MetricSample{{
+		BucketTs: end - 60, ChannelID: 1, ModelName: "m", Grp: "g", Failed: 3,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.storeDB.Model(&MetricSample{}).Where("bucket_ts = ?", end-60).
+		Update("ttft_semantics_version", 0).Error; err != nil {
+		t.Fatal(err)
+	}
+	state, err := m.loadOrExtendMetricFinalizeState(now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.NextTs != end || state.CoverageFromTs != end-3600 || state.TTFTCoverageThroughTs >= end {
+		t.Fatalf("FRT migration must not revoke request coverage: %+v", state)
+	}
+	snap, err := m.GetSnapshot(60, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !snap.RequestsComplete || snap.TTFTComplete || snap.FinalizationDelayed {
+		t.Fatalf("FRT migration stopped a current request snapshot: %+v", snap)
+	}
+	if err := m.saveAlertConfig(AlertConfig{
+		ID: 1, Enabled: true, SMTPHost: "unused.invalid", Recipients: "test@example.invalid",
+		EvalWindowMin: 60, ErrBurstCount: 1, ModelAlertsEnabled: false,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	m.evaluateAlerts(now)
+	var count int64
+	if err := m.storeDB.Model(&AlertLog{}).Count(&count).Error; err != nil {
+		t.Fatal(err)
+	}
+	if count == 0 {
+		t.Fatal("historical FRT replay must not pause error/anomaly alerts")
+	}
+}
+
 // 验证三栏目邮件开关:关闭的栏目 fire 不发邮件但仍记「最近告警」;打开的栏目会尝试发送(无收件人→记 _FAILED)。
 func TestAlertCategoryGate(t *testing.T) {
 	m := &Monitor{cfg: Settings{SessionSecret: "test-secret"}, chNames: map[string]string{}}

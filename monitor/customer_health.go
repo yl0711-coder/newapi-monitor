@@ -21,6 +21,11 @@ package monitor
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
+	"sort"
+	"strings"
 	"time"
 )
 
@@ -191,6 +196,72 @@ type CustomerHealthCollectionStatus struct {
 	LastSuccessAt int64  `json:"last_success_at"`
 	LastFailureAt int64  `json:"last_failure_at"`
 	Note          string `json:"note"`
+	// Membership* make it explicit which local SQLite list produced this
+	// report.  Production and 8204 must not be compared by customer count
+	// until these values match; the list is deliberately independent from the
+	// usage-watch list.
+	MembershipSource      string `json:"membership_source"`
+	MembershipGroups      int    `json:"membership_groups"`
+	MembershipMembers     int    `json:"membership_members"`
+	MembershipFingerprint string `json:"membership_fingerprint"`
+}
+
+// customerHealthMembershipFingerprint is a stable, non-sensitive identity for
+// the local customer-maintenance list.  It contains IDs and names only through
+// a digest, so the API can prove two instances use the same list without
+// exposing extra customer data or depending on insertion order.
+func customerHealthMembershipFingerprint(companies []customerHealthCompany) string {
+	h := sha256.New()
+	ordered := append([]customerHealthCompany(nil), companies...)
+	sort.SliceStable(ordered, func(i, j int) bool {
+		// The local group ID is an auto-increment implementation detail.  It can
+		// differ between production and 8204 even when the customer list is
+		// identical, so it must never participate in the cross-instance identity.
+		leftName, rightName := normalizeCustomerHealthCompanyName(ordered[i].name), normalizeCustomerHealthCompanyName(ordered[j].name)
+		if leftName != rightName {
+			return leftName < rightName
+		}
+		leftIDs, rightIDs := customerHealthMemberIDs(ordered[i].members), customerHealthMemberIDs(ordered[j].members)
+		for k := 0; k < len(leftIDs) && k < len(rightIDs); k++ {
+			if leftIDs[k] != rightIDs[k] {
+				return leftIDs[k] < rightIDs[k]
+			}
+		}
+		return len(leftIDs) < len(rightIDs)
+	})
+	for _, company := range ordered {
+		// Names are normalized so harmless whitespace/case differences do not
+		// make otherwise identical local lists look different.  Membership is
+		// represented solely by stable server User IDs, never usernames or the
+		// local auto-increment group ID.
+		_, _ = fmt.Fprintf(h, "%s\x00", normalizeCustomerHealthCompanyName(company.name))
+		for _, userID := range customerHealthMemberIDs(company.members) {
+			_, _ = fmt.Fprintf(h, "%d\x00", userID)
+		}
+		_, _ = fmt.Fprint(h, "\x01")
+	}
+	digest := hex.EncodeToString(h.Sum(nil))
+	if len(digest) > 16 {
+		return digest[:16]
+	}
+	return digest
+}
+
+// normalizeCustomerHealthCompanyName defines the stable company-name portion
+// of the membership identity.  Fields collapses repeated/leading/trailing
+// whitespace and ToLower makes case-only edits non-semantic while preserving
+// all other characters (including non-ASCII names).
+func normalizeCustomerHealthCompanyName(name string) string {
+	return strings.ToLower(strings.Join(strings.Fields(name), " "))
+}
+
+func customerHealthMemberIDs(members []CustomerHealthMember) []int64 {
+	ids := make([]int64, 0, len(members))
+	for _, member := range members {
+		ids = append(ids, member.UserID)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	return ids
 }
 
 // 当前公司相对同渠道其他账号是否明显更差。四态分离，不合并成布尔——
@@ -266,11 +337,12 @@ func customerHealthStability(total, stabilityAnomaly, stabilityFailed int64) *fl
 // buildCustomerHealthReport 汇总所有公司今天的稳定性。
 func (m *Monitor) buildCustomerHealthReport(ctx context.Context, now time.Time) (CustomerHealthReport, error) {
 	fromTs, toTs, day := customerHealthDayRange(now)
+	_, collectionTarget := customerHealthSourceRange(now)
 	report := CustomerHealthReport{
 		Day: day, FromTs: fromTs, ToTs: toTs,
 		GeneratedAt: now.Unix(), TimeZone: "Asia/Shanghai",
 		RedThreshold: customerHealthRedThreshold,
-		Collection:   m.customerHealthCollectionStatus(fromTs),
+		Collection:   m.customerHealthCollectionStatus(fromTs, collectionTarget),
 		Rows:         []CustomerHealthRow{},
 		Notes:        customerHealthNotes(),
 	}
@@ -278,19 +350,33 @@ func (m *Monitor) buildCustomerHealthReport(ctx context.Context, now time.Time) 
 	if err != nil {
 		return CustomerHealthReport{}, err
 	}
+	// The list is a local SQLite snapshot, independent from the usage page.
+	// Always return its identity, including when it is empty, so an operator
+	// can tell "different list" from "different query result" before comparing
+	// production and 8204.
+	report.Collection.MembershipSource = "local_sqlite:customer_health_groups/customer_health_members"
+	report.Collection.MembershipGroups = len(companies)
+	for _, company := range companies {
+		report.Collection.MembershipMembers += len(company.members)
+	}
+	report.Collection.MembershipFingerprint = customerHealthMembershipFingerprint(companies)
 	if len(companies) == 0 {
 		return report, nil
 	}
-	usageToTs := toTs
-	metricsReady := true
-	if m.cfg.CustomerHealthSourceEnabled {
-		metricsReady = report.Collection.Ready
-		if !metricsReady {
-			usageToTs = fromTs
-		} else if report.Collection.ThroughTs < usageToTs {
-			// 独立采集重启后 SQLite 里可能留有右水位之后的旧行。只统计本轮已经
-			// 从 00:00 连续证明到的区间，保证页面数字与显示的水位完全一致。
+	usageToTs := fromTs
+	metricsReady := report.Collection.Ready
+	if report.Collection.Mode == "logchain_only" || report.Collection.Mode == "source_worker" {
+		// Both customer-health source lanes expose a durable contiguous
+		// watermark.  Never read beyond it, even if an old restart left rows in
+		// SQLite for a later interval.  When the watermark has not caught up to
+		// the current target, keep the safe partial range for internal queries
+		// but fail closed in the response (metrics_ready=false) so the UI cannot
+		// present a partial day as zero/full data.
+		if report.Collection.ThroughTs > fromTs {
 			usageToTs = report.Collection.ThroughTs
+			if usageToTs > toTs {
+				usageToTs = toTs
+			}
 		}
 	}
 	usage, err := m.customerHealthUsage(ctx, fromTs, usageToTs)
@@ -315,9 +401,7 @@ func (m *Monitor) buildCustomerHealthReport(ctx context.Context, now time.Time) 
 	for _, company := range companies {
 		row := buildCustomerHealthRow(company, usage, problems)
 		row.MetricsReady = metricsReady
-		if m.cfg.CustomerHealthSourceEnabled {
-			row.MetricsNote = report.Collection.Note
-		}
+		row.MetricsNote = report.Collection.Note
 		if !metricsReady {
 			row.Total, row.Success, row.Anomaly, row.Failed = 0, 0, 0, 0
 			row.StabilityAnomaly, row.StabilityFailed = 0, 0

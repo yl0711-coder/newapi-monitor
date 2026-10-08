@@ -88,12 +88,29 @@ function setNotes(t){
   el.hidden=false;
   el.textContent=t;
 }
+// 覆盖不完整时必须在表格上方显著提示。数量仍可用于排查已采集的事实，
+// 但不能被读成整个日期范围的最终总数。
+function syncCoverageWarning(){
+  const el=$("alCoverageWarning");
+  if(!el)return;
+  if(lastMeta.coverage_complete===true){
+    el.hidden=true;el.textContent="";return;
+  }
+  const source=lastMeta.source||"未知来源";
+  const srcName={cloudwatch:"CloudWatch 直采",collector:"旁路采集器",mixed:"CloudWatch 直采 + 旁路采集器",unknown:"本地采集"}[source]||source;
+  let text="数据不完整：当前问题预警只覆盖已采集部分，数量不能作为最终总数（来源："+srcName+"）。";
+  if(lastMeta.through_ts||lastMeta.target_ts){
+    text+="已覆盖至 "+(lastMeta.through_ts?fmtTs(lastMeta.through_ts):"—")+
+      "，目标至 "+(lastMeta.target_ts?fmtTs(lastMeta.target_ts):"—")+"。";
+  }
+  el.hidden=false;el.textContent=text;
+}
 function setBody(html){
   const b=$("alTableBody");
   if(b)b.innerHTML=html;
 }
 
-let lastMeta={enabled:true,total:0,truncated:false,note:"",unauth_count:0,
+let lastMeta={enabled:true,total:0,truncated:false,note:"",coverage_complete:false,source:"unknown",through_ts:0,target_ts:0,unauth_count:0,
   unknown_customer_count:0,unknown_user_quota_count:0,unknown_pre_consume_count:0,
   unknown_token_quota_count:0,unknown_quota_account_count:0,unknown_customer_other_count:0,
   reason_options:[]};
@@ -106,6 +123,7 @@ async function load(more=false){
   abort?.abort();
   const ac=new AbortController();abort=ac;
   if(!more){lastRows=[];rowTotal=0;hasMore=false;nextCursor="";}
+  if(!more){lastMeta.coverage_complete=false;lastMeta.source="unknown";lastMeta.through_ts=0;lastMeta.target_ts=0;syncCoverageWarning();}
   setStatus(more?"加载更多…":"正在读取…");
   if(!more)setBody('<tr><td colspan="6" class="lc-empty">加载中…</td></tr>');
   syncMore();
@@ -130,6 +148,8 @@ async function load(more=false){
     nextCursor=d.next_cursor||"";
     lastMeta={enabled:d.enabled!==false,total:d.total||0,
       truncated:!!d.has_more,note:d.coverage_note||"",
+      coverage_complete:d.coverage_complete===true,
+      source:d.source||"unknown",through_ts:+d.through_ts||0,target_ts:+d.target_ts||0,
       unauth_count:d.unauth_count||0,
       unknown_customer_count:d.unknown_customer_count||0,
       unknown_user_quota_count:d.unknown_user_quota_count||0,
@@ -138,6 +158,7 @@ async function load(more=false){
       unknown_quota_account_count:d.unknown_quota_account_count||0,
       unknown_customer_other_count:d.unknown_customer_other_count||0,
       reason_options:Array.isArray(d.reason_options)?d.reason_options:[]};
+    syncCoverageWarning();
     fillReasonOptions(d.reason_options||[]);
     loading=false;
     setStatus("");
@@ -148,6 +169,7 @@ async function load(more=false){
     lastError=e.message||String(e);
     setStatus("读取失败："+lastError);
     if(!more)lastRows=[];
+    syncCoverageWarning();
     paint();
   }finally{
     if(gen===generation){loading=false;syncMore();}
@@ -302,6 +324,7 @@ const cust=x=>{
 // 两处各算一遍口径一旦漂移就会互相打脸。这里只回答
 // 「哪个客户、什么时候、请求什么、为什么被拒」。
 function paint(){
+  syncCoverageWarning();
   if(lastError){
     setNotes(lastRows.length?"加载更多失败，已保留此前加载的记录。":"读取失败，请检查连接后重试。");
     if(!lastRows.length)setBody('<tr><td colspan="6" class="lc-empty">读取失败：'+esc(lastError)+'</td></tr>');
@@ -328,6 +351,7 @@ function paint(){
   const rows=lastRows;
 
   let note="这些请求从未到达任何渠道，不计入渠道稳定率；但客户当时确实用不了。";
+  if(lastMeta.coverage_complete!==true)note+=" 当前数据不完整，以下数量仅代表已采集部分，不能作为最终总数。";
   if(lastMeta.note)note+=" "+lastMeta.note;
   if(hasMore)note+=" 当前筛选共有 "+nfmt(rowTotal)+" 条聚合记录，可继续加载。";
   // ★ 身份缺失分两档 ★
@@ -385,8 +409,10 @@ function setCounter(shown,all){
   const el=$("alCounter");
   if(!el)return;
   if(!all&&!shown){el.textContent="";return;}
-  el.innerHTML="已加载 <b>"+nfmt(shown)+"</b> / 共 <b>"+nfmt(all)+
-    "</b> 条聚合记录 · 当前筛选共 <b>"+nfmt(lastMeta.total)+"</b> 次被拒";
+  const total=lastMeta.coverage_complete===true?nfmt(lastMeta.total):"—（未完成）";
+  const rowsTotal=lastMeta.coverage_complete===true?nfmt(all):"—（未完成）";
+  el.innerHTML="已加载 <b>"+nfmt(shown)+"</b> / 共 <b>"+rowsTotal+
+    "</b> 条聚合记录 · 当前筛选被拒次数 <b>"+total+"</b>";
 }
 
 })();

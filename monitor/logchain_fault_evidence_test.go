@@ -45,17 +45,107 @@ func TestLogChainFaultEvidenceRefinesVerifiedClientDisconnect(t *testing.T) {
 	}
 }
 
-func TestLogChainFaultEvidenceUsesVerifiedUpstreamStatus(t *testing.T) {
-	status := 502
+func TestLogChainFaultEvidenceTreatsNginxUpstreamAsNewAPI(t *testing.T) {
+	for _, tc := range []struct {
+		name, endReason string
+		status, newAPI  int
+		tags            []string
+	}{
+		{name: "NewAPI itself returned 503", status: 503, newAPI: 503, tags: []string{anomalyUndeliveredUnbilled}},
+		{name: "edge 502 NewAPI 502", status: 502, newAPI: 502, tags: []string{anomalyUndeliveredUnbilled}},
+		{name: "edge 200 NewAPI 502", status: 200, newAPI: 502, tags: []string{anomalyUndeliveredUnbilled}},
+		{name: "edge 499 NewAPI 500", status: 499, newAPI: 500, endReason: logChainClientGoneEndReason, tags: []string{logChainClientGoneEndReason}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			row := LogChainRow{
+				Type: 2, EndReason: tc.endReason, UseTime: 8, AnomalyTags: tc.tags,
+				EdgeEvidenceVerified: true,
+				EdgeEvidence:         &LogChainEdgeEvidence{Status: tc.status, UpstreamStatus: tc.newAPI},
+			}
+			f := logChainAttributeFaultWithEvidence(row, row.AnomalyTags)
+			if f.Fault != faultUnknown || f.Confidence != faultConfNone {
+				t.Fatalf("Nginx upstream_status 是 NewAPI，不是模型供应商证据: %+v", f)
+			}
+			if !strings.Contains(f.Why, "NewAPI") || !strings.Contains(f.Why, "不是模型供应商") ||
+				!strings.Contains(f.Reason, "NewAPI") || strings.Contains(f.Reason, "模型供应商没有及时处理") {
+				t.Fatalf("入口证据说明仍误称模型供应商故障: %+v", f)
+			}
+		})
+	}
+}
+
+func TestLogChainFaultEvidenceUnverifiedOrMissingNginxStatusDoesNotAssignOwner(t *testing.T) {
+	for _, tc := range []struct {
+		name, mode string
+		edge       *LogChainEdgeEvidence
+	}{
+		{name: "missing"},
+		{name: "pilot unverified", mode: "pilot", edge: &LogChainEdgeEvidence{Status: 502, UpstreamStatus: 502}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			row := LogChainRow{Type: 2, AnomalyTags: []string{anomalyUndeliveredUnbilled},
+				EdgeEvidenceMode: tc.mode, EdgeEvidence: tc.edge}
+			f := logChainAttributeFaultWithEvidence(row, row.AnomalyTags)
+			if f.Fault != faultUnknown || strings.Contains(f.Why, "NewAPI 返回") || strings.Contains(f.Reason, "入口日志显示 NewAPI") {
+				t.Fatalf("缺失或未验证的入口状态不能参与归因: %+v", f)
+			}
+		})
+	}
+}
+
+func TestLogChainFaultEvidenceKeepsDirectSupplierButNotStreamHeuristic(t *testing.T) {
+	supplier := LogChainRow{
+		Type: 5, Content: "status_code=500, bad response status code 500", UpstreamStatusCode: 500,
+		UpstreamMatch: &LogChainUpstreamMatch{Confidence: correlateExact,
+			UpstreamStatusCode: 500, UpstreamContent: "status_code=500, bad response status code 500"},
+		EdgeEvidenceVerified: true, EdgeEvidence: &LogChainEdgeEvidence{Status: 200, UpstreamStatus: 502},
+	}
+	if f := logChainAttributeFaultWithEvidence(supplier, nil); f.Fault != faultUpstream || f.Confidence != faultConfHigh {
+		t.Fatalf("真实供应商错误日志不应被 NewAPI 502 覆盖: %+v", f)
+	}
+	stream := LogChainRow{
+		Type: 2, EndReason: "scanner_error", StreamErrorCount: 1, AnomalyTags: []string{"stream"},
+		EdgeEvidenceVerified: true, EdgeEvidence: &LogChainEdgeEvidence{Status: 502, UpstreamStatus: 502},
+	}
+	if f := logChainAttributeFaultWithEvidence(stream, stream.AnomalyTags); f.Fault != faultUnknown || f.Confidence != faultConfNone {
+		t.Fatalf("流错误说明链路失败，但不能在 NewAPI 5xx 下硬判模型供应商: %+v", f)
+	}
+	stream.EdgeEvidenceVerified = false
+	if f := logChainAttributeFaultWithEvidence(stream, stream.AnomalyTags); f.Fault != faultUpstream || f.Confidence != faultConfMid {
+		t.Fatalf("未验证入口日志不应改变原有流错误归因: %+v", f)
+	}
+}
+
+func TestLogChainFaultEvidenceGateway5xxWithNewAPI200IsUnknown(t *testing.T) {
 	row := LogChainRow{
-		Type:                 2,
-		AnomalyTags:          []string{anomalyUndeliveredUnbilled},
-		EdgeEvidenceVerified: true,
-		EdgeEvidence:         &LogChainEdgeEvidence{Status: 502, UpstreamStatus: status},
+		Type: 2, EndReason: logChainClientGoneEndReason, UseTime: 8,
+		AnomalyTags:          []string{logChainClientGoneEndReason},
+		EdgeEvidenceVerified: true, EdgeEvidence: &LogChainEdgeEvidence{Status: 502, UpstreamStatus: 200},
 	}
 	f := logChainAttributeFaultWithEvidence(row, row.AnomalyTags)
-	if f.Fault != faultUpstream || f.Confidence != faultConfHigh {
-		t.Fatalf("已验证入口上游 502 应判上游: %+v", f)
+	if f.Fault != faultUnknown || f.Confidence != faultConfNone ||
+		!strings.Contains(f.Why, "Nginx 返回 HTTP 502") || !strings.Contains(f.Why, "NewAPI 返回 HTTP 200") ||
+		!strings.Contains(f.Reason, "两层状态不一致") {
+		t.Fatalf("入口 502/NewAPI 200 不应回落到断连耗时推断: %+v", f)
+	}
+}
+
+func TestLogChainRefineUnknownDoesNotTreatNewAPIAsSupplier(t *testing.T) {
+	r := LogChainRow{Type: 5, EdgeEvidenceVerified: true,
+		EdgeEvidence: &LogChainEdgeEvidence{Status: 200, UpstreamStatus: 503}}
+	f := logChainRefineUnknownFault(r, logChainFault{Fault: faultUnknown, Confidence: faultConfNone})
+	if f.Fault != faultUnknown || !strings.Contains(f.Why, "NewAPI") || strings.Contains(f.Why, "失败发生在上游") {
+		t.Fatalf("refineUnknown 把 NewAPI 503 当成模型供应商状态: %+v", f)
+	}
+}
+
+func TestLogChainRefineUnknownDoesNotLetClientCompletionHideGateway5xx(t *testing.T) {
+	r := LogChainRow{Type: 2, EndReason: logChainClientGoneEndReason, EdgeEvidenceVerified: true,
+		EdgeEvidence: &LogChainEdgeEvidence{Status: 502, UpstreamStatus: 200, Completion: "client_closed"}}
+	f := logChainRefineUnknownFault(r, logChainFault{Fault: faultUnknown, Confidence: faultConfNone})
+	if f.Fault != faultUnknown || !strings.Contains(f.Why, "Nginx 返回 HTTP 502") ||
+		!strings.Contains(f.Why, "NewAPI 返回 HTTP 200") {
+		t.Fatalf("refineUnknown 被 client_closed 掩盖入口 5xx: %+v", f)
 	}
 }
 

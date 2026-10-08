@@ -37,6 +37,25 @@ func accountingCompleteHourPredicateSQL(alias string) string {
 func (m *Monitor) accountingDataCoverage(ctx context.Context, fromTs, toTs, now int64) StabilityDataCoverage {
 	fromTs = fromTs / 3600 * 3600
 	requestedTo, finalizedTo := toTs, finalizedStabilityHourTo(now)
+	// The accounting request ledger accepts compatible delivery versions, but
+	// its overview response must still expose the same independent FRT
+	// coverage proof as the stability page.  Keep the request coverage fields
+	// below on the accounting predicate and copy only the FRT fields from the
+	// canonical stability coverage calculation.
+	withFRTCoverage := func(result StabilityDataCoverage) StabilityDataCoverage {
+		frt := m.stabilityDataCoverage(ctx, fromTs, requestedTo, now)
+		result.TTFTExpectedHours = frt.TTFTExpectedHours
+		result.TTFTCompletedHours = frt.TTFTCompletedHours
+		result.TTFTMissingHours = frt.TTFTMissingHours
+		result.TTFTPercent = frt.TTFTPercent
+		result.TTFTComplete = frt.TTFTComplete
+		result.FRTExpectedHours = frt.FRTExpectedHours
+		result.FRTCompletedHours = frt.FRTCompletedHours
+		result.FRTMissingHours = frt.FRTMissingHours
+		result.FRTPercent = frt.FRTPercent
+		result.FRTComplete = frt.FRTComplete
+		return result
+	}
 	toTs = min(toTs, finalizedTo) / 3600 * 3600
 	result := StabilityDataCoverage{FromTs: fromTs, ToTs: toTs}
 	if requestedTo > toTs {
@@ -50,7 +69,7 @@ func (m *Monitor) accountingDataCoverage(ctx context.Context, fromTs, toTs, now 
 		if result.LatestHourPending {
 			result.PendingHourTs = max(fromTs, toTs)
 		}
-		return result
+		return withFRTCoverage(result)
 	}
 	result.ExpectedHours = (toTs - fromTs) / 3600
 	result.MissingHours, result.EffectiveMissingHours = result.ExpectedHours, result.ExpectedHours
@@ -59,7 +78,7 @@ func (m *Monitor) accountingDataCoverage(ctx context.Context, fromTs, toTs, now 
 	if err := m.storeDB.WithContext(ctx).Raw(query, fromTs, toTs, accountingTrafficVersions(), accountingTrafficVersions()).
 		Scan(&result.CompletedHours).Error; err != nil {
 		slog.Warn("读取核算用量小时覆盖台账失败", "err", err)
-		return result
+		return withFRTCoverage(result)
 	}
 	result.MissingHours = max(int64(0), result.ExpectedHours-result.CompletedHours)
 	result.Percent = float64(result.CompletedHours) / float64(result.ExpectedHours) * 100
@@ -78,5 +97,5 @@ func (m *Monitor) accountingDataCoverage(ctx context.Context, fromTs, toTs, now 
 			slog.Warn("读取最新核算用量小时状态失败", "err", err)
 		}
 	}
-	return result
+	return withFRTCoverage(result)
 }

@@ -25,6 +25,7 @@ const (
 	cloudWatchPreRouteWindow        = time.Hour
 	cloudWatchPreRouteCatchupDelay  = 2 * time.Second
 	cloudWatchPreRouteQueryBudget   = 2 * time.Minute
+	cloudWatchPreRouteInitRetry     = 15 * time.Second
 )
 
 // CloudWatchPreRouteCursor 是连续覆盖水位。ThroughTs 只在一个完整窗口已经
@@ -238,11 +239,26 @@ func (m *Monitor) startCloudWatchPreRoute(ctx context.Context) {
 	go func() {
 		m.cloudWatchPreRouteRunning.Store(true)
 		defer m.cloudWatchPreRouteRunning.Store(false)
-		state, err := m.loadCloudWatchPreRouteCursor(time.Now())
-		if err != nil {
+		poll := time.Duration(m.cfg.CloudWatchPreRoutePollSeconds) * time.Second
+		if poll <= 0 {
+			poll = 5 * time.Minute
+		}
+		initRetry := cloudWatchPreRouteInitRetry
+		if poll < initRetry {
+			initRetry = poll
+		}
+		var state CloudWatchPreRouteCursor
+		for {
+			var err error
+			state, err = m.loadCloudWatchPreRouteCursor(time.Now())
+			if err == nil {
+				break
+			}
 			m.recordCloudWatchPreRouteFailure(nil, err, time.Now().Unix())
-			slog.Error("初始化 CloudWatch 前置拒绝采集水位失败", "err", cloudWatchPreRouteErrorCode(err))
-			return
+			slog.Error("初始化 CloudWatch 前置拒绝采集水位失败，将重试", "err", cloudWatchPreRouteErrorCode(err))
+			if !waitSourceLifecycle(ctx, initRetry) {
+				return
+			}
 		}
 		m.cloudWatchPreRouteFrom.Store(state.CoverageFromTs)
 		m.cloudWatchPreRouteThrough.Store(state.ThroughTs)
@@ -252,7 +268,6 @@ func (m *Monitor) startCloudWatchPreRoute(ctx context.Context) {
 		// the next CloudWatch request finishes.
 		m.cloudWatchPreRouteLastSuccess.Store(state.LastSuccessAt)
 		m.cloudWatchPreRouteLastFailure.Store(state.LastFailureAt)
-		poll := time.Duration(m.cfg.CloudWatchPreRoutePollSeconds) * time.Second
 		for {
 			if ctx.Err() != nil {
 				return

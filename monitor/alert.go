@@ -279,7 +279,9 @@ func (m *Monitor) evaluateAlerts(nowUnix int64) {
 	}
 
 	snap, err := m.GetSnapshot(c.EvalWindowMin, nowUnix)
-	if err != nil || !snap.DataComplete || snap.FinalizationDelayed {
+	// 请求事实和 FRT 投影是两个独立的覆盖水位。FRT 回填期间仍然要
+	// 继续评估错误/异常告警；只有请求事实未完整时才不能把窗口当最终值。
+	if err != nil || snap == nil || !snap.RequestsComplete || snap.FinalizationDelayed {
 		return
 	}
 	rows := append(append([]Row{}, snap.ByChannel...), snap.ByModel...)
@@ -288,14 +290,14 @@ func (m *Monitor) evaluateAlerts(nowUnix int64) {
 		if c.ErrBurstCount > 0 && r.Failed >= int64(c.ErrBurstCount) {
 			m.fire(c, "error_burst", r.Label,
 				fmt.Sprintf("错误突发:%s", r.Label),
-				alertBody(r, c, fmt.Sprintf("近%d分钟错误 %d 条(突发阈值 %d)", c.EvalWindowMin, r.Failed, c.ErrBurstCount)), nowUnix)
+				alertBody(r, c, fmt.Sprintf("近%d分钟错误 %d 条(突发阈值 %d)", c.EvalWindowMin, r.Failed, c.ErrBurstCount), snap.TTFTComplete), nowUnix)
 			continue
 		}
 		// 错误·渠道异常(错误率 + 最小样本)
 		if c.ErrRatePct > 0 && r.ErrorRate >= c.ErrRatePct && r.Failed >= int64(c.ErrMinCount) {
 			m.fire(c, "error_rate", r.Label,
 				fmt.Sprintf("错误率告警:%s", r.Label),
-				alertBody(r, c, fmt.Sprintf("近%d分钟错误率 %.1f%%(阈值 %.0f%%)、错误 %d/%d", c.EvalWindowMin, r.ErrorRate, c.ErrRatePct, r.Failed, r.Total)), nowUnix)
+				alertBody(r, c, fmt.Sprintf("近%d分钟错误率 %.1f%%(阈值 %.0f%%)、错误 %d/%d", c.EvalWindowMin, r.ErrorRate, c.ErrRatePct, r.Failed, r.Total), snap.TTFTComplete), nowUnix)
 			continue
 		}
 		// ---- 交付异常(B 类)走 anomaly 栏目:独立开关 + 独立冷却 ----
@@ -307,20 +309,20 @@ func (m *Monitor) evaluateAlerts(nowUnix int64) {
 			m.fire(c, kind, r.Label,
 				fmt.Sprintf("交付异常·已扣费:%s", r.Label),
 				alertBody(r, c, fmt.Sprintf("近%d分钟有 %d 次请求已扣费但零输出,合计 $%.2f(阈值 $%.2f);用户平均白等 %.0f 秒",
-					c.EvalWindowMin, r.AnomalyBilled, r.AnomalyCostUSD, c.AnomalyBilledUSD, r.AnomalyAvgWait)), nowUnix)
+					c.EvalWindowMin, r.AnomalyBilled, r.AnomalyCostUSD, c.AnomalyBilledUSD, r.AnomalyAvgWait), snap.TTFTComplete), nowUnix)
 		case "anomaly_rate":
 			// 持续性的交付质量下降,供人工判断降权。
 			m.fire(c, kind, r.Label,
 				fmt.Sprintf("交付异常率告警:%s", r.Label),
 				alertBody(r, c, fmt.Sprintf("近%d分钟交付异常率 %.1f%%(阈值 %.0f%%)、%d/%d 次用户没拿到内容;其中已扣费 %d 次、未扣费 %d 次,平均白等 %.0f 秒",
 					c.EvalWindowMin, r.AnomalyRate, c.AnomalyRatePct, r.Anomaly, r.Total,
-					r.AnomalyBilled, r.AnomalyFree, r.AnomalyAvgWait)), nowUnix)
+					r.AnomalyBilled, r.AnomalyFree, r.AnomalyAvgWait), snap.TTFTComplete), nowUnix)
 		case "anomaly_burst":
 			// 量不大但连续多桶出现,形态上是持续故障而非抖动。
 			m.fire(c, kind, r.Label,
 				fmt.Sprintf("交付异常成簇:%s", r.Label),
 				alertBody(r, c, fmt.Sprintf("近%d分钟交付异常成簇 %d 次(连续≥%d桶),用户平均白等 %.0f 秒,多为上游静默断流",
-					c.EvalWindowMin, r.Anomaly, c.AnomalyBurstBuckets, r.AnomalyAvgWait)), nowUnix)
+					c.EvalWindowMin, r.Anomaly, c.AnomalyBurstBuckets, r.AnomalyAvgWait), snap.TTFTComplete), nowUnix)
 		}
 	}
 }
@@ -404,7 +406,7 @@ func (m *Monitor) fire(c AlertConfig, kind, target, subject, body string, now in
 	m.logAlert(kind, target, subject, now)
 }
 
-func alertBody(r Row, c AlertConfig, head string) string {
+func alertBody(r Row, c AlertConfig, head string, ttftComplete bool) string {
 	em := []string{}
 	if r.Err5xx > 0 {
 		em = append(em, fmt.Sprintf("5xx %d", r.Err5xx))
@@ -418,15 +420,23 @@ func alertBody(r Row, c AlertConfig, head string) string {
 	if r.ErrOther > 0 {
 		em = append(em, fmt.Sprintf("其它 %d", r.ErrOther))
 	}
+	ttftP95 := "未完整"
+	if ttftComplete {
+		if r.TtftObserved > 0 && r.TtftP95 > 0 {
+			ttftP95 = fmt.Sprintf("%.1fs", r.TtftP95)
+		} else {
+			ttftP95 = "—"
+		}
+	}
 	return fmt.Sprintf(`%s
 
 对象:%s
 窗口:近 %d 分钟
 成功率:%.1f%%  |  请求:%d  成功:%d  异常:%d  错误:%d
 错误构成:%s
-延迟 p95:%.0fs  最大:%ds  首字p95:%.1fs
+	延迟 p95:%.0fs  最大:%ds  FRT p95:%s
 
 (new-api 上游监控自动报警;阈值可在监控"报警设置"页调整)`,
 		head, r.Label, c.EvalWindowMin, r.SuccessRate, r.Total, r.Success, r.Anomaly, r.Failed,
-		strings.Join(em, " / "), r.P95, r.MaxLatency, r.TtftP95)
+		strings.Join(em, " / "), r.P95, r.MaxLatency, ttftP95)
 }

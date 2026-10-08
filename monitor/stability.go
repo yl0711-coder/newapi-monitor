@@ -74,7 +74,24 @@ type StabilityMetrics struct {
 	Err5xx         int64    `json:"err_5xx"`
 	ErrTimeout     int64    `json:"err_timeout"`
 	ErrOther       int64    `json:"err_other"`
-	Health         string   `json:"health"`
+	// Legacy ttft_* response keys are FRT observations from other.frt; they do
+	// not prove that a valid model token was received.
+	TTFTObserved  int64    `json:"ttft_observed"`
+	TTFTOver3s    int64    `json:"ttft_over_3s"`
+	TTFTOver3sPct *float64 `json:"ttft_over_3s_pct"`
+	TTFTP50Ms     float64  `json:"ttft_p50_ms"`
+	TTFTP95Ms     float64  `json:"ttft_p95_ms"`
+	TTFTP99Ms     float64  `json:"ttft_p99_ms"`
+	TTFTMaxMs     int64    `json:"ttft_max_ms"`
+	// Canonical FRT aliases; legacy ttft_* keys above remain for compatibility.
+	FRTObserved  int64    `json:"frt_observed"`
+	FRTOver3s    int64    `json:"frt_over_3s"`
+	FRTOver3sPct *float64 `json:"frt_over_3s_pct"`
+	FRTP50Ms     float64  `json:"frt_p50_ms"`
+	FRTP95Ms     float64  `json:"frt_p95_ms"`
+	FRTP99Ms     float64  `json:"frt_p99_ms"`
+	FRTMaxMs     int64    `json:"frt_max_ms"`
+	Health       string   `json:"health"`
 }
 
 type stabilityCounts struct {
@@ -83,6 +100,8 @@ type stabilityCounts struct {
 	SumUseTime, Tokens, Quota                               int64
 	MaxUseTime                                              int
 	Err4xx, Err5xx, ErrTimeout, ErrOther                    int64
+	Ttft500, Ttft1k, Ttft2k, Ttft5k, Ttft10k, TtftInf       int64
+	TtftMaxMs, TtftObserved, TtftOver3s                     int64
 }
 
 func (c *stabilityCounts) add(o stabilityCounts) {
@@ -104,6 +123,17 @@ func (c *stabilityCounts) add(o stabilityCounts) {
 	c.Err5xx += o.Err5xx
 	c.ErrTimeout += o.ErrTimeout
 	c.ErrOther += o.ErrOther
+	c.Ttft500 += o.Ttft500
+	c.Ttft1k += o.Ttft1k
+	c.Ttft2k += o.Ttft2k
+	c.Ttft5k += o.Ttft5k
+	c.Ttft10k += o.Ttft10k
+	c.TtftInf += o.TtftInf
+	c.TtftObserved += o.TtftObserved
+	c.TtftOver3s += o.TtftOver3s
+	if o.TtftMaxMs > c.TtftMaxMs {
+		c.TtftMaxMs = o.TtftMaxMs
+	}
 }
 
 func floatPtr(v float64) *float64 { return &v }
@@ -132,6 +162,25 @@ func (c stabilityCounts) metrics() StabilityMetrics {
 	if delivered := c.Success + c.Anomaly; delivered > 0 {
 		m.AvgLatencySec = floatPtr(float64(c.SumUseTime) / float64(delivered))
 	}
+	observed := c.TtftObserved
+	view := computeTTFTMetricView(
+		[6]int64{c.Ttft500, c.Ttft1k, c.Ttft2k, c.Ttft5k, c.Ttft10k, c.TtftInf},
+		observed, c.TtftOver3s, c.TtftMaxMs,
+	)
+	if view.Observed > 0 {
+		m.TTFTObserved = view.Observed
+		m.TTFTOver3s = view.Over3s
+		m.TTFTOver3sPct = floatPtr(view.Over3sPct)
+		if view.HistValid {
+			m.TTFTP50Ms = view.P50Ms
+			m.TTFTP95Ms = view.P95Ms
+			m.TTFTP99Ms = view.P99Ms
+			m.TTFTMaxMs = view.MaxMs
+		}
+	}
+	// Keep the canonical FRT vocabulary synchronized with legacy ttft_* keys.
+	m.FRTObserved, m.FRTOver3s, m.FRTOver3sPct = m.TTFTObserved, m.TTFTOver3s, m.TTFTOver3sPct
+	m.FRTP50Ms, m.FRTP95Ms, m.FRTP99Ms, m.FRTMaxMs = m.TTFTP50Ms, m.TTFTP95Ms, m.TTFTP99Ms, m.TTFTMaxMs
 	return m
 }
 
@@ -221,6 +270,8 @@ type StabilitySourceStatus struct {
 type StabilityReportMeta struct {
 	From                string                `json:"from"`
 	To                  string                `json:"to"`
+	FromTs              int64                 `json:"from_ts"`
+	ToTs                int64                 `json:"to_ts"`
 	GeneratedAt         int64                 `json:"generated_at"`
 	FirstDataTs         int64                 `json:"first_data_ts"`
 	LastDataTs          int64                 `json:"last_data_ts"`
@@ -269,6 +320,8 @@ type stabilityDimRow struct {
 	SumUseTime, Tokens, Quota                               int64
 	MaxUseTime                                              int
 	Err4xx, Err5xx, ErrTimeout, ErrOther                    int64
+	Ttft500, Ttft1k, Ttft2k, Ttft5k, Ttft10k, TtftInf       int64
+	TtftMaxMs, TtftObserved, TtftOver3s                     int64
 }
 
 func (r stabilityDimRow) counts() stabilityCounts {
@@ -278,6 +331,8 @@ func (r stabilityDimRow) counts() stabilityCounts {
 		AnomalyStream: r.AnomalyStream, AnomalyQuota: r.AnomalyQuota,
 		SumUseTime: r.SumUseTime, MaxUseTime: r.MaxUseTime, Tokens: r.Tokens, Quota: r.Quota,
 		Err4xx: r.Err4xx, Err5xx: r.Err5xx, ErrTimeout: r.ErrTimeout, ErrOther: r.ErrOther,
+		Ttft500: r.Ttft500, Ttft1k: r.Ttft1k, Ttft2k: r.Ttft2k, Ttft5k: r.Ttft5k, Ttft10k: r.Ttft10k, TtftInf: r.TtftInf,
+		TtftMaxMs: r.TtftMaxMs, TtftObserved: r.TtftObserved, TtftOver3s: r.TtftOver3s,
 	}
 }
 
@@ -294,6 +349,8 @@ type stabilityDailyRow struct {
 	SumUseTime, Tokens, Quota                               int64
 	MaxUseTime                                              int
 	Err4xx, Err5xx, ErrTimeout, ErrOther                    int64
+	Ttft500, Ttft1k, Ttft2k, Ttft5k, Ttft10k, TtftInf       int64
+	TtftMaxMs, TtftObserved, TtftOver3s                     int64
 }
 
 type stabilityTimelineRow struct {
@@ -305,6 +362,8 @@ type stabilityTimelineRow struct {
 	SumUseTime, Tokens, Quota                               int64
 	MaxUseTime                                              int
 	Err4xx, Err5xx, ErrTimeout, ErrOther                    int64
+	Ttft500, Ttft1k, Ttft2k, Ttft5k, Ttft10k, TtftInf       int64
+	TtftMaxMs, TtftObserved, TtftOver3s                     int64
 }
 
 func (r stabilityTimelineRow) counts() stabilityCounts {
@@ -314,6 +373,8 @@ func (r stabilityTimelineRow) counts() stabilityCounts {
 		AnomalyStream: r.AnomalyStream, AnomalyQuota: r.AnomalyQuota,
 		SumUseTime: r.SumUseTime, MaxUseTime: r.MaxUseTime, Tokens: r.Tokens, Quota: r.Quota,
 		Err4xx: r.Err4xx, Err5xx: r.Err5xx, ErrTimeout: r.ErrTimeout, ErrOther: r.ErrOther,
+		Ttft500: r.Ttft500, Ttft1k: r.Ttft1k, Ttft2k: r.Ttft2k, Ttft5k: r.Ttft5k, Ttft10k: r.Ttft10k, TtftInf: r.TtftInf,
+		TtftMaxMs: r.TtftMaxMs, TtftObserved: r.TtftObserved, TtftOver3s: r.TtftOver3s,
 	}
 }
 
@@ -324,6 +385,8 @@ func (r stabilityDailyRow) counts() stabilityCounts {
 		AnomalyStream: r.AnomalyStream, AnomalyQuota: r.AnomalyQuota,
 		SumUseTime: r.SumUseTime, MaxUseTime: r.MaxUseTime, Tokens: r.Tokens, Quota: r.Quota,
 		Err4xx: r.Err4xx, Err5xx: r.Err5xx, ErrTimeout: r.ErrTimeout, ErrOther: r.ErrOther,
+		Ttft500: r.Ttft500, Ttft1k: r.Ttft1k, Ttft2k: r.Ttft2k, Ttft5k: r.Ttft5k, Ttft10k: r.Ttft10k, TtftInf: r.TtftInf,
+		TtftMaxMs: r.TtftMaxMs, TtftObserved: r.TtftObserved, TtftOver3s: r.TtftOver3s,
 	}
 }
 
@@ -342,7 +405,16 @@ const stabilityAggColumns = `
 	COALESCE(SUM(sh.err_4xx),0) AS err_4xx,
 	COALESCE(SUM(sh.err_5xx),0) AS err_5xx,
 	COALESCE(SUM(sh.err_timeout),0) AS err_timeout,
-	COALESCE(SUM(sh.err_other),0) AS err_other`
+	COALESCE(SUM(sh.err_other),0) AS err_other,
+	COALESCE(SUM(sh.ttft_500),0) AS ttft_500,
+	COALESCE(SUM(sh.ttft_1k),0) AS ttft_1k,
+	COALESCE(SUM(sh.ttft_2k),0) AS ttft_2k,
+	COALESCE(SUM(sh.ttft_5k),0) AS ttft_5k,
+	COALESCE(SUM(sh.ttft_10k),0) AS ttft_10k,
+	COALESCE(SUM(sh.ttft_inf),0) AS ttft_inf,
+	COALESCE(MAX(sh.ttft_max_ms),0) AS ttft_max_ms,
+	COALESCE(SUM(sh.ttft_observed),0) AS ttft_observed,
+	COALESCE(SUM(sh.ttft_over_3s),0) AS ttft_over_3s`
 
 func (s stabilityScope) sqlWhere(alias string) (string, []any) {
 	where := " WHERE " + alias + ".hour_ts >= ? AND " + alias + ".hour_ts < ? AND " + stabilityEffectiveSampleSQL(alias)
@@ -1067,7 +1139,7 @@ func (m *Monitor) buildStabilityReportWithDetails(ctx context.Context, scope sta
 	}
 
 	queryDays := m.cfg.stabilityQueryDays()
-	meta := StabilityReportMeta{From: time.Unix(scope.FromTs, 0).In(cstLocation).Format("2006-01-02"), To: time.Unix(scope.ToTs-1, 0).In(cstLocation).Format("2006-01-02"), GeneratedAt: now, RetentionDays: queryDays, RowsTruncated: false, ComparisonAvailable: comparisonAvailable, ComparisonCoverage: comparisonCoverage, TimelineBucketSec: timelineStep}
+	meta := StabilityReportMeta{From: time.Unix(scope.FromTs, 0).In(cstLocation).Format("2006-01-02"), To: time.Unix(scope.ToTs-1, 0).In(cstLocation).Format("2006-01-02"), FromTs: scope.FromTs, ToTs: scope.ToTs, GeneratedAt: now, RetentionDays: queryDays, RowsTruncated: false, ComparisonAvailable: comparisonAvailable, ComparisonCoverage: comparisonCoverage, TimelineBucketSec: timelineStep}
 	meta.DataCoverage = dataCoverage
 	var coverage struct{ Min, Max int64 }
 	warnReadErr("stability coverage", m.storeDB.WithContext(ctx).Raw(

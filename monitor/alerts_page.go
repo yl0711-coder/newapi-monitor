@@ -18,55 +18,122 @@ import (
 // 对应来源未运行、失败或尚未追平时，表同样可能为空。
 const alertsNoDataNote = "无数据。前置拒绝来自本地分钟事实（CloudWatch 直采或兼容采集器），请先确认对应采集水位与采集器状态——0 条不代表没有问题。"
 
-// alertsCoverageNote 在直采尚未覆盖完请求日期时给出 fail-closed 提示。
-// 问题预警可以同时包含历史旁路采集器和 CloudWatch 直采事实；即使已经有
-// 几行结果，也不能把尚未追平的窗口展示成完整统计。日期完全早于直采的
-// 保留起点时不提示，避免把历史兼容来源误报成当前缺口。
-func (m *Monitor) alertsCoverageNote(scope stabilityScope, now time.Time) string {
-	if m == nil || !m.cfg.CloudWatchPreRouteEnabled {
-		return ""
+// AlertsCoverage describes the evidence watermark for the local rejection
+// facts.  The count returned by this page is always a count of rows currently
+// present in rejection_samples; it is not a final total unless Complete is
+// true.  Keeping this state in the response prevents callers from mistaking a
+// partially caught-up CloudWatch lane for a zero/complete result.
+type AlertsCoverage struct {
+	Complete bool   `json:"coverage_complete"`
+	Source   string `json:"source"` // cloudwatch, collector, mixed, or unknown
+	Through  int64  `json:"through_ts"`
+	Target   int64  `json:"target_ts"`
+	Note     string `json:"coverage_note,omitempty"`
+}
+
+const alertsIncompleteCoverageNote = "问题预警数据不完整：本地 rejection_samples 尚未证明连续覆盖当前范围；页面中的数量只能作为已采集部分，不能当作最终总数。"
+
+// The collector cursor can predate the fact-retention boundary. Its original
+// start must not certify a historical interval whose minute rows were pruned.
+func (m *Monitor) retainedRejectionCoverageFrom(from, now int64) int64 {
+	days := m.cfg.RetentionDays
+	if days <= 0 {
+		days = 7
+	}
+	return max(from, metricMinuteRetentionCutoff(now, days))
+}
+
+// alertsCoverage computes a fail-closed watermark for the requested range.
+// Legacy/旁路 collector rows do not carry a durable range watermark, so a
+// range that relies on them is explicitly incomplete rather than silently
+// claiming that a partial total is complete.  CloudWatch direct rows are
+// complete only when the whole requested interval lies inside its [from,
+// through) watermark and does not extend beyond the current closed target.
+func (m *Monitor) alertsCoverage(scope stabilityScope, now time.Time) AlertsCoverage {
+	coverage := AlertsCoverage{Source: "unknown"}
+	if scope.ToTs <= scope.FromTs || scope.ToTs <= 0 {
+		return coverage
+	}
+	if m == nil || !m.cfg.CloudWatchPreRouteEnabled || m.storeDB == nil || !cloudWatchPreRouteCoverageTableAvailable(m.storeDB) {
+		coverage.Source = "collector"
+		if m != nil && m.cfg.CloudWatchPreRouteEnabled {
+			coverage.Note = alertsIncompleteCoverageNote + " CloudWatch 前置拒绝采集水位尚未就绪。"
+		}
+		return coverage
 	}
 	targetFrom, target := cloudWatchPreRouteRange(now, m.cfg.CloudWatchPreRouteLookbackHours)
-	if target <= 0 || scope.ToTs <= 0 {
-		return ""
-	}
+	coverage.Target = target
+	coverage.Through = m.cloudWatchPreRouteThrough.Load()
 	coverageFrom := m.cloudWatchPreRouteFrom.Load()
-	// Before the durable cursor is restored, use the configured lookback start
-	// as the conservative lower bound. A date wholly before that bound is not a
-	// missing CloudWatch window; it is outside this direct lane's responsibility
-	// and may legitimately be served by the compatibility collector.
 	if coverageFrom <= 0 {
 		coverageFrom = targetFrom
 	}
-	// No direct-lane interval intersects this range when it ends before the
-	// retained lookback starts, or when it begins after the current closed
-	// target.  A range that crosses coverageFrom is only partly owned by the
-	// direct lane and must be called out as dependent on the compatibility
-	// collector rather than silently presented as complete.
+	coverageFrom = m.retainedRejectionCoverageFrom(coverageFrom, now.Unix())
+	// A range wholly before the direct lane is owned by the compatibility
+	// collector.  Its source is explicit, but without a collector cursor it is
+	// not safe to call that range complete.
 	if scope.ToTs <= coverageFrom || scope.FromTs >= target {
-		return ""
+		coverage.Source = "collector"
+		return coverage
+	}
+	coverage.Source = "cloudwatch"
+	coverage.Note = alertsIncompleteCoverageNote
+	if scope.FromTs < coverageFrom || scope.ToTs > target {
+		coverage.Source = "mixed"
+	}
+	// During migration the same minute can contain direct CloudWatch rows and
+	// legacy collector rows.  The overlap query can suppress a proven duplicate
+	// for user_id>0, but it cannot prove that user_id=0 rows describe the same
+	// request.  Therefore any legacy row in the direct lane makes the requested
+	// range mixed/incomplete; never publish a complete CloudWatch result based
+	// only on the direct watermark.
+	if coverage.Source == "cloudwatch" {
+		legacy, err := m.alertsHasLegacyRows(scope.FromTs, scope.ToTs)
+		if err != nil {
+			coverage.Source = "mixed"
+			coverage.Note = alertsIncompleteCoverageNote + " 无法确认旧采集器与 CloudWatch 的来源边界。"
+			return coverage
+		}
+		if legacy {
+			coverage.Source = "mixed"
+			coverage.Note = alertsIncompleteCoverageNote + " 当前区间同时包含 CloudWatch 直采和旧采集器记录，来源尚未统一。"
+			return coverage
+		}
 	}
 	requiredThrough := scope.ToTs
 	if requiredThrough > target {
 		requiredThrough = target
 	}
-	lastSuccess := m.cloudWatchPreRouteLastSuccess.Load()
-	lastFailure := m.cloudWatchPreRouteLastFailure.Load()
-	through := m.cloudWatchPreRouteThrough.Load()
-	// This page is an incident/evidence view, so any unpublished closed
-	// minute must be called out.  The readiness endpoint intentionally keeps a
-	// 20-minute noise budget for normal polling jitter, but silently accepting
-	// that gap here can make a real recent rejection look absent.
-	coverageIncomplete := through <= 0 || through < requiredThrough
-	legacyPrefixRisk := scope.FromTs < coverageFrom && scope.ToTs > coverageFrom
-	// A later failed poll must not taint a historical range whose requested end
-	// is already behind the durable watermark. It matters only when the failure
-	// leaves part of this particular range unpublished.
-	failureAffectsScope := lastFailure > lastSuccess && through < requiredThrough
-	if coverageIncomplete || failureAffectsScope || legacyPrefixRisk {
-		return "CloudWatch 前置拒绝直采覆盖范围不完整或最近采集失败，当前结果可能只覆盖已发布窗口或兼容采集器已覆盖的部分；请同时核对采集水位与兼容采集器状态。"
+	// A date that starts before the direct lane also depends on the legacy
+	// prefix; it is therefore incomplete even when the direct suffix caught up.
+	if scope.FromTs >= coverageFrom && scope.ToTs <= target && coverage.Through >= scope.ToTs {
+		coverage.Complete = true
+		coverage.Note = ""
+		return coverage
 	}
-	return ""
+	// Keep the failure check explicit: a failed poll must not be hidden just
+	// because the in-memory through value was restored after a restart.
+	if m.cloudWatchPreRouteLastFailure.Load() > m.cloudWatchPreRouteLastSuccess.Load() && coverage.Through < requiredThrough {
+		coverage.Note = alertsIncompleteCoverageNote + " CloudWatch 前置拒绝采集最近一次失败，需先追平水位。"
+	}
+	return coverage
+}
+
+func (m *Monitor) alertsHasLegacyRows(from, to int64) (bool, error) {
+	if m == nil || m.storeDB == nil || to <= from {
+		return false, nil
+	}
+	var count int64
+	err := m.storeDB.Model(&RejectionSample{}).
+		Where("bucket_ts >= ? AND bucket_ts < ? AND node <> ? AND count > 0", from, to, cloudWatchPreRouteNode).
+		Count(&count).Error
+	return count > 0, err
+}
+
+// alertsCoverageNote is retained for existing callers/tests; the structured
+// coverage fields above are the authoritative API contract.
+func (m *Monitor) alertsCoverageNote(scope stabilityScope, now time.Time) string {
+	return m.alertsCoverage(scope, now).Note
 }
 
 // AlertRejectRow 是一条按分钟聚合的前置拒绝明细，供表格逐行展示。
@@ -110,6 +177,12 @@ type AlertsResponse struct {
 	From    string `json:"from"`
 	To      string `json:"to"`
 	Total   int64  `json:"total"`
+	// Total is a partial/local count when CoverageComplete is false.  Clients
+	// must not present it as the final number until the watermark catches up.
+	CoverageComplete bool   `json:"coverage_complete"`
+	Source           string `json:"source"`
+	ThroughTs        int64  `json:"through_ts"`
+	TargetTs         int64  `json:"target_ts"`
 	// CoverageNote 说明这批数据靠旁路采集器，以及直采水位是否完整；
 	// 空结果也必须明确提示「未采集」或覆盖风险，不能说成「没有问题」。
 	CoverageNote string `json:"coverage_note,omitempty"`
@@ -167,6 +240,7 @@ func (m *Monitor) getRejectAlertsHandler(c *gin.Context) {
 		writeStabilityReadError(c, err)
 		return
 	}
+	coverage := m.alertsCoverage(scope, time.Now())
 	reasons, err := m.queryRejectReasonOptions(scope, filter)
 	if err != nil {
 		writeStabilityReadError(c, err)
@@ -175,6 +249,10 @@ func (m *Monitor) getRejectAlertsHandler(c *gin.Context) {
 	resp := AlertsResponse{
 		Enabled:                   true,
 		Total:                     stats.Total,
+		CoverageComplete:          coverage.Complete,
+		Source:                    coverage.Source,
+		ThroughTs:                 coverage.Through,
+		TargetTs:                  coverage.Target,
 		Rows:                      rows,
 		RowsTruncated:             hasMore,
 		RowTotal:                  stats.RowTotal,
@@ -189,8 +267,8 @@ func (m *Monitor) getRejectAlertsHandler(c *gin.Context) {
 		UnknownQuotaAccountCount:  stats.UnknownQuotaAccountCount,
 		UnknownCustomerOtherCount: stats.UnknownCustomerOtherCount,
 	}
-	if note := m.alertsCoverageNote(scope, time.Now()); note != "" {
-		resp.CoverageNote = note
+	if coverage.Note != "" {
+		resp.CoverageNote = coverage.Note
 	} else if len(rows) == 0 && filter.Reason == "" && filter.UserID == nil {
 		resp.CoverageNote = alertsNoDataNote
 	}

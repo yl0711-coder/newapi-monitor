@@ -9,6 +9,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -65,10 +66,31 @@ func chSeedCompany(t *testing.T, m *Monitor, name string, userIDs ...int64) int6
 	return g.ID
 }
 
+// chSeedCompleteTodaySource models a standard source worker that has queried
+// every minute in [today 00:00, target) and persisted its continuous request
+// coverage. Sparse fact rows in these tests mean the omitted minutes had no
+// requests; the rows alone would not prove that without this durable cursor.
+func chSeedCompleteTodaySource(t *testing.T, m *Monitor, now time.Time) {
+	t.Helper()
+	m.cfg.sourceLifecycleConfigured = true
+	m.cfg.SourceWorkerEnabled = true
+	m.cfg.CapacityEnabled = true
+	m.sourceWorkerRunning.Store(true)
+	from, target := customerHealthSourceRange(now)
+	if err := m.storeDB.Save(&CustomerHealthSourceCursor{
+		ID: 1, DayTs: from, ThroughTs: target,
+		SemanticsVersion: customerHealthStabilityPolicyVersion,
+		UpdatedAt:        now.Unix(),
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+}
+
 // 一家公司多个用户名必须合并成一行统计：用户明确要求"统一按一个算"。
 // 若分开统计，同一家公司会占两行，"这家公司稳不稳"就答不了。
 func TestCustomerHealthMergesAllUsersOfOneCompany(t *testing.T) {
 	m := newTestMonitor(t)
+	chSeedCompleteTodaySource(t, m, chTestNow())
 	from, _, _ := customerHealthDayRange(chTestNow())
 	chSeedCompany(t, m, "甲公司", 101, 102)
 	rows := []CapacityUserMinuteSample{
@@ -97,8 +119,45 @@ func TestCustomerHealthMergesAllUsersOfOneCompany(t *testing.T) {
 	}
 }
 
+func TestCustomerHealthReportExposesIndependentMembershipIdentity(t *testing.T) {
+	m := newTestMonitor(t)
+	from, _, _ := customerHealthDayRange(chTestNow())
+	chSeedCompany(t, m, "名单公司", 101, 102)
+	if err := m.storeDB.Create(&CapacityUserMinuteSample{
+		BucketTs: from + 60, UserID: 101, ChannelID: 7, ModelName: "m", Grp: "g", Success: 1,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	report, err := m.buildCustomerHealthReport(context.Background(), chTestNow())
+	if err != nil {
+		t.Fatal(err)
+	}
+	collection := report.Collection
+	if collection.MembershipSource != "local_sqlite:customer_health_groups/customer_health_members" ||
+		collection.MembershipGroups != 1 || collection.MembershipMembers != 2 ||
+		len(collection.MembershipFingerprint) != 16 {
+		t.Fatalf("customer-maintenance list identity missing: %+v", collection)
+	}
+	if customerHealthMembershipFingerprint(nil) == collection.MembershipFingerprint {
+		t.Fatal("different membership lists must not share a fingerprint")
+	}
+}
+
+func TestCustomerHealthMembershipFingerprintIgnoresLocalGroupID(t *testing.T) {
+	left := []customerHealthCompany{{groupID: 1, name: "  Acme   Corp ", members: []CustomerHealthMember{{UserID: 22}, {UserID: 11}}}}
+	right := []customerHealthCompany{{groupID: 9876, name: "acme corp", members: []CustomerHealthMember{{UserID: 11}, {UserID: 22}}}}
+	if got, want := customerHealthMembershipFingerprint(left), customerHealthMembershipFingerprint(right); got != want {
+		t.Fatalf("fingerprint must ignore local group IDs, member order, and cosmetic name whitespace/case: left=%q right=%q", got, want)
+	}
+	changed := []customerHealthCompany{{groupID: 9876, name: "acme corp", members: []CustomerHealthMember{{UserID: 11}, {UserID: 23}}}}
+	if customerHealthMembershipFingerprint(left) == customerHealthMembershipFingerprint(changed) {
+		t.Fatal("fingerprint must change when a stable member User ID changes")
+	}
+}
+
 func TestCustomerHealthPrimaryModelAggregatesMembersAndUsesFortyPercentPairRule(t *testing.T) {
 	m := newTestMonitor(t)
+	chSeedCompleteTodaySource(t, m, chTestNow())
 	from, _, _ := customerHealthDayRange(chTestNow())
 	chSeedCompany(t, m, "模型公司", 101, 102)
 	rows := []CapacityUserMinuteSample{
@@ -180,11 +239,11 @@ func TestCustomerHealthSpendUnknownIsNeverZero(t *testing.T) {
 
 func TestCustomerHealthCollectedSpendUsesContinuousLocalCoverage(t *testing.T) {
 	m := newTestMonitor(t)
-	from, _, _ := customerHealthDayRange(chTestNow())
+	from, target := customerHealthSourceRange(chTestNow())
 	m.cfg.CustomerHealthSourceEnabled = true
 	m.customerHealthSourceRunning.Store(true)
 	m.customerHealthSourceFrom.Store(from)
-	m.customerHealthSourceThrough.Store(from + 3600)
+	m.customerHealthSourceThrough.Store(target)
 	chSeedCompany(t, m, "采集公司", 101, 102)
 	rows := []CapacityUserMinuteSample{
 		{BucketTs: from + 60, UserID: 101, ChannelID: 7, ModelName: "m", Grp: "g",
@@ -197,7 +256,7 @@ func TestCustomerHealthCollectedSpendUsesContinuousLocalCoverage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !report.Collection.Ready || report.Collection.Mode != "logchain_only" || report.Collection.ThroughTs != from+3600 {
+	if !report.Collection.Ready || report.Collection.Mode != "logchain_only" || report.Collection.ThroughTs != target {
 		t.Fatalf("collection status does not prove continuous coverage: %+v", report.Collection)
 	}
 	if len(report.Rows) != 1 {
@@ -235,17 +294,173 @@ func TestCustomerHealthCollectedSpendRefusesUnprovenCoverage(t *testing.T) {
 	}
 }
 
+func TestCustomerHealthDisabledSourceDoesNotPresentStaleFactsAsComplete(t *testing.T) {
+	m := newTestMonitor(t)
+	defer m.Close()
+	from, _, _ := customerHealthDayRange(chTestNow())
+	chSeedCompany(t, m, "未采集公司", 101)
+	if err := m.storeDB.Create(&CapacityUserMinuteSample{
+		BucketTs: from + 60, UserID: 101, ChannelID: 7, ModelName: "m", Grp: "g", Success: 9,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	report, err := m.buildCustomerHealthReport(context.Background(), chTestNow())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Collection.Mode != "disabled" || report.Collection.Ready || len(report.Rows) != 1 {
+		t.Fatalf("disabled collection status mismatch: %+v rows=%d", report.Collection, len(report.Rows))
+	}
+	row := report.Rows[0]
+	if row.MetricsReady || row.Total != 0 || row.StabilityPct != nil || row.MetricsNote == "" {
+		t.Fatalf("stale local facts must not appear complete when collection is disabled: %+v", row)
+	}
+}
+
+// Standard source-worker regression: a recent sampler heartbeat is not a
+// coverage proof.  When the durable customer-health cursor only reaches the
+// middle of the day, the report must expose the actual through_ts, mark
+// metrics incomplete, and avoid querying/presenting the unproven tail as zero.
+func TestCustomerHealthStandardSourceRequiresContinuousCoverage(t *testing.T) {
+	m := newTestMonitor(t)
+	from, target := customerHealthSourceRange(chTestNow())
+	m.cfg.CapacityEnabled = true
+	m.lastRun.Store(chTestNow().Unix()) // recent heartbeat alone must not make it Ready
+	chSeedCompany(t, m, "标准来源公司", 101)
+	rows := []CapacityUserMinuteSample{
+		{BucketTs: from + 60, UserID: 101, ChannelID: 7, ModelName: "m", Grp: "g", Success: 2},
+		// This row is deliberately beyond the proven watermark.  It must never
+		// leak into a complete-looking report while the cursor is still behind.
+		{BucketTs: target + 60, UserID: 101, ChannelID: 7, ModelName: "m", Grp: "g", Success: 99},
+	}
+	if err := m.storeDB.Create(&rows).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := m.storeDB.Save(&CustomerHealthSourceCursor{
+		ID: 1, DayTs: from, ThroughTs: from + 3600,
+		SemanticsVersion:     customerHealthStabilityPolicyVersion,
+		TTFTSemanticsVersion: ttftCoverageSemanticsVersion,
+		TTFTCoverageFromTs:   from, TTFTCoverageThroughTs: from + 3600,
+		UpdatedAt: chTestNow().Unix(),
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	report, err := m.buildCustomerHealthReport(context.Background(), chTestNow())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Collection.Mode != "source_worker" || report.Collection.ThroughTs != from+3600 || report.Collection.Ready {
+		t.Fatalf("partial source cursor must be visibly incomplete: %+v", report.Collection)
+	}
+	if len(report.Rows) != 1 || report.Rows[0].MetricsReady {
+		t.Fatalf("partial source coverage must not present complete metrics: %+v", report.Rows)
+	}
+	if report.Rows[0].Total != 0 || report.Rows[0].StabilityPct != nil {
+		t.Fatalf("unproven tail must not be silently counted or converted to a stability value: %+v", report.Rows[0])
+	}
+
+	// Once the contiguous cursor catches up to the report target, the same
+	// future row is still outside the target and must remain excluded.
+	if err := m.storeDB.Model(&CustomerHealthSourceCursor{}).Where("id = ?", 1).Updates(map[string]any{
+		"through_ts": target, "ttft_coverage_through_ts": target,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	report, err = m.buildCustomerHealthReport(context.Background(), chTestNow())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !report.Collection.Ready || !report.Rows[0].MetricsReady || report.Rows[0].Total != 2 {
+		t.Fatalf("caught-up source coverage did not use the bounded target: collection=%+v row=%+v", report.Collection, report.Rows[0])
+	}
+}
+
+func TestCustomerHealthStandardRealtimeSampleAdvancesCursorOnlyContinuously(t *testing.T) {
+	m := newTestMonitor(t)
+	defer m.Close()
+	m.cfg.CapacityEnabled = true
+	now := time.Now()
+	dayStart, target := customerHealthSourceRange(now)
+	through := target - 10*60
+	if through <= dayStart {
+		t.Skip("test requires a non-empty current CST day")
+	}
+	if err := m.storeDB.Save(&CustomerHealthSourceCursor{
+		ID: 1, DayTs: dayStart, ThroughTs: through,
+		SemanticsVersion:     customerHealthStabilityPolicyVersion,
+		TTFTSemanticsVersion: ttftCoverageSemanticsVersion,
+		TTFTCoverageFromTs:   dayStart, TTFTCoverageThroughTs: through,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	// Overlapping realtime windows advance the proof to the finalized target.
+	if err := m.advanceCustomerHealthSourceCursorFromRealtime(through-120, target+60); err != nil {
+		t.Fatal(err)
+	}
+	var state CustomerHealthSourceCursor
+	if err := m.storeDB.First(&state, 1).Error; err != nil {
+		t.Fatal(err)
+	}
+	if state.ThroughTs != target {
+		t.Fatalf("realtime source sample did not advance cursor: got=%d want=%d", state.ThroughTs, target)
+	}
+	// A disjoint window after an outage must not bridge the gap.
+	old := state.ThroughTs
+	if err := m.advanceCustomerHealthSourceCursorFromRealtime(old+60, old+180); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.storeDB.First(&state, 1).Error; err != nil {
+		t.Fatal(err)
+	}
+	if state.ThroughTs != old {
+		t.Fatalf("disjoint realtime sample fabricated continuous coverage: got=%d want=%d", state.ThroughTs, old)
+	}
+}
+
+func TestCustomerHealthRealtimeCannotSkipIncompleteFRTReplay(t *testing.T) {
+	m := newTestMonitor(t)
+	defer m.Close()
+	m.cfg.CapacityEnabled = true
+	dayStart, target := customerHealthSourceRange(time.Now())
+	through := target - 10*60
+	if through <= dayStart+2*60 {
+		t.Skip("test requires a non-empty current CST day")
+	}
+	if err := m.storeDB.Save(&CustomerHealthSourceCursor{
+		ID: 1, DayTs: dayStart, ThroughTs: through,
+		SemanticsVersion:     customerHealthStabilityPolicyVersion,
+		TTFTSemanticsVersion: ttftCoverageSemanticsVersion,
+		TTFTCoverageFromTs:   dayStart, TTFTCoverageThroughTs: through - 60,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := m.advanceCustomerHealthSourceCursorFromRealtime(through-120, target); err != nil {
+		t.Fatal(err)
+	}
+	var state CustomerHealthSourceCursor
+	if err := m.storeDB.First(&state, 1).Error; err != nil {
+		t.Fatal(err)
+	}
+	if state.ThroughTs != target || state.TTFTCoverageThroughTs != through-60 {
+		t.Fatalf("live request proof must advance without bridging an unfilled FRT gap: %+v", state)
+	}
+	status := m.customerHealthCollectionStatus(dayStart, target)
+	if !status.Ready || status.ThroughTs != target {
+		t.Fatalf("customer-health request readiness must not be held back by FRT replay: %+v", status)
+	}
+}
+
 func TestCustomerHealthIndependentSourceCapsMetricsAtContinuousWatermark(t *testing.T) {
 	m := newTestMonitor(t)
-	from, _, _ := customerHealthDayRange(chTestNow())
+	from, target := customerHealthSourceRange(chTestNow())
 	m.cfg.CustomerHealthSourceEnabled = true
 	m.customerHealthSourceFrom.Store(from)
-	m.customerHealthSourceThrough.Store(from + 3600)
+	m.customerHealthSourceThrough.Store(target)
 	chSeedCompany(t, m, "水位公司", 101)
 	rows := []CapacityUserMinuteSample{
 		{BucketTs: from + 60, UserID: 101, ChannelID: 7, ModelName: "m", Grp: "g", Success: 2},
 		// 模拟重启前遗留、但本轮尚未重新证明覆盖到的未来本地行。
-		{BucketTs: from + 7200, UserID: 101, ChannelID: 7, ModelName: "m", Grp: "g", Success: 99},
+		{BucketTs: target + 60, UserID: 101, ChannelID: 7, ModelName: "m", Grp: "g", Success: 99},
 	}
 	if err := m.storeDB.Create(&rows).Error; err != nil {
 		t.Fatal(err)
@@ -340,6 +555,150 @@ func TestCustomerHealthSourceCursorRewindsTodayWhenPolicyChanges(t *testing.T) {
 	}
 }
 
+func TestCustomerHealthSourceCursorTTFTReplayKeepsRequestWatermark(t *testing.T) {
+	m := newTestMonitor(t)
+	from, _, _ := customerHealthDayRange(chTestNow())
+	high := from + 8*3600
+	// Request facts are already on the current policy, but the FRT projection
+	// predates its semantics version.  Replaying FRT must not make request
+	// coverage appear to disappear.
+	if err := m.storeDB.Exec(`INSERT INTO customer_health_source_cursors
+		(id, day_ts, through_ts, semantics_version, ttft_semantics_version,
+		 ttft_coverage_from_ts, ttft_coverage_through_ts, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, 1, from, high,
+		customerHealthStabilityPolicyVersion, ttftCoverageSemanticsVersion-1,
+		from, high, chTestNow().Unix()).Error; err != nil {
+		t.Fatal(err)
+	}
+	cursor, covered, err := m.loadCustomerHealthSourceCursor(from, high+3600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cursor != from || covered != from {
+		t.Fatalf("legacy FRT replay must start at day start: cursor=(%d,%d)", cursor, covered)
+	}
+	var saved CustomerHealthSourceCursor
+	if err := m.storeDB.First(&saved, 1).Error; err != nil {
+		t.Fatal(err)
+	}
+	if saved.ThroughTs != high {
+		t.Fatalf("FRT replay rewound request watermark: %+v", saved)
+	}
+	if saved.TTFTCoverageThroughTs != from || saved.TTFTSemanticsVersion != ttftCoverageSemanticsVersion {
+		t.Fatalf("FRT watermark was not reset independently: %+v", saved)
+	}
+}
+
+func TestCustomerHealthFRTReplayResumesAfterFailedSlice(t *testing.T) {
+	m := newTestMonitor(t)
+	from, target := customerHealthSourceRange(chTestNow())
+	requestThrough := from + 8*3600
+	frtThrough := from + 3*3600
+	if err := m.storeDB.Save(&CustomerHealthSourceCursor{
+		ID: 1, DayTs: from, ThroughTs: requestThrough,
+		SemanticsVersion:     customerHealthStabilityPolicyVersion,
+		TTFTSemanticsVersion: ttftCoverageSemanticsVersion,
+		TTFTCoverageFromTs:   from, TTFTCoverageThroughTs: frtThrough,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	firstFrom := frtThrough - customerHealthSourceReplaySeconds
+	firstTo := customerHealthSourceNext(firstFrom, target)
+	calls := 0
+	err := m.backfillCustomerHealthPolicyTodayWith(context.Background(), chTestNow(),
+		func(_ context.Context, sliceFrom, sliceTo int64) (int, error) {
+			calls++
+			if calls == 1 {
+				if sliceFrom != firstFrom || sliceTo != firstTo {
+					t.Fatalf("first FRT replay slice=[%d,%d), want=[%d,%d)", sliceFrom, sliceTo, firstFrom, firstTo)
+				}
+				return 0, nil
+			}
+			return 0, fmt.Errorf("simulated source outage")
+		})
+	if err == nil || calls != 2 {
+		t.Fatalf("expected one committed FRT slice then a source failure: calls=%d err=%v", calls, err)
+	}
+	var state CustomerHealthSourceCursor
+	if err := m.storeDB.First(&state, 1).Error; err != nil {
+		t.Fatal(err)
+	}
+	if state.ThroughTs != requestThrough || state.TTFTCoverageThroughTs != firstTo {
+		t.Fatalf("failed replay lost request proof or first FRT slice: %+v", state)
+	}
+	resumeFrom, covered, err := m.loadCustomerHealthSourceCursor(from, target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if covered != firstTo || resumeFrom != firstTo-customerHealthSourceReplaySeconds {
+		t.Fatalf("FRT replay restarted at midnight instead of durable slice: cursor=%d covered=%d state=%+v", resumeFrom, covered, state)
+	}
+}
+
+func TestCustomerHealthFRTReplayRewindsOnlyForLegacyRowsInsideProof(t *testing.T) {
+	m := newTestMonitor(t)
+	from, target := customerHealthSourceRange(chTestNow())
+	frtThrough := from + 3*3600
+	if err := m.storeDB.Save(&CustomerHealthSourceCursor{
+		ID: 1, DayTs: from, ThroughTs: from + 8*3600,
+		SemanticsVersion:     customerHealthStabilityPolicyVersion,
+		TTFTSemanticsVersion: ttftCoverageSemanticsVersion,
+		TTFTCoverageFromTs:   from, TTFTCoverageThroughTs: frtThrough,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	oldAhead := CapacityUserMinuteSample{BucketTs: from + 5*3600, UserID: 7, ChannelID: 1, ModelName: "m", Grp: "g", Success: 1}
+	if err := m.storeDB.Create(&oldAhead).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := m.storeDB.Model(&CapacityUserMinuteSample{}).Where("bucket_ts = ?", oldAhead.BucketTs).
+		Update("ttft_semantics_version", 0).Error; err != nil {
+		t.Fatal(err)
+	}
+	cursor, covered, err := m.loadCustomerHealthSourceCursor(from, target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if covered != frtThrough || cursor != frtThrough-customerHealthSourceReplaySeconds {
+		t.Fatalf("legacy row ahead of FRT cursor unnecessarily rewound replay: cursor=%d covered=%d", cursor, covered)
+	}
+	oldInside := CapacityUserMinuteSample{BucketTs: from + 2*3600, UserID: 7, ChannelID: 1, ModelName: "m", Grp: "g", Success: 1}
+	if err := m.storeDB.Create(&oldInside).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := m.storeDB.Model(&CapacityUserMinuteSample{}).Where("bucket_ts = ?", oldInside.BucketTs).
+		Update("ttft_semantics_version", 0).Error; err != nil {
+		t.Fatal(err)
+	}
+	cursor, covered, err = m.loadCustomerHealthSourceCursor(from, target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cursor != from || covered != from {
+		t.Fatalf("legacy row within certified FRT prefix failed to invalidate proof: cursor=%d covered=%d", cursor, covered)
+	}
+}
+
+func TestCustomerHealthFRTReplayRejectsLaterStartAsCompletePrefix(t *testing.T) {
+	m := newTestMonitor(t)
+	from, target := customerHealthSourceRange(chTestNow())
+	if err := m.storeDB.Save(&CustomerHealthSourceCursor{
+		ID: 1, DayTs: from, ThroughTs: from + 8*3600,
+		SemanticsVersion:     customerHealthStabilityPolicyVersion,
+		TTFTSemanticsVersion: ttftCoverageSemanticsVersion,
+		TTFTCoverageFromTs:   from + 60, TTFTCoverageThroughTs: from + 3*3600,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	cursor, covered, err := m.loadCustomerHealthSourceCursor(from, target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cursor != from || covered != from {
+		t.Fatalf("later-start FRT interval must not certify midnight prefix: cursor=%d covered=%d", cursor, covered)
+	}
+}
+
 func TestCustomerHealthStandardSourceBackfillsNewPolicyAcrossToday(t *testing.T) {
 	m := newTestMonitor(t)
 	from, target := customerHealthSourceRange(chTestNow())
@@ -397,6 +756,54 @@ func TestCustomerHealthSourceCursorNeverRegressesWithinDay(t *testing.T) {
 	if covered != high || cursor != high-customerHealthSourceReplaySeconds {
 		t.Fatalf("same-day cursor regressed: cursor=(%d,%d), want=(%d,%d)",
 			cursor, covered, high-customerHealthSourceReplaySeconds, high)
+	}
+}
+
+func TestCustomerHealthSourceCursorConcurrentWritersPreserveHighestCoverage(t *testing.T) {
+	m := newTestMonitor(t)
+	dayStart, _, _ := customerHealthDayRange(chTestNow())
+	const writers = 20
+	var wg sync.WaitGroup
+	errs := make(chan error, writers)
+	for i := 1; i <= writers; i++ {
+		wg.Add(1)
+		go func(through int64) {
+			defer wg.Done()
+			errs <- m.saveCustomerHealthSourceCursor(dayStart, through)
+		}(dayStart + int64(i)*60)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	var state CustomerHealthSourceCursor
+	if err := m.storeDB.First(&state, 1).Error; err != nil {
+		t.Fatal(err)
+	}
+	if state.ThroughTs != dayStart+writers*60 || state.TTFTCoverageThroughTs != state.ThroughTs {
+		t.Fatalf("concurrent cursor write regressed coverage: %+v", state)
+	}
+}
+
+func TestCustomerHealthSourceCursorRejectsLatePreviousDayWrite(t *testing.T) {
+	m := newTestMonitor(t)
+	oldDay, _, _ := customerHealthDayRange(chTestNow())
+	newDay := oldDay + 24*3600
+	if err := m.saveCustomerHealthSourceCursor(newDay, newDay+3600); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.saveCustomerHealthSourceCursor(oldDay, oldDay+23*3600); err != nil {
+		t.Fatal(err)
+	}
+	var state CustomerHealthSourceCursor
+	if err := m.storeDB.First(&state, 1).Error; err != nil {
+		t.Fatal(err)
+	}
+	if state.DayTs != newDay || state.ThroughTs != newDay+3600 {
+		t.Fatalf("late previous-day write replaced new-day cursor: %+v", state)
 	}
 }
 
@@ -915,6 +1322,7 @@ func stripGoLineComments(s string) string {
 // 0% 会被读成"全挂了"，而实际是"今天还没用"——这是本仓库的硬约束。
 func TestCustomerHealthMissingDataIsNotZero(t *testing.T) {
 	m := newTestMonitor(t)
+	chSeedCompleteTodaySource(t, m, chTestNow())
 	chSeedCompany(t, m, "乙公司", 201)
 	report, err := m.buildCustomerHealthReport(context.Background(), chTestNow())
 	if err != nil {
@@ -991,7 +1399,7 @@ func TestCustomerHealthStabilityUsesActionableClientGoneBoundary(t *testing.T) {
 	}
 	healthSQL := customerHealthAttributedAnomalySQL()
 	for _, want := range []string{"completion_tokens = 0", "COALESCE(use_time,0) > 3", logChainClientGoneEndReason,
-		"JSON_EXTRACT(other,'$.frt')", "> 3000"} {
+		"COALESCE(is_stream,0)=1", "JSON_EXTRACT(other,'$.frt')", "> 3000"} {
 		if !strings.Contains(healthSQL, want) {
 			t.Fatalf("客户维护遗漏断连异常边界 %q: %s", want, healthSQL)
 		}
@@ -1218,8 +1626,8 @@ func TestCustomerHealthSamplingAppliesResponsibilityPolicy(t *testing.T) {
 	}
 	for _, row := range rows {
 		if _, err := m.prodDB.Exec(`INSERT INTO logs
-			(id,user_id,channel_id,created_at,type,model_name,quota,prompt_tokens,completion_tokens,use_time,`+"`group`"+`,username,content,other)
-			VALUES (?,101,7,?,?,?,?,10,?,?,'g','alice',?,?)`,
+			(id,user_id,channel_id,created_at,type,model_name,quota,prompt_tokens,completion_tokens,use_time,`+"`group`"+`,username,is_stream,content,other)
+			VALUES (?,101,7,?,?,?,?,10,?,?,'g','alice',1,?,?)`,
 			row.id, from+int64(row.id), row.typ, "gpt-test", 0, row.completion, row.useTime, row.content, row.other); err != nil {
 			t.Fatal(err)
 		}

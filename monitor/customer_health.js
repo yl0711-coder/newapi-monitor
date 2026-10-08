@@ -308,7 +308,11 @@ function render(){
     meta.textContent=ch.report
       ? '统计日 '+ch.report.day+'（'+ch.report.time_zone+'）· 出报于 '+
         new Date((ch.report.generated_at||0)*1000).toLocaleTimeString('zh-CN')+
-        (collection?.note?' · '+collection.note:'')
+        (collection?.note?' · '+collection.note:'')+
+        (collection?.membership_source
+          ? ' · 名单：'+collection.membership_source+' · '+num(collection.membership_groups||0)+'家公司/'+
+            num(collection.membership_members||0)+'个用户 · 指纹 '+String(collection.membership_fingerprint||'—')
+          : '')
       : '';
   }
   // 空/错/加载三态都得是 <tr>：本页表格化后 tbody 里放 div 会被浏览器

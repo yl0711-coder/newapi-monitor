@@ -70,6 +70,10 @@ services:
       MONITOR_SAMPLE_SECONDS: "60"
       MONITOR_BACKFILL_HOURS: "1"
       MONITOR_STABILITY_ENABLED: "true"
+      # 显式启动客户维护所需的问题签名来源，仅只读生产 logs 的错误记录。
+      # 前置拒绝另由下方 CloudWatch PREROUTE 采集，不能用此开关代替。
+      MONITOR_STABILITY_PROBLEM_SOURCE_ENABLED: "true"
+      MONITOR_STABILITY_PROBLEM_SOURCE_LOOKBACK_HOURS: "24"
       # 容量规划只读取本机已采集的脱敏事实，不新增来源 worker；真实只读
       # 验收需要显式开启页面，线上默认开关仍不受影响。
       MONITOR_CAPACITY_ENABLED: "true"
@@ -90,8 +94,13 @@ services:
       AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
       AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
       AWS_SESSION_TOKEN: ${AWS_SESSION_TOKEN:-}
-      MONITOR_CLOUDWATCH_LOGS_ENABLED: ${MONITOR_CLOUDWATCH_LOGS_ENABLED:-false}
-      MONITOR_CLOUDWATCH_PREROUTE_ENABLED: ${MONITOR_CLOUDWATCH_PREROUTE_ENABLED:-false}
+      # 前置拒绝 lane 依赖 CloudWatch Logs 客户端；显式开启，避免仅开
+      # MONITOR_CLOUDWATCH_PREROUTE_ENABLED 却因默认 false 在启动校验处被拒绝。
+      # 没有可用 AWS 凭证时采集器会 fail-closed 并保留旧水位，不会伪造 0。
+      MONITOR_CLOUDWATCH_LOGS_ENABLED: "true"
+      # 前置拒绝由 Monitor 直接从 CloudWatch 连续采集；8204 不再依赖
+      # nginxcollector/旧旁路是否仍在上报。
+      MONITOR_CLOUDWATCH_PREROUTE_ENABLED: "true"
       MONITOR_CLOUDWATCH_PREROUTE_POLL_SECONDS: ${MONITOR_CLOUDWATCH_PREROUTE_POLL_SECONDS:-300}
       MONITOR_CLOUDWATCH_PREROUTE_LOOKBACK_HOURS: ${MONITOR_CLOUDWATCH_PREROUTE_LOOKBACK_HOURS:-168}
       MONITOR_CLOUDWATCH_EVIDENCE_HMAC_KEY: ${MONITOR_CLOUDWATCH_EVIDENCE_HMAC_KEY:-}

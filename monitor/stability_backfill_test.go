@@ -26,13 +26,53 @@ func TestStabilityHourSQLUsesBoundedHalfOpenRangeAndSuccessOnlyUsage(t *testing.
 		"is_channel_test",
 		"channel_test_origin",
 		"GROUP BY channel_id, model_name, grp, is_channel_test, channel_test_origin",
+		"AS ttft_observed",
+		"AS ttft_over_3s",
+		"COALESCE(is_stream,0)=1",
 	} {
 		if !strings.Contains(q, want) {
 			t.Fatalf("小时补数 SQL 缺少 %q:\n%s", want, q)
 		}
 	}
+	if strings.Contains(q, "FRT>3000") || !strings.Contains(q, "JSON_EXTRACT(other,'$.frt')") {
+		t.Fatalf("小时补数 TTFT 必须使用 other.frt 且严格投影: %s", q)
+	}
 	if strings.Contains(q, "SUM(quota)") {
 		t.Fatal("错误日志的 quota 不得混入消费额")
+	}
+}
+
+func TestStabilityTTFTUsesStrictThreeSecondBoundary(t *testing.T) {
+	m := newStabilityTestMonitor(t)
+	m.prodDB = newFakeProdDB(t)
+	m.usageDayExpr = usageDayExprSQLite
+	base := time.Date(2026, 9, 6, 10, 0, 0, 0, cstLocation).Unix()
+	for id, frt := range []int{3000, 3001, 500} {
+		if _, err := m.prodDB.Exec(`INSERT INTO logs
+			(id,user_id,channel_id,created_at,type,model_name,quota,prompt_tokens,completion_tokens,use_time,`+"`group`"+`,token_id,token_name,is_stream,content,other,request_id)
+			VALUES (?,2,9,?,2,'ttft-test',0,1,1,1,'g',1,'customer',1,'ok',?,?)`,
+			id+1, base+int64(id+1), fmt.Sprintf(`{"frt":%d}`, frt), fmt.Sprintf("ttft-%d", id)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// A non-streaming row may carry a stale frt field, but it is not a valid
+	// first-data timing observation and must not affect any histogram bucket.
+	if _, err := m.prodDB.Exec(`INSERT INTO logs
+		(id,user_id,channel_id,created_at,type,model_name,quota,prompt_tokens,completion_tokens,use_time,`+"`group`"+`,token_id,token_name,is_stream,content,other,request_id)
+		VALUES (99,2,9,?,2,'ttft-test',0,1,1,1,'g',1,'customer',0,'ok',?, 'ttft-nonstream')`,
+		base+99, `{"frt":9000}`); err != nil {
+		t.Fatal(err)
+	}
+	got, err := m.fetchStabilityHour(context.Background(), base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Users) != 1 {
+		t.Fatalf("unexpected rows: %+v", got.Users)
+	}
+	row := got.Users[0]
+	if row.TtftObserved != 3 || row.TtftOver3s != 1 || row.Ttft5k != 2 || row.Ttft500 != 1 {
+		t.Fatalf("TTFT projection mismatch: %+v", row)
 	}
 }
 
@@ -533,6 +573,30 @@ func TestStabilityCoverageCountsLedgerNotSamplePresence(t *testing.T) {
 	}
 }
 
+func TestStabilityTTFTCoverageDoesNotTreatLegacyRowsAsFast(t *testing.T) {
+	m := newStabilityTestMonitor(t)
+	from := time.Date(2026, 8, 7, 0, 0, 0, 0, cstLocation).Unix()
+	if err := m.storeDB.Create(&StabilityHourSample{
+		HourTs: from, ChannelID: 1, ModelName: "legacy", Grp: "g", Success: 1,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := m.storeDB.Create(&StabilityHourIngestState{HourTs: from, Status: "complete", Requests: 1}).Error; err != nil {
+		t.Fatal(err)
+	}
+	// Simulate a pre-TTFT database: both the row and its completion ledger have
+	// no exact projection version. Request coverage remains complete, but TTFT
+	// coverage must be explicitly incomplete.
+	if err := m.storeDB.Model(&StabilityHourIngestState{}).Where("hour_ts = ?", from).
+		Update("ttft_semantics_version", 0).Error; err != nil {
+		t.Fatal(err)
+	}
+	cov := m.stabilityDataCoverage(context.Background(), from, from+3600, from+2*3600)
+	if !cov.Complete || cov.TTFTComplete || cov.TTFTMissingHours != 1 || cov.TTFTCompletedHours != 0 {
+		t.Fatalf("legacy TTFT rows must remain incomplete without affecting request coverage: %+v", cov)
+	}
+}
+
 func TestStabilityCoverageSeparatesLatestPendingFromHistoricalGap(t *testing.T) {
 	m := newStabilityTestMonitor(t)
 	from := time.Date(2026, 8, 9, 0, 0, 0, 0, cstLocation).Unix()
@@ -579,6 +643,58 @@ func TestLocalRollupDoesNotOverwriteAuthoritativeCompleteHour(t *testing.T) {
 	}
 	if got.Success != 99 {
 		t.Fatalf("分钟级局部数据覆盖了权威小时补数: %+v", got)
+	}
+}
+
+func TestLocalRollupCarriesExactTTFTCounters(t *testing.T) {
+	m := newStabilityTestMonitor(t)
+	hour := time.Date(2026, 8, 5, 11, 0, 0, 0, cstLocation).Unix()
+	if err := m.storeDB.Create(&MetricSample{
+		BucketTs: hour, ChannelID: 1, ModelName: "m", Grp: "g", Success: 3,
+		Ttft500: 1, Ttft5k: 1, Ttft10k: 1, TtftMaxMs: 6000, TtftObserved: 3, TtftOver3s: 2,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := m.rollupStabilityHours(hour); err != nil {
+		t.Fatal(err)
+	}
+	var got StabilityHourSample
+	if err := m.storeDB.First(&got, "hour_ts = ?", hour).Error; err != nil {
+		t.Fatal(err)
+	}
+	if got.TtftObserved != 3 || got.TtftOver3s != 2 || got.Ttft500 != 1 || got.Ttft5k != 1 || got.Ttft10k != 1 || got.TtftMaxMs != 6000 || got.TTFTSemanticsVersion != ttftCoverageSemanticsVersion {
+		t.Fatalf("local rollup lost exact TTFT counters: %+v", got)
+	}
+	metrics := (stabilityCounts{Ttft500: got.Ttft500, Ttft5k: got.Ttft5k, Ttft10k: got.Ttft10k,
+		TtftMaxMs: int64(got.TtftMaxMs), TtftObserved: got.TtftObserved, TtftOver3s: got.TtftOver3s}).metrics()
+	if metrics.TTFTObserved != 3 || metrics.TTFTOver3s != 2 || metrics.TTFTMaxMs != 6000 || metrics.TTFTP95Ms <= metrics.TTFTP50Ms {
+		t.Fatalf("stability metrics did not expose exact TTFT distribution: %+v", metrics)
+	}
+}
+
+func TestLocalRollupPreservesLegacyTTFTCoverageGap(t *testing.T) {
+	m := newStabilityTestMonitor(t)
+	hour := time.Date(2026, 8, 5, 12, 0, 0, 0, cstLocation).Unix()
+	if err := m.storeDB.Create(&MetricSample{
+		BucketTs: hour, ChannelID: 1, ModelName: "legacy-ttft", Grp: "g", Success: 1,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	// Simulate a row written before the exact TTFT projection existed.  The
+	// local rollup must not stamp it with the current version and make the
+	// resulting stability hour look TTFT-complete.
+	if err := m.storeDB.Model(&MetricSample{}).Where("bucket_ts = ?", hour).Update("ttft_semantics_version", 0).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := m.rollupStabilityHours(hour); err != nil {
+		t.Fatal(err)
+	}
+	var got StabilityHourSample
+	if err := m.storeDB.First(&got, "hour_ts = ?", hour).Error; err != nil {
+		t.Fatal(err)
+	}
+	if got.TTFTSemanticsVersion != 0 {
+		t.Fatalf("legacy minute rows must keep the TTFT coverage gap: %+v", got)
 	}
 }
 

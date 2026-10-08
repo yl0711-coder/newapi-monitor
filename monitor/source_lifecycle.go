@@ -1092,21 +1092,70 @@ type sourceReadyStatus struct {
 	LastFailureAt        int64  `json:"last_failure_at"`
 	NextRetryAt          int64  `json:"next_retry_at"`
 	FailureStreak        int64  `json:"failure_streak"`
+	FromTs               int64  `json:"from_ts"`
+	ThroughTs            int64  `json:"through_ts"`
+	TargetTs             int64  `json:"target_ts"`
+}
+
+// readyCoverageStatus is intentionally a generic, half-open watermark shape.
+// Every collector reports the range it has proved, separately from its target;
+// a target is never implied to be covered merely because the worker is alive.
+// For problem_source, zero from/through with coverage_status=unknown means no
+// continuous range is certified. Its requested range and durable cursor progress
+// are exposed separately so an old gap remains visible without claiming coverage.
+type readyCoverageStatus struct {
+	FromTs            int64  `json:"from_ts"`
+	ThroughTs         int64  `json:"through_ts"`
+	TargetTs          int64  `json:"target_ts"`
+	RequestedFromTs   int64  `json:"requested_from_ts,omitempty"`
+	ProgressThroughTs int64  `json:"progress_through_ts,omitempty"`
+	CoverageStatus    string `json:"coverage_status,omitempty"`
+}
+
+type readyEffectiveConfig struct {
+	LocalSnapshotOnly             bool   `json:"local_snapshot_only"`
+	SourceWorkerEnabled           bool   `json:"source_worker_enabled"`
+	LogChainOnlySource            bool   `json:"logchain_only_source"`
+	SourceLeaseRequired           bool   `json:"source_lease_required"`
+	SampleSeconds                 int    `json:"sample_seconds"`
+	CapacityEnabled               bool   `json:"capacity_enabled"`
+	StabilityEnabled              bool   `json:"stability_enabled"`
+	StabilityProblemSourceEnabled bool   `json:"stability_problem_source_enabled"`
+	CustomerHealthSourceEnabled   bool   `json:"customer_health_source_enabled"`
+	UsageFactsEnabled             bool   `json:"usage_facts_enabled"`
+	UsageFactsReadEnabled         bool   `json:"usage_facts_read_enabled"`
+	CloudWatchPreRouteEnabled     bool   `json:"cloudwatch_preroute_enabled"`
+	CloudWatchPreRoutePollSeconds int    `json:"cloudwatch_preroute_poll_seconds"`
+	CloudWatchPreRouteLookbackHrs int    `json:"cloudwatch_preroute_lookback_hours"`
+	CloudWatchNginxEnabled        bool   `json:"cloudwatch_nginx_enabled"`
+	CloudWatchNginxPollSeconds    int    `json:"cloudwatch_nginx_poll_seconds"`
+	CloudWatchNginxLookbackHrs    int    `json:"cloudwatch_nginx_lookback_hours"`
+	CloudWatchLogsEnabled         bool   `json:"cloudwatch_logs_enabled"`
+	CloudWatchShadowEnabled       bool   `json:"cloudwatch_shadow_enabled"`
+	NginxEnabled                  bool   `json:"nginx_enabled"`
+	NginxSourceV2Enabled          bool   `json:"nginx_source_v2_enabled"`
+	NginxSourceV2CutoverEnabled   bool   `json:"nginx_source_v2_cutover_enabled"`
+	NginxEvidenceMode             string `json:"nginx_evidence_mode"`
+	AlertsDisabled                bool   `json:"alerts_disabled"`
 }
 
 type readyStatusResponse struct {
-	Status             string                        `json:"status"`
-	StartedAt          int64                         `json:"started_at"`
-	Store              lifecycleComponentStatus      `json:"store"`
-	FactsStore         lifecycleComponentStatus      `json:"facts_store"`
-	Source             sourceReadyStatus             `json:"source"`
-	SampledAt          int64                         `json:"sampled_at"`
-	MetricFinalize     metricFinalizeReadyStatus     `json:"metric_finalize"`
-	FactsHeartbeat     int64                         `json:"facts_heartbeat_at"`
-	FactsDisk          factsDiskReadyStatus          `json:"facts_disk"`
-	CloudWatchPreRoute cloudWatchPreRouteReadyStatus `json:"cloudwatch_pre_route"`
-	CloudWatchNginx    cloudWatchNginxReadyStatus    `json:"cloudwatch_nginx"`
-	DegradedReasons    []string                      `json:"degraded_reasons,omitempty"`
+	Status             string                         `json:"status"`
+	GitSHA             string                         `json:"git_sha"`
+	ImageVersion       string                         `json:"image_version"`
+	Config             readyEffectiveConfig           `json:"config"`
+	Collectors         map[string]readyCoverageStatus `json:"collectors"`
+	StartedAt          int64                          `json:"started_at"`
+	Store              lifecycleComponentStatus       `json:"store"`
+	FactsStore         lifecycleComponentStatus       `json:"facts_store"`
+	Source             sourceReadyStatus              `json:"source"`
+	SampledAt          int64                          `json:"sampled_at"`
+	MetricFinalize     metricFinalizeReadyStatus      `json:"metric_finalize"`
+	FactsHeartbeat     int64                          `json:"facts_heartbeat_at"`
+	FactsDisk          factsDiskReadyStatus           `json:"facts_disk"`
+	CloudWatchPreRoute cloudWatchPreRouteReadyStatus  `json:"cloudwatch_pre_route"`
+	CloudWatchNginx    cloudWatchNginxReadyStatus     `json:"cloudwatch_nginx"`
+	DegradedReasons    []string                       `json:"degraded_reasons,omitempty"`
 }
 
 type cloudWatchPreRouteReadyStatus struct {
@@ -1155,6 +1204,103 @@ func appendReason(reasons []string, reason string) []string {
 	return append(reasons, reason)
 }
 
+// metricFRTReadyCoverage reads the independent, durable FRT replay watermark
+// from the local SQLite state.  /ready must not infer it from the request
+// finalizer's atomic NextTs: request facts may be caught up while historical
+// FRT rows are still being replayed.  This is a local indexed read, never a
+// production-source probe.
+func (m *Monitor) metricFRTReadyCoverage() readyCoverageStatus {
+	if m == nil || m.storeDB == nil {
+		return readyCoverageStatus{}
+	}
+	var state MetricFinalizeState
+	tx := m.storeDB.Select("ttft_coverage_from_ts", "ttft_coverage_through_ts", "target_through_ts").
+		Where("id = ?", 1).Limit(1).Find(&state)
+	if tx.Error != nil || tx.RowsAffected == 0 {
+		return readyCoverageStatus{}
+	}
+	return readyCoverageStatus{
+		FromTs: state.TTFTCoverageFromTs, ThroughTs: state.TTFTCoverageThroughTs,
+		TargetTs: state.TargetThroughTs,
+	}
+}
+
+// customerHealthReadyCoverage reports the current CST day's durable request
+// prefix.  The two customer-health writers publish in-memory watermarks too,
+// but those are only process-local hints and can lag or outlive a day switch.
+// /ready must use the same persisted proof as the report itself.
+func (m *Monitor) customerHealthReadyCoverage(now time.Time) readyCoverageStatus {
+	if m == nil || m.storeDB == nil ||
+		!(m.cfg.CustomerHealthSourceEnabled || (m.cfg.sourceWorkerIsEnabled() && m.cfg.CapacityEnabled)) {
+		return readyCoverageStatus{}
+	}
+	dayStart, target := customerHealthSourceRange(now)
+	status := readyCoverageStatus{TargetTs: target}
+	var cursor CustomerHealthSourceCursor
+	tx := m.storeDB.Select("day_ts", "through_ts", "semantics_version").
+		Where("id = ?", 1).Limit(1).Find(&cursor)
+	if tx.Error != nil || tx.RowsAffected == 0 || cursor.DayTs != dayStart ||
+		cursor.SemanticsVersion != customerHealthStabilityPolicyVersion ||
+		cursor.ThroughTs < dayStart || cursor.ThroughTs > dayStart+24*3600 {
+		return status
+	}
+	status.FromTs = dayStart
+	status.ThroughTs = cursor.ThroughTs
+	return status
+}
+
+// customerHealthHistoryReadyCoverage exposes the independent source's rolling
+// seven-day request and FRT certificates.  Standard source deployments already
+// expose metric_finalize and frt_replay; these customer-health history entries
+// remain zero there so a different source's watermark is not misidentified.
+func (m *Monitor) customerHealthHistoryReadyCoverage(now time.Time) (readyCoverageStatus, readyCoverageStatus) {
+	var requests, frt readyCoverageStatus
+	if m == nil || m.storeDB == nil || !m.cfg.CustomerHealthSourceEnabled {
+		return requests, frt
+	}
+	_, target := customerHealthSourceRange(now)
+	requests.TargetTs, frt.TargetTs = target, target
+	from := target - customerHealthHistoryDays*24*3600
+	if from <= 0 || target <= from {
+		return requests, frt
+	}
+	proof, err := m.customerHealthHistoricalCoverage(context.Background(), from, target)
+	if err != nil {
+		return requests, frt
+	}
+	requests.FromTs, requests.ThroughTs = proof.RequestFromTs, proof.RequestThroughTs
+	frt.FromTs, frt.ThroughTs = proof.FRTFromTs, proof.FRTThroughTs
+	return requests, frt
+}
+
+// problemSourceReadyCoverage keeps the requested range and durable cursor
+// progress visible without claiming a continuously covered interval. The ID=2
+// cutover marker cannot prove one: if ID=1 is recreated later, it can start at
+// the current lookback while an older gap remains. /stability/problems verifies
+// completeness from the minute states for each requested reporting window.
+func (m *Monitor) problemSourceReadyCoverage() readyCoverageStatus {
+	if m == nil {
+		return readyCoverageStatus{CoverageStatus: "unknown"}
+	}
+	status := readyCoverageStatus{
+		RequestedFromTs:   m.problemSourceFrom.Load(),
+		ProgressThroughTs: m.problemLiveThrough.Load(),
+		TargetTs:          m.problemSourceTarget.Load(),
+		CoverageStatus:    "unknown",
+	}
+	if m.storeDB == nil {
+		return status
+	}
+	var live StabilityProblemLiveCursor
+	tx := m.storeDB.Select("next_ts").
+		Where("id = ? AND traffic_class_version = ?", 1, stabilityTrafficClassificationVersion).
+		Limit(1).Find(&live)
+	if tx.Error == nil && tx.RowsAffected > 0 {
+		status.ProgressThroughTs = live.NextTs
+	}
+	return status
+}
+
 func (m *Monitor) readyStatus(now time.Time) (readyStatusResponse, int) {
 	mainOK := m.localStoreProbeOK.Load() && m.storeIntegrityOK.Load()
 	factsOK := m.localFactsProbeOK.Load()
@@ -1169,8 +1315,65 @@ func (m *Monitor) readyStatus(now time.Time) (readyStatusResponse, int) {
 	if m.cfg.CloudWatchPreRouteEnabled {
 		_, cloudWatchPreRouteTarget = cloudWatchPreRouteRange(now, m.cfg.CloudWatchPreRouteLookbackHours)
 	}
+	gitSHA, imageVersion := effectiveBuildMetadata()
+	customerHealthCoverage := m.customerHealthReadyCoverage(now)
+	customerHealthHistoryRequests, customerHealthHistoryFRT := m.customerHealthHistoryReadyCoverage(now)
+	metricFinalizeFrom := m.metricFinalizeFrom.Load()
+	metricFinalizeThrough := m.metricFinalizeThrough.Load()
+	metricFinalizeTargetTs := m.metricFinalizeTarget.Load()
+	problemCoverage := m.problemSourceReadyCoverage()
 	response := readyStatusResponse{
-		Status:    "ready",
+		Status:       "ready",
+		GitSHA:       gitSHA,
+		ImageVersion: imageVersion,
+		Config: readyEffectiveConfig{
+			LocalSnapshotOnly:             m.cfg.LocalSnapshotOnly,
+			SourceWorkerEnabled:           m.cfg.sourceWorkerIsEnabled(),
+			LogChainOnlySource:            m.cfg.LogChainOnlySource,
+			SourceLeaseRequired:           m.cfg.sourceLeaseIsRequired(),
+			SampleSeconds:                 m.cfg.SampleSeconds,
+			CapacityEnabled:               m.cfg.CapacityEnabled,
+			StabilityEnabled:              m.cfg.StabilityEnabled,
+			StabilityProblemSourceEnabled: m.cfg.StabilityProblemSourceEnabled,
+			CustomerHealthSourceEnabled:   m.cfg.CustomerHealthSourceEnabled,
+			UsageFactsEnabled:             m.cfg.UsageFactsEnabled,
+			UsageFactsReadEnabled:         m.cfg.UsageFactsReadEnabled,
+			CloudWatchPreRouteEnabled:     m.cfg.CloudWatchPreRouteEnabled,
+			CloudWatchPreRoutePollSeconds: m.cfg.CloudWatchPreRoutePollSeconds,
+			CloudWatchPreRouteLookbackHrs: m.cfg.CloudWatchPreRouteLookbackHours,
+			CloudWatchNginxEnabled:        m.cfg.CloudWatchNginxEnabled,
+			CloudWatchNginxPollSeconds:    m.cfg.CloudWatchNginxPollSeconds,
+			CloudWatchNginxLookbackHrs:    m.cfg.CloudWatchNginxLookbackHours,
+			CloudWatchLogsEnabled:         m.cfg.CloudWatchLogsEnabled,
+			CloudWatchShadowEnabled:       m.cfg.CloudWatchShadowEnabled,
+			NginxEnabled:                  m.cfg.NginxEnabled,
+			NginxSourceV2Enabled:          m.cfg.NginxSourceV2Enabled,
+			NginxSourceV2CutoverEnabled:   m.cfg.NginxSourceV2CutoverEnabled,
+			NginxEvidenceMode:             nginxEvidenceMode(m.cfg.NginxEvidenceMode),
+			AlertsDisabled:                m.cfg.AlertsDisabled,
+		},
+		Collectors: map[string]readyCoverageStatus{
+			"source_worker": {
+				FromTs: m.sourceWorkerCoverageFrom.Load(), ThroughTs: m.sourceWorkerCoverageThrough.Load(), TargetTs: m.sourceWorkerCoverageTarget.Load(),
+			},
+			"customer_health":                  customerHealthCoverage,
+			"customer_health_history_requests": customerHealthHistoryRequests,
+			"customer_health_history_frt":      customerHealthHistoryFRT,
+			"problem_source":                   problemCoverage,
+			"metric_finalize": {
+				FromTs: metricFinalizeFrom, ThroughTs: metricFinalizeThrough, TargetTs: metricFinalizeTargetTs,
+			},
+			"frt_replay": m.metricFRTReadyCoverage(),
+			"cloudwatch_pre_route": {
+				FromTs: m.cloudWatchPreRouteFrom.Load(), ThroughTs: m.cloudWatchPreRouteThrough.Load(), TargetTs: cloudWatchPreRouteTarget,
+			},
+			"cloudwatch_nginx": {
+				FromTs: m.cloudWatchNginxFrom.Load(), ThroughTs: m.cloudWatchNginxThrough.Load(), TargetTs: cloudWatchNginxTarget,
+			},
+			"nginx_evidence": {
+				FromTs: m.cloudWatchNginxEvidenceFrom.Load(), ThroughTs: m.cloudWatchNginxEvidenceThrough.Load(), TargetTs: cloudWatchNginxTarget,
+			},
+		},
 		StartedAt: m.processStartedAt.Load(),
 		Store: lifecycleComponentStatus{
 			OK: mainOK, CheckedAt: m.localStoreProbeAt.Load(),
@@ -1191,6 +1394,9 @@ func (m *Monitor) readyStatus(now time.Time) (readyStatusResponse, int) {
 			LastFailureAt:        m.sourceLastFailureAt.Load(),
 			NextRetryAt:          m.sourceNextRetryAt.Load(),
 			FailureStreak:        m.sourceFailureStreak.Load(),
+			FromTs:               m.sourceWorkerCoverageFrom.Load(),
+			ThroughTs:            m.sourceWorkerCoverageThrough.Load(),
+			TargetTs:             m.sourceWorkerCoverageTarget.Load(),
 		},
 		SampledAt: m.lastRun.Load(),
 		MetricFinalize: metricFinalizeReadyStatus{

@@ -29,6 +29,20 @@ const (
 	metricMigrationLookbackSec      int64 = 24 * 60 * 60
 )
 
+// Metric minute facts must outlive the full finalized report window.  The
+// right edge is delayed by an hour; pruning relative to wall-clock now would
+// otherwise delete the first hour of every nominal 7-day query.
+func metricMinuteRetentionCutoff(now int64, days int) int64 {
+	if days <= 0 {
+		return 0
+	}
+	cutoff := metricFinalizeTarget(now) - int64(days)*86400
+	if cutoff < 0 {
+		return 0
+	}
+	return cutoff / 60 * 60
+}
+
 type metricRangeSampler func(context.Context, int64, int64) (int, error)
 type tokenRangeSampler func(context.Context, int64, int64) error
 
@@ -123,7 +137,7 @@ func (m *Monitor) startSampler(ctx context.Context) {
 				slog.Warn("token 维度启动缺口补齐失败(忽略,不影响主监控)", "err", err)
 			}
 		}
-		if err := m.rollupHours(time.Now().Unix() - int64(m.cfg.RetentionDays)*86400); err != nil {
+		if err := m.rollupHours(metricMinuteRetentionCutoff(time.Now().Unix(), m.cfg.RetentionDays)); err != nil {
 			slog.Warn("启动小时汇总失败(忽略)", "err", err)
 		}
 	}
@@ -255,7 +269,7 @@ func (m *Monitor) loop(ctx context.Context, interval time.Duration) {
 			}
 			if ticks%(int(600/interval.Seconds())+1) == 0 {
 				if d := m.cfg.RetentionDays; d > 0 {
-					cutoff := time.Now().Unix() - int64(d)*86400
+					cutoff := metricMinuteRetentionCutoff(now, d)
 					// 必须先把即将越过保留线的分钟事实汇总成功，再删除原始数据。
 					// 汇总失败时保留分钟事实供下轮重试，避免维护任务主动制造永久缺口。
 					if err := m.rollupHours(cutoff); err != nil {
@@ -303,9 +317,45 @@ func metricFinalizeRetryDelay(attempts int) int64 {
 	return min(int64(60)<<uint(attempts-1), int64(10*60))
 }
 
+// metricFinalizeHasLegacyTTFTRows detects request facts written before the
+// exact TTFT projection was introduced.  The cursor's semantics version is
+// not sufficient by itself: a database may lose/recreate MetricFinalizeState
+// with the current default version while the historical minute rows still
+// carry ttft_semantics_version=0.  In that case the cursor would otherwise
+// start at the live tail and permanently certify an incomplete TTFT window.
+func (m *Monitor) metricFinalizeHasLegacyTTFTRows(from, to int64) (bool, error) {
+	if m == nil || m.storeDB == nil || from >= to {
+		return false, nil
+	}
+	var count int64
+	if err := m.storeDB.Model(&MetricSample{}).
+		Where("bucket_ts >= ? AND bucket_ts < ? AND traffic_class_version = ? AND (success + anomaly + failed > 0 OR tokens <> 0) AND COALESCE(ttft_semantics_version,0) <> ?", from, to, stabilityTrafficClassificationVersion, ttftCoverageSemanticsVersion).
+		Limit(1).Count(&count).Error; err != nil {
+		return false, err
+	}
+	if count > 0 {
+		return true, nil
+	}
+	if err := m.storeDB.Model(&CapacityUserMinuteSample{}).
+		Where("bucket_ts >= ? AND bucket_ts < ? AND traffic_class_version = ? AND (success + anomaly + failed > 0 OR tokens <> 0 OR quota <> 0 OR refund_quota <> 0) AND COALESCE(ttft_semantics_version,0) <> ?", from, to, stabilityTrafficClassificationVersion, ttftCoverageSemanticsVersion).
+		Limit(1).Count(&count).Error; err != nil {
+		return false, err
+	}
+	return count > 0, nil
+}
+
 func (m *Monitor) loadOrExtendMetricFinalizeState(now int64) (*MetricFinalizeState, error) {
 	target := metricFinalizeTarget(now)
 	start := target - metricFinalizeInitialOverlapSec
+	retentionDays := m.cfg.RetentionDays
+	if retentionDays <= 0 {
+		retentionDays = 7
+	}
+	ttftMigrationStart := target - int64(retentionDays)*86400
+	if ttftMigrationStart < 0 {
+		ttftMigrationStart = 0
+	}
+	ttftMigrationStart = ttftMigrationStart / 60 * 60
 	var legacyCount int64
 	if err := m.storeDB.Model(&MetricSample{}).Where("traffic_class_version <> ?", stabilityTrafficClassificationVersion).Limit(1).Count(&legacyCount).Error; err != nil {
 		return nil, err
@@ -320,14 +370,30 @@ func (m *Monitor) loadOrExtendMetricFinalizeState(now int64) (*MetricFinalizeSta
 	hourStart := ((start + 3599) / 3600) * 3600
 	defaults := MetricFinalizeState{
 		ID: 1, NextTs: start, TargetThroughTs: target, CoverageFromTs: start,
-		SemanticsVersion:   stabilityTrafficClassificationVersion,
-		HourCoverageFromTs: hourStart, HourCoverageToTs: hourStart,
+		SemanticsVersion:     stabilityTrafficClassificationVersion,
+		TTFTSemanticsVersion: ttftCoverageSemanticsVersion,
+		HourCoverageFromTs:   hourStart, HourCoverageToTs: hourStart,
 		HourSemanticsVersion: stabilityTrafficClassificationVersion,
 		Status:               "queued", UpdatedAt: now,
 	}
 	var state MetricFinalizeState
 	if err := m.storeDB.Where("id = ?", 1).Attrs(defaults).FirstOrCreate(&state).Error; err != nil {
 		return nil, err
+	}
+	// FirstOrCreate applies current defaults when MetricFinalizeState is
+	// recreated, so inspect the facts as well as the cursor.  During a replay,
+	// legacy rows *ahead* of its FRT watermark are expected; only legacy rows
+	// inside the already certified FRT prefix invalidate that progress.
+	legacyTTFT, err := m.metricFinalizeHasLegacyTTFTRows(ttftMigrationStart, target)
+	if err != nil {
+		return nil, err
+	}
+	legacyInsideFRTPrefix := false
+	if legacyTTFT && state.TTFTCoverageThroughTs > ttftMigrationStart {
+		legacyInsideFRTPrefix, err = m.metricFinalizeHasLegacyTTFTRows(ttftMigrationStart, min(target, state.TTFTCoverageThroughTs))
+		if err != nil {
+			return nil, err
+		}
 	}
 	updates := map[string]any{}
 	if state.SemanticsVersion != stabilityTrafficClassificationVersion {
@@ -344,6 +410,22 @@ func (m *Monitor) loadOrExtendMetricFinalizeState(now int64) (*MetricFinalizeSta
 			"semantics_version": stabilityTrafficClassificationVersion, "status": "queued",
 			"attempts": 0, "next_retry_at": 0, "last_error": "",
 		}
+	}
+	frtReplayActive := state.TTFTSemanticsVersion == ttftCoverageSemanticsVersion &&
+		state.TTFTCoverageFromTs > 0 && state.TTFTCoverageFromTs <= ttftMigrationStart &&
+		state.TTFTCoverageThroughTs >= ttftMigrationStart && state.TTFTCoverageThroughTs < target
+	if state.TTFTSemanticsVersion != ttftCoverageSemanticsVersion ||
+		(legacyTTFT && (!frtReplayActive || legacyInsideFRTPrefix)) {
+		// FRT has its own replay cursor. Never rewind the request-fact NextTs or
+		// CoverageFromTs merely because an old FRT projection needs replacing:
+		// those request facts remain certified and must keep error/anomaly alerts
+		// running during the historical replay.
+		state.TTFTSemanticsVersion = ttftCoverageSemanticsVersion
+		state.TTFTCoverageFromTs = ttftMigrationStart
+		state.TTFTCoverageThroughTs = ttftMigrationStart
+		updates["ttft_semantics_version"] = ttftCoverageSemanticsVersion
+		updates["ttft_coverage_from_ts"] = ttftMigrationStart
+		updates["ttft_coverage_through_ts"] = ttftMigrationStart
 	}
 	if state.HourSemanticsVersion != stabilityTrafficClassificationVersion {
 		state.HourCoverageFromTs = hourStart
@@ -372,6 +454,7 @@ func (m *Monitor) loadOrExtendMetricFinalizeState(now int64) (*MetricFinalizeSta
 		}
 	}
 	m.metricFinalizeThrough.Store(state.NextTs)
+	m.metricFinalizeFrom.Store(state.CoverageFromTs)
 	m.metricFinalizeTarget.Store(state.TargetThroughTs)
 	m.metricFinalizeLastSuccess.Store(state.LastSuccessAt)
 	m.metricFinalizeLastFailure.Store(state.LastFailureAt)
@@ -385,7 +468,9 @@ func (m *Monitor) metricWindowCoverage(fromTs, now int64) (bool, int64, int64) {
 		return false, 0, target
 	}
 	complete := state.SemanticsVersion == stabilityTrafficClassificationVersion &&
-		state.CoverageFromTs > 0 && state.CoverageFromTs <= fromTs && state.NextTs >= target
+		state.CoverageFromTs > 0 && state.CoverageFromTs <= fromTs && state.NextTs >= target &&
+		state.TTFTSemanticsVersion == ttftCoverageSemanticsVersion &&
+		state.TTFTCoverageFromTs > 0 && state.TTFTCoverageFromTs <= fromTs && state.TTFTCoverageThroughTs >= target
 	return complete, state.CoverageFromTs, min(state.NextTs, target)
 }
 
@@ -419,10 +504,25 @@ func (m *Monitor) publishMetricBackfillCoverage(stateID uint, minuteFrom, finali
 			ELSE ? END`, stabilityTrafficClassificationVersion, minuteFrom, finalizeTarget, minuteFrom,
 			stabilityTrafficClassificationVersion, minuteFrom, minuteFrom,
 			stabilityTrafficClassificationVersion, finalizeTarget, minuteFrom),
-		"next_ts":           gorm.Expr("MAX(next_ts,?)", finalizeTarget),
-		"target_through_ts": gorm.Expr("MAX(target_through_ts,?)", finalizeTarget),
-		"semantics_version": stabilityTrafficClassificationVersion,
-		"status":            gorm.Expr(`CASE WHEN MAX(next_ts,?)>=target_through_ts THEN 'caught_up' ELSE status END`, finalizeTarget),
+		"next_ts":                gorm.Expr("MAX(next_ts,?)", finalizeTarget),
+		"target_through_ts":      gorm.Expr("MAX(target_through_ts,?)", finalizeTarget),
+		"semantics_version":      stabilityTrafficClassificationVersion,
+		"ttft_semantics_version": ttftCoverageSemanticsVersion,
+		"ttft_coverage_from_ts": gorm.Expr(`CASE
+			WHEN ttft_semantics_version=? AND ttft_coverage_from_ts>0 AND ttft_coverage_through_ts>ttft_coverage_from_ts AND ttft_coverage_through_ts>=? AND ?>=ttft_coverage_from_ts THEN MIN(ttft_coverage_from_ts,?)
+			WHEN ttft_semantics_version=? AND ttft_coverage_from_ts>0 AND ttft_coverage_through_ts>ttft_coverage_from_ts AND ?>ttft_coverage_through_ts THEN ?
+			WHEN ttft_semantics_version=? AND ttft_coverage_from_ts>0 AND ttft_coverage_through_ts>ttft_coverage_from_ts THEN ttft_coverage_from_ts
+			WHEN ? > 0 THEN ? ELSE 0 END`, ttftCoverageSemanticsVersion, minuteFrom, finalizeTarget, minuteFrom,
+			ttftCoverageSemanticsVersion, minuteFrom, minuteFrom,
+			ttftCoverageSemanticsVersion, minuteFrom, minuteFrom),
+		"ttft_coverage_through_ts": gorm.Expr(`CASE
+			WHEN ttft_semantics_version=? AND ttft_coverage_from_ts>0 AND ttft_coverage_through_ts>ttft_coverage_from_ts AND ttft_coverage_through_ts>=? AND ?>=ttft_coverage_from_ts THEN MAX(ttft_coverage_through_ts,?)
+			WHEN ttft_semantics_version=? AND ttft_coverage_from_ts>0 AND ttft_coverage_through_ts>ttft_coverage_from_ts AND ?>ttft_coverage_through_ts THEN ?
+			WHEN ttft_semantics_version=? AND ttft_coverage_from_ts>0 AND ttft_coverage_through_ts>ttft_coverage_from_ts THEN ttft_coverage_through_ts
+			WHEN ? > 0 THEN ? ELSE 0 END`, ttftCoverageSemanticsVersion, minuteFrom, finalizeTarget, finalizeTarget,
+			ttftCoverageSemanticsVersion, minuteFrom, finalizeTarget,
+			ttftCoverageSemanticsVersion, finalizeTarget, finalizeTarget),
+		"status": gorm.Expr(`CASE WHEN MAX(next_ts,?)>=target_through_ts THEN 'caught_up' ELSE status END`, finalizeTarget),
 		"hour_coverage_from_ts": gorm.Expr(`CASE
 			WHEN hour_semantics_version=? AND hour_coverage_from_ts>0 AND hour_coverage_to_ts>hour_coverage_from_ts AND hour_coverage_to_ts>=? AND ?>=hour_coverage_from_ts THEN MIN(hour_coverage_from_ts,?)
 			WHEN hour_semantics_version=? AND hour_coverage_from_ts>0 AND hour_coverage_to_ts>hour_coverage_from_ts AND ?>hour_coverage_to_ts THEN ?
@@ -455,10 +555,11 @@ func (m *Monitor) recordMetricFinalizeFailure(state *MetricFinalizeState, cause 
 	}
 }
 
-// runMetricFinalizeTurnWith executes at most one bounded source slice. The
-// cursor advances only after both the model and token projections plus their
-// local hour rollup succeed. Replaying a partly written slice is safe because
-// both minute tables use replace-style UPSERTs.
+// runMetricFinalizeTurnWith first advances one bounded request/token slice,
+// then (if needed) one independent historical FRT replay slice. The request
+// cursor advances only after both projections and their local hour rollup
+// succeed. Replaying a partly written slice is safe because minute writes use
+// replace-style UPSERTs. An FRT replay never rewinds the request cursor.
 func (m *Monitor) runMetricFinalizeTurnWith(ctx context.Context, now int64, metric metricRangeSampler, token tokenRangeSampler) error {
 	state, err := m.loadOrExtendMetricFinalizeState(now)
 	if err != nil {
@@ -468,9 +569,12 @@ func (m *Monitor) runMetricFinalizeTurnWith(ctx context.Context, now int64, metr
 		return nil
 	}
 	if state.NextTs >= state.TargetThroughTs {
-		return m.storeDB.Model(&MetricFinalizeState{}).Where("id = ?", state.ID).Updates(map[string]any{
+		if err := m.storeDB.Model(&MetricFinalizeState{}).Where("id = ?", state.ID).Updates(map[string]any{
 			"status": "caught_up", "attempts": 0, "next_retry_at": 0, "last_error": "", "updated_at": now,
-		}).Error
+		}).Error; err != nil {
+			return err
+		}
+		return m.runMetricFRTReplayTurnWith(ctx, now, metric)
 	}
 	from, to := state.NextTs, min(state.NextTs+metricFinalizeSliceSec, state.TargetThroughTs)
 	if _, err := metric(ctx, from, to); err != nil {
@@ -493,6 +597,14 @@ func (m *Monitor) runMetricFinalizeTurnWith(ctx context.Context, now int64, metr
 		"next_ts": to, "target_through_ts": state.TargetThroughTs, "status": status,
 		"attempts": 0, "next_retry_at": 0, "last_success_at": now,
 		"last_failure_at": 0, "last_error": "", "updated_at": now,
+		"ttft_semantics_version": ttftCoverageSemanticsVersion,
+	}
+	// The request slice also proves FRT only if it directly extends the FRT
+	// prefix. A disjoint live tail must not jump over historical FRT gaps.
+	if state.TTFTSemanticsVersion == ttftCoverageSemanticsVersion &&
+		state.TTFTCoverageFromTs > 0 && state.TTFTCoverageFromTs <= from &&
+		state.TTFTCoverageThroughTs == from {
+		updates["ttft_coverage_through_ts"] = to
 	}
 	completedHourTo := to / 3600 * 3600
 	if completedHourTo > state.HourCoverageToTs {
@@ -508,10 +620,65 @@ func (m *Monitor) runMetricFinalizeTurnWith(ctx context.Context, now int64, metr
 		return fmt.Errorf("模型监控迟到日志水位并发更新冲突")
 	}
 	m.metricFinalizeThrough.Store(to)
+	m.metricFinalizeFrom.Store(state.CoverageFromTs)
 	m.metricFinalizeTarget.Store(state.TargetThroughTs)
 	m.metricFinalizeLastSuccess.Store(now)
 	m.metricFinalizeLastFailure.Store(0)
+	return m.runMetricFRTReplayTurnWith(ctx, now, metric)
+}
+
+// runMetricFRTReplayTurnWith replaces one old FRT slice without touching the
+// already certified request/token cursor. Token logs do not carry FRT and are
+// deliberately not re-queried for this migration-only pass.
+func (m *Monitor) runMetricFRTReplayTurnWith(ctx context.Context, now int64, metric metricRangeSampler) error {
+	var state MetricFinalizeState
+	if err := m.storeDB.First(&state, "id = ?", 1).Error; err != nil {
+		return err
+	}
+	from := state.TTFTCoverageThroughTs
+	limit := min(state.NextTs, state.TargetThroughTs)
+	if state.TTFTSemanticsVersion != ttftCoverageSemanticsVersion || state.TTFTCoverageFromTs <= 0 ||
+		from < state.TTFTCoverageFromTs || from >= limit {
+		return nil
+	}
+	to := min(from+metricFinalizeSliceSec, limit)
+	if _, err := metric(ctx, from, to); err != nil {
+		return m.recordMetricFRTReplayFailure(state.ID, now, err)
+	}
+	if err := m.rollupHours(from / 3600 * 3600); err != nil {
+		return m.recordMetricFRTReplayFailure(state.ID, now, err)
+	}
+	status := "frt_replay"
+	if to >= limit && state.NextTs >= state.TargetThroughTs {
+		status = "caught_up"
+	}
+	result := m.storeDB.Model(&MetricFinalizeState{}).
+		Where("id = ? AND ttft_coverage_through_ts = ? AND ttft_semantics_version = ?", state.ID, from, ttftCoverageSemanticsVersion).
+		Updates(map[string]any{
+			"ttft_coverage_through_ts": to, "status": status,
+			"last_success_at": now, "last_failure_at": 0,
+			"last_error": "", "updated_at": now,
+		})
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected != 1 {
+		return fmt.Errorf("FRT 历史回放水位并发更新冲突")
+	}
+	m.metricFinalizeLastSuccess.Store(now)
+	m.metricFinalizeLastFailure.Store(0)
 	return nil
+}
+
+func (m *Monitor) recordMetricFRTReplayFailure(stateID uint, now int64, cause error) error {
+	if err := m.storeDB.Model(&MetricFinalizeState{}).Where("id = ?", stateID).Updates(map[string]any{
+		"status": "frt_retry", "last_failure_at": now,
+		"last_error": clip(cause.Error(), 512), "updated_at": now,
+	}).Error; err != nil {
+		return fmt.Errorf("FRT 回放失败: %w (记录错误时也失败: %w)", cause, err)
+	}
+	m.metricFinalizeLastFailure.Store(now)
+	return fmt.Errorf("FRT 回放失败: %w", cause)
 }
 
 func (m *Monitor) runMetricFinalizeTurn(ctx context.Context, now int64) error {
@@ -574,13 +741,63 @@ func channelTestCostBasisSQL(testPredicate string) string {
 		`ELSE 'legacy_assumed_base' END ELSE '' END`
 }
 
-// sampleWindow 查询生产库最近 lookbackSec 秒日志,按"分钟桶×渠道×模型×分组"聚合并写本地。
-// 这是全程唯一打到生产库的查询。
+// sourceWorkerSampleBounds keeps both SQL boundaries on minute edges.  The
+// current, unclosed minute may still feed the realtime page, but only minutes
+// strictly before closedThrough can be published as continuous coverage.
+// Rounding the lower bound down is essential because the SQL groups whole
+// minute buckets and replace-style UPSERTs overwrite each returned bucket.
+func sourceWorkerSampleBounds(now, lookbackSec int64) (from, to, closedThrough int64) {
+	closedThrough = now / 60 * 60
+	from = (now - lookbackSec) / 60 * 60
+	if from < 0 {
+		from = 0
+	}
+	to = closedThrough + 60
+	return from, to, closedThrough
+}
+
+// sampleWindow queries a bounded source range and writes minute projections.
+// The SQL uses [from,to); the last bucket remains provisional until the next
+// minute, while /ready.source_worker only publishes closedThrough.
 func (m *Monitor) sampleWindow(ctx context.Context, lookbackSec int64) (int, error) {
 	now := time.Now().Unix()
-	// +60 上界留一分钟余量,避免边界那一秒的日志正好落在两次采样之间被漏掉
-	// (桶是幂等 UPSERT,重叠采样只会覆盖同一桶,不会重复累加)。
-	return m.sampleRange(ctx, now-lookbackSec, now+60)
+	from, to, closedThrough := sourceWorkerSampleBounds(now, lookbackSec)
+	rows, err := m.sampleRange(ctx, from, to)
+	if err == nil {
+		m.publishSourceWorkerCoverage(from, closedThrough, closedThrough)
+		// The standard source worker and the customer-maintenance report share
+		// the same user-minute projection.  Publish its successful overlapping
+		// live window to the durable customer-health cursor as well; this keeps
+		// /customer-health/report moving after the historical policy backfill
+		// without claiming a gap was covered.
+		if cursorErr := m.advanceCustomerHealthSourceCursorFromRealtime(from, to); cursorErr != nil {
+			slog.Warn("标准来源实时采样推进客户维护水位失败(保留旧水位重试)", "err", cursorErr)
+		}
+	}
+	return rows, err
+}
+
+// publishSourceWorkerCoverage advances only across overlapping successful
+// windows.  It must never turn two disjoint successful queries into a fake
+// continuous range, because /ready is used to decide whether local metrics are
+// safe to compare between deployments.
+func (m *Monitor) publishSourceWorkerCoverage(from, through, target int64) {
+	if through <= from {
+		return
+	}
+	previousThrough := m.sourceWorkerCoverageThrough.Load()
+	previousFrom := m.sourceWorkerCoverageFrom.Load()
+	if previousThrough == 0 || from > previousThrough {
+		m.sourceWorkerCoverageFrom.Store(from)
+	} else if previousFrom == 0 || from < previousFrom {
+		m.sourceWorkerCoverageFrom.Store(from)
+	}
+	if through > previousThrough {
+		m.sourceWorkerCoverageThrough.Store(through)
+	}
+	if target > m.sourceWorkerCoverageTarget.Load() {
+		m.sourceWorkerCoverageTarget.Store(target)
+	}
 }
 
 // sampleRange 采集 [fromTs, toTs) 区间的日志并写入本地桶。
@@ -677,12 +894,14 @@ func (m *Monitor) sampleRangeWithPriorityOptions(ctx context.Context, fromTs, to
 			&e4, &e5, &eto,
 			&s.Lat1, &s.Lat2, &s.Lat5, &s.Lat10, &s.Lat30, &s.Lat60, &s.LatInf,
 			&s.CompletionTokens,
-			&s.Ttft500, &s.Ttft1k, &s.Ttft2k, &s.Ttft5k, &s.Ttft10k, &s.TtftInf, &s.TtftMaxMs)
+			&s.Ttft500, &s.Ttft1k, &s.Ttft2k, &s.Ttft5k, &s.Ttft10k, &s.TtftInf, &s.TtftMaxMs,
+			&s.TtftObserved, &s.TtftOver3s)
 		if err := rows.Scan(scanArgs...); err != nil {
 			return 0, err
 		}
 		s.Grp = grp.String
 		s.TrafficClassVersion = stabilityTrafficClassificationVersion
+		s.TTFTSemanticsVersion = ttftCoverageSemanticsVersion
 		s.Err4xx, s.Err5xx, s.ErrTimeout = e4, e5, eto
 		if other := s.Failed - e4 - e5 - eto; other > 0 {
 			s.ErrOther = other
@@ -705,6 +924,10 @@ func (m *Monitor) sampleRangeWithPriorityOptions(ctx context.Context, fromTs, to
 				CustomerHealthAnomaly: customerHealthAnomaly, CustomerHealthFailed: customerHealthFailed,
 				CustomerHealthVersion: customerHealthStabilityPolicyVersion, Tokens: s.Tokens,
 				Quota: s.Quota, RefundQuota: s.RefundQuota,
+				Ttft500: s.Ttft500, Ttft1k: s.Ttft1k, Ttft2k: s.Ttft2k, Ttft5k: s.Ttft5k,
+				Ttft10k: s.Ttft10k, TtftInf: s.TtftInf, TtftMaxMs: s.TtftMaxMs,
+				TtftObserved: s.TtftObserved, TtftOver3s: s.TtftOver3s,
+				TTFTSemanticsVersion: ttftCoverageSemanticsVersion,
 			})
 		}
 	}
@@ -767,6 +990,8 @@ func mergeMetricSample(dst *MetricSample, src MetricSample) {
 	dst.Ttft5k += src.Ttft5k
 	dst.Ttft10k += src.Ttft10k
 	dst.TtftInf += src.TtftInf
+	dst.TtftObserved += src.TtftObserved
+	dst.TtftOver3s += src.TtftOver3s
 	if src.TtftMaxMs > dst.TtftMaxMs {
 		dst.TtftMaxMs = src.TtftMaxMs
 	}
@@ -782,7 +1007,9 @@ func sampleWindowUserSQL() string { return sampleWindowSQLWithUser(true) }
 func sampleWindowSQLWithUser(includeUser bool) string {
 	// MySQL SUM/布尔聚合返回 DECIMAL,需 CAST 成 SIGNED 才能 Scan 进 int64。
 	// 错误分类互斥(优先级:超时 > 5xx > 4xx),四类之和不超过失败数。
-	// FRT = 首字延迟(ms),取自 other JSON 的 frt;非法 JSON 或缺失则计 0(被 frt>0 过滤掉)。
+	// FRT = 首个 data 事件延迟(ms),取自 other JSON 的 frt;它不是严格的
+	// 首个有效模型 token。只有流式请求才有可比较的 FRT；非流式日志即使
+	// 携带历史 frt 字段也不得进入这些聚合。
 	//
 	// 交付异常判据见 expandAnomalyPredicates。
 	const frt = "(CASE WHEN JSON_VALID(other) THEN CAST(JSON_EXTRACT(other,'$.frt') AS SIGNED) ELSE 0 END)"
@@ -825,13 +1052,15 @@ SELECT /*+ MAX_EXECUTION_TIME(8000) */
   CAST(COALESCE(SUM(type=2 AND use_time>30 AND use_time<=60),0) AS SIGNED) AS lat_60,
   CAST(COALESCE(SUM(type=2 AND use_time>60),0) AS SIGNED)                 AS lat_inf,
   CAST(COALESCE(SUM(CASE WHEN type=2 THEN completion_tokens END),0) AS SIGNED) AS completion_tokens,
-  CAST(COALESCE(SUM(type=2 AND FRT>0    AND FRT<=500),0)   AS SIGNED) AS ttft_500,
-  CAST(COALESCE(SUM(type=2 AND FRT>500  AND FRT<=1000),0)  AS SIGNED) AS ttft_1k,
-  CAST(COALESCE(SUM(type=2 AND FRT>1000 AND FRT<=2000),0)  AS SIGNED) AS ttft_2k,
-  CAST(COALESCE(SUM(type=2 AND FRT>2000 AND FRT<=5000),0)  AS SIGNED) AS ttft_5k,
-  CAST(COALESCE(SUM(type=2 AND FRT>5000 AND FRT<=10000),0) AS SIGNED) AS ttft_10k,
-  CAST(COALESCE(SUM(type=2 AND FRT>10000),0)               AS SIGNED) AS ttft_inf,
-  CAST(COALESCE(MAX(CASE WHEN type=2 AND FRT>0 THEN FRT END),0) AS SIGNED) AS ttft_max_ms
+  CAST(COALESCE(SUM(type=2 AND COALESCE(is_stream,0)=1 AND FRT>0    AND FRT<=500),0)   AS SIGNED) AS ttft_500,
+  CAST(COALESCE(SUM(type=2 AND COALESCE(is_stream,0)=1 AND FRT>500  AND FRT<=1000),0)  AS SIGNED) AS ttft_1k,
+  CAST(COALESCE(SUM(type=2 AND COALESCE(is_stream,0)=1 AND FRT>1000 AND FRT<=2000),0)  AS SIGNED) AS ttft_2k,
+  CAST(COALESCE(SUM(type=2 AND COALESCE(is_stream,0)=1 AND FRT>2000 AND FRT<=5000),0)  AS SIGNED) AS ttft_5k,
+  CAST(COALESCE(SUM(type=2 AND COALESCE(is_stream,0)=1 AND FRT>5000 AND FRT<=10000),0) AS SIGNED) AS ttft_10k,
+  CAST(COALESCE(SUM(type=2 AND COALESCE(is_stream,0)=1 AND FRT>10000),0)               AS SIGNED) AS ttft_inf,
+  CAST(COALESCE(MAX(CASE WHEN type=2 AND COALESCE(is_stream,0)=1 AND FRT>0 THEN FRT END),0) AS SIGNED) AS ttft_max_ms,
+  CAST(COALESCE(SUM(type=2 AND COALESCE(is_stream,0)=1 AND FRT>0),0) AS SIGNED) AS ttft_observed,
+  CAST(COALESCE(SUM(type=2 AND COALESCE(is_stream,0)=1 AND FRT>0 AND FRT>3000),0) AS SIGNED) AS ttft_over_3s
 FROM logs
 WHERE created_at >= ? AND created_at < ? AND type IN (2,5,6)
   AND NOT (` + channelTestLogPredicateSQL() + `)
@@ -927,7 +1156,7 @@ func (m *Monitor) backfillHoursLocked(ctx context.Context, hours int, metric, hi
 	finalizeTarget := metricFinalizeTarget(now)
 	hourlyUntil := finalizeTarget / 3600 * 3600
 	hourlyFrom := hourlyUntil - int64(hours)*3600
-	minuteCutoff := now - int64(m.cfg.RetentionDays)*86400
+	minuteCutoff := metricMinuteRetentionCutoff(now, m.cfg.RetentionDays)
 	res := &BackfillResult{Hours: hours}
 	slog.Info("开始历史回填", "hours", hours, "note", "只读生产库,按小时切片")
 

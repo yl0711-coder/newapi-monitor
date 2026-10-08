@@ -3,6 +3,7 @@ package monitor
 import (
 	"regexp"
 	"strings"
+	"unicode"
 	"unicode/utf8"
 )
 
@@ -93,6 +94,11 @@ func cwBusinessLabel(raw string, maximum int) (string, bool) {
 // example, "codex 企业分组"). Keep model IDs strict and retain the same
 // sensitive-content and control-character checks for both kinds of label.
 func cwBusinessGroupLabel(raw string, maximum int) (string, bool) {
+	for _, r := range raw {
+		if r != ' ' && unicode.IsSpace(r) {
+			return "", false
+		}
+	}
 	return cwBusinessLabelWithSpaces(raw, maximum, true)
 }
 
@@ -113,6 +119,11 @@ func cwBusinessLabelWithSpaces(raw string, maximum int, allowSpaces bool) (strin
 		}
 	}
 	lower := strings.ToLower(value)
+	if allowSpaces {
+		// Keep the local safety rule for spaced secret markers without
+		// changing the group name returned to the caller.
+		lower = strings.ReplaceAll(lower, " ", "_")
+	}
 	for _, fragment := range []string{"authorization", "api_key", "apikey", "access_token", "refresh_token", "bearer", "secret"} {
 		if strings.Contains(lower, fragment) {
 			return "", false

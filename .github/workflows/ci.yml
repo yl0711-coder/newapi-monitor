@@ -261,6 +261,9 @@ jobs:
           push: false
           tags: monitor-security:${{ matrix.image }}
           labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VCS_REF=${{ github.sha }}
+            IMAGE_VERSION=${{ steps.meta.outputs.version }}
       - name: Block high and critical runtime OS vulnerabilities (including unfixed)
         uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # 0.35.0
         with:
