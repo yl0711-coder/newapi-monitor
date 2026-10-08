@@ -106,32 +106,51 @@ type Monitor struct {
 	// without querying SQLite from the health endpoint.
 	nginxSourceV2RuntimeConfigOK atomic.Bool
 
-	lastRun                         atomic.Int64 // 采样心跳:最近一次成功采样的 Unix 秒(0=从未)
+	lastRun atomic.Int64 // 采样心跳:最近一次成功采样的 Unix 秒(0=从未)
+	// sourceWorkerCoverage* describe the last continuous range proved by the
+	// ordinary source worker.  They are deliberately separate from lastRun:
+	// a successful heartbeat alone does not prove that a requested range was
+	// covered without gaps.
+	sourceWorkerCoverageFrom        atomic.Int64
+	sourceWorkerCoverageThrough     atomic.Int64
+	sourceWorkerCoverageTarget      atomic.Int64
 	metricFinalizeThrough           atomic.Int64 // 模型/token 迟到日志已定稿到的右水位
+	metricFinalizeFrom              atomic.Int64 // 迟到日志定稿连续覆盖左水位
 	metricFinalizeTarget            atomic.Int64 // 当前延迟定稿目标水位
 	metricFinalizeLastSuccess       atomic.Int64
 	metricFinalizeLastFailure       atomic.Int64
 	problemLastSuccess              atomic.Int64 // 原始错误采集器最近一次成功执行
 	problemLastFailure              atomic.Int64 // 原始错误采集器最近一次失败
 	problemLiveThrough              atomic.Int64 // 原始错误实时 lane 已确认到的分钟右水位
+	problemSourceFrom               atomic.Int64 // 当前问题采集请求窗口左水位
+	problemSourceTarget             atomic.Int64 // 当前问题采集请求窗口目标右水位
 	problemSourceRunning            atomic.Bool  // logchain-only 独立问题签名只读 lane 是否正在运行
 	customerHealthSourceRunning     atomic.Bool  // logchain-only 客户维护只读 lane 是否正在运行
 	customerHealthSourceFrom        atomic.Int64 // 当天连续覆盖左水位（CST 日起点）
 	customerHealthSourceThrough     atomic.Int64 // 当天连续覆盖右水位（不含）
+	customerHealthSourceTarget      atomic.Int64 // 客户维护当前采集目标右水位
 	customerHealthSourceLastSuccess atomic.Int64
 	customerHealthSourceLastFailure atomic.Int64
-	stabilityBackfillRunning        atomic.Bool // 长期小时补数串行闸门；人工任务与自动修洞共用
-	metricBackfillMu                sync.RWMutex
-	metricBackfillStatus            MetricBackfillStatus
-	usageFactsHistoryRestarts       atomic.Int64 // 全历史持久 worker panic/意外退出后的守护重启次数
-	ctxMu                           sync.RWMutex
-	backgroundCtx                   context.Context // Start 注入；后台任务不绑定浏览器请求生命周期
-	shutdownInitOnce                sync.Once
-	closeOnce                       sync.Once
-	portalGCOnce                    sync.Once
-	shutdown                        chan struct{}
-	processStartedAt                atomic.Int64
-	shuttingDown                    atomic.Bool
+	// Last whole-day history cutoff pruned during an idle history turn. This
+	// avoids repeating the same DELETE transaction during each worker poll.
+	customerHealthHistoryPrunedBefore atomic.Int64
+	// customerHealthCursorMu serializes the read/merge/write of the durable
+	// customer-maintenance coverage cursor.  The standard realtime sampler and
+	// the policy backfill can both publish overlapping windows; without this
+	// lock a stale read could overwrite a newer TTFT watermark.
+	customerHealthCursorMu    sync.Mutex
+	stabilityBackfillRunning  atomic.Bool // 长期小时补数串行闸门；人工任务与自动修洞共用
+	metricBackfillMu          sync.RWMutex
+	metricBackfillStatus      MetricBackfillStatus
+	usageFactsHistoryRestarts atomic.Int64 // 全历史持久 worker panic/意外退出后的守护重启次数
+	ctxMu                     sync.RWMutex
+	backgroundCtx             context.Context // Start 注入；后台任务不绑定浏览器请求生命周期
+	shutdownInitOnce          sync.Once
+	closeOnce                 sync.Once
+	portalGCOnce              sync.Once
+	shutdown                  chan struct{}
+	processStartedAt          atomic.Int64
+	shuttingDown              atomic.Bool
 	// 来源库生命周期与 Web/SQLite 服务解耦。这些状态只由
 	// supervisor 写、健康接口原子读，绝不在 /ready 请求中探测 MySQL。
 	sourceLifecycleInitialized atomic.Bool
@@ -1084,17 +1103,33 @@ type Summary struct {
 	P50            float64 `json:"p50"`
 	P95            float64 `json:"p95"`
 	P99            float64 `json:"p99"`
-	TtftP50        float64 `json:"ttft_p50"` // 首字延迟 p50(秒)
-	TtftP95        float64 `json:"ttft_p95"` // 首字延迟 p95(秒)
-	TokPerSec      float64 `json:"tok_per_sec"`
-	Tokens         int64   `json:"tokens"`
-	CostUSD        float64 `json:"cost_usd"`
-	Err4xx         int64   `json:"err_4xx"`
-	Err5xx         int64   `json:"err_5xx"`
-	ErrTimeout     int64   `json:"err_timeout"`
-	ErrOther       int64   `json:"err_other"`
-	LatHist        []int64 `json:"lat_hist"`  // 总延迟分布:≤1/≤2/≤5/≤10/≤30/≤60/>60 秒
-	TtftHist       []int64 `json:"ttft_hist"` // 首字延迟分布:≤.5/≤1/≤2/≤5/≤10/>10 秒
+	// The ttft_* JSON names are retained for compatibility. Values are FRT:
+	// NewAPI's first observed data event, not a verified model-token TTFT.
+	TtftP50 float64 `json:"ttft_p50"` // FRT p50(秒)
+	TtftP95 float64 `json:"ttft_p95"` // FRT p95(秒)
+	TtftP99 float64 `json:"ttft_p99"` // FRT p99(秒)
+	// TtftObserved 只统计有有效 FRT 的 type=2 请求；TtftOver3s 是严格
+	// 超过 3000ms 的精确计数，不能从 2~5s 直方图桶反推。
+	TtftObserved  int64   `json:"ttft_observed"`
+	TtftOver3s    int64   `json:"ttft_over_3s"`
+	TtftOver3sPct float64 `json:"ttft_over_3s_pct"`
+	// Canonical FRT aliases. The ttft_* names above remain for API compatibility.
+	FRTP50       float64 `json:"frt_p50"`
+	FRTP95       float64 `json:"frt_p95"`
+	FRTP99       float64 `json:"frt_p99"`
+	FRTObserved  int64   `json:"frt_observed"`
+	FRTOver3s    int64   `json:"frt_over_3s"`
+	FRTOver3sPct float64 `json:"frt_over_3s_pct"`
+	TokPerSec    float64 `json:"tok_per_sec"`
+	Tokens       int64   `json:"tokens"`
+	CostUSD      float64 `json:"cost_usd"`
+	Err4xx       int64   `json:"err_4xx"`
+	Err5xx       int64   `json:"err_5xx"`
+	ErrTimeout   int64   `json:"err_timeout"`
+	ErrOther     int64   `json:"err_other"`
+	LatHist      []int64 `json:"lat_hist"`  // 总延迟分布:≤1/≤2/≤5/≤10/≤30/≤60/>60 秒
+	TtftHist     []int64 `json:"ttft_hist"` // FRT 分布:≤.5/≤1/≤2/≤5/≤10/>10 秒
+	FRTHist      []int64 `json:"frt_hist"`
 }
 
 // Row 是某维度取值(分组 / 渠道 / 模型)在窗口内的指标行,含迷你趋势与健康色标。
@@ -1109,30 +1144,43 @@ type Row struct {
 	AnomalyRate float64 `json:"anomaly_rate"`
 	ErrorRate   float64 `json:"error_rate"`
 	// 交付异常明细(B 类):三项互斥、之和 = Anomaly;金额只含 B1(零输出却已扣费)。
-	AnomalyBilled  int64       `json:"anomaly_billed"`
-	AnomalyFree    int64       `json:"anomaly_free"`
-	AnomalyStream  int64       `json:"anomaly_stream"`
-	AnomalyCostUSD float64     `json:"anomaly_cost_usd"`
-	AnomalyAvgWait float64     `json:"anomaly_avg_wait"` // 秒;用户白等多久
-	QPS            float64     `json:"qps"`
-	AvgLatency     float64     `json:"avg_latency"`
-	MaxLatency     int         `json:"max_latency"`
-	P50            float64     `json:"p50"`
-	P95            float64     `json:"p95"`
-	P99            float64     `json:"p99"`
-	TtftP50        float64     `json:"ttft_p50"`
-	TtftP95        float64     `json:"ttft_p95"`
-	TokPerSec      float64     `json:"tok_per_sec"`
-	Tokens         int64       `json:"tokens"`
-	CostUSD        float64     `json:"cost_usd"`
-	Err4xx         int64       `json:"err_4xx"`
-	Err5xx         int64       `json:"err_5xx"`
-	ErrTimeout     int64       `json:"err_timeout"`
-	ErrOther       int64       `json:"err_other"`
-	Health         string      `json:"health"`
-	ErrorHealth    string      `json:"error_health"`  // 仅请求错误判级；Health 仍兼容异常成簇提示。
-	AnomalyBurst   bool        `json:"anomaly_burst"` // 异常成簇(连续/突增),需要关注
-	Spark          []TimePoint `json:"spark"`         // 该维度最近若干分钟桶的成功/异常/失败,供迷你趋势
+	AnomalyBilled  int64   `json:"anomaly_billed"`
+	AnomalyFree    int64   `json:"anomaly_free"`
+	AnomalyStream  int64   `json:"anomaly_stream"`
+	AnomalyCostUSD float64 `json:"anomaly_cost_usd"`
+	AnomalyAvgWait float64 `json:"anomaly_avg_wait"` // 秒;用户白等多久
+	QPS            float64 `json:"qps"`
+	AvgLatency     float64 `json:"avg_latency"`
+	MaxLatency     int     `json:"max_latency"`
+	P50            float64 `json:"p50"`
+	P95            float64 `json:"p95"`
+	P99            float64 `json:"p99"`
+	// Legacy ttft_* JSON names are FRT (first observed data event), not a
+	// verified first valid model token.
+	TtftP50       float64 `json:"ttft_p50"`
+	TtftP95       float64 `json:"ttft_p95"`
+	TtftP99       float64 `json:"ttft_p99"`
+	TtftObserved  int64   `json:"ttft_observed"`
+	TtftOver3s    int64   `json:"ttft_over_3s"`
+	TtftOver3sPct float64 `json:"ttft_over_3s_pct"`
+	// Canonical FRT aliases. The ttft_* names above remain for API compatibility.
+	FRTP50       float64     `json:"frt_p50"`
+	FRTP95       float64     `json:"frt_p95"`
+	FRTP99       float64     `json:"frt_p99"`
+	FRTObserved  int64       `json:"frt_observed"`
+	FRTOver3s    int64       `json:"frt_over_3s"`
+	FRTOver3sPct float64     `json:"frt_over_3s_pct"`
+	TokPerSec    float64     `json:"tok_per_sec"`
+	Tokens       int64       `json:"tokens"`
+	CostUSD      float64     `json:"cost_usd"`
+	Err4xx       int64       `json:"err_4xx"`
+	Err5xx       int64       `json:"err_5xx"`
+	ErrTimeout   int64       `json:"err_timeout"`
+	ErrOther     int64       `json:"err_other"`
+	Health       string      `json:"health"`
+	ErrorHealth  string      `json:"error_health"`  // 仅请求错误判级；Health 仍兼容异常成簇提示。
+	AnomalyBurst bool        `json:"anomaly_burst"` // 异常成簇(连续/突增),需要关注
+	Spark        []TimePoint `json:"spark"`         // 该维度最近若干分钟桶的成功/异常/失败,供迷你趋势
 }
 
 // TimePoint 是某分钟桶的成功 / 异常 / 失败计数,用于趋势与迷你图(sparkline)。
@@ -1193,30 +1241,36 @@ type CompareStat struct {
 
 // Snapshot 是一次完整看板快照:总览 + 分组 / 渠道 / 模型 / 令牌明细 + 趋势 + SLO + 同比环比。
 type Snapshot struct {
-	LocalSnapshotOnly   bool                      `json:"local_snapshot_only"`
-	View                string                    `json:"view"`
-	FinalizationDelayed bool                      `json:"finalization_delayed"`
-	WindowFromTs        int64                     `json:"window_from_ts"`
-	WindowToTs          int64                     `json:"window_to_ts"`
-	WindowMinutes       int                       `json:"window_minutes"`
-	GeneratedAt         string                    `json:"generated_at"`
-	SamplingActive      bool                      `json:"sampling_active"`
-	DataAgeSec          int64                     `json:"data_age_sec"`
-	DataComplete        bool                      `json:"data_complete"`
-	CoverageFromTs      int64                     `json:"coverage_from_ts,omitempty"`
-	CoverageToTs        int64                     `json:"coverage_to_ts,omitempty"`
-	Summary             Summary                   `json:"summary"`
-	ByGroup             []Row                     `json:"by_group"`
-	ByChannel           []Row                     `json:"by_channel"`
-	ByModel             []Row                     `json:"by_model"`
-	DimensionLimits     map[string]DimensionLimit `json:"dimension_limits,omitempty"`
-	ByToken             []TokenRow                `json:"by_token"`
-	Trend               []TimePoint               `json:"trend"`
-	SLO                 SLOStatus                 `json:"slo"`
-	Compare             CompareStat               `json:"compare"`
-	CompareAvailable    bool                      `json:"compare_available"`
-	Rejections          []RejectionRow            `json:"rejections"`     // 前置拒绝(采集器旁路采集,logs 盲区)
-	RejectEnabled       bool                      `json:"reject_enabled"` // 超管是否开启「被拒请求」面板
+	LocalSnapshotOnly   bool   `json:"local_snapshot_only"`
+	View                string `json:"view"`
+	FinalizationDelayed bool   `json:"finalization_delayed"`
+	WindowFromTs        int64  `json:"window_from_ts"`
+	WindowToTs          int64  `json:"window_to_ts"`
+	WindowMinutes       int    `json:"window_minutes"`
+	GeneratedAt         string `json:"generated_at"`
+	SamplingActive      bool   `json:"sampling_active"`
+	DataAgeSec          int64  `json:"data_age_sec"`
+	DataComplete        bool   `json:"data_complete"`
+	// RequestsComplete and TTFTComplete are intentionally separate. A request
+	// window may be fully finalized while historical rows still lack the exact
+	// TTFT projection; that must not be exposed as a fast-request result.
+	RequestsComplete bool                      `json:"requests_complete"`
+	TTFTComplete     bool                      `json:"ttft_complete"`
+	FRTComplete      bool                      `json:"frt_complete"`
+	CoverageFromTs   int64                     `json:"coverage_from_ts,omitempty"`
+	CoverageToTs     int64                     `json:"coverage_to_ts,omitempty"`
+	Summary          Summary                   `json:"summary"`
+	ByGroup          []Row                     `json:"by_group"`
+	ByChannel        []Row                     `json:"by_channel"`
+	ByModel          []Row                     `json:"by_model"`
+	DimensionLimits  map[string]DimensionLimit `json:"dimension_limits,omitempty"`
+	ByToken          []TokenRow                `json:"by_token"`
+	Trend            []TimePoint               `json:"trend"`
+	SLO              SLOStatus                 `json:"slo"`
+	Compare          CompareStat               `json:"compare"`
+	CompareAvailable bool                      `json:"compare_available"`
+	Rejections       []RejectionRow            `json:"rejections"`     // 前置拒绝(采集器旁路采集,logs 盲区)
+	RejectEnabled    bool                      `json:"reject_enabled"` // 超管是否开启「被拒请求」面板
 }
 
 // attachSpark 给每行挂上对应维度取值的分钟桶时序。Spark 还用于
@@ -1284,6 +1338,55 @@ func rate(success, total int64) float64 {
 	return float64(success) / float64(total) * 100
 }
 
+// clearTTFT removes the projection from a snapshot when its independent
+// coverage proof is incomplete.  Request facts remain available, but callers
+// must not mistake a partial/legacy TTFT histogram for a complete fast-request
+// distribution.  The model-statistics and stability endpoints apply the same
+// rule in their renderers.
+func clearTTFT(summary *Summary, rows ...[]Row) {
+	if summary != nil {
+		summary.TtftP50 = 0
+		summary.TtftP95 = 0
+		summary.TtftP99 = 0
+		summary.TtftObserved = 0
+		summary.TtftOver3s = 0
+		summary.TtftOver3sPct = 0
+		summary.TtftHist = []int64{}
+		summary.FRTHist = []int64{}
+		summary.FRTP50, summary.FRTP95, summary.FRTP99 = 0, 0, 0
+		summary.FRTObserved, summary.FRTOver3s, summary.FRTOver3sPct = 0, 0, 0
+	}
+	for _, group := range rows {
+		for i := range group {
+			group[i].TtftP50 = 0
+			group[i].TtftP95 = 0
+			group[i].TtftP99 = 0
+			group[i].TtftObserved = 0
+			group[i].TtftOver3s = 0
+			group[i].TtftOver3sPct = 0
+			group[i].FRTP50, group[i].FRTP95, group[i].FRTP99 = 0, 0, 0
+			group[i].FRTObserved, group[i].FRTOver3s, group[i].FRTOver3sPct = 0, 0, 0
+		}
+	}
+}
+
+// syncSnapshotFRTAliases publishes the canonical FRT vocabulary while keeping
+// historical ttft_* JSON names for existing clients. The values are sourced
+// from other.frt and therefore do not claim first-valid-token semantics.
+func syncSnapshotFRTAliases(summary *Summary, rows ...[]Row) {
+	if summary != nil {
+		summary.FRTP50, summary.FRTP95, summary.FRTP99 = summary.TtftP50, summary.TtftP95, summary.TtftP99
+		summary.FRTObserved, summary.FRTOver3s, summary.FRTOver3sPct = summary.TtftObserved, summary.TtftOver3s, summary.TtftOver3sPct
+		summary.FRTHist = append([]int64(nil), summary.TtftHist...)
+	}
+	for _, group := range rows {
+		for i := range group {
+			group[i].FRTP50, group[i].FRTP95, group[i].FRTP99 = group[i].TtftP50, group[i].TtftP95, group[i].TtftP99
+			group[i].FRTObserved, group[i].FRTOver3s, group[i].FRTOver3sPct = group[i].TtftObserved, group[i].TtftOver3s, group[i].TtftOver3sPct
+		}
+	}
+}
+
 type snapshotCacheKey struct {
 	Minutes  int
 	Observed bool
@@ -1344,12 +1447,25 @@ func (m *Monitor) computeSnapshotForScope(windowMinutes int, nowUnix int64, obse
 	}
 	since := until - int64(windowMinutes)*60
 	windowSec := float64(windowMinutes) * 60
-	coverageComplete := validCoverage && coverage.CoverageFromTs <= since && coverage.NextTs >= until
+	requestsComplete := validCoverage && coverage.CoverageFromTs <= since && coverage.NextTs >= until
+	ttftComplete := validCoverage && coverage.TTFTSemanticsVersion == ttftCoverageSemanticsVersion &&
+		coverage.TTFTCoverageFromTs > 0 && coverage.TTFTCoverageFromTs <= since && coverage.TTFTCoverageThroughTs >= until
+	if ttftComplete {
+		// A newly-created/current finalize row can coexist with historical
+		// minute rows written before the TTFT columns existed. Inspect the rows
+		// themselves so that the watermark cannot certify missing samples.
+		ttftComplete = capacityTTFTRowsComplete(context.Background(), m.storeDB, since, until)
+	}
+	// DataComplete keeps the historical combined meaning used by the page,
+	// while the two component flags let callers distinguish a complete request
+	// window from an incomplete TTFT projection. TTFT is never inferred as
+	// complete merely because request facts are complete.
+	coverageComplete := requestsComplete && ttftComplete
 	coverageFrom, coverageTo := coverage.CoverageFromTs, min(coverage.NextTs, until)
 	if !validCoverage {
 		coverageFrom, coverageTo = 0, 0
 	}
-	if !coverageComplete && !observed {
+	if !requestsComplete && !observed {
 		lastBucket := m.storeFreshness()
 		age := int64(-1)
 		if lastBucket > 0 {
@@ -1360,7 +1476,8 @@ func (m *Monitor) computeSnapshotForScope(windowMinutes int, nowUnix int64, obse
 			View:              view, WindowFromTs: since, WindowToTs: until,
 			WindowMinutes: windowMinutes, GeneratedAt: time.Unix(nowUnix, 0).Format("2006-01-02 15:04:05"),
 			SamplingActive: age >= 0 && m.LastSampleRun() > nowUnix-int64(m.cfg.SampleSeconds)*3,
-			DataAgeSec:     age, DataComplete: false, CoverageFromTs: coverageFrom, CoverageToTs: coverageTo,
+			DataAgeSec:     age, DataComplete: false, RequestsComplete: false, TTFTComplete: false,
+			CoverageFromTs: coverageFrom, CoverageToTs: coverageTo,
 			// The dashboard renders these fields even while a historical coverage
 			// migration is in progress. Keep the JSON collection contract stable:
 			// [] means "no publishable rows yet"; null is not a collection and used
@@ -1456,6 +1573,11 @@ func (m *Monitor) computeSnapshotForScope(windowMinutes int, nowUnix int64, obse
 		}
 	}
 	sum.WindowMinutes = windowMinutes
+	publishedTTFTComplete := ttftComplete && !observed
+	if !publishedTTFTComplete {
+		clearTTFT(sum, grp, ch, md)
+	}
+	syncSnapshotFRTAliases(sum, grp, ch, md)
 
 	return &Snapshot{
 		LocalSnapshotOnly: m.cfg.LocalSnapshotOnly,
@@ -1468,6 +1590,9 @@ func (m *Monitor) computeSnapshotForScope(windowMinutes int, nowUnix int64, obse
 		SamplingActive:   liveAvailable && m.LastSampleRun() > nowUnix-int64(m.cfg.SampleSeconds)*3,
 		DataAgeSec:       age,
 		DataComplete:     coverageComplete && !observed,
+		RequestsComplete: requestsComplete && !observed,
+		TTFTComplete:     publishedTTFTComplete,
+		FRTComplete:      publishedTTFTComplete,
 		CoverageFromTs:   coverageFrom,
 		CoverageToTs:     coverageTo,
 		Summary:          *sum,

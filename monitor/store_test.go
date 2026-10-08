@@ -182,6 +182,70 @@ func TestStoreAggregation(t *testing.T) {
 	}
 }
 
+// TestStoreTTFTExactCounters verifies that the legacy summary/dimension
+// aggregation carries the source-exact TTFT counters instead of trying to
+// infer the strict 3000ms boundary from the coarse (2s,5s] histogram bucket.
+// A request at exactly 3000ms is therefore represented with over_3s=0;
+// only the explicitly marked >3000ms observation increments the counter.
+func TestStoreTTFTExactCounters(t *testing.T) {
+	m := newTestMonitor(t)
+	const bucket = 1_700_000_000 / 60 * 60
+	if err := m.upsertSamples([]MetricSample{
+		{BucketTs: bucket, ChannelID: 1, ModelName: "ttft-boundary", Grp: "g",
+			Success: 1, Ttft5k: 1, TtftMaxMs: 3000, TtftObserved: 1, TtftOver3s: 0},
+		{BucketTs: bucket, ChannelID: 2, ModelName: "ttft-boundary", Grp: "g",
+			Success: 1, Ttft5k: 1, TtftMaxMs: 3001, TtftObserved: 1, TtftOver3s: 1},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	sum, err := m.storeSummary(bucket-60, 900)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sum.TtftObserved != 2 || sum.TtftOver3s != 1 {
+		t.Fatalf("旧 summary 必须保留精确 TTFT 计数: observed=%d over3s=%d", sum.TtftObserved, sum.TtftOver3s)
+	}
+	if want := 50.0; !approx(sum.TtftOver3sPct, want) {
+		t.Fatalf("严格超过 3000ms 占比错误: got=%v want=%v", sum.TtftOver3sPct, want)
+	}
+	rows, err := m.storeDim("model_name", bucket-60, 900)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0].TtftObserved != 2 || rows[0].TtftOver3s != 1 || !approx(rows[0].TtftOver3sPct, 50) {
+		t.Fatalf("维度汇总必须与旧 summary 使用同一严格口径: %+v", rows)
+	}
+}
+
+// TestStoreTTFTHistogramWithoutObservedIsUnknown guards the upgrade boundary:
+// rows written before the exact TTFT counter existed can retain histogram
+// values while ttft_observed remains zero.  Such rows must not produce
+// fabricated P50/P95 values from the legacy histogram.
+func TestStoreTTFTHistogramWithoutObservedIsUnknown(t *testing.T) {
+	m := newTestMonitor(t)
+	const bucket = 1_700_000_000 / 60 * 60
+	if err := m.upsertSamples([]MetricSample{{
+		BucketTs: bucket, ChannelID: 1, ModelName: "legacy-ttft", Grp: "g",
+		Success: 1, Ttft5k: 4, TtftMaxMs: 4900,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	sum, err := m.storeSummary(bucket-60, 900)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sum.TtftObserved != 0 || sum.TtftP50 != 0 || sum.TtftP95 != 0 || sum.TtftOver3s != 0 || sum.TtftOver3sPct != 0 {
+		t.Fatalf("历史 observed=0 行不能产生 TTFT 数值: observed=%d p50=%v p95=%v over3s=%d pct=%v", sum.TtftObserved, sum.TtftP50, sum.TtftP95, sum.TtftOver3s, sum.TtftOver3sPct)
+	}
+	rows, err := m.storeDim("model_name", bucket-60, 900)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0].TtftObserved != 0 || rows[0].TtftP50 != 0 || rows[0].TtftP95 != 0 {
+		t.Fatalf("历史 observed=0 行维度视图不能产生 TTFT 数值: %+v", rows)
+	}
+}
+
 func TestSnapshotWithoutFactsCannotReportSamplingActive(t *testing.T) {
 	m := newTestMonitor(t)
 	now := int64(1_800_000_000)

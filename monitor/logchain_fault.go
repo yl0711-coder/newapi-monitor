@@ -340,17 +340,14 @@ type logChainFault struct {
 // 降到最低。证据不完整时仍保留 unknown，绝不为了凑覆盖率硬猜。
 func logChainAttributeFaultWithEvidence(r LogChainRow, tags []string) logChainFault {
 	f := logChainAttributeFault(r, tags)
-	// 已验证的入口 499 是比本地耗时启发式更强的事实：Nginx 明确记录
-	// 客户先关闭了连接。必须允许它覆盖“等待过久疑似上游”的第一层结果。
-	// 其它证据只在第一层仍待判时补齐，避免弱证据覆盖更强的语义规则。
-	if r.Type == 2 && r.EdgeEvidenceVerified && r.EdgeEvidence != nil && r.EdgeEvidence.UpstreamStatus >= 500 {
-		f = logChainFault{Fault: faultUpstream, Confidence: faultConfHigh,
-			Why: "已验证入口日志显示模型上游返回 HTTP " + strconv.Itoa(r.EdgeEvidence.UpstreamStatus) + "，失败发生在上游"}
+	// Nginx 的 upstream_status 是 NewAPI 的 HTTP 状态，不是模型供应商的。
+	// type=2 的流错误/断连耗时也不能单独证明供应商责任；已验证入口
+	// 任一 5xx 与它们并存时保持待判。真正的供应商关联目前只附到 type=5。
+	if r.Type == 2 && r.EdgeEvidenceVerified && r.EdgeEvidence != nil &&
+		r.EdgeEvidence.UpstreamStatus >= 500 {
+		f = logChainEdgeNewAPIErrorUnknownFault(r.EdgeEvidence)
 	} else if r.Type == 2 && r.EdgeEvidenceVerified && r.EdgeEvidence != nil && r.EdgeEvidence.Status >= 500 {
-		// 入口 502/503/504 可能是 Nginx 自身故障，也可能是连接上游失败；
-		// 没有 upstream_status 时不能把客户断连或本地启发式当成根因。
-		f = logChainFault{Fault: faultUnknown, Confidence: faultConfNone,
-			Why: "已验证入口日志显示 HTTP " + strconv.Itoa(r.EdgeEvidence.Status) + "，但没有上游状态；可能是入口故障，也可能是连接上游失败，当前证据不足以定责"}
+		f = logChainEdgeGatewayErrorUnknownFault(r.EdgeEvidence)
 	} else if logChainVerifiedClientDisconnect(r) {
 		f = logChainVerifiedClientDisconnectFault()
 	} else if f.Fault == faultUnknown {
@@ -360,12 +357,31 @@ func logChainAttributeFaultWithEvidence(r LogChainRow, tags []string) logChainFa
 	return f
 }
 
+func logChainEdgeNewAPIErrorUnknownFault(e *LogChainEdgeEvidence) logChainFault {
+	return logChainFault{Fault: faultUnknown, Confidence: faultConfNone,
+		Why: "已验证入口日志显示 Nginx 的上游 NewAPI 返回 HTTP " + strconv.Itoa(e.UpstreamStatus) +
+			"（入口 HTTP " + strconv.Itoa(e.Status) + "）；这不是模型供应商的 HTTP 状态，无法区分 NewAPI 自身故障与模型供应商错误"}
+}
+
+func logChainEdgeGatewayErrorUnknownFault(e *LogChainEdgeEvidence) logChainFault {
+	if e.UpstreamStatus > 0 {
+		return logChainFault{Fault: faultUnknown, Confidence: faultConfNone,
+			Why: "已验证入口日志显示 Nginx 返回 HTTP " + strconv.Itoa(e.Status) +
+				"，NewAPI 返回 HTTP " + strconv.Itoa(e.UpstreamStatus) +
+				"；两层状态不一致，不能仅凭入口状态判断模型供应商或我方责任"}
+	}
+	return logChainFault{Fault: faultUnknown, Confidence: faultConfNone,
+		Why: "已验证入口日志显示 HTTP " + strconv.Itoa(e.Status) +
+			"，但没有 NewAPI 状态；可能是 Nginx 入口故障，也可能是连接 NewAPI 失败，当前证据不足以定责"}
+}
+
 func logChainVerifiedClientDisconnect(r LogChainRow) bool {
 	if !r.EdgeEvidenceVerified || r.EdgeEvidence == nil || r.Type != 2 {
 		return false
 	}
 	e := r.EdgeEvidence
-	if r.StreamErrorCount > 0 || e.UpstreamStatus >= 500 {
+	// 入口或 NewAPI 同时记录 5xx 时，关闭连接不能单独证明是客户造成失败。
+	if r.StreamErrorCount > 0 || e.Status >= 500 || e.UpstreamStatus >= 500 {
 		return false
 	}
 	if e.Status == 499 {
@@ -439,16 +455,11 @@ func logChainRefineUnknownFault(r LogChainRow, f logChainFault) logChainFault {
 			return logChainFault{Fault: faultDownstream, Confidence: faultConfHigh,
 				Why: "已验证入口日志记录客户端提前断开（HTTP 499/连接关闭），不是上游返回错误"}
 		}
-		if e.Status >= 500 && e.UpstreamStatus == 0 {
-			// 502/503/504 在 Nginx 没来得及写 upstream_status 时，既可能是
-			// 入口自身故障，也可能是连接上游/读取上游失败。没有 completion
-			// 等更细事实时不能把它硬判成“我们的问题”。
-			return logChainFault{Fault: faultUnknown, Confidence: faultConfNone,
-				Why: "已验证入口日志显示 HTTP " + strconv.Itoa(e.Status) + "，但没有上游状态；可能是入口故障，也可能是连接上游失败，当前证据不足以定责"}
-		}
 		if e.UpstreamStatus >= 500 {
-			return logChainFault{Fault: faultUpstream, Confidence: faultConfHigh,
-				Why: "已验证入口日志显示模型上游返回 HTTP " + strconv.Itoa(e.UpstreamStatus) + "，失败发生在上游"}
+			return logChainEdgeNewAPIErrorUnknownFault(e)
+		}
+		if e.Status >= 500 {
+			return logChainEdgeGatewayErrorUnknownFault(e)
 		}
 		if e.Status >= 400 && e.Status < 500 && e.Status != 499 && e.UpstreamStatus == 0 {
 			return logChainFault{Fault: faultOurs, Confidence: faultConfMid,
@@ -479,10 +490,20 @@ func logChainHumanFaultReason(r LogChainRow, f logChainFault) string {
 		// 已验证的入口状态码是比 FRT 启发式更强的事实。即使这一行同时
 		// 命中“未交付未扣费”，也要把 HTTP 状态写出来，不能退回成泛化的
 		// “没有交付内容”或误报为响应链路偏慢。
-		if f.Fault == faultUnknown && r.EdgeEvidenceVerified && r.EdgeEvidence != nil &&
-			r.EdgeEvidence.Status >= 400 && r.EdgeEvidence.UpstreamStatus == 0 {
-			return "已验证入口日志显示 HTTP " + strconv.Itoa(r.EdgeEvidence.Status) +
-				"，但没有上游状态；可能是入口故障，也可能是连接上游失败，当前证据不足以定责"
+		if f.Fault == faultUnknown && r.EdgeEvidenceVerified && r.EdgeEvidence != nil {
+			e := r.EdgeEvidence
+			if e.UpstreamStatus >= 500 {
+				return "入口日志显示 NewAPI 返回 HTTP " + strconv.Itoa(e.UpstreamStatus) +
+					"（入口 HTTP " + strconv.Itoa(e.Status) + "）；无法确定是 NewAPI 自身出错，还是模型供应商错误被它转发"
+			}
+			if e.Status >= 500 {
+				if e.UpstreamStatus > 0 {
+					return "入口日志显示 Nginx 返回 HTTP " + strconv.Itoa(e.Status) +
+						"，NewAPI 返回 HTTP " + strconv.Itoa(e.UpstreamStatus) + "；两层状态不一致，当前不能确定故障在哪一层"
+				}
+				return "已验证入口日志显示 HTTP " + strconv.Itoa(e.Status) +
+					"，但没有 NewAPI 状态；可能是 Nginx 入口故障，也可能是连接 NewAPI 失败，当前证据不足以定责"
+			}
 		}
 		if r.EndReason == logChainClientGoneEndReason {
 			if f.Fault == faultDownstream {

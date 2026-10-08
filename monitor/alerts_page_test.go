@@ -170,6 +170,58 @@ func TestAlertsCoverageNoteDoesNotHideNearThresholdGap(t *testing.T) {
 	}
 }
 
+// The alert endpoint must expose the source and watermarks separately from
+// the partial count.  A failed/half-caught-up direct lane is never allowed to
+// look like a complete zero (or a complete legacy total) to the UI.
+func TestAlertsStructuredCoverageIsFailClosed(t *testing.T) {
+	m := newTestMonitor(t)
+	defer m.Close()
+	now := time.Date(2026, 9, 22, 12, 34, 45, 0, time.UTC)
+	m.cfg.CloudWatchPreRouteEnabled = true
+	m.cfg.CloudWatchPreRouteLookbackHours = 168
+	from, target := cloudWatchPreRouteRange(now, m.cfg.CloudWatchPreRouteLookbackHours)
+	m.cloudWatchPreRouteFrom.Store(from)
+	m.cloudWatchPreRouteThrough.Store(target - 60)
+	partial := m.alertsCoverage(stabilityScope{FromTs: target - 3600, ToTs: target}, now)
+	if partial.Complete || partial.Source != "cloudwatch" || partial.Through != target-60 || partial.Target != target {
+		t.Fatalf("partial coverage=%+v", partial)
+	}
+	complete := m.alertsCoverage(stabilityScope{FromTs: target - 3600, ToTs: target - 60}, now)
+	if !complete.Complete || complete.Source != "cloudwatch" || complete.Through != target-60 || complete.Target != target {
+		t.Fatalf("complete coverage=%+v", complete)
+	}
+	legacy := m.alertsCoverage(stabilityScope{FromTs: from - 3600, ToTs: from}, now)
+	if legacy.Complete || legacy.Source != "collector" {
+		t.Fatalf("legacy-only range must remain fail-closed: %+v", legacy)
+	}
+	if !strings.Contains(string(alertsJS), "数据不完整") || !strings.Contains(pageHTML, `id="alCoverageWarning"`) {
+		t.Fatal("alerts UI lacks a prominent incomplete-coverage warning")
+	}
+}
+
+func TestAlertsCoverageMarksCloudWatchLegacyMixIncomplete(t *testing.T) {
+	m := newTestMonitor(t)
+	defer m.Close()
+	now := time.Date(2026, 9, 22, 12, 34, 45, 0, time.UTC)
+	m.cfg.CloudWatchPreRouteEnabled = true
+	m.cfg.CloudWatchPreRouteLookbackHours = 168
+	from, target := cloudWatchPreRouteRange(now, m.cfg.CloudWatchPreRouteLookbackHours)
+	m.cloudWatchPreRouteFrom.Store(from)
+	m.cloudWatchPreRouteThrough.Store(target)
+	// user_id=0 cannot be used to prove that a legacy row and a direct row are
+	// the same request.  Even with a caught-up direct watermark, their coexistence
+	// must be surfaced as mixed/incomplete rather than a complete CloudWatch view.
+	if err := m.storeDB.Create(&RejectionSample{
+		BucketTs: target - 60, Node: "legacy", Reason: "no_channel", Model: "m", Grp: "g", UserID: 0, Count: 1,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	coverage := m.alertsCoverage(stabilityScope{FromTs: target - 3600, ToTs: target}, now)
+	if coverage.Complete || coverage.Source != "mixed" || coverage.Note == "" {
+		t.Fatalf("CloudWatch + legacy (user_id=0) must be mixed/incomplete: %+v", coverage)
+	}
+}
+
 // canonical 与旧 collector reason 必须共享同一套身份文案：user_id=0
 // 只有 invalid_token 能确定为未鉴权，其余（包括 canonical reason）都是
 // 日志未提供用户 ID 的客户未知，不能在页面上误称为未鉴权。

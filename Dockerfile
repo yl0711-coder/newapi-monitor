@@ -23,12 +23,16 @@ COPY go.mod go.sum ./
 # module cache HTTP 容器，并在 Docker internal network 中完成不可发外的构建。
 ARG GOPROXY=https://goproxy.cn,direct
 ARG GOSUMDB=sum.golang.google.cn
+ARG VCS_REF=unknown
+ARG IMAGE_VERSION=unknown
 RUN GOPROXY="$GOPROXY" GOSUMDB="$GOSUMDB" go mod download
 COPY . .
 # glebarez/modernc 纯 Go sqlite,无需 CGO,静态编译;main 在模块根。
 # 产物输出到 /app —— 不能用 /build/monitor:源码里有 monitor/ 目录,COPY . . 后 /build/monitor 已是目录,
 # go build -o 到已存在目录会把二进制塞进去,导致产物变成目录、容器 ENTRYPOINT 报 "is a directory"。
-RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /app .
+RUN CGO_ENABLED=0 GOOS=linux go build -trimpath \
+      -ldflags="-s -w -X github.com/yl0711-coder/newapi-monitor/monitor.BuildGitSHA=${VCS_REF} -X github.com/yl0711-coder/newapi-monitor/monitor.BuildImageVersion=${IMAGE_VERSION}" \
+      -o /app .
 
 # ---- 运行阶段(最小镜像)----
 FROM ${RUNTIME_IMAGE} AS runtime
@@ -44,7 +48,9 @@ RUN if [ "$OFFLINE_RUNTIME" = "true" ]; then \
       && apk add --no-cache ca-certificates tzdata; \
     fi
 ARG VCS_REF=unknown
+ARG IMAGE_VERSION=unknown
 LABEL org.opencontainers.image.revision="$VCS_REF"
+LABEL org.opencontainers.image.version="$IMAGE_VERSION"
 WORKDIR /app
 COPY --from=builder /app /app/monitor
 # 运行用户只需要写 /data、独立备份卷 /backup 和短期证据卷 /evidence。二进制与 /app 保持 root 所有且只读，

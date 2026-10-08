@@ -533,6 +533,13 @@ func (m *Monitor) loadOrExtendStabilityProblemLiveCursor(requestedFrom, requeste
 	if err != nil {
 		return nil, err
 	}
+	// Keep the request window visible to /ready.  The durable cursor supplies
+	// the actual through watermark; the requested bounds are not treated as
+	// proof of coverage until the cursor advances to them.
+	m.problemSourceFrom.Store(requestedFrom)
+	if requestedTo > m.problemSourceTarget.Load() {
+		m.problemSourceTarget.Store(requestedTo)
+	}
 	m.problemLiveThrough.Store(result.NextTs)
 	if result.LastSuccessAt > 0 {
 		m.problemLastSuccess.Store(result.LastSuccessAt)

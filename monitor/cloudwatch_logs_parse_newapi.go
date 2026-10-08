@@ -334,7 +334,15 @@ func cwNewAPIModelContext(message string) string {
 		cwModelNotFoundContext, cwModelNotFoundAfter, cwModelNotFoundAfterZH,
 	} {
 		if match := pattern.FindStringSubmatch(message); len(match) == 2 {
-			return strings.TrimSpace(match[1])
+			model := strings.TrimSpace(match[1])
+			// NewAPI may quote a model in an English error sentence, e.g.
+			// model '<name>' does not exist. Only paired outer quotes are
+			// syntax; cwBusinessLabel still rejects unpaired/internal quotes,
+			// unsafe characters and secret-looking model values.
+			if len(model) >= 2 && model[0] == '\'' && model[len(model)-1] == '\'' {
+				model = model[1 : len(model)-1]
+			}
+			return model
 		}
 	}
 	return ""

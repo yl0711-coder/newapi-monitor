@@ -575,7 +575,7 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
 <link rel="stylesheet" href="/capacity.css?v=2">
 <link rel="stylesheet" href="/group-governance.css?v=1">
 <link rel="stylesheet" href="/finance.css?v=14">
-<link rel="stylesheet" href="/model-statistics.css?v=2">
+<link rel="stylesheet" href="/model-statistics.css?v=3">
 </head>
 <body theme-mode="dark">
 <div class="monitor-shell">
@@ -739,7 +739,7 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
   <div class="card-header">⏱ 延迟分布</div>
   <div style="padding:16px 20px;display:flex;gap:24px;flex-wrap:wrap">
     <div style="flex:1;min-width:300px"><div class="muted" style="font-size:12px;margin-bottom:6px">总延迟(秒)</div><div id="latHist" style="width:100%;height:180px"></div></div>
-    <div style="flex:1;min-width:300px"><div class="muted" style="font-size:12px;margin-bottom:6px">首字 TTFT(秒)</div><div id="ttftHist" style="width:100%;height:180px"></div></div>
+    <div style="flex:1;min-width:300px"><div class="muted" style="font-size:12px;margin-bottom:6px">首个数据事件延迟（FRT，秒）</div><div id="ttftHist" style="width:100%;height:180px"></div></div>
   </div>
 </div>
 
@@ -923,7 +923,7 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
 
 <div class="tabpane model-statistics-page" id="tab-model-statistics" hidden>
   <div class="ms-toolbar">
-    <div><h2>模型统计</h2><p>按模型请求次数排行；展开模型查看分组，再点分组查看客户请求次数和占比；无可用渠道的模型请求也会计入。</p></div>
+    <div><h2>模型统计</h2><p>按模型请求次数排行；展开模型查看分组、FRT，再点分组查看渠道 FRT 和客户请求次数；FRT P95 超过 3 秒或 FRT 超过 3 秒的请求会标红。FRT 页面按有效样本显示 P50/P95，统计区间以接口实际 from/to 为准。</p></div>
     <div class="ms-range" role="group" aria-label="模型统计时间范围">
       <button type="button" data-ms-window="24h" class="active">近24小时</button>
       <button type="button" data-ms-window="3d">近3天</button>
@@ -1323,6 +1323,7 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
   </div>
 
   <!-- 采集覆盖提示：0 条既可能是没问题，也可能是采集器没跑，必须说清是哪种。 -->
+  <div id="alCoverageWarning" class="lc-alert" hidden role="alert"></div>
   <div id="alNotes" class="lc-notes" hidden></div>
 
   <div class="card lc-card">
@@ -1469,16 +1470,16 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
   </main>
 </div><!-- /monitor-shell -->
 
-<script src="/stability.js?v=6"></script>
+<script src="/stability.js?v=7"></script>
 <script src="/channel-data-status.js?v=2"></script>
 <script src="/channel-management.js?v=17"></script>
-<script src="/logchain.js?v=15"></script>
+<script src="/logchain.js?v=16"></script>
 <script src="/customer-health.js?v=3"></script>
 <script src="/alerts.js?v=1"></script>
 <script src="/capacity.js?v=2"></script>
 <script src="/group-governance.js?v=1"></script>
 <script src="/finance.js?v=54"></script>
-<script src="/model-statistics.js?v=3"></script>
+<script src="/model-statistics.js?v=5"></script>
 <script src="/infra-assets.js?v=1"></script>
 <script src="/ecs-log-sources.js?v=1"></script>
 <script>
@@ -1497,6 +1498,11 @@ const fmtQPS=v=>(v||0).toFixed(3);
 const esc=s=>String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const fmtAge=s=>s<0?'无数据':(s<90?Math.round(s)+' 秒前':(s<5400?Math.round(s/60)+' 分钟前':(s/3600).toFixed(1)+' 小时前'));
 const latClass=s=>s>=60?'lat-bad':(s>=20?'lat-warn':'');
+// FRT (first data event latency) has an independent, strict 3-second
+// threshold.  Do not reuse total-request latency thresholds here: exactly
+// 3.0s is within the limit and must not be marked as slow.
+const frtClass=s=>{const v=Number(s);return Number.isFinite(v)&&v>3?'lat-bad':''};
+const frtColor=s=>frtClass(s)==='lat-bad'?'#ef4444':'#94a3b8';
 const dotClass=h=>h==='good'?'dot-g':(h==='warn'?'dot-y':(h==='bad'?'dot-r':'dot-x'));
 // undTip 交付异常的悬浮明细:三项拆分 + 平均白等时长。
 function undTip(r){
@@ -1561,6 +1567,9 @@ function renderBanner(s){
   else if(bad.length){cls='bad';txt=`<span class="dot dot-r"></span> ${bad.length} 项错误`}
   else if(warn.length){cls='warn';txt=`<span class="dot dot-y"></span> ${warn.length} 项波动`}
   else{cls='ok';txt='<span class="dot dot-g"></span> 运行正常'}
+  if(s.view!=='observed' && s.requests_complete===true && s.frt_complete!==true && s.ttft_complete!==true){
+    txt+='<span class="muted" style="font-weight:400;font-size:13px;margin-left:10px">· 请求事实已完整；FRT 尚未完整，缺失 FRT 样本不按快速请求计算</span>';
+  }
   // 顶部横幅只报"达门槛"的条数(不然低频异常天天挂在标题上,横幅就没意义了),
   // 观察区列的是更宽的 watch 集合,两者故意不同源。
   const flagged=undelivFlagged(s);
@@ -1656,6 +1665,7 @@ function renderUndeliv(rows,flaggedKeys){
 }
 const fmtTok=v=>v>=1?Math.round(v)+' tok/s':(v?v.toFixed(1)+' tok/s':'—');
 const fmtTtft=v=>v>0?fmtLat(v):'—';
+const frtField=(obj,key)=>{const canonical=obj?.['frt_'+key];return canonical!==undefined&&canonical!==null?Number(canonical):Number(obj?.['ttft_'+key]||0)};
 const clock=ts=>{const d=new Date(ts*1000);return String(d.getHours()).padStart(2,'0')+':'+String(d.getMinutes()).padStart(2,'0');};
 // 从该行的分钟桶序列里,挑出"有异常或错误"的桶——用于行内时间跨度 + 展开逐分钟明细。
 function problemBuckets(spark){ return (spark||[]).filter(p=>p.anomaly>0||p.failed>0); }
@@ -1675,7 +1685,7 @@ function problemDetail(spark){   // 展开:逐分钟桶 + 各自异常/错误次
     return `<span class="tb"><b>${clock(p.ts)}</b>${s}</span>`;
   }).join('');
 }
-function renderSummary(s,complete=false){
+function renderSummary(s,complete=false,ttftComplete=false){
   s=s||{};
   const hasRequests=Number.isFinite(s.total)&&s.total>0;
   const unknown=!hasRequests&&!(complete&&s.total===0);
@@ -1688,12 +1698,13 @@ function renderSummary(s,complete=false){
     ['交付异常',fmtNum(s.anomaly),s.anomaly>0?'#f59e0b':'#10b981',
       [s.total?`${(s.anomaly_rate||0).toFixed(2)}%`:'',s.anomaly_cost_usd>0?`已扣 ${fmtUSD(s.anomaly_cost_usd)}`:''].filter(Boolean).join(' · ')],
     ['错误',fmtNum(s.failed),s.failed>0?'#ef4444':'#10b981',s.total?`${(s.error_rate||0).toFixed(2)}%`:''],
-    ['首字 TTFT p95',fmtTtft(s.ttft_p95),s.ttft_p95>=5?'#ef4444':(s.ttft_p95>=2?'#f59e0b':'#94a3b8')],
+    ['首个数据事件延迟（FRT）P95',fmtTtft(frtField(s,'p95')),frtColor(frtField(s,'p95'))],
     ['出字速度',fmtTok(s.tok_per_sec),'#6366f1'],
     ['消费',fmtUSD(s.cost_usd),'#f59e0b']];
   document.getElementById('summary').innerHTML=c.map(([l,v,col,sub])=>{
     if(unknown){v='—';col='#94a3b8';sub='暂无请求事实，区间完整性未确认'}
-    else if(!hasRequests&&['成功率','首字 TTFT p95','出字速度'].includes(l)){v='—';col='#94a3b8';sub='区间已定稿，无请求样本'}
+    else if(!hasRequests&&['成功率','首个数据事件延迟（FRT）P95','出字速度'].includes(l)){v='—';col='#94a3b8';sub='区间已定稿，无请求样本'}
+    else if(l==='首个数据事件延迟（FRT）P95'&&!ttftComplete){v='—';col='#94a3b8';sub='FRT 覆盖未完整，缺失样本不按快速请求计算'}
     else if(!complete){sub=[sub,'仅已采集记录，区间尚未完整'].filter(Boolean).join(' · ')}
     return `<div class="stat-card"><div class="stat-label">${l}</div><div class="stat-value num" style="color:${col}">${v}</div>${sub?`<div class="stat-sub num">${sub}</div>`:''}</div>`;
   }).join('');
@@ -1701,8 +1712,8 @@ function renderSummary(s,complete=false){
 function dimensionLimitNotice(meta){
   return meta?.truncated===true?`<tr><td colspan="9" class="muted" style="padding:12px">仅显示消费排序前 ${esc(meta.limit)} 项；总览与总趋势包含全部记录，当前明细不是完整合计。</td></tr>`:'';
 }
-const HEAD=`<tr><th>名称</th><th>趋势</th><th class="right">请求</th><th>稳定性</th><th class="right">首字p95</th><th class="right">出字</th><th class="right">延迟 p95/max</th><th>交付异常/错误</th><th class="right">消费</th></tr>`;
-function renderTable(th,tb,rows,meta){
+const HEAD=`<tr><th>名称</th><th>趋势</th><th class="right">请求</th><th>稳定性</th><th class="right">FRT P95</th><th class="right">出字</th><th class="right">延迟 p95/max</th><th>交付异常/错误</th><th class="right">消费</th></tr>`;
+function renderTable(th,tb,rows,meta,ttftComplete=false){
   document.getElementById(th).innerHTML=HEAD;
   const e=document.getElementById(tb);
   if(!rows||!rows.length){e.innerHTML=`<tr><td colspan="9" class="muted" style="text-align:center;padding:24px">窗口内暂无数据</td></tr>`;return}
@@ -1714,12 +1725,12 @@ function renderTable(th,tb,rows,meta){
     <td>${sparkSVG(r.spark)}</td>
     <td class="right num">${fmtNum(r.total)}</td>
     <td>${healthBadge(r.health,r.success_rate)}</td>
-    <td class="right num ${latClass(r.ttft_p95)}">${fmtTtft(r.ttft_p95)}</td>
+    <td class="right num ${ttftComplete?frtClass(frtField(r,'p95')):''}">${ttftComplete?fmtTtft(frtField(r,'p95')):'<span class="muted" title="FRT覆盖未完整">—</span>'}</td>
     <td class="right num">${fmtTok(r.tok_per_sec)}</td>
     <td class="right num"><span class="${latClass(r.p95)}">${fmtLat(r.p95)}</span> / <span class="${latClass(r.max_latency)}">${r.max_latency||0}s</span></td>
     <td class="emix">${(r.failed||r.anomaly)?errMix(r):'<span class="muted">—</span>'}</td>
     <td class="right num">${fmtUSD(r.cost_usd)}</td></tr>
-    <tr class="drill" style="display:${open?'':'none'}"><td colspan="9" style="background:var(--bg);padding:0">${drillDetail(r,dimension)}</td></tr>`;
+    <tr class="drill" style="display:${open?'':'none'}"><td colspan="9" style="background:var(--bg);padding:0">${drillDetail(r,dimension,ttftComplete)}</td></tr>`;
   }).join('');
 }
 const TOKHEAD=`<tr><th>Key / 用户</th><th class="right">请求</th><th>稳定性</th><th class="right">交付异常</th><th class="right">错误</th><th class="right">Tokens</th><th class="right">消费</th></tr>`;
@@ -1855,9 +1866,9 @@ function barOption(labels,data,colors){
     yAxis:{type:'value',minInterval:1,axisLabel:{color:'#94a3b8',fontSize:11},splitLine:{lineStyle:{color:'#2a2d3e'}}},
     series:[{type:'bar',barWidth:'62%',data:data.map((v,i)=>({value:v,itemStyle:{color:colors[i],borderRadius:[3,3,0,0]}}))}]};
 }
-function renderLatHist(sum){
+function renderLatHist(sum,ttftComplete=false){
   sum=sum||{};
-  const lat=sum.lat_hist||[],ttft=sum.ttft_hist||[];
+  const lat=sum.lat_hist||[],ttft=ttftComplete?(sum.frt_hist||sum.ttft_hist||[]):[];
   const card=document.getElementById('latCard');
   if(lat.reduce((a,b)=>a+b,0)+ttft.reduce((a,b)=>a+b,0)===0){card.style.display='none';return}
   card.style.display='';
@@ -1874,12 +1885,12 @@ function toggleDrill(el){
   if(drill&&drill.classList.contains('drill'))drill.style.display=open?'':'none';
   const arrow=el.querySelector('.drill-arrow');if(arrow)arrow.textContent=open?'▼':'▶';
 }
-function drillDetail(r,dimension){
+function drillDetail(r,dimension,ttftComplete=false){
   const et=errText(r),det=problemDetail(r.spark);
   const ctx=btoa(unescape(encodeURIComponent(JSON.stringify({[dimension]:r.key||r.label,days:7}))));
   const actions=dimension?`<div class="monitor-cross-actions"><button type="button" onclick="event.stopPropagation();monitorOpenEncoded('stability','${ctx}')">查看历史稳定性 →</button>${dimension==='channel'?`<button type="button" onclick="event.stopPropagation();monitorOpenEncoded('channels','${ctx}')">查看渠道资料 →</button>`:''}</div>`:'';
   return `<div class="attn-detail" style="padding:8px 14px 10px 32px;flex-direction:column;gap:6px">
-    <div><span class="muted">延迟</span> p50 ${fmtLat(r.p50)} · p95 ${fmtLat(r.p95)} · p99 ${fmtLat(r.p99)} · max ${r.max_latency||0}s · 首字p95 ${fmtTtft(r.ttft_p95)}</div>
+    <div><span class="muted">延迟</span> p50 ${fmtLat(r.p50)} · p95 ${fmtLat(r.p95)} · p99 ${fmtLat(r.p99)} · max ${r.max_latency||0}s · FRT P95 ${ttftComplete?`<span class="${frtClass(frtField(r,'p95'))}">${fmtTtft(frtField(r,'p95'))}</span>`:'<span class="muted">—（FRT未完整）</span>'}</div>
     ${et?`<div><span class="muted">错误构成</span> ${et}</div>`:''}
     ${r.anomaly>0?`<div><span class="muted">交付异常构成</span> ${undTip(r)}${r.anomaly_cost_usd>0?` · <b style="color:var(--red)">已扣 ${fmtUSD(r.anomaly_cost_usd)}</b>`:''}</div>`:''}
     <div><span class="muted">异常/错误时间</span> ${det||'<span style="color:var(--green)">窗口内无异常分钟</span>'}</div>${actions}</div>`;
@@ -1905,7 +1916,7 @@ function drawTrend(points){
 function apply(s){
   const observed=s.view==='observed';
   document.getElementById('genAt').textContent='生成于 '+s.generated_at+' · '+(observed?'实时观察':'已定稿')+'区间 '+syncTime(s.window_from_ts)+' 至 '+syncTime(s.window_to_ts||s.coverage_to_ts)+' · 窗口 '+s.window_minutes+' 分钟';
-  if(s.data_complete===false&&!observed){
+  if(s.data_complete===false&&!observed&&s.requests_complete!==true){
     renderBanner(s);
     document.getElementById('summary').innerHTML='<div class="card"><span class="muted">该时间窗口的新口径数据尚未形成连续覆盖，补齐前不展示部分金额、成功率或趋势。</span></div>';
     document.getElementById('attnList').innerHTML='<div class="attn-empty">数据补齐中，暂不判定错误与波动</div>';
@@ -1921,9 +1932,16 @@ function apply(s){
     lastTrend=[];drawTrend([]);
     return;
   }
-  renderBanner(s);renderSummary(s.summary,s.data_complete===true);renderSLO(s.slo);renderCompare(s.compare_available?s.compare:null);renderLatHist(s.summary);lastTrend=s.trend||[];drawTrend(lastTrend);
+  const requestsComplete=s.requests_complete===true||(s.requests_complete===undefined&&s.data_complete===true);
+  // FRT has an independent coverage watermark. Legacy responses that do not
+  // expose it must remain unknown; data_complete only proves request facts
+  // and cannot be used to infer first-data-event coverage. The ttft_* key
+  // names are retained for API compatibility, but their source is other.frt,
+  // not a verified first valid model token.
+  const ttftComplete=s.frt_complete===true||(s.frt_complete===undefined&&s.ttft_complete===true);
+  renderBanner(s);renderSummary(s.summary,requestsComplete,ttftComplete);renderSLO(s.slo);renderCompare(s.compare_available?s.compare:null);renderLatHist(s.summary,ttftComplete);lastTrend=s.trend||[];drawTrend(lastTrend);
   if(observed)document.getElementById('sloCard').style.display='none';
-  renderTable('thGroup','tbGroup',s.by_group,s.dimension_limits?.group);renderTable('thChannel','tbChannel',s.by_channel,s.dimension_limits?.channel);renderTable('thModel','tbModel',s.by_model,s.dimension_limits?.model);
+  renderTable('thGroup','tbGroup',s.by_group,s.dimension_limits?.group,ttftComplete);renderTable('thChannel','tbChannel',s.by_channel,s.dimension_limits?.channel,ttftComplete);renderTable('thModel','tbModel',s.by_model,s.dimension_limits?.model,ttftComplete);
   renderTokens(s.by_token);
   renderRejections(s.rejections, s.reject_enabled);
 }

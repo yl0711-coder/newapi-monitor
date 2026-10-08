@@ -74,6 +74,94 @@ func TestCapacityCoverageControlsZerosAndAverages(t *testing.T) {
 	}
 }
 
+func TestCapacityTTFTCoverageChecksExactCountersSeparately(t *testing.T) {
+	m := newTestMonitor(t)
+	ctx := context.Background()
+	metric := MetricSample{BucketTs: 120, ChannelID: 1, ModelName: "m", Grp: "g", Success: 1,
+		Ttft5k: 1, TtftObserved: 1, TtftMaxMs: 5000, TtftOver3s: 1}
+	user := CapacityUserMinuteSample{BucketTs: 120, UserID: 7, ChannelID: 1, ModelName: "m", Grp: "g", Success: 1}
+	if err := m.storeDB.Create(&MetricFinalizeState{ID: 1, CoverageFromTs: 60, NextTs: 180, SemanticsVersion: stabilityTrafficClassificationVersion}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := m.storeDB.Create(&metric).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := m.storeDB.Create(&user).Error; err != nil {
+		t.Fatal(err)
+	}
+	if !m.capacityWindowComplete(ctx, 60, 180, true) {
+		t.Fatal("request facts should remain complete when only TTFT projection differs")
+	}
+	if capacityTTFTProjectionComplete(ctx, m.storeDB, 60, 180) {
+		t.Fatal("TTFT projection mismatch was incorrectly certified")
+	}
+	if err := m.storeDB.Model(&CapacityUserMinuteSample{}).Where("user_id = ?", 7).Updates(map[string]any{
+		"ttft_5k": 1, "ttft_observed": 1, "ttft_max_ms": 5000, "ttft_over_3s": 1,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if !capacityTTFTProjectionComplete(ctx, m.storeDB, 60, 180) {
+		t.Fatal("matching exact TTFT projection was rejected")
+	}
+}
+
+func TestCapacityTTFTCoverageChecksMaxAndHighestBucket(t *testing.T) {
+	m := newTestMonitor(t)
+	ctx := context.Background()
+	state := MetricFinalizeState{ID: 1, CoverageFromTs: 60, NextTs: 180, SemanticsVersion: stabilityTrafficClassificationVersion}
+	if err := m.storeDB.Create(&state).Error; err != nil {
+		t.Fatal(err)
+	}
+	metric := MetricSample{BucketTs: 120, ChannelID: 1, ModelName: "m", Grp: "g", Success: 1,
+		Ttft5k: 1, TtftObserved: 1, TtftMaxMs: 5000, TtftOver3s: 1}
+	user := CapacityUserMinuteSample{BucketTs: 120, UserID: 7, ChannelID: 1, ModelName: "m", Grp: "g", Success: 1,
+		Ttft5k: 1, TtftObserved: 1, TtftMaxMs: 5000, TtftOver3s: 1}
+	if err := m.storeDB.Create(&metric).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := m.storeDB.Create(&user).Error; err != nil {
+		t.Fatal(err)
+	}
+	if !capacityTTFTProjectionComplete(ctx, m.storeDB, 60, 180) {
+		t.Fatal("matching max/highest bucket projection rejected")
+	}
+	if err := m.storeDB.Model(&CapacityUserMinuteSample{}).Where("user_id = ?", 7).Update("ttft_max_ms", 4500).Error; err != nil {
+		t.Fatal(err)
+	}
+	if capacityTTFTProjectionComplete(ctx, m.storeDB, 60, 180) {
+		t.Fatal("max discrepancy was incorrectly certified")
+	}
+	if err := m.storeDB.Model(&CapacityUserMinuteSample{}).Where("user_id = ?", 7).Updates(map[string]any{
+		"ttft_max_ms": 5000, "ttft_5k": 0, "ttft_2k": 1,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if capacityTTFTProjectionComplete(ctx, m.storeDB, 60, 180) {
+		t.Fatal("highest non-zero histogram bucket discrepancy was incorrectly certified")
+	}
+}
+
+func TestCapacityTTFTRowsRejectInconsistentMaxAndHistogram(t *testing.T) {
+	m := newTestMonitor(t)
+	ctx := context.Background()
+	row := MetricSample{BucketTs: 120, ChannelID: 1, ModelName: "m", Grp: "g", Success: 1,
+		Ttft5k: 1, TtftObserved: 1, TtftMaxMs: 5001}
+	if err := m.storeDB.Create(&row).Error; err != nil {
+		t.Fatal(err)
+	}
+	if capacityTTFTRowsComplete(ctx, m.storeDB, 60, 180) {
+		t.Fatal("max outside highest non-zero bucket was incorrectly accepted")
+	}
+	if err := m.storeDB.Model(&MetricSample{}).Where("bucket_ts = ?", 120).Updates(map[string]any{
+		"ttft_5k": 0, "ttft_max_ms": 0, "ttft_observed": 0,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if !capacityTTFTRowsComplete(ctx, m.storeDB, 60, 180) {
+		t.Fatal("a zero FRT observation row should be valid when all counters are zero")
+	}
+}
+
 func TestCapacitySeriesGapsKeepPartialBucketDuration(t *testing.T) {
 	points := capacitySeriesWithGaps(nil, 120, 660, 300)
 	if len(points) != 3 || points[0].DurationMinutes != 3 || points[1].DurationMinutes != 5 || points[2].DurationMinutes != 1 {

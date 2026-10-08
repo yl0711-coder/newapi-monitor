@@ -114,7 +114,7 @@ body{max-width:none!important;margin:0!important;padding:0!important;overflow-x:
 .stability-filters label{display:flex;flex-direction:column;gap:5px;color:#748096;font-size:11px}.stability-filters select{width:100%;min-width:0;padding:9px 10px;border:1px solid #343e51;border-radius:8px;background:#181e2a;color:#dfe5ef;outline:none}.stability-filters select:focus{border-color:#7469f4}
 .stability-filter-actions{display:flex;align-items:flex-end;gap:7px}
 
-.stability-kpis{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:11px;margin-bottom:14px}
+.stability-kpis{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:11px;margin-bottom:14px}
 .stability-kpi{min-height:116px;border:1px solid var(--st-border);border-radius:12px;background:var(--st-surface);padding:16px 17px}.stability-kpi small{display:block;color:#7f8ba0;font-size:11px}.stability-kpi b{display:block;font-size:27px;line-height:1;margin:14px 0 8px;font-variant-numeric:tabular-nums}.stability-kpi em{font-size:11px;color:#778399;font-style:normal}.stability-kpi b.good{color:var(--st-good)}.stability-kpi b.warn{color:var(--st-warn)}.stability-kpi b.bad{color:var(--st-bad)}
 
 .stability-panel{border:1px solid var(--st-border);border-radius:12px;background:var(--st-surface);overflow:hidden;margin-bottom:14px}

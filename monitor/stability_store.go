@@ -40,6 +40,19 @@ type StabilityHourSample struct {
 	Err5xx              int64 `gorm:"column:err_5xx"`
 	ErrTimeout          int64 `gorm:"column:err_timeout"`
 	ErrOther            int64 `gorm:"column:err_other"`
+	// Legacy ttft_* columns are the exact first-data delay (FRT) projection from
+	// source other.frt. FRT proves that NewAPI observed a data row, not that a valid model token
+	// was delivered, so it remains separate from delivery and use_time facts.
+	Ttft500              int64 `gorm:"column:ttft_500"`
+	Ttft1k               int64 `gorm:"column:ttft_1k"`
+	Ttft2k               int64 `gorm:"column:ttft_2k"`
+	Ttft5k               int64 `gorm:"column:ttft_5k"`
+	Ttft10k              int64 `gorm:"column:ttft_10k"`
+	TtftInf              int64 `gorm:"column:ttft_inf"`
+	TtftMaxMs            int   `gorm:"column:ttft_max_ms"`
+	TtftObserved         int64 `gorm:"column:ttft_observed"`
+	TtftOver3s           int64 `gorm:"column:ttft_over_3s"`
+	TTFTSemanticsVersion int   `gorm:"column:ttft_semantics_version;index"`
 }
 
 func (s *StabilityHourSample) BeforeCreate(_ *gorm.DB) error {
@@ -277,12 +290,14 @@ func (m *Monitor) rollupStabilityHours(sinceTs int64) error {
 		hour_ts, channel_id, model_name, grp, success, anomaly, failed,
 		anomaly_billed, anomaly_free, anomaly_stream, anomaly_quota,
 		sum_use_time, max_use_time, tokens, quota, refund_records, refund_quota, err_4xx, err_5xx, err_timeout, err_other,
-		traffic_class_version)
+		ttft_500, ttft_1k, ttft_2k, ttft_5k, ttft_10k, ttft_inf, ttft_max_ms, ttft_observed, ttft_over_3s,
+		traffic_class_version, ttft_semantics_version)
 		SELECT (bucket_ts/3600)*3600 AS hour_ts, channel_id, model_name, grp,
 		  SUM(success), SUM(anomaly), SUM(failed),
 		  SUM(anomaly_billed), SUM(anomaly_free), SUM(anomaly_stream), SUM(anomaly_quota),
 		  SUM(sum_use_time), MAX(max_use_time), SUM(tokens), SUM(quota), SUM(refund_records), SUM(refund_quota),
-		  SUM(err_4xx), SUM(err_5xx), SUM(err_timeout), SUM(err_other), ?
+		  SUM(err_4xx), SUM(err_5xx), SUM(err_timeout), SUM(err_other),
+		  SUM(ttft_500), SUM(ttft_1k), SUM(ttft_2k), SUM(ttft_5k), SUM(ttft_10k), SUM(ttft_inf), MAX(ttft_max_ms), SUM(ttft_observed), SUM(ttft_over_3s), ?, MIN(COALESCE(ttft_semantics_version,0))
 		FROM metric_samples WHERE bucket_ts >= ? AND traffic_class_version = ?
 		  AND NOT EXISTS (
 		    SELECT 1 FROM stability_hour_ingest_states hs
@@ -299,7 +314,11 @@ func (m *Monitor) rollupStabilityHours(sinceTs int64) error {
 		  err_4xx=excluded.err_4xx, err_5xx=excluded.err_5xx,
 		  err_timeout=excluded.err_timeout, err_other=excluded.err_other,
 		  refund_records=excluded.refund_records, refund_quota=excluded.refund_quota,
-		  traffic_class_version=excluded.traffic_class_version`,
+		  ttft_500=excluded.ttft_500, ttft_1k=excluded.ttft_1k, ttft_2k=excluded.ttft_2k,
+		  ttft_5k=excluded.ttft_5k, ttft_10k=excluded.ttft_10k, ttft_inf=excluded.ttft_inf,
+		  ttft_max_ms=excluded.ttft_max_ms, ttft_observed=excluded.ttft_observed, ttft_over_3s=excluded.ttft_over_3s,
+		  traffic_class_version=excluded.traffic_class_version,
+		  ttft_semantics_version=excluded.ttft_semantics_version`,
 			stabilityTrafficClassificationVersion, sinceTs, stabilityTrafficClassificationVersion, stabilityTrafficClassificationVersion).Error; err != nil {
 			return err
 		}

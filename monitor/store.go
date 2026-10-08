@@ -94,7 +94,8 @@ type MetricSample struct {
 	// 出字速度用:成功请求的输出 token 数之和(tok/s = CompletionTokens / SumUseTime)。
 	CompletionTokens int64 `gorm:"column:completion_tokens"`
 
-	// 首字延迟 TTFT 直方图(成功且 frt>0,单位【毫秒】),用于近似 p50/p95。
+	// Legacy ttft_* histogram columns store FRT (the first observed data event)
+	// from other.frt, not a verified first valid model token. Values are in ms.
 	Ttft500   int64 `gorm:"column:ttft_500"`    // (0,500ms]
 	Ttft1k    int64 `gorm:"column:ttft_1k"`     // (500,1000]
 	Ttft2k    int64 `gorm:"column:ttft_2k"`     // (1000,2000]
@@ -102,6 +103,15 @@ type MetricSample struct {
 	Ttft10k   int64 `gorm:"column:ttft_10k"`    // (5000,10000]
 	TtftInf   int64 `gorm:"column:ttft_inf"`    // (10000,+∞)
 	TtftMaxMs int   `gorm:"column:ttft_max_ms"` // 最大 frt(ms),用于分位末档收尾
+	// TtftObserved 是有有效首字耗时(FRT>0)的 type=2 请求数；
+	// TtftOver3s 是严格超过 3000ms 的精确计数。直方图的 2~5s 桶无法
+	// 单独推导 3s 阈值，因此两项均由来源 SQL 直接聚合。
+	TtftObserved int64 `gorm:"column:ttft_observed"`
+	TtftOver3s   int64 `gorm:"column:ttft_over_3s"`
+	// TTFTSemanticsVersion is zero on rows written before the exact TTFT
+	// projection was introduced.  Such rows are never treated as fast; the
+	// coverage layer must re-read them from the source first.
+	TTFTSemanticsVersion int `gorm:"column:ttft_semantics_version;index"`
 }
 
 // CapacityUserMinuteSample 是容量/RPM 查询专用的最小用户分钟事实。
@@ -127,17 +137,32 @@ type CapacityUserMinuteSample struct {
 	Tokens                int64 `gorm:"column:tokens"`
 	Quota                 int64 `gorm:"column:quota"`
 	RefundQuota           int64 `gorm:"column:refund_quota"`
+	// 首字延迟 TTFT 直方图沿用 MetricSample 的 6 档(单位毫秒)。
+	// 只有 FRT>0 的 type=2 请求进入有效样本数；没有 FRT 的请求不进入分母。
+	Ttft500              int64 `gorm:"column:ttft_500"`
+	Ttft1k               int64 `gorm:"column:ttft_1k"`
+	Ttft2k               int64 `gorm:"column:ttft_2k"`
+	Ttft5k               int64 `gorm:"column:ttft_5k"`
+	Ttft10k              int64 `gorm:"column:ttft_10k"`
+	TtftInf              int64 `gorm:"column:ttft_inf"`
+	TtftMaxMs            int   `gorm:"column:ttft_max_ms"`
+	TtftObserved         int64 `gorm:"column:ttft_observed"`
+	TtftOver3s           int64 `gorm:"column:ttft_over_3s"`
+	TTFTSemanticsVersion int   `gorm:"column:ttft_semantics_version;index"`
 }
 
 // CustomerHealthSourceCursor 是客户维护责任方口径回算的本地持久水位。
 // 只有对应范围的用户分钟事实已成功提交后才推进；进程/隧道重连后从这里回放
 // 最近窗口，而不是重新扫描当天全部生产日志。
 type CustomerHealthSourceCursor struct {
-	ID               uint  `gorm:"primaryKey;autoIncrement:false"`
-	DayTs            int64 `gorm:"column:day_ts"`
-	ThroughTs        int64 `gorm:"column:through_ts"`
-	SemanticsVersion int   `gorm:"column:semantics_version"`
-	UpdatedAt        int64 `gorm:"column:updated_at"`
+	ID                    uint  `gorm:"primaryKey;autoIncrement:false"`
+	DayTs                 int64 `gorm:"column:day_ts"`
+	ThroughTs             int64 `gorm:"column:through_ts"`
+	SemanticsVersion      int   `gorm:"column:semantics_version"`
+	TTFTSemanticsVersion  int   `gorm:"column:ttft_semantics_version"`
+	TTFTCoverageFromTs    int64 `gorm:"column:ttft_coverage_from_ts"`
+	TTFTCoverageThroughTs int64 `gorm:"column:ttft_coverage_through_ts"`
+	UpdatedAt             int64 `gorm:"column:updated_at"`
 }
 
 func (s *CapacityUserMinuteSample) BeforeCreate(_ *gorm.DB) error {
@@ -147,12 +172,8 @@ func (s *CapacityUserMinuteSample) BeforeCreate(_ *gorm.DB) error {
 	if s.CustomerHealthVersion == 0 {
 		s.CustomerHealthVersion = customerHealthStabilityPolicyVersion
 	}
-	return nil
-}
-
-func (s *MetricSample) BeforeCreate(_ *gorm.DB) error {
-	if s.TrafficClassVersion == 0 {
-		s.TrafficClassVersion = stabilityTrafficClassificationVersion
+	if s.TTFTSemanticsVersion == 0 {
+		s.TTFTSemanticsVersion = ttftCoverageSemanticsVersion
 	}
 	return nil
 }
@@ -177,21 +198,68 @@ type TokenSample struct {
 // a low-frequency closed-window pass catch those late rows without widening
 // every realtime query or replaying a large range after each restart.
 type MetricFinalizeState struct {
-	ID                   uint   `gorm:"primaryKey;autoIncrement:false"`
-	NextTs               int64  `gorm:"column:next_ts"`
-	TargetThroughTs      int64  `gorm:"column:target_through_ts"`
-	CoverageFromTs       int64  `gorm:"column:coverage_from_ts"`
-	SemanticsVersion     int    `gorm:"column:semantics_version;index"`
-	HourCoverageFromTs   int64  `gorm:"column:hour_coverage_from_ts"`
-	HourCoverageToTs     int64  `gorm:"column:hour_coverage_to_ts"`
-	HourSemanticsVersion int    `gorm:"column:hour_semantics_version;index"`
-	Status               string `gorm:"size:24"`
-	Attempts             int
-	NextRetryAt          int64  `gorm:"column:next_retry_at"`
-	LastSuccessAt        int64  `gorm:"column:last_success_at"`
-	LastFailureAt        int64  `gorm:"column:last_failure_at"`
-	LastError            string `gorm:"size:512;column:last_error"`
-	UpdatedAt            int64  `gorm:"index;column:updated_at"`
+	ID                    uint   `gorm:"primaryKey;autoIncrement:false"`
+	NextTs                int64  `gorm:"column:next_ts"`
+	TargetThroughTs       int64  `gorm:"column:target_through_ts"`
+	CoverageFromTs        int64  `gorm:"column:coverage_from_ts"`
+	SemanticsVersion      int    `gorm:"column:semantics_version;index"`
+	TTFTSemanticsVersion  int    `gorm:"column:ttft_semantics_version;index"`
+	TTFTCoverageFromTs    int64  `gorm:"column:ttft_coverage_from_ts"`
+	TTFTCoverageThroughTs int64  `gorm:"column:ttft_coverage_through_ts"`
+	HourCoverageFromTs    int64  `gorm:"column:hour_coverage_from_ts"`
+	HourCoverageToTs      int64  `gorm:"column:hour_coverage_to_ts"`
+	HourSemanticsVersion  int    `gorm:"column:hour_semantics_version;index"`
+	Status                string `gorm:"size:24"`
+	Attempts              int
+	NextRetryAt           int64  `gorm:"column:next_retry_at"`
+	LastSuccessAt         int64  `gorm:"column:last_success_at"`
+	LastFailureAt         int64  `gorm:"column:last_failure_at"`
+	LastError             string `gorm:"size:512;column:last_error"`
+	UpdatedAt             int64  `gorm:"index;column:updated_at"`
+}
+
+// ttftCoverageSemanticsVersion is independent from the traffic classification
+// version.  Bumping the TTFT projection must invalidate only its coverage
+// proof, rather than silently interpreting historical zero-valued columns as
+// observations with a very small latency. Version 2 also records the
+// stream-only FRT rule: rows produced before that rule must be replayed so a
+// non-stream log carrying a stale frt value cannot survive as an FRT sample.
+const ttftCoverageSemanticsVersion = 2
+
+func (s *MetricSample) BeforeCreate(_ *gorm.DB) error {
+	if s.TrafficClassVersion == 0 {
+		s.TrafficClassVersion = stabilityTrafficClassificationVersion
+	}
+	if s.TTFTSemanticsVersion == 0 {
+		s.TTFTSemanticsVersion = ttftCoverageSemanticsVersion
+	}
+	return nil
+}
+
+func (s *MetricFinalizeState) BeforeCreate(_ *gorm.DB) error {
+	if s.TTFTSemanticsVersion == 0 {
+		s.TTFTSemanticsVersion = ttftCoverageSemanticsVersion
+	}
+	if s.TTFTCoverageFromTs == 0 {
+		s.TTFTCoverageFromTs = s.CoverageFromTs
+	}
+	if s.TTFTCoverageThroughTs == 0 {
+		s.TTFTCoverageThroughTs = s.NextTs
+	}
+	return nil
+}
+
+func (s *CustomerHealthSourceCursor) BeforeCreate(_ *gorm.DB) error {
+	if s.TTFTSemanticsVersion == 0 {
+		s.TTFTSemanticsVersion = ttftCoverageSemanticsVersion
+	}
+	if s.TTFTCoverageFromTs == 0 {
+		s.TTFTCoverageFromTs = s.DayTs
+	}
+	if s.TTFTCoverageThroughTs == 0 {
+		s.TTFTCoverageThroughTs = s.ThroughTs
+	}
+	return nil
 }
 
 func (s *TokenSample) BeforeCreate(_ *gorm.DB) error {
@@ -938,7 +1006,7 @@ func (m *Monitor) openStore(path string) error {
 	if err := db.AutoMigrate(
 		&ECSLogSource{}, &ECSLogDiscovery{}, &ECSLogLeaseWindow{}, &ECSLogArchiveReceipt{}, &ECSLogArchiveScan{},
 		&AICodeWithRecordCheckpoint{}, &AICodeWithRecordSeen{},
-		&MetricSample{}, &CapacityUserMinuteSample{}, &CustomerHealthSourceCursor{}, &TokenSample{}, &MetricFinalizeState{}, &HourSample{}, &ChannelSnap{}, &RejectionSample{}, &RejectionIngestBatch{}, &SelectablePair{},
+		&MetricSample{}, &CapacityUserMinuteSample{}, &CustomerHealthSourceCursor{}, &CustomerHealthDayCoverage{}, &TokenSample{}, &MetricFinalizeState{}, &HourSample{}, &ChannelSnap{}, &RejectionSample{}, &RejectionIngestBatch{}, &SelectablePair{},
 		&StabilityHourSample{}, &ChannelTestHourSample{}, &StabilityRejectHour{}, &StabilityProblemSample{},
 		&StabilityProblemIngestState{}, &StabilityProblemStage{}, &StabilityProblemClassificationMigration{}, &StabilityProblemLiveCursor{},
 		&StabilityHourIngestState{}, &StabilityBackfillJob{},
@@ -1362,16 +1430,46 @@ func (m *Monitor) replaceSelectablePairs(pairs []SelectablePair) error {
 }
 
 func (m *Monitor) pruneOlderThan(cutoffTs int64) (int64, error) {
-	r := m.storeDB.Where("bucket_ts < ?", cutoffTs).Delete(&MetricSample{})
-	if r.Error != nil {
-		return r.RowsAffected, r.Error
+	m.customerHealthCursorMu.Lock()
+	defer m.customerHealthCursorMu.Unlock()
+	var removed int64
+	var retained MetricFinalizeState
+	err := m.storeDB.Transaction(func(tx *gorm.DB) error {
+		for _, model := range []any{&MetricSample{}, &CapacityUserMinuteSample{}, &TokenSample{}} {
+			result := tx.Where("bucket_ts < ?", cutoffTs).Delete(model)
+			if result.Error != nil {
+				return result.Error
+			}
+			removed += result.RowsAffected
+		}
+		// A retention delete also removes coverage evidence. Publish the narrower
+		// range in the same transaction so readers cannot certify deleted facts.
+		if err := tx.Model(&MetricFinalizeState{}).Where("id = ?", 1).Updates(map[string]any{
+			"coverage_from_ts":         gorm.Expr("CASE WHEN coverage_from_ts > 0 THEN MAX(coverage_from_ts, ?) ELSE 0 END", cutoffTs),
+			"next_ts":                  gorm.Expr("CASE WHEN coverage_from_ts > 0 THEN MAX(next_ts, ?) ELSE next_ts END", cutoffTs),
+			"ttft_coverage_from_ts":    gorm.Expr("CASE WHEN ttft_coverage_from_ts > 0 THEN MAX(ttft_coverage_from_ts, ?) ELSE 0 END", cutoffTs),
+			"ttft_coverage_through_ts": gorm.Expr("CASE WHEN ttft_coverage_from_ts > 0 THEN MAX(ttft_coverage_through_ts, ?) ELSE ttft_coverage_through_ts END", cutoffTs),
+		}).Error; err != nil {
+			return err
+		}
+		// Day certificates prove a complete prefix from midnight. A partly
+		// deleted day must lose its certificate rather than certify missing rows.
+		if err := tx.Where("day_ts < ?", cutoffTs).Delete(&CustomerHealthDayCoverage{}).Error; err != nil {
+			return err
+		}
+		if err := tx.Where("day_ts < ?", cutoffTs).Delete(&CustomerHealthSourceCursor{}).Error; err != nil {
+			return err
+		}
+		return tx.Where("id = ?", 1).Limit(1).Find(&retained).Error
+	})
+	if err != nil {
+		return 0, err
 	}
-	users := m.storeDB.Where("bucket_ts < ?", cutoffTs).Delete(&CapacityUserMinuteSample{})
-	if users.Error != nil {
-		return r.RowsAffected, users.Error
+	if retained.ID != 0 {
+		m.metricFinalizeFrom.Store(retained.CoverageFromTs)
+		m.metricFinalizeThrough.Store(retained.NextTs)
 	}
-	tokens := m.storeDB.Where("bucket_ts < ?", cutoffTs).Delete(&TokenSample{}) // token 维度一并清理
-	return r.RowsAffected + users.RowsAffected + tokens.RowsAffected, tokens.Error
+	return removed, nil
 }
 
 // upsertRejections 累加一个已经确认是“新批次”的拒绝计数。HTTP 重试幂等由
@@ -1531,6 +1629,10 @@ type aggRow struct {
 	Ttft10k          int64 `gorm:"column:ttft_10k"`
 	TtftInf          int64 `gorm:"column:ttft_inf"`
 	TtftMaxMs        int   `gorm:"column:ttft_max_ms"`
+	// These are source-exact counters.  The 2~5s histogram bucket cannot
+	// determine which observations are strictly over 3000ms.
+	TtftObserved int64 `gorm:"column:ttft_observed"`
+	TtftOver3s   int64 `gorm:"column:ttft_over_3s"`
 }
 
 const aggCols = `
@@ -1556,7 +1658,9 @@ const aggCols = `
   COALESCE(SUM(completion_tokens),0) AS completion_tokens,
   COALESCE(SUM(ttft_500),0) AS ttft_500, COALESCE(SUM(ttft_1k),0) AS ttft_1k, COALESCE(SUM(ttft_2k),0) AS ttft_2k,
   COALESCE(SUM(ttft_5k),0) AS ttft_5k, COALESCE(SUM(ttft_10k),0) AS ttft_10k, COALESCE(SUM(ttft_inf),0) AS ttft_inf,
-  COALESCE(MAX(ttft_max_ms),0) AS ttft_max_ms`
+  COALESCE(MAX(ttft_max_ms),0) AS ttft_max_ms,
+  COALESCE(SUM(ttft_observed),0) AS ttft_observed,
+  COALESCE(SUM(ttft_over_3s),0) AS ttft_over_3s`
 
 func (a aggRow) fill(r *Row, windowSec float64) {
 	typ2 := a.Success + a.Anomaly // 所有计费请求(干净成功 + 异常)
@@ -1589,10 +1693,21 @@ func (a aggRow) fill(r *Row, windowSec float64) {
 	if a.SumUseTime > 0 {
 		r.TokPerSec = float64(a.CompletionTokens) / float64(a.SumUseTime)
 	}
-	// TTFT 首字延迟(直方图单位 ms,展示转秒)
-	ttft := []int64{a.Ttft500, a.Ttft1k, a.Ttft2k, a.Ttft5k, a.Ttft10k, a.TtftInf}
-	r.TtftP50 = percentile(ttft, ttftEdges, a.TtftMaxMs, 50) / 1000
-	r.TtftP95 = percentile(ttft, ttftEdges, a.TtftMaxMs, 95) / 1000
+	// TTFT 首字延迟(直方图单位 ms,展示转秒)。使用与模型统计、稳定性
+	// 汇总相同的精确 >3s 拆桶逻辑；历史行在 TTFT 字段加入前可能只有
+	// 直方图但 observed=0，这类行不会伪造 P50/P95 或“快速请求”。
+	ttftView := computeTTFTMetricView(
+		[6]int64{a.Ttft500, a.Ttft1k, a.Ttft2k, a.Ttft5k, a.Ttft10k, a.TtftInf},
+		a.TtftObserved, a.TtftOver3s, int64(a.TtftMaxMs),
+	)
+	r.TtftObserved = ttftView.Observed
+	r.TtftOver3s = ttftView.Over3s
+	r.TtftOver3sPct = ttftView.Over3sPct
+	if ttftView.HistValid {
+		r.TtftP50 = ttftView.P50Ms / 1000
+		r.TtftP95 = ttftView.P95Ms / 1000
+		r.TtftP99 = ttftView.P99Ms / 1000
+	}
 
 	// 健康由【错误(type=5)】驱动——错误是重点,每条都关注。
 	// 异常(client_gone 等)不在此驱动色标;其"成簇"判定在 GetSnapshot 里按时间序列另行升级为关注。
@@ -1665,11 +1780,14 @@ func (m *Monitor) storeSummaryRangeForScope(since, until int64, windowSec float6
 		AnomalyCostUSD: r.AnomalyCostUSD, AnomalyAvgWait: r.AnomalyAvgWait,
 		QPS: r.QPS, AvgLatency: r.AvgLatency, MaxLatency: r.MaxLatency,
 		P50: r.P50, P95: r.P95, P99: r.P99,
-		TtftP50: r.TtftP50, TtftP95: r.TtftP95, TokPerSec: r.TokPerSec,
-		Tokens: r.Tokens, CostUSD: r.CostUSD,
+		TtftP50: r.TtftP50, TtftP95: r.TtftP95, TtftP99: r.TtftP99,
+		TtftObserved: r.TtftObserved, TtftOver3s: r.TtftOver3s, TtftOver3sPct: r.TtftOver3sPct,
+		TokPerSec: r.TokPerSec,
+		Tokens:    r.Tokens, CostUSD: r.CostUSD,
 		Err4xx: r.Err4xx, Err5xx: r.Err5xx, ErrTimeout: r.ErrTimeout, ErrOther: r.ErrOther,
 		LatHist:  []int64{a.Lat1, a.Lat2, a.Lat5, a.Lat10, a.Lat30, a.Lat60, a.LatInf},
 		TtftHist: []int64{a.Ttft500, a.Ttft1k, a.Ttft2k, a.Ttft5k, a.Ttft10k, a.TtftInf},
+		FRTHist:  []int64{a.Ttft500, a.Ttft1k, a.Ttft2k, a.Ttft5k, a.Ttft10k, a.TtftInf},
 	}, nil
 }
 

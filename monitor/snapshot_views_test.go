@@ -64,6 +64,41 @@ func TestSnapshotFinalizedWindowDoesNotDriftBetweenWorkerRuns(t *testing.T) {
 	}
 }
 
+func TestSnapshotSeparatesRequestAndTTFTCoverage(t *testing.T) {
+	m := newTestMonitor(t)
+	now := int64(1_800_000_000)
+	end := metricFinalizeTarget(now)
+	if err := m.storeDB.Create(&MetricSample{
+		BucketTs: end - 60, ChannelID: 1, ModelName: "m", Grp: "g", Success: 2,
+		Ttft5k: 2, TtftObserved: 2, TtftOver3s: 2, TtftMaxMs: 4500,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := m.storeDB.Create(&MetricFinalizeState{
+		ID: 1, CoverageFromTs: end - 3600, NextTs: end, SemanticsVersion: stabilityTrafficClassificationVersion,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	// Request facts are finalized, but a historical minute row predates the
+	// exact TTFT projection. The snapshot should keep request rows while
+	// clearly marking TTFT as incomplete; callers must not read zero TTFT as a
+	// fast result.
+	if err := m.storeDB.Model(&MetricSample{}).Where("bucket_ts = ?", end-60).
+		Update("ttft_semantics_version", 0).Error; err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := m.computeSnapshot(60, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !snapshot.RequestsComplete || snapshot.TTFTComplete || snapshot.DataComplete || snapshot.Summary.Total != 2 || len(snapshot.ByModel) != 1 {
+		t.Fatalf("request and TTFT coverage were not separated: %+v", snapshot)
+	}
+	if snapshot.Summary.TtftObserved != 0 || snapshot.Summary.TtftP50 != 0 || snapshot.Summary.TtftP95 != 0 || len(snapshot.Summary.TtftHist) != 0 || snapshot.ByModel[0].TtftObserved != 0 {
+		t.Fatalf("TTFT incomplete snapshot must expose unknown values, not partial numbers: %+v", snapshot.Summary)
+	}
+}
+
 func TestSnapshotObservedViewUsesCurrentFactsWithoutClaimingCompleteness(t *testing.T) {
 	m := newTestMonitor(t)
 	now := int64(1_800_000_000)
