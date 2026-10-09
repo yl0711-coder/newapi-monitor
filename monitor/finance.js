@@ -696,7 +696,7 @@
     const count = (value) => Number.isSafeInteger(value) && value >= 0 ? value.toLocaleString('zh-CN') : '—';
     target.innerHTML = rows.map((row) => `<p><b>${esc(row.domain || '未知上游')}</b> · 已发布 ${count(row.published_hours)} 小时`
       + `<br>有业务且已配对 ${count(row.paired_activity_hours)} · 已核验空小时 ${count(row.verified_empty_hours)}`
-      + ` · 成本已采到待归属 ${count(row.unallocated_cost_hours)} · 本地有业务但上游零记录 ${count(row.upstream_zero_check_hours)}`
+      + ` · 成本已采到待归属 ${count(row.unallocated_cost_hours)} · 本站有请求、上游零记录（待核对） ${count(row.upstream_zero_check_hours)}`
       + ` · 其他待核对 ${count(row.other_incomplete_hours)}</p>`).join('')
       + '<p>以上均为小时数，不是请求数。空小时不计作业务配对成功；待归属需核对令牌与渠道的历史关系。上游零记录也可能对应本站未扣费的失败请求，不直接认定丢日志或零成本，需核对账号及同窗日志。重复重算不会自动补齐这两类依据。</p>';
   }

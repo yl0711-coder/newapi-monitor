@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -157,5 +158,102 @@ func TestHistoricalCostRangeKeepsSnapshotAndMissingEvidenceGuards(t *testing.T) 
 	}
 	if historyRangeCount(t, m.storeDB, "channel_cost_source_bindings") != 0 || historyRangeCount(t, m.storeDB, "channel_economics_dirty_hours") != 0 {
 		t.Fatal("read-only preview or denied write changed state")
+	}
+}
+
+func TestHistoricalCostRangeActivityUsesAccountingVersionsAndPositiveRequests(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		version   int
+		requests  int64
+		wantHours int64
+	}{
+		{"compatible v6", 6, 2, 1},
+		{"compatible v7", 7, 2, 1},
+		{"unknown version", 99, 2, 0},
+		{"empty aggregate", 7, 0, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m, in := historyRangeFixture(t)
+			in.ValidFrom, in.ValidTo = historyRangeHour(3600), historyRangeHour(7200)
+			if err := m.storeDB.Model(&StabilityHourSample{}).Where("hour_ts=?", 3600).
+				Updates(map[string]any{"traffic_class_version": tc.version, "success": tc.requests}).Error; err != nil {
+				t.Fatal(err)
+			}
+			if err := m.storeDB.Create(&ChannelTestHourSample{ChannelID: 59, HourTs: 3600, ModelName: "model", Grp: "test", Origin: "scheduled", TrafficClassVersion: tc.version, Requests: tc.requests}).Error; err != nil {
+				t.Fatal(err)
+			}
+			plan, status, err := m.planChannelCostHistoricalBinding(context.Background(), in, "test")
+			if err != nil || status != http.StatusOK || plan.LocalActiveHours != tc.wantHours || plan.LocalTestActiveHours != tc.wantHours {
+				t.Fatalf("unsupported/empty activity must not support a historical candidate: %+v status=%d err=%v", plan, status, err)
+			}
+			wantRequests := tc.requests * tc.wantHours
+			if plan.LocalRequests != wantRequests || plan.LocalTestRequests != wantRequests || plan.EvidenceRequests != 2 || plan.WillQueueHours != 1 {
+				t.Fatal("activity filtering changed evidence or retained unsupported requests", plan)
+			}
+		})
+	}
+}
+
+func TestHistoricalCostRangeSeparatesFailuresWithoutChangingCostEvidence(t *testing.T) {
+	for _, version := range []int{6, 7, 99} {
+		t.Run("v"+strconv.Itoa(version), func(t *testing.T) {
+			m, in := historyRangeFixture(t)
+			in.ValidFrom, in.ValidTo = historyRangeHour(3600), historyRangeHour(7200)
+			if err := m.storeDB.Model(&StabilityHourSample{}).Where("hour_ts=?", 3600).
+				Updates(map[string]any{"traffic_class_version": version, "failed": 3}).Error; err != nil {
+				t.Fatal(err)
+			}
+			if err := m.storeDB.Create(&ChannelTestHourSample{ChannelID: 59, HourTs: 3600, ModelName: "model", Grp: "test", Origin: "scheduled",
+				TrafficClassVersion: version, Requests: 4, Success: 3, Failed: 1}).Error; err != nil {
+				t.Fatal(err)
+			}
+			response := previewChannelCostHistoricalBinding(t, m, in)
+			var payload map[string]json.RawMessage
+			if response.Code != http.StatusOK || json.Unmarshal(response.Body.Bytes(), &payload) != nil {
+				t.Fatal("preview failed", response.Code, response.Body.String())
+			}
+			want := map[string]int64{"local_requests": 5, "local_failed_requests": 3, "local_test_requests": 4, "local_test_failed_requests": 1}
+			for key, expected := range want {
+				if version == 99 {
+					expected = 0
+				}
+				var got int64
+				if err := json.Unmarshal(payload[key], &got); err != nil || got != expected {
+					t.Fatalf("%s: got %s want %d; err=%v", key, payload[key], expected, err)
+				}
+			}
+			var plan channelCostHistoricalBindingPlan
+			if err := json.Unmarshal(response.Body.Bytes(), &plan); err != nil || plan.EvidenceRequests != 2 || plan.EvidenceBilledCost.MicroUSD != "1000000" || plan.WillQueueHours != 1 {
+				t.Fatal("failure diagnostics changed upstream evidence", plan, err)
+			}
+			if historyRangeCount(t, m.storeDB, "channel_cost_source_bindings") != 0 || historyRangeCount(t, m.storeDB, "channel_economics_dirty_hours") != 0 {
+				t.Fatal("preview wrote state")
+			}
+		})
+	}
+}
+
+func TestHistoricalCostRangeRejectsInvalidFailureCounts(t *testing.T) {
+	for _, scope := range []string{"customer", "test"} {
+		for _, failed := range []int64{-1, 3} {
+			t.Run(scope+"/"+strconv.FormatInt(failed, 10), func(t *testing.T) {
+				m, in := historyRangeFixture(t)
+				in.ValidFrom, in.ValidTo = historyRangeHour(3600), historyRangeHour(7200)
+				if scope == "customer" {
+					if err := m.storeDB.Model(&StabilityHourSample{}).Where("hour_ts=?", 3600).Updates(map[string]any{"success": 2 - failed, "failed": failed}).Error; err != nil {
+						t.Fatal(err)
+					}
+				} else if err := m.storeDB.Create(&ChannelTestHourSample{ChannelID: 59, HourTs: 3600, ModelName: "model", Grp: "test", Origin: "scheduled", TrafficClassVersion: 7, Requests: 2, Failed: failed}).Error; err != nil {
+					t.Fatal(err)
+				}
+				if response := previewChannelCostHistoricalBinding(t, m, in); response.Code != http.StatusConflict {
+					t.Fatal("invalid failure subtotal accepted", response.Code, response.Body.String())
+				}
+				if historyRangeCount(t, m.storeDB, "channel_cost_source_bindings") != 0 || historyRangeCount(t, m.storeDB, "channel_economics_dirty_hours") != 0 {
+					t.Fatal("invalid preview wrote state")
+				}
+			})
+		}
 	}
 }

@@ -99,8 +99,10 @@ type channelCostHistoricalBindingPlan struct {
 	EvidenceBilledCost       channelEconomicsMoneyView `json:"evidence_billed_cost"`
 	LocalActiveHours         int64                     `json:"local_active_hours"`
 	LocalRequests            int64                     `json:"local_requests"`
+	LocalFailedRequests      int64                     `json:"local_failed_requests"`
 	LocalTestActiveHours     int64                     `json:"local_test_active_hours"`
 	LocalTestRequests        int64                     `json:"local_test_requests"`
+	LocalTestFailedRequests  int64                     `json:"local_test_failed_requests"`
 	ActiveEvidenceRequests   int64                     `json:"active_evidence_requests"`
 	InactiveEvidenceRequests int64                     `json:"inactive_evidence_requests"`
 	ActiveBilledCost         channelEconomicsMoneyView `json:"active_billed_cost"`
@@ -595,49 +597,58 @@ func (m *Monitor) planChannelCostHistoricalBinding(ctx context.Context, in chann
 		return plan, http.StatusConflict, errors.New("同一来源存在重叠的已确认映射")
 	}
 	type localActivityHour struct {
-		HourTs   int64
-		Requests int64
+		HourTs         int64
+		Requests       int64
+		FailedRequests int64
 	}
 	var activityHours []localActivityHour
 	if err := m.storeDB.WithContext(ctx).Model(&StabilityHourSample{}).
-		Select("hour_ts, COALESCE(SUM(success + anomaly + failed), 0) requests").
-		Where("channel_id = ?", in.LocalChannelID).
+		Select("hour_ts, COALESCE(SUM(success + anomaly + failed), 0) requests, COALESCE(SUM(failed), 0) failed_requests").
+		Where("channel_id = ? AND traffic_class_version IN ?", in.LocalChannelID, accountingTrafficVersions()).
 		Scopes(channelCostHistoricalRangeScope(in, "stability_hour_samples.hour_ts")).
 		Where(`EXISTS (SELECT 1 FROM channel_upstream_cost_hour_evidence e
 			WHERE e.domain = ? AND e.account_epoch = ? AND e.source_ref = ?
 			AND e.semantics_version = ? AND e.hour_ts = stability_hour_samples.hour_ts)`,
 			in.Domain, in.AccountEpoch, in.SourceRef, channelCostEvidenceSemanticsVersion).
-		Group("hour_ts").Order("hour_ts").Scan(&activityHours).Error; err != nil {
+		Group("hour_ts").Having("COALESCE(SUM(success + anomaly + failed),0)>0").Order("hour_ts").Scan(&activityHours).Error; err != nil {
 		return plan, http.StatusServiceUnavailable, errors.New("读取本地渠道同时段活动失败")
 	}
 	activeHours := make(map[int64]bool, len(activityHours))
-	var localRequests int64
+	var localRequests, localFailedRequests int64
 	for _, activity := range activityHours {
+		if activity.FailedRequests < 0 || activity.FailedRequests > activity.Requests {
+			return plan, http.StatusConflict, errors.New("本地渠道失败记录数与总请求数不一致")
+		}
 		activeHours[activity.HourTs] = true
 		if err := addEconomicsInt64(&localRequests, activity.Requests); err != nil {
 			return plan, http.StatusConflict, errors.New("本地渠道同时段请求数超出安全范围")
 		}
+		if err := addEconomicsInt64(&localFailedRequests, activity.FailedRequests); err != nil {
+			return plan, http.StatusConflict, errors.New("本地渠道失败记录数超出安全范围")
+		}
 	}
-	type localTestActivityHour struct {
-		HourTs   int64
-		Requests int64
-	}
-	var testActivityHours []localTestActivityHour
+	var testActivityHours []localActivityHour
 	if err := m.storeDB.WithContext(ctx).Model(&ChannelTestHourSample{}).
-		Select("hour_ts, COALESCE(SUM(requests), 0) requests").
-		Where("channel_id = ? AND traffic_class_version = ?", in.LocalChannelID, stabilityTrafficClassificationVersion).
+		Select("hour_ts, COALESCE(SUM(requests), 0) requests, COALESCE(SUM(failed), 0) failed_requests").
+		Where("channel_id = ? AND traffic_class_version IN ?", in.LocalChannelID, accountingTrafficVersions()).
 		Scopes(channelCostHistoricalRangeScope(in, "channel_test_hour_samples.hour_ts")).
 		Where(`EXISTS (SELECT 1 FROM channel_upstream_cost_hour_evidence e
 			WHERE e.domain = ? AND e.account_epoch = ? AND e.source_ref = ?
 			AND e.semantics_version = ? AND e.hour_ts = channel_test_hour_samples.hour_ts)`,
 			in.Domain, in.AccountEpoch, in.SourceRef, channelCostEvidenceSemanticsVersion).
-		Group("hour_ts").Order("hour_ts").Scan(&testActivityHours).Error; err != nil {
+		Group("hour_ts").Having("COALESCE(SUM(requests),0)>0").Order("hour_ts").Scan(&testActivityHours).Error; err != nil {
 		return plan, http.StatusServiceUnavailable, errors.New("读取本地渠道内部测试活动失败")
 	}
-	var localTestRequests int64
+	var localTestRequests, localTestFailedRequests int64
 	for _, activity := range testActivityHours {
+		if activity.FailedRequests < 0 || activity.FailedRequests > activity.Requests {
+			return plan, http.StatusConflict, errors.New("本地渠道测试失败记录数与总请求数不一致")
+		}
 		if err := addEconomicsInt64(&localTestRequests, activity.Requests); err != nil {
 			return plan, http.StatusConflict, errors.New("本地渠道内部测试请求数超出安全范围")
+		}
+		if err := addEconomicsInt64(&localTestFailedRequests, activity.FailedRequests); err != nil {
+			return plan, http.StatusConflict, errors.New("本地渠道测试失败记录数超出安全范围")
 		}
 	}
 	type evidenceCostHour struct {
@@ -706,8 +717,8 @@ func (m *Monitor) planChannelCostHistoricalBinding(ctx context.Context, in chann
 	plan = channelCostHistoricalBindingPlan{
 		Binding: row, ChannelName: channel.Name, EvidenceHours: evidence.Hours,
 		EvidenceRequests: evidence.Requests, EvidenceBilledCost: economicsMoney(evidenceCost),
-		LocalActiveHours: int64(len(activityHours)), LocalRequests: localRequests,
-		LocalTestActiveHours: int64(len(testActivityHours)), LocalTestRequests: localTestRequests,
+		LocalActiveHours: int64(len(activityHours)), LocalRequests: localRequests, LocalFailedRequests: localFailedRequests,
+		LocalTestActiveHours: int64(len(testActivityHours)), LocalTestRequests: localTestRequests, LocalTestFailedRequests: localTestFailedRequests,
 		ActiveEvidenceRequests: activeEvidenceRequests, InactiveEvidenceRequests: inactiveEvidenceRequests,
 		ActiveBilledCost: economicsMoney(activeCost), InactiveBilledCost: economicsMoney(inactiveCost),
 		WillQueueHours: queueable.Hours, HasLocalActivity: len(activityHours) > 0,

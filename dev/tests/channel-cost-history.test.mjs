@@ -137,6 +137,28 @@ test('future submission does not read the historical selection',async()=>{
   assert.equal(fields.get('[data-cost-history-channel]').value,'69');
 });
 
+test('historical preview separates failed records and never deducts them from upstream evidence',async()=>{
+  for(const failures of [3,0,undefined,null,-1,8,'3']){
+    const {api,confirmations,calls}=fixture({confirm:false,fetchOverride:url=>url.endsWith('/preview')?response({
+      binding:{ValidFrom:3600,ValidTo:7200},evidence_hours:1,evidence_requests:2,
+      has_local_activity:true,local_active_hours:1,local_requests:5,local_failed_requests:failures,
+      local_test_active_hours:1,local_test_requests:4,local_test_failed_requests:1,
+      temporal_overlap_quality:'strong',activity_coverage:1,
+      evidence_billed_cost:{micro_usd:'1000000',display:'$1.000000'},
+    }):null});
+    await api.saveHistoricalCostBinding(domain.key,0);
+    const message=confirmations[0];
+    assert.match(message,/上游证据：1 小时 \/ 2 请求/);
+    assert.match(message,/共 5 个请求/);
+    assert.match(message,/内部测试：1 个小时 \/ 4 请求（其中失败记录 1）/);
+    if(failures===3||failures===0) assert.ok(message.includes(`共 5 个请求（其中失败记录 ${failures}）`));
+    else assert.doesNotMatch(message,/共 5 个请求（其中失败记录/);
+    assert.match(message,/本站活动包含失败记录，上游成本证据来自消费日志，不能直接用请求数差额判定漏采或扣减成本/);
+    assert.doesNotMatch(message,/NaN|undefined/);
+    assert.equal(writes(calls).length,1); // Cancelled preview never saves a binding.
+  }
+});
+
 test('existing historical segment keeps bounded continuation available',()=>{
   const {api,data}=fixture();data.sources[0].historical_binding_count=1;
   const html=api.costSourceRows(domain,data);

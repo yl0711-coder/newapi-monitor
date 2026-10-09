@@ -652,6 +652,10 @@ async function saveCostBinding(key,index){
   button.disabled=true;
   try{const res=await fetch('/channels/cost/bindings',{method:'POST',headers:{Accept:'application/json','Content-Type':'application/json'},body:JSON.stringify(body)}),result=await res.json();if(!res.ok)throw new Error(result.error||`HTTP ${res.status}`);await loadCostLedger(key)}catch(error){alert(error.message||'保存来源映射失败');await loadCostLedger(key)}finally{button.disabled=false}
 }
+function costHistoryFailureNote(failed,total){
+  // Older servers do not provide this field; absence must not imply zero.
+  return Number.isSafeInteger(failed)&&failed>=0&&Number.isSafeInteger(total)&&failed<=total?`（其中失败记录 ${nfmt(failed)}）`:'';
+}
 async function saveHistoricalCostBinding(key,index){
   const domain=reportDomain(key),data=cm.costLedger.get(key),source=data?.sources?.[index];if(!domain||!source)return;
   const button=document.querySelector(`[data-cm-cost-history-binding="${CSS.escape(key)}"][data-source-index="${index}"]`),row=button?.closest('.cm-cost-source');
@@ -669,11 +673,12 @@ async function saveHistoricalCostBinding(key,index){
     const binding=preview.binding||{},plannedFrom=Number(proposalValue(binding,'valid_from','ValidFrom')),plannedTo=Number(proposalValue(binding,'valid_to','ValidTo'));
     if(!Number.isSafeInteger(plannedFrom)||!Number.isSafeInteger(plannedTo)||plannedFrom%3600||plannedTo%3600||plannedFrom<selectedFrom||plannedTo>selectedTo||plannedTo<=plannedFrom)throw new Error('预演范围与所选时段不一致，请刷新页面后重新预演。');
     const from=costHistoryHourInput(plannedFrom).replace('T',' '),to=costHistoryHourInput(plannedTo).replace('T',' ');
-    const activity=preview.has_local_activity?`所选渠道在其中 ${nfmt(preview.local_active_hours)} 个小时有活动，共 ${nfmt(preview.local_requests)} 个请求。`:'⚠ 所选渠道在这些小时没有本地请求，请重点核对归属。';
-    const testActivity=Number(preview.local_test_requests||0)>0?`内部测试：${nfmt(preview.local_test_active_hours)} 个小时 / ${nfmt(preview.local_test_requests)} 请求（时段覆盖 ${(Math.max(0,Math.min(1,Number(preview.test_activity_coverage)||0))*100).toFixed(1)}%）。`:'内部测试：未发现同时段请求。';
+    const activity=preview.has_local_activity?`所选渠道在其中 ${nfmt(preview.local_active_hours)} 个小时有活动，共 ${nfmt(preview.local_requests)} 个请求${costHistoryFailureNote(preview.local_failed_requests,preview.local_requests)}。`:'⚠ 所选渠道在这些小时没有本地请求，请重点核对归属。';
+    const testActivity=Number(preview.local_test_requests||0)>0?`内部测试：${nfmt(preview.local_test_active_hours)} 个小时 / ${nfmt(preview.local_test_requests)} 请求${costHistoryFailureNote(preview.local_test_failed_requests,preview.local_test_requests)}（时段覆盖 ${(Math.max(0,Math.min(1,Number(preview.test_activity_coverage)||0))*100).toFixed(1)}%）。`:'内部测试：未发现同时段请求。';
     const coverage=Math.max(0,Math.min(1,Number(preview.activity_coverage)||0)),costCoverage=Math.max(0,Math.min(1,Number(preview.cost_activity_coverage)||0)),quality=String(preview.temporal_overlap_quality||'review'),warnings=Array.isArray(preview.risk_warnings)?preview.risk_warnings.filter(Boolean):[];
     const qualityLabel={strong:'较强',review:'需复核',weak:'弱',no_activity:'无同时段活动',invalid:'无效'}[quality]||'需复核';
-    const warningText=warnings.length?`\n风险提示：\n- ${warnings.join('\n- ')}`:'';
+    const requestBasis='本站活动包含失败记录，上游成本证据来自消费日志，不能直接用请求数差额判定漏采或扣减成本。';
+    const warningText=`\n${requestBasis}`+(warnings.length?`\n风险提示：\n- ${warnings.join('\n- ')}`:'');
     const costEvidence=`上游金额：${economicsMoneyLabel(preview.evidence_billed_cost)}；其中本地有活动的同小时 ${economicsMoneyLabel(preview.active_billed_cost)}（${(costCoverage*100).toFixed(1)}%），无同小时活动 ${economicsMoneyLabel(preview.inactive_billed_cost)} / ${nfmt(preview.inactive_evidence_requests)} 请求。`;
     if(!window.confirm(`回填影响预演\n来源：…${String(source.source_ref||'').slice(-8)}\n渠道：#${channelID} ${preview.channel_name||''}\n时段：${from} 至 ${to}\n上游证据：${nfmt(preview.evidence_hours)} 小时 / ${nfmt(preview.evidence_requests)} 请求\n${activity}\n${testActivity}\n客户流量同小时覆盖：${(coverage*100).toFixed(1)}% （时段证据${qualityLabel}）\n${costEvidence}${warningText}\n注：时段和金额重叠只是复核证据，不等于上游令牌归属证明；内部测试成本不得混入客户毛利。\n\n确认写入审计映射并排队重算？\n不会修改 NewAPI 渠道或未来路由。`))return;
     if(quality!=='strong'&&!window.confirm(`该映射的历史归属证据为“${qualityLabel}”。\n已人工核对上游令牌、账户或变更记录，仍要继续吗？`))return;

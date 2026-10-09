@@ -37,7 +37,9 @@ test('pairing hours distinguish empty verification from business progress and mi
   assert.match(html,/有业务且已配对 0/);
   assert.match(html,/已核验空小时 142/);
   assert.match(html,/成本已采到待归属 156/);
-  assert.match(html,/本地有业务但上游零记录 7/);
+  assert.match(html,/本站有请求、上游零记录（待核对） 7/);
+  assert.match(html,/本站未扣费的失败请求/);
+  assert.match(html,/不直接认定丢日志或零成本/);
   assert.match(html,/重复重算不会自动补齐/);
   assert.equal(JSON.stringify(row),original);
   assert.doesNotMatch(html,/正在回填|正在同步|46\.6%|\$0\.00/);

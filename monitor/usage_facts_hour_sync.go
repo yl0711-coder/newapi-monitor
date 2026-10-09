@@ -281,6 +281,7 @@ func (m *Monitor) claimUsageFactHour(hourTs int64, ids []int64) (usageFactHourCl
 			return err
 		}
 		claim.localRows = rows
+		rowsByUser := usageFactRowsByUser(rows)
 		for _, id := range ids {
 			var state UsageFactMemberHourState
 			err := tx.First(&state, "user_id = ? AND hour_ts = ?", id, hourTs).Error
@@ -288,10 +289,19 @@ func (m *Monitor) claimUsageFactHour(hourTs int64, ids []int64) (usageFactHourCl
 				return err
 			}
 			if err == nil {
-				claim.previous[id] = state
 				if state.Status == "running" && state.LeaseUntil > now.Unix() {
 					return errUsageFactLeaseBusy
 				}
+				previous := state
+				// A crashed refresher can leave a running lease over a valid old
+				// completion proof. If its successor is cancelled, restore that
+				// proof instead of deleting it as if this were a first import.
+				memberRows := rowsByUser[id]
+				if previous.Status == "running" && previous.CompletedAt > 0 && previous.ContentHash != "" &&
+					usageFactMemberMetricsMatchState(factsMetrics(memberRows), previous) && usageFactContentHash(memberRows) == previous.ContentHash {
+					previous.Status = "complete"
+				}
+				claim.previous[id] = previous
 			} else {
 				state = UsageFactMemberHourState{UserID: id, HourTs: hourTs}
 			}

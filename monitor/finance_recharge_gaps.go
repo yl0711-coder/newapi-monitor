@@ -3,7 +3,6 @@ package monitor
 import (
 	"context"
 	"errors"
-	"math"
 	"sort"
 	"strconv"
 )
@@ -48,14 +47,15 @@ type FinanceRechargeGapSkipped struct {
 }
 
 type FinanceRechargeGapInspection struct {
-	Mode                 string                      `json:"mode"`
-	FromTs               int64                       `json:"from_ts"`
-	ToTs                 int64                       `json:"to_ts"`
-	SourceSnapshotSHA256 string                      `json:"source_snapshot_sha256,omitempty"`
-	MonetaryUnit         string                      `json:"monetary_unit"`
-	ExcludedDomains      []string                    `json:"excluded_domains"`
-	Domains              []FinanceRechargeGapDomain  `json:"domains"`
-	Skipped              []FinanceRechargeGapSkipped `json:"skipped"`
+	Mode                 string                        `json:"mode"`
+	FromTs               int64                         `json:"from_ts"`
+	ToTs                 int64                         `json:"to_ts"`
+	SourceSnapshotSHA256 string                        `json:"source_snapshot_sha256,omitempty"`
+	MonetaryUnit         string                        `json:"monetary_unit"`
+	ExcludedDomains      []string                      `json:"excluded_domains"`
+	Domains              []FinanceRechargeGapDomain    `json:"domains"`
+	Skipped              []FinanceRechargeGapSkipped   `json:"skipped"`
+	BillCoverage         []FinanceRechargeBillCoverage `json:"bill_coverage"`
 }
 
 // Use the report's existing bill verifier and recharge selection rules. A
@@ -85,17 +85,9 @@ func inspectFinanceRechargeGaps(ctx context.Context, in *financeBillInputs, now 
 		}
 	}
 	accepted := make([]ChannelUpstreamUsageHour, 0, len(rows))
-	for _, row := range rows {
-		if account, ok := accounts[row.Domain]; !ok || account.Provider != row.Provider {
-			continue
-		}
-		seconds := row.BucketSeconds
-		if seconds <= 0 {
-			seconds = 3600
-		}
-		if row.HourTs < 0 || row.HourTs > math.MaxInt64-seconds || (seconds != 3600 && seconds != 86400) {
-			return empty, errors.New("recharge inspection found an invalid original bill interval")
-		}
+	rows, unsupported, err := financeRechargeInspectionRows(ctx, rows, accounts)
+	if err != nil {
+		return empty, err
 	}
 	metrics, err := projectUpstreamUsageBuckets(rows, in.scope, now, accounts, in.versions, func(row ChannelUpstreamUsageHour) {
 		accepted = append(accepted, row)
@@ -103,8 +95,15 @@ func inspectFinanceRechargeGaps(ctx context.Context, in *financeBillInputs, now 
 	if err != nil {
 		return empty, err
 	}
+	for domain := range unsupported {
+		metric := metrics[domain]
+		metric.Available = true // Source exists, but is not eligible for this repair tool.
+		metric.IntegrityStatus = financeRechargeUnsupportedInterval
+		metrics[domain] = metric
+	}
 	result := FinanceRechargeGapInspection{Mode: "offline_recharge_gap_plan_no_writes", FromTs: in.scope.FromTs, ToTs: in.scope.ToTs,
-		MonetaryUnit: "platform_accounting_usd", Domains: []FinanceRechargeGapDomain{}, Skipped: []FinanceRechargeGapSkipped{}}
+		MonetaryUnit: "platform_accounting_usd", Domains: []FinanceRechargeGapDomain{}, Skipped: []FinanceRechargeGapSkipped{},
+		BillCoverage: financeRechargeInspectionCoverage(metrics)}
 	byDomain, skipped, err := financeRechargeInspectionDomains(ctx, metrics, accounts, in.versions, in.scope.ToTs)
 	if err != nil {
 		return empty, err

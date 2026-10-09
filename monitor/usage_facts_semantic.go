@@ -147,6 +147,22 @@ func usageDailyFactsByMemberDay(rows []UsageDailyFact) map[usageFactMemberDayKey
 }
 
 func auditUsageFactTrailingHours(db *gorm.DB, start, end int64, ids []int64) error {
+	return auditUsageFactTrailingHoursWithRefresh(db, start, end, ids, false)
+}
+
+// Only the already-published reader may use the last committed proof during
+// a refresh. The lease never proves completeness: epoch, metrics and the hash
+// of the actual rows must still match. An expired lease leaves those old rows
+// valid, but a first import (no completion proof) must remain unavailable.
+// Candidate publication, cursor advancement and day finalization stay strict.
+func usageFactAuditHourProofCondition(allowRefreshing bool) string {
+	if allowRefreshing {
+		return "(status = 'complete' OR (status = 'running' AND completed_at > 0 AND lease_token <> ''))"
+	}
+	return "status = 'complete'"
+}
+
+func auditUsageFactTrailingHoursWithRefresh(db *gorm.DB, start, end int64, ids []int64, allowRefreshing bool) error {
 	if start >= end {
 		return nil
 	}
@@ -155,10 +171,10 @@ func auditUsageFactTrailingHours(db *gorm.DB, start, end int64, ids []int64) err
 	countArgs := make([]any, 0, 3+len(inArgs))
 	countArgs = append(countArgs, start, end)
 	countArgs = append(countArgs, inArgs...)
-	countArgs = append(countArgs, "complete")
+	proofCondition := usageFactAuditHourProofCondition(allowRefreshing)
 	var memberProofs int64
 	if err := db.Model(&UsageFactMemberHourState{}).
-		Where("hour_ts >= ? AND hour_ts < ? AND "+inSQL+" AND status = ? AND content_hash <> ''", countArgs...).
+		Where("hour_ts >= ? AND hour_ts < ? AND "+inSQL+" AND "+proofCondition+" AND content_hash <> ''", countArgs...).
 		Count(&memberProofs).Error; err != nil {
 		return err
 	}
@@ -172,9 +188,8 @@ func auditUsageFactTrailingHours(db *gorm.DB, start, end int64, ids []int64) err
 			stateArgs := make([]any, 0, 3+len(inArgs))
 			stateArgs = append(stateArgs, cursor, limit)
 			stateArgs = append(stateArgs, inArgs...)
-			stateArgs = append(stateArgs, "complete")
 			var states []UsageFactMemberHourState
-			if err := db.Where("hour_ts >= ? AND hour_ts < ? AND "+inSQL+" AND status = ?",
+			if err := db.Where("hour_ts >= ? AND hour_ts < ? AND "+inSQL+" AND "+proofCondition,
 				stateArgs...).Order("hour_ts, user_id").Find(&states).Error; err != nil {
 				return err
 			}
@@ -250,6 +265,10 @@ func auditUsageFactTrailingHours(db *gorm.DB, start, end int64, ids []int64) err
 // combining old hourly proofs with a new control result. The ordinary wrapper
 // remains available to the legacy finite-window reader.
 func auditUsageFactTrailingHoursForEpoch(db *gorm.DB, start, end int64, ids []int64, epoch string) error {
+	return auditUsageFactTrailingHoursForEpochWithRefresh(db, start, end, ids, epoch, false)
+}
+
+func auditUsageFactTrailingHoursForEpochWithRefresh(db *gorm.DB, start, end int64, ids []int64, epoch string, allowRefreshing bool) error {
 	if start >= end {
 		return nil
 	}
@@ -260,10 +279,10 @@ func auditUsageFactTrailingHoursForEpoch(db *gorm.DB, start, end int64, ids []in
 	args := make([]any, 0, 4+len(inArgs))
 	args = append(args, start, end)
 	args = append(args, inArgs...)
-	args = append(args, "complete", epoch)
+	args = append(args, epoch)
 	var complete int64
 	if err := db.Model(&UsageFactMemberHourState{}).
-		Where("hour_ts >= ? AND hour_ts < ? AND "+inSQL+" AND status = ? AND content_hash <> '' AND source_epoch = ?", args...).
+		Where("hour_ts >= ? AND hour_ts < ? AND "+inSQL+" AND "+usageFactAuditHourProofCondition(allowRefreshing)+" AND content_hash <> '' AND source_epoch = ?", args...).
 		Count(&complete).Error; err != nil {
 		return err
 	}
@@ -271,7 +290,7 @@ func auditUsageFactTrailingHoursForEpoch(db *gorm.DB, start, end int64, ids []in
 	if complete != want {
 		return fmt.Errorf("当前来源 epoch 小时证明不完整: got=%d want=%d", complete, want)
 	}
-	return auditUsageFactTrailingHours(db, start, end, ids)
+	return auditUsageFactTrailingHoursWithRefresh(db, start, end, ids, allowRefreshing)
 }
 
 func auditUsageFactKnownEmptyRange(db *gorm.DB, userID, start, end int64) error {

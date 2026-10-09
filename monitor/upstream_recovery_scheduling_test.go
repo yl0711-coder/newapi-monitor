@@ -69,27 +69,31 @@ func TestUpstreamRecoveryConfigurationPreservesFinancialFacts(t *testing.T) {
 }
 
 func TestUpstreamRecoveryLongRetryAfterPersistsAcrossHostGuardRestart(t *testing.T) {
-	m, row, calls := newUpstreamRecoveryFixture(t)
-	transport := upstreamRoundTripFunc(func(r *http.Request) (*http.Response, error) {
-		calls.Add(1)
-		response := recoveryHTTPResponse(429, `{"message":"rate limited"}`)
-		response.Header.Set("Retry-After", "36000")
-		return response, nil
-	})
-	setUpstreamRecoveryTransport(m, transport)
-	result, err := m.recoverUpstreamTask(context.Background(), row.Domain, "usage")
-	if err != nil || result.Status != "blocked" || result.RetryAt < time.Now().Unix()+35998 {
-		t.Fatalf("long cooldown lost: %+v %v", result, err)
-	}
-	// Simulate expiry of only the per-task 5-minute click guard. Recreate the
-	// host guard as on restart: its durable 10-hour Retry-After still wins.
-	if err := m.storeDB.Model(&ChannelUpstreamAccount{}).Where("domain = ?", row.Domain).UpdateColumn("usage_last_attempt_at", time.Now().Unix()-3600).Error; err != nil {
-		t.Fatal(err)
-	}
-	setUpstreamRecoveryTransport(m, transport)
-	result, err = m.recoverUpstreamTask(context.Background(), row.Domain, "usage")
-	if err != nil || result.Status != "blocked" || calls.Load() != 1 || result.RetryAt < time.Now().Unix()+35998 {
-		t.Fatalf("restart bypassed Retry-After: %+v %v requests=%d", result, err, calls.Load())
+	for _, status := range []int{http.StatusTooManyRequests, http.StatusServiceUnavailable} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			m, row, calls := newUpstreamRecoveryFixture(t)
+			transport := upstreamRoundTripFunc(func(r *http.Request) (*http.Response, error) {
+				calls.Add(1)
+				response := recoveryHTTPResponse(status, `{"message":"temporarily unavailable"}`)
+				response.Header.Set("Retry-After", "36000")
+				return response, nil
+			})
+			setUpstreamRecoveryTransport(m, transport)
+			result, err := m.recoverUpstreamTask(context.Background(), row.Domain, "usage")
+			if err != nil || result.Status != "blocked" || result.RetryAt < time.Now().Unix()+35998 {
+				t.Fatalf("long cooldown lost: %+v %v", result, err)
+			}
+			// Simulate expiry of only the per-task 5-minute click guard. Recreate the
+			// host guard as on restart: its durable 10-hour Retry-After still wins.
+			if err := m.storeDB.Model(&ChannelUpstreamAccount{}).Where("domain = ?", row.Domain).UpdateColumn("usage_last_attempt_at", time.Now().Unix()-3600).Error; err != nil {
+				t.Fatal(err)
+			}
+			setUpstreamRecoveryTransport(m, transport)
+			result, err = m.recoverUpstreamTask(context.Background(), row.Domain, "usage")
+			if err != nil || result.Status != "blocked" || calls.Load() != 1 || result.RetryAt < time.Now().Unix()+35998 {
+				t.Fatalf("restart bypassed Retry-After: %+v %v requests=%d", result, err, calls.Load())
+			}
+		})
 	}
 }
 

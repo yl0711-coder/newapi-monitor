@@ -1938,6 +1938,10 @@ func auditUsageFactRecentServiceRange(db *gorm.DB, state UsageFactMemberState, t
 }
 
 func auditUsageFactFullHistoryDayRange(db *gorm.DB, state UsageFactMemberState, start, end int64) error {
+	return auditUsageFactFullHistoryDayRangeWithRefresh(db, state, start, end, false)
+}
+
+func auditUsageFactFullHistoryDayRangeWithRefresh(db *gorm.DB, state UsageFactMemberState, start, end int64, allowRefreshing bool) error {
 	if start >= end {
 		return nil
 	}
@@ -1952,7 +1956,7 @@ func auditUsageFactFullHistoryDayRange(db *gorm.DB, state UsageFactMemberState, 
 	startDay := usageFactDayStart(start)
 	if start > startDay {
 		leadingThrough := min(end, startDay+usageFactDaySeconds)
-		if err := auditUsageFactTrailingHoursForEpoch(db, start, leadingThrough, []int64{state.UserID}, state.SourceEpoch); err != nil {
+		if err := auditUsageFactTrailingHoursForEpochWithRefresh(db, start, leadingThrough, []int64{state.UserID}, state.SourceEpoch, allowRefreshing); err != nil {
 			return err
 		}
 		start = leadingThrough
@@ -1993,7 +1997,7 @@ func auditUsageFactFullHistoryDayRange(db *gorm.DB, state UsageFactMemberState, 
 		batchStart = batchEnd
 	}
 	if fullDaysThrough < end {
-		return auditUsageFactTrailingHoursForEpoch(db, fullDaysThrough, end, []int64{state.UserID}, state.SourceEpoch)
+		return auditUsageFactTrailingHoursForEpochWithRefresh(db, fullDaysThrough, end, []int64{state.UserID}, state.SourceEpoch, allowRefreshing)
 	}
 	return nil
 }
@@ -2384,7 +2388,9 @@ func (m *Monitor) validateUsageFactFullHistoryCheckpoint(ctx context.Context, th
 			return fmt.Errorf("full-history verification checkpoint incomplete user_id=%d", row.UserID)
 		}
 		if recentReady && !fullReady {
-			if err := auditUsageFactRecentServiceRange(db, state, through); err != nil {
+			// Validate the immutable serving window, not the next candidate.
+			// Its unchanged completed facts remain usable during a refresh lease.
+			if err := auditUsageFactFullHistoryDayRangeWithRefresh(db, state, row.SourceFloorHour, through, true); err != nil {
 				return fmt.Errorf("recent service checkpoint failed user_id=%d: %w", row.UserID, err)
 			}
 		} else if state.SourceHistoryStatus == "complete_hot" {
@@ -2400,7 +2406,7 @@ func (m *Monitor) validateUsageFactFullHistoryCheckpoint(ctx context.Context, th
 	}
 	trailingStart := usageFactDayStart(through)
 	if trailingStart < through && len(trailingIDs) > 0 {
-		if err := auditUsageFactTrailingHoursForEpoch(db, trailingStart, through, trailingIDs, epoch); err != nil {
+		if err := auditUsageFactTrailingHoursForEpochWithRefresh(db, trailingStart, through, trailingIDs, epoch, true); err != nil {
 			return fmt.Errorf("full-history published trailing-hour checkpoint failed: %w", err)
 		}
 	}

@@ -134,12 +134,17 @@ func openAttributionLocalCopy(t *testing.T, source string) (*gorm.DB, string) {
 
 func openAttributionLocalCopyAt(t *testing.T, source, output string) (*gorm.DB, string) {
 	t.Helper()
+	return openAttributionLocalCopyWithHashAt(t, source, output, attributionLocalSHA256)
+}
+
+func openAttributionLocalCopyWithHashAt(t *testing.T, source, output, expectedHash string) (*gorm.DB, string) {
+	t.Helper()
 	backup, err := openGiftRelevantBackup(source)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(backup.close)
-	if giftLocalFileHash(t, source) != attributionLocalSHA256 {
+	if giftLocalFileHash(t, source) != expectedHash {
 		t.Fatal("sealed rehearsal source hash mismatch")
 	}
 	if output == "" {
@@ -160,7 +165,7 @@ func openAttributionLocalCopyAt(t *testing.T, source, output string) (*gorm.DB, 
 		t.Fatal(err)
 	}
 	destination := filepath.Join(output, "monitor-unconfirmed.db")
-	if hash, err := giftLocalCopyBackup(source, destination); err != nil || hash != attributionLocalSHA256 {
+	if hash, err := giftLocalCopyBackup(source, destination); err != nil || hash != expectedHash {
 		t.Fatal("copy failed", err)
 	}
 	if err := backup.unchanged(); err != nil {

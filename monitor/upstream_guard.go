@@ -309,6 +309,14 @@ func (g *upstreamHostGuard) waitForStart(ctx context.Context, state *upstreamGua
 	return nil
 }
 
+// A 503 can explicitly ask us to wait during maintenance/overload. Without
+// that header it keeps the ordinary finite retry policy; authentication errors
+// must never open a host-wide circuit on behalf of just one account.
+func upstreamResponseHasRetryAfter(status int, value string) bool {
+	return status == http.StatusTooManyRequests ||
+		(status == http.StatusServiceUnavailable && strings.TrimSpace(value) != "")
+}
+
 func parseUpstreamRetryAfter(value string, now time.Time) time.Time {
 	value = strings.TrimSpace(value)
 	var retryAt time.Time
@@ -355,13 +363,20 @@ func (g *upstreamHostGuard) recordResponse(state *upstreamGuardHostState, status
 		state.circuit.ConsecutiveFailures++
 		state.circuit.LastFailureAt = now.Unix()
 		state.circuit.LastStatus = status
+		retryAt := int64(0)
 		if state.circuit.ConsecutiveFailures >= upstreamGuardFailureThreshold {
 			index := state.circuit.OpenCount
 			if index >= len(upstreamGuardOpenDurations) {
 				index = len(upstreamGuardOpenDurations) - 1
 			}
+			retryAt = now.Add(upstreamGuardOpenDurations[index]).Unix()
+		}
+		if upstreamResponseHasRetryAfter(status, retryAfter) {
+			retryAt = max(retryAt, parseUpstreamRetryAfter(retryAfter, now).Unix())
+		}
+		if retryAt > 0 {
 			state.circuit.OpenCount++
-			state.circuit.OpenUntil = now.Add(upstreamGuardOpenDurations[index]).Unix()
+			state.circuit.OpenUntil = max(state.circuit.OpenUntil, retryAt)
 		}
 		changed = true
 	case isUpstreamAccountAuthStatus(status):

@@ -1734,7 +1734,7 @@ func doUpstreamJSON(ctx context.Context, client *http.Client, method, endpoint s
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		retryAt := int64(0)
-		if resp.StatusCode == http.StatusTooManyRequests {
+		if upstreamResponseHasRetryAfter(resp.StatusCode, resp.Header.Get("Retry-After")) {
 			retryAt = parseUpstreamRetryAfter(resp.Header.Get("Retry-After"), time.Now()).Unix()
 		}
 		return nil, &upstreamHTTPError{Status: resp.StatusCode, Message: upstreamResponseMessage(data), RetryAt: retryAt}
