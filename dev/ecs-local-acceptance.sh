@@ -17,7 +17,7 @@ trap 'echo "Acceptance failed at line $LINENO; evidence retained at $acceptance_
 
 # CI pins the reviewed toolchain separately; local acceptance defaults to an
 # already-installed toolchain and never silently downloads one. Set
-# GOTOOLCHAIN=go1.26.6 explicitly when that reviewed toolchain is installed.
+# GOTOOLCHAIN=go1.26.9 explicitly when that reviewed toolchain is installed.
 export GOTOOLCHAIN="${GOTOOLCHAIN:-local}"
 # Process fixtures provide synthetic credentials and their own local settings.
 # Do not give this acceptance script accidental production environment inputs.

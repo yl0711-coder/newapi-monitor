@@ -44,12 +44,19 @@ test('publisher loads the scanned artifact and cannot rebuild or push unrelated 
 });
 
 test('all production images use the same patched Go build version as CI', () => {
+  const patchedVersion = '1.26.9';
+  const read = file => readFileSync(new URL(`../../${file}`, import.meta.url), 'utf8');
+  assert.equal(read('go.mod').match(/^go (\S+)$/m)?.[1], patchedVersion);
+  const ciVersions = [...workflow.matchAll(/go-version:\s*'([^']+)'/g)];
+  assert.ok(ciVersions.length > 0, 'CI must retain explicit toolchain pins');
+  for (const [, version] of ciVersions) assert.equal(version, patchedVersion);
   for (const file of ['Dockerfile', 'cmd/hostagent/Dockerfile', 'cmd/nginxcollector/Dockerfile',
-    'cmd/ecslogagent/Dockerfile', 'cmd/nginxcollector/Dockerfile.ecs-isolated']) {
-    const dockerfile = readFileSync(new URL(`../../${file}`, import.meta.url), 'utf8');
-    assert.match(dockerfile, /golang:1\.26\.6-alpine3\.23/);
-    assert.match(dockerfile, /FROM .* AS runtime/);
-    assert.doesNotMatch(dockerfile, /golang:1\.26-alpine/);
+    'cmd/ecslogagent/Dockerfile', 'cmd/nginxcollector/Dockerfile.ecs-isolated', 'cmd/ecssynthetic/Dockerfile']) {
+    const dockerfile = read(file);
+    const builders = [...dockerfile.matchAll(/^(?:FROM |ARG BUILDER_IMAGE=)golang:([^\s]+)/gm)];
+    assert.ok(builders.length > 0, `${file}: pinned default builder required`);
+    for (const [, image] of builders) assert.equal(image, `${patchedVersion}-alpine3.23`, file);
+    if (file !== 'cmd/ecssynthetic/Dockerfile') assert.match(dockerfile, /FROM .* AS runtime/);
   }
   assert.match(job('image-security'), /labels: \$\{\{ steps.meta.outputs.labels \}\}/);
   assert.match(job('image-security'), /pull: true\s+no-cache-filters: runtime/);

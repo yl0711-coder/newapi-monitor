@@ -7,7 +7,7 @@
 # 见 docker-compose.hostagent.yml。
 
 # ---- 构建阶段 ----
-FROM golang:1.26.6-alpine3.23 AS builder
+FROM golang:1.26.9-alpine3.23 AS builder
 WORKDIR /build
 COPY go.mod go.sum ./
 RUN go mod download

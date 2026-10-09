@@ -1,4 +1,4 @@
-FROM golang:1.26.6-alpine3.23 AS build
+FROM golang:1.26.9-alpine3.23 AS build
 WORKDIR /src
 COPY cmd/ecssynthetic/*.go ./
 RUN GO111MODULE=off CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /synthetic .

@@ -11,9 +11,9 @@ ARG RUNTIME_IMAGE=alpine:3.23
 # BUILDER_IMAGE 与 RUNTIME_IMAGE 同理：镜像代理不可达时（dockerproxy.com 超时、
 # Docker Hub 直连失败），可传入本机已缓存的任意 golang 镜像完成构建。
 # 产物是 CGO_ENABLED=0 的静态二进制，构建镜像的基础发行版不影响运行结果，
-# 因此 golang:1.26.6（Debian 基）编出的二进制同样能在 alpine 运行层跑。
+# 因此 golang:1.26.9（Debian 基）编出的二进制同样能在 alpine 运行层跑。
 # 仅要求 Go 版本 >= go.mod 里声明的版本。
-ARG BUILDER_IMAGE=golang:1.26.6-alpine3.23
+ARG BUILDER_IMAGE=golang:1.26.9-alpine3.23
 
 # ---- 构建阶段 ----
 FROM ${BUILDER_IMAGE} AS builder

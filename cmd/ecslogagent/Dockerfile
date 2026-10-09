@@ -1,5 +1,5 @@
 # Scoped agent artifact. It is a collector sidecar, never the Monitor image.
-FROM golang:1.26.6-alpine3.23 AS build
+FROM golang:1.26.9-alpine3.23 AS build
 WORKDIR /src
 COPY go.mod go.sum ./
 COPY internal/ecslogagent/*.go ./internal/ecslogagent/

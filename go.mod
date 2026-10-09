@@ -1,6 +1,6 @@
 module github.com/yl0711-coder/newapi-monitor
 
-go 1.26.0
+go 1.26.9
 
 require (
 	github.com/aws/aws-sdk-go-v2 v1.47.0
@@ -21,8 +21,9 @@ require (
 	github.com/joho/godotenv v1.5.1
 	github.com/parquet-go/parquet-go v0.32.0
 	github.com/wneessen/go-mail v0.7.3
-	golang.org/x/crypto v0.56.0
-	golang.org/x/net v0.57.0
+	golang.org/x/crypto v0.57.0
+	golang.org/x/net v0.60.0
+	golang.org/x/sys v0.48.0
 	gorm.io/gorm v1.31.1
 )
 
@@ -76,8 +77,7 @@ require (
 	github.com/ugorji/go/codec v1.3.1 // indirect
 	go.mongodb.org/mongo-driver/v2 v2.5.0 // indirect
 	golang.org/x/arch v0.22.0 // indirect
-	golang.org/x/sys v0.47.0 // indirect
-	golang.org/x/text v0.41.0 // indirect
+	golang.org/x/text v0.42.0 // indirect
 	google.golang.org/protobuf v1.36.10 // indirect
 	modernc.org/libc v1.22.5 // indirect
 	modernc.org/mathutil v1.5.0 // indirect

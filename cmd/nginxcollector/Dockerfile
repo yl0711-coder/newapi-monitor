@@ -1,4 +1,4 @@
-FROM golang:1.26.6-alpine3.23 AS build
+FROM golang:1.26.9-alpine3.23 AS build
 WORKDIR /src
 COPY cmd/nginxcollector/*.go ./
 # 采集器只依赖 Go 标准库；关闭 module 解析，避免为了它下载 Monitor 的 AWS/Gin/GORM 依赖。
