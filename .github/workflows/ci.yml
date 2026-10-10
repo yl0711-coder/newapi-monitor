@@ -105,6 +105,9 @@ jobs:
           touch local-untracked.txt
           touch .context-probe/nested/customer-export.csv
           touch monitor/ci-local-config.json
+          touch internal/observability/ci-probe_test.go
+          touch internal/observability/ci-local-config.json
+          touch internal/observability/schema/ci-local-config.json
           docker build -f .github/Dockerfile.context-check -t newapi-monitor-context-audit:${{ github.run_id }} .
           docker run --rm --entrypoint sh newapi-monitor-context-audit:${{ github.run_id }} -ec '
             test -e /context/go.mod &&
@@ -112,6 +115,11 @@ jobs:
             test -e /context/monitor/page.html &&
             test -e /context/cmd/hostagent/main.go &&
             test -e /context/cmd/nginxcollector/main.go &&
+            test -e /context/internal/observability/contract.go &&
+            test -e /context/internal/observability/identifiers.go &&
+            test -e /context/internal/observability/metrics.go &&
+            test -e /context/internal/observability/schema.go &&
+            test -e /context/internal/observability/schema/observability.v1.schema.json &&
             test ! -e /context/.local-data &&
             test ! -e /context/tools &&
             test ! -e /context/dev/ecs_acceptance_run.py &&
@@ -137,7 +145,10 @@ jobs:
             test ! -e /context/.context-probe/nested/ci-client.pfx &&
             test ! -e /context/local-untracked.txt &&
             test ! -e /context/.context-probe/nested/customer-export.csv &&
-            test ! -e /context/monitor/ci-local-config.json
+            test ! -e /context/monitor/ci-local-config.json &&
+            test ! -e /context/internal/observability/ci-probe_test.go &&
+            test ! -e /context/internal/observability/ci-local-config.json &&
+            test ! -e /context/internal/observability/schema/ci-local-config.json
           '
 
   # 保留全部竞态检测。按实际耗时拆分财务、渠道和稳定性等重分片。

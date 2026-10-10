@@ -61,3 +61,37 @@ test('all production images use the same patched Go build version as CI', () => 
   assert.match(job('image-security'), /labels: \$\{\{ steps.meta.outputs.labels \}\}/);
   assert.match(job('image-security'), /pull: true\s+no-cache-filters: runtime/);
 });
+
+test('Docker context allowlist includes observability sources and the embedded schema', () => {
+  const rules = readFileSync(new URL('../../.dockerignore', import.meta.url), 'utf8')
+    .split(/\r?\n/);
+  for (const rule of [
+    '!internal/observability/',
+    '!internal/observability/*.go',
+    '!internal/observability/schema/',
+    '!internal/observability/schema/observability.v1.schema.json',
+  ]) {
+    assert.ok(rules.includes(rule), 'missing production context rule: ' + rule);
+  }
+});
+
+test('Docker context audit checks observability assets and excluded fixtures', () => {
+  const audit = job('test').split('- name: Verify Docker build context isolation')[1] ?? '';
+  for (const file of [
+    'internal/observability/contract.go',
+    'internal/observability/identifiers.go',
+    'internal/observability/metrics.go',
+    'internal/observability/schema.go',
+    'internal/observability/schema/observability.v1.schema.json',
+  ]) {
+    assert.ok(audit.includes('test -e /context/' + file), 'missing context inclusion check: ' + file);
+  }
+  for (const file of [
+    'internal/observability/ci-probe_test.go',
+    'internal/observability/ci-local-config.json',
+    'internal/observability/schema/ci-local-config.json',
+  ]) {
+    assert.ok(audit.includes('touch ' + file), 'missing excluded context fixture: ' + file);
+    assert.ok(audit.includes('test ! -e /context/' + file), 'missing context exclusion check: ' + file);
+  }
+});

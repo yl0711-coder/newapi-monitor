@@ -22,6 +22,12 @@ monitor/public/**
 !monitor/public/*.html
 !internal/
 internal/**
+!internal/observability/
+internal/observability/**
+!internal/observability/*.go
+!internal/observability/schema/
+internal/observability/schema/**
+!internal/observability/schema/observability.v1.schema.json
 !internal/trafficclass/
 internal/trafficclass/**
 !internal/trafficclass/*.go
