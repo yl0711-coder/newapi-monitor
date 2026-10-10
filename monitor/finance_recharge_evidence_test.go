@@ -151,3 +151,39 @@ func TestFinanceRechargeRecordedChangesIgnoreUnrelatedSavesAndRetainInvalidity(t
 		t.Fatal("unrelated save/future version masked a real record discrepancy", changes)
 	}
 }
+
+func TestFinanceRechargeRecordedChangesUseEffectiveVersions(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		winner      channelRechargeVersion
+		wantChanges int
+	}{
+		{"equivalent_correction", channelRechargeVersion{Version: 4, EffectiveAt: 1800, Paid: 2, Credit: 20, Valid: true}, 0},
+		{"real_change", channelRechargeVersion{Version: 4, EffectiveAt: 1800, Paid: 1, Credit: 7.14, Valid: true}, 1},
+		{"invalid_winner", channelRechargeVersion{Version: 4, EffectiveAt: 1800}, 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			versions := []channelRechargeVersion{
+				{Version: 1, EffectiveAt: 0}, // Superseded invalid initial entry.
+				{Version: 2, EffectiveAt: 0, Paid: 1, Credit: 10, Valid: true},
+				{Version: 3, EffectiveAt: 1800, Paid: 1, Credit: 6.66, Valid: true},
+				tc.winner,
+				{Version: 5, EffectiveAt: 3600, Paid: 1, Credit: 1, Valid: true},
+			}
+			before := append([]channelRechargeVersion(nil), versions...)
+			changes := financeRechargeRecordedChanges(versions, 3600)
+			if len(changes) != tc.wantChanges {
+				t.Fatalf("superseded/future entry reported as effective change: %+v", changes)
+			}
+			if len(changes) == 1 && (changes[0].Before.Version != 2 || changes[0].After.Version != 4 || changes[0].After.Valid != tc.winner.Valid) {
+				t.Fatalf("wrong effective transition: %+v", changes)
+			}
+			if !reflect.DeepEqual(versions, before) {
+				t.Fatal("review changed immutable audit history")
+			}
+		})
+	}
+	if got := financeRechargeRecordedChanges(nil, 3600); got == nil || len(got) != 0 {
+		t.Fatal("empty history must remain an empty JSON array", got)
+	}
+}

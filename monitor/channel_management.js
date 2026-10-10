@@ -149,6 +149,8 @@ function init(){
     if(group){toggleSet(cm.collapsedGroups,group.dataset.cmGroupToggle);render()}
   });
   $('cmBody')?.addEventListener('change',event=>{
+    const historyMode=event.target.closest('[data-cost-history-mode]');
+    if(historyMode){updateCostHistoryMode(historyMode);return}
     const mode=event.target.closest('[data-cost-mode]');if(!mode)return;
     const channel=mode.closest('.cm-cost-source')?.querySelector('[data-cost-channel]');if(!channel)return;
     channel.disabled=mode.value!=='allocated';
@@ -524,7 +526,14 @@ function costHistoryBindingFields(domain,data,source,index,exactCandidateID){
   const candidateAvailable=channels.some(channel=>+channel.id===exactCandidateID);
   const channelID=+(proposalValue(binding,'local_channel_id','LocalChannelID')||(!binding&&candidateAvailable?exactCandidateID:0));
   const options=channels.map(channel=>`<option value="${+channel.id}" ${channelID===+channel.id?'selected':''}>#${+channel.id} ${esc(channel.name)}${channel.current===false?'（已删除，仅历史）':''}</option>`).join('');
-  return `<div class="cm-cost-history"><label><span>历史回填渠道 · 与未来配置分开</span><select data-cost-history-channel><option value="0">请选择历史归属渠道</option>${options}</select></label><label><span>开始时间 · 北京时间</span><input type="datetime-local" step="3600" data-cost-history-from value="${costHistoryHourInput(+source.first_hour)}"></label><label><span>结束时间 · 不含此小时</span><input type="datetime-local" step="3600" data-cost-history-to value="${costHistoryHourInput(+source.last_hour+3600)}"></label><button type="button" data-cm-cost-history-binding="${esc(String(domain.key||domain.domain))}" data-source-index="${index}" ${!channels.length?'disabled':''}>预演并回填所选时段</button><small>单次最多 90 天；可分段补齐，不能与已确认归属重叠。仅处理所选范围内已有证据的小时。</small></div>`;
+  return `<div class="cm-cost-history"><label><span>历史归属方式 · 与未来配置分开</span><select data-cost-history-mode><option value="allocated">指定本地渠道</option><option value="shared">历史共享 · 不分摊</option></select></label><label><span>历史回填渠道</span><select data-cost-history-channel><option value="0">请选择历史归属渠道</option>${options}</select></label><label><span>开始时间 · 北京时间</span><input type="datetime-local" step="3600" data-cost-history-from value="${costHistoryHourInput(+source.first_hour)}"></label><label><span>结束时间 · 不含此小时</span><input type="datetime-local" step="3600" data-cost-history-to value="${costHistoryHourInput(+source.last_hour+3600)}"></label><button type="button" data-cm-cost-history-binding="${esc(String(domain.key||domain.domain))}" data-source-index="${index}" ${!channels.length?'disabled':''}>预演并回填所选时段</button><small>单次最多 90 天；可分段补齐，不能与已确认归属重叠。仅处理所选范围内已有证据的小时。历史共享保留账户成本，不猜测渠道分摊；当前令牌匹配不代表历史归属。</small></div>`;
+}
+function updateCostHistoryMode(mode){
+  const row=mode.closest('.cm-cost-history'),channel=row?.querySelector('[data-cost-history-channel]'),button=row?.querySelector('[data-cm-cost-history-binding]');
+  if(!channel||!button)return;
+  channel.disabled=mode.value==='shared';
+  if(channel.disabled)channel.value='0';
+  button.disabled=mode.value!=='shared'&&channel.options.length<=1;
 }
 function costLedgerStatus(status){
   return ({pending:'待审批',scheduled:'待生效',applied:'已生效',rejected:'已驳回',rollback_scheduled:'回滚待生效',rolled_back:'已回滚',conflict:'冲突',cancelled:'已取消'})[status]||status||'未知';
@@ -564,7 +573,8 @@ function costSourceRows(domain,data){
     const channelID=+(proposalValue(binding,'local_channel_id','LocalChannelID')||suggestedChannelID||0);
     const channelOptions=channels.map(channel=>`<option value="${+channel.id}" ${channelID===+channel.id?'selected':''}>#${+channel.id} ${esc(channel.name)}</option>`).join('');
     const groups=(source.source_groups||[]).slice(0,3),models=(source.upstream_models||[]).slice(0,3),identity=String(source.source_ref||'').slice(-8);
-    const historyCount=Number(source.historical_binding_count||0),historyNote=historyCount?`已有 ${nfmt(historyCount)} 段历史归属`:'历史回填使用下方独立选择，不改变未来配置';
+    const historyCount=Number(source.historical_binding_count||0),sharedCount=Number(source.historical_shared_binding_count||0);
+    const historyNote=historyCount?`已有 ${nfmt(historyCount)} 段历史归属${sharedCount>0?` · 其中 ${nfmt(sharedCount)} 段共享不分摊`:''}`:'历史回填使用下方独立选择，不改变未来配置';
     let ownershipNote='';
     if(ownership?.state==='exact_unique')ownershipNote=`密钥精确匹配：#${nfmt(exactCandidateID)} ${exactCandidate?.name||''}${candidateAvailable?'；已作为候选预填，回填前仍会校验历史时段证据':costHistoricalChannels(domain,data).some(channel=>+channel.id===exactCandidateID)?'；已作为历史回填候选，未来配置保持不变，历史归属仍需人工核实':'；本地渠道目录中不可选，需核对快照与主域名'}`;
     else if(ownership?.state==='exact_shared')ownershipNote=`同一上游 Key 被 ${nfmt(ownership.candidates?.length||0)} 个本地渠道共用，不能自动归属`;
@@ -659,19 +669,23 @@ function costHistoryFailureNote(failed,total){
 async function saveHistoricalCostBinding(key,index){
   const domain=reportDomain(key),data=cm.costLedger.get(key),source=data?.sources?.[index];if(!domain||!source)return;
   const button=document.querySelector(`[data-cm-cost-history-binding="${CSS.escape(key)}"][data-source-index="${index}"]`),row=button?.closest('.cm-cost-source');
-  const channelID=+(row?.querySelector('[data-cost-history-channel]')?.value||0);
-  if(!channelID||!costHistoricalChannels(domain,data).some(channel=>+channel.id===channelID)){alert('历史回填请先选择目录中的历史归属渠道。');return}
+  const mode=row?.querySelector('[data-cost-history-mode]')?.value||'allocated',shared=mode==='shared';
+  if(!['allocated','shared'].includes(mode)){alert('请选择有效的历史归属方式。');return}
+  const channelID=shared?0:+(row?.querySelector('[data-cost-history-channel]')?.value||0);
+  if(!shared&&(!channelID||!costHistoricalChannels(domain,data).some(channel=>+channel.id===channelID))){alert('历史回填请先选择目录中的历史归属渠道。');return}
   const selectedFrom=parseCostHistoryHour(row?.querySelector('[data-cost-history-from]')?.value),selectedTo=parseCostHistoryHour(row?.querySelector('[data-cost-history-to]')?.value);
   if(!Number.isSafeInteger(selectedFrom)||!Number.isSafeInteger(selectedTo)||selectedTo<=selectedFrom){alert('请选择有效的北京时间整小时时段，结束时间不包含在内。');return}
-  const reason=window.prompt(`将来源 …${String(source.source_ref||'').slice(-8)} 的已采集历史归属到渠道 #${channelID}。\n请填写可追溯的核对依据：`,'已核对上游令牌来源与本地渠道历史归属');
+  const target=shared?'标记为历史共享，不分摊到渠道':`归属到渠道 #${channelID}`;
+  const reason=window.prompt(`将来源 …${String(source.source_ref||'').slice(-8)} 的已采集历史${target}。\n请填写可追溯的核对依据：`,shared?'':'已核对上游令牌来源与本地渠道历史归属');
   if(!reason?.trim())return;
-  const body={domain:domain.domain,account_epoch:data.accountEpoch,source_ref:source.source_ref,local_channel_id:channelID,reason:reason.trim(),valid_from:selectedFrom,valid_to:selectedTo};
+  const body={domain:domain.domain,account_epoch:data.accountEpoch,source_ref:source.source_ref,local_channel_id:channelID,allocation_mode:mode,reason:reason.trim(),valid_from:selectedFrom,valid_to:selectedTo};
   button.disabled=true;
   try{
     const previewRes=await fetch('/channels/cost/historical-bindings/preview',{method:'POST',headers:{Accept:'application/json','Content-Type':'application/json'},body:JSON.stringify(body)}),preview=await previewRes.json();
     if(!previewRes.ok)throw new Error(preview.error||`预演 HTTP ${previewRes.status}`);
     const binding=preview.binding||{},plannedFrom=Number(proposalValue(binding,'valid_from','ValidFrom')),plannedTo=Number(proposalValue(binding,'valid_to','ValidTo'));
     if(!Number.isSafeInteger(plannedFrom)||!Number.isSafeInteger(plannedTo)||plannedFrom%3600||plannedTo%3600||plannedFrom<selectedFrom||plannedTo>selectedTo||plannedTo<=plannedFrom)throw new Error('预演范围与所选时段不一致，请刷新页面后重新预演。');
+    if(shared&&(proposalValue(binding,'allocation_mode','AllocationMode')!=='shared'||proposalValue(binding,'local_channel_id','LocalChannelID')!==0||preview.temporal_overlap_quality!=='shared'))throw new Error('服务端未确认历史共享模式，已停止写入，请刷新后重试。');
     const from=costHistoryHourInput(plannedFrom).replace('T',' '),to=costHistoryHourInput(plannedTo).replace('T',' ');
     const activity=preview.has_local_activity?`所选渠道在其中 ${nfmt(preview.local_active_hours)} 个小时有活动，共 ${nfmt(preview.local_requests)} 个请求${costHistoryFailureNote(preview.local_failed_requests,preview.local_requests)}。`:'⚠ 所选渠道在这些小时没有本地请求，请重点核对归属。';
     const testActivity=Number(preview.local_test_requests||0)>0?`内部测试：${nfmt(preview.local_test_active_hours)} 个小时 / ${nfmt(preview.local_test_requests)} 请求${costHistoryFailureNote(preview.local_test_failed_requests,preview.local_test_requests)}（时段覆盖 ${(Math.max(0,Math.min(1,Number(preview.test_activity_coverage)||0))*100).toFixed(1)}%）。`:'内部测试：未发现同时段请求。';
@@ -680,8 +694,10 @@ async function saveHistoricalCostBinding(key,index){
     const requestBasis='本站活动包含失败记录，上游成本证据来自消费日志，不能直接用请求数差额判定漏采或扣减成本。';
     const warningText=`\n${requestBasis}`+(warnings.length?`\n风险提示：\n- ${warnings.join('\n- ')}`:'');
     const costEvidence=`上游金额：${economicsMoneyLabel(preview.evidence_billed_cost)}；其中本地有活动的同小时 ${economicsMoneyLabel(preview.active_billed_cost)}（${(costCoverage*100).toFixed(1)}%），无同小时活动 ${economicsMoneyLabel(preview.inactive_billed_cost)} / ${nfmt(preview.inactive_evidence_requests)} 请求。`;
-    if(!window.confirm(`回填影响预演\n来源：…${String(source.source_ref||'').slice(-8)}\n渠道：#${channelID} ${preview.channel_name||''}\n时段：${from} 至 ${to}\n上游证据：${nfmt(preview.evidence_hours)} 小时 / ${nfmt(preview.evidence_requests)} 请求\n${activity}\n${testActivity}\n客户流量同小时覆盖：${(coverage*100).toFixed(1)}% （时段证据${qualityLabel}）\n${costEvidence}${warningText}\n注：时段和金额重叠只是复核证据，不等于上游令牌归属证明；内部测试成本不得混入客户毛利。\n\n确认写入审计映射并排队重算？\n不会修改 NewAPI 渠道或未来路由。`))return;
-    if(quality!=='strong'&&!window.confirm(`该映射的历史归属证据为“${qualityLabel}”。\n已人工核对上游令牌、账户或变更记录，仍要继续吗？`))return;
+    const details=shared?`归属：历史共享 · 不分摊\n上游已采集金额：${economicsMoneyLabel(preview.evidence_billed_cost)}（账单原值，未作充值比例修正）。\n仅核验对平的 ${nfmt(preview.will_queue_hours)} 个小时进入重算；其余不是零成本。\n账户成本只保留一次，不按请求数或 Tokens 分摊到各渠道。\n内部测试或站外使用尚未拆分，不据此确认客户毛利。`:`渠道：#${channelID} ${preview.channel_name||''}\n${activity}\n${testActivity}\n客户流量同小时覆盖：${(coverage*100).toFixed(1)}% （时段证据${qualityLabel}）\n${costEvidence}${warningText}\n注：时段和金额重叠只是复核证据，不等于上游令牌归属证明；内部测试成本不得混入客户毛利。`;
+    if(!window.confirm(`回填影响预演\n来源：…${String(source.source_ref||'').slice(-8)}\n时段：${from} 至 ${to}\n上游证据：${nfmt(preview.evidence_hours)} 小时 / ${nfmt(preview.evidence_requests)} 请求\n${details}\n\n确认写入审计映射并排队重算？\n不会修改 NewAPI 渠道或未来路由。`))return;
+    const finalWarning=shared?'已人工核对该来源在所选时段为共享使用，并理解本次不确认各渠道成本、也不扣除内部测试成本，仍要继续吗？':`该映射的历史归属证据为“${qualityLabel}”。\n已人工核对上游令牌、账户或变更记录，仍要继续吗？`;
+    if((shared||quality!=='strong')&&!window.confirm(finalWarning))return;
     // Freeze the observed interval before confirmation; later evidence must
     // not silently extend this operation to hours the operator did not see.
     const savedBody={...body,valid_from:plannedFrom,valid_to:plannedTo};

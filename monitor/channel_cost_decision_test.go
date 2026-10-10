@@ -690,6 +690,8 @@ func TestChannelCostDecisionRoutesRequireRealRootSession(t *testing.T) {
 	}{
 		{http.MethodGet, "/channels/cost/sources?domain=" + proposal.Domain, "", http.StatusOK},
 		{http.MethodPost, "/channels/cost/bindings", `{}`, http.StatusBadRequest},
+		{http.MethodPost, "/channels/cost/historical-bindings/preview", `{"allocation_mode":"shared"}`, http.StatusBadRequest},
+		{http.MethodPost, "/channels/cost/historical-bindings", `{"allocation_mode":"shared"}`, http.StatusBadRequest},
 		{http.MethodGet, "/channels/cost/proposals?domain=" + proposal.Domain, "", http.StatusOK},
 		{http.MethodGet, "/channels/cost/proposals/" + proposal.ProposalKey + "/impact", "", http.StatusOK},
 		{http.MethodPost, "/channels/cost/proposals/invalid/decisions", `{}`, http.StatusBadRequest},

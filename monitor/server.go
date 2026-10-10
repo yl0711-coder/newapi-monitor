@@ -65,6 +65,9 @@ var stabilityCSS []byte // Monitor 管理端新框架与稳定性报表样式；
 //go:embed stability.js
 var stabilityJS []byte // 稳定性报表交互；页面请求只访问 /stability/* 本地汇总接口
 
+//go:embed quantile_display.js
+var quantileDisplayJS []byte
+
 //go:embed logchain.js
 var logChainJS []byte // 客户排障页交互；只访问 /logchain/* 管理员接口
 
@@ -212,6 +215,10 @@ func (m *Monitor) RegisterRoutes(r *gin.Engine) {
 	r.GET("/stability.js", func(c *gin.Context) {
 		c.Header("Cache-Control", "no-cache")
 		c.Data(http.StatusOK, "application/javascript; charset=utf-8", stabilityJS)
+	})
+	r.GET("/quantile_display.js", func(c *gin.Context) {
+		c.Header("Cache-Control", "no-cache")
+		c.Data(http.StatusOK, "application/javascript; charset=utf-8", quantileDisplayJS)
 	})
 	r.GET("/channel-management.js", func(c *gin.Context) {
 		c.Header("Cache-Control", "no-cache")

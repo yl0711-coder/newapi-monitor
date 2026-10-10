@@ -50,6 +50,7 @@ func TestChannelCostFailedRequestsSealedLocalRehearsal(t *testing.T) {
 }
 
 type sealedCostCandidate struct {
+	snapshotSHA256, databaseEnv                          string
 	channel                                              int
 	sourceRef                                            string
 	from                                                 int64
@@ -61,11 +62,18 @@ type sealedCostCandidate struct {
 
 func rehearseSealedCostCandidate(t *testing.T, fixture sealedCostCandidate) {
 	t.Helper()
-	source := os.Getenv("MONITOR_SPLIT_ACCEPTANCE_DB")
+	databaseEnv := fixture.databaseEnv
+	if databaseEnv == "" {
+		databaseEnv = "MONITOR_SPLIT_ACCEPTANCE_DB"
+	}
+	source := os.Getenv(databaseEnv)
 	if source == "" {
 		t.Skip("requires a pinned sealed local snapshot")
 	}
-	const digest = "94b5ee4e2bdce45228676eb61ce4e54c0dc5e95dc8baa00f618eaf9c7f37f0b2"
+	digest := fixture.snapshotSHA256
+	if digest == "" {
+		digest = "94b5ee4e2bdce45228676eb61ce4e54c0dc5e95dc8baa00f618eaf9c7f37f0b2"
+	}
 	from, to := fixture.from, fixture.from+int64(len(fixture.charges))*3600
 	var upstreamRequests, customerRequests, revenue, sourceCost, activeHours int64
 	hours := make([]int64, len(fixture.charges))

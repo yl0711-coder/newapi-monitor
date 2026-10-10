@@ -14,7 +14,7 @@
     verified: '已核验', incomplete: '覆盖不完整', no_data: '暂无数据',
     paired_verified: '配对已核验', partially_paired: '部分配对',
     binding_required: '待完成来源归属', not_enrolled: '未进入配对账本', not_required: '暂不纳入',
-    in_progress: '闭环进行中', bill_not_connected: '账单未接入',
+    in_progress: '配对待核验', bill_not_connected: '账单未接入',
     bill_missing: '账单证据缺失', correction_missing: '缺修正依据', correction_ambiguous: '历史比例边界待核对', source_binding_required: '成本来源待归属',
     cost_evidence_missing: '成本证据未采集', cost_evidence_incomplete: '成本证据未补齐', finance_history_missing: '历史财务版本缺失', ledger_backfill_required: '待试算配对账本',
     local_estimate_ready: '可闭合的本地估算', pricing_evidence_only: '仅倍率/费用证据', adapter_probe_required: '需适配器探测', range_exceeds_limit: '超过安全历史范围',
@@ -710,7 +710,7 @@
       return result;
     }, {});
     const groups = [
-      ['not_required', '暂不纳入', '未配置上游账户，不进入覆盖率和利润'],
+      ['not_required', '暂不纳入', '未配置不自动补采；成本未知，不按零计算利润'],
       ['precheck_required', '待灰度前核对', '已有账单与修正证据'],
       ['correction_missing', '缺修正依据', '先补充值比例或审计证据'],
       ['correction_ambiguous', '历史比例边界待核对', '区分配置录入纠正与真实比例变化'],
@@ -721,7 +721,7 @@
       ['finance_history_missing', '历史财务版本缺失', '不用当前配置覆盖历史'],
       ['source_binding_required', '成本来源待归属', '需核对历史时段与本地渠道'],
       ['ledger_backfill_required', '待试算配对账本', '前置证据已具备'],
-      ['in_progress', '闭环进行中', '继续补来源绑定与历史版本'],
+      ['in_progress', '配对待核验', '核对历史依据；不代表后台正在补采'],
       ['verified', '闭环已核验', '收入成本已经同窗闭合'],
     ].filter(([key]) => Number(counts[key] || 0) > 0);
     target.innerHTML = groups.length ? groups.map(([key, label, note]) =>
@@ -851,6 +851,15 @@
   }
 
   function closureAction(row) {
+    // Accounting readiness is not a worker execution state. Correct old
+    // cached explanations too, without invalidating any monetary snapshot.
+    if (row.closure_readiness === 'in_progress') {
+      const count = Number(row.unallocated_sources);
+      const reason = Number.isSafeInteger(count) && count > 0
+        ? `有 ${count.toLocaleString('zh-CN')} 个成本来源未归属，需核对历史渠道绑定。`
+        : '需核对历史财务版本和同小时收入成本依据。';
+      return `配对尚未核验完成；${reason}此状态不代表后台正在补采，任务运行情况见数据同步状态。`;
+    }
     // Old persistent snapshots may still contain the former claim that a
     // recorded rate boundary proves a real payment-rate change. Correct the
     // explanation without invalidating cached amounts or rebuilding history.
