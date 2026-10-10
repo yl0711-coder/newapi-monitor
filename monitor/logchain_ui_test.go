@@ -593,8 +593,8 @@ func TestLogChainFocusedReasonUIWiring(t *testing.T) {
 			t.Errorf("筛选原因模式前端接线缺少 %q", want)
 		}
 	}
-	if !strings.Contains(pageHTML, `<script src="/logchain.js?v=16"></script>`) {
-		t.Error("logchain.js 行为已变化但缓存版本未提升到 v16")
+	if !strings.Contains(pageHTML, `<script src="/logchain.js?v=18"></script>`) {
+		t.Error("logchain.js 行为已变化但缓存版本未提升到 v17")
 	}
 }
 
@@ -1014,8 +1014,8 @@ func TestLogChainCloudWatchIsOnDemandOnly(t *testing.T) {
 	}
 	// 换筛选条件后必须清空：行集整体替换时若沿用旧结果，相同行 id 会把
 	// 上一次查询的证据显示在新一次查询的行下面，页面上完全看不出来。
-	if !strings.Contains(js, "lc.cwState.clear()") {
-		t.Error("重新查询时必须清空按需证据结果，避免跨查询错配")
+	if !strings.Contains(js, "if(!more)clearRowInvestigationStates()") || !strings.Contains(js, "id!==STANDALONE_INVESTIGATION") {
+		t.Error("重新查询时必须清空行级证据结果并保留独立排障任务，避免跨查询错配")
 	}
 	// 竞态与防连点：迟到响应不得覆盖更新的一次查询。
 	if !strings.Contains(js, "cur.seq!==seq") {

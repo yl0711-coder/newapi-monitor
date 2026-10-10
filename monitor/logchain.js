@@ -3,9 +3,10 @@
 
 // 客户排障（tab-logchain）。回答"某客户某条请求走了哪个上游、上游返回了什么错"。
 //
-// 只访问两个接口，都在 view 组（管理员）：
+// 使用现有只读排障接口，都在 view 组（管理员）：
 //   GET /logchain/requests  逐条明细（查生产 logs，含 type=5）
 //   GET /logchain/filters   下拉取值（只读本地 channel_snaps）
+//   POST /logchain/investigations  受控异步排障，敏感输入只在请求体中传递
 //
 // 默认看错误 + 全部异常（anomaly=err_anom）：本页定位是“问题清单”，不是全量请求流水。
 // 错误、流故障、客户端断连和交付/计费异常都应默认可见；需要单看某类时再切换范围。
@@ -19,6 +20,7 @@ const lc={
   // 用 Map 而不是写回 row：行会被 render 整体重建，挂在行上会连同结果一起丢。
   cloudWatchEnabled:false,
   cwState:new Map(),
+  cwSequence:0,
   // 已应用的查询范围：起止日期 + 起止分钟，四者都包含在内。
   // date/toDate 相同即单日；不同即跨日（客户常给“昨晚 22:40 到今早 09:15”）。
   date:'',            // 开始日期 YYYY-MM-DD（CST），空=今天
@@ -105,6 +107,7 @@ window.logChainActivate=function(){
 // 触发的旧请求即使稍后进入 catch/finally，也无权改写当前页面状态。
 window.logChainDeactivate=function(){
   if(!lc.inited)return;
+  closeStandaloneInvestigation();
   ++lc.generation;
   lc.abort?.abort();
   lc.abort=null;
@@ -264,6 +267,7 @@ function init(){
   lc.inited=true;
   lc.date=lc.date||cstToday();
   lc.toDate=lc.toDate||lc.date;
+  initStandaloneInvestigation();
 
   $('lcPrevDay')?.addEventListener('click',()=>{
     clearDiagnosisContext();
@@ -570,7 +574,7 @@ async function load(more){
     // 不清的话，若新结果里出现相同行 id，上一次查询的证据会显示在新行下面，
     // 等于把 A 请求的入口证据当成 B 请求的——这类错误在页面上完全看不出来。
     // more=true 是「加载更早」，旧行仍在表里，结果要保留。
-    if(!more)lc.cwState.clear();
+    if(!more)clearRowInvestigationStates();
     lc.rows=more?lc.rows.concat(data.rows||[]):(data.rows||[]);
     lc.hasMore=!!data.has_more;
     lc.nextBeforeTs=+data.next_before_ts||0;
@@ -1198,8 +1202,22 @@ const CW_STATUS_LABEL={
   invalid:'查询条件不被接受',
   skipped:'本次未查询'
 };
-const CW_LINKAGE_LABEL={exact:'精确关联',correlated:'高置信相关',ambiguous:'候选（不能据此定责）',inferred:'推断'};
+const CW_LINKAGE_LABEL={exact:'精确关联',correlated:'高置信相关',ambiguous:'候选（不能据此定责）',inferred:'推断',unavailable:'缺少必要证据'};
 const CW_TASK_STATUS_LABEL={queued:'排队中',running:'查询中',pending_delivery:'等待 CloudFront 日志投递',complete:'已完成',partial:'部分完成',failed:'查询失败',cancelled:'已取消'};
+
+function sharedEvidenceLabel(e){
+  if(e?.candidate)return '候选（未建立唯一关联，不能据此定责）';
+  return CW_LINKAGE_LABEL[e?.evidence_level]||CW_LINKAGE_LABEL.unavailable;
+}
+
+function sharedSourceEvidenceLabel(events,source){
+  const matched=events.filter(e=>e.source===source);
+  if(!matched.length)return CW_LINKAGE_LABEL.unavailable;
+  if(matched.some(e=>e.candidate))return sharedEvidenceLabel({candidate:true});
+  const rank={unavailable:0,inferred:1,correlated:2,exact:3};
+  const weakest=matched.reduce((a,b)=>(rank[a.evidence_level]??0)<=(rank[b.evidence_level]??0)?a:b);
+  return sharedEvidenceLabel(weakest);
+}
 
 // 全链路结果对客户排障只保留两个答案：问题原因、问题位置。
 // classification 是后端闭集枚举，不能把英文机器值直接丢给使用者。
@@ -1213,35 +1231,124 @@ const CW_FAULT_LOCATION_LABEL={
   upstream_error:'上游渠道',
   platform_error:'平台配置 / 路由 / 运行时',
   downstream_disconnect:'客户侧连接',
-  business_completed:'未发现平台或上游故障',
+  business_completed:'已记录消费，不能据此确认无故障',
   inconclusive:'暂无法确定（证据不足）'
 };
 const CW_ROW_FAULT_LOCATION={upstream:'上游渠道',ours:'平台自身',downstream:'客户侧连接 / 网络',unknown:'待判'};
 
+// 独立入口不继承日志筛选、不依赖业务行；原始身份只留在表单和 POST 请求体。
+const STANDALONE_INVESTIGATION='standalone-investigation';
+const STANDALONE_INPUTS=['lcInvestigationFrom','lcInvestigationTo','lcInvestigationRequestID','lcInvestigationCloudFrontID','lcInvestigationUserID','lcInvestigationPath'];
+
+function clearRowInvestigationStates(){
+  for(const id of lc.cwState.keys()){
+    if(id!==STANDALONE_INVESTIGATION)lc.cwState.delete(id);
+  }
+}
+
+function initStandaloneInvestigation(){
+  window.addEventListener?.('pagehide',closeStandaloneInvestigation);
+  $('lcInvestigationOpen')?.addEventListener('click',()=>{
+    const panel=$('lcInvestigationPanel');
+    if(!panel)return;
+    panel.hidden=false;
+    $('lcInvestigationOpen')?.setAttribute('aria-expanded','true');
+    $('lcInvestigationFrom')?.focus();
+  });
+  $('lcInvestigationClose')?.addEventListener('click',closeStandaloneInvestigation);
+  $('lcInvestigationForm')?.addEventListener('submit',e=>{
+    e.preventDefault();
+    return submitStandaloneInvestigation();
+  });
+  $('lcInvestigationResult')?.addEventListener('click',e=>{
+    const cancel=e.target.closest('[data-lc-cw-cancel]');
+    if(cancel)cancelCloudWatchInvestigation(STANDALONE_INVESTIGATION);
+  });
+}
+
+function closeStandaloneInvestigation(){
+  for(const id of STANDALONE_INPUTS)if($(id))$(id).value='';
+  if($('lcInvestigationSensitive'))$('lcInvestigationSensitive').checked=false;
+  if($('lcInvestigationPanel'))$('lcInvestigationPanel').hidden=true;
+  $('lcInvestigationOpen')?.setAttribute('aria-expanded','false');
+  lc.cwState.delete(STANDALONE_INVESTIGATION);
+  renderStandaloneInvestigation();
+}
+
+function investigationInputTime(value){
+  // datetime-local 是显式北京时间，不按浏览器所在时区解释；拒绝 JS 自动修正的无效日期。
+  if(!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/.test(value))return null;
+  const ms=Date.parse(value+':00+08:00');
+  if(!Number.isFinite(ms)||new Date(ms+8*3600000).toISOString().slice(0,16)!==value)return null;
+  return new Date(ms).toISOString();
+}
+
+function standaloneInvestigationPayload(){
+  const value=id=>String($(id)?.value||'').trim();
+  const from=investigationInputTime(value('lcInvestigationFrom')),to=investigationInputTime(value('lcInvestigationTo'));
+  if(!from||!to)throw new Error('请填写完整的开始和结束时间（北京时间）。');
+  const span=Date.parse(to)-Date.parse(from);
+  if(span<=0||span>7200000)throw new Error('时间范围必须大于 0 且不超过 2 小时。');
+  const requestID=value('lcInvestigationRequestID'),cloudFrontID=value('lcInvestigationCloudFrontID'),
+    userID=value('lcInvestigationUserID'),path=value('lcInvestigationPath');
+  if(!requestID&&!cloudFrontID&&!userID&&!path)throw new Error('请至少填写 Request ID、CloudFront ID、客户 ID 或 API 路径中的一项。');
+  if(userID&&(!/^[1-9]\d*$/.test(userID)||!Number.isSafeInteger(Number(userID))))throw new Error('客户 ID 必须是可精确表示的正整数。');
+  if(path&&(!path.startsWith('/')||path.length>1024||/[?#\u0000-\u001f\u007f]/.test(path)))throw new Error('请填写以 / 开头的 API 路径，不要包含查询参数、片段或控制字符。');
+  return {schema_version:'observability.v1',from,to,timezone:'Asia/Shanghai',
+    ...(requestID?{newapi_request_id:requestID}:{}),...(cloudFrontID?{cloudfront_request_id:cloudFrontID}:{}),
+    ...(userID?{user_id:Number(userID)}:{}),...(path?{path}:{}),
+    include_sensitive_diagnostics:!!$('lcInvestigationSensitive')?.checked,purpose:'独立全链路排障'};
+}
+
+async function submitStandaloneInvestigation(){
+  if(lc.cwState.get(STANDALONE_INVESTIGATION)?.loading)return;
+  let payload;
+  try{payload=standaloneInvestigationPayload()}catch(err){
+    lc.cwState.set(STANDALONE_INVESTIGATION,{loading:false,error:err.message});
+    renderStandaloneInvestigation();return;
+  }
+  // 查询条件可能已改变，不能把上次查询结论留在新条件下。
+  lc.cwState.delete(STANDALONE_INVESTIGATION);
+  await createCloudWatchInvestigation(STANDALONE_INVESTIGATION,payload);
+}
+
+function renderStandaloneInvestigation(){
+  const result=$('lcInvestigationResult');
+  if(result)result.innerHTML=cloudWatchBlockBody(STANDALONE_INVESTIGATION);
+  const loading=!!lc.cwState.get(STANDALONE_INVESTIGATION)?.loading;
+  if($('lcInvestigationFields'))$('lcInvestigationFields').disabled=loading;
+  if($('lcInvestigationSubmit')){
+    $('lcInvestigationSubmit').disabled=loading;
+    $('lcInvestigationSubmit').textContent=loading?'排障中…':'开始排障';
+  }
+}
+
 async function loadCloudWatchEvidence(id){
   const row=(lc.rows||[]).find(x=>String(x.id)===String(id));
   if(!row||!row.request_id)return;
-  const prev=lc.cwState.get(id)||{};
-  if(prev.loading)return; // 防连点：一次点击只发一次，避免重复计费与重复排队
-  const seq=(prev.seq||0)+1;
   const includeSensitive=!!document.querySelector(`[data-lc-cw-sensitive="${String(id).replace(/"/g,'')}"]`)?.checked;
   // 路径可帮助在生产库暂时不可用时查询入口日志，但只带符合接口边界的值；
   // 不合规路径直接省略，让精确 Request ID 仍能完成应用层排障。
   const rawPath=typeof row.request_path==='string'?row.request_path.trim():'';
   const safePath=rawPath&&rawPath.startsWith('/')&&rawPath.length<=1024&&!/[\u0000-\u001f\u007f]/.test(rawPath)?rawPath:'';
+  // 精确 Request ID 已足够定位，沿用旧入口，不回传业务行的冗余筛选。
+  await createCloudWatchInvestigation(id,{newapi_request_id:row.request_id,at_unix:row.created_at,
+    ...(safePath?{path:safePath}:{}),include_sensitive_diagnostics:includeSensitive,purpose:'客户单请求全链路排障'});
+}
+
+async function createCloudWatchInvestigation(id,payload){
+  const prev=lc.cwState.get(id)||{};
+  if(prev.loading)return;
+  // 关闭后重开也不能复用序号，否则上一次迟到响应可能污染新任务。
+  const seq=++lc.cwSequence;
+  const includeSensitive=!!payload.include_sensitive_diagnostics;
   lc.cwState.set(id,{loading:true,seq,result:prev.result,error:'',includeSensitive,investigationId:''});
   render();
   try{
     const r=await fetch('/logchain/investigations',{
       method:'POST',cache:'no-store',
       headers:{'Content-Type':'application/json','Accept':'application/json'},
-      // 有精确 Request ID 时，业务行上的客户/模型/分组都是冗余筛选。
-      // 不把它们回传给排障接口：历史日志里的 group 可能包含业务系统允许、
-      // 但 CloudWatch 查询过滤器不接受的字符（或看起来像 secret 的片段），
-      // 这会让点击单条记录时无故得到“group 不合法”。候选查询会用 Request ID
-      // 重新取回同一行，并自行补出路径、模型和分组。
-      body:JSON.stringify({newapi_request_id:row.request_id,at_unix:row.created_at,
-        ...(safePath?{path:safePath}:{}),include_sensitive_diagnostics:includeSensitive,purpose:'客户单请求全链路排障'})
+      body:JSON.stringify(payload)
     });
     const data=await r.json().catch(()=>({}));
     const cur=lc.cwState.get(id)||{};
@@ -1252,6 +1359,7 @@ async function loadCloudWatchEvidence(id){
       lc.cwState.set(id,{loading:false,seq,result:cur.result,error:data.error||('创建任务失败（HTTP '+r.status+'）'),includeSensitive});
     }else{
       const investigationId=data.investigation_id||'';
+      if(!investigationId)throw new Error('服务未返回排障任务 ID，请重试。');
       lc.cwState.set(id,{loading:true,seq,result:cur.result,error:'',includeSensitive,investigationId});
       render();
       pollCloudWatchInvestigation(id,investigationId,seq,+data.poll_after_ms||800);
@@ -1302,9 +1410,11 @@ async function cancelCloudWatchInvestigation(id){
       method:'POST',cache:'no-store',headers:{Accept:'application/json'}
     });
     const data=await r.json().catch(()=>({}));
+    if(lc.cwState.get(id)?.seq!==st.seq)return;
     if(!r.ok)throw new Error(data.error||('取消失败（HTTP '+r.status+'）'));
-    lc.cwState.set(id,{...st,loading:false,result:data,error:''});
+    lc.cwState.set(id,{...st,seq:++lc.cwSequence,loading:false,result:data,error:''});
   }catch(err){
+    if(lc.cwState.get(id)?.seq!==st.seq)return;
     lc.cwState.set(id,{...st,error:'取消失败：'+(err&&err.message?err.message:'网络错误')});
   }
   render();
@@ -1320,8 +1430,14 @@ function cloudWatchBlockBody(id){
   if(st.loading)parts.push(`<div class="lc-sub">异步任务正在查询 CloudWatch… <button type="button" class="lc-jump" data-lc-cw-cancel="${esc(id)}">取消</button></div>`);
   if(st.error)parts.push(`<div class="lc-cw-err">${esc(st.error)}</div>`);
   const res=st.result;
-  const sources=res&&(res.source_status||res.sources);
-  if(res&&Array.isArray(sources)){
+  const sourceResult=res&&(res.source_status||res.sources);
+  const sources=Array.isArray(sourceResult)?sourceResult:[];
+  if(res){
+    // 排队、刚启动和提前取消时 source_status 可以是 null；任务状态不能依赖来源数组。
+    parts.push(`<div class="lc-sub lc-cw-task-status">任务状态：${esc(CW_TASK_STATUS_LABEL[res.status]||'状态未知')}</div>`);
+    if(!Array.isArray(sourceResult))parts.push('<div class="lc-sub">尚未取得来源结果；不代表请求没有发生，也不能据此确定责任方。</div>');
+    const observability=res.observability?.schema_version==='observability.v1'?res.observability:null;
+    const sharedSummary=observability?.summary;
     const listedRow=(lc.rows||[]).find(x=>String(x.id)===String(id))||{};
     // 排障任务会重新补全上游/入口证据；优先使用任务返回的候选行，
     // 让“问题原因/位置”反映本次排障后的最新归因，而不是点击前的旧快照。
@@ -1343,13 +1459,19 @@ function cloudWatchBlockBody(id){
     }
     if(!location&&row.fault)location=CW_ROW_FAULT_LOCATION[row.fault]||'待判';
     if(!location)location='暂无法确定（证据不足）';
+    if(sharedSummary?.fault_class==='unknown'&&
+      (!summary.classification||['inconclusive','application_reached','business_completed'].includes(summary.classification))){
+      location='待判（已记录错误或异常，责任尚不明确）';
+    }
+    if(sharedSummary&&(sharedSummary.candidate||sharedSummary.evidence_level==='unavailable'))location='暂无法确定（证据不足，候选不作为定责依据）';
     // 对上游/平台结论补出具体渠道或域名，方便直接定位到责任对象。
     const target=row.channel_name||row.upstream_domain||'';
     if(target&&(/上游渠道|平台应用链路/.test(location)))location+=`（${target}）`;
     const rowReason=String(row.fault_reason||'').trim();
     const genericSummary=['inconclusive','application_reached','business_completed'].includes(summary.classification);
-    const cause=String((genericSummary&&rowReason)?rowReason:(summary.conclusion||rowReason||'暂无法确定：当前证据不足以判断错误原因')).trim();
-    const confidence=CW_LINKAGE_LABEL[summary.evidence_level]||summary.evidence_level||'待核验';
+    const cause=String(sharedSummary?.conclusion||((genericSummary&&rowReason)?rowReason:(summary.conclusion||rowReason||'暂无法确定：当前证据不足以判断错误原因'))).trim();
+    const evidenceLevel=sharedSummary?.evidence_level||summary.evidence_level;
+    const confidence=sharedSummary?sharedEvidenceLabel(sharedSummary):(CW_LINKAGE_LABEL[evidenceLevel]||evidenceLevel||'待核验');
     const impact=summary.customer_impact==='single_request'?'单个请求':
       summary.customer_impact==='multiple_candidates'?'多个候选请求':'当前请求范围';
     parts.push(`<div class="lc-cw-summary lc-cw-diagnosis">`+
@@ -1361,6 +1483,14 @@ function cloudWatchBlockBody(id){
       `${rowReason&&rowReason!==cause?`<div class="lc-cw-diagnosis-note">本条记录判据：${esc(rowReason)}</div>`:''}`+
       `<div class="lc-sub">证据：${esc(confidence)} · 影响：${esc(impact)}</div>`+
       `</div>`);
+    if(observability){
+      const from=Date.parse(observability.from),to=Date.parse(observability.to),
+        events=Array.isArray(observability.events)?observability.events:[];
+      const window=Number.isFinite(from)&&Number.isFinite(to)
+        ?`${fullTime(from/1000)} ～ ${fullTime(to/1000)}（北京时间，左闭右开）`:'时间窗口不可用';
+      parts.push(`<div class="lc-sub" title="${esc(observability.from)} ～ ${esc(observability.to)}">实际窗口：${esc(window)}；脱敏证据事件 ${nfmt(events.length)} 条（不是独立请求数）。</div>`);
+      parts.push('<div class="lc-sub">FRT 只代表首个 data: 事件延迟；严格 TTFT 和客户端最终交付尚无直接观察点，不能由 FRT、HTTP 200 或扣费推定。</div>');
+    }
     if(res.candidate_truncated)parts.push('<div class="lc-cw-err">业务候选已达到安全上限，以上结论可能不完整，请缩小时间或筛选条件后重查。</div>');
     if(res.audit_recorded===false)parts.push('<div class="lc-cw-err">本次审计记录不完整；结果可供参考，但不要作为最终定责依据。</div>');
 
@@ -1373,14 +1503,22 @@ function cloudWatchBlockBody(id){
     const cost=res.cost||{};
     const costText=`AWS 查询 ${nfmt(cost.queries)} 次 · Logs Insights 扫描 ${nfmt(cost.bytes_scanned)} 字节`;
     technical.push(`<div class="lc-sub">任务 ${esc(res.investigation_id||'—')} · ${esc(CW_TASK_STATUS_LABEL[res.status]||res.status||'—')}；${win}${win?'；':''}${esc(sens)}；${esc(costText)}${cost.cache_hit?'；命中短缓存':''}</div>`);
+    const sharedEvents=Array.isArray(observability?.events)?observability.events:[];
     const sourceRows=sources.map(s=>{
       const label=CW_STATUS_LABEL[s.status]||s.status||'未知';
-      const link=CW_LINKAGE_LABEL[s.linkage]||s.linkage||'';
+      const link=observability?sharedSourceEvidenceLabel(sharedEvents,s.source):(CW_LINKAGE_LABEL[s.linkage]||s.linkage||'');
       const extra=[];
       if(s.status==='found')extra.push(`命中 ${s.events} 条`);
       if(s.parse_failed>0)extra.push(`解析失败 ${s.parse_failed} 条`);
       if(s.truncated)extra.push('结果已截断');
       if(s.partial)extra.push('部分查询失败/未完成');
+      if(observability){
+        const quality=(observability.source_quality||[]).find(q=>q.source_id===s.source);
+        extra.push(quality?.query_complete===true?'本次查询已完成':quality?.query_complete===false?'本次查询未完成':'本次查询完整性未知');
+        extra.push(quality?.coverage_complete===true?'持续采集覆盖完整':quality?.coverage_complete===false?'持续采集覆盖不完整':'持续采集覆盖未知');
+        if(quality?.parse_failures==null)extra.push('解析失败数未知');
+        if(quality?.quality_metadata_complete!==true)extra.push('来源质量信息仍有缺项');
+      }
       return `<div class="lc-kv"><span>${esc(s.log_group||s.source)}${s.sensitive?'（敏感）':''}</span>`+
         `<b class="cw-${esc(s.status)}">${esc(label)}${link?' · '+esc(link):''}${extra.length?' · '+esc(extra.join('、')):''}</b></div>`;
     }).join('');
@@ -1388,7 +1526,17 @@ function cloudWatchBlockBody(id){
     sources.forEach(s=>{
       if(s.note)technical.push(`<div class="lc-sub">${esc(s.log_group||s.source)}：${esc(s.note)}</div>`);
     });
-    if(Array.isArray(res.timeline)&&res.timeline.length){
+    if(observability&&sharedEvents.length){
+      const legacyTimeline=Array.isArray(res.timeline)?res.timeline:[];
+      const timeline=sharedEvents.slice().sort((a,b)=>(Date.parse(a.occurred_at)||0)-(Date.parse(b.occurred_at)||0)||String(a.event_id).localeCompare(String(b.event_id)));
+      technical.push('<div class="lc-raw-head"><span>统一生命周期时间线（北京时间）</span></div>');
+      technical.push('<div class="lc-cw-timeline">'+timeline.map(e=>{
+        const original=legacyTimeline.find(x=>x.evidence_ref===e.evidence_ref&&x.source===e.source);
+        const occurred=Date.parse(e.occurred_at),time=Number.isFinite(occurred)?fullTime(occurred/1000):'时间未知';
+        const frt=typeof e.frt_ms==='number'&&Number.isFinite(e.frt_ms)&&e.frt_ms>=0?` · FRT ${nfmt(e.frt_ms)}ms（非 TTFT）`:'';
+        return `<div class="lc-cw-event"><time title="${esc(e.occurred_at)}">${esc(time)}</time><b>${esc(original?.node||e.source)}</b><span>${esc(original?.fact||'已读取脱敏事件，未验证协议终态')}${esc(frt)}</span><small>${esc(sharedEvidenceLabel(e))}${e.complete?' · 来源查询完整':' · 来源查询可能不完整'}</small></div>`;
+      }).join('')+'</div>');
+    }else if(!observability&&Array.isArray(res.timeline)&&res.timeline.length){
       technical.push('<div class="lc-raw-head"><span>统一生命周期时间线</span></div>');
       technical.push('<div class="lc-cw-timeline">'+res.timeline.map(x=>`<div class="lc-cw-event"><time>${esc(new Date((+x.event_ms||0)).toLocaleString('zh-CN',{hour12:false,timeZone:'Asia/Shanghai'}))}</time><b>${esc(x.node||x.source)}</b><span>${esc(x.fact||'—')}</span><small>${esc(CW_LINKAGE_LABEL[x.evidence_level]||x.evidence_level||'—')}${x.complete?' · 完整':' · 可能不完整'}</small></div>`).join('')+'</div>');
     }
@@ -1405,6 +1553,7 @@ function cloudWatchBlockBody(id){
 }
 
 function render(){
+  renderStandaloneInvestigation();
   const body=$('lcTableBody');
   if(!body)return;
 

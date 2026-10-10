@@ -19,6 +19,7 @@ package monitor
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"net/http"
@@ -514,9 +515,12 @@ type LogChainRow struct {
 	CompletionTokens  int64  `json:"completion_tokens"`
 	CacheReadTokens   int64  `json:"cache_read_tokens,omitempty"`
 	UseTime           int64  `json:"use_time"`
-	IsStream          bool   `json:"is_stream"`
-	FirstByteMs       int64  `json:"first_byte_ms,omitempty"`
-	RequestPath       string `json:"request_path,omitempty"`
+	// UseTimeKnown preserves SQL NULL separately from a real zero-second duration.
+	// Unknown duration can remain an association candidate, never positive proof.
+	UseTimeKnown bool   `json:"use_time_known"`
+	IsStream     bool   `json:"is_stream"`
+	FirstByteMs  int64  `json:"first_byte_ms,omitempty"`
+	RequestPath  string `json:"request_path,omitempty"`
 
 	// CostUSD 仅消费(type=2)有意义，同 LogRow 口径：其它类型 quota 恒为 0，折美元会误导。
 	CostUSD float64 `json:"cost_usd"`
@@ -1437,14 +1441,15 @@ func (m *Monitor) queryLogChainPage(ctx context.Context, s logChainScope, domain
 		first.ErrorOnly = true
 	}
 	where, args := logChainWhere(first, domainChans)
-	// COALESCE 全列：历史版本与迁移数据可能留 NULL，直接 Scan 进 int64 会让整页返回 500。
+	// 历史版本与迁移数据可能留 NULL：大多数字段 COALESCE，use_time 则用
+	// sql.NullInt64 保留缺失语义，不能把 NULL 冒充真实的零秒用于入口关联。
 	// 列必须带别名：拆分时外层要按 created_at / id 排序，而
 	// COALESCE(...) 未命名时列名就是整个表达式，外层引用不到。
 	cols := " id, created_at, COALESCE(type,0) AS c_type, COALESCE(user_id,0) AS c_uid," +
 		" COALESCE(username,'') AS c_uname, COALESCE(`group`,'') AS c_group," +
 		" COALESCE(token_name,'') AS c_token, COALESCE(channel_id,0) AS c_chid," +
 		" COALESCE(model_name,'') AS c_model, COALESCE(prompt_tokens,0) AS c_pt," +
-		" COALESCE(completion_tokens,0) AS c_ct, COALESCE(use_time,0) AS c_ut," +
+		" COALESCE(completion_tokens,0) AS c_ct, use_time AS c_ut," +
 		" COALESCE(is_stream,0) AS c_stream, COALESCE(quota,0) AS c_quota," +
 		" COALESCE(content,'') AS c_content, COALESCE(other,'') AS c_other," +
 		" COALESCE(request_id,'') AS c_reqid"
@@ -1476,14 +1481,16 @@ func (m *Monitor) queryLogChainPage(ctx context.Context, s logChainScope, domain
 	for rows.Next() {
 		var r LogChainRow
 		var quota int64
+		var useTime sql.NullInt64
 		var isStream int
 		var content, other string
 		if err := rows.Scan(&r.ID, &r.CreatedAt, &r.Type, &r.UserID, &r.Member,
 			&r.Group, &r.TokenName, &r.ChannelID, &r.ModelName, &r.PromptTokens,
-			&r.CompletionTokens, &r.UseTime, &isStream, &quota,
+			&r.CompletionTokens, &useTime, &isStream, &quota,
 			&content, &other, &r.RequestID); err != nil {
 			return nil, false, err
 		}
+		r.UseTime, r.UseTimeKnown = useTime.Int64, useTime.Valid
 		r.TypeName = logTypeName(r.Type)
 		r.IsStream = isStream != 0
 		// 同 LogRow：非消费类型 quota 恒为 0，折美元会得 $0.00 误导对账。
@@ -1774,6 +1781,43 @@ func logChainBlindSpots(cloudWatchEnabled bool) []string {
 	}
 }
 
+func (m *Monitor) logChainCurrentBlindSpots(now time.Time) []string {
+	spots := logChainBlindSpots(m.cloudWatchEvidenceAvailable())
+	recovery := m.cloudWatchNginxEvidenceRecovery(now)
+	if recovery.Incomplete {
+		gap := "入口证据库尚未完成覆盖核验，或正在重建补扫；目前查不到入口证据不代表请求没有发生或没有到达入口。"
+		if recovery.DetectedAt > 0 {
+			gap = fmt.Sprintf("入口证据库与原采集水位不一致，正在补扫 %s 至 %s 的证据缺口（结束时间不含）；"+
+				"补齐前，查不到入口证据不代表请求没有发生或没有到达入口。",
+				time.Unix(recovery.FromTs, 0).In(cstLocation).Format("2006-01-02 15:04:05"),
+				time.Unix(recovery.ToTs, 0).In(cstLocation).Format("2006-01-02 15:04:05"))
+		}
+		spots = append(spots, gap)
+	}
+	return spots
+}
+
+func (m *Monitor) logChainNginxEvidenceCoverage(now time.Time) gin.H {
+	recovery := m.cloudWatchNginxEvidenceRecovery(now)
+	from, through := m.cloudWatchNginxEvidenceFrom.Load(), m.cloudWatchNginxEvidenceThrough.Load()
+	retentionFrom, target := cloudWatchNginxEvidenceRange(now, m.cfg.NginxEvidenceRetentionHours)
+	if m.cfg.CloudWatchNginxEnabled && nginxEvidenceMode(m.cfg.NginxEvidenceMode) != "off" {
+		// TTL cleanup runs independently of the collection cursor. Never include
+		// an expired interval just because the collector has not polled again.
+		from = max(from, retentionFrom)
+		if !recovery.Verified {
+			through = 0
+		} else {
+			through = min(through, recovery.ThroughTs)
+		}
+	}
+	return gin.H{
+		"from_ts": from, "through_ts": through, "target_ts": target, "recovery": recovery,
+		"last_success_at": m.cloudWatchNginxEvidenceLastSuccess.Load(),
+		"last_failure_at": m.cloudWatchNginxEvidenceLastFailure.Load(),
+	}
+}
+
 // serveLogChainRequests GET /logchain/requests
 // 管理员排障：按客户/渠道/上游域名/模型筛请求，看上游返回的错误原文。
 func (m *Monitor) serveLogChainRequests(c *gin.Context) {
@@ -1824,7 +1868,7 @@ func (m *Monitor) serveLogChainRequests(c *gin.Context) {
 		if len(domainChans) == 0 {
 			c.JSON(http.StatusOK, gin.H{
 				"ok": true, "rows": []LogChainRow{}, "has_more": false,
-				"scope": logChainScopeEcho(scope), "blind_spots": logChainBlindSpots(m.cloudWatchEvidenceAvailable()),
+				"scope": logChainScopeEcho(scope), "blind_spots": m.logChainCurrentBlindSpots(time.Now()),
 				"cloudwatch_enabled": m.cloudWatchEvidenceAvailable(),
 				"note":               "该上游主域名在本地渠道快照中没有对应渠道",
 			})
@@ -1860,19 +1904,10 @@ func (m *Monitor) serveLogChainRequests(c *gin.Context) {
 	resp := gin.H{
 		"ok": true, "rows": rows, "has_more": hasMore,
 		"attribution": logChainAttributionSummaryForRows(rows),
-		"scope":       logChainScopeEcho(scope), "blind_spots": logChainBlindSpots(m.cloudWatchEvidenceAvailable()),
+		"scope":       logChainScopeEcho(scope), "blind_spots": m.logChainCurrentBlindSpots(time.Now()),
 		"nginx_evidence_mode":     nginxEvidenceMode(m.cfg.NginxEvidenceMode),
 		"nginx_evidence_verified": nginxEvidenceMode(m.cfg.NginxEvidenceMode) == "verified",
-		"nginx_evidence_coverage": gin.H{
-			"from_ts":    m.cloudWatchNginxEvidenceFrom.Load(),
-			"through_ts": m.cloudWatchNginxEvidenceThrough.Load(),
-			"target_ts": func() int64 {
-				_, target := cloudWatchNginxEvidenceRange(time.Now(), m.cfg.NginxEvidenceRetentionHours)
-				return target
-			}(),
-			"last_success_at": m.cloudWatchNginxEvidenceLastSuccess.Load(),
-			"last_failure_at": m.cloudWatchNginxEvidenceLastFailure.Load(),
-		},
+		"nginx_evidence_coverage": m.logChainNginxEvidenceCoverage(time.Now()),
 		// 只回传一个布尔：前端据此决定是否显示按需查询按钮。
 		// 不在这里预取任何 CloudWatch 数据，避免每次翻页都产生 AWS 调用。
 		"cloudwatch_enabled": m.cloudWatchEvidenceAvailable(),

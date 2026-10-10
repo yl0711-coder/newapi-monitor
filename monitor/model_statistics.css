@@ -26,9 +26,6 @@
 .ms-model-row-high-unavailable td{background:rgba(239,68,68,.11);color:#fecaca}
 .ms-model-row-high-unavailable strong{color:#fca5a5}
 .ms-model-row-high-unavailable:hover td,.ms-model-row-high-unavailable.is-open td{background:rgba(239,68,68,.16)}
-.ms-ttft-row-slow td{background:rgba(239,68,68,.10);color:#fecaca}
-.ms-ttft-row-slow:hover td,.ms-ttft-row-slow.is-open td{background:rgba(239,68,68,.15)}
-.ms-ttft-slow{color:#fca5a5;font-weight:700}
 .ms-model-name{white-space:nowrap}
 .ms-model-name strong{font-weight:600;overflow-wrap:anywhere;white-space:normal}
 .ms-expand{width:23px;height:23px;margin-right:5px;padding:0;border:1px solid var(--border);border-radius:4px;background:transparent;color:var(--text-muted);cursor:pointer;line-height:19px}
@@ -51,7 +48,6 @@
 .ms-customer-detail table{min-width:430px}
 .ms-subtitle{font-size:12px;color:var(--text-muted);margin:8px 0 5px;font-weight:600}
 .ms-channel-table{margin-bottom:12px}
-.ms-channel-row.ms-ttft-row-slow td{background:rgba(239,68,68,.09)}
 .ms-channel-row:hover td{background:rgba(148,163,184,.035)}
 .ms-customer-detail th:nth-child(2),.ms-customer-detail td:nth-child(2){text-align:left}
 .ms-customer-empty{text-align:center!important;color:var(--text-muted)}

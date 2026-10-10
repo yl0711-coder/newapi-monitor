@@ -370,71 +370,81 @@ func (m *Monitor) finishPreviousCustomerHealthDay(ctx context.Context, currentDa
 // for both the standard source worker and the logchain-only lane.
 //
 // targetTs is passed by the caller (rather than calculated again here) so the
-// readiness decision and the query window use the same instant.  A cursor that
-// is behind target is deliberately not Ready: callers may still use its
-// through_ts as a safe truncation boundary, but must present metrics as
-// incomplete instead of silently treating the missing tail as zero.
+// readiness decision and the query window use the same instant. Ready only
+// means caught up to target; MetricsAvailable separately certifies a nonempty
+// continuous prefix. Falling behind by a minute never erases that prefix.
 func (m *Monitor) customerHealthCollectionStatus(dayStart, targetTs int64) CustomerHealthCollectionStatus {
+	status := CustomerHealthCollectionStatus{TargetTs: targetTs}
 	if m.cfg.CustomerHealthSourceEnabled {
-		from := m.customerHealthSourceFrom.Load()
-		through := m.customerHealthSourceThrough.Load()
-		status := CustomerHealthCollectionStatus{
-			Mode: "logchain_only", Enabled: true,
-			Running: m.customerHealthSourceRunning.Load(),
-			FromTs:  from, ThroughTs: through,
-			LastSuccessAt: m.customerHealthSourceLastSuccess.Load(),
-			LastFailureAt: m.customerHealthSourceLastFailure.Load(),
+		status.Mode, status.Enabled = "logchain_only", true
+		status.Running = m.customerHealthSourceRunning.Load()
+		status.LastSuccessAt = m.customerHealthSourceLastSuccess.Load()
+		status.LastFailureAt = m.customerHealthSourceLastFailure.Load()
+	} else if m.cfg.sourceWorkerIsEnabled() && m.cfg.CapacityEnabled {
+		status.Mode, status.Enabled = "source_worker", true
+		status.Running = m.sourceWorkerRunning.Load()
+		status.LastSuccessAt = m.LastSampleRun()
+		status.LastFailureAt = m.sourceLastFailureAt.Load()
+	} else {
+		status.Mode, status.State = "disabled", "source_unavailable"
+		status.Note = "客户维护本地采集未开启，指标暂不可用"
+		return status
+	}
+	// Both lanes use the durable certificate. In-memory watermarks can be
+	// empty just after restart, or be reset by an independent FRT replay. A
+	// recent heartbeat and sparse fact rows cannot replace this proof.
+	status.FromTs = dayStart
+	var cursor CustomerHealthSourceCursor
+	if m.storeDB == nil {
+		status.State, status.Note = "source_unavailable", "本地事实库不可用，无法验证指标覆盖"
+		return status
+	}
+	tx := m.storeDB.Where("id = ?", 1).Limit(1).Find(&cursor)
+	switch {
+	case tx.Error != nil:
+		status.State, status.Note = "source_unavailable", "本地覆盖证明读取失败，指标暂不可用"
+		return status
+	case tx.RowsAffected == 0 || cursor.DayTs < dayStart:
+		status.State, status.Note = "initial_backfill", "今日首次回算中，尚未建立从 00:00 起的连续覆盖"
+		if status.LastFailureAt > status.LastSuccessAt {
+			status.State, status.Note = "source_unavailable", "来源采集失败，尚无今日连续数据可展示"
 		}
-		status.Ready = from == dayStart && through >= targetTs && targetTs > dayStart
-		switch {
-		case status.Ready:
-			status.Note = "本地只读采集已连续覆盖至 " +
-				time.Unix(through, 0).In(cstLocation).Format("15:04") + "（CST）"
-		case status.Running:
-			status.Note = "本地只读采集正在从今日 00:00 追赶，已连续覆盖至 " +
-				time.Unix(through, 0).In(cstLocation).Format("15:04") +
-				"（CST）；目标尚未追平，指标显示未完成"
-		default:
-			status.Note = "本地只读采集已开启但当前未运行，指标显示未完成"
+		return status
+	case cursor.SemanticsVersion != customerHealthStabilityPolicyVersion:
+		status.State, status.Note = "policy_backfill", "统计口径正在更新，旧口径覆盖证明不能用于当前指标"
+		return status
+	case cursor.DayTs != dayStart || cursor.ThroughTs < dayStart || cursor.ThroughTs > dayStart+24*3600:
+		status.State, status.Note = "coverage_gap", "今日连续覆盖存在缺口，指标暂不可用"
+		return status
+	}
+	status.ThroughTs = min(cursor.ThroughTs, targetTs)
+	status.LastSuccessAt = max(status.LastSuccessAt, cursor.UpdatedAt)
+	if status.ThroughTs <= dayStart {
+		status.State, status.Note = "initial_backfill", "今日首次回算中，尚无已确认的完整分钟"
+		if status.LastFailureAt > status.LastSuccessAt {
+			status.State, status.Note = "source_unavailable", "来源采集失败，尚无今日连续数据可展示"
 		}
 		return status
 	}
-	if m.cfg.sourceWorkerIsEnabled() && m.cfg.CapacityEnabled {
-		status := CustomerHealthCollectionStatus{
-			Mode: "source_worker", Enabled: true, Running: m.sourceWorkerRunning.Load(),
-			FromTs:        dayStart,
-			LastSuccessAt: m.LastSampleRun(),
-		}
-		// Do not use LastSampleRun as a coverage proof.  The policy cursor is
-		// persisted after each contiguous source slice by
-		// backfillCustomerHealthPolicyTodayWith; a missing/legacy cursor means
-		// the report has no certified range, even if the realtime sampler is
-		// healthy.
-		var cursor CustomerHealthSourceCursor
-		tx := m.storeDB.Where("id = ?", 1).Limit(1).Find(&cursor)
-		if tx.Error == nil && tx.RowsAffected > 0 && cursor.DayTs == dayStart &&
-			cursor.SemanticsVersion == customerHealthStabilityPolicyVersion &&
-			cursor.ThroughTs >= dayStart {
-			status.ThroughTs = cursor.ThroughTs
-			if cursor.UpdatedAt > status.LastSuccessAt {
-				status.LastSuccessAt = cursor.UpdatedAt
-			}
-		}
-		status.Ready = status.FromTs == dayStart && status.ThroughTs >= targetTs && targetTs > dayStart
-		switch {
-		case status.Ready:
-			status.Note = "标准来源采样器已连续覆盖至 " +
-				time.Unix(status.ThroughTs, 0).In(cstLocation).Format("15:04") + "（CST）"
-		case status.ThroughTs > dayStart:
-			status.Note = "标准来源采样器已连续覆盖至 " +
-				time.Unix(status.ThroughTs, 0).In(cstLocation).Format("15:04") +
-				"（CST），尚未追平目标；指标显示未完成"
-		default:
-			status.Note = "标准来源采样器尚未证明今日 00:00 起的连续覆盖，指标显示未完成"
-		}
-		return status
+	status.MetricsAvailable, status.CoverageComplete = true, true
+	status.Ready = status.ThroughTs >= targetTs
+	status.State = "syncing"
+	status.Note = "截至 " + time.Unix(status.ThroughTs, 0).In(cstLocation).Format("15:04") +
+		"（CST），尾部同步中；仅统计今日 00:00 起已连续覆盖的数据"
+	if status.Ready {
+		status.State = "ready"
+		status.Note += "（已追平定稿目标）"
 	}
-	return CustomerHealthCollectionStatus{Mode: "disabled", Note: "客户维护本地采集未开启"}
+	if status.LastFailureAt > status.LastSuccessAt {
+		status.State = "source_failed"
+		status.Note = "采集失败；截至 " + time.Unix(status.ThroughTs, 0).In(cstLocation).Format("15:04") +
+			"（CST），仅展示今日 00:00 起已确认的连续数据，不代表实时完整数据"
+	} else if !status.Running {
+		status.State = "source_paused"
+		status.Note = "采集器已暂停；截至 " + time.Unix(status.ThroughTs, 0).In(cstLocation).Format("15:04") +
+			"（CST），仅展示今日 00:00 起已确认的连续数据，不代表实时完整数据"
+	}
+	return status
 }
 
 // backfillCustomerHealthPolicyToday 是普通完整来源 worker 的低优先级连续

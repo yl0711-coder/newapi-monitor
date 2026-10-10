@@ -1,0 +1,173 @@
+{
+  "$comment": "Definition library only: validate instances against an explicit $defs reference. No Incident or Eval transport envelope is defined. HMAC encoding is the existing Monitor SHA-256 profile. Validate RFC3339 calendar values with date-time format assertion enabled.",
+  "$defs": {
+    "evidence_level": {
+      "enum": [
+        "exact",
+        "correlated",
+        "inferred",
+        "unavailable"
+      ],
+      "type": "string"
+    },
+    "fault_class": {
+      "enum": [
+        "transport_connect",
+        "transport_timeout",
+        "upstream_first_byte_slow",
+        "stream_first_event_slow",
+        "text_first_content_slow",
+        "stream_interrupted_before_first_event",
+        "stream_interrupted_midstream",
+        "client_gone",
+        "protocol_invalid",
+        "responses_incomplete",
+        "thinking_signature_invalid",
+        "tool_call_invalid",
+        "route_no_channel",
+        "model_not_found",
+        "auth_quota_account",
+        "rate_limit_capacity",
+        "upstream_5xx",
+        "empty_or_truncated_output",
+        "billing_anomaly",
+        "semantic_quality",
+        "client_retry_loop",
+        "client_compaction",
+        "telemetry_gap",
+        "unknown"
+      ],
+      "type": "string"
+    },
+    "governance_state": {
+      "enum": [
+        "HEALTHY",
+        "SUSPECT",
+        "DEGRADED",
+        "QUARANTINED",
+        "RECOVERY_PROBATION"
+      ],
+      "type": "string"
+    },
+    "hmac_reference": {
+      "additionalProperties": false,
+      "properties": {
+        "hash": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "key_id": {
+          "pattern": "^[^\\s\\x00-\\x1f\\x7f]+$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "hash",
+        "key_id"
+      ],
+      "type": "object"
+    },
+    "metric_measurement": {
+      "oneOf": [
+        {
+          "properties": {
+            "evidence_level": {
+              "const": "unavailable"
+            },
+            "value_ms": {
+              "type": "null"
+            }
+          }
+        },
+        {
+          "properties": {
+            "evidence_level": {
+              "enum": [
+                "exact",
+                "correlated",
+                "inferred"
+              ]
+            },
+            "value_ms": {
+              "type": "integer"
+            }
+          }
+        }
+      ],
+      "properties": {
+        "evidence_level": {
+          "$ref": "#/$defs/evidence_level"
+        },
+        "value_ms": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "value_ms",
+        "evidence_level"
+      ],
+      "type": "object"
+    },
+    "metrics": {
+      "properties": {
+        "first_thinking_event_ms": {
+          "$ref": "#/$defs/metric_measurement"
+        },
+        "first_tool_call_ms": {
+          "$ref": "#/$defs/metric_measurement"
+        },
+        "total_ms": {
+          "$ref": "#/$defs/metric_measurement"
+        },
+        "ttfb_ms": {
+          "$ref": "#/$defs/metric_measurement"
+        },
+        "ttfc_ms": {
+          "$ref": "#/$defs/metric_measurement"
+        },
+        "ttfe_ms": {
+          "$ref": "#/$defs/metric_measurement"
+        },
+        "ttft_ms": {
+          "$ref": "#/$defs/metric_measurement"
+        }
+      },
+      "required": [
+        "ttfb_ms",
+        "ttfe_ms",
+        "ttfc_ms",
+        "ttft_ms",
+        "first_thinking_event_ms",
+        "first_tool_call_ms",
+        "total_ms"
+      ],
+      "type": "object"
+    },
+    "schema_version": {
+      "const": "observability.v1",
+      "type": "string"
+    },
+    "severity": {
+      "enum": [
+        "SEV0",
+        "SEV1",
+        "SEV2",
+        "SEV3"
+      ],
+      "type": "string"
+    },
+    "timestamp": {
+      "format": "date-time",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?(Z|\\+00:00)$",
+      "type": "string"
+    }
+  },
+  "$id": "urn:nexusapi:observability:v1:definitions",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "observability.v1 shared definitions (01.3 document v2.0)"
+}

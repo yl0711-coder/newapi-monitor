@@ -143,15 +143,11 @@ function renderModels(models){
     const groups=Array.isArray(model.groups)?model.groups:[];
     const requests=Math.max(Number(model.requests)||0,0);
     const unavailable=Math.max(Number(model.unavailable_channel_requests)||0,0);
-    const highUnavailable=requests>0&&unavailable/requests>0.4;
+    // Only this model's unavailable-channel share controls row highlighting.
+    // Exactly 35% is not highlighted; FRT values remain informational.
+    const highUnavailable=requests>0&&unavailable/requests>0.35;
     const ttft=ttftStats(model,ttftComplete);
-    // A row is slow when either the estimated p95 exceeds the strict 3s
-    // threshold or at least one observed request crossed that threshold.  The
-    // latter matters when the histogram's p95 bucket is coarse (for example a
-    // single slow request among a large fast sample) and keeps model/group/
-    // channel highlighting consistent with the API's exact over-3s count.
-    const slowRow=ttft.p95>3000||ttftOver3s(model,ttftComplete)>0;
-    rows+='<tr class="ms-model-row'+(open?' is-open':'')+(highUnavailable?' ms-model-row-high-unavailable':'')+(slowRow?' ms-ttft-row-slow':'')+'"'+(highUnavailable?' title="无可用渠道请求占比超过40%"':'')+'><td class="ms-model-name"><button type="button" class="ms-expand" data-ms-expand="'+esc(name)+'" aria-expanded="'+String(open)+'" aria-label="'+(open?'收起':'展开')+esc(name)+'">'+(open?'▾':'▸')+'</button><strong>'+esc(name)+'</strong></td><td>'+num(model.requests)+'</td><td>'+num(model.routed_requests)+'</td><td>'+num(model.unavailable_channel_requests)+'</td><td>'+pct(Number(model.requests)||0,total)+'</td><td>'+ttftCell(ttft,'observed')+'</td><td>'+ttftCell(ttft,'p50')+'</td><td>'+ttftCell(ttft,'p95')+'</td><td>'+ttftCell(ttft,'p99')+'</td><td>'+ttftCell(ttft,'max')+'</td><td>'+ttftCell(ttft,'over')+'</td></tr>';
+    rows+='<tr class="ms-model-row'+(open?' is-open':'')+(highUnavailable?' ms-model-row-high-unavailable':'')+'"'+(highUnavailable?' title="无可用渠道请求次数占该模型总请求次数超过35%"':'')+'><td class="ms-model-name"><button type="button" class="ms-expand" data-ms-expand="'+esc(name)+'" aria-expanded="'+String(open)+'" aria-label="'+(open?'收起':'展开')+esc(name)+'">'+(open?'▾':'▸')+'</button><strong>'+esc(name)+'</strong></td><td>'+num(model.requests)+'</td><td>'+num(model.routed_requests)+'</td><td>'+num(model.unavailable_channel_requests)+'</td><td>'+pct(Number(model.requests)||0,total)+'</td><td>'+ttftCell(ttft,'observed')+'</td><td>'+ttftCell(ttft,'p50')+'</td><td>'+ttftCell(ttft,'p95')+'</td><td>'+ttftCell(ttft,'p99')+'</td><td>'+ttftCell(ttft,'max')+'</td><td>'+ttftCell(ttft,'over')+'</td></tr>';
     if(open){
       const groupRows=groups.map(group=>renderGroup(name,group,Number(model.requests)||0,ttftComplete)).join('');
       rows+='<tr class="ms-detail-row"><td colspan="11"><div class="ms-detail"><div class="ms-detail-title">'+esc(name)+' 的分组明细（点击分组查看渠道和客户）</div><table><thead><tr><th>分组</th><th>请求次数</th><th>已进入渠道</th><th>无可用渠道</th><th>占该模型</th><th>FRT样本</th><th>FRT P50</th><th>FRT P95</th><th>FRT P99</th><th>最大FRT</th><th>超3秒</th></tr></thead><tbody>'+groupRows+'</tbody></table></div></td></tr>';
@@ -165,8 +161,7 @@ function renderGroup(modelName,group,modelTotal,ttftComplete=false){
   const open=state.expandedGroups.has(key);
   const customers=Array.isArray(group.customers)?group.customers:[];
   const ttft=ttftStats(group,ttftComplete);
-  const slowRow=ttft.p95>3000||ttftOver3s(group,ttftComplete)>0;
-  let html='<tr class="ms-group-row'+(open?' is-open':'')+(slowRow?' ms-ttft-row-slow':'')+'" data-ms-group-key="'+esc(key)+'"><td><button type="button" class="ms-expand ms-group-expand" data-ms-group-key="'+esc(key)+'" aria-expanded="'+String(open)+'" aria-label="'+(open?'收起':'展开')+esc(groupName)+'的渠道和客户明细">'+(open?'▾':'▸')+'</button><strong>'+esc(groupName)+'</strong></td><td>'+num(group.requests)+'</td><td>'+num(group.routed_requests)+'</td><td>'+num(group.unavailable_channel_requests)+'</td><td>'+pct(Number(group.requests)||0,modelTotal)+'</td><td>'+ttftCell(ttft,'observed')+'</td><td>'+ttftCell(ttft,'p50')+'</td><td>'+ttftCell(ttft,'p95')+'</td><td>'+ttftCell(ttft,'p99')+'</td><td>'+ttftCell(ttft,'max')+'</td><td>'+ttftCell(ttft,'over')+'</td></tr>';
+  let html='<tr class="ms-group-row'+(open?' is-open':'')+'" data-ms-group-key="'+esc(key)+'"><td><button type="button" class="ms-expand ms-group-expand" data-ms-group-key="'+esc(key)+'" aria-expanded="'+String(open)+'" aria-label="'+(open?'收起':'展开')+esc(groupName)+'的渠道和客户明细">'+(open?'▾':'▸')+'</button><strong>'+esc(groupName)+'</strong></td><td>'+num(group.requests)+'</td><td>'+num(group.routed_requests)+'</td><td>'+num(group.unavailable_channel_requests)+'</td><td>'+pct(Number(group.requests)||0,modelTotal)+'</td><td>'+ttftCell(ttft,'observed')+'</td><td>'+ttftCell(ttft,'p50')+'</td><td>'+ttftCell(ttft,'p95')+'</td><td>'+ttftCell(ttft,'p99')+'</td><td>'+ttftCell(ttft,'max')+'</td><td>'+ttftCell(ttft,'over')+'</td></tr>';
   if(!open)return html;
   const channels=Array.isArray(group.channels)?group.channels:[];
   const channelRows=channels.map(channel=>renderChannel(channel,ttftComplete)).join('');
@@ -212,24 +207,17 @@ function ttftStats(item,complete=false){
   if(overPct===null&&over!==null&&observed!==null&&observed>0)overPct=over*100/observed;
   return {observed:observed===null?0:Math.max(0,observed),p50:p50===null?0:Math.max(0,p50),p95:p95===null?0:Math.max(0,p95),p99:p99===null?0:Math.max(0,p99),max:max===null?0:Math.max(0,max),over:over,overPct:overPct===null?null:Math.max(0,overPct)};
 }
-function ttftOver3s(item,complete=false){
-  if(!complete)return 0;
-  const observed=numericField(item,['frt_observed','ttft_observed','ttft_samples','ttft_sample_count','ttft_count']);
-  if(observed===null||observed<=0)return 0;
-  const over=numericField(item,['frt_over_3s','ttft_over_3s','ttft_over_3000ms','ttft_slow_count']);
-  return over===null||over<0||over>observed?0:over;
-}
 function formatMs(ms){return ms>0?(ms/1000).toFixed(ms>=10000?0:1)+'秒':'—'}
 function ttftCell(stats,kind){
   if(kind==='observed')return stats.observed>0?num(stats.observed):'—';
   if(kind==='over'){
     if(stats.over===null||stats.observed<=0)return '—';
     const share=stats.overPct===null?'':(' '+stats.overPct.toFixed(1)+'%');
-    return '<span class="'+(stats.over>0?'ms-ttft-slow':'')+'">'+num(stats.over)+'次'+share+'</span>';
+    return num(stats.over)+'次'+share;
   }
   const value=stats[kind];
   if(value<=0)return '—';
-  return '<span class="'+(value>3000?'ms-ttft-slow':'')+'">'+formatMs(value)+'</span>';
+  return formatMs(value);
 }
 function renderChannel(channel,ttftComplete=false){
   const rawID=Number(channel?.channel_id);
@@ -248,7 +236,6 @@ function renderChannel(channel,ttftComplete=false){
   const identity=resolvedKind+':'+id;
   const identityTitle=unavailable?'无可用渠道（channel_id=-1）':(id===0?'未标注渠道（channel_id=0）':label+'（channel_id='+id+'）');
   const ttft=ttftStats(channel,ttftComplete);
-  const slow=ttft.p95>3000||ttftOver3s(channel,ttftComplete)>0;
-  return '<tr class="ms-channel-row'+(slow?' ms-ttft-row-slow':'')+'" data-ms-channel-key="'+esc(identity)+'" data-ms-channel-kind="'+esc(resolvedKind)+'" data-ms-channel-id="'+String(id)+'"><td title="'+esc(identityTitle)+'">'+esc(label)+'</td><td>'+num(channel.requests)+'</td><td>'+ttftCell(ttft,'observed')+'</td><td>'+ttftCell(ttft,'p50')+'</td><td>'+ttftCell(ttft,'p95')+'</td><td>'+ttftCell(ttft,'p99')+'</td><td>'+ttftCell(ttft,'max')+'</td><td>'+ttftCell(ttft,'over')+'</td></tr>';
+  return '<tr class="ms-channel-row" data-ms-channel-key="'+esc(identity)+'" data-ms-channel-kind="'+esc(resolvedKind)+'" data-ms-channel-id="'+String(id)+'"><td title="'+esc(identityTitle)+'">'+esc(label)+'</td><td>'+num(channel.requests)+'</td><td>'+ttftCell(ttft,'observed')+'</td><td>'+ttftCell(ttft,'p50')+'</td><td>'+ttftCell(ttft,'p95')+'</td><td>'+ttftCell(ttft,'p99')+'</td><td>'+ttftCell(ttft,'max')+'</td><td>'+ttftCell(ttft,'over')+'</td></tr>';
 }
 })();

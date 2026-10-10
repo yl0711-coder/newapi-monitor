@@ -442,6 +442,16 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
   .lc-cw b.cw-unavailable,.lc-cw b.cw-access_denied,.lc-cw b.cw-throttled,
   .lc-cw b.cw-timeout,.lc-cw b.cw-invalid,.lc-cw b.cw-cancelled{color:var(--warn,#c9a227)}
   .lc-cw-err{font-size:12px;color:var(--danger,#c0564f);margin:6px 0}
+  .lc-investigation-entry{margin:0 0 16px;padding:12px 14px;border:1px solid var(--border);border-radius:10px;background:var(--surface)}
+  .lc-investigation-head{display:flex;gap:12px;align-items:center;flex-wrap:wrap}
+  .lc-investigation-head .lc-sub{flex:1}
+  .lc-investigation-panel{margin-top:12px}
+  .lc-investigation-fields{border:0;padding:0;margin:0;display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:10px 14px}
+  .lc-investigation-fields label{display:flex;flex-direction:column;gap:5px;font-size:12px;color:var(--text-muted)}
+  .lc-investigation-fields input{min-width:0;padding:7px 9px;border:1px solid var(--border);border-radius:6px;background:var(--bg);color:var(--text)}
+  .lc-investigation-fields .lc-investigation-sensitive{flex-direction:row;align-items:center}
+  .lc-investigation-actions{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:10px 0}
+  .lc-investigation-actions .lc-primary{background:var(--accent);border-color:var(--accent);color:#fff}
   .lc-cw-summary{margin:8px 0;padding:9px 11px;border:1px solid var(--border);border-radius:8px;background:rgba(148,163,184,.05)}
   .lc-cw-summary>b{font-size:13px;font-weight:600}
   /* 全链路排障默认只展示原因和位置；来源/时间线收进可选详情，避免一点击就铺满原始信息。 */
@@ -577,7 +587,7 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
 <link rel="stylesheet" href="/capacity.css?v=2">
 <link rel="stylesheet" href="/group-governance.css?v=1">
 <link rel="stylesheet" href="/finance.css?v=14">
-<link rel="stylesheet" href="/model-statistics.css?v=3">
+<link rel="stylesheet" href="/model-statistics.css?v=4">
 </head>
 <body theme-mode="dark">
 <div class="monitor-shell">
@@ -925,7 +935,7 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
 
 <div class="tabpane model-statistics-page" id="tab-model-statistics" hidden>
   <div class="ms-toolbar">
-    <div><h2>模型统计</h2><p>按模型请求次数排行；展开模型查看分组、FRT，再点分组查看渠道 FRT 和客户请求次数；FRT P95 超过 3 秒或 FRT 超过 3 秒的请求会标红。FRT 页面按有效样本显示 P50/P95，统计区间以接口实际 from/to 为准。</p></div>
+    <div><h2>模型统计</h2><p>按模型请求次数排行；展开模型查看分组，再点分组查看渠道 FRT 和客户请求次数。仅当无可用渠道次数占该模型总请求次数超过35%时，模型行标红；FRT 只展示，不参与标红。FRT 按有效样本显示 P50/P95/P99，统计区间以页面实际起止时间为准。</p></div>
     <div class="ms-range" role="group" aria-label="模型统计时间范围">
       <button type="button" data-ms-window="24h" class="active">近24小时</button>
       <button type="button" data-ms-window="3d">近3天</button>
@@ -1184,6 +1194,33 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
       <span class="lc-daylabel" id="lcDateLabel"></span>
     </div>
   </div>
+
+  <section class="lc-investigation-entry" aria-label="独立全链路排障">
+    <div class="lc-investigation-head">
+      <button type="button" class="lc-jump" id="lcInvestigationOpen" aria-expanded="false" aria-controls="lcInvestigationPanel">独立全链路排障</button>
+      <span class="lc-sub">没有业务日志也能查：按时间、请求标识、客户或 API 路径查询已有证据。</span>
+    </div>
+    <div id="lcInvestigationPanel" class="lc-investigation-panel" hidden>
+      <form id="lcInvestigationForm" method="post" action="/logchain/investigations" autocomplete="off" novalidate>
+        <fieldset id="lcInvestigationFields" class="lc-investigation-fields">
+          <label>开始时间（北京时间，含）<input id="lcInvestigationFrom" type="datetime-local" step="60" required></label>
+          <label>结束时间（北京时间，不含）<input id="lcInvestigationTo" type="datetime-local" step="60" required></label>
+          <label>NewAPI Request ID<input id="lcInvestigationRequestID" type="text" autocomplete="off" spellcheck="false" maxlength="256" placeholder="可不填"></label>
+          <label>CloudFront Request ID<input id="lcInvestigationCloudFrontID" type="text" autocomplete="off" spellcheck="false" maxlength="256" placeholder="可不填"></label>
+          <label>客户 ID<input id="lcInvestigationUserID" type="text" inputmode="numeric" autocomplete="off" placeholder="正整数，可不填"></label>
+          <label>API 路径<input id="lcInvestigationPath" type="text" autocomplete="off" spellcheck="false" maxlength="1024" placeholder="例如 /v1/chat/completions，不含查询参数"></label>
+          <label class="lc-investigation-sensitive"><input id="lcInvestigationSensitive" type="checkbox">查询客户网络诊断（仅脱敏摘要）</label>
+        </fieldset>
+        <div class="lc-investigation-actions">
+          <button type="submit" class="lc-jump lc-primary" id="lcInvestigationSubmit">开始排障</button>
+          <button type="button" class="lc-jump" id="lcInvestigationClose">关闭并清除</button>
+          <span class="lc-sub">最多 2 小时；至少填写一项定位条件。关闭清除本页输入和结果，已启动任务可先点“取消”。</span>
+        </div>
+      </form>
+      <div class="lc-sub">未找到证据不代表客户没有发出请求，也不能据此判为客户问题。原始标识不写入网址或浏览器存储。</div>
+      <div id="lcInvestigationResult" class="lc-cw" aria-live="polite"></div>
+    </div>
+  </section>
 
   <div class="lc-filterbar">
     <span class="lc-scopebar" role="group" aria-label="查看范围">
@@ -1483,13 +1520,13 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
 <script src="/channel-data-status.js?v=2"></script>
 <script src="/channel-pricing-observations.js?v=1"></script>
 <script src="/channel-management.js?v=17"></script>
-<script src="/logchain.js?v=16"></script>
-<script src="/customer-health.js?v=3"></script>
-<script src="/alerts.js?v=1"></script>
+<script src="/logchain.js?v=18"></script>
+<script src="/customer-health.js?v=4"></script>
+<script src="/alerts.js?v=3"></script>
 <script src="/capacity.js?v=2"></script>
 <script src="/group-governance.js?v=1"></script>
 <script src="/finance.js?v=57"></script>
-<script src="/model-statistics.js?v=5"></script>
+<script src="/model-statistics.js?v=6"></script>
 <script src="/infra-assets.js?v=1"></script>
 <script src="/ecs-log-sources.js?v=1"></script>
 <script>

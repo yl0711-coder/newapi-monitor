@@ -264,7 +264,7 @@ func (m *Monitor) openNginxEvidenceStore() error {
 	if err != nil {
 		return fmt.Errorf("open evidence store: %w", err)
 	}
-	if err := db.AutoMigrate(&NginxRequestEvidence{}, &NginxEvidenceIngestBatch{}, &NginxEvidenceSourceState{}); err != nil {
+	if err := db.AutoMigrate(&NginxRequestEvidence{}, &NginxEvidenceIngestBatch{}, &NginxEvidenceSourceState{}, &CloudWatchNginxEvidenceCheckpoint{}); err != nil {
 		if sqlDB, dbErr := db.DB(); dbErr == nil {
 			_ = sqlDB.Close()
 		}
@@ -291,6 +291,7 @@ func (m *Monitor) openNginxEvidenceStore() error {
 		return fmt.Errorf("secure evidence store permissions: %w", err)
 	}
 	m.nginxEvidenceDB = db
+	m.cloudWatchNginxEvidenceRecoveryCache.Store(nil)
 	if sqlDB, dbErr := db.DB(); dbErr == nil {
 		sqlDB.SetMaxOpenConns(1)
 		sqlDB.SetMaxIdleConns(1)
@@ -488,6 +489,18 @@ func (m *Monitor) pruneNginxEvidenceOnce(ctx context.Context, now time.Time) err
 	}
 	eventCutoffMS := now.Add(-time.Duration(retentionHours) * time.Hour).UnixMilli()
 	batchCutoff := now.Add(-time.Duration(retentionHours+24) * time.Hour).Unix()
+	if m.cfg.CloudWatchNginxEnabled {
+		// Narrow the durable proof before deleting any evidence. A restart
+		// between these operations must underclaim coverage, never overclaim it.
+		retainedFrom := (eventCutoffMS + 59_999) / 60_000 * 60
+		if err := m.nginxEvidenceDB.WithContext(ctx).Model(&CloudWatchNginxEvidenceCheckpoint{}).
+			Where("id = ?", cloudWatchNginxCursorID).Updates(map[string]any{
+			"coverage_from_ts": gorm.Expr("MAX(coverage_from_ts, ?)", retainedFrom),
+			"through_ts":       gorm.Expr("MAX(through_ts, ?)", retainedFrom),
+		}).Error; err != nil {
+			return err
+		}
+	}
 	for i := 0; i < 5; i++ {
 		result := m.nginxEvidenceDB.WithContext(ctx).Exec(`DELETE FROM nginx_request_evidences WHERE event_id IN (
 			SELECT event_id FROM nginx_request_evidences WHERE event_ms < ? ORDER BY event_ms LIMIT 10000

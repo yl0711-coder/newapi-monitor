@@ -53,6 +53,8 @@ func newCloudWatchEvidenceParseError(kind cloudWatchEvidenceParseErrorKind, sour
 }
 
 type cloudWatchStructuredEvidence struct {
+	// Set after request association, never copied from a query/source label.
+	EvidenceLevel     string                 `json:"evidence_level,omitempty"`
 	Source            cloudWatchLogSourceID  `json:"source"`
 	Kind              cloudWatchEvidenceKind `json:"kind"`
 	EventRef          string                 `json:"event_ref"`

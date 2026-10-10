@@ -115,6 +115,7 @@ type CustomerHealthRow struct {
 	// false 时数值字段只是 Go 零值，前端必须显示“—”，不得解释为真实零。
 	MetricsReady bool   `json:"metrics_ready"`
 	MetricsNote  string `json:"metrics_note"`
+	MetricsState string `json:"metrics_state"`
 
 	// Total = Success + Anomaly + Failed，即已进入渠道的日志记录数。
 	// NewAPI 换渠道重试会为同一个外部请求写多条 type=5，最后还可能再写一条
@@ -179,7 +180,7 @@ type CustomerHealthReport struct {
 	// RedThreshold 标红阈值，由后端下发，前端不得自行硬编码。
 	RedThreshold float64 `json:"red_threshold"`
 	// Collection 说明本页本地事实采集是否开启、是否已经连续覆盖到某个时刻。
-	// 0 请求只有在 Ready=true 时才可理解为覆盖区间内的真实零。
+	// 0 请求只有在 MetricsAvailable=true 时才是实际窗口内的真实零。
 	Collection CustomerHealthCollectionStatus `json:"collection"`
 	Rows       []CustomerHealthRow            `json:"rows"`
 	// Notes 字段保留为空，兼容旧接口字段；客户维护页不再展示长篇口径说明。
@@ -187,15 +188,21 @@ type CustomerHealthReport struct {
 }
 
 type CustomerHealthCollectionStatus struct {
-	Mode          string `json:"mode"`
-	Enabled       bool   `json:"enabled"`
-	Running       bool   `json:"running"`
-	Ready         bool   `json:"ready"`
-	FromTs        int64  `json:"from_ts"`
-	ThroughTs     int64  `json:"through_ts"`
-	LastSuccessAt int64  `json:"last_success_at"`
-	LastFailureAt int64  `json:"last_failure_at"`
-	Note          string `json:"note"`
+	Mode    string `json:"mode"`
+	Enabled bool   `json:"enabled"`
+	Running bool   `json:"running"`
+	Ready   bool   `json:"ready"`
+	// Ready means caught up to TargetTs; MetricsAvailable is independent of
+	// freshness and certifies the actual report [FromTs, ToTs) only.
+	MetricsAvailable bool   `json:"metrics_available"`
+	CoverageComplete bool   `json:"coverage_complete"`
+	TargetTs         int64  `json:"target_ts"`
+	State            string `json:"state"`
+	FromTs           int64  `json:"from_ts"`
+	ThroughTs        int64  `json:"through_ts"`
+	LastSuccessAt    int64  `json:"last_success_at"`
+	LastFailureAt    int64  `json:"last_failure_at"`
+	Note             string `json:"note"`
 	// Membership* make it explicit which local SQLite list produced this
 	// report.  Production and 8204 must not be compared by customer count
 	// until these values match; the list is deliberately independent from the
@@ -360,24 +367,17 @@ func (m *Monitor) buildCustomerHealthReport(ctx context.Context, now time.Time) 
 		report.Collection.MembershipMembers += len(company.members)
 	}
 	report.Collection.MembershipFingerprint = customerHealthMembershipFingerprint(companies)
+	// A target moves every minute, but already certified data remains usable.
+	// Always expose and query the same actual interval, never the uncollected
+	// tail or the remainder of the natural day.
+	usageToTs := fromTs
+	metricsReady := report.Collection.MetricsAvailable
+	if metricsReady {
+		usageToTs = min(report.Collection.ThroughTs, collectionTarget, toTs)
+	}
+	report.ToTs = usageToTs
 	if len(companies) == 0 {
 		return report, nil
-	}
-	usageToTs := fromTs
-	metricsReady := report.Collection.Ready
-	if report.Collection.Mode == "logchain_only" || report.Collection.Mode == "source_worker" {
-		// Both customer-health source lanes expose a durable contiguous
-		// watermark.  Never read beyond it, even if an old restart left rows in
-		// SQLite for a later interval.  When the watermark has not caught up to
-		// the current target, keep the safe partial range for internal queries
-		// but fail closed in the response (metrics_ready=false) so the UI cannot
-		// present a partial day as zero/full data.
-		if report.Collection.ThroughTs > fromTs {
-			usageToTs = report.Collection.ThroughTs
-			if usageToTs > toTs {
-				usageToTs = toTs
-			}
-		}
 	}
 	usage, err := m.customerHealthUsage(ctx, fromTs, usageToTs)
 	if err != nil {
@@ -386,7 +386,10 @@ func (m *Monitor) buildCustomerHealthReport(ctx context.Context, now time.Time) 
 	if metricsReady && !usage.policyReady {
 		metricsReady = false
 		report.Collection.Ready = false
-		report.Collection.Note = "客户维护的新稳定性归因口径正在回算今日数据，完成前不展示不完整指标"
+		report.Collection.MetricsAvailable = false
+		report.Collection.CoverageComplete = false
+		report.Collection.State = "policy_backfill"
+		report.Collection.Note = "统计口径正在更新，当前窗口仍有旧口径记录，指标暂不可用"
 	}
 	problems := &customerHealthProblemIndex{byChannel: map[int][]customerHealthProblem{}}
 	if metricsReady {
@@ -402,6 +405,7 @@ func (m *Monitor) buildCustomerHealthReport(ctx context.Context, now time.Time) 
 		row := buildCustomerHealthRow(company, usage, problems)
 		row.MetricsReady = metricsReady
 		row.MetricsNote = report.Collection.Note
+		row.MetricsState = report.Collection.State
 		if !metricsReady {
 			row.Total, row.Success, row.Anomaly, row.Failed = 0, 0, 0, 0
 			row.StabilityAnomaly, row.StabilityFailed = 0, 0

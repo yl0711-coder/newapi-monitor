@@ -87,7 +87,7 @@ func TestPersistCloudWatchNginxRequestEvidenceUsesHMACOnlyRows(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := db.AutoMigrate(&NginxRequestEvidence{}, &NginxEvidenceIngestBatch{}, &NginxEvidenceSourceState{}); err != nil {
+	if err := db.AutoMigrate(&NginxRequestEvidence{}, &NginxEvidenceIngestBatch{}, &NginxEvidenceSourceState{}, &CloudWatchNginxEvidenceCheckpoint{}); err != nil {
 		t.Fatal(err)
 	}
 	now := time.Now().Unix()
@@ -129,7 +129,7 @@ func TestPersistCloudWatchNginxRequestEvidenceLargeBatchChunksAndReplaces(t *tes
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := db.AutoMigrate(&NginxRequestEvidence{}, &NginxEvidenceIngestBatch{}, &NginxEvidenceSourceState{}); err != nil {
+	if err := db.AutoMigrate(&NginxRequestEvidence{}, &NginxEvidenceIngestBatch{}, &NginxEvidenceSourceState{}, &CloudWatchNginxEvidenceCheckpoint{}); err != nil {
 		t.Fatal(err)
 	}
 	now := time.Now().Unix()
@@ -196,7 +196,7 @@ func TestPersistCloudWatchNginxRequestEvidenceRejectsCrossWindowEventConflict(t 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := db.AutoMigrate(&NginxRequestEvidence{}, &NginxEvidenceIngestBatch{}, &NginxEvidenceSourceState{}); err != nil {
+	if err := db.AutoMigrate(&NginxRequestEvidence{}, &NginxEvidenceIngestBatch{}, &NginxEvidenceSourceState{}, &CloudWatchNginxEvidenceCheckpoint{}); err != nil {
 		t.Fatal(err)
 	}
 	now := time.Now().Unix()
@@ -405,7 +405,7 @@ func TestPersistCloudWatchNginxRequestEvidenceEmptyWindowRemovesStaleRows(t *tes
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := db.AutoMigrate(&NginxRequestEvidence{}, &NginxEvidenceIngestBatch{}, &NginxEvidenceSourceState{}); err != nil {
+	if err := db.AutoMigrate(&NginxRequestEvidence{}, &NginxEvidenceIngestBatch{}, &NginxEvidenceSourceState{}, &CloudWatchNginxEvidenceCheckpoint{}); err != nil {
 		t.Fatal(err)
 	}
 	now := time.Now().Unix()
@@ -498,7 +498,7 @@ func TestLoadCloudWatchNginxCursorInitializesIndependentEvidenceBackfill(t *test
 		t.Fatal(err)
 	}
 	m.nginxEvidenceDB = evidenceDB
-	if err := evidenceDB.AutoMigrate(&NginxRequestEvidence{}); err != nil {
+	if err := evidenceDB.AutoMigrate(&NginxRequestEvidence{}, &CloudWatchNginxEvidenceCheckpoint{}); err != nil {
 		t.Fatal(err)
 	}
 	now := time.Date(2026, 9, 20, 15, 37, 0, 0, time.UTC)
@@ -642,6 +642,11 @@ func TestNginxReportPrefersCloudWatchWithinSameMinute(t *testing.T) {
 }
 
 func TestCloudWatchNginxCursorBumpsMigrationPlan(t *testing.T) {
+	for _, plan := range []string{preMigrationPlanID, preMigrationCombinedPlanID} {
+		if !strings.Contains(plan, "v58-nginx-evidence-store-proof") {
+			t.Fatalf("证据卷关联与缺口列必须触发新的迁移前备份: %s", plan)
+		}
+	}
 	if !strings.Contains(preMigrationPlanID, "v52") || !strings.Contains(preMigrationPlanID, "nginx-cursor-v1-nginx-repair-cursor-v1") || !strings.Contains(preMigrationPlanID, "nginx-evidence-backfill-v1") {
 		t.Fatalf("CloudWatch Nginx 水位表加入 AutoMigrate 后必须产生独立迁移快照: %s", preMigrationPlanID)
 	}

@@ -64,6 +64,11 @@ type CloudWatchNginxCursor struct {
 	EvidenceLastSuccessAt  int64  `gorm:"column:evidence_last_success_at"`
 	EvidenceLastFailureAt  int64  `gorm:"column:evidence_last_failure_at"`
 	EvidenceLastError      string `gorm:"size:64;column:evidence_last_error"`
+	EvidenceStoreID        string `gorm:"size:64;column:evidence_store_id"`
+	EvidenceGapFromTs      int64  `gorm:"column:evidence_gap_from_ts"`
+	EvidenceGapToTs        int64  `gorm:"column:evidence_gap_to_ts"`
+	EvidenceGapDetectedAt  int64  `gorm:"column:evidence_gap_detected_at"`
+	EvidenceGapReason      string `gorm:"size:64;column:evidence_gap_reason"`
 	UpdatedAt              int64  `gorm:"column:updated_at"`
 }
 
@@ -90,7 +95,9 @@ func cloudWatchNginxEvidenceRange(now time.Time, retentionHours int) (int64, int
 		retentionHours = 744
 	}
 	through := now.Add(-cloudWatchNginxFinalizeDelay).Unix() / 60 * 60
-	from := through - int64(retentionHours)*3600
+	// Start at the next retained whole minute, not two minutes before the
+	// retention cutoff (the finalized target already includes a delay).
+	from := (now.UnixMilli() - int64(retentionHours)*3_600_000 + 59_999) / 60_000 * 60
 	if from < 0 {
 		from = 0
 	}
@@ -163,26 +170,8 @@ func (m *Monitor) loadCloudWatchNginxCursor(now time.Time) (CloudWatchNginxCurso
 		if state.ThroughTs < state.CoverageFromTs {
 			state.ThroughTs = state.CoverageFromTs
 		}
-		if nginxEvidenceMode(m.cfg.NginxEvidenceMode) == "off" || m.nginxEvidenceDB == nil {
-			state.EvidenceStatus = "disabled"
-		} else {
-			if state.EvidenceCoverageFromTs <= 0 || state.EvidenceCoverageFromTs > evidenceTarget {
-				state.EvidenceCoverageFromTs = evidenceFrom
-			}
-			if state.EvidenceCoverageFromTs < evidenceFrom {
-				state.EvidenceCoverageFromTs = evidenceFrom
-			}
-			if state.EvidenceNextTs < state.EvidenceCoverageFromTs || state.EvidenceNextTs == 0 {
-				state.EvidenceNextTs = state.EvidenceCoverageFromTs
-			}
-			if state.EvidenceThroughTs < state.EvidenceCoverageFromTs {
-				state.EvidenceThroughTs = state.EvidenceCoverageFromTs
-			}
-			if state.EvidenceNextTs >= evidenceTarget {
-				state.EvidenceStatus = "caught_up"
-			} else if state.EvidenceStatus == "" || state.EvidenceStatus == "disabled" {
-				state.EvidenceStatus = "running"
-			}
+		if err := m.reconcileCloudWatchNginxEvidence(&state, evidenceFrom, evidenceTarget, now); err != nil {
+			return CloudWatchNginxCursor{}, err
 		}
 		repairStart, repairEnd := cloudWatchNginxRepairBounds(state, target)
 		if repairEnd > repairStart && (state.RepairNextTs < repairStart || state.RepairNextTs >= repairEnd ||
@@ -193,6 +182,7 @@ func (m *Monitor) loadCloudWatchNginxCursor(now time.Time) (CloudWatchNginxCurso
 		if saveErr := m.storeDB.Save(&state).Error; saveErr != nil {
 			return CloudWatchNginxCursor{}, saveErr
 		}
+		m.refreshCloudWatchNginxEvidenceRecovery(now)
 		return state, nil
 	}
 	if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
@@ -203,11 +193,8 @@ func (m *Monitor) loadCloudWatchNginxCursor(now time.Time) (CloudWatchNginxCurso
 		ThroughTs: from, TargetThroughTs: target, SemanticsVersion: cloudWatchNginxVersion,
 		Status: "running", UpdatedAt: now.Unix(),
 	}
-	if nginxEvidenceMode(m.cfg.NginxEvidenceMode) == "off" || m.nginxEvidenceDB == nil {
-		state.EvidenceStatus = "disabled"
-	} else {
-		state.EvidenceCoverageFromTs, state.EvidenceNextTs, state.EvidenceThroughTs = evidenceFrom, evidenceFrom, evidenceFrom
-		state.EvidenceStatus = "running"
+	if err := m.reconcileCloudWatchNginxEvidence(&state, evidenceFrom, evidenceTarget, now); err != nil {
+		return CloudWatchNginxCursor{}, err
 	}
 	state.RepairNextTs, _ = cloudWatchNginxRepairBounds(state, target)
 	// 语义升级只重置 CloudWatch 自己的分钟事实与状态；旧采集器历史保留，
@@ -229,6 +216,7 @@ func (m *Monitor) loadCloudWatchNginxCursor(now time.Time) (CloudWatchNginxCurso
 	}); err != nil {
 		return CloudWatchNginxCursor{}, err
 	}
+	m.refreshCloudWatchNginxEvidenceRecovery(now)
 	return state, nil
 }
 
@@ -524,7 +512,14 @@ func (m *Monitor) persistCloudWatchNginxRequestEvidence(ctx context.Context, evi
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	// The next transaction may invalidate an already covered interval. Publish
+	// unknown before touching it so readiness cannot reuse a stale proof while
+	// the bounded replacement transactions are in progress.
+	m.cloudWatchNginxEvidenceRecoveryCache.Store(nil)
 	if err := m.nginxEvidenceDB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := beginCloudWatchNginxEvidenceReplace(tx, from, to); err != nil {
+			return err
+		}
 		return tx.Where("node = ? AND event_ms >= ? AND event_ms < ?", cloudWatchNginxNode, from*1000, to*1000).
 			Delete(&NginxRequestEvidence{}).Error
 	}); err != nil {
@@ -548,7 +543,13 @@ func (m *Monitor) persistCloudWatchNginxRequestEvidence(ctx context.Context, evi
 			return fmt.Errorf("insert cloudwatch nginx evidence batch [%d,%d): %w", start, end, err)
 		}
 	}
-	return ctx.Err()
+	err := m.nginxEvidenceDB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		return completeCloudWatchNginxEvidenceReplace(tx, from, to)
+	})
+	if err == nil {
+		m.refreshCloudWatchNginxEvidenceRecovery(time.Now())
+	}
+	return err
 }
 
 func (m *Monitor) publishCloudWatchNginxEvidenceCursor(ctx context.Context, state *CloudWatchNginxCursor, from, to, target int64) error {
@@ -561,14 +562,29 @@ func (m *Monitor) publishCloudWatchNginxEvidenceCursor(ctx context.Context, stat
 	next.EvidenceStatus = "running"
 	next.EvidenceLastError = ""
 	next.EvidenceLastSuccessAt = time.Now().Unix()
+	var proof CloudWatchNginxEvidenceCheckpoint
+	if m.nginxEvidenceDB == nil {
+		return fmt.Errorf("cloudwatch nginx evidence store unavailable")
+	}
+	if err := m.nginxEvidenceDB.WithContext(ctx).First(&proof, "id = ?", cloudWatchNginxCursorID).Error; err != nil {
+		return err
+	}
+	retentionFrom, _ := cloudWatchNginxEvidenceRange(time.Now(), m.cfg.NginxEvidenceRetentionHours)
+	if !cloudWatchNginxEvidenceProofMatches(next, proof, retentionFrom) {
+		return fmt.Errorf("cloudwatch nginx evidence coverage proof mismatch")
+	}
 	if to >= target {
 		next.EvidenceStatus = "caught_up"
+	}
+	if next.EvidenceGapToTs > to {
+		next.EvidenceStatus = "recovering"
 	}
 	next.UpdatedAt = time.Now().Unix()
 	if err := m.storeDB.WithContext(ctx).Save(&next).Error; err != nil {
 		return err
 	}
 	*state = next
+	m.refreshCloudWatchNginxEvidenceRecovery(time.Now())
 	return nil
 }
 
@@ -760,6 +776,16 @@ func (m *Monitor) startCloudWatchNginx(ctx context.Context) {
 		for {
 			if ctx.Err() != nil {
 				return
+			}
+			// Re-check durable evidence proof before choosing another window.
+			// A failed multi-transaction replacement can invalidate an older
+			// covered interval even though the main cursor did not move.
+			if err := m.refreshCloudWatchNginxEvidenceCursor(ctx, &state, time.Now()); err != nil {
+				m.recordCloudWatchNginxEvidenceFailure(&state, err, time.Now().Unix())
+				if !waitSourceLifecycle(ctx, poll) {
+					return
+				}
+				continue
 			}
 			_, target := cloudWatchNginxRange(time.Now(), m.cfg.CloudWatchNginxLookbackHours)
 			state.TargetThroughTs = target

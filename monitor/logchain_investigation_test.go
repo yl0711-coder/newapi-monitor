@@ -163,7 +163,7 @@ func TestAsyncInvestigationReturnsAllSourceStatesAndRedactedTimeline(t *testing.
 	before := len(client.filterInputs) + len(client.startInputs)
 	client.mu.Unlock()
 	cached, err := m.createLogChainInvestigation("owner", input)
-	if err != nil || !cached.Cost.CacheHit || cached.Status != "complete" {
+	if err != nil || !cached.Cost.CacheHit || cached.Status != result.Status {
 		t.Fatalf("cache result=%+v err=%v", cached, err)
 	}
 	client.mu.Lock()
@@ -295,7 +295,7 @@ func TestPendingDeliveryRecheckOnlyQueriesCloudFront(t *testing.T) {
 	task := &logChainInvestigationTask{ID: "inv_0123456789abcdef0123456789abcdef", Owner: "owner", Input: in, Status: "pending_delivery", CreatedAt: time.Now()}
 	task.Result = &logChainInvestigationResult{
 		OK: true, InvestigationID: task.ID, Status: "pending_delivery", Scope: m.investigationScopeView(in),
-		SourceStatus: statuses, AuditRecorded: false,
+		SourceStatus: statuses, AuditRecorded: false, CandidatesComplete: true,
 	}
 	m.investigationTasks = map[string]*logChainInvestigationTask{task.ID: task}
 	result := m.recheckPendingCloudFront(context.Background(), task)
@@ -347,14 +347,19 @@ func TestPendingDeliveryCancellationReturnsCancelledImmediately(t *testing.T) {
 }
 
 func TestCloudFrontMultipleEqualCandidatesStayAmbiguous(t *testing.T) {
+	m := newLogChainCloudWatchTestMonitor(t, &fakeCloudWatchLogsClient{})
 	status := 200
 	requestMS := int64(1000)
-	rows := []LogChainRow{{CreatedAt: 100, RequestPath: "/v1/responses", UseTime: 1}}
+	rows := []LogChainRow{{CreatedAt: 100, RequestPath: "/v1/responses", UseTime: 1, UseTimeKnown: true}}
 	evidence := []cloudWatchStructuredEvidence{
 		{EventRef: "a", EventMS: 100000, Route: "/v1/responses", Status: &status, RequestMS: &requestMS},
 		{EventRef: "b", EventMS: 100000, Route: "/v1/responses", Status: &status, RequestMS: &requestMS},
 	}
-	levels := cloudFrontEvidenceLevels(rows, evidence, logChainInvestigationInput{Status: 200})
+	for i := range evidence {
+		evidence[i].HMACKeyID = m.cfg.CloudWatchEvidenceHMACKeyID
+		evidence[i].CloudFrontIDHMAC = m.investigationDigest("cloudfront-request-id", evidence[i].EventRef)
+	}
+	levels := m.cloudFrontEvidenceLevels(rows, evidence, logChainInvestigationInput{Status: 200}, true)
 	if levels["a"] != "ambiguous" || levels["b"] != "ambiguous" {
 		t.Fatalf("equal candidates were presented as certain: %+v", levels)
 	}

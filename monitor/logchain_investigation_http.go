@@ -73,7 +73,7 @@ func (m *Monitor) serveGetLogChainInvestigation(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "排障任务不存在或不属于当前操作者"})
 		return
 	}
-	c.JSON(http.StatusOK, result)
+	c.JSON(http.StatusOK, m.investigationResponse(result))
 }
 
 // serveCancelLogChainInvestigation POST /logchain/investigations/:id/cancel
@@ -92,7 +92,7 @@ func (m *Monitor) serveCancelLogChainInvestigation(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "排障任务不存在或不属于当前操作者"})
 		return
 	}
-	c.JSON(http.StatusOK, result)
+	c.JSON(http.StatusOK, m.investigationResponse(result))
 }
 
 func validLogChainInvestigationID(value string) bool {

@@ -22,17 +22,19 @@ var logChainInvestigationSourceOrder = []cloudWatchLogSourceID{
 }
 
 type logChainInvestigationRunner struct {
-	m        *Monitor
-	parser   *cloudWatchEvidenceParser
-	mu       sync.Mutex
-	statuses map[cloudWatchLogSourceID]logChainCloudWatchSourceStatus
-	evidence map[cloudWatchLogSourceID][]cloudWatchStructuredEvidence
-	queries  int
-	bytes    uint64
+	m                             *Monitor
+	parser                        *cloudWatchEvidenceParser
+	mu                            sync.Mutex
+	statuses                      map[cloudWatchLogSourceID]logChainCloudWatchSourceStatus
+	evidence                      map[cloudWatchLogSourceID][]cloudWatchStructuredEvidence
+	queries                       int
+	bytes                         uint64
+	cloudFrontCandidateSetQueried bool
 }
 
 func (m *Monitor) executeLogChainInvestigation(ctx context.Context, id string, in logChainInvestigationInput) logChainInvestigationResult {
 	result := logChainInvestigationResult{
+		SchemaVersion:   in.SchemaVersion,
 		InvestigationID: id, Status: "running", Scope: m.investigationScopeView(in), StartedAt: time.Now().Unix(),
 		Requests: []LogChainRow{}, Timeline: []logChainInvestigationTimelineEvent{},
 		SourceStatus: []logChainCloudWatchSourceStatus{}, Evidence: []logChainCloudWatchEvidence{},
@@ -41,6 +43,9 @@ func (m *Monitor) executeLogChainInvestigation(ctx context.Context, id string, i
 			"CloudFront 标准日志存在投递延迟；暂时查不到只表示当前没有入口证据，不等于请求没有到达。",
 			"页面只返回结构化字段和脱敏证据引用，不读取 Authorization、Cookie、API Key、提示词或响应正文。",
 		},
+	}
+	if m.cfg.CloudWatchNginxEnabled && nginxEvidenceMode(m.cfg.NginxEvidenceMode) != "off" && m.cloudWatchNginxEvidenceRecovery(time.Now()).Incomplete {
+		result.BlindSpots = append(result.BlindSpots, "本地 Nginx 请求证据存在缺口，正在补扫有效保留期；暂时查不到不代表请求未发生。")
 	}
 	parser, err := m.cloudWatchEvidenceParser(in.IncludeSensitiveDiagnostics)
 	if err != nil {
@@ -53,6 +58,7 @@ func (m *Monitor) executeLogChainInvestigation(ctx context.Context, id string, i
 
 	rows, truncated, candidateErrs := m.investigationCandidates(ctx, in)
 	result.Requests, result.CandidateTruncated = rows, truncated
+	result.CandidatesComplete = !truncated && len(candidateErrs) == 0
 	result.BlindSpots = append(result.BlindSpots, candidateErrs...)
 	requestIDs := investigationRequestIDs(in.NewAPIRequestID, rows)
 	paths := investigationPaths(in.Path, rows)
@@ -61,8 +67,8 @@ func (m *Monitor) executeLogChainInvestigation(ctx context.Context, id string, i
 
 	if len(requestIDs) > 0 {
 		for _, requestID := range requestIDs {
-			runner.filter(ctx, cwSourceWorkerNginx, cwFilterWorkerNginxID, requestID, in.From, in.To, "exact", "按 NewAPI Request ID 精确匹配 Nginx 日志。", nil)
-			runner.filter(ctx, cwSourceWorkerNewAPI, cwFilterWorkerNewAPIID, requestID, in.From, in.To, "exact", "按 NewAPI Request ID 精确匹配应用日志。", nil)
+			runner.filter(ctx, cwSourceWorkerNginx, cwFilterWorkerNginxID, requestID, in.From, in.To, "exact", "按 NewAPI Request ID 查询 Nginx 日志；关联等级以逐条核验为准。", nil)
+			runner.filter(ctx, cwSourceWorkerNewAPI, cwFilterWorkerNewAPIID, requestID, in.From, in.To, "exact", "按 NewAPI Request ID 查询应用日志；关联等级以逐条核验为准。", nil)
 		}
 	} else {
 		if len(paths) > 0 {
@@ -106,22 +112,24 @@ func (m *Monitor) executeLogChainInvestigation(ctx context.Context, id string, i
 		runner.skip(cwSourceMaster, "skipped", "普通客户 API 请求不经过 Master，本次未触发查询。")
 	}
 
-	runner.refineCloudFrontLinkage(rows, in)
 	result.SourceStatus = runner.orderedStatuses()
 	result.Evidence = runner.groupedEvidence()
+	result.associationEdgesComplete = runner.cloudFrontCandidateSetQueried
+	m.loadInvestigationAssociationCandidates(ctx, &result, in)
+	m.associateInvestigationEvidence(&result, in)
 	result.Timeline = m.investigationTimeline(rows, result.Evidence, result.SourceStatus, in)
-	result.Summary = summarizeInvestigation(rows, runner.allEvidence(), result.SourceStatus, in)
+	result.Summary = summarizeInvestigation(rows, flattenInvestigationEvidence(result.Evidence), in)
 	result.Cost = logChainInvestigationCost{Queries: runner.queries, BytesScanned: runner.bytes}
 	result.SensitiveDiagnosticsRead = sourceWasRead(result.SourceStatus, cwSourceCloudFrontDiagnostic)
-	result.Status = investigationCompletionStatus(ctx, result)
+	result = withInvestigationCompletion(ctx, result)
 	if result.CandidateTruncated {
 		result.BlindSpots = append(result.BlindSpots, "业务候选超过单任务安全上限，只对本次返回的候选补证据；请缩小时间或筛选条件。")
 	}
 	return result
 }
 
-// recheckPendingCloudFront 只复查投递延迟来源，不重复读取 NewAPI、Worker、RDS
-// 或 Master。旧证据保持不变，CloudFront 两个来源用本轮结果原子替换。
+// recheckPendingCloudFront 只重查投递延迟来源与其有界业务反查，不重复读取
+// Worker、RDS 或 Master。旧证据保持不变，CloudFront 来源用本轮结果替换。
 func (m *Monitor) recheckPendingCloudFront(ctx context.Context, task *logChainInvestigationTask) logChainInvestigationResult {
 	m.investigationMu.Lock()
 	current := m.investigationTasks[task.ID]
@@ -142,7 +150,6 @@ func (m *Monitor) recheckPendingCloudFront(ctx context.Context, task *logChainIn
 	paths := investigationPaths(task.Input.Path, result.Requests)
 	cloudFrontIDs := runner.queryCloudFront(ctx, task.Input, paths)
 	runner.queryCloudFrontDiagnostic(ctx, task.Input, cloudFrontIDs)
-	runner.refineCloudFrontLinkage(result.Requests, task.Input)
 
 	statuses := append([]logChainCloudWatchSourceStatus(nil), result.SourceStatus...)
 	for _, source := range []cloudWatchLogSourceID{cwSourceCloudFrontAccess, cwSourceCloudFrontDiagnostic} {
@@ -155,13 +162,16 @@ func (m *Monitor) recheckPendingCloudFront(ctx context.Context, task *logChainIn
 		evidence = replaceInvestigationEvidence(evidence, source, runner.evidenceFor(source))
 	}
 	result.SourceStatus, result.Evidence = statuses, evidence
-	result.Timeline = m.investigationTimeline(result.Requests, evidence, statuses, task.Input)
-	result.Summary = summarizeInvestigation(result.Requests, flattenInvestigationEvidence(evidence), statuses, task.Input)
+	result.associationEdgesComplete = runner.cloudFrontCandidateSetQueried
+	m.loadInvestigationAssociationCandidates(ctx, &result, task.Input)
+	m.associateInvestigationEvidence(&result, task.Input)
+	result.Timeline = m.investigationTimeline(result.Requests, result.Evidence, result.SourceStatus, task.Input)
+	result.Summary = summarizeInvestigation(result.Requests, flattenInvestigationEvidence(result.Evidence), task.Input)
 	result.Cost.Queries += runner.queries
 	result.Cost.BytesScanned += runner.bytes
 	result.Cost.CacheHit = false
 	result.SensitiveDiagnosticsRead = sourceWasRead(statuses, cwSourceCloudFrontDiagnostic)
-	result.Status = investigationCompletionStatus(ctx, result)
+	result = withInvestigationCompletion(ctx, result)
 	return result
 }
 
@@ -284,23 +294,29 @@ func (r *logChainInvestigationRunner) queryCloudFront(ctx context.Context, in lo
 	cloudFrontIDs := make([]string, 0, 4)
 	if in.CloudFrontRequestID != "" {
 		r.filter(ctx, cwSourceCloudFrontAccess, cwFilterCloudFrontRequestID, in.CloudFrontRequestID,
-			in.From, in.To, "exact", "按明确的 CloudFront Request ID 精确查询。", nil)
-		return append(cloudFrontIDs, in.CloudFrontRequestID)
+			in.From, in.To, "exact", "按 CloudFront Request ID 查询入口记录；该 ID 本身不证明与 NewAPI 请求的跨层关联。", nil)
+		cloudFrontIDs = append(cloudFrontIDs, in.CloudFrontRequestID)
+		if in.NewAPIRequestID == "" {
+			// This proves the edge event only, not a link to business rows.
+			return cloudFrontIDs
+		}
+		// Two independently supplied IDs do not prove a bridge. Include other
+		// edge requests on the target's path before testing reverse uniqueness.
+		for _, e := range r.evidenceFor(cwSourceCloudFrontAccess) {
+			if e.CloudFrontIDHMAC == r.m.investigationDigest("cloudfront-request-id", in.CloudFrontRequestID) && e.Route != "" {
+				paths = appendUniqueBounded(paths, e.Route, 4)
+			}
+		}
 	}
 	if len(paths) == 0 {
 		r.skip(cwSourceCloudFrontAccess, "ambiguous", "没有 CloudFront Request ID 或请求路径，无法安全构造入口层候选查询。")
 		return cloudFrontIDs
 	}
+	r.cloudFrontCandidateSetQueried = true
 	for _, path := range paths {
-		keep := func(e cloudWatchStructuredEvidence) bool {
-			return in.Status == 0 || e.Status != nil && *e.Status == in.Status
-		}
 		rowsResult := r.insights(ctx, cwSourceCloudFrontAccess, cwQueryCloudFrontPath, path,
-			in.From, in.To, "ambiguous", "按路径、完成时间、状态码和耗时寻找入口候选；候选不唯一时不自动选一条。", keep)
+			in.From, in.To, "ambiguous", "按路径和时间查询完整入口候选；再核对关键字段及两侧唯一性。", nil)
 		for _, row := range rowsResult {
-			if in.Status != 0 && strings.TrimSpace(cwField(row, "sc-status")) != strconv.Itoa(in.Status) {
-				continue
-			}
 			if raw := strings.TrimSpace(cwField(row, "x-edge-request-id")); raw != "" {
 				cloudFrontIDs = appendUniqueBounded(cloudFrontIDs, raw, 4)
 			}
@@ -315,7 +331,7 @@ func (r *logChainInvestigationRunner) queryCloudFrontDiagnostic(ctx context.Cont
 		return
 	}
 	if in.ClientIP != "" {
-		r.filter(ctx, cwSourceCloudFrontDiagnostic, cwFilterCloudFrontDiagnosticIP, in.ClientIP, in.From, in.To, "exact", "按客户出口 IP 精确筛选诊断日志；结果只返回 IP HMAC 与网络摘要。", nil)
+		r.filter(ctx, cwSourceCloudFrontDiagnostic, cwFilterCloudFrontDiagnosticIP, in.ClientIP, in.From, in.To, "ambiguous", "按客户出口 IP 筛选诊断候选；同一 IP 可有多个请求，关联等级以逐条核验为准。", nil)
 		return
 	}
 	if len(cloudFrontIDs) == 0 {
@@ -323,7 +339,7 @@ func (r *logChainInvestigationRunner) queryCloudFrontDiagnostic(ctx context.Cont
 		return
 	}
 	for _, requestID := range cloudFrontIDs {
-		r.filter(ctx, cwSourceCloudFrontDiagnostic, cwFilterCloudFrontDiagnosticRequestID, requestID, in.From, in.To, "exact", "按 CloudFront Request ID 补查客户网络诊断，原始 IP 与 User-Agent 不回传。", nil)
+		r.filter(ctx, cwSourceCloudFrontDiagnostic, cwFilterCloudFrontDiagnosticRequestID, requestID, in.From, in.To, "exact", "按 CloudFront Request ID 补查客户网络诊断；关联等级以逐条核验为准，原始 IP 与 User-Agent 不回传。", nil)
 	}
 }
 
@@ -415,9 +431,6 @@ func (r *logChainInvestigationRunner) insights(ctx context.Context, source cloud
 	status.Events, status.Parsed, status.ParseFailed, status.Truncated = len(result.Rows), uint64(len(evidence)), batch.ParseFailed, result.Truncated
 	if len(evidence) > 0 {
 		status.Status = "found"
-		if linkage == "ambiguous" && len(evidence) == 1 {
-			status.Linkage = "correlated"
-		}
 	}
 	if len(result.Rows) > 0 && batch.Parsed == 0 {
 		status.Status = "unavailable"
@@ -438,7 +451,7 @@ func (r *logChainInvestigationRunner) mergeStatus(next logChainCloudWatchSourceS
 	defer r.mu.Unlock()
 	current, exists := r.statuses[next.Source]
 	if !exists {
-		next.Partial = forcedPartial
+		next.Partial = next.Partial || forcedPartial || next.Truncated || next.ParseFailed > 0
 		r.statuses[next.Source] = next
 		return
 	}
@@ -446,7 +459,7 @@ func (r *logChainInvestigationRunner) mergeStatus(next logChainCloudWatchSourceS
 	current.Parsed += next.Parsed
 	current.ParseFailed += next.ParseFailed
 	current.Truncated = current.Truncated || next.Truncated
-	current.Partial = current.Partial || forcedPartial
+	current.Partial = current.Partial || next.Partial || forcedPartial || current.Truncated || current.ParseFailed > 0
 	if current.Note != next.Note && next.Note != "" {
 		current.Note = strings.TrimSpace(current.Note + " " + next.Note)
 	}
@@ -455,9 +468,6 @@ func (r *logChainInvestigationRunner) mergeStatus(next logChainCloudWatchSourceS
 			current.Partial = true
 		}
 		current.Status = "found"
-		if current.Linkage == "ambiguous" && next.Linkage == "correlated" {
-			current.Linkage = "correlated"
-		}
 	} else if next.Status == "empty" {
 		if current.Status == "skipped" {
 			current.Status = "empty"
@@ -479,7 +489,16 @@ func (r *logChainInvestigationRunner) addEvidence(source cloudWatchLogSourceID, 
 		return
 	}
 	r.mu.Lock()
-	r.evidence[source] = append(r.evidence[source], evidence...)
+	seen := make(map[string]bool, len(r.evidence[source]))
+	for _, item := range r.evidence[source] {
+		seen[item.EventRef] = true
+	}
+	for _, item := range evidence {
+		if item.EventRef == "" || !seen[item.EventRef] {
+			r.evidence[source] = append(r.evidence[source], item)
+			seen[item.EventRef] = true
+		}
+	}
 	r.mu.Unlock()
 }
 
@@ -520,27 +539,6 @@ func (r *logChainInvestigationRunner) groupedEvidence() []logChainCloudWatchEvid
 	return out
 }
 
-func (r *logChainInvestigationRunner) refineCloudFrontLinkage(rows []LogChainRow, in logChainInvestigationInput) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	status, ok := r.statuses[cwSourceCloudFrontAccess]
-	if !ok || status.Linkage == "exact" || status.Status != "found" {
-		return
-	}
-	levels := cloudFrontEvidenceLevels(rows, r.evidence[cwSourceCloudFrontAccess], in)
-	correlated := 0
-	for _, level := range levels {
-		if level == "correlated" {
-			correlated++
-		}
-	}
-	if correlated == 1 {
-		status.Linkage = "correlated"
-		status.Note += " 仅一条候选同时满足完成时间、路径、状态码/耗时约束，标为高置信相关；仍非统一 ID 精确关联。"
-	}
-	r.statuses[cwSourceCloudFrontAccess] = status
-}
-
 func investigationHasDatabaseSignal(rows []LogChainRow, evidence []cloudWatchStructuredEvidence) bool {
 	for _, item := range evidence {
 		if item.Category == "database_error" || item.Kind == cwEvidenceRDSError || item.Kind == cwEvidenceRDSSlowQuery {
@@ -572,40 +570,31 @@ func investigationHasMasterSignal(in logChainInvestigationInput, evidence []clou
 }
 
 func (m *Monitor) investigationTimeline(rows []LogChainRow, grouped []logChainCloudWatchEvidence, statuses []logChainCloudWatchSourceStatus, in logChainInvestigationInput) []logChainInvestigationTimelineEvent {
-	linkage := make(map[cloudWatchLogSourceID]string, len(statuses))
 	complete := make(map[cloudWatchLogSourceID]bool, len(statuses))
 	for _, status := range statuses {
-		linkage[status.Source] = status.Linkage
 		complete[status.Source] = status.Status == "found" && !status.Partial && status.ParseFailed == 0 && !status.Truncated
 	}
-	var cloudFrontItems []cloudWatchStructuredEvidence
-	for _, group := range grouped {
-		if group.Source == cwSourceCloudFrontAccess {
-			cloudFrontItems = group.Evidence
-			break
-		}
-	}
-	cloudFrontLevels := cloudFrontEvidenceLevels(rows, cloudFrontItems, in)
 	out := make([]logChainInvestigationTimelineEvent, 0, len(rows)+16)
 	for _, row := range rows {
 		fact := "NewAPI 业务日志记录到" + row.TypeName
 		if row.Fault != "" {
 			fact += "；疑似责任方 " + row.Fault + "（" + row.FaultConfidence + "）"
 		}
+		level := "exact"
+		if in.CloudFrontRequestID != "" && in.NewAPIRequestID == "" {
+			level = "ambiguous"
+		}
 		out = append(out, logChainInvestigationTimelineEvent{
 			EventMS: row.CreatedAt * 1000, Node: "NewAPI 业务记录", Source: cloudWatchLogSourceID("newapi_database"), Fact: fact,
 			EvidenceRef: m.investigationDigest("newapi-log-row", strconv.FormatInt(row.ID, 10)),
-			RequestRef:  m.investigationDigest("oneapi-request-id", row.RequestID), EvidenceLevel: "exact", Complete: true,
+			RequestRef:  m.investigationDigest("oneapi-request-id", row.RequestID), EvidenceLevel: level, Complete: true,
 		})
 	}
 	for _, group := range grouped {
 		for _, item := range group.Evidence {
-			level := linkage[group.Source]
-			if item.Source == cwSourceCloudFrontAccess && level != "exact" {
-				level = cloudFrontLevels[item.EventRef]
-			}
+			level := item.EvidenceLevel
 			if level == "" || level == "skipped" {
-				level = "inferred"
+				level = "ambiguous"
 			}
 			out = append(out, logChainInvestigationTimelineEvent{
 				EventMS: item.EventMS, Node: investigationTimelineNode(item.Kind), Source: group.Source, Fact: item.Summary,
@@ -619,74 +608,6 @@ func (m *Monitor) investigationTimeline(rows []LogChainRow, grouped []logChainCl
 		}
 		return out[i].Node < out[j].Node
 	})
-	return out
-}
-
-// cloudFrontEvidenceLevels 用完成时间、路径、显式状态码和耗时共同筛候选。
-// 只有唯一最高分且至少满足两类约束时才标 correlated；其余一律 ambiguous。
-func cloudFrontEvidenceLevels(rows []LogChainRow, evidence []cloudWatchStructuredEvidence, in logChainInvestigationInput) map[string]string {
-	out := make(map[string]string, len(evidence))
-	if in.CloudFrontRequestID != "" {
-		for _, item := range evidence {
-			out[item.EventRef] = "exact"
-		}
-		return out
-	}
-	if len(evidence) == 1 && len(rows) == 0 {
-		out[evidence[0].EventRef] = "correlated"
-		return out
-	}
-	type scored struct {
-		ref   string
-		score int
-	}
-	scores := make([]scored, 0, len(evidence))
-	best := -1
-	for _, item := range evidence {
-		baseScore := 0
-		if in.Status > 0 && item.Status != nil && *item.Status == in.Status {
-			baseScore++
-		}
-		score := baseScore
-		for _, row := range rows {
-			candidate := baseScore
-			if absInt64(item.EventMS-row.CreatedAt*1000) <= 5000 {
-				candidate++
-			}
-			if row.RequestPath != "" && cwRoute(row.RequestPath) == item.Route {
-				candidate++
-			}
-			if row.UseTime > 0 && item.RequestMS != nil {
-				expected := row.UseTime * 1000
-				tolerance := expected / 2
-				if tolerance < 2000 {
-					tolerance = 2000
-				}
-				if absInt64(*item.RequestMS-expected) <= tolerance {
-					candidate++
-				}
-			}
-			if candidate > score {
-				score = candidate
-			}
-		}
-		scores = append(scores, scored{ref: item.EventRef, score: score})
-		if score > best {
-			best = score
-		}
-	}
-	bestCount := 0
-	for _, candidate := range scores {
-		if candidate.score == best {
-			bestCount++
-		}
-	}
-	for _, candidate := range scores {
-		out[candidate.ref] = "ambiguous"
-		if best >= 2 && bestCount == 1 && candidate.score == best {
-			out[candidate.ref] = "correlated"
-		}
-	}
 	return out
 }
 
@@ -718,54 +639,88 @@ func investigationTimelineNode(kind cloudWatchEvidenceKind) string {
 	}
 }
 
-func summarizeInvestigation(rows []LogChainRow, evidence []cloudWatchStructuredEvidence, statuses []logChainCloudWatchSourceStatus, in logChainInvestigationInput) logChainInvestigationSummary {
+func summarizeInvestigation(rows []LogChainRow, evidence []cloudWatchStructuredEvidence, in logChainInvestigationInput) logChainInvestigationSummary {
 	summary := logChainInvestigationSummary{Classification: "inconclusive", EvidenceLevel: "ambiguous", Conclusion: "已有证据不足以确定故障位置，请结合各来源状态与盲区继续排查", CustomerImpact: "unknown"}
 	if in.NewAPIRequestID != "" || in.CloudFrontRequestID != "" {
 		summary.CustomerImpact = "single_request"
 	} else if len(rows) > 1 {
 		summary.CustomerImpact = "multiple_candidates"
 	}
-	for _, item := range evidence {
-		switch {
-		case item.Kind == cwEvidenceCloudFrontAccess && item.Status != nil && *item.Status == 0:
-			return logChainInvestigationSummary{Classification: "client_disconnect_at_edge", EvidenceLevel: "correlated", Conclusion: "CloudFront 记录到响应完成前断开；这只能确认下游连接结束，不能单凭这一条归责客户", CustomerImpact: summary.CustomerImpact}
-		case item.Kind == cwEvidenceNginxAccess && item.Status != nil && *item.Status == 499:
-			return logChainInvestigationSummary{Classification: "client_or_network_disconnect", EvidenceLevel: "exact", Conclusion: "Nginx 以同一 NewAPI Request ID 记录到 499，连接在向客户回传阶段结束", CustomerImpact: summary.CustomerImpact}
-		case item.Category == "database_error":
-			return logChainInvestigationSummary{Classification: "database_error", EvidenceLevel: evidenceLevelForSource(statuses, item.Source), Conclusion: "NewAPI 记录到数据库异常，并已按同一时间窗补查 RDS 证据", CustomerImpact: summary.CustomerImpact}
-		case item.Category == "route_no_channel":
-			return logChainInvestigationSummary{Classification: "platform_routing_rejection", EvidenceLevel: evidenceLevelForSource(statuses, item.Source), Conclusion: "请求到达 NewAPI，但当时没有可用渠道", CustomerImpact: summary.CustomerImpact}
-		case item.FaultClass == "upstream_5xx":
-			return logChainInvestigationSummary{Classification: "upstream_5xx", EvidenceLevel: evidenceLevelForSource(statuses, item.Source), Conclusion: "请求已到达平台，NewAPI 记录到上游 5xx", CustomerImpact: summary.CustomerImpact}
-		case item.Category == "request_completed" && summary.Classification == "inconclusive":
-			summary = logChainInvestigationSummary{Classification: "application_reached", EvidenceLevel: evidenceLevelForSource(statuses, item.Source), Conclusion: "请求已到达 Worker 与 NewAPI；是否完整交付仍需结合 Nginx/CloudFront 回传证据", CustomerImpact: summary.CustomerImpact}
-		}
-	}
+	// An exact business failure takes precedence over unrelated/correlated edge
+	// observations. This is an observation, not a claim about the final retry.
+	hasUnclassifiedFailure, hasConsumption := false, false
 	for _, row := range rows {
+		if in.NewAPIRequestID != "" && row.RequestID != in.NewAPIRequestID {
+			continue
+		}
+		if in.CloudFrontRequestID != "" && in.NewAPIRequestID == "" {
+			continue
+		}
 		switch row.Fault {
 		case "upstream":
-			return logChainInvestigationSummary{Classification: "upstream_error", EvidenceLevel: "exact", Conclusion: "NewAPI 业务日志记录到上游侧失败；请按页面显示的归因依据复核", CustomerImpact: summary.CustomerImpact}
+			return logChainInvestigationSummary{Classification: "upstream_error", EvidenceLevel: "exact", Conclusion: "NewAPI 业务日志记录到上游侧失败；请按页面显示的归因依据复核，不代表重试后的最终结果", CustomerImpact: summary.CustomerImpact}
 		case "ours":
 			return logChainInvestigationSummary{Classification: "platform_error", EvidenceLevel: "exact", Conclusion: "NewAPI 业务日志指向平台配置、路由或运行时问题", CustomerImpact: summary.CustomerImpact}
 		case "downstream":
 			return logChainInvestigationSummary{Classification: "downstream_disconnect", EvidenceLevel: "exact", Conclusion: "业务日志记录到下游连接中断；需结合时间与是否已输出判断是否为超时等待", CustomerImpact: summary.CustomerImpact}
 		}
-		if row.Type == 2 && len(row.AnomalyTags) == 0 {
-			summary = logChainInvestigationSummary{Classification: "business_completed", EvidenceLevel: "exact", Conclusion: "NewAPI 业务日志记录到正常消费；完整回传情况仍以入口层证据为准", CustomerImpact: summary.CustomerImpact}
+		if row.Type == 5 || len(row.AnomalyTags) > 0 {
+			hasUnclassifiedFailure = true
 		}
+		if row.Type == 2 && len(row.AnomalyTags) == 0 {
+			hasConsumption = true
+			summary = logChainInvestigationSummary{Classification: "business_completed", EvidenceLevel: "exact", Conclusion: "NewAPI 业务日志记录到正常消费；这不能单独证明客户已完整收到回答", CustomerImpact: summary.CustomerImpact}
+		}
+	}
+	if hasUnclassifiedFailure {
+		// Consumption can follow a failed attempt with the same Request ID.
+		// Keep both observations regardless of row order; neither proves the
+		// final outcome of the logical request or erases the earlier failure.
+		summary.Classification, summary.EvidenceLevel = "inconclusive", "exact"
+		summary.Conclusion = investigationUnknownFailureConclusion(hasConsumption)
+	}
+	for _, item := range evidence {
+		// Candidate and window-level infrastructure events remain on the timeline;
+		// they cannot determine this request's outcome.
+		rank := investigationLinkageRank(item.EvidenceLevel)
+		if rank < 2 || rank < investigationLinkageRank(summary.EvidenceLevel) {
+			continue
+		}
+		classification, conclusion := "", ""
+		switch {
+		case item.Kind == cwEvidenceCloudFrontAccess && item.Status != nil && *item.Status == 0:
+			classification, conclusion = "client_disconnect_at_edge", "CloudFront 记录到响应完成前断开；这只能说明连接结束，不能单凭这一条归责客户"
+		case item.Kind == cwEvidenceNginxAccess && item.Status != nil && *item.Status == 499:
+			classification, conclusion = "client_or_network_disconnect", "Nginx 记录到与本请求关联的 499；连接已断开，不能仅据此确认是客户责任"
+		case item.Category == "database_error":
+			classification, conclusion = "database_error", "关联的 NewAPI 证据记录到数据库异常；RDS 只作为同窗口背景证据"
+		case item.Category == "route_no_channel":
+			classification, conclusion = "platform_routing_rejection", "关联的应用日志记录到请求被拒绝：当时没有可用渠道"
+		case item.FaultClass == "upstream_5xx" && item.Kind == cwEvidenceNewAPIError:
+			classification, conclusion = "upstream_5xx", "关联的 NewAPI 应用日志记录到上游 5xx"
+		case item.Category == "request_completed" && summary.Classification == "inconclusive" && !hasUnclassifiedFailure:
+			classification, conclusion = "application_reached", "请求已到达 NewAPI；完整交付仍缺客户端直接证据"
+		}
+		if classification == "" {
+			continue
+		}
+		if item.EvidenceLevel == "correlated" {
+			conclusion = "高置信候选（非精确关联）：" + conclusion
+		}
+		summary = logChainInvestigationSummary{Classification: classification, EvidenceLevel: item.EvidenceLevel, Conclusion: conclusion, CustomerImpact: summary.CustomerImpact}
+	}
+	if hasUnclassifiedFailure && hasConsumption && summary.Classification != "inconclusive" {
+		summary.Conclusion += "；同一查询范围还有正常消费记录，不能据此抹掉错误或判定重试后的最终结果"
 	}
 	return summary
 }
 
-func evidenceLevelForSource(statuses []logChainCloudWatchSourceStatus, source cloudWatchLogSourceID) string {
-	for _, status := range statuses {
-		if status.Source == source && status.Linkage != "" {
-			return status.Linkage
-		}
+func investigationUnknownFailureConclusion(hasConsumption bool) string {
+	if hasConsumption {
+		return "NewAPI 同时记录到错误/异常和正常消费；错误仍需排查，责任方待判，重试后的最终结果尚未确认"
 	}
-	return "ambiguous"
+	return "NewAPI 已记录错误或异常，但责任方尚未判明；这条记录不能代表请求重试后的最终结果"
 }
-
 func sourceWasRead(statuses []logChainCloudWatchSourceStatus, source cloudWatchLogSourceID) bool {
 	for _, status := range statuses {
 		if status.Source == source {
@@ -776,6 +731,10 @@ func sourceWasRead(statuses []logChainCloudWatchSourceStatus, source cloudWatchL
 }
 
 func investigationCompletionStatus(ctx context.Context, result logChainInvestigationResult) string {
+	return investigationCompletionStatusAt(ctx, result, time.Now())
+}
+
+func investigationCompletionStatusAt(ctx context.Context, result logChainInvestigationResult, now time.Time) string {
 	failures, successful := 0, 0
 	cloudFrontEmpty := false
 	for _, status := range result.SourceStatus {
@@ -789,33 +748,64 @@ func investigationCompletionStatus(ctx context.Context, result logChainInvestiga
 		default:
 			failures++
 		}
-		if status.Partial {
+		if status.Partial || status.Truncated || status.ParseFailed > 0 {
 			failures++
 		}
 	}
 	if successful == 0 && failures > 0 && len(result.Requests) == 0 {
 		return "failed"
 	}
-	if failures > 0 || ctx.Err() != nil {
+	if failures > 0 || ctx.Err() != nil || !result.CandidatesComplete || result.CandidateTruncated ||
+		result.associationCandidatesRequired && !result.associationCandidatesComplete {
 		return "partial"
 	}
 	if cloudFrontEmpty {
-		to, _ := time.Parse(time.RFC3339, result.Scope.ToUTC)
-		if time.Since(to) < time.Hour {
+		to, err := time.Parse(time.RFC3339, result.Scope.ToUTC)
+		if err == nil && now.Sub(to) < time.Hour {
 			return "pending_delivery"
 		}
+		// The delivery wait expiring is not evidence that the source is complete.
+		return "partial"
 	}
 	return "complete"
+}
+
+func investigationHasEmptyCloudFront(result logChainInvestigationResult) bool {
+	for _, status := range result.SourceStatus {
+		if status.Source == cwSourceCloudFrontAccess && status.Status == "empty" {
+			return true
+		}
+	}
+	return false
+}
+
+func appendInvestigationBlindSpot(result logChainInvestigationResult, message string) logChainInvestigationResult {
+	for _, existing := range result.BlindSpots {
+		if existing == message {
+			return result
+		}
+	}
+	// Rechecks share the previous result's backing slices; preserve old snapshots.
+	result.BlindSpots = append(append([]string(nil), result.BlindSpots...), message)
+	return result
+}
+
+func withInvestigationCompletion(ctx context.Context, result logChainInvestigationResult) logChainInvestigationResult {
+	result.Status = investigationCompletionStatus(ctx, result)
+	if result.Status == "partial" && investigationHasEmptyCloudFront(result) {
+		result = appendInvestigationBlindSpot(result, "CloudFront 入口证据仍缺失，本次结果不完整；等待投递超时或其他查询结束不能证明请求未到达。")
+	}
+	return result
 }
 
 // finalizePendingDeliveryRecheck 防止 60 分钟最后一轮复查后任务仍永久停在
 // pending_delivery。最终仍没有 CloudFront 证据属于明确的数据缺口，因此收口为
 // partial，而不是伪装成完整结果；页面会停止轮询并保留下一步说明。
 func finalizePendingDeliveryRecheck(result logChainInvestigationResult, final bool) logChainInvestigationResult {
-	if !final || result.Status != "pending_delivery" {
+	if !final || (result.Status != "pending_delivery" &&
+		!((result.Status == "partial" || result.Status == "complete") && investigationHasEmptyCloudFront(result))) {
 		return result
 	}
 	result.Status = "partial"
-	result.BlindSpots = append(result.BlindSpots, "CloudFront 已完成 5、15、60 分钟三轮延迟复查，仍无可用入口证据；任务已停止自动复查，不能据此断定请求未到达。")
-	return result
+	return appendInvestigationBlindSpot(result, "CloudFront 已完成 5、15、60 分钟三轮延迟复查，仍无可用入口证据；任务已停止自动复查，不能据此断定请求未到达。")
 }

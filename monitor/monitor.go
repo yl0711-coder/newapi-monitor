@@ -86,6 +86,8 @@ type Monitor struct {
 	cloudWatchNginxEvidenceThrough     atomic.Int64
 	cloudWatchNginxEvidenceLastSuccess atomic.Int64
 	cloudWatchNginxEvidenceLastFailure atomic.Int64
+	// Coverage proof is checked by the collector, never by /ready HTTP reads.
+	cloudWatchNginxEvidenceRecoveryCache atomic.Pointer[cloudWatchNginxEvidenceRecoveryStatus]
 	// CloudWatch 排障任务只在管理员明确创建后运行。任务结果与短缓存留在内存，
 	// 本地 SQLite 仅保存不含原始 Request ID/IP 的追加式审计摘要。
 	investigationMu      sync.Mutex

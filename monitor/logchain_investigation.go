@@ -18,6 +18,8 @@ import (
 	"strings"
 	"time"
 	"unicode/utf8"
+
+	"github.com/yl0711-coder/newapi-monitor/internal/observability"
 )
 
 const (
@@ -30,6 +32,7 @@ const (
 )
 
 type logChainInvestigationCreateRequest struct {
+	SchemaVersion               string `json:"schema_version,omitempty"`
 	From                        string `json:"from"`
 	To                          string `json:"to"`
 	Timezone                    string `json:"timezone"`
@@ -47,6 +50,7 @@ type logChainInvestigationCreateRequest struct {
 }
 
 type logChainInvestigationInput struct {
+	SchemaVersion               string
 	From                        time.Time
 	To                          time.Time
 	Timezone                    string
@@ -63,6 +67,7 @@ type logChainInvestigationInput struct {
 }
 
 type logChainInvestigationScopeView struct {
+	HMACKeyID            string `json:"hmac_key_id,omitempty"`
 	FromUTC              string `json:"from_utc"`
 	ToUTC                string `json:"to_utc"`
 	Timezone             string `json:"timezone"`
@@ -85,6 +90,7 @@ type logChainInvestigationSummary struct {
 }
 
 type logChainInvestigationTimelineEvent struct {
+	Candidate     bool                  `json:"candidate,omitempty"`
 	EventMS       int64                 `json:"event_ms"`
 	Node          string                `json:"node"`
 	Source        cloudWatchLogSourceID `json:"source"`
@@ -102,6 +108,8 @@ type logChainInvestigationCost struct {
 }
 
 type logChainInvestigationResult struct {
+	SchemaVersion            string                               `json:"schema_version,omitempty"`
+	Observability            *investigationObservability          `json:"observability,omitempty"`
 	OK                       bool                                 `json:"ok"`
 	InvestigationID          string                               `json:"investigation_id"`
 	Status                   string                               `json:"status"`
@@ -115,9 +123,17 @@ type logChainInvestigationResult struct {
 	Cost                     logChainInvestigationCost            `json:"cost"`
 	SensitiveDiagnosticsRead bool                                 `json:"sensitive_diagnostics_read"`
 	CandidateTruncated       bool                                 `json:"candidate_truncated,omitempty"`
+	CandidatesComplete       bool                                 `json:"candidates_complete"`
 	AuditRecorded            bool                                 `json:"audit_recorded"`
 	StartedAt                int64                                `json:"started_at"`
 	CompletedAt              int64                                `json:"completed_at,omitempty"`
+
+	// Unfiltered, bounded reverse-lookup proof stays in memory only. Unrelated
+	// customers' business rows must never enter the API response or audit data.
+	associationCandidates         []LogChainRow
+	associationCandidatesRequired bool
+	associationCandidatesComplete bool
+	associationEdgesComplete      bool
 }
 
 type logChainInvestigationTask struct {
@@ -167,11 +183,17 @@ type CloudWatchInvestigationAudit struct {
 
 func parseLogChainInvestigationInput(in logChainInvestigationCreateRequest, now time.Time) (logChainInvestigationInput, error) {
 	out := logChainInvestigationInput{
-		Timezone: strings.TrimSpace(in.Timezone), UserID: in.UserID,
+		SchemaVersion: in.SchemaVersion,
+		Timezone:      strings.TrimSpace(in.Timezone), UserID: in.UserID,
 		NewAPIRequestID: strings.TrimSpace(in.NewAPIRequestID), CloudFrontRequestID: strings.TrimSpace(in.CloudFrontRequestID),
 		Model: strings.TrimSpace(in.Model), Group: strings.TrimSpace(in.Group), Path: strings.TrimSpace(in.Path),
 		Status: in.Status, ClientIP: strings.TrimSpace(in.ClientIP),
 		IncludeSensitiveDiagnostics: in.IncludeSensitiveDiagnostics, Purpose: strings.TrimSpace(in.Purpose),
+	}
+	if in.SchemaVersion != "" {
+		if err := observability.ValidateSchemaVersion(in.SchemaVersion); err != nil {
+			return out, errors.New("不支持的 schema_version；当前仅支持 observability.v1")
+		}
 	}
 	if out.Timezone == "" {
 		out.Timezone = "Asia/Shanghai"
@@ -310,14 +332,15 @@ func (m *Monitor) investigationDigest(domain string, values ...string) string {
 }
 
 func (m *Monitor) investigationScopeDigest(in logChainInvestigationInput) string {
-	encoded, _ := json.Marshal([]any{in.From.Unix(), in.To.Unix(), in.UserID, in.NewAPIRequestID,
+	encoded, _ := json.Marshal([]any{in.SchemaVersion, in.From.Unix(), in.To.Unix(), in.UserID, in.NewAPIRequestID,
 		in.CloudFrontRequestID, in.Model, in.Group, in.Path, in.Status, in.ClientIP, in.IncludeSensitiveDiagnostics, in.Purpose})
 	return m.investigationDigest("cloudwatch-investigation-scope", string(encoded))
 }
 
 func (m *Monitor) investigationScopeView(in logChainInvestigationInput) logChainInvestigationScopeView {
 	view := logChainInvestigationScopeView{
-		FromUTC: in.From.Format(time.RFC3339), ToUTC: in.To.Format(time.RFC3339), Timezone: in.Timezone,
+		HMACKeyID: m.cfg.CloudWatchEvidenceHMACKeyID,
+		FromUTC:   in.From.Format(time.RFC3339), ToUTC: in.To.Format(time.RFC3339), Timezone: in.Timezone,
 		UserID: in.UserID, Model: in.Model, Group: in.Group, Path: in.Path, Status: in.Status,
 		SensitiveDiagnostics: in.IncludeSensitiveDiagnostics,
 	}
@@ -452,22 +475,24 @@ func (m *Monitor) createLogChainInvestigation(ownerName string, in logChainInves
 	}
 	if cached, ok := m.investigationCache[cacheKey]; ok && now.Before(cached.ExpiresAt) {
 		result := cached.Result
-		result.InvestigationID, result.Status, result.Cost.CacheHit = id, "complete", true
-		result.StartedAt, result.CompletedAt, result.AuditRecorded = now.Unix(), now.Unix(), true
-		task := &logChainInvestigationTask{ID: id, Owner: owner, Input: in, ScopeDigest: digest, CacheKey: cacheKey, Status: "complete", Result: &result, CreatedAt: now, CompletedAt: now}
-		m.investigationTasks[id] = task
+		// 缓存只复用证据，不能把原始 partial 或历史审计缺口升级成完整。
+		// 本次审计失败时还会追加缺口，先隔离切片，避免污染原缓存。
+		result.BlindSpots = append([]string(nil), result.BlindSpots...)
+		result.InvestigationID, result.Cost.CacheHit = id, true
+		result.StartedAt, result.CompletedAt = now.Unix(), now.Unix()
+		task := &logChainInvestigationTask{ID: id, Owner: owner, Input: in, ScopeDigest: digest, CacheKey: cacheKey, Status: result.Status, Result: &result, CreatedAt: now, CompletedAt: now}
 		// 缓存命中仍要落审计；把这段同步写入也纳入关闭等待，避免 Close
 		// 在审计写入过程中先关闭 SQLite。
 		m.investigationWG.Add(1)
 		m.investigationMu.Unlock()
 		defer m.investigationWG.Done()
-		if err := m.appendInvestigationAudit(task, "cache_hit", "complete", &result); err != nil {
-			m.investigationMu.Lock()
+		if err := m.appendInvestigationAudit(task, "cache_hit", result.Status, &result); err != nil {
 			result.AuditRecorded = false
 			result.BlindSpots = append(result.BlindSpots, "本次缓存命中结果可用，但审计写入失败。")
-			task.Result = &result
-			m.investigationMu.Unlock()
 		}
+		m.investigationMu.Lock()
+		m.investigationTasks[id] = task
+		m.investigationMu.Unlock()
 		return &result, nil
 	}
 
@@ -493,7 +518,7 @@ func (m *Monitor) createLogChainInvestigation(ownerName string, in logChainInves
 		m.runLogChainInvestigationTask(ctx, task)
 	}()
 	return &logChainInvestigationResult{
-		OK: true, InvestigationID: id, Status: "queued", Scope: m.investigationScopeView(in),
+		OK: true, InvestigationID: id, Status: "queued", Scope: m.investigationScopeView(in), SchemaVersion: in.SchemaVersion,
 		AuditRecorded: true, StartedAt: now.Unix(),
 	}, nil
 }
@@ -570,6 +595,18 @@ func (m *Monitor) runLogChainInvestigationTask(parent context.Context, task *log
 	if startedAuditErr != nil {
 		result.BlindSpots = append(result.BlindSpots, "任务已执行，但开始事件的审计写入失败。")
 	}
+	// 完成审计确定后再发布终态与缓存，否则并发缓存命中可能丢失本轮审计缺口。
+	m.investigationMu.Unlock()
+	if err := m.appendInvestigationAudit(task, "finished", result.Status, &result); err != nil {
+		result.AuditRecorded = false
+		result.BlindSpots = append(result.BlindSpots, "排障结果已生成，但完成事件的审计写入失败。")
+	}
+	m.investigationMu.Lock()
+	current = m.investigationTasks[task.ID]
+	if current == nil || current.Status == "cancelled" {
+		m.investigationMu.Unlock()
+		return
+	}
 	current.Status, current.Result, current.CompletedAt = result.Status, &result, now
 	delete(m.investigationByOwner, task.Owner)
 	if result.Status == "complete" || result.Status == "partial" {
@@ -581,18 +618,6 @@ func (m *Monitor) runLogChainInvestigationTask(parent context.Context, task *log
 	}
 	m.investigationMu.Unlock()
 
-	if err := m.appendInvestigationAudit(task, "finished", result.Status, &result); err != nil {
-		m.investigationMu.Lock()
-		if current := m.investigationTasks[task.ID]; current != nil && current.Result != nil {
-			current.Result.AuditRecorded = false
-			current.Result.BlindSpots = append(current.Result.BlindSpots, "排障结果已生成，但完成事件的审计写入失败。")
-			if cached, ok := m.investigationCache[task.CacheKey]; ok {
-				cached.Result = *current.Result
-				m.investigationCache[task.CacheKey] = cached
-			}
-		}
-		m.investigationMu.Unlock()
-	}
 	if result.Status == "pending_delivery" {
 		m.schedulePendingDeliveryRechecks(parent, task)
 	}
@@ -634,6 +659,10 @@ func (m *Monitor) schedulePendingDeliveryRechecks(parent context.Context, task *
 			result.InvestigationID = task.ID
 			result.OK = result.Status != "failed"
 			result.CompletedAt = time.Now().Unix()
+			if err := m.appendInvestigationAudit(task, "rechecked", result.Status, &result); err != nil {
+				result.AuditRecorded = false
+				result.BlindSpots = append(append([]string(nil), result.BlindSpots...), "CloudFront 延迟复查完成，但复查事件的审计写入失败。")
+			}
 
 			m.investigationMu.Lock()
 			current = m.investigationTasks[task.ID]
@@ -650,18 +679,6 @@ func (m *Monitor) schedulePendingDeliveryRechecks(parent context.Context, task *
 				m.investigationCache[task.CacheKey] = logChainInvestigationCacheEntry{Result: result, ExpiresAt: time.Now().Add(ttl)}
 			}
 			m.investigationMu.Unlock()
-			if err := m.appendInvestigationAudit(task, "rechecked", result.Status, &result); err != nil {
-				m.investigationMu.Lock()
-				if current := m.investigationTasks[task.ID]; current != nil && current.Result != nil {
-					current.Result.AuditRecorded = false
-					current.Result.BlindSpots = append(current.Result.BlindSpots, "CloudFront 延迟复查完成，但复查事件的审计写入失败。")
-					if cached, ok := m.investigationCache[task.CacheKey]; ok {
-						cached.Result = *current.Result
-						m.investigationCache[task.CacheKey] = cached
-					}
-				}
-				m.investigationMu.Unlock()
-			}
 			if result.Status != "pending_delivery" {
 				return
 			}
@@ -684,7 +701,7 @@ func (m *Monitor) getLogChainInvestigation(ownerName, id string) (logChainInvest
 		return result, true
 	}
 	return logChainInvestigationResult{
-		OK: true, InvestigationID: task.ID, Status: task.Status, Scope: m.investigationScopeView(task.Input),
+		OK: true, InvestigationID: task.ID, Status: task.Status, Scope: m.investigationScopeView(task.Input), SchemaVersion: task.Input.SchemaVersion,
 		AuditRecorded: true, StartedAt: task.CreatedAt.Unix(),
 	}, true
 }
@@ -703,7 +720,7 @@ func (m *Monitor) cancelLogChainInvestigation(ownerName, id string) (logChainInv
 		delete(m.investigationByOwner, task.Owner)
 		if task.Result == nil {
 			task.Result = &logChainInvestigationResult{
-				OK: true, InvestigationID: id, Status: "cancelled", Scope: m.investigationScopeView(task.Input),
+				OK: true, InvestigationID: id, Status: "cancelled", Scope: m.investigationScopeView(task.Input), SchemaVersion: task.Input.SchemaVersion,
 				Summary:       logChainInvestigationSummary{Classification: "cancelled", EvidenceLevel: "unavailable", Conclusion: "排障任务已取消", CustomerImpact: "unknown"},
 				AuditRecorded: true, StartedAt: task.CreatedAt.Unix(), CompletedAt: task.CompletedAt.Unix(),
 			}

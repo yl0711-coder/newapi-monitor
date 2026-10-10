@@ -90,3 +90,76 @@ test('a caught-up closed window does not show a pending tail',()=>{
   assert.doesNotMatch(view.element('msCoverage').textContent,/采集进度比目标落后/);
   assert.match(view.element('msModels').innerHTML,/2\.7秒/);
 });
+
+test('model highlighting uses a strictly greater than 35% unavailable share',()=>{
+  for(const [unavailable,highlighted] of [[0,false],[3499,false],[3500,false],[3501,true],[3600,true],[10000,true]]) {
+    const view=modelView(),data=report();
+    Object.assign(data.models[0],{requests:10000,routed_requests:10000-unavailable,unavailable_channel_requests:unavailable});
+    view.render(data);
+    const html=view.element('msModels').innerHTML;
+    const modelRow=html.match(/<tr class="ms-model-row[^"]*"[^>]*>/)?.[0];
+    assert.ok(modelRow);
+    assert.equal(modelRow.includes('ms-model-row-high-unavailable'),highlighted,`unavailable=${unavailable}/10000`);
+    assert.equal(modelRow.includes('占该模型总请求次数超过35%'),highlighted);
+    assert.doesNotMatch(html,/ms-ttft-slow|ms-ttft-row-slow|超过40%/);
+  }
+});
+
+test('the denominator is this model total, not routed requests or all models',()=>{
+  const view=modelView(),data=report();
+  data.models=[
+    {model:'low',requests:100,routed_requests:70,unavailable_channel_requests:30,groups:[]},
+    {model:'high',requests:100,routed_requests:64,unavailable_channel_requests:36,groups:[]},
+    {model:'other',requests:10000,routed_requests:10000,unavailable_channel_requests:0,groups:[]}
+  ];
+  view.render(data);
+  const rows=[...view.element('msModels').innerHTML.matchAll(/<tr class="ms-model-row([^"]*)"[^>]*>.*?<strong>(.*?)<\/strong>/g)];
+  assert.equal(rows.length,3);
+  assert.deepEqual(rows.filter(row=>row[1].includes('ms-model-row-high-unavailable')).map(row=>row[2]),['high']);
+});
+
+test('zero or missing request counts never highlight a model',()=>{
+  for(const counts of [{requests:0,unavailable_channel_requests:0},{requests:0,unavailable_channel_requests:5},
+    {unavailable_channel_requests:5},{requests:100}]) {
+    const view=modelView(),data=report();
+    data.models=[{model:'test-model',groups:[],...counts}];
+    view.render(data);
+    assert.doesNotMatch(view.element('msModels').innerHTML,/ms-model-row-high-unavailable/);
+  }
+});
+
+test('model share highlighting does not depend on FRT coverage',()=>{
+  for(const complete of [true,false]) {
+    const view=modelView(),data=report();
+    data.source.frt_complete=complete;
+    Object.assign(data.models[0],{requests:100,routed_requests:64,unavailable_channel_requests:36});
+    view.render(data);
+    assert.match(view.element('msModels').innerHTML,/ms-model-row-high-unavailable/);
+  }
+});
+
+test('slow FRT remains visible without coloring model, group, channel or cells',()=>{
+  for(const legacy of [false,true]) {
+    const view=modelView(),data=report();
+    const model=data.models[0],group=model.groups[0],channel=group.channels[0];
+    for(const item of [model,group,channel]) {
+      Object.assign(item,{frt_p50_ms:5000,frt_p95_ms:5500,frt_p99_ms:6000,frt_max_ms:7000});
+      if(legacy)for(const field of Object.keys(item).filter(key=>key.startsWith('frt_'))) {
+        item[field.replace('frt_','ttft_')]=item[field];delete item[field];
+      }
+    }
+    view.render(data);
+    const html=view.element('msModels').innerHTML;
+    assert.doesNotMatch(html,/ms-model-row-high-unavailable|ms-ttft-slow|ms-ttft-row-slow/);
+    for(const value of [/5\.0秒/g,/5\.5秒/g,/6\.0秒/g,/7\.0秒/g,/7次/g])assert.equal([...html.matchAll(value)].length,3);
+  }
+});
+
+test('page explanation and stylesheet contain only the model share highlight rule',()=>{
+  const page=readFileSync(new URL('../../monitor/page.html',import.meta.url),'utf8');
+  const css=readFileSync(new URL('../../monitor/model_statistics.css',import.meta.url),'utf8');
+  assert.match(page,/仅当无可用渠道次数占该模型总请求次数超过35%时，模型行标红/);
+  assert.doesNotMatch(page,/FRT P95 超过 3 秒或 FRT 超过 3 秒的请求会标红/);
+  assert.match(css,/\.ms-model-row-high-unavailable td\{/);
+  assert.doesNotMatch(css,/ms-ttft-slow|ms-ttft-row-slow/);
+});

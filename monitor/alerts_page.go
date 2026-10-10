@@ -8,6 +8,7 @@ package monitor
 
 import (
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -61,26 +62,27 @@ func (m *Monitor) alertsCoverage(scope stabilityScope, now time.Time) AlertsCove
 		}
 		return coverage
 	}
-	targetFrom, target := cloudWatchPreRouteRange(now, m.cfg.CloudWatchPreRouteLookbackHours)
+	_, target := cloudWatchPreRouteRange(now, m.cfg.CloudWatchPreRouteLookbackHours)
 	coverage.Target = target
 	coverage.Through = m.cloudWatchPreRouteThrough.Load()
 	coverageFrom := m.cloudWatchPreRouteFrom.Load()
 	if coverageFrom <= 0 {
-		coverageFrom = targetFrom
+		coverage.Source = "cloudwatch"
+		coverage.Note = alertsIncompleteCoverageNote + " 连续采集起点尚未就绪。"
+		return coverage
 	}
 	coverageFrom = m.retainedRejectionCoverageFrom(coverageFrom, now.Unix())
 	// A range wholly before the direct lane is owned by the compatibility
 	// collector.  Its source is explicit, but without a collector cursor it is
 	// not safe to call that range complete.
-	if scope.ToTs <= coverageFrom || scope.FromTs >= target {
+	if scope.ToTs <= coverageFrom {
 		coverage.Source = "collector"
 		return coverage
 	}
 	coverage.Source = "cloudwatch"
 	coverage.Note = alertsIncompleteCoverageNote
-	if scope.FromTs < coverageFrom || scope.ToTs > target {
-		coverage.Source = "mixed"
-	}
+	// A missing prefix or unfinalized tail is a coverage gap, not evidence of
+	// another collector. Only actual legacy facts establish a mixed source.
 	// During migration the same minute can contain direct CloudWatch rows and
 	// legacy collector rows.  The overlap query can suppress a proven duplicate
 	// for user_id>0, but it cannot prove that user_id=0 rows describe the same
@@ -90,7 +92,7 @@ func (m *Monitor) alertsCoverage(scope stabilityScope, now time.Time) AlertsCove
 	if coverage.Source == "cloudwatch" {
 		legacy, err := m.alertsHasLegacyRows(scope.FromTs, scope.ToTs)
 		if err != nil {
-			coverage.Source = "mixed"
+			coverage.Source = "unknown"
 			coverage.Note = alertsIncompleteCoverageNote + " 无法确认旧采集器与 CloudWatch 的来源边界。"
 			return coverage
 		}
@@ -117,6 +119,34 @@ func (m *Monitor) alertsCoverage(scope stabilityScope, now time.Time) AlertsCove
 		coverage.Note = alertsIncompleteCoverageNote + " CloudWatch 前置拒绝采集最近一次失败，需先追平水位。"
 	}
 	return coverage
+}
+
+// alertsTrustedThrough is the end of the existing continuous prefix, not a
+// readiness flag for the moving target. A missing start cannot prove a range.
+func (m *Monitor) alertsTrustedThrough(scope stabilityScope, now time.Time) int64 {
+	if m == nil || !m.cfg.CloudWatchPreRouteEnabled || m.storeDB == nil || !cloudWatchPreRouteCoverageTableAvailable(m.storeDB) {
+		return 0
+	}
+	from := m.cloudWatchPreRouteFrom.Load()
+	if from <= 0 || scope.FromTs < m.retainedRejectionCoverageFrom(from, now.Unix()) {
+		return 0
+	}
+	_, target := cloudWatchPreRouteRange(now, m.cfg.CloudWatchPreRouteLookbackHours)
+	through := min(m.cloudWatchPreRouteThrough.Load(), target)
+	if through <= scope.FromTs {
+		return 0
+	}
+	return through
+}
+
+// alertsQueryWindow pins all aggregations to the same published prefix. For
+// first collection, historical gaps or legacy-only data, keep the requested
+// scope and label its known count as partial instead of manufacturing zeros.
+func (m *Monitor) alertsQueryWindow(scope stabilityScope, now time.Time) stabilityScope {
+	if through := m.alertsTrustedThrough(scope, now); through > 0 && through < scope.ToTs {
+		scope.ToTs = through
+	}
+	return scope
 }
 
 func (m *Monitor) alertsHasLegacyRows(from, to int64) (bool, error) {
@@ -179,10 +209,21 @@ type AlertsResponse struct {
 	Total   int64  `json:"total"`
 	// Total is a partial/local count when CoverageComplete is false.  Clients
 	// must not present it as the final number until the watermark catches up.
-	CoverageComplete bool   `json:"coverage_complete"`
-	Source           string `json:"source"`
-	ThroughTs        int64  `json:"through_ts"`
-	TargetTs         int64  `json:"target_ts"`
+	CoverageComplete bool `json:"coverage_complete"`
+	// StatisticsComplete certifies only [FromTs,ToTs); CoverageComplete also
+	// requires the originally requested window to be fully included.
+	StatisticsComplete  bool   `json:"statistics_complete"`
+	StatisticsAvailable bool   `json:"statistics_available"`
+	FromTs              int64  `json:"from_ts"`
+	ToTs                int64  `json:"to_ts"`
+	RequestedFromTs     int64  `json:"requested_from_ts"`
+	RequestedToTs       int64  `json:"requested_to_ts"`
+	CutoffTs            int64  `json:"cutoff_ts,omitempty"`
+	TailSyncing         bool   `json:"tail_syncing"`
+	CollectionFailed    bool   `json:"collection_failed"`
+	Source              string `json:"source"`
+	ThroughTs           int64  `json:"through_ts"`
+	TargetTs            int64  `json:"target_ts"`
 	// CoverageNote 说明这批数据靠旁路采集器，以及直采水位是否完整；
 	// 空结果也必须明确提示「未采集」或覆盖风险，不能说成「没有问题」。
 	CoverageNote string `json:"coverage_note,omitempty"`
@@ -207,6 +248,10 @@ type AlertsResponse struct {
 // 分页、筛选和统计查询见 alerts_query.go。
 
 func (m *Monitor) getRejectAlertsHandler(c *gin.Context) {
+	m.getRejectAlertsAt(c, time.Now())
+}
+
+func (m *Monitor) getRejectAlertsAt(c *gin.Context, now time.Time) {
 	if !m.cfg.StabilityEnabled {
 		c.JSON(200, AlertsResponse{Enabled: false})
 		return
@@ -215,10 +260,21 @@ func (m *Monitor) getRejectAlertsHandler(c *gin.Context) {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "本地事实库未就绪，无法读取问题预警"})
 		return
 	}
-	scope, err := stabilityRange(c, time.Now(), m.cfg.stabilityQueryDays())
+	scope, err := stabilityRange(c, now, m.cfg.stabilityQueryDays())
 	if err != nil {
 		c.JSON(400, gin.H{"error": err.Error()})
 		return
+	}
+	requested := scope
+	// Filtering a displayed snapshot must not advance its cutoff. The client
+	// may pin a previously returned cutoff, but never extend the proven prefix.
+	if raw, exists := c.GetQuery("cutoff_ts"); exists {
+		cutoff, parseErr := strconv.ParseInt(raw, 10, 64)
+		if parseErr != nil || cutoff <= scope.FromTs || cutoff > scope.ToTs || cutoff%60 != 0 || cutoff > m.alertsTrustedThrough(scope, now) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "cutoff_ts 必须位于当前日期范围和可信采集水位内，请刷新后重试"})
+			return
+		}
+		scope.ToTs = cutoff
 	}
 	filter, err := parseAlertRejectFilter(c)
 	if err != nil {
@@ -234,13 +290,21 @@ func (m *Monitor) getRejectAlertsHandler(c *gin.Context) {
 	}
 	if cursor := filter.Cursor; cursor != nil {
 		scope.FromTs, scope.ToTs = cursor.FromTs, cursor.ToTs
+	} else {
+		scope = m.alertsQueryWindow(scope, now)
 	}
 	rows, hasMore, nextCursor, stats, err := m.queryRejectPage(scope, filter)
 	if err != nil {
 		writeStabilityReadError(c, err)
 		return
 	}
-	coverage := m.alertsCoverage(scope, time.Now())
+	coverage := m.alertsCoverage(scope, now)
+	windowRestricted := scope.ToTs < requested.ToTs
+	// A pinned historical snapshot can be shorter than its requested day even
+	// after that day has fully caught up. That is not an actively syncing tail.
+	tailSyncing := windowRestricted && requested.ToTs > min(coverage.Through, coverage.Target)
+	collectionFailed := (!coverage.Complete || tailSyncing) &&
+		m.cloudWatchPreRouteLastFailure.Load() > m.cloudWatchPreRouteLastSuccess.Load()
 	reasons, err := m.queryRejectReasonOptions(scope, filter)
 	if err != nil {
 		writeStabilityReadError(c, err)
@@ -249,7 +313,15 @@ func (m *Monitor) getRejectAlertsHandler(c *gin.Context) {
 	resp := AlertsResponse{
 		Enabled:                   true,
 		Total:                     stats.Total,
-		CoverageComplete:          coverage.Complete,
+		CoverageComplete:          coverage.Complete && !windowRestricted,
+		StatisticsComplete:        coverage.Complete,
+		StatisticsAvailable:       true,
+		FromTs:                    scope.FromTs,
+		ToTs:                      scope.ToTs,
+		RequestedFromTs:           requested.FromTs,
+		RequestedToTs:             requested.ToTs,
+		TailSyncing:               tailSyncing,
+		CollectionFailed:          collectionFailed,
 		Source:                    coverage.Source,
 		ThroughTs:                 coverage.Through,
 		TargetTs:                  coverage.Target,
@@ -267,10 +339,20 @@ func (m *Monitor) getRejectAlertsHandler(c *gin.Context) {
 		UnknownQuotaAccountCount:  stats.UnknownQuotaAccountCount,
 		UnknownCustomerOtherCount: stats.UnknownCustomerOtherCount,
 	}
+	if scope.ToTs%60 == 0 && scope.ToTs <= m.alertsTrustedThrough(requested, now) {
+		resp.CutoffTs = scope.ToTs
+	}
 	if coverage.Note != "" {
 		resp.CoverageNote = coverage.Note
-	} else if len(rows) == 0 && filter.Reason == "" && filter.UserID == nil {
+	} else if len(rows) == 0 && !coverage.Complete && filter.Reason == "" && filter.UserID == nil {
 		resp.CoverageNote = alertsNoDataNote
+	}
+	if collectionFailed {
+		if coverage.Complete {
+			resp.CoverageNote += " CloudWatch 前置拒绝采集最近一次失败；已发布的连续区间仍可查看，后续数据尚未补齐。"
+		} else {
+			resp.CoverageNote += " CloudWatch 前置拒绝采集最近一次失败；以下仅为已采集部分，尚未证明该区间连续覆盖。"
+		}
 	}
 	resp.From = time.Unix(scope.FromTs, 0).In(cstLocation).Format("2006-01-02")
 	resp.To = time.Unix(scope.ToTs-1, 0).In(cstLocation).Format("2006-01-02")

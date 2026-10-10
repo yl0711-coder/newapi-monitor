@@ -1140,6 +1140,7 @@ type readyEffectiveConfig struct {
 }
 
 type readyStatusResponse struct {
+	SourceQuality      []observabilitySourceQuality   `json:"source_quality"`
 	Status             string                         `json:"status"`
 	GitSHA             string                         `json:"git_sha"`
 	ImageVersion       string                         `json:"image_version"`
@@ -1169,17 +1170,18 @@ type cloudWatchPreRouteReadyStatus struct {
 }
 
 type cloudWatchNginxReadyStatus struct {
-	Enabled               bool  `json:"enabled"`
-	Running               bool  `json:"running"`
-	CoverageFrom          int64 `json:"coverage_from_ts"`
-	ThroughTs             int64 `json:"through_ts"`
-	TargetTs              int64 `json:"target_ts"`
-	LastSuccessAt         int64 `json:"last_success_at"`
-	LastFailureAt         int64 `json:"last_failure_at"`
-	EvidenceCoverageFrom  int64 `json:"evidence_coverage_from_ts"`
-	EvidenceThroughTs     int64 `json:"evidence_through_ts"`
-	EvidenceLastSuccessAt int64 `json:"evidence_last_success_at"`
-	EvidenceLastFailureAt int64 `json:"evidence_last_failure_at"`
+	Enabled               bool                                  `json:"enabled"`
+	Running               bool                                  `json:"running"`
+	CoverageFrom          int64                                 `json:"coverage_from_ts"`
+	ThroughTs             int64                                 `json:"through_ts"`
+	TargetTs              int64                                 `json:"target_ts"`
+	LastSuccessAt         int64                                 `json:"last_success_at"`
+	LastFailureAt         int64                                 `json:"last_failure_at"`
+	EvidenceCoverageFrom  int64                                 `json:"evidence_coverage_from_ts"`
+	EvidenceThroughTs     int64                                 `json:"evidence_through_ts"`
+	EvidenceLastSuccessAt int64                                 `json:"evidence_last_success_at"`
+	EvidenceLastFailureAt int64                                 `json:"evidence_last_failure_at"`
+	EvidenceRecovery      cloudWatchNginxEvidenceRecoveryStatus `json:"evidence_recovery"`
 }
 
 type metricFinalizeReadyStatus struct {
@@ -1424,7 +1426,29 @@ func (m *Monitor) readyStatus(now time.Time) (readyStatusResponse, int) {
 			EvidenceThroughTs:     m.cloudWatchNginxEvidenceThrough.Load(),
 			EvidenceLastSuccessAt: m.cloudWatchNginxEvidenceLastSuccess.Load(),
 			EvidenceLastFailureAt: m.cloudWatchNginxEvidenceLastFailure.Load(),
+			EvidenceRecovery:      m.cloudWatchNginxEvidenceRecovery(now),
 		},
+	}
+	if m.cfg.CloudWatchNginxEnabled && nginxEvidenceMode(m.cfg.NginxEvidenceMode) != "off" {
+		if response.CloudWatchNginx.EvidenceRecovery.Incomplete {
+			response.DegradedReasons = appendReason(response.DegradedReasons, "cloudwatch_nginx_evidence_recovery_incomplete")
+		}
+		if !response.CloudWatchNginx.EvidenceRecovery.Verified {
+			// A stale process/main-store watermark is not evidence-store proof.
+			response.CloudWatchNginx.EvidenceThroughTs = 0
+			coverage := response.Collectors["nginx_evidence"]
+			coverage.ThroughTs = 0
+			response.Collectors["nginx_evidence"] = coverage
+		} else {
+			response.CloudWatchNginx.EvidenceThroughTs = min(response.CloudWatchNginx.EvidenceThroughTs,
+				response.CloudWatchNginx.EvidenceRecovery.ThroughTs)
+			coverage := response.Collectors["nginx_evidence"]
+			coverage.ThroughTs = response.CloudWatchNginx.EvidenceThroughTs
+			retentionFrom, _ := cloudWatchNginxEvidenceRange(now, m.cfg.NginxEvidenceRetentionHours)
+			coverage.FromTs = max(coverage.FromTs, retentionFrom)
+			response.Collectors["nginx_evidence"] = coverage
+			response.CloudWatchNginx.EvidenceCoverageFrom = coverage.FromTs
+		}
 	}
 	if m.shuttingDown.Load() || !mainOK || (m.factsStoreRequired() && !factsOK) {
 		response.Status = "not_ready"
@@ -1437,6 +1461,7 @@ func (m *Monitor) readyStatus(now time.Time) (readyStatusResponse, int) {
 		if m.factsStoreRequired() && !factsOK {
 			response.DegradedReasons = appendReason(response.DegradedReasons, "facts_store_unavailable")
 		}
+		response.SourceQuality = buildObservabilitySourceQuality(response, now)
 		return response, http.StatusServiceUnavailable
 	}
 
@@ -1604,6 +1629,7 @@ func (m *Monitor) readyStatus(now time.Time) (readyStatusResponse, int) {
 	if len(response.DegradedReasons) > 0 {
 		response.Status = "degraded"
 	}
+	response.SourceQuality = buildObservabilitySourceQuality(response, now)
 	return response, http.StatusOK
 }
 

@@ -335,10 +335,10 @@ function rowHTML(r){
   const threshold=ch.report?.red_threshold??90;
   // 标红条件：有稳定率且低于阈值。没有稳定率（今天无日志记录）不标红——
   // 那是"没数据"，标红会让人以为出了故障。
-  const bad=r.stability_pct!==null&&r.stability_pct!==undefined&&r.stability_pct<threshold;
+  const metricsReady=r.metrics_ready!==false;
+  const bad=metricsReady&&r.stability_pct!==null&&r.stability_pct!==undefined&&r.stability_pct<threshold;
   // 复用客户排障的行状态类：lc-err = 红底（这里表示低于阈值），lc-open = 展开态。
   const cls=[bad?'lc-err':'',open?'lc-open':''].filter(Boolean).join(' ');
-  const metricsReady=r.metrics_ready!==false;
   const metric=v=>metricsReady?num(v):'<span class="ch-unknown">—</span>';
   const tds=[
     `<td class="ch-company"><span class="ch-arrow">${open?'▾':'▸'}</span>${esc(r.company)}</td>`,
@@ -349,7 +349,7 @@ function rowHTML(r){
       `<span class="fail">错误 ${metric(r.failed)}</span></div>`+
       (metricsReady?`<span class="ch-impact">计入稳定性：异常 ${num(r.stability_anomaly)} · 错误 ${num(r.stability_failed)}</span>`:'')+
       `</td>`,
-    `<td class="ch-stability"><b>${pct(r.stability_pct)}</b></td>`,
+    `<td class="ch-stability"><b>${metricsReady?pct(r.stability_pct):'—'}</b></td>`,
     `<td>${primaryModelsHTML(r)}</td>`,
     spendCell(r),
     `<td class="lc-fault">${faultCell(r)}</td>`,
@@ -362,8 +362,12 @@ function rowHTML(r){
 // 主要模型由后端按公司全部成员合并后计算；前端只展示，不自行重算口径。
 // 默认展示使用最多的一个；仅当两个模型都严格超过 40% 时展示两个。
 function primaryModelsHTML(r){
-  if(r.metrics_ready===false)return '<div class="ch-primary-model ch-none"><b>—</b><span>指标回算中</span></div>';
-  if((+r.total||0)<=0)return '<div class="ch-primary-model ch-none"><b>—</b><span>今日无记录</span></div>';
+  if(r.metrics_ready===false){
+    const labels={initial_backfill:'首次回算中',coverage_gap:'覆盖有缺口',policy_backfill:'统计口径更新中',source_unavailable:'数据来源不可用'};
+    const state=r.metrics_state||ch.report?.collection?.state;
+    return `<div class="ch-primary-model ch-none" title="${esc(r.metrics_note||ch.report?.collection?.note||'指标未完成')}"><b>—</b><span>${esc(labels[state]||'指标未完成')}</span></div>`;
+  }
+  if((+r.total||0)<=0)return '<div class="ch-primary-model ch-none"><b>—</b><span>统计窗口内无记录</span></div>';
   const models=Array.isArray(r.primary_models)?r.primary_models:[];
   if(!models.length)return '<div class="ch-primary-model ch-none"><b>暂无可识别模型</b></div>';
   return models.map(m=>`<div class="ch-primary-model" title="${esc(m.name)} · ${num(m.requests)} 条日志记录">`+
@@ -396,6 +400,7 @@ function spendCell(r){
 
 // faultCell 责任方格。沿用客户排障的描边色块 + 低可信度降权。
 function faultCell(r){
+  if(r.metrics_ready===false)return '<span class="lc-sub">—</span>';
   if(!r.fault)return '<span class="lc-sub">—</span>';
   const cls=FAULT_CLS[r.fault]||'lc-fault-unknown';
   // 本页归因一律降过一档（后端 customerHealthDowngradeConfidence），
@@ -421,7 +426,7 @@ function detailHTML(r){
       <div><b${metricsReady?'':' class="ch-unknown"'}>${metric(r.failed)}</b><span>错误记录</span></div>
       <div><b${metricsReady?'':' class="ch-unknown"'}>${metric(r.stability_anomaly)}</b><span>计入稳定性的异常</span></div>
       <div><b${metricsReady?'':' class="ch-unknown"'}>${metric(r.stability_failed)}</b><span>计入稳定性的错误</span></div>
-      <div><b>${pct(r.stability_pct)}</b><span>记录稳定率</span></div>
+      <div><b>${metricsReady?pct(r.stability_pct):'—'}</b><span>记录稳定率</span></div>
       <div><b${spend===null?' class="ch-unknown"':''}>${spend===null?'—':esc(spend)}</b><span>今日消耗（全部用户）</span></div>
     </div>`;
   const primary=`<div class="ch-reason">

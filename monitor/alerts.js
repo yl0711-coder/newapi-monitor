@@ -7,6 +7,7 @@
 let loaded=false;
 // date 与客户排障同口径：单日、CST。空=今天。
 let date="";
+let cutoffTs=0;
 let inited=false;
 let fReason="";
 let fUser="";
@@ -76,6 +77,7 @@ if(l)l.textContent=date+" (CST)";
 }
 function go(d){
 date=d;
+cutoffTs=0;
 sync();
 load();
 }
@@ -96,6 +98,11 @@ function syncCoverageWarning(){
   if(lastMeta.coverage_complete===true){
     el.hidden=true;el.textContent="";return;
   }
+  if(lastMeta.statistics_complete===true){
+    let text="截至 "+fmtTs(lastMeta.to_ts)+(lastMeta.tail_syncing?"，尾部同步中":"，固定统计窗口")+"；以下数量仅统计已连续覆盖的时间范围。";
+    if(lastMeta.collection_failed)text+=" 最近一次采集失败，正在等待恢复。";
+    el.hidden=false;el.textContent=text;return;
+  }
   const source=lastMeta.source||"未知来源";
   const srcName={cloudwatch:"CloudWatch 直采",collector:"旁路采集器",mixed:"CloudWatch 直采 + 旁路采集器",unknown:"本地采集"}[source]||source;
   let text="数据不完整：当前问题预警只覆盖已采集部分，数量不能作为最终总数（来源："+srcName+"）。";
@@ -103,6 +110,7 @@ function syncCoverageWarning(){
     text+="已覆盖至 "+(lastMeta.through_ts?fmtTs(lastMeta.through_ts):"—")+
       "，目标至 "+(lastMeta.target_ts?fmtTs(lastMeta.target_ts):"—")+"。";
   }
+  if(lastMeta.collection_failed)text+="最近一次采集失败，正在等待恢复。";
   el.hidden=false;el.textContent=text;
 }
 function setBody(html){
@@ -110,7 +118,7 @@ function setBody(html){
   if(b)b.innerHTML=html;
 }
 
-let lastMeta={enabled:true,total:0,truncated:false,note:"",coverage_complete:false,source:"unknown",through_ts:0,target_ts:0,unauth_count:0,
+let lastMeta={enabled:true,total:0,truncated:false,note:"",coverage_complete:false,statistics_complete:false,statistics_available:false,tail_syncing:false,collection_failed:false,from_ts:0,to_ts:0,source:"unknown",through_ts:0,target_ts:0,unauth_count:0,
   unknown_customer_count:0,unknown_user_quota_count:0,unknown_pre_consume_count:0,
   unknown_token_quota_count:0,unknown_quota_account_count:0,unknown_customer_other_count:0,
   reason_options:[]};
@@ -123,12 +131,13 @@ async function load(more=false){
   abort?.abort();
   const ac=new AbortController();abort=ac;
   if(!more){lastRows=[];rowTotal=0;hasMore=false;nextCursor="";}
-  if(!more){lastMeta.coverage_complete=false;lastMeta.source="unknown";lastMeta.through_ts=0;lastMeta.target_ts=0;syncCoverageWarning();}
+  if(!more){lastMeta.coverage_complete=false;lastMeta.statistics_complete=false;lastMeta.statistics_available=false;lastMeta.tail_syncing=false;lastMeta.source="unknown";lastMeta.through_ts=0;lastMeta.target_ts=0;syncCoverageWarning();}
   setStatus(more?"加载更多…":"正在读取…");
   if(!more)setBody('<tr><td colspan="6" class="lc-empty">加载中…</td></tr>');
   syncMore();
   try{
     const q=new URLSearchParams({from:date,to:date,limit:"100"});
+    if(cutoffTs)q.set("cutoff_ts",String(cutoffTs));
     if(fReason)q.set("reason",fReason);
     if(fUser!=="")q.set("user_id",fUser);
     if(more)q.set("cursor",nextCursor);
@@ -149,6 +158,12 @@ async function load(more=false){
     lastMeta={enabled:d.enabled!==false,total:d.total||0,
       truncated:!!d.has_more,note:d.coverage_note||"",
       coverage_complete:d.coverage_complete===true,
+      statistics_complete:d.statistics_complete===true||d.coverage_complete===true,
+      // Old responses also contain known local counts. Lack of independent
+      // coverage proof changes the label, never erases those observations.
+      statistics_available:d.statistics_available!==false,
+      tail_syncing:d.tail_syncing===true,collection_failed:d.collection_failed===true,
+      from_ts:+d.from_ts||0,to_ts:+d.to_ts||0,
       source:d.source||"unknown",through_ts:+d.through_ts||0,target_ts:+d.target_ts||0,
       unauth_count:d.unauth_count||0,
       unknown_customer_count:d.unknown_customer_count||0,
@@ -158,6 +173,9 @@ async function load(more=false){
       unknown_quota_account_count:d.unknown_quota_account_count||0,
       unknown_customer_other_count:d.unknown_customer_other_count||0,
       reason_options:Array.isArray(d.reason_options)?d.reason_options:[]};
+    // Only reuse a cutoff explicitly approved by the server. A recovered
+    // cursor can still carry a seconds-based to_ts, even when its data is complete.
+    cutoffTs=+d.cutoff_ts>0?+d.cutoff_ts:0;
     syncCoverageWarning();
     fillReasonOptions(d.reason_options||[]);
     loading=false;
@@ -335,15 +353,17 @@ function paint(){
   if(!lastMeta.enabled){
     setNotes("稳定性采集未开启，本页无数据。");
     setBody('<tr><td colspan="6" class="lc-empty">未开启</td></tr>');
+    if($("alCounter"))$("alCounter").textContent="";
     return;
   }
   // ★ 0 条必须说成「未采集」，不能让人以为没有问题 ★
   if(!lastRows.length){
     const filtered=!!(fReason||fUser!=="");
-    let emptyNote=filtered?"当前筛选下无记录。":(lastMeta.note||"当日无记录。");
+    const emptyText=filtered?"当前筛选下无记录":(lastMeta.statistics_complete?"当前统计范围内无记录":"已采集部分暂无记录");
+    let emptyNote=filtered?"当前筛选下无记录。":(lastMeta.note||emptyText+"。");
     if(filtered&&lastMeta.note)emptyNote+=" "+lastMeta.note;
     setNotes(emptyNote);
-    setBody('<tr><td colspan="6" class="lc-empty">'+(filtered?"当前筛选下无记录":"当日无记录")+'</td></tr>');
+    setBody('<tr><td colspan="6" class="lc-empty">'+emptyText+'</td></tr>');
     setCounter(0,0);
     return;
   }
@@ -351,7 +371,8 @@ function paint(){
   const rows=lastRows;
 
   let note="这些请求从未到达任何渠道，不计入渠道稳定率；但客户当时确实用不了。";
-  if(lastMeta.coverage_complete!==true)note+=" 当前数据不完整，以下数量仅代表已采集部分，不能作为最终总数。";
+  if(lastMeta.statistics_complete!==true)note+=" 当前数据不完整，以下数量仅代表已采集部分，不能作为最终总数。";
+  if(lastMeta.from_ts&&lastMeta.to_ts)note+=" 统计范围："+fmtTs(lastMeta.from_ts)+" 至 "+fmtTs(lastMeta.to_ts)+"（不含结束时刻）。";
   if(lastMeta.note)note+=" "+lastMeta.note;
   if(hasMore)note+=" 当前筛选共有 "+nfmt(rowTotal)+" 条聚合记录，可继续加载。";
   // ★ 身份缺失分两档 ★
@@ -408,11 +429,11 @@ function paint(){
 function setCounter(shown,all){
   const el=$("alCounter");
   if(!el)return;
-  if(!all&&!shown){el.textContent="";return;}
-  const total=lastMeta.coverage_complete===true?nfmt(lastMeta.total):"—（未完成）";
-  const rowsTotal=lastMeta.coverage_complete===true?nfmt(all):"—（未完成）";
-  el.innerHTML="已加载 <b>"+nfmt(shown)+"</b> / 共 <b>"+rowsTotal+
-    "</b> 条聚合记录 · 当前筛选被拒次数 <b>"+total+"</b>";
+  if(!lastMeta.statistics_available){el.textContent="";return;}
+  const prefix=lastMeta.statistics_complete===true?
+    (lastMeta.coverage_complete?"":"截至 "+fmtTs(lastMeta.to_ts)+(lastMeta.tail_syncing?"，尾部同步中":"，固定统计窗口")+" · "):"已采集部分 · ";
+  el.innerHTML=prefix+"已加载 <b>"+nfmt(shown)+"</b> / 共 <b>"+nfmt(all)+
+    "</b> 条聚合记录 · 当前筛选被拒次数 <b>"+nfmt(lastMeta.total)+"</b>";
 }
 
 })();

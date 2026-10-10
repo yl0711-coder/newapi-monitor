@@ -124,6 +124,16 @@ func (m *Monitor) customerHealthUsage(ctx context.Context, fromTs, toTs int64) (
 		channelTotals: map[int]customerHealthChannelFacts{},
 		channelUsers:  map[int]map[int64]struct{}{},
 	}
+	// Filtering obsolete classification rows from the aggregate must not make
+	// their absence look like a real zero. A cursor proves collection, not a
+	// completed migration of every stored row in the visible window.
+	var obsoleteClassification int
+	if err := m.storeDB.WithContext(qctx).Model(&CapacityUserMinuteSample{}).
+		Select("1").Where("bucket_ts >= ? AND bucket_ts < ? AND COALESCE(traffic_class_version,0) <> ?",
+		fromTs, toTs, stabilityTrafficClassificationVersion).Limit(1).Scan(&obsoleteClassification).Error; err != nil {
+		return nil, err
+	}
+	index.policyReady = obsoleteClassification == 0
 	type aggRow struct {
 		UserID        int64
 		ChannelID     int

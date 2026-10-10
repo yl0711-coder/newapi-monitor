@@ -239,6 +239,7 @@ func TestCustomerHealthSpendUnknownIsNeverZero(t *testing.T) {
 
 func TestCustomerHealthCollectedSpendUsesContinuousLocalCoverage(t *testing.T) {
 	m := newTestMonitor(t)
+	chSeedCompleteTodaySource(t, m, chTestNow())
 	from, target := customerHealthSourceRange(chTestNow())
 	m.cfg.CustomerHealthSourceEnabled = true
 	m.customerHealthSourceRunning.Store(true)
@@ -319,8 +320,8 @@ func TestCustomerHealthDisabledSourceDoesNotPresentStaleFactsAsComplete(t *testi
 
 // Standard source-worker regression: a recent sampler heartbeat is not a
 // coverage proof.  When the durable customer-health cursor only reaches the
-// middle of the day, the report must expose the actual through_ts, mark
-// metrics incomplete, and avoid querying/presenting the unproven tail as zero.
+// middle of the day, the report must expose the actual through_ts and show
+// that certified prefix, without querying/presenting the unproven tail as zero.
 func TestCustomerHealthStandardSourceRequiresContinuousCoverage(t *testing.T) {
 	m := newTestMonitor(t)
 	from, target := customerHealthSourceRange(chTestNow())
@@ -352,11 +353,11 @@ func TestCustomerHealthStandardSourceRequiresContinuousCoverage(t *testing.T) {
 	if report.Collection.Mode != "source_worker" || report.Collection.ThroughTs != from+3600 || report.Collection.Ready {
 		t.Fatalf("partial source cursor must be visibly incomplete: %+v", report.Collection)
 	}
-	if len(report.Rows) != 1 || report.Rows[0].MetricsReady {
-		t.Fatalf("partial source coverage must not present complete metrics: %+v", report.Rows)
+	if len(report.Rows) != 1 || !report.Rows[0].MetricsReady || !report.Collection.MetricsAvailable {
+		t.Fatalf("certified prefix must remain available: %+v", report.Rows)
 	}
-	if report.Rows[0].Total != 0 || report.Rows[0].StabilityPct != nil {
-		t.Fatalf("unproven tail must not be silently counted or converted to a stability value: %+v", report.Rows[0])
+	if report.Rows[0].Total != 2 || report.Rows[0].StabilityPct == nil || report.ToTs != from+3600 {
+		t.Fatalf("only the proven prefix may be counted: %+v", report.Rows[0])
 	}
 
 	// Once the contiguous cursor catches up to the report target, the same
@@ -452,6 +453,7 @@ func TestCustomerHealthRealtimeCannotSkipIncompleteFRTReplay(t *testing.T) {
 
 func TestCustomerHealthIndependentSourceCapsMetricsAtContinuousWatermark(t *testing.T) {
 	m := newTestMonitor(t)
+	chSeedCompleteTodaySource(t, m, chTestNow())
 	from, target := customerHealthSourceRange(chTestNow())
 	m.cfg.CustomerHealthSourceEnabled = true
 	m.customerHealthSourceFrom.Store(from)
@@ -1345,6 +1347,7 @@ func TestCustomerHealthMissingDataIsNotZero(t *testing.T) {
 
 func TestCustomerHealthOldPolicyFactsFailClosed(t *testing.T) {
 	m := newTestMonitor(t)
+	chSeedCompleteTodaySource(t, m, chTestNow())
 	from, _, _ := customerHealthDayRange(chTestNow())
 	chSeedCompany(t, m, "旧口径公司", 201)
 	row := CapacityUserMinuteSample{
