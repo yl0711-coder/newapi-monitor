@@ -1653,7 +1653,10 @@ func TestStabilityDrawerReleasesScrollLockWhenNavigatingAway(t *testing.T) {
 	if !strings.Contains(pageHTML, "else if(window.stabilityDeactivate)window.stabilityDeactivate();") {
 		t.Error("页面切换未调用稳定性离页清理，抽屉的 body 滚动锁会泄漏到客户排障")
 	}
-	if !strings.Contains(pageHTML, `<script src="/stability.js?v=7"></script>`) {
+	_, scriptVersion, found := strings.Cut(pageHTML, `<script src="/stability.js?v=`)
+	var version int
+	_, scanErr := fmt.Sscanf(scriptVersion, "%d", &version)
+	if !found || scanErr != nil || version < 7 {
 		t.Error("修复后必须更新 stability.js 缓存版本，避免浏览器继续使用旧脚本")
 	}
 }

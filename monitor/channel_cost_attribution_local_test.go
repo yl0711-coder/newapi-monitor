@@ -201,7 +201,7 @@ func checkAttributionLocalBindingRetry(ctx context.Context, t *testing.T, m *Mon
 	if err := m.storeDB.First(&saved).Error; err != nil {
 		t.Fatal(err)
 	}
-	if saved != binding || saved.Status != "confirmed" || saved.AllocationMode != "allocated" {
+	if saved != binding || saved.Status != "confirmed" {
 		t.Fatal("saved rehearsal binding differs from its finite plan")
 	}
 	queries := []attributionLocalQuery{

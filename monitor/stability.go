@@ -84,14 +84,15 @@ type StabilityMetrics struct {
 	TTFTP99Ms     float64  `json:"ttft_p99_ms"`
 	TTFTMaxMs     int64    `json:"ttft_max_ms"`
 	// Canonical FRT aliases; legacy ttft_* keys above remain for compatibility.
-	FRTObserved  int64    `json:"frt_observed"`
-	FRTOver3s    int64    `json:"frt_over_3s"`
-	FRTOver3sPct *float64 `json:"frt_over_3s_pct"`
-	FRTP50Ms     float64  `json:"frt_p50_ms"`
-	FRTP95Ms     float64  `json:"frt_p95_ms"`
-	FRTP99Ms     float64  `json:"frt_p99_ms"`
-	FRTMaxMs     int64    `json:"frt_max_ms"`
-	Health       string   `json:"health"`
+	FRTObserved  int64                    `json:"frt_observed"`
+	FRTOver3s    int64                    `json:"frt_over_3s"`
+	FRTOver3sPct *float64                 `json:"frt_over_3s_pct"`
+	FRTP50Ms     float64                  `json:"frt_p50_ms"`
+	FRTP95Ms     float64                  `json:"frt_p95_ms"`
+	FRTQuantiles *histogramQuantileBounds `json:"frt_quantiles_ms,omitempty"`
+	FRTP99Ms     float64                  `json:"frt_p99_ms"`
+	FRTMaxMs     int64                    `json:"frt_max_ms"`
+	Health       string                   `json:"health"`
 }
 
 type stabilityCounts struct {
@@ -172,6 +173,8 @@ func (c stabilityCounts) metrics() StabilityMetrics {
 		m.TTFTOver3s = view.Over3s
 		m.TTFTOver3sPct = floatPtr(view.Over3sPct)
 		if view.HistValid {
+			bounds := stabilityFRTQuantileBounds(c, view)
+			m.FRTQuantiles = &bounds
 			m.TTFTP50Ms = view.P50Ms
 			m.TTFTP95Ms = view.P95Ms
 			m.TTFTP99Ms = view.P99Ms

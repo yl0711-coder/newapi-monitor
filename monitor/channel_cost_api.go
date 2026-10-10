@@ -37,25 +37,26 @@ func (m *Monitor) channelCostRecoveryDomains(ctx context.Context) ([]string, err
 }
 
 type channelCostSourceView struct {
-	SourceRef               string                    `json:"source_ref"`
-	SourceRefKind           string                    `json:"source_ref_kind"`
-	HMACKeyID               string                    `json:"hmac_key_id"`
-	SourceGroup             string                    `json:"source_group"`
-	UpstreamModel           string                    `json:"upstream_model"`
-	SourceGroups            []string                  `json:"source_groups" gorm:"-"`
-	UpstreamModels          []string                  `json:"upstream_models" gorm:"-"`
-	DimensionCount          int                       `json:"dimension_count" gorm:"-"`
-	FirstHour               int64                     `json:"first_hour"`
-	LastHour                int64                     `json:"last_hour"`
-	Requests                int64                     `json:"requests"`
-	ChargeUnits             int64                     `json:"charge_units"`
-	ChargeUnit              string                    `json:"charge_unit"`
-	CurrentBinding          *ChannelCostSourceBinding `json:"current_binding,omitempty" gorm:"-"`
-	CurrentBindingSignature string                    `json:"current_binding_signature,omitempty" gorm:"-"`
-	AttributionState        string                    `json:"attribution_state"`
-	HistoricalBindingCount  int                       `json:"historical_binding_count" gorm:"-"`
-	HistoricalBoundFrom     int64                     `json:"historical_bound_from,omitempty" gorm:"-"`
-	HistoricalBoundTo       int64                     `json:"historical_bound_to,omitempty" gorm:"-"`
+	SourceRef                    string                    `json:"source_ref"`
+	SourceRefKind                string                    `json:"source_ref_kind"`
+	HMACKeyID                    string                    `json:"hmac_key_id"`
+	SourceGroup                  string                    `json:"source_group"`
+	UpstreamModel                string                    `json:"upstream_model"`
+	SourceGroups                 []string                  `json:"source_groups" gorm:"-"`
+	UpstreamModels               []string                  `json:"upstream_models" gorm:"-"`
+	DimensionCount               int                       `json:"dimension_count" gorm:"-"`
+	FirstHour                    int64                     `json:"first_hour"`
+	LastHour                     int64                     `json:"last_hour"`
+	Requests                     int64                     `json:"requests"`
+	ChargeUnits                  int64                     `json:"charge_units"`
+	ChargeUnit                   string                    `json:"charge_unit"`
+	CurrentBinding               *ChannelCostSourceBinding `json:"current_binding,omitempty" gorm:"-"`
+	CurrentBindingSignature      string                    `json:"current_binding_signature,omitempty" gorm:"-"`
+	AttributionState             string                    `json:"attribution_state"`
+	HistoricalBindingCount       int                       `json:"historical_binding_count" gorm:"-"`
+	HistoricalSharedBindingCount int                       `json:"historical_shared_binding_count" gorm:"-"`
+	HistoricalBoundFrom          int64                     `json:"historical_bound_from,omitempty" gorm:"-"`
+	HistoricalBoundTo            int64                     `json:"historical_bound_to,omitempty" gorm:"-"`
 }
 
 type channelCostSourceDimensionRow struct {
@@ -85,7 +86,8 @@ type channelCostHistoricalBindingInput struct {
 	Domain         string `json:"domain" binding:"required"`
 	AccountEpoch   string `json:"account_epoch" binding:"required"`
 	SourceRef      string `json:"source_ref" binding:"required"`
-	LocalChannelID int    `json:"local_channel_id" binding:"required"`
+	LocalChannelID int    `json:"local_channel_id"`
+	AllocationMode string `json:"allocation_mode,omitempty"`
 	Reason         string `json:"reason" binding:"required"`
 	ValidFrom      *int64 `json:"valid_from,omitempty"`
 	ValidTo        *int64 `json:"valid_to,omitempty"`
@@ -459,6 +461,9 @@ func (m *Monitor) listChannelCostSourcesHandler(c *gin.Context) {
 				continue
 			}
 			view.HistoricalBindingCount++
+			if binding.AllocationMode == "shared" {
+				view.HistoricalSharedBindingCount++
+			}
 			left := max(binding.ValidFrom, view.FirstHour)
 			right := min(bindingTo, evidenceTo)
 			if view.HistoricalBoundFrom == 0 || left < view.HistoricalBoundFrom {
@@ -513,6 +518,9 @@ func normalizeChannelCostHistoricalBindingInput(in *channelCostHistoricalBinding
 	if in.Reason == "" || len(in.Reason) > 512 {
 		return errors.New("必须填写 1-512 字符的历史归属审计原因")
 	}
+	if err := normalizeChannelCostHistoricalMode(in); err != nil {
+		return err
+	}
 	return validateChannelCostHistoricalRange(*in, time.Now().Unix()/3600*3600)
 }
 
@@ -524,11 +532,13 @@ func (m *Monitor) planChannelCostHistoricalBinding(ctx context.Context, in chann
 		return plan, http.StatusBadRequest, err
 	}
 	var channel ChannelSnap
-	if err := m.storeDB.WithContext(ctx).Where("id = ?", in.LocalChannelID).First(&channel).Error; err != nil {
-		return plan, http.StatusBadRequest, errors.New("本地渠道不存在")
-	}
-	if strings.ToLower(strings.TrimSpace(channel.BaseDomain)) != in.Domain {
-		return plan, http.StatusBadRequest, errors.New("本地渠道不属于该上游主域名")
+	if in.AllocationMode == "allocated" {
+		if err := m.storeDB.WithContext(ctx).Where("id = ?", in.LocalChannelID).First(&channel).Error; err != nil {
+			return plan, http.StatusBadRequest, errors.New("本地渠道不存在")
+		}
+		if strings.ToLower(strings.TrimSpace(channel.BaseDomain)) != in.Domain {
+			return plan, http.StatusBadRequest, errors.New("本地渠道不属于该上游主域名")
+		}
 	}
 	var evidence struct {
 		Provider           string
@@ -596,6 +606,16 @@ func (m *Monitor) planChannelCostHistoricalBinding(ctx context.Context, in chann
 	if overlaps > 0 {
 		return plan, http.StatusConflict, errors.New("同一来源存在重叠的已确认映射")
 	}
+	row := ChannelCostSourceBinding{
+		Domain: in.Domain, AccountEpoch: in.AccountEpoch, SourceRef: in.SourceRef,
+		Provider: evidence.Provider, SourceRefKind: evidence.SourceRefKind, HMACKeyID: evidence.HMACKeyID,
+		LocalChannelID: in.LocalChannelID, ValidFrom: evidence.FirstHour, ValidTo: validTo,
+		Status: "confirmed", AllocationMode: in.AllocationMode, MappingSource: "manual_history",
+		Reason: in.Reason, CreatedBy: createdBy, CreatedAt: time.Now().Unix(),
+	}
+	if in.AllocationMode == "shared" {
+		return m.planChannelCostSharedHistory(ctx, in, row, evidence.Hours, evidence.Requests, queueable.Hours)
+	}
 	type localActivityHour struct {
 		HourTs         int64
 		Requests       int64
@@ -651,18 +671,8 @@ func (m *Monitor) planChannelCostHistoricalBinding(ctx context.Context, in chann
 			return plan, http.StatusConflict, errors.New("本地渠道测试失败记录数超出安全范围")
 		}
 	}
-	type evidenceCostHour struct {
-		HourTs            int64
-		ChargeUnits       int64
-		ChargeUnitsPerUSD string
-		Requests          int64
-	}
-	var costHours []evidenceCostHour
-	if err := m.storeDB.WithContext(ctx).Model(&ChannelUpstreamCostHourEvidence{}).
-		Select("hour_ts, charge_units_per_usd, COALESCE(SUM(charge_units), 0) charge_units, COALESCE(SUM(requests), 0) requests").
-		Where("domain = ? AND account_epoch = ? AND source_ref = ? AND semantics_version = ?", in.Domain, in.AccountEpoch, in.SourceRef, channelCostEvidenceSemanticsVersion).
-		Scopes(channelCostHistoricalRangeScope(in, "hour_ts")).
-		Group("hour_ts, charge_units_per_usd").Order("hour_ts").Scan(&costHours).Error; err != nil {
+	costHours, err := m.channelCostHistoricalCostHours(ctx, in)
+	if err != nil {
 		return plan, http.StatusServiceUnavailable, errors.New("读取历史来源金额证据失败")
 	}
 	var evidenceCost, activeCost, activeEvidenceRequests int64
@@ -691,13 +701,6 @@ func (m *Monitor) planChannelCostHistoricalBinding(ctx context.Context, in chann
 	costCoverage := float64(0)
 	if evidenceCost > 0 {
 		costCoverage = float64(activeCost) / float64(evidenceCost)
-	}
-	row := ChannelCostSourceBinding{
-		Domain: in.Domain, AccountEpoch: in.AccountEpoch, SourceRef: in.SourceRef,
-		Provider: evidence.Provider, SourceRefKind: evidence.SourceRefKind, HMACKeyID: evidence.HMACKeyID,
-		LocalChannelID: in.LocalChannelID, ValidFrom: evidence.FirstHour, ValidTo: validTo,
-		Status: "confirmed", AllocationMode: "allocated", MappingSource: "manual_history",
-		Reason: in.Reason, CreatedBy: createdBy, CreatedAt: time.Now().Unix(),
 	}
 	coverage, quality, warnings := historicalBindingEvidenceQuality(evidence.Hours, int64(len(activityHours)))
 	testCoverage := float64(0)

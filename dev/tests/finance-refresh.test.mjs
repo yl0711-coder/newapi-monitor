@@ -23,7 +23,7 @@ function fixture(fetchImpl = async()=>{throw new Error('offline');}) {
   const source=readFileSync(new URL('../../monitor/finance.js',import.meta.url),'utf8');
   const end=source.lastIndexOf('}());');
   assert.ok(end>0,'finance module closure not found');
-  vm.runInContext(source.slice(0,end)+'\nglobalThis.fixture={state,scheduleStaleRefresh,load,financeIsPriorStale,financeCacheRefreshNote,renderProfitBridge,operatingProfitBlockers,setGiftEvidence,renderPeriods,renderDays,internalCostDeductionNote,grossCorrectedCost,chartValue,renderExecutive,upstreamCoverage,renderCosts,renderEvidenceRollout,renderPairingHours,renderPairingAudit};\n'+source.slice(end),context);
+  vm.runInContext(source.slice(0,end)+'\nglobalThis.fixture={state,scheduleStaleRefresh,load,financeIsPriorStale,financeCacheRefreshNote,renderProfitBridge,operatingProfitBlockers,setGiftEvidence,renderPeriods,renderDays,internalCostDeductionNote,grossCorrectedCost,chartValue,renderExecutive,upstreamCoverage,renderCosts,renderEvidenceRollout,renderPairingHours,renderPairingAudit,renderClosureReadiness};\n'+source.slice(end),context);
   return {api:context.fixture,element,timers};
 }
 
@@ -264,6 +264,45 @@ test('cached rate-boundary explanation is corrected without changing verified mo
   assert.match(html,/配置录入纠正还是真实比例变化/);
   assert.doesNotMatch(html,/账单桶内充值比例发生变化/);
   assert.equal(JSON.stringify(row),before);
+});
+
+test('unfinished pairing is not represented as a running backfill, including cached reports',()=>{
+  const {api,element}=fixture();
+  const rows=[{domain:'blocked.example',closure_readiness:'in_progress',unallocated_sources:2,
+    closure_next_action:'已进入成本闭环；继续补历史财务版本或缺失的同小时收入成本。',
+    known_billed_cost:{micro_usd:'12000000'},known_corrected_cost:{micro_usd:'3000000'}},
+    {domain:'review.example',closure_readiness:'in_progress',unallocated_sources:0}];
+  const before=JSON.stringify(rows);
+  api.renderCosts(rows);
+  const html=element('finCostRows').innerHTML;
+  assert.match(html,/配对待核验/);
+  assert.match(html,/2 个成本来源未归属/);
+  assert.match(html,/不代表后台正在补采/);
+  assert.match(html,/历史财务版本和同小时收入成本依据/);
+  assert.doesNotMatch(html,/闭环进行中|已进入成本闭环/);
+  assert.match(html,/\$12\.00/);
+  assert.equal(JSON.stringify(rows),before);
+});
+
+test('pairing status summary does not promise active collection or treat unknown cost as zero',()=>{
+  const {api,element}=fixture();
+  api.renderClosureReadiness([{domain:'pending.example',closure_readiness:'in_progress'},
+    {domain:'unconfigured.example',closure_readiness:'not_required'}]);
+  const html=element('finClosureReadiness').innerHTML;
+  assert.match(html,/配对待核验/);
+  assert.match(html,/不代表后台正在补采/);
+  assert.match(html,/未配置不自动补采；成本未知，不按零计算利润/);
+  assert.doesNotMatch(html,/闭环进行中|不进入覆盖率和利润/);
+});
+
+test('invalid attribution counts cannot appear as factual source counts',()=>{
+  const {api,element}=fixture();
+  for(const count of [-1,1.5,Infinity,'invalid',Number.MAX_SAFE_INTEGER+1]) {
+    api.renderCosts([{domain:'pending.example',closure_readiness:'in_progress',unallocated_sources:count}]);
+    const html=element('finCostRows').innerHTML;
+    assert.match(html,/需核对历史财务版本和同小时收入成本依据/);
+    assert.doesNotMatch(html,/个成本来源未归属/);
+  }
 });
 
 test('upgrade snapshot preserves old date and never conceals failed recomputation',()=>{

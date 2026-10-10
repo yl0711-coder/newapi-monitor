@@ -135,8 +135,20 @@ func reviewFinanceRechargeFunds(events []ChannelUpstreamFundEvent, provider stri
 
 func financeRechargeRecordedChanges(versions []channelRechargeVersion, end int64) []FinanceRechargeRecordedChange {
 	out := []FinanceRechargeRecordedChange{}
-	for i := 1; i < len(versions) && versions[i].EffectiveAt < end; i++ {
-		before, after := versions[i-1], versions[i]
+	previous := -1
+	// The loader orders by effective_at,version, as rechargeTermsForBucket
+	// requires. A superseded entry remains in the audit ledger but must not
+	// manufacture a price transition in the effective-history review.
+	for i := 0; i < len(versions) && versions[i].EffectiveAt < end; i++ {
+		if i+1 < len(versions) && versions[i+1].EffectiveAt == versions[i].EffectiveAt {
+			continue
+		}
+		beforeIndex := previous
+		previous = i
+		if beforeIndex < 0 {
+			continue
+		}
+		before, after := versions[beforeIndex], versions[i]
 		left, leftOK := financeRechargeFraction(before.Paid, before.Credit)
 		right, rightOK := financeRechargeFraction(after.Paid, after.Credit)
 		if before.Valid && after.Valid && leftOK && rightOK && left.Cmp(right) == 0 {

@@ -271,7 +271,7 @@ function renderReport(){
   const coverageLabel=hasCoverage&&(legacy||missing)
     ?`${nfmt(effective)}/${nfmt(expected)} 小时可展示${legacy?` · ${nfmt(legacy)} 小时为旧口径参考`:''}${missing?` · ${nfmt(missing)} 小时未覆盖`:''}${ttftLabel}`
     :`${esc(d.meta.from)} 至 ${esc(d.meta.to)}${ttftLabel}`;
-  body.innerHTML=`<section class="stability-kpis" id="stKpis"></section>
+  body.innerHTML=`<div class="stability-kpi-region"><section class="stability-kpis" id="stKpis"></section></div>
     <section class="stability-panel"><div class="stability-panel-head"><div><h3>每日稳定性变化</h3><p>历史日志推断成功 / 纳入口径请求；无请求或未覆盖日期断线，柱形为每日请求量</p></div><span class="muted">${coverageLabel}</span></div><div id="stTrend" class="stability-chart"></div></section>
     <section class="stability-panel"><div class="stability-panel-head"><div><h3>历史日志推断 · 服务分组</h3><p>仅按中转站历史日志结果推断；展开查看实际承载渠道，不代表用户侧最终感知</p></div><span class="muted">${nfmt(d.groups?.length||0)} 个有流量分组</span></div><div class="stability-group-head"><span>服务分组 / 渠道</span><span>日志推断成功率 / 环比</span><span>时间窄条 · ${bucketLabel(d.meta.timeline_bucket_sec||3600)}</span><span>纳入口径请求 / 占比</span><span>问题 / 问题率</span><span>渠道 / 操作</span></div><div id="stGroupList"></div></section>
     <section class="stability-ranking-grid"><article class="stability-panel"><div class="stability-panel-head"><div><h3>分组与渠道使用量排行</h3><p>按真实请求数排序，识别优先保障对象</p></div></div><div id="stUsageRank" class="stability-rank-list"></div></article><article class="stability-panel"><div class="stability-panel-head"><div><h3>渠道问题排行</h3><p>按问题数排序；数量分布不等于问题归因</p></div></div><div id="stProblemRank" class="stability-rank-list"></div></article></section>`;
@@ -315,18 +315,26 @@ function stabilityTTFTSummary(metrics, complete){
   const observed=Number(metrics?.frt_observed??metrics?.ttft_observed)||0;
   const ready=complete===true&&observed>0;
   const ms=value=>Number(value)>0?`${nfmt(Math.round(Number(value)))} ms`:'—';
+  const quantile=key=>window.MonitorQuantiles.format(metrics?.['frt_'+key+'_ms']??metrics?.['ttft_'+key+'_ms'],metrics?.frt_quantiles_ms?.[key],1,'ms',10000);
   const overRaw=metrics?.frt_over_3s??metrics?.ttft_over_3s;
   const over=ready&&overRaw!==undefined&&overRaw!==null&&Number.isFinite(Number(overRaw))&&Number(overRaw)>=0&&Number(overRaw)<=observed?Number(overRaw):null;
   const overPct=ready&&over!==null&&(metrics?.frt_over_3s_pct??metrics?.ttft_over_3s_pct)!=null?pct(Number(metrics?.frt_over_3s_pct??metrics?.ttft_over_3s_pct)):null;
   const p95=Number(metrics?.frt_p95_ms??metrics?.ttft_p95_ms)||0;
+  const percentiles=['p50','p95','p99'].map(key=>({label:key.toUpperCase(),value:ready?quantile(key):'—'}));
   return {
-    title:ready?`P50 ${ms(metrics.frt_p50_ms??metrics.ttft_p50_ms)} · P95 ${ms(metrics.frt_p95_ms??metrics.ttft_p95_ms)} · P99 ${ms(metrics.frt_p99_ms??metrics.ttft_p99_ms)}`:'P50 — · P95 — · P99 —',
+    title:percentiles.map(item=>`${item.label} ${item.value}`).join(' · '),
+    percentiles,
     detail:ready?`最大 ${ms(metrics.frt_max_ms??metrics.ttft_max_ms)} · 超3秒 ${over===null?'—':`${nfmt(over)} 次${overPct==null?'':`（${overPct}）`}`}`:'最大 — · 超3秒 —',
     className:ready&&((p95>3000)||(over!==null&&over>0))?'bad':'',
     note:complete===true?(ready?'已覆盖 · 有效样本 '+nfmt(observed)+' 条':'已覆盖 · 无有效样本'):'FRT 覆盖未完整，缺失样本不展示'
   };
 }
 function stabilityActualWindow(meta){const from=Number(meta?.from_ts)||0,to=Number(meta?.to_ts)||0;if(!(from>0&&to>from))return '时间窗口未知';const f=new Date(from*1000).toLocaleString('zh-CN',{hour12:false,timeZone:'Asia/Shanghai'}),t=new Date(to*1000).toLocaleString('zh-CN',{hour12:false,timeZone:'Asia/Shanghai'});return `${f} 至 ${t}`}
+function renderStabilityFRTCard(view,meta){
+  return `<article class="stability-kpi stability-frt-kpi"><small>首个数据事件延迟（FRT）</small>
+    <dl class="stability-frt-values${view.className==='bad'?' bad':''}">${view.percentiles.map(item=>`<div><dt>${esc(item.label)}</dt><dd>${esc(item.value)}</dd></div>`).join('')}</dl>
+    <div class="stability-frt-notes"><em>${esc(view.detail)}</em><em>${esc(view.note)}</em><em>有效窗口 ${esc(stabilityActualWindow(meta))}</em></div></article>`;
+}
 function renderKpis(d){const s=d.summary,p=d.previous,canCompare=d.meta?.comparison_available===true;const k=$('stKpis');if(!k)return;
   const coverage=d.meta?.data_coverage||{};
   const frtComplete=coverage.frt_complete===true||(coverage.frt_complete===undefined&&coverage.ttft_complete===true);
@@ -335,9 +343,8 @@ function renderKpis(d){const s=d.summary,p=d.previous,canCompare=d.meta?.compari
     ['历史日志推断稳定性',pct(s.stability),canCompare?delta(d.delta_pp):'环比待补齐',health(s)],
     ['历史日志请求',nfmt(s.requests),`日志推断成功 ${nfmt(s.success)} · 问题 ${nfmt(s.problems)}`,''],
     ['问题请求',nfmt(s.problems),`异常 ${nfmt(s.anomaly)} · 错误 ${nfmt(s.failed)}`,s.problems?'bad':'good'],
-    ['上一周期',d.meta.comparison_available?pct(p.stability):'—',d.meta.comparison_available?`${nfmt(p.requests)} 次请求`:comparisonPendingText(d.meta),''],
-    ['首个数据事件延迟（FRT）',ttft.title,`${ttft.detail} · ${ttft.note} · 有效窗口 ${stabilityActualWindow(d.meta)}`,ttft.className]
-  ].map(x=>`<article class="stability-kpi"><small>${x[0]}</small><b class="${x[3]||''}">${x[1]}</b><em>${x[2]}</em></article>`).join('')}
+    ['上一周期',d.meta.comparison_available?pct(p.stability):'—',d.meta.comparison_available?`${nfmt(p.requests)} 次请求`:comparisonPendingText(d.meta),'']
+  ].map(x=>`<article class="stability-kpi"><small>${x[0]}</small><b class="${x[3]||''}">${x[1]}</b><em>${x[2]}</em></article>`).join('')+renderStabilityFRTCard(ttft,d.meta)}
 function aggregateDaily(groups){const by={};for(const g of groups)for(const d of g.daily||[]){const v=by[d.date]||(by[d.date]={date:d.date,success:0,anomaly:0,failed:0,rejected:0,requests:0});v.success+=d.success||0;v.anomaly+=d.anomaly||0;v.failed+=d.failed||0;v.rejected+=d.rejected||0;v.requests+=d.requests||0}return Object.values(by).sort((a,b)=>a.date.localeCompare(b.date)).map(v=>({...v,stability:v.requests?v.success/v.requests*100:null}))}
 function renderTrend(groups){const el=$('stTrend');if(!el||!window.echarts)return;const rows=aggregateDaily(groups);if(st.chart)st.chart.dispose();st.chart=echarts.init(el);st.chart.setOption({animation:false,grid:{left:50,right:55,top:28,bottom:38},tooltip:{trigger:'axis',backgroundColor:'#151b27',borderColor:'#39445a',textStyle:{color:'#e5ebf5'},formatter:p=>{const r=rows[p[0]?.dataIndex];return r?`${esc(r.date)}<br>稳定性 ${pct(r.stability)}<br>已路由请求 ${nfmt(r.requests)}<br>问题 ${nfmt(r.anomaly+r.failed)}`:''}},xAxis:{type:'category',data:rows.map(r=>r.date.slice(5)),axisLabel:{color:'#7e8a9f'},axisLine:{lineStyle:{color:'#354055'}}},yAxis:[{type:'value',min:v=>Math.max(0,Math.floor(v.min-2)),max:100,axisLabel:{color:'#7e8a9f',formatter:'{value}%'},splitLine:{lineStyle:{color:'#283143'}}},{type:'value',axisLabel:{color:'#657188'},splitLine:{show:false}}],series:[{name:'稳定性',type:'line',connectNulls:false,smooth:.25,symbol:'circle',symbolSize:5,data:rows.map(r=>r.stability==null?null:+r.stability.toFixed(3)),lineStyle:{width:2,color:'#8177ff'},itemStyle:{color:'#8177ff'},areaStyle:{color:'rgba(129,119,255,.08)'}},{name:'请求量',type:'bar',yAxisIndex:1,data:rows.map(r=>r.requests),barMaxWidth:20,itemStyle:{color:'rgba(79,153,229,.28)',borderRadius:[3,3,0,0]}}]})}
 

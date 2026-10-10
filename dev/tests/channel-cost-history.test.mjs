@@ -17,6 +17,7 @@ function fixture({match=64,shared=false,confirm=true,fetchOverride,site=domain,s
   const fields=new Map([
     ['[data-cost-mode]',{value:'unallocated'}],
     ['[data-cost-channel]',{value:'0'}],
+    ['[data-cost-history-mode]',{value:'allocated'}],
     ['[data-cost-history-channel]',{value:'69'}],
   ]);
   const row={querySelector:selector=>fields.get(selector)};
@@ -40,11 +41,11 @@ function fixture({match=64,shared=false,confirm=true,fetchOverride,site=domain,s
     if(url==='/channels/cost/bindings')return response({ok:true});
     throw new Error('unexpected request '+url);
   };
-  const context=vm.createContext({document,window:{prompt:message=>{prompts.push(message);return 'test-only audit'},confirm:message=>{confirmations.push(message);return confirm}},
+  const context=vm.createContext({document,window:{prompt:message=>{prompts.push(message);return 'test-only audit'},confirm:message=>{confirmations.push(message);return typeof confirm==='function'?confirm(confirmations.length):confirm}},
     alert:message=>alerts.push(message),CSS:{escape:value=>value},location:{},URLSearchParams,AbortController,fetch:fetchImpl});
   const js=readFileSync(new URL('../../monitor/channel_management.js',import.meta.url),'utf8'),end=js.lastIndexOf('})();');
   assert.ok(end>0);
-  vm.runInContext(js.slice(0,end)+'\nrender=()=>{};globalThis.testAPI={cm,costSourceRows,costHistoricalChannels,costHistoryHourInput,parseCostHistoryHour,saveCostBinding,saveHistoricalCostBinding,loadCostLedger};\n'+js.slice(end),context);
+  vm.runInContext(js.slice(0,end)+'\nrender=()=>{};globalThis.testAPI={cm,costSourceRows,costHistoricalChannels,costHistoryHourInput,parseCostHistoryHour,updateCostHistoryMode,saveCostBinding,saveHistoricalCostBinding,loadCostLedger};\n'+js.slice(end),context);
   const api=context.testAPI;
   const data={accountEpoch:apiData.account_epoch,sources:apiData.sources,historicalChannels:apiData.historical_channels,
     ownership:{exact_unique:shared?0:1,exact_shared:shared?1:0,matches:[{source_ref:apiData.sources[0].source_ref,state:shared?'exact_shared':'exact_unique',candidates:[{channel_id:match,name:'candidate'}]}]}};
@@ -167,6 +168,65 @@ test('existing historical segment keeps bounded continuation available',()=>{
   assert.match(html,/data-cost-history-to value="1970-01-01T10:00"/);
   assert.doesNotMatch(html,/data-cm-cost-history-binding[^>]*disabled/);
   assert.match(html,/单次最多 90 天/);
+});
+
+test('shared history is explicit, never inferred from a current shared token',()=>{
+  const {api,data}=fixture({shared:true});
+  data.sources[0].historical_binding_count=2;
+  data.sources[0].historical_shared_binding_count=1;
+  const html=api.costSourceRows(domain,data);
+  assert.match(html,/已有 2 段历史归属 · 其中 1 段共享不分摊/);
+  assert.match(selectHTML(html,'data-cost-history-mode'),/value="shared">历史共享 · 不分摊/);
+  assert.doesNotMatch(selectHTML(html,'data-cost-history-mode'),/value="shared" selected/);
+  assert.match(html,/当前令牌匹配不代表历史归属/);
+});
+
+test('shared mode clears only the history channel and works with an empty channel directory',()=>{
+  const {api}=fixture();
+  const channel={value:'69',disabled:false,options:[{value:'0'}]},button={disabled:true};
+  const mode={value:'shared',closest:()=>({querySelector:selector=>selector==='[data-cost-history-channel]'?channel:button})};
+  api.updateCostHistoryMode(mode);
+  assert.equal(channel.value,'0');assert.equal(channel.disabled,true);assert.equal(button.disabled,false);
+  mode.value='allocated';api.updateCostHistoryMode(mode);
+  assert.equal(channel.disabled,false);assert.equal(button.disabled,true);
+});
+
+const sharedPreview={binding:{ValidFrom:3600,ValidTo:7200,AllocationMode:'shared',LocalChannelID:0},
+  evidence_hours:1,evidence_requests:2,evidence_billed_cost:{micro_usd:'1000000',display:'$1.000000'},
+  temporal_overlap_quality:'shared',will_queue_hours:1};
+
+test('shared history requires two confirmations and saves no guessed channel or future mapping',async()=>{
+  const f=fixture({fetchOverride:url=>url.endsWith('/preview')?response(sharedPreview):null});
+  f.data.historicalChannels=[];
+  f.fields.get('[data-cost-history-mode]').value='shared';
+  f.fields.get('[data-cost-channel]').value='59';
+  f.fields.get('[data-cost-mode]').value='allocated';
+  await f.api.saveHistoricalCostBinding(domain.key,0);
+  assert.equal(f.confirmations.length,2);
+  assert.match(f.confirmations[0],/历史共享 · 不分摊/);
+  assert.match(f.confirmations[0],/\$1\.000000（账单原值，未作充值比例修正）/);
+  assert.match(f.confirmations[0],/内部测试或站外使用尚未拆分/);
+  assert.doesNotMatch(f.confirmations[0],/未发现同时段请求|客户流量同小时覆盖|NaN|undefined/);
+  assert.match(f.confirmations[1],/也不扣除内部测试成本/);
+  const posted=writes(f.calls);
+  assert.deepEqual(posted.map(call=>call.url),['/channels/cost/historical-bindings/preview','/channels/cost/historical-bindings']);
+  for(const call of posted){const body=JSON.parse(call.body);assert.equal(body.allocation_mode,'shared');assert.equal(body.local_channel_id,0)}
+  assert.equal(f.fields.get('[data-cost-mode]').value,'allocated');
+  assert.equal(f.fields.get('[data-cost-channel]').value,'59');
+});
+
+test('shared history cancels safely and rejects older servers without explicit shared support',async()=>{
+  const cancelled=fixture({confirm:count=>count===1,fetchOverride:url=>url.endsWith('/preview')?response(sharedPreview):null});
+  cancelled.fields.get('[data-cost-history-mode]').value='shared';
+  await cancelled.api.saveHistoricalCostBinding(domain.key,0);
+  assert.equal(cancelled.confirmations.length,2);assert.equal(writes(cancelled.calls).length,1);
+  for(const replacement of [{}, {AllocationMode:'allocated',LocalChannelID:59}, {AllocationMode:'shared',LocalChannelID:59}]){
+    const f=fixture({fetchOverride:url=>url.endsWith('/preview')?response({...sharedPreview,binding:{ValidFrom:3600,ValidTo:7200,...replacement}}):null});
+    f.fields.get('[data-cost-history-mode]').value='shared';
+    await f.api.saveHistoricalCostBinding(domain.key,0);
+    assert.equal(writes(f.calls).length,1);assert.equal(f.confirmations.length,0);
+    assert.match(f.alerts[0],/服务端未确认历史共享模式/);
+  }
 });
 
 test('historical hour input is strict Beijing time independent of browser timezone',()=>{
