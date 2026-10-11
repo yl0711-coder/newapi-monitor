@@ -94,7 +94,7 @@ func TestAipipeUsageUSDRejectsMissingInvalidAndConflictingMoney(t *testing.T) {
 		`"quota":null,"usage_usd":1`, `"quota":"bad","usage_usd":1`,
 		`"quota":0,"usage_usd":1`, `"quota":500000,"usage_usd":2`,
 	} {
-		t.Run(fmt.Sprintf("%s", fields), func(t *testing.T) {
+		t.Run(fields, func(t *testing.T) {
 			body := `{"created_at":1791525571`
 			if fields != "" {
 				body += "," + fields
