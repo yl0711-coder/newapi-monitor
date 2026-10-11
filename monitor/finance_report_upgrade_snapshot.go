@@ -24,7 +24,7 @@ func financeUpgradeProjectionKey(request financeReportRequest, projection string
 func (m *Monitor) loadFinanceUpgradeSnapshot(request financeReportRequest, now time.Time) ([]byte, bool, error) {
 	// A future projection/classification change must opt in after its own
 	// accounting review; it must not inherit this compatibility implicitly.
-	if financeReportProjection != "accounting-pairing-hour-diagnostics-v8" || stabilityTrafficClassificationVersion != 7 ||
+	if financeReportProjection != "accounting-empty-bill-coverage-v9" || stabilityTrafficClassificationVersion != 7 ||
 		!m.cfg.FinanceFastSnapshotEnabled || !m.cfg.FinanceReportSnapshotReadEnabled ||
 		request.configurationHash == "" || request.snapshotAsOf != 0 || request.snapshotClamped {
 		return nil, false, nil
@@ -39,7 +39,7 @@ func (m *Monitor) loadFinanceUpgradeSnapshot(request financeReportRequest, now t
 		if !candidate.from.Before(candidate.to) {
 			break
 		}
-		for _, projection := range []string{"accounting-recharge-zero-proof-v7", "accounting-platform-recharge-v6", "accounting-gift-horizon-v5", "accounting-pairing-proof-v4", "accounting-partial-correction-v3", "accounting-amount-evidence-v2", "accounting-delivery-compat-v1"} {
+		for _, projection := range []string{"accounting-pairing-hour-diagnostics-v8", "accounting-recharge-zero-proof-v7", "accounting-platform-recharge-v6", "accounting-gift-horizon-v5", "accounting-pairing-proof-v4", "accounting-partial-correction-v3", "accounting-amount-evidence-v2", "accounting-delivery-compat-v1"} {
 			payload, storedAt, _, ok, err := m.loadFinanceReportSnapshotKey(candidate, financeUpgradeProjectionKey(candidate, projection), now)
 			if err != nil {
 				return nil, false, err
@@ -50,10 +50,10 @@ func (m *Monitor) loadFinanceUpgradeSnapshot(request financeReportRequest, now t
 			if !validFinanceSnapshotBounds(payload, candidate, storedAt) {
 				return nil, false, errors.New("经营核算升级前快照范围或生成时间无效")
 			}
-			// v8 adds read-only hour diagnostics, with no monetary or period
-			// formula change. Keep v7's dated money intact while rebuilding the
-			// report shell; unchanged monthly components remain reusable.
-			if projection == "accounting-recharge-zero-proof-v7" {
+			// v9 corrects missing-hour counts, not money. v7/v8 remain dated
+			// display only while the new report and monthly coverage rebuild;
+			// never promote their old coverage to the current projection.
+			if projection == "accounting-pairing-hour-diagnostics-v8" || projection == "accounting-recharge-zero-proof-v7" {
 				return payload, true, nil
 			}
 			// v6 already adopted native TokenForce face values. Older projections

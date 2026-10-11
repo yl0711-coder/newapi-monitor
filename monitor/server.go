@@ -443,6 +443,7 @@ func (m *Monitor) RegisterRoutes(r *gin.Engine) {
 		rootChannels.GET("/upstream/pricing-observations", m.getChannelPricingObservationsHandler)
 		rootChannels.POST("/upstream/diagnose", m.diagnoseChannelUpstreamHandler)
 		rootChannels.POST("/upstream/recover", m.recoverChannelUpstreamHandler)
+		rootChannels.GET("/upstream/recovery-status", m.upstreamRecoveryStatusHandler)
 		rootChannels.POST("/upstream", m.saveChannelUpstreamHandler)
 		rootChannels.POST("/upstream/retirement", m.saveChannelUpstreamRetirementHandler)
 		rootChannels.POST("/upstream/sync", m.syncChannelUpstreamHandler)

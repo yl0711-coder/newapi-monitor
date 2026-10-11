@@ -36,10 +36,13 @@ func openOxGET(ctx context.Context, client *http.Client, row ChannelUpstreamAcco
 	if err != nil {
 		var httpErr *upstreamHTTPError
 		if errors.As(err, &httpErr) {
+			// Keep the status for the shared retry policy, but never retain an
+			// upstream body which may echo the imported management token.
+			safeErr := &upstreamHTTPError{Status: httpErr.Status, RetryAt: httpErr.RetryAt}
 			if httpErr.Status == http.StatusUnauthorized || httpErr.Status == http.StatusForbidden {
-				return &upstreamAuthError{err: fmt.Errorf("OpenOx 管理令牌已失效或无权限（HTTP %d），请重新登录上游并导入 auth_token", httpErr.Status)}
+				return &upstreamAuthError{err: safeErr}
 			}
-			return &upstreamHTTPError{Status: httpErr.Status, RetryAt: httpErr.RetryAt}
+			return safeErr
 		}
 		return err
 	}

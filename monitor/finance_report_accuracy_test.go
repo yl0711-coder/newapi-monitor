@@ -118,6 +118,44 @@ func TestFinanceBillRedistributionInvalidatesMonthlyDailyCache(t *testing.T) {
 	}
 }
 
+func TestFinancePeriodCoverageCountsEmptyBillWindow(t *testing.T) {
+	for _, domain := range []string{"hour.example", "day.example"} {
+		t.Run(domain, func(t *testing.T) {
+			m, scope, accounts := dailyBillFixture(t)
+			// An already-used account stops reporting for the entire second
+			// window. Absence must remain missing coverage, never zero usage.
+			if err := m.storeDB.Where("domain=? AND hour_ts>=?", domain, scope.FromTs+86400).Delete(&ChannelUpstreamUsageHour{}).Error; err != nil {
+				t.Fatal(err)
+			}
+			var parts [][]financeCostDetailView
+			var expected, completed int64
+			for day := scope.FromTs; day < scope.ToTs; day += 86400 {
+				_, exact, _, corrected, coverage, details, err := m.loadFinanceUpstreamFacts(context.Background(),
+					stabilityScope{FromTs: day, ToTs: day + 86400}, scope.ToTs+86400, accounts, channelFinanceSnapshot{}, nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if coverage.ExpectedDomainHours != 48 {
+					t.Fatalf("empty account window dropped from denominator: %+v", coverage)
+				}
+				if day > scope.FromTs && (coverage.CompletedDomainHours != 24 || coverage.Complete || exact != nil || corrected != nil) {
+					t.Fatalf("empty window treated as complete: %+v", coverage)
+				}
+				expected += coverage.ExpectedDomainHours
+				completed += coverage.CompletedDomainHours
+				parts = append(parts, details)
+			}
+			merged, _, err := mergeFinanceCostDetails(parts, accounts)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if expected != 96 || completed != 72 || merged.ExpectedDomainHours != expected || merged.CompletedDomainHours != completed {
+				t.Fatalf("period and total coverage disagree: parts=%d/%d total=%+v", completed, expected, merged)
+			}
+		})
+	}
+}
+
 func TestFinanceBillFingerprintTracksBucketEvidence(t *testing.T) {
 	for _, tc := range []struct {
 		name   string

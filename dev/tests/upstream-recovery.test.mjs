@@ -7,106 +7,116 @@ const source=readFileSync(new URL('../../monitor/channel_management.js',import.m
 const start=source.indexOf('function renderUpstreamRecoveryOptions(');
 const end=source.indexOf('function upstreamBalanceSummary(',start);
 assert.ok(start>=0&&end>start);
-function setup(fetcher){
-  const elements=new Map(),messages=[],requests=[],rendered=[];
+const response=(data,status=200)=>({status,ok:status===200,json:async()=>data});
+const snapshot=(state='pending',success=100)=>({domain:'fixture.example',account_epoch:'epoch-1',tasks:[{task:'usage',label:'消费账单',state,can_recover:state==='failed',last_success_at:success}]});
+
+function setup(fetcher=async()=>response(snapshot())){
+  const elements=new Map(),messages=[],requests=[],timers=new Map();let timerID=0;
   const $=id=>{
-    if(!elements.has(id))elements.set(id,{disabled:false,hidden:false,value:'usage',options:['balance','usage','usage_history','funds','pricing','error_logs'].map(value=>({value,disabled:false}))});
+    if(!elements.has(id))elements.set(id,{disabled:false,hidden:false,value:'',innerHTML:'',textContent:''});
     return elements.get(id);
   };
-  const context=vm.createContext({$,AbortController,setTimeout,clearTimeout,location:{href:''},
-    cm:{loaded:true,upstreamDomain:{domain:'fixture.example'},upstreamConfig:{provider:'newapi'}},dateTime:ts=>`time:${ts}`,
-    renderUpstreamStatus:account=>rendered.push(account),
-    showUpstreamMessage:(message,warning)=>messages.push({message,warning}),
-    fetch:async(url,options)=>{requests.push({url,options});return fetcher(url,options);},
+  const context=vm.createContext({$,AbortController,location:{href:''},
+    setTimeout:(fn,ms)=>{timers.set(++timerID,{fn,ms});return timerID},clearTimeout:id=>timers.delete(id),
+    cm:{loaded:true,upstreamDomain:{domain:'fixture.example'},upstreamConfig:{provider:'newapi'}},
+    dateTime:ts=>`time:${ts}`,esc:s=>String(s??'').replaceAll('<','&lt;').replaceAll('"','&quot;'),
+    showUpstreamMessage:(message,warning)=>messages.push({message,warning:!!warning}),
+    fetch:async(url,options)=>{requests.push({url,options});return fetcher(url,options);},initial:snapshot('failed'),
   });
-  vm.runInContext('let upstreamRecoverySeq=0,upstreamRecoveryAbort=null;\n'+source.slice(start,end),context);
-  return {context,$,messages,requests,rendered,run:()=>vm.runInContext('recoverUpstreamTask()',context)};
+  vm.runInContext(`let upstreamRecoverySeq=0,upstreamRecoveryAbort=null;
+    let upstreamRecoveryStatusSeq=0,upstreamRecoveryStatusAbort=null,upstreamRecoveryTimer=null,upstreamRecoveryData=initial,upstreamRecoveryWatch=null;
+    ${source.slice(start,end)}`,context);
+  return {context,$,messages,requests,timers,run:()=>vm.runInContext("recoverUpstreamTask('usage')",context),
+    refresh:()=>vm.runInContext('loadUpstreamRecoveryStatus()',context),
+    tick:async()=>{const entry=[...timers].find(([,t])=>t.ms===5000);assert.ok(entry,'poll expected');timers.delete(entry[0]);await entry[1].fn();}};
 }
-function response(data,status=200){return {status,ok:status===200,json:async()=>data};}
+
 for(const status of ['queued','waiting','blocked','not_needed','unknown']){
   test(`recovery feedback: ${status}`,async()=>{
-    const fixture=setup(async url=>response(url==='/channels/upstream/recover'?{status,message:'fixture message',retry_at:status==='waiting'?123:2**62}:{account:{configured:true,usage_status:'pending'}}));
-    fixture.$('cmUpstreamBaseURL').value='unsaved input';
-    await fixture.run();
-    const {messages,requests,$,context}=fixture;
-    assert.equal(requests.length,status==='queued'?2:1);assert.equal(requests[0].url,'/channels/upstream/recover');
-    assert.deepEqual(JSON.parse(requests[0].options.body),{domain:'fixture.example',task:'usage'});
-    assert.equal(messages.at(-1).warning,status==='blocked'||status==='unknown');
-    assert.doesNotMatch(messages.at(-1).message,/账单已更新|余额已更新|数据已补齐|Invalid Date/);
-    if(status==='waiting')assert.match(messages.at(-1).message,/time:123/);
-    else assert.doesNotMatch(messages.at(-1).message,/下次可检测/);
-    assert.equal(context.cm.loaded,status!=='queued');
-    assert.equal(fixture.rendered.length,status==='queued'?1:0);
-    if(status==='queued'){
-      assert.equal(requests[1].url,'/channels/upstream?domain=fixture.example');
-      assert.equal(requests[1].options.cache,'no-store');
-      assert.equal(context.cm.upstreamConfig.account.usage_status,'pending');
-      assert.equal(context.cm.upstreamConfig.provider,'newapi');
+    const f=setup(async url=>response(url==='/channels/upstream/recover'?{status,message:'fixture message',queued_at:200,retry_at:status==='waiting'?123:2**62}:snapshot()));
+    f.$('cmUpstreamBaseURL').value='unsaved input';await f.run();
+    assert.equal(f.requests.length,status==='unknown'?1:2);
+    assert.deepEqual(JSON.parse(f.requests[0].options.body),{domain:'fixture.example',task:'usage'});
+    assert.equal(f.messages.at(-1).warning,status==='blocked'||status==='unknown');
+    assert.doesNotMatch(f.messages.at(-1).message,/账单已更新|余额已更新|数据已补齐|Invalid Date/);
+    if(status==='waiting')assert.match(f.messages.at(-1).message,/time:123/);
+    else assert.doesNotMatch(f.messages.at(-1).message,/下次可检测/);
+    assert.equal(f.context.cm.loaded,status!=='queued');
+    assert.equal(f.$('cmUpstreamBaseURL').value,'unsaved input');
+    if(status!=='unknown'){
+      assert.equal(f.requests[1].url,'/channels/upstream/recovery-status?domain=fixture.example');
+      assert.equal(f.requests[1].options.cache,'no-store');
     }
-    assert.equal(fixture.$('cmUpstreamBaseURL').value,'unsaved input');
-    assert.equal($('cmUpstreamRecover').disabled,false);
+    assert.equal([...f.timers.values()].filter(t=>t.ms===5000).length,status==='queued'?1:0);
   });
 }
-test('recovery suppresses duplicate clicks and ignores stale domain response',async()=>{
-  let resolve;
-  const fixture=setup(()=>new Promise(r=>{resolve=r}));
-  const first=fixture.run();await fixture.run();
-  assert.equal(fixture.requests.length,1);
-  fixture.context.cm.upstreamDomain={domain:'other.example'};
-  resolve(response({status:'queued',message:'stale result'}));await first;
-  assert.ok(!fixture.messages.some(m=>m.message==='stale result'));
-  assert.equal(fixture.context.cm.loaded,true);
-});
-test('local status refresh failure must not claim the recovery itself failed',async()=>{
-  for(const reply of [response({},500),response({account:null}),response({account:[]})]){
-    const fixture=setup(async url=>url==='/channels/upstream/recover'?response({status:'queued',message:'已恢复排期'}):reply);
-    await fixture.run();
-    assert.equal(fixture.context.cm.loaded,false);
-    assert.equal(fixture.rendered.length,0);
-    assert.equal(fixture.requests.length,2);
-    assert.match(fixture.messages.at(-1).message,/已恢复排期.*状态刷新失败/);
-    assert.equal(fixture.messages.at(-1).warning,true);
-  }
-});
-test('late local status refresh cannot update another or closed account dialog',async()=>{
-  for(const close of [false,true]){
-    let resolve,started;
-    const refreshing=new Promise(r=>{started=r});
-    const fixture=setup(async url=>{
-      if(url==='/channels/upstream/recover')return response({status:'queued',message:'已恢复排期'});
-      started();return new Promise(r=>{resolve=r});
-    });
-    const first=fixture.run();await refreshing;await fixture.run();
-    assert.equal(fixture.requests.length,2);
-    fixture.context.cm.upstreamDomain=close?null:{domain:'other.example'};
-    resolve(response({account:{configured:true,usage_status:'pending'}}));await first;
-    assert.equal(fixture.rendered.length,0);
-    assert.equal(fixture.context.cm.upstreamConfig.account,undefined);
-  }
-});
-test('expired session redirects without claiming recovery success',async()=>{
-  const fixture=setup(async()=>response({},401));await fixture.run();
-  assert.equal(fixture.context.location.href,'/login');
-  assert.equal(fixture.context.cm.loaded,true);
-  assert.equal(fixture.$('cmUpstreamRecover').disabled,false);
-});
-test('unsupported or disabled task options are not offered',()=>{
-  const fixture=setup();
-  fixture.context.account={configured:true,enabled:true,usage_sync_enabled:true,provider:'tokenforce'};
-  vm.runInContext('renderUpstreamRecoveryOptions(account)',fixture.context);
-  for(const option of fixture.$('cmUpstreamRecoveryTask').options)assert.equal(option.disabled,['funds','pricing','error_logs'].includes(option.value));
-  fixture.context.account.enabled=false;vm.runInContext('renderUpstreamRecoveryOptions(account)',fixture.context);
-  assert.equal(fixture.$('cmUpstreamRecovery').hidden,true);
+
+test('duplicate clicks suppressed and stale domain POST ignored',async()=>{
+  let resolve;const f=setup(()=>new Promise(r=>{resolve=r}));
+  const first=f.run();await f.run();assert.equal(f.requests.length,1);
+  f.context.cm.upstreamDomain={domain:'other.example'};
+  resolve(response({status:'queued',message:'stale result',queued_at:200}));await first;
+  assert.ok(!f.messages.some(m=>m.message==='stale result'));assert.equal(f.context.cm.loaded,true);
 });
 
-test('diagnostic refresh preserves recovery action but closing clears it',()=>{
-  const fixture=setup();
-  const resetStart=source.indexOf('function resetUpstreamDiagnostic(');
-  const resetEnd=source.indexOf('function renderUpstreamDiagnostic(',resetStart);
-  vm.runInContext('let upstreamDiagnosticSeq=0,upstreamDiagnosticAbort=null;\n'+source.slice(resetStart,resetEnd),fixture.context);
-  fixture.$('cmUpstreamRecovery').hidden=false;
-  vm.runInContext('resetUpstreamDiagnostic(false)',fixture.context);
-  assert.equal(fixture.$('cmUpstreamRecovery').hidden,false);
-  vm.runInContext('resetUpstreamDiagnostic()',fixture.context);
-  assert.equal(fixture.$('cmUpstreamRecovery').hidden,true);
+test('failed local refresh preserves queued result, never permits stale recovery action',async()=>{
+  for(const reply of [response({},500),response({tasks:null}),response({tasks:[]})]){
+    const f=setup(async url=>url==='/channels/upstream/recover'?response({status:'queued',message:'已恢复排期',queued_at:200}):reply);
+    await f.run();assert.equal(f.context.cm.loaded,false);
+    assert.equal(f.requests.length,2);assert.match(f.messages.at(-1).message,/已恢复排期/);
+    assert.match(f.$('cmUpstreamRecoveryRows').textContent,/状态读取失败/);
+    await f.run();assert.equal(f.requests.length,2);assert.equal(f.timers.size,0);
+  }
+});
+
+test('late status response cannot update another or closed account dialog',async()=>{
+  for(const close of [false,true]){
+    let resolve;const f=setup(()=>new Promise(r=>{resolve=r}));
+    const first=f.refresh();f.context.cm.upstreamDomain=close?null:{domain:'other.example'};
+    resolve(response(snapshot('synced',300)));await first;
+    assert.equal(f.$('cmUpstreamRecoveryRows').innerHTML,'');assert.equal(f.messages.length,0);
+  }
+});
+
+test('expired session redirects without claiming recovery success',async()=>{
+  const f=setup(async()=>response({},401));await f.run();
+  assert.equal(f.context.location.href,'/login');assert.equal(f.context.cm.loaded,true);assert.equal(f.timers.size,0);
+});
+
+test('backend capabilities control actions; escaped content and no guessed providers',async()=>{
+  const data=snapshot('disabled');data.tasks[0].label='<script>';data.tasks.push({task:'funds',label:'资金流水',state:'cooling',retry_at:250});
+  const f=setup(async()=>response(data));await f.refresh();
+  const html=f.$('cmUpstreamRecoveryRows').innerHTML;
+  assert.doesNotMatch(html,/<script>|data-recovery-task="usage"/);
+  assert.match(html,/&lt;script>/);assert.match(html,/data-recovery-task="funds" disabled/);
+  await f.run();assert.equal(f.requests.length,1);
+});
+
+test('only newer published success after receipt confirms a completed batch',async()=>{
+  let data=snapshot();const f=setup(async url=>response(url==='/channels/upstream/recover'?{status:'queued',message:'排期',queued_at:200}:data));
+  await f.run();data=snapshot('synced',100);await f.tick();assert.doesNotMatch(f.messages.at(-1).message,/已确认/);
+  data=snapshot('synced',199);await f.tick();assert.doesNotMatch(f.messages.at(-1).message,/已确认/);
+  data=snapshot('synced',201);await f.tick();assert.match(f.messages.at(-1).message,/已确认后台完成一批实际同步.*历史覆盖/);
+  assert.equal(f.timers.size,0);assert.equal(f.requests.filter(r=>r.options.method==='POST').length,1);
+});
+
+test('tracking bounded to twelve reads; changing identity or new failure stops tracking',async()=>{
+  for(const next of ['pending','failed','cooling','disabled','changed']){
+    let data=snapshot();const f=setup(async url=>response(url==='/channels/upstream/recover'?{status:'queued',message:'排期',queued_at:200}:data));
+    await f.run();
+    if(next==='pending'){for(let i=0;i<11;i++)await f.tick();assert.equal(f.requests.length,13);}
+    else{data=snapshot(next);if(next==='changed')data.account_epoch='epoch-2';await f.tick();}
+    assert.equal(f.timers.size,0);assert.doesNotMatch(f.messages.at(-1).message,/已确认后台/);
+    assert.equal(f.requests.filter(r=>r.options.method==='POST').length,1);
+  }
+});
+
+test('closing or diagnostic reset cancels polling and in-flight status reads',async()=>{
+  const f=setup(async url=>response(url==='/channels/upstream/recover'?{status:'queued',message:'排期',queued_at:200}:snapshot()));
+  const resetStart=source.indexOf('function resetUpstreamDiagnostic('),resetEnd=source.indexOf('function renderUpstreamDiagnostic(',resetStart);
+  vm.runInContext('let upstreamDiagnosticSeq=0,upstreamDiagnosticAbort=null;\n'+source.slice(resetStart,resetEnd),f.context);
+  await f.run();assert.equal(f.timers.size,1);f.$('cmUpstreamRecovery').hidden=false;
+  vm.runInContext('resetUpstreamDiagnostic(false)',f.context);
+  assert.equal(f.$('cmUpstreamRecovery').hidden,false);assert.equal(f.timers.size,0);
+  vm.runInContext('resetUpstreamDiagnostic()',f.context);assert.equal(f.$('cmUpstreamRecovery').hidden,true);
 });

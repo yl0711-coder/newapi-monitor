@@ -14,10 +14,11 @@ import (
 const upstreamRecoveryCooldown = 5 * time.Minute
 
 type upstreamRecoveryResult struct {
-	Status  string `json:"status"`
-	Task    string `json:"task"`
-	Message string `json:"message"`
-	RetryAt int64  `json:"retry_at,omitempty"`
+	Status   string `json:"status"`
+	Task     string `json:"task"`
+	Message  string `json:"message"`
+	RetryAt  int64  `json:"retry_at,omitempty"`
+	QueuedAt int64  `json:"queued_at,omitempty"`
 }
 
 // Column names and predicates are internal constants, never request input.
@@ -29,6 +30,8 @@ type upstreamRecoveryTarget struct {
 	args                                                                []any
 	status, errorText                                                   string
 	next, last                                                          int64
+	success                                                             int64
+	done                                                                bool
 	failures                                                            int
 	attemptColumn, nextColumn, errorColumn, failureColumn, statusColumn string
 	secondNextColumn                                                    string
@@ -45,15 +48,19 @@ func (m *Monitor) loadUpstreamRecoveryTarget(ctx context.Context, row ChannelUps
 	t := upstreamRecoveryTarget{model: &ChannelUpstreamAccount{}, where: "domain = ?", args: []any{row.Domain}, statusColumn: "status"}
 	switch task {
 	case "balance":
+		t.success = row.LastSuccessAt
 		t.status, t.errorText, t.next, t.last, t.failures = row.Status, row.LastError, row.NextSyncAt, row.LastAttemptAt, row.ConsecutiveFails
 		t.attemptColumn, t.nextColumn, t.errorColumn, t.failureColumn = "last_attempt_at", "next_sync_at", "last_error", "consecutive_fails"
 	case "usage":
+		t.success = row.UsageLastSuccessAt
 		t.status, t.errorText, t.next, t.last, t.failures = row.UsageStatus, row.UsageLastError, row.UsageNextSyncAt, row.UsageLastAttemptAt, row.UsageConsecutiveFails
 		t.attemptColumn, t.nextColumn, t.errorColumn, t.failureColumn, t.statusColumn = "usage_last_attempt_at", "usage_next_sync_at", "usage_last_error", "usage_consecutive_fails", "usage_status"
 		if row.UsageBackfillNextSyncAt == upstreamAccountIsolatedUntil {
 			t.secondNextColumn = "usage_backfill_next_sync_at"
 		}
 	case "usage_history":
+		t.success = row.UsageBackfillLastSuccessAt
+		t.done = row.UsageBackfillDone
 		t.errorText, t.next, t.last, t.failures = row.UsageBackfillLastError, row.UsageBackfillNextSyncAt, row.UsageBackfillLastAttemptAt, row.UsageBackfillConsecutiveFails
 		t.attemptColumn, t.nextColumn, t.errorColumn, t.failureColumn, t.statusColumn = "usage_backfill_last_attempt_at", "usage_backfill_next_sync_at", "usage_backfill_last_error", "usage_backfill_consecutive_fails", ""
 	case "funds":
@@ -63,6 +70,7 @@ func (m *Monitor) loadUpstreamRecoveryTarget(ctx context.Context, row ChannelUps
 			return t, err
 		}
 		t.status, t.errorText, t.next, t.last, t.failures = state.Status, state.LastError, state.NextSyncAt, state.LastAttemptAt, state.ConsecutiveFails
+		t.success = state.LastSuccessAt
 		t.attemptColumn, t.nextColumn, t.errorColumn, t.failureColumn = "last_attempt_at", "next_sync_at", "last_error", "consecutive_fails"
 	case "error_logs":
 		var state UpstreamErrorLogSyncState
@@ -71,6 +79,7 @@ func (m *Monitor) loadUpstreamRecoveryTarget(ctx context.Context, row ChannelUps
 			return t, err
 		}
 		t.status, t.errorText, t.next, t.last, t.failures = state.Status, state.LastError, state.NextSyncAt, state.LastAttemptAt, state.ConsecutiveFails
+		t.success = state.LastSuccessAt
 		t.attemptColumn, t.nextColumn, t.errorColumn, t.failureColumn = "last_attempt_at", "next_sync_at", "last_error", "consecutive_fails"
 	case "pricing":
 		var state ChannelUpstreamPricingSyncState
@@ -79,6 +88,7 @@ func (m *Monitor) loadUpstreamRecoveryTarget(ctx context.Context, row ChannelUps
 			return t, err
 		}
 		t.status, t.errorText, t.next, t.last, t.failures = state.Status, state.LastError, state.TailNextSyncAt, state.LastAttemptAt, state.ConsecutiveFailures
+		t.success = state.LastSuccessAt
 		if !state.BackfillDone && state.BackfillNextSyncAt < t.next {
 			t.next = state.BackfillNextSyncAt
 		}
@@ -193,6 +203,7 @@ func (m *Monitor) probeAndResumeUpstreamTask(ctx context.Context, observed, prob
 		return result, err
 	}
 	result.Status, result.Message = "queued", "接口检测通过，已恢复排期；等待实际同步入库，历史缺口仍需补齐"
+	result.QueuedAt = now
 	return result, nil
 }
 

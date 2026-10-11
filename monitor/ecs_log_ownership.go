@@ -52,6 +52,9 @@ func (m *Monitor) initECSLogOwnership(db *gorm.DB) error {
 	if !hasBinding && !hasOwners && !m.cfg.ECSLogOwnershipEnabled {
 		return nil
 	}
+	if m.cfg.LocalSnapshotOnly {
+		return m.inspectECSLogOwnershipSnapshot(db, hasBinding, hasOwners)
+	}
 	if !m.cfg.ECSLogOwnershipEnabled || !ecsLogRuntimeEnabled(m.cfg) || !ecsLogAudiencePattern.MatchString(m.cfg.ECSLogAudience) {
 		return errors.New("ownership store cannot disable its gate or change receiver identity")
 	}
@@ -104,6 +107,36 @@ func (m *Monitor) initECSLogOwnership(db *gorm.DB) error {
 		m.ecsLogOwnershipActive.Store(true)
 	}
 	return err
+}
+
+// A closed local snapshot retains its receiver identity as historical data.
+// It must not activate, adopt, rewrite or downgrade that identity. Production
+// startup still requires the authenticated receiver and exact binding above.
+func (m *Monitor) inspectECSLogOwnershipSnapshot(db *gorm.DB, hasBinding, hasOwners bool) error {
+	if m.cfg.ECSLogEnabled || m.cfg.ECSLogProductionEnabled || m.cfg.ECSLogOwnershipEnabled || m.cfg.ECSArchiveEnabled {
+		return errors.New("offline ownership inspection cannot enable an ECS receiver")
+	}
+	// Require the same external-I/O isolation even for authenticated previews.
+	isolated := m.cfg
+	isolated.LocalAuthBypass = true
+	if err := validateLocalAuthBypassSettings(isolated); err != nil {
+		return err
+	}
+	if !hasBinding || !hasOwners {
+		return errors.New("incomplete ownership schema; recovery required")
+	}
+	var rows []ECSLogOwnershipBinding
+	if err := db.Limit(2).Find(&rows).Error; err != nil {
+		return err
+	}
+	if len(rows) != 1 || rows[0].ID != 1 || rows[0].Version != 1 || !ecsLogAudiencePattern.MatchString(rows[0].Audience) ||
+		(rows[0].Purpose != ecsLogCandidatePurpose && rows[0].Purpose != "production-v1") {
+		return errors.New("invalid offline ownership binding; recovery required")
+	}
+	// Preserve fail-closed ownership semantics for any internal reader. Runtime
+	// registration/ingest/discovery remain disabled by their independent gates.
+	m.ecsLogOwnershipActive.Store(true)
+	return nil
 }
 
 func ecsLogOwnershipFor(source ECSLogSource, audience, publicKey, purpose string) ECSLogOwnership {

@@ -21,7 +21,10 @@ func (p *paths) String() string     { return fmt.Sprint([]string(*p)) }
 func (p *paths) Set(s string) error { *p = append(*p, s); return nil }
 
 func main() {
-	action := flag.String("action", "plan", "inspect-backup, plan, run, status, candidates, read-plan, advance; large-read-plan, large-plan, large-run, large-status; series-check, series-run; handoff-check, handoff-plan, handoff-run")
+	action := flag.String("action", "plan", "inspect-backup, inspect-relevant, plan, run, status, candidates, read-plan, advance; large-read-plan, large-plan, large-run, large-status; series-check, series-run; handoff-check, handoff-plan, handoff-run")
+	mainBackup := flag.String("main-backup", "", "closed local Monitor main backup; inspect-relevant only")
+	fromDate := flag.String("from", "", "recorded accounting origin date in Asia/Shanghai; inspect-relevant only")
+	toDate := flag.String("to", "", "exclusive closed accounting end date in Asia/Shanghai; inspect-relevant only")
 	receiver := flag.String("receiver-backup", "", "closed local receiver snapshot; read-only input for handoff-check or handoff-plan")
 	handoffMaxHours := flag.Int("handoff-max-hours", 2, "maximum repaired user-hours per handoff-run invocation (1-10); paused_limit requires explicit resume")
 	seriesPath := flag.String("series-plan", "", "private finite offline series manifest; series-check/run only")
@@ -46,6 +49,19 @@ func main() {
 	})
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	used := map[string]bool{}
+	flag.Visit(func(f *flag.Flag) { used[f.Name] = true })
+	if *action == "inspect-relevant" {
+		if flag.NArg() != 0 {
+			fail(fmt.Errorf("positional arguments are not supported"))
+		}
+		output, err := runRelevantInspection(ctx, *mainBackup, *backup, *epoch, *fromDate, *toDate, used)
+		printResult(output, err)
+		return
+	}
+	if used["main-backup"] || used["from"] || used["to"] {
+		fail(fmt.Errorf("main-backup, from and to flags require inspect-relevant"))
+	}
 	if *action == "handoff-check" || *action == "handoff-plan" || *action == "handoff-run" {
 		used := map[string]bool{}
 		flag.Visit(func(f *flag.Flag) { used[f.Name] = true })

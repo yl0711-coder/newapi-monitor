@@ -352,6 +352,21 @@ body{max-width:none!important;margin:0!important;padding:0!important;overflow-x:
 .cm-finance-group-title{align-items:flex-start}
 .cm-finance-group-title>div:first-child{min-width:0}
 .cm-finance-group-title>div:first-child>small{display:block;margin-top:6px;color:#68758a;font-size:var(--cm-font-caption);line-height:1.4}
+.cm-recovery[hidden]{display:none!important}
+.cm-recovery{margin-top:16px;padding:14px 16px;border:1px solid #30394b;border-radius:10px;background:#141a25;font-size:13px}
+.cm-recovery>header{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:6px}
+.cm-recovery button{flex:none;border:1px solid #6259bd;border-radius:7px;background:rgba(110,96,236,.1);color:#c0baff;padding:6px 10px;font-size:12px;cursor:pointer}
+.cm-recovery button:disabled{opacity:.5;cursor:not-allowed}
+.cm-recovery small{display:block;color:#929eb1;font-size:12px;line-height:1.6;overflow-wrap:anywhere}
+.cm-recovery>small{margin-top:10px}
+.cm-recovery-row{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:10px 0;border-bottom:1px solid #293142}
+.cm-recovery-row>div{min-width:0}
+.cm-recovery-row b{font-size:13px;font-weight:500}
+.cm-recovery-state{margin-left:10px;color:#aeb8ca;font-size:12px}
+.cm-recovery-state[data-state="synced"],.cm-recovery-state[data-state="complete"]{color:#70d6ae}
+.cm-recovery-state[data-state="failed"],.cm-recovery-state[data-state="mismatch"]{color:#ee858a}
+.cm-recovery-state[data-state="cooling"],.cm-recovery-state[data-state="verifying"]{color:#e6b866}
+@media(max-width:480px){.cm-recovery{padding:12px}.cm-recovery-row{align-items:flex-start}.cm-recovery-state{display:block;margin:3px 0}}
 .cm-finance-group-actions{display:flex;align-items:center;gap:10px;flex:none}
 .cm-finance-group-actions>span{font-size:var(--cm-font-caption);color:#9aa6b8;white-space:nowrap}
 .cm-finance-group-actions>button{height:34px;padding:0 12px;border:1px solid #5e55c9;border-radius:8px;background:rgba(102,91,224,.12);color:#bcb7ff;font-size:var(--cm-font-caption);cursor:pointer;white-space:nowrap}

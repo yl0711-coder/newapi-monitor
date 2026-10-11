@@ -1206,6 +1206,10 @@ func syncAICodeWithBalanceSnapshot(ctx context.Context, client *http.Client, row
 		return upstreamBalanceResult{}, cred, &upstreamAuthError{err: err}
 	}
 	pacer := newUpstreamUsageRequestPacer(len(normalized.Slots), aiCodeWithUsageRequestInterval)
+	// Only all-401 failures prove that every configured Key is invalid. A
+	// 403 may be a temporary WAF/permission rejection, even alongside a 401.
+	// Preserve that distinction without retaining provider response bodies.
+	failureStatus := http.StatusUnauthorized
 	for index := range normalized.Slots {
 		if paceErr := pacer.beforeRequest(ctx); paceErr != nil {
 			return upstreamBalanceResult{}, normalized, paceErr
@@ -1218,8 +1222,15 @@ func syncAICodeWithBalanceSnapshot(ctx context.Context, client *http.Client, row
 		if !errors.As(syncErr, &authErr) {
 			return upstreamBalanceResult{}, normalized, syncErr
 		}
+		var httpErr *upstreamHTTPError
+		if !errors.As(syncErr, &httpErr) || (httpErr.Status != http.StatusUnauthorized && httpErr.Status != http.StatusForbidden) {
+			return upstreamBalanceResult{}, normalized, syncErr
+		}
+		if httpErr.Status == http.StatusForbidden {
+			failureStatus = http.StatusForbidden
+		}
 	}
-	return upstreamBalanceResult{}, normalized, &upstreamAuthError{err: fmt.Errorf("AICodeWith 已配置的 %d 把 API Key 均无法读取余额，请检查或替换失效 Key", len(normalized.Slots))}
+	return upstreamBalanceResult{}, normalized, &upstreamAuthError{err: fmt.Errorf("AICodeWith 已配置的 %d 把 API Key 均无法读取余额，请检查访问权限或凭据: %w", len(normalized.Slots), &upstreamHTTPError{Status: failureStatus})}
 }
 
 func (m *Monitor) loadChannelUpstreamViews(ctx context.Context) (map[string]ChannelUpstreamAccountView, error) {

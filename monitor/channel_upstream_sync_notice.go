@@ -15,8 +15,13 @@ func deferredUpstreamUsageSync(row ChannelUpstreamAccount, now int64) error {
 	notice := &upstreamUsageDeferredError{
 		message: "本次未执行消费同步：尚未到下次同步时间，当前仍展示已采集账单。",
 	}
-	if row.UsageStatus == upstreamStatusReconnect || row.UsageNextSyncAt == upstreamAccountIsolatedUntil {
+	if row.UsageStatus == upstreamStatusReconnect {
 		notice.message = "本次未执行消费同步：上游日志认证或权限异常，自动同步已暂停。请先检测日志访问权限，必要时更新凭据。"
+		notice.warning = true
+		return notice
+	}
+	if row.UsageNextSyncAt == upstreamAccountIsolatedUntil {
+		notice.message = "本次未执行消费同步：自动重试已暂停。请在账户配置中检查恢复；检测通过后恢复排期，不会清空已有账单。"
 		notice.warning = true
 		return notice
 	}

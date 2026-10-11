@@ -1075,13 +1075,12 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
       <label class="cm-upstream-enabled"><input id="cmUpstreamEnabled" type="checkbox" checked><span><b>启用后台自动同步</b><small>停用后保留配置和最后余额，但不再访问该上游</small></span></label>
       <label class="cm-upstream-enabled cm-upstream-usage-option"><input id="cmUpstreamUsageEnabled" type="checkbox"><span><b id="cmUpstreamUsageLabel">同步上游消费账单</b><small id="cmUpstreamUsageHelp">默认每 30 分钟串行汇总一次；当天水位和历史补数独立运行，不保存上游原始内容</small></span></label>
       <section class="cm-upstream-security"><b>凭据安全</b><span>访问令牌、Refresh Token 与 AICodeWith API Key 在本地 SQLite 中经 AES-256-GCM 加密；页面和接口只返回脱敏账户信息。Sub2API 与 TokenForce 的 refresh token 轮换会原子更新。</span></section>
+      <section class="cm-recovery" id="cmUpstreamRecovery" hidden aria-label="上游同步状态">
+        <header><b>同步状态</b><button type="button" id="cmUpstreamRecoveryRefresh">刷新状态</button></header>
+        <div id="cmUpstreamRecoveryRows" aria-live="polite">正在读取同步状态…</div>
+        <small>按已保存配置检查，遵守冷却时间，不清空数据。检测通过仅恢复排期；此处不代表历史覆盖完整。</small>
+      </section>
     </div>
-    <section class="cm-upstream-note" id="cmUpstreamRecovery" hidden>
-      <label for="cmUpstreamRecoveryTask">恢复失败的同步任务</label>
-      <select id="cmUpstreamRecoveryTask"><option value="balance">余额</option><option value="usage">消费同步</option><option value="usage_history">历史消费补采</option><option value="funds">充值及额度调整</option><option value="pricing">计价明细</option><option value="error_logs">错误日志</option></select>
-      <button type="button" class="cm-upstream-sync" id="cmUpstreamRecover">检测并恢复</button>
-      <small>仅使用已保存配置；遵守冷却时间，不开启已关闭任务，不清空历史数据。检测通过后等待后台实际同步。</small>
-    </section>
     <footer><span id="cmUpstreamMessage"></span><div><button type="button" class="cm-upstream-cancel" id="cmUpstreamCancel">取消</button><button type="button" class="cm-upstream-sync" id="cmUpstreamSync" hidden>同步余额</button><button type="button" class="cm-upstream-sync" id="cmUpstreamUsageSync" hidden>同步消费</button><button type="button" class="cm-upstream-sync" id="cmUpstreamFundsSync" hidden>同步资金流水</button><button type="button" class="cm-upstream-save" id="cmUpstreamSave">保存并验证</button></div></footer>
   </aside>
 </div>

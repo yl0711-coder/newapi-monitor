@@ -66,19 +66,23 @@ func TestFinanceUpgradeSnapshotRetainsDeployedProjectionFallback(t *testing.T) {
 	}
 }
 
-func TestFinanceUpgradeHourDiagnosticsPreservesV7MoneyWithoutPromotion(t *testing.T) {
-	m, request, now, _ := newFinanceUpgradeSnapshotFixture(t)
-	payload := []byte(fmt.Sprintf(`{"enabled":true,"from":3600,"to":10800,"generated_at":%d,"statement":{"contribution_profit":{"micro_usd":"42"},"contribution_margin_percent":"1.2"},"cost_details":[{"provider":"tokenforce"}],"pairing_audit":{"paired_rows":3}}`, now.Unix()))
-	key := financeUpgradeProjectionKey(request, "accounting-recharge-zero-proof-v7")
-	if err := m.persistFinanceReportSnapshotShadow(key, "v7-source", payload, now); err != nil {
-		t.Fatal(err)
-	}
-	got, ok, err := m.loadFinanceUpgradeSnapshot(request, now)
-	if err != nil || !ok || !bytes.Equal(got, payload) {
-		t.Fatalf("display-only diagnostic upgrade changed amounts: ok=%t err=%v", ok, err)
-	}
-	if _, _, _, ok, err := m.loadFinanceReportSnapshot(request, now); err != nil || ok {
-		t.Fatal("v7 without hour diagnosis promoted to current v8 report", err)
+func TestFinanceUpgradeCoveragePreservesPriorMoneyWithoutPromotion(t *testing.T) {
+	for _, projection := range []string{"accounting-recharge-zero-proof-v7", "accounting-pairing-hour-diagnostics-v8"} {
+		t.Run(projection, func(t *testing.T) {
+			m, request, now, _ := newFinanceUpgradeSnapshotFixture(t)
+			payload := []byte(fmt.Sprintf(`{"enabled":true,"from":3600,"to":10800,"generated_at":%d,"statement":{"contribution_profit":{"micro_usd":"42"},"contribution_margin_percent":"1.2"},"cost_details":[{"provider":"tokenforce"}],"pairing_audit":{"paired_rows":3}}`, now.Unix()))
+			key := financeUpgradeProjectionKey(request, projection)
+			if err := m.persistFinanceReportSnapshotShadow(key, "v7-source", payload, now); err != nil {
+				t.Fatal(err)
+			}
+			got, ok, err := m.loadFinanceUpgradeSnapshot(request, now)
+			if err != nil || !ok || !bytes.Equal(got, payload) {
+				t.Fatalf("display-only diagnostic upgrade changed amounts: ok=%t err=%v", ok, err)
+			}
+			if _, _, _, ok, err := m.loadFinanceReportSnapshot(request, now); err != nil || ok {
+				t.Fatal("prior coverage promoted to current report", err)
+			}
+		})
 	}
 }
 

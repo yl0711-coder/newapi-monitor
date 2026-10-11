@@ -2417,6 +2417,13 @@ func (m *Monitor) loadFinanceUpstreamFactsWithSources(ctx context.Context, scope
 		}
 		if usageFound {
 			detail.ExpectedHours, detail.CompletedHours, detail.DataUntil = metrics.ExpectedHours, metrics.CompletedHours, metrics.DataUntil
+			// Expected coverage exists even when an account reports no buckets
+			// for this entire window. Keep it aligned with merged detail totals;
+			// availability below still gates all monetary publication.
+			if configured && account.UsageSyncEnabled {
+				coverage.ExpectedDomainHours += metrics.ExpectedHours
+				coverage.CompletedDomainHours += metrics.CompletedHours
+			}
 			detail.BillBasis = metrics.Granularity
 			if dailyPartial[domain] {
 				detail.BillBasis = "closed_natural_days"
@@ -2428,8 +2435,6 @@ func (m *Monitor) loadFinanceUpstreamFactsWithSources(ctx context.Context, scope
 				detail.RechargeHistoryStatus = metrics.AdjustedCostStatus
 			}
 			coverage.AvailableDomains++
-			coverage.ExpectedDomainHours += metrics.ExpectedHours
-			coverage.CompletedDomainHours += metrics.CompletedHours
 			detail.UpstreamRequests = metrics.Requests
 			amounts, found := rawBills[domain]
 			if !found {

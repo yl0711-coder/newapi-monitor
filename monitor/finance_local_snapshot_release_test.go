@@ -186,9 +186,16 @@ func TestFinanceLocalSnapshotColdBuild(t *testing.T) {
 		t.Fatal(err)
 	}
 	// A closed range within this snapshot; it never contacts the live source.
-	to, err := time.ParseInLocation("2006-01-02 15:04", "2026-09-20 16:00", loc)
+	endText := os.Getenv("MONITOR_FINANCE_ACCEPTANCE_TO")
+	if endText == "" {
+		endText = "2026-09-20 16:00" // Preserve the original baseline window.
+	}
+	to, err := time.ParseInLocation("2006-01-02 15:04", endText, loc)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if !to.After(from) || to.After(time.Now()) {
+		t.Fatal("acceptance requires a closed, nonempty report window")
 	}
 	m := &Monitor{storeDB: openReadOnly(mainPath), usageFactsDB: openReadOnly(factsPath), cfg: Settings{
 		FinanceEnabled: true, FinanceStartDate: "2026-05-01", ChannelEconomicsReportEnabled: true,

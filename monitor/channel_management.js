@@ -14,6 +14,7 @@ const cm={
 };
 let upstreamDiagnosticSeq=0,upstreamDiagnosticAbort=null;
 let upstreamRecoverySeq=0,upstreamRecoveryAbort=null;
+let upstreamRecoveryStatusSeq=0,upstreamRecoveryStatusAbort=null,upstreamRecoveryTimer=null,upstreamRecoveryData=null,upstreamRecoveryWatch=null;
 const $=id=>document.getElementById(id);
 const esc=s=>String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const zero=()=>({requests:0,tokens:0,cost_usd:0});
@@ -188,7 +189,11 @@ function init(){
   $('cmUpstreamProvider')?.addEventListener('change',resetUpstreamDiagnostic);
   $('cmUpstreamSync')?.addEventListener('click',syncUpstreamNow);
   $('cmUpstreamUsageSync')?.addEventListener('click',syncUpstreamUsageNow);
-  $('cmUpstreamRecover')?.addEventListener('click',recoverUpstreamTask);
+  $('cmUpstreamRecovery')?.addEventListener('click',event=>{
+    const button=event.target.closest('button');if(!button||button.disabled)return;
+    if(button.id==='cmUpstreamRecoveryRefresh')loadUpstreamRecoveryStatus();
+    else if(button.dataset.recoveryTask)recoverUpstreamTask(button.dataset.recoveryTask);
+  });
   $('cmUpstreamFundsSync')?.addEventListener('click',syncUpstreamFundsNow);
   document.addEventListener('keydown',event=>{if(event.key==='Escape'){if(cm.upstreamDomain)closeUpstream();else if(cm.financeMode)closeFinance()}});
   window.addEventListener('monitor:navigate',event=>{if(event.detail?.tab==='channels'&&applyNavigationContext())loadReport()});
@@ -1121,7 +1126,10 @@ function showUpstreamMessage(message,error=false){
 function resetUpstreamDiagnostic(clearRecovery=true){
   upstreamRecoverySeq++;
   upstreamRecoveryAbort?.abort();upstreamRecoveryAbort=null;
-  if($('cmUpstreamRecover'))$('cmUpstreamRecover').disabled=false;
+  stopUpstreamRecoveryStatus();
+  upstreamRecoveryWatch=null;
+  if(clearRecovery){upstreamRecoveryData=null;if($('cmUpstreamRecoveryRows'))$('cmUpstreamRecoveryRows').textContent='正在读取同步状态…'}
+  else renderUpstreamRecoveryRows();
   if(clearRecovery&&$('cmUpstreamRecovery'))$('cmUpstreamRecovery').hidden=true;
   upstreamDiagnosticSeq++;
   upstreamDiagnosticAbort?.abort();upstreamDiagnosticAbort=null;
@@ -1493,26 +1501,77 @@ async function syncUpstreamFundsNow(){
 }
 
 function renderUpstreamRecoveryOptions(account){
-  const box=$('cmUpstreamRecovery'),select=$('cmUpstreamRecoveryTask');
-  if(!box||!select)return;
-  box.hidden=!account?.configured||!account.enabled;
-  const provider=account?.provider,logs=!!account?.usage_sync_enabled;
-  const tasks=new Set(['balance']);
-  if(logs){
-    tasks.add('usage');tasks.add('usage_history');
-    if(['newapi','sub2api'].includes(provider))tasks.add('funds');
-    if(['newapi','sub2api','aicodewith'].includes(provider))tasks.add('pricing');
-    if(provider==='newapi')tasks.add('error_logs');
-  }
-  [...select.options].forEach(option=>{option.disabled=!tasks.has(option.value)});
-  if(!tasks.has(select.value))select.value='balance';
+  const box=$('cmUpstreamRecovery');if(!box)return;
+  box.hidden=!account?.configured;
+  if(!box.hidden)loadUpstreamRecoveryStatus();
+  else{stopUpstreamRecoveryStatus();upstreamRecoveryData=null;upstreamRecoveryWatch=null}
 }
 
-async function recoverUpstreamTask(){
+function stopUpstreamRecoveryStatus(){
+  upstreamRecoveryStatusSeq++;
+  upstreamRecoveryStatusAbort?.abort();upstreamRecoveryStatusAbort=null;
+  clearTimeout(upstreamRecoveryTimer);upstreamRecoveryTimer=null;
+}
+
+function renderUpstreamRecoveryRows(){
+  const box=$('cmUpstreamRecoveryRows');if(!box)return;
+  if(!upstreamRecoveryData)return;
+  const states={disabled:'不可执行',pending:'等待同步',synced:'最近已同步',complete:'任务已完成',blocked:'需先恢复消费',cooling:'等待重试',failed:'同步异常',collecting:'继续采集',verifying:'等待核验',mismatch:'对账待处理'};
+  const tasks=upstreamRecoveryData?.tasks||[];
+  box.innerHTML=tasks.map(item=>`<div class="cm-recovery-row"><div><b>${esc(item.label)}</b><span class="cm-recovery-state" data-state="${esc(item.state)}">${esc(states[item.state]||'状态未知')}</span><small>${esc(item.note||'')}${item.last_success_at>0?` · 最近成功读取 ${esc(dateTime(item.last_success_at))}`:''}${item.retry_at>0?` · 可再检测 ${esc(dateTime(item.retry_at))}`:''}</small></div>${item.can_recover===true||item.state==='cooling'?`<button type="button" data-recovery-task="${esc(item.task)}" ${item.can_recover!==true||upstreamRecoveryAbort?'disabled':''}>检查恢复</button>`:''}</div>`).join('');
+}
+
+async function loadUpstreamRecoveryStatus(){
+  if(!cm.upstreamDomain)return;
+  stopUpstreamRecoveryStatus();
+  const domain=cm.upstreamDomain.domain,seq=upstreamRecoveryStatusSeq,controller=new AbortController();
+  upstreamRecoveryStatusAbort=controller;
+  const timeout=setTimeout(()=>controller.abort(),8000);
+  const current=()=>seq===upstreamRecoveryStatusSeq&&cm.upstreamDomain?.domain===domain;
+  $('cmUpstreamRecoveryRefresh').disabled=true;
+  try{
+    const response=await fetch(`/channels/upstream/recovery-status?domain=${encodeURIComponent(domain)}`,{headers:{Accept:'application/json'},cache:'no-store',signal:controller.signal});
+    if(!current())return;
+    if(response.status===401){location.href='/login';return}
+    const data=await response.json();if(!current())return;
+    if(!response.ok||data.domain!==domain||!Array.isArray(data.tasks))throw Error('status unavailable');
+    upstreamRecoveryData=data;renderUpstreamRecoveryRows();
+    const watch=upstreamRecoveryWatch;
+    if(watch){
+      const task=data.tasks.find(item=>item.task===watch.task);
+      if(data.account_epoch!==watch.epoch){
+        upstreamRecoveryWatch=null;showUpstreamMessage('账户配置已变化，已停止跟踪旧任务，请按当前状态检查。',true);
+      }else if(['synced','complete'].includes(task?.state)&&Number(task.last_success_at)>watch.baseline&&Number(task.last_success_at)>=watch.queuedAt){
+        upstreamRecoveryWatch=null;cm.loaded=false;
+        showUpstreamMessage('已确认后台完成一批实际同步；历史覆盖是否齐全请查看数据同步状态。');
+      }else if(['failed','blocked','cooling','disabled','mismatch'].includes(task?.state)){
+        upstreamRecoveryWatch=null;showUpstreamMessage('后台尚未确认同步完成，请查看该任务当前状态；未清空历史数据。',true);
+      }else if(--watch.remaining>0){
+        upstreamRecoveryTimer=setTimeout(loadUpstreamRecoveryStatus,5000);
+      }else{
+        upstreamRecoveryWatch=null;showUpstreamMessage('尚未确认实际同步完成，已停止自动刷新；可稍后刷新状态，不必重复检测。');
+      }
+    }
+  }catch(error){
+    if(current()){
+      upstreamRecoveryData=null;upstreamRecoveryWatch=null;
+      $('cmUpstreamRecoveryRows').textContent='状态读取失败，请刷新重试；不会因此请求上游或清空数据。';
+    }
+  }finally{
+    clearTimeout(timeout);
+    if(current()){$('cmUpstreamRecoveryRefresh').disabled=false;upstreamRecoveryStatusAbort=null}
+  }
+}
+
+async function recoverUpstreamTask(task){
   if(!cm.upstreamDomain||upstreamRecoveryAbort)return;
-  const domain=cm.upstreamDomain.domain,task=$('cmUpstreamRecoveryTask').value,seq=++upstreamRecoverySeq;
+  const eligible=upstreamRecoveryData?.tasks?.find(item=>item.task===task&&item.can_recover===true);
+  if(!eligible)return;
+  const baseline=Number(eligible.last_success_at)||0,epoch=upstreamRecoveryData.account_epoch;
+  stopUpstreamRecoveryStatus();upstreamRecoveryWatch=null;
+  const domain=cm.upstreamDomain.domain,seq=++upstreamRecoverySeq;
   const controller=new AbortController();upstreamRecoveryAbort=controller;
-  const button=$('cmUpstreamRecover');button.disabled=true;
+  renderUpstreamRecoveryRows();
   const timeout=setTimeout(()=>controller.abort(),60000);
   showUpstreamMessage('正在检测所选接口；通过后恢复排期，不会清空历史数据…');
   try{
@@ -1527,26 +1586,16 @@ async function recoverUpstreamTask(){
     showUpstreamMessage((known?data.message:'未取得有效恢复结果，请查看数据同步状态。')+(validRetry?` 下次可检测：${dateTime(retry)}`:''),!known||data.status==='blocked');
     if(data.status==='queued'){
       cm.loaded=false;
-      // Re-read local status only: do not repeat synchronization or reopen the
-      // form, which would discard unsaved credential/configuration edits.
-      try{
-        const latest=await fetch(`/channels/upstream?domain=${encodeURIComponent(domain)}`,{headers:{Accept:'application/json'},cache:'no-store',signal:controller.signal});
-        if(seq!==upstreamRecoverySeq||cm.upstreamDomain?.domain!==domain)return;
-        if(latest.status===401){location.href='/login';return}
-        const refreshed=await latest.json();
-        if(seq!==upstreamRecoverySeq||cm.upstreamDomain?.domain!==domain)return;
-        if(!latest.ok||refreshed?.account?.configured!==true)throw Error('local status unavailable');
-        cm.upstreamConfig={...cm.upstreamConfig,account:refreshed.account};
-        renderUpstreamStatus(refreshed.account);
-      }catch(error){
-        if(seq===upstreamRecoverySeq&&cm.upstreamDomain?.domain===domain)showUpstreamMessage('已恢复排期，但状态刷新失败；请重新打开账户配置查看。尚不代表数据已更新。',true);
-      }
+      // Poll only persisted local state, never repeat POST/probes or reset
+      // unsaved fields. Old servers without a receipt cannot prove completion.
+      if(Number(data.queued_at)>0)upstreamRecoveryWatch={task,epoch,baseline,queuedAt:Number(data.queued_at),remaining:12};
     }
+    if(known)await loadUpstreamRecoveryStatus();
   }catch(error){
     if(seq===upstreamRecoverySeq&&cm.upstreamDomain?.domain===domain)showUpstreamMessage(error.name==='AbortError'?'检测超时，请查看同步状态后再试；未清空历史数据。':error.message,true);
   }finally{
     clearTimeout(timeout);
-    if(seq===upstreamRecoverySeq){button.disabled=false;upstreamRecoveryAbort=null}
+    if(seq===upstreamRecoverySeq){upstreamRecoveryAbort=null;renderUpstreamRecoveryRows()}
   }
 }
 

@@ -710,7 +710,17 @@ func fetchNewAPILogPageWithType[T any](ctx context.Context, client *http.Client,
 		Total:       int64(total),
 		Fingerprint: fingerprint,
 	}
+	aipipeAmounts := usesAipipeUsageUSD(row, logType)
 	for _, itemJSON := range data.Items {
+		if aipipeAmounts {
+			// Fingerprint the untouched upstream page above; normalize only the
+			// decoder input so pagination identity and retry checks stay stable.
+			var normalizeErr error
+			itemJSON, normalizeErr = normalizeAipipeUsageItem(itemJSON, row.BalanceUnit)
+			if normalizeErr != nil {
+				return newAPIUsagePage[T]{}, normalizeErr
+			}
+		}
 		item, decodeErr := decodeItem(itemJSON)
 		if decodeErr != nil {
 			return newAPIUsagePage[T]{}, decodeErr

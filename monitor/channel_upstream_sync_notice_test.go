@@ -52,7 +52,8 @@ func TestManualUsageSyncDeferredDoesNotClaimSuccessOrTouchState(t *testing.T) {
 		warning                         bool
 	}{
 		{"auth_403", upstreamStatusReconnect, "上游返回 HTTP 403", "认证或权限异常", upstreamAccountIsolatedUntil, 0, true},
-		{"isolated_sentinel", upstreamStatusOK, "", "认证或权限异常", upstreamAccountIsolatedUntil, 0, true},
+		{"isolated_sentinel", upstreamStatusOK, "", "自动重试已暂停", upstreamAccountIsolatedUntil, 0, true},
+		{"exhausted_503", upstreamStatusError, "上游返回 HTTP 503", "自动重试已暂停", upstreamAccountIsolatedUntil, 0, true},
 		{"retry_429", upstreamStatusError, "上游返回 HTTP 429", "等待重试时间", now + 3600, now + 3600, true},
 		{"normal_interval", upstreamStatusOK, "", "尚未到下次同步时间", now + 1800, now + 1800, false},
 	} {
