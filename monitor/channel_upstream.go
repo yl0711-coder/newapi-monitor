@@ -3567,7 +3567,7 @@ func (m *Monitor) startChannelUpstreamSync(ctx context.Context) {
 		// pricing lane must not prevent the already queued economic ledger from
 		// draining; no provider credentials or network calls are made here.
 		goSourceEpoch(ctx, func(laneCtx context.Context) {
-			runUpstreamPeriodicLane(laneCtx, 20*time.Second, time.Minute, m.syncDueChannelEconomics)
+			runUpstreamPeriodicLane(laneCtx, 20*time.Second, time.Minute, m.syncDueChannelCostPipeline)
 		})
 	}
 	if !m.cfg.UpstreamSyncEnabled && !m.cfg.UpstreamUsageSyncEnabled && !m.cfg.UpstreamPricingLedgerEnabled && !m.cfg.UpstreamErrorLogSyncEnabled && !m.cfg.UpstreamFundsSyncEnabled {

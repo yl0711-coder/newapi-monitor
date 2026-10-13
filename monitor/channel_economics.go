@@ -305,6 +305,18 @@ func (m *Monitor) publishChannelEconomicsHour(ctx context.Context, account Chann
 	if !m.channelCostEnabledFor(account) {
 		return nil
 	}
+	return m.publishVerifiedChannelEconomicsHour(ctx, account, hourTs, reason, now)
+}
+
+// Provider wrappers own activation. In particular, adding the Sub2 adapter
+// does not enable the existing NewAPI collectors or workers for Sub2.
+func (m *Monitor) publishVerifiedChannelEconomicsHour(ctx context.Context, account ChannelUpstreamAccount, hourTs int64, reason string, now int64) error {
+	chargeUnit := channelCostChargeUnitNewAPIQuota
+	if account.Provider == upstreamProviderSub2API {
+		chargeUnit = sub2TokenChargeUnit
+	} else if account.Provider != upstreamProviderNewAPI {
+		return errors.New("该上游不支持令牌经济账")
+	}
 	if hourTs < 0 || hourTs%3600 != 0 {
 		return errors.New("渠道经济账只允许整小时")
 	}
@@ -332,8 +344,17 @@ func (m *Monitor) publishChannelEconomicsHour(ctx context.Context, account Chann
 			return errors.New("渠道成本小时尚未核验对平")
 		}
 		var costRows []ChannelUpstreamCostHourEvidence
-		if err := tx.Where("domain = ? AND account_epoch = ? AND hour_ts = ? AND semantics_version = ?", account.Domain, epoch, hourTs, channelCostEvidenceSemanticsVersion).Order("dimension_hash").Find(&costRows).Error; err != nil {
+		costQuery := tx.Where("domain = ? AND account_epoch = ? AND hour_ts = ? AND semantics_version = ?", account.Domain, epoch, hourTs, channelCostEvidenceSemanticsVersion).Order("dimension_hash")
+		if account.Provider == upstreamProviderSub2API {
+			costQuery = costQuery.Limit(sub2TokenMaxScanRows + 1)
+		}
+		if err := costQuery.Find(&costRows).Error; err != nil {
 			return err
+		}
+		if account.Provider == upstreamProviderSub2API {
+			if err := m.validateSub2TokenEconomicsHour(tx, account, hourTs, now, costRows, costState); err != nil {
+				return err
+			}
 		}
 		financeVersion, rechargePaid, rechargeCredit, financeKnown, err := economicsFinanceForHour(tx, account.Domain, hourTs)
 		if err != nil {
@@ -352,6 +373,7 @@ func (m *Monitor) publishChannelEconomicsHour(ctx context.Context, account Chann
 			}
 			return row
 		}
+		var tokenOwnerHashes map[string]upstreamTokenOwnerState
 		for _, evidence := range costRows {
 			var binding ChannelCostSourceBinding
 			bindingErr := tx.Where("domain = ? AND account_epoch = ? AND source_ref = ? AND status = 'confirmed' AND valid_from <= ? AND (valid_to = 0 OR valid_to > ?)", account.Domain, epoch, evidence.SourceRef, hourTs, hourTs).
@@ -360,6 +382,15 @@ func (m *Monitor) publishChannelEconomicsHour(ctx context.Context, account Chann
 			allocated := bindingErr == nil && binding.AllocationMode == "allocated" && binding.LocalChannelID > 0
 			if bindingErr != nil && !errors.Is(bindingErr, gorm.ErrRecordNotFound) {
 				return bindingErr
+			}
+			if allocated && binding.MappingSource == upstreamTokenBindingMappingSource {
+				if tokenOwnerHashes == nil {
+					tokenOwnerHashes, err = readUpstreamTokenOwnerHashesAt(tx, account, hourTs, []byte(m.cfg.ChannelCostHMACKey), m.cfg.ChannelCostHMACKeyID)
+					if err != nil {
+						return err
+					}
+				}
+				allocated = upstreamTokenBindingMatchesOwners(binding, tokenOwnerHashes, m.cfg.ChannelCostHMACKeyID)
 			}
 			if allocated {
 				channelID = binding.LocalChannelID
@@ -523,7 +554,7 @@ func (m *Monitor) publishChannelEconomicsHour(ctx context.Context, account Chann
 				LocalRequests: acc.localRequests, UpstreamRequests: acc.upstreamRequests,
 				LocalConsumeQuota: acc.localConsume, LocalRefundRecords: acc.localRefunds, LocalRefundQuota: acc.localRefund, LocalNetQuota: netQuota,
 				UnallocatedRefundRecords: 0, UnallocatedRefundQuota: 0, LocalFactStatus: localFactStatus,
-				RevenueMicroUSD: revenue, UpstreamChargeUnits: acc.chargeUnits, UpstreamChargeUnit: channelCostChargeUnitNewAPIQuota, ChargeUnitsPerUSD: unitsPerUSD,
+				RevenueMicroUSD: revenue, UpstreamChargeUnits: acc.chargeUnits, UpstreamChargeUnit: chargeUnit, ChargeUnitsPerUSD: unitsPerUSD,
 				UpstreamCostMicroUSD: upstreamCost, CorrectedCostMicroUSD: corrected, ProfitMicroUSD: profit,
 				CorrectedCostKnown: acc.hasCost && financeKnown, ProfitKnown: profitKnown,
 				CoverageStatus: coverage, ReconcileStatus: costState.ReconcileStatus, MappingHash: mappingHash, SourceHash: sourceHash,
@@ -774,16 +805,24 @@ const (
 // account gate for many turns. One selected domain gets at most eight local
 // publications per minute; each scan introduces at most four missing hours.
 func (m *Monitor) syncDueChannelEconomics(ctx context.Context) {
-	if m == nil || m.storeDB == nil || !m.cfg.ChannelCostClosureEnabled || len(m.cfg.ChannelCostClosureDomains) == 0 {
+	m.syncDueChannelEconomicsAt(ctx, time.Now().Unix())
+}
+
+// The injected wall clock is also used by isolated acceptance tests. Keep one
+// shared per-tick budget across providers, not a second competing writer lane.
+func (m *Monitor) syncDueChannelEconomicsAt(ctx context.Context, now int64) {
+	if m == nil || m.storeDB == nil || m.cfg.LocalSnapshotOnly || !m.cfg.ChannelCostClosureEnabled || len(m.cfg.ChannelCostClosureDomains) == 0 || now <= 0 || now > math.MaxInt64-3840 {
 		return
 	}
 	ctx, cancel := context.WithTimeout(ctx, channelEconomicsTickTimeout)
 	defer cancel()
-	now := time.Now().Unix()
 	domains := m.cfg.ChannelCostClosureDomains
 	// Rotate the first candidate so one noisy supplier cannot starve others.
 	start := int((now / 60) % int64(len(domains)))
 	for i := range domains {
+		if ctx.Err() != nil {
+			return
+		}
 		domain := strings.ToLower(strings.TrimSpace(domains[(start+i)%len(domains)]))
 		if domain == "" {
 			continue
@@ -795,21 +834,28 @@ func (m *Monitor) syncDueChannelEconomics(ctx context.Context) {
 			}
 			continue
 		}
-		if !m.channelCostEnabledFor(account) {
+		sub2 := account.Provider == upstreamProviderSub2API && account.UsageAdapter != upstreamUsageAdapterSub2Stats
+		if !sub2 && !m.channelCostEnabledFor(account) {
 			continue
 		}
-		if err := m.enqueueMissingChannelEconomicsHours(ctx, account, channelEconomicsEnqueuePerTick); err != nil {
-			slog.Warn("扫描缺失渠道经济账小时失败", "domain", domain, "err", err)
-			continue
+		if !sub2 {
+			if err := m.enqueueMissingChannelEconomicsHours(ctx, account, channelEconomicsEnqueuePerTick); err != nil {
+				slog.Warn("扫描缺失渠道经济账小时失败", "domain", domain, "err", err)
+				continue
+			}
 		}
-		var due int64
-		if err := m.storeDB.WithContext(ctx).Model(&ChannelEconomicsDirtyHour{}).
+		// Sub2 drains only jobs already committed atomically with verified
+		// costs. Discovery/preparation is separate; never infer attribution or
+		// copy NewAPI's quota semantics while scanning for missing jobs.
+		var due ChannelEconomicsDirtyHour
+		probe := m.storeDB.WithContext(ctx).Select("hour_ts").
 			Where("domain = ? AND account_epoch = ? AND status = 'pending' AND next_attempt_at <= ?", account.Domain, newAPIUpstreamAccountEpoch(account), now).
-			Limit(1).Count(&due).Error; err != nil {
-			slog.Warn("读取渠道经济账待办失败", "domain", domain, "err", err)
+			Limit(1).Find(&due)
+		if probe.Error != nil {
+			slog.Warn("读取渠道经济账待办失败", "domain", domain, "err", probe.Error)
 			continue
 		}
-		if due == 0 {
+		if probe.RowsAffected == 0 {
 			continue
 		}
 		if err := m.publishDueChannelEconomicsBatch(ctx, account, now); err != nil {
@@ -839,6 +885,10 @@ func (m *Monitor) publishOneDueChannelEconomicsHour(ctx context.Context, account
 }
 
 func (m *Monitor) publishOneDueChannelEconomicsHourOrdered(ctx context.Context, account ChannelUpstreamAccount, now int64, oldestFirst bool) error {
+	if account.Provider == upstreamProviderSub2API {
+		_, err := m.publishOneDueSub2TokenEconomicsHour(ctx, account, 0, now, oldestFirst)
+		return err
+	}
 	var dirty ChannelEconomicsDirtyHour
 	order := "hour_ts DESC, created_at ASC"
 	if oldestFirst {

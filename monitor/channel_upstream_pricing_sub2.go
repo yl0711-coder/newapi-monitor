@@ -26,7 +26,12 @@ import (
 )
 
 type sub2PricingUsageItem struct {
-	ID                 int64
+	ID int64
+	// Optional attribution metadata. Not part of the existing account-level
+	// pricing dimension or checkpoint fingerprint; adding it must not rewrite
+	// historical pricing evidence or invalidate an in-progress legacy scan.
+	UpstreamTokenID    string
+	UpstreamTokenState string
 	CreatedAt          int64
 	ModelName          string
 	SourceGroup        string
@@ -61,6 +66,7 @@ func exactDecimalMicros(raw json.RawMessage) (int64, error) {
 func decodeSub2PricingUsageItem(rawItem json.RawMessage) (sub2PricingUsageItem, error) {
 	var raw struct {
 		ID           json.RawMessage `json:"id"`
+		APIKeyID     json.RawMessage `json:"api_key_id"`
 		CreatedAt    string          `json:"created_at"`
 		Model        string          `json:"model"`
 		InputTokens  json.RawMessage `json:"input_tokens"`
@@ -118,8 +124,10 @@ func decodeSub2PricingUsageItem(rawItem json.RawMessage) (sub2PricingUsageItem, 
 	if raw.BillingMode != nil {
 		billingMode = boundedPricingDimension(*raw.BillingMode)
 	}
+	tokenID, tokenState := decodeOptionalUpstreamTokenID(raw.APIKeyID)
 	return sub2PricingUsageItem{
 		ID: id, CreatedAt: created.Unix(), ModelName: boundedPricingDimension(raw.Model), SourceGroup: groupName,
+		UpstreamTokenID: tokenID, UpstreamTokenState: tokenState,
 		GroupRatio: group, EffectiveRatio: effective, BillingMode: billingMode,
 		PromptTokens: prompt, CompletionTokens: completion, ActualCostMicros: costMicros,
 		ActualCostKnown: true, TokensExactKnown: true, EvidenceCapability: capability,
@@ -284,6 +292,7 @@ func (m *Monitor) fetchSub2PricingDay(ctx context.Context, account ChannelUpstre
 			return nil, "", false, err
 		}
 	}
+	shadow := m.beginSub2TokenShadow(ctx, account, dayTs, now, checkpoint, hasCheckpoint)
 	client := m.channelUpstreamHTTPClient()
 	var first sub2PricingPage
 	checkpointVerified := false
@@ -304,6 +313,7 @@ func (m *Monitor) fetchSub2PricingDay(ctx context.Context, account ChannelUpstre
 			return nil, "", false, fmt.Errorf("Sub2API 计价日志断点期间首页已变化，窗口将重试")
 		}
 		checkpointVerified = true
+		shadow.observe(page)
 	}
 	evidenceMap := make(map[string]*ChannelUpstreamPricingHourEvidence)
 	if !hasCheckpoint {
@@ -339,6 +349,7 @@ func (m *Monitor) fetchSub2PricingDay(ctx context.Context, account ChannelUpstre
 		if err := m.savePricingPageCheckpoint(ctx, &checkpoint, evidenceMap); err != nil {
 			return nil, "", false, err
 		}
+		shadow.observe(first)
 	} else {
 		var err error
 		evidenceMap, err = decodePricingCheckpointEvidence(checkpoint)
@@ -379,6 +390,7 @@ func (m *Monitor) fetchSub2PricingDay(ctx context.Context, account ChannelUpstre
 		if err := m.savePricingPageCheckpoint(ctx, &checkpoint, evidenceMap); err != nil {
 			return nil, "", false, err
 		}
+		shadow.observe(page)
 	}
 	if checkpoint.SourceRows != checkpoint.Total {
 		return nil, "", false, fmt.Errorf("Sub2API 计价日志分页数量不完整（got=%d want=%d）", checkpoint.SourceRows, checkpoint.Total)
@@ -396,6 +408,7 @@ func (m *Monitor) fetchSub2PricingDay(ctx context.Context, account ChannelUpstre
 			_ = m.deletePricingPageCheckpoint(ctx, account.Domain, epoch, dayTs)
 			return nil, "", false, fmt.Errorf("Sub2API 计价日志扫描期间首页已变化，窗口将重试")
 		}
+		shadow.observe(probe)
 	}
 	byHour := make(map[int64][]ChannelUpstreamPricingHourEvidence, 24)
 	for hour := dayTs; hour < dayTs+86400; hour += 3600 {
@@ -407,6 +420,7 @@ func (m *Monitor) fetchSub2PricingDay(ctx context.Context, account ChannelUpstre
 	for hour := range byHour {
 		sort.Slice(byHour[hour], func(i, j int) bool { return byHour[hour][i].DimensionHash < byHour[hour][j].DimensionHash })
 	}
+	shadow.finish(byHour)
 	return byHour, "", true, nil
 }
 

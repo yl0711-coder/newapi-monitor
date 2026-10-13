@@ -1059,13 +1059,16 @@ func TestAICodeWithRoundWaitUsesEarliestRunnableKeyDeadline(t *testing.T) {
 }
 
 func TestSyncStoredSub2APIUsagePublishesTailHistoryAdapterAndRotatedCredential(t *testing.T) {
-	var refreshCalls, trendCalls atomic.Int64
+	var refreshCalls, trendCalls, statsCalls atomic.Int64
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch r.URL.Path {
 		case "/api/v1/auth/refresh":
 			refreshCalls.Add(1)
 			_, _ = w.Write([]byte(`{"code":0,"data":{"access_token":"access-rotated","refresh_token":"refresh-rotated","expires_in":3600}}`))
+		case "/api/v1/usage/stats":
+			statsCalls.Add(1)
+			_, _ = w.Write([]byte(`{"code":0,"data":{"total_requests":4,"total_tokens":80,"total_actual_cost":"1.5"}}`))
 		case "/api/v1/usage/dashboard/trend":
 			trendCalls.Add(1)
 			if r.Header.Get("Authorization") != "Bearer access-rotated" {
@@ -1109,8 +1112,8 @@ func TestSyncStoredSub2APIUsagePublishesTailHistoryAdapterAndRotatedCredential(t
 	if synced.UsageStatus != upstreamStatusOK || !synced.UsageBackfillDone || synced.UsageAdapter != upstreamUsageAdapterSub2Trend || synced.UsageDataUntil < today {
 		t.Fatalf("stored Sub2API sync state=%+v", synced)
 	}
-	if refreshCalls.Load() != 1 || trendCalls.Load() != 2 {
-		t.Fatalf("refresh calls=%d trend calls=%d, want 1/2", refreshCalls.Load(), trendCalls.Load())
+	if refreshCalls.Load() != 1 || trendCalls.Load() != 2 || statsCalls.Load() != 1 {
+		t.Fatalf("refresh calls=%d trend calls=%d stats calls=%d, want 1/2/1", refreshCalls.Load(), trendCalls.Load(), statsCalls.Load())
 	}
 	var stored ChannelUpstreamAccount
 	if err := m.storeDB.First(&stored, "domain = ?", row.Domain).Error; err != nil {

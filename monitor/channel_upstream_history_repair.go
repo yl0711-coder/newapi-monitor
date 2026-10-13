@@ -271,6 +271,11 @@ func (m *Monitor) inspectSub2HistoricalDay(ctx context.Context, domain, day, exp
 	if err := verifySub2HistoricalDailyTotal(ctx, m.channelUpstreamHTTPClient(), row, cred, from, to, pacer, view); err != nil {
 		return upstreamHistoricalDayView{}, err
 	}
+	markSub2UsageDayVerified(&result)
+	view, err = historicalSub2ResultView(row, day, firstStoredAt, result)
+	if err != nil {
+		return upstreamHistoricalDayView{}, err
+	}
 	view.AnchorDay, view.AnchorMatched = storedAnchor.Day, true
 	combined := sha256.Sum256([]byte(view.Digest + ":" + storedAnchor.Digest + ":" + fetchedAnchor.Digest))
 	view.Digest = hex.EncodeToString(combined[:])

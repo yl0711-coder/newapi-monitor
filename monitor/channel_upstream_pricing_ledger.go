@@ -1796,6 +1796,14 @@ func (m *Monitor) syncDueUpstreamPricing(ctx context.Context) {
 				due = true
 			}
 		}
+		var tokenRecovery sub2TokenRecoveryCandidate
+		if !due && err == nil && m.sub2TokenRecoveryEnabled(account) {
+			var recoveryErr error
+			tokenRecovery, recoveryErr = m.nextSub2TokenRecovery(ctx, account, state, now)
+			if recoveryErr == nil && tokenRecovery.DayTs > 0 {
+				due = true
+			}
+		}
 		if due {
 			nextDue := int64(0)
 			if err == nil {
@@ -1807,7 +1815,12 @@ func (m *Monitor) syncDueUpstreamPricing(ctx context.Context) {
 			if costRecoveryDueAt > 0 && (nextDue == 0 || costRecoveryDueAt < nextDue) {
 				nextDue = costRecoveryDueAt
 			}
-			candidates = append(candidates, upstreamPricingDueAccount{Domain: domain, NextDueAt: nextDue, LastAttemptAt: state.LastAttemptAt})
+			lastAttempt := state.LastAttemptAt
+			if tokenRecovery.DayTs > 0 {
+				nextDue = tokenRecovery.NextAttemptAt
+				lastAttempt = max(lastAttempt, tokenRecovery.LastAttemptAt)
+			}
+			candidates = append(candidates, upstreamPricingDueAccount{Domain: domain, NextDueAt: nextDue, LastAttemptAt: lastAttempt, TokenRecoveryDay: tokenRecovery.DayTs})
 		}
 	}
 	if len(candidates) == 0 {
@@ -1819,12 +1832,21 @@ func (m *Monitor) syncDueUpstreamPricing(ctx context.Context) {
 	// 让一个热门账户浪费整轮倍率账本调度并长期饿死其他账户。
 	for _, candidate := range candidates {
 		syncCtx, cancel := context.WithTimeout(ctx, upstreamPricingOperationTimeout(m.cfg))
-		_, syncErr := m.syncStoredUpstreamPricing(syncCtx, candidate.Domain)
+		var syncErr error
+		if candidate.TokenRecoveryDay > 0 {
+			syncErr = m.syncStoredSub2TokenRecoveryAt(syncCtx, candidate.Domain, candidate.TokenRecoveryDay, now)
+		} else {
+			_, syncErr = m.syncStoredUpstreamPricing(syncCtx, candidate.Domain)
+		}
 		cancel()
 		if errors.Is(syncErr, errUpstreamAccountBusy) {
 			continue
 		}
 		if syncErr != nil {
+			if candidate.TokenRecoveryDay > 0 {
+				slog.Warn("上游令牌证据补扫待重试", "domain", candidate.Domain)
+				return // never log credentials, raw upstream bodies or SQL
+			}
 			// 影子账本故障只记录自身状态，绝不能污染既有消费汇总健康。
 			slog.Warn("上游计价账本同步失败", "domain", candidate.Domain, "err", sanitizeUpstreamError(syncErr))
 		}
@@ -1912,9 +1934,10 @@ func upstreamPricingOperationTimeout(s Settings) time.Duration {
 }
 
 type upstreamPricingDueAccount struct {
-	Domain        string
-	NextDueAt     int64
-	LastAttemptAt int64
+	Domain           string
+	NextDueAt        int64
+	LastAttemptAt    int64
+	TokenRecoveryDay int64
 }
 
 func sortUpstreamPricingDueAccounts(accounts []upstreamPricingDueAccount) []upstreamPricingDueAccount {

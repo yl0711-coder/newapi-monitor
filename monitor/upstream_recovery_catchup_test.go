@@ -30,12 +30,15 @@ func TestUpstreamRecoveryCatchupReopensCompletedHistory(t *testing.T) {
 				credential = sub2APICredential{AccessToken: "fixture-access", RefreshToken: "fixture-refresh", ExpiresAt: now + 3600}
 				setUpstreamRecoveryTransport(m, upstreamRoundTripFunc(func(r *http.Request) (*http.Response, error) {
 					calls.Add(1)
-					if r.Method != http.MethodGet || r.URL.Path != "/api/v1/usage/dashboard/trend" {
+					if r.Method != http.MethodGet || (r.URL.Path != "/api/v1/usage/dashboard/trend" && r.URL.Path != "/api/v1/usage/stats") {
 						t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
 					}
 					day := r.URL.Query().Get("start_date")
 					if day == "" || day != r.URL.Query().Get("end_date") {
 						t.Fatal("history request expanded beyond one calendar day")
+					}
+					if r.URL.Path == "/api/v1/usage/stats" {
+						return recoveryHTTPResponse(http.StatusOK, `{"code":0,"data":{"total_requests":2,"total_tokens":30,"total_actual_cost":"1.5"}}`), nil
 					}
 					body, err := json.Marshal(map[string]any{"code": 0, "data": map[string]any{
 						"start_date": day, "end_date": day, "granularity": "hour",

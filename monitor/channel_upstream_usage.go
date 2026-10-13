@@ -1501,7 +1501,9 @@ func fetchSub2APIUsageTrend(ctx context.Context, client *http.Client, row Channe
 		}
 		bucket, ok := buckets[hour]
 		if !ok {
-			bucket = ChannelUpstreamUsageHour{Domain: row.Domain, HourTs: hour, Provider: row.Provider}
+			// A sparse trend can mean either no usage or unavailable history.
+			// Only a closed-day total reconciliation may confirm these zeros.
+			bucket = ChannelUpstreamUsageHour{Domain: row.Domain, HourTs: hour, Provider: row.Provider, Provisional: true}
 		}
 		bucket.BucketSeconds = seconds
 		hours = append(hours, bucket)
@@ -1577,7 +1579,7 @@ func syncSub2APIUsage(ctx context.Context, client *http.Client, row ChannelUpstr
 		}
 		refreshed = true
 	}
-	result, err := fetchSub2APIUsageWindow(ctx, client, row, cred, from, to, pacer, adapter)
+	result, err := fetchSub2APIUsageForSync(ctx, client, row, cred, from, to, pacer, adapter)
 	if err == nil {
 		return result, cred, nil
 	}
@@ -1588,7 +1590,7 @@ func syncSub2APIUsage(ctx context.Context, client *http.Client, row ChannelUpstr
 			return upstreamUsageResult{}, cred, refreshErr
 		}
 		cred = updated
-		result, err = fetchSub2APIUsageWindow(ctx, client, row, cred, from, to, pacer, adapter)
+		result, err = fetchSub2APIUsageForSync(ctx, client, row, cred, from, to, pacer, adapter)
 		if err == nil {
 			return result, cred, nil
 		}
@@ -2399,7 +2401,11 @@ func persistUpstreamUsageWindowTx(tx *gorm.DB, domain string, from, to int64, ho
 	// while accepting the refreshed complete facts; the new unit starts with the
 	// next bucket. This avoids both historical repricing and dropped requests.
 	var existing []ChannelUpstreamUsageHour
-	if err := tx.Where("domain = ? AND hour_ts >= ? AND hour_ts < ? AND unit_per_usd > 0", domain, from, to).Find(&existing).Error; err != nil {
+	if err := tx.Where("domain = ? AND hour_ts >= ? AND hour_ts < ?", domain, from, to).Find(&existing).Error; err != nil {
+		return err
+	}
+	retainedFetchedAt, err := retainSub2OmittedUsageHours(existing, hours)
+	if err != nil {
 		return err
 	}
 	existingUnit := make(map[int64]float64, len(existing))
@@ -2440,6 +2446,11 @@ func persistUpstreamUsageWindowTx(tx *gorm.DB, domain string, from, to int64, ho
 	}
 	for i := range hours {
 		hours[i].FetchedAt = now
+		if fetchedAt, retained := retainedFetchedAt[hours[i].HourTs]; retained {
+			// The upstream did not return this hour. Do not make the old
+			// amount look freshly measured or extend its covered interval.
+			hours[i].FetchedAt = fetchedAt
+		}
 		if err := tx.Clauses(clause.OnConflict{Columns: []clause.Column{{Name: "domain"}, {Name: "hour_ts"}}, UpdateAll: true}).Create(&hours[i]).Error; err != nil {
 			return err
 		}
@@ -2492,6 +2503,8 @@ type upstreamUsageSyncPlan struct {
 	tailTo       int64
 	backfillFrom int64
 	backfillTo   int64
+	// Repair yesterday without skipping the older historical cursor.
+	recentOnly bool
 }
 
 // planUpstreamUsageSync treats the open-day tail and history as two due lanes.
@@ -2759,6 +2772,10 @@ func (m *Monitor) syncStoredUpstreamUsageWithPriority(ctx context.Context, domai
 		backfillDays = 7
 	}
 	plan := planUpstreamUsageSyncForLane(row, now, backfillDays, lane)
+	plan, err = m.prioritizeSub2RecentUsage(ctx, row, now, plan)
+	if err != nil {
+		return row, err
+	}
 	if !background && plan.tailTo <= plan.tailFrom && plan.backfillTo <= plan.backfillFrom {
 		// The admin action observes the same isolation/backoff as the worker.
 		// Report a deferred check, not success; do not persist a no-op as a new
@@ -2882,8 +2899,10 @@ func (m *Monitor) syncStoredUpstreamUsageWithPriority(ctx context.Context, domai
 				err = historyErr
 			} else {
 				applyUpstreamUsageBackfillResult(&row, nil, now, m.cfg, secrets...)
-				row.UsageBackfillCursor = plan.backfillTo
-				row.UsageBackfillDone = plan.backfillTo >= cstDayStart(now)
+				if !plan.recentOnly {
+					row.UsageBackfillCursor = plan.backfillTo
+				}
+				row.UsageBackfillDone = row.UsageBackfillCursor >= cstDayStart(now)
 				if row.UsageBackfillDone {
 					row.UsageBackfillNextSyncAt = 0
 				}

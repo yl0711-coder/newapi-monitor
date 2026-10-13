@@ -12,6 +12,8 @@ const cm={
   financeMode:'',financeDomain:null,financeGroups:[],financeChannels:[],financeChannel:null,upstreamDomain:null,upstreamConfig:null,upstreamFunds:null,
   removedAICodeWithKeyIDs:new Set()
 };
+const tokenEditors=new Map();
+let tokenFinanceNotice=false;
 let upstreamDiagnosticSeq=0,upstreamDiagnosticAbort=null;
 let upstreamRecoverySeq=0,upstreamRecoveryAbort=null;
 let upstreamRecoveryStatusSeq=0,upstreamRecoveryStatusAbort=null,upstreamRecoveryTimer=null,upstreamRecoveryData=null,upstreamRecoveryWatch=null;
@@ -167,6 +169,12 @@ function init(){
   $('cmFinanceCancel')?.addEventListener('click',closeFinance);
   $('cmFinanceMask')?.addEventListener('click',closeFinance);
   $('cmFinanceSave')?.addEventListener('click',saveFinance);
+  $('cmFinanceDomainChannelRows')?.addEventListener('click',event=>{
+    const open=event.target.closest('[data-cm-token-open]');
+    if(open){const panel=open.closest('.cm-finance-domain-channel')?.querySelector('[data-cm-token-panel]');if(panel){panel.hidden=!panel.hidden;open.setAttribute('aria-expanded',String(!panel.hidden));if(!panel.hidden&&!tokenEditors.has(panel))tokenEditorAction(panel,'load')}return}
+    const action=event.target.closest('[data-cm-token-action]');
+    if(action&&!action.disabled)tokenEditorAction(action.closest('[data-cm-token-panel]'),action.dataset.cmTokenAction);
+  });
   $('cmFinanceSyncGroups')?.addEventListener('click',syncWebsiteGroups);
   $('cmSiteFinanceOpen')?.addEventListener('click',openSiteFinance);
   ['cmFinanceFX','cmFinanceSitePaid','cmFinanceSiteCredit','cmFinanceUpPaid','cmFinanceUpCredit'].forEach(id=>$(id)?.addEventListener('input',refreshFinancePreview));
@@ -944,6 +952,7 @@ function financeGroupBusinessIncluded(index){
   return el?el.checked:true;
 }
 function showFinanceMessage(message,error=false){
+  tokenFinanceNotice=false;
   const el=$('cmFinanceMessage');if(!el)return;
   el.textContent=message||'';el.classList.toggle('error',!!error);
 }
@@ -992,9 +1001,129 @@ function renderFinanceChannelRows(){
     const multiplier=conflict?'':(first.upstream_configured?first.upstream_multiplier:'');
     const discount=conflict?'':(first.upstream_configured?(first.upstream_discount_factor||1):'');
     const state=conflict?'<small class="cm-finance-channel-warning">历史配置不一致，请重新确认</small>':'';
-    return `<article class="cm-finance-domain-channel"><div class="cm-finance-domain-channel-name"><b>#${esc(channel.id)} ${esc(channel.name)}</b>${state}</div><div class="cm-finance-channel-status">${statusLabel(channel)}</div><label class="cm-finance-upstream-group"><input type="text" maxlength="128" value="${esc(upstreamGroupName)}" data-cm-domain-rate="group-name" data-channel-id="${esc(channel.id)}" aria-label="#${esc(channel.id)} 上游分组名" placeholder="填写上游对应分组"></label><label><input type="number" min="0.000001" step="0.0001" inputmode="decimal" value="${multiplier}" data-cm-domain-rate="multiplier" data-channel-id="${esc(channel.id)}" aria-label="#${esc(channel.id)} 上游基础倍率"></label><label><input type="number" min="0.000001" step="0.0001" inputmode="decimal" value="${discount}" data-cm-domain-rate="discount" data-channel-id="${esc(channel.id)}" aria-label="#${esc(channel.id)} 上游折扣系数"></label></article>`;
+    return `<article class="cm-finance-domain-channel"><div class="cm-finance-domain-channel-name"><b>#${esc(channel.id)} ${esc(channel.name)}</b>${state}<button type="button" class="cm-token-open" data-cm-token-open="${esc(channel.id)}" aria-expanded="false">上游令牌 ID（可选）</button></div><div class="cm-finance-channel-status">${statusLabel(channel)}</div><label class="cm-finance-upstream-group"><input type="text" maxlength="128" value="${esc(upstreamGroupName)}" data-cm-domain-rate="group-name" data-channel-id="${esc(channel.id)}" aria-label="#${esc(channel.id)} 上游分组名" placeholder="填写上游对应分组"></label><label><input type="number" min="0.000001" step="0.0001" inputmode="decimal" value="${multiplier}" data-cm-domain-rate="multiplier" data-channel-id="${esc(channel.id)}" aria-label="#${esc(channel.id)} 上游基础倍率"></label><label><input type="number" min="0.000001" step="0.0001" inputmode="decimal" value="${discount}" data-cm-domain-rate="discount" data-channel-id="${esc(channel.id)}" aria-label="#${esc(channel.id)} 上游折扣系数"></label><div class="cm-token-panel" data-cm-token-panel="${esc(channel.id)}" hidden></div></article>`;
   }).join('');
   target.insertAdjacentHTML('afterbegin','<div class="cm-finance-domain-channel-head"><span>渠道</span><span>状态</span><span>上游分组名</span><span>上游基础倍率</span><span>上游折扣系数</span></div>');
+}
+function canonicalTokenInput(value){
+  const raw=String(value??'').trim();if(!raw)return '';
+  if(!/^[0-9]{1,19}$/.test(raw))throw Error('请填写正整数令牌 ID，不是令牌名称、渠道 ID 或 API Key。');
+  const id=raw.replace(/^0+/,'');
+  if(!id||id.length>19||(id.length===19&&id>'9223372036854775807'))throw Error('令牌 ID 超出有效范围。');
+  return id; // Never convert an ID to Number: values above 2^53 must survive.
+}
+function tokenEditorCurrent(panel,state){return panel?.isConnected&&tokenEditors.get(panel)===state&&cm.financeMode==='domain'&&cm.financeDomain?.domain===state.domain}
+function tokenEditorDirty(panel,state){return !!state.config&&String(panel.querySelector('[data-cm-token-id]')?.value??'').trim()!==state.config.upstream_token_id}
+function showTokenFinanceNotice(message){showFinanceMessage(message,true);tokenFinanceNotice=true}
+function clearResolvedTokenFinanceNotice(){
+  if(!tokenFinanceNotice||financeSubmissionPending())return;
+  if([...tokenEditors].some(([p,s])=>tokenEditorCurrent(p,s)&&(s.busy||tokenEditorDirty(p,s))))return;
+  showFinanceMessage('');
+}
+function tokenEditorHasPending(discard){
+  const active=[...tokenEditors].filter(([p,s])=>tokenEditorCurrent(p,s));
+  if(active.some(([,s])=>s.busy)){showTokenFinanceNotice('令牌配置请求正在处理，请等待结果后再关闭或保存倍率。');return true}
+  if(active.some(([p,s])=>tokenEditorDirty(p,s))){
+    if(discard)return !window.confirm('尚有未保存的令牌 ID，关闭将放弃这些输入。已单独保存的令牌配置不会撤销。');
+    showTokenFinanceNotice('请先单独保存令牌配置，或点击“放弃输入”；倍率保存不包含令牌 ID。');return true;
+  }
+  return false;
+}
+function financeSubmissionPending(){return !!($('cmFinanceSave')?.disabled||$('cmFinanceSyncGroups')?.disabled)}
+function financeDialogCanLeave(){
+  if(financeSubmissionPending()){showFinanceMessage('倍率配置请求正在处理，请等待结果后再关闭或切换。',true);return false}
+  return !tokenEditorHasPending(true);
+}
+function tokenEditorMessage(panel,text,error=false){const el=panel.querySelector('[data-cm-token-message]');if(el){el.textContent=text;el.classList.toggle('error',error)}}
+function tokenProcessingText(c){
+  if(!c.upstream_token_id)return '未配置，继续使用原统计方式；此前确认的历史归属仍保留。';
+  if(c.state==='unsupported')return '该上游暂不支持令牌证据核验，不会启用按令牌拆分。';
+  const p=c.processing,labels={pending:'已保存，等待核验当前配置。',scheduled:'归属已核验，等待生效时间。',active:'当前令牌归属已生效。',shared:'当前令牌按共享来源归属，不能作为各渠道独立成本重复计算。',disabled:'已保存；当前未开启该账户的令牌归属处理。',unavailable:'已保存；处理状态暂不可用，请稍后重新读取。'};
+  let text=labels[p?.status]||'已保存；请重新读取确认处理状态，不能据此判断是否已启用拆分。';
+  if(['scheduled','active','shared'].includes(p?.status)){
+    if(Number.isSafeInteger(p.effective_at)&&p.effective_at>0&&p.effective_at<253402300800)text+=` 生效时间：${new Date(p.effective_at*1000).toLocaleString('zh-CN',{timeZone:'Asia/Shanghai',hour12:false})}（北京时间）。`;
+    text+='归属生效不代表账单数据已补齐，请以报表覆盖状态为准。';
+  }
+  if(p?.check_status==='waiting_evidence')text+='后台等待完整的令牌证据。';
+  if(p?.check_status==='running')text+='后台正在核验。';
+  if(p?.check_status==='retry')text+='上次核验未完成，后台将限频重试。';
+  return text;
+}
+function tokenRecoveryText(c){
+  if(!c.upstream_token_id||c.state==='unsupported'||c.provider!=='sub2api')return '';
+  const recovery=c.processing?.recovery,recoveryLabels={pending:'等待后台安排或重新核验。',disabled:'当前未开启自动补扫。',running:'后台正在处理。',reconnect:'鉴权失败，已暂停；请在账户配置重新授权，后台随后复核。',retry:'上次未完成，后台限频重试。',paging:'分页补扫中。',waiting_second_scan:'等待第二轮独立核验。',waiting_legacy:'等待原账单采集完成。',observed:'该日扫描已核验，不代表全部历史或金额已补齐。',unavailable:'状态暂不可用，请稍后重新读取。'};
+  let text='';
+  if(recovery){
+    text='账户令牌证据补扫：'+(recoveryLabels[recovery.status]||'状态暂不可用，请稍后重新读取。');
+    if(Number.isSafeInteger(recovery.day_ts)&&recovery.day_ts>0&&recovery.day_ts<253402300800)text+=` 对应日期：${cstDate(recovery.day_ts)}（北京时间）。`;
+    if(['retry','paging','waiting_second_scan','waiting_legacy'].includes(recovery.status)&&Number.isSafeInteger(recovery.retry_at)&&recovery.retry_at>0&&recovery.retry_at<253402300800)text+=` 最早继续检查：${new Date(recovery.retry_at*1000).toLocaleString('zh-CN',{timeZone:'Asia/Shanghai',hour12:false})}（以后台调度为准）。`;
+  }
+  return text;
+}
+function tokenEditorForm(panel,state){
+  const c=state.config,unsupported=c.state==='unsupported';
+  const shared=Array.isArray(c.shared_channel_ids)&&c.shared_channel_ids.length>1?`同一令牌还被多个渠道配置：${c.shared_channel_ids.map(id=>'#'+id).join('、')}。不得重复计入消费，实际处理状态以上方核验结果为准。`:'';
+  panel.innerHTML=`<div class="cm-token-editor"><label>上游令牌 ID（可选）<input type="text" inputmode="numeric" maxlength="19" autocomplete="off" spellcheck="false" data-cm-token-id aria-label="#${esc(state.channelID)} 上游令牌 ID" value="${esc(c.upstream_token_id)}" placeholder="例如 575；不要填写 API Key"></label><button type="button" data-cm-token-action="save">保存令牌配置</button><button type="button" data-cm-token-action="discard">放弃输入</button><button type="button" data-cm-token-action="load">重新读取</button></div>
+    <p>此项单独保存，不修改上游或倍率；留空沿用原统计方式。保存后由后台核验证据并按生效时间处理；保存本身不重算历史账单。</p>
+    <p>${esc(tokenProcessingText(c))}</p>
+    ${tokenRecoveryText(c)?`<p>${esc(tokenRecoveryText(c))}</p>`:''}
+    ${shared?`<p class="cm-token-warning">${esc(shared)}</p>`:''}
+    ${!unsupported&&c.provider==='sub2api'?`<div class="cm-token-check"><label>核验日期（北京时间）<input type="date" data-cm-token-day value="${cstDate(Math.floor(Date.now()/1000)-86400)}" aria-label="#${esc(state.channelID)} 令牌核验日期"></label><button type="button" data-cm-token-action="check">检查本地证据</button></div>`:''}
+    <p data-cm-token-message role="status" aria-live="polite"></p>`;
+}
+function tokenReadinessText(v){
+  const statuses={evidence_ready:'所选日账户证据已对账。此结果不是渠道归属确认；归属生效状态请重新读取上方配置。',token_not_observed:'所选日未观察到该令牌，不能据此确认归属。',waiting_second_scan:'等待第二轮独立扫描；原统计不受影响。',scan_not_completed:'令牌扫描尚未完成核验。',evidence_missing:'所选日尚无令牌证据。',evidence_invalid:'令牌证据未通过完整性校验。',pricing_evidence_changed:'计价明细发生变化，等待重新核验。',window_open:'请选择已经结束的自然日。',reconciliation_blocked:'部分小时缺少数据或对账未通过，暂不用于渠道拆分。',unconfigured:'尚未配置令牌 ID。',unsupported:'该上游暂不支持此项核验。',verification_unavailable:'本地核验条件尚未就绪。'};
+  let text=statuses[v.status]||'未取得可确认的核验结果，不能据此判断归属及数据完整性。';
+  if(Array.isArray(v.hours)&&v.hours.length===24){text+=` 已对账 ${Number(v.ready_hours)||0}/24 小时`;if(v.rounding_hours)text+=`，其中 ${Number(v.rounding_hours)} 小时存在允许范围内的舍入差额`;text+='。'}
+  return text;
+}
+async function tokenEditorAction(panel,action){
+  if(!panel||cm.financeMode!=='domain'||!cm.financeDomain||!cm.report?.finance?.can_edit)return;
+  if(financeSubmissionPending()){showFinanceMessage('倍率配置请求正在处理，请等待结果后再操作令牌配置。',true);return}
+  let state=tokenEditors.get(panel);
+  if(!state){state={domain:cm.financeDomain.domain,channelID:Number(panel.dataset.cmTokenPanel),config:null,busy:false};tokenEditors.set(panel,state)}
+  if(!tokenEditorCurrent(panel,state)||state.busy)return;
+  if(action==='discard'){if(state.config)tokenEditorForm(panel,state);clearResolvedTokenFinanceNotice();return}
+  if(action==='load'&&tokenEditorDirty(panel,state)&&!window.confirm('重新读取将放弃尚未保存的令牌 ID，是否继续？'))return;
+  let body,url='/channels/upstream/token-config',method='GET';
+  const query=new URLSearchParams({domain:state.domain,channel_id:String(state.channelID)});
+  try{
+    if(action==='save'){
+      if(!state.config)return;
+      const id=canonicalTokenInput(panel.querySelector('[data-cm-token-id]')?.value);
+      if(id===state.config.upstream_token_id){panel.querySelector('[data-cm-token-id]').value=id;tokenEditorMessage(panel,'令牌 ID 没有变化，无需保存。');clearResolvedTokenFinanceNotice();return}
+      if(!id&&!window.confirm('清空令牌 ID 将恢复未配置状态；本次不会改写历史消费。是否继续？'))return;
+      body={domain:state.domain,channel_id:state.channelID,account_epoch:state.config.account_epoch,expected_revision:state.config.revision,upstream_token_id:id};method='POST';
+    }else if(action==='check'){
+      if(!state.config?.upstream_token_id){tokenEditorMessage(panel,'请先填写并单独保存令牌 ID。',true);return}
+      if(tokenEditorDirty(panel,state)){tokenEditorMessage(panel,'请先保存或放弃输入，再核验已保存的令牌。',true);return}
+      const date=panel.querySelector('[data-cm-token-day]')?.value||'';
+      const day=Date.parse(date+'T00:00:00+08:00')/1000;
+      if(!/^\d{4}-\d{2}-\d{2}$/.test(date)||!Number.isFinite(day)||cstDate(day)!==date)throw Error('请选择有效的核验日期。');
+      query.set('day_ts',String(day));url='/channels/upstream/token-check';
+    }else if(action!=='load')return;
+  }catch(error){tokenEditorMessage(panel,error.message,true);return}
+  if(!state.config)panel.innerHTML='<p data-cm-token-message role="status" aria-live="polite"></p><button type="button" data-cm-token-action="load">重新读取</button>';
+  state.busy=true;
+  panel.querySelectorAll('button,input').forEach(el=>el.disabled=true);
+  tokenEditorMessage(panel,action==='save'?'正在保存令牌配置…':action==='check'?'正在核验本机已采集证据，不访问上游…':'正在读取令牌配置…');
+  const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),10000);
+  try{
+    const res=await fetch(method==='GET'?url+'?'+query:url,{method,headers:{Accept:'application/json',...(body?{'Content-Type':'application/json'}:{})},...(body?{body:JSON.stringify(body)}:{}),signal:controller.signal});
+    if(!tokenEditorCurrent(panel,state))return;
+    if(res.status===401){location.href='/login';return}
+    const data=await res.json();if(!tokenEditorCurrent(panel,state))return;
+    if(!res.ok)throw Error(res.status===409?'配置已被其他操作修改，请重新读取后确认；没有自动覆盖。':data.error||`HTTP ${res.status}`);
+    if(action==='check'){tokenEditorMessage(panel,tokenReadinessText(data),!['evidence_ready','token_not_observed','waiting_second_scan'].includes(data.status));return}
+    if(data.domain!==state.domain||data.channel_id!==state.channelID||typeof data.upstream_token_id!=='string'||!Number.isSafeInteger(data.revision)||!/^[a-f0-9]{64}$/.test(data.account_epoch))throw Error('返回配置不完整，请重新读取，暂不保存。');
+    state.config=data;tokenEditorForm(panel,state);
+    if(action==='save')tokenEditorMessage(panel,'令牌配置已单独保存；倍率未修改，历史账单未重算。');
+  }catch(error){
+    if(tokenEditorCurrent(panel,state))tokenEditorMessage(panel,action==='save'?`未能确认保存结果：${error.name==='AbortError'?'请求超时':error.message}。请重新读取确认，系统不会自动重试保存。`:error.name==='AbortError'?'读取超时，请稍后重试。':error.message,true);
+  }finally{
+    clearTimeout(timer);state.busy=false;
+    if(tokenEditorCurrent(panel,state)){panel.querySelectorAll('button,input').forEach(el=>el.disabled=false);clearResolvedTokenFinanceNotice()}
+  }
 }
 function setFinanceMode(mode){
   cm.financeMode=mode;
@@ -1009,6 +1138,8 @@ function showFinanceDialog(){
 }
 function openSiteFinance(){
   if(!cm.report?.finance?.can_edit)return;
+  if(cm.financeMode&&!financeDialogCanLeave())return;
+  tokenEditors.clear();
   cm.financeDomain=null;cm.financeChannel=null;cm.financeChannels=[];
   cm.financeGroups=Array.isArray(cm.report.website_groups)?cm.report.website_groups.slice():[];
   const global=cm.report.finance||{};
@@ -1028,6 +1159,8 @@ function openFinance(domainKey){
   if(!cm.report?.finance?.can_edit)return;
   const domain=(cm.report.domains||[]).find(item=>item.key===domainKey&&item.configured);
   if(!domain)return;
+  if(cm.financeMode&&!financeDialogCanLeave())return;
+  tokenEditors.clear();
   cm.financeDomain=domain;cm.financeChannel=null;cm.financeGroups=[];
   cm.financeChannels=(domain.vendors||[]).flatMap(vendor=>(vendor.channels||[]).filter(channel=>channel.current).map(channel=>({...channel,vendor:vendor.name})))
     .sort((a,b)=>channelStatusRank(a)-channelStatusRank(b)||(+a.id||0)-(+b.id||0));
@@ -1045,12 +1178,15 @@ function openFinance(domainKey){
 }
 function closeFinance(){
   if(!cm.financeMode)return;
+  if(!financeDialogCanLeave())return;
+  tokenEditors.clear();
   cm.financeMode='';cm.financeDomain=null;cm.financeChannel=null;cm.financeGroups=[];
   $('cmFinanceMask').hidden=true;$('cmFinanceDialog').classList.remove('show');$('cmFinanceDialog').setAttribute('aria-hidden','true');
   document.body.classList.remove('cm-dialog-open');showFinanceMessage('');
 }
 async function syncWebsiteGroups(){
   if(cm.financeMode!=='site'||!cm.report?.finance?.can_edit)return;
+  if(financeSubmissionPending())return;
   const button=$('cmFinanceSyncGroups');if(!button)return;
   button.disabled=true;showFinanceMessage('正在读取 NewAPI 分组管理…');
   try{
@@ -1068,11 +1204,13 @@ async function syncWebsiteGroups(){
       data=await res.json();
     }
     if(!res.ok)throw new Error(data.error||`HTTP ${res.status}`);
-    closeFinance();cm.loaded=false;await loadReport();
+    button.disabled=false;closeFinance();cm.loaded=false;await loadReport();
   }catch(error){showFinanceMessage(error.message||'同步失败，请稍后重试。',true)}finally{button.disabled=false}
 }
 async function saveFinance(){
   if(!cm.financeMode||!cm.report?.finance?.can_edit)return;
+  if(financeSubmissionPending())return;
+  if(tokenEditorHasPending(false))return;
   let endpoint,payload,kind;
   if(cm.financeMode==='site'){
     const values={fx_benchmark:financeNumber('cmFinanceFX'),site_recharge_paid:financeNumber('cmFinanceSitePaid'),site_recharge_credit:financeNumber('cmFinanceSiteCredit')};
@@ -1115,7 +1253,7 @@ async function saveFinance(){
     if(!res.ok)throw new Error(data.error||`HTTP ${res.status}`);
     // “没有变化”只表示数据库中的值已经相同，当前弹窗仍可能来自保存前
     // 的旧报表。无论是否创建新版本，都重新读取 SQLite 作为页面真相源。
-    closeFinance();cm.loaded=false;await loadReport();
+    button.disabled=false;closeFinance();cm.loaded=false;await loadReport();
   }catch(error){showFinanceMessage(error.message||'保存失败，请稍后重试。',true)}finally{button.disabled=false}
 }
 
