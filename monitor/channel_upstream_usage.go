@@ -1458,7 +1458,7 @@ func fetchSub2APIUsageTrend(ctx context.Context, client *http.Client, row Channe
 		return upstreamUsageResult{}, wrapSub2APIUsageHTTPError(err)
 	}
 	var data struct {
-		Trend []struct {
+		Trend *[]struct {
 			Date        string          `json:"date"`
 			Requests    json.RawMessage `json:"requests"`
 			TotalTokens json.RawMessage `json:"total_tokens"`
@@ -1474,8 +1474,13 @@ func fetchSub2APIUsageTrend(ctx context.Context, client *http.Client, row Channe
 	if data.StartDate != day || data.EndDate != day || data.Granularity != "hour" {
 		return upstreamUsageResult{}, fmt.Errorf("Sub2API 用量返回的统计范围与请求不一致")
 	}
-	buckets := make(map[int64]ChannelUpstreamUsageHour, len(data.Trend))
-	for _, item := range data.Trend {
+	// An explicitly empty array can represent a zero day; an omitted/null
+	// field is not usage evidence, even when the daily endpoint reports zero.
+	if data.Trend == nil {
+		return upstreamUsageResult{}, fmt.Errorf("Sub2API 小时用量响应缺少有效 trend 数组，不能确认为零消费")
+	}
+	buckets := make(map[int64]ChannelUpstreamUsageHour, len(*data.Trend))
+	for _, item := range *data.Trend {
 		hour, parseErr := time.ParseInLocation("2006-01-02 15:04", strings.TrimSpace(item.Date), cstLocation)
 		if parseErr != nil || hour.Minute() != 0 || hour.Second() != 0 || hour.Unix() < from || hour.Unix() >= from+86400 {
 			return upstreamUsageResult{}, fmt.Errorf("Sub2API 用量包含越界或无效小时")
@@ -2504,7 +2509,8 @@ type upstreamUsageSyncPlan struct {
 	backfillFrom int64
 	backfillTo   int64
 	// Repair yesterday without skipping the older historical cursor.
-	recentOnly bool
+	recentOnly       bool
+	closeoutResolved bool
 }
 
 // planUpstreamUsageSync treats the open-day tail and history as two due lanes.
@@ -2552,6 +2558,12 @@ func planUpstreamUsageSync(row ChannelUpstreamAccount, now int64, backfillDays i
 			}
 		}
 	}
+	// Candidate only: the bounded local read below must prove yesterday exists
+	// and remains unverified before making any upstream request.
+	if row.Provider == upstreamProviderSub2API && (row.UsageBackfillDone || hasSub2PendingCloseout(row)) && row.UsageStatus == upstreamStatusOK &&
+		(row.UsageBackfillNextSyncAt == 0 || row.UsageBackfillNextSyncAt <= now) {
+		plan.backfillFrom, plan.backfillTo, plan.recentOnly = today-86400, today, true
+	}
 	return plan
 }
 
@@ -2560,6 +2572,7 @@ func planUpstreamUsageSyncForLane(row ChannelUpstreamAccount, now int64, backfil
 	switch lane {
 	case upstreamUsageLaneTail:
 		plan.backfillFrom, plan.backfillTo = 0, 0
+		plan.recentOnly = false
 	case upstreamUsageLaneHistory:
 		plan.tailFrom, plan.tailTo = 0, 0
 	}
@@ -2580,7 +2593,9 @@ func applyUpstreamUsageBackfillResult(row *ChannelUpstreamAccount, err error, no
 		return
 	}
 	row.UsageBackfillLastError = sanitizeUpstreamErrorWithSecrets(err, secrets...)
-	row.UsageBackfillProgress = ""
+	if !hasSub2PendingCloseout(*row) {
+		row.UsageBackfillProgress = ""
+	}
 	row.UsageBackfillConsecutiveFails++
 	if upstreamProvenAuthenticationFailure(err) {
 		// Tail and history share one account credential. Once either lane proves
@@ -2774,7 +2789,20 @@ func (m *Monitor) syncStoredUpstreamUsageWithPriority(ctx context.Context, domai
 	plan := planUpstreamUsageSyncForLane(row, now, backfillDays, lane)
 	plan, err = m.prioritizeSub2RecentUsage(ctx, row, now, plan)
 	if err != nil {
+		if hasSub2PendingCloseout(row) && !errors.Is(err, context.Canceled) {
+			applyUpstreamUsageBackfillResult(&row, err, now, m.cfg, secrets...)
+			persistCtx, cancel := upstreamUsageLocalCommitContext(ctx)
+			defer cancel()
+			if saveErr := m.persistUpstreamAccount(persistCtx, &row); saveErr != nil {
+				return row, saveErr
+			}
+		}
 		return row, err
+	}
+	if plan.closeoutResolved {
+		if err := m.setSub2CloseoutProgress(ctx, &row, ""); err != nil {
+			return row, err
+		}
 	}
 	if !background && plan.tailTo <= plan.tailFrom && plan.backfillTo <= plan.backfillFrom {
 		// The admin action observes the same isolation/backoff as the worker.
@@ -2837,6 +2865,11 @@ func (m *Monitor) syncStoredUpstreamUsageWithPriority(ctx context.Context, domai
 	if err == nil && !tailYielded && plan.backfillTo > plan.backfillFrom &&
 		(pacer.maxRequests <= 0 || pacer.calls < pacer.maxRequests) {
 		historyRan = true
+		if row.Provider == upstreamProviderSub2API && plan.recentOnly {
+			if err := m.pinSub2Closeout(ctx, &row, plan); err != nil {
+				return row, err
+			}
+		}
 		if probeErr := upstreamProbeBeforeRetry(ctx, m, row, "usage_history", upstreamStatusError, row.UsageBackfillConsecutiveFails); probeErr != nil {
 			applyUpstreamUsageBackfillResult(&row, probeErr, now, m.cfg, secrets...)
 			err = probeErr
@@ -2901,8 +2934,8 @@ func (m *Monitor) syncStoredUpstreamUsageWithPriority(ctx context.Context, domai
 				applyUpstreamUsageBackfillResult(&row, nil, now, m.cfg, secrets...)
 				if !plan.recentOnly {
 					row.UsageBackfillCursor = plan.backfillTo
+					row.UsageBackfillDone = row.UsageBackfillCursor >= cstDayStart(now)
 				}
-				row.UsageBackfillDone = row.UsageBackfillCursor >= cstDayStart(now)
 				if row.UsageBackfillDone {
 					row.UsageBackfillNextSyncAt = 0
 				}
@@ -3018,9 +3051,15 @@ func (m *Monitor) loadDueUpstreamUsageAccountsForLane(ctx context.Context, now i
 		OR (provider = ? AND usage_backfill_done = ? AND usage_backfill_cursor > 0
 			AND usage_backfill_cursor < ? AND usage_status = ?
 			AND (usage_backfill_next_sync_at = 0 OR usage_backfill_next_sync_at <= ?))
+		OR (provider = ? AND usage_status = ?
+			AND (usage_backfill_next_sync_at = 0 OR usage_backfill_next_sync_at <= ?)
+			AND (usage_backfill_progress LIKE ? OR (usage_backfill_done = ? AND `+sub2UnverifiedYesterdaySQL+`)))
 	)`, true, true, false, now, upstreamStatusOK,
 		upstreamProviderNewAPI, false, legacyBudgetError,
-		upstreamProviderAICodeWith, true, cstDayStart(now), upstreamStatusOK, now).
+		upstreamProviderAICodeWith, true, cstDayStart(now), upstreamStatusOK, now,
+		upstreamProviderSub2API, upstreamStatusOK, now, sub2CloseoutProgressPrefix+"%", true,
+		cstDayStart(now)-86400, cstDayStart(now), cstDayStart(now)-86400, cstDayStart(now),
+		cstDayStart(now), cstDayStart(now)-86400).
 		Order("usage_backfill_next_sync_at ASC, domain ASC").
 		Limit(limit).Find(&rows).Error
 	return rows, err

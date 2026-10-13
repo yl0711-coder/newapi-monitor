@@ -84,15 +84,43 @@ func retainSub2OmittedUsageHours(existing, incoming []ChannelUpstreamUsageHour) 
 	return retained, nil
 }
 
-// Sub2API tail reads today, not yesterday. While older history is pending,
+// Correlated lookups use the existing (domain,hour_ts) key and only yesterday.
+// No rows means no authority to extend an account's collection history. A
+// verified day is either 24 disjoint hourly buckets or one natural-day bucket.
+const sub2UnverifiedYesterdaySQL = `
+ EXISTS (SELECT 1 FROM channel_upstream_usage_hours u
+   WHERE u.domain=channel_upstream_accounts.domain AND u.provider='sub2api'
+   AND u.hour_ts>=? AND u.hour_ts<?)
+ AND NOT EXISTS (SELECT 1 FROM channel_upstream_usage_hours u
+   WHERE u.domain=channel_upstream_accounts.domain AND u.provider='sub2api'
+   AND u.hour_ts>=? AND u.hour_ts<?
+   GROUP BY u.domain
+   HAVING COUNT(*) IN (1,24) AND SUM(u.bucket_seconds)=86400
+   AND MIN(CASE WHEN u.source_kind='sub2api_day_verified' AND COALESCE(u.provisional,0)=0
+     AND u.fetched_at>=? AND
+     ((u.bucket_seconds=3600 AND u.hour_ts%3600=0) OR
+      (u.bucket_seconds=86400 AND u.hour_ts=?)) THEN 1 ELSE 0 END)=1)
+`
+
+// Sub2API tail reads today, not yesterday. Independently of history completion,
 // finish yesterday first, once, on the SAME due history lane and request
 // budget. A failed verification uses the existing history backoff. No cursor
 // rewind, extra worker, schema change or request on page reads is needed.
 func (m *Monitor) prioritizeSub2RecentUsage(ctx context.Context, row ChannelUpstreamAccount, now int64, plan upstreamUsageSyncPlan) (upstreamUsageSyncPlan, error) {
 	today := cstDayStart(now)
 	yesterday := today - 86400
-	if row.Provider != upstreamProviderSub2API || plan.backfillTo <= plan.backfillFrom || plan.backfillFrom >= yesterday {
+	if row.Provider != upstreamProviderSub2API || plan.backfillTo <= plan.backfillFrom ||
+		(!plan.recentOnly && plan.backfillFrom >= yesterday) {
 		return plan, nil
+	}
+	pending := hasSub2PendingCloseout(row)
+	if pending {
+		day, err := sub2PendingCloseoutDay(row, now)
+		if err != nil {
+			return plan, err
+		}
+		yesterday, today = day, day+86400
+		plan.backfillFrom, plan.backfillTo, plan.recentOnly = yesterday, today, true
 	}
 	var hours []ChannelUpstreamUsageHour
 	if err := m.storeDB.WithContext(ctx).Where("domain = ? AND hour_ts >= ? AND hour_ts < ?", row.Domain, yesterday, today).
@@ -102,18 +130,30 @@ func (m *Monitor) prioritizeSub2RecentUsage(ctx context.Context, row ChannelUpst
 	// Do not silently extend an account's collection start or fill a wholly
 	// absent day. This path only closes a day already collected by the tail.
 	if len(hours) == 0 {
+		if pending {
+			return plan, fmt.Errorf("Sub2API 待核验日期的原账单缺失，保留任务，不自动扩大采集范围")
+		}
+		if plan.recentOnly {
+			plan.backfillFrom, plan.backfillTo, plan.recentOnly = 0, 0, false
+		}
 		return plan, nil
 	}
 	cursor := yesterday
+	valid := len(hours) == 1 || len(hours) == 24
 	for _, hour := range hours {
-		if hour.Provider != upstreamProviderSub2API || hour.HourTs != cursor || hour.BucketSeconds <= 0 ||
+		if hour.Provider != upstreamProviderSub2API || hour.HourTs != cursor ||
+			(hour.BucketSeconds != 3600 && (hour.BucketSeconds != 86400 || hour.HourTs != yesterday)) ||
 			hour.Provisional || hour.SourceKind != sub2VerifiedDaySource || hour.FetchedAt < today {
+			valid = false
 			break
 		}
 		cursor += hour.BucketSeconds
 	}
-	if cursor != today {
+	if !valid || cursor != today {
 		plan.backfillFrom, plan.backfillTo, plan.recentOnly = yesterday, today, true
+	} else if plan.recentOnly {
+		plan.backfillFrom, plan.backfillTo, plan.recentOnly = 0, 0, false
+		plan.closeoutResolved = pending
 	}
 	return plan, nil
 }

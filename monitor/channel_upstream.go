@@ -1165,13 +1165,15 @@ func upstreamUsageHistoryPhase(row ChannelUpstreamAccount, s Settings) string {
 		return upstreamStatusDisabled
 	case row.UsageStatus == upstreamStatusError || row.UsageStatus == upstreamStatusReconnect || row.UsageStatus == upstreamStatusUnsupported:
 		return "blocked"
-	case row.UsageBackfillDone:
+	case row.UsageBackfillDone && !hasSub2PendingCloseout(row):
 		return "complete"
 	case row.UsageBackfillNextSyncAt == upstreamAccountIsolatedUntil:
 		return "paused"
 	case row.UsageBackfillLastError != "":
 		return "retry"
 	case row.UsageBackfillLastAttemptAt == 0 && row.UsageBackfillLastSuccessAt == 0:
+		return "queued"
+	case hasSub2PendingCloseout(row):
 		return "queued"
 	case row.UsageBackfillProgress != "":
 		return "paging"
@@ -2641,6 +2643,9 @@ func migrateLegacyUpstreamEconomicUnitEvidence(db *gorm.DB) error {
 		  AND quota / cost_usd <= 1000000000000000000`).Error
 }
 
+// This row preserves a conversion boundary, not a collected usage bucket.
+const upstreamUsageSourceUnitBoundary = "newapi_unit_boundary"
+
 // reconcileUpstreamEconomicUnitTx preserves the conversion evidence already
 // attached to historical rows. A newly observed account unit is forward
 // effective: it must not rewrite amounts that were derived under an older
@@ -2676,6 +2681,7 @@ func reconcileUpstreamEconomicUnitTx(tx *gorm.DB, previous ChannelUpstreamAccoun
 	marker := ChannelUpstreamUsageHour{
 		Domain: next.Domain, HourTs: openHour, BucketSeconds: 3600,
 		Provider: next.Provider, UnitPerUSD: previousEffectiveUnit, FetchedAt: effectiveAt,
+		SourceKind: upstreamUsageSourceUnitBoundary, Provisional: true,
 	}
 	if err := tx.Clauses(clause.OnConflict{
 		Columns:   []clause.Column{{Name: "domain"}, {Name: "hour_ts"}},
@@ -3475,7 +3481,11 @@ func (m *Monitor) saveChannelUpstreamHandler(c *gin.Context) {
 		row.UsageNextSyncAt, row.UsageConsecutiveFails = 0, 0
 		row.UsageBackfillNextSyncAt, row.UsageBackfillConsecutiveFails = 0, 0
 		row.UsageBackfillLastError = ""
-		row.UsageBackfillProgress = ""
+		// Reauthorizing the same identity resumes its original closed-day
+		// verification; it must not silently move that task to a newer day.
+		if !hasSub2PendingCloseout(row) {
+			row.UsageBackfillProgress = ""
+		}
 	}
 	if err := m.sealUpstreamAccountCredential(&row, credential); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "保存上游配置失败"})

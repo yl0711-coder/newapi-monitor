@@ -638,6 +638,11 @@ func projectUpstreamUsageBuckets(rows []ChannelUpstreamUsageHour, scope stabilit
 	}
 	aggregates := make(map[string]*aggregate)
 	for _, row := range rows {
+		// Configuration evidence must not count as a zero bill, coverage, or
+		// freshness. Real collection replaces this marker while keeping its unit.
+		if row.SourceKind == upstreamUsageSourceUnitBoundary {
+			continue
+		}
 		account, configured := accounts[row.Domain]
 		if !configured || !account.UsageSyncEnabled || row.Provider != account.Provider {
 			continue
