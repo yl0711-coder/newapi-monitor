@@ -3,10 +3,12 @@ package monitor
 import (
 	"context"
 	"errors"
+	"path/filepath"
 	"reflect"
 	"testing"
 	"time"
 
+	"github.com/glebarez/sqlite"
 	"gorm.io/gorm"
 )
 
@@ -309,18 +311,51 @@ func TestUpstreamTokenPipelineConfigChangeReactivatesCooldown(t *testing.T) {
 
 func TestSub2TokenPipelinePreparationTimeoutDoesNotBlockPublication(t *testing.T) {
 	f, now := tokenWorkerFixture(t, false)
-	tokenPipelineStore(t, f)
-	if err := f.m.storeDB.Where("day_ts<>?", f.day).Delete(&ChannelUpstreamTokenScanCheckpoint{}).Error; err != nil {
+	// Cancellation may discard a driver connection. A shared-memory SQLite DB
+	// disappears when its last connection closes; production uses a file. Copy
+	// this fixture to a private file before testing deadline recovery.
+	path := filepath.Join(t.TempDir(), "pipeline.db")
+	if err := f.m.storeDB.Exec("VACUUM main INTO ?", path).Error; err != nil {
 		t.Fatal(err)
 	}
-	f.m.channelCostBindingMu.Lock()
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	db, err := gorm.Open(sqlite.Open(path), &gorm.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sqlDB, err := db.DB()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = sqlDB.Close() })
+	f.m.storeDB = db
+	tokenPipelineStore(t, f)
+	money := tokenPublishedSnapshot(t, f)
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	f.m.syncDueUpstreamTokenWorkAt(ctx, now)
-	f.m.channelCostBindingMu.Unlock()
+	key := ChannelUpstreamTokenWorkState{Domain: f.account.Domain, AccountEpoch: newAPIUpstreamAccountEpoch(f.account), Kind: "cost_day", DayTs: f.day, ChannelID: 185}
+	did, err := f.m.runUpstreamTokenWork(ctx, key, 0, now, func() (string, bool, error) {
+		// Enter the preparation deadline path only AFTER the work is claimed.
+		// No 30 ms race against scheduler/fixture SQL on a busy CI runner.
+		prepCtx, stop := context.WithDeadline(ctx, time.Now().Add(-time.Second))
+		defer stop()
+		_, prepErr := f.m.prepareSub2TokenHistoricalCostDay(prepCtx, f.account.Domain, 185, f.day, now)
+		if !errors.Is(prepErr, context.DeadlineExceeded) {
+			t.Fatalf("expected preparation deadline, got %v", prepErr)
+		}
+		cancel() // finishing the claim must survive parent cancellation as well
+		// Force connection retirement: a file-backed store must retain the claim.
+		sqlDB.SetMaxIdleConns(0)
+		return "retry", true, prepErr
+	})
+	if !did || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatal("deadline path was not exercised", did, err)
+	}
 	s := tokenPipelineState(t, f, "cost_day", f.day, 185)
-	if s.Attempts != 1 || s.Status != "retry" || s.LeaseUntil != 0 {
+	if s.Attempts != 1 || s.Status != "retry" || s.LeaseUntil != 0 || s.NextAttemptAt != now+60 {
 		t.Fatal("timeout cooldown not durable", s)
+	}
+	if tokenPublishedSnapshot(t, f) != money {
+		t.Fatal("failed preparation changed money or queued publications")
 	}
 	f.m.syncDueChannelEconomicsAt(context.Background(), now)
 	tokenCostAssertCount(t, f, &ChannelEconomicsHourManifestPublication{}, 8)
