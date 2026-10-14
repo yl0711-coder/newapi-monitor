@@ -188,7 +188,7 @@
   .logwrap{overflow-x:auto}
   .logtable{min-width:1626px;table-layout:fixed}
   .logtable th,.logtable td{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-  .logtable col.c-time{width:150px}.logtable col.c-mem{width:200px}.logtable col.c-tok{width:180px}
+  .logtable col.c-time{width:180px}.logtable col.c-mem{width:200px}.logtable col.c-tok{width:180px}
   .logtable col.c-grp{width:120px}.logtable col.c-type{width:70px}.logtable col.c-mdl{width:180px}
   .logtable col.c-dur{width:170px}.logtable col.c-numq{width:140px}.logtable col.c-num{width:100px}.logtable col.c-cost{width:120px}.logtable col.c-detail{width:220px}
   /* 成员列(首列)锁左:横向滚动查看其它列时,始终知道这行是谁的记录 */
@@ -204,17 +204,27 @@
   .log-expand-td{background:var(--bg);padding:0!important;overflow:visible}
   .log-expand-inner{position:sticky;left:0;padding:10px 16px 12px 40px;box-sizing:border-box}
   .log-desc{display:flex;flex-direction:column}
-  .dr-row{display:grid;grid-template-columns:110px minmax(0,1fr);gap:16px;padding:5px 0;font-size:12.5px;border-bottom:1px solid rgba(120,130,150,.08)}
+  .dr-row{display:grid;grid-template-columns:clamp(110px,24vw,180px) minmax(0,1fr);gap:16px;padding:5px 0;font-size:12.5px;border-bottom:1px solid rgba(120,130,150,.08);white-space:normal;line-height:1.6}
+  .log-billing-advanced{margin:10px 0;padding:8px 12px;border:1px solid rgba(120,130,150,.18);border-radius:8px}
+  .log-billing-advanced summary{cursor:pointer;color:var(--muted);font-size:12px;line-height:1.6}
   .dr-row:last-child{border-bottom:none}
-  .dr-label{color:var(--muted);font-size:12px;text-align:right}
+  .dr-label{min-width:0;color:var(--muted);font-size:12px;text-align:right;white-space:normal;overflow-wrap:anywhere}
   /* 只在整段词放不下时才硬断(break-word),不能用 break-all:计费公式里的
      "补全 1500 tokens" 会被拦腰断成"补全 1"+"500 tokens",看着像两个不同的数 */
-  .dr-value{min-width:0;overflow-wrap:break-word;word-break:normal}
+  .dr-value{min-width:0;white-space:normal;overflow-wrap:break-word;word-break:normal}
   .dr-value.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
   /* 令牌/模型列内容常较长,不截断,允许比其它数值列宽一些,靠横向滚动看全 */
   .logtable td.tok-cell,.logtable td.mdl{overflow:visible;text-overflow:clip;white-space:normal;word-break:break-all}
   /* 详情列(末列)锁右+单行截断；错误原文用页面内 Popover 悬停查看，列窄不占宽度。 */
   .logtable tr:not(.log-expand-row) td:last-child,.logtable th:last-child{position:sticky;right:0;z-index:2;background:var(--panel);box-shadow:-6px 0 8px -6px rgba(20,30,50,.16)}
+  /* 小屏保留横向滚动，不让两侧固定列遮住费用/Token；详情按标签、值上下排。 */
+  @media(max-width:600px){
+    .logtable tr:not(.log-expand-row) td:first-child,.logtable th:first-child,
+    .logtable tr:not(.log-expand-row) td:last-child,.logtable th:last-child{position:static;box-shadow:none}
+    .log-expand-inner{padding:12px}
+    .log-expand-inner .dr-row{grid-template-columns:minmax(0,1fr);gap:3px;padding:8px 0}
+    .log-expand-inner .dr-label{text-align:left}
+  }
   .logtable thead th:last-child{z-index:4;background:var(--th-bg)}
   /* 详情列:多行堆叠,首行深色/其余灰色小字,每行各自单行截断+省略号(对齐 new-api web/classic
      renderCompactDetailSummary,不是"首行+个数"标签) */
@@ -259,6 +269,8 @@
   .log-token-main{font-variant-numeric:tabular-nums}
   .log-token-cache{margin-top:2px;color:var(--muted);font-size:11.5px;line-height:1.25;white-space:nowrap;font-variant-numeric:tabular-nums}
   .log-cost{font-variant-numeric:tabular-nums}
+  .logtable td.log-cost{white-space:normal;overflow-wrap:anywhere}
+  .log-timing{display:flex;flex-wrap:wrap;gap:3px;align-items:center;white-space:normal}
   .lognote{color:var(--muted);font-size:12px;margin:10px 2px 0;line-height:1.6}
   /* 导出进度弹窗 */
   .exp-bar{height:8px;background:var(--panel);border-radius:5px;overflow:hidden;margin:16px 0 8px}
@@ -351,7 +363,7 @@
       <input class="cbox-input" id="logGroupQ" placeholder="全部分组" autocomplete="off" readonly onfocus="this.removeAttribute('readonly')">
       <div class="cbox-pop" id="logGroupPop"></div>
     </div>
-    <select id="logType"><option value="">全部类型</option><option value="1">充值</option><option value="2">消费</option><option value="3">管理</option><option value="4">系统</option><option value="5">错误</option><option value="6">退款</option></select>
+    <select id="logType"><option value="">全部类型</option><option value="1">充值</option><option value="2">消费</option><option value="3">管理</option><option value="4">系统</option><option value="5">错误</option><option value="6">退款</option><option value="7">登录</option></select>
     <input id="logToken" placeholder="令牌名（精确）" style="width:150px" autocomplete="off">
     <input id="logDetailKw" placeholder="详情关键字搜索" style="width:150px" maxlength="64" autocomplete="off">
     <input id="logRequestId" placeholder="Request ID" style="width:150px" maxlength="64" autocomplete="off">
@@ -363,7 +375,10 @@
         · 按当前筛选条件导出,时间范围最长一年<br>
         · 单次最多 5 万条;超出会先确认,导出最新 5 万条,更早的请缩小范围分段导<br>
         · 每 5 分钟可导出 1 次(仅成功下载计次)<br>
-        · UTF-8 CSV,Excel / WPS 直接打开不乱码
+        · 时间为北京时间（UTC+8），费用单位为美元，保留 6 位小数<br>
+        · 金额按原始日志展示；请结合“金额性质”和“计费来源”区分消费、退款与订阅抵扣，不直接混合求和<br>
+        · 缓存分项不可直接与输入 Tokens 相加；计价依据请看“费用计算说明”，不适用或未记录的字段留空<br>
+        · UTF-8 CSV，常用字段独立成列；“费用计算说明”和“补充详情”可在 Excel / WPS 中开启自动换行
       </span>
     </span>
   </div>
@@ -372,14 +387,15 @@
       <table class="logtable">
         <colgroup><col class="c-mem"><col class="c-time"><col class="c-tok"><col class="c-grp"><col class="c-type"><col class="c-mdl"><col class="c-dur"><col class="c-numq"><col class="c-num"><col class="c-cost"><col class="c-detail"></colgroup>
         <thead><tr><th>成员</th><th>时间</th><th>令牌</th><th>分组</th><th>类型</th><th>模型</th><th>用时/首字</th>
-          <th class="right">输入<span class="th-help" tabindex="0">?<span class="tip">根据 Anthropic 协定,/v1/messages 的输入 tokens 仅统计非缓存输入,不包含缓存读取与缓存写入 tokens。</span></span></th>
-          <th class="right">输出</th><th class="right">花费</th><th>详情</th></tr></thead>
+          <th class="right">输入<span class="th-help" tabindex="0">?<span class="tip">保留本条日志的输入 Tokens 原值。不同计量口径下，缓存可能已包含在输入中；不能仅凭请求路径判断，也不要将缓存分项再次累加。可展开详情查看本条计费依据。</span></span></th>
+          <th class="right">输出</th><th class="right">费用（美元）</th><th>详情</th></tr></thead>
         <tbody id="logTb"></tbody>
       </table>
     </div>
     <div class="pager" id="logPager" style="padding:12px 14px"></div>
   </div>
-  <p class="lognote">· 仅含本公司成员的 充值/消费/管理/系统/错误/退款 日志(不含请求/响应内容及内部信息)· 时间倒序 · 时间窗口最多一年<br>
+  <p class="lognote">· 时间为北京时间（UTC+8）；输入/输出为日志记录的 Tokens，缓存分项不可直接再次累加。金额按原始日志类型展示；退款不算消费，订阅抵扣不等于钱包扣款，空值不代表零费用。<br>
+    · 点击成员前的箭头可查看用量、费用依据与请求状态。仅含本公司成员的日志，不含请求/响应内容及内部信息；时间倒序，时间窗口最多一年。<br>
     · CSV 单次最多导出 5 万条,超出将导最新 5 万条;导出限每 5 分钟 1 次,超量请缩小范围分段导</p>
 </div>
 
@@ -1060,7 +1076,7 @@ function showView(v){
   $('logsBar').style.display=logs?'flex':'none';
   $('statBar').style.display=logs?'none':'';
   $('logsView').style.display=logs?'block':'none';
-  if(logs){$('listView').style.display='none';$('detail').style.display='none';}
+  if(logs){$('listView').style.display='none';$('detail').style.display='none';resizeLogDetails();}
   else{ if(detailUid){$('detail').style.display='block';$('listView').style.display='none';}
         else{$('detail').style.display='none';$('listView').style.display='';} }
   if(logs&&(!logsLoaded||logDirty)){logsLoaded=true;logDirty=false;loadLogs(true);}
@@ -1069,9 +1085,9 @@ document.querySelectorAll('#vnav a').forEach(a=>a.onclick=()=>showView(a.dataset
 
 // 日志时间固定按 Asia/Shanghai 展示，不跟随访问者电脑时区。
 function fmtLogTime(ts){const d=new Date(ts*1000+8*3600*1000),p=n=>String(n).padStart(2,'0');
-  return `${p(d.getUTCMonth()+1)}-${p(d.getUTCDate())} ${p(d.getUTCHours())}:${p(d.getUTCMinutes())}:${p(d.getUTCSeconds())}`;}
+  return `${d.getUTCFullYear()}-${p(d.getUTCMonth()+1)}-${p(d.getUTCDate())} ${p(d.getUTCHours())}:${p(d.getUTCMinutes())}:${p(d.getUTCSeconds())}`;}
 // 类型小标(1充值/2消费/3管理/4系统/5错误/6退款)
-const LOG_TYPE={1:['充值','tp-topup'],2:['消费','tp-consume'],3:['管理','tp-manage'],4:['系统','tp-system'],5:['错误','tp-error'],6:['退款','tp-refund']};
+const LOG_TYPE={1:['充值','tp-topup'],2:['消费','tp-consume'],3:['管理','tp-manage'],4:['系统','tp-system'],5:['错误','tp-error'],6:['退款','tp-refund'],7:['登录','tp-other']};
 function typeTag(t){const m=LOG_TYPE[t]||['其它','tp-other'];return `<span class="tp ${m[1]}">${m[0]}</span>`;}
 // 耗时/首字延迟颜色分级,阈值对齐 new-api web/classic renderUseTime/renderFirstUseTime:
 // 总耗时(秒):<101绿 <300黄 其余红;首字延迟(秒):<3绿 <10黄 其余红
@@ -1085,27 +1101,56 @@ function frtVariant(sec){return sec<3?'ok':sec<10?'warn':'bad';}
 // 用时/首字:总耗时+(流式再显首字)+流/非流,单行圆形胶囊并排(对齐 new-api web/classic
 // renderUseTime/renderFirstUseTime/renderIsStream 三个 Tag 并排,无出字速度这类额外信息)。
 function timeCell(r){
-  const hasInfo=r.use_time>0||r.is_stream;
-  if(!hasInfo)return '<span class="muted">—</span>';
-  const total=r.use_time>0?`<span class="tb ${timeColorClass(respTimeVariant(r.use_time))}">${r.use_time} s</span>`:'';
+  if(![2,5].includes(r.type))return '<span class="muted">—</span>';
+  const total=Number.isFinite(r.use_time)&&r.use_time>=0?`<span class="tb ${timeColorClass(respTimeVariant(r.use_time))}">耗时 ${formatLogDuration(r.use_time)}</span>`:'';
   if(r.is_stream){
-    const frt=r.first_byte_ms>0?`<span class="tb ${timeColorClass(frtVariant(r.first_byte_ms/1000))}">${(r.first_byte_ms/1000).toFixed(1)} s</span>`:'<span class="tb tb-na">N/A</span>';
-    return `${total}${frt}<span class="tb tb-stream">流</span>`;
+    const evidence=r.first_byte_evidence;
+    const ms=evidence?(evidence.state==='valid'&&typeof evidence.value==='string'&&evidence.value.trim()!==''?Number(evidence.value):NaN):Number(r.first_byte_ms);
+    const valid=Number.isFinite(ms)&&ms>0;
+    const frt=valid?`<span class="tb ${timeColorClass(frtVariant(ms/1000))}" title="首字延迟 ${ms} 毫秒">首字 ${formatLogDuration(ms/1000)}</span>`:'<span class="tb tb-na">首字 不适用</span>';
+    return `<div class="log-timing">${total}${frt}<span class="tb tb-stream">流式</span></div>`;
   }
-  return `${total}<span class="tb tb-nostream">非流</span>`;
+  return `<div class="log-timing">${total}<span class="tb tb-nostream">非流式</span></div>`;
+}
+function formatLogDuration(sec){
+  return sec<60?`${sec.toFixed(1)}s`:`${Math.floor(sec/60)}m ${(sec%60).toFixed(0)}s`;
 }
 function logTokenNumber(v){
+  if(typeof v==='string'&&/^\d+$/.test(v))return v.replace(/\B(?=(\d{3})+(?!\d))/g,',');
   const n=Number(v);
-  return Number.isFinite(n)?String(Math.trunc(n)):DASH;
+  return Number.isFinite(n)?Math.trunc(n).toLocaleString('en-US'):DASH;
+}
+function logRecordedToken(r,output){
+  if(![0,2,5,6].includes(r.type))return DASH;
+  if(r.source_facts&&!(output?r.source_facts.completion_present:r.source_facts.prompt_present))return DASH;
+  return logTokenNumber(output?r.completion_tokens:r.prompt_tokens);
+}
+function logRecordedCost(r){
+  if(![0,2,5,6].includes(r.type)||(r.source_facts&&!r.source_facts.quota_present))return DASH;
+  const amount=logCostUSD(r.cost_usd);
+  const main=r.billing_source==='subscription'?`<span class="tb tb-stream" title="订阅抵扣：${esc(amount)}（额度折美元，非钱包扣款）">订阅</span>`:amount;
+  return main+(r.has_tool_surcharge?'<span class="tb tb-na" title="原始费用已含工具调用附加费，不重复加算">工具费 +</span>':'');
 }
 function logInputCell(r){
-  const cache=Number(r.cache_read_tokens)||0;
-  return `<div class="log-token-main">${logTokenNumber(r.prompt_tokens)}</div>`
-    +(cache>0?`<div class="log-token-cache">缓存读 ${fmtNum(cache)}</div>`:'');
+  if(![0,2,5,6].includes(r.type))return DASH;
+  let cache='';
+  for(const [key,fallback,label] of [['cache_read','cache_read_tokens','缓存读'],['cache_write','cache_write_tokens','缓存创建']]){
+    const c=r.usage_details?.[key];
+    const value=c?(c.state==='valid'?c.value:''):r[fallback];
+    if(value!==''&&value!=null&&String(value)!=='0'&&Number(value)>0){
+      const name=c?.source==='split_only'?`${label}小计`:label;
+      cache+=`<div class="log-token-cache">${name} ${esc(logTokenNumber(value))}</div>`;
+    }
+  }
+  return `<div class="log-token-main">${logRecordedToken(r,false)}</div>`+cache;
 }
 function logCostUSD(v){
   const n=Number(v);
   return Number.isFinite(n)?`$${n.toFixed(6)}`:DASH;
+}
+// 开着的新页面可能遇到已回滚的旧后端。旧接口退款零值/type=7 语义不同，不能继续渲染或导出。
+function logContractError(d){
+  return d&&d.log_contract===1?'':'使用日志页面与服务版本不一致，请刷新页面后重试。';
 }
 // 当前筛选拼成查询串(member/model/group/type/token),供查看与导出共用
 function logQuery(){
@@ -1139,6 +1184,12 @@ async function loadLogs(reset){
     const d=await api(`/api/logs?${logQuery()}&cursor=${cursor}`,{signal:logAbort.signal});
     if(seq!==logSeq)return;
     if(!d.ok){$('logTb').innerHTML=`<tr><td colspan="11" class="muted" style="text-align:center;padding:22px">${esc(d.error||'加载失败')}</td></tr>`;$('logPager').innerHTML='';return;}
+    const contractError=logContractError(d);
+    if(contractError){
+      hideLogRawTip();logRowsCache=[];logStack=[0];logTotal=null;logHasMore=false;logNextCursor=0;
+      $('logTb').innerHTML=`<tr><td colspan="11" class="muted" style="text-align:center;padding:22px">${esc(contractError)}</td></tr>`;
+      $('logPager').innerHTML='';return;
+    }
     logHasMore=!!d.has_more;logNextCursor=d.next_cursor||0;
     renderLogRows(d.rows||[]);
     renderLogPager();
@@ -1171,8 +1222,8 @@ function renderLogRows(rows){
       +`<td class="mdl">${r.model_name?esc(r.model_name):DASH}</td>`
       +`<td>${timeCell(r)}</td>`
       +`<td class="right num">${logInputCell(r)}</td>`
-      +`<td class="right num">${logTokenNumber(r.completion_tokens)}</td>`
-      +`<td class="right num log-cost">${(r.type===2||r.type===5)?logCostUSD(r.cost_usd):DASH}</td>`
+      +`<td class="right num">${logRecordedToken(r,true)}</td>`
+      +`<td class="right num log-cost">${logRecordedCost(r)}</td>`
       +`<td class="dtl-cell">${detail}</td></tr>`
       +`<tr class="log-expand-row" data-idx="${i}" style="display:none"><td colspan="11" class="log-expand-td"></td></tr>`;
   }).join('');
@@ -1233,7 +1284,7 @@ $('logTb').addEventListener('mouseover',e=>{
 $('logTb').addEventListener('mouseout',e=>{
   const source=e.target.closest('.dtl-raw[data-raw-tip]');
   const next=e.relatedTarget;
-  if(source===logRawTipSource&&!(next&&(source.contains(next)||(logRawTip&&logRawTip.contains(next))))){
+  if(source&&source===logRawTipSource&&!(next&&(source.contains(next)||(logRawTip&&logRawTip.contains(next))))){
     scheduleLogRawTipClose();
   }
 });
@@ -1243,7 +1294,7 @@ $('logTb').addEventListener('focusin',e=>{
 });
 $('logTb').addEventListener('focusout',e=>{
   const source=e.target.closest('.dtl-raw[data-raw-tip]');
-  if(source===logRawTipSource)scheduleLogRawTipClose();
+  if(source&&source===logRawTipSource)scheduleLogRawTipClose();
 });
 window.addEventListener('scroll',hideLogRawTip,true);
 window.addEventListener('resize',hideLogRawTip);
@@ -1257,15 +1308,44 @@ function detailRow(label,value,mono){
 function detailRowPre(label,value){
   return `<div class="dr-row"><span class="dr-label">${label}</span><span class="dr-value" style="white-space:pre-line">${value}</span></div>`;
 }
-// 行内展开区内容:字段列表与出现顺序严格对齐 new-api web/classic useUsageLogsData.jsx setLogsFormat
-// 的【非管理员】分支(渠道信息/拦截原因/流状态/请求转换/计费模式等管理员专属字段,普通客户端本就看不到,
-// 后端天然不产出这些字段,故此处不写这些分支)。
+function renderUsageLogEvidence(details,technicalFormula){
+  if(!details)return '';
+  let html='',advanced='';
+  if(details.notice)html+=detailRowPre('计费记录说明',esc(details.notice));
+  const verified=details.billing?.state==='matched'&&!details.legacy_formula_unsafe;
+  if(verified&&details.billing?.readable)html+=detailRowPre('计费过程',esc(details.billing.readable));
+  if(details.billing?.message){
+    if(verified)advanced+=detailRowPre('公式核验',esc(details.billing.message));
+    else html+=detailRowPre('费用说明',esc(details.billing.message));
+  }
+  if(verified&&technicalFormula)advanced+=detailRowPre('技术核验过程',esc(technicalFormula));
+  if(Array.isArray(details.items))for(const item of details.items){
+    const row=detailRow(esc(item.label||''),esc(item.value??''),item.state==='valid');
+    if((item.label||'').includes('倍率'))advanced+=row;
+    else html+=row;
+  }
+  if(advanced)html+=`<details class="log-billing-advanced"><summary>查看详细计费依据（可选）</summary>${advanced}</details>`;
+  return html;
+}
+// 客户详情：rc26 的流式状态采用后端安全投影；不包含管理员请求转换链、渠道、重试信息。
 function buildLogDetailDesc(idx){
   const r=logRowsCache[idx];if(!r)return '';
   let html='';
   if(r.request_id)html+=detailRow('Request ID',esc(r.request_id),true);
-  if(r.cache_read_tokens>0)html+=detailRow('缓存 Tokens',fmtNum(r.cache_read_tokens),true);
-  if(r.cache_write_tokens>0)html+=detailRow('缓存创建 Tokens',fmtNum(r.cache_write_tokens),true);
+  if(r.ip)html+=detailRow('IP 地址',esc(r.ip),true);
+  if(r.source_field_notice)html+=detailRowPre('字段说明',esc(r.source_field_notice));
+  if([0,2,5,6].includes(r.type)){
+    html+=detailRow('输入 / 输出 Tokens（日志原值）',`${logRecordedToken(r,false)} / ${logRecordedToken(r,true)}`,true);
+    const recorded=r.source_facts&&!r.source_facts.quota_present?DASH:logCostUSD(r.cost_usd);
+    html+=detailRow(r.type===6?'退款金额（美元）':r.billing_source==='subscription'?'订阅抵扣（额度折美元）':'记录费用（美元）',recorded,true);
+  }
+  if(r.type===5)html+=detailRowPre('费用说明','此行为错误记录，不能据此判断是否另有消费扣费；可结合相同 Request ID 的消费记录核对。');
+  if(![2,5,6].includes(r.type)&&r.detail)html+=detailRowPre('日志详情',esc(r.detail));
+  if([2,5,7].includes(r.type)&&Array.isArray(r.request_details))for(const item of r.request_details){
+    html+=detailRow(esc(item.label||''),esc(item.value??''),item.state==='valid');
+  }
+  if(!r.usage_details&&r.cache_read_tokens>0)html+=detailRow('缓存 Tokens',fmtNum(r.cache_read_tokens),true);
+  if(!r.usage_details&&r.cache_write_tokens>0)html+=detailRow('缓存创建 Tokens',fmtNum(r.cache_write_tokens),true);
   if(r.type===2){
     if(r.log_content)html+=detailRow('日志详情',esc(r.log_content));
     if(r.other_content)html+=detailRowPre('其他详情',esc(r.other_content));
@@ -1273,22 +1353,29 @@ function buildLogDetailDesc(idx){
       html+=detailRow('请求并计费模型',esc(r.model_name||''));
       html+=detailRow('实际模型',esc(r.upstream_model_name||''));
     }
-    if(r.billing_process)html+=detailRowPre('计费过程',esc(r.billing_process));
-    if(r.reasoning_effort)html+=detailRow('Reasoning Effort',esc(r.reasoning_effort));
+    if(!r.usage_details&&r.billing_process)html+=`<details class="log-billing-advanced"><summary>查看详细计费依据（可选）</summary>${detailRowPre('计费过程',esc(r.billing_process))}</details>`;
+    html+=renderUsageLogEvidence(r.usage_details,r.billing_process);
+    if(r.reasoning_effort)html+=detailRow('推理强度（Reasoning Effort）',esc(r.reasoning_effort));
   }
   if(r.type===5&&r.detail)html+=detailRowPre('错误详情',esc(r.detail));
   if(r.type===6){
     if(r.task_id)html+=detailRow('任务ID',esc(r.task_id),true);
     if(r.refund_reason)html+=detailRowPre('失败原因',esc(r.refund_reason));
   }
-  if(r.request_path)html+=detailRow('请求路径',esc(r.request_path),true);
   if(r.param_override&&r.param_override.length)html+=detailRowPre('参数覆盖',esc(r.param_override.join('\n')));
   if(r.sub_plan)html+=detailRow('订阅套餐',esc(r.sub_plan));
   if(r.sub_instance)html+=detailRow('订阅实例',esc(r.sub_instance));
   if(r.sub_settlement)html+=detailRowPre('订阅结算',esc(r.sub_settlement));
   if(r.sub_remain)html+=detailRow('订阅剩余',esc(r.sub_remain));
-  if(r.billing_source==='subscription')html+=detailRowPre('订阅说明','token 会按倍率换算成"额度/次数"，请求结束后再做差额结算（补扣/返还）。');
+  if(r.billing_source==='subscription')html+=detailRowPre('订阅说明','token 按倍率换算成额度/次数，请求结束后差额结算（补扣/返还）；不等同于钱包现金扣款。');
   return `<div class="log-desc">${html||'<span class="muted">无更多信息</span>'}</div>`;
+}
+function resizeLogDetails(){
+  const wrap=document.querySelector('.logwrap');
+  const width=wrap?.clientWidth;
+  // 隐藏页签宽度为 0 时保留原宽度；不重建内容、请求数据或改变展开状态。
+  if(!Number.isFinite(width)||width<=0)return;
+  wrap.querySelectorAll('.log-expand-inner').forEach(el=>{el.style.width=`${width}px`;});
 }
 $('logTb').addEventListener('click',e=>{
   const btn=e.target.closest('.log-expand');
@@ -1374,13 +1461,14 @@ function beginNativeExport(ticket,confirm){
   setExpBar(1);expStatus('已交给浏览器下载','文件由浏览器直接写入磁盘,不会占用页面内存');
   $('expCancel').textContent='关闭';$('expCancel').disabled=false;
   const q=new URLSearchParams({ticket});if(confirm)q.set('confirm','1');
-  const a=document.createElement('a');a.href='/api/logs/export?'+q.toString();a.download='usage-logs.csv';a.hidden=true;
+  const a=document.createElement('a');a.href='/api/logs/export/v1?'+q.toString();a.download='usage-logs.csv';a.hidden=true;
   document.body.appendChild(a);a.click();a.remove();
   exporting=false;expCtrl=null;$('expBtn').disabled=false;
   setTimeout(closeExp,1800);
 }
 async function startExport(){
   if(exporting)return;
+  pendingExportTicket='';
   exporting=true;expHeaders=false;
   $('expBtn').disabled=true;
   $('expTitle').textContent='正在导出';
@@ -1401,6 +1489,8 @@ async function startExport(){
     const r=await fetch(`/api/logs/export/prepare?${logQuery()}`,{signal:ctrl.signal});
     const d=await r.json().catch(()=>({}));
     if(!r.ok||!d.ok){expFail(d.error||'导出失败');return;}
+    const contractError=logContractError(d);
+    if(contractError){expFail(contractError);return;}
     if(d.need_confirm){pendingExportTicket=d.ticket||'';closeExp();askExportConfirm(d.cap,d.total,d.total_exact!==false);return;}
     beginNativeExport(d.ticket,false);
   }catch(e){
@@ -1423,7 +1513,7 @@ function askExportConfirm(cap,total,totalExact){
 $('expConfirmNo').onclick=()=>{$('expConfirmMask').style.display='none';pendingExportTicket='';};
 $('expConfirmYes').onclick=()=>{const ticket=pendingExportTicket;pendingExportTicket='';$('expConfirmMask').style.display='none';beginNativeExport(ticket,true);};
 
-let _rz;window.addEventListener('resize',()=>{clearTimeout(_rz);_rz=setTimeout(()=>{[['trendChart',trendCh],['memberBar',memberCh],['modelPie',modelPieCh],['dModelPie',dModelPieCh],['groupPie',groupPieCh],['dailyChart',dailyChart]].forEach(([id,ch])=>resizeChart(ch,id));sizePortalMatrixUserColumn(portalMatrixUsers,(ov&&ov.matrix_available!==false?(ov.days||[]).length:0));},150);});
+let _rz;window.addEventListener('resize',()=>{clearTimeout(_rz);_rz=setTimeout(()=>{resizeLogDetails();[['trendChart',trendCh],['memberBar',memberCh],['modelPie',modelPieCh],['dModelPie',dModelPieCh],['groupPie',groupPieCh],['dailyChart',dailyChart]].forEach(([id,ch])=>resizeChart(ch,id));sizePortalMatrixUserColumn(portalMatrixUsers,(ov&&ov.matrix_available!==false?(ov.days||[]).length:0));},150);});
 load();
 </script>
 </body>
