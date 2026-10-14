@@ -12,12 +12,33 @@ test('actual CI matrix covers ordinary and non-letter tests, examples and fuzz s
 
 test('finance exclusions route tests to another shard rather than omit coverage', () => {
   assert.throws(() => verifyRaceShards(workflow.replace("            skip: '^TestFinanceGift'\n", ''), names.join('\n')), /belongs to 2/);
-  assert.throws(() => verifyRaceShards(workflow.replace("pattern: '^TestFinanceGiftScope'", "pattern: '^TestMissingScope'"), names.join('\n')), /belongs to 0/);
+  assert.throws(() => verifyRaceShards(workflow.replace("pattern: '^TestFinanceGift(Scope|Live|Progress)'", "pattern: '^TestMissingScope'"), names.join('\n')), /belongs to 0/);
   const shards = readRaceShards(workflow);
   for (const suffix of ['', 'Boundary', 'Future2027', '中文']) {
-    for (const prefix of ['TestFinanceGift', 'TestFinanceGiftScope', 'TestFinanceGiftHandoff']) {
+    for (const prefix of ['TestFinanceGift', 'TestFinanceGiftScope', 'TestFinanceGiftHandoff', 'TestFinanceGiftLarge', 'TestFinanceGiftLive', 'TestFinanceGiftProgress']) {
       const name = prefix + suffix;
       assert.equal(shards.filter(s => s.pattern.test(name) && !s.skip?.test(name)).length, 1, name);
+    }
+  }
+});
+
+test('timing-based redistribution keeps every moved family covered exactly once', () => {
+  const shards = readRaceShards(workflow);
+  const moved = { TestNginx: 'a-b', TestSub2: 'c-channel', TestModel: 'c-other', TestUpstream: 'd-e', TestFinanceGiftLarge: 'f-gift-handoff', TestFinanceGiftLive: 'f-gift-scope', TestFinanceGiftProgress: 'f-gift-scope' };
+  for (const [prefix, shard] of Object.entries(moved)) {
+    for (const suffix of ['', 'Future', '中文']) {
+      const name = prefix + suffix;
+      assert.deepEqual(shards.filter(s => s.pattern.test(name) && !s.skip?.test(name)).map(s => s.name), [shard]);
+    }
+  }
+  assert.match(workflow, /go test -race -list \. \.\/monitor/);
+  assert.match(workflow, /if test "\$TEST_SHARD" = d-e; then\s+go build/);
+  // The tests that require the prebuilt nginx collector must stay in d-e.
+  const sourceRoot = new URL('../../monitor/', import.meta.url);
+  for (const file of ['ecs_log_agent_integration_test.go', 'ecs_log_shutdown_process_test.go']) {
+    const text = readFileSync(new URL(file, sourceRoot), 'utf8');
+    for (const [, name] of text.matchAll(/^func (Test\w+)\(t \*testing\.T\)/gm)) {
+      assert.deepEqual(shards.filter(s => s.pattern.test(name) && !s.skip?.test(name)).map(s => s.name), ['d-e'], name);
     }
   }
 });

@@ -161,32 +161,35 @@ jobs:
       matrix:
         include:
           - shard: a-b
-            pattern: '^Test[A-B]'
+            pattern: '^Test([A-B]|Nginx)'
           - shard: c-channel
-            pattern: '^TestChannel'
+            pattern: '^Test(Channel|Sub2)'
           - shard: c-other
-            pattern: '^TestC'
+            pattern: '^Test(C|Model)'
             skip: '^TestChannel'
           - shard: d-e
-            pattern: '^Test[D-E]'
+            pattern: '^Test([D-E]|Upstream)'
           - shard: f-other
             pattern: '^TestF'
             skip: '^TestFinanceGift'
           - shard: f-gift-other
             pattern: '^TestFinanceGift'
-            skip: '^TestFinanceGift(Scope|Handoff)'
+            skip: '^TestFinanceGift(Scope|Handoff|Large|Live|Progress)'
           - shard: f-gift-handoff
-            pattern: '^TestFinanceGiftHandoff'
+            pattern: '^TestFinanceGift(Handoff|Large)'
           - shard: f-gift-scope
-            pattern: '^TestFinanceGiftScope'
+            pattern: '^TestFinanceGift(Scope|Live|Progress)'
           - shard: g-n
             pattern: '^Test[G-N]'
+            skip: '^Test(Nginx|Model)'
           - shard: o-r
             pattern: '^Test[O-R]'
           - shard: s
             pattern: '^TestS'
+            skip: '^TestSub2'
           - shard: t-z
             pattern: '^(Test[T-Z]|Test[^A-Z]|Test$|Example|Fuzz)'
+            skip: '^TestUpstream'
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -199,7 +202,7 @@ jobs:
         env:
           TEST_SHARD: ${{ matrix.shard }}
         run: |
-          go test -list . ./monitor | node dev/check-race-shards.mjs "$TEST_SHARD"
+          go test -race -list . ./monitor | node dev/check-race-shards.mjs "$TEST_SHARD"
       - name: Test monitor shard with race detector
         env:
           TEST_PATTERN: ${{ matrix.pattern }}
@@ -207,8 +210,12 @@ jobs:
           TEST_SHARD: ${{ matrix.shard }}
         run: |
           set -o pipefail
-          go build -o "$RUNNER_TEMP/nginxcollector" ./cmd/nginxcollector
-          MONITOR_TEST_NGINX_COLLECTOR_BIN="$RUNNER_TEMP/nginxcollector" go test -race -count=1 -json -timeout 20m -run "$TEST_PATTERN" -skip "$TEST_SKIP" ./monitor | tee "$RUNNER_TEMP/monitor-race-$TEST_SHARD.jsonl"
+          # Only the D/E shard contains real collector process tests.
+          if test "$TEST_SHARD" = d-e; then
+            go build -o "$RUNNER_TEMP/nginxcollector" ./cmd/nginxcollector
+            export MONITOR_TEST_NGINX_COLLECTOR_BIN="$RUNNER_TEMP/nginxcollector"
+          fi
+          go test -race -count=1 -json -timeout 20m -run "$TEST_PATTERN" -skip "$TEST_SKIP" ./monitor | tee "$RUNNER_TEMP/monitor-race-$TEST_SHARD.jsonl"
       - name: Summarize slow tests even on failure
         if: always()
         env:
