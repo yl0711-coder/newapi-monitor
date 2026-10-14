@@ -190,7 +190,7 @@ func portalLogDetailsFromEvidence(logType int, e portalLogEvidence) *portalLogDe
 			d.LegacyFormulaUnsafe = true
 		}
 	}
-	for _, key := range []string{"audio", "image", "ws", "audio_input_seperate_price", "image_generation_call", "web_search", "file_search"} {
+	for _, key := range []string{"audio", "image", "ws", portalAudioInputSeparatePriceKey, "image_generation_call", "web_search", "file_search"} {
 		if f := e.Flags[key]; f.State == portalEvidenceInvalid || f.State == portalEvidenceNull || f.Text == "true" {
 			d.LegacyFormulaUnsafe = true
 		}

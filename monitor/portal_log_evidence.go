@@ -58,6 +58,9 @@ type portalEvidenceRule struct {
 
 const portalEvidenceMaxBytes = 128 << 10
 
+// Preserve the historical upstream wire spelling; this is not a display label.
+const portalAudioInputSeparatePriceKey = "audio_input_seperate_price" //nolint:misspell // Upstream JSON compatibility.
+
 // Missing and malformed fields are retained as states, never silently made zero.
 // Only allowlisted fields are retained. Unknown/admin/raw content is discarded.
 func parsePortalLogEvidence(raw string) portalLogEvidence {
@@ -103,7 +106,7 @@ func parsePortalLogEvidence(raw string) portalLogEvidence {
 	for _, key := range strings.Fields("billing_mode billing_source matched_tier expr_b64 reasoning_effort task_id usage_semantic request_path subscription_plan_title") {
 		e.Strings[key] = portalEvidenceScalar(fields[key], "string")
 	}
-	for _, key := range strings.Fields("claude image audio ws is_task web_search file_search audio_input_seperate_price image_generation_call is_system_prompt_overwritten") {
+	for _, key := range append(strings.Fields("claude image audio ws is_task web_search file_search image_generation_call is_system_prompt_overwritten"), portalAudioInputSeparatePriceKey) {
 		e.Flags[key] = portalEvidenceScalar(fields[key], "bool")
 	}
 	e.ToolsState, e.Tools = portalEvidenceTools(fields["tool_surcharges"])

@@ -32,7 +32,7 @@ func checkPortalBilling(r LogRow, e portalLogEvidence) portalBillingCheck {
 	if e.ExtraBilling || e.ToolsState != portalEvidenceMissing || (source.State != portalEvidenceMissing && (source.State != portalEvidenceValid || source.Text != "wallet")) || e.Strings["task_id"].State != portalEvidenceMissing {
 		return unavailable("unsupported", "日志包含附加计费或结算信息，暂不套用普通文本公式。")
 	}
-	for _, key := range []string{"image", "audio", "ws", "is_task", "web_search", "file_search", "audio_input_seperate_price", "image_generation_call"} {
+	for _, key := range []string{"image", "audio", "ws", "is_task", "web_search", "file_search", portalAudioInputSeparatePriceKey, "image_generation_call"} {
 		f := e.Flags[key]
 		if f.State != portalEvidenceMissing && (f.State != portalEvidenceValid || f.Text != "false") {
 			return unavailable("unsupported", "复杂计费记录暂不套用普通文本公式。")

@@ -52,7 +52,11 @@ func TestPortalCustomerLogsTLSBlackBoxAcceptance(t *testing.T) {
 	defer server.Close()
 	client := server.Client()
 	client.Timeout = 5 * time.Second
-	request := func(method, path, body string, cookie *http.Cookie) (int, string, *http.Response) {
+	type responseMetadata struct {
+		Header  http.Header
+		Cookies []*http.Cookie
+	}
+	request := func(method, path, body string, cookie *http.Cookie) (int, string, responseMetadata) {
 		t.Helper()
 		req, err := http.NewRequest(method, server.URL+path, strings.NewReader(body))
 		if err != nil {
@@ -74,7 +78,7 @@ func TestPortalCustomerLogsTLSBlackBoxAcceptance(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		return response.StatusCode, string(data), response
+		return response.StatusCode, string(data), responseMetadata{Header: response.Header.Clone(), Cookies: response.Cookies()}
 	}
 	login := func(email string) *http.Cookie {
 		t.Helper()
@@ -83,7 +87,7 @@ func TestPortalCustomerLogsTLSBlackBoxAcceptance(t *testing.T) {
 		if status != 200 {
 			t.Fatalf("local login status=%d", status)
 		}
-		for _, cookie := range response.Cookies() {
+		for _, cookie := range response.Cookies {
 			if cookie.Name == portalSessionCookie {
 				if !cookie.Secure || !cookie.HttpOnly || cookie.SameSite != http.SameSiteLaxMode {
 					t.Fatal("customer TLS cookie protections missing")

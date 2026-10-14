@@ -19,8 +19,8 @@ func TestPortalMediaDetailsStatesAndUnits(t *testing.T) {
 		{"large integer", `{"audio_output":9007199254740993}`, "音频输出 Tokens（分项原值）", "9007199254740993", portalEvidenceValid},
 		{"bad string", `{"audio_ratio":"secret-key"}`, "音频输入倍率（日志原值，非单价）", "记录异常", portalEvidenceInvalid},
 		{"zero rate", `{"audio_completion_ratio":0}`, "音频输出倍率（日志原值，非单价）", "0", portalEvidenceValid},
-		{"audio price", `{"audio_input_seperate_price":true,"audio_input_price":7.5}`, "独立音频输入单价（$/百万 Tokens，未乘分组倍率）", "7.5", portalEvidenceValid},
-		{"missing audio price", `{"audio_input_seperate_price":true}`, "独立音频输入单价（$/百万 Tokens，未乘分组倍率）", "未记录", portalEvidenceMissing},
+		{"audio price", `{"audio_input_seperate_price":true,"audio_input_price":7.5}`, "独立音频输入单价（$/百万 Tokens，未乘分组倍率）", "7.5", portalEvidenceValid}, //nolint:misspell // Original upstream wire fixture, deliberately independent of the constant.
+		{"missing audio price", `{"audio_input_seperate_price":true}`, "独立音频输入单价（$/百万 Tokens，未乘分组倍率）", "未记录", portalEvidenceMissing},               //nolint:misspell // Original upstream wire fixture.
 		{"image input historical key", `{"image":true,"image_output":321}`, "图片 Tokens（历史字段原值）", "321", portalEvidenceValid},
 		{"old image call", `{"image_generation_call":true,"image_generation_call_price":0.04}`, "图片生成单价（$/次，未乘分组倍率）", "0.04", portalEvidenceValid},
 	} {
@@ -55,7 +55,7 @@ func TestPortalMediaAndToolDetailExportPreservesOriginalCharge(t *testing.T) {
 	for _, raw := range []string{
 		`{"audio":true,"audio_input":20,"audio_output":0,"text_input":30,"text_output":0,"audio_ratio":4,"audio_completion_ratio":8}`,
 		`{"image":true,"image_output":99,"image_ratio":1.5}`,
-		`{"audio_input_seperate_price":true,"audio_input_token_count":45,"audio_input_price":6.25}`,
+		`{"audio_input_seperate_price":true,"audio_input_token_count":45,"audio_input_price":6.25}`, //nolint:misspell // Original upstream wire fixture.
 		`{"image_generation_call":true,"image_generation_call_price":0.04}`,
 		`{"tool_surcharges":[{"name":"web_search_preview","count":2,"price":10},{"name":"google_search","count":0,"price":0},{"name":"private-secret-name","count":3,"price":5}]}`,
 	} {

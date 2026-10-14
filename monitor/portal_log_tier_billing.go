@@ -21,7 +21,7 @@ func checkPortalTierBilling(r LogRow, e portalLogEvidence) portalBillingCheck {
 	if e.ExtraBilling || e.ToolsState != portalEvidenceMissing || e.Strings["task_id"].State != portalEvidenceMissing || (source.State != portalEvidenceMissing && (source.State != portalEvidenceValid || source.Text != "wallet")) {
 		return fail("unsupported", "包含附加计费、订阅或边界处理记录，暂不套用文本阶梯公式")
 	}
-	for _, k := range []string{"image", "audio", "ws", "is_task", "web_search", "file_search", "audio_input_seperate_price", "image_generation_call"} {
+	for _, k := range []string{"image", "audio", "ws", "is_task", "web_search", "file_search", portalAudioInputSeparatePriceKey, "image_generation_call"} {
 		f := e.Flags[k]
 		if f.State != portalEvidenceMissing && (f.State != portalEvidenceValid || f.Text != "false") {
 			return fail("unsupported", "多模态或工具计费尚需独立核验")

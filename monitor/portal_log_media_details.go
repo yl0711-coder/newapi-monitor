@@ -35,7 +35,7 @@ func portalMediaDetailItems(e portalLogEvidence) []portalLogDetailItem {
 	} {
 		add(field.key, field.label, audio)
 	}
-	separate := e.Flags["audio_input_seperate_price"].Text == "true"
+	separate := e.Flags[portalAudioInputSeparatePriceKey].Text == "true"
 	add("audio_input_token_count", "独立计价音频输入 Tokens（分项原值）", separate)
 	add("audio_input_price", "独立音频输入单价（$/百万 Tokens，未乘分组倍率）", separate)
 	image := e.Flags["image"].Text == "true"
