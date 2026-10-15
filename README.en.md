@@ -56,6 +56,7 @@ Open `http://<host>:8090` and log in with a new-api admin account. See [`docker-
 | `MONITOR_STORE_BACKUP_ENABLED` | Runtime paired main+facts backup; migration snapshots remain mandatory independently | `true` |
 | `MONITOR_STORE_BACKUP_DIR` | Runtime and pre-migration snapshot directory | `<MONITOR_STORE_PATH directory>/backups` |
 | `MONITOR_STORE_BACKUP_RETENTION` | Number of verified main+facts `backup-set` manifests retained | `7` |
+| `MONITOR_STORE_BACKUP_RETENTION_DAYS` | `0` keeps count-based retention. A positive N retains the latest set for each of the last N available Beijing calendar dates, plus the newest two sets (at most N+1). Downtime never expires all recovery points. Enables restart interval reuse only after verifying a backup of the same source files. Does not prune release, migration, or repair snapshots | `0` |
 | `MONITOR_STORE_MIGRATION_BACKUP_RETENTION` | Number of paired pre-migration snapshot sets retained | `3` |
 | `MONITOR_USAGE_FACTS_ENABLED` | Build member-scoped local usage facts in the background | `false` |
 | `MONITOR_USAGE_FACTS_READ_ENABLED` | Serve aggregates only from a completely published local snapshot; unavailable data fails closed and never falls back to source `logs` | `false` |
