@@ -1072,12 +1072,6 @@ func RestoreStoreBackupSet(parent context.Context, manifestPath, targetDir, main
 	return nil
 }
 
-func pruneStoreBackupSets(dir string, retention int) error {
-	ctx, cancel := context.WithTimeout(context.Background(), storeBackupTimeout)
-	defer cancel()
-	return pruneStoreBackupSetsWithPolicy(ctx, dir, retention, 0, time.Now(), nil)
-}
-
 // createStoreBackupSet holds the member-lifecycle and facts-publication
 // barriers across both VACUUM INTO operations. This is intentionally a single
 // low-frequency operation: it trades Tail progress during the snapshot for a
