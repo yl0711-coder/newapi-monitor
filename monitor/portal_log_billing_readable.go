@@ -16,6 +16,20 @@ type portalBillingTerm struct {
 	perCall bool
 }
 
+// Exact recorded-price subtotal, independent of group ratio and rounded quota.
+// Call only with components from the verified accounting path.
+func portalBillingBaseUSD(terms []portalBillingTerm) *big.Rat {
+	total := new(big.Rat)
+	for _, term := range terms {
+		amount := new(big.Rat).Mul(term.count, term.price)
+		if !term.perCall {
+			amount.Quo(amount, big.NewRat(1000000, 1))
+		}
+		total.Add(total, amount)
+	}
+	return total
+}
+
 func portalBillingDisplayNumber(v *big.Rat) string {
 	const places = 8
 	s := v.FloatString(places)

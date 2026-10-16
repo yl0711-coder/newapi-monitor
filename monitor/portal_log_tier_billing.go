@@ -10,6 +10,14 @@ import (
 // Arithmetic over a small, fully parsed linear grammar, never execution of an
 // upstream expression. The original quota remains the authoritative charge.
 func checkPortalTierBilling(r LogRow, e portalLogEvidence) portalBillingCheck {
+	return checkPortalTierBillingMode(r, e, false)
+}
+
+// sameVariableReference is bill-only: preserve the recorded context length,
+// but charge Anthropic cache writes only via recorded TTL variables, as the
+// customer-approved same-variable reference requires. Ordinary log details
+// retain their existing stricter explanation gates.
+func checkPortalTierBillingMode(r LogRow, e portalLogEvidence, sameVariableReference bool) portalBillingCheck {
 	fail := func(state, message string) portalBillingCheck {
 		return portalBillingCheck{State: state, Message: message + "；费用仍以实际扣费为准。"}
 	}
@@ -41,7 +49,7 @@ func checkPortalTierBilling(r LogRow, e portalLogEvidence) portalBillingCheck {
 	if path.State != portalEvidenceValid || (path.Text != "/v1/responses" && path.Text != "/v1/chat/completions" && path.Text != "/v1/messages") {
 		return fail("incomplete", "缺少可核验的文本请求路径")
 	}
-	if r.PromptTokens == 0 && r.CompletionTokens == 0 {
+	if r.PromptTokens == 0 && r.CompletionTokens == 0 && !sameVariableReference {
 		return fail("incomplete", "零 Token 记录需结合额外结算依据")
 	}
 	get := func(k string, optional bool) (*big.Rat, bool) {
@@ -101,7 +109,7 @@ func checkPortalTierBilling(r LogRow, e portalLogEvidence) portalBillingCheck {
 	length := new(big.Rat).Set(input)
 	cc, cc1h := write, new(big.Rat)
 	if anthropic {
-		if new(big.Rat).Add(five, hour).Cmp(write) != 0 {
+		if new(big.Rat).Add(five, hour).Cmp(write) != 0 && !sameVariableReference {
 			return fail("incomplete", "Anthropic 缓存创建总量存在未拆分部分，不能猜测 TTL 计价")
 		}
 		cc, cc1h = five, hour
@@ -197,8 +205,13 @@ func checkPortalTierBilling(r LogRow, e portalLogEvidence) portalBillingCheck {
 	}
 	rounded := new(big.Rat).Add(amount, big.NewRat(1, 2))
 	quota := new(big.Int).Quo(rounded.Num(), rounded.Denom())
-	if !quota.IsInt64() || quota.Int64() != int64(math.Round(floatQuota)) {
+	if !quota.IsInt64() || (!sameVariableReference && quota.Int64() != int64(math.Round(floatQuota))) {
 		return fail("unsupported", "金额位于浮点舍入边界，暂不输出确定公式")
+	}
+	if sameVariableReference {
+		// Verify actual quota with the source evaluator's float rounding. The
+		// reference itself stays exact; never reverse-divide rounded quota.
+		quota.SetInt64(int64(math.Round(floatQuota)))
 	}
 	if quota.Int64() != r.billingQuota {
 		return fail("mismatch", "现有日志字段复算与实际扣费不一致，可能缺少计费依据，未修改实际扣费")
@@ -222,5 +235,5 @@ func checkPortalTierBilling(r LogRow, e portalLogEvidence) portalBillingCheck {
 	}
 	semantics += "\n计价输入：" + normalization + " = " + input.Num().String()
 	usd := new(big.Rat).SetFrac(quota, big.NewInt(500000)).FloatString(6)
-	return portalBillingCheck{State: "matched", Message: "按日志档位、Token、单价和分组倍率复核，与本条实际扣费一致；不代表计费证据已完整审计。", Readable: portalReadableBilling(displayTerms, group, quota.Int64(), false), Formula: fmt.Sprintf("%s\n上下文长度 %s，核验命中第 %d 档\n（%s）÷ 1000000 × 分组倍率 %s × 500000\n按整数额度四舍五入 = %s 额度（阶梯不套用普通倍率最低 1 额度）\n实际扣费：%s ÷ 500000 = $%s", semantics, length.Num().String(), index, strings.Join(terms, " + "), e.Numbers["group_ratio"].Text, quota.String(), quota.String(), usd)}
+	return portalBillingCheck{baseUSD: portalBillingBaseUSD(displayTerms), State: "matched", Message: "按日志档位、Token、单价和分组倍率复核，与本条实际扣费一致；不代表计费证据已完整审计。", Readable: portalReadableBilling(displayTerms, group, quota.Int64(), false), Formula: fmt.Sprintf("%s\n上下文长度 %s，核验命中第 %d 档\n（%s）÷ 1000000 × 分组倍率 %s × 500000\n按整数额度四舍五入 = %s 额度（阶梯不套用普通倍率最低 1 额度）\n实际扣费：%s ÷ 500000 = $%s", semantics, length.Num().String(), index, strings.Join(terms, " + "), e.Numbers["group_ratio"].Text, quota.String(), quota.String(), usd)}
 }

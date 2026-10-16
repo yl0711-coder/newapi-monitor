@@ -61,6 +61,8 @@ const (
 	portalExportWindow       = 5 * time.Minute  // 导出限流:每组织账号该窗口内 1 次(仅计成功下载)
 	portalExportPrepWindow   = 5 * time.Second  // 预检 COUNT 防连点/并发；不改变成功导出的 5 分钟限额
 	portalExportTicketTTL    = 5 * time.Minute  // 预检结果短期有效；下载凭票跳过第二次 COUNT
+	portalExportGenerateTTL  = 60 * time.Second // 整份生成预算，不随每页查询重新计时
+	portalExportTotalTTL     = 2 * time.Minute  // 生成+下载总上限，与原 HTTP 写入预算一致
 	// CSV 必须完整落盘并通过末端权限复核后才发给客户。
 	// 上限避免单个导出吃满 /data；保留水位保护 SQLite WAL/备份。
 	portalExportMaxBytes         int64 = 128 << 20
@@ -259,6 +261,7 @@ func (m *Monitor) verifyPortalSession(token string, nowUnix int64) (gid, authVer
 // MaxID 快照开始分页，避免预检后新写入的日志让“是否超过 5 万行”结论漂移。
 // 票据只含服务端已校验的筛选条件和成员指纹，不含密码、令牌密钥或日志内容。
 type portalExportClaim struct {
+	Format      string `json:"format,omitempty"`
 	GID         int64  `json:"gid"`
 	MemberFP    string `json:"member_fp"`
 	MemberUID   int64  `json:"member_uid"`
@@ -609,6 +612,15 @@ func (m *Monitor) portalExportTempDir() (string, error) {
 }
 
 func preparePortalExportTempDir(dir string) error {
+	// Startup cleanup runs before task initialization. Reject a substituted
+	// leaf here too, rather than following it and chmod'ing another directory.
+	if info, err := os.Lstat(dir); err == nil {
+		if !info.IsDir() {
+			return errors.New("导出暂存路径不是普通目录")
+		}
+	} else if !os.IsNotExist(err) {
+		return err
+	}
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
@@ -633,16 +645,18 @@ func ensurePortalExportDiskCapacity(dir string, maxBytes int64) error {
 	return nil
 }
 
-func (m *Monitor) createPortalExportTempFile(maxBytes int64) (*os.File, *portalExportStorageLease, error) {
+// Both synchronous CSV and background bill generation share this process/file
+// lock and disk reserve. Retained completed bills do not hold the generation lock.
+func (m *Monitor) acquirePortalExportStorage(maxBytes int64) (string, *portalExportStorageLease, error) {
 	select {
 	case portalExportProcessGate <- struct{}{}:
 	default:
-		return nil, nil, errPortalExportStorageBusy
+		return "", nil, errPortalExportStorageBusy
 	}
 	lease := &portalExportStorageLease{}
-	fail := func(err error) (*os.File, *portalExportStorageLease, error) {
+	fail := func(err error) (string, *portalExportStorageLease, error) {
 		lease.release()
-		return nil, nil, err
+		return "", nil, err
 	}
 	dir, err := m.portalExportTempDir()
 	if err != nil {
@@ -667,6 +681,18 @@ func (m *Monitor) createPortalExportTempFile(maxBytes int64) (*os.File, *portalE
 	}
 	if err := ensurePortalExportDiskCapacity(dir, maxBytes); err != nil {
 		return fail(err)
+	}
+	return dir, lease, nil
+}
+
+func (m *Monitor) createPortalExportTempFile(maxBytes int64) (*os.File, *portalExportStorageLease, error) {
+	dir, lease, err := m.acquirePortalExportStorage(maxBytes)
+	if err != nil {
+		return nil, nil, err
+	}
+	fail := func(err error) (*os.File, *portalExportStorageLease, error) {
+		lease.release()
+		return nil, nil, err
 	}
 	tmp, err := os.CreateTemp(dir, portalExportTempFilePrefix+"*.csv")
 	if err != nil {
@@ -824,7 +850,9 @@ func (m *Monitor) RegisterPortalRoutes(r *gin.Engine) {
 	// 新页面只走此路径：预检后发生回滚时旧版返回 404，不能悄悄下载旧口径 CSV。
 	// 保留原路径供旧页面/已有票据使用，权限、限流与下载实现完全共用。
 	api.GET("/logs/export/v1", m.portalLogsExport)
+	api.GET("/logs/bill/v1", m.portalLogsExport)
 	api.POST("/password", m.portalChangePassword)
+	m.registerPortalBillTasks(r)
 }
 
 // requirePortal 客户会话门:apiMode=true 未登录回 401 JSON,否则 302 到 /login。
@@ -1671,6 +1699,15 @@ func (m *Monitor) portalLogs(c *gin.Context) {
 // 下载票据。前端随后交给浏览器原生下载，不再把最多 5 万行 CSV 堆进 JS Blob；
 // 真正下载仍由 portalLogsExport 原子限流，预检不会占掉“成功下载”额度。
 func (m *Monitor) portalLogsExportPrepare(c *gin.Context) {
+	format := c.Query("format")
+	if !portalExportFormatValid(format) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "不支持的导出格式"})
+		return
+	}
+	if format == portalBillFormat && m.cfg.PortalBillTasksEnabled && m.portalBillTaskContract() != 1 {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "账单任务服务暂不可用，请稍后重试"})
+		return
+	}
 	gid, ids, memberUID, fromTs, toTs, logType, model, group, tokenName, detailKw, requestID, err := m.portalLogParams(c)
 	if err != nil {
 		portalLogParamsError(c, err)
@@ -1683,6 +1720,10 @@ func (m *Monitor) portalLogsExportPrepare(c *gin.Context) {
 	if len(ids) == 0 {
 		c.JSON(http.StatusOK, gin.H{"error": "本组暂无成员日志"})
 		return
+	}
+	if format == portalBillFormat {
+		// Keep all non-type filters, but a bill always selects consumption.
+		logType = 2
 	}
 	now := time.Now().Unix()
 	if !m.exportLim.allowPrepare(gid, now, int64(portalExportWindow.Seconds()), int64(portalExportPrepWindow.Seconds())) {
@@ -1697,7 +1738,12 @@ func (m *Monitor) portalLogsExportPrepare(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "查询失败,请稍后重试"})
 		return
 	}
+	if format == portalBillFormat && total > portalExportCap {
+		c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "消费记录超过 5 万条，请缩小时间范围；账单不支持截断导出"})
+		return
+	}
 	claim := portalExportClaim{
+		Format:      format,
 		GID:         gid,
 		MemberFP:    portalMemberFingerprintFromIDs(ids),
 		MemberUID:   memberUID,
@@ -1719,15 +1765,22 @@ func (m *Monitor) portalLogsExportPrepare(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "准备下载失败,请稍后重试"})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{
+	response := gin.H{
 		"ok":           true,
 		"log_contract": portalLogContractVersion,
 		"ticket":       ticket,
+		"format":       format,
 		"total":        total,
 		"total_exact":  total <= portalExportCap,
 		"need_confirm": total > portalExportCap,
 		"cap":          portalExportCap,
-	})
+	}
+	if format == portalBillFormat {
+		if contract := m.portalBillTaskContract(); contract != 0 {
+			response["bill_task_contract"] = contract
+		}
+	}
+	c.JSON(http.StatusOK, response)
 }
 
 // csvSafe 防 CSV 公式注入:文本以 = + - @ 制表符或回车开头时前置单引号,Excel/WPS 打开时按文本处理。
@@ -1760,6 +1813,24 @@ func (m *Monitor) portalLogsExportWithLimit(c *gin.Context, maxBytes int64) {
 // portalLogsExportWithWriter 的 writerWrapper 只用于确定性注入落盘中途失败。
 // 生产调用固定为 nil，不存在配置或客户输入通道。
 func (m *Monitor) portalLogsExportWithWriter(c *gin.Context, maxBytes int64, writerWrapper func(io.Writer) io.Writer) {
+	m.portalLogsExportWithBudgets(c, maxBytes, writerWrapper, portalExportGenerateTTL, portalExportTotalTTL)
+}
+
+// Budgets are server-owned; parameters only permit deterministic local acceptance tests.
+func (m *Monitor) portalLogsExportWithBudgets(c *gin.Context, maxBytes int64, writerWrapper func(io.Writer) io.Writer, generateTTL, totalTTL time.Duration) {
+	deliveryDeadline := time.Now().Add(totalTTL)
+	ctx, cancelGeneration := context.WithTimeout(c.Request.Context(), min(generateTTL, totalTTL))
+	defer cancelGeneration()
+	if portalExportGenerationStopped(ctx, c) {
+		return
+	}
+	bill := c.Request.URL.Path == "/api/logs/bill/v1"
+	if bill && m.cfg.PortalBillTasksEnabled {
+		// A stale page/ticket must not silently bypass the selected snapshot
+		// mode. Ordinary usage CSV remains unaffected.
+		c.JSON(http.StatusConflict, gin.H{"error": "账单导出方式已更新，请刷新页面后重新导出"})
+		return
+	}
 	var (
 		gid, memberUID, fromTs, toTs, startCursor int64
 		logType                                   int
@@ -1770,6 +1841,10 @@ func (m *Monitor) portalLogsExportWithWriter(c *gin.Context, maxBytes int64, wri
 		err                                       error
 	)
 	ticket := strings.TrimSpace(c.Query("ticket"))
+	if bill && ticket == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "请先准备账单并获取下载凭证"})
+		return
+	}
 	if ticket != "" {
 		claim, ok := m.verifyPortalExportClaim(ticket, time.Now().Unix())
 		gid = c.GetInt64("portalGID")
@@ -1777,8 +1852,15 @@ func (m *Monitor) portalLogsExportWithWriter(c *gin.Context, maxBytes int64, wri
 			c.JSON(http.StatusBadRequest, gin.H{"error": "下载凭证无效或已过期,请重新导出"})
 			return
 		}
-		tracked, storeErr := m.portalTrackedMembersForUsageRead(c.Request.Context(), gid)
+		if !portalExportFormatValid(claim.Format) || bill != (claim.Format == portalBillFormat) || (bill && (claim.LogType != 2 || claim.Total > portalExportCap)) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "下载凭证与导出类型不一致，请重新导出"})
+			return
+		}
+		tracked, storeErr := m.portalTrackedMembersForUsageRead(ctx, gid)
 		if storeErr != nil {
+			if portalExportGenerationStopped(ctx, c) {
+				return
+			}
 			portalLogParamsError(c, storeErr)
 			return
 		}
@@ -1791,8 +1873,15 @@ func (m *Monitor) portalLogsExportWithWriter(c *gin.Context, maxBytes int64, wri
 		model, group, tokenName, detailKw, requestID = claim.Model, claim.Group, claim.TokenName, claim.DetailKw, claim.RequestID
 		total, startCursor = claim.Total, claim.StartCursor
 	} else {
+		// Legacy parameter lookup must share the same total generation budget.
+		originalRequest := c.Request
+		c.Request = originalRequest.WithContext(ctx)
 		gid, ids, memberUID, fromTs, toTs, logType, model, group, tokenName, detailKw, requestID, err = m.portalLogParams(c)
+		c.Request = originalRequest
 		if err != nil {
+			if portalExportGenerationStopped(ctx, c) {
+				return
+			}
 			portalLogParamsError(c, err)
 			return
 		}
@@ -1801,8 +1890,11 @@ func (m *Monitor) portalLogsExportWithWriter(c *gin.Context, maxBytes int64, wri
 		c.JSON(http.StatusOK, gin.H{"error": "本组暂无成员日志"})
 		return
 	}
-	authorizationBefore, authErr := m.loadPortalUsageAuthorizationSnapshot(c.Request.Context(), gid)
+	authorizationBefore, authErr := m.loadPortalUsageAuthorizationSnapshot(ctx, gid)
 	if authErr != nil {
+		if portalExportGenerationStopped(ctx, c) {
+			return
+		}
 		if errors.Is(authErr, errPortalAuthorizationInvalid) {
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
 		} else {
@@ -1836,8 +1928,11 @@ func (m *Monitor) portalLogsExportWithWriter(c *gin.Context, maxBytes int64, wri
 	if ticket == "" {
 		// 兼容旧页面：无预检票据时在下载请求内一次取得 COUNT+MaxID；新页面则复用
 		// prepare 票据。旧路径也必须固定快照，否则计数后新到的日志会混入文件。
-		total, startCursor, err = m.countGroupLogsSnapshot(c.Request.Context(), ids, fromTs, toTs, memberUID, logType, model, group, tokenName, detailKw, requestID)
+		total, startCursor, err = m.countGroupLogsSnapshot(ctx, ids, fromTs, toTs, memberUID, logType, model, group, tokenName, detailKw, requestID)
 		if err != nil {
+			if portalExportGenerationStopped(ctx, c) {
+				return
+			}
 			if abortCanceledUsageRequest(c, err) {
 				return
 			}
@@ -1853,6 +1948,9 @@ func (m *Monitor) portalLogsExportWithWriter(c *gin.Context, maxBytes int64, wri
 	fname := fmt.Sprintf("usage-logs-%s_%s.csv",
 		time.Unix(fromTs, 0).In(usageCST).Format("20060102"),
 		time.Unix(toTs-1, 0).In(usageCST).Format("20060102"))
+	if bill {
+		fname = strings.Replace(fname, "usage-logs-", "usage-bill-", 1)
+	}
 	// 先流式落到 0600 临时文件，再复核当前成员 revision/Portal AuthVer。
 	// 权限变化时整份丢弃，一个字节都不发给旧组；内存仍只保留一页。
 	tmp, storageLease, err := m.createPortalExportTempFile(maxBytes)
@@ -1876,7 +1974,11 @@ func (m *Monitor) portalLogsExportWithWriter(c *gin.Context, maxBytes int64, wri
 		return
 	}
 	w := csv.NewWriter(limited)
-	if err := w.Write(portalCSVHeader()); err != nil {
+	header := portalCSVHeader()
+	if bill {
+		header = portalBillHeader()
+	}
+	if err := w.Write(header); err != nil {
 		slog.Warn("客户端 CSV 表头写入失败", "gid", gid, "err", err)
 		portalExportStorageError(c, err)
 		return
@@ -1892,13 +1994,20 @@ func (m *Monitor) portalLogsExportWithWriter(c *gin.Context, maxBytes int64, wri
 	// 第一页即按时间复合索引读取，且不会混入预检后新写入的 ID。
 	cursor := logPageCursor{HasUpper: true, UpperID: startCursor - 1}
 	remaining := portalExportCap
+	written := int64(0)
 	for remaining > 0 {
+		if portalExportGenerationStopped(ctx, c) {
+			return
+		}
 		limit := portalExportPageSize
 		if remaining < limit {
 			limit = remaining
 		}
-		rows, qerr := m.queryGroupLogsForExportCursor(c.Request.Context(), ids, fromTs, toTs, memberUID, logType, model, group, tokenName, detailKw, requestID, cursor, limit)
+		rows, qerr := m.queryGroupLogsForExportCursor(ctx, ids, fromTs, toTs, memberUID, logType, model, group, tokenName, detailKw, requestID, cursor, limit)
 		if qerr != nil {
+			if portalExportGenerationStopped(ctx, c) {
+				return
+			}
 			if isCanceledUsageRequest(c, qerr) {
 				return
 			}
@@ -1912,11 +2021,26 @@ func (m *Monitor) portalLogsExportWithWriter(c *gin.Context, maxBytes int64, wri
 			break
 		}
 		for _, row := range rows {
-			if err := w.Write(portalCSVRecord(row)); err != nil {
+			if portalExportGenerationStopped(ctx, c) {
+				return
+			}
+			var record []string
+			if bill {
+				var billErr error
+				record, billErr = portalBillRecord(row)
+				if billErr != nil {
+					c.JSON(http.StatusUnprocessableEntity, gin.H{"error": billErr.Error()})
+					return
+				}
+			} else {
+				record = portalCSVRecord(row)
+			}
+			if err := w.Write(record); err != nil {
 				slog.Warn("客户端 CSV 写入失败", "gid", gid, "err", err)
 				portalExportStorageError(c, err)
 				return
 			}
+			written++
 		}
 		w.Flush()
 		if err := w.Error(); err != nil {
@@ -1935,8 +2059,18 @@ func (m *Monitor) portalLogsExportWithWriter(c *gin.Context, maxBytes int64, wri
 		portalExportStorageError(c, err)
 		return
 	}
-	authorizationAfter, authErr := m.loadPortalUsageAuthorizationSnapshot(c.Request.Context(), gid)
+	if bill && written != total {
+		c.JSON(http.StatusConflict, gin.H{"error": "消费记录在导出期间发生变化，请重新导出；未生成部分账单"})
+		return
+	}
+	if portalExportGenerationStopped(ctx, c) {
+		return
+	}
+	authorizationAfter, authErr := m.loadPortalUsageAuthorizationSnapshot(ctx, gid)
 	if authErr != nil {
+		if portalExportGenerationStopped(ctx, c) {
+			return
+		}
 		if errors.Is(authErr, errPortalAuthorizationInvalid) {
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
 		} else {
@@ -1952,10 +2086,16 @@ func (m *Monitor) portalLogsExportWithWriter(c *gin.Context, maxBytes int64, wri
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "准备下载失败,请稍后重试"})
 		return
 	}
-	c.Header("Content-Disposition", "attachment; filename=\""+fname+"\"")
-	c.Header("Content-Type", "text/csv; charset=utf-8")
-	c.Status(http.StatusOK)
-	if _, err := io.Copy(c.Writer, tmp); err != nil {
+	info, err := tmp.Stat()
+	if err != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "准备下载失败,请稍后重试"})
+		return
+	}
+	if portalExportGenerationStopped(ctx, c) {
+		return
+	}
+	cancelGeneration() // Download only receives the remaining total budget; no database connection is retained.
+	if err := portalSendExport(c, tmp, info.Size(), fname, time.Until(deliveryDeadline)); err != nil {
 		slog.Warn("客户端 CSV 发送失败", "gid", gid, "err", err)
 		return
 	}

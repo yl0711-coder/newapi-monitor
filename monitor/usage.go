@@ -1229,8 +1229,9 @@ type LogRow struct {
 	FirstByteEvidence *portalDurationEvidence `json:"first_byte_evidence,omitempty"` // 区分真实零值、缺失和异常；旧数值字段保持兼容
 	SourceFacts       *portalLogSourceFacts   `json:"source_facts,omitempty"`        // 可选存在标记；历史 NULL 不冒充真实零
 	billingQuota      int64
-	billingFactsValid bool // NULL source counts/quota must not become verified zero
-	streamFlagUnknown bool // Preserve missing/invalid historical request-mode evidence.
+	billEvidence      *portalLogEvidence // private parsed evidence; never serialized to customers
+	billingFactsValid bool               // NULL source counts/quota must not become verified zero
+	streamFlagUnknown bool               // Preserve missing/invalid historical request-mode evidence.
 }
 
 // logPageCursor 是使用日志的键集分页位点。新页面按

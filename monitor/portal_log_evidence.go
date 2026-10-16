@@ -100,7 +100,7 @@ func parsePortalLogEvidence(raw string) portalLogEvidence {
 	for _, key := range strings.Fields("model_ratio completion_ratio group_ratio user_group_ratio model_price cache_ratio cache_creation_ratio cache_creation_ratio_5m cache_creation_ratio_1h image_ratio audio_ratio audio_completion_ratio web_search_price file_search_price audio_input_price image_generation_call_price") {
 		e.Numbers[key] = portalEvidenceNumber(fields[key], false, key == "model_price" || key == "user_group_ratio")
 	}
-	for _, key := range strings.Fields("cache_tokens cache_creation_tokens cache_creation_tokens_5m cache_creation_tokens_1h audio_input audio_output text_input text_output image_output web_search_call_count file_search_call_count audio_input_token_count image_generation_call_count subscription_id subscription_plan_id subscription_pre_consumed subscription_post_delta subscription_consumed subscription_remain subscription_total subscription_used wallet_quota_deducted") {
+	for _, key := range strings.Fields("cache_tokens cache_creation_tokens cache_creation_tokens_5m cache_creation_tokens_1h cache_write_tokens input_tokens_total audio_input audio_output text_input text_output image_output web_search_call_count file_search_call_count audio_input_token_count image_generation_call_count subscription_id subscription_plan_id subscription_pre_consumed subscription_post_delta subscription_consumed subscription_remain subscription_total subscription_used wallet_quota_deducted") {
 		e.Numbers[key] = portalEvidenceNumber(fields[key], true, key == "subscription_post_delta")
 	}
 	for _, key := range strings.Fields("billing_mode billing_source matched_tier expr_b64 reasoning_effort task_id usage_semantic request_path subscription_plan_title") {

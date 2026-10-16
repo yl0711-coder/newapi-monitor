@@ -193,6 +193,9 @@ type Settings struct {
 	// 客户端「用量报表」独立监听(portal.go):客户域名只指这个端口,上面不存在任何管理端路由。
 	// 留空 = 关闭(默认);如 ":8092"。
 	PortalAddr string // MONITOR_PORTAL_ADDR
+	// Default off: an explicit opt-in switches bills (not ordinary CSV) to
+	// bounded background generation with a consistent source snapshot.
+	PortalBillTasksEnabled bool // MONITOR_PORTAL_BILL_TASKS_ENABLED
 
 	// 兼容旧部署的已弃用字段：仅地址用于启动提示，prefix 用于本机键命名。
 	// 不存在 Redis 网络客户端，账号/密码/DB 不再用于任何连接。
@@ -485,6 +488,7 @@ func LoadSettings() Settings {
 		FinanceCURArtifactEnabled:                env("MONITOR_FINANCE_CUR_ARTIFACT_ENABLED", "false") == "true",
 		FinanceCURArtifactPath:                   strings.TrimSpace(env("MONITOR_FINANCE_CUR_ARTIFACT_PATH", "")),
 		PortalAddr:                               env("MONITOR_PORTAL_ADDR", ""),
+		PortalBillTasksEnabled:                   env("MONITOR_PORTAL_BILL_TASKS_ENABLED", "false") == "true",
 		UsageRedisAddr:                           strings.TrimSpace(env("MONITOR_USAGE_REDIS_ADDR", "")),
 		UsageRedisUsername:                       strings.TrimSpace(env("MONITOR_USAGE_REDIS_USERNAME", "")),
 		UsageRedisPassword:                       env("MONITOR_USAGE_REDIS_PASSWORD", ""),
