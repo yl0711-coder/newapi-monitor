@@ -51,15 +51,16 @@ var portalHTML string
 var portalLoginHTML string
 
 const (
-	portalSessionCookie    = "report_session" // 中性命名,不带 monitor 字样
-	portalSessionTTL       = 12 * time.Hour
-	portalLoginWindow      = 10 * time.Minute // 登录限流窗口
-	portalLogPageSize      = 50               // 日志查看每页条数
-	portalExportCap        = 50000            // 单次 CSV 导出封顶行数(超出弹确认导最新这么多)
-	portalExportPageSize   = 500              // CSV 分页读取，避免 5 万行及详情同时堆入内存
-	portalExportWindow     = 5 * time.Minute  // 导出限流:每组织账号该窗口内 1 次(仅计成功下载)
-	portalExportPrepWindow = 5 * time.Second  // 预检 COUNT 防连点/并发；不改变成功导出的 5 分钟限额
-	portalExportTicketTTL  = 5 * time.Minute  // 预检结果短期有效；下载凭票跳过第二次 COUNT
+	portalSessionCookie      = "report_session" // 中性命名,不带 monitor 字样
+	portalSessionTTL         = 12 * time.Hour
+	portalLoginWindow        = 10 * time.Minute // 登录限流窗口
+	portalLogPageSize        = 50               // 日志查看每页条数
+	portalLogContractVersion = 1                // 客户日志/导出语义；旧页面忽略，新页面拒绝不兼容响应
+	portalExportCap          = 50000            // 单次 CSV 导出封顶行数(超出弹确认导最新这么多)
+	portalExportPageSize     = 500              // CSV 分页读取，避免 5 万行及详情同时堆入内存
+	portalExportWindow       = 5 * time.Minute  // 导出限流:每组织账号该窗口内 1 次(仅计成功下载)
+	portalExportPrepWindow   = 5 * time.Second  // 预检 COUNT 防连点/并发；不改变成功导出的 5 分钟限额
+	portalExportTicketTTL    = 5 * time.Minute  // 预检结果短期有效；下载凭票跳过第二次 COUNT
 	// CSV 必须完整落盘并通过末端权限复核后才发给客户。
 	// 上限避免单个导出吃满 /data；保留水位保护 SQLite WAL/备份。
 	portalExportMaxBytes         int64 = 128 << 20
@@ -820,6 +821,9 @@ func (m *Monitor) RegisterPortalRoutes(r *gin.Engine) {
 	api.GET("/logs", m.portalAggregateAuthorizationGuard(m.portalLogs))                             // 使用日志:游标分页查看
 	api.GET("/logs/export/prepare", m.portalAggregateAuthorizationGuard(m.portalLogsExportPrepare)) // CSV 预检并签发短期下载票据
 	api.GET("/logs/export", m.portalLogsExport)                                                     // 使用日志:CSV 原生下载(超5万确认/限流)
+	// 新页面只走此路径：预检后发生回滚时旧版返回 404，不能悄悄下载旧口径 CSV。
+	// 保留原路径供旧页面/已有票据使用，权限、限流与下载实现完全共用。
+	api.GET("/logs/export/v1", m.portalLogsExport)
 	api.POST("/password", m.portalChangePassword)
 }
 
@@ -1573,8 +1577,8 @@ func (m *Monitor) portalLogParams(c *gin.Context) (gid int64, ids []int64, membe
 			return
 		}
 	}
-	if t, e := strconv.Atoi(c.Query("type")); e == nil && t >= 1 && t <= 6 {
-		logType = t // 具体类型(1-6 全部开放,同 new-api 官方客户端使用日志);其余(0/越界)= 全部
+	if t, e := strconv.Atoi(c.Query("type")); e == nil && t >= 1 && t <= 7 {
+		logType = t // rc26 增加登录(7)；0/越界仍表示全部
 	}
 	model = strings.TrimSpace(c.Query("model"))
 	group = strings.TrimSpace(c.Query("group"))
@@ -1626,7 +1630,7 @@ func (m *Monitor) portalLogs(c *gin.Context) {
 	}
 	_ = gid
 	if len(ids) == 0 {
-		c.JSON(http.StatusOK, gin.H{"ok": true, "rows": []LogRow{}, "has_more": false})
+		c.JSON(http.StatusOK, gin.H{"ok": true, "log_contract": portalLogContractVersion, "rows": []LogRow{}, "has_more": false})
 		return
 	}
 	cursor, err := parseLogPageCursor(c.Query("cursor"))
@@ -1657,7 +1661,10 @@ func (m *Monitor) portalLogs(c *gin.Context) {
 	// 游标 + has_more 已足够稳定翻页。不要为了一个总页数在首屏追加 COUNT(*)：
 	// 大窗口/模糊筛选下，50 行本身可能瞬间返回，而全量计数却扫描数百万行，
 	// 同时拖慢页面和来源库。精确总数不属于日志查看的正确性条件。
-	c.JSON(http.StatusOK, gin.H{"ok": true, "rows": rows, "has_more": hasMore, "next_cursor": next})
+	for i := range rows {
+		rows[i] = portalCustomerLogRow(rows[i])
+	}
+	c.JSON(http.StatusOK, gin.H{"ok": true, "log_contract": portalLogContractVersion, "rows": rows, "has_more": hasMore, "next_cursor": next})
 }
 
 // portalLogsExportPrepare 只做一次受统一闸门保护的 COUNT+MAX(id)，并签发短期
@@ -1714,6 +1721,7 @@ func (m *Monitor) portalLogsExportPrepare(c *gin.Context) {
 	}
 	c.JSON(http.StatusOK, gin.H{
 		"ok":           true,
+		"log_contract": portalLogContractVersion,
 		"ticket":       ticket,
 		"total":        total,
 		"total_exact":  total <= portalExportCap,
@@ -1868,7 +1876,7 @@ func (m *Monitor) portalLogsExportWithWriter(c *gin.Context, maxBytes int64, wri
 		return
 	}
 	w := csv.NewWriter(limited)
-	if err := w.Write([]string{"时间", "成员", "令牌", "分组", "类型", "模型", "用时(秒)", "输入tokens", "输出tokens", "费用(美元)", "详情", "Request ID"}); err != nil {
+	if err := w.Write(portalCSVHeader()); err != nil {
 		slog.Warn("客户端 CSV 表头写入失败", "gid", gid, "err", err)
 		portalExportStorageError(c, err)
 		return
@@ -1957,16 +1965,38 @@ func (m *Monitor) portalLogsExportWithWriter(c *gin.Context, maxBytes int64, wri
 // portalCSVRecord 把允许给客户导出的字段转成一行。详情保留原始内容；csvSafe
 // 防 Excel/WPS 把用户可控文本当作公式执行。
 func portalCSVRecord(r LogRow) []string {
+	r = portalCustomerLogRow(r)
 	cost := ""
-	if r.Type == 2 {
+	if portalLogHasRecordedAmount(r.Type) {
 		cost = strconv.FormatFloat(r.CostUSD, 'f', 6, 64)
 	}
-	return []string{
+	base := []string{
 		time.Unix(r.CreatedAt, 0).In(usageCST).Format("2006-01-02 15:04:05"),
 		csvSafe(r.Member), csvSafe(r.TokenName), csvSafe(r.Group), logTypeName(r.Type), csvSafe(r.ModelName),
 		strconv.FormatInt(r.UseTime, 10), strconv.FormatInt(r.PromptTokens, 10), strconv.FormatInt(r.CompletionTokens, 10),
 		cost, csvSafe(r.Detail), csvSafe(r.RequestID),
 	}
+	if r.Type != 2 && r.Type != 5 {
+		base[6] = "" // login/top-up/admin/refund records are not request timings
+	}
+	if !portalLogHasRecordedAmount(r.Type) {
+		base[7], base[8] = "", ""
+	}
+	if r.Type == 2 && (r.UsageDetails != nil || r.OtherContent != "") {
+		base[10] = csvSafe(r.OtherContent) // price summaries belong only in the billing column
+	}
+	if facts := r.SourceFacts; facts != nil {
+		if !facts.PromptPresent {
+			base[7] = ""
+		}
+		if !facts.CompletionPresent {
+			base[8] = ""
+		}
+		if !facts.QuotaPresent {
+			base[9] = ""
+		}
+	}
+	return append(base, portalCSVLogEvidence(r)...)
 }
 
 // invalidatePortalAggregates 管理端手动刷新矩阵后，精确删除同范围内各客户组的

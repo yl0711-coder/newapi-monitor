@@ -1745,6 +1745,16 @@ function upstreamBalanceSummary(accounts){
   return {known,excluded,unverified,missing:included.length-known.length,total:known.reduce((sum,domain)=>sum+Number(domain.upstream.balance_usd),0)};
 }
 
+function domainSections(domains,total,filtered,costBases){
+  if(!domains.length)return '<div class="cm-domain-list"><div class="cm-empty"><b>当前筛选没有匹配渠道</b><p>请重置筛选条件或更换日期范围。</p></div></div>';
+  // Use the server's whole-account flag, never infer disabled status from
+  // filtered children. Grouping must not remove historical spend or balances.
+  const active=domains.filter(domain=>!domain.manually_disabled);
+  const disabled=domains.filter(domain=>domain.manually_disabled);
+  const section=(items,isDisabled,offset)=>items.length?`<section class="cm-channel-section${isDisabled?' is-disabled':''}" aria-label="${isDisabled?'已禁用渠道':'未禁用渠道'}"><div class="cm-channel-section-head"><h4>${isDisabled?'已禁用渠道':'未禁用渠道'} <span>${nfmt(items.length)} 个上游</span></h4><p>${isDisabled?'全部当前渠道均已手动禁用；余额、历史消费及配置仍可查看。':'日常余额关注区；含自动禁用、部分禁用及停止使用的上游，请结合状态标签查看。'}</p></div><div class="cm-domain-list">${items.map((domain,index)=>domainCard(domain,offset+index,total,filtered,costBases)).join('')}</div></section>`:'';
+  return section(active,false,0)+section(disabled,true,active.length);
+}
+
 function render(){
   if(!cm.report)return;
   const domains=filteredDomains();
@@ -1796,7 +1806,7 @@ function render(){
     }
     summary.removeAttribute('aria-busy')}
   $('cmBody').innerHTML=`<section class="cm-list-head"><div><h3>渠道列表</h3><p>共 ${nfmt(domains.length)} 个归并项 · ${esc(domainSortDescription())}，展开后直接查看服务分组及实际渠道。</p></div><div class="cm-fresh"><small>数据截至 ${esc(shortDateTime(cm.report.meta.data_until))}</small></div></section>
-  <div class="cm-domain-list">${domains.map((domain,index)=>domainCard(domain,index,filteredUsage,filtered,costBases)).join('')||'<div class="cm-empty"><b>当前筛选没有匹配渠道</b><p>请重置筛选条件或更换日期范围。</p></div>'}</div>`;
+  ${domainSections(domains,filteredUsage,filtered,costBases)}`;
 }
 
 document.addEventListener('DOMContentLoaded',()=>{if($('tab-channels')&&!cm.inited)init()});

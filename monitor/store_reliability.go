@@ -58,6 +58,7 @@ type storeBackupSetManifest struct {
 	MigrationPlan           string                   `json:"migration_plan"`
 	SetID                   string                   `json:"set_id"`
 	CreatedAt               int64                    `json:"created_at"`
+	SourceIdentity          string                   `json:"source_identity,omitempty"`
 	Main                    *storeBackupFileManifest `json:"main,omitempty"`
 	Facts                   *storeBackupFileManifest `json:"facts,omitempty"`
 	ActiveMemberManifestSHA string                   `json:"active_member_manifest_sha256,omitempty"`
@@ -97,6 +98,7 @@ type StoreReliabilityStatus struct {
 	BackupEnabled       bool  `json:"backup_enabled"`
 	BackupIntervalHours int   `json:"backup_interval_hours"`
 	BackupRetention     int   `json:"backup_retention"`
+	BackupRetentionDays int   `json:"backup_retention_days"`
 	LastBackupSuccessAt int64 `json:"last_backup_success_at"`
 	LastBackupFailureAt int64 `json:"last_backup_failure_at"`
 	LastBackupBytes     int64 `json:"last_backup_bytes"`
@@ -113,6 +115,7 @@ func (m *Monitor) storeReliabilityStatus() StoreReliabilityStatus {
 		BackupEnabled:       m.cfg.StoreBackupEnabled && m.storeDB != nil && storeUsesFile(m.cfg.StorePath),
 		BackupIntervalHours: int(m.storeBackupInterval() / time.Hour),
 		BackupRetention:     m.storeBackupRetention(),
+		BackupRetentionDays: m.storeBackupRetentionDays(),
 		LastBackupSuccessAt: m.storeBackupLastSuccess.Load(),
 		LastBackupFailureAt: m.storeBackupLastFailure.Load(),
 		LastBackupBytes:     m.storeBackupBytes.Load(),
@@ -133,6 +136,7 @@ func (m *Monitor) usageFactsStoreReliabilityStatus() StoreReliabilityStatus {
 		BackupEnabled:       m.cfg.StoreBackupEnabled && m.usageFactsDB != nil && storeUsesFile(m.cfg.UsageFactsStorePath),
 		BackupIntervalHours: int(m.storeBackupInterval() / time.Hour),
 		BackupRetention:     m.storeBackupRetention(),
+		BackupRetentionDays: m.storeBackupRetentionDays(),
 		LastBackupSuccessAt: m.usageFactsBackupLastSuccess.Load(),
 		LastBackupFailureAt: m.usageFactsBackupLastFailure.Load(),
 		LastBackupBytes:     m.usageFactsBackupBytes.Load(),
@@ -260,6 +264,17 @@ func (m *Monitor) storeBackupDir() string {
 	return filepath.Join(filepath.Dir(m.cfg.StorePath), "backups")
 }
 
+func (m *Monitor) storeBackupRetentionDays() int {
+	days := m.cfg.StoreBackupRetentionDays
+	if days < 0 {
+		return 0
+	}
+	if days > 365 {
+		return 365
+	}
+	return days
+}
+
 // startStoreMaintenance 延迟首次备份，避开启动迁移和第一轮同步；之后每次只在
 // 上一次任务结束后计时，不会因慢盘产生重叠备份。
 func (m *Monitor) startStoreMaintenance(ctx context.Context) {
@@ -279,6 +294,19 @@ func (m *Monitor) startStoreMaintenance(ctx context.Context) {
 			}
 			for {
 				now := time.Now()
+				if delay, err := m.storeBackupResumeDelay(ctx, now, mainEnabled, factsEnabled); err != nil {
+					slog.Warn("无法复用现有在线备份，尝试生成新备份", "err", err)
+				} else if delay > 0 {
+					slog.Info("现有成套备份已验证，延续原备份周期", "next_in", delay)
+					timer := time.NewTimer(delay)
+					select {
+					case <-ctx.Done():
+						timer.Stop()
+						return
+					case <-timer.C:
+						continue
+					}
+				}
 				if _, err := m.createStoreBackupSet(ctx, now, mainEnabled, factsEnabled); err != nil {
 					if !errors.Is(err, context.Canceled) {
 						slog.Error("Monitor 双库成套在线备份失败", "err", err)
@@ -1044,44 +1072,6 @@ func RestoreStoreBackupSet(parent context.Context, manifestPath, targetDir, main
 	return nil
 }
 
-func pruneStoreBackupSets(dir string, retention int) error {
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return err
-	}
-	manifests := make([]string, 0)
-	for _, entry := range entries {
-		if entry.Type().IsRegular() && strings.HasPrefix(entry.Name(), storeBackupSetPrefix) && strings.HasSuffix(entry.Name(), storeBackupSetSuffix) {
-			manifests = append(manifests, filepath.Join(dir, entry.Name()))
-		}
-	}
-	sort.Strings(manifests)
-	for len(manifests) > retention {
-		path := manifests[0]
-		data, err := os.ReadFile(path)
-		if err != nil {
-			return err
-		}
-		var manifest storeBackupSetManifest
-		if err := json.Unmarshal(data, &manifest); err != nil {
-			return fmt.Errorf("旧备份集 manifest 损坏 %s: %w", filepath.Base(path), err)
-		}
-		for _, file := range []*storeBackupFileManifest{manifest.Main, manifest.Facts} {
-			if file == nil || filepath.Base(file.File) != file.File {
-				continue
-			}
-			if err := os.Remove(filepath.Join(dir, file.File)); err != nil && !errors.Is(err, os.ErrNotExist) {
-				return err
-			}
-		}
-		if err := os.Remove(path); err != nil {
-			return err
-		}
-		manifests = manifests[1:]
-	}
-	return nil
-}
-
 // createStoreBackupSet holds the member-lifecycle and facts-publication
 // barriers across both VACUUM INTO operations. This is intentionally a single
 // low-frequency operation: it trades Tail progress during the snapshot for a
@@ -1112,6 +1102,13 @@ func (m *Monitor) createStoreBackupSet(parent context.Context, now time.Time, ma
 	manifest := storeBackupSetManifest{
 		Version: storeBackupSetVersion, MigrationPlan: m.currentMigrationPlanID(), SetID: setID, CreatedAt: now.Unix(),
 	}
+	identity, identityErr := runtimeBackupSourceIdentity(paths)
+	if identityErr != nil {
+		m.storeBackupSetLastFailure.Store(time.Now().Unix())
+		m.storeBackupSetVerified.Store(false)
+		return "", identityErr
+	}
+	manifest.SourceIdentity = identity
 	var mainSuccess, mainFailure, mainBytes atomic.Int64
 	var factsSuccess, factsFailure, factsBytes atomic.Int64
 	var created []string
@@ -1136,8 +1133,15 @@ func (m *Monitor) createStoreBackupSet(parent context.Context, now time.Time, ma
 
 	usageMemberMutationMu.Lock()
 	m.usageFactsSyncMu.Lock()
-	defer usageMemberMutationMu.Unlock()
-	defer m.usageFactsSyncMu.Unlock()
+	sourcesLocked := true
+	unlockSources := func() {
+		if sourcesLocked {
+			m.usageFactsSyncMu.Unlock()
+			usageMemberMutationMu.Unlock()
+			sourcesLocked = false
+		}
+	}
+	defer unlockSources()
 	var mainPath, factsPath string
 	var err error
 	if mainEnabled {
@@ -1194,7 +1198,10 @@ func (m *Monitor) createStoreBackupSet(parent context.Context, now time.Time, ma
 	}
 	m.storeBackupSetLastSuccess.Store(successAt)
 	m.storeBackupSetVerified.Store(true)
-	if err := pruneStoreBackupSets(dir, m.storeBackupRetention()); err != nil {
+	// Retention verifies immutable backup files, not live data. Do not hold
+	// publication/member barriers while hashing old recovery points.
+	unlockSources()
+	if err := pruneStoreBackupSetsWithPolicy(ctx, dir, m.storeBackupRetention(), m.storeBackupRetentionDays(), now, paths); err != nil {
 		m.storeBackupSetLastFailure.Store(time.Now().Unix())
 		return manifestPath, err
 	}
@@ -1305,6 +1312,9 @@ func pruneStoreBackups(dir string, retention int) error {
 }
 
 func pruneSQLiteBackups(dir, prefix string, retention int) error {
+	if retention < 1 {
+		return errors.New("备份保留数量必须大于零")
+	}
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return err
@@ -1312,6 +1322,11 @@ func pruneSQLiteBackups(dir, prefix string, retention int) error {
 	paths := make([]string, 0, len(entries))
 	for _, entry := range entries {
 		name := entry.Name()
+		// Once paired backups exist, only their owner may delete members.
+		// Legacy single-store cleanup must never tear a published pair apart.
+		if strings.HasPrefix(name, storeBackupSetPrefix) && strings.HasSuffix(name, storeBackupSetSuffix) {
+			return nil
+		}
 		if entry.Type().IsRegular() && strings.HasPrefix(name, prefix) && strings.HasSuffix(name, storeBackupSuffix) {
 			paths = append(paths, filepath.Join(dir, name))
 		}

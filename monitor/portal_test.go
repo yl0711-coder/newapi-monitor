@@ -1543,7 +1543,7 @@ func TestCSVSafe(t *testing.T) {
 
 func TestPortalCSVRecord(t *testing.T) {
 	r := portalCSVRecord(LogRow{CreatedAt: 1751328000, Member: "alice", TokenName: "=formula", Group: "vip", Type: 2, ModelName: "m", CostUSD: 0.12, Detail: "raw upstream detail", RequestID: "req-1"})
-	if len(r) != 12 || r[2] != "'=formula" || r[9] != "0.120000" || r[10] != "raw upstream detail" {
+	if len(r) != len(portalCSVHeader()) || r[2] != "'=formula" || r[9] != "0.120000" || r[10] != "raw upstream detail" {
 		t.Fatalf("CSV 行字段不符合预期: %#v", r)
 	}
 }
@@ -1568,7 +1568,7 @@ func TestPortalExportDefaultCapacityAccepts50000RowsWith2KiBDetails(t *testing.T
 	if _, err := limited.Write([]byte("\xEF\xBB\xBF")); err != nil {
 		t.Fatal(err)
 	}
-	header := []string{"时间", "成员", "令牌", "分组", "类型", "模型", "用时(秒)", "输入tokens", "输出tokens", "费用(美元)", "详情", "Request ID"}
+	header := portalCSVHeader()
 	if err := writer.Write(header); err != nil {
 		t.Fatal(err)
 	}
@@ -1742,13 +1742,28 @@ func TestPortalExportMidWriteENOSPCReturns507AndCleansPartialFile(t *testing.T) 
 		t.Fatal("登录失败")
 	}
 
+	// Keep the fault in a DATA row even if export columns grow. A fixed 256
+	// bytes now fails in the header and no longer exercises partial-row cleanup.
+	var header, staged bytes.Buffer
+	hw := csv.NewWriter(&header)
+	if err := hw.Write(portalCSVHeader()); err != nil {
+		t.Fatal(err)
+	}
+	hw.Flush()
+	if err := hw.Error(); err != nil {
+		t.Fatal(err)
+	}
+	failAfter := len("\xEF\xBB\xBF") + header.Len() + 256
 	router := gin.New()
 	router.GET("/api/logs/export", m.requirePortal(true), func(c *gin.Context) {
 		m.portalLogsExportWithWriter(c, portalExportMaxBytes, func(dst io.Writer) io.Writer {
-			return &portalFailAfterWriter{dst: dst, remaining: 256}
+			return &portalFailAfterWriter{dst: io.MultiWriter(dst, &staged), remaining: failAfter}
 		})
 	})
 	response := portalDo(router, http.MethodGet, "/api/logs/export?from=2026-08-02&to=2026-08-02", "", cookie)
+	if !strings.Contains(staged.String(), "enospc-model") {
+		t.Fatal("fault fired before writing a data row")
+	}
 	if response.Code != http.StatusInsufficientStorage || strings.Contains(response.Header().Get("Content-Type"), "text/csv") || response.Header().Get("Content-Disposition") != "" {
 		t.Fatalf("落盘中途 ENOSPC 必须在下载前返回 507 JSON: %d headers=%v body=%s", response.Code, response.Header(), response.Body.String())
 	}
@@ -2077,11 +2092,11 @@ func TestPortalExportUsesNativeDownloadWithoutBlobAccumulation(t *testing.T) {
 	}
 }
 
-// 客户日志 API 参数契约:与 new-api 普通用户日志一致，类型 1-6 均可筛选；
+// 客户日志 API 参数契约:与 new-api 普通用户日志一致，类型 1-7 均可筛选；
 // 超出范围的类型按“全部”处理。令牌名搜索超长仍应 400。查看与导出共用 portalLogParams,两端点都验。
 func TestPortalLogsParamContract(t *testing.T) {
 	m, _, portal := newPortalTestMonitor(t)
-	m.prodDB = newFakeProdDB(t) // type 1-6 全开放后会真的查生产库(不再在参数层短路拒绝),需要一个可查的假库
+	m.prodDB = newFakeProdDB(t) // 查询必须使用本机假来源库
 	h, _ := hashPassword("password-aaa")
 	g := CustomerGroup{Name: "A公司", PortalEmail: "a@x.com", PortalPwAdmin: h}
 	m.storeDB.Create(&g)
@@ -2090,7 +2105,7 @@ func TestPortalLogsParamContract(t *testing.T) {
 	if ck == nil {
 		t.Fatal("登录失败")
 	}
-	// 类型 1-6 全部开放(对齐 new-api 官方客户端使用日志,含错误5/退款6);越界(如7)静默当"全部",两者都不应 400。
+	// 类型 1-7 开放；type=7 的实际筛选结果另有端到端行级断言。
 	// /api/logs 不限流,循环测;/api/logs/export 有 1 次/5min 的下载限流,只在循环外单测一次,避免第二次触发 429。
 	for _, q := range []string{"type=5", "type=6", "type=7"} {
 		if w := portalDo(portal, "GET", "/api/logs?"+q, "", ck); w.Code != 200 {

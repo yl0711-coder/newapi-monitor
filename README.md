@@ -70,6 +70,7 @@ docker run -d --name newapi-monitor \
 | `MONITOR_STORE_BACKUP_ENABLED` | 运行期在线日备份开关；不影响启动时强制迁移前快照 | `true` |
 | `MONITOR_STORE_BACKUP_DIR` | 在线备份和迁移前成套快照目录 | `<MONITOR_STORE_PATH 目录>/backups` |
 | `MONITOR_STORE_BACKUP_RETENTION` | 已验证 main+facts `backup-set` 成套备份保留数 | `7` |
+| `MONITOR_STORE_BACKUP_RETENTION_DAYS` | `0` 保持按套数保留；正数改为保留最近 N 个有备份的北京时间自然日，每日最新一套，另保护最近两套（最多 N+1 套）。停机不清空旧恢复点；启用后重启可延续同一数据卷经核验的备份周期。仅管理在线 `backup-set`，不管理发布/迁移/修复备份 | `0` |
 | `MONITOR_STORE_MIGRATION_BACKUP_RETENTION` | main+facts 同一 manifest 的迁移前快照批次保留数 | `3` |
 | `MONITOR_USAGE_FACTS_ENABLED` | 后台按成员、按小时构建本地用量事实；生产部署示例固定开启 | `false` |
 | `MONITOR_USAGE_FACTS_READ_ENABLED` | 聚合页面只读取完整发布的本地事实；未完成时 fail-closed，不回扫 logs | `false` |
@@ -183,6 +184,18 @@ usage.example.com {
 - `GET /health` 只用于容器存活检查，不会因报表数据暂时延迟而触发错误重启。
 - 管理员登录后可读取 `GET /stability/health`，查看主采样新鲜度、错误采集完整覆盖时间、积压分钟和本地库状态；该接口不查询生产库。
 - Monitor SQLite 已包含稳定性历史、渠道最后快照和倍率版本，必须随 `/data` 数据卷备份。安全备份、恢复、功能关闭和镜像回退步骤见 [`docs/monitor-operations.md`](docs/monitor-operations.md)。
+
+## 在线备份按日保留（需显式启用）
+
+`MONITOR_STORE_BACKUP_RETENTION_DAYS=0` 为兼容模式；设为 `7` 后，保留最近七个**实际存在备份**的北京时间日期，每日最新一套，并额外保留最新两套。一般为 7～8 套；原来缺少的日期不会凭空补出。主库和事实库按 manifest 成套处理，不分别计数。
+
+只在新备份成功后淘汰旧套；淘汰前复核最新恢复点。清单损坏、成员缺失、链接、运行库身份冲突或 SQLite 活动边文件会中止清理并报错，不进行广泛目录扫描删除。意外中断可能留下未发布的散文件，须人工复核，不自动推断它们可删。保留数量受保护条件约束，不是磁盘字节硬上限；磁盘告警仍须保留。
+
+重启延续备份周期需同时满足源文件身份、迁移版本、成员类型和备份完整性核验；旧 manifest 或换卷恢复会重新备份。已验证快照发布后才释放成套复制屏障，旧备份核验不继续阻塞事实同步。
+
+上线应先保持新开关为 `0`，验证备份与恢复后再显式设为 `7`。停止新规则设回 `0` 即恢复按套数保留，**不会恢复已淘汰文件**；不要为回退该策略恢复业务数据库。本改动不修改 SQLite 业务结构或备份恢复格式版本。
+
+发布冷备份（最近两份已验收恢复点）、迁移快照、修复证据是独立生命周期，**不由此开关清理**。发布清理必须在新版本验收完成后另行检查挂载、保留点和完整性；当前并未自动接入发布脚本。不要对 `/opt/nexus-tools/backups` 或 Docker 卷做按目录名/年龄的统一递归删除：历史目录可能仍挂载为在线数据。
 
 ## 构建
 ```bash

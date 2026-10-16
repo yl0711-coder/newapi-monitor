@@ -11,6 +11,7 @@ package monitor
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -1188,7 +1189,7 @@ type LogRow struct {
 	ID                int64    `json:"id"`
 	CreatedAt         int64    `json:"created_at"`
 	Member            string   `json:"member"` // 成员用户名(日志写入时记录)
-	Type              int      `json:"type"`   // 1充值 2消费 3管理 4系统 5错误 6退款
+	Type              int      `json:"type"`   // 1充值 2消费 3管理 4系统 5错误 6退款 7登录
 	TokenName         string   `json:"token_name"`
 	ModelName         string   `json:"model_name"`
 	Group             string   `json:"group"`
@@ -1197,11 +1198,15 @@ type LogRow struct {
 	UseTime           int64    `json:"use_time"`                      // 总耗时(秒)
 	IsStream          bool     `json:"is_stream"`                     // 流式请求
 	FirstByteMs       int64    `json:"first_byte_ms"`                 // 首字延迟(毫秒);仅流式且有值时>0
-	CostUSD           float64  `json:"cost_usd"`                      // 费用(美元);仅消费(type=2)有值,其它类型 quota 恒为0不代表费用,置0且前端/CSV留空
+	CostUSD           float64  `json:"cost_usd"`                      // 原始额度折美元；按日志类型展示，不将错误/退款当消费
 	Detail            string   `json:"detail"`                        // 详情摘要(消费=计价摘要/退款=退款文案/其它=content)
 	RequestID         string   `json:"request_id"`                    // new-api logs.request_id,同官方客户端使用日志展示;无则空
+	UpstreamRequestID string   `json:"upstream_request_id,omitempty"` // rc26 可选来源列；历史表不存在时不要求迁移
+	IP                string   `json:"ip,omitempty"`
+	SourceFieldNotice string   `json:"source_field_notice,omitempty"`
+	HasToolSurcharge  bool     `json:"has_tool_surcharge,omitempty"`  // 标记已包含的工具费，不另加费用
 	CacheReadTokens   int64    `json:"cache_read_tokens"`             // 缓存读 tokens(other.cache_tokens);供 tokens 列下方展示,同 new-api
-	CacheWriteTokens  int64    `json:"cache_write_tokens"`            // 缓存写 tokens(优先取 5m/1h 拆分之和,否则 other.cache_creation_tokens)
+	CacheWriteTokens  int64    `json:"cache_write_tokens"`            // 消费日志采用明确总量；仅有分项时为小计，完整性见 usage_details.cache_write
 	LogContent        string   `json:"log_content,omitempty"`         // 对齐 new-api 展开区"日志详情"(renderLogContent,一句逗号连接的话);仅消费且非阶梯计费有值
 	OtherContent      string   `json:"other_content,omitempty"`       // 对齐 new-api 展开区"其他详情"(logs[i].content,仅消费(type=2)且非空时展示;已过 scrubContent 纵深防御)
 	BillingProcess    string   `json:"billing_process,omitempty"`     // 对齐 new-api 展开区"计费过程"(renderModelPrice,含具体计算公式);见 buildBillingProcess 覆盖范围
@@ -1218,6 +1223,14 @@ type LogRow struct {
 	SubRemain         string   `json:"sub_remain,omitempty"`          // 订阅剩余:"remain/total 额度"
 	BillingSource     string   `json:"billing_source,omitempty"`      // other.billing_source,=="subscription" 时前端加"订阅说明"固定提示行
 	sortTypeValid     bool     // 复合游标专用：保留历史 NULL type 的排序语义，不对外输出
+
+	UsageDetails      *portalLogDetails       `json:"usage_details,omitempty"`       // 客户安全白名单；仅日志证据，不修改扣费
+	RequestDetails    []portalLogDetailItem   `json:"request_details,omitempty"`     // 有界客户可见详情；错误脱敏，不含管理员字段
+	FirstByteEvidence *portalDurationEvidence `json:"first_byte_evidence,omitempty"` // 区分真实零值、缺失和异常；旧数值字段保持兼容
+	SourceFacts       *portalLogSourceFacts   `json:"source_facts,omitempty"`        // 可选存在标记；历史 NULL 不冒充真实零
+	billingQuota      int64
+	billingFactsValid bool // NULL source counts/quota must not become verified zero
+	streamFlagUnknown bool // Preserve missing/invalid historical request-mode evidence.
 }
 
 // logPageCursor 是使用日志的键集分页位点。新页面按
@@ -1260,9 +1273,17 @@ func logTypeName(t int) string {
 		return "错误"
 	case 6:
 		return "退款"
+	case 7:
+		return "登录"
 	default:
 		return "其它"
 	}
+}
+
+// rc26 DISPLAYABLE_LOG_TYPES. Displaying recorded amounts does not add these
+// rows to consumption aggregates or change any quota.
+func portalLogHasRecordedAmount(t int) bool {
+	return t == 0 || t == 2 || t == 5 || t == 6
 }
 
 // logOther 日志 other JSON 里【仅】我们要用的安全字段:首字延迟 + 计价摘要所需的价格/倍率。
@@ -1661,13 +1682,15 @@ func scrubContent(content string) string {
 // useUsageLogsData.jsx setLogsFormat 的【非管理员】分支字段列表与出现顺序(管理员专属字段——渠道信息/
 // 拦截原因/流状态/请求转换/计费模式/订单支付方式等——普通客户端本就看不到,此处天然不产出)。
 func populateExpandFields(r *LogRow, o *logOther, content string) {
+	// Historical logs can have content but no other JSON. Keep that original
+	// customer-visible explanation even when no pricing metadata is available.
+	if r.Type == 2 && content != "" {
+		r.OtherContent = scrubContent(content)
+	}
 	if o == nil {
 		return
 	}
 	r.LogContent = buildLogContent(r.Type, o)
-	if r.Type == 2 && content != "" {
-		r.OtherContent = scrubContent(content) // 与 Detail 回退口径一致,先剔"渠道"内部字样纵深防御
-	}
 	if r.Type == 2 {
 		if o.IsModelMapped && o.UpstreamModelName != "" {
 			r.IsModelMapped = true
@@ -1702,32 +1725,29 @@ func populateExpandFields(r *LogRow, o *logOther, content string) {
 		if o.SubscriptionID != nil && *o.SubscriptionID != 0 {
 			r.SubInstance = fmt.Sprintf("#%d", *o.SubscriptionID)
 		}
-		pre := int64(0)
+		var settlement []string
 		if o.SubscriptionPreConsumed != nil {
-			pre = *o.SubscriptionPreConsumed
+			settlement = append(settlement, fmt.Sprintf("预扣：%d 额度", *o.SubscriptionPreConsumed))
 		}
-		postDelta := int64(0)
-		if o.SubscriptionPostDelta != nil {
-			postDelta = *o.SubscriptionPostDelta
+		if o.SubscriptionPostDelta != nil && *o.SubscriptionPostDelta != 0 {
+			settlement = append(settlement, fmt.Sprintf("结算差额：%+d 额度", *o.SubscriptionPostDelta))
 		}
-		finalConsumed := pre + postDelta
 		if o.SubscriptionConsumed != nil {
-			finalConsumed = *o.SubscriptionConsumed
+			settlement = append(settlement, fmt.Sprintf("最终抵扣：%d 额度", *o.SubscriptionConsumed))
 		}
-		deltaSign := ""
-		if postDelta > 0 {
-			deltaSign = "+"
-		}
-		r.SubSettlement = fmt.Sprintf("预扣：%d 额度\n结算差额：%s%d 额度\n最终抵扣：%d 额度", pre, deltaSign, postDelta, finalConsumed)
-		if o.SubscriptionRemain != nil && o.SubscriptionTotal != nil {
-			r.SubRemain = fmt.Sprintf("%d/%d 额度", *o.SubscriptionRemain, *o.SubscriptionTotal)
+		r.SubSettlement = strings.Join(settlement, "\n")
+		if o.SubscriptionRemain != nil {
+			r.SubRemain = fmt.Sprintf("%d 额度", *o.SubscriptionRemain)
+			if o.SubscriptionTotal != nil {
+				r.SubRemain = fmt.Sprintf("%d/%d 额度", *o.SubscriptionRemain, *o.SubscriptionTotal)
+			}
 		}
 	}
 }
 
 // logFilterWhere 拼日志筛选的公共 WHERE(不含游标/排序/上限);全部用户可控值参数化,无注入。
 // 查看(queryGroupLogs)与计数(countGroupLogs)共用,保证两者筛选口径完全一致。logType=0 表示全部类型。
-// 类型口径对齐 new-api 官方客户端使用日志(model.GetUserLogs):普通用户可见全部 6 种类型,
+// 类型口径对齐 new-api 官方客户端使用日志(model.GetUserLogs):包含 rc26 的登录类型(7),
 // 含错误(5)/退款(6)——官方不在查询层屏蔽,靠写入时已脱敏的 content(见 buildLogDetail/scrubContent)+
 // 不回传渠道信息兜底,故此处不再排除 5/6。
 func (m *Monitor) logFilterWhere(ids []int64, fromTs, toTs, memberUID int64, logType int, model, group, tokenName, detailKw, requestID string) (string, []any) {
@@ -1735,7 +1755,7 @@ func (m *Monitor) logFilterWhere(ids []int64, fromTs, toTs, memberUID int64, log
 	where := "created_at >= ? AND created_at < ? AND " + inSQL +
 		" AND NOT (" + m.channelTestSourcePredicateSQL() + ")"
 	args := append([]any{fromTs, toTs}, inArgs...)
-	if logType > 0 { // 仅看某类型(1-6 全部开放,同 new-api 官方客户端使用日志)
+	if logType > 0 { // 仅看某类型(1-7 全部开放,同 new-api 官方客户端使用日志)
 		where += " AND type = ?"
 		args = append(args, logType)
 	}
@@ -1934,8 +1954,8 @@ func (m *Monitor) queryGroupLogsWithLane(ctx context.Context, ids []int64, fromT
 	where, args := m.logFilterWhere(ids, fromTs, toTs, memberUID, logType, model, group, tokenName, detailKw, requestID)
 	where, args = appendCompositeLogCursor(where, args, cursor)
 	// NewAPI 历史版本与迁移数据可能让计数/耗时/流式标记保留 NULL。
-	// 这些字段在客户日志语义上都等价于 0；直接 Scan 到 int64/int 会使
-	// 整个分页返回 500。查询层统一归零，既兼容历史数据，也不改变筛选口径。
+	// 旧数值字段仍保留兼容占位；计费核验与新增详情单独保留缺失状态，不能
+	// 因 COALESCE 将未知当成实际零值。筛选、分页与游标口径不变。
 	maxExecutionMS := 3000
 	if export {
 		maxExecutionMS = 8000
@@ -1946,9 +1966,10 @@ func (m *Monitor) queryGroupLogsWithLane(ctx context.Context, ids []int64, fromT
 		fromClause = m.logSourceClause(ids, memberUID, model, group, tokenName, requestID)
 		orderBy = "created_at DESC, type DESC, id DESC"
 	}
+	optionalColumns := m.portalLogOptionalColumns(cctx)
 	q := "SELECT /*+ MAX_EXECUTION_TIME(" + strconv.Itoa(maxExecutionMS) + ") */ id, created_at, COALESCE(username,''), COALESCE(token_name,''), COALESCE(model_name,''), COALESCE(`group`,'')," +
-		" COALESCE(prompt_tokens,0), COALESCE(completion_tokens,0), COALESCE(use_time,0), COALESCE(quota,0), COALESCE(type,0), type IS NOT NULL, COALESCE(is_stream,0)," +
-		" COALESCE(content,''), COALESCE(other,''), COALESCE(request_id,'')" +
+		" prompt_tokens, completion_tokens, COALESCE(use_time,0), quota, COALESCE(type,0), type IS NOT NULL, is_stream," +
+		" COALESCE(content,''), COALESCE(other,''), COALESCE(request_id,''), (quota IS NOT NULL AND prompt_tokens IS NOT NULL AND completion_tokens IS NOT NULL)" + optionalColumns.selectSQL() +
 		" FROM " + fromClause + " WHERE " + where + " ORDER BY " + orderBy + " LIMIT " + strconv.Itoa(limit)
 	rows, err := m.prodDB.QueryContext(cctx, q, args...)
 	if err != nil {
@@ -1958,18 +1979,29 @@ func (m *Monitor) queryGroupLogsWithLane(ctx context.Context, ids []int64, fromT
 	out := make([]LogRow, 0, limit)
 	for rows.Next() {
 		var r LogRow
+		var prompt, completion, sourceQuota sql.NullInt64
 		var quota int64
-		var isStream, typeValid int
+		var isStream sql.NullInt64
+		var typeValid, billingValid int
 		var content, other string
-		if err := rows.Scan(&r.ID, &r.CreatedAt, &r.Member, &r.TokenName, &r.ModelName, &r.Group, &r.PromptTokens, &r.CompletionTokens, &r.UseTime, &quota, &r.Type, &typeValid, &isStream, &content, &other, &r.RequestID); err != nil {
+		if err := rows.Scan(&r.ID, &r.CreatedAt, &r.Member, &r.TokenName, &r.ModelName, &r.Group, &prompt, &completion, &r.UseTime, &sourceQuota, &r.Type, &typeValid, &isStream, &content, &other, &r.RequestID, &billingValid, &r.IP, &r.UpstreamRequestID); err != nil {
 			return nil, err
 		}
+		if r.Type != 2 && r.Type != 5 && r.Type != 7 {
+			r.IP = ""
+		}
+		if optionalColumns.unavailable {
+			r.SourceFieldNotice = "IP / 上游请求 ID 字段暂未取得，不影响原始用量和费用。"
+		}
+		r.PromptTokens, r.CompletionTokens, quota = prompt.Int64, completion.Int64, sourceQuota.Int64
+		r.SourceFacts = &portalLogSourceFacts{PromptPresent: prompt.Valid, CompletionPresent: completion.Valid, QuotaPresent: sourceQuota.Valid}
 		r.sortTypeValid = typeValid != 0
-		r.IsStream = isStream != 0
+		r.billingQuota, r.billingFactsValid = quota, billingValid != 0
+		r.IsStream = isStream.Int64 != 0
+		r.streamFlagUnknown = !isStream.Valid || (isStream.Int64 != 0 && isStream.Int64 != 1)
 		o := parseLogOther(other)
-		// 费用仅消费(type=2)有意义:充值/管理/系统在 new-api 里 quota 恒为 0(金额只写在 content),
-		// 折美元会得 $0.00 误导客户对账,故非消费不给 CostUSD,前端/CSV 费用列留空。
-		if r.Type == 2 {
+		// 退款也有原始 quota；只展示退款原值，绝不参与消费聚合或重新计费。
+		if portalLogHasRecordedAmount(r.Type) {
 			r.CostUSD = float64(quota) / quotaPerUSD
 		}
 		if r.IsStream && o != nil && o.FRT > 0 {
@@ -1988,6 +2020,13 @@ func (m *Monitor) queryGroupLogsWithLane(ctx context.Context, ids []int64, fromT
 		}
 		r.Detail = buildLogDetail(r.Type, o, content)
 		populateExpandFields(&r, o, content)
+		legacyBillingText := r.BillingProcess
+		populatePortalLogEvidence(&r, other)
+		// The old task renderer deduplicates content into BillingProcess. If the
+		// new checker withholds that formula, keep the original task explanation.
+		if r.Type == 2 && r.OtherContent == "" && legacyBillingText != "" && legacyBillingText == scrubContent(content) && legacyBillingText != r.BillingProcess {
+			r.OtherContent = scrubContent(content)
+		}
 		out = append(out, r)
 	}
 	if err := rows.Err(); err != nil {

@@ -46,8 +46,9 @@ type Monitor struct {
 	ecsLogVerifications   atomic.Int32
 	ecsLogRequests        atomic.Int32
 	cfg                   Settings
-	prodDB                *sql.DB  // new-api 生产库【只读】连接(采样器周期查询 + 用户用量按需查询);nil = 未连接
-	storeDB               *gorm.DB // 本地采样库
+	prodDB                *sql.DB              // new-api 生产库【只读】连接(采样器周期查询 + 用户用量按需查询);nil = 未连接
+	portalLogColumns      portalLogColumnCache // Usage 可选来源列元数据缓存；不迁移业务表
+	storeDB               *gorm.DB             // 本地采样库
 	// usageFactsDB 独立承载高增长的用量小时/日事实、同步水位和资料快照。
 	// 生产通过 New 创建时默认与 storeDB 分文件，避免补数、WAL 膨胀、损坏或
 	// 写锁把告警配置、渠道配置和其他 Monitor 页面一起拖垮。测试直接调用
