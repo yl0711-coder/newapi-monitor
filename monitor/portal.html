@@ -173,6 +173,8 @@
   .cbox-empty{padding:7px 12px;font-size:13px;color:var(--muted)}
   .exp-btn{margin-left:auto;background:var(--green);color:#fff;border:none;border-radius:8px;padding:8px 16px;font-size:13px;font-weight:600;cursor:pointer;display:inline-flex;align-items:center;gap:6px}
   .exp-btn:disabled{opacity:.5;cursor:default}
+  .exp-btn[hidden]{display:none}
+  #billResumeBtn{margin-left:0;background:transparent;color:var(--muted);border:1px solid var(--border)}
   /* 导出说明:按钮旁 ? 图标(实心醒目),悬停/聚焦弹出规则卡片(右对齐防溢出) */
   .exp-help{position:relative;display:inline-flex;align-items:center;justify-content:center;width:24px;height:24px;background:var(--accent);border:none;border-radius:50%;color:#fff;font-size:14px;font-weight:700;cursor:help;user-select:none;flex:none;box-shadow:0 1px 3px rgba(82,87,224,.35)}
   .exp-help:hover,.exp-help:focus{background:#3f44c9;outline:none}
@@ -286,6 +288,7 @@
   .modal label{display:block;font-size:12px;color:var(--muted);margin:12px 0 5px}
   .modal input{width:100%;background:var(--bg);border:1px solid var(--border);border-radius:8px;color:var(--text);padding:9px 12px;font-size:14px}
   .modal .row{display:flex;gap:10px;margin-top:20px;justify-content:flex-end}
+  #expMask .modal{max-width:calc(100vw - 32px)}
   .btn{border:1px solid var(--border);border-radius:8px;padding:8px 16px;font-size:13px;cursor:pointer;background:transparent;color:var(--text)}
   .btn.p{background:var(--accent);border-color:var(--accent);color:#fff}
   .msg{font-size:13px;margin-top:10px;min-height:16px}
@@ -369,16 +372,25 @@
     <input id="logRequestId" placeholder="Request ID" style="width:150px" maxlength="64" autocomplete="off">
     <button type="button" class="btn p" id="logDetailKwBtn">查询</button>
     <button class="exp-btn" id="expBtn">⬇ 导出 CSV</button>
+    <button class="exp-btn" id="billBtn" title="按当前筛选导出消费账单，不含充值、退款。实际收费沿用原始扣费额度÷500000；原价参考按本条日志记录的基础单价、命中档位及计费变量计算，不乘分组倍率，再按固定比例×7展示为元，并非独立核验的官方历史账单。无法核验时留空，不表示免费。">⬇ 导出账单</button>
+    <button class="exp-btn" id="billResumeBtn" hidden title="恢复本标签页上次的账单任务，使用上次导出范围，不应用当前筛选；过期后需重新生成。">恢复上次账单</button>
     <span class="exp-help" tabindex="0">?
       <span class="tip">
-        <b>导出说明</b>
+        <b>使用日志 CSV</b>
         · 按当前筛选条件导出,时间范围最长一年<br>
         · 单次最多 5 万条;超出会先确认,导出最新 5 万条,更早的请缩小范围分段导<br>
         · 每 5 分钟可导出 1 次(仅成功下载计次)<br>
         · 时间为北京时间（UTC+8），费用单位为美元，保留 6 位小数<br>
         · 金额按原始日志展示；请结合“金额性质”和“计费来源”区分消费、退款与订阅抵扣，不直接混合求和<br>
         · 缓存分项不可直接与输入 Tokens 相加；计价依据请看“费用计算说明”，不适用或未记录的字段留空<br>
-        · UTF-8 CSV，常用字段独立成列；“费用计算说明”和“补充详情”可在 Excel / WPS 中开启自动换行
+        · UTF-8 CSV，常用字段独立成列；“费用计算说明”和“补充详情”可在 Excel / WPS 中开启自动换行<br><br>
+        <b>消费账单 CSV</b>
+        · 按当前日期及账户、令牌、分组、模型等筛选导出消费日志，不跟随日志类型筛选；不包含充值、退款、错误或登录记录<br>
+        · 历史计费信息缺失时仍保留原始扣费；缺少原始扣费或包含订阅额度抵扣时暂不能生成账单，不会静默漏行<br>
+        · 固定 14 列，Request ID 后是“类型”（如文本）；不含 IP、上游 Request ID 或内部说明<br>
+        · 北京时间精确到秒；Token 为整数；金额以元展示并保留 6 位小数，折数保留 2 位小数<br>
+        · 原价参考不是官方账单；未核验的原价、折扣或用量留空，不代表零值<br>
+        · 超过 5 万条请缩小时间范围，不截断；与日志导出共用每 5 分钟 1 次的成功下载限额
       </span>
     </span>
   </div>
@@ -404,9 +416,9 @@
   <div class="modal" style="width:380px">
     <h3 id="expTitle">正在导出</h3>
     <div class="exp-bar indet" id="expBar"><span></span></div>
-    <div class="exp-status" id="expStatus">正在查询日志…</div>
+    <div class="exp-status" id="expStatus" role="status" aria-live="polite">正在查询日志…</div>
     <div class="exp-sub" id="expSub"></div>
-    <div class="row"><button class="btn" id="expCancel">取消</button></div>
+    <div class="row"><button class="btn" id="expAction" hidden></button><button class="btn" id="expCancel">取消</button></div>
   </div>
 </div>
 
@@ -1447,6 +1459,171 @@ $('logRequestId').addEventListener('keydown',e=>{if(e.key==='Enter')loadLogs(tru
 // 先预检一次并取得服务端签名票据，再交给浏览器原生下载。CSV 不再经过
 // fetch reader + chunks + Blob，因此前端内存不会随最多 5 万行日志增长。
 let exporting=false,expCtrl=null,expTimer=null,expHeaders=false,pendingExportTicket='';
+let billExportClient=null;
+// Remember only a task ID in this tab, never tickets, amounts or permissions.
+// Storage is optional; the server remains authoritative after every reload.
+function createBillTaskMemory(getStorage,now=()=>Date.now()){
+  const key='usage-bill-task-v1';
+  function clear(){try{getStorage().removeItem(key);}catch{}}
+  function read(){
+    try{
+      const v=JSON.parse(getStorage().getItem(key));
+      if(!v||!/^[a-f0-9]{32}$/.test(v.id)||!Number.isSafeInteger(v.savedAt)||v.savedAt>now()||now()-v.savedAt>=600000){clear();return '';}
+      return v.id;
+    }catch{clear();return '';}
+  }
+  function save(id){try{if(/^[a-f0-9]{32}$/.test(id))getStorage().setItem(key,JSON.stringify({id,savedAt:now()}));}catch{}}
+  return {read,save,clear};
+}
+const billTaskMemory=createBillTaskMemory(()=>window.sessionStorage);
+function updateBillResumeButton(){
+  const btn=$('billResumeBtn');if(btn){btn.hidden=!billTaskMemory.read();btn.disabled=exporting;}
+}
+function rememberBillTask(v){
+  if(['failed','canceled'].includes(v.state))billTaskMemory.clear();
+  else if(v.task)billTaskMemory.save(v.task.id);
+  updateBillResumeButton();
+}
+// No CSV body enters JS memory. Only small task metadata is polled; downloads
+// require a fresh user click and go directly to the browser download manager.
+function createBillExportClient(request,wait,changed){
+  let task=null,busy=false,cancelRequested=false,recoveryID='';
+  const messages={authorization_changed:'成员权限已变化，请重新登录后导出',file_too_large:'账单文件过大，请缩小时间范围',row_count_mismatch:'生成期间日志数量发生变化，请重新导出',generation_timeout:'生成超时，请缩小时间范围后重试',generation_failed:'账单未通过生成或完整性检查，请稍后重试'};
+  function validate(v){
+    if(!v||!/^[a-f0-9]{32}$/.test(v.id)||!['queued','running','ready','failed','canceled'].includes(v.state)||
+      !Number.isSafeInteger(v.rows)||!Number.isSafeInteger(v.total)||v.rows<0||v.total<0||v.rows>v.total||v.total>50000||
+      (task&&(v.id!==task.id||v.total!==task.total))||
+      (v.state==='ready'&&(v.rows!==v.total||!Number.isSafeInteger(v.bytes)||v.bytes<=0||!/^[a-f0-9]{64}$/.test(v.sha256)))){
+      throw new Error('账单服务返回格式不兼容，请刷新页面后重试');
+    }
+    return v;
+  }
+  function emit(state,message=''){changed({state,message,task,cancelRequested});}
+  async function run(ticket,restoreID=''){
+    if(busy)return;
+    busy=true;let awaitingCreation=!!ticket;
+    try{
+      if(restoreID){
+        task=null;cancelRequested=false;emit('restoring');
+        if(!/^[a-f0-9]{32}$/.test(restoreID))throw new Error('任务记录无效，请重新导出');
+        recoveryID=restoreID;
+        const d=await request('/api/logs/bill/tasks/'+restoreID,'GET');
+        if(d.task?.id!==restoreID)throw new Error('任务记录不匹配，请重新导出');
+        task=validate(d.task);
+        recoveryID='';
+      }
+      if(ticket){
+        task=null;recoveryID='';cancelRequested=false;emit('creating');
+        const d=await request('/api/logs/bill/tasks','POST',{ticket});
+        awaitingCreation=false;
+        task=validate(d.task);
+      }
+      if(!task)throw new Error('任务不存在，请重新导出');
+      // Bounded foreground polling. Pausing polling never creates another job.
+      for(let i=0;i<=60;i++){
+        if(cancelRequested){
+          emit('canceling');
+          await request('/api/logs/bill/tasks/'+task.id+'/cancel','POST',{});
+          task={...task,state:'canceled'};cancelRequested=false;emit('canceled');return;
+        }
+        if(task.state==='ready'){emit('ready');return;}
+        if(task.state==='failed'){emit('failed',messages[task.failure_code]||messages.generation_failed);return;}
+        if(task.state==='canceled'){emit('canceled');return;}
+        if(i===60)break;
+        emit(task.state);
+        await wait(1000);
+        if(cancelRequested)continue;
+        const d=await request('/api/logs/bill/tasks/'+task.id,'GET');
+        task=validate(d.task);
+      }
+      emit('paused','状态检查已暂停；点击继续检查，不会重复生成账单');
+    }catch(e){
+      const terminal=[401,403,404].includes(e.status);
+      if(terminal){task=null;recoveryID='';}
+      if(awaitingCreation&&![400,401,403,404,429].includes(e.status)){
+        emit('unconfirmed','任务提交结果未确认，请稍后重试；本次尚未发起下载');
+      }else emit(task||recoveryID?'paused':'failed',e.message||'网络中断，请稍后重试');
+    }finally{busy=false;}
+  }
+  return {start:ticket=>run(ticket),restore:id=>run(null,id),resume:()=>run(null,recoveryID),cancel(){cancelRequested=true;if(!busy)return run();},
+    pending:()=>!!recoveryID||!!task&&['queued','running'].includes(task.state)};
+}
+async function billTaskRequest(path,method,body){
+  const ctrl=new AbortController(),timer=setTimeout(()=>ctrl.abort(),10000);
+  try{
+    const r=await fetch(path,{method,credentials:'same-origin',cache:'no-store',signal:ctrl.signal,
+      headers:method==='POST'?{'Content-Type':'application/json','X-Usage-Bill-Request':'1'}:{},
+      ...(body?{body:JSON.stringify(body)}:{})});
+    const d=await r.json().catch(()=>({}));
+    if(!r.ok||d.ok!==true){
+      const messages={400:'账单请求已失效，请重新导出',401:'登录或成员权限已变化，请重新登录',403:'请求来源或权限校验失败，请刷新页面',404:'任务不存在或已过期，请重新导出',409:'账单尚未完成',429:'导出任务繁忙，请稍后继续检查',503:'账单服务暂不可用，请稍后继续检查'};
+      const e=new Error(messages[r.status]||'账单服务返回异常，请稍后重试');e.status=r.status;throw e;
+    }
+    return d;
+  }catch(e){if(e.name==='AbortError')throw new Error('查询超时；可继续检查已有任务');throw e;}
+  finally{clearTimeout(timer);}
+}
+function renderBillTask(v){
+  rememberBillTask(v);
+  $('expMask').style.display='flex';$('expAction').hidden=true;$('expCancel').disabled=false;
+  $('expCancel').textContent='取消任务';$('expCancel').onclick=()=>{
+    $('expCancel').disabled=true;
+    expStatus('正在确认并取消任务','取消成功前不会显示为已取消');
+    if(exporting)billExportClient.cancel();else resumeBillExport(true);
+  };
+  const labels={restoring:'正在恢复上次账单',creating:'正在提交账单任务',queued:'账单等待生成',running:'正在生成账单',canceling:'正在取消任务',ready:'账单已生成',failed:'账单生成失败',canceled:'账单任务已取消',paused:'账单状态待确认',unconfirmed:'账单提交结果待确认'};
+  $('expTitle').textContent=labels[v.state];setExpBar(null);
+  expStatus(v.message||labels[v.state],'仅消费记录；生成完成并核验通过后才可下载');
+  if(v.state==='running'&&v.task){
+    setExpBar(v.task.total?Math.min(.99,v.task.rows/v.task.total):null);
+    expStatus(`已整理 ${v.task.rows.toLocaleString()} / ${v.task.total.toLocaleString()} 条`,'正在核验完整性，尚未开始下载');
+  }
+  if(v.state==='canceling')$('expCancel').disabled=true;
+  if(v.state==='restoring'||(v.state==='paused'&&!v.task)){
+    $('expCancel').textContent='关闭';$('expCancel').onclick=closeExp;
+  }
+  if(v.state==='ready'){
+    setExpBar(1);expStatus(`共 ${v.task.total.toLocaleString()} 条消费记录`,'文件暂存约 10 分钟，过期需重新生成；下载结果请在浏览器中确认');
+    $('expAction').hidden=false;$('expAction').textContent='下载账单';
+    $('expAction').onclick=()=>{
+      const a=document.createElement('a');a.href='/api/logs/bill/tasks/'+v.task.id+'/download';a.download='usage-bill.csv';a.hidden=true;
+      document.body.appendChild(a);a.click();a.remove();
+      expStatus('已请求浏览器下载','请检查浏览器下载结果；此提示不代表文件已保存成功');
+    };
+  }
+  if(v.state==='paused'){
+    $('expAction').hidden=false;$('expAction').textContent='继续检查';$('expAction').onclick=()=>resumeBillExport();
+  }
+  if(['ready','failed','canceled','unconfirmed'].includes(v.state)){
+    $('expCancel').textContent='关闭';$('expCancel').onclick=closeExp;
+  }
+}
+async function runBillExport(ticket){
+  clearInterval(expTimer);expHeaders=true;
+  billTaskMemory.clear();
+  billExportClient=createBillExportClient(billTaskRequest,ms=>new Promise(resolve=>setTimeout(resolve,ms)),renderBillTask);
+  await billExportClient.start(ticket);
+}
+async function restoreBillExport(){
+  if(exporting)return;
+  const id=billTaskMemory.read();updateBillResumeButton();if(!id)return;
+  exporting=true;$('expBtn').disabled=true;$('billBtn').disabled=true;updateBillResumeButton();
+  clearInterval(expTimer);expHeaders=true;
+  // Explicit separate action: never silently substitute an old scope for the
+  // current filters. Metadata and authorization must be re-read from server.
+  billExportClient=createBillExportClient(billTaskRequest,ms=>new Promise(resolve=>setTimeout(resolve,ms)),v=>{
+    renderBillTask(v);
+    if(v.state==='ready')$('expSub').textContent='这是上次导出范围的账单，不应用当前筛选；过期需重新生成';
+  });
+  try{await billExportClient.restore(id);}
+  finally{exporting=false;$('expBtn').disabled=false;$('billBtn').disabled=false;updateBillResumeButton();}
+}
+async function resumeBillExport(cancel=false){
+  if(exporting||!billExportClient)return;
+  exporting=true;$('expBtn').disabled=true;$('billBtn').disabled=true;
+  try{if(cancel)await billExportClient.cancel();else await billExportClient.resume();}
+  finally{exporting=false;$('expBtn').disabled=false;$('billBtn').disabled=false;updateBillResumeButton();}
+}
 function setExpBar(pct){ // pct null=不定态(转圈),数字=确定进度
   const bar=$('expBar'),span=bar.firstElementChild;
   if(pct==null){bar.classList.add('indet');span.style.width='';}
@@ -1466,11 +1643,17 @@ function beginNativeExport(ticket,confirm){
   exporting=false;expCtrl=null;$('expBtn').disabled=false;
   setTimeout(closeExp,1800);
 }
-async function startExport(){
+async function startExport(format=''){
   if(exporting)return;
+  if(format==='bill-v1'&&billExportClient&&billExportClient.pending()){
+    await resumeBillExport();return;
+  }
+  $('expAction').hidden=true;
+  $('expCancel').onclick=()=>{if(expCtrl&&exporting)expCtrl.abort();else closeExp();};
   pendingExportTicket='';
   exporting=true;expHeaders=false;
   $('expBtn').disabled=true;
+  $('billBtn').disabled=true;
   $('expTitle').textContent='正在导出';
   $('expCancel').textContent='取消';$('expCancel').disabled=false;
   setExpBar(null);expStatus('正在查询日志…','');
@@ -1486,11 +1669,25 @@ async function startExport(){
     expStatus(msg,`已用 ${s} 秒`);
   },500);
   try{
-    const r=await fetch(`/api/logs/export/prepare?${logQuery()}`,{signal:ctrl.signal});
+    const r=await fetch(format==='bill-v1'?`/api/logs/export/prepare?${logQuery()}&format=bill-v1`:`/api/logs/export/prepare?${logQuery()}`,{signal:ctrl.signal});
     const d=await r.json().catch(()=>({}));
     if(!r.ok||!d.ok){expFail(d.error||'导出失败');return;}
     const contractError=logContractError(d);
     if(contractError){expFail(contractError);return;}
+    if(format==='bill-v1'){
+      if(d.format!=='bill-v1'||typeof d.ticket!=='string'||!d.ticket){expFail('服务版本不支持账单导出，请刷新页面后重试');return;}
+      if(d.need_confirm){expFail('账单不能截断导出，请缩小时间范围');return;}
+      if(d.bill_task_contract!==undefined){
+        if(d.bill_task_contract!==1){expFail('账单任务版本不兼容，请刷新页面后重试');return;}
+        await runBillExport(d.ticket);return;
+      }
+      // Dedicated route fails closed after a rollback; no silent ordinary-CSV fallback.
+      const a=document.createElement('a');a.href='/api/logs/bill/v1?'+new URLSearchParams({ticket:d.ticket});a.download='usage-bill.csv';a.hidden=true;
+      document.body.appendChild(a);a.click();a.remove();
+      $('expTitle').textContent='账单导出已请求';setExpBar(1);
+      expStatus('请查看浏览器下载结果','按所选范围导出消费记录，不跟随日志类型筛选。实际收费保留原始扣费；原价、折扣或用量空白不代表零值。缺少原始扣费或包含订阅抵扣时，拒绝整份账单。');
+      $('expCancel').textContent='关闭';return;
+    }
     if(d.need_confirm){pendingExportTicket=d.ticket||'';closeExp();askExportConfirm(d.cap,d.total,d.total_exact!==false);return;}
     beginNativeExport(d.ticket,false);
   }catch(e){
@@ -1498,11 +1695,16 @@ async function startExport(){
     else expFail('网络中断,请重试');
   }finally{
     clearInterval(expTimer);
+    $('billBtn').disabled=false;
     if(expCtrl===ctrl){exporting=false;expCtrl=null;$('expBtn').disabled=false;}
+    updateBillResumeButton();
   }
 }
 function expFail(msg){$('expTitle').textContent='导出失败';setExpBar(0);expStatus(msg,'');$('expCancel').textContent='关闭';}
 $('expBtn').onclick=()=>startExport();
+$('billBtn').onclick=()=>startExport('bill-v1');
+if($('billResumeBtn'))$('billResumeBtn').onclick=restoreBillExport;
+updateBillResumeButton();
 $('expCancel').onclick=()=>{if(expCtrl&&exporting)expCtrl.abort();else closeExp();};
 // 超 5 万条确认框
 function askExportConfirm(cap,total,totalExact){

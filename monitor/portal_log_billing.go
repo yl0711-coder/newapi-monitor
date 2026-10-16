@@ -6,10 +6,11 @@ import (
 )
 
 type portalBillingCheck struct {
-	State    string `json:"state"` // matched / incomplete / unsupported / mismatch
-	Message  string `json:"message"`
-	Formula  string `json:"formula,omitempty"`
-	Readable string `json:"readable,omitempty"`
+	baseUSD  *big.Rat // internal exact subtotal before group ratio; never serialized
+	State    string   `json:"state"` // matched / incomplete / unsupported / mismatch
+	Message  string   `json:"message"`
+	Formula  string   `json:"formula,omitempty"`
+	Readable string   `json:"readable,omitempty"`
 }
 
 // This is a bounded explanation, not a billing engine. Only plain-text and
@@ -140,6 +141,7 @@ func checkPortalBilling(r LogRow, e portalLogEvidence) portalBillingCheck {
 		rounding += "，适用最小扣费 1 额度"
 	}
 	return portalBillingCheck{State: "matched", Message: "按已记录字段复核，与本条实际扣费一致；不代表原始计费记录已完整审计。",
+		baseUSD:  portalBillingBaseUSD(displayTerms),
 		Readable: portalReadableBilling(displayTerms, group, quota.Int64(), minimum),
 		Formula:  fmt.Sprintf("%s\n%s = %s 额度\n实际扣费：%s ÷ 500000 = $%s（沿用平台美元展示口径）", expression, rounding, quota.String(), quota.String(), amountUSD)}
 }

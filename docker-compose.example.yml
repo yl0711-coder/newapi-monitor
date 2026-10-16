@@ -18,6 +18,8 @@ services:
       - MONITOR_SESSION_SECRET=${MONITOR_SESSION_SECRET:-}
       - MONITOR_UPSTREAM_CREDENTIAL_SECRET=${MONITOR_UPSTREAM_CREDENTIAL_SECRET:-}
       - MONITOR_PORTAL_ADDR=:8091
+      # 独立 opt-in；只影响客户账单，普通使用日志 CSV 不变。
+      - MONITOR_PORTAL_BILL_TASKS_ENABLED=${MONITOR_PORTAL_BILL_TASKS_ENABLED:-false}
       # 同机 Caddy/Nginx 的来源；若反代在容器/其他主机，请按实际网段修改。
       - MONITOR_TRUSTED_PROXIES=127.0.0.1,::1
       - MONITOR_STORE_PATH=/data/monitor.db

@@ -152,6 +152,8 @@ type Monitor struct {
 	shutdownInitOnce          sync.Once
 	closeOnce                 sync.Once
 	portalGCOnce              sync.Once
+	portalBillMu              sync.Mutex
+	portalBillService         *portalBillTasks
 	shutdown                  chan struct{}
 	processStartedAt          atomic.Int64
 	shuttingDown              atomic.Bool
@@ -1014,6 +1016,13 @@ func (m *Monitor) Close() {
 	m.closeOnce.Do(func() {
 		m.shuttingDown.Store(true)
 		close(m.shutdownSignal())
+		billStopCtx, billStopCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		billStopped := m.stopPortalBillTasks(billStopCtx)
+		billStopCancel()
+		if !billStopped {
+			slog.Error("客户账单生成任务未按时退出，保留数据库连接等待进程退出")
+			return
+		}
 		giftStopCtx, giftStopCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		giftStopped := m.financeGiftTask.shutdown(giftStopCtx)
 		giftStopCancel()

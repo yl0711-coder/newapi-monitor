@@ -15,11 +15,11 @@ function harness(){
     AbortController,URLSearchParams,esc:String,
     logStack:[0,42],logTotal:99,logSeq:0,logAbort:null,logLoading:false,
     logRowsCache:[{type:6,cost_usd:0.0002}],logHasMore:true,logNextCursor:43,
-    exporting:false,expHeaders:false,expCtrl:null,expTimer:null,pendingExportTicket:'stale-ticket',
+    exporting:false,expHeaders:false,expCtrl:null,expTimer:null,pendingExportTicket:'stale-ticket',billExportClient:null,
     $(id){if(!elements.has(id))elements.set(id,{innerHTML:'',textContent:'',style:{},disabled:false});return elements.get(id);},
     logQuery:()=> 'from=2026-10-14&to=2026-10-14&type=7',
     hideLogRawTip(){},renderLogRows(rows){rendered.push(rows);},renderLogPager(){},
-    setInterval:()=>1,clearInterval(){},setExpBar(){},expStatus(){},closeExp(){},askExportConfirm(){},
+    setInterval:()=>1,clearInterval(){},setExpBar(){},expStatus(){},closeExp(){},askExportConfirm(){},updateBillResumeButton(){},
     beginNativeExport(ticket,confirm){downloads.push({ticket,confirm});},
     expFail(message){failures.push(message);},
   });
@@ -113,4 +113,35 @@ test('native download uses a versioned path absent from the old server, includin
   assert.deepEqual(links,['/api/logs/export/v1?ticket=signed%2Bticket','/api/logs/export/v1?ticket=signed%2Bticket&confirm=1']);
   // No automatic fallback to the legacy route: a rollback between prepare and download returns 404, not a different CSV.
   assert.doesNotMatch(page.match(/^function beginNativeExport\([^]*?^}/m)[0],/href='\/api\/logs\/export\?'/);
+});
+
+test('bill download requires bill protocol and never truncates or falls back',async()=>{
+  for(const mode of ['ok','legacy','cap','missing-ticket','rejected']){
+    const h=harness(),links=[];
+    h.ctx.document={body:{appendChild(){}},createElement(){return {click(){links.push(this.href);},remove(){}};}};
+    h.ctx.fetch=async url=>{
+      assert.match(url,/format=bill-v1/);
+      return {ok:mode!=='rejected',json:async()=>({ok:mode!=='rejected',error:'缩小时间范围',log_contract:1,format:mode==='legacy'?'':'bill-v1',ticket:mode==='missing-ticket'?'':'bill-ticket',need_confirm:mode==='cap'})};
+    };
+    await vm.runInContext('startExport("bill-v1")',h.ctx);
+    if(mode==='ok')assert.deepEqual(links,['/api/logs/bill/v1?ticket=bill-ticket']);
+    else {assert.equal(links.length,0);assert.equal(h.failures.length,1);}
+    assert.equal(h.elements.get('billBtn').disabled,false);
+    assert.equal(h.elements.get('expBtn').disabled,false);
+    assert.equal(h.ctx.exporting,false);
+    assert.equal(h.ctx.pendingExportTicket,'');
+  }
+});
+
+test('task contract explicitly selects async bill only, unknown versions fail closed',async()=>{
+  for(const contract of [1,2,null,'1']){
+    const h=harness(),tasks=[],links=[];
+    h.ctx.runBillExport=async ticket=>{tasks.push(ticket);};
+    h.ctx.document={body:{appendChild(){}},createElement(){return {click(){links.push(this.href);},remove(){}};}};
+    h.ctx.fetch=async()=>({ok:true,json:async()=>({ok:true,log_contract:1,format:'bill-v1',ticket:'ticket',bill_task_contract:contract})});
+    await vm.runInContext('startExport("bill-v1")',h.ctx);
+    assert.equal(links.length,0);
+    if(contract===1){assert.deepEqual(tasks,['ticket']);assert.equal(h.failures.length,0);}
+    else{assert.equal(tasks.length,0);assert.match(h.failures[0],/不兼容/);}
+  }
 });

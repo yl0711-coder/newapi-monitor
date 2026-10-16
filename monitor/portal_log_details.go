@@ -209,6 +209,7 @@ func portalLogDetailsFromEvidence(logType int, e portalLogEvidence) *portalLogDe
 func populatePortalLogEvidence(r *LogRow, raw string) {
 	populatePortalCustomerOperation(r, raw)
 	e := parsePortalLogEvidence(raw)
+	r.billEvidence = &e
 	populatePortalSubscription(r, e)
 	if portalLogHasRecordedAmount(r.Type) {
 		r.HasToolSurcharge = portalHasToolSurcharge(e)
