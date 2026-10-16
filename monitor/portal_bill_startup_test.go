@@ -229,7 +229,7 @@ func portalBillStartupMySQLHTTPDownload(t *testing.T, count int) {
 	for i, row := range rows[1:] {
 		wantID := count - i
 		wantCharge := strconv.FormatFloat(float64(wantID%31)/500000, 'f', 6, 64)
-		if len(row) != 14 || row[5] != "local-"+strconv.Itoa(wantID) || row[12] != wantCharge {
+		if len(row) != 15 || row[5] != "local-"+strconv.Itoa(wantID) || strings.TrimPrefix(row[13], "¥") != wantCharge {
 			t.Fatalf("row %d identity/charge mismatch", i)
 		}
 	}

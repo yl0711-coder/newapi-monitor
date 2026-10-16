@@ -77,7 +77,7 @@ func TestPortalBillBuilderTaskPublishesOnlyVerifiedFile(t *testing.T) {
 				t.Fatal(err)
 			}
 			rows, err := csv.NewReader(strings.NewReader(strings.TrimPrefix(string(b), "\ufeff"))).ReadAll()
-			if err != nil || len(rows) != 2 || rows[1][12] != "0.000246" {
+			if err != nil || len(rows) != 2 || strings.TrimPrefix(rows[1][13], "¥") != "0.000246" {
 				t.Fatal("wrong completed artifact")
 			}
 		})
@@ -208,7 +208,7 @@ func TestPortalBillBuilderExactLargeSumAndEmpty(t *testing.T) {
 		}
 		actual := new(big.Rat)
 		for _, row := range rows[1:] {
-			v, ok := new(big.Rat).SetString(row[12])
+			v, ok := new(big.Rat).SetString(strings.TrimPrefix(row[13], "¥"))
 			if !ok {
 				t.Fatal("bad amount")
 			}
@@ -321,13 +321,13 @@ func TestPortalBillBuilderLocalDatabase(t *testing.T) {
 	amount := new(big.Rat)
 	for id := count; id > 0; id-- {
 		row, err := reader.Read()
-		if err != nil || len(row) != 14 {
+		if err != nil || len(row) != 15 {
 			t.Fatalf("row=%d err=%v", id, err)
 		}
-		if row[5] != fmt.Sprintf("local-%d", id) || row[6] != "文本" || row[7] != "5" || row[8] != "5" || row[9] != "2" || row[10] != "3" || row[11] != "" || row[13] != "" {
+		if row[5] != fmt.Sprintf("local-%d", id) || row[6] != "文本" || row[7] != "5" || row[8] != "5" || row[9] != "2" || row[10] != "3" || strings.TrimPrefix(row[12], "¥") != "" || row[14] != "" {
 			t.Fatal("row order/columns mismatch")
 		}
-		v, ok := new(big.Rat).SetString(row[12])
+		v, ok := new(big.Rat).SetString(strings.TrimPrefix(row[13], "¥"))
 		if !ok {
 			t.Fatal("bad amount")
 		}

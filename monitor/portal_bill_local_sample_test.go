@@ -3,6 +3,7 @@ package monitor
 import (
 	"encoding/csv"
 	"encoding/json"
+	"math/big"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -87,7 +88,8 @@ func TestPortalBillLocalApprovedCSV(t *testing.T) {
 			t.Fatal("approved source CSV width differs")
 		}
 	}
-	if len(rows) != 11 || !reflect.DeepEqual(rows[0], portalBillHeader()) {
+	legacyHeader := []string{"消费时间（北京时间）", "账户名", "令牌名", "分组名", "模型", "Request ID", "类型", "普通输入 Token", "输出 Token", "缓存读取 Token", "缓存写入 Token", "同口径官方原价参考（元）", "实际收费（元）", "折扣参考（折）"}
+	if len(rows) != 11 || !reflect.DeepEqual(rows[0], legacyHeader) {
 		t.Fatal("approved CSV schema differs")
 	}
 	m, _, portal := newPortalTestMonitor(t)
@@ -140,7 +142,7 @@ func TestPortalBillLocalApprovedCSV(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if !reflect.DeepEqual(got, want) {
+			if !reflect.DeepEqual(portalBillLegacySampleProjection(t, got), want) {
 				t.Fatalf("source row %s differs: got=%v want=%v", strconv.FormatInt(f.ID, 10), got, want)
 			}
 			// Isolated temporary SQLite only: exercise the real query, signed
@@ -161,11 +163,11 @@ func TestPortalBillLocalApprovedCSV(t *testing.T) {
 		t.Fatalf("download status %d", w.Code)
 	}
 	actual, err := csv.NewReader(strings.NewReader(strings.TrimPrefix(w.Body.String(), "\ufeff"))).ReadAll()
-	if err != nil || len(actual) != len(rows) || !reflect.DeepEqual(actual[0], rows[0]) {
+	if err != nil || len(actual) != len(rows) || !reflect.DeepEqual(actual[0], portalBillHeader()) {
 		t.Fatal("download CSV schema/row count differs")
 	}
 	for _, row := range actual[1:] {
-		if len(row) != 14 || !reflect.DeepEqual(row, expectedByRequest[row[5]]) {
+		if len(row) != 15 || !reflect.DeepEqual(portalBillLegacySampleProjection(t, row), expectedByRequest[row[5]]) {
 			t.Fatal("download row differs from approved sample")
 		}
 		delete(expectedByRequest, row[5])
@@ -173,4 +175,24 @@ func TestPortalBillLocalApprovedCSV(t *testing.T) {
 	if len(expectedByRequest) != 0 {
 		t.Fatal("download omitted sample rows")
 	}
+}
+
+// Keep the original customer-approved fixture immutable. Compare its old
+// presentation with the equivalent projection; new columns are covered by
+// explicit money-layout tests, not by rewriting private source evidence.
+func portalBillLegacySampleProjection(t *testing.T, row []string) []string {
+	t.Helper()
+	if len(row) != 15 {
+		t.Fatal("new bill width differs")
+	}
+	out := append([]string(nil), row[:11]...)
+	fold := ""
+	if row[14] != "" {
+		ratio, ok := new(big.Rat).SetString(row[14])
+		if !ok {
+			t.Fatal("invalid ratio")
+		}
+		fold = new(big.Rat).Mul(ratio, big.NewRat(10, 1)).FloatString(2)
+	}
+	return append(out, strings.TrimPrefix(row[12], "¥"), strings.TrimPrefix(row[13], "¥"), fold)
 }

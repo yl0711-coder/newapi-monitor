@@ -127,10 +127,10 @@ func TestPortalBillSnapshotMySQLConcurrentChanges(t *testing.T) {
 	}
 	sum := new(big.Rat)
 	for i, row := range rows[1:] {
-		if len(row) != 14 || row[5] != fmt.Sprintf("local-%d", 2100-i) {
+		if len(row) != 15 || row[5] != fmt.Sprintf("local-%d", 2100-i) {
 			t.Fatal("mixed source versions")
 		}
-		v, ok := new(big.Rat).SetString(row[12])
+		v, ok := new(big.Rat).SetString(strings.TrimPrefix(row[13], "¥"))
 		if !ok {
 			t.Fatal("invalid amount")
 		}
@@ -269,7 +269,7 @@ func TestPortalBillSnapshotMySQLLarge(t *testing.T) {
 			t.Fatal(err)
 		}
 		want := big.NewRat(int64(id%31), 500000).FloatString(6)
-		if len(row) != 14 || row[5] != fmt.Sprintf("local-%d", id) || row[12] != want {
+		if len(row) != 15 || row[5] != fmt.Sprintf("local-%d", id) || strings.TrimPrefix(row[13], "¥") != want {
 			t.Fatalf("row %d not identical", id)
 		}
 	}

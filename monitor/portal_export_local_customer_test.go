@@ -139,7 +139,7 @@ func TestPortalExportLocalCustomerSample(t *testing.T) {
 			}
 			amountColumn, requestColumn, modelColumn := 9, 11, 5
 			if format == "bill" {
-				amountColumn, requestColumn, modelColumn = 12, 5, 4
+				amountColumn, requestColumn, modelColumn = 13, 5, 4
 			}
 			sum := new(big.Rat)
 			missingInput, missingWrite, missingReference := 0, 0, 0
@@ -152,7 +152,7 @@ func TestPortalExportLocalCustomerSample(t *testing.T) {
 					if row[10] == "" {
 						missingWrite++
 					}
-					if row[11] == "" {
+					if strings.TrimPrefix(row[12], "¥") == "" {
 						missingReference++
 					}
 				}
@@ -161,18 +161,18 @@ func TestPortalExportLocalCustomerSample(t *testing.T) {
 					wantReference := portalBillPinnedSampleReference(t, fact.Model, fact.Other, fact.Prompt.Int64, fact.Completion.Int64)
 					wantDiscount := ""
 					if wantReference == nil {
-						if row[11] != "" {
+						if strings.TrimPrefix(row[12], "¥") != "" {
 							t.Fatal("redacted tool facts unexpectedly priced")
 						}
 					} else {
-						if row[11] != wantReference.FloatString(6) {
+						if strings.TrimPrefix(row[12], "¥") != wantReference.FloatString(6) {
 							t.Fatalf("reference arithmetic differs at sample row %d", i)
 						}
 						if wantReference.Sign() > 0 {
-							wantDiscount = new(big.Rat).Quo(big.NewRat(fact.Quota.Int64*10, 500000), wantReference).FloatString(2)
+							wantDiscount = strings.TrimRight(strings.TrimRight(new(big.Rat).Quo(big.NewRat(fact.Quota.Int64, 500000), wantReference).FloatString(3), "0"), ".")
 						}
 					}
-					if row[13] != wantDiscount {
+					if row[14] != wantDiscount {
 						t.Fatalf("discount arithmetic differs at sample row %d", i)
 					}
 				}
@@ -197,10 +197,10 @@ func TestPortalExportLocalCustomerSample(t *testing.T) {
 					tokenBlockers[check.State+": "+check.Message]++
 				}
 				want := big.NewRat(fact.Quota.Int64, 500000)
-				if row[amountColumn] != want.FloatString(6) || row[requestColumn] != fact.RequestID || row[modelColumn] != fact.Model || row[0] != time.Unix(fact.Created, 0).In(usageCST).Format("2006-01-02 15:04:05") {
+				if strings.TrimPrefix(row[amountColumn], "¥") != want.FloatString(6) || row[requestColumn] != fact.RequestID || row[modelColumn] != fact.Model || row[0] != time.Unix(fact.Created, 0).In(usageCST).Format("2006-01-02 15:04:05") {
 					t.Fatalf("source row %d changed or reordered", i)
 				}
-				v, ok := new(big.Rat).SetString(row[amountColumn])
+				v, ok := new(big.Rat).SetString(strings.TrimPrefix(row[amountColumn], "¥"))
 				if !ok {
 					t.Fatal("invalid amount")
 				}

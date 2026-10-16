@@ -12,7 +12,7 @@ import (
 const portalBillFormat = "bill-v1"
 
 func portalBillHeader() []string {
-	return []string{"消费时间（北京时间）", "账户名", "令牌名", "分组名", "模型", "Request ID", "类型", "普通输入 Token", "输出 Token", "缓存读取 Token", "缓存写入 Token", "同口径官方原价参考（元）", "实际收费（元）", "折扣参考（折）"}
+	return []string{"消费时间（北京时间）", "账户名", "令牌名", "分组名", "模型", "Request ID", "类型", "普通输入 Token", "输出 Token", "缓存读取 Token", "缓存写入 Token", "官方原价（美元）", "折扣前价格（元）", "折后价格（元）", "折扣比例"}
 }
 
 // Optional historical pricing metadata must not erase recorded consumption.
@@ -33,7 +33,7 @@ func portalBillRecord(r LogRow) ([]string, error) {
 		return nil, errors.New("所选消费包含订阅额度抵扣，不能按钱包收费导出；未生成部分账单")
 	}
 	actual := new(big.Rat).SetFrac(big.NewInt(r.billingQuota), big.NewInt(500000))
-	row := []string{time.Unix(r.CreatedAt, 0).In(usageCST).Format("2006-01-02 15:04:05"), r.Member, r.TokenName, r.Group, r.ModelName, r.RequestID, portalBillRequestType(e), "", "", "", "", "", actual.FloatString(6), ""}
+	row := []string{time.Unix(r.CreatedAt, 0).In(usageCST).Format("2006-01-02 15:04:05"), r.Member, r.TokenName, r.Group, r.ModelName, r.RequestID, portalBillRequestType(e), "", "", "", "", "", "", "¥" + actual.FloatString(6), ""}
 	if r.CompletionTokens >= 0 && (r.SourceFacts == nil || r.SourceFacts.CompletionPresent) {
 		row[8] = strconv.FormatInt(r.CompletionTokens, 10)
 	}
@@ -68,9 +68,12 @@ func portalBillRecord(r LogRow) ([]string, error) {
 		}
 	}
 	if original, ok := portalBillRecordedReference(r, e); ok {
-		row[11] = original.FloatString(6)
+		// Reference is exact CNY, not the already-rounded CSV display. Keep
+		// the existing recorded-price checks and the agreed fixed factor 7.
+		row[11] = "$" + new(big.Rat).Quo(original, big.NewRat(7, 1)).FloatString(6)
+		row[12] = "¥" + original.FloatString(6)
 		if original.Sign() > 0 {
-			row[13] = new(big.Rat).Mul(new(big.Rat).Quo(actual, original), big.NewRat(10, 1)).FloatString(2)
+			row[14] = strings.TrimRight(strings.TrimRight(new(big.Rat).Quo(actual, original).FloatString(3), "0"), ".")
 		}
 	}
 	for i := range row {

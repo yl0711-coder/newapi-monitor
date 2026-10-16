@@ -36,7 +36,7 @@ func TestPortalBillSampleAndMissingTTL(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(got) != 14 || got[5] != "local-request-1" || got[6] != "文本" || got[7] != "0" || got[10] != "237815" || got[11] != "0.028280" || got[12] != "0.002424" || got[13] != "0.86" {
+	if len(got) != 15 || got[5] != "local-request-1" || got[6] != "文本" || got[7] != "0" || got[10] != "237815" || got[11] != "$0.004040" || got[12] != "¥0.028280" || got[13] != "¥0.002424" || got[14] != "0.086" {
 		t.Fatalf("%v", got)
 	}
 	after, _ := json.Marshal(r)
@@ -75,7 +75,7 @@ func TestPortalBillReferenceFailsClosed(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if got[11] != "" || got[13] != "" || got[12] == "" {
+			if strings.TrimPrefix(got[12], "¥") != "" || got[14] != "" || strings.TrimPrefix(got[13], "¥") == "" {
 				t.Fatalf("unverified price or lost charge: %v", got)
 			}
 		})
@@ -132,7 +132,7 @@ func TestPortalBillHistoricalAmountIndependentOfMetadata(t *testing.T) {
 			r := LogRow{Type: 2, billingQuota: 123, SourceFacts: &portalLogSourceFacts{QuotaPresent: true}}
 			populatePortalLogEvidence(&r, raw)
 			got, err := portalBillRecord(r)
-			if err != nil || got[12] != "0.000246" || got[7] != "" || got[8] != "" || got[11] != "" || got[13] != "" {
+			if err != nil || strings.TrimPrefix(got[13], "¥") != "0.000246" || got[7] != "" || got[8] != "" || strings.TrimPrefix(got[12], "¥") != "" || got[14] != "" {
 				t.Fatalf("historical amount lost or NULL tokens invented: %v %v", got, err)
 			}
 		})
@@ -146,7 +146,7 @@ func TestPortalBillHistoricalAmountIndependentOfMetadata(t *testing.T) {
 	}
 	r := LogRow{Type: 2, billingQuota: 0, SourceFacts: &portalLogSourceFacts{QuotaPresent: true}}
 	got, err := portalBillRecord(r)
-	if err != nil || got[12] != "0.000000" {
+	if err != nil || strings.TrimPrefix(got[13], "¥") != "0.000000" {
 		t.Fatal("true zero must remain zero")
 	}
 	r.SourceFacts.QuotaPresent = false
@@ -200,7 +200,7 @@ func TestPortalBillVerifiedDefaultTierTokenCompatibility(t *testing.T) {
 			} else if got[7] != "" {
 				t.Fatal("ambiguous input inferred")
 			}
-			if got[12] != new(big.Rat).SetFrac(big.NewInt(tc.quota), big.NewInt(500000)).FloatString(6) {
+			if strings.TrimPrefix(got[13], "¥") != new(big.Rat).SetFrac(big.NewInt(tc.quota), big.NewInt(500000)).FloatString(6) {
 				t.Fatal("actual changed")
 			}
 		})
@@ -229,7 +229,7 @@ func TestPortalBillDefaultTokensIndependentOfChargeAndOutput(t *testing.T) {
 				populatePortalLogEvidence(&r, raw)
 				before, _ := json.Marshal(r.billEvidence)
 				got, err := portalBillRecord(r)
-				if err != nil || got[7] != strconv.FormatInt(prompt-read-write, 10) || got[8] != "" || got[9] != strconv.FormatInt(read, 10) || got[10] != strconv.FormatInt(write, 10) || got[12] != "0.000246" || got[11] != "" || got[13] != "" {
+				if err != nil || got[7] != strconv.FormatInt(prompt-read-write, 10) || got[8] != "" || got[9] != strconv.FormatInt(read, 10) || got[10] != strconv.FormatInt(write, 10) || strings.TrimPrefix(got[13], "¥") != "0.000246" || strings.TrimPrefix(got[12], "¥") != "" || got[14] != "" {
 					t.Fatalf("token conservation or independent charge failed: %v %v", got, err)
 				}
 				after, _ := json.Marshal(r.billEvidence)
@@ -264,7 +264,7 @@ func TestPortalBillScopeAlwaysConsumptionAndLegacyRowsRetained(t *testing.T) {
 		t.Fatalf("legacy export: %d %s", w.Code, w.Body.String())
 	}
 	rows, err := csv.NewReader(strings.NewReader(strings.TrimPrefix(w.Body.String(), "\ufeff"))).ReadAll()
-	if err != nil || len(rows) != 2 || rows[1][12] != "0.000246" || rows[1][7] != "" || rows[1][8] != "" {
+	if err != nil || len(rows) != 2 || strings.TrimPrefix(rows[1][13], "¥") != "0.000246" || rows[1][7] != "" || rows[1][8] != "" {
 		t.Fatalf("legacy row lost or mutated: %v %v", rows, err)
 	}
 }
@@ -374,7 +374,7 @@ func TestPortalBillHTTPIsolationAndContract(t *testing.T) {
 		t.Fatalf("%d %s", w.Code, w.Body.String())
 	}
 	rows, err := csv.NewReader(strings.NewReader(strings.TrimPrefix(w.Body.String(), "\ufeff"))).ReadAll()
-	if err != nil || len(rows) != 2 || !reflect.DeepEqual(rows[0], portalBillHeader()) || rows[1][7] != "5" || rows[1][12] != "0.000246" || rows[1][11] != "" {
+	if err != nil || len(rows) != 2 || !reflect.DeepEqual(rows[0], portalBillHeader()) || rows[1][7] != "5" || strings.TrimPrefix(rows[1][13], "¥") != "0.000246" || strings.TrimPrefix(rows[1][12], "¥") != "" {
 		t.Fatalf("%v %v", rows, err)
 	}
 	if err := m.storeDB.Model(&TrackedUser{}).Where("user_id = ?", 101).Update("group_id", 0).Error; err != nil {

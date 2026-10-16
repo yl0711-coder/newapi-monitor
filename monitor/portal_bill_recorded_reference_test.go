@@ -26,7 +26,7 @@ func TestPortalBillRecordedReferencePricesAndGroups(t *testing.T) {
 			populatePortalLogEvidence(&r, tc.raw)
 			before, _ := json.Marshal(r.billEvidence)
 			row, err := portalBillRecord(r)
-			if err != nil || row[11] != tc.reference || row[12] != big.NewRat(tc.quota, 500000).FloatString(6) {
+			if err != nil || strings.TrimPrefix(row[12], "¥") != tc.reference || strings.TrimPrefix(row[13], "¥") != big.NewRat(tc.quota, 500000).FloatString(6) {
 				t.Fatalf("recorded reference: %v %v", row, err)
 			}
 			after, _ := json.Marshal(r.billEvidence)
@@ -75,7 +75,7 @@ func TestPortalBillRecordedTierReferenceBoundaries(t *testing.T) {
 			r := LogRow{Type: 2, ModelName: "any-model", PromptTokens: tc.prompt, CompletionTokens: tc.output, billingQuota: tc.quota, billingFactsValid: true}
 			populatePortalLogEvidence(&r, string(raw))
 			row, err := portalBillRecord(r)
-			if err != nil || row[11] != tc.reference || row[12] != big.NewRat(tc.quota, 500000).FloatString(6) {
+			if err != nil || strings.TrimPrefix(row[12], "¥") != tc.reference || strings.TrimPrefix(row[13], "¥") != big.NewRat(tc.quota, 500000).FloatString(6) {
 				t.Fatalf("%v %v", row, err)
 			}
 		})
@@ -90,14 +90,14 @@ func TestPortalBillRecordedReferenceFloatRoundingAndMissingFacts(t *testing.T) {
 		t.Fatal("ordinary details float boundary gate changed")
 	}
 	row, err := portalBillRecord(r)
-	if err != nil || row[11] != "0.000861" || row[12] != "0.000122" {
+	if err != nil || strings.TrimPrefix(row[12], "¥") != "0.000861" || strings.TrimPrefix(row[13], "¥") != "0.000122" {
 		t.Fatalf("source rounding or exact base reference differs: %v %v", row, err)
 	}
 	// Decimal arithmetic would round to 62; this is NOT the source evaluator's
 	// result. Do not accept it by allowing a one-unit tolerance.
 	r.billingQuota = 62
 	row, err = portalBillRecord(r)
-	if err != nil || row[11] != "" || row[12] != "0.000124" {
+	if err != nil || strings.TrimPrefix(row[12], "¥") != "" || strings.TrimPrefix(row[13], "¥") != "0.000124" {
 		t.Fatal("rounding mismatch was tolerated")
 	}
 	r.billingQuota = 61
@@ -107,7 +107,7 @@ func TestPortalBillRecordedReferenceFloatRoundingAndMissingFacts(t *testing.T) {
 	} {
 		r.SourceFacts = &facts
 		row, err = portalBillRecord(r)
-		if err != nil || row[11] != "" || row[13] != "" || row[12] != "0.000122" {
+		if err != nil || strings.TrimPrefix(row[12], "¥") != "" || row[14] != "" || strings.TrimPrefix(row[13], "¥") != "0.000122" {
 			t.Fatal("missing source token became zero or charge lost")
 		}
 	}
@@ -124,7 +124,7 @@ func TestPortalBillRecordedAnthropicUnsplitPreservesContextAndDetails(t *testing
 		t.Fatal("ordinary log explanation unexpectedly relaxed")
 	}
 	row, err := portalBillRecord(r)
-	if err != nil || row[11] != "0.056560" || row[12] != "0.004848" || row[10] != "237815" {
+	if err != nil || strings.TrimPrefix(row[12], "¥") != "0.056560" || strings.TrimPrefix(row[13], "¥") != "0.004848" || row[10] != "237815" {
 		t.Fatalf("lost actual context or invented cache price: %v %v", row, err)
 	}
 	after, _ := json.Marshal(r.billEvidence)
@@ -133,7 +133,7 @@ func TestPortalBillRecordedAnthropicUnsplitPreservesContextAndDetails(t *testing
 	}
 	r.billEvidence.Strings["matched_tier"] = portalEvidenceField{State: portalEvidenceValid, Text: "short"}
 	row, err = portalBillRecord(r)
-	if err != nil || row[11] != "" {
+	if err != nil || strings.TrimPrefix(row[12], "¥") != "" {
 		t.Fatal("unsplit write omitted from tier selection")
 	}
 }

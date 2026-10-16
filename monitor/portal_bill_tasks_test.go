@@ -2,6 +2,7 @@ package monitor
 
 import (
 	"context"
+	"encoding/csv"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -9,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"reflect"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -171,6 +173,33 @@ func TestPortalBillTasksHTTPFlowAndDuplicate(t *testing.T) {
 	// Same group cannot bypass the ordinary CSV download quota either.
 	if w = billGet(h, ck, "/api/logs/bill/v1?ticket="+ticket); w.Code != 429 {
 		t.Fatalf("existing route quota bypass: %d", w.Code)
+	}
+}
+
+func TestPortalBillTasksDownloadMoneyLayout(t *testing.T) {
+	s, h, ck, ticket := billTasksFixture(t)
+	metadata := `{"billing_source":"wallet","model_ratio":1,"completion_ratio":1,"request_path":"/v1/responses","model_price":1,"group_ratio":0.602}`
+	if _, err := s.m.prodDB.Exec("UPDATE logs SET quota=301000,prompt_tokens=1,completion_tokens=0,other=? WHERE id=101", metadata); err != nil {
+		t.Fatal(err)
+	}
+	s.build = func(ctx context.Context, w io.Writer, scope portalBillScope, total int64, auth func(context.Context) error, p func(int64) error) (int64, error) {
+		return portalBuildVerifiedBill(ctx, w, portalBillBuildPlan{1, "301000", 101, 10}, func(ctx context.Context, c logPageCursor, n int) ([]LogRow, error) {
+			return s.m.queryGroupLogsForExportCursor(ctx, scope.IDs, scope.From, scope.To, scope.Member, 2, scope.Model, scope.Group, scope.Token, scope.Detail, scope.RequestID, c, n)
+		}, auth, p)
+	}
+	id := billTaskID(t, billTaskRequest(h, ck, "POST", "/api/logs/bill/tasks", `{"ticket":"`+ticket+`"}`))
+	billTaskWait(t, h, ck, id, "ready")
+	w := billTaskRequest(h, ck, "GET", "/api/logs/bill/tasks/"+id+"/download", "")
+	if w.Code != 200 {
+		t.Fatalf("download: %d", w.Code)
+	}
+	rows, err := csv.NewReader(strings.NewReader(strings.TrimPrefix(w.Body.String(), "\ufeff"))).ReadAll()
+	if err != nil || len(rows) != 2 || len(rows[0]) != 15 || len(rows[1]) != 15 {
+		t.Fatalf("download shape: %v %v", rows, err)
+	}
+	if !reflect.DeepEqual(rows[0][11:], []string{"官方原价（美元）", "折扣前价格（元）", "折后价格（元）", "折扣比例"}) ||
+		!reflect.DeepEqual(rows[1][11:], []string{"$1.000000", "¥7.000000", "¥0.602000", "0.086"}) {
+		t.Fatalf("download money columns: %v", rows)
 	}
 }
 

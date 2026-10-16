@@ -192,7 +192,7 @@ func TestPortalExportLocalWideRows(t *testing.T) {
 					if err != nil {
 						t.Fatal(err)
 					}
-					if row[12] != "0.000246" {
+					if strings.TrimPrefix(row[13], "¥") != "0.000246" {
 						t.Fatal("bill charge changed")
 					}
 					count++

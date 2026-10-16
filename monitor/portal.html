@@ -171,10 +171,16 @@
   .cbox-opt:hover{background:var(--panel)}
   .cbox-opt.sel{color:var(--accent);font-weight:600}
   .cbox-empty{padding:7px 12px;font-size:13px;color:var(--muted)}
-  .exp-btn{margin-left:auto;background:var(--green);color:#fff;border:none;border-radius:8px;padding:8px 16px;font-size:13px;font-weight:600;cursor:pointer;display:inline-flex;align-items:center;gap:6px}
+  .export-actions{margin-left:auto;display:flex;align-items:center;gap:8px;flex-wrap:wrap;max-width:100%}
+  .export-buttons{display:inline-flex;align-items:center;gap:8px;flex-shrink:0}
+  .exp-btn{margin-left:0;background:var(--green);color:#fff;border:1px solid transparent;border-radius:8px;padding:8px 12px;font-family:inherit;font-size:13px;font-weight:600;cursor:pointer;display:inline-flex;align-items:center;justify-content:center;gap:6px;white-space:nowrap}
+  #expBtn{background:var(--surface);color:var(--green);border-color:var(--green)}
+  .exp-btn:hover:not(:disabled){filter:brightness(.95)}
+  .exp-btn:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   .exp-btn:disabled{opacity:.5;cursor:default}
   .exp-btn[hidden]{display:none}
   #billResumeBtn{margin-left:0;background:transparent;color:var(--muted);border:1px solid var(--border)}
+  @media(max-width:600px){.export-actions{margin-left:0;flex-basis:100%}}
   /* 导出说明:按钮旁 ? 图标(实心醒目),悬停/聚焦弹出规则卡片(右对齐防溢出) */
   .exp-help{position:relative;display:inline-flex;align-items:center;justify-content:center;width:24px;height:24px;background:var(--accent);border:none;border-radius:50%;color:#fff;font-size:14px;font-weight:700;cursor:help;user-select:none;flex:none;box-shadow:0 1px 3px rgba(82,87,224,.35)}
   .exp-help:hover,.exp-help:focus{background:#3f44c9;outline:none}
@@ -371,10 +377,13 @@
     <input id="logDetailKw" placeholder="详情关键字搜索" style="width:150px" maxlength="64" autocomplete="off">
     <input id="logRequestId" placeholder="Request ID" style="width:150px" maxlength="64" autocomplete="off">
     <button type="button" class="btn p" id="logDetailKwBtn">查询</button>
-    <button class="exp-btn" id="expBtn">⬇ 导出 CSV</button>
-    <button class="exp-btn" id="billBtn" title="按当前筛选导出消费账单，不含充值、退款。实际收费沿用原始扣费额度÷500000；原价参考按本条日志记录的基础单价、命中档位及计费变量计算，不乘分组倍率，再按固定比例×7展示为元，并非独立核验的官方历史账单。无法核验时留空，不表示免费。">⬇ 导出账单</button>
-    <button class="exp-btn" id="billResumeBtn" hidden title="恢复本标签页上次的账单任务，使用上次导出范围，不应用当前筛选；过期后需重新生成。">恢复上次账单</button>
-    <span class="exp-help" tabindex="0">?
+    <div class="export-actions" role="group" aria-label="日志与账单导出">
+      <div class="export-buttons">
+        <button type="button" class="exp-btn" id="expBtn">⬇ 导出 CSV</button>
+        <button type="button" class="exp-btn" id="billBtn" title="按当前筛选导出消费账单，不含充值、退款。官方原价（美元）按本条日志记录的计价依据计算，折扣前价格（元）按固定比例×7换算；折后价格沿用原始扣费，折扣比例最多保留3位小数。并非独立核验的官方历史账单；无法核验时留空，不表示免费。">⬇ 导出账单</button>
+      </div>
+      <button type="button" class="exp-btn" id="billResumeBtn" hidden title="恢复本标签页上次的账单任务，使用上次导出范围，不应用当前筛选；过期后需重新生成。">恢复上次账单</button>
+      <span class="exp-help" tabindex="0" aria-label="导出规则说明">?
       <span class="tip">
         <b>使用日志 CSV</b>
         · 按当前筛选条件导出,时间范围最长一年<br>
@@ -387,12 +396,14 @@
         <b>消费账单 CSV</b>
         · 按当前日期及账户、令牌、分组、模型等筛选导出消费日志，不跟随日志类型筛选；不包含充值、退款、错误或登录记录<br>
         · 历史计费信息缺失时仍保留原始扣费；缺少原始扣费或包含订阅额度抵扣时暂不能生成账单，不会静默漏行<br>
-        · 固定 14 列，Request ID 后是“类型”（如文本）；不含 IP、上游 Request ID 或内部说明<br>
-        · 北京时间精确到秒；Token 为整数；金额以元展示并保留 6 位小数，折数保留 2 位小数<br>
+        · 固定 15 列，Request ID 后是“类型”（如文本）；不含 IP、上游 Request ID 或内部说明<br>
+        · 官方原价（美元）以 $ 标识，按本条日志计费依据计算；折扣前价格（元）按固定比例 ×7 换算，以 ¥ 标识；折后价格（元）为原始实际收费，不额外乘 7<br>
+        · 北京时间精确到秒；Token 为整数；金额保留 6 位小数；折扣比例 = 折后价格 ÷ 折扣前价格，四舍五入最多保留 3 位小数（如 0.086 表示支付原价的 8.6%，不是 0.086%）<br>
         · 原价参考不是官方账单；未核验的原价、折扣或用量留空，不代表零值<br>
         · 超过 5 万条请缩小时间范围，不截断；与日志导出共用每 5 分钟 1 次的成功下载限额
       </span>
-    </span>
+      </span>
+    </div>
   </div>
   <div class="card">
     <div class="logwrap">

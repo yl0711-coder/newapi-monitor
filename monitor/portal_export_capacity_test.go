@@ -128,8 +128,8 @@ func TestPortalExportLocalCapacity(t *testing.T) {
 				}
 				amountColumn, idColumn := 9, 11
 				if format == "bill" {
-					amountColumn, idColumn = 12, 5
-					if len(header) != 14 {
+					amountColumn, idColumn = 13, 5
+					if len(header) != 15 {
 						t.Fatal("wrong bill width")
 					}
 				}
@@ -149,7 +149,7 @@ func TestPortalExportLocalCapacity(t *testing.T) {
 						t.Fatal("missing/duplicate/unexpected row")
 					}
 					seen[id] = true
-					amount, ok := new(big.Rat).SetString(record[amountColumn])
+					amount, ok := new(big.Rat).SetString(strings.TrimPrefix(record[amountColumn], "¥"))
 					if !ok {
 						t.Fatal("invalid charge")
 					}
