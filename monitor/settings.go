@@ -185,6 +185,10 @@ type Settings struct {
 	FinanceGiftHandoffApprovalEnabled       bool   // MONITOR_FINANCE_GIFT_HANDOFF_APPROVAL_ENABLED; records authorization only, default false
 	FinanceGiftHandoffLocalExecutionEnabled bool   // MONITOR_FINANCE_GIFT_HANDOFF_LOCAL_EXECUTION_ENABLED; local snapshot only, default false
 	FinanceGiftHandoffLiveExecutionEnabled  bool   // MONITOR_FINANCE_GIFT_HANDOFF_LIVE_EXECUTION_ENABLED; explicit finite execution core, default false; no auto-start
+	FinanceRechargeMaintenanceEnabled       bool   // MONITOR_FINANCE_RECHARGE_MAINTENANCE_ENABLED; default false, root-only finite tasks
+	FinanceRechargeExecutionEnabled         bool   // MONITOR_FINANCE_RECHARGE_EXECUTION_ENABLED; independent write gate, default false
+	FinanceRechargeTaskDir                  string // MONITOR_FINANCE_RECHARGE_TASK_DIR; private server-owned directory, fixed proposal.json
+	FinanceRechargeProposalSHA256           string // MONITOR_FINANCE_RECHARGE_PROPOSAL_SHA256; exact operator-reviewed proposal bytes
 	// CUR 核算产物由离线命令生成并完成哈希自校验。Monitor 只读本地文件，
 	// 不访问 AWS/S3；独立开关默认关闭，路径必须为绝对路径。
 	FinanceCURArtifactEnabled bool   // MONITOR_FINANCE_CUR_ARTIFACT_ENABLED，默认 false
@@ -485,6 +489,10 @@ func LoadSettings() Settings {
 		FinanceGiftHandoffApprovalEnabled:        env("MONITOR_FINANCE_GIFT_HANDOFF_APPROVAL_ENABLED", "false") == "true",
 		FinanceGiftHandoffLocalExecutionEnabled:  env("MONITOR_FINANCE_GIFT_HANDOFF_LOCAL_EXECUTION_ENABLED", "false") == "true",
 		FinanceGiftHandoffLiveExecutionEnabled:   env("MONITOR_FINANCE_GIFT_HANDOFF_LIVE_EXECUTION_ENABLED", "false") == "true",
+		FinanceRechargeMaintenanceEnabled:        env("MONITOR_FINANCE_RECHARGE_MAINTENANCE_ENABLED", "false") == "true",
+		FinanceRechargeExecutionEnabled:          env("MONITOR_FINANCE_RECHARGE_EXECUTION_ENABLED", "false") == "true",
+		FinanceRechargeTaskDir:                   strings.TrimSpace(env("MONITOR_FINANCE_RECHARGE_TASK_DIR", "")),
+		FinanceRechargeProposalSHA256:            strings.TrimSpace(env("MONITOR_FINANCE_RECHARGE_PROPOSAL_SHA256", "")),
 		FinanceCURArtifactEnabled:                env("MONITOR_FINANCE_CUR_ARTIFACT_ENABLED", "false") == "true",
 		FinanceCURArtifactPath:                   strings.TrimSpace(env("MONITOR_FINANCE_CUR_ARTIFACT_PATH", "")),
 		PortalAddr:                               env("MONITOR_PORTAL_ADDR", ""),

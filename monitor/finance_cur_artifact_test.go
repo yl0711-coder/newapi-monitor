@@ -213,12 +213,16 @@ func TestFinanceCURSharePercentAndAbsoluteMagnitude(t *testing.T) {
 }
 
 func financeCURTestArtifact(t *testing.T, finalized bool) financecur.Artifact {
+	return financeCURTestArtifactWithCost(t, finalized, 1_000_000_000)
+}
+
+func financeCURTestArtifactWithCost(t *testing.T, finalized bool, nanoUSD int64) financecur.Artifact {
 	t.Helper()
 	loc, _ := time.LoadLocation("Asia/Shanghai")
 	start := time.Date(2026, 9, 2, 0, 0, 0, 0, loc).UTC()
 	entry := financecur.CostEntry{
 		FromUnix: start.Unix(), ToUnix: start.Add(24 * time.Hour).Unix(), LineItemType: "Usage",
-		ProductCode: "AmazonECS", Rows: 1, NanoUSD: 1_000_000_000,
+		ProductCode: "AmazonECS", Rows: 1, NanoUSD: nanoUSD,
 	}
 	rules := []financecur.AllocationRule{{
 		ID: "ecs", ProductCode: "AmazonECS", ResourceMatch: financecur.ResourceAny,
@@ -231,7 +235,7 @@ func financeCURTestArtifact(t *testing.T, finalized bool) financecur.Artifact {
 	audit := financecur.Audit{
 		Rows: 1, Currency: "USD", BillingPeriodStart: start.Add(-time.Hour).Unix(),
 		BillingPeriodEnd: start.AddDate(0, 1, 0).Unix(), FirstUsageUnix: start.Unix(),
-		LastUsageThroughUnix: start.Add(24 * time.Hour).Unix(), TotalNanoUSD: 1_000_000_000,
+		LastUsageThroughUnix: start.Add(24 * time.Hour).Unix(), TotalNanoUSD: nanoUSD,
 	}
 	const digest = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 	statement, timeline, err := financecur.BuildStatement(audit, report, digest, digest, "Asia/Shanghai", finalized)

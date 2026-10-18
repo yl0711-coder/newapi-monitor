@@ -53,6 +53,30 @@ func (m *Monitor) loadFinanceReportSnapshot(request financeReportRequest, now ti
 	return m.loadFinanceReportSnapshotKey(request, key, now)
 }
 
+// Older reports could include a provisional tail beyond the range checked by
+// their coverage proof. Matching source fingerprints do not repair that time
+// mismatch. Treat these rebuildable snapshots as misses without deleting them
+// or rejecting closed historical reports that honestly show missing receipts.
+// Projections without an explicit coverage horizon retain their existing
+// separately gated compatibility handling.
+type financeSnapshotBounds struct {
+	From        int64 `json:"from"`
+	To          int64 `json:"to"`
+	GeneratedAt int64 `json:"generated_at"`
+	Coverage    struct {
+		To int64 `json:"to_ts"`
+	} `json:"user_coverage"`
+}
+
+func (b financeSnapshotBounds) hasUnfinalizedTail() bool {
+	return b.Coverage.To > 0 && b.Coverage.To < b.To
+}
+
+func financeSnapshotHasUnfinalizedTail(payload []byte) bool {
+	var bounds financeSnapshotBounds
+	return json.Unmarshal(payload, &bounds) == nil && bounds.hasUnfinalizedTail()
+}
+
 // Keep key selection outside the verified reader. Normal report/cache reads
 // only use the current key; the explicitly dated upgrade fallback below is
 // the sole caller allowed to select the previous projection.
@@ -88,6 +112,9 @@ func (m *Monitor) loadFinanceReportSnapshotKey(request financeReportRequest, key
 	digest := sha256.Sum256(envelope.Payload)
 	if envelope.PayloadSHA256 != hex.EncodeToString(digest[:]) {
 		return nil, time.Time{}, "", false, errors.New("经营核算持久快照载荷哈希不一致")
+	}
+	if financeSnapshotHasUnfinalizedTail(envelope.Payload) {
+		return nil, time.Time{}, "", false, nil
 	}
 	storedAt := time.Unix(envelope.StoredAt, 0)
 	if storedAt.After(now.Add(time.Minute)) {

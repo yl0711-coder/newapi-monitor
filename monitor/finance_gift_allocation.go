@@ -35,6 +35,8 @@ type financeGiftCoverageView struct {
 	ScopeUnknownEvents         int64 `json:"scope_unknown_events,omitempty"`
 	ScopeIndependentUserHours  int64 `json:"scope_independent_user_hours,omitempty"`
 	ScopeIndependentRows       int64 `json:"scope_independent_rows,omitempty"`
+	PriorScopeUnknownEvents    int64 `json:"prior_scope_unknown_events,omitempty"`
+	VerifiedSuffixFromTs       int64 `json:"verified_suffix_from_ts,omitempty"`
 }
 
 type financeGiftAllocationResult struct {
@@ -52,6 +54,10 @@ type financeGiftAllocationResult struct {
 	// Only set after all monetary/hour proofs passed and a later scope gap was
 	// found. It is a closed-hour prefix, never a replacement for overall coverage.
 	verifiedPrefix *financeGiftAllocationResult
+	// An independently proven suffix; never makes the intervening historical
+	// gap complete. Its ledger omits gift-neutral gap users. Only period gift
+	// deductions are meaningful; omitted inactive wallets may retain a balance.
+	verifiedSuffix *financeGiftAllocationResult
 }
 
 type financeGiftUserHourKey struct {
@@ -205,8 +211,10 @@ func (m *Monitor) loadFinanceGiftAllocationForScope(ctx context.Context, seedFro
 	}
 	// Keep the full monetary/hour proof checks above. Only historical scope
 	// detail reads become unnecessary after a proven, irreversible depletion.
+	var horizons map[int64]int64
+	independenceVerified := false
 	if channelBusinessGroupsExcluded(policies) {
-		horizons, err := financeGiftScopeHorizons(ctx, facts, ledger)
+		horizons, err = financeGiftScopeHorizons(ctx, facts, ledger)
 		if err != nil {
 			return result, fmt.Errorf("verify gift scope horizon: %w", err)
 		}
@@ -214,6 +222,7 @@ func (m *Monitor) loadFinanceGiftAllocationForScope(ctx context.Context, seedFro
 			if err := verifyFinanceGiftHorizonFacts(ctx, db, seedFrom, to, userByHour, facts, firstGrantHour); err != nil {
 				return result, err
 			}
+			independenceVerified = true
 		}
 		for key, state := range stateByKey {
 			if horizon, ok := horizons[key.UserID]; ok && key.HourTs >= horizon {
@@ -227,10 +236,12 @@ func (m *Monitor) loadFinanceGiftAllocationForScope(ctx context.Context, seedFro
 	}
 
 	firstScopeGap := to
+	gapUsers := make(map[int64]bool)
 	err = m.walkFinanceGiftHourEvidence(ctx, db, stateByKey, policies, excludedUsers, func(key financeGiftUserHourKey, evidence financeGiftHourEvidence) {
 		ledger = append(ledger, evidence.Ledger...)
 		result.Coverage.ScopeUnknownEvents += evidence.UnknownScopeEvents
 		if evidence.UnknownScopeEvents > 0 {
+			gapUsers[key.UserID] = true
 			firstScopeGap = min(firstScopeGap, key.HourTs)
 			result.scopeGapUserHours++
 			result.scopeGapStates = retainEarliestFinanceGiftScopeGap(result.scopeGapStates, stateByKey[key])
@@ -240,6 +251,24 @@ func (m *Monitor) loadFinanceGiftAllocationForScope(ctx context.Context, seedFro
 		return result, err
 	}
 	if result.Coverage.ScopeUnknownEvents > 0 {
+		// Inactive wallets need the same complete monetary proof as depleted
+		// wallets. Deleting an aggregate row must never masquerade as inactivity.
+		if !independenceVerified {
+			if err := verifyFinanceGiftHorizonFacts(ctx, db, seedFrom, to, userByHour, facts, firstGrantHour); err != nil {
+				return result, err
+			}
+		}
+		suffix, err := financeGiftIndependentSuffix(result, ledger, gapUsers, financeGiftIndependentBoundaries(facts, horizons))
+		if err != nil {
+			return result, err
+		}
+		if suffix != nil {
+			if suffix.Coverage.FromTs == from {
+				return *suffix, nil
+			}
+			result.verifiedSuffix = suffix
+			result.Coverage.VerifiedSuffixFromTs = suffix.Coverage.FromTs
+		}
 		// All preceding proof/hash checks succeeded. Unknown events can affect
 		// later wallet balances, so never skip a gap or publish its partial hour.
 		if firstScopeGap > from {
@@ -286,6 +315,13 @@ func financeGiftSubrange(result financeGiftAllocationResult, from, to int64) (fi
 // 移除已配置的内部账号。这只改变本次内存中的分配账本，不改原始
 // 额度调整事件或小时事实。
 func excludeFinanceGiftUsers(result financeGiftAllocationResult, excluded map[int64]bool) (financeGiftAllocationResult, error) {
+	if result.verifiedSuffix != nil && len(excluded) > 0 {
+		suffix, err := excludeFinanceGiftUsers(*result.verifiedSuffix, excluded)
+		if err != nil {
+			return result, err
+		}
+		result.verifiedSuffix = &suffix
+	}
 	if result.verifiedPrefix != nil && len(excluded) > 0 {
 		prefix, err := excludeFinanceGiftUsers(*result.verifiedPrefix, excluded)
 		if err != nil {

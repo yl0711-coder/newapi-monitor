@@ -23,9 +23,176 @@ function fixture(fetchImpl = async()=>{throw new Error('offline');}) {
   const source=readFileSync(new URL('../../monitor/finance.js',import.meta.url),'utf8');
   const end=source.lastIndexOf('}());');
   assert.ok(end>0,'finance module closure not found');
-  vm.runInContext(source.slice(0,end)+'\nglobalThis.fixture={state,scheduleStaleRefresh,load,financeIsPriorStale,financeCacheRefreshNote,renderProfitBridge,operatingProfitBlockers,setGiftEvidence,renderPeriods,renderDays,internalCostDeductionNote,grossCorrectedCost,chartValue,renderExecutive,upstreamCoverage,renderCosts,renderEvidenceRollout,renderPairingHours,renderPairingAudit,renderClosureReadiness};\n'+source.slice(end),context);
+  vm.runInContext(source.slice(0,end)+'\nglobalThis.fixture={state,scheduleStaleRefresh,load,financeIsPriorStale,financeCacheRefreshNote,renderProfitBridge,operatingProfitBlockers,setCUREvidence,setGiftEvidence,renderPeriods,renderDays,internalCostDeductionNote,grossCorrectedCost,chartValue,renderExecutive,upstreamCoverage,renderCosts,renderEvidenceRollout,renderPairingHours,renderPairingAudit,renderClosureReadiness,renderCURProducts,renderAWSMonthlyBills,renderBillingAccounting,renderSources};\n'+source.slice(end),context);
   return {api:context.fixture,element,timers};
 }
+
+test('billing-month profit is separate, explicit, provisional-safe and backward compatible',()=>{
+  const {api,element}=fixture();
+  const m=v=>({micro_usd:String(v)});
+  const result={basis:'aws_billing_month_v1',status:'reconciled',revenue:m(100000000),upstream_cost:m(40000000),aws_cost:m(8000000),profit:m(52000000),margin_percent:'52.00',aws_source:'cost_explorer',aws_status:'reconciled'};
+  const data={billing_result:result,periods:[{period:'2026-08',from:1785513600,to:1788192000,billing_result:result}]};
+  const before=JSON.stringify(data);api.renderBillingAccounting(data);
+  assert.equal(element('finBillingCard').hidden,false);
+  assert.match(element('finBillingSummary').textContent,/经营利润 \$52\.00.*52\.00%/);
+  assert.match(element('finBillingRows').innerHTML,/Cost Explorer 月账/);
+  api.renderExecutive(data,{});
+  assert.match(element('finDecisionTitle').textContent,/完整月份经营利润 \$52\.00.*52\.00%/);
+  assert.equal(element('finDecisionBadge').textContent,'月账口径');
+  assert.match(element('finDecisionText').textContent,/不等于逐日同时间区间利润/);
+  assert.equal(JSON.stringify(data),before);
+  const provisional={...result,status:'provisional',aws_status:'provisional'};
+  api.renderExecutive({billing_result:provisional},{});
+  assert.equal(element('finDecisionBadge').textContent,'月账暂估');
+  api.renderBillingAccounting({billing_result:provisional,periods:[{period:'<script>x</script>',billing_result:provisional}]});
+  assert.match(element('finBillingSummary').textContent,/暂估/);
+  assert.match(element('finBillingRows').innerHTML,/暂估/);
+  assert.doesNotMatch(element('finBillingRows').innerHTML,/<script>/);
+  for(const status of ['partial_period','incomplete','unknown']) {
+    const blocked={...result,status,reason:'不能计算整个区间'};
+    api.renderBillingAccounting({billing_result:blocked,periods:[{period:'2026-08',billing_result:blocked}]});
+    assert.doesNotMatch(element('finBillingRows').innerHTML,/\$52\.00|52\.00%/);
+    assert.match(element('finBillingSummary').textContent,/不能计算整个区间/);
+  }
+  api.renderBillingAccounting({});
+  assert.equal(element('finBillingCard').hidden,true);
+  assert.equal(element('finBillingRows').innerHTML,'');assert.equal(element('finBillingSummary').textContent,'');
+});
+
+test('incomplete monthly headline separates monthly results from daily AWS gaps without changing facts',()=>{
+  const {api,element}=fixture();
+  const complete={basis:'aws_billing_month_v1',status:'reconciled',profit:{micro_usd:'52000000'}};
+  const data={billing_result:{basis:'aws_billing_month_v1',status:'incomplete',reason:'部分月份成本缺失'},
+    periods:[{billing_result:complete},{billing_result:{...complete,status:'provisional'}},
+      {billing_result:{...complete,status:'incomplete'}},{billing_result:{...complete,basis:'unknown'}},{}],
+    cur_cost:{enabled:true,loaded:true,coverage_ppm:1000000,allocation_complete:true,range_complete:false,missing_billing_periods:[{}]}};
+  const before=JSON.stringify(data);
+  api.renderExecutive(data,{});
+  assert.equal(element('finDecisionTitle').textContent,'部分月份已有经营结果，全区间利润待核验');
+  assert.match(element('finDecisionText').textContent,/2 个完整月份已有结果（其中 1 个为暂估）/);
+  assert.match(element('finDecisionText').textContent,/部分月份成本缺失.*不能用它判断月账是否齐全/);
+  assert.doesNotMatch(element('finDecisionText').textContent,/\$52\.00|AWS 缺少/);
+  assert.match(element('finCUREvidence:span').textContent,/缺少 1 段同时间区间日级来源.*仅表示日级成本/);
+  assert.equal(element('finDecision').classList.contains('ready'),false);
+  assert.equal(JSON.stringify(data),before);
+  api.renderExecutive({...data,periods:[]},{});
+  assert.equal(element('finDecisionTitle').textContent,'月度经营结果待核验');
+  api.renderExecutive({...data,billing_result:{basis:'aws_billing_month_v1',status:'partial_period',reason:'非完整月份不计算整月利润'}},{});
+  assert.match(element('finDecisionText').textContent,/非完整月份不计算整月利润/);
+  api.renderExecutive(data,{operating_profit:{micro_usd:'1000000'}});
+  assert.equal(element('finDecisionTitle').textContent,'当前区间经营毛利 $1.00');
+  api.renderExecutive({},{});
+  assert.equal(element('finDecisionTitle').textContent,'暂不发布全站利润');
+  assert.doesNotMatch(element('finCUREvidence:span').textContent,/月账核验/);
+  api.renderExecutive({...data,billing_result:{basis:'unknown'}},{});
+  assert.equal(element('finDecisionTitle').textContent,'暂不发布全站利润');
+});
+
+test('source labels distinguish daily coverage from monthly evidence and preserve original warnings',()=>{
+  const {api,element}=fixture();
+  const rows=[{key:'aws_cur',name:'AWS 资源成本',status:'incomplete',description:'缺少 1 段账单来源 <script>bad</script>'},
+    {key:'upstream',name:'上游成本',status:'incomplete',description:'账单不完整'}];
+  const before=JSON.stringify(rows);
+  api.renderSources(rows,true);
+  assert.match(element('finSources').innerHTML,/AWS 日级成本（同时间区间）/);
+  assert.match(element('finSources').innerHTML,/以下状态仅对应日级成本.*缺少 1 段账单来源/);
+  assert.match(element('finSources').innerHTML,/上游成本.*账单不完整/);
+  assert.doesNotMatch(element('finSources').innerHTML,/<script>/);
+  assert.equal(JSON.stringify(rows),before);
+  api.renderSources(rows);
+  assert.match(element('finSources').innerHTML,/AWS 资源成本/);
+  assert.doesNotMatch(element('finSources').innerHTML,/以下状态仅对应日级成本/);
+  const page=readFileSync(new URL('../../monitor/page.html',import.meta.url),'utf8');
+  assert.match(page,/经营损益桥 · 同时间区间/);
+  assert.match(page,/月度事实明细 · 同时间区间/);
+  assert.match(page,/同区间状态/);
+});
+
+test('historical AWS monthly bills remain explicit full UTC reference amounts with safe details',()=>{
+  const {api,element}=fixture();
+  const rows=[{period:'2026-08',from_utc:'2026-08-01',to_utc_exclusive:'2026-09-01',net_usd:'197.1008700236',range_relation:'partial_overlap',status:'reconciled',verified_days:31,record_types:[{name:'Usage',usd:'217.1008700236'},{name:'Credit',usd:'-20'}],services:[{name:'<script>bad</script>',usd:'197.1008700236'}]}];
+  const before=JSON.stringify(rows);api.renderAWSMonthlyBills(rows);
+  const html=element('finAWSMonthlyRows').innerHTML;
+  assert.equal(element('finAWSMonthlyCard').hidden,false);
+  assert.match(html,/\$197\.1008700236/);assert.match(html,/抵扣：\$-20/);
+  assert.match(html,/仅部分重叠.*未按天拆分/);assert.match(html,/非发票核验/);
+  assert.match(html,/另一种分组，不能再相加/);assert.doesNotMatch(html,/<script>/);
+  assert.match(html,/服务、费用类型与每日汇总一致/);assert.doesNotMatch(html,/三方汇总/);
+  assert.match(html,/class="fin-aws-month-details" tabindex="0" role="region" aria-label="2026-08 月账费用明细"/);
+  assert.equal(JSON.stringify(rows),before);
+  assert.match(api.operatingProfitBlockers({aws_monthly_bills:rows,cur_cost:{loaded:true,missing_billing_periods:[{}]}},{}).join('；'),/同期间日级成本来源.*历史 UTC 月账在下方单列/);
+  api.renderAWSMonthlyBills([{...rows[0],status:'estimated',range_relation:'whole_utc_month'}]);
+  assert.match(element('finAWSMonthlyRows').innerHTML,/预估账单，尚未定稿/);
+  assert.match(element('finAWSMonthlyRows').innerHTML,/完整 UTC 账期在查询范围内/);
+  api.renderAWSMonthlyBills([]);assert.equal(element('finAWSMonthlyCard').hidden,true);assert.equal(element('finAWSMonthlyRows').innerHTML,'');
+});
+
+test('CUR product zero allocated subtotal is not presented as verified zero service cost',()=>{
+  const {api,element}=fixture();
+  const zero={micro_usd:'0',display:'$0.00'};
+  const row={product_code:'AmazonECS',known_nano_usd:'0',known_cost:zero,exact_cost:null,share_percent:'0.00',included_days:5,status:'incomplete'};
+  const before=JSON.stringify(row);
+  api.renderCURProducts([row]);
+  assert.match(element('finCURProductRows').innerHTML,/已归属净额为 0，完整成本待核验/);
+  assert.doesNotMatch(element('finCURProductRows').innerHTML,/\$0\.00|0\.00%/);
+  assert.equal(JSON.stringify(row),before);
+  api.renderCURProducts([{...row,exact_cost:zero,status:'verified'}]);
+  assert.match(element('finCURProductRows').innerHTML,/\$0\.00/);
+  assert.doesNotMatch(element('finCURProductRows').innerHTML,/完整成本待核验/);
+  for(const value of ['1000000000','-1000000000']){
+    api.renderCURProducts([{...row,known_nano_usd:value,known_cost:{micro_usd:value[0]==='-'?'-1000000':'1000000'}}]);
+    assert.match(element('finCURProductRows').innerHTML,/\$1\.00/);
+    assert.doesNotMatch(element('finCURProductRows').innerHTML,/完整成本待核验/);
+  }
+});
+
+test('finance status displays the exact exclusive accounting cutoff, not only a calendar date',async()=>{
+  const report={enabled:true,from:1792080000,to:1792152000,generated_at:1792156080,
+    statement:{user_consumption:{micro_usd:'800000'}},user_coverage:{complete:true,expected_hours:20,completed_hours:20},
+    upstream_coverage:{complete:false},gift_coverage:{complete:false}};
+  const before=JSON.stringify(report.statement);
+  const {api,element}=fixture(async()=>({ok:true,status:200,headers:{get:()=>null},json:async()=>report}));
+  await api.load(false);
+  assert.match(element('finStatus').innerHTML,/2026\/10\/16 20:00:00/);
+  assert.match(element('finStatus').innerHTML,/不含结束时刻，按安全闭合小时统计/);
+  assert.equal(element('finConsumption').textContent,'$0.80');
+  assert.equal(JSON.stringify(report.statement),before,'display must not alter financial data');
+});
+
+test('CUR allocation coverage does not hide missing monthly sources or partial days',()=>{
+  const {api,element}=fixture();
+  const data={enabled:true,loaded:true,coverage_ppm:1000000,allocation_complete:true,billing_finalized:true,range_complete:false,conflict_nano_usd:'0',missing_billing_periods:[{from_unix:1,to_unix:2}]};
+  const original=JSON.stringify(data);
+  api.setCUREvidence(data);
+  assert.equal(element('finCUREvidence').classList.contains('ready'),false);
+  assert.equal(element('finCUREvidence').classList.contains('warn'),true);
+  assert.match(element('finCUREvidence:span').textContent,/缺少 1 段账单来源/);
+  assert.doesNotMatch(element('finCUREvidence:span').textContent,/成本证据已闭合/);
+  assert.match(api.operatingProfitBlockers({cur_cost:data},{}).join('；'),/不能按零成本计算/);
+  api.setCUREvidence({...data,missing_billing_periods:[],partial_boundary_days:[{from_unix:1,to_unix:2}]});
+  assert.match(element('finCUREvidence:span').textContent,/非完整自然日未拆分估算/);
+  api.setCUREvidence({...data,missing_billing_periods:[]});
+  assert.match(element('finCUREvidence:span').textContent,/所选时段证据不完整/);
+  assert.equal(JSON.stringify(data),original);
+});
+
+test('CUR multi-source issue count is labelled as billing-period scope',()=>{
+  const {api,element}=fixture();
+  api.setCUREvidence({enabled:true,loaded:true,coverage_ppm:500000,source_count:2,issue_count:30,
+    allocation_complete:false,billing_finalized:false,unallocated_cost:{display:'$1.00'},conflict_nano_usd:'0'});
+  assert.match(element('finCUREvidence:span').textContent,/涉及账期 30 条归属问题/);
+  api.setCUREvidence({enabled:true,loaded:true,coverage_ppm:1000000,range_complete:true});
+  assert.equal(element('finCUREvidence:span').textContent,'当前区间成本证据已闭合');
+  assert.equal(element('finCUREvidence').classList.contains('ready'),true);
+});
+
+test('gift period independence never describes missing historical groups as repaired',()=>{
+  const {api,element}=fixture();
+  api.setGiftEvidence({complete:true,expected_hours:4,user_completed_hours:4,credit_completed_hours:4,
+    prior_scope_unknown_events:1,scope_unknown_events:0,gift_users:1});
+  assert.equal(element('finGiftEvidence').querySelector('b').textContent,'已完成');
+  assert.match(element('finGiftEvidence').querySelector('span').textContent,/1 条更早的分组未知事件已证明不影响本区间，历史未修复/);
+});
 
 test('pairing hours distinguish empty verification from business progress and missing attribution',()=>{
   const {api,element}=fixture();

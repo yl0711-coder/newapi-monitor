@@ -39,7 +39,8 @@ func ReadArtifact(reader io.Reader) (Artifact, error) {
 	if reader == nil {
 		return Artifact{}, errors.New("CUR artifact reader is nil")
 	}
-	decoder := json.NewDecoder(io.LimitReader(reader, maxArtifactBytes+1))
+	limited := &io.LimitedReader{R: reader, N: maxArtifactBytes + 1}
+	decoder := json.NewDecoder(limited)
 	decoder.DisallowUnknownFields()
 	var artifact Artifact
 	if err := decoder.Decode(&artifact); err != nil {
@@ -51,6 +52,11 @@ func ReadArtifact(reader io.Reader) (Artifact, error) {
 			return Artifact{}, errors.New("CUR artifact contains trailing JSON")
 		}
 		return Artifact{}, fmt.Errorf("decode CUR artifact trailer: %w", err)
+	}
+	// EOF from the limit is not proof that the original document ended.
+	// Reject overflow even when the entire excess prefix was whitespace.
+	if limited.N <= 0 {
+		return Artifact{}, errors.New("CUR artifact exceeds size limit")
 	}
 	if err := VerifyArtifact(artifact); err != nil {
 		return Artifact{}, err

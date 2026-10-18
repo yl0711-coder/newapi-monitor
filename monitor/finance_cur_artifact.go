@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"math"
 	"math/big"
-	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -17,31 +16,35 @@ import (
 )
 
 type financeCURCostView struct {
-	Enabled              bool                       `json:"enabled"`
-	Loaded               bool                       `json:"loaded"`
-	Status               string                     `json:"status"`
-	StatementID          string                     `json:"statement_id,omitempty"`
-	BillingPeriodStart   int64                      `json:"billing_period_start,omitempty"`
-	BillingPeriodEnd     int64                      `json:"billing_period_end,omitempty"`
-	DataFrom             int64                      `json:"data_from,omitempty"`
-	DataThrough          int64                      `json:"data_through,omitempty"`
-	AllocationComplete   bool                       `json:"allocation_complete"`
-	BillingFinalized     bool                       `json:"billing_finalized"`
-	CoveragePPM          int64                      `json:"coverage_ppm,omitempty"`
-	IssueCount           int64                      `json:"issue_count,omitempty"`
-	UnallocatedNanoUSD   string                     `json:"unallocated_nano_usd,omitempty"`
-	UnallocatedCost      channelEconomicsMoneyView  `json:"unallocated_cost"`
-	ConflictNanoUSD      string                     `json:"conflict_nano_usd,omitempty"`
-	ConflictCost         channelEconomicsMoneyView  `json:"conflict_cost"`
-	IncludedDays         int                        `json:"included_days,omitempty"`
-	KnownNanoUSD         string                     `json:"known_nano_usd,omitempty"`
-	KnownCost            channelEconomicsMoneyView  `json:"known_cost"`
-	ExactCost            *channelEconomicsMoneyView `json:"exact_cost"`
-	RangeComplete        bool                       `json:"range_complete"`
-	MonthRoundingMicro   string                     `json:"month_rounding_adjustment_micro_usd,omitempty"`
-	DayRoundingMicro     string                     `json:"day_rounding_adjustment_micro_usd,omitempty"`
-	ProductRoundingMicro string                     `json:"product_rounding_adjustment_micro_usd,omitempty"`
-	Error                string                     `json:"error,omitempty"`
+	Enabled               bool                        `json:"enabled"`
+	Loaded                bool                        `json:"loaded"`
+	Status                string                      `json:"status"`
+	StatementID           string                      `json:"statement_id,omitempty"`
+	BillingPeriodStart    int64                       `json:"billing_period_start,omitempty"`
+	BillingPeriodEnd      int64                       `json:"billing_period_end,omitempty"`
+	DataFrom              int64                       `json:"data_from,omitempty"`
+	DataThrough           int64                       `json:"data_through,omitempty"`
+	AllocationComplete    bool                        `json:"allocation_complete"`
+	BillingFinalized      bool                        `json:"billing_finalized"`
+	CoveragePPM           int64                       `json:"coverage_ppm,omitempty"`
+	IssueCount            int64                       `json:"issue_count,omitempty"`
+	UnallocatedNanoUSD    string                      `json:"unallocated_nano_usd,omitempty"`
+	UnallocatedCost       channelEconomicsMoneyView   `json:"unallocated_cost"`
+	ConflictNanoUSD       string                      `json:"conflict_nano_usd,omitempty"`
+	ConflictCost          channelEconomicsMoneyView   `json:"conflict_cost"`
+	IncludedDays          int                         `json:"included_days,omitempty"`
+	KnownNanoUSD          string                      `json:"known_nano_usd,omitempty"`
+	KnownCost             channelEconomicsMoneyView   `json:"known_cost"`
+	ExactCost             *channelEconomicsMoneyView  `json:"exact_cost"`
+	RangeComplete         bool                        `json:"range_complete"`
+	MonthRoundingMicro    string                      `json:"month_rounding_adjustment_micro_usd,omitempty"`
+	DayRoundingMicro      string                      `json:"day_rounding_adjustment_micro_usd,omitempty"`
+	ProductRoundingMicro  string                      `json:"product_rounding_adjustment_micro_usd,omitempty"`
+	Error                 string                      `json:"error,omitempty"`
+	SourceCount           int                         `json:"source_count,omitempty"`
+	MissingBillingPeriods []financecur.SourceInterval `json:"missing_billing_periods,omitempty"`
+	PartialBoundaryDays   []financecur.SourceInterval `json:"partial_boundary_days,omitempty"`
+	UnverifiedSourceCount int                         `json:"unverified_source_count,omitempty"`
 }
 
 type financeCURProductCostView struct {
@@ -55,11 +58,11 @@ type financeCURProductCostView struct {
 }
 
 func (m *Monitor) loadFinanceCURCost(fromUnix, toUnix int64) financeCURCostView {
-	artifact, view := m.loadFinanceCURArtifact()
+	source, view := m.loadFinanceCURSource()
 	if !view.Loaded {
 		return view
 	}
-	projected, err := projectVerifiedFinanceCURCost(artifact, fromUnix, toUnix)
+	projected, err := source.project(fromUnix, toUnix)
 	if err != nil {
 		view.Status = "error"
 		view.Loaded = false
@@ -67,27 +70,6 @@ func (m *Monitor) loadFinanceCURCost(fromUnix, toUnix int64) financeCURCostView 
 		return view
 	}
 	return projected
-}
-
-func (m *Monitor) loadFinanceCURArtifact() (financecur.Artifact, financeCURCostView) {
-	if !m.cfg.FinanceCURArtifactEnabled {
-		return financecur.Artifact{}, financeCURCostView{Status: "disabled"}
-	}
-	view := financeCURCostView{Enabled: true, Status: "error"}
-	file, err := os.Open(strings.TrimSpace(m.cfg.FinanceCURArtifactPath))
-	if err != nil {
-		view.Error = "无法打开本地核算产物"
-		return financecur.Artifact{}, view
-	}
-	defer file.Close()
-	artifact, err := financecur.ReadArtifact(file)
-	if err != nil {
-		view.Error = "本地核算产物完整性校验失败"
-		return financecur.Artifact{}, view
-	}
-	view.Loaded = true
-	view.Status = "draft"
-	return artifact, view
 }
 
 func projectFinanceCURCost(artifact financecur.Artifact, fromUnix, toUnix int64) (financeCURCostView, error) {
@@ -185,19 +167,20 @@ func (m *Monitor) applyFinanceCURArtifactToReport(report *financeOperatingReport
 	if report == nil {
 		return
 	}
-	artifact, state := m.loadFinanceCURArtifact()
+	clearFinanceCURReport(report)
+	source, state := m.loadFinanceCURSource()
 	if !state.Loaded {
 		report.CURCost = state
 		return
 	}
-	total, err := projectVerifiedFinanceCURCost(artifact, report.From, report.To)
+	total, err := source.project(report.From, report.To)
 	if err != nil {
 		report.CURCost = financeCURProjectionError(state, err)
 		return
 	}
 	periods := make([]financeCURCostView, len(report.Periods))
 	for index := range report.Periods {
-		periods[index], err = projectVerifiedFinanceCURCost(artifact, report.Periods[index].From, report.Periods[index].To)
+		periods[index], err = source.project(report.Periods[index].From, report.Periods[index].To)
 		if err != nil {
 			report.CURCost = financeCURProjectionError(state, err)
 			return
@@ -205,26 +188,16 @@ func (m *Monitor) applyFinanceCURArtifactToReport(report *financeOperatingReport
 	}
 	days := make([]financeCURCostView, len(report.Days))
 	for index := range report.Days {
-		days[index], err = projectVerifiedFinanceCURCost(artifact, report.Days[index].From, report.Days[index].To)
+		days[index], err = source.project(report.Days[index].From, report.Days[index].To)
 		if err != nil {
 			report.CURCost = financeCURProjectionError(state, err)
 			return
 		}
 	}
-	type productProjection struct {
-		code string
-		cost financeCURCostView
-	}
-	products := make([]productProjection, 0, len(artifact.Timeline.Products))
-	for _, product := range artifact.Timeline.Products {
-		cost, projectErr := projectFinanceCURBuckets(artifact.Statement, product.Days, report.From, report.To)
-		if projectErr != nil {
-			report.CURCost = financeCURProjectionError(state, projectErr)
-			return
-		}
-		if cost.IncludedDays > 0 {
-			products = append(products, productProjection{code: product.ProductCode, cost: cost})
-		}
+	products, err := source.products(report.From, report.To, total)
+	if err != nil {
+		report.CURCost = financeCURProjectionError(state, err)
+		return
 	}
 	monthAdjustment, err := reconcileFinanceCURRoundedCosts(total, periods)
 	if err != nil {
@@ -279,6 +252,7 @@ func (m *Monitor) applyFinanceCURArtifactToReport(report *financeOperatingReport
 	})
 	report.CURCost = total
 	report.CURProducts = productViews
+	report.AWSMonthlyBills = source.monthlyBills(report.From, report.To)
 	applyFinanceCURCost(&report.Statement, total)
 	for index := range report.Periods {
 		applyFinanceCURCost(&report.Periods[index].Statement, periods[index])
@@ -292,6 +266,7 @@ func (m *Monitor) applyFinanceCURArtifactToReport(report *financeOperatingReport
 			report.Days[index].Status = "incomplete"
 		}
 	}
+	source.applyBillingMonths(report)
 }
 
 func financeCURSharePercent(partRaw, totalRaw string) string {
@@ -443,14 +418,24 @@ func financeCURSourceStatus(cur financeCURCostView) (string, string) {
 			rounding = "；明细舍入尾差已确定性归入最后完整期间"
 		}
 		blockers := make([]string, 0, 2)
+		if len(cur.MissingBillingPeriods) > 0 {
+			blockers = append(blockers, fmt.Sprintf("缺少 %d 段账单来源", len(cur.MissingBillingPeriods)))
+		}
+		if len(cur.PartialBoundaryDays) > 0 {
+			blockers = append(blockers, "查询含非完整自然日，边界费用未拆分估算")
+		}
 		if !cur.AllocationComplete {
-			blockers = append(blockers, fmt.Sprintf("归属未闭合（%d 条，%s）", cur.IssueCount, cur.UnallocatedCost.Display))
+			if cur.SourceCount > 0 {
+				blockers = append(blockers, fmt.Sprintf("涉及账期有 %d 条归属问题；当前区间待归属 %s", cur.IssueCount, cur.UnallocatedCost.Display))
+			} else {
+				blockers = append(blockers, fmt.Sprintf("归属未闭合（%d 条，%s）", cur.IssueCount, cur.UnallocatedCost.Display))
+			}
 		}
 		if !cur.BillingFinalized {
 			blockers = append(blockers, "AWS 当期账单未封账")
 		}
 		if len(blockers) == 0 {
-			blockers = append(blockers, "CUR 产物仍为草稿")
+			blockers = append(blockers, "所选时段成本证据尚未完整覆盖")
 		}
 		return "incomplete", fmt.Sprintf("%s；归属覆盖 %.4f%%；%s，草稿不参与正式利润%s", amount, float64(cur.CoveragePPM)/10_000, strings.Join(blockers, "；"), rounding)
 	case "error":

@@ -67,7 +67,7 @@ func TestFinanceUpgradeSnapshotRetainsDeployedProjectionFallback(t *testing.T) {
 }
 
 func TestFinanceUpgradeCoveragePreservesPriorMoneyWithoutPromotion(t *testing.T) {
-	for _, projection := range []string{"accounting-recharge-zero-proof-v7", "accounting-pairing-hour-diagnostics-v8"} {
+	for _, projection := range []string{"accounting-recharge-zero-proof-v7", "accounting-pairing-hour-diagnostics-v8", "accounting-empty-bill-coverage-v9"} {
 		t.Run(projection, func(t *testing.T) {
 			m, request, now, _ := newFinanceUpgradeSnapshotFixture(t)
 			payload := []byte(fmt.Sprintf(`{"enabled":true,"from":3600,"to":10800,"generated_at":%d,"statement":{"contribution_profit":{"micro_usd":"42"},"contribution_margin_percent":"1.2"},"cost_details":[{"provider":"tokenforce"}],"pairing_audit":{"paired_rows":3}}`, now.Unix()))

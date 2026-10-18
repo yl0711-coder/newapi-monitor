@@ -70,6 +70,7 @@ type financeStatementView struct {
 }
 
 type financePeriodView struct {
+	BillingResult    *financeBillingResult       `json:"billing_result,omitempty"`
 	Period           string                      `json:"period"`
 	From             int64                       `json:"from"`
 	To               int64                       `json:"to"`
@@ -250,6 +251,7 @@ type financePairingBlockerView struct {
 }
 
 type financeOperatingReport struct {
+	BillingResult    *financeBillingResult       `json:"billing_result,omitempty"`
 	Enabled          bool                        `json:"enabled"`
 	Stage            string                      `json:"stage"`
 	GeneratedAt      int64                       `json:"generated_at"`
@@ -267,6 +269,7 @@ type financeOperatingReport struct {
 	PairingAudit     financePairingAuditView     `json:"pairing_audit"`
 	CURCost          financeCURCostView          `json:"cur_cost"`
 	CURProducts      []financeCURProductCostView `json:"cur_products"`
+	AWSMonthlyBills  []financeAWSMonthlyBillView `json:"aws_monthly_bills,omitempty"`
 	InternalAccounts financeInternalFactStatus   `json:"internal_accounts"`
 	Sources          []financeSourceView         `json:"sources"`
 	Notices          []string                    `json:"notices"`
@@ -540,15 +543,16 @@ func (m *Monitor) loadFinancePairingAudit(ctx context.Context, scope stabilitySc
 		LedgerDomains: []string{}, UnenrolledDomains: []string{}, UnallocatedByDomain: map[string]int64{},
 	}
 	var rows []financePairingAuditRow
-	if err := m.storeDB.WithContext(ctx).Raw(`SELECT p.coverage_status status,
+	// Match the financial report's authoritative domain-hour manifest. Child
+	// current pointers also survive for previous account epochs and therefore
+	// cannot independently identify the currently published financial result.
+	if err := currentEconomicsPublicationQuery(m.storeDB.WithContext(ctx)).Select(`p.coverage_status status,
 		p.domain domain,p.local_channel_id local_channel_id,
 		MIN(p.hour_ts) first_hour,MAX(p.hour_ts) last_hour,COUNT(*) rows,
 		COALESCE(SUM(p.revenue_micro_usd),0) revenue_micro_usd,
-		COALESCE(SUM(CASE WHEN p.corrected_cost_known=1 THEN p.corrected_cost_micro_usd ELSE 0 END),0) corrected_cost_micro_usd
-		FROM channel_economics_hour_current c
-		JOIN channel_economics_hour_publications p ON p.publication_id=c.publication_id
-		WHERE p.semantics_version=? AND p.hour_ts>=? AND p.hour_ts<?
-		GROUP BY p.coverage_status,p.domain,p.local_channel_id ORDER BY rows DESC,status,p.domain,p.local_channel_id`, channelEconomicsSemanticsVersion, scope.FromTs, scope.ToTs).Scan(&rows).Error; err != nil {
+		COALESCE(SUM(CASE WHEN p.corrected_cost_known=1 THEN p.corrected_cost_micro_usd ELSE 0 END),0) corrected_cost_micro_usd`).
+		Where("p.semantics_version=? AND p.hour_ts>=? AND p.hour_ts<?", channelEconomicsSemanticsVersion, scope.FromTs, scope.ToTs).
+		Group("p.coverage_status,p.domain,p.local_channel_id").Order("rows DESC,status,p.domain,p.local_channel_id").Scan(&rows).Error; err != nil {
 		return audit, fmt.Errorf("读取收入成本配对缺口: %w", err)
 	}
 	blockers := make(map[string]*financePairingBlockerAccumulator)
@@ -778,7 +782,7 @@ func applyFinancePairingDomainCoverage(audit *financePairingAuditView, details [
 	sort.Strings(audit.UnenrolledDomains)
 }
 
-// loadFinanceClosureEvidence reads only local immutable control rows. The
+// loadFinanceClosureEvidence reads local control rows and current identity metadata. The
 // legacy aggregate bill can show an amount before the newer cost ledger has
 // reconstructed the same historical requests, so those two kinds of evidence
 // must remain visibly separate during gray rollout.
@@ -800,16 +804,28 @@ func (m *Monitor) loadFinanceClosureEvidence(ctx context.Context, scope stabilit
 	if len(domains) == 0 {
 		return map[string]financeClosureCostEvidenceRow{}, map[string]financeClosureVersionRow{}, nil
 	}
-	costRows := []financeClosureCostEvidenceRow{}
-	if err := m.storeDB.WithContext(ctx).Raw(`SELECT domain,
-		MIN(hour_ts) first_hour,COUNT(*) evidence_hours,
-		SUM(CASE WHEN status='verified' AND reconcile_status='matched' THEN 1 ELSE 0 END) verified_hours,
-		COALESCE(SUM(requests),0) evidence_requests,
-		COALESCE(SUM(CASE WHEN status='verified' AND reconcile_status='matched' THEN requests ELSE 0 END),0) verified_requests
-		FROM channel_upstream_cost_hour_states
-		WHERE domain IN ? AND semantics_version=? AND hour_ts>=? AND hour_ts<?
-		AND (requests>0 OR evidence_rows>0 OR control_charge_units<>0 OR evidence_charge_units<>0)
-		GROUP BY domain ORDER BY domain`, domains, channelCostEvidenceSemanticsVersion, scope.FromTs, scope.ToTs).Scan(&costRows).Error; err != nil {
+	// Resolve identity in the same read as the control rows. Grouping only by
+	// domain mixes preserved evidence from previous accounts/providers into
+	// current-account coverage. Read only identity metadata, never credentials;
+	// retain old rows, but do not advertise them as current bill evidence.
+	var costRows []struct {
+		Domain                                   string
+		FirstHour, EvidenceHours, VerifiedHours  int64
+		EvidenceRequests, VerifiedRequests       int64
+		AccountEpoch, Provider, BaseURL, Account string
+		UserID                                   int64
+	}
+	if err := m.storeDB.WithContext(ctx).Raw(`SELECT s.domain,s.account_epoch,s.provider,a.base_url,a.user_id,a.account,
+		MIN(s.hour_ts) first_hour,COUNT(*) evidence_hours,
+		SUM(CASE WHEN s.status='verified' AND s.reconcile_status='matched' THEN 1 ELSE 0 END) verified_hours,
+		COALESCE(SUM(s.requests),0) evidence_requests,
+		COALESCE(SUM(CASE WHEN s.status='verified' AND s.reconcile_status='matched' THEN s.requests ELSE 0 END),0) verified_requests
+		FROM channel_upstream_cost_hour_states s
+		JOIN channel_upstream_accounts a ON a.domain=s.domain AND a.provider=s.provider
+		WHERE s.domain IN ? AND s.semantics_version=? AND s.hour_ts>=? AND s.hour_ts<?
+		AND (s.requests>0 OR s.evidence_rows>0 OR s.control_charge_units<>0 OR s.evidence_charge_units<>0)
+		GROUP BY s.domain,s.account_epoch,s.provider,a.base_url,a.user_id,a.account
+		ORDER BY s.domain,s.account_epoch`, domains, channelCostEvidenceSemanticsVersion, scope.FromTs, scope.ToTs).Scan(&costRows).Error; err != nil {
 		return nil, nil, fmt.Errorf("读取成本闭环小时证据: %w", err)
 	}
 	versionRows := []financeClosureVersionRow{}
@@ -819,9 +835,14 @@ func (m *Monitor) loadFinanceClosureEvidence(ctx context.Context, scope stabilit
 	}
 	costByDomain := make(map[string]financeClosureCostEvidenceRow, len(costRows))
 	for _, row := range costRows {
+		account := ChannelUpstreamAccount{Provider: row.Provider, BaseURL: row.BaseURL, UserID: row.UserID, Account: row.Account}
+		if row.AccountEpoch != newAPIUpstreamAccountEpoch(account) {
+			continue
+		}
 		domain := strings.ToLower(strings.TrimSpace(row.Domain))
 		if domain != "" {
-			costByDomain[domain] = row
+			costByDomain[domain] = financeClosureCostEvidenceRow{Domain: domain, FirstHour: row.FirstHour, EvidenceHours: row.EvidenceHours,
+				VerifiedHours: row.VerifiedHours, EvidenceRequests: row.EvidenceRequests, VerifiedRequests: row.VerifiedRequests}
 		}
 	}
 	versionByDomain := make(map[string]financeClosureVersionRow, len(versionRows))
@@ -1357,13 +1378,20 @@ func applyFinanceGiftBreakdowns(report *financeOperatingReport, result financeGi
 	if report == nil {
 		return nil
 	}
-	strictPrefix := !result.Coverage.Complete
-	if strictPrefix {
-		if result.verifiedPrefix == nil || !result.verifiedPrefix.Coverage.Complete {
-			return nil
-		}
-		result = *result.verifiedPrefix
+	if result.Coverage.Complete {
+		return applyFinanceGiftVerifiedBreakdowns(report, result, false)
 	}
+	for _, part := range []*financeGiftAllocationResult{result.verifiedPrefix, result.verifiedSuffix} {
+		if part != nil && part.Coverage.Complete {
+			if err := applyFinanceGiftVerifiedBreakdowns(report, *part, true); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func applyFinanceGiftVerifiedBreakdowns(report *financeOperatingReport, result financeGiftAllocationResult, strictBounds bool) error {
 	type target struct {
 		label     string
 		from      int64
@@ -1373,7 +1401,7 @@ func applyFinanceGiftBreakdowns(report *financeOperatingReport, result financeGi
 	targets := make([]target, 0, len(report.Periods)+len(report.Days))
 	boundaries := make(map[int64]struct{}, len(report.Periods)*2+len(report.Days)*2)
 	for index := range report.Periods {
-		if strictPrefix && report.Periods[index].To > result.Coverage.ToTs {
+		if strictBounds && report.Periods[index].To > result.Coverage.ToTs {
 			continue
 		}
 		from := report.Periods[index].From
@@ -1385,7 +1413,7 @@ func applyFinanceGiftBreakdowns(report *financeOperatingReport, result financeGi
 		boundaries[from], boundaries[to] = struct{}{}, struct{}{}
 	}
 	for index := range report.Days {
-		if strictPrefix && report.Days[index].To > result.Coverage.ToTs {
+		if strictBounds && report.Days[index].To > result.Coverage.ToTs {
 			continue
 		}
 		from := report.Days[index].From
@@ -3074,7 +3102,7 @@ func (m *Monitor) buildFinanceOperatingReport(ctx context.Context, from, to time
 			return nil, fmt.Errorf("核验注册赠送实际消耗: %w", giftErr)
 		}
 		if giftResult.Coverage.ScopeUnknownEvents > 0 {
-			report.Notices = append(report.Notices, "部分历史赠送消耗缺少分组依据；缺口前已完整核验的期间正常显示，跨越缺口的期间及总收入待补齐，其他已知金额仍保留。")
+			report.Notices = append(report.Notices, "部分历史赠送消耗缺少分组依据；缺口前已完整核验的期间，以及已证明不受历史缺口影响的后续期间正常显示，跨越缺口的期间及总收入待补齐。")
 		}
 		giftResult, giftErr = excludeFinanceGiftUsers(giftResult, excludedGiftUsers)
 		if giftErr != nil {
@@ -3188,6 +3216,11 @@ func financeSourceViews(user StabilityDataCoverage, upstream financeUpstreamCove
 	if gift.ScopeIndependentUserHours > 0 {
 		giftDescription += fmt.Sprintf("；%d 个后续用户小时已证明赠送耗尽且无退款，不需要重取历史分组，不代表原始分组已补齐", gift.ScopeIndependentUserHours)
 	}
+	if gift.PriorScopeUnknownEvents > 0 {
+		giftDescription = fmt.Sprintf("当前区间赠送扣减已核验；%d 条更早的分组未知事件已通过赠送耗尽或后续无消费退款的证据证明不影响本区间，不代表历史已修复", gift.PriorScopeUnknownEvents)
+	} else if gift.VerifiedSuffixFromTs > 0 {
+		giftDescription += "；已证明不受历史缺口影响的后续完整期间可独立显示收入，历史总额仍待补齐"
+	}
 	internalTestStatus := "no_data"
 	internalTestDescription := "当前区间没有内部测试请求"
 	if statement.InternalTestRequests > 0 {
@@ -3230,14 +3263,20 @@ func parseFinanceRange(c *gin.Context, now time.Time, startDate string) (time.Ti
 			return time.Time{}, time.Time{}, errors.New("from 必须是 YYYY-MM-DD")
 		}
 	}
-	to := now.Truncate(time.Hour)
+	// Use the same exclusive end as accounting's hourly coverage proof.
+	// Wall-clock truncation includes one additional, still provisional hour:
+	// coverage can read 100% while internal-account facts have not reached it,
+	// which hides the entire current month's consumption after an hour rolls.
+	// This is a time boundary, not a data-availability fallback: genuine gaps
+	// inside the selected range must still fail the existing completeness gates.
+	closedHour := time.Unix(finalizedStabilityHourTo(now.Unix()), 0).In(loc)
+	to := closedHour
 	if raw := strings.TrimSpace(c.Query("to")); raw != "" {
 		day, parseErr := time.ParseInLocation("2006-01-02", raw, loc)
 		if parseErr != nil {
 			return time.Time{}, time.Time{}, errors.New("to 必须是 YYYY-MM-DD")
 		}
 		to = day.AddDate(0, 0, 1)
-		closedHour := now.Truncate(time.Hour)
 		if to.After(closedHour) {
 			to = closedHour
 		}

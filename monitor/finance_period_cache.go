@@ -217,10 +217,14 @@ func (m *Monitor) buildFinancePeriodComponent(
 	key := financePeriodCacheKey(scope, configurationKey, fingerprint)
 	cache := m.getFinancePeriodCache()
 	force, _ := ctx.Value(financeForceRebuildKey{}).(bool)
+	// The coverage horizon can advance without any source row changing.
+	// Rebuild only a cached component calculated against a different horizon;
+	// unchanged closed historical months remain reusable, including real gaps.
+	coverageTo := min(scope.ToTs, finalizedStabilityHourTo(now)) / 3600 * 3600
 	if !force {
 		if payload, ok := cache.Get(key, time.Now()); ok {
 			var component financePeriodComponent
-			if json.Unmarshal(payload, &component) == nil {
+			if json.Unmarshal(payload, &component) == nil && component.UserCoverage.ToTs == coverageTo {
 				return component, true, nil
 			}
 		}
@@ -228,7 +232,7 @@ func (m *Monitor) buildFinancePeriodComponent(
 			financePeriodLogicalKey(scope, configurationKey), fingerprint,
 		); loadErr == nil && ok {
 			var component financePeriodComponent
-			if json.Unmarshal(payload, &component) == nil {
+			if json.Unmarshal(payload, &component) == nil && component.UserCoverage.ToTs == coverageTo {
 				cache.Put(key, payload, financePeriodCacheTTL, time.Now())
 				return component, true, nil
 			}

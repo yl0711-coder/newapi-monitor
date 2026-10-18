@@ -115,6 +115,16 @@ func VerifyStatement(statement Statement, timeline Timeline) error {
 	if statement.TimeZone != timeline.TimeZone || statement.TimelineSHA256 != timelineHash {
 		return errors.New("CUR statement timeline digest mismatch")
 	}
+	// Hashes bind bytes but do not establish monetary reconciliation. Check
+	// independently, including artifacts written by other compatible producers.
+	if err := validateTimelineTotals(timeline, AllocationReport{
+		TotalNanoUSD: statement.SourceNanoUSD, NexusAPINanoUSD: statement.NexusAPINanoUSD,
+		ExcludedNanoUSD: statement.ExcludedNanoUSD, UnallocatedNanoUSD: statement.UnallocatedNanoUSD,
+		ConflictNanoUSD: statement.ConflictNanoUSD, TotalAbsNanoUSD: statement.TotalAbsNanoUSD,
+		AllocatedAbsNanoUSD: statement.AllocatedAbsNanoUSD,
+	}); err != nil {
+		return err
+	}
 	expected, err := statementDigest(statement)
 	if err != nil {
 		return err
