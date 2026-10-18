@@ -1180,14 +1180,43 @@ func TestChannelManagementManualDisabledUpstreamPresentation(t *testing.T) {
 	js := string(channelManagementJS)
 	css := string(stabilityCSS)
 	for _, marker := range []string{
-		`if(domain.manually_disabled)return 2`,
-		`Number(a.sortRank)-Number(b.sortRank)`,
 		`cm-upstream-disabled`,
 		`已禁用`,
 		`.cm-domain-card.manually-disabled`,
 	} {
 		if !strings.Contains(js, marker) && !strings.Contains(css, marker) {
 			t.Fatalf("全渠道手动禁用上游展示缺少 %q", marker)
+		}
+	}
+}
+
+func TestChannelManagementRetirementSectionsIndependentOfDisabledStatus(t *testing.T) {
+	js := string(channelManagementJS)
+	// These assertions cover the embedded asset shipped by Go. Rendering,
+	// filters, mark/cancel and unchanged money totals are exercised by the
+	// executable frontend tests in channel-disabled-sections.test.mjs.
+	for _, marker := range []string{
+		`if(domain.retiring===true)return 2`,
+		`Number(a.sortRank)-Number(b.sortRank)`,
+		`domains.filter(domain=>domain.retiring!==true)`,
+		`domains.filter(domain=>domain.retiring===true)`,
+		`已停用渠道`,
+		`未停用渠道`,
+		`不再充值续费`,
+	} {
+		if !strings.Contains(js, marker) {
+			t.Errorf("停止使用分区缺少 %q", marker)
+		}
+	}
+	for _, obsolete := range []string{
+		`if(domain.manually_disabled)return 2`,
+		`domains.filter(domain=>domain.manually_disabled)`,
+		`domains.filter(domain=>!domain.manually_disabled)`,
+		`已禁用渠道`,
+		`未禁用渠道`,
+	} {
+		if strings.Contains(js, obsolete) {
+			t.Errorf("停止使用分区仍使用旧的渠道禁用规则 %q", obsolete)
 		}
 	}
 }
