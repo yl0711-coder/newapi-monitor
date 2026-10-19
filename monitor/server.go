@@ -466,6 +466,7 @@ func (m *Monitor) RegisterRoutes(r *gin.Engine) {
 		rootChannels.POST("/cost/activations/:activation_id/cancel", m.cancelChannelFinanceActivationHandler)
 	}
 	r.POST("/finance/internal-accounts", m.requireRole(roleRoot), m.saveFinanceInternalAccounts)
+	m.registerFinanceRechargeRoutes(r)
 	r.POST("/finance/gift-handoff/preview", noStoreSensitive, m.requireRole(roleRoot), m.serveFinanceGiftHandoffPreview)
 	r.POST("/finance/gift-handoff/authorizations", noStoreSensitive, m.requireRole(roleRoot), m.serveFinanceGiftHandoffAuthorize)
 	r.GET("/finance/gift-handoff/authorizations/:id", noStoreSensitive, m.requireRole(roleRoot), m.serveFinanceGiftHandoffAuthorizationStatus)

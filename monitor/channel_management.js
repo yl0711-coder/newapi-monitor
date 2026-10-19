@@ -303,12 +303,12 @@ function inactiveUnconfiguredDomain(domain){
   return !configured&&!active;
 }
 function domainSortRank(domain){
-  if(domain.manually_disabled)return 2;
+  if(domain.retiring===true)return 2;
   return inactiveUnconfiguredDomain(domain)?1:0;
 }
 function domainSortDescription(){
   const order=cm.sort==='name'?'按名称 A–Z 排序':'按 '+metricLabel()+' 从高到低排序';
-  return order+'；未配置且无当前启用渠道的上游置后，全部渠道均手动禁用的上游最后';
+  return order+'；未配置且无当前启用渠道的上游置后，标记“停止使用”的上游单独列在最后';
 }
 function channelUsageComplete(){return cm.report?.meta?.data_coverage?.complete===true}
 function usageMetric(value,formatter){
@@ -1747,12 +1747,12 @@ function upstreamBalanceSummary(accounts){
 
 function domainSections(domains,total,filtered,costBases){
   if(!domains.length)return '<div class="cm-domain-list"><div class="cm-empty"><b>当前筛选没有匹配渠道</b><p>请重置筛选条件或更换日期范围。</p></div></div>';
-  // Use the server's whole-account flag, never infer disabled status from
-  // filtered children. Grouping must not remove historical spend or balances.
-  const active=domains.filter(domain=>!domain.manually_disabled);
-  const disabled=domains.filter(domain=>domain.manually_disabled);
-  const section=(items,isDisabled,offset)=>items.length?`<section class="cm-channel-section${isDisabled?' is-disabled':''}" aria-label="${isDisabled?'已禁用渠道':'未禁用渠道'}"><div class="cm-channel-section-head"><h4>${isDisabled?'已禁用渠道':'未禁用渠道'} <span>${nfmt(items.length)} 个上游</span></h4><p>${isDisabled?'全部当前渠道均已手动禁用；余额、历史消费及配置仍可查看。':'日常余额关注区；含自动禁用、部分禁用及停止使用的上游，请结合状态标签查看。'}</p></div><div class="cm-domain-list">${items.map((domain,index)=>domainCard(domain,offset+index,total,filtered,costBases)).join('')}</div></section>`:'';
-  return section(active,false,0)+section(disabled,true,active.length);
+  // Retirement is an explicit no-renewal decision, independent of channel
+  // routing status or filtered children. Keep all historical spend and balances.
+  const active=domains.filter(domain=>domain.retiring!==true);
+  const retired=domains.filter(domain=>domain.retiring===true);
+  const section=(items,isRetired,offset)=>items.length?`<section class="cm-channel-section${isRetired?' is-disabled':''}" aria-label="${isRetired?'已停用渠道':'未停用渠道'}"><div class="cm-channel-section-head"><h4>${isRetired?'已停用渠道':'未停用渠道'} <span>${nfmt(items.length)} 个上游</span></h4><p>${isRetired?'已标记“停止使用”，不再充值续费；可继续消耗余量，余额、账单同步及历史消费仍保留。':'日常余额及充值评估区；未标记“停止使用”的上游均在此显示，与渠道启用或禁用状态无关。'}</p></div><div class="cm-domain-list">${items.map((domain,index)=>domainCard(domain,offset+index,total,filtered,costBases)).join('')}</div></section>`:'';
+  return section(active,false,0)+section(retired,true,active.length);
 }
 
 function render(){

@@ -234,7 +234,24 @@ func Allocate(entries []CostEntry, rules []AllocationRule) (AllocationReport, er
 		if left.ResourceID != right.ResourceID {
 			return left.ResourceID < right.ResourceID
 		}
-		return left.UsageType < right.UsageType
+		// Map iteration is random. Equal amounts and resource/usage keys can
+		// still describe different fees or credits; use every bucket identity
+		// field so replay and serialized evidence remain deterministic.
+		for _, pair := range [][2]string{
+			{left.UsageType, right.UsageType}, {left.Kind, right.Kind},
+			{left.LineItemType, right.LineItemType}, {left.ServiceCode, right.ServiceCode},
+			{left.Operation, right.Operation}, {left.Description, right.Description},
+		} {
+			if pair[0] != pair[1] {
+				return pair[0] < pair[1]
+			}
+		}
+		for k := 0; k < len(left.RuleIDs) && k < len(right.RuleIDs); k++ {
+			if left.RuleIDs[k] != right.RuleIDs[k] {
+				return left.RuleIDs[k] < right.RuleIDs[k]
+			}
+		}
+		return len(left.RuleIDs) < len(right.RuleIDs)
 	})
 	report.Publishable = report.IssueCount == 0 && report.Entries > 0 && report.AllocatedAbsNanoUSD == report.TotalAbsNanoUSD
 	return report, nil

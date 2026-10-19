@@ -34,6 +34,24 @@ func TestArtifactStrictRoundTrip(t *testing.T) {
 	if decoded.Statement.StatementID != artifact.Statement.StatementID || decoded.Statement.TimelineSHA256 != artifact.Statement.TimelineSHA256 {
 		t.Fatalf("decoded=%+v artifact=%+v", decoded, artifact)
 	}
+	for _, tc := range []struct {
+		name    string
+		extra   int
+		trailer string
+		valid   bool
+	}{
+		{"exact_limit", 0, "", true},
+		{"over_limit_whitespace", 1, "", false},
+		{"hidden_trailing_json", 1, "{}", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			input := encoded.String() + strings.Repeat(" ", maxArtifactBytes-encoded.Len()+tc.extra) + tc.trailer
+			_, err := ReadArtifact(strings.NewReader(input))
+			if (err == nil) != tc.valid {
+				t.Fatalf("size boundary accepted=%v want=%v: %v", err == nil, tc.valid, err)
+			}
+		})
+	}
 }
 
 func TestArtifactRejectsUnknownTrailingAndTamperedJSON(t *testing.T) {

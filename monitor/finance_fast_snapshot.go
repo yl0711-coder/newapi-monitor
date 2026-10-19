@@ -45,13 +45,10 @@ func (m *Monitor) financeFastSnapshotPayload(request financeReportRequest, now t
 }
 
 func validFinanceSnapshotBounds(payload []byte, request financeReportRequest, verifiedAt time.Time) bool {
-	var bounds struct {
-		From        int64 `json:"from"`
-		To          int64 `json:"to"`
-		GeneratedAt int64 `json:"generated_at"`
-	}
+	var bounds financeSnapshotBounds
 	return json.Unmarshal(payload, &bounds) == nil && bounds.From == request.from.Unix() &&
-		bounds.To == request.to.Unix() && bounds.GeneratedAt > 0 && bounds.GeneratedAt <= verifiedAt.Add(time.Minute).Unix()
+		bounds.To == request.to.Unix() && bounds.GeneratedAt > 0 && bounds.GeneratedAt <= verifiedAt.Add(time.Minute).Unix() &&
+		!bounds.hasUnfinalizedTail()
 }
 
 // This path never computes source fingerprints on the HTTP goroutine.

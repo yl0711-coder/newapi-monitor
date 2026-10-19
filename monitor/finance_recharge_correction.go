@@ -21,8 +21,9 @@ type FinanceRechargeCorrection struct {
 
 // buildFinanceRechargeCorrection only plans append-only rows. It preserves
 // every old publication's referenced version, all unrelated snapshot fields,
-// and the effective configuration outside the explicit interval. The offline
-// rehearsal is its only writer; no automatic repair or HTTP route uses it.
+// and the effective configuration outside the explicit interval. Only offline
+// rehearsal and the guarded maintenance workflow write these rows; no startup
+// task or automatic repair calls it. Maintenance execution is separately gated.
 func buildFinanceRechargeCorrection(history []ChannelFinanceVersion, in FinanceRechargeCorrection, now int64) ([]ChannelFinanceVersion, error) {
 	if in.Domain == "" || len(in.Domain) > 253 || normalizeChannelBaseDomain(in.Domain) != in.Domain ||
 		in.FromTs < 0 || in.ToTs <= in.FromTs || in.ToTs > now-now%3600 ||

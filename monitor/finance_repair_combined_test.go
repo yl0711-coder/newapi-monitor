@@ -21,7 +21,13 @@ func TestFinanceRepairCombinedCurrentSnapshot(t *testing.T) {
 	if manifest == "" || os.Getenv("MONITOR_GIFT_RETAINED_MANIFEST") == "" {
 		t.Skip("requires explicit private recharge and retained gift inventories")
 	}
-	corrected, requests := rechargeReuseCurrentSnapshot(t, manifest)
+	var corrected string
+	var requests []FinanceRechargeRehearsalRequest
+	if fixture := os.Getenv("MONITOR_FINANCE_BOUNDED_RECHARGE_FIXTURE"); fixture != "" {
+		corrected, requests = boundedRechargeCombinedBills(t, manifest, fixture)
+	} else {
+		corrected, requests = rechargeReuseCurrentSnapshot(t, manifest)
+	}
 	gift := giftReuseRetainedSeries(t, corrected)
 	// Keep the preceding step's checkpoint closed and immutable. Only this new
 	// continuation copy gets ledger revisions; repaired facts remain the same.

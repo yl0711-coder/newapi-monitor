@@ -514,13 +514,14 @@ func TestLoadFinanceClosureEvidenceSeparatesVerifiedActivityAndHistory(t *testin
 		t.Fatalf("empty closure scope should not query or invent evidence: cost=%v versions=%v err=%v", emptyCost, emptyVersions, err)
 	}
 	hour := int64(1_788_195_600)
-	epoch := strings.Repeat("9", 64)
+	epoch := newAPIUpstreamAccountEpoch(ChannelUpstreamAccount{Provider: upstreamProviderNewAPI, BaseURL: "https://4sapi.com"})
 	states := []ChannelUpstreamCostHourState{
 		{Domain: "4sapi.com", AccountEpoch: epoch, HourTs: hour, SemanticsVersion: channelCostEvidenceSemanticsVersion, Status: "verified", ReconcileStatus: "matched", Requests: 7, EvidenceRows: 1},
 		{Domain: "4sapi.com", AccountEpoch: epoch, HourTs: hour + 3600, SemanticsVersion: channelCostEvidenceSemanticsVersion, Status: "observed", ReconcileStatus: "pending", Requests: 3, EvidenceRows: 1},
 		{Domain: "4sapi.com", AccountEpoch: epoch, HourTs: hour + 7200, SemanticsVersion: channelCostEvidenceSemanticsVersion, Status: "verified", ReconcileStatus: "matched"},
 	}
 	for _, state := range states {
+		state.Provider = upstreamProviderNewAPI
 		if err := m.storeDB.Create(&state).Error; err != nil {
 			t.Fatal(err)
 		}
@@ -686,6 +687,7 @@ func TestFinancePairingAuditExplainsUnallocatedCostAndMissingCost(t *testing.T) 
 			t.Fatal(err)
 		}
 	}
+	insertEconomicsReportManifest(t, m, "4sapi.com", epoch, hour, rows...)
 	if err := m.storeDB.Create(&ChannelUpstreamCostHourEvidence{
 		Domain: "4sapi.com", AccountEpoch: epoch, HourTs: hour, SemanticsVersion: channelCostEvidenceSemanticsVersion,
 		SourceRef: strings.Repeat("c", 64), DimensionHash: strings.Repeat("d", 64), SourceGroup: "Gpt-codex", UpstreamModel: "gpt-5.6-sol",
@@ -751,6 +753,7 @@ func TestFinancePairingAuditAggregatesAndSortsDomainEvidence(t *testing.T) {
 		if err := m.storeDB.Create(&ChannelEconomicsHourCurrent{LogicalKey: row.LogicalKey, PublicationID: row.PublicationID, Revision: 1}).Error; err != nil {
 			t.Fatal(err)
 		}
+		insertEconomicsReportManifest(t, m, row.Domain, epoch, hour, row)
 	}
 	audit, err := m.loadFinancePairingAudit(context.Background(), stabilityScope{FromTs: hour, ToTs: hour + 3600})
 	if err != nil {
@@ -880,7 +883,8 @@ func TestFinancePageAndNavigationAreWired(t *testing.T) {
 		`id="finPeriodRows"`, `id="finDailyRows"`, `id="finCostRows"`, `id="finPairingRows"`, `id="finPairingCoverage"`, `id="finClosureReadiness"`, `id="finUnallocatedSourceRows"`, `id="finBridgeRevenue"`, `id="finBridgeProfit"`, `window.financeActivate`,
 		`id="finEvidenceRollout"`, `id="finEvidenceRolloutRows"`, `id="finEvidenceRolloutSummary"`, `历史成本补证计划`, `仅改善上游证据`, `建议首个灰度`,
 		`function operatingProfitBlockers`, `上游账单区间不完整`, `上游修正成本区间不完整`, `AWS 当期未封账`,
-		`id="finCURProductRows"`, `AWS 基础设施成本明细`, `renderCURProducts`,
+		`id="finCURProductRows"`, `AWS 日级成本明细 · 同时间区间`, `renderCURProducts`,
+		`经营损益桥 · 同时间区间`, `月度事实明细 · 同时间区间`, `月度经营结果 · AWS 账单月份口径`, `同区间状态`,
 		`id="finGiftEvidence"`, `注册赠送消耗`, `经营收入`, `已配对计费贡献（赠送前）`, `减：修正上游总成本`, `其中：内部测试上游成本`, `id="finInternalAccounts"`, `分组名称候选（非归属证据）`, `不会自动绑定或改变核算金额`, `仅分组名称得到一个候选；不代表令牌归属`, `去渠道管理精确核对`, `window.channelManagementOpenCostSource`, `当前区间没有可发布的上游账单`, `当前区间没有同时核验的收入与成本`, `缺账单证据`,
 		`load(true)`, `query.set('fresh', '1')`, `X-Monitor-Finance-Cache`, `生成于`, `后台更新中`,
 		`function scheduleStaleRefresh`, `state.refreshAttempts >= 5`, `load(false, true)`,

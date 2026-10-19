@@ -212,13 +212,14 @@
       const pending = value?.latest_hour_pending ? ' · 当前小时待闭合' : '';
       const scopePending = Number(value?.scope_unknown_events || 0) > 0 ? ` · ${Number(value.scope_unknown_events)} 条历史分组依据待补` : '';
       const scopeIndependent = Number(value?.scope_independent_user_hours || 0) > 0 ? ` · ${Number(value.scope_independent_user_hours)} 个后续用户小时已证明不影响赠送扣减` : '';
+      const priorUnknown = Number(value?.prior_scope_unknown_events || 0) > 0 ? ` · ${Number(value.prior_scope_unknown_events)} 条更早的分组未知事件已证明不影响本区间，历史未修复` : '';
       note.textContent = expected > 0
-        ? `小时覆盖 ${coveragePercent(completed, expected)} · ${completed}/${expected} 小时 · 赠送用户 ${giftUsers}${sequence}${pending}${scopePending}${scopeIndependent}`
+        ? `小时覆盖 ${coveragePercent(completed, expected)} · ${completed}/${expected} 小时 · 赠送用户 ${giftUsers}${sequence}${pending}${scopePending}${scopeIndependent}${priorUnknown}`
         : '当前区间没有可核验证据';
     }
   }
 
-  function setCUREvidence(value) {
+  function setCUREvidence(value, billingMonth = false) {
     const element = $('finCUREvidence');
     if (!element) return;
     const enabled = value?.enabled === true;
@@ -227,6 +228,11 @@
     const issues = Number(value?.issue_count || 0);
     const residual = value?.unallocated_cost?.display || money(value?.unallocated_cost);
     const conflicts = value?.conflict_cost?.display || money(value?.conflict_cost);
+    const missingSources = Array.isArray(value?.missing_billing_periods) ? value.missing_billing_periods.length : 0;
+    const partialDays = Array.isArray(value?.partial_boundary_days) ? value.partial_boundary_days.length : 0;
+    const sourceGaps = `${missingSources ? ` · 缺少 ${missingSources} 段${billingMonth ? '同时间区间日级来源' : '账单来源'}` : ''}${partialDays ? ' · 非完整自然日未拆分估算' : ''}`;
+    const issueLabel = Number(value?.source_count || 0) > 0 ? `涉及账期 ${issues.toLocaleString('zh-CN')} 条归属问题` : `${issues.toLocaleString('zh-CN')} 条`;
+    const rangeGap = !sourceGaps && value?.billing_finalized === true && value?.allocation_complete === true && value?.range_complete !== true ? ' · 所选时段证据不完整' : '';
     element.classList.remove('ready', 'warn', 'missing');
     element.classList.add(!enabled || !loaded ? 'missing' : value?.range_complete ? 'ready' : 'warn');
     const amount = element.querySelector('b');
@@ -235,7 +241,12 @@
     if (note) note.textContent = !enabled ? 'CUR 产物未接入'
       : !loaded ? (value?.error || 'CUR 产物不可用')
         : value?.range_complete ? '当前区间成本证据已闭合'
-          : `${value?.billing_finalized === false ? '当期未封账 · ' : ''}${value?.allocation_complete === false ? `待归属 ${residual}（${issues.toLocaleString('zh-CN')} 条）` : '归属已闭合'}${value?.conflict_nano_usd !== '0' ? ` · 冲突 ${conflicts}` : ''}`;
+          : `${value?.billing_finalized === false ? '当期未封账 · ' : ''}${value?.allocation_complete === false ? `待归属 ${residual}（${issueLabel}）` : '归属已闭合'}${value?.conflict_nano_usd && value.conflict_nano_usd !== '0' ? ` · 冲突 ${conflicts}` : ''}${sourceGaps}${rangeGap}`;
+    if (note && billingMonth) note.textContent += '；仅表示日级成本，月账核验见下方月度经营结果';
+  }
+
+  function acceptedBillingResult(result) {
+    return result?.basis === 'aws_billing_month_v1' && ['reconciled', 'provisional'].includes(result.status) && hasMoney(result.profit);
   }
 
   function operatingProfitBlockers(data, statement) {
@@ -259,6 +270,10 @@
     if (!hasMoney(statement.aws_infrastructure_cost)) {
       const cur = data.cur_cost || {};
       if (cur.loaded !== true) blockers.push('AWS CUR 成本未载入');
+      else if (Array.isArray(cur.missing_billing_periods) && cur.missing_billing_periods.length) blockers.push(Array.isArray(data.aws_monthly_bills) && data.aws_monthly_bills.length
+        ? `AWS 缺少 ${cur.missing_billing_periods.length} 段同期间日级成本来源；已有历史 UTC 月账在下方单列，不直接拼入经营毛利`
+        : `AWS 缺少 ${cur.missing_billing_periods.length} 段账单来源，不能按零成本计算`);
+      else if (Array.isArray(cur.partial_boundary_days) && cur.partial_boundary_days.length) blockers.push('AWS 查询包含非完整自然日，边界费用未拆分估算');
       else if (cur.billing_finalized === false && cur.allocation_complete === false) blockers.push(`AWS 当期未封账且仍有 ${Number(cur.issue_count || 0).toLocaleString('zh-CN')} 条待归属`);
       else if (cur.billing_finalized === false) blockers.push('AWS 当期账单尚未封账');
       else if (cur.allocation_complete === false) blockers.push(`AWS 成本仍有 ${Number(cur.issue_count || 0).toLocaleString('zh-CN')} 条待归属`);
@@ -274,7 +289,7 @@
     setUpstreamEvidence('finBillEvidence', data.upstream_coverage, 'complete_domains', 'available_domains');
     setUpstreamEvidence('finCorrectionEvidence', data.upstream_coverage, 'corrected_complete_domains', 'corrected_domains');
     setEvidence('finPairingEvidence', audit.paired_rows, audit.publication_rows, '核算行');
-	setCUREvidence(data.cur_cost);
+    setCUREvidence(data.cur_cost, data.billing_result?.basis === 'aws_billing_month_v1');
 
     const decision = $('finDecision');
     const badge = $('finDecisionBadge');
@@ -285,11 +300,29 @@
     const knownContribution = hasMoney(statement.known_contribution_profit);
     const blockers = operatingProfitBlockers(data, statement);
     decision?.classList.remove('ready', 'warn');
+    const monthly = data.billing_result;
+    if (acceptedBillingResult(monthly)) {
+      const provisional = monthly.status === 'provisional';
+      decision?.classList.add(provisional ? 'warn' : 'ready');
+      if (badge) badge.textContent = provisional ? '月账暂估' : '月账口径';
+      if (title) title.textContent = `当前完整月份经营利润 ${money(monthly.profit)}${monthly.margin_percent != null ? ` · 毛利率 ${monthly.margin_percent}%` : ''}`;
+      if (text) text.textContent = `经营收入减修正上游总成本（含内部测试）及同名 AWS 账单月费用；不等于逐日同时间区间利润。${monthly.reason || ''}`;
+      return;
+    }
     if (exactOperating) {
       decision?.classList.add('ready');
       if (badge) badge.textContent = '可发布';
       if (title) title.textContent = `当前区间经营毛利 ${money(statement.operating_profit)}`;
       if (text) text.textContent = '经营收入、修正上游成本和 AWS 基础设施成本均已闭合，可作为当前区间经营结论。';
+      return;
+    }
+    if (monthly?.basis === 'aws_billing_month_v1') {
+      const results = (data.periods || []).map(p => p.billing_result).filter(acceptedBillingResult);
+      const provisional = results.filter(r => r.status === 'provisional').length;
+      decision?.classList.add('warn');
+      if (badge) badge.textContent = '月度核算';
+      if (title) title.textContent = results.length ? '部分月份已有经营结果，全区间利润待核验' : '月度经营结果待核验';
+      if (text) text.textContent = `${monthly.reason || '月度收入或成本尚未完整，不显示全区间利润'}。下方 ${results.length} 个完整月份已有结果${provisional ? `（其中 ${provisional} 个为暂估）` : ''}，逐月查看金额与缺口；不将已完成月份的小计当作全区间利润。日级 AWS 覆盖是另一种时间口径，不能用它判断月账是否齐全。`;
       return;
     }
     decision?.classList.add('warn');
@@ -602,7 +635,7 @@
     const snapshotNote=data.data_as_of?` · 快照截至 ${dateTime(data.data_as_of)}`:'';
     const generatedNote=data.generated_at?` · 生成于 ${dateTime(data.generated_at)}`:'';
     const refreshingNote=financeCacheRefreshNote(data);
-    status.innerHTML = `<i></i><div><b>${summary}</b><br>${enabled ? `区间 ${date(data.from)} 至 ${date(data.to)} · 用量 ${userCoverage(data.user_coverage)} · 成本 ${upstreamCoverage(data.upstream_coverage)}${snapshotNote}${generatedNote}${refreshingNote}` : '配置 MONITOR_FINANCE_ENABLED=true 后，只读展示已有事实。'}</div>`;
+    status.innerHTML = `<i></i><div><b>${summary}</b><br>${enabled ? `核算区间 ${dateTime(data.from)} 至 ${dateTime(data.to)}（不含结束时刻，按安全闭合小时统计） · 用量 ${userCoverage(data.user_coverage)} · 成本 ${upstreamCoverage(data.upstream_coverage)}${snapshotNote}${generatedNote}${refreshingNote}` : '配置 MONITOR_FINANCE_ENABLED=true 后，只读展示已有事实。'}</div>`;
 
     setMoney('finConsumption', statement.user_consumption, statement.known_user_consumption,
       `消费扣额 ${money(statement.gross_user_consumption)} - 退还 ${money(statement.user_refunds)}；内部测试另列 ${money(statement.internal_test_consumption)}`,
@@ -622,6 +655,8 @@
     renderExecutive(data, statement);
     renderProfitBridge(data, statement);
     renderCURProducts(data.cur_products || []);
+    renderAWSMonthlyBills(data.aws_monthly_bills || []);
+    renderBillingAccounting(data);
 
     renderPeriods(data.periods || []);
     renderDays(data.days || []);
@@ -629,9 +664,48 @@
     renderClosureReadiness(data.cost_details || []);
     renderEvidenceRollout(data.cost_details || []);
     renderPairingAudit(data.pairing_audit || {});
-    renderSources(data.sources || []);
+    renderSources(data.sources || [], data.billing_result?.basis === 'aws_billing_month_v1');
     renderChart(data.periods || []);
     $('finFootnote').textContent = data.semantics_note || '';
+  }
+
+  function renderBillingAccounting(data) {
+    const card = $('finBillingCard'), body = $('finBillingRows'), summary = $('finBillingSummary');
+    if (!card || !body || !summary) return;
+    const total = data.billing_result;
+    card.hidden = !total;
+    if (!total) { body.innerHTML = ''; summary.textContent = ''; return; }
+    const accepted = acceptedBillingResult;
+    const margin = r => accepted(r) && /^-?\d+(?:\.\d+)?$/.test(String(r.margin_percent ?? '')) ? `${esc(r.margin_percent)}%` : '—';
+    const profit = r => accepted(r) ? `${money(r.profit)}${r.status === 'provisional' ? '<small>暂估</small>' : ''}` : '—';
+    const statuses = {reconciled:'已核验月账口径',provisional:'暂估',incomplete:'资料不完整',partial_period:'非完整月份'};
+    summary.textContent = accepted(total)
+      ? `当前完整月份合计：经营收入 ${money(total.revenue)} − 修正上游总成本 ${money(total.upstream_cost)} − AWS 月账 ${money(total.aws_cost)} = 经营利润 ${money(total.profit)}${total.margin_percent != null ? `；毛利率 ${total.margin_percent}%` : '；收入非正，毛利率不适用'}${total.status === 'provisional' ? '（暂估）' : ''}。`
+      : total.reason || '月度核算尚未完整，不显示全区间利润。';
+    body.innerHTML = (data.periods || []).slice().reverse().map(p => {
+      const r = p.billing_result || {};
+      const source = {cost_explorer:'Cost Explorer 月账',cur:'CUR 月账'}[r.aws_source] || '';
+      return `<tr><td><b>${esc(p.period)}</b><small>${date(p.from)} – ${date(p.to)}</small></td>`
+        + `<td class="num">${money(r.revenue)}</td><td class="num">${money(r.upstream_cost)}</td>`
+        + `<td class="num">${money(r.aws_cost)}<small>${esc(source)}${r.aws_status === 'provisional' ? ' · 暂估' : ''}</small></td>`
+        + `<td class="num">${profit(r)}</td><td class="num">${margin(r)}</td>`
+        + `<td>${esc(statuses[r.status] || '待核验')}<small>${esc(r.reason || '')}</small></td></tr>`;
+    }).join('');
+  }
+
+  function renderAWSMonthlyBills(rows) {
+    const card = $('finAWSMonthlyCard'), body = $('finAWSMonthlyRows');
+    if (!card || !body) return;
+    const items = Array.isArray(rows) ? rows : [];
+    card.hidden = items.length === 0;
+    const amount = (raw) => /^-?\d+(?:\.\d+)?$/.test(String(raw ?? '')) ? `$${esc(raw)}` : '—';
+    const labels = { Usage: '使用费', Credit: '抵扣', Refund: '退款', Tax: '税费', Fee: '费用', Other: '其他' };
+    const details = (values, kind) => (Array.isArray(values) ? values : []).map(v => `<div>${esc(kind === 'type' ? (labels[v.name] || v.name) : v.name)}：${amount(v.usd)}</div>`).join('');
+    body.innerHTML = items.map(row => `<tr><td><b>${esc(row.period)}</b><small>${esc(row.from_utc)} 至 ${esc(row.to_utc_exclusive)} UTC</small></td>`
+      + `<td class="num">${amount(row.net_usd)}<small>含抵扣，不重复扣减</small></td>`
+      + `<td>${row.range_relation === 'whole_utc_month' ? '完整 UTC 账期在查询范围内' : '仅部分重叠：展示整月原账单，未按天拆分'}</td>`
+      + `<td>${row.status === 'reconciled' ? '服务、费用类型与每日汇总一致' : '预估账单，尚未定稿'}<small>${esc(row.verified_days)} 天核验 · 非发票核验 · 非最终毛利</small></td>`
+      + `<td><details><summary>费用类型 / 服务明细</summary><div class="fin-aws-month-details" tabindex="0" role="region" aria-label="${esc(row.period)} 月账费用明细"><b>费用类型（抵扣已含在净额）</b>${details(row.record_types, 'type')}<b>服务分类（另一种分组，不能再相加）</b>${details(row.services, 'service')}</div></details></td></tr>`).join('');
   }
 
   function renderCURProducts(rows) {
@@ -640,10 +714,16 @@
     body.innerHTML = rows.length ? rows.map((row) => {
       const code = String(row.product_code || '').trim();
       const name = curProductNames[code] || (code ? code : '未分类');
-      const share = row.share_percent === '' || row.share_percent == null ? '—' : `${esc(row.share_percent)}%`;
+      // A zero allocated subtotal is not proof that this service was free.
+      // Preserve the original amount; only clarify its incomplete evidence.
+      const incompleteZero = !row.exact_cost && /^-?0+$/.test(String(row.known_nano_usd ?? ''));
+      const share = incompleteZero || row.share_percent === '' || row.share_percent == null ? '—' : `${esc(row.share_percent)}%`;
+      const cost = incompleteZero
+        ? '—<small>已归属净额为 0，完整成本待核验</small>'
+        : knownValue(row.exact_cost, row.known_cost, '已知部分');
       return `<tr><td><b>${esc(name)}</b></td>`
         + `<td><code>${esc(code || '未提供')}</code></td>`
-        + `<td class="num">${knownValue(row.exact_cost, row.known_cost, '已知部分')}</td>`
+        + `<td class="num">${cost}</td>`
         + `<td class="num">${share}</td>`
         + `<td class="num">${Number(row.included_days || 0).toLocaleString('zh-CN')}</td>`
         + `<td>${chip(row.status || 'incomplete')}</td></tr>`;
@@ -916,8 +996,13 @@
     }).join('') : '<tr><td colspan="7" class="fin-empty">当前没有可展示的历史补证计划；不代表成本证据已完整，请结合下方核算缺口核对。</td></tr>';
   }
 
-  function renderSources(rows) {
-    $('finSources').innerHTML = rows.map((row) => `<div class="fin-source"><div><b>${esc(row.name)}</b>${chip(row.status)}</div><p>${esc(row.description)}</p></div>`).join('');
+  function renderSources(rows, billingMonth = false) {
+    $('finSources').innerHTML = rows.map((row) => {
+      const dailyAWS = billingMonth && row.key === 'aws_cur';
+      const name = dailyAWS ? 'AWS 日级成本（同时间区间）' : row.name;
+      const scope = dailyAWS ? '以下状态仅对应日级成本，不代表月账缺失；按账单月份的核验结果见“月度经营结果”。' : '';
+      return `<div class="fin-source"><div><b>${esc(name)}</b>${chip(row.status)}</div><p>${esc(scope)}${esc(row.description)}</p></div>`;
+    }).join('');
   }
 
   function renderChart(rows) {

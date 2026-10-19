@@ -5,7 +5,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"os"
 	"strings"
 
 	"gorm.io/gorm"
@@ -47,6 +46,7 @@ func (m *Monitor) financeReportSourceFingerprintForScope(ctx context.Context, fr
 		Provider               string
 		BaseURL                string
 		UserID                 int64
+		Account                string
 		Enabled                bool
 		UsageSyncEnabled       bool
 		UsageAdapter           string
@@ -56,15 +56,18 @@ func (m *Monitor) financeReportSourceFingerprintForScope(ctx context.Context, fr
 		BalanceUnitEffectiveAt int64
 		CredentialVersion      int
 	}
-	if err := m.storeDB.WithContext(ctx).Raw(`SELECT domain,provider,base_url,user_id,enabled,
+	if err := m.storeDB.WithContext(ctx).Raw(`SELECT domain,provider,base_url,user_id,account,enabled,
 		usage_sync_enabled,usage_adapter,usage_tail_mode,balance_unit,balance_unit_previous,
 		balance_unit_effective_at,credential_version
 		FROM channel_upstream_accounts ORDER BY domain`).Scan(&accountRows).Error; err != nil {
 		return "", fmt.Errorf("读取上游账户配置版本: %w", err)
 	}
 	for _, row := range accountRows {
-		_, _ = fmt.Fprintf(hash, "upstream-account|%q|%q|%q|%d|%t|%t|%q|%q|%.12g|%.12g|%d|%d\n",
-			row.Domain, row.Provider, row.BaseURL, row.UserID, row.Enabled, row.UsageSyncEnabled,
+		// Account participates in the cost-evidence namespace even when a
+		// metadata edit does not rotate credentials. Invalidate both report
+		// and period caches on that edit; do not reuse old-account readiness.
+		_, _ = fmt.Fprintf(hash, "upstream-account|%q|%q|%q|%d|%q|%t|%t|%q|%q|%.12g|%.12g|%d|%d\n",
+			row.Domain, row.Provider, row.BaseURL, row.UserID, row.Account, row.Enabled, row.UsageSyncEnabled,
 			row.UsageAdapter, row.UsageTailMode, row.BalanceUnit, row.BalanceUnitPrevious,
 			row.BalanceUnitEffectiveAt, row.CredentialVersion)
 	}
@@ -293,15 +296,11 @@ func (m *Monitor) financeReportSourceFingerprintForScope(ctx context.Context, fr
 	hash.section = "cur-artifact"
 	if includeCUR && m.cfg.FinanceCURArtifactEnabled {
 		path := strings.TrimSpace(m.cfg.FinanceCURArtifactPath)
-		info, err := os.Stat(path)
-		switch {
-		case err == nil:
-			_, _ = fmt.Fprintf(hash, "cur-artifact|%s|%d|%d\n", path, info.Size(), info.ModTime().UnixNano())
-		case os.IsNotExist(err):
-			_, _ = fmt.Fprintf(hash, "cur-artifact|%s|missing\n", path)
-		default:
+		version, err := financeCURArtifactSourceVersion(ctx, path)
+		if err != nil {
 			return "", fmt.Errorf("读取 AWS CUR 成本产物版本: %w", err)
 		}
+		_, _ = fmt.Fprintf(hash, "cur-artifact|%q|%s\n", path, version)
 	} else if includeCUR {
 		_, _ = hash.Write([]byte("cur-artifact|disabled\n"))
 	}

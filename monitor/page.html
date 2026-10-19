@@ -886,10 +886,10 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
     <article id="finBillEvidence"><small>上游账单覆盖</small><b>—</b><span>待读取</span></article>
     <article id="finCorrectionEvidence"><small>充值修正覆盖</small><b>—</b><span>待读取</span></article>
     <article id="finPairingEvidence"><small>收入成本同窗配对</small><b>—</b><span>待读取</span></article>
-    <article id="finCUREvidence"><small>AWS 成本归属覆盖</small><b>—</b><span>待读取</span></article>
+    <article id="finCUREvidence"><small>AWS 日级成本归属覆盖</small><b>—</b><span>待读取</span></article>
   </section>
   <article class="fin-card fin-bridge-card">
-    <header><div><h3>经营损益桥</h3><p>从平台计费消耗逐项调整为可发布经营毛利；缺少证据的项目保持空值</p></div><span>USD · 当前查询区间</span></header>
+    <header><div><h3>经营损益桥 · 同时间区间</h3><p>按当前查询的实际日期范围核算；完整月份的账单口径结果另列。两种口径不可相加，缺少证据的项目保持空值</p></div><span>USD · 当前查询区间</span></header>
     <div class="fin-bridge">
       <div class="fin-bridge-row base"><span><b>平台净计费消耗</b><small>消费扣额减退还；内部测试已从用户口径分离</small></span><strong id="finBridgeConsumption">—</strong><em id="finBridgeConsumptionState">待读取</em></div>
       <details class="fin-consumption-breakdown"><summary>查看扣款与退款明细</summary>
@@ -900,20 +900,29 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
       <div class="fin-bridge-row subtotal"><span><b>可发布经营收入</b><small>不是充值额；赠送扣减完整后才能发布</small></span><strong id="finBridgeRevenue">—</strong><em id="finBridgeRevenueState">待核验</em></div>
       <div class="fin-bridge-row deduction"><span><b>减：修正上游总成本</b><small>包含内部测试实际支出；缺失成本不按零计算</small></span><strong id="finBridgeUpstream">—</strong><em id="finBridgeUpstreamState">待读取</em></div>
       <div class="fin-bridge-row reference"><span><b>其中：内部测试上游成本</b><small>已包含在上游总成本中，不重复扣除；不计客户收入</small></span><strong id="finBridgeInternalTestCost">—</strong><em id="finBridgeInternalTestCostState">待读取</em></div>
-      <div class="fin-bridge-row deduction"><span><b>减：AWS 基础设施成本</b><small>CUR 账单按 NexusAPI 资源和期间归集</small></span><strong id="finBridgeAWS">—</strong><em id="finBridgeAWSState">未接入</em></div>
-      <div class="fin-bridge-row total"><span><b>可发布经营毛利</b><small>经营收入减修正上游总成本（含内部测试）和 AWS 成本</small></span><strong id="finBridgeProfit">—</strong><em id="finBridgeProfitState">待核验</em></div>
+      <div class="fin-bridge-row deduction"><span><b>减：AWS 基础设施成本</b><small>仅扣当前日期范围内的日级成本；不以整月账单填补日级缺口</small></span><strong id="finBridgeAWS">—</strong><em id="finBridgeAWSState">未接入</em></div>
+      <div class="fin-bridge-row total"><span><b>同时间区间经营毛利</b><small>收入减修正上游总成本和同时间范围 AWS 成本；账单月份口径另见下方月度经营结果</small></span><strong id="finBridgeProfit">—</strong><em id="finBridgeProfitState">待核验</em></div>
     </div>
     <footer id="finBridgeFootnote">内部测试及其它未归属成本单独列示；混合流量不做比例估算，也不会静默计为 0。</footer>
   </article>
   <article class="fin-card">
-    <header><div><h3>AWS 基础设施成本明细</h3><p>按 CUR 原始 Product Code 归类；不按比例估算，各行与当前区间 AWS 总成本严格对平</p></div><span>USD · 已闭合自然日</span></header>
+    <header><div><h3>AWS 日级成本明细 · 同时间区间</h3><p>按 CUR 原始 Product Code 归类；各行与当前区间日级 AWS 成本对平，不包含历史月账补入，不与月账结果相加</p></div><span>USD · 已闭合自然日</span></header>
     <div class="fin-table-wrap"><table class="fin-table"><thead><tr><th>服务分类</th><th>CUR Product Code</th><th class="num">已知成本</th><th class="num">成本占比</th><th class="num">含该服务成本日</th><th>状态</th></tr></thead><tbody id="finCURProductRows"><tr><td colspan="6" class="fin-empty">进入页面后加载</td></tr></tbody></table></div>
+  </article>
+  <article class="fin-card" id="finAWSMonthlyCard" hidden>
+    <header><div><h3>历史 AWS 月账</h3><p>整账号费用，含实际抵扣；保留 AWS UTC 原账期。用于下方月度经营核算时按账单所属月份归集，不摊到每日，不与上方 CUR 日级费用重复相加</p></div><span>Cost Explorer · USD</span></header>
+    <div class="fin-table-wrap"><table class="fin-table"><thead><tr><th>UTC 账期（结束日不含）</th><th class="num">整月账单净额</th><th>与查询区间的关系</th><th>核验状态</th><th>明细</th></tr></thead><tbody id="finAWSMonthlyRows"></tbody></table></div>
+  </article>
+  <article class="fin-card" id="finBillingCard" hidden>
+    <header><div><h3>月度经营结果 · AWS 账单月份口径</h3><p>收入及上游消费按北京时间；AWS 费用按同名账单月份计入，含内部测试支出。完整月份独立核算，不替代上方同时间区间或逐日结果；不是现金收支或发票审计。</p></div><span>USD</span></header>
+    <p class="fin-billing-summary" id="finBillingSummary"></p>
+    <div class="fin-table-wrap"><table class="fin-table"><thead><tr><th>期间</th><th class="num">经营收入</th><th class="num">修正上游总成本</th><th class="num">AWS 账期成本</th><th class="num">经营利润</th><th class="num">经营毛利率</th><th>状态与说明</th></tr></thead><tbody id="finBillingRows"></tbody></table></div>
   </article>
   <section class="fin-grid">
     <article class="fin-card"><header><div><h3>月度趋势</h3><p>仅绘制当前查询区间的真实已发布值</p></div><span>北京时间 · USD</span></header><div class="fin-chart" id="finChart"></div></article>
     <article class="fin-card"><header><div><h3>数据源状态</h3><p>未接入、缺失和待核对分开显示</p></div></header><div class="fin-source-list" id="finSources"><div class="fin-empty">待读取</div></div></article>
   </section>
-  <article class="fin-card"><header><div><h3>月度核算明细</h3><p>经营收入 = 净计费消耗 - 注册赠送实际消耗；证据不完整时保持空值</p></div></header><div class="fin-table-wrap"><table class="fin-table fin-period-table"><thead><tr><th>期间</th><th class="num">净计费消耗</th><th class="num">注册赠送消耗</th><th class="num">经营收入</th><th class="num">上游账单</th><th class="num">修正上游总成本</th><th class="num">内部测试上游成本</th><th class="num">AWS 成本</th><th class="num">已配对计费贡献（赠送前）</th><th>用量覆盖</th><th>成本覆盖</th><th>状态</th></tr></thead><tbody id="finPeriodRows"><tr><td colspan="12" class="fin-empty">进入页面后加载</td></tr></tbody></table></div></article>
+  <article class="fin-card"><header><div><h3>月度事实明细 · 同时间区间</h3><p>经营收入 = 净计费消耗 - 注册赠送实际消耗。此表 AWS 列按实际日期范围汇总日级成本；空值或覆盖不完整不代表同月账单缺失，月账利润见“月度经营结果”</p></div></header><div class="fin-table-wrap"><table class="fin-table fin-period-table"><thead><tr><th>期间</th><th class="num">净计费消耗</th><th class="num">注册赠送消耗</th><th class="num">经营收入</th><th class="num">上游账单</th><th class="num">修正上游总成本</th><th class="num">内部测试上游成本</th><th class="num">AWS 日级成本</th><th class="num">已配对计费贡献（赠送前）</th><th>用量覆盖</th><th>成本覆盖</th><th>同区间状态</th></tr></thead><tbody id="finPeriodRows"><tr><td colspan="12" class="fin-empty">进入页面后加载</td></tr></tbody></table></div></article>
   <details class="fin-disclosure">
     <summary><span><b>核算缺口与待归属成本</b><small>财务或研发核对使用；不影响老板查看已核验结论</small></span><em id="finPairingSummary">待读取</em></summary>
     <div class="fin-disclosure-body">
@@ -1519,7 +1528,7 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
 <script src="/stability.js?v=8"></script>
 <script src="/channel-data-status.js?v=2"></script>
 <script src="/channel-pricing-observations.js?v=1"></script>
-<script src="/channel-management.js?v=18"></script>
+<script src="/channel-management.js?v=19"></script>
 <script src="/logchain.js?v=18"></script>
 <script src="/customer-health.js?v=4"></script>
 <script src="/alerts.js?v=3"></script>

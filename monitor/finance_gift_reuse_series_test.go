@@ -4,6 +4,7 @@ package monitor
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -149,6 +150,19 @@ func giftReuseRetainedSeries(t *testing.T, mainPath string) *Monitor {
 	var integrity string
 	if err := m.usageFactsDB.Raw("PRAGMA quick_check").Scan(&integrity).Error; err != nil || integrity != "ok" {
 		t.Fatal("receiver integrity", integrity, err)
+	}
+	if output := os.Getenv("MONITOR_GIFT_RETAINED_RESULT"); output != "" {
+		data, err := json.MarshalIndent(struct {
+			Mode                        string `json:"mode"`
+			Updated, Targets, ReadyJobs int
+			Before, After               financeOperatingReport
+		}{"local_retained_gift_rehearsal_not_publishable", updated, targets, readyJobs, before, after}, "", "  ")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := giftLocalWriteNew(output, data); err != nil {
+			t.Fatal(err)
+		}
 	}
 	t.Logf("months=%d days=%d money=unchanged quick_check=ok profit_complete=%t", len(after.Periods), len(after.Days), after.Statement.OperatingProfit != nil)
 	return m
