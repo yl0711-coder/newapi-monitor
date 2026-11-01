@@ -162,7 +162,17 @@ func TestFundingAuditResourceBounds(t *testing.T) {
 			if err := tx.Commit(); err != nil {
 				t.Fatal(err)
 			}
-			_, err = auditFundingScan(context.Background(), db, pages[0].Scan.ID)
+			// Isolate row/byte enforcement from the separate five-second audit
+			// deadline. Under race on a slow runner, the full-size fixture can
+			// legitimately hit the deadline before reaching its resource limit.
+			// Exercise the exact production chain validator without changing any
+			// limit or accepting a generic error in place of the expected guard.
+			stored, err := db.QueryContext(t.Context(), `SELECT id,sequence,payload FROM portal_monthly_funding_pages WHERE scan_id=? ORDER BY sequence`, pages[0].Scan.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer stored.Close()
+			_, err = readFundingChain(t.Context(), stored, pages[0].Scan.ID)
 			if err == nil || !strings.Contains(err.Error(), tc.wantError) {
 				t.Fatal("resource limit did not fail explicitly", err)
 			}

@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import {readFileSync} from 'node:fs';
 import {pathToFileURL} from 'node:url';
 
-export const monthlyRaceShardCount = 4;
+export const monthlyRaceShardCount = 12;
 
 // The actual go test inventory is authoritative. Stable round-robin assignment
 // includes new tests automatically and keeps every top-level test in one shard.
@@ -21,8 +21,10 @@ export function monthlyRaceShards(listing) {
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   const raw = process.argv[2];
-  assert.match(raw ?? '', /^[0-3]$/, 'monthly race shard must be 0, 1, 2 or 3');
+  const index = Number(raw);
+  assert.ok(raw !== undefined && String(index) === raw && Number.isInteger(index) && index >= 0 && index < monthlyRaceShardCount,
+    `monthly race shard must be an integer from 0 to ${monthlyRaceShardCount - 1}`);
   const result = monthlyRaceShards(readFileSync(0, 'utf8'));
   console.error(`Monthly race coverage: ${result.count} tests, shard sizes ${result.groups.map(group => group.length).join(',')}`);
-  console.log(result.patterns[Number(raw)]);
+  console.log(result.patterns[index]);
 }

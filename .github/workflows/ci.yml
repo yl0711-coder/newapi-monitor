@@ -265,7 +265,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [0, 1, 2, 3]
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -281,7 +281,24 @@ jobs:
           set -euo pipefail
           pattern="$(go test -list . ./internal/monthlydraft | node dev/monthly-race-shard.mjs "$MONTHLY_SHARD")"
           test -n "$pattern"
-          go test -race -count=1 -timeout 20m -run "$pattern" ./internal/monthlydraft
+          go test -race -count=1 -json -timeout 20m -run "$pattern" ./internal/monthlydraft | tee "$RUNNER_TEMP/monthly-race-$MONTHLY_SHARD.jsonl"
+      - name: Summarize monthly slow tests even on failure
+        if: always()
+        env:
+          MONTHLY_SHARD: ${{ matrix.shard }}
+        run: |
+          report="$RUNNER_TEMP/monthly-race-$MONTHLY_SHARD.jsonl"
+          if test -s "$report"; then
+            node dev/summarize-race-tests.mjs "$report" "monthly-$MONTHLY_SHARD" >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Preserve monthly timing evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: monthly-race-${{ matrix.shard }}
+          path: ${{ runner.temp }}/monthly-race-${{ matrix.shard }}.jsonl
+          if-no-files-found: ignore
+          retention-days: 7
 
   image-security:
     needs: [test, race-monitor, race-monthly, secrets]
