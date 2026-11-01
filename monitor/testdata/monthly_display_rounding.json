@@ -1,0 +1,13 @@
+[
+  {"name":"positive_wallet_cent","total":"4295.548386","terms":[["2321.744170",1],["5000.000000",1],["3026.195784",-1]],"residual":"0.010000"},
+  {"name":"negative_wallet_cent","total":"7.002000","terms":[["10.006000",1],["3.004000",-1]],"residual":"-0.010000"},
+  {"name":"credit_sum","total":"0.009996","terms":[["0.004998",1],["0.004998",1]],"residual":"0.010000"},
+  {"name":"token_sum","total":"0.010004","terms":[["0.005002",1],["0.005002",1]],"residual":"-0.010000"},
+  {"name":"refund_net","total":"1.000002","terms":[["1.005000",1],["0.004998",-1]],"residual":"-0.010000"},
+  {"name":"negative_balance","total":"-1.000002","terms":[["0.000000",1],["1.005000",-1],["0.004998",1]],"residual":"0.010000"},
+  {"name":"exact_cents","total":"15739.824738","terms":[["53200.000000",1],["-2000.000000",1],["35460.175262",-1]],"residual":"0.000000"},
+  {"name":"beyond_js_integer","total":"9007199254740993.999000","terms":[["9007199254740993.995000",1],["0.004000",1]],"residual":"0.000000"},
+  {"name":"not_an_actual_equation","total":"1.000000","terms":[["2.000000",1]],"residual":null},
+  {"name":"missing_source","total":"1.000000","terms":[[null,1]],"residual":null},
+  {"name":"invalid_number","total":"NaN","terms":[],"residual":null}
+]

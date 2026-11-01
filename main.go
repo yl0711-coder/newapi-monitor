@@ -58,6 +58,10 @@ func main() {
 // os.Exit，确保监听失败、配置失败都不会跳过 stop/Shutdown 等 defer。
 func run() error {
 	s := monitor.LoadSettings()
+	generationConfig, err := monthlyGenerationConfig(os.Getenv, s)
+	if err != nil {
+		return err
+	}
 	m, err := monitor.New(s)
 	if err != nil {
 		return fmt.Errorf("启动失败: %w", err)
@@ -67,7 +71,11 @@ func run() error {
 	// 收到 SIGINT/SIGTERM 时取消 ctx:采样器退出 + HTTP 优雅关停。
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	m.Start(ctx)
+	generation, err := openMonthlyGeneration(ctx, generationConfig, m)
+	if err != nil {
+		return fmt.Errorf("月度账单生成配置/资源检查失败: %w", err)
+	}
+	defer closeMonthlyGeneration(generation) // before m.Close; no shared handle ownership
 
 	gin.SetMode(gin.ReleaseMode)
 	r := gin.New()
@@ -80,12 +88,6 @@ func run() error {
 
 	listenErr := make(chan error, 2) // 管理端 + 可选 Portal；避免监听协程直接 os.Exit 跳过优雅关停。
 	srv := monitoredHTTPServer(s.Addr, r)
-	go func() {
-		slog.Info("上游监控已启动", "addr", listenURL(s.Addr))
-		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			listenErr <- fmt.Errorf("管理端监听失败: %w", err)
-		}
-	}()
 
 	// 客户端「用量报表」:独立引擎+独立端口(配置了才起),上面零管理端路由——客户域名只指它
 	var portalSrv *http.Server
@@ -95,8 +97,29 @@ func run() error {
 		if err := pr.SetTrustedProxies(s.TrustedProxies); err != nil {
 			return fmt.Errorf("MONITOR_TRUSTED_PROXIES 配置无效: %w", err)
 		}
-		m.RegisterPortalRoutes(pr)
+		if generation != nil {
+			if err := m.RegisterPortalRoutesWithGeneration(pr, generation); err != nil {
+				return err
+			}
+		} else {
+			m.RegisterPortalRoutes(pr)
+		}
 		portalSrv = monitoredHTTPServer(s.PortalAddr, pr)
+	}
+	// Finish all configuration/route checks before opening either listener.
+	if generation != nil {
+		if err := generation.Start(ctx); err != nil {
+			return err
+		}
+	}
+	m.Start(ctx)
+	go func() {
+		slog.Info("上游监控已启动", "addr", listenURL(s.Addr))
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			listenErr <- fmt.Errorf("管理端监听失败: %w", err)
+		}
+	}()
+	if portalSrv != nil {
 		go func() {
 			slog.Info("客户用量报表已启动", "addr", listenURL(s.PortalAddr))
 			if err := portalSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {

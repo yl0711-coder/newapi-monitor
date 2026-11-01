@@ -759,6 +759,10 @@ func portalExportStorageError(c *gin.Context, err error) {
 // ---- 路由注册(独立引擎,挂到独立端口) ----
 
 func (m *Monitor) RegisterPortalRoutes(r *gin.Engine) {
+	m.registerPortalRoutes(r, false, false)
+}
+
+func (m *Monitor) registerPortalRoutes(r *gin.Engine, generationEnabled, calendarEnabled bool) {
 	r.Use(requestBodyLimit(maxJSONRequestBody))
 	if m.usageCache == nil {
 		m.usageCache = newUsageResultCache(m.cfg)
@@ -838,9 +842,26 @@ func (m *Monitor) RegisterPortalRoutes(r *gin.Engine) {
 	page := r.Group("/", m.requirePortal(false))
 	page.GET("/", func(c *gin.Context) {
 		c.Header("Content-Type", "text/html; charset=utf-8")
-		c.String(http.StatusOK, portalHTML)
+		link := ""
+		if m.cfg.PortalMonthlyStatementEnabled {
+			link = `<a data-v="monthly">月度账单</a>`
+		}
+		html := strings.Replace(portalHTML, "<!--MONTHLY_STATEMENT_LINK-->", link, 1)
+		if generationEnabled {
+			script := strings.Replace(portalMonthlyGenerationLocalJS, "生成账单 · 本机验收", "生成月度账单", 1)
+			if calendarEnabled {
+				script = strings.Replace(script, "/*MONTHLY_CALENDAR_ENABLED*/ false", "/*MONTHLY_CALENDAR_ENABLED*/ true", 1)
+			}
+			html = strings.Replace(html, "</body>", "<script>"+script+"</script></body>", 1)
+		}
+		c.String(http.StatusOK, html)
 	})
 	api := r.Group("/api", m.requirePortal(true))
+	if m.cfg.PortalMonthlyStatementEnabled {
+		api.GET("/monthly-statements", m.portalMonthlyAuthorizationGuard(m.portalPublishedMonthlyStatementList))
+		api.GET("/monthly-statement", m.portalMonthlyAuthorizationGuard(m.portalPublishedMonthlyStatement))
+		api.GET("/monthly-statement/download", m.portalMonthlyAuthorizationGuard(m.portalPublishedMonthlyStatement))
+	}
 	api.GET("/overview", m.portalAggregateAuthorizationGuard(m.portalOverview))
 	api.GET("/breakdown", m.portalAggregateAuthorizationGuard(m.portalBreakdown)) // 整组按分组/按模型汇总
 	api.GET("/user", m.portalAggregateAuthorizationGuard(m.portalUserDetail))
@@ -1994,7 +2015,7 @@ func (m *Monitor) portalLogsExportWithBudgets(c *gin.Context, maxBytes int64, wr
 	// 第一页即按时间复合索引读取，且不会混入预检后新写入的 ID。
 	cursor := logPageCursor{HasUpper: true, UpperID: startCursor - 1}
 	remaining := portalExportCap
-	written := int64(0)
+	sourceRows := int64(0)
 	for remaining > 0 {
 		if portalExportGenerationStopped(ctx, c) {
 			return
@@ -2024,6 +2045,7 @@ func (m *Monitor) portalLogsExportWithBudgets(c *gin.Context, maxBytes int64, wr
 			if portalExportGenerationStopped(ctx, c) {
 				return
 			}
+			sourceRows++
 			var record []string
 			if bill {
 				var billErr error
@@ -2031,6 +2053,9 @@ func (m *Monitor) portalLogsExportWithBudgets(c *gin.Context, maxBytes int64, wr
 				if billErr != nil {
 					c.JSON(http.StatusUnprocessableEntity, gin.H{"error": billErr.Error()})
 					return
+				}
+				if portalBillOmitZeroRecord(row, record) {
+					continue
 				}
 			} else {
 				record = portalCSVRecord(row)
@@ -2040,7 +2065,6 @@ func (m *Monitor) portalLogsExportWithBudgets(c *gin.Context, maxBytes int64, wr
 				portalExportStorageError(c, err)
 				return
 			}
-			written++
 		}
 		w.Flush()
 		if err := w.Error(); err != nil {
@@ -2059,7 +2083,7 @@ func (m *Monitor) portalLogsExportWithBudgets(c *gin.Context, maxBytes int64, wr
 		portalExportStorageError(c, err)
 		return
 	}
-	if bill && written != total {
+	if bill && sourceRows != total {
 		c.JSON(http.StatusConflict, gin.H{"error": "消费记录在导出期间发生变化，请重新导出；未生成部分账单"})
 		return
 	}

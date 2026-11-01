@@ -22,7 +22,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.26.9'
+          go-version: '1.26.10'
       # CLI is pinned and isolated from application dependencies. No action licence
       # or production credentials required; never upload reports containing secrets.
       - uses: actions/setup-node@v4
@@ -43,7 +43,7 @@ jobs:
         with:
           # 与候选镜像构建链对齐到已修补的 Go 版本。不使用模糊的
           # 1.25，否则 runner 可能解析到存在可达标准库漏洞的 1.25.12。
-          go-version: '1.26.9'
+          go-version: '1.26.10'
       - run: go vet ./...
       - name: Test isolated AWS IAM registration bridge without credentials
         run: python3 -m unittest discover -s deploy/ecs-log-bridge -v
@@ -69,11 +69,18 @@ jobs:
         run: node dev/check-dependency-policy.mjs
       - name: Verify every monitor test belongs to exactly one race shard
         run: go test -list . ./monitor | node dev/check-race-shards.mjs
-      # monitor 包的 1000+ 个测试由下方 race-monitor 作业分片执行。这里继续
-      # 覆盖其余全部包，避免新增包静默逃离竞态检测。
+      - name: Test monthly statement preparation CLI with synthetic files
+        run: |
+          set -euo pipefail
+          go build -trimpath -o "$RUNNER_TEMP/monthlybillstage" ./cmd/monthlybillstage
+          MONTHLY_STAGE_TEST_BINARY="$RUNNER_TEMP/monthlybillstage" \
+            go test -race -count=1 -timeout 3m \
+              -run '^Test(PreparationCLI|AutomaticPreparationFilesCLIRoundTrip)$' ./internal/monthlydraft
+      # 两个大型测试包分别由 race-monitor / race-monthly 完整分片覆盖。
+      # 这里继续覆盖其余全部包，避免新增包静默逃离竞态检测。
       - name: Test non-monitor packages with race detector
         run: |
-          mapfile -t packages < <(go list ./... | grep -v '/monitor$')
+          mapfile -t packages < <(go list ./... | grep -Ev '/(monitor$|internal/monthlydraft$)')
           test "${#packages[@]}" -gt 0
           go test -race -timeout 20m "${packages[@]}"
       - name: Check reachable Go vulnerabilities
@@ -209,7 +216,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.26.9'
+          go-version: '1.26.10'
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
@@ -252,8 +259,32 @@ jobs:
   # PRs are scanned too. No registry write credentials in the build/scan job.
   # All three images must pass before ANY image is published. Transfer the exact
   # scanned image, not a rebuild with potentially different base packages.
+  race-monthly:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.10'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Test complete monthly statement inventory with race detector
+        env:
+          MONTHLY_SHARD: ${{ matrix.shard }}
+        run: |
+          set -euo pipefail
+          pattern="$(go test -list . ./internal/monthlydraft | node dev/monthly-race-shard.mjs "$MONTHLY_SHARD")"
+          test -n "$pattern"
+          go test -race -count=1 -timeout 20m -run "$pattern" ./internal/monthlydraft
+
   image-security:
-    needs: [test, race-monitor, secrets]
+    needs: [test, race-monitor, race-monthly, secrets]
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
@@ -333,7 +364,7 @@ jobs:
           retention-days: 1
 
   build-push:
-    needs: [test, race-monitor, secrets, image-security]
+    needs: [test, race-monitor, race-monthly, secrets, image-security]
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     permissions:
@@ -384,7 +415,7 @@ jobs:
   # tested Linux revision and publish checksums so production never receives
   # an untraceable binary built by hand on an operator laptop.
   build-nginx-ops-tools:
-    needs: [test, race-monitor, secrets, image-security]
+    needs: [test, race-monitor, race-monthly, secrets, image-security]
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     permissions:
@@ -393,7 +424,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.26.9'
+          go-version: '1.26.10'
       - name: Build static Linux amd64 tools
         env:
           CGO_ENABLED: '0'

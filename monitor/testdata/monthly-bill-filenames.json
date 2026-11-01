@@ -1,0 +1,17 @@
+[
+  {"account":"示例组织","month":"2026-09","want":"NexusAPI-示例组织-月度账单-2026-09.xlsx"},
+  {"account":"  示例 / 组织:一  ","month":"2026-09","want":"NexusAPI-示例 _ 组织_一-月度账单-2026-09.xlsx"},
+  {"account":"A\r\nB/../C\\D","month":"2026-09","want":"NexusAPI-A__B_.._C_D-月度账单-2026-09.xlsx"},
+  {"account":"a\u202eb.exe","month":"2026-09","want":"NexusAPI-a_b.exe-月度账单-2026-09.xlsx"},
+  {"account":"CON","month":"2026-09","want":"NexusAPI-CON-月度账单-2026-09.xlsx"},
+  {"account":"  ..  ","month":"2026-09","want":"NexusAPI-组织-月度账单-2026-09.xlsx"},
+  {"account":" \u00a0 ","month":"2026-09","want":"NexusAPI-组织-月度账单-2026-09.xlsx"},
+  {"account":null,"month":"2026-09","want":"NexusAPI-组织-月度账单-2026-09.xlsx"},
+  {"account":"😀 测试","month":"2026-01","want":"NexusAPI-😀 测试-月度账单-2026-01.xlsx"},
+  {"account":"name\ufefftest","month":"2026-09","want":"NexusAPI-name_test-月度账单-2026-09.xlsx"},
+  {"account":"示例","month":"2026-9","want":null},
+  {"account":"示例","month":"2026-13","want":null},
+  {"account":"示例","month":"2026-00","want":null},
+  {"account":"示例","month":"2026-09\n","want":null},
+  {"account":"示例","month":"../2026","want":null}
+]

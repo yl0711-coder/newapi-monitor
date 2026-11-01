@@ -1004,6 +1004,8 @@ func (m *Monitor) openStore(path string) error {
 		return err
 	}
 	if err := db.AutoMigrate(
+		&PortalMonthlyBill{},
+		&PortalMonthlyBillWithdrawal{},
 		&ECSLogSource{}, &ECSLogDiscovery{}, &ECSLogLeaseWindow{}, &ECSLogArchiveReceipt{}, &ECSLogArchiveScan{},
 		&AICodeWithRecordCheckpoint{}, &AICodeWithRecordSeen{},
 		&MetricSample{}, &CapacityUserMinuteSample{}, &CustomerHealthSourceCursor{}, &CustomerHealthDayCoverage{}, &TokenSample{}, &MetricFinalizeState{}, &HourSample{}, &ChannelSnap{}, &RejectionSample{}, &RejectionIngestBatch{}, &SelectablePair{},

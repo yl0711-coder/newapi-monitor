@@ -7,6 +7,7 @@
 !go.mod
 !go.sum
 !main.go
+!monthly_generation.go
 !restore_command.go
 !finance_backfill_command.go
 !stability_backfill_command.go
@@ -46,6 +47,15 @@ internal/usagebill/**
 !internal/usagebill/exportjobs/
 internal/usagebill/exportjobs/**
 !internal/usagebill/exportjobs/*.go
+!internal/monthlydraft/
+internal/monthlydraft/**
+!internal/monthlydraft/*.go
+!internal/monthlytasks/
+internal/monthlytasks/**
+!internal/monthlytasks/*.go
+!internal/monthlysource/
+internal/monthlysource/**
+!internal/monthlysource/*.go
 !internal/ecslogagent/
 internal/ecslogagent/**
 !internal/ecslogagent/*.go

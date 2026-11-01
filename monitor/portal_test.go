@@ -66,6 +66,9 @@ func portalDo(r *gin.Engine, method, path, body string, cookies ...*http.Cookie)
 		req.Header.Set("Content-Type", "application/json")
 	}
 	req.Header.Set("Accept", "application/json")
+	if strings.HasPrefix(path, "/api/monthly-statement") {
+		req.Header.Set("X-Monthly-Display", "cents-chain-v1")
+	}
 	for _, c := range cookies {
 		req.AddCookie(c)
 	}

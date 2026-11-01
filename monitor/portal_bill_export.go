@@ -11,6 +11,24 @@ import (
 
 const portalBillFormat = "bill-v1"
 
+// Apply only after portalBillRecord has validated the original source. Missing
+// facts and rounded-to-zero prices are NOT evidence of a zero-cost request.
+// This is an export presentation rule, not deletion or a billing correction.
+func portalBillOmitZeroRecord(r LogRow, record []string) bool {
+	if r.Type != 2 || r.billingQuota != 0 || len(record) != 15 || record[6] != "文本" || r.billEvidence == nil || r.billEvidence.Mode == "per_request" {
+		return false
+	}
+	for _, i := range []int{7, 8, 9, 10} {
+		if record[i] != "0" {
+			return false
+		}
+	}
+	// Compare exact reference money, not its six-decimal display: a positive
+	// reference that rounds to $0.000000 must remain in a customer's bill.
+	original, known := portalBillRecordedReference(r, *r.billEvidence)
+	return known && original.Sign() == 0
+}
+
 func portalBillHeader() []string {
 	return []string{"消费时间（北京时间）", "账户名", "令牌名", "分组名", "模型", "Request ID", "类型", "普通输入 Token", "输出 Token", "缓存读取 Token", "缓存写入 Token", "官方原价（美元）", "折扣前价格（元）", "折后价格（元）", "折扣比例"}
 }
