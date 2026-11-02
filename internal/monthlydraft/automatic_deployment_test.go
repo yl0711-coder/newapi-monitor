@@ -95,11 +95,8 @@ func TestAutomaticDeploymentMachineInputPublishRestartAndDraftFallback(t *testin
 	if _, err := d.SubmitMonthly(ctx, 1, 1, "2026-09"); err != nil {
 		t.Fatal(err)
 	}
-	// This is an eventual-completion assertion, not a five-second product SLA.
-	// Keep the actual worker and all production query/retry budgets unchanged.
-	deadline := time.Now().Add(30 * time.Second)
-	for d.runtime.worker.Status().Published != 1 && time.Now().Before(deadline) {
-		time.Sleep(10 * time.Millisecond)
+	if !waitMonthlyAcceptance(t, func() bool { return d.runtime.worker.Status().Published == 1 }) {
+		t.Fatal("explicit deployment did not finish", d.runtime.worker.Status())
 	}
 	closeDeploymentTest(t, d)
 	if d.runtime.worker.Status().Published != 1 || loads.Load() != 1 || publishes.Load() != 1 {

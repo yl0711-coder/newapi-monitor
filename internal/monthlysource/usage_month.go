@@ -3,7 +3,6 @@ package monthlysource
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
 	"errors"
 	"math"
 	"slices"
@@ -177,14 +176,32 @@ func reviewUsageMonth(parent context.Context, db *sql.DB, request FundingMonthRe
 // Shared ORIGINAL pair/window rules. The explicit partition reader also uses
 // this helper with one transaction and one cumulative payload budget.
 func appendUsageMonthWindows(ctx context.Context, tx *sql.Tx, request FundingMonthRequest, versions []UsageWindowVersion, now time.Time, r *UsageMonthReport, usedBytes *int) error {
+	// Keep both the existing transaction snapshot and cumulative byte limit.
+	// Only SQL round trips are batched; every original is still independently
+	// hash/canonical/identity validated before the unchanged month audit.
+	for from := 0; from < len(versions); from += 64 {
+		part := versions[from:min(from+64, len(versions))]
+		originals, err := loadUsageMonthBatch(ctx, tx, part, usedBytes)
+		if err != nil {
+			return err
+		}
+		if err := appendLoadedUsageMonthWindows(ctx, request, part, originals, now, r); err != nil {
+			return err
+		}
+	}
+	return ctx.Err()
+}
+
+func appendLoadedUsageMonthWindows(ctx context.Context, request FundingMonthRequest, versions []UsageWindowVersion, originals map[string]UsageWindowObservation, now time.Time, r *UsageMonthReport) error {
 	accounts := make(map[int64]int, len(r.Accounts))
 	for i, a := range r.Accounts {
 		accounts[a.UserID] = i
 	}
 	for _, v := range versions {
-		a, b, err := loadUsageMonthPair(ctx, tx, v, usedBytes)
-		if err != nil {
-			return err
+		a, aOK := originals[v.OlderID]
+		b, bOK := originals[v.NewerID]
+		if !aOK || !bOK {
+			return errors.New("usage month original observation missing")
 		}
 		index, ok := accounts[a.Request.UserID]
 		if !ok || a.Request != b.Request || a.Request.SourceIdentity != request.SourceIdentity || a.Request.Rules != request.Rules ||
@@ -213,24 +230,6 @@ func appendUsageMonthWindows(ctx context.Context, tx *sql.Tx, request FundingMon
 		r.Accounts[index].Windows = append(r.Accounts[index].Windows, w)
 	}
 	return ctx.Err()
-}
-
-func loadUsageMonthPair(ctx context.Context, tx *sql.Tx, v UsageWindowVersion, usedBytes *int) (UsageWindowObservation, UsageWindowObservation, error) {
-	var pair [2]UsageWindowObservation
-	for i, id := range []string{v.OlderID, v.NewerID} {
-		raw, err := loadUsageWindow(ctx, tx, id)
-		if err != nil {
-			return pair[0], pair[1], err
-		}
-		*usedBytes += len(raw)
-		if *usedBytes > usageMonthBytesLimit {
-			return pair[0], pair[1], errors.New("usage month payload budget exceeded; split account batches")
-		}
-		if err := json.Unmarshal(raw, &pair[i]); err != nil {
-			return pair[0], pair[1], err
-		}
-	}
-	return pair[0], pair[1], nil
 }
 
 func assembleUsageAccount(ctx context.Context, a *UsageMonthAccountReport, from, to int64) error {

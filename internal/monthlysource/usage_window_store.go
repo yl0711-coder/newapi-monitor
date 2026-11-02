@@ -88,16 +88,23 @@ func loadUsageWindow(ctx context.Context, db walletRowReader, id string) ([]byte
 FROM portal_monthly_usage_observations WHERE id=? AND length(payload)<=32768`, id).Scan(&source, &user, &from, &to, &started, &completed, &raw); err != nil {
 		return nil, err
 	}
+	if _, err := validateStoredUsageWindow(id, source, user, from, to, started, completed, raw); err != nil {
+		return nil, err
+	}
+	return raw, nil
+}
+
+func validateStoredUsageWindow(id, source string, user, from, to, started, completed int64, raw []byte) (UsageWindowObservation, error) {
 	var o UsageWindowObservation
 	if digest(raw) != id || json.Unmarshal(raw, &o) != nil || source != o.Request.SourceIdentity || user != o.Request.UserID ||
 		from != o.Request.From || to != o.Request.To || started != o.StartedAtMS || completed != o.CompletedAtMS {
-		return nil, errors.New("usage observation integrity check failed")
+		return o, errors.New("usage observation integrity check failed")
 	}
 	canonical, err := usageWindowBytes(o)
 	if err != nil || !bytes.Equal(raw, canonical) {
-		return nil, errors.New("usage observation is not a valid complete canonical record")
+		return o, errors.New("usage observation is not a valid complete canonical record")
 	}
-	return raw, nil
+	return o, nil
 }
 
 // LoadUsageWindowObservation validates the stored digest, canonical payload and

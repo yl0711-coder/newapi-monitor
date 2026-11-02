@@ -195,7 +195,11 @@ func assertRetainedLateCustomerDownload(t *testing.T, f capturedHistoryFixture, 
 		want.Members = append(want.Members, m)
 	}
 	oracle := materialPreparationJSON(t, map[string]any{"ok": true, "data": want})
-	retainedSeriesWorkbookMatchesSource(t, oracle, page.Body.Bytes(), book.Body.Bytes())
+	var saved monitor.PortalMonthlyBill
+	if err := f.auth.First(&saved, "group_id=? AND month=?", f.req.Owner.GroupID, f.req.Month).Error; err != nil || !strings.HasPrefix(saved.PublicationID, "monthly-cent-bill-v1:") {
+		t.Fatal("registered late-member fixture did not publish the new cent format", err)
+	}
+	retainedSeriesCentWorkbookMatchesSource(t, oracle, page.Body.Bytes(), book.Body.Bytes())
 	parts := retainedWorkbookParts(t, book.Body.Bytes())
 	for _, private := range []string{"captured-scope", "captured-reconstruction", "observation_database", "reconstructions", "source_identity", "candidate_sha256"} {
 		if bytes.Contains(page.Body.Bytes(), []byte(private)) {

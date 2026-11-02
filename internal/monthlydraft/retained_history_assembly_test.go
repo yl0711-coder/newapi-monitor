@@ -73,13 +73,11 @@ func writeHistoryAssemblyConfig(t *testing.T, f capturedHistoryFixture, cfg Capt
 
 func waitHistoryAssemblyBill(t *testing.T, f capturedHistoryFixture, d *Deployment) monitor.PortalMonthlyBill {
 	t.Helper()
-	deadline := time.Now().Add(20 * time.Second)
-	for time.Now().Before(deadline) {
-		var record monitor.PortalMonthlyBill
-		if err := f.auth.First(&record, "group_id=? AND month=?", f.req.Owner.GroupID, f.req.Month).Error; err == nil {
-			return record
-		}
-		time.Sleep(20 * time.Millisecond)
+	var record monitor.PortalMonthlyBill
+	if waitMonthlyAcceptance(t, func() bool {
+		return f.auth.First(&record, "group_id=? AND month=?", f.req.Owner.GroupID, f.req.Month).Error == nil
+	}) {
+		return record
 	}
 	state, steps, failures := preparationState(t, f.f.receiver)
 	t.Fatal("assembly did not publish requested bill", state, steps, failures, d.runtime.worker.Status())

@@ -464,14 +464,10 @@ func testUsageGenerationHTTPJourneyWithRetained(t *testing.T, retainedPrepared, 
 				}
 				resume()
 			}
-			deadline := time.Now().Add(5 * time.Second)
-			for worker.Status().Published != 1 && time.Now().Before(deadline) {
-				time.Sleep(time.Millisecond)
-			}
-			stopRuntime(t, runtime)
-			if worker.Status().Published != 1 {
+			if !waitMonthlyAcceptance(t, func() bool { return worker.Status().Published == 1 }) {
 				t.Fatal("on-demand publication did not complete", worker.Status())
 			}
+			stopRuntime(t, runtime)
 		} else {
 			workerCtx, cancel := context.WithCancel(ctx)
 			done := make(chan error, 1)

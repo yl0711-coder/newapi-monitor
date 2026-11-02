@@ -44,7 +44,7 @@ test('release gates wait for all monthly race shards without weakening the time 
   const matrix=job.match(/shard: \[([\d, ]+)\]/)?.[1].split(',').map(v=>Number(v.trim()));
   assert.deepEqual(matrix,Array.from({length:monthlyRaceShardCount},(_,i)=>i));
   assert.match(job, /set -euo pipefail/);
-  assert.match(job, /go test -list \. \.\/internal\/monthlydraft/);
+  assert.match(job, /go test -race -list \. \.\/internal\/monthlydraft/);
   assert.match(job, /node dev\/monthly-race-shard\.mjs "\$MONTHLY_SHARD"/);
   assert.match(job, /go test -race -count=1 -json -timeout 20m -run "\$pattern" \.\/internal\/monthlydraft \| tee/);
   assert.match(job, /node dev\/summarize-race-tests\.mjs/);

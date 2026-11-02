@@ -401,6 +401,16 @@ func TestRetainedIndependentDisplaySeriesRejectsUnknownAndInconsistentSources(t 
 
 func retainedSeriesWorkbookMatchesSource(t *testing.T, source, current, book []byte, prefix ...retainedIndependentDisplayMonth) {
 	t.Helper()
+	retainedSeriesWorkbookMatchesSourceFormat(t, source, current, book, false, prefix...)
+}
+
+func retainedSeriesCentWorkbookMatchesSource(t *testing.T, source, current, book []byte) {
+	t.Helper()
+	retainedSeriesWorkbookMatchesSourceFormat(t, source, current, book, true)
+}
+
+func retainedSeriesWorkbookMatchesSourceFormat(t *testing.T, source, current, book []byte, modern bool, prefix ...retainedIndependentDisplayMonth) {
+	t.Helper()
 	var old, now struct {
 		OK   bool               `json:"ok"`
 		Data retainedSeriesView `json:"data"`
@@ -433,19 +443,61 @@ func retainedSeriesWorkbookMatchesSource(t *testing.T, source, current, book []b
 			}
 		}
 	}
-	if now.Data.Display.Version != 1 || now.Data.Display.Organization.Opening != org["月初余额（元）"]+"0000" || now.Data.Display.Organization.Closing != org["月末余额（元）"]+"0000" {
-		t.Fatal("actual customer summary differs from independent cents arithmetic")
-	}
-	if len(now.Data.Display.Members) != len(members) {
-		t.Fatal("actual frozen account scope differs")
-	}
 	seen := map[int64]bool{}
-	for _, m := range now.Data.Display.Members {
-		want, ok := wallets[m.UserID]
-		if !ok || seen[m.UserID] || m.Opening != want["月初余额（元）"]+"0000" || m.Closing != want["月末余额（元）"]+"0000" {
-			t.Fatal("frozen account cents differ from independent source", m.UserID)
+	if modern {
+		// New-format HTTP money is already the frozen cent view. No legacy
+		// display_balances object is expected. Check actual amounts against
+		// the independent original-source oracle, never inject a fake object.
+		if now.Data.Display.Version != 0 || now.Data.Opening != org["月初余额（元）"]+"0000" || now.Data.Closing != org["月末余额（元）"]+"0000" || len(now.Data.Members) != len(members) {
+			t.Fatal("new-format customer summary/scope differs from independent cents")
 		}
-		seen[m.UserID] = true
+		if now.Data.Consumption != p.Consumption || retainedSeriesCents(t, now.Data.Credits.Total) != org["到账（含赠送）（元）"] || retainedSeriesCents(t, now.Data.Credits.Adjustment) != org["余额扣减（元）"] || retainedSeriesCents(t, now.Data.Credits.Correction) != org["余额校正（元）"] {
+			t.Fatal("exact-cent fixture changed consumption or funding")
+		}
+		for _, m := range now.Data.Members {
+			want, ok := wallets[m.UserID]
+			if !ok || seen[m.UserID] || m.Opening != want["月初余额（元）"]+"0000" || m.Closing != want["月末余额（元）"]+"0000" {
+				t.Fatal("new-format customer account cents differ from independent source", m.UserID)
+			}
+			if original := members[m.UserID]; m.Username != original.Username || m.Consumption != original.Consumption || len(m.Tokens) != len(original.Tokens) {
+				t.Fatal("new-format account consumption or token scope changed")
+			}
+			if retainedSeriesCents(t, m.CreditTotal) != want["到账（含赠送）（元）"] || retainedSeriesCents(t, m.Adjustment) != want["余额扣减（元）"] || retainedSeriesCents(t, m.BalanceCorrection) != want["余额校正（元）"] {
+				t.Fatal("new-format account funding differs from independent source")
+			}
+			originalTokens := map[int64]retainedSeriesToken{}
+			for _, token := range members[m.UserID].Tokens {
+				originalTokens[token.TokenID] = token
+			}
+			seenTokens := map[int64]bool{}
+			for _, token := range m.Tokens {
+				original, ok := originalTokens[token.TokenID]
+				if !ok || seenTokens[token.TokenID] || original.Name != token.Name {
+					t.Fatal("new-format customer token ownership/name changed")
+				}
+				for i, amount := range []string{token.Amount, token.Refund, token.Net} {
+					if amount != retainedSeriesCents(t, []string{original.Amount, original.Refund, original.Net}[i])+"0000" {
+						t.Fatal("new-format customer token money differs from independent source")
+					}
+				}
+				seenTokens[token.TokenID] = true
+			}
+			seen[m.UserID] = true
+		}
+	} else {
+		if now.Data.Display.Version != 1 || now.Data.Display.Organization.Opening != org["月初余额（元）"]+"0000" || now.Data.Display.Organization.Closing != org["月末余额（元）"]+"0000" {
+			t.Fatal("legacy customer summary differs from independent cents arithmetic")
+		}
+		if len(now.Data.Display.Members) != len(members) {
+			t.Fatal("actual frozen account scope differs")
+		}
+		for _, m := range now.Data.Display.Members {
+			want, ok := wallets[m.UserID]
+			if !ok || seen[m.UserID] || m.Opening != want["月初余额（元）"]+"0000" || m.Closing != want["月末余额（元）"]+"0000" {
+				t.Fatal("frozen account cents differ from independent source", m.UserID)
+			}
+			seen[m.UserID] = true
+		}
 	}
 	parts := retainedWorkbookParts(t, book)
 	headers := map[string]string{}

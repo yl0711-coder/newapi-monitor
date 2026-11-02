@@ -143,7 +143,17 @@ func buildCapturedMonthSelection(parent context.Context, receiver *sql.DB, key s
 				selection.Version, selection.Mode = 2, RecoveredCapturedMonthSelectionMode
 			}
 		} else {
-			pairs, _, err = LoadCapturedTokenMonth(ctx, receiver, key, scope, id)
+			// Keep a fresh indexed-digest/byte-identity check per member, as
+			// before. Only reuse the deep decoding of this SAME pinned plan;
+			// never reuse a plan after its bytes or digest have changed.
+			// The existing per-account ten-second budget also includes this
+			// reread, not a fresh budget added before the original reader.
+			accountCtx, accountCancel := context.WithTimeout(ctx, 10*time.Second)
+			err = confirmFundingCapturePlan(accountCtx, receiver, key, planRaw)
+			if err == nil {
+				pairs, _, err = loadCapturedTokenMonthPlan(accountCtx, receiver, plan, id)
+			}
+			accountCancel()
 		}
 		if err != nil {
 			return empty, err
@@ -212,6 +222,11 @@ func buildCapturedMonthSelection(parent context.Context, receiver *sql.DB, key s
 		if !token.TraversalsFinished {
 			return empty, ErrTokenMonthCaptureIntegrity
 		}
+	}
+	// A plan changed during the last member's read must not produce an
+	// apparently complete selection either. This is still local/read-only.
+	if err := confirmFundingCapturePlan(ctx, receiver, key, planRaw); err != nil {
+		return empty, err
 	}
 	raw, err := json.Marshal(selection)
 	if err != nil || len(raw) > 2<<20 {

@@ -49,6 +49,9 @@ job_key TEXT NOT NULL CHECK(length(job_key)=64),ordinal INTEGER NOT NULL CHECK(o
 user_id INTEGER NOT NULL CHECK(user_id>0),sha256 TEXT NOT NULL CHECK(length(sha256)=64),usage_id TEXT NOT NULL CHECK(length(usage_id)=64),
 started_at_ms INTEGER NOT NULL,completed_at_ms INTEGER NOT NULL,payload BLOB NOT NULL CHECK(length(payload)<=2097152),
 PRIMARY KEY(job_key,ordinal))`,
+		// Per-account completeness/byte checks must not scan every other
+		// account's payload for each member of a large captured month.
+		`CREATE INDEX IF NOT EXISTS monthly_token_capture_job_user ON portal_monthly_token_capture_slots(job_key,user_id)`,
 		`CREATE TRIGGER IF NOT EXISTS monthly_token_capture_no_update BEFORE UPDATE ON portal_monthly_token_capture_slots BEGIN SELECT RAISE(ABORT,'token captures are immutable'); END`,
 		`CREATE TRIGGER IF NOT EXISTS monthly_token_capture_no_delete BEFORE DELETE ON portal_monthly_token_capture_slots BEGIN SELECT RAISE(ABORT,'token captures are immutable'); END`,
 	} {
@@ -126,35 +129,49 @@ func InspectTokenMonthCapture(parent context.Context, receiver *sql.DB, key stri
 }
 
 func loadTokenCaptureSlot(ctx context.Context, db walletRowReader, plan FundingMonthCapturePlan, ordinal int) (TokenUsageWindowObservation, error) {
-	var o TokenUsageWindowObservation
-	var raw []byte
-	var sha, usageID string
-	var user, started, completed int64
-	err := db.QueryRowContext(ctx, `SELECT user_id,sha256,usage_id,started_at_ms,completed_at_ms,CASE WHEN length(payload)<=2097152 THEN payload END FROM portal_monthly_token_capture_slots WHERE job_key=? AND ordinal=?`, plan.Key, ordinal).Scan(&user, &sha, &usageID, &started, &completed, &raw)
+	var slot storedTokenCaptureSlot
+	err := db.QueryRowContext(ctx, `SELECT user_id,sha256,usage_id,started_at_ms,completed_at_ms,CASE WHEN length(payload)<=2097152 THEN payload END FROM portal_monthly_token_capture_slots WHERE job_key=? AND ordinal=?`, plan.Key, ordinal).Scan(&slot.user, &slot.sha, &slot.usageID, &slot.started, &slot.completed, &slot.raw)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return o, errors.Join(errTokenCaptureSlotMissing, err)
+			return TokenUsageWindowObservation{}, errors.Join(errTokenCaptureSlotMissing, err)
 		}
-		return o, err
+		return TokenUsageWindowObservation{}, err
 	}
-	want, err := tokenCaptureRequest(plan, ordinal)
-	if err != nil || digest(raw) != sha || json.Unmarshal(raw, &o) != nil || ValidateTokenUsageWindowObservation(o) != nil || o.Request != want || o.Request.UserID != user || o.StartedAtMS != started || o.CompletedAtMS != completed {
-		return TokenUsageWindowObservation{}, ErrTokenMonthCaptureIntegrity
+	o, projectedRaw, err := validateStoredTokenCaptureSlot(plan, ordinal, slot)
+	if err != nil {
+		return TokenUsageWindowObservation{}, err
 	}
-	canonical, _ := json.Marshal(o)
-	projection, err := UsageObservationFromToken(o)
-	if err != nil || !bytes.Equal(raw, canonical) {
-		return TokenUsageWindowObservation{}, ErrTokenMonthCaptureIntegrity
-	}
-	projectedRaw, err := usageWindowBytes(projection)
-	if err != nil || digest(projectedRaw) != usageID {
-		return TokenUsageWindowObservation{}, ErrTokenMonthCaptureIntegrity
-	}
-	stored, err := loadUsageWindow(ctx, db, usageID)
+	stored, err := loadUsageWindow(ctx, db, slot.usageID)
 	if err != nil || !bytes.Equal(stored, projectedRaw) {
 		return TokenUsageWindowObservation{}, errors.Join(ErrTokenMonthCaptureIntegrity, err)
 	}
 	return o, nil
+}
+
+type storedTokenCaptureSlot struct {
+	user, started, completed int64
+	sha, usageID             string
+	raw                      []byte
+}
+
+// Shared by single-slot recovery and batched month reads. Batching changes
+// only SQL round trips, never validation of the original or its projection.
+func validateStoredTokenCaptureSlot(plan FundingMonthCapturePlan, ordinal int, slot storedTokenCaptureSlot) (TokenUsageWindowObservation, []byte, error) {
+	var o TokenUsageWindowObservation
+	want, err := tokenCaptureRequest(plan, ordinal)
+	if err != nil || digest(slot.raw) != slot.sha || json.Unmarshal(slot.raw, &o) != nil || ValidateTokenUsageWindowObservation(o) != nil || o.Request != want || o.Request.UserID != slot.user || o.StartedAtMS != slot.started || o.CompletedAtMS != slot.completed {
+		return TokenUsageWindowObservation{}, nil, ErrTokenMonthCaptureIntegrity
+	}
+	canonical, _ := json.Marshal(o)
+	projection, err := UsageObservationFromToken(o)
+	if err != nil || !bytes.Equal(slot.raw, canonical) {
+		return TokenUsageWindowObservation{}, nil, ErrTokenMonthCaptureIntegrity
+	}
+	projectedRaw, err := usageWindowBytes(projection)
+	if err != nil || digest(projectedRaw) != slot.usageID {
+		return TokenUsageWindowObservation{}, nil, ErrTokenMonthCaptureIntegrity
+	}
+	return o, projectedRaw, nil
 }
 
 // Save both the ORIGINAL token capture and its exact SAME-TRANSACTION user
@@ -280,6 +297,17 @@ func LoadCapturedTokenMonth(parent context.Context, receiver *sql.DB, key string
 	if err != nil {
 		return nil, empty, err
 	}
+	return loadCapturedTokenMonthPlan(ctx, receiver, plan, userID)
+}
+
+// Callers must have fully validated the plan and confirmed its unchanged
+// canonical bytes. This avoids re-decoding the whole roster/day plan for each
+// account; all original-slot, projection and monetary checks stay below.
+func loadCapturedTokenMonthPlan(parent context.Context, receiver *sql.DB, plan FundingMonthCapturePlan, userID int64) ([]TokenUsageWindowPair, TokenUsageMonthReport, error) {
+	var empty TokenUsageMonthReport
+	ctx, cancel := context.WithTimeout(parent, 10*time.Second)
+	defer cancel()
+	scope := plan.Scope
 	member := -1
 	for i, id := range scope.Funding.UserIDs {
 		if id == userID {
@@ -292,22 +320,23 @@ func LoadCapturedTokenMonth(parent context.Context, receiver *sql.DB, key string
 	}
 	var count int
 	var size int64
-	if err := receiver.QueryRowContext(ctx, `SELECT count(*),COALESCE(sum(length(payload)),0) FROM portal_monthly_token_capture_slots WHERE job_key=? AND user_id=?`, key, userID).Scan(&count, &size); err != nil {
+	if err := receiver.QueryRowContext(ctx, `SELECT count(*),COALESCE(sum(length(payload)),0) FROM portal_monthly_token_capture_slots WHERE job_key=? AND user_id=?`, plan.Key, userID).Scan(&count, &size); err != nil {
 		return nil, empty, err
 	}
 	if count != len(plan.Scans) || size > 64<<20 {
 		return nil, empty, ErrTokenMonthCaptureIntegrity
 	}
+	originals, err := loadAccountTokenCaptureSlots(ctx, receiver, plan, userID)
+	if err != nil {
+		return nil, empty, err
+	}
 	pairs := make([]TokenUsageWindowPair, 0, len(plan.Scans)/2)
 	for day := 0; day < len(plan.Scans)/2; day++ {
 		ordinal := day*len(scope.Funding.UserIDs) + member
-		a, err := loadTokenCaptureSlot(ctx, receiver, plan, ordinal)
-		if err != nil {
-			return nil, empty, err
-		}
-		b, err := loadTokenCaptureSlot(ctx, receiver, plan, ordinal+len(plan.Scans)*len(scope.Funding.UserIDs)/2)
-		if err != nil {
-			return nil, empty, err
+		a, aOK := originals[ordinal]
+		b, bOK := originals[ordinal+len(plan.Scans)*len(scope.Funding.UserIDs)/2]
+		if !aOK || !bOK {
+			return nil, empty, ErrTokenMonthCaptureIntegrity
 		}
 		pairs = append(pairs, TokenUsageWindowPair{Older: a, Newer: b})
 	}

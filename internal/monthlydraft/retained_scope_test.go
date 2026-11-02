@@ -332,14 +332,10 @@ func TestRetainedAutomaticDeploymentPublishesAndRestarts(t *testing.T) {
 	if _, err := d.SubmitMonthly(ctx, 1, 1, "2026-09"); err != nil {
 		t.Fatal(err)
 	}
-	deadline := time.Now().Add(5 * time.Second)
-	for d.runtime.worker.Status().Published != 1 && time.Now().Before(deadline) {
-		time.Sleep(time.Millisecond)
-	}
-	closeDeploymentTest(t, d)
-	if d.runtime.worker.Status().Published != 1 {
+	if !waitMonthlyAcceptance(t, func() bool { return d.runtime.worker.Status().Published == 1 }) {
 		t.Fatal("retained-source publication did not finish", d.runtime.worker.Status())
 	}
+	closeDeploymentTest(t, d)
 	var saved monitor.PortalMonthlyBill
 	if err := auth.First(&saved, "group_id=1 AND month='2026-09'").Error; err != nil {
 		t.Fatal(err)

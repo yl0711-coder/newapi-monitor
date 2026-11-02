@@ -76,6 +76,28 @@ jobs:
           MONTHLY_STAGE_TEST_BINARY="$RUNNER_TEMP/monthlybillstage" \
             go test -race -count=1 -timeout 3m \
               -run '^Test(PreparationCLI|AutomaticPreparationFilesCLIRoundTrip)$' ./internal/monthlydraft
+      # 最大规模仍用真实业务时限；race 在共享端到端逻辑和大规模原件审计中覆盖。
+      # 两套清单必须严格闭环，native 最大规模必须实际通过，不能靠跳过变绿。
+      - name: Verify complete monthly coverage and real-deadline maximum scale
+        run: |
+          set -euo pipefail
+          go test -list . ./internal/monthlydraft > "$RUNNER_TEMP/monthly-native-inventory.txt"
+          go test -race -list . ./internal/monthlydraft > "$RUNNER_TEMP/monthly-race-inventory.txt"
+          native_pattern="$(node dev/check-monthly-test-coverage.mjs "$RUNNER_TEMP/monthly-native-inventory.txt" "$RUNNER_TEMP/monthly-race-inventory.txt")"
+          test -n "$native_pattern"
+          go test -count=1 -json -timeout 3m -run "$native_pattern" ./internal/monthlydraft | tee "$RUNNER_TEMP/monthly-native-scale.jsonl"
+          node dev/check-monthly-test-coverage.mjs --results "$RUNNER_TEMP/monthly-native-scale.jsonl"
+      - name: Preserve monthly native scale evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: monthly-native-scale
+          path: |
+            ${{ runner.temp }}/monthly-native-inventory.txt
+            ${{ runner.temp }}/monthly-race-inventory.txt
+            ${{ runner.temp }}/monthly-native-scale.jsonl
+          if-no-files-found: ignore
+          retention-days: 7
       # 两个大型测试包分别由 race-monitor / race-monthly 完整分片覆盖。
       # 这里继续覆盖其余全部包，避免新增包静默逃离竞态检测。
       - name: Test non-monitor packages with race detector
@@ -274,12 +296,12 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
-      - name: Test complete monthly statement inventory with race detector
+      - name: Test race-eligible monthly statement inventory with race detector
         env:
           MONTHLY_SHARD: ${{ matrix.shard }}
         run: |
           set -euo pipefail
-          pattern="$(go test -list . ./internal/monthlydraft | node dev/monthly-race-shard.mjs "$MONTHLY_SHARD")"
+          pattern="$(go test -race -list . ./internal/monthlydraft | node dev/monthly-race-shard.mjs "$MONTHLY_SHARD")"
           test -n "$pattern"
           go test -race -count=1 -json -timeout 20m -run "$pattern" ./internal/monthlydraft | tee "$RUNNER_TEMP/monthly-race-$MONTHLY_SHARD.jsonl"
       - name: Summarize monthly slow tests even on failure

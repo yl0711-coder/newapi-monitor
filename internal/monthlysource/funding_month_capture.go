@@ -108,16 +108,39 @@ type fundingCapturePlanReader interface {
 }
 
 func loadFundingMonthCapturePlan(ctx context.Context, db fundingCapturePlanReader, key string, scope OrganizationMonthScope, now time.Time) (FundingMonthCapturePlan, error) {
+	raw, err := loadFundingCapturePlanBytes(ctx, db, key)
+	if err != nil {
+		return FundingMonthCapturePlan{}, err
+	}
+	return decodeFundingMonthCapturePlan(raw, key, scope, now)
+}
+
+// An already-decoded immutable plan may be reused only while its exact bytes
+// remain current. Keep the indexed digest check on EVERY reread; equality to
+// the previously canonical/validated bytes replaces repeated JSON decoding,
+// not source-integrity or current-authority checks.
+func loadFundingCapturePlanBytes(ctx context.Context, db fundingCapturePlanReader, key string) ([]byte, error) {
 	var raw []byte
 	var sha string
 	err := db.QueryRowContext(ctx, `SELECT sha256,CASE WHEN length(payload)<=1048576 THEN payload END FROM portal_monthly_funding_capture_plans WHERE key=?`, key).Scan(&sha, &raw)
 	if err != nil {
-		return FundingMonthCapturePlan{}, err
+		return nil, err
 	}
-	if digest(raw) != sha {
-		return FundingMonthCapturePlan{}, ErrFundingMonthCaptureIntegrity
+	if len(raw) == 0 || digest(raw) != sha {
+		return nil, ErrFundingMonthCaptureIntegrity
 	}
-	return decodeFundingMonthCapturePlan(raw, key, scope, now)
+	return raw, nil
+}
+
+func confirmFundingCapturePlan(ctx context.Context, db fundingCapturePlanReader, key string, expected []byte) error {
+	current, err := loadFundingCapturePlanBytes(ctx, db, key)
+	if err != nil {
+		return err
+	}
+	if !bytes.Equal(current, expected) {
+		return ErrFundingMonthCaptureIntegrity
+	}
+	return ctx.Err()
 }
 
 // EnsureFundingMonthCapture reuses the original plan after restarts. It never

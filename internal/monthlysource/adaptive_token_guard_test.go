@@ -233,6 +233,20 @@ func TestAdaptiveTokenConcurrentOwnerAndCancellationReleaseWithoutSourceFault(t 
 	case <-time.After(time.Second):
 		t.Fatal("source capture did not cancel")
 	}
+	// database/sql may return ErrTxDone while its cancellation goroutine is
+	// still returning the connection. Prove both one-connection pools are
+	// reusable within a bound; do not mistake that transient for a leaked slot.
+	released, stop := context.WithTimeout(t.Context(), time.Second)
+	defer stop()
+	for _, db := range []*sql.DB{f.source, f.store} {
+		conn, err := db.Conn(released)
+		if err != nil {
+			t.Fatal("cancelled transaction did not release its connection", err)
+		}
+		if err := conn.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
 	if adaptiveTokenCount(t, f.store, `SELECT count(*) FROM monthly_adaptive_token_faults`) != 0 || f.source.Stats().InUse != 0 || f.store.Stats().InUse != 0 {
 		t.Fatal("cancellation leaked a connection or consumed source failure budget")
 	}

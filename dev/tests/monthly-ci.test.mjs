@@ -37,6 +37,10 @@ test('monthly CI contract rejects accidental command-test skips and ignored fail
     yaml=>yaml.replace('MONTHLY_STAGE_TEST_BINARY="$RUNNER_TEMP/monthlybillstage"','OTHER_VARIABLE="$RUNNER_TEMP/monthlybillstage"'),
     yaml=>yaml.replace('go build -trimpath -o "$RUNNER_TEMP/monthlybillstage" ./cmd/monthlybillstage','echo command-not-built'),
     yaml=>yaml.replace('^Test(PreparationCLI|AutomaticPreparationFilesCLIRoundTrip)$','^TestPreparationCLI$'),
-    yaml=>yaml.replace("./internal/monthlydraft\n      #", "./internal/monthlydraft || true\n      #"),
-  ])assert.throws(()=>assertMonthlyCLIContract(change(workflow)));
+    yaml=>yaml.replace("-run '^Test(PreparationCLI|AutomaticPreparationFilesCLIRoundTrip)$' ./internal/monthlydraft", "-run '^Test(PreparationCLI|AutomaticPreparationFilesCLIRoundTrip)$' ./internal/monthlydraft || true"),
+  ]){
+    const mutated=change(workflow);
+    assert.notEqual(mutated,workflow,'negative fixture no longer changes the intended CLI step');
+    assert.throws(()=>assertMonthlyCLIContract(mutated));
+  }
 });
