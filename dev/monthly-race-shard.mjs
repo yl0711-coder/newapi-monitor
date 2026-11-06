@@ -2,7 +2,9 @@ import assert from 'node:assert/strict';
 import {readFileSync} from 'node:fs';
 import {pathToFileURL} from 'node:url';
 
-export const monthlyRaceShardCount = 12;
+// Current CI high-water timings need more headroom than the original 12 shards.
+// Keep the full race inventory and the existing 20-minute per-package limit.
+export const monthlyRaceShardCount = 16;
 export const monthlyRaceShardTargetSeconds = 16 * 60;
 const recordedTimings = JSON.parse(readFileSync(new URL('./monthly-race-timings.json', import.meta.url), 'utf8'));
 

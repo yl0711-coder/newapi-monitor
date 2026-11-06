@@ -52,13 +52,16 @@ test('invalid timing metadata and insufficient timeout headroom fail before exec
   ])assert.throws(()=>monthlyRaceShards(names,config));
 });
 
-test('recorded CI durations leave headroom without increasing shard count or business timeouts',()=>{
+test('current CI high-water durations leave headroom without relaxing business or race timeouts',()=>{
   const timings=JSON.parse(readFileSync(new URL('../monthly-race-timings.json',import.meta.url),'utf8'));
-  assert.equal(timings.source.run_id,41373090040);
+  assert.equal(timings.source.run_id,42147047484);
+  assert.equal(timings.source.baseline_run_id,41373090040);
   const names=[...Object.keys(timings.test_seconds),...Array.from({length:3},(_,i)=>`TestFutureUnmeasured${i}`)];
   const result=monthlyRaceShards(names.join('\n'));
-  assert.equal(result.groups.length,12);
+  assert.equal(result.groups.length,16);
   assert.ok(Math.max(...result.estimatedSeconds)<=monthlyRaceShardTargetSeconds);
+  assert.ok(Math.max(...result.estimatedSeconds)<=13*60,
+    'current measured workload must leave at least seven minutes below the race timeout');
   assert.ok(Math.max(...result.estimatedSeconds)-Math.min(...result.estimatedSeconds)<=2);
 });
 
