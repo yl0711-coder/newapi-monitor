@@ -54,6 +54,9 @@ func portalBuildVerifiedBill(ctx context.Context, dst io.Writer, plan portalBill
 	if err := w.Write(portalBillHeader()); err != nil {
 		return 0, err
 	}
+	// Count/progress/limits refer to source records, including verified zero
+	// records omitted from CSV. They still participate in exhaustion, order,
+	// duplicate, original-quota and authorization checks below.
 	var count int64
 	sum := new(big.Int)
 	// Order validation catches repeats at page boundaries; the ID set also
@@ -94,8 +97,10 @@ func portalBuildVerifiedBill(ctx context.Context, dst io.Writer, plan portalBill
 			if err != nil {
 				return count, err
 			}
-			if err := w.Write(record); err != nil {
-				return count, err
+			if !portalBillOmitZeroRecord(row, record) {
+				if err := w.Write(record); err != nil {
+					return count, err
+				}
 			}
 			seen[row.ID] = struct{}{}
 			sum.Add(sum, big.NewInt(row.billingQuota))

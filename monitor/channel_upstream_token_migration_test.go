@@ -19,7 +19,10 @@ func TestUpstreamTokenMigrationPinsFreshDualStoreRollbackPoint(t *testing.T) {
 			if !strings.Contains(plan, "20261013-v59-upstream-token-attribution-from-v58") {
 				t.Fatal("adding token tables must advance both migration plans before AutoMigrate")
 			}
-			priorPlan := strings.Replace(plan, "20261013-v59-upstream-token-attribution-from-v58", "20261008-v58", 1)
+			// Keep this token migration case pinned to the actual pre-v59 plan,
+			// not a fictitious v58 plan carrying the newer monthly-bill prefix.
+			priorPlan := strings.Replace(plan, "20261031-v60-portal-monthly-statements-from-", "", 1)
+			priorPlan = strings.Replace(priorPlan, "20261013-v59-upstream-token-attribution-from-v58", "20261008-v58", 1)
 			dir := t.TempDir()
 			mainPath, factsPath := filepath.Join(dir, "monitor.db"), filepath.Join(dir, "usage-facts.db")
 			backupDir := filepath.Join(dir, "backups")

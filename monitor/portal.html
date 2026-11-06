@@ -299,6 +299,20 @@
   .btn.p{background:var(--accent);border-color:var(--accent);color:#fff}
   .msg{font-size:13px;margin-top:10px;min-height:16px}
   .msg.ok{color:var(--green)}.msg.err{color:var(--red)}
+  #monthlyContent td:last-child,#monthlyContent th:last-child{text-align:right;font-variant-numeric:tabular-nums}
+  #monthlyContent h3{font-size:15px;margin-top:24px}
+.bill-scroll{overflow-x:auto;padding:2px 0 12px}.bill-sheet{width:100%;min-width:820px;border-collapse:collapse;background:white;color:#213547;font-size:14px;font-variant-numeric:tabular-nums;table-layout:fixed}
+.bill-sheet th,.bill-sheet td{border:1px solid #dce3eb;padding:11px 14px;line-height:1.5;white-space:normal}
+.bill-sheet .bill-title{background:#204f78;color:white;text-align:center;font-size:23px;font-weight:600;padding:20px;letter-spacing:2px}
+.bill-sheet .bill-label{background:white;color:#576779}.bill-sheet .bill-section{background:#f1f5f9;text-align:left;color:#204f78;font-weight:600;padding:10px 14px}
+.bill-sheet .bill-columns th{background:#f1f5f9;color:#264969;text-align:center;font-weight:600}.bill-sheet .money{text-align:right}.bill-sheet .center{text-align:center}
+.bill-sheet .bill-total td{background:white;font-weight:400}.bill-sheet .bill-metrics td{text-align:center;font-size:18px;font-weight:600;color:#204f78;padding:19px 14px}
+.bill-sheet .bill-balance td{background:white;color:#204f78;font-weight:600;padding:15px}.bill-sheet .bill-balance td:last-child{text-align:right;font-size:18px}
+.bill-member-sheet{min-width:1120px;margin-top:18px}.bill-member-sheet td:first-child{overflow-wrap:anywhere}.bill-member-sheet .money{white-space:nowrap}.bill-member-sheet small{display:block;color:#576779}.bill-note{color:var(--muted);font-size:13px;margin:8px 0}
+#monthlyContent .bill-sheet td:last-child{text-align:left}#monthlyContent .bill-sheet .bill-title{text-align:center}#monthlyContent .bill-sheet .bill-section{text-align:left}#monthlyContent .bill-sheet .bill-columns th,#monthlyContent .bill-sheet .bill-metrics td{text-align:center}#monthlyContent .bill-sheet .bill-balance td:last-child{text-align:right}
+#monthlyContent .bill-member-sheet td.money{text-align:right}
+#monthlyContent .bill-token-member td.money{text-align:right}
+@media(max-width:600px){#monthlyContent{padding:12px!important}.bill-sheet th,.bill-sheet td{padding:9px 11px}}
 </style>
 </head>
 <body>
@@ -308,8 +322,27 @@
 </header>
 
 <div class="vnav" id="vnav" style="margin-bottom:16px">
-  <a data-v="overview" class="on">用量总览</a><a data-v="logs">使用日志</a>
+  <a data-v="overview" class="on">用量总览</a><a data-v="logs">使用日志</a><!--MONTHLY_STATEMENT_LINK-->
 </div>
+
+<section id="monthlyView" style="display:none" aria-label="月度账单">
+  <div id="monthlyListBar" style="display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin-bottom:16px">
+    <label for="monthlyMonth">账单月份</label><input type="month" id="monthlyMonth" min="2020-01">
+    <button type="button" class="btn" id="monthlyRefresh">查询</button>
+    <button type="button" class="btn" id="monthlyReset">全部月份</button>
+    <span class="lognote">只展示已结束月份，不含当月</span>
+  </div>
+  <div id="monthlyDetailBar" style="display:none;gap:12px;margin-bottom:16px">
+    <button type="button" class="btn" id="monthlyBack">← 返回账单列表</button>
+    <button type="button" class="btn p" id="monthlyDownload" disabled>下载账单（Excel）</button>
+  </div>
+  <p id="monthlyStatus" role="status" aria-live="polite"></p>
+  <div class="card" style="padding:20px;overflow-x:auto" id="monthlyContent"></div>
+  <div class="pager" id="monthlyPager">
+    <button type="button" class="btn" id="monthlyPrev" disabled>较新月份</button>
+    <button type="button" class="btn" id="monthlyNext" disabled>更早月份</button>
+  </div>
+</section>
 
 <!-- 总览工具条:与中转站使用日志同款日期范围控件,配色仍客户端浅色 -->
 <div id="ovBar" style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
@@ -463,7 +496,7 @@ const fmtNum=n=>(+n||0).toLocaleString('en-US');
 // 紧凑数字:大数用 k/M/B(1位小数去尾零),避免小卡片挤爆
 const fmtCompact=n=>{n=+n||0;const a=Math.abs(n);for(const [d,u] of [[1e9,'B'],[1e6,'M'],[1e3,'k']]){if(a>=d){const v=n/d;return (Math.abs(v)>=100?v.toFixed(0):v.toFixed(1)).replace(/\.0$/,'')+u;}}return n.toLocaleString('en-US');};
 const fmtCell=v=>v>=0.005?'$'+v.toFixed(2):(v>0?'<$0.01':'$0.00');
-let range='7d',ov=null,detailUid=null;
+let range='7d',ov=null,detailUid=null,detailRangeKey='';
 let overviewSeq=0,overviewAbort=null,breakdownSeq=0,breakdownAbort=null,detailSeq=0,detailAbort=null;
 let logStack=[0],logHasMore=false,logNextCursor=0,logLoading=false,logTotal=null,logDirty=false;
 let logSeq=0,logAbort=null,logRowsCache=[];
@@ -537,7 +570,7 @@ async function load(){
     if(ov.matrix_available===false)renderBreakdownUnavailable('分组与模型统计未加载：每日消费明细暂不可用');
     else loadBreakdown();
     fillMemberSelect();
-    if(detailUid){detailTok?loadTokenDetail(detailTok.tid,detailTok.name):loadDetail(detailUid);} // 切范围时明细页(成员/令牌)跟着刷新
+    if(detailUid&&view==='overview'){detailTok?loadTokenDetail(detailTok.tid,detailTok.name):loadDetail(detailUid);} // 切范围时明细页(成员/令牌)跟着刷新
     if(view==='logs')loadLogs(true);    // 日志视图下切范围 → 重新拉第一页
     else logDirty=true;                 // 总览里改的范围:回日志视图时强制重拉,防止显旧窗口数据
   }catch(e){
@@ -909,6 +942,15 @@ function drawDailyChart(daily,dailyByModel,byModel,unavailableMessage){
     series
   });
 }
+function portalDetailRangeKey(){
+  const {from,to}=rangeDates(range);
+  return from+'|'+to;
+}
+function hideStalePortalDetail(){
+  if(detailUid&&detailRangeKey!==portalDetailRangeKey()){
+    $('detail').style.display='none';$('listView').style.display='';
+  }
+}
 async function loadDetail(uid){
   const seq=++detailSeq;
   if(detailAbort)detailAbort.abort();
@@ -916,11 +958,13 @@ async function loadDetail(uid){
   // 新请求开始时先清掉上一位成员可能遗留的时效提示；成功响应再按本次数据重绘。
   $('detailDataState').textContent='';
   const {from,to}=rangeDates(range);
+  hideStalePortalDetail();
   try{
     const d=await api(`/api/user?uid=${uid}&from=${from}&to=${to}`,{signal:detailAbort.signal});
-    if(seq!==detailSeq)return;
+    if(seq!==detailSeq||view!=='overview')return;
     if(!d.ok){$('ovErr').textContent=d.error||'成员详情加载失败，请重试';return;}
-    detailUid=uid;detailTok=null;
+    $('ovErr').textContent='';
+    detailUid=uid;detailTok=null;detailRangeKey=from+'|'+to;
     const u=(ov.users||[]).find(x=>x.user_id===uid)||{};
     $('listView').style.display='none';$('detail').style.display='block';
     $('tokCard').style.display='';
@@ -957,12 +1001,14 @@ async function loadTokenDetail(tid,tname){
   detailAbort=new AbortController();
   $('detailDataState').textContent='';
   const {from,to}=rangeDates(range);
+  hideStalePortalDetail();
   const uid=detailUid;
   try{
     const d=await api(`/api/user?uid=${uid}&token_id=${tid}&from=${from}&to=${to}`,{signal:detailAbort.signal});
-    if(seq!==detailSeq)return;
+    if(seq!==detailSeq||view!=='overview')return;
     if(!d.ok){$('ovErr').textContent=d.error||'令牌详情加载失败，请重试';return;}
-    detailTok={tid,name:tname};
+    $('ovErr').textContent='';
+    detailTok={tid,name:tname};detailRangeKey=from+'|'+to;
     const u=(ov.users||[]).find(x=>x.user_id===uid)||{};
     $('listView').style.display='none';$('detail').style.display='block';
     $('tokCard').style.display='none';
@@ -1026,7 +1072,7 @@ function renderTokens(rows,unavailable,rangePartial){
 function backToList(){
   if(detailTok){detailTok=null;loadDetail(detailUid);return}
   detailSeq++;if(detailAbort)detailAbort.abort();
-  detailUid=null;$('detailDataState').textContent='';$('detail').style.display='none';$('listView').style.display='';
+  detailUid=null;detailRangeKey='';$('detailDataState').textContent='';$('detail').style.display='none';$('listView').style.display='';
 }
 $('backLink').onclick=backToList;
 $('tbMx').addEventListener('click',e=>{const a=e.target.closest('[data-uid]');if(a)loadDetail(+a.dataset.uid)});
@@ -1094,17 +1140,280 @@ let view='overview',logsLoaded=false;
 function showView(v){
   view=v;
   document.querySelectorAll('#vnav a').forEach(a=>a.classList.toggle('on',a.dataset.v===v));
-  const logs=v==='logs';
-  $('ovBar').style.display=logs?'none':'flex';
+  const logs=v==='logs',monthly=v==='monthly';
+  if(!monthly&&monthlyAbort){monthlyAbort.abort();if(monthlyDownloadAbort)monthlyDownloadAbort.abort();monthlySequence++;}
+  $('monthlyView').style.display=monthly?'block':'none';
+  $('ovBar').style.display=(logs||monthly)?'none':'flex';
   $('logsBar').style.display=logs?'flex':'none';
-  $('statBar').style.display=logs?'none':'';
+  $('statBar').style.display=(logs||monthly)?'none':'';
   $('logsView').style.display=logs?'block':'none';
-  if(logs){$('listView').style.display='none';$('detail').style.display='none';resizeLogDetails();}
-  else{ if(detailUid){$('detail').style.display='block';$('listView').style.display='none';}
+  if(logs||monthly){if(detailAbort)detailAbort.abort();detailSeq++;}
+  if(monthly){$('listView').style.display='none';$('detail').style.display='none';}
+  else if(logs){$('listView').style.display='none';$('detail').style.display='none';resizeLogDetails();}
+  else{ if(detailUid&&detailRangeKey!==portalDetailRangeKey()){
+          hideStalePortalDetail();
+          detailTok?loadTokenDetail(detailTok.tid,detailTok.name):loadDetail(detailUid);
+        }
+        else if(detailUid){$('detail').style.display='block';$('listView').style.display='none';}
         else{$('detail').style.display='none';$('listView').style.display='';} }
   if(logs&&(!logsLoaded||logDirty)){logsLoaded=true;logDirty=false;loadLogs(true);}
+  if(monthly)loadMonthlyList(monthlyListCursor,'keep');
 }
 document.querySelectorAll('#vnav a').forEach(a=>a.onclick=()=>showView(a.dataset.v));
+
+// Monthly statements have their own range and never inherit log/token filters.
+let monthlySequence=0,monthlyAbort=null,monthlyDownloadAbort=null;
+let monthlyListCursor='',monthlyPrevious=[],monthlyNextCursor='',monthlyDetail=null;
+function lastClosedMonth(){
+  const [y,m]=cstDayStr(0).slice(0,7).split('-').map(Number);
+  const d=new Date(Date.UTC(y,m-2,1));
+  return d.toISOString().slice(0,7);
+}
+function monthlyMoney(value,summary=false,places=2){
+  const cents=monthlyDisplayUnits(value);
+  if(cents===null)return '待核验';
+  const negative=cents<0n;
+  // All bill amounts display cents, including older precision hints. Only
+  // format the value; never round or replace the frozen six-decimal source.
+  const units=(negative?-cents:cents).toString().padStart(3,'0');
+  return '¥'+(negative?'-':'')+units.slice(0,-2).replace(/\B(?=(\d{3})+(?!\d))/g,',')+'.'+units.slice(-2);
+}
+function monthlySummaryPrecision(d){
+  return 2;
+}
+function monthlyDisplayUnits(value){
+  if(typeof value!=='string'||value.length>30||!/^[-]?\d+\.\d{6}$/.test(value))return null;
+  const n=BigInt(value.replace('.','')),absolute=n<0n?-n:n;
+  return (n<0n?-1n:1n)*((absolute+5000n)/10000n);
+}
+function monthlyDisplayCentsMoney(value){
+  const sign=value<0n?'-':'',digits=(value<0n?-value:value).toString().padStart(3,'0');
+  return sign+digits.slice(0,-2)+'.'+digits.slice(-2)+'0000';
+}
+function monthlyDisplayResidual(total,terms){
+  let cents=monthlyDisplayUnits(total);
+  if(cents===null)return null;
+  let exact=BigInt(total.replace('.',''));
+  for(const [value,sign=1] of terms){
+    const rounded=monthlyDisplayUnits(value);
+    if(rounded===null||![1,-1].includes(sign))return null;
+    cents-=BigInt(sign)*rounded;exact-=BigInt(sign)*BigInt(value.replace('.',''));
+  }
+  return exact===0n?monthlyDisplayCentsMoney(cents):null;
+}
+function monthlyDisplayNonzero(value){
+  return value!=null&&value!=='0.000000';
+}
+function monthlyNetDisplayResidual(c){
+  return monthlyDisplayResidual(c?.net,[[c?.amount],[c?.refund,-1]]);
+}
+function monthlyDisplayNetColumnResidual(values){
+  const units=values.map(monthlyDisplayUnits);
+  return units.some(v=>v===null)?null:monthlyDisplayCentsMoney(units[2]-units[0]+units[1]);
+}
+function monthlyWalletDisplayResidual(m){
+  return monthlyDisplayResidual(m.closing,[[m.opening],[m.credit_total],[m.adjustment],[m.consumption?.amount,-1],[m.consumption?.refund],[m.balance_correction??'0.000000']]);
+}
+function monthlyWalletDisplayClosing(m){
+  const residual=monthlyWalletDisplayResidual(m);
+  return residual===null?null:monthlyDisplayCentsMoney(monthlyDisplayUnits(m.closing)-monthlyDisplayUnits(residual));
+}
+function monthlyDisplayWallet(m,frozen=null){
+  const closing=monthlyWalletDisplayClosing(m),opening=monthlyDisplayUnits(m.opening);
+  if(closing===null||opening===null)return null;
+  if(frozen===null)return {opening:monthlyDisplayCentsMoney(opening),closing};
+  const fo=monthlyDisplayUnits(frozen?.opening),fc=monthlyDisplayUnits(frozen?.closing);
+  if(fo===null||fc===null||monthlyDisplayCentsMoney(fo)!==frozen.opening||monthlyDisplayCentsMoney(fc)!==frozen.closing||fc-fo!==monthlyDisplayUnits(closing)-opening)return null;
+  return {opening:frozen.opening,closing:frozen.closing};
+}
+function monthlyMemberDisplayProjection(d){
+  const correction=typeof d.credits?.balance_correction==='string';
+  const org={opening:d.month_opening_balance,credit_total:d.credits?.known_total,adjustment:d.credits?.adjustment,consumption:d.consumption,balance_correction:d.credits?.balance_correction,closing:d.month_end_balance};
+  const frozen=d.display_balances;
+  const frozenRows=Array.isArray(frozen?.members)?frozen.members:[];
+  const frozenMembers=new Map(frozenRows.map(m=>[m.user_id,m]));
+  const frozenOK=frozen==null||(frozen.version===1&&frozenRows.length===d.members.length&&frozenMembers.size===frozenRows.length);
+  const rounding=false;
+  const amounts=(m,isOrg=false)=>{
+    const balance=monthlyDisplayWallet(m,frozen==null?null:!frozenOK?{}:isOrg?(frozen.organization??{}):(frozenMembers.get(m.user_id)??{}));
+    return [balance?.opening??null,m.credit_total,m.adjustment,m.consumption?.amount,m.consumption?.refund,...(correction?[m.balance_correction]:[]),balance?.closing??null];
+  };
+  const rows=d.members.map(m=>amounts(m)),totals=amounts(org,true);
+  const residuals=totals.map((value,i)=>{
+    if(i===0||i===totals.length-1){
+      const key=i===0?'opening':'closing';
+      if(monthlyDisplayResidual(org[key],d.members.map(m=>[m[key]]))===null)return null;
+      const n=monthlyDisplayUnits(value),values=rows.map(r=>monthlyDisplayUnits(r[i]));
+      return n===null||values.some(v=>v===null)?null:monthlyDisplayCentsMoney(n-values.reduce((a,v)=>a+v,0n));
+    }
+    return monthlyDisplayResidual(value,rows.map(r=>[r[i]]));
+  });
+  return {correction,rounding,rows,totals,residuals};
+}
+function renderMonthlyMembers(d){
+  if(![1,2].includes(d.member_details_version)||!Array.isArray(d.members)||!d.members.length)return '';
+  const {correction,rounding,rows,totals,residuals}=monthlyMemberDisplayProjection(d),cols=7+Number(correction)+Number(rounding);
+  const tokenDetails=d.token_details_version===1?`<h3>用户与令牌消费明细</h3>${d.members.map((m,i)=>`<details class="bill-token-member" data-monthly-token-member="${i}" data-token-loaded="1" open><summary>${esc(m.username||'—')} · ID ${esc(m.user_id)} · 总消费 ${monthlyMoney(m.consumption?.amount)}</summary><div class="bill-token-body">${renderMonthlyTokenRows(m)}</div></details>`).join('')}<p class="bill-note">按令牌 ID 区分，名称为本期留存名称；改名或同名不会合并不同 ID。历史未记录令牌的消费单独列示，计入用户合计。仅展示消费归属，不展示令牌密钥。</p>`:'';
+  const values=a=>a.map(v=>`<td class="money">${monthlyMoney(v)}</td>`).join('');
+  const row=(m,i)=>`<tr data-monthly-member="${esc(m.user_id)}"><td>${esc(m.username||'—')}<small>ID ${esc(m.user_id)}</small></td>${values(rows[i])}</tr>`;
+  const footer=d.members.length>1&&totals.every(v=>monthlyDisplayUnits(v)!==null)&&residuals.every(v=>v!==null)?`${residuals.some(monthlyDisplayNonzero)?'<tr data-monthly-member-rounding><td>分项舍入尾差</td>'+values(residuals)+'</tr>':''}<tr class="bill-total" data-monthly-member-total><td>组织合计</td>${values(totals)}</tr>`:'';
+  return `<div class="bill-scroll"><table class="bill-sheet bill-member-sheet"><colgroup><col style="width:22%">${'<col>'.repeat(cols-1)}</colgroup><thead><tr><th colspan="${cols}" class="bill-section">账号收支明细</th></tr><tr class="bill-columns"><th>账号</th><th>月初余额（元）</th><th>到账（含赠送）（元）</th><th>余额扣减（元）</th><th>消费（元）</th><th>退款（元）</th>${correction?'<th>余额校正（元）</th>':''}<th>月末余额（元）</th></tr></thead><tbody>${d.members.map(row).join('')}${footer}</tbody></table></div><p class="bill-note">各账号独立核算：月初余额 + 到账 + 余额扣减 − 消费 + 退款${correction?' + 余额校正':''} = 月末余额。${correction?'余额校正为独立列示的账户余额核对调整，不计入充值或消费。':''}</p>${tokenDetails}`;
+}
+function renderMonthlyTokenRows(m){
+  const tokens=m.token_consumption||[],residuals=['amount','refund','net'].map(k=>monthlyDisplayResidual(m.consumption?.[k],tokens.map(r=>[r[k]])));
+  const netTail=[m.consumption,...tokens].some(r=>monthlyDisplayNonzero(monthlyNetDisplayResidual(r)));
+  const extra=value=>netTail?'<td class="money">'+monthlyMoney(value)+'</td>':'';
+  const tail=residuals.some(monthlyDisplayNonzero)?`<tr data-monthly-token-rounding><td colspan="2">分项舍入尾差</td>${residuals.map(v=>'<td class="money">'+monthlyMoney(v)+'</td>').join('')}${extra(monthlyDisplayNetColumnResidual(residuals))}</tr>`:'';
+  return `<div class="bill-scroll"><table class="bill-sheet"><thead><tr class="bill-columns"><th>令牌名称</th><th>令牌 ID</th><th>消费（元）</th><th>退款（元）</th><th>净消费（元）</th>${netTail?'<th>净额舍入尾差（元）</th>':''}</tr></thead><tbody>${tokens.map(r=>`<tr data-monthly-token-user="${esc(m.user_id)}" data-monthly-token="${esc(r.token_id)}"><td>${esc(r.name)}</td><td>${r.token_id===0?'—':esc(r.token_id)}</td><td class="money">${monthlyMoney(r.amount)}</td><td class="money">${monthlyMoney(r.refund)}</td><td class="money">${monthlyMoney(r.net)}</td>${extra(monthlyNetDisplayResidual(r))}</tr>`).join('')||'<tr><td colspan="'+(netTail?6:5)+'">本月无令牌消费或退款记录</td></tr>'}${tail}<tr class="bill-total"><td colspan="2">用户合计</td><td class="money">${monthlyMoney(m.consumption?.amount)}</td><td class="money">${monthlyMoney(m.consumption?.refund)}</td><td class="money">${monthlyMoney(m.consumption?.net)}</td>${extra(monthlyNetDisplayResidual(m.consumption))}</tr></tbody></table></div>`;
+}
+function expandMonthlyTokens(event){
+  const node=event.target,root=$('monthlyContent');
+  if(!node?.matches?.('details.bill-token-member[data-monthly-token-member]')||!node.open||!root.contains(node)||node.dataset.tokenLoaded==='1')return;
+  const index=Number(node.dataset.monthlyTokenMember);
+  if(!Number.isSafeInteger(index)||index<0||monthlyDetail?.token_details_version!==1||!Array.isArray(monthlyDetail.members))return;
+  const member=monthlyDetail.members[index],body=node.querySelector('.bill-token-body');
+  if(!member||!body)return;
+  body.innerHTML=renderMonthlyTokenRows(member);node.dataset.tokenLoaded='1';
+}
+function monthlyTokens(value){
+  if(value===null)return '—';
+  if(!Number.isSafeInteger(value)||value<0)return '待核验';
+  let text=fmtNum(value);
+  for(const [divisor,unit] of [[100000000,'亿'],[10000,'万'],[1000,'千']]){
+    if(value>=divisor){text=(value/divisor).toFixed(2)+' '+unit;break;}
+  }
+  return `<span title="${esc(fmtNum(value))} Token">${esc(text)}</span>`;
+}
+function renderMonthlyStatement(d){
+  const cr=d.credits||{},s=d.consumption,rows=Array.isArray(cr.rows)?cr.rows:[];
+  const places=monthlySummaryPrecision(d),money=v=>monthlyMoney(v,true,places);
+  const total=(label,value,extra='')=>`<tr class="bill-total"><td colspan="3">${label}</td><td class="money">${value}</td><td colspan="2">${extra}</td></tr>`;
+  const tail=(label,value)=>monthlyDisplayNonzero(value)?total(label,money(value),'仅显示舍入，不改变实际金额'):'';
+  const balance=monthlyDisplayWallet({opening:d.month_opening_balance,credit_total:cr.known_total,adjustment:cr.adjustment,consumption:s,balance_correction:cr.balance_correction,closing:d.month_end_balance},d.display_balances==null?null:d.display_balances.version===1?(d.display_balances.organization??{}):{});
+  const fundingTails=[['recharge',cr.recharge_total,'充值分项舍入尾差'],['gift',cr.gift_total,'赠送分项舍入尾差'],['adjustment',cr.adjustment,'扣减分项舍入尾差']].map(([kind,value,label])=>[label,monthlyDisplayResidual(value,rows.filter(r=>r.kind===kind).map(r=>[r.amount]))]);
+  return `<div class="bill-scroll"><table class="bill-sheet"><colgroup><col style="width:8%"><col style="width:22%"><col style="width:16%"><col style="width:20%"><col style="width:18%"><col style="width:16%"></colgroup><tbody>
+    <tr><th class="bill-title" colspan="6">${esc(d.account||'—')} · 月度消费账单</th></tr>
+    <tr><td colspan="2" class="bill-label">组织名称</td><td colspan="4">${esc(d.account||'—')}</td></tr>
+    <tr><td colspan="2" class="bill-label">服务类型</td><td>MaaS 云计算服务</td><td class="bill-label">账单期间（北京时间）</td><td colspan="2">${esc(d.from)} 至 ${esc(d.to)}</td></tr>
+    <tr><th colspan="6" class="bill-section">本月收支汇总</th></tr>
+    ${d.month_opening_balance!=null?total('月初余额（元）',money(d.display_balances==null?d.month_opening_balance:balance?.opening)):''}
+    ${total('充值合计',money(cr.recharge_total),cr.recharge_count==null?'待核验':esc(cr.recharge_count)+' 次')}
+    ${total('赠送合计',money(cr.gift_total))}
+    ${tail('到账汇总舍入尾差（元）',monthlyDisplayResidual(cr.known_total,[[cr.recharge_total],[cr.gift_total]]))}
+    ${total('到账合计',money(cr.known_total))}
+    <tr><th colspan="6" class="bill-section">消费统计</th></tr>
+    <tr class="bill-columns"><th colspan="2">总消费（元）</th><th colspan="2">请求次数</th><th colspan="2">总 Token 数</th></tr>
+    <tr class="bill-metrics"><td colspan="2">${s?money(s.amount):'待核验'}</td><td colspan="2">${s?(s.requests===null?'—':esc(fmtNum(s.requests))):'待核验'}</td><td colspan="2">${s?monthlyTokens(s.tokens):'待核验'}</td></tr>
+    ${s&&s.refund!=='0.000000'?total('退款金额（元）',money(s.refund))+tail('净消费舍入尾差（元）',monthlyDisplayResidual(s.net,[[s.amount],[s.refund,-1]]))+total('净消费（元）',money(s.net)):''}
+    ${cr.available&&cr.adjustment&&cr.adjustment!=='0.000000'?total('余额扣减调整（元）',money(cr.adjustment)):''}
+    ${cr.balance_correction?total('余额校正（元）',money(cr.balance_correction)):''}
+    <tr class="bill-balance"><td colspan="2">月末余额（元）</td><td colspan="4">${balance===null?'待核验':money(balance.closing)}</td></tr>
+    <tr><th colspan="6" class="bill-section">额度变动记录</th></tr>
+    <tr class="bill-columns"><th>序号</th><th>时间（北京时间）</th><th>被操作账号</th><th>金额（元）</th><th>操作类型</th><th>备注</th></tr>
+    ${cr.available?(rows.map((r,i)=>`<tr><td class="center">${i+1}</td><td>${esc(fmtLogTime(r.at))}</td><td>${esc(r.username||'—')}${Number.isSafeInteger(r.user_id)&&r.user_id>0?' · ID '+esc(r.user_id):''}</td><td class="money">${monthlyMoney(r.amount)}</td><td>${esc(r.method||'待核验')}</td><td>${r.kind==='gift'?'赠送额度':''}</td></tr>`).join('')||'<tr><td colspan="6">本月无额度变动</td></tr>'):'<tr><td colspan="6">额度变动记录暂不可用（不代表零充值）</td></tr>'}
+    ${cr.available?fundingTails.filter(([,value])=>monthlyDisplayNonzero(value)).map(([label,value])=>`<tr data-monthly-funding-rounding><td colspan="3">${label}</td><td class="money">${money(value)}</td><td colspan="2">仅显示舍入，不是交易</td></tr>`).join(''):''}
+    </tbody></table></div>${renderMonthlyMembers(d)}`;
+}
+function renderMonthlyList(d){
+  const rows=Array.isArray(d.rows)?d.rows:[];
+  const unavailable=Array.isArray(d.unavailable_months)?d.unavailable_months:[];
+  const notice=unavailable.length?`<p role="status">以下月份账单暂不可用：${unavailable.map(esc).join('、')}。其他月份可正常查看，请稍后重试或联系管理员。</p>`:'';
+  const classified=rows.some(r=>r.gift_total!=null);
+const body=rows.map(r=>`<tr><td>${esc(r.month)}</td><td>${r.recharge_count==null?'待核验':esc(fmtNum(r.recharge_count))+' 次'}</td><td>${monthlyMoney(r.recharge_total,true,r.money_decimal_places??2)}</td>${classified?'<td>'+monthlyMoney(r.gift_total,true,r.money_decimal_places??2)+'</td><td>'+monthlyMoney(r.credit_total,true,r.money_decimal_places??2)+'</td>':''}<td>${monthlyMoney(r.consumption?.amount,true,r.money_decimal_places??2)}</td><td>${r.consumption?(r.consumption.requests===null?'—':esc(fmtNum(r.consumption.requests))):'待核验'}</td><td>${r.consumption?monthlyTokens(r.consumption.tokens):'待核验'}</td><td>${r.downloadable?'可查看 / 下载':'数据待核验'}</td><td><button class="btn" type="button" data-month-detail="${esc(r.month)}">查看明细</button></td></tr>`).join('');
+  return notice+`<table><thead><tr><th>账单月份</th><th>充值次数</th><th>充值总额（元）</th>${classified?'<th>赠送（元）</th><th>到账合计（元）</th>':''}<th>消费总额（元）</th><th>请求次数</th><th>Token 数</th><th>状态</th><th>操作</th></tr></thead><tbody>${body||'<tr><td colspan="'+(classified?10:8)+'">'+(unavailable.length?'本页账单暂不可用':'没有符合条件的月份')+'</td></tr>'}</tbody></table>`;
+}
+function monthlyBegin(detail){
+  const seq=++monthlySequence;
+  if(monthlyAbort)monthlyAbort.abort();
+  if(monthlyDownloadAbort)monthlyDownloadAbort.abort();
+  monthlyAbort=new AbortController();
+  monthlyDetail=null;
+  $('monthlyDownload').disabled=true;
+  $('monthlyListBar').style.display=detail?'none':'flex';
+  $('monthlyDetailBar').style.display=detail?'flex':'none';
+  $('monthlyPager').style.display=detail?'none':'flex';
+  $('monthlyPrev').disabled=true;$('monthlyNext').disabled=true;
+  $('monthlyContent').innerHTML='';$('monthlyStatus').textContent='正在查询…';
+  return seq;
+}
+async function loadMonthlyList(before='',direction='reset'){
+  $('monthlyMonth').max=$('monthlyMonth').monthlyGenerationMaxMonth||lastClosedMonth();
+  const month=$('monthlyMonth').value;
+  const seq=monthlyBegin(false),ctrl=monthlyAbort;
+  const timeout=setTimeout(()=>ctrl.abort(),30000);
+  const params=new URLSearchParams(month?{month}:before?{before}:{});
+  try{
+    const r=await api('/api/monthly-statements?'+params,{signal:ctrl.signal,headers:{'X-Monthly-Statistics':'nullable-v1','X-Monthly-Accounting':'balance-correction-v1','X-Monthly-Display':'cents-chain-v1'}});
+    if(seq!==monthlySequence)return;
+    if(!r.ok||!r.data)throw new Error(r.error||'账单列表暂不可用');
+    if(direction==='next')monthlyPrevious.push(monthlyListCursor);
+    else if(direction==='prev')monthlyPrevious.pop();
+    else if(direction==='reset')monthlyPrevious=[];
+    monthlyListCursor=month?'':before;monthlyNextCursor=r.data.next||'';
+    $('monthlyContent').innerHTML=renderMonthlyList(r.data);$('monthlyStatus').textContent='';
+    $('monthlyPrev').disabled=monthlyPrevious.length===0;$('monthlyNext').disabled=!monthlyNextCursor;
+  }catch(e){if(seq===monthlySequence)$('monthlyStatus').textContent=e.name==='AbortError'?'查询已超时，请重试':e.message;}
+  finally{clearTimeout(timeout);}
+}
+async function loadMonthlyStatement(month){
+  if(!/^\d{4}-\d{2}$/.test(month))return;
+  const seq=monthlyBegin(true);
+  const ctrl=monthlyAbort;
+  const timeout=setTimeout(()=>ctrl.abort(),30000);
+  try{
+    const r=await api('/api/monthly-statement?'+new URLSearchParams({month}),{signal:ctrl.signal,headers:{'X-Monthly-Statistics':'nullable-v1','X-Monthly-Accounting':'balance-correction-v1','X-Monthly-Display':'cents-chain-v1'}});
+    if(seq!==monthlySequence)return;
+    if(!r.ok||!r.data)throw new Error(r.error||'账单暂不可用');
+    monthlyDetail=r.data;
+    $('monthlyContent').innerHTML=renderMonthlyStatement(r.data);$('monthlyStatus').textContent='';
+    $('monthlyDownload').disabled=!(r.data.published&&r.data.month_end_balance!=null&&r.data.credits?.available&&r.data.credits.unknown===0&&r.data.consumption&&/^[a-f0-9]{64}$/.test(r.data.publication||''));
+  }catch(e){
+    if(seq===monthlySequence)$('monthlyStatus').textContent=e.name==='AbortError'?'查询已超时，请重试':e.message;
+  }finally{clearTimeout(timeout);}
+}
+function monthlyBillFilename(account,month){
+  if(typeof month!=='string'||month.length!==7||!/^\d{4}-(0[1-9]|1[0-2])$/.test(month))return null;
+  let name=typeof account==='string'?account:'';
+  name=name.replace(/[\u0000-\u001f\u007f-\u009f<>:"/\\|?*\u202a-\u202e\u2066-\u2069\ufeff]/g,'_').replace(/\s+/g,' ').replace(/^[. ]+|[. ]+$/g,'');
+  name=Array.from(name).slice(0,48).join('').replace(/[. ]+$/g,'')||'组织';
+  return `NexusAPI-${name}-月度账单-${month}.xlsx`;
+}
+async function downloadMonthlyStatement(){
+  if(!monthlyDetail||$('monthlyDownload').disabled)return;
+  const month=monthlyDetail.month,publication=monthlyDetail.publication,seq=monthlySequence;
+  const filename=monthlyBillFilename(monthlyDetail.account,month);
+  if(!filename){$('monthlyDownload').disabled=true;$('monthlyStatus').textContent='账单信息无效，请重新打开详情';return;}
+  if(!/^[a-f0-9]{64}$/.test(publication||'')){
+    $('monthlyDownload').disabled=true;$('monthlyStatus').textContent='账单版本缺失，请重新打开详情';return;
+  }
+  const ctrl=new AbortController();monthlyDownloadAbort=ctrl;
+  let versionValid=true;
+  const timeout=setTimeout(()=>ctrl.abort(),30000);
+  $('monthlyDownload').disabled=true;$('monthlyStatus').textContent='正在准备下载…';
+  try{
+    const r=await fetch('/api/monthly-statement/download?'+new URLSearchParams({month,publication}),{signal:ctrl.signal,headers:{'X-Monthly-Statistics':'nullable-v1','X-Monthly-Accounting':'balance-correction-v1','X-Monthly-Display':'cents-chain-v1'}});
+    if(r.status===401){location.href='/login';throw new Error('请重新登录');}
+    if(r.status===409||r.status===404){versionValid=false;throw new Error('账单已变更或撤回，请返回列表重新打开');}
+    if(r.status===429)throw new Error('账单下载繁忙，请稍后重试');
+    if(!r.ok||!r.headers.get('content-type')?.startsWith('application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'))throw new Error('账单尚未核验完整或下载失败，请刷新后重试');
+    const blob=await r.blob();
+    if(blob.size>2*1024*1024)throw new Error('账单超过下载大小限制');
+    if(seq!==monthlySequence)return;
+    const url=URL.createObjectURL(blob),a=document.createElement('a');
+    a.href=url;a.download=filename;a.hidden=true;document.body.appendChild(a);a.click();a.remove();
+    setTimeout(()=>URL.revokeObjectURL(url),60000);$('monthlyStatus').textContent='已发起下载';
+  }catch(e){if(seq===monthlySequence)$('monthlyStatus').textContent=e.name==='AbortError'?'下载超时，请重试':e.message;}
+  finally{clearTimeout(timeout);if(seq===monthlySequence)$('monthlyDownload').disabled=!versionValid;}
+}
+$('monthlyRefresh').onclick=()=>loadMonthlyList();
+$('monthlyMonth').onchange=()=>loadMonthlyList();
+$('monthlyReset').onclick=()=>{$('monthlyMonth').value='';loadMonthlyList();};
+$('monthlyPrev').onclick=()=>{if(monthlyPrevious.length)loadMonthlyList(monthlyPrevious[monthlyPrevious.length-1],'prev');};
+$('monthlyNext').onclick=()=>{if(monthlyNextCursor)loadMonthlyList(monthlyNextCursor,'next');};
+$('monthlyBack').onclick=()=>loadMonthlyList(monthlyListCursor,'keep');
+$('monthlyDownload').onclick=downloadMonthlyStatement;
+$('monthlyContent').addEventListener('click',e=>{const b=e.target.closest('[data-month-detail]');if(b)loadMonthlyStatement(b.dataset.monthDetail);});
+$('monthlyContent').addEventListener('toggle',expandMonthlyTokens,true);
 
 // 日志时间固定按 Asia/Shanghai 展示，不跟随访问者电脑时区。
 function fmtLogTime(ts){const d=new Date(ts*1000+8*3600*1000),p=n=>String(n).padStart(2,'0');
@@ -1587,14 +1896,14 @@ function renderBillTask(v){
   expStatus(v.message||labels[v.state],'仅消费记录；生成完成并核验通过后才可下载');
   if(v.state==='running'&&v.task){
     setExpBar(v.task.total?Math.min(.99,v.task.rows/v.task.total):null);
-    expStatus(`已整理 ${v.task.rows.toLocaleString()} / ${v.task.total.toLocaleString()} 条`,'正在核验完整性，尚未开始下载');
+    expStatus(`已核对 ${v.task.rows.toLocaleString()} / ${v.task.total.toLocaleString()} 条源日志`,'正在核验完整性，尚未开始下载');
   }
   if(v.state==='canceling')$('expCancel').disabled=true;
   if(v.state==='restoring'||(v.state==='paused'&&!v.task)){
     $('expCancel').textContent='关闭';$('expCancel').onclick=closeExp;
   }
   if(v.state==='ready'){
-    setExpBar(1);expStatus(`共 ${v.task.total.toLocaleString()} 条消费记录`,'文件暂存约 10 分钟，过期需重新生成；下载结果请在浏览器中确认');
+    setExpBar(1);expStatus(`已核对 ${v.task.total.toLocaleString()} 条消费日志`,'全零的文本消费记录不列入账单；文件暂存约 10 分钟，下载结果请在浏览器中确认');
     $('expAction').hidden=false;$('expAction').textContent='下载账单';
     $('expAction').onclick=()=>{
       const a=document.createElement('a');a.href='/api/logs/bill/tasks/'+v.task.id+'/download';a.download='usage-bill.csv';a.hidden=true;

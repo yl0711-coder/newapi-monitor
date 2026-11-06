@@ -7,7 +7,7 @@ const job = name => workflow.split(`\n  ${name}:\n`)[1]?.split(/^  [\w-]+:/m)[0]
 
 test('all release artifacts wait for secret, test and image gates', () => {
   for (const name of ['build-push', 'build-nginx-ops-tools']) {
-    assert.match(job(name), /needs: \[test, race-monitor, secrets, image-security\]/);
+    assert.match(job(name), /needs: \[test, race-monitor, race-monthly, secrets, image-security\]/);
     assert.match(job(name), /if: github.event_name != 'pull_request'/);
   }
   assert.match(job('secrets'), /fetch-depth: 0/);
@@ -44,7 +44,7 @@ test('publisher loads the scanned artifact and cannot rebuild or push unrelated 
 });
 
 test('all production images use the same patched Go build version as CI', () => {
-  const patchedVersion = '1.26.9';
+  const patchedVersion = '1.26.10';
   const read = file => readFileSync(new URL(`../../${file}`, import.meta.url), 'utf8');
   assert.equal(read('go.mod').match(/^go (\S+)$/m)?.[1], patchedVersion);
   const ciVersions = [...workflow.matchAll(/go-version:\s*'([^']+)'/g)];
