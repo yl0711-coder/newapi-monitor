@@ -192,7 +192,7 @@
         if (typeof loadMonthlyList === 'function') void loadMonthlyList();
       }
       if (state === 'queued' || state === 'processing' || state === 'finalizing') {
-        if (++polls < 600) timer = setTimeout(() => { timer = null; void request(false); }, 3000);
+        if (++polls < 120) timer = setTimeout(() => { timer = null; void request(false); }, 5000);
         else status.textContent += ' 已暂停自动刷新，可手动刷新进度。';
       }
     } catch (_) {
