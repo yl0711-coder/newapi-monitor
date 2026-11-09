@@ -8,6 +8,8 @@ type monthlyCustomerBill struct {
 	source    monthlyStatement
 	statement monthlyStatement
 	retained  *monthlyRetainedCentBill
+	simple    bool // issued by the simple generator: customer statement layout
+	sub       *simpleSubscriptionBill
 }
 
 func monthlyReadCustomerBill(record PortalMonthlyBill) (monthlyCustomerBill, error) {
@@ -40,6 +42,9 @@ func (bill monthlyCustomerBill) summary() (monthlyStatementRow, error) {
 func (bill monthlyCustomerBill) workbook() ([]byte, error) {
 	if bill.retained != nil {
 		return monthlyCentBillXLSX(*bill.retained)
+	}
+	if bill.simple {
+		return simpleStatementXLSX(bill.source, bill.sub)
 	}
 	return monthlyStatementXLSX(bill.source)
 }

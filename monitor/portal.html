@@ -1284,8 +1284,21 @@ function monthlyTokens(value){
   }
   return `<span title="${esc(fmtNum(value))} Token">${esc(text)}</span>`;
 }
-function renderMonthlyStatement(d){
+function monthlyCentsOf(v){const m=/^(-?)(\d+)\.(\d{6})$/.exec(v||'');return m?(m[1]?-1:1)*(Number(m[2])*100+Number(m[3].slice(0,2))):null;}
+function monthlyCentsMoney(c){const n=c<0;c=Math.abs(c);return (n?'-':'')+Math.floor(c/100)+'.'+String(c%100).padStart(2,'0')+'0000';}
+function monthlySubNet(sub){return (sub&&Array.isArray(sub.users))?sub.users.reduce((a,u)=>a+(u.consume_cents||0)-(u.refund_cents||0),0):0;}
+function renderMonthlySubscription(sub,d){
+  if(!sub||sub.version!==1)return '';
+  const names=new Map((d.members||[]).map(m=>[m.user_id,m.username||'—']));
+  const t=v=>v?esc(fmtLogTime(v)):'—';
+  const orders=(sub.orders||[]).length?`<div class="bill-scroll"><table class="bill-sheet"><thead><tr><th colspan="7" class="bill-section">订阅服务（本月开通）</th></tr><tr class="bill-columns"><th>订阅记录编号</th><th>订阅服务名称</th><th>数量（张）</th><th>金额（元）</th><th>服务开始时间</th><th>服务到期时间</th><th>服务状态</th></tr></thead><tbody>${sub.orders.map(o=>`<tr><td>SUB-${esc(o.user_id)}-${String(o.id).padStart(6,'0')}</td><td>${esc(o.name)}${o.trial?'（试用）':''}</td><td class="center">${esc(o.quantity)}</td><td class="money">${monthlyMoney(monthlyCentsMoney(o.price_cents))}</td><td>${t(o.start)}</td><td>${t(o.end)}</td><td>${o.active?'服务中':'已到期'}</td></tr>`).join('')}</tbody></table></div>`:'';
+  const users=sub.users||[];
+  const usage=users.length?`<div class="bill-scroll"><table class="bill-sheet"><thead><tr><th colspan="4" class="bill-section">套餐内消费（由订阅额度支付，不扣余额）</th></tr><tr class="bill-columns"><th>账号</th><th>令牌名称</th><th>令牌 ID</th><th>套餐内消费（元）</th></tr></thead><tbody>${users.flatMap(u=>(u.tokens||[]).map(k=>`<tr><td>${esc(names.get(u.user_id)||'—')}<small>ID ${esc(u.user_id)}</small></td><td>${esc(k.name||'—')}</td><td>${esc(k.token_id)}</td><td class="money">${monthlyMoney(monthlyCentsMoney((k.consume_cents||0)-(k.refund_cents||0)))}</td></tr>`)).join('')}</tbody></table></div>`:'';
+  return orders+usage;
+}
+function renderMonthlyStatement(d,sub){
   const cr=d.credits||{},s=d.consumption,rows=Array.isArray(cr.rows)?cr.rows:[];
+  const subNet=monthlySubNet(sub),walletCents=s?monthlyCentsOf(s.amount):null;
   const places=monthlySummaryPrecision(d),money=v=>monthlyMoney(v,true,places);
   const total=(label,value,extra='')=>`<tr class="bill-total"><td colspan="3">${label}</td><td class="money">${value}</td><td colspan="2">${extra}</td></tr>`;
   const tail=(label,value)=>monthlyDisplayNonzero(value)?total(label,money(value),'仅显示舍入，不改变实际金额'):'';
@@ -1303,7 +1316,8 @@ function renderMonthlyStatement(d){
     ${total('到账合计',money(cr.known_total))}
     <tr><th colspan="6" class="bill-section">消费统计</th></tr>
     <tr class="bill-columns"><th colspan="2">总消费（元）</th><th colspan="2">请求次数</th><th colspan="2">总 Token 数</th></tr>
-    <tr class="bill-metrics"><td colspan="2">${s?money(s.amount):'待核验'}</td><td colspan="2">${s?(s.requests===null?'—':esc(fmtNum(s.requests))):'待核验'}</td><td colspan="2">${s?monthlyTokens(s.tokens):'待核验'}</td></tr>
+    <tr class="bill-metrics"><td colspan="2">${s?money(subNet&&walletCents!==null?monthlyCentsMoney(walletCents+subNet):s.amount):'待核验'}</td><td colspan="2">${s?(s.requests===null?'—':esc(fmtNum(s.requests))):'待核验'}</td><td colspan="2">${s?monthlyTokens(s.tokens):'待核验'}</td></tr>
+    ${s&&subNet?total('其中 套餐内（元）',money(monthlyCentsMoney(subNet)),'由订阅额度支付，不扣余额')+total('其中 余额支付（元）',money(s.amount)):''}
     ${s&&s.refund!=='0.000000'?total('退款金额（元）',money(s.refund))+tail('净消费舍入尾差（元）',monthlyDisplayResidual(s.net,[[s.amount],[s.refund,-1]]))+total('净消费（元）',money(s.net)):''}
     ${cr.available&&cr.adjustment&&cr.adjustment!=='0.000000'?total('余额扣减调整（元）',money(cr.adjustment)):''}
     ${cr.balance_correction?total('余额校正（元）',money(cr.balance_correction)):''}
@@ -1312,7 +1326,7 @@ function renderMonthlyStatement(d){
     <tr class="bill-columns"><th>序号</th><th>时间（北京时间）</th><th>被操作账号</th><th>金额（元）</th><th>操作类型</th><th>备注</th></tr>
     ${cr.available?(rows.map((r,i)=>`<tr><td class="center">${i+1}</td><td>${esc(fmtLogTime(r.at))}</td><td>${esc(r.username||'—')}${Number.isSafeInteger(r.user_id)&&r.user_id>0?' · ID '+esc(r.user_id):''}</td><td class="money">${monthlyMoney(r.amount)}</td><td>${esc(r.method||'待核验')}</td><td>${r.kind==='gift'?'赠送额度':''}</td></tr>`).join('')||'<tr><td colspan="6">本月无额度变动</td></tr>'):'<tr><td colspan="6">额度变动记录暂不可用（不代表零充值）</td></tr>'}
     ${cr.available?fundingTails.filter(([,value])=>monthlyDisplayNonzero(value)).map(([label,value])=>`<tr data-monthly-funding-rounding><td colspan="3">${label}</td><td class="money">${money(value)}</td><td colspan="2">仅显示舍入，不是交易</td></tr>`).join(''):''}
-    </tbody></table></div>${renderMonthlyMembers(d)}`;
+    </tbody></table></div>${renderMonthlySubscription(sub,d)}${renderMonthlyMembers(d)}`;
 }
 function renderMonthlyList(d){
   const rows=Array.isArray(d.rows)?d.rows:[];
@@ -1365,7 +1379,7 @@ async function loadMonthlyStatement(month){
     if(seq!==monthlySequence)return;
     if(!r.ok||!r.data)throw new Error(r.error||'账单暂不可用');
     monthlyDetail=r.data;
-    $('monthlyContent').innerHTML=renderMonthlyStatement(r.data);$('monthlyStatus').textContent='';
+    $('monthlyContent').innerHTML=renderMonthlyStatement(r.data,r.subscription||null);$('monthlyStatus').textContent='';
     $('monthlyDownload').disabled=!(r.data.published&&r.data.month_end_balance!=null&&r.data.credits?.available&&r.data.credits.unknown===0&&r.data.consumption&&/^[a-f0-9]{64}$/.test(r.data.publication||''));
   }catch(e){
     if(seq===monthlySequence)$('monthlyStatus').textContent=e.name==='AbortError'?'查询已超时，请重试':e.message;

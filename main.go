@@ -15,6 +15,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/yl0711-coder/newapi-monitor/internal/monthlydraft"
 	"log/slog"
 	"net/http"
 	"os"
@@ -71,11 +72,20 @@ func run() error {
 	// 收到 SIGINT/SIGTERM 时取消 ctx:采样器退出 + HTTP 优雅关停。
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	generation, err := openMonthlyGeneration(ctx, generationConfig, m)
-	if err != nil {
-		return fmt.Errorf("月度账单生成配置/资源检查失败: %w", err)
+	var simpleGeneration *monitor.SimpleMonthlyGeneration
+	var generation *monthlydraft.Deployment
+	if generationConfig.mode == "simple" {
+		simpleGeneration, err = m.NewSimpleMonthlyGeneration()
+		if err != nil {
+			return fmt.Errorf("月度账单生成配置/资源检查失败: %w", err)
+		}
+	} else {
+		generation, err = openMonthlyGeneration(ctx, generationConfig, m)
+		if err != nil {
+			return fmt.Errorf("月度账单生成配置/资源检查失败: %w", err)
+		}
+		defer closeMonthlyGeneration(generation) // before m.Close; no shared handle ownership
 	}
-	defer closeMonthlyGeneration(generation) // before m.Close; no shared handle ownership
 
 	gin.SetMode(gin.ReleaseMode)
 	r := gin.New()
@@ -97,7 +107,11 @@ func run() error {
 		if err := pr.SetTrustedProxies(s.TrustedProxies); err != nil {
 			return fmt.Errorf("MONITOR_TRUSTED_PROXIES 配置无效: %w", err)
 		}
-		if generation != nil {
+		if simpleGeneration != nil {
+			if err := m.RegisterPortalRoutesWithGeneration(pr, simpleGeneration); err != nil {
+				return err
+			}
+		} else if generation != nil {
 			if err := m.RegisterPortalRoutesWithGeneration(pr, generation); err != nil {
 				return err
 			}
@@ -109,6 +123,11 @@ func run() error {
 	// Finish all configuration/route checks before opening either listener.
 	if generation != nil {
 		if err := generation.Start(ctx); err != nil {
+			return err
+		}
+	}
+	if simpleGeneration != nil && portalSrv != nil {
+		if err := simpleGeneration.Start(ctx); err != nil {
 			return err
 		}
 	}
