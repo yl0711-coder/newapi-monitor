@@ -1499,6 +1499,12 @@ func TestPricingLedgerProductionWorkerBudgetResumesAcrossRestart(t *testing.T) {
 }
 
 func TestChannelCostDirtyRecoveryResumesAfterTwentyPages(t *testing.T) {
+	// The sync plan is relative to the current hour; crossing an hour
+	// boundary mid-test changes the expected request count. Start well
+	// inside an hour.
+	if left := 3600 - time.Now().Unix()%3600; left < 90 {
+		time.Sleep(time.Duration(left+1) * time.Second)
+	}
 	hour := time.Now().Unix()
 	hour = hour - hour%3600 - 7200
 	rows := usageFixtureRows(4500, hour, 3600)

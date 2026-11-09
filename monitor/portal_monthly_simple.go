@@ -492,9 +492,10 @@ func (g *SimpleMonthlyGeneration) runOne(ctx context.Context) bool {
 func (g *SimpleMonthlyGeneration) claim(ctx context.Context) (PortalMonthlySimpleJob, bool) {
 	var jobs []PortalMonthlySimpleJob
 	now := g.now().Unix()
-	// Single UPDATE ... RETURNING: selecting and leasing the job is one write
-	// statement, so it waits for concurrent writers instead of failing.
-	err := g.m.storeDB.WithContext(ctx).Raw(`UPDATE portal_monthly_simple_jobs
+	// Single UPDATE ... RETURNING on the queued writer: it takes SQLite's
+	// writer slot up front and waits for it (startup backups and syncs write
+	// concurrently), instead of failing the poll with SQLITE_BUSY.
+	err := g.m.queuedWriteStore().WithContext(ctx).Raw(`UPDATE portal_monthly_simple_jobs
 SET state = ?, lease_until = ?, updated_at = ?
 WHERE (group_id, month) = (
   SELECT group_id, month FROM portal_monthly_simple_jobs

@@ -1670,6 +1670,28 @@ func newUpstreamHTTPClient(timeout time.Duration) *http.Client {
 	}
 }
 
+// upstreamUsageRequestTimeout bounds one usage/log request. Log queries scan
+// the upstream's database and are often slower than a balance read; with the
+// balance timeout they failed repeatedly on slow but healthy upstreams.
+func upstreamUsageRequestTimeout(s Settings) time.Duration {
+	seconds := s.UpstreamUsageTimeoutSec
+	if seconds <= 0 {
+		seconds = 45
+	}
+	floor := int(upstreamSyncTimeout(s) / time.Second)
+	seconds = min(max(seconds, floor), 120)
+	return time.Duration(seconds) * time.Second
+}
+
+// channelUpstreamUsageHTTPClient is channelUpstreamHTTPClient with the usage
+// request timeout. It shares the guarded transport (connection pool, host
+// pacing and circuits); only the per-request timeout differs.
+func (m *Monitor) channelUpstreamUsageHTTPClient() *http.Client {
+	usage := *m.channelUpstreamHTTPClient()
+	usage.Timeout = upstreamUsageRequestTimeout(m.cfg)
+	return &usage
+}
+
 func (m *Monitor) channelUpstreamHTTPClient() *http.Client {
 	client := m.upstreamClient
 	if client == nil {
@@ -2552,6 +2574,10 @@ func applyUpstreamSyncResult(row *ChannelUpstreamAccount, result upstreamBalance
 		return
 	}
 	row.LastAttemptAt = now
+	if next, paused := upstreamPauseRetryAt(err, now); paused {
+		row.NextSyncAt = next
+		return
+	}
 	if err == nil {
 		row.BalanceUSD = result.BalanceUSD
 		row.BalanceRaw = result.BalanceRaw

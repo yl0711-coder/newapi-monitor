@@ -70,6 +70,7 @@ docker run -d --name newapi-monitor \
 | `MONITOR_UPSTREAM_SYNC_ENABLED` | 上游余额后台同步开关；上游故障/风控维护窗口可临时关闭 | `true` |
 | `MONITOR_UPSTREAM_SYNC_MINUTES` | NewAPI / Sub2API 上游账户余额正常同步间隔；失败自动指数退避 | `5` |
 | `MONITOR_UPSTREAM_SYNC_TIMEOUT_SECONDS` | 单个上游同步请求超时 | `15` |
+| `MONITOR_UPSTREAM_USAGE_TIMEOUT_SECONDS` | 单个上游使用日志请求超时（日志查询通常比余额慢；不低于上一项，最多 120） | `45` |
 | `MONITOR_UPSTREAM_USAGE_SYNC_ENABLED` | 上游消费日志后台同步的独立灰度闸门；首次发布不会访问上游，验证后再显式开启 | `false` |
 | `MONITOR_UPSTREAM_USAGE_SYNC_MINUTES` | 上游消费账单当天尾部刷新间隔；支持 NewAPI 分页日志、Sub2API 小时汇总（旧版回退单日汇总）和 AICodeWith 按 Key 日账单；AICodeWith 始终至少 30 分钟 | `20` |
 | `MONITOR_UPSTREAM_MAX_CONCURRENCY` | 不同上游主机的全局并发上限；同一主机始终串行，当前硬上限为 2，生产先以 1 灰度 | `1` |

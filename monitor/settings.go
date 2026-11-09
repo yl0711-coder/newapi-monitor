@@ -121,9 +121,10 @@ type Settings struct {
 	UpstreamCredentialSecret string // MONITOR_UPSTREAM_CREDENTIAL_SECRET
 	// 关闭后禁止后台主动轮询已配置的上游账户余额。默认开启，保证已有生产行为不变；
 	// 本地验收可显式关闭，避免启动页面时向任何上游站点发出请求。
-	UpstreamSyncEnabled    bool // MONITOR_UPSTREAM_SYNC_ENABLED,默认 true
-	UpstreamSyncMinutes    int  // MONITOR_UPSTREAM_SYNC_MINUTES,默认 5；失败时按账户退避，最长 60 分钟
-	UpstreamSyncTimeoutSec int  // MONITOR_UPSTREAM_SYNC_TIMEOUT_SECONDS,默认 15
+	UpstreamSyncEnabled     bool // MONITOR_UPSTREAM_SYNC_ENABLED,默认 true
+	UpstreamSyncMinutes     int  // MONITOR_UPSTREAM_SYNC_MINUTES,默认 5；失败时按账户退避，最长 60 分钟
+	UpstreamSyncTimeoutSec  int  // MONITOR_UPSTREAM_SYNC_TIMEOUT_SECONDS,默认 15
+	UpstreamUsageTimeoutSec int  // MONITOR_UPSTREAM_USAGE_TIMEOUT_SECONDS,使用日志单次请求超时,默认 45(15~120)
 	// 上游使用日志与余额是两条独立同步链。日志全局开关默认关闭，
 	// 只有全局开关与账户开关同时开启才会后台读取。页面访问绝不会触发上游请求。
 	UpstreamUsageSyncEnabled          bool     // MONITOR_UPSTREAM_USAGE_SYNC_ENABLED,默认 false；新功能灰度闸门
@@ -460,6 +461,7 @@ func LoadSettings() Settings {
 		UpstreamSyncEnabled:                      env("MONITOR_UPSTREAM_SYNC_ENABLED", "true") == "true",
 		UpstreamSyncMinutes:                      envInt("MONITOR_UPSTREAM_SYNC_MINUTES", 5),
 		UpstreamSyncTimeoutSec:                   envInt("MONITOR_UPSTREAM_SYNC_TIMEOUT_SECONDS", 15),
+		UpstreamUsageTimeoutSec:                  envInt("MONITOR_UPSTREAM_USAGE_TIMEOUT_SECONDS", 45),
 		UpstreamUsageSyncEnabled:                 env("MONITOR_UPSTREAM_USAGE_SYNC_ENABLED", "false") == "true",
 		UpstreamUsageHistoryRepairEnabled:        env("MONITOR_UPSTREAM_USAGE_HISTORY_REPAIR_ENABLED", "false") == "true",
 		UpstreamUsageHistoryRepairDomains:        envCSV("MONITOR_UPSTREAM_USAGE_HISTORY_REPAIR_DOMAINS"),
