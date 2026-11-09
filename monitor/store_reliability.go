@@ -283,6 +283,12 @@ func (m *Monitor) startStoreMaintenance(ctx context.Context) {
 	if !m.cfg.StoreBackupEnabled || (!mainEnabled && !factsEnabled) {
 		return
 	}
+	if at, ok := storeBackupDailyAt(m.cfg.StoreBackupDailyAt); ok {
+		m.storeMaintenanceOnce.Do(func() { go m.runDailyStoreBackups(ctx, at, mainEnabled, factsEnabled) })
+		return
+	} else if m.cfg.StoreBackupDailyAt != "" {
+		slog.Warn("MONITOR_STORE_BACKUP_DAILY_AT 格式无效（应为 HH:MM，UTC），改用按间隔备份", "value", m.cfg.StoreBackupDailyAt)
+	}
 	m.storeMaintenanceOnce.Do(func() {
 		go func() {
 			initial := time.NewTimer(5 * time.Minute)
@@ -1339,4 +1345,78 @@ func pruneSQLiteBackups(dir, prefix string, retention int) error {
 		paths = paths[1:]
 	}
 	return nil
+}
+
+// storeBackupDailyAt parses "HH:MM" (UTC) into minutes after midnight.
+func storeBackupDailyAt(v string) (int, bool) {
+	t, err := time.Parse("15:04", strings.TrimSpace(v))
+	if err != nil {
+		return 0, false
+	}
+	return t.Hour()*60 + t.Minute(), true
+}
+
+// storeBackupLastSlot returns the most recent daily slot at or before now.
+func storeBackupLastSlot(now time.Time, minute int) time.Time {
+	u := now.UTC()
+	slot := time.Date(u.Year(), u.Month(), u.Day(), 0, minute, 0, 0, time.UTC)
+	if slot.After(u) {
+		slot = slot.AddDate(0, 0, -1)
+	}
+	return slot
+}
+
+// newestStoreBackupAt returns the creation time of the newest verified backup
+// set, or zero when none can be read (which makes the caller back up).
+func (m *Monitor) newestStoreBackupAt(now time.Time, mainEnabled, factsEnabled bool) time.Time {
+	var paths []string
+	if mainEnabled {
+		paths = append(paths, m.cfg.StorePath)
+	}
+	if factsEnabled {
+		paths = append(paths, m.cfg.UsageFactsStorePath)
+	}
+	m.storeBackupMu.Lock()
+	entries, err := scanRuntimeBackupSets(m.storeBackupDir(), now, paths)
+	m.storeBackupMu.Unlock()
+	if err != nil || len(entries) == 0 {
+		return time.Time{}
+	}
+	return time.Unix(entries[0].manifest.CreatedAt, 0)
+}
+
+// runDailyStoreBackups backs up at a fixed UTC time every day, so restarts do
+// not move the schedule (an off-host copy can then be timed after it). After a
+// restart that missed the latest slot, one catch-up backup runs once startup
+// settles; the following backups stay on the fixed time.
+func (m *Monitor) runDailyStoreBackups(ctx context.Context, minute int, mainEnabled, factsEnabled bool) {
+	initial := time.NewTimer(5 * time.Minute)
+	defer initial.Stop()
+	select {
+	case <-ctx.Done():
+		return
+	case <-initial.C:
+	}
+	for {
+		now := time.Now()
+		slot := storeBackupLastSlot(now, minute)
+		if m.newestStoreBackupAt(now, mainEnabled, factsEnabled).Before(slot) {
+			if _, err := m.createStoreBackupSet(ctx, now, mainEnabled, factsEnabled); err != nil {
+				if !errors.Is(err, context.Canceled) {
+					slog.Error("Monitor 双库成套在线备份失败", "err", err)
+				}
+			} else {
+				slog.Info("Monitor 双库成套在线备份完成")
+			}
+		}
+		next := slot.AddDate(0, 0, 1)
+		slog.Info("下一次 Monitor 定时备份", "at_utc", next.Format("2006-01-02 15:04"))
+		timer := time.NewTimer(time.Until(next) + time.Second)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
+		}
+	}
 }

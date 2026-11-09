@@ -340,3 +340,26 @@ func TestBackupRetentionRealPairRestore(t *testing.T) {
 		t.Fatalf("real pair resume: %s %v", delay, err)
 	}
 }
+
+func TestStoreBackupDailySlot(t *testing.T) {
+	m, ok := storeBackupDailyAt("05:40")
+	if !ok || m != 5*60+40 {
+		t.Fatalf("parse: %d %v", m, ok)
+	}
+	for _, bad := range []string{"", "5:4x", "24:00", "05:60", "0540"} {
+		if _, ok := storeBackupDailyAt(bad); ok {
+			t.Fatalf("accepted %q", bad)
+		}
+	}
+	cases := map[string]string{
+		"2026-11-09T05:39:59Z": "2026-11-08T05:40:00Z", // before today's slot
+		"2026-11-09T05:40:00Z": "2026-11-09T05:40:00Z",
+		"2026-11-09T12:40:00Z": "2026-11-09T05:40:00Z", // restart in the afternoon keeps 05:40
+	}
+	for now, want := range cases {
+		n, _ := time.Parse(time.RFC3339, now)
+		if got := storeBackupLastSlot(n, m).Format(time.RFC3339); got != want {
+			t.Fatalf("%s: got %s want %s", now, got, want)
+		}
+	}
+}

@@ -84,6 +84,7 @@ docker run -d --name newapi-monitor \
 | `MONITOR_USAGE_FACTS_STORE_PATH` | 独立用量事实库路径；与主库分文件，避免补数/WAL/损坏影响控制数据 | `<MONITOR_STORE_PATH 目录>/usage-facts.db` |
 | `MONITOR_STORE_BACKUP_ENABLED` | 运行期在线日备份开关；不影响启动时强制迁移前快照 | `true` |
 | `MONITOR_STORE_BACKUP_DIR` | 在线备份和迁移前成套快照目录 | `<MONITOR_STORE_PATH 目录>/backups` |
+| `MONITOR_STORE_BACKUP_DAILY_AT` | 每天固定时刻（UTC，`HH:MM`）做成套备份；重启不改变时刻，重启时若已错过最近一次时刻会在启动 5 分钟后补做一次。设置后取代按间隔备份；格式无效时记录警告并回退间隔模式 | 空 |
 | `MONITOR_STORE_BACKUP_RETENTION` | 已验证 main+facts `backup-set` 成套备份保留数 | `7` |
 | `MONITOR_STORE_BACKUP_RETENTION_DAYS` | `0` 保持按套数保留；正数改为保留最近 N 个有备份的北京时间自然日，每日最新一套，另保护最近两套（最多 N+1 套）。停机不清空旧恢复点；启用后重启可延续同一数据卷经核验的备份周期。仅管理在线 `backup-set`，不管理发布/迁移/修复备份 | `0` |
 | `MONITOR_STORE_MIGRATION_BACKUP_RETENTION` | main+facts 同一 manifest 的迁移前快照批次保留数 | `3` |

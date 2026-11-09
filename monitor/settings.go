@@ -30,6 +30,7 @@ type Settings struct {
 	StoreBackupEnabled       bool   // MONITOR_STORE_BACKUP_ENABLED，默认 true
 	StoreBackupDir           string // MONITOR_STORE_BACKUP_DIR，默认 <StorePath 目录>/backups
 	StoreBackupIntervalHours int    // MONITOR_STORE_BACKUP_INTERVAL_HOURS，默认 24
+	StoreBackupDailyAt       string // MONITOR_STORE_BACKUP_DAILY_AT，"HH:MM"(UTC)；设置后每天固定时刻备份，重启不改变时刻；空=按间隔
 	StoreBackupRetention     int    // MONITOR_STORE_BACKUP_RETENTION，默认 7
 	StoreBackupRetentionDays int    // MONITOR_STORE_BACKUP_RETENTION_DAYS，0 保留旧计数策略；正数按北京时间日期保留
 	// 迁移前成套快照不受 StoreBackupEnabled 影响，独立限量保留，避免与日备份
@@ -404,6 +405,7 @@ func LoadSettings() Settings {
 		StoreBackupEnabled:                       env("MONITOR_STORE_BACKUP_ENABLED", "true") == "true",
 		StoreBackupDir:                           strings.TrimSpace(env("MONITOR_STORE_BACKUP_DIR", "")),
 		StoreBackupIntervalHours:                 envInt("MONITOR_STORE_BACKUP_INTERVAL_HOURS", 24),
+		StoreBackupDailyAt:                       strings.TrimSpace(env("MONITOR_STORE_BACKUP_DAILY_AT", "")),
 		StoreBackupRetention:                     envInt("MONITOR_STORE_BACKUP_RETENTION", 7),
 		StoreBackupRetentionDays:                 envInt("MONITOR_STORE_BACKUP_RETENTION_DAYS", 0),
 		StoreMigrationBackupRetention:            envInt("MONITOR_STORE_MIGRATION_BACKUP_RETENTION", 3),
