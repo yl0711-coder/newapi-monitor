@@ -120,8 +120,8 @@ func TestChannelManagementFiltersConfiguredInternalUsageAndStrictCost(t *testing
 		t.Fatalf("unexpected configured-account usage: %+v", fact)
 	}
 	row := channelManagementUsageRow{ChannelID: 5, Grp: "paid", Requests: 10, Tokens: 500, Quota: 5_000_000}
-	if err := subtractChannelInternalUsage(&row, fact); err != nil {
-		t.Fatal(err)
+	if shortfall, short := subtractChannelInternalUsage(&row, fact); short {
+		t.Fatalf("unexpected shortfall %+v", shortfall)
 	}
 	if row.Requests != 7 || row.Tokens != 450 || row.Quota != 4_000_000 {
 		t.Fatalf("configured-account usage was not excluded: %+v", row)
@@ -336,5 +336,26 @@ func TestExcludeFinanceGiftUsersPreventsDoubleDeduction(t *testing.T) {
 	}
 	if filtered.Allocation.PeriodGiftConsumptionMicroUSD != 500_000 || filtered.Coverage.GiftUsers != 1 || filtered.Coverage.EligibleGrants != 1 {
 		t.Fatalf("internal gift usage was still deducted: %+v", filtered)
+	}
+}
+
+// Missing sampler hours make internal facts exceed the sampled row. The row is
+// clamped and the shortfall reported with its hours; the report never fails.
+func TestChannelInternalUsageShortfallIsReportedNotFatal(t *testing.T) {
+	row := channelManagementUsageRow{ChannelID: 195, Grp: "internal", Requests: 1, Tokens: 4236, Quota: 1491}
+	shortfall, short := subtractChannelInternalUsage(&row, channelInternalUsageFact{Requests: 5, Tokens: 21182, Quota: 7709})
+	if !short || row.Requests != 0 || row.Tokens != 0 || row.Quota != 0 ||
+		shortfall.Requests != 4 || shortfall.Tokens != 16946 || shortfall.Quota != 6218 {
+		t.Fatalf("row=%+v shortfall=%+v", row, shortfall)
+	}
+	internal := financeConfiguredInternalEvidence{Complete: true, Accounts: 1, Rows: []FinanceInternalAccountHourFact{
+		{HourTs: 3600, ChannelID: 195, Grp: "internal", Requests: 2, Tokens: 10, ConsumeQuota: 10},
+		{HourTs: 7200, ChannelID: 195, Grp: "internal", Requests: 3, Tokens: 10, ConsumeQuota: 10},
+		{HourTs: 7200, ChannelID: 9, Grp: "internal", Requests: 9, Tokens: 9, ConsumeQuota: 9},
+	}}
+	sampled := map[int64]channelInternalUsageFact{3600: {Requests: 2, Tokens: 10, Quota: 10}, 7200: {Requests: 1, Tokens: 10, Quota: 10}}
+	hours, truncated := channelInternalShortfallHours(internal, sampled, 195, "internal")
+	if truncated || len(hours) != 1 || hours[0] != 7200 {
+		t.Fatalf("short hours = %v truncated=%v", hours, truncated)
 	}
 }

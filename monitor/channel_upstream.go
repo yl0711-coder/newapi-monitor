@@ -1654,12 +1654,27 @@ func aicodeWithEndpoint(baseURL, endpoint string) string {
 }
 
 func newUpstreamHTTPClient(timeout time.Duration) *http.Client {
+	return newUpstreamHTTPClientWithHeaderTimeout(timeout, timeout)
+}
+
+// newMonitorUpstreamHTTPClient is the shared pool for balance and usage calls.
+// Balance requests keep the short total timeout; the usage copy raises only
+// Client.Timeout, so the transport's header wait must allow the usage timeout
+// too, or slow log queries still fail at the balance timeout.
+func newMonitorUpstreamHTTPClient(s Settings) *http.Client {
+	return newUpstreamHTTPClientWithHeaderTimeout(upstreamSyncTimeout(s), upstreamUsageRequestTimeout(s))
+}
+
+func newUpstreamHTTPClientWithHeaderTimeout(timeout, headerTimeout time.Duration) *http.Client {
+	if headerTimeout < timeout {
+		headerTimeout = timeout
+	}
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.MaxIdleConns = 8
 	transport.MaxIdleConnsPerHost = 2
 	transport.IdleConnTimeout = 60 * time.Second
 	transport.TLSHandshakeTimeout = 8 * time.Second
-	transport.ResponseHeaderTimeout = timeout
+	transport.ResponseHeaderTimeout = headerTimeout
 	return &http.Client{
 		Timeout:   timeout,
 		Transport: transport,
@@ -1696,7 +1711,7 @@ func (m *Monitor) channelUpstreamHTTPClient() *http.Client {
 	client := m.upstreamClient
 	if client == nil {
 		// 仅兼容直接构造 Monitor 的单元测试；生产实例均由 New 初始化并复用连接池。
-		client = newUpstreamHTTPClient(upstreamSyncTimeout(m.cfg))
+		client = newMonitorUpstreamHTTPClient(m.cfg)
 	}
 	return installUpstreamHostGuardWithConcurrency(client, m.storeDB, upstreamMaxConcurrency(m.cfg))
 }

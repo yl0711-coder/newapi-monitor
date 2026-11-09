@@ -39,7 +39,7 @@ func (m *Monitor) queuedWriteStore() *gorm.DB {
 	if m.queuedWriteFailed {
 		return m.storeDB
 	}
-	dsn := m.cfg.StorePath + "?_pragma=busy_timeout("+queuedWriteBusyTimeout+")&_pragma=journal_mode(WAL)&_pragma=temp_store(2)&_txlock=immediate"
+	dsn := m.cfg.StorePath + "?_pragma=busy_timeout(" + queuedWriteBusyTimeout + ")&_pragma=journal_mode(WAL)&_pragma=temp_store(2)&_txlock=immediate"
 	db, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})
 	if err == nil {
 		if sqlDB, dbErr := db.DB(); dbErr == nil {

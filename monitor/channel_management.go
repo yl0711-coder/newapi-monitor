@@ -168,17 +168,18 @@ type ChannelManagementMeta struct {
 }
 
 type ChannelManagementReport struct {
-	Enabled               bool                          `json:"enabled"`
-	Meta                  ChannelManagementMeta         `json:"meta"`
-	Finance               ChannelFinanceSettingsView    `json:"finance"`
-	CostClosure           ChannelCostClosureCapability  `json:"cost_closure"`
-	WebsiteGroups         []ChannelWebsiteGroupRateView `json:"website_groups"`
-	WebsiteGroupsSyncedAt int64                         `json:"website_groups_synced_at"`
-	Summary               ChannelManagementSummary      `json:"summary"`
-	Filters               ChannelManagementFilters      `json:"filters"`
-	Domains               []ChannelManagementDomain     `json:"domains"`
-	InternalAccounts      financeInternalFactStatus     `json:"internal_accounts"`
-	InternalScopeComplete bool                          `json:"internal_scope_complete"`
+	Enabled               bool                           `json:"enabled"`
+	Meta                  ChannelManagementMeta          `json:"meta"`
+	Finance               ChannelFinanceSettingsView     `json:"finance"`
+	CostClosure           ChannelCostClosureCapability   `json:"cost_closure"`
+	WebsiteGroups         []ChannelWebsiteGroupRateView  `json:"website_groups"`
+	WebsiteGroupsSyncedAt int64                          `json:"website_groups_synced_at"`
+	Summary               ChannelManagementSummary       `json:"summary"`
+	Filters               ChannelManagementFilters       `json:"filters"`
+	Domains               []ChannelManagementDomain      `json:"domains"`
+	InternalAccounts      financeInternalFactStatus      `json:"internal_accounts"`
+	InternalScopeComplete bool                           `json:"internal_scope_complete"`
+	DataWarnings          []ChannelManagementDataWarning `json:"data_warnings,omitempty"`
 }
 
 // ChannelCostClosureCapability is an explicit, read-only UI capability. The
@@ -940,14 +941,20 @@ func (m *Monitor) buildChannelManagementReport(ctx context.Context, scope stabil
 	if len(usageRows) > maxChannelManagementRows {
 		return nil, fmt.Errorf("渠道×服务分组维度超过安全上限 %d，为保证准确性已拒绝返回部分结果", maxChannelManagementRows)
 	}
+	var dataWarnings []ChannelManagementDataWarning
+	sampledKeys := make(map[channelInternalUsageKey]bool, len(usageRows))
 	for _, row := range usageRows {
 		groupName := strings.TrimSpace(row.Grp)
 		if groupName != "" && !channelBusinessGroupIncluded(businessGroupPolicies, groupName) {
 			continue
 		}
+		sampledKeys[channelInternalUsageKey{ChannelID: row.ChannelID, Group: groupName}] = true
 		if fact, ok := internalUsage[channelInternalUsageKey{ChannelID: row.ChannelID, Group: groupName}]; ok {
-			if err := subtractChannelInternalUsage(&row, fact); err != nil {
-				return nil, err
+			if shortfall, short := subtractChannelInternalUsage(&row, fact); short {
+				dataWarnings = append(dataWarnings, ChannelManagementDataWarning{
+					Kind: channelDataWarningInternalExceedsSampled, ChannelID: row.ChannelID, Group: groupName,
+					MissingRequests: shortfall.Requests, MissingTokens: shortfall.Tokens, MissingQuota: shortfall.Quota,
+				})
 			}
 		}
 		ch := channels[row.ChannelID]
@@ -972,6 +979,29 @@ func (m *Monitor) buildChannelManagementReport(ctx context.Context, scope stabil
 		ch.Groups[groupName].add(usage)
 		groupSet[groupName] = true
 	}
+	// Internal usage on a channel×group with no sampled row at all is the same
+	// defect (sampled hours missing); report it rather than dropping it.
+	for key, fact := range internalUsage {
+		if sampledKeys[key] || (key.Group != "" && !channelBusinessGroupIncluded(businessGroupPolicies, key.Group)) {
+			continue
+		}
+		if fact.Requests > 0 || fact.Tokens > 0 || fact.Quota > 0 {
+			dataWarnings = append(dataWarnings, ChannelManagementDataWarning{
+				Kind: channelDataWarningInternalExceedsSampled, ChannelID: key.ChannelID, Group: key.Group,
+				MissingRequests: fact.Requests, MissingTokens: fact.Tokens, MissingQuota: fact.Quota,
+			})
+		}
+	}
+	if err := m.locateChannelDataWarningHours(ctx, scope, internalAccounts, dataWarnings); err != nil {
+		// Locating hours is diagnostic detail only; the report stays available.
+		slog.Warn("定位渠道采样缺口小时失败", "err", err)
+	}
+	sort.Slice(dataWarnings, func(i, j int) bool {
+		if dataWarnings[i].ChannelID != dataWarnings[j].ChannelID {
+			return dataWarnings[i].ChannelID < dataWarnings[j].ChannelID
+		}
+		return dataWarnings[i].Group < dataWarnings[j].Group
+	})
 
 	domains := map[string]*channelDomainBuild{}
 	var total channelUsageAgg
@@ -1169,7 +1199,51 @@ func (m *Monitor) buildChannelManagementReport(ctx context.Context, scope stabil
 		},
 		Filters: ChannelManagementFilters{Domains: filterDomains, Vendors: filterVendors, Groups: filterGroups},
 		Domains: responseDomains, InternalAccounts: internalAccounts.SyncState, InternalScopeComplete: internalAccounts.Complete,
+		DataWarnings: dataWarnings,
 	}, nil
+}
+
+// locateChannelDataWarningHours fills in which hours are short for each warned
+// channel×group, using one bounded per-hour read of the sampled rollup.
+func (m *Monitor) locateChannelDataWarningHours(ctx context.Context, scope stabilityScope, internal financeConfiguredInternalEvidence, warnings []ChannelManagementDataWarning) error {
+	if len(warnings) == 0 {
+		return nil
+	}
+	ids := make([]int, 0, len(warnings))
+	seen := map[int]bool{}
+	for _, w := range warnings {
+		if !seen[w.ChannelID] {
+			seen[w.ChannelID] = true
+			ids = append(ids, w.ChannelID)
+		}
+	}
+	var rows []struct {
+		HourTs    int64
+		ChannelID int
+		Grp       string
+		Requests  int64
+		Tokens    int64
+		Quota     int64
+	}
+	if err := m.storeDB.WithContext(ctx).Raw(`SELECT hour_ts,channel_id,COALESCE(grp,'') grp,
+		COALESCE(SUM(success+anomaly+failed),0) requests,COALESCE(SUM(tokens),0) tokens,COALESCE(SUM(quota),0) quota
+		FROM stability_hour_samples WHERE hour_ts>=? AND hour_ts<? AND traffic_class_version IN ? AND channel_id IN ?
+		GROUP BY hour_ts,channel_id,grp LIMIT ?`, scope.FromTs, scope.ToTs, accountingTrafficVersions(), ids, maxChannelManagementRows+1).Scan(&rows).Error; err != nil {
+		return err
+	}
+	sampled := map[channelInternalUsageKey]map[int64]channelInternalUsageFact{}
+	for _, row := range rows {
+		key := channelInternalUsageKey{ChannelID: row.ChannelID, Group: strings.TrimSpace(row.Grp)}
+		if sampled[key] == nil {
+			sampled[key] = map[int64]channelInternalUsageFact{}
+		}
+		sampled[key][row.HourTs] = channelInternalUsageFact{Requests: row.Requests, Tokens: row.Tokens, Quota: row.Quota}
+	}
+	for i := range warnings {
+		key := channelInternalUsageKey{ChannelID: warnings[i].ChannelID, Group: warnings[i].Group}
+		warnings[i].Hours, warnings[i].HoursTruncated = channelInternalShortfallHours(internal, sampled[key], key.ChannelID, key.Group)
+	}
+	return nil
 }
 
 func (m *Monitor) serveChannelManagementReport(c *gin.Context) {

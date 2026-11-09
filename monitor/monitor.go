@@ -467,7 +467,7 @@ func New(s Settings) (*Monitor, error) {
 		chNames:                      map[string]string{},
 		snapCache:                    map[snapshotCacheKey]cachedSnap{},
 		usageCache:                   newUsageResultCache(s),
-		upstreamClient:               newUpstreamHTTPClient(upstreamSyncTimeout(s)),
+		upstreamClient:               newMonitorUpstreamHTTPClient(s),
 		cloudWatchLogs:               newCloudWatchLogsRuntime(s.CloudWatchLogsEnabled, nil),
 		upstreamCredentialPersistent: credentialSecretConfigured,
 		sourceFailureNotify:          make(chan struct{}, 1),

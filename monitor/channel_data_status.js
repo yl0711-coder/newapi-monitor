@@ -98,6 +98,10 @@ function issues(report){
 		const detail=report.internal_scope_complete===false?'所选区间内部账号用量依据未齐':'所选区间内部账号覆盖状态待确认';
 		rows.push({scope:'内部账号过滤',detail:detail+'；全局同步进度不代表所选区间的成本已核验。'});
 	}
+  for(const w of report?.data_warnings||[]){
+    const hours=(w.hours||[]).map(h=>time(h)).join('、');
+    rows.push({scope:`渠道 #${w.channel_id} · ${w.group||'未标记服务分组'}`,detail:`内部账号用量比渠道采样多 ${w.missing_requests||0} 次请求、${w.missing_tokens||0} Tokens，说明这段时间渠道采样缺失；该行已按 0 显示，实际用量偏低。${hours?'缺口小时：'+hours+(w.hours_truncated?' 等':'')+'。':''}需要补采这些小时。`});
+  }
   if(!coverage||coverage.complete!==true||coverage.provisional_seconds>0){
     const detail=coverage?`已确认 ${coverage.completed_hours||0}/${coverage.expected_hours||0} 小时；缺少 ${coverage.missing_hours||0} 小时`:'覆盖状态未返回';
     const pending=coverage?.latest_hour_pending?`；最新小时 ${time(coverage.pending_hour_ts)} 尚在汇总，并非已确认丢失`:'';
@@ -137,7 +141,8 @@ function issues(report){
   return rows;
 }
 function note(report){
-  const warning=issues(report).length?'金额及用量按现有记录统计，后续可能更新。':'';
+  const gaps=(report?.data_warnings||[]).length;
+  const warning=(gaps?`有 ${gaps} 个渠道×分组的采样数据缺失（内部账号用量多于渠道采样），相关用量偏低，明细见数据同步状态。`:'')+(issues(report).length?'金额及用量按现有记录统计，后续可能更新。':'');
   return `<p class="cm-data-note">${warning}<a href="#tab=sync">查看数据同步状态</a></p>`;
 }
 function render(report){

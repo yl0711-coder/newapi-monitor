@@ -3,6 +3,8 @@ package monitor
 import (
 	"context"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -127,4 +129,31 @@ func TestUpstreamUsageRequestTimeout(t *testing.T) {
 	if op := upstreamUsageOperationTimeout(Settings{}); op < 2*upstreamUsageRequestTimeout(Settings{}) {
 		t.Fatalf("tail operation timeout %v shorter than two usage requests", op)
 	}
+}
+
+// The usage client is a copy of the shared pool with a longer Client.Timeout.
+// The pool's transport header wait must not cut a slow log query at the
+// balance timeout ("timeout awaiting response headers").
+func TestUsageClientWaitsPastBalanceTimeoutForHeaders(t *testing.T) {
+	s := Settings{UpstreamSyncTimeoutSec: 3, UpstreamUsageTimeoutSec: 6}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		time.Sleep(4 * time.Second)
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer server.Close()
+	balance := newMonitorUpstreamHTTPClient(s)
+	if transport, ok := balance.Transport.(*http.Transport); !ok || transport.ResponseHeaderTimeout != upstreamUsageRequestTimeout(s) {
+		t.Fatalf("shared transport header timeout must allow usage requests")
+	}
+	if resp, err := balance.Get(server.URL); err == nil {
+		resp.Body.Close()
+		t.Fatal("balance requests must keep the short total timeout")
+	}
+	usage := *balance
+	usage.Timeout = upstreamUsageRequestTimeout(s)
+	resp, err := usage.Get(server.URL)
+	if err != nil {
+		t.Fatalf("slow usage query must succeed within the usage timeout: %v", err)
+	}
+	resp.Body.Close()
 }
