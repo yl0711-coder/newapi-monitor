@@ -41,7 +41,7 @@ python3 -m unittest discover -s dev -p 'test_ecs_task*.py' -v > "$acceptance_dir
 python3 -m unittest discover -s dev -p 'test_ecs_acceptance*.py' -v > "$acceptance_dir/template-iam.log" 2>&1
 python3 -m unittest discover -s dev -p 'test_ecs_split*.py' -v > "$acceptance_dir/split-preparation.log" 2>&1
 node --test dev/tests/*.test.mjs > "$acceptance_dir/frontend.log" 2>&1
-go test -list . ./monitor | node dev/check-race-shards.mjs > "$acceptance_dir/test-shards.log"
+go test -race -list . ./monitor | node dev/race-plan.mjs monitor --verify > "$acceptance_dir/test-shards.log"
 git diff --check
 git -C "$reject_repo" diff --check
 echo 'Local process acceptance PASSED. This does not approve production, real IAM, external recovery, or image security.'

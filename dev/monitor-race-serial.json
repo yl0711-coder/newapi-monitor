@@ -1,0 +1,7 @@
+{
+ "format_version": 1,
+ "note": "Race tests that assert behaviour bounded by real wall-clock budgets and fail under CPU contention. They run alone in the serial race job. Add a test only with evidence (repeated failures under parallel load that pass alone); see docs/CI-规范.md.",
+ "tests": [
+  "TestTokenReviewReplayFailureAndAtomicCompleteness"
+ ]
+}

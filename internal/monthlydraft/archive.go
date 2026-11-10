@@ -55,6 +55,10 @@ type archiveEntry struct {
 // No SQL writes, eviction, activation, or production hooks are performed.
 // Failed copies remain private and incomplete; retries create fresh directories
 // rather than overwrite/resume files of uncertain provenance.
+// archiveOperationTimeout bounds one archive copy or verification. A variable
+// only so race-detector tests of the maximum record bound can widen it.
+var archiveOperationTimeout = 30 * time.Second
+
 func CopyGenerationArchive(parent context.Context, db *sql.DB, directory, expectedSnapshot string, asOf time.Time) (ArchiveReceipt, error) {
 	return copyGenerationArchive(parent, db, directory, expectedSnapshot, asOf, writeArchiveFile)
 }
@@ -72,7 +76,7 @@ func copyGenerationArchive(parent context.Context, db *sql.DB, directory, expect
 	default:
 		return ArchiveReceipt{}, ErrGenerationBusy
 	}
-	ctx, cancel := context.WithTimeout(parent, 30*time.Second)
+	ctx, cancel := context.WithTimeout(parent, archiveOperationTimeout)
 	defer cancel()
 	root, err := openArchiveRoot(directory)
 	if err != nil {
@@ -195,7 +199,7 @@ func VerifyGenerationArchive(parent context.Context, receipt ArchiveReceipt) err
 	default:
 		return ErrGenerationBusy
 	}
-	ctx, cancel := context.WithTimeout(parent, 30*time.Second)
+	ctx, cancel := context.WithTimeout(parent, archiveOperationTimeout)
 	defer cancel()
 	root, err := openArchiveRoot(receipt.Directory)
 	if err != nil {

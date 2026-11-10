@@ -20,6 +20,10 @@ const retentionReviewAge = 30 * 24 * time.Hour // LOCAL proposal, not a producti
 
 var retentionInspectionSlots = make(chan struct{}, 1)
 
+// retentionInspectionTimeout bounds one receiver inspection snapshot. A
+// variable only so race-detector tests of the maximum record bound can widen it.
+var retentionInspectionTimeout = 5 * time.Second
+
 // RetentionInspection is an INTERNAL read-only inventory. It contains no money,
 // usernames, paths, raw logs or lease tokens. A copy candidate is NOT permission
 // to delete, publish or restore anything. Source evidence is not re-audited.
@@ -76,7 +80,7 @@ func InspectGenerationRetention(parent context.Context, db *sql.DB, asOf time.Ti
 	default:
 		return RetentionInspection{}, ErrGenerationBusy
 	}
-	ctx, cancel := context.WithTimeout(parent, 5*time.Second)
+	ctx, cancel := context.WithTimeout(parent, retentionInspectionTimeout)
 	defer cancel()
 	conn, err := db.Conn(ctx)
 	if err != nil {
