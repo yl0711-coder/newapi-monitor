@@ -95,7 +95,7 @@ func TestTokenRuntimeRetainedSnapshotConcurrentProgress(t *testing.T) {
 						// scheduler, plus the actual deadline and durable release.
 						var state TokenDetectionState
 						if readErr := m.tokenReadStore().First(&state).Error; readErr != nil || state.LeaseUntil != 0 || state.LeaseToken != "" || state.LastReason != "local_detection_incomplete" {
-							workers <- fmt.Errorf("partial detection release failed: %v", readErr)
+							workers <- fmt.Errorf("partial detection release failed: %w", readErr)
 							return
 						}
 						budgetYields.Add(1)

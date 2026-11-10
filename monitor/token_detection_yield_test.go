@@ -29,7 +29,11 @@ func TestTokenDetectionLearnedBatchYieldsWhenRowsBecomeExpensive(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	defer m.tokenStore().Callback().Create().Remove("new_expensive_detection_rows")
+	defer func() {
+		if err := m.tokenStore().Callback().Create().Remove("new_expensive_detection_rows"); err != nil {
+			t.Error(err)
+		}
+	}()
 	ctx, cancel := context.WithCancel(context.Background())
 	type outcome struct {
 		processed int

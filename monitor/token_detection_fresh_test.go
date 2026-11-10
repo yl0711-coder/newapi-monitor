@@ -2,8 +2,6 @@ package monitor
 
 import (
 	"testing"
-
-	"gorm.io/gorm"
 )
 
 func TestTokenDetectionFreshBacklogMakesProgressAtBothEnds(t *testing.T) {
@@ -67,7 +65,7 @@ func TestTokenDetectionFreshBacklogMakesProgressAtBothEnds(t *testing.T) {
 		t.Fatal(err)
 	}
 	check()
-	if err := m.tokenStore().Transaction(func(tx *gorm.DB) error { return initTokenDetectionReportIndex(tx) }); err != nil {
+	if err := m.tokenStore().Transaction(initTokenDetectionReportIndex); err != nil {
 		t.Fatal(err)
 	}
 	check() // Reopened projections do not reset or hide either end.

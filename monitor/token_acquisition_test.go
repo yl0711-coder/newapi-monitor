@@ -73,7 +73,7 @@ func TestTokenAcquisitionDiscoveryCommittedPrefix(t *testing.T) {
 	}
 	rows[0].Changed = false
 	at, id, ok = tokenDetectionRecentCommittedPrefix(rows, jobs[1:])
-	if !ok || id != 250 {
+	if !ok || at != 100 || id != 250 {
 		t.Fatal("unchanged prefix not traversed")
 	}
 	at, id, ok = tokenDetectionRecentCommittedPrefix(rows[:200], jobs)

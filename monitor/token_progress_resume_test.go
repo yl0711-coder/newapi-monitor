@@ -83,9 +83,9 @@ func TestTokenMeteringLocalBudgetCommitsPrefixAndResumes(t *testing.T) {
 }
 
 func TestTokenDetectionMaintenanceCatchesNewArrivals(t *testing.T) {
-	m, now, _ := detectionFixture(t)
+	m, _, _ := detectionFixture(t)
 	defer m.Close()
-	now = time.Now().Unix()
+	now := time.Now().Unix()
 	m.cfg.TokenFactsEnabled = false
 	m.cfg.TokenProcessingBatchRows, m.cfg.TokenProcessingPollSeconds = 250, 10
 	base := detectionFact(t, m, 1, now-600, 3, 20000, 0, 0)

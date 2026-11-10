@@ -96,7 +96,7 @@ func TestTokenMaintenanceDetectionContinuesDuringCleanupRead(t *testing.T) {
 			t.Error("cleanup did not honor its independent deadline")
 		}
 		m.tokenDetectionMu.Lock()
-		m.tokenDetectionMu.Unlock()
+		defer m.tokenDetectionMu.Unlock()
 		_ = m.tokenReadStore().Callback().Query().Remove("slow_cleanup_read")
 	}()
 	// The first detection round completes before cleanup's ten-second tick.

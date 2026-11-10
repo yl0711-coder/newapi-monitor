@@ -37,7 +37,11 @@ func TestTokenDetectionBudgetYieldContinuesBacklogWithoutIdlePoll(t *testing.T) 
 	}); err != nil {
 		t.Fatal(err)
 	}
-	defer m.tokenStore().Callback().Create().Remove("budget_detection_cost")
+	defer func() {
+		if err := m.tokenStore().Callback().Create().Remove("budget_detection_cost"); err != nil {
+			t.Error(err)
+		}
+	}()
 	if err := m.tokenStore().Callback().Update().Before("gorm:update").Register("budget_detection_round", func(tx *gorm.DB) {
 		if tx.Statement.Table != "token_detection_states" {
 			return
@@ -65,7 +69,11 @@ func TestTokenDetectionBudgetYieldContinuesBacklogWithoutIdlePoll(t *testing.T) 
 	}); err != nil {
 		t.Fatal(err)
 	}
-	defer m.tokenStore().Callback().Update().Remove("budget_detection_round")
+	defer func() {
+		if err := m.tokenStore().Callback().Update().Remove("budget_detection_round"); err != nil {
+			t.Error(err)
+		}
+	}()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer func() {
 		cancel()
@@ -118,7 +126,11 @@ func TestTokenDetectionTimeBudgetReportsRemainingWork(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	defer m.tokenStore().Callback().Create().Remove("bounded_detection_cost")
+	defer func() {
+		if err := m.tokenStore().Callback().Create().Remove("bounded_detection_cost"); err != nil {
+			t.Error(err)
+		}
+	}()
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 	processed, remaining, err := m.runTokenDetectionRoundProgress(ctx, now)
@@ -128,6 +140,19 @@ func TestTokenDetectionTimeBudgetReportsRemainingWork(t *testing.T) {
 	var persisted int64
 	if err := m.tokenStore().Model(&TokenDetectionCurrent{}).Count(&persisted).Error; err != nil || persisted != int64(processed) {
 		t.Fatal("progress includes uncommitted results", persisted, processed, err)
+	}
+	var state TokenDetectionState
+	if err := m.tokenStore().First(&state).Error; err != nil || state.LastReason != "" || state.LastFailed != 0 || state.LeaseToken != "" {
+		t.Fatal("a cooperative yield became a failure or retained its lease", state, err)
+	}
+	if err := m.tokenStore().Callback().Create().Remove("bounded_detection_cost"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.runTokenDetectionRound(context.Background(), now+1); err != nil {
+		t.Fatal("committed prefix did not resume", err)
+	}
+	if err := m.tokenStore().Model(&TokenDetectionCurrent{}).Count(&persisted).Error; err != nil || persisted != 40 {
+		t.Fatal("remaining identities were lost after a cooperative yield", persisted, err)
 	}
 }
 

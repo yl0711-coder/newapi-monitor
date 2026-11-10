@@ -111,7 +111,7 @@ func initTokenReportSummaryStore(tx *gorm.DB) error {
 func tokenReportSummaryRange(db *gorm.DB, q tokenDetectionQuery) *gorm.DB {
 	ready, err := tokenReportEntriesReady(db)
 	if err != nil {
-		db.AddError(err)
+		_ = db.AddError(err)
 	}
 	if ready && db.Migrator().HasTable(tokenReportSummaryTable) {
 		// Keep the existing filter predicates, including their head alias, exact.

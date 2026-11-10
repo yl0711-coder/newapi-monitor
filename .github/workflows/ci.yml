@@ -210,17 +210,27 @@ jobs:
       matrix:
         include:
           - shard: a-b
-            pattern: '^Test([A-B]|Nginx)'
+            pattern: '^Test[A-B]'
+          - shard: nginx
+            pattern: '^TestNginx'
           - shard: c-channel
             pattern: '^Test(Channel|Sub2)'
           - shard: c-other
             pattern: '^Test(C|Model)'
-            skip: '^TestChannel'
+            skip: '^Test(Channel|CloudWatch|Customer)'
+          - shard: c-cloudwatch
+            pattern: '^TestCloudWatch'
+          - shard: c-customer
+            pattern: '^TestCustomer'
           - shard: d-e
-            pattern: '^Test([D-E]|Upstream)'
+            pattern: '^Test[D-E]'
+          - shard: upstream
+            pattern: '^TestUpstream'
           - shard: f-other
             pattern: '^TestF'
-            skip: '^TestFinanceGift'
+            skip: '^TestFinance(Gift|Recharge)'
+          - shard: f-recharge
+            pattern: '^TestFinanceRecharge'
           - shard: f-gift-other
             pattern: '^TestFinanceGift'
             skip: '^TestFinanceGift(Scope|Handoff|Large|Live|Progress)'
@@ -228,17 +238,43 @@ jobs:
             pattern: '^TestFinanceGift(Handoff|Large)'
           - shard: f-gift-scope
             pattern: '^TestFinanceGift(Scope|Live|Progress)'
-          - shard: g-n
-            pattern: '^Test[G-N]'
-            skip: '^Test(Nginx|Model)'
+          - shard: g-l
+            pattern: '^Test([G-H]|[J-L])'
+          - shard: i
+            pattern: '^TestI'
+          - shard: m-n
+            pattern: '^Test[M-N]'
+            skip: '^Test(Nginx|Model|Monthly)'
+          - shard: monthly-a-m
+            pattern: '^TestMonthly[A-M]'
+          - shard: monthly-other
+            pattern: '^TestMonthly'
+            skip: '^TestMonthly[A-M]'
           - shard: o-r
             pattern: '^Test[O-R]'
+            skip: '^TestPortal'
+          - shard: portal
+            pattern: '^TestPortal'
           - shard: s
             pattern: '^TestS'
             skip: '^TestSub2'
           - shard: t-z
             pattern: '^(Test[T-Z]|Test[^A-Z]|Test$|Example|Fuzz)'
-            skip: '^TestUpstream'
+            skip: '^Test(Upstream|Token)'
+          - shard: token-detection-a-c
+            pattern: '^TestTokenDetection[A-C]'
+          - shard: token-detection-d-i
+            pattern: '^TestTokenDetection[D-I]'
+          - shard: token-detection-j-r
+            pattern: '^TestTokenDetection[J-R]'
+          - shard: token-detection-other
+            pattern: '^TestTokenDetection'
+            skip: '^TestTokenDetection[A-R]'
+          - shard: token-metering
+            pattern: '^TestTokenMetering'
+          - shard: token-other
+            pattern: '^TestToken'
+            skip: '^TestToken(Detection|Metering)'
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5

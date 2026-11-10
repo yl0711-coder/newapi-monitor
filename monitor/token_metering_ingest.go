@@ -132,7 +132,7 @@ func readTokenMeteringFrontier(tx *gorm.DB, epoch string) (*tokenMeteringFrontie
 
 func (f *tokenMeteringFrontier) delay(now int64) time.Duration {
 	sealed := (now - tokenMeteringLagSeconds) / tokenMeteringWindowSeconds * tokenMeteringWindowSeconds
-	delay := time.Minute
+	var delay time.Duration
 	if f.ScanThrough < sealed {
 		if f.NextAt <= now {
 			delay = 2 * time.Second
@@ -248,7 +248,7 @@ func (m *Monitor) tokenMeteringRoundDelay(ctx context.Context, pages int, runErr
 		// idle time to that independent work. A replay can spend the entire
 		// round before the forward lane gets a slot. Joined local/persistence
 		// errors and gate failures keep the existing slow cadence.
-		sourceErr, sourceOnly := runErr.(*tokenMeteringReadError)
+		sourceErr, sourceOnly := runErr.(*tokenMeteringReadError) //nolint:errorlint // Joined persistence failures must not receive the source-only fast retry cadence.
 		if !sourceOnly || !sourceErr.queryStarted {
 			return time.Minute
 		}
@@ -574,7 +574,7 @@ func (m *Monitor) runTokenMeteringRound(parent context.Context, at time.Time) (p
 		var readErr error
 		observedAt, nextPageRows := now, pageRows
 		nextSuccessPages, nextWorstMS := window.ReadSuccessPages, window.ReadWorstMS
-		expiresAt := time.Time{}
+		var expiresAt time.Time
 		cachedFailureReason := ""
 		cached := m.takeTokenMeteringCachedRead(window, now)
 		if cached != nil {

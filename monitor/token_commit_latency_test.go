@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"database/sql/driver"
+	"errors"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -48,13 +49,11 @@ func (c *tokenCommitLatencyConn) QueryContext(ctx context.Context, query string,
 }
 
 func (c *tokenCommitLatencyConn) BeginTx(ctx context.Context, opts driver.TxOptions) (driver.Tx, error) {
-	var tx driver.Tx
-	var err error
-	if begin, ok := c.Conn.(driver.ConnBeginTx); ok {
-		tx, err = begin.BeginTx(ctx, opts)
-	} else {
-		tx, err = c.Conn.Begin()
+	begin, ok := c.Conn.(driver.ConnBeginTx)
+	if !ok {
+		return nil, errors.New("commit latency fixture requires context-aware transactions")
 	}
+	tx, err := begin.BeginTx(ctx, opts)
 	if err != nil {
 		return nil, err
 	}
@@ -237,7 +236,11 @@ func TestTokenCheapAssociationSharesCommitBeforeCollectionHandoff(t *testing.T) 
 	}); err != nil {
 		t.Fatal(err)
 	}
-	defer m.tokenStore().Callback().Update().Remove("queue_during_cheap_association")
+	defer func() {
+		if err := m.tokenStore().Callback().Update().Remove("queue_during_cheap_association"); err != nil {
+			t.Error(err)
+		}
+	}()
 	n, _, err := m.linkTokenMeteringBatchProgress(context.Background(), now)
 	if err != nil {
 		t.Fatal(err)

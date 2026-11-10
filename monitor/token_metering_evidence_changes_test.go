@@ -38,7 +38,11 @@ func TestTokenEvidenceChangeBatchesWakeCommits(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	defer m.storeDB.Callback().Update().Remove("evidence_cursor_budget")
+	defer func() {
+		if err := m.storeDB.Callback().Update().Remove("evidence_cursor_budget"); err != nil {
+			t.Error(err)
+		}
+	}()
 	if _, err := m.refreshTokenMeteringEvidence(context.Background(), now); err != nil {
 		t.Fatal(err)
 	}

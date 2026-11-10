@@ -60,9 +60,11 @@ func TestTokenDetectionSealedWindowSuffixSurvivesLargeNewerWindow(t *testing.T) 
 				t.Fatal(err)
 			}
 			previous, newer, history := 0, 0, 0
-			// Latest work now leads. The historical suffix keeps its reservation
-			// and drains within twelve bounded prefixes, including restarts.
-			for turn := 0; turn < 12; turn++ {
+			// This carry window is older than the latest fifteen-minute range.
+			// Latest work leads while that range is busy; the old suffix keeps
+			// making progress and drains once the 600 newer identities finish.
+			// Twelve prefixes cannot drain 64 old rows at the reserved share.
+			for turn := 0; turn < 32 && previous < 64; turn++ {
 				jobs, err := tokenDetectionJobsBounded(m.tokenReadStore(), base.SourceEpoch, hash, now, 250, 15)
 				if err != nil || len(jobs) != 250 {
 					t.Fatal("fixture needs a full retained queue", len(jobs), err)
@@ -88,6 +90,9 @@ func TestTokenDetectionSealedWindowSuffixSurvivesLargeNewerWindow(t *testing.T) 
 					return nil
 				}); err != nil {
 					t.Fatal(err)
+				}
+				if turn == 11 && (previous == 0 || history == 0 || newer <= previous) {
+					t.Fatal("latest priority or a historical reservation was lost", previous, newer, history)
 				}
 			}
 			var pending int64

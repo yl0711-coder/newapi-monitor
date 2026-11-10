@@ -76,7 +76,11 @@ func TestTokenDetectionDueCoveredQueueMatchesAuthoritativeFacts(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	defer db.Callback().Row().Remove("capture_due_covered")
+	defer func() {
+		if err := db.Callback().Row().Remove("capture_due_covered"); err != nil {
+			t.Error(err)
+		}
+	}()
 	verify := func(db *gorm.DB) {
 		t.Helper()
 		for _, limit := range []int{1, 250} {

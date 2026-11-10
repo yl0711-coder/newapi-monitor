@@ -325,7 +325,7 @@ func parseTokenMetering(s Settings, r tokenMeteringRaw, now int64) (TokenMeterin
 		p.Fields["request_method"] = metering.Field{State: "missing", Reason: requestMethodState}
 	}
 	// Presence-only blocker: never retain task IDs, fee payloads or audit text.
-	for _, key := range []string{"task_id", "audio_tokens", "image_tokens", "web_search", "file_search", "tool_usage", "quota_clamp", "pre_consume_fallback", "audio", "ws", "audio_input_seperate_price", "fixed_price", "billing_tokens", "image_cache_tokens"} {
+	for _, key := range []string{"task_id", "audio_tokens", "image_tokens", "web_search", "file_search", "tool_usage", "quota_clamp", "pre_consume_fallback", "audio", "ws", "audio_input_seperate_price", "fixed_price", "billing_tokens", "image_cache_tokens"} { //nolint:misspell // Preserve the original upstream JSON field name.
 		if _, present := other[key]; present {
 			p.Fields["unsupported_cost_context"] = metering.Field{State: "invalid", Reason: "special_cost_present"}
 		}

@@ -226,12 +226,9 @@ func (m *Monitor) tokenMeteringHealth(ctx context.Context, epoch string, now int
 			if err := tx.Model(&TokenMeteringFact{}).Where("source_epoch = ? AND link_next_at > 0", epoch).Count(&h.PendingLinks).Error; err != nil {
 				return err
 			}
-		} else {
-			// A counter table exists but its rebuild has not published the
-			// ready marker.  Do not mix direct scans with a partial ledger: the
-			// response remains explicitly rebuilding/unavailable instead of
-			// presenting a plausible subset as the health total.
 		}
+		// Existing counters without a ready marker remain rebuilding/unavailable;
+		// do not mix a direct facts scan with their partial ledger.
 		if err := tx.Model(&TokenMeteringWindow{}).Where("source_epoch = ? AND last_reason != ''", epoch).Count(&h.FailedWindows).Error; err != nil {
 			return err
 		}

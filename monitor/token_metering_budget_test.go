@@ -187,14 +187,18 @@ func TestTokenMeteringLocalCommitsDoNotSpendSourceReadBudget(t *testing.T) {
 			return
 		}
 		if deadline, ok := tx.Statement.Context.Deadline(); !ok || time.Until(deadline) > 2*time.Second {
-			tx.AddError(errors.New("local commit lost its two-second budget"))
+			_ = tx.AddError(errors.New("local commit lost its two-second budget"))
 			return
 		}
 		time.Sleep(600 * time.Millisecond)
 	}); err != nil {
 		t.Fatal(err)
 	}
-	defer m.tokenStore().Callback().Create().Remove("source_budget_local_commit")
+	defer func() {
+		if err := m.tokenStore().Callback().Create().Remove("source_budget_local_commit"); err != nil {
+			t.Error(err)
+		}
+	}()
 	pages, err := m.runTokenMeteringRound(context.Background(), time.Unix(now, 0))
 	if err != nil || pages < 2 || pages > 3 || source.queries != pages {
 		t.Fatal("local commits consumed the next source read's allowance", pages, source.queries, err)
@@ -248,7 +252,7 @@ func tokenMeteringRoundReadSuffixCheck(t *testing.T, queueHeadroom time.Duration
 		}
 		deadline, ok := tx.Statement.Context.Deadline()
 		if !ok || time.Until(deadline) > 2*time.Second {
-			tx.AddError(errors.New("local turn lost its two-second deadline"))
+			_ = tx.AddError(errors.New("local turn lost its two-second deadline"))
 			return
 		}
 		workers.Add(1)
@@ -269,7 +273,11 @@ func tokenMeteringRoundReadSuffixCheck(t *testing.T, queueHeadroom time.Duration
 	}); err != nil {
 		t.Fatal(err)
 	}
-	defer m.tokenStore().Callback().Create().Remove("read_suffix_queue")
+	defer func() {
+		if err := m.tokenStore().Callback().Create().Remove("read_suffix_queue"); err != nil {
+			t.Error(err)
+		}
+	}()
 	pages, err := m.runTokenMeteringRound(ctx, time.Unix(now, 0))
 	state := tokenMeteringStateRead(t, m)
 	if err != nil || pages != 1 || state.FactCount <= 0 || state.FactCount >= 120 || m.tokenMeteringReadCache == nil {
@@ -401,7 +409,11 @@ func tokenMeteringQueuedPageCheck(t *testing.T, count int64, hold time.Duration,
 	}); err != nil {
 		t.Fatal(err)
 	}
-	defer m.tokenStore().Callback().Create().Remove("contended_page")
+	defer func() {
+		if err := m.tokenStore().Callback().Create().Remove("contended_page"); err != nil {
+			t.Error(err)
+		}
+	}()
 	written, err := m.commitTokenMeteringReadPage(ctx, state.LeaseToken, w, raw, facts, refs, true, now)
 	if err != nil || written != len(raw) {
 		t.Fatalf("queue wait prevented a cheap complete page: written=%d error=%v", written, err)
@@ -451,7 +463,7 @@ func TestTokenMeteringResumedPageReusesSafeWriteSizeWithoutPublishingFailedRows(
 	if err := m.tokenStore().Callback().Create().Before("gorm:create").Register("resumed_page_failure", func(tx *gorm.DB) {
 		if tx.Statement.Table == "token_metering_facts" {
 			attemptedRows = tx.Statement.ReflectValue.Len()
-			tx.AddError(errors.New("injected resumed transaction failure"))
+			_ = tx.AddError(errors.New("injected resumed transaction failure"))
 		}
 	}); err != nil {
 		t.Fatal(err)
@@ -499,12 +511,16 @@ func TestTokenMeteringLearnedWriteSizeShrinksAfterTransactionTimeout(t *testing.
 	if err := m.tokenStore().Callback().Create().Before("gorm:create").Register("dense_page_timeout", func(tx *gorm.DB) {
 		if tx.Statement.Table == "token_metering_facts" && tx.Statement.ReflectValue.Len() > 16 {
 			<-tx.Statement.Context.Done()
-			tx.AddError(tx.Statement.Context.Err())
+			_ = tx.AddError(tx.Statement.Context.Err())
 		}
 	}); err != nil {
 		t.Fatal(err)
 	}
-	defer m.tokenStore().Callback().Create().Remove("dense_page_timeout")
+	defer func() {
+		if err := m.tokenStore().Callback().Create().Remove("dense_page_timeout"); err != nil {
+			t.Error(err)
+		}
+	}()
 	if n, err := m.commitTokenMeteringReadPage(ctx, state.LeaseToken, w, raw, facts, refs, true, now); n != 0 || !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatal("expected atomic rollback of expensive learned batch", n, err)
 	}
@@ -537,7 +553,11 @@ func TestTokenMeteringFailureCheckpointSurvivesNearlySpentRound(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	defer m.storeDB.Callback().Update().Remove("failure_checkpoint_local_work")
+	defer func() {
+		if err := m.storeDB.Callback().Update().Remove("failure_checkpoint_local_work"); err != nil {
+			t.Error(err)
+		}
+	}()
 	ctx, stop := context.WithTimeout(context.Background(), 75*time.Millisecond)
 	defer stop()
 	if err := m.failTokenMeteringWindow(ctx, state.LeaseToken, w, now, "source_read_failed", 128); err != nil {
@@ -569,7 +589,7 @@ func TestTokenMeteringCommitProgressWithCostlyRetainedWrites(t *testing.T) {
 			return
 		}
 		if deadline, ok := tx.Statement.Context.Deadline(); !ok || time.Until(deadline) > 2*time.Second {
-			tx.AddError(errors.New("costly write lost its two-second budget"))
+			_ = tx.AddError(errors.New("costly write lost its two-second budget"))
 			return
 		}
 		timer := time.NewTimer(time.Duration(tx.Statement.ReflectValue.Len()) * 40 * time.Millisecond)
@@ -577,7 +597,7 @@ func TestTokenMeteringCommitProgressWithCostlyRetainedWrites(t *testing.T) {
 		select {
 		case <-timer.C:
 		case <-tx.Statement.Context.Done():
-			tx.AddError(tx.Statement.Context.Err())
+			_ = tx.AddError(tx.Statement.Context.Err())
 		}
 	}); err != nil {
 		t.Fatal(err)
@@ -630,10 +650,10 @@ func TestTokenMeteringAmortizesBoundedTransactionLatency(t *testing.T) {
 		}
 		transactions++
 		if tx.Statement.ReflectValue.Len() > 64 {
-			tx.AddError(errors.New("source commit exceeded its existing 64-row cap"))
+			_ = tx.AddError(errors.New("source commit exceeded its existing 64-row cap"))
 		}
 		if deadline, ok := tx.Statement.Context.Deadline(); !ok || time.Until(deadline) > 2*time.Second {
-			tx.AddError(errors.New("source commit lost its existing two-second budget"))
+			_ = tx.AddError(errors.New("source commit lost its existing two-second budget"))
 		}
 		time.Sleep(300 * time.Millisecond)
 	}); err != nil {
@@ -690,14 +710,14 @@ func TestTokenMeteringSQLiteBudgetInterruptKeepsDurableProgress(t *testing.T) {
 				if !duringCommit {
 					var persisted int64
 					if err := tx.Session(&gorm.Session{NewDB: true}).Raw("SELECT fact_count FROM token_metering_states WHERE source_epoch=?", m.cfg.TokenFactsSourceEpoch).Scan(&persisted).Error; err != nil {
-						tx.AddError(err)
+						_ = tx.AddError(err)
 						return
 					}
 					inject = persisted == 128
 				}
 				if inject {
 					interrupted = tx.Session(&gorm.Session{NewDB: true}).Exec("WITH RECURSIVE busy(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM busy) SELECT max(n) FROM busy").Error
-					tx.AddError(interrupted)
+					_ = tx.AddError(interrupted)
 				}
 			}
 			if duringCommit {
@@ -846,7 +866,11 @@ func TestTokenMeteringCompletedReadSurvivesExpiringRoundBudget(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	defer m.storeDB.Callback().Create().Remove("test_slow_local_commit")
+	defer func() {
+		if err := m.storeDB.Callback().Create().Remove("test_slow_local_commit"); err != nil {
+			t.Error(err)
+		}
+	}()
 	pages, err := m.runTokenMeteringRound(context.Background(), time.Unix(now, 0))
 	if err != nil || pages != 1 {
 		t.Fatalf("completed read discarded: pages=%d err=%v", pages, err)
@@ -878,7 +902,7 @@ func TestTokenMeteringFailedCommitAfterRoundDeadlineDoesNotPublishProgress(t *te
 	if err := m.storeDB.Callback().Create().Before("gorm:create").Register("test_commit_timeout", func(tx *gorm.DB) {
 		if tx.Statement.Table == "token_metering_facts" {
 			<-tx.Statement.Context.Done()
-			tx.AddError(tx.Statement.Context.Err())
+			_ = tx.AddError(tx.Statement.Context.Err())
 		}
 	}); err != nil {
 		t.Fatal(err)

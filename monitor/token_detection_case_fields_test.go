@@ -11,7 +11,7 @@ import (
 func TestTokenDetectionInputComparisonDoesNotRequirePriceTTLOrMapping(t *testing.T) {
 	m, now, _ := detectionFixture(t)
 	for _, id := range []int64{1, 2, 3, 10} {
-		channel, total := int64(1+id%2), int64(10000)
+		channel, total := 1+id%2, int64(10000)
 		if id == 10 {
 			channel, total = 3, 100000
 		}

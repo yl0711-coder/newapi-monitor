@@ -31,13 +31,17 @@ func TestTokenAssociationLearnedBatchYieldsAndResumes(t *testing.T) {
 		if tx.Statement.Table == "token_metering_facts" {
 			once.Do(func() { close(entered) })
 			if !waitSourceLifecycle(tx.Statement.Context, 60*time.Millisecond) {
-				tx.AddError(tx.Statement.Context.Err())
+				_ = tx.AddError(tx.Statement.Context.Err())
 			}
 		}
 	}); err != nil {
 		t.Fatal(err)
 	}
-	defer m.tokenStore().Callback().Update().Remove("costly_association")
+	defer func() {
+		if err := m.tokenStore().Callback().Update().Remove("costly_association"); err != nil {
+			t.Error(err)
+		}
+	}()
 	ctx, cancel := context.WithCancel(context.Background())
 	type outcome struct {
 		count int

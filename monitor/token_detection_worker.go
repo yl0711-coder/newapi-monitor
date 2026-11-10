@@ -112,6 +112,8 @@ func (m *Monitor) runTokenDetectionRoundProgress(ctx context.Context, now int64)
 		// within this batch. Further changes remain durable for the next turn.
 		reprepared := map[int64]bool{}
 		lastDuration := time.Duration(0)
+		lastWriteDuration := time.Duration(0)
+		lastRows := 0
 		chunkRows := m.tokenDetectionCommitRows
 		if chunkRows == 0 {
 			chunkRows = 4
@@ -128,7 +130,14 @@ func (m *Monitor) runTokenDetectionRoundProgress(ctx context.Context, now int64)
 				runErr = errors.Join(runErr, ctx.Err())
 				break
 			}
-			if !tokenLocalWriteBudgetAvailable(ctx, lastDuration) {
+			// Preparing the next batch also spends this round's deadline. When
+			// the learned batch grows, reserve its larger cost before preparing
+			// it; the preceding transaction alone understates that next turn.
+			nextDuration := lastDuration
+			if lastRows > 0 && chunkRows > lastRows {
+				nextDuration = lastDuration * time.Duration(chunkRows) / time.Duration(lastRows)
+			}
+			if !tokenLocalWriteBudgetAvailable(ctx, nextDuration) {
 				yielded = true
 				break
 			}
@@ -146,6 +155,7 @@ func (m *Monitor) runTokenDetectionRoundProgress(ctx context.Context, now int64)
 			chunkCheckpointed := []TokenMeteringFact{}
 			var deferredErr error
 			end := min(start+chunkRows, len(jobs))
+			batchStarted := time.Now()
 			plans, planErrors, prepareErr := m.prepareTokenDetectionBatch(ctx, jobs[start:end], p, lease, now)
 			if prepareErr != nil {
 				runErr = errors.Join(runErr, prepareErr)
@@ -154,6 +164,16 @@ func (m *Monitor) runTokenDetectionRoundProgress(ctx context.Context, now int64)
 				} else {
 					failed++
 				}
+				break
+			}
+			// A slow read can consume the reservation without changing any
+			// durable result. Yield before beginning a write that cannot finish.
+			nextWriteDuration := lastWriteDuration
+			if lastRows > 0 && end-start > lastRows {
+				nextWriteDuration = lastWriteDuration * time.Duration(end-start) / time.Duration(lastRows)
+			}
+			if !tokenLocalWriteBudgetAvailable(ctx, nextWriteDuration) {
+				yielded = true
 				break
 			}
 			workBudget := m.tokenDetectionWorkBudget
@@ -170,6 +190,11 @@ func (m *Monitor) runTokenDetectionRoundProgress(ctx context.Context, now int64)
 			err := m.tokenLocalWriteTransaction(context.WithValue(ctx, tokenWriteTimingKey{}, timing), func(tx *gorm.DB) error {
 				workStarted := time.Now()
 				for offset, job := range jobs[start:end] {
+					if offset > 0 && !tokenLocalWriteBudgetAvailable(ctx, time.Since(workStarted)/time.Duration(offset)) {
+						end = start + offset
+						yielded = true
+						break
+					}
 					if err := tx.SavePoint("token_detection_job").Error; err != nil {
 						return err
 					}
@@ -279,7 +304,9 @@ func (m *Monitor) runTokenDetectionRoundProgress(ctx context.Context, now int64)
 				runErr = errors.Join(runErr, err)
 				break
 			}
-			lastDuration = time.Since(turnStarted)
+			lastWriteDuration = time.Since(turnStarted)
+			lastDuration = time.Since(batchStarted)
+			lastRows = end - start
 			checkpointedJobs = append(checkpointedJobs, chunkCheckpointed...)
 			processed += committed
 			runErr = errors.Join(runErr, deferredErr)

@@ -29,7 +29,11 @@ func TestTokenReportPendingAlignedAndPartialEdgesUseRangeSeeks(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	defer db.Callback().Row().Remove("pending_edge_plan")
+	defer func() {
+		if err := db.Callback().Row().Remove("pending_edge_plan"); err != nil {
+			t.Error(err)
+		}
+	}()
 	hash := tokenDetectionPolicyHash(detectionPolicy())
 	for _, bounds := range [][2]int64{{from, from + 1200}, {from + 7, from + 1200}, {from, from + 1193}, {from + 7, from + 1193}} {
 		q := tokenDetectionQuery{SourceEpoch: m.cfg.TokenFactsSourceEpoch, From: bounds[0], To: bounds[1]}

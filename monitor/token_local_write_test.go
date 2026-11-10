@@ -27,7 +27,11 @@ func TestTokenDetectionCostlyWritesYieldToCollection(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	defer m.tokenStore().Callback().Create().Remove("costly_detection_insert")
+	defer func() {
+		if err := m.tokenStore().Callback().Create().Remove("costly_detection_insert"); err != nil {
+			t.Error(err)
+		}
+	}()
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { _, err := m.runTokenDetectionRound(ctx, now); done <- err }()

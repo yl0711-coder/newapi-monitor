@@ -31,7 +31,11 @@ func TestTokenCleanupRemembersBatchAndAvoidsEmptyCoverageTransaction(t *testing.
 	}); err != nil {
 		t.Fatal(err)
 	}
-	defer db.Callback().Delete().Remove("observe_cleanup_batch")
+	defer func() {
+		if err := db.Callback().Delete().Remove("observe_cleanup_batch"); err != nil {
+			t.Error(err)
+		}
+	}()
 	if err := db.Callback().Query().Before("gorm:query").Register("observe_cleanup_coverage_writer", func(tx *gorm.DB) {
 		if tx.Statement.Table == "token_metering_states" && tx.Statement.Context.Value(tokenWriteOperationKey{}) == "facts_cleanup" {
 			if _, held := tx.Logger.(*tokenWriteTrace); held {
@@ -41,7 +45,11 @@ func TestTokenCleanupRemembersBatchAndAvoidsEmptyCoverageTransaction(t *testing.
 	}); err != nil {
 		t.Fatal(err)
 	}
-	defer db.Callback().Query().Remove("observe_cleanup_coverage_writer")
+	defer func() {
+		if err := db.Callback().Query().Remove("observe_cleanup_coverage_writer"); err != nil {
+			t.Error(err)
+		}
+	}()
 	if err := m.cleanupTokenMetering(context.Background(), now); err != nil {
 		t.Fatal(err)
 	}

@@ -107,7 +107,11 @@ func TestTokenDetectionRecentCorrectionsCommitBothEndsInShortRound(t *testing.T)
 	}); err != nil {
 		t.Fatal(err)
 	}
-	defer m.tokenStore().Callback().Create().Remove("short_correction_round")
+	defer func() {
+		if err := m.tokenStore().Callback().Create().Remove("short_correction_round"); err != nil {
+			t.Error(err)
+		}
+	}()
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	processed, remaining, err := m.runTokenDetectionRoundProgress(ctx, now)

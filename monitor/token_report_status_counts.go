@@ -33,7 +33,7 @@ func tokenReportUseEntryIndex(db *gorm.DB) bool {
 	}
 	ready, err := tokenReportEntriesReady(db)
 	if err != nil {
-		db.AddError(err)
+		_ = db.AddError(err)
 	}
 	return err == nil && ready
 }

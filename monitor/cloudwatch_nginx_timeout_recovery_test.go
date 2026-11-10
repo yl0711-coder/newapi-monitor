@@ -74,7 +74,7 @@ func TestCloudWatchNginxRepairTimeoutResumesNarrowedHourAfterRestart(t *testing.
 	}
 	if err := m.storeDB.Callback().Update().Before("gorm:update").Register("repair-checkpoint-failure", func(tx *gorm.DB) {
 		if tx.Statement.Table == "cloud_watch_nginx_cursors" {
-			tx.AddError(errors.New("injected repair checkpoint failure"))
+			_ = tx.AddError(errors.New("injected repair checkpoint failure"))
 		}
 	}); err != nil {
 		t.Fatal(err)
@@ -315,7 +315,7 @@ func TestCloudWatchNginxEvidenceTimeoutWriteFailureRestartRecovery(t *testing.T)
 		if tx.Statement.Table == "nginx_request_evidences" {
 			insertCalls++
 			if insertCalls == 2 {
-				tx.AddError(errors.New("injected local write failure"))
+				_ = tx.AddError(errors.New("injected local write failure"))
 			}
 		}
 	}); err != nil {

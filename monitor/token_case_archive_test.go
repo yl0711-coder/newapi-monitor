@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -71,7 +72,7 @@ func TestTokenCaseArchiveReplay(t *testing.T) {
 	policy := detectionPolicy()
 	policy.Version, policy.SizeTolerance = "case-offline-v1", 64
 	// These are archived parameters, not new production thresholds.
-	rows := append(history.Rows, controls.Rows...)
+	rows := slices.Concat(history.Rows, controls.Rows)
 	facts := make([]TokenMeteringFact, 0, len(rows))
 	refs := make(map[int64][]TokenMeteringRef, len(rows))
 	owners := map[string][]TokenMeteringRef{}

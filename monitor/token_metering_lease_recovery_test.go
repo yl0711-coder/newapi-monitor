@@ -24,14 +24,18 @@ func TestTokenMeteringActiveOwnerCannotOverlapRounds(t *testing.T) {
 				select {
 				case <-release:
 				case <-tx.Statement.Context.Done():
-					tx.AddError(tx.Statement.Context.Err())
+					_ = tx.AddError(tx.Statement.Context.Err())
 				}
 			})
 		}
 	}); err != nil {
 		t.Fatal(err)
 	}
-	defer m.storeDB.Callback().Create().Remove("hold_metering_owner")
+	defer func() {
+		if err := m.storeDB.Callback().Create().Remove("hold_metering_owner"); err != nil {
+			t.Error(err)
+		}
+	}()
 	type outcome struct {
 		pages int
 		err   error
@@ -72,7 +76,7 @@ func TestTokenMeteringCompletedOwnerResumesAfterReleaseDeadline(t *testing.T) {
 		fields, ok := tx.Statement.Dest.(map[string]any)
 		if tx.Statement.Table == "token_metering_states" && ok && len(fields) == 1 && fields["lease_until"] == 0 {
 			<-tx.Statement.Context.Done()
-			tx.AddError(tx.Statement.Context.Err())
+			_ = tx.AddError(tx.Statement.Context.Err())
 			releaseFailed = true
 		}
 	}); err != nil {

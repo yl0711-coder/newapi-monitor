@@ -237,12 +237,16 @@ func TestCustomerHealthSamplerReleasesSourceBeforeSQLite(t *testing.T) {
 		m.backgroundSourceScheduleMu.Unlock()
 		checked = true
 		if active {
-			tx.AddError(errors.New("SQLite write still holds production source slot"))
+			_ = tx.AddError(errors.New("SQLite write still holds production source slot"))
 		}
 	}); err != nil {
 		t.Fatal(err)
 	}
-	defer m.storeDB.Callback().Create().Remove("source_release_before_write")
+	defer func() {
+		if err := m.storeDB.Callback().Create().Remove("source_release_before_write"); err != nil {
+			t.Error(err)
+		}
+	}()
 	_, err := m.sampleCustomerHealthRangeLow(context.Background(), from, from+60)
 	if err != nil || !checked {
 		t.Fatal("sampler did not release before persistence", checked, err)

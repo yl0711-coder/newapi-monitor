@@ -125,7 +125,7 @@ func TestTokenCleanupAmortizesBoundedDeleteLatency(t *testing.T) {
 			return
 		}
 		if !waitSourceLifecycle(tx.Statement.Context, 60*time.Millisecond) {
-			tx.AddError(tx.Statement.Context.Err())
+			_ = tx.AddError(tx.Statement.Context.Err())
 		}
 	}); err != nil {
 		t.Fatal(err)
@@ -247,7 +247,11 @@ func TestTokenCleanupReportsOnlyCommittedEpochsWhenCollectionQueues(t *testing.T
 	}); err != nil {
 		t.Fatal(err)
 	}
-	defer db.Callback().Delete().Remove("cleanup_queue_after_first_epoch")
+	defer func() {
+		if err := db.Callback().Delete().Remove("cleanup_queue_after_first_epoch"); err != nil {
+			t.Error(err)
+		}
+	}()
 
 	if err := m.cleanupTokenMetering(context.Background(), now); err != nil {
 		t.Fatal(err)
@@ -344,7 +348,11 @@ func TestTokenCleanupIdentityDeletesUseBothPrimaryKeyColumns(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	defer db.Callback().Delete().Remove("cleanup_identity_plan")
+	defer func() {
+		if err := db.Callback().Delete().Remove("cleanup_identity_plan"); err != nil {
+			t.Error(err)
+		}
+	}()
 	// Even an expired head remains while its source fact is retained.
 	if err := m.cleanupTokenDetection(context.Background(), now); err != nil {
 		t.Fatal(err)

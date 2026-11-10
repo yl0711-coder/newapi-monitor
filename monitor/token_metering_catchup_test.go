@@ -2,7 +2,6 @@ package monitor
 
 import (
 	"context"
-	"fmt"
 	"testing"
 	"time"
 )
@@ -140,7 +139,7 @@ func TestTokenMeteringCatchupWithContinuousArrivalsAndPageRecovery(t *testing.T)
 		// Ongoing traffic is added at the newly closed edge, never overwrites IDs.
 		appendRows(20, now-tokenMeteringLagSeconds-15)
 	}
-	t.Fatal(fmt.Sprintf("continuous arrivals failed to catch up: %+v", tokenMeteringStateRead(t, m)))
+	t.Fatalf("continuous arrivals failed to catch up: %+v", tokenMeteringStateRead(t, m))
 }
 
 func TestTokenMeteringBudgetWaitIsDueButFailureBackoffIsNot(t *testing.T) {

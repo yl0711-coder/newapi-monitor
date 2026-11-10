@@ -20,7 +20,7 @@ func (s logchainFailureSource) Connect(context.Context) (driver.Conn, error) {
 	if s.phase == "connection" {
 		return nil, context.DeadlineExceeded
 	}
-	return logchainFailureConn{s.phase}, nil
+	return logchainFailureConn(s), nil
 }
 
 type logchainFailureConn struct{ phase string }

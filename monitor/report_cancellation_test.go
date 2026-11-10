@@ -33,14 +33,22 @@ func TestLocalReportsDistinguishClientCancellationFromReadFailure(t *testing.T) 
 			if err := m.storeDB.Callback().Query().Before("gorm:query").Register("report-read-failure", failRead); err != nil {
 				t.Fatal(err)
 			}
-			defer m.storeDB.Callback().Query().Remove("report-read-failure")
+			defer func() {
+				if err := m.storeDB.Callback().Query().Remove("report-read-failure"); err != nil {
+					t.Error(err)
+				}
+			}()
 			// Model statistics aggregates use Raw().Scan(), which runs the row
 			// callback. A failure only in optional channel names is not a failed
 			// facts read and correctly leaves the report available with unknown names.
 			if err := m.storeDB.Callback().Row().Before("gorm:row").Register("report-read-failure", failRead); err != nil {
 				t.Fatal(err)
 			}
-			defer m.storeDB.Callback().Row().Remove("report-read-failure")
+			defer func() {
+				if err := m.storeDB.Callback().Row().Remove("report-read-failure"); err != nil {
+					t.Error(err)
+				}
+			}()
 			for _, tc := range []struct {
 				name string
 				ctx  context.Context

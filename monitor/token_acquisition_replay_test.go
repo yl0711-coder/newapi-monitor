@@ -2,7 +2,6 @@ package monitor
 
 import (
 	"context"
-	"database/sql"
 	"encoding/json"
 	"net/http/httptest"
 	"os"
@@ -29,11 +28,6 @@ type tokenAcquisitionCapturedRow struct {
 	Stream    string          `json:"stream"`
 	UseTime   string          `json:"use_time"`
 	Other     json.RawMessage `json:"other"`
-}
-
-func (r tokenAcquisitionCapturedRow) raw() tokenMeteringRaw {
-	v := func(s string) sql.NullString { return sql.NullString{String: s, Valid: s != ""} }
-	return tokenMeteringRaw{ID: r.ID, CreatedAt: r.CreatedAt, UserID: r.UserID, ChannelID: r.ChannelID, RequestID: r.RequestID, Model: r.Model, Group: r.Group, Input: v(r.Input), Output: v(r.Output), Quota: v(r.Quota), Stream: v(r.Stream), UseTime: v(r.UseTime), Other: v(string(r.Other)), OtherBytes: int64(len(r.Other))}
 }
 
 // Replays a bounded production capture in isolated SQLite databases. This

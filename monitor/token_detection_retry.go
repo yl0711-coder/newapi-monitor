@@ -1,15 +1,8 @@
 package monitor
 
 import (
-	"context"
 	"gorm.io/gorm"
 )
-
-func (m *Monitor) deferTokenDetection(ctx context.Context, job TokenMeteringFact, policyHash, lease string, now int64) error {
-	return m.tokenStore().WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		return m.deferTokenDetectionTx(tx, job, policyHash, lease, now)
-	})
-}
 
 func (m *Monitor) deferTokenDetectionTx(tx *gorm.DB, job TokenMeteringFact, policyHash, lease string, now int64) error {
 	fence := tx.Model(&TokenDetectionState{}).Where("source_epoch = ? AND lease_token = ? AND lease_until > ?", job.SourceEpoch, lease, now).Update("policy_hash", policyHash)

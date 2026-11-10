@@ -129,7 +129,7 @@ func TestTokenCapacityUpgradeRollsBackDDL(t *testing.T) {
 	failure := errors.New("injected trigger install failure")
 	if err := db.Callback().Raw().Before("gorm:raw").Register("fail_capacity_trigger", func(tx *gorm.DB) {
 		if strings.HasPrefix(tx.Statement.SQL.String(), "CREATE TRIGGER IF NOT EXISTS token_detection_currents_capacity_UPDATE_v1") {
-			tx.AddError(failure)
+			_ = tx.AddError(failure)
 		}
 	}); err != nil {
 		t.Fatal(err)

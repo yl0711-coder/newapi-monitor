@@ -4,14 +4,16 @@ import test from 'node:test';
 import { readRaceShards, verifyRaceShards } from '../check-race-shards.mjs';
 
 const workflow = readFileSync(new URL('../../.github/workflows/ci.yml', import.meta.url), 'utf8').replace(/\r\n?/g, '\n');
-const names = ['TestAlpha', 'TestChannel', 'TestCloudWatch', 'TestDelta', 'TestEcho', 'TestFinance', 'TestFinanceGiftNewFeature', 'TestFinanceGiftHandoffNewFeature', 'TestFinanceGiftScopeNewFeature', 'TestGroup', 'TestOperations', 'TestStability', 'TestZulu', 'Test_Regression', 'Test2026', 'Test', 'Test中文', 'Example', 'ExampleMonitor', 'FuzzDecode'];
+const names = ['TestAlpha', 'TestNginx', 'TestChannel', 'TestConfig', 'TestCloudWatch', 'TestCustomer', 'TestDelta', 'TestEcho', 'TestUpstream', 'TestFinance', 'TestFinanceRecharge', 'TestFinanceGiftNewFeature', 'TestFinanceGiftHandoffNewFeature', 'TestFinanceGiftScopeNewFeature', 'TestGroup', 'TestIncident', 'TestMinute', 'TestMonthlyCoverage', 'TestMonthlyRestore', 'TestOperations', 'TestPortal', 'TestStability', 'TestZulu', 'TestTokenDetectionAmortizes', 'TestTokenDetectionFairness', 'TestTokenDetectionReference', 'TestTokenDetectionSealed', 'TestTokenMetering', 'TestTokenLatest', 'Test_Regression', 'Test2026', 'Test', 'Test中文', 'Example', 'ExampleMonitor', 'FuzzDecode'];
 
 test('actual CI matrix covers ordinary and non-letter tests, examples and fuzz seeds', () => {
-  assert.deepEqual(verifyRaceShards(workflow, names.concat('BenchmarkRead', 'ok example/monitor 0.01s').join('\n')), { tests: 20, counts: [1, 1, 1, 2, 1, 1, 1, 1, 1, 1, 1, 8] });
+  const result = verifyRaceShards(workflow, names.concat('BenchmarkRead', 'ok example/monitor 0.01s').join('\n'));
+  assert.equal(result.tests, names.length);
+  assert.equal(result.counts.reduce((total, count) => total + count, 0), names.length);
 });
 
 test('finance exclusions route tests to another shard rather than omit coverage', () => {
-  assert.throws(() => verifyRaceShards(workflow.replace("            skip: '^TestFinanceGift'\n", ''), names.join('\n')), /belongs to 2/);
+  assert.throws(() => verifyRaceShards(workflow.replace("            skip: '^TestFinance(Gift|Recharge)'\n", ''), names.join('\n')), /belongs to 2/);
   assert.throws(() => verifyRaceShards(workflow.replace("pattern: '^TestFinanceGift(Scope|Live|Progress)'", "pattern: '^TestMissingScope'"), names.join('\n')), /belongs to 0/);
   const shards = readRaceShards(workflow);
   for (const suffix of ['', 'Boundary', 'Future2027', '中文']) {
@@ -24,7 +26,7 @@ test('finance exclusions route tests to another shard rather than omit coverage'
 
 test('timing-based redistribution keeps every moved family covered exactly once', () => {
   const shards = readRaceShards(workflow);
-  const moved = { TestNginx: 'a-b', TestSub2: 'c-channel', TestModel: 'c-other', TestUpstream: 'd-e', TestFinanceGiftLarge: 'f-gift-handoff', TestFinanceGiftLive: 'f-gift-scope', TestFinanceGiftProgress: 'f-gift-scope' };
+  const moved = { TestNginx: 'nginx', TestSub2: 'c-channel', TestModel: 'c-other', TestCloudWatch: 'c-cloudwatch', TestCustomer: 'c-customer', TestUpstream: 'upstream', TestPortal: 'portal', TestFinanceRecharge: 'f-recharge', TestIncident: 'i', TestMinute: 'm-n', TestFinanceGiftLarge: 'f-gift-handoff', TestFinanceGiftLive: 'f-gift-scope', TestFinanceGiftProgress: 'f-gift-scope', TestTokenDetectionAmortizes: 'token-detection-a-c', TestTokenDetectionFairness: 'token-detection-d-i', TestTokenDetectionReference: 'token-detection-j-r', TestTokenDetectionSealed: 'token-detection-other', TestTokenMetering: 'token-metering', TestTokenLatest: 'token-other' };
   for (const [prefix, shard] of Object.entries(moved)) {
     for (const suffix of ['', 'Future', '中文']) {
       const name = prefix + suffix;
@@ -50,7 +52,7 @@ test('invalid shard identifiers and subtest routing fail closed', () => {
 });
 
 test('channel and stability splits keep old A-C and O-S coverage without overlaps', () => {
-  assert.throws(() => verifyRaceShards(workflow.replace("            skip: '^TestChannel'\n", ''), names.join('\n')), /belongs to 2/);
+  assert.throws(() => verifyRaceShards(workflow.replace("            skip: '^Test(Channel|CloudWatch|Customer)'\n", ''), names.join('\n')), /belongs to 2/);
   assert.throws(() => verifyRaceShards(workflow.replace("pattern: '^TestS'", "pattern: '^TestMissingStability'"), names.join('\n')), /belongs to 0/);
   const shards = readRaceShards(workflow);
   for (const name of ['TestA', 'TestB', 'TestC', 'TestChannel', 'TestChannelFuture', 'TestCloudWatch', 'TestCustomer', 'TestO', 'TestP', 'TestQ', 'TestR', 'TestS', 'TestStabilityFuture']) {
@@ -69,6 +71,6 @@ test('shard gate rejects missing, duplicate, overlapping and empty coverage', ()
   assert.throws(() => verifyRaceShards(workflow, names.concat('TestAlpha').join('\n')), /duplicate/);
   assert.throws(() => verifyRaceShards(workflow, 'TestAlpha'), /Empty monitor race shard/);
   assert.throws(() => verifyRaceShards(workflow.replace("'^(Test[T-Z]|Test[^A-Z]|Test$|Example|Fuzz)'", "'^Test[T-Z]'"), names.join('\n')), /belongs to 0/);
-  assert.throws(() => verifyRaceShards(workflow.replace("'^Test[G-N]'", "'^Test[A-N]'"), names.join('\n')), /belongs to 2/);
+  assert.throws(() => verifyRaceShards(workflow.replace("'^Test[M-N]'", "'^Test[A-N]'"), names.join('\n')), /belongs to 2/);
   assert.throws(() => verifyRaceShards('no matrix', names.join('\n')), /No monitor/);
 });

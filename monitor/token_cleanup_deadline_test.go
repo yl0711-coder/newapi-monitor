@@ -59,7 +59,7 @@ func TestTokenCleanupYieldsCommittedPrefixBeforeAnotherWriterWait(t *testing.T) 
 							break
 						}
 						if !waitSourceLifecycle(ctx, time.Millisecond) {
-							tx.AddError(ctx.Err())
+							_ = tx.AddError(ctx.Err())
 							return
 						}
 					}

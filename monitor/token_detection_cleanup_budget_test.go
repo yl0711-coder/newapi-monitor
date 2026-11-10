@@ -68,7 +68,7 @@ func TestTokenDetectionCleanupLargeTurnYieldsAtBoundedStatement(t *testing.T) {
 			return
 		}
 		if len(tx.Statement.Vars) > 33 { // one epoch plus at most 32 identities
-			tx.AddError(errors.New("cleanup statement exceeded bounded identities"))
+			_ = tx.AddError(errors.New("cleanup statement exceeded bounded identities"))
 			return
 		}
 		once.Do(func() {
@@ -92,7 +92,11 @@ func TestTokenDetectionCleanupLargeTurnYieldsAtBoundedStatement(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	defer m.tokenStore().Callback().Delete().Remove("collection_after_cleanup_statement")
+	defer func() {
+		if err := m.tokenStore().Callback().Delete().Remove("collection_after_cleanup_statement"); err != nil {
+			t.Error(err)
+		}
+	}()
 	if err := m.cleanupTokenDetection(ctx, now); err != nil {
 		t.Fatal("cleanup prefix failed", err)
 	}
@@ -117,12 +121,12 @@ func TestTokenDetectionCleanupMultiStatementRollbackKeepsEvidence(t *testing.T) 
 			return
 		}
 		if len(tx.Statement.Vars) > 33 {
-			tx.AddError(errors.New("cleanup statement exceeded bounded identities"))
+			_ = tx.AddError(errors.New("cleanup statement exceeded bounded identities"))
 			return
 		}
 		deletes++
 		if deletes == 2 {
-			tx.AddError(failure)
+			_ = tx.AddError(failure)
 		}
 	}); err != nil {
 		t.Fatal(err)

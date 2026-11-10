@@ -242,13 +242,17 @@ func TestTokenMeteringPageWidthNeedsLastChunkCommit(t *testing.T) {
 			rows := tx.Statement.ReflectValue
 			if rows.Index(rows.Len()-1).Interface().(TokenMeteringFact).LogID == raw[len(raw)-1].ID {
 				wantPrefix = rows.Index(0).Interface().(TokenMeteringFact).LogID - 1
-				tx.AddError(errors.New("injected last chunk failure"))
+				_ = tx.AddError(errors.New("injected last chunk failure"))
 			}
 		}
 	}); err != nil {
 		t.Fatal(err)
 	}
-	defer m.storeDB.Callback().Create().Remove("last_chunk_failure")
+	defer func() {
+		if err := m.storeDB.Callback().Create().Remove("last_chunk_failure"); err != nil {
+			t.Error(err)
+		}
+	}()
 	n, err := m.commitTokenMeteringReadPage(context.Background(), state.LeaseToken, w, raw, facts, refs, false, now, 144, 2, 2200)
 	if err == nil || wantPrefix <= 0 || wantPrefix >= int64(len(raw)) || int64(n) != wantPrefix {
 		t.Fatal("expected a durable prefix and failed last chunk", n, err)
@@ -318,12 +322,16 @@ func TestTokenMeteringTimedOutStreamNeverPublishesUncommittedPrefix(t *testing.T
 	start := tokenMeteringStateRead(t, m).StartAt
 	if err := m.storeDB.Callback().Create().Before("gorm:create").Register("stream_commit_failure", func(tx *gorm.DB) {
 		if tx.Statement.Table == "token_metering_facts" {
-			tx.AddError(errors.New("injected prefix commit failure"))
+			_ = tx.AddError(errors.New("injected prefix commit failure"))
 		}
 	}); err != nil {
 		t.Fatal(err)
 	}
-	defer m.storeDB.Callback().Create().Remove("stream_commit_failure")
+	defer func() {
+		if err := m.storeDB.Callback().Create().Remove("stream_commit_failure"); err != nil {
+			t.Error(err)
+		}
+	}()
 	if _, err := m.runTokenMeteringRound(context.Background(), time.Unix(now, 0)); err == nil {
 		t.Fatal("failed prefix commit became success")
 	}
@@ -347,7 +355,11 @@ func TestTokenMeteringStreamTimeoutSurvivesLaterRoundDeadline(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	defer m.storeDB.Callback().Create().Remove("slow_stream_prefix")
+	defer func() {
+		if err := m.storeDB.Callback().Create().Remove("slow_stream_prefix"); err != nil {
+			t.Error(err)
+		}
+	}()
 	pages, err := m.runTokenMeteringRound(context.Background(), time.Unix(now, 0))
 	if pages != 1 || !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("transport failure hidden by later local work: pages=%d err=%v", pages, err)

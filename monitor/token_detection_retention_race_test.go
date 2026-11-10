@@ -25,14 +25,18 @@ func TestTokenDetectionRetiredQueueEntryDoesNotAbortRetainedWork(t *testing.T) {
 		retired = true
 		local := tx.Session(&gorm.Session{NewDB: true})
 		if err := local.Where("source_epoch=? AND log_id=2", m.cfg.TokenFactsSourceEpoch).Delete(&TokenMeteringRef{}).Error; err != nil {
-			tx.AddError(err)
+			_ = tx.AddError(err)
 			return
 		}
-		tx.AddError(local.Where("source_epoch=? AND log_id=2", m.cfg.TokenFactsSourceEpoch).Delete(&TokenMeteringFact{}).Error)
+		_ = tx.AddError(local.Where("source_epoch=? AND log_id=2", m.cfg.TokenFactsSourceEpoch).Delete(&TokenMeteringFact{}).Error)
 	}); err != nil {
 		t.Fatal(err)
 	}
-	defer m.tokenStore().Callback().Query().Remove("expire_queued_fact")
+	defer func() {
+		if err := m.tokenStore().Callback().Query().Remove("expire_queued_fact"); err != nil {
+			t.Error(err)
+		}
+	}()
 	processed, _, err := m.runTokenDetectionRoundProgress(context.Background(), now)
 	if err != nil || !retired || processed != 2 {
 		t.Fatal("retired queue entry interrupted retained work or counted as a decision", processed, retired, err)
@@ -54,12 +58,16 @@ func TestTokenDetectionMissingDependencyStillFails(t *testing.T) {
 	detectionFact(t, m, 1, now-600, 3, 20000, 0, 0)
 	if err := m.tokenStore().Callback().Query().Before("gorm:query").Register("missing_capacity_dependency", func(tx *gorm.DB) {
 		if tx.Statement.Table == "token_detection_capacity" {
-			tx.AddError(gorm.ErrRecordNotFound)
+			_ = tx.AddError(gorm.ErrRecordNotFound)
 		}
 	}); err != nil {
 		t.Fatal(err)
 	}
-	defer m.tokenStore().Callback().Query().Remove("missing_capacity_dependency")
+	defer func() {
+		if err := m.tokenStore().Callback().Query().Remove("missing_capacity_dependency"); err != nil {
+			t.Error(err)
+		}
+	}()
 	processed, _, err := m.runTokenDetectionRoundProgress(context.Background(), now)
 	if processed != 0 || !errors.Is(err, gorm.ErrRecordNotFound) {
 		t.Fatal("missing dependency was swallowed as retention", processed, err)

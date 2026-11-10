@@ -134,7 +134,11 @@ func TestTokenMeteringMigrationWorkerResumesCommittedBudgetPrefix(t *testing.T) 
 	}); err != nil {
 		t.Fatal(err)
 	}
-	defer m.tokenStore().Callback().Update().Remove("migration-prefix-deadline")
+	defer func() {
+		if err := m.tokenStore().Callback().Update().Remove("migration-prefix-deadline"); err != nil {
+			t.Error(err)
+		}
+	}()
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {
@@ -229,11 +233,11 @@ func tokenMeteringMigrationWorkerYieldCheck(t *testing.T, rowBudget bool) {
 			// ends. The next loop yields with nil error and a durable cursor.
 			deadline, ok := tx.Statement.Context.Deadline()
 			if !ok {
-				tx.AddError(context.DeadlineExceeded)
+				_ = tx.AddError(context.DeadlineExceeded)
 				return
 			}
 			if !waitSourceLifecycle(tx.Statement.Context, time.Until(deadline)-180*time.Millisecond) {
-				tx.AddError(tx.Statement.Context.Err())
+				_ = tx.AddError(tx.Statement.Context.Err())
 				return
 			}
 		}
@@ -243,7 +247,11 @@ func tokenMeteringMigrationWorkerYieldCheck(t *testing.T, rowBudget bool) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	defer m.tokenStore().Callback().Update().Remove("migration-successful-budget-yield")
+	defer func() {
+		if err := m.tokenStore().Callback().Update().Remove("migration-successful-budget-yield"); err != nil {
+			t.Error(err)
+		}
+	}()
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {
@@ -581,7 +589,7 @@ func TestTokenMeteringMigrationCommitRestartAndAccounting(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if changed, err := restarted.migrateTokenMeteringBatch(ctx, now+3); err != context.Canceled || changed != 0 {
+	if changed, err := restarted.migrateTokenMeteringBatch(ctx, now+3); !errors.Is(err, context.Canceled) || changed != 0 {
 		t.Fatalf("cancel ignored: %d %v", changed, err)
 	}
 }

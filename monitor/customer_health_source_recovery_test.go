@@ -144,7 +144,9 @@ func TestCustomerHealthSourceNarrowsTimeoutAndCommitsOnlyReadPrefix(t *testing.T
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	before := m.customerHealthSourceReadSeconds.Load()
-	m.sampleCustomerHealthSourcePrefix(ctx, left, right, func(context.Context, int64, int64) (int, error) { return 0, ctx.Err() })
+	if _, _, err := m.sampleCustomerHealthSourcePrefix(ctx, left, right, func(context.Context, int64, int64) (int, error) { return 0, ctx.Err() }); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled source read returned %v", err)
+	}
 	if m.customerHealthSourceReadSeconds.Load() != before {
 		t.Fatal("source epoch cancellation changed query retry width")
 	}
@@ -157,12 +159,16 @@ func TestCustomerHealthSourceRetriesCursorReadFailureAndHonorsCancellation(t *te
 	if err := m.storeDB.Callback().Query().Before("gorm:query").Register("customer_health_init_failure", func(tx *gorm.DB) {
 		if tx.Statement.Table == "customer_health_source_cursors" && !injected {
 			injected = true
-			tx.AddError(errors.New("temporary local read failure"))
+			_ = tx.AddError(errors.New("temporary local read failure"))
 		}
 	}); err != nil {
 		t.Fatal(err)
 	}
-	defer m.storeDB.Callback().Query().Remove("customer_health_init_failure")
+	defer func() {
+		if err := m.storeDB.Callback().Query().Remove("customer_health_init_failure"); err != nil {
+			t.Error(err)
+		}
+	}()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	reads, waits := 0, 0
@@ -232,13 +238,15 @@ func TestCustomerHealthReadCheckpointPreservesAtomicityAndLateReplay(t *testing.
 	injected := errors.New("checkpoint commit interrupted")
 	if err := m.storeDB.Callback().Update().Before("gorm:update").Register("fail_read_checkpoint", func(tx *gorm.DB) {
 		if tx.Statement.Table == "customer_health_source_cursors" {
-			tx.AddError(injected)
+			_ = tx.AddError(injected)
 		}
 	}); err != nil {
 		t.Fatal(err)
 	}
 	err := m.saveCustomerHealthSourceReadCursor(day, through+60, target)
-	m.storeDB.Callback().Update().Remove("fail_read_checkpoint")
+	if removeErr := m.storeDB.Callback().Update().Remove("fail_read_checkpoint"); removeErr != nil {
+		t.Fatal(removeErr)
+	}
 	if !errors.Is(err, injected) {
 		t.Fatalf("checkpoint failure was hidden: %v", err)
 	}

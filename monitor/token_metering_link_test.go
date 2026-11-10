@@ -37,7 +37,7 @@ func TestTokenMeteringAssociationChunksRollbackAndResume(t *testing.T) {
 		if tx.Statement.Table == "token_metering_facts" {
 			writes++
 			if writes == 11 {
-				tx.AddError(injected)
+				_ = tx.AddError(injected)
 			}
 		}
 	}); err != nil {

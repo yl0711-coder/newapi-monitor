@@ -92,8 +92,9 @@ func TestTokenMaintenanceZeroProgressHandoffResumesWithoutIdlePoll(t *testing.T)
 				time.Sleep(10 * time.Millisecond)
 			}
 			cancel()
+			// Join the in-flight detector before the fixture can close its DB.
 			m.tokenDetectionMu.Lock()
-			m.tokenDetectionMu.Unlock()
+			defer m.tokenDetectionMu.Unlock()
 		})
 	}
 }

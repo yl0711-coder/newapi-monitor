@@ -30,17 +30,21 @@ func TestTokenDetectionCleanupRechecksRenewedHeadsAndRestoredFacts(t *testing.T)
 		}
 		injected = true
 		if err := m.tokenStore().Model(&TokenDetectionCurrent{}).Where("source_epoch=? AND log_id=1", epoch).Update("expires_at", now+60).Error; err != nil {
-			tx.AddError(err)
+			_ = tx.AddError(err)
 			return
 		}
 		raw := tokenMeteringRawFixture(`{"claude":true,"cache_tokens":0,"cache_creation_tokens":0}`)
 		raw.ID, raw.CreatedAt = 2, now-600
 		fact, _ := parseTokenMetering(m.cfg, raw, now)
-		tx.AddError(m.tokenStore().Create(&fact).Error)
+		_ = tx.AddError(m.tokenStore().Create(&fact).Error)
 	}); err != nil {
 		t.Fatal(err)
 	}
-	defer reader.Callback().Query().Remove("renew_after_cleanup_read")
+	defer func() {
+		if err := reader.Callback().Query().Remove("renew_after_cleanup_read"); err != nil {
+			t.Error(err)
+		}
+	}()
 	if err := m.cleanupTokenDetection(context.Background(), now); err != nil {
 		t.Fatal(err)
 	}
