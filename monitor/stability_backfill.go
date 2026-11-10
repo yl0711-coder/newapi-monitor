@@ -34,8 +34,11 @@ const (
 )
 
 var (
-	errStabilityBackfillDisabled  = errors.New("稳定性历史补数已禁用")
-	errStabilityRangeTooLarge     = errors.New("稳定性分段结果超过安全上限")
+	errStabilityBackfillDisabled = errors.New("稳定性历史补数已禁用")
+	errStabilityRangeTooLarge    = errors.New("稳定性分段结果超过安全上限")
+	// Not wrapped with %w on purpose: splitting further cannot shrink a
+	// merged hour, so it must not trigger the split fallback again.
+	errStabilityHourTooManyRows   = "单小时维度超过安全上限"
 	errStabilityControlMismatch   = errors.New("稳定性来源控制总数不一致")
 	errStabilityZeroContradiction = errors.New("稳定性来源零流量与本地分钟事实矛盾")
 )
@@ -152,7 +155,7 @@ func (m *Monitor) RunBoundedStabilityBackfill(ctx context.Context, fromTs, toTs 
 		m.stabilityBackfillRunning.Store(false)
 		return result, err
 	}
-	m.runStabilityBackfillWithFetcher(ctx, result.ID, m.fetchStabilityRange)
+	m.runStabilityBackfillWithFetcher(ctx, result.ID, m.fetchStabilityRangeSplitting)
 	if err := m.storeDB.WithContext(ctx).First(&result, "id = ?", result.ID).Error; err != nil {
 		return result, err
 	}
@@ -567,9 +570,34 @@ func (m *Monitor) queryStabilitySource(ctx context.Context, query string, args [
 }
 
 func (m *Monitor) fetchStabilityRange(ctx context.Context, fromTs, toTs int64) (out stabilityRangeResult, retErr error) {
-	out.Hours = make(map[int64]stabilityHourTraffic)
 	if fromTs%3600 != 0 || toTs%3600 != 0 || toTs <= fromTs || toTs-fromTs > 12*3600 {
-		return out, fmt.Errorf("稳定性分段范围非法: [%d,%d)", fromTs, toTs)
+		return stabilityRangeResult{Hours: map[int64]stabilityHourTraffic{}}, fmt.Errorf("稳定性分段范围非法: [%d,%d)", fromTs, toTs)
+	}
+	return m.fetchStabilityWindow(ctx, fromTs, toTs)
+}
+
+// stabilityWindowTestFault lets tests simulate the source's statement timeout
+// for selected windows. Always nil in production.
+var stabilityWindowTestFault func(fromTs, toTs int64) error
+
+// fetchStabilityWindow reads [fromTs, toTs) from the source. The window is
+// either whole hours, or a sub-range inside one hour (used when a whole hour
+// exceeds the source statement limit). Rows are still bucketed by hour, and the
+// control totals are verified for exactly the same window.
+func (m *Monitor) fetchStabilityWindow(ctx context.Context, fromTs, toTs int64) (out stabilityRangeResult, retErr error) {
+	out.Hours = make(map[int64]stabilityHourTraffic)
+	bucketFrom, bucketTo := fromTs, toTs
+	if fromTs%3600 != 0 || toTs%3600 != 0 {
+		bucketFrom = fromTs - fromTs%3600
+		bucketTo = bucketFrom + 3600
+		if toTs <= fromTs || toTs > bucketTo {
+			return out, fmt.Errorf("稳定性子区间必须位于同一小时内: [%d,%d)", fromTs, toTs)
+		}
+	}
+	if stabilityWindowTestFault != nil {
+		if err := stabilityWindowTestFault(fromTs, toTs); err != nil {
+			return out, err
+		}
 	}
 	q := stabilityRangeSQLWithMaxExecution(m.stabilityServerMaxExecutionMS())
 	if m.usageDayExpr != "" {
@@ -596,8 +624,8 @@ func (m *Monitor) fetchStabilityRange(ctx context.Context, fromTs, toTs int64) (
 				&row.TtftMaxMs, &row.TtftObserved, &row.TtftOver3s); err != nil {
 				return err
 			}
-			if hourTs < fromTs || hourTs >= toTs || hourTs%3600 != 0 {
-				return fmt.Errorf("来源返回越界小时 %d，不在 [%d,%d)", hourTs, fromTs, toTs)
+			if hourTs < bucketFrom || hourTs >= bucketTo || hourTs%3600 != 0 {
+				return fmt.Errorf("来源返回越界小时 %d，不在 [%d,%d)", hourTs, bucketFrom, bucketTo)
 			}
 			traffic := out.Hours[hourTs]
 			if traffic.Users == nil {
@@ -667,7 +695,7 @@ func (m *Monitor) fetchStabilityRange(ctx context.Context, fromTs, toTs int64) (
 				&control.InternalRequests, &control.InternalTokens, &control.InternalQuota); err != nil {
 				return err
 			}
-			if hourTs < fromTs || hourTs >= toTs || hourTs%3600 != 0 {
+			if hourTs < bucketFrom || hourTs >= bucketTo || hourTs%3600 != 0 {
 				return fmt.Errorf("来源控制查询返回越界小时 %d", hourTs)
 			}
 			controls[hourTs] = control
@@ -681,7 +709,7 @@ func (m *Monitor) fetchStabilityRange(ctx context.Context, fromTs, toTs int64) (
 	if err != nil {
 		return out, err
 	}
-	if err := verifyStabilitySourceControls(fromTs, toTs, out.Hours, controls); err != nil {
+	if err := verifyStabilitySourceControls(bucketFrom, bucketTo, out.Hours, controls); err != nil {
 		return out, err
 	}
 	return out, nil
@@ -705,12 +733,150 @@ func verifyStabilitySourceControls(fromTs, toTs int64, hours map[int64]stability
 	return nil
 }
 
+// A busy hour can exceed the source's MAX_EXECUTION_TIME as one query, so the
+// hour could never be repaired. On a timeout, read it as 10-minute windows, and
+// a still-slow window as 1-minute windows; each window is control-verified
+// before the parts are merged back into the identical hourly rows.
+var stabilityHourSplitSeconds = []int64{600, 60}
+
+// maxStabilityRowsPerHourLimit is maxStabilityRowsPerHour for merged split
+// hours; a variable only so tests can lower it.
+var maxStabilityRowsPerHourLimit = maxStabilityRowsPerHour
+
 func (m *Monitor) fetchStabilityHour(ctx context.Context, hourTs int64) (stabilityHourTraffic, error) {
-	result, err := m.fetchStabilityRange(ctx, hourTs, hourTs+3600)
+	result, err := m.fetchStabilityRangeSplitting(ctx, hourTs, hourTs+3600)
 	if err != nil {
 		return stabilityHourTraffic{}, err
 	}
 	return result.Hours[hourTs], nil
+}
+
+// fetchStabilityRangeSplitting is fetchStabilityRange, except that a single
+// hour whose whole-hour query times out (or is too large to read at once) is
+// read in split windows. Both the bulk migration job and the single-hour
+// repair use it, so neither leaves a slow hour permanently failed.
+func (m *Monitor) fetchStabilityRangeSplitting(ctx context.Context, fromTs, toTs int64) (stabilityRangeResult, error) {
+	result, err := m.fetchStabilityRange(ctx, fromTs, toTs)
+	if err == nil || toTs-fromTs != 3600 || !stabilityRangeShouldFallback(err) || ctx.Err() != nil {
+		return result, err
+	}
+	hourTs := fromTs
+	slog.Info("稳定性小时整段查询超时，改为分段读取", "hour", hourTs)
+	out := stabilityRangeResult{Hours: map[int64]stabilityHourTraffic{}, SourceQueries: result.SourceQueries, QueryDuration: result.QueryDuration}
+	var merged stabilityHourTraffic
+	if err := m.fetchStabilityHourSplit(ctx, hourTs, hourTs, hourTs+3600, 0, &merged, &out); err != nil {
+		return stabilityRangeResult{Hours: map[int64]stabilityHourTraffic{}, SourceQueries: out.SourceQueries, QueryDuration: out.QueryDuration}, err
+	}
+	// The merged rows are what the whole-hour query would have returned, so
+	// the same per-hour cap applies (later per-hour readers rely on it).
+	out.Rows = len(merged.Users) + len(merged.InternalTests)
+	if out.Rows > maxStabilityRowsPerHourLimit {
+		return stabilityRangeResult{Hours: map[int64]stabilityHourTraffic{}, SourceQueries: out.SourceQueries, QueryDuration: out.QueryDuration},
+			fmt.Errorf("稳定性小时 %d 分段合并后 %d 维度超过 %d（%s）", hourTs, out.Rows, maxStabilityRowsPerHourLimit, errStabilityHourTooManyRows)
+	}
+	if out.Rows > 0 {
+		out.Hours[hourTs] = merged
+	}
+	return out, nil
+}
+
+func (m *Monitor) fetchStabilityHourSplit(ctx context.Context, hourTs, fromTs, toTs int64, level int, merged *stabilityHourTraffic, stats *stabilityRangeResult) error {
+	step := stabilityHourSplitSeconds[level]
+	for from := fromTs; from < toTs; from += step {
+		to := min(from+step, toTs)
+		part, err := m.fetchStabilityWindow(ctx, from, to)
+		stats.SourceQueries += part.SourceQueries
+		stats.QueryDuration += part.QueryDuration
+		if err != nil {
+			if level+1 < len(stabilityHourSplitSeconds) && stabilityRangeShouldFallback(err) && ctx.Err() == nil {
+				if splitErr := m.fetchStabilityHourSplit(ctx, hourTs, from, to, level+1, merged, stats); splitErr != nil {
+					return splitErr
+				}
+				continue
+			}
+			return fmt.Errorf("稳定性小时 %d 分段 [%d,%d) 读取失败: %w", hourTs, from, to, err)
+		}
+		mergeStabilityHourTraffic(merged, part.Hours[hourTs])
+	}
+	return nil
+}
+
+type stabilityUserKey struct {
+	ChannelID int
+	ModelName string
+	Grp       string
+}
+
+type stabilityTestKey struct {
+	ChannelID                         int
+	ModelName, Grp, Origin, Scope, CB string
+}
+
+// mergeStabilityHourTraffic adds one window's rows into dst using the same
+// grouping keys as the hourly SQL: counters add, maxima take the max.
+func mergeStabilityHourTraffic(dst *stabilityHourTraffic, src stabilityHourTraffic) {
+	users := make(map[stabilityUserKey]int, len(dst.Users))
+	for i, row := range dst.Users {
+		users[stabilityUserKey{row.ChannelID, row.ModelName, row.Grp}] = i
+	}
+	for _, row := range src.Users {
+		key := stabilityUserKey{row.ChannelID, row.ModelName, row.Grp}
+		i, ok := users[key]
+		if !ok {
+			users[key] = len(dst.Users)
+			dst.Users = append(dst.Users, row)
+			continue
+		}
+		d := &dst.Users[i]
+		d.Success += row.Success
+		d.Anomaly += row.Anomaly
+		d.Failed += row.Failed
+		d.AnomalyBilled += row.AnomalyBilled
+		d.AnomalyFree += row.AnomalyFree
+		d.AnomalyStream += row.AnomalyStream
+		d.AnomalyQuota += row.AnomalyQuota
+		d.SumUseTime += row.SumUseTime
+		d.MaxUseTime = max(d.MaxUseTime, row.MaxUseTime)
+		d.Tokens += row.Tokens
+		d.Quota += row.Quota
+		d.RefundRecords += row.RefundRecords
+		d.RefundQuota += row.RefundQuota
+		d.Err4xx += row.Err4xx
+		d.Err5xx += row.Err5xx
+		d.ErrTimeout += row.ErrTimeout
+		d.ErrOther += row.ErrOther
+		d.Ttft500 += row.Ttft500
+		d.Ttft1k += row.Ttft1k
+		d.Ttft2k += row.Ttft2k
+		d.Ttft5k += row.Ttft5k
+		d.Ttft10k += row.Ttft10k
+		d.TtftInf += row.TtftInf
+		d.TtftMaxMs = max(d.TtftMaxMs, row.TtftMaxMs)
+		d.TtftObserved += row.TtftObserved
+		d.TtftOver3s += row.TtftOver3s
+	}
+	tests := make(map[stabilityTestKey]int, len(dst.InternalTests))
+	for i, row := range dst.InternalTests {
+		tests[stabilityTestKey{row.ChannelID, row.ModelName, row.Grp, row.Origin, row.Scope, row.CostBasis}] = i
+	}
+	for _, row := range src.InternalTests {
+		key := stabilityTestKey{row.ChannelID, row.ModelName, row.Grp, row.Origin, row.Scope, row.CostBasis}
+		i, ok := tests[key]
+		if !ok {
+			tests[key] = len(dst.InternalTests)
+			dst.InternalTests = append(dst.InternalTests, row)
+			continue
+		}
+		d := &dst.InternalTests[i]
+		d.Requests += row.Requests
+		d.Success += row.Success
+		d.Anomaly += row.Anomaly
+		d.Failed += row.Failed
+		d.Tokens += row.Tokens
+		d.Quota += row.Quota
+		d.SumUseTime += row.SumUseTime
+		d.MaxUseTime = max(d.MaxUseTime, row.MaxUseTime)
+	}
 }
 
 func stabilityHourTotals(rows []StabilityHourSample) (requests, tokens, quota int64) {
@@ -1058,7 +1224,7 @@ func (m *Monitor) startStabilityBackfillKind(fromTs, toTs int64, kind string) (*
 }
 
 func (m *Monitor) runStabilityBackfill(ctx context.Context, jobID string) {
-	m.runStabilityBackfillWithFetcher(ctx, jobID, m.fetchStabilityRange)
+	m.runStabilityBackfillWithFetcher(ctx, jobID, m.fetchStabilityRangeSplitting)
 }
 
 func (m *Monitor) runStabilityBackfillWithFetcher(ctx context.Context, jobID string, fetch stabilityRangeFetcher) {
