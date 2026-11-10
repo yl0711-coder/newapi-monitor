@@ -11,7 +11,7 @@ test('a few ordinary failed tests may be re-run once', () => {
     report([ev('pass', 'TestB'), ev('pass')], true),
     report([ev('fail', 'TestC'), ev('fail')]),
   ]);
-  assert.deepEqual(r, {tests: ['TestA', 'TestC'], rerunAllowed: true, reasons: []});
+  assert.deepEqual(r, {tests: ['TestA', 'TestC'], rerunAllowed: true, reasons: [], blocking: []});
 });
 
 test('data races, panics, timeouts and unidentified failures are never re-run', () => {
@@ -41,4 +41,12 @@ test('more than the limit of failed tests is a systemic failure, not flakiness',
 
 test('nothing failed means nothing to re-run', () => {
   assert.equal(classifyRaceFailures([report([ev('pass', 'TestA'), ev('pass')], true)]).rerunAllowed, false);
+});
+
+test('race-advisory runs are blocked only by data races, panics, hangs and unidentified failures', () => {
+  const assertionOnly = classifyRaceFailures([report([...Array.from({length: 8}, (_, i) => ev('fail', `TestSlow${i}`)), ev('fail')])]);
+  assert.deepEqual(assertionOnly.blocking, []);
+  assert.equal(assertionOnly.rerunAllowed, false); // too many to re-run, but not blocking in advisory mode
+  const raced = classifyRaceFailures([report([ev('output', 'TestA', 'WARNING: DATA RACE\n'), ev('fail', 'TestA'), ev('fail')])]);
+  assert.deepEqual(raced.blocking, ['data race reported']);
 });

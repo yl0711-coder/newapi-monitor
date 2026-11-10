@@ -34,13 +34,16 @@ export function classifyRaceFailures(reports) {
     if ((!exitedOK || packageFailed) && ownFailures.size === 0) unexplained = true;
   }
   const tests = [...failed].sort();
-  const reasons = [];
-  if (dataRace) reasons.push('data race reported');
-  if (panic) reasons.push('test panicked');
-  if (timedOut) reasons.push('test binary timed out');
-  if (unexplained) reasons.push('a process failed without a failing test');
+  // Failures that never come from machine speed: they always fail the job,
+  // including in race-advisory runs (docs/CI-规范.md §3).
+  const blocking = [];
+  if (dataRace) blocking.push('data race reported');
+  if (panic) blocking.push('test panicked');
+  if (timedOut) blocking.push('test binary timed out');
+  if (unexplained) blocking.push('a process failed without a failing test');
+  const reasons = [...blocking];
   if (tests.length > raceRerunMaxTests) reasons.push(`more than ${raceRerunMaxTests} tests failed`);
-  return {tests, rerunAllowed: tests.length > 0 && reasons.length === 0, reasons};
+  return {tests, rerunAllowed: tests.length > 0 && reasons.length === 0, reasons, blocking};
 }
 
 const escape = value => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');

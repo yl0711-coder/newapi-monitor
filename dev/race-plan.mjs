@@ -30,7 +30,16 @@ const lexical = (a, b) => a < b ? -1 : a > b ? 1 : 0;
 const escape = value => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 const toPattern = group => `^(${[...group].sort(lexical).map(escape).join('|')})$`;
 
-const noSerial = {jobs: 0, prefixes: [], tests: []};
+// How a package's serial jobs run their tests:
+//   race:                       race-built binary; every failure fails the job.
+//   native-gate-race-advisory:  native binary first (every assertion must pass,
+//                               at production speed), then the race binary,
+//                               which fails the job only on data races, panics
+//                               or a hung binary; other race-mode assertion
+//                               failures (performance thresholds the race
+//                               detector's slowdown cannot meet) are reported.
+export const serialModes = ['race', 'native-gate-race-advisory'];
+const noSerial = {jobs: 0, prefixes: [], tests: [], mode: 'race'};
 
 export function validateSerial(serial) {
   assert.equal(serial?.format_version, 2, 'unsupported serial test list format');
@@ -40,7 +49,8 @@ export function validateSerial(serial) {
     assert.equal(new Set(serial[field]).size, serial[field].length, `duplicate serial ${field}`);
   }
   assert.ok(serial.jobs > 0 || (!serial.prefixes.length && !serial.tests.length), 'serial tests need at least one serial job');
-  return serial;
+  assert.ok(serial.mode === undefined || serialModes.includes(serial.mode), 'unknown serial mode');
+  return {mode: 'race', ...serial};
 }
 
 export function loadRaceSerial(name) {
@@ -128,15 +138,16 @@ export function racePlanForJob(name, listing, job, timings = loadRaceTimings(nam
   const plan = racePlan(listing, timings, config, serial);
   if (job >= config.jobs) {
     const index = job - config.jobs;
-    return {...plan, serialJob: true, jobPatterns: [plan.serialPatterns[index]], jobSeconds: [plan.serialSeconds[index]]};
+    return {...plan, serialJob: true, mode: serial.mode ?? 'race', jobPatterns: [plan.serialPatterns[index]], jobSeconds: [plan.serialSeconds[index]]};
   }
   const from = job * config.processes;
-  return {...plan, serialJob: false, jobPatterns: plan.patterns.slice(from, from + config.processes),
+  return {...plan, serialJob: false, mode: 'race', jobPatterns: plan.patterns.slice(from, from + config.processes),
     jobSeconds: plan.estimatedSeconds.slice(from, from + config.processes)};
 }
 
 // CLI: `node dev/race-plan.mjs <monitor|monthly> <job>` prints that job's
-// process patterns, one per line; `--verify` instead only checks coverage.
+// process patterns, one per line; `<job> --mode` prints how the job runs them;
+// `--verify` instead only checks coverage.
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   try {
     const [name, raw] = process.argv.slice(2);
@@ -152,6 +163,10 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
       const job = Number(raw);
       assert.ok(raw !== undefined && String(job) === raw, 'race job index required');
       const plan = racePlanForJob(name, listing, job);
+      if (process.argv[4] === '--mode') {
+        process.stdout.write(plan.mode + '\n');
+        process.exit(0);
+      }
       console.error(`${name} race: ${plan.count} tests (${plan.knownTimingCount} measured); job ${job} ${plan.serialJob ? 'serial (one process)' : 'parallel'} estimates ${plan.jobSeconds.join(',')}s`);
       process.stdout.write(plan.jobPatterns.join('\n') + '\n');
     }

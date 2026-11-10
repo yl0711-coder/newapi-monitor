@@ -1,7 +1,10 @@
 {
  "format_version": 2,
- "note": "Race tests that assert behaviour bounded by real wall-clock budgets (round, commit and cleanup budgets, latency amortisation) and fail when other test processes compete for the CPU. They run as ONE process per runner in the serial jobs. All Token tests are included: in CI run 42820117288 (3 processes per runner) 19 distinct ones failed across two attempts while every other monitor test passed. Add a test only with evidence; see docs/CI-规范.md.",
+ "note": "Race tests that assert behaviour bounded by real wall-clock budgets (round, commit and cleanup budgets, latency amortisation, throughput). All Token tests are included. On GitHub runners these thresholds cannot be met under the race detector's slowdown even alone on a runner (20 distinct Token tests failed across four CI runs, most deterministically, and v1.18.44/45 CI failed on them too). So they run natively first (every assertion must pass) and then under race, where only data races, panics and hangs fail the job. Temporary until the tests stop depending on machine speed; see docs/CI-规范.md.",
  "jobs": 4,
- "prefixes": ["TestToken"],
- "tests": []
+ "prefixes": [
+  "TestToken"
+ ],
+ "tests": [],
+ "mode": "native-gate-race-advisory"
 }

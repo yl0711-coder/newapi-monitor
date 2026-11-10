@@ -117,9 +117,12 @@ test('CI runs every planned job with race detection and gates publication on all
   assert.match(runner, /MONITOR_TEST_NGINX_COLLECTOR_BIN/);
   assert.match(runner, /wait "\$\{pids\[\$index\]\}"/);
   // Failures go through the classifier; only an allowed, passing isolated re-run turns a job green.
-  assert.match(runner, /node dev\/race-failures\.mjs "\$\{reports\[@\]\}"/);
-  assert.match(runner, /test -n "\$pattern" \|\| exit 1/);
-  assert.match(runner, /re-run FAILED[^\n]*\nexit 1/);
+  assert.match(runner, /classify "\$\{reports\[@\]\}"/);
+  assert.match(runner, /rerun_failed "\$bin" "\$name-\$job" "\$verdict" \|\| exit 1/);
+  assert.match(runner, /test -n "\$pattern" \|\| return 1/);
+  // Advisory serial jobs: the native run gates; the race run gates on blocking failures only.
+  assert.match(runner, /rerun_failed "\$native" "\$name-\$job-native" "\$verdict" \|\| exit 1/);
+  assert.match(runner, /if test -n "\$blocking"; then[\s\S]*?exit 1/);
 });
 
 test('timing refresh takes passed measurements, keeps estimates for failed tests and drops removed tests', async () => {

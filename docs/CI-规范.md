@@ -78,6 +78,17 @@ monitor 包约 3900 个测试，monthlydraft 包约 580 个，全部串行跑要
 - 清单里的测试被改名、删除，或者某个前缀已经匹配不到任何测试时，CI 会报错，需要同步更新清单。
 - 串行任务的预估总时长同样受 14 分钟目标约束；不够时增加 `jobs`，同时核算总任务数（第 2 节）。
 
+### 串行任务的运行方式（`mode`）
+
+| mode | 做法 | 当前用于 |
+|---|---|---|
+| `race` | race 模式运行，任何失败都让任务失败（允许单独重跑一次，见第 7 节） | monthly 的性能测试 |
+| `native-gate-race-advisory` | 先在**正常模式**（不开 race）运行，所有断言都必须通过，包括性能指标；再在 race 模式运行，只有数据竞争、panic、测试程序卡死、找不到失败测试会让任务失败，其他失败只在 Summary 列为"Race-mode advisory failures" | monitor 的全部 `TestToken*` |
+
+为什么令牌测试用第二种方式：这批测试里有大约 100 个检验"在多少毫秒内至少处理多少条"这类性能指标。race 模式会让程序慢好几倍，GitHub 的机器在 race 模式下达不到这些指标，即使一台机器只跑一个进程、单独重跑也一样。v1.18.48 验证期间有 20 个不同的令牌测试这样失败过，v1.18.44、v1.18.45 当时的 CI 也因此失败。这些指标是按线上（正常模式）速度定的，所以在正常模式下必须通过；race 模式继续检查数据竞争。
+
+这是过渡做法：等这些测试改成不依赖机器速度（第 7 节"待修"），令牌测试恢复为 `race` 模式，和其他测试一样必须在 race 模式下通过。**新写的性能类测试不要依赖这个豁免**，按第 4 节的规则写。
+
 预估值按"一台机器只跑 1 个进程"时的实测耗时计算；3 个进程同时跑会互相抢 CPU，实际会慢一些，所以目标上限定在 14 分钟，单进程超时 25 分钟，任务超时 35 分钟。
 
 ## 4. 开发者写测试的规则
@@ -170,9 +181,10 @@ race 任务里有测试失败时，`dev/run-race-job.sh` 会等这台机器上�
 ### 已知情况
 
 - 已修复：`TestArchiveFullRecordBoundRoundtrip`、`TestRetentionFullReceiverPayloadPerformance`（race 下盘点的 5 秒时限过紧，已在 race 模式下放宽测试用的时限，正式时限不变）。
-- 已列入串行任务：全部 `TestToken*` 测试，以及 monthly 的 `TestRetentionFullReceiverPayloadPerformance`。
+- 已列入串行任务：全部 `TestToken*` 测试（`native-gate-race-advisory` 方式，见第 3 节），以及 monthly 的 `TestRetentionFullReceiverPayloadPerformance`（`race` 方式）。
+- 已修复：`TestTokenMeteringPaginationCrashResumeAndFencing`（原来要求恢复后一轮内写完，慢机器上稳定失败；改为最多 4 轮，仍检查结果正确）。
 - 待修（v1.18.48 验证期间在真实 CI 上出现过）：
-  - `TestTokenMeteringPaginationCrashResumeAndFencing`：单进程也偶发失败；
+  - 在 race 模式下达不到性能指标的令牌测试（共 20 个，集中在 `token_metering_budget_test.go`、`token_commit_latency_test.go` 等）：改成不依赖机器速度后，令牌测试恢复 `race` 模式；CI 每次的"Race-mode advisory failures"清单就是这份待修清单；
   - `TestTokenReviewReplayFailureAndAtomicCompleteness`：单进程也偶发失败；
   - `TestFinanceGiftSeriesBudgetsAndLocks/timeout`：并行时偶发"deadline not respected"；
   - `TestTokenDetectionFairnessMinuteBacklogRestartRecovery`：race 下约 6 分钟，每轮有 5 秒时限，需要观察。
