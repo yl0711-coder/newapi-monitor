@@ -1595,7 +1595,7 @@ func (m *Monitor) readyStatus(now time.Time) (readyStatusResponse, int) {
 			response.DegradedReasons = appendReason(response.DegradedReasons, "local_backup_failed")
 		} else if lastSuccess == 0 && uptime > backupGrace {
 			response.DegradedReasons = appendReason(response.DegradedReasons, "local_backup_missing")
-		} else if lastSuccess > 0 && now.Unix()-lastSuccess > int64((2*m.storeBackupInterval()+10*time.Minute).Seconds()) {
+		} else if lastSuccess > 0 && now.Unix()-lastSuccess > int64(m.storeBackupStaleAfter().Seconds()) {
 			response.DegradedReasons = appendReason(response.DegradedReasons, "local_backup_stale")
 		}
 	}
@@ -1606,7 +1606,7 @@ func (m *Monitor) readyStatus(now time.Time) (readyStatusResponse, int) {
 			response.DegradedReasons = appendReason(response.DegradedReasons, "facts_backup_failed")
 		} else if lastSuccess == 0 && uptime > backupGrace {
 			response.DegradedReasons = appendReason(response.DegradedReasons, "facts_backup_missing")
-		} else if lastSuccess > 0 && now.Unix()-lastSuccess > int64((2*m.storeBackupInterval()+10*time.Minute).Seconds()) {
+		} else if lastSuccess > 0 && now.Unix()-lastSuccess > int64(m.storeBackupStaleAfter().Seconds()) {
 			response.DegradedReasons = appendReason(response.DegradedReasons, "facts_backup_stale")
 		}
 	}
@@ -1619,7 +1619,7 @@ func (m *Monitor) readyStatus(now time.Time) (readyStatusResponse, int) {
 			response.DegradedReasons = appendReason(response.DegradedReasons, "backup_set_missing")
 		case setSuccess > 0 && !m.storeBackupSetVerified.Load():
 			response.DegradedReasons = appendReason(response.DegradedReasons, "backup_set_unverified")
-		case setSuccess > 0 && now.Unix()-setSuccess > int64((2*m.storeBackupInterval()+10*time.Minute).Seconds()):
+		case setSuccess > 0 && now.Unix()-setSuccess > int64(m.storeBackupStaleAfter().Seconds()):
 			response.DegradedReasons = appendReason(response.DegradedReasons, "backup_set_stale")
 		}
 	}

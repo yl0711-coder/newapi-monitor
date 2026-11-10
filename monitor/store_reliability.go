@@ -246,6 +246,17 @@ func (m *Monitor) storeBackupInterval() time.Duration {
 	return time.Duration(hours) * time.Hour
 }
 
+// storeBackupStaleAfter is the age at which the newest backup is reported
+// stale. A fixed daily time backs up every 24 hours (failures are retried), so
+// a day plus an hour of slack is already late; interval mode keeps two
+// intervals.
+func (m *Monitor) storeBackupStaleAfter() time.Duration {
+	if _, ok := storeBackupDailyAt(m.cfg.StoreBackupDailyAt); ok {
+		return 25 * time.Hour
+	}
+	return 2*m.storeBackupInterval() + 10*time.Minute
+}
+
 func (m *Monitor) storeBackupRetention() int {
 	retention := m.cfg.StoreBackupRetention
 	if retention <= 0 {
@@ -1366,52 +1377,62 @@ func storeBackupLastSlot(now time.Time, minute int) time.Time {
 	return slot
 }
 
-// newestStoreBackupAt returns the creation time of the newest verified backup
-// set, or zero when none can be read (which makes the caller back up).
-func (m *Monitor) newestStoreBackupAt(now time.Time, mainEnabled, factsEnabled bool) time.Time {
-	var paths []string
-	if mainEnabled {
-		paths = append(paths, m.cfg.StorePath)
-	}
-	if factsEnabled {
-		paths = append(paths, m.cfg.UsageFactsStorePath)
-	}
-	m.storeBackupMu.Lock()
-	entries, err := scanRuntimeBackupSets(m.storeBackupDir(), now, paths)
-	m.storeBackupMu.Unlock()
-	if err != nil || len(entries) == 0 {
-		return time.Time{}
-	}
-	return time.Unix(entries[0].manifest.CreatedAt, 0)
-}
+// storeBackupDailyRetryDelay is how long a failed fixed-time backup waits
+// before trying again, instead of waiting for the next day's slot.
+var storeBackupDailyRetryDelay = 30 * time.Minute
+
+// storeBackupDailyStartDelay keeps the first backup check clear of startup.
+var storeBackupDailyStartDelay = 5 * time.Minute
 
 // runDailyStoreBackups backs up at a fixed UTC time every day, so restarts do
 // not move the schedule (an off-host copy can then be timed after it). After a
-// restart that missed the latest slot, one catch-up backup runs once startup
-// settles; the following backups stay on the fixed time.
+// restart, a verified backup taken since the latest slot is adopted so backup
+// health survives the restart; otherwise one catch-up backup runs once startup
+// settles. A failed backup is retried every storeBackupDailyRetryDelay until it
+// succeeds or the next slot arrives.
 func (m *Monitor) runDailyStoreBackups(ctx context.Context, minute int, mainEnabled, factsEnabled bool) {
-	initial := time.NewTimer(5 * time.Minute)
+	initial := time.NewTimer(storeBackupDailyStartDelay)
 	defer initial.Stop()
 	select {
 	case <-ctx.Done():
 		return
 	case <-initial.C:
 	}
+	var lastGood time.Time
+	if createdAt, err := m.adoptStoreBackupSet(ctx, time.Now(), mainEnabled, factsEnabled, func(createdAt time.Time) bool {
+		return !createdAt.Before(storeBackupLastSlot(time.Now(), minute))
+	}); err != nil {
+		if errors.Is(err, context.Canceled) {
+			return
+		}
+		slog.Warn("无法复用现有在线备份，尝试生成新备份", "err", err)
+	} else if !createdAt.IsZero() {
+		lastGood = createdAt
+		slog.Info("现有成套备份已验证，沿用定时备份", "created_at_utc", createdAt.UTC().Format("2006-01-02 15:04"))
+	}
 	for {
 		now := time.Now()
 		slot := storeBackupLastSlot(now, minute)
-		if m.newestStoreBackupAt(now, mainEnabled, factsEnabled).Before(slot) {
+		next := slot.AddDate(0, 0, 1)
+		wait := time.Until(next) + time.Second
+		if lastGood.Before(slot) {
 			if _, err := m.createStoreBackupSet(ctx, now, mainEnabled, factsEnabled); err != nil {
-				if !errors.Is(err, context.Canceled) {
-					slog.Error("Monitor 双库成套在线备份失败", "err", err)
+				if errors.Is(err, context.Canceled) {
+					return
+				}
+				slog.Error("Monitor 双库成套在线备份失败", "err", err, "retry_in", storeBackupDailyRetryDelay)
+				if storeBackupDailyRetryDelay < wait {
+					wait = storeBackupDailyRetryDelay
 				}
 			} else {
+				lastGood = now
 				slog.Info("Monitor 双库成套在线备份完成")
 			}
 		}
-		next := slot.AddDate(0, 0, 1)
-		slog.Info("下一次 Monitor 定时备份", "at_utc", next.Format("2006-01-02 15:04"))
-		timer := time.NewTimer(time.Until(next) + time.Second)
+		if !lastGood.Before(slot) {
+			slog.Info("下一次 Monitor 定时备份", "at_utc", next.Format("2006-01-02 15:04"))
+		}
+		timer := time.NewTimer(wait)
 		select {
 		case <-ctx.Done():
 			timer.Stop()
