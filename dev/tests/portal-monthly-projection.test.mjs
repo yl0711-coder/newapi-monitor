@@ -10,7 +10,7 @@ const html=readFileSync(new URL('../../monitor/portal.html',import.meta.url),'ut
 const ctx=vm.createContext({});
 for(const name of ['esc','fmtNum'])vm.runInContext(html.match(new RegExp(`^const ${name}=.*$`,'m'))[0],ctx);
 vm.runInContext(html.match(/^function fmtLogTime\([^]*?^.*?;}/m)[0],ctx);
-for(const name of ['monthlyMoney','monthlySummaryPrecision','monthlyDisplayUnits','monthlyDisplayCentsMoney','monthlyDisplayResidual','monthlyDisplayNonzero','monthlyNetDisplayResidual','monthlyDisplayNetColumnResidual','monthlyWalletDisplayResidual','monthlyWalletDisplayClosing','monthlyDisplayWallet','monthlyMemberDisplayProjection','monthlyTokens','renderMonthlyMembers','renderMonthlyTokenRows','renderMonthlyStatement','renderMonthlyList']){
+for(const name of ['monthlyMoney','monthlySummaryPrecision','monthlyDisplayUnits','monthlyDisplayCentsMoney','monthlyDisplayResidual','monthlyDisplayNonzero','monthlyNetDisplayResidual','monthlyDisplayNetColumnResidual','monthlyWalletDisplayResidual','monthlyWalletDisplayClosing','monthlyDisplayWallet','monthlyMemberDisplayProjection','monthlyTokens','renderMonthlyMembers','renderMonthlyTokenRows','monthlyCentsOf','monthlyCentsMoney','monthlySubNet','renderMonthlySubscription','renderMonthlyStatement','renderMonthlyList']){
   vm.runInContext(html.match(new RegExp(`^function ${name}\\([^]*?^}`,'m'))[0],ctx);
 }
 const text=markup=>markup.replace(/<[^>]*>/g,'').replace(/&(amp|lt|gt|quot|#39);/g,(_,k)=>({amp:'&',lt:'<',gt:'>',quot:'"','#39':"'"}[k]));

@@ -6,7 +6,7 @@ import vm from 'node:vm';
 const source = fs.readFileSync(new URL('../../monitor/portal_monthly_generation_local.js', import.meta.url), 'utf8');
 const flush = async () => { for (let i = 0; i < 8; i++) await Promise.resolve(); };
 function fixture(month = '2026-09', calendar = false) {
-  const nodes = {}, calls = [], timers = new Map(), docEvents = {}, winEvents = {}, refreshed = [];
+  const nodes = {}, calls = [], timers = new Map(), intervals = new Map(), docEvents = {}, winEvents = {}, refreshed = [];
   let next = 0, observer;
   const node = id => nodes[id] ||= {style: {display: 'block'}, value: '', disabled: false, textContent: '', events: {}, before() {}, addEventListener(k, fn) { this.events[k] = fn; }};
   node('monthlyMonth').value = month;
@@ -16,6 +16,7 @@ function fixture(month = '2026-09', calendar = false) {
     loadMonthlyList: () => { refreshed.push(node('monthlyMonth').value); },
     MutationObserver: class {constructor(fn) { observer = fn; } observe() {}},
     setTimeout(fn, delay) { const id = ++next; timers.set(id, {fn, delay}); return id; }, clearTimeout(id) { timers.delete(id); },
+    setInterval(fn, delay) { const id = ++next; intervals.set(id, {fn, delay}); return id; }, clearInterval(id) { intervals.delete(id); },
     fetch(url, options) { return new Promise((resolve, reject) => calls.push({url, options, resolve, reject})); }
   });
   vm.runInContext(calendar ? source.replace('/*MONTHLY_CALENDAR_ENABLED*/ false', '/*MONTHLY_CALENDAR_ENABLED*/ true') : source, ctx);
@@ -25,7 +26,7 @@ function fixture(month = '2026-09', calendar = false) {
     call.resolve({status, ok: status >= 200 && status < 300, json: async () => ({month: m, state, message: '<sensitive raw error>'})}); await flush();
   };
   const fire = async delay => { const pair = [...timers].find(([, t]) => t.delay === delay); assert.ok(pair, `timer ${delay}`); timers.delete(pair[0]); pair[1].fn(); await flush(); };
-  return {nodes, node, calls, timers, document, docEvents, winEvents, refreshed, reply, fire, observe: () => observer()};
+  return {nodes, node, calls, timers, intervals, document, docEvents, winEvents, refreshed, reply, fire, observe: () => observer()};
 }
 
 test('read first; only explicit click posts once; draft readiness never publishes or downloads', async () => {
@@ -302,4 +303,16 @@ test('refresh discovers the new server month without a reload, new generation or
   await f.reply(4, 'not_requested');
   assert.equal(f.node('monthlyGenerate').disabled, false);
   assert.ok(f.calls.every(c => c.options.method === 'GET'));
+});
+
+test('progress bar stops when automatic refresh stops (busy, error, poll limit)', async () => {
+  for (const stopAt of [429, 503, 'reject']) {
+    const f = fixture(); await f.reply(0, 'processing'); assert.equal(f.intervals.size, 1);
+    await f.fire(5000);
+    if (stopAt === 'reject') { f.calls[1].reject(new Error('network')); await flush(); } else await f.reply(1, 'processing', stopAt);
+    assert.equal(f.intervals.size, 0, String(stopAt)); assert.equal(f.timers.size, 0);
+  }
+  const f = fixture(); for (let i = 0; i < 120; i++) { await f.reply(i, 'processing'); if (i < 119) await f.fire(5000); }
+  assert.equal(f.intervals.size, 0); assert.match(f.node('monthlyGenerationStatus').textContent, /暂停自动/);
+  f.node('monthlyGenerationCheck').events.click(); await f.reply(120, 'processing'); assert.equal(f.intervals.size, 1);
 });

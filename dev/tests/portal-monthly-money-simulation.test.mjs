@@ -8,7 +8,7 @@ import {isAbsolute} from 'node:path';
 // come from the independent Go/rational simulation and never from a live site.
 const source=readFileSync(new URL('../../monitor/portal.html',import.meta.url),'utf8');
 const ctx=vm.createContext({esc:v=>String(v).replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;').replaceAll("'",'&#39;'),fmtNum:String,fmtLogTime:String});
-for(const name of ['monthlyMoney','monthlySummaryPrecision','monthlyDisplayUnits','monthlyDisplayCentsMoney','monthlyDisplayResidual','monthlyDisplayNonzero','monthlyNetDisplayResidual','monthlyDisplayNetColumnResidual','monthlyWalletDisplayResidual','monthlyWalletDisplayClosing','monthlyDisplayWallet','monthlyMemberDisplayProjection','monthlyTokens','renderMonthlyMembers','renderMonthlyTokenRows','renderMonthlyStatement']){
+for(const name of ['monthlyMoney','monthlySummaryPrecision','monthlyDisplayUnits','monthlyDisplayCentsMoney','monthlyDisplayResidual','monthlyDisplayNonzero','monthlyNetDisplayResidual','monthlyDisplayNetColumnResidual','monthlyWalletDisplayResidual','monthlyWalletDisplayClosing','monthlyDisplayWallet','monthlyMemberDisplayProjection','monthlyTokens','renderMonthlyMembers','renderMonthlyTokenRows','monthlyCentsOf','monthlyCentsMoney','monthlySubNet','renderMonthlySubscription','renderMonthlyStatement']){
   vm.runInContext(source.match(new RegExp(`^function ${name}\\([^]*?^}`,'m'))[0],ctx);
 }
 const amountCells=markup=>[...markup.matchAll(/<td class="money">¥(-?[\d,]+\.\d{2})<\/td>/g)].map(m=>m[1].replaceAll(',',''));

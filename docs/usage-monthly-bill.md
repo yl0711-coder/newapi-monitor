@@ -156,7 +156,9 @@
 |---|---|
 | `MONITOR_PORTAL_MONTHLY_STATEMENT_ENABLED` | 月度账单页面/API，总开关，默认 `false` |
 | `MONITOR_PORTAL_MONTHLY_GENERATION_ENABLED` | 后台生成，默认 `false`；依赖 Usage 监听及页面开关 |
-| `MONITOR_PORTAL_MONTHLY_GENERATION_MODE` | 默认 `draft`，只准备草稿；本轮连续月份保存显式选 `automatic-series`，兼容原有 `automatic` 单月模式 |
+| `MONITOR_PORTAL_MONTHLY_GENERATION_MODE` | 默认 `draft`，只准备草稿；本轮连续月份保存显式选 `automatic-series`，兼容原有 `automatic` 单月模式；`simple` 为简化生成（见下节），其余生成变量在该模式下被忽略 |
+| `MONITOR_PORTAL_SUBSCRIPTION_PLANS` | 仅 `simple` 模式：NewAPI 订阅套餐的对外名称和售价，JSON，键为套餐 ID，例如 `{"2":{"name":"GPT模型调用服务月卡","price":"10000.00"}}`。某月开通了未配置的套餐时，该月账单转人工复核 |
+| `MONITOR_PORTAL_SUBSCRIPTION_OVERRIDES` | 仅 `simple` 模式：按订阅记录 ID 覆盖，例如试用 `{"16":{"trial":true}}`（金额记 0，名称后加“（试用）”），也可单独覆盖 `name`/`price` |
 | `MONITOR_PORTAL_MONTHLY_GENERATION_DISPLAY_SERIES_INDEX` | `automatic-series` 模式必填；私有资料根内的固定起点范围索引文件名，其他模式不得配置 |
 | `MONITOR_PORTAL_MONTHLY_GENERATION_TARGETS` | 明确的 `组织ID:YYYY-MM` 白名单，逗号分隔，最多 32 项；不是 NewAPI 用户 ID |
 | `MONITOR_PORTAL_MONTHLY_GENERATION_SCOPE_SOURCE` | `automatic` 模式必须设置的规范来源标识，与留存计划一致 |
@@ -164,6 +166,16 @@
 | `MONITOR_PORTAL_MONTHLY_GENERATION_FUNDING` | 已封存资金资料库的绝对路径，以只读方式使用 |
 | `MONITOR_PORTAL_MONTHLY_GENERATION_EVIDENCE` | 私有留存资料根目录 |
 | `MONITOR_PORTAL_MONTHLY_GENERATION_PREPARATION_INBOX` | 可选资料接收目录；仅 `automatic` 模式可用 |
+
+## 简化生成模式（`simple`）
+
+客户在门户点“生成”后进入单一后台队列，单次约 25～35 秒（其中 20 秒为两次余额读取的固定间隔，用于排除在途扣费），排队时页面显示前面还有几份及预计时间。
+
+- **口径**：每月消费、退款、请求数、Token 数取 Monitor 本地已与 NewAPI 日志核验过的每日用量事实（`usage_daily_facts`）；充值、赠送、扣减取从库资金日志。余额从成员注册时的 0 按日志逐月前推：`月末 = 月初 + 充值赠送 + 调整 − 余额支付消费 + 退款`，结果与生成顺序无关，用过的月界冻结、后续复用。消费不因任何余额差额而改动。
+- **内部对账**：每次生成用 NewAPI 当前钱包反推月末余额，与日志前推结果的差额只写入 `portal_monthly_simple_audits.wallet_residual`，不出现在客户账单；差额超过 5 元或钱包低于日志推算值时不出账，转人工复核（典型原因：线下改余额未留日志）。
+- **订阅**：日志 `other.billing_source=subscription` 的用量（扣除 `wallet_quota_deducted`）计为“套餐内”，不进入余额；订阅开通当月在账单最前加“订阅服务账单”页，名称、售价取 `MONITOR_PORTAL_SUBSCRIPTION_PLANS`/`_OVERRIDES`。订阅部分保存在 `portal_monthly_simple_subscriptions`，其 SHA-256 写入账单证据的 `source_reference`（`;subscriptions=sha256:`），读取时校验。
+- **Excel**：版式与业务已发给客户的模板一致（页序：账号收支 / 月度账单 / 令牌消费，样式表取自该模板 `monitor/portal_monthly_simple_styles.xml`）。有订阅时三页增加“其中套餐内”“其中余额支付”。导出前校验各余额等式与合计，不一致拒绝导出。
+- **金额精度**：每个显示金额与真实值相差不超过 1 分，真实为 0 显示为 0，账单逐账号、逐组织精确平衡，相邻月份首尾相接。
 
 权限依据固定为当前 `MONITOR_STORE_PATH` 对应的主库，不提供客户自选数据库入口。开启生成时，配置错误必须在开始服务前被发现；关闭生成时不打开或校验遗留生成路径。
 

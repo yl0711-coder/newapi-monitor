@@ -349,6 +349,10 @@ func classifySourceErrorWithFallback(err error, fallback sourceErrorClass) sourc
 	if errors.As(err, &netErr) {
 		return sourceErrorTransient
 	}
+	// The peer closing the connection (replica restart or failover, a killed
+	// idle connection, a dropped tunnel) surfaces as the driver's
+	// ErrInvalidConn. It is a network event, never a configuration error:
+	// treating it as permanent would stop source reads until a manual restart.
 	for _, transient := range []error{
 		context.Canceled, context.DeadlineExceeded, driver.ErrBadConn, io.EOF,
 		sql.ErrConnDone, mysqlDriver.ErrInvalidConn, mysqlDriver.ErrMalformPkt,
@@ -363,7 +367,7 @@ func classifySourceErrorWithFallback(err error, fallback sourceErrorClass) sourc
 	message := strings.ToLower(err.Error())
 	for _, fragment := range []string{
 		"connection refused", "connection reset", "broken pipe", "i/o timeout",
-		"server has gone away", "lost connection", "bad connection", "unexpected eof",
+		"server has gone away", "lost connection", "bad connection", "unexpected eof", "invalid connection",
 	} {
 		if strings.Contains(message, fragment) {
 			return sourceErrorTransient
@@ -1729,7 +1733,7 @@ func (m *Monitor) readyStatus(now time.Time) (readyStatusResponse, int) {
 			response.DegradedReasons = appendReason(response.DegradedReasons, "local_backup_failed")
 		} else if lastSuccess == 0 && uptime > backupGrace {
 			response.DegradedReasons = appendReason(response.DegradedReasons, "local_backup_missing")
-		} else if lastSuccess > 0 && now.Unix()-lastSuccess > int64((2*m.storeBackupInterval()+10*time.Minute).Seconds()) {
+		} else if lastSuccess > 0 && now.Unix()-lastSuccess > int64(m.storeBackupStaleAfter().Seconds()) {
 			response.DegradedReasons = appendReason(response.DegradedReasons, "local_backup_stale")
 		}
 	}
@@ -1740,7 +1744,7 @@ func (m *Monitor) readyStatus(now time.Time) (readyStatusResponse, int) {
 			response.DegradedReasons = appendReason(response.DegradedReasons, "facts_backup_failed")
 		} else if lastSuccess == 0 && uptime > backupGrace {
 			response.DegradedReasons = appendReason(response.DegradedReasons, "facts_backup_missing")
-		} else if lastSuccess > 0 && now.Unix()-lastSuccess > int64((2*m.storeBackupInterval()+10*time.Minute).Seconds()) {
+		} else if lastSuccess > 0 && now.Unix()-lastSuccess > int64(m.storeBackupStaleAfter().Seconds()) {
 			response.DegradedReasons = appendReason(response.DegradedReasons, "facts_backup_stale")
 		}
 	}
@@ -1753,7 +1757,7 @@ func (m *Monitor) readyStatus(now time.Time) (readyStatusResponse, int) {
 			response.DegradedReasons = appendReason(response.DegradedReasons, "backup_set_missing")
 		case setSuccess > 0 && !m.storeBackupSetVerified.Load():
 			response.DegradedReasons = appendReason(response.DegradedReasons, "backup_set_unverified")
-		case setSuccess > 0 && now.Unix()-setSuccess > int64((2*m.storeBackupInterval()+10*time.Minute).Seconds()):
+		case setSuccess > 0 && now.Unix()-setSuccess > int64(m.storeBackupStaleAfter().Seconds()):
 			response.DegradedReasons = appendReason(response.DegradedReasons, "backup_set_stale")
 		}
 	}

@@ -18,6 +18,8 @@ monitor/**
 !monitor/*.js
 !monitor/*.css
 !monitor/logchain_diagnostic_rules.json
+# Cell styles of the customer-approved monthly statement (embedded).
+!monitor/portal_monthly_simple_styles.xml
 !monitor/public/
 monitor/public/**
 !monitor/public/*.go

@@ -21,6 +21,73 @@
     needs_review: '该月账单暂未生成，请联系客服协助处理。',
     temporarily_unavailable: '账单暂时未能生成，请稍后查看。'
   };
+  // Pending-generation row in the saved-bill list: shows that the month is
+  // being generated with a coarse progress estimate. It never shows amounts;
+  // the list, detail and download endpoints stay authoritative.
+  // The progress row is an enhancement: without the DOM APIs it needs (or in
+  // a minimal host page) generation still works and the row is skipped.
+  let pending = null, ticker = null;
+  const byId = id => typeof document.getElementById === 'function' ? document.getElementById(id) : null;
+  const every = (fn, ms) => typeof setInterval === 'function' ? setInterval(fn, ms) : null;
+  const cancelEvery = handle => { if (handle !== null && typeof clearInterval === 'function') clearInterval(handle); };
+  const fmtWait = sec => sec >= 90 ? '约 ' + Math.ceil(sec / 60) + ' 分钟' : '约 ' + Math.max(5, Math.ceil(sec / 5) * 5) + ' 秒';
+  function pendingView() {
+    if (!pending) return null;
+    const p = pending.progress || {};
+    const est = Math.max(1, Number(p.estimated_seconds) || 35);
+    const elapsed = (Number(p.elapsed_seconds) || 0) + (Date.now() - pending.at) / 1000;
+    if (pending.state === 'queued') {
+      const ahead = Number(p.queue_ahead) || 0;
+      return {pct: 3 + 9 * Math.min(1, elapsed / est), text: ahead > 0 ? '排队中，前面还有 ' + ahead + ' 份账单，预计' + fmtWait(Math.max(0, est - elapsed)) + '后开始' : '即将开始生成…'};
+    }
+    if (pending.state === 'processing') {
+      const r = elapsed / est;
+      const stage = r < 0.35 ? '正在读取充值与消费记录' : r < 0.8 ? '正在核对账户余额' : '正在生成并核对账单';
+      const left = est - elapsed;
+      return {pct: 12 + 83 * (1 - Math.exp(-1.6 * r)), text: stage + '，' + (left > 3 ? '预计还需' + fmtWait(left) : '即将完成…')};
+    }
+    if (pending.state === 'finalizing') return {pct: 97, text: '正在保存账单…'};
+    if (pending.state === 'needs_review') return {pct: 0, text: '该月账单暂未生成，请联系客服协助处理。', stopped: true};
+    if (pending.state === 'paused') return {pct: 0, text: '已暂停自动刷新进度，可点击刷新进度查看；不会重复提交。', stopped: true, paused: true};
+    return null;
+  }
+  function renderPending() {
+    const content = $('monthlyContent');
+    if (!content || typeof content.querySelector !== 'function') return;
+    const old = byId('monthlyGenRow');
+    const view = pendingView();
+    const table = content.querySelector('table');
+    if (!view || !table || !table.tBodies[0]) { if (old) old.remove(); return; }
+    const body = table.tBodies[0], cols = table.tHead ? table.tHead.rows[0].cells.length : 8;
+    // The saved bill already listed means generation finished: no placeholder.
+    for (const row of body.rows) if (row.id !== 'monthlyGenRow' && row.cells[0] && row.cells[0].textContent.trim() === pending.month) { if (old) old.remove(); return; }
+    for (const row of [...body.rows]) if (row.id !== 'monthlyGenRow' && row.cells.length === 1) row.remove(); // "没有符合条件的月份"
+    const tr = old || document.createElement('tr');
+    tr.id = 'monthlyGenRow';
+    const bar = view.stopped ? '' : '<div style="height:8px;background:#e5edf5;border-radius:4px;overflow:hidden;margin-bottom:6px"><i style="display:block;height:100%;width:' + view.pct.toFixed(1) + '%;background:#1f4e78;transition:width 1s linear"></i></div>';
+    tr.innerHTML = '<td>' + pending.month + '</td><td colspan="' + Math.max(1, cols - 3) + '">' + bar + '<span style="color:#475569">' + view.text + (view.stopped ? '' : '（可离开此页面，完成后在列表中查看）') + '</span></td><td>' + (view.paused ? '状态待刷新' : view.stopped ? '未生成' : '生成中') + '</td><td>—</td>';
+    if (!old) body.insertBefore(tr, body.firstChild);
+  }
+  function setPending(month, state, progress) {
+    if (['queued', 'processing', 'finalizing', 'needs_review'].includes(state)) {
+      pending = {month, state, progress: progress || null, at: Date.now()};
+      if (!ticker && state !== 'needs_review') ticker = every(renderPending, 1000);
+    } else {
+      pending = null;
+    }
+    if ((!pending || pending.state === 'needs_review') && ticker) { cancelEvery(ticker); ticker = null; }
+    renderPending();
+  }
+  // Polling stopped (busy server, error, poll limit): the bar must not keep
+  // advancing as if the job were progressing. Keeps the row, stops the clock.
+  function pausePending(month) {
+    if (ticker) { cancelEvery(ticker); ticker = null; }
+    if (pending && pending.month === month && pending.state !== 'needs_review') pending = {month, state: 'paused', progress: null, at: Date.now()};
+    renderPending();
+  }
+  if ($('monthlyContent') && typeof MutationObserver === 'function') {
+    new MutationObserver(() => { if (pending && !byId('monthlyGenRow')) renderPending(); }).observe($('monthlyContent'), {childList: true});
+  }
   let epoch = 0, selected = '', timer = null, controller = null;
   let state = '', busy = false, posting = false, polls = 0, suspended = false, refreshed = '';
   let calendar = null, calendarLoading = false, calendarFailed = false, calendarUnauthorized = false, calendarController = null, calendarEpoch = 0;
@@ -80,6 +147,7 @@
     clearTimeout(timer); timer = null;
     if (controller) controller.abort();
     controller = null; busy = false; state = ''; polls = 0; refreshed = '';
+    pending = null; if (ticker) { cancelEvery(ticker); ticker = null; } renderPending();
   }
   function sync() {
     const month = activeMonth();
@@ -114,16 +182,18 @@
           const problem = await response.json();
           if (!current()) return;
           if (problem.code === 'not_prepared' || problem.code === 'needs_review') {
-            state = problem.code; status.textContent = messages[state]; return;
+            state = problem.code; status.textContent = messages[state]; setPending(month, state, null); return;
           }
         }
         status.textContent = response.status === 429 ? '服务暂忙，已停止自动刷新；请稍后刷新进度。' : '暂未确认生成状态，请刷新进度；已发布账单不受影响。';
+        pausePending(month);
         return;
       }
       const data = await response.json();
       if (!current()) return;
       if (data.month !== month || !Object.hasOwn(messages, data.state)) throw new Error('invalid status');
       state = data.state; status.textContent = messages[state];
+      setPending(month, state, data.progress);
       if (state === 'available' && refreshed !== month) {
         // The list/detail/download endpoints remain authoritative for amounts,
         // scope and version. Never enable download from a task response alone.
@@ -132,10 +202,10 @@
       }
       if (state === 'queued' || state === 'processing' || state === 'finalizing') {
         if (++polls < 120) timer = setTimeout(() => { timer = null; void request(false); }, 5000);
-        else status.textContent += ' 已暂停自动刷新，可手动刷新进度。';
+        else { status.textContent += ' 已暂停自动刷新，可手动刷新进度。'; pausePending(month); }
       }
     } catch (_) {
-      if (current()) { state = ''; status.textContent = timedOut ? '请求超时，请刷新进度确认是否已受理；不会自动重复提交。' : '暂时无法读取进度，请稍后刷新；不会自动重复提交。'; }
+      if (current()) { state = ''; status.textContent = timedOut ? '请求超时，请刷新进度确认是否已受理；不会自动重复提交。' : '暂时无法读取进度，请稍后刷新；不会自动重复提交。'; pausePending(month); }
     } finally {
       clearTimeout(timeout);
       if (write) posting = false;

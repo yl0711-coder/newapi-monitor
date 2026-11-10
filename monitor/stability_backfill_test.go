@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
@@ -840,5 +841,124 @@ func TestUsageAdminLabelsAndGroupOrderContract(t *testing.T) {
 	}
 	if strings.Contains(portalHTML, "关注客户数") {
 		t.Fatal("本轮管理端文案不得进入 Usage Portal")
+	}
+}
+
+// A busy hour whose single query exceeds MAX_EXECUTION_TIME must still be
+// repairable: windows are read and control-verified separately, then merged
+// into exactly the rows one whole-hour query would have produced.
+func TestFetchStabilityHourSplitsTimedOutHourIntoIdenticalRows(t *testing.T) {
+	m := newStabilityTestMonitor(t)
+	m.cfg.StabilityBackfillDelayMS = -1
+	m.cfg.StabilityBackfillSourceDutyPercent = 100
+	m.prodDB = newFakeProdDB(t)
+	m.usageDayExpr = usageDayExprSQLite
+	base := time.Date(2026, 11, 9, 16, 0, 0, 0, cstLocation).Unix()
+	id := int64(0)
+	insert := func(offset int64, channel int, model, grp string, typ, quota, prompt, completion int64, tokenName, content string, stream int, other string) {
+		id++
+		if _, err := m.prodDB.Exec(`INSERT INTO logs
+			(id,user_id,channel_id,created_at,type,model_name,quota,prompt_tokens,completion_tokens,use_time,`+"`group`"+`,token_id,token_name,is_stream,content,other,request_id)
+			VALUES (?,2,?,?,?,?,?,?,?,?,?,1,?,?,?,?,?)`,
+			id, channel, base+offset, typ, model, quota, prompt, completion, offset%7+1, grp, tokenName, stream, content, other, "split-"+strconv.FormatInt(id, 10)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Rows across all six 10-minute windows and inside one 1-minute window.
+	for offset := int64(5); offset < 3600; offset += 173 {
+		insert(offset, 9, "m1", "g1", 2, 100+offset%13, 7, 3, "customer", "ok", 1, fmt.Sprintf(`{"frt":%d}`, 400+offset%4000))
+		insert(offset+1, 9, "m2", "g1", 2, 50, 4, 4, "customer", "ok", 0, `{}`)
+		if offset%3 == 0 {
+			insert(offset+2, 11, "m1", "g2", 5, 0, 0, 0, "customer", "status_code=503 request timeout", 0, `{}`)
+		}
+		if offset%5 == 0 {
+			insert(offset+3, 11, "m1", "g2", 2, 60, 3, 3, "模型测试", "模型测试", 0, `{}`)
+		}
+	}
+	want, err := m.fetchStabilityHour(context.Background(), base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(want.Users) < 3 || len(want.InternalTests) == 0 {
+		t.Fatalf("fixture too small: users=%d tests=%d", len(want.Users), len(want.InternalTests))
+	}
+	timeout := &mysql.MySQLError{Number: 3024, Message: "maximum statement execution time exceeded"}
+	var windows [][2]int64
+	stabilityWindowTestFault = func(from, to int64) error {
+		windows = append(windows, [2]int64{from, to})
+		if to-from == 3600 || (from == base+1200 && to-from == 600) {
+			return timeout // whole hour, and one 10-minute window, time out
+		}
+		return nil
+	}
+	t.Cleanup(func() { stabilityWindowTestFault = nil })
+	got, err := m.fetchStabilityHour(context.Background(), base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	minuteWindows := 0
+	for _, w := range windows {
+		if w[1]-w[0] == 60 {
+			minuteWindows++
+		}
+	}
+	if minuteWindows != 10 {
+		t.Fatalf("slow 10-minute window must be read as 10 one-minute windows, got windows=%v", windows)
+	}
+	normalize := func(tr stabilityHourTraffic) string {
+		sort.Slice(tr.Users, func(i, j int) bool {
+			a, b := tr.Users[i], tr.Users[j]
+			return fmt.Sprint(a.ChannelID, a.ModelName, a.Grp) < fmt.Sprint(b.ChannelID, b.ModelName, b.Grp)
+		})
+		sort.Slice(tr.InternalTests, func(i, j int) bool {
+			a, b := tr.InternalTests[i], tr.InternalTests[j]
+			return fmt.Sprint(a.ChannelID, a.ModelName, a.Grp, a.Origin) < fmt.Sprint(b.ChannelID, b.ModelName, b.Grp, b.Origin)
+		})
+		return fmt.Sprintf("%+v", tr)
+	}
+	if normalize(got) != normalize(want) {
+		t.Fatalf("split result differs from whole-hour result\n got %s\nwant %s", normalize(got), normalize(want))
+	}
+	// A non-timeout error is not masked by splitting.
+	stabilityWindowTestFault = func(from, to int64) error {
+		if to-from == 3600 {
+			return errors.New("connection refused")
+		}
+		return nil
+	}
+	if _, err := m.fetchStabilityHour(context.Background(), base); err == nil || !strings.Contains(err.Error(), "connection refused") {
+		t.Fatalf("non-timeout errors must surface, got %v", err)
+	}
+	// The bulk migration job's fetcher splits a timed-out single hour too, and
+	// reports the merged rows and every source query it made.
+	stabilityWindowTestFault = func(from, to int64) error {
+		if to-from == 3600 {
+			return timeout
+		}
+		return nil
+	}
+	bulk, err := m.fetchStabilityRangeSplitting(context.Background(), base, base+3600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if normalize(bulk.Hours[base]) != normalize(want) || bulk.Rows != len(want.Users)+len(want.InternalTests) || bulk.SourceQueries < 7 {
+		t.Fatalf("bulk fetcher split: rows=%d queries=%d", bulk.Rows, bulk.SourceQueries)
+	}
+	// A multi-hour batch is not split; it degrades to single hours instead.
+	stabilityWindowTestFault = func(from, to int64) error {
+		if to-from >= 3600 {
+			return timeout
+		}
+		return nil
+	}
+	if _, err := m.fetchStabilityRangeSplitting(context.Background(), base, base+7200); err == nil || !stabilityRangeShouldFallback(err) {
+		t.Fatalf("multi-hour batch must fail for the caller to shrink it, got %v", err)
+	}
+	// The merged hour keeps the per-hour row cap and does not split again.
+	oldCap := maxStabilityRowsPerHourLimit
+	maxStabilityRowsPerHourLimit = 2
+	t.Cleanup(func() { maxStabilityRowsPerHourLimit = oldCap })
+	if _, err := m.fetchStabilityRangeSplitting(context.Background(), base, base+3600); err == nil || stabilityRangeShouldFallback(err) {
+		t.Fatalf("merged hour over the row cap: %v", err)
 	}
 }

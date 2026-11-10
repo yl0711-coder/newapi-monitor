@@ -23,8 +23,18 @@ var portalMonthlyGenerationLocalJS string
 // raw diagnostics and publication identifiers. A ready draft is NOT a saved bill;
 // only the HTTP adapter can derive "available" from a validated publication.
 type MonthlyGenerationView struct {
-	Month string
-	State string
+	Month    string
+	State    string
+	Progress *MonthlyGenerationProgress // optional, for the customer's progress display
+}
+
+// MonthlyGenerationProgress is a coarse, customer-safe progress hint: how many
+// requests are ahead in the shared queue, how long this one has been waiting or
+// running, and a typical duration. It carries no amounts or diagnostics.
+type MonthlyGenerationProgress struct {
+	QueueAhead       int   `json:"queue_ahead"`
+	ElapsedSeconds   int64 `json:"elapsed_seconds"`
+	EstimatedSeconds int64 `json:"estimated_seconds"`
 }
 
 // MonthlyGenerationFailure carries an allowlisted code, never a raw diagnostic.
@@ -111,19 +121,34 @@ func (m *Monitor) registerMonthlyGenerationAPI(r *gin.Engine, service MonthlyGen
 			return errors.New("monthly generation routes already registered")
 		}
 	}
-	// Bounded in-flight metadata/admission operations; no waiting queue or timer
-	// goroutine. Long-running calculation is never executed inside an HTTP call.
+	// Bounded in-flight metadata/admission operations; a request waits at most
+	// two seconds for a slot (no queue, no extra goroutine). Long-running
+	// calculation is never executed inside an HTTP call.
 	slots := make(chan struct{}, 4)
 	gate := func(c *gin.Context) {
 		c.Header("Cache-Control", "private, no-store")
 		c.Header("X-Content-Type-Options", "nosniff")
+		// Admission takes milliseconds, so a burst of clicks briefly waits for
+		// a slot instead of being turned away; only a sustained overload (or a
+		// cancelled request) is reported as busy.
 		select {
 		case slots <- struct{}{}:
 			defer func() { <-slots }()
 		default:
-			monthlyGenerationHTTPError(c, MonthlyGenerationFailure("temporarily_busy"))
-			c.Abort()
-			return
+			wait := time.NewTimer(2 * time.Second)
+			select {
+			case slots <- struct{}{}:
+				wait.Stop()
+				defer func() { <-slots }()
+			case <-wait.C:
+				monthlyGenerationHTTPError(c, MonthlyGenerationFailure("temporarily_busy"))
+				c.Abort()
+				return
+			case <-c.Request.Context().Done():
+				wait.Stop()
+				c.Abort()
+				return
+			}
 		}
 		ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
 		defer cancel()
@@ -274,7 +299,11 @@ func (m *Monitor) monthlyGenerationHTTP(service MonthlyGenerationService, submit
 		if submit && record == nil {
 			code = http.StatusAccepted
 		}
-		c.JSON(code, gin.H{"month": month, "state": view.State, "message": message})
+		body := gin.H{"month": month, "state": view.State, "message": message}
+		if view.Progress != nil && view.State != "available" {
+			body["progress"] = view.Progress
+		}
+		c.JSON(code, body)
 	}
 }
 

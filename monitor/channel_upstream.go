@@ -464,6 +464,17 @@ func (e *upstreamHTTPError) Error() string {
 	return fmt.Sprintf("上游返回 HTTP %d：%s", e.Status, e.Message)
 }
 
+// upstreamRemoteError carries an error message taken from an upstream
+// response body (the upstream's own failure, not ours).
+type upstreamRemoteError struct{ message string }
+
+func (e *upstreamRemoteError) Error() string { return e.message }
+
+const (
+	sqliteCodeBusy   = 5
+	sqliteCodeLocked = 6
+)
+
 type upstreamStoredSyncError struct {
 	message string
 	retryAt int64
@@ -1654,12 +1665,27 @@ func aicodeWithEndpoint(baseURL, endpoint string) string {
 }
 
 func newUpstreamHTTPClient(timeout time.Duration) *http.Client {
+	return newUpstreamHTTPClientWithHeaderTimeout(timeout, timeout)
+}
+
+// newMonitorUpstreamHTTPClient is the shared pool for balance and usage calls.
+// Balance requests keep the short total timeout; the usage copy raises only
+// Client.Timeout, so the transport's header wait must allow the usage timeout
+// too, or slow log queries still fail at the balance timeout.
+func newMonitorUpstreamHTTPClient(s Settings) *http.Client {
+	return newUpstreamHTTPClientWithHeaderTimeout(upstreamSyncTimeout(s), upstreamUsageRequestTimeout(s))
+}
+
+func newUpstreamHTTPClientWithHeaderTimeout(timeout, headerTimeout time.Duration) *http.Client {
+	if headerTimeout < timeout {
+		headerTimeout = timeout
+	}
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.MaxIdleConns = 8
 	transport.MaxIdleConnsPerHost = 2
 	transport.IdleConnTimeout = 60 * time.Second
 	transport.TLSHandshakeTimeout = 8 * time.Second
-	transport.ResponseHeaderTimeout = timeout
+	transport.ResponseHeaderTimeout = headerTimeout
 	return &http.Client{
 		Timeout:   timeout,
 		Transport: transport,
@@ -1670,11 +1696,33 @@ func newUpstreamHTTPClient(timeout time.Duration) *http.Client {
 	}
 }
 
+// upstreamUsageRequestTimeout bounds one usage/log request. Log queries scan
+// the upstream's database and are often slower than a balance read; with the
+// balance timeout they failed repeatedly on slow but healthy upstreams.
+func upstreamUsageRequestTimeout(s Settings) time.Duration {
+	seconds := s.UpstreamUsageTimeoutSec
+	if seconds <= 0 {
+		seconds = 45
+	}
+	floor := int(upstreamSyncTimeout(s) / time.Second)
+	seconds = min(max(seconds, floor), 120)
+	return time.Duration(seconds) * time.Second
+}
+
+// channelUpstreamUsageHTTPClient is channelUpstreamHTTPClient with the usage
+// request timeout. It shares the guarded transport (connection pool, host
+// pacing and circuits); only the per-request timeout differs.
+func (m *Monitor) channelUpstreamUsageHTTPClient() *http.Client {
+	usage := *m.channelUpstreamHTTPClient()
+	usage.Timeout = upstreamUsageRequestTimeout(m.cfg)
+	return &usage
+}
+
 func (m *Monitor) channelUpstreamHTTPClient() *http.Client {
 	client := m.upstreamClient
 	if client == nil {
 		// 仅兼容直接构造 Monitor 的单元测试；生产实例均由 New 初始化并复用连接池。
-		client = newUpstreamHTTPClient(upstreamSyncTimeout(m.cfg))
+		client = newMonitorUpstreamHTTPClient(m.cfg)
 	}
 	return installUpstreamHostGuardWithConcurrency(client, m.storeDB, upstreamMaxConcurrency(m.cfg))
 }
@@ -1792,7 +1840,7 @@ func decodeNewAPIData(body []byte, out any) error {
 		if message == "" {
 			message = "请求失败"
 		}
-		return fmt.Errorf("NewAPI：%s", sanitizeUpstreamError(errors.New(message)))
+		return &upstreamRemoteError{message: fmt.Sprintf("NewAPI：%s", sanitizeUpstreamError(errors.New(message)))}
 	}
 	if err := json.Unmarshal(envelope.Data, out); err != nil {
 		return fmt.Errorf("NewAPI 数据格式无效")
@@ -2105,7 +2153,7 @@ func decodeSub2APIData(body []byte, out any) error {
 		if message == "" {
 			message = fmt.Sprintf("错误码 %d", envelope.Code)
 		}
-		return fmt.Errorf("Sub2API：%s", sanitizeUpstreamError(errors.New(message)))
+		return &upstreamRemoteError{message: fmt.Sprintf("Sub2API：%s", sanitizeUpstreamError(errors.New(message)))}
 	}
 	if err := json.Unmarshal(envelope.Data, out); err != nil {
 		return fmt.Errorf("Sub2API 数据格式无效")
@@ -2552,6 +2600,10 @@ func applyUpstreamSyncResult(row *ChannelUpstreamAccount, result upstreamBalance
 		return
 	}
 	row.LastAttemptAt = now
+	if next, paused := upstreamPauseRetryAt(err, now); paused {
+		row.NextSyncAt = next
+		return
+	}
 	if err == nil {
 		row.BalanceUSD = result.BalanceUSD
 		row.BalanceRaw = result.BalanceRaw
@@ -2600,6 +2652,8 @@ func (m *Monitor) credentialForAccount(row ChannelUpstreamAccount) (any, error) 
 	}
 }
 
+const upstreamCredentialLocalWriteTimeout = 20 * time.Second
+
 func (m *Monitor) persistSyncedUpstreamAccount(ctx context.Context, row *ChannelUpstreamAccount, credential any) error {
 	sealed, err := m.sealUpstreamCredential(row.Domain, row.Provider, credential)
 	if err != nil {
@@ -2607,7 +2661,12 @@ func (m *Monitor) persistSyncedUpstreamAccount(ctx context.Context, row *Channel
 	}
 	row.Credential = sealed
 	row.CredentialVersion = upstreamCredentialVersion
-	return m.storeDB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	// A rotated refresh token is single-use: losing this write leaves the
+	// account unable to sync. Give it its own bounded deadline, longer than
+	// the queued writer's busy timeout, whatever the caller has left.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), upstreamCredentialLocalWriteTimeout)
+	defer cancel()
+	return m.queuedWriteStore().WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var previous ChannelUpstreamAccount
 		loadErr := tx.First(&previous, "domain = ?", row.Domain).Error
 		if loadErr != nil && !errors.Is(loadErr, gorm.ErrRecordNotFound) {

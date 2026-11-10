@@ -50,10 +50,24 @@ func (m *Monitor) storeBackupResumeDelay(parent context.Context, now time.Time, 
 	if m.storeBackupRetentionDays() == 0 {
 		return 0, nil
 	}
+	createdAt, err := m.adoptStoreBackupSet(parent, now, mainEnabled, factsEnabled, func(createdAt time.Time) bool {
+		return createdAt.Add(m.storeBackupInterval()).After(now)
+	})
+	if err != nil || createdAt.IsZero() {
+		return 0, err
+	}
+	return createdAt.Add(m.storeBackupInterval()).Sub(now), nil
+}
+
+// adoptStoreBackupSet verifies the newest backup set on disk and, when it was
+// made from the current files under the current migration plan and fresh()
+// accepts its age, restores backup health from it after a restart. It returns
+// the set's creation time, or zero when a new backup is needed.
+func (m *Monitor) adoptStoreBackupSet(parent context.Context, now time.Time, mainEnabled, factsEnabled bool, fresh func(time.Time) bool) (time.Time, error) {
 	m.storeBackupMu.Lock()
 	defer m.storeBackupMu.Unlock()
 	if err := parent.Err(); err != nil {
-		return 0, err
+		return time.Time{}, err
 	}
 	var paths []string
 	if mainEnabled {
@@ -64,32 +78,32 @@ func (m *Monitor) storeBackupResumeDelay(parent context.Context, now time.Time, 
 	}
 	entries, err := scanRuntimeBackupSets(m.storeBackupDir(), now, paths)
 	if os.IsNotExist(err) {
-		return 0, nil
+		return time.Time{}, nil
 	}
 	if err != nil {
-		return 0, err
+		return time.Time{}, err
 	}
 	if len(entries) == 0 {
-		return 0, nil
+		return time.Time{}, nil
 	}
 	entry := entries[0]
 	manifest := entry.manifest
-	delay := time.Unix(manifest.CreatedAt, 0).Add(m.storeBackupInterval()).Sub(now)
-	if delay <= 0 || manifest.SourceIdentity == "" || manifest.MigrationPlan != m.currentMigrationPlanID() ||
+	createdAt := time.Unix(manifest.CreatedAt, 0)
+	if !fresh(createdAt) || manifest.SourceIdentity == "" || manifest.MigrationPlan != m.currentMigrationPlanID() ||
 		(manifest.Main != nil) != mainEnabled || (manifest.Facts != nil) != factsEnabled {
-		return 0, nil
+		return time.Time{}, nil
 	}
 	identity, err := runtimeBackupSourceIdentity(paths)
 	if err != nil {
-		return 0, err
+		return time.Time{}, err
 	}
 	if manifest.SourceIdentity != identity {
-		return 0, nil
+		return time.Time{}, nil
 	}
 	ctx, cancel := context.WithTimeout(parent, storeBackupTimeout)
 	defer cancel()
 	if _, err := verifyStoreBackupSetManifest(ctx, entry.path); err != nil {
-		return 0, err
+		return time.Time{}, err
 	}
 	if manifest.Main != nil {
 		m.storeBackupLastSuccess.Store(manifest.CreatedAt)
@@ -101,7 +115,7 @@ func (m *Monitor) storeBackupResumeDelay(parent context.Context, now time.Time, 
 	}
 	m.storeBackupSetLastSuccess.Store(manifest.CreatedAt)
 	m.storeBackupSetVerified.Store(true)
-	return delay, nil
+	return createdAt, nil
 }
 
 type runtimeBackupRetentionEntry struct {

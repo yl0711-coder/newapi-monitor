@@ -85,7 +85,7 @@ func (m *Monitor) commitAICodeWithRecordPage(ctx context.Context, cp *AICodeWith
 		}
 		cursors = append(cursors, hash)
 	}
-	return m.storeDB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	return m.queuedWriteStore().WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		newRecords := 0
 		for _, record := range page.Records {
 			if record.CreatedAt > now+300 {
@@ -216,7 +216,7 @@ func (m *Monitor) fetchAICodeWithRecordWindow(ctx context.Context, row ChannelUp
 			}
 			var status *upstreamHTTPError
 			if cp.Cursor != "" && errors.As(err, &status) && status.Status == http.StatusBadRequest {
-				if resetErr := m.storeDB.WithContext(ctx).Transaction(func(tx *gorm.DB) error { return clearAICodeWithRecordCheckpoint(tx, row.Domain, round.RoundID, slot) }); resetErr != nil {
+				if resetErr := m.queuedWriteStore().WithContext(ctx).Transaction(func(tx *gorm.DB) error { return clearAICodeWithRecordCheckpoint(tx, row.Domain, round.RoundID, slot) }); resetErr != nil {
 					return upstreamUsageResult{}, false, resetErr
 				}
 			}
@@ -225,7 +225,7 @@ func (m *Monitor) fetchAICodeWithRecordWindow(ctx context.Context, row ChannelUp
 		if err := m.commitAICodeWithRecordPage(ctx, &cp, round, page, now); err != nil {
 			var restart *aiCodeWithRecordRestartError
 			if errors.As(err, &restart) {
-				if resetErr := m.storeDB.WithContext(ctx).Transaction(func(tx *gorm.DB) error { return clearAICodeWithRecordCheckpoint(tx, row.Domain, round.RoundID, slot) }); resetErr != nil {
+				if resetErr := m.queuedWriteStore().WithContext(ctx).Transaction(func(tx *gorm.DB) error { return clearAICodeWithRecordCheckpoint(tx, row.Domain, round.RoundID, slot) }); resetErr != nil {
 					return upstreamUsageResult{}, false, resetErr
 				}
 			}
@@ -243,7 +243,7 @@ func (m *Monitor) fetchAICodeWithRecordWindow(ctx context.Context, row ChannelUp
 			var status *upstreamHTTPError
 			var auth *upstreamAuthError
 			if !errors.As(err, &status) && !errors.As(err, &auth) && !isUpstreamUsageTransientFailure(err) && ctx.Err() == nil {
-				if cleanup := m.storeDB.WithContext(ctx).Transaction(func(tx *gorm.DB) error { return clearAICodeWithRecordCheckpoint(tx, row.Domain, round.RoundID, slot) }); cleanup != nil {
+				if cleanup := m.queuedWriteStore().WithContext(ctx).Transaction(func(tx *gorm.DB) error { return clearAICodeWithRecordCheckpoint(tx, row.Domain, round.RoundID, slot) }); cleanup != nil {
 					return upstreamUsageResult{}, false, cleanup
 				}
 			}

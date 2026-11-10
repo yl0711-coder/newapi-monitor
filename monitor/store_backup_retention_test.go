@@ -340,3 +340,130 @@ func TestBackupRetentionRealPairRestore(t *testing.T) {
 		t.Fatalf("real pair resume: %s %v", delay, err)
 	}
 }
+
+func TestStoreBackupDailySlot(t *testing.T) {
+	m, ok := storeBackupDailyAt("05:40")
+	if !ok || m != 5*60+40 {
+		t.Fatalf("parse: %d %v", m, ok)
+	}
+	for _, bad := range []string{"", "5:4x", "24:00", "05:60", "0540"} {
+		if _, ok := storeBackupDailyAt(bad); ok {
+			t.Fatalf("accepted %q", bad)
+		}
+	}
+	cases := map[string]string{
+		"2026-11-09T05:39:59Z": "2026-11-08T05:40:00Z", // before today's slot
+		"2026-11-09T05:40:00Z": "2026-11-09T05:40:00Z",
+		"2026-11-09T12:40:00Z": "2026-11-09T05:40:00Z", // restart in the afternoon keeps 05:40
+	}
+	for now, want := range cases {
+		n, _ := time.Parse(time.RFC3339, now)
+		if got := storeBackupLastSlot(n, m).Format(time.RFC3339); got != want {
+			t.Fatalf("%s: got %s want %s", now, got, want)
+		}
+	}
+}
+
+func countBackupSets(t *testing.T, dir string) int {
+	t.Helper()
+	entries, err := scanRuntimeBackupSets(dir, time.Now(), nil)
+	if err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+	return len(entries)
+}
+
+func waitFor(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %s", what)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// A restart in fixed-time mode must adopt the backup already taken since the
+// latest slot (health restored, no duplicate backup), even with the legacy
+// count-based retention that production uses.
+func TestDailyBackupRestartAdoptsVerifiedBackup(t *testing.T) {
+	oldStart := storeBackupDailyStartDelay
+	storeBackupDailyStartDelay = time.Millisecond
+	t.Cleanup(func() { storeBackupDailyStartDelay = oldStart })
+	dir := t.TempDir()
+	m := &Monitor{cfg: Settings{StorePath: filepath.Join(dir, "main.db"), UsageFactsStorePath: filepath.Join(dir, "facts.db"), StoreBackupDir: filepath.Join(dir, "backups")}}
+	if err := m.openStore(m.cfg.StorePath); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(m.Close)
+	now := time.Now().UTC()
+	minute := now.Hour()*60 + now.Minute() - 1 // slot one minute ago
+	if minute < 0 {
+		minute += 24 * 60
+	}
+	created := now.Add(-10 * time.Second)
+	if _, err := m.createStoreBackupSet(context.Background(), created, true, true); err != nil {
+		t.Fatal(err)
+	}
+	restarted := &Monitor{cfg: m.cfg, storeDB: m.storeDB, usageFactsDB: m.usageFactsDB}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { restarted.runDailyStoreBackups(ctx, minute, true, true); close(done) }()
+	waitFor(t, "adoption", func() bool { return restarted.storeBackupSetVerified.Load() })
+	cancel()
+	<-done
+	if got := restarted.storeBackupSetLastSuccess.Load(); got != created.Unix() {
+		t.Fatalf("adopted set time %d, want %d", got, created.Unix())
+	}
+	if restarted.storeBackupLastSuccess.Load() == 0 || restarted.usageFactsBackupLastSuccess.Load() == 0 {
+		t.Fatal("per-store backup health not restored")
+	}
+	if n := countBackupSets(t, m.storeBackupDir()); n != 1 {
+		t.Fatalf("restart created a duplicate backup: %d sets", n)
+	}
+}
+
+// A failed fixed-time backup is retried soon, not a day later.
+func TestDailyBackupRetriesAfterFailure(t *testing.T) {
+	oldStart, oldRetry := storeBackupDailyStartDelay, storeBackupDailyRetryDelay
+	storeBackupDailyStartDelay, storeBackupDailyRetryDelay = time.Millisecond, 50*time.Millisecond
+	t.Cleanup(func() { storeBackupDailyStartDelay, storeBackupDailyRetryDelay = oldStart, oldRetry })
+	dir := t.TempDir()
+	backupDir := filepath.Join(dir, "backups")
+	m := &Monitor{cfg: Settings{StorePath: filepath.Join(dir, "main.db"), StoreBackupDir: backupDir}}
+	if err := m.openStore(m.cfg.StorePath); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(m.Close)
+	// A regular file where the backup directory should be makes backups fail.
+	if err := os.WriteFile(backupDir, []byte("x"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { m.runDailyStoreBackups(ctx, now.Hour()*60+now.Minute(), true, false); close(done) }()
+	waitFor(t, "first failure", func() bool { return m.storeBackupSetLastFailure.Load() > 0 })
+	if err := os.Remove(backupDir); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "retry success", func() bool { return m.storeBackupSetLastSuccess.Load() > 0 })
+	cancel()
+	<-done
+	if n := countBackupSets(t, backupDir); n != 1 {
+		t.Fatalf("want 1 backup set after retry, got %d", n)
+	}
+}
+
+// Fixed daily backups are stale after a day plus slack, not two days.
+func TestStoreBackupStaleAfter(t *testing.T) {
+	daily := &Monitor{cfg: Settings{StoreBackupDailyAt: "05:40"}}
+	if got := daily.storeBackupStaleAfter(); got != 25*time.Hour {
+		t.Fatalf("daily stale after %s", got)
+	}
+	interval := &Monitor{cfg: Settings{StoreBackupIntervalHours: 6}}
+	if got := interval.storeBackupStaleAfter(); got != 12*time.Hour+10*time.Minute {
+		t.Fatalf("interval stale after %s", got)
+	}
+}

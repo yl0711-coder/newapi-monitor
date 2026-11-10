@@ -1029,6 +1029,12 @@ func TestClassifySourceErrors(t *testing.T) {
 	if classifySourceError(&net.DNSError{Err: "no such host", Name: "db.service", IsNotFound: true}) != sourceErrorTransient {
 		t.Fatal("DNS not-found must degrade and retry as transient")
 	}
+	// A connection closed by the peer (replica restart, dropped tunnel) is
+	// what the driver reports as "invalid connection"; it must be retried.
+	if classifySourceError(mysql.ErrInvalidConn) != sourceErrorTransient ||
+		classifySourceError(fmt.Errorf("lease release: %w", mysql.ErrInvalidConn)) != sourceErrorTransient {
+		t.Fatal("invalid connection must be transient")
+	}
 	if classifySourceError(errSourceLeaseResultInvalid) != sourceErrorTransient {
 		t.Fatal("GET_LOCK NULL/unexpected result must retry as transient")
 	}

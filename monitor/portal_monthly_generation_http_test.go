@@ -185,7 +185,7 @@ func TestMonthlyGenerationHTTPExplicitLocalGateAndAuthenticatedScope(t *testing.
 		if gid != g.ID || version != 2 || month != "2026-09" {
 			t.Fatal("untrusted scope reached service", gid, version, month)
 		}
-		return MonthlyGenerationView{month, "queued"}, nil
+		return MonthlyGenerationView{Month: month, State: "queued"}, nil
 	}}
 	if w := generationHTTPDo(r, "GET", "?month=2026-09", "", cookie, nil); w.Code != 404 {
 		t.Fatal("generation mounted by default", w.Code)
@@ -284,7 +284,7 @@ func TestMonthlyGenerationHTTPRecheckDoesNotReplaySubmission(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				return MonthlyGenerationView{month, "queued"}, nil
+				return MonthlyGenerationView{Month: month, State: "queued"}, nil
 			}}
 			if err := m.RegisterLocalPortalMonthlyGenerationRoutes(r, service); err != nil {
 				t.Fatal(err)
@@ -305,7 +305,7 @@ func TestMonthlyGenerationHTTPAllowlistAndExistingBillsUnaffected(t *testing.T) 
 	if before.Code != 200 {
 		t.Fatal(before.Code, before.Body.String())
 	}
-	view, failure := MonthlyGenerationView{f.latest, "pending_verification"}, error(nil)
+	view, failure := MonthlyGenerationView{Month: f.latest, State: "pending_verification"}, error(nil)
 	if err := f.m.RegisterLocalPortalMonthlyGenerationRoutes(f.r, monthlyGenerationTestService{func(context.Context, int64, int64, string, bool) (MonthlyGenerationView, error) { return view, failure }}); err != nil {
 		t.Fatal(err)
 	}
@@ -323,7 +323,7 @@ func TestMonthlyGenerationHTTPAllowlistAndExistingBillsUnaffected(t *testing.T) 
 	// Use a genuinely unissued month to test untrusted service results. An
 	// existing valid publication intentionally bypasses the source/task service.
 	missing := time.Now().In(usageCST).AddDate(0, -8, 0).Format("2006-01")
-	for _, bad := range []MonthlyGenerationView{{f.latest, "published"}, {"2026-01", "queued"}, {f.latest, "<script>secret</script>"}} {
+	for _, bad := range []MonthlyGenerationView{{Month: f.latest, State: "published"}, {Month: "2026-01", State: "queued"}, {Month: f.latest, State: "<script>secret</script>"}} {
 		view = bad
 		if w := generationHTTPDo(f.r, "GET", "?month="+missing, "", cookie, nil); w.Code != 503 || strings.Contains(w.Body.String(), "secret") {
 			t.Fatal("invalid service result escaped", w.Code)
@@ -376,7 +376,7 @@ func TestMonthlyGenerationHTTPBoundedConcurrentCalls(t *testing.T) {
 		entered <- struct{}{}
 		select {
 		case <-release:
-			return MonthlyGenerationView{month, "not_requested"}, nil
+			return MonthlyGenerationView{Month: month, State: "not_requested"}, nil
 		case <-ctx.Done():
 			return MonthlyGenerationView{}, ctx.Err()
 		}
