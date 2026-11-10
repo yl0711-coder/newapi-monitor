@@ -504,8 +504,10 @@ func simpleTokenSheet(p monthlyStatement, ix simpleSubIndex) string {
 		r := t.n + 1
 		var values []int64
 		if ix.any {
-			refund := l.refund + l.subRefund
-			values = []int64{l.subConsume, l.wallet, refund, l.subConsume + l.wallet - refund}
+			// Same rule as the summary: subscription usage net of its own
+			// refunds, 退款 = balance refund only.
+			subNet := l.subConsume - l.subRefund
+			values = []int64{subNet, l.wallet, l.refund, subNet + l.wallet - l.refund}
 			cells = append(cells, tplCell{col: 'E', style: tplMoney, num: tplMoneyNum(values[0])}, tplCell{col: 'F', style: tplMoney, num: tplMoneyNum(values[1])},
 				tplCell{col: 'G', style: tplMoney, num: tplMoneyNum(values[2])}, tplCell{col: 'H', style: tplMoney, num: tplMoneyNum(values[3]), formula: fmt.Sprintf("ROUND(E%d+F%d-G%d,2)", r, r, r)})
 		} else {

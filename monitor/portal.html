@@ -1298,7 +1298,11 @@ function renderMonthlySubscription(sub,d){
 }
 function renderMonthlyStatement(d,sub){
   const cr=d.credits||{},s=d.consumption,rows=Array.isArray(cr.rows)?cr.rows:[];
-  const subNet=monthlySubNet(sub),walletCents=s?monthlyCentsOf(s.amount):null;
+  const subNet=monthlySubNet(sub),walletCents=s?monthlyCentsOf(s.amount):null,walletNetCents=s?monthlyCentsOf(s.net):null;
+  // Subscription usage is shown net of its own refunds (they return to the
+  // subscription); 退款 is the balance refund, so 总消费 − 退款 = 净消费.
+  const totalShown=s?(subNet&&walletCents!==null?monthlyCentsMoney(walletCents+subNet):s.amount):null;
+  const netShown=s?(subNet&&walletNetCents!==null?monthlyCentsMoney(walletNetCents+subNet):s.net):null;
   const places=monthlySummaryPrecision(d),money=v=>monthlyMoney(v,true,places);
   const total=(label,value,extra='')=>`<tr class="bill-total"><td colspan="3">${label}</td><td class="money">${value}</td><td colspan="2">${extra}</td></tr>`;
   const tail=(label,value)=>monthlyDisplayNonzero(value)?total(label,money(value),'仅显示舍入，不改变实际金额'):'';
@@ -1316,9 +1320,9 @@ function renderMonthlyStatement(d,sub){
     ${total('到账合计',money(cr.known_total))}
     <tr><th colspan="6" class="bill-section">消费统计</th></tr>
     <tr class="bill-columns"><th colspan="2">总消费（元）</th><th colspan="2">请求次数</th><th colspan="2">总 Token 数</th></tr>
-    <tr class="bill-metrics"><td colspan="2">${s?money(subNet&&walletCents!==null?monthlyCentsMoney(walletCents+subNet):s.amount):'待核验'}</td><td colspan="2">${s?(s.requests===null?'—':esc(fmtNum(s.requests))):'待核验'}</td><td colspan="2">${s?monthlyTokens(s.tokens):'待核验'}</td></tr>
+    <tr class="bill-metrics"><td colspan="2">${s?money(totalShown):'待核验'}</td><td colspan="2">${s?(s.requests===null?'—':esc(fmtNum(s.requests))):'待核验'}</td><td colspan="2">${s?monthlyTokens(s.tokens):'待核验'}</td></tr>
     ${s&&subNet?total('其中 套餐内（元）',money(monthlyCentsMoney(subNet)),'由订阅额度支付，不扣余额')+total('其中 余额支付（元）',money(s.amount)):''}
-    ${s&&s.refund!=='0.000000'?total('退款金额（元）',money(s.refund))+tail('净消费舍入尾差（元）',monthlyDisplayResidual(s.net,[[s.amount],[s.refund,-1]]))+total('净消费（元）',money(s.net)):''}
+    ${s&&s.refund!=='0.000000'?total('退款金额（元）',money(s.refund),subNet?'退回余额':'')+tail('净消费舍入尾差（元）',monthlyDisplayResidual(netShown,[[totalShown],[s.refund,-1]]))+total('净消费（元）',money(netShown)):''}
     ${cr.available&&cr.adjustment&&cr.adjustment!=='0.000000'?total('余额扣减调整（元）',money(cr.adjustment)):''}
     ${cr.balance_correction?total('余额校正（元）',money(cr.balance_correction)):''}
     <tr class="bill-balance"><td colspan="2">月末余额（元）</td><td colspan="4">${balance===null?'待核验':money(balance.closing)}</td></tr>

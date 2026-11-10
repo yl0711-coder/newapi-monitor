@@ -291,6 +291,16 @@ func (s *simpleReplicaSource) Snapshot(ctx context.Context, ids []int64, funding
 	return out, nil
 }
 
+// simpleSubscriptionTaskLogSQL also counts async-task refunds and price
+// corrections paid by a subscription. NewAPI writes those logs without
+// other.billing_source (only other.task_id); the task row records the paying
+// source in private_data. Without this a subscription refund would be read as
+// money returned to the wallet.
+const simpleSubscriptionTaskLogSQL = ` OR (JSON_EXTRACT(other,'$.billing_source') IS NULL AND JSON_EXTRACT(other,'$.task_id') IS NOT NULL
+AND EXISTS (SELECT 1 FROM tasks t WHERE t.user_id = logs.user_id AND t.task_id = JSON_UNQUOTE(JSON_EXTRACT(logs.other,'$.task_id'))
+AND JSON_UNQUOTE(JSON_EXTRACT(t.private_data,'$.billing_source')) = 'subscription'
+AND CAST(COALESCE(JSON_EXTRACT(t.private_data,'$.subscription_id'),0) AS SIGNED) > 0))`
+
 // subscriptionUsage reads the members' subscriptions and, for members that
 // have one, the subscription-paid part of their logged usage (log
 // other.billing_source = "subscription"; a request that overflowed to the
@@ -332,7 +342,7 @@ func (s *simpleReplicaSource) subscriptionUsage(ctx context.Context, tx *sql.Tx,
 			rows, err := tx.QueryContext(ctx, `SELECT /*+ MAX_EXECUTION_TIME(15000) */ FLOOR((created_at+28800)/86400)*86400-28800, token_id, type,
 COALESCE(SUM(quota),0), COALESCE(SUM(CAST(COALESCE(JSON_EXTRACT(other,'$.wallet_quota_deducted'),0) AS SIGNED)),0)
 FROM logs FORCE INDEX (idx_user_created_type) WHERE user_id = ? AND created_at >= ? AND created_at < ? AND type IN (2,6)
-AND JSON_UNQUOTE(JSON_EXTRACT(other,'$.billing_source')) = 'subscription' GROUP BY 1, 2, 3`, uid, t, t+window)
+AND (JSON_UNQUOTE(JSON_EXTRACT(other,'$.billing_source')) = 'subscription'`+simpleSubscriptionTaskLogSQL+`) GROUP BY 1, 2, 3`, uid, t, t+window)
 			if err != nil {
 				return fmt.Errorf("subscription usage: %w", err)
 			}

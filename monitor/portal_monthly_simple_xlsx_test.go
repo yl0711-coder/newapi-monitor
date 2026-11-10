@@ -1,6 +1,9 @@
 package monitor
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestSimpleChineseAmount(t *testing.T) {
 	for cents, want := range map[int64]string{
@@ -11,5 +14,23 @@ func TestSimpleChineseAmount(t *testing.T) {
 		if got := simpleChineseAmount(cents); got != want {
 			t.Errorf("%d: got %s want %s", cents, got, want)
 		}
+	}
+}
+
+// The token sheet follows the summary: subscription usage net of its own
+// refunds, 退款 = balance refund only, so each column sums to the summary line.
+func TestSimpleTokenSheetSubscriptionRefundMatchesSummary(t *testing.T) {
+	p := monthlyStatement{Members: []monthlyMemberStatement{{UserID: 1, Username: "u", TokenConsumption: []monthlyTokenConsumption{
+		{TokenID: 7, Name: "k", Amount: "100.000000", Refund: "10.000000", Net: "90.000000"}}}}}
+	ix := newSimpleSubIndex(&simpleSubscriptionBill{Users: []simpleSubscriptionUser{{UserID: 1, ConsumeCents: 5000, RefundCents: 1000,
+		Tokens: []simpleSubscriptionToken{{TokenID: 7, Name: "k", ConsumeCents: 5000, RefundCents: 1000}}}}})
+	sheet := simpleTokenSheet(p, ix)
+	for _, want := range []string{"<v>40.00</v>", "<v>100.00</v>", "<v>10.00</v>", "<v>130.00</v>"} {
+		if !strings.Contains(sheet, want) {
+			t.Fatalf("token sheet missing %s", want)
+		}
+	}
+	if strings.Contains(sheet, "<v>50.00</v>") || strings.Contains(sheet, "<v>20.00</v>") {
+		t.Fatal("token sheet still shows gross subscription usage or mixed refunds")
 	}
 }
