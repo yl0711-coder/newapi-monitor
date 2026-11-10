@@ -10,8 +10,10 @@ package monitor
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"sort"
 	"strings"
 	"time"
@@ -233,16 +235,20 @@ func minPositive(value, upper int64) int64 {
 }
 
 type ModelStatisticsReport struct {
-	Window      string                 `json:"window"`
-	WindowLabel string                 `json:"window_label"`
-	FromTs      int64                  `json:"from_ts"`
-	ToTs        int64                  `json:"to_ts"`
-	TargetTs    int64                  `json:"target_ts"`
-	LagSeconds  int64                  `json:"lag_seconds"`
-	GeneratedAt int64                  `json:"generated_at"`
-	GroupCount  int                    `json:"group_count"`
-	Models      []ModelStatisticsModel `json:"models"`
-	Source      ModelStatisticsSource  `json:"source"`
+	Range            ModelReportRange       `json:"range"`
+	Window           string                 `json:"window"`
+	WindowLabel      string                 `json:"window_label"`
+	FromTs           int64                  `json:"from_ts"`
+	ToTs             int64                  `json:"to_ts"`
+	ActualThroughTs  int64                  `json:"actual_through_ts"`
+	TargetTs         int64                  `json:"target_ts"`
+	LagSeconds       int64                  `json:"lag_seconds"`
+	GeneratedAt      int64                  `json:"generated_at"`
+	Timing           ReportTiming           `json:"timing"`
+	CollectionFailed bool                   `json:"collection_failed"`
+	GroupCount       int                    `json:"group_count"`
+	Models           []ModelStatisticsModel `json:"models"`
+	Source           ModelStatisticsSource  `json:"source"`
 }
 
 func modelStatisticsWindowFor(raw string) (modelStatisticsWindow, error) {
@@ -298,34 +304,29 @@ func modelStatisticsWindowTarget(m *Monitor, now time.Time) int64 {
 // buildModelStatisticsReport 只读取 Monitor 本地 SQLite，不触发生产库查询。
 // to 同时受理论定稿目标与持久采集水位约束；窗口宽度不变。
 func (m *Monitor) buildModelStatisticsReport(ctx context.Context, windowKey string, now time.Time) (ModelStatisticsReport, error) {
-	window, err := modelStatisticsWindowFor(windowKey)
+	selection, err := modelReportSelectionFor(url.Values{"window": {windowKey}})
 	if err != nil {
 		return ModelStatisticsReport{}, err
 	}
-	if m == nil {
-		return ModelStatisticsReport{}, fmt.Errorf("Monitor 未初始化")
-	}
-	retentionDays := modelStatisticsRetentionDays(m.cfg)
-	if window.Seconds > int64(retentionDays)*86400 {
-		return ModelStatisticsReport{}, fmt.Errorf("%s 数据超出当前分钟事实留存 %d 天", window.Label, retentionDays)
-	}
-	if m.storeDB == nil {
+	return m.buildModelStatisticsSelected(ctx, selection, now)
+}
+
+func (m *Monitor) buildModelStatisticsSelected(ctx context.Context, selection modelReportSelection, now time.Time) (ModelStatisticsReport, error) {
+	if m == nil || m.storeDB == nil {
 		return ModelStatisticsReport{}, fmt.Errorf("本地事实库未就绪")
 	}
-	// A normal polling delay must not mix an uncollected tail into an otherwise
-	// complete window. Shift the whole window to the common committed end,
-	// then validate all historical coverage and row semantics as before.
 	target := modelStatisticsWindowTarget(m, now)
-	to, err := m.modelStatisticsAvailableWindowEnd(ctx, target)
+	available, err := m.modelStatisticsAvailableWindowEnd(ctx, target)
 	if err != nil {
 		return ModelStatisticsReport{}, fmt.Errorf("读取模型统计采集水位失败: %w", err)
 	}
-	if to <= 0 {
-		return ModelStatisticsReport{}, fmt.Errorf("模型统计定稿水位尚未建立")
+	bounds, err := m.resolveModelReportBounds(selection, now, target, available)
+	if err != nil {
+		return ModelStatisticsReport{}, err
 	}
-	from := to - window.Seconds
-	if from <= 0 || to <= from {
-		return ModelStatisticsReport{}, fmt.Errorf("模型统计时间窗口无效")
+	from, to := bounds.From, bounds.To
+	if !bounds.Range.HasWindow {
+		return ModelStatisticsReport{Timing: m.modelReportTiming(true), Range: bounds.Range, Window: bounds.Key, WindowLabel: bounds.Label, FromTs: from, ToTs: to, ActualThroughTs: bounds.ActualThrough, TargetTs: bounds.Target, LagSeconds: bounds.Lag, GeneratedAt: now.Unix(), CollectionFailed: m.modelReportCollectionFailed(true), Models: []ModelStatisticsModel{}, Source: ModelStatisticsSource{CoverageStatus: modelCoverageUnavailable, Note: bounds.Range.Note}}, nil
 	}
 
 	var rows []modelStatisticsRow
@@ -429,6 +430,12 @@ func (m *Monitor) buildModelStatisticsReport(ctx context.Context, windowKey stri
 	}
 	routedCoverage := m.modelStatisticsRoutedCoverage(ctx, from, to, now)
 	rejectionCoverage := m.modelStatisticsRejectionCoverage(ctx, from, to, now)
+	if bounds.Incomplete {
+		routedCoverage.Status = modelCoverageIncomplete
+		routedCoverage.RequestsComplete = false
+		routedCoverage.TTFTComplete = false
+		routedCoverage.Note += "；" + bounds.Range.Note
+	}
 	coverageStatus := modelStatisticsCombinedCoverage(routedCoverage, rejectionCoverage)
 
 	groups := make(map[string]map[string]*modelStatisticsAggregate)
@@ -516,9 +523,11 @@ func (m *Monitor) buildModelStatisticsReport(ctx context.Context, windowKey stri
 	}
 	sourceNote += " " + routedCoverage.Note + " " + rejectionCoverage.Note + " " + ttftCoverage.Note
 	report := ModelStatisticsReport{
-		Window: window.Key, WindowLabel: window.Label, FromTs: from, ToTs: to,
-		TargetTs: target, LagSeconds: max(int64(0), target-to), GeneratedAt: now.Unix(),
-		GroupCount: len(groups), Models: make([]ModelStatisticsModel, 0),
+		Timing: m.modelReportTiming(true),
+		Range:  bounds.Range, Window: bounds.Key, WindowLabel: bounds.Label, FromTs: from, ToTs: to, ActualThroughTs: bounds.ActualThrough,
+		TargetTs: bounds.Target, LagSeconds: bounds.Lag, GeneratedAt: now.Unix(),
+		CollectionFailed: m.modelReportCollectionFailed(true),
+		GroupCount:       len(groups), Models: make([]ModelStatisticsModel, 0),
 		Source: ModelStatisticsSource{
 			RoutedFact:       "capacity_user_minute_samples：复用客户维护采集的已进入渠道用户请求（成功、交付异常、错误均计一次）",
 			UnavailableFact:  "rejection_samples：选渠道前无可用渠道的模型请求",
@@ -801,16 +810,21 @@ func (m *Monitor) serveModelStatisticsReport(c *gin.Context) {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "本地事实库未就绪，无法统计模型"})
 		return
 	}
-	window := c.DefaultQuery("window", "24h")
-	if _, err := modelStatisticsWindowFor(window); err != nil {
+	c.Header("Cache-Control", "private, no-store")
+	selection, err := modelReportSelectionFor(c.Request.URL.Query())
+	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 	ctx, cancel := context.WithTimeout(c.Request.Context(), modelStatisticsQueryTimeout)
 	defer cancel()
-	report, err := m.buildModelStatisticsReport(ctx, window, time.Now())
+	report, err := m.buildModelStatisticsSelected(ctx, selection, time.Now())
 	if err != nil {
-		if strings.Contains(err.Error(), "超出当前分钟事实留存") {
+		if abortCanceledUsageRequest(c, err) {
+			return
+		}
+		var input *modelFRTInputError
+		if errors.As(err, &input) {
 			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 			return
 		}

@@ -14,6 +14,28 @@ const (
 	modelCoverageUnavailable = "unavailable"
 )
 
+// A certified historical window remains valid during a source outage. Report
+// current collection failure separately so a zero-lag snapshot cannot hide a
+// failure that happened before the next finalization target advanced.
+func (m *Monitor) modelReportCollectionFailed(includeRejections bool) bool {
+	if m == nil {
+		return false
+	}
+	failed := false
+	if m.cfg.CustomerHealthSourceEnabled {
+		failed = m.customerHealthSourceLastFailure.Load() > m.customerHealthSourceLastSuccess.Load()
+	} else if m.cfg.CapacityEnabled {
+		failed = m.metricFinalizeLastFailure.Load() > m.metricFinalizeLastSuccess.Load()
+	}
+	if m.cfg.CustomerHealthSourceEnabled || m.cfg.CapacityEnabled {
+		failed = failed || m.sourceLastFailureAt.Load() > m.sourceLastSuccessAt.Load()
+	}
+	if includeRejections && m.cfg.CloudWatchPreRouteEnabled {
+		failed = failed || m.cloudWatchPreRouteLastFailure.Load() > m.cloudWatchPreRouteLastSuccess.Load()
+	}
+	return failed
+}
+
 // modelStatisticsAvailableWindowEnd bounds the theoretical target by durable
 // request/FRT/rejection cursors. This selects a window, not a coverage verdict:
 // the existing full-window checks still reject missing days, old semantics,
@@ -21,6 +43,11 @@ const (
 // or a left-to-right history proof here: a historical hole must not move the
 // right boundary backwards and disappear from the queried interval.
 func (m *Monitor) modelStatisticsAvailableWindowEnd(ctx context.Context, target int64) (int64, error) {
+	return m.modelStatisticsAvailableEnd(ctx, target, true)
+}
+
+// modelStatisticsAvailableEnd optionally includes the rejection lane; FRT never does.
+func (m *Monitor) modelStatisticsAvailableEnd(ctx context.Context, target int64, includeRejections bool) (int64, error) {
 	end := target
 	if m == nil || m.storeDB == nil || target <= 0 {
 		return end, nil
@@ -75,7 +102,7 @@ func (m *Monitor) modelStatisticsAvailableWindowEnd(ctx context.Context, target 
 		// Older read-only snapshots may have legacy rejection facts but no
 		// direct-source cursor table. Preserve those partial reports; absence
 		// of a table is not a watermark or a coverage certificate.
-		if m.cfg.CloudWatchPreRouteEnabled && cloudWatchPreRouteCoverageTableAvailable(tx) {
+		if includeRejections && m.cfg.CloudWatchPreRouteEnabled && cloudWatchPreRouteCoverageTableAvailable(tx) {
 			var state CloudWatchPreRouteCursor
 			if err := tx.Where("id = ?", cloudWatchPreRouteCursorID).Limit(1).Find(&state).Error; err != nil {
 				return err
@@ -119,8 +146,13 @@ type ModelStatisticsCoverage struct {
 // exact TTFT projection existed.  Those rows have version 0 and must never be
 // counted as a fast request merely because all TTFT counters are zero.
 func (m *Monitor) modelStatisticsTTFTRowsComplete(ctx context.Context, from, to int64) bool {
+	complete, _ := m.modelStatisticsTTFTRowsCoverage(ctx, from, to)
+	return complete
+}
+
+func (m *Monitor) modelStatisticsTTFTRowsCoverage(ctx context.Context, from, to int64) (bool, error) {
 	if m == nil || m.storeDB == nil || from >= to {
-		return false
+		return false, nil
 	}
 	var old int64
 	err := m.storeDB.WithContext(ctx).Raw(`SELECT COUNT(*) FROM capacity_user_minute_samples
@@ -129,7 +161,7 @@ func (m *Monitor) modelStatisticsTTFTRowsComplete(ctx context.Context, from, to 
 		        AND COALESCE(ttft_semantics_version,0) <> ?)
 		       OR `+ttftInvalidRowPredicate("capacity_user_minute_samples")+`)`, from, to,
 		stabilityTrafficClassificationVersion, ttftCoverageSemanticsVersion).Scan(&old).Error
-	return err == nil && old == 0
+	return err == nil && old == 0, err
 }
 
 func (m *Monitor) modelStatisticsRoutedCoverage(ctx context.Context, from, to int64, now time.Time) ModelStatisticsCoverage {

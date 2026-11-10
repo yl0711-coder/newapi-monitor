@@ -632,8 +632,8 @@ func TestCustomerHealthFRTReplayResumesAfterFailedSlice(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if covered != firstTo || resumeFrom != firstTo-customerHealthSourceReplaySeconds {
-		t.Fatalf("FRT replay restarted at midnight instead of durable slice: cursor=%d covered=%d state=%+v", resumeFrom, covered, state)
+	if covered != firstTo || resumeFrom != firstTo {
+		t.Fatalf("FRT retry lost its committed read prefix: cursor=%d covered=%d state=%+v", resumeFrom, covered, state)
 	}
 }
 
@@ -1423,11 +1423,12 @@ func TestCustomerHealthAttributionReusesFaultRulesAndDowngrades(t *testing.T) {
 		problem customerHealthProblem
 		fault   string
 	}{
-		// 带 status_code 前缀（code 非空）→ 上游说的。
-		{customerHealthProblem{code: "503", message: "bad response status code 503", count: 5}, faultUpstream},
-		{customerHealthProblem{code: "400", message: "Invalid 'input[60].id'", count: 3}, faultDownstream},
-		// 原文措辞明确且来自上游：优先于状态码泛规则。
-		{customerHealthProblem{code: "503", message: "No available channel for model gpt-5", count: 9}, faultUpstream},
+		// 仅有外层状态码，客户排障同样不能确认具体责任方。
+		{customerHealthProblem{code: "503", message: "bad response status code 503", count: 5}, faultUnknown},
+		{customerHealthProblem{code: "400", message: "Invalid 'input[60].id'", count: 3}, faultUnknown},
+		{customerHealthProblem{code: "400", message: "status_code=400, Invalid 'input[60].id'", count: 3}, faultDownstream},
+		// 提取出的 code 不能代替原文来源，平台路由错误仍由同一诊断定责。
+		{customerHealthProblem{code: "503", message: "No available channel for model gpt-5", count: 9}, faultOurs},
 		// 无前缀的同样措辞 → 我方路由失败。
 		{customerHealthProblem{code: "", message: "No available channel for model gpt-5", count: 2}, faultOurs},
 		// 401/403 原文不含判别信息，必须保持待判，不能猜。
@@ -1455,9 +1456,9 @@ func TestCustomerHealthAttributionReusesFaultRulesAndDowngrades(t *testing.T) {
 func TestCustomerHealthUnknownNeverWinsOverDefiniteFault(t *testing.T) {
 	verdict := customerHealthPickFault([]customerHealthProblem{
 		{code: "500", message: "internal error", count: 1000}, // unknown，量极大
-		{code: "502", message: "bad response status code 502", count: 1},
+		{code: "503", message: "system cpu overloaded (current: 95%, threshold: 90%)", count: 1},
 	})
-	if verdict.fault != faultUpstream {
+	if verdict.fault != faultOurs {
 		t.Fatalf("确定档必须优先于 unknown: %+v", verdict)
 	}
 	// 只有 unknown 时才允许 unknown 胜出。
@@ -1579,7 +1580,7 @@ func TestCustomerHealthAttributionRequiresOwnExactFailedScope(t *testing.T) {
 			}},
 			channelUsers: map[int]map[int64]struct{}{7: {101: {}}},
 		}, []customerHealthProblem{problem}, faultUpstream},
-		{"完全匹配仍可定责", failedUsage(map[customerHealthProblemScope]int64{exactScope: 3}), []customerHealthProblem{problem}, faultUpstream},
+		{"完全匹配但只有状态码仍待查", failedUsage(map[customerHealthProblemScope]int64{exactScope: 3}), []customerHealthProblem{problem}, faultUnknown},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1680,8 +1681,16 @@ func TestCustomerHealthSamplingAppliesResponsibilityPolicy(t *testing.T) {
 		}
 		return n
 	}
-	if raw, filtered := asInt("failed"), asInt("customer_health_failed"); raw != 9 || filtered != 6 {
-		t.Fatalf("错误责任方筛选错误: raw=%d stability=%d", raw, filtered)
+	if raw, projected := asInt("failed"), asInt("customer_health_failed"); raw != 9 || projected != 9 {
+		t.Fatalf("SQL must retain raw errors for bounded diagnostic classification: raw=%d projected=%d", raw, projected)
+	}
+	result.Close()
+	batch := []CapacityUserMinuteSample{{BucketTs: from, UserID: 101, ChannelID: 7, ModelName: "gpt-test", Grp: "g", Failed: 9}}
+	if err := classifyCustomerHealthErrors(context.Background(), m.prodDB, from, from+60, batch); err != nil {
+		t.Fatal(err)
+	}
+	if batch[0].CustomerHealthFailed != 6 || batch[0].CustomerHealthVersion != customerHealthStabilityPolicyVersion {
+		t.Fatalf("classified=%+v", batch[0])
 	}
 	if raw, filtered := asInt("anomaly"), asInt("customer_health_anomaly"); raw != 7 || filtered != 4 {
 		t.Fatalf("异常责任方筛选错误: raw=%d stability=%d", raw, filtered)

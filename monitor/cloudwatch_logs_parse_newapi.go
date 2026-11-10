@@ -118,7 +118,16 @@ func (p *cloudWatchEvidenceParser) parseNewAPI(in cloudWatchEvidenceInput) (clou
 		}
 	}
 	if !ok {
-		return cloudWatchStructuredEvidence{}, newCloudWatchEvidenceParseError(cwParseUnsupported, in.Source)
+		// Keep previously unsupported structured errors, while leaving the
+		// shared pre-route category and traffic statistics unchanged.
+		candidate := LogChainRow{Type: 5, Content: message}
+		if p.customerDiagnostics && (logChainDiagnose(candidate) != nil || strings.HasPrefix(trimmedLower, "[err]") || strings.Contains(lower, `"error"`)) {
+			rule = cwNewAPIClassRule{category: "diagnostic_error", fault: "unknown", summary: "NewAPI 记录到请求错误，详见结构化诊断"}
+		} else if p.customerDiagnostics && len(logChainParseDiagnosticFacts(message, "", "cloudwatch:newapi", in.TimestampMS/1000).Fields) > 1 {
+			rule = cwNewAPIClassRule{category: "diagnostic_context", summary: "NewAPI 记录到本请求的路由或处理上下文"}
+		} else {
+			return cloudWatchStructuredEvidence{}, newCloudWatchEvidenceParseError(cwParseUnsupported, in.Source)
+		}
 	}
 	// The same new-api log stream contains both pre-route decisions and
 	// responses copied from a selected upstream.  A phrase such as
@@ -223,7 +232,27 @@ func cwGuardPreRouteRuleAgainstUpstream(rule cwNewAPIClassRule, lower, message s
 }
 
 func (p *cloudWatchEvidenceParser) addNewAPIContext(out *cloudWatchStructuredEvidence, message string, fields map[string]string) error {
+	if p.customerDiagnostics {
+		diagnosticText := message
+		if parts := strings.SplitN(message, " | ", 4); len(parts) == 4 && cwNewAPIPipeContext.MatchString(message) {
+			// Identity/user headers are parsed separately below; retain only
+			// the error payload in the bounded diagnostic body.
+			diagnosticText = parts[3]
+		}
+		out.Diagnostic = logChainParseDiagnosticAcquisitionFacts(diagnosticText, "", "cloudwatch:newapi", out.EventMS/1000)
+		for key, value := range fields {
+			if name := logChainDiagnosticAliases[key]; name != "" {
+				out.Diagnostic.put(name, value, "cloudwatch:field:"+key, out.EventMS/1000, "request")
+			}
+		}
+		if out.Category == "request_completed" || out.Category == "billing_recorded" || out.Category == "quota_precheck" || out.Category == "diagnostic_context" {
+			out.Diagnostic.Errors = nil
+		}
+	}
 	requestID := cwField(fields, "request_id", "oneapi_request_id")
+	if requestID == "" && out.Diagnostic != nil {
+		requestID = out.Diagnostic.value("request_id")
+	}
 	if match := cwNewAPIPipeContext.FindStringSubmatch(message); len(match) == 2 {
 		// 只扫描前 4 段：Request ID 与 user 段都在日志头部，再往后是耗时、IP、
 		// 路径和自由文本，继续扫会把它们误当成标识。
@@ -255,6 +284,7 @@ func (p *cloudWatchEvidenceParser) addNewAPIContext(out *cloudWatchStructuredEvi
 	}
 	var ok bool
 	out.OneAPIIDHMAC, ok = p.optionalOpaqueHMAC("oneapi-request-id", requestID)
+	out.OneAPIRequestID = requestID
 	if !ok {
 		return newCloudWatchEvidenceParseError(cwParseMalformed, out.Source)
 	}

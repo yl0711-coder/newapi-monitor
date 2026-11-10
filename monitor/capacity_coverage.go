@@ -11,17 +11,24 @@ import (
 // The user projection was introduced later: reconcile it against minute facts
 // before reusing their coverage. All reads stay within Monitor's local store.
 func (m *Monitor) capacityWindowComplete(ctx context.Context, from, to int64, users bool) bool {
+	complete, _ := m.capacityWindowCoverage(ctx, from, to, users)
+	return complete
+}
+
+func (m *Monitor) capacityWindowCoverage(ctx context.Context, from, to int64, users bool) (bool, error) {
 	if from >= to {
-		return false
+		return false, nil
 	}
 	var state MetricFinalizeState
-	if err := m.storeDB.WithContext(ctx).First(&state, 1).Error; err != nil ||
-		state.SemanticsVersion != stabilityTrafficClassificationVersion ||
+	if err := m.storeDB.WithContext(ctx).Where("id = ?", 1).Limit(1).Find(&state).Error; err != nil {
+		return false, err
+	}
+	if state.SemanticsVersion != stabilityTrafficClassificationVersion ||
 		state.CoverageFromTs <= 0 || state.CoverageFromTs > from || state.NextTs < to {
-		return false
+		return false, nil
 	}
 	if !users {
-		return true
+		return true, nil
 	}
 	var mismatches int64
 	err := m.storeDB.WithContext(ctx).Raw(`SELECT COUNT(*) FROM (
@@ -35,7 +42,7 @@ func (m *Monitor) capacityWindowComplete(ctx context.Context, from, to int64, us
 		HAVING SUM(success) != 0 OR SUM(anomaly) != 0 OR SUM(failed) != 0 OR SUM(tokens) != 0
 	)`, from, to, stabilityTrafficClassificationVersion,
 		from, to, stabilityTrafficClassificationVersion).Scan(&mismatches).Error
-	return err == nil && mismatches == 0
+	return err == nil && mismatches == 0, err
 }
 
 func capacityTTFTRowsComplete(ctx context.Context, db *gorm.DB, from, to int64) bool {
@@ -91,8 +98,16 @@ func ttftInvalidRowPredicate(table string) string {
 // separate from capacityWindowComplete lets callers report request coverage
 // and TTFT coverage independently.
 func capacityTTFTProjectionComplete(ctx context.Context, db *gorm.DB, from, to int64) bool {
+	complete, err := capacityTTFTProjectionCoverage(ctx, db, from, to)
+	if err != nil {
+		slog.Warn("FRT projection coverage query failed", "err", err)
+	}
+	return complete
+}
+
+func capacityTTFTProjectionCoverage(ctx context.Context, db *gorm.DB, from, to int64) (bool, error) {
 	if db == nil || from >= to {
-		return false
+		return false, nil
 	}
 	// Keep the reconciliation inside SQLite: transferring every minute/key to
 	// Go grows with the full historical window, and string-joined keys are not
@@ -125,11 +140,7 @@ func capacityTTFTProjectionComplete(ctx context.Context, db *gorm.DB, from, to i
 			SUM(ttft_observed) <> 0 OR SUM(ttft_over_3s) <> 0 OR MAX(metric_max) <> MAX(user_max)
 	) AS mismatches`, from, to, stabilityTrafficClassificationVersion,
 		from, to, stabilityTrafficClassificationVersion).Scan(&mismatches).Error
-	if err != nil {
-		slog.Warn("FRT projection coverage query failed", "err", err)
-		return false
-	}
-	return mismatches == 0
+	return err == nil && mismatches == 0, err
 }
 
 // Explicit null buckets prevent the chart connecting two isolated samples as

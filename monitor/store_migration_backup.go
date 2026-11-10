@@ -27,11 +27,22 @@ const (
 	// Bump this ID whenever either AutoMigrate model set or a post-migration
 	// schema/data transform changes. Restarts of the same plan reuse its pinned
 	// original snapshot, so they cannot prune away the old-image rollback point.
-	// v60 adds immutable monthly bills and withdrawals. Pin a fresh paired
-	// rollback point before these tables are added, even when v59 was retained.
-	// v59 adds optional upstream-token configuration, scan and work-state tables.
-	// Take a fresh paired snapshot before adding them; a retained v58 snapshot
-	// can predate the latest financial facts and is not this upgrade's rollback.
+	// v67 combines main monthly statements with the local Token/Incident/FRT schema.
+	// Neither parent plan can serve as this upgrade rollback point.
+	// v65 adds bounded detection retry state and durable reference invalidation.
+	// v64 adds local token detection heads, frozen revisions and references.
+	// v63 combines main's upstream-token tables with the local Incident, Token
+	// facts and FRT sum schemas. Neither parent's pinned snapshot is the rollback
+	// point for this combined layout; advance both plans before AutoMigrate.
+	// main's v59 adds upstream-token configuration, scan and work-state tables.
+	// v60 adds the Incident ingest adapter tables (cursor, per-window state,
+	// revision trail, gap summary, per-window impact contributions). They
+	// change both the schema SHA and the table count, so the v59 snapshot is
+	// no longer a valid rollback point for a v60 database: restoring it would
+	// leave the new tables missing while the binary expects them. Both plan IDs
+	// must move together — bumping only one makes the source-v2 database reuse
+	// the wrong pinned snapshot.
+	// local v59 adds the Incident core models.
 	// v58 adds the evidence-store identity and recovery-gap columns to the
 	// main CloudWatch cursor. Pin a new rollback point before AutoMigrate.
 	// v57 adds exact TTFT projections to the independent stability-hour facts;
@@ -41,8 +52,8 @@ const (
 	// v54 combines v1.18.3's v53 customer/CloudWatch models with v1.17.15's
 	// v43 internal-account and business-group models. Both layouts need a new
 	// rollback snapshot; neither parent's migration plan can be reused.
-	preMigrationPlanID               = "main-facts-schema-20261031-v60-portal-monthly-statements-from-20261013-v59-upstream-token-attribution-from-v58-nginx-evidence-store-proof-from-v57-stability-ttft-from-v56-ttft-coverage-from-v55-ttft-observed-over-3s-from-v54-customer-health-independent-members-v1-from-v52-upstream-errorlog-identity-archive-infra-resource-lifecycle-ecs-log-archive-rejection-user-id-pk-user-directory-customer-health-quota-cursor-responsibility-cloudwatch-investigation-audit-shadow-reconciliation-preroute-cursor-nginx-cursor-v1-nginx-repair-cursor-v1-nginx-evidence-backfill-v1-finance-user-credit-gift-facts-v1-finance-internal-accounts-business-groups"
-	preMigrationCombinedPlanID       = "main-facts-schema-20261031-v60-portal-monthly-statements-from-20261013-v59-upstream-token-attribution-from-v58-nginx-evidence-store-proof-from-v57-stability-ttft-from-v56-ttft-coverage-from-v55-ttft-observed-over-3s-from-v54-customer-health-independent-members-v1-from-v52-upstream-errorlog-identity-archive-infra-resource-lifecycle-ecs-log-archive-rejection-user-id-pk-user-directory-customer-health-quota-cursor-responsibility-cloudwatch-investigation-audit-shadow-reconciliation-preroute-cursor-nginx-cursor-v1-nginx-repair-cursor-v1-nginx-evidence-backfill-v1-nginx-source-v2-finance-user-credit-gift-facts-v1-finance-internal-accounts-business-groups"
+	preMigrationPlanID               = "main-facts-schema-20261109-v67-portal-monthly-statements-from-20261016-v66-token-delivery-v1-from-v65-token-detection-review-v2-from-v64-token-detection-v1-from-v63-upstream-token-attribution-from-v62-frt-sum-v1-from-v61-token-facts-v1-from-v60-incident-ingest-v1-from-v59-incident-core-v1-from-v58-nginx-evidence-store-proof-from-v57-stability-ttft-from-v56-ttft-coverage-from-v55-ttft-observed-over-3s-from-v54-customer-health-independent-members-v1-from-v52-upstream-errorlog-identity-archive-infra-resource-lifecycle-ecs-log-archive-rejection-user-id-pk-user-directory-customer-health-quota-cursor-responsibility-cloudwatch-investigation-audit-shadow-reconciliation-preroute-cursor-nginx-cursor-v1-nginx-repair-cursor-v1-nginx-evidence-backfill-v1-finance-user-credit-gift-facts-v1-finance-internal-accounts-business-groups-frt-sum-recompute-v2-lease-window-20261023-nginx-adaptive-evidence-20261028-customer-health-read-checkpoint-20261031-nginx-repair-read-width-20261101-nginx-independent-replay-v1"
+	preMigrationCombinedPlanID       = "main-facts-schema-20261109-v67-portal-monthly-statements-from-20261016-v66-token-delivery-v1-from-v65-token-detection-review-v2-from-v64-token-detection-v1-from-v63-upstream-token-attribution-from-v62-frt-sum-v1-from-v61-token-facts-v1-from-v60-incident-ingest-v1-from-v59-incident-core-v1-from-v58-nginx-evidence-store-proof-from-v57-stability-ttft-from-v56-ttft-coverage-from-v55-ttft-observed-over-3s-from-v54-customer-health-independent-members-v1-from-v52-upstream-errorlog-identity-archive-infra-resource-lifecycle-ecs-log-archive-rejection-user-id-pk-user-directory-customer-health-quota-cursor-responsibility-cloudwatch-investigation-audit-shadow-reconciliation-preroute-cursor-nginx-cursor-v1-nginx-repair-cursor-v1-nginx-evidence-backfill-v1-nginx-source-v2-finance-user-credit-gift-facts-v1-finance-internal-accounts-business-groups-frt-sum-recompute-v2-lease-window-20261023-nginx-adaptive-evidence-20261028-customer-health-read-checkpoint-20261031-nginx-repair-read-width-20261101-nginx-independent-replay-v1"
 	preMigrationSnapshotPrefix       = "pre-migrate-"
 	preMigrationReferencePrefix      = ".pre-migration-plan-"
 	preMigrationReferenceSuffix      = ".json"

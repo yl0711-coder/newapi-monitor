@@ -101,14 +101,14 @@ func buildCloudWatchInsightsQuery(req cloudWatchInsightsRequest) (cloudWatchLogS
 			return cloudWatchLogSource{}, "", 0, err
 		}
 		sourceID = cwSourceWorkerNginx
-		query = fmt.Sprintf("filter @logStream like /^nginx\\// | filter oneapi_request_id = %s | fields @timestamp, @logStream, nginx_request_id, oneapi_request_id, request_method, uri, status, request_time, upstream_status, upstream_response_time, upstream_connect_time, upstream_header_time, bytes_sent, request_completion", cloudWatchQueryLiteral(value))
+		query = fmt.Sprintf("filter @logStream like /^nginx\\// | filter oneapi_request_id = %s | fields @timestamp, @logStream, nginx_request_id, oneapi_request_id, request_method, uri, status, request_time, upstream_status, upstream_response_time, upstream_connect_time, upstream_header_time, bytes_sent, request_length, request_completion", cloudWatchQueryLiteral(value))
 	case cwQueryWorkerPath:
 		value, err := validateCloudWatchQueryValue(req.Value, 1024)
 		if err != nil || !strings.HasPrefix(value, "/") {
 			return cloudWatchLogSource{}, "", 0, newCloudWatchLogsError(cwLogsErrInvalid, "path", err)
 		}
 		sourceID = cwSourceWorkerNginx
-		query = fmt.Sprintf("filter @logStream like /^nginx\\// | filter uri = %s | fields @timestamp, @logStream, nginx_request_id, oneapi_request_id, request_method, uri, status, request_time, upstream_status, upstream_response_time, upstream_connect_time, upstream_header_time, bytes_sent, request_completion", cloudWatchQueryLiteral(value))
+		query = fmt.Sprintf("filter @logStream like /^nginx\\// | filter uri = %s | fields @timestamp, @logStream, nginx_request_id, oneapi_request_id, request_method, uri, status, request_time, upstream_status, upstream_response_time, upstream_connect_time, upstream_header_time, bytes_sent, request_length, request_completion", cloudWatchQueryLiteral(value))
 	case cwQueryWorkerFixedErrors:
 		if strings.TrimSpace(req.Value) != "" {
 			return cloudWatchLogSource{}, "", 0, newCloudWatchLogsError(cwLogsErrInvalid, "fixed_query_value", nil)
@@ -124,7 +124,7 @@ func buildCloudWatchInsightsQuery(req cloudWatchInsightsRequest) (cloudWatchLogS
 		// 运行日志；若不在查询侧排除，它们既不是 access 请求，也没有完整的
 		// access 字段，会把本来完整的窗口误标为解析失败。
 		// 不使用任意用户提供的查询语句，也不把原始日志正文作为持久化结果。
-		query = "filter @logStream like /^nginx\\// | filter ispresent(request_method) and ispresent(uri) and ispresent(status) and ispresent(request_time) | fields @timestamp, @logStream, @ptr, nginx_request_id, oneapi_request_id, request_method, uri, status, request_time, upstream_status, upstream_response_time, upstream_connect_time, upstream_header_time, bytes_sent, request_completion"
+		query = "filter @logStream like /^nginx\\// | filter ispresent(request_method) and ispresent(uri) and ispresent(status) and ispresent(request_time) | fields @timestamp, @logStream, @ptr, nginx_request_id, oneapi_request_id, request_method, uri, status, request_time, upstream_status, upstream_response_time, upstream_connect_time, upstream_header_time, bytes_sent, request_length, request_completion"
 	case cwQueryWorkerShadowReject, cwQueryWorkerPreRouteReject:
 		if strings.TrimSpace(req.Value) != "" {
 			return cloudWatchLogSource{}, "", 0, newCloudWatchLogsError(cwLogsErrInvalid, "shadow_query_value", nil)
@@ -141,7 +141,7 @@ func buildCloudWatchInsightsQuery(req cloudWatchInsightsRequest) (cloudWatchLogS
 		sourceID = cwSourceWorkerNginx
 		// 只允许结构化 access 和标准 error.log 行进入解析器。nginx/ 前缀下
 		// 的启动/运行噪声既不是请求事实也不是错误分类，必须在 AWS 查询侧排除。
-		query = "filter @logStream like /^nginx\\// | filter (ispresent(request_method) and ispresent(uri) and ispresent(status) and ispresent(request_time)) or @message like /\\[(emerg|alert|crit|error|warn|notice)\\]/ | fields @timestamp, @logStream, @ptr, @message, nginx_request_id, oneapi_request_id, request_method, uri, status, request_time, upstream_status, upstream_response_time, upstream_connect_time, upstream_header_time, bytes_sent, request_completion"
+		query = "filter @logStream like /^nginx\\// | filter (ispresent(request_method) and ispresent(uri) and ispresent(status) and ispresent(request_time)) or @message like /\\[(emerg|alert|crit|error|warn|notice)\\]/ | fields @timestamp, @logStream, @ptr, @message, nginx_request_id, oneapi_request_id, request_method, uri, status, request_time, upstream_status, upstream_response_time, upstream_connect_time, upstream_header_time, bytes_sent, request_length, request_completion"
 	default:
 		return cloudWatchLogSource{}, "", 0, newCloudWatchLogsError(cwLogsErrInvalid, "query_kind", nil)
 	}
@@ -220,7 +220,11 @@ func (r *cloudWatchLogsRuntime) insights(ctx context.Context, req cloudWatchInsi
 		switch output.Status {
 		case cwlogtypes.QueryStatusScheduled, cwlogtypes.QueryStatusRunning:
 			if pollErr := r.poll(totalCtx); pollErr != nil {
-				return result, newCloudWatchLogsError(classifyCloudWatchLogsError(pollErr), "poll_query", pollErr)
+				operation := "poll_query"
+				if output.Status == cwlogtypes.QueryStatusScheduled {
+					operation = "poll_scheduled"
+				}
+				return result, newCloudWatchLogsError(classifyCloudWatchLogsError(pollErr), operation, pollErr)
 			}
 			continue
 		case cwlogtypes.QueryStatusComplete:

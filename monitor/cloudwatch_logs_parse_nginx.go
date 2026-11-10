@@ -1,6 +1,9 @@
 package monitor
 
 import (
+	"encoding/json"
+	"github.com/yl0711-coder/newapi-monitor/internal/metering"
+
 	"regexp"
 	"strconv"
 	"strings"
@@ -59,6 +62,8 @@ func (p *cloudWatchEvidenceParser) parseNginxAccess(in cloudWatchEvidenceInput, 
 	} else if present {
 		out.BytesSent = cwInt64Pointer(bytes)
 	}
+	out.RequestLength, out.RequestLengthState = parseCloudWatchRequestLength(in)
+	out.RequestLengthVersion = "request-length-v1"
 	out.Completion = cwCompletion(cwField(fields, "request_completion"))
 	nginxHMAC, ok := p.optionalOpaqueHMAC("nginx-request-id", cwField(fields, "nginx_request_id", "request_id"))
 	if !ok {
@@ -70,6 +75,18 @@ func (p *cloudWatchEvidenceParser) parseNginxAccess(in cloudWatchEvidenceInput, 
 		return cloudWatchStructuredEvidence{}, newCloudWatchEvidenceParseError(cwParseMalformed, in.Source)
 	}
 	out.OneAPIIDHMAC = oneAPIHMAC
+	// Query pointers are transport references, not the ingress request's
+	// identity. A full immutable message, stream and millisecond event time,
+	// with both request identities present, remain stable across overlap reads.
+	if p.nginxContinuousIdentity && nginxHMAC != "" && oneAPIHMAC != "" &&
+		in.Message != "" && len(in.Message) <= cloudWatchEvidenceMaxMessageBytes {
+		if stream, ok := cwBoundedOpaque(in.LogStream, 2048); ok && stream != "" {
+			out.EventRef = p.hmac("nginx-continuous-event-v1", string(in.Source)+"\x00"+stream+"\x00"+strconv.FormatInt(eventMS, 10)+"\x00"+in.Message)
+		}
+	}
+	if requestID := cwField(fields, "oneapi_request_id"); validNginxEvidenceLookupID(requestID) {
+		out.OneAPIRequestID = requestID
+	}
 	detail := ""
 	if len(upstreamStatuses) > 0 {
 		detail = strconv.Itoa(upstreamStatuses[len(upstreamStatuses)-1])
@@ -159,4 +176,24 @@ func cwNginxErrorFault(category string) string {
 func cwNginxErrorSummary(category string) string {
 	labels := map[string]string{"upstream_timeout": "Nginx 上游响应超时", "upstream_connect_failed": "Nginx 上游连接失败", "upstream_closed": "Nginx 上游提前关闭", "upstream_tls": "Nginx 上游 TLS 失败", "client_closed": "Nginx 记录到客户端提前关闭", "worker_capacity": "Nginx Worker 容量不足", "resolver": "Nginx 上游解析失败", "rate_limited": "Nginx 触发限流", "request_body": "Nginx 请求体处理异常", "other_error": "Nginx 记录到其他错误"}
 	return labels[category]
+}
+
+// Optional length errors do not discard other request evidence.
+func parseCloudWatchRequestLength(in cloudWatchEvidenceInput) (*int64, string) {
+	if in.Fields != nil {
+		value, ok := in.Fields["request_length"]
+		if !ok {
+			return nil, "missing"
+		}
+		if value == "null" {
+			return nil, "null"
+		}
+		raw, _ := json.Marshal(value)
+		return metering.RequestLength(raw)
+	}
+	fields, err := metering.Object([]byte(in.Message), 1<<20, 12)
+	if err != nil {
+		return nil, "invalid"
+	}
+	return metering.RequestLength(fields["request_length"])
 }

@@ -829,7 +829,8 @@ func (m *Monitor) sampleRangeWithPriority(ctx context.Context, fromTs, toTs int6
 	return m.sampleRangeWithPriorityOptions(ctx, fromTs, toTs, lowPriority, includeCapacity, true)
 }
 
-// sampleCustomerHealthRangeLow 复用同一条用户聚合 SQL 和扫描口径，但只落客户维护
+// sampleCustomerHealthRangeLow 复用用户聚合口径，仅选择客户维护需要的 24 列。
+// 普通采样保留完整投影；此路径只落客户维护
 // 需要的用户分钟事实。logchain-only 没有主采样/封口链，顺带写 MetricSample 既没人消费，
 // 又会制造“普通采样器曾运行”的假象和冗余磁盘写入。
 func (m *Monitor) sampleCustomerHealthRangeLow(ctx context.Context, fromTs, toTs int64) (int, error) {
@@ -864,8 +865,12 @@ func (m *Monitor) sampleRangeWithPriorityOptions(ctx context.Context, fromTs, to
 	defer cancel()
 
 	query := sampleWindowSQL()
+	healthOnly := includeCapacity && !includeMetrics
 	if includeCapacity {
 		query = sampleWindowUserSQL()
+	}
+	if healthOnly {
+		query = sampleCustomerHealthWindowSQL()
 	}
 	rows, err := m.prodDB.QueryContext(cctx, query, fromTs, toTs)
 	if err != nil {
@@ -899,20 +904,26 @@ func (m *Monitor) sampleRangeWithPriorityOptions(ctx context.Context, fromTs, to
 		if includeCapacity {
 			scanArgs = append(scanArgs, &customerHealthAnomaly, &customerHealthFailed)
 		}
+		if healthOnly {
+			scanArgs = append(scanArgs, &s.Tokens, &s.Quota, &s.RefundQuota)
+		} else {
+			scanArgs = append(scanArgs,
+				&s.AnomalyBilled, &s.AnomalyFree, &s.AnomalyStream, &s.AnomalyQuota, &s.AnomalySumTime,
+				&s.SumUseTime, &s.MaxUseTime, &s.Tokens, &s.Quota, &s.RefundRecords, &s.RefundQuota,
+				&e4, &e5, &eto,
+				&s.Lat1, &s.Lat2, &s.Lat5, &s.Lat10, &s.Lat30, &s.Lat60, &s.LatInf,
+				&s.CompletionTokens)
+		}
 		scanArgs = append(scanArgs,
-			&s.AnomalyBilled, &s.AnomalyFree, &s.AnomalyStream, &s.AnomalyQuota, &s.AnomalySumTime,
-			&s.SumUseTime, &s.MaxUseTime, &s.Tokens, &s.Quota, &s.RefundRecords, &s.RefundQuota,
-			&e4, &e5, &eto,
-			&s.Lat1, &s.Lat2, &s.Lat5, &s.Lat10, &s.Lat30, &s.Lat60, &s.LatInf,
-			&s.CompletionTokens,
 			&s.Ttft500, &s.Ttft1k, &s.Ttft2k, &s.Ttft5k, &s.Ttft10k, &s.TtftInf, &s.TtftMaxMs,
-			&s.TtftObserved, &s.TtftOver3s)
+			&s.TtftObserved, &s.TtftOver3s, &s.FRTSumMs)
 		if err := rows.Scan(scanArgs...); err != nil {
 			return 0, err
 		}
 		s.Grp = grp.String
 		s.TrafficClassVersion = stabilityTrafficClassificationVersion
 		s.TTFTSemanticsVersion = ttftCoverageSemanticsVersion
+		s.FRTSumObserved, s.FRTSumVersion = s.TtftObserved, frtSumSemanticsVersion
 		s.Err4xx, s.Err5xx, s.ErrTimeout = e4, e5, eto
 		if other := s.Failed - e4 - e5 - eto; other > 0 {
 			s.ErrOther = other
@@ -933,12 +944,15 @@ func (m *Monitor) sampleRangeWithPriorityOptions(ctx context.Context, fromTs, to
 				ModelName: s.ModelName, Grp: s.Grp, TrafficClassVersion: stabilityTrafficClassificationVersion,
 				Success: s.Success, Anomaly: s.Anomaly, Failed: s.Failed,
 				CustomerHealthAnomaly: customerHealthAnomaly, CustomerHealthFailed: customerHealthFailed,
-				CustomerHealthVersion: customerHealthStabilityPolicyVersion, Tokens: s.Tokens,
+				// The shared SQL has only raw error totals. Version is assigned
+				// after the bounded diagnostic pass has accounted for every row.
+				CustomerHealthVersion: 0, Tokens: s.Tokens,
 				Quota: s.Quota, RefundQuota: s.RefundQuota,
 				Ttft500: s.Ttft500, Ttft1k: s.Ttft1k, Ttft2k: s.Ttft2k, Ttft5k: s.Ttft5k,
 				Ttft10k: s.Ttft10k, TtftInf: s.TtftInf, TtftMaxMs: s.TtftMaxMs,
 				TtftObserved: s.TtftObserved, TtftOver3s: s.TtftOver3s,
 				TTFTSemanticsVersion: ttftCoverageSemanticsVersion,
+				FRTSumMs:             s.FRTSumMs, FRTSumObserved: s.FRTSumObserved, FRTSumVersion: s.FRTSumVersion,
 			})
 		}
 	}
@@ -946,6 +960,26 @@ func (m *Monitor) sampleRangeWithPriorityOptions(ctx context.Context, fromTs, to
 		m.reportSourceQueryError(err)
 		return 0, err
 	}
+	if err := rows.Close(); err != nil {
+		m.reportSourceQueryError(err)
+		return 0, err
+	}
+	healthReady := true
+	if includeCapacity {
+		if err := classifyCustomerHealthErrors(cctx, m.prodDB, fromTs, toTs, userBatch); err != nil {
+			if healthOnly {
+				return 0, err
+			}
+			healthReady = false
+			// Model statistics, FRT, capacity and alerts keep their independent
+			// aggregate. A failed health projection is explicitly unversioned;
+			// its existing policy-replay lane retries without moving coverage.
+			slog.Warn("客户维护诊断分类延期；保留共享统计，等待独立重试", "err", err)
+		}
+	}
+	// Source rows are fully consumed. Local SQLite contention must not keep
+	// other collectors or the runtime health probe out of the source lane.
+	release()
 	batch := make([]MetricSample, 0, len(metricByKey))
 	for _, sample := range metricByKey {
 		batch = append(batch, *sample)
@@ -955,6 +989,9 @@ func (m *Monitor) sampleRangeWithPriorityOptions(ctx context.Context, fromTs, to
 			if err := upsertSamplesDB(tx, batch); err != nil {
 				return err
 			}
+		}
+		if !healthReady {
+			return upsertCustomerHealthDeferredSamples(tx, userBatch)
 		}
 		return upsertCapacityUserMinuteSamplesDB(tx, userBatch)
 	}); err != nil {
@@ -967,6 +1004,7 @@ func (m *Monitor) sampleRangeWithPriorityOptions(ctx context.Context, fromTs, to
 }
 
 func mergeMetricSample(dst *MetricSample, src MetricSample) {
+	mergeMetricFRTSum(dst, src)
 	dst.Success += src.Success
 	dst.Anomaly += src.Anomaly
 	dst.Failed += src.Failed
@@ -1016,6 +1054,14 @@ func sampleWindowSQL() string { return sampleWindowSQLWithUser(false) }
 func sampleWindowUserSQL() string { return sampleWindowSQLWithUser(true) }
 
 func sampleWindowSQLWithUser(includeUser bool) string {
+	return sampleWindowSQLProjection(includeUser, false)
+}
+
+func sampleCustomerHealthWindowSQL() string { return sampleWindowSQLProjection(true, true) }
+
+func sampleWindowSQLProjection(includeUser, healthOnly bool) string {
+	// The FRT sum keeps MySQL DECIMAL until Scan, which rejects int64 overflow
+	// instead of silently saturating a CAST AS SIGNED. Existing projections stay unchanged.
 	// MySQL SUM/布尔聚合返回 DECIMAL,需 CAST 成 SIGNED 才能 Scan 进 int64。
 	// 错误分类互斥(优先级:超时 > 5xx > 4xx),四类之和不超过失败数。
 	// FRT = 首个 data 事件延迟(ms),取自 other JSON 的 frt;它不是严格的
@@ -1023,24 +1069,18 @@ func sampleWindowSQLWithUser(includeUser bool) string {
 	// 携带历史 frt 字段也不得进入这些聚合。
 	//
 	// 交付异常判据见 expandAnomalyPredicates。
-	const frt = "(CASE WHEN JSON_VALID(other) THEN CAST(JSON_EXTRACT(other,'$.frt') AS SIGNED) ELSE 0 END)"
+	// 表达式提为包级常量 frtSourceExpr，供 FRT 总和回算复用同一口径；
+	// 两处各写一份迟早漂移，而漂移后算出的均值无法与采集结果对账。
+	const frt = frtSourceExpr
 	userColumns, userHealthColumns, userGroup := "", "", ""
 	if includeUser {
 		userColumns = "  user_id, MAX(COALESCE(username,'')) AS username,\n"
 		userHealthColumns =
 			"  CAST(COALESCE(SUM(type=2 AND {{HEALTHANOM}}),0) AS SIGNED) AS customer_health_anomaly,\n" +
-				"  CAST(COALESCE(SUM(type=5 AND NOT " + customerHealthDownstreamErrorSQL() + "),0) AS SIGNED) AS customer_health_failed,\n"
+				"  CAST(COALESCE(SUM(type=5),0) AS SIGNED) AS customer_health_failed,\n"
 		userGroup = ", user_id"
 	}
-	q := `
-SELECT /*+ MAX_EXECUTION_TIME(8000) */
-  (created_at DIV 60)*60 AS bucket,
-  channel_id, model_name, ` + "`group`" + ` AS grp,
-` + userColumns + `
-  CAST(COALESCE(SUM(type=2 AND NOT {{ANOM}}),0) AS SIGNED) AS success,
-  CAST(COALESCE(SUM(type=2 AND {{ANOM}}),0) AS SIGNED) AS anomaly,
-  CAST(COALESCE(SUM(type=5),0) AS SIGNED) AS failed,
-` + userHealthColumns + `
+	metricTimingColumns := `
   CAST(COALESCE(SUM(type=2 AND {{ZERO}} AND quota > 0),0) AS SIGNED) AS anomaly_billed,
   CAST(COALESCE(SUM(type=2 AND {{ZERO}} AND quota = 0),0) AS SIGNED) AS anomaly_free,
   CAST(COALESCE(SUM(type=2 AND {{STREAMBAD}} AND NOT {{ZERO}}),0) AS SIGNED) AS anomaly_stream,
@@ -1048,10 +1088,9 @@ SELECT /*+ MAX_EXECUTION_TIME(8000) */
   CAST(COALESCE(SUM(CASE WHEN type=2 AND {{ANOM}} THEN use_time END),0) AS SIGNED) AS anomaly_sum_time,
   CAST(COALESCE(SUM(CASE WHEN type=2 THEN use_time END),0) AS SIGNED) AS sum_use_time,
   CAST(COALESCE(MAX(CASE WHEN type=2 THEN use_time END),0) AS SIGNED) AS max_use_time,
-  CAST(COALESCE(SUM(CASE WHEN type=2 THEN prompt_tokens+completion_tokens END),0) AS SIGNED) AS tokens,
-  CAST(COALESCE(SUM(CASE WHEN type=2 THEN quota END),0) AS SIGNED) AS quota,
-  CAST(COALESCE(SUM(type=6),0) AS SIGNED) AS refund_records,
-  CAST(COALESCE(SUM(CASE WHEN type=6 THEN quota END),0) AS SIGNED) AS refund_quota,
+`
+	refundRecordsColumn := "  CAST(COALESCE(SUM(type=6),0) AS SIGNED) AS refund_records,\n"
+	metricDistributionColumns := `
   CAST(COALESCE(SUM(type=5 AND {{ERR4XX}}),0) AS SIGNED) AS err_4xx,
   CAST(COALESCE(SUM(type=5 AND {{ERR5XX}}),0) AS SIGNED) AS err_5xx,
   CAST(COALESCE(SUM(type=5 AND {{ERRTIMEOUT}}),0) AS SIGNED) AS err_timeout,
@@ -1063,6 +1102,24 @@ SELECT /*+ MAX_EXECUTION_TIME(8000) */
   CAST(COALESCE(SUM(type=2 AND use_time>30 AND use_time<=60),0) AS SIGNED) AS lat_60,
   CAST(COALESCE(SUM(type=2 AND use_time>60),0) AS SIGNED)                 AS lat_inf,
   CAST(COALESCE(SUM(CASE WHEN type=2 THEN completion_tokens END),0) AS SIGNED) AS completion_tokens,
+`
+	if healthOnly {
+		metricTimingColumns, refundRecordsColumn, metricDistributionColumns = "", "", ""
+	}
+	q := `
+SELECT /*+ MAX_EXECUTION_TIME(8000) */
+  (created_at DIV 60)*60 AS bucket,
+  channel_id, model_name, ` + "`group`" + ` AS grp,
+` + userColumns + `
+  CAST(COALESCE(SUM(type=2 AND NOT {{ANOM}}),0) AS SIGNED) AS success,
+  CAST(COALESCE(SUM(type=2 AND {{ANOM}}),0) AS SIGNED) AS anomaly,
+  CAST(COALESCE(SUM(type=5),0) AS SIGNED) AS failed,
+` + userHealthColumns + metricTimingColumns + `
+  CAST(COALESCE(SUM(CASE WHEN type=2 THEN prompt_tokens+completion_tokens END),0) AS SIGNED) AS tokens,
+  CAST(COALESCE(SUM(CASE WHEN type=2 THEN quota END),0) AS SIGNED) AS quota,
+` + refundRecordsColumn + `
+  CAST(COALESCE(SUM(CASE WHEN type=6 THEN quota END),0) AS SIGNED) AS refund_quota,
+` + metricDistributionColumns + `
   CAST(COALESCE(SUM(type=2 AND COALESCE(is_stream,0)=1 AND FRT>0    AND FRT<=500),0)   AS SIGNED) AS ttft_500,
   CAST(COALESCE(SUM(type=2 AND COALESCE(is_stream,0)=1 AND FRT>500  AND FRT<=1000),0)  AS SIGNED) AS ttft_1k,
   CAST(COALESCE(SUM(type=2 AND COALESCE(is_stream,0)=1 AND FRT>1000 AND FRT<=2000),0)  AS SIGNED) AS ttft_2k,
@@ -1071,7 +1128,8 @@ SELECT /*+ MAX_EXECUTION_TIME(8000) */
   CAST(COALESCE(SUM(type=2 AND COALESCE(is_stream,0)=1 AND FRT>10000),0)               AS SIGNED) AS ttft_inf,
   CAST(COALESCE(MAX(CASE WHEN type=2 AND COALESCE(is_stream,0)=1 AND FRT>0 THEN FRT END),0) AS SIGNED) AS ttft_max_ms,
   CAST(COALESCE(SUM(type=2 AND COALESCE(is_stream,0)=1 AND FRT>0),0) AS SIGNED) AS ttft_observed,
-  CAST(COALESCE(SUM(type=2 AND COALESCE(is_stream,0)=1 AND FRT>0 AND FRT>3000),0) AS SIGNED) AS ttft_over_3s
+  CAST(COALESCE(SUM(type=2 AND COALESCE(is_stream,0)=1 AND FRT>0 AND FRT>3000),0) AS SIGNED) AS ttft_over_3s,
+  COALESCE(SUM(CASE WHEN type=2 AND COALESCE(is_stream,0)=1 AND FRT>0 THEN FRT END),0) AS frt_sum_ms
 FROM logs
 WHERE created_at >= ? AND created_at < ? AND type IN (2,5,6)
   AND NOT (` + channelTestLogPredicateSQL() + `)

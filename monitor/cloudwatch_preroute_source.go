@@ -243,6 +243,14 @@ func (m *Monitor) startCloudWatchPreRoute(ctx context.Context) {
 		if poll <= 0 {
 			poll = 5 * time.Minute
 		}
+		livePoll := time.Duration(m.cfg.CloudWatchPreRouteLivePollSeconds) * time.Second
+		if livePoll < time.Minute {
+			livePoll = time.Minute
+		}
+		if livePoll > poll {
+			livePoll = poll
+		}
+		var nextReplay time.Time
 		initRetry := cloudWatchPreRouteInitRetry
 		if poll < initRetry {
 			initRetry = poll
@@ -272,25 +280,12 @@ func (m *Monitor) startCloudWatchPreRoute(ctx context.Context) {
 			if ctx.Err() != nil {
 				return
 			}
-			_, target := cloudWatchPreRouteRange(time.Now(), m.cfg.CloudWatchPreRouteLookbackHours)
+			started := time.Now()
+			_, target := cloudWatchPreRouteRange(started, m.cfg.CloudWatchPreRouteLookbackHours)
+			from, to, replay := cloudWatchPreRouteNextWindow(state, target, started, nextReplay)
 			state.TargetThroughTs = target
-			from := state.NextTs
-			// 一旦已经追平，后续每轮都重放最近窗口以接住 CloudWatch 迟到事件；
-			// 不能用“旧 Through 是否达到本轮新 target”判断，否则 target 每次前移
-			// 都会让 replay 永远无法发生。
-			caughtUp := state.Status == "caught_up"
-			if caughtUp {
-				from = state.ThroughTs - int64(cloudWatchPreRouteReplay/time.Second)
-				if from < state.CoverageFromTs {
-					from = state.CoverageFromTs
-				}
-			}
-			to := from + int64(cloudWatchPreRouteWindow/time.Second)
-			if to > target {
-				to = target
-			}
 			if to <= from {
-				if !waitSourceLifecycle(ctx, poll) {
+				if !waitSourceLifecycle(ctx, livePoll) {
 					return
 				}
 				continue
@@ -306,14 +301,38 @@ func (m *Monitor) startCloudWatchPreRoute(ctx context.Context) {
 				continue
 			}
 			slog.Info("CloudWatch 前置拒绝持续采集完成窗口", "from", from, "to", to,
-				"through", state.ThroughTs, "target", target, "queries", queries)
+				"through", state.ThroughTs, "target", target, "queries", queries, "replay", replay,
+				"duration_ms", time.Since(started).Milliseconds())
+			if replay {
+				nextReplay = started.Add(poll)
+			}
 			delay := cloudWatchPreRouteCatchupDelay
 			if state.ThroughTs >= target {
-				delay = poll
+				delay = sourceCadenceDelay(started, time.Now(), livePoll)
 			}
 			if !waitSourceLifecycle(ctx, delay) {
 				return
 			}
 		}
 	}()
+}
+
+// A minute increment no longer waits for the five-minute replay cadence. The
+// replay span and cadence stay bounded, rather than scanning twenty minutes on
+// every live poll. A failed replay remains due; publication still requires the
+// whole source query and the local fact transaction to succeed.
+func cloudWatchPreRouteNextWindow(state CloudWatchPreRouteCursor, target int64, now, nextReplay time.Time) (from, to int64, replay bool) {
+	from = state.NextTs
+	replay = !now.Before(nextReplay) && (state.Status == "caught_up" || state.Status == "degraded")
+	if replay {
+		from = max(state.CoverageFromTs, state.ThroughTs-int64(cloudWatchPreRouteReplay/time.Second))
+	}
+	to = min(target, from+int64(cloudWatchPreRouteWindow/time.Second))
+	return
+}
+
+// Keep the configured start-to-start cadence. Query time must not be added to
+// a full sleep on every successful cycle; retain a small yield after slow work.
+func sourceCadenceDelay(started, now time.Time, period time.Duration) time.Duration {
+	return max(2*time.Second, period-now.Sub(started))
 }

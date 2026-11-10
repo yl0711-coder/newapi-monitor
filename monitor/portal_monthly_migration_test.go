@@ -17,10 +17,10 @@ func TestMonthlyStatementMigrationPinsLatestDualStoreRollback(t *testing.T) {
 			name, plan = "source-v2", preMigrationCombinedPlanID
 		}
 		t.Run(name, func(t *testing.T) {
-			const prefix = "20261031-v60-portal-monthly-statements-from-"
+			const prefix = "20261109-v67-portal-monthly-statements-from-"
 			priorPlan := strings.Replace(plan, prefix, "", 1)
-			if priorPlan == plan || !strings.HasPrefix(priorPlan, "main-facts-schema-20261013-v59-") {
-				t.Fatal("monthly tables must advance the actual v59 migration plan")
+			if priorPlan == plan || !strings.HasPrefix(priorPlan, "main-facts-schema-20261016-v66-") {
+				t.Fatal("monthly tables must advance the actual local v66 migration plan")
 			}
 			dir := t.TempDir()
 			mainPath, factsPath := filepath.Join(dir, "monitor.db"), filepath.Join(dir, "usage-facts.db")
@@ -48,7 +48,7 @@ func TestMonthlyStatementMigrationPinsLatestDualStoreRollback(t *testing.T) {
 			defer m.Close()
 			snapshots := preMigrationSnapshotDirs(t, cfg.StoreBackupDir)
 			if len(snapshots) != 2 {
-				t.Fatal("stale v59 rollback point was reused", len(snapshots))
+				t.Fatal("stale local v66 rollback point was reused", len(snapshots))
 			}
 			var current string
 			for _, snapshot := range snapshots {

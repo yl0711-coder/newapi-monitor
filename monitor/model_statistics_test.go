@@ -590,7 +590,7 @@ func TestModelStatisticsKeepsUnknownIdentityOverlap(t *testing.T) {
 
 func TestModelStatisticsCustomerDrilldownUIContract(t *testing.T) {
 	js := string(modelStatisticsJS)
-	for _, want := range []string{"data-ms-group-key", "ms-group-row", "group.channels", "ttft_p95_ms", "ttft_over_3s", "customer_id", "customer_name", "客户 ID", "客户名", "占该分组", "ms-model-row-high-unavailable", "unavailable_channel_requests", "channel_kind", "is_unavailable", "data-ms-channel-key", "data-ms-channel-kind", "data-ms-channel-id", "unavailable/requests>0.35"} {
+	for _, want := range []string{"data-ms-group-key", "ms-group-row", "group.channels", "渠道请求统计", "colspan=\"5\"", "customer_id", "customer_name", "客户 ID", "客户名", "占该分组", "ms-model-row-high-unavailable", "unavailable_channel_requests", "channel_kind", "is_unavailable", "data-ms-channel-key", "data-ms-channel-kind", "data-ms-channel-id", "unavailable/requests>0.35"} {
 		if !strings.Contains(js, want) {
 			t.Errorf("模型统计客户下钻展示缺少 %q", want)
 		}

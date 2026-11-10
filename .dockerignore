@@ -17,6 +17,7 @@ monitor/**
 !monitor/*.html
 !monitor/*.js
 !monitor/*.css
+!monitor/logchain_diagnostic_rules.json
 !monitor/public/
 monitor/public/**
 !monitor/public/*.go
@@ -29,6 +30,9 @@ internal/observability/**
 !internal/observability/schema/
 internal/observability/schema/**
 !internal/observability/schema/observability.v1.schema.json
+!internal/metering/
+internal/metering/**
+!internal/metering/*.go
 !internal/trafficclass/
 internal/trafficclass/**
 !internal/trafficclass/*.go
@@ -76,6 +80,9 @@ cmd/ecslogagent/**
 !cmd/ecssynthetic/
 cmd/ecssynthetic/**
 !cmd/ecssynthetic/*.go
+!cmd/buildmanifest/
+cmd/buildmanifest/**
+!cmd/buildmanifest/*.go
 
 # 测试源码不参与生产镜像编译；CI 在宿主工作树中单独执行测试。
 **/*_test.go

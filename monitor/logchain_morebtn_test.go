@@ -5,11 +5,25 @@ import (
 	"testing"
 )
 
+func logChainPaginationLoadBody(t *testing.T) string {
+	t.Helper()
+	js := strings.ReplaceAll(stripJSLineComments(string(logChainJS)), "\r\n", "\n")
+	start := strings.Index(js, "async function load(")
+	if start < 0 {
+		t.Fatal("找不到 load")
+	}
+	end := strings.Index(js[start:], "\n}\n")
+	if end < 0 {
+		t.Fatal("找不到 load 的函数边界")
+	}
+	return js[start : start+end+2]
+}
+
 // “加载更多”按钮的解锁顺序。
 //
 // render() 会按 lc.loading 设置 disabled；因此最终收尾必须先解锁再渲染。
 func TestMoreButtonUnlocksBeforeRender(t *testing.T) {
-	js := string(logChainJS)
+	js := logChainPaginationLoadBody(t)
 	finallyAt := strings.Index(js, "}finally{")
 	if finallyAt < 0 {
 		t.Fatal("找不到 load 的 finally")
@@ -28,12 +42,7 @@ func TestMoreButtonUnlocksBeforeRender(t *testing.T) {
 // 新筛选开始后，上一页留下的 hasMore/游标必须立即失效；否则旧按钮在新响应
 // 回来前仍可点击，并把新筛选中止成一次 append 查询。
 func TestNewQueryInvalidatesOldPaginationBeforeFetch(t *testing.T) {
-	js := string(logChainJS)
-	start := strings.Index(js, "async function load(more){")
-	if start < 0 {
-		t.Fatal("找不到 load")
-	}
-	seg := js[start:]
+	seg := logChainPaginationLoadBody(t)
 	fetchAt := strings.Index(seg, "fetch('/logchain/requests?")
 	resetAt := strings.Index(seg, "lc.hasMore=false;lc.nextBeforeTs=0;lc.nextBeforeID=0")
 	disableAt := strings.Index(seg, "moreBtn.disabled=true")
@@ -47,7 +56,9 @@ func TestNewQueryInvalidatesOldPaginationBeforeFetch(t *testing.T) {
 
 // 只拦重复分页，不得拦新的首屏筛选：后者需要中止旧请求并立即生效。
 func TestDuplicateLoadMoreIsIgnored(t *testing.T) {
-	js := stripJSLineComments(string(logChainJS))
+	// Automatic refresh may wait for an in-flight request; the interactive load
+	// path still has to cancel and replace it. Check that path specifically.
+	js := logChainPaginationLoadBody(t)
 	if !strings.Contains(js, "if(more&&(lc.loading||!lc.hasMore||!lc.nextBeforeTs||!lc.nextBeforeID))return;") {
 		t.Error("加载更多应在已有请求、无下一页或无完整游标时直接返回")
 	}

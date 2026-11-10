@@ -11,7 +11,8 @@ const ST_HEADERS={
   model:{title:'模型监控',subtitle:'分钟级实时状态、告警、SLO、稳定性与响应耗时',icon:'activity'},
   server:{title:'服务端监控',subtitle:'实例、数据库、负载均衡、域名探活与证书',icon:'chart'},
   capacity:{title:'容量规划',subtitle:'RPM / TPM · 日志稳定率 · 分组与渠道负载 · 服务资源同轴观察',icon:'capacity'},
-  'model-statistics':{title:'模型统计',subtitle:'按模型统计客户请求次数，展开查看各分组明细',icon:'model-statistics'},
+  'model-statistics':{title:'模型统计',subtitle:'模型请求统计 · 渠道 / 实际服务分组 / 模型首字耗时',icon:'model-statistics'},
+  anomalies:{title:'异常监控',subtitle:'Token 异常与事故事实',icon:'alert'},
   'customer-health':{title:'客户维护',subtitle:'客户日志记录、稳定率、主要模型与责任线索',icon:'heart'},
   // 缺这条会走第 22 行的 ||ST_HEADERS.usage 兜底，顶部标题错显成"用户用量"。
   // 新增 tab 时必须同步加，否则页面标题静默串台。

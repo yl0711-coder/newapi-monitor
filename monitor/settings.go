@@ -11,6 +11,40 @@ import (
 
 // Settings 是监控服务的独立配置,全部从环境变量读取——不依赖任何外部 config 包。
 type Settings struct {
+	TokenExportsEnabled                bool
+	TokenExportPolicy                  string
+	TokenNotificationEvaluationEnabled bool
+	TokenNotificationsEnabled          bool
+	TokenNotificationPolicy            string
+	TokenNotificationRecipients        string
+	TokenNotificationBaseURL           string
+	TokenDetectionEnabled              bool
+	TokenDetectionPolicy               string
+	TokenStorePath                     string
+	TokenStoreMinFreeBytes             int64
+	TokenStoreMaxUsedPercent           int
+	TokenProcessingPollSeconds         int
+	TokenProcessingBatchRows           int
+	TokenDetectionWorkers              int
+	TokenDetectionWorkMilliseconds     int
+	TokenDetectionCommitRows           int
+	TokenDetectionMaxRows              int64
+	TokenDetectionMaxBytes             int64
+	TokenDetectionMaxReferences        int64
+	TokenDetectionMaxReferenceRecords  int64
+	TokenDetectionRetentionDays        int
+	TokenDetectionRetentionBasis       string
+	// Token facts are independent of Incident/Usage ingestion; default disabled.
+	TokenFactsEnabled                bool
+	TokenFactsSourceEpoch            string
+	TokenFactsSourceMode             string
+	TokenFactsUsageAdapter           string
+	TokenFactsSemanticBindings       string
+	TokenFactsMaxRows                int64
+	TokenFactsMaxBytes               int64
+	TokenFactsRetentionDays          int
+	TokenFactsInitialLookbackSeconds int
+
 	ECSLogEnabled           bool // Default-off authenticated ECS collection receiver.
 	ECSLogProductionEnabled bool // Second, explicit gate required when ECSLogScope=production.
 	ECSLogOwnershipEnabled  bool // Explicit opt-in for the task/container/lane responsibility ledger.
@@ -290,9 +324,10 @@ type Settings struct {
 	// CloudWatchPreRouteEnabled 启用前置拒绝的连续只读采集。它与 Shadow 完全
 	// 分离：采集结果写入 rejection_samples，供模型统计消费；不会生成对账记录，
 	// 也不会打开 Nginx Shadow。
-	CloudWatchPreRouteEnabled       bool // MONITOR_CLOUDWATCH_PREROUTE_ENABLED，默认 false
-	CloudWatchPreRoutePollSeconds   int  // MONITOR_CLOUDWATCH_PREROUTE_POLL_SECONDS，默认 300
-	CloudWatchPreRouteLookbackHours int  // MONITOR_CLOUDWATCH_PREROUTE_LOOKBACK_HOURS，默认 168
+	CloudWatchPreRouteEnabled         bool // MONITOR_CLOUDWATCH_PREROUTE_ENABLED，默认 false
+	CloudWatchPreRoutePollSeconds     int  // MONITOR_CLOUDWATCH_PREROUTE_POLL_SECONDS，默认 300
+	CloudWatchPreRouteLivePollSeconds int  // 新封口分钟的增量周期，默认 60；20 分钟迟到重放仍使用 PollSeconds
+	CloudWatchPreRouteLookbackHours   int  // MONITOR_CLOUDWATCH_PREROUTE_LOOKBACK_HOURS，默认 168
 	// CloudWatchNginxEnabled 让 Monitor 持续读取结构化 Nginx access/error，
 	// 按分钟聚合后写入现有 Nginx 本地事实表。它是旧 nginxcollector 的替代
 	// 来源，不保存原始日志，也不改变人工按需排障的查询路径。
@@ -401,6 +436,38 @@ func LoadSettings() Settings {
 		Addr:                                     env("MONITOR_ADDR", ":8090"),
 		ProdDSN:                                  env("NEWAPI_LOG_DSN", ""),
 		StorePath:                                env("MONITOR_STORE_PATH", "monitor.db"),
+		TokenExportsEnabled:                      env("MONITOR_TOKEN_EXPORTS_ENABLED", "false") == "true",
+		TokenExportPolicy:                        env("MONITOR_TOKEN_EXPORT_POLICY", ""),
+		TokenNotificationEvaluationEnabled:       env("MONITOR_TOKEN_NOTIFICATION_EVALUATION_ENABLED", "false") == "true",
+		TokenNotificationsEnabled:                env("MONITOR_TOKEN_NOTIFICATIONS_ENABLED", "false") == "true",
+		TokenNotificationPolicy:                  env("MONITOR_TOKEN_NOTIFICATION_POLICY", ""),
+		TokenNotificationRecipients:              env("MONITOR_TOKEN_NOTIFICATION_RECIPIENTS", ""),
+		TokenNotificationBaseURL:                 env("MONITOR_TOKEN_NOTIFICATION_BASE_URL", ""),
+		TokenDetectionEnabled:                    env("MONITOR_TOKEN_DETECTION_ENABLED", "false") == "true",
+		TokenDetectionPolicy:                     env("MONITOR_TOKEN_DETECTION_POLICY", ""),
+		TokenStorePath:                           strings.TrimSpace(env("MONITOR_TOKEN_STORE_PATH", "")),
+		TokenStoreMinFreeBytes:                   envInt64("MONITOR_TOKEN_STORE_MIN_FREE_BYTES", 2<<30),
+		TokenStoreMaxUsedPercent:                 envInt("MONITOR_TOKEN_STORE_MAX_USED_PERCENT", 80),
+		TokenProcessingPollSeconds:               envInt("MONITOR_TOKEN_PROCESSING_POLL_SECONDS", 60),
+		TokenProcessingBatchRows:                 envInt("MONITOR_TOKEN_PROCESSING_BATCH_ROWS", 50),
+		TokenDetectionWorkers:                    envInt("MONITOR_TOKEN_DETECTION_WORKERS", 1),
+		TokenDetectionWorkMilliseconds:           envInt("MONITOR_TOKEN_DETECTION_WORK_MS", 250),
+		TokenDetectionCommitRows:                 envInt("MONITOR_TOKEN_DETECTION_COMMIT_ROWS", 32),
+		TokenDetectionMaxRows:                    envInt64("MONITOR_TOKEN_DETECTION_MAX_ROWS", tokenDetectionMaxRows),
+		TokenDetectionMaxBytes:                   envInt64("MONITOR_TOKEN_DETECTION_MAX_BYTES", tokenDetectionMaxBytes),
+		TokenDetectionMaxReferences:              envInt64("MONITOR_TOKEN_DETECTION_MAX_REFERENCES", tokenDetectionMaxReferences),
+		TokenDetectionMaxReferenceRecords:        envInt64("MONITOR_TOKEN_DETECTION_MAX_REFERENCE_RECORDS", tokenDetectionMaxReferenceRecords),
+		TokenDetectionRetentionDays:              envInt("MONITOR_TOKEN_DETECTION_RETENTION_DAYS", 90),
+		TokenDetectionRetentionBasis:             env("MONITOR_TOKEN_DETECTION_RETENTION_BASIS", "last_evaluated"),
+		TokenFactsEnabled:                        env("MONITOR_TOKEN_FACTS_ENABLED", "false") == "true",
+		TokenFactsSourceEpoch:                    strings.TrimSpace(env("MONITOR_TOKEN_FACTS_SOURCE_EPOCH", "")),
+		TokenFactsSourceMode:                     env("MONITOR_TOKEN_FACTS_SOURCE_MODE", "unverified"),
+		TokenFactsUsageAdapter:                   env("MONITOR_TOKEN_FACTS_USAGE_ADAPTER", "unknown"),
+		TokenFactsSemanticBindings:               env("MONITOR_TOKEN_FACTS_SEMANTIC_BINDINGS", ""),
+		TokenFactsMaxRows:                        envInt64("MONITOR_TOKEN_FACTS_MAX_ROWS", 1000000),
+		TokenFactsMaxBytes:                       envInt64("MONITOR_TOKEN_FACTS_MAX_BYTES", 512<<20),
+		TokenFactsRetentionDays:                  envInt("MONITOR_TOKEN_FACTS_RETENTION_DAYS", 7),
+		TokenFactsInitialLookbackSeconds:         envInt("MONITOR_TOKEN_FACTS_INITIAL_LOOKBACK_SECONDS", 86400),
 		StoreBackupEnabled:                       env("MONITOR_STORE_BACKUP_ENABLED", "true") == "true",
 		StoreBackupDir:                           strings.TrimSpace(env("MONITOR_STORE_BACKUP_DIR", "")),
 		StoreBackupIntervalHours:                 envInt("MONITOR_STORE_BACKUP_INTERVAL_HOURS", 24),
@@ -540,6 +607,7 @@ func LoadSettings() Settings {
 		CloudWatchShadowRetentionDays:            envInt("MONITOR_CLOUDWATCH_SHADOW_RETENTION_DAYS", 14),
 		CloudWatchPreRouteEnabled:                env("MONITOR_CLOUDWATCH_PREROUTE_ENABLED", "false") == "true",
 		CloudWatchPreRoutePollSeconds:            envInt("MONITOR_CLOUDWATCH_PREROUTE_POLL_SECONDS", 300),
+		CloudWatchPreRouteLivePollSeconds:        envInt("MONITOR_CLOUDWATCH_PREROUTE_LIVE_POLL_SECONDS", 60),
 		CloudWatchPreRouteLookbackHours:          envInt("MONITOR_CLOUDWATCH_PREROUTE_LOOKBACK_HOURS", 168),
 		CloudWatchNginxEnabled:                   env("MONITOR_CLOUDWATCH_NGINX_ENABLED", "false") == "true",
 		CloudWatchNginxPollSeconds:               envInt("MONITOR_CLOUDWATCH_NGINX_POLL_SECONDS", 300),

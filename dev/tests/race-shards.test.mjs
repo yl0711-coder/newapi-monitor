@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs';
 import test from 'node:test';
 import { readRaceShards, verifyRaceShards } from '../check-race-shards.mjs';
 
-const workflow = readFileSync(new URL('../../.github/workflows/ci.yml', import.meta.url), 'utf8');
+const workflow = readFileSync(new URL('../../.github/workflows/ci.yml', import.meta.url), 'utf8').replace(/\r\n?/g, '\n');
 const names = ['TestAlpha', 'TestChannel', 'TestCloudWatch', 'TestDelta', 'TestEcho', 'TestFinance', 'TestFinanceGiftNewFeature', 'TestFinanceGiftHandoffNewFeature', 'TestFinanceGiftScopeNewFeature', 'TestGroup', 'TestOperations', 'TestStability', 'TestZulu', 'Test_Regression', 'Test2026', 'Test', 'Test中文', 'Example', 'ExampleMonitor', 'FuzzDecode'];
 
 test('actual CI matrix covers ordinary and non-letter tests, examples and fuzz seeds', () => {

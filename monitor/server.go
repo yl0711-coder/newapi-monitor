@@ -104,11 +104,35 @@ var financeJS []byte // 只读 /finance/report，不触发任何外部同步
 //go:embed customer_health.js
 var customerHealthJS []byte // 客户维护页交互；只访问 /customer-health/report 与独立写接口
 
+//go:embed view_refresh.js
+var viewRefreshJS []byte
+
+//go:embed model_report_dates.js
+var modelReportDatesJS []byte
+
 //go:embed model_statistics.js
 var modelStatisticsJS []byte // 模型统计页交互；只访问 /model-statistics/report 本地事实接口
 
 //go:embed model_statistics.css
 var modelStatisticsCSS []byte // 模型统计页独立样式，不污染其他 Monitor Tab
+
+//go:embed model_frt.js
+var modelFRTJS []byte
+
+//go:embed model_frt.css
+var modelFRTCSS []byte
+
+//go:embed token_anomaly.js
+var tokenAnomalyJS []byte
+
+//go:embed token_anomaly.css
+var tokenAnomalyCSS []byte
+
+//go:embed incident.js
+var incidentJS []byte
+
+//go:embed incident.css
+var incidentCSS []byte
 
 var allowedWindows = map[int]bool{15: true, 30: true, 60: true, 180: true, 360: true, 720: true, 1440: true}
 
@@ -268,6 +292,14 @@ func (m *Monitor) RegisterRoutes(r *gin.Engine) {
 		c.Header("Cache-Control", "no-cache")
 		c.Data(http.StatusOK, "application/javascript; charset=utf-8", customerHealthJS)
 	})
+	r.GET("/view-refresh.js", func(c *gin.Context) {
+		c.Header("Cache-Control", "no-cache")
+		c.Data(http.StatusOK, "application/javascript; charset=utf-8", viewRefreshJS)
+	})
+	r.GET("/model-report-dates.js", func(c *gin.Context) {
+		c.Header("Cache-Control", "public, max-age=3600")
+		c.Data(http.StatusOK, "application/javascript; charset=utf-8", modelReportDatesJS)
+	})
 	r.GET("/model-statistics.js", func(c *gin.Context) {
 		c.Header("Cache-Control", "no-cache")
 		c.Data(http.StatusOK, "application/javascript; charset=utf-8", modelStatisticsJS)
@@ -275,6 +307,30 @@ func (m *Monitor) RegisterRoutes(r *gin.Engine) {
 	r.GET("/model-statistics.css", func(c *gin.Context) {
 		c.Header("Cache-Control", "no-cache")
 		c.Data(http.StatusOK, "text/css; charset=utf-8", modelStatisticsCSS)
+	})
+	r.GET("/model-frt.js", func(c *gin.Context) {
+		c.Header("Cache-Control", "no-cache")
+		c.Data(http.StatusOK, "application/javascript; charset=utf-8", modelFRTJS)
+	})
+	r.GET("/model-frt.css", func(c *gin.Context) {
+		c.Header("Cache-Control", "no-cache")
+		c.Data(http.StatusOK, "text/css; charset=utf-8", modelFRTCSS)
+	})
+	r.GET("/token-anomaly.js", func(c *gin.Context) {
+		c.Header("Cache-Control", "no-cache")
+		c.Data(http.StatusOK, "application/javascript; charset=utf-8", tokenAnomalyJS)
+	})
+	r.GET("/token-anomaly.css", func(c *gin.Context) {
+		c.Header("Cache-Control", "no-cache")
+		c.Data(http.StatusOK, "text/css; charset=utf-8", tokenAnomalyCSS)
+	})
+	r.GET("/incident.js", func(c *gin.Context) {
+		c.Header("Cache-Control", "no-cache")
+		c.Data(http.StatusOK, "application/javascript; charset=utf-8", incidentJS)
+	})
+	r.GET("/incident.css", func(c *gin.Context) {
+		c.Header("Cache-Control", "no-cache")
+		c.Data(http.StatusOK, "text/css; charset=utf-8", incidentCSS)
 	})
 	r.GET("/api/brand", m.brandHandler) // 公开:站点名,供前端设置页面标题
 	r.GET("/infra-assets.js", func(c *gin.Context) {
@@ -319,6 +375,20 @@ func (m *Monitor) RegisterRoutes(r *gin.Engine) {
 		reports.GET("/stability/report", m.serveStabilityReport) // 历史稳定性:只读 Monitor 本地 SQLite
 		reports.GET("/stability/detail", m.serveStabilityDetail) // 单分组详情:按需加载渠道时间条/模型
 		reports.GET("/stability/problems", m.serveStabilityProblems)
+		// Incident 只读查询（MON-003 B3），同时供异常监控事故子页使用。这三个端点
+		// 用于通过接口验证功能；入口位置与样式待定。
+		reports.GET("/incidents", m.serveIncidentList)
+		reports.GET("/incidents/detail", m.serveIncidentDetail)
+		reports.GET("/incidents/health", m.serveIncidentIngestHealth)
+		reports.GET("/anomalies/token/health", m.serveTokenMeteringHealth)
+		reports.GET("/anomalies/token/detection/health", m.serveTokenDetectionHealth)
+		reports.POST("/anomalies/token/detection/query", m.serveTokenDetectionQuery)
+		reports.POST("/anomalies/token/detection/detail", m.serveTokenDetectionDetail)
+		reports.GET("/anomalies/token/access", m.serveTokenDeliveryAccess)
+		reports.GET("/anomalies/token/notifications/health", m.serveTokenDeliveryHealth)
+		reports.POST("/anomalies/token/exports", m.requireRole(roleRoot), m.serveTokenExportCreate)
+		reports.GET("/anomalies/token/exports/:id", m.requireRole(roleRoot), m.serveTokenExportStatus)
+		reports.POST("/anomalies/token/exports/:id/download", m.requireRole(roleRoot), m.serveTokenExportDownload)
 		view.GET("/alerts/rejections", noStoreSensitive, m.getRejectAlertsHandler)
 		view.GET("/stability/health", m.serveStabilityHealth)                             // 采集新鲜度/覆盖/积压:不查生产库
 		view.GET("/stability/edge", m.serveNginxEdge)                                     // Nginx 入口层:只读本地脱敏分钟汇总
@@ -355,9 +425,10 @@ func (m *Monitor) RegisterRoutes(r *gin.Engine) {
 		view.GET("/group-governance/export.csv", noStoreSensitive, m.exportGroupGovernanceCSV)
 		// noStoreSensitive 必须挂：响应含公司名、用户名、user_id、消耗金额与故障归因，
 		// 属客户可识别信息，不得进浏览器磁盘缓存或任何中间缓存。
-		view.GET("/customer-health/report", noStoreSensitive, m.serveCustomerHealthReport)    // 客户维护:名单内公司今日稳定性(只读本地事实)
-		view.GET("/customer-health/groups", noStoreSensitive, m.listCustomerHealthGroups)     // 客户维护:独立公司名单
-		view.GET("/customer-health/members", noStoreSensitive, m.listCustomerHealthMembers)   // 客户维护:独立成员名单
+		view.GET("/customer-health/report", noStoreSensitive, m.serveCustomerHealthReport)  // 客户维护:名单内公司今日稳定性(只读本地事实)
+		view.GET("/customer-health/groups", noStoreSensitive, m.listCustomerHealthGroups)   // 客户维护:独立公司名单
+		view.GET("/customer-health/members", noStoreSensitive, m.listCustomerHealthMembers) // 客户维护:独立成员名单
+		view.GET("/model-statistics/frt", noStoreSensitive, m.serveModelFRTReport)
 		view.GET("/model-statistics/report", noStoreSensitive, m.serveModelStatisticsReport)  // 模型统计:分组模型请求次数(只读本地事实)
 		reports.GET("/usage/users", m.listTrackedUsers)                                       // 用户用量:被盯名单(含分组)
 		reports.GET("/usage/groups", m.listGroups)                                            // 用户用量:客户分组列表
@@ -387,6 +458,10 @@ func (m *Monitor) RegisterRoutes(r *gin.Engine) {
 	// 做成接口而非启动参数:不必重启、可重跑、可只补一段;放启动流程会每次重启都压一遍生产库。
 	r.POST("/admin/backfill", m.requireRole(roleRoot), m.backfillHandler)
 	r.GET("/admin/backfill", m.requireRole(roleRoot), m.backfillStatusHandler)
+	// FRT 总和一次性受控回算：普通 backfill 只写 metric_samples，补不了
+	// 首字耗时读取的 capacity_user_minute_samples 的三个总和列。见 model_frt_recompute.go。
+	r.POST("/admin/frt-sum/recompute", m.requireRole(roleRoot), m.serveFRTSumRecompute)
+	r.GET("/admin/frt-sum/recompute", m.requireRole(roleRoot), m.serveFRTSumRecomputeStatus)
 	r.POST("/admin/stability/backfill", m.requireRole(roleRoot), m.startStabilityBackfillHandler)
 	r.POST("/admin/stability/backfill/retry", m.requireRole(roleRoot), m.retryStabilityBackfillHandler)
 	r.GET("/admin/stability/backfill", m.requireRole(roleRoot), m.stabilityBackfillStatusHandler)

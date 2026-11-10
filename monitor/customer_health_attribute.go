@@ -1,17 +1,7 @@
 package monitor
 
-// 客户维护的归因层：把公司今天命中的问题归到 上游 / 我方 / 客户 三档。
-//
-// ★ 复用既有判据，不另立一套 ★
-// 责任方取值用 logchain_fault.go 的 faultUpstream/faultOurs/faultDownstream/
-// faultUnknown；判据用同两张表：
-//   logChainFaultByStatus       按 HTTP 状态码
-//   logChainFaultMessageRules   按错误原文措辞（含 requireUpstream 来源门）
-//
-// 为什么能直接复用：StabilityProblemSample.Code 就是从原文里提取的
-// status_code（见 stabilityProblemCode），Message 是脱敏后的错误原文。
-// Code 非空 ⟺ 原文带 status_code= 前缀 ⟺ 这句话是上游说的，
-// 这正是 logChainFaultMessageRules 里 requireUpstream 想区分的东西。
+// 客户维护按客户排障同一诊断入口解释已有问题签名，不另行维护状态码归责。
+// 状态码只说明响应层；具体原因和责任方仍由原文及可靠证据决定。
 //
 // 归因粒度的诚实说明：StabilityProblemSample 没有 user_id，所以本页给出的是
 // “这家公司失败记录命中的渠道＋模型＋分组上主要在出什么问题”，不是
@@ -36,27 +26,10 @@ type customerHealthFaultVerdict struct {
 // 判据顺序与客户排障一致：先按原文措辞（更具体），再按状态码（更泛）。
 // 反过来会让"上游说它没有可用渠道"这类明确措辞被 503 那条泛规则吃掉。
 func customerHealthAttributeProblem(p customerHealthProblem) customerHealthFaultVerdict {
-	fromUpstream := p.code != ""
-	for _, rule := range logChainFaultMessageRules {
-		if !rule.pattern.MatchString(p.message) {
-			continue
-		}
-		if rule.requireUpstream != nil && *rule.requireUpstream != fromUpstream {
-			continue
-		}
-		return customerHealthFaultVerdict{fault: rule.fault, confidence: rule.confidence, reason: rule.why}
-	}
-	if status, err := strconv.Atoi(p.code); err == nil {
-		if rule, ok := logChainFaultByStatus[status]; ok {
-			return customerHealthFaultVerdict{fault: rule.fault, confidence: rule.confidence, reason: rule.why}
-		}
-	}
-	// 认不出来必须落 unknown，不能默认归给任何一方。
-	// 默认归我方会让人白查我们自己，默认归上游会让人错误投诉上游。
-	return customerHealthFaultVerdict{
-		fault: faultUnknown, confidence: faultConfNone,
-		reason: "错误原文不匹配任何既有判据，需到「客户排障」看原文",
-	}
+	r := customerHealthDiagnosticRow(LogChainRow{Type: 5, Content: p.message}, "{}")
+	r.UpstreamStatusCode, _ = strconv.Atoi(p.code)
+	_, f := customerHealthDiagnosticFailure(r)
+	return customerHealthFaultVerdict{fault: f.Fault, confidence: f.Confidence, reason: f.Reason}
 }
 
 // customerHealthDowngradeConfidence 把逐条判据的置信度降一档。

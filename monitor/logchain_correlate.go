@@ -60,6 +60,8 @@ const correlateFallbackWindow = 10
 
 // LogChainUpstreamMatch 一条我方错误行的上游对应。
 type LogChainUpstreamMatch struct {
+	JoinKey           string `json:"join_key,omitempty"`
+	UpstreamRequestID string `json:"upstream_request_id,omitempty"`
 	// Confidence 是 correlateExact / Probable / Ambiguous / None 之一。
 	// **前端必须按它分档显示**，不能把 probable 画成 exact。
 	Confidence string `json:"confidence"`
@@ -99,6 +101,14 @@ func (m *Monitor) correlateUpstreamErrors(ctx context.Context, rows []LogChainRo
 	out := map[int64]LogChainUpstreamMatch{}
 	if len(rows) == 0 || m.storeDB == nil {
 		return out, nil
+	}
+	rows = append([]LogChainRow(nil), rows...)
+	for i := range rows {
+		if host := rows[i].DiagnosticFacts.value("actual_upstream_host"); host != "" {
+			if domain := normalizeChannelBaseDomain(host); domain != "" {
+				rows[i].UpstreamDomain = domain
+			}
+		}
 	}
 
 	// 先读取各域名的采集覆盖。没有被可靠覆盖的行不能进入匹配：空表在这种
@@ -140,7 +150,7 @@ func (m *Monitor) correlateUpstreamErrors(ctx context.Context, rows []LogChainRo
 			out[r.ID] = coverage
 			continue
 		}
-		if k := logChainJoinKeyFrom(r.Content); k != "" {
+		if k := logChainDiagnosticJoinKey(r); k != "" {
 			ck := upstreamJoinKey{Domain: r.UpstreamDomain, JoinKey: k}
 			keyed[ck] = append(keyed[ck], r.ID)
 			continue
@@ -265,16 +275,27 @@ func (m *Monitor) matchByJoinKey(ctx context.Context, keyed map[upstreamJoinKey]
 		}
 	}
 	var hits []ChannelUpstreamErrorLog
+	const maxExactHits = 1600
 	if err := m.storeDB.WithContext(ctx).
 		Where("domain IN ? AND join_key IN ?", domains, keys).
-		Find(&hits).Error; err != nil {
+		Limit(maxExactHits + 1).Find(&hits).Error; err != nil {
 		return fmt.Errorf("查询上游错误日志精确关联失败: %w", err)
 	}
+	if len(hits) > maxExactHits {
+		for _, ids := range keyed {
+			for _, id := range ids {
+				out[id] = LogChainUpstreamMatch{Confidence: correlateIncomplete, Why: "精确关联候选达到本页上限，未确认唯一性；请按 Request ID 补查"}
+			}
+		}
+		return nil
+	}
 	byKey := map[upstreamJoinKey]ChannelUpstreamErrorLog{}
+	counts := map[upstreamJoinKey]int{}
 	for _, h := range hits {
 		k := upstreamJoinKey{Domain: h.Domain, JoinKey: h.JoinKey}
-		// 同一个键理论上只有一条。真出现多条时取先到的那条并不重要——
-		// 它们描述的是同一个模型商请求，上游侧重复记录不影响我方判读。
+		counts[k]++
+		// Retain a candidate only for the uniqueness check below. Multiple
+		// records may be distinct retries and never become an exact match.
 		if _, ok := byKey[k]; !ok {
 			byKey[k] = h
 		}
@@ -285,7 +306,12 @@ func (m *Monitor) matchByJoinKey(ctx context.Context, keyed map[upstreamJoinKey]
 			continue
 		}
 		for _, id := range ids {
+			if counts[k] != 1 || len(ids) != 1 {
+				out[id] = LogChainUpstreamMatch{Confidence: correlateAmbiguous, Why: "相同请求标识存在多个错误/重试记录，缺少 attempt_id，不能混用证据", CandidateCount: counts[k]}
+				continue
+			}
 			out[id] = LogChainUpstreamMatch{
+				JoinKey: k.JoinKey, UpstreamRequestID: h.UpstreamRequestID,
 				Confidence:          correlateExact,
 				Why:                 "双方错误原文里嵌着同一个模型商 request id，是同一请求",
 				UpstreamChannelName: h.UpstreamChannelName,
@@ -347,7 +373,7 @@ func noMatchFor(r LogChainRow) LogChainUpstreamMatch {
 	}
 	return LogChainUpstreamMatch{
 		Confidence: correlateNone,
-		Why:        "上游日志里没有相近时刻的同模型同状态码错误",
+		Why:        "精确请求证据未找到；附近时间的请求不能作为本请求证据",
 	}
 }
 
@@ -386,11 +412,18 @@ func (m *Monitor) matchByFallback(ctx context.Context, rows []LogChainRow, out m
 		}
 	}
 	var pool []ChannelUpstreamErrorLog
+	const maxFallbackHits = 2000
 	if err := m.storeDB.WithContext(ctx).
 		Where("domain IN ? AND created_at BETWEEN ? AND ?", domains,
 			minTs-correlateFallbackWindow, maxTs+correlateFallbackWindow).
-		Find(&pool).Error; err != nil {
+		Limit(maxFallbackHits + 1).Find(&pool).Error; err != nil {
 		return fmt.Errorf("查询上游错误日志回退关联失败: %w", err)
+	}
+	if len(pool) > maxFallbackHits {
+		for _, r := range rows {
+			out[r.ID] = LogChainUpstreamMatch{Confidence: correlateIncomplete, Why: "附近时间候选达到本页上限；精确请求证据未找到，未用于诊断"}
+		}
+		return nil
 	}
 	if len(pool) == 0 {
 		return nil
@@ -437,7 +470,7 @@ func (m *Monitor) matchByFallback(ctx context.Context, rows []LogChainRow, out m
 		h := cands[0]
 		out[r.ID] = LogChainUpstreamMatch{
 			Confidence:          correlateProbable,
-			Why:                 "按模型名 + 状态码 + 时间窗匹配（非精确键，仅高置信推断）",
+			Why:                 "精确请求证据未找到；以下仅为同模型、状态码和时间窗内的候选，不参与本请求诊断",
 			UpstreamChannelName: h.UpstreamChannelName,
 			UpstreamStatusCode:  h.StatusCode,
 			UpstreamErrorCode:   h.ErrorCode,

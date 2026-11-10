@@ -66,6 +66,8 @@ test('Docker context allowlist includes observability sources and the embedded s
   const rules = readFileSync(new URL('../../.dockerignore', import.meta.url), 'utf8')
     .split(/\r?\n/);
   for (const rule of [
+    '!internal/metering/',
+    '!internal/metering/*.go',
     '!internal/observability/',
     '!internal/observability/*.go',
     '!internal/observability/schema/',
@@ -78,6 +80,7 @@ test('Docker context allowlist includes observability sources and the embedded s
 test('Docker context audit checks observability assets and excluded fixtures', () => {
   const audit = job('test').split('- name: Verify Docker build context isolation')[1] ?? '';
   for (const file of [
+    'internal/metering/field.go',
     'internal/observability/contract.go',
     'internal/observability/identifiers.go',
     'internal/observability/metrics.go',
@@ -87,6 +90,8 @@ test('Docker context audit checks observability assets and excluded fixtures', (
     assert.ok(audit.includes('test -e /context/' + file), 'missing context inclusion check: ' + file);
   }
   for (const file of [
+    'internal/metering/ci-probe_test.go',
+    'internal/metering/ci-local-config.json',
     'internal/observability/ci-probe_test.go',
     'internal/observability/ci-local-config.json',
     'internal/observability/schema/ci-local-config.json',

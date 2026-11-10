@@ -3,6 +3,9 @@ import { pathToFileURL } from 'node:url';
 
 export function readRaceShards(workflow) {
   // Read the actual CI matrix, not a second copy of its routing rules.
+  // Windows checkouts may retain CRLF; normalize it before the line-oriented
+  // expressions below so the local gate behaves like the Linux CI runner.
+  workflow = String(workflow).replace(/\r\n?/g, '\n');
   const afterJobHeader = workflow.split(/^  race-monitor:[ \t]*$/m)[1];
   const job = afterJobHeader?.split(/^  [\w-]+:/m)[0];
   const blocks = [...(job ?? '').matchAll(/^          - shard: ([\w-]+)\n((?:^            [^\n]*\n)*)/gm)];

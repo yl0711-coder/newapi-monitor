@@ -1,6 +1,7 @@
 package monitor
 
 import (
+	"context"
 	"fmt"
 	"html"
 	"strings"
@@ -207,6 +208,10 @@ func recipientList(s string) []string {
 
 // sendMail 用 go-mail 发送一封 HTML 报警邮件(465 隐式 TLS 或 587 STARTTLS)。
 func sendMail(c AlertConfig, subject, body string) error {
+	return sendMailWithContext(context.Background(), c, subject, body, "")
+}
+
+func sendMailWithContext(ctx context.Context, c AlertConfig, subject, body, messageID string) error {
 	to := recipientList(c.Recipients)
 	if len(to) == 0 {
 		return fmt.Errorf("无收件人")
@@ -223,6 +228,9 @@ func sendMail(c AlertConfig, subject, body string) error {
 		return fmt.Errorf("收件人无效: %w", err)
 	}
 	msg.Subject(subject)
+	if messageID != "" {
+		msg.SetMessageIDWithValue(messageID)
+	}
 	msg.SetBodyString(mail.TypeTextHTML, htmlWrap(subject, body))
 
 	opts := []mail.Option{
@@ -243,7 +251,7 @@ func sendMail(c AlertConfig, subject, body string) error {
 	if err != nil {
 		return fmt.Errorf("创建邮件客户端失败: %w", err)
 	}
-	return cl.DialAndSend(msg)
+	return cl.DialAndSendWithContext(ctx, msg)
 }
 
 // htmlWrap 把纯文本报警内容包成一封简洁好看的 HTML 邮件(深色卡片 + 红色顶边)。

@@ -254,6 +254,18 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
   .lc-daylabel{color:var(--text-muted);font-size:13px;margin-left:4px}
   /* 客户排障摘要最长是跨日范围；固定占位避免文字长度变化把整组日期控件左右推移。 */
   #lcDateLabel{display:inline-block;width:310px;font-variant-numeric:tabular-nums;white-space:nowrap}
+  @media(max-width:700px){
+    #tab-logchain .lc-daybar{min-width:0;max-width:100%}
+    #tab-logchain .lc-time-range{display:grid;grid-template-columns:auto minmax(0,1fr) minmax(0,1fr);width:100%;min-width:0}
+    #tab-logchain .lc-time-range input{width:100%;min-width:0}
+    #tab-logchain #lcDateLabel{max-width:100%;margin-left:0;white-space:normal;overflow-wrap:anywhere}
+    #tab-logchain .lc-time-hint{white-space:normal}
+  }
+  @media(max-width:400px){
+    #tab-logchain .lc-time-range{grid-template-columns:auto minmax(0,1fr)}
+    #tab-logchain .lc-time-range label{grid-row:span 2}
+    #tab-logchain .lc-time-range input{grid-column:2}
+  }
   .lc-filterbar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:12px}
   .lc-filterbar select,.lc-filterbar input[type=text],.lc-filterbar input:not([type]){background:var(--surface);color:var(--text);border:1px solid var(--border);border-radius:7px;padding:6px 9px;font-size:13px;max-width:190px}
   .lc-filterbar input.lc-request-id{max-width:280px;min-width:220px}
@@ -446,9 +458,34 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
   .lc-investigation-head{display:flex;gap:12px;align-items:center;flex-wrap:wrap}
   .lc-investigation-head .lc-sub{flex:1}
   .lc-investigation-panel{margin-top:12px}
-  .lc-investigation-fields{border:0;padding:0;margin:0;display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:10px 14px}
+  .lc-investigation-fields{border:0;padding:0;margin:0;display:grid;grid-template-columns:repeat(auto-fit,minmax(min(240px,100%),1fr));min-width:0;gap:10px 14px}
   .lc-investigation-fields label{display:flex;flex-direction:column;gap:5px;font-size:12px;color:var(--text-muted)}
   .lc-investigation-fields input{min-width:0;padding:7px 9px;border:1px solid var(--border);border-radius:6px;background:var(--bg);color:var(--text)}
+  .lc-investigation-time{display:flex;flex-direction:column;gap:6px;min-width:0}
+  .lc-investigation-time input{width:100%;min-height:40px;color-scheme:dark}
+  .lc-investigation-time input::-webkit-calendar-picker-indicator{width:20px;height:20px;cursor:pointer}
+  .lc-investigation-time .lc-jump{min-height:40px;white-space:normal;border-color:var(--accent);color:var(--text);font-size:13px}
+  .lc-investigation-time .lc-jump:focus-visible,.lc-time-dialog :focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+  .lc-investigation-time .lc-jump:disabled{opacity:.5;cursor:wait}
+  .lc-time-dialog{margin:auto;padding:16px;width:350px;max-width:calc(100vw - 24px);max-height:calc(100dvh - 24px);overflow:auto;border:1px solid var(--border);border-radius:12px;background:var(--surface);color:var(--text);color-scheme:dark}
+  .lc-time-dialog::backdrop{background:rgba(0,0,0,.65)}
+  .lc-time-dialog h3{font-size:16px;margin-bottom:8px}
+  .lc-time-dialog .lc-sub{white-space:normal}
+  .lc-time-calendar .flatpickr-calendar{width:100%;box-shadow:none;background:var(--surface);margin:8px 0}
+  .lc-time-calendar .flatpickr-innerContainer,.lc-time-calendar .flatpickr-rContainer,.lc-time-calendar .flatpickr-days,.lc-time-calendar .dayContainer{width:100%;min-width:0;max-width:100%}
+  .lc-time-calendar .flatpickr-day{max-width:none;flex-basis:14.2857%;color:var(--text)}
+  .lc-time-calendar .flatpickr-day.prevMonthDay,.lc-time-calendar .flatpickr-day.nextMonthDay{color:var(--text-muted)}
+  .lc-time-calendar .flatpickr-day:hover,.lc-time-calendar .flatpickr-day:focus{background:var(--border);border-color:var(--border)}
+  .lc-time-calendar .flatpickr-day.selected{background:var(--accent);border-color:var(--accent);color:#fff}
+  .lc-time-calendar .flatpickr-month,.lc-time-calendar .flatpickr-weekday,.lc-time-calendar .flatpickr-current-month .flatpickr-monthDropdown-months{background:var(--surface);color:var(--text);fill:var(--text)}
+  .lc-time-calendar .flatpickr-prev-month,.lc-time-calendar .flatpickr-next-month{padding:8px;color:var(--text);fill:var(--text)}
+  .lc-time-calendar .numInputWrapper span.arrowUp:after{border-bottom-color:var(--text)}
+  .lc-time-calendar .numInputWrapper span.arrowDown:after{border-top-color:var(--text)}
+  .lc-time-clock{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin:12px 0}
+  .lc-time-clock label{display:flex;flex-direction:column;gap:6px;font-size:13px}
+  .lc-time-clock select{width:100%;min-height:40px;padding:8px;border:1px solid var(--border);border-radius:6px;background:var(--bg);color:var(--text);font-size:16px}
+  .lc-time-dialog .lc-investigation-actions{justify-content:flex-end;margin-bottom:0}
+  .lc-time-dialog .lc-jump{min-height:40px}
   .lc-investigation-fields .lc-investigation-sensitive{flex-direction:row;align-items:center}
   .lc-investigation-actions{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:10px 0}
   .lc-investigation-actions .lc-primary{background:var(--accent);border-color:var(--accent);color:#fff}
@@ -476,8 +513,8 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
      沿用客户排障的变量与配色，不引入新色板。
      ch-bad 标红只用于"有稳定率且低于阈值"；今天没有请求的行不标红——
      那是缺数据，标红会被读成故障。 */
-  .ch-bar{display:flex;align-items:center;gap:10px}
-  .ch-meta{font-size:12px;color:var(--text-muted)}
+  .ch-bar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;min-width:0;max-width:100%}
+  .ch-meta{font-size:12px;color:var(--text-muted);min-width:0;overflow-wrap:anywhere}
   .ch-bar button,.ch-add button{background:var(--surface);color:var(--text);border:1px solid var(--border);border-radius:7px;padding:6px 14px;font-size:13px;cursor:pointer}
   .ch-bar button:hover,.ch-add button:hover{border-color:var(--accent)}
   .ch-add{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:12px 0;padding:12px;background:var(--surface);border:1px solid var(--border);border-radius:9px}
@@ -587,7 +624,10 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
 <link rel="stylesheet" href="/capacity.css?v=2">
 <link rel="stylesheet" href="/group-governance.css?v=1">
 <link rel="stylesheet" href="/finance.css?v=14">
-<link rel="stylesheet" href="/model-statistics.css?v=4">
+<link rel="stylesheet" href="/model-statistics.css?v=6">
+<link rel="stylesheet" href="/model-frt.css?v=1">
+<link rel="stylesheet" href="/token-anomaly.css?v=1">
+<link rel="stylesheet" href="/incident.css?v=1">
 </head>
 <body theme-mode="dark">
 <div class="monitor-shell">
@@ -604,6 +644,7 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
       <div class="tab" data-tab="server" title="服务端监控"><span class="monitor-nav-icon"><svg viewBox="0 0 24 24"><path d="M3 3v18h18"/><path d="m7 16 4-5 4 3 5-7"/></svg></span><span class="monitor-nav-label">服务端监控</span></div>
       <div class="tab" data-tab="capacity" title="容量规划"><span class="monitor-nav-icon"><svg viewBox="0 0 24 24"><path d="M4 19V9M10 19V5M16 19v-8M22 19V3"/><path d="M2 19h22"/></svg></span><span class="monitor-nav-label">容量规划</span></div>
       <div class="tab" data-tab="model-statistics" title="模型统计"><span class="monitor-nav-icon"><svg viewBox="0 0 24 24"><path d="M4 19V5M4 19h17"/><path d="m7 15 3-4 3 2 5-6"/></svg></span><span class="monitor-nav-label">模型统计</span></div>
+      <div class="tab" data-tab="anomalies" title="异常监控"><span class="monitor-nav-icon"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v6M12 16h.01"/></svg></span><span class="monitor-nav-label">异常监控</span></div>
       <div class="tab" data-tab="sync" title="数据同步状态"><span class="monitor-nav-icon"><svg viewBox="0 0 24 24"><path d="M20 7h-6V1"/><path d="M4 17h6v6"/><path d="M20 7a8 8 0 0 0-13.7-3.6L4 5.7M4 17a8 8 0 0 0 13.7 3.6l2.3-2.3"/></svg></span><span class="monitor-nav-label">数据同步状态</span></div>
       <div class="tab" data-tab="logchain" title="客户排障"><span class="monitor-nav-icon"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/><path d="M11 8v3"/><path d="M11 14h.01"/></svg></span><span class="monitor-nav-label">客户排障</span></div>
       <div class="tab" data-tab="alerts" title="问题预警"><span class="monitor-nav-icon"><svg viewBox="0 0 24 24"><path d="M12 9v4"/><path d="M12 17h.01"/><path d="M10.3 3.9 2 18a2 2 0 0 0 1.7 3h16.6a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/></svg></span><span class="monitor-nav-label">问题预警</span></div>
@@ -634,6 +675,7 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
       <div class="tab" data-tab="server">服务端监控</div>
       <div class="tab" data-tab="capacity">容量规划</div>
       <div class="tab" data-tab="model-statistics">模型统计</div>
+      <div class="tab" data-tab="anomalies">异常监控</div>
       <div class="tab" data-tab="logchain">客户排障</div>
       <div class="tab" data-tab="alerts">问题预警</div>
       <!-- 顺序与侧栏一致（alerts 之后、group-governance 之前）。
@@ -943,20 +985,101 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
 </div><!-- /tab-finance -->
 
 <div class="tabpane model-statistics-page" id="tab-model-statistics" hidden>
+  <div class="stability-module-tabs monitor-feature-tabs"><div role="tablist" aria-label="模型统计子功能">
+    <button type="button" id="msRequestsTab" class="active" data-ms-view="requests" role="tab" aria-selected="true" aria-controls="msRequestsView"><b>模型统计</b><small>原有请求统计</small></button>
+    <button type="button" id="msFRTTab" data-ms-view="frt" role="tab" aria-selected="false" aria-controls="msFRTView" tabindex="-1"><b>首字耗时</b><small>首个数据事件延迟 · FRT</small></button>
+  </div></div>
+  <section id="msRequestsView" role="tabpanel" aria-labelledby="msRequestsTab">
   <div class="ms-toolbar">
-    <div><h2>模型统计</h2><p>按模型请求次数排行；展开模型查看分组，再点分组查看渠道 FRT 和客户请求次数。仅当无可用渠道次数占该模型总请求次数超过35%时，模型行标红；FRT 只展示，不参与标红。FRT 按有效样本显示 P50/P95/P99，统计区间以页面实际起止时间为准。</p></div>
+    <div><h2>模型统计</h2><p>按模型请求次数排行；展开模型查看分组，再点分组查看渠道和客户请求次数。仅当无可用渠道次数占该模型总请求次数超过35%时，模型行标红。统计区间以页面实际起止时间为准。</p></div>
     <div class="ms-range" role="group" aria-label="模型统计时间范围">
       <button type="button" data-ms-window="24h" class="active">近24小时</button>
       <button type="button" data-ms-window="3d">近3天</button>
       <button type="button" data-ms-window="7d">近7天</button>
     </div>
+    <button type="button" id="msRefresh">刷新</button>
     <span class="ms-status" id="msStatus">尚未加载</span>
   </div>
+<form id="msDates" class="model-date-controls" aria-label="选择统计日期"><div class="md-presets"><button type="button" class="md-step" data-md-action="previous" title="整段范围前移一天" aria-label="前一天">‹</button><button type="button" class="md-step" data-md-action="next" title="整段范围后移一天" aria-label="后一天">›</button><button type="button" data-md-action="today">今天</button><button type="button" data-md-action="yesterday">昨天</button></div><div class="md-fields"><label>从<span class="md-input-row"><input id="msDateStart" type="text" inputmode="numeric" maxlength="10" placeholder="YYYY-MM-DD" aria-label="开始日期（北京时间）"><button type="button" data-md-action="start" aria-label="选择开始日期">选择</button></span></label><label>到<span class="md-input-row"><input id="msDateEnd" type="text" inputmode="numeric" maxlength="10" placeholder="YYYY-MM-DD" aria-label="结束日期（包含当天）"><button type="button" data-md-action="end" aria-label="选择结束日期">选择</button></span></label></div><div class="md-presets"><button type="button" data-md-action="single">指定一天</button><button type="submit">查询范围</button><button type="button" data-md-action="reset">重置</button></div><p id="msDateNote" role="status"></p></form>
   <div class="ms-error" id="msError" hidden></div>
   <div class="ms-summary" id="msSummary"></div>
   <div class="ms-note" id="msCoverage">数据来自 Monitor 本地模型事实。</div>
   <div id="msModels"><div class="ms-empty">进入页面后加载本地模型统计。</div></div>
+  </section>
+  <section id="msFRTView" class="frt-page" role="tabpanel" aria-labelledby="msFRTTab" hidden>
+    <div class="frt-toolbar"><div><h2>首字耗时</h2><p>FRT 是 NewAPI 首个 data: 数据事件延迟，并非首个文本内容或客户侧首字。渠道 → 实际服务分组 → 模型；分位数由合并直方图估计；平均 FRT 使用真实耗时总和 ÷ 有效样本数；历史缺少总和时不可计算。各层按平均 FRT 从高到低排列，缺失值置后。</p></div>
+      <div class="frt-actions" role="group" aria-label="首字耗时时间窗口"><button type="button" data-frt-window="24h">近24小时</button><button type="button" data-frt-window="3d">近3天</button><button type="button" data-frt-window="7d">近7天</button><button type="button" id="frtRefresh">刷新</button></div>
+      <form id="frtFilters" class="frt-filters">
+        <label>渠道 ID<input type="number" min="0" step="1" id="frtChannel" placeholder="全部渠道；0 为未记录"></label>
+        <label>实际服务分组<input type="search" id="frtGroup" maxlength="512" placeholder="精确名称；留空为全部"></label>
+        <label>模型<input type="search" id="frtModel" maxlength="512" placeholder="精确名称；留空为全部"></label>
+        <label>平均 FRT 大于（秒）<input type="number" id="frtMeanGt" min="0" max="3600" step="0.1" placeholder="留空为不限；按渠道真实平均值"></label>
+        <button type="submit">应用筛选</button><button type="button" id="frtReset">清除筛选</button>
+      </form>
+      <div class="frt-actions"><button type="button" id="frtCompare" disabled>按原统计窗口核对</button><button type="button" id="frtLatest" hidden>返回最新窗口</button><span id="frtStatus" role="status">尚未加载</span></div>
+    </div>
+<form id="frtDates" class="model-date-controls" aria-label="选择统计日期"><div class="md-presets"><button type="button" class="md-step" data-md-action="previous" title="整段范围前移一天" aria-label="前一天">‹</button><button type="button" class="md-step" data-md-action="next" title="整段范围后移一天" aria-label="后一天">›</button><button type="button" data-md-action="today">今天</button><button type="button" data-md-action="yesterday">昨天</button></div><div class="md-fields"><label>从<span class="md-input-row"><input id="frtDateStart" type="text" inputmode="numeric" maxlength="10" placeholder="YYYY-MM-DD" aria-label="开始日期（北京时间）"><button type="button" data-md-action="start" aria-label="选择开始日期">选择</button></span></label><label>到<span class="md-input-row"><input id="frtDateEnd" type="text" inputmode="numeric" maxlength="10" placeholder="YYYY-MM-DD" aria-label="结束日期（包含当天）"><button type="button" data-md-action="end" aria-label="选择结束日期">选择</button></span></label></div><div class="md-presets"><button type="button" data-md-action="single">指定一天</button><button type="submit">查询范围</button><button type="button" data-md-action="reset">重置</button></div><p id="frtDateNote" role="status"></p></form>
+    <div id="frtError" class="frt-message" role="alert" hidden></div>
+    <div id="frtCoverage" class="frt-message">只读取 Monitor 本地事实。</div>
+    <div id="frtTree" aria-busy="false"></div>
+  </section>
 </div><!-- /tab-model-statistics -->
+<dialog id="modelDateDialog" class="model-date-dialog" aria-labelledby="modelDateDialogTitle"><h3 id="modelDateDialogTitle">选择日期</h3><input id="modelDateCalendarInput" type="hidden"><div id="modelDateCalendar"></div><div class="md-presets"><button type="button" id="modelDateCancel">取消</button><button type="button" id="modelDateConfirm">使用日期</button></div></dialog>
+
+<div class="tabpane anomaly-page" id="tab-anomalies" hidden>
+  <div class="stability-module-tabs monitor-feature-tabs"><div role="tablist" aria-label="异常监控子功能">
+    <button type="button" class="active" id="tokenAnomalyTab" data-anomaly-view="token" role="tab" aria-selected="true" aria-controls="tokenAnomalyView"><b>Token 异常</b></button>
+    <button type="button" id="incidentTab" data-anomaly-view="incidents" role="tab" aria-selected="false" aria-controls="incidentView" tabindex="-1"><b>事故监控</b></button>
+  </div></div>
+  <section id="tokenAnomalyView" role="tabpanel" aria-labelledby="tokenAnomalyTab" class="token-anomaly">
+    <form id="taFilters" class="ta-toolbar">
+	  <label>时间模式<select id="taTimeMode"><option value="900">跟随最新 · 最近十五分钟</option><option value="3600">跟随最新 · 最近一小时</option><option value="0">固定历史窗口</option></select></label>
+      <label>开始（北京时间）<span class="ta-date"><input id="taFrom" type="text" maxlength="16" placeholder="YYYY-MM-DDTHH:mm" required><button type="button" data-ta-picker="taFrom" aria-label="选择开始日期和时间">选择</button></span></label>
+      <label>结束（北京时间，不含该时刻）<span class="ta-date"><input id="taTo" type="text" maxlength="16" placeholder="YYYY-MM-DDTHH:mm" required><button type="button" data-ta-picker="taTo" aria-label="选择结束日期和时间">选择</button></span></label>
+      <button type="submit">查询</button><button type="button" id="taReset">重置</button>
+      <details class="ta-more-filters"><summary>更多筛选</summary>
+      <div class="ta-actions"><button type="button" data-ta-window="1">近 24 小时</button><button type="button" data-ta-window="3">近 3 天</button><button type="button" data-ta-window="7">近 7 天</button><button type="button" id="taRefresh">刷新</button></div><div class="ta-toolbar">
+      <label>渠道 ID<input id="taChannel" type="text" inputmode="numeric" maxlength="16" placeholder="全部渠道"></label>
+      <label>实际服务组<input id="taGroup" maxlength="128" placeholder="精确分组"></label>
+      <label>模型<input id="taModel" maxlength="256" placeholder="精确模型"></label>
+      <label>结果<select id="taStatusFilter"><option value="candidate">异常候选</option><option value="insufficient">证据不足</option><option value="not_hit">可用规则未命中</option><option value="">全部结果</option></select></label>
+      <label>命中规则<select id="taRule"><option value="">全部规则</option><option value="input_inflation">输入计量放大</option><option value="cache_structure">缓存计费结构变化</option><option value="usage_format">用量格式异常</option><option value="historical_price_difference">日志计价差异</option></select></label>
+      <label>证据等级<select id="taEvidence"><option value="">全部等级</option><option value="exact">直接日志事实</option><option value="correlated">相关性证据</option><option value="inferred">统计推断</option><option value="unavailable">不可用</option></select></label>
+      <label>可核算方法<select id="taMethod"><option value="">不限</option><option value="historical_formula_v1">日志费用差额</option><option value="input_upper_reference_v1">参考估计损失</option><option value="observed_consumption_not_loss">涉及消费</option></select></label>
+      </div></details>
+    </form>
+    <p id="taUpdated" class="ta-note" role="status"></p>
+    <p id="taError" class="ta-error" role="alert" hidden></p>
+    <p id="taCoverage" class="ta-warning">尚未读取覆盖。</p>
+    <section aria-label="所选时间内的 Token 异常记录"><div id="taList" aria-busy="false"></div><button type="button" id="taNext" disabled>加载下一页</button></section>
+    <details id="taMore" class="ta-panel"><summary>更多：规则、健康状态、核算与导出</summary>
+    <p id="taScope" class="ta-filters-note"></p>
+    <p class="ta-note">来源：本地冻结检测结果，按请求时间、日志 ID 升序分页。同一请求多规则命中只列一次。名称来自本地当前快照；不能确认的身份显示未知。展开本区后可在表格选择导出证据。候选需核实，统计参考差异不能确认多扣。</p>
+    <details class="ta-panel"><summary>汇总、分组与规则说明</summary><div id="taSummary" class="ta-cards"></div><p class="ta-note">直接日志事实只确认已记录的字段或公式差异。当前检测结果没有“已确认多扣”状态；统计推断仍为待核实候选。迟到事实会产生新修订，原证据保留。</p><label>查看维度 <select id="taDimension"><option value="channel_id">渠道</option><option value="group">实际服务组</option><option value="model">模型</option><option value="user_id">客户代号</option><option value="hour">小时（北京时间）</option></select></label><div id="taBreakdown"></div><button type="button" id="taBreakdownMore" hidden>显示更多维度</button></details>
+    <details class="ta-panel"><summary>采集、检测与通知健康详情</summary><div class="ta-health"><section id="taFactsHealth"></section><section id="taDetectionHealth"></section><section id="taNotifyHealth"></section></div></details>
+    <details class="ta-panel"><summary>数量与金额拆分</summary><p class="ta-note">只有同主体、同单位、同方法的金额可以相加。缺失价格、语义或参考时显示不可计算；客户钱包额度不等于上游扣账。动态计价 tiered_expr 仅在历史条件完整且受支持时核算。</p><div id="taAmounts"></div><div id="taUnavailable"></div></details>
+    <details class="ta-panel"><summary>受控脱敏导出</summary><p id="taExportNote" class="ta-note">导出权限尚未读取。</p><div class="ta-export"><label>目标供应商<select id="taTarget"><option value="">选择已授权供应商范围</option></select></label><label class="ta-inline"><input type="checkbox" id="taCustomerPrices" disabled>包含已单独授权的客户侧价格</label><label class="ta-inline"><input type="checkbox" id="taExportConfirm">我已核对供应商、时间范围和所选修订</label><button type="button" id="taCreateExport" disabled>生成脱敏证据包</button><button type="button" id="taDownloadExport" disabled>下载已生成包</button></div><p id="taExportResult" role="status" class="ta-note"></p></details>
+    <details class="ta-panel"><summary>最近通知记录与失败原因</summary><p class="ta-note">通知失败不进入成功冷却。SMTP 结果不确定时可能发生重复邮件；请求与金额统计始终按消费身份去重。暂停恢复受有效期和日预算约束。</p><div id="taNotifications"></div></details>
+    </details>
+    <dialog id="taTimeDialog" class="ta-dialog ta-time-dialog" aria-labelledby="taTimeTitle"><h3 id="taTimeTitle">日期和时间（北京时间）</h3><input id="taCalendarInput" type="hidden"><div id="taCalendar" class="lc-time-calendar"></div><div class="ta-toolbar"><label>小时<select id="taHour"></select></label><label>分钟<select id="taMinute"></select></label></div><div class="ta-actions"><button type="button" id="taTimeCancel">取消</button><button type="button" id="taTimeApply">使用此时间</button></div></dialog>
+    <dialog id="taDetail" class="ta-dialog" aria-labelledby="taDetailTitle"><header><h3 id="taDetailTitle">冻结依据与金额</h3><button type="button" id="taTroubleshoot">前往客户排障（仅预填，不自动查询）</button><button type="button" id="taDetailClose">关闭</button></header><form id="taRevisionForm" class="ta-toolbar"><label>查看修订<input id="taRevision" type="number" min="1" required></label><button type="submit">读取此修订</button><button type="button" id="taOriginal">首次冻结</button><button type="button" id="taLatest">列表所示修订</button></form><div id="taDetailBody"></div></dialog>
+  </section>
+  <section id="incidentView" class="incident-page" role="tabpanel" aria-labelledby="incidentTab" hidden>
+    <form id="imFilters" class="im-filters">
+      <label>开始（北京时间）<input id="imFrom" type="datetime-local" required></label>
+      <label>结束（北京时间，不含该时刻）<input id="imTo" type="datetime-local" required></label>
+      <button type="submit">查询</button><button type="button" id="imReset">重置</button>
+    </form>
+    <p id="imUpdated" class="im-note" role="status"></p>
+    <p id="imError" class="im-error" role="alert" hidden></p>
+    <p id="imCoverage" class="im-warning">尚未确认事故处理覆盖。</p>
+    <div id="imList" aria-busy="false"></div>
+    <div class="im-actions"><button type="button" id="imNext" hidden>加载下一页</button><button type="button" id="imRefresh" hidden>重新查询最新列表</button></div>
+    <details><summary>范围与统计口径</summary><p id="imRange" class="im-note"></p><p class="im-note">数据来自本地 B2/B3 事故、分段和冻结观测。结束观测段不表示已通过恢复门禁；缺失事实不计为零。当前列表不触发生产日志查询或启用采集、检测、通知。</p></details>
+    <details id="imHealth"><summary>采集健康与未接入能力</summary><pre id="imHealthBody">展开后读取本地健康状态。</pre></details>
+    <dialog id="imDetail" class="im-dialog" aria-labelledby="imDetailTitle"><header><h3 id="imDetailTitle">事故详情与证据</h3><button type="button" id="imDetailClose">关闭</button></header><p id="imDetailError" class="im-error" role="alert" hidden></p><div id="imDetailBody"></div><div class="im-actions"><button type="button" id="imSegMore" hidden>更多异常分段</button><button type="button" id="imObsMore" hidden>更多观测证据</button><button type="button" id="imImpactMore" hidden>更多影响范围</button><button type="button" id="imArchiveMore" hidden>更多归档证据</button><button type="button" id="imRevisionMore" hidden>更多修订记录</button></div></dialog>
+  </section>
+</div><!-- /tab-anomalies -->
 
 <div class="tabpane channel-management-page" id="tab-channels" hidden>
   <div class="cm-toolbar">
@@ -1211,8 +1334,16 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
     <div id="lcInvestigationPanel" class="lc-investigation-panel" hidden>
       <form id="lcInvestigationForm" method="post" action="/logchain/investigations" autocomplete="off" novalidate>
         <fieldset id="lcInvestigationFields" class="lc-investigation-fields">
-          <label>开始时间（北京时间，含）<input id="lcInvestigationFrom" type="datetime-local" step="60" required></label>
-          <label>结束时间（北京时间，不含）<input id="lcInvestigationTo" type="datetime-local" step="60" required></label>
+          <div class="lc-investigation-time">
+            <label for="lcInvestigationFrom">开始时间（北京时间，含）</label>
+            <input id="lcInvestigationFrom" type="datetime-local" step="60" required aria-describedby="lcInvestigationTimeHelp">
+            <button type="button" class="lc-jump" id="lcInvestigationFromPick" aria-haspopup="dialog" aria-controls="lcInvestigationTimeDialog">选择开始日期和时间</button>
+          </div>
+          <div class="lc-investigation-time">
+            <label for="lcInvestigationTo">结束时间（北京时间，不含）</label>
+            <input id="lcInvestigationTo" type="datetime-local" step="60" required aria-describedby="lcInvestigationTimeHelp">
+            <button type="button" class="lc-jump" id="lcInvestigationToPick" aria-haspopup="dialog" aria-controls="lcInvestigationTimeDialog">选择结束日期和时间</button>
+          </div>
           <label>NewAPI Request ID<input id="lcInvestigationRequestID" type="text" autocomplete="off" spellcheck="false" maxlength="256" placeholder="可不填"></label>
           <label>CloudFront Request ID<input id="lcInvestigationCloudFrontID" type="text" autocomplete="off" spellcheck="false" maxlength="256" placeholder="可不填"></label>
           <label>客户 ID<input id="lcInvestigationUserID" type="text" inputmode="numeric" autocomplete="off" placeholder="正整数，可不填"></label>
@@ -1226,6 +1357,21 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
         </div>
       </form>
       <div class="lc-sub">未找到证据不代表客户没有发出请求，也不能据此判为客户问题。原始标识不写入网址或浏览器存储。</div>
+      <p id="lcInvestigationTimeHelp" class="lc-sub">时间均按北京时间解释，可直接用键盘修改日期、小时和分钟；查询范围左闭右开，最多 2 小时。</p>
+      <p id="lcInvestigationTimeNotice" class="lc-cw-err" role="status" hidden></p>
+      <dialog id="lcInvestigationTimeDialog" class="lc-time-dialog" aria-labelledby="lcInvestigationTimeTitle" aria-describedby="lcInvestigationTimeZone">
+        <h3 id="lcInvestigationTimeTitle">选择日期和时间</h3>
+        <p id="lcInvestigationTimeZone" class="lc-sub">北京时间（UTC+8），24 小时制</p>
+        <div id="lcInvestigationCalendar" class="lc-time-calendar"><input id="lcInvestigationDate" type="text" hidden></div>
+        <div class="lc-time-clock">
+          <label for="lcInvestigationHour">小时<select id="lcInvestigationHour"></select></label>
+          <label for="lcInvestigationMinute">分钟<select id="lcInvestigationMinute"></select></label>
+        </div>
+        <div class="lc-investigation-actions">
+          <button type="button" class="lc-jump" id="lcInvestigationTimeCancel">放弃修改</button>
+          <button type="button" class="lc-jump lc-primary" id="lcInvestigationTimeApply">确认时间</button>
+        </div>
+      </dialog>
       <div id="lcInvestigationResult" class="lc-cw" aria-live="polite"></div>
     </div>
   </section>
@@ -1263,6 +1409,7 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
       <option value="false">仅非流式</option>
     </select>
     <input id="lcRequestID" class="lc-request-id" placeholder="Request ID（精确）" aria-label="Request ID" title="按 new-api logs.request_id 精确匹配，使用独立索引">
+    <input id="lcKeyword" placeholder="错误原文关键词" aria-label="错误原文关键词" maxlength="128" title="搜索原始错误文本；沿用后端有界时间窗口，点击查询或按回车生效">
     <button type="button" id="lcApply" class="lc-primary">查询</button>
     <button type="button" id="lcReset">重置</button>
     <span class="lc-sortbar" role="group" aria-label="时间排序">
@@ -1287,11 +1434,9 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
           <th style="width:9%"><span class="lc-th">令牌</span><span class="lc-th-sub">token 名称</span></th>
           <th style="width:8%"><span class="lc-th">分组</span><span class="lc-th-sub">服务分组</span></th>
           <th style="width:13%"><span class="lc-th">模型</span><span class="lc-th-sub">映射后显示实际模型</span></th>
-          <th style="width:18%"><span class="lc-th">渠道 → 上游主域名</span><span class="lc-th-sub">这条请求发给了谁</span></th>
-          <!-- 归因列。表头明写"推断"：这一列与其它列性质不同，其余都是转述 new-api /
-               上游写下的事实，只有它是我方规则对事实的解读。判错的代价是找错人。 -->
-          <th style="width:11%"><span class="lc-th">疑似责任方</span><span class="lc-th-sub">推断 · 非事实 · 悬停看依据</span></th>
-          <th><span class="lc-th" id="lcDetailTh">上游返回原文</span><span class="lc-th-sub" id="lcDetailThSub">未做任何改写 · 点行看全文</span></th>
+          <th style="width:18%"><span class="lc-th">渠道 → 上游地址</span><span class="lc-th-sub">实际转发与当前快照分别标注</span></th>
+          <th style="width:11%"><span class="lc-th">责任方</span><span class="lc-th-sub">已知归属与待查分别标注</span></th>
+          <th><span class="lc-th" id="lcDetailTh">错误原因</span><span class="lc-th-sub" id="lcDetailThSub">具体原因 · 展开查看依据、建议及错误原文</span></th>
           <th style="width:9%" class="lc-th-sortable" id="lcSortTh" role="button" tabindex="0"
               title="点击切换时间正序 / 倒序">
             <span class="lc-th">时间 <span class="lc-sort-arrow" id="lcSortArrow">↓</span></span>
@@ -1372,6 +1517,7 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
     <input id="alUser" placeholder="客户 ID" aria-label="客户 ID" title="按 new-api 用户 ID 精确筛">
     <button type="button" id="alApply">查询</button>
     <button type="button" id="alReset">重置</button>
+    <button type="button" id="alRefreshLatest" hidden>返回最新结果</button>
     <span class="lc-counter" id="alCounter"></span>
     <span class="lc-status" id="alStatus"></span>
   </div>
@@ -1524,18 +1670,23 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
   </main>
 </div><!-- /monitor-shell -->
 
+<script src="/view-refresh.js?v=1"></script>
 <script src="/quantile_display.js?v=1"></script>
 <script src="/stability.js?v=8"></script>
 <script src="/channel-data-status.js?v=2"></script>
 <script src="/channel-pricing-observations.js?v=1"></script>
 <script src="/channel-management.js?v=19"></script>
-<script src="/logchain.js?v=18"></script>
+<script src="/logchain.js?v=20"></script>
 <script src="/customer-health.js?v=4"></script>
 <script src="/alerts.js?v=3"></script>
 <script src="/capacity.js?v=2"></script>
 <script src="/group-governance.js?v=1"></script>
 <script src="/finance.js?v=58"></script>
-<script src="/model-statistics.js?v=6"></script>
+<script src="/model-report-dates.js?v=1"></script>
+<script src="/model-statistics.js?v=9"></script>
+<script src="/model-frt.js?v=3"></script>
+<script src="/token-anomaly.js?v=1"></script>
+<script src="/incident.js?v=1"></script>
 <script src="/infra-assets.js?v=1"></script>
 <script src="/ecs-log-sources.js?v=1"></script>
 <script>
@@ -2410,6 +2561,7 @@ function monitorHashParams(){return new URLSearchParams(location.hash.replace(/^
 window.monitorNavigationContext=function(){const out={};for(const[k,v]of monitorHashParams())if(k!=='tab')out[k]=v;return out};
 window.monitorNavigate=function(name,context){const q=new URLSearchParams();q.set('tab',name);for(const[k,v]of Object.entries(context||{}))if(v!=null&&v!=='')q.set(k,String(v));history.replaceState(null,'',location.pathname+location.search+'#'+q.toString());switchTab(name,true);window.dispatchEvent(new CustomEvent('monitor:navigate',{detail:{tab:name,context:window.monitorNavigationContext()}}))};
 window.monitorOpenEncoded=function(name,encoded){let context={};try{context=JSON.parse(decodeURIComponent(escape(atob(encoded))))}catch(e){}window.monitorNavigate(name,context)};
+let monitorLastTab=null; // 用于区分「换页」与「同页重查」，见下方滚动处理。
 function switchTab(name,preserveHash){
   // 普通点击侧栏代表进入该页默认视图；必须先清掉旧跨页筛选，再执行页面激活。
   // 跨页按钮会先写入新 hash 并传 preserveHash=true，因此不会走这里。
@@ -2422,6 +2574,7 @@ function switchTab(name,preserveHash){
   document.getElementById('tab-server').hidden=(name!=='server');
   document.getElementById('tab-capacity').hidden=(name!=='capacity');
   document.getElementById('tab-model-statistics').hidden=(name!=='model-statistics');
+  document.getElementById('tab-anomalies').hidden=(name!=='anomalies');
   document.getElementById('tab-usage').hidden=(name!=='usage');
   document.getElementById('tab-group-governance').hidden=(name!=='group-governance');
   document.getElementById('tab-finance').hidden=(name!=='finance');
@@ -2446,10 +2599,18 @@ document.getElementById('tab-alerts').hidden=(name!=='alerts');
   if(name==='customer-health'&&window.customerHealthActivate)window.customerHealthActivate();
   else if(window.customerHealthDeactivate)window.customerHealthDeactivate();
 if(name==='alerts'&&window.alertsActivate)window.alertsActivate();
+else if(window.alertsDeactivate)window.alertsDeactivate();
   if(name==='capacity'&&window.capacityActivate)window.capacityActivate();
   if(name!=='capacity'&&window.capacityDeactivate)window.capacityDeactivate();
-  if(name==='model-statistics'&&window.modelStatisticsActivate)window.modelStatisticsActivate();
-  else if(window.modelStatisticsDeactivate)window.modelStatisticsDeactivate();
+  if(name==='anomalies'&&window.anomalyPageActivate)window.anomalyPageActivate();
+  else if(window.anomalyPageDeactivate)window.anomalyPageDeactivate();
+  if(name==='model-statistics'&&window.modelStatisticsPageActivate)window.modelStatisticsPageActivate();
+  else if(window.modelStatisticsPageDeactivate)window.modelStatisticsPageDeactivate();
+  // 这两页进入时必须先看到标题和筛选,而不是停在上一页的滚动位置看到中段数据。
+  // 只在「真的换了页」时滚:这两页改筛选/日期也会走 monitorNavigate -> switchTab,
+  // 那种同页重查不能把用户正在看的位置顶回顶部。usage 的 scrollToMatrix 同样不受影响。
+  if((name==='model-statistics'||name==='anomalies')&&monitorLastTab!==name)window.scrollTo({top:0});
+  monitorLastTab=name;
   if(name==='model')setTimeout(resizeModelCharts,60); // 模型 tab 非默认可见,切回时按可见宽度重排图表
 }
 function resizeModelCharts(){[trendChart,longChart,sloGauge,latChart,ttftChart].forEach(c=>c&&c.resize());}
@@ -4058,7 +4219,7 @@ setSeg();const _mePromise=loadMe();load();schedule();
 document.querySelectorAll('#longSeg a').forEach(a=>{a.href='javascript:void 0';a.classList.toggle('active',+a.dataset.d===longDays);a.addEventListener('click',e=>{e.preventDefault();longDays=+a.dataset.d;document.querySelectorAll('#longSeg a').forEach(x=>x.classList.toggle('active',x===a));loadLongTrend();});});
 loadLongTrend();
 // 默认落在「用户用量」;URL hash 带 tab(从报警设置返回/手动刷新)则恢复到该 tab。等 IS_ROOT 就位再渲染,模型/服务端数据后台预载
-_mePromise.finally(()=>{const q=monitorHashParams(),tab=q.get('tab');const target=/^(sync|model|server|capacity|model-statistics|usage|stability|channels|finance|logchain|alerts|group-governance|customer-health)$/.test(tab||'')?tab:'usage';switchTab(target,true);window.dispatchEvent(new CustomEvent('monitor:navigate',{detail:{tab:target,context:window.monitorNavigationContext()}}))});
+_mePromise.finally(()=>{const q=monitorHashParams(),tab=q.get('tab');const target=/^(sync|model|server|capacity|model-statistics|anomalies|usage|stability|channels|finance|logchain|alerts|group-governance|customer-health)$/.test(tab||'')?tab:'usage';switchTab(target,true);window.dispatchEvent(new CustomEvent('monitor:navigate',{detail:{tab:target,context:window.monitorNavigationContext()}}))});
 </script>
 </body>
 </html>

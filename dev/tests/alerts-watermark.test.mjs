@@ -7,12 +7,14 @@ function alertsView(responses) {
   const source=readFileSync(new URL('../../monitor/alerts.js',import.meta.url),'utf8');
   const end=source.lastIndexOf('})();');
   assert.ok(end>0);
-  const elements=new Map(),requests=[];
+  const elements=new Map(),requests=[],timers=new Map(),listeners=new Map();let timerID=0;
+  const on=(name,fn)=>listeners.set(name,[...(listeners.get(name)||[]),fn]);
   const element=id=>{
     if(!elements.has(id))elements.set(id,{textContent:'',innerHTML:'',hidden:false,value:'',disabled:false,addEventListener(){}});
     return elements.get(id);
   };
-  const context=vm.createContext({window:{},document:{getElementById:element},URLSearchParams,AbortController,
+  const context=vm.createContext({window:{addEventListener:on},document:{getElementById:element,addEventListener:on,hidden:false},URLSearchParams,AbortController,
+    setTimeout(fn){const id=++timerID;timers.set(id,fn);return id},clearTimeout(id){timers.delete(id)},
     fetch:async url=>{
       requests.push(new URL(url,'http://local.test'));
       // Match the endpoint's minute-boundary validation so invalid cutoff
@@ -21,18 +23,23 @@ function alertsView(responses) {
       if(cutoff!==null&&(!Number.isSafeInteger(+cutoff)||+cutoff<=0||+cutoff%60!==0)){
         return {ok:false,status:400,text:async()=>JSON.stringify({error:'cutoff_ts 必须为可信的整分钟截止时间'})};
       }
-      const data=responses[Math.min(requests.length-1,responses.length-1)];
+      const data=typeof responses==='function'?responses(requests.at(-1)):responses[Math.min(requests.length-1,responses.length-1)];
       return {ok:true,status:200,text:async()=>JSON.stringify(data)};
     }});
+  vm.runInContext(readFileSync(new URL('../../monitor/view_refresh.js',import.meta.url),'utf8'),context);
+  context.window.MonitorView.preserve=(_root,update)=>update();
   vm.runInContext(source.slice(0,end)+`
-    globalThis.alertsTest={load,go,paint,setFilters(reason,user){fReason=reason;fUser=user;},setDate(value){date=value;}};
+    globalThis.alertsTest={load,go,paint,resumeLive,setFilters(reason,user){fReason=reason;fUser=user;},setDate(value){date=value;}};
   `+source.slice(end),context);
   context.alertsTest.setDate('2026-10-08');
-  return {ui:context.alertsTest,element,requests};
+  return {ui:context.alertsTest,element,requests,activate:context.window.alertsActivate,deactivate:context.window.alertsDeactivate,
+    async tick(){const [id,fn]=timers.entries().next().value;timers.delete(id);fn();await new Promise(setImmediate)},
+    async focus(){for(const fn of listeners.get('focus')||[])fn();await new Promise(setImmediate)}};
 }
 
 const through=Date.parse('2026-10-08T15:56:00+08:00')/1000;
 const today={enabled:true,total:7,row_total:1,rows:[{ts:through-60,reason:'route_no_channel',count:7,user_id:0}],
+  generated_at:through+180,lag_seconds:0,timing:{finalize_delay_seconds:120,alignment_seconds:60,collection_poll_seconds:60},
   coverage_complete:false,statistics_complete:true,statistics_available:true,tail_syncing:true,
   from_ts:Date.parse('2026-10-08T00:00:00+08:00')/1000,to_ts:through,cutoff_ts:through,through_ts:through,target_ts:through,source:'cloudwatch'};
 
@@ -41,7 +48,8 @@ test('alerts shows seven known rejections while only the unfinalized tail is pen
   assert.match(element('alCounter').innerHTML,/被拒次数 <b>7<\/b>/);
   assert.match(element('alCounter').innerHTML,/截至 10-08 15:56，尾部同步中/);
   assert.doesNotMatch(element('alCounter').innerHTML,/未完成|—/);
-  assert.match(element('alCoverageWarning').textContent,/尾部同步中/);
+  assert.equal(element('alCoverageWarning').hidden,true);
+  assert.match(element('alStatus').textContent,/封口等待 120 秒/);
   assert.doesNotMatch(element('alCoverageWarning').textContent,/数据不完整|混合|旁路/);
   assert.match(element('alNotes').textContent,/10-08 00:00 至 10-08 15:56/);
 });
@@ -77,6 +85,19 @@ test('alerts ongoing collection failure cannot be hidden by an available prefix'
   const {ui,element}=alertsView([{...today,collection_failed:true,coverage_note:'最近一次采集失败。'}]);await ui.load();
   assert.match(element('alCoverageWarning').textContent,/采集失败/);
   assert.match(element('alCounter').innerHTML,/被拒次数 <b>7<\/b>/);
+});
+
+test('alerts normal tail stays neutral, but backlog and historical gaps warn across refreshes',async()=>{
+ const {ui,element}=alertsView([
+  {...today,lag_seconds:60},
+  {...today,lag_seconds:180},
+  {...today,lag_seconds:0,statistics_complete:false},
+  {...today,lag_seconds:0,coverage_complete:true,tail_syncing:false}
+ ]);
+ await ui.load();assert.equal(element('alCoverageWarning').hidden,true);assert.match(element('alStatus').textContent,/正常等待/);
+ await ui.load(false,true);assert.equal(element('alCoverageWarning').hidden,false);assert.match(element('alCoverageWarning').textContent,/采集积压 180 秒/);assert.match(element('alCoverageWarning').textContent,/统计窗口覆盖完整/);
+ ui.setDate('2026-10-07');await ui.load();assert.match(element('alCoverageWarning').textContent,/数据不完整/);
+ await ui.load(false,true);assert.equal(element('alCoverageWarning').hidden,true);
 });
 
 test('alerts first collection failure is visible even without a usable prefix',async()=>{
@@ -130,7 +151,7 @@ test('alerts unready first page can keep paging and filtering after recovery wit
   ui.setFilters('','0');await ui.load();
   assert.equal(requests.length,5);
   assert.equal(requests[4].searchParams.get('cutoff_ts'),String(recoveredThrough));
-  assert.equal(element('alStatus').textContent,'');
+  assert.doesNotMatch(element('alStatus').textContent,/读取失败/);
 });
 
 test('alerts complete responses without cutoff_ts never infer it from to_ts',async()=>{
@@ -160,4 +181,41 @@ test('alerts a fixed historical snapshot is not described as an actively syncing
   const {ui,element}=alertsView([{...today,tail_syncing:false}]);await ui.load();
   assert.match(element('alCounter').innerHTML,/固定统计窗口/);
   assert.doesNotMatch(element('alCoverageWarning').textContent,/尾部同步中|数据不完整/);
+});
+
+test('alerts timer, focus and page return advance the source window while preserving date and filters',async()=>{
+  let sourceThrough=through;
+  const v=alertsView(request=>{
+    const end=Number(request.searchParams.get('cutoff_ts'))||sourceThrough;
+    return {...today,to_ts:end,cutoff_ts:end,through_ts:end,target_ts:sourceThrough,total:end-through+7};
+  });
+  v.ui.setFilters('route_no_channel','0');v.activate();await new Promise(setImmediate);
+  assert.match(v.element('alCounter').innerHTML,/被拒次数 <b>7<\/b>/);
+  for(const refresh of [()=>v.tick(),()=>v.focus(),async()=>{v.deactivate();v.activate();await new Promise(setImmediate)}]){
+    sourceThrough+=300;await refresh();
+    const query=v.requests.at(-1).searchParams;
+    assert.equal(query.has('cutoff_ts'),false,'live refresh must release the previous snapshot cutoff');
+    assert.equal(query.get('from'),'2026-10-08');assert.equal(query.get('to'),'2026-10-08');
+    assert.equal(query.get('reason'),'route_no_channel');assert.equal(query.get('user_id'),'0');
+    assert.match(v.element('alCounter').innerHTML,new RegExp('被拒次数 <b>'+(sourceThrough-through+7)+'</b>'));
+  }
+});
+
+test('alerts pagination retains its snapshot across automatic refresh until explicitly returning to latest',async()=>{
+  let sourceThrough=through;
+  const v=alertsView(request=>{
+    const pinned=request.searchParams.has('cursor')||request.searchParams.has('cutoff_ts');
+    const end=pinned?through:sourceThrough;
+    return {...today,to_ts:end,cutoff_ts:end,through_ts:end,has_more:true,next_cursor:'page-snapshot',total:end-through+7};
+  });
+  v.activate();await new Promise(setImmediate);sourceThrough+=300;
+  await v.ui.load(true);
+  assert.equal(v.requests.at(-1).searchParams.get('cursor'),'page-snapshot');
+  assert.equal(v.requests.at(-1).searchParams.get('cutoff_ts'),String(through));
+  await v.tick();
+  assert.equal(v.requests.length,2,'automatic refresh must not discard paginated rows');
+  await v.ui.resumeLive();
+  assert.equal(v.requests.at(-1).searchParams.has('cursor'),false);
+  assert.equal(v.requests.at(-1).searchParams.has('cutoff_ts'),false);
+  assert.match(v.element('alCounter').innerHTML,/被拒次数 <b>307<\/b>/);
 });

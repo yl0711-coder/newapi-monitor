@@ -266,9 +266,15 @@ func computeLogChainBlastRadiusMode(rows []LogChainRow, mode string, hasMore boo
 			rb.channels[chanKey] = struct{}{}
 		}
 		fault := r.Fault
-		switch fault {
-		case faultUpstream, faultOurs, faultDownstream, faultUnknown:
-		default:
+		validFault := fault != ""
+		for _, part := range strings.Split(fault, "+") {
+			switch part {
+			case faultUpstream, faultOurs, faultDownstream, faultUnknown, "network":
+			default:
+				validFault = false
+			}
+		}
+		if !validFault {
 			fault = faultUnknown
 		}
 		faults[fault]++
@@ -322,7 +328,16 @@ func computeLogChainBlastRadiusMode(rows []LogChainRow, mode string, hasMore boo
 	for _, fault := range []string{faultUpstream, faultOurs, faultDownstream, faultUnknown} {
 		if count := faults[fault]; count > 0 {
 			faultSummary = append(faultSummary, logChainFaultCount{Fault: fault, Count: count})
+			delete(faults, fault)
 		}
+	}
+	var combinations []string
+	for fault := range faults {
+		combinations = append(combinations, fault)
+	}
+	sort.Strings(combinations)
+	for _, fault := range combinations {
+		faultSummary = append(faultSummary, logChainFaultCount{Fault: fault, Count: faults[fault]})
 	}
 
 	br := logChainBlastRadius{

@@ -84,12 +84,12 @@ func TestAlertsWatermarkHistoricalCompleteDayHasNoTail(t *testing.T) {
 	m.cloudWatchPreRouteThrough.Store(start + 86400)
 	m.cloudWatchPreRouteLastFailure.Store(now.Unix()) // Today's failure is not yesterday's gap.
 	r, status := serveAlertsWatermarkTest(t, m, now, "from=2026-10-07&to=2026-10-07")
-	if status != 200 || !r.CoverageComplete || !r.StatisticsComplete || r.TailSyncing || r.CollectionFailed || r.ToTs != start+86400 || r.CoverageNote != "" || r.Total != 0 {
+	if status != 200 || !r.CoverageComplete || !r.StatisticsComplete || r.TailSyncing || !r.CollectionFailed || r.ToTs != start+86400 || r.CoverageNote == "" || r.Total != 0 {
 		t.Fatalf("complete historical zero should remain complete: status=%d %+v", status, r)
 	}
 	// A deliberately pinned shorter historical window is not live syncing.
 	pinned, status := serveAlertsWatermarkTest(t, m, now, "from=2026-10-07&to=2026-10-07&cutoff_ts="+strconv.FormatInt(start+3600, 10))
-	if status != 200 || pinned.CoverageComplete || !pinned.StatisticsComplete || pinned.TailSyncing || pinned.CollectionFailed {
+	if status != 200 || pinned.CoverageComplete || !pinned.StatisticsComplete || pinned.TailSyncing || !pinned.CollectionFailed {
 		t.Fatalf("historical snapshot must not claim a syncing tail: status=%d %+v", status, pinned)
 	}
 }

@@ -20,6 +20,53 @@ func customerHealthHistoryFixtureNow() time.Time {
 	return time.Date(2026, 9, 30, 12, 0, 0, 0, cstLocation)
 }
 
+func TestCustomerHealthHistorySwitchValidatesOutgoingFRTProof(t *testing.T) {
+	m := customerHealthHistoryTestMonitor(t)
+	defer m.Close()
+	now := customerHealthHistoryFixtureNow()
+	today, target := customerHealthSourceRange(now)
+	yesterday := today - 86400
+	if err := m.saveCustomerHealthSourceCursor(yesterday, yesterday+7200); err != nil {
+		t.Fatal(err)
+	}
+	row := CapacityUserMinuteSample{BucketTs: yesterday + 60, UserID: 1, ChannelID: 1, ModelName: "legacy-frt", Grp: "g", Success: 1,
+		CustomerHealthVersion: customerHealthStabilityPolicyVersion, TrafficClassVersion: stabilityTrafficClassificationVersion}
+	if err := m.storeDB.Create(&row).Error; err != nil {
+		t.Fatal(err)
+	}
+	// New rows default to the current FRT version; model a persisted legacy
+	// row explicitly instead of relying on a zero-valued Go field at Create.
+	if err := m.storeDB.Model(&CapacityUserMinuteSample{}).Where("bucket_ts = ?", row.BucketTs).
+		Update("ttft_semantics_version", 0).Error; err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := m.loadCustomerHealthSourceCursor(today, target); err != nil {
+		t.Fatal(err)
+	}
+	var proof CustomerHealthDayCoverage
+	if err := m.storeDB.First(&proof, "day_ts=?", yesterday).Error; err != nil {
+		t.Fatal(err)
+	}
+	if proof.ThroughTs != yesterday+7200 || proof.TTFTCoverageThroughTs != yesterday || proof.ReplayNextTs != yesterday {
+		t.Fatal("day switch borrowed invalid FRT proof or discarded request coverage", proof)
+	}
+	worked, err := m.runCustomerHealthHistoryTurnWith(context.Background(), now, func(_ context.Context, from, to int64) (int, error) {
+		if from != yesterday || to != yesterday+3600 {
+			t.Fatal("FRT replay skipped legacy prefix", from, to)
+		}
+		return 1, nil
+	})
+	if err != nil || !worked {
+		t.Fatal(worked, err)
+	}
+	if err := m.storeDB.First(&proof, "day_ts=?", yesterday).Error; err != nil {
+		t.Fatal(err)
+	}
+	if proof.ThroughTs != yesterday+7200 || proof.TTFTCoverageThroughTs != yesterday+3600 {
+		t.Fatal("independent replay proofs merged incorrectly", proof)
+	}
+}
+
 func TestCustomerHealthHistoricalCoverageStitches24HoursAnd7Days(t *testing.T) {
 	m := customerHealthHistoryTestMonitor(t)
 	defer m.Close()

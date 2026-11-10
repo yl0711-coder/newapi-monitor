@@ -83,10 +83,11 @@ type logChainInvestigationScopeView struct {
 }
 
 type logChainInvestigationSummary struct {
-	Classification string `json:"classification"`
-	EvidenceLevel  string `json:"evidence_level"`
-	Conclusion     string `json:"conclusion"`
-	CustomerImpact string `json:"customer_impact"`
+	Diagnosis      *LogChainDiagnosis `json:"diagnosis,omitempty"`
+	Classification string             `json:"classification"`
+	EvidenceLevel  string             `json:"evidence_level"`
+	Conclusion     string             `json:"conclusion"`
+	CustomerImpact string             `json:"customer_impact"`
 }
 
 type logChainInvestigationTimelineEvent struct {
@@ -116,6 +117,7 @@ type logChainInvestigationResult struct {
 	Scope                    logChainInvestigationScopeView       `json:"scope"`
 	Summary                  logChainInvestigationSummary         `json:"summary"`
 	Requests                 []LogChainRow                        `json:"requests"`
+	RequestDiagnoses         []logChainRequestDiagnosis           `json:"request_diagnoses,omitempty"`
 	Timeline                 []logChainInvestigationTimelineEvent `json:"timeline"`
 	SourceStatus             []logChainCloudWatchSourceStatus     `json:"source_status"`
 	Evidence                 []logChainCloudWatchEvidence         `json:"evidence"`

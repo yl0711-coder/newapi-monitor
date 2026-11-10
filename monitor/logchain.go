@@ -22,6 +22,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"sort"
 	"strconv"
@@ -573,6 +574,10 @@ type LogChainRow struct {
 	FaultConfidence string `json:"fault_confidence,omitempty"`
 	FaultWhy        string `json:"fault_why,omitempty"`
 	FaultReason     string `json:"fault_reason,omitempty"` // 给人直接看的大白话原因；原文和 FaultWhy 仍保留供复核
+	// Admin troubleshooting fields. Never added to the Usage/portal LogRow.
+	DiagnosticFacts *LogChainDiagnosticFacts `json:"diagnostic_facts,omitempty"`
+	DiagnosticRef   string                   `json:"diagnostic_ref,omitempty"`
+	Diagnosis       *LogChainDiagnosis       `json:"diagnosis,omitempty"`
 
 	// EdgeEvidence 是 Nginx 入口层的短期旁路事实。它只通过本行已经存在的
 	// NewAPI Request ID 在内存中做 HMAC 后查询，不保存或再次回传任何 HMAC。
@@ -583,20 +588,22 @@ type LogChainRow struct {
 }
 
 type LogChainEdgeEvidence struct {
-	EventMS          int64  `json:"event_ms"`
-	Node             string `json:"node"`
-	Route            string `json:"route"`
-	Status           int    `json:"status"`
-	UpstreamStatus   int    `json:"upstream_status"`
-	UpstreamAttempts int    `json:"upstream_attempts"`
-	UpstreamStatuses string `json:"upstream_statuses,omitempty"`
-	RequestMS        int64  `json:"request_ms"`
-	UpstreamMS       int64  `json:"upstream_ms"`
-	UpstreamPresent  bool   `json:"upstream_present"`
-	ConnectMS        int64  `json:"connect_ms"`
-	HeaderMS         int64  `json:"header_ms"`
-	BytesSent        int64  `json:"bytes_sent"`
-	Completion       string `json:"completion"`
+	EventMS                int64  `json:"event_ms"`
+	Node                   string `json:"node"`
+	Route                  string `json:"route"`
+	Status                 int    `json:"status"`
+	UpstreamStatus         int    `json:"upstream_status"`
+	UpstreamAttempts       int    `json:"upstream_attempts"`
+	UpstreamStatuses       string `json:"upstream_statuses,omitempty"`
+	RequestMS              int64  `json:"request_ms"`
+	UpstreamMS             int64  `json:"upstream_ms"`
+	UpstreamPresent        bool   `json:"upstream_present"`
+	ConnectMS              int64  `json:"connect_ms"`
+	HeaderMS               int64  `json:"header_ms"`
+	BytesSent              int64  `json:"bytes_sent"`
+	Completion             string `json:"completion"`
+	RequestLength          *int64 `json:"request_length,omitempty"`
+	RequestLengthSemantics string `json:"request_length_semantics,omitempty"`
 }
 
 // logChainScope 已校验的查询范围。所有字段都来自用户输入但已收敛到安全区间。
@@ -1430,7 +1437,11 @@ func logChainDailySlices(s logChainScope) []logChainScope {
 
 // queryLogChainPage 执行一个已经收窄的时间片；调用方负责闸门与总超时。
 func (m *Monitor) queryLogChainPage(ctx context.Context, s logChainScope, domainChans []int64) ([]LogChainRow, bool, error) {
+	q, args := m.logChainPageQuery(s, domainChans)
+	return m.readLogChainPage(ctx, s, q, args)
+}
 
+func (m *Monitor) logChainPageQuery(s logChainScope, domainChans []int64) (string, []any) {
 	// err_anom 走 UNION ALL 拆分，见 logChainSplitErrAnom 的说明。
 	splitWhere2, splitArgs2, split := logChainSplitErrAnom(s, domainChans)
 	split = split && m.logChainCanSplit()
@@ -1471,24 +1482,96 @@ func (m *Monitor) queryLogChainPage(ctx context.Context, s logChainScope, domain
 		q = "SELECT " + hint + cols + " FROM " + src + " WHERE " + where + " " + order + lim
 	}
 
-	rows, err := m.prodDB.QueryContext(ctx, q, args...)
+	if m.logChainCanSplit() {
+		q = logChainPackedPageQuery(q)
+	}
+	return q, args
+}
+
+func (m *Monitor) readLogChainPage(ctx context.Context, s logChainScope, q string, args []any) (out []LogChainRow, more bool, resultErr error) {
+	started := time.Now()
+	var connectionMS, executeMS, receiveMS, decodeMS int64
+	stage, received := "connection_acquire", 0
+	defer func() {
+		if resultErr != nil {
+			slog.Warn("logchain source read failed", "stage", stage, "elapsed_ms", time.Since(started).Milliseconds(),
+				"connection_ms", connectionMS, "execute_ms", executeMS, "receive_ms", receiveMS,
+				"decode_ms", decodeMS, "received_rows", received, "page_rows", s.Limit+1,
+				"deadline", errors.Is(resultErr, context.DeadlineExceeded))
+		}
+	}()
+	phase := time.Now()
+	conn, err := m.prodDB.Conn(ctx)
+	connectionMS = time.Since(phase).Milliseconds()
+	if err != nil {
+		return nil, false, fmt.Errorf("排障日志连接获取失败: %w", err)
+	}
+	defer conn.Close()
+	stage, phase = "query_execute", time.Now()
+	rows, err := conn.QueryContext(ctx, q, args...)
+	executeMS = time.Since(phase).Milliseconds()
 	if err != nil {
 		return nil, false, fmt.Errorf("排障日志查询失败: %w", err)
 	}
 	defer rows.Close()
 
-	out := make([]LogChainRow, 0, s.Limit+1)
-	for rows.Next() {
+	packedMode := m.logChainCanSplit()
+	var packed []logChainWireRow
+	if packedMode {
+		stage, phase = "result_receive", time.Now()
+		var payload []byte
+		if !rows.Next() {
+			err = rows.Err()
+			if err == nil {
+				err = errors.New("packed log page aggregate is missing")
+			}
+		} else if err = rows.Scan(&payload); err == nil {
+			if rows.Next() {
+				err = errors.New("packed log query returned multiple pages")
+			} else {
+				err = rows.Err()
+			}
+		}
+		receiveMS += time.Since(phase).Milliseconds()
+		if err != nil {
+			return nil, false, fmt.Errorf("排障日志接收失败: %w", err)
+		}
+		stage, phase = "row_decode", time.Now()
+		packed, err = decodeLogChainPackedPage(payload, s.Limit+1, s.Asc)
+		decodeMS += time.Since(phase).Milliseconds()
+		if err != nil {
+			return nil, false, fmt.Errorf("排障日志解析失败: %w", err)
+		}
+	}
+	out = make([]LogChainRow, 0, s.Limit+1)
+	for i := 0; ; i++ {
+		if packedMode && i == len(packed) {
+			break
+		}
+		if !packedMode {
+			stage, phase = "result_receive", time.Now()
+			next := rows.Next()
+			receiveMS += time.Since(phase).Milliseconds()
+			if !next {
+				break
+			}
+		}
+		stage, phase = "row_decode", time.Now()
 		var r LogChainRow
 		var quota int64
 		var useTime sql.NullInt64
 		var isStream int
 		var content, other string
-		if err := rows.Scan(&r.ID, &r.CreatedAt, &r.Type, &r.UserID, &r.Member,
+		scan := rows.Scan
+		if packedMode {
+			scan = packed[i].scan
+		}
+		if err := scan(&r.ID, &r.CreatedAt, &r.Type, &r.UserID, &r.Member,
 			&r.Group, &r.TokenName, &r.ChannelID, &r.ModelName, &r.PromptTokens,
 			&r.CompletionTokens, &useTime, &isStream, &quota,
 			&content, &other, &r.RequestID); err != nil {
-			return nil, false, err
+			decodeMS += time.Since(phase).Milliseconds()
+			return nil, false, fmt.Errorf("排障日志解析失败: %w", err)
 		}
 		r.UseTime, r.UseTimeKnown = useTime.Int64, useTime.Valid
 		r.TypeName = logTypeName(r.Type)
@@ -1524,16 +1607,24 @@ func (m *Monitor) queryLogChainPage(ctx context.Context, s logChainScope, domain
 			r.StreamErrorCount = o.StreamStatus.ErrorCount
 			r.BillingSource = o.BillingSource
 		}
+		r.DiagnosticFacts = logChainParseDiagnosticFacts(content, other, "logs", r.CreatedAt)
+		if r.Type == 2 {
+			r.DiagnosticFacts = logChainParseDiagnosticAcquisitionFacts(content, other, "logs", r.CreatedAt)
+		}
+		r.DiagnosticRef = m.logChainDiagnosticReference(r)
+		r.DiagnosticFacts = logChainRowDiagnosticFacts(r)
 		r.AnomalyTags = logChainAnomalyTags(r, quota)
 		// 归因必须在标签算完之后：异常行的责任方依赖标签种类
 		// （client_gone 与 stream 的归因逻辑完全不同）。
 		if f := logChainAttributeFaultWithEvidence(r, r.AnomalyTags); f.Fault != "" {
-			r.Fault, r.FaultConfidence, r.FaultWhy, r.FaultReason = f.Fault, f.Confidence, f.Why, f.Reason
+			logChainApplyFault(&r, f)
 		}
 		out = append(out, r)
+		received++
+		decodeMS += time.Since(phase).Milliseconds()
 	}
 	if err := rows.Err(); err != nil {
-		return nil, false, err
+		return nil, false, fmt.Errorf("排障日志接收失败: %w", err)
 	}
 	hasMore := len(out) > s.Limit
 	if hasMore {
@@ -1568,7 +1659,7 @@ func (m *Monitor) attachChannelSnaps(ctx context.Context, rows []LogChainRow) er
 	}
 	var snaps []ChannelSnap
 	if err := m.storeDB.WithContext(ctx).
-		Select("id", "name", "vendor", "base_domain", "status", "deleted_at").
+		Select("id", "name", "vendor", "base_domain", "base_host", "models", "groups", "updated_at", "status", "deleted_at").
 		Where("id IN ?", ids).Find(&snaps).Error; err != nil {
 		return fmt.Errorf("读取渠道快照失败: %w", err)
 	}
@@ -1590,11 +1681,15 @@ func (m *Monitor) attachChannelSnaps(ctx context.Context, rows []LogChainRow) er
 		rows[i].UpstreamDomain = s.BaseDomain
 		rows[i].ChannelStatus = s.Status
 		rows[i].ChannelDeleted = s.DeletedAt > 0
+		rows[i].DiagnosticFacts = logChainRowDiagnosticFacts(rows[i])
+		rows[i].DiagnosticFacts.put("current_channel_host", s.BaseHost, "channel_snaps.base_host", s.UpdatedAt, "current_config")
+		rows[i].DiagnosticFacts.put("current_channel_models", s.Models, "channel_snaps.models", s.UpdatedAt, "current_config")
+		rows[i].DiagnosticFacts.put("current_channel_groups", s.Groups, "channel_snaps.groups", s.UpdatedAt, "current_config")
 	}
 	return nil
 }
 
-// attachNginxEvidence performs one bounded local lookup for the whole page.
+// attachNginxEvidence performs bounded local batch lookups for the whole page.
 // It never adds production-DB work and never turns missing optional evidence
 // into a customer-troubleshooting failure.
 func (m *Monitor) attachNginxEvidence(ctx context.Context, rows []LogChainRow) error {
@@ -1612,6 +1707,10 @@ func (m *Monitor) attachNginxEvidence(ctx context.Context, rows []LogChainRow) e
 		sets = append(sets, keySet{id: m.cfg.NginxEvidencePreviousHMACKeyID, key: m.cfg.NginxEvidencePreviousHMACKey})
 	}
 	seen := make(map[string]struct{}, len(rows))
+	requestRows := make(map[string]int, len(rows))
+	for _, row := range rows {
+		requestRows[row.RequestID]++
+	}
 	for _, row := range rows {
 		if row.RequestID == "" {
 			continue
@@ -1627,7 +1726,7 @@ func (m *Monitor) attachNginxEvidence(ctx context.Context, rows []LogChainRow) e
 	}
 	qctx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
 	defer cancel()
-	query := m.nginxEvidenceDB.WithContext(qctx).Model(&NginxRequestEvidence{})
+	identity := m.nginxEvidenceDB.WithContext(qctx).Model(&NginxRequestEvidence{})
 	hasClause := false
 	for _, set := range sets {
 		if len(set.hashes) == 0 {
@@ -1635,28 +1734,68 @@ func (m *Monitor) attachNginxEvidence(ctx context.Context, rows []LogChainRow) e
 		}
 		clause := "hmac_key_id = ? AND oneapi_id_hmac IN ?"
 		if !hasClause {
-			query = query.Where(clause, set.id, set.hashes)
+			identity = identity.Where(clause, set.id, set.hashes)
 			hasClause = true
 		} else {
-			query = query.Or(clause, set.id, set.hashes)
+			identity = identity.Or(clause, set.id, set.hashes)
 		}
 	}
 	if !hasClause {
 		return nil
 	}
-	// Keep only the newest row for each (key_id, oneapi_id_hmac) pair in SQL.
-	// A global LIMIT is unsafe: one request with repeated retries could consume
-	// the limit and hide the evidence for every later request on the page.
-	// The correlated NOT EXISTS uses the same indexed identity columns and makes
-	// the result bound equal to the number of requested hashes, not duplicate
-	// evidence rows.
-	query = query.Where(`NOT EXISTS (
-		SELECT 1 FROM nginx_request_evidences newer
-		WHERE newer.hmac_key_id = nginx_request_evidences.hmac_key_id
-		  AND newer.oneapi_id_hmac = nginx_request_evidences.oneapi_id_hmac
-		  AND (newer.event_ms > nginx_request_evidences.event_ms OR
-		       (newer.event_ms = nginx_request_evidences.event_ms AND newer.event_id > nginx_request_evidences.event_id))
-	)`)
+	// Both reads must see one snapshot if a collector appends another retry.
+	readDB := m.nginxEvidenceDB.WithContext(qctx).Begin(&sql.TxOptions{ReadOnly: true})
+	if readDB.Error != nil {
+		return readDB.Error
+	}
+	defer readDB.Rollback()
+	// Count identities before fetching details. The same request can occur in
+	// both HMAC generations after rotation; per-key uniqueness alone must not
+	// let one generation hide retries recorded under the other generation.
+	type identityCount struct {
+		HMACKeyID    string `gorm:"column:hmac_key_id"`
+		OneAPIIDHMAC string `gorm:"column:oneapi_id_hmac"`
+		Events       int64  `gorm:"column:events"`
+	}
+	var counts []identityCount
+	if err := readDB.Model(&NginxRequestEvidence{}).
+		Select("hmac_key_id, oneapi_id_hmac, count(*) AS events").Where(identity).
+		Group("hmac_key_id, oneapi_id_hmac").Limit(len(seen)).Scan(&counts).Error; err != nil {
+		return err
+	}
+	countByKey := make(map[string]int64, len(counts))
+	for _, item := range counts {
+		countByKey[item.HMACKeyID+"\x00"+item.OneAPIIDHMAC] = item.Events
+	}
+	unique := readDB.Model(&NginxRequestEvidence{})
+	uniqueRows := 0
+	for _, row := range rows {
+		if row.RequestID == "" || requestRows[row.RequestID] != 1 {
+			continue
+		}
+		var total int64
+		var matchedKey, matchedHash string
+		for _, set := range sets {
+			h := nginxEvidenceIDHMAC(set.key, "oneapi-request-id", row.RequestID)
+			if n := countByKey[set.id+"\x00"+h]; n > 0 {
+				total += n
+				matchedKey, matchedHash = set.id, h
+			}
+		}
+		if total != 1 {
+			continue
+		}
+		if uniqueRows == 0 {
+			unique = unique.Where("hmac_key_id = ? AND oneapi_id_hmac = ?", matchedKey, matchedHash)
+		} else {
+			unique = unique.Or("hmac_key_id = ? AND oneapi_id_hmac = ?", matchedKey, matchedHash)
+		}
+		uniqueRows++
+	}
+	if uniqueRows == 0 {
+		return nil
+	}
+	query := readDB.Model(&NginxRequestEvidence{}).Where(unique)
 	var evidence []NginxRequestEvidence
 	if err := query.Order("event_ms DESC, event_id DESC").Limit(len(seen)).Find(&evidence).Error; err != nil {
 		return err
@@ -1669,7 +1808,7 @@ func (m *Monitor) attachNginxEvidence(ctx context.Context, rows []LogChainRow) e
 		}
 	}
 	for i := range rows {
-		if rows[i].RequestID == "" {
+		if rows[i].RequestID == "" || requestRows[rows[i].RequestID] != 1 {
 			continue
 		}
 		for _, set := range sets {
@@ -1678,12 +1817,33 @@ func (m *Monitor) attachNginxEvidence(ctx context.Context, rows []LogChainRow) e
 			if !ok {
 				continue
 			}
+			// Same Request ID can be retried. An event outside this attempt's
+			// lifetime cannot supply timings, bytes or a fault for this row.
+			if rows[i].CreatedAt > 0 && (item.EventMS < rows[i].CreatedAt*1000-2000 ||
+				item.EventMS > (rows[i].CreatedAt+rows[i].UseTime+2)*1000) {
+				continue
+			}
 			rows[i].EdgeEvidenceMode = mode
 			rows[i].EdgeEvidenceVerified = mode == "verified"
 			rows[i].EdgeEvidence = &LogChainEdgeEvidence{EventMS: item.EventMS, Node: item.Node, Route: item.Route, Status: item.Status,
 				UpstreamStatus: item.UpstreamStatus, UpstreamAttempts: item.UpstreamAttempts, UpstreamStatuses: item.UpstreamStatuses,
 				RequestMS: item.RequestMS, UpstreamMS: item.UpstreamMS, UpstreamPresent: item.UpstreamPresent,
-				ConnectMS: item.ConnectMS, HeaderMS: item.HeaderMS, BytesSent: item.BytesSent, Completion: item.Completion}
+				ConnectMS: item.ConnectMS, HeaderMS: item.HeaderMS, BytesSent: item.BytesSent, Completion: item.Completion,
+				RequestLength: item.RequestLength, RequestLengthSemantics: "nginx_request_length_headers_and_body"}
+			rows[i].DiagnosticFacts = logChainRowDiagnosticFacts(rows[i])
+			if mode == "verified" && item.UpstreamAttempts <= 1 {
+				f := rows[i].DiagnosticFacts
+				f.put("request_path", item.Route, "nginx_evidence.route", item.EventMS/1000, "request")
+				f.put("request_method", item.Method, "nginx_evidence.method", item.EventMS/1000, "request")
+				f.put("total_ms", strconv.FormatInt(item.RequestMS, 10), "nginx_evidence.request_ms", item.EventMS/1000, "request")
+				f.put("node", item.Node, "nginx_evidence", item.EventMS/1000, "request")
+				f.put("layer_statuses", fmt.Sprintf("nginx=%d,newapi=%d", item.Status, item.UpstreamStatus), "nginx_evidence", item.EventMS/1000, "request")
+				f.put("connect_ms", strconv.FormatInt(item.ConnectMS, 10), "nginx_evidence", item.EventMS/1000, "request")
+				f.put("first_byte_ms", strconv.FormatInt(item.HeaderMS, 10), "nginx_evidence.header_ms", item.EventMS/1000, "request")
+				if item.RequestLength != nil {
+					f.put("request_length", strconv.FormatInt(*item.RequestLength, 10), "nginx_evidence:headers_and_body", item.EventMS/1000, "request")
+				}
+			}
 			break
 		}
 	}
@@ -1827,6 +1987,43 @@ func (m *Monitor) serveLogChainRequests(c *gin.Context) {
 		return
 	}
 	ctx := c.Request.Context()
+	generatedAt := time.Now()
+	// The requested day often ends at the next midnight. That is the user's
+	// requested boundary, not a statement that production logs already exist
+	// through that instant. Read only through the instant at which this request
+	// was made and expose the unserved tail explicitly.
+	queryThrough := generatedAt.Unix() + 1
+	if queryThrough > scope.ToTs {
+		queryThrough = scope.ToTs
+	}
+	coverageComplete := queryThrough >= scope.ToTs
+	coverageStatus := "complete"
+	coverageNote := ""
+	if !coverageComplete {
+		coverageStatus = "collecting"
+		coverageNote = "正在采集：生产 logs 当前查询水位尚未到达所选范围右端；以下结果仅覆盖已到达水位，不能据此确认未出现问题"
+	}
+	// A historical window can be fully queried even though it is older than
+	// the current clock. Do not report that age as source lag; the incomplete
+	// tail is represented by coverage_complete/coverage_note.
+	lagSeconds := int64(0)
+	queryScope := scope
+	if queryThrough < queryScope.ToTs {
+		queryScope.ToTs = queryThrough
+	}
+	writeMeta := func(resp gin.H) gin.H {
+		resp["generated_at"] = generatedAt.Unix()
+		resp["through_ts"] = queryThrough
+		resp["query_through_ts"] = queryThrough
+		resp["actual_through_ts"] = queryThrough
+		resp["target_ts"] = generatedAt.Unix() + 1
+		resp["requested_to_ts"] = scope.ToTs
+		resp["coverage_complete"] = coverageComplete
+		resp["coverage_status"] = coverageStatus
+		resp["coverage_note"] = coverageNote
+		resp["lag_seconds"] = lagSeconds
+		return resp
+	}
 
 	// 只给客户名、没给客户 ID 时先确认这个名字指向唯一客户。
 	//
@@ -1866,17 +2063,27 @@ func (m *Monitor) serveLogChainRequests(c *gin.Context) {
 			return
 		}
 		if len(domainChans) == 0 {
-			c.JSON(http.StatusOK, gin.H{
+			c.JSON(http.StatusOK, writeMeta(gin.H{
 				"ok": true, "rows": []LogChainRow{}, "has_more": false,
 				"scope": logChainScopeEcho(scope), "blind_spots": m.logChainCurrentBlindSpots(time.Now()),
 				"cloudwatch_enabled": m.cloudWatchEvidenceAvailable(),
 				"note":               "该上游主域名在本地渠道快照中没有对应渠道",
-			})
+			}))
 			return
 		}
 	}
 
-	rows, hasMore, err := m.queryLogChain(ctx, scope, domainChans)
+	var rows []LogChainRow
+	var hasMore bool
+	// A range that starts after the live source boundary has no queryable
+	// interval yet. Return an explicit incomplete snapshot instead of turning
+	// it into a successful-looking "no problems" result.
+	if queryScope.ToTs > queryScope.FromTs {
+		rows, hasMore, err = m.queryLogChain(ctx, queryScope, domainChans)
+	} else {
+		rows = []LogChainRow{}
+		hasMore = false
+	}
 	if err != nil {
 		if abortCanceledUsageRequest(c, err) {
 			return
@@ -1912,6 +2119,7 @@ func (m *Monitor) serveLogChainRequests(c *gin.Context) {
 		// 不在这里预取任何 CloudWatch 数据，避免每次翻页都产生 AWS 调用。
 		"cloudwatch_enabled": m.cloudWatchEvidenceAvailable(),
 	}
+	resp = writeMeta(resp)
 	// 两类本地补全都只能降级，不能吞掉已经从生产 logs 取回的明细。
 	if channelEnrichErr != nil {
 		resp["channel_enrich_error"] = channelEnrichErr.Error()

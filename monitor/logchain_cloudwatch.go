@@ -135,7 +135,7 @@ func (m *Monitor) lookupLogChainCloudWatchEvidence(ctx context.Context, requestI
 		}
 		return out
 	}
-	parser, err := m.cloudWatchEvidenceParser(includeSensitive)
+	parser, err := m.customerDiagnosticEvidenceParser(includeSensitive)
 	if err != nil {
 		for _, plan := range logChainCloudWatchPlans(includeSensitive) {
 			out.Sources = append(out.Sources, m.cloudWatchSourceStatus(plan, "unavailable",

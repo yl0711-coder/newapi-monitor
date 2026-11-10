@@ -12,6 +12,9 @@ class Element {
   addEventListener(type,handler){this.handlers.set(type,handler)}
   setAttribute(key,value){this.attributes.set(key,value)}
   focus(){this.focused=true}
+  showModal(){this.open=true}
+  close(){this.open=false;this.handlers.get('close')?.()}
+  querySelector(){return null}
   async emit(type,event={}){return this.handlers.get(type)?.({preventDefault(){},...event})}
 }
 
@@ -339,4 +342,110 @@ test('shared unknown fault taxonomy does not erase a proven fault location',()=>
     assert.match(html,new RegExp(`问题位置</span><b>${location}`));
     assert.doesNotMatch(html,/责任尚不明确/);
   }
+});
+
+test('time buttons open a shared calendar, keep Beijing wall-clock time and cancel without changes',async()=>{
+  const v=view();setWindow(v,'2026-03-08T02:30','2026-03-08T03:30');
+  let options,calendar;
+  v.context.window.flatpickr=(input,config)=>{
+    options=config;
+    return calendar={selectedDates:[],calendarContainer:new Element(),
+      setDate(value){this.selectedDates=[config.parseDate(value)]},
+      formatDate(date){return [date.getFullYear(),String(date.getMonth()+1).padStart(2,'0'),String(date.getDate()).padStart(2,'0')].join('-')},
+      clear(){this.selectedDates=[]}};
+  };
+  await v.el('lcInvestigationFromPick').emit('click');
+  assert.equal(v.el('lcInvestigationTimeDialog').open,true);
+  assert.equal(options.enableTime,undefined,'local Date must never normalize Beijing hour/minute through DST');
+  assert.equal(v.el('lcInvestigationHour').value,'02');
+  assert.equal(v.el('lcInvestigationMinute').value,'30');
+  assert.equal((v.el('lcInvestigationMinute').innerHTML.match(/<option /g)||[]).length,60);
+  v.el('lcInvestigationMinute').value='45';
+  await v.el('lcInvestigationTimeCancel').emit('click');
+  assert.equal(v.el('lcInvestigationFrom').value,'2026-03-08T02:30');
+  await v.el('lcInvestigationToPick').emit('click');
+  v.el('lcInvestigationHour').value='03';v.el('lcInvestigationMinute').value='59';
+  await v.el('lcInvestigationTimeApply').emit('click');
+  assert.equal(v.el('lcInvestigationTo').value,'2026-03-08T03:59');
+  assert.equal(v.el('lcInvestigationFrom').value,'2026-03-08T02:30');
+  assert.equal(v.el('lcInvestigationTimeDialog').open,false);
+  await v.el('lcInvestigationFromPick').emit('click');
+  v.closeStandaloneInvestigation();
+  assert.equal(v.el('lcInvestigationTimeDialog').open,false);
+  assert.equal(calendar.selectedDates.length,0);
+  assert.equal(v.el('lcInvestigationHour').value,'');
+  assert.equal(v.el('lcInvestigationMinute').value,'');
+});
+
+test('unavailable calendar leaves editable keyboard inputs and explains the fallback',async()=>{
+  const v=view();
+  await v.el('lcInvestigationFromPick').emit('click');
+  assert.equal(v.el('lcInvestigationTimeNotice').hidden,false);
+  assert.match(v.el('lcInvestigationTimeNotice').textContent,/组件不可用.*键盘/);
+  assert.equal(v.el('lcInvestigationFrom').focused,true);
+  assert.equal(v.el('lcInvestigationFields').disabled,false);
+  assert.equal(v.requests.length,0);
+});
+
+test('terminal results and create or poll failures unlock inputs and permit another query',async()=>{
+  for(const terminal of ['complete','partial','failed','cancelled','poll-http','poll-network','create-http','create-network']){
+    const v=view(async url=>{
+      const create=url==='/logchain/investigations';
+      if(terminal===(create?'create-network':'poll-network'))throw new Error('offline fixture');
+      if(terminal===(create?'create-http':'poll-http'))return {ok:false,status:503,json:async()=>({error:'unavailable fixture'})};
+      return {ok:true,status:200,json:async()=>create?{investigation_id:'opaque-task'}:{status:terminal,source_status:[]}};
+    });
+    setWindow(v);v.el('lcInvestigationRequestID').value='fixture';
+    await v.submitStandaloneInvestigation();
+    if(v.timers.length){v.timers.shift().fn();await tick()}
+    assert.equal(v.el('lcInvestigationFields').disabled,false,terminal);
+    assert.equal(v.el('lcInvestigationSubmit').disabled,false,terminal);
+    const before=v.requests.length;
+    await v.submitStandaloneInvestigation();
+    assert.ok(v.requests.length>before,terminal+' can retry');
+  }
+});
+
+test('loading closes calendar and prevents it reopening; failed cancellation stays locked until settled',async()=>{
+  const v=view(async url=>({ok:!url.endsWith('/cancel'),status:503,json:async()=>url.endsWith('/cancel')?{error:'cancel unavailable'}:{investigation_id:'opaque-task'}}));
+  setWindow(v);v.el('lcInvestigationRequestID').value='fixture';
+  v.el('lcInvestigationTimeDialog').showModal();
+  await v.submitStandaloneInvestigation();
+  assert.equal(v.el('lcInvestigationTimeDialog').open,false);
+  await v.el('lcInvestigationFromPick').emit('click');
+  assert.equal(v.el('lcInvestigationTimeNotice').textContent,'');
+  assert.equal(v.el('lcInvestigationTimeDialog').open,false);
+  await v.cancelCloudWatchInvestigation(v.STANDALONE_INVESTIGATION);
+  assert.equal(v.el('lcInvestigationFields').disabled,true);
+  assert.match(v.el('lcInvestigationResult').innerHTML,/取消失败/);
+  v.closeStandaloneInvestigation();
+  assert.equal(v.el('lcInvestigationFields').disabled,false);
+});
+
+test('source limitations are visible outside collapsed details and escaped without calling empty a fault',()=>{
+  const v=view();
+  v.lc.cwState.set(v.STANDALONE_INVESTIGATION,{result:{status:'partial',source_status:[
+    {source:'cloudfront<script>',status:'disabled'},{source:'nginx',status:'unavailable'},{source:'newapi',status:'empty'}]}});
+  v.render();
+  const html=v.el('lcInvestigationResult').innerHTML,visible=html.split('<details')[0];
+  assert.match(visible,/来源受限/);assert.match(visible,/该来源未启用/);assert.match(visible,/数据源不可用/);
+  assert.match(visible,/cloudfront&lt;script&gt;/);assert.doesNotMatch(visible,/<script>|newapi：/);
+  assert.match(visible,/缺少的证据不能用于排除故障/);
+});
+
+test('a late cancel error after a terminal poll must not restore the old loading state',async()=>{
+  let finishCancel;
+  const v=view(async url=>{
+    if(url.endsWith('/cancel'))return new Promise(resolve=>{finishCancel=resolve});
+    return {ok:true,status:200,json:async()=>url==='/logchain/investigations'?{investigation_id:'opaque-task'}:{status:'complete',source_status:[]}};
+  });
+  setWindow(v);v.el('lcInvestigationRequestID').value='fixture';
+  await v.submitStandaloneInvestigation();
+  const cancelling=v.cancelCloudWatchInvestigation(v.STANDALONE_INVESTIGATION);
+  v.timers.shift().fn();await tick();
+  assert.equal(v.el('lcInvestigationFields').disabled,false);
+  finishCancel({ok:false,status:503,json:async()=>({error:'late cancel failure'})});await cancelling;
+  assert.equal(v.el('lcInvestigationFields').disabled,false);
+  assert.equal(v.el('lcInvestigationSubmit').disabled,false);
+  assert.equal(v.lc.cwState.get(v.STANDALONE_INVESTIGATION).result.status,'complete');
 });

@@ -1,10 +1,12 @@
 package monitor
 
 // nginx_evidence.go 是入口请求级证据的独立、短期存储层。它不保存原始
-// Request ID、IP、query、Header、请求体或响应体；两个 Request ID 都必须
-// 已在节点侧使用共享密钥做 HMAC-SHA256。
+// IP、query、Header、请求体或响应体。可选的原始 NewAPI Request ID 只在
+// 本地受保护列中保存，不进入通用证据响应；已有 HMAC 协议继续兼容。
 
 import (
+	"github.com/yl0711-coder/newapi-monitor/internal/metering"
+
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
@@ -41,8 +43,13 @@ var (
 )
 
 type NginxRequestEvidence struct {
-	EventID          string `gorm:"primaryKey;size:64;column:event_id" json:"event_id"`
-	EventMS          int64  `gorm:"index:idx_nginx_evidence_time;column:event_ms" json:"event_ms"`
+	OneAPIRequestID      string `gorm:"column:oneapi_request_id;size:256;index:idx_nginx_evidence_request_id,priority:1" json:"-"`
+	RequestLength        *int64 `json:"request_length,omitempty"`
+	RequestLengthState   string `json:"request_length_state,omitempty"`
+	RequestLengthVersion string `json:"request_length_version,omitempty"`
+
+	EventID          string `gorm:"primaryKey;size:64;column:event_id;index:idx_nginx_evidence_request_id,priority:3" json:"event_id"`
+	EventMS          int64  `gorm:"index:idx_nginx_evidence_time;column:event_ms;index:idx_nginx_evidence_request_id,priority:2" json:"event_ms"`
 	Node             string `gorm:"size:64;not null" json:"node,omitempty"`
 	Route            string `gorm:"size:48;not null" json:"route"`
 	Method           string `gorm:"size:8;not null" json:"method"`
@@ -164,6 +171,11 @@ type nginxEvidenceTelemetry struct {
 }
 
 type nginxEvidenceEvent struct {
+	OneAPIRequestID      string `json:"oneapi_request_id,omitempty"`
+	RequestLength        *int64 `json:"request_length,omitempty"`
+	RequestLengthState   string `json:"request_length_state,omitempty"`
+	RequestLengthVersion string `json:"request_length_version,omitempty"`
+
 	EventID          string `json:"event_id"`
 	EventMS          int64  `json:"event_ms"`
 	Route            string `json:"route"`
@@ -256,6 +268,9 @@ func (m *Monitor) openNginxEvidenceStore() error {
 	if len(m.cfg.NginxEvidenceHMACKey) < 32 || !nginxEvidenceKeyIDPattern.MatchString(m.cfg.NginxEvidenceHMACKeyID) {
 		return errors.New("evidence HMAC key must be at least 32 bytes and key id must be valid")
 	}
+	if err := backupNginxLengthMigration(path); err != nil {
+		return err
+	}
 	// Keep SQLite's transient sort/index work in memory. The container's /tmp
 	// is deliberately bounded; spilling a large evidence replacement there
 	// can surface as SQLITE_FULL even while the evidence volume has space.
@@ -264,11 +279,17 @@ func (m *Monitor) openNginxEvidenceStore() error {
 	if err != nil {
 		return fmt.Errorf("open evidence store: %w", err)
 	}
-	if err := db.AutoMigrate(&NginxRequestEvidence{}, &NginxEvidenceIngestBatch{}, &NginxEvidenceSourceState{}, &CloudWatchNginxEvidenceCheckpoint{}); err != nil {
+	if err := db.AutoMigrate(&NginxRequestEvidence{}, &NginxEvidenceIngestBatch{}, &NginxEvidenceSourceState{}, &CloudWatchNginxEvidenceCheckpoint{}, &CloudWatchNginxRecentWindow{}); err != nil {
 		if sqlDB, dbErr := db.DB(); dbErr == nil {
 			_ = sqlDB.Close()
 		}
 		return fmt.Errorf("migrate evidence store: %w", err)
+	}
+	if err := initNginxEvidenceChanges(db); err != nil {
+		if sqlDB, dbErr := db.DB(); dbErr == nil {
+			_ = sqlDB.Close()
+		}
+		return fmt.Errorf("migrate evidence change cursor: %w", err)
 	}
 	if m.cfg.NginxSourceV2Enabled {
 		if err := db.AutoMigrate(&NginxEvidenceFileState{}); err != nil {
@@ -540,6 +561,9 @@ func (m *Monitor) startNginxEvidenceMaintenance(ctx context.Context) {
 }
 
 func validNginxEvidenceEvent(e nginxEvidenceEvent, nowMS int64, retentionHours int) bool {
+	if !metering.ValidLength(e.RequestLength, e.RequestLengthState, e.RequestLengthVersion) {
+		return false
+	}
 	if !nginxEvidenceHex64Pattern.MatchString(e.EventID) || e.EventMS <= 0 || e.EventMS > nowMS+300_000 {
 		return false
 	}
@@ -574,6 +598,9 @@ func validNginxEvidenceEvent(e nginxEvidenceEvent, nowMS int64, retentionHours i
 		if h != "" && !nginxEvidenceHex64Pattern.MatchString(h) {
 			return false
 		}
+	}
+	if e.OneAPIRequestID != "" && !validNginxEvidenceLookupID(e.OneAPIRequestID) {
+		return false
 	}
 	return true
 }
@@ -702,7 +729,8 @@ func (m *Monitor) ingestNginxEvidence(c *gin.Context) {
 			Status: event.Status, UpstreamStatus: event.UpstreamStatus, UpstreamAttempts: event.UpstreamAttempts, UpstreamStatuses: string(statuses), RequestMS: event.RequestMS,
 			UpstreamMS: event.UpstreamMS, UpstreamPresent: event.UpstreamPresent, ConnectMS: event.ConnectMS, HeaderMS: event.HeaderMS,
 			BytesSent: event.BytesSent, Completion: event.Completion,
-			NginxIDHMAC: event.NginxIDHMAC, OneAPIIDHMAC: event.OneAPIIDHMAC, HMACKeyID: in.HMACKeyID, BatchID: in.BatchID, ReceivedAt: now})
+			RequestLength: event.RequestLength, RequestLengthState: event.RequestLengthState, RequestLengthVersion: event.RequestLengthVersion,
+			NginxIDHMAC: event.NginxIDHMAC, OneAPIIDHMAC: event.OneAPIIDHMAC, OneAPIRequestID: event.OneAPIRequestID, HMACKeyID: in.HMACKeyID, BatchID: in.BatchID, ReceivedAt: now})
 	}
 	v2BaseOffset := int64(0)
 	v2CommitExpired := false
@@ -809,7 +837,7 @@ func (m *Monitor) ingestNginxEvidence(c *gin.Context) {
 					return err
 				}
 			}
-			if err := tx.Clauses(clause.OnConflict{DoNothing: true}).CreateInBatches(acceptedRows, 200).Error; err != nil {
+			if err := saveNginxEvidenceRows(tx, acceptedRows); err != nil {
 				return err
 			}
 		}
@@ -856,6 +884,10 @@ func (m *Monitor) ingestNginxEvidence(c *gin.Context) {
 	})
 	if errors.Is(err, errNginxEvidenceBatchConflict) {
 		c.JSON(http.StatusConflict, gin.H{"error": "batch id conflict"})
+		return
+	}
+	if errors.Is(err, errNginxEvidenceEventConflict) {
+		c.JSON(http.StatusConflict, gin.H{"error": "evidence event identity conflict"})
 		return
 	}
 	if errors.Is(err, errNginxEvidenceSourceConflict) {

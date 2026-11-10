@@ -25,6 +25,7 @@ type CustomerHealthDayCoverage struct {
 	TTFTCoverageFromTs    int64 `gorm:"column:ttft_coverage_from_ts"`
 	TTFTCoverageThroughTs int64 `gorm:"column:ttft_coverage_through_ts"`
 	UpdatedAt             int64 `gorm:"column:updated_at"`
+	ReplayNextTs          int64 `gorm:"column:replay_next_ts"`
 }
 
 type CustomerHealthHistoricalCoverage struct {
@@ -181,8 +182,12 @@ func (m *Monitor) runCustomerHealthHistoryTurnWith(ctx context.Context, now time
 			continue
 		}
 		from := min(requestThrough, frtThrough)
+		if row.ReplayNextTs >= day && row.ReplayNextTs < from {
+			from = row.ReplayNextTs
+		}
 		to := customerHealthSourceNext(from, target)
-		if _, err := sample(ctx, from, to); err != nil {
+		_, to, err = m.sampleCustomerHealthSourcePrefix(ctx, from, to, sample)
+		if err != nil {
 			return false, err
 		}
 		m.customerHealthCursorMu.Lock()
@@ -213,6 +218,7 @@ func (m *Monitor) runCustomerHealthHistoryTurnWith(ctx context.Context, now time
 			current.SemanticsVersion = customerHealthStabilityPolicyVersion
 			current.TTFTSemanticsVersion = ttftCoverageSemanticsVersion
 			current.UpdatedAt = time.Now().Unix()
+			current.ReplayNextTs = to
 			return tx.Save(&current).Error
 		})
 		m.customerHealthCursorMu.Unlock()
