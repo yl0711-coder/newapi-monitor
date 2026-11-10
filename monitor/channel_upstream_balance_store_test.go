@@ -111,7 +111,7 @@ func TestBalanceStoreUnitBoundaryRollbackAndRetry(t *testing.T) {
 			if busy {
 				failure = errors.New("database is locked (SQLITE_BUSY)")
 			}
-			if err := m.storeDB.Callback().Update().Before("gorm:update").Register("test:balance-fail", func(tx *gorm.DB) {
+			if err := m.queuedWriteStore().Callback().Update().Before("gorm:update").Register("test:balance-fail", func(tx *gorm.DB) {
 				if tx.Statement.Table == "channel_upstream_accounts" {
 					attempts++
 					if attempts == 1 {
@@ -171,33 +171,31 @@ func TestBalanceStoreRealLockDoesNotRepeatCredentialRefresh(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = locker.Close() })
 	locker.SetMaxOpenConns(1)
+	// Another connection holds the writer slot when the balance is saved. The
+	// queued writer takes the slot up front (BEGIN IMMEDIATE), so it waits for
+	// the lock instead of failing mid-transaction, and the upstream (with its
+	// one-time refresh token) is called only once.
 	committed := make(chan error, 1)
 	attempts := 0
-	if err := m.storeDB.Callback().Update().Before("gorm:update").Register("test:real-lock", func(tx *gorm.DB) {
-		if tx.Statement.Table != "channel_upstream_accounts" {
-			return
+	if err := m.queuedWriteStore().Callback().Update().Before("gorm:update").Register("test:real-lock", func(tx *gorm.DB) {
+		if tx.Statement.Table == "channel_upstream_accounts" {
+			attempts++
 		}
-		attempts++
-		if attempts != 1 {
-			return
-		}
-		if _, err := locker.Exec("BEGIN IMMEDIATE"); err != nil {
-			_ = tx.AddError(err)
-			return
-		}
-		if _, err := locker.Exec("INSERT INTO tracked_users(user_id, username) VALUES (99301, 'lock-fixture')"); err != nil {
-			_, _ = locker.Exec("ROLLBACK")
-			_ = tx.AddError(err)
-			return
-		}
-		go func() {
-			time.Sleep(120 * time.Millisecond)
-			_, err := locker.Exec("COMMIT")
-			committed <- err
-		}()
 	}); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := locker.Exec("BEGIN IMMEDIATE"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := locker.Exec("INSERT INTO tracked_users(user_id, username) VALUES (99301, 'lock-fixture')"); err != nil {
+		_, _ = locker.Exec("ROLLBACK")
+		t.Fatal(err)
+	}
+	go func() {
+		time.Sleep(120 * time.Millisecond)
+		_, err := locker.Exec("COMMIT")
+		committed <- err
+	}()
 	synced, err := m.syncStoredUpstreamAccount(t.Context(), row.Domain)
 	if err != nil {
 		t.Fatal(err)
@@ -210,7 +208,7 @@ func TestBalanceStoreRealLockDoesNotRepeatCredentialRefresh(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("real lock not released")
 	}
-	if attempts < 2 || refreshes.Load() != 1 || profiles.Load() != 1 || synced.BalanceUSD != 19.25 {
+	if attempts < 1 || refreshes.Load() != 1 || profiles.Load() != 1 || synced.BalanceUSD != 19.25 {
 		t.Fatalf("local retry refetched upstream or lost balance: attempts=%d refreshes=%d profiles=%d", attempts, refreshes.Load(), profiles.Load())
 	}
 	stored := loadBalanceAccount(t, m, row.Domain)
@@ -227,20 +225,30 @@ func TestBalanceStoreRevalidatesBetweenRetries(t *testing.T) {
 	m, observed := balanceStoreFixture(t)
 	next := observed
 	next.BalanceUSD = 999
-	attempts := 0
-	if err := m.storeDB.Callback().Update().Before("gorm:update").Register("test:concurrent-config", func(tx *gorm.DB) {
+	// The first attempt fails as busy; the configuration changes before the
+	// retry reads the account. The retry must reread and reject, not apply a
+	// stale balance. (A change inside one attempt cannot happen: the queued
+	// writer holds the writer slot for the whole transaction.)
+	attempts, changed := 0, false
+	w := m.queuedWriteStore()
+	if err := w.Callback().Update().Before("gorm:update").Register("test:concurrent-config", func(tx *gorm.DB) {
 		if tx.Statement.Table != "channel_upstream_accounts" {
 			return
 		}
 		attempts++
-		// External writer commits after this attempt's read snapshot. The
-		// retry must reread and reject, not apply a stale full-row upsert.
-		if err := m.storeDB.Exec("UPDATE channel_upstream_accounts SET credential = ? WHERE domain = ?", "new-ciphertext", observed.Domain).Error; err != nil {
-			_ = tx.AddError(err)
-		}
+		_ = tx.AddError(errors.New("database is locked (SQLITE_BUSY)"))
 	}); err != nil {
 		t.Fatal(err)
 	}
+	upstreamLocalStoreBetweenRetries = func() {
+		if !changed {
+			changed = true
+			if err := m.storeDB.Exec("UPDATE channel_upstream_accounts SET credential = ? WHERE domain = ?", "new-ciphertext", observed.Domain).Error; err != nil {
+				t.Error(err)
+			}
+		}
+	}
+	t.Cleanup(func() { upstreamLocalStoreBetweenRetries = nil })
 	if err := m.persistUpstreamBalanceResult(t.Context(), observed, &next); !errors.Is(err, errUpstreamBalanceSuperseded) {
 		t.Fatalf("retry failed to revalidate: %v", err)
 	}

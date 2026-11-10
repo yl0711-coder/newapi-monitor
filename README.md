@@ -70,6 +70,7 @@ docker run -d --name newapi-monitor \
 | `MONITOR_UPSTREAM_SYNC_ENABLED` | 上游余额后台同步开关；上游故障/风控维护窗口可临时关闭 | `true` |
 | `MONITOR_UPSTREAM_SYNC_MINUTES` | NewAPI / Sub2API 上游账户余额正常同步间隔；失败自动指数退避 | `5` |
 | `MONITOR_UPSTREAM_SYNC_TIMEOUT_SECONDS` | 单个上游同步请求超时 | `15` |
+| `MONITOR_UPSTREAM_USAGE_TIMEOUT_SECONDS` | 单个上游使用日志请求超时（日志查询通常比余额慢；不低于上一项，最多 120） | `45` |
 | `MONITOR_UPSTREAM_USAGE_SYNC_ENABLED` | 上游消费日志后台同步的独立灰度闸门；首次发布不会访问上游，验证后再显式开启 | `false` |
 | `MONITOR_UPSTREAM_USAGE_SYNC_MINUTES` | 上游消费账单当天尾部刷新间隔；支持 NewAPI 分页日志、Sub2API 小时汇总（旧版回退单日汇总）和 AICodeWith 按 Key 日账单；AICodeWith 始终至少 30 分钟 | `20` |
 | `MONITOR_UPSTREAM_MAX_CONCURRENCY` | 不同上游主机的全局并发上限；同一主机始终串行，当前硬上限为 2，生产先以 1 灰度 | `1` |
@@ -84,6 +85,7 @@ docker run -d --name newapi-monitor \
 | `MONITOR_USAGE_FACTS_STORE_PATH` | 独立用量事实库路径；与主库分文件，避免补数/WAL/损坏影响控制数据 | `<MONITOR_STORE_PATH 目录>/usage-facts.db` |
 | `MONITOR_STORE_BACKUP_ENABLED` | 运行期在线日备份开关；不影响启动时强制迁移前快照 | `true` |
 | `MONITOR_STORE_BACKUP_DIR` | 在线备份和迁移前成套快照目录 | `<MONITOR_STORE_PATH 目录>/backups` |
+| `MONITOR_STORE_BACKUP_DAILY_AT` | 每天固定时刻（UTC，`HH:MM`）做成套备份；重启不改变时刻，重启时若已错过最近一次时刻会在启动 5 分钟后补做一次。设置后取代按间隔备份；格式无效时记录警告并回退间隔模式 | 空 |
 | `MONITOR_STORE_BACKUP_RETENTION` | 已验证 main+facts `backup-set` 成套备份保留数 | `7` |
 | `MONITOR_STORE_BACKUP_RETENTION_DAYS` | `0` 保持按套数保留；正数改为保留最近 N 个有备份的北京时间自然日，每日最新一套，另保护最近两套（最多 N+1 套）。停机不清空旧恢复点；启用后重启可延续同一数据卷经核验的备份周期。仅管理在线 `backup-set`，不管理发布/迁移/修复备份 | `0` |
 | `MONITOR_STORE_MIGRATION_BACKUP_RETENTION` | main+facts 同一 manifest 的迁移前快照批次保留数 | `3` |

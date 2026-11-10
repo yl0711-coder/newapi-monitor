@@ -2,9 +2,9 @@ package monitor
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"math"
+	"sort"
 	"strings"
 )
 
@@ -127,17 +127,72 @@ func channelInternalUsageByChannelGroup(evidence financeConfiguredInternalEviden
 	return result, nil
 }
 
-func subtractChannelInternalUsage(row *channelManagementUsageRow, fact channelInternalUsageFact) error {
+// ChannelManagementDataWarning reports a channel×group whose configured
+// internal-account usage (log-derived facts) exceeds the sampled channel usage
+// for the same scope. That means sampled hours are missing; the row is shown
+// clamped at zero and flagged instead of failing the whole report.
+type ChannelManagementDataWarning struct {
+	Kind            string  `json:"kind"`
+	ChannelID       int     `json:"channel_id"`
+	Group           string  `json:"group"`
+	MissingRequests int64   `json:"missing_requests"`
+	MissingTokens   int64   `json:"missing_tokens"`
+	MissingQuota    int64   `json:"missing_quota"`
+	Hours           []int64 `json:"hours,omitempty"`
+	HoursTruncated  bool    `json:"hours_truncated,omitempty"`
+}
+
+const channelDataWarningInternalExceedsSampled = "internal_exceeds_sampled"
+
+// subtractChannelInternalUsage removes configured internal-account usage. When
+// the sampled row is smaller (missing sampler hours), it clamps at zero and
+// returns the shortfall so the caller can report it; it never fails the report.
+func subtractChannelInternalUsage(row *channelManagementUsageRow, fact channelInternalUsageFact) (channelInternalUsageFact, bool) {
+	var shortfall channelInternalUsageFact
 	if row == nil {
-		return nil
+		return shortfall, false
 	}
-	row.Requests -= fact.Requests
-	row.Tokens -= fact.Tokens
-	row.Quota -= fact.Quota
-	if row.Requests < 0 || row.Tokens < 0 || row.Quota < 0 {
-		return errors.New("内部账号用量超过渠道管理同口径用量")
+	clamp := func(value *int64, sub int64, missing *int64) {
+		*value -= sub
+		if *value < 0 {
+			*missing = -*value
+			*value = 0
+		}
 	}
-	return nil
+	clamp(&row.Requests, fact.Requests, &shortfall.Requests)
+	clamp(&row.Tokens, fact.Tokens, &shortfall.Tokens)
+	clamp(&row.Quota, fact.Quota, &shortfall.Quota)
+	return shortfall, shortfall.Requests > 0 || shortfall.Tokens > 0 || shortfall.Quota > 0
+}
+
+const channelDataWarningMaxHours = 48
+
+// channelInternalShortfallHours finds the hours where internal facts exceed the
+// sampled usage for one channel×group, so operators know which hours to repair.
+func channelInternalShortfallHours(internal financeConfiguredInternalEvidence, sampled map[int64]channelInternalUsageFact, channelID int, group string) ([]int64, bool) {
+	byHour := map[int64]channelInternalUsageFact{}
+	for _, row := range internal.Rows {
+		if row.ChannelID != channelID || strings.TrimSpace(row.Grp) != group {
+			continue
+		}
+		fact := byHour[row.HourTs]
+		fact.Requests += row.Requests
+		fact.Tokens += row.Tokens
+		fact.Quota += row.ConsumeQuota
+		byHour[row.HourTs] = fact
+	}
+	hours := make([]int64, 0, len(byHour))
+	for hour, fact := range byHour {
+		got := sampled[hour]
+		if fact.Requests > got.Requests || fact.Tokens > got.Tokens || fact.Quota > got.Quota {
+			hours = append(hours, hour)
+		}
+	}
+	sort.Slice(hours, func(i, j int) bool { return hours[i] < hours[j] })
+	if len(hours) > channelDataWarningMaxHours {
+		return hours[:channelDataWarningMaxHours], true
+	}
+	return hours, false
 }
 
 // financeInternalCostDomainComplete isolates evidence failures by upstream

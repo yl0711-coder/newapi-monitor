@@ -96,3 +96,21 @@ func upstreamProbeBeforeRetry(ctx context.Context, m *Monitor, row ChannelUpstre
 	}
 	return err
 }
+
+// upstreamPauseRetryAt reports outcomes that are not upstream failures: the
+// local store was busy, or the host circuit is open after an earlier failure.
+// The account keeps its last status and error and is simply retried later, so
+// the console shows only problems that need attention.
+func upstreamPauseRetryAt(err error, now int64) (int64, bool) {
+	if isUpstreamUsageLocalStoreBusy(err) {
+		return now + int64(upstreamUsageLocalStoreRetryDelays[0]/time.Second), true
+	}
+	var circuit *upstreamCircuitOpenError
+	if errors.As(err, &circuit) {
+		if circuit.RetryAt > now {
+			return circuit.RetryAt, true
+		}
+		return now + 60, true
+	}
+	return 0, false
+}

@@ -49,6 +49,10 @@ type Monitor struct {
 	prodDB                *sql.DB              // new-api 生产库【只读】连接(采样器周期查询 + 用户用量按需查询);nil = 未连接
 	portalLogColumns      portalLogColumnCache // Usage 可选来源列元数据缓存；不迁移业务表
 	storeDB               *gorm.DB             // 本地采样库
+	queuedWriteMu         sync.Mutex           // guards queuedWriteDB
+	queuedWriteDB         *gorm.DB             // 后台排队写连接(BEGIN IMMEDIATE，单连接)
+	queuedWriteClosed     bool                 // set by Close; no reopen afterwards
+	queuedWriteRetryAt    time.Time            // after a failed open, fall back until then
 	// usageFactsDB 独立承载高增长的用量小时/日事实、同步水位和资料快照。
 	// 生产通过 New 创建时默认与 storeDB 分文件，避免补数、WAL 膨胀、损坏或
 	// 写锁把告警配置、渠道配置和其他 Monitor 页面一起拖垮。测试直接调用
@@ -464,7 +468,7 @@ func New(s Settings) (*Monitor, error) {
 		chNames:                      map[string]string{},
 		snapCache:                    map[snapshotCacheKey]cachedSnap{},
 		usageCache:                   newUsageResultCache(s),
-		upstreamClient:               newUpstreamHTTPClient(upstreamSyncTimeout(s)),
+		upstreamClient:               newMonitorUpstreamHTTPClient(s),
 		cloudWatchLogs:               newCloudWatchLogsRuntime(s.CloudWatchLogsEnabled, nil),
 		upstreamCredentialPersistent: credentialSecretConfigured,
 		sourceFailureNotify:          make(chan struct{}, 1),
@@ -1082,6 +1086,7 @@ func (m *Monitor) Close() {
 				_ = db.Close()
 			}
 		}
+		m.closeQueuedWriteStore()
 		if m.storeDB != nil {
 			if db, err := m.storeDB.DB(); err == nil {
 				_ = db.Close()

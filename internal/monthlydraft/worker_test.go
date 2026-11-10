@@ -75,7 +75,17 @@ func TestLocalWorkerStartupDuplicateOwnersAndCachedMoney(t *testing.T) {
 	if err := w.Serve(ctx); !errors.Is(err, ErrGenerationBusy) {
 		t.Fatal("same runner entered twice", err)
 	}
-	artifact, err := f.g.Run(context.Background(), job.Request.Owner, job.ID)
+	// DraftReady is published before the worker releases its run slot; under
+	// the race detector the cached read can arrive in between. Busy is the
+	// documented answer then, so wait for the slot instead of failing.
+	var artifact GenerationArtifact
+	var err error
+	for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(10 * time.Millisecond) {
+		artifact, err = f.g.Run(context.Background(), job.Request.Owner, job.ID)
+		if !errors.Is(err, ErrGenerationBusy) || time.Now().After(deadline) {
+			break
+		}
+	}
 	if err != nil {
 		t.Fatal(err)
 	}

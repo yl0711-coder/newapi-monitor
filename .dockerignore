@@ -17,6 +17,8 @@ monitor/**
 !monitor/*.html
 !monitor/*.js
 !monitor/*.css
+# Cell styles of the customer-approved monthly statement (embedded).
+!monitor/portal_monthly_simple_styles.xml
 !monitor/public/
 monitor/public/**
 !monitor/public/*.go

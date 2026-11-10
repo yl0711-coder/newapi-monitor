@@ -39,6 +39,12 @@ func monthlyGenerationConfig(getenv func(string) string, s monitor.Settings) (mo
 		return cfg, errors.New("monthly generation requires the Usage listener and monthly statements")
 	}
 	cfg.mode = getenv("MONITOR_PORTAL_MONTHLY_GENERATION_MODE")
+	if cfg.mode == "simple" {
+		// Simple generator: read replica + verified usage facts, published via
+		// the existing validated path. Other monthly generation settings are
+		// ignored so switching back to a previous mode needs no other edits.
+		return cfg, nil
+	}
 	cfg.scopeSource = getenv("MONITOR_PORTAL_MONTHLY_GENERATION_SCOPE_SOURCE")
 	cfg.displaySeriesIndex = getenv("MONITOR_PORTAL_MONTHLY_GENERATION_DISPLAY_SERIES_INDEX")
 	if cfg.displaySeriesIndex != "" && cfg.mode != "automatic-series" {

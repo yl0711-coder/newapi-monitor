@@ -5,6 +5,10 @@ import (
 	"time"
 )
 
+// upstreamLocalStoreBetweenRetries is a test seam: it runs after a busy
+// attempt has finished and before the next one starts. Nil in production.
+var upstreamLocalStoreBetweenRetries func()
+
 // Shared by verified, idempotent local writes only. Never include an upstream
 // HTTP request or credential refresh in operation. Each attempt must own and
 // finish its transaction before returning (and before waiting).
@@ -17,6 +21,9 @@ func retryUpstreamLocalStore(ctx context.Context, operation func() error) error 
 		err := operation()
 		if err == nil || !isUpstreamUsageLocalStoreBusy(err) || attempt >= len(delays) {
 			return err
+		}
+		if upstreamLocalStoreBetweenRetries != nil {
+			upstreamLocalStoreBetweenRetries()
 		}
 		timer := time.NewTimer(delays[attempt])
 		select {
