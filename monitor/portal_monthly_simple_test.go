@@ -3,6 +3,7 @@ package monitor
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"math/rand"
 	"net/http"
 	"net/http/httptest"
@@ -827,5 +828,54 @@ func TestSimpleMonthlyGenerationCreditTotalsPerAccountWithinCent(t *testing.T) {
 		if !simpleWithinCent(a.CreditCents, a.CreditRaw) {
 			t.Fatalf("user %d credit shown %d cents, true %d quota", a.UserID, a.CreditCents, a.CreditRaw)
 		}
+	}
+}
+
+// Publication failures have their own budget: waiting retries earlier in the
+// same request (facts not ready, balance moving) do not use it up.
+func TestSimpleMonthlyGenerationPublicationRetriesOwnBudget(t *testing.T) {
+	m, svc, _, _, g, _ := simpleTestService(t)
+	ctx := context.Background()
+	job := PortalMonthlySimpleJob{GroupID: g.ID, Month: "2026-10", AuthVersion: g.PortalAuthVer, State: simpleJobRunning, Attempts: 7, CreatedAt: 1, UpdatedAt: 1}
+	if err := m.storeDB.Create(&job).Error; err != nil {
+		t.Fatal(err)
+	}
+	for i := 1; i <= simplePublishAttempts; i++ {
+		svc.finish(ctx, job, errSimplePublication("publication: busy"))
+		if err := m.storeDB.First(&job, "group_id = ? AND month = ?", g.ID, "2026-10").Error; err != nil {
+			t.Fatal(err)
+		}
+		want := simpleJobRetry
+		if i == simplePublishAttempts {
+			want = simpleJobReview
+		}
+		if job.State != want || job.PublishAttempts != i {
+			t.Fatalf("publication failure %d: state %s publish_attempts %d (want %s)", i, job.State, job.PublishAttempts, want)
+		}
+	}
+}
+
+// Clicking again while a request runs keeps its progress clock, and an attempt
+// that still holds the previous organization version runs again with the new
+// one instead of being held for review.
+func TestSimpleMonthlyGenerationResubmitWhileRunning(t *testing.T) {
+	m, svc, _, _, g, _ := simpleTestService(t)
+	ctx := context.Background()
+	old := PortalMonthlySimpleJob{GroupID: g.ID, Month: "2026-10", AuthVersion: g.PortalAuthVer - 1, State: simpleJobRunning, LeaseUntil: svc.now().Unix() + 600, CreatedAt: 100, UpdatedAt: 200}
+	if err := m.storeDB.Create(&old).Error; err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.SubmitMonthly(ctx, g.ID, g.PortalAuthVer, "2026-10"); err != nil {
+		t.Fatal(err)
+	}
+	var job PortalMonthlySimpleJob
+	m.storeDB.First(&job, "group_id = ? AND month = ?", g.ID, "2026-10")
+	if job.State != simpleJobRunning || job.UpdatedAt != 200 || job.AuthVersion != g.PortalAuthVer {
+		t.Fatalf("resubmit while running: %+v", job)
+	}
+	err := svc.generate(ctx, old)
+	var retry errSimpleRetry
+	if !errors.As(err, &retry) {
+		t.Fatalf("stale-version attempt: %v (want retry)", err)
 	}
 }

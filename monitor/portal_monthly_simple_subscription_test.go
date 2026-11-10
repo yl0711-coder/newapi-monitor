@@ -7,10 +7,13 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"gorm.io/gorm"
 )
 
 // Subscription-paid usage is split out of the wallet: balances follow the
@@ -150,6 +153,40 @@ func TestSimpleMonthlyGenerationSubscription(t *testing.T) {
 	// A bill without subscription activity keeps the plain template.
 	if _, err := simpleStatementXLSX(monthlyStatement{}, nil); err == nil {
 		t.Fatal("incomplete statement exported")
+	}
+
+	// Once issued, the subscription part is never rewritten: not when the
+	// issued-bill lookup fails, and not when the lookup misses a legacy row,
+	// even though the inputs have changed since (the plan price was edited).
+	var issuedSub PortalMonthlySimpleSubscription
+	m.storeDB.First(&issuedSub, "group_id = ? AND month = ?", g.ID, "2026-10")
+	svc.SetSubscriptionPlans(map[int64]simplePlan{2: {Name: "GPT模型调用服务月卡", PriceCents: 900000}}, map[int64]simplePlan{16: {Trial: true}})
+	failLookup := true
+	if err := m.storeDB.Callback().Query().Before("gorm:query").Register("test:fail-saved-bill-lookup", func(db *gorm.DB) {
+		if failLookup && db.Statement.Table == "portal_monthly_bills" && len(db.Statement.Selects) > 0 {
+			_ = db.AddError(errors.New("disk I/O error"))
+		}
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.SubmitMonthly(ctx, g.ID, g.PortalAuthVer, "2026-10"); err != nil {
+		t.Fatal(err)
+	}
+	svc.runOne(ctx)
+	failLookup = false
+	var fp string
+	m.storeDB.Model(&PortalMonthlyBill{}).Where("group_id = ? AND month = ?", g.ID, "2026-10").Pluck("member_fingerprint", &fp)
+	m.storeDB.Model(&PortalMonthlyBill{}).Where("group_id = ? AND month = ?", g.ID, "2026-10").Update("member_fingerprint", "")
+	m.storeDB.Model(&PortalMonthlySimpleJob{}).Where("group_id = ? AND month = ?", g.ID, "2026-10").Updates(map[string]any{"state": simpleJobQueued, "lease_until": 0, "next_at": 0})
+	svc.runOne(ctx)
+	m.storeDB.Model(&PortalMonthlyBill{}).Where("group_id = ? AND month = ?", g.ID, "2026-10").Update("member_fingerprint", fp)
+	var afterSub PortalMonthlySimpleSubscription
+	m.storeDB.First(&afterSub, "group_id = ? AND month = ?", g.ID, "2026-10")
+	if afterSub.Digest != issuedSub.Digest || afterSub.Data != issuedSub.Data {
+		t.Fatal("subscription part of an issued bill was rewritten")
+	}
+	if w := portalDo(r, "GET", "/api/monthly-statement?month=2026-10", "", cookie); w.Code != 200 {
+		t.Fatalf("issued bill unreadable after regeneration: %d %s", w.Code, w.Body.String())
 	}
 }
 

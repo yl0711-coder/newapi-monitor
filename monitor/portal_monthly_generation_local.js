@@ -48,6 +48,7 @@
     }
     if (pending.state === 'finalizing') return {pct: 97, text: '正在保存账单…'};
     if (pending.state === 'needs_review') return {pct: 0, text: '该月账单暂未生成，请联系客服协助处理。', stopped: true};
+    if (pending.state === 'paused') return {pct: 0, text: '已暂停自动刷新进度，可点击刷新进度查看；不会重复提交。', stopped: true, paused: true};
     return null;
   }
   function renderPending() {
@@ -64,7 +65,7 @@
     const tr = old || document.createElement('tr');
     tr.id = 'monthlyGenRow';
     const bar = view.stopped ? '' : '<div style="height:8px;background:#e5edf5;border-radius:4px;overflow:hidden;margin-bottom:6px"><i style="display:block;height:100%;width:' + view.pct.toFixed(1) + '%;background:#1f4e78;transition:width 1s linear"></i></div>';
-    tr.innerHTML = '<td>' + pending.month + '</td><td colspan="' + Math.max(1, cols - 3) + '">' + bar + '<span style="color:#475569">' + view.text + (view.stopped ? '' : '（可离开此页面，完成后在列表中查看）') + '</span></td><td>' + (view.stopped ? '未生成' : '生成中') + '</td><td>—</td>';
+    tr.innerHTML = '<td>' + pending.month + '</td><td colspan="' + Math.max(1, cols - 3) + '">' + bar + '<span style="color:#475569">' + view.text + (view.stopped ? '' : '（可离开此页面，完成后在列表中查看）') + '</span></td><td>' + (view.paused ? '状态待刷新' : view.stopped ? '未生成' : '生成中') + '</td><td>—</td>';
     if (!old) body.insertBefore(tr, body.firstChild);
   }
   function setPending(month, state, progress) {
@@ -75,6 +76,13 @@
       pending = null;
     }
     if ((!pending || pending.state === 'needs_review') && ticker) { cancelEvery(ticker); ticker = null; }
+    renderPending();
+  }
+  // Polling stopped (busy server, error, poll limit): the bar must not keep
+  // advancing as if the job were progressing. Keeps the row, stops the clock.
+  function pausePending(month) {
+    if (ticker) { cancelEvery(ticker); ticker = null; }
+    if (pending && pending.month === month && pending.state !== 'needs_review') pending = {month, state: 'paused', progress: null, at: Date.now()};
     renderPending();
   }
   if ($('monthlyContent') && typeof MutationObserver === 'function') {
@@ -178,6 +186,7 @@
           }
         }
         status.textContent = response.status === 429 ? '服务暂忙，已停止自动刷新；请稍后刷新进度。' : '暂未确认生成状态，请刷新进度；已发布账单不受影响。';
+        pausePending(month);
         return;
       }
       const data = await response.json();
@@ -193,10 +202,10 @@
       }
       if (state === 'queued' || state === 'processing' || state === 'finalizing') {
         if (++polls < 120) timer = setTimeout(() => { timer = null; void request(false); }, 5000);
-        else status.textContent += ' 已暂停自动刷新，可手动刷新进度。';
+        else { status.textContent += ' 已暂停自动刷新，可手动刷新进度。'; pausePending(month); }
       }
     } catch (_) {
-      if (current()) { state = ''; status.textContent = timedOut ? '请求超时，请刷新进度确认是否已受理；不会自动重复提交。' : '暂时无法读取进度，请稍后刷新；不会自动重复提交。'; }
+      if (current()) { state = ''; status.textContent = timedOut ? '请求超时，请刷新进度确认是否已受理；不会自动重复提交。' : '暂时无法读取进度，请稍后刷新；不会自动重复提交。'; pausePending(month); }
     } finally {
       clearTimeout(timeout);
       if (write) posting = false;

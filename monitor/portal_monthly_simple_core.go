@@ -30,6 +30,14 @@ func (e errSimpleRetry) Error() string { return "retry: " + string(e) }
 
 type errSimpleReview string
 
+// errSimplePublication is a failed publication: retried, but held for review
+// after simplePublishAttempts failures (e.g. a conflicting saved bill).
+type errSimplePublication string
+
+func (e errSimplePublication) Error() string { return "retry: " + string(e) }
+
+const simplePublishAttempts = 3
+
 func (e errSimpleReview) Error() string { return "review: " + string(e) }
 
 type simpleBoundaryKey struct {

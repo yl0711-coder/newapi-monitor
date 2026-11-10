@@ -33,11 +33,14 @@ type PortalMonthlySimpleJob struct {
 	AuthVersion int64
 	State       string `gorm:"size:16;index"` // queued, running, retry, review, done
 	Attempts    int
-	NextAt      int64
-	LeaseUntil  int64
-	LastError   string `gorm:"size:512"` // internal only, never returned to customers
-	CreatedAt   int64
-	UpdatedAt   int64
+	// PublishAttempts counts failed publications only; earlier waiting
+	// retries (facts not ready, balance moving) must not use them up.
+	PublishAttempts int `gorm:"not null;default:0"`
+	NextAt          int64
+	LeaseUntil      int64
+	LastError       string `gorm:"size:512"` // internal only, never returned to customers
+	CreatedAt       int64
+	UpdatedAt       int64
 }
 
 // PortalMonthlySimpleBoundary freezes an account's month-boundary balance the
@@ -387,20 +390,22 @@ func (g *SimpleMonthlyGeneration) SubmitMonthly(ctx context.Context, gid, versio
 	//   - review: requeue when the organization changed (new auth version), or
 	//     when the customer asks again at least simpleReviewRetryAfter seconds
 	//     after it was held (data may have settled, e.g. a later month issued);
-	//   - queued/running/retry: unchanged.
+	//   - queued/running/retry: unchanged, including updated_at (the progress
+	//     clock); a new auth version is picked up by the next attempt.
 	// Every expression on the right reads the row as it was before the update.
 	var state string
 	err = g.m.storeDB.WithContext(ctx).Raw(`INSERT INTO portal_monthly_simple_jobs
-(group_id, month, auth_version, state, attempts, next_at, lease_until, last_error, created_at, updated_at)
-VALUES (?, ?, ?, ?, 0, ?, 0, '', ?, ?)
+(group_id, month, auth_version, state, attempts, publish_attempts, next_at, lease_until, last_error, created_at, updated_at)
+VALUES (?, ?, ?, ?, 0, 0, ?, 0, '', ?, ?)
 ON CONFLICT (group_id, month) DO UPDATE SET
   state = CASE WHEN state = ? OR (state = ? AND (auth_version <> excluded.auth_version OR updated_at <= excluded.updated_at - ?)) THEN ? ELSE state END,
   attempts = CASE WHEN state = ? OR (state = ? AND (auth_version <> excluded.auth_version OR updated_at <= excluded.updated_at - ?)) THEN 0 ELSE attempts END,
+  publish_attempts = CASE WHEN state = ? OR (state = ? AND (auth_version <> excluded.auth_version OR updated_at <= excluded.updated_at - ?)) THEN 0 ELSE publish_attempts END,
   next_at = CASE WHEN state = ? OR (state = ? AND (auth_version <> excluded.auth_version OR updated_at <= excluded.updated_at - ?)) THEN excluded.next_at ELSE next_at END,
   lease_until = CASE WHEN state = ? OR (state = ? AND (auth_version <> excluded.auth_version OR updated_at <= excluded.updated_at - ?)) THEN 0 ELSE lease_until END,
   last_error = CASE WHEN state = ? OR (state = ? AND (auth_version <> excluded.auth_version OR updated_at <= excluded.updated_at - ?)) THEN '' ELSE last_error END,
   auth_version = excluded.auth_version,
-  updated_at = CASE WHEN state = ? AND auth_version = excluded.auth_version AND updated_at > excluded.updated_at - ? THEN updated_at ELSE excluded.updated_at END
+  updated_at = CASE WHEN state IN (?, ?, ?) OR (state = ? AND auth_version = excluded.auth_version AND updated_at > excluded.updated_at - ?) THEN updated_at ELSE excluded.updated_at END
 RETURNING state`,
 		gid, month, version, simpleJobQueued, now, now, now,
 		simpleJobDone, simpleJobReview, simpleReviewRetryAfter, simpleJobQueued,
@@ -408,7 +413,8 @@ RETURNING state`,
 		simpleJobDone, simpleJobReview, simpleReviewRetryAfter,
 		simpleJobDone, simpleJobReview, simpleReviewRetryAfter,
 		simpleJobDone, simpleJobReview, simpleReviewRetryAfter,
-		simpleJobReview, simpleReviewRetryAfter).Scan(&state).Error
+		simpleJobDone, simpleJobReview, simpleReviewRetryAfter,
+		simpleJobQueued, simpleJobRunning, simpleJobRetry, simpleJobReview, simpleReviewRetryAfter).Scan(&state).Error
 	if err != nil || state == "" {
 		slog.Warn("月度账单生成申请保存失败", "group", gid, "month", month, "err", err)
 		return MonthlyGenerationView{}, MonthlyGenerationFailure("temporarily_unavailable")
@@ -437,7 +443,7 @@ func (g *SimpleMonthlyGeneration) Start(ctx context.Context) error {
 func (g *SimpleMonthlyGeneration) requeueHeld(ctx context.Context) {
 	now := g.now().Unix()
 	res := g.m.storeDB.WithContext(ctx).Model(&PortalMonthlySimpleJob{}).Where("state = ?", simpleJobReview).
-		Updates(map[string]any{"state": simpleJobQueued, "attempts": 0, "next_at": now, "lease_until": 0, "updated_at": now})
+		Updates(map[string]any{"state": simpleJobQueued, "attempts": 0, "publish_attempts": 0, "next_at": now, "lease_until": 0, "updated_at": now})
 	if res.Error != nil {
 		slog.Warn("月度账单待复核任务重新排队失败", "err", res.Error)
 	} else if res.RowsAffected > 0 {
@@ -525,6 +531,16 @@ func (g *SimpleMonthlyGeneration) finish(ctx context.Context, job PortalMonthlyS
 		// by the shutdown, not by the bill. Resume first thing after restart,
 		// without counting an attempt; a bill already issued is detected then.
 		updates["state"], updates["next_at"], updates["last_error"] = simpleJobQueued, now, "interrupted by shutdown"
+	case errors.As(err, new(errSimplePublication)):
+		attempts, published := job.Attempts+1, job.PublishAttempts+1
+		updates["attempts"], updates["publish_attempts"] = attempts, published
+		updates["last_error"] = simpleTrim(err.Error())
+		if published >= simplePublishAttempts || attempts >= g.maxAttempts {
+			updates["state"] = simpleJobReview
+		} else {
+			delay := time.Duration(30<<min(attempts, 5)) * time.Second
+			updates["state"], updates["next_at"] = simpleJobRetry, now+int64(delay/time.Second)
+		}
 	case errors.As(err, &retry) || !errors.As(err, new(errSimpleReview)):
 		attempts := job.Attempts + 1
 		updates["attempts"] = attempts
@@ -566,16 +582,31 @@ func simpleTrim(s string) string {
 	return s
 }
 
+var errSimpleBillAlreadyIssued = errors.New("monthly bill already issued")
+
 // generate builds and publishes one bill.
 func (g *SimpleMonthlyGeneration) generate(ctx context.Context, job PortalMonthlySimpleJob) error {
 	scope, err := LoadMonthlyGenerationScope(ctx, g.m.storeDB, job.GroupID, job.AuthVersion)
 	if errors.Is(err, ErrMonthlyGenerationUnauthorized) {
+		// A newer request for the changed organization arrived while this
+		// attempt held the old version: run again with it, not review.
+		var current int64
+		if e := g.m.storeDB.WithContext(ctx).Model(&PortalMonthlySimpleJob{}).Where("group_id = ? AND month = ?", job.GroupID, job.Month).
+			Pluck("auth_version", &current).Error; e == nil && current != job.AuthVersion {
+			return errSimpleRetry("organization changed; a newer request is pending")
+		}
 		return errSimpleReview("organization authorization changed since the request")
 	}
 	if err != nil {
 		return errSimpleRetry("authorization store: " + err.Error())
 	}
-	if saved, err := g.m.monthlyGenerationSavedBill(ctx, scope, job.Month); err == nil && saved != nil {
+	// A failed lookup must not be read as "not issued": regenerating would
+	// rewrite the subscription part that an issued bill is verified against.
+	saved, err := g.m.monthlyGenerationSavedBill(ctx, scope, job.Month)
+	if err != nil {
+		return errSimpleRetry("saved bill lookup: " + err.Error())
+	}
+	if saved != nil {
 		return nil // already issued
 	}
 	ids := scope.UserIDs
@@ -664,9 +695,23 @@ func (g *SimpleMonthlyGeneration) generate(ctx context.Context, job PortalMonthl
 		return errSimpleRetry("freeze: " + err.Error())
 	}
 	// Stored before publication (a reader verifies it against the digest in
-	// the published evidence); replaced freely until the bill is issued.
+	// the published evidence); replaced freely until the bill is issued, and
+	// never after: the check and the write share one transaction.
 	if subRow != nil {
-		if err := g.m.storeDB.WithContext(ctx).Clauses(clause.OnConflict{UpdateAll: true}).Create(subRow).Error; err != nil {
+		err := g.m.storeDB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+			var issued int64
+			if err := tx.Model(&PortalMonthlyBill{}).Where("group_id = ? AND month = ?", job.GroupID, job.Month).Count(&issued).Error; err != nil {
+				return err
+			}
+			if issued > 0 {
+				return errSimpleBillAlreadyIssued
+			}
+			return tx.Clauses(clause.OnConflict{UpdateAll: true}).Create(subRow).Error
+		})
+		if errors.Is(err, errSimpleBillAlreadyIssued) {
+			return errSimpleRetry("bill already issued; re-reading it")
+		}
+		if err != nil {
 			return errSimpleRetry("subscription store: " + err.Error())
 		}
 	}
@@ -674,10 +719,7 @@ func (g *SimpleMonthlyGeneration) generate(ctx context.Context, job PortalMonthl
 	if _, err := g.m.PublishMonthlyBillForAuthorization(ctx, raw, expected); err != nil {
 		// Membership changed during generation, a busy store, ...: try again
 		// twice; a failure that persists (e.g. a conflicting saved bill) is held.
-		if job.Attempts < 2 {
-			return errSimpleRetry("publication: " + err.Error())
-		}
-		return errSimpleReview("publication: " + err.Error())
+		return errSimplePublication("publication: " + err.Error())
 	}
 	g.saveAudit(ctx, job, out, ref)
 	return nil
