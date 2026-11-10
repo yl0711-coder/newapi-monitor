@@ -131,7 +131,7 @@ go test -race -list . ./internal/monthlydraft | node dev/race-plan.mjs monthly -
 
 ## 6. 排查失败
 
-- **哪个测试失败**：在失败的 race 任务日志末尾，`dev/run-race-job.sh` 会列出 `failed: <测试名>`；Summary 页列出失败和未完成的测试。
+- **哪个测试失败**：在失败的 race 任务日志末尾，`dev/run-race-job.sh` 会列出 `failed: <测试名>`，以及是否做了重跑、不重跑的原因（`not re-run: …`）；Summary 页列出失败和未完成的测试，以及偶发失败清单。
 - **完整输出**：每个进程的 Go 测试事件保存在任务的 artifact（`monitor-race-<n>` / `monthly-race-<n>`）里，保留 7 天。
 - **本地复现某个任务**（和 CI 完全相同的分配和并行方式）：
 
@@ -144,11 +144,40 @@ go test -race -list . ./internal/monthlydraft | node dev/race-plan.mjs monthly -
 
 ## 7. 偶发失败（flaky）的处理
 
-- 偶发失败不能靠"重跑通过"就当作没发生。重跑可以先让发布继续，但必须记录失败的测试名和原因，并在下一个版本里修掉。
-- 常见原因：真实时间等待、对执行时间的断言太紧、依赖机器速度。修法见第 4 节。
-- 已知并已修复的例子：`TestArchiveFullRecordBoundRoundtrip`（race 下盘点时限过紧）。
-- 已知并已列入串行任务：全部 `TestToken*` 测试（轮次、提交、清理的时间预算在并行负载下提前耗尽），以及 monthly 的 `TestRetentionFullReceiverPayloadPerformance`。
-- 已知待观察：`internal/usagebill/exportjobs` 的 `TestExpiryAndCancellationPreserveOpenLeaseOnly`，机器很忙时偶发"产物未清理"；`TestTokenDetectionFairnessMinuteBacklogRestartRecovery`（race 下约 6 分钟，每轮有 5 秒时限）。
+### 自动重跑一次
+
+race 任务里有测试失败时，`dev/run-race-job.sh` 会等这台机器上的所有进程结束，再把失败的测试**单独重跑一次**（同一台机器上不再有其他测试争用 CPU）：
+
+- 重跑通过：任务通过，但会在 PR 页面标出黄色警告（"Flaky race test"），并在 Summary 里列出"Flaky race tests"清单；
+- 重跑仍然失败：任务失败；
+- 以下情况**不重跑，直接失败**，因为它们不是机器快慢造成的：
+  - 报告了数据竞争（`WARNING: DATA RACE`）；
+  - 测试 panic，或测试程序整体超时；
+  - 进程失败但找不到是哪个测试失败；
+  - 同一个任务里失败的测试超过 5 个（`dev/race-failures.mjs` 的 `raceRerunMaxTests`），这说明是系统性问题。
+
+判断逻辑在 `dev/race-failures.mjs`，单元测试在 `dev/tests/race-failures.test.mjs`。
+
+### 偶发失败必须修
+
+重跑只是为了不让偶发失败卡住发版，**不能一直靠重跑**：
+
+- 每次 CI 列出的偶发失败清单就是待修清单。由负责该模块的开发修复，原则上在下一个版本修掉；一时修不了的，记录原因和计划。
+- 修法见第 4 节：不依赖真实时间；做不到的，放宽 race 模式下测试用的时限，或者加入串行清单。
+- 同一个测试多次被列为偶发失败，又一直没修，要在发版评审时提出来。
+- 重跑掩盖不了真问题：稳定会失败的测试，重跑一样失败；数据竞争不会重跑。
+
+### 已知情况
+
+- 已修复：`TestArchiveFullRecordBoundRoundtrip`、`TestRetentionFullReceiverPayloadPerformance`（race 下盘点的 5 秒时限过紧，已在 race 模式下放宽测试用的时限，正式时限不变）。
+- 已列入串行任务：全部 `TestToken*` 测试，以及 monthly 的 `TestRetentionFullReceiverPayloadPerformance`。
+- 待修（v1.18.48 验证期间在真实 CI 上出现过）：
+  - `TestTokenMeteringPaginationCrashResumeAndFencing`：单进程也偶发失败；
+  - `TestTokenReviewReplayFailureAndAtomicCompleteness`：单进程也偶发失败；
+  - `TestFinanceGiftSeriesBudgetsAndLocks/timeout`：并行时偶发"deadline not respected"；
+  - `TestTokenDetectionFairnessMinuteBacklogRestartRecovery`：race 下约 6 分钟，每轮有 5 秒时限，需要观察。
+- 历史上 v1.18.44、v1.18.45 的 CI（每台机器 1 个进程）也有 `TestTokenDetection*` 等令牌测试偶发失败，说明这批测试本身对机器快慢敏感，和并行方式无关。
+- 待观察：`internal/usagebill/exportjobs` 的 `TestExpiryAndCancellationPreserveOpenLeaseOnly`，机器很忙时偶发"产物未清理"。
 
 ## 8. 发版时的 CI
 

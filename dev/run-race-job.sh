@@ -5,7 +5,8 @@
 # usage: dev/run-race-job.sh <monitor|monthly> <job> <output-dir>
 #
 # Each process writes Go test JSON events to <output-dir>/<name>-<job>-<n>.jsonl
-# (the same events `go test -json` emits). Exits non-zero if any process fails.
+# (the same events `go test -json` emits). If a process fails, the failed tests
+# may be re-run once alone (see below); otherwise the job exits non-zero.
 set -euo pipefail
 
 name=${1:?package name (monitor|monthly)}
@@ -49,19 +50,51 @@ done < "$out/$name-$job-patterns.txt"
 test "$i" -gt 0
 
 status=0
+reports=()
 for index in "${!pids[@]}"; do
+  report="$out/$name-$job-$index.jsonl"
   if wait "${pids[$index]}"; then
     echo "$name race job $job process $index: pass"
+    reports+=("$report:0")
   else
     status=1
     echo "$name race job $job process $index: FAIL" >&2
-    # Name the failing tests in the job log; full events stay in the artifact.
-    node -e '
-      const lines = require("fs").readFileSync(process.argv[1], "utf8").split("\n");
-      const failed = new Set();
-      for (const line of lines) { try { const e = JSON.parse(line); if (e.Action === "fail" && e.Test) failed.add(e.Test); } catch {} }
-      console.error(failed.size ? [...failed].map(n => "  failed: " + n).join("\n") : "  (no test-level failure recorded; see artifact)");
-    ' "$out/$name-$job-$index.jsonl" >&2
+    reports+=("$report:1")
   fi
 done
-exit "$status"
+test "$status" -eq 0 && exit 0
+
+# One isolated re-run of the failed tests, after every process of this job has
+# finished (no other test competes for the CPU). It absorbs failures caused by
+# machine speed, never real ones: data races, panics, timeouts, unidentified
+# failures and more than a few failed tests are not re-run, and a test that
+# fails again fails the job. Passing re-runs are reported as flaky tests that
+# must be fixed (docs/CI-规范.md §7).
+verdict=$(cd "$root" && node dev/race-failures.mjs "${reports[@]}")
+node -e '
+  const v = JSON.parse(process.argv[1]);
+  for (const name of v.tests) console.error("  failed: " + name);
+  if (!v.tests.length) console.error("  (no test-level failure recorded; see artifact)");
+  if (!v.rerunAllowed && v.reasons.length) console.error("  not re-run: " + v.reasons.join("; "));
+' "$verdict"
+pattern=$(node -e 'const v = JSON.parse(process.argv[1]); process.stdout.write(v.rerunAllowed ? v.pattern : "")' "$verdict")
+test -n "$pattern" || exit 1
+
+rerun="$out/$name-$job-rerun.jsonl"
+echo "$name race job $job: re-running the failed tests once, alone" >&2
+if go tool test2json -t -p "$module/$dir" \
+    sh -c 'exec "$0" -test.v=test2json -test.count=1 -test.timeout=25m -test.run "$1" 2>&1' "$bin" "$pattern" > "$rerun"; then
+  node -e '
+    const fs = require("fs");
+    const v = JSON.parse(process.argv[1]);
+    const lines = ["## Flaky race tests: " + process.argv[2], "",
+      "These tests failed in the parallel run and passed when re-run alone. They are timing-sensitive and must be fixed (docs/CI-规范.md §7):", "",
+      ...v.tests.map(n => "- `" + n + "`"), ""];
+    fs.writeFileSync(process.argv[3], lines.join("\n"));
+    for (const n of v.tests) console.log("::warning title=Flaky race test::" + n + " failed in " + process.argv[2] + " and passed when re-run alone; fix it (docs/CI-规范.md §7)");
+  ' "$verdict" "$name-$job" "$out/$name-$job-flaky.md"
+  echo "$name race job $job: re-run passed; flaky tests reported"
+  exit 0
+fi
+echo "$name race job $job: re-run FAILED" >&2
+exit 1

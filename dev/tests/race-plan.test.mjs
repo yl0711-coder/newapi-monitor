@@ -116,7 +116,10 @@ test('CI runs every planned job with race detection and gates publication on all
   assert.match(runner, /-test\.count=1 -test\.timeout=25m -test\.run/);
   assert.match(runner, /MONITOR_TEST_NGINX_COLLECTOR_BIN/);
   assert.match(runner, /wait "\$\{pids\[\$index\]\}"/);
-  assert.match(runner, /exit "\$status"/);
+  // Failures go through the classifier; only an allowed, passing isolated re-run turns a job green.
+  assert.match(runner, /node dev\/race-failures\.mjs "\$\{reports\[@\]\}"/);
+  assert.match(runner, /test -n "\$pattern" \|\| exit 1/);
+  assert.match(runner, /re-run FAILED[^\n]*\nexit 1/);
 });
 
 test('timing refresh takes passed measurements, keeps estimates for failed tests and drops removed tests', async () => {

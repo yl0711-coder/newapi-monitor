@@ -240,12 +240,17 @@ jobs:
             test -s "$report" || continue
             node dev/summarize-race-tests.mjs "$report" "$(basename "$report" .jsonl)" >> "$GITHUB_STEP_SUMMARY"
           done
+          for flaky in "$RUNNER_TEMP"/race/monitor-*-flaky.md; do
+            if test -s "$flaky"; then cat "$flaky" >> "$GITHUB_STEP_SUMMARY"; fi
+          done
       - name: Preserve timing evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: monitor-race-${{ matrix.job }}
-          path: ${{ runner.temp }}/race/monitor-*.jsonl
+          path: |
+            ${{ runner.temp }}/race/monitor-*.jsonl
+            ${{ runner.temp }}/race/monitor-*-flaky.md
           if-no-files-found: ignore
           retention-days: 7
 
@@ -279,12 +284,17 @@ jobs:
             test -s "$report" || continue
             node dev/summarize-race-tests.mjs "$report" "$(basename "$report" .jsonl)" >> "$GITHUB_STEP_SUMMARY"
           done
+          for flaky in "$RUNNER_TEMP"/race/monthly-*-flaky.md; do
+            if test -s "$flaky"; then cat "$flaky" >> "$GITHUB_STEP_SUMMARY"; fi
+          done
       - name: Preserve timing evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: monthly-race-${{ matrix.job }}
-          path: ${{ runner.temp }}/race/monthly-*.jsonl
+          path: |
+            ${{ runner.temp }}/race/monthly-*.jsonl
+            ${{ runner.temp }}/race/monthly-*-flaky.md
           if-no-files-found: ignore
           retention-days: 7
 
