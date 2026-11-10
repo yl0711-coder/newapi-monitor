@@ -172,7 +172,7 @@ const channelDataWarningMaxHours = 48
 func channelInternalShortfallHours(internal financeConfiguredInternalEvidence, sampled map[int64]channelInternalUsageFact, channelID int, group string) ([]int64, bool) {
 	byHour := map[int64]channelInternalUsageFact{}
 	for _, row := range internal.Rows {
-		if row.ChannelID != channelID || row.Grp != group {
+		if row.ChannelID != channelID || strings.TrimSpace(row.Grp) != group {
 			continue
 		}
 		fact := byHour[row.HourTs]

@@ -1231,13 +1231,24 @@ func (m *Monitor) locateChannelDataWarningHours(ctx context.Context, scope stabi
 		GROUP BY hour_ts,channel_id,grp LIMIT ?`, scope.FromTs, scope.ToTs, accountingTrafficVersions(), ids, maxChannelManagementRows+1).Scan(&rows).Error; err != nil {
 		return err
 	}
+	if len(rows) > maxChannelManagementRows {
+		// Too many hours to locate exactly: list none rather than a partial,
+		// misleading set. The totals in each warning are still exact.
+		for i := range warnings {
+			warnings[i].Hours, warnings[i].HoursTruncated = nil, true
+		}
+		return nil
+	}
 	sampled := map[channelInternalUsageKey]map[int64]channelInternalUsageFact{}
 	for _, row := range rows {
 		key := channelInternalUsageKey{ChannelID: row.ChannelID, Group: strings.TrimSpace(row.Grp)}
 		if sampled[key] == nil {
 			sampled[key] = map[int64]channelInternalUsageFact{}
 		}
-		sampled[key][row.HourTs] = channelInternalUsageFact{Requests: row.Requests, Tokens: row.Tokens, Quota: row.Quota}
+		// Groups that differ only by surrounding spaces are one group.
+		f := sampled[key][row.HourTs]
+		f.Requests, f.Tokens, f.Quota = f.Requests+row.Requests, f.Tokens+row.Tokens, f.Quota+row.Quota
+		sampled[key][row.HourTs] = f
 	}
 	for i := range warnings {
 		key := channelInternalUsageKey{ChannelID: warnings[i].ChannelID, Group: warnings[i].Group}

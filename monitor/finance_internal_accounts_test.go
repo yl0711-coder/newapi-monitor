@@ -359,3 +359,43 @@ func TestChannelInternalUsageShortfallIsReportedNotFatal(t *testing.T) {
 		t.Fatalf("short hours = %v truncated=%v", hours, truncated)
 	}
 }
+
+// Gap hours: sampled rows whose group differs only by spaces are added, not
+// overwritten; past the row limit no partial hour list is shown.
+func TestLocateChannelDataWarningHoursTrimmedGroupsAndLimit(t *testing.T) {
+	m := newStabilityTestMonitor(t)
+	if err := m.storeDB.Create(&[]StabilityHourSample{
+		{HourTs: 3600, ChannelID: 195, ModelName: "a", Grp: "internal", TrafficClassVersion: 7, Success: 1, Tokens: 5, Quota: 5},
+		{HourTs: 3600, ChannelID: 195, ModelName: "a", Grp: "internal ", TrafficClassVersion: 7, Success: 1, Tokens: 5, Quota: 5},
+		{HourTs: 7200, ChannelID: 195, ModelName: "a", Grp: "internal", TrafficClassVersion: 7, Success: 1, Tokens: 10, Quota: 10},
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	internal := financeConfiguredInternalEvidence{Complete: true, Accounts: 1, Rows: []FinanceInternalAccountHourFact{
+		{HourTs: 3600, ChannelID: 195, Grp: "internal", Requests: 2, Tokens: 10, ConsumeQuota: 10},
+		{HourTs: 7200, ChannelID: 195, Grp: "internal", Requests: 3, Tokens: 10, ConsumeQuota: 10},
+	}}
+	scope := stabilityScope{FromTs: 0, ToTs: 3 * 3600}
+	warnings := []ChannelManagementDataWarning{{ChannelID: 195, Group: "internal"}}
+	if err := m.locateChannelDataWarningHours(context.Background(), scope, internal, warnings); err != nil {
+		t.Fatal(err)
+	}
+	if len(warnings[0].Hours) != 1 || warnings[0].Hours[0] != 7200 || warnings[0].HoursTruncated {
+		t.Fatalf("hours = %v truncated=%v (hour 3600 is fully sampled across both group spellings)", warnings[0].Hours, warnings[0].HoursTruncated)
+	}
+	rows := make([]StabilityHourSample, 0, maxChannelManagementRows+1)
+	for i := 0; i <= maxChannelManagementRows; i++ {
+		rows = append(rows, StabilityHourSample{HourTs: int64(10+i) * 3600, ChannelID: 195, ModelName: "a", Grp: "internal", TrafficClassVersion: 7, Success: 1})
+	}
+	if err := m.storeDB.CreateInBatches(rows, 500).Error; err != nil {
+		t.Fatal(err)
+	}
+	scope.ToTs = int64(20+maxChannelManagementRows) * 3600
+	warnings = []ChannelManagementDataWarning{{ChannelID: 195, Group: "internal", Hours: []int64{1}}}
+	if err := m.locateChannelDataWarningHours(context.Background(), scope, internal, warnings); err != nil {
+		t.Fatal(err)
+	}
+	if len(warnings[0].Hours) != 0 || !warnings[0].HoursTruncated {
+		t.Fatalf("over the row limit: hours=%v truncated=%v", warnings[0].Hours, warnings[0].HoursTruncated)
+	}
+}

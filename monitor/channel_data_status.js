@@ -100,7 +100,7 @@ function issues(report){
 	}
   for(const w of report?.data_warnings||[]){
     const hours=(w.hours||[]).map(h=>time(h)).join('、');
-    rows.push({scope:`渠道 #${w.channel_id} · ${w.group||'未标记服务分组'}`,detail:`内部账号用量比渠道采样多 ${w.missing_requests||0} 次请求、${w.missing_tokens||0} Tokens，说明这段时间渠道采样缺失；该行已按 0 显示，实际用量偏低。${hours?'缺口小时：'+hours+(w.hours_truncated?' 等':'')+'。':''}需要补采这些小时。`});
+    rows.push({scope:`渠道 #${w.channel_id} · ${w.group||'未标记服务分组'}`,detail:`内部账号用量比渠道采样多 ${w.missing_requests||0} 次请求、${w.missing_tokens||0} Tokens，说明这段时间渠道采样缺失；该行已按 0 显示，实际用量偏低。${hours?'缺口小时：'+hours+(w.hours_truncated?' 等':'')+'。':(w.hours_truncated?'缺口小时较多，未逐一列出。':'')}需要补采这些小时。`});
   }
   if(!coverage||coverage.complete!==true||coverage.provisional_seconds>0){
     const detail=coverage?`已确认 ${coverage.completed_hours||0}/${coverage.expected_hours||0} 小时；缺少 ${coverage.missing_hours||0} 小时`:'覆盖状态未返回';
