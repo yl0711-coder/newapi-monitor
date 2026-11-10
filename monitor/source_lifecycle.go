@@ -298,7 +298,12 @@ func classifySourceError(err error) sourceErrorClass {
 	if errors.As(err, &netErr) {
 		return sourceErrorTransient
 	}
+	// The peer closing the connection (replica restart or failover, a killed
+	// idle connection, a dropped tunnel) surfaces as the driver's
+	// ErrInvalidConn. It is a network event, never a configuration error:
+	// treating it as permanent would stop source reads until a manual restart.
 	for _, transient := range []error{
+		mysqlDriver.ErrInvalidConn,
 		context.Canceled, context.DeadlineExceeded, driver.ErrBadConn, io.EOF,
 		syscall.ECONNREFUSED, syscall.ECONNRESET, syscall.EHOSTUNREACH,
 		syscall.ENETUNREACH, syscall.ETIMEDOUT, syscall.EPIPE,
@@ -310,7 +315,7 @@ func classifySourceError(err error) sourceErrorClass {
 	message := strings.ToLower(err.Error())
 	for _, fragment := range []string{
 		"connection refused", "connection reset", "broken pipe", "i/o timeout",
-		"server has gone away", "lost connection", "bad connection", "unexpected eof",
+		"server has gone away", "lost connection", "bad connection", "unexpected eof", "invalid connection",
 	} {
 		if strings.Contains(message, fragment) {
 			return sourceErrorTransient
