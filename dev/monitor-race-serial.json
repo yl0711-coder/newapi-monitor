@@ -1,7 +1,7 @@
 {
- "format_version": 1,
- "note": "Race tests that assert behaviour bounded by real wall-clock budgets and fail under CPU contention. They run alone in the serial race job. Add a test only with evidence (repeated failures under parallel load that pass alone); see docs/CI-规范.md.",
- "tests": [
-  "TestTokenReviewReplayFailureAndAtomicCompleteness"
- ]
+ "format_version": 2,
+ "note": "Race tests that assert behaviour bounded by real wall-clock budgets (round, commit and cleanup budgets, latency amortisation) and fail when other test processes compete for the CPU. They run as ONE process per runner in the serial jobs. All Token tests are included: in CI run 42820117288 (3 processes per runner) 19 distinct ones failed across two attempts while every other monitor test passed. Add a test only with evidence; see docs/CI-规范.md.",
+ "jobs": 4,
+ "prefixes": ["TestToken"],
+ "tests": []
 }

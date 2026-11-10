@@ -61,22 +61,29 @@ test('current measured workloads fit the per-process target with headroom for fu
     const names = [...Object.keys(timings.test_seconds), ...Array.from({length: 5}, (_, i) => `TestFutureUnmeasured${i}`)];
     const plan = racePlan(names.join('\n'), timings, racePackages[name], loadRaceSerial(name));
     assert.equal(plan.patterns.length, racePackages[name].jobs * racePackages[name].processes);
-    assert.ok(Math.max(...plan.estimatedSeconds) <= 12 * 60, `${name}: measured work must leave room below the 14-minute target`);
+    // At least a minute below the 14-minute target, about half the 25-minute process timeout.
+    assert.ok(Math.max(...plan.estimatedSeconds, ...plan.serialSeconds) <= 13 * 60, `${name}: measured work must leave room below the 14-minute target`);
   }
 });
 
 test('job CLI prints exactly that job\'s processes and rejects ambiguous or out-of-range jobs', () => {
   const config = racePackages.monthly;
-  const names = Array.from({length: config.jobs * config.processes * 2}, (_, i) => `TestCLI${i}`);
+  const serial = loadRaceSerial('monthly');
+  const names = [...Array.from({length: config.jobs * config.processes * 2}, (_, i) => `TestCLI${i}`), ...serial.tests];
   const script = fileURLToPath(new URL('../race-plan.mjs', import.meta.url));
-  const all = racePlan(names.join('\n'), loadRaceTimings('monthly'), config).patterns;
+  const plan = racePlan(names.join('\n'), loadRaceTimings('monthly'), config, serial);
+  const all = plan.patterns;
   for (let job = 0; job < config.jobs; job++) {
     const result = spawnSync(process.execPath, [script, 'monthly', String(job)], {input: names.join('\n'), encoding: 'utf8'});
     assert.equal(result.status, 0, result.stderr);
     assert.deepEqual(result.stdout.trim().split('\n'), all.slice(job * config.processes, (job + 1) * config.processes));
     assert.deepEqual(racePlanForJob('monthly', names.join('\n'), job).jobPatterns, all.slice(job * config.processes, (job + 1) * config.processes));
   }
-  for (const job of ['-1', '01', '1.0', 'NaN', String(config.jobs)]) {
+  // The serial job (index config.jobs) prints its one pattern.
+  const serialRun = spawnSync(process.execPath, [script, 'monthly', String(config.jobs)], {input: names.join('\n'), encoding: 'utf8'});
+  assert.equal(serialRun.status, 0, serialRun.stderr);
+  assert.deepEqual(serialRun.stdout.trim().split('\n'), plan.serialPatterns.slice(0, 1));
+  for (const job of ['-1', '01', '1.0', 'NaN', String(raceJobCount('monthly'))]) {
     assert.notEqual(spawnSync(process.execPath, [script, 'monthly', job], {input: names.join('\n'), encoding: 'utf8'}).status, 0, job);
   }
   assert.notEqual(spawnSync(process.execPath, [script, 'unknown', '0'], {input: names.join('\n'), encoding: 'utf8'}).status, 0);
@@ -133,21 +140,31 @@ test('timing refresh takes passed measurements, keeps estimates for failed tests
   assert.throws(() => refreshTimings(previous, measured, {runIds: []}));
 });
 
-test('serial tests run alone in the extra job, exactly once, and a stale serial list fails', () => {
-  const names = [...Array.from({length: 12}, (_, i) => `TestParallel${i}`), 'TestWallClockBudget'];
-  const plan = racePlan(names.join('\n'), empty, small, ['TestWallClockBudget']);
+test('serial tests run one process per job, exactly once, and a stale serial list fails', () => {
+  const names = [...Array.from({length: 12}, (_, i) => `TestParallel${i}`), 'TestWallClockBudget', 'TestTokenA', 'TestTokenB', 'TestTokenC'];
+  const serial = {jobs: 2, prefixes: ['TestToken'], tests: ['TestWallClockBudget']};
+  const plan = racePlan(names.join('\n'), empty, small, serial);
   assert.equal(plan.patterns.length, 6);
-  assert.equal(plan.serialPattern, '^(TestWallClockBudget)$');
-  for (const pattern of plan.patterns) assert.equal(new RegExp(pattern).test('TestWallClockBudget'), false);
-  for (const name of names) assert.equal([...plan.patterns, plan.serialPattern].filter(p => new RegExp(p).test(name)).length, 1, name);
-  assert.throws(() => racePlan(names.join('\n'), empty, small, ['TestRenamedAway']), /not in the inventory/);
-  assert.throws(() => racePlan(names.join('\n'), empty, small, ['TestWallClockBudget', 'TestWallClockBudget']));
-  // The monitor package's serial job is the last matrix index.
-  const serial = loadRaceSerial('monitor');
-  assert.ok(serial.length > 0);
-  const listing = [...serial, ...Array.from({length: 40}, (_, i) => `TestMonitorFixture${i}`)].join('\n');
-  const job = racePlanForJob('monitor', listing, racePackages.monitor.jobs, empty, serial);
-  assert.deepEqual(job.jobPatterns, [`^(${[...serial].sort().join('|')})$`]);
-  assert.throws(() => racePlanForJob('monitor', listing, racePackages.monitor.jobs + 1, empty, serial));
-  assert.equal(raceJobCount('monthly'), racePackages.monthly.jobs);
+  assert.equal(plan.serialPatterns.length, 2);
+  assert.equal(plan.serialCount, 4);
+  const all = [...plan.patterns, ...plan.serialPatterns];
+  for (const name of names) assert.equal(all.filter(p => new RegExp(p).test(name)).length, 1, name);
+  for (const pattern of plan.patterns) for (const name of ['TestWallClockBudget', 'TestTokenA']) assert.equal(new RegExp(pattern).test(name), false);
+  assert.throws(() => racePlan(names.join('\n'), empty, small, {...serial, tests: ['TestRenamedAway']}), /not in the inventory/);
+  assert.throws(() => racePlan(names.join('\n'), empty, small, {...serial, prefixes: ['TestGone']}), /matches no test/);
+  assert.throws(() => racePlan(names.join('\n'), empty, small, {...serial, tests: ['TestWallClockBudget', 'TestWallClockBudget']}));
+  assert.throws(() => racePlan(names.join('\n'), empty, small, {jobs: 0, prefixes: ['TestToken'], tests: []}));
+  // Serial jobs follow the parallel ones and each runs exactly one process.
+  for (const name of Object.keys(racePackages)) {
+    const pkgSerial = loadRaceSerial(name);
+    const fixtures = Array.from({length: 60}, (_, i) => `TestFixture${i}`);
+    const extra = [...pkgSerial.tests, ...pkgSerial.prefixes.flatMap(prefix => [prefix + 'One', prefix + 'Two', prefix + 'Three', prefix + 'Four'])];
+    const listing = [...fixtures, ...extra].join('\n');
+    for (let job = racePackages[name].jobs; job < raceJobCount(name); job++) {
+      const planned = racePlanForJob(name, listing, job, empty, pkgSerial);
+      assert.equal(planned.serialJob, true);
+      assert.equal(planned.jobPatterns.length, 1);
+    }
+    assert.throws(() => racePlanForJob(name, listing, raceJobCount(name), empty, pkgSerial));
+  }
 });

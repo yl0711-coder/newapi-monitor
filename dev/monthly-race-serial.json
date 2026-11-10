@@ -1,0 +1,7 @@
+{
+ "format_version": 2,
+ "note": "Performance assertions on wall-clock time. Failed with 3 processes per runner in CI run 42820117288. Run as ONE process on its own runner; see docs/CI-规范.md.",
+ "jobs": 1,
+ "prefixes": [],
+ "tests": ["TestRetentionFullReceiverPayloadPerformance"]
+}

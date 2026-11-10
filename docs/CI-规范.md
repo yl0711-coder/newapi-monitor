@@ -42,7 +42,7 @@ race-monthly（7 个任务）─────────────────
 
 本仓库是公开仓库，GitHub 免费额度下同时最多运行约 20 个任务，超出的任务要排队。所以：
 
-- 测试阶段同时运行的任务总数不超过 20：`secrets` + `test` + race 18 个（monitor 11、monthly 7）= 20 个。
+- 测试阶段同时运行的任务总数不超过 20：`secrets` + `test` + race 18 个（monitor 7 并行 + 4 串行，monthly 6 并行 + 1 串行）= 20 个。
 - 镜像扫描是 5 个 1–2 分钟的短任务，利用剩余的空位依次完成，不影响总时长。
 - **调整任务数时，必须重新核算这个总数。**
 
@@ -57,18 +57,26 @@ monitor 包约 3900 个测试，monthlydraft 包约 580 个，全部串行跑要
 
 当前配置（`dev/race-plan.mjs` 的 `racePackages`）：
 
-| 包 | 并行任务数 | 每任务进程数 | 并行进程总数 | 串行任务 | 单进程预估上限 |
-|---|---|---|---|---|---|
-| monitor | 10（编号 0–9） | 3 | 30 | 1 个（编号 10） | 14 分钟（目标） |
-| monthly | 7（编号 0–6） | 3 | 21 | 无 | 14 分钟（目标） |
+| 包 | 并行任务 | 每任务进程数 | 串行任务（每任务 1 个进程） | 单进程预估上限 |
+|---|---|---|---|---|
+| monitor | 7 个（编号 0–6），共 21 个进程 | 3 | 4 个（编号 7–10）：全部 `TestToken*` 测试 | 14 分钟（目标） |
+| monthly | 6 个（编号 0–5），共 18 个进程 | 3 | 1 个（编号 6）：`TestRetentionFullReceiverPayloadPerformance` | 14 分钟（目标） |
 
 ### 串行任务（对 CPU 争用敏感的测试）
 
-有少数测试验证的是"受真实时间预算限制"的行为（例如一轮处理只能用 4 秒），和别的进程抢 CPU 时会偶发失败，单独运行却稳定通过。这类测试列在 `dev/monitor-race-serial.json`，放在额外的一个任务里单独跑（1 个进程，独占机器），不和其他测试并行。
+有一类测试验证的是"受真实时间预算限制"的行为（例如一轮处理只能用 4 秒、提交成本要在预算内分摊、清理要在限定延迟内完成）。和别的进程抢 CPU 时，这类测试会失败。这类测试列在 `dev/monitor-race-serial.json`、`dev/monthly-race-serial.json`，放在串行任务里跑：**每台机器只跑 1 个进程**，不和其他测试并行。
 
+清单格式：
+
+```json
+{"format_version": 2, "jobs": 4, "prefixes": ["TestToken"], "tests": ["TestSomeBudgetCase"]}
+```
+
+- `prefixes` 按测试名前缀整批归入（目前 monitor 的全部 `TestToken*`，约 420 个），`tests` 逐个列出；`jobs` 是串行任务的数量，这些测试按耗时均分给它们。
+- **依据**：v1.18.48 在真实 CI 上试过每台机器 3 个进程，两轮里有 19 个不同的 `TestToken*` 测试和 1 个 monthly 性能测试失败，其余约 3900 个测试全部通过。所以只把这些测试单独运行，其余测试保持 3 个进程并行。
 - **只有证据充分才加入**：在并行负载下重复失败、单独运行稳定通过，才列入清单；不要把普通的慢测试放进来。
-- 清单里的测试被改名或删除时，CI 会报错（"serial test … is not in the inventory"），需要同步更新清单。
-- 串行任务的预估总时长也受 14 分钟目标约束。
+- 清单里的测试被改名、删除，或者某个前缀已经匹配不到任何测试时，CI 会报错，需要同步更新清单。
+- 串行任务的预估总时长同样受 14 分钟目标约束；不够时增加 `jobs`，同时核算总任务数（第 2 节）。
 
 预估值按"一台机器只跑 1 个进程"时的实测耗时计算；3 个进程同时跑会互相抢 CPU，实际会慢一些，所以目标上限定在 14 分钟，单进程超时 25 分钟，任务超时 35 分钟。
 
@@ -82,7 +90,8 @@ monitor 包约 3900 个测试，monthlydraft 包约 580 个，全部串行跑要
    - 对执行时间的断言要留足余量。
 4. **race 模式比正常慢好几倍**：如果测试必须验证某个正式时限（例如"最大规模的数据要在 5 秒内处理完"），可以在 race 模式下放宽**测试使用的时限**，正式代码里的时限值不变。做法参考 `internal/monthlydraft/archive_test.go` 中的 `TestArchiveFullRecordBoundRoundtrip`：用 `raceDetector` 常量（`race_enabled_test.go` / `race_disabled_test.go`）判断，把包内的时限变量临时调大。
 5. **大量造数用批量 SQL**：上千行的测试数据，不要用 ORM 逐条插入（race 模式下非常慢）。用一条 `INSERT ... SELECT`（递归 CTE）或批量插入。
-6. **新增需要外部程序的测试**（例如需要预先编译的采集器）：在 `dev/run-race-job.sh` 里统一准备，并通过环境变量传给测试；不要假设测试会落在某一个特定任务里。
+6. **新写的测试如果检验"在多少秒内完成"这类真实时间预算**：先在本地模拟并行负载跑一下（例如同时跑 3 个 `dev/run-race-job.sh` 任务）。如果会失败，优先改成不依赖真实时间；做不到的，在 PR 里说明，并加入串行清单（`TestToken*` 前缀的测试会自动进入串行任务）。
+7. **新增需要外部程序的测试**（例如需要预先编译的采集器）：在 `dev/run-race-job.sh` 里统一准备，并通过环境变量传给测试；不要假设测试会落在某一个特定任务里。
 
 ## 5. 维护：刷新耗时表与调整任务数
 
@@ -138,7 +147,7 @@ go test -race -list . ./internal/monthlydraft | node dev/race-plan.mjs monthly -
 - 偶发失败不能靠"重跑通过"就当作没发生。重跑可以先让发布继续，但必须记录失败的测试名和原因，并在下一个版本里修掉。
 - 常见原因：真实时间等待、对执行时间的断言太紧、依赖机器速度。修法见第 4 节。
 - 已知并已修复的例子：`TestArchiveFullRecordBoundRoundtrip`（race 下盘点时限过紧）。
-- 已知并已列入串行任务：`TestTokenReviewReplayFailureAndAtomicCompleteness`（重放通道每轮 4 秒预算，并行负载下预算提前耗尽）。
+- 已知并已列入串行任务：全部 `TestToken*` 测试（轮次、提交、清理的时间预算在并行负载下提前耗尽），以及 monthly 的 `TestRetentionFullReceiverPayloadPerformance`。
 - 已知待观察：`internal/usagebill/exportjobs` 的 `TestExpiryAndCancellationPreserveOpenLeaseOnly`，机器很忙时偶发"产物未清理"；`TestTokenDetectionFairnessMinuteBacklogRestartRecovery`（race 下约 6 分钟，每轮有 5 秒时限）。
 
 ## 8. 发版时的 CI

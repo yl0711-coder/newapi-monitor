@@ -219,7 +219,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # 0–9: three parallel processes each; 10: the serial (contention-sensitive) tests alone.
+        # 0–6: three parallel processes each; 7–10: serial (wall-clock budget) tests, one process each.
         job: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
     steps:
       - uses: actions/checkout@v4
@@ -258,6 +258,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # 0–5: three parallel processes each; 6: serial performance tests, one process.
         job: [0, 1, 2, 3, 4, 5, 6]
     steps:
       - uses: actions/checkout@v4
