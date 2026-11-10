@@ -263,6 +263,9 @@ jobs:
             skip: '^Test(Upstream|Token)'
           - shard: token-detection-a-c
             pattern: '^TestTokenDetection[A-C]'
+            skip: '^TestTokenDetectionConfiguredBatch'
+          - shard: token-detection-capacity
+            pattern: '^TestTokenDetectionConfiguredBatch'
           - shard: token-detection-d-i
             pattern: '^TestTokenDetection[D-I]'
           - shard: token-detection-j-r

@@ -338,14 +338,19 @@ func TestTokenRuntimeReadsDuringCollectionAndDetection(t *testing.T) {
 	collectionDone := make(chan struct{})
 	budgetYields := 0
 	detectRound := func(round int64) error {
+		// Production gives association and detection independent budgets. A
+		// slow link turn must not pass its nearly expired context to detection.
+		linkCtx, linkStop := context.WithTimeout(ctx, 5*time.Second)
+		linked, linkErr := m.linkTokenMeteringBatch(linkCtx, now+round)
+		linkExpired := errors.Is(linkCtx.Err(), context.DeadlineExceeded) && ctx.Err() == nil
+		linkStop()
+		if linkErr != nil && !(linkExpired && linked > 0 && errors.Is(linkErr, context.DeadlineExceeded)) {
+			return linkErr
+		}
 		// Deliberately exercise a caller budget shorter than the worker's own
 		// deadline. A partial round requires durable progress, released lease,
 		// and an explicit incomplete health state before the next round resumes.
 		roundCtx, stop := context.WithTimeout(ctx, 5*time.Second)
-		if _, err := m.linkTokenMeteringBatch(roundCtx, now+round); err != nil {
-			stop()
-			return err
-		}
 		processed, err := m.runTokenDetectionRound(roundCtx, now+round)
 		expired := errors.Is(roundCtx.Err(), context.DeadlineExceeded) && ctx.Err() == nil
 		stop()

@@ -87,20 +87,20 @@ func TestTokenDetectionMaintenanceCatchesNewArrivals(t *testing.T) {
 	defer m.Close()
 	now := time.Now().Unix()
 	m.cfg.TokenFactsEnabled = false
-	m.cfg.TokenProcessingBatchRows, m.cfg.TokenProcessingPollSeconds = 250, 10
-	base := detectionFact(t, m, 1, now-600, 3, 20000, 0, 0)
-	add := func(start, end int64) {
+	m.cfg.TokenProcessingBatchRows, m.cfg.TokenProcessingPollSeconds = 50, 10
+	base := detectionFact(t, m, 1, now-3600, 3, 20000, 0, 0)
+	add := func(start, end, createdAt int64) {
 		rows := []TokenMeteringFact{}
 		for id := start; id <= end; id++ {
 			f := base
-			f.LogID = id
+			f.LogID, f.CreatedAt = id, createdAt
 			rows = append(rows, f)
 		}
 		if err := m.storeDB.CreateInBatches(rows, 64).Error; err != nil {
 			t.Fatal(err)
 		}
 	}
-	add(2, 500)
+	add(2, 500, now-3600)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	m.startTokenMeteringMaintenance(ctx)
@@ -112,22 +112,34 @@ func TestTokenDetectionMaintenanceCatchesNewArrivals(t *testing.T) {
 			t.Fatal(err)
 		}
 		if count > 0 && !added {
-			add(501, 525)
+			// These requests arrived after maintenance started. Give them their
+			// actual recent event time rather than copying the backlog's timestamp.
+			add(501, 525, time.Now().Unix()-30)
 			added = true
 		}
-		if count == 525 {
-			var span struct{ First, Last int64 }
-			if err := m.storeDB.Model(&TokenDetectionCurrent{}).Select("MIN(first_evaluated_at) AS first, MAX(first_evaluated_at) AS last").Scan(&span).Error; err != nil {
+		if added {
+			var recent int64
+			if err := m.storeDB.Model(&TokenDetectionCurrent{}).Where("log_id>=501 AND log_id<=525").Count(&recent).Error; err != nil {
 				t.Fatal(err)
 			}
-			if span.Last-span.First >= 20 {
-				t.Fatal("catch-up still waits idle cadence between full batches")
+			if recent == 25 {
+				var historical int64
+				if err := m.storeDB.Model(&TokenDetectionCurrent{}).Where("log_id<=500").Count(&historical).Error; err != nil {
+					t.Fatal(err)
+				}
+				if historical == 0 || historical >= 500 {
+					t.Fatal("new arrivals waited for history to drain or history never progressed", historical)
+				}
+				var retained int64
+				if err := m.storeDB.Model(&TokenMeteringFact{}).Count(&retained).Error; err != nil || retained != 525 {
+					t.Fatal("latest priority removed retained work", retained, err)
+				}
+				t.Logf("maintenance detected recent=%d while historical=%d/500 remained durable", recent, historical)
+				cancel()
+				return
 			}
-			t.Logf("maintenance detected historical=500 ongoing_arrivals=25 elapsed_between_first_and_last=%ds", span.Last-span.First)
-			cancel()
-			return
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	t.Fatal("maintenance did not drain historical and newly arrived work")
+	t.Fatal("maintenance did not detect the new arrivals while history remained queued")
 }

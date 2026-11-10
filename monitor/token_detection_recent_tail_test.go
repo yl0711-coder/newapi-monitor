@@ -75,7 +75,7 @@ func TestTokenDetectionFreshRecentTailNotHiddenByRecentPrefix(t *testing.T) {
 	}
 }
 
-func TestTokenDetectionRecentCorrectionsCommitBothEndsInShortRound(t *testing.T) {
+func TestTokenDetectionRecentCorrectionsLeadShortRoundAndPreserveHistory(t *testing.T) {
 	m, now, _ := detectionFixture(t)
 	defer m.Close()
 	base := detectionFact(t, m, 1, now-4*3600, 3, 20000, 0, 0)
@@ -127,8 +127,21 @@ func TestTokenDetectionRecentCorrectionsCommitBothEndsInShortRound(t *testing.T)
 			t.Fatal(err)
 		}
 	}
-	if prefix == 0 || tail == 0 || prefix+tail != int64(processed) {
-		t.Fatal("short round starved one selected recent end", prefix, tail, processed)
+	// The primary recent lane leads. A two-second prefix can end before the
+	// one-in-sixteen historical opportunity, so it must not require a historical
+	// decision ahead of the current requests that fit in that prefix.
+	if tail == 0 || tail < prefix || prefix+tail != int64(processed) {
+		t.Fatal("short round lost latest priority or durable accounting", prefix, tail, processed)
+	}
+	if err := m.tokenStore().Callback().Create().Remove("short_correction_round"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.runTokenDetectionRound(context.Background(), now+1); err != nil {
+		t.Fatal("bounded prefix did not resume", err)
+	}
+	if err := m.tokenReadStore().Model(&TokenDetectionCurrent{}).
+		Where("policy_hash=? AND log_id<1000000000", tokenDetectionPolicyHash(detectionPolicy())).Count(&prefix).Error; err != nil || prefix == 0 {
+		t.Fatal("historical corrections lost their reserved progress", prefix, err)
 	}
 }
 

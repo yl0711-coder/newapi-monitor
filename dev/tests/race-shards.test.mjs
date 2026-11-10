@@ -4,7 +4,7 @@ import test from 'node:test';
 import { readRaceShards, verifyRaceShards } from '../check-race-shards.mjs';
 
 const workflow = readFileSync(new URL('../../.github/workflows/ci.yml', import.meta.url), 'utf8').replace(/\r\n?/g, '\n');
-const names = ['TestAlpha', 'TestNginx', 'TestChannel', 'TestConfig', 'TestCloudWatch', 'TestCustomer', 'TestDelta', 'TestEcho', 'TestUpstream', 'TestFinance', 'TestFinanceRecharge', 'TestFinanceGiftNewFeature', 'TestFinanceGiftHandoffNewFeature', 'TestFinanceGiftScopeNewFeature', 'TestGroup', 'TestIncident', 'TestMinute', 'TestMonthlyCoverage', 'TestMonthlyRestore', 'TestOperations', 'TestPortal', 'TestStability', 'TestZulu', 'TestTokenDetectionAmortizes', 'TestTokenDetectionFairness', 'TestTokenDetectionReference', 'TestTokenDetectionSealed', 'TestTokenMetering', 'TestTokenLatest', 'Test_Regression', 'Test2026', 'Test', 'Test中文', 'Example', 'ExampleMonitor', 'FuzzDecode'];
+const names = ['TestAlpha', 'TestNginx', 'TestChannel', 'TestConfig', 'TestCloudWatch', 'TestCustomer', 'TestDelta', 'TestEcho', 'TestUpstream', 'TestFinance', 'TestFinanceRecharge', 'TestFinanceGiftNewFeature', 'TestFinanceGiftHandoffNewFeature', 'TestFinanceGiftScopeNewFeature', 'TestGroup', 'TestIncident', 'TestMinute', 'TestMonthlyCoverage', 'TestMonthlyRestore', 'TestOperations', 'TestPortal', 'TestStability', 'TestZulu', 'TestTokenDetectionAmortizes', 'TestTokenDetectionConfiguredBatch', 'TestTokenDetectionFairness', 'TestTokenDetectionReference', 'TestTokenDetectionSealed', 'TestTokenMetering', 'TestTokenLatest', 'Test_Regression', 'Test2026', 'Test', 'Test中文', 'Example', 'ExampleMonitor', 'FuzzDecode'];
 
 test('actual CI matrix covers ordinary and non-letter tests, examples and fuzz seeds', () => {
   const result = verifyRaceShards(workflow, names.concat('BenchmarkRead', 'ok example/monitor 0.01s').join('\n'));
@@ -27,6 +27,7 @@ test('finance exclusions route tests to another shard rather than omit coverage'
 test('timing-based redistribution keeps every moved family covered exactly once', () => {
   const shards = readRaceShards(workflow);
   const moved = { TestNginx: 'nginx', TestSub2: 'c-channel', TestModel: 'c-other', TestCloudWatch: 'c-cloudwatch', TestCustomer: 'c-customer', TestUpstream: 'upstream', TestPortal: 'portal', TestFinanceRecharge: 'f-recharge', TestIncident: 'i', TestMinute: 'm-n', TestFinanceGiftLarge: 'f-gift-handoff', TestFinanceGiftLive: 'f-gift-scope', TestFinanceGiftProgress: 'f-gift-scope', TestTokenDetectionAmortizes: 'token-detection-a-c', TestTokenDetectionFairness: 'token-detection-d-i', TestTokenDetectionReference: 'token-detection-j-r', TestTokenDetectionSealed: 'token-detection-other', TestTokenMetering: 'token-metering', TestTokenLatest: 'token-other' };
+  moved.TestTokenDetectionConfiguredBatch = 'token-detection-capacity';
   for (const [prefix, shard] of Object.entries(moved)) {
     for (const suffix of ['', 'Future', '中文']) {
       const name = prefix + suffix;

@@ -53,7 +53,7 @@ func TestTokenBackgroundReadsReserveExistingPoolForHealth(t *testing.T) {
 		t.Fatal("background read did not hold its connection")
 	}
 	var entered atomic.Bool
-	queued, stop := context.WithTimeout(ctx, 150*time.Millisecond)
+	queued, stop := context.WithCancel(ctx)
 	defer stop()
 	second := make(chan error, 1)
 	go func() {
@@ -64,13 +64,16 @@ func TestTokenBackgroundReadsReserveExistingPoolForHealth(t *testing.T) {
 	}()
 	// A queued maintenance reader must not take the remaining pool connection.
 	// Exercise the real health path while the first background query is held.
-	healthCtx, healthCancel := context.WithTimeout(ctx, 100*time.Millisecond)
+	// Keep the waiter queued for the whole health read. Use the handler's real
+	// three-second budget so race instrumentation is not a 100 ms benchmark.
+	healthCtx, healthCancel := context.WithTimeout(ctx, 3*time.Second)
 	defer healthCancel()
 	health, err := m.tokenMeteringHealth(healthCtx, "", now)
 	if err != nil || !health.Available || health.Facts != 0 {
 		t.Fatal("maintenance starved current health", health.HealthCountsState, err)
 	}
-	if err := <-second; !errors.Is(err, context.DeadlineExceeded) || entered.Load() {
+	stop()
+	if err := <-second; !errors.Is(err, context.Canceled) || entered.Load() {
 		t.Fatal("cancelled background waiter ran SQL", entered.Load(), err)
 	}
 }

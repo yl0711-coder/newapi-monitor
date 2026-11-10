@@ -16,13 +16,16 @@ func tokenDetectionRetainedWindowFixture(t *testing.T, corrected ...bool) (*Moni
 	if err := m.storeDB.Raw("SELECT file FROM pragma_database_list WHERE name='main'").Scan(&path).Error; err != nil {
 		t.Fatal(err)
 	}
-	m.cfg.TokenProcessingBatchRows, m.cfg.TokenProcessingPollSeconds = 250, 15
+	m.cfg.TokenProcessingBatchRows, m.cfg.TokenProcessingPollSeconds = 50, 15
 	base := detectionFact(t, m, 1, now-86400, 3, 100, 0, 0)
 	base.LinkRevision = 1
 	from, to := tokenDetectionCarryWindow(now)
 	var facts []TokenMeteringFact
 	for _, population := range []struct{ first, count, at int64 }{
-		{10, 5000, now - 2*3600}, {1_000_000, 1200, from + 1}, {2_000_000, 3000, to + 1},
+		// Each cohort exceeds one worker batch. This exercises the same
+		// persistent reservation across moving seals without making this a
+		// race-instrumented throughput benchmark (capacity has its own test).
+		{10, 256, now - 2*3600}, {1_000_000, 96, from + 1}, {2_000_000, 256, to + 1},
 	} {
 		for i := int64(0); i < population.count; i++ {
 			f := base
@@ -65,10 +68,24 @@ func tokenDetectionCheckRetainedWindow(t *testing.T, corrected bool) {
 		// Advance through many seal boundaries while the old cohort is still
 		// unfinished. Its reservation must not move with the wall clock.
 		processed, _, err := m.runTokenDetectionRoundProgress(context.Background(), now+int64(turn)*300)
-		if err != nil || processed == 0 {
+		if err != nil || (turn == 0 && processed == 0) {
 			t.Fatal("retained worker stopped", turn, processed, err)
 		}
+		var completed int64
+		if err := m.tokenReadStore().Model(&TokenDetectionCurrent{}).
+			Where("log_id>=1000000 AND log_id<2000000 AND evaluated_at>=?", now).Count(&completed).Error; err != nil {
+			t.Fatal(err)
+		}
+		if completed < 96 {
+			var state TokenDetectionState
+			if err := m.tokenReadStore().First(&state).Error; err != nil || (!corrected && state.FreshWindowAt != from) || (corrected && state.CorrectionWindowAt != from) {
+				t.Fatal("moving seal abandoned an unfinished reservation", turn, completed, state, err)
+			}
+		}
 		if turn == 0 {
+			if completed == 96 {
+				t.Fatal("fixture must reopen a partially processed reservation")
+			}
 			var state TokenDetectionState
 			if err := m.tokenStore().First(&state).Error; err != nil || (!corrected && state.FreshWindowAt != from) || (corrected && state.CorrectionWindowAt != from) || state.LastSuccessAt != now {
 				t.Fatal("reservation did not commit with successful decisions", state, err)
@@ -98,8 +115,8 @@ func tokenDetectionCheckRetainedWindow(t *testing.T, corrected bool) {
 			t.Fatal(err)
 		}
 	}
-	t.Logf("retained fixed window=%d/1200 historical=%d newer=%d after 18 moving seals and reopen", target, history, newer)
-	if target != 1200 || history == 0 || newer == 0 {
+	t.Logf("retained fixed window=%d/96 historical=%d newer=%d after 18 moving seals and reopen", target, history, newer)
+	if target != 96 || history == 0 || newer == 0 {
 		t.Fatal("moving seal stranded a partially processed window", target, history, newer)
 	}
 }
