@@ -464,6 +464,17 @@ func (e *upstreamHTTPError) Error() string {
 	return fmt.Sprintf("上游返回 HTTP %d：%s", e.Status, e.Message)
 }
 
+// upstreamRemoteError carries an error message taken from an upstream
+// response body (the upstream's own failure, not ours).
+type upstreamRemoteError struct{ message string }
+
+func (e *upstreamRemoteError) Error() string { return e.message }
+
+const (
+	sqliteCodeBusy   = 5
+	sqliteCodeLocked = 6
+)
+
 type upstreamStoredSyncError struct {
 	message string
 	retryAt int64
@@ -1829,7 +1840,7 @@ func decodeNewAPIData(body []byte, out any) error {
 		if message == "" {
 			message = "请求失败"
 		}
-		return fmt.Errorf("NewAPI：%s", sanitizeUpstreamError(errors.New(message)))
+		return &upstreamRemoteError{message: fmt.Sprintf("NewAPI：%s", sanitizeUpstreamError(errors.New(message)))}
 	}
 	if err := json.Unmarshal(envelope.Data, out); err != nil {
 		return fmt.Errorf("NewAPI 数据格式无效")
@@ -2142,7 +2153,7 @@ func decodeSub2APIData(body []byte, out any) error {
 		if message == "" {
 			message = fmt.Sprintf("错误码 %d", envelope.Code)
 		}
-		return fmt.Errorf("Sub2API：%s", sanitizeUpstreamError(errors.New(message)))
+		return &upstreamRemoteError{message: fmt.Sprintf("Sub2API：%s", sanitizeUpstreamError(errors.New(message)))}
 	}
 	if err := json.Unmarshal(envelope.Data, out); err != nil {
 		return fmt.Errorf("Sub2API 数据格式无效")
@@ -2641,6 +2652,8 @@ func (m *Monitor) credentialForAccount(row ChannelUpstreamAccount) (any, error) 
 	}
 }
 
+const upstreamCredentialLocalWriteTimeout = 20 * time.Second
+
 func (m *Monitor) persistSyncedUpstreamAccount(ctx context.Context, row *ChannelUpstreamAccount, credential any) error {
 	sealed, err := m.sealUpstreamCredential(row.Domain, row.Provider, credential)
 	if err != nil {
@@ -2648,7 +2661,12 @@ func (m *Monitor) persistSyncedUpstreamAccount(ctx context.Context, row *Channel
 	}
 	row.Credential = sealed
 	row.CredentialVersion = upstreamCredentialVersion
-	return m.storeDB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	// A rotated refresh token is single-use: losing this write leaves the
+	// account unable to sync. Give it its own bounded deadline, longer than
+	// the queued writer's busy timeout, whatever the caller has left.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), upstreamCredentialLocalWriteTimeout)
+	defer cancel()
+	return m.queuedWriteStore().WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var previous ChannelUpstreamAccount
 		loadErr := tx.First(&previous, "domain = ?", row.Domain).Error
 		if loadErr != nil && !errors.Is(loadErr, gorm.ErrRecordNotFound) {

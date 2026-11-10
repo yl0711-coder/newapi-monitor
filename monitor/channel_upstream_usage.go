@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	sqlite "github.com/glebarez/go-sqlite"
 	"log/slog"
 	"math"
 	"net"
@@ -179,8 +180,23 @@ func upstreamUsageRetryDelay(delays []time.Duration, failures int) time.Duration
 	return delays[index]
 }
 
+// isUpstreamUsageLocalStoreBusy reports contention on our own SQLite store.
+// An upstream that itself runs on SQLite can return the same "database is
+// locked" text; that is an upstream failure and must be recorded, so errors
+// carrying upstream response text never count as local busy.
 func isUpstreamUsageLocalStoreBusy(err error) bool {
 	if err == nil {
+		return false
+	}
+	var sqliteErr *sqlite.Error
+	if errors.As(err, &sqliteErr) {
+		code := sqliteErr.Code() & 0xff
+		return code == sqliteCodeBusy || code == sqliteCodeLocked
+	}
+	var httpErr *upstreamHTTPError
+	var remoteErr *upstreamRemoteError
+	var tokenForceErr *tokenForceAPIError
+	if errors.As(err, &httpErr) || errors.As(err, &remoteErr) || errors.As(err, &tokenForceErr) {
 		return false
 	}
 	message := strings.ToLower(err.Error())

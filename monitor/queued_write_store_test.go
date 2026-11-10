@@ -157,3 +157,33 @@ func TestUsageClientWaitsPastBalanceTimeoutForHeaders(t *testing.T) {
 	}
 	resp.Body.Close()
 }
+
+// After Close no queued-write connection is opened again, and a failed open
+// is retried after a short delay instead of being given up until restart.
+func TestQueuedWriteStoreNoReopenAfterCloseAndRetriesFailedOpen(t *testing.T) {
+	m := &Monitor{cfg: Settings{LocalSnapshotOnly: true}}
+	if err := m.openStore(filepath.Join(t.TempDir(), "monitor.db")); err != nil {
+		t.Fatal(err)
+	}
+	m.queuedWriteMu.Lock()
+	m.queuedWriteRetryAt = time.Now().Add(time.Hour) // as if an open just failed
+	m.queuedWriteMu.Unlock()
+	if m.queuedWriteStore() != m.storeDB {
+		t.Fatal("within the retry delay the main connection is used")
+	}
+	m.queuedWriteMu.Lock()
+	m.queuedWriteRetryAt = time.Now().Add(-time.Second) // delay elapsed
+	m.queuedWriteMu.Unlock()
+	if w := m.queuedWriteStore(); w == m.storeDB || !m.queuedWriteRetryAt.IsZero() {
+		t.Fatal("after the retry delay the queued writer must be opened again")
+	}
+	m.Close()
+	if w := m.queuedWriteStore(); w != m.storeDB {
+		t.Fatal("a queued-write connection was reopened after Close")
+	}
+	m.queuedWriteMu.Lock()
+	defer m.queuedWriteMu.Unlock()
+	if m.queuedWriteDB != nil {
+		t.Fatal("queued writer left open after Close")
+	}
+}

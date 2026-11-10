@@ -51,7 +51,8 @@ type Monitor struct {
 	storeDB               *gorm.DB             // 本地采样库
 	queuedWriteMu         sync.Mutex           // guards queuedWriteDB
 	queuedWriteDB         *gorm.DB             // 后台排队写连接(BEGIN IMMEDIATE，单连接)
-	queuedWriteFailed     bool
+	queuedWriteClosed     bool                 // set by Close; no reopen afterwards
+	queuedWriteRetryAt    time.Time            // after a failed open, fall back until then
 	// usageFactsDB 独立承载高增长的用量小时/日事实、同步水位和资料快照。
 	// 生产通过 New 创建时默认与 storeDB 分文件，避免补数、WAL 膨胀、损坏或
 	// 写锁把告警配置、渠道配置和其他 Monitor 页面一起拖垮。测试直接调用
