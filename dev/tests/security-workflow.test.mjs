@@ -44,7 +44,7 @@ test('publisher loads the scanned artifact and cannot rebuild or push unrelated 
 });
 
 test('all production images use the same patched Go build version as CI', () => {
-  const patchedVersion = '1.26.10';
+  const patchedVersion = '1.26.11';
   const read = file => readFileSync(new URL(`../../${file}`, import.meta.url), 'utf8');
   assert.equal(read('go.mod').match(/^go (\S+)$/m)?.[1], patchedVersion);
   const ciVersions = [...workflow.matchAll(/go-version:\s*'([^']+)'/g)];
