@@ -34,6 +34,13 @@ test('unaccounted channel address can be aliased to a configured supplier',()=>{
   assert.equal(box.hidden,true,'a configured supplier without aliases shows nothing');
 });
 
+test('alias targets come from configured accounts, including suppliers without channels',()=>{
+  const {ui,element}=fixture();
+  ui.cm.report={alias_targets:['rkshadow.com'],domains:[{domain:'148.163.65.162',upstream:{configured:false}}]};
+  ui.renderDomainAlias(ui.cm.report.domains[0],false);
+  assert.match(element('cmDomainAlias').innerHTML,/<option value="rkshadow.com">/);
+});
+
 test('target domain lists its aliases with a remove action',()=>{
   const {ui,element}=fixture();
   ui.cm.report={domains:[{domain:'rkshadow.com',upstream:{configured:true},aliases:['148.163.65.162']}]};

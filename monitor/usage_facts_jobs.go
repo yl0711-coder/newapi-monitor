@@ -1275,7 +1275,11 @@ func (m *Monitor) runUsageFactHistoryWorker(ctx context.Context) {
 		}
 		tuning.localWork = false
 		worked, err := m.syncNextUsageFactHistoryWork(ctx, owner, &tuning, now)
-		if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, errSourceNotReady) {
+		if errors.Is(err, errUsageFactRawPageSuperseded) {
+			// Another lane already advanced this cursor; the job yields and
+			// resumes from the newer position. Not a failure.
+			slog.Info("全历史任务让出：分页游标已由其他同步通道推进")
+		} else if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, errSourceNotReady) {
 			slog.Warn("全历史任务执行失败", "err", err)
 		}
 		if worked {
@@ -1941,6 +1945,30 @@ func auditUsageFactFullHistoryDayRange(db *gorm.DB, state UsageFactMemberState, 
 	return auditUsageFactFullHistoryDayRangeWithRefresh(db, state, start, end, false)
 }
 
+// auditUsageFactPublishedHistoryWithRefresh audits a published member from its
+// source floor. Like the verify and local-audit jobs it proves the prefix
+// before the first source log as known-empty: those days have no daily facts
+// and no day proofs by design. Auditing them as proved days failed every
+// member whose floor precedes its first log, which closed fact reading for
+// all customers whenever such a member was in its recent-only state.
+func auditUsageFactPublishedHistoryWithRefresh(db *gorm.DB, state UsageFactMemberState, floor, through int64) error {
+	if state.SourceHistoryStatus == "no_history" {
+		return auditUsageFactKnownEmptyRange(db, state.UserID, floor, through)
+	}
+	if state.SourceFirstLogHour == nil {
+		return fmt.Errorf("full-history first-log boundary missing user=%d", state.UserID)
+	}
+	from := floor
+	if from < *state.SourceFirstLogHour {
+		prefixThrough := min(through, *state.SourceFirstLogHour)
+		if err := auditUsageFactKnownEmptyRange(db, state.UserID, from, prefixThrough); err != nil {
+			return err
+		}
+		from = prefixThrough
+	}
+	return auditUsageFactFullHistoryDayRangeWithRefresh(db, state, from, through, true)
+}
+
 func auditUsageFactFullHistoryDayRangeWithRefresh(db *gorm.DB, state UsageFactMemberState, start, end int64, allowRefreshing bool) error {
 	if start >= end {
 		return nil
@@ -2390,7 +2418,7 @@ func (m *Monitor) validateUsageFactFullHistoryCheckpoint(ctx context.Context, th
 		if recentReady && !fullReady {
 			// Validate the immutable serving window, not the next candidate.
 			// Its unchanged completed facts remain usable during a refresh lease.
-			if err := auditUsageFactFullHistoryDayRangeWithRefresh(db, state, row.SourceFloorHour, through, true); err != nil {
+			if err := auditUsageFactPublishedHistoryWithRefresh(db, state, row.SourceFloorHour, through); err != nil {
 				return fmt.Errorf("recent service checkpoint failed user_id=%d: %w", row.UserID, err)
 			}
 		} else if state.SourceHistoryStatus == "complete_hot" {

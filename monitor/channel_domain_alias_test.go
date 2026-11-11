@@ -45,6 +45,16 @@ func TestChannelDomainAliasAttributesOriginIPChannel(t *testing.T) {
 	if err := m.storeDB.Create(&ChannelUpstreamAccount{Domain: "rkshadow.com", Provider: upstreamProviderSub2API, BaseURL: "https://sub.rkshadow.com", Enabled: true}).Error; err != nil {
 		t.Fatal(err)
 	}
+	hour := time.Date(2026, 9, 18, 10, 0, 0, 0, cstLocation).Unix()
+	before, err := m.buildChannelManagementReport(context.Background(), stabilityScope{FromTs: hour, ToTs: hour + 3600}, hour+7200)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The target has no channel of its own, so it is not in Domains; the
+	// dialog must still be able to offer it.
+	if len(before.AliasTargets) != 1 || before.AliasTargets[0] != "rkshadow.com" {
+		t.Fatalf("configured supplier without channels must be an alias target: %v", before.AliasTargets)
+	}
 	if code, body := post("unknown.example", "rkshadow.com"); code == http.StatusOK || !strings.Contains(body, "不是当前任何渠道") {
 		t.Fatalf("an address no channel uses must be refused: %d %s", code, body)
 	}
@@ -58,7 +68,6 @@ func TestChannelDomainAliasAttributesOriginIPChannel(t *testing.T) {
 	if got := snap(); got.BaseDomain != "rkshadow.com" || got.BaseHost != "148.163.65.162" {
 		t.Fatalf("aliased channel=%+v", got)
 	}
-	hour := time.Date(2026, 9, 18, 10, 0, 0, 0, cstLocation).Unix()
 	report, err := m.buildChannelManagementReport(context.Background(), stabilityScope{FromTs: hour, ToTs: hour + 3600}, hour+7200)
 	if err != nil {
 		t.Fatal(err)

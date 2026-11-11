@@ -1552,6 +1552,9 @@ async function openUpstream(domainKey){
 // Domain alias: another channel address of an already configured supplier
 // (for example its origin IP) is attributed to that supplier's domain.
 function domainAliasTargets(domain){
+  // Prefer the server's list of configured upstream accounts: an alias target
+  // usually has no channel of its own and so is absent from the domain list.
+  if(Array.isArray(cm.report?.alias_targets))return cm.report.alias_targets.filter(target=>target!==domain.domain);
   const aliased=new Set((cm.report?.domains||[]).flatMap(d=>d.aliases||[]));
   return (cm.report?.domains||[]).filter(d=>d.domain!==domain.domain&&d.upstream?.configured&&!aliased.has(d.domain)).map(d=>d.domain).sort();
 }

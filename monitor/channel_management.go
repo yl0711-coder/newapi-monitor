@@ -182,6 +182,10 @@ type ChannelManagementReport struct {
 	InternalAccounts      financeInternalFactStatus      `json:"internal_accounts"`
 	InternalScopeComplete bool                           `json:"internal_scope_complete"`
 	DataWarnings          []ChannelManagementDataWarning `json:"data_warnings,omitempty"`
+	// AliasTargets lists every domain with a configured upstream account,
+	// including suppliers whose channels all use another address (the
+	// typical domain alias target), which are absent from Domains.
+	AliasTargets []string `json:"alias_targets,omitempty"`
 }
 
 // ChannelCostClosureCapability is an explicit, read-only UI capability. The
@@ -1189,8 +1193,16 @@ func (m *Monitor) buildChannelManagementReport(ctx context.Context, scope stabil
 
 	// Always expose the actual exclusive cutoff, including partial date ranges.
 	const rangeFormat = "2006-01-02 15:04"
+	aliasTargets := make([]string, 0, len(upstreamAccounts))
+	for domain, account := range upstreamAccounts {
+		if account.Configured && domainAliases[domain] == "" {
+			aliasTargets = append(aliasTargets, domain)
+		}
+	}
+	sort.Strings(aliasTargets)
 	return &ChannelManagementReport{
 		Enabled:       true,
+		AliasTargets:  aliasTargets,
 		Finance:       finance.settingsView(),
 		WebsiteGroups: websiteGroups, WebsiteGroupsSyncedAt: websiteGroupsSyncedAt,
 		Meta: ChannelManagementMeta{
