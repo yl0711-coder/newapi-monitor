@@ -105,6 +105,34 @@ func (m *Monitor) probeSavedUpstream(ctx context.Context, client *http.Client, r
 			mode.Action = "小时账单须经分页补齐和日总额核对后发布；此检测不验证全日总额，也不写入账单。"
 		}
 		report.Checks = append(report.Checks, mode)
+	case upstreamProviderOrion:
+		var cred orionCredential
+		if m.openUpstreamCredential(row, &cred) != nil {
+			return fmt.Errorf("凭据无效")
+		}
+		hourTo := now.Unix() - now.Unix()%3600
+		balance = func() error { _, _, err := readOrionProfile(ctx, client, row, cred); return err }
+		usage = func() error {
+			page, err := fetchOrionRequestPage(ctx, client, row, cred, hourTo-3600, hourTo, "", pacer)
+			if err != nil {
+				return err
+			}
+			_, err = aggregateOrionUsage(row, page.Items, hourTo-3600, hourTo)
+			return err
+		}
+		scope = "上一个整点小时的请求明细首页"
+	case upstreamProviderVolcengine:
+		var cred volcengineCredential
+		if m.openUpstreamCredential(row, &cred) != nil {
+			return fmt.Errorf("凭据无效")
+		}
+		balance = func() error { _, _, err := readVolcengineBalance(ctx, client, cred); return err }
+		usage = func() error {
+			_, err := fetchVolcengineBillPage(ctx, client, cred, time.Unix(dayFrom, 0).In(cstLocation), 0, pacer)
+			return err
+		}
+		scope = "昨日账单明细首页"
+		report.Checks = append(report.Checks, upstreamDiagnosticCheck{Name: "金额口径", Status: "ok", Code: "cny_payable_amount", Message: "余额为可用余额，消费为账单应付金额（人民币），按自然日汇总", Action: "账单有延迟，最近一天显示为待结算；火山不提供逐笔请求明细，只能按天与 new-api 对账。"})
 	default:
 		return errDiagnosticShape
 	}

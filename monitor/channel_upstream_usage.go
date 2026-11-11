@@ -20,6 +20,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -526,6 +527,23 @@ func fetchTokenForceUsageItemsSplit(ctx context.Context, client *http.Client, ro
 	return append(left, right...), nil
 }
 
+// mergeTokenForceUsageItems appends extra to items, skipping requestIds
+// already present: overlapping reads list a boundary request twice.
+func mergeTokenForceUsageItems(items, extra []tokenForceUsageItem) []tokenForceUsageItem {
+	seen := make(map[string]struct{}, len(items)+len(extra))
+	for _, item := range items {
+		seen[item.RequestID] = struct{}{}
+	}
+	for _, item := range extra {
+		if _, duplicate := seen[item.RequestID]; duplicate {
+			continue
+		}
+		seen[item.RequestID] = struct{}{}
+		items = append(items, item)
+	}
+	return items
+}
+
 func fetchTokenForceUsageWindow(ctx context.Context, client *http.Client, row ChannelUpstreamAccount, cred tokenForceCredential, from, to int64, pacer *upstreamUsageRequestPacer) (upstreamUsageResult, error) {
 	if cred.AccessToken == "" {
 		return upstreamUsageResult{}, &upstreamAuthError{err: fmt.Errorf("TokenForce 访问令牌为空，请重新连接")}
@@ -536,6 +554,52 @@ func fetchTokenForceUsageWindow(ctx context.Context, client *http.Client, row Ch
 	items, err := fetchTokenForceUsageItemsSplit(ctx, client, row, cred, from, to, pacer)
 	if err != nil {
 		return upstreamUsageResult{}, err
+	}
+	// TokenForce lists a request by a timestamp later than its requestTime (a
+	// request that started at 01:59:41 is listed for a window beginning at
+	// 02:00), so an hour is complete only together with the requests that
+	// started in it but finished after it. Read a short slice past `to` and
+	// keep only those; without it, re-reading an older hour (history) would
+	// delete such a request that an earlier, wider read had recorded.
+	if slackTo := min(to+tokenForceLateFinishSeconds, time.Now().Unix()); slackTo > to {
+		late, lateErr := fetchTokenForceUsageItemsSplit(ctx, client, row, cred, to, slackTo, pacer)
+		if lateErr != nil {
+			return upstreamUsageResult{}, lateErr
+		}
+		finishedLate := late[:0]
+		for _, item := range late {
+			if item.RequestAt >= from && item.RequestAt < to {
+				finishedLate = append(finishedLate, item)
+			}
+		}
+		items = mergeTokenForceUsageItems(items, finishedLate)
+	}
+	// A request listed here that started before `from` belongs to an earlier
+	// hour, which may already have been stored without it. Widen to that hour,
+	// reading only the missing slice [widened, from), so the hour is replaced
+	// complete; every request stays counted once (merged by requestId).
+	for expansions := 0; ; expansions++ {
+		earliest := from
+		for _, item := range items {
+			if item.RequestAt < earliest {
+				earliest = item.RequestAt
+			}
+		}
+		if earliest >= from {
+			break
+		}
+		widened := earliest - earliest%3600
+		if expansions >= tokenForceMaxWindowExpansions || from-widened > tokenForceMaxEarlyStartSeconds || to-widened > 26*3600 {
+			return upstreamUsageResult{}, fmt.Errorf("TokenForce 使用明细包含查询区间之外的 requestTime（%s 不在 %s ~ %s）",
+				time.Unix(earliest, 0).In(cstLocation).Format("01-02 15:04:05"),
+				time.Unix(from, 0).In(cstLocation).Format("01-02 15:04:05"), time.Unix(to, 0).In(cstLocation).Format("01-02 15:04:05"))
+		}
+		earlier, earlierErr := fetchTokenForceUsageItemsSplit(ctx, client, row, cred, widened, from, pacer)
+		if earlierErr != nil {
+			return upstreamUsageResult{}, earlierErr
+		}
+		items = mergeTokenForceUsageItems(items, earlier)
+		from = widened
 	}
 	// Dense windows are recursively split. The API could still return the same
 	// boundary request in both half-open ranges, so re-check the combined result
@@ -622,8 +686,20 @@ func syncTokenForceUsage(ctx context.Context, client *http.Client, row ChannelUp
 	return result, cred, err
 }
 
-// tokenForceBackfillWindowSeconds bounds one TokenForce history window.
-const tokenForceBackfillWindowSeconds = 3 * 3600
+// tokenForceBackfillWindowSeconds bounds one TokenForce history window. Busy
+// three-hour windows needed more requests than one run allows and never
+// completed (hainahn.com, 2026-11), so history advances one hour at a time.
+const tokenForceBackfillWindowSeconds = 3600
+
+// A request listed before its window may have started at most this long ago
+// (long streaming calls); anything earlier is treated as invalid data.
+const (
+	tokenForceMaxEarlyStartSeconds = 6 * 3600
+	tokenForceMaxWindowExpansions  = 3
+	// Requests that start in a window and finish within this long after it
+	// are read back into it (see fetchTokenForceUsageWindow).
+	tokenForceLateFinishSeconds = 30 * 60
+)
 
 type upstreamUsageWindowTooDense struct {
 	total int64
@@ -858,8 +934,71 @@ func fetchNewAPIUsageItems(ctx context.Context, client *http.Client, row Channel
 	return items, nil
 }
 
+// Some NewAPI sites answer short ranges quickly but time out on a whole hour
+// (query cost grows with the range). After a request-local timeout the window
+// is read again as consecutive shorter children (5 min, then 1 min, then 10 s)
+// in the same run; every child is fully scanned, so the parent is complete
+// exactly when all children are. The domain is then remembered as slow for a
+// while so later windows start with children instead of first paying another
+// whole-window timeout. The run's request budget and deadline still apply.
+var newAPISlowLogDomains = struct {
+	sync.Mutex
+	until map[string]time.Time
+}{until: map[string]time.Time{}}
+
+const newAPISlowLogHint = 6 * time.Hour
+
+func newAPISlowLogDomain(domain string) bool {
+	newAPISlowLogDomains.Lock()
+	defer newAPISlowLogDomains.Unlock()
+	until, ok := newAPISlowLogDomains.until[domain]
+	if ok && time.Now().After(until) {
+		delete(newAPISlowLogDomains.until, domain)
+		return false
+	}
+	return ok
+}
+
+func markNewAPISlowLogDomain(domain string) {
+	newAPISlowLogDomains.Lock()
+	defer newAPISlowLogDomains.Unlock()
+	newAPISlowLogDomains.until[domain] = time.Now().Add(newAPISlowLogHint)
+}
+
+func newAPIUsageChildWindow(seconds int64) int64 {
+	switch {
+	case seconds > int64(newAPIBackfillAdaptiveSegment/time.Second):
+		return int64(newAPIBackfillAdaptiveSegment / time.Second)
+	case seconds > 60:
+		return 60
+	case seconds > int64(newAPIBackfillAdaptiveMinSegment/time.Second):
+		return int64(newAPIBackfillAdaptiveMinSegment / time.Second)
+	}
+	return 0
+}
+
+func fetchNewAPIUsageItemsInChildren(ctx context.Context, client *http.Client, row ChannelUpstreamAccount, cred newAPICredential, from, to, step int64, pacer *upstreamUsageRequestPacer) ([]newAPIUsageItem, error) {
+	var items []newAPIUsageItem
+	for childFrom := from; childFrom < to; childFrom += step {
+		child, err := fetchNewAPIUsageItemsSplit(ctx, client, row, cred, childFrom, min(to, childFrom+step), pacer)
+		if err != nil {
+			return nil, err
+		}
+		items = append(items, child...)
+	}
+	return items, nil
+}
+
 func fetchNewAPIUsageItemsSplit(ctx context.Context, client *http.Client, row ChannelUpstreamAccount, cred newAPICredential, from, to int64, pacer *upstreamUsageRequestPacer) ([]newAPIUsageItem, error) {
+	step := newAPIUsageChildWindow(to - from)
+	if step > 0 && to-from > int64(newAPIBackfillAdaptiveSegment/time.Second) && newAPISlowLogDomain(row.Domain) {
+		return fetchNewAPIUsageItemsInChildren(ctx, client, row, cred, from, to, step, pacer)
+	}
 	items, err := fetchNewAPIUsageItems(ctx, client, row, cred, from, to, pacer)
+	if err != nil && step > 0 && ctx.Err() == nil && isNewAPIBackfillTimeout(err) {
+		markNewAPISlowLogDomain(row.Domain)
+		return fetchNewAPIUsageItemsInChildren(ctx, client, row, cred, from, to, step, pacer)
+	}
 	var dense *upstreamUsageWindowTooDense
 	if !errors.As(err, &dense) {
 		return items, err
@@ -1116,7 +1255,7 @@ const (
 )
 
 func isNewAPIBackfillTimeout(err error) bool {
-	if err == nil {
+	if err == nil || isUpstreamLocalQueueTimeout(err) {
 		return false
 	}
 	if errors.Is(err, context.DeadlineExceeded) {
@@ -1278,7 +1417,7 @@ func (m *Monitor) syncNewAPIUsageBackfillWindowSegmented(ctx context.Context, ro
 			// The lane's 45-second parent deadline is a cooperative yield, not
 			// evidence that this source interval is slow. Preserve topology and
 			// checkpoints; only a request-local timeout may split the interval.
-			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			if errors.Is(ctx.Err(), context.DeadlineExceeded) || isUpstreamLocalQueueTimeout(err) {
 				return newAPIBackfillOperationBudgetYield(ctx, from, completed, len(stored))
 			}
 			if isNewAPIBackfillTimeout(err) && segment.SegmentTo-segment.SegmentFrom > int64(newAPIBackfillAdaptiveMinSegment/time.Second) {
@@ -1347,7 +1486,7 @@ func (m *Monitor) syncNewAPIUsageBackfillWindow(ctx context.Context, row Channel
 		return m.syncNewAPIUsageBackfillWindowSegmented(ctx, row, cred, from, to, pacer)
 	}
 	result, progress, complete, err := m.syncNewAPIUsageBackfillWindowDirect(ctx, row, cred, from, to, pacer, false)
-	if err != nil && errors.Is(ctx.Err(), context.DeadlineExceeded) {
+	if err != nil && (errors.Is(ctx.Err(), context.DeadlineExceeded) || isUpstreamLocalQueueTimeout(err)) {
 		return newAPIBackfillOperationBudgetYield(ctx, from, 0, 1)
 	}
 	if !isNewAPIBackfillTimeout(err) {
@@ -2558,12 +2697,23 @@ func planUpstreamUsageSync(row ChannelUpstreamAccount, now int64, backfillDays i
 	tailDue := row.UsageNextSyncAt == 0 || row.UsageNextSyncAt <= now
 	if tailDue {
 		plan.tailFrom, plan.tailTo = today, now
-		if row.Provider != upstreamProviderAICodeWith && row.Provider != upstreamProviderSub2API && row.UsageDataUntil > today {
+		if row.Provider != upstreamProviderAICodeWith && row.Provider != upstreamProviderSub2API && row.Provider != upstreamProviderVolcengine && row.UsageDataUntil > today {
 			plan.tailFrom = row.UsageDataUntil - int64(upstreamUsageTailOverlap/time.Second)
 			if plan.tailFrom < today {
 				plan.tailFrom = today
 			}
 			plan.tailFrom -= plan.tailFrom % 3600
+		}
+		if row.Provider == upstreamProviderVolcengine {
+			// Daily bills only, rated after the fact: always re-read whole recent
+			// China days (never hour-aligned partial days).
+			plan.tailFrom = today - volcengineTailDays*86400
+		}
+		if row.Provider == upstreamProviderOrion && plan.tailTo-plan.tailFrom > orionTailMaxSeconds {
+			// Cursor pages are capped per run; a busy day read from midnight
+			// in one window would never fit. Catch up in bounded windows: the
+			// next run continues from the committed data watermark.
+			plan.tailTo = plan.tailFrom + orionTailMaxSeconds
 		}
 		if row.Provider == upstreamProviderOpenOx && row.UsageDataUntil > 0 {
 			// The provider only filters calendar days. Recheck yesterday and
@@ -2589,9 +2739,14 @@ func planUpstreamUsageSync(row ChannelUpstreamAccount, now int64, backfillDays i
 		}
 		if row.Provider == upstreamProviderTokenForce {
 			// A busy whole day needs more pages than one run may request, so
-			// the day never completed. Import closed three-hour windows; the
+			// the day never completed. Import closed one-hour windows; the
 			// cursor advances after each.
 			plan.backfillTo = backfill + tokenForceBackfillWindowSeconds
+		}
+		if row.Provider == upstreamProviderOrion {
+			// One history run may request only a few cursor pages; import one
+			// closed hour at a time so a busy day still completes.
+			plan.backfillTo = backfill + 3600
 		}
 		if row.Provider == upstreamProviderAICodeWith {
 			plan.backfillTo = backfill + aiCodeWithUsageMaxDays*86400
@@ -2626,6 +2781,12 @@ func applyUpstreamUsageBackfillResult(row *ChannelUpstreamAccount, err error, no
 		return
 	}
 	row.UsageBackfillLastAttemptAt = now
+	if next, paused := upstreamPauseRetryAt(err, now); paused {
+		// Local queueing, local store contention or an open host circuit: the
+		// history task is postponed without consuming its failure budget.
+		row.UsageBackfillNextSyncAt = next
+		return
+	}
 	if err == nil {
 		row.UsageBackfillLastSuccessAt = now
 		row.UsageBackfillLastError = ""
@@ -2744,7 +2905,7 @@ func (m *Monitor) syncStoredUpstreamUsageWithPriority(ctx context.Context, domai
 	}
 	now := time.Now().Unix()
 	normalizeLegacyNewAPIBackfillBudgetState(&row, now)
-	if row.Provider != upstreamProviderNewAPI && row.Provider != upstreamProviderSub2API && row.Provider != upstreamProviderAICodeWith && row.Provider != upstreamProviderTokenForce && row.Provider != upstreamProviderOpenOx {
+	if row.Provider != upstreamProviderNewAPI && row.Provider != upstreamProviderSub2API && row.Provider != upstreamProviderAICodeWith && row.Provider != upstreamProviderTokenForce && row.Provider != upstreamProviderOpenOx && row.Provider != upstreamProviderOrion && row.Provider != upstreamProviderVolcengine {
 		err := fmt.Errorf("%s 暂未验证公开使用日志接口，未自动读取日志", upstreamProviderName(row.Provider))
 		row.UsageStatus = upstreamStatusUnsupported
 		row.UsageLastAttemptAt = now
@@ -2769,13 +2930,27 @@ func (m *Monitor) syncStoredUpstreamUsageWithPriority(ctx context.Context, domai
 			return row, persistErr
 		}
 		if err != nil {
-			return row, &upstreamStoredSyncError{message: sanitizeUpstreamErrorWithSecrets(err, upstreamCredentialSecrets(cred)...), retryAt: upstreamRetryAt(err)}
+			return row, storedSyncError(sanitizeUpstreamErrorWithSecrets(err, upstreamCredentialSecrets(cred)...), upstreamRetryAt(err), err)
 		}
 		return row, nil
 	}
 	secrets := upstreamCredentialSecrets(credential)
 	var syncUsage func(context.Context, int64, int64, *upstreamUsageRequestPacer) (upstreamUsageResult, error)
 	switch cred := credential.(type) {
+	case orionCredential:
+		if row.Provider != upstreamProviderOrion {
+			return row, fmt.Errorf("Orion 凭据与供应商不匹配")
+		}
+		syncUsage = func(callCtx context.Context, from, to int64, pacer *upstreamUsageRequestPacer) (upstreamUsageResult, error) {
+			return fetchOrionUsageWindow(callCtx, m.channelUpstreamUsageHTTPClient(), row, cred, from, to, pacer)
+		}
+	case volcengineCredential:
+		if row.Provider != upstreamProviderVolcengine {
+			return row, errVolcengineCredentialMismatch
+		}
+		syncUsage = func(callCtx context.Context, from, to int64, pacer *upstreamUsageRequestPacer) (upstreamUsageResult, error) {
+			return fetchVolcengineUsageWindow(callCtx, m.channelUpstreamUsageHTTPClient(), row, cred, from, to, pacer)
+		}
 	case openOxCredential:
 		if row.Provider != upstreamProviderOpenOx {
 			return row, fmt.Errorf("OpenOx 凭据与供应商不匹配")
@@ -2830,6 +3005,9 @@ func (m *Monitor) syncStoredUpstreamUsageWithPriority(ctx context.Context, domai
 	}
 	plan := planUpstreamUsageSyncForLane(row, now, backfillDays, lane)
 	plan, err = m.prioritizeSub2RecentUsage(ctx, row, now, plan)
+	if err == nil {
+		plan, err = m.prioritizeVolcengineSettlement(ctx, row, now, plan)
+	}
 	if err != nil {
 		if hasSub2PendingCloseout(row) && !errors.Is(err, context.Canceled) {
 			applyUpstreamUsageBackfillResult(&row, err, now, m.cfg, secrets...)
@@ -3008,7 +3186,7 @@ func (m *Monitor) syncStoredUpstreamUsageWithPriority(ctx context.Context, domai
 		if message == "" {
 			message = sanitizeUpstreamErrorWithSecrets(err, secrets...)
 		}
-		return row, &upstreamStoredSyncError{message: message, retryAt: operationRetryAt}
+		return row, storedSyncError(message, operationRetryAt, err)
 	}
 	return row, nil
 }
@@ -3081,7 +3259,7 @@ func (m *Monitor) loadDueUpstreamUsageAccountsForLane(ctx context.Context, now i
 	var rows []ChannelUpstreamAccount
 	if lane == upstreamUsageLaneTail {
 		err := m.storeDB.WithContext(ctx).Where(`enabled = ? AND usage_sync_enabled = ?
-			AND (usage_next_sync_at = 0 OR usage_next_sync_at <= ?)`, true, true, now).
+			AND (usage_next_sync_at = 0 OR usage_next_sync_at <= ?)`, true, true, now).Where(upstreamSyncNotPausedSQL).
 			Order("usage_next_sync_at ASC, domain ASC").Limit(limit).Find(&rows).Error
 		return rows, err
 	}
@@ -3101,7 +3279,7 @@ func (m *Monitor) loadDueUpstreamUsageAccountsForLane(ctx context.Context, now i
 		upstreamProviderAICodeWith, true, cstDayStart(now), upstreamStatusOK, now,
 		upstreamProviderSub2API, upstreamStatusOK, now, sub2CloseoutProgressPrefix+"%", true,
 		cstDayStart(now)-86400, cstDayStart(now), cstDayStart(now)-86400, cstDayStart(now),
-		cstDayStart(now), cstDayStart(now)-86400).
+		cstDayStart(now), cstDayStart(now)-86400).Where(upstreamSyncNotPausedSQL).
 		Order("usage_backfill_next_sync_at ASC, domain ASC").
 		Limit(limit).Find(&rows).Error
 	return rows, err
@@ -3148,9 +3326,17 @@ func (m *Monitor) runDueUpstreamUsageAccounts(ctx context.Context, rows []Channe
 		}
 		attempted++
 		if result.err != nil {
+			if reason, yielded := upstreamSyncYieldReason(result.err); yielded {
+				slog.Info("上游使用日志同步暂缓，稍后自动重试", "domain", result.row.Domain, "lane", lane, "reason", reason)
+				fill()
+				continue
+			}
 			message := result.synced.UsageLastError
 			if lane == upstreamUsageLaneHistory || message == "" {
 				message = result.synced.UsageBackfillLastError
+			}
+			if message == "" {
+				message = sanitizeUpstreamError(result.err)
 			}
 			slog.Warn("上游使用日志同步失败", "domain", result.row.Domain, "provider", result.row.Provider, "lane", lane, "err", message)
 		}

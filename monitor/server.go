@@ -524,6 +524,7 @@ func (m *Monitor) RegisterRoutes(r *gin.Engine) {
 		rootChannels.GET("/upstream/recovery-status", m.upstreamRecoveryStatusHandler)
 		rootChannels.POST("/upstream", m.saveChannelUpstreamHandler)
 		rootChannels.POST("/upstream/retirement", m.saveChannelUpstreamRetirementHandler)
+		rootChannels.POST("/domain-alias", m.saveChannelDomainAliasHandler)
 		rootChannels.POST("/upstream/sync", m.syncChannelUpstreamHandler)
 		rootChannels.POST("/upstream/usage-sync", m.syncChannelUpstreamUsageHandler)
 		rootChannels.POST("/upstream/usage-history/preview", m.previewSub2HistoricalDayHandler)

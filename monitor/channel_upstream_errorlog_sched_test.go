@@ -167,7 +167,8 @@ func TestFailUpstreamErrorLogStateDoesNotAdvanceWatermark(t *testing.T) {
 }
 
 // Continuous errors first back off, then allow bounded recovery probes, then
-// pause for an explicit recovery. The old policy retried forever every 2h.
+// fall back to a slow recheck (never shorter than the last probe delay), so a
+// recovered upstream resumes without an administrator.
 func TestFailUpstreamErrorLogStateBacksOffExponentially(t *testing.T) {
 	m := newTestMonitor(t)
 	state := UpstreamErrorLogSyncState{Domain: "d.example"}
@@ -185,8 +186,8 @@ func TestFailUpstreamErrorLogStateBacksOffExponentially(t *testing.T) {
 		}
 		prev = gap
 	}
-	if prev != upstreamAccountIsolatedUntil {
-		t.Errorf("bounded probes exhausted but task was not paused: %d", prev)
+	if prev != int64(upstreamTransientFailureRecheck/time.Second) {
+		t.Errorf("bounded probes exhausted: next=%d, want slow recheck", prev)
 	}
 }
 

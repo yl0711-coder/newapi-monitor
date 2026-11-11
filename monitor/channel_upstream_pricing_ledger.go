@@ -1767,7 +1767,7 @@ func (m *Monitor) syncDueUpstreamPricing(ctx context.Context) {
 			continue
 		}
 		var account ChannelUpstreamAccount
-		if err := m.storeDB.WithContext(ctx).Where("domain = ? AND enabled = ? AND usage_sync_enabled = ?", domain, true, true).First(&account).Error; err != nil || !pricingLedgerAccountSupported(account) {
+		if err := m.storeDB.WithContext(ctx).Where("domain = ? AND enabled = ? AND usage_sync_enabled = ?", domain, true, true).Where(upstreamSyncNotPausedSQL).First(&account).Error; err != nil || !pricingLedgerAccountSupported(account) {
 			continue
 		}
 		epoch := newAPIUpstreamAccountEpoch(account)

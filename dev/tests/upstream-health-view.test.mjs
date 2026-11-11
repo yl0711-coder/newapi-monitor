@@ -66,3 +66,20 @@ test('Spring per-key history distinguishes pause, retry and published completion
   assert.match(element('syncChannels').innerHTML,/历史已完成/);
   assert.doesNotMatch(element('syncChannels').innerHTML,/历史退避重试/);
 });
+test('retired domain without enabled channels: sync paused, not a failure',()=>{
+  const {ctx,element}=fixture();
+  const failed={...account,status:'error',balance_effective_status:'error',usage_status:'error',usage_tail_phase:'error',last_error:'boom'};
+  ctx.report={enabled:true,domains:[{domain:'retired.example',upstream:{...failed,sync_paused:true}},{domain:'live.example',upstream:{...account,balance_fresh:true,balance_effective_status:'ok',usage_history_phase:'complete'}}]};
+  assert.equal(vm.runInContext('syncRenderChannels(report)',ctx),'ok');
+  const html=element('syncChannels').innerHTML;
+  assert.match(html,/停止使用·暂停同步<\/small><b>1/);
+  assert.match(html,/已停止使用 · 暂停同步/);
+  assert.match(html,/余额同步正常<\/small><b>1\/1/);
+  assert.doesNotMatch(html,/boom/);
+  const status=ctx.window.channelDataStatus;
+  const report={meta:{data_coverage:{complete:true}},domains:[{domain:'retired.example',upstream:{...failed,sync_paused:true},upstream_usage:{}}]};
+  assert.equal(status.issues(report).length,0);
+  assert.match(status.render(report),/1 个上游已标记停止使用、没有启用渠道且 48 小时内无调用，已暂停自动同步余额和日志，不作为同步故障：retired\.example/);
+  report.domains[0].upstream={...failed,sync_paused:false};
+  assert.ok(status.issues(report).some(row=>row.scope==='retired.example'));
+});

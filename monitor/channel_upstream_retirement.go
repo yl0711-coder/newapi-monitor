@@ -3,7 +3,9 @@ package monitor
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -101,4 +103,53 @@ func (m *Monitor) saveChannelUpstreamRetirementHandler(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"domain": domain, "retiring": *input.Retiring, "updated_at": now})
+}
+
+// Automatic upstream sync pauses for a domain only while BOTH hold: an operator
+// marked it 停止使用 and none of its current NewAPI channels is enabled
+// (status 1). Either condition alone keeps syncing: a retiring supplier may
+// still carry traffic, and a disabled channel may be enabled again. The pause
+// is derived on every scheduler pass, so enabling a channel or clearing the
+// mark resumes from the stored watermarks; stored history is never removed.
+// Operator-triggered syncs are not affected.
+//
+// The pause starts only after the domain has had no recorded traffic for
+// upstreamSyncPauseGraceSeconds, so the usage up to the moment its last
+// channel was disabled, and the next day's history re-read of that final day,
+// are still imported before syncing stops.
+//
+// upstreamSyncNotPausedSQL is a WHERE fragment for channel_upstream_accounts.
+const upstreamSyncPauseGraceSeconds = 48 * 3600
+
+var upstreamSyncPausedDomainSQL = `SELECT 1 FROM channel_upstream_retirements r
+	WHERE r.retiring = 1 AND r.domain = LOWER(TRIM(%s))
+	AND NOT EXISTS (SELECT 1 FROM channel_snaps s
+		WHERE s.deleted_at = 0 AND s.status = 1 AND LOWER(TRIM(s.base_domain)) = r.domain)
+	AND NOT EXISTS (SELECT 1 FROM channel_snaps s JOIN stability_hour_samples h ON h.channel_id = s.id
+		WHERE LOWER(TRIM(s.base_domain)) = r.domain
+		AND h.hour_ts >= CAST(strftime('%%s','now') AS INTEGER) - ` + strconv.Itoa(upstreamSyncPauseGraceSeconds) + `
+		AND h.success + h.anomaly + h.failed > 0)`
+
+var upstreamSyncNotPausedSQL = "NOT EXISTS (" + fmt.Sprintf(upstreamSyncPausedDomainSQL, "channel_upstream_accounts.domain") + ")"
+
+// upstreamSyncPausedDomains lists the configured domains whose automatic sync is
+// paused, for display. Old closed snapshots without the table pause nothing.
+func (m *Monitor) upstreamSyncPausedDomains(ctx context.Context) (map[string]bool, error) {
+	result := map[string]bool{}
+	if m == nil || m.storeDB == nil {
+		return nil, errors.New("渠道本地库不可用")
+	}
+	if !m.storeDB.Migrator().HasTable(&ChannelUpstreamRetirement{}) {
+		return result, nil
+	}
+	var domains []string
+	err := m.storeDB.WithContext(ctx).Raw(`SELECT a.domain FROM channel_upstream_accounts a
+		WHERE EXISTS (` + fmt.Sprintf(upstreamSyncPausedDomainSQL, "a.domain") + `)`).Scan(&domains).Error
+	if err != nil {
+		return nil, err
+	}
+	for _, domain := range domains {
+		result[domain] = true
+	}
+	return result, nil
 }

@@ -914,7 +914,7 @@ func (m *Monitor) syncDueUpstreamErrorLogs(ctx context.Context) {
 	// 只取启用了日志同步授权的账户。UsageSyncEnabled 是管理员对
 	// 「允许读这个上游的日志」的授权，错误日志同属日志，不绕过它。
 	if err := m.storeDB.WithContext(roundCtx).
-		Where("enabled = ? AND usage_sync_enabled = ?", true, true).
+		Where("enabled = ? AND usage_sync_enabled = ?", true, true).Where(upstreamSyncNotPausedSQL).
 		Order("domain ASC").Find(&rows).Error; err != nil {
 		slog.Warn("读取上游账户失败，本轮错误日志采集跳过", "err", err)
 		return
@@ -1160,6 +1160,16 @@ func (m *Monitor) saveUpstreamErrorLogState(ctx context.Context, state *Upstream
 // **不推进水位**：失败那段必须留给下一轮重试，否则会永久漏掉。
 func (m *Monitor) failUpstreamErrorLogState(ctx context.Context, state *UpstreamErrorLogSyncState, now int64, cause error) error {
 	if errors.Is(cause, context.Canceled) {
+		return cause
+	}
+	if next, paused := upstreamPauseRetryAt(cause, now); paused {
+		// Local postponement: keep status and error, only reschedule.
+		state.LastAttemptAt, state.NextSyncAt = now, next
+		commitCtx, cancel := upstreamUsageLocalCommitContext(ctx)
+		defer cancel()
+		if err := m.saveUpstreamErrorLogState(commitCtx, state, now); err != nil {
+			return errors.Join(cause, err)
+		}
 		return cause
 	}
 	state.Status = upstreamStatusError

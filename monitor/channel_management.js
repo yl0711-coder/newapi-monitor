@@ -194,6 +194,12 @@ function init(){
   $('cmUpstreamSave')?.addEventListener('click',saveUpstream);
   $('cmUpstreamDetect')?.addEventListener('click',diagnoseUpstream);
   $('cmUpstreamBaseURL')?.addEventListener('input',resetUpstreamDiagnostic);
+  $('cmDomainAlias')?.addEventListener('click',event=>{
+    const remove=event.target.closest('[data-cm-alias-remove]');
+    if(remove){saveDomainAlias(remove.dataset.cmAliasRemove,'',remove);return}
+    const save=event.target.closest('[data-cm-alias-save]');
+    if(save&&cm.upstreamDomain)saveDomainAlias(cm.upstreamDomain.domain,$('cmDomainAliasTarget')?.value||'',save);
+  });
   $('cmUpstreamProvider')?.addEventListener('change',resetUpstreamDiagnostic);
   $('cmUpstreamSync')?.addEventListener('click',syncUpstreamNow);
   $('cmUpstreamUsageSync')?.addEventListener('click',syncUpstreamUsageNow);
@@ -1277,7 +1283,7 @@ function resetUpstreamDiagnostic(clearRecovery=true){
 function renderUpstreamDiagnostic(data){
   const box=$('cmUpstreamDiagnostic');if(!box)return;
   const labels={ok:'通过',warning:'需确认',error:'异常',skipped:'未检测'};
-  const providers={newapi:'NewAPI',sub2api:'Sub2API',aicodewith:'AICodeWith（春秋）',tokenforce:'海南海纳（TokenForce MaaS）',openox:'OpenOx',unknown:'尚未识别'};
+  const providers={newapi:'NewAPI',sub2api:'Sub2API',aicodewith:'AICodeWith（春秋）',tokenforce:'海南海纳（TokenForce MaaS）',openox:'OpenOx',orion:'Orion',volcengine:'火山引擎（方舟）',unknown:'尚未识别'};
   const confidence={configured:'按已保存类型测试',compatible:'兼容接口特征',suspected:'仅疑似，需确认',unknown:'信息不足'};
   box.hidden=false;
   box.innerHTML=`<h3>检测结果：${esc(providers[data.provider]||'尚未识别')}</h3><small>${esc(confidence[data.confidence]||'信息不足')}</small>
@@ -1375,10 +1381,12 @@ function syncUpstreamFields(){
   document.querySelectorAll('.cm-upstream-tokenforce').forEach(el=>el.hidden=provider!=='tokenforce');
   if(provider==='tokenforce'&&$('cmUpstreamUnitPerUSD'))$('cmUpstreamUnitPerUSD').value='1';
   document.querySelectorAll('.cm-upstream-openox').forEach(el=>el.hidden=provider!=='openox');
+  document.querySelectorAll('.cm-upstream-orion').forEach(el=>el.hidden=provider!=='orion');
+  document.querySelectorAll('.cm-upstream-volcengine').forEach(el=>el.hidden=provider!=='volcengine');
   const sub2AuthMode=$('cmUpstreamAuthMode')?.value||'password';
   document.querySelectorAll('.cm-upstream-sub2-password').forEach(el=>el.hidden=provider!=='sub2api'||sub2AuthMode!=='password');
   document.querySelectorAll('.cm-upstream-sub2-refresh').forEach(el=>el.hidden=provider!=='sub2api'||sub2AuthMode!=='refresh_token');
-  const usageSupported=provider==='newapi'||provider==='sub2api'||provider==='aicodewith'||provider==='tokenforce'||provider==='openox';
+  const usageSupported=provider==='newapi'||provider==='sub2api'||provider==='aicodewith'||provider==='tokenforce'||provider==='openox'||provider==='orion'||provider==='volcengine';
   const usageOption=document.querySelector('.cm-upstream-usage-option');
   if(usageOption)usageOption.hidden=!usageSupported;
   if($('cmUpstreamUsageLabel'))$('cmUpstreamUsageLabel').textContent=provider==='aicodewith'?'同步按 Key 消费账单':provider==='sub2api'?'同步消费汇总（Sub2API）':provider==='tokenforce'?'同步调用明细（TokenForce）':'同步消费日志（NewAPI）';
@@ -1393,6 +1401,14 @@ function syncUpstreamFields(){
   if(provider==='openox'){
     if($('cmUpstreamUsageLabel'))$('cmUpstreamUsageLabel').textContent='同步 OpenOx 账面用量（含订阅抵扣）';
     if($('cmUpstreamUsageHelp'))$('cmUpstreamUsageHelp').textContent='按中国自然日分页读取，再汇总为小时；估算记录保留暂定标记，不重建费用。不代表钱包实际扣款或现金成本。';
+  }
+  if(provider==='orion'){
+    if($('cmUpstreamUsageLabel'))$('cmUpstreamUsageLabel').textContent='同步请求明细（Orion）';
+    if($('cmUpstreamUsageHelp'))$('cmUpstreamUsageHelp').textContent='按小时游标分页读取已应答请求的计费金额并汇总；完整取得窗口后才替换本地汇总，不保存上游原始内容';
+  }
+  if(provider==='volcengine'){
+    if($('cmUpstreamUsageLabel'))$('cmUpstreamUsageLabel').textContent='同步按日账单（火山引擎）';
+    if($('cmUpstreamUsageHelp'))$('cmUpstreamUsageHelp').textContent='读取费用中心账单明细的应付金额（人民币），按中国自然日汇总；最近三天反复复核，结算前标记待结算，不伪造小时明细';
   }
 }
 function upstreamState(status,enabled=true){
@@ -1504,13 +1520,13 @@ async function openUpstream(domainKey){
   const domain=(cm.report.domains||[]).find(item=>item.key===domainKey&&item.configured);
   if(!domain)return;
   cm.upstreamDomain=domain;cm.upstreamConfig=null;cm.upstreamFunds=null;
-  $('cmUpstreamOpenOxToken').value='';
+  $('cmUpstreamOpenOxToken').value='';$('cmUpstreamOrionKey').value='';$('cmUpstreamVolcAK').value='';$('cmUpstreamVolcSK').value='';
   resetUpstreamDiagnostic();$('cmUpstreamDetect').disabled=true;
   $('cmUpstreamTitle').textContent=`${domain.domain} · 余额自动同步`;
   $('cmUpstreamSubtitle').textContent='正在读取当前配置…';
   $('cmUpstreamStatus').hidden=true;$('cmUpstreamFunds').hidden=true;
-  $('cmUpstreamProvider').value='newapi';$('cmUpstreamBaseURL').value=`https://${domain.domain}`;
-  $('cmUpstreamUserID').value='';$('cmUpstreamAccessToken').value='';$('cmUpstreamSessionID').value='';$('cmUpstreamEmail').value='';$('cmUpstreamAuthMode').value='password';$('cmUpstreamPassword').value='';$('cmUpstreamRefreshToken').value='';$('cmUpstreamOrgID').value='';$('cmUpstreamUnitPerUSD').value='';$('cmUpstreamTokenForceRefreshToken').value='';resetAICodeWithKeyInputs();updateAICodeWithKeyHelp(null);$('cmUpstreamEnabled').checked=true;$('cmUpstreamUsageEnabled').checked=false;
+  $('cmUpstreamProvider').value='newapi';$('cmUpstreamBaseURL').value=`https://${domain.domain}`;if($('cmUpstreamCrossDomain'))$('cmUpstreamCrossDomain').checked=false;
+  $('cmUpstreamUserID').value='';$('cmUpstreamAccessToken').value='';$('cmUpstreamSessionID').value='';if($('cmUpstreamClearSession'))$('cmUpstreamClearSession').checked=false;$('cmUpstreamEmail').value='';$('cmUpstreamAuthMode').value='password';$('cmUpstreamPassword').value='';$('cmUpstreamRefreshToken').value='';$('cmUpstreamOrgID').value='';$('cmUpstreamUnitPerUSD').value='';$('cmUpstreamTokenForceRefreshToken').value='';resetAICodeWithKeyInputs();updateAICodeWithKeyHelp(null);$('cmUpstreamEnabled').checked=true;$('cmUpstreamUsageEnabled').checked=false;
   $('cmUpstreamSync').hidden=true;$('cmUpstreamUsageSync').hidden=true;$('cmUpstreamFundsSync').hidden=true;showUpstreamMessage('');syncUpstreamFields();
   $('cmUpstreamMask').hidden=false;$('cmUpstreamDialog').classList.add('show');$('cmUpstreamDialog').setAttribute('aria-hidden','false');
   document.body.classList.add('cm-dialog-open');
@@ -1521,7 +1537,7 @@ async function openUpstream(domainKey){
     if(cm.upstreamDomain!==domain)return;
     cm.upstreamConfig=data;
     $('cmUpstreamDetect').disabled=false;
-    $('cmUpstreamProvider').value=data.provider||'newapi';$('cmUpstreamBaseURL').value=data.base_url||`https://${domain.domain}`;
+    $('cmUpstreamProvider').value=data.provider||'newapi';$('cmUpstreamBaseURL').value=data.base_url||`https://${domain.domain}`;if($('cmUpstreamCrossDomain'))$('cmUpstreamCrossDomain').checked=data.cross_domain_base_url===true;
     $('cmUpstreamUserID').value=data.user_id||'';$('cmUpstreamOrgID').value=data.provider==='tokenforce'?(data.user_id||''):'';$('cmUpstreamUnitPerUSD').value=data.provider==='tokenforce'?(data.unit_per_usd||''):'';$('cmUpstreamEmail').value=data.email||'';$('cmUpstreamEnabled').checked=data.enabled!==false;$('cmUpstreamUsageEnabled').checked=!!data.usage_sync_enabled;
     $('cmUpstreamSubtitle').textContent=data.account?.configured
       ?'令牌已加密保存；敏感字段留空表示保持原连接不变。'
@@ -1529,16 +1545,43 @@ async function openUpstream(domainKey){
     $('cmUpstreamSync').hidden=!data.account?.configured||data.enabled===false;
     $('cmUpstreamUsageSync').hidden=!data.account?.configured||data.enabled===false||!data.account?.usage_sync_enabled;
     if(data.provider==='aicodewith')renderAICodeWithKeySlots(data.account?.api_key_slots||[]);
-    renderUpstreamStatus(data.account);updateAICodeWithKeyHelp(data.account);syncUpstreamFields();showUpstreamMessage('');if(data.account?.configured)await loadUpstreamFunds(domain.domain);else renderUpstreamFunds(null);
+    renderUpstreamStatus(data.account);updateAICodeWithKeyHelp(data.account);syncUpstreamFields();showUpstreamMessage('');renderDomainAlias(domain,data.account?.configured===true);if(data.account?.configured)await loadUpstreamFunds(domain.domain);else renderUpstreamFunds(null);
     setTimeout(()=>$('cmUpstreamBaseURL')?.focus(),20);
   }catch(error){showUpstreamMessage(error.message||'读取配置失败。',true)}
 }
+// Domain alias: another channel address of an already configured supplier
+// (for example its origin IP) is attributed to that supplier's domain.
+function domainAliasTargets(domain){
+  const aliased=new Set((cm.report?.domains||[]).flatMap(d=>d.aliases||[]));
+  return (cm.report?.domains||[]).filter(d=>d.domain!==domain.domain&&d.upstream?.configured&&!aliased.has(d.domain)).map(d=>d.domain).sort();
+}
+function renderDomainAlias(domain,accountConfigured){
+  const box=$('cmDomainAlias');if(!box)return;
+  const aliases=domain?.aliases||[];let html='';
+  if(aliases.length){
+    html=`<b>已归并到本域名的渠道地址</b><br>${aliases.map(alias=>`${esc(alias)} <button type="button" class="cm-upstream-cancel" data-cm-alias-remove="${esc(alias)}">取消归并</button>`).join('<br>')}<br><small>这些地址的渠道按本域名的上游账户核对成本；经营核算只从归并生效时起按本域名归属。</small>`;
+  }else if(domain&&!accountConfigured){
+    const targets=domainAliasTargets(domain);
+    if(targets.length)html=`<b>这是已配置上游的另一个地址？</b><br><small>如果该渠道地址（例如供应商的源站 IP）属于某个已配置上游，可以归并过去，渠道用量将与该上游账单对应。只影响 Monitor 统计，不改 NewAPI 路由；历史金额不迁移。</small><br><select id="cmDomainAliasTarget">${targets.map(target=>`<option value="${esc(target)}">${esc(target)}</option>`).join('')}</select> <button type="button" class="cm-upstream-save" data-cm-alias-save="1">归并到所选上游</button>`;
+  }
+  box.innerHTML=html;box.hidden=!html;
+}
+async function saveDomainAlias(alias,target,button){
+  if(button)button.disabled=true;
+  try{
+    const res=await fetch('/channels/domain-alias',{method:'POST',cache:'no-store',headers:{Accept:'application/json','Content-Type':'application/json'},body:JSON.stringify({alias,domain:target})});
+    if(res.status===401){location.href='/login';return}
+    const data=await res.json();if(!res.ok)throw new Error(data.error||`HTTP ${res.status}`);
+    showUpstreamMessage(target?`已归并到 ${target}：${data.note||''}`:`已取消 ${alias} 的归并，下一轮渠道目录同步生效`);
+    cm.loaded=false;await loadReport();
+  }catch(error){showUpstreamMessage(error.message||'保存域名归并失败',true)}finally{if(button)button.disabled=false}
+}
 function closeUpstream(){
-  $('cmUpstreamOpenOxToken').value='';
-  resetUpstreamDiagnostic();
+  $('cmUpstreamOpenOxToken').value='';$('cmUpstreamOrionKey').value='';$('cmUpstreamVolcAK').value='';$('cmUpstreamVolcSK').value='';
+  resetUpstreamDiagnostic();renderDomainAlias(null,false);
   if(!cm.upstreamDomain)return;
   cm.upstreamDomain=null;cm.upstreamConfig=null;cm.upstreamFunds=null;renderUpstreamFunds(null);
-  $('cmUpstreamAccessToken').value='';$('cmUpstreamSessionID').value='';$('cmUpstreamPassword').value='';$('cmUpstreamRefreshToken').value='';$('cmUpstreamTokenForceRefreshToken').value='';resetAICodeWithKeyInputs();updateAICodeWithKeyHelp(null);
+  $('cmUpstreamAccessToken').value='';$('cmUpstreamSessionID').value='';if($('cmUpstreamClearSession'))$('cmUpstreamClearSession').checked=false;$('cmUpstreamPassword').value='';$('cmUpstreamRefreshToken').value='';$('cmUpstreamTokenForceRefreshToken').value='';resetAICodeWithKeyInputs();updateAICodeWithKeyHelp(null);
   $('cmUpstreamMask').hidden=true;$('cmUpstreamDialog').classList.remove('show');$('cmUpstreamDialog').setAttribute('aria-hidden','true');
   document.body.classList.remove('cm-dialog-open');showUpstreamMessage('');
 }
@@ -1547,14 +1590,21 @@ async function saveUpstream(){
   if(!cm.upstreamDomain||!cm.report?.finance?.can_edit)return;
   const provider=$('cmUpstreamProvider').value,baseURL=$('cmUpstreamBaseURL').value.trim();
   if(!baseURL){showUpstreamMessage('请填写站点地址。',true);return}
-  const usageSupported=provider==='newapi'||provider==='sub2api'||provider==='aicodewith'||provider==='tokenforce'||provider==='openox';
-  const payload={domain:cm.upstreamDomain.domain,provider,base_url:baseURL,enabled:$('cmUpstreamEnabled').checked,usage_sync_enabled:usageSupported&&$('cmUpstreamUsageEnabled').checked};
+  const usageSupported=provider==='newapi'||provider==='sub2api'||provider==='aicodewith'||provider==='tokenforce'||provider==='openox'||provider==='orion'||provider==='volcengine';
+  const payload={domain:cm.upstreamDomain.domain,provider,base_url:baseURL,cross_domain_base_url:!!$('cmUpstreamCrossDomain')?.checked,enabled:$('cmUpstreamEnabled').checked,usage_sync_enabled:usageSupported&&$('cmUpstreamUsageEnabled').checked};
   if(provider==='newapi'){
-    payload.user_id=Number($('cmUpstreamUserID').value);payload.access_token=$('cmUpstreamAccessToken').value.trim();payload.session_id=$('cmUpstreamSessionID').value.trim();
+    payload.user_id=Number($('cmUpstreamUserID').value);payload.access_token=$('cmUpstreamAccessToken').value.trim();payload.session_id=$('cmUpstreamSessionID').value.trim();payload.clear_session_id=!!$('cmUpstreamClearSession')?.checked;
     if(!Number.isInteger(payload.user_id)||payload.user_id<=0){showUpstreamMessage('请填写有效的 NewAPI 用户 ID。',true);return}
   }else if(provider==='openox'){
     payload.access_token=$('cmUpstreamOpenOxToken').value.trim();
     if(!payload.access_token&&cm.upstreamConfig?.provider!=='openox'){showUpstreamMessage('首次连接请填写 OpenOx 后台 auth_token。',true);return}
+  }else if(provider==='orion'){
+    payload.access_token=$('cmUpstreamOrionKey').value.trim();
+    if(!payload.access_token&&cm.upstreamConfig?.provider!=='orion'){showUpstreamMessage('首次连接请填写 Orion 管理密钥（smk_ 开头）。',true);return}
+  }else if(provider==='volcengine'){
+    payload.access_key_id=$('cmUpstreamVolcAK').value.trim();payload.secret_access_key=$('cmUpstreamVolcSK').value.trim();
+    if(!!payload.access_key_id!==!!payload.secret_access_key){showUpstreamMessage('AccessKey ID 和 Secret Access Key 需要一起填写。',true);return}
+    if(!payload.access_key_id&&cm.upstreamConfig?.provider!=='volcengine'){showUpstreamMessage('首次连接请填写火山引擎费用中心只读子用户的 AccessKey ID 和 Secret Access Key。',true);return}
   }else if(provider==='sub2api'){
     const authMode=$('cmUpstreamAuthMode').value;payload.email=$('cmUpstreamEmail').value.trim();
     if(authMode==='refresh_token')payload.refresh_token=$('cmUpstreamRefreshToken').value.trim();else payload.password=$('cmUpstreamPassword').value;
@@ -1572,8 +1622,8 @@ async function saveUpstream(){
   const button=$('cmUpstreamSave');button.disabled=true;$('cmUpstreamSync').disabled=true;$('cmUpstreamUsageSync').disabled=true;showUpstreamMessage(payload.enabled?'正在安全连接并读取余额…':'正在停用自动同步…');
   try{
     const res=await fetch('/channels/upstream',{method:'POST',headers:{Accept:'application/json','Content-Type':'application/json'},body:JSON.stringify(payload)});
-    $('cmUpstreamOpenOxToken').value='';
-    $('cmUpstreamAccessToken').value='';$('cmUpstreamSessionID').value='';$('cmUpstreamPassword').value='';$('cmUpstreamRefreshToken').value='';$('cmUpstreamTokenForceRefreshToken').value='';payload.access_token='';payload.session_id='';payload.password='';payload.refresh_token='';payload.add_api_key_slots=[];payload.rename_api_key_slots=[];payload.remove_api_key_ids=[];
+    $('cmUpstreamOpenOxToken').value='';$('cmUpstreamOrionKey').value='';$('cmUpstreamVolcAK').value='';$('cmUpstreamVolcSK').value='';payload.access_key_id='';payload.secret_access_key='';
+    $('cmUpstreamAccessToken').value='';$('cmUpstreamSessionID').value='';if($('cmUpstreamClearSession'))$('cmUpstreamClearSession').checked=false;$('cmUpstreamPassword').value='';$('cmUpstreamRefreshToken').value='';$('cmUpstreamTokenForceRefreshToken').value='';payload.access_token='';payload.session_id='';payload.password='';payload.refresh_token='';payload.add_api_key_slots=[];payload.rename_api_key_slots=[];payload.remove_api_key_ids=[];
     if(res.status===401){location.href='/login';return}
     const data=await res.json();if(!res.ok)throw new Error(data.error||`HTTP ${res.status}`);
     cm.upstreamConfig={...(cm.upstreamConfig||{}),provider,base_url:baseURL,enabled:payload.enabled,account:data.account};
@@ -1582,7 +1632,7 @@ async function saveUpstream(){
     cm.loaded=false;await loadReport();
     if(data.sync_error){showUpstreamMessage(`配置已保存，但本次同步失败：${data.sync_error}`,true);return}
     closeUpstream();
-  }catch(error){$('cmUpstreamAccessToken').value='';$('cmUpstreamSessionID').value='';$('cmUpstreamPassword').value='';$('cmUpstreamRefreshToken').value='';$('cmUpstreamTokenForceRefreshToken').value='';if(provider==='aicodewith')renderAICodeWithKeySlots(cm.upstreamConfig?.account?.api_key_slots||[]);showUpstreamMessage(error.message||'保存失败，请稍后重试。',true)}finally{$('cmUpstreamOpenOxToken').value='';payload.access_token='';button.disabled=false;$('cmUpstreamSync').disabled=false;$('cmUpstreamUsageSync').disabled=false}
+  }catch(error){$('cmUpstreamAccessToken').value='';$('cmUpstreamSessionID').value='';if($('cmUpstreamClearSession'))$('cmUpstreamClearSession').checked=false;$('cmUpstreamPassword').value='';$('cmUpstreamRefreshToken').value='';$('cmUpstreamTokenForceRefreshToken').value='';if(provider==='aicodewith')renderAICodeWithKeySlots(cm.upstreamConfig?.account?.api_key_slots||[]);showUpstreamMessage(error.message||'保存失败，请稍后重试。',true)}finally{$('cmUpstreamOpenOxToken').value='';$('cmUpstreamOrionKey').value='';$('cmUpstreamVolcAK').value='';$('cmUpstreamVolcSK').value='';payload.access_token='';payload.access_key_id='';payload.secret_access_key='';button.disabled=false;$('cmUpstreamSync').disabled=false;$('cmUpstreamUsageSync').disabled=false}
 }
 async function syncUpstreamNow(){
   if(!cm.upstreamDomain)return;

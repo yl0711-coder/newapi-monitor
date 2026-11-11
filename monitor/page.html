@@ -1178,6 +1178,7 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
         <button type="button" class="cm-upstream-sync" id="cmUpstreamDetect">检测类型 / 配置问题</button>
       </section>
       <section class="cm-upstream-note" id="cmUpstreamDiagnostic" aria-live="polite" hidden></section>
+      <section class="cm-upstream-note" id="cmDomainAlias" hidden></section>
       <section class="cm-upstream-status" id="cmUpstreamStatus" hidden></section>
       <section class="cm-upstream-funds" id="cmUpstreamFunds" hidden></section>
       <section class="cm-upstream-note">
@@ -1185,12 +1186,15 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
         <span>余额默认每 5 分钟同步；使用数据仅在显式开启后低频汇总到 Monitor 本地，页面查询不会访问上游。</span>
       </section>
       <section class="cm-upstream-fields">
-        <label><span>中转站类型</span><select id="cmUpstreamProvider"><option value="newapi">NewAPI</option><option value="sub2api">Sub2API</option><option value="aicodewith">AICodeWith（春秋）</option><option value="tokenforce">海南海纳（TokenForce MaaS）</option><option value="openox">OpenOx</option></select></label>
+        <label><span>中转站类型</span><select id="cmUpstreamProvider"><option value="newapi">NewAPI</option><option value="sub2api">Sub2API</option><option value="aicodewith">AICodeWith（春秋）</option><option value="tokenforce">海南海纳（TokenForce MaaS）</option><option value="openox">OpenOx</option><option value="orion">Orion（modelrouter 等）</option><option value="volcengine">火山引擎（方舟）</option></select></label>
+        <label class="cm-upstream-orion wide" hidden><span>Orion 管理密钥</span><input id="cmUpstreamOrionKey" type="password" autocomplete="new-password" placeholder="已配置时留空保持原连接"><small>登录上游控制台 → 管理密钥（Management keys）→ 新建，复制 smk_ 开头的密钥（只显示一次）。不是模型调用 Key；不会过期或轮换，被撤销后需重新导入。</small></label>
+        <label class="cm-upstream-volcengine" hidden><span>AccessKey ID</span><input id="cmUpstreamVolcAK" type="password" autocomplete="new-password" placeholder="已配置时留空保持原连接"></label>
+        <label class="cm-upstream-volcengine wide" hidden><span>Secret Access Key</span><input id="cmUpstreamVolcSK" type="password" autocomplete="new-password" placeholder="已配置时留空保持原连接"><small>火山引擎控制台 → 访问控制 → 新建子用户，只授予费用中心只读权限后创建 AccessKey。不要使用主账号密钥或模型 API Key。余额为可用余额（人民币）；消费为账单应付金额，仅按天汇总。金额按人民币原值记入，与海纳相同：务必在倍率配置里为该主域名填写“上游充值比例”（例如 1 美元到账需付 7.2 元，则填 1/7.2），否则人民币会被当作美元，成本约偏高 7 倍。</small></label>
         <label class="cm-upstream-openox wide" hidden><span>OpenOx 后台令牌</span><input id="cmUpstreamOpenOxToken" type="password" autocomplete="new-password" placeholder="已配置时留空保持原连接"><small>登录 https://api.openox.net → 开发者工具 → Application → Local Storage → 当前站点 → auth_token。不是模型 Key；到期需重新登录并导入。余额仅指可用钱包，不含订阅额度；用量包含订阅抵扣，暂不计算现金修正成本和可用天数。订阅订单及退款暂不作为充值流水导入。</small></label>
-        <label class="wide"><span>站点地址</span><input id="cmUpstreamBaseURL" type="url" placeholder="https://example.com" autocomplete="url"><small>填写站点根地址，不要追加 API 路径</small></label>
+        <label class="wide"><span>站点地址</span><input id="cmUpstreamBaseURL" type="url" placeholder="https://example.com" autocomplete="url"><small>填写站点根地址，不要追加 API 路径</small><span class="cm-upstream-inline-check"><input id="cmUpstreamCrossDomain" type="checkbox"> 站点地址与渠道域名不同（已核实是同一供应商的控制台，凭据会发往该地址）</span></label>
         <label class="cm-upstream-newapi"><span>用户 ID</span><input id="cmUpstreamUserID" type="number" min="1" step="1" inputmode="numeric" placeholder="例如 123"></label>
-        <label class="cm-upstream-newapi wide"><span>用户访问令牌</span><input id="cmUpstreamAccessToken" type="password" autocomplete="new-password" placeholder="已配置时留空表示保持不变"><small>个人设置中的系统访问令牌，不是模型调用 Key</small></label>
-        <label class="cm-upstream-newapi wide"><span>会话 SID（可选）</span><input id="cmUpstreamSessionID" type="password" autocomplete="new-password" placeholder="长期令牌站点留空；短期令牌站点填写"><small>仅用于访问令牌自动续期。可填 Application → Local Storage 中 auth_session 的 sid，也可直接粘贴完整 auth_session JSON；勿填模型 API Key。</small></label>
+        <label class="cm-upstream-newapi wide"><span>用户访问令牌</span><input id="cmUpstreamAccessToken" type="password" autocomplete="new-password" placeholder="已配置时留空表示保持不变"><small>个人设置中的系统访问令牌，不是模型调用 Key。新版 NewAPI 改用安全设置中 nap_ 开头的个人访问令牌，需勾选 profile:read（余额）和 usage:read（日志）。</small></label>
+        <label class="cm-upstream-newapi wide"><span>会话 SID（可选）</span><input id="cmUpstreamSessionID" type="password" autocomplete="new-password" placeholder="长期令牌站点留空；短期令牌站点填写"><small>仅用于访问令牌自动续期。可填 Application → Local Storage 中 auth_session 的 sid，也可直接粘贴完整 auth_session JSON；勿填模型 API Key。nap_ 个人访问令牌长期有效，不需要会话。</small><span class="cm-upstream-inline-check"><input id="cmUpstreamClearSession" type="checkbox"> 清除已保存的会话 SID</span></label>
         <label class="cm-upstream-sub2api"><span>登录邮箱</span><input id="cmUpstreamEmail" type="email" autocomplete="username" placeholder="name@example.com"></label>
         <label class="cm-upstream-sub2api"><span>认证方式</span><select id="cmUpstreamAuthMode"><option value="password">邮箱密码</option><option value="refresh_token">导入已登录会话</option></select></label>
         <label class="cm-upstream-sub2api cm-upstream-sub2-password wide"><span>登录密码</span><input id="cmUpstreamPassword" type="password" autocomplete="new-password" placeholder="已连接时留空表示沿用当前会话"><small>适用于没有验证码或 Turnstile 的站点；密码只用于本次换取令牌</small></label>
@@ -2745,9 +2749,11 @@ function syncRenderChannels(report){
     if(status==='backfilling')return {label:'历史补全',level:'warn'};
     return {label:'等待同步',level:'warn'};
   };
-  let level='ok',enabledAccounts=0,balanceHealthy=0,usageEnabled=0,usageHealthy=0,historyComplete=0,historyRetry=0,historyPaused=0;
+  let level='ok',pausedAccounts=0,enabledAccounts=0,balanceHealthy=0,usageEnabled=0,usageHealthy=0,historyComplete=0,historyRetry=0,historyPaused=0;
   const cards=domains.map(x=>{
     const u=x.upstream||{},balance=statusInfo(u.balance_effective_status||u.status,u.enabled),usage=u.usage_sync_enabled?statusInfo(u.usage_tail_phase||u.usage_effective_status||u.usage_status,u.enabled):{label:'未开启',level:'neutral'},history=u.usage_sync_enabled?statusInfo(u.usage_history_phase,u.enabled):{label:'未开启',level:'neutral'},pricingStatus=statusInfo(u.pricing_ledger_status,u.enabled),errorLog=statusInfo(u.error_log_status,u.enabled);
+    // 停止使用且无启用渠道：自动同步已暂停，只保留历史，不计入健康统计也不算故障。
+    if(u.sync_paused){pausedAccounts++;return `<article class="sync-upstream-account"><div class="sync-upstream-head"><div><b>${esc(x.domain||x.key||'—')}</b><small>${esc(u.provider_name||u.provider||'—')} · ${esc(u.account_masked||'已配置账户')}</small></div><span class="sync-status neutral">已停止使用 · 暂停同步</span></div><p class="sync-upstream-note">已标记停止使用、没有启用渠道且 48 小时内无调用，自动同步余额和日志已暂停，已同步的历史数据保留。重新启用渠道或取消停止使用标记后自动恢复。最近余额同步 ${syncTime(u.last_success_at)} · 消费截至 ${syncTime(u.usage_data_until)}</p></article>`}
     if(u.enabled){enabledAccounts++;if(balance.level==='ok')balanceHealthy++}
     if(u.enabled&&u.usage_sync_enabled&&u.usage_worker_enabled){usageEnabled++;if(usage.level==='ok')usageHealthy++;if(history.level==='ok')historyComplete++;if(u.usage_history_phase==='retry')historyRetry++;if(u.usage_history_phase==='paused')historyPaused++}
     let accountLevel='ok';
@@ -2788,7 +2794,7 @@ function syncRenderChannels(report){
 	  <section class="sync-upstream-lane" style="grid-column:1/-1"><header><b>上游错误证据</b><span class="sync-status ${errorLog.level}">${esc(errorLog.label)}</span></header>${errorLogContent}</section>
     </div></article>`;
   }).join('');
-  el.innerHTML=`<div class="sync-upstream-summary"><div><small>已配置账户</small><b>${fmtNum(domains.length)}</b></div><div><small>余额同步正常</small><b>${fmtNum(balanceHealthy)}/${fmtNum(enabledAccounts)}</b></div><div><small>已开启消费同步</small><b>${fmtNum(usageEnabled)}</b></div><div><small>当天 Tail 正常</small><b>${fmtNum(usageHealthy)}/${fmtNum(usageEnabled)}</b></div><div><small>历史补数完成</small><b>${fmtNum(historyComplete)}/${fmtNum(usageEnabled)}</b></div><div><small>历史任务退避</small><b>${fmtNum(historyRetry)}</b></div><div><small>历史任务已暂停</small><b>${fmtNum(historyPaused)}</b></div></div><div class="sync-upstream-list">${cards}</div>`;
+  el.innerHTML=`<div class="sync-upstream-summary"><div><small>已配置账户</small><b>${fmtNum(domains.length)}</b></div><div><small>停止使用·暂停同步</small><b>${fmtNum(pausedAccounts)}</b></div><div><small>余额同步正常</small><b>${fmtNum(balanceHealthy)}/${fmtNum(enabledAccounts)}</b></div><div><small>已开启消费同步</small><b>${fmtNum(usageEnabled)}</b></div><div><small>当天 Tail 正常</small><b>${fmtNum(usageHealthy)}/${fmtNum(usageEnabled)}</b></div><div><small>历史补数完成</small><b>${fmtNum(historyComplete)}/${fmtNum(usageEnabled)}</b></div><div><small>历史任务退避</small><b>${fmtNum(historyRetry)}</b></div><div><small>历史任务已暂停</small><b>${fmtNum(historyPaused)}</b></div></div><div class="sync-upstream-list">${cards}</div>`;
   return level;
 }
 function syncRenderCostClosure(report){
