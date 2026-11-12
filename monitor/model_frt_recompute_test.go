@@ -47,6 +47,7 @@ type frtSourceQueryFailures struct {
 	always      atomic.Bool
 	calls       atomic.Int64
 	beforeQuery func()
+	maxSeconds  int64
 }
 
 func (f *frtSourceQueryFailures) failQuery() bool {
@@ -85,6 +86,13 @@ func (d frtFailingSQLDriver) Open(name string) (driver.Conn, error) {
 
 func (c frtFailingSQLConn) QueryContext(ctx context.Context, q string, args []driver.NamedValue) (driver.Rows, error) {
 	if strings.Contains(strings.ToUpper(q), "FROM LOGS") && c.failures != nil {
+		if c.failures.maxSeconds > 0 && strings.Contains(q, "frt_sum_ms") && len(args) >= 2 {
+			from, _ := args[0].Value.(int64)
+			to, _ := args[1].Value.(int64)
+			if to-from > c.failures.maxSeconds {
+				return nil, context.DeadlineExceeded
+			}
+		}
 		if c.failures.beforeQuery != nil {
 			c.failures.beforeQuery()
 		}

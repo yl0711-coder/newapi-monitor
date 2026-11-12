@@ -109,10 +109,10 @@ window.logChainActivate=function(){
   if(navigationChanged){
     lc.navigationSignature=signature;
     applyNavigationContext();
-    lc.requiresManualQuery=context.preset==='token_local_review';
+    lc.requiresManualQuery=context.preset==='token_local_review'||context.preset==='group_governance';
   }
   if(lc.requiresManualQuery){
-    ++lc.generation;lc.abort?.abort();lc.abort=null;lc.loading=false;lc.rows=[];lc.scopeEcho=null;lc.note='Token 冻结证据入口仅预填筛选，未查询生产日志。核对范围后可手动使用现有排障。';render();renderStatus(lc.note);return;
+    ++lc.generation;lc.abort?.abort();lc.abort=null;lc.loading=false;lc.rows=[];lc.scopeEcho=null;lc.note='跨页证据入口仅预填筛选，未查询生产日志。核对范围后可手动使用现有排障。';render();renderStatus(lc.note);return;
   }
   if(navigationChanged&&Object.keys(context).length)load();else refreshList();
   scheduleRefresh();
@@ -176,6 +176,7 @@ function applyNavigationContext(){
   const c=window.monitorNavigationContext?.()||{};
   if(!Object.keys(c).length)return false;
   let changed=false;
+  if(c.preset==='group_governance'){lc.filters=emptyNavigationFilters();lc.scope='err_anom';lc.diagnosisContext=null;changed=true}
   if(c.preset==='token_local_review'&&/^[1-9]\d*$/.test(String(c.user_id||''))){
     lc.filters=emptyNavigationFilters({user_id:String(c.user_id),channel_id:/^[1-9]\d*$/.test(String(c.channel_id||''))?String(c.channel_id):'',model:String(c.model||'')});lc.scope='all';lc.date=/^\d{4}-\d\d-\d\d$/.test(c.date||'')?c.date:cstToday();lc.toDate=lc.date;lc.fromTime='00:00';lc.toTime='23:59';lc.timeDirty=false;lc.asc=false;lc.diagnosisContext=null;syncControls();return true;
   }

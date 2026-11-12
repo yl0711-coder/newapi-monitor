@@ -24,8 +24,7 @@ func (m *Monitor) modelReportCollectionFailed(includeRejections bool) bool {
 	failed := false
 	if m.cfg.CustomerHealthSourceEnabled {
 		failed = m.customerHealthSourceLastFailure.Load() > m.customerHealthSourceLastSuccess.Load()
-	} else if m.cfg.CapacityEnabled {
-		failed = m.metricFinalizeLastFailure.Load() > m.metricFinalizeLastSuccess.Load()
+
 	}
 	if m.cfg.CustomerHealthSourceEnabled || m.cfg.CapacityEnabled {
 		failed = failed || m.sourceLastFailureAt.Load() > m.sourceLastSuccessAt.Load()
@@ -88,16 +87,17 @@ func (m *Monitor) modelStatisticsAvailableEnd(ctx context.Context, target int64,
 				}
 			}
 		} else if m.cfg.CapacityEnabled {
-			var state MetricFinalizeState
-			if err := tx.Where("id = ?", 1).Limit(1).Find(&state).Error; err != nil {
-				return err
+			local := &Monitor{cfg: m.cfg, storeDB: tx}
+			requests, frt, readErr := local.modelMinuteProof(ctx, target)
+			if readErr != nil {
+				return readErr
 			}
-			if state.SemanticsVersion == stabilityTrafficClassificationVersion {
-				bound(state.CoverageFromTs, state.NextTs)
+			if requests.From <= 0 || requests.Through < requests.From {
+				end = 0
+			} else {
+				bound(requests.From, requests.Through)
 			}
-			if state.TTFTSemanticsVersion == ttftCoverageSemanticsVersion {
-				bound(state.TTFTCoverageFromTs, state.TTFTCoverageThroughTs)
-			}
+			bound(frt.From, frt.Through)
 		}
 		// Older read-only snapshots may have legacy rejection facts but no
 		// direct-source cursor table. Preserve those partial reports; absence
@@ -170,6 +170,9 @@ func (m *Monitor) modelStatisticsRoutedCoverage(ctx context.Context, from, to in
 		result.Note = "已路由请求：用户分钟事实采集未开启，覆盖不完整"
 		return result
 	}
+	if m.cfg.CapacityEnabled {
+		result.ExpectedThroughTs = min(to, now.Unix()/60*60)
+	}
 	if m.cfg.CustomerHealthSourceEnabled {
 		_, target := customerHealthSourceRange(now)
 		result.ExpectedThroughTs = min(to, target)
@@ -187,15 +190,9 @@ func (m *Monitor) modelStatisticsRoutedCoverage(ctx context.Context, from, to in
 		result.TTFTFromTs, result.TTFTThroughTs = proof.FRTFromTs, proof.FRTThroughTs
 		result.TTFTComplete = result.TTFTComplete && err == nil && proof.FRTComplete
 	} else {
-		var state MetricFinalizeState
-		if err := m.storeDB.WithContext(ctx).First(&state, 1).Error; err == nil &&
-			state.TTFTSemanticsVersion == ttftCoverageSemanticsVersion {
-			result.TTFTFromTs, result.TTFTThroughTs = state.TTFTCoverageFromTs, min(state.TTFTCoverageThroughTs, to)
-			result.TTFTComplete = result.TTFTComplete && state.TTFTCoverageFromTs > 0 &&
-				state.TTFTCoverageFromTs <= from && state.TTFTCoverageThroughTs >= to
-		} else {
-			result.TTFTComplete = false
-		}
+		_, proof, err := m.modelMinuteProof(ctx, to)
+		result.TTFTFromTs, result.TTFTThroughTs = proof.From, minPositive(proof.Through, to)
+		result.TTFTComplete = result.TTFTComplete && err == nil && proof.covers(from, to)
 	}
 	if !result.TTFTComplete {
 		result.Note += "；FRT 覆盖尚未确认，历史缺失样本不计入快速请求"

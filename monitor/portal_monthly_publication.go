@@ -690,6 +690,9 @@ func (m *Monitor) portalPublishedMonthlyStatement(c *gin.Context) {
 		return
 	}
 	bill, err := monthlyReadCustomerBill(record)
+	if err == nil {
+		err = m.loadSimpleBillExtras(ctx, record, &bill)
+	}
 	if err != nil {
 		c.JSON(503, gin.H{"error": "账单完整性校验失败"})
 		return
@@ -734,6 +737,10 @@ func (m *Monitor) portalPublishedMonthlyStatement(c *gin.Context) {
 		return
 	}
 	if !m.portalMonthlyPublicationStillCurrent(ctx, c, record) {
+		return
+	}
+	if bill.sub != nil {
+		c.JSON(200, gin.H{"ok": true, "data": p, "subscription": bill.sub})
 		return
 	}
 	c.JSON(200, gin.H{"ok": true, "data": p})

@@ -6,7 +6,7 @@ import {readFileSync} from 'node:fs';
 const html=readFileSync(new URL('../../monitor/portal.html',import.meta.url),'utf8');
 function context(extra={}){
   const ctx=vm.createContext({esc:v=>String(v).replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;'),fmtNum:n=>String(n),fmtLogTime:n=>String(n),...extra});
-  for(const name of ['monthlyMoney','monthlySummaryPrecision','monthlyDisplayUnits','monthlyDisplayCentsMoney','monthlyDisplayResidual','monthlyDisplayNonzero','monthlyNetDisplayResidual','monthlyDisplayNetColumnResidual','monthlyWalletDisplayResidual','monthlyWalletDisplayClosing','monthlyDisplayWallet','monthlyMemberDisplayProjection','monthlyTokens','renderMonthlyMembers','renderMonthlyTokenRows','renderMonthlyStatement','renderMonthlyList','monthlyBillFilename'])vm.runInContext(html.match(new RegExp(`^function ${name}\\([^]*?^}`,'m'))[0],ctx);
+  for(const name of ['monthlyMoney','monthlySummaryPrecision','monthlyDisplayUnits','monthlyDisplayCentsMoney','monthlyDisplayResidual','monthlyDisplayNonzero','monthlyNetDisplayResidual','monthlyDisplayNetColumnResidual','monthlyWalletDisplayResidual','monthlyWalletDisplayClosing','monthlyDisplayWallet','monthlyMemberDisplayProjection','monthlyTokens','renderMonthlyMembers','renderMonthlyTokenRows','monthlyCentsOf','monthlyCentsMoney','monthlySubNet','renderMonthlySubscription','renderMonthlyStatement','renderMonthlyList','monthlyBillFilename'])vm.runInContext(html.match(new RegExp(`^function ${name}\\([^]*?^}`,'m'))[0],ctx);
   return ctx;
 }
 const sample={account:'sample',published:true,publication:'a'.repeat(64),month:'2026-09',from:'2026-09-01',to:'2026-09-30',as_of:1,current_month:false,credits:{available:true,rows:[{at:2,amount:'20000.000000',method:'后台充值',kind:'recharge'}],recharge_count:1,recharge_total:'20000.000000',gift_total:'0.000000',known_total:'20000.000000',unknown:0,adjustment:'0.000000'},consumption:{requests:100,tokens:20000,amount:'0.000002',refund:'0.000000',net:'0.000002'},current_balance:'8000.000000',month_end_balance:'19999.999998'};
@@ -311,4 +311,18 @@ test('download refuses an old detail without a publication version',async()=>{
   await vm.runInContext('downloadMonthlyStatement()',ctx);
   assert.equal(nodes.monthlyDownload.disabled,true);
   assert.match(nodes.monthlyStatus.textContent,/版本缺失/);
+});
+
+test('subscription bill: 总消费 − 退款 = 净消费, subscription shown net of its own refunds',()=>{
+ const d={...structuredClone(sample),consumption:{requests:10,tokens:100,amount:'100.000000',refund:'10.000000',net:'90.000000'}};
+ const sub={version:1,orders:[],users:[{user_id:1,consume_cents:5000,refund_cents:1000,tokens:[{token_id:7,name:'k',consume_cents:5000,refund_cents:1000}]}]};
+ const ctx=context({d,sub});
+ const out=vm.runInContext('renderMonthlyStatement(d,sub)',ctx);
+ const cell=label=>{const m=new RegExp(label+'</td><td class="money">([^<]+)<').exec(out);return m&&m[1];};
+ assert.match(out,/<tr class="bill-metrics"><td colspan="2">¥140\.00</);
+ assert.equal(cell('其中 套餐内（元）'),'¥40.00');
+ assert.equal(cell('其中 余额支付（元）'),'¥100.00');
+ assert.equal(cell('退款金额（元）'),'¥10.00');
+ assert.equal(cell('净消费（元）'),'¥130.00');
+ assert.doesNotMatch(out,/净消费舍入尾差/);
 });

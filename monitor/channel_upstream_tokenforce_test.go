@@ -112,15 +112,54 @@ func TestTokenForceUsageWindowStrictlyAggregatesFaceValue(t *testing.T) {
 
 func TestTokenForceUsageRejectsOutOfRangeRows(t *testing.T) {
 	from := time.Date(2026, 9, 3, 20, 0, 0, 0, cstLocation).Unix()
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	for _, outside := range []string{"2026-09-03T13:00:01Z", "2026-09-03T11:59:59Z"} {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"status":0,"result":{"content":[{"requestId":"req-outside","requestTime":"` + outside + `","inputTokens":1,"outputTokens":1,"costInCny":1}],"totalElements":1}}`))
+		}))
+		row := ChannelUpstreamAccount{Domain: "hainahn.com", Provider: upstreamProviderTokenForce, BaseURL: server.URL, UserID: 123, BalanceUnit: 7.2}
+		_, err := fetchTokenForceUsageWindow(context.Background(), server.Client(), row, tokenForceCredential{AccessToken: "access"}, from, from+3600, newUpstreamUsageRequestPacer(5, 0))
+		server.Close()
+		if err == nil || !strings.Contains(err.Error(), "不在") {
+			t.Fatalf("%s: out-of-range usage row must fail the whole window with its time, got %v", outside, err)
+		}
+	}
+}
+
+// The console filters both ends inclusively: a request at exactly the window
+// end is returned for this window and the next. It is counted once, in the
+// window that starts at that second.
+func TestTokenForceUsageCountsBoundaryRowOnceInNextWindow(t *testing.T) {
+	from := time.Date(2026, 9, 3, 20, 0, 0, 0, cstLocation).Unix()
+	boundary := `{"requestId":"req-boundary","requestTime":"2026-09-03T13:00:00Z","inputTokens":1,"outputTokens":1,"costInCny":2}`
+	inside := `{"requestId":"req-inside","requestTime":"2026-09-03T12:30:00Z","inputTokens":1,"outputTokens":1,"costInCny":1}`
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"status":0,"result":{"content":[{"requestId":"req-outside","requestTime":"2026-09-03T13:00:00Z","inputTokens":1,"outputTokens":1,"costInCny":1}],"totalElements":1}}`))
+		if r.URL.Query().Get("beginTime") == time.Unix(from, 0).UTC().Format(time.RFC3339) {
+			_, _ = w.Write([]byte(`{"status":0,"result":{"content":[` + inside + `,` + boundary + `],"totalElements":2}}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"status":0,"result":{"content":[` + boundary + `],"totalElements":1}}`))
 	}))
 	defer server.Close()
 	row := ChannelUpstreamAccount{Domain: "hainahn.com", Provider: upstreamProviderTokenForce, BaseURL: server.URL, UserID: 123, BalanceUnit: 7.2}
-	_, err := fetchTokenForceUsageWindow(context.Background(), server.Client(), row, tokenForceCredential{AccessToken: "access"}, from, from+3600, newUpstreamUsageRequestPacer(5, 0))
-	if err == nil {
-		t.Fatal("out-of-range usage row must fail the whole window")
+	cred := tokenForceCredential{AccessToken: "access"}
+	first, err := fetchTokenForceUsageWindow(context.Background(), server.Client(), row, cred, from, from+3600, newUpstreamUsageRequestPacer(5, 0))
+	if err != nil || len(first.Hours) != 1 || first.Hours[0].Requests != 1 || first.Hours[0].Quota != 1 {
+		t.Fatalf("first window must count only the inside row: %+v err=%v", first, err)
+	}
+	next, err := fetchTokenForceUsageWindow(context.Background(), server.Client(), row, cred, from+3600, from+7200, newUpstreamUsageRequestPacer(5, 0))
+	if err != nil || len(next.Hours) != 1 || next.Hours[0].Requests != 1 || next.Hours[0].Quota != 2 {
+		t.Fatalf("next window must count the boundary row once: %+v err=%v", next, err)
+	}
+}
+
+func TestTokenForceHistoryUsesBoundedWindows(t *testing.T) {
+	now := time.Date(2026, 9, 10, 15, 0, 0, 0, cstLocation).Unix()
+	row := ChannelUpstreamAccount{Provider: upstreamProviderTokenForce, UsageNextSyncAt: now + 600}
+	plan := planUpstreamUsageSync(row, now, 7)
+	if plan.backfillTo-plan.backfillFrom != tokenForceBackfillWindowSeconds || plan.backfillFrom != cstDayStart(now-7*86400) {
+		t.Fatalf("TokenForce history window: %+v", plan)
 	}
 }
 

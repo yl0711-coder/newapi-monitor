@@ -99,6 +99,9 @@ type FRTSumWindowStats struct {
 	RowsZeroVer       int64  `json:"rows_frt_sum_version_zero"`
 	ComputableChannel int64  `json:"computable_channels"`
 	TotalChannel      int64  `json:"total_channels"`
+	MissingSumRows    int64  `json:"missing_sum_rows"`
+	MissingFromTs     int64  `json:"missing_from_ts"`
+	MissingThroughTs  int64  `json:"missing_through_ts"`
 }
 
 // frtRecomputeWindowSQL 按与 sampleWindowUserSQL 相同的 FRT 判据重读日志。
@@ -135,11 +138,23 @@ func (m *Monitor) recomputeFRTSumSlice(ctx context.Context, from, to int64, owne
 	// every attempt keeps the 20s slice + at most 25s backoff below the 120s lease.
 	qctx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
+	phase := "queue"
+	defer func() {
+		if err != nil {
+			err = fmt.Errorf("FRT %s: %w", phase, errors.Join(err, qctx.Err()))
+		}
+	}()
 	release, err := m.acquireBackgroundSourceLow(qctx)
 	if err != nil {
 		return 0, 0, 0, err
 	}
-	defer release()
+	released := false
+	defer func() {
+		if !released {
+			release()
+		}
+	}()
+	phase = "source_read"
 
 	rows, err := m.prodDB.QueryContext(qctx, frtRecomputeWindowSQL(), from, to)
 	if err != nil {
@@ -166,6 +181,12 @@ func (m *Monitor) recomputeFRTSumSlice(ctx context.Context, from, to int64, owne
 		m.reportSourceQueryError(err)
 		return 0, 0, 0, err
 	}
+	if err := rows.Close(); err != nil {
+		return 0, 0, 0, err
+	}
+	release()
+	released = true
+	phase = "local_publish"
 
 	// Fence the writes as well as the checkpoint. The first UPDATE obtains
 	// SQLite's write lock: a takeover or sampler write cannot interleave with
@@ -341,11 +362,12 @@ func (m *Monitor) recomputeFRTSumWithOwner(ctx context.Context, from, to int64, 
 		return &state, err
 	}
 
+	width := int64(frtRecomputeSliceSeconds)
 	for cursor := state.DoneThroughTs; cursor < to; {
 		if err := ctx.Err(); err != nil {
 			return &state, err
 		}
-		next := min(cursor+frtRecomputeSliceSeconds, to)
+		next := min(cursor+width, to)
 		// 来源 lease 丢失是瞬时的（回算与常态采集共用同一条低优先来源泳道，
 		// 采集抢到 lease 时回算会被拒）。有界退避重试，不让整个长任务停在这里；
 		// 退避期间仍受 ctx 取消控制。耗尽次数才算真失败。
@@ -364,6 +386,10 @@ func (m *Monitor) recomputeFRTSumWithOwner(ctx context.Context, from, to int64, 
 			if ctxErr := ctx.Err(); ctxErr != nil {
 				err = ctxErr
 				break
+			}
+			if errors.Is(err, context.DeadlineExceeded) && next-cursor > 60 {
+				width = max(int64(60), (next-cursor)/2/60*60)
+				next = min(cursor+width, to)
 			}
 			state.LastReason = clip(fmt.Sprintf("切片 %d 第 %d 次重试：%v", cursor, attempt+1, err), 512)
 			if saveErr := m.saveFRTSumRecomputeStateOwned(ctx, state, owner); saveErr != nil {
@@ -479,6 +505,13 @@ func (m *Monitor) FRTSumWindowReport(ctx context.Context, label string, from, to
 	// computable channel which the page renders as unavailable.
 	s.FRTSumMs, s.FRTSumObserved = 0, 0
 	s.RowsCurrentVer, s.RowsZeroVer = scanned.RowsCurrentVer, scanned.RowsZeroVer
+	var missing struct{ Rows, FromTs, ThroughTs int64 }
+	if err := m.storeDB.WithContext(ctx).Raw(`SELECT COUNT(*) AS rows,COALESCE(MIN(bucket_ts),0) AS from_ts,COALESCE(MAX(bucket_ts)+60,0) AS through_ts
+	 FROM capacity_user_minute_samples WHERE bucket_ts>=? AND bucket_ts<? AND ttft_observed>0
+	 AND (COALESCE(frt_sum_version,0)<>? OR frt_sum_ms IS NULL)`, from, to, frtSumSemanticsVersion).Scan(&missing).Error; err != nil {
+		return s, err
+	}
+	s.MissingSumRows, s.MissingFromTs, s.MissingThroughTs = missing.Rows, missing.FromTs, missing.ThroughTs
 
 	// 可计算渠道数必须与页面同源：走 modelFRTRows + modelFRTTree 的同一条路径，
 	// 按 MeanMs 是否为 nil 计数。另写一条 SQL 判据会在口径变更时和页面显示脱节，
@@ -592,13 +625,23 @@ func (m *Monitor) serveFRTSumRecompute(c *gin.Context) {
 }
 
 func (m *Monitor) serveFRTSumRecomputeStatus(c *gin.Context) {
+	ctx, cancel := context.WithTimeout(c.Request.Context(), modelStatisticsQueryTimeout)
+	defer cancel()
 	var state FRTSumRecomputeState
-	if err := m.storeDB.WithContext(c.Request.Context()).Where("id = ?", 1).Limit(1).Find(&state).Error; err != nil {
+	if err := m.storeDB.WithContext(ctx).Where("id = ?", 1).Limit(1).Find(&state).Error; err != nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "回算状态不可读"})
 		return
 	}
 	if state.Status == "" {
 		state.Status = "idle"
+	}
+	if c.Query("job_only") == "1" {
+		c.JSON(http.StatusOK, gin.H{"job": state})
+		return
+	}
+	if w := c.Query("window"); w != "" && w != "24h" && w != "3d" && w != "7d" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "window 必须为 24h、3d 或 7d"})
+		return
 	}
 	stats := []FRTSumWindowStats{}
 	now := time.Now()
@@ -626,7 +669,10 @@ func (m *Monitor) serveFRTSumRecomputeStatus(c *gin.Context) {
 		label string
 		hours int64
 	}{{"24h", 24}, {"3d", 72}, {"7d", 168}} {
-		s, err := m.FRTSumWindowReport(c.Request.Context(), w.label, end-w.hours*3600, end)
+		if selected := c.Query("window"); selected != "" && selected != w.label {
+			continue
+		}
+		s, err := m.FRTSumWindowReport(ctx, w.label, end-w.hours*3600, end)
 		if err != nil {
 			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "窗口统计不可读"})
 			return

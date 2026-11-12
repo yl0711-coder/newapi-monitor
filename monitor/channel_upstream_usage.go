@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	sqlite "github.com/glebarez/go-sqlite"
 	"log/slog"
 	"math"
 	"net"
@@ -179,8 +180,23 @@ func upstreamUsageRetryDelay(delays []time.Duration, failures int) time.Duration
 	return delays[index]
 }
 
+// isUpstreamUsageLocalStoreBusy reports contention on our own SQLite store.
+// An upstream that itself runs on SQLite can return the same "database is
+// locked" text; that is an upstream failure and must be recorded, so errors
+// carrying upstream response text never count as local busy.
 func isUpstreamUsageLocalStoreBusy(err error) bool {
 	if err == nil {
+		return false
+	}
+	var sqliteErr *sqlite.Error
+	if errors.As(err, &sqliteErr) {
+		code := sqliteErr.Code() & 0xff
+		return code == sqliteCodeBusy || code == sqliteCodeLocked
+	}
+	var httpErr *upstreamHTTPError
+	var remoteErr *upstreamRemoteError
+	var tokenForceErr *tokenForceAPIError
+	if errors.As(err, &httpErr) || errors.As(err, &remoteErr) || errors.As(err, &tokenForceErr) {
 		return false
 	}
 	message := strings.ToLower(err.Error())
@@ -237,7 +253,7 @@ func upstreamUsageOperationTimeout(s Settings) time.Duration {
 	// guarded request allowance. Slow responses are still bounded by the hard
 	// two-minute operation cap and each request's own HTTP timeout.
 	pacingBudget := time.Duration(upstreamUsageMaxRequestsPerRun-1) * (upstreamGuardMinInterval + upstreamGuardMaxJitter)
-	timeout := pacingBudget + 2*upstreamSyncTimeout(s)
+	timeout := pacingBudget + 2*upstreamUsageRequestTimeout(s)
 	if timeout < 30*time.Second {
 		return 30 * time.Second
 	}
@@ -472,6 +488,17 @@ func fetchTokenForceUsageItems(ctx context.Context, client *http.Client, row Cha
 			return nil, fmt.Errorf("TokenForce 使用明细扫描期间首页已变化，窗口将重试")
 		}
 	}
+	// The console filters both ends inclusively: a request at exactly `to`
+	// also belongs to the next window, which starts at `to`. Count it there
+	// only, so adjacent (and split) windows stay disjoint. Anything else
+	// outside [from, to) is still rejected by the aggregation below.
+	kept := items[:0]
+	for _, item := range items {
+		if item.RequestAt != to {
+			kept = append(kept, item)
+		}
+	}
+	items = kept
 	if err := validateUniqueTokenForceUsageItems(items, ""); err != nil {
 		return nil, err
 	}
@@ -519,7 +546,9 @@ func fetchTokenForceUsageWindow(ctx context.Context, client *http.Client, row Ch
 	buckets := make(map[int64]*ChannelUpstreamUsageHour)
 	for _, item := range items {
 		if item.RequestAt < from || item.RequestAt >= to {
-			return upstreamUsageResult{}, fmt.Errorf("TokenForce 使用明细包含查询区间之外的 requestTime")
+			return upstreamUsageResult{}, fmt.Errorf("TokenForce 使用明细包含查询区间之外的 requestTime（%s 不在 %s ~ %s）",
+				time.Unix(item.RequestAt, 0).In(cstLocation).Format("01-02 15:04:05"),
+				time.Unix(from, 0).In(cstLocation).Format("01-02 15:04:05"), time.Unix(to, 0).In(cstLocation).Format("01-02 15:04:05"))
 		}
 		hour := item.RequestAt - item.RequestAt%3600
 		bucket := buckets[hour]
@@ -592,6 +621,9 @@ func syncTokenForceUsage(ctx context.Context, client *http.Client, row ChannelUp
 	}
 	return result, cred, err
 }
+
+// tokenForceBackfillWindowSeconds bounds one TokenForce history window.
+const tokenForceBackfillWindowSeconds = 3 * 3600
 
 type upstreamUsageWindowTooDense struct {
 	total int64
@@ -971,7 +1003,7 @@ func (m *Monitor) syncNewAPIUsageBackfillWindowDirect(ctx context.Context, row C
 		checkpoint = NewAPIUsageBackfillCheckpoint{}
 	}
 
-	client := m.channelUpstreamHTTPClient()
+	client := m.channelUpstreamUsageHTTPClient()
 	var first newAPIUsagePage[newAPIUsageItem]
 	firstLoaded := false
 	checkpointVerified := false
@@ -1119,7 +1151,7 @@ func newAPIBackfillOperationBudgetYield(ctx context.Context, from int64, complet
 func (m *Monitor) saveNewAPIUsageBackfillSegment(ctx context.Context, segment NewAPIUsageBackfillSegment) error {
 	segment.UpdatedAt = time.Now().Unix()
 	segment.Status = newAPIBackfillSegmentComplete
-	return m.storeDB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	return m.queuedWriteStore().WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		if err := tx.Clauses(clause.OnConflict{
 			Columns:   []clause.Column{{Name: "domain"}, {Name: "hour_from"}, {Name: "segment_from"}},
 			UpdateAll: true,
@@ -1132,7 +1164,7 @@ func (m *Monitor) saveNewAPIUsageBackfillSegment(ctx context.Context, segment Ne
 }
 
 func (m *Monitor) ensureNewAPIUsageBackfillSegmentPlan(ctx context.Context, domain string, from, to int64) error {
-	return m.storeDB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	return m.queuedWriteStore().WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var count int64
 		if err := tx.Model(&NewAPIUsageBackfillSegment{}).Where("domain = ? AND hour_from = ?", domain, from).Count(&count).Error; err != nil {
 			return err
@@ -1173,7 +1205,7 @@ func (m *Monitor) splitNewAPIUsageBackfillSegment(ctx context.Context, segment N
 	if step == 0 {
 		return fmt.Errorf("NewAPI 历史补数最小子窗口仍然超时")
 	}
-	return m.storeDB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	return m.queuedWriteStore().WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		result := tx.Where("domain = ? AND hour_from = ? AND segment_from = ? AND status = ?", segment.Domain, segment.HourFrom, segment.SegmentFrom, newAPIBackfillSegmentPending).
 			Delete(&NewAPIUsageBackfillSegment{})
 		if result.Error != nil {
@@ -1328,7 +1360,7 @@ func (m *Monitor) syncNewAPIUsageBackfillWindow(ctx context.Context, row Channel
 }
 
 func (m *Monitor) syncNewAPIUsage(ctx context.Context, row ChannelUpstreamAccount, cred newAPICredential, from, to int64, pacer *upstreamUsageRequestPacer) (upstreamUsageResult, error) {
-	return fetchNewAPIUsageWindowWithPacer(ctx, m.channelUpstreamHTTPClient(), row, cred, from, to, pacer)
+	return fetchNewAPIUsageWindowWithPacer(ctx, m.channelUpstreamUsageHTTPClient(), row, cred, from, to, pacer)
 }
 
 // syncNewAPITailIncremental keeps the live NewAPI watermark moving even when a
@@ -1811,7 +1843,7 @@ func (m *Monitor) ensureAICodeWithUsageRound(ctx context.Context, row ChannelUps
 		CredentialSetVersion: version, WindowFrom: from, WindowTo: to, TotalKeys: total,
 		Status: upstreamStatusPending, CreatedAt: now, UpdatedAt: now,
 	}
-	err = m.storeDB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	err = m.queuedWriteStore().WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		if oldRoundID != "" {
 			if err := clearAICodeWithRecordCheckpoint(tx, row.Domain, oldRoundID, ""); err != nil {
 				return err
@@ -1829,7 +1861,7 @@ func (m *Monitor) ensureAICodeWithUsageRound(ctx context.Context, row ChannelUps
 }
 
 func (m *Monitor) stageAICodeWithKeyResult(ctx context.Context, round AICodeWithUsageRound, state *AICodeWithKeySyncState, result upstreamUsageResult, now int64) error {
-	return m.storeDB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	return m.queuedWriteStore().WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		if result.SourceKeyID <= 0 {
 			return fmt.Errorf("AICodeWith 使用量缺少有效 api_key_id")
 		}
@@ -1972,7 +2004,7 @@ func (m *Monitor) publishAICodeWithRound(ctx context.Context, row *ChannelUpstre
 		bucket.FetchedAt = now
 		aggregated[part.HourTs] = bucket
 	}
-	return true, m.storeDB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	return true, m.queuedWriteStore().WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var current AICodeWithUsageRound
 		if err := tx.First(&current, "domain = ? AND kind = ?", row.Domain, round.Kind).Error; err != nil {
 			return err
@@ -2038,7 +2070,7 @@ func (m *Monitor) processAICodeWithRound(ctx context.Context, row *ChannelUpstre
 		return false, 0, 0, err
 	}
 	if len(states) != len(normalized.Slots) {
-		if err := m.storeDB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := m.queuedWriteStore().WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 			if err := clearAICodeWithRecordCheckpoint(tx, row.Domain, "", ""); err != nil {
 				return err
 			}
@@ -2393,7 +2425,7 @@ func (m *Monitor) syncStoredAICodeWithUsage(ctx context.Context, row *ChannelUps
 // persistUpstreamUsageWindow 仅在完整读取窗口后替换同一窗口的小时桶。事务失败时保留
 // 原数据，确保页面既不会出现半窗口，也不会把上游故障解释为零消费。
 func (m *Monitor) persistUpstreamUsageWindow(ctx context.Context, domain string, from, to int64, hours []ChannelUpstreamUsageHour, now int64) error {
-	return m.storeDB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	return m.queuedWriteStore().WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		return persistUpstreamUsageWindowTx(tx, domain, from, to, hours, now)
 	})
 }
@@ -2464,7 +2496,7 @@ func persistUpstreamUsageWindowTx(tx *gorm.DB, domain string, from, to int64, ho
 }
 
 func (m *Monitor) persistNewAPIUsageBackfillWindow(ctx context.Context, domain string, from, to int64, hours []ChannelUpstreamUsageHour, now int64) error {
-	return m.storeDB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	return m.queuedWriteStore().WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		if err := persistUpstreamUsageWindowTx(tx, domain, from, to, hours, now); err != nil {
 			return err
 		}
@@ -2480,6 +2512,10 @@ func applyUpstreamUsageResult(row *ChannelUpstreamAccount, result upstreamUsageR
 		return
 	}
 	row.UsageLastAttemptAt = now
+	if next, paused := upstreamPauseRetryAt(err, now); paused {
+		row.UsageNextSyncAt = next
+		return
+	}
 	if err == nil {
 		row.UsageStatus, row.UsageLastError = upstreamStatusOK, ""
 		row.UsageLastSuccessAt, row.UsageDataUntil = now, result.DataUntil
@@ -2550,6 +2586,12 @@ func planUpstreamUsageSync(row ChannelUpstreamAccount, now int64, backfillDays i
 			// NewAPI exposes mutable OFFSET pages. Import one closed hour at a
 			// time so a dense day can yield and resume without rescanning it.
 			plan.backfillTo = backfill + 3600
+		}
+		if row.Provider == upstreamProviderTokenForce {
+			// A busy whole day needs more pages than one run may request, so
+			// the day never completed. Import closed three-hour windows; the
+			// cursor advances after each.
+			plan.backfillTo = backfill + tokenForceBackfillWindowSeconds
 		}
 		if row.Provider == upstreamProviderAICodeWith {
 			plan.backfillTo = backfill + aiCodeWithUsageMaxDays*86400
@@ -2739,7 +2781,7 @@ func (m *Monitor) syncStoredUpstreamUsageWithPriority(ctx context.Context, domai
 			return row, fmt.Errorf("OpenOx 凭据与供应商不匹配")
 		}
 		syncUsage = func(callCtx context.Context, from, to int64, pacer *upstreamUsageRequestPacer) (upstreamUsageResult, error) {
-			return fetchOpenOxUsageWindow(callCtx, m.channelUpstreamHTTPClient(), row, cred, from, to, pacer)
+			return fetchOpenOxUsageWindow(callCtx, m.channelUpstreamUsageHTTPClient(), row, cred, from, to, pacer)
 		}
 	case newAPICredential:
 		if row.Provider != upstreamProviderNewAPI {
@@ -2755,7 +2797,7 @@ func (m *Monitor) syncStoredUpstreamUsageWithPriority(ctx context.Context, domai
 		current := cred
 		adapter := row.UsageAdapter
 		syncUsage = func(callCtx context.Context, from, to int64, pacer *upstreamUsageRequestPacer) (upstreamUsageResult, error) {
-			result, updated, syncErr := syncSub2APIUsage(callCtx, m.channelUpstreamHTTPClient(), row, current, from, to, pacer, adapter)
+			result, updated, syncErr := syncSub2APIUsage(callCtx, m.channelUpstreamUsageHTTPClient(), row, current, from, to, pacer, adapter)
 			current = updated
 			credential = current
 			secrets = upstreamCredentialSecrets(current)
@@ -2770,7 +2812,7 @@ func (m *Monitor) syncStoredUpstreamUsageWithPriority(ctx context.Context, domai
 		}
 		current := cred
 		syncUsage = func(callCtx context.Context, from, to int64, pacer *upstreamUsageRequestPacer) (upstreamUsageResult, error) {
-			result, updated, syncErr := syncTokenForceUsage(callCtx, m.channelUpstreamHTTPClient(), row, current, from, to, pacer)
+			result, updated, syncErr := syncTokenForceUsage(callCtx, m.channelUpstreamUsageHTTPClient(), row, current, from, to, pacer)
 			current = updated
 			credential = current
 			secrets = upstreamCredentialSecrets(current)

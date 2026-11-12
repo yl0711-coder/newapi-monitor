@@ -12,7 +12,9 @@ import (
 
 var errUpstreamBalanceSuperseded = errors.New("账户配置或余额状态已变化，本次旧余额结果未保存")
 
-const upstreamBalanceLocalWriteTimeout = 5 * time.Second
+// upstreamBalanceLocalWriteTimeout must exceed the queued writer's busy
+// timeout (15 s): the write may wait behind another queued transaction.
+const upstreamBalanceLocalWriteTimeout = 20 * time.Second
 
 // The per-account gate is held by the caller throughout request + persistence.
 // A transactional snapshot guard additionally rejects configuration/credential
@@ -28,7 +30,9 @@ func (m *Monitor) persistUpstreamBalanceResult(ctx context.Context, observed Cha
 	err := retryUpstreamLocalStore(ctx, func() error {
 		attempts++
 		next := base
-		return m.storeDB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		// Read-then-write: on the queued writer it takes the writer slot up
+		// front (BEGIN IMMEDIATE) instead of failing with SQLITE_BUSY.
+		return m.queuedWriteStore().WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 			var current ChannelUpstreamAccount
 			if err := tx.First(&current, "domain = ?", observed.Domain).Error; err != nil {
 				if errors.Is(err, gorm.ErrRecordNotFound) {

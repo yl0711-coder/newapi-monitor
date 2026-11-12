@@ -21,6 +21,9 @@ func (m *Monitor) rejectionReportTiming() ReportTiming {
 
 func (m *Monitor) modelReportTiming(rejections bool) ReportTiming {
 	t := ReportTiming{metricFinalizeDelaySec, 60, metricFinalizeRunEverySec}
+	if m.cfg.CapacityEnabled {
+		t = ReportTiming{0, 60, max(10, int64(m.cfg.SampleSeconds))}
+	}
 	if m.cfg.CustomerHealthSourceEnabled {
 		t = ReportTiming{int64(customerHealthSourceFinalizeDelay / time.Second), 60, int64(m.customerHealthSourcePollEvery() / time.Second)}
 	}

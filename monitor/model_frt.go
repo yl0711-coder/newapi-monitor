@@ -100,6 +100,10 @@ type ModelFRTReport struct {
 }
 
 type modelFRTRow struct {
+	BucketTs            int64
+	Success             int64
+	Anomaly             int64
+	Failed              int64
 	FRTSumMs            int64
 	FRTSumObserved      int64
 	MeanUnsupportedRows int64
@@ -188,12 +192,16 @@ func (m *Monitor) buildModelFRTReportFiltered(ctx context.Context, key, rawEnd s
 }
 
 func (m *Monitor) buildModelFRTSelected(ctx context.Context, selection modelReportSelection, filter ModelFRTFilter, now time.Time) (ModelFRTReport, error) {
+	ctx = withReportProjectionCache(ctx)
 	report := ModelFRTReport{Channels: []ModelFRTChannel{}}
 	if m == nil || m.storeDB == nil {
 		return report, fmt.Errorf("local fact store unavailable")
 	}
 	retainedFrom := m.modelReportRetainedFrom(now)
 	target := metricFinalizeTarget(now.Unix())
+	if m.cfg.CapacityEnabled {
+		target = now.Unix() / 60 * 60
+	}
 	if m.cfg.CustomerHealthSourceEnabled {
 		target = customerHealthSourceFinalizedThrough(now)
 	}
@@ -203,9 +211,18 @@ func (m *Monitor) buildModelFRTSelected(ctx context.Context, selection modelRepo
 		if readErr != nil {
 			return readErr
 		}
+		available := end
+		if end <= 0 {
+			end = target
+		}
 		bounds, readErr := local.resolveModelReportBounds(selection, now, target, end)
 		if readErr != nil {
 			return readErr
+		}
+		if available <= 0 {
+			bounds.ActualThrough = 0
+			bounds.Range.AvailableThrough = time.Time{}
+			bounds.Range.Note += " 尚无完整分钟证明，已有样本不代表完整窗口。"
 		}
 		from, end := bounds.From, bounds.To
 		if !bounds.Range.HasWindow {
@@ -376,5 +393,5 @@ func (m *Monitor) serveModelFRTReport(c *gin.Context) {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": message})
 		return
 	}
-	c.JSON(http.StatusOK, report)
+	serveLocalReportJSON(c, report)
 }

@@ -2,7 +2,6 @@ package monitor
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"strings"
 	"testing"
@@ -39,17 +38,17 @@ func testModelStatisticsReadHonorsCancellation(t *testing.T, table string) {
 	pool.SetMaxOpenConns(1)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	acquired := make(chan *sql.Conn, 1)
+	acquired := make(chan struct{}, 1)
 	if err := m.storeDB.Callback().Query().Before("gorm:query").Register("model-statistics-directory-block", func(tx *gorm.DB) {
 		if tx.Statement.Table != table {
 			return
 		}
-		conn, acquireErr := pool.Conn(context.Background())
-		if acquireErr != nil {
-			_ = tx.AddError(acquireErr)
-			return
-		}
-		acquired <- conn
+		acquired <- struct{}{}
+		// Report reads now share a transaction/connection. Simulate a slow
+		// local query on that connection rather than deadlocking the fixture
+		// by acquiring a second connection from a size-one pool.
+		<-tx.Statement.Context.Done()
+		_ = tx.AddError(tx.Statement.Context.Err())
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -58,15 +57,13 @@ func testModelStatisticsReadHonorsCancellation(t *testing.T, table string) {
 		_, reportErr := m.buildModelStatisticsReport(ctx, "24h", now)
 		done <- reportErr
 	}()
-	var conn *sql.Conn
 	select {
-	case conn = <-acquired:
+	case <-acquired:
 	case err = <-done:
 		t.Fatalf("did not reach %s read: %v", table, err)
 	case <-time.After(time.Second):
 		t.Fatalf("%s read not reached", table)
 	}
-	defer conn.Close()
 	cancel()
 	select {
 	case err = <-done:

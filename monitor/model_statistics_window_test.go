@@ -83,7 +83,7 @@ func TestModelStatisticsActualWindowUsesPersistedCommonTail(t *testing.T) {
 		{name: "frt_replay_tail_behind_requests", independent: true, routedLag: 60, frtLag: 120, endLag: 120},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			target := metricFinalizeTarget(now.Unix())
+			_, target := cloudWatchPreRouteRange(now, 240)
 			if tc.independent {
 				target = customerHealthSourceFinalizedThrough(now)
 			}

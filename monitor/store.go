@@ -1041,6 +1041,8 @@ func (m *Monitor) openStore(path string) error {
 		&AlertConfig{}, &AlertLog{}, &TrackedUser{}, &CustomerGroup{}, &CustomerHealthGroup{}, &CustomerHealthMember{}, &CustomerHealthMigrationState{}, &UsageMemberControl{}, &UsageMemberAudit{}, &UsageMemberControlMigration{}, &FollowUpLog{}, &UsageSettings{}, &UserDirectoryEntry{},
 		&CloudWatchInvestigationAudit{}, &CloudWatchShadowReconciliationRun{}, &CloudWatchShadowReconciliationDiff{}, &CloudWatchPreRouteCursor{}, &CloudWatchNginxCursor{},
 		&GroupGovernanceState{}, &GroupGovernanceGroup{}, &GroupGovernanceUser{},
+		&GroupGovernanceErrorMinute{}, &GroupGovernanceRealtimeState{},
+		&GroupGovernanceMinuteCoverage{},
 		// Incident 核心（MON-003~006）。建表不受 MONITOR_INCIDENT_CORE_ENABLED 控制：
 		// AutoMigrate 与功能开关无关，开关只管引擎是否跑、入口是否显示。
 		&Incident{}, &IncidentSegment{}, &IncidentContinuity{},
@@ -1439,12 +1441,16 @@ func (m *Monitor) replaceChannelSnaps(rows []ChannelSnap, now int64) error {
 // 与 replaceChannelSnaps 不同，此处的空集合是可信事实，表示当前已没有任何渠道。
 // 删除判断按本轮 ID 集合而不是 updated_at，避免同一秒内连续刷新时漏标。
 func (m *Monitor) replaceChannelSnapsAuthoritative(rows []ChannelSnap, now int64) error {
+	return m.replaceChannelSnapsAuthoritativeContext(context.Background(), rows, now)
+}
+
+func (m *Monitor) replaceChannelSnapsAuthoritativeContext(ctx context.Context, rows []ChannelSnap, now int64) error {
 	ids := make([]int, 0, len(rows))
 	for i := range rows {
 		rows[i].DeletedAt = 0
 		ids = append(ids, rows[i].ID)
 	}
-	return m.storeDB.Transaction(func(tx *gorm.DB) error {
+	return m.storeDB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		if len(rows) > 0 {
 			if err := recordFinanceChannelDomains(tx, rows, now); err != nil {
 				return err

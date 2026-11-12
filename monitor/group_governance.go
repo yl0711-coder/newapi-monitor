@@ -9,6 +9,8 @@ package monitor
 //   - 同步失败保留上一份成功结果，不把未知重置为 0。
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
 	"database/sql"
 	"encoding/csv"
@@ -185,6 +187,8 @@ type groupGovernanceReport struct {
 	State        GroupGovernanceState       `json:"state"`
 	SourceErrors []string                   `json:"source_errors"`
 	Groups       []groupGovernanceGroupView `json:"groups"`
+	Realtime     *ggRealtimeReport          `json:"realtime,omitempty"`
+	ConfigOnly   bool                       `json:"config_only"`
 }
 
 func groupGovernanceInterval(minutes int) time.Duration {
@@ -205,6 +209,16 @@ func (m *Monitor) runGroupGovernanceLoop(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			return
+		case <-m.groupGovernanceConfigWake():
+			if m.groupGovernanceWaitingChannels.Load() {
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+				timer.Reset(0)
+			}
 		case <-timer.C:
 			if ctx.Err() != nil {
 				return
@@ -244,15 +258,25 @@ func groupGovernanceRetryDelay(syncMinutes, failures int) time.Duration {
 	return delay
 }
 
-func (m *Monitor) syncGroupGovernance(parent context.Context) error {
+func (m *Monitor) syncGroupGovernance(parent context.Context) (result error) {
 	if !m.cfg.GroupGovernanceEnabled {
 		return nil
 	}
+	if m.cfg.LogChainOnlySource {
+		return m.syncGroupGovernanceConfigOnly(parent)
+	}
+	timing := &configSyncTiming{}
+	timing.enter("publish")
+	defer func() { timing.finish("group_audit", result) }()
 	if m.prodDB == nil {
 		return errSourceNotReady
 	}
 	ctx, cancel := context.WithTimeout(parent, groupGovernanceQueryTimeout)
 	defer cancel()
+	if err := m.requireGroupGovernanceChannels(ctx); err != nil {
+		return err
+	}
+	timing.enter("queue")
 	release, err := m.acquireBackgroundSourceLow(ctx)
 	if err != nil {
 		return err
@@ -264,6 +288,7 @@ func (m *Monitor) syncGroupGovernance(parent context.Context) error {
 		}
 	}()
 
+	timing.enter("source")
 	options, err := m.fetchGroupGovernanceOptions(ctx)
 	if err != nil {
 		m.reportSourceQueryError(err)
@@ -285,24 +310,16 @@ func (m *Monitor) syncGroupGovernance(parent context.Context) error {
 	// 快照发布不得继续阻塞实时采样。
 	release()
 	released = true
-	channels, channelUpdatedAt, channelErr := m.loadGroupGovernanceChannels(ctx)
+	timing.enter("publish")
+	channels, _, channelErr := m.currentGroupGovernanceChannels(ctx)
+	if channelErr != nil {
+		return channelErr
+	}
 	now := time.Now()
 	activity, coverageStart, coverageEnd, historyComplete, unattributed7d, unattributed30d, historyErr := m.loadGroupGovernanceActivity(ctx, now)
 	sourceErrors := append([]string(nil), options.ParseErrors...)
 	if subscriptionErr != nil {
 		sourceErrors = append(sourceErrors, "订阅套餐引用未核验")
-	}
-	channelMaxAge := int64(groupGovernanceInterval(m.cfg.GroupGovernanceSyncMinutes).Seconds() * 2)
-	if samplerAge := int64(m.cfg.SampleSeconds * 3); samplerAge > channelMaxAge {
-		channelMaxAge = samplerAge
-	}
-	if channelMaxAge < 15*60 {
-		channelMaxAge = 15 * 60
-	}
-	if channelErr != nil || channelUpdatedAt == 0 {
-		sourceErrors = append(sourceErrors, "渠道快照尚不可用")
-	} else if now.Unix()-channelUpdatedAt > channelMaxAge {
-		sourceErrors = append(sourceErrors, "渠道快照已过期")
 	}
 	if historyErr != nil {
 		sourceErrors = append(sourceErrors, "本地历史使用量未核验")
@@ -973,6 +990,8 @@ func groupGovernanceErrorSummary(err error) string {
 		return "后台同步超时，已保留上次快照"
 	case errors.Is(err, errSourceNotReady):
 		return "NewAPI 只读来源尚未就绪，已保留上次快照"
+	case errors.Is(err, errGroupGovernanceChannelsPending):
+		return "渠道配置尚未更新，暂不能确认调整范围；渠道恢复后自动复核"
 	default:
 		return "后台同步失败，已保留上次快照"
 	}
@@ -980,12 +999,16 @@ func groupGovernanceErrorSummary(err error) string {
 
 func (m *Monitor) loadGroupGovernanceReport(ctx context.Context) (groupGovernanceReport, error) {
 	report := groupGovernanceReport{Enabled: m.cfg.GroupGovernanceEnabled, Groups: []groupGovernanceGroupView{}, SourceErrors: []string{}}
+	report.ConfigOnly = m.cfg.LogChainOnlySource
 	if !m.cfg.GroupGovernanceEnabled {
 		return report, nil
 	}
 	var rows []GroupGovernanceGroup
 	err := m.storeDB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		if err := tx.First(&report.State, groupGovernanceStateID).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return nil
+			}
 			return err
 		}
 		return tx.Order("CASE status WHEN 'high' THEN 0 WHEN 'pending' THEN 1 WHEN 'observe' THEN 2 ELSE 3 END, grp ASC").Find(&rows).Error
@@ -1017,10 +1040,20 @@ func (m *Monitor) loadGroupGovernanceReport(ctx context.Context) (groupGovernanc
 		}
 		report.Groups = append(report.Groups, view)
 	}
+	var realtimeErr error
+	report.Realtime, realtimeErr = m.loadGroupGovernanceRealtime(ctx)
+	if realtimeErr != nil {
+		report.Realtime = &ggRealtimeReport{Status: "pending", Note: "近期指标读取失败；配置快照仍可查看"}
+	}
 	return report, nil
 }
 
 func (m *Monitor) serveGroupGovernanceReport(c *gin.Context) {
+	// This report includes all configured idle models and expanded evidence.
+	// Keep large local snapshots out of the reverse proxy's small temp volume.
+	c.Header("Cache-Control", "private, no-store")
+	c.Header("X-Accel-Buffering", "no")
+	c.Header("Vary", "Accept-Encoding")
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
 	defer cancel()
 	report, err := m.loadGroupGovernanceReport(ctx)
@@ -1028,7 +1061,54 @@ func (m *Monitor) serveGroupGovernanceReport(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "读取分组治理本地快照失败"})
 		return
 	}
-	c.JSON(http.StatusOK, report)
+	if !groupGovernanceAcceptsGzip(c.GetHeader("Accept-Encoding")) {
+		c.JSON(http.StatusOK, report)
+		return
+	}
+	encoded, err := json.Marshal(report)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "生成分组治理快照失败"})
+		return
+	}
+	var compressed bytes.Buffer
+	w, _ := gzip.NewWriterLevel(&compressed, gzip.BestSpeed)
+	if _, err = w.Write(encoded); err == nil {
+		err = w.Close()
+	}
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "生成分组治理快照失败"})
+		return
+	}
+	c.Header("Content-Encoding", "gzip")
+	c.Data(http.StatusOK, "application/json; charset=utf-8", compressed.Bytes())
+}
+
+func groupGovernanceAcceptsGzip(header string) bool {
+	star := false
+	for _, item := range strings.Split(strings.ToLower(header), ",") {
+		parts := strings.Split(item, ";")
+		coding := strings.TrimSpace(parts[0])
+		if coding != "gzip" && coding != "*" {
+			continue
+		}
+		q := 1.0
+		for _, parameter := range parts[1:] {
+			pair := strings.SplitN(strings.TrimSpace(parameter), "=", 2)
+			if len(pair) == 2 && pair[0] == "q" {
+				v, err := strconv.ParseFloat(pair[1], 64)
+				if err != nil || !(v >= 0 && v <= 1) {
+					q = 0
+				} else {
+					q = v
+				}
+			}
+		}
+		if coding == "gzip" {
+			return q > 0
+		}
+		star = q > 0
+	}
+	return star
 }
 
 func (m *Monitor) serveGroupGovernanceUsers(c *gin.Context) {
