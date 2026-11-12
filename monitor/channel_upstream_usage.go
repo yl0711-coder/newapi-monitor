@@ -275,10 +275,6 @@ func upstreamUsageOperationTimeout(s Settings) time.Duration {
 	return timeout
 }
 
-func upstreamUsageOperationTimeoutForLane(s Settings, lane upstreamUsageLane) time.Duration {
-	return upstreamUsageOperationTimeoutForAccount(s, lane, "")
-}
-
 // upstreamUsageOperationTimeoutForAccount gives TokenForce history the full
 // operation budget. One TokenForce hour is not resumable inside the window
 // (own pages, late-finish slice, widened earlier hours) and the host guard
