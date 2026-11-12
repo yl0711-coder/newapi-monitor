@@ -34,6 +34,15 @@ type ChannelUpstreamBalanceAssessment struct {
 	// reached the start of the window yet; the estimate uses only the most
 	// recent LookbackDays complete days (at least upstreamBalancePartialMinDays).
 	PartialHistory bool `json:"partial_history,omitempty"`
+	// RecentDailyCostUSD is the daily rate of the last 24 closed hours, when
+	// those hours are covered well enough to be measured.
+	RecentDailyCostUSD *float64 `json:"recent_daily_cost_usd,omitempty"`
+	// EffectiveDailyCostUSD is the rate the runway and required balance use:
+	// the higher of the lookback average and the recent 24-hour rate.
+	EffectiveDailyCostUSD float64 `json:"effective_daily_cost_usd"`
+	// RunwayBasis is "recent_24h" when the recent rate is the higher one and
+	// therefore drives the estimate; otherwise "lookback".
+	RunwayBasis string `json:"runway_basis,omitempty"`
 }
 
 type upstreamBurnEstimate struct {
@@ -46,7 +55,19 @@ type upstreamBurnEstimate struct {
 	// has not reached it yet, and AverageDailyCostUSD is taken from this many
 	// most recent complete days instead.
 	PartialDays int
+	// RecentDailyCostUSD/RecentAvailable: daily rate over the last 24 closed
+	// hours (see loadUpstreamRecentBurn).
+	RecentDailyCostUSD float64
+	RecentAvailable    bool
 }
+
+// upstreamBalanceRecentWindowSeconds is the recent window whose rate can
+// override the lookback average. A 7-day average lags a channel whose traffic
+// is ramping: on 2026-11-12 lingxuapi.com had 2.4 days by its 7-day average
+// but only 0.3 days at the previous day's rate, so a 1-day threshold never
+// fired. The runway uses the higher of the two rates (the usual "recent burn
+// rate first" rule in budget forecasting).
+const upstreamBalanceRecentWindowSeconds = 24 * 3600
 
 // upstreamBalancePartialMinDays is the fewest complete recent days a
 // still-importing account needs before its balance runway is estimated.
@@ -194,7 +215,88 @@ func (m *Monitor) loadUpstreamBurnEstimates(ctx context.Context, now int64, poli
 		}
 		estimates[domain] = estimate
 	}
+	recent, err := m.loadUpstreamRecentBurn(ctx, now, policy, accounts)
+	if err != nil {
+		return nil, err
+	}
+	for domain, rate := range recent {
+		estimate := estimates[domain]
+		estimate.RecentDailyCostUSD, estimate.RecentAvailable = rate, true
+		estimates[domain] = estimate
+	}
 	return estimates, nil
+}
+
+// loadUpstreamRecentBurn measures the daily rate of the last 24 closed hours
+// per account. An account is returned only when its rows cover at least
+// MinCoverage of the window without overlap or invalid amounts; otherwise the
+// lookback average alone is used. Provisional Sub2API rows are counted: they
+// are unconfirmed zero (or retained) hours, so including them can only lower
+// the recent rate, and the recent rate is used only when it is the higher one.
+// Accounts with natural-day buckets (AICodeWith, legacy Sub2API) have no
+// recent rate.
+func (m *Monitor) loadUpstreamRecentBurn(ctx context.Context, now int64, policy upstreamBalancePolicy, accounts map[string]ChannelUpstreamAccountView) (map[string]float64, error) {
+	to := now - now%3600
+	from := to - upstreamBalanceRecentWindowSeconds
+	var rows []ChannelUpstreamUsageHour
+	if err := m.storeDB.WithContext(ctx).Raw(`SELECT domain,hour_ts,bucket_seconds,requests,tokens,quota,cost_usd,
+		COALESCE(unit_per_usd,0) unit_per_usd,fetched_at,provider,provisional
+		FROM channel_upstream_usage_hours
+		WHERE hour_ts>=? AND hour_ts+(CASE WHEN bucket_seconds>0 THEN bucket_seconds ELSE 3600 END)<=?
+		ORDER BY domain ASC,hour_ts ASC`, from, to).Scan(&rows).Error; err != nil {
+		return nil, fmt.Errorf("读取最近 24 小时上游账面消费: %w", err)
+	}
+	type accumulator struct {
+		cost    float64
+		seconds int64
+		lastEnd int64
+		invalid bool
+	}
+	byDomain := make(map[string]*accumulator, len(accounts))
+	for _, row := range rows {
+		account, ok := accounts[row.Domain]
+		if !ok || row.Provider != account.Provider {
+			continue
+		}
+		a := byDomain[row.Domain]
+		if a == nil {
+			a = &accumulator{}
+			byDomain[row.Domain] = a
+		}
+		seconds := row.BucketSeconds
+		if seconds <= 0 {
+			seconds = 3600
+		}
+		// A natural-day bucket fits the trailing 24 hours exactly between 00:00
+		// and 00:59 and never otherwise; using it would flip the basis once a
+		// day. The recent rate is measured on hourly ledgers only.
+		if seconds > 3600 || a.lastEnd > row.HourTs {
+			a.invalid = true
+			continue
+		}
+		if row.Provider == upstreamProviderTokenForce {
+			var valid bool
+			if row, valid = tokenForceBillFaceValue(row); !valid {
+				a.invalid = true
+				continue
+			}
+		}
+		if math.IsNaN(row.CostUSD) || math.IsInf(row.CostUSD, 0) || row.CostUSD < 0 {
+			a.invalid = true
+			continue
+		}
+		a.cost += row.CostUSD
+		a.seconds += seconds
+		a.lastEnd = row.HourTs + seconds
+	}
+	out := make(map[string]float64, len(byDomain))
+	for domain, a := range byDomain {
+		if a.invalid || a.seconds <= 0 || float64(a.seconds)*100 < float64(upstreamBalanceRecentWindowSeconds)*policy.MinCoverage-1e-6 {
+			continue
+		}
+		out[domain] = a.cost / (float64(a.seconds) / 86400)
+	}
+	return out, nil
 }
 
 // applyPartialHistoryEstimate lets a newly connected account be assessed
@@ -289,14 +391,25 @@ func assessUpstreamBalance(account ChannelUpstreamAccountView, estimate upstream
 		return assessment
 	}
 	assessment.Available = true
-	if estimate.AverageDailyCostUSD < minUpstreamDailyCostUSD {
+	daily, basis := estimate.AverageDailyCostUSD, fmt.Sprintf("近 %d 个完整自然日上游账面日均消费%s", lookback, basisNote)
+	assessment.RunwayBasis = "lookback"
+	if estimate.RecentAvailable {
+		recent := estimate.RecentDailyCostUSD
+		assessment.RecentDailyCostUSD = &recent
+		if recent > daily {
+			daily, basis = recent, fmt.Sprintf("最近 24 小时上游账面消费速度（高于近 %d 日日均）", lookback)
+			assessment.RunwayBasis = "recent_24h"
+		}
+	}
+	assessment.EffectiveDailyCostUSD = daily
+	if daily < minUpstreamDailyCostUSD {
 		assessment.Status = "idle"
 		assessment.Reason = fmt.Sprintf("近 %d 个完整自然日无显著上游消耗%s", lookback, basisNote)
 		return assessment
 	}
-	requiredBalance := estimate.AverageDailyCostUSD * policy.RunwayDays
+	requiredBalance := daily * policy.RunwayDays
 	assessment.RequiredBalanceUSD = &requiredBalance
-	runway := *account.BalanceUSD / estimate.AverageDailyCostUSD
+	runway := *account.BalanceUSD / daily
 	if runway < 0 {
 		runway = 0
 	}
@@ -306,7 +419,7 @@ func assessUpstreamBalance(account ChannelUpstreamAccountView, estimate upstream
 		assessment.Reason = "余额已用尽或为负"
 	} else if runway <= policy.RunwayDays {
 		assessment.Status = "warning"
-		assessment.Reason = fmt.Sprintf("按近 %d 个完整自然日上游账面日均消费估算%s，余额不足 %.1f 天", lookback, basisNote, policy.RunwayDays)
+		assessment.Reason = fmt.Sprintf("按%s估算，余额不足 %.1f 天", basis, policy.RunwayDays)
 	} else {
 		assessment.Status = "healthy"
 	}
@@ -380,11 +493,22 @@ func (m *Monitor) evaluateUpstreamBalanceAlerts(c AlertConfig, now int64) {
 		account := accounts[domain]
 		m.fire(c, "upstream_balance_low", domain,
 			fmt.Sprintf("渠道余额预计不足 %.1f 天：%s", assessment.ThresholdDays, domain),
-			fmt.Sprintf("主域名：%s\n当前余额：$%.2f\n近 %d 个完整自然日上游账面日均消费：$%.2f\n余额保障时长：%.1f 天\n当前动态预警线：$%.2f\n预计可用：%.2f 天（%.1f 小时）\n上游账单覆盖率：%.1f%%（%d/%d 小时）%s\n\n预计可用时间按当前余额 ÷ 上游账面日均消费计算；充值比例修正仅用于成本与利润核算。",
-				domain, *account.BalanceUSD, assessment.LookbackDays, assessment.AverageDailyCostUSD,
+			fmt.Sprintf("主域名：%s\n当前余额：$%.2f\n近 %d 个完整自然日上游账面日均消费：$%.2f\n%s余额保障时长：%.1f 天\n当前动态预警线：$%.2f\n预计可用：%.2f 天（%.1f 小时）\n上游账单覆盖率：%.1f%%（%d/%d 小时）%s\n\n预计可用时间按当前余额 ÷ 日均消费计算，日均消费取近期日均与最近 24 小时速度中较高者；充值比例修正仅用于成本与利润核算。",
+				domain, *account.BalanceUSD, assessment.LookbackDays, assessment.AverageDailyCostUSD, upstreamBalanceRecentAlertLine(assessment),
 				assessment.ThresholdDays, *assessment.RequiredBalanceUSD, *assessment.EstimatedRunwayDays,
 				*assessment.EstimatedRunwayDays*24, assessment.CoveragePct, assessment.CompletedHours, assessment.ExpectedHours, upstreamBalancePartialAlertNote(assessment)), now)
 	}
+}
+
+func upstreamBalanceRecentAlertLine(assessment ChannelUpstreamBalanceAssessment) string {
+	if assessment.RecentDailyCostUSD == nil {
+		return "最近 24 小时消费速度：数据不完整，未参与估算\n"
+	}
+	line := fmt.Sprintf("最近 24 小时消费速度：$%.2f/天", *assessment.RecentDailyCostUSD)
+	if assessment.RunwayBasis == "recent_24h" {
+		line += "（高于近期日均，本次按此估算）"
+	}
+	return line + "\n"
 }
 
 func upstreamBalancePartialAlertNote(assessment ChannelUpstreamBalanceAssessment) string {

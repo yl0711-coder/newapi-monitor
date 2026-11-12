@@ -445,3 +445,108 @@ func TestUpstreamBalancePartialHistoryUsesRecentCompleteDays(t *testing.T) {
 		}
 	})
 }
+
+// lingxuapi.com, 2026-11-12: a ramping channel is assessed by the higher of the
+// lookback average and the last 24 closed hours, so the 1-day threshold fires
+// before the 7-day average catches up.
+func TestUpstreamBalanceRunwayUsesRecentRateWhenHigher(t *testing.T) {
+	// 00:30: the recent window is exactly the last lookback day.
+	now := time.Date(2026, 8, 8, 0, 30, 0, 0, cstLocation).Unix()
+	_, to := upstreamBalanceWindow(now, 7)
+	domain := "ramp.example"
+	policy := upstreamBalancePolicyFor(defaultAlertConfig())
+	setup := func(t *testing.T, lastDayHourCost float64) *Monitor {
+		t.Helper()
+		m := newStabilityTestMonitor(t)
+		seedUpstreamLedger(t, m, domain, upstreamProviderNewAPI, now, 7, 48, 3600)
+		if err := m.storeDB.Model(&ChannelUpstreamUsageHour{}).Where("domain=? AND hour_ts>=?", domain, to-86400).Update("cost_usd", lastDayHourCost).Error; err != nil {
+			t.Fatal(err)
+		}
+		return m
+	}
+	assess := func(t *testing.T, m *Monitor, account ChannelUpstreamAccountView) ChannelUpstreamBalanceAssessment {
+		t.Helper()
+		estimates, err := m.loadUpstreamBurnEstimates(context.Background(), now, policy, map[string]ChannelUpstreamAccountView{domain: account})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return assessUpstreamBalance(account, estimates[domain], policy, now, 5)
+	}
+
+	t.Run("recent rate higher drives the runway", func(t *testing.T) {
+		a := assess(t, setup(t, 4), seededUpstreamBalanceAccount(now, 80)) // last day 96/day
+		avg := (6*48.0 + 96) / 7
+		if !a.Available || math.Abs(a.AverageDailyCostUSD-avg) > 1e-6 || a.RecentDailyCostUSD == nil || math.Abs(*a.RecentDailyCostUSD-96) > 1e-6 ||
+			a.RunwayBasis != "recent_24h" || math.Abs(a.EffectiveDailyCostUSD-96) > 1e-6 ||
+			a.EstimatedRunwayDays == nil || math.Abs(*a.EstimatedRunwayDays-80.0/96) > 1e-6 ||
+			a.RequiredBalanceUSD == nil || math.Abs(*a.RequiredBalanceUSD-96) > 1e-6 ||
+			a.Status != "warning" || !strings.Contains(a.Reason, "最近 24 小时") {
+			t.Fatalf("assessment=%+v", a)
+		}
+		// By the 7-day average alone the same balance would look healthy.
+		if 80/avg <= policy.RunwayDays {
+			t.Fatal("fixture no longer shows the lag of the 7-day average")
+		}
+		if line := upstreamBalanceRecentAlertLine(a); !strings.Contains(line, "$96.00/天") || !strings.Contains(line, "本次按此估算") {
+			t.Fatalf("alert line=%q", line)
+		}
+	})
+	t.Run("recent rate lower keeps the lookback average", func(t *testing.T) {
+		a := assess(t, setup(t, 1), seededUpstreamBalanceAccount(now, 80)) // last day 24/day
+		avg := (6*48.0 + 24) / 7
+		if !a.Available || a.RunwayBasis != "lookback" || a.RecentDailyCostUSD == nil || math.Abs(*a.RecentDailyCostUSD-24) > 1e-6 ||
+			math.Abs(a.EffectiveDailyCostUSD-avg) > 1e-6 || math.Abs(*a.EstimatedRunwayDays-80/avg) > 1e-6 || a.Status != "healthy" {
+			t.Fatalf("assessment=%+v", a)
+		}
+		if line := upstreamBalanceRecentAlertLine(a); strings.Contains(line, "本次按此估算") {
+			t.Fatalf("alert line=%q", line)
+		}
+	})
+	t.Run("incomplete recent window is not used", func(t *testing.T) {
+		m := setup(t, 4)
+		// Drop 3 of the last 24 hours: 87.5% < 95% recent coverage, while the
+		// 7-day window keeps 165/168 hours.
+		if err := m.storeDB.Where("domain=? AND hour_ts>=?", domain, to-3*3600).Delete(&ChannelUpstreamUsageHour{}).Error; err != nil {
+			t.Fatal(err)
+		}
+		a := assess(t, m, seededUpstreamBalanceAccount(now, 80))
+		if !a.Available || a.RecentDailyCostUSD != nil || a.RunwayBasis != "lookback" || math.Abs(a.EffectiveDailyCostUSD-a.AverageDailyCostUSD) > 1e-9 {
+			t.Fatalf("assessment=%+v", a)
+		}
+		if line := upstreamBalanceRecentAlertLine(a); !strings.Contains(line, "数据不完整") {
+			t.Fatalf("alert line=%q", line)
+		}
+	})
+	t.Run("provisional zero hours count as covered and only lower the rate", func(t *testing.T) {
+		m := setup(t, 4)
+		if err := m.storeDB.Model(&ChannelUpstreamUsageHour{}).Where("domain=? AND hour_ts>=?", domain, to-2*3600).
+			Updates(map[string]any{"provisional": true, "cost_usd": 0, "requests": 0}).Error; err != nil {
+			t.Fatal(err)
+		}
+		a := assess(t, m, seededUpstreamBalanceAccount(now, 80))
+		if a.RecentDailyCostUSD == nil || math.Abs(*a.RecentDailyCostUSD-88) > 1e-6 || a.RunwayBasis != "recent_24h" {
+			t.Fatalf("assessment=%+v", a)
+		}
+	})
+	t.Run("natural-day ledger leaves the recent rate unavailable", func(t *testing.T) {
+		m := newStabilityTestMonitor(t)
+		seedUpstreamLedger(t, m, domain, upstreamProviderNewAPI, now, 7, 48, 86400)
+		midday := now + 12*3600
+		estimates, err := m.loadUpstreamBurnEstimates(context.Background(), midday, policy, map[string]ChannelUpstreamAccountView{domain: seededUpstreamBalanceAccount(midday, 80)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if estimates[domain].RecentAvailable {
+			t.Fatalf("estimate=%+v", estimates[domain])
+		}
+		// Between 00:00 and 00:59 yesterday's daily bucket fits the trailing
+		// 24 hours exactly; it must still not produce a recent rate.
+		estimates, err = m.loadUpstreamBurnEstimates(context.Background(), now, policy, map[string]ChannelUpstreamAccountView{domain: seededUpstreamBalanceAccount(now, 80)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if estimates[domain].RecentAvailable {
+			t.Fatalf("daily bucket used at 00:30: %+v", estimates[domain])
+		}
+	})
+}

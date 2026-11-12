@@ -276,6 +276,19 @@ func upstreamUsageOperationTimeout(s Settings) time.Duration {
 }
 
 func upstreamUsageOperationTimeoutForLane(s Settings, lane upstreamUsageLane) time.Duration {
+	return upstreamUsageOperationTimeoutForAccount(s, lane, "")
+}
+
+// upstreamUsageOperationTimeoutForAccount gives TokenForce history the full
+// operation budget. One TokenForce hour is not resumable inside the window
+// (own pages, late-finish slice, widened earlier hours) and the host guard
+// spaces requests by at least one second, so a busy hour of ~22 requests
+// cannot finish inside the 45-second history lane deadline and would fail on
+// every retry. Other providers keep the short history deadline.
+func upstreamUsageOperationTimeoutForAccount(s Settings, lane upstreamUsageLane, provider string) time.Duration {
+	if lane == upstreamUsageLaneHistory && provider == upstreamProviderTokenForce {
+		return upstreamUsageOperationTimeout(s)
+	}
 	if lane == upstreamUsageLaneHistory {
 		return upstreamUsageHistoryOperationTimeout
 	}
@@ -1164,6 +1177,9 @@ func (m *Monitor) syncNewAPIUsagePagedWindow(ctx context.Context, table string, 
 	}
 
 	client := m.channelUpstreamUsageHTTPClient()
+	if table == newAPIUsageBackfillCheckpointTable {
+		client = m.channelUpstreamUsageHistoryHTTPClient()
+	}
 	var first newAPIUsagePage[newAPIUsageItem]
 	firstLoaded := false
 	checkpointVerified := false
@@ -3441,7 +3457,7 @@ func (m *Monitor) runDueUpstreamUsageAccounts(ctx context.Context, rows []Channe
 	launch := func(row ChannelUpstreamAccount) {
 		active++
 		go func() {
-			syncCtx, cancel := context.WithTimeout(ctx, upstreamUsageOperationTimeoutForLane(m.cfg, lane))
+			syncCtx, cancel := context.WithTimeout(ctx, upstreamUsageOperationTimeoutForAccount(m.cfg, lane, row.Provider))
 			defer cancel()
 			synced, syncErr := m.syncStoredUpstreamUsageLaneBackground(syncCtx, row.Domain, lane)
 			results <- dueUpstreamUsageResult{row: row, synced: synced, err: syncErr}

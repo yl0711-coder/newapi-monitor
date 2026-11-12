@@ -13,6 +13,16 @@ import (
 // budget is left, so a round never opens a window it cannot normally finish.
 const tokenForceHistoryMinRequestsPerWindow = 3
 
+// tokenForceHistoryWindowMaxRequests is the hard request cap for one history
+// round once a window has started. The run budget (20) still decides whether
+// a further window may start, but a started window may finish: a busy hour
+// costs its own pages, the late-finish slice and up to three whole earlier
+// hours re-read by the widening step (11-09 12:00 on hainahn.com needed about
+// 22 requests). With the cap equal to the start budget such an hour exhausted
+// the budget on every retry, was booked as a failure and never advanced. 60
+// covers hours of roughly 1000 requests; the pacer interval still spaces them.
+const tokenForceHistoryWindowMaxRequests = 60
+
 // syncTokenForceHistoryWindows imports closed one-hour history windows in
 // order until the run's request budget or operation deadline is used up.
 // A typical hour needs two or three requests, so importing only one hour per
@@ -30,8 +40,16 @@ func (m *Monitor) syncTokenForceHistoryWindows(ctx context.Context, row *Channel
 	today := cstDayStart(now)
 	cursor := plan.backfillFrom
 	completed := 0
+	startBudget := 0
+	if pacer != nil && pacer.maxRequests > 0 {
+		startBudget = pacer.maxRequests
+		if pacer.maxRequests < tokenForceHistoryWindowMaxRequests {
+			pacer.maxRequests = tokenForceHistoryWindowMaxRequests
+			defer func() { pacer.maxRequests = startBudget }()
+		}
+	}
 	for cursor < today {
-		if completed > 0 && pacer != nil && pacer.maxRequests > 0 && pacer.maxRequests-pacer.calls < tokenForceHistoryMinRequestsPerWindow {
+		if completed > 0 && startBudget > 0 && startBudget-pacer.calls < tokenForceHistoryMinRequestsPerWindow {
 			break
 		}
 		windowTo := cursor + tokenForceBackfillWindowSeconds

@@ -30,6 +30,10 @@ test('unaccounted channel address can be aliased to a configured supplier',()=>{
   assert.match(box.innerHTML,/归并到所选上游/);
   assert.match(box.innerHTML,/<option value="rkshadow.com">/);
   assert.doesNotMatch(box.innerHTML,/other\.example/);
+  // No supplier is preselected: a misclick must not merge into the first one.
+  assert.match(box.innerHTML,/<option value="" selected>选择要归并到的上游…<\/option>/);
+  assert.match(box.innerHTML,/data-cm-alias-save="1" disabled>/);
+  assert.match(box.innerHTML,/<code>148\.163\.65\.162<\/code>/);
   ui.renderDomainAlias(ui.cm.report.domains[1],true);
   assert.equal(box.hidden,true,'a configured supplier without aliases shows nothing');
 });
@@ -46,7 +50,7 @@ test('target domain lists its aliases with a remove action',()=>{
   ui.cm.report={domains:[{domain:'rkshadow.com',upstream:{configured:true},aliases:['148.163.65.162']}]};
   ui.renderDomainAlias(ui.cm.report.domains[0],true);
   const box=element('cmDomainAlias');
-  assert.match(box.innerHTML,/148\.163\.65\.162 <button[^>]*data-cm-alias-remove="148\.163\.65\.162"/);
+  assert.match(box.innerHTML,/<li><code>148\.163\.65\.162<\/code><button[^>]*data-cm-alias-remove="148\.163\.65\.162"/);
   ui.renderDomainAlias(null,false);
   assert.equal(box.hidden,true);
 });

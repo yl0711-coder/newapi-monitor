@@ -39,7 +39,7 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
   .btn{padding:7px 14px;border-radius:8px;border:1px solid var(--border);background:transparent;color:var(--text);cursor:pointer;font-size:13px}
   .btn:hover{border-color:var(--accent);color:var(--accent)}
   /* 用户用量·消费矩阵:用户多(20-30列)时的可读性——双向滚动容器内粘住表头行/日期列/合计列,列头截断悬停看全,格子按金额热力着色 */
-  .mxwrap{max-height:65vh;overflow:auto;position:relative;--mx-user-w:216px;--mx-user-text-w:188px;--mx-left-2:var(--mx-user-w);--mx-left-3:calc(var(--mx-user-w) + 132px)}
+  .mxwrap{max-height:65vh;overflow:auto;position:relative;scroll-snap-type:x proximity;scroll-padding-left:calc(var(--mx-user-w) + 274px);scroll-padding-right:124px;--mx-user-w:216px;--mx-user-text-w:188px;--mx-left-2:var(--mx-user-w);--mx-left-3:calc(var(--mx-user-w) + 132px)}
   .mxwrap table{width:100%;min-width:var(--mx-table-min,620px);table-layout:fixed;border-collapse:separate;border-spacing:0}
   .mxwrap thead th{position:sticky;top:0;background:var(--surface);z-index:3}
   .mxwrap td:first-child,.mxwrap th:first-child{position:sticky;left:0;background:var(--surface);z-index:2;white-space:nowrap;width:var(--mx-user-w);min-width:var(--mx-user-w);max-width:var(--mx-user-w);box-sizing:border-box}
@@ -50,10 +50,14 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
   .mxwrap td:last-child,.mxwrap th:last-child{position:sticky;right:0;background:var(--surface);z-index:2;box-shadow:-6px 0 8px -6px rgba(0,0,0,.55)}
   .mxwrap thead th:first-child{z-index:4}
   .mxwrap thead th:last-child{z-index:4}
+  @media(max-width:620px){ /* 窄屏只锁用户列：多列同时固定会把余额和日期全部盖住 */
+    .mxwrap td:nth-child(2),.mxwrap th:nth-child(2),.mxwrap td:nth-child(3),.mxwrap th:nth-child(3),.mxwrap td:last-child,.mxwrap th:last-child{position:static;box-shadow:none}
+    .mxwrap td:first-child,.mxwrap th:first-child{box-shadow:6px 0 8px -6px rgba(0,0,0,.55)}
+  }
   .mxwrap td,.mxwrap th{white-space:nowrap} /* 表头日期绝不折行 */
   /* 统一列宽:数据列(日期)等宽,不随内容宽窄不一;首列(用户)与尾列(合计)各自给足 */
-  .mxwrap thead th:nth-child(n+4):not(:last-child),.mxwrap tbody td:nth-child(n+4):not(:last-child){width:92px;min-width:92px;max-width:92px}
-  .mxwrap thead th:last-child,.mxwrap tbody td:last-child{width:104px;min-width:104px;max-width:104px}
+  .mxwrap thead th:nth-child(n+4):not(:last-child),.mxwrap tbody td:nth-child(n+4):not(:last-child){width:var(--mx-day-w,104px);min-width:var(--mx-day-w,104px);max-width:var(--mx-day-w,104px);scroll-snap-align:start} /* 至少容纳带千分位的五位金额；列宽按可见区整除，横向滚动按整列停靠，金额不被切半 */
+  .mxwrap thead th:last-child,.mxwrap tbody td:last-child{width:124px;min-width:124px;max-width:124px}
   /* 每日明细不可用时只剩“用户/余额/累计总消耗”三列。此时不能继续沿用
      多日期矩阵的冻结列宽规则，否则浏览器会把整行余量几乎都补给用户列。
      单独按三列总宽分配：用户名有一个有上限的可读宽度，其余空间由两列金额均分。 */
@@ -620,7 +624,7 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
   .tabs .tab.active{color:var(--text);border-bottom-color:var(--accent);font-weight:600}
   .tabpane[hidden]{display:none}
 </style>
-<link rel="stylesheet" href="/stability.css?v=16">
+<link rel="stylesheet" href="/stability.css?v=17">
 <link rel="stylesheet" href="/capacity.css?v=2">
 <link rel="stylesheet" href="/group-governance.css?v=1">
 <link rel="stylesheet" href="/finance.css?v=14">
@@ -1111,8 +1115,8 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
   <div class="cm-sortbar">
     <div><b>排行口径</b><span>切换后主域名、服务分组和实际渠道同步重排</span></div>
     <div class="cm-sort-switch">
-      <button type="button" class="active" data-cm-sort="name">名称 A–Z</button>
-      <button type="button" data-cm-sort="cost">用户侧消费</button>
+      <button type="button" data-cm-sort="name">名称 A–Z</button>
+      <button type="button" class="active" data-cm-sort="cost">用户侧消费</button>
       <button type="button" data-cm-sort="requests">请求数</button>
       <button type="button" data-cm-sort="tokens">Tokens</button>
     </div>
@@ -1189,7 +1193,7 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
         <label><span>中转站类型</span><select id="cmUpstreamProvider"><option value="newapi">NewAPI</option><option value="sub2api">Sub2API</option><option value="aicodewith">AICodeWith（春秋）</option><option value="tokenforce">海南海纳（TokenForce MaaS）</option><option value="openox">OpenOx</option><option value="orion">Orion（modelrouter 等）</option><option value="volcengine">火山引擎（方舟）</option></select></label>
         <label class="cm-upstream-orion wide" hidden><span>Orion 管理密钥</span><input id="cmUpstreamOrionKey" type="password" autocomplete="new-password" placeholder="已配置时留空保持原连接"><small>登录上游控制台 → 管理密钥（Management keys）→ 新建，复制 smk_ 开头的密钥（只显示一次）。不是模型调用 Key；不会过期或轮换，被撤销后需重新导入。</small></label>
         <label class="cm-upstream-volcengine" hidden><span>AccessKey ID</span><input id="cmUpstreamVolcAK" type="password" autocomplete="new-password" placeholder="已配置时留空保持原连接"></label>
-        <label class="cm-upstream-volcengine wide" hidden><span>Secret Access Key</span><input id="cmUpstreamVolcSK" type="password" autocomplete="new-password" placeholder="已配置时留空保持原连接"><small>火山引擎控制台 → 访问控制 → 新建子用户，只授予费用中心只读权限后创建 AccessKey。不要使用主账号密钥或模型 API Key。余额为可用余额（人民币）；消费为账单应付金额，仅按天汇总。金额按人民币原值记入，与海纳相同：务必在倍率配置里为该主域名填写“上游充值比例”（例如 1 美元到账需付 7.2 元，则填 1/7.2），否则人民币会被当作美元，成本约偏高 7 倍。</small></label>
+        <label class="cm-upstream-volcengine wide" hidden><span>Secret Access Key</span><input id="cmUpstreamVolcSK" type="password" autocomplete="new-password" placeholder="已配置时留空保持原连接"><small>火山引擎控制台 → 访问控制 → 新建子用户，只授予费用中心只读权限后创建 AccessKey。不要使用主账号密钥或模型 API Key。余额为可用余额（人民币）；消费为账单应付金额，仅按天汇总。金额按人民币原值记入，与海纳相同。平台的修正成本按“实际支付”计（本站充值 1 元到账 1 个额度单位），因此上游充值比例按实际支付与到账填写：无优惠填 1:1；有赠送时按实付和到账金额填写（例如付 1000 元到账 1100 元，则支付 1000、到账 1100）。</small></label>
         <label class="cm-upstream-openox wide" hidden><span>OpenOx 后台令牌</span><input id="cmUpstreamOpenOxToken" type="password" autocomplete="new-password" placeholder="已配置时留空保持原连接"><small>登录 https://api.openox.net → 开发者工具 → Application → Local Storage → 当前站点 → auth_token。不是模型 Key；到期需重新登录并导入。余额仅指可用钱包，不含订阅额度；用量包含订阅抵扣，暂不计算现金修正成本和可用天数。订阅订单及退款暂不作为充值流水导入。</small></label>
         <label class="wide"><span>站点地址</span><input id="cmUpstreamBaseURL" type="url" placeholder="https://example.com" autocomplete="url"><small>填写站点根地址，不要追加 API 路径</small><span class="cm-upstream-inline-check"><input id="cmUpstreamCrossDomain" type="checkbox"> 站点地址与渠道域名不同（已核实是同一供应商的控制台，凭据会发往该地址）</span></label>
         <label class="cm-upstream-newapi"><span>用户 ID</span><input id="cmUpstreamUserID" type="number" min="1" step="1" inputmode="numeric" placeholder="例如 123"></label>
@@ -1679,7 +1683,7 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
 <script src="/stability.js?v=8"></script>
 <script src="/channel-data-status.js?v=2"></script>
 <script src="/channel-pricing-observations.js?v=1"></script>
-<script src="/channel-management.js?v=19"></script>
+<script src="/channel-management.js?v=20"></script>
 <script src="/logchain.js?v=20"></script>
 <script src="/customer-health.js?v=4"></script>
 <script src="/alerts.js?v=3"></script>
@@ -2933,7 +2937,8 @@ let usageFilterGid=null;   // null=全部;0=未分组;>0=分组id
 let usageSearchText='';    // 搜索词(公司/用户名/邮箱)
 let usageGrpExpanded=false;// 分组卡条是否展开(默认只显一行,点更多全展开)
 let usageRowCap=5;         // 一行能放几张卡(按容器宽度动态测得)
-const fmtCost=v=>{v=+v||0;return '$'+(v>=0.01||v===0?v.toFixed(2):v.toFixed(4))}; // 常规两位小数;<1分钱才放开到4位
+// 金额统一千分位、两位小数；绝对值 <1 分钱才放开到 4 位；负数写成 -$0.03 而不是 $-0.0336。
+const fmtCost=v=>{v=+v||0;const a=Math.abs(v),d=a>=0.01||a===0?2:4;return (v<0?'-$':'$')+a.toLocaleString('en-US',{minimumFractionDigits:d,maximumFractionDigits:d})};
 let usageFp=null; // Semi DatePicker 同款双月范围选择器;数据按天聚合故为日期粒度
 // CST"今天"的 Y-m-d 串(不能用浏览器时区的 today,否则跨时区用户会偏一天)
 const cstDayStr=off=>{const d=new Date(Date.now()+8*3600*1000-(off||0)*86400000);return d.getUTCFullYear()+'-'+String(d.getUTCMonth()+1).padStart(2,'0')+'-'+String(d.getUTCDate()).padStart(2,'0')};
@@ -3782,12 +3787,14 @@ function renderGrpCards(){
     return `<div class="grpcard${usageFilterGid===gid?' active':''}" data-gid="${gid}">
       <div class="g-top"><span class="g-ico">${gid===0?'📂':'🏢'}</span><span class="g-nm" title="${esc(a.name)}">${esc(a.name)}</span><a href="javascript:void 0" class="g-link" data-gdetail="${gid}" data-glabel="${esc(a.name)}">详情 →</a></div>
       <div class="g-sub">${a.n} 人 · 总消耗 <b class="usage-profile-value" style="color:#fbbf24">${usageProfileAmount(a.used,a.usedKnown,a.n)}</b></div>
-      <div class="g-sub">余额 <span class="usage-profile-value" style="color:#34d399">${usageProfileAmount(a.bal,a.balKnown,a.n)}</span> · ${rangePartial?'已展示范围':'范围'} ${matrixAvailable?fmtCost(a.total):'—'}</div>
+      <div class="g-sub">余额 <span class="usage-profile-value" style="color:#34d399">${usageProfileAmount(a.bal,a.balKnown,a.n)}</span></div>
+      <div class="g-sub">${rangePartial?'已展示范围消费':'范围消费'} <b>${matrixAvailable?fmtCost(a.total):'—'}</b></div>
     </div>`;};
   const allCard=`<div class="grpcard g-all${usageFilterGid===null?' active':''}" data-gid="">
       <div class="g-top"><span class="g-ico">👥</span><span class="g-nm">全部用户</span></div>
-      <div class="g-sub">${all.length} 人 · ${rangePartial?'已展示范围消费':'范围消费'} ${matrixAvailable?fmtCost(totalAll):'—'}</div>
-      <div class="g-sub muted" style="font-size:11px">总消耗见页顶</div>
+      <div class="g-sub">${all.length} 人</div>
+      <div class="g-sub">总消耗见页顶</div>
+      <div class="g-sub">${rangePartial?'已展示范围消费':'范围消费'} <b>${matrixAvailable?fmtCost(totalAll):'—'}</b></div>
     </div>`;
   const toggle=folded>0
     ?`<div class="grpcard grpmore" data-gexpand="1"><div class="m-h">+${folded} 更多</div><div class="m-s">展开全部分组 ▾</div></div>`
@@ -3853,8 +3860,13 @@ function sizeUsageMatrix(table,dayCount,users){
   wrap.style.setProperty('--mx-user-text-w',Math.max(160,userWidth-24)+'px');
   wrap.style.setProperty('--mx-left-2',userWidth+'px');
   wrap.style.setProperty('--mx-left-3',(userWidth+132)+'px');
-  // 只把首列的实际宽度带回既有最小宽度公式，其他列和 table 宽度规则不变。
-  const minimumWidth=userWidth+132+142+Math.max(1,dayCount)*92+104;
+  // 日期列宽按可见区域整除：可见区内正好放下整数个日期列，右侧固定的范围合计列
+  // 不会压住半个金额；日期较少时把多余宽度均分给日期列。最窄 104px 以容纳千分位金额。
+  const fixedWidth=userWidth+132+142+124,days=Math.max(1,dayCount);
+  const room=Math.max(104,wrapWidth-fixedWidth),visible=Math.max(1,Math.min(days,Math.floor(room/104)));
+  const dayWidth=Math.max(104,Math.floor(room/visible));
+  wrap.style.setProperty('--mx-day-w',dayWidth+'px');
+  const minimumWidth=fixedWidth+days*dayWidth;
   table.style.setProperty('--mx-table-min',minimumWidth+'px');
 }
 function resizeUsageMatrices(){
@@ -3919,7 +3931,7 @@ function drawUsageMatrix(mx,users,empty,thId,tbId){
   const vis=new Set(users.map(u=>u.user_id));
   (mx.cells||[]).forEach(c=>{if(!vis.has(c.user_id))return;cell.set(c.user_id+'|'+c.date,c);if(c.cost_usd>maxCost)maxCost=c.cost_usd});
   const heat=v=>v>0&&maxCost>0?` style="background:rgba(245,158,11,${(0.08+0.30*Math.sqrt(v/maxCost)).toFixed(3)})"`:''; // 感知刻度:sqrt 让中段金额也可见,不只头部一人有热力
-  const fmtCell=v=>v>=0.005?'$'+v.toFixed(2):(v>0?'<$0.01':'$0.00');
+  const fmtCell=v=>v>=0.005?'$'+v.toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2}):(v>0?'<$0.01':'$0.00');
   th.innerHTML='<tr><th>用户</th><th class="right" style="color:#34d399">余额</th><th class="right" style="color:#fbbf24" title="累计总消耗:该用户终身消耗,不受下方日期范围影响">累计总消耗</th>'+days.map(d=>`<th class="right" title="${esc(d)} · 单元格显示消费">${esc(d.slice(5))}</th>`).join('')+`<th class="right" title="${rangePartial?'当前已展示日期范围内消费合计':'所选日期范围内消费合计'}">${rangePartial?'已展示范围消费':'范围消费'}</th></tr>`;
   const daySum={};
   tb.innerHTML=users.map(u=>{

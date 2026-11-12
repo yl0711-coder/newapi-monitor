@@ -2,7 +2,7 @@
 'use strict';
 
 const cm={
-  inited:false,loaded:false,loadedAt:0,loading:false,refreshTimer:null,hours:24,days:7,custom:null,preset:'',report:null,abort:null,sort:'name',
+  inited:false,loaded:false,loadedAt:0,loading:false,refreshTimer:null,hours:24,days:7,custom:null,preset:'',report:null,abort:null,sort:'cost',
   economics:null,economicsError:'',economicsSeq:0,economicsHourly:new Map(),economicsHourlySeq:new Map(),
   costLedger:new Map(),costLedgerSeq:new Map(),costLedgerOpen:new Set(),
   navigationCostLedgerDomain:'',navigationCostSourceRef:'',
@@ -115,7 +115,11 @@ function init(){
     render();
   });
   $('cmRefresh')?.addEventListener('click',()=>loadReport());
-  $('cmSummary')?.addEventListener('click',navigateDataStatus);
+  $('cmSummary')?.addEventListener('click',event=>{
+    const attention=event.target.closest('[data-cm-attention]');
+    if(attention){focusDomainCard(attention.dataset.cmAttention);return}
+    navigateDataStatus(event);
+  });
   document.querySelectorAll('[data-cm-sort]').forEach(btn=>btn.addEventListener('click',()=>{
     cm.sort=btn.dataset.cmSort;
     document.querySelectorAll('[data-cm-sort]').forEach(x=>x.classList.toggle('active',x===btn));
@@ -198,7 +202,16 @@ function init(){
     const remove=event.target.closest('[data-cm-alias-remove]');
     if(remove){saveDomainAlias(remove.dataset.cmAliasRemove,'',remove);return}
     const save=event.target.closest('[data-cm-alias-save]');
-    if(save&&cm.upstreamDomain)saveDomainAlias(cm.upstreamDomain.domain,$('cmDomainAliasTarget')?.value||'',save);
+    if(!save||!cm.upstreamDomain)return;
+    const alias=cm.upstreamDomain.domain,target=$('cmDomainAliasTarget')?.value||'';
+    if(!target)return;
+    if(!window.confirm(`确认把 ${alias} 归并到 ${target}？\n之后该地址渠道的用量按 ${target} 的上游账单核对成本；只影响 Monitor 统计，可随时取消归并。`))return;
+    saveDomainAlias(alias,target,save);
+  });
+  $('cmDomainAlias')?.addEventListener('change',event=>{
+    if(event.target.id!=='cmDomainAliasTarget')return;
+    const save=$('cmDomainAlias').querySelector('[data-cm-alias-save]');
+    if(save)save.disabled=!event.target.value;
   });
   $('cmUpstreamProvider')?.addEventListener('change',resetUpstreamDiagnostic);
   $('cmUpstreamSync')?.addEventListener('click',syncUpstreamNow);
@@ -446,14 +459,18 @@ function upstreamRunway(upstream){
   const assessment=upstream?.assessment||{},days=Number(assessment.estimated_runway_days);
   const required=Number(assessment.required_balance_usd);
   const partial=assessment.partial_history?`（新接入，历史补齐中，暂按已同步的近 ${Number(assessment.lookback_days||0)} 天估算，结果可能偏高或偏低）`:'';
-  const basis=`近 ${Number(assessment.lookback_days||0)} 个完整自然日上游账面日均消费 ${usd(assessment.average_daily_cost_usd||0)} × 余额保障 ${Number(assessment.threshold_days||0).toFixed(1)} 天；上游账单覆盖率 ${Number(assessment.coverage_pct||0).toFixed(1)}%${partial}`;
+  const recentRate=Number(assessment.recent_daily_cost_usd),recentKnown=assessment.recent_daily_cost_usd!=null&&Number.isFinite(recentRate);
+  const byRecent=assessment.runway_basis==='recent_24h'&&recentKnown;
+  const recentNote=recentKnown?`；最近 24 小时消费速度 ${usd(recentRate)}/天${byRecent?'（高于近期日均，按此估算）':''}`:assessment.runway_basis?'；最近 24 小时数据不完整，未参与估算':'';
+  const rateText=byRecent?`最近 24 小时消费速度 ${usd(recentRate)}/天`:`近 ${Number(assessment.lookback_days||0)} 个完整自然日上游账面日均消费 ${usd(assessment.average_daily_cost_usd||0)}`;
+  const basis=`${rateText} × 余额保障 ${Number(assessment.threshold_days||0).toFixed(1)} 天；近 ${Number(assessment.lookback_days||0)} 日日均 ${usd(assessment.average_daily_cost_usd||0)}${recentNote}；上游账单覆盖率 ${Number(assessment.coverage_pct||0).toFixed(1)}%${partial}`;
   const title=assessment.available&&assessment.status!=='idle'&&Number.isFinite(required)?`动态最低余额 ${usd(required)} = ${basis}`:`动态余额评估：${basis}`;
   if(!assessment.available)return {text:assessment.reason?`暂不可评估：${assessment.reason}`:'暂不可评估',basis:'',cls:'pending',title};
   if(assessment.status==='idle')return {text:assessment.reason||'近期无显著消耗',basis:'',cls:'neutral',title};
   if(!Number.isFinite(days))return {text:'暂不可评估',basis:'',cls:'pending',title};
   const cls=assessment.status==='critical'?'bad':assessment.status==='warning'?'warn':assessment.status==='healthy'?'ready':'neutral';
   const hours=days<2?`（${(days*24).toFixed(1)} 小时）`:'';
-  return {text:`预计可用 ${days.toFixed(1)} 天${hours}`,basis:`按近 ${Number(assessment.lookback_days||0)} 日原始账单日均 ${usd(assessment.average_daily_cost_usd||0)} 估算${assessment.partial_history?'（历史补齐中）':''}`,cls,title};
+  return {text:`预计可用 ${days.toFixed(1)} 天${hours}`,basis:byRecent?`按最近 24 小时消费速度 ${usd(recentRate)}/天估算（近 ${Number(assessment.lookback_days||0)} 日日均 ${usd(assessment.average_daily_cost_usd||0)}）`:`按近 ${Number(assessment.lookback_days||0)} 日原始账单日均 ${usd(assessment.average_daily_cost_usd||0)} 估算${assessment.partial_history?'（历史补齐中）':''}`,cls,title};
 }
 function upstreamSummary(upstream){
   if(!upstream?.configured)return '<span class="pending">余额未配置</span>';
@@ -873,8 +890,59 @@ async function setDomainRetiring(key,button){
 	}catch(error){alert(error.message||'保存停止使用标记失败');await loadReport({quiet:true})}
 	finally{button.disabled=false}
 }
+// Problems an operator should act on, judged on the full (unfiltered) report
+// domain. Retired or fully manually disabled upstreams are intentional and
+// never listed. Levels: bad = act now, warn = check soon.
+function runwayShort(days){return days<1?`${Math.max(0,days*24).toFixed(0)} 小时`:`${days.toFixed(1)} 天`}
+function domainChannelStates(domain){
+  const channels=(domain?.vendors||[]).flatMap(v=>v.channels||[]).filter(ch=>ch.current);
+  return {enabled:channels.filter(ch=>+ch.status===1).length,auto:channels.filter(ch=>+ch.status===3).length,
+    manual:channels.filter(ch=>+ch.status!==1&&+ch.status!==3).length};
+}
+function domainIssues(domain){
+  const source=reportDomain(domain?.key)||domain;
+  if(!source||source.retiring===true||source.manually_disabled||source.key==='special:unconfigured')return [];
+  const issues=[],up=source.upstream||{},states=domainChannelStates(source);
+  if(states.auto)issues.push({level:'bad',label:`${states.auto} 个渠道自动禁用`});
+  if(up.configured){
+    const a=up.assessment||{},days=Number(a.estimated_runway_days);
+    if(a.available&&a.status==='critical')issues.push({level:'bad',label:'余额已用尽'});
+    else if(a.available&&a.status==='warning'&&Number.isFinite(days))issues.push({level:'bad',label:`余额约 ${runwayShort(days)}`,runway:days});
+    else if(a.available&&a.status==='healthy'&&Number.isFinite(days)&&days<2)issues.push({level:'warn',label:`余额约 ${runwayShort(days)}`,runway:days});
+    if(up.enabled!==false){
+      const phase=up.balance_effective_status||up.status;
+      if(phase==='error')issues.push({level:'warn',label:'余额同步失败'});
+      else if(phase==='reconnect')issues.push({level:'warn',label:'余额同步需重新连接'});
+      const usage=up.usage_effective_status||up.usage_tail_phase||up.usage_status;
+      if(up.usage_sync_enabled!==false&&(usage==='error'||usage==='reconnect'))issues.push({level:'warn',label:usage==='error'?'消费同步失败':'消费同步需重新连接'});
+      else if(up.usage_sync_enabled!==false&&usage==='stale')issues.push({level:'warn',label:'消费同步延迟'});
+    }
+  }else if(states.enabled>0&&source.configured&&(+domain?.usage?.requests||0)>0)issues.push({level:'warn',label:'未配置上游账户'});
+  return issues;
+}
+function issueBadges(issues){
+  return issues.map(issue=>`<span class="cm-issue ${issue.level}">${esc(issue.label)}</span>`).join('');
+}
+function attentionPanel(domains){
+  const rows=domains.map(domain=>({domain,issues:domainIssues(domain)})).filter(row=>row.issues.length);
+  const severity=row=>row.issues.some(i=>i.level==='bad')?0:1;
+  const runway=row=>Math.min(...row.issues.map(i=>Number.isFinite(i.runway)?i.runway:Infinity));
+  rows.sort((a,b)=>severity(a)-severity(b)||runway(a)-runway(b)||metric(b.domain.usage)-metric(a.domain.usage)||compareNames(a.domain.domain,b.domain.domain));
+  if(!rows.length)return '<section class="cm-attention clear"><b>需要处理</b><span>当前列表中没有余额不足、同步异常或被自动禁用的上游。</span></section>';
+  return `<section class="cm-attention" aria-label="需要处理的上游"><header><b>需要处理</b><span>${nfmt(rows.length)} 个上游 · 点击定位到对应卡片</span></header><ul>${rows.map(row=>`<li><button type="button" data-cm-attention="${esc(row.domain.key)}"><b>${esc(row.domain.domain)}</b><span class="cm-issue-list">${issueBadges(row.issues)}</span><em>查看</em></button></li>`).join('')}</ul></section>`;
+}
+function focusDomainCard(key){
+  if(!key)return;
+  cm.expandedDomains.add(key);render();loadEconomicsDomain(key);
+  const cards=document.querySelectorAll?document.querySelectorAll('[data-cm-card]'):[];
+  const card=Array.from(cards||[]).find(el=>el.dataset?.cmCard===key);
+  if(card?.scrollIntoView)card.scrollIntoView({block:'start',behavior:'smooth'});
+}
 function domainCard(domain,index,total,filtered,costBases=upstreamCostBases([domain])){
   const channels=domain.vendors.flatMap(v=>v.channels),enabled=channels.filter(ch=>ch.current&&+ch.status===1).length;
+  const autoDisabled=channels.filter(ch=>ch.current&&+ch.status===3).length,manualDisabled=channels.filter(ch=>ch.current&&+ch.status!==1&&+ch.status!==3).length;
+  const channelStateText=`${channels.length} 个实际渠道 · ${enabled} 个启用${autoDisabled?` · <span class="cm-auto-disabled">${autoDisabled} 个自动禁用</span>`:''}${manualDisabled?` · ${manualDisabled} 个手动停用`:''}`;
+  const issues=domainIssues(domain);
   const groups=domainServiceGroups(domain);
   const open=cm.expandedDomains.has(domain.key),share=metric(total)>0?metric(domain.usage)/metric(total)*100:0;
   const disabledBadge=domain.manually_disabled?'<span class="cm-upstream-disabled">已禁用</span>':'';
@@ -898,20 +966,20 @@ function domainCard(domain,index,total,filtered,costBases=upstreamCostBases([dom
 	let ratioLabel=domain.upstream?.provider==='openox'?'订阅成本待分摊，暂不折算现金成本':'';
 	if(adjustedCostView.available)ratioLabel=upstreamCostView.available&&upstreamCostView.value===0&&adjustedCostView.value===0?'已核验零消费':adjustedCostView.partial?'已知时段按历史充值比例修正':upstreamUsage.recharge_ratio_varies?'按历史充值比例版本修正':ratio>0?`到账/支付 ${ratio.toLocaleString(undefined,{maximumFractionDigits:4})}×`:'按历史充值比例修正';
 	const adjustedSpend=upstreamTrusted&&adjustedCostView.available?usd(adjustedCostView.value):'—';
-	const internalNote=upstreamCostNote(upstreamUsage,costBases.cost),adjustedInternalNote=[adjustedCostCoverageNote(upstreamUsage,costBases.adjusted),upstreamCostNote(upstreamUsage,costBases.adjusted,true)].filter(Boolean).join(' · ');
+	const internalNote=upstreamCostNote(upstreamUsage,costBases.cost);
   const upstreamSpendLabel=domain.upstream?.provider==='openox'?'账面用量（含订阅抵扣）':(billView.daily?'所涉自然日':upstreamUsage.granularity==='day'?'自然日':'区间')+(costBases.cost==='business'?'上游消费':'上游账单消费');
   const upstreamMetrics=domain.upstream?.configured||upstreamUsage.available?`
-    <span class="cm-domain-upstream-spend" title="金额按上游账户（主域名）汇总，不拆分到筛选的渠道或分组"><small>${upstreamSpendLabel}</small><b>${upstreamSpend}</b>${billSyncHint}<em class="cm-domain-metric-note neutral">${esc([billRangeNote,internalNote].filter(Boolean).join(' · '))}</em></span>
-    <span class="cm-domain-upstream-adjusted" title="修正成本 = 账面消费 × 历史充值支付 ÷ 历史充值到账；内部账号扣除口径见金额下方；${esc(billRangeNote)}"><small>上游修正成本</small><b>${adjustedSpend}</b>${billSyncHint}<em class="cm-domain-metric-note neutral">${esc([ratioLabel,adjustedInternalNote].filter(Boolean).join(' · '))}${billView.daily?' · 同左侧账单范围':''}</em></span>
+    <span class="cm-domain-upstream-spend" title="${esc(['金额按上游账户（主域名）汇总，不拆分到筛选的渠道或分组',billRangeNote,internalNote].filter(Boolean).join('；'))}"><small>${upstreamSpendLabel}</small><b>${upstreamSpend}</b>${billSyncHint}${billRangeNote?`<em class="cm-domain-metric-note neutral">${esc(billRangeNote)}</em>`:''}</span>
+    <span class="cm-domain-upstream-adjusted" title="${esc(['修正成本 = 账面消费 × 历史充值支付 ÷ 历史充值到账',ratioLabel,upstreamCostNote(upstreamUsage,costBases.adjusted,true),billRangeNote].filter(Boolean).join('；'))}"><small>上游修正成本</small><b>${adjustedSpend}</b>${billSyncHint}${adjustedCostCoverageNote(upstreamUsage,costBases.adjusted)?`<em class="cm-domain-metric-note neutral">${esc(adjustedCostCoverageNote(upstreamUsage,costBases.adjusted))}${billView.daily?' · 同左侧账单范围':''}</em>`:''}</span>
     <span class="cm-domain-upstream-balance"><small>上游当前余额</small><b>${upstreamBalance}</b>${balanceHint}${domain.retiring?'<em class="cm-domain-metric-note retiring">不再充值 · 余量消耗中</em>':''}<em class="cm-domain-metric-note ${upstreamRunwayView.cls}" title="${esc(upstreamRunwayView.title)}">${esc(upstreamRunwayView.text)}</em>${upstreamRunwayView.basis?`<em class="cm-domain-metric-note neutral">${esc(upstreamRunwayView.basis)}</em>`:''}</span>`:'';
   const financeButton=cm.report?.finance?.can_edit&&domain.configured?`<button type="button" class="cm-finance-open" data-cm-finance="${esc(domain.key)}">倍率配置</button>`:'';
   const upstreamButton=cm.report?.finance?.can_edit&&domain.configured?`<button type="button" class="cm-upstream-open" data-cm-upstream="${esc(domain.key)}">账户配置</button>`:'';
 	const retiringButton=cm.report?.finance?.can_edit&&domain.configured?`<button type="button" class="cm-retiring-toggle${domain.retiring?' active':''}" aria-pressed="${domain.retiring?'true':'false'}" data-cm-retiring="${esc(domain.key)}">${domain.retiring?'取消停止使用':'标记停止使用'}</button>`:'';
-  return `<article class="cm-domain-card${open?' open':''}${domain.manually_disabled?' manually-disabled':''}"><div class="cm-domain-head" role="button" tabindex="0" data-cm-domain-toggle="${esc(domain.key)}">
+  return `<article class="cm-domain-card${open?' open':''}${domain.manually_disabled?' manually-disabled':''}${issues.some(i=>i.level==='bad')?' has-issue':''}" data-cm-card="${esc(domain.key)}"><div class="cm-domain-head" role="button" tabindex="0" data-cm-domain-toggle="${esc(domain.key)}">
     <span class="cm-rank">${String(index+1).padStart(2,'0')}</span>
-    <div class="cm-domain-identity"><span class="cm-domain-icon">${domain.configured?'◎':'—'}</span><div><b>${esc(domain.domain)}${disabledBadge}${retiringBadge}</b><small>${channels.length} 个实际渠道 · ${enabled} 个启用 · ${groups.length} 个服务分组</small><div class="cm-domain-config"><div class="cm-domain-finance"><span class="${domain.finance?.configured?'ready':'pending'}">${esc(financeLabel)}</span>${financeButton}</div><div class="cm-domain-upstream">${upstreamSummary(domain.upstream)}${upstreamButton}${retiringButton}</div></div></div></div>
+    <div class="cm-domain-identity"><span class="cm-domain-icon">${domain.configured?'◎':'—'}</span><div><b>${esc(domain.domain)}${disabledBadge}${retiringBadge}${issueBadges(issues)}</b><small>${channelStateText} · ${groups.length} 个服务分组</small><div class="cm-domain-config"><div class="cm-domain-finance"><span class="${domain.finance?.configured?'ready':'pending'}">${esc(financeLabel)}</span>${financeButton}</div><div class="cm-domain-upstream">${upstreamSummary(domain.upstream)}${upstreamButton}${retiringButton}</div></div></div></div>
 	<div class="cm-share"><div><b>${metric(total)>0?share.toFixed(1)+'%':'—'}</b><small>${(filtered?'筛选内':'全站')+esc(metricLabel())}</small></div><i><em style="width:${Math.max(share&&2,share)}%"></em></i></div>
-	<div class="cm-domain-metrics"><span class="cm-domain-requests"><small>渠道请求数</small><b>${usageMetric(domain.usage.requests,nfmt)}</b></span><span class="cm-domain-tokens"><small>Tokens</small><b>${usageMetric(domain.usage.tokens,compact)}</b></span><span class="cm-domain-user-spend"><small>用户侧消费</small><b>${usageMetric(domain.usage.cost_usd,usd)}</b><em class="cm-domain-metric-note neutral">当前查询区间</em></span>${upstreamMetrics}</div>
+	<div class="cm-domain-metrics"><span class="cm-domain-requests"><small>渠道请求数</small><b>${usageMetric(domain.usage.requests,nfmt)}</b></span><span class="cm-domain-tokens"><small>Tokens</small><b>${usageMetric(domain.usage.tokens,compact)}</b></span><span class="cm-domain-user-spend" title="当前查询区间的用户消费金额"><small>用户侧消费</small><b>${usageMetric(domain.usage.cost_usd,usd)}</b></span>${upstreamMetrics}</div>
     <span class="cm-chevron">${open?'−':'+'}</span>
   </div>${open?`<div class="cm-domain-body">${economicsStrip(domain)}${window.channelPricingObservations?.render(domain,cm.report?.finance?.can_edit)||''}${costLedgerPanel(domain)}${groups.map((group,index)=>groupSection(domain,group,index,domain.usage)).join('')}</div>`:''}</article>`;
 }
@@ -1563,10 +1631,10 @@ function renderDomainAlias(domain,accountConfigured){
   const box=$('cmDomainAlias');if(!box)return;
   const aliases=domain?.aliases||[];let html='';
   if(aliases.length){
-    html=`<b>已归并到本域名的渠道地址</b><br>${aliases.map(alias=>`${esc(alias)} <button type="button" class="cm-upstream-cancel" data-cm-alias-remove="${esc(alias)}">取消归并</button>`).join('<br>')}<br><small>这些地址的渠道按本域名的上游账户核对成本；经营核算只从归并生效时起按本域名归属。</small>`;
+    html=`<b>已归并到本域名的渠道地址</b><p>这些地址的渠道按本域名的上游账户核对成本；经营核算只从归并生效时起按本域名归属。</p><ul class="cm-alias-list">${aliases.map(alias=>`<li><code>${esc(alias)}</code><button type="button" class="cm-upstream-cancel" data-cm-alias-remove="${esc(alias)}">取消归并</button></li>`).join('')}</ul>`;
   }else if(domain&&!accountConfigured){
     const targets=domainAliasTargets(domain);
-    if(targets.length)html=`<b>这是已配置上游的另一个地址？</b><br><small>如果该渠道地址（例如供应商的源站 IP）属于某个已配置上游，可以归并过去，渠道用量将与该上游账单对应。只影响 Monitor 统计，不改 NewAPI 路由；历史金额不迁移。</small><br><select id="cmDomainAliasTarget">${targets.map(target=>`<option value="${esc(target)}">${esc(target)}</option>`).join('')}</select> <button type="button" class="cm-upstream-save" data-cm-alias-save="1">归并到所选上游</button>`;
+    if(targets.length)html=`<b>这是已配置上游的另一个地址？</b><p>如果 <code>${esc(domain.domain)}</code>（例如供应商的源站 IP）属于某个已配置上游，可以归并过去，渠道用量将与该上游账单对应。只影响 Monitor 统计，不改 NewAPI 路由；历史金额不迁移。</p><div class="cm-alias-row"><select id="cmDomainAliasTarget" aria-label="选择要归并到的上游"><option value="" selected>选择要归并到的上游…</option>${targets.map(target=>`<option value="${esc(target)}">${esc(target)}</option>`).join('')}</select><button type="button" class="cm-upstream-save" data-cm-alias-save="1" disabled>归并到所选上游</button></div>`;
   }
   box.innerHTML=html;box.hidden=!html;
 }
@@ -1578,7 +1646,7 @@ async function saveDomainAlias(alias,target,button){
     const data=await res.json();if(!res.ok)throw new Error(data.error||`HTTP ${res.status}`);
     showUpstreamMessage(target?`已归并到 ${target}：${data.note||''}`:`已取消 ${alias} 的归并，下一轮渠道目录同步生效`);
     cm.loaded=false;await loadReport();
-  }catch(error){showUpstreamMessage(error.message||'保存域名归并失败',true)}finally{if(button)button.disabled=false}
+  }catch(error){showUpstreamMessage(error.message||'保存域名归并失败',true)}finally{if(button)button.disabled=button.matches('[data-cm-alias-save]')&&!$('cmDomainAliasTarget')?.value}
 }
 function closeUpstream(){
   $('cmUpstreamOpenOxToken').value='';$('cmUpstreamOrionKey').value='';$('cmUpstreamVolcAK').value='';$('cmUpstreamVolcSK').value='';
@@ -1839,7 +1907,7 @@ function render(){
   const exact=cm.economics?.totals||null,exactCoverage=cm.economics?.coverage||null;
   const exactKPIs=exact?`<article class="economics"><small>精确修正成本</small><b>${economicsMoneyLabel(exact.corrected_cost,exact.corrected_cost_known)}</b><span>${esc(economicsCoverageLabel(exactCoverage))}</span></article><article class="economics ${exact.profit_known?'':'warn'}"><small>精确毛利润</small><b>${economicsMoneyLabel(exact.profit,exact.profit_known)}</b><span>白名单域名 · 不随前端筛选重算</span></article><article class="economics ${exact.profit_known?'':'warn'}"><small>精确毛利率</small><b>${exact.profit_known?esc(exact.margin_display||'不可判定'):'不可判定'}</b><span>${exact.profit_known?'证据已闭合':esc(economicsReason(exact.unknown_reason))}</span></article>`:'';
   const summary=$('cmSummary');
-  if(summary){summary.innerHTML=`<section class="cm-kpis">
+  if(summary){summary.innerHTML=`${attentionPanel(domains)}<section class="cm-kpis">
     <article><small>已配置主域名</small><b>${nfmt(configuredDomains)}</b><span>当前显示 ${nfmt(domains.length)} 个归并项</span></article>
     <article><small>当前实际渠道</small><b>${nfmt(currentChannels.length)}</b><span>${nfmt(enabled)} 启用 · ${nfmt(currentChannels.length-enabled)} 停用${historical?' · '+nfmt(historical)+' 历史':''}</span></article>
     <article class="${unconfigured?'warn':''}"><small>未归并渠道</small><b>${nfmt(unconfigured)}</b><span>${unconfigured?'尚未配置主地址':'当前渠道均已归并'}</span></article>

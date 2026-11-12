@@ -69,9 +69,9 @@ func TestTokenForceHistoryImportsManyHoursPerRound(t *testing.T) {
 	}
 }
 
-// Running out of budget inside a window after progress keeps every committed
-// hour and is a healthy yield, not a failure.
-func TestTokenForceHistoryBudgetStopMidWindowIsYield(t *testing.T) {
+// A window that starts within the run budget may finish above it; no further
+// window starts once the budget is spent.
+func TestTokenForceHistoryStartedWindowFinishesAboveStartBudget(t *testing.T) {
 	m := newChannelUpstreamTestMonitor(t)
 	now := time.Date(2026, 11, 12, 7, 30, 0, 0, cstLocation).Unix()
 	from := time.Date(2026, 11, 10, 0, 0, 0, 0, cstLocation).Unix()
@@ -84,12 +84,101 @@ func TestTokenForceHistoryBudgetStopMidWindowIsYield(t *testing.T) {
 		t.Fatal(err)
 	}
 	// 4 + 4 requests commit two hours; 3 remain, so a third window starts and
-	// runs out inside it.
-	if len(*windows) != 3 || row.UsageBackfillCursor != from+2*3600 || row.UsageBackfillNextSyncAt != now+15 || row.UsageBackfillConsecutiveFails != 0 {
+	// completes with 12 requests in total. No fourth window starts.
+	if len(*windows) != 3 || row.UsageBackfillCursor != from+3*3600 || row.UsageBackfillNextSyncAt != now+15 || row.UsageBackfillConsecutiveFails != 0 {
 		t.Fatalf("windows=%d row=%+v", len(*windows), row)
 	}
-	if n := countTokenForceHistoryHours(t, m, row.Domain); n != 2 {
+	if n := countTokenForceHistoryHours(t, m, row.Domain); n != 3 {
 		t.Fatalf("committed hours=%d", n)
+	}
+	if pacer.maxRequests != 11 {
+		t.Fatalf("run budget not restored: %d", pacer.maxRequests)
+	}
+}
+
+// hainahn.com 11-09 12:00: one busy hour needs more requests than the run
+// budget (own pages, late-finish slice, three widened earlier hours). It must
+// complete instead of failing on every retry.
+func TestTokenForceHistoryBusyHourAboveRunBudgetCompletes(t *testing.T) {
+	m := newChannelUpstreamTestMonitor(t)
+	now := time.Date(2026, 11, 12, 7, 30, 0, 0, cstLocation).Unix()
+	from := time.Date(2026, 11, 9, 12, 0, 0, 0, cstLocation).Unix()
+	row := tokenForceHistoryRow("hainahn.test", from)
+	plan := upstreamUsageSyncPlan{backfillFrom: from, backfillTo: from + 3600}
+	syncUsage, windows := tokenForceHistoryFakeSync(t, 22, nil)
+	retryAt := int64(0)
+	pacer := newUpstreamUsageRequestPacer(upstreamUsageHistoryMaxRequestsPerRun, 0)
+	if err := m.syncTokenForceHistoryWindows(context.Background(), &row, plan, now, pacer, syncUsage, &retryAt, noTokenForceHistorySecrets); err != nil {
+		t.Fatal(err)
+	}
+	if len(*windows) != 1 || row.UsageBackfillCursor != from+3600 || row.UsageBackfillConsecutiveFails != 0 || row.UsageBackfillLastError != "" {
+		t.Fatalf("windows=%d row=%+v", len(*windows), row)
+	}
+}
+
+// Running out of the hard cap inside a window after progress keeps every
+// committed hour and is a healthy yield, not a failure.
+func TestTokenForceHistoryHardCapStopAfterProgressIsYield(t *testing.T) {
+	m := newChannelUpstreamTestMonitor(t)
+	now := time.Date(2026, 11, 12, 7, 30, 0, 0, cstLocation).Unix()
+	from := time.Date(2026, 11, 10, 0, 0, 0, 0, cstLocation).Unix()
+	row := tokenForceHistoryRow("hainahn.test", from)
+	plan := upstreamUsageSyncPlan{backfillFrom: from, backfillTo: from + 3600}
+	heavy := from + 3600
+	var windows []int64
+	syncUsage := func(ctx context.Context, wFrom, wTo int64, pacer *upstreamUsageRequestPacer) (upstreamUsageResult, error) {
+		windows = append(windows, wFrom)
+		need := 2
+		if wFrom == heavy {
+			need = tokenForceHistoryWindowMaxRequests
+		}
+		for i := 0; i < need; i++ {
+			if err := pacer.beforeRequest(ctx); err != nil {
+				return upstreamUsageResult{}, err
+			}
+		}
+		return upstreamUsageResult{Hours: []ChannelUpstreamUsageHour{{Domain: "hainahn.test", HourTs: wFrom, BucketSeconds: 3600, Provider: upstreamProviderTokenForce, UnitPerUSD: tokenForceLedgerUnit}}, DataUntil: wTo}, nil
+	}
+	retryAt := int64(0)
+	pacer := newUpstreamUsageRequestPacer(upstreamUsageHistoryMaxRequestsPerRun, 0)
+	if err := m.syncTokenForceHistoryWindows(context.Background(), &row, plan, now, pacer, syncUsage, &retryAt, noTokenForceHistorySecrets); err != nil {
+		t.Fatal(err)
+	}
+	if len(windows) != 2 || row.UsageBackfillCursor != heavy || row.UsageBackfillNextSyncAt != now+15 || row.UsageBackfillConsecutiveFails != 0 {
+		t.Fatalf("windows=%d row=%+v", len(windows), row)
+	}
+}
+
+// TokenForce history needs the full operation budget: the host guard spaces
+// requests by at least one second, so a busy hour cannot fit in 45 seconds.
+func TestTokenForceHistoryUsesFullOperationTimeout(t *testing.T) {
+	s := Settings{UpstreamUsageTimeoutSec: 45}
+	if got := upstreamUsageOperationTimeoutForAccount(s, upstreamUsageLaneHistory, upstreamProviderTokenForce); got != upstreamUsageOperationTimeout(s) ||
+		got < time.Duration(tokenForceHistoryWindowMaxRequests)*upstreamGuardMinInterval {
+		t.Fatalf("tokenforce history timeout=%s", got)
+	}
+	if got := upstreamUsageOperationTimeoutForAccount(s, upstreamUsageLaneHistory, upstreamProviderNewAPI); got != upstreamUsageHistoryOperationTimeout {
+		t.Fatalf("newapi history timeout=%s", got)
+	}
+	if got := upstreamUsageOperationTimeoutForAccount(s, upstreamUsageLaneTail, upstreamProviderTokenForce); got != upstreamUsageOperationTimeout(s) {
+		t.Fatalf("tokenforce tail timeout=%s", got)
+	}
+}
+
+// A single window that needs more than the hard cap still fails visibly
+// instead of looping silently.
+func TestTokenForceHistoryWindowAboveHardCapFails(t *testing.T) {
+	m := newChannelUpstreamTestMonitor(t)
+	now := time.Date(2026, 11, 12, 7, 30, 0, 0, cstLocation).Unix()
+	from := time.Date(2026, 11, 9, 12, 0, 0, 0, cstLocation).Unix()
+	row := tokenForceHistoryRow("hainahn.test", from)
+	plan := upstreamUsageSyncPlan{backfillFrom: from, backfillTo: from + 3600}
+	syncUsage, _ := tokenForceHistoryFakeSync(t, tokenForceHistoryWindowMaxRequests+1, nil)
+	retryAt := int64(0)
+	pacer := newUpstreamUsageRequestPacer(upstreamUsageHistoryMaxRequestsPerRun, 0)
+	err := m.syncTokenForceHistoryWindows(context.Background(), &row, plan, now, pacer, syncUsage, &retryAt, noTokenForceHistorySecrets)
+	if !upstreamUsageRunBudgetWasExhausted(err) || row.UsageBackfillCursor != from || row.UsageBackfillConsecutiveFails != 3 {
+		t.Fatalf("err=%v row=%+v", err, row)
 	}
 }
 

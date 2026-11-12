@@ -1797,6 +1797,24 @@ func (m *Monitor) channelUpstreamUsageHTTPClient() *http.Client {
 	return withUpstreamRequestTimeout(m.sharedUpstreamHTTPClient(), upstreamUsageRequestTimeout(m.cfg))
 }
 
+// upstreamUsageHistoryRequestTimeout bounds one NewAPI history page request.
+// It must stay well below upstreamUsageHistoryOperationTimeout: when the two
+// were equal (45 s), a slow source page always ran into the lane deadline
+// first, so it was booked as a cooperative budget yield instead of a
+// request-local timeout. The hour then never switched to five-minute children
+// and the same first page was retried forever (fastrelay.org and last-api.ai,
+// 2026-11). With the shorter request timeout a slow page fails on its own
+// clock while the lane still has budget, and the adaptive split can run.
+// 35 s plus the guard's 5 s minimum send budget still ends before the 45 s
+// lane deadline, while leaving healthy 30-35 s pages unsplit.
+var upstreamUsageHistoryRequestTimeout = 35 * time.Second
+
+// channelUpstreamUsageHistoryHTTPClient is the usage client for the history
+// lane, with the request timeout capped below the lane budget.
+func (m *Monitor) channelUpstreamUsageHistoryHTTPClient() *http.Client {
+	return withUpstreamRequestTimeout(m.sharedUpstreamHTTPClient(), min(upstreamUsageRequestTimeout(m.cfg), upstreamUsageHistoryRequestTimeout))
+}
+
 // upstreamBalanceQueueAllowance is how long a background balance sync may
 // wait for an upstream request slot before it yields.
 const upstreamBalanceQueueAllowance = time.Minute
