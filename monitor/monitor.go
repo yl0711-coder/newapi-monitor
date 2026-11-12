@@ -98,6 +98,8 @@ type Monitor struct {
 	// read-only WAL handle. It cannot write or consume the facts writer's pool.
 	financeFactsReadDB   atomic.Pointer[gorm.DB]
 	financeFactsReadOnce sync.Once
+	usageFactsReadDB     atomic.Pointer[gorm.DB]
+	usageFactsReadOnce   sync.Once
 	// nginxEvidenceDB 是短期、高基数的入口请求证据库。它与主库、用量事实库
 	// 分离；损坏、锁或满盘只会关闭 evidence lane，不影响现有 Monitor 页面。
 	nginxEvidenceDB *gorm.DB
@@ -1136,6 +1138,11 @@ func (m *Monitor) Close() {
 		if m.usageFactsDB != nil && m.usageFactsDB != m.storeDB {
 			if financeReader := m.financeFactsReadDB.Load(); financeReader != nil {
 				if readDB, err := financeReader.DB(); err == nil {
+					_ = readDB.Close()
+				}
+			}
+			if usageReader := m.usageFactsReadDB.Load(); usageReader != nil {
+				if readDB, err := usageReader.DB(); err == nil {
 					_ = readDB.Close()
 				}
 			}

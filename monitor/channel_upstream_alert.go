@@ -30,6 +30,10 @@ type ChannelUpstreamBalanceAssessment struct {
 	CompletedHours      int64    `json:"completed_hours"`
 	CoveragePct         float64  `json:"coverage_pct"`
 	Reason              string   `json:"reason,omitempty"`
+	// PartialHistory: a newly connected account whose history import has not
+	// reached the start of the window yet; the estimate uses only the most
+	// recent LookbackDays complete days (at least upstreamBalancePartialMinDays).
+	PartialHistory bool `json:"partial_history,omitempty"`
 }
 
 type upstreamBurnEstimate struct {
@@ -38,7 +42,15 @@ type upstreamBurnEstimate struct {
 	CompletedHours      int64
 	CoveragePct         float64
 	Reason              string
+	// PartialDays > 0: the window is incomplete only because history import
+	// has not reached it yet, and AverageDailyCostUSD is taken from this many
+	// most recent complete days instead.
+	PartialDays int
 }
+
+// upstreamBalancePartialMinDays is the fewest complete recent days a
+// still-importing account needs before its balance runway is estimated.
+const upstreamBalancePartialMinDays = 2
 
 type upstreamBalancePolicy struct {
 	RunwayDays  float64
@@ -114,6 +126,8 @@ func (m *Monitor) loadUpstreamBurnEstimates(ctx context.Context, now int64, poli
 		lastEnd          int64
 		overlap          bool
 		invalidCost      bool
+		daySeconds       []int64
+		dayCost          []float64
 	}
 	byDomain := make(map[string]*accumulator, len(accounts))
 	for _, row := range rows {
@@ -150,6 +164,13 @@ func (m *Monitor) loadUpstreamBurnEstimates(ctx context.Context, now int64, poli
 		a.cost += row.CostUSD
 		a.completedSeconds += seconds
 		a.lastEnd = end
+		if day := int((row.HourTs - from) / 86400); day >= 0 && day < policy.Lookback {
+			if a.daySeconds == nil {
+				a.daySeconds, a.dayCost = make([]int64, policy.Lookback), make([]float64, policy.Lookback)
+			}
+			a.daySeconds[day] += seconds
+			a.dayCost[day] += row.CostUSD
+		}
 	}
 	for domain, estimate := range estimates {
 		a := byDomain[domain]
@@ -167,10 +188,51 @@ func (m *Monitor) loadUpstreamBurnEstimates(ctx context.Context, now int64, poli
 			estimate.Reason = "上游账单含无效消费金额，暂不评估"
 		} else if a.completedSeconds > 0 {
 			estimate.AverageDailyCostUSD = a.cost / (float64(a.completedSeconds) / 86400)
+			if estimate.CoveragePct+1e-9 < policy.MinCoverage {
+				applyPartialHistoryEstimate(&estimate, accounts[domain], a.daySeconds, a.dayCost, from, policy)
+			}
 		}
 		estimates[domain] = estimate
 	}
 	return estimates, nil
+}
+
+// applyPartialHistoryEstimate lets a newly connected account be assessed
+// before its history import reaches the start of the window. The missing
+// earlier days must be explained by an import that is still running and
+// healthy, never by a sync gap:
+//   - the import is unfinished, has no recorded failure and is not isolated;
+//   - its cursor (start of the next window still to import) lies strictly
+//     before the first day used, so the incomplete day just before them is
+//     still partly unimported;
+//   - every window day the import has already passed is itself complete.
+//
+// Every day used must meet the coverage threshold on its own.
+func applyPartialHistoryEstimate(estimate *upstreamBurnEstimate, account ChannelUpstreamAccountView, daySeconds []int64, dayCost []float64, from int64, policy upstreamBalancePolicy) {
+	cursor := account.UsageBackfillCursor
+	if account.UsageBackfillDone || cursor <= 0 || len(daySeconds) != policy.Lookback ||
+		account.UsageBackfillConsecutiveFails > 0 || account.UsageBackfillLastError != "" ||
+		account.UsageBackfillNextSyncAt == upstreamAccountIsolatedUntil {
+		return
+	}
+	complete := func(day int) bool { return float64(daySeconds[day])*100 >= 86400*policy.MinCoverage-1e-6 }
+	days, seconds, cost := 0, int64(0), 0.0
+	for day := policy.Lookback - 1; day >= 0 && complete(day); day-- {
+		days++
+		seconds += daySeconds[day]
+		cost += dayCost[day]
+	}
+	start := from + int64(policy.Lookback-days)*86400
+	if days < upstreamBalancePartialMinDays || days >= policy.Lookback || cursor >= start {
+		return
+	}
+	for day := 0; from+int64(day+1)*86400 <= cursor; day++ {
+		if !complete(day) {
+			return
+		}
+	}
+	estimate.PartialDays = days
+	estimate.AverageDailyCostUSD = cost / (float64(seconds) / 86400)
 }
 
 func assessUpstreamBalance(account ChannelUpstreamAccountView, estimate upstreamBurnEstimate, policy upstreamBalancePolicy, now int64, syncMinutes int) ChannelUpstreamBalanceAssessment {
@@ -189,6 +251,12 @@ func assessUpstreamBalance(account ChannelUpstreamAccountView, estimate upstream
 	}
 	if !account.Enabled {
 		assessment.Reason = "余额自动同步已停用"
+		return assessment
+	}
+	if account.SyncPaused {
+		// Paused sync leaves the recent bill window incomplete by design; a
+		// coverage percentage here would read as a sync fault.
+		assessment.Reason = "已标记停止使用且无启用渠道，自动同步已暂停"
 		return assessment
 	}
 	if account.Status != upstreamStatusOK {
@@ -211,14 +279,19 @@ func assessUpstreamBalance(account ChannelUpstreamAccountView, estimate upstream
 		assessment.Reason = estimate.Reason
 		return assessment
 	}
-	if estimate.ExpectedHours == 0 || estimate.CompletedHours == 0 || estimate.CoveragePct+1e-9 < policy.MinCoverage {
+	lookback, basisNote := policy.Lookback, ""
+	if estimate.PartialDays > 0 {
+		lookback, basisNote = estimate.PartialDays, "（历史补齐中）"
+		assessment.LookbackDays, assessment.PartialHistory = lookback, true
+	}
+	if estimate.ExpectedHours == 0 || estimate.CompletedHours == 0 || (estimate.PartialDays == 0 && estimate.CoveragePct+1e-9 < policy.MinCoverage) {
 		assessment.Reason = fmt.Sprintf("上游账单覆盖率 %.1f%%，低于 %.1f%% 评估门槛", estimate.CoveragePct, policy.MinCoverage)
 		return assessment
 	}
 	assessment.Available = true
 	if estimate.AverageDailyCostUSD < minUpstreamDailyCostUSD {
 		assessment.Status = "idle"
-		assessment.Reason = fmt.Sprintf("近 %d 个完整自然日无显著上游消耗", policy.Lookback)
+		assessment.Reason = fmt.Sprintf("近 %d 个完整自然日无显著上游消耗%s", lookback, basisNote)
 		return assessment
 	}
 	requiredBalance := estimate.AverageDailyCostUSD * policy.RunwayDays
@@ -233,7 +306,7 @@ func assessUpstreamBalance(account ChannelUpstreamAccountView, estimate upstream
 		assessment.Reason = "余额已用尽或为负"
 	} else if runway <= policy.RunwayDays {
 		assessment.Status = "warning"
-		assessment.Reason = fmt.Sprintf("按近 %d 个完整自然日上游账面日均消费估算，余额不足 %.1f 天", policy.Lookback, policy.RunwayDays)
+		assessment.Reason = fmt.Sprintf("按近 %d 个完整自然日上游账面日均消费估算%s，余额不足 %.1f 天", lookback, basisNote, policy.RunwayDays)
 	} else {
 		assessment.Status = "healthy"
 	}
@@ -307,9 +380,16 @@ func (m *Monitor) evaluateUpstreamBalanceAlerts(c AlertConfig, now int64) {
 		account := accounts[domain]
 		m.fire(c, "upstream_balance_low", domain,
 			fmt.Sprintf("渠道余额预计不足 %.1f 天：%s", assessment.ThresholdDays, domain),
-			fmt.Sprintf("主域名：%s\n当前余额：$%.2f\n近 %d 个完整自然日上游账面日均消费：$%.2f\n余额保障时长：%.1f 天\n当前动态预警线：$%.2f\n预计可用：%.2f 天（%.1f 小时）\n上游账单覆盖率：%.1f%%（%d/%d 小时）\n\n预计可用时间按当前余额 ÷ 上游账面日均消费计算；充值比例修正仅用于成本与利润核算。",
+			fmt.Sprintf("主域名：%s\n当前余额：$%.2f\n近 %d 个完整自然日上游账面日均消费：$%.2f\n余额保障时长：%.1f 天\n当前动态预警线：$%.2f\n预计可用：%.2f 天（%.1f 小时）\n上游账单覆盖率：%.1f%%（%d/%d 小时）%s\n\n预计可用时间按当前余额 ÷ 上游账面日均消费计算；充值比例修正仅用于成本与利润核算。",
 				domain, *account.BalanceUSD, assessment.LookbackDays, assessment.AverageDailyCostUSD,
 				assessment.ThresholdDays, *assessment.RequiredBalanceUSD, *assessment.EstimatedRunwayDays,
-				*assessment.EstimatedRunwayDays*24, assessment.CoveragePct, assessment.CompletedHours, assessment.ExpectedHours), now)
+				*assessment.EstimatedRunwayDays*24, assessment.CoveragePct, assessment.CompletedHours, assessment.ExpectedHours, upstreamBalancePartialAlertNote(assessment)), now)
 	}
+}
+
+func upstreamBalancePartialAlertNote(assessment ChannelUpstreamBalanceAssessment) string {
+	if !assessment.PartialHistory {
+		return ""
+	}
+	return fmt.Sprintf("\n注意：该渠道为新接入，历史账单仍在补齐，本次只按已同步的近 %d 个完整自然日估算，结果可能偏高或偏低。", assessment.LookbackDays)
 }

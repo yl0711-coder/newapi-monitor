@@ -445,14 +445,15 @@ function groupSection(domain,group,index,domainTotal){
 function upstreamRunway(upstream){
   const assessment=upstream?.assessment||{},days=Number(assessment.estimated_runway_days);
   const required=Number(assessment.required_balance_usd);
-  const basis=`近 ${Number(assessment.lookback_days||0)} 个完整自然日上游账面日均消费 ${usd(assessment.average_daily_cost_usd||0)} × 余额保障 ${Number(assessment.threshold_days||0).toFixed(1)} 天；上游账单覆盖率 ${Number(assessment.coverage_pct||0).toFixed(1)}%`;
+  const partial=assessment.partial_history?`（新接入，历史补齐中，暂按已同步的近 ${Number(assessment.lookback_days||0)} 天估算，结果可能偏高或偏低）`:'';
+  const basis=`近 ${Number(assessment.lookback_days||0)} 个完整自然日上游账面日均消费 ${usd(assessment.average_daily_cost_usd||0)} × 余额保障 ${Number(assessment.threshold_days||0).toFixed(1)} 天；上游账单覆盖率 ${Number(assessment.coverage_pct||0).toFixed(1)}%${partial}`;
   const title=assessment.available&&assessment.status!=='idle'&&Number.isFinite(required)?`动态最低余额 ${usd(required)} = ${basis}`:`动态余额评估：${basis}`;
   if(!assessment.available)return {text:assessment.reason?`暂不可评估：${assessment.reason}`:'暂不可评估',basis:'',cls:'pending',title};
   if(assessment.status==='idle')return {text:assessment.reason||'近期无显著消耗',basis:'',cls:'neutral',title};
   if(!Number.isFinite(days))return {text:'暂不可评估',basis:'',cls:'pending',title};
   const cls=assessment.status==='critical'?'bad':assessment.status==='warning'?'warn':assessment.status==='healthy'?'ready':'neutral';
   const hours=days<2?`（${(days*24).toFixed(1)} 小时）`:'';
-  return {text:`预计可用 ${days.toFixed(1)} 天${hours}`,basis:`按近 ${Number(assessment.lookback_days||0)} 日原始账单日均 ${usd(assessment.average_daily_cost_usd||0)} 估算`,cls,title};
+  return {text:`预计可用 ${days.toFixed(1)} 天${hours}`,basis:`按近 ${Number(assessment.lookback_days||0)} 日原始账单日均 ${usd(assessment.average_daily_cost_usd||0)} 估算${assessment.partial_history?'（历史补齐中）':''}`,cls,title};
 }
 function upstreamSummary(upstream){
   if(!upstream?.configured)return '<span class="pending">余额未配置</span>';

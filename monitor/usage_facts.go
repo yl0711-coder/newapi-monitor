@@ -1173,12 +1173,64 @@ func (m *Monitor) refreshUsageFactsFullHistoryReadiness(ctx context.Context, now
 	if auditErr != nil {
 		m.recordUsageFactsSemanticAudit(now, auditErr)
 		m.setUsageFactsPublishedReadiness(false, 0, 0)
+		if userID, dayTs, isolated := m.isolateUsageFactCheckpointMember(ctx, auditErr, now); isolated {
+			// Only the affected member was revoked (durable repair hold in the same
+			// transaction). Re-run the checkpoint on the reduced publication so
+			// every other member keeps serving instead of the whole page closing.
+			slog.Warn("全历史发布核验发现单个用户单日不一致，已撤下该用户并排队精确修复，其余用户继续服务",
+				"user_id", userID, "day", dayTs, "err", auditErr)
+			m.refreshUsageFactsReadiness(withUsageFactCheckpointIsolationDepth(ctx), now)
+			return
+		}
 		slog.Warn("全历史用量事实发布签名核验失败，已停止事实读取", "err", auditErr)
 		return
 	}
 	m.recordUsageFactsSemanticAudit(now, nil)
 	_ = m.setUsageFactsPublishedReadinessIfCurrent(ctx, status.ReadEnabled,
 		status.PublishedRangeStart, status.PublishedThrough)
+}
+
+// usageFactCheckpointIsolationLimit bounds how many members one readiness
+// refresh may revoke. A widespread failure (many members at once) is more
+// likely global and keeps the conservative whole-page close.
+const usageFactCheckpointIsolationLimit = 3
+
+type usageFactCheckpointIsolationDepthKey struct{}
+
+func withUsageFactCheckpointIsolationDepth(ctx context.Context) context.Context {
+	depth, _ := ctx.Value(usageFactCheckpointIsolationDepthKey{}).(int)
+	return context.WithValue(ctx, usageFactCheckpointIsolationDepthKey{}, depth+1)
+}
+
+// isolateUsageFactCheckpointMember converts a checkpoint failure that names one
+// member and one closed CST day into that member's exact day repair. The repair
+// enqueue revokes only that member's publication row in the same transaction,
+// exactly like a proven rolling-audit mismatch. Any other failure (or a mounted
+// read-only snapshot) keeps the fail-closed global gate.
+func (m *Monitor) isolateUsageFactCheckpointMember(ctx context.Context, auditErr error, now time.Time) (int64, int64, bool) {
+	var dayErr *usageFactMemberDayAuditError
+	if !errors.As(auditErr, &dayErr) || dayErr.UserID <= 0 || dayErr.DayTs <= 0 {
+		return 0, 0, false
+	}
+	if m.usageFactsLocalSnapshotReadOnly() || !m.usageFactsFullHistoryEnabled() {
+		return 0, 0, false
+	}
+	if depth, _ := ctx.Value(usageFactCheckpointIsolationDepthKey{}).(int); depth >= usageFactCheckpointIsolationLimit {
+		return 0, 0, false
+	}
+	day := usageFactDayStart(dayErr.DayTs)
+	if day+usageFactDaySeconds > usageFactDayStart(now.Unix()) {
+		// Today's open day is protected by hour proofs; keep fail-closed.
+		return 0, 0, false
+	}
+	durableCtx, cancel := usageFactAuditDurableContext()
+	defer cancel()
+	if _, err := m.enqueueUsageFactHistoryRepair(durableCtx, dayErr.UserID, day,
+		"发布核验发现单日证明不一致："+truncateUsageFactError(auditErr.Error()), "system", now); err != nil {
+		slog.Warn("发布核验失败的用户无法单独撤下，保持整体停止读取", "user_id", dayErr.UserID, "err", err)
+		return 0, 0, false
+	}
+	return dayErr.UserID, day, true
 }
 
 // publishUsageFactsSnapshot 只在当前成员和时间窗口全部回填完成后调用。
@@ -2974,7 +3026,7 @@ func (m *Monitor) computeUsageStatsFromFacts(ctx context.Context, ids []int64, f
 	// 三类事实，不能让前一次慢查询耗尽后续正常查询的完整预算。
 	readRows := func(q string, queryArgs ...any) (*sql.Rows, context.CancelFunc, error) {
 		qctx, cancel := usageFactQueryContext(ctx)
-		rows, err := m.usageFactsStore().WithContext(qctx).Raw(q, queryArgs...).Rows()
+		rows, err := m.usageFactsInteractiveReadStore().WithContext(qctx).Raw(q, queryArgs...).Rows()
 		if err != nil {
 			cancel()
 			return nil, nil, err
@@ -3132,7 +3184,7 @@ func (m *Monitor) computeUsageMatrixFromFacts(ctx context.Context, ids []int64, 
 	}
 	cctx, cancel := usageFactQueryContext(ctx)
 	defer cancel()
-	rows, err := m.usageFactsStore().WithContext(cctx).Raw(cte+`SELECT user_id,bucket_ts,
+	rows, err := m.usageFactsInteractiveReadStore().WithContext(cctx).Raw(cte+`SELECT user_id,bucket_ts,
  COALESCE(SUM(requests),0),COALESCE(SUM(refund_records),0),
  COALESCE(SUM(consume_quota),0),COALESCE(SUM(refund_quota),0)
  FROM facts GROUP BY user_id,bucket_ts`, args...).Rows()
@@ -3172,7 +3224,7 @@ func (m *Monitor) computeUserTokenAggregatesFromFacts(ctx context.Context, uid, 
 	}
 	cctx, cancel := usageFactQueryContext(ctx)
 	defer cancel()
-	rows, err := m.usageFactsStore().WithContext(cctx).Raw(cte+`SELECT token_id,COALESCE(MAX(token_name),''),
+	rows, err := m.usageFactsInteractiveReadStore().WithContext(cctx).Raw(cte+`SELECT token_id,COALESCE(MAX(token_name),''),
  COALESCE(SUM(requests),0),COALESCE(SUM(refund_records),0),
  COALESCE(SUM(prompt_tokens),0)+COALESCE(SUM(completion_tokens),0),
  COALESCE(SUM(consume_quota),0),COALESCE(SUM(refund_quota),0)
@@ -3322,7 +3374,7 @@ func (m *Monitor) refreshTrackedLabelsForRead(ctx context.Context, tracked []Tra
 	var snapshots []UsageUserSnapshot
 	qctx, cancel := usageFactQueryContext(ctx)
 	defer cancel()
-	if err := m.usageFactsStore().WithContext(qctx).Where("user_id IN ?", idsOf(tracked)).Find(&snapshots).Error; err != nil {
+	if err := m.usageFactsInteractiveReadStore().WithContext(qctx).Where("user_id IN ?", idsOf(tracked)).Find(&snapshots).Error; err != nil {
 		slog.Warn("读取本地用户资料快照失败，沿用名单", "err", err)
 		return tracked, balances, used
 	}
@@ -3355,7 +3407,7 @@ func (m *Monitor) userLiveUsageForRead(ctx context.Context, uid int64) (string, 
 	var snap UsageUserSnapshot
 	qctx, cancel := usageFactQueryContext(ctx)
 	defer cancel()
-	if err := m.usageFactsStore().WithContext(qctx).First(&snap, "user_id = ?", uid).Error; err != nil || !snap.Exists {
+	if err := m.usageFactsInteractiveReadStore().WithContext(qctx).First(&snap, "user_id = ?", uid).Error; err != nil || !snap.Exists {
 		return owner, nil, nil
 	}
 	if snap.Username != "" {
@@ -3374,7 +3426,7 @@ func (m *Monitor) tokenMetaOfForRead(ctx context.Context, uid, tokenID int64) *T
 	var snap UsageTokenSnapshot
 	qctx, cancel := usageFactQueryContext(ctx)
 	defer cancel()
-	if err := m.usageFactsStore().WithContext(qctx).Where("token_id = ? AND user_id = ?", tokenID, uid).First(&snap).Error; err != nil {
+	if err := m.usageFactsInteractiveReadStore().WithContext(qctx).Where("token_id = ? AND user_id = ?", tokenID, uid).First(&snap).Error; err != nil {
 		return nil
 	}
 	total := float64(snap.UsedQuota) / quotaPerUSD

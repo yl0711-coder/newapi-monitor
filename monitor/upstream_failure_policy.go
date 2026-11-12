@@ -178,6 +178,11 @@ func (m *Monitor) releaseNonCredentialUpstreamIsolation(ctx context.Context, now
 		{&ChannelUpstreamAccount{}, "next_sync_at", "status = ? AND next_sync_at = ?", []any{upstreamStatusError, isolated}},
 		{&ChannelUpstreamAccount{}, "usage_next_sync_at", "usage_status = ? AND usage_next_sync_at = ?", []any{upstreamStatusError, isolated}},
 		{&ChannelUpstreamAccount{}, "usage_backfill_next_sync_at", "usage_status <> ? AND usage_backfill_done = ? AND usage_backfill_next_sync_at = ?", []any{upstreamStatusReconnect, false, isolated}},
+		// Older images recorded a NewAPI tail round that ran out of its request
+		// budget on one dense hour as a failure with exponential backoff. The live
+		// lane now resumes such hours with a durable page cursor, so reschedule
+		// those accounts now instead of waiting hours for the inherited backoff.
+		{&ChannelUpstreamAccount{}, "usage_next_sync_at", "provider = ? AND usage_status = ? AND usage_last_error = ? AND usage_next_sync_at > ? AND usage_next_sync_at <> ?", []any{upstreamProviderNewAPI, upstreamStatusError, legacyNewAPIBackfillBudgetError(), now, isolated}},
 		{&UpstreamErrorLogSyncState{}, "next_sync_at", "status = ? AND next_sync_at = ?", []any{upstreamStatusError, isolated}},
 		{&UpstreamFundSyncState{}, "next_sync_at", "status = ? AND next_sync_at = ?", []any{upstreamStatusError, isolated}},
 		{&AICodeWithKeySyncState{}, "next_sync_at", "status = ? AND next_sync_at = ?", []any{upstreamStatusError, isolated}},

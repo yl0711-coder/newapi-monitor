@@ -1761,7 +1761,7 @@ func TestNewAPITailPersistsCompleteHoursAndResumesAfterBudgetYield(t *testing.T)
 	credential := newAPICredential{AccessToken: "usage-token"}
 
 	firstPacer := newUpstreamUsageRequestPacer(upstreamUsageMaxRequestsPerRun, 0)
-	first, yielded, err := m.syncNewAPITailIncremental(context.Background(), row, credential, from, to, to, firstPacer)
+	first, yielded, _, err := m.syncNewAPITailIncremental(context.Background(), row, credential, from, to, to, firstPacer)
 	if err != nil || !yielded {
 		t.Fatalf("first tail turn yielded=%v err=%v", yielded, err)
 	}
@@ -1785,7 +1785,7 @@ func TestNewAPITailPersistsCompleteHoursAndResumesAfterBudgetYield(t *testing.T)
 	// any remaining budget to refresh the configured three-hour overlap.
 	row.UsageDataUntil = first.DataUntil
 	secondPacer := newUpstreamUsageRequestPacer(upstreamUsageMaxRequestsPerRun, 0)
-	second, yielded, err := m.syncNewAPITailIncremental(context.Background(), row, credential, first.DataUntil-3*3600, to, to+15, secondPacer)
+	second, yielded, _, err := m.syncNewAPITailIncremental(context.Background(), row, credential, first.DataUntil-3*3600, to, to+15, secondPacer)
 	if err != nil || yielded || second.DataUntil != to {
 		t.Fatalf("second tail turn watermark=%d yielded=%v err=%v", second.DataUntil, yielded, err)
 	}

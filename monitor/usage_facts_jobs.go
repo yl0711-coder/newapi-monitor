@@ -1916,8 +1916,13 @@ func usageFactMemberPublishedCheckpointReady(state UsageFactMemberState, row Usa
 		*state.SourceFirstLogHour < *state.SourceFloorHour {
 		return false, false
 	}
-	if *state.SourceFloorHour == row.SourceFloorHour && state.TailThroughHour != nil &&
-		*state.TailThroughHour >= through && state.VerifiedThroughHour != nil &&
+	// The Tail job cursor is deliberately not required here. The publisher
+	// advances the global right edge from per-hour proofs (complete, hashed,
+	// current epoch) and may retain a member whose job cursor is briefly behind;
+	// requiring the cursor at checkpoint time closed the whole read gate right
+	// after such a publish. The caller instead audits today's trailing hour
+	// proofs for these members (see usageFactPublishedCheckpointNeedsTrailingProof).
+	if *state.SourceFloorHour == row.SourceFloorHour && state.VerifiedThroughHour != nil &&
 		*state.VerifiedThroughHour >= row.VerifiedThroughHour {
 		return true, false
 	}
@@ -1927,6 +1932,18 @@ func usageFactMemberPublishedCheckpointReady(state UsageFactMemberState, row Usa
 		return false, true
 	}
 	return false, false
+}
+
+// usageFactPublishedCheckpointNeedsTrailingProof reports whether a full-ready
+// published member must prove today's closed hours with per-hour proofs. That
+// is always the case for members with history, and for a no-history member
+// whose Tail cursor has not reached the watermark (the publisher likewise
+// requires hour proofs for such a retained member).
+func usageFactPublishedCheckpointNeedsTrailingProof(state UsageFactMemberState, through int64) bool {
+	if state.SourceHistoryStatus == "complete_hot" {
+		return true
+	}
+	return state.TailThroughHour == nil || *state.TailThroughHour < through
 }
 
 func auditUsageFactRecentServiceRange(db *gorm.DB, state UsageFactMemberState, through int64) error {
@@ -2421,7 +2438,7 @@ func (m *Monitor) validateUsageFactFullHistoryCheckpoint(ctx context.Context, th
 			if err := auditUsageFactPublishedHistoryWithRefresh(db, state, row.SourceFloorHour, through); err != nil {
 				return fmt.Errorf("recent service checkpoint failed user_id=%d: %w", row.UserID, err)
 			}
-		} else if state.SourceHistoryStatus == "complete_hot" {
+		} else if usageFactPublishedCheckpointNeedsTrailingProof(state, through) {
 			trailingIDs = append(trailingIDs, row.UserID)
 		}
 		if minFloor == 0 || row.SourceFloorHour < minFloor {

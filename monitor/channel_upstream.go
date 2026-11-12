@@ -105,7 +105,9 @@ type ChannelUpstreamAccount struct {
 	UsageAdapter string `gorm:"size:32;column:usage_adapter"`
 	// UsageTailMode is a durable scheduling strategy, not provider capability.
 	// Empty keeps the one-window low-request path; "hourly" is learned only
-	// after this account exhausts a bounded NewAPI tail request budget.
+	// after this account exhausts a bounded NewAPI tail request budget; "paged"
+	// after one closed hour needed more pages than a round allows (see
+	// NewAPIUsageTailCheckpoint).
 	UsageTailMode string `gorm:"size:16;column:usage_tail_mode"`
 	// 当天尾部刷新与历史回填分别退避。历史某一天异常不能拖慢当天数据，
 	// 也不能在每次尾部刷新时无节制重试同一个高流量窗口。
@@ -166,6 +168,22 @@ type NewAPIUsageBackfillCheckpoint struct {
 	FirstPageFingerprint string  `gorm:"size:64;column:first_page_fingerprint"`
 	UpdatedAt            int64   `gorm:"column:updated_at;index"`
 }
+
+// NewAPIUsageTailCheckpoint is the live-lane counterpart of
+// NewAPIUsageBackfillCheckpoint. A closed hour of a busy account may need more
+// pages than one bounded tail round allows; its verified page accumulation is
+// kept here (one row per domain, independent of the history lane cursor) and
+// the hour is published only after every page and the first-page probe agree.
+type NewAPIUsageTailCheckpoint struct {
+	NewAPIUsageBackfillCheckpoint
+}
+
+func (NewAPIUsageTailCheckpoint) TableName() string { return newAPIUsageTailCheckpointTable }
+
+const (
+	newAPIUsageBackfillCheckpointTable = "new_api_usage_backfill_checkpoints"
+	newAPIUsageTailCheckpointTable     = "new_api_usage_tail_checkpoints"
+)
 
 // NewAPIUsageBackfillSegment records one fully verified child window of a
 // historical hour. Slow upstreams can time out while evaluating a whole hour;
@@ -2934,6 +2952,9 @@ func (m *Monitor) persistUpstreamAccountIdentityChange(ctx context.Context, row 
 			if err := tx.Where("domain = ?", row.Domain).Delete(&NewAPIUsageBackfillCheckpoint{}).Error; err != nil {
 				return err
 			}
+			if err := tx.Where("domain = ?", row.Domain).Delete(&NewAPIUsageTailCheckpoint{}).Error; err != nil {
+				return err
+			}
 			if err := tx.Where("domain = ?", row.Domain).Delete(&NewAPIUsageBackfillSegment{}).Error; err != nil {
 				return err
 			}
@@ -3026,6 +3047,9 @@ func (m *Monitor) persistAICodeWithAccountChange(ctx context.Context, row *Chann
 				return err
 			}
 			if err := tx.Where("domain = ?", row.Domain).Delete(&NewAPIUsageBackfillCheckpoint{}).Error; err != nil {
+				return err
+			}
+			if err := tx.Where("domain = ?", row.Domain).Delete(&NewAPIUsageTailCheckpoint{}).Error; err != nil {
 				return err
 			}
 			if err := tx.Where("domain = ?", row.Domain).Delete(&NewAPIUsageBackfillSegment{}).Error; err != nil {

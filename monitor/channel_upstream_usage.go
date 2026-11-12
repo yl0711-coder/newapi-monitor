@@ -58,6 +58,10 @@ const (
 	upstreamUsageAdapterAICodeWith = "aicodewith_key"
 	upstreamUsageAdapterTokenForce = "tokenforce_detail"
 	upstreamUsageTailModeHourly    = "hourly"
+	// "paged" is learned when a single closed hour needs more pages than one
+	// bounded tail round allows. Closed hours are then read with a durable
+	// live-lane page cursor across rounds; the open hour keeps the normal path.
+	upstreamUsageTailModePaged = "paged"
 	// Tail 与历史补数是两条调度泳道。管理员手动同步仍走 auto，后台必须
 	// 显式选择一条，防止一个历史密集小时占满整轮而拖延其他账户的 Tail。
 	upstreamUsageLaneAuto    upstreamUsageLane = "auto"
@@ -73,6 +77,13 @@ const (
 	// still applies, so recovery cannot turn into an upstream request burst.
 	newAPIBackfillAdaptiveSegment    = 5 * time.Minute
 	newAPIBackfillAdaptiveMinSegment = 10 * time.Second
+	// A whole-hour scan that resumes from page 2 must first re-read page 1 to
+	// prove the source did not change. When each page takes most of the lane
+	// budget, every round re-reads page 1 and then yields on page 2, so the
+	// durable cursor never advances and no request-local timeout ever fires.
+	// A parent checkpoint that has not advanced for this long is treated as
+	// slow and switched to the same durable five-minute children.
+	newAPIBackfillParentStallAfter = 20 * time.Minute
 	// Tail 持续有流量时，每完成 4 个 Tail 批次允许 1 个历史批次；但只要
 	// 最老 Tail 已逾期超过 5 分钟，就继续优先追新，不为历史让路。
 	upstreamUsageHistoryFairnessTailBatches = 4
@@ -1113,8 +1124,12 @@ func validateNewAPIUsagePage[T any](page newAPIUsagePage[T], total int64, pageNu
 }
 
 func (m *Monitor) saveNewAPIUsageBackfillCheckpoint(ctx context.Context, checkpoint *NewAPIUsageBackfillCheckpoint) error {
+	return m.saveNewAPIUsagePageCheckpoint(ctx, newAPIUsageBackfillCheckpointTable, checkpoint)
+}
+
+func (m *Monitor) saveNewAPIUsagePageCheckpoint(ctx context.Context, table string, checkpoint *NewAPIUsageBackfillCheckpoint) error {
 	checkpoint.UpdatedAt = time.Now().Unix()
-	return m.storeDB.WithContext(ctx).Clauses(clause.OnConflict{
+	return m.storeDB.WithContext(ctx).Table(table).Clauses(clause.OnConflict{
 		Columns:   []clause.Column{{Name: "domain"}},
 		UpdateAll: true,
 	}).Create(checkpoint).Error
@@ -1125,17 +1140,23 @@ func (m *Monitor) saveNewAPIUsageBackfillCheckpoint(ctx context.Context, checkpo
 // completed pages stay only in the checkpoint and public hourly data remains
 // untouched until the final total/fingerprint verification succeeds.
 func (m *Monitor) syncNewAPIUsageBackfillWindowDirect(ctx context.Context, row ChannelUpstreamAccount, cred newAPICredential, from, to int64, pacer *upstreamUsageRequestPacer, requireStableProbe bool) (upstreamUsageResult, string, bool, error) {
+	return m.syncNewAPIUsagePagedWindow(ctx, newAPIUsageBackfillCheckpointTable, row, cred, from, to, pacer, requireStableProbe)
+}
+
+// syncNewAPIUsagePagedWindow reads one window inside a single hour with a
+// durable page cursor stored in table (history or live lane checkpoint).
+func (m *Monitor) syncNewAPIUsagePagedWindow(ctx context.Context, table string, row ChannelUpstreamAccount, cred newAPICredential, from, to int64, pacer *upstreamUsageRequestPacer, requireStableProbe bool) (upstreamUsageResult, string, bool, error) {
 	if to <= from || to-from > 3600 || from-from%3600 != (to-1)-(to-1)%3600 {
 		return upstreamUsageResult{}, "", false, fmt.Errorf("NewAPI 历史补数窗口必须位于同一小时且不超过一小时")
 	}
 	var checkpoint NewAPIUsageBackfillCheckpoint
-	loadErr := m.storeDB.WithContext(ctx).First(&checkpoint, "domain = ?", row.Domain).Error
+	loadErr := m.storeDB.WithContext(ctx).Table(table).First(&checkpoint, "domain = ?", row.Domain).Error
 	if loadErr != nil && !errors.Is(loadErr, gorm.ErrRecordNotFound) {
 		return upstreamUsageResult{}, "", false, loadErr
 	}
 	hasCheckpoint := loadErr == nil
 	if hasCheckpoint && (checkpoint.WindowFrom != from || checkpoint.WindowTo != to || checkpoint.NextPage < 2 || checkpoint.Total < 0 || checkpoint.SourceRows < 0 || checkpoint.SourceRows > checkpoint.Total || len(checkpoint.FirstPageFingerprint) != 64) {
-		if err := m.storeDB.WithContext(ctx).Where("domain = ?", row.Domain).Delete(&NewAPIUsageBackfillCheckpoint{}).Error; err != nil {
+		if err := m.storeDB.WithContext(ctx).Exec("DELETE FROM "+table+" WHERE domain = ?", row.Domain).Error; err != nil {
 			return upstreamUsageResult{}, "", false, err
 		}
 		hasCheckpoint = false
@@ -1160,7 +1181,7 @@ func (m *Monitor) syncNewAPIUsageBackfillWindowDirect(ctx context.Context, row C
 		if page.Total == checkpoint.Total && fingerprint == checkpoint.FirstPageFingerprint {
 			checkpointVerified = true
 		} else {
-			if err := m.storeDB.WithContext(ctx).Where("domain = ?", row.Domain).Delete(&NewAPIUsageBackfillCheckpoint{}).Error; err != nil {
+			if err := m.storeDB.WithContext(ctx).Exec("DELETE FROM "+table+" WHERE domain = ?", row.Domain).Error; err != nil {
 				return upstreamUsageResult{}, "", false, err
 			}
 			hasCheckpoint = false
@@ -1192,7 +1213,7 @@ func (m *Monitor) syncNewAPIUsageBackfillWindowDirect(ctx context.Context, row C
 			Total: first.Total, FirstPageFingerprint: hex.EncodeToString(first.Fingerprint[:]),
 		}
 		accumulateNewAPIBackfillPage(&checkpoint, first.Items)
-		if err := m.saveNewAPIUsageBackfillCheckpoint(ctx, &checkpoint); err != nil {
+		if err := m.saveNewAPIUsagePageCheckpoint(ctx, table, &checkpoint); err != nil {
 			return upstreamUsageResult{}, "", false, err
 		}
 	}
@@ -1213,7 +1234,7 @@ func (m *Monitor) syncNewAPIUsageBackfillWindowDirect(ctx context.Context, row C
 		}
 		accumulateNewAPIBackfillPage(&checkpoint, page.Items)
 		checkpoint.NextPage++
-		if err := m.saveNewAPIUsageBackfillCheckpoint(ctx, &checkpoint); err != nil {
+		if err := m.saveNewAPIUsagePageCheckpoint(ctx, table, &checkpoint); err != nil {
 			return upstreamUsageResult{}, "", false, err
 		}
 	}
@@ -1230,7 +1251,7 @@ func (m *Monitor) syncNewAPIUsageBackfillWindowDirect(ctx context.Context, row C
 			return upstreamUsageResult{}, "", false, err
 		}
 		if probe.Total != checkpoint.Total || hex.EncodeToString(probe.Fingerprint[:]) != checkpoint.FirstPageFingerprint {
-			if deleteErr := m.storeDB.WithContext(ctx).Where("domain = ?", row.Domain).Delete(&NewAPIUsageBackfillCheckpoint{}).Error; deleteErr != nil {
+			if deleteErr := m.storeDB.WithContext(ctx).Exec("DELETE FROM "+table+" WHERE domain = ?", row.Domain).Error; deleteErr != nil {
 				return upstreamUsageResult{}, "", false, deleteErr
 			}
 			return upstreamUsageResult{}, "", false, fmt.Errorf("NewAPI 使用日志扫描期间首页已变化，窗口将重试")
@@ -1268,6 +1289,17 @@ func isNewAPIBackfillTimeout(err error) bool {
 	message := strings.ToLower(err.Error())
 	return strings.Contains(message, "timeout") || strings.Contains(message, "deadline exceeded") ||
 		strings.Contains(message, "awaiting headers") || strings.Contains(message, "请求超时")
+}
+
+// newAPIBackfillParentStalled reports whether a whole-hour page cursor has
+// stopped advancing across rounds (see newAPIBackfillParentStallAfter).
+// Wall-clock age alone is not enough: when the history lane simply did not run
+// (tail catch-up, backoff, restart) the cursor also stops moving. Require that
+// the lane kept attempting for the whole stall window after the last advance.
+func newAPIBackfillParentStalled(exists bool, checkpoint NewAPIUsageBackfillCheckpoint, from, to, lastAttemptAt int64, now time.Time) bool {
+	stall := int64(newAPIBackfillParentStallAfter / time.Second)
+	return exists && checkpoint.WindowFrom == from && checkpoint.WindowTo == to && checkpoint.UpdatedAt > 0 &&
+		now.Unix()-checkpoint.UpdatedAt >= stall && lastAttemptAt-checkpoint.UpdatedAt >= stall
 }
 
 func newAPIBackfillNeedsAdaptiveSegments(row ChannelUpstreamAccount) bool {
@@ -1479,7 +1511,7 @@ func (m *Monitor) syncNewAPIUsageBackfillWindow(ctx context.Context, row Channel
 		return upstreamUsageResult{}, "", false, err
 	}
 	checkpointIsChild := checkpointErr == nil && checkpoint.WindowFrom >= from && checkpoint.WindowTo <= to && (checkpoint.WindowFrom != from || checkpoint.WindowTo != to)
-	if segmentCount > 0 || checkpointIsChild || newAPIBackfillNeedsAdaptiveSegments(row) {
+	if segmentCount > 0 || checkpointIsChild || newAPIBackfillNeedsAdaptiveSegments(row) || newAPIBackfillParentStalled(checkpointErr == nil, checkpoint, from, to, row.UsageBackfillLastAttemptAt, time.Now()) {
 		if err := m.ensureNewAPIUsageBackfillSegmentPlan(ctx, row.Domain, from, to); err != nil {
 			return upstreamUsageResult{}, "", false, err
 		}
@@ -1508,10 +1540,10 @@ func (m *Monitor) syncNewAPIUsage(ctx context.Context, row ChannelUpstreamAccoun
 // watermark advances; an incomplete hour is never published. The forward range
 // is processed before the overlap range so repeatedly refreshing recent closed
 // hours cannot starve a stale account forever.
-func (m *Monitor) syncNewAPITailIncremental(ctx context.Context, row ChannelUpstreamAccount, cred newAPICredential, from, to, now int64, pacer *upstreamUsageRequestPacer) (upstreamUsageResult, bool, error) {
+func (m *Monitor) syncNewAPITailIncremental(ctx context.Context, row ChannelUpstreamAccount, cred newAPICredential, from, to, now int64, pacer *upstreamUsageRequestPacer) (upstreamUsageResult, bool, bool, error) {
 	result := upstreamUsageResult{DataUntil: row.UsageDataUntil, Adapter: upstreamUsageAdapterNewAPILog}
 	if to <= from {
-		return result, false, fmt.Errorf("上游日志同步窗口无效")
+		return result, false, false, fmt.Errorf("上游日志同步窗口无效")
 	}
 
 	forwardFrom := from
@@ -1520,19 +1552,78 @@ func (m *Monitor) syncNewAPITailIncremental(ctx context.Context, row ChannelUpst
 		// partial hour from the exact watermark would discard its earlier rows.
 		forwardFrom = row.UsageDataUntil - row.UsageDataUntil%3600
 	}
+	currentHour := now - now%3600
 	completedForward := false
 	for cursor := forwardFrom; cursor < to; {
-		windowTo := min(to, cursor-cursor%3600+3600)
-		window, err := m.syncNewAPIUsage(ctx, row, cred, cursor, windowTo, pacer)
-		if err != nil {
-			var exhausted *upstreamUsageRunBudgetExhausted
-			if errors.As(err, &exhausted) && completedForward {
-				return result, true, nil
+		hourEnd := cursor - cursor%3600 + 3600
+		windowTo := min(to, hourEnd)
+		closedHour := windowTo == hourEnd && windowTo <= currentHour
+		pagedHour := closedHour && m.newAPITailUsesPagedHour(ctx, row, cursor, windowTo)
+		var pagedErr error
+		if pagedHour {
+			pageBefore := m.newAPITailCheckpointPage(ctx, row.Domain, cursor, windowTo)
+			window, _, complete, err := m.syncNewAPIUsagePagedWindow(ctx, newAPIUsageTailCheckpointTable, row, cred, cursor, windowTo, pacer, false)
+			switch {
+			case err == nil && complete:
+				if err := m.persistNewAPITailPagedWindow(ctx, row.Domain, cursor, windowTo, window.Hours, now); err != nil {
+					return result, false, false, err
+				}
+			case err == nil || errors.Is(ctx.Err(), context.DeadlineExceeded) || isUpstreamLocalQueueTimeout(err):
+				// The round budget (requests or wall clock) ended mid-hour. Verified
+				// pages are durable. Resume soon only if this round actually moved
+				// the cursor; otherwise report the real outcome so a stuck hour is
+				// visible and backs off instead of looping or looking healthy.
+				progressed := completedForward || m.newAPITailCheckpointPage(context.WithoutCancel(ctx), row.Domain, cursor, windowTo) > pageBefore
+				if progressed {
+					return result, true, false, nil
+				}
+				if err == nil {
+					err = fmt.Errorf("上游使用日志单小时分页本轮未推进（%s）", time.Unix(cursor, 0).In(cstLocation).Format("2006-01-02 15:00"))
+				}
+				return result, false, false, err
+			case ctx.Err() == nil && isNewAPIBackfillTimeout(err):
+				// A whole-hour page query timed out on a slow source. Fall back to
+				// the single-read path for this round, which splits slow windows.
+				pagedHour, pagedErr = false, err
+			default:
+				return result, false, false, err
 			}
-			return result, false, err
 		}
-		if err := m.persistUpstreamUsageWindow(ctx, row.Domain, cursor, windowTo, window.Hours, now); err != nil {
-			return result, false, err
+		if !pagedHour {
+			window, err := m.syncNewAPIUsage(ctx, row, cred, cursor, windowTo, pacer)
+			if err != nil {
+				var exhausted *upstreamUsageRunBudgetExhausted
+				if !errors.As(err, &exhausted) {
+					return result, false, false, err
+				}
+				if completedForward {
+					return result, true, false, nil
+				}
+				if pagedErr != nil {
+					// Slow and dense: neither path finished this hour. Surface the
+					// paged timeout as the outcome (normal failure backoff, visible
+					// in status) rather than a fast loop or a silent success.
+					return result, false, false, pagedErr
+				}
+				if closedHour {
+					// One closed hour does not fit a bounded round. Switch this
+					// account to durable paged hours and resume soon; the request
+					// budget per round stays unchanged.
+					return result, true, true, nil
+				}
+				// The open hour alone exceeds the round budget. Earlier hours are
+				// already published; keep the watermark and retry on the normal
+				// cadence. Once the hour closes it is read with the paged cursor.
+				return result, false, true, nil
+			}
+			persist := m.persistUpstreamUsageWindow
+			if pagedErr != nil {
+				// Clear the abandoned paged cursor in the same commit.
+				persist = m.persistNewAPITailPagedWindow
+			}
+			if err := persist(ctx, row.Domain, cursor, windowTo, window.Hours, now); err != nil {
+				return result, false, false, err
+			}
 		}
 		completedForward = true
 		if windowTo > result.DataUntil {
@@ -1550,16 +1641,54 @@ func (m *Monitor) syncNewAPITailIncremental(ctx context.Context, row ChannelUpst
 		if err != nil {
 			var exhausted *upstreamUsageRunBudgetExhausted
 			if errors.As(err, &exhausted) {
-				return result, false, nil
+				return result, false, false, nil
 			}
-			return result, false, err
+			return result, false, false, err
 		}
 		if err := m.persistUpstreamUsageWindow(ctx, row.Domain, cursor, windowTo, window.Hours, now); err != nil {
-			return result, false, err
+			return result, false, false, err
 		}
 		cursor = windowTo
 	}
-	return result, false, nil
+	return result, false, false, nil
+}
+
+// newAPITailUsesPagedHour selects the durable page cursor for a closed hour of
+// an account that has needed it before, or whose checkpoint already holds this
+// hour. Other accounts keep the cheaper single-read path with slow-window split.
+func (m *Monitor) newAPITailUsesPagedHour(ctx context.Context, row ChannelUpstreamAccount, from, to int64) bool {
+	if row.UsageTailMode == upstreamUsageTailModePaged {
+		return true
+	}
+	var count int64
+	if err := m.storeDB.WithContext(ctx).Model(&NewAPIUsageTailCheckpoint{}).
+		Where("domain = ? AND window_from = ? AND window_to = ?", row.Domain, from, to).Count(&count).Error; err != nil {
+		return false
+	}
+	return count > 0
+}
+
+// newAPITailCheckpointPage returns the next page of the live-lane cursor for
+// this hour, or 0 when there is none (or it belongs to another hour).
+func (m *Monitor) newAPITailCheckpointPage(ctx context.Context, domain string, from, to int64) int {
+	qctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	var cp NewAPIUsageTailCheckpoint
+	if err := m.storeDB.WithContext(qctx).First(&cp, "domain = ?", domain).Error; err != nil || cp.WindowFrom != from || cp.WindowTo != to {
+		return 0
+	}
+	return cp.NextPage
+}
+
+// persistNewAPITailPagedWindow publishes a fully verified paged hour and clears
+// its live-lane checkpoint in one commit.
+func (m *Monitor) persistNewAPITailPagedWindow(ctx context.Context, domain string, from, to int64, hours []ChannelUpstreamUsageHour, now int64) error {
+	return m.queuedWriteStore().WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := persistUpstreamUsageWindowTx(tx, domain, from, to, hours, now); err != nil {
+			return err
+		}
+		return tx.Where("domain = ?", domain).Delete(&NewAPIUsageTailCheckpoint{}).Error
+	})
 }
 
 type sub2APIUsageMetric struct {
@@ -2831,7 +2960,7 @@ func legacyNewAPIBackfillBudgetError() string {
 }
 
 func newAPITailNeedsIncrementalSync(row ChannelUpstreamAccount, now int64) bool {
-	if row.UsageTailMode == upstreamUsageTailModeHourly || row.UsageLastError == legacyNewAPIBackfillBudgetError() {
+	if row.UsageTailMode == upstreamUsageTailModeHourly || row.UsageTailMode == upstreamUsageTailModePaged || row.UsageLastError == legacyNewAPIBackfillBudgetError() {
 		return true
 	}
 	// A stale watermark needs forward-first hourly commits so one dense overlap
@@ -3051,8 +3180,12 @@ func (m *Monitor) syncStoredUpstreamUsageWithPriority(ctx context.Context, domai
 		if probeErr := upstreamProbeBeforeRetry(ctx, m, row, "usage", row.UsageStatus, row.UsageConsecutiveFails); probeErr != nil {
 			err = probeErr
 		} else if newAPICred, ok := credential.(newAPICredential); ok && row.Provider == upstreamProviderNewAPI && newAPITailNeedsIncrementalSync(row, now) {
-			result, tailYielded, err = m.syncNewAPITailIncremental(ctx, row, newAPICred, plan.tailFrom, plan.tailTo, now, pacer)
+			var enterPaged bool
+			result, tailYielded, enterPaged, err = m.syncNewAPITailIncremental(ctx, row, newAPICred, plan.tailFrom, plan.tailTo, now, pacer)
 			tailPersisted = err == nil
+			if enterPaged {
+				row.UsageTailMode = upstreamUsageTailModePaged
+			}
 		} else {
 			result, err = syncUsage(ctx, plan.tailFrom, plan.tailTo, pacer)
 			if row.Provider == upstreamProviderNewAPI && upstreamUsageRunBudgetWasExhausted(err) {
@@ -3130,6 +3263,11 @@ func (m *Monitor) syncStoredUpstreamUsageWithPriority(ctx context.Context, domai
 					row.UsageBackfillNextSyncAt = 0
 					break
 				}
+			}
+		} else if row.Provider == upstreamProviderTokenForce {
+			err = m.syncTokenForceHistoryWindows(ctx, &row, plan, now, pacer, syncUsage, &operationRetryAt, func() []string { return secrets })
+			if errors.Is(err, context.Canceled) {
+				return row, err
 			}
 		} else {
 			history, historyErr := syncUsage(ctx, plan.backfillFrom, plan.backfillTo, pacer)
