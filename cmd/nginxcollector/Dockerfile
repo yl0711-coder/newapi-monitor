@@ -1,4 +1,4 @@
-FROM golang:1.26.10-alpine3.23 AS build
+FROM golang:1.26.11-alpine3.23 AS build
 WORKDIR /go/src/github.com/yl0711-coder/newapi-monitor
 COPY cmd/nginxcollector/*.go ./cmd/nginxcollector/
 COPY internal/metering/*.go ./internal/metering/

@@ -11,9 +11,9 @@ ARG RUNTIME_IMAGE=alpine:3.23
 # BUILDER_IMAGE 与 RUNTIME_IMAGE 同理：镜像代理不可达时（dockerproxy.com 超时、
 # Docker Hub 直连失败），可传入本机已缓存的任意 golang 镜像完成构建。
 # 产物是 CGO_ENABLED=0 的静态二进制，构建镜像的基础发行版不影响运行结果，
-# 因此 golang:1.26.10（Debian 基）编出的二进制同样能在 alpine 运行层跑。
-# 构建工具链必须为 1.26.10，与产物元数据和镜像标签一致。
-ARG BUILDER_IMAGE=golang:1.26.10-alpine3.23
+# 因此 golang:1.26.11（Debian 基）编出的二进制同样能在 alpine 运行层跑。
+# 构建工具链必须为 1.26.11，与产物元数据和镜像标签一致。
+ARG BUILDER_IMAGE=golang:1.26.11-alpine3.23
 
 # ---- 构建阶段 ----
 FROM ${BUILDER_IMAGE} AS builder
@@ -32,7 +32,7 @@ COPY . .
 # glebarez/modernc 纯 Go sqlite,无需 CGO,静态编译;main 在模块根。
 # 产物输出到 /app —— 不能用 /build/monitor:源码里有 monitor/ 目录,COPY . . 后 /build/monitor 已是目录,
 # go build -o 到已存在目录会把二进制塞进去,导致产物变成目录、容器 ENTRYPOINT 报 "is a directory"。
-RUN test "$(go env GOVERSION)" = "go1.26.10" && CGO_ENABLED=0 GOOS=linux go build -trimpath \
+RUN test "$(go env GOVERSION)" = "go1.26.11" && CGO_ENABLED=0 GOOS=linux go build -trimpath \
       -ldflags="-s -w -X github.com/yl0711-coder/newapi-monitor/monitor.BuildGitSHA=${VCS_REF} -X github.com/yl0711-coder/newapi-monitor/monitor.BuildImageVersion=${IMAGE_VERSION}" \
       -o /app .
 RUN test -n "$SOURCE_MANIFEST_SHA256" \
@@ -65,7 +65,7 @@ ARG SOURCE_MANIFEST_SHA256
 LABEL org.opencontainers.image.revision="$VCS_REF"
 LABEL org.opencontainers.image.version="$IMAGE_VERSION"
 LABEL org.opencontainers.image.source-manifest-sha256="$SOURCE_MANIFEST_SHA256"
-LABEL org.opencontainers.image.go-version="go1.26.10"
+LABEL org.opencontainers.image.go-version="go1.26.11"
 WORKDIR /app
 COPY --from=builder --chmod=0555 /app /app/monitor
 COPY --from=builder --chmod=0444 /buildinfo/source-manifest.json /buildinfo/build-info.json /app/buildinfo/
