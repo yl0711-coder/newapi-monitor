@@ -54,11 +54,13 @@ func TestReportProjectionReusesOneSnapshotAndSeesNextCorrection(t *testing.T) {
 		t.Fatal(err)
 	}
 	queries := 0
-	m.storeDB.Callback().Row().Before("gorm:row").Register("projection_query_counter", func(tx *gorm.DB) {
+	if err := m.storeDB.Callback().Row().Before("gorm:row").Register("projection_query_counter", func(tx *gorm.DB) {
 		if strings.Contains(tx.Statement.SQL.String(), "SUM(request_error)") {
 			queries++
 		}
-	})
+	}); err != nil {
+		t.Fatal(err)
+	}
 	read := func(want bool) {
 		t.Helper()
 		ctx := withReportProjectionCache(context.Background())

@@ -1403,29 +1403,6 @@ func nextEnabledSince(status, prevStatus int, prevSince, now int64) int64 {
 	return now
 }
 
-// chanPrev 是某渠道上一轮的状态与启用起始时刻,供刷新时判断"禁用→启用"跳变。
-type chanPrev struct {
-	status    int
-	since     int64
-	deletedAt int64
-}
-
-// channelEnabledState 返回当前 channel_snaps 里每个渠道的上一轮状态,
-// 供刷新时正确维护 enabled_since(渠道不存在时取零值,即按"新建"处理)。
-func (m *Monitor) channelEnabledState() map[int]chanPrev {
-	var rows []struct {
-		ID, Status   int
-		EnabledSince int64
-		DeletedAt    int64
-	}
-	warnReadErr("channelEnabledState", m.storeDB.Raw("SELECT id, status, enabled_since, deleted_at FROM channel_snaps").Scan(&rows))
-	out := make(map[int]chanPrev, len(rows))
-	for _, r := range rows {
-		out[r.ID] = chanPrev{status: r.Status, since: r.EnabledSince, deletedAt: r.DeletedAt}
-	}
-	return out
-}
-
 // replaceChannelSnaps 用本轮完整读取到的渠道快照更新本地表。
 // 同 ID 的名称/厂商/地址等直接同步最新值；本轮未出现的渠道只标记 deleted_at，
 // 永不物理删除其最后快照，以便历史报表仍能解释旧 channel_id。

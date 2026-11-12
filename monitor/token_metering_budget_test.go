@@ -211,7 +211,9 @@ func TestTokenMeteringLocalCommitsDoNotSpendSourceReadBudget(t *testing.T) {
 }
 
 func TestTokenMeteringQueuedPageUsesWriteCostAndKeepsFairness(t *testing.T) {
-	tokenMeteringQueuedPageCheck(t, 128, 300*time.Millisecond)
+	synctest.Test(t, func(t *testing.T) {
+		tokenMeteringQueuedPageCheck(t, 128, 300*time.Millisecond)
+	})
 }
 
 func TestTokenMeteringTransientQueueUsesRemainingCommitBudget(t *testing.T) {

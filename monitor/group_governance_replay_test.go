@@ -220,7 +220,7 @@ func TestGGReadOnlyReplay(t *testing.T) {
 		if user > 0 {
 			m.cfg.UsageFactsEnabled = true
 			m.cfg.UsageFactsReadEnabled = true
-			actual := ggReadCustomerMinute(t, ctx, m, user, auditFrom, auditTo)
+			actual := ggReadCustomerMinute(ctx, t, m, user, auditFrom, auditTo)
 			evidence["source_customer_amount"] = map[string]any{"user_id": user, "from_ts": auditFrom, "to_ts": auditTo, "source_net_quota": spend[user], "local_usd": actual, "usage_enabled": true}
 			if actual == nil || math.Abs(*actual-float64(spend[user])/quotaPerUSD) > 1e-10 {
 				t.Error("same-customer source net amount differs; evidence retained")
@@ -249,7 +249,7 @@ func TestGGReadOnlyReplay(t *testing.T) {
 
 // The production amount API has a day-prefix contract. Compare two proven
 // prefixes to audit a closed minute; never pretend a minute starts a new day.
-func ggReadCustomerMinute(t *testing.T, ctx context.Context, m *Monitor, user, from, to int64) *float64 {
+func ggReadCustomerMinute(ctx context.Context, t *testing.T, m *Monitor, user, from, to int64) *float64 {
 	t.Helper()
 	var proof CustomerHealthSourceCursor
 	if err := m.storeDB.WithContext(ctx).First(&proof, 1).Error; err != nil || proof.DayTs > from || proof.ThroughTs < to {
@@ -304,7 +304,7 @@ func TestGGRecordedSourceCustomerMinute(t *testing.T) {
 	m := &Monitor{storeDB: db, cfg: Settings{CustomerHealthSourceEnabled: true, UsageFactsEnabled: true, UsageFactsReadEnabled: true}}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	actual := ggReadCustomerMinute(t, ctx, m, a.User, a.From, a.To)
+	actual := ggReadCustomerMinute(ctx, t, m, a.User, a.From, a.To)
 	if actual == nil || math.Abs(*actual-float64(a.Quota)/quotaPerUSD) > 1e-10 {
 		t.Fatal("retained source amount differs", actual)
 	}

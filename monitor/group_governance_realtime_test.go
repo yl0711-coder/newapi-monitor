@@ -177,9 +177,14 @@ func TestGGContinuityRecoveryStaleAndRestart(t *testing.T) {
 	if !r.Active || r.Hits != 2 {
 		t.Fatal(r)
 	}
-	b, _ := json.Marshal(old)
+	b, err := json.Marshal(old)
+	if err != nil {
+		t.Fatal(err)
+	}
 	var restored ggRuleMemory
-	json.Unmarshal(b, &restored)
+	if err := json.Unmarshal(b, &restored); err != nil {
+		t.Fatal(err)
+	}
 	for _, at := range []int64{780, 840} {
 		restored, r = ggUpdateRule(restored, ggRuleResult{Eligible: true, recovered: true}, at, p, false)
 		if !r.Active {
@@ -206,8 +211,8 @@ func TestGGLateEvidenceDoesNotCountRefreshAsRecovery(t *testing.T) {
 	p := groupGovernancePolicy()
 	hit := ggRuleResult{Eligible: true, Hit: true}
 	old, _ := ggUpdateRule(ggRuleMemory{}, hit, 600, p, true)
+	old, _ = ggUpdateRule(old, ggRuleResult{}, 660, p, true)
 	old, r := ggUpdateRule(old, ggRuleResult{}, 660, p, true)
-	old, r = ggUpdateRule(old, ggRuleResult{}, 660, p, true)
 	if !r.Active || r.Recoveries != 0 {
 		t.Fatal("missing same-minute evidence erased a known failure", r)
 	}
@@ -550,7 +555,9 @@ func TestGGCollectorEnrichmentIsOptionalAndReplayIdempotent(t *testing.T) {
 		t.Fatal("shared denominator or customer stability changed", sample)
 	}
 	// A missing optional projection must leave independent minute ingestion usable.
-	m.storeDB.Migrator().DropTable(&GroupGovernanceErrorMinute{})
+	if err := m.storeDB.Migrator().DropTable(&GroupGovernanceErrorMinute{}); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := m.sampleCustomerHealthRangeLow(context.Background(), from, from+60); err != nil {
 		t.Fatal("optional enrichment blocked FRT", err)
 	}

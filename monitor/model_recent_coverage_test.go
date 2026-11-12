@@ -90,7 +90,7 @@ func TestModelNormalSamplerPublishesLatestWithoutGovernanceAndSurvivesEnrichment
 	m.cfg.GroupGovernanceEnabled = true
 	if err = m.storeDB.Callback().Create().Before("gorm:create").Register("gg-window-fail", func(tx *gorm.DB) {
 		if tx.Statement.Table == "group_governance_error_minutes" {
-			tx.AddError(errors.New("enrichment failed"))
+			_ = tx.AddError(errors.New("enrichment failed"))
 		}
 	}); err != nil {
 		t.Fatal(err)
@@ -102,7 +102,9 @@ func TestModelNormalSamplerPublishesLatestWithoutGovernanceAndSurvivesEnrichment
 	if ok, _, _, _ := restarted.modelStatisticsFactsCoverage(context.Background(), from, now); !ok {
 		t.Fatal("optional governance failure blocked shared requests")
 	}
-	m.storeDB.Callback().Create().Remove("gg-window-fail")
+	if err := m.storeDB.Callback().Create().Remove("gg-window-fail"); err != nil {
+		t.Fatal(err)
+	}
 	read()
 	if modelStatisticsWindowTarget(m, time.Unix(now+25, 0)) != now || m.modelReportTiming(false).FinalizeDelaySeconds != 0 {
 		t.Fatal("ordinary mode still waits an hour")

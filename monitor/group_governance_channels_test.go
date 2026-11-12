@@ -82,9 +82,14 @@ func TestGGChannelTotalsUseAlignedFactsAndMinutePeaks(t *testing.T) {
 			t.Fatal("mixed model windows", m.Model)
 		}
 	}
-	b, _ := json.Marshal(r)
+	b, err := json.Marshal(r)
+	if err != nil {
+		t.Fatal(err)
+	}
 	var public map[string]json.RawMessage
-	json.Unmarshal(b, &public)
+	if err := json.Unmarshal(b, &public); err != nil {
+		t.Fatal(err)
+	}
 	if _, ok := public["metrics"]; ok {
 		t.Fatal("internal model totals leaked as public rows")
 	}
@@ -126,7 +131,7 @@ func TestGGChannelSpeedComparisonPreservesModelMix(t *testing.T) {
 }
 
 func TestGGIncreaseOperationMergesModelsAndKeepsTriggerChannels(t *testing.T) {
-	r, groups := ggActionFixture()
+	r, _ := ggActionFixture()
 	for i := range r.Metrics {
 		r.Metrics[i].Rules = nil
 	}
@@ -136,7 +141,7 @@ func TestGGIncreaseOperationMergesModelsAndKeepsTriggerChannels(t *testing.T) {
 	other.Key = ggKey(ggMetricKey{other.Group, other.Model, other.ChannelID})
 	r.Metrics = append(r.Metrics, other)
 	// Appending can relocate the slice; rebuild all pointers.
-	groups = map[[2]string][]*ggMetrics{}
+	groups := map[[2]string][]*ggMetrics{}
 	for i := range r.Metrics {
 		v := &r.Metrics[i]
 		groups[[2]string{v.Group, v.Model}] = append(groups[[2]string{v.Group, v.Model}], v)

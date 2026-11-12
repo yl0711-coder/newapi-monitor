@@ -58,7 +58,9 @@ func TestGGConfigExpiryPreservesEvidenceAndTimestampDoesNotReset(t *testing.T) {
 		var s GroupGovernanceRealtimeState
 		m.storeDB.First(&s, 1)
 		var r ggRealtimeReport
-		json.Unmarshal([]byte(s.ReportJSON), &r)
+		if err := json.Unmarshal([]byte(s.ReportJSON), &r); err != nil {
+			t.Fatal(err)
+		}
 		return r
 	}
 	r := read()

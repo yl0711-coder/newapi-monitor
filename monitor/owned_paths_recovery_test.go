@@ -172,7 +172,9 @@ func TestGGFinalizedErrorReplayAndPublicationRetry(t *testing.T) {
 	if err := m.storeDB.First(&fact).Error; err != nil || fact.Failed != 3 {
 		t.Fatal("optional error publish blocked shared facts", fact, err)
 	}
-	m.storeDB.Callback().Create().Remove("fail-gg-publish")
+	if err := m.storeDB.Callback().Create().Remove("fail-gg-publish"); err != nil {
+		t.Fatal(err)
+	}
 	read()
 	check(3, groupGovernanceErrorVersion)
 }
