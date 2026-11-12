@@ -2,8 +2,14 @@ import assert from 'node:assert/strict';
 import {readFileSync} from 'node:fs';
 import {pathToFileURL} from 'node:url';
 
-export const monthlyNativeOnlyTests = Object.freeze(['TestPartitionedCapturedGenerationLargeCompleteMonth']);
-export const monthlyBoundedRaceTest = 'TestPartitionedCapturedGenerationBoundedRaceMonth';
+export const monthlyNativeOnlyTests = Object.freeze([
+  'TestPartitionedCapturedGenerationLargeCompleteMonth',
+  'TestRetentionFullReceiverPayloadPerformance',
+]);
+export const monthlyBoundedRaceTests = Object.freeze([
+  'TestPartitionedCapturedGenerationBoundedRaceMonth',
+  'TestRetentionBoundedReceiverPayloadRace',
+]);
 
 function inventory(listing) {
   const names = listing.split(/\r?\n/).filter(line => /^(?:Test|Example|Fuzz)\S*$/.test(line));
@@ -21,7 +27,9 @@ export function checkMonthlyTestCoverage(allListing, raceListing) {
     assert.ok(all.includes(name), `required native scale test is missing: ${name}`);
     assert.ok(!race.includes(name), `native scale test unexpectedly belongs to race inventory: ${name}`);
   }
-  assert.ok(race.includes(monthlyBoundedRaceTest), 'shared end-to-end bounded race test is missing');
+  for (const name of monthlyBoundedRaceTests) {
+    assert.ok(race.includes(name), `shared bounded race test is missing: ${name}`);
+  }
   const expectedRace = all.filter(name => !monthlyNativeOnlyTests.includes(name));
   assert.deepEqual(race, expectedRace, 'unaccounted native-only, race-only or missing monthly test');
   return {
