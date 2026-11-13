@@ -1,6 +1,8 @@
 package main
 
 import (
+	"github.com/yl0711-coder/newapi-monitor/internal/metering"
+
 	"bytes"
 	"context"
 	"crypto/hmac"
@@ -60,6 +62,10 @@ type evidenceTelemetry struct {
 }
 
 type evidenceEvent struct {
+	RequestLength        *int64 `json:"request_length,omitempty"`
+	RequestLengthState   string `json:"request_length_state,omitempty"`
+	RequestLengthVersion string `json:"request_length_version,omitempty"`
+
 	EventID          string `json:"event_id"`
 	EventMS          int64  `json:"event_ms"`
 	Route            string `json:"route"`
@@ -112,6 +118,8 @@ type evidenceGapRef struct {
 }
 
 type rawEvidenceLine struct {
+	RequestLength json.RawMessage `json:"request_length"`
+
 	LogSchema         flexNumber       `json:"log_schema"`
 	UpstreamStatus    upstreamSequence `json:"upstream_status"`
 	NginxRequestID    string           `json:"nginx_request_id"`
@@ -319,7 +327,12 @@ func makeEvidenceEvent(c config, data []byte, raw rawLine, row sample, inode uin
 	}
 	_, _ = identity.Write(lineDigest[:])
 	eventID := hex.EncodeToString(identity.Sum(nil))
+	requestLength, lengthState := metering.RequestLength(extra.RequestLength)
+	if _, err := metering.Object(data, 1<<20, 12); err != nil {
+		requestLength, lengthState = nil, "invalid"
+	}
 	return evidenceEvent{
+		RequestLength: requestLength, RequestLengthState: lengthState, RequestLengthVersion: "request-length-v1",
 		EventID: eventID, EventMS: rawEventMS(raw), Route: row.Route, Method: row.Method, Status: row.Status,
 		UpstreamStatus: row.UpstreamStatus, UpstreamAttempts: len(statuses), UpstreamStatuses: statuses,
 		RequestMS: row.RequestTimeSumMS, UpstreamMS: row.UpstreamTimeSumMS, UpstreamPresent: row.UpstreamTimeCount == 1,

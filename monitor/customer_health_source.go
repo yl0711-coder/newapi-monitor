@@ -11,8 +11,10 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"net"
 	"time"
 
+	"github.com/go-sql-driver/mysql"
 	"gorm.io/gorm"
 )
 
@@ -52,6 +54,33 @@ func customerHealthSourceNext(from, through int64) int64 {
 	return next
 }
 
+// A timed-out hour is retried from its same left edge in smaller slices.
+// Keep the learned width across source epochs; an intermittent connection must
+// not reset every retry to the same expensive hour. The caller certifies only
+// the returned successful prefix, after the sampler has committed its facts.
+func (m *Monitor) sampleCustomerHealthSourcePrefix(ctx context.Context, from, target int64,
+	sample metricRangeSampler) (rows int, through int64, err error) {
+	width := m.customerHealthSourceReadSeconds.Load()
+	if width < 60 || width > customerHealthSourceSliceSeconds {
+		width = customerHealthSourceSliceSeconds
+	}
+	through = min(target, from+width)
+	started := time.Now()
+	rows, err = sample(ctx, from, through)
+	if err == nil {
+		if through >= target || through-from >= width && time.Since(started) < 10*time.Second {
+			m.customerHealthSourceReadSeconds.Store(min(customerHealthSourceSliceSeconds, width+60))
+		}
+	} else if ctx.Err() == nil {
+		var server *mysql.MySQLError
+		var network net.Error
+		if errors.Is(err, errCustomerHealthClassificationBudget) || errors.Is(err, context.DeadlineExceeded) || errors.As(err, &server) && server.Number == 3024 || errors.As(err, &network) && network.Timeout() {
+			m.customerHealthSourceReadSeconds.Store(max(int64(60), (through-from)/2/60*60))
+		}
+	}
+	return rows, through, err
+}
+
 // customerHealthSourceDayTransition decides whether a source loop may switch
 // to the next CST day.  The previous day remains active until its finalized
 // watermark reaches the natural day end; this is what closes the delayed tail
@@ -85,6 +114,19 @@ func (m *Monitor) saveCustomerHealthSourceCursor(dayStart, through int64) error 
 }
 
 func (m *Monitor) saveCustomerHealthSourceCursorLocked(dayStart, through int64) error {
+	return m.saveCustomerHealthSourceProgressLocked(dayStart, through, 0)
+}
+
+func (m *Monitor) saveCustomerHealthSourceReadCursor(dayStart, through, target int64) error {
+	if through < dayStart || target < through || target > dayStart+86400 {
+		return errors.New("invalid customer-health read checkpoint")
+	}
+	m.customerHealthCursorMu.Lock()
+	defer m.customerHealthCursorMu.Unlock()
+	return m.saveCustomerHealthSourceProgressLocked(dayStart, through, target)
+}
+
+func (m *Monitor) saveCustomerHealthSourceProgressLocked(dayStart, through, readTarget int64) error {
 	// 同一天的可信持久水位只增不减。系统时间短暂回拨时，页面可以把本轮可见
 	// 右界夹到当前 target，但不能让随后较小的分片覆盖已经落盘的更高水位。
 	// The standard source worker has both realtime and policy-backfill writers.
@@ -106,7 +148,7 @@ func (m *Monitor) saveCustomerHealthSourceCursorLocked(dayStart, through int64) 
 	currentMainSemantics := tx.RowsAffected > 0 && current.DayTs == dayStart &&
 		current.SemanticsVersion == customerHealthStabilityPolicyVersion
 	currentTTFTSemantics := currentMainSemantics && current.TTFTSemanticsVersion == ttftCoverageSemanticsVersion
-	if currentTTFTSemantics && current.TTFTCoverageFromTs == dayStart &&
+	if readTarget == 0 && currentTTFTSemantics && current.TTFTCoverageFromTs == dayStart &&
 		current.ThroughTs >= through &&
 		current.TTFTCoverageThroughTs >= through {
 		// Existing databases may predate the per-day ledger.  Even a no-op
@@ -140,6 +182,12 @@ func (m *Monitor) saveCustomerHealthSourceCursorLocked(dayStart, through int64) 
 		TTFTCoverageFromTs:   ttftFrom, TTFTCoverageThroughTs: ttftThrough,
 		UpdatedAt: time.Now().Unix(),
 	}
+	if currentTTFTSemantics {
+		next.ReadNextTs, next.ReadTargetTs = current.ReadNextTs, current.ReadTargetTs
+	}
+	if readTarget > 0 {
+		next.ReadNextTs, next.ReadTargetTs = through, readTarget
+	}
 	return m.storeDB.Transaction(func(tx *gorm.DB) error {
 		// A single-row cursor is about to move to a newer day.  Preserve the
 		// outgoing day's certified interval before replacing that row, in the
@@ -147,6 +195,18 @@ func (m *Monitor) saveCustomerHealthSourceCursorLocked(dayStart, through int64) 
 		if hadCurrent && current.DayTs > 0 && current.DayTs < dayStart {
 			if err := m.persistCustomerHealthDayCoverageTx(tx, current); err != nil {
 				return err
+			}
+			// Preserve an unfinished tail replay separately from the coverage
+			// proof. History resumes it without blocking the new day's reads.
+			resume := max(current.DayTs, min(current.ThroughTs, current.TTFTCoverageThroughTs)-customerHealthSourceReplaySeconds)
+			if current.ReadNextTs >= current.DayTs && current.ReadNextTs <= min(current.ThroughTs, current.TTFTCoverageThroughTs) &&
+				current.ReadNextTs < current.ReadTargetTs && current.ReadTargetTs <= current.DayTs+86400 {
+				resume = current.ReadNextTs
+			}
+			if current.ThroughTs < current.DayTs+86400 || current.TTFTCoverageThroughTs < current.DayTs+86400 {
+				if err := tx.Model(&CustomerHealthDayCoverage{}).Where("day_ts = ?", current.DayTs).Update("replay_next_ts", resume).Error; err != nil {
+					return err
+				}
 			}
 		}
 		if err := tx.Save(&next).Error; err != nil {
@@ -234,6 +294,13 @@ func (m *Monitor) advanceCustomerHealthSourceCursorFromRealtime(from, to int64) 
 	if from > state.ThroughTs || through <= state.ThroughTs {
 		return nil
 	}
+	var incomplete []CapacityUserMinuteSample
+	if err := m.storeDB.Select("bucket_ts").Where("bucket_ts>=? AND bucket_ts<? AND customer_health_version<>?", from, through, customerHealthStabilityPolicyVersion).Limit(1).Find(&incomplete).Error; err != nil {
+		return err
+	}
+	if len(incomplete) > 0 {
+		return nil
+	}
 	// When FRT history is behind, the same successful live slice still proves
 	// *request* facts. Publish request through_ts alone; extending the FRT
 	// watermark here would bridge an unsampled historical FRT gap.
@@ -264,6 +331,14 @@ func (m *Monitor) loadCustomerHealthSourceCursorLocked(dayStart, target int64) (
 	tx := m.storeDB.Where("id = ?", 1).Limit(1).Find(&state)
 	if tx.Error != nil {
 		return 0, 0, tx.Error
+	}
+	if tx.RowsAffected > 0 && state.DayTs > 0 && state.DayTs < dayStart {
+		// Validate the outgoing day's independent FRT proof before archiving
+		// it. Switching to today's lane must not preserve a legacy FRT prefix
+		// that the old single-day startup path would have invalidated.
+		if _, _, err := m.loadCustomerHealthSourceCursorLocked(state.DayTs, state.DayTs+86400); err != nil {
+			return 0, 0, err
+		}
 	}
 	if tx.RowsAffected == 0 || state.DayTs != dayStart || state.ThroughTs < dayStart ||
 		state.SemanticsVersion != customerHealthStabilityPolicyVersion {
@@ -300,6 +375,8 @@ func (m *Monitor) loadCustomerHealthSourceCursorLocked(dayStart, target int64) (
 				"ttft_semantics_version":   ttftCoverageSemanticsVersion,
 				"ttft_coverage_from_ts":    dayStart,
 				"ttft_coverage_through_ts": dayStart,
+				"read_next_ts":             0,
+				"read_target_ts":           0,
 				"updated_at":               state.UpdatedAt,
 			}).Error; err != nil {
 				return err
@@ -322,6 +399,18 @@ func (m *Monitor) loadCustomerHealthSourceCursorLocked(dayStart, target int64) (
 	if cursor < dayStart {
 		cursor = dayStart
 	}
+	// Resume a partially completed read cycle, including its replay prefix.
+	// Coverage can remain unchanged while those replay minutes are committed;
+	// deriving the retry from coverage-20m would repeat the same prefix forever
+	// when short source epochs cannot finish the whole overlap in one attempt.
+	// Once a cycle is complete and its target has moved, start a fresh tail
+	// replay so late source rows continue to be picked up normally.
+	if !ttftNeedsReplay && state.ReadTargetTs >= dayStart && state.ReadTargetTs <= dayStart+86400 &&
+		state.ReadNextTs >= dayStart && state.ReadNextTs <= coveredThrough &&
+		state.ReadNextTs <= state.ReadTargetTs &&
+		(state.ReadNextTs < state.ReadTargetTs || state.ReadTargetTs >= target) {
+		cursor = state.ReadNextTs
+	}
 	return cursor, coveredThrough, nil
 }
 
@@ -330,6 +419,11 @@ func (m *Monitor) loadCustomerHealthSourceCursorLocked(dayStart, target int64) (
 // Without this startup path, a restart between 00:00 and the normal two-minute
 // finalization point could permanently lose the previous day's tail.
 func (m *Monitor) finishPreviousCustomerHealthDay(ctx context.Context, currentDay int64) error {
+	return m.finishPreviousCustomerHealthDayWith(ctx, currentDay, m.sampleCustomerHealthRangeLow)
+}
+
+func (m *Monitor) finishPreviousCustomerHealthDayWith(ctx context.Context, currentDay int64,
+	sample func(context.Context, int64, int64) (int, error)) error {
 	if currentDay <= 0 {
 		return nil
 	}
@@ -350,11 +444,11 @@ func (m *Monitor) finishPreviousCustomerHealthDay(ctx context.Context, currentDa
 		return err
 	}
 	for cursor < currentDay {
-		to := customerHealthSourceNext(cursor, currentDay)
-		if _, err := m.sampleCustomerHealthRangeLow(ctx, cursor, to); err != nil {
+		_, to, err := m.sampleCustomerHealthSourcePrefix(ctx, cursor, currentDay, sample)
+		if err != nil {
 			return err
 		}
-		if err := m.saveCustomerHealthSourceCursor(dayStart, to); err != nil {
+		if err := m.saveCustomerHealthSourceReadCursor(dayStart, to, currentDay); err != nil {
 			return err
 		}
 		cursor = to
@@ -420,6 +514,8 @@ func (m *Monitor) customerHealthCollectionStatus(dayStart, targetTs int64) Custo
 	status.ThroughTs = min(cursor.ThroughTs, targetTs)
 	status.LastSuccessAt = max(status.LastSuccessAt, cursor.UpdatedAt)
 	if status.ThroughTs <= dayStart {
+		// Midnight is an empty interval, not an observed collection watermark.
+		status.ThroughTs = 0
 		status.State, status.Note = "initial_backfill", "今日首次回算中，尚无已确认的完整分钟"
 		if status.LastFailureAt > status.LastSuccessAt {
 			status.State, status.Note = "source_unavailable", "来源采集失败，尚无今日连续数据可展示"
@@ -479,11 +575,12 @@ func (m *Monitor) backfillCustomerHealthPolicyToday(ctx context.Context) {
 			}
 			continue
 		}
-		err := m.backfillCustomerHealthPolicyTodayWith(ctx, time.Now(), m.sampleCustomerHealthRangeLow)
+		started := time.Now()
+		err := m.backfillCustomerHealthPolicyTodayWith(ctx, started, m.sampleCustomerHealthRangeLow)
 		if errors.Is(err, context.Canceled) || ctx.Err() != nil {
 			return
 		}
-		wait := m.customerHealthSourcePollEvery()
+		wait := sourceCadenceDelay(started, time.Now(), m.customerHealthSourcePollEvery())
 		if err != nil {
 			// 查询失败时保留现有连续水位，并使用较慢的重试节奏；成功
 			// 追平后只需按正常采样周期重读最近窗口接住迟到日志。
@@ -516,15 +613,15 @@ func (m *Monitor) backfillCustomerHealthPolicyTodayWith(ctx context.Context, now
 	}
 	m.resetCustomerHealthSourceWatermark(dayStart, coveredThrough)
 	for cursor < target {
-		to := customerHealthSourceNext(cursor, target)
-		if _, err := sample(ctx, cursor, to); err != nil {
+		_, to, err := m.sampleCustomerHealthSourcePrefix(ctx, cursor, target, sample)
+		if err != nil {
+			return err
+		}
+		if err := m.saveCustomerHealthSourceReadCursor(dayStart, to, target); err != nil {
 			return err
 		}
 		if to > coveredThrough {
 			coveredThrough = to
-			if err := m.saveCustomerHealthSourceCursor(dayStart, coveredThrough); err != nil {
-				return err
-			}
 			m.publishCustomerHealthSourceThrough(dayStart, coveredThrough)
 		}
 		cursor = to
@@ -540,46 +637,50 @@ func (m *Monitor) startCustomerHealthSource(ctx context.Context) {
 	if !m.cfg.CustomerHealthSourceEnabled || m.prodDB == nil {
 		return
 	}
+	m.runCustomerHealthSource(ctx, time.Now, m.sampleCustomerHealthRangeLow, waitSourceLifecycle)
+}
+
+func (m *Monitor) runCustomerHealthSource(ctx context.Context, now func() time.Time,
+	sample func(context.Context, int64, int64) (int, error), wait func(context.Context, time.Duration) bool) {
 	m.customerHealthSourceRunning.Store(true)
 	defer m.customerHealthSourceRunning.Store(false)
 
-	dayStart, target := customerHealthSourceRange(time.Now())
-	if err := m.finishPreviousCustomerHealthDay(ctx, dayStart); err != nil {
-		if errors.Is(err, context.Canceled) || ctx.Err() != nil {
+	var dayStart, target, cursor, coveredThrough int64
+	for {
+		if ctx.Err() != nil {
 			return
 		}
-		m.customerHealthSourceLastFailure.Store(time.Now().Unix())
-		slog.Warn("启动时封口上一自然日客户维护采集失败", "day_start", dayStart, "err", err)
-		return
-	}
-	cursor, coveredThrough, err := m.loadCustomerHealthSourceCursor(dayStart, target)
-	if err != nil {
-		m.customerHealthSourceLastFailure.Store(time.Now().Unix())
-		slog.Error("初始化客户维护独立采集水位失败", "err", err)
-		return
+		dayStart, target = customerHealthSourceRange(now())
+		var err error
+		cursor, coveredThrough, err = m.loadCustomerHealthSourceCursor(dayStart, target)
+		if err == nil {
+			break
+		}
+		if ctx.Err() != nil {
+			return
+		}
+		m.customerHealthSourceLastFailure.Store(now().Unix())
+		slog.Warn("客户维护采集初始化未完成(保留跨日水位重试)", "day_start", dayStart, "err", err)
+		if !wait(ctx, 15*time.Second) {
+			return
+		}
 	}
 	m.resetCustomerHealthSourceWatermark(dayStart, coveredThrough)
 	m.customerHealthSourceTarget.Store(target)
+	cycleStarted := now()
+	foregroundTurns := 0
 
 	for {
 		if err := ctx.Err(); err != nil {
 			return
 		}
-		iterationNow := time.Now()
+		iterationNow := now()
 		currentDay, currentTarget := customerHealthSourceRange(iterationNow)
-		// The current-day target is clamped to today's midnight during the
-		// first two minutes. Use the raw finalized target while closing the
-		// previous day, or its unfinalized tail would be signed prematurely.
-		transitionTarget := currentTarget
-		if currentDay != dayStart {
-			transitionTarget = customerHealthSourceFinalizedThrough(iterationNow)
-		}
-		switchDay, previousDayTarget := customerHealthSourceDayTransition(dayStart, currentDay, transitionTarget, cursor)
-		if switchDay {
+		if currentDay > dayStart {
 			if err := m.saveCustomerHealthSourceCursor(currentDay, currentDay); err != nil {
-				m.customerHealthSourceLastFailure.Store(time.Now().Unix())
+				m.customerHealthSourceLastFailure.Store(now().Unix())
 				slog.Warn("切换客户维护独立采集自然日失败", "day_start", currentDay, "err", err)
-				if !waitSourceLifecycle(ctx, 15*time.Second) {
+				if !wait(ctx, 15*time.Second) {
 					return
 				}
 				continue
@@ -588,45 +689,65 @@ func (m *Monitor) startCustomerHealthSource(ctx context.Context) {
 			cursor, coveredThrough = dayStart, dayStart
 			m.resetCustomerHealthSourceWatermark(dayStart, dayStart)
 			m.customerHealthSourceTarget.Store(target)
+			foregroundTurns = 0
 		} else if currentDay != dayStart {
-			// Do not discard the old-day cursor at midnight.  The normal two-minute
-			// finalization delay means the last minutes of the previous day become
-			// queryable only after midnight.  Keep collecting that day until its
-			// natural end, then start the new day on the next loop.  Otherwise a
-			// restart or a slow poll at 00:00 would leave a permanent tail gap.
-			// Keep the old day active.  The helper clamps the target to its end
-			// so the source never reads a new-day minute into the old cursor.
-			target = previousDayTarget
+			// A clock rollback cannot replace the durable cursor with an older day.
+			if !wait(ctx, m.customerHealthSourcePollEvery()) {
+				return
+			}
+			continue
 		} else {
 			target = currentTarget
 		}
 		m.customerHealthSourceTarget.Store(target)
+		if cursor >= target && iterationNow.Sub(cycleStarted) >= m.customerHealthSourcePollEvery() {
+			// A long historical backlog must not suppress the current-day late
+			// arrival replay for days. Resume an in-flight prefix before starting
+			// another replay, so a slow source still makes forward progress.
+			cycleStarted = iterationNow
+			cursor = max(dayStart, coveredThrough-customerHealthSourceReplaySeconds)
+			if cursor < target {
+				continue
+			}
+		}
+
+		// Historical gaps retain independent durable proofs. Reserve one turn
+		// in four while today's prefix catches up, so neither day can starve
+		// the other during an outage, a restart, or a large previous-day gap.
+		if foregroundTurns >= 3 && cursor < target {
+			foregroundTurns = 0
+			if _, err := m.runCustomerHealthHistoryTurnWith(ctx, iterationNow, sample); err != nil && ctx.Err() == nil {
+				slog.Warn("客户维护历史日回放失败(保留水位重试)", "err", err)
+			}
+			continue
+		}
 
 		if cursor >= target {
-			m.customerHealthSourceLastSuccess.Store(time.Now().Unix())
+			m.customerHealthSourceLastSuccess.Store(now().Unix())
 			// Today's closed minutes always have priority.  Once caught up,
 			// process at most one historical hour, then recheck the moving today
 			// target before taking another historical slice.
-			worked, historyErr := m.runCustomerHealthHistoryTurnWith(ctx, time.Now(), m.sampleCustomerHealthRangeLow)
+			worked, historyErr := m.runCustomerHealthHistoryTurnWith(ctx, now(), sample)
 			if historyErr != nil {
-				if errors.Is(historyErr, context.Canceled) || ctx.Err() != nil {
+				if ctx.Err() != nil {
 					return
 				}
 				slog.Warn("客户维护历史日回放失败(保留水位重试)", "err", historyErr)
-				if !waitSourceLifecycle(ctx, 15*time.Second) {
+				if !wait(ctx, 15*time.Second) {
 					return
 				}
 				continue
 			}
 			if worked {
-				if !waitSourceLifecycle(ctx, 2*time.Second) {
+				if !wait(ctx, 2*time.Second) {
 					return
 				}
 				continue
 			}
-			if !waitSourceLifecycle(ctx, m.customerHealthSourcePollEvery()) {
+			if !wait(ctx, sourceCadenceDelay(cycleStarted, now(), m.customerHealthSourcePollEvery())) {
 				return
 			}
+			cycleStarted = now()
 			// 重放最近窗口以接住迟到日志；覆盖水位不会因此倒退。
 			cursor = coveredThrough - customerHealthSourceReplaySeconds
 			if cursor < dayStart {
@@ -636,38 +757,38 @@ func (m *Monitor) startCustomerHealthSource(ctx context.Context) {
 		}
 
 		sliceFrom := cursor
-		to := customerHealthSourceNext(sliceFrom, target)
-		rows, err := m.sampleCustomerHealthRangeLow(ctx, sliceFrom, to)
+		foregroundTurns++
+		rows, to, err := m.sampleCustomerHealthSourcePrefix(ctx, sliceFrom, target, sample)
 		if err != nil {
-			if errors.Is(err, context.Canceled) || errors.Is(err, errSourceNotReady) {
+			if ctx.Err() != nil {
 				return
 			}
-			m.customerHealthSourceLastFailure.Store(time.Now().Unix())
+			m.customerHealthSourceLastFailure.Store(now().Unix())
 			slog.Warn("客户维护独立只读采集失败(保留水位重试)",
 				"from", sliceFrom, "to", to, "err", err)
-			if !waitSourceLifecycle(ctx, 15*time.Second) {
+			if !wait(ctx, 15*time.Second) {
 				return
 			}
 			continue
 		}
 
-		if to > coveredThrough {
-			// 水位必须在事实已落库之后持久化。若这里失败，保留旧水位并重读该片；
-			// upsert 使重复读取不会重复累计。
-			if err := m.saveCustomerHealthSourceCursor(dayStart, to); err != nil {
-				m.customerHealthSourceLastFailure.Store(time.Now().Unix())
-				slog.Warn("客户维护独立采集水位持久化失败(保留旧水位重试)",
-					"from", sliceFrom, "to", to, "err", err)
-				if !waitSourceLifecycle(ctx, 15*time.Second) {
-					return
-				}
-				continue
+		// Commit read progress even inside the already covered replay tail.
+		// Both proofs and the retry checkpoint share one local transaction.
+		if err := m.saveCustomerHealthSourceReadCursor(dayStart, to, target); err != nil {
+			m.customerHealthSourceLastFailure.Store(now().Unix())
+			slog.Warn("客户维护独立采集水位持久化失败(保留旧水位重试)",
+				"from", sliceFrom, "to", to, "err", err)
+			if !wait(ctx, 15*time.Second) {
+				return
 			}
+			continue
+		}
+		if to > coveredThrough {
 			coveredThrough = to
 			m.publishCustomerHealthSourceThrough(dayStart, coveredThrough)
 		}
 		cursor = to
-		m.customerHealthSourceLastSuccess.Store(time.Now().Unix())
+		m.customerHealthSourceLastSuccess.Store(now().Unix())
 		slog.Info("客户维护独立只读采集完成分片", "from", sliceFrom, "to", to, "rows", rows)
 	}
 }

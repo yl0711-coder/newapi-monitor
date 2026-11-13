@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -732,7 +733,7 @@ func TestSourcePreflightRequiresUserRegistrationTime(t *testing.T) {
 
 func TestSourcePreflightLogChainOnlyUsesGrantedTables(t *testing.T) {
 	queries := sourcePreflightQueriesForSettings(Settings{LogChainOnlySource: true})
-	if len(queries) != 2 || !strings.Contains(queries[0], "FROM logs") || !strings.Contains(queries[1], "FROM channels") {
+	if len(queries) != 1 || !strings.Contains(queries[0], "FROM logs") || !strings.Contains(queries[0], "FROM channels") {
 		t.Fatalf("logchain-only preflight=%v, want logs/channels only", queries)
 	}
 	for _, query := range queries {
@@ -763,6 +764,85 @@ func TestSourcePreflightLogChainOnlyUsesGrantedTables(t *testing.T) {
 	}
 	if cfg.sourceLeaseIsRequired() {
 		t.Fatal("logchain-only channel refresh must not claim the full source-worker lease")
+	}
+}
+
+func TestSourcePreflightCombinedQueryChecksBothSchemasAndRecovers(t *testing.T) {
+	db, err := sql.Open("sqlite", filepath.Join(t.TempDir(), "preflight.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	for _, query := range sourcePreflightQueries[:2] {
+		selection, rest, _ := strings.Cut(strings.TrimPrefix(query, "SELECT "), " FROM ")
+		table, _, _ := strings.Cut(rest, " ")
+		columns := strings.Split(selection, ",")
+		for i := range columns {
+			columns[i] += " TEXT"
+		}
+		if _, err := db.Exec("CREATE TABLE " + table + " (" + strings.Join(columns, ",") + ")"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	m := &Monitor{prodDB: db, cfg: Settings{LogChainOnlySource: true}}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := m.probeSource(ctx); err != nil {
+		t.Fatal("valid minimal source was rejected", err)
+	}
+	for _, missing := range []struct{ table, column string }{{"logs", "other"}, {"channels", "base_url"}} {
+		if _, err := db.Exec("ALTER TABLE " + missing.table + " RENAME COLUMN " + missing.column + " TO hidden_column"); err != nil {
+			t.Fatal(err)
+		}
+		if err := m.probeSource(ctx); err == nil {
+			t.Fatal("zero-row optimization bypassed required column validation", missing)
+		}
+		if _, err := db.Exec("ALTER TABLE " + missing.table + " RENAME COLUMN hidden_column TO " + missing.column); err != nil {
+			t.Fatal(err)
+		}
+		if err := m.probeSource(ctx); err != nil {
+			t.Fatal("restored schema did not recover", err)
+		}
+	}
+}
+
+func TestSourcePreflightRealReadonlyTunnel(t *testing.T) {
+	dsn := os.Getenv("MONITOR_SOURCE_RECOVERY_AUDIT_DSN")
+	if dsn == "" {
+		t.Skip("explicit bounded read-only tunnel verification is not configured")
+	}
+	cfg, err := mysql.ParseDSN(dsn)
+	if err != nil || cfg.Net != "tcp" || cfg.Addr != "host.docker.internal:13306" || cfg.DBName != "nexusapi" || cfg.User != "nexus_ro" {
+		t.Fatal("read-only source identity rejected")
+	}
+	db, err := sql.Open("mysql", dsn)
+	if err != nil {
+		t.Fatal("could not open read-only source")
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+	m := &Monitor{prodDB: db, cfg: Settings{LogChainOnlySource: true}}
+	// Real production code and budget, but only zero-row schema validation
+	// and three Pings. No table scan, monitor worker or runtime mutation.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	began := time.Now()
+	err = m.probeSource(ctx)
+	cancel()
+	t.Logf("combined_preflight_ms=%d success=%t", time.Since(began).Milliseconds(), err == nil)
+	if err != nil {
+		t.Fatal("bounded source preflight failed")
+	}
+	for i := 0; i < 3; i++ {
+		time.Sleep(10 * time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		began := time.Now()
+		err := m.pingSource(ctx)
+		cancel()
+		t.Logf("ping=%d elapsed_ms=%d success=%t", i, time.Since(began).Milliseconds(), err == nil)
+		if err != nil {
+			t.Fatal("source connection did not remain readable")
+		}
 	}
 }
 

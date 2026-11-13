@@ -51,7 +51,11 @@ test('CI runs native scale as a required gate and enumerates race-built tests fo
   assert.match(normal, /node dev\/check-monthly-test-coverage\.mjs --results/);
   assert.doesNotMatch(normal, /continue-on-error/);
   const race = ci.split('\n  race-monthly:\n')[1]?.split(/^  [\w-]+:/m)[0] ?? '';
-  assert.match(race, /go test -race -list \. \.\/internal\/monthlydraft \| node dev\/monthly-race-shard\.mjs/);
+  // Race processes are planned from the race-built binary's own inventory.
+  assert.match(race, /dev\/run-race-job\.sh monthly "\$\{\{ matrix\.job \}\}"/);
+  const runner = readFileSync(new URL('../run-race-job.sh', import.meta.url), 'utf8');
+  assert.match(runner, /go test -race -c -o "\$bin"/);
+  assert.match(runner, /"\$bin" -test\.list \./);
   const file = readFileSync(new URL('../../internal/monthlydraft/partitioned_captured_large_test.go', import.meta.url), 'utf8');
   assert.match(file, /^\/\/go:build !race/);
   assert.match(file, /testPartitionedCapturedGenerationScale\(t, 200\)/);

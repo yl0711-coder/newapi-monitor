@@ -1,0 +1,26 @@
+.token-anomaly{color:var(--text,#dbe4f0);max-width:100%;min-width:0}.token-anomaly h2,.token-anomaly h3{margin:0 0 10px}.ta-note{color:var(--muted,#a4aec3);line-height:1.6}.ta-toolbar,.ta-actions,.ta-export{display:flex;gap:10px;flex-wrap:wrap;align-items:end;margin:14px 0}.ta-toolbar label,.ta-export label{display:flex;flex-direction:column;gap:5px;font-size:13px}.token-anomaly input,.token-anomaly select,.token-anomaly button{font:inherit;border:1px solid var(--border,#35415a);background:var(--card,#19202d);color:var(--text,#e5eaf5);border-radius:7px;padding:8px 10px;min-height:38px;max-width:100%}.token-anomaly input[type=checkbox]{min-height:auto}.token-anomaly button{cursor:pointer}.token-anomaly button:disabled{opacity:.5;cursor:not-allowed}.token-anomaly :focus-visible{outline:2px solid var(--accent,#818cf8);outline-offset:3px}.ta-date{display:flex;gap:4px;align-items:center}.ta-date input{min-width:210px;color-scheme:dark}.ta-health,.ta-cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:10px;margin:14px 0}.ta-health>section,.ta-cards>button,.ta-panel{border:1px solid var(--border,#35415a);border-radius:9px;padding:14px;background:var(--card,#19202d)}.ta-health p{margin:6px 0;font-size:13px;overflow-wrap:anywhere}.ta-cards>button{text-align:left}.ta-cards b{display:block;font-size:25px;margin-top:6px}.ta-warning{padding:12px;border:1px solid #b58a37;background:rgba(181,138,55,.1);border-radius:8px;line-height:1.6}.ta-error{color:var(--red,#fca5a5);padding:10px}.ta-table{overflow-x:auto;max-width:100%;margin:12px 0}.ta-table table{width:100%;border-collapse:collapse;min-width:650px}.ta-table th,.ta-table td{padding:9px 10px;text-align:left;border-bottom:1px solid var(--border,#35415a);vertical-align:top;overflow-wrap:anywhere}.ta-table th{white-space:nowrap;font-size:13px}.ta-table td{font-size:13px;max-width:360px}.ta-tag{display:inline-block;padding:3px 7px;margin:2px;border-radius:5px;border:1px solid var(--border,#53617e);font-size:12px}.ta-panel{margin:14px 0}.ta-panel summary{cursor:pointer;padding:5px}.ta-export label.ta-inline{flex-direction:row;align-items:center}.ta-dialog{width:min(1040px,94vw);max-height:90vh;box-sizing:border-box;overflow:auto;background:var(--card,#19202d);color:var(--text,#e5eaf5);border:1px solid var(--border,#53617e);border-radius:12px;padding:20px}.ta-dialog::backdrop{background:rgba(0,0,0,.6)}.ta-dialog header{display:flex;justify-content:space-between;align-items:center;gap:10px;position:sticky;top:-20px;background:var(--card,#19202d);padding:10px 0;z-index:2}.ta-dialog pre{white-space:pre-wrap;overflow-wrap:anywhere;max-height:350px;overflow:auto;font-size:12px}.ta-dialog dl{display:grid;grid-template-columns:minmax(100px,180px) 1fr;gap:8px}.ta-dialog dd{margin:0;overflow-wrap:anywhere}.ta-filters-note{overflow-wrap:anywhere;font-size:13px}
+html[data-theme=light] .ta-date input,body.light .ta-date input{color-scheme:light}
+@media(max-width:600px){.ta-toolbar label,.ta-toolbar .ta-date{width:100%}.ta-date input{min-width:0;flex:1}.ta-toolbar input,.ta-toolbar select{width:100%;box-sizing:border-box}.ta-date button{flex:0 0 auto}.ta-health,.ta-cards{grid-template-columns:1fr}.ta-dialog{padding:12px;width:96vw;max-height:92vh}.ta-dialog header{top:-12px}.ta-dialog dl{grid-template-columns:1fr}.ta-export{align-items:stretch;flex-direction:column}}
+
+.ta-time-dialog{width:min(390px,96vw)}.ta-dialog header{flex-wrap:wrap}.ta-time-dialog .ta-toolbar label{width:auto}.ta-time-dialog .ta-toolbar select{min-width:90px}
+
+/* 折叠区密度向模型统计靠：收起时只占一行标题，展开才铺开内容。
+   details 自身已有 .ta-panel 的边框和背景，收起时去掉多余内边距即可。 */
+details.ta-panel{padding:0}
+details.ta-panel>summary{padding:11px 14px;font-weight:600;font-size:14px;list-style-position:inside}
+details.ta-panel[open]>summary{border-bottom:1px solid var(--border,#35415a)}
+details.ta-panel>:not(summary){margin-left:14px;margin-right:14px}
+details.ta-panel>:last-child{margin-bottom:12px}
+/* 「更多筛选」挂在筛选表单内,须自己换行占满,否则会挤进输入框那一行。 */
+.ta-more-filters{flex:1 1 100%;margin:0;border:1px dashed var(--border,#35415a);border-radius:8px;padding:0}
+.ta-more-filters>summary{padding:8px 11px;font-size:13px;cursor:pointer;color:var(--muted,#a4aec3)}
+.ta-more-filters .ta-toolbar{margin:0 11px 11px}
+
+.token-anomaly{overflow-wrap:anywhere}.ta-dialog h3{min-width:0}.ta-dialog header button{flex-shrink:0}
+.ta-table button{white-space:nowrap;min-width:80px}
+.token-anomaly .ta-select-column{display:none}
+.token-anomaly:has(#taMore[open]) .ta-select-column{display:table-cell}
+.token-anomaly .ta-more-filters{border:0;flex-basis:auto}
+.token-anomaly .ta-more-filters[open]{flex-basis:100%}
+.token-anomaly #taUpdated{font-size:12px;margin:8px 0}
+.token-anomaly #taCoverage[hidden]{display:none}

@@ -294,6 +294,14 @@ func TestRetentionBoundedFailureDoesNotInitializeOrReturnPartialResult(t *testin
 }
 
 func TestRetentionFullReceiverPayloadPerformance(t *testing.T) {
+	if raceDetector {
+		// The 5-second production bound is sized for native speed; hashing the
+		// maximum record set under the race detector takes longer even on an
+		// idle CI runner. Widen only this test's bound, never the production value.
+		inspect := retentionInspectionTimeout
+		retentionInspectionTimeout = 6 * inspect
+		t.Cleanup(func() { retentionInspectionTimeout = inspect })
+	}
 	f := generationFixtureNew(t)
 	ctx := context.Background()
 	// Exercise the full RECORD bound with large payloads, leaving CI headroom

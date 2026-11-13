@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -60,6 +61,32 @@ func completeEmptyCloudWatchNginxEvidence(t *testing.T, m *Monitor, now time.Tim
 		t.Fatal(err)
 	}
 	return state
+}
+
+func TestCloudWatchNginxEvidenceCatchupRetainsSuccessfulSmallWindow(t *testing.T) {
+	m, now := newCloudWatchNginxRecoveryTestMonitor(t)
+	state, err := m.loadCloudWatchNginxCursor(now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	from, target := cloudWatchNginxEvidenceRange(now, m.cfg.NginxEvidenceRetentionHours)
+	state.ThroughTs = target
+	state.EvidenceReadWindowSeconds = 60
+	for attempt := 0; attempt < 5; attempt++ {
+		left, right, ok := cloudWatchNginxEvidenceWindow(state, target)
+		if !ok || left != from+int64(attempt)*60 || right-left != 60 {
+			t.Fatalf("evidence retry enlarged its read before backlog recovered: %d..%d state=%+v", left, right, state)
+		}
+		if err := m.persistCloudWatchNginxRequestEvidence(context.Background(), nil, left, right, fmt.Sprintf("small-window-%d", attempt)); err != nil {
+			t.Fatal(err)
+		}
+		if err := m.publishCloudWatchNginxEvidenceCursor(context.Background(), &state, left, right, target); err != nil {
+			t.Fatal(err)
+		}
+		if err := m.storeDB.First(&state, "id=?", cloudWatchNginxCursorID).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
 }
 
 func TestCloudWatchNginxEvidenceRestoredMainWithEmptyVolumeReplaysRetention(t *testing.T) {
@@ -191,7 +218,11 @@ func TestCloudWatchNginxEvidenceOlderSnapshotAndInterruptedReplaceAreIncomplete(
 			if err != nil {
 				t.Fatal(err)
 			}
-			if got.EvidenceThroughTs != state.EvidenceCoverageFromTs || got.EvidenceStatus != "recovering" {
+			wantThrough := state.EvidenceCoverageFromTs
+			if test == "interrupted_replace" {
+				wantThrough = from // The same store still proves the preceding prefix.
+			}
+			if got.EvidenceThroughTs != wantThrough || got.EvidenceStatus != "recovering" {
 				t.Fatalf("incomplete evidence DB not scheduled for recovery: %+v", got)
 			}
 		})

@@ -17,7 +17,7 @@
 .ms-note{padding:10px 13px;color:var(--text-muted);font-size:12px;line-height:1.5;border:1px solid var(--border);border-radius:7px;background:rgba(148,163,184,.035);margin-bottom:16px}
 .ms-note.incomplete{color:#f6c453;border-color:rgba(245,158,11,.45);background:rgba(245,158,11,.08)}
 .ms-model-table-wrap{border:1px solid var(--border);border-radius:8px;background:var(--card);overflow-x:auto}
-.ms-model-table-wrap>table{width:100%;border-collapse:collapse;min-width:1240px}
+.ms-model-table-wrap>table{width:100%;border-collapse:collapse;min-width:660px}
 .ms-model-table-wrap th,.ms-model-table-wrap td{padding:11px 14px;text-align:right;border-bottom:1px solid rgba(148,163,184,.12);font-size:12px}
 .ms-model-table-wrap th:first-child,.ms-model-table-wrap td:first-child{text-align:left}
 .ms-model-table-wrap>table>thead th{color:var(--text-muted);font-weight:500;background:rgba(148,163,184,.035)}
@@ -33,7 +33,7 @@
 .ms-detail-row>td{padding:0!important;background:rgba(15,23,42,.25)!important}
 .ms-detail{margin:0 16px 13px 42px;border-left:2px solid var(--accent);padding:9px 0 0 13px}
 .ms-detail-title{font-size:12px;color:var(--text-muted);margin-bottom:6px}
-.ms-detail table{width:100%;border-collapse:collapse;min-width:900px}
+.ms-detail table{width:100%;border-collapse:collapse;min-width:540px}
 .ms-detail th,.ms-detail td{padding:8px 11px;text-align:right;border-bottom:1px solid rgba(148,163,184,.1);font-size:11px}
 .ms-detail th:first-child,.ms-detail td:first-child{text-align:left}
 .ms-detail th{color:var(--text-muted);font-weight:500}
@@ -54,3 +54,44 @@
 .ms-empty{padding:35px 16px;text-align:center;color:var(--text-muted);border:1px dashed var(--border);border-radius:8px}
 @media(max-width:850px){.ms-summary{grid-template-columns:repeat(2,minmax(0,1fr))}.ms-range{margin-left:0}.ms-status{margin-left:0}}
 @media(max-width:520px){.ms-summary{grid-template-columns:1fr}.ms-toolbar{align-items:flex-start;flex-direction:column}.ms-range{width:100%}.ms-range button{flex:1}.ms-detail{margin-left:14px}}
+
+.ms-channel-table th:nth-child(2),.ms-channel-table td:nth-child(2){text-align:right}
+
+/* Date selection is scoped to the two local model reports.
+   密度照客户排障的 .lc-daybar：单行、无外框、日期输入高亮浅底，
+   这样进页面第一屏就是标题和数据，不再被三行表单推下去。 */
+.model-date-controls{display:flex;align-items:center;flex-wrap:wrap;gap:6px;margin:8px 0 10px;color:var(--text,#e7eaf1)}
+.md-presets{display:contents}
+.model-date-controls button,.model-date-dialog button,#msRefresh{min-height:32px;padding:6px 11px;border:1px solid var(--border,#465068);border-radius:7px;background:var(--surface,#181c24);color:var(--text,#e7eaf1);font-size:13px;cursor:pointer}
+.model-date-controls button:hover:not(:disabled){border-color:var(--accent,#6ba6ff)}
+.model-date-controls button.active{border-color:var(--accent,#6ba6ff);background:#233c63}
+.model-date-controls button:disabled{opacity:.4;cursor:not-allowed}
+.model-date-controls button:focus-visible,.model-date-controls input:focus-visible,.model-date-dialog button:focus-visible{outline:2px solid #78b5ff;outline-offset:2px}
+/* 方向键按钮压成方形图标,替代原来的「前一天 / 后一天」两个宽按钮。 */
+.model-date-controls button.md-step{min-width:32px;padding:6px 9px;font-size:15px;line-height:1}
+.md-fields{display:contents}
+.md-fields label{display:inline-flex;align-items:center;gap:5px;font-size:12px;color:var(--text-muted,#aab6c9);min-width:0}
+.md-input-row{display:inline-flex;align-items:center;gap:4px;min-width:0}
+.md-input-row input{width:120px;min-width:0;padding:5px 8px;border:2px solid #60a5fa;border-radius:7px;background:#f8fafc;color:#0f172a;font-weight:700;font-size:13px;font-variant-numeric:tabular-nums;color-scheme:light}
+.md-input-row input:focus{outline:2px solid #93c5fd;outline-offset:2px;border-color:#2563eb}
+.md-input-row button{flex:none;min-height:28px;padding:4px 8px;font-size:12px}
+.model-date-controls p{flex:1 1 100%;margin:0;font-size:12px;line-height:1.5;color:var(--text-muted,#aab6c9)}
+.model-date-controls .md-error{color:#ffb4aa}
+.model-date-dialog{box-sizing:border-box;width:min(390px,calc(100% - 20px));max-height:calc(100dvh - 24px);overflow:auto;padding:16px;border:1px solid var(--border,#465068);border-radius:12px;background:var(--surface,#181c24);color:var(--text,#e7eaf1)}
+.model-date-dialog::backdrop{background:rgba(0,0,0,.65)}
+.model-date-dialog h3{margin:0 0 10px;font-size:17px}
+.model-date-dialog .flatpickr-calendar{box-shadow:none;background:transparent;width:100%;max-width:100%}
+.model-date-dialog .flatpickr-innerContainer,.model-date-dialog .flatpickr-rContainer,.model-date-dialog .flatpickr-days,.model-date-dialog .dayContainer{width:100%;min-width:0;max-width:100%}
+.model-date-dialog .flatpickr-day{max-width:none;flex-basis:14.2857%;color:var(--text,#e7eaf1)}
+.model-date-dialog .flatpickr-day.prevMonthDay,.model-date-dialog .flatpickr-day.nextMonthDay{color:#94a3b8}
+.model-date-dialog .flatpickr-day.flatpickr-disabled{color:#687286}
+.model-date-dialog .flatpickr-day:hover,.model-date-dialog .flatpickr-day:focus{background:#344158;border-color:#78b5ff}
+.model-date-dialog .flatpickr-day.selected{background:#2867b8;border-color:#78b5ff;color:white}
+.model-date-dialog .flatpickr-current-month,.model-date-dialog .flatpickr-weekday,.model-date-dialog .flatpickr-month{color:var(--text,#e7eaf1)}
+.model-date-dialog .flatpickr-monthDropdown-months,.model-date-dialog .numInput{background:var(--surface,#181c24);color:var(--text,#e7eaf1)}
+.model-date-dialog .flatpickr-prev-month svg,.model-date-dialog .flatpickr-next-month svg{fill:var(--text,#e7eaf1)}
+/* 窄屏仍保持紧凑：允许换行,不回到纵向大块表单。日期输入与其按钮成对不拆行。 */
+@media(max-width:600px){.model-date-controls{gap:5px}.md-fields label{flex:1 1 100%}.md-input-row{flex:1 1 auto}.md-input-row input{width:auto;flex:1 1 auto}.model-date-dialog{padding:10px}}
+
+#modelDateCalendarInput{display:none!important}
+.model-date-dialog{position:fixed;inset:0;margin:auto}

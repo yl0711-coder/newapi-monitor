@@ -54,6 +54,9 @@ func TestCustomerHealthWatermarkUsableAcrossMinuteRefreshAndRecovery(t *testing.
 				if report.Collection.Ready != (offset == 0) || !strings.Contains(row.MetricsNote, "尾部同步中") {
 					t.Fatalf("caught-up and available were conflated: %+v", report.Collection)
 				}
+				if report.Collection.LagSeconds == nil || *report.Collection.LagSeconds != int64(offset/time.Second) {
+					t.Fatalf("valid watermark lag: %+v", report.Collection)
+				}
 			}
 			if err := m.saveCustomerHealthSourceCursor(from, through+120); err != nil {
 				t.Fatal(err)
@@ -99,7 +102,8 @@ func TestCustomerHealthWatermarkUnusableReasons(t *testing.T) {
 				t.Fatal(err)
 			}
 			if report.Collection.State != tc.want || report.Collection.MetricsAvailable || report.Collection.Ready || report.Collection.CoverageComplete ||
-				report.Rows[0].MetricsReady || report.Rows[0].StabilityPct != nil || report.ToTs != from {
+				report.Rows[0].MetricsReady || report.Rows[0].StabilityPct != nil || report.ToTs != from ||
+				report.Collection.ThroughTs != 0 || report.Collection.LagSeconds != nil {
 				t.Fatalf("missing proof must not be interpreted as zero or usable data: %+v", report)
 			}
 		})

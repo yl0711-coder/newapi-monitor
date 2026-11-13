@@ -25,6 +25,9 @@ func (m *Monitor) serveCustomerHealthReport(c *gin.Context) {
 	}
 	report, err := m.buildCustomerHealthReport(c.Request.Context(), time.Now())
 	if err != nil {
+		if abortCanceledUsageRequest(c, err) {
+			return
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "客户维护取数失败：" + err.Error()})
 		return
 	}

@@ -52,7 +52,7 @@ function billSyncNote(domain){
   else if(account.usage_worker_enabled===false)label='消费同步已暂停';
   if(!label){
     if(!usage.available)label='暂无区间消费账单';
-    else if(usage.provisional)label=account.provider==='openox'?'上游估算待结算':'消费待日账单核对';
+    else if(usage.provisional)label=account.provider==='openox'?'上游估算待结算':account.provider==='volcengine'?'火山账单待结算':'消费待日账单核对';
     else if(usage.complete!==true)label='区间消费尚未同步完整';
     else if(account.usage_fresh===false)label='消费同步延迟';
     else if(account.usage_fresh!==true)label='消费同步时效待确认';
@@ -109,7 +109,7 @@ function issues(report){
   }
   for(const domain of report?.domains||[]){
     const account=domain.upstream||{},usage=billView(domain).usage,reasons=[];
-    if(!account.configured){
+    if(!account.configured||account.sync_paused){
       continue;
     }
     if(domain.missing_rate_channels>0)reasons.push(`${domain.missing_rate_channels} 个启用渠道缺少倍率配置，不能据此核验渠道成本`);
@@ -123,7 +123,7 @@ function issues(report){
         if(integrity!=='complete')reasons.push(integrityReasons[integrity]||'账单校验未通过，金额未计入汇总');
         else{
           if(!known(usage.cost_usd))reasons.push('消费金额未返回，未计入消费汇总');
-          if(usage.provisional)reasons.push(account.provider==='openox'?'OpenOx 含上游估算记录，金额暂定；不会根据单价重建扣款':'春秋当前日小时金额来自已采集明细，尚待跨日后与日账单总数核对；迟到或修正记录可能更新金额');
+          if(usage.provisional)reasons.push(account.provider==='openox'?'OpenOx 含上游估算记录，金额暂定；不会根据单价重建扣款':account.provider==='volcengine'?'火山引擎最近一天的账单仍在出账，金额会随复核更新；结束 24 小时后定稿':'春秋当前日小时金额来自已采集明细，尚待跨日后与日账单总数核对；迟到或修正记录可能更新金额');
           if(!usage.complete&&(!usage.provisional||usage.completed_hours<usage.expected_hours))reasons.push(`账单已覆盖 ${usage.completed_hours||0}/${usage.expected_hours||0} 小时，汇总仅含已校验金额`);
           if(!usage.adjusted_cost_available)reasons.push(usage.adjusted_cost_status==='subscription_cost_unallocated'?'OpenOx 用量含订阅抵扣，未完成现金成本分摊，不计入修正成本':usage.adjusted_cost_status==='bucket_boundary_ambiguous'?'充值比例在账单桶中途变化，修正消费无法精确拆分':'缺少对应时段充值比例证据，未计入修正消费汇总');
           else if(!known(usage.adjusted_cost_usd))reasons.push('修正消费金额未返回，未计入修正消费汇总');
@@ -149,10 +149,12 @@ function render(report){
   if(report?.enabled===false)return '<p class="muted">渠道用量未启用，无法核验区间覆盖。</p>';
   const rows=issues(report),meta=report?.meta||{};
   const unconfigured=(report?.domains||[]).filter(d=>!d.upstream?.configured&&d.enabled_channels>0);
+  const paused=(report?.domains||[]).filter(d=>d.upstream?.configured&&d.upstream?.sync_paused);
+  const pausedNote=paused.length?`<p class="muted">${paused.length} 个上游已标记停止使用、没有启用渠道且 48 小时内无调用，已暂停自动同步余额和日志，不作为同步故障：${esc(paused.map(d=>d.domain).join('、'))}。</p>`:'';
   const configurationNote=unconfigured.length?`<p class="muted">${unconfigured.length} 个上游未配置，暂不采集，不作为同步故障；有消费而成本未知的部分不能按零成本核算。</p>`:'';
   const dailyNotes=(report?.domains||[]).filter(domain=>billView(domain).daily).map(domain=>`<p class="muted">${esc(domain.domain)}：${esc(billRangeNote(billView(domain).daily))}。上游按自然日出账，渠道卡片单独展示，不计入精确区间汇总。</p>`).join('');
   return `<p class="muted">渠道管理当前日期范围（全部账户）：${esc(time(meta.from_ts))} → ${esc(time(meta.to_ts))}（结束时间不含）。仅检查本地数据，不触发补数。</p>`+
-    (rows.length?`<div class="sync-status bad">${rows.length} 项数据异常 / 待核验</div><div class="sync-upstream-list">${rows.map(row=>`<article class="sync-upstream-account"><b class="sync-upstream-error">${esc(row.scope)}</b><p class="sync-upstream-error">${esc(row.detail)}</p></article>`).join('')}</div>`:'<span class="sync-status ok">用量覆盖与可用账单校验通过</span>')+configurationNote+dailyNotes;
+    (rows.length?`<div class="sync-status bad">${rows.length} 项数据异常 / 待核验</div><div class="sync-upstream-list">${rows.map(row=>`<article class="sync-upstream-account"><b class="sync-upstream-error">${esc(row.scope)}</b><p class="sync-upstream-error">${esc(row.detail)}</p></article>`).join('')}</div>`:'<span class="sync-status ok">用量覆盖与可用账单校验通过</span>')+pausedNote+configurationNote+dailyNotes;
 }
 window.channelDataStatus={issues,note,render,known,billView,billRangeNote,billSyncNote,balanceSnapshot};
 })();

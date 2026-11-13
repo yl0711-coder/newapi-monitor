@@ -64,7 +64,7 @@ type IncidentConfig struct {
 
 // DefaultIncidentConfig 返回全部默认值，Enabled 为 false。
 //
-// 默认关闭（02.1 §10 可回滚要求）：关闭时不起 worker、不写新表、页面不显示子视图，
+// 默认关闭（02.1 §10 可回滚要求）：关闭时不起 worker、不写新表，页面明确显示未启用，
 // 但**不删除任何历史事故数据**。验收时显式开启，生产启用另行确认。
 func DefaultIncidentConfig() IncidentConfig {
 	return IncidentConfig{

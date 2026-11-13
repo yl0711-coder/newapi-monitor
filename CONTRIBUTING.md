@@ -15,7 +15,8 @@ docker build -t newapi-monitor .   # 构建镜像
 ## 提交 PR
 - 代码保持 `gofmt` 格式化(`gofmt -w .`);
 - 新功能 / 修复请尽量附带测试;
-- PR 会自动跑 CI(`go vet` + `go test`),通过后再合并。
+- PR 会自动跑 CI(vet、lint、前端测试、全量 race 测试),通过后再合并;
+- 写测试、调整 CI 前先读 [`docs/CI-规范.md`](docs/CI-规范.md)(测试耗时规则、race 分配、耗时表刷新、偶发失败处理)。
 
 ## 约定
 - 镜像由 CI 在 `main` 推送 / 打 `v*` tag 时自动构建并发布到 GHCR;

@@ -73,21 +73,21 @@ func TestLogChainJSAvoidsChangeOnTextInputs(t *testing.T) {
 	if found == 0 {
 		t.Fatal("找不到任何 change 绑定")
 	}
-	if !strings.Contains(js, `['lcModel','lcUserID','lcUsername','lcTokenName','lcTokenID','lcEndpoint','lcRequestID'].forEach`) {
+	if !strings.Contains(js, `['lcModel','lcUserID','lcUsername','lcTokenName','lcTokenID','lcEndpoint','lcRequestID','lcKeyword'].forEach`) {
 		t.Error("排障文本框应统一走回车或查询按钮")
 	}
 }
 
-func TestLogChainKeywordFilterIsNotExposed(t *testing.T) {
+func TestLogChainKeywordFilterUsesOriginalTextQuery(t *testing.T) {
 	js := stripJSLineComments(string(logChainJS))
-	for _, forbidden := range []string{`id="lcKeyword"`, `placeholder="错误原文关键词"`} {
-		if strings.Contains(pageHTML, forbidden) {
-			t.Errorf("客户排障页面仍暴露关键词筛选 %q", forbidden)
+	for _, wanted := range []string{`id="lcKeyword"`, `placeholder="错误原文关键词"`} {
+		if !strings.Contains(pageHTML, wanted) {
+			t.Errorf("客户排障缺少原文查询控件 %q", wanted)
 		}
 	}
-	for _, forbidden := range []string{"filters.keyword", "$('lcKeyword')", "q.set('keyword'"} {
-		if strings.Contains(js, forbidden) {
-			t.Errorf("客户排障前端仍保留关键词筛选接线 %q", forbidden)
+	for _, wanted := range []string{"filters.keyword", "$('lcKeyword')", "q.set('keyword'"} {
+		if !strings.Contains(js, wanted) {
+			t.Errorf("客户排障缺少原文查询接线 %q", wanted)
 		}
 	}
 }
@@ -99,7 +99,15 @@ func TestLogChainJSUsesGenerationGuard(t *testing.T) {
 	// 必须剔掉注释再搜：解释"为什么不用 loading 互斥"的注释里本就含这段字面量，
 	// 直接搜整个文件会命中自己写的说明，制造假警报。
 	code := stripJSLineComments(js)
-	if strings.Contains(code, "if(lc.loading)return") {
+	loadStart := strings.Index(code, "async function load(")
+	if loadStart < 0 {
+		t.Fatal("missing load")
+	}
+	loadEnd := strings.Index(code[loadStart:], "\n}")
+	if loadEnd < 0 {
+		t.Fatal("missing load end")
+	}
+	if strings.Contains(code[loadStart:loadStart+loadEnd], "if(lc.loading)return") {
 		t.Error("不得用 loading 标记做互斥：会静默丢弃请求进行中的筛选变更")
 	}
 	if !strings.Contains(code, "++lc.generation") || !strings.Contains(code, "gen!==lc.generation") {
@@ -593,8 +601,8 @@ func TestLogChainFocusedReasonUIWiring(t *testing.T) {
 			t.Errorf("筛选原因模式前端接线缺少 %q", want)
 		}
 	}
-	if !strings.Contains(pageHTML, `<script src="/logchain.js?v=18"></script>`) {
-		t.Error("logchain.js 行为已变化但缓存版本未提升到 v17")
+	if !strings.Contains(pageHTML, `<script src="/logchain.js?v=20"></script>`) {
+		t.Error("logchain.js 行为已变化但缓存版本未提升到 v19")
 	}
 }
 
@@ -693,7 +701,10 @@ func TestLogChainRenderDoesNotClearQueryError(t *testing.T) {
 	if strings.Contains(js[start:start+end], "clearError()") {
 		t.Error("纯重绘不得清除查询失败提示")
 	}
-	loadStart := strings.Index(js, "async function load(more){")
+	loadStart := strings.Index(js, "async function load(more,automatic=false){")
+	if loadStart < 0 {
+		t.Fatal("找不到 load")
+	}
 	fetchAt := strings.Index(js[loadStart:], "await fetch('/logchain/requests?")
 	if loadStart < 0 || fetchAt < 0 {
 		t.Fatal("找不到 load/fetch")
@@ -1014,7 +1025,7 @@ func TestLogChainCloudWatchIsOnDemandOnly(t *testing.T) {
 	}
 	// 换筛选条件后必须清空：行集整体替换时若沿用旧结果，相同行 id 会把
 	// 上一次查询的证据显示在新一次查询的行下面，页面上完全看不出来。
-	if !strings.Contains(js, "if(!more)clearRowInvestigationStates()") || !strings.Contains(js, "id!==STANDALONE_INVESTIGATION") {
+	if !strings.Contains(js, "if(!more&&!automatic)clearRowInvestigationStates()") || !strings.Contains(js, "id!==STANDALONE_INVESTIGATION") {
 		t.Error("重新查询时必须清空行级证据结果并保留独立排障任务，避免跨查询错配")
 	}
 	// 竞态与防连点：迟到响应不得覆盖更新的一次查询。
@@ -1111,12 +1122,12 @@ func TestLogChainBlindSpotsDropsBodyCapture(t *testing.T) {
 	}
 }
 
-// TestLogChainDetailColumnSwitchesByScope 明细列必须随范围切换表头与内容。
+// TestLogChainDetailColumnKeepsCauseHeader 各筛选都使用错误原因表头。
 //
 // logs.content 在不同类型里装的是完全不同的东西：type=5 是上游错误原文，
 // type=2 是计费摘要（"模型倍率 3.00, 分组倍率 1.00"）。异常行全是 type=2，
 // 表头固定写"上游返回原文"就会在最显眼的位置摆一句无用的计费摘要。
-func TestLogChainDetailColumnSwitchesByScope(t *testing.T) {
+func TestLogChainDetailColumnKeepsCauseHeader(t *testing.T) {
 	if !strings.Contains(pageHTML, `id="lcDetailTh"`) {
 		t.Fatal("明细列表头缺少 id，无法随范围切换")
 	}
@@ -1124,8 +1135,8 @@ func TestLogChainDetailColumnSwitchesByScope(t *testing.T) {
 	if !strings.Contains(js, "function syncDetailHeader(") {
 		t.Fatal("缺少 syncDetailHeader")
 	}
-	if !strings.Contains(js, "异常详情") {
-		t.Error("异常范围下表头应改为「异常详情」")
+	if !strings.Contains(js, "th.textContent='错误原因'") {
+		t.Error("各筛选表头必须固定为错误原因")
 	}
 	// contentCell 必须按行的性质判断，不能只按当前筛选——
 	// err_anom 混排时同一列里两种行并存。
@@ -1183,7 +1194,7 @@ func TestLogChainTableHeaderHasSubLabels(t *testing.T) {
 	// 明细列表头带 id（随范围切换文案），故按 id 断言而非按文案全等——
 	// 文案是动态的，钉死字面量会与 syncDetailHeader 冲突。
 	for _, want := range []string{
-		`<span class="lc-th">渠道 → 上游主域名</span>`,
+		`<span class="lc-th">渠道 → 上游地址</span>`,
 		`<span class="lc-th" id="lcDetailTh">`,
 	} {
 		if !strings.Contains(pageHTML, want) {

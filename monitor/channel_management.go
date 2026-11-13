@@ -121,21 +121,23 @@ type ChannelManagementVendor struct {
 }
 
 type ChannelManagementDomain struct {
-	Key               string                          `json:"key"`
-	Domain            string                          `json:"domain"`
-	Configured        bool                            `json:"configured"`
-	ManuallyDisabled  bool                            `json:"manually_disabled"`
-	Retiring          bool                            `json:"retiring"`
-	RetiringUpdatedAt int64                           `json:"retiring_updated_at,omitempty"`
-	Usage             ChannelUsageMetrics             `json:"usage"`
-	Finance           ChannelDomainFinanceView        `json:"finance"`
-	Upstream          ChannelUpstreamAccountView      `json:"upstream"`
-	RateConfig        ChannelManagementRateConfig     `json:"rate_config"`
-	UpstreamUsage     ChannelUpstreamUsageMetrics     `json:"upstream_usage"`
-	NaturalDayBill    *ChannelUpstreamNaturalDayBill  `json:"natural_day_bill,omitempty"`
-	FinanceGroups     []ChannelManagementFinanceGroup `json:"finance_groups"`
-	Groups            []ChannelManagementGroup        `json:"groups"`
-	Vendors           []ChannelManagementVendor       `json:"vendors"`
+	Key               string `json:"key"`
+	Domain            string `json:"domain"`
+	Configured        bool   `json:"configured"`
+	ManuallyDisabled  bool   `json:"manually_disabled"`
+	Retiring          bool   `json:"retiring"`
+	RetiringUpdatedAt int64  `json:"retiring_updated_at,omitempty"`
+	// Aliases are other channel addresses attributed to this domain.
+	Aliases        []string                        `json:"aliases,omitempty"`
+	Usage          ChannelUsageMetrics             `json:"usage"`
+	Finance        ChannelDomainFinanceView        `json:"finance"`
+	Upstream       ChannelUpstreamAccountView      `json:"upstream"`
+	RateConfig     ChannelManagementRateConfig     `json:"rate_config"`
+	UpstreamUsage  ChannelUpstreamUsageMetrics     `json:"upstream_usage"`
+	NaturalDayBill *ChannelUpstreamNaturalDayBill  `json:"natural_day_bill,omitempty"`
+	FinanceGroups  []ChannelManagementFinanceGroup `json:"finance_groups"`
+	Groups         []ChannelManagementGroup        `json:"groups"`
+	Vendors        []ChannelManagementVendor       `json:"vendors"`
 }
 
 type ChannelManagementFilters struct {
@@ -180,6 +182,10 @@ type ChannelManagementReport struct {
 	InternalAccounts      financeInternalFactStatus      `json:"internal_accounts"`
 	InternalScopeComplete bool                           `json:"internal_scope_complete"`
 	DataWarnings          []ChannelManagementDataWarning `json:"data_warnings,omitempty"`
+	// AliasTargets lists every domain with a configured upstream account,
+	// including suppliers whose channels all use another address (the
+	// typical domain alias target), which are absent from Domains.
+	AliasTargets []string `json:"alias_targets,omitempty"`
 }
 
 // ChannelCostClosureCapability is an explicit, read-only UI capability. The
@@ -851,6 +857,11 @@ func (m *Monitor) buildChannelManagementReport(ctx context.Context, scope stabil
 	if err != nil {
 		return nil, fmt.Errorf("读取停止使用标记: %w", err)
 	}
+	domainAliases, err := loadChannelDomainAliases(ctx, m.storeDB)
+	if err != nil {
+		return nil, fmt.Errorf("读取域名归并: %w", err)
+	}
+	aliasesByTarget := channelDomainAliasesByTarget(domainAliases)
 	upstreamUsage, err := m.loadChannelUpstreamUsage(ctx, scope, now, upstreamAccounts, finance)
 	if err != nil {
 		return nil, fmt.Errorf("读取上游使用日志汇总: %w", err)
@@ -1009,7 +1020,8 @@ func (m *Monitor) buildChannelManagementReport(ctx context.Context, scope stabil
 	for _, ch := range channels {
 		// 当前渠道只关联了明确排除的测试分组，且没有其他业务
 		// 分组用量时，不进入渠道管理的面向经营视图。原始快照和日志仍保留。
-		if ch.BusinessGroupOnly && len(ch.Groups) == 0 {
+		// 但已配置上游账户的主域名必须可见，否则无法管理其同步、标记停止使用。
+		if ch.BusinessGroupOnly && len(ch.Groups) == 0 && !upstreamAccounts[ch.BaseDomain].Configured {
 			continue
 		}
 		vendorSet[ch.Vendor] = true
@@ -1111,7 +1123,8 @@ func (m *Monitor) buildChannelManagementReport(ctx context.Context, scope stabil
 		responseDomains = append(responseDomains, ChannelManagementDomain{
 			Key: domain.Key, Domain: domain.Domain, Configured: domain.Configured, ManuallyDisabled: channelDomainManuallyDisabled(domain),
 			Retiring: retirements[domain.Domain].Retiring, RetiringUpdatedAt: retirements[domain.Domain].UpdatedAt,
-			Usage: domain.Usage.metrics(), Finance: finance.domainView(domain.Domain),
+			Aliases: aliasesByTarget[domain.Domain],
+			Usage:   domain.Usage.metrics(), Finance: finance.domainView(domain.Domain),
 			Upstream:       upstream,
 			RateConfig:     managementRateConfig(domain, finance),
 			UpstreamUsage:  upstreamUsage[domain.Domain],
@@ -1180,8 +1193,16 @@ func (m *Monitor) buildChannelManagementReport(ctx context.Context, scope stabil
 
 	// Always expose the actual exclusive cutoff, including partial date ranges.
 	const rangeFormat = "2006-01-02 15:04"
+	aliasTargets := make([]string, 0, len(upstreamAccounts))
+	for domain, account := range upstreamAccounts {
+		if account.Configured && domainAliases[domain] == "" {
+			aliasTargets = append(aliasTargets, domain)
+		}
+	}
+	sort.Strings(aliasTargets)
 	return &ChannelManagementReport{
 		Enabled:       true,
+		AliasTargets:  aliasTargets,
 		Finance:       finance.settingsView(),
 		WebsiteGroups: websiteGroups, WebsiteGroupsSyncedAt: websiteGroupsSyncedAt,
 		Meta: ChannelManagementMeta{

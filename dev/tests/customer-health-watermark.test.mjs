@@ -90,3 +90,26 @@ test('zero is shown only for a certified visible interval and labelled as that i
   assert.match(view.element('chRows').innerHTML,/>0</);
   assert.match(view.element('chRows').innerHTML,/统计窗口内无记录/);
 });
+
+test('missing or midnight-only watermark never becomes epoch lag or a query watermark',()=>{
+  for(const watermark of [0,Date.UTC(2026,9,7,16)/1000]) {
+    const view=healthView(), data=report({available:false,state:'initial_backfill'});
+    data.to_ts=data.from_ts;
+    data.collection.through_ts=watermark;
+    // Also tolerate an old server's invalid lag while a rolling update runs.
+    data.collection.lag_seconds=through;
+    view.render(data);
+    assert.match(view.element('chMeta').textContent,/查询水位 尚未采集／未知/);
+    assert.doesNotMatch(view.element('chMeta').textContent,/延迟 \d+ 分钟|查询水位 .*00:00:00/);
+  }
+});
+
+test('valid watermark retains normal delay display after collection resumes',()=>{
+  const view=healthView(), data=report();
+  data.collection.lag_seconds=125;
+  view.render(data);
+  assert.match(view.element('chMeta').textContent,/查询水位 .*15:56:00.*延迟 3 分钟/);
+  data.collection.lag_seconds=0;
+  view.render(data);
+  assert.doesNotMatch(view.element('chMeta').textContent,/延迟|尚未采集／未知/);
+});

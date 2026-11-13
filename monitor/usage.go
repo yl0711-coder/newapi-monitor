@@ -147,12 +147,21 @@ type usageQueryLaneStats struct {
 }
 
 type usageSourceBudgetStats struct {
-	Capacity           int                 `json:"capacity"`
-	InUse              int                 `json:"in_use"`
-	InteractiveWaiters int64               `json:"interactive_waiters"`
-	Aggregate          usageQueryLaneStats `json:"aggregate"`
-	Detail             usageQueryLaneStats `json:"detail"`
-	Export             usageQueryLaneStats `json:"export"`
+	Capacity           int                   `json:"capacity"`
+	InUse              int                   `json:"in_use"`
+	InteractiveWaiters int64                 `json:"interactive_waiters"`
+	Aggregate          usageQueryLaneStats   `json:"aggregate"`
+	Detail             usageQueryLaneStats   `json:"detail"`
+	Export             usageQueryLaneStats   `json:"export"`
+	ConnectionPool     *usageSourcePoolStats `json:"connection_pool,omitempty"`
+}
+
+type usageSourcePoolStats struct {
+	MaxOpen   int   `json:"max_open"`
+	InUse     int   `json:"in_use"`
+	Idle      int   `json:"idle"`
+	WaitCount int64 `json:"wait_count"`
+	WaitMS    int64 `json:"wait_ms"`
 }
 
 func usageLaneStats(metrics *usageQueryLaneMetrics) usageQueryLaneStats {
@@ -168,7 +177,7 @@ func usageLaneStats(metrics *usageQueryLaneMetrics) usageQueryLaneStats {
 }
 
 func (m *Monitor) usageSourceStats() usageSourceBudgetStats {
-	return usageSourceBudgetStats{
+	stats := usageSourceBudgetStats{
 		Capacity:           2,
 		InUse:              int(m.usageSourceInUse.Load()),
 		InteractiveWaiters: m.usageInteractiveWaiters.Load(),
@@ -176,6 +185,11 @@ func (m *Monitor) usageSourceStats() usageSourceBudgetStats {
 		Detail:             usageLaneStats(&m.usageDetailMetrics),
 		Export:             usageLaneStats(&m.usageExportMetrics),
 	}
+	if m.prodDB != nil {
+		pool := m.prodDB.Stats()
+		stats.ConnectionPool = &usageSourcePoolStats{MaxOpen: pool.MaxOpenConnections, InUse: pool.InUse, Idle: pool.Idle, WaitCount: pool.WaitCount, WaitMS: pool.WaitDuration.Milliseconds()}
+	}
+	return stats
 }
 
 // acquireInteractiveUsageGate 为页面上的重查询登记一个短暂等待标记。标记只覆盖

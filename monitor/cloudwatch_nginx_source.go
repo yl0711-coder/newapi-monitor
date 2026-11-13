@@ -7,6 +7,8 @@ package monitor
 // 均不落盘。水位只在 access/error 同一窗口原子发布成功后推进。
 
 import (
+	"github.com/yl0711-coder/newapi-monitor/internal/metering"
+
 	"context"
 	"encoding/json"
 	"errors"
@@ -43,18 +45,26 @@ const (
 // CloudWatchNginxCursor 是 access/error 共用的连续覆盖水位。ThroughTs 之前
 // 的窗口均已完整查询、解析并原子发布；失败时 NextTs 保持不动。
 type CloudWatchNginxCursor struct {
-	ID               uint   `gorm:"primaryKey;autoIncrement:false"`
-	CoverageFromTs   int64  `gorm:"column:coverage_from_ts"`
-	NextTs           int64  `gorm:"column:next_ts;index"`
-	ThroughTs        int64  `gorm:"column:through_ts"`
-	TargetThroughTs  int64  `gorm:"column:target_through_ts"`
-	SemanticsVersion int    `gorm:"column:semantics_version;index"`
-	Status           string `gorm:"size:24;index"`
-	LastSuccessAt    int64  `gorm:"column:last_success_at"`
-	LastFailureAt    int64  `gorm:"column:last_failure_at"`
-	RepairNextTs     int64  `gorm:"column:repair_next_ts;index"`
-	LastRepairAt     int64  `gorm:"column:last_repair_at"`
-	LastError        string `gorm:"size:64;column:last_error"`
+	ID                uint   `gorm:"primaryKey;autoIncrement:false"`
+	CoverageFromTs    int64  `gorm:"column:coverage_from_ts"`
+	NextTs            int64  `gorm:"column:next_ts;index"`
+	ThroughTs         int64  `gorm:"column:through_ts"`
+	TargetThroughTs   int64  `gorm:"column:target_through_ts"`
+	SemanticsVersion  int    `gorm:"column:semantics_version;index"`
+	Status            string `gorm:"size:24;index"`
+	LastSuccessAt     int64  `gorm:"column:last_success_at"`
+	LastFailureAt     int64  `gorm:"column:last_failure_at"`
+	RepairNextTs      int64  `gorm:"column:repair_next_ts;index"`
+	LastRepairAt      int64  `gorm:"column:last_repair_at"`
+	LastError         string `gorm:"size:64;column:last_error"`
+	ReadWindowSeconds int64  `gorm:"not null;default:0" json:"-"`
+	// Historical repair keeps its own read width; a slow old hour must not
+	// throttle the primary lane or restart at the same full hour forever.
+	RepairReadWindowSeconds int64 `gorm:"not null;default:0" json:"-"`
+	ReplayNextTs            int64
+	ReplayThroughTs         int64
+	ReplayLastAt            int64
+	ReplayReadWindowSeconds int64 `gorm:"not null;default:0" json:"-"`
 	// 请求级 HMAC evidence 的独立补扫水位。它与分钟聚合的 NextTs/RepairNextTs
 	// 分开，允许在主聚合已追平后把 evidence retention 内的历史补回来。
 	EvidenceCoverageFromTs int64  `gorm:"column:evidence_coverage_from_ts"`
@@ -64,12 +74,16 @@ type CloudWatchNginxCursor struct {
 	EvidenceLastSuccessAt  int64  `gorm:"column:evidence_last_success_at"`
 	EvidenceLastFailureAt  int64  `gorm:"column:evidence_last_failure_at"`
 	EvidenceLastError      string `gorm:"size:64;column:evidence_last_error"`
-	EvidenceStoreID        string `gorm:"size:64;column:evidence_store_id"`
-	EvidenceGapFromTs      int64  `gorm:"column:evidence_gap_from_ts"`
-	EvidenceGapToTs        int64  `gorm:"column:evidence_gap_to_ts"`
-	EvidenceGapDetectedAt  int64  `gorm:"column:evidence_gap_detected_at"`
-	EvidenceGapReason      string `gorm:"size:64;column:evidence_gap_reason"`
-	UpdatedAt              int64  `gorm:"column:updated_at"`
+	// Execution timeouts narrow only the next read, never the covered interval.
+	// Keep the successful smaller chunk across retries and restarts. An unknown
+	// legacy timeout is not enough evidence to select a smaller range.
+	EvidenceReadWindowSeconds int64  `gorm:"not null;default:0" json:"-"`
+	EvidenceStoreID           string `gorm:"size:64;column:evidence_store_id"`
+	EvidenceGapFromTs         int64  `gorm:"column:evidence_gap_from_ts"`
+	EvidenceGapToTs           int64  `gorm:"column:evidence_gap_to_ts"`
+	EvidenceGapDetectedAt     int64  `gorm:"column:evidence_gap_detected_at"`
+	EvidenceGapReason         string `gorm:"size:64;column:evidence_gap_reason"`
+	UpdatedAt                 int64  `gorm:"column:updated_at"`
 }
 
 func cloudWatchNginxRange(now time.Time, lookbackHours int) (int64, int64) {
@@ -82,6 +96,17 @@ func cloudWatchNginxRange(now time.Time, lookbackHours int) (int64, int64) {
 		from = 0
 	}
 	return from / 60 * 60, through
+}
+
+// Read width is a retry checkpoint, not a coverage proof. Never move the left
+// boundary on timeout. Recent replay has a separate durable cursor.
+func cloudWatchNginxNextWindow(state CloudWatchNginxCursor, target int64) (int64, int64) {
+	from := state.NextTs
+	width := state.ReadWindowSeconds
+	if width <= 0 || width > int64(cloudWatchNginxWindow/time.Second) {
+		width = int64(cloudWatchNginxWindow / time.Second)
+	}
+	return from, min(target, from+width)
 }
 
 func cloudWatchNginxEvidenceRange(now time.Time, retentionHours int) (int64, int64) {
@@ -115,11 +140,24 @@ func cloudWatchNginxEvidenceWindow(state CloudWatchNginxCursor, target int64) (i
 	if from >= target {
 		return 0, 0, false
 	}
-	to := from + int64(cloudWatchNginxEvidenceChunkWindow/time.Second)
+	width := state.EvidenceReadWindowSeconds
+	if width <= 0 || width > int64(cloudWatchNginxEvidenceChunkWindow/time.Second) {
+		width = int64(cloudWatchNginxEvidenceChunkWindow / time.Second)
+	}
+	to := from + width
 	if to > target {
 		to = target
 	}
 	return from, to, to > from
+}
+
+func narrowCloudWatchNginxEvidenceRead(state *CloudWatchNginxCursor, attemptedSeconds int64, err error) {
+	if state == nil || cloudWatchNginxTimeoutStage(err) != "execution" {
+		return
+	}
+	// Retry the same left boundary with fewer minutes. Do not increase the
+	// two-minute query budget, issue an extra query here, or publish coverage.
+	state.EvidenceReadWindowSeconds = max(int64(60), min(int64(15*60), attemptedSeconds/2/60*60))
 }
 
 // cloudWatchNginxRepairBounds returns only fully closed UTC hours. The moving
@@ -135,6 +173,12 @@ func cloudWatchNginxRepairBounds(state CloudWatchNginxCursor, target int64) (int
 	if start < 0 {
 		start = 0
 	}
+	// The rolling repair horizon selects new cycles; it is not a successful
+	// checkpoint. Keep an already scheduled interval across clock movement and
+	// restarts, so an hour of repeated timeouts cannot silently age past it.
+	if state.RepairNextTs > 0 && state.RepairNextTs%60 == 0 && state.RepairNextTs >= state.CoverageFromTs && state.RepairNextTs < start {
+		start = state.RepairNextTs
+	}
 	return start, end
 }
 
@@ -144,13 +188,16 @@ func cloudWatchNginxRepairWindow(state CloudWatchNginxCursor, target int64) (int
 		return 0, 0, false
 	}
 	from := state.RepairNextTs
-	if from < start || from >= end || from%int64(time.Hour/time.Second) != 0 {
+	if from < start || from >= end || from%60 != 0 {
 		from = start
 	}
-	to := from + int64(cloudWatchNginxWindow/time.Second)
-	if to > end {
-		to = end
+	width := state.RepairReadWindowSeconds
+	if width < 60 || width > int64(cloudWatchNginxWindow/time.Second) {
+		width = int64(cloudWatchNginxWindow / time.Second)
 	}
+	// Complete the scheduled UTC hour in contiguous minute-sized pieces.
+	// Its last piece can be shorter than the learned transport width.
+	to := min(end, from+width/60*60, (from/3600+1)*3600)
 	return from, to, to > from
 }
 
@@ -160,6 +207,13 @@ func (m *Monitor) loadCloudWatchNginxCursor(now time.Time) (CloudWatchNginxCurso
 	var state CloudWatchNginxCursor
 	err := m.storeDB.First(&state, "id = ?", cloudWatchNginxCursorID).Error
 	if err == nil && state.SemanticsVersion == cloudWatchNginxVersion {
+		// Older versions shared NextTs with split replays. Preserve that exact
+		// unfinished replay while restoring the independently proven frontier.
+		if state.NextTs > 0 && state.NextTs >= state.CoverageFromTs && state.NextTs < state.ThroughTs && state.ReplayThroughTs <= state.ReplayNextTs {
+			state.ReplayNextTs, state.ReplayThroughTs = state.NextTs, state.ThroughTs
+			state.ReplayReadWindowSeconds = state.ReadWindowSeconds
+			state.NextTs = state.ThroughTs
+		}
 		state.TargetThroughTs = target
 		if state.CoverageFromTs <= 0 {
 			state.CoverageFromTs = from
@@ -175,7 +229,7 @@ func (m *Monitor) loadCloudWatchNginxCursor(now time.Time) (CloudWatchNginxCurso
 		}
 		repairStart, repairEnd := cloudWatchNginxRepairBounds(state, target)
 		if repairEnd > repairStart && (state.RepairNextTs < repairStart || state.RepairNextTs >= repairEnd ||
-			state.RepairNextTs%int64(time.Hour/time.Second) != 0) {
+			state.RepairNextTs%60 != 0) {
 			state.RepairNextTs = repairStart
 		}
 		state.UpdatedAt = now.Unix()
@@ -234,7 +288,9 @@ func (m *Monitor) recordCloudWatchNginxFailure(state *CloudWatchNginxCursor, cau
 
 func (m *Monitor) queryCloudWatchNginxRange(ctx context.Context, parser *cloudWatchEvidenceParser,
 	from, to time.Time, queries *int, depth int) ([]cloudWatchStructuredEvidence, error) {
-	return m.queryCloudWatchCompleteEvidenceRange(ctx, parser, cwQueryWorkerNginxContinuous,
+	continuousParser := *parser
+	continuousParser.nginxContinuousIdentity = true
+	return m.queryCloudWatchCompleteEvidenceRange(ctx, &continuousParser, cwQueryWorkerNginxContinuous,
 		cloudWatchLogsNginxLimit, from, to, queries, depth)
 }
 
@@ -353,25 +409,53 @@ func cloudWatchNginxSamples(evidence []cloudWatchStructuredEvidence, from, to in
 
 func (m *Monitor) publishCloudWatchNginxWindowMode(ctx context.Context, state *CloudWatchNginxCursor,
 	from, to int64, access []NginxMinuteSample, errorRows []NginxErrorMinuteSample, lastAccess, lastError, target int64,
-	repair bool) error {
+	repair bool, recoveryWidth ...int64) error {
+	return m.publishCloudWatchNginxWindowLane(ctx, state, from, to, access, errorRows, lastAccess, lastError, target, repair, false, recoveryWidth...)
+}
+
+func (m *Monitor) publishCloudWatchNginxWindowLane(ctx context.Context, state *CloudWatchNginxCursor,
+	from, to int64, access []NginxMinuteSample, errorRows []NginxErrorMinuteSample, lastAccess, lastError, target int64,
+	repair, replay bool, recoveryWidth ...int64) error {
 	finishedAt := time.Now().Unix()
 	next := *state
 	next.TargetThroughTs = target
-	if repair {
+	if replay {
+		next.ReplayNextTs = to
+		if to >= next.ReplayThroughTs {
+			next.ReplayLastAt = finishedAt
+		}
+		if len(recoveryWidth) > 0 && recoveryWidth[0] > 0 {
+			next.ReplayReadWindowSeconds = recoveryWidth[0]
+		}
+	} else if repair {
+		if len(recoveryWidth) > 0 && recoveryWidth[0] > 0 {
+			next.RepairReadWindowSeconds = recoveryWidth[0]
+		}
 		repairStart, repairEnd := cloudWatchNginxRepairBounds(next, target)
 		next.RepairNextTs = to
 		if next.RepairNextTs >= repairEnd {
 			next.RepairNextTs = repairStart
 		}
-		next.LastRepairAt = finishedAt
+		// The existing twenty-minute pause applies after a whole repaired
+		// hour. A split prefix must resume after the primary lane's next turn.
+		if to%3600 == 0 {
+			next.LastRepairAt = finishedAt
+		}
 	} else {
 		if to > next.ThroughTs {
 			next.ThroughTs = to
 		}
 		next.NextTs = to
 		next.Status = "running"
-		if next.ThroughTs >= target {
+		if next.ThroughTs >= target && to >= target {
 			next.Status = "caught_up"
+		}
+		// Grow during catch-up only after the reader has observed sustained
+		// fast, unsplit successes. Publish the width with this exact prefix;
+		// it is a retry hint and never coverage for the next unread window.
+		if len(recoveryWidth) > 0 && recoveryWidth[0] > next.ReadWindowSeconds &&
+			next.ReadWindowSeconds > 0 && to-from == next.ReadWindowSeconds {
+			next.ReadWindowSeconds = recoveryWidth[0]
 		}
 		next.LastSuccessAt = finishedAt
 	}
@@ -447,6 +531,10 @@ func (m *Monitor) publishCloudWatchNginxWindowMode(ctx context.Context, state *C
 // optional store is unavailable, the CloudWatch watermark must not advance
 // past a window whose request-level evidence was lost.
 func (m *Monitor) persistCloudWatchNginxRequestEvidence(ctx context.Context, evidence []cloudWatchStructuredEvidence, from, to int64, batchID string) error {
+	return m.persistCloudWatchNginxEvidenceMode(ctx, evidence, from, to, batchID, false)
+}
+
+func (m *Monitor) persistCloudWatchNginxEvidenceMode(ctx context.Context, evidence []cloudWatchStructuredEvidence, from, to int64, batchID string, recent bool) error {
 	if m == nil || m.nginxEvidenceDB == nil || nginxEvidenceMode(m.cfg.NginxEvidenceMode) == "off" {
 		return nil
 	}
@@ -468,6 +556,9 @@ func (m *Monitor) persistCloudWatchNginxRequestEvidence(ctx context.Context, evi
 			continue
 		}
 		seen[item.EventRef] = struct{}{}
+		if !metering.ValidLength(item.RequestLength, item.RequestLengthState, item.RequestLengthVersion) {
+			return fmt.Errorf("cloudwatch nginx request length metadata invalid")
+		}
 		statuses := append([]int(nil), item.UpstreamStatuses...)
 		upstreamStatus := 0
 		if len(statuses) > 0 {
@@ -490,17 +581,37 @@ func (m *Monitor) persistCloudWatchNginxRequestEvidence(ctx context.Context, evi
 			UpstreamStatus: upstreamStatus, UpstreamAttempts: len(statuses), UpstreamStatuses: string(statusesJSON),
 			RequestMS: valueOrZero(item.RequestMS), UpstreamMS: valueOrZero(item.UpstreamMS), UpstreamPresent: len(statuses) > 0,
 			ConnectMS: valueOrZero(item.ConnectMS), HeaderMS: valueOrZero(item.HeaderMS), BytesSent: valueOrZero(item.BytesSent),
-			Completion: item.Completion, NginxIDHMAC: item.NginxIDHMAC, OneAPIIDHMAC: item.OneAPIIDHMAC,
+			RequestLength: item.RequestLength, RequestLengthState: item.RequestLengthState, RequestLengthVersion: item.RequestLengthVersion,
+			Completion: item.Completion, NginxIDHMAC: item.NginxIDHMAC, OneAPIIDHMAC: item.OneAPIIDHMAC, OneAPIRequestID: item.OneAPIRequestID,
 			HMACKeyID: item.HMACKeyID, BatchID: batchID, ReceivedAt: time.Now().Unix(),
 		}
 		if !validNginxEvidenceEvent(nginxEvidenceEvent{EventID: row.EventID, EventMS: row.EventMS, Route: row.Route, Method: row.Method,
 			Status: row.Status, UpstreamStatus: row.UpstreamStatus, UpstreamAttempts: row.UpstreamAttempts, UpstreamStatuses: statuses,
 			RequestMS: row.RequestMS, UpstreamMS: row.UpstreamMS, UpstreamPresent: row.UpstreamPresent, ConnectMS: row.ConnectMS,
-			HeaderMS: row.HeaderMS, BytesSent: row.BytesSent, Completion: row.Completion, NginxIDHMAC: row.NginxIDHMAC, OneAPIIDHMAC: row.OneAPIIDHMAC},
+			HeaderMS: row.HeaderMS, BytesSent: row.BytesSent, RequestLength: row.RequestLength, RequestLengthState: row.RequestLengthState, RequestLengthVersion: row.RequestLengthVersion, Completion: row.Completion, NginxIDHMAC: row.NginxIDHMAC, OneAPIIDHMAC: row.OneAPIIDHMAC},
 			time.Now().UnixMilli(), m.cfg.NginxEvidenceRetentionHours) {
 			continue
 		}
 		rows = append(rows, row)
+	}
+	if recent {
+		// Append/update immutable exact events. A provisional observation never
+		// deletes prior evidence or touches the historical continuity proof.
+		for start := 0; start < len(rows); start += cloudWatchNginxEvidencePersistBatchSize {
+			end := min(start+cloudWatchNginxEvidencePersistBatchSize, len(rows))
+			if err := m.nginxEvidenceDB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+				fields := []string{"route", "method", "status", "upstream_status", "request_ms", "request_length", "request_length_state", "request_length_version", "oneapi_id_hmac", "oneapi_request_id", "hmac_key_id", "completion"}
+				changed := make([]string, 0, len(fields))
+				for _, field := range fields {
+					changed = append(changed, "nginx_request_evidences."+field+" IS NOT excluded."+field)
+				}
+				return tx.Clauses(clause.OnConflict{Columns: []clause.Column{{Name: "event_id"}}, DoUpdates: clause.AssignmentColumns(append(fields, "received_at", "batch_id")), Where: clause.Where{Exprs: []clause.Expression{clause.Expr{SQL: strings.Join(changed, " OR ")}}}}).CreateInBatches(rows[start:end], end-start).Error
+			}); err != nil {
+				return err
+			}
+		}
+		m.signalTokenAssociationWake()
+		return nil
 	}
 	// A replay/repair window is a replacement, not an increment.  Remove
 	// only this source's rows; old collector evidence remains untouched.  The
@@ -629,6 +740,7 @@ func cloudWatchNginxErrorDetail(err error) string {
 }
 
 func (m *Monitor) runCloudWatchNginxEvidenceWindow(ctx context.Context, state *CloudWatchNginxCursor, from, to, target int64) (int, error) {
+	started := time.Now()
 	parser, err := m.cloudWatchEvidenceParser(false)
 	if err != nil {
 		return 0, err
@@ -638,15 +750,19 @@ func (m *Monitor) runCloudWatchNginxEvidenceWindow(ctx context.Context, state *C
 	queries := 0
 	evidence, err := m.queryCloudWatchNginxRange(queryCtx, parser, time.Unix(from, 0).UTC(), time.Unix(to, 0).UTC(), &queries, 0)
 	if err != nil {
+		m.cloudWatchNginxEvidenceFastWindows.Store(0)
 		return queries, err
 	}
 	if err := m.persistCloudWatchNginxRequestEvidence(ctx, evidence, from, to,
 		fmt.Sprintf("cw-evidence-%d-%d", from, to)); err != nil {
 		return queries, fmt.Errorf("request evidence persist: %w", err)
 	}
-	if err := m.publishCloudWatchNginxEvidenceCursor(ctx, state, from, to, target); err != nil {
+	next := *state
+	next.EvidenceReadWindowSeconds = cloudWatchNginxRecoveredWidth(state.EvidenceReadWindowSeconds, to-from, queries, time.Since(started), &m.cloudWatchNginxEvidenceFastWindows, int64(cloudWatchNginxEvidenceChunkWindow/time.Second))
+	if err := m.publishCloudWatchNginxEvidenceCursor(ctx, &next, from, to, target); err != nil {
 		return queries, fmt.Errorf("request evidence cursor publish: %w", err)
 	}
+	*state = next
 	m.cloudWatchNginxEvidenceFrom.Store(state.EvidenceCoverageFromTs)
 	m.cloudWatchNginxEvidenceThrough.Store(state.EvidenceThroughTs)
 	m.cloudWatchNginxEvidenceLastSuccess.Store(state.EvidenceLastSuccessAt)
@@ -668,6 +784,7 @@ func (m *Monitor) processCloudWatchNginxEvidenceChunk(ctx context.Context, state
 	}
 	queries, err := m.runCloudWatchNginxEvidenceWindow(ctx, state, from, to, target)
 	if err != nil {
+		narrowCloudWatchNginxEvidenceRead(state, to-from, err)
 		m.recordCloudWatchNginxEvidenceFailure(state, err, time.Now().Unix())
 		m.cloudWatchNginxEvidenceLastFailure.Store(state.EvidenceLastFailureAt)
 		slog.Warn("CloudWatch Nginx 请求级证据补扫失败(保留水位重试)",
@@ -697,7 +814,25 @@ func (m *Monitor) publishCloudWatchNginxRepairWindow(ctx context.Context, state 
 }
 
 func (m *Monitor) runCloudWatchNginxWindowMode(ctx context.Context, state *CloudWatchNginxCursor,
-	from, to, target int64, repair bool) (int, error) {
+	from, to, target int64, repair bool) (queryCount int, runErr error) {
+	return m.runCloudWatchNginxWindowLane(ctx, state, from, to, target, repair, false)
+}
+
+func (m *Monitor) runCloudWatchNginxWindowLane(ctx context.Context, state *CloudWatchNginxCursor,
+	from, to, target int64, repair, replay bool) (queryCount int, runErr error) {
+	started := time.Now()
+	width, fast := state.ReadWindowSeconds, &m.cloudWatchNginxFastWindows
+	if repair {
+		width, fast = state.RepairReadWindowSeconds, &m.cloudWatchNginxRepairFastWindows
+	}
+	if replay {
+		width, fast = state.ReplayReadWindowSeconds, &m.cloudWatchNginxReplayFastWindows
+	}
+	defer func() {
+		if runErr != nil {
+			fast.Store(0)
+		}
+	}()
 	parser, err := m.cloudWatchEvidenceParser(false)
 	if err != nil {
 		return 0, err
@@ -707,6 +842,19 @@ func (m *Monitor) runCloudWatchNginxWindowMode(ctx context.Context, state *Cloud
 	queries := 0
 	evidence, err := m.queryCloudWatchNginxRange(queryCtx, parser, time.Unix(from, 0).UTC(), time.Unix(to, 0).UTC(), &queries, 0)
 	if err != nil {
+		if cloudWatchNginxTimeoutStage(err) == "execution" {
+			width := max(int64(60), min(int64(15*60), (to-from)/2/60*60))
+			if replay {
+				state.ReplayReadWindowSeconds = width
+				state.ReplayNextTs = from
+			} else if repair {
+				state.RepairReadWindowSeconds = width
+				state.RepairNextTs = from
+			} else {
+				state.ReadWindowSeconds = width
+				state.NextTs = from
+			}
+		}
 		return queries, err
 	}
 	access, errorRows, lastAccess, lastError, err := cloudWatchNginxSamples(evidence, from, to)
@@ -721,13 +869,14 @@ func (m *Monitor) runCloudWatchNginxWindowMode(ctx context.Context, state *Cloud
 		fmt.Sprintf("%s-%d-%d", batchPrefix, from, to)); err != nil {
 		return queries, fmt.Errorf("request evidence persist: %w", err)
 	}
-	if err := m.publishCloudWatchNginxWindowMode(ctx, state, from, to, access, errorRows, lastAccess, lastError, target, repair); err != nil {
+	recoveryWidth := cloudWatchNginxRecoveredWidth(width, to-from, queries, time.Since(started), fast, int64(cloudWatchNginxWindow/time.Second))
+	if err := m.publishCloudWatchNginxWindowLane(ctx, state, from, to, access, errorRows, lastAccess, lastError, target, repair, replay, recoveryWidth); err != nil {
 		return queries, fmt.Errorf("minute aggregate publish: %w", err)
 	}
 	// The primary catch-up windows already contain the same request-level
 	// evidence. Advance the independent evidence watermark only when this exact
 	// window is contiguous; replay and repair windows must not jump it forward.
-	if !repair && state.EvidenceStatus != "disabled" && state.EvidenceNextTs == from {
+	if !repair && !replay && state.EvidenceStatus != "disabled" && state.EvidenceNextTs == from {
 		if err := m.publishCloudWatchNginxEvidenceCursor(ctx, state, from, to, target); err != nil {
 			return queries, err
 		}
@@ -773,117 +922,100 @@ func (m *Monitor) startCloudWatchNginx(ctx context.Context) {
 		m.cloudWatchNginxEvidenceLastSuccess.Store(state.EvidenceLastSuccessAt)
 		m.cloudWatchNginxEvidenceLastFailure.Store(state.EvidenceLastFailureAt)
 		poll := time.Duration(m.cfg.CloudWatchNginxPollSeconds) * time.Second
+		schedule := cloudWatchNginxSchedule{}
 		for {
 			if ctx.Err() != nil {
 				return
 			}
-			// Re-check durable evidence proof before choosing another window.
-			// A failed multi-transaction replacement can invalidate an older
-			// covered interval even though the main cursor did not move.
-			if err := m.refreshCloudWatchNginxEvidenceCursor(ctx, &state, time.Now()); err != nil {
-				m.recordCloudWatchNginxEvidenceFailure(&state, err, time.Now().Unix())
-				if !waitSourceLifecycle(ctx, poll) {
-					return
-				}
-				continue
+			now := time.Now()
+			historyReady := true
+			if err := m.refreshCloudWatchNginxEvidenceCursor(ctx, &state, now); err != nil {
+				m.recordCloudWatchNginxEvidenceFailure(&state, err, now.Unix())
+				historyReady = false
 			}
-			_, target := cloudWatchNginxRange(time.Now(), m.cfg.CloudWatchNginxLookbackHours)
+			_, target := cloudWatchNginxRange(now, m.cfg.CloudWatchNginxLookbackHours)
 			state.TargetThroughTs = target
-			// Once the primary minute lane is caught up, drain the independent
-			// request-evidence backlog before replaying the same recent minutes.
-			// This prevents the five-minute poll interval from throttling the
-			// initial historical evidence backfill.
-			if state.ThroughTs >= target {
-				if processed, evidenceErr := m.processCloudWatchNginxEvidenceChunk(ctx, &state, target); processed {
-					delay := cloudWatchNginxCatchupDelay
-					if evidenceErr != nil {
-						delay = poll
-					}
-					if !waitSourceLifecycle(ctx, delay) {
-						return
-					}
-					continue
+			if m.cfg.TokenFactsEnabled && state.EvidenceStatus != "disabled" && m.nginxEvidenceDB != nil {
+				w, found, e := selectCloudWatchNginxRecentWindow(m.nginxEvidenceDB.WithContext(ctx), now.Unix())
+				if e == nil && found {
+					schedule.recentFrom, schedule.recentTo = w.StartAt, w.EndAt
+				} else {
+					schedule.recentFrom, schedule.recentTo = 0, 0
+				}
+				if e != nil {
+					slog.Warn("CloudWatch Nginx recent scheduling deferred", "detail", cloudWatchNginxErrorDetail(e))
 				}
 			}
-			from := state.NextTs
-			if state.Status == "caught_up" {
-				from = state.ThroughTs - int64(cloudWatchNginxReplay/time.Second)
-				if from < state.CoverageFromTs {
-					from = state.CoverageFromTs
-				}
+			lane, from, to, replayEnd, ok := schedule.choose(state, target, now, poll)
+			if !historyReady {
+				lane, from, to, replayEnd = nginxRecent, schedule.recentFrom, schedule.recentTo, 0
+				ok = to > from && !now.Before(schedule.due[nginxRecent])
 			}
-			to := from + int64(cloudWatchNginxWindow/time.Second)
-			if to > target {
-				to = target
-			}
-			if to <= from {
-				// The minute lane is already caught up.  Continue the independent
-				// request-evidence backfill even when the old main cursor was
-				// caught_up before evidence persistence was enabled.
-				if processed, evidenceErr := m.processCloudWatchNginxEvidenceChunk(ctx, &state, target); processed {
-					delay := cloudWatchNginxCatchupDelay
-					if evidenceErr != nil {
-						delay = poll
-					}
-					if !waitSourceLifecycle(ctx, delay) {
-						return
-					}
-					continue
-				}
-				if !waitSourceLifecycle(ctx, poll) {
+			if !ok {
+				if !waitSourceLifecycle(ctx, schedule.idleDelay(now, poll)) {
 					return
 				}
 				continue
 			}
-			queries, runErr := m.runCloudWatchNginxWindow(ctx, &state, from, to, target)
-			if runErr != nil {
-				m.recordCloudWatchNginxFailure(&state, runErr, time.Now().Unix())
-				slog.Warn("CloudWatch Nginx 持续采集失败(保留水位重试)",
-					"from", from, "to", to, "queries", queries, "class", cloudWatchPreRouteErrorCode(runErr), "detail", cloudWatchNginxErrorDetail(runErr))
-				if !waitSourceLifecycle(ctx, poll) {
-					return
-				}
-				continue
+			if m.cfg.TokenFactsEnabled && state.EvidenceStatus != "disabled" && lane != nginxRecent {
+				// Historical work keeps its left boundary and proof; a small turn
+				// lets the recent lane run between remote queries without extra concurrency.
+				to = min(to, from+60)
 			}
-			// If this primary window did not advance the independent cursor (for
-			// example, the main lane was already caught up before evidence was
-			// enabled), consume one bounded evidence chunk before the optional
-			// late-log repair.  The chunk is replacement-based and fail-closed.
-			if state.ThroughTs >= target {
-				if processed, evidenceErr := m.processCloudWatchNginxEvidenceChunk(ctx, &state, target); processed {
-					if evidenceErr != nil {
-						if !waitSourceLifecycle(ctx, poll) {
-							return
-						}
-					} else if !waitSourceLifecycle(ctx, cloudWatchNginxCatchupDelay) {
-						return
-					}
+			// Persist a newly scheduled replay before reading. Its unfinished
+			// suffix survives cancellation/restart without changing NextTs.
+			if lane == nginxReplay && state.ReplayThroughTs <= state.ReplayNextTs {
+				next := state
+				next.ReplayNextTs, next.ReplayThroughTs = from, replayEnd
+				if err := m.storeDB.WithContext(ctx).Save(&next).Error; err != nil {
+					m.recordCloudWatchNginxFailure(&state, err, now.Unix())
+					schedule.due[lane] = now.Add(poll)
 					continue
 				}
+				state = next
 			}
-			slog.Info("CloudWatch Nginx 持续采集完成窗口", "from", from, "to", to,
-				"through", state.ThroughTs, "target", target, "queries", queries)
-			if state.ThroughTs >= target && (state.LastRepairAt == 0 ||
-				time.Now().Unix()-state.LastRepairAt >= int64(cloudWatchNginxRepairEvery/time.Second)) {
-				repairFrom, repairTo, ok := cloudWatchNginxRepairWindow(state, target)
-				if ok {
-					repairQueries, repairErr := m.runCloudWatchNginxRepairWindow(ctx, &state, repairFrom, repairTo, target)
-					if repairErr != nil {
-						m.recordCloudWatchNginxFailure(&state, repairErr, time.Now().Unix())
-						slog.Warn("CloudWatch Nginx 历史补扫失败(保留修复水位重试)",
-							"from", repairFrom, "to", repairTo, "queries", repairQueries,
-							"class", cloudWatchPreRouteErrorCode(repairErr), "detail", cloudWatchNginxErrorDetail(repairErr))
-					} else {
-						slog.Info("CloudWatch Nginx 历史补扫完成窗口", "from", repairFrom, "to", repairTo,
-							"next", state.RepairNextTs, "queries", repairQueries)
-					}
+			var queries int
+			var runErr error
+			workCtx, finishTurn := context.WithCancel(ctx)
+			if m.cfg.TokenFactsEnabled && state.EvidenceStatus != "disabled" {
+				finishTurn()
+				workCtx, finishTurn = context.WithTimeout(ctx, 20*time.Second)
+			}
+			if lane == nginxRecent {
+				queries, runErr = m.runCloudWatchNginxRecentWindow(workCtx, from, to)
+			} else if lane == nginxEvidence {
+				queries, runErr = m.runCloudWatchNginxEvidenceWindow(workCtx, &state, from, to, target)
+				if runErr != nil && workCtx.Err() == nil {
+					narrowCloudWatchNginxEvidenceRead(&state, to-from, runErr)
+					m.recordCloudWatchNginxEvidenceFailure(&state, runErr, time.Now().Unix())
+				}
+			} else {
+				queries, runErr = m.runCloudWatchNginxWindowLane(workCtx, &state, from, to, target, lane == nginxRepair, lane == nginxReplay)
+				if runErr != nil && workCtx.Err() == nil {
+					m.recordCloudWatchNginxFailure(&state, runErr, time.Now().Unix())
 				}
 			}
-			delay := cloudWatchNginxCatchupDelay
-			if state.ThroughTs >= target {
-				delay = poll
+			yielded := runErr != nil && workCtx.Err() != nil && ctx.Err() == nil
+			finishTurn()
+			if ctx.Err() != nil {
+				return
 			}
-			if !waitSourceLifecycle(ctx, delay) {
+			if yielded {
+				schedule.due[lane] = time.Now().Add(cloudWatchNginxCatchupDelay)
+				slog.Info("CloudWatch Nginx 窗口延期(保留水位重试)", "lane", lane.String(), "from", from, "to", to, "queries", queries, "state", "deferred")
+			} else if runErr != nil {
+				schedule.due[lane] = time.Now().Add(cloudWatchNginxRetryDelay(runErr, poll))
+				if lane == nginxRecent {
+					schedule.due[lane] = time.Now().Add(cloudWatchNginxCatchupDelay)
+				}
+				slog.Warn("CloudWatch Nginx 窗口失败(保留水位重试)", "lane", lane.String(), "from", from, "to", to, "queries", queries,
+					"stage", cloudWatchNginxTimeoutStage(runErr), "class", cloudWatchPreRouteErrorCode(runErr), "detail", cloudWatchNginxErrorDetail(runErr))
+			} else {
+				schedule.due[lane] = time.Now().Add(cloudWatchNginxCatchupDelay)
+				slog.Info("CloudWatch Nginx 完成窗口", "lane", lane.String(), "from", from, "to", to, "through", state.ThroughTs,
+					"evidence_through", state.EvidenceThroughTs, "target", target, "queries", queries)
+			}
+			if !waitSourceLifecycle(ctx, cloudWatchNginxCatchupDelay) {
 				return
 			}
 		}

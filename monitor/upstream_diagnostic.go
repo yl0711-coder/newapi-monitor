@@ -158,6 +158,7 @@ func diagnosePublicUpstream(ctx context.Context, client *http.Client, base strin
 				{upstreamProviderAICodeWith, []string{"aicodewith"}},
 				{upstreamProviderTokenForce, []string{"tokenforce", "fastmodels", "海南海纳"}},
 				{upstreamProviderOpenOx, []string{"openox"}},
+				{upstreamProviderOrion, []string{"<title>orion</title>"}},
 				{upstreamProviderSub2API, []string{"sub2api", "sub2-api"}},
 				{upstreamProviderNewAPI, []string{"new-api", "new api", "one-api"}},
 			} {

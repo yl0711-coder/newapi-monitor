@@ -383,11 +383,11 @@ func TestLocateChannelDataWarningHoursTrimmedGroupsAndLimit(t *testing.T) {
 	if len(warnings[0].Hours) != 1 || warnings[0].Hours[0] != 7200 || warnings[0].HoursTruncated {
 		t.Fatalf("hours = %v truncated=%v (hour 3600 is fully sampled across both group spellings)", warnings[0].Hours, warnings[0].HoursTruncated)
 	}
-	rows := make([]StabilityHourSample, 0, maxChannelManagementRows+1)
-	for i := 0; i <= maxChannelManagementRows; i++ {
-		rows = append(rows, StabilityHourSample{HourTs: int64(10+i) * 3600, ChannelID: 195, ModelName: "a", Grp: "internal", TrafficClassVersion: 7, Success: 1})
-	}
-	if err := m.storeDB.CreateInBatches(rows, 500).Error; err != nil {
+	// One INSERT ... SELECT for the over-limit hours (thousands of ORM inserts
+	// are slow under the race detector).
+	if err := m.storeDB.Exec(`WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i+1 FROM n WHERE i < ?)
+		INSERT INTO stability_hour_samples (hour_ts, channel_id, model_name, grp, traffic_class_version, success)
+		SELECT (10+i)*3600, 195, 'a', 'internal', 7, 1 FROM n`, maxChannelManagementRows).Error; err != nil {
 		t.Fatal(err)
 	}
 	scope.ToTs = int64(20+maxChannelManagementRows) * 3600

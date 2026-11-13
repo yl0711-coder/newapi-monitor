@@ -13,6 +13,8 @@ let fReason="";
 let fUser="";
 let lastRows=[];
 let rowTotal=0,hasMore=false,nextCursor="",loading=false,generation=0,abort=null,lastError="";
+let refreshTimer=null,active=false;
+let paged=false;
 const $=id=>document.getElementById(id);
 const esc=s=>String(s==null?"":s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 const nfmt=n=>(+n||0).toLocaleString("zh-CN");
@@ -31,8 +33,37 @@ const shiftDate=(d,delta)=>{
 
 window.alertsActivate=function(){
   if(!inited)init();
-  if(!loaded)load();
+  active=true;
+  refreshLatest();
+  scheduleRefresh();
 };
+window.alertsDeactivate=function(){
+  active=false;
+  generation++;
+  abort?.abort();abort=null;loading=false;
+  if(refreshTimer){clearTimeout(refreshTimer);refreshTimer=null}
+};
+
+function scheduleRefresh(){
+  if(refreshTimer)clearTimeout(refreshTimer);
+  refreshTimer=null;
+  if(document.hidden||$('tab-alerts')?.hidden||!active)return;
+  refreshTimer=setTimeout(()=>{
+    refreshTimer=null;
+    if(!document.hidden&&!$('tab-alerts')?.hidden&&active)refreshLatest();
+    scheduleRefresh();
+  },30000);
+}
+
+// A filter or continuation stays within its displayed snapshot. Live refresh
+// must release that cutoff so a newly collected prefix can become visible.
+function refreshLatest(){
+  if(paged){renderFreshness();return}
+  if(loading)return;
+  cutoffTs=0;
+  return load(false,true);
+}
+function resumeLive(){paged=false;return refreshLatest()}
 
 function init(){
   inited=true;
@@ -64,7 +95,17 @@ function init(){
     load();
   });
   $("alMore")?.addEventListener("click",()=>load(true));
+  $("alRefreshLatest")?.addEventListener("click",resumeLive);
   sync();
+  const refreshIfVisible=()=>{
+    if(document.hidden||$('tab-alerts')?.hidden||!active)return;
+    refreshLatest();scheduleRefresh();
+  };
+  window.addEventListener('focus',refreshIfVisible);
+  document.addEventListener('visibilitychange',()=>{
+    if(document.hidden){if(refreshTimer){clearTimeout(refreshTimer);refreshTimer=null}}
+    else refreshIfVisible();
+  });
 }
 // sync 同步日期状态到控件。
 function sync(){
@@ -82,7 +123,13 @@ sync();
 load();
 }
 // setStatus/setNotes 与客户排障一致：状态短句放筛选栏，覆盖说明放独立条。
-function setStatus(t){const el=$("alStatus");if(el)el.textContent=t||"";}
+function updateView(update){
+  if(window.MonitorView)return window.MonitorView.preserve($('tab-alerts'),update);
+  return update();
+}
+// Status and coverage text can wrap differently from the previous response.
+// Preserve the row before changing that text, not only before repainting rows.
+function setStatus(t){updateView(()=>{const el=$("alStatus");if(el)el.textContent=t||"";});}
 function setNotes(t){
   const el=$("alNotes");
   if(!el)return;
@@ -93,14 +140,18 @@ function setNotes(t){
 // 覆盖不完整时必须在表格上方显著提示。数量仍可用于排查已采集的事实，
 // 但不能被读成整个日期范围的最终总数。
 function syncCoverageWarning(){
+  return updateView(renderCoverageWarning);
+}
+function renderCoverageWarning(){
   const el=$("alCoverageWarning");
   if(!el)return;
-  if(lastMeta.coverage_complete===true){
+  const sync=window.MonitorView?.freshness(lastMeta);
+  if((lastMeta.statistics_complete===true||lastMeta.coverage_complete===true)&&!lastMeta.collection_failed&&!sync?.warning){
     el.hidden=true;el.textContent="";return;
   }
   if(lastMeta.statistics_complete===true){
-    let text="截至 "+fmtTs(lastMeta.to_ts)+(lastMeta.tail_syncing?"，尾部同步中":"，固定统计窗口")+"；以下数量仅统计已连续覆盖的时间范围。";
-    if(lastMeta.collection_failed)text+=" 最近一次采集失败，正在等待恢复。";
+    let text="截至 "+fmtTs(lastMeta.to_ts)+" 的统计窗口覆盖完整。";
+    text+=sync?.text||(lastMeta.collection_failed?"最近一次采集失败，正在等待恢复。":"");
     el.hidden=false;el.textContent=text;return;
   }
   const source=lastMeta.source||"未知来源";
@@ -118,22 +169,22 @@ function setBody(html){
   if(b)b.innerHTML=html;
 }
 
-let lastMeta={enabled:true,total:0,truncated:false,note:"",coverage_complete:false,statistics_complete:false,statistics_available:false,tail_syncing:false,collection_failed:false,from_ts:0,to_ts:0,source:"unknown",through_ts:0,target_ts:0,unauth_count:0,
+let lastMeta={enabled:true,total:0,truncated:false,note:"",coverage_complete:false,statistics_complete:false,statistics_available:false,tail_syncing:false,collection_failed:false,from_ts:0,to_ts:0,source:"unknown",through_ts:0,target_ts:0,generated_at:0,lag_seconds:0,unauth_count:0,
   unknown_customer_count:0,unknown_user_quota_count:0,unknown_pre_consume_count:0,
   unknown_token_quota_count:0,unknown_quota_account_count:0,unknown_customer_other_count:0,
   reason_options:[]};
 
-async function load(more=false){
+async function load(more=false,background=false){
   if(more&&(!hasMore||!nextCursor||loading))return;
   const gen=++generation;
   loading=true;
   lastError="";
   abort?.abort();
   const ac=new AbortController();abort=ac;
-  if(!more){lastRows=[];rowTotal=0;hasMore=false;nextCursor="";}
-  if(!more){lastMeta.coverage_complete=false;lastMeta.statistics_complete=false;lastMeta.statistics_available=false;lastMeta.tail_syncing=false;lastMeta.source="unknown";lastMeta.through_ts=0;lastMeta.target_ts=0;syncCoverageWarning();}
-  setStatus(more?"加载更多…":"正在读取…");
-  if(!more)setBody('<tr><td colspan="6" class="lc-empty">加载中…</td></tr>');
+  if(!more&&!background){lastRows=[];rowTotal=0;hasMore=false;nextCursor="";paged=false;}
+  if(!more&&!background){lastMeta.coverage_complete=false;lastMeta.statistics_complete=false;lastMeta.statistics_available=false;lastMeta.tail_syncing=false;lastMeta.source="unknown";lastMeta.through_ts=0;lastMeta.target_ts=0;lastMeta.generated_at=0;lastMeta.lag_seconds=0;syncCoverageWarning();}
+  setStatus(more?"加载更多…":loaded&&background?"正在更新，当前仍显示上次结果…":"正在读取…");
+  if(!more&&!background)setBody('<tr><td colspan="6" class="lc-empty">加载中…</td></tr>');
   syncMore();
   try{
     const q=new URLSearchParams({from:date,to:date,limit:"100"});
@@ -156,6 +207,7 @@ async function load(more=false){
     hasMore=!!d.has_more;
     nextCursor=d.next_cursor||"";
     lastMeta={enabled:d.enabled!==false,total:d.total||0,
+      timing:d.timing,
       truncated:!!d.has_more,note:d.coverage_note||"",
       coverage_complete:d.coverage_complete===true,
       statistics_complete:d.statistics_complete===true||d.coverage_complete===true,
@@ -165,6 +217,7 @@ async function load(more=false){
       tail_syncing:d.tail_syncing===true,collection_failed:d.collection_failed===true,
       from_ts:+d.from_ts||0,to_ts:+d.to_ts||0,
       source:d.source||"unknown",through_ts:+d.through_ts||0,target_ts:+d.target_ts||0,
+      generated_at:+d.generated_at||0,lag_seconds:Number.isFinite(d.lag_seconds)?d.lag_seconds:null,
       unauth_count:d.unauth_count||0,
       unknown_customer_count:d.unknown_customer_count||0,
       unknown_user_quota_count:d.unknown_user_quota_count||0,
@@ -179,14 +232,15 @@ async function load(more=false){
     syncCoverageWarning();
     fillReasonOptions(d.reason_options||[]);
     loading=false;
-    setStatus("");
+    if(more)paged=true;
+    renderFreshness();
     paint();
   }catch(e){
     if(e.name==="AbortError"||gen!==generation)return;
     loading=false;
     lastError=e.message||String(e);
     setStatus("读取失败："+lastError);
-    if(!more)lastRows=[];
+    if(!more&&!background)lastRows=[];
     syncCoverageWarning();
     paint();
   }finally{
@@ -194,7 +248,15 @@ async function load(more=false){
   }
 }
 
+function renderFreshness(){
+  const freshness=lastMeta.generated_at?"响应生成 "+fmtTs(lastMeta.generated_at)+
+    (lastMeta.through_ts?" · 数据截至 "+fmtTs(lastMeta.through_ts):" · 水位与延迟未知"):"";
+  const timing=window.MonitorView?.timing(lastMeta)||'';
+  setStatus([freshness,timing].filter(Boolean).join(' ')+(paged?' · 正在浏览分页，自动刷新暂停；可返回最新结果':''));
+}
+
 function syncMore(){
+  const latest=$("alRefreshLatest");if(latest)latest.hidden=!paged;
   const b=$("alMore");if(!b)return;
   b.hidden=!hasMore;
   b.disabled=loading;
@@ -342,6 +404,9 @@ const cust=x=>{
 // 两处各算一遍口径一旦漂移就会互相打脸。这里只回答
 // 「哪个客户、什么时候、请求什么、为什么被拒」。
 function paint(){
+  return updateView(paintContent);
+}
+function paintContent(){
   syncCoverageWarning();
   if(lastError){
     setNotes(lastRows.length?"加载更多失败，已保留此前加载的记录。":"读取失败，请检查连接后重试。");
@@ -413,7 +478,7 @@ function paint(){
     // 分组/模型：额度类错误的日志本来就不带这两项，显示「—」而不是猜。
     const grp=x.grp?esc(x.grp):'<span class="lc-sub">—</span>';
     const model=(x.model&&x.model!=="unknown")?esc(x.model):'<span class="lc-sub">—</span>';
-    return "<tr><td>"+fmtTs(x.ts)+"</td>"+
+    return '<tr data-al-row="'+esc(JSON.stringify([x.ts,x.user_id,x.grp,x.model,x.reason]))+'"><td>'+fmtTs(x.ts)+"</td>"+
       cust(x)+
       "<td>"+grp+"</td>"+
       "<td>"+model+"</td>"+

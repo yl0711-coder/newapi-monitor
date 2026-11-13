@@ -1,20 +1,8 @@
 package monitor
 
-// logchain_fault.go：疑似责任方归因。回答排障最核心的问题——**这条请求出错，是谁的问题。**
-//
-// ★★ 这一层输出的是**推断，不是事实** ★★
-//
-// 与本页其它字段的根本区别：
-//   - end_reason / content / channel_id → **事实**，转述 new-api 或上游写下的原值
-//   - fault（本文件产出）              → **推断**，我方规则对事实的解读
-//
-// 因此每条判断都必须携带依据（FaultWhy）与可信度（FaultConfidence），
-// 并且必须保留「待判」这一档。没有「待判」，规则会被迫对每条给答案，
-// 模糊的那些会得到看似确定实则瞎猜的结论——**那比不给结论更糟**：
-// 判成"我方配置"会让人去改自己的配置，而问题其实在上游。
-//
-// 规则来源：2026-08-21 与 08-24 两天生产真实数据（约 3600 条问题记录）逐条核对得出。
-// 全部判据都有实测支撑，注释里记了条数——那是判断可信度的唯一依据。
+// 客户排障先使用文档规则表，分别输出明确原因、责任方和仍需补取的证据。
+// 原文事实与规则结论同时保留。未命中文档的记录沿用下面的历史推断兜底；
+// 共享统计读取的错误码映射保持原口径，不使用客户排障专用规则表。
 
 import (
 	"regexp"
@@ -324,6 +312,7 @@ func logChainHighFirstByteHintEligible(r LogChainRow) bool {
 
 // logChainFault 归因结果。三个字段必须一起用：只显示 Fault 会让推断被当成事实。
 type logChainFault struct {
+	Diagnosis  *LogChainDiagnosis
 	Fault      string // faultUpstream / faultOurs / faultDownstream / faultUnknown
 	Confidence string
 	Why        string // 依据。必须能让人复核，不能只说结论
@@ -339,6 +328,13 @@ type logChainFault struct {
 // “页面刚好查到的其它请求”偷偷混入基础规则，同时能把完整证据下的待判
 // 降到最低。证据不完整时仍保留 unknown，绝不为了凑覆盖率硬猜。
 func logChainAttributeFaultWithEvidence(r LogChainRow, tags []string) logChainFault {
+	r.AnomalyTags = tags
+	r = logChainWithExactUpstreamDiagnostic(r)
+	// Unified order: specific catalogue cause, trusted same-attempt code,
+	// then generic wrappers. Evidence may refine the cause without changing SQL.
+	if diagnosis := logChainDiagnose(r); diagnosis != nil {
+		return logChainDiagnosisFault(diagnosis)
+	}
 	f := logChainAttributeFault(r, tags)
 	// Nginx 的 upstream_status 是 NewAPI 的 HTTP 状态，不是模型供应商的。
 	// type=2 的流错误/断连耗时也不能单独证明供应商责任；已验证入口
@@ -354,6 +350,7 @@ func logChainAttributeFaultWithEvidence(r LogChainRow, tags []string) logChainFa
 		f = logChainRefineUnknownFault(r, f)
 	}
 	f.Reason = logChainHumanFaultReason(r, f)
+	f.Diagnosis = logChainDeliveryDiagnostic(r, f)
 	return f
 }
 
@@ -411,12 +408,16 @@ func logChainVerifiedClientDisconnectFault() logChainFault {
 // 上游精确/唯一关联可以把通用状态码从“待判”提升为上游错误；
 // Nginx 入口证据只判断客户端与 Nginx/NewAPI 这一跳，不能冒充模型供应商证据。
 func logChainRefineUnknownFault(r LogChainRow, f logChainFault) logChainFault {
+	r = logChainWithExactUpstreamDiagnostic(r)
+	if diagnosis := logChainDiagnose(r); diagnosis != nil {
+		return logChainDiagnosisFault(diagnosis)
+	}
 	if f.Fault != faultUnknown {
 		return f
 	}
 	if r.Type == 5 && r.UpstreamMatch != nil {
 		match := r.UpstreamMatch
-		if match.Confidence == correlateExact || match.Confidence == correlateProbable {
+		if match.Confidence == correlateExact {
 			if rule, ok := logChainFaultByErrorCode[match.UpstreamErrorCode]; ok {
 				return logChainFault{Fault: rule.fault, Confidence: rule.confidence,
 					Why: rule.why + "；已在上游错误日志中找到对应请求"}
@@ -481,6 +482,12 @@ func containsAny(value string, needles ...string) bool {
 // logChainHumanFaultReason 把技术字段翻译成表格里一眼能看懂的原因。
 // 原始 content、error_code 和 FaultWhy 仍在展开区保留，避免人话摘要丢失证据。
 func logChainHumanFaultReason(r LogChainRow, f logChainFault) string {
+	if f.Diagnosis != nil {
+		return f.Diagnosis.Reason
+	}
+	if diagnosis := logChainDiagnose(logChainWithExactUpstreamDiagnostic(r)); diagnosis != nil {
+		return diagnosis.Reason
+	}
 	if f.Fault == "" {
 		return ""
 	}
@@ -574,47 +581,8 @@ func logChainHumanFaultReason(r LogChainRow, f logChainFault) string {
 	}
 	// error_code 是上游或路由层记录的更具体事实。优先把它翻译成人话，
 	// 但只有责任方与代码语义一致时才使用，避免证据冲突时再造一层矛盾。
-	switch strings.ToLower(strings.TrimSpace(r.UpstreamErrorCode)) {
-	case "channel:response_time_exceeded":
-		if f.Fault == faultUpstream {
-			return "上游渠道响应太慢，超过了上游允许的等待时间"
-		}
-	case "do_request_failed":
-		if f.Fault == faultUpstream {
-			return "上游没有把请求成功发到模型渠道"
-		}
-	case "bad_response_body":
-		if f.Fault == faultUpstream {
-			return "上游返回的数据格式不正确，无法继续处理"
-		}
-	case "upstream_error":
-		if f.Fault == faultUpstream {
-			return "上游明确报告它后面的供应商返回了错误"
-		}
-	case "upstream_http2_stream_error", "stream_read_error":
-		if f.Fault == faultUpstream {
-			return "读取上游响应流时出错，回答没有正常完成"
-		}
-	case "session_blocked_by_cyber_policy":
-		if f.Fault == faultUpstream {
-			return "上游的安全策略拦截了这次请求"
-		}
-	case "insufficient_user_quota":
-		if f.Fault == faultOurs {
-			return "我们配置的上游账号额度不足，需要到上游充值或更换账号"
-		}
-	case "user:concurrency_limited":
-		if f.Fault == faultOurs {
-			return "我们配置的上游账号被并发限流，需要降低并发或申请提额"
-		}
-	case "array_above_max_length":
-		if f.Fault == faultDownstream {
-			return "客户请求里的数组太长，超过了接口允许的长度"
-		}
-	case "invalid_value":
-		if f.Fault == faultDownstream {
-			return "客户请求参数的值不合法，上游拒绝处理"
-		}
+	if reason := logChainHumanErrorCodeReason(r.UpstreamErrorCode, f.Fault); reason != "" {
+		return reason
 	}
 	code := r.UpstreamStatusCode
 	if code == 0 {
@@ -723,8 +691,9 @@ func logChainRefreshFaults(rows []LogChainRow) {
 		if len(rows[i].AnomalyTags) == 0 && rows[i].Type != 5 {
 			continue
 		}
+		rows[i] = logChainWithExactUpstreamDiagnostic(rows[i])
 		f := logChainAttributeFaultWithEvidence(rows[i], rows[i].AnomalyTags)
-		rows[i].Fault, rows[i].FaultConfidence, rows[i].FaultWhy, rows[i].FaultReason = f.Fault, f.Confidence, f.Why, f.Reason
+		logChainApplyFault(&rows[i], f)
 	}
 }
 
@@ -790,6 +759,12 @@ func logChainAttributionSummaryForRows(rows []LogChainRow) logChainAttributionSu
 //  4. 客户断连的耗时/产出启发式
 //  5. 兜底 → 待判（绝不猜）
 func logChainAttributeFault(r LogChainRow, tags []string) logChainFault {
+	r.AnomalyTags = tags
+	// The diagnostic entry includes the source-gated specific code layer before
+	// it can return a generic request failed / openai_error conclusion.
+	if diagnosis := logChainDiagnose(r); diagnosis != nil {
+		return logChainDiagnosisFault(diagnosis)
+	}
 	isErr := r.Type == 5
 	hasTag := len(tags) > 0
 	if !isErr && !hasTag {
@@ -920,4 +895,50 @@ func logChainClientGoneFault(r LogChainRow) logChainFault {
 		return logChainFault{Fault: faultUnknown, Confidence: faultConfNone,
 			Why: "上游已开口但零产出，客户在 " + sec(afterOpen) + " 秒后断开——时长不足以区分上游停滞与客户放弃"}
 	}
+}
+
+func logChainHumanErrorCodeReason(errorCode, fault string) string {
+	switch strings.ToLower(strings.TrimSpace(errorCode)) {
+	case "channel:response_time_exceeded":
+		if fault == faultUpstream {
+			return "上游渠道响应太慢，超过了上游允许的等待时间"
+		}
+	case "do_request_failed":
+		if fault == faultUpstream {
+			return "上游没有把请求成功发到模型渠道"
+		}
+	case "bad_response_body":
+		if fault == faultUpstream {
+			return "上游返回的数据格式不正确，无法继续处理"
+		}
+	case "upstream_error":
+		if fault == faultUpstream {
+			return "上游明确报告它后面的供应商返回了错误"
+		}
+	case "upstream_http2_stream_error", "stream_read_error":
+		if fault == faultUpstream {
+			return "读取上游响应流时出错，回答没有正常完成"
+		}
+	case "session_blocked_by_cyber_policy":
+		if fault == faultUpstream {
+			return "上游的安全策略拦截了这次请求"
+		}
+	case "insufficient_user_quota":
+		if fault == faultOurs {
+			return "我们配置的上游账号额度不足，需要到上游充值或更换账号"
+		}
+	case "user:concurrency_limited":
+		if fault == faultOurs {
+			return "我们配置的上游账号被并发限流，需要降低并发或申请提额"
+		}
+	case "array_above_max_length":
+		if fault == faultDownstream {
+			return "客户请求里的数组太长，超过了接口允许的长度"
+		}
+	case "invalid_value":
+		if fault == faultDownstream {
+			return "客户请求参数的值不合法，上游拒绝处理"
+		}
+	}
+	return ""
 }

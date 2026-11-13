@@ -161,6 +161,30 @@ func (m *Monitor) initializeSource() error {
 		return err
 	}
 	m.sourceLeaseName = leaseName
+	if m.cfg.LogChainOnlySource {
+		// This lane runs bounded read-only queries over the tunnel. Preparing
+		// and closing a statement for each page adds protocol round trips that
+		// can consume its entire read budget before rows arrive. Let the MySQL
+		// driver bind parameters in one query, retaining its escaping rules and
+		// unsafe-collation validation. Explicit DSN choices remain authoritative.
+		fast := parsed.Clone()
+		if !strings.Contains(dsn, "interpolateParams=") {
+			fast.InterpolateParams = true
+			if _, err := mysqlDriver.ParseDSN(fast.FormatDSN()); err != nil {
+				fast.InterpolateParams = parsed.InterpolateParams
+			}
+		}
+		// The read-only tunnel carries complete log content/other fields. Use
+		// negotiated protocol compression to reduce transport time without
+		// truncating evidence or changing SQL/connection budgets. MySQL can
+		// decline compression; an explicit DSN choice remains authoritative.
+		if !strings.Contains(dsn, "compress=") {
+			_ = fast.Apply(mysqlDriver.EnableCompression(true))
+		}
+		if _, err := mysqlDriver.ParseDSN(fast.FormatDSN()); err == nil {
+			dsn = fast.FormatDSN()
+		}
+	}
 
 	open := m.cfg.sourceOpen
 	if open == nil {
@@ -220,7 +244,10 @@ func sourcePreflightQueriesForSettings(cfg Settings) []string {
 	// 客户排障验收环境只需要直查 logs，并用 channels 补渠道名/上游域名。
 	// 显式模式之外一律保持原来的完整权限校验，不能让生产因少授权而假健康。
 	if cfg.LogChainOnlySource {
-		return append([]string(nil), sourcePreflightQueries[:2]...)
+		// Validate every required column/permission with one zero-row query.
+		// A slow SSH handshake plus Ping and two separate queries could exhaust
+		// the five-second probe before an otherwise usable source became ready.
+		return []string{"SELECT * FROM (" + sourcePreflightQueries[0] + ") AS source_logs CROSS JOIN (" + sourcePreflightQueries[1] + ") AS source_channels WHERE 1=0"}
 	}
 	queries := append([]string(nil), sourcePreflightQueries...)
 	// Full-history boundary discovery deliberately forces this production index.
@@ -240,19 +267,23 @@ func (m *Monitor) probeSource(ctx context.Context) error {
 	if m.cfg.sourceProbe != nil {
 		return m.cfg.sourceProbe(ctx, m.prodDB)
 	}
-	if err := m.prodDB.PingContext(ctx); err != nil {
-		return err
-	}
-	for _, query := range sourcePreflightQueriesForSettings(m.cfg) {
-		rows, err := m.prodDB.QueryContext(ctx, query)
-		if err != nil {
-			return err
+	// The schema reads already check connectivity. Keep one connection for
+	// the complete validation, without a redundant Ping round trip or picking
+	// another connection from the pool for each table.
+	return sourceProbeConnection(ctx, m.prodDB, func(conn *sql.Conn) error {
+		for _, query := range sourcePreflightQueriesForSettings(m.cfg) {
+			started := time.Now()
+			rows, err := conn.QueryContext(ctx, query)
+			if err != nil {
+				return sourceOperationFailure("preflight_query", started, err)
+			}
+			started = time.Now()
+			if err := rows.Close(); err != nil {
+				return sourceOperationFailure("preflight_receive", started, err)
+			}
 		}
-		if err := rows.Close(); err != nil {
-			return err
-		}
-	}
-	return nil
+		return nil
+	})
 }
 
 func (m *Monitor) pingSource(ctx context.Context) error {
@@ -262,17 +293,31 @@ func (m *Monitor) pingSource(ctx context.Context) error {
 	if m.cfg.sourceProbe != nil {
 		return m.cfg.sourceProbe(ctx, m.prodDB)
 	}
-	return m.prodDB.PingContext(ctx)
+	return sourceProbeConnection(ctx, m.prodDB, func(conn *sql.Conn) error {
+		started := time.Now()
+		return sourceOperationFailure("ping", started, conn.PingContext(ctx))
+	})
 }
 
 func classifySourceError(err error) sourceErrorClass {
+	return classifySourceErrorWithFallback(err, sourceErrorPermanent)
+}
+
+// An unrecognized error is not proof that a running source's configuration
+// changed. Keep startup fail-fast, but let the supervisor revalidate runtime
+// failures. Only identified permission/schema/TLS errors may stop recovery.
+func classifySourceRuntimeError(err error) sourceErrorClass {
+	return classifySourceErrorWithFallback(err, sourceErrorTransient)
+}
+
+func classifySourceErrorWithFallback(err error, fallback sourceErrorClass) sourceErrorClass {
 	if err == nil {
 		return sourceErrorTransient
 	}
 	var my *mysqlDriver.MySQLError
 	if errors.As(err, &my) {
 		switch my.Number {
-		case 1044, 1045, 1046, 1049, 1054, 1142, 1143, 1146, 1176, 1227:
+		case 1044, 1045, 1046, 1049, 1054, 1064, 1109, 1142, 1143, 1146, 1149, 1176, 1227:
 			return sourceErrorPermanent
 		case 1040, 1203, 1205, 1213, 2002, 2003, 2006, 2013, 3024:
 			return sourceErrorTransient
@@ -283,6 +328,12 @@ func classifySourceError(err error) sourceErrorClass {
 	var invalidCert x509.CertificateInvalidError
 	if errors.As(err, &unknownAuthority) || errors.As(err, &hostname) || errors.As(err, &invalidCert) {
 		return sourceErrorPermanent
+	}
+	for _, permanent := range []error{mysqlDriver.ErrNoTLS, mysqlDriver.ErrCleartextPassword,
+		mysqlDriver.ErrNativePassword, mysqlDriver.ErrOldPassword, mysqlDriver.ErrUnknownPlugin, mysqlDriver.ErrOldProtocol} {
+		if errors.Is(err, permanent) {
+			return sourceErrorPermanent
+		}
 	}
 	var dnsErr *net.DNSError
 	if errors.As(err, &dnsErr) {
@@ -303,8 +354,9 @@ func classifySourceError(err error) sourceErrorClass {
 	// ErrInvalidConn. It is a network event, never a configuration error:
 	// treating it as permanent would stop source reads until a manual restart.
 	for _, transient := range []error{
-		mysqlDriver.ErrInvalidConn,
 		context.Canceled, context.DeadlineExceeded, driver.ErrBadConn, io.EOF,
+		sql.ErrConnDone, mysqlDriver.ErrInvalidConn, mysqlDriver.ErrMalformPkt,
+		mysqlDriver.ErrPktSync, mysqlDriver.ErrPktSyncMul, mysqlDriver.ErrBusyBuffer,
 		syscall.ECONNREFUSED, syscall.ECONNRESET, syscall.EHOSTUNREACH,
 		syscall.ENETUNREACH, syscall.ETIMEDOUT, syscall.EPIPE,
 	} {
@@ -330,9 +382,7 @@ func classifySourceError(err error) sourceErrorClass {
 			return sourceErrorPermanent
 		}
 	}
-	// 未知错误在首启时宁可 fail-fast，避免把错表/错驱动当成
-	// 网络抖动后长期空跑。已运行进程会以低频周期复核。
-	return sourceErrorPermanent
+	return fallback
 }
 
 func sourceFailureCode(err error) string {
@@ -340,8 +390,11 @@ func sourceFailureCode(err error) string {
 	if errors.As(err, &my) {
 		return fmt.Sprintf("mysql_%d", my.Number)
 	}
-	if classifySourceError(err) == sourceErrorPermanent {
+	if classifySourceRuntimeError(err) == sourceErrorPermanent {
 		return "permanent"
+	}
+	if classifySourceError(err) == sourceErrorPermanent {
+		return "unclassified"
 	}
 	return "network"
 }
@@ -359,9 +412,33 @@ func (m *Monitor) recordSourceFailure(class sourceErrorClass) int {
 }
 
 func (m *Monitor) recordSourceSuccess() {
-	m.sourceLastSuccessAt.Store(time.Now().Unix())
+	m.recordSourceSuccessAt(time.Now())
+}
+
+func (m *Monitor) recordSourceSuccessAt(at time.Time) {
+	for {
+		previous := m.sourceLastSuccessAt.Load()
+		if previous >= at.Unix() || m.sourceLastSuccessAt.CompareAndSwap(previous, at.Unix()) {
+			break
+		}
+	}
 	m.sourceFailureStreak.Store(0)
 	m.sourceNextRetryAt.Store(0)
+}
+
+func (m *Monitor) recentSourceReadSuccess(now, nextPreflight time.Time, lease sourceLeaseHandle) *time.Time {
+	if !m.cfg.LogChainOnlySource || lease != nil || !now.Before(nextPreflight) {
+		return nil
+	}
+	last := m.sourceReadLastSuccess.Load()
+	if last == nil {
+		return nil
+	}
+	age := now.Sub(*last)
+	if age < 0 || age >= m.sourceCheckEvery() {
+		return nil
+	}
+	return last
 }
 
 func (m *Monitor) reportSourceQueryError(err error) {
@@ -369,7 +446,7 @@ func (m *Monitor) reportSourceQueryError(err error) {
 		errors.Is(err, errSourceNotReady) {
 		return
 	}
-	class := classifySourceError(err)
+	class := classifySourceRuntimeError(err)
 	want := int32(1)
 	if class == sourceErrorPermanent {
 		want = 2
@@ -384,6 +461,8 @@ func (m *Monitor) reportSourceQueryError(err error) {
 			break
 		}
 	}
+	// Record classification without logging SQL, credentials or row payloads.
+	slog.Warn("来源查询连接或配置错误，通知采集恢复", "class", sourceFailureCode(err), "error_type", fmt.Sprintf("%T", err))
 	if m.sourceFailureNotify != nil {
 		select {
 		case m.sourceFailureNotify <- struct{}{}:
@@ -408,6 +487,8 @@ func isSourceConnectionFailure(err error) bool {
 	}
 	for _, target := range []error{
 		driver.ErrBadConn, io.EOF, syscall.ECONNREFUSED, syscall.ECONNRESET,
+		sql.ErrConnDone, mysqlDriver.ErrInvalidConn, mysqlDriver.ErrMalformPkt,
+		mysqlDriver.ErrPktSync, mysqlDriver.ErrPktSyncMul, mysqlDriver.ErrBusyBuffer,
 		syscall.EHOSTUNREACH, syscall.ENETUNREACH, syscall.ETIMEDOUT, syscall.EPIPE,
 	} {
 		if errors.Is(err, target) {
@@ -748,7 +829,7 @@ func (m *Monitor) superviseSource(ctx context.Context) {
 				if errors.Is(err, context.Canceled) && ctx.Err() != nil {
 					return
 				}
-				class := classifySourceError(err)
+				class := classifySourceRuntimeError(err)
 				streak := m.recordSourceFailure(class)
 				if class == sourceErrorPermanent {
 					m.sourceNextRetryAt.Store(0)
@@ -772,7 +853,7 @@ func (m *Monitor) superviseSource(ctx context.Context) {
 		lease, acquired, err := m.acquireSourceLease(leaseCtx)
 		cancel()
 		if err != nil {
-			class := classifySourceError(err)
+			class := classifySourceRuntimeError(err)
 			streak := m.recordSourceFailure(class)
 			if class == sourceErrorPermanent {
 				m.sourceNextRetryAt.Store(0)
@@ -803,6 +884,7 @@ func (m *Monitor) superviseSource(ctx context.Context) {
 		m.setSourceState(sourceStateReady)
 		m.sourceNextRetryAt.Store(0)
 		epochCtx, epochCancel, group := newSourceEpoch(ctx)
+		m.sourceReadLastSuccess.Store(nil)
 		m.setSourceEpochContext(epochCtx)
 		m.sourceWorkerRunning.Store(true)
 		m.startSourceEpoch(epochCtx, group)
@@ -868,6 +950,11 @@ func (m *Monitor) startSourceEpoch(ctx context.Context, group *sourceEpochGroup)
 		if m.cfg.CustomerHealthSourceEnabled {
 			group.Go(ctx, func(workerCtx context.Context) { m.startCustomerHealthSource(workerCtx) })
 		}
+		// Incident 采集接入（MON-003 B3）。必须挂在这个分支里：8204 跑
+		// logchain-only，startSampler 整条不运行，只挂普通分支等于永不执行。
+		// 自身按 CORE_ENABLED && INGEST_ENABLED 总开关判断是否真的起循环。
+		group.Go(ctx, func(workerCtx context.Context) { m.startIncidentIngest(workerCtx) })
+		group.Go(ctx, func(workerCtx context.Context) { m.startTokenMetering(workerCtx) })
 		return
 	}
 	if m.cfg.sourceWorkerStart != nil {
@@ -875,6 +962,8 @@ func (m *Monitor) startSourceEpoch(ctx context.Context, group *sourceEpochGroup)
 		return
 	}
 	group.Go(ctx, func(workerCtx context.Context) { m.startSampler(workerCtx) })
+	group.Go(ctx, func(workerCtx context.Context) { m.startIncidentIngest(workerCtx) })
+	group.Go(ctx, func(workerCtx context.Context) { m.startTokenMetering(workerCtx) })
 	if m.usageFactsEnabled() {
 		group.Go(ctx, func(workerCtx context.Context) { m.superviseUsageFactsSync(workerCtx) })
 		if m.usageFactsFullHistoryEnabled() {
@@ -907,33 +996,62 @@ func (m *Monitor) monitorSourceEpoch(ctx context.Context, lease sourceLeaseHandl
 			m.recordSourceFailure(class)
 			return class, true, false
 		case <-ticker.C:
-			checkCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			if readAt := m.recentSourceReadSuccess(time.Now(), nextPreflight, lease); readAt != nil {
+				m.recordSourceSuccessAt(*readAt)
+				continue
+			}
 			var err error
-			if !time.Now().Before(nextPreflight) {
-				err = m.probeSource(checkCtx)
-				nextPreflight = time.Now().Add(m.sourcePreflightEvery())
-			} else {
-				err = m.pingSource(checkCtx)
-			}
-			if err == nil && lease != nil {
-				var held bool
-				held, err = lease.Check(checkCtx)
-				if err == nil && !held {
-					cancel()
-					return sourceErrorTransient, false, true
+			leaseLost := false
+			var successAt time.Time
+			check := func(checkCtx context.Context) error {
+				var err error
+				if !time.Now().Before(nextPreflight) {
+					err = m.probeSource(checkCtx)
+					nextPreflight = time.Now().Add(m.sourcePreflightEvery())
+				} else if readAt := m.recentSourceReadSuccess(time.Now(), nextPreflight, lease); readAt != nil {
+					// A workload may have completed while this probe waited for
+					// the shared slot. Recheck before issuing another round trip.
+					successAt = *readAt
+				} else {
+					err = m.pingSource(checkCtx)
 				}
+				if err == nil && lease != nil {
+					var held bool
+					held, err = lease.Check(checkCtx)
+					leaseLost = err == nil && !held
+				}
+				return err
 			}
-			cancel()
+			if m.cfg.LogChainOnlySource && lease == nil {
+				// Do not open a competing cold connection while the single source
+				// lane is streaming a healthy read. A queue timeout is not evidence
+				// of connection loss. Keep lease-bearing deployments' checks strict.
+				timing, checkErr := m.withBackgroundSourceLowOperation(ctx, backgroundSourceLowWaitTimeout, 5*time.Second, false, check)
+				if timing.Query == 0 && ctx.Err() == nil && errors.Is(checkErr, context.DeadlineExceeded) {
+					continue
+				}
+				err = checkErr
+			} else {
+				checkCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+				err = check(checkCtx)
+				cancel()
+			}
+			if leaseLost {
+				return sourceErrorTransient, false, true
+			}
 			if err != nil {
 				if errors.Is(err, context.Canceled) && ctx.Err() != nil {
 					return sourceErrorTransient, false, false
 				}
-				class := classifySourceError(err)
+				class := classifySourceRuntimeError(err)
 				m.recordSourceFailure(class)
-				slog.Warn("来源库连接或 lease 丢失，正在停止当前 epoch", "class", sourceFailureCode(err))
+				slog.Warn("来源库连接或 lease 丢失，正在停止当前 epoch", "class", sourceFailureCode(err), "stage", sourceOperationStage(err))
 				return class, true, false
 			}
-			m.recordSourceSuccess()
+			if successAt.IsZero() {
+				successAt = time.Now()
+			}
+			m.recordSourceSuccessAt(successAt)
 		}
 	}
 }
@@ -1005,24 +1123,37 @@ func (m *Monitor) probeLocalOperationalState(parent context.Context, now int64) 
 	}
 	ctx, cancel := context.WithTimeout(parent, time.Second)
 	defer cancel()
-	to := finalizedStabilityHourTo(now)
-	from := to - int64(m.cfg.stabilityStorageDays())*86400
-	if from < 0 {
-		from = 0
-	}
-	expected := (to - from) / 3600
-	var completed int64
-	err := m.storeDB.WithContext(ctx).Model(&StabilityHourIngestState{}).
-		Where("hour_ts >= ? AND hour_ts < ? AND status = ? AND traffic_class_version = ?",
-			from, to, "complete", stabilityTrafficClassificationVersion).Count(&completed).Error
+	// The logchain-only runtime deliberately disables the hourly NewAPI
+	// sampler.  Its active stability fact source is the CloudWatch Nginx lane,
+	// which is also the source used by the edge-backed report.  Readiness must
+	// evaluate that durable waterline instead of demanding an impossible
+	// 90-day stability_hour_samples certificate.
 	bps := int64(0)
-	if err == nil {
-		if expected <= 0 {
+	if m.cfg.LogChainOnlySource && m.cfg.CloudWatchNginxEnabled {
+		_, target := cloudWatchNginxRange(time.Unix(now, 0), m.cfg.CloudWatchNginxLookbackHours)
+		through := m.cloudWatchNginxThrough.Load()
+		if through > 0 && target > 0 && target-through <= 20*60 {
 			bps = 10000
-		} else {
-			bps = completed * 10000 / expected
-			if bps > 10000 {
+		}
+	} else {
+		to := finalizedStabilityHourTo(now)
+		from := to - int64(m.cfg.stabilityStorageDays())*86400
+		if from < 0 {
+			from = 0
+		}
+		expected := (to - from) / 3600
+		var completed int64
+		err := m.storeDB.WithContext(ctx).Model(&StabilityHourIngestState{}).
+			Where("hour_ts >= ? AND hour_ts < ? AND status = ? AND traffic_class_version = ?",
+				from, to, "complete", stabilityTrafficClassificationVersion).Count(&completed).Error
+		if err == nil {
+			if expected <= 0 {
 				bps = 10000
+			} else {
+				bps = completed * 10000 / expected
+				if bps > 10000 {
+					bps = 10000
+				}
 			}
 		}
 	}
@@ -1118,30 +1249,31 @@ type readyCoverageStatus struct {
 }
 
 type readyEffectiveConfig struct {
-	LocalSnapshotOnly             bool   `json:"local_snapshot_only"`
-	SourceWorkerEnabled           bool   `json:"source_worker_enabled"`
-	LogChainOnlySource            bool   `json:"logchain_only_source"`
-	SourceLeaseRequired           bool   `json:"source_lease_required"`
-	SampleSeconds                 int    `json:"sample_seconds"`
-	CapacityEnabled               bool   `json:"capacity_enabled"`
-	StabilityEnabled              bool   `json:"stability_enabled"`
-	StabilityProblemSourceEnabled bool   `json:"stability_problem_source_enabled"`
-	CustomerHealthSourceEnabled   bool   `json:"customer_health_source_enabled"`
-	UsageFactsEnabled             bool   `json:"usage_facts_enabled"`
-	UsageFactsReadEnabled         bool   `json:"usage_facts_read_enabled"`
-	CloudWatchPreRouteEnabled     bool   `json:"cloudwatch_preroute_enabled"`
-	CloudWatchPreRoutePollSeconds int    `json:"cloudwatch_preroute_poll_seconds"`
-	CloudWatchPreRouteLookbackHrs int    `json:"cloudwatch_preroute_lookback_hours"`
-	CloudWatchNginxEnabled        bool   `json:"cloudwatch_nginx_enabled"`
-	CloudWatchNginxPollSeconds    int    `json:"cloudwatch_nginx_poll_seconds"`
-	CloudWatchNginxLookbackHrs    int    `json:"cloudwatch_nginx_lookback_hours"`
-	CloudWatchLogsEnabled         bool   `json:"cloudwatch_logs_enabled"`
-	CloudWatchShadowEnabled       bool   `json:"cloudwatch_shadow_enabled"`
-	NginxEnabled                  bool   `json:"nginx_enabled"`
-	NginxSourceV2Enabled          bool   `json:"nginx_source_v2_enabled"`
-	NginxSourceV2CutoverEnabled   bool   `json:"nginx_source_v2_cutover_enabled"`
-	NginxEvidenceMode             string `json:"nginx_evidence_mode"`
-	AlertsDisabled                bool   `json:"alerts_disabled"`
+	LocalSnapshotOnly                 bool   `json:"local_snapshot_only"`
+	SourceWorkerEnabled               bool   `json:"source_worker_enabled"`
+	LogChainOnlySource                bool   `json:"logchain_only_source"`
+	SourceLeaseRequired               bool   `json:"source_lease_required"`
+	SampleSeconds                     int    `json:"sample_seconds"`
+	CapacityEnabled                   bool   `json:"capacity_enabled"`
+	StabilityEnabled                  bool   `json:"stability_enabled"`
+	StabilityProblemSourceEnabled     bool   `json:"stability_problem_source_enabled"`
+	CustomerHealthSourceEnabled       bool   `json:"customer_health_source_enabled"`
+	UsageFactsEnabled                 bool   `json:"usage_facts_enabled"`
+	UsageFactsReadEnabled             bool   `json:"usage_facts_read_enabled"`
+	CloudWatchPreRouteEnabled         bool   `json:"cloudwatch_preroute_enabled"`
+	CloudWatchPreRoutePollSeconds     int    `json:"cloudwatch_preroute_poll_seconds"`
+	CloudWatchPreRouteLivePollSeconds int    `json:"cloudwatch_preroute_live_poll_seconds"`
+	CloudWatchPreRouteLookbackHrs     int    `json:"cloudwatch_preroute_lookback_hours"`
+	CloudWatchNginxEnabled            bool   `json:"cloudwatch_nginx_enabled"`
+	CloudWatchNginxPollSeconds        int    `json:"cloudwatch_nginx_poll_seconds"`
+	CloudWatchNginxLookbackHrs        int    `json:"cloudwatch_nginx_lookback_hours"`
+	CloudWatchLogsEnabled             bool   `json:"cloudwatch_logs_enabled"`
+	CloudWatchShadowEnabled           bool   `json:"cloudwatch_shadow_enabled"`
+	NginxEnabled                      bool   `json:"nginx_enabled"`
+	NginxSourceV2Enabled              bool   `json:"nginx_source_v2_enabled"`
+	NginxSourceV2CutoverEnabled       bool   `json:"nginx_source_v2_cutover_enabled"`
+	NginxEvidenceMode                 string `json:"nginx_evidence_mode"`
+	AlertsDisabled                    bool   `json:"alerts_disabled"`
 }
 
 type readyStatusResponse struct {
@@ -1334,30 +1466,31 @@ func (m *Monitor) readyStatus(now time.Time) (readyStatusResponse, int) {
 		GitSHA:       gitSHA,
 		ImageVersion: imageVersion,
 		Config: readyEffectiveConfig{
-			LocalSnapshotOnly:             m.cfg.LocalSnapshotOnly,
-			SourceWorkerEnabled:           m.cfg.sourceWorkerIsEnabled(),
-			LogChainOnlySource:            m.cfg.LogChainOnlySource,
-			SourceLeaseRequired:           m.cfg.sourceLeaseIsRequired(),
-			SampleSeconds:                 m.cfg.SampleSeconds,
-			CapacityEnabled:               m.cfg.CapacityEnabled,
-			StabilityEnabled:              m.cfg.StabilityEnabled,
-			StabilityProblemSourceEnabled: m.cfg.StabilityProblemSourceEnabled,
-			CustomerHealthSourceEnabled:   m.cfg.CustomerHealthSourceEnabled,
-			UsageFactsEnabled:             m.cfg.UsageFactsEnabled,
-			UsageFactsReadEnabled:         m.cfg.UsageFactsReadEnabled,
-			CloudWatchPreRouteEnabled:     m.cfg.CloudWatchPreRouteEnabled,
-			CloudWatchPreRoutePollSeconds: m.cfg.CloudWatchPreRoutePollSeconds,
-			CloudWatchPreRouteLookbackHrs: m.cfg.CloudWatchPreRouteLookbackHours,
-			CloudWatchNginxEnabled:        m.cfg.CloudWatchNginxEnabled,
-			CloudWatchNginxPollSeconds:    m.cfg.CloudWatchNginxPollSeconds,
-			CloudWatchNginxLookbackHrs:    m.cfg.CloudWatchNginxLookbackHours,
-			CloudWatchLogsEnabled:         m.cfg.CloudWatchLogsEnabled,
-			CloudWatchShadowEnabled:       m.cfg.CloudWatchShadowEnabled,
-			NginxEnabled:                  m.cfg.NginxEnabled,
-			NginxSourceV2Enabled:          m.cfg.NginxSourceV2Enabled,
-			NginxSourceV2CutoverEnabled:   m.cfg.NginxSourceV2CutoverEnabled,
-			NginxEvidenceMode:             nginxEvidenceMode(m.cfg.NginxEvidenceMode),
-			AlertsDisabled:                m.cfg.AlertsDisabled,
+			LocalSnapshotOnly:                 m.cfg.LocalSnapshotOnly,
+			SourceWorkerEnabled:               m.cfg.sourceWorkerIsEnabled(),
+			LogChainOnlySource:                m.cfg.LogChainOnlySource,
+			SourceLeaseRequired:               m.cfg.sourceLeaseIsRequired(),
+			SampleSeconds:                     m.cfg.SampleSeconds,
+			CapacityEnabled:                   m.cfg.CapacityEnabled,
+			StabilityEnabled:                  m.cfg.StabilityEnabled,
+			StabilityProblemSourceEnabled:     m.cfg.StabilityProblemSourceEnabled,
+			CustomerHealthSourceEnabled:       m.cfg.CustomerHealthSourceEnabled,
+			UsageFactsEnabled:                 m.cfg.UsageFactsEnabled,
+			UsageFactsReadEnabled:             m.cfg.UsageFactsReadEnabled,
+			CloudWatchPreRouteEnabled:         m.cfg.CloudWatchPreRouteEnabled,
+			CloudWatchPreRoutePollSeconds:     m.cfg.CloudWatchPreRoutePollSeconds,
+			CloudWatchPreRouteLivePollSeconds: m.cfg.CloudWatchPreRouteLivePollSeconds,
+			CloudWatchPreRouteLookbackHrs:     m.cfg.CloudWatchPreRouteLookbackHours,
+			CloudWatchNginxEnabled:            m.cfg.CloudWatchNginxEnabled,
+			CloudWatchNginxPollSeconds:        m.cfg.CloudWatchNginxPollSeconds,
+			CloudWatchNginxLookbackHrs:        m.cfg.CloudWatchNginxLookbackHours,
+			CloudWatchLogsEnabled:             m.cfg.CloudWatchLogsEnabled,
+			CloudWatchShadowEnabled:           m.cfg.CloudWatchShadowEnabled,
+			NginxEnabled:                      m.cfg.NginxEnabled,
+			NginxSourceV2Enabled:              m.cfg.NginxSourceV2Enabled,
+			NginxSourceV2CutoverEnabled:       m.cfg.NginxSourceV2CutoverEnabled,
+			NginxEvidenceMode:                 nginxEvidenceMode(m.cfg.NginxEvidenceMode),
+			AlertsDisabled:                    m.cfg.AlertsDisabled,
 		},
 		Collectors: map[string]readyCoverageStatus{
 			"source_worker": {

@@ -129,6 +129,11 @@ func TestPersistCloudWatchNginxRequestEvidenceLargeBatchChunksAndReplaces(t *tes
 	if err != nil {
 		t.Fatal(err)
 	}
+	sqlDB, err := db.DB()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = sqlDB.Close() })
 	if err := db.AutoMigrate(&NginxRequestEvidence{}, &NginxEvidenceIngestBatch{}, &NginxEvidenceSourceState{}, &CloudWatchNginxEvidenceCheckpoint{}); err != nil {
 		t.Fatal(err)
 	}
@@ -196,6 +201,11 @@ func TestPersistCloudWatchNginxRequestEvidenceRejectsCrossWindowEventConflict(t 
 	if err != nil {
 		t.Fatal(err)
 	}
+	sqlDB, err := db.DB()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = sqlDB.Close() })
 	if err := db.AutoMigrate(&NginxRequestEvidence{}, &NginxEvidenceIngestBatch{}, &NginxEvidenceSourceState{}, &CloudWatchNginxEvidenceCheckpoint{}); err != nil {
 		t.Fatal(err)
 	}
@@ -336,6 +346,60 @@ func TestCloudWatchNginxEvidenceChunkIsAcceptedByInsightsValidator(t *testing.T)
 	}
 }
 
+func TestCloudWatchNginxEvidenceTimeoutNarrowsReadWithoutMovingCoverage(t *testing.T) {
+	state := CloudWatchNginxCursor{EvidenceCoverageFromTs: 1200, EvidenceNextTs: 1800, EvidenceThroughTs: 1800, ThroughTs: 20000}
+	from, to, _ := cloudWatchNginxEvidenceWindow(state, 20000)
+	narrowCloudWatchNginxEvidenceRead(&state, to-from, newCloudWatchLogsError(cwLogsErrTimeout, "query_status", nil))
+	for _, want := range []int64{900, 420, 180, 60, 60} {
+		from, to, ok := cloudWatchNginxEvidenceWindow(state, 20000)
+		if !ok || from != 1800 || to-from != want || state.EvidenceThroughTs != 1800 || state.ThroughTs != 20000 {
+			t.Fatalf("retry skipped a failed interval or changed coverage: %+v, %d..%d", state, from, to)
+		}
+		narrowCloudWatchNginxEvidenceRead(&state, to-from, newCloudWatchLogsError(cwLogsErrTimeout, "query_status", nil))
+	}
+	// A completed smaller window keeps the next read small; its publisher
+	// still owns the only update of the coverage cursor.
+	state.EvidenceNextTs, state.EvidenceThroughTs = 1860, 1860
+	from, to, ok := cloudWatchNginxEvidenceWindow(state, 1890)
+	if !ok || from != 1860 || to != 1890 {
+		t.Fatalf("retry failed to honor the actual target: %d..%d", from, to)
+	}
+	before := state
+	narrowCloudWatchNginxEvidenceRead(&state, 60, context.Canceled)
+	narrowCloudWatchNginxEvidenceRead(&state, 60, errors.New("local disk full"))
+	if state != before {
+		t.Fatal("non-timeout errors changed the read window")
+	}
+	// An unclassified legacy timeout does not prove a large execution range.
+	state.EvidenceReadWindowSeconds, state.EvidenceLastError = 0, "timeout"
+	from, to, _ = cloudWatchNginxEvidenceWindow(state, 20000)
+	if from != 1860 || to != min(int64(20000), from+int64(cloudWatchNginxEvidenceChunkWindow/time.Second)) {
+		t.Fatal("legacy timeout shrank a window without execution evidence")
+	}
+}
+
+func TestCloudWatchNginxCatchupRetainsSuccessfulSmallWindow(t *testing.T) {
+	m := newTestMonitor(t)
+	defer m.Close()
+	from := time.Now().Unix()/60*60 - 86400
+	state := CloudWatchNginxCursor{ID: cloudWatchNginxCursorID, CoverageFromTs: from,
+		NextTs: from, ThroughTs: from, TargetThroughTs: from + 86400,
+		ReadWindowSeconds: 60, SemanticsVersion: cloudWatchNginxVersion, Status: "recovering"}
+	for attempt := 0; attempt < 5; attempt++ {
+		left, right := cloudWatchNginxNextWindow(state, state.TargetThroughTs)
+		if left != from+int64(attempt)*60 || right-left != 60 {
+			t.Fatalf("successful retry width was enlarged before backlog recovered: %d..%d state=%+v", left, right, state)
+		}
+		if err := m.publishCloudWatchNginxWindow(context.Background(), &state, left, right, nil, nil, 0, 0, state.TargetThroughTs); err != nil {
+			t.Fatal(err)
+		}
+		// Use the persisted cursor, as a restart would.
+		if err := m.storeDB.First(&state, "id=?", cloudWatchNginxCursorID).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
 func TestPublishCloudWatchNginxRepairReplacesLateRowsWithoutMovingMainCursor(t *testing.T) {
 	m := newTestMonitor(t)
 	defer m.Close()
@@ -428,7 +492,7 @@ func TestPersistCloudWatchNginxRequestEvidenceEmptyWindowRemovesStaleRows(t *tes
 	}
 }
 
-func TestAttachNginxEvidenceReturnsNewestRowPerRequestWithoutGlobalTruncation(t *testing.T) {
+func TestAttachNginxEvidenceRejectsMultipleAttemptsWithoutGlobalTruncation(t *testing.T) {
 	db, err := gorm.Open(sqlite.Open("file::memory:?cache=shared"), &gorm.Config{})
 	if err != nil {
 		t.Fatal(err)
@@ -454,8 +518,8 @@ func TestAttachNginxEvidenceReturnsNewestRowPerRequestWithoutGlobalTruncation(t 
 	if err := m.attachNginxEvidence(context.Background(), logs); err != nil {
 		t.Fatal(err)
 	}
-	if logs[0].EdgeEvidence == nil || logs[0].EdgeEvidence.Status != 200 {
-		t.Fatalf("newest evidence was not selected for first request: %+v", logs[0].EdgeEvidence)
+	if logs[0].EdgeEvidence != nil {
+		t.Fatalf("different attempts must not select the newest event as proof: %+v", logs[0].EdgeEvidence)
 	}
 	if logs[1].EdgeEvidence == nil || logs[1].EdgeEvidence.Status != 503 {
 		t.Fatalf("later request evidence was truncated: %+v", logs[1].EdgeEvidence)
@@ -643,6 +707,12 @@ func TestNginxReportPrefersCloudWatchWithinSameMinute(t *testing.T) {
 
 func TestCloudWatchNginxCursorBumpsMigrationPlan(t *testing.T) {
 	for _, plan := range []string{preMigrationPlanID, preMigrationCombinedPlanID} {
+		if !strings.Contains(plan, "nginx-repair-read-width-20261101") {
+			t.Fatal("persisted historical repair width requires a new backup plan")
+		}
+		if !strings.Contains(plan, "nginx-adaptive-evidence-20261028") {
+			t.Fatal("persisted adaptive evidence window requires a new backup plan")
+		}
 		if !strings.Contains(plan, "v58-nginx-evidence-store-proof") {
 			t.Fatalf("证据卷关联与缺口列必须触发新的迁移前备份: %s", plan)
 		}

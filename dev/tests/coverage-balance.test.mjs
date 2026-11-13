@@ -71,18 +71,18 @@ test('model coverage UI distinguishes real-time tail, unknown history and comple
   assert.match(element('msCoverage').textContent,/历史覆盖尚未全部确认/);
 });
 
-test('model statistics renders rows without an undefined item and keeps missing over-3s unknown',()=>{
-  const {api,element}=fixture('model_statistics.js','render,state,ttftStats,ttftCell');
+test('model statistics renders requests without an undefined item and ignores legacy FRT display fields',()=>{
+  const {api,element}=fixture('model_statistics.js','render,state');
   api.state.report={source:{ttft_complete:true}};
   assert.doesNotThrow(()=>api.render({
     source:{facts_complete:true,requests_complete:true,ttft_complete:true},
     models:[{model:'gpt-test',requests:2,routed_requests:2,unavailable_channel_requests:0,
       ttft_observed:2,ttft_p50_ms:1200,ttft_p95_ms:1800,ttft_p99_ms:2100,ttft_max_ms:2200,groups:[]}]
   }));
-  const stats=api.ttftStats({ttft_observed:2,ttft_p50_ms:1200,ttft_p95_ms:1800,ttft_p99_ms:2100,ttft_max_ms:2200},true);
-  assert.match(api.ttftCell(stats,'p99'),/2\.1秒/);
-  assert.equal(api.ttftCell(stats,'over'),'—');
-  const explicitZero=api.ttftStats({ttft_observed:2,ttft_over_3s:0},true);
-  assert.match(api.ttftCell(explicitZero,'over'),/0次/);
+  assert.doesNotMatch(element('msModels').innerHTML,/FRT|P99|超3秒|2\.1秒/);
+  assert.match(element('msModels').innerHTML,/<td>2<\/td><td>2<\/td><td>0<\/td>/);
+  const html=element('msModels').innerHTML;
+  api.render({source:{facts_complete:true,requests_complete:true},models:[{model:'gpt-test',requests:2,routed_requests:2,unavailable_channel_requests:0,ttft_over_3s:0,groups:[]}]});
+  assert.equal(element('msModels').innerHTML,html,'missing and explicit zero legacy FRT do not change request rendering');
   assert.match(element('msModels').innerHTML,/gpt-test/);
 });

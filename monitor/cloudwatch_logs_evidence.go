@@ -53,6 +53,14 @@ func newCloudWatchEvidenceParseError(kind cloudWatchEvidenceParseErrorKind, sour
 }
 
 type cloudWatchStructuredEvidence struct {
+	// Admin diagnostic metadata; the shared observability projection never
+	// copies error bodies or these fields into Usage/customer portal responses.
+	Diagnostic           *LogChainDiagnosticFacts `json:"diagnostic,omitempty"`
+	OneAPIRequestID      string                   `json:"-"`
+	RequestLength        *int64                   `json:"request_length,omitempty"`
+	RequestLengthState   string                   `json:"request_length_state,omitempty"`
+	RequestLengthVersion string                   `json:"request_length_version,omitempty"`
+
 	// Set after request association, never copied from a query/source label.
 	EvidenceLevel     string                 `json:"evidence_level,omitempty"`
 	Source            cloudWatchLogSourceID  `json:"source"`
@@ -130,6 +138,12 @@ type cloudWatchEvidenceParser struct {
 	key            []byte
 	keyID          string
 	allowSensitive bool
+	// Enabled only by administrator troubleshooting; continuous/shared parsers
+	// keep their existing closed classifications and redacted projections.
+	customerDiagnostics bool
+	// Only the continuous Nginx reader enables content identity across
+	// overlapping Insights results. Other parsers retain their event IDs.
+	nginxContinuousIdentity bool
 }
 
 func newCloudWatchEvidenceParser(key, keyID string, allowSensitive bool) (*cloudWatchEvidenceParser, error) {

@@ -21,6 +21,7 @@ type investigationObservability struct {
 }
 
 type investigationObservationSummary struct {
+	Diagnosis     *LogChainDiagnosis          `json:"diagnosis,omitempty"`
 	FaultClass    *observability.FaultClass   `json:"fault_class"`
 	EvidenceLevel observability.EvidenceLevel `json:"evidence_level"`
 	Candidate     bool                        `json:"candidate"`
@@ -60,7 +61,7 @@ func observationFault(value string) *observability.FaultClass {
 
 func sharedInvestigationSummary(s logChainInvestigationSummary) investigationObservationSummary {
 	level, candidate := sharedInvestigationLevel(s.EvidenceLevel)
-	out := investigationObservationSummary{EvidenceLevel: level, Candidate: candidate, Conclusion: s.Conclusion}
+	out := investigationObservationSummary{EvidenceLevel: level, Candidate: candidate, Conclusion: s.Conclusion, Diagnosis: s.Diagnosis}
 	switch s.Classification {
 	case "business_completed", "application_reached":
 		// Normal consumption and HTTP completion are not protocol success.
@@ -105,7 +106,7 @@ func sharedEvidenceFault(e cloudWatchStructuredEvidence) *observability.FaultCla
 	// These parser categories share the historical NewAPIError kind with
 	// failures. The kind names a log source, not proof of a business fault.
 	switch e.Category {
-	case "request_completed", "stream_ended", "billing_recorded", "quota_precheck":
+	case "request_completed", "stream_ended", "billing_recorded", "quota_precheck", "diagnostic_context":
 		return nil
 	case "invalid_token", "token_disabled", "quota_account", "model_forbidden":
 		// Legacy auth_quota_account means a customer-side pre-route refusal
@@ -218,6 +219,7 @@ func (m *Monitor) buildInvestigationObservability(result logChainInvestigationRe
 }
 
 func (m *Monitor) investigationResponse(result logChainInvestigationResult) logChainInvestigationResult {
+	result.RequestDiagnoses = m.logChainRequestDiagnoses(result.Requests)
 	if result.SchemaVersion != observability.SchemaVersion {
 		return result
 	}

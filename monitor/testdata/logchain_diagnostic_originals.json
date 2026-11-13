@@ -1,0 +1,2706 @@
+{
+  "document_sha256": "a64b6f6562f05bc74f2fde1930ac11d77f72c917462d10cb4f1dd87c8d43b56d",
+  "original_sha256": "9384190a7abaa52b9baf4a9f44564828302d4f4c6d5a9a6312e3393097e254d5",
+  "rows": [
+    {
+      "line": 1,
+      "rule_id": "LC-001",
+      "content": "status_code=301, bad response status code 301",
+      "responsibility": "平台侧/上游",
+      "reason": "上游 301 重定向：通道 base_url 被跳转到新地址",
+      "profile": "route",
+      "cause_known": true
+    },
+    {
+      "line": 2,
+      "rule_id": "LC-002",
+      "content": "status_code=400, \"***.***.disabled\" is not supported for this model. Thinking defaults to adaptive mode when not specified; use \"***.***.enabled\" with \"budget_tokens\" for extended thinking.",
+      "responsibility": "客户侧",
+      "reason": "模型不支持 disabled 思考模式，需改 adaptive",
+      "profile": "parameter",
+      "cause_known": true
+    },
+    {
+      "line": 3,
+      "rule_id": "LC-003",
+      "content": "status_code=400, \"***.***.disabled\" is not supported for this model. Use \"***.***.adaptive\" and \"output_config.effort\" to control thinking behavior.",
+      "responsibility": "客户侧",
+      "reason": "模型要求 adaptive 思考模式",
+      "profile": "parameter",
+      "cause_known": true
+    },
+    {
+      "line": 4,
+      "rule_id": "LC-003",
+      "content": "status_code=400, \"***.***.disabled\" is not supported for this model. Use \"***.***.adaptive\" and \"output_config.effort\" to control thinking behavior. (request id: <id>) (request id: <id>)",
+      "responsibility": "客户侧",
+      "reason": "模型要求 adaptive 思考模式",
+      "profile": "parameter",
+      "cause_known": true
+    },
+    {
+      "line": 5,
+      "rule_id": "LC-004",
+      "content": "status_code=400, {\"code\":11115,\"msg\":\"prompt is too long: 100001 tokens \\u003e 100000 maximum\",\"requestId\":\"01a1914ea5e973e49eff74ec144b80e7\",\"retry_policy\":{\"retry\":false},\"extError\":{\"code\":\"context_length_exceeded\",\"message\":\"prompt is too long: 100001 tokens \\u003e 100000 maximum\",\"param\":\"\",\"type\":\"invalid_request_error\",\"StatusCode\":400,\"Request\":null,\"Response\":null},\"displayMsg\":{\"en\":\"Content too long. Please shorten it or start a new task\",\"zh\":\"内容过长，请精简或新建任务\",\"zh-hant\":\"內容過長，請精簡或新建任務\"},\"displayTips\":{\"en\":\"Your input plus the conversation history exceeds the model limit. Please shorten the content, remove large attachments, or start a new task.\",\"zh\":\"本次输入加上历史对话超过了模型上限。请精简内容、删掉大附件，或新建任务。\",\"zh-hant\":\"本次輸入加上歷史對話超過模型上限。請精簡內容、刪除大型附件，或新建任務。\"},\"actions\":[\"EDIT_INPUT\",\"SUBMIT_FEEDBACK\"]} (request context exceeds the model's limit; reduce history/message size) (request id: <id>)",
+      "responsibility": "客户侧",
+      "reason": "输入与历史 Token 超过模型上下文上限",
+      "profile": "context",
+      "cause_known": true
+    },
+    {
+      "line": 6,
+      "rule_id": "LC-005",
+      "content": "status_code=400, ***.***.***.***.text: text content blocks must contain non-whitespace text",
+      "responsibility": "客户侧",
+      "reason": "消息 text 块为空/纯空白",
+      "profile": "parameter",
+      "cause_known": true
+    },
+    {
+      "line": 7,
+      "rule_id": "LC-006",
+      "content": "status_code=400, ***.***.content.0: Invalid `signature` in `thinking` block",
+      "responsibility": "客户侧",
+      "reason": "thinking 块签名失效，客户端续传/缓存复用了旧 thinking",
+      "profile": "continuation",
+      "cause_known": true
+    },
+    {
+      "line": 8,
+      "rule_id": "LC-006",
+      "content": "status_code=400, ***.***.content.0: Invalid `signature` in `thinking` block (request id: <id>)",
+      "responsibility": "客户侧",
+      "reason": "thinking 块签名失效，客户端续传/缓存复用了旧 thinking",
+      "profile": "continuation",
+      "cause_known": true
+    },
+    {
+      "line": 9,
+      "rule_id": "LC-006",
+      "content": "status_code=400, ***.***.content.0: Invalid `signature` in `thinking` block (request id: <id>) (request id: <id>)",
+      "responsibility": "客户侧",
+      "reason": "thinking 块签名失效，客户端续传/缓存复用了旧 thinking",
+      "profile": "continuation",
+      "cause_known": true
+    },
+    {
+      "line": 10,
+      "rule_id": "LC-006",
+      "content": "status_code=400, ***.***.content.0: Invalid `signature` in `thinking` block (request id: <id>) (request id: <id>) (request id: <id>)",
+      "responsibility": "客户侧",
+      "reason": "thinking 块签名失效，客户端续传/缓存复用了旧 thinking",
+      "profile": "continuation",
+      "cause_known": true
+    },
+    {
+      "line": 11,
+      "rule_id": "LC-006",
+      "content": "status_code=400, ***.***.content.1: Input tag 'advisor_tool_result' found using 'type' does not match any of the expected tags: 'bash_code_execution_tool_result', 'code_execution_tool_result', 'connector_text', 'container_upload', 'document', 'image', 'mid_conv_system', 'redacted_thinking', 'search_result', 'server_tool_use', 'text', 'text_editor_code_execution_tool_result', 'thinking', 'tool_result', 'tool_search_tool_result', 'tool_use', 'web_fetch_tool_result', 'web_search_tool_result' (request id: <id>) (request id: <id>)",
+      "responsibility": "客户侧",
+      "reason": "thinking 块签名失效，客户端续传/缓存复用了旧 thinking",
+      "profile": "continuation",
+      "cause_known": true
+    },
+    {
+      "line": 12,
+      "rule_id": "LC-006",
+      "content": "status_code=400, ***.***.content.2: Invalid `signature` in `thinking` block",
+      "responsibility": "客户侧",
+      "reason": "thinking 块签名失效，客户端续传/缓存复用了旧 thinking",
+      "profile": "continuation",
+      "cause_known": true
+    },
+    {
+      "line": 13,
+      "rule_id": "LC-006",
+      "content": "status_code=400, ***.***.content.2: Invalid `signature` in `thinking` block (request id: <id>) (request id: <id>)",
+      "responsibility": "客户侧",
+      "reason": "thinking 块签名失效，客户端续传/缓存复用了旧 thinking",
+      "profile": "continuation",
+      "cause_known": true
+    },
+    {
+      "line": 14,
+      "rule_id": "LC-007",
+      "content": "status_code=400, `temperature` is deprecated for this model.",
+      "responsibility": "客户侧",
+      "reason": "模型已弃用 temperature 参数，请求仍传入",
+      "profile": "parameter",
+      "cause_known": true
+    },
+    {
+      "line": 15,
+      "rule_id": "LC-007",
+      "content": "status_code=400, `temperature` is deprecated for this model. (request id: <id>)",
+      "responsibility": "客户侧",
+      "reason": "模型已弃用 temperature 参数，请求仍传入",
+      "profile": "parameter",
+      "cause_known": true
+    },
+    {
+      "line": 16,
+      "rule_id": "LC-007",
+      "content": "status_code=400, `temperature` is deprecated for this model. (request id: <id>) (request id: <id>)",
+      "responsibility": "客户侧",
+      "reason": "模型已弃用 temperature 参数，请求仍传入",
+      "profile": "parameter",
+      "cause_known": true
+    },
+    {
+      "line": 17,
+      "rule_id": "LC-008",
+      "content": "status_code=400, `temperature` may only be set to 1 when thinking is enabled. Please consult our documentation at https://***.com/***/***/***/***",
+      "responsibility": "客户侧",
+      "reason": "开启 thinking 时 temperature 必须为 1",
+      "profile": "parameter",
+      "cause_known": true
+    },
+    {
+      "line": 18,
+      "rule_id": "LC-008",
+      "content": "status_code=400, `temperature` may only be set to 1 when thinking is enabled. Please consult our documentation at https://***.com/***/***/***/*** (request id: <id>)",
+      "responsibility": "客户侧",
+      "reason": "开启 thinking 时 temperature 必须为 1",
+      "profile": "parameter",
+      "cause_known": true
+    },
+    {
+      "line": 19,
+      "rule_id": "LC-009",
+      "content": "status_code=400, 当前对话因上游安全拒绝已锁定",
+      "responsibility": "上游侧",
+      "reason": "上游安全策略拒绝，会话被锁定",
+      "profile": "policy",
+      "cause_known": true
+    },
+    {
+      "line": 20,
+      "rule_id": "LC-010",
+      "content": "status_code=400, 对话内容太长了，请新开对话或删减内容后重试。 (request id: <id>)",
+      "responsibility": "客户侧",
+      "reason": "上下文超长",
+      "profile": "context",
+      "cause_known": true
+    },
+    {
+      "line": 21,
+      "rule_id": "LC-011",
+      "content": "status_code=400, 该模型不支持这类文件，请转成 PDF 或文字后重试。 (request id: <id>)",
+      "responsibility": "客户侧",
+      "reason": "模型不支持该文件类型",
+      "profile": "parameter",
+      "cause_known": true
+    },
+    {
+      "line": 22,
+      "rule_id": "LC-012",
+      "content": "status_code=400, 客户端发来的请求格式有误，请升级客户端或新开对话后重试。",
+      "responsibility": "客户侧",
+      "reason": "客户端请求格式错误",
+      "profile": "parameter",
+      "cause_known": true
+    },
+    {
+      "line": 23,
+      "rule_id": "LC-012",
+      "content": "status_code=400, 客户端发来的请求格式有误，请升级客户端或新开对话后重试。 (request id: <id>)",
+      "responsibility": "客户侧",
+      "reason": "客户端请求格式错误",
+      "profile": "parameter",
+      "cause_known": true
+    },
+    {
+      "line": 24,
+      "rule_id": "LC-013",
+      "content": "status_code=400, 流式 API 请求失败: 400 Bad Request {\"message\":\"Invalid tool use format.\",\"reason\":\"REQUEST_BODY_INVALID\"}",
+      "responsibility": "客户侧",
+      "reason": "工具调用(tool use)格式无效",
+      "profile": "tools",
+      "cause_known": true
+    },
+    {
+      "line": 25,
+      "rule_id": "LC-014",
+      "content": "status_code=400, 请求被拒绝",
+      "responsibility": "待查",
+      "reason": "请求被拒，原因未透出",
+      "profile": "generic",
+      "cause_known": false
+    },
+    {
+      "line": 26,
+      "rule_id": "LC-015",
+      "content": "status_code=400, 上游 API 调用失败: 流式 API 请求失败: 400 Bad Request {\"message\":\"Invalid tool use format.\",\"reason\":\"REQUEST_BODY_INVALID\"} (request id: <id>)",
+      "responsibility": "客户侧",
+      "reason": "上游流式请求因 tool 格式无效失败",
+      "profile": "tools",
+      "cause_known": true
+    },
+    {
+      "line": 27,
+      "rule_id": "LC-016",
+      "content": "status_code=400, 上游 API 调用失败: 上游连续 4 个号在 10 秒内未返回首帧（请求体 28896 字节），放弃换号 (request id: <id>)",
+      "responsibility": "上游侧/网络",
+      "reason": "上游多个账号在等待期限内未返回首帧，触发换号放弃",
+      "profile": "network",
+      "cause_known": true
+    },
+    {
+      "line": 28,
+      "rule_id": "LC-017",
+      "content": "status_code=400, 上游空闲超时（长时间无数据） (request id: <id>)",
+      "responsibility": "上游侧/网络",
+      "reason": "上游长时间无数据（SSE 断流）",
+      "profile": "network",
+      "cause_known": true
+    },
+    {
+      "line": 29,
+      "rule_id": "LC-018",
+      "content": "status_code=400, 网关内部错误，请联系管理员。Internal gateway error, please contact the administrator. [E5001-<id>]",
+      "responsibility": "平台侧",
+      "reason": "平台网关内部错误",
+      "profile": "platform",
+      "cause_known": true
+    },
+    {
+      "line": 30,
+      "rule_id": "LC-019",
+      "content": "status_code=400, 找不到模型 claude-opus-5-5，请检查模型名称。",
+      "responsibility": "平台侧",
+      "reason": "模型未在通道登记/不支持",
+      "profile": "capability",
+      "cause_known": true
+    },
+    {
+      "line": 31,
+      "rule_id": "LC-019",
+      "content": "status_code=400, 找不到模型 claude-opus-5-5，请检查模型名称。 (request id: <id>)",
+      "responsibility": "平台侧",
+      "reason": "模型未在通道登记/不支持",
+      "profile": "capability",
+      "cause_known": true
+    },
+    {
+      "line": 32,
+      "rule_id": "LC-020",
+      "content": "status_code=400, 找不到模型 claude-sonnet-5-5，请检查模型名称。",
+      "responsibility": "平台侧",
+      "reason": "模型未在通道登记/不支持",
+      "profile": "capability",
+      "cause_known": true
+    },
+    {
+      "line": 33,
+      "rule_id": "LC-020",
+      "content": "status_code=400, 找不到模型 claude-sonnet-5-5，请检查模型名称。 (request id: <id>)",
+      "responsibility": "平台侧",
+      "reason": "模型未在通道登记/不支持",
+      "profile": "capability",
+      "cause_known": true
+    },
+    {
+      "line": 34,
+      "rule_id": "LC-021",
+      "content": "status_code=400, 这段对话无法继续了，请新开对话后重试。 (request id: <id>)",
+      "responsibility": "待查",
+      "reason": "对话状态损坏/上下文无法续",
+      "profile": "continuation",
+      "cause_known": false
+    },
+    {
+      "line": 35,
+      "rule_id": "LC-022",
+      "content": "status_code=400, 子代理任务正文为无法恢复的旧加密格式，请重建子代理并重新派发任务。",
+      "responsibility": "客户侧/上游",
+      "reason": "子代理任务为旧加密格式，无法恢复",
+      "profile": "continuation",
+      "cause_known": true
+    },
+    {
+      "line": 36,
+      "rule_id": "LC-023",
+      "content": "status_code=400, alpha/search does not support tiered billing for model gpt-6.1-sol (request id: <id>)",
+      "responsibility": "平台侧/上游",
+      "reason": "该接口不支持请求模型的分层计费",
+      "profile": "capability",
+      "cause_known": true
+    },
+    {
+      "line": 37,
+      "rule_id": "LC-024",
+      "content": "status_code=400, bad response status code 400 (request id: <id>)",
+      "responsibility": "待查",
+      "reason": "上游返回 400，具体原因未透出",
+      "profile": "generic",
+      "cause_known": false
+    },
+    {
+      "line": 38,
+      "rule_id": "LC-025",
+      "content": "status_code=400, Basis Points upstream failure (event=error; status=400; type=invalid_request_error; code=invalid_value) (content_type=text/event-stream; bytes=275)",
+      "responsibility": "上游侧",
+      "reason": "BPS 上游参数校验失败(invalid_value)",
+      "profile": "parameter",
+      "cause_known": true
+    },
+    {
+      "line": 39,
+      "rule_id": "LC-026",
+      "content": "status_code=400, basispoints cannot read a new encrypted agent assignment; resend the task using the original plaintext collaboration path (path=input[<index>].content[1]; type=encrypted_content)",
+      "responsibility": "客户侧/上游",
+      "reason": "加密 agent 任务无法读取",
+      "profile": "continuation",
+      "cause_known": true
+    },
+    {
+      "line": 40,
+      "rule_id": "LC-027",
+      "content": "status_code=400, basispoints original tool item is unavailable for this tool result (path=input[<index>]); resend the matching complete tool call with its result, or start a new conversation",
+      "responsibility": "客户侧",
+      "reason": "工具调用与结果不匹配/丢失",
+      "profile": "tools",
+      "cause_known": true
+    },
+    {
+      "line": 41,
+      "rule_id": "LC-028",
+      "content": "status_code=400, BPS 槽不支持此 Codex 专用接口，请使用 Responses 请求。",
+      "responsibility": "平台侧/上游",
+      "reason": "BPS 通道不支持 Codex 专用接口",
+      "profile": "capability",
+      "cause_known": true
+    },
+    {
+      "line": 42,
+      "rule_id": "LC-029",
+      "content": "status_code=400, Cannot prove ownership of opaque conversation state; start a new conversation or resend complete plaintext history",
+      "responsibility": "客户侧/上游",
+      "reason": "加密会话状态无法证明所有权",
+      "profile": "continuation",
+      "cause_known": true
+    },
+    {
+      "line": 43,
+      "rule_id": "LC-030",
+      "content": "status_code=400, claude-opus-5-5 requires adaptive thinking; omit thinking or use ***.type=adaptive and output_config.effort",
+      "responsibility": "客户侧",
+      "reason": "请求的 thinking 参数与模型要求不兼容，需要 adaptive",
+      "profile": "parameter",
+      "cause_known": true
+    },
+    {
+      "line": 44,
+      "rule_id": "LC-030",
+      "content": "status_code=400, claude-opus-5-5 requires adaptive thinking; omit thinking or use ***.type=adaptive and output_config.effort (request id: <id>)",
+      "responsibility": "客户侧",
+      "reason": "请求的 thinking 参数与模型要求不兼容，需要 adaptive",
+      "profile": "parameter",
+      "cause_known": true
+    },
+    {
+      "line": 45,
+      "rule_id": "LC-030",
+      "content": "status_code=400, claude-opus-5-5 requires adaptive thinking; omit thinking or use ***.type=adaptive and output_config.effort (request id: <id>) (request id: <id>)",
+      "responsibility": "客户侧",
+      "reason": "请求的 thinking 参数与模型要求不兼容，需要 adaptive",
+      "profile": "parameter",
+      "cause_known": true
+    },
+    {
+      "line": 46,
+      "rule_id": "LC-031",
+      "content": "status_code=400, claude-sonnet-5-5 does not support non-default temperature",
+      "responsibility": "客户侧",
+      "reason": "模型不支持非默认 temperature",
+      "profile": "parameter",
+      "cause_known": true
+    },
+    {
+      "line": 47,
+      "rule_id": "LC-031",
+      "content": "status_code=400, claude-sonnet-5-5 does not support non-default temperature (request id: <id>) (request id: <id>)",
+      "responsibility": "客户侧",
+      "reason": "模型不支持非默认 temperature",
+      "profile": "parameter",
+      "cause_known": true
+    },
+    {
+      "line": 48,
+      "rule_id": "LC-032",
+      "content": "status_code=400, claude-sonnet-5-5 requires adaptive thinking or ***.type=between_tools; omit thinking or use one of those modes",
+      "responsibility": "客户侧",
+      "reason": "模型要求 adaptive 或 between_tools 思考模式",
+      "profile": "parameter",
+      "cause_known": true
+    },
+    {
+      "line": 49,
+      "rule_id": "LC-032",
+      "content": "status_code=400, claude-sonnet-5-5 requires adaptive thinking or ***.type=between_tools; omit thinking or use one of those modes (request id: <id>)",
+      "responsibility": "客户侧",
+      "reason": "模型要求 adaptive 或 between_tools 思考模式",
+      "profile": "parameter",
+      "cause_known": true
+    },
+    {
+      "line": 50,
+      "rule_id": "LC-032",
+      "content": "status_code=400, claude-sonnet-5-5 requires adaptive thinking or ***.type=between_tools; omit thinking or use one of those modes (request id: <id>) (request id: <id>)",
+      "responsibility": "客户侧",
+      "reason": "模型要求 adaptive 或 between_tools 思考模式",
+      "profile": "parameter",
+      "cause_known": true
+    },
+    {
+      "line": 51,
+      "rule_id": "LC-033",
+      "content": "status_code=400, Context window is full. Reduce conversation history, system prompt, or tools.",
+      "responsibility": "客户侧",
+      "reason": "上下文窗口已满",
+      "profile": "context",
+      "cause_known": true
+    },
+    {
+      "line": 52,
+      "rule_id": "LC-033",
+      "content": "status_code=400, Context window is full. Reduce conversation history, system prompt, or tools. (request id: <id>)",
+      "responsibility": "客户侧",
+      "reason": "上下文窗口已满",
+      "profile": "context",
+      "cause_known": true
+    },
+    {
+      "line": 53,
+      "rule_id": "LC-033",
+      "content": "status_code=400, Context window is full. Reduce conversation history, system prompt, or tools. (request id: <id>) (request id: <id>)",
+      "responsibility": "客户侧",
+      "reason": "上下文窗口已满",
+      "profile": "context",
+      "cause_known": true
+    },
+    {
+      "line": 54,
+      "rule_id": "LC-034",
+      "content": "status_code=400, Encrypted function output content could not be decrypted or decoded.",
+      "responsibility": "客户侧/上游",
+      "reason": "加密函数输出无法解密",
+      "profile": "continuation",
+      "cause_known": true
+    },
+    {
+      "line": 55,
+      "rule_id": "LC-035",
+      "content": "status_code=400, gpt-6-astra requires Responses for tool calls; this account only supports Chat Completions",
+      "responsibility": "平台侧/上游",
+      "reason": "工具调用需要 Responses 接口，账号只支持 Chat Completions",
+      "profile": "capability",
+      "cause_known": true
+    },
+    {
+      "line": 56,
+      "rule_id": "LC-036",
+      "content": "status_code=400, gpt-6-sol requires Responses for tool calls with reasoning; this account only supports Chat Completions. Use reasoning_effort=none or a Responses-capable account",
+      "responsibility": "平台侧/上游",
+      "reason": "工具调用与推理需要 Responses 接口，账号只支持 Chat Completions",
+      "profile": "capability",
+      "cause_known": true
+    },
+    {
+      "line": 57,
+      "rule_id": "LC-037",
+      "content": "status_code=400, Input exceeds the model's context window. Please shorten your input and try again. (request id: <id>) (request id: <id>) (request id: <id>)",
+      "responsibility": "客户侧",
+      "reason": "输入超模型上下文",
+      "profile": "context",
+      "cause_known": true
+    },
+    {
+      "line": 58,
+      "rule_id": "LC-038",
+      "content": "status_code=400, Input is too long >1m (request id: <id>) (request id: <id>)",
+      "responsibility": "客户侧",
+      "reason": "输入长度超过模型限制",
+      "profile": "context",
+      "cause_known": true
+    },
+    {
+      "line": 59,
+      "rule_id": "LC-038",
+      "content": "status_code=400, Input is too long >1m (request id: <id>) (request id: <id>) (request id: <id>)",
+      "responsibility": "客户侧",
+      "reason": "输入长度超过模型限制",
+      "profile": "context",
+      "cause_known": true
+    },
+    {
+      "line": 60,
+      "rule_id": "LC-039",
+      "content": "status_code=400, Invalid 'input[<index>].id': 'msg-<opaque-id>'. Expected an ID that contains letters, numbers, underscores, or dashes, but this value contained additional characters.",
+      "responsibility": "客户侧",
+      "reason": "客户端消息 id 含非法字符",
+      "profile": "parameter",
+      "cause_known": true
+    },
+    {
+      "line": 61,
+      "rule_id": "LC-040",
+      "content": "status_code=400, Invalid encrypted content.",
+      "responsibility": "客户侧/上游",
+      "reason": "加密内容无效",
+      "profile": "continuation",
+      "cause_known": true
+    },
+    {
+      "line": 62,
+      "rule_id": "LC-041",
+      "content": "status_code=400, Invalid input type 'configuration_update' at index 165",
+      "responsibility": "客户侧",
+      "reason": "客户端请求混入 configuration_update 类型，位置/类型错误",
+      "profile": "parameter",
+      "cause_known": true
+    },
+    {
+      "line": 63,
+      "rule_id": "LC-041",
+      "content": "status_code=400, Invalid input type 'configuration_update' at index 342",
+      "responsibility": "客户侧",
+      "reason": "客户端请求混入 configuration_update 类型，位置/类型错误",
+      "profile": "parameter",
+      "cause_known": true
+    },
+    {
+      "line": 64,
+      "rule_id": "LC-041",
+      "content": "status_code=400, Invalid input type 'configuration_update' at index 7",
+      "responsibility": "客户侧",
+      "reason": "客户端请求混入 configuration_update 类型，位置/类型错误",
+      "profile": "parameter",
+      "cause_known": true
+    },
+    {
+      "line": 65,
+      "rule_id": "LC-041",
+      "content": "status_code=400, Invalid input type 'configuration_update' at index 8",
+      "responsibility": "客户侧",
+      "reason": "客户端请求混入 configuration_update 类型，位置/类型错误",
+      "profile": "parameter",
+      "cause_known": true
+    },
+    {
+      "line": 66,
+      "rule_id": "LC-042",
+      "content": "status_code=400, Invalid max_tokens value, the valid range of max_tokens is [1, 393216] (request_id: <id>)",
+      "responsibility": "客户侧",
+      "reason": "max_tokens 超出允许范围",
+      "profile": "parameter",
+      "cause_known": true
+    },
+    {
+      "line": 67,
+      "rule_id": "LC-043",
+      "content": "status_code=400, Invalid message sequence: tool_use and tool_result blocks must be correctly paired and ordered. (request id: <id>)",
+      "responsibility": "客户侧",
+      "reason": "tool_use 与 tool_result 未正确配对",
+      "profile": "tools",
+      "cause_known": true
+    },
+    {
+      "line": 68,
+      "rule_id": "LC-044",
+      "content": "status_code=400, Invalid parameters. Please modify and try again.",
+      "responsibility": "待查",
+      "reason": "参数无效，具体未透出",
+      "profile": "generic",
+      "cause_known": false
+    },
+    {
+      "line": 69,
+      "rule_id": "LC-045",
+      "content": "status_code=400, Invalid prompt: your prompt was flagged as potentially violating our usage policy. Please try again with a different prompt: [地址已隐藏]",
+      "responsibility": "客户侧",
+      "reason": "输入命中上游使用策略",
+      "profile": "policy",
+      "cause_known": true
+    },
+    {
+      "line": 70,
+      "rule_id": "LC-045",
+      "content": "status_code=400, Invalid prompt: your prompt was flagged as potentially violating our usage policy. Please try again with a different prompt: https://***.win",
+      "responsibility": "客户侧",
+      "reason": "输入命中上游使用策略",
+      "profile": "policy",
+      "cause_known": true
+    },
+    {
+      "line": 71,
+      "rule_id": "LC-046",
+      "content": "status_code=400, Invalid request. Please check the request parameters.",
+      "responsibility": "待查",
+      "reason": "请求无效，具体未透出",
+      "profile": "generic",
+      "cause_known": false
+    },
+    {
+      "line": 72,
+      "rule_id": "LC-047",
+      "content": "status_code=400, Invalid schema for response_format 'codex_output_schema': context=('properties', 'agent'), Unexpected constant value: {'evidence_ids': [], 'hypothesis': 'Original frozen agent, no learned memory', 'memory': [], 'name': 'baseline', 'review_guidance': {'centering': '', 'gate': '', 'lift': '', 'section': '', 'spatial': ''}, 'tools_by_review': {'centering': [], 'gate': [], 'lift': [], 'section': [], 'spatial': []}}.",
+      "responsibility": "客户侧",
+      "reason": "自定义 response_format schema 不符合要求（anyOf/allOf/additionalProperties/type）",
+      "profile": "schema",
+      "cause_known": true
+    },
+    {
+      "line": 73,
+      "rule_id": "LC-047",
+      "content": "status_code=400, Invalid schema for response_format 'codex_output_schema': In context=('anyOf', '0'), 'additionalProperties' is required to be supplied and to be false.",
+      "responsibility": "客户侧",
+      "reason": "自定义 response_format schema 不符合要求（anyOf/allOf/additionalProperties/type）",
+      "profile": "schema",
+      "cause_known": true
+    },
+    {
+      "line": 74,
+      "rule_id": "LC-047",
+      "content": "status_code=400, Invalid schema for response_format 'codex_output_schema': In context=(), 'allOf' is not permitted.",
+      "responsibility": "客户侧",
+      "reason": "自定义 response_format schema 不符合要求（anyOf/allOf/additionalProperties/type）",
+      "profile": "schema",
+      "cause_known": true
+    },
+    {
+      "line": 75,
+      "rule_id": "LC-047",
+      "content": "status_code=400, Invalid schema for response_format 'codex_output_schema': schema must have type 'object' and not have 'oneOf'/'anyOf'/'allOf'/'enum'/'not' at the top level. Found 'anyOf'.",
+      "responsibility": "客户侧",
+      "reason": "自定义 response_format schema 不符合要求（anyOf/allOf/additionalProperties/type）",
+      "profile": "schema",
+      "cause_known": true
+    },
+    {
+      "line": 76,
+      "rule_id": "LC-048",
+      "content": "status_code=400, Invalid value: 'other'. Supported values are: 'additional_tools', 'agent_message', 'apply_patch_call', 'apply_patch_call_output', 'code_interpreter_call', 'compaction', 'compaction_trigger', 'computer_call', 'computer_call_output', 'custom_tool_call', 'custom_tool_call_output', 'file_search_call', 'function_call', 'function_call_output', 'image_generation_call', 'item_reference', 'local_shell_call', 'local_shell_call_output', 'mcp_approval_request', 'mcp_approval_response', 'mcp_call', 'mcp_list_tools', 'message', 'multi_agent_call', 'multi_agent_call_output', 'program', 'program_output', 'reasoning', 'shell_call', 'shell_call_output', 'tool_search_call', 'tool_search_output', and 'web_search_call'.",
+      "responsibility": "客户侧",
+      "reason": "枚举字段值不在允许范围内",
+      "profile": "parameter",
+      "cause_known": true
+    },
+    {
+      "line": 77,
+      "rule_id": "LC-049",
+      "content": "status_code=400, invalid_json_schema · invalid_request_error · Invalid schema for response_format 'codex_output_schema': context=('properties', 'agent'), Unexpected constant value: {'evidence_ids': [], 'hypothesis': 'Original frozen agent, no learned memory', 'memory': [], 'name': 'baseline', 'review_guidance': {'centering': '', 'gate': '', 'lift': '', 'section': '', 'spatial': ''}, 'tools_by_review': {'centering': [], 'gate': [], 'lift': [], 'section': [], 'spatial': []}}.",
+      "responsibility": "客户侧",
+      "reason": "response_format schema 不符合接口约束（字段类型、组合规则或额外属性）",
+      "profile": "schema",
+      "cause_known": true
+    },
+    {
+      "line": 78,
+      "rule_id": "LC-049",
+      "content": "status_code=400, invalid_json_schema · invalid_request_error · Invalid schema for response_format 'codex_output_schema': In context=('anyOf', '0', 'properties', 'progress'), schema must have a 'type' key.",
+      "responsibility": "客户侧",
+      "reason": "response_format schema 不符合接口约束（字段类型、组合规则或额外属性）",
+      "profile": "schema",
+      "cause_known": true
+    },
+    {
+      "line": 79,
+      "rule_id": "LC-049",
+      "content": "status_code=400, invalid_json_schema · invalid_request_error · Invalid schema for response_format 'codex_output_schema': In context=(), 'allOf' is not permitted.",
+      "responsibility": "客户侧",
+      "reason": "response_format schema 不符合接口约束（字段类型、组合规则或额外属性）",
+      "profile": "schema",
+      "cause_known": true
+    },
+    {
+      "line": 80,
+      "rule_id": "LC-050",
+      "content": "status_code=400, messages.4: system content must contain at least one block (request id: <id>) (request id: <id>)",
+      "responsibility": "客户侧",
+      "reason": "system 消息内容为空",
+      "profile": "parameter",
+      "cause_known": true
+    },
+    {
+      "line": 81,
+      "rule_id": "LC-050",
+      "content": "status_code=400, messages.7: system content must contain at least one block",
+      "responsibility": "客户侧",
+      "reason": "system 消息内容为空",
+      "profile": "parameter",
+      "cause_known": true
+    },
+    {
+      "line": 82,
+      "rule_id": "LC-050",
+      "content": "status_code=400, messages.722: system content must contain at least one block",
+      "responsibility": "客户侧",
+      "reason": "system 消息内容为空",
+      "profile": "parameter",
+      "cause_known": true
+    },
+    {
+      "line": 83,
+      "rule_id": "LC-051",
+      "content": "status_code=400, No tool output found for function call fc_a7c4fa0f38edec5c.",
+      "responsibility": "客户侧",
+      "reason": "工具调用结果缺失（function call 无 output）",
+      "profile": "tools",
+      "cause_known": true
+    },
+    {
+      "line": 84,
+      "rule_id": "LC-052",
+      "content": "status_code=400, oai-basispoints does not implement structured ***.format output; omit the format or use type=text",
+      "responsibility": "平台侧/上游",
+      "reason": "通道不支持结构化输出",
+      "profile": "capability",
+      "cause_known": true
+    },
+    {
+      "line": 85,
+      "rule_id": "LC-053",
+      "content": "status_code=400, only base64 document sources are supported",
+      "responsibility": "客户侧",
+      "reason": "文档源需 base64",
+      "profile": "parameter",
+      "cause_known": true
+    },
+    {
+      "line": 86,
+      "rule_id": "LC-054",
+      "content": "status_code=400, openai_error",
+      "responsibility": "待查",
+      "reason": "上游通用 openai_error",
+      "profile": "generic",
+      "cause_known": false
+    },
+    {
+      "line": 87,
+      "rule_id": "LC-055",
+      "content": "status_code=400, previous_response_id is not available for this user",
+      "responsibility": "平台侧/上游",
+      "reason": "该用户/账号不支持 previous_response_id",
+      "profile": "capability",
+      "cause_known": true
+    },
+    {
+      "line": 88,
+      "rule_id": "LC-056",
+      "content": "status_code=400, previous_response_id requires an OpenAI API-key account for HTTP requests",
+      "responsibility": "平台侧",
+      "reason": "需 OpenAI API-key 类型账号",
+      "profile": "capability",
+      "cause_known": true
+    },
+    {
+      "line": 89,
+      "rule_id": "LC-057",
+      "content": "status_code=400, prompt is too long: 1000001 tokens > 1000000 maximum",
+      "responsibility": "客户侧",
+      "reason": "输入与历史 Token 超过模型上下文上限",
+      "profile": "context",
+      "cause_known": true
+    },
+    {
+      "line": 90,
+      "rule_id": "LC-057",
+      "content": "status_code=400, prompt is too long: 1000001 tokens > 1000000 maximum (request id: <id>)",
+      "responsibility": "客户侧",
+      "reason": "输入与历史 Token 超过模型上下文上限",
+      "profile": "context",
+      "cause_known": true
+    },
+    {
+      "line": 91,
+      "rule_id": "LC-057",
+      "content": "status_code=400, prompt is too long: 1025497 tokens > 1000000 maximum (request id: <id>) (request id: <id>)",
+      "responsibility": "客户侧",
+      "reason": "输入与历史 Token 超过模型上下文上限",
+      "profile": "context",
+      "cause_known": true
+    },
+    {
+      "line": 92,
+      "rule_id": "LC-057",
+      "content": "status_code=400, prompt is too long: 1038426 tokens > 1000000 maximum (request id: <id>)",
+      "responsibility": "客户侧",
+      "reason": "输入与历史 Token 超过模型上下文上限",
+      "profile": "context",
+      "cause_known": true
+    },
+    {
+      "line": 93,
+      "rule_id": "LC-057",
+      "content": "status_code=400, prompt is too long: 1065333 tokens > 1000000 maximum",
+      "responsibility": "客户侧",
+      "reason": "输入与历史 Token 超过模型上下文上限",
+      "profile": "context",
+      "cause_known": true
+    },
+    {
+      "line": 94,
+      "rule_id": "LC-057",
+      "content": "status_code=400, prompt is too long: 1091214 tokens > 1000000 maximum (request id: <id>)",
+      "responsibility": "客户侧",
+      "reason": "输入与历史 Token 超过模型上下文上限",
+      "profile": "context",
+      "cause_known": true
+    },
+    {
+      "line": 95,
+      "rule_id": "LC-057",
+      "content": "status_code=400, prompt is too long: 1125702 tokens > 1000000 maximum (request id: <id>) (request id: <id>)",
+      "responsibility": "客户侧",
+      "reason": "输入与历史 Token 超过模型上下文上限",
+      "profile": "context",
+      "cause_known": true
+    },
+    {
+      "line": 96,
+      "rule_id": "LC-057",
+      "content": "status_code=400, prompt is too long: 1133403 tokens > 1000000 maximum",
+      "responsibility": "客户侧",
+      "reason": "输入与历史 Token 超过模型上下文上限",
+      "profile": "context",
+      "cause_known": true
+    },
+    {
+      "line": 97,
+      "rule_id": "LC-057",
+      "content": "status_code=400, prompt is too long: 1149871 tokens > 1000000 maximum (request id: <id>)",
+      "responsibility": "客户侧",
+      "reason": "输入与历史 Token 超过模型上下文上限",
+      "profile": "context",
+      "cause_known": true
+    },
+    {
+      "line": 98,
+      "rule_id": "LC-057",
+      "content": "status_code=400, prompt is too long: 1189901 tokens > 1000000 maximum (request id: <id>)",
+      "responsibility": "客户侧",
+      "reason": "输入与历史 Token 超过模型上下文上限",
+      "profile": "context",
+      "cause_known": true
+    },
+    {
+      "line": 99,
+      "rule_id": "LC-057",
+      "content": "status_code=400, prompt is too long: 1351077 tokens > 1000000 maximum",
+      "responsibility": "客户侧",
+      "reason": "输入与历史 Token 超过模型上下文上限",
+      "profile": "context",
+      "cause_known": true
+    },
+    {
+      "line": 100,
+      "rule_id": "LC-057",
+      "content": "status_code=400, prompt is too long: 1364267 tokens > 1000000 maximum",
+      "responsibility": "客户侧",
+      "reason": "输入与历史 Token 超过模型上下文上限",
+      "profile": "context",
+      "cause_known": true
+    },
+    {
+      "line": 101,
+      "rule_id": "LC-057",
+      "content": "status_code=400, prompt is too long: 1553947 tokens > 1000000 maximum",
+      "responsibility": "客户侧",
+      "reason": "输入与历史 Token 超过模型上下文上限",
+      "profile": "context",
+      "cause_known": true
+    },
+    {
+      "line": 102,
+      "rule_id": "LC-057",
+      "content": "status_code=400, prompt is too long: 1612955 tokens > 1000000 maximum (request id: <id>)",
+      "responsibility": "客户侧",
+      "reason": "输入与历史 Token 超过模型上下文上限",
+      "profile": "context",
+      "cause_known": true
+    },
+    {
+      "line": 103,
+      "rule_id": "LC-057",
+      "content": "status_code=400, prompt is too long: 1624549 tokens > 1000000 maximum",
+      "responsibility": "客户侧",
+      "reason": "输入与历史 Token 超过模型上下文上限",
+      "profile": "context",
+      "cause_known": true
+    },
+    {
+      "line": 104,
+      "rule_id": "LC-057",
+      "content": "status_code=400, prompt is too long: 1647336 tokens > 1000000 maximum (request id: <id>)",
+      "responsibility": "客户侧",
+      "reason": "输入与历史 Token 超过模型上下文上限",
+      "profile": "context",
+      "cause_known": true
+    },
+    {
+      "line": 105,
+      "rule_id": "LC-058",
+      "content": "status_code=400, request failed",
+      "responsibility": "待查",
+      "reason": "请求失败，原因未透出",
+      "profile": "generic",
+      "cause_known": false
+    },
+    {
+      "line": 106,
+      "rule_id": "LC-059",
+      "content": "status_code=400, Request is too large for claude-opus-5-5 after safe local compression (1158441 body bytes, 1158067 input-text bytes, 0 image bytes, approximately 339077 input tokens; body limit 10000000, text limit 950000, token limit 993636). Reduce old conversation history/tool output or the number/size of attached images or PDFs. The request was not sent upstream.",
+      "responsibility": "客户侧",
+      "reason": "请求体超限（历史/附件过大），本地压缩后仍超",
+      "profile": "context",
+      "cause_known": true
+    },
+    {
+      "line": 107,
+      "rule_id": "LC-059",
+      "content": "status_code=400, Request is too large for claude-opus-5-5 after safe local compression (1202790 body bytes, 1202416 input-text bytes, 0 image bytes, approximately 352058 input tokens; body limit 10000000, text limit 950000, token limit 993636). Reduce old conversation history/tool output or the number/size of attached images or PDFs. The request was not sent upstream.",
+      "responsibility": "客户侧",
+      "reason": "请求体超限（历史/附件过大），本地压缩后仍超",
+      "profile": "context",
+      "cause_known": true
+    },
+    {
+      "line": 108,
+      "rule_id": "LC-060",
+      "content": "status_code=400, Search input supports text messages, not encrypted history or tool items",
+      "responsibility": "客户侧",
+      "reason": "search 接口不接受加密历史/tool item",
+      "profile": "tools",
+      "cause_known": true
+    },
+    {
+      "line": 109,
+      "rule_id": "LC-061",
+      "content": "status_code=400, status_code=400, 请联系管理员处理！ (request id: <id>)",
+      "responsibility": "待查",
+      "reason": "原因未明的平台提示",
+      "profile": "generic",
+      "cause_known": false
+    },
+    {
+      "line": 110,
+      "rule_id": "LC-062",
+      "content": "status_code=400, The 'configuration_update' item type is not supported with compaction without a subsequent configuration update.",
+      "responsibility": "客户侧",
+      "reason": "compaction 场景混入 configuration_update",
+      "profile": "parameter",
+      "cause_known": true
+    },
+    {
+      "line": 111,
+      "rule_id": "LC-062",
+      "content": "status_code=400, The 'configuration_update' item type is not supported with compaction.",
+      "responsibility": "客户侧",
+      "reason": "compaction 场景混入 configuration_update",
+      "profile": "parameter",
+      "cause_known": true
+    },
+    {
+      "line": 112,
+      "rule_id": "LC-063",
+      "content": "status_code=400, The ChatGPT user has reached their Subscription Sharing usage limit. Ask the user to try again after their usage limit resets or use an API key instead.",
+      "responsibility": "上游侧",
+      "reason": "ChatGPT 订阅共享账号额度达上限",
+      "profile": "quota",
+      "cause_known": true
+    },
+    {
+      "line": 113,
+      "rule_id": "LC-064",
+      "content": "status_code=400, The configured accounts in this group do not support the requested endpoint",
+      "responsibility": "平台侧",
+      "reason": "分组账号不支持该端点",
+      "profile": "capability",
+      "cause_known": true
+    },
+    {
+      "line": 114,
+      "rule_id": "LC-065",
+      "content": "status_code=400, The encrypted content for item amsg_<id> could not be verified. Reason: encrypted content hydration failed: Encrypted content could not be decrypted or parsed.",
+      "responsibility": "客户侧/上游",
+      "reason": "加密内容校验失败（hydration failed）",
+      "profile": "continuation",
+      "cause_known": true
+    },
+    {
+      "line": 115,
+      "rule_id": "LC-066",
+      "content": "status_code=400, The image you provided requires 31610 patches after processing, exceeding the limit of 30000. Please resize the image and try again.",
+      "responsibility": "客户侧",
+      "reason": "图片 patch 数超过模型允许上限",
+      "profile": "parameter",
+      "cause_known": true
+    },
+    {
+      "line": 116,
+      "rule_id": "LC-066",
+      "content": "status_code=400, The image you provided requires 34155 patches after processing, exceeding the limit of 30000. Please resize the image and try again.",
+      "responsibility": "客户侧",
+      "reason": "图片 patch 数超过模型允许上限",
+      "profile": "parameter",
+      "cause_known": true
+    },
+    {
+      "line": 117,
+      "rule_id": "LC-066",
+      "content": "status_code=400, The image you provided requires 35420 patches after processing, exceeding the limit of 30000. Please resize the image and try again.",
+      "responsibility": "客户侧",
+      "reason": "图片 patch 数超过模型允许上限",
+      "profile": "parameter",
+      "cause_known": true
+    },
+    {
+      "line": 118,
+      "rule_id": "LC-066",
+      "content": "status_code=400, The image you provided requires 35420 patches after processing, exceeding the limit of 30000. Please resize the image and try again. (E1001-<opaque-id>)",
+      "responsibility": "客户侧",
+      "reason": "图片 patch 数超过模型允许上限",
+      "profile": "parameter",
+      "cause_known": true
+    },
+    {
+      "line": 119,
+      "rule_id": "LC-066",
+      "content": "status_code=400, The image you provided requires 43776 patches after processing, exceeding the limit of 30000. Please resize the image and try again.",
+      "responsibility": "客户侧",
+      "reason": "图片 patch 数超过模型允许上限",
+      "profile": "parameter",
+      "cause_known": true
+    },
+    {
+      "line": 120,
+      "rule_id": "LC-066",
+      "content": "status_code=400, The image you provided requires 46272 patches after processing, exceeding the limit of 30000. Please resize the image and try again.",
+      "responsibility": "客户侧",
+      "reason": "图片 patch 数超过模型允许上限",
+      "profile": "parameter",
+      "cause_known": true
+    },
+    {
+      "line": 121,
+      "rule_id": "LC-066",
+      "content": "status_code=400, The image you provided requires 46272 patches after processing, exceeding the limit of 30000. Please resize the image and try again. (request id: <id>)",
+      "responsibility": "客户侧",
+      "reason": "图片 patch 数超过模型允许上限",
+      "profile": "parameter",
+      "cause_known": true
+    },
+    {
+      "line": 122,
+      "rule_id": "LC-066",
+      "content": "status_code=400, The image you provided requires 49232 patches after processing, exceeding the limit of 30000. Please resize the image and try again.",
+      "responsibility": "客户侧",
+      "reason": "图片 patch 数超过模型允许上限",
+      "profile": "parameter",
+      "cause_known": true
+    },
+    {
+      "line": 123,
+      "rule_id": "LC-067",
+      "content": "status_code=400, The request could not be processed. Please check the request parameters.",
+      "responsibility": "待查",
+      "reason": "请求无法处理，原因未透出",
+      "profile": "generic",
+      "cause_known": false
+    },
+    {
+      "line": 124,
+      "rule_id": "LC-067",
+      "content": "status_code=400, The request could not be processed. Please check the request parameters. (request id: <id>)",
+      "responsibility": "待查",
+      "reason": "请求无法处理，原因未透出",
+      "profile": "generic",
+      "cause_known": false
+    },
+    {
+      "line": 125,
+      "rule_id": "LC-067",
+      "content": "status_code=400, The request could not be processed. Please check the request parameters. (request id: <id>) (request id: <id>)",
+      "responsibility": "待查",
+      "reason": "请求无法处理，原因未透出",
+      "profile": "generic",
+      "cause_known": false
+    },
+    {
+      "line": 126,
+      "rule_id": "LC-068",
+      "content": "status_code=400, The request exceeds the model context limit. Shorten the input and retry.",
+      "responsibility": "客户侧",
+      "reason": "请求超模型上下文限制",
+      "profile": "context",
+      "cause_known": true
+    },
+    {
+      "line": 127,
+      "rule_id": "LC-069",
+      "content": "status_code=400, The tools definition is invalid or unsupported. Trace ID: 6190f853-4988-4f5a-9f0e-51d3ac08d525",
+      "responsibility": "客户侧",
+      "reason": "工具(tools)定义无效",
+      "profile": "tools",
+      "cause_known": true
+    },
+    {
+      "line": 128,
+      "rule_id": "LC-070",
+      "content": "status_code=400, The upstream could not validate encrypted continuation context. Rebuild the conversation context in the client.",
+      "responsibility": "客户侧/上游",
+      "reason": "上游无法校验加密续传上下文",
+      "profile": "continuation",
+      "cause_known": true
+    },
+    {
+      "line": 129,
+      "rule_id": "LC-071",
+      "content": "status_code=400, This conversation can no longer be routed to its original account. Start a new Claude Code session.",
+      "responsibility": "平台侧/上游",
+      "reason": "加密历史绑定原账号，路由/账号变化无法匹配",
+      "profile": "continuation",
+      "cause_known": true
+    },
+    {
+      "line": 130,
+      "rule_id": "LC-071",
+      "content": "status_code=400, This conversation can no longer be routed to its original account. Start a new Claude Code session. (request id: <id>)",
+      "responsibility": "平台侧/上游",
+      "reason": "加密历史绑定原账号，路由/账号变化无法匹配",
+      "profile": "continuation",
+      "cause_known": true
+    },
+    {
+      "line": 131,
+      "rule_id": "LC-072",
+      "content": "status_code=400, To turn thinking off on this model, send \"thinking\": {\"type\": \"between_tools\"} instead of {\"type\": \"disabled\"}. The model does not think before responding. The short updates it writes between tool calls come back as thinking blocks. (request id: <id>) (request id: <id>)",
+      "responsibility": "客户侧",
+      "reason": "关闭思考需用 between_tools 而非 disabled",
+      "profile": "parameter",
+      "cause_known": true
+    },
+    {
+      "line": 132,
+      "rule_id": "LC-073",
+      "content": "status_code=400, Unable to download content from the provided URL before the timeout. Check that the URL is publicly accessible and responds promptly, or upload the file and provide a file_id instead.",
+      "responsibility": "客户侧/上游",
+      "reason": "客户 URL 不可访问/下载超时",
+      "profile": "network",
+      "cause_known": true
+    },
+    {
+      "line": 133,
+      "rule_id": "LC-074",
+      "content": "status_code=400, unknown provider for model gpt-6-astra",
+      "responsibility": "平台侧",
+      "reason": "请求模型的 provider 未配置",
+      "profile": "capability",
+      "cause_known": true
+    },
+    {
+      "line": 134,
+      "rule_id": "LC-075",
+      "content": "status_code=400, Unrecognized conversation state; start a new conversation or resend complete plaintext history",
+      "responsibility": "客户侧/上游",
+      "reason": "会话状态无法识别",
+      "profile": "continuation",
+      "cause_known": true
+    },
+    {
+      "line": 135,
+      "rule_id": "LC-076",
+      "content": "status_code=400, Upstream encrypted content error (details redacted)",
+      "responsibility": "上游侧",
+      "reason": "上游加密内容错误，细节脱敏",
+      "profile": "continuation",
+      "cause_known": true
+    },
+    {
+      "line": 136,
+      "rule_id": "LC-077",
+      "content": "status_code=400, Upstream rate limit exceeded, please retry later (request id: <id>) (request id: <id>)",
+      "responsibility": "上游侧",
+      "reason": "上游限流",
+      "profile": "quota",
+      "cause_known": true
+    },
+    {
+      "line": 137,
+      "rule_id": "LC-078",
+      "content": "status_code=400, Upstream rejected the request",
+      "responsibility": "待查",
+      "reason": "上游拒绝请求，原因未透出",
+      "profile": "generic",
+      "cause_known": false
+    },
+    {
+      "line": 138,
+      "rule_id": "LC-079",
+      "content": "status_code=400, Upstream request failed",
+      "responsibility": "待查",
+      "reason": "上游请求失败，原因未透出",
+      "profile": "generic",
+      "cause_known": false
+    },
+    {
+      "line": 139,
+      "rule_id": "LC-080",
+      "content": "status_code=400, Upstream service temporarily unavailable (request id: <id>)",
+      "responsibility": "上游侧",
+      "reason": "上游服务暂不可用",
+      "profile": "network",
+      "cause_known": true
+    },
+    {
+      "line": 140,
+      "rule_id": "LC-081",
+      "content": "status_code=400, Your input exceeds the context window of this model. Please adjust your input and try again.",
+      "responsibility": "客户侧",
+      "reason": "输入超模型上下文",
+      "profile": "context",
+      "cause_known": true
+    },
+    {
+      "line": 141,
+      "rule_id": "LC-082",
+      "content": "status_code=401, User account is not active",
+      "responsibility": "平台侧/上游",
+      "reason": "账号未激活/禁用",
+      "profile": "account",
+      "cause_known": true
+    },
+    {
+      "line": 142,
+      "rule_id": "LC-083",
+      "content": "status_code=403, 非法请求 (request id: <id>)",
+      "responsibility": "待查",
+      "reason": "非法请求，原因未透出",
+      "profile": "generic",
+      "cause_known": false
+    },
+    {
+      "line": 143,
+      "rule_id": "LC-084",
+      "content": "status_code=403, 服务暂时不可用。 原因：上游服务、网络链路或代理返回异常响应。 解决方案：请稍后重试。如当前使用智能路由，请先重试；若仍失败，建议切换固定商家；如当前使用固定商家，请切换固定商家或开启智能路由。 request_id: <id>",
+      "responsibility": "上游侧/网络",
+      "reason": "上游/网络/代理异常",
+      "profile": "network",
+      "cause_known": true
+    },
+    {
+      "line": 144,
+      "rule_id": "LC-085",
+      "content": "status_code=403, 该会话已被网络安全策略屏蔽，请开启新会话 / This session is blocked by cyber-security policy, please start a new session",
+      "responsibility": "平台侧/上游",
+      "reason": "会话被网络安全策略屏蔽",
+      "profile": "policy",
+      "cause_known": true
+    },
+    {
+      "line": 145,
+      "rule_id": "LC-086",
+      "content": "status_code=403, 内容审计命中风险规则，请调整输入后重试",
+      "responsibility": "平台侧/客户输入",
+      "reason": "平台内容审计命中风险规则",
+      "profile": "policy",
+      "cause_known": true
+    },
+    {
+      "line": 146,
+      "rule_id": "LC-087",
+      "content": "status_code=403, 用户额度不足, 剩余额度: ＄-1.029680 (request id: <id>)",
+      "responsibility": "客户侧",
+      "reason": "客户额度耗尽且透支为负",
+      "profile": "quota",
+      "cause_known": true
+    },
+    {
+      "line": 147,
+      "rule_id": "LC-087",
+      "content": "status_code=403, 用户额度不足, 剩余额度: ＄-1.708508 (request id: <id>)",
+      "responsibility": "客户侧",
+      "reason": "客户额度耗尽且透支为负",
+      "profile": "quota",
+      "cause_known": true
+    },
+    {
+      "line": 148,
+      "rule_id": "LC-088",
+      "content": "status_code=403, 预扣费额度失败, 用户剩余额度: ＄0.006044, 需要预扣费额度: ＄0.101460 (request id: <id>)",
+      "responsibility": "客户侧/平台",
+      "reason": "余额不足预扣本次费用",
+      "profile": "quota",
+      "cause_known": true
+    },
+    {
+      "line": 149,
+      "rule_id": "LC-088",
+      "content": "status_code=403, 预扣费额度失败, 用户剩余额度: ＄0.006044, 需要预扣费额度: ＄0.102372 (request id: <id>)",
+      "responsibility": "客户侧/平台",
+      "reason": "余额不足预扣本次费用",
+      "profile": "quota",
+      "cause_known": true
+    },
+    {
+      "line": 150,
+      "rule_id": "LC-088",
+      "content": "status_code=403, 预扣费额度失败, 用户剩余额度: ＄0.006044, 需要预扣费额度: ＄0.115562 (request id: <id>)",
+      "responsibility": "客户侧/平台",
+      "reason": "余额不足预扣本次费用",
+      "profile": "quota",
+      "cause_known": true
+    },
+    {
+      "line": 151,
+      "rule_id": "LC-088",
+      "content": "status_code=403, 预扣费额度失败, 用户剩余额度: ＄0.006044, 需要预扣费额度: ＄0.222354 (request id: <id>)",
+      "responsibility": "客户侧/平台",
+      "reason": "余额不足预扣本次费用",
+      "profile": "quota",
+      "cause_known": true
+    },
+    {
+      "line": 152,
+      "rule_id": "LC-088",
+      "content": "status_code=403, 预扣费额度失败, 用户剩余额度: ＄0.006044, 需要预扣费额度: ＄0.535990 (request id: <id>)",
+      "responsibility": "客户侧/平台",
+      "reason": "余额不足预扣本次费用",
+      "profile": "quota",
+      "cause_known": true
+    },
+    {
+      "line": 153,
+      "rule_id": "LC-088",
+      "content": "status_code=403, 预扣费额度失败, 用户剩余额度: ＄0.006044, 需要预扣费额度: ＄0.580656 (request id: <id>)",
+      "responsibility": "客户侧/平台",
+      "reason": "余额不足预扣本次费用",
+      "profile": "quota",
+      "cause_known": true
+    },
+    {
+      "line": 154,
+      "rule_id": "LC-088",
+      "content": "status_code=403, 预扣费额度失败, 用户剩余额度: ＄0.006044, 需要预扣费额度: ＄0.971410 (request id: <id>)",
+      "responsibility": "客户侧/平台",
+      "reason": "余额不足预扣本次费用",
+      "profile": "quota",
+      "cause_known": true
+    },
+    {
+      "line": 155,
+      "rule_id": "LC-088",
+      "content": "status_code=403, 预扣费额度失败, 用户剩余额度: ＄0.019840, 需要预扣费额度: ＄0.076326 (request id: <id>)",
+      "responsibility": "客户侧/平台",
+      "reason": "余额不足预扣本次费用",
+      "profile": "quota",
+      "cause_known": true
+    },
+    {
+      "line": 156,
+      "rule_id": "LC-088",
+      "content": "status_code=403, 预扣费额度失败, 用户剩余额度: ＄0.019840, 需要预扣费额度: ＄0.435824 (request id: <id>)",
+      "responsibility": "客户侧/平台",
+      "reason": "余额不足预扣本次费用",
+      "profile": "quota",
+      "cause_known": true
+    },
+    {
+      "line": 157,
+      "rule_id": "LC-088",
+      "content": "status_code=403, 预扣费额度失败, 用户剩余额度: ＄0.287898, 需要预扣费额度: ＄0.711360 (request id: <id>)",
+      "responsibility": "客户侧/平台",
+      "reason": "余额不足预扣本次费用",
+      "profile": "quota",
+      "cause_known": true
+    },
+    {
+      "line": 158,
+      "rule_id": "LC-088",
+      "content": "status_code=403, 预扣费额度失败, 用户剩余额度: ＄0.633468, 需要预扣费额度: ＄1.930448 (request id: <id>)",
+      "responsibility": "客户侧/平台",
+      "reason": "余额不足预扣本次费用",
+      "profile": "quota",
+      "cause_known": true
+    },
+    {
+      "line": 159,
+      "rule_id": "LC-088",
+      "content": "status_code=403, 预扣费额度失败, 用户剩余额度: ＄0.633468, 需要预扣费额度: ＄2.091318 (request id: <id>)",
+      "responsibility": "客户侧/平台",
+      "reason": "余额不足预扣本次费用",
+      "profile": "quota",
+      "cause_known": true
+    },
+    {
+      "line": 160,
+      "rule_id": "LC-088",
+      "content": "status_code=403, 预扣费额度失败, 用户剩余额度: ＄2.007566, 需要预扣费额度: ＄3.176448 (request id: <id>)",
+      "responsibility": "客户侧/平台",
+      "reason": "余额不足预扣本次费用",
+      "profile": "quota",
+      "cause_known": true
+    },
+    {
+      "line": 161,
+      "rule_id": "LC-088",
+      "content": "status_code=403, 预扣费额度失败, 用户剩余额度: ＄2.740346, 需要预扣费额度: ＄3.180418 (request id: <id>)",
+      "responsibility": "客户侧/平台",
+      "reason": "余额不足预扣本次费用",
+      "profile": "quota",
+      "cause_known": true
+    },
+    {
+      "line": 162,
+      "rule_id": "LC-089",
+      "content": "status_code=403, 站长忘记给上游上供了，稍等",
+      "responsibility": "平台侧",
+      "reason": "平台未给上游充值（上游欠费）",
+      "profile": "quota",
+      "cause_known": true
+    },
+    {
+      "line": 163,
+      "rule_id": "LC-090",
+      "content": "status_code=403, API Key 所属分组已删除",
+      "responsibility": "平台侧",
+      "reason": "API key 所属分组被删除",
+      "profile": "account",
+      "cause_known": true
+    },
+    {
+      "line": 164,
+      "rule_id": "LC-091",
+      "content": "status_code=403, bad response status code 403",
+      "responsibility": "待查",
+      "reason": "上游返回 403，具体未透出",
+      "profile": "generic",
+      "cause_known": false
+    },
+    {
+      "line": 165,
+      "rule_id": "LC-092",
+      "content": "status_code=403, Insufficient account balance (request id: <id>)",
+      "responsibility": "上游/平台账户",
+      "reason": "账户余额不足",
+      "profile": "quota",
+      "cause_known": true
+    },
+    {
+      "line": 166,
+      "rule_id": "LC-093",
+      "content": "status_code=403, insufficient balance",
+      "responsibility": "上游/平台账户",
+      "reason": "账户余额不足",
+      "profile": "quota",
+      "cause_known": true
+    },
+    {
+      "line": 167,
+      "rule_id": "LC-094",
+      "content": "status_code=403, Insufficient user balance. Please top up your user balance.",
+      "responsibility": "客户侧",
+      "reason": "用户余额不足",
+      "profile": "quota",
+      "cause_known": true
+    },
+    {
+      "line": 168,
+      "rule_id": "LC-095",
+      "content": "status_code=403, openai_error",
+      "responsibility": "待查",
+      "reason": "上游通用 openai_error",
+      "profile": "generic",
+      "cause_known": false
+    },
+    {
+      "line": 169,
+      "rule_id": "LC-096",
+      "content": "status_code=403, Service is temporarily unavailable, please retry later (request id: <id>)",
+      "responsibility": "平台/上游",
+      "reason": "服务暂不可用",
+      "profile": "network",
+      "cause_known": true
+    },
+    {
+      "line": 170,
+      "rule_id": "LC-097",
+      "content": "status_code=403, The request failed because your account has an overdue balance. Request id: <opaque-id>",
+      "responsibility": "客户/平台账户",
+      "reason": "账户欠费",
+      "profile": "quota",
+      "cause_known": true
+    },
+    {
+      "line": 171,
+      "rule_id": "LC-098",
+      "content": "status_code=403, This session was blocked by the upstream safety policy. 此会话被上游安全策略拒绝。",
+      "responsibility": "上游侧",
+      "reason": "上游安全策略拒绝会话",
+      "profile": "policy",
+      "cause_known": true
+    },
+    {
+      "line": 172,
+      "rule_id": "LC-099",
+      "content": "status_code=404, bad response status code 404",
+      "responsibility": "待查",
+      "reason": "上游返回 404",
+      "profile": "route",
+      "cause_known": false
+    },
+    {
+      "line": 173,
+      "rule_id": "LC-100",
+      "content": "status_code=404, Model \"claude-sonnet-5-5\" is not supported by any configured account in this group",
+      "responsibility": "平台侧",
+      "reason": "分组下无账号支持该模型",
+      "profile": "capability",
+      "cause_known": true
+    },
+    {
+      "line": 174,
+      "rule_id": "LC-101",
+      "content": "status_code=404, Model \"gpt-5.5\" is not available for this group",
+      "responsibility": "平台侧",
+      "reason": "分组未开放请求模型或没有可用账号",
+      "profile": "capability",
+      "cause_known": true
+    },
+    {
+      "line": 175,
+      "rule_id": "LC-102",
+      "content": "status_code=404, Model \"gpt-5.6-sol\" is not supported by any configured account in this group",
+      "responsibility": "平台侧",
+      "reason": "分组下无账号支持该模型",
+      "profile": "capability",
+      "cause_known": true
+    },
+    {
+      "line": 176,
+      "rule_id": "LC-102",
+      "content": "status_code=404, Model \"gpt-5.6-terra\" is not supported by any configured account in this group",
+      "responsibility": "平台侧",
+      "reason": "分组下无账号支持该模型",
+      "profile": "capability",
+      "cause_known": true
+    },
+    {
+      "line": 177,
+      "rule_id": "LC-102",
+      "content": "status_code=404, Model \"gpt-6-sol\" is not supported by any configured account in this group",
+      "responsibility": "平台侧",
+      "reason": "分组下无账号支持该模型",
+      "profile": "capability",
+      "cause_known": true
+    },
+    {
+      "line": 178,
+      "rule_id": "LC-102",
+      "content": "status_code=404, Model \"gpt-6.1-sol\" is not supported by any configured account in this group",
+      "responsibility": "平台侧",
+      "reason": "分组下无账号支持该模型",
+      "profile": "capability",
+      "cause_known": true
+    },
+    {
+      "line": 179,
+      "rule_id": "LC-103",
+      "content": "status_code=404, Not found",
+      "responsibility": "待查",
+      "reason": "上游返回 Not found",
+      "profile": "route",
+      "cause_known": false
+    },
+    {
+      "line": 180,
+      "rule_id": "LC-104",
+      "content": "status_code=413, bad response status code 413",
+      "responsibility": "客户侧",
+      "reason": "请求体过大（413）",
+      "profile": "size",
+      "cause_known": true
+    },
+    {
+      "line": 181,
+      "rule_id": "LC-105",
+      "content": "status_code=413, Request payload is too large",
+      "responsibility": "客户侧",
+      "reason": "请求体过大",
+      "profile": "size",
+      "cause_known": true
+    },
+    {
+      "line": 182,
+      "rule_id": "LC-106",
+      "content": "status_code=422, The original upstream for this encrypted history is unavailable or its credential/model mapping changed. Retry the original route later; the history has been preserved.",
+      "responsibility": "平台侧/上游",
+      "reason": "加密历史原上游不可用",
+      "profile": "continuation",
+      "cause_known": true
+    },
+    {
+      "line": 183,
+      "rule_id": "LC-107",
+      "content": "status_code=422, The original upstream for this encrypted history is unknown. Automatic provider switching is blocked; the history has been preserved.",
+      "responsibility": "平台侧",
+      "reason": "原上游未知，自动切换被阻断",
+      "profile": "continuation",
+      "cause_known": true
+    },
+    {
+      "line": 184,
+      "rule_id": "LC-108",
+      "content": "status_code=429, All available accounts are currently rate-limited. Please retry later.",
+      "responsibility": "上游/平台账号池",
+      "reason": "所有可用账号限流",
+      "profile": "quota",
+      "cause_known": true
+    },
+    {
+      "line": 185,
+      "rule_id": "LC-109",
+      "content": "status_code=429, API error (HTTP 429): {\"message\":\"Too many requests, please wait before trying again.\",\"reason\":null} (request id: <id>) (request id: <id>) (request id: <id>)",
+      "responsibility": "客户侧/上游",
+      "reason": "请求过多（429）",
+      "profile": "quota",
+      "cause_known": true
+    },
+    {
+      "line": 186,
+      "rule_id": "LC-110",
+      "content": "status_code=429, Concurrency limit exceeded for account, please retry later",
+      "responsibility": "上游侧",
+      "reason": "上游账号并发超限",
+      "profile": "quota",
+      "cause_known": true
+    },
+    {
+      "line": 187,
+      "rule_id": "LC-111",
+      "content": "status_code=429, Concurrency limit exceeded for user, please retry later",
+      "responsibility": "平台侧/客户侧",
+      "reason": "用户并发超限",
+      "profile": "quota",
+      "cause_known": true
+    },
+    {
+      "line": 188,
+      "rule_id": "LC-112",
+      "content": "status_code=429, Overloaded (request id: <id>)",
+      "responsibility": "上游/平台",
+      "reason": "服务过载",
+      "profile": "quota",
+      "cause_known": true
+    },
+    {
+      "line": 189,
+      "rule_id": "LC-113",
+      "content": "status_code=429, Rate limit exceeded",
+      "responsibility": "上游/平台",
+      "reason": "限流",
+      "profile": "quota",
+      "cause_known": true
+    },
+    {
+      "line": 190,
+      "rule_id": "LC-114",
+      "content": "status_code=429, Too many pending requests, please retry later",
+      "responsibility": "平台/上游",
+      "reason": "待处理请求过多",
+      "profile": "quota",
+      "cause_known": true
+    },
+    {
+      "line": 191,
+      "rule_id": "LC-115",
+      "content": "status_code=429, Upstream rate limit exceeded, please retry later",
+      "responsibility": "上游侧",
+      "reason": "上游限流",
+      "profile": "quota",
+      "cause_known": true
+    },
+    {
+      "line": 192,
+      "rule_id": "LC-115",
+      "content": "status_code=429, Upstream rate limit exceeded, please retry later (request id: <id>)",
+      "responsibility": "上游侧",
+      "reason": "上游限流",
+      "profile": "quota",
+      "cause_known": true
+    },
+    {
+      "line": 193,
+      "rule_id": "LC-115",
+      "content": "status_code=429, Upstream rate limit exceeded, please retry later. (request id: <id>) (request id: <id>)",
+      "responsibility": "上游侧",
+      "reason": "上游限流",
+      "profile": "quota",
+      "cause_known": true
+    },
+    {
+      "line": 194,
+      "rule_id": "LC-116",
+      "content": "status_code=500, 对话内容太长了，请新开对话或删减内容后重试。 (request id: <id>)",
+      "responsibility": "客户侧",
+      "reason": "上下文超长",
+      "profile": "context",
+      "cause_known": true
+    },
+    {
+      "line": 195,
+      "rule_id": "LC-117",
+      "content": "status_code=500, 该模型不支持这类文件，请转成 PDF 或文字后重试。 (request id: <id>)",
+      "responsibility": "客户侧",
+      "reason": "模型不支持该文件类型",
+      "profile": "parameter",
+      "cause_known": true
+    },
+    {
+      "line": 196,
+      "rule_id": "LC-118",
+      "content": "status_code=500, 这段对话无法继续了，请新开对话后重试。 (request id: <id>)",
+      "responsibility": "待查",
+      "reason": "对话无法继续",
+      "profile": "continuation",
+      "cause_known": false
+    },
+    {
+      "line": 197,
+      "rule_id": "LC-119",
+      "content": "status_code=500, channel does not support /v1/alpha/search (request id: <id>)",
+      "responsibility": "平台侧/上游",
+      "reason": "通道不支持 /v1/alpha/search",
+      "profile": "capability",
+      "cause_known": true
+    },
+    {
+      "line": 198,
+      "rule_id": "LC-120",
+      "content": "status_code=500, Concurrency limit exceeded for account, please retry later",
+      "responsibility": "上游侧",
+      "reason": "上游账号级并发超限",
+      "profile": "quota",
+      "cause_known": true
+    },
+    {
+      "line": 199,
+      "rule_id": "LC-121",
+      "content": "status_code=500, Concurrency limit exceeded for user, please retry later",
+      "responsibility": "平台/客户",
+      "reason": "用户级并发超限",
+      "profile": "quota",
+      "cause_known": true
+    },
+    {
+      "line": 200,
+      "rule_id": "LC-122",
+      "content": "status_code=500, Failed to validate API key",
+      "responsibility": "平台侧/上游",
+      "reason": "API key 校验失败",
+      "profile": "account",
+      "cause_known": true
+    },
+    {
+      "line": 201,
+      "rule_id": "LC-123",
+      "content": "status_code=500, Model 'claude-fable-5-1' is not supported. (request id: <id>) (request id: <id>)",
+      "responsibility": "平台侧/上游",
+      "reason": "模型不支持",
+      "profile": "capability",
+      "cause_known": true
+    },
+    {
+      "line": 202,
+      "rule_id": "LC-124",
+      "content": "status_code=500, No available accounts: no available accounts",
+      "responsibility": "平台侧",
+      "reason": "无可用账号",
+      "profile": "account",
+      "cause_known": true
+    },
+    {
+      "line": 203,
+      "rule_id": "LC-125",
+      "content": "status_code=500, sensitive_words_detected (request id: <id>)",
+      "responsibility": "平台侧/客户输入",
+      "reason": "命中敏感词",
+      "profile": "policy",
+      "cause_known": true
+    },
+    {
+      "line": 204,
+      "rule_id": "LC-125",
+      "content": "status_code=500, sensitive_words_detected (request id: <id>) (request id: <id>)",
+      "responsibility": "平台侧/客户输入",
+      "reason": "命中敏感词",
+      "profile": "policy",
+      "cause_known": true
+    },
+    {
+      "line": 205,
+      "rule_id": "LC-126",
+      "content": "status_code=500, stream relay failure: scanner_error: stream error: stream ID 759; INTERNAL_ERROR; received from peer",
+      "responsibility": "网络/上游",
+      "reason": "流中继对端内部错误",
+      "profile": "network",
+      "cause_known": true
+    },
+    {
+      "line": 206,
+      "rule_id": "LC-127",
+      "content": "status_code=500, stream relay failure: scanner_error: unexpected EOF",
+      "responsibility": "上游/网络",
+      "reason": "流中继异常 EOF",
+      "profile": "network",
+      "cause_known": true
+    },
+    {
+      "line": 207,
+      "rule_id": "LC-128",
+      "content": "status_code=500, The request could not be completed. Please retry or contact support.",
+      "responsibility": "待查",
+      "reason": "请求未完成，原因未透出",
+      "profile": "generic",
+      "cause_known": false
+    },
+    {
+      "line": 208,
+      "rule_id": "LC-129",
+      "content": "status_code=500, Upstream access forbidden, please contact administrator",
+      "responsibility": "上游侧",
+      "reason": "上游访问被禁",
+      "profile": "account",
+      "cause_known": true
+    },
+    {
+      "line": 209,
+      "rule_id": "LC-129",
+      "content": "status_code=500, Upstream access forbidden, please contact administrator (request id: <id>)",
+      "responsibility": "上游侧",
+      "reason": "上游访问被禁",
+      "profile": "account",
+      "cause_known": true
+    },
+    {
+      "line": 210,
+      "rule_id": "LC-130",
+      "content": "status_code=500, upstream error: do request failed",
+      "responsibility": "上游侧",
+      "reason": "上游请求发起失败",
+      "profile": "network",
+      "cause_known": true
+    },
+    {
+      "line": 211,
+      "rule_id": "LC-130",
+      "content": "status_code=500, upstream error: do request failed (request id: <id>)",
+      "responsibility": "上游侧",
+      "reason": "上游请求发起失败",
+      "profile": "network",
+      "cause_known": true
+    },
+    {
+      "line": 212,
+      "rule_id": "LC-131",
+      "content": "status_code=500, Upstream request failed",
+      "responsibility": "待查",
+      "reason": "上游请求失败，原因未透出",
+      "profile": "generic",
+      "cause_known": false
+    },
+    {
+      "line": 213,
+      "rule_id": "LC-132",
+      "content": "status_code=500, upstream stream disconnected: connection reset by peer",
+      "responsibility": "上游/网络",
+      "reason": "连接被对端重置",
+      "profile": "network",
+      "cause_known": true
+    },
+    {
+      "line": 214,
+      "rule_id": "LC-133",
+      "content": "status_code=500, upstream stream disconnected: unexpected EOF",
+      "responsibility": "上游/网络",
+      "reason": "上游流意外 EOF",
+      "profile": "network",
+      "cause_known": true
+    },
+    {
+      "line": 215,
+      "rule_id": "LC-134",
+      "content": "status_code=500, user sensitive words detected: test_sensitive (request id: <id>)",
+      "responsibility": "客户输入",
+      "reason": "用户输入命中敏感词",
+      "profile": "policy",
+      "cause_known": true
+    },
+    {
+      "line": 216,
+      "rule_id": "LC-134",
+      "content": "status_code=500, user sensitive words detected: test_sensitive (request id: <id>) (request id: <id>)",
+      "responsibility": "客户输入",
+      "reason": "用户输入命中敏感词",
+      "profile": "policy",
+      "cause_known": true
+    },
+    {
+      "line": 217,
+      "rule_id": "LC-135",
+      "content": "status_code=500, write tcp <endpoint>: write: broken pipe",
+      "responsibility": "网络/客户断开",
+      "reason": "写连接断开（broken pipe）",
+      "profile": "network",
+      "cause_known": true
+    },
+    {
+      "line": 218,
+      "rule_id": "LC-136",
+      "content": "status_code=502, bad response status code 502",
+      "responsibility": "待查",
+      "reason": "上游返回 502",
+      "profile": "generic",
+      "cause_known": false
+    },
+    {
+      "line": 219,
+      "rule_id": "LC-136",
+      "content": "status_code=502, bad response status code 502 (request id: <id>)",
+      "responsibility": "待查",
+      "reason": "上游返回 502",
+      "profile": "generic",
+      "cause_known": false
+    },
+    {
+      "line": 220,
+      "rule_id": "LC-137",
+      "content": "status_code=502, openai_error",
+      "responsibility": "待查",
+      "reason": "上游通用 openai_error",
+      "profile": "generic",
+      "cause_known": false
+    },
+    {
+      "line": 221,
+      "rule_id": "LC-138",
+      "content": "status_code=502, Relay upstream error: claude-opus-5-5 requires adaptive thinking; omit thinking or use ***.type=adaptive and output_config.effort (request id: <id>) (request id: <id>) (request id: <id>)",
+      "responsibility": "客户侧",
+      "reason": "请求的 thinking 参数与模型要求不兼容，需要 adaptive",
+      "profile": "parameter",
+      "cause_known": true
+    },
+    {
+      "line": 222,
+      "rule_id": "LC-139",
+      "content": "status_code=502, Relay upstream error: Model \"claude-sonnet-5\" is not available for this group (request id: <id>) (request id: <id>) (request id: <id>)",
+      "responsibility": "平台侧",
+      "reason": "分组未开放请求模型或没有可用账号",
+      "profile": "capability",
+      "cause_known": true
+    },
+    {
+      "line": 223,
+      "rule_id": "LC-140",
+      "content": "status_code=502, The origin web server returned an invalid or incomplete response to Cloudflare. This typically indicates the origin is overloaded or misconfigured.",
+      "responsibility": "上游侧(源站)",
+      "reason": "上游源站对 CF 返回无效/不完整响应",
+      "profile": "network",
+      "cause_known": true
+    },
+    {
+      "line": 224,
+      "rule_id": "LC-140",
+      "content": "status_code=502, The origin web server returned an invalid or incomplete response to Cloudflare. This typically indicates the origin is overloaded or misconfigured. (request id: <id>)",
+      "responsibility": "上游侧(源站)",
+      "reason": "上游源站对 CF 返回无效/不完整响应",
+      "profile": "network",
+      "cause_known": true
+    },
+    {
+      "line": 225,
+      "rule_id": "LC-141",
+      "content": "status_code=502, The original upstream request failed (upstream_server_error). Provider switching is blocked for this encrypted history; the history has been preserved.",
+      "responsibility": "上游侧",
+      "reason": "上游服务器错误",
+      "profile": "network",
+      "cause_known": true
+    },
+    {
+      "line": 226,
+      "rule_id": "LC-142",
+      "content": "status_code=502, The request could not be processed. Please check the request parameters.",
+      "responsibility": "待查",
+      "reason": "请求无法处理，原因未透出",
+      "profile": "generic",
+      "cause_known": false
+    },
+    {
+      "line": 227,
+      "rule_id": "LC-143",
+      "content": "status_code=502, Unable to download content from the provided URL before the timeout. Check that the URL is publicly accessible and responds promptly, or upload the file and provide a file_id instead.",
+      "responsibility": "客户URL/上游",
+      "reason": "客户 URL 下载超时",
+      "profile": "network",
+      "cause_known": true
+    },
+    {
+      "line": 228,
+      "rule_id": "LC-144",
+      "content": "status_code=502, Unable to forward upstream stream",
+      "responsibility": "上游/平台",
+      "reason": "无法转发上游流",
+      "profile": "network",
+      "cause_known": true
+    },
+    {
+      "line": 229,
+      "rule_id": "LC-145",
+      "content": "status_code=502, Upstream access forbidden, please contact administrator",
+      "responsibility": "上游侧",
+      "reason": "上游访问被禁",
+      "profile": "account",
+      "cause_known": true
+    },
+    {
+      "line": 230,
+      "rule_id": "LC-146",
+      "content": "status_code=502, Upstream authentication failed, please contact administrator",
+      "responsibility": "上游侧",
+      "reason": "上游认证失败（key 无效）",
+      "profile": "account",
+      "cause_known": true
+    },
+    {
+      "line": 231,
+      "rule_id": "LC-147",
+      "content": "status_code=502, upstream error: do request failed",
+      "responsibility": "上游侧",
+      "reason": "上游请求发起失败",
+      "profile": "network",
+      "cause_known": true
+    },
+    {
+      "line": 232,
+      "rule_id": "LC-148",
+      "content": "status_code=502, Upstream request failed",
+      "responsibility": "待查",
+      "reason": "上游请求失败，原因未透出",
+      "profile": "generic",
+      "cause_known": false
+    },
+    {
+      "line": 233,
+      "rule_id": "LC-148",
+      "content": "status_code=502, Upstream request failed (request id: <id>)",
+      "responsibility": "待查",
+      "reason": "上游请求失败，原因未透出",
+      "profile": "generic",
+      "cause_known": false
+    },
+    {
+      "line": 234,
+      "rule_id": "LC-149",
+      "content": "status_code=502, Upstream service temporarily unavailable",
+      "responsibility": "上游侧",
+      "reason": "上游服务暂不可用",
+      "profile": "network",
+      "cause_known": true
+    },
+    {
+      "line": 235,
+      "rule_id": "LC-149",
+      "content": "status_code=502, Upstream service temporarily unavailable (request id: <id>)",
+      "responsibility": "上游侧",
+      "reason": "上游服务暂不可用",
+      "profile": "network",
+      "cause_known": true
+    },
+    {
+      "line": 236,
+      "rule_id": "LC-150",
+      "content": "status_code=503, 服务暂时不可用。 原因：上游服务、网络链路或代理返回异常响应。 解决方案：请稍后重试。如当前使用智能路由，请先重试；若仍失败，建议切换固定商家；如当前使用固定商家，请切换固定商家或开启智能路由。 request_id: <id>",
+      "responsibility": "上游侧/网络",
+      "reason": "上游/网络/代理异常",
+      "profile": "network",
+      "cause_known": true
+    },
+    {
+      "line": 237,
+      "rule_id": "LC-151",
+      "content": "status_code=503, 请求格式有误。请先执行 ⁠/export，新建会话后将内容粘贴进去，然后继续对话即可 (request_id: <id>)",
+      "responsibility": "客户侧",
+      "reason": "客户端请求格式有误，需 export 重建",
+      "profile": "parameter",
+      "cause_known": true
+    },
+    {
+      "line": 238,
+      "rule_id": "LC-152",
+      "content": "status_code=503, 上游服务暂时不可用，请稍后重试；持续出现请联系服务方 (Upstream temporarily unavailable, please retry later or contact the service provider)",
+      "responsibility": "上游侧",
+      "reason": "上游服务暂不可用",
+      "profile": "network",
+      "cause_known": true
+    },
+    {
+      "line": 239,
+      "rule_id": "LC-153",
+      "content": "status_code=503, 正在紧急停机升级，维护时间为2026年10月29日12:00—13:30（北京时间），预计13:30恢复服务，如有变化将另行通知。请稍后重试。",
+      "responsibility": "平台侧",
+      "reason": "平台计划维护停机",
+      "profile": "platform",
+      "cause_known": true
+    },
+    {
+      "line": 240,
+      "rule_id": "LC-154",
+      "content": "status_code=503, Account eligibility changed; please retry with complete context",
+      "responsibility": "上游/平台账号",
+      "reason": "账号资格变化",
+      "profile": "account",
+      "cause_known": true
+    },
+    {
+      "line": 241,
+      "rule_id": "LC-155",
+      "content": "status_code=503, Accounts supporting model \"gpt-6-astra\" are currently rate-limited. Earliest quota reset is 2026-11-06T11:54:42Z; availability may recover later.",
+      "responsibility": "上游侧",
+      "reason": "支持该模型的账号限流，附配额重置时间",
+      "profile": "quota",
+      "cause_known": true
+    },
+    {
+      "line": 242,
+      "rule_id": "LC-156",
+      "content": "status_code=503, auth_not_found: no auth available",
+      "responsibility": "平台侧/上游",
+      "reason": "无可用认证",
+      "profile": "account",
+      "cause_known": true
+    },
+    {
+      "line": 243,
+      "rule_id": "LC-157",
+      "content": "status_code=503, Billing service temporarily unavailable. Please retry later.",
+      "responsibility": "平台侧",
+      "reason": "平台计费服务暂不可用",
+      "profile": "platform",
+      "cause_known": true
+    },
+    {
+      "line": 244,
+      "rule_id": "LC-158",
+      "content": "status_code=503, Direct IP authorization is temporarily unavailable.",
+      "responsibility": "平台侧/上游",
+      "reason": "直连 IP 授权暂不可用",
+      "profile": "account",
+      "cause_known": true
+    },
+    {
+      "line": 245,
+      "rule_id": "LC-159",
+      "content": "status_code=503, High demand. Please try again later. (request id: <id>)",
+      "responsibility": "上游侧",
+      "reason": "高需求",
+      "profile": "network",
+      "cause_known": true
+    },
+    {
+      "line": 246,
+      "rule_id": "LC-160",
+      "content": "status_code=503, No available accounts for model claude-haiku-5-5 (request id: <id>) (request id: <id>) (request id: <id>)",
+      "responsibility": "平台侧",
+      "reason": "该模型无可用账号",
+      "profile": "account",
+      "cause_known": true
+    },
+    {
+      "line": 247,
+      "rule_id": "LC-160",
+      "content": "status_code=503, No available accounts for model claude-sonnet-5-5 (request id: <id>) (request id: <id>) (request id: <id>)",
+      "responsibility": "平台侧",
+      "reason": "该模型无可用账号",
+      "profile": "account",
+      "cause_known": true
+    },
+    {
+      "line": 248,
+      "rule_id": "LC-161",
+      "content": "status_code=503, No available accounts: no available accounts",
+      "responsibility": "平台侧",
+      "reason": "无可用账号",
+      "profile": "account",
+      "cause_known": true
+    },
+    {
+      "line": 249,
+      "rule_id": "LC-161",
+      "content": "status_code=503, No available accounts: no available accounts (request id: <id>)",
+      "responsibility": "平台侧",
+      "reason": "无可用账号",
+      "profile": "account",
+      "cause_known": true
+    },
+    {
+      "line": 250,
+      "rule_id": "LC-162",
+      "content": "status_code=503, No available channel for model claude-haiku-5-5 under group CLAUDE-满血 (distributor) (request id: <id>)",
+      "responsibility": "平台侧",
+      "reason": "分组下无支持该模型的可用通道（distributor 分发组）",
+      "profile": "capability",
+      "cause_known": true
+    },
+    {
+      "line": 251,
+      "rule_id": "LC-162",
+      "content": "status_code=503, No available channel for model claude-opus-4-8 under group kiro (distributor) (request id: <id>)",
+      "responsibility": "平台侧",
+      "reason": "分组下无支持该模型的可用通道（distributor 分发组）",
+      "profile": "capability",
+      "cause_known": true
+    },
+    {
+      "line": 252,
+      "rule_id": "LC-162",
+      "content": "status_code=503, No available channel for model claude-opus-5-5 under group kiro (distributor) (request id: <id>)",
+      "responsibility": "平台侧",
+      "reason": "分组下无支持该模型的可用通道（distributor 分发组）",
+      "profile": "capability",
+      "cause_known": true
+    },
+    {
+      "line": 253,
+      "rule_id": "LC-162",
+      "content": "status_code=503, No available channel for model claude-sonnet-5-5 under group Claude CCMax【无限制】 (distributor) (request id: <id>)",
+      "responsibility": "平台侧",
+      "reason": "分组下无支持该模型的可用通道（distributor 分发组）",
+      "profile": "capability",
+      "cause_known": true
+    },
+    {
+      "line": 254,
+      "rule_id": "LC-162",
+      "content": "status_code=503, No available channel for model gpt-6-astra under group gpt混池不降智 (distributor) (request id: <id>)",
+      "responsibility": "平台侧",
+      "reason": "分组下无支持该模型的可用通道（distributor 分发组）",
+      "profile": "capability",
+      "cause_known": true
+    },
+    {
+      "line": 255,
+      "rule_id": "LC-162",
+      "content": "status_code=503, No available channel for model gpt-6-sol under group codex-pro-vip (distributor) (request id: <id>)",
+      "responsibility": "平台侧",
+      "reason": "分组下无支持该模型的可用通道（distributor 分发组）",
+      "profile": "capability",
+      "cause_known": true
+    },
+    {
+      "line": 256,
+      "rule_id": "LC-162",
+      "content": "status_code=503, No available channel for model gpt-6.1-sol under group codex-smart (distributor) (request id: <id>)",
+      "responsibility": "平台侧",
+      "reason": "分组下无支持该模型的可用通道（distributor 分发组）",
+      "profile": "capability",
+      "cause_known": true
+    },
+    {
+      "line": 257,
+      "rule_id": "LC-162",
+      "content": "status_code=503, No available channel for model gpt-6.1-sol under group gpt混池不降智 (distributor) (request id: <id>)",
+      "responsibility": "平台侧",
+      "reason": "分组下无支持该模型的可用通道（distributor 分发组）",
+      "profile": "capability",
+      "cause_known": true
+    },
+    {
+      "line": 258,
+      "rule_id": "LC-163",
+      "content": "status_code=503, openai_error",
+      "responsibility": "待查",
+      "reason": "上游通用 openai_error",
+      "profile": "generic",
+      "cause_known": false
+    },
+    {
+      "line": 259,
+      "rule_id": "LC-164",
+      "content": "status_code=503, Relay 请求体内存保护已触发。 原因：平台无法为本次 Relay 请求体保留所需内存。 解决方案：请稍后重试，或缩小请求体。 request_id: <id>",
+      "responsibility": "平台侧",
+      "reason": "平台 Relay 请求体内存保护触发",
+      "profile": "platform",
+      "cause_known": true
+    },
+    {
+      "line": 260,
+      "rule_id": "LC-165",
+      "content": "status_code=503, Service temporarily unavailable",
+      "responsibility": "平台/上游",
+      "reason": "服务暂不可用",
+      "profile": "network",
+      "cause_known": true
+    },
+    {
+      "line": 261,
+      "rule_id": "LC-166",
+      "content": "status_code=503, Service temporarily unavailable, please retry later",
+      "responsibility": "平台/上游",
+      "reason": "服务暂不可用",
+      "profile": "network",
+      "cause_known": true
+    },
+    {
+      "line": 262,
+      "rule_id": "LC-167",
+      "content": "status_code=503, strict_session_binding_unavailable (request id: <id>)",
+      "responsibility": "平台侧/上游",
+      "reason": "严格会话绑定不可用",
+      "profile": "continuation",
+      "cause_known": true
+    },
+    {
+      "line": 263,
+      "rule_id": "LC-168",
+      "content": "status_code=503, system cpu overloaded (current: 100.0%, threshold: 90%)",
+      "responsibility": "平台侧",
+      "reason": "平台系统 CPU 使用率超过保护阈值",
+      "profile": "platform",
+      "cause_known": true
+    },
+    {
+      "line": 264,
+      "rule_id": "LC-168",
+      "content": "status_code=503, system cpu overloaded (current: 100.0%, threshold: 96%)",
+      "responsibility": "平台侧",
+      "reason": "平台系统 CPU 使用率超过保护阈值",
+      "profile": "platform",
+      "cause_known": true
+    },
+    {
+      "line": 265,
+      "rule_id": "LC-168",
+      "content": "status_code=503, system cpu overloaded (current: 100.1%, threshold: 90%)",
+      "responsibility": "平台侧",
+      "reason": "平台系统 CPU 使用率超过保护阈值",
+      "profile": "platform",
+      "cause_known": true
+    },
+    {
+      "line": 266,
+      "rule_id": "LC-168",
+      "content": "status_code=503, system cpu overloaded (current: 100.2%, threshold: 90%)",
+      "responsibility": "平台侧",
+      "reason": "平台系统 CPU 使用率超过保护阈值",
+      "profile": "platform",
+      "cause_known": true
+    },
+    {
+      "line": 267,
+      "rule_id": "LC-168",
+      "content": "status_code=503, system cpu overloaded (current: 100.8%, threshold: 90%)",
+      "responsibility": "平台侧",
+      "reason": "平台系统 CPU 使用率超过保护阈值",
+      "profile": "platform",
+      "cause_known": true
+    },
+    {
+      "line": 268,
+      "rule_id": "LC-168",
+      "content": "status_code=503, system cpu overloaded (current: 101.7%, threshold: 90%)",
+      "responsibility": "平台侧",
+      "reason": "平台系统 CPU 使用率超过保护阈值",
+      "profile": "platform",
+      "cause_known": true
+    },
+    {
+      "line": 269,
+      "rule_id": "LC-168",
+      "content": "status_code=503, system cpu overloaded (current: 91.4%, threshold: 90%)",
+      "responsibility": "平台侧",
+      "reason": "平台系统 CPU 使用率超过保护阈值",
+      "profile": "platform",
+      "cause_known": true
+    },
+    {
+      "line": 270,
+      "rule_id": "LC-168",
+      "content": "status_code=503, system cpu overloaded (current: 93.1%, threshold: 90%)",
+      "responsibility": "平台侧",
+      "reason": "平台系统 CPU 使用率超过保护阈值",
+      "profile": "platform",
+      "cause_known": true
+    },
+    {
+      "line": 271,
+      "rule_id": "LC-168",
+      "content": "status_code=503, system cpu overloaded (current: 94.0%, threshold: 90%)",
+      "responsibility": "平台侧",
+      "reason": "平台系统 CPU 使用率超过保护阈值",
+      "profile": "platform",
+      "cause_known": true
+    },
+    {
+      "line": 272,
+      "rule_id": "LC-168",
+      "content": "status_code=503, system cpu overloaded (current: 96.3%, threshold: 90%)",
+      "responsibility": "平台侧",
+      "reason": "平台系统 CPU 使用率超过保护阈值",
+      "profile": "platform",
+      "cause_known": true
+    },
+    {
+      "line": 273,
+      "rule_id": "LC-168",
+      "content": "status_code=503, system cpu overloaded (current: 97.0%, threshold: 96%)",
+      "responsibility": "平台侧",
+      "reason": "平台系统 CPU 使用率超过保护阈值",
+      "profile": "platform",
+      "cause_known": true
+    },
+    {
+      "line": 274,
+      "rule_id": "LC-168",
+      "content": "status_code=503, system cpu overloaded (current: 97.8%, threshold: 90%)",
+      "responsibility": "平台侧",
+      "reason": "平台系统 CPU 使用率超过保护阈值",
+      "profile": "platform",
+      "cause_known": true
+    },
+    {
+      "line": 275,
+      "rule_id": "LC-168",
+      "content": "status_code=503, system cpu overloaded (current: 98.8%, threshold: 90%)",
+      "responsibility": "平台侧",
+      "reason": "平台系统 CPU 使用率超过保护阈值",
+      "profile": "platform",
+      "cause_known": true
+    },
+    {
+      "line": 276,
+      "rule_id": "LC-168",
+      "content": "status_code=503, system cpu overloaded (current: 98.8%, threshold: 96%)",
+      "responsibility": "平台侧",
+      "reason": "平台系统 CPU 使用率超过保护阈值",
+      "profile": "platform",
+      "cause_known": true
+    },
+    {
+      "line": 277,
+      "rule_id": "LC-168",
+      "content": "status_code=503, system cpu overloaded (current: 99.2%, threshold: 90%)",
+      "responsibility": "平台侧",
+      "reason": "平台系统 CPU 使用率超过保护阈值",
+      "profile": "platform",
+      "cause_known": true
+    },
+    {
+      "line": 278,
+      "rule_id": "LC-168",
+      "content": "status_code=503, system cpu overloaded (current: 99.4%, threshold: 90%)",
+      "responsibility": "平台侧",
+      "reason": "平台系统 CPU 使用率超过保护阈值",
+      "profile": "platform",
+      "cause_known": true
+    },
+    {
+      "line": 279,
+      "rule_id": "LC-168",
+      "content": "status_code=503, system cpu overloaded (current: 99.7%, threshold: 90%)",
+      "responsibility": "平台侧",
+      "reason": "平台系统 CPU 使用率超过保护阈值",
+      "profile": "platform",
+      "cause_known": true
+    },
+    {
+      "line": 280,
+      "rule_id": "LC-168",
+      "content": "status_code=503, system cpu overloaded (current: 99.8%, threshold: 90%)",
+      "responsibility": "平台侧",
+      "reason": "平台系统 CPU 使用率超过保护阈值",
+      "profile": "platform",
+      "cause_known": true
+    },
+    {
+      "line": 281,
+      "rule_id": "LC-168",
+      "content": "status_code=503, system cpu overloaded (current: 99.9%, threshold: 90%)",
+      "responsibility": "平台侧",
+      "reason": "平台系统 CPU 使用率超过保护阈值",
+      "profile": "platform",
+      "cause_known": true
+    },
+    {
+      "line": 282,
+      "rule_id": "LC-169",
+      "content": "status_code=503, The model is currently experiencing high demand. Please try again later. (request id: <id>)",
+      "responsibility": "上游侧",
+      "reason": "模型当前高需求",
+      "profile": "network",
+      "cause_known": true
+    },
+    {
+      "line": 283,
+      "rule_id": "LC-170",
+      "content": "status_code=503, The origin web server returned an invalid or incomplete response to Cloudflare. This typically indicates the origin is overloaded or misconfigured. (request id: <id>)",
+      "responsibility": "上游侧(源站)",
+      "reason": "上游源站对 CF 返回无效/不完整响应",
+      "profile": "network",
+      "cause_known": true
+    },
+    {
+      "line": 284,
+      "rule_id": "LC-171",
+      "content": "status_code=503, The service is busy. Please retry later. (request id: <id>)",
+      "responsibility": "平台/上游",
+      "reason": "服务繁忙",
+      "profile": "network",
+      "cause_known": true
+    },
+    {
+      "line": 285,
+      "rule_id": "LC-172",
+      "content": "status_code=503, This model is currently experiencing high demand. Please try again later. (request id: <id>)",
+      "responsibility": "上游侧",
+      "reason": "模型当前高需求",
+      "profile": "network",
+      "cause_known": true
+    },
+    {
+      "line": 286,
+      "rule_id": "LC-173",
+      "content": "status_code=503, Upstream access forbidden, please contact administrator",
+      "responsibility": "上游侧",
+      "reason": "上游访问被禁",
+      "profile": "account",
+      "cause_known": true
+    },
+    {
+      "line": 287,
+      "rule_id": "LC-174",
+      "content": "status_code=503, Upstream request failed",
+      "responsibility": "待查",
+      "reason": "上游请求失败，原因未透出",
+      "profile": "generic",
+      "cause_known": false
+    },
+    {
+      "line": 288,
+      "rule_id": "LC-175",
+      "content": "status_code=503, Upstream service temporarily unavailable",
+      "responsibility": "上游侧",
+      "reason": "上游服务暂不可用",
+      "profile": "network",
+      "cause_known": true
+    },
+    {
+      "line": 289,
+      "rule_id": "LC-176",
+      "content": "status_code=504, 上游空回，请稍后尝试。",
+      "responsibility": "上游侧",
+      "reason": "上游返回空响应",
+      "profile": "network",
+      "cause_known": true
+    },
+    {
+      "line": 290,
+      "rule_id": "LC-177",
+      "content": "status_code=504, account_retry_no_response_timeout",
+      "responsibility": "上游侧",
+      "reason": "账号重试无响应超时",
+      "profile": "network",
+      "cause_known": true
+    },
+    {
+      "line": 291,
+      "rule_id": "LC-178",
+      "content": "status_code=504, bad response status code 504",
+      "responsibility": "上游/网关",
+      "reason": "上游返回 504 超时",
+      "profile": "network",
+      "cause_known": true
+    },
+    {
+      "line": 292,
+      "rule_id": "LC-179",
+      "content": "status_code=504, openai_error",
+      "responsibility": "待查",
+      "reason": "上游通用 openai_error",
+      "profile": "generic",
+      "cause_known": false
+    },
+    {
+      "line": 293,
+      "rule_id": "LC-180",
+      "content": "status_code=520, bad response status code 520",
+      "responsibility": "上游侧(源站)/CDN",
+      "reason": "Cloudflare 520（未知源站错误）",
+      "profile": "network",
+      "cause_known": true
+    },
+    {
+      "line": 294,
+      "rule_id": "LC-181",
+      "content": "status_code=521, bad response status code 521",
+      "responsibility": "上游侧(源站)",
+      "reason": "Cloudflare 521（无法连接源站）",
+      "profile": "network",
+      "cause_known": true
+    },
+    {
+      "line": 295,
+      "rule_id": "LC-182",
+      "content": "status_code=522, bad response status code 522",
+      "responsibility": "上游侧(源站)",
+      "reason": "Cloudflare 522（TCP 握手超时）",
+      "profile": "network",
+      "cause_known": true
+    },
+    {
+      "line": 296,
+      "rule_id": "LC-183",
+      "content": "status_code=522, Cloudflare could not establish a TCP connection to the origin server. The TCP handshake timed out, which may indicate the origin is overloaded, firewalling Cloudflare, or unreachable at the network level.",
+      "responsibility": "上游侧(源站)",
+      "reason": "CF 无法与源站建立 TCP 连接（握手超时）",
+      "profile": "network",
+      "cause_known": true
+    },
+    {
+      "line": 297,
+      "rule_id": "LC-184",
+      "content": "status_code=524, bad response status code 524",
+      "responsibility": "上游侧(源站)",
+      "reason": "Cloudflare 524（读源站超时）",
+      "profile": "network",
+      "cause_known": true
+    },
+    {
+      "line": 298,
+      "rule_id": "LC-185",
+      "content": "status_code=524, openai_error",
+      "responsibility": "待查",
+      "reason": "上游通用 openai_error",
+      "profile": "generic",
+      "cause_known": false
+    },
+    {
+      "line": 299,
+      "rule_id": "LC-186",
+      "content": "status_code=524, The origin web server did not return a complete response within the 120-second Proxy Read Timeout window. The connection was established, but the origin took too long to respond.",
+      "responsibility": "上游侧(源站)",
+      "reason": "源站未在 Proxy Read Timeout 期限内返回完整响应",
+      "profile": "network",
+      "cause_known": true
+    },
+    {
+      "line": 300,
+      "rule_id": "LC-186",
+      "content": "status_code=524, The origin web server did not return a complete response within the 120-second Proxy Read Timeout window. The connection was established, but the origin took too long to respond. (request id: <id>)",
+      "responsibility": "上游侧(源站)",
+      "reason": "源站未在 Proxy Read Timeout 期限内返回完整响应",
+      "profile": "network",
+      "cause_known": true
+    }
+  ]
+}

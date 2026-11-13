@@ -44,7 +44,7 @@ const customerHealthScopeGapThresholdPct = 7.0
 // responsibility filter. It is intentionally separate from the global
 // delivery classification version: changing who should lower a customer's
 // stability must not rewrite the stability dashboard's historical meaning.
-const customerHealthStabilityPolicyVersion = 3
+const customerHealthStabilityPolicyVersion = 4
 
 // customerHealthSlowFirstByteMS 是客户维护稳定性采用的首字延迟边界。
 // other.frt 单位为毫秒；严格大于 3 秒才计入稳定性，恰好 3 秒仍不计入。
@@ -197,6 +197,7 @@ type CustomerHealthCollectionStatus struct {
 	MetricsAvailable bool   `json:"metrics_available"`
 	CoverageComplete bool   `json:"coverage_complete"`
 	TargetTs         int64  `json:"target_ts"`
+	LagSeconds       *int64 `json:"lag_seconds"`
 	State            string `json:"state"`
 	FromTs           int64  `json:"from_ts"`
 	ThroughTs        int64  `json:"through_ts"`
@@ -352,6 +353,10 @@ func (m *Monitor) buildCustomerHealthReport(ctx context.Context, now time.Time) 
 		Collection:   m.customerHealthCollectionStatus(fromTs, collectionTarget),
 		Rows:         []CustomerHealthRow{},
 		Notes:        customerHealthNotes(),
+	}
+	if report.Collection.ThroughTs > fromTs {
+		lag := max(int64(0), report.Collection.TargetTs-report.Collection.ThroughTs)
+		report.Collection.LagSeconds = &lag
 	}
 	companies, err := m.customerHealthCompanies(ctx)
 	if err != nil {

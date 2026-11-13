@@ -3,6 +3,7 @@ package monitor
 import (
 	"context"
 	"math"
+	"strings"
 	"testing"
 	"time"
 )
@@ -270,4 +271,282 @@ func TestUpstreamBalanceAlertSkipsFullyManuallyDisabledDomain(t *testing.T) {
 	if count != 0 {
 		t.Fatalf("fully manually-disabled upstream emitted %d low-balance alerts", count)
 	}
+}
+
+// A domain whose automatic sync is paused (停止使用, no enabled channel) has an
+// incomplete recent ledger by design; it must say so instead of showing a
+// coverage shortfall that reads as a sync fault.
+func TestUpstreamBalanceAssessmentExplainsPausedSync(t *testing.T) {
+	m := newStabilityTestMonitor(t)
+	now := time.Date(2026, 8, 8, 12, 0, 0, 0, cstLocation).Unix()
+	domain := "last-api.ai"
+	account := seededUpstreamBalanceAccount(now, 100)
+	account.SyncPaused = true
+	seedUpstreamLedger(t, m, domain, account.Provider, now, 7, 50, 3600)
+	from, _ := upstreamBalanceWindow(now, 7)
+	if err := m.storeDB.Where("domain=? AND hour_ts>=? AND hour_ts<?", domain, from+6*86400, from+7*86400).Delete(&ChannelUpstreamUsageHour{}).Error; err != nil {
+		t.Fatal(err)
+	}
+	policy := upstreamBalancePolicyFor(defaultAlertConfig())
+	estimates, err := m.loadUpstreamBurnEstimates(context.Background(), now, policy, map[string]ChannelUpstreamAccountView{domain: account})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assessment := assessUpstreamBalance(account, estimates[domain], policy, now, 5)
+	if assessment.Available || assessment.Status != "unavailable" || !strings.Contains(assessment.Reason, "自动同步已暂停") || strings.Contains(assessment.Reason, "覆盖率") {
+		t.Fatalf("paused sync must be explained, assessment=%+v", assessment)
+	}
+	account.SyncPaused = false
+	if assessment := assessUpstreamBalance(account, estimates[domain], policy, now, 5); !strings.Contains(assessment.Reason, "覆盖率") {
+		t.Fatalf("active domain keeps the coverage reason, assessment=%+v", assessment)
+	}
+}
+
+// A newly connected account whose history import has not reached the window
+// yet is assessed from its most recent complete days, labeled as partial.
+func TestUpstreamBalancePartialHistoryUsesRecentCompleteDays(t *testing.T) {
+	now := time.Date(2026, 8, 8, 12, 0, 0, 0, cstLocation).Unix()
+	from, to := upstreamBalanceWindow(now, 7)
+	domain := "last-api.ai"
+	policy := upstreamBalancePolicyFor(defaultAlertConfig())
+	setup := func(t *testing.T, keepFrom int64, lastDayHours int) *Monitor {
+		t.Helper()
+		m := newStabilityTestMonitor(t)
+		seedUpstreamLedger(t, m, domain, upstreamProviderNewAPI, now, 7, 48, 3600)
+		if err := m.storeDB.Where("domain=? AND hour_ts<?", domain, keepFrom).Delete(&ChannelUpstreamUsageHour{}).Error; err != nil {
+			t.Fatal(err)
+		}
+		// The most recent day spent twice as much: the estimate must use only
+		// the recent days, (48+96)/2 = 72 per day.
+		if err := m.storeDB.Model(&ChannelUpstreamUsageHour{}).Where("domain=? AND hour_ts>=?", domain, to-86400).Update("cost_usd", 4).Error; err != nil {
+			t.Fatal(err)
+		}
+		if err := m.storeDB.Where("domain=? AND hour_ts>=?", domain, to-86400+int64(lastDayHours)*3600).Delete(&ChannelUpstreamUsageHour{}).Error; err != nil {
+			t.Fatal(err)
+		}
+		return m
+	}
+	assess := func(t *testing.T, m *Monitor, account ChannelUpstreamAccountView) ChannelUpstreamBalanceAssessment {
+		t.Helper()
+		estimates, err := m.loadUpstreamBurnEstimates(context.Background(), now, policy, map[string]ChannelUpstreamAccountView{domain: account})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return assessUpstreamBalance(account, estimates[domain], policy, now, 5)
+	}
+	importing := seededUpstreamBalanceAccount(now, 50)
+	importing.UsageBackfillCursor = from - 20*86400
+
+	t.Run("two recent complete days", func(t *testing.T) {
+		m := setup(t, to-2*86400, 24)
+		a := assess(t, m, importing)
+		if !a.Available || !a.PartialHistory || a.LookbackDays != 2 || math.Abs(a.AverageDailyCostUSD-72) > 1e-6 ||
+			a.EstimatedRunwayDays == nil || math.Abs(*a.EstimatedRunwayDays-50.0/72) > 1e-6 || a.Status != "warning" || !strings.Contains(a.Reason, "历史补齐中") {
+			t.Fatalf("assessment=%+v", a)
+		}
+		if note := upstreamBalancePartialAlertNote(a); !strings.Contains(note, "近 2 个完整自然日") {
+			t.Fatalf("alert note=%q", note)
+		}
+	})
+	t.Run("only one complete day", func(t *testing.T) {
+		if a := assess(t, setup(t, to-86400, 24), importing); a.Available || a.PartialHistory || !strings.Contains(a.Reason, "覆盖率") {
+			t.Fatalf("assessment=%+v", a)
+		}
+	})
+	t.Run("most recent day incomplete", func(t *testing.T) {
+		if a := assess(t, setup(t, to-3*86400, 20), importing); a.Available || a.PartialHistory {
+			t.Fatalf("assessment=%+v", a)
+		}
+	})
+	t.Run("history import finished", func(t *testing.T) {
+		done := importing
+		done.UsageBackfillDone = true
+		if a := assess(t, setup(t, to-2*86400, 24), done); a.Available || a.PartialHistory {
+			t.Fatalf("a gap after the import finished must still fail closed: %+v", a)
+		}
+	})
+	t.Run("import already passed the gap", func(t *testing.T) {
+		passed := importing
+		passed.UsageBackfillCursor = to - 86400
+		if a := assess(t, setup(t, to-2*86400, 24), passed); a.Available || a.PartialHistory {
+			t.Fatalf("a gap the import already covered is a sync gap: %+v", a)
+		}
+	})
+	t.Run("cursor exactly at the first day used", func(t *testing.T) {
+		// The day before the recent complete days is fully past the import:
+		// its gap is a sync gap (e.g. the AICodeWith reconcile cursor).
+		at := importing
+		at.UsageBackfillCursor = to - 2*86400
+		if a := assess(t, setup(t, to-2*86400, 24), at); a.Available || a.PartialHistory {
+			t.Fatalf("assessment=%+v", a)
+		}
+	})
+	t.Run("import still inside the breaking day", func(t *testing.T) {
+		// Earlier window days are imported and complete; the import is now in
+		// the last hour of the day before the recent complete days.
+		m := setup(t, from, 24)
+		if err := m.storeDB.Where("domain=? AND hour_ts>=? AND hour_ts<?", domain, to-3*86400, to-2*86400-3600).Delete(&ChannelUpstreamUsageHour{}).Error; err != nil {
+			t.Fatal(err)
+		}
+		inside := importing
+		inside.UsageBackfillCursor = to - 2*86400 - 3600
+		if a := assess(t, m, inside); !a.Available || !a.PartialHistory || a.LookbackDays != 2 {
+			t.Fatalf("assessment=%+v", a)
+		}
+	})
+	for name, mutate := range map[string]func(*ChannelUpstreamAccountView){
+		"history failing": func(a *ChannelUpstreamAccountView) {
+			a.UsageBackfillConsecutiveFails, a.UsageBackfillLastError = 3, "上游返回 HTTP 500"
+		},
+		"history isolated": func(a *ChannelUpstreamAccountView) { a.UsageBackfillNextSyncAt = upstreamAccountIsolatedUntil },
+	} {
+		t.Run(name, func(t *testing.T) {
+			stuck := importing
+			mutate(&stuck)
+			if a := assess(t, setup(t, to-2*86400, 24), stuck); a.Available || a.PartialHistory {
+				t.Fatalf("a stalled import must not be labeled as catching up: %+v", a)
+			}
+		})
+	}
+	t.Run("imported window day has a gap", func(t *testing.T) {
+		// History imported the first window day (cursor past it), yet that day
+		// is incomplete: a real sync gap, so no partial estimate.
+		m := setup(t, from, 24)
+		if err := m.storeDB.Where("domain=? AND hour_ts>=? AND hour_ts<?", domain, from, from+5*3600).Delete(&ChannelUpstreamUsageHour{}).Error; err != nil {
+			t.Fatal(err)
+		}
+		if err := m.storeDB.Where("domain=? AND hour_ts>=? AND hour_ts<?", domain, from+2*86400, to-2*86400).Delete(&ChannelUpstreamUsageHour{}).Error; err != nil {
+			t.Fatal(err)
+		}
+		passed := importing
+		passed.UsageBackfillCursor = from + 2*86400
+		if a := assess(t, m, passed); a.Available || a.PartialHistory {
+			t.Fatalf("assessment=%+v", a)
+		}
+		if err := m.storeDB.Where("domain=? AND hour_ts>=? AND hour_ts<?", domain, from, from+86400).Delete(&ChannelUpstreamUsageHour{}).Error; err != nil {
+			t.Fatal(err)
+		}
+		seedRows := make([]ChannelUpstreamUsageHour, 0, 24)
+		for h := from; h < from+86400; h += 3600 {
+			seedRows = append(seedRows, ChannelUpstreamUsageHour{Domain: domain, HourTs: h, BucketSeconds: 3600, Requests: 1, CostUSD: 2, FetchedAt: now, Provider: upstreamProviderNewAPI})
+		}
+		if err := m.storeDB.Create(&seedRows).Error; err != nil {
+			t.Fatal(err)
+		}
+		if a := assess(t, m, passed); !a.Available || !a.PartialHistory || a.LookbackDays != 2 {
+			t.Fatalf("complete imported days with only unimported gaps must estimate: %+v", a)
+		}
+	})
+	t.Run("cursor unset", func(t *testing.T) {
+		unset := importing
+		unset.UsageBackfillCursor = 0
+		if a := assess(t, setup(t, to-2*86400, 24), unset); a.Available {
+			t.Fatalf("assessment=%+v", a)
+		}
+	})
+}
+
+// lingxuapi.com, 2026-11-12: a ramping channel is assessed by the higher of the
+// lookback average and the last 24 closed hours, so the 1-day threshold fires
+// before the 7-day average catches up.
+func TestUpstreamBalanceRunwayUsesRecentRateWhenHigher(t *testing.T) {
+	// 00:30: the recent window is exactly the last lookback day.
+	now := time.Date(2026, 8, 8, 0, 30, 0, 0, cstLocation).Unix()
+	_, to := upstreamBalanceWindow(now, 7)
+	domain := "ramp.example"
+	policy := upstreamBalancePolicyFor(defaultAlertConfig())
+	setup := func(t *testing.T, lastDayHourCost float64) *Monitor {
+		t.Helper()
+		m := newStabilityTestMonitor(t)
+		seedUpstreamLedger(t, m, domain, upstreamProviderNewAPI, now, 7, 48, 3600)
+		if err := m.storeDB.Model(&ChannelUpstreamUsageHour{}).Where("domain=? AND hour_ts>=?", domain, to-86400).Update("cost_usd", lastDayHourCost).Error; err != nil {
+			t.Fatal(err)
+		}
+		return m
+	}
+	assess := func(t *testing.T, m *Monitor, account ChannelUpstreamAccountView) ChannelUpstreamBalanceAssessment {
+		t.Helper()
+		estimates, err := m.loadUpstreamBurnEstimates(context.Background(), now, policy, map[string]ChannelUpstreamAccountView{domain: account})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return assessUpstreamBalance(account, estimates[domain], policy, now, 5)
+	}
+
+	t.Run("recent rate higher drives the runway", func(t *testing.T) {
+		a := assess(t, setup(t, 4), seededUpstreamBalanceAccount(now, 80)) // last day 96/day
+		avg := (6*48.0 + 96) / 7
+		if !a.Available || math.Abs(a.AverageDailyCostUSD-avg) > 1e-6 || a.RecentDailyCostUSD == nil || math.Abs(*a.RecentDailyCostUSD-96) > 1e-6 ||
+			a.RunwayBasis != "recent_24h" || math.Abs(a.EffectiveDailyCostUSD-96) > 1e-6 ||
+			a.EstimatedRunwayDays == nil || math.Abs(*a.EstimatedRunwayDays-80.0/96) > 1e-6 ||
+			a.RequiredBalanceUSD == nil || math.Abs(*a.RequiredBalanceUSD-96) > 1e-6 ||
+			a.Status != "warning" || !strings.Contains(a.Reason, "最近 24 小时") {
+			t.Fatalf("assessment=%+v", a)
+		}
+		// By the 7-day average alone the same balance would look healthy.
+		if 80/avg <= policy.RunwayDays {
+			t.Fatal("fixture no longer shows the lag of the 7-day average")
+		}
+		if line := upstreamBalanceRecentAlertLine(a); !strings.Contains(line, "$96.00/天") || !strings.Contains(line, "本次按此估算") {
+			t.Fatalf("alert line=%q", line)
+		}
+	})
+	t.Run("recent rate lower keeps the lookback average", func(t *testing.T) {
+		a := assess(t, setup(t, 1), seededUpstreamBalanceAccount(now, 80)) // last day 24/day
+		avg := (6*48.0 + 24) / 7
+		if !a.Available || a.RunwayBasis != "lookback" || a.RecentDailyCostUSD == nil || math.Abs(*a.RecentDailyCostUSD-24) > 1e-6 ||
+			math.Abs(a.EffectiveDailyCostUSD-avg) > 1e-6 || math.Abs(*a.EstimatedRunwayDays-80/avg) > 1e-6 || a.Status != "healthy" {
+			t.Fatalf("assessment=%+v", a)
+		}
+		if line := upstreamBalanceRecentAlertLine(a); strings.Contains(line, "本次按此估算") {
+			t.Fatalf("alert line=%q", line)
+		}
+	})
+	t.Run("incomplete recent window is not used", func(t *testing.T) {
+		m := setup(t, 4)
+		// Drop 3 of the last 24 hours: 87.5% < 95% recent coverage, while the
+		// 7-day window keeps 165/168 hours.
+		if err := m.storeDB.Where("domain=? AND hour_ts>=?", domain, to-3*3600).Delete(&ChannelUpstreamUsageHour{}).Error; err != nil {
+			t.Fatal(err)
+		}
+		a := assess(t, m, seededUpstreamBalanceAccount(now, 80))
+		if !a.Available || a.RecentDailyCostUSD != nil || a.RunwayBasis != "lookback" || math.Abs(a.EffectiveDailyCostUSD-a.AverageDailyCostUSD) > 1e-9 {
+			t.Fatalf("assessment=%+v", a)
+		}
+		if line := upstreamBalanceRecentAlertLine(a); !strings.Contains(line, "数据不完整") {
+			t.Fatalf("alert line=%q", line)
+		}
+	})
+	t.Run("provisional zero hours count as covered and only lower the rate", func(t *testing.T) {
+		m := setup(t, 4)
+		if err := m.storeDB.Model(&ChannelUpstreamUsageHour{}).Where("domain=? AND hour_ts>=?", domain, to-2*3600).
+			Updates(map[string]any{"provisional": true, "cost_usd": 0, "requests": 0}).Error; err != nil {
+			t.Fatal(err)
+		}
+		a := assess(t, m, seededUpstreamBalanceAccount(now, 80))
+		if a.RecentDailyCostUSD == nil || math.Abs(*a.RecentDailyCostUSD-88) > 1e-6 || a.RunwayBasis != "recent_24h" {
+			t.Fatalf("assessment=%+v", a)
+		}
+	})
+	t.Run("natural-day ledger leaves the recent rate unavailable", func(t *testing.T) {
+		m := newStabilityTestMonitor(t)
+		seedUpstreamLedger(t, m, domain, upstreamProviderNewAPI, now, 7, 48, 86400)
+		midday := now + 12*3600
+		estimates, err := m.loadUpstreamBurnEstimates(context.Background(), midday, policy, map[string]ChannelUpstreamAccountView{domain: seededUpstreamBalanceAccount(midday, 80)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if estimates[domain].RecentAvailable {
+			t.Fatalf("estimate=%+v", estimates[domain])
+		}
+		// Between 00:00 and 00:59 yesterday's daily bucket fits the trailing
+		// 24 hours exactly; it must still not produce a recent rate.
+		estimates, err = m.loadUpstreamBurnEstimates(context.Background(), now, policy, map[string]ChannelUpstreamAccountView{domain: seededUpstreamBalanceAccount(now, 80)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if estimates[domain].RecentAvailable {
+			t.Fatalf("daily bucket used at 00:30: %+v", estimates[domain])
+		}
+	})
 }

@@ -67,10 +67,16 @@ func TestTokenForceUsageWindowStrictlyAggregatesFaceValue(t *testing.T) {
 		if r.URL.Path != "/api/usages/detail" || r.URL.Query().Get("orgId") != "123" || r.URL.Query().Get("page") != "0" || r.URL.Query().Get("size") != "100" {
 			t.Fatalf("unexpected request: %s?%s", r.URL.Path, r.URL.RawQuery)
 		}
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Query().Get("beginTime") == time.Unix(to, 0).UTC().Format(time.RFC3339) &&
+			r.URL.Query().Get("endTime") == time.Unix(to+tokenForceLateFinishSeconds, 0).UTC().Format(time.RFC3339) {
+			// Late-finish slice after the window: nothing finished late here.
+			_, _ = w.Write([]byte(`{"status":0,"result":{"content":[],"totalElements":0}}`))
+			return
+		}
 		if r.URL.Query().Get("beginTime") != time.Unix(from, 0).UTC().Format(time.RFC3339) || r.URL.Query().Get("endTime") != time.Unix(to, 0).UTC().Format(time.RFC3339) {
 			t.Fatalf("unexpected time range: %s", r.URL.RawQuery)
 		}
-		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"status":0,"result":{"content":[` +
 			`{"requestId":"req-1","requestTime":"2026-09-03T12:10:00Z","inputTokens":100,"outputTokens":10,"inputCachedTokens":50,"outputReasoningTokens":4,"costInCny":"7.2"},` +
 			`{"requestId":"req-2","requestTime":"2026-09-03T12:20:00Z","inputTokens":"50","outputTokens":"5","costInCny":14.4}` +
@@ -110,9 +116,38 @@ func TestTokenForceUsageWindowStrictlyAggregatesFaceValue(t *testing.T) {
 	}
 }
 
+// A request listed before its window started earlier but finished inside it
+// (TokenForce filters on a later timestamp). The window widens to that hour and
+// is read again, so the request is counted once, in its own hour.
+func TestTokenForceUsageWidensForEarlyStartedRows(t *testing.T) {
+	from := time.Date(2026, 9, 3, 20, 0, 0, 0, cstLocation).Unix()
+	var begins []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		begins = append(begins, r.URL.Query().Get("beginTime"))
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"status":0,"result":{"content":[{"requestId":"req-early","requestTime":"2026-09-03T11:59:41Z","inputTokens":1,"outputTokens":2,"costInCny":3}],"totalElements":1}}`))
+	}))
+	defer server.Close()
+	row := ChannelUpstreamAccount{Domain: "hainahn.com", Provider: upstreamProviderTokenForce, BaseURL: server.URL, UserID: 123, BalanceUnit: 7.2}
+	result, err := fetchTokenForceUsageWindow(context.Background(), server.Client(), row, tokenForceCredential{AccessToken: "access"}, from, from+3600, newUpstreamUsageRequestPacer(5, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Main read, the late-finish slice after the window, then only the
+	// missing earlier slice of the widened hour.
+	if len(begins) != 3 || begins[0] != "2026-09-03T12:00:00Z" || begins[1] != "2026-09-03T13:00:00Z" || begins[2] != "2026-09-03T11:00:00Z" {
+		t.Fatalf("window must read late finishers and widen to the early row's hour, begins=%v", begins)
+	}
+	if len(result.Hours) != 2 || result.Hours[0].HourTs != from-3600 || result.Hours[0].Requests != 1 || result.Hours[0].BucketSeconds != 3600 ||
+		result.Hours[1].HourTs != from || result.Hours[1].Requests != 0 || result.DataUntil != from+3600 {
+		t.Fatalf("early row must be counted once in its own hour: %+v", result)
+	}
+}
+
 func TestTokenForceUsageRejectsOutOfRangeRows(t *testing.T) {
 	from := time.Date(2026, 9, 3, 20, 0, 0, 0, cstLocation).Unix()
-	for _, outside := range []string{"2026-09-03T13:00:01Z", "2026-09-03T11:59:59Z"} {
+	// After the window end, or earlier than any plausible request duration.
+	for _, outside := range []string{"2026-09-03T13:00:01Z", "2026-09-03T04:59:59Z"} {
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`{"status":0,"result":{"content":[{"requestId":"req-outside","requestTime":"` + outside + `","inputTokens":1,"outputTokens":1,"costInCny":1}],"totalElements":1}}`))
@@ -199,7 +234,8 @@ func TestTokenForceUsageRefreshesOnceAfterUnauthorized(t *testing.T) {
 	result, updated, err := syncTokenForceUsage(context.Background(), server.Client(), row,
 		tokenForceCredential{AccessToken: "expired", RefreshToken: "refresh", ExpiresAt: time.Now().Add(time.Hour).Unix()},
 		from, from+3600, newUpstreamUsageRequestPacer(5, 0))
-	if err != nil || refreshCalls != 1 || usageCalls != 2 || updated.AccessToken != "renewed" || updated.RefreshToken != "rotated" || len(result.Hours) != 1 {
+	// expired read, renewed read, renewed late-finish slice.
+	if err != nil || refreshCalls != 1 || usageCalls != 3 || updated.AccessToken != "renewed" || updated.RefreshToken != "rotated" || len(result.Hours) != 1 {
 		t.Fatalf("result=%+v updated=%+v refresh=%d usage=%d err=%v", result, updated, refreshCalls, usageCalls, err)
 	}
 }
@@ -318,5 +354,28 @@ func TestTokenForceConfigurationUIExposesOnlyRequiredNonPasswordFields(t *testin
 	if !strings.Contains(page, `value="1" readonly`) || !strings.Contains(js, "payload.unit_per_usd=1") ||
 		strings.Contains(page, "每 1 USD 对应多少 CNY") || strings.Contains(js, "请填写有效的 CNY/每 USD") {
 		t.Fatal("TokenForce configuration must not require or allow an additional FX input")
+	}
+}
+
+// Re-reading an older hour keeps a request that started in it but is listed
+// only after it (finished later): the slice after the window is read too.
+func TestTokenForceUsageKeepsRequestsFinishingAfterWindow(t *testing.T) {
+	from := time.Date(2026, 9, 3, 23, 0, 0, 0, cstLocation).Unix()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Query().Get("beginTime") == "2026-09-03T16:00:00Z" { // the slice after the window
+			_, _ = w.Write([]byte(`{"status":0,"result":{"content":[{"requestId":"straggler","requestTime":"2026-09-03T15:59:41Z","inputTokens":1,"outputTokens":1,"costInCny":2},{"requestId":"next-hour","requestTime":"2026-09-03T16:00:10Z","inputTokens":1,"outputTokens":1,"costInCny":5}],"totalElements":2}}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"status":0,"result":{"content":[{"requestId":"inside","requestTime":"2026-09-03T15:10:00Z","inputTokens":1,"outputTokens":1,"costInCny":1}],"totalElements":1}}`))
+	}))
+	defer server.Close()
+	row := ChannelUpstreamAccount{Domain: "hainahn.com", Provider: upstreamProviderTokenForce, BaseURL: server.URL, UserID: 123}
+	result, err := fetchTokenForceUsageWindow(context.Background(), server.Client(), row, tokenForceCredential{AccessToken: "access"}, from, from+3600, newUpstreamUsageRequestPacer(10, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Hours) != 1 || result.Hours[0].Requests != 2 || result.Hours[0].CostUSD != 3 {
+		t.Fatalf("hour must include the late finisher and exclude the next hour's request: %+v", result.Hours)
 	}
 }

@@ -1,4 +1,4 @@
-FROM golang:1.26.10-alpine3.23 AS agent
+FROM golang:1.26.11-alpine3.23 AS agent
 WORKDIR /src
 COPY go.mod go.sum ./
 COPY internal/ecslogagent/*.go ./internal/ecslogagent/
@@ -6,10 +6,11 @@ COPY internal/ecsarchive/*.go ./internal/ecsarchive/
 COPY cmd/ecslogagent/*.go ./cmd/ecslogagent/
 RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/ecslogagent ./cmd/ecslogagent
 
-FROM golang:1.26.10-alpine3.23 AS collector
-WORKDIR /src
-COPY cmd/nginxcollector/*.go ./
-RUN GO111MODULE=off CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/nginxcollector .
+FROM golang:1.26.11-alpine3.23 AS collector
+WORKDIR /go/src/github.com/yl0711-coder/newapi-monitor
+COPY cmd/nginxcollector/*.go ./cmd/nginxcollector/
+COPY internal/metering/*.go ./internal/metering/
+RUN GO111MODULE=off CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/nginxcollector ./cmd/nginxcollector
 
 FROM alpine:3.23 AS runtime
 RUN apk upgrade --no-cache && apk add --no-cache ca-certificates \

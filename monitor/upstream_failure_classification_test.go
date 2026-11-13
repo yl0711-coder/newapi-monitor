@@ -69,8 +69,8 @@ func TestUpstreamOpenOxPauseRestartAndManualReactivation(t *testing.T) {
 			if err := m.storeDB.Model(&ChannelUpstreamAccount{}).Where("domain = ?", row.Domain).UpdateColumn("next_sync_at", 0).Error; err != nil {
 				t.Fatal(err)
 			}
-		} else if got.NextSyncAt != upstreamAccountIsolatedUntil {
-			t.Fatal("exhausted incident budget did not pause")
+		} else if got.NextSyncAt == upstreamAccountIsolatedUntil || got.NextSyncAt < before+int64(upstreamClientErrorRecheck/time.Second) {
+			t.Fatal("exhausted 403 budget must recheck slowly, not pause or retry soon")
 		}
 	}
 	restarted := &Monitor{cfg: m.cfg, storeDB: m.storeDB, upstreamClient: m.upstreamClient}

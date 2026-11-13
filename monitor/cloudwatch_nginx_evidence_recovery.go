@@ -72,12 +72,23 @@ func (m *Monitor) reconcileCloudWatchNginxEvidence(state *CloudWatchNginxCursor,
 				state.EvidenceGapReason = "evidence_store_replaced"
 			}
 		}
-		proof.CoverageFromTs, proof.ThroughTs = from, from
-		proof.PendingFromTs, proof.PendingToTs, proof.RestoreThroughTs = 0, 0, 0
-		if err := m.nginxEvidenceDB.Save(&proof).Error; err != nil {
-			return err
+		// An interrupted replacement on the SAME store leaves a durable safe
+		// prefix. Resume that prefix, including the failed left boundary, instead
+		// of throwing away days of successfully committed historical coverage.
+		// A replaced/legacy store still requires a full retained-range replay.
+		resume, coverageFrom := from, from
+		if state.EvidenceStoreID == proof.StoreID && proof.PendingToTs != 0 &&
+			proof.CoverageFromTs <= max(state.EvidenceCoverageFromTs, from) && proof.ThroughTs >= from && proof.ThroughTs <= target {
+			resume = proof.ThroughTs
+			coverageFrom = max(from, proof.CoverageFromTs)
+		} else {
+			proof.CoverageFromTs, proof.ThroughTs = from, from
+			proof.PendingFromTs, proof.PendingToTs, proof.RestoreThroughTs = 0, 0, 0
+			if err := m.nginxEvidenceDB.Save(&proof).Error; err != nil {
+				return err
+			}
 		}
-		state.EvidenceCoverageFromTs, state.EvidenceNextTs, state.EvidenceThroughTs = from, from, from
+		state.EvidenceCoverageFromTs, state.EvidenceNextTs, state.EvidenceThroughTs = coverageFrom, resume, resume
 		state.EvidenceLastSuccessAt = 0
 	}
 	state.EvidenceStoreID = proof.StoreID

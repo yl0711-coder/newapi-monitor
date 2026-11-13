@@ -1,0 +1,18 @@
+.incident-page{min-width:0;color:var(--text);padding-bottom:30px;overflow-wrap:anywhere}
+.incident-page[hidden],.incident-page [hidden]{display:none}
+.im-filters,.im-actions{display:flex;gap:10px;align-items:end;flex-wrap:wrap;margin:14px 0}
+.im-filters label{display:flex;flex-direction:column;gap:6px;font-size:13px}
+.incident-page input,.incident-page button{font:inherit;min-height:40px;border:1px solid var(--border);border-radius:7px;padding:8px 12px;background:var(--card);color:var(--text);max-width:100%;box-sizing:border-box}
+.incident-page input{color-scheme:dark}
+body[theme-mode="light"] .incident-page input{color-scheme:light}
+.incident-page button{cursor:pointer}.incident-page button:disabled{opacity:.55;cursor:default}
+.incident-page :focus-visible{outline:2px solid var(--accent);outline-offset:3px}
+.im-note{font-size:12px;line-height:1.65;color:var(--text-muted)}
+.im-warning,.im-empty{border:1px solid #9d7b32;border-radius:8px;padding:12px;background:rgba(181,138,55,.1);line-height:1.6}
+.im-error{color:var(--red);padding:10px 0;line-height:1.6}
+.im-table{overflow:auto;max-width:100%;margin:12px 0}.im-table table{border-collapse:collapse;width:100%;min-width:680px}.im-table td,.im-table th{padding:10px;text-align:left;vertical-align:top;border-bottom:1px solid var(--border);font-size:13px;line-height:1.6}.im-table th{white-space:nowrap}.im-table button{white-space:nowrap}
+.incident-page details{border:1px solid var(--border);border-radius:8px;padding:12px;margin:14px 0}.incident-page summary{cursor:pointer}
+.incident-page pre{white-space:pre-wrap;overflow-wrap:anywhere;max-height:350px;overflow:auto;font-size:12px}
+.im-dialog{width:min(1100px,96vw);max-height:90vh;overflow:auto;border:1px solid var(--border);border-radius:12px;background:var(--card);color:var(--text);padding:20px;box-sizing:border-box}
+.im-dialog::backdrop{background:#0009}.im-dialog header{display:flex;align-items:center;justify-content:space-between;gap:12px;position:sticky;top:-20px;background:var(--card);z-index:1}.im-dialog h3{margin:10px 0}.im-dialog h4{margin:20px 0 6px}
+@media(max-width:600px){.im-filters label{width:100%}.im-filters input{width:100%;min-width:0}.im-dialog{padding:12px}.im-dialog header{top:-12px;flex-wrap:wrap}}

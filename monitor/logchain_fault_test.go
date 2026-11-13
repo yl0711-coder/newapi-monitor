@@ -10,6 +10,7 @@ package monitor
 // 我在评估阶段对同一个案子连错三次，全都是这个方向的错。
 
 import (
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -30,9 +31,9 @@ func TestLogChainFaultMessageSourceBeatsStatusCode(t *testing.T) {
 	}{
 		{
 			// 生产原文（渠道 74，08-24，实测 71 条同形）
-			name:      "上游说它没有可用账号_带前缀_判上游",
+			name:      "文档明确平台账号能力_前缀不能覆盖归属",
 			content:   `status_code=404, Model "gpt-5.4" is not supported by any configured account in this group`,
-			wantFault: faultUpstream,
+			wantFault: faultOurs,
 		},
 		{
 			// 生产原文（渠道 32/39，08-24，实测 2 条）。状态码是 503，
@@ -43,9 +44,9 @@ func TestLogChainFaultMessageSourceBeatsStatusCode(t *testing.T) {
 		},
 		{
 			// 生产原文（渠道 79，08-21，实测 1 条）
-			name:      "上游无可用渠道_带前缀_判上游",
+			name:      "文档明确平台渠道配置_前缀不能覆盖归属",
 			content:   "status_code=503, No available channel for model claude-fable-5 under group Claude max (distributor)",
-			wantFault: faultUpstream,
+			wantFault: faultOurs,
 		},
 		{
 			// **同样措辞但无 status_code 前缀** → 是我方 new-api 自己的路由失败。
@@ -77,13 +78,6 @@ func TestLogChainFaultNeverGuessesOnAmbiguous(t *testing.T) {
 		content string
 		reason  string
 	}{
-		{
-			// 生产原文（08-21 实测 12 条 / 08-24 实测 3 条）。措辞指向上游，
-			// 但无法排除我方限流阈值或客户突发——要真正区分需要上游侧配额数据（未采集）。
-			name:    "429限流",
-			content: "status_code=429, Upstream rate limit exceeded, please retry later",
-			reason:  "无法区分上游配额、我方限流与客户突发",
-		},
 		{
 			// 生产原文（08-21 实测 3 条）。可能上游真的全挂，
 			// 也可能我方熔断/健康检查把它们全禁用了。
@@ -130,9 +124,9 @@ func TestLogChainFaultStatusCodeMapping(t *testing.T) {
 		note      string
 	}{
 		// 两天实测共 121 条，判据明确。
-		{502, "status_code=502, bad response status code 502", faultUpstream, faultConfHigh, "实测 58 条"},
-		{503, "status_code=503, Service temporarily unavailable", faultUpstream, faultConfHigh, "实测 49 条"},
-		{524, "status_code=524, openai_error", faultUpstream, faultConfHigh, "实测 20 条"},
+		{502, "status_code=502, bad response status code 502", faultUnknown, faultConfNone, "文档通用502待补证据"},
+		{503, "status_code=503, Service temporarily unavailable", "ours+upstream", faultConfHigh, "文档组合归属"},
+		{524, "status_code=524, openai_error", faultUnknown, faultConfNone, "文档通用openai_error待补证据"},
 		// 403/401 **不给结论**。原因不是"样本少"，而是原文本身不含判别信息：
 		// 鉴权失败可能是我方密钥失效（换密钥）也可能是上游主动封禁（联系上游），
 		// 而原文只有 "bad response status code 403"，**再多样本也不会变得可区分**。
@@ -142,7 +136,7 @@ func TestLogChainFaultStatusCodeMapping(t *testing.T) {
 		{403, "status_code=403, bad response status code 403", faultUnknown, faultConfNone, "403原文无判别信息_不给结论"},
 		{401, "status_code=401, bad response status code 401", faultUnknown, faultConfNone, "401原文无判别信息_不给结论"},
 		// 样本不足，必须标 low——不能与 502/503 那些同等呈现。
-		{413, "status_code=413, bad response status code 413", faultDownstream, faultConfLow, "实测仅 1 条"},
+		{413, "status_code=413, bad response status code 413", faultDownstream, faultConfHigh, "文档已明确请求体过大"},
 		// 生产原文：Invalid 'input[60].id' —— 明确的客户参数错误。
 		{400, "status_code=400, Invalid 'input[60].id': expected an ID", faultDownstream, faultConfMid, "客户参数错"},
 	} {
@@ -330,7 +324,7 @@ func TestLogChainFaultIsPureFunction(t *testing.T) {
 	row := LogChainRow{Type: 5, Content: "status_code=503, Service temporarily unavailable"}
 	a := logChainAttributeFault(row, nil)
 	b := logChainAttributeFault(row, nil)
-	if a != b {
+	if !reflect.DeepEqual(a, b) {
 		t.Errorf("同一行两次归因结果不同: %+v vs %+v", a, b)
 	}
 }

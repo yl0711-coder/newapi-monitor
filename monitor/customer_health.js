@@ -43,7 +43,7 @@ const pct=v=>(v===null||v===undefined)?'—':(+v).toFixed(1)+'%';
 
 // 责任方与置信度的中文标签。取值与后端 faultUpstream 等常量一一对应，
 // 前端不做任何推断，只做翻译。
-const FAULT_LABEL={upstream:'上游问题',ours:'我方问题',downstream:'客户问题',unknown:'待判'};
+const FAULT_LABEL={upstream:'上游问题',ours:'我方问题',downstream:'客户问题',network:'网络/CDN',unknown:'待判'};
 const CONF_LABEL={high:'判据明确',mid:'判据合理',low:'样本不足',none:'证据不足'};
 
 // 责任方色块沿用客户排障的 .lc-fault-tag（描边而非实心底色）：那一列是推断，
@@ -110,25 +110,32 @@ function init(){
     }
     if(!$('tab-customer-health')?.hidden){load();scheduleRefresh()}
   });
+  window.addEventListener('focus',()=>{
+    if(!document.hidden&&!$('tab-customer-health')?.hidden){load();scheduleRefresh()}
+  });
   // 事件委托：行按钮由 render 整体重建，不能逐个绑定，也不用内联 onclick。
   $('chRows')?.addEventListener('click',onRowClick);
 }
 
 // ═══════════ 取数 ═══════════
 
-async function load(){
-  if(ch.loading)return;
+async function load(afterWrite=false){
+  // Editing and writes own the displayed snapshot; refresh resumes afterwards.
+  if(!afterWrite&&(ch.editing!==null||ch.saving))return;
+  // Every refresh supersedes the previous request. Abort plus a new
+  // generation prevents a late response from repainting an older snapshot.
+  const gen=++ch.generation;
   ch.loading=true;
   ch.error='';
-  const gen=ch.generation;
   ch.abort?.abort();
-  ch.abort=new AbortController();
+  const controller=new AbortController();
+  ch.abort=controller;
   render();
   try{
     // cache:'no-store' 与后端的 noStoreSensitive 配对：响应含公司名、用户名、
     // user_id、消耗金额与故障归因，不得进浏览器磁盘缓存。
     // 两边都要：响应头管中间层与后续请求，这里管本次请求不去读旧缓存。
-    const r=await fetch('/customer-health/report',{signal:ch.abort.signal,cache:'no-store',
+    const r=await fetch('/customer-health/report',{signal:controller.signal,cache:'no-store',
       headers:{'Accept':'application/json'}});
     const data=await r.json().catch(()=>({}));
     if(gen!==ch.generation)return; // 已离开本页，无权改写状态
@@ -138,7 +145,7 @@ async function load(){
     if(gen!==ch.generation)return;
     if(e.name!=='AbortError')ch.error='取数失败：'+e.message;
   }finally{
-    if(gen===ch.generation){ch.loading=false;render();}
+    if(gen===ch.generation){ch.loading=false;if(ch.abort===controller)ch.abort=null;render();}
   }
 }
 
@@ -161,7 +168,7 @@ async function addCustomer(){
     }
     $('chUsername').value='';
     $('chCompany').value='';
-    await load();
+    await load(true);
   }catch(e){
     setFormError('添加失败：'+e.message+'；重试会复用同一幂等键，不会重复添加');
   }finally{
@@ -223,7 +230,7 @@ async function deleteCompany(groupID){
       setFormError('解散公司失败，成员和公司均未删除：'+(data?.error||('HTTP '+res.status)));
       return;
     }
-    await load();
+    await load(true);
   }catch(e){
     setFormError('解散请求的结果暂时未知：'+e.message+'；重试会复用同一幂等键，不会重复执行。');
   }finally{
@@ -238,7 +245,7 @@ async function saveCompany(groupID){
   if(!name){setFormError('公司名不能为空');render();return}
   const ok=await post('/customer-health/groups/update',{id:groupID,name},'改名失败',
     `ch-group-rename:${groupID}:${name}`);
-  if(ok)ch.editing=null;
+  if(ok){ch.editing=null;render()}
 }
 
 // addMember 给公司加用户名。
@@ -285,7 +292,7 @@ async function post(url,body,failLabel,actionKey){
       setFormError((data&&data.error)||(failLabel+' HTTP '+res.status));
       return false;
     }
-    await load();
+    await load(true);
     return true;
   }catch(e){
     setFormError(failLabel+'：'+e.message+'；重试会复用同一幂等键，不会重复执行');
@@ -298,6 +305,10 @@ async function post(url,body,failLabel,actionKey){
 // ═══════════ 渲染 ═══════════
 
 function render(){
+  if(window.MonitorView)return window.MonitorView.preserve($('tab-customer-health'),renderContent);
+  renderContent();
+}
+function renderContent(){
   const box=$('chRows');
   if(!box)return;
   $('chFormError')&&($('chFormError').textContent=ch.formError||'');
@@ -307,7 +318,10 @@ function render(){
     const collection=ch.report?.collection;
     meta.textContent=ch.report
       ? '统计日 '+ch.report.day+'（'+ch.report.time_zone+'）· 出报于 '+
-        new Date((ch.report.generated_at||0)*1000).toLocaleTimeString('zh-CN')+
+        new Date((ch.report.generated_at||0)*1000).toLocaleString('zh-CN',{hour12:false,timeZone:'Asia/Shanghai'})+
+        ' · 查询水位 '+(collection?.through_ts>ch.report.from_ts?new Date(collection.through_ts*1000).toLocaleString('zh-CN',{hour12:false,timeZone:'Asia/Shanghai'}):'尚未采集／未知')+
+        (collection?.through_ts>ch.report.from_ts&&Number.isFinite(collection?.lag_seconds)&&collection.lag_seconds>0?' · 延迟 '+Math.ceil(collection.lag_seconds/60)+' 分钟':'')+
+        (collection?.metrics_available===false?' · 正在采集/数据可能不完整':'')+
         (collection?.note?' · '+collection.note:'')+
         (collection?.membership_source
           ? ' · 名单：'+collection.membership_source+' · '+num(collection.membership_groups||0)+'家公司/'+
@@ -315,10 +329,16 @@ function render(){
           : '')
       : '';
   }
-  // 空/错/加载三态都得是 <tr>：本页表格化后 tbody 里放 div 会被浏览器
+
   // 提到表格外面渲染，出现"提示文字飘在表格上方"。
   // colspan 必须与 page.html 表头列数一致（7）。
-  if(ch.error){box.innerHTML='<tr><td colspan="7" class="lc-empty">'+esc(ch.error)+'</td></tr>';return}
+  if(ch.error){
+    if(ch.report){
+      if(meta)meta.textContent+=' · 刷新失败，保留上次结果：'+ch.error;
+    }else{
+      box.innerHTML='<tr><td colspan="7" class="lc-empty">'+esc(ch.error)+'</td></tr>';return;
+    }
+  }
   if(ch.loading&&!ch.report){box.innerHTML='<tr><td colspan="7" class="lc-empty">加载中…</td></tr>';return}
   const rows=ch.report?.rows||[];
   if(!rows.length){
@@ -408,7 +428,7 @@ function faultCell(r){
   const dim=(r.fault_confidence==='low'||r.fault_confidence==='none')?' lc-fault-dim':'';
   const conf=r.fault_confidence?CONF_LABEL[r.fault_confidence]||r.fault_confidence:'';
   const tip=(r.reason||'')+(conf?'（'+conf+'）':'');
-  return `<span class="lc-fault-tag ${cls}${dim}" title="${esc(tip)}">${esc(FAULT_LABEL[r.fault]||r.fault)}</span>`;
+  return `<span class="lc-fault-tag ${cls}${dim}" title="${esc(tip)}">${esc(String(r.fault).split('+').map(p=>FAULT_LABEL[p]||p).join(' / '))}</span>`;
 }
 
 function detailHTML(r){

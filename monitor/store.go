@@ -112,6 +112,11 @@ type MetricSample struct {
 	// projection was introduced.  Such rows are never treated as fast; the
 	// coverage layer must re-read them from the source first.
 	TTFTSemanticsVersion int `gorm:"column:ttft_semantics_version;index"`
+	// Independent mean projection. NULL/version 0 means historical sum unknown.
+	// Do not infer it from histogram buckets or initialize it in create hooks.
+	FRTSumMs       *int64 `gorm:"column:frt_sum_ms"`
+	FRTSumObserved int64  `gorm:"column:frt_sum_observed"`
+	FRTSumVersion  int    `gorm:"column:frt_sum_version"`
 }
 
 // CapacityUserMinuteSample 是容量/RPM 查询专用的最小用户分钟事实。
@@ -149,6 +154,11 @@ type CapacityUserMinuteSample struct {
 	TtftObserved         int64 `gorm:"column:ttft_observed"`
 	TtftOver3s           int64 `gorm:"column:ttft_over_3s"`
 	TTFTSemanticsVersion int   `gorm:"column:ttft_semantics_version;index"`
+	// Independent mean projection. NULL/version 0 means historical sum unknown.
+	// Do not infer it from histogram buckets or initialize it in create hooks.
+	FRTSumMs       *int64 `gorm:"column:frt_sum_ms"`
+	FRTSumObserved int64  `gorm:"column:frt_sum_observed"`
+	FRTSumVersion  int    `gorm:"column:frt_sum_version"`
 }
 
 // CustomerHealthSourceCursor 是客户维护责任方口径回算的本地持久水位。
@@ -163,6 +173,10 @@ type CustomerHealthSourceCursor struct {
 	TTFTCoverageFromTs    int64 `gorm:"column:ttft_coverage_from_ts"`
 	TTFTCoverageThroughTs int64 `gorm:"column:ttft_coverage_through_ts"`
 	UpdatedAt             int64 `gorm:"column:updated_at"`
+	// Read progress is separate from coverage: replaying an already covered
+	// minute must survive a restart without falsely advancing either proof.
+	ReadNextTs   int64 `gorm:"not null;default:0" json:"-"`
+	ReadTargetTs int64 `gorm:"not null;default:0" json:"-"`
 }
 
 func (s *CapacityUserMinuteSample) BeforeCreate(_ *gorm.DB) error {
@@ -1008,13 +1022,13 @@ func (m *Monitor) openStore(path string) error {
 		&PortalMonthlyBillWithdrawal{},
 		&ECSLogSource{}, &ECSLogDiscovery{}, &ECSLogLeaseWindow{}, &ECSLogArchiveReceipt{}, &ECSLogArchiveScan{},
 		&AICodeWithRecordCheckpoint{}, &AICodeWithRecordSeen{},
-		&MetricSample{}, &CapacityUserMinuteSample{}, &CustomerHealthSourceCursor{}, &CustomerHealthDayCoverage{}, &TokenSample{}, &MetricFinalizeState{}, &HourSample{}, &ChannelSnap{}, &RejectionSample{}, &RejectionIngestBatch{}, &SelectablePair{},
+		&MetricSample{}, &CapacityUserMinuteSample{}, &CustomerHealthSourceCursor{}, &CustomerHealthDayCoverage{}, &FRTSumRecomputeState{}, &TokenSample{}, &MetricFinalizeState{}, &HourSample{}, &ChannelSnap{}, &RejectionSample{}, &RejectionIngestBatch{}, &SelectablePair{},
 		&StabilityHourSample{}, &ChannelTestHourSample{}, &StabilityRejectHour{}, &StabilityProblemSample{},
 		&StabilityProblemIngestState{}, &StabilityProblemStage{}, &StabilityProblemClassificationMigration{}, &StabilityProblemLiveCursor{},
 		&StabilityHourIngestState{}, &StabilityBackfillJob{},
 		&ChannelFinanceSetting{}, &ChannelSaleGroupRate{}, &ChannelBusinessGroupPolicy{}, &WebsiteGroupCatalog{}, &ChannelDomainCost{}, &ChannelDomainGroupCost{}, &ChannelFinanceChannelCost{}, &ChannelFinanceVersion{},
 		&FinanceInternalAccount{}, &FinanceInternalAccountAudit{}, &FinanceChannelDomainPeriod{},
-		&ChannelUpstreamAccount{}, &ChannelUpstreamRetirement{}, &ChannelUpstreamUsageHour{}, &ChannelUpstreamUsageArchive{}, &ChannelUpstreamHistoricalRepair{}, &ChannelUpstreamErrorLog{}, &ChannelUpstreamErrorLogArchive{}, &UpstreamErrorLogSyncState{}, &ChannelUpstreamFundEvent{}, &UpstreamFundSyncState{}, &NewAPIUsageBackfillCheckpoint{}, &NewAPIUsageBackfillSegment{}, &AICodeWithKeySyncState{}, &AICodeWithUsageStage{}, &AICodeWithUsageRound{}, &UpstreamHostCircuit{},
+		&ChannelUpstreamAccount{}, &ChannelUpstreamRetirement{}, &ChannelDomainAlias{}, &ChannelUpstreamUsageHour{}, &ChannelUpstreamUsageArchive{}, &ChannelUpstreamHistoricalRepair{}, &ChannelUpstreamErrorLog{}, &ChannelUpstreamErrorLogArchive{}, &UpstreamErrorLogSyncState{}, &ChannelUpstreamFundEvent{}, &UpstreamFundSyncState{}, &NewAPIUsageBackfillCheckpoint{}, &NewAPIUsageTailCheckpoint{}, &NewAPIUsageBackfillSegment{}, &AICodeWithKeySyncState{}, &AICodeWithUsageStage{}, &AICodeWithUsageRound{}, &UpstreamHostCircuit{},
 		&ChannelUpstreamPricingHourEvidence{}, &ChannelUpstreamPricingHourState{}, &ChannelUpstreamPricingObservedState{}, &ChannelUpstreamPricingChangeEvent{}, &ChannelUpstreamPricingSyncState{}, &ChannelUpstreamPricingPageCheckpoint{}, &AICodeWithPricingCheckpoint{},
 		&ChannelUpstreamCostHourEvidence{}, &ChannelUpstreamCostHourState{}, &ChannelCostPageCheckpoint{}, &ChannelCostSourceBinding{}, &ChannelCostDirtyHour{}, &ChannelCostKeyRegistry{},
 		&ChannelUpstreamTokenConfig{},
@@ -1027,8 +1041,27 @@ func (m *Monitor) openStore(path string) error {
 		&AlertConfig{}, &AlertLog{}, &TrackedUser{}, &CustomerGroup{}, &CustomerHealthGroup{}, &CustomerHealthMember{}, &CustomerHealthMigrationState{}, &UsageMemberControl{}, &UsageMemberAudit{}, &UsageMemberControlMigration{}, &FollowUpLog{}, &UsageSettings{}, &UserDirectoryEntry{},
 		&CloudWatchInvestigationAudit{}, &CloudWatchShadowReconciliationRun{}, &CloudWatchShadowReconciliationDiff{}, &CloudWatchPreRouteCursor{}, &CloudWatchNginxCursor{},
 		&GroupGovernanceState{}, &GroupGovernanceGroup{}, &GroupGovernanceUser{},
+		// Incident 核心（MON-003~006）。建表不受 MONITOR_INCIDENT_CORE_ENABLED 控制：
+		// AutoMigrate 与功能开关无关，开关只管引擎是否跑、入口是否显示。
+		&Incident{}, &IncidentSegment{}, &IncidentContinuity{},
+		&IncidentObservation{}, &IncidentImpact{}, &IncidentState{}, &IncidentAudit{},
+		// Incident 采集接入（MON-003 B3）。同样不受 feature flag 控制。
+		&IncidentIngestCursor{}, &IncidentIngestWindowState{},
+		&IncidentIngestRevision{}, &IncidentIngestGapSummary{}, &IncidentImpactWindow{},
+		&IncidentPendingSummary{},
+		&TokenMeteringFact{}, &TokenMeteringRef{}, &TokenMeteringState{}, &TokenMeteringWindow{}, &TokenMeteringLaneState{},
+		&TokenDetectionState{}, &TokenDetectionRetry{}, &TokenDetectionBucket{}, &TokenDetectionCurrent{}, &TokenDetectionRevision{}, &TokenDetectionReference{},
+		&TokenEvidenceExport{}, &TokenDeliveryAudit{}, &TokenNotifyOutbox{}, &tokenNotifyTarget{}, &tokenDeliveryState{},
 	); err != nil {
 		return fmt.Errorf("表迁移失败: %w", err)
+	}
+	if strings.TrimSpace(m.cfg.TokenStorePath) == "" {
+		if err := initTokenMeteringLinkIndex(db); err != nil {
+			return fmt.Errorf("initialize token association index: %w", err)
+		}
+		if err := initTokenDetectionReportIndex(db); err != nil {
+			return fmt.Errorf("initialize token report index: %w", err)
+		}
 	}
 	if err := migrateLegacyCustomerHealthTables(db); err != nil {
 		return fmt.Errorf("客户维护名单迁移失败: %w", err)

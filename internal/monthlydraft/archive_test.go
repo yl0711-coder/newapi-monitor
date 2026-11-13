@@ -327,6 +327,14 @@ func TestArchiveActualInterruptedWritesAndCorruptReadback(t *testing.T) {
 }
 
 func TestArchiveFullRecordBoundRoundtrip(t *testing.T) {
+	if raceDetector {
+		// The production bounds are sized for native speed; the race detector
+		// multiplies the cost of hashing the maximum record set. A busy CI runner
+		// must not turn that into a spurious deadline failure.
+		inspect, archive := retentionInspectionTimeout, archiveOperationTimeout
+		retentionInspectionTimeout, archiveOperationTimeout = 6*inspect, 6*archive
+		t.Cleanup(func() { retentionInspectionTimeout, archiveOperationTimeout = inspect, archive })
+	}
 	f := generationFixtureNew(t)
 	f.raw = append(bytes.Clone(f.raw), bytes.Repeat([]byte(" "), 512<<10)...)
 	f.plan.PreparationSHA256 = generationHash(f.raw)

@@ -40,19 +40,55 @@ const minSample = 20
 // Monitor 是一个监控实例:持有配置、生产库只读连接、本地采样库与采样心跳。
 // 用 New 创建,Start 启动后台采样,RegisterRoutes 挂载页面与接口。零包级全局,可多实例、易测。
 type Monitor struct {
-	ecsLogPolicies        []ECSLogPolicy
-	ecsLogOwnershipActive atomic.Bool
-	ecsLogVerify          func(context.Context, ecsLogRegistration, ECSLogPolicy) (ECSLogSource, error)
-	ecsLogVerifications   atomic.Int32
-	ecsLogRequests        atomic.Int32
-	cfg                   Settings
-	prodDB                *sql.DB              // new-api 生产库【只读】连接(采样器周期查询 + 用户用量按需查询);nil = 未连接
-	portalLogColumns      portalLogColumnCache // Usage 可选来源列元数据缓存；不迁移业务表
-	storeDB               *gorm.DB             // 本地采样库
-	queuedWriteMu         sync.Mutex           // guards queuedWriteDB
-	queuedWriteDB         *gorm.DB             // 后台排队写连接(BEGIN IMMEDIATE，单连接)
-	queuedWriteClosed     bool                 // set by Close; no reopen afterwards
-	queuedWriteRetryAt    time.Time            // after a failed open, fall back until then
+	tokenDetectionCapacityReady atomic.Bool
+	ecsLogPolicies              []ECSLogPolicy
+	ecsLogOwnershipActive       atomic.Bool
+	ecsLogVerify                func(context.Context, ecsLogRegistration, ECSLogPolicy) (ECSLogSource, error)
+	ecsLogVerifications         atomic.Int32
+	ecsLogRequests              atomic.Int32
+	cfg                         Settings
+	prodDB                      *sql.DB              // new-api 生产库【只读】连接(采样器周期查询 + 用户用量按需查询);nil = 未连接
+	portalLogColumns            portalLogColumnCache // Usage 可选来源列元数据缓存；不迁移业务表
+	storeDB                     *gorm.DB             // 本地采样库
+	tokenDB                     *gorm.DB             // Optional isolated Token facts/results store.
+	tokenReadDB                 *gorm.DB             // Bounded WAL readers, independent of the Token writer.
+	tokenBackgroundReadOnce     sync.Once
+	tokenBackgroundReadGate     chan struct{}            // Long background read phases share one of the existing readers.
+	tokenMeteringRounds         atomic.Uint64            // Rotate the first lane when a round can finish only one page.
+	tokenMeteringMigrationTurns atomic.Uint64            // Fair turns; each migration keeps its own durable checkpoint.
+	tokenMeteringPartialPage    atomic.Bool              // A durable local prefix still has already-read source rows to resume.
+	tokenMeteringCommitRows     atomic.Int64             // Reuse measured local write size across partially committed source pages.
+	tokenCleanupCommitRows      atomic.Int64             // Retain the measured cleanup size across bounded sweeps.
+	tokenDetectionCleanupRows   atomic.Int64             // Expired results share fixed commit cost within the same cleanup budget.
+	tokenLinkCommitRows         atomic.Int64             // Retain association batch size without repeating writer warmup.
+	tokenMeteringMu             sync.Mutex               // A remembered completed lease never authorizes overlapping rounds.
+	tokenMeteringFinishedLease  string                   // Guarded by tokenMeteringMu; only the most recently finished owner.
+	tokenMeteringReadCache      *tokenMeteringCachedRead // Guarded by tokenMeteringMu; at most one bounded already-read page.
+	// Contract migration walks the immutable (source_epoch, log_id) key in
+	// order. Keeping the cursor in memory avoids rescanning the retained facts
+	// table for every bounded batch; a restart safely resumes at zero.
+	tokenDetectionMu            sync.Mutex
+	tokenDetectionFinishedLease string        // Guarded by tokenDetectionMu; never authorizes a different worker.
+	tokenDetectionCommitRows    int           // Guarded by tokenDetectionMu; measured SQL work, excluding fixed commit cost.
+	tokenDetectionWorkBudget    time.Duration // Guarded by tokenDetectionMu; cheap rows may share fixed commit cost.
+	// Collection and association publish durable queue work through this
+	// coalescing signal. It only shortens an idle detection wait; the detector
+	// still takes its normal lease and round budget before doing any writes.
+	tokenDetectionWakeOnce   sync.Once
+	tokenDetectionWake       chan struct{}
+	tokenAssociationWakeOnce sync.Once
+	tokenAssociationWake     chan struct{}
+	// SQLite has one writer even though the isolated Token store has separate
+	// reader and writer handles.  Serialise the background Token write lanes so
+	// contract migration, evidence linking, collection and detection do not
+	// repeatedly collide on the one-second busy timeout and turn durable work
+	// into an apparent backlog.
+	tokenLocalWriteMu       tokenLocalWriter
+	tokenReportSummaryCache tokenSummaryCache
+	queuedWriteMu           sync.Mutex // guards queuedWriteDB
+	queuedWriteDB           *gorm.DB   // 后台排队写连接(BEGIN IMMEDIATE，单连接)
+	queuedWriteClosed       bool       // set by Close; no reopen afterwards
+	queuedWriteRetryAt      time.Time  // after a failed open, fall back until then
 	// usageFactsDB 独立承载高增长的用量小时/日事实、同步水位和资料快照。
 	// 生产通过 New 创建时默认与 storeDB 分文件，避免补数、WAL 膨胀、损坏或
 	// 写锁把告警配置、渠道配置和其他 Monitor 页面一起拖垮。测试直接调用
@@ -62,6 +98,8 @@ type Monitor struct {
 	// read-only WAL handle. It cannot write or consume the facts writer's pool.
 	financeFactsReadDB   atomic.Pointer[gorm.DB]
 	financeFactsReadOnce sync.Once
+	usageFactsReadDB     atomic.Pointer[gorm.DB]
+	usageFactsReadOnce   sync.Once
 	// nginxEvidenceDB 是短期、高基数的入口请求证据库。它与主库、用量事实库
 	// 分离；损坏、锁或满盘只会关闭 evidence lane，不影响现有 Monitor 页面。
 	nginxEvidenceDB *gorm.DB
@@ -79,11 +117,15 @@ type Monitor struct {
 	cloudWatchPreRouteLastFailure atomic.Int64
 	// CloudWatch Nginx 连续来源使用独立水位；任何查询、解析或发布失败都不
 	// 推进水位。页面只读已经原子发布的分钟事实。
-	cloudWatchNginxRunning     atomic.Bool
-	cloudWatchNginxFrom        atomic.Int64
-	cloudWatchNginxThrough     atomic.Int64
-	cloudWatchNginxLastSuccess atomic.Int64
-	cloudWatchNginxLastFailure atomic.Int64
+	cloudWatchNginxRunning             atomic.Bool
+	cloudWatchNginxFrom                atomic.Int64
+	cloudWatchNginxThrough             atomic.Int64
+	cloudWatchNginxLastSuccess         atomic.Int64
+	cloudWatchNginxLastFailure         atomic.Int64
+	cloudWatchNginxFastWindows         atomic.Int64
+	cloudWatchNginxRepairFastWindows   atomic.Int64
+	cloudWatchNginxEvidenceFastWindows atomic.Int64
+	cloudWatchNginxReplayFastWindows   atomic.Int64
 	// 请求级 Nginx evidence 的覆盖水位独立于分钟聚合水位。它用于让
 	// /ready 和排障页面明确知道“入口证据还在补扫”，而不是把未关联
 	// 误报成“请求没有到达”。
@@ -133,6 +175,7 @@ type Monitor struct {
 	problemSourceTarget             atomic.Int64 // 当前问题采集请求窗口目标右水位
 	problemSourceRunning            atomic.Bool  // logchain-only 独立问题签名只读 lane 是否正在运行
 	customerHealthSourceRunning     atomic.Bool  // logchain-only 客户维护只读 lane 是否正在运行
+	customerHealthSourceReadSeconds atomic.Int64 // adaptive read width, survives source epoch restarts
 	customerHealthSourceFrom        atomic.Int64 // 当天连续覆盖左水位（CST 日起点）
 	customerHealthSourceThrough     atomic.Int64 // 当天连续覆盖右水位（不含）
 	customerHealthSourceTarget      atomic.Int64 // 客户维护当前采集目标右水位
@@ -166,24 +209,27 @@ type Monitor struct {
 	sourceLifecycleInitialized atomic.Bool
 	sourceState                atomic.Int32
 	sourceLastSuccessAt        atomic.Int64
-	sourceLastFailureAt        atomic.Int64
-	sourceNextRetryAt          atomic.Int64
-	sourceFailureStreak        atomic.Int64
-	sourceRuntimeFailureClass  atomic.Int32 // 0=none,1=transient,2=permanent；permanent 不会被覆盖
-	sourceFailureNotify        chan struct{}
-	sourceLeaseHeld            atomic.Bool
-	sourceLeaseName            string // 由配置名 + DBName 稳定摘要组成，不含 host/凭据
-	sourceWorkerRunning        atomic.Bool
-	sourceSupervisorOnce       sync.Once
-	sourceSupervisorCancelMu   sync.Mutex
-	sourceSupervisorCancel     context.CancelFunc
-	sourceSupervisorDone       chan struct{}
-	sourceEpochMu              sync.RWMutex
-	sourceEpochCtx             context.Context
-	sourceQuarantineMu         sync.Mutex
-	sourceQuarantinedLease     sourceLeaseHandle
-	sourceQuarantineDone       <-chan struct{}
-	sourceDrainTimedOut        atomic.Bool
+	// Completed workload reads can prove liveness without a second connection.
+	// Health probes never refresh this timestamp; it expires within one check.
+	sourceReadLastSuccess     atomic.Pointer[time.Time]
+	sourceLastFailureAt       atomic.Int64
+	sourceNextRetryAt         atomic.Int64
+	sourceFailureStreak       atomic.Int64
+	sourceRuntimeFailureClass atomic.Int32 // 0=none,1=transient,2=permanent；permanent 不会被覆盖
+	sourceFailureNotify       chan struct{}
+	sourceLeaseHeld           atomic.Bool
+	sourceLeaseName           string // 由配置名 + DBName 稳定摘要组成，不含 host/凭据
+	sourceWorkerRunning       atomic.Bool
+	sourceSupervisorOnce      sync.Once
+	sourceSupervisorCancelMu  sync.Mutex
+	sourceSupervisorCancel    context.CancelFunc
+	sourceSupervisorDone      chan struct{}
+	sourceEpochMu             sync.RWMutex
+	sourceEpochCtx            context.Context
+	sourceQuarantineMu        sync.Mutex
+	sourceQuarantinedLease    sourceLeaseHandle
+	sourceQuarantineDone      <-chan struct{}
+	sourceDrainTimedOut       atomic.Bool
 	// 本地探针在后台低频更新。/ready 本身只读这些原子值。
 	localProbeOnce    sync.Once
 	localStoreProbeOK atomic.Bool
@@ -260,6 +306,8 @@ type Monitor struct {
 	backgroundSourceNotify      chan struct{}
 	backgroundSourceHighWaiters int
 	backgroundSourceLowWaiters  int
+	backgroundSourceLowQueue    []uint64
+	backgroundSourceNextTicket  uint64
 	backgroundSourceLastStart   atomic.Int64
 	backgroundSourceStarts      atomic.Uint64
 	// 用户名缓存只是展示增强；异步走低优先来源槽且禁止重叠，不能延迟主采样。
@@ -404,6 +452,15 @@ const snapCacheTTL = 15
 // New 创建监控实例:打开本地采样库;若配置了生产 DSN,则连库并校验连通。
 // 不自动启动采样器——需调用 Start 才开始后台采样。
 func New(s Settings) (*Monitor, error) {
+	if err := validateTokenDeliverySettings(s); err != nil {
+		return nil, err
+	}
+	if err := validateTokenDetectionSettings(s); err != nil {
+		return nil, err
+	}
+	if err := validateTokenMeteringSettings(s); err != nil {
+		return nil, err
+	}
 	if err := validateECSArchiveSettings(s); err != nil {
 		return nil, err
 	}
@@ -480,6 +537,10 @@ func New(s Settings) (*Monitor, error) {
 	if err := m.validateChannelCostKeyRegistry(); err != nil {
 		return nil, err
 	}
+	if err := m.openTokenStore(); err != nil {
+		// Token storage failure cannot redirect writes or stop shared modules.
+		slog.Error("Token 本地库不可用，已隔离 Token 采集与检测", "err", err)
+	}
 	if err := m.openNginxEvidenceStore(); err != nil {
 		// 证据是旁路增强，不得让主 Monitor、Usage 或分钟聚合因其启动失败。
 		slog.Error("Nginx 请求证据库不可用，已仅关闭 evidence lane", "err", err)
@@ -549,6 +610,9 @@ func validateCustomerHealthSourceSettings(s Settings) error {
 }
 
 func validateCloudWatchPreRouteSettings(s Settings) error {
+	if s.CloudWatchPreRouteLivePollSeconds != 0 && (s.CloudWatchPreRouteLivePollSeconds < 60 || s.CloudWatchPreRouteLivePollSeconds > 900) {
+		return fmt.Errorf("MONITOR_CLOUDWATCH_PREROUTE_LIVE_POLL_SECONDS must be between 60 and 900")
+	}
 	if !s.CloudWatchPreRouteEnabled {
 		return nil
 	}
@@ -766,6 +830,8 @@ func (m *Monitor) Start(ctx context.Context) {
 	m.startStoreMaintenance(ctx)
 	m.startLocalStoreProbe(ctx)
 	m.startNginxEvidenceMaintenance(ctx)
+	m.startTokenMeteringMaintenance(ctx)
+	m.startTokenDeliveryMaintenance(ctx)
 	go func() {
 		select {
 		case <-ctx.Done():
@@ -840,25 +906,38 @@ func (m *Monitor) acquireBackgroundSourcePriority(ctx context.Context, priority 
 	}
 	m.backgroundSourceScheduleMu.Lock()
 	m.ensureBackgroundSourceNotifyLocked()
+	var ticket uint64
 	if priority == backgroundSourceHigh {
 		m.backgroundSourceHighWaiters++
 	} else {
 		m.backgroundSourceLowWaiters++
+		m.backgroundSourceNextTicket++
+		ticket = m.backgroundSourceNextTicket
+		m.backgroundSourceLowQueue = append(m.backgroundSourceLowQueue, ticket)
 	}
 	m.signalBackgroundSourceLocked()
 	m.backgroundSourceScheduleMu.Unlock()
 	registered := true
+	unregisterLocked := func() {
+		if priority == backgroundSourceHigh {
+			m.backgroundSourceHighWaiters--
+		} else {
+			m.backgroundSourceLowWaiters--
+			for i, queued := range m.backgroundSourceLowQueue {
+				if queued == ticket {
+					m.backgroundSourceLowQueue = append(m.backgroundSourceLowQueue[:i], m.backgroundSourceLowQueue[i+1:]...)
+					break
+				}
+			}
+		}
+		registered = false
+	}
 	unregister := func() {
 		if !registered {
 			return
 		}
 		m.backgroundSourceScheduleMu.Lock()
-		if priority == backgroundSourceHigh {
-			m.backgroundSourceHighWaiters--
-		} else {
-			m.backgroundSourceLowWaiters--
-		}
-		registered = false
+		unregisterLocked()
 		m.signalBackgroundSourceLocked()
 		m.backgroundSourceScheduleMu.Unlock()
 	}
@@ -867,23 +946,13 @@ func (m *Monitor) acquireBackgroundSourcePriority(ctx context.Context, priority 
 		m.backgroundSourceScheduleMu.Lock()
 		m.ensureBackgroundSourceNotifyLocked()
 		if err := ctx.Err(); err != nil {
-			if priority == backgroundSourceHigh {
-				m.backgroundSourceHighWaiters--
-			} else {
-				m.backgroundSourceLowWaiters--
-			}
-			registered = false
+			unregisterLocked()
 			m.signalBackgroundSourceLocked()
 			m.backgroundSourceScheduleMu.Unlock()
 			return nil, err
 		}
 		if !m.sourceAccessAllowed() {
-			if priority == backgroundSourceHigh {
-				m.backgroundSourceHighWaiters--
-			} else {
-				m.backgroundSourceLowWaiters--
-			}
-			registered = false
+			unregisterLocked()
 			m.signalBackgroundSourceLocked()
 			m.backgroundSourceScheduleMu.Unlock()
 			return nil, errSourceNotReady
@@ -891,17 +960,12 @@ func (m *Monitor) acquireBackgroundSourcePriority(ctx context.Context, priority 
 		now := time.Now()
 		startAt := m.backgroundSourceStartAtLocked(priority)
 		canClaim := !m.backgroundSourceActive && !now.Before(startAt)
-		if priority == backgroundSourceLow && m.backgroundSourceHighWaiters > 0 {
+		if priority == backgroundSourceLow && (m.backgroundSourceHighWaiters > 0 || len(m.backgroundSourceLowQueue) == 0 || m.backgroundSourceLowQueue[0] != ticket) {
 			canClaim = false
 		}
 		if canClaim {
 			m.backgroundSourceActive = true
-			if priority == backgroundSourceHigh {
-				m.backgroundSourceHighWaiters--
-			} else {
-				m.backgroundSourceLowWaiters--
-			}
-			registered = false
+			unregisterLocked()
 			m.backgroundSourceLastStart.Store(now.UnixNano())
 			m.backgroundSourceStarts.Add(1)
 			m.signalBackgroundSourceLocked()
@@ -1077,6 +1141,11 @@ func (m *Monitor) Close() {
 					_ = readDB.Close()
 				}
 			}
+			if usageReader := m.usageFactsReadDB.Load(); usageReader != nil {
+				if readDB, err := usageReader.DB(); err == nil {
+					_ = readDB.Close()
+				}
+			}
 			if db, err := m.usageFactsDB.DB(); err == nil {
 				_ = db.Close()
 			}
@@ -1088,6 +1157,19 @@ func (m *Monitor) Close() {
 		}
 		m.closeQueuedWriteStore()
 		if m.storeDB != nil {
+			if m.tokenReadDB != nil {
+				if db, err := m.tokenReadDB.DB(); err == nil {
+					_ = db.Close()
+				}
+			}
+			if m.tokenDB != nil && m.tokenDB != m.storeDB {
+				if statements, ok := m.tokenDB.ConnPool.(*gorm.PreparedStmtDB); ok {
+					statements.Close()
+				}
+				if db, err := m.tokenDB.DB(); err == nil {
+					_ = db.Close()
+				}
+			}
 			if db, err := m.storeDB.DB(); err == nil {
 				_ = db.Close()
 			}

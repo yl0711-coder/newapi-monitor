@@ -47,7 +47,7 @@ func (m *Monitor) executeLogChainInvestigation(ctx context.Context, id string, i
 	if m.cfg.CloudWatchNginxEnabled && nginxEvidenceMode(m.cfg.NginxEvidenceMode) != "off" && m.cloudWatchNginxEvidenceRecovery(time.Now()).Incomplete {
 		result.BlindSpots = append(result.BlindSpots, "本地 Nginx 请求证据存在缺口，正在补扫有效保留期；暂时查不到不代表请求未发生。")
 	}
-	parser, err := m.cloudWatchEvidenceParser(in.IncludeSensitiveDiagnostics)
+	parser, err := m.customerDiagnosticEvidenceParser(in.IncludeSensitiveDiagnostics)
 	if err != nil {
 		result.Status = "failed"
 		result.Summary = logChainInvestigationSummary{Classification: "telemetry_unavailable", EvidenceLevel: "unavailable", Conclusion: "证据脱敏配置不可用，已拒绝读取 CloudWatch 日志", CustomerImpact: "unknown"}
@@ -63,12 +63,31 @@ func (m *Monitor) executeLogChainInvestigation(ctx context.Context, id string, i
 	requestIDs := investigationRequestIDs(in.NewAPIRequestID, rows)
 	paths := investigationPaths(in.Path, rows)
 
-	cloudFrontIDs := runner.queryCloudFront(ctx, in, paths)
+	var cloudFrontIDs []string
 
 	if len(requestIDs) > 0 {
+		queriedNginx, queriedNewAPI := false, false
 		for _, requestID := range requestIDs {
-			runner.filter(ctx, cwSourceWorkerNginx, cwFilterWorkerNginxID, requestID, in.From, in.To, "exact", "按 NewAPI Request ID 查询 Nginx 日志；关联等级以逐条核验为准。", nil)
-			runner.filter(ctx, cwSourceWorkerNewAPI, cwFilterWorkerNewAPIID, requestID, in.From, in.To, "exact", "按 NewAPI Request ID 查询应用日志；关联等级以逐条核验为准。", nil)
+			if logChainDiagnosticNeedsSource(rows, requestID, cwSourceWorkerNewAPI) {
+				queriedNewAPI = true
+				runner.filter(ctx, cwSourceWorkerNewAPI, cwFilterWorkerNewAPIID, requestID, in.From, in.To, "exact", "按 NewAPI Request ID 补取错误响应、参数与请求时路由/账号快照；不同重试不混用。", nil)
+			}
+			// Refine before choosing the next source. A generic application
+			// error may become a delivery/timeout diagnosis requiring edge data.
+			partial := logChainInvestigationResult{Requests: rows, Evidence: runner.groupedEvidence(), SourceStatus: runner.orderedStatuses()}
+			m.associateInvestigationEvidence(&partial, in)
+			m.rediagnoseInvestigationRequests(&partial)
+			rows, result.Requests = partial.Requests, partial.Requests
+			if logChainDiagnosticNeedsSource(rows, requestID, cwSourceWorkerNginx) {
+				queriedNginx = true
+				runner.filter(ctx, cwSourceWorkerNginx, cwFilterWorkerNginxID, requestID, in.From, in.To, "exact", "按 NewAPI Request ID 补取入口路径、整包长度与分层耗时；关联等级以逐条核验为准。", nil)
+			}
+		}
+		if !queriedNginx {
+			runner.skip(cwSourceWorkerNginx, "skipped", "当前诊断缺项不在入口层，本次未追加 Nginx 查询。")
+		}
+		if !queriedNewAPI {
+			runner.skip(cwSourceWorkerNewAPI, "skipped", "当前诊断所需应用字段已记录，本次未重复查询。")
 		}
 	} else {
 		if len(paths) > 0 {
@@ -94,6 +113,9 @@ func (m *Monitor) executeLogChainInvestigation(ctx context.Context, id string, i
 		}
 	}
 
+	// Spend the existing task budget on exact request gaps before optional CDN
+	// correlation. This does not add per-page lookups or a second scheduler.
+	cloudFrontIDs = runner.queryCloudFront(ctx, in, paths)
 	runner.queryCloudFrontDiagnostic(ctx, in, cloudFrontIDs)
 
 	allEvidence := runner.allEvidence()
@@ -117,6 +139,8 @@ func (m *Monitor) executeLogChainInvestigation(ctx context.Context, id string, i
 	result.associationEdgesComplete = runner.cloudFrontCandidateSetQueried
 	m.loadInvestigationAssociationCandidates(ctx, &result, in)
 	m.associateInvestigationEvidence(&result, in)
+	m.rediagnoseInvestigationRequests(&result)
+	rows = result.Requests
 	result.Timeline = m.investigationTimeline(rows, result.Evidence, result.SourceStatus, in)
 	result.Summary = summarizeInvestigation(rows, flattenInvestigationEvidence(result.Evidence), in)
 	result.Cost = logChainInvestigationCost{Queries: runner.queries, BytesScanned: runner.bytes}
@@ -140,7 +164,7 @@ func (m *Monitor) recheckPendingCloudFront(ctx context.Context, task *logChainIn
 	result := *current.Result
 	m.investigationMu.Unlock()
 
-	parser, err := m.cloudWatchEvidenceParser(task.Input.IncludeSensitiveDiagnostics)
+	parser, err := m.customerDiagnosticEvidenceParser(task.Input.IncludeSensitiveDiagnostics)
 	if err != nil {
 		result.Status = "partial"
 		result.BlindSpots = append(append([]string(nil), result.BlindSpots...), "CloudFront 延迟复查因脱敏配置不可用而失败。")
@@ -165,6 +189,7 @@ func (m *Monitor) recheckPendingCloudFront(ctx context.Context, task *logChainIn
 	result.associationEdgesComplete = runner.cloudFrontCandidateSetQueried
 	m.loadInvestigationAssociationCandidates(ctx, &result, task.Input)
 	m.associateInvestigationEvidence(&result, task.Input)
+	m.rediagnoseInvestigationRequests(&result)
 	result.Timeline = m.investigationTimeline(result.Requests, result.Evidence, result.SourceStatus, task.Input)
 	result.Summary = summarizeInvestigation(result.Requests, flattenInvestigationEvidence(result.Evidence), task.Input)
 	result.Cost.Queries += runner.queries
@@ -640,6 +665,9 @@ func investigationTimelineNode(kind cloudWatchEvidenceKind) string {
 }
 
 func summarizeInvestigation(rows []LogChainRow, evidence []cloudWatchStructuredEvidence, in logChainInvestigationInput) logChainInvestigationSummary {
+	if summary, ok := logChainDiagnosticInvestigationSummary(rows, evidence, in); ok {
+		return summary
+	}
 	summary := logChainInvestigationSummary{Classification: "inconclusive", EvidenceLevel: "ambiguous", Conclusion: "已有证据不足以确定故障位置，请结合各来源状态与盲区继续排查", CustomerImpact: "unknown"}
 	if in.NewAPIRequestID != "" || in.CloudFrontRequestID != "" {
 		summary.CustomerImpact = "single_request"

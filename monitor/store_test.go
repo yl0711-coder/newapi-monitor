@@ -1,6 +1,33 @@
 package monitor
 
-import "testing"
+import (
+	"database/sql"
+	"testing"
+
+	"gorm.io/gorm"
+)
+
+// Close before testing removes the directory. Unlinked open SQLite WALs still
+// consume tmpfs space until the process exits, which broke the full suite.
+// Capture only the fixture's pools; later installed production sentinels belong
+// to their own tests and must not be closed via Monitor.Close here.
+func cleanupLocalTestStore(t *testing.T, m *Monitor) {
+	t.Helper()
+	seen := map[*sql.DB]bool{}
+	for _, store := range []*gorm.DB{m.storeDB, m.usageFactsDB} {
+		if store == nil {
+			continue
+		}
+		pool, err := store.DB()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !seen[pool] {
+			seen[pool] = true
+			t.Cleanup(func() { _ = pool.Close() })
+		}
+	}
+}
 
 // store_test.go:存储/聚合层集成测试。用临时 SQLite 塞入已知采样,验证从"采样行 → 看板数字"
 // 这条聚合链路(三态、成功率、成本、错误分类、维度排序、趋势、UPSERT 幂等)算得对。

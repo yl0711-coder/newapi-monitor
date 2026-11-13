@@ -57,6 +57,10 @@ func (m *Monitor) alertsCoverage(scope stabilityScope, now time.Time) AlertsCove
 	}
 	if m == nil || !m.cfg.CloudWatchPreRouteEnabled || m.storeDB == nil || !cloudWatchPreRouteCoverageTableAvailable(m.storeDB) {
 		coverage.Source = "collector"
+		// Raw error-signature collection does not produce rejection_samples.
+		// Legacy rejection collectors provide no durable contiguous range proof;
+		// neither their last row nor another source's cursor can certify it.
+		coverage.Note = alertsIncompleteCoverageNote + " 前置拒绝来源没有可用的连续覆盖证明，实际水位与延迟未知。"
 		if m != nil && m.cfg.CloudWatchPreRouteEnabled {
 			coverage.Note = alertsIncompleteCoverageNote + " CloudWatch 前置拒绝采集水位尚未就绪。"
 		}
@@ -203,10 +207,17 @@ type AlertRejectStats struct {
 
 // AlertsResponse 是问题预警接口的返回。
 type AlertsResponse struct {
-	Enabled bool   `json:"enabled"`
-	From    string `json:"from"`
-	To      string `json:"to"`
-	Total   int64  `json:"total"`
+	Enabled bool `json:"enabled"`
+	// GeneratedAt is the instant at which this local fact snapshot was read.
+	// Through/Target below describe the independently proven collection waterline;
+	// clients must not infer freshness from the HTTP response time alone.
+	GeneratedAt     int64         `json:"generated_at"`
+	Timing          *ReportTiming `json:"timing,omitempty"`
+	LagSeconds      *int64        `json:"lag_seconds"`
+	ActualThroughTs *int64        `json:"actual_through_ts"`
+	From            string        `json:"from"`
+	To              string        `json:"to"`
+	Total           int64         `json:"total"`
 	// Total is a partial/local count when CoverageComplete is false.  Clients
 	// must not present it as the final number until the watermark catches up.
 	CoverageComplete bool `json:"coverage_complete"`
@@ -253,7 +264,7 @@ func (m *Monitor) getRejectAlertsHandler(c *gin.Context) {
 
 func (m *Monitor) getRejectAlertsAt(c *gin.Context, now time.Time) {
 	if !m.cfg.StabilityEnabled {
-		c.JSON(200, AlertsResponse{Enabled: false})
+		c.JSON(200, AlertsResponse{Enabled: false, GeneratedAt: now.Unix()})
 		return
 	}
 	if m.storeDB == nil {
@@ -303,7 +314,7 @@ func (m *Monitor) getRejectAlertsAt(c *gin.Context, now time.Time) {
 	// A pinned historical snapshot can be shorter than its requested day even
 	// after that day has fully caught up. That is not an actively syncing tail.
 	tailSyncing := windowRestricted && requested.ToTs > min(coverage.Through, coverage.Target)
-	collectionFailed := (!coverage.Complete || tailSyncing) &&
+	collectionFailed := m.cfg.CloudWatchPreRouteEnabled &&
 		m.cloudWatchPreRouteLastFailure.Load() > m.cloudWatchPreRouteLastSuccess.Load()
 	reasons, err := m.queryRejectReasonOptions(scope, filter)
 	if err != nil {
@@ -312,6 +323,7 @@ func (m *Monitor) getRejectAlertsAt(c *gin.Context, now time.Time) {
 	}
 	resp := AlertsResponse{
 		Enabled:                   true,
+		GeneratedAt:               now.Unix(),
 		Total:                     stats.Total,
 		CoverageComplete:          coverage.Complete && !windowRestricted,
 		StatisticsComplete:        coverage.Complete,
@@ -338,6 +350,16 @@ func (m *Monitor) getRejectAlertsAt(c *gin.Context, now time.Time) {
 		UnknownTokenQuotaCount:    stats.UnknownTokenQuotaCount,
 		UnknownQuotaAccountCount:  stats.UnknownQuotaAccountCount,
 		UnknownCustomerOtherCount: stats.UnknownCustomerOtherCount,
+	}
+	if coverage.Source == "cloudwatch" {
+		timing := m.rejectionReportTiming()
+		resp.Timing = &timing
+	}
+	if coverage.Through > 0 && coverage.Target > 0 {
+		lag := max(int64(0), coverage.Target-coverage.Through)
+		resp.LagSeconds = &lag
+		through := min(coverage.Through, scope.ToTs)
+		resp.ActualThroughTs = &through
 	}
 	if scope.ToTs%60 == 0 && scope.ToTs <= m.alertsTrustedThrough(requested, now) {
 		resp.CutoffTs = scope.ToTs

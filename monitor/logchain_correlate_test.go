@@ -156,7 +156,7 @@ func TestCorrelateFallbackUniqueIsProbableNotExact(t *testing.T) {
 	if mt.Confidence != correlateProbable {
 		t.Errorf("唯一命中应为 probable: got=%s why=%s", mt.Confidence, mt.Why)
 	}
-	if !strings.Contains(mt.Why, "非精确") {
+	if !strings.Contains(mt.Why, "精确请求证据未找到") || !strings.Contains(mt.Why, "不参与本请求诊断") {
 		t.Errorf("依据必须说明这不是精确匹配: %s", mt.Why)
 	}
 }
