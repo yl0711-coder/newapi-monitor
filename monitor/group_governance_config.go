@@ -30,16 +30,19 @@ func (m *Monitor) syncGroupGovernanceConfigOnly(parent context.Context) (result 
 	if m.prodDB == nil {
 		return errSourceNotReady
 	}
-	ctx, cancel := context.WithTimeout(parent, groupGovernanceQueryTimeout)
+	ctx, cancel := context.WithTimeout(parent, groupGovernanceQueueWait+groupGovernanceQueryTimeout)
 	defer cancel()
 	if err := m.requireGroupGovernanceChannels(ctx); err != nil {
 		return err
 	}
 	timing.enter("queue")
-	release, err := m.acquireBackgroundSourceLow(ctx)
+	release, err := m.acquireGroupGovernanceSource(ctx)
 	if err != nil {
 		return err
 	}
+	queryCtx, cancelQuery := context.WithTimeout(ctx, groupGovernanceQueryTimeout)
+	defer cancelQuery()
+	ctx = queryCtx
 	timing.enter("source")
 	options, err := m.fetchGroupGovernanceOptions(ctx)
 	release()

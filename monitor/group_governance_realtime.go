@@ -204,7 +204,11 @@ func (m *Monitor) loadGroupGovernanceRealtime(ctx context.Context) (*ggRealtimeR
 
 func (m *Monitor) applyGroupGovernanceConfig(report *ggRealtimeReport, snapshot GroupGovernanceState, now time.Time) {
 	report.ConfigAt = snapshot.LastSuccessAt
-	configStale := snapshot.LastSuccessAt == 0 || snapshot.LastError != "" || now.Unix()-snapshot.LastSuccessAt > int64(groupGovernanceInterval(m.cfg.GroupGovernanceSyncMinutes).Seconds()*2)
+	// A failed attempt keeps the previous snapshot (only a success replaces it),
+	// so the snapshot's age alone decides staleness. Treating any failed attempt
+	// as stale paused advice for minutes after a single queue timeout although
+	// the configuration was minutes old.
+	configStale := snapshot.LastSuccessAt == 0 || now.Unix()-snapshot.LastSuccessAt > int64(groupGovernanceInterval(m.cfg.GroupGovernanceSyncMinutes).Seconds()*2)
 	report.ChannelMaxAge = int64(m.groupGovernanceChannelMaxAge().Seconds())
 	report.ConfigReady = !configStale && m.groupGovernanceChannelCurrent(report.ChannelConfigAt, now)
 	if !report.ConfigReady {

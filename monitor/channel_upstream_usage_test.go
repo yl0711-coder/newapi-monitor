@@ -2308,3 +2308,53 @@ func TestFetchNewAPIUsageWindowRejectsSameTotalHeadMutation(t *testing.T) {
 		t.Fatalf("same-total head mutation should fail closed, err=%v", err)
 	}
 }
+
+// A NewAPI live watermark that fell behind midnight resumes from its own hour.
+// Starting at today left the rest of the earlier day unread for good, because
+// history had already finished (funnycode.cc 11-12 03:00-24:00).
+func TestPlanNewAPITailResumesStaleWatermarkAcrossMidnight(t *testing.T) {
+	now := time.Date(2026, 11, 13, 10, 0, 0, 0, cstLocation).Unix()
+	today := cstDayStart(now)
+	row := ChannelUpstreamAccount{Provider: upstreamProviderNewAPI, UsageDataUntil: today - 20*3600 + 1320, UsageBackfillDone: true}
+	plan := planUpstreamUsageSync(row, now, 30)
+	if want := today - 20*3600; plan.tailFrom != want || plan.tailTo != now {
+		t.Fatalf("stale watermark tail [%d,%d), want [%d,%d)", plan.tailFrom, plan.tailTo, want, now)
+	}
+	if !newAPITailNeedsIncrementalSync(row, now) {
+		t.Fatal("a stale watermark must use the hourly incremental path")
+	}
+	row.UsageDataUntil = today - newAPITailStaleCatchUpSeconds - 3600
+	if plan := planUpstreamUsageSync(row, now, 30); plan.tailFrom != today {
+		t.Fatalf("a watermark older than the catch-up limit starts at today, got %d", plan.tailFrom)
+	}
+	row.Provider, row.UsageDataUntil = upstreamProviderSub2API, today-3600
+	if plan := planUpstreamUsageSync(row, now, 30); plan.tailFrom != today {
+		t.Fatalf("other providers keep their day-based tail, got %d", plan.tailFrom)
+	}
+}
+
+func TestUpstreamGuardSendBudget(t *testing.T) {
+	for _, c := range []struct{ timeout, want time.Duration }{
+		{45 * time.Second, 15 * time.Second}, {20 * time.Second, 10 * time.Second}, {6 * time.Second, upstreamGuardMinSendBudget},
+	} {
+		if got := upstreamGuardSendBudget(c.timeout); got != c.want {
+			t.Fatalf("send budget for %s = %s, want %s", c.timeout, got, c.want)
+		}
+	}
+}
+
+// On error the watermark moves only to hours a run reports as saved (the
+// hourly path); a failed single-window read or a failed save reports none.
+func TestApplyUpstreamUsageResultKeepsOnlySavedProgressOnError(t *testing.T) {
+	s := Settings{}
+	now := time.Date(2026, 11, 13, 10, 0, 0, 0, cstLocation).Unix()
+	row := ChannelUpstreamAccount{Provider: upstreamProviderNewAPI, UsageDataUntil: now - 5*3600}
+	applyUpstreamUsageResult(&row, upstreamUsageResult{}, errors.New("database is locked"), now, s)
+	if row.UsageDataUntil != now-5*3600 {
+		t.Fatalf("nothing saved: watermark moved to %d", row.UsageDataUntil)
+	}
+	applyUpstreamUsageResult(&row, upstreamUsageResult{DataUntil: now - 3*3600}, &upstreamHTTPError{Status: http.StatusTooManyRequests}, now, s)
+	if row.UsageDataUntil != now-3*3600 || row.UsageStatus != upstreamStatusError {
+		t.Fatalf("saved hours must keep the watermark while the error is recorded: until=%d status=%s", row.UsageDataUntil, row.UsageStatus)
+	}
+}

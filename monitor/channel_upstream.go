@@ -1806,7 +1806,9 @@ func (m *Monitor) channelUpstreamUsageHTTPClient() *http.Client {
 // 2026-11). With the shorter request timeout a slow page fails on its own
 // clock while the lane still has budget, and the adaptive split can run.
 // 35 s plus the guard's 5 s minimum send budget still ends before the 45 s
-// lane deadline, while leaving healthy 30-35 s pages unsplit.
+// lane deadline, while leaving healthy 30-35 s pages unsplit. When queueing
+// consumed most of the lane, the guard requires up to 15 s instead and yields
+// below it (upstreamGuardSendBudget), which only ends a round earlier.
 var upstreamUsageHistoryRequestTimeout = 35 * time.Second
 
 // channelUpstreamUsageHistoryHTTPClient is the usage client for the history
