@@ -28,7 +28,7 @@ type upstreamDiagnosticReport struct {
 func diagnosticGuide(provider string) []string {
 	switch provider {
 	case upstreamProviderOrion:
-		return []string{"类型选择 Orion；站点地址填上游控制台根地址（例如 https://modelrouter.best）。", "登录上游控制台 → 管理密钥（Management keys）→ 新建，复制 smk_ 开头的密钥（只显示一次）到账户配置，不要发送到聊天。不是模型调用 Key。", "余额取账户余额；消费按每条已应答请求的计费金额（cost_billed）按小时汇总。管理密钥不会过期或轮换；被撤销后需重新导入。"}
+		return []string{"类型选择 Orion；站点地址填上游控制台根地址（例如 https://modelrouter.best）。", "菜单里有“管理密钥”（管理员或持有人）时，新建并复制 smk_ 开头的密钥（只显示一次）；普通用户没有该菜单，改为登录控制台后在浏览器开发者工具 → Application → Local storage 复制 session.token 的值。填入账户配置，不要发送到聊天。都不是模型调用 Key。", "余额取账户余额；消费按每条已应答请求的计费金额（cost_billed）按小时汇总。管理密钥不会过期；登录令牌会过期，失效或在该浏览器退出登录后需重新导入。"}
 	case upstreamProviderVolcengine:
 		return []string{"类型选择 火山引擎（方舟）；站点地址填渠道实际调用地址（例如 https://ark.cn-beijing.volces.com）。", "在火山引擎控制台 → 访问控制 → 用户，新建子用户，只授予费用中心只读权限（如 BillingCenterReadOnlyAccess），为其创建 AccessKey；把 AccessKey ID 和 Secret Access Key 填入账户配置，不要使用主账号密钥，也不要发送到聊天。", "余额为账户可用余额；消费为账单明细的应付金额（人民币），只有按天汇总，最近一天待结算；火山不提供逐笔请求明细。"}
 	case upstreamProviderOpenOx:

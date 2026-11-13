@@ -39,6 +39,9 @@ const (
 	// Re-read a short overlap on every tail pass so delayed log commits are
 	// corrected without re-reading the whole open day every 30 minutes.
 	upstreamUsageTailOverlap = 3 * time.Hour
+	// A NewAPI live watermark that fell behind midnight resumes from itself, up
+	// to this far back; older gaps are left to history or a manual repair.
+	newAPITailStaleCatchUpSeconds = 7 * 86400
 	// AICodeWith 的按 Key 账单接口最多接受 31 个中国自然日。
 	// 历史每轮一次请求批量补齐，避免把按天聚合接口退化为逐日请求。
 	aiCodeWithUsageMaxDays = 31
@@ -595,13 +598,26 @@ func fetchTokenForceUsageWindow(ctx context.Context, client *http.Client, row Ch
 		items = mergeTokenForceUsageItems(items, finishedLate)
 	}
 	// A request listed here that started before `from` belongs to an earlier
-	// hour, which may already have been stored without it. Widen to that hour,
-	// reading only the missing slice [widened, from), so the hour is replaced
-	// complete; every request stays counted once (merged by requestId).
+	// hour, which may already have been stored without it (for example the
+	// live tail, which reads no late slice, or a request listed after the
+	// earlier window's late slice). Widen to that hour, reading only the
+	// missing slice [widened, from), so the hour is replaced complete; every
+	// request stays counted once (merged by requestId).
+	//
+	// The first widening considers every early row. Rows that the widened slice
+	// itself lists as starting at most tokenForceLateFinishSeconds before the
+	// widened boundary are left to that earlier hour: on a busy account almost
+	// every hour has one, and widening for each chained back hour by hour until
+	// the expansion limit failed history for good (hainahn.com, 2026-11-09).
+	// Only a longer call keeps widening.
 	for expansions := 0; ; expansions++ {
+		threshold := from
+		if expansions > 0 {
+			threshold = from - tokenForceLateFinishSeconds
+		}
 		earliest := from
 		for _, item := range items {
-			if item.RequestAt < earliest {
+			if item.RequestAt < threshold && item.RequestAt < earliest {
 				earliest = item.RequestAt
 			}
 		}
@@ -629,6 +645,11 @@ func fetchTokenForceUsageWindow(ctx context.Context, client *http.Client, row Ch
 	}
 	buckets := make(map[int64]*ChannelUpstreamUsageHour)
 	for _, item := range items {
+		if item.RequestAt < from && item.RequestAt >= from-tokenForceLateFinishSeconds {
+			// Only reachable after a widening: a late finisher of the hour
+			// before the widened boundary, left to that hour (see above).
+			continue
+		}
 		if item.RequestAt < from || item.RequestAt >= to {
 			return upstreamUsageResult{}, fmt.Errorf("TokenForce 使用明细包含查询区间之外的 requestTime（%s 不在 %s ~ %s）",
 				time.Unix(item.RequestAt, 0).In(cstLocation).Format("01-02 15:04:05"),
@@ -1606,6 +1627,18 @@ func (m *Monitor) syncNewAPITailIncremental(ctx context.Context, row ChannelUpst
 			if err != nil {
 				var exhausted *upstreamUsageRunBudgetExhausted
 				if !errors.As(err, &exhausted) {
+					if completedForward && newAPITailYieldsAfterProgress(err) {
+						// Earlier hours of this run are already published. Report
+						// that progress and resume soon from the failed hour; if it
+						// fails again without progress, that run records the error
+						// and backs off. Returning the error here discarded the
+						// progress, so every run re-read the same hours and stalled
+						// on the same slow hour (funnycode.cc, 2026-11-12).
+						return result, true, false, nil
+					}
+					// Auth, rate-limit and circuit errors keep their own status
+					// and backoff; the committed hours still move the watermark
+					// (applyUpstreamUsageResult keeps result.DataUntil on error).
 					return result, false, false, err
 				}
 				if completedForward {
@@ -2792,6 +2825,14 @@ func applyUpstreamUsageResult(row *ChannelUpstreamAccount, result upstreamUsageR
 		return
 	}
 	row.UsageLastAttemptAt = now
+	// Hours an hourly run already published stay published when a later hour
+	// fails or the run is paused; keep the watermark on them so the retry
+	// resumes there instead of re-reading them (funnycode.cc, 2026-11-12).
+	// Results of failed single-window reads carry no DataUntil and leave the
+	// watermark unchanged.
+	if err != nil && result.DataUntil > row.UsageDataUntil {
+		row.UsageDataUntil = result.DataUntil
+	}
 	if next, paused := upstreamPauseRetryAt(err, now); paused {
 		row.UsageNextSyncAt = next
 		return
@@ -2838,8 +2879,18 @@ func planUpstreamUsageSync(row ChannelUpstreamAccount, now int64, backfillDays i
 	tailDue := row.UsageNextSyncAt == 0 || row.UsageNextSyncAt <= now
 	if tailDue {
 		plan.tailFrom, plan.tailTo = today, now
-		if row.Provider != upstreamProviderAICodeWith && row.Provider != upstreamProviderSub2API && row.Provider != upstreamProviderVolcengine && row.UsageDataUntil > today {
-			plan.tailFrom = row.UsageDataUntil - int64(upstreamUsageTailOverlap/time.Second)
+		if row.Provider == upstreamProviderNewAPI && row.UsageDataUntil > 0 && row.UsageDataUntil <= today && today-row.UsageDataUntil <= newAPITailStaleCatchUpSeconds {
+			// The live watermark fell behind midnight. History is already done up
+			// to its own cursor, so starting at today would leave the rest of the
+			// earlier day(s) unread for good. Continue from the watermark hour;
+			// the hourly incremental path moves forward within each run's budget.
+			plan.tailFrom = row.UsageDataUntil - row.UsageDataUntil%3600
+		} else if row.Provider != upstreamProviderAICodeWith && row.Provider != upstreamProviderSub2API && row.Provider != upstreamProviderVolcengine && row.UsageDataUntil > today {
+			overlap := int64(upstreamUsageTailOverlap / time.Second)
+			if row.Provider == upstreamProviderOrion {
+				overlap = orionTailOverlapSeconds
+			}
+			plan.tailFrom = row.UsageDataUntil - overlap
 			if plan.tailFrom < today {
 				plan.tailFrom = today
 			}
@@ -2969,6 +3020,26 @@ func applyUpstreamUsageBackfillYield(row *ChannelUpstreamAccount, progress strin
 
 func legacyNewAPIBackfillBudgetError() string {
 	return (&upstreamUsageRunBudgetExhausted{max: upstreamUsageMaxRequestsPerRun}).Error()
+}
+
+// newAPITailYieldsAfterProgress reports whether a failure after this run
+// already published hours is a quick resume (a transient timeout, network or
+// 5xx error, or a local queue timeout) rather than a failure with its own
+// status and backoff (authentication, rate limit, Retry-After, open circuit).
+func newAPITailYieldsAfterProgress(err error) bool {
+	if err == nil || errors.Is(err, context.Canceled) || upstreamRetryAt(err) > 0 {
+		return false
+	}
+	var authErr *upstreamAuthError
+	var circuit *upstreamCircuitOpenError
+	if errors.As(err, &authErr) || errors.As(err, &circuit) {
+		return false
+	}
+	var statusErr *upstreamHTTPError
+	if errors.As(err, &statusErr) && statusErr.Status == http.StatusTooManyRequests {
+		return false
+	}
+	return isUpstreamUsageTransientFailure(err) || isUpstreamLocalQueueTimeout(err)
 }
 
 func newAPITailNeedsIncrementalSync(row ChannelUpstreamAccount, now int64) bool {
@@ -3200,6 +3271,11 @@ func (m *Monitor) syncStoredUpstreamUsageWithPriority(ctx context.Context, domai
 			}
 		} else {
 			result, err = syncUsage(ctx, plan.tailFrom, plan.tailTo, pacer)
+			if err != nil {
+				// A failed single-window read saved nothing; only the hourly
+				// incremental path reports committed progress with an error.
+				result.DataUntil = 0
+			}
 			if row.Provider == upstreamProviderNewAPI && upstreamUsageRunBudgetWasExhausted(err) {
 				row.UsageTailMode = upstreamUsageTailModeHourly
 			}
@@ -3209,7 +3285,10 @@ func (m *Monitor) syncStoredUpstreamUsageWithPriority(ctx context.Context, domai
 		}
 		operationRetryAt = upstreamRetryAt(err)
 		if err == nil && !tailPersisted {
-			err = m.persistUpstreamUsageWindow(ctx, row.Domain, plan.tailFrom, plan.tailTo, result.Hours, now)
+			if err = m.persistUpstreamUsageWindow(ctx, row.Domain, plan.tailFrom, plan.tailTo, result.Hours, now); err != nil {
+				// Nothing of this window was saved: the watermark must not move.
+				result.DataUntil = 0
+			}
 		}
 		if errors.Is(err, context.Canceled) {
 			return row, err

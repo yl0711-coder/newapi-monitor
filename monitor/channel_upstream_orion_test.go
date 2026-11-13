@@ -24,7 +24,8 @@ func orionFixtureServer(t *testing.T, me string, pages map[string]map[string]any
 		case "/api/v1/console/me/requests":
 			q := r.URL.Query()
 			*calls = append(*calls, q.Get("cursor"))
-			if q.Get("limit") != "200" || q.Get("outcome") != "answered" || q.Get("from") == "" || q.Get("to") == "" {
+			// Mirror the live panel: limit at most 100, no parameters it never sends.
+			if q.Get("limit") != "100" || q.Has("outcome") || len(q) > 4 || q.Get("from") == "" || q.Get("to") == "" {
 				t.Errorf("bad request query %s", r.URL.RawQuery)
 			}
 			page, ok := pages[q.Get("cursor")]
@@ -196,5 +197,92 @@ func TestOrionForbiddenIsNotAuthFailure(t *testing.T) {
 	var httpErr *upstreamHTTPError
 	if err == nil || errors.As(err, &authErr) || !errors.As(err, &httpErr) || httpErr.Status != http.StatusForbidden {
 		t.Fatalf("403 must stay an HTTP 403, got %v", err)
+	}
+}
+
+// The panel answers a bad query with HTTP 400 and a JSON reason. Keep a short
+// message for status, never the key, and keep 400 out of auth isolation.
+func TestOrionRejectedQueryKeepsSafeMessage(t *testing.T) {
+	cases := map[string]string{
+		`{"status":400,"reason":"INVALID_ARGUMENT","message":"limit must be between 1 and 100"}`: "limit must be between 1 and 100",
+		`{"status":400,"reason":"INVALID_ARGUMENT","message":"bad token smk_fixture"}`:           "",
+	}
+	for body, want := range cases {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(body))
+		}))
+		row := ChannelUpstreamAccount{Domain: "modelrouter.best", BaseURL: server.URL, Provider: upstreamProviderOrion}
+		from := time.Date(2026, 11, 9, 8, 0, 0, 0, time.UTC).Unix()
+		_, err := fetchOrionUsageWindow(context.Background(), server.Client(), row, orionCredential{AccessToken: "smk_fixture"}, from, from+3600, newUpstreamUsageRequestPacer(10, 0))
+		server.Close()
+		var httpErr *upstreamHTTPError
+		var authErr *upstreamAuthError
+		if !errors.As(err, &httpErr) || httpErr.Status != http.StatusBadRequest || errors.As(err, &authErr) {
+			t.Fatalf("%s: want a plain 400, got %v", body, err)
+		}
+		if httpErr.Message != want || strings.Contains(err.Error(), "smk_") {
+			t.Fatalf("%s: message %q, want %q", body, httpErr.Message, want)
+		}
+	}
+}
+
+// A failed, unbilled row is not usage; a billed row counts whatever its status.
+func TestOrionUsageSkipsUnbilledFailedRequests(t *testing.T) {
+	from := time.Date(2026, 11, 9, 8, 0, 0, 0, time.UTC)
+	failed := orionItem("r2", from.Add(2*time.Minute), 0, 0, 0)
+	failed["status"] = 502
+	billedFailed := orionItem("r3", from.Add(3*time.Minute), 0.5, 1, 1)
+	billedFailed["status"] = 499
+	pages := map[string]map[string]any{"": {"items": []any{orionItem("r1", from.Add(time.Minute), 1, 1, 1), failed, billedFailed}}}
+	var calls []string
+	server := orionFixtureServer(t, `{}`, pages, &calls)
+	defer server.Close()
+	row := ChannelUpstreamAccount{Domain: "modelrouter.best", BaseURL: server.URL, Provider: upstreamProviderOrion}
+	result, err := fetchOrionUsageWindow(context.Background(), server.Client(), row, orionCredential{AccessToken: "smk_fixture"}, from.Unix(), from.Add(time.Hour).Unix(), newUpstreamUsageRequestPacer(10, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if h := result.Hours[0]; h.Requests != 2 || h.CostUSD != 1.5 {
+		t.Fatalf("hour = %+v", h)
+	}
+}
+
+// Orion re-reads one closed hour, not the generic three, and a caught-up tail
+// at peak volume stays within one run's page budget.
+func TestOrionTailOverlapIsOneHour(t *testing.T) {
+	now := time.Date(2026, 11, 9, 20, 30, 0, 0, cstLocation).Unix()
+	row := ChannelUpstreamAccount{Provider: upstreamProviderOrion, UsageDataUntil: now - 600}
+	plan := planUpstreamUsageSync(row, now, 30)
+	wantFrom := row.UsageDataUntil - orionTailOverlapSeconds
+	wantFrom -= wantFrom % 3600
+	if plan.tailFrom != wantFrom || plan.tailTo != now {
+		t.Fatalf("tail [%d,%d), want [%d,%d)", plan.tailFrom, plan.tailTo, wantFrom, now)
+	}
+	const peakRequestsPerHour = 1600
+	if pages := (orionTailMaxSeconds / 3600) * peakRequestsPerHour / orionPageSize; pages > orionMaxPages {
+		t.Fatalf("a full tail window needs %d pages at peak, budget %d", pages, orionMaxPages)
+	}
+	newAPI := row
+	newAPI.Provider = upstreamProviderNewAPI
+	if generic := planUpstreamUsageSync(newAPI, now, 30); generic.tailFrom >= plan.tailFrom {
+		t.Fatalf("other providers keep the three-hour overlap: %d vs %d", generic.tailFrom, plan.tailFrom)
+	}
+}
+
+// The panel's times are UTC; accept them with or without an explicit offset.
+func TestParseOrionTimeAcceptsUTCWithOrWithoutZone(t *testing.T) {
+	want := time.Date(2026, 11, 13, 9, 59, 49, 744208000, time.UTC)
+	for _, raw := range []string{"2026-11-13T09:59:49.744208Z", "2026-11-13T09:59:49.744208+00:00", "2026-11-13T17:59:49.744208+08:00", "2026-11-13T09:59:49.744208"} {
+		got, err := parseOrionTime(raw)
+		if err != nil || !got.Equal(want) {
+			t.Fatalf("%s: got %v err %v", raw, got, err)
+		}
+	}
+	for _, bad := range []string{"", "11/13/2026 09:59", "2026-11-13 09:59:49"} {
+		if _, err := parseOrionTime(bad); err == nil {
+			t.Fatalf("%q must be rejected", bad)
+		}
 	}
 }

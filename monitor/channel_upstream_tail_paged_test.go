@@ -2,6 +2,8 @@ package monitor
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -342,5 +344,76 @@ func TestNewAPITailSlowDenseWithoutProgressIsReported(t *testing.T) {
 	var published int64
 	if err := m.storeDB.Model(&ChannelUpstreamUsageHour{}).Where("domain = ?", row.Domain).Count(&published).Error; err != nil || published != 0 {
 		t.Fatalf("partial hour became public: rows=%d err=%v", published, err)
+	}
+}
+
+// funnycode.cc, 2026-11-12: a run published the first hours, then one later
+// hour timed out. Returning that error discarded the progress, so every run
+// re-read the same hours and stalled on the same slow hour for 36 hours. The
+// committed hours now move the watermark and the run resumes from the failed
+// hour; a retry that makes no progress still reports the failure.
+func TestNewAPITailKeepsCommittedHoursWhenLaterHourFails(t *testing.T) {
+	from := time.Date(2026, 11, 12, 1, 0, 0, 0, cstLocation).Unix()
+	now := from + 2*3600 + 300
+	backend, _ := newUpstreamUsageFixtureServer(t, usageFixtureRows(20, from, 3*3600), nil)
+	front := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start, _ := strconv.ParseInt(r.URL.Query().Get("start_timestamp"), 10, 64)
+		if start >= from+3600 && start < from+2*3600 {
+			http.Error(w, "upstream timeout", http.StatusGatewayTimeout)
+			return
+		}
+		req, _ := http.NewRequestWithContext(r.Context(), http.MethodGet, backend.URL+r.URL.RequestURI(), nil)
+		req.Header = r.Header.Clone()
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		defer resp.Body.Close()
+		w.WriteHeader(resp.StatusCode)
+		_, _ = io.Copy(w, resp.Body)
+	}))
+	t.Cleanup(front.Close)
+	m := newChannelUpstreamTestMonitor(t)
+	row := ChannelUpstreamAccount{
+		Domain: front.Listener.Addr().String(), Provider: upstreamProviderNewAPI,
+		BaseURL: front.URL, UserID: 31, BalanceUnit: 500000, UsageDataUntil: from,
+		UsageTailMode: upstreamUsageTailModeHourly,
+	}
+	cred := newAPICredential{AccessToken: "usage-token"}
+	// The repeated 504s open the host circuit, so this run reports that error
+	// (its cooldown must be respected) together with the committed hour.
+	result, yielded, _, err := m.syncNewAPITailIncremental(context.Background(), row, cred, from, now, now, newUpstreamUsageRequestPacer(upstreamUsageMaxRequestsPerRun, 0))
+	if result.DataUntil != from+3600 || yielded || err == nil {
+		t.Fatalf("committed hour with a circuit error: yielded=%v until=%d err=%v", yielded, result.DataUntil, err)
+	}
+	applyUpstreamUsageResult(&row, result, err, now, m.cfg)
+	// An open circuit pauses the account until its cooldown (status is kept).
+	if row.UsageDataUntil != from+3600 || row.UsageNextSyncAt <= now {
+		t.Fatalf("watermark must keep the committed hour while the circuit cools down: until=%d next=%d", row.UsageDataUntil, row.UsageNextSyncAt)
+	}
+}
+
+// Only transient failures after progress are a quick resume; errors with
+// their own status or cooldown keep it.
+func TestNewAPITailYieldsAfterProgressOnlyForTransientFailures(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"deadline", fmt.Errorf("连接上游失败: %w", context.DeadlineExceeded), true},
+		{"5xx", &upstreamHTTPError{Status: http.StatusBadGateway}, true},
+		{"local queue", &upstreamLocalQueueError{err: context.DeadlineExceeded}, true},
+		{"429", &upstreamHTTPError{Status: http.StatusTooManyRequests}, false},
+		{"retry-after", &upstreamHTTPError{Status: http.StatusServiceUnavailable, RetryAt: time.Now().Add(time.Minute).Unix()}, false},
+		{"auth", &upstreamAuthError{err: errors.New("401")}, false},
+		{"circuit", &upstreamCircuitOpenError{RetryAt: time.Now().Add(time.Minute).Unix()}, false},
+		{"canceled", context.Canceled, false},
+		{"format", errors.New("NewAPI 使用日志缺少有效 total"), false},
+	} {
+		if got := newAPITailYieldsAfterProgress(c.err); got != c.want {
+			t.Fatalf("%s: yield=%v want %v", c.name, got, c.want)
+		}
 	}
 }

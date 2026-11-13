@@ -274,7 +274,9 @@ func TestGGComparisonsSmallPopulationAndLongTail(t *testing.T) {
 		vs = append(vs, &ms[i])
 	}
 	ggCompare(vs, p)
-	if *ms[4].Comparison.P90 != 2800 || ms[4].Comparison.Count != 5 {
+	// R-7 interpolation in floating point: arm64 fuses the multiply-add and
+	// yields 2800.0000000000005, so compare with a tolerance.
+	if math.Abs(*ms[4].Comparison.P90-2800) > 1e-6 || ms[4].Comparison.Count != 5 {
 		t.Fatal(ms[4].Comparison)
 	}
 	ms[4].FRT.P50Ms = ggFloat(1000)
@@ -655,5 +657,24 @@ func TestGGCorrelatedFailureAndRetiredPrimary(t *testing.T) {
 	ggPlanActions(&r, g, p)
 	if r.PauseCount != 0 || r.IncreaseCount != 1 {
 		t.Fatal("retired primary backup need missing", r.Actions)
+	}
+}
+
+// A failed attempt keeps the previous snapshot, so advice continues while
+// that snapshot is recent; only age makes it stale (2026-11-13 queue timeouts
+// paused advice for minutes although the configuration was minutes old).
+func TestGGConfigStaysReadyAfterFailedAttemptWhileSnapshotRecent(t *testing.T) {
+	m := newChannelUpstreamTestMonitor(t)
+	m.cfg.GroupGovernanceSyncMinutes = 30
+	now := time.Now()
+	report := &ggRealtimeReport{Status: "ready", ChannelConfigAt: now.Unix() - 10}
+	m.applyGroupGovernanceConfig(report, GroupGovernanceState{LastSuccessAt: now.Unix() - 600, LastError: "后台同步超时，已保留上次快照"}, now)
+	if !report.ConfigReady || report.Status != "ready" {
+		t.Fatalf("recent snapshot after one failed attempt must stay ready: %+v", report)
+	}
+	old := &ggRealtimeReport{Status: "ready", ChannelConfigAt: now.Unix() - 10}
+	m.applyGroupGovernanceConfig(old, GroupGovernanceState{LastSuccessAt: now.Unix() - 2*30*60 - 1}, now)
+	if old.ConfigReady || old.Status != "pending" {
+		t.Fatalf("a snapshot older than two intervals is stale: %+v", old)
 	}
 }

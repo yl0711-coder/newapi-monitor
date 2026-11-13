@@ -31,10 +31,15 @@ import (
 )
 
 const (
-	groupGovernanceStateID       = 1
-	groupGovernanceMaxGroups     = 2000
-	groupGovernanceMaxUsers      = 200000
-	groupGovernanceQueryTimeout  = 35 * time.Second
+	groupGovernanceStateID      = 1
+	groupGovernanceMaxGroups    = 2000
+	groupGovernanceMaxUsers     = 200000
+	groupGovernanceQueryTimeout = 35 * time.Second
+	// The audit waits in the lowest-priority source lane behind the sampler and
+	// history work. In production that wait alone reached 32-35s and used up the
+	// shared 35s budget, so syncs failed in the queue and realtime advice paused
+	// (2026-11-13). Waiting has its own budget; the query keeps its 35s.
+	groupGovernanceQueueWait     = 90 * time.Second
 	groupGovernanceHistoryDays   = 30
 	groupGovernanceUserPageLimit = 100
 	groupGovernanceMaxRetrySteps = 12 // 2^11 分钟已覆盖最长 24 小时同步周期。
@@ -258,6 +263,14 @@ func groupGovernanceRetryDelay(syncMinutes, failures int) time.Duration {
 	return delay
 }
 
+// acquireGroupGovernanceSource waits for the low-priority source slot within
+// groupGovernanceQueueWait, so a long queue cannot consume the query budget.
+func (m *Monitor) acquireGroupGovernanceSource(ctx context.Context) (func(), error) {
+	waitCtx, cancel := context.WithTimeout(ctx, groupGovernanceQueueWait)
+	defer cancel()
+	return m.acquireBackgroundSourceLow(waitCtx)
+}
+
 func (m *Monitor) syncGroupGovernance(parent context.Context) (result error) {
 	if !m.cfg.GroupGovernanceEnabled {
 		return nil
@@ -271,16 +284,19 @@ func (m *Monitor) syncGroupGovernance(parent context.Context) (result error) {
 	if m.prodDB == nil {
 		return errSourceNotReady
 	}
-	ctx, cancel := context.WithTimeout(parent, groupGovernanceQueryTimeout)
+	ctx, cancel := context.WithTimeout(parent, groupGovernanceQueueWait+groupGovernanceQueryTimeout)
 	defer cancel()
 	if err := m.requireGroupGovernanceChannels(ctx); err != nil {
 		return err
 	}
 	timing.enter("queue")
-	release, err := m.acquireBackgroundSourceLow(ctx)
+	release, err := m.acquireGroupGovernanceSource(ctx)
 	if err != nil {
 		return err
 	}
+	queryCtx, cancelQuery := context.WithTimeout(ctx, groupGovernanceQueryTimeout)
+	defer cancelQuery()
+	ctx = queryCtx
 	released := false
 	defer func() {
 		if !released {

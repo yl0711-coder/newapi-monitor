@@ -481,6 +481,18 @@ const upstreamGuardMaxQueueWait = 3 * time.Minute
 // request with once it may start; less is reported as a local yield.
 const upstreamGuardMinSendBudget = 5 * time.Second
 
+// upstreamGuardSendBudget is the least caller budget worth sending with. A
+// request sent with only a few seconds left after queueing is cut off by the
+// caller and booked as an upstream timeout although the upstream answers in a
+// normal time (funnycode.cc answered in about 4s while runs failed with
+// "context deadline exceeded"). When queueing took longer than the time left,
+// require half the request timeout, at most 15s, at least the old 5s floor;
+// below it the slot is given back as a local yield. A caller whose whole budget
+// is short (it did not lose it to the queue) still sends down to the 5s floor.
+func upstreamGuardSendBudget(requestTimeout time.Duration) time.Duration {
+	return max(upstreamGuardMinSendBudget, min(requestTimeout/2, 15*time.Second))
+}
+
 // upstreamLocalQueueError reports that a request never started because the
 // caller's budget ran out while it waited for a local slot or pacing. It is a
 // local yield: the upstream was not contacted.
@@ -513,6 +525,7 @@ func (t *upstreamGuardTransport) RoundTrip(req *http.Request) (*http.Response, e
 	if req == nil {
 		return nil, errors.New("上游请求无效")
 	}
+	queuedAt := time.Now()
 	hostKey, err := upstreamGuardHostKey(req.URL)
 	if err != nil {
 		return nil, err
@@ -581,7 +594,10 @@ func (t *upstreamGuardTransport) RoundTrip(req *http.Request) (*http.Response, e
 		// request sent now would be cut off by the caller and booked as an
 		// upstream failure; give the slot back instead.
 		if deadline, ok := req.Context().Deadline(); ok {
-			if remaining := time.Until(deadline); remaining < t.requestTimeout && remaining < upstreamGuardMinSendBudget {
+			remaining := time.Until(deadline)
+			waited := time.Since(queuedAt)
+			if remaining < t.requestTimeout && (remaining < upstreamGuardMinSendBudget ||
+				(remaining < upstreamGuardSendBudget(t.requestTimeout) && waited > remaining)) {
 				release()
 				return nil, &upstreamLocalQueueError{err: context.DeadlineExceeded}
 			}
