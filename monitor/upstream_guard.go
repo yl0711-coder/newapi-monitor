@@ -272,6 +272,23 @@ func clampUpstreamGuardJitter(jitter time.Duration) time.Duration {
 	return jitter
 }
 
+// waitForHost waits until this host's own pacing allows a request. Callers
+// hold only the host slot, so no other host is delayed meanwhile.
+func (g *upstreamHostGuard) waitForHost(ctx context.Context, state *upstreamGuardHostState) error {
+	for {
+		now := g.clock.Now()
+		state.mu.Lock()
+		waitUntil := state.nextStart
+		state.mu.Unlock()
+		if !waitUntil.After(now) {
+			return nil
+		}
+		if err := g.clock.Wait(ctx, waitUntil.Sub(now)); err != nil {
+			return err
+		}
+	}
+}
+
 func (g *upstreamHostGuard) waitForStart(ctx context.Context, state *upstreamGuardHostState) error {
 	for {
 		now := g.clock.Now()
@@ -448,6 +465,48 @@ func upstreamRetryAt(err error) int64 {
 type upstreamGuardTransport struct {
 	base  http.RoundTripper
 	guard *upstreamHostGuard
+	// requestTimeout, when set, bounds one request from the moment it holds
+	// its global and host slots and has passed pacing. Time spent queued
+	// behind other upstream requests is local scheduling, so it must neither
+	// consume the upstream's response allowance nor count as an upstream
+	// failure. Clients built with it carry no http.Client.Timeout.
+	requestTimeout time.Duration
+}
+
+// upstreamGuardMaxQueueWait bounds waiting for a slot when the caller's own
+// context has no earlier deadline.
+const upstreamGuardMaxQueueWait = 3 * time.Minute
+
+// upstreamGuardMinSendBudget is the least caller budget worth sending a
+// request with once it may start; less is reported as a local yield.
+const upstreamGuardMinSendBudget = 5 * time.Second
+
+// upstreamLocalQueueError reports that a request never started because the
+// caller's budget ran out while it waited for a local slot or pacing. It is a
+// local yield: the upstream was not contacted.
+type upstreamLocalQueueError struct{ err error }
+
+func (e *upstreamLocalQueueError) Error() string {
+	return "本地排队等待上游请求名额超时，未请求上游: " + e.err.Error()
+}
+func (e *upstreamLocalQueueError) Unwrap() error { return e.err }
+
+func isUpstreamLocalQueueTimeout(err error) bool {
+	var queued *upstreamLocalQueueError
+	return errors.As(err, &queued)
+}
+
+// withUpstreamRequestTimeout returns a client sharing c's guard and
+// connection pool whose timeout starts once the request may be sent.
+func withUpstreamRequestTimeout(c *http.Client, timeout time.Duration) *http.Client {
+	shared, ok := c.Transport.(*upstreamGuardTransport)
+	if !ok || timeout <= 0 {
+		return c
+	}
+	timed := *c
+	timed.Timeout = 0
+	timed.Transport = &upstreamGuardTransport{base: shared.base, guard: shared.guard, requestTimeout: timeout}
+	return &timed
 }
 
 func (t *upstreamGuardTransport) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -459,8 +518,47 @@ func (t *upstreamGuardTransport) RoundTrip(req *http.Request) (*http.Response, e
 		return nil, err
 	}
 	state := t.guard.hostState(hostKey)
-	if err := acquireUpstreamGuard(req.Context(), t.guard.globalSem); err != nil {
+	waitCtx := req.Context()
+	if t.requestTimeout > 0 {
+		var cancelWait context.CancelFunc
+		waitCtx, cancelWait = context.WithTimeout(waitCtx, upstreamGuardMaxQueueWait)
+		defer cancelWait()
+	}
+	queued := func(err error) error {
+		if t.requestTimeout > 0 && !errors.Is(req.Context().Err(), context.Canceled) {
+			return &upstreamLocalQueueError{err: err}
+		}
+		return err
+	}
+	// Take the host slot and wait out that host's own pacing first, then the
+	// global slot. Waiting for one slow-paced host (AICodeWith requires 8 s
+	// between requests) must not hold the process-wide slot and stall every
+	// other upstream meanwhile.
+	if err := acquireUpstreamGuard(waitCtx, state.sem); err != nil {
+		return nil, queued(err)
+	}
+	hostHeld := true
+	releaseHost := func() {
+		if hostHeld {
+			releaseUpstreamGuard(state.sem)
+			hostHeld = false
+		}
+	}
+	if err := t.guard.loadCircuit(req.Context(), state); err != nil {
+		releaseHost()
 		return nil, err
+	}
+	if retryAt := t.guard.circuitRetryAt(state); retryAt > 0 {
+		releaseHost()
+		return nil, &upstreamCircuitOpenError{RetryAt: retryAt}
+	}
+	if err := t.guard.waitForHost(waitCtx, state); err != nil {
+		releaseHost()
+		return nil, queued(err)
+	}
+	if err := acquireUpstreamGuard(waitCtx, t.guard.globalSem); err != nil {
+		releaseHost()
+		return nil, queued(err)
 	}
 	globalHeld := true
 	releaseGlobal := func() {
@@ -469,31 +567,34 @@ func (t *upstreamGuardTransport) RoundTrip(req *http.Request) (*http.Response, e
 			globalHeld = false
 		}
 	}
-	if err := acquireUpstreamGuard(req.Context(), state.sem); err != nil {
-		releaseGlobal()
-		return nil, err
-	}
-	hostHeld := true
 	release := func() {
-		if hostHeld {
-			releaseUpstreamGuard(state.sem)
-			hostHeld = false
-		}
+		releaseHost()
 		releaseGlobal()
 	}
-	if err := t.guard.loadCircuit(req.Context(), state); err != nil {
+	if err := t.guard.waitForStart(waitCtx, state); err != nil {
 		release()
-		return nil, err
+		return nil, queued(err)
 	}
-	if retryAt := t.guard.circuitRetryAt(state); retryAt > 0 {
-		release()
-		return nil, &upstreamCircuitOpenError{RetryAt: retryAt}
+	sent := req
+	if t.requestTimeout > 0 {
+		// Queueing may have consumed nearly all of the caller's budget. A
+		// request sent now would be cut off by the caller and booked as an
+		// upstream failure; give the slot back instead.
+		if deadline, ok := req.Context().Deadline(); ok {
+			if remaining := time.Until(deadline); remaining < t.requestTimeout && remaining < upstreamGuardMinSendBudget {
+				release()
+				return nil, &upstreamLocalQueueError{err: context.DeadlineExceeded}
+			}
+		}
+		requestCtx, cancelRequest := context.WithTimeout(req.Context(), t.requestTimeout)
+		sent = req.WithContext(requestCtx)
+		releaseSlots := release
+		release = func() {
+			releaseSlots()
+			cancelRequest()
+		}
 	}
-	if err := t.guard.waitForStart(req.Context(), state); err != nil {
-		release()
-		return nil, err
-	}
-	response, err := t.base.RoundTrip(req)
+	response, err := t.base.RoundTrip(sent)
 	if err != nil {
 		if response != nil && response.Body != nil {
 			_ = response.Body.Close()

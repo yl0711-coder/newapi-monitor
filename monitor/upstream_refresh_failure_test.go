@@ -42,9 +42,14 @@ func TestUpstreamRefreshFailureClassificationAcrossProviders(t *testing.T) {
 				balance, usage := row, row
 				applyUpstreamSyncResult(&balance, upstreamBalanceResult{}, err, now, Settings{})
 				applyUpstreamUsageResult(&usage, upstreamUsageResult{}, err, now, Settings{})
-				wantIsolated := status == 401 || status == 400 || status == 404
+				// Only a proven credential failure isolates; another 4xx is
+				// rechecked slowly.
+				wantIsolated := status == 401
 				if (balance.NextSyncAt == upstreamAccountIsolatedUntil) != wantIsolated || (usage.UsageNextSyncAt == upstreamAccountIsolatedUntil) != wantIsolated {
 					t.Fatal("temporary refresh error permanently isolated a task")
+				}
+				if (status == 400 || status == 404) && (balance.NextSyncAt < now+int64(upstreamClientErrorRecheck/time.Second) || usage.UsageNextSyncAt < now+int64(upstreamClientErrorRecheck/time.Second)) {
+					t.Fatal("client error must be rechecked slowly")
 				}
 				if status == 429 && (balance.NextSyncAt < now+36000 || usage.UsageNextSyncAt < now+36000) {
 					t.Fatal("Retry-After was lost or shortened")

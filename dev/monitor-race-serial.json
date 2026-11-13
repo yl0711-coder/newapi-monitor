@@ -1,0 +1,10 @@
+{
+ "format_version": 2,
+ "note": "Race tests that assert behaviour bounded by real wall-clock budgets (round, commit and cleanup budgets, latency amortisation, throughput). All Token tests are included. On GitHub runners these thresholds cannot be met under the race detector's slowdown even alone on a runner (20 distinct Token tests failed across four CI runs, most deterministically, and v1.18.44/45 CI failed on them too). So they run natively first (every assertion must pass) and then under race, where only data races, panics and hangs fail the job. Temporary until the tests stop depending on machine speed; see docs/CI-规范.md.",
+ "jobs": 4,
+ "prefixes": [
+  "TestToken"
+ ],
+ "tests": [],
+ "mode": "native-gate-race-advisory"
+}

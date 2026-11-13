@@ -105,7 +105,9 @@ type ChannelUpstreamAccount struct {
 	UsageAdapter string `gorm:"size:32;column:usage_adapter"`
 	// UsageTailMode is a durable scheduling strategy, not provider capability.
 	// Empty keeps the one-window low-request path; "hourly" is learned only
-	// after this account exhausts a bounded NewAPI tail request budget.
+	// after this account exhausts a bounded NewAPI tail request budget; "paged"
+	// after one closed hour needed more pages than a round allows (see
+	// NewAPIUsageTailCheckpoint).
 	UsageTailMode string `gorm:"size:16;column:usage_tail_mode"`
 	// 当天尾部刷新与历史回填分别退避。历史某一天异常不能拖慢当天数据，
 	// 也不能在每次尾部刷新时无节制重试同一个高流量窗口。
@@ -166,6 +168,22 @@ type NewAPIUsageBackfillCheckpoint struct {
 	FirstPageFingerprint string  `gorm:"size:64;column:first_page_fingerprint"`
 	UpdatedAt            int64   `gorm:"column:updated_at;index"`
 }
+
+// NewAPIUsageTailCheckpoint is the live-lane counterpart of
+// NewAPIUsageBackfillCheckpoint. A closed hour of a busy account may need more
+// pages than one bounded tail round allows; its verified page accumulation is
+// kept here (one row per domain, independent of the history lane cursor) and
+// the hour is published only after every page and the first-page probe agree.
+type NewAPIUsageTailCheckpoint struct {
+	NewAPIUsageBackfillCheckpoint
+}
+
+func (NewAPIUsageTailCheckpoint) TableName() string { return newAPIUsageTailCheckpointTable }
+
+const (
+	newAPIUsageBackfillCheckpointTable = "new_api_usage_backfill_checkpoints"
+	newAPIUsageTailCheckpointTable     = "new_api_usage_tail_checkpoints"
+)
 
 // NewAPIUsageBackfillSegment records one fully verified child window of a
 // historical hour. Slow upstreams can time out while evaluating a whole hour;
@@ -254,8 +272,10 @@ type AICodeWithUsageRound struct {
 
 // ChannelUpstreamAccountView 是渠道管理页可见的脱敏状态。
 type ChannelUpstreamAccountView struct {
-	Configured                    bool                              `json:"configured"`
-	Enabled                       bool                              `json:"enabled"`
+	Configured bool `json:"configured"`
+	Enabled    bool `json:"enabled"`
+	// SyncPaused: marked 停止使用 with no enabled channel; automatic sync skips it.
+	SyncPaused                    bool                              `json:"sync_paused,omitempty"`
 	Provider                      string                            `json:"provider,omitempty"`
 	ProviderName                  string                            `json:"provider_name,omitempty"`
 	BaseURL                       string                            `json:"base_url,omitempty"`
@@ -368,13 +388,20 @@ type AICodeWithKeySlotView struct {
 }
 
 type channelUpstreamSaveInput struct {
-	Domain            string                       `json:"domain"`
-	Provider          string                       `json:"provider"`
-	BaseURL           string                       `json:"base_url"`
-	Enabled           *bool                        `json:"enabled"`
-	UserID            int64                        `json:"user_id"`
-	AccessToken       string                       `json:"access_token"`
-	SessionID         string                       `json:"session_id"`
+	Domain   string `json:"domain"`
+	Provider string `json:"provider"`
+	BaseURL  string `json:"base_url"`
+	// CrossDomainBaseURL confirms a console address outside the channel's
+	// registrable domain (a supplier that moved its panel, e.g. a6api.com ->
+	// a6api.vip). Credentials are then sent to that host, so it is explicit.
+	CrossDomainBaseURL bool   `json:"cross_domain_base_url"`
+	Enabled            *bool  `json:"enabled"`
+	UserID             int64  `json:"user_id"`
+	AccessToken        string `json:"access_token"`
+	SessionID          string `json:"session_id"`
+	// ClearSessionID drops a stored renewal session. Leaving session_id empty
+	// otherwise keeps it, which cannot remove a session that no longer applies.
+	ClearSessionID    bool                         `json:"clear_session_id"`
 	APIKey            string                       `json:"api_key"`
 	APIKeys           []string                     `json:"api_keys"`
 	AddAPIKeys        []string                     `json:"add_api_keys"`
@@ -384,6 +411,8 @@ type channelUpstreamSaveInput struct {
 	Email             string                       `json:"email"`
 	Password          string                       `json:"password"`
 	RefreshToken      string                       `json:"refresh_token"`
+	AccessKeyID       string                       `json:"access_key_id"`
+	SecretAccessKey   string                       `json:"secret_access_key"`
 	UnitPerUSD        float64                      `json:"unit_per_usd"`
 	UsageSyncEnabled  *bool                        `json:"usage_sync_enabled"`
 }
@@ -402,6 +431,8 @@ type channelUpstreamConfigView struct {
 	Email            string                     `json:"email,omitempty"`
 	UnitPerUSD       float64                    `json:"unit_per_usd,omitempty"`
 	Account          ChannelUpstreamAccountView `json:"account"`
+	// CrossDomainBaseURL reports a saved console outside the channel domain.
+	CrossDomainBaseURL bool `json:"cross_domain_base_url,omitempty"`
 }
 
 type newAPICredential struct {
@@ -478,6 +509,18 @@ const (
 type upstreamStoredSyncError struct {
 	message string
 	retryAt int64
+	// yield names a local postponement (queueing, local store busy, open
+	// circuit); the stored status and error were deliberately left unchanged.
+	yield string
+}
+
+// storedSyncError wraps a sync outcome for callers, keeping a local
+// postponement recognisable and describing it instead of the stale error.
+func storedSyncError(message string, retryAt int64, err error) *upstreamStoredSyncError {
+	if reason, yielded := upstreamSyncYieldReason(err); yielded {
+		return &upstreamStoredSyncError{message: "同步暂缓：" + reason + "，稍后自动重试", retryAt: retryAt, yield: reason}
+	}
+	return &upstreamStoredSyncError{message: message, retryAt: retryAt}
 }
 
 func (e *upstreamStoredSyncError) Error() string { return e.message }
@@ -499,6 +542,10 @@ func upstreamProviderName(provider string) string {
 		return "AICodeWith（春秋）"
 	case upstreamProviderTokenForce:
 		return "海南海纳（TokenForce MaaS）"
+	case upstreamProviderOrion:
+		return "Orion"
+	case upstreamProviderVolcengine:
+		return "火山引擎（方舟）"
 	default:
 		return provider
 	}
@@ -521,6 +568,10 @@ func upstreamUsageAdapterName(provider, adapter string) string {
 		return "AICodeWith 分页明细小时汇总"
 	case upstreamUsageAdapterTokenForce:
 		return "TokenForce 分页调用明细"
+	case upstreamUsageAdapterOrion:
+		return "Orion 分页请求明细"
+	case upstreamUsageAdapterVolcengine:
+		return "火山引擎按日账单（应付金额）"
 	}
 	switch provider {
 	case upstreamProviderNewAPI:
@@ -531,6 +582,10 @@ func upstreamUsageAdapterName(provider, adapter string) string {
 		return "AICodeWith 按 Key 日账单"
 	case upstreamProviderTokenForce:
 		return "TokenForce 分页调用明细"
+	case upstreamProviderOrion:
+		return "Orion 分页请求明细"
+	case upstreamProviderVolcengine:
+		return "火山引擎按日账单（应付金额）"
 	default:
 		return ""
 	}
@@ -540,7 +595,7 @@ func upstreamUsageGranularity(provider, adapter string) string {
 	if adapter == upstreamUsageAdapterAICodeWithRecord {
 		return "hour"
 	}
-	if provider == upstreamProviderAICodeWith || adapter == upstreamUsageAdapterSub2Stats {
+	if provider == upstreamProviderAICodeWith || adapter == upstreamUsageAdapterSub2Stats || provider == upstreamProviderVolcengine {
 		return "day"
 	}
 	return "hour"
@@ -894,6 +949,18 @@ func applyAICodeWithSlotChanges(existing aiCodeWithCredential, additions []aicod
 
 func upstreamCredentialSecrets(credential any) []string {
 	switch cred := credential.(type) {
+	case orionCredential:
+		return []string{cred.AccessToken}
+	case *orionCredential:
+		if cred != nil {
+			return []string{cred.AccessToken}
+		}
+	case volcengineCredential:
+		return []string{cred.AccessKeyID, cred.SecretAccessKey}
+	case *volcengineCredential:
+		if cred != nil {
+			return []string{cred.AccessKeyID, cred.SecretAccessKey}
+		}
 	case openOxCredential:
 		return []string{cred.AccessToken}
 	case *openOxCredential:
@@ -959,6 +1026,15 @@ func maskUpstreamAccount(provider, account string, userID int64) string {
 		if userID > 0 {
 			return fmt.Sprintf("组织 ID %d", userID)
 		}
+	case upstreamProviderOrion:
+		if userID > 0 {
+			return fmt.Sprintf("用户 ID %d · 管理密钥", userID)
+		}
+	case upstreamProviderVolcengine:
+		if userID > 0 {
+			return fmt.Sprintf("火山账号 ID %d · 费用中心只读 AK", userID)
+		}
+		return "费用中心只读 AK"
 	}
 	return "已配置"
 }
@@ -1106,16 +1182,16 @@ func upstreamAccountView(row ChannelUpstreamAccount) ChannelUpstreamAccountView 
 	}
 	if row.BalanceKnown {
 		balance := row.BalanceUSD
-		if row.Provider == upstreamProviderTokenForce {
+		if upstreamProviderUsesCNYLedger(row.Provider) {
 			balance = row.BalanceRaw
 		}
 		view.BalanceUSD = &balance
-		if row.Provider == upstreamProviderTokenForce {
+		if upstreamProviderUsesCNYLedger(row.Provider) {
 			raw := row.BalanceRaw
 			view.BalanceRaw = &raw
 		}
 	}
-	if row.Provider == upstreamProviderTokenForce {
+	if upstreamProviderUsesCNYLedger(row.Provider) {
 		view.NativeCurrency = "CNY"
 		view.UnitPerUSD = tokenForceLedgerUnit
 	}
@@ -1279,6 +1355,10 @@ func (m *Monitor) loadChannelUpstreamViews(ctx context.Context) (map[string]Chan
 	for _, state := range errorLogStates {
 		errorLogStateByDomain[state.Domain] = state
 	}
+	paused, err := m.upstreamSyncPausedDomains(ctx)
+	if err != nil {
+		return nil, err
+	}
 	out := make(map[string]ChannelUpstreamAccountView, len(rows))
 	now := time.Now().Unix()
 	for _, row := range rows {
@@ -1354,6 +1434,7 @@ func (m *Monitor) loadChannelUpstreamViews(ctx context.Context) (map[string]Chan
 			view.ErrorLogLastError = errorState.LastError
 			view.ErrorLogUnresolvedFields = errorState.UnresolvedFields
 		}
+		view.SyncPaused = paused[row.Domain]
 		out[row.Domain] = view
 	}
 	return out, nil
@@ -1713,12 +1794,40 @@ func upstreamUsageRequestTimeout(s Settings) time.Duration {
 // request timeout. It shares the guarded transport (connection pool, host
 // pacing and circuits); only the per-request timeout differs.
 func (m *Monitor) channelUpstreamUsageHTTPClient() *http.Client {
-	usage := *m.channelUpstreamHTTPClient()
-	usage.Timeout = upstreamUsageRequestTimeout(m.cfg)
-	return &usage
+	return withUpstreamRequestTimeout(m.sharedUpstreamHTTPClient(), upstreamUsageRequestTimeout(m.cfg))
 }
 
+// upstreamUsageHistoryRequestTimeout bounds one NewAPI history page request.
+// It must stay well below upstreamUsageHistoryOperationTimeout: when the two
+// were equal (45 s), a slow source page always ran into the lane deadline
+// first, so it was booked as a cooperative budget yield instead of a
+// request-local timeout. The hour then never switched to five-minute children
+// and the same first page was retried forever (fastrelay.org and last-api.ai,
+// 2026-11). With the shorter request timeout a slow page fails on its own
+// clock while the lane still has budget, and the adaptive split can run.
+// 35 s plus the guard's 5 s minimum send budget still ends before the 45 s
+// lane deadline, while leaving healthy 30-35 s pages unsplit.
+var upstreamUsageHistoryRequestTimeout = 35 * time.Second
+
+// channelUpstreamUsageHistoryHTTPClient is the usage client for the history
+// lane, with the request timeout capped below the lane budget.
+func (m *Monitor) channelUpstreamUsageHistoryHTTPClient() *http.Client {
+	return withUpstreamRequestTimeout(m.sharedUpstreamHTTPClient(), min(upstreamUsageRequestTimeout(m.cfg), upstreamUsageHistoryRequestTimeout))
+}
+
+// upstreamBalanceQueueAllowance is how long a background balance sync may
+// wait for an upstream request slot before it yields.
+const upstreamBalanceQueueAllowance = time.Minute
+
+// channelUpstreamHTTPClient is the guarded client for balance-class calls.
+// Its timeout covers only the request itself; queueing behind other upstream
+// requests is bounded separately and reported as a local yield.
 func (m *Monitor) channelUpstreamHTTPClient() *http.Client {
+	shared := m.sharedUpstreamHTTPClient()
+	return withUpstreamRequestTimeout(shared, shared.Timeout)
+}
+
+func (m *Monitor) sharedUpstreamHTTPClient() *http.Client {
 	client := m.upstreamClient
 	if client == nil {
 		// 仅兼容直接构造 Monitor 的单元测试；生产实例均由 New 初始化并复用连接池。
@@ -1729,6 +1838,7 @@ func (m *Monitor) channelUpstreamHTTPClient() *http.Client {
 
 func upstreamResponseMessage(body []byte) string {
 	var payload struct {
+		Code    string          `json:"code"`
 		Message string          `json:"message"`
 		Error   json.RawMessage `json:"error"`
 		Detail  string          `json:"detail"`
@@ -1737,6 +1847,9 @@ func upstreamResponseMessage(body []byte) string {
 		return ""
 	}
 	message := payload.Message
+	if hint := newAPIAccessTokenHint(payload.Code); hint != "" {
+		return sanitizeUpstreamError(errors.New(strings.TrimSpace(message + " " + hint)))
+	}
 	if message == "" && len(payload.Error) > 0 && string(payload.Error) != "null" {
 		if payload.Error[0] == '"' {
 			_ = json.Unmarshal(payload.Error, &message)
@@ -1864,12 +1977,14 @@ func syncNewAPIBalance(ctx context.Context, client *http.Client, row ChannelUpst
 	if err == nil {
 		return result, cred, nil
 	}
-	if refreshed || strings.TrimSpace(cred.SessionID) == "" || !upstreamProvenAuthenticationFailure(err) {
+	if refreshed || strings.TrimSpace(cred.SessionID) == "" || newAPIPersonalAccessToken(cred.AccessToken) || !upstreamProvenAuthenticationFailure(err) {
 		return upstreamBalanceResult{}, cred, err
 	}
 	updated, refreshErr := refreshNewAPICredential(ctx, client, row, cred)
 	if refreshErr != nil {
-		return upstreamBalanceResult{}, cred, refreshErr
+		// Report why the access token was rejected; the renewal's own
+		// error (often a bare "Unauthorized") would otherwise hide it.
+		return upstreamBalanceResult{}, cred, fmt.Errorf("访问令牌验证失败（%s）；会话续期也失败：%w", sanitizeUpstreamError(err), refreshErr)
 	}
 	cred = updated
 	result, err = fetchNewAPIBalance(ctx, client, row, cred)
@@ -1960,6 +2075,27 @@ func newAPIRefreshSessionID(raw json.RawMessage, fallback string) string {
 		return session
 	}
 	return fallback
+}
+
+// newAPIAccessTokenHint explains NewAPI's personal access token errors, which
+// arrive as English messages with a stable code.
+func newAPIAccessTokenHint(code string) string {
+	switch code {
+	case "ACCESS_TOKEN_LEGACY_RETIRED":
+		return "（上游已升级 NewAPI，旧访问令牌失效：请在上游安全设置新建 nap_ 开头的个人访问令牌，勾选 profile:read 与 usage:read，填入「用户访问令牌」）"
+	case "ACCESS_TOKEN_SCOPE_DENIED":
+		return "（个人访问令牌缺少权限：读余额需 profile:read，读日志需 usage:read）"
+	case "ACCESS_TOKEN_EXPIRED":
+		return "（个人访问令牌已过期，请在上游新建后更新）"
+	}
+	return ""
+}
+
+// newAPIPersonalAccessToken reports a NewAPI personal access token (prefix
+// "nap_"), introduced when NewAPI retired legacy access tokens. It is long
+// lived and scoped; a browser session never renews it.
+func newAPIPersonalAccessToken(token string) bool {
+	return strings.HasPrefix(strings.TrimSpace(token), "nap_")
 }
 
 func refreshNewAPICredential(ctx context.Context, client *http.Client, row ChannelUpstreamAccount, cred newAPICredential) (newAPICredential, error) {
@@ -2548,6 +2684,20 @@ func (m *Monitor) syncUpstreamCredential(ctx context.Context, row ChannelUpstrea
 		}
 		result, updated, err := syncTokenForceBalance(ctx, client, row, cred)
 		return result, updated, err
+	case upstreamProviderOrion:
+		cred, ok := credential.(orionCredential)
+		if !ok {
+			return upstreamBalanceResult{}, credential, fmt.Errorf("Orion 凭据格式无效")
+		}
+		result, _, err := readOrionProfile(ctx, client, row, cred)
+		return result, cred, err
+	case upstreamProviderVolcengine:
+		cred, ok := credential.(volcengineCredential)
+		if !ok {
+			return upstreamBalanceResult{}, credential, fmt.Errorf("火山引擎凭据格式无效")
+		}
+		result, _, err := readVolcengineBalance(ctx, client, cred)
+		return result, cred, err
 	default:
 		return upstreamBalanceResult{}, credential, fmt.Errorf("不支持的中转站类型")
 	}
@@ -2646,6 +2796,12 @@ func (m *Monitor) credentialForAccount(row ChannelUpstreamAccount) (any, error) 
 		return cred, m.openUpstreamCredential(row, &cred)
 	case upstreamProviderTokenForce:
 		var cred tokenForceCredential
+		return cred, m.openUpstreamCredential(row, &cred)
+	case upstreamProviderOrion:
+		var cred orionCredential
+		return cred, m.openUpstreamCredential(row, &cred)
+	case upstreamProviderVolcengine:
+		var cred volcengineCredential
 		return cred, m.openUpstreamCredential(row, &cred)
 	default:
 		return nil, fmt.Errorf("不支持的中转站类型")
@@ -2753,8 +2909,14 @@ func reconcileUpstreamEconomicUnitTx(tx *gorm.DB, previous ChannelUpstreamAccoun
 	return nil
 }
 
+// upstreamProviderUsesCNYLedger marks providers whose balance and bills are
+// CNY face values with unit 1 (no panel quota conversion).
+func upstreamProviderUsesCNYLedger(provider string) bool {
+	return provider == upstreamProviderTokenForce || provider == upstreamProviderVolcengine
+}
+
 func upstreamEconomicUnitAt(row ChannelUpstreamAccount, ts int64) (float64, bool) {
-	if row.Provider == upstreamProviderTokenForce {
+	if upstreamProviderUsesCNYLedger(row.Provider) {
 		return tokenForceLedgerUnit, true
 	}
 	if !validUpstreamEconomicUnit(row.BalanceUnit) {
@@ -2806,6 +2968,9 @@ func (m *Monitor) persistUpstreamAccountIdentityChange(ctx context.Context, row 
 				return err
 			}
 			if err := tx.Where("domain = ?", row.Domain).Delete(&NewAPIUsageBackfillCheckpoint{}).Error; err != nil {
+				return err
+			}
+			if err := tx.Where("domain = ?", row.Domain).Delete(&NewAPIUsageTailCheckpoint{}).Error; err != nil {
 				return err
 			}
 			if err := tx.Where("domain = ?", row.Domain).Delete(&NewAPIUsageBackfillSegment{}).Error; err != nil {
@@ -2900,6 +3065,9 @@ func (m *Monitor) persistAICodeWithAccountChange(ctx context.Context, row *Chann
 				return err
 			}
 			if err := tx.Where("domain = ?", row.Domain).Delete(&NewAPIUsageBackfillCheckpoint{}).Error; err != nil {
+				return err
+			}
+			if err := tx.Where("domain = ?", row.Domain).Delete(&NewAPIUsageTailCheckpoint{}).Error; err != nil {
 				return err
 			}
 			if err := tx.Where("domain = ?", row.Domain).Delete(&NewAPIUsageBackfillSegment{}).Error; err != nil {
@@ -3020,7 +3188,7 @@ func (m *Monitor) syncStoredUpstreamAccountWithPriority(ctx context.Context, dom
 		return row, persistErr
 	}
 	if err != nil {
-		return row, &upstreamStoredSyncError{message: row.LastError, retryAt: upstreamRetryAt(err)}
+		return row, storedSyncError(row.LastError, upstreamRetryAt(err), err)
 	}
 	return row, nil
 }
@@ -3037,6 +3205,11 @@ func validateChannelUpstreamInput(in *channelUpstreamSaveInput) error {
 	}
 	in.APIKey = strings.TrimSpace(in.APIKey)
 	in.RefreshToken = strings.TrimSpace(in.RefreshToken)
+	in.AccessKeyID = strings.TrimSpace(in.AccessKeyID)
+	in.SecretAccessKey = strings.TrimSpace(in.SecretAccessKey)
+	if in.Provider != upstreamProviderVolcengine && (in.AccessKeyID != "" || in.SecretAccessKey != "") {
+		return fmt.Errorf("AccessKey ID / Secret Access Key 只适用于火山引擎")
+	}
 	if in.Provider != upstreamProviderNewAPI && in.SessionID != "" {
 		return fmt.Errorf("NewAPI 会话 SID 不适用于当前中转站类型")
 	}
@@ -3049,12 +3222,16 @@ func validateChannelUpstreamInput(in *channelUpstreamSaveInput) error {
 	}
 	in.BaseURL = baseURL
 	parsedURL, _ := url.Parse(baseURL)
-	if normalizeChannelBaseDomain(parsedURL.Hostname()) != in.Domain {
-		return fmt.Errorf("站点地址必须属于所配置的主域名")
+	if normalizeChannelBaseDomain(parsedURL.Hostname()) != in.Domain && !in.CrossDomainBaseURL {
+		return fmt.Errorf("站点地址不属于渠道主域名 %s；如已核实是同一供应商的控制台，请勾选「站点地址与渠道域名不同」后保存", in.Domain)
 	}
 	switch in.Provider {
 	case upstreamProviderOpenOx:
 		return validateOpenOxInput(in)
+	case upstreamProviderOrion:
+		return validateOrionInput(in)
+	case upstreamProviderVolcengine:
+		return validateVolcengineInput(in)
 	case upstreamProviderNewAPI:
 		if in.UserID <= 0 {
 			return fmt.Errorf("NewAPI 用户 ID 必须大于 0")
@@ -3179,8 +3356,11 @@ func (m *Monitor) getChannelUpstreamHandler(c *gin.Context) {
 		Domain: domain, Provider: row.Provider, BaseURL: row.BaseURL, Enabled: row.Enabled,
 		UsageSyncEnabled: row.UsageSyncEnabled, UserID: row.UserID, Account: m.channelUpstreamAccountView(row),
 	}
-	if row.Provider == upstreamProviderTokenForce {
+	if upstreamProviderUsesCNYLedger(row.Provider) {
 		view.UnitPerUSD = tokenForceLedgerUnit
+	}
+	if parsed, err := url.Parse(row.BaseURL); err == nil && parsed.Hostname() != "" {
+		view.CrossDomainBaseURL = normalizeChannelBaseDomain(parsed.Hostname()) != domain
 	}
 	view.Account.APIKeySlots = m.aicodeWithSlotViews(ctx, row)
 	if row.Provider == upstreamProviderSub2API {
@@ -3267,7 +3447,7 @@ func (m *Monitor) saveChannelUpstreamHandler(c *gin.Context) {
 	var credential any
 	var existingAICodeWithCredential *aiCodeWithCredential
 	preserveSealedCredential := false
-	credentialUpdated := in.AccessToken != "" || in.SessionID != "" || len(in.APIKeys) > 0 || len(in.AddAPIKeys) > 0 || len(in.AddAPIKeySlots) > 0 || len(in.RemoveAPIKeyIDs) > 0 || in.Password != "" || in.RefreshToken != ""
+	credentialUpdated := in.AccessToken != "" || in.SessionID != "" || len(in.APIKeys) > 0 || len(in.AddAPIKeys) > 0 || len(in.AddAPIKeySlots) > 0 || len(in.RemoveAPIKeyIDs) > 0 || in.Password != "" || in.RefreshToken != "" || in.AccessKeyID != ""
 	credentialMetadataChanged := len(in.RenameAPIKeySlots) > 0
 	sameIdentity := existingErr == nil && existing.Provider == in.Provider && existing.BaseURL == in.BaseURL
 	credentialSetChanged := false
@@ -3294,6 +3474,48 @@ func (m *Monitor) saveChannelUpstreamHandler(c *gin.Context) {
 			err = fmt.Errorf("首次连接或变更 OpenOx 站点时必须填写后台 auth_token")
 		}
 		row.Account = strconv.FormatInt(row.UserID, 10)
+	case upstreamProviderOrion:
+		if in.AccessToken != "" {
+			cred := orionCredential{AccessToken: in.AccessToken}
+			// /api/v1/console/me is authoritative for the account identity.
+			var userID int64
+			_, userID, err = readOrionProfile(ctx, m.channelUpstreamHTTPClient(), row, cred)
+			row.UserID = userID
+			credential = cred
+			sameIdentity = sameIdentity && userID == existing.UserID
+		} else if sameIdentity {
+			row.UserID = existing.UserID
+			if !row.Enabled {
+				row.Credential, row.CredentialVersion = existing.Credential, existing.CredentialVersion
+				preserveSealedCredential = true
+			} else {
+				credential, err = m.credentialForAccount(existing)
+			}
+		} else {
+			err = fmt.Errorf("首次连接或变更 Orion 站点时必须填写管理密钥")
+		}
+		row.Account = strconv.FormatInt(row.UserID, 10)
+	case upstreamProviderVolcengine:
+		if in.AccessKeyID != "" {
+			cred := volcengineCredential{AccessKeyID: in.AccessKeyID, SecretAccessKey: in.SecretAccessKey}
+			// The balance call proves the AK/SK and returns the account ID.
+			var accountID int64
+			_, accountID, err = readVolcengineBalance(ctx, m.channelUpstreamHTTPClient(), cred)
+			row.UserID = accountID
+			credential = cred
+			sameIdentity = sameIdentity && accountID == existing.UserID
+		} else if sameIdentity {
+			row.UserID = existing.UserID
+			if !row.Enabled {
+				row.Credential, row.CredentialVersion = existing.Credential, existing.CredentialVersion
+				preserveSealedCredential = true
+			} else {
+				credential, err = m.credentialForAccount(existing)
+			}
+		} else {
+			err = fmt.Errorf("首次连接火山引擎时必须填写费用中心只读子用户的 AK/SK")
+		}
+		row.Account = "volc:" + strconv.FormatInt(row.UserID, 10)
 	case upstreamProviderNewAPI:
 		row.UserID = in.UserID
 		row.Account = strconv.FormatInt(in.UserID, 10)
@@ -3311,7 +3533,19 @@ func (m *Monitor) saveChannelUpstreamHandler(c *gin.Context) {
 			if in.SessionID != "" {
 				current.SessionID = in.SessionID
 			}
+			if in.ClearSessionID && in.SessionID == "" {
+				current.SessionID = ""
+			}
 			credential = current
+		} else if in.ClearSessionID && sameIdentity {
+			loaded, loadErr := m.credentialForAccount(existing)
+			current, _ := loaded.(newAPICredential)
+			if loadErr != nil || strings.TrimSpace(current.AccessToken) == "" {
+				err = fmt.Errorf("清除会话 SID 需要同时填写用户访问令牌")
+			} else {
+				current.SessionID = ""
+				credential = current
+			}
 		} else if sameIdentity && !row.Enabled {
 			row.Credential, row.CredentialVersion = existing.Credential, existing.CredentialVersion
 			preserveSealedCredential = true
@@ -3418,7 +3652,7 @@ func (m *Monitor) saveChannelUpstreamHandler(c *gin.Context) {
 		row.UsageBackfillLastError = existing.UsageBackfillLastError
 		row.UsageBackfillProgress = existing.UsageBackfillProgress
 	}
-	if row.Provider == upstreamProviderTokenForce {
+	if upstreamProviderUsesCNYLedger(row.Provider) {
 		// Keep account identity, credentials and all usage/cursor history.
 		// The source's CNY label is metadata, not an additional conversion.
 		row.BalanceUnit, row.UnitAssumed = tokenForceLedgerUnit, false
@@ -3643,6 +3877,13 @@ func (m *Monitor) startChannelUpstreamSync(ctx context.Context) {
 		slog.Info("上游余额、消费账单、计价证据、错误日志与资金流水采集均已关闭")
 		return
 	}
+	releaseCtx, releaseCancel := context.WithTimeout(ctx, 20*time.Second)
+	if released, err := m.releaseNonCredentialUpstreamIsolation(releaseCtx, time.Now().Unix()); err != nil {
+		slog.Warn("恢复非凭证原因暂停的上游同步任务失败，下次启动重试", "err", err)
+	} else if released > 0 {
+		slog.Info("已将非凭证原因永久暂停的上游同步任务改为低频自动重试", "tasks", released)
+	}
+	releaseCancel()
 
 	var configured int64
 	if err := m.storeDB.Model(&ChannelUpstreamAccount{}).Count(&configured).Error; err != nil {
@@ -3771,7 +4012,7 @@ func runUpstreamPeriodicLane(ctx context.Context, initialDelay, interval time.Du
 func (m *Monitor) syncDueUpstreamAccounts(ctx context.Context) {
 	now := time.Now().Unix()
 	var rows []ChannelUpstreamAccount
-	if err := m.storeDB.WithContext(ctx).Where("enabled = ? AND (next_sync_at = 0 OR next_sync_at <= ?)", true, now).
+	if err := m.storeDB.WithContext(ctx).Where("enabled = ? AND (next_sync_at = 0 OR next_sync_at <= ?)", true, now).Where(upstreamSyncNotPausedSQL).
 		Order("next_sync_at ASC").Limit(50).Find(&rows).Error; err != nil {
 		slog.Warn("读取待同步上游账户失败", "err", err)
 		return
@@ -3780,11 +4021,17 @@ func (m *Monitor) syncDueUpstreamAccounts(ctx context.Context) {
 		if ctx.Err() != nil {
 			return
 		}
-		syncCtx, cancel := context.WithTimeout(ctx, upstreamSyncTimeout(m.cfg)+2*time.Second)
+		// The request timeout starts once the request may be sent; the extra
+		// allowance covers queueing behind other upstream requests.
+		syncCtx, cancel := context.WithTimeout(ctx, upstreamSyncTimeout(m.cfg)+2*time.Second+upstreamBalanceQueueAllowance)
 		synced, err := m.syncStoredUpstreamAccountBackground(syncCtx, row.Domain)
 		cancel()
 		if err != nil {
 			if errors.Is(err, errUpstreamAccountBusy) {
+				continue
+			}
+			if reason, yielded := upstreamSyncYieldReason(err); yielded {
+				slog.Info("上游余额同步暂缓，稍后自动重试", "domain", row.Domain, "reason", reason)
 				continue
 			}
 			message := synced.LastError

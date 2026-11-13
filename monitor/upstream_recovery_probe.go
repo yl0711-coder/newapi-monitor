@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"net/url"
 	"sync/atomic"
 	"time"
 
@@ -20,10 +21,30 @@ type upstreamRecoveryProbeTransport struct {
 }
 
 func (t *upstreamRecoveryProbeTransport) RoundTrip(r *http.Request) (*http.Response, error) {
-	if r.Method != http.MethodGet || t.calls.Add(1) > 4 {
+	if !upstreamProbeReadOnlyRequest(r) || t.calls.Add(1) > 4 {
 		return nil, errUpstreamProbeBudget
 	}
 	return t.base.RoundTrip(r)
+}
+
+// upstreamProbeReadOnlyRequest allows GET, plus the read-only Volcengine
+// billing actions, which its OpenAPI only accepts as signed POSTs.
+func upstreamProbeReadOnlyRequest(r *http.Request) bool {
+	if r.Method == http.MethodGet {
+		return true
+	}
+	if r.Method != http.MethodPost || r.URL == nil {
+		return false
+	}
+	endpoint, err := url.Parse(volcengineBillingEndpoint)
+	if err != nil || r.URL.Scheme != endpoint.Scheme || r.URL.Host != endpoint.Host {
+		return false
+	}
+	switch r.URL.Query().Get("Action") {
+	case "QueryBalanceAcct", "ListBillDetail":
+		return true
+	}
+	return false
 }
 
 // Probe only the requested capability, never a different successful endpoint.
@@ -107,6 +128,24 @@ func (m *Monitor) probeUpstreamRecovery(ctx context.Context, row ChannelUpstream
 		default:
 			return errDiagnosticShape
 		}
+	case orionCredential:
+		switch task {
+		case "balance":
+			_, _, err = readOrionProfile(ctx, client, row, cred)
+		case "usage", "usage_history":
+			_, err = fetchOrionRequestPage(ctx, client, row, cred, from, to, "", pacer)
+		default:
+			return errDiagnosticShape
+		}
+	case volcengineCredential:
+		switch task {
+		case "balance":
+			_, _, err = readVolcengineBalance(ctx, client, cred)
+		case "usage", "usage_history":
+			_, err = fetchVolcengineBillPage(ctx, client, cred, time.Unix(day, 0).In(cstLocation), 0, pacer)
+		default:
+			return errDiagnosticShape
+		}
 	case aiCodeWithCredential:
 		if task == "balance" {
 			_, _, err = syncAICodeWithBalanceSnapshot(ctx, client, row, cred)
@@ -177,7 +216,7 @@ func upstreamRecoveryTaskAllowed(s Settings, row ChannelUpstreamAccount, task st
 	if !row.Enabled || s.LocalSnapshotOnly {
 		return false
 	}
-	supported := row.Provider == upstreamProviderNewAPI || row.Provider == upstreamProviderSub2API || row.Provider == upstreamProviderTokenForce || row.Provider == upstreamProviderAICodeWith || row.Provider == upstreamProviderOpenOx
+	supported := row.Provider == upstreamProviderNewAPI || row.Provider == upstreamProviderSub2API || row.Provider == upstreamProviderTokenForce || row.Provider == upstreamProviderAICodeWith || row.Provider == upstreamProviderOpenOx || row.Provider == upstreamProviderOrion || row.Provider == upstreamProviderVolcengine
 	if !supported {
 		return false
 	}

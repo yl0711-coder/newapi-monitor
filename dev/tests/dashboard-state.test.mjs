@@ -120,7 +120,7 @@ function dashboard(fetchImpl = () => {throw Error('network forbidden in renderer
   const channel = source('channel_management.js');
   const end = channel.lastIndexOf('})();');
   assert.ok(end > 0, 'channel module closure must exist');
-  vm.runInContext(channel.slice(0, end) + '\nglobalThis.channelTest={loadReport,render,navigateDataStatus,usageMetric,renderUpstreamFunds,dateTime,shortDateTime,domainCard,freshness,cm,filteredDomains,domainSortDescription,renderUpstreamDiagnostic,diagnoseUpstream,resetUpstreamDiagnostic};\n' + channel.slice(end), context);
+  vm.runInContext(channel.slice(0, end) + '\nglobalThis.channelTest={loadReport,render,navigateDataStatus,usageMetric,renderUpstreamFunds,dateTime,shortDateTime,domainCard,freshness,cm,filteredDomains,domainSortDescription,renderUpstreamDiagnostic,diagnoseUpstream,resetUpstreamDiagnostic,domainIssues,attentionPanel};\n' + channel.slice(end), context);
 
   const page = source('page.html');
   vm.runInContext(page.match(/^function problemBuckets\(.*$/m)[0], context);
@@ -399,7 +399,7 @@ test('dimension truncation is explicit only when the server found a sentinel row
   assert.match(context.dimensionLimitNotice({limit: 200, truncated: true}), /前 200 项.*总览与总趋势包含全部记录/);
 });
 
-test('upstreams default to name order with unconfigured inactive domains last', () => {
+test('upstreams default to user-side spend order; name order keeps unconfigured inactive domains last', () => {
   const {context} = dashboard();
   const api = context.channelTest, cm = api.cm;
   const domain = (name, active, config = {}, cost = 0) => ({key: name, domain: name, configured: true, ...config,
@@ -415,7 +415,10 @@ test('upstreams default to name order with unconfigured inactive domains last', 
   // A historical channel with stale status=1 is not currently usable.
   Object.assign(cm.report.domains[4].vendors[0].channels[0], {current: false, status: 1});
   const names = () => Array.from(api.filteredDomains(), d => d.domain);
-  assert.equal(cm.sort, 'name');
+  // The busiest upstreams come first by default; idle unconfigured ones still sink.
+  assert.equal(cm.sort, 'cost');
+  assert.deepEqual(names(), ['z-active.test', 'b-account.test', 'a-rates.test', 'aaa-unused.test', 'aaa-history.test']);
+  cm.sort = 'name';
   assert.deepEqual(names(), ['a-rates.test', 'b-account.test', 'z-active.test', 'aaa-history.test', 'aaa-unused.test']);
   assert.match(api.domainSortDescription(), /名称 A–Z.*置后.*最后/);
   cm.sort = 'cost';
@@ -950,4 +953,64 @@ test('paused scheduling sentinels never render Invalid Date', () => {
     for (const value of [null, undefined, 0, -1]) assert.equal(format(value), '—');
     assert.doesNotMatch(format(1788552000), /Invalid Date|未安排|^—$/);
   }
+});
+
+test('balance runway names the recent 24h rate when it drives the estimate',()=>{
+  const {context}=dashboard(),ui=context.channelTest;
+  const usage={requests:10,tokens:100,cost_usd:20};
+  const card=(assessment)=>ui.domainCard({key:'ramp',domain:'ramp.example',configured:true,usage,
+    vendors:[{name:'vendor',channels:[{id:1,name:'channel',current:true,status:1,usage,groups:[]}]}],
+    upstream:{configured:true,usage_sync_enabled:true,balance_usd:80,status:'ok',assessment},
+    upstream_usage:{available:true,integrity_status:'complete',cost_usd:70}},0,usage,false);
+  const base={available:true,status:'warning',estimated_runway_days:80/96,required_balance_usd:96,average_daily_cost_usd:54.86,
+    effective_daily_cost_usd:96,lookback_days:7,threshold_days:1,coverage_pct:100};
+  const recent=card({...base,recent_daily_cost_usd:96,runway_basis:'recent_24h'});
+  assert.match(recent,/按最近 24 小时消费速度 \$96\.00\/天估算（近 7 日日均 \$54\.86）/);
+  assert.match(recent,/预计可用 0\.8 天（20\.0 小时）/);
+  const lookback=card({...base,status:'healthy',estimated_runway_days:3.3,required_balance_usd:24.2,average_daily_cost_usd:24.2,
+    effective_daily_cost_usd:24.2,recent_daily_cost_usd:10,runway_basis:'lookback'});
+  assert.match(lookback,/按近 7 日原始账单日均 \$24\.20 估算/);
+  assert.match(lookback,/最近 24 小时消费速度 \$10\.00\/天/);
+  const missing=card({...base,status:'healthy',estimated_runway_days:3.3,runway_basis:'lookback'});
+  assert.match(missing,/最近 24 小时数据不完整，未参与估算/);
+  const olderBackend=card({...base,status:'healthy',estimated_runway_days:3.3,average_daily_cost_usd:24.2});
+  assert.doesNotMatch(olderBackend,/最近 24 小时/);
+  assert.match(olderBackend,/按近 7 日原始账单日均 \$24\.20 估算/);
+});
+
+test('attention panel lists upstreams that need action, most urgent first, and cards show the same badges', () => {
+  const {context} = dashboard();
+  const api = context.channelTest, cm = api.cm;
+  const channel = (id, status, requests = 10) => ({id, name: 'ch' + id, current: true, status, usage: {requests, tokens: 1, cost_usd: requests}, groups: []});
+  const domain = (name, extra, channels = [channel(name + 1, 1)]) => ({key: name, domain: name, configured: true, vendors: [{name: 'v', channels}], ...extra});
+  const account = (assessment, extra = {}) => ({configured: true, enabled: true, status: 'ok', usage_sync_enabled: true, usage_status: 'ok', assessment, ...extra});
+  cm.report = {meta: {data_coverage: {complete: true}}, finance: {can_edit: false}, domains: [
+    domain('healthy.example', {upstream: account({available: true, status: 'healthy', estimated_runway_days: 9})}),
+    domain('soon.example', {upstream: account({available: true, status: 'healthy', estimated_runway_days: 1.5})}),
+    domain('low.example', {upstream: account({available: true, status: 'warning', estimated_runway_days: 0.25})}),
+    domain('auto.example', {upstream: account({available: true, status: 'healthy', estimated_runway_days: 9})}, [channel(41, 1), channel(42, 3), channel(43, 2)]),
+    domain('sync.example', {upstream: account({available: true, status: 'healthy', estimated_runway_days: 9}, {usage_status: 'error'})}),
+    domain('noaccount.example', {}),
+    domain('idle-noaccount.example', {}, [channel(61, 1, 0)]),
+    domain('retired.example', {retiring: true, upstream: account({available: true, status: 'warning', estimated_runway_days: 0.1})}),
+  ]};
+  const issues = name => Array.from(api.domainIssues(Array.from(api.filteredDomains()).find(d => d.domain === name)), i => i.level + ':' + i.label);
+  assert.deepEqual(issues('healthy.example'), []);
+  assert.deepEqual(issues('soon.example'), ['warn:余额约 1.5 天']);
+  assert.deepEqual(issues('low.example'), ['bad:余额约 6 小时']);
+  assert.deepEqual(issues('auto.example'), ['bad:1 个渠道自动禁用']);
+  assert.deepEqual(issues('sync.example'), ['warn:消费同步失败']);
+  assert.deepEqual(issues('noaccount.example'), ['warn:未配置上游账户']);
+  assert.deepEqual(issues('idle-noaccount.example'), [], 'no traffic: not worth an alert');
+  assert.deepEqual(issues('retired.example'), [], 'an operator decision is not a problem to act on');
+  const panel = api.attentionPanel(api.filteredDomains());
+  const order = [...panel.matchAll(/data-cm-attention="([^"]+)"/g)].map(m => m[1]);
+  assert.deepEqual(order.slice(0, 2), ['low.example', 'auto.example'], 'bad issues first, shortest runway first');
+  assert.equal(order.length, 5);
+  const card = api.domainCard(api.filteredDomains().find(d => d.domain === 'auto.example'), 0, {requests: 1, tokens: 1, cost_usd: 1}, false);
+  assert.match(card, /<span class="cm-issue bad">1 个渠道自动禁用<\/span>/);
+  assert.match(card, /3 个实际渠道 · 1 个启用 · <span class="cm-auto-disabled">1 个自动禁用<\/span> · 1 个手动停用/);
+  assert.match(card, /class="cm-domain-card has-issue" data-cm-card="auto.example"/);
+  cm.report.domains = cm.report.domains.filter(d => ['healthy.example', 'retired.example'].includes(d.domain));
+  assert.match(api.attentionPanel(api.filteredDomains()), /cm-attention clear/);
 });

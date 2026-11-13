@@ -354,9 +354,8 @@ func classifySourceErrorWithFallback(err error, fallback sourceErrorClass) sourc
 	// ErrInvalidConn. It is a network event, never a configuration error:
 	// treating it as permanent would stop source reads until a manual restart.
 	for _, transient := range []error{
-		mysqlDriver.ErrInvalidConn,
 		context.Canceled, context.DeadlineExceeded, driver.ErrBadConn, io.EOF,
-		sql.ErrConnDone, mysqlDriver.ErrMalformPkt,
+		sql.ErrConnDone, mysqlDriver.ErrInvalidConn, mysqlDriver.ErrMalformPkt,
 		mysqlDriver.ErrPktSync, mysqlDriver.ErrPktSyncMul, mysqlDriver.ErrBusyBuffer,
 		syscall.ECONNREFUSED, syscall.ECONNRESET, syscall.EHOSTUNREACH,
 		syscall.ENETUNREACH, syscall.ETIMEDOUT, syscall.EPIPE,

@@ -893,6 +893,16 @@ func (m *Monitor) failFundState(ctx context.Context, state *UpstreamFundSyncStat
 	if errors.Is(cause, context.Canceled) {
 		return cause
 	}
+	if next, paused := upstreamPauseRetryAt(cause, now); paused {
+		// Local postponement: keep status and error, only reschedule.
+		state.LastAttemptAt, state.NextSyncAt = now, next
+		commitCtx, cancel := upstreamUsageLocalCommitContext(ctx)
+		defer cancel()
+		if err := m.saveFundState(commitCtx, state, now); err != nil {
+			return errors.Join(cause, err)
+		}
+		return cause
+	}
 	state.Status = upstreamStatusError
 	state.LastAttemptAt = now
 	state.ConsecutiveFails++
@@ -1139,7 +1149,7 @@ func (m *Monitor) syncDueUpstreamFunds(ctx context.Context) {
 	defer cancel()
 	now := time.Now().Unix()
 	var rows []ChannelUpstreamAccount
-	if err := m.storeDB.WithContext(roundCtx).Where("enabled = ? AND usage_sync_enabled = ?", true, true).Order("domain ASC").Find(&rows).Error; err != nil {
+	if err := m.storeDB.WithContext(roundCtx).Where("enabled = ? AND usage_sync_enabled = ?", true, true).Where(upstreamSyncNotPausedSQL).Order("domain ASC").Find(&rows).Error; err != nil {
 		slog.Warn("读取上游资金流水账户失败", "err", err)
 		return
 	}

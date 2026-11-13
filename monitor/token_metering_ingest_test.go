@@ -214,10 +214,22 @@ func TestTokenMeteringPaginationCrashResumeAndFencing(t *testing.T) {
 	if err := reopened.Model(&TokenMeteringState{}).Where("source_epoch = ?", next.SourceEpoch).Update("lease_until", 0).Error; err != nil {
 		t.Fatal(err)
 	}
-	tokenMeteringRun(t, replacement, now+32)
+	// The replacement must finish the window. Each round is bounded by a
+	// wall-clock budget, so a slow CI runner may need more than one round;
+	// what matters is that it completes with exactly the 501 facts (no loss,
+	// no duplicates from the fenced stale worker), not how many rounds it takes.
 	var count int64
-	if err := reopened.Model(&TokenMeteringFact{}).Count(&count).Error; err != nil || count != 501 {
-		t.Fatalf("%d %v", count, err)
+	for round := 0; round < 4; round++ {
+		tokenMeteringRun(t, replacement, now+32+int64(2*round))
+		if err := reopened.Model(&TokenMeteringFact{}).Count(&count).Error; err != nil {
+			t.Fatal(err)
+		}
+		if count >= 501 {
+			break
+		}
+	}
+	if count != 501 {
+		t.Fatalf("%d facts after resume, want 501", count)
 	}
 	if got := tokenMeteringStateRead(t, replacement); got.CompleteThrough != start+300 {
 		t.Fatalf("%+v", got)

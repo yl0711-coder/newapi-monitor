@@ -77,7 +77,8 @@ func TestChannelManagementFlattensLegacyVendorTypeLayer(t *testing.T) {
 		`function domainServiceGroups(domain)`,
 		`domain.vendors.flatMap(vendor=>vendor.channels||[])`,
 		`展开后直接查看服务分组及实际渠道`,
-		`${channels.length} 个实际渠道 · ${enabled} 个启用 · ${groups.length} 个服务分组`,
+		`${channels.length} 个实际渠道 · ${enabled} 个启用`,
+		`${channelStateText} · ${groups.length} 个服务分组`,
 	} {
 		if !strings.Contains(js, marker) {
 			t.Fatalf("渠道管理缺少扁平化渠道展示标记 %q", marker)

@@ -273,6 +273,26 @@ func upsertUsageFactAuditJob(tx *gorm.DB, desired UsageFactJob, cycle time.Durat
 		// kind, the next reconciliation can start the new cycle normally.
 		fromChanged = false
 	}
+	// The recent 14-day audit's left edge moves forward every midnight. Treating
+	// that as a new target restarted the job from the left edge each day; at
+	// roughly 100 audited hours per day out of 336 it never reached the newest
+	// week (48/48 jobs stuck at 96/336 hours, 2026-11-12). A forward-only move
+	// of the same job is a sliding window: keep the cursor, drop only the hours
+	// that left the window, and let the normal cycle restart after completion.
+	// A paused job is still reset (as before), which re-queues it after its
+	// failures. A job under a live lease is left untouched for this pass: the
+	// worker's advance is computed from the range it claimed, and the next
+	// reconciliation (every minute) slides it once the lease is released.
+	slide := fromChanged && current.Kind == desired.Kind && desired.Kind == usageFactHistoryKindRecentAudit &&
+		desired.FromTs > current.FromTs && current.TrackedRevision == desired.TrackedRevision &&
+		current.SourceEpoch == desired.SourceEpoch && current.Status != usageFactHistoryJobCancelled &&
+		current.Status != usageFactHistoryJobPaused
+	if slide && current.Status == usageFactHistoryJobRunning && current.LeaseUntil > now.Unix() {
+		return nil
+	}
+	if slide {
+		fromChanged = false
+	}
 	reset := current.TrackedRevision != desired.TrackedRevision || current.SourceEpoch != desired.SourceEpoch ||
 		fromChanged || !usageFactAuditKindsCompatible(current.Kind, desired.Kind) ||
 		current.Status == usageFactHistoryJobCancelled
@@ -283,6 +303,15 @@ func upsertUsageFactAuditJob(tx *gorm.DB, desired UsageFactJob, cycle time.Durat
 		return tx.Save(&current).Error
 	}
 	changed := false
+	if slide {
+		current.FromTs = desired.FromTs
+		if current.NextHour < current.FromTs {
+			current.NextHour = current.FromTs
+		}
+		current.TotalHours = max(current.ThroughTs-current.FromTs, 0) / usageFactHourSeconds
+		current.CompletedHours = max(min(current.NextHour, current.ThroughTs)-current.FromTs, 0) / usageFactHourSeconds
+		changed = true
+	}
 	cycleDue := current.Status == usageFactHistoryJobComplete && current.CompletedAt > 0 &&
 		now.Unix()-current.CompletedAt >= int64(cycle/time.Second)
 	if desired.ThroughTs > current.ThroughTs {

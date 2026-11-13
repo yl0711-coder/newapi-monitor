@@ -31,8 +31,10 @@ func TestUpstreamFailurePolicyFiniteBudget(t *testing.T) {
 			if row.NextSyncAt < want || row.NextSyncAt == upstreamAccountIsolatedUntil {
 				t.Fatalf("retryAt=%d below probe minimum %d or permanently paused too soon", row.NextSyncAt, want)
 			}
-		} else if row.NextSyncAt != upstreamAccountIsolatedUntil {
-			t.Fatal("exhausted budget keeps retrying")
+		} else if row.NextSyncAt != now+int64(upstreamTransientFailureRecheck/time.Second) {
+			// An exhausted budget is not a credential failure: recheck slowly
+			// instead of pausing until an administrator notices.
+			t.Fatalf("exhausted budget next=%d, want slow recheck", row.NextSyncAt)
 		}
 		now = row.NextSyncAt
 	}

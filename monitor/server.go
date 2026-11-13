@@ -429,17 +429,17 @@ func (m *Monitor) RegisterRoutes(r *gin.Engine) {
 		view.GET("/customer-health/groups", noStoreSensitive, m.listCustomerHealthGroups)   // 客户维护:独立公司名单
 		view.GET("/customer-health/members", noStoreSensitive, m.listCustomerHealthMembers) // 客户维护:独立成员名单
 		view.GET("/model-statistics/frt", noStoreSensitive, m.serveModelFRTReport)
-		view.GET("/model-statistics/report", noStoreSensitive, m.serveModelStatisticsReport)  // 模型统计:分组模型请求次数(只读本地事实)
-		reports.GET("/usage/users", m.listTrackedUsers)                                       // 用户用量:被盯名单(含分组)
-		reports.GET("/usage/groups", m.listGroups)                                            // 用户用量:客户分组列表
-		reports.GET("/usage/followups", m.usageAggregateAuthorizationGuard(m.serveFollowUps)) // 用户用量:待跟进清单
-		reports.GET("/usage/followups/log", m.listFollowLogs)                                 // 用户用量:某客户跟进记录
-		reports.GET("/usage/settings", m.getUsageSettings)                                    // 用户用量:跟进阈值(读)
-		reports.GET("/usage/matrix", m.usageAggregateAuthorizationGuard(m.serveUsageMatrix))  // 用户用量:列表页矩阵(前端渲染 行=用户×列=日期,格=当日费用)
-		reports.GET("/usage/stats", m.usageAggregateAuthorizationGuard(m.serveUsageStats))    // 用户用量:单用户详情聚合(每日/分组/模型/费用)
-		view.GET("/usage/cache-stats", m.serveUsageCacheStats)                                // 用户用量缓存:无敏感信息的运维计数
-		view.GET("/usage/facts-status", m.serveUsageFactsStatus)                              // 用户用量本地事实层:覆盖率/同步状态(只读 Monitor SQLite)
-		view.GET("/usage/facts-history", m.serveUsageFactHistoryStatus)                       // 全历史逐成员阶段/水位/失败原因(只读本地)
+		view.GET("/model-statistics/report", noStoreSensitive, m.serveModelStatisticsReport)                                            // 模型统计:分组模型请求次数(只读本地事实)
+		reports.GET("/usage/users", m.listTrackedUsers)                                                                                 // 用户用量:被盯名单(含分组)
+		reports.GET("/usage/groups", m.listGroups)                                                                                      // 用户用量:客户分组列表
+		reports.GET("/usage/followups", m.usageReadTimingDiagnostic("followups", m.usageAggregateAuthorizationGuard(m.serveFollowUps))) // 用户用量:待跟进清单
+		reports.GET("/usage/followups/log", m.listFollowLogs)                                                                           // 用户用量:某客户跟进记录
+		reports.GET("/usage/settings", m.getUsageSettings)                                                                              // 用户用量:跟进阈值(读)
+		reports.GET("/usage/matrix", m.usageReadTimingDiagnostic("matrix", m.usageAggregateAuthorizationGuard(m.serveUsageMatrix)))     // 用户用量:列表页矩阵(前端渲染 行=用户×列=日期,格=当日费用)
+		reports.GET("/usage/stats", m.usageReadTimingDiagnostic("stats", m.usageAggregateAuthorizationGuard(m.serveUsageStats)))        // 用户用量:单用户详情聚合(每日/分组/模型/费用)
+		view.GET("/usage/cache-stats", m.serveUsageCacheStats)                                                                          // 用户用量缓存:无敏感信息的运维计数
+		view.GET("/usage/facts-status", m.serveUsageFactsStatus)                                                                        // 用户用量本地事实层:覆盖率/同步状态(只读 Monitor SQLite)
+		view.GET("/usage/facts-history", m.serveUsageFactHistoryStatus)                                                                 // 全历史逐成员阶段/水位/失败原因(只读本地)
 		view.GET("/me", me)
 	}
 
@@ -524,6 +524,7 @@ func (m *Monitor) RegisterRoutes(r *gin.Engine) {
 		rootChannels.GET("/upstream/recovery-status", m.upstreamRecoveryStatusHandler)
 		rootChannels.POST("/upstream", m.saveChannelUpstreamHandler)
 		rootChannels.POST("/upstream/retirement", m.saveChannelUpstreamRetirementHandler)
+		rootChannels.POST("/domain-alias", m.saveChannelDomainAliasHandler)
 		rootChannels.POST("/upstream/sync", m.syncChannelUpstreamHandler)
 		rootChannels.POST("/upstream/usage-sync", m.syncChannelUpstreamUsageHandler)
 		rootChannels.POST("/upstream/usage-history/preview", m.previewSub2HistoricalDayHandler)

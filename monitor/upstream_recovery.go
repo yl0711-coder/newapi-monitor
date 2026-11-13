@@ -162,13 +162,24 @@ func (m *Monitor) recoverUpstreamTask(ctx context.Context, domain, task string) 
 	return m.probeAndResumeUpstreamTask(ctx, row, row, task, target)
 }
 
+// upstreamRecoveryRetryAt is the earliest time a manual recovery may probe.
+// A probe schedule (up to its longest delay) is honoured. Anything later — the
+// slow recheck after an exhausted budget or a 4xx, or a Retry-After beyond that
+// delay — does not block an administrator's single recovery probe.
+func upstreamRecoveryRetryAt(target upstreamRecoveryTarget, now int64) int64 {
+	retryAt := target.last + int64(upstreamRecoveryCooldown/time.Second)
+	slowRecheck := target.failures >= upstreamRecoveryFailureLimit ||
+		target.next-now > int64(upstreamRecoveryProbeDelays[len(upstreamRecoveryProbeDelays)-1]/time.Second)
+	if target.next > now && target.next < upstreamAccountIsolatedUntil && target.next > retryAt && !slowRecheck {
+		retryAt = target.next
+	}
+	return retryAt
+}
+
 func (m *Monitor) probeAndResumeUpstreamTask(ctx context.Context, observed, probeRow ChannelUpstreamAccount, task string, target upstreamRecoveryTarget) (upstreamRecoveryResult, error) {
 	now := time.Now().Unix()
 	result := upstreamRecoveryResult{Task: task}
-	retryAt := target.last + int64(upstreamRecoveryCooldown/time.Second)
-	if target.next > now && target.next < upstreamAccountIsolatedUntil && target.next > retryAt {
-		retryAt = target.next
-	}
+	retryAt := upstreamRecoveryRetryAt(target, now)
 	if retryAt > now {
 		result.Status, result.RetryAt, result.Message = "waiting", retryAt, "任务仍在重试冷却期，本次未请求上游"
 		return result, nil

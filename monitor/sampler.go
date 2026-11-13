@@ -1534,6 +1534,12 @@ func (m *Monitor) refreshChannelsContext(parent context.Context) (result error) 
 		return err
 	}
 	defer rows.Close()
+	// Without the alias table a refresh would move aliased channels back to
+	// their raw address and record a false ownership change; skip instead.
+	aliases, err := loadChannelDomainAliases(cctx, m.storeDB)
+	if err != nil {
+		return err
+	}
 	names := map[string]string{}
 	var snaps []ChannelSnap
 	now := time.Now().Unix()
@@ -1546,7 +1552,7 @@ func (m *Monitor) refreshChannelsContext(parent context.Context) (result error) 
 		names[strconv.Itoa(id)] = name.String
 		snaps = append(snaps, ChannelSnap{
 			ID: id, Name: name.String, Type: channelType, Vendor: newAPIChannelTypeName(channelType), Status: status,
-			BaseDomain: normalizeChannelBaseDomain(baseURL.String), BaseHost: normalizeChannelBaseHost(baseURL.String),
+			BaseDomain: channelDomainWithAlias(aliases, normalizeChannelBaseDomain(baseURL.String)), BaseHost: normalizeChannelBaseHost(baseURL.String),
 			Groups: grp.String, Models: models.String,
 			UpdatedAt: now,
 		})

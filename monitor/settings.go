@@ -215,6 +215,7 @@ type Settings struct {
 	FinanceReportSnapshotReadEnabled   bool // MONITOR_FINANCE_REPORT_SNAPSHOT_READ_ENABLED，默认 false；独立灰度读取闸门
 	FinanceFastSnapshotEnabled         bool // MONITOR_FINANCE_FAST_SNAPSHOT_ENABLED，默认 false；有界快照先返回，统一队列后台核验/生成
 	FinanceFactsReadIsolationEnabled   bool // MONITOR_FINANCE_FACTS_READ_ISOLATION_ENABLED，默认 false；经营核算事实使用单独只读 SQLite 连接
+	UsageFactsReadIsolationEnabled     bool // MONITOR_USAGE_FACTS_READ_ISOLATION_ENABLED，默认 false；用户用量页面聚合查询使用单独只读 SQLite 连接，不排在后台写入之后
 	// Optional root-only readonly handoff preview. Both empty means disabled.
 	FinanceGiftHandoffPreviewDir            string // MONITOR_FINANCE_GIFT_HANDOFF_PREVIEW_DIR
 	FinanceGiftHandoffPreviewSHA256         string // MONITOR_FINANCE_GIFT_HANDOFF_PREVIEW_SHA256
@@ -556,6 +557,7 @@ func LoadSettings() Settings {
 		FinanceReportSnapshotReadEnabled:         env("MONITOR_FINANCE_REPORT_SNAPSHOT_READ_ENABLED", "false") == "true",
 		FinanceFastSnapshotEnabled:               env("MONITOR_FINANCE_FAST_SNAPSHOT_ENABLED", "false") == "true",
 		FinanceFactsReadIsolationEnabled:         env("MONITOR_FINANCE_FACTS_READ_ISOLATION_ENABLED", "false") == "true",
+		UsageFactsReadIsolationEnabled:           env("MONITOR_USAGE_FACTS_READ_ISOLATION_ENABLED", "false") == "true",
 		FinanceGiftHandoffPreviewDir:             strings.TrimSpace(env("MONITOR_FINANCE_GIFT_HANDOFF_PREVIEW_DIR", "")),
 		FinanceGiftHandoffPreviewSHA256:          strings.TrimSpace(env("MONITOR_FINANCE_GIFT_HANDOFF_PREVIEW_SHA256", "")),
 		FinanceGiftHandoffApprovalEnabled:        env("MONITOR_FINANCE_GIFT_HANDOFF_APPROVAL_ENABLED", "false") == "true",
