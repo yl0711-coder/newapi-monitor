@@ -7,6 +7,12 @@ import (
 )
 
 func (m *Monitor) modelFRTRows(ctx context.Context, from, to int64, filter ModelFRTFilter) ([]modelFRTRow, error) {
+	return m.modelFRTRowsGrouped(ctx, from, to, filter, false)
+}
+
+// Governance uses the identical validity checks and sums, retaining minutes for
+// trends. It never averages minute means and never queries the production DB.
+func (m *Monitor) modelFRTRowsGrouped(ctx context.Context, from, to int64, filter ModelFRTFilter, minutes bool) ([]modelFRTRow, error) {
 	// Keep the old page's per-user HAVING population, then merge to leaf keys in
 	// SQLite. Validate each original row before SUM: corrupt rows cannot cancel.
 	columns := []string{"ttft_500", "ttft_1k", "ttft_2k", "ttft_5k", "ttft_10k", "ttft_inf", "ttft_observed", "ttft_over_3s"}
@@ -18,6 +24,10 @@ func (m *Monitor) modelFRTRows(ctx context.Context, from, to int64, filter Model
 	nulls := []string{"ttft_max_ms IS NULL"}
 	for _, column := range columns {
 		nulls = append(nulls, column+" IS NULL")
+	}
+	for _, column := range []string{"success", "anomaly", "failed"} {
+		projection := "COALESCE(SUM(" + column + "),0) AS " + column
+		inner, outer = append(inner, projection), append(outer, projection)
 	}
 	invalid := ttftInvalidRowPredicate("capacity_user_minute_samples") + " OR " + strings.Join(nulls, " OR ")
 	where := ""
@@ -34,7 +44,13 @@ func (m *Monitor) modelFRTRows(ctx context.Context, from, to int64, filter Model
 		where += " AND TRIM(model_name) = ?"
 		args = append(args, *filter.Model)
 	}
-	args = append(args, modelFRTMaxLeaves+1)
+	limit := modelFRTMaxLeaves
+	minuteColumn := ""
+	if minutes {
+		limit = groupGovernanceMaxMinuteRows
+		minuteColumn = "bucket_ts, "
+	}
+	args = append(args, limit+1)
 	// Validate before SUM so negative/missing rows cannot cancel. Empty historical
 	// rows add no samples; history with valid samples but no sum blocks only mean.
 	version := strconv.Itoa(frtSumSemanticsVersion)
@@ -54,26 +70,26 @@ func (m *Monitor) modelFRTRows(ctx context.Context, from, to int64, filter Model
 	if sumColumns != 3 {
 		meanProjection = "0 AS frt_sum_ms, 0 AS frt_sum_observed, SUM(CASE WHEN ttft_observed > 0 THEN 1 ELSE 0 END) AS mean_unsupported_rows, 0 AS mean_invalid_rows,"
 	}
-	query := `SELECT channel_id, grp, model, ` + strings.Join(outer, ",") + `,
+	query := `SELECT ` + minuteColumn + `channel_id, grp, model, ` + strings.Join(outer, ",") + `,
   MAX(ttft_max_ms) AS ttft_max_ms,
   SUM(frt_sum_ms) AS frt_sum_ms, SUM(frt_sum_observed) AS frt_sum_observed,
   SUM(mean_unsupported_rows) AS mean_unsupported_rows, SUM(mean_invalid_rows) AS mean_invalid_rows,
   SUM(historical_rows) AS historical_rows, SUM(invalid_rows) AS invalid_rows
-  FROM (SELECT channel_id, grp, model_name AS model, ` + strings.Join(inner, ",") + `,
+  FROM (SELECT ` + minuteColumn + `channel_id, grp, model_name AS model, ` + strings.Join(inner, ",") + `,
    COALESCE(MAX(ttft_max_ms),0) AS ttft_max_ms,
 ` + meanProjection + `
    SUM(CASE WHEN COALESCE(ttft_semantics_version,0) <> ? THEN 1 ELSE 0 END) AS historical_rows,
    SUM(CASE WHEN (` + invalid + `) THEN 1 ELSE 0 END) AS invalid_rows
    FROM capacity_user_minute_samples
    WHERE bucket_ts >= ? AND bucket_ts < ? AND traffic_class_version = ? AND user_id >= 0 ` + where + `
-   GROUP BY grp, model_name, user_id, channel_id
+   GROUP BY ` + minuteColumn + `grp, model_name, user_id, channel_id
    HAVING SUM(CASE WHEN success+anomaly+failed > 0 THEN success+anomaly+failed ELSE 0 END) > 0
-  ) GROUP BY channel_id, grp, model LIMIT ?`
+  ) GROUP BY ` + minuteColumn + `channel_id, grp, model LIMIT ?`
 	var rows []modelFRTRow
 	if err := m.storeDB.WithContext(ctx).Raw(query, args...).Scan(&rows).Error; err != nil {
 		return nil, err
 	}
-	if len(rows) > modelFRTMaxLeaves {
+	if len(rows) > limit {
 		return nil, errModelFRTLimit
 	}
 	return rows, nil
@@ -94,23 +110,17 @@ func (m *Monitor) modelFRTCoverage(ctx context.Context, from, to int64) (ModelFR
 		requestComplete, frtComplete = proof.RequestsComplete, proof.FRTComplete
 		result.From, result.Through = modelFRTTime(proof.FRTFromTs), modelFRTTime(proof.FRTThroughTs)
 	} else {
-		var state MetricFinalizeState
-		if err := m.storeDB.WithContext(ctx).Where("id = ?", 1).Limit(1).Find(&state).Error; err != nil {
-			return result, err
-		}
-		var err error
-		requestComplete, err = m.capacityWindowCoverage(ctx, from, to, true)
+		requests, proof, err := m.modelMinuteProof(ctx, to)
 		if err != nil {
 			return result, err
 		}
-		frtComplete, err = capacityTTFTProjectionCoverage(ctx, m.storeDB, from, to)
+		projection, err := capacityProjectionCoverage(ctx, m.storeDB, from, to)
 		if err != nil {
 			return result, err
 		}
-		frtComplete = frtComplete && state.TTFTSemanticsVersion == ttftCoverageSemanticsVersion && state.TTFTCoverageFromTs > 0 && state.TTFTCoverageFromTs <= from && state.TTFTCoverageThroughTs >= to
-		if state.TTFTSemanticsVersion == ttftCoverageSemanticsVersion {
-			result.From, result.Through = modelFRTTime(state.TTFTCoverageFromTs), modelFRTTime(min(state.TTFTCoverageThroughTs, to))
-		}
+		requestComplete = requests.covers(from, to) && projection.RequestErrors == 0
+		frtComplete = proof.covers(from, to) && projection.FRTErrors == 0
+		result.From, result.Through = modelFRTTime(proof.From), modelFRTTime(minPositive(proof.Through, to))
 	}
 	rowsComplete, err := m.modelStatisticsTTFTRowsCoverage(ctx, from, to)
 	if err != nil {

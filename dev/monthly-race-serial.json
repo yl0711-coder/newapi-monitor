@@ -4,7 +4,7 @@
  "jobs": 1,
  "prefixes": [],
  "tests": [
-  "TestRetentionFullReceiverPayloadPerformance"
+  "TestRetentionBoundedReceiverPayloadRace"
  ],
  "mode": "race"
 }

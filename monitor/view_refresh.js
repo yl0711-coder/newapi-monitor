@@ -1,7 +1,7 @@
 (function(){
 'use strict';
 // Capture when committing, since the user can scroll or edit during a slow fetch.
-const keys=['data-frt-key','data-frt-model-key','data-ms-expand','data-ms-group-key','data-ms-section-key','data-ms-channel-key','data-lc-id','data-ch-row','data-al-row','data-incident-id'];
+const keys=['data-frt-key','data-frt-model-key','data-ms-expand','data-ms-group-key','data-ms-section-key','data-ms-channel-key','data-lc-id','data-ch-row','data-al-row','data-incident-id','data-gg-key'];
 function identity(el){
   if(el.id)return ['id',el.id];
   for(const key of keys)if(el.hasAttribute(key))return [key,el.getAttribute(key)];

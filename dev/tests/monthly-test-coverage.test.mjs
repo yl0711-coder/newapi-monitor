@@ -1,14 +1,14 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {readFileSync} from 'node:fs';
-import {checkMonthlyTestCoverage, checkMonthlyNativeResults, monthlyNativeOnlyTests, monthlyBoundedRaceTest} from '../check-monthly-test-coverage.mjs';
+import {checkMonthlyTestCoverage, checkMonthlyNativeResults, monthlyNativeOnlyTests, monthlyBoundedRaceTests} from '../check-monthly-test-coverage.mjs';
 
-const names = ['TestMoney', 'TestOwner', 'ExampleBill', 'FuzzAmounts', monthlyBoundedRaceTest];
+const names = ['TestMoney', 'TestOwner', 'ExampleBill', 'FuzzAmounts', ...monthlyBoundedRaceTests];
 const listing = values => `${values.join('\n')}\nok example.invalid/monthlydraft 0.1s\n`;
 
 test('all monthly tests are accounted for by race plus the mandatory real-deadline scale gate', () => {
   const result = checkMonthlyTestCoverage(listing([...names, ...monthlyNativeOnlyTests]), listing(names));
-  assert.equal(result.allCount, names.length + 1);
+  assert.equal(result.allCount, names.length + monthlyNativeOnlyTests.length);
   assert.equal(result.raceCount, names.length);
   assert.deepEqual(result.nativeOnly, monthlyNativeOnlyTests);
   for (const name of monthlyNativeOnlyTests) assert.ok(new RegExp(result.nativePattern).test(name));
@@ -25,20 +25,24 @@ test('coverage gate rejects missing scale, missing race, unknown exemptions and 
     [all, [...names, 'TestUnregisteredRaceOnly']],
     [[...all, names[0]], names],
     [all, [...names, names[0]]],
-    [all, names.filter(name => name !== monthlyBoundedRaceTest)],
+    ...monthlyBoundedRaceTests.map(testName => [all, names.filter(name => name !== testName)]),
     [[], []],
   ];
   for (const [a, r] of invalid) assert.throws(() => checkMonthlyTestCoverage(listing(a), listing(r)));
 });
 
 test('mandatory native scale must actually execute and pass; skipped, empty and truncated runs fail', () => {
-  const name = monthlyNativeOnlyTests[0];
   const encode = rows => rows.map(row => JSON.stringify(row)).join('\n');
-  const passed = [{Action:'pass',Test:name},{Action:'pass'}];
-  assert.deepEqual(checkMonthlyNativeResults(encode(passed)), {passed:1});
-  for (const rows of [[], [{Action:'pass'}], [{Action:'pass',Test:name}],
-    [{Action:'skip',Test:name},{Action:'pass'}], [{Action:'fail',Test:name},{Action:'fail'}],
-    [passed[0],passed[0],passed[1]]]) assert.throws(() => checkMonthlyNativeResults(encode(rows)));
+  const completed = monthlyNativeOnlyTests.map(name => ({Action:'pass',Test:name}));
+  const passed = [...completed, {Action:'pass'}];
+  assert.deepEqual(checkMonthlyNativeResults(encode(passed)), {passed:monthlyNativeOnlyTests.length});
+  for (const rows of [[], [{Action:'pass'}], completed,
+    ...monthlyNativeOnlyTests.flatMap(name => [
+      passed.filter(row => row.Test !== name),
+      passed.map(row => row.Test === name ? {...row,Action:'skip'} : row),
+      passed.map(row => row.Test === name ? {...row,Action:'fail'} : row),
+    ]),
+    [passed[0], ...passed]]) assert.throws(() => checkMonthlyNativeResults(encode(rows)));
 });
 
 test('CI runs native scale as a required gate and enumerates race-built tests for race shards', () => {
@@ -64,4 +68,12 @@ test('CI runs native scale as a required gate and enumerates race-built tests fo
   assert.match(common, /for _, u := range e.Users/);
   assert.match(common, /large per-account\/token money changed/);
   assert.doesNotMatch(file + common, /t\.Skip|testing\.Short|os\.Getenv/);
+  const retentionNative = readFileSync(new URL('../../internal/monthlydraft/retention_payload_native_test.go', import.meta.url), 'utf8');
+  const retentionCommon = readFileSync(new URL('../../internal/monthlydraft/retention_test.go', import.meta.url), 'utf8');
+  assert.match(retentionNative, /^\/\/go:build !race/);
+  assert.match(retentionNative, /testRetentionReceiverPayload\(t, 512<<10\)/);
+  assert.match(retentionCommon, /testRetentionReceiverPayload\(t, 32<<10\)/);
+  assert.match(retentionCommon, /for i := range generationRecordLimit/);
+  assert.match(retentionCommon, /InspectGenerationRetention\(ctx, ro, start\)/);
+  assert.doesNotMatch(retentionNative + retentionCommon, /t\.Skip|testing\.Short|os\.Getenv/);
 });

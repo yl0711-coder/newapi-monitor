@@ -879,26 +879,26 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
 
 <div class="tabpane group-governance-page" id="tab-group-governance" hidden>
   <section class="gg-readonly">
-    <div><b>只读审计，不会修改 NewAPI 配置</b><p>后台低频生成脱敏快照；本页、用户展开和 CSV 只读 Monitor 本地 SQLite，页面刷新不会查询生产库。</p><p id="ggCoverage">历史覆盖尚未核验</p></div>
-    <div class="gg-readonly-actions"><button class="gg-btn" type="button" id="ggRefresh">刷新本地结果</button><a class="gg-btn primary" id="ggExport" href="/group-governance/export.csv">导出 CSV</a></div>
+    <div><b>渠道实时调整建议 · 由管理员在中转站手动操作</b><p>围绕首字耗时、错误归责与请求压力计算建议。配置低频同步，页面和展开只读本地结果。</p><p id="ggCoverage">近期数据覆盖待核验</p></div>
+    <div class="gg-readonly-actions"><button class="gg-btn" type="button" id="ggRefresh">刷新本地结果</button><a class="gg-btn primary" id="ggExport" href="/group-governance/export.csv">配置审计 CSV</a></div>
   </section>
   <div class="gg-alert" id="ggAlert" hidden></div>
   <div class="gg-kpis">
-    <div class="gg-kpi"><small>当前分组总数</small><b id="ggTotal">—</b></div>
-    <div class="gg-kpi bad"><small>高风险问题</small><b id="ggHigh">—</b></div>
-    <div class="gg-kpi warn"><small>无启用渠道分组</small><b id="ggNoChannelCount">—</b></div>
-    <div class="gg-kpi observe"><small>清理候选</small><b id="ggCleanup">—</b></div>
+    <div class="gg-kpi"><small>当前分组数（含无请求分组）</small><b id="ggTotal">—</b></div>
+    <div class="gg-kpi"><small>建议调整数（事项去重）</small><b id="ggAdjust">—</b></div>
+    <div class="gg-kpi bad"><small>其中：建议暂停</small><b id="ggPause">—</b></div>
+    <div class="gg-kpi warn"><small>其中：建议增加渠道</small><b id="ggIncrease">—</b></div>
   </div>
   <div class="gg-toolbar">
-    <input type="search" id="ggSearch" placeholder="搜索分组名或展示说明" aria-label="搜索分组">
-    <select id="ggStatus" aria-label="按状态筛选"><option value="">全部状态</option><option value="high">高风险</option><option value="pending">待处理</option><option value="observe">观察</option><option value="normal">正常</option></select>
+    <input type="search" id="ggSearch" placeholder="搜索分组、渠道或模型" aria-label="搜索分组、渠道或模型">
+    <select id="ggStatus" aria-label="按建议状态筛选"><option value="">全部状态</option><option value="pause">建议暂停</option><option value="increase">建议增加渠道</option><option value="attention">继续观察</option><option value="pending">暂无法判断</option><option value="low_sample">有效样本不足</option><option value="no_requests">近期没有请求</option><option value="stale">采集落后</option><option value="unchanged">不用调整</option></select>
     <label class="gg-check"><input type="checkbox" id="ggRatioName"> 名称含倍率</label>
     <label class="gg-check"><input type="checkbox" id="ggNoChannel"> 无启用渠道</label>
-    <label class="gg-check"><input type="checkbox" id="ggNoRequest"> 30 天无请求</label>
+    <label class="gg-check"><input type="checkbox" id="ggNoRequest"> 近期无请求</label>
     <span class="gg-count" id="ggVisible"></span>
     <span class="gg-count" id="ggUpdated">尚未加载</span>
   </div>
-  <div class="gg-table-wrap"><table class="gg-table"><thead><tr><th>状态</th><th>分组标识</th><th>展示说明</th><th>倍率</th><th>渠道 启/禁</th><th>用户</th><th>显式令牌</th><th>请求 7d/30d</th><th>主要问题</th><th>建议</th></tr></thead><tbody id="ggRows"><tr><td colspan="10" class="gg-empty">进入页面后加载本地快照</td></tr></tbody></table></div>
+  <div class="gg-tree" id="ggRows" aria-live="polite"><p class="gg-empty">进入页面后加载本地结果</p></div>
 </div><!-- /tab-group-governance -->
 
 <div class="tabpane finance-page" id="tab-finance" hidden>

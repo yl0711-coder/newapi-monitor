@@ -293,20 +293,18 @@ func TestRetentionBoundedFailureDoesNotInitializeOrReturnPartialResult(t *testin
 	}
 }
 
-func TestRetentionFullReceiverPayloadPerformance(t *testing.T) {
-	if raceDetector {
-		// The 5-second production bound is sized for native speed; hashing the
-		// maximum record set under the race detector takes longer even on an
-		// idle CI runner. Widen only this test's bound, never the production value.
-		inspect := retentionInspectionTimeout
-		retentionInspectionTimeout = 6 * inspect
-		t.Cleanup(func() { retentionInspectionTimeout = inspect })
-	}
+func TestRetentionBoundedReceiverPayloadRace(t *testing.T) {
+	// Keep the full record count under race instrumentation. The mandatory
+	// native test exercises the larger payload with the same production timeout.
+	testRetentionReceiverPayload(t, 32<<10)
+}
+
+func testRetentionReceiverPayload(t *testing.T, paddingBytes int) {
+	t.Helper()
 	f := generationFixtureNew(t)
 	ctx := context.Background()
-	// Exercise the full RECORD bound with large payloads, leaving CI headroom
-	// for race instrumentation. Byte overflow is separately rejected pre-decode.
-	raw := append(bytes.Clone(f.raw), bytes.Repeat([]byte(" "), 512<<10)...)
+	// Byte overflow is separately rejected before payload decoding.
+	raw := append(bytes.Clone(f.raw), bytes.Repeat([]byte(" "), paddingBytes)...)
 	for i := range generationRecordLimit {
 		p := f.plan
 		p.Owner.AuthVersion = int64(i + 1)
@@ -324,10 +322,11 @@ func TestRetentionFullReceiverPayloadPerformance(t *testing.T) {
 	ro := generationDB(t, f.receiverPath, true)
 	start := time.Now()
 	r, err := InspectGenerationRetention(ctx, ro, start)
-	if err != nil || r.InputCount != 32 || r.ReviewRequired != 32 || r.RetainedPayloadBytes < 16<<20 || r.ArchiveCopyCandidates != 0 {
+	if err != nil || r.InputCount != generationRecordLimit || r.ReviewRequired != generationRecordLimit ||
+		r.RetainedPayloadBytes < int64(generationRecordLimit*paddingBytes) || r.ArchiveCopyCandidates != 0 {
 		t.Fatal("full receiver inspection failed", err)
 	}
-	t.Logf("32 retained inputs, %d bytes: read-only structural inventory %s (not bill generation)", r.RetainedPayloadBytes, time.Since(start))
+	t.Logf("%d retained inputs, %d bytes: read-only structural inventory %s (not bill generation)", generationRecordLimit, r.RetainedPayloadBytes, time.Since(start))
 }
 
 func TestRetentionByteLimitsRejectBeforeDecodingPayloads(t *testing.T) {

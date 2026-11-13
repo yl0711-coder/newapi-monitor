@@ -30,6 +30,10 @@ func (m *Monitor) capacityWindowCoverage(ctx context.Context, from, to int64, us
 	if !users {
 		return true, nil
 	}
+	if ctx.Value(reportProjectionCacheKey{}) != nil {
+		result, err := capacityProjectionCoverage(ctx, m.storeDB, from, to)
+		return err == nil && result.RequestErrors == 0, err
+	}
 	var mismatches int64
 	err := m.storeDB.WithContext(ctx).Raw(`SELECT COUNT(*) FROM (
 		SELECT bucket_ts FROM (
@@ -108,6 +112,10 @@ func capacityTTFTProjectionComplete(ctx context.Context, db *gorm.DB, from, to i
 func capacityTTFTProjectionCoverage(ctx context.Context, db *gorm.DB, from, to int64) (bool, error) {
 	if db == nil || from >= to {
 		return false, nil
+	}
+	if ctx.Value(reportProjectionCacheKey{}) != nil {
+		result, err := capacityProjectionCoverage(ctx, db, from, to)
+		return err == nil && result.FRTErrors == 0, err
 	}
 	// Keep the reconciliation inside SQLite: transferring every minute/key to
 	// Go grows with the full historical window, and string-joined keys are not

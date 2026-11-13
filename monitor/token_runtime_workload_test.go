@@ -16,6 +16,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -121,7 +122,11 @@ func (r *tokenWorkloadRows) Next(dest []driver.Value) error {
 func TestTokenMeteringReplayFailureDoesNotIdleDurableForwardProgress(t *testing.T) {
 	for _, replayFirst := range []bool{false, true} {
 		t.Run(fmt.Sprintf("replay_first_%t", replayFirst), func(t *testing.T) {
-			tokenMeteringCheckReplayFailureProgress(t, replayFirst)
+			// Exercise the injected replay timeout independently of host disk
+			// speed, which may legitimately make a forward page yield early.
+			synctest.Test(t, func(t *testing.T) {
+				tokenMeteringCheckReplayFailureProgress(t, replayFirst)
+			})
 		})
 	}
 }

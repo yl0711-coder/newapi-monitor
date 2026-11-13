@@ -40,30 +40,35 @@ const minSample = 20
 // Monitor 是一个监控实例:持有配置、生产库只读连接、本地采样库与采样心跳。
 // 用 New 创建,Start 启动后台采样,RegisterRoutes 挂载页面与接口。零包级全局,可多实例、易测。
 type Monitor struct {
-	tokenDetectionCapacityReady atomic.Bool
-	ecsLogPolicies              []ECSLogPolicy
-	ecsLogOwnershipActive       atomic.Bool
-	ecsLogVerify                func(context.Context, ecsLogRegistration, ECSLogPolicy) (ECSLogSource, error)
-	ecsLogVerifications         atomic.Int32
-	ecsLogRequests              atomic.Int32
-	cfg                         Settings
-	prodDB                      *sql.DB              // new-api 生产库【只读】连接(采样器周期查询 + 用户用量按需查询);nil = 未连接
-	portalLogColumns            portalLogColumnCache // Usage 可选来源列元数据缓存；不迁移业务表
-	storeDB                     *gorm.DB             // 本地采样库
-	tokenDB                     *gorm.DB             // Optional isolated Token facts/results store.
-	tokenReadDB                 *gorm.DB             // Bounded WAL readers, independent of the Token writer.
-	tokenBackgroundReadOnce     sync.Once
-	tokenBackgroundReadGate     chan struct{}            // Long background read phases share one of the existing readers.
-	tokenMeteringRounds         atomic.Uint64            // Rotate the first lane when a round can finish only one page.
-	tokenMeteringMigrationTurns atomic.Uint64            // Fair turns; each migration keeps its own durable checkpoint.
-	tokenMeteringPartialPage    atomic.Bool              // A durable local prefix still has already-read source rows to resume.
-	tokenMeteringCommitRows     atomic.Int64             // Reuse measured local write size across partially committed source pages.
-	tokenCleanupCommitRows      atomic.Int64             // Retain the measured cleanup size across bounded sweeps.
-	tokenDetectionCleanupRows   atomic.Int64             // Expired results share fixed commit cost within the same cleanup budget.
-	tokenLinkCommitRows         atomic.Int64             // Retain association batch size without repeating writer warmup.
-	tokenMeteringMu             sync.Mutex               // A remembered completed lease never authorizes overlapping rounds.
-	tokenMeteringFinishedLease  string                   // Guarded by tokenMeteringMu; only the most recently finished owner.
-	tokenMeteringReadCache      *tokenMeteringCachedRead // Guarded by tokenMeteringMu; at most one bounded already-read page.
+	tokenDetectionCapacityReady   atomic.Bool
+	ecsLogPolicies                []ECSLogPolicy
+	ecsLogOwnershipActive         atomic.Bool
+	ecsLogVerify                  func(context.Context, ecsLogRegistration, ECSLogPolicy) (ECSLogSource, error)
+	ecsLogVerifications           atomic.Int32
+	ecsLogRequests                atomic.Int32
+	cfg                           Settings
+	prodDB                        *sql.DB              // new-api 生产库【只读】连接(采样器周期查询 + 用户用量按需查询);nil = 未连接
+	portalLogColumns              portalLogColumnCache // Usage 可选来源列元数据缓存；不迁移业务表
+	storeDB                       *gorm.DB             // 本地采样库
+	queuedWriteMu                 sync.Mutex           // guards queuedWriteDB
+	queuedWriteDB                 *gorm.DB             // 后台排队写连接(BEGIN IMMEDIATE，单连接)
+	queuedWriteClosed             bool                 // set by Close; no reopen afterwards
+	queuedWriteRetryAt            time.Time            // after a failed open, fall back until then
+	tokenDB                       *gorm.DB             // Optional isolated Token facts/results store.
+	tokenReadDB                   *gorm.DB             // Bounded WAL readers, independent of the Token writer.
+	tokenBackgroundReadOnce       sync.Once
+	tokenBackgroundReadGate       chan struct{} // Long background read phases share one of the existing readers.
+	tokenMeteringRounds           atomic.Uint64 // Rotate the first lane when a round can finish only one page.
+	tokenMeteringMigrationTurns   atomic.Uint64 // Fair turns; each migration keeps its own durable checkpoint.
+	tokenProjectionMigrationTurns atomic.Uint64
+	tokenMeteringPartialPage      atomic.Bool              // A durable local prefix still has already-read source rows to resume.
+	tokenMeteringCommitRows       atomic.Int64             // Reuse measured local write size across partially committed source pages.
+	tokenCleanupCommitRows        atomic.Int64             // Retain the measured cleanup size across bounded sweeps.
+	tokenDetectionCleanupRows     atomic.Int64             // Expired results share fixed commit cost within the same cleanup budget.
+	tokenLinkCommitRows           atomic.Int64             // Retain association batch size without repeating writer warmup.
+	tokenMeteringMu               sync.Mutex               // A remembered completed lease never authorizes overlapping rounds.
+	tokenMeteringFinishedLease    string                   // Guarded by tokenMeteringMu; only the most recently finished owner.
+	tokenMeteringReadCache        *tokenMeteringCachedRead // Guarded by tokenMeteringMu; at most one bounded already-read page.
 	// Contract migration walks the immutable (source_epoch, log_id) key in
 	// order. Keeping the cursor in memory avoids rescanning the retained facts
 	// table for every bounded batch; a restart safely resumes at zero.
@@ -85,10 +90,6 @@ type Monitor struct {
 	// into an apparent backlog.
 	tokenLocalWriteMu       tokenLocalWriter
 	tokenReportSummaryCache tokenSummaryCache
-	queuedWriteMu           sync.Mutex // guards queuedWriteDB
-	queuedWriteDB           *gorm.DB   // 后台排队写连接(BEGIN IMMEDIATE，单连接)
-	queuedWriteClosed       bool       // set by Close; no reopen afterwards
-	queuedWriteRetryAt      time.Time  // after a failed open, fall back until then
 	// usageFactsDB 独立承载高增长的用量小时/日事实、同步水位和资料快照。
 	// 生产通过 New 创建时默认与 storeDB 分文件，避免补数、WAL 膨胀、损坏或
 	// 写锁把告警配置、渠道配置和其他 Monitor 页面一起拖垮。测试直接调用
@@ -249,8 +250,12 @@ type Monitor struct {
 	// healthy recent live cursor.
 	stabilityProblemMigrationIncomplete atomic.Bool
 
-	chMu    sync.RWMutex
-	chNames map[string]string // 渠道 id->name 映射缓存
+	chMu                           sync.RWMutex
+	chNames                        map[string]string // 渠道 id->name 映射缓存
+	channelSnapshotSyncFailed      atomic.Bool       // Latest existing channel sync attempt; no additional source query.
+	groupGovernanceWakeOnce        sync.Once
+	groupGovernanceWake            chan struct{}
+	groupGovernanceWaitingChannels atomic.Bool
 
 	snapMu    sync.Mutex
 	snapCache map[snapshotCacheKey]cachedSnap // 按窗口和视图隔离缓存
@@ -832,6 +837,9 @@ func (m *Monitor) Start(ctx context.Context) {
 	m.startNginxEvidenceMaintenance(ctx)
 	m.startTokenMeteringMaintenance(ctx)
 	m.startTokenDeliveryMaintenance(ctx)
+	if m.cfg.GroupGovernanceEnabled {
+		go m.runGroupGovernanceRealtime(ctx)
+	}
 	go func() {
 		select {
 		case <-ctx.Done():

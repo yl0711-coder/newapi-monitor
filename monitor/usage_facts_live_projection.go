@@ -85,48 +85,6 @@ func (m *Monitor) loadUsageLiveProjection(ctx context.Context, ids []int64, from
 	return projection, err
 }
 
-// loadUsageLiveProjectionBatch 与 loadUsageLiveProjection 使用完全相同的判据，
-// 但返回逐成员结果，供客户维护一次读完所有公司后分别判断完整性。
-func (m *Monitor) loadUsageLiveProjectionBatch(ctx context.Context, ids []int64, fromTs, toTs int64, now time.Time) (*usageLiveProjectionBatch, error) {
-	if m == nil || !m.usageFactsReadEnabled() || len(ids) == 0 || toTs <= fromTs {
-		return nil, nil
-	}
-	dayTs := usageFactDayStart(now.Unix())
-	if fromTs > dayTs || toTs <= dayTs {
-		return nil, nil
-	}
-	finalizedThrough := m.usageFactsReadyThrough.Load()
-	if finalizedThrough < dayTs || finalizedThrough > now.Unix()+usageFactHourSeconds {
-		return nil, nil
-	}
-	unique := make(map[int64]struct{}, len(ids))
-	ordered := make([]int64, 0, len(ids))
-	for _, id := range ids {
-		if id <= 0 {
-			continue
-		}
-		if _, exists := unique[id]; exists {
-			continue
-		}
-		unique[id] = struct{}{}
-		ordered = append(ordered, id)
-	}
-	if len(ordered) == 0 {
-		return nil, nil
-	}
-	sort.Slice(ordered, func(i, j int) bool { return ordered[i] < ordered[j] })
-
-	qctx, cancel := usageFactQueryContext(ctx)
-	defer cancel()
-	var batch *usageLiveProjectionBatch
-	err := m.usageFactsStore().WithContext(qctx).Transaction(func(tx *gorm.DB) error {
-		var err error
-		batch, err = m.loadUsageLiveProjectionBatchTx(tx, ordered, dayTs, finalizedThrough, now)
-		return err
-	})
-	return batch, err
-}
-
 // loadUsageLiveProjectionTx deliberately reads publication, member proof,
 // profile watermarks and the historical baseline from one SQLite snapshot.
 // Without this transaction a fact publication between two SELECTs could pair

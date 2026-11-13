@@ -874,10 +874,8 @@ func TestCustomerHealthSpendGivesTotalOnlyWhenAllMembersResolved(t *testing.T) {
 	}
 }
 
-// 完整发布的成员即使今天没有事实行，也应得到可信的 0，而不是 partial。
-// usage_hour_facts 是稀疏表，零请求/零退款不会制造占位行；是否可补 0 必须由
-// published membership 证明，不能由聚合 map 是否有 key 猜测。
-func TestCustomerHealthFinalizedSpendPublishedZeroIsNotPartial(t *testing.T) {
+// 零消费由客户维护自己的完整分钟覆盖证明，Usage 的发布状态不参与判断。
+func TestCustomerHealthIndependentSpendZeroRequiresCoverage(t *testing.T) {
 	m := newTestMonitor(t)
 	m.prodDB = newFakeProdDB(t)
 	enableUsageFactsForTest(m)
@@ -886,14 +884,18 @@ func TestCustomerHealthFinalizedSpendPublishedZeroIsNotPartial(t *testing.T) {
 	finalizedThrough := from + usageFactHourSeconds
 	seedPublishedUsageFactsForTest(t, m, []int64{101}, from, finalizedThrough)
 	m.setUsageFactsReadiness(true, finalizedThrough)
+	m.cfg.CapacityEnabled = true
+	if err := m.saveCustomerHealthSourceCursor(from, finalizedThrough); err != nil {
+		t.Fatal(err)
+	}
 
 	row := CustomerHealthRow{
 		GroupID: groupID, Company: "零消费公司",
 		Members: []CustomerHealthMember{{UserID: 101, Username: "零消费成员"}},
 	}
 	m.attachCustomerHealthSpend(context.Background(), &row, from, to, chTestNow())
-	if row.SpendState != customerHealthSpendFinalized {
-		t.Fatalf("完整发布的零消费成员应为 finalized，不应是 partial: %+v", row)
+	if row.SpendState != customerHealthSpendSampled {
+		t.Fatalf("独立事实完整覆盖的零消费成员应为 sampled: %+v", row)
 	}
 	if row.TodaySpendUSD == nil || *row.TodaySpendUSD != 0 {
 		t.Fatalf("完整发布且无事实行应得到可信的公司 0，实际 %v", row.TodaySpendUSD)
@@ -903,9 +905,8 @@ func TestCustomerHealthFinalizedSpendPublishedZeroIsNotPartial(t *testing.T) {
 	}
 }
 
-// 回归：旧成员已发布、新成员尚未发布时，公司合计不得给部分和。测试构造真实
-// control/publication 状态，并故意给未发布成员塞入候选事实，确保读取面不会泄漏它。
-func TestCustomerHealthSpendNewMemberNotPublishedYieldsPartial(t *testing.T) {
+// 即使 Usage 有已发布金额，没有独立覆盖时也不能给客户维护填入部分和。
+func TestCustomerHealthSpendUsagePublicationCannotProveIndependentAmount(t *testing.T) {
 	m := newTestMonitor(t)
 	m.prodDB = newFakeProdDB(t)
 	enableUsageFactsForTest(m)
@@ -935,11 +936,11 @@ func TestCustomerHealthSpendNewMemberNotPublishedYieldsPartial(t *testing.T) {
 	if row.SpendState == customerHealthSpendFinalized {
 		t.Fatal("不得标成 finalized：那会让缺人的合计看起来是完整的封口金额")
 	}
-	if row.SpendState != customerHealthSpendPartial {
-		t.Fatalf("状态应为 %q，实际 %q", customerHealthSpendPartial, row.SpendState)
+	if row.SpendState != customerHealthSpendUnavailable {
+		t.Fatalf("独立覆盖缺失应为 unavailable，实际 %q", row.SpendState)
 	}
-	if row.Members[0].TodaySpendUSD == nil || math.Abs(*row.Members[0].TodaySpendUSD-2.0) > 1e-9 {
-		t.Fatalf("老成员金额应为 2.0，实际 %v", row.Members[0].TodaySpendUSD)
+	if row.Members[0].TodaySpendUSD != nil {
+		t.Fatal("不能用 Usage 的已发布老成员金额替代")
 	}
 	if row.Members[1].TodaySpendUSD != nil {
 		t.Fatal("新成员金额必须为 nil")
@@ -991,35 +992,18 @@ func TestCustomerHealthSpendFrontendNeverRendersZeroForUnknown(t *testing.T) {
 //
 // 客户维护的退路与实时投影都要算这个数。两处各写一份 SQL，同一家公司在
 // 两个页面上会显示不同金额，而且是"看起来都合理"的差异，极难发现。
-func TestCustomerHealthSpendSharesFinalizedNetFormula(t *testing.T) {
+func TestCustomerHealthSpendIndependentFactPath(t *testing.T) {
 	q, err := os.ReadFile("customer_health_query.go")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(q), "usageFactsTodayFinalizedNetByUser(") {
-		t.Fatal("客户维护必须调用共享的 usageFactsTodayFinalizedNetByUser，不得自写净额 SQL")
-	}
-	// 净额公式（消费 - 退款）在全仓库只能出现一次。
-	pattern := regexp.MustCompile(`COALESCE\(SUM\(consume_quota\),0\)-COALESCE\(SUM\(refund_quota\),0\)`)
-	entries, err := os.ReadDir(".")
-	if err != nil {
-		t.Fatal(err)
-	}
-	hits := []string{}
-	for _, e := range entries {
-		if e.IsDir() || !strings.HasSuffix(e.Name(), ".go") || strings.HasSuffix(e.Name(), "_test.go") {
-			continue
-		}
-		b, err := os.ReadFile(e.Name())
-		if err != nil {
-			t.Fatal(err)
-		}
-		if pattern.Match(b) {
-			hits = append(hits, e.Name())
+	for _, forbidden := range []string{"loadUsageLiveProjectionBatch(", "usageFactsTodayFinalizedNetByUser(", "m.usageFactsStore()"} {
+		if strings.Contains(string(q), forbidden) {
+			t.Fatalf("客户维护金额仍读取 Usage: %s", forbidden)
 		}
 	}
-	if len(hits) != 1 || hits[0] != "usage_facts_live_projection.go" {
-		t.Fatalf("今日已封口净额公式必须只在 usage_facts_live_projection.go 出现一次，实际: %v", hits)
+	if !strings.Contains(string(q), "FROM capacity_user_minute_samples") || !strings.Contains(string(q), "CustomerHealthSourceCursor") {
+		t.Fatal("缺少独立事实与覆盖证明")
 	}
 }
 
@@ -1752,6 +1736,13 @@ func TestCustomerHealthSpendBatchKeepsCompaniesIndependent(t *testing.T) {
 	finalizedThrough := from + usageFactHourSeconds
 	seedPublishedUsageFactsForTest(t, m, []int64{101}, from, finalizedThrough)
 	m.setUsageFactsReadiness(true, finalizedThrough)
+	m.cfg.CapacityEnabled = true
+	if err := m.saveCustomerHealthSourceCursor(from, finalizedThrough); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.storeDB.Create(&CapacityUserMinuteSample{BucketTs: from + 60, UserID: 101, ChannelID: 1, ModelName: "m", Grp: "g", Quota: 750000, RefundQuota: 250000, TrafficClassVersion: stabilityTrafficClassificationVersion}).Error; err != nil {
+		t.Fatal(err)
+	}
 	if err := m.usageFactsStore().Create(&UsageHourFact{
 		HourTs: from, DayTs: from, UserID: 101, ChannelID: 1, Grp: "g", ModelName: "m", TokenID: 1,
 		ConsumeQuota: 500000,
@@ -1763,11 +1754,11 @@ func TestCustomerHealthSpendBatchKeepsCompaniesIndependent(t *testing.T) {
 		{GroupID: pendingGroup, Company: "待发布公司", Members: []CustomerHealthMember{{UserID: 201}}},
 	}
 	m.attachCustomerHealthSpendBatch(context.Background(), rows, from, to, chTestNow())
-	if rows[0].TodaySpendUSD == nil || math.Abs(*rows[0].TodaySpendUSD-1) > 1e-9 || rows[0].SpendState != customerHealthSpendFinalized {
+	if rows[0].TodaySpendUSD == nil || math.Abs(*rows[0].TodaySpendUSD-1) > 1e-9 || rows[0].SpendState != customerHealthSpendSampled {
 		t.Fatalf("已发布公司不应被另一家公司拖累: %+v", rows[0])
 	}
-	if rows[1].TodaySpendUSD != nil || rows[1].SpendState != customerHealthSpendPartial {
-		t.Fatalf("未发布公司必须独立保持 partial: %+v", rows[1])
+	if rows[1].TodaySpendUSD == nil || *rows[1].TodaySpendUSD != 0 || rows[1].SpendState != customerHealthSpendSampled {
+		t.Fatalf("完整独立来源覆盖的零消费与 Usage 发布状态无关: %+v", rows[1])
 	}
 }
 

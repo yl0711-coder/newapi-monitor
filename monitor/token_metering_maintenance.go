@@ -354,10 +354,11 @@ func (m *Monitor) migrateTokenMeteringProjectionBatchProgress(ctx context.Contex
 	if m.tokenLocalWriteMu.collectionQueued() {
 		return 0, true, nil
 	}
-	// Advance every projection once per turn. A large queue migration must not
-	// starve report/counter recovery, and each prefix releases the shared writer.
+	// Rotate the first bounded prefix, including reference/revision membership.
+	// Previously those two dependencies waited for the million-row report queue
+	// to finish, making safe cleanup unreachable while capacity was exhausted.
 	projected := 0
-	for _, step := range []struct {
+	steps := []struct {
 		table string
 		run   func(*gorm.DB) error
 	}{
@@ -382,13 +383,37 @@ func (m *Monitor) migrateTokenMeteringProjectionBatchProgress(ctx context.Contex
 			}
 			return err
 		}},
-	} {
+		{"token_reference_members_checkpoint_v1", func(tx *gorm.DB) error {
+			_, err := migrateTokenReferenceMembers(tx)
+			if err == nil {
+				projected++
+			}
+			return err
+		}},
+		{"token_revision_members_checkpoint_v1", func(tx *gorm.DB) error {
+			_, err := migrateTokenRevisionMembers(tx)
+			if err == nil {
+				projected++
+			}
+			return err
+		}},
+	}
+	start := int((m.tokenProjectionMigrationTurns.Add(1) - 1) % uint64(len(steps)))
+	for i := range steps {
+		step := steps[(start+i)%len(steps)]
 		if !m.tokenReadStore().Migrator().HasTable(step.table) {
 			continue
 		}
 		var ready bool
 		if err := m.tokenReadStore().WithContext(ctx).Table(step.table).Where("id=1").Select("ready").Scan(&ready).Error; err != nil {
 			return projected, false, err
+		}
+		if ready && step.table == "token_revision_members_checkpoint_v1" {
+			var dirty bool
+			if err := m.tokenReadStore().WithContext(ctx).Raw("SELECT EXISTS(SELECT 1 FROM token_revision_members_dirty_v1 LIMIT 1)").Scan(&dirty).Error; err != nil {
+				return projected, false, err
+			}
+			ready = !dirty
 		}
 		if !ready {
 			if m.tokenLocalWriteMu.collectionQueued() {
@@ -397,30 +422,7 @@ func (m *Monitor) migrateTokenMeteringProjectionBatchProgress(ctx context.Contex
 			if err := m.tokenLocalWriteTransaction(ctx, step.run); err != nil {
 				return projected, false, err
 			}
-		}
-	}
-	if projected > 0 {
-		return projected, false, nil
-	}
-	if m.tokenReadStore().Migrator().HasTable("token_reference_members_checkpoint_v1") {
-		var ready bool
-		if err := m.tokenReadStore().WithContext(ctx).Raw("SELECT ready FROM token_reference_members_checkpoint_v1 WHERE id=1").Scan(&ready).Error; err != nil {
-			return 0, false, err
-		}
-		if !ready {
-			err := m.tokenLocalWriteTransaction(ctx, func(tx *gorm.DB) error { var err error; ready, err = migrateTokenReferenceMembers(tx); return err })
-			return 0, !ready, err
-		}
-	}
-	if m.tokenReadStore().Migrator().HasTable("token_revision_members_checkpoint_v1") {
-		var pending bool
-		if err := m.tokenReadStore().WithContext(ctx).Raw(`SELECT EXISTS(SELECT 1 FROM token_revision_members_checkpoint_v1 WHERE ready=0) OR EXISTS(SELECT 1 FROM token_revision_members_dirty_v1 LIMIT 1)`).Scan(&pending).Error; err != nil {
-			return 0, false, err
-		}
-		if pending {
-			var ready bool
-			err := m.tokenLocalWriteTransaction(ctx, func(tx *gorm.DB) error { var err error; ready, err = migrateTokenRevisionMembers(tx); return err })
-			return 0, !ready, err
+			return projected, true, nil
 		}
 	}
 	return m.migrateTokenMeteringFactsBatchProgress(ctx, now)

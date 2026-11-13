@@ -162,7 +162,9 @@ type CustomerHealthRow struct {
 	// 这是系统定位宪法「缺失绝不显示为零」在本字段上的形态。
 	TodaySpendUSD *float64 `json:"today_spend_usd"`
 	// SpendState 金额的可信状态，取值见 customerHealthSpend* 常量。
-	SpendState string `json:"spend_state"`
+	SpendState     string `json:"spend_state"`
+	SpendFromTs    int64  `json:"spend_from_ts"`
+	SpendThroughTs int64  `json:"spend_through_ts"`
 	// SpendNote 金额口径/为什么取不到的说明，页面必须展示。
 	SpendNote string `json:"spend_note"`
 }

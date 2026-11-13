@@ -965,8 +965,14 @@ func (m *Monitor) sampleRangeWithPriorityOptions(ctx context.Context, fromTs, to
 		return 0, err
 	}
 	healthReady := true
+	var governance *ggErrorProjection
+	var observers []func(LogChainRow, logChainFault)
+	if includeCapacity && m.cfg.GroupGovernanceEnabled {
+		governance = newGGErrorProjection(userBatch)
+		observers = append(observers, governance.observe)
+	}
 	if includeCapacity {
-		if err := classifyCustomerHealthErrors(cctx, m.prodDB, fromTs, toTs, userBatch); err != nil {
+		if err := classifyCustomerHealthErrors(cctx, m.prodDB, fromTs, toTs, userBatch, observers...); err != nil {
 			if healthOnly {
 				return 0, err
 			}
@@ -976,6 +982,9 @@ func (m *Monitor) sampleRangeWithPriorityOptions(ctx context.Context, fromTs, to
 			// its existing policy-replay lane retries without moving coverage.
 			slog.Warn("客户维护诊断分类延期；保留共享统计，等待独立重试", "err", err)
 		}
+	}
+	if governance != nil && healthReady {
+		governance.collectDelivery(cctx, m.prodDB, fromTs, toTs)
 	}
 	// Source rows are fully consumed. Local SQLite contention must not keep
 	// other collectors or the runtime health probe out of the source lane.
@@ -991,9 +1000,51 @@ func (m *Monitor) sampleRangeWithPriorityOptions(ctx context.Context, fromTs, to
 			}
 		}
 		if !healthReady {
-			return upsertCustomerHealthDeferredSamples(tx, userBatch)
+			if err := upsertCustomerHealthDeferredSamples(tx, userBatch); err != nil {
+				return err
+			}
+		} else if err := upsertCapacityUserMinuteSamplesDB(tx, userBatch); err != nil {
+			return err
 		}
-		return upsertCapacityUserMinuteSamplesDB(tx, userBatch)
+		if includeCapacity && includeMetrics {
+			if err := tx.SavePoint("model_live_proof").Error; err != nil {
+				return err
+			}
+			if err := publishModelMinuteCoverage(tx, fromTs, toTs, time.Now().Unix()); err != nil {
+				if rollback := tx.RollbackTo("model_live_proof").Error; rollback != nil {
+					return rollback
+				}
+				slog.Warn("模型统计完整分钟证明发布延期；保留共享事实及原水位", "err", err)
+			}
+		}
+		if governance != nil {
+			// Optional diagnostic enrichment must not roll back the independent
+			// request/FRT projection on disk pressure or an incompatible snapshot.
+			if err := tx.SavePoint("gg_errors").Error; err != nil {
+				return err
+			}
+			var projectionErr error
+			if healthReady {
+				projectionErr = governance.publish(tx, time.Now().Unix())
+			} else {
+				projectionErr = tx.Model(&GroupGovernanceErrorMinute{}).Where("bucket_ts>=? AND bucket_ts<?", fromTs, toTs).Update("version", 0).Error
+			}
+
+			if projectionErr != nil {
+				if rollback := tx.RollbackTo("gg_errors").Error; rollback != nil {
+					return rollback
+				}
+				// The shared facts may have changed even when counts did not.
+				// Old reasons cannot remain certified after a failed replacement.
+				if tx.Migrator().HasTable(&GroupGovernanceErrorMinute{}) {
+					if err := tx.Model(&GroupGovernanceErrorMinute{}).Where("bucket_ts>=? AND bucket_ts<?", fromTs, toTs).Update("version", 0).Error; err != nil {
+						return err
+					}
+				}
+				slog.Warn("分组治理错误投影延期", "err", projectionErr)
+			}
+		}
+		return nil
 	}); err != nil {
 		return 0, err
 	}
@@ -1422,33 +1473,43 @@ func (m *Monitor) logChainChannelSyncEvery() time.Duration {
 // startLogChainChannelSync 是最小权限客户排障模式唯一的后台来源任务。
 // 只复用 channels 查询刷新本地快照，不启动 logs 聚合、用户/令牌同步或 Usage Facts。
 func (m *Monitor) startLogChainChannelSync(ctx context.Context) {
-	syncNow := func() bool {
-		if err := m.refreshChannelsContext(ctx); err != nil {
-			if ctx.Err() == nil && !errors.Is(err, errSourceNotReady) {
-				slog.Warn("客户排障渠道快照同步失败", "err", err)
-			}
-			return false
-		}
-		return true
-	}
-	if !syncNow() && ctx.Err() != nil {
-		return
-	}
-	ticker := time.NewTicker(m.logChainChannelSyncEvery())
-	defer ticker.Stop()
+	timer := time.NewTimer(0)
+	defer timer.Stop()
+	failures := 0
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
-			if !syncNow() && ctx.Err() != nil {
+		case <-timer.C:
+			err := m.refreshChannelsContext(ctx)
+			if ctx.Err() != nil {
 				return
 			}
+			if err != nil {
+				failures = min(failures+1, 4)
+				if !errors.Is(err, errSourceNotReady) {
+					slog.Warn("客户排障渠道快照同步失败", "err", err)
+				}
+			} else {
+				failures = 0
+			}
+			timer.Reset(channelSyncRetryDelay(m.logChainChannelSyncEvery(), failures))
 		}
 	}
 }
 
-func (m *Monitor) refreshChannelsContext(parent context.Context) error {
+func (m *Monitor) refreshChannelsContext(parent context.Context) (result error) {
+	timing := &configSyncTiming{}
+	timing.enter("queue")
+	defer func() { timing.finish("channels", result) }()
+	defer func() {
+		if parent.Err() == nil {
+			m.channelSnapshotSyncFailed.Store(result != nil)
+			if result == nil {
+				m.notifyGroupGovernanceChannelsReady()
+			}
+		}
+	}()
 	if m.prodDB == nil {
 		return errSourceNotReady
 	}
@@ -1458,7 +1519,13 @@ func (m *Monitor) refreshChannelsContext(parent context.Context) error {
 	if err != nil {
 		return err
 	}
-	defer release()
+	released := false
+	defer func() {
+		if !released {
+			release()
+		}
+	}()
+	timing.enter("source")
 	// type 按 NewAPI 官方映射展示厂商。base_url 只在内存中提取可注册主域名，
 	// 本地快照不保存完整 URL/路径，更不读取 key。这只是在原有渠道小查询上多取一列。
 	rows, err := m.prodDB.QueryContext(cctx, "SELECT id, name, type, status, `group`, models, base_url FROM channels")
@@ -1476,7 +1543,6 @@ func (m *Monitor) refreshChannelsContext(parent context.Context) error {
 	names := map[string]string{}
 	var snaps []ChannelSnap
 	now := time.Now().Unix()
-	prev := m.channelEnabledState() // 上一轮各渠道 (status, enabled_since)
 	for rows.Next() {
 		var id, channelType, status int
 		var name, grp, models, baseURL sql.NullString
@@ -1484,31 +1550,47 @@ func (m *Monitor) refreshChannelsContext(parent context.Context) error {
 			return err
 		}
 		names[strconv.Itoa(id)] = name.String
-		p := prev[id] // 不存在或曾被删除都按新建处理，重新出现时从本轮重新计算启用起点。
-		if p.deletedAt > 0 {
-			p.status, p.since = 0, 0
-		}
-		enabledSince := nextEnabledSince(status, p.status, p.since, now)
 		snaps = append(snaps, ChannelSnap{
 			ID: id, Name: name.String, Type: channelType, Vendor: newAPIChannelTypeName(channelType), Status: status,
 			BaseDomain: channelDomainWithAlias(aliases, normalizeChannelBaseDomain(baseURL.String)), BaseHost: normalizeChannelBaseHost(baseURL.String),
 			Groups: grp.String, Models: models.String,
-			EnabledSince: enabledSince, UpdatedAt: now,
+			UpdatedAt: now,
 		})
 	}
 	if err := rows.Err(); err != nil {
 		m.reportSourceQueryError(err)
 		return err
 	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	release()
+	released = true
+	timing.enter("publish")
+	var prior []ChannelSnap
+	if err := m.storeDB.WithContext(cctx).Select("id,status,enabled_since,deleted_at").Find(&prior).Error; err != nil {
+		return err
+	}
+	prev := map[int]ChannelSnap{}
+	for _, s := range prior {
+		prev[s.ID] = s
+	}
+	for i := range snaps {
+		p := prev[snaps[i].ID]
+		if p.DeletedAt > 0 {
+			p.Status, p.EnabledSince = 0, 0
+		}
+		snaps[i].EnabledSince = nextEnabledSince(snaps[i].Status, p.Status, p.EnabledSince, now)
+	}
 	// rows 已成功读到 EOF，因此即使为空也是可信的当前状态。
 	// 同步清空内存名称映射，并将本地旧渠道软删除，但保留最后快照。
-	m.chMu.Lock()
-	m.chNames = names
-	m.chMu.Unlock()
-	if err := m.replaceChannelSnapsAuthoritative(snaps, now); err != nil {
+	if err := m.replaceChannelSnapsAuthoritativeContext(cctx, snaps, now); err != nil {
 		slog.Warn("渠道健康快照写入失败(忽略,不影响监控)", "err", err)
 		return err
 	}
+	m.chMu.Lock()
+	m.chNames = names
+	m.chMu.Unlock()
 	return nil
 }
 

@@ -7,7 +7,7 @@ import (
 
 func TestModelStatisticsCollectionFailureVisibleBeforeWatermarkLags(t *testing.T) {
 	for _, independent := range []bool{false, true} {
-		name := "metric_finalize"
+		name := "normal_source"
 		if independent {
 			name = "customer_health"
 		}
@@ -22,8 +22,8 @@ func TestModelStatisticsCollectionFailureVisibleBeforeWatermarkLags(t *testing.T
 				m.customerHealthSourceLastSuccess.Store(now - 1)
 				m.customerHealthSourceLastFailure.Store(now)
 			} else {
-				m.metricFinalizeLastSuccess.Store(now - 1)
-				m.metricFinalizeLastFailure.Store(now)
+				m.sourceLastSuccessAt.Store(now - 1)
+				m.sourceLastFailureAt.Store(now)
 			}
 			after, err := m.buildModelStatisticsReport(context.Background(), "24h", modelFRTTestNow)
 			if err != nil {
@@ -39,7 +39,7 @@ func TestModelStatisticsCollectionFailureVisibleBeforeWatermarkLags(t *testing.T
 			if independent {
 				m.customerHealthSourceLastSuccess.Store(now + 1)
 			} else {
-				m.metricFinalizeLastSuccess.Store(now + 1)
+				m.sourceLastSuccessAt.Store(now + 1)
 			}
 			if m.modelReportCollectionFailed(false) {
 				t.Fatal("recovered collection must clear failure")

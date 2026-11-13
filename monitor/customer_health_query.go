@@ -7,6 +7,8 @@ import (
 	"sort"
 	"strconv"
 	"time"
+
+	"gorm.io/gorm"
 )
 
 // customerHealthQueryTimeout 单条本地查询预算。
@@ -292,8 +294,7 @@ func customerHealthRelevantChannels(companies []customerHealthCompany, usage *cu
 // 每次刷新都那么干会让客户查自己日志排队。所以本页取不到就如实说取不到，
 // 不借那条路补数——这是"新增功能不得妨碍既有功能"的直接应用。
 //
-// 口径与用户用量页的今日总消费同源：都是 loadUsageLiveProjection 的
-// 「已封口小时事实 + (当前累计 - 封口后锚点)」双水位（见 usage-live-projection.md）。
+// 金额只读客户维护的用户分钟事实与独立连续覆盖，不受 Usage 读开关影响。
 func (m *Monitor) attachCustomerHealthSpend(ctx context.Context, row *CustomerHealthRow, fromTs, toTs int64, now time.Time) {
 	rows := []CustomerHealthRow{*row}
 	m.attachCustomerHealthSpendBatch(ctx, rows, fromTs, toTs, now)
@@ -302,6 +303,13 @@ func (m *Monitor) attachCustomerHealthSpend(ctx context.Context, row *CustomerHe
 
 // attachCustomerHealthSpendBatch 一次读取整页成员金额，再按公司独立判断完整性。
 func (m *Monitor) attachCustomerHealthSpendBatch(ctx context.Context, rows []CustomerHealthRow, fromTs, toTs int64, now time.Time) {
+	for i := range rows {
+		rows[i].TodaySpendUSD = nil
+		rows[i].SpendFromTs, rows[i].SpendThroughTs = 0, 0
+		for j := range rows[i].Members {
+			rows[i].Members[j].TodaySpendUSD = nil
+		}
+	}
 	ids := customerHealthRowUserIDs(rows)
 	if len(ids) == 0 {
 		for i := range rows {
@@ -310,58 +318,7 @@ func (m *Monitor) attachCustomerHealthSpendBatch(ctx context.Context, rows []Cus
 		}
 		return
 	}
-	// 事实层没启用时 usageFactsStore() 可能返回 nil，直接查会 panic。
-	if !m.usageFactsReadEnabled() || m.usageFactsStore() == nil {
-		if m.cfg.CustomerHealthSourceEnabled {
-			m.attachCustomerHealthCollectedSpendBatch(ctx, rows, ids, fromTs, toTs)
-			return
-		}
-		for i := range rows {
-			rows[i].SpendState = customerHealthSpendUnavailable
-			rows[i].SpendNote = "本地用量事实层未启用，今日消耗金额不可知（不代表没有消耗）。"
-		}
-		return
-	}
-	batch, err := m.loadUsageLiveProjectionBatch(ctx, ids, fromTs, toTs, now)
-	if err != nil {
-		for i := range rows {
-			rows[i].SpendState = customerHealthSpendUnavailable
-			rows[i].SpendNote = "今日消耗金额暂时读不到（本地事实库查询失败），不代表没有消耗。"
-		}
-		return
-	}
-	fallback := make([]int, 0, len(rows))
-	for i := range rows {
-		net := make(map[int64]int64, len(rows[i].Members))
-		through := now.Unix()
-		complete := batch != nil
-		for _, member := range rows[i].Members {
-			value, okValue := int64(0), false
-			memberThrough, okThrough := int64(0), false
-			if batch != nil {
-				value, okValue = batch.TodayNetByUser[member.UserID]
-				memberThrough, okThrough = batch.ThroughByUser[member.UserID]
-			}
-			if !okValue || !okThrough {
-				complete = false
-				break
-			}
-			net[member.UserID] = value
-			if memberThrough < through {
-				through = memberThrough
-			}
-		}
-		if complete {
-			applyCustomerHealthSpend(&rows[i], net, customerHealthSpendLive,
-				"今日消耗＝已封口小时事实＋实时累计差额，口径与用户用量页今日总消费一致；"+
-					"已更新至 "+time.Unix(through, 0).In(cstLocation).Format("15:04")+"（CST）。")
-		} else {
-			fallback = append(fallback, i)
-		}
-	}
-	if len(fallback) > 0 {
-		m.attachCustomerHealthFinalizedSpendBatch(ctx, rows, fallback, fromTs)
-	}
+	m.attachCustomerHealthCollectedSpendBatch(ctx, rows, ids, fromTs, min(toTs, customerHealthSourceFinalizedThrough(now)))
 }
 
 func customerHealthRowUserIDs(rows []CustomerHealthRow) []int64 {
@@ -381,28 +338,15 @@ func customerHealthRowUserIDs(rows []CustomerHealthRow) []int64 {
 	return ids
 }
 
-// attachCustomerHealthCollectedSpendBatch 读取 logchain-only 独立采集已写入
+// attachCustomerHealthCollectedSpendBatch 读取客户维护独立采集已写入
 // 本地 SQLite 的用户分钟净 quota。整页只执行一次聚合查询。
 func (m *Monitor) attachCustomerHealthCollectedSpendBatch(ctx context.Context, rows []CustomerHealthRow, ids []int64, dayTs, dayEnd int64) {
-	from := m.customerHealthSourceFrom.Load()
-	through := m.customerHealthSourceThrough.Load()
-	if from != dayTs || through <= dayTs {
-		for i := range rows {
-			rows[i].SpendState = customerHealthSpendUnavailable
-			rows[i].SpendNote = "客户维护只读采集正在追赶今日数据，连续覆盖尚未建立；金额暂不展示。"
-		}
-		return
-	}
-	if through > dayEnd {
-		through = dayEnd
-	}
+	var through int64
 	net := make(map[int64]int64, len(ids))
 	for _, id := range ids {
 		net[id] = 0
 	}
 	in, args := usageIn("user_id", ids)
-	queryArgs := []any{dayTs, through, stabilityTrafficClassificationVersion}
-	queryArgs = append(queryArgs, args...)
 	type rowNet struct {
 		UserID int64 `gorm:"column:user_id"`
 		Net    int64 `gorm:"column:net"`
@@ -410,11 +354,28 @@ func (m *Monitor) attachCustomerHealthCollectedSpendBatch(ctx context.Context, r
 	var netRows []rowNet
 	qctx, cancel := context.WithTimeout(ctx, customerHealthQueryTimeout)
 	defer cancel()
-	err := m.storeDB.WithContext(qctx).Raw(`SELECT user_id,
+	err := m.storeDB.WithContext(qctx).Transaction(func(tx *gorm.DB) error {
+		if !m.cfg.CapacityEnabled && !m.cfg.CustomerHealthSourceEnabled {
+			return nil
+		}
+		var proof CustomerHealthSourceCursor
+		if err := tx.Where("id=1").Limit(1).Find(&proof).Error; err != nil {
+			return err
+		}
+		if proof.DayTs != dayTs || proof.SemanticsVersion != customerHealthStabilityPolicyVersion || proof.ThroughTs <= dayTs {
+			return nil
+		}
+		through = min(proof.ThroughTs, dayEnd)
+		if through <= dayTs {
+			return nil
+		}
+		queryArgs := append([]any{dayTs, through, stabilityTrafficClassificationVersion}, args...)
+		return tx.Raw(`SELECT user_id,
 CAST(COALESCE(SUM(quota),0)-COALESCE(SUM(refund_quota),0) AS INTEGER) AS net
 FROM capacity_user_minute_samples
 WHERE bucket_ts >= ? AND bucket_ts < ? AND traffic_class_version = ? AND `+in+`
 GROUP BY user_id`, queryArgs...).Scan(&netRows).Error
+	})
 	if err != nil {
 		for i := range rows {
 			rows[i].SpendState = customerHealthSpendUnavailable
@@ -422,68 +383,23 @@ GROUP BY user_id`, queryArgs...).Scan(&netRows).Error
 		}
 		return
 	}
+	if through <= dayTs {
+		for i := range rows {
+			rows[i].TodaySpendUSD = nil
+			rows[i].SpendState = customerHealthSpendUnavailable
+			rows[i].SpendNote = "客户维护独立分钟事实尚未连续覆盖今日数据；金额暂不展示，不使用 Usage 金额替代。"
+		}
+		return
+	}
 	for _, item := range netRows {
 		net[item.UserID] = item.Net
 	}
 	for i := range rows {
+		rows[i].SpendFromTs, rows[i].SpendThroughTs = dayTs, through
 		applyCustomerHealthSpend(&rows[i], net, customerHealthSpendSampled,
-			"8204 独立只读采集已连续覆盖今日 00:00 至 "+
+			"客户维护独立分钟事实已连续覆盖今日 00:00 至 "+
 				time.Unix(through, 0).In(cstLocation).Format("15:04")+
 				"（CST）；金额来自生产 logs 的只读聚合并仅写本地 SQLite，已扣退款。")
-	}
-}
-
-// attachCustomerHealthFinalizedSpendBatch 为实时投影未就绪的公司批量读取已封口金额。
-func (m *Monitor) attachCustomerHealthFinalizedSpendBatch(ctx context.Context, rows []CustomerHealthRow, indexes []int, dayTs int64) {
-	finalizedThrough := m.usageFactsReadyThrough.Load()
-	if finalizedThrough <= dayTs {
-		for _, i := range indexes {
-			rows[i].SpendState = customerHealthSpendUnavailable
-			rows[i].SpendNote = "今日尚无已封口的用量事实，金额不可知（不代表没有消耗）。"
-		}
-		return
-	}
-	qctx, cancel := context.WithTimeout(ctx, customerHealthQueryTimeout)
-	defer cancel()
-	// usage_hour_facts is intentionally sparse: a fully verified member with no
-	// requests/refunds has no row. Publication, not row existence, proves that a
-	// missing aggregate is a legitimate zero. Unpublished members must remain nil.
-	membership, err := m.currentPublishedUsageMembership(qctx, nil)
-	if err != nil {
-		for _, i := range indexes {
-			rows[i].SpendState = customerHealthSpendUnavailable
-			rows[i].SpendNote = "今日消耗金额暂时读不到（成员发布状态查询失败），不代表没有消耗。"
-		}
-		return
-	}
-	publishedIDs := make([]int64, 0, len(membership.Members))
-	net := make(map[int64]int64, len(membership.Members))
-	publishedByGroup := make(map[int64][]int64)
-	for _, member := range membership.Members {
-		publishedIDs = append(publishedIDs, member.UserID)
-		net[member.UserID] = 0
-		publishedByGroup[member.GroupID] = append(publishedByGroup[member.GroupID], member.UserID)
-	}
-	actual, err := usageFactsTodayFinalizedNetByUser(m.usageFactsStore().WithContext(qctx), publishedIDs, dayTs, finalizedThrough)
-	if err != nil {
-		for _, i := range indexes {
-			rows[i].SpendState = customerHealthSpendUnavailable
-			rows[i].SpendNote = "今日消耗金额暂时读不到（已封口事实查询失败），不代表没有消耗。"
-		}
-		return
-	}
-	for userID, quota := range actual {
-		net[userID] = quota
-	}
-	for _, i := range indexes {
-		companyNet := make(map[int64]int64, len(publishedByGroup[rows[i].GroupID]))
-		for _, id := range publishedByGroup[rows[i].GroupID] {
-			companyNet[id] = net[id]
-		}
-		applyCustomerHealthSpend(&rows[i], companyNet, customerHealthSpendFinalized,
-			"实时水位暂不可用，此处只统计到已封口小时 "+
-				time.Unix(finalizedThrough, 0).In(cstLocation).Format("15:04")+
-				"（CST）；该时刻之后的消耗未计入。")
 	}
 }
 

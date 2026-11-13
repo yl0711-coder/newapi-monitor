@@ -52,7 +52,7 @@ func customerHealthClassificationSQL() string {
 // truncation or a read failure cannot certify a partial classification.
 // The existing aggregate and these bounded error reads share one source slot
 // and the original overall deadline. General metric columns are untouched.
-func classifyCustomerHealthErrors(ctx context.Context, db *sql.DB, from, through int64, batch []CapacityUserMinuteSample) error {
+func classifyCustomerHealthErrors(ctx context.Context, db *sql.DB, from, through int64, batch []CapacityUserMinuteSample, observers ...func(LogChainRow, logChainFault)) error {
 	expected := map[customerHealthClassificationKey]int64{}
 	var total int64
 	for _, r := range batch {
@@ -93,8 +93,13 @@ func classifyCustomerHealthErrors(ctx context.Context, db *sql.DB, from, through
 			if actual[k] > expected[k] {
 				return errCustomerHealthClassificationChanged
 			}
-			if count, _ := customerHealthDiagnosticFailure(customerHealthDiagnosticRow(r, other)); count {
+			r = customerHealthDiagnosticRow(r, other)
+			count, fault := customerHealthDiagnosticFailure(r)
+			if count {
 				failed[k]++
+			}
+			for _, observe := range observers {
+				observe(r, fault)
 			}
 		}
 		if err := rows.Err(); err != nil {

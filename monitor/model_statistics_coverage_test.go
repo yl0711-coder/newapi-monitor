@@ -92,7 +92,8 @@ func TestModelStatisticsUsesClosedFinalizationWindowAndSeparatesCoverageGaps(t *
 		if report.Source.CoverageStatus != want || report.Source.FactsComplete != (want == modelCoverageComplete) {
 			t.Fatalf("want %s: %+v", want, report.Source)
 		}
-		if report.ToTs != wantTo || report.TargetTs != to || report.LagSeconds != to-wantTo || report.ToTs-report.FromTs != 86400 {
+		target := modelStatisticsWindowTarget(m, now)
+		if report.ToTs != wantTo || report.TargetTs != target || report.LagSeconds != target-wantTo || report.ToTs-report.FromTs != 86400 {
 			t.Fatalf("window must follow committed cursors without shortening duration: %+v", report)
 		}
 	}

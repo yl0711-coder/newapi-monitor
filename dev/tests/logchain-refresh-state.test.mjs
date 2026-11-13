@@ -5,6 +5,11 @@ import test from 'node:test';
 const js=readFileSync(new URL('../../monitor/logchain.js',import.meta.url),'utf8');
 const html=readFileSync(new URL('../../monitor/page.html',import.meta.url),'utf8');
 const flush=()=>new Promise(setImmediate);
+test('governance evidence prefill does not query source on entry or focus',async()=>{
+ const h=fixture({preset:'group_governance',request_id:'gg-request',channel_id:'3',model:'m',group:'g',date:'2026-11-10',from_time:'12:00',to_time:'12:00'});
+ await h.activate();assert.equal(h.logs().length,0);assert.equal(h.lc.requiresManualQuery,true);assert.equal(h.lc.filters.request_id,'gg-request');
+ await h.activate();assert.equal(h.logs().length,0);
+});
 class Element{
   value='';hidden=false;disabled=false;checked=false;innerHTML='';textContent='';handlers=new Map();dataset={};
   classList={toggle(){},add(){},remove(){}};

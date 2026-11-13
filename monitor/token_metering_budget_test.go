@@ -10,6 +10,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"gorm.io/gorm"
@@ -210,15 +211,19 @@ func TestTokenMeteringLocalCommitsDoNotSpendSourceReadBudget(t *testing.T) {
 }
 
 func TestTokenMeteringQueuedPageUsesWriteCostAndKeepsFairness(t *testing.T) {
-	tokenMeteringQueuedPageCheck(t, 128, 300*time.Millisecond)
+	synctest.Test(t, func(t *testing.T) {
+		tokenMeteringQueuedPageCheck(t, 128, 300*time.Millisecond)
+	})
 }
 
 func TestTokenMeteringTransientQueueUsesRemainingCommitBudget(t *testing.T) {
 	// One 1.1s maintenance turn drains before the remaining cheap chunks.
 	// Including that wait in the next-write prediction stops after 24 rows,
-	// although almost 900ms remain. Leave enough headroom for race tracing;
-	// three 580ms waits consumed the legitimate 250ms safety margin under race.
-	tokenMeteringQueuedPageCheck(t, 120, 1100*time.Millisecond, 1)
+	// although almost 900ms remain. Measure the injected queue delay with a
+	// controlled clock so race instrumentation cannot consume that headroom.
+	synctest.Test(t, func(t *testing.T) {
+		tokenMeteringQueuedPageCheck(t, 120, 1100*time.Millisecond, 1)
+	})
 }
 
 func TestTokenMeteringRoundFlushesReadSuffixWithoutRepeatingSource(t *testing.T) {
@@ -623,6 +628,13 @@ func TestTokenMeteringCommitProgressWithCostlyRetainedWrites(t *testing.T) {
 }
 
 func TestTokenMeteringAmortizesBoundedTransactionLatency(t *testing.T) {
+	// The injected transaction latency exercises batching within the unchanged
+	// two-second budget; host speed is not part of this scheduling assertion.
+	synctest.Test(t, tokenMeteringAmortizedCommitCheck)
+}
+
+func tokenMeteringAmortizedCommitCheck(t *testing.T) {
+	t.Helper()
 	m, now, _ := tokenMeteringHistoryFixture(t)
 	defer m.Close()
 	ctx := context.Background()

@@ -8,6 +8,7 @@ import {createHmac,createHash,randomUUID} from 'node:crypto';
 import {createGzip} from 'node:zlib';
 import {pipeline} from 'node:stream/promises';
 import {once} from 'node:events';
+import {tokenHeadColumns,tokenHeadJoins,tokenHeadStaleReasons} from './token-detection-validity.mjs';
 
 const args=process.argv.slice(2),option=(key,fallback)=>args.includes(key)?args[args.indexOf(key)+1]:fallback;
 const from=Number(option('--from')),to=Number(option('--to')),out=path.resolve(option('--out',''));
@@ -29,11 +30,16 @@ assert.equal((await api('/ready')).image_version,image);
 const health=await api('/anomalies/token/health'),epoch=health.source_epoch;
 assert.match(epoch,/^[A-Za-z0-9._:-]+$/);
 write('health-before.json',health);
+const detectionHealth=await api('/anomalies/token/detection/health'),policy=detectionHealth.policy_hash;
+assert.match(policy,/^[a-f0-9]{64}$/);
+write('detection-health-before.json',detectionHealth);
 // Resume only a finalized, fsynced evidence segment. The per-page checkpoint
 // remains diagnostic: a crash cannot promote buffered gzip output to proof.
 const previous=args.includes('--resume')?JSON.parse(fs.readFileSync(path.join(out,'durable-checkpoint.json'),'utf8')):null;
 if(previous){
  assert.equal(previous.source_epoch,epoch);assert.equal(previous.from,from);assert.equal(previous.to,to);assert.equal(previous.image,image);
+ assert.equal(previous.validity_scope,'fact/link/policy/reference-generation/source-window','replay older captures locally before using their detection verdict');
+ assert.equal(previous.policy_hash,policy,'policy changed; replay captured rows locally');
  assert.equal(previous.complete,false,'this fixed window already finished');
  for(const segment of previous.segments){assert.equal(path.basename(segment.file),segment.file);const data=fs.readFileSync(path.join(out,segment.file));assert.equal(createHash('sha256').update(data).digest('hex'),segment.sha256,'evidence segment changed');}
 }else assert.ok(!fs.existsSync(path.join(out,'durable-checkpoint.json')),'use --resume for an existing audit');
@@ -86,7 +92,7 @@ try{
   const batch=(await source(query)).trim().split('\n').filter(Boolean).map(v=>JSON.parse(v));
   if(!batch.length){completed=true;break}
   const batchIDs=batch.map(v=>v.id);assert.ok(batchIDs.every(Number.isSafeInteger));
-  const sql="SELECT f.*,c.fact_revision AS detected_fact_revision,c.link_revision AS detected_link_revision,c.detection_state,c.evaluated_at,(SELECT json_group_array(json_object('key_id',r.key_id,'hash',r.hash,'version',r.version)) FROM token_metering_refs r WHERE r.source_epoch=f.source_epoch AND r.log_id=f.log_id) AS refs FROM token_metering_facts f LEFT JOIN token_detection_currents c ON c.source_epoch=f.source_epoch AND c.log_id=f.log_id WHERE f.source_epoch="+literal(epoch)+' AND f.log_id IN ('+batchIDs.join(',')+')';
+  const sql="SELECT f.*,c.fact_revision AS detected_fact_revision,c.link_revision AS detected_link_revision,c.detection_state,c.evaluated_at,"+tokenHeadColumns+",(SELECT json_group_array(json_object('key_id',r.key_id,'hash',r.hash,'version',r.version)) FROM token_metering_refs r WHERE r.source_epoch=f.source_epoch AND r.log_id=f.log_id) AS refs FROM token_metering_facts f LEFT JOIN token_detection_currents c ON c.source_epoch=f.source_epoch AND c.log_id=f.log_id"+tokenHeadJoins+"WHERE f.source_epoch="+literal(epoch)+' AND f.log_id IN ('+batchIDs.join(',')+')';
   if(!runPages)write('local-query-plan.json',{read_only:true,query:sql,plan:local('EXPLAIN QUERY PLAN '+sql)});
   const facts=local(sql),map=new Map(facts.map(v=>[v.log_id,v]));duplicate+=facts.length-map.size;
   for(const row of batch){
@@ -107,12 +113,14 @@ try{
     if(row.request_id&&keys.length)for(const key of keys){const hash=createHmac('sha256',key.secret).update('oneapi-request-id\0'+row.request_id.trim()).digest('hex');if(!refs.some(r=>r.key_id===key.keyID&&r.hash===hash))reasons.push('request_hmac_ref_mismatch')}
     if(row.request_id&&!refs.length)reasons.push('request_refs_missing');
     const state=f.detection_state||'detection_pending';states[state]=(states[state]||0)+1;
-    if(f.detection_state){detected++;if(f.detected_fact_revision!==f.revision||f.detected_link_revision!==f.link_revision)stale++}
+    f.audit_stale_reasons=tokenHeadStaleReasons(f,policy);
+    if(f.detection_state){detected++;if(f.audit_stale_reasons.length)stale++}
    }
    if(reasons.length)mismatched++;
    for(const reason of reasons)mismatchReasons[reason]=(mismatchReasons[reason]||0)+1;
    const operands=Object.fromEntries(['prompt_tokens','completion_tokens','quota',...fields].map(k=>[k,usage?.fields?.[k]?.value??null]));
    const evidence={source:row,fact:f?{source_epoch:epoch,log_id:f.log_id,request_id:f.request_id,created_at:f.created_at,user_id:f.user_id,channel_id:f.channel_id,model:f.model,user_group:f.user_group,request_path:f.request_path,request_method:f.request_method,request_length:f.request_length,source_operands:operands,source_facts_sha256:createHash('sha256').update(f.source_facts).digest('hex'),missing_fields_sha256:createHash('sha256').update(f.missing_fields||'').digest('hex'),revision:f.revision,link_revision:f.link_revision,link_state:f.link_state,link_reason:f.link_reason,refs,detection_state:f.detection_state,detected_fact_revision:f.detected_fact_revision,detected_link_revision:f.detected_link_revision}:null,reasons};
+   evidence.detection_validity={policy_hash:policy,stale_reasons:f?.audit_stale_reasons||['fact_missing']};
    const line=JSON.stringify(evidence)+'\n';if(!stream.write(line))await once(stream,'drain');bytes+=Buffer.byteLength(line);rows++;cursorAt=row.created_at;cursorID=row.id;
   }
   pages++;runPages++;
@@ -122,6 +130,7 @@ try{
 }catch(e){error=e.message;}
 finally{stream.end();try{await written;const temporary=path.join(out,segmentFile+'.partial'),fd=fs.openSync(temporary,'r+');try{fs.fsyncSync(fd)}finally{fs.closeSync(fd)}fs.renameSync(temporary,path.join(out,segmentFile));segments.push({file:segmentFile,sha256:createHash('sha256').update(fs.readFileSync(path.join(out,segmentFile))).digest('hex'),bytes:compressedBytes});segmentWritten=true}catch{error=error||'evidence_write_failed';completed=false}mysql.stdin.end('quit\n');try{docker(['stop','--time','2',sourceContainer],{timeout:5000})}catch{}mysql.kill();}
 const result={observed_at:new Date().toISOString(),image,source:'production.logs',source_epoch:epoch,from,to,read_only:true,source_concurrency:1,source_query_budget_ms:3000,page_rows:pageRows,budget_seconds:seconds,elapsed_seconds:(Date.now()-started)/1000,complete:completed,error,rows,pages,cursor_at:cursorAt,cursor_id:cursorID,missing_facts:missing,mismatched_rows:mismatched,mismatch_reasons:mismatchReasons,duplicate_identities:duplicate,detected,stale,detection_states:states,ref_keys_verified:keys.map(v=>v.keyID),row_evidence_bytes:bytes,compressed_bytes:compressedBytes,pass:completed&&!error&&rows>0&&missing===0&&mismatched===0&&duplicate===0&&stale===0&&detected===rows};
+result.validity_scope='fact/link/policy/reference-generation/source-window';result.policy_hash=policy;
 result.resumed=!!previous;result.segments=segments;result.run_pages=runPages;result.elapsed_total_seconds=(previous?.elapsed_total_seconds||0)+result.elapsed_seconds;
 if(segmentWritten)durableWrite('durable-checkpoint.json',result);
 write('reconciliation.json',result);console.log(JSON.stringify(result));

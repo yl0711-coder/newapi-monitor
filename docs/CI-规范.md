@@ -60,7 +60,7 @@ monitor 包约 3900 个测试，monthlydraft 包约 580 个，全部串行跑要
 | 包 | 并行任务 | 每任务进程数 | 串行任务（每任务 1 个进程） | 单进程预估上限 |
 |---|---|---|---|---|
 | monitor | 7 个（编号 0–6），共 21 个进程 | 3 | 4 个（编号 7–10）：全部 `TestToken*` 测试 | 14 分钟（目标） |
-| monthly | 6 个（编号 0–5），共 18 个进程 | 3 | 1 个（编号 6）：`TestRetentionFullReceiverPayloadPerformance` | 14 分钟（目标） |
+| monthly | 6 个（编号 0–5），共 18 个进程 | 3 | 1 个（编号 6）：`TestRetentionBoundedReceiverPayloadRace` | 14 分钟（目标） |
 
 ### 串行任务（对 CPU 争用敏感的测试）
 
@@ -180,8 +180,8 @@ race 任务里有测试失败时，`dev/run-race-job.sh` 会等这台机器上�
 
 ### 已知情况
 
-- 已修复：`TestArchiveFullRecordBoundRoundtrip`、`TestRetentionFullReceiverPayloadPerformance`（race 下盘点的 5 秒时限过紧，已在 race 模式下放宽测试用的时限，正式时限不变）。
-- 已列入串行任务：全部 `TestToken*` 测试（`native-gate-race-advisory` 方式，见第 3 节），以及 monthly 的 `TestRetentionFullReceiverPayloadPerformance`（`race` 方式）。
+- 已修复：`TestArchiveFullRecordBoundRoundtrip`、`TestRetentionFullReceiverPayloadPerformance`（拆分为两个：完整 512KB 负载的 `TestRetentionFullReceiverPayloadPerformance` 只在非 race 模式运行，作为单独的必过检查；race 模式运行 32KB 负载的 `TestRetentionBoundedReceiverPayloadRace`，记录数不变、正式时限不变）。
+- 已列入串行任务：全部 `TestToken*` 测试（`native-gate-race-advisory` 方式，见第 3 节），以及 monthly 的 `TestRetentionBoundedReceiverPayloadRace`（`race` 方式）。
 - 已修复：`TestTokenMeteringPaginationCrashResumeAndFencing`（原来要求恢复后一轮内写完，慢机器上稳定失败；改为最多 4 轮，仍检查结果正确）。
 - 待修（v1.18.48 验证期间在真实 CI 上出现过）：
   - 在 race 模式下达不到性能指标的令牌测试（共 20 个，集中在 `token_metering_budget_test.go`、`token_commit_latency_test.go` 等）：改成不依赖机器速度后，令牌测试恢复 `race` 模式；CI 每次的"Race-mode advisory failures"清单就是这份待修清单；

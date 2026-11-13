@@ -944,6 +944,9 @@ func (m *Monitor) superviseSource(ctx context.Context) {
 func (m *Monitor) startSourceEpoch(ctx context.Context, group *sourceEpochGroup) {
 	if m.cfg.LogChainOnlySource {
 		group.Go(ctx, func(workerCtx context.Context) { m.startLogChainChannelSync(workerCtx) })
+		if m.cfg.GroupGovernanceEnabled {
+			group.Go(ctx, m.runGroupGovernanceLoop)
+		}
 		if m.cfg.StabilityProblemSourceEnabled {
 			group.Go(ctx, func(workerCtx context.Context) { m.startStabilityProblemSource(workerCtx) })
 		}

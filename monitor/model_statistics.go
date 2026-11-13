@@ -213,15 +213,16 @@ func (m *Monitor) modelStatisticsFactsCoverage(ctx context.Context, from, to int
 		}
 		return false, coveredFrom, minPositive(coveredThrough, to), "客户维护独立采集仍在追赶所选窗口，当前排名可能不完整"
 	}
-	complete, coveredFrom, coveredThrough = m.capacityWindowComplete(ctx, from, to, true), 0, 0
-	var state MetricFinalizeState
-	if err := m.storeDB.WithContext(ctx).First(&state, 1).Error; err == nil {
-		coveredFrom, coveredThrough = state.CoverageFromTs, min(state.NextTs, to)
+	proof, _, err := m.modelMinuteProof(ctx, to)
+	coveredFrom, coveredThrough = proof.From, minPositive(proof.Through, to)
+	if err == nil && proof.covers(from, to) {
+		projection, readErr := capacityProjectionCoverage(ctx, m.storeDB, from, to)
+		complete = readErr == nil && projection.RequestErrors == 0
 	}
 	if complete {
-		return true, coveredFrom, coveredThrough, "已由分钟事实定稿水位连续覆盖所选窗口"
+		return true, coveredFrom, coveredThrough, "已由定稿区间及常规采集完整分钟证明覆盖所选窗口"
 	}
-	return false, coveredFrom, coveredThrough, "分钟事实定稿水位未连续覆盖所选窗口，当前排名可能不完整"
+	return false, coveredFrom, coveredThrough, "完整分钟证明存在缺口或请求投影尚未一致，当前排名可能不完整"
 }
 
 func minPositive(value, upper int64) int64 {
@@ -279,7 +280,11 @@ func modelStatisticsWindowTarget(m *Monitor, now time.Time) int64 {
 	}
 	targets := make([]int64, 0, 2)
 	if m == nil || !m.cfg.CustomerHealthSourceEnabled {
-		targets = append(targets, metricFinalizeTarget(now.Unix()))
+		if m != nil && m.cfg.CapacityEnabled {
+			targets = append(targets, now.Unix()/60*60)
+		} else {
+			targets = append(targets, metricFinalizeTarget(now.Unix()))
+		}
 	} else {
 		// Do not clamp to today's midnight: during the first two minutes,
 		// yesterday's last minutes are still inside the finalization delay.
@@ -315,14 +320,39 @@ func (m *Monitor) buildModelStatisticsSelected(ctx context.Context, selection mo
 	if m == nil || m.storeDB == nil {
 		return ModelStatisticsReport{}, fmt.Errorf("本地事实库未就绪")
 	}
+	ctx = withReportProjectionCache(ctx)
+	var report ModelStatisticsReport
+	err := m.storeDB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		local := &Monitor{cfg: m.cfg, storeDB: tx}
+		var err error
+		report, err = local.buildModelStatisticsSelectedRead(ctx, selection, now)
+		return err
+	})
+	report.CollectionFailed = m.modelReportCollectionFailed(true)
+	return report, err
+}
+
+func (m *Monitor) buildModelStatisticsSelectedRead(ctx context.Context, selection modelReportSelection, now time.Time) (ModelStatisticsReport, error) {
+	if m == nil || m.storeDB == nil {
+		return ModelStatisticsReport{}, fmt.Errorf("本地事实库未就绪")
+	}
 	target := modelStatisticsWindowTarget(m, now)
 	available, err := m.modelStatisticsAvailableWindowEnd(ctx, target)
 	if err != nil {
 		return ModelStatisticsReport{}, fmt.Errorf("读取模型统计采集水位失败: %w", err)
 	}
-	bounds, err := m.resolveModelReportBounds(selection, now, target, available)
+	queryEnd := available
+	if queryEnd <= 0 {
+		queryEnd = target
+	} // Keep already stored rows visible without claiming a watermark.
+	bounds, err := m.resolveModelReportBounds(selection, now, target, queryEnd)
 	if err != nil {
 		return ModelStatisticsReport{}, err
+	}
+	if available <= 0 {
+		bounds.ActualThrough = 0
+		bounds.Range.AvailableThrough = time.Time{}
+		bounds.Range.Note += " 尚无完整分钟证明，已有记录不代表完整窗口。"
 	}
 	from, to := bounds.From, bounds.To
 	if !bounds.Range.HasWindow {
@@ -832,5 +862,5 @@ func (m *Monitor) serveModelStatisticsReport(c *gin.Context) {
 		return
 	}
 	c.Header("Cache-Control", "private, no-store")
-	c.JSON(http.StatusOK, report)
+	serveLocalReportJSON(c, report)
 }
