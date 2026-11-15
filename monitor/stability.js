@@ -16,10 +16,12 @@ const ST_HEADERS={
   'customer-health':{title:'客户维护',subtitle:'客户日志记录、稳定率、主要模型与责任线索',icon:'heart'},
   // 缺这条会走第 22 行的 ||ST_HEADERS.usage 兜底，顶部标题错显成"用户用量"。
   // 新增 tab 时必须同步加，否则页面标题静默串台。
+  'usage-logs':{title:'使用日志',subtitle:'通用日志 · 与 new-api 管理员使用日志一致 · 只读查询 new-api 从库',icon:'logs'},
   logchain:{title:'客户排障',subtitle:'逐条请求 · 客户 / 令牌 / 分组 / 模型 · 渠道 → 上游主域名 · 上游返回原文',icon:'search'},
   alerts:{title:'问题预警',subtitle:'未到达任何渠道的请求 · 哪个客户、请求什么、为什么被拒',icon:'alert'}
 };
 const ST_ICONS={
+  logs:'<svg viewBox="0 0 24 24"><path d="M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><path d="M14 3v6h6M8 13h8M8 17h5"/></svg>',
   sync:'<svg viewBox="0 0 24 24"><path d="M20 7h-6V1"/><path d="M4 17h6v6"/><path d="M20 7a8 8 0 0 0-13.7-3.6L4 5.7M4 17a8 8 0 0 0 13.7 3.6l2.3-2.3"/></svg>',
   users:'<svg viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"/></svg>',
   groups:'<svg viewBox="0 0 24 24"><circle cx="6" cy="6" r="2"/><circle cx="18" cy="6" r="2"/><circle cx="12" cy="18" r="2"/><path d="M8 7.2l3 8.2M16 7.2l-3 8.2M8 6h8"/></svg>',

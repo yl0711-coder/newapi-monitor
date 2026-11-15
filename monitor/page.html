@@ -627,6 +627,7 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
 <link rel="stylesheet" href="/stability.css?v=17">
 <link rel="stylesheet" href="/capacity.css?v=2">
 <link rel="stylesheet" href="/group-governance.css?v=1">
+<link rel="stylesheet" href="/usage-logs.css?v=3">
 <link rel="stylesheet" href="/finance.css?v=14">
 <link rel="stylesheet" href="/model-statistics.css?v=6">
 <link rel="stylesheet" href="/model-frt.css?v=1">
@@ -643,6 +644,7 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
     <nav class="tabs monitor-nav">
       <div class="tab active" data-tab="usage" title="用户用量"><span class="monitor-nav-icon"><svg viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"/></svg></span><span class="monitor-nav-label">用户用量</span></div>
       <div class="tab" data-tab="channels" title="渠道管理"><span class="monitor-nav-icon"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a15 15 0 0 1 0 18M12 3a15 15 0 0 0 0 18"/></svg></span><span class="monitor-nav-label">渠道管理</span></div>
+      <div class="tab" data-tab="usage-logs" title="使用日志"><span class="monitor-nav-icon"><svg viewBox="0 0 24 24"><path d="M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><path d="M14 3v6h6M8 13h8M8 17h5"/></svg></span><span class="monitor-nav-label">使用日志</span></div>
       <div class="tab" data-tab="stability" title="稳定性报表"><span class="monitor-nav-icon"><svg viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="m9 12 2 2 4-4"/></svg></span><span class="monitor-nav-label">稳定性报表</span></div>
       <div class="tab" data-tab="model" title="模型监控"><span class="monitor-nav-icon"><svg viewBox="0 0 24 24"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg></span><span class="monitor-nav-label">模型监控</span></div>
       <div class="tab" data-tab="server" title="服务端监控"><span class="monitor-nav-icon"><svg viewBox="0 0 24 24"><path d="M3 3v18h18"/><path d="m7 16 4-5 4 3 5-7"/></svg></span><span class="monitor-nav-label">服务端监控</span></div>
@@ -674,6 +676,7 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
       <div class="tab" data-tab="sync">同步状态</div>
       <div class="tab active" data-tab="usage">用户用量</div>
       <div class="tab" data-tab="channels">渠道管理</div>
+      <div class="tab" data-tab="usage-logs">使用日志</div>
       <div class="tab" data-tab="stability">稳定性报表</div>
       <div class="tab" data-tab="model">模型监控</div>
       <div class="tab" data-tab="server">服务端监控</div>
@@ -1309,6 +1312,7 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
 </div>
 
 <!-- ═══════════ Tab 7:客户排障(逐条请求→渠道→上游主域名→错误原文;查生产库 logs,含 type=5) ═══════════ -->
+<div class="tabpane usage-logs-page" id="tab-usage-logs" hidden></div>
 <div class="tabpane logchain-page" id="tab-logchain" hidden>
   <div id="lcError" class="lc-alert" hidden></div>
 
@@ -1685,6 +1689,7 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
 <script src="/channel-pricing-observations.js?v=1"></script>
 <script src="/channel-management.js?v=20"></script>
 <script src="/logchain.js?v=20"></script>
+<script src="/usage-logs.js?v=3"></script>
 <script src="/customer-health.js?v=4"></script>
 <script src="/alerts.js?v=3"></script>
 <script src="/capacity.js?v=2"></script>
@@ -2587,6 +2592,7 @@ function switchTab(name,preserveHash){
   document.getElementById('tab-group-governance').hidden=(name!=='group-governance');
   document.getElementById('tab-finance').hidden=(name!=='finance');
   document.getElementById('tab-logchain').hidden=(name!=='logchain');
+  document.getElementById('tab-usage-logs').hidden=(name!=='usage-logs');
 document.getElementById('tab-alerts').hidden=(name!=='alerts');
   document.getElementById('tab-customer-health').hidden=(name!=='customer-health');
   if(window.monitorShellSetTab)window.monitorShellSetTab(name);
@@ -2594,6 +2600,8 @@ document.getElementById('tab-alerts').hidden=(name!=='alerts');
   else if(infraTimer){clearInterval(infraTimer);}
   if(name==='sync')syncActivate();else syncDeactivate();
   if(name==='usage')usageInit();
+  if(name==='usage-logs'&&window.usageLogsActivate)window.usageLogsActivate();
+  else if(window.usageLogsDeactivate)window.usageLogsDeactivate();
   if(name==='group-governance'&&window.groupGovernanceActivate)window.groupGovernanceActivate();
   else if(window.groupGovernanceDeactivate)window.groupGovernanceDeactivate();
   if(name==='finance'&&window.financeActivate)window.financeActivate();
@@ -4237,7 +4245,7 @@ setSeg();const _mePromise=loadMe();load();schedule();
 document.querySelectorAll('#longSeg a').forEach(a=>{a.href='javascript:void 0';a.classList.toggle('active',+a.dataset.d===longDays);a.addEventListener('click',e=>{e.preventDefault();longDays=+a.dataset.d;document.querySelectorAll('#longSeg a').forEach(x=>x.classList.toggle('active',x===a));loadLongTrend();});});
 loadLongTrend();
 // 默认落在「用户用量」;URL hash 带 tab(从报警设置返回/手动刷新)则恢复到该 tab。等 IS_ROOT 就位再渲染,模型/服务端数据后台预载
-_mePromise.finally(()=>{const q=monitorHashParams(),tab=q.get('tab');const target=/^(sync|model|server|capacity|model-statistics|anomalies|usage|stability|channels|finance|logchain|alerts|group-governance|customer-health)$/.test(tab||'')?tab:'usage';switchTab(target,true);window.dispatchEvent(new CustomEvent('monitor:navigate',{detail:{tab:target,context:window.monitorNavigationContext()}}))});
+_mePromise.finally(()=>{const q=monitorHashParams(),tab=q.get('tab');const target=/^(sync|model|server|capacity|model-statistics|anomalies|usage|stability|channels|finance|logchain|alerts|group-governance|customer-health|usage-logs)$/.test(tab||'')?tab:'usage';switchTab(target,true);window.dispatchEvent(new CustomEvent('monitor:navigate',{detail:{tab:target,context:window.monitorNavigationContext()}}))});
 </script>
 </body>
 </html>

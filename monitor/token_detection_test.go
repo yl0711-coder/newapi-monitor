@@ -51,7 +51,7 @@ func detectionFact(t *testing.T, m *Monitor, id, at, ch, input, read, delta int6
 	raw.Input = sql.NullString{String: strconv.FormatInt(input, 10), Valid: true}
 	raw.Output = sql.NullString{String: "2", Valid: true}
 	raw.RequestID = fmt.Sprintf("fixture-%d", id)
-	f, refs := parseTokenMetering(m.cfg, raw, at+1)
+	f, _ := parseTokenMetering(m.cfg, raw, at+1)
 	u := tokenMeteringDecode(t, f)
 	price := tokenPrice(u, detectionPolicy(), big.NewRat(1, 1))
 	if !price.Supported {
@@ -59,7 +59,7 @@ func detectionFact(t *testing.T, m *Monitor, id, at, ch, input, read, delta int6
 	}
 	q, _ := strconv.ParseInt(price.Quota, 10, 64)
 	raw.Quota = sql.NullString{String: strconv.FormatInt(q+delta, 10), Valid: true}
-	f, refs = parseTokenMetering(m.cfg, raw, at+1)
+	f, refs := parseTokenMetering(m.cfg, raw, at+1)
 	length := int64(1000)
 	f.RequestLength = &length
 	f.LengthState = "valid"
