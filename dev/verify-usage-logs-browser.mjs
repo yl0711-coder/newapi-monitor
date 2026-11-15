@@ -1,0 +1,110 @@
+// Local opt-in acceptance against actual Go handlers and actual embedded UI.
+// Started by TestUsageLogsBrowserAcceptance; synthetic DB only, no live source.
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
+import {browserSession} from './browser-session.mjs';
+const args=process.argv.slice(2),opt=k=>args[args.indexOf(k)+1];
+assert.ok(['--origin','--out','--browser'].every(k=>args.includes(k)));
+const origin=opt('--origin'),out=path.resolve(opt('--out'));
+assert.match(origin,/^http:\/\/127\.0\.0\.1:\d+$/);
+fs.mkdirSync(out,{recursive:true});
+const b=await browserSession({browser:opt('--browser'),scratch:out,origin});
+const {evaluate:ev,waitFor,click,input}=b,checks=[];let failure;
+try{
+  await b.call('Emulation.setTimezoneOverride',{timezoneId:'Asia/Shanghai'});
+  await b.call('Page.navigate',{url:origin+'/usage-logs-acceptance'});
+  await waitFor('document.querySelectorAll(".ul-table tbody tr").length===100');
+  await waitFor('document.querySelector("#ulStats").textContent.includes("¥")&&!document.querySelector("#ulPager").textContent.includes("计算中")');
+  assert.equal(await ev('document.querySelectorAll(".ul-table th").length'),10);
+  assert.equal(await ev('getComputedStyle(document.querySelector("#ulAdv")).display'),'none');
+  assert.match(await ev('document.querySelector("#ulStats").textContent'),/¥/);
+  assert.equal(await ev('getComputedStyle(document.querySelector(".ul-c-tokens .ul-mono")).whiteSpace'),'nowrap');
+  checks.push('真实后端列表、货币设置、统计、十列显示和高级筛选默认收起');
+  await click('button[data-detail="0"]');
+  assert.match(await ev('document.querySelector("#ulModalBody").textContent'),/动态计费/);
+  assert.match(await ev('document.querySelector("#ulModalBody").textContent'),/测试套餐/);
+  await click('.ul-raw summary');
+  assert.equal(await ev('document.querySelector(".ul-raw").open'),true);
+  assert.match(await ev('document.querySelector(".ul-raw").textContent'),/expr_b64/);
+  await click('#ulModalClose');
+  await click('button[data-user="31"]');
+  await waitFor('document.querySelector("#ulModalBody").textContent.includes("合成用户")');
+  assert.match(await ev('document.querySelector("#ulModalBody").textContent'),/fixture-user/);
+  await click('#ulModalClose');
+  await click('#ulToggle');await input('#ulReq','fixture-error');await click('#ulSearch');
+  await waitFor('document.querySelectorAll(".ul-table tbody tr").length===1&&!document.querySelector("#ulSearch").disabled');
+  await click('button[data-detail="0"]');
+  assert.match(await ev('document.querySelector("#ulModalBody").textContent'),/synthetic rejection/);
+  await click('#ulModalClose');
+  checks.push('Request ID 精确筛选与历史 admin_info:null 错误详情');
+  await click('#ulReset');
+  await waitFor('document.querySelectorAll(".ul-table tbody tr").length===100&&!document.querySelector("#ulSearch").disabled');
+  await click('#ulCols');await click('input[data-col="channel"]');
+  assert.equal(await ev('document.querySelectorAll(".ul-table th").length'),9);
+  await click('input[data-col="channel"]');await click('#ulCols');
+  await click('#ulEye');assert.match(await ev('document.querySelector(".ul-uname").textContent'),/•/);await click('#ulEye');
+  checks.push('列显示开关、列恢复与隐藏/显示');
+  await click('#ulPager button[data-page="2"]');
+  await waitFor('!document.querySelector("#ulSearch").disabled&&document.querySelector(".ul-pg.active").dataset.page==="2"');
+  assert.ok(await ev('performance.getEntriesByType("resource").some(r=>r.name.includes("before_id="))'));
+  await click('#ulPager button[data-page="1"]');
+  await waitFor('!document.querySelector("#ulSearch").disabled&&document.querySelector(".ul-pg.active").dataset.page==="1"');
+  checks.push('实际游标下一页、返回首页与完整分页');
+  // Hold only count transport in this synthetic browser. Actual list handlers
+  // remain live, proving that a slow count cannot hide records or paging.
+  await ev(`(()=>{window.__originalUsageFetch=window.fetch;window.__heldCountRequests=0;window.fetch=(url,options)=>{if(!String(url).includes('/usage-logs/count?'))return window.__originalUsageFetch(url,options);window.__heldCountRequests++;return new Promise((resolve,reject)=>{const stop=()=>reject(new DOMException('Cancelled','AbortError'));if(options.signal.aborted)stop();else options.signal.addEventListener('abort',stop,{once:true})})};return true})()`);
+  await click('#ulSearch');
+  await waitFor('document.querySelectorAll(".ul-table tbody tr").length===100&&!document.querySelector("#ulSearch").disabled&&document.querySelector("#ulPager").textContent.includes("计算中")');
+  assert.equal(await ev('document.querySelector("#ulCancel").hidden'),false);
+  await click('#ulPager button[data-page="2"]');
+  await waitFor('!document.querySelector("#ulSearch").disabled&&document.querySelector(".ul-pg.active").dataset.page==="2"');
+  assert.equal(await ev('window.__heldCountRequests'),1);
+  await click('#ulCancel');
+  await waitFor('document.querySelector("#ulCancel").hidden&&document.querySelector("#ulPager").textContent.includes("未完成")');
+  assert.equal(await ev('document.querySelectorAll(".ul-table tbody tr").length'),100);
+  assert.equal(await ev('getComputedStyle(document.querySelector("#ulCancel")).display'),'none');
+  await ev('window.fetch=window.__originalUsageFetch;true');
+  await click('#ulSearch');
+  await waitFor('!document.querySelector("#ulSearch").disabled&&document.querySelectorAll(".ul-table tbody tr").length===100&&!document.querySelector("#ulPager").textContent.includes("计算中")');
+  checks.push('总数传输停滞时列表先显示、仍可游标翻页、在途计数不重复、取消可恢复');
+  const countRequests=()=>ev('performance.getEntriesByType("resource").filter(r=>r.name.includes("/usage-logs/count?")).length');
+  const countsBefore=await countRequests();
+  for(const page of['2','3']){
+    await click(`#ulPager button[data-page="${page}"]`);
+    await waitFor(`!document.querySelector("#ulSearch").disabled&&document.querySelector(".ul-pg.active").dataset.page==="${page}"`);
+  }
+  assert.equal(await countRequests(),countsBefore,'paging one search must reuse its exact total');
+  assert.match(await ev('document.querySelector("#ulPager b.ul-mono").title'),/按本次搜索时计算/);
+  checks.push('同一次搜索翻页沿用精确总数，不重复 COUNT');
+  await click('#ulDateBtn');await click('[data-preset="week"]');await click('#ulSearch');
+  await waitFor('!document.querySelector("#ulSearch").disabled&&!!document.querySelector("#ulStats [data-quota-calc]")');
+  assert.match(await ev('document.querySelector("#ulStats").textContent'),/RPM/);
+  assert.ok(await ev('performance.getEntriesByType("resource").some(r=>r.name.includes("/usage-logs/stat?")&&r.name.includes("skip_quota=1"))'));
+  await b.screenshot(path.join(out,'wide-range.png'));
+  await click('#ulStats [data-quota-calc]');
+  await waitFor('!document.querySelector("#ulStats [data-quota-calc]")&&document.querySelector("#ulStats").textContent.includes("¥")');
+  checks.push('超过 26 小时用量改为点击计算，RPM/TPM 照常自动显示');
+  await click('#ulDateBtn');await click('[data-preset="today"]');await click('#ulSearch');
+  await waitFor('!document.querySelector("#ulSearch").disabled&&!document.querySelector("#ulStats [data-quota-calc]")&&document.querySelector("#ulStats").textContent.includes("¥")');
+  await b.screenshot(path.join(out,'desktop.png'));
+  assert.equal(await ev('document.querySelector("#ulExport")'),null);
+  checks.push('页面无 CSV 导出入口');
+  await b.call('Emulation.setDeviceMetricsOverride',{width:390,height:844,deviceScaleFactor:1,mobile:true});
+  assert.equal(await ev('document.documentElement.scrollWidth'),390);
+  await click('button[data-detail="0"]');
+  assert.ok(await ev('document.querySelector(".ul-dialog").getBoundingClientRect().width<=390'));
+  await b.screenshot(path.join(out,'mobile.png'));await click('#ulModalClose');
+  checks.push('390px 手机布局无页面横向溢出，详情弹窗可操作');
+  // On mobile a date preset searches by itself.
+  await click('#ulDateBtn');await click('[data-preset="week"]');
+  await waitFor('!document.querySelector("#ulSearch").disabled&&!!document.querySelector("#ulStats [data-quota-calc]")');
+  assert.equal(await ev('document.documentElement.scrollWidth'),390);
+  await b.screenshot(path.join(out,'mobile-wide.png'));
+  checks.push('390px 手机布局下大范围“点击计算”无横向溢出');
+  assert.deepEqual(b.exceptions,[]);assert.deepEqual(b.external,[]);
+}catch(e){failure=e;console.error(e.stack);await b.screenshot(path.join(out,'failure.png'));console.error(JSON.stringify(await ev(`(()=>{const e=document.querySelector('#ulReset'),r=e.getBoundingClientRect(),p=document.elementFromPoint(r.x+r.width/2,r.y+r.height/2);return{reset:{x:r.x,y:r.y,w:r.width,h:r.height},hit:p?.outerHTML?.slice(0,300),viewport:[innerWidth,innerHeight],scroll:[scrollX,scrollY]}})()`)))}finally{
+  fs.writeFileSync(path.join(out,'result.json'),JSON.stringify({at:new Date().toISOString(),kind:'actual Go handlers + actual UI; synthetic data only',checks,failure:failure?.message||null},null,2)+'\n');
+  await b.close();
+}
+if(failure)process.exitCode=1;else console.log('PASS '+checks.length+' browser acceptance groups');

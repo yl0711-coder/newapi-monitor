@@ -71,6 +71,12 @@ var quantileDisplayJS []byte
 //go:embed logchain.js
 var logChainJS []byte // 客户排障页交互；只访问 /logchain/* 管理员接口
 
+//go:embed usage_logs.js
+var usageLogsJS []byte // 使用日志页交互；只访问 /usage-logs/* 管理员接口
+
+//go:embed usage_logs.css
+var usageLogsCSS []byte
+
 //go:embed alerts.js
 var alertsJS []byte // 问题预警页交互；只访问 /alerts/rejections
 
@@ -284,6 +290,14 @@ func (m *Monitor) RegisterRoutes(r *gin.Engine) {
 		c.Header("Cache-Control", "no-cache")
 		c.Data(http.StatusOK, "application/javascript; charset=utf-8", alertsJS)
 	})
+	r.GET("/usage-logs.js", func(c *gin.Context) {
+		c.Header("Cache-Control", "no-cache")
+		c.Data(http.StatusOK, "application/javascript; charset=utf-8", usageLogsJS)
+	})
+	r.GET("/usage-logs.css", func(c *gin.Context) {
+		c.Header("Cache-Control", "no-cache")
+		c.Data(http.StatusOK, "text/css; charset=utf-8", usageLogsCSS)
+	})
 	r.GET("/logchain.js", func(c *gin.Context) {
 		c.Header("Cache-Control", "no-cache")
 		c.Data(http.StatusOK, "application/javascript; charset=utf-8", logChainJS)
@@ -404,6 +418,12 @@ func (m *Monitor) RegisterRoutes(r *gin.Engine) {
 		// 上游主域名与错误原文，属敏感诊断数据，不得被任何中间层缓存。
 		// 用中间件而非在 handler 里逐个 c.Header：handler 有多条提前 return
 		// 的错误分支（400/401/403/500），逐个加必然漏，而漏掉的恰好是错误响应。
+		// 使用日志（通用日志）：复刻 new-api 管理员视图，只读查询 new-api 从库。
+		view.GET("/usage-logs/meta", noStoreSensitive, m.serveUsageLogsMeta)
+		view.GET("/usage-logs/list", noStoreSensitive, m.serveUsageLogsList)
+		view.GET("/usage-logs/count", noStoreSensitive, m.serveUsageLogsCount)
+		view.GET("/usage-logs/stat", noStoreSensitive, m.serveUsageLogsStat)
+		view.GET("/usage-logs/user/:id", noStoreSensitive, m.serveUsageLogsUser)
 		view.GET("/logchain/requests", noStoreSensitive, m.serveLogChainRequests) // 客户排障:逐条请求→渠道→上游主域名→错误原文(含 type=5,含渠道信息,仅管理员)
 		view.GET("/logchain/filters", noStoreSensitive, m.serveLogChainFilters)   // 客户排障:筛选下拉取值(服务分组/上游域名/渠道),只读本地快照
 		// 按需 CloudWatch 证据：仅在人工展开某条请求并点击时触发，一次只查一个

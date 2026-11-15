@@ -190,6 +190,7 @@ func TestFinanceGiftVerifiedPeriodsRealSnapshot(t *testing.T) {
 		}
 		if gift == nil {
 			t.Fatal("complete real day hidden")
+			return
 		}
 		value, ok := financeMoneyInt64(*gift)
 		if !ok {

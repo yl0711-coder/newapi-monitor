@@ -126,6 +126,7 @@ func TestModelFRTPageMeanMatchesDirectAggregationAtAllThreeLevels(t *testing.T) 
 	}
 	if channel1 == nil {
 		t.Fatal("缺少渠道 1")
+		return
 	}
 	if math.Abs(*channel1.FRT.MeanMs-1120) > 1e-9 {
 		t.Fatalf("渠道均值必须按样本数加权（期望 1120ms，模型均值平均会得 1600ms），实为 %v", *channel1.FRT.MeanMs)

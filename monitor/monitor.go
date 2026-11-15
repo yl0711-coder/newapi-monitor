@@ -90,6 +90,15 @@ type Monitor struct {
 	// into an apparent backlog.
 	tokenLocalWriteMu       tokenLocalWriter
 	tokenReportSummaryCache tokenSummaryCache
+	// 使用日志页独立的从库查询闸门（容量 usageLogsGateCapacity），不占 usageDetailGate。
+	usageLogsGateOnce       sync.Once
+	usageLogsGate           chan struct{}
+	usageLogsBackgroundGate chan struct{}
+	// Test seams for the replica thread id and KILL QUERY; nil uses MySQL.
+	usageLogsThreadIDFn func(context.Context, *sql.Conn) int64
+	usageLogsKillFn     func(context.Context, int64) error
+	usageLogsKillOnce   sync.Once
+	usageLogsKillDB     *sql.DB
 	// usageFactsDB 独立承载高增长的用量小时/日事实、同步水位和资料快照。
 	// 生产通过 New 创建时默认与 storeDB 分文件，避免补数、WAL 膨胀、损坏或
 	// 写锁把告警配置、渠道配置和其他 Monitor 页面一起拖垮。测试直接调用

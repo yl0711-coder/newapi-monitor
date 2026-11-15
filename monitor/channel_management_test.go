@@ -891,6 +891,7 @@ func TestBuildChannelManagementReportGroupsDomainVendorChannelAndServiceGroup(t 
 	}
 	if last == nil || !hasUnconfigured || !hasHistorical {
 		t.Fatalf("domains=%+v", report.Domains)
+		return
 	}
 	if got := report.Domains[len(report.Domains)-1]; got.Domain != "other.ai" || !got.ManuallyDisabled {
 		t.Fatalf("全手动禁用上游未在报表末尾标记: %+v", got)

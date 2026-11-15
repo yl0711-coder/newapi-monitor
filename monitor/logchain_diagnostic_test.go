@@ -67,6 +67,7 @@ func TestCustomerDiagnosticChecklistAndOriginal300(t *testing.T) {
 			d := logChainDiagnose(r)
 			if d == nil {
 				t.Fatal("original error was not recognized")
+				return
 			}
 			want, got := logChainDiagnosticParties(sample.Responsibility), append([]string(nil), d.ResponsibleParties...)
 			sort.Strings(want)
@@ -202,6 +203,7 @@ func TestCustomerDiagnosticDynamicOriginals(t *testing.T) {
 			d := logChainDiagnose(LogChainRow{Type: 5, Content: text})
 			if d == nil {
 				t.Fatal("dynamic values broke matching")
+				return
 			}
 			want, got := logChainDiagnosticParties(row.Responsibility), append([]string(nil), d.ResponsibleParties...)
 			sort.Strings(want)
