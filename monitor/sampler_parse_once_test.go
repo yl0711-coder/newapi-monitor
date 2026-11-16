@@ -49,7 +49,11 @@ func TestSampleWindowParsesOtherOnce(t *testing.T) {
 		if strings.Count(q, "JSON_VALID(other)") != 2 || strings.Count(q, "JSON_EXTRACT(other,") != 1 {
 			t.Fatalf("%s: `other` must be validated/parsed only inside the derived table", v.name)
 		}
-		outer := q[:strings.Index(q, "\nFROM (")]
+		from := strings.Index(q, "\nFROM (")
+		if from < 0 {
+			t.Fatalf("%s: derived table missing", v.name)
+		}
+		outer := q[:from]
 		if refs := bare.FindAllString(outer, -1); len(refs) != 0 {
 			t.Fatalf("%s: outer aggregation still reads raw other %d times", v.name, len(refs))
 		}
