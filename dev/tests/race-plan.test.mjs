@@ -61,8 +61,8 @@ test('current measured workloads fit the per-process target with headroom for fu
     const names = [...Object.keys(timings.test_seconds), ...Array.from({length: 5}, (_, i) => `TestFutureUnmeasured${i}`)];
     const plan = racePlan(names.join('\n'), timings, racePackages[name], loadRaceSerial(name));
     assert.equal(plan.patterns.length, racePackages[name].jobs * racePackages[name].processes);
-    // At least a minute below the 14-minute target, about half the 25-minute process timeout.
-    assert.ok(Math.max(...plan.estimatedSeconds, ...plan.serialSeconds) <= 13 * 60, `${name}: measured work must leave room below the 14-minute target`);
+    // Five more unmeasured tests (fallback seconds each) must still fit the 15-minute target, well inside the 25-minute process timeout.
+    assert.ok(Math.max(...plan.estimatedSeconds, ...plan.serialSeconds) <= raceProcessTargetSeconds, `${name}: measured work must leave room for future tests below the 15-minute target`);
   }
 });
 

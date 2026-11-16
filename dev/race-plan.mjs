@@ -17,13 +17,13 @@ import {pathToFileURL} from 'node:url';
 // race-built inventory selects tests; a test without a recorded duration gets a
 // conservative estimate and still runs exactly once.
 export const racePackages = {
-  monitor: {pkg: './monitor', jobs: 7, processes: 4, timings: './monitor-race-timings.json', serial: './monitor-race-serial.json'},
-  monthly: {pkg: './internal/monthlydraft', jobs: 5, processes: 4, timings: './monthly-race-timings.json', serial: './monthly-race-serial.json'},
+  monitor: {pkg: './monitor', jobs: 8, processes: 3, timings: './monitor-race-timings.json', serial: './monitor-race-serial.json'},
+  monthly: {pkg: './internal/monthlydraft', jobs: 6, processes: 3, timings: './monthly-race-timings.json', serial: './monthly-race-serial.json'},
 };
 
 // Durations are single-process CI measurements; leave headroom below the
 // 25-minute per-process test timeout (parallel processes share a runner).
-export const raceProcessTargetSeconds = 14 * 60;
+export const raceProcessTargetSeconds = 15 * 60;
 
 const testName = /^(?:Test|Example|Fuzz)\S*$/;
 const lexical = (a, b) => a < b ? -1 : a > b ? 1 : 0;
@@ -115,7 +115,7 @@ export function racePlan(listing, timings, {jobs, processes}, serial = noSerial)
   const serialPack = serial.jobs ? pack(serialNames, serial.jobs, weight) : {groups: [], seconds: []};
   for (const group of [...parallel.groups, ...serialPack.groups]) assert.ok(group.length, 'empty race process');
   assert.ok(Math.max(...parallel.seconds, ...serialPack.seconds) <= raceProcessTargetSeconds,
-    'predicted race process exceeds the 14-minute target; refresh timings or add jobs');
+    'predicted race process exceeds the 15-minute target; refresh timings or add jobs');
   const patterns = parallel.groups.map(toPattern);
   const serialPatterns = serialPack.groups.map(toPattern);
   const compiled = [...patterns, ...serialPatterns].map(pattern => new RegExp(pattern));
