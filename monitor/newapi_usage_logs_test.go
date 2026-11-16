@@ -846,6 +846,10 @@ func TestUsageLogsBrowserAcceptance(t *testing.T) {
 		usageLogRow{2002, 31, now - 59, 6, "fixture-user", "fixture-token", "fixture-model", 1000, 0, 0, 7, "codex", "fixture-refund", `{"task_id":"synthetic-task","reason":"synthetic refund"}`},
 		usageLogRow{2003, 31, now - 58, 3, "fixture-user", "", "", 0, 0, 0, 0, "", "fixture-audit", `{"op":{"action":"synthetic update","params":{"fields":["models"]}},"admin_info":{"admin_username":"fixture-admin"}}`},
 		usageLogRow{2004, 31, now - 57, 2, "fixture-user", "fixture-token", "fixture-model", 500000, 100, 20, 7, "codex", "fixture-tier", `{"billing_source":"subscription","subscription_consumed":500000,"subscription_plan_title":"测试套餐","frt":600,"billing_mode":"tiered_expr","matched_tier":"base","expr_b64":"dGllcigiYmFzZSIsIHAgKiAyICsgYyAqIDgp"}`})
+	// A second account for the shortcut-switching browser check.
+	for i := 0; i < 5; i++ {
+		rows = append(rows, usageLogRow{int64(3001 + i), 32, now - 120 - int64(i), 2, "fixture-vip", "vip-token", "fixture-model", 250000, 50, 10, 7, "codex", fmt.Sprintf("fixture-vip-%d", i), `{"frt":400,"model_ratio":1,"completion_ratio":2}`})
+	}
 	insertUsageLogs(t, m.prodDB, rows...)
 	if _, err := m.prodDB.Exec(`UPDATE users SET username='fixture-user', display_name='合成用户' WHERE id=31`); err != nil {
 		t.Fatal(err)

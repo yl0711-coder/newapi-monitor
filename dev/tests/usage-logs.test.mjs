@@ -21,7 +21,7 @@ function fixture(handler=()=>ok({})){
     URLSearchParams,AbortController,
     setTimeout:(fn,ms)=>{const id=++timerID;timers.set(id,{fn,ms});return id},clearTimeout:id=>timers.delete(id),atob:s=>Buffer.from(s,'base64').toString('binary'),
     fetch:(url,options={})=>{calls.push({url,options});return handler(url,options)}});
-  vm.runInContext(source.replace('window.usageLogsActivate=activate;',`globalThis.api={st,activate,deactivate,search,prepareSearch,loadMeta,loadList,loadCount,loadStat,cancelQueries,openUser,openDetail,openModal,closeModal,cellCost,queryParams,fmtQuota,detailSegments};window.usageLogsActivate=activate;`),context);
+  vm.runInContext(source.replace('window.usageLogsActivate=activate;',`globalThis.api={st,activate,deactivate,search,prepareSearch,loadMeta,loadList,loadCount,loadStat,cancelQueries,openUser,openDetail,openModal,closeModal,cellCost,queryParams,fmtQuota,detailSegments,loadShortcuts,renderShortcuts,onShortcutBarClick,onShortcutModalClick,saveShortcut,openShortcutManage,scApply};window.usageLogsActivate=activate;`),context);
   const api=context.api;api.st.meta={...meta};api.st.applied={startTime:1794400000000,endTime:1794500000000};api.st.pageSize=100;
   return{...api,el,calls,timers};
 }
@@ -220,7 +220,11 @@ test('server queries put MySQL time hints after SELECT; page remains isolated fr
   assert.match(go,/COUNT\(\*\) OVER\(\) AS matched_total/);
   const html=readFileSync(new URL('../../monitor/page.html',import.meta.url),'utf8');assert.match(html,/else if\(window\.usageLogsDeactivate\)window\.usageLogsDeactivate\(\)/);
   const server=readFileSync(new URL('../../monitor/server.go',import.meta.url),'utf8');assert.match(server,/view := r.Group\("\/", m.requireRole\(roleAdmin\)\)/);
-  assert.equal((server.match(/view.GET\("\/usage-logs\//g)||[]).length,5);
+  // Replica-backed GET routes stay at five; shortcut routes only touch the local store.
+  assert.equal((server.match(/view.GET\("\/usage-logs\/(?!shortcuts)/g)||[]).length,5);
+  assert.equal((server.match(/view.(GET|POST)\("\/usage-logs\/shortcuts/g)||[]).length,5);
+  const sc=readFileSync(new URL('../../monitor/usage_logs_shortcuts.go',import.meta.url),'utf8');
+  assert.doesNotMatch(sc,/prodDB|usageLogsSource|QueryContext|ExecContext/);assert.match(sc,/m\.storeDB/);
   assert.doesNotMatch(server,/view.GET\("\/usage-logs\/export/);
   assert.doesNotMatch(source,/ulExport|runExport|csvCell/);
   // The only Exec is the KILL QUERY of this request's own replica thread.
@@ -249,4 +253,71 @@ test('searching again with unchanged filters keeps a clicked wide-range SUM runn
   await v.loadStat();v.loadStat(true);const sum=v.calls.at(-1);
   v.prepareSearch();
   assert.equal(sum.options.signal.aborted,false);assert.equal(v.st.statRequested,false);
+});
+
+const scItems=[{id:1,username:'yiche-api',label:'易车',sort:1},{id:2,username:'gaotu',label:'gaotu',sort:2}];
+const scTarget=(sel,data={})=>({closest:q=>q.split(',').some(x=>x.trim()===sel)?{dataset:data,hasAttribute:a=>`[${a}]`===sel,disabled:false,textContent:'',classList:{add(){},remove(){}},closest:()=>null}:null});
+function scFixture(extra){
+  const v=fixture((url,o)=>{
+    if(String(url).startsWith('/usage-logs/shortcuts'))return extra?extra(url,o):ok({items:scItems,max:20});
+    return ok({items:[],total:0,page_size:100});
+  });
+  v.st.inited=true;v.st.draft={startTime:1794400000000,endTime:1794500000000,type:'0',model:'',token:'',channel:'',group:'',username:'',requestId:'',upstreamRequestId:''};
+  return v;
+}
+
+test('shortcut chips load once per admin, mark the active user and respect masking',async()=>{
+  const v=scFixture();
+  await v.loadShortcuts();
+  const h=v.el('ulShortcuts').innerHTML;
+  assert.match(h,/data-sc="1"[^>]*>易车</);assert.match(h,/data-sc="2"[^>]*>gaotu</);assert.match(h,/data-sc-add/);assert.match(h,/data-sc-manage/);
+  assert.doesNotMatch(h,/ul-sc-chip active/);
+  v.st.draft.username='gaotu';v.renderShortcuts();
+  assert.match(v.el('ulShortcuts').innerHTML,/class="ul-sc-chip active" data-sc="2" aria-pressed="true"/);
+  v.st.masked=true;v.renderShortcuts();
+  const m=v.el('ulShortcuts').innerHTML;
+  assert.match(m,/>易车</);assert.match(m,/data-sc="2"[^>]*>••••</);assert.doesNotMatch(m,/yiche-api|用户名：gaotu/);
+});
+
+test('clicking a shortcut searches that user; clicking the active one clears the user filter',async()=>{
+  const v=scFixture();await v.loadShortcuts();
+  v.onShortcutBarClick({target:scTarget('[data-sc]',{sc:'1'})});
+  assert.equal(v.el('ulUser').value,'yiche-api');assert.equal(v.st.draft.username,'yiche-api');
+  await new Promise(r=>setImmediate(r));
+  const list=v.calls.map(c=>new URL(c.url,'http://localhost')).find(u=>u.pathname==='/usage-logs/list');
+  assert.ok(list,'search issued a list query');assert.equal(list.searchParams.get('username'),'yiche-api');
+  v.onShortcutBarClick({target:scTarget('[data-sc]',{sc:'1'})});
+  assert.equal(v.el('ulUser').value,'');assert.equal(v.st.draft.username,'');
+});
+
+test('shortcut load failure shows a retry instead of chips',async()=>{
+  const v=scFixture(()=>new Response('{"success":false,"message":"boom"}'));
+  await v.loadShortcuts();
+  assert.match(v.el('ulShortcuts').innerHTML,/加载失败/);assert.match(v.el('ulShortcuts').innerHTML,/data-sc-retry/);
+});
+
+test('saving a shortcut posts JSON and surfaces server validation errors',async()=>{
+  let fail=true;const posts=[];
+  const v=scFixture((url,o)=>{if(o.method==='POST'){posts.push({url,o});return fail?new Response(JSON.stringify({success:false,message:'该用户已在快捷标签中'})):ok({items:scItems,max:20})}return ok({items:[],max:20})});
+  v.openModal('t','','');v.el('ulScUser').value=' yiche-api ';v.el('ulScLabel').value='易车';v.el('ulScErr').hidden=true;
+  await v.saveShortcut(0,false);
+  assert.equal(posts.length,1);assert.equal(posts[0].url,'/usage-logs/shortcuts');assert.equal(posts[0].o.headers['Content-Type'],'application/json');
+  assert.deepEqual(JSON.parse(posts[0].o.body),{username:'yiche-api',label:'易车'});
+  assert.equal(v.el('ulScErr').hidden,false);assert.match(v.el('ulScErr').textContent,/已在快捷标签中/);assert.equal(v.el('ulModal').hidden,false);
+  fail=false;v.el('ulModalFoot:child').disabled=false;
+  await v.saveShortcut(0,false);
+  assert.equal(v.el('ulModal').hidden,true);assert.equal(v.st.shortcuts.length,2);
+  v.openModal('t','','');v.el('ulModalFoot:child').disabled=false;v.el('ulScUser').value='gao%';v.el('ulScErr').hidden=true;
+  await v.saveShortcut(0,false);assert.equal(posts.length,2,'wildcard rejected client-side');assert.match(v.el('ulScErr').textContent,/通配符/);
+});
+
+test('deleting a shortcut needs a second confirming click',async()=>{
+  const posts=[];
+  const v=scFixture((url,o)=>{if(o.method==='POST'){posts.push(url);return ok({items:[scItems[1]],max:20})}return ok({items:scItems,max:20})});
+  await v.loadShortcuts();v.openShortcutManage();
+  const btn={dataset:{},disabled:false,textContent:'删除',classList:{add(){},remove(){}},hasAttribute:a=>a==='data-sc-del',closest:q=>q==='.ul-sc-row'?{dataset:{id:'1'}}:null};
+  const ev={target:{closest:()=>btn}};
+  v.onShortcutModalClick(ev);assert.equal(posts.length,0);assert.equal(btn.textContent,'确认删除');
+  v.onShortcutModalClick(ev);await new Promise(r=>setImmediate(r));
+  assert.deepEqual(posts,['/usage-logs/shortcuts/1/delete']);assert.equal(v.st.shortcuts.length,1);
 });
