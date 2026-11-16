@@ -61,8 +61,8 @@ test('current measured workloads fit the per-process target with headroom for fu
     const names = [...Object.keys(timings.test_seconds), ...Array.from({length: 5}, (_, i) => `TestFutureUnmeasured${i}`)];
     const plan = racePlan(names.join('\n'), timings, racePackages[name], loadRaceSerial(name));
     assert.equal(plan.patterns.length, racePackages[name].jobs * racePackages[name].processes);
-    // At least a minute below the 14-minute target, about half the 25-minute process timeout.
-    assert.ok(Math.max(...plan.estimatedSeconds, ...plan.serialSeconds) <= 13 * 60, `${name}: measured work must leave room below the 14-minute target`);
+    // Five more unmeasured tests (fallback seconds each) must still fit the 15-minute target, well inside the 25-minute process timeout.
+    assert.ok(Math.max(...plan.estimatedSeconds, ...plan.serialSeconds) <= raceProcessTargetSeconds, `${name}: measured work must leave room for future tests below the 15-minute target`);
   }
 });
 
@@ -104,11 +104,16 @@ test('CI runs every planned job with race detection and gates publication on all
     assert.match(body, /node dev\/summarize-race-tests\.mjs/);
     assert.doesNotMatch(body, /continue-on-error|\|\|\s*true|(?:^|\s)-short(?:\s|$)/);
   }
-  assert.match(job('test'), /node dev\/race-plan\.mjs monitor --verify/);
-  assert.match(job('test'), /node dev\/race-plan\.mjs monthly --verify/);
+  // Coverage is proven inside every race job: run-race-job.sh plans its own job
+  // from the race-built inventory, and racePlan asserts every test belongs to
+  // exactly one process (so no separate verification job is needed).
+  const plannerCall = readFileSync(new URL('../run-race-job.sh', import.meta.url), 'utf8');
+  assert.match(plannerCall, /"\$bin" -test\.list \./);
+  assert.match(plannerCall, /node dev\/race-plan\.mjs "\$name" "\$job" < "\$out\/\$name-list\.txt"/);
   assert.ok(ci.includes("grep -Ev '/(monitor$|internal/monthlydraft$)'"));
   for (const name of ['build-push', 'build-nginx-ops-tools']) {
-    assert.match(job(name), /needs: \[test, race-monitor, race-monthly, secrets, image-security\]/);
+    assert.match(job(name), /needs: \[reuse, test, race-monitor, race-monthly, secrets, image-security\]/);
+    assert.match(job(name), /needs\.test\.result == 'success' && needs\.race-monitor\.result == 'success' && needs\.race-monthly\.result == 'success'/);
   }
   const runner = readFileSync(new URL('../run-race-job.sh', import.meta.url), 'utf8');
   assert.match(runner, /set -euo pipefail/);
@@ -164,7 +169,7 @@ test('serial tests run one process per job, exactly once, and a stale serial lis
   for (const name of Object.keys(racePackages)) {
     const pkgSerial = loadRaceSerial(name);
     const fixtures = Array.from({length: 60}, (_, i) => `TestFixture${i}`);
-    const extra = [...pkgSerial.tests, ...pkgSerial.prefixes.flatMap(prefix => [prefix + 'One', prefix + 'Two', prefix + 'Three', prefix + 'Four'])];
+    const extra = [...pkgSerial.tests, ...pkgSerial.prefixes.flatMap(prefix => Array.from({length: Math.max(4, pkgSerial.jobs)}, (_, i) => `${prefix}Fixture${i}`))];
     const listing = [...fixtures, ...extra].join('\n');
     for (let job = racePackages[name].jobs; job < raceJobCount(name); job++) {
       const planned = racePlanForJob(name, listing, job, empty, pkgSerial);

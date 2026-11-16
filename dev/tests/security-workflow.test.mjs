@@ -7,9 +7,29 @@ const job = name => workflow.split(`\n  ${name}:\n`)[1]?.split(/^  [\w-]+:/m)[0]
 
 test('all release artifacts wait for secret, test and image gates', () => {
   for (const name of ['build-push', 'build-nginx-ops-tools']) {
-    assert.match(job(name), /needs: \[test, race-monitor, race-monthly, secrets, image-security\]/);
-    assert.match(job(name), /if: github.event_name != 'pull_request'/);
+    const body = job(name);
+    assert.match(body, /needs: \[reuse, test, race-monitor, race-monthly, secrets, image-security\]/);
+    const gate = body.match(/if: >-\n([\s\S]*?)\n    [a-z]/)?.[1].replace(/\s+/g, ' ') ?? '';
+    // Never publish from a pull request; secrets, image scan and the reuse check must always succeed.
+    for (const required of ["github.event_name != 'pull_request'", '!cancelled()', "needs.reuse.result == 'success'",
+      "needs.secrets.result == 'success'", "needs.image-security.result == 'success'"]) assert.ok(gate.includes(required), `${name}: ${required}`);
+    // Tests may only be absent when reuse proved this exact commit passed them; otherwise all three must succeed.
+    assert.ok(gate.includes("(needs.reuse.outputs.tested == 'true' || (needs.test.result == 'success' && needs.race-monitor.result == 'success' && needs.race-monthly.result == 'success'))"), name);
+    assert.doesNotMatch(gate, /always\(\)/);
   }
+  // Reuse only for tags, only for a successful pull-request run of the same commit,
+  // and only when main is an ancestor (the tested merge result is this commit).
+  const reuse = job('reuse');
+  assert.match(reuse, /if \[ "\$GITHUB_REF_TYPE" = tag \]; then/);
+  assert.match(reuse, /head_sha=\$GITHUB_SHA&event=pull_request&status=success/);
+  assert.match(reuse, /git merge-base --is-ancestor origin\/main "\$GITHUB_SHA"/);
+  assert.match(reuse, /tested=false\n/);
+  for (const name of ['test', 'race-monitor', 'race-monthly']) {
+    assert.match(job(name), /needs: \[reuse\]\n    if: needs\.reuse\.outputs\.tested != 'true'/, name);
+  }
+  // Secret and image scans never depend on the reuse decision.
+  assert.doesNotMatch(job('secrets'), /reuse/);
+  assert.doesNotMatch(job('image-security'), /needs\.reuse/);
   assert.match(job('secrets'), /fetch-depth: 0/);
   assert.match(job('secrets'), /--redact=100.*--ignore-gitleaks-allow.*--log-opts="--all"/);
   assert.match(job('secrets'), /check-secret-policy\.mjs/);

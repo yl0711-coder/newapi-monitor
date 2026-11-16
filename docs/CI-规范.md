@@ -27,22 +27,23 @@
 任务关系：
 
 ```
-secrets ──┬─ image-security（5 个镜像，扫描）──┐
-          │                                   ├─ build-push（发布镜像）
-test ─────┤                                   ├─ build-nginx-ops-tools
-race-monitor（11 个任务）──────────────────────┤
-race-monthly（7 个任务）───────────────────────┘
+secrets ──── image-security（5 个镜像，扫描）──────┐
+reuse ──┬─ test ───────────────────────────────────┤
+        ├─ race-monitor（12 个任务）───────────────┼─ build-push（发布镜像）
+        └─ race-monthly（6 个任务）────────────────┴─ build-nginx-ops-tools
 ```
 
 - `test`：vet、lint、前端测试、各类离线检查，以及 monitor 和 monthlydraft 以外所有包的 race 测试。
 - `race-monitor`、`race-monthly`：这两个包测试量最大，单独分配（见第 3 节）。
 - `image-security` 只依赖 `secrets`，和测试同时开始；**镜像发布仍然要求测试和扫描全部通过**。
+- `reuse`：只在推送 `v*` 标签时生效。同时满足两个条件才复用：同一个提交在 PR 上已经跑过完整 CI 且全部成功；当前 `main` 是这个提交的祖先，也就是 PR 当时测的合并结果就是这个提交本身。满足时 `test`、`race-monitor`、`race-monthly` 跳过，密钥扫描、镜像构建、漏洞扫描和发布照常执行；不满足（或任何其他事件）一律完整运行。发布条件写在 `build-push` 的 `if` 里：测试任务只有在 `reuse` 证明已通过时才允许缺席，`dev/tests/security-workflow.test.mjs` 校验这条规则。
+- 按 v1.18.62/63 发版流程（先在 PR 最新提交上打标签，上线稳定后再合并 main），标签 CI 通常只需几分钟。
 
 ### 并发上限
 
 本仓库是公开仓库，GitHub 免费额度下同时最多运行约 20 个任务，超出的任务要排队。所以：
 
-- 测试阶段同时运行的任务总数不超过 20：`secrets` + `test` + race 18 个（monitor 7 并行 + 4 串行，monthly 6 并行 + 1 串行）= 20 个。
+- 测试阶段同时运行的任务总数为 20：`test` + race 19 个（monitor 7 并行 + 5 串行，monthly 6 并行 + 1 串行）。`reuse` 和 `secrets` 在开始后 1 分钟内结束，期间最多有 1 个任务排队几十秒；镜像漏洞扫描在有空位后依次运行，只影响推送时的发布，不影响 PR。
 - 镜像扫描是 5 个 1–2 分钟的短任务，利用剩余的空位依次完成，不影响总时长。
 - **调整任务数时，必须重新核算这个总数。**
 
@@ -50,17 +51,19 @@ race-monthly（7 个任务）─────────────────
 
 monitor 包约 3900 个测试，monthlydraft 包约 580 个，全部串行跑要 7 个多小时（race 模式）。分配方式：
 
-1. **按实测耗时均分**：`dev/monitor-race-timings.json`、`dev/monthly-race-timings.json` 记录每个测试在 CI 上的实测耗时（秒）。`dev/race-plan.mjs` 按"最长的先放"把测试分给 `任务数 × 3` 个进程，使每个进程的预估总时长接近。
-2. **每台机器同时跑 3 个进程**：测试本身是串行的，一个进程只用得上 4 核里的 1 核。`dev/run-race-job.sh` 在每台机器上把 race 测试程序编译一次，再同时启动 3 个进程。
-3. **测试清单以实际编译结果为准**：分配用的是 race 编译出的程序自己列出的测试清单（`-test.list`），不是耗时表。耗时表里没有的新测试按默认估计（monitor 30 秒，monthly 90 秒）分配，**照样会跑**。
-4. **覆盖校验**：`test` 任务里的 "Verify every race test belongs to exactly one planned process" 步骤会证明每个测试恰好属于一个进程，漏了或重复都会失败。
+1. **按实测耗时均分**：`dev/monitor-race-timings.json`、`dev/monthly-race-timings.json` 记录每个测试在 CI 上的实测耗时（秒）。`dev/race-plan.mjs` 按"最长的先放"把测试分给 `任务数 × 3` 个进程，使每个进程的预估总时长接近。（`任务数 × 每任务进程数`，见下表。）
+2. **每台机器同时跑 3 个进程**：测试本身是串行的，一个进程只用得上 4 核里的 1 核。`dev/run-race-job.sh` 在每台机器上把 race 测试程序编译一次，再同时启动 3 个进程。2026-11 试过 4 个（PR #59 首轮）：CPU 争用使 monitor 测试整体慢 16%、monthly 慢 45%，个别测试耗时翻倍并出现需重跑的测试，总时长反而变成 22 分钟，所以保持 3 个。
+   - race 编译缓存：`setup-go` 自带的缓存按 `go.sum` 只保存一次，不含 race 编译产物，原来每个任务都要从头编译约 2 分 20 秒。现在 race 编译缓存（`~/.cache/go-build`）按提交单独保存：所有 race 任务和 `test` 从最近一次恢复，只由 `race-monitor` 第 0 个任务编译并保存。
+3. **SQLite 第三方库关闭 checkptr**：`test`、`race-monitor`、`race-monthly` 三个任务设置 `GOFLAGS=-gcflags=modernc.org/...=-d=checkptr=0 -gcflags=github.com/glebarez/...=-d=checkptr=0`。`-race` 会顺带对所有代码打开 unsafe 指针检查（checkptr），它与数据竞争检测无关；项目用的纯 Go SQLite 大量使用 unsafe，这项检查在它身上开销很大。只对这两个第三方库关闭，race 检测本身和本仓代码的 checkptr 都不变。抽样 40 条测试：monitor 72 秒降到 44 秒，monthly 303 秒降到 226 秒。**不能改用 `-race=false` 让这些库完全不做 race 插桩**：PR #59 实测会让 race 检测器丢失同步关系，在 `encoding/json`、gorm 的内部缓存上报出误报（本机同样复现，完整插桩下为 0）。本机直接运行 `go test -race` 不受影响。
+4. **测试清单以实际编译结果为准**：分配用的是 race 编译出的程序自己列出的测试清单（`-test.list`），不是耗时表。耗时表里没有的新测试按默认估计（monitor 30 秒，monthly 90 秒）分配，**照样会跑**。
+5. **覆盖校验**：每个 race 任务开始时，`dev/run-race-job.sh` 用 race 编译出的实际清单调用 `dev/race-plan.mjs`，规划过程会证明每个测试恰好属于一个进程，漏了或重复都会让该任务失败。（原来 `test` 任务里单独的校验步骤与此重复，且要额外编译两次，已去掉；本地仍可用下文的 `--verify` 命令检查。）
 
 当前配置（`dev/race-plan.mjs` 的 `racePackages`）：
 
 | 包 | 并行任务 | 每任务进程数 | 串行任务（每任务 1 个进程） | 单进程预估上限 |
 |---|---|---|---|---|
-| monitor | 7 个（编号 0–6），共 21 个进程 | 3 | 4 个（编号 7–10）：全部 `TestToken*` 测试 | 14 分钟（目标） |
-| monthly | 6 个（编号 0–5），共 18 个进程 | 3 | 1 个（编号 6）：`TestRetentionBoundedReceiverPayloadRace` | 14 分钟（目标） |
+| monitor | 7 个（编号 0–6），共 21 个进程 | 3 | 5 个（编号 7–11）：全部 `TestToken*` 测试（每个任务先跑原生、再跑 race，所以比并行任务多分一个） | 15 分钟（目标） |
+| monthly | 6 个（编号 0–5），共 18 个进程 | 3 | 1 个（编号 6）：`TestRetentionBoundedReceiverPayloadRace` | 15 分钟（目标） |
 
 ### 串行任务（对 CPU 争用敏感的测试）
 
@@ -76,7 +79,7 @@ monitor 包约 3900 个测试，monthlydraft 包约 580 个，全部串行跑要
 - **依据**：v1.18.48 在真实 CI 上试过每台机器 3 个进程，两轮里有 19 个不同的 `TestToken*` 测试和 1 个 monthly 性能测试失败，其余约 3900 个测试全部通过。所以只把这些测试单独运行，其余测试保持 3 个进程并行。
 - **只有证据充分才加入**：在并行负载下重复失败、单独运行稳定通过，才列入清单；不要把普通的慢测试放进来。
 - 清单里的测试被改名、删除，或者某个前缀已经匹配不到任何测试时，CI 会报错，需要同步更新清单。
-- 串行任务的预估总时长同样受 14 分钟目标约束；不够时增加 `jobs`，同时核算总任务数（第 2 节）。
+- 串行任务的预估总时长同样受 15 分钟目标约束；不够时增加 `jobs`，同时核算总任务数（第 2 节）。
 
 ### 串行任务的运行方式（`mode`）
 
@@ -89,7 +92,7 @@ monitor 包约 3900 个测试，monthlydraft 包约 580 个，全部串行跑要
 
 这是过渡做法：等这些测试改成不依赖机器速度（第 7 节"待修"），令牌测试恢复为 `race` 模式，和其他测试一样必须在 race 模式下通过。**新写的性能类测试不要依赖这个豁免**，按第 4 节的规则写。
 
-预估值按"一台机器只跑 1 个进程"时的实测耗时计算；3 个进程同时跑会互相抢 CPU，实际会慢一些，所以目标上限定在 14 分钟，单进程超时 25 分钟，任务超时 35 分钟。
+预估值按 CI 上的实测耗时计算；多个进程同时跑会互相抢 CPU，实际会慢一些，所以目标上限定在 15 分钟，单进程超时 25 分钟，任务超时 35 分钟。
 
 ## 4. 开发者写测试的规则
 
@@ -134,11 +137,11 @@ go test -race -list . ./internal/monthlydraft | node dev/race-plan.mjs monthly -
 
 ### 怎么调整任务数
 
-测试总量增长、刷新耗时表后仍超过 14 分钟目标时：
+测试总量增长、刷新耗时表后仍超过 15 分钟目标时：
 
 1. 改 `dev/race-plan.mjs` 里 `racePackages` 的 `jobs`；
 2. 同步改 `.github/workflows/ci.yml` 里 `race-monitor` / `race-monthly` 的 `matrix.job` 列表：并行任务编号 0 到 `jobs-1`，有串行清单的包再加一个编号 `jobs`（`dev/tests/race-plan.test.mjs` 会校验两者一致）；
-3. 重新核算并发总数（第 2 节），保持测试阶段的任务数不超过 20。超过时优先考虑把 `processes` 从 3 调到 4（runner 为 4 核），但要先观察时间敏感测试是否稳定。
+3. 重新核算并发总数（第 2 节），保持测试阶段的任务数不超过 20。`processes` 已是 4（runner 为 4 核），不能再加；再超时优先缩短最慢的测试（第 4 节），或刷新耗时表重新均分。
 
 ## 6. 排查失败
 
