@@ -228,6 +228,16 @@ func abortCanceledUsageRequest(c *gin.Context, err error) bool {
 	return true
 }
 
+// Raw-logs aggregations below are the fallback used only when the usage-facts
+// store is not serving. Their client contexts give up after 15-20 s, but MySQL
+// does not notice an abandoned connection and kept such statements running for
+// minutes on the replica. These hints make the server stop just before the
+// client deadline (and below the 20 s driver readTimeout).
+const (
+	usageRawSelect20s = "SELECT /*+ MAX_EXECUTION_TIME(18000) */ "
+	usageRawSelect15s = "SELECT /*+ MAX_EXECUTION_TIME(13000) */ "
+)
+
 // usageDayExprMySQL 把 created_at(unix 秒)折算成 CST 日序号(自 epoch 起第几天)。
 // MySQL 整除用 DIV;测试里(sqlite)用 usageDayExpr 字段覆盖为 '/'(sqlite 整型相除即整除)。
 const usageDayExprMySQL = "(created_at + 28800) DIV 86400"
@@ -366,7 +376,7 @@ func (m *Monitor) computeUsageStats(ctx context.Context, ids []int64, fromTs, to
 	st := newUsageStatsRange(fromTs, toTs)
 
 	// 1) 每日:日桶 = CST 日序号,回来再折成日期文本。
-	dailyQ := "SELECT " + m.dayExpr() + " AS day_idx," +
+	dailyQ := usageRawSelect20s + m.dayExpr() + " AS day_idx," +
 		" CAST(COALESCE(SUM(CASE WHEN type=2 THEN 1 ELSE 0 END),0) AS SIGNED)," +
 		" CAST(COALESCE(SUM(CASE WHEN type=6 THEN 1 ELSE 0 END),0) AS SIGNED)," +
 		" CAST(COALESCE(SUM(CASE WHEN type=2 THEN COALESCE(prompt_tokens,0) ELSE 0 END),0) AS SIGNED)," +
@@ -415,7 +425,7 @@ func (m *Monitor) computeUsageStats(ctx context.Context, ids []int64, fromTs, to
 		{"COALESCE(model_name,'')", &st.ByModel, &st.ByModelTruncated, "按模型"},
 	}
 	for _, dim := range dims {
-		q := "SELECT " + dim.col + " AS k," +
+		q := usageRawSelect20s + dim.col + " AS k," +
 			" CAST(COALESCE(SUM(CASE WHEN type=2 THEN 1 ELSE 0 END),0) AS SIGNED)," +
 			" CAST(COALESCE(SUM(CASE WHEN type=6 THEN 1 ELSE 0 END),0) AS SIGNED)," +
 			" CAST(COALESCE(SUM(CASE WHEN type=2 THEN COALESCE(prompt_tokens,0)+COALESCE(completion_tokens,0) ELSE 0 END),0) AS SIGNED)," +
@@ -468,7 +478,7 @@ func (m *Monitor) computeUsageStats(ctx context.Context, ids []int64, fromTs, to
 		dmArgs = append(dmArgs, args...)
 		modelExpr := "CASE WHEN COALESCE(model_name,'') IN (" + strings.Join(ph, ",") + ")" +
 			" THEN COALESCE(model_name,'') ELSE '" + otherModelSentinel + "' END"
-		dailyModelQ := "SELECT " + m.dayExpr() + " AS day_idx, " + modelExpr + " AS model_bucket," +
+		dailyModelQ := usageRawSelect20s + m.dayExpr() + " AS day_idx, " + modelExpr + " AS model_bucket," +
 			" CAST(COALESCE(SUM(CASE WHEN type=2 THEN 1 ELSE 0 END),0) AS SIGNED)," +
 			" CAST(COALESCE(SUM(CASE WHEN type=6 THEN 1 ELSE 0 END),0) AS SIGNED)," +
 			" CAST(COALESCE(SUM(CASE WHEN type=2 THEN COALESCE(prompt_tokens,0)+COALESCE(completion_tokens,0) ELSE 0 END),0) AS SIGNED)," +
@@ -597,7 +607,7 @@ func (m *Monitor) computeUsageMatrix(ctx context.Context, ids []int64, fromTs, t
 	defer m.releaseUsageGate()
 
 	inSQL, inArgs := usageIn("user_id", ids)
-	q := "SELECT user_id, " + m.dayExpr() + " AS day_idx," +
+	q := usageRawSelect20s + "user_id, " + m.dayExpr() + " AS day_idx," +
 		" CAST(COALESCE(SUM(CASE WHEN type=2 THEN 1 ELSE 0 END),0) AS SIGNED)," +
 		" CAST(COALESCE(SUM(CASE WHEN type=6 THEN 1 ELSE 0 END),0) AS SIGNED)," +
 		" CAST(COALESCE(SUM(CASE WHEN type=2 THEN COALESCE(quota,0) ELSE 0 END),0) AS SIGNED)," +
@@ -1025,7 +1035,7 @@ func (m *Monitor) computeUserTokenAggregates(ctx context.Context, uid, fromTs, t
 	}
 	defer m.releaseUsageGate()
 
-	q := "SELECT token_id, COALESCE(MAX(token_name),'')," +
+	q := usageRawSelect15s + "token_id, COALESCE(MAX(token_name),'')," +
 		" CAST(COALESCE(SUM(CASE WHEN type=2 THEN 1 ELSE 0 END),0) AS SIGNED)," +
 		" CAST(COALESCE(SUM(CASE WHEN type=6 THEN 1 ELSE 0 END),0) AS SIGNED)," +
 		" CAST(COALESCE(SUM(CASE WHEN type=2 THEN COALESCE(prompt_tokens,0)+COALESCE(completion_tokens,0) ELSE 0 END),0) AS SIGNED)," +

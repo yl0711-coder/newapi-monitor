@@ -138,7 +138,7 @@ func TestModelFRTMeanMergeOverflowAndUnknown(t *testing.T) {
 }
 
 // Execute the actual sampler and Scan/persistence path with only MySQL DIV
-// translated for the local SQLite source. No fabricated query results.
+// and the whole-document JSON_EXTRACT translated for the local SQLite source. No fabricated query results.
 type modelFRTSQLDriver struct{ driver.Driver }
 type modelFRTSQLConn struct{ driver.Conn }
 
@@ -154,7 +154,16 @@ func (c modelFRTSQLConn) QueryContext(ctx context.Context, q string, args []driv
 	if !ok {
 		return nil, driver.ErrSkip
 	}
-	return inner.QueryContext(ctx, strings.ReplaceAll(q, "created_at DIV 60", "created_at / 60"), args)
+	return inner.QueryContext(ctx, sqliteSourceDialect(q), args)
+}
+
+// sqliteSourceDialect maps the MySQL-only spellings of the production sampler
+// to SQLite. MySQL's JSON_EXTRACT(other,'$') yields a JSON value even for a
+// scalar document; SQLite's json_extract unwraps scalars to plain text, so
+// json() is the JSON-preserving equivalent there.
+func sqliteSourceDialect(q string) string {
+	q = strings.ReplaceAll(q, "JSON_EXTRACT(other,'$')", "json(other)")
+	return strings.ReplaceAll(q, "created_at DIV 60", "created_at / 60")
 }
 func TestModelFRTMeanSourceProjectionPersistenceAndIdempotence(t *testing.T) {
 	m, end := modelFRTFixture(t, true)

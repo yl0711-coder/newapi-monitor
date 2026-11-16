@@ -1622,7 +1622,7 @@ func TestCustomerHealthSamplingAppliesResponsibilityPolicy(t *testing.T) {
 	}
 	// 生产查询使用 MySQL 的 DIV；SQLite 假来源只为真执行判据，把这一处等价替换
 	// 成整数除法。其余完整 SELECT、JSON、REGEXP 和列顺序均执行原始成品 SQL。
-	query := strings.Replace(sampleWindowUserSQL(), "(created_at DIV 60)*60", "CAST(created_at / 60 AS INTEGER)*60", 1)
+	query := sqliteSourceDialect(strings.Replace(sampleWindowUserSQL(), "(created_at DIV 60)*60", "CAST(created_at / 60 AS INTEGER)*60", 1))
 	result, err := m.prodDB.QueryContext(context.Background(), query, from, from+60)
 	if err != nil {
 		t.Fatal(err)

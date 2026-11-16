@@ -428,7 +428,9 @@ func stabilityRangeSQLWithMaxExecution(maxExecutionMS int) string {
 	q := stabilityHourSQL()
 	q = strings.Replace(q, "SELECT channel_id,", fmt.Sprintf("SELECT /*+ MAX_EXECUTION_TIME(%d) */ (created_at DIV 3600) * 3600 AS hour_ts, channel_id,", maxExecutionMS), 1)
 	q = strings.Replace(q, "GROUP BY channel_id,", "GROUP BY hour_ts, channel_id,", 1)
-	return q + fmt.Sprintf("\nLIMIT %d", maxStabilityRowsPerRange+1)
+	// Same once-per-row JSON parsing as the minute sampler (93 parses per row
+	// before); see logsParseOtherOnce.
+	return logsParseOtherOnce(q) + fmt.Sprintf("\nLIMIT %d", maxStabilityRowsPerRange+1)
 }
 
 func stabilityRangeControlSQL() string {
@@ -491,6 +493,9 @@ func stabilitySQLiteSQL(q string) string {
 		`model_name NOT REGEXP 'embed|rerank|bge-|m3e|image|seedream|seedance'`, sqliteModelClass)
 	q = strings.ReplaceAll(q, `content REGEXP 'status_code=4'`, `content LIKE '%status_code=4%'`)
 	q = strings.ReplaceAll(q, `content REGEXP 'status_code=5'`, `content LIKE '%status_code=5%'`)
+	// MySQL's JSON_EXTRACT(other,'$') keeps scalar documents as JSON values;
+	// SQLite's json_extract unwraps them to plain text, json() does not.
+	q = strings.ReplaceAll(q, "JSON_EXTRACT(other,'$')", "json(other)")
 	return q
 }
 
