@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -837,7 +838,56 @@ func (m *Monitor) sampleCustomerHealthRangeLow(ctx context.Context, fromTs, toTs
 	return m.sampleRangeWithPriorityOptions(ctx, fromTs, toTs, true, true, false)
 }
 
+// Wide source windows (startup gap fill up to an hour, hourly history
+// backfill) are aggregated in ten-minute slices. A whole busy hour cannot
+// finish inside the 8 s MAX_EXECUTION_TIME, so it was killed after burning
+// 8 s of replica CPU and retried on the next restart or backfill pass. Slices
+// start on minute boundaries, so every minute bucket is produced entirely by
+// one slice and the replace-style minute UPSERTs end in the same state as a
+// single statement. The range-level live coverage proof is published once,
+// after every slice succeeded, exactly as the single statement did.
+const (
+	sourceAggregateMaxWindowSec int64 = 25 * 60
+	sourceAggregateSliceSec     int64 = 10 * 60
+)
+
+// sourceAggregateSlices returns the half-open windows one source aggregation
+// is split into: the window itself when it is small or not minute-aligned,
+// otherwise consecutive minute-aligned ten-minute slices.
+func sourceAggregateSlices(fromTs, toTs int64) [][2]int64 {
+	if toTs-fromTs <= sourceAggregateMaxWindowSec || fromTs%60 != 0 {
+		return [][2]int64{{fromTs, toTs}}
+	}
+	var out [][2]int64
+	for from := fromTs; from < toTs; from += sourceAggregateSliceSec {
+		out = append(out, [2]int64{from, min(from+sourceAggregateSliceSec, toTs)})
+	}
+	return out
+}
+
 func (m *Monitor) sampleRangeWithPriorityOptions(ctx context.Context, fromTs, toTs int64, lowPriority, includeCapacity, includeMetrics bool) (int, error) {
+	if len(sourceAggregateSlices(fromTs, toTs)) == 1 {
+		return m.sampleRangeSlice(ctx, fromTs, toTs, lowPriority, includeCapacity, includeMetrics, true)
+	}
+	total := 0
+	for _, w := range sourceAggregateSlices(fromTs, toTs) {
+		n, err := m.sampleRangeSlice(ctx, w[0], w[1], lowPriority, includeCapacity, includeMetrics, false)
+		if err != nil {
+			return 0, err
+		}
+		total += n
+	}
+	if includeCapacity && includeMetrics {
+		if err := m.storeDB.Transaction(func(tx *gorm.DB) error {
+			return publishModelMinuteCoverage(tx, fromTs, toTs, time.Now().Unix())
+		}); err != nil {
+			slog.Warn("模型统计完整分钟证明发布延期；保留共享事实及原水位", "err", err)
+		}
+	}
+	return total, nil
+}
+
+func (m *Monitor) sampleRangeSlice(ctx context.Context, fromTs, toTs int64, lowPriority, includeCapacity, includeMetrics, publishCoverage bool) (int, error) {
 	gateCtx := ctx
 	var cctx context.Context
 	var cancel context.CancelFunc
@@ -1006,7 +1056,7 @@ func (m *Monitor) sampleRangeWithPriorityOptions(ctx context.Context, fromTs, to
 		} else if err := upsertCapacityUserMinuteSamplesDB(tx, userBatch); err != nil {
 			return err
 		}
-		if includeCapacity && includeMetrics {
+		if publishCoverage && includeCapacity && includeMetrics {
 			if err := tx.SavePoint("model_live_proof").Error; err != nil {
 				return err
 			}
@@ -1111,6 +1161,13 @@ func sampleWindowSQLWithUser(includeUser bool) string {
 func sampleCustomerHealthWindowSQL() string { return sampleWindowSQLProjection(true, true) }
 
 func sampleWindowSQLProjection(includeUser, healthOnly bool) string {
+	return sampleWindowParseOtherOnce(sampleWindowAggregateSQL(includeUser, healthOnly))
+}
+
+// sampleWindowAggregateSQL is the aggregation in its plain form, with every
+// predicate reading `other` directly. Production runs it through
+// sampleWindowParseOtherOnce; tests use it as the reference result.
+func sampleWindowAggregateSQL(includeUser, healthOnly bool) string {
 	// The FRT sum keeps MySQL DECIMAL until Scan, which rejects int64 overflow
 	// instead of silently saturating a CAST AS SIGNED. Existing projections stay unchanged.
 	// MySQL SUM/布尔聚合返回 DECIMAL,需 CAST 成 SIGNED 才能 Scan 进 int64。
@@ -1187,6 +1244,53 @@ WHERE created_at >= ? AND created_at < ? AND type IN (2,5,6)
 GROUP BY bucket, channel_id, model_name, grp` + userGroup
 	q = expandAnomalyPredicates(q)
 	return strings.ReplaceAll(q, "FRT", frt)
+}
+
+// logsAggregateSourceColumns are the only logs columns the minute sampler and
+// the stability hour aggregation read besides `other`. Keeping the derived
+// table narrow avoids copying the large `other` text into the temporary table.
+// A predicate that starts reading another column must add it here; the SQL
+// then fails loudly (unknown column) rather than computing a wrong value.
+const logsAggregateSourceColumns = "created_at, type, channel_id, model_name, `group`, user_id, username, quota, prompt_tokens, completion_tokens, use_time, is_stream, content, token_name, token_id, request_id"
+
+var logsAggregateHint = regexp.MustCompile(`MAX_EXECUTION_TIME\((\d+)\) \*/`)
+
+// sampleWindowParseOtherOnce applies logsParseOtherOnce to the minute sampler.
+func sampleWindowParseOtherOnce(q string) string { return logsParseOtherOnce(q) }
+
+// logsParseOtherOnce makes MySQL parse the `other` JSON once per row in an
+// aggregation of the form "SELECT /*+ MAX_EXECUTION_TIME(n) */ ... FROM logs
+// WHERE ... GROUP BY ...".
+//
+// The classification predicates repeat `CASE WHEN JSON_VALID(other) THEN
+// JSON_EXTRACT(other, ...)` dozens of times (87 parses per row in the full
+// minute projection, 93 in the stability hour aggregation). MySQL does not
+// share these sub-expressions, so at weekday peak the aggregations spent most
+// of their replica CPU on JSON parsing. A materialized derived table now
+// validates and parses `other` once, and the unchanged predicates read the
+// already-parsed value:
+//   - other_valid = JSON_VALID(other), same truth value as before;
+//   - other_json  = JSON_EXTRACT(other,'$') for valid rows, else NULL, so every
+//     JSON_EXTRACT(other_json, path) returns what JSON_EXTRACT(other, path) did.
+//
+// The WHERE clause moves into the derived table, so the statement keeps the
+// same placeholders. NO_MERGE keeps MySQL from folding the derived table back
+// into the outer query (which would re-inline the parsing).
+func logsParseOtherOnce(q string) string {
+	i := strings.Index(q, "\nFROM logs\nWHERE ")
+	j := strings.Index(q, "\nGROUP BY ")
+	if i < 0 || j < i || !logsAggregateHint.MatchString(q[:i]) {
+		return q // shape changed; tests pin the rewritten form
+	}
+	where := q[i+len("\nFROM logs\n") : j]
+	outer := q[:i]
+	loc := logsAggregateHint.FindStringSubmatchIndex(outer)
+	outer = outer[:loc[0]] + "MAX_EXECUTION_TIME(" + outer[loc[2]:loc[3]] + ") NO_MERGE(logs) */" + outer[loc[1]:]
+	outer = strings.ReplaceAll(outer, "JSON_VALID(other)", "other_valid")
+	outer = strings.ReplaceAll(outer, "JSON_EXTRACT(other,", "JSON_EXTRACT(other_json,")
+	return outer + "\nFROM (\n  SELECT " + logsAggregateSourceColumns +
+		",\n    JSON_VALID(other) AS other_valid,\n    CASE WHEN JSON_VALID(other) THEN JSON_EXTRACT(other,'$') END AS other_json\n  FROM logs\n  " +
+		strings.ReplaceAll(strings.TrimSpace(where), "\n", "\n  ") + "\n) logs" + q[j:]
 }
 
 // BackfillResult 回填结果,回给管理接口。

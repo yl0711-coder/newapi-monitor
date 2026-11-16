@@ -79,20 +79,23 @@ func TestSampleWindowSQLPlaceholderCount(t *testing.T) {
 	if !strings.Contains(q, "type IN (2,5,6)") {
 		t.Error("来源聚合必须读取消费、错误和退款日志；退款只进入退款字段")
 	}
+	// Predicate semantics are asserted on the plain aggregation; production
+	// only changes how `other` is parsed (TestSampleWindowParsesOtherOnce).
+	plain := sampleWindowAggregateSQL(false, false)
 	for _, marker := range []string{
 		"AS ttft_observed",
 		"SUM(type=2 AND COALESCE(is_stream,0)=1 AND (CASE WHEN JSON_VALID(other)",
 		"AS ttft_over_3s",
 		"COALESCE(is_stream,0)=1",
 	} {
-		if !strings.Contains(q, marker) {
+		if !strings.Contains(plain, marker) {
 			t.Errorf("来源聚合必须直接生成首字有效样本和严格超过3秒计数 %q", marker)
 		}
 	}
 	if !strings.Contains(q, ">3000") || strings.Contains(q, ">=3000") {
 		t.Error("首字慢判定必须严格使用 FRT > 3000ms，恰好 3000ms 不应计入")
 	}
-	if !strings.Contains(q, "type=2 AND COALESCE(is_stream,0)=1 AND (CASE WHEN JSON_VALID(other)") {
+	if !strings.Contains(plain, "type=2 AND COALESCE(is_stream,0)=1 AND (CASE WHEN JSON_VALID(other)") {
 		t.Error("FRT 聚合必须只统计流式请求")
 	}
 	userQuery := sampleWindowUserSQL()

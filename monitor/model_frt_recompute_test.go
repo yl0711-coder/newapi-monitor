@@ -625,7 +625,9 @@ func TestFRTSumRecomputeSQLUsesSameFRTSourceAsSampler(t *testing.T) {
 	if !strings.Contains(q, frtSourceExpr) {
 		t.Fatal("回算必须复用 frtSourceExpr，不得另写一份 FRT 取值口径")
 	}
-	if !strings.Contains(sampleWindowUserSQL(), frtSourceExpr) {
+	// The sampler is built from the same expression; production then only
+	// rewrites how `other` is parsed (see TestSampleWindowParsesOtherOnce).
+	if !strings.Contains(sampleWindowAggregateSQL(true, false), frtSourceExpr) {
 		t.Fatal("采集也必须使用同一个 frtSourceExpr，否则两处会漂移")
 	}
 	for _, forbidden := range []string{"use_time", "p95", "P95", "percentile", "ttft_500", "ttft_5k"} {
