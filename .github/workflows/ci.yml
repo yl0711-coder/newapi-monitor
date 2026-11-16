@@ -78,10 +78,10 @@ jobs:
     needs: [reuse]
     if: needs.reuse.outputs.tested != 'true'
     runs-on: ubuntu-latest
-    # 纯 Go SQLite 引擎（modernc.org、glebarez）不做 race 插桩：它被逐条插桩是 race 慢的主因；
-    # 本仓代码、标准库、gorm 等仍完整做 race 检测。见 docs/CI-规范.md。
+    # race 检测完全照旧；只对纯 Go SQLite 第三方库（modernc.org、glebarez）关闭 race 附带的
+    # unsafe 指针检查（checkptr），本仓代码照常检查。不能用 -race=false（会产生误报）。见 docs/CI-规范.md。
     env:
-      GOFLAGS: -gcflags=modernc.org/...=-race=false -gcflags=github.com/glebarez/...=-race=false
+      GOFLAGS: -gcflags=modernc.org/...=-d=checkptr=0 -gcflags=github.com/glebarez/...=-d=checkptr=0
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -262,10 +262,10 @@ jobs:
     needs: [reuse]
     if: needs.reuse.outputs.tested != 'true'
     runs-on: ubuntu-latest
-    # 纯 Go SQLite 引擎（modernc.org、glebarez）不做 race 插桩：它被逐条插桩是 race 慢的主因；
-    # 本仓代码、标准库、gorm 等仍完整做 race 检测。见 docs/CI-规范.md。
+    # race 检测完全照旧；只对纯 Go SQLite 第三方库（modernc.org、glebarez）关闭 race 附带的
+    # unsafe 指针检查（checkptr），本仓代码照常检查。不能用 -race=false（会产生误报）。见 docs/CI-规范.md。
     env:
-      GOFLAGS: -gcflags=modernc.org/...=-race=false -gcflags=github.com/glebarez/...=-race=false
+      GOFLAGS: -gcflags=modernc.org/...=-d=checkptr=0 -gcflags=github.com/glebarez/...=-d=checkptr=0
     timeout-minutes: 35
     strategy:
       fail-fast: false
@@ -337,10 +337,10 @@ jobs:
     needs: [reuse]
     if: needs.reuse.outputs.tested != 'true'
     runs-on: ubuntu-latest
-    # 纯 Go SQLite 引擎（modernc.org、glebarez）不做 race 插桩：它被逐条插桩是 race 慢的主因；
-    # 本仓代码、标准库、gorm 等仍完整做 race 检测。见 docs/CI-规范.md。
+    # race 检测完全照旧；只对纯 Go SQLite 第三方库（modernc.org、glebarez）关闭 race 附带的
+    # unsafe 指针检查（checkptr），本仓代码照常检查。不能用 -race=false（会产生误报）。见 docs/CI-规范.md。
     env:
-      GOFLAGS: -gcflags=modernc.org/...=-race=false -gcflags=github.com/glebarez/...=-race=false
+      GOFLAGS: -gcflags=modernc.org/...=-d=checkptr=0 -gcflags=github.com/glebarez/...=-d=checkptr=0
     timeout-minutes: 35
     strategy:
       fail-fast: false
