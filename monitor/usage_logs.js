@@ -204,6 +204,7 @@ function shell(){
   const p=$('tab-usage-logs');if(!p)return;
   p.innerHTML=`
   <div class="ul-card ul-filter-card">
+    <div class="ul-sc" id="ulShortcuts" aria-label="常用用户"></div>
     <div class="ul-filters">
       <div class="ul-date" id="ulDateWrap"><button type="button" class="ul-input ul-date-btn" id="ulDateBtn">${svg(ICON.calendar,'ul-ico')}<span id="ulDateLabel"></span></button>
         <div class="ul-pop" id="ulDatePop" hidden>
@@ -263,10 +264,12 @@ function renderToggle(){
   b.classList.toggle('active',!st.expanded&&n>0);
   $('ulAdv').hidden=!st.expanded;
   $('ulReset').disabled=!anyFilter(st.draft);
+  renderShortcuts();
 }
 function renderEye(){
   const b=$('ulEye');b.innerHTML=svg(st.masked?ICON.eyeOff:ICON.eye);b.classList.toggle('active',st.masked);b.title=st.masked?'显示':'隐藏';b.setAttribute('aria-label',b.title);
   for(const id of['ulToken','ulUser','ulGroup'])$(id).type=st.masked?'password':'text';
+  renderShortcuts();
 }
 function rangeOf(d){const r=defaultRange();return{start:d.startTime||r.start,end:d.endTime||r.end}}
 function renderDateLabel(){
@@ -304,6 +307,8 @@ function bind(){
   $('ulDatePop').addEventListener('click',e=>{e.stopPropagation();const b=e.target.closest('[data-preset]');if(!b)return;const r=presetRange(b.dataset.preset);applyDraftRange(r.start,r.end)});
   $('ulDateOk').addEventListener('click',()=>applyDraftRange(fromLocalInput($('ulDateStart').value),fromLocalInput($('ulDateEnd').value)));
   document.addEventListener('click',e=>{if(!e.target.closest('#ulDateWrap'))$('ulDatePop')&&($('ulDatePop').hidden=true);if(!e.target.closest('.ul-colmenu'))$('ulColsPop')&&($('ulColsPop').hidden=true)});
+  $('ulShortcuts').addEventListener('click',onShortcutBarClick);
+  $('ulModal').addEventListener('click',onShortcutModalClick);
   $('ulModalClose').addEventListener('click',closeModal);
   $('ulModalBody').addEventListener('click',e=>{const b=e.target.closest('[data-copyval]');if(b)copy(b.dataset.copyval)});
   $('ulModal').addEventListener('click',e=>{if(e.target.id==='ulModal')closeModal()});
@@ -634,6 +639,101 @@ function toast(msg){let el=$('ulToast');if(!el){el=document.createElement('div')
 // ---------- 弹窗 ----------
 function openModal(title,body,foot,wide){st.modalSeq=(st.modalSeq||0)+1;if(st.userAbort){st.userAbort.abort();st.userAbort=null}$('ulModalTitle').innerHTML=title;$('ulModalBody').innerHTML=body;$('ulModalFoot').innerHTML=foot||'';$('ulModal').hidden=false;$('ulModal').querySelector('.ul-dialog').classList.toggle('wide',!!wide)}
 function closeModal(){st.modalSeq=(st.modalSeq||0)+1;$('ulModal').hidden=true;if(st.userAbort){st.userAbort.abort();st.userAbort=null}}
+
+// ---------- 常用用户快捷标签（每个管理员各自一份，存监控本地库） ----------
+async function postJSON(url,body){
+  const res=await fetch(url,{method:'POST',credentials:'same-origin',headers:{Accept:'application/json','Content-Type':'application/json'},body:JSON.stringify(body||{})});
+  if(res.status===401){location.href='/login';throw new Error('未登录')}
+  const j=await res.json().catch(()=>null);
+  if(!j)throw new Error('HTTP '+res.status);
+  if(!j.success)throw new Error(j.message||'请求失败');
+  return j.data;
+}
+function scApply(d){if(!d)return;st.shortcuts=Array.isArray(d.items)?d.items:[];st.scMax=Number(d.max)||20;st.scError='';renderShortcuts()}
+async function loadShortcuts(){try{scApply(await getJSON('/usage-logs/shortcuts'))}catch(e){st.scError=e.message||'加载失败';renderShortcuts()}}
+const scText=s=>st.masked&&s.label===s.username?'••••':s.label;
+function renderShortcuts(){
+  const el=$('ulShortcuts');if(!el||!st.draft)return;
+  const items=st.shortcuts||[],cur=st.draft.username||'',max=st.scMax||20;
+  let h='<span class="ul-sc-title">常用用户</span>';
+  if(st.scError)h+=`<span class="ul-sc-hint">常用用户加载失败</span><button type="button" class="ul-sc-link" data-sc-retry>重试</button>`;
+  else{
+    if(!items.length)h+='<span class="ul-sc-hint">把常看的用户加成标签，点一下就能查他的日志</span>';
+    h+=items.map(s=>{const on=s.username===cur;return`<button type="button" class="ul-sc-chip${on?' active':''}" data-sc="${s.id}" aria-pressed="${on}" title="${esc(st.masked?(on?'再次点击取消筛选':'查看该用户的日志'):'用户名：'+s.username+(on?'（再次点击取消筛选）':''))}">${esc(scText(s))}</button>`}).join('');
+    if(items.length<max)h+='<button type="button" class="ul-sc-add" data-sc-add title="添加常用用户">+ 添加</button>';
+    if(items.length)h+='<button type="button" class="ul-sc-link" data-sc-manage>管理</button>';
+  }
+  el.innerHTML=h;
+}
+function onShortcutBarClick(e){
+  const c=e.target.closest('[data-sc]');
+  if(c){
+    const s=(st.shortcuts||[]).find(x=>String(x.id)===c.dataset.sc);if(!s)return;
+    $('ulUser').value=st.draft.username===s.username?'':s.username;
+    readDraftFromInputs();renderToggle();search();return;
+  }
+  if(e.target.closest('[data-sc-add]'))return openShortcutForm(null,st.draft.username&&!st.draft.username.includes('%')?st.draft.username:'',false);
+  if(e.target.closest('[data-sc-manage]'))return openShortcutManage();
+  if(e.target.closest('[data-sc-retry]'))loadShortcuts();
+}
+function openShortcutForm(s,prefill,back){
+  const label=s&&s.label!==s.username?s.label:'';
+  const body=`<div class="ul-sc-form">
+    <label><span>用户名</span><input class="ul-input" id="ulScUser" maxlength="64" autocomplete="off" spellcheck="false" placeholder="完整的 new-api 用户名" value="${esc(s?s.username:prefill||'')}"></label>
+    <label><span>标签名称</span><input class="ul-input" id="ulScLabel" maxlength="16" autocomplete="off" placeholder="留空则显示用户名，最多 16 个字" value="${esc(label)}"></label>
+    <div class="muted ul-sc-note">常用用户只有你自己能看到，最多 ${st.scMax||20} 个。</div>
+    <div class="ul-err ul-sc-err" id="ulScErr" hidden></div></div>`;
+  const foot=`<button type="button" class="ul-btn" ${back?'data-sc-back>返回':'data-sc-cancel>取消'}</button><button type="button" class="ul-btn primary" data-sc-save="${s?s.id:0}" data-sc-from="${back?'manage':''}">保存</button>`;
+  openModal(s?'编辑常用用户':'添加常用用户',body,foot);
+  const u=$('ulScUser');(u.value?$('ulScLabel'):u).focus();
+  for(const id of['ulScUser','ulScLabel'])$(id).addEventListener('keydown',ev=>{if(ev.key==='Enter'){ev.preventDefault();saveShortcut(s?s.id:0,back)}});
+}
+async function saveShortcut(id,back){
+  const btn=$('ulModalFoot').querySelector('[data-sc-save]'),err=$('ulScErr');if(!err||(btn&&btn.disabled))return;
+  const body={username:$('ulScUser').value.trim(),label:$('ulScLabel').value.trim()};
+  const fail=m=>{err.textContent=m;err.hidden=false;if(btn)btn.disabled=false};
+  if(!body.username)return fail('请填写用户名');
+  if(body.username.includes('%'))return fail('请填写完整用户名，快捷标签不支持 % 通配符');
+  if(btn)btn.disabled=true;
+  const seq=st.modalSeq;
+  try{
+    const d=await postJSON(id?'/usage-logs/shortcuts/'+id:'/usage-logs/shortcuts',body);scApply(d);
+    if(seq!==st.modalSeq)return;
+    toast(id?'已保存':'已添加');if(back)openShortcutManage();else closeModal();
+  }catch(e){if(seq===st.modalSeq)fail(e.message||'保存失败')}
+}
+function openShortcutManage(){
+  const items=st.shortcuts||[],max=st.scMax||20;
+  const rows=items.map((s,i)=>`<div class="ul-sc-row" data-id="${s.id}">
+    <div class="ul-sc-row-main"><b>${esc(scText(s))}</b><span class="muted ul-mono">${st.masked?'••••':esc(s.username)}</span></div>
+    <div class="ul-sc-row-act"><button type="button" class="ul-icon-btn" data-sc-move="-1" ${i===0?'disabled':''} title="上移" aria-label="上移">${svg(ICON.chevUp)}</button><button type="button" class="ul-icon-btn" data-sc-move="1" ${i===items.length-1?'disabled':''} title="下移" aria-label="下移">${svg(ICON.chevDown)}</button><button type="button" class="ul-btn" data-sc-edit>编辑</button><button type="button" class="ul-btn ul-sc-del" data-sc-del>删除</button></div></div>`).join('');
+  openModal(`管理常用用户 <span class="muted ul-sc-cnt">${items.length}/${max}</span>`,rows?`<div class="ul-sc-list">${rows}</div>`:'<div class="ul-empty muted">还没有常用用户</div>',`${items.length<max?'<button type="button" class="ul-btn" data-sc-new>添加</button>':''}<button type="button" class="ul-btn primary" data-sc-cancel>完成</button>`);
+}
+async function moveShortcut(id,dir){
+  const ids=(st.shortcuts||[]).map(s=>s.id),i=ids.indexOf(id),j=i+dir;if(i<0||j<0||j>=ids.length||st.scBusy)return;
+  [ids[i],ids[j]]=[ids[j],ids[i]];st.scBusy=true;
+  try{scApply(await postJSON('/usage-logs/shortcuts/order',{ids}));if(!$('ulModal').hidden)openShortcutManage()}catch(e){toast(e.message||'保存顺序失败')}finally{st.scBusy=false}
+}
+async function deleteShortcut(id){
+  if(st.scBusy)return;st.scBusy=true;
+  try{scApply(await postJSON('/usage-logs/shortcuts/'+id+'/delete'));if(!$('ulModal').hidden)openShortcutManage();toast('已删除')}catch(e){toast(e.message||'删除失败')}finally{st.scBusy=false}
+}
+function onShortcutModalClick(e){
+  const t=e.target.closest('[data-sc-save],[data-sc-cancel],[data-sc-back],[data-sc-new],[data-sc-edit],[data-sc-del],[data-sc-move],[data-sc-pin]');if(!t||t.disabled)return;
+  if(t.hasAttribute('data-sc-cancel'))return closeModal();
+  if(t.hasAttribute('data-sc-back'))return openShortcutManage();
+  if(t.hasAttribute('data-sc-new'))return openShortcutForm(null,'',true);
+  if(t.hasAttribute('data-sc-save'))return saveShortcut(Number(t.dataset.scSave)||0,t.dataset.scFrom==='manage');
+  if(t.hasAttribute('data-sc-pin'))return openShortcutForm(null,t.dataset.scPin,false);
+  const row=t.closest('.ul-sc-row');if(!row)return;
+  const id=Number(row.dataset.id),s=(st.shortcuts||[]).find(x=>x.id===id);if(!s)return;
+  if(t.hasAttribute('data-sc-edit'))return openShortcutForm(s,'',true);
+  if(t.hasAttribute('data-sc-move'))return moveShortcut(id,Number(t.dataset.scMove));
+  if(t.hasAttribute('data-sc-del')){
+    if(t.dataset.armed!=='1'){t.dataset.armed='1';t.textContent='确认删除';t.classList.add('armed');clearTimeout(t._t);t._t=setTimeout(()=>{t.dataset.armed='';t.textContent='删除';t.classList.remove('armed')},3000);return}
+    return deleteShortcut(id);
+  }
+}
 const kv=(k,v,cls)=>v==null||v===''?'':`<div class="ul-kv"><span>${esc(k)}</span><b class="${cls||''}">${v}</b></div>`;
 const kvCopy=(k,raw)=>raw?`<div class="ul-kv"><span>${esc(k)}</span><b class="ul-mono">${esc(raw)}<button type="button" class="ul-copy" data-copyval="${esc(raw)}" title="复制" aria-label="复制">${svg(ICON.copy)}</button></b></div>`:'';
 const section=(title,body,danger)=>body?`<div class="ul-sec${danger?' danger':''}">${title?`<div class="ul-sec-title">${esc(title)}</div>`:''}${body}</div>`:'';
@@ -772,6 +872,7 @@ async function openUser(id){
     if(u.aff_code||u.aff_count||u.aff_quota>0)h+=section('邀请信息',`<div class="ul-ugrid">${u.aff_code?item('邀请码',u.aff_code,'ul-mono'):''}${item('受邀用户',compact(u.aff_count),'ul-mono')}${u.aff_quota>0?item('邀请额度',fmtQuotaShort(u.aff_quota),'ul-mono'):''}</div>`);
     if(u.remark)h+=section('备注',`<div class="ul-content">${esc(u.remark)}</div>`);
     $('ulModalBody').innerHTML=h;
+    if(nm)$('ulModalFoot').innerHTML=(st.shortcuts||[]).some(s=>s.username===nm)?'<button type="button" class="ul-btn" disabled>已在常用用户中</button>':`<button type="button" class="ul-btn" data-sc-pin="${esc(nm)}">加为常用用户</button>`;
   }catch(e){if(seq!==st.modalSeq||e.name==='AbortError')return;$('ulModalBody').innerHTML=`<div class="ul-empty"><b class="ul-err">获取用户信息失败</b><div class="muted">${esc(e.message||'')}</div></div>`;toast(e.message||'获取用户信息失败')}
 }
 
@@ -779,7 +880,7 @@ async function openUser(id){
 async function activate(){
   const seq=(st.activationSeq||0)+1;st.activationSeq=seq;
   if(!st.inited){
-    st.inited=true;shell();
+    st.inited=true;shell();loadShortcuts();
     if(!st.pageSize){let ps=0;try{ps=Number(localStorage.getItem(PAGE_SIZE_KEY))}catch{}st.pageSize=[10,20,30,40,50,100].includes(ps)?ps:(MOBILE()?20:100)}
   }
   const fromHash=readHash();

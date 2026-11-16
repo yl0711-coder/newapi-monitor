@@ -424,6 +424,12 @@ func (m *Monitor) RegisterRoutes(r *gin.Engine) {
 		view.GET("/usage-logs/count", noStoreSensitive, m.serveUsageLogsCount)
 		view.GET("/usage-logs/stat", noStoreSensitive, m.serveUsageLogsStat)
 		view.GET("/usage-logs/user/:id", noStoreSensitive, m.serveUsageLogsUser)
+		// 使用日志快捷标签：每个管理员各自一份，只写监控本地库。
+		view.GET("/usage-logs/shortcuts", noStoreSensitive, m.serveUsageLogShortcuts)
+		view.POST("/usage-logs/shortcuts", noStoreSensitive, m.createUsageLogShortcut)
+		view.POST("/usage-logs/shortcuts/order", noStoreSensitive, m.reorderUsageLogShortcuts)
+		view.POST("/usage-logs/shortcuts/:id", noStoreSensitive, m.updateUsageLogShortcut)
+		view.POST("/usage-logs/shortcuts/:id/delete", noStoreSensitive, m.deleteUsageLogShortcut)
 		view.GET("/logchain/requests", noStoreSensitive, m.serveLogChainRequests) // 客户排障:逐条请求→渠道→上游主域名→错误原文(含 type=5,含渠道信息,仅管理员)
 		view.GET("/logchain/filters", noStoreSensitive, m.serveLogChainFilters)   // 客户排障:筛选下拉取值(服务分组/上游域名/渠道),只读本地快照
 		// 按需 CloudWatch 证据：仅在人工展开某条请求并点击时触发，一次只查一个

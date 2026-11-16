@@ -1038,7 +1038,7 @@ func (m *Monitor) openStore(path string) error {
 		&ChannelEconomicsHourPublication{}, &ChannelEconomicsHourCurrent{}, &ChannelEconomicsHourManifestPublication{}, &ChannelEconomicsHourManifestCurrent{}, &ChannelEconomicsGlobalHourFact{}, &ChannelEconomicsDirtyHour{},
 		&InfraSample{}, &HostContainerSnapshot{}, &InfraAsset{}, &InfraAssetAudit{}, &InfraAssetScope{}, &NginxMinuteSample{}, &NginxIngestBatch{}, &NginxSourceState{},
 		&NginxErrorMinuteSample{}, &NginxErrorIngestBatch{}, &NginxErrorSourceState{},
-		&AlertConfig{}, &AlertLog{}, &TrackedUser{}, &CustomerGroup{}, &CustomerHealthGroup{}, &CustomerHealthMember{}, &CustomerHealthMigrationState{}, &UsageMemberControl{}, &UsageMemberAudit{}, &UsageMemberControlMigration{}, &FollowUpLog{}, &UsageSettings{}, &UserDirectoryEntry{},
+		&AlertConfig{}, &AlertLog{}, &TrackedUser{}, &CustomerGroup{}, &CustomerHealthGroup{}, &CustomerHealthMember{}, &CustomerHealthMigrationState{}, &UsageMemberControl{}, &UsageMemberAudit{}, &UsageMemberControlMigration{}, &FollowUpLog{}, &UsageSettings{}, &UserDirectoryEntry{}, &UsageLogShortcut{},
 		&CloudWatchInvestigationAudit{}, &CloudWatchShadowReconciliationRun{}, &CloudWatchShadowReconciliationDiff{}, &CloudWatchPreRouteCursor{}, &CloudWatchNginxCursor{},
 		&GroupGovernanceState{}, &GroupGovernanceGroup{}, &GroupGovernanceUser{},
 		&GroupGovernanceErrorMinute{}, &GroupGovernanceRealtimeState{},
