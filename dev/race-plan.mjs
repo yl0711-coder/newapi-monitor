@@ -17,7 +17,7 @@ import {pathToFileURL} from 'node:url';
 // race-built inventory selects tests; a test without a recorded duration gets a
 // conservative estimate and still runs exactly once.
 export const racePackages = {
-  monitor: {pkg: './monitor', jobs: 8, processes: 3, timings: './monitor-race-timings.json', serial: './monitor-race-serial.json'},
+  monitor: {pkg: './monitor', jobs: 7, processes: 3, timings: './monitor-race-timings.json', serial: './monitor-race-serial.json'},
   monthly: {pkg: './internal/monthlydraft', jobs: 6, processes: 3, timings: './monthly-race-timings.json', serial: './monthly-race-serial.json'},
 };
 

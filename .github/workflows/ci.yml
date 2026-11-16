@@ -270,7 +270,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # 0–7: three parallel processes each; 8–11: serial (wall-clock budget) tests, one process each.
+        # 0–6: three parallel processes each; 7–11: serial (wall-clock budget) tests, one process each.
         job: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
     steps:
       - uses: actions/checkout@v4
