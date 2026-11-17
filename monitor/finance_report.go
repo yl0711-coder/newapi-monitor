@@ -2030,9 +2030,34 @@ func (m *Monitor) loadFinanceInternalCostEvidence(ctx context.Context, scope sta
 		validByPair[pair] = append(validByPair[pair], row)
 	}
 
+	// A pair with no cost publication at all has no historical owner in the
+	// economics ledger. Fall back to the channel's own upstream so the event
+	// is charged to that upstream only; an unknown owner would otherwise mark
+	// every upstream, including fully verified ones, as unverified.
+	var unowned []int
+	for _, test := range testPairs {
+		pair := financeTestPairKey{HourTs: test.HourTs, ChannelID: test.ChannelID}
+		if _, found := domainByPair[pair]; !found {
+			unowned = append(unowned, test.ChannelID)
+		}
+	}
+	channelDomain := map[int]string{}
+	if len(unowned) > 0 {
+		var snaps []ChannelSnap
+		if err := m.storeDB.WithContext(ctx).Select("id", "base_domain").Where("id IN ?", unowned).Find(&snaps).Error; err != nil {
+			return result, fmt.Errorf("读取内部测试渠道归属: %w", err)
+		}
+		for _, snap := range snaps {
+			channelDomain[snap.ID] = strings.ToLower(strings.TrimSpace(snap.BaseDomain))
+		}
+	}
+
 	for _, test := range testPairs {
 		pair := financeTestPairKey{HourTs: test.HourTs, ChannelID: test.ChannelID}
 		rows := validByPair[pair]
+		if _, found := domainByPair[pair]; !found && channelDomain[test.ChannelID] != "" {
+			domainByPair[pair] = channelDomain[test.ChannelID]
+		}
 		if len(rows) != 1 {
 			result.UnverifiedPairs++
 			reason := diagnosticsByPair[pair].reason(len(rows))

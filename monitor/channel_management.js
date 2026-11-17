@@ -867,7 +867,7 @@ function upstreamCostNote(usage,basis,adjusted=false){
   if(basis==='business')return '已扣配置内部账号；不代表全部测试成本已排除';
   const included=adjusted?'含内部测试成本':'含内部测试用量';
   const status=usage?.internal_filter_status;
-  return included+(status==='complete'?' · 统一账单口径':status==='not_configured'?' · 未配置内部账号':
+  return included+(status==='complete'?' · 统一账单口径':status==='not_configured'?' · 未配置内部账号':status==='outside_closure'?' · 未纳入成本闭环，无法扣除':
     status==='inconsistent'?' · 内部扣除核验异常':status?' · 内部扣除尚未核验':' · 核验状态待确认');
 }
 // 停止使用原因：与后端 retirementReasonCodes 一致（顺序即显示顺序）。

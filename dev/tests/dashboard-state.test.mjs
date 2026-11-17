@@ -1014,3 +1014,20 @@ test('attention panel lists upstreams that need action, most urgent first, and c
   cm.report.domains = cm.report.domains.filter(d => ['healthy.example', 'retired.example'].includes(d.domain));
   assert.match(api.attentionPanel(api.filteredDomains()), /cm-attention clear/);
 });
+
+test('upstreams outside the cost-closure pilot are one note, not repeated anomalies',()=>{
+  const {context}=dashboard();
+  const ok={available:true,complete:true,cost_usd:10,adjusted_cost_available:true,adjusted_cost_usd:5};
+  const account={configured:true,usage_sync_enabled:true,balance_usd:20,balance_fresh:true,status:'ok',balance_effective_status:'ok',usage_status:'ok'};
+  const report={meta:{data_coverage:{complete:true}},domains:[
+    {domain:'a.example',upstream:account,upstream_usage:{...ok,internal_filter_status:'outside_closure'}},
+    {domain:'b.example',upstream:account,upstream_usage:{...ok,internal_filter_status:'outside_closure'}},
+    {domain:'pilot.example',upstream:account,upstream_usage:{...ok,internal_filter_status:'backfilling',internal_filter_reasons:['pairing_unverified']}}
+  ]};
+  const rows=context.window.channelDataStatus.issues(report);
+  assert.equal(JSON.stringify(rows.map(r=>r.scope)),JSON.stringify(['pilot.example']));
+  assert.match(rows[0].detail,/内部账号成本配对尚未核验/);
+  const html=context.window.channelDataStatus.render(report);
+  assert.match(html,/1 项数据异常/);
+  assert.match(html,/2 个上游未纳入渠道成本闭环试点.*含内部测试成本/);
+});
