@@ -6,26 +6,43 @@
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E📈%3C/text%3E%3C/svg%3E">
 <title>登录 · new-api 监控</title>
 <script>
+// Apply the saved theme before first paint (per browser; light / dark / follow system).
+(function(){var p='dark';try{var v=localStorage.getItem('monitor-theme');if(v==='light'||v==='dark'||v==='system')p=v}catch(e){}
+var d=p==='dark'||(p==='system'&&!!(window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches));
+document.documentElement.setAttribute('data-theme',d?'dark':'light');document.documentElement.setAttribute('data-theme-pref',p)})();
+</script>
+<link rel="stylesheet" href="/theme-tokens.css?v=2">
+<script>
 fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
-  if(!d||!d.name)return;
-  document.title=document.title.replace('new-api',d.name);
-  var set=function(){document.querySelectorAll('[data-brand]').forEach(function(el){el.textContent=d.name})};
+  if(!d)return;
+  if(d.name)document.title=document.title.replace('new-api',d.name);
+  var set=function(){
+    if(d.name)document.querySelectorAll('[data-brand]').forEach(function(el){el.textContent=d.name});
+    // Same logo as the new-api site; the default mark stays if it fails to load.
+    if(d.logo){
+      var icon=document.querySelector('link[rel="icon"]');if(icon)icon.href=d.logo;
+      var mark=document.getElementById('brandMark'),img=new Image();img.alt='';img.className='brand-logo';
+      img.onload=function(){if(mark){mark.textContent='';mark.appendChild(img)}};
+      img.src=d.logo;
+    }
+  };
   if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',set);else set();
 }).catch(function(){});
 </script>
 <style>
   *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
-  :root{--bg:#0f1117;--surface:#1a1d27;--border:#2a2d3e;--accent:#6366f1;--text:#e2e8f0;--muted:#94a3b8;--red:#ef4444}
+  :root{--bg:rgb(var(--cr-0f1117));--surface:rgb(var(--cr-1a1d27));--border:rgb(var(--cr-2a2d3e));--accent:rgb(var(--cr-6366f1));--text:rgb(var(--cr-e2e8f0));--muted:rgb(var(--cr-94a3b8));--red:rgb(var(--cr-ef4444))}
   body{background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
     display:flex;align-items:center;justify-content:center;min-height:100vh}
   .card{background:var(--surface);border:1px solid var(--border);border-radius:14px;padding:32px 30px;width:340px}
-  h1{font-size:19px;font-weight:600;margin-bottom:4px}
+  h1{font-size:19px;font-weight:600;margin-bottom:4px;display:flex;align-items:center;gap:6px}
+  .brand-logo{width:26px;height:26px;object-fit:contain;display:block}
   .sub{color:var(--muted);font-size:13px;margin-bottom:22px}
   label{display:block;font-size:12px;color:var(--muted);margin:14px 0 6px}
   input{width:100%;background:var(--bg);border:1px solid var(--border);color:var(--text);
     padding:10px 12px;border-radius:8px;font-size:14px;outline:none}
   input:focus{border-color:var(--accent)}
-  button{width:100%;margin-top:22px;background:var(--accent);color:#fff;border:none;
+  button{width:100%;margin-top:22px;background:var(--accent);color:rgb(var(--cr-ffffff));border:none;
     padding:11px;border-radius:8px;font-size:15px;font-weight:500;cursor:pointer}
   button:disabled{opacity:.6;cursor:default}
   #msg{margin-top:14px;font-size:13px;min-height:18px;color:var(--red)}
@@ -34,7 +51,7 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
 </head>
 <body>
 <form class="card" id="f">
-  <h1>📈 <span data-brand>new-api</span> 上游监控</h1>
+  <h1><span id="brandMark">📈</span> <span data-brand>new-api</span> 上游监控</h1>
   <div class="sub">请用主站(new-api)账号登录</div>
   <label>用户名</label>
   <input id="u" autocomplete="username" autofocus>

@@ -879,7 +879,7 @@ func TestFinanceReportDoesNotTreatMissingUpstreamEvidenceAsZero(t *testing.T) {
 
 func TestFinancePageAndNavigationAreWired(t *testing.T) {
 	for _, required := range []string{
-		`data-tab="finance"`, `id="tab-finance"`, `/finance.css?v=14`, `/finance.js?v=`,
+		`data-tab="finance"`, `id="tab-finance"`, `/finance.css?v=15`, `/finance.js?v=`,
 		`id="finPeriodRows"`, `id="finDailyRows"`, `id="finCostRows"`, `id="finPairingRows"`, `id="finPairingCoverage"`, `id="finClosureReadiness"`, `id="finUnallocatedSourceRows"`, `id="finBridgeRevenue"`, `id="finBridgeProfit"`, `window.financeActivate`,
 		`id="finEvidenceRollout"`, `id="finEvidenceRolloutRows"`, `id="finEvidenceRolloutSummary"`, `历史成本补证计划`, `仅改善上游证据`, `建议首个灰度`,
 		`function operatingProfitBlockers`, `上游账单区间不完整`, `上游修正成本区间不完整`, `AWS 当期未封账`,

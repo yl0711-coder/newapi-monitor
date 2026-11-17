@@ -77,6 +77,18 @@ var usageLogsJS []byte // 使用日志页交互；只访问 /usage-logs/* 管理
 //go:embed usage_logs.css
 var usageLogsCSS []byte
 
+//go:embed theme_tokens.css
+var themeTokensCSS []byte // 生成文件：浅色/深色主题颜色变量（dev/theme-tokens.mjs）
+
+//go:embed theme.css
+var themeCSS []byte // 主题按钮与主题设置面板
+
+//go:embed theme_palette.js
+var themePaletteJS []byte // 浅色换算规则，与生成器共用
+
+//go:embed theme.js
+var themeJS []byte // 主题切换：浅色/深色/跟随系统，偏好只存当前浏览器
+
 //go:embed alerts.js
 var alertsJS []byte // 问题预警页交互；只访问 /alerts/rejections
 
@@ -294,6 +306,21 @@ func (m *Monitor) RegisterRoutes(r *gin.Engine) {
 		c.Header("Cache-Control", "no-cache")
 		c.Data(http.StatusOK, "application/javascript; charset=utf-8", usageLogsJS)
 	})
+	for path, asset := range map[string]struct {
+		body []byte
+		mime string
+	}{
+		"/theme-tokens.css": {themeTokensCSS, "text/css; charset=utf-8"},
+		"/theme.css":        {themeCSS, "text/css; charset=utf-8"},
+		"/theme-palette.js": {themePaletteJS, "application/javascript; charset=utf-8"},
+		"/theme.js":         {themeJS, "application/javascript; charset=utf-8"},
+	} {
+		asset := asset
+		r.GET(path, func(c *gin.Context) {
+			c.Header("Cache-Control", "no-cache")
+			c.Data(http.StatusOK, asset.mime, asset.body)
+		})
+	}
 	r.GET("/usage-logs.css", func(c *gin.Context) {
 		c.Header("Cache-Control", "no-cache")
 		c.Data(http.StatusOK, "text/css; charset=utf-8", usageLogsCSS)

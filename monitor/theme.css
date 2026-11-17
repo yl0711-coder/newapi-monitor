@@ -1,0 +1,75 @@
+/* Theme button and settings panel. The preview cards use fixed colors on
+   purpose: each one shows what that choice looks like, whatever is active. */
+.monitor-head-actions{display:flex;align-items:center;gap:14px}
+.monitor-theme-btn{display:inline-flex;align-items:center;justify-content:center;width:32px;height:32px;border-radius:8px;
+  border:1px solid var(--border);background:var(--surface);color:var(--text-muted);cursor:pointer;padding:0}
+.monitor-theme-btn:hover{color:var(--text);border-color:var(--accent)}
+.monitor-theme-btn:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.monitor-theme-btn svg{width:17px;height:17px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
+
+.mt-root[hidden]{display:none}
+.mt-root{position:fixed;inset:0;z-index:1000}
+.mt-backdrop{position:absolute;inset:0;background:rgba(0,0,0,.35)}
+.mt-panel{position:absolute;top:0;right:0;height:100%;width:min(460px,100vw);background:var(--surface);color:var(--text);
+  border-left:1px solid var(--border);box-shadow:-12px 0 32px rgba(0,0,0,.18);display:flex;flex-direction:column;overflow:auto}
+.mt-head{display:flex;justify-content:space-between;align-items:flex-start;gap:12px;padding:22px 24px 18px;border-bottom:1px solid var(--border)}
+.mt-head h2{font-size:18px;font-weight:600;margin:0 0 6px}
+.mt-head p{font-size:13px;color:var(--text-muted);margin:0}
+.mt-close{width:30px;height:30px;border:0;background:transparent;color:var(--text-muted);cursor:pointer;border-radius:6px;padding:4px}
+.mt-close:hover{color:var(--text);background:var(--border)}
+.mt-close svg{width:20px;height:20px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round}
+.mt-body{padding:20px 24px}
+.mt-body h3{font-size:14px;font-weight:600;margin:0 0 12px;color:var(--text)}
+.mt-options{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px}
+.mt-option{position:relative;display:flex;flex-direction:column;gap:8px;align-items:flex-start;background:transparent;border:0;padding:0;
+  cursor:pointer;color:var(--text);font:inherit;text-align:left}
+.mt-option:focus-visible{outline:none}
+.mt-option:focus-visible .mt-prev{outline:2px solid #3b82f6;outline-offset:2px}
+.mt-label{font-size:13px}
+.mt-check{position:absolute;top:-8px;right:-8px;width:22px;height:22px;border-radius:50%;background:#3b82f6;border:2px solid var(--surface);
+  display:none;align-items:center;justify-content:center}
+.mt-check svg{width:12px;height:12px;fill:none;stroke:#fff;stroke-width:3;stroke-linecap:round;stroke-linejoin:round}
+.mt-option.active .mt-check{display:flex}
+.mt-option.active .mt-prev{box-shadow:0 0 0 2px #3b82f6}
+.mt-note{margin:16px 0 0;font-size:12px;color:var(--text-muted)}
+
+/* Miniature page previews */
+.mt-prev{display:flex;width:100%;aspect-ratio:1.55;border-radius:10px;overflow:hidden;border:1px solid rgba(127,127,127,.25)}
+.mt-prev-side{width:31%;display:flex;flex-direction:column;gap:6px;padding:9% 8%}
+.mt-prev-main{flex:1;position:relative;padding:12% 10%}
+.mt-dot{width:15px;height:15px;border-radius:50%}
+.mt-line{height:4px;border-radius:3px;width:90%}
+.mt-line.short{width:60%}
+.mt-bars{position:absolute;left:12%;top:16%;display:flex;align-items:flex-end;gap:3px;height:22%}
+.mt-bars i{width:5px;border-radius:1px}
+.mt-bars i:nth-child(1){height:45%}.mt-bars i:nth-child(2){height:65%}.mt-bars i:nth-child(3){height:85%}.mt-bars i:nth-child(4){height:100%}
+.mt-pie{position:absolute;right:12%;top:12%;width:22%;aspect-ratio:1;border-radius:50%}
+.mt-card{position:absolute;left:12%;right:12%;bottom:12%;height:30%;border-radius:5px}
+/* system: half light, tinted blue like the new-api preview */
+.mt-prev-system .mt-prev-side{background:#dbeafe}.mt-prev-system .mt-prev-main{background:#ffffff}
+.mt-prev-system .mt-dot,.mt-prev-system .mt-line{background:#ffffff}
+.mt-prev-system .mt-bars i{background:#93c5fd}.mt-prev-system .mt-card{background:#cfe3f8}
+.mt-prev-system .mt-pie{background:conic-gradient(#93c5fd 0 25%,#cfe3f8 25% 100%)}
+.mt-prev-light .mt-prev-side{background:#e3e5e8}.mt-prev-light .mt-prev-main{background:#eef0f2}
+.mt-prev-light .mt-dot,.mt-prev-light .mt-line{background:#ffffff}
+.mt-prev-light .mt-bars i{background:#cfd3d9}.mt-prev-light .mt-card{background:#ffffff}
+.mt-prev-light .mt-pie{background:conic-gradient(#cfd3d9 0 25%,#ffffff 25% 100%)}
+.mt-prev-dark .mt-prev-side{background:#1e293b}.mt-prev-dark .mt-prev-main{background:#0f172a}
+.mt-prev-dark .mt-dot,.mt-prev-dark .mt-line{background:#3b5379}
+.mt-prev-dark .mt-bars i{background:#2c4a7c}.mt-prev-dark .mt-card{background:#1e2a44}
+.mt-prev-dark .mt-pie{background:conic-gradient(#2c4a7c 0 25%,#1e2a44 25% 100%)}
+@media (max-width:600px){.mt-options{gap:10px}.mt-head,.mt-body{padding-left:18px;padding-right:18px}}
+
+/* Light-only adjustments where a dark-theme trick reads heavy on white. */
+/* The model statistics summary paints its 1px grid lines with the border
+   color as background; on white that becomes a solid grey block. */
+:root[data-theme="light"] .ms-summary{background:#e8e8e8;border:1px solid #e8e8e8;border-radius:8px;overflow:hidden}
+:root[data-theme="light"] .ms-summary-card{background:#fafafa}
+
+/* Grayscale antialiasing (set by Semi UI on body) suits light text on dark;
+   for dark text on white it renders thin and washed out on macOS. */
+:root[data-theme="light"] body,:root[data-theme="light"] body *{-webkit-font-smoothing:auto;-moz-osx-font-smoothing:auto}
+
+/* Data-check list: long reason paragraphs in solid red read as glare on
+   white. Keep the upstream name red, set the reason text in body color. */
+:root[data-theme="light"] p.sync-upstream-error{color:var(--text)!important}

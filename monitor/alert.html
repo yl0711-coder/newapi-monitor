@@ -6,14 +6,22 @@
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E📈%3C/text%3E%3C/svg%3E">
 <title>报警设置 · new-api 监控</title>
 <script>
+// Apply the saved theme before first paint (per browser; light / dark / follow system).
+(function(){var p='dark';try{var v=localStorage.getItem('monitor-theme');if(v==='light'||v==='dark'||v==='system')p=v}catch(e){}
+var d=p==='dark'||(p==='system'&&!!(window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches));
+document.documentElement.setAttribute('data-theme',d?'dark':'light');document.documentElement.setAttribute('data-theme-pref',p)})();
+</script>
+<link rel="stylesheet" href="/theme-tokens.css?v=2">
+<script>
 fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
   if(d&&d.name)document.title=document.title.replace('new-api',d.name);
+  if(d&&d.logo){var icon=document.querySelector('link[rel="icon"]');if(icon)icon.href=d.logo}
 }).catch(function(){});
 </script>
 <style>
   *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
-  :root{--bg:#0f1117;--surface:#1a1d27;--border:#2a2d3e;--accent:#6366f1;--text:#e2e8f0;--text-muted:#94a3b8;
-    --green:#10b981;--yellow:#f59e0b;--red:#ef4444;--font:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif}
+  :root{--bg:rgb(var(--cr-0f1117));--surface:rgb(var(--cr-1a1d27));--border:rgb(var(--cr-2a2d3e));--accent:rgb(var(--cr-6366f1));--text:rgb(var(--cr-e2e8f0));--text-muted:rgb(var(--cr-94a3b8));
+    --green:rgb(var(--cr-10b981));--yellow:rgb(var(--cr-f59e0b));--red:rgb(var(--cr-ef4444));--font:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif}
   body{background:var(--bg);color:var(--text);font-family:var(--font);min-height:100vh;padding:28px 32px;max-width:860px;margin:0 auto}
   h1{font-size:21px;font-weight:600;margin-bottom:4px}
   a{color:var(--accent);text-decoration:none}
@@ -36,7 +44,7 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
   textarea{width:100%;min-height:64px;resize:vertical}
   .ck{display:flex;align-items:center;gap:8px;font-size:14px}
   .btn{padding:9px 18px;border-radius:8px;border:none;cursor:pointer;font-size:14px;font-weight:500}
-  .btn-primary{background:var(--accent);color:#fff}
+  .btn-primary{background:var(--accent);color:rgb(var(--cr-ffffff))}
   .btn-outline{background:transparent;border:1px solid var(--border);color:var(--text)}
   .bar{display:flex;gap:12px;align-items:center;margin-top:8px}
   #msg{font-size:14px;margin-left:8px}
