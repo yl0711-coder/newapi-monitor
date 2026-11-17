@@ -105,6 +105,11 @@ func upstreamUsageRequestBudget(provider string, lane upstreamUsageLane) int {
 	if provider == upstreamProviderOpenOx {
 		return openOxMaxPages + 1
 	}
+	if provider == upstreamProviderOrion {
+		// One closed Orion hour must be read whole (cursor pages, no partial
+		// publish); a busy hour needs more than the shared 20-request budget.
+		return upstreamUsageMaxRequestsPerRun
+	}
 	return upstreamUsageHistoryMaxRequestsPerRun
 }
 
@@ -285,7 +290,7 @@ func upstreamUsageOperationTimeout(s Settings) time.Duration {
 // cannot finish inside the 45-second history lane deadline and would fail on
 // every retry. Other providers keep the short history deadline.
 func upstreamUsageOperationTimeoutForAccount(s Settings, lane upstreamUsageLane, provider string) time.Duration {
-	if lane == upstreamUsageLaneHistory && provider == upstreamProviderTokenForce {
+	if lane == upstreamUsageLaneHistory && (provider == upstreamProviderTokenForce || provider == upstreamProviderOrion) {
 		return upstreamUsageOperationTimeout(s)
 	}
 	if lane == upstreamUsageLaneHistory {
@@ -2879,7 +2884,12 @@ func planUpstreamUsageSync(row ChannelUpstreamAccount, now int64, backfillDays i
 	tailDue := row.UsageNextSyncAt == 0 || row.UsageNextSyncAt <= now
 	if tailDue {
 		plan.tailFrom, plan.tailTo = today, now
-		if row.Provider == upstreamProviderNewAPI && row.UsageDataUntil > 0 && row.UsageDataUntil <= today && today-row.UsageDataUntil <= newAPITailStaleCatchUpSeconds {
+		if row.Provider == upstreamProviderOrion && row.UsageDataUntil > 0 && today-row.UsageDataUntil <= orionTailCatchUpSeconds {
+			// Continue from the watermark hour, including one left on an
+			// earlier day: restarting at today would leave the rest of that day
+			// unread for good (history treats closed days as done).
+			plan.tailFrom = row.UsageDataUntil - row.UsageDataUntil%3600
+		} else if row.Provider == upstreamProviderNewAPI && row.UsageDataUntil > 0 && row.UsageDataUntil <= today && today-row.UsageDataUntil <= newAPITailStaleCatchUpSeconds {
 			// The live watermark fell behind midnight. History is already done up
 			// to its own cursor, so starting at today would leave the rest of the
 			// earlier day(s) unread for good. Continue from the watermark hour;
@@ -2887,9 +2897,6 @@ func planUpstreamUsageSync(row ChannelUpstreamAccount, now int64, backfillDays i
 			plan.tailFrom = row.UsageDataUntil - row.UsageDataUntil%3600
 		} else if row.Provider != upstreamProviderAICodeWith && row.Provider != upstreamProviderSub2API && row.Provider != upstreamProviderVolcengine && row.UsageDataUntil > today {
 			overlap := int64(upstreamUsageTailOverlap / time.Second)
-			if row.Provider == upstreamProviderOrion {
-				overlap = orionTailOverlapSeconds
-			}
 			plan.tailFrom = row.UsageDataUntil - overlap
 			if plan.tailFrom < today {
 				plan.tailFrom = today
@@ -3215,6 +3222,18 @@ func (m *Monitor) syncStoredUpstreamUsageWithPriority(ctx context.Context, domai
 		// history or create a permanent retry loop.
 		backfillDays = 7
 	}
+	if row.Provider == upstreamProviderOrion && lane != upstreamUsageLaneHistory && row.UsageDataUntil > 0 {
+		// An hour the tail never committed (e.g. skipped before a fix) is
+		// re-read by moving the watermark back to it; the tail then walks
+		// forward one hour per run and republishes the following hours.
+		gap, found, gapErr := m.orionEarliestMissingHour(ctx, row, now)
+		if gapErr != nil {
+			return row, gapErr
+		}
+		if found && gap < row.UsageDataUntil {
+			row.UsageDataUntil = gap
+		}
+	}
 	plan := planUpstreamUsageSyncForLane(row, now, backfillDays, lane)
 	plan, err = m.prioritizeSub2RecentUsage(ctx, row, now, plan)
 	if err == nil {
@@ -3296,7 +3315,7 @@ func (m *Monitor) syncStoredUpstreamUsageWithPriority(ctx context.Context, domai
 	}
 	if tailRan {
 		applyUpstreamUsageResult(&row, result, err, now, m.cfg, secrets...)
-		if tailYielded {
+		if tailYielded || (row.Provider == upstreamProviderOrion && err == nil && plan.tailTo < now-60) {
 			// The source is healthy and at least one complete hour was committed.
 			// Resume quickly instead of waiting for the normal live-sync interval.
 			row.UsageNextSyncAt = now + 15

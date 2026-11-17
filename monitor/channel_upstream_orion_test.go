@@ -152,7 +152,7 @@ func TestOrionSyncPlanUsesBoundedWindows(t *testing.T) {
 	}
 	// Each catch-up run must move the watermark forward until it reaches now.
 	for runs := 0; row.UsageDataUntil < now; runs++ {
-		if runs > 10 {
+		if runs > 24 {
 			t.Fatalf("tail never caught up; watermark %d now %d", row.UsageDataUntil, now)
 		}
 		next := planUpstreamUsageSync(row, now, 30)
@@ -249,25 +249,73 @@ func TestOrionUsageSkipsUnbilledFailedRequests(t *testing.T) {
 	}
 }
 
-// Orion re-reads one closed hour, not the generic three, and a caught-up tail
-// at peak volume stays within one run's page budget.
-func TestOrionTailOverlapIsOneHour(t *testing.T) {
+// The live tail re-reads the watermark hour from its start, never a wider
+// window than one run's page budget can hold at observed peak volume.
+func TestOrionTailReadsFromWatermarkHourWithinPageBudget(t *testing.T) {
 	now := time.Date(2026, 11, 9, 20, 30, 0, 0, cstLocation).Unix()
 	row := ChannelUpstreamAccount{Provider: upstreamProviderOrion, UsageDataUntil: now - 600}
 	plan := planUpstreamUsageSync(row, now, 30)
-	wantFrom := row.UsageDataUntil - orionTailOverlapSeconds
-	wantFrom -= wantFrom % 3600
+	wantFrom := row.UsageDataUntil - row.UsageDataUntil%3600
 	if plan.tailFrom != wantFrom || plan.tailTo != now {
 		t.Fatalf("tail [%d,%d), want [%d,%d)", plan.tailFrom, plan.tailTo, wantFrom, now)
 	}
-	const peakRequestsPerHour = 1600
-	if pages := (orionTailMaxSeconds / 3600) * peakRequestsPerHour / orionPageSize; pages > orionMaxPages {
+	// modelrouter.best answered ~3,700 requests per hour on 2026-11-16.
+	const peakRequestsPerHour = 3700
+	if pages := (orionTailMaxSeconds/3600)*peakRequestsPerHour/orionPageSize + 1; pages > orionMaxPages {
 		t.Fatalf("a full tail window needs %d pages at peak, budget %d", pages, orionMaxPages)
 	}
-	newAPI := row
-	newAPI.Provider = upstreamProviderNewAPI
-	if generic := planUpstreamUsageSync(newAPI, now, 30); generic.tailFrom >= plan.tailFrom {
-		t.Fatalf("other providers keep the three-hour overlap: %d vs %d", generic.tailFrom, plan.tailFrom)
+	if budget := upstreamUsageRequestBudget(upstreamProviderOrion, upstreamUsageLaneHistory); budget < peakRequestsPerHour/orionPageSize+1 {
+		t.Fatalf("a busy closed hour cannot be backfilled within %d requests", budget)
+	}
+}
+
+// Regression for 2026-11-16: the watermark stalled at 10:56 and at midnight
+// the tail restarted at the new day, leaving 11:00-24:00 unread for good.
+func TestOrionTailContinuesStaleWatermarkAcrossMidnight(t *testing.T) {
+	now := time.Date(2026, 11, 17, 0, 5, 0, 0, cstLocation).Unix()
+	stalled := time.Date(2026, 11, 16, 10, 56, 0, 0, cstLocation).Unix()
+	row := ChannelUpstreamAccount{Provider: upstreamProviderOrion, UsageDataUntil: stalled, UsageBackfillDone: true, UsageBackfillCursor: cstDayStart(now)}
+	plan := planUpstreamUsageSync(row, now, 30)
+	if want := stalled - stalled%3600; plan.tailFrom != want || plan.tailTo != want+3600 {
+		t.Fatalf("tail [%d,%d), want the stalled hour [%d,%d)", plan.tailFrom, plan.tailTo, want, want+3600)
+	}
+	// Watermarks older than the catch-up range are not chased.
+	row.UsageDataUntil = cstDayStart(now) - orionTailCatchUpSeconds - 3600
+	if old := planUpstreamUsageSync(row, now, 30); old.tailFrom != cstDayStart(now) {
+		t.Fatalf("ancient watermark should restart at today, got %d", old.tailFrom)
+	}
+}
+
+func TestOrionEarliestMissingHourFindsHoleInsideCatchUpRange(t *testing.T) {
+	m := newStabilityTestMonitor(t)
+	now := time.Date(2026, 11, 17, 17, 30, 0, 0, cstLocation).Unix()
+	day := time.Date(2026, 11, 16, 0, 0, 0, 0, cstLocation).Unix()
+	var hours []ChannelUpstreamUsageHour
+	for h := day; h < now-now%3600; h += 3600 {
+		if h >= day+11*3600 && h < day+24*3600 {
+			continue // the 2026-11-16 11:00-24:00 hole
+		}
+		hours = append(hours, ChannelUpstreamUsageHour{Domain: "orion.example", HourTs: h, BucketSeconds: 3600, Provider: upstreamProviderOrion, SourceKind: upstreamUsageAdapterOrion})
+	}
+	if err := m.storeDB.Create(&hours).Error; err != nil {
+		t.Fatal(err)
+	}
+	row := ChannelUpstreamAccount{Domain: "orion.example", Provider: upstreamProviderOrion, UsageDataUntil: now - 600}
+	gap, found, err := m.orionEarliestMissingHour(context.Background(), row, now)
+	if err != nil || !found || gap != day+11*3600 {
+		t.Fatalf("gap=%d found=%v err=%v, want %d", gap, found, err, day+11*3600)
+	}
+	// Once filled, nothing is reported; hours before the first stored hour
+	// (before the account existed) are never treated as holes.
+	var fill []ChannelUpstreamUsageHour
+	for h := day + 11*3600; h < day+24*3600; h += 3600 {
+		fill = append(fill, ChannelUpstreamUsageHour{Domain: "orion.example", HourTs: h, BucketSeconds: 3600, Provider: upstreamProviderOrion, SourceKind: upstreamUsageAdapterOrion})
+	}
+	if err := m.storeDB.Create(&fill).Error; err != nil {
+		t.Fatal(err)
+	}
+	if _, found, err := m.orionEarliestMissingHour(context.Background(), row, now); err != nil || found {
+		t.Fatalf("filled range still reports a gap: found=%v err=%v", found, err)
 	}
 }
 
