@@ -1285,6 +1285,7 @@ func (m *Monitor) openUsageFactsStore(path string, prechecked bool) error {
 		&FinanceUserHourFact{}, &FinanceUserHourState{}, &FinanceCreditEvent{}, &FinanceCreditHourState{},
 		&FinanceGiftBoundaryEvent{}, &FinanceGiftBoundaryState{}, &FinanceGiftRecipient{}, &FinanceFactSyncState{},
 		&FinanceInternalAccountHourFact{}, &FinanceInternalAccountFactState{},
+		&UsageFactSourceShrinkFinding{},
 	); err != nil {
 		return fmt.Errorf("用量事实表迁移失败: %w", err)
 	}

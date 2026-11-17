@@ -338,7 +338,9 @@ func (m *Monitor) finalizeUsageFactHistoryDayFromHours(
 	}
 	var generation, servingGeneration int64
 	var factsChanged, servingChanged bool
+	var shrinkFound []UsageFactSourceShrinkFinding
 	err = db.Transaction(func(tx *gorm.DB) error {
+		shrinkFound = nil
 		verified, verifyErr := verifyUsageFactDayHours(tx, dayTs, ordered)
 		if verifyErr != nil {
 			return verifyErr
@@ -362,10 +364,29 @@ func (m *Monitor) finalizeUsageFactHistoryDayFromHours(
 			return loadErr
 		}
 		priorByDay := usageDailyFactsByMemberDay(priorRows)
+		// A source smaller than the verified day keeps the verified day (see
+		// usage_facts_source_shrink.go); only the other members are replaced.
+		var priorProofs []UsageFactMemberDayState
+		if err := tx.Where("date_ts = ? AND user_id IN ?", dayTs, ordered).Find(&priorProofs).Error; err != nil {
+			return err
+		}
+		protected := make(map[int64]UsageFactMemberDayState)
+		for _, proof := range priorProofs {
+			key := usageFactMemberDayKey{userID: proof.UserID, dayTs: dayTs}
+			if control, ok := controls[key]; ok && usageFactSourceShrank(proof, usageDailyFactContentHash(priorByDay[key]), control, epoch) {
+				protected[proof.UserID] = proof
+			}
+		}
+		rebuildIDs := make([]int64, 0, len(ordered))
+		for _, id := range ordered {
+			if _, keep := protected[id]; !keep {
+				rebuildIDs = append(rebuildIDs, id)
+			}
+		}
 		// Hour rows are staging material in full-history mode. Only after the
 		// independent source proof succeeds do we replace daily facts and
 		// the strict proof together in this one SQLite transaction.
-		if rebuildErr := m.rebuildUsageDailyFact(tx, dayTs, ordered); rebuildErr != nil {
+		if rebuildErr := m.rebuildUsageDailyFact(tx, dayTs, rebuildIDs); rebuildErr != nil {
 			return rebuildErr
 		}
 		rows, loadErr := loadUsageDailyFacts(tx, dayTs, dayTs+usageFactDaySeconds, ordered)
@@ -376,6 +397,16 @@ func (m *Monitor) finalizeUsageFactHistoryDayFromHours(
 		nowUnix := time.Now().Unix()
 		for _, id := range ordered {
 			key := usageFactMemberDayKey{userID: id, dayTs: dayTs}
+			if proof, keep := protected[id]; keep {
+				first, recordErr := recordUsageFactSourceShrinkTx(tx, proof, controls[key], jobID, nowUnix)
+				if recordErr != nil {
+					return recordErr
+				}
+				if first {
+					shrinkFound = append(shrinkFound, usageFactSourceShrinkFindingOf(proof, controls[key]))
+				}
+				continue
+			}
 			memberRows := rowsByDay[key]
 			metrics := dailyFactsMetrics(memberRows)
 			control := controls[key]
@@ -438,6 +469,9 @@ func (m *Monitor) finalizeUsageFactHistoryDayFromHours(
 	})
 	if err != nil {
 		return err
+	}
+	if len(shrinkFound) > 0 {
+		go m.alertUsageFactSourceShrink(shrinkFound)
 	}
 	if factsChanged {
 		m.publishUsageFactGenerations(generation, 0)
@@ -779,7 +813,9 @@ func (m *Monitor) commitUsageFactHistoryRange(
 	now := time.Now().Unix()
 	var generation, servingGeneration int64
 	var servingChanged bool
+	var shrinkFound []UsageFactSourceShrinkFinding
 	err = m.usageFactsStore().WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		shrinkFound = nil
 		var global UsageFactSyncState
 		if err := tx.First(&global, 1).Error; err != nil {
 			return err
@@ -804,6 +840,20 @@ func (m *Monitor) commitUsageFactHistoryRange(
 			attempts[key] = row.Attempts
 			priorByKey[key] = row
 		}
+		// Member-days whose source shrank below the verified copy keep that
+		// copy: it is written back after the range delete below.
+		priorFactRows, loadErr := loadUsageDailyFacts(tx, result.FromTs, result.ThroughTs, result.UserIDs)
+		if loadErr != nil {
+			return loadErr
+		}
+		priorFacts := usageDailyFactsByMemberDay(priorFactRows)
+		protected := make(map[usageFactMemberDayKey]UsageFactMemberDayState)
+		epoch := strings.TrimSpace(m.cfg.UsageFactsHistorySourceEpoch)
+		for key, old := range priorByKey {
+			if control, ok := result.Controls[key]; ok && usageFactSourceShrank(old, usageDailyFactContentHash(priorFacts[key]), control, epoch) {
+				protected[key] = old
+			}
+		}
 		deleteArgs := append([]any{result.FromTs, result.ThroughTs}, inArgs...)
 		if err := tx.Where("date_ts >= ? AND date_ts < ? AND "+inSQL, deleteArgs...).Delete(&UsageDailyFact{}).Error; err != nil {
 			return err
@@ -817,6 +867,18 @@ func (m *Monitor) commitUsageFactHistoryRange(
 		for day := result.FromTs; day < result.ThroughTs; day += usageFactDaySeconds {
 			for _, id := range result.UserIDs {
 				key := usageFactMemberDayKey{userID: id, dayTs: day}
+				if old, keep := protected[key]; keep {
+					facts = append(facts, priorFacts[key]...)
+					proofs = append(proofs, old)
+					first, recordErr := recordUsageFactSourceShrinkTx(tx, old, result.Controls[key], jobID, now)
+					if recordErr != nil {
+						return recordErr
+					}
+					if first {
+						shrinkFound = append(shrinkFound, usageFactSourceShrinkFindingOf(old, result.Controls[key]))
+					}
+					continue
+				}
 				rows := result.Facts[key]
 				facts = append(facts, rows...)
 				control := result.Controls[key]
@@ -862,6 +924,9 @@ func (m *Monitor) commitUsageFactHistoryRange(
 	})
 	if err != nil {
 		return err
+	}
+	if len(shrinkFound) > 0 {
+		go m.alertUsageFactSourceShrink(shrinkFound)
 	}
 	m.publishUsageFactGenerations(generation, 0)
 	if servingChanged {
