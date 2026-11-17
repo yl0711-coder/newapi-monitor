@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -60,7 +61,52 @@ func (m *Monitor) fetchBrand() (name, logo string) {
 	return name, logo
 }
 
-// brandHandler 公开返回站点名,供前端设置页面标题与品牌文字。
+// brandLogo 返回 new-api 当前配置的 logo 地址(与主站一致,主站换 logo 后自动跟随)。
+// 结果按 new-api 地址缓存:成功缓存 30 分钟,失败 5 分钟内不再重试,避免每次打开页面都请求 new-api。
+func (m *Monitor) brandLogo() string {
+	base := strings.TrimRight(m.cfg.NewAPIBaseURL, "/")
+	if base == "" {
+		return ""
+	}
+	now := time.Now()
+	brandLogoCache.Lock()
+	entry, ok := brandLogoCache.entries[base]
+	brandLogoCache.Unlock()
+	if ok && now.Before(entry.until) {
+		return entry.logo
+	}
+	_, logo := m.fetchBrand()
+	logo = safeBrandLogo(logo)
+	ttl := 30 * time.Minute
+	if logo == "" {
+		ttl = 5 * time.Minute
+	}
+	brandLogoCache.Lock()
+	brandLogoCache.entries[base] = brandLogoEntry{logo: logo, until: now.Add(ttl)}
+	brandLogoCache.Unlock()
+	return logo
+}
+
+type brandLogoEntry struct {
+	logo  string
+	until time.Time
+}
+
+var brandLogoCache = struct {
+	sync.Mutex
+	entries map[string]brandLogoEntry
+}{entries: map[string]brandLogoEntry{}}
+
+// safeBrandLogo 只接受 http(s) 图片地址或 data:image,其余(如 javascript:)一律丢弃。
+func safeBrandLogo(logo string) string {
+	lower := strings.ToLower(logo)
+	if strings.HasPrefix(lower, "https://") || strings.HasPrefix(lower, "http://") || strings.HasPrefix(lower, "data:image/") {
+		return logo
+	}
+	return ""
+}
+
+// brandHandler 公开返回站点名与 logo,供前端设置页面标题、品牌文字和图标。
 func (m *Monitor) brandHandler(c *gin.Context) {
-	c.JSON(http.StatusOK, gin.H{"name": m.brandName()})
+	c.JSON(http.StatusOK, gin.H{"name": m.brandName(), "logo": m.brandLogo()})
 }
