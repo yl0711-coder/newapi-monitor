@@ -2,12 +2,14 @@ package monitor
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
@@ -21,6 +23,78 @@ type ChannelUpstreamRetirement struct {
 	Retiring  bool   `gorm:"column:retiring"`
 	UpdatedAt int64  `gorm:"column:updated_at"`
 	UpdatedBy string `gorm:"size:128;column:updated_by"`
+	// Reasons is a JSON array of retirementReasonCodes chosen when marking;
+	// ReasonNote is the free text for "other". Both are cleared on unmark.
+	// Rows marked before reasons existed keep them empty.
+	Reasons    string `gorm:"size:256;column:reasons"`
+	ReasonNote string `gorm:"size:400;column:reason_note"`
+}
+
+// retirementReasonCodes are the selectable 停止使用 reasons, in display order.
+var retirementReasonCodes = []string{"no_recharge", "degraded", "unstable", "slow", "token_inflation", "other"}
+
+const retirementReasonNoteMaxRunes = 100
+
+// normalizeRetirementReasons validates the selection and returns the codes in
+// canonical order plus the note (kept only with "other").
+func normalizeRetirementReasons(codes []string, note string) ([]string, string, error) {
+	selected := map[string]bool{}
+	for _, code := range codes {
+		code = strings.TrimSpace(code)
+		known := false
+		for _, allowed := range retirementReasonCodes {
+			if code == allowed {
+				known = true
+				break
+			}
+		}
+		if !known {
+			return nil, "", fmt.Errorf("未知的停止使用原因：%s", code)
+		}
+		selected[code] = true
+	}
+	var ordered []string
+	for _, code := range retirementReasonCodes {
+		if selected[code] {
+			ordered = append(ordered, code)
+		}
+	}
+	if len(ordered) == 0 {
+		return nil, "", errors.New("请至少选择一个停止使用原因")
+	}
+	note = strings.Join(strings.Fields(note), " ")
+	if !selected["other"] {
+		return ordered, "", nil
+	}
+	if note == "" {
+		return nil, "", errors.New("选择“其他”时请填写原因")
+	}
+	if utf8.RuneCountInString(note) > retirementReasonNoteMaxRunes {
+		return nil, "", fmt.Errorf("其他原因不能超过 %d 个字", retirementReasonNoteMaxRunes)
+	}
+	return ordered, note, nil
+}
+
+// retirementReasonList decodes the stored codes; unknown or malformed values
+// are dropped so a bad row never breaks the report.
+func retirementReasonList(stored string) []string {
+	if strings.TrimSpace(stored) == "" {
+		return nil
+	}
+	var codes []string
+	if json.Unmarshal([]byte(stored), &codes) != nil {
+		return nil
+	}
+	var out []string
+	for _, code := range retirementReasonCodes {
+		for _, got := range codes {
+			if got == code {
+				out = append(out, code)
+				break
+			}
+		}
+	}
+	return out
 }
 
 func (ChannelUpstreamRetirement) TableName() string { return "channel_upstream_retirements" }
@@ -46,9 +120,11 @@ func (m *Monitor) loadChannelUpstreamRetirements(ctx context.Context) (map[strin
 }
 
 type channelUpstreamRetirementInput struct {
-	Domain           string `json:"domain"`
-	Retiring         *bool  `json:"retiring"`
-	ExpectedRetiring *bool  `json:"expected_retiring"`
+	Domain           string   `json:"domain"`
+	Retiring         *bool    `json:"retiring"`
+	ExpectedRetiring *bool    `json:"expected_retiring"`
+	Reasons          []string `json:"reasons"`
+	ReasonNote       string   `json:"reason_note"`
 }
 
 var errChannelUpstreamRetirementChanged = errors.New("停止使用标记已被其他管理员修改，请刷新后重试")
@@ -65,6 +141,20 @@ func (m *Monitor) saveChannelUpstreamRetirementHandler(c *gin.Context) {
 	if domain == "" || len(domain) > 253 {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "主域名无效"})
 		return
+	}
+	var reasons []string
+	var note string
+	if *input.Retiring {
+		var err error
+		if reasons, note, err = normalizeRetirementReasons(input.Reasons, input.ReasonNote); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+	}
+	encodedReasons := ""
+	if len(reasons) > 0 {
+		raw, _ := json.Marshal(reasons)
+		encodedReasons = string(raw)
 	}
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 3*time.Second)
 	defer cancel()
@@ -88,10 +178,13 @@ func (m *Monitor) saveChannelUpstreamRetirementHandler(c *gin.Context) {
 		if current != *input.ExpectedRetiring {
 			return errChannelUpstreamRetirementChanged
 		}
-		if current == *input.Retiring {
+		if current == *input.Retiring && (!current || (row.Reasons == encodedReasons && row.ReasonNote == note)) {
 			return nil
 		}
+		// Marking (or re-saving the reasons of a marked upstream) stores the
+		// reasons; unmarking clears them.
 		row.Domain, row.Retiring, row.UpdatedAt, row.UpdatedBy = domain, *input.Retiring, now, c.GetString("uname")
+		row.Reasons, row.ReasonNote = encodedReasons, note
 		return tx.Save(&row).Error
 	})
 	if errors.Is(err, errChannelUpstreamRetirementChanged) {
@@ -102,7 +195,11 @@ func (m *Monitor) saveChannelUpstreamRetirementHandler(c *gin.Context) {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "保存停止使用标记失败"})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"domain": domain, "retiring": *input.Retiring, "updated_at": now})
+	if reasons == nil {
+		reasons = []string{}
+	}
+	c.JSON(http.StatusOK, gin.H{"domain": domain, "retiring": *input.Retiring, "updated_at": now,
+		"reasons": reasons, "reason_note": note})
 }
 
 // Automatic upstream sync pauses for a domain only while BOTH hold: an operator

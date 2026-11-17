@@ -62,7 +62,8 @@ test('mark and cancel move the account without changing balances, totals or rout
   const d=domain('account',2),{api,element,context}=setup([d,domain('other')]);
   api.render();const totals=element('cmSummary').innerHTML,requests=[];
   context.window.confirm=()=>true;
-  context.fetch=async(url,options)=>{const body=JSON.parse(options.body);requests.push({url,body});return {ok:true,status:200,json:async()=>({retiring:body.retiring,updated_at:123})}};
+  api.cm.reasonPicker=async()=>({reasons:['no_recharge','unstable'],note:''});
+  context.fetch=async(url,options)=>{const body=JSON.parse(options.body);requests.push({url,body});return {ok:true,status:200,json:async()=>({retiring:body.retiring,updated_at:123,reasons:body.retiring?body.reasons:[],reason_note:''})}};
   const button={disabled:false};
   await api.setDomainRetiring(d.key,button);
   assert.match(element('cmBody').innerHTML,/aria-label="已停用渠道"/);
@@ -73,7 +74,29 @@ test('mark and cancel move the account without changing balances, totals or rout
   assert.equal(d.retiring,false);assert.equal(d.vendors[0].channels[0].status,2);
   assert.equal(element('cmSummary').innerHTML,totals);
   assert.deepEqual(requests.map(r=>r.body.expected_retiring),[false,true]);
+  assert.deepEqual(requests.map(r=>r.body.reasons),[['no_recharge','unstable'],[]]);
   assert(requests.every(r=>r.url==='/channels/upstream/retirement'));
+});
+test('marking asks for reasons; cancelling the picker sends nothing',async()=>{
+  const d=domain('account',1),{api,context}=setup([d]);api.render();
+  const requests=[];context.fetch=async(url,options)=>{requests.push(JSON.parse(options.body));return {ok:true,status:200,json:async()=>({})}};
+  let asked=0;api.cm.reasonPicker=async()=>{asked++;return null};
+  await api.setDomainRetiring(d.key,{disabled:false});
+  assert.equal(asked,1);assert.equal(requests.length,0);assert.equal(!!d.retiring,false);
+});
+test('reasons are shown after the 停止使用 badge, escaped, with the other note',async()=>{
+  const d=domain('account',1),{api,element,context}=setup([d]);api.render();
+  api.cm.reasonPicker=async()=>({reasons:['degraded','token_inflation','other'],note:'对账<差异>'});
+  context.fetch=async(url,options)=>{const body=JSON.parse(options.body);return {ok:true,status:200,json:async()=>({retiring:true,updated_at:1,reasons:body.reasons,reason_note:body.reason_note})}};
+  await api.setDomainRetiring(d.key,{disabled:false});
+  const html=element('cmBody').innerHTML;
+  assert.match(html,/停止使用<\/span><span class="cm-upstream-retiring-reasons"[^>]*>降智、token虚报、其他：对账&lt;差异&gt;<\/span>/);
+  assert.doesNotMatch(html,/对账<差异>/);
+});
+test('legacy retired accounts without reasons show only the badge',()=>{
+  const {api,element}=setup([domain('old',1,{retiring:true})]);api.render();
+  const html=element('cmBody').innerHTML;
+  assert.match(html,/cm-upstream-retiring"/);assert.doesNotMatch(html,/cm-upstream-retiring-reasons/);
 });
 test('routing status filters and metric sorting never turn an unmarked account into retired',()=>{
   for(const status of ['','enabled','disabled'])for(const sort of ['name','cost','requests','tokens']){
