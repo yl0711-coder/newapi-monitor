@@ -37,7 +37,13 @@
     this.pickerRef = window.React.createRef();
 
     this.mount = document.createElement('div');
-    this.mount.className = `srp-wrap${this.options.theme === 'dark' ? ' semi-always-dark' : ''}`;
+    this.mount.className = `srp-wrap${this.darkMode() ? ' semi-always-dark' : ''}`;
+    // theme: 'dark' means "follow the Monitor page theme" now that the page
+    // can be light. Re-render when the page theme changes.
+    window.addEventListener('monitor-theme-change', () => {
+      this.mount.className = `srp-wrap${this.darkMode() ? ' semi-always-dark' : ''}`;
+      if (typeof this.render === 'function') this.render();
+    });
     input.parentNode.insertBefore(this.mount, input);
     input.hidden = true;
     input.tabIndex = -1;
@@ -46,6 +52,10 @@
     this.root = window.ReactDOM.createRoot(this.mount);
     this.setDate(this.options.value || [], false);
   }
+
+  SemiRangePicker.prototype.darkMode = function () {
+    return this.options.theme === 'dark' && document.documentElement.getAttribute('data-theme') !== 'light';
+  };
 
   SemiRangePicker.prototype.selectedDates = function () {
     return this.value.map(cloneDate);
@@ -133,7 +143,7 @@
       style: { width: '100%' },
       presets,
       disabledDate,
-      dropdownClassName: this.options.theme === 'dark' ? 'semi-always-dark' : '',
+      dropdownClassName: this.darkMode() ? 'semi-always-dark' : '',
       onChange: nextValue => this.handleChange(nextValue),
       onClear: () => this.handleClear(),
     }));

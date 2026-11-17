@@ -261,8 +261,8 @@ func TestLogChainDateSummaryKeepsToolbarControlsStable(t *testing.T) {
 func TestLogChainDatePickerMatchesTimeStyleWithoutChangingBehavior(t *testing.T) {
 	js := stripJSLineComments(string(logChainJS))
 	for _, want := range []string{
-		`.lc-daybar input[type=date]{width:142px;color:#0f172a;background:#f8fafc;border:2px solid #60a5fa;font-weight:700;color-scheme:light}`,
-		`.lc-daybar input[type=date]:focus{outline:2px solid #93c5fd;outline-offset:2px;border-color:#2563eb}`,
+		`.lc-daybar input[type=date]{width:142px;color:#0f172a/*fixed*/;background:#f8fafc/*fixed*/;border:2px solid #60a5fa/*fixed*/;font-weight:700;color-scheme:light}`,
+		`.lc-daybar input[type=date]:focus{outline:2px solid #93c5fd/*fixed*/;outline-offset:2px;border-color:#2563eb/*fixed*/}`,
 		`.lc-daybar input[type=date]::-webkit-calendar-picker-indicator{opacity:1;cursor:pointer}`,
 	} {
 		if !strings.Contains(pageHTML, want) {

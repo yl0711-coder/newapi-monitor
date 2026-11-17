@@ -136,7 +136,7 @@ func TestFinanceLocalSnapshotPreview(t *testing.T) {
 	fromDate := time.Unix(r.From, 0).In(loc).Format("2006-01-02")
 	toDate := time.Unix(r.To-1, 0).In(loc).Format("2006-01-02")
 	banner := fmt.Sprintf("本机只读展示验收 · 当前开发代码 · 非线上实时数据<br>固定区间：%s 至 %s（北京时间）；业务快照生成于 %s。%s<br>日期、配置与同步操作已禁用；本页不连接数据库或上游。", fromDate, toDate, time.Unix(r.GeneratedAt, 0).In(loc).Format("2006-01-02 15:04:05"), scopeNotice)
-	html := `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>本机经营核算只读验收</title>` + pageHTML[styleStart:styleEnd+len("</style>")] + `<link rel="stylesheet" href="/stability.css"><link rel="stylesheet" href="/finance.css"><style>body{max-width:none;margin:0;padding:0;background:#10131b;color:#e3e8f2}.preview-shell{display:grid;grid-template-columns:220px minmax(0,1fr);min-height:100vh}.preview-side{padding:28px 20px;background:#161b27;border-right:1px solid #30394c}.preview-side p{color:#9da9bd;line-height:2}.preview-main{padding:24px;min-width:0}.preview-banner{padding:16px 20px;border:1px solid #8d7134;border-radius:10px;background:#30291b;color:#f4dc9f;line-height:1.7;margin-bottom:20px}.preview-side b{color:#a7a1ff}button:disabled,input:disabled,textarea:disabled{cursor:not-allowed;opacity:.5}@media(max-width:760px){.preview-shell{grid-template-columns:1fr}.preview-side{display:none}.preview-main{padding:12px}}</style></head><body theme-mode="dark"><div class="preview-shell"><aside class="preview-side"><h3>NexusAPI Monitor</h3><p>本机隔离验收<br>用户用量 · 未载入<br>渠道管理 · 未载入<br>稳定性报表 · 未载入</p><b>经营核算</b></aside><main class="preview-main"><div class="preview-banner">` + banner + `</div>` + fragment + `</main></div><script src="/echarts.js"></script><script src="/finance.js"></script><script src="/preview.js"></script></body></html>`
+	html := `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>本机经营核算只读验收</title>` + pageHTML[styleStart:styleEnd+len("</style>")] + `<link rel="stylesheet" href="/theme-tokens.css"><link rel="stylesheet" href="/stability.css"><link rel="stylesheet" href="/finance.css"><style>body{max-width:none;margin:0;padding:0;background:#10131b;color:#e3e8f2}.preview-shell{display:grid;grid-template-columns:220px minmax(0,1fr);min-height:100vh}.preview-side{padding:28px 20px;background:#161b27;border-right:1px solid #30394c}.preview-side p{color:#9da9bd;line-height:2}.preview-main{padding:24px;min-width:0}.preview-banner{padding:16px 20px;border:1px solid #8d7134;border-radius:10px;background:#30291b;color:#f4dc9f;line-height:1.7;margin-bottom:20px}.preview-side b{color:#a7a1ff}button:disabled,input:disabled,textarea:disabled{cursor:not-allowed;opacity:.5}@media(max-width:760px){.preview-shell{grid-template-columns:1fr}.preview-side{display:none}.preview-main{padding:12px}}</style></head><body theme-mode="dark"><div class="preview-shell"><aside class="preview-side"><h3>NexusAPI Monitor</h3><p>本机隔离验收<br>用户用量 · 未载入<br>渠道管理 · 未载入<br>稳定性报表 · 未载入</p><b>经营核算</b></aside><main class="preview-main"><div class="preview-banner">` + banner + `</div>` + fragment + `</main></div><script src="/echarts.js"></script><script src="/finance.js"></script><script src="/preview.js"></script></body></html>`
 	bootstrap := fmt.Sprintf(`document.getElementById('finFrom').value=%q;document.getElementById('finTo').value=%q;`, fromDate, toDate) + `for(const id of ['finSinceLaunch','finLastMonth','finThisMonth','finFrom','finTo','finInternalSave','finInternalAccounts']){document.getElementById(id).disabled=true;}window.financeActivate();new MutationObserver(()=>{document.querySelectorAll('[data-fin-cost-source]').forEach(b=>{b.disabled=true;b.title='本次只验收经营核算展示，未载入渠道配置';});}).observe(document.getElementById('finReportContent'),{childList:true,subtree:true});`
 	// The configuration editor is outside this snapshot acceptance. Do not
 	// fabricate an empty account list or manufacture a production API failure.
@@ -149,13 +149,14 @@ func TestFinanceLocalSnapshotPreview(t *testing.T) {
 		kind string
 		body []byte
 	}{
-		"/":               {"text/html; charset=utf-8", []byte(html)},
-		"/finance.css":    {"text/css; charset=utf-8", financeCSS},
-		"/stability.css":  {"text/css; charset=utf-8", stabilityCSS},
-		"/finance.js":     {"application/javascript", []byte(previewJS)},
-		"/echarts.js":     {"application/javascript", echartsJS},
-		"/preview.js":     {"application/javascript", []byte(bootstrap)},
-		"/finance/report": {"application/json", reportJSON},
+		"/":                 {"text/html; charset=utf-8", []byte(html)},
+		"/finance.css":      {"text/css; charset=utf-8", financeCSS},
+		"/stability.css":    {"text/css; charset=utf-8", stabilityCSS},
+		"/theme-tokens.css": {"text/css; charset=utf-8", themeTokensCSS},
+		"/finance.js":       {"application/javascript", []byte(previewJS)},
+		"/echarts.js":       {"application/javascript", echartsJS},
+		"/preview.js":       {"application/javascript", []byte(bootstrap)},
+		"/finance/report":   {"application/json", reportJSON},
 	}
 	port := 8156
 	if value := os.Getenv("MONITOR_LOCAL_PREVIEW_PORT"); value != "" {

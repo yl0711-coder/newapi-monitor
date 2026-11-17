@@ -7,7 +7,7 @@ import (
 
 func TestCapacityUIIsIsolatedAndRegistered(t *testing.T) {
 	for _, want := range []string{
-		`data-tab="capacity"`, `id="tab-capacity"`, `/capacity.css?v=2`, `/capacity.js?v=2`,
+		`data-tab="capacity"`, `id="tab-capacity"`, `/capacity.css?v=3`, `/capacity.js?v=2`,
 		`window.capacityActivate`, `MONITOR_CAPACITY_ENABLED=true`, `id="capUser"`, `id="capSearch"`,
 		`id="capFrom"`, `id="capTo"`, `id="capApplyRange"`, `已观测分钟峰值 TPM`,
 	} {

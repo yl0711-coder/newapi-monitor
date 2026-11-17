@@ -3,12 +3,12 @@
 .im-filters,.im-actions{display:flex;gap:10px;align-items:end;flex-wrap:wrap;margin:14px 0}
 .im-filters label{display:flex;flex-direction:column;gap:6px;font-size:13px}
 .incident-page input,.incident-page button{font:inherit;min-height:40px;border:1px solid var(--border);border-radius:7px;padding:8px 12px;background:var(--card);color:var(--text);max-width:100%;box-sizing:border-box}
-.incident-page input{color-scheme:dark}
+.incident-page input{color-scheme:inherit}
 body[theme-mode="light"] .incident-page input{color-scheme:light}
 .incident-page button{cursor:pointer}.incident-page button:disabled{opacity:.55;cursor:default}
 .incident-page :focus-visible{outline:2px solid var(--accent);outline-offset:3px}
 .im-note{font-size:12px;line-height:1.65;color:var(--text-muted)}
-.im-warning,.im-empty{border:1px solid #9d7b32;border-radius:8px;padding:12px;background:rgba(181,138,55,.1);line-height:1.6}
+.im-warning,.im-empty{border:1px solid rgb(var(--crb-9d7b32));border-radius:8px;padding:12px;background:rgb(var(--cra-b58a37) / calc(.1 * var(--cr-af)));line-height:1.6}
 .im-error{color:var(--red);padding:10px 0;line-height:1.6}
 .im-table{overflow:auto;max-width:100%;margin:12px 0}.im-table table{border-collapse:collapse;width:100%;min-width:680px}.im-table td,.im-table th{padding:10px;text-align:left;vertical-align:top;border-bottom:1px solid var(--border);font-size:13px;line-height:1.6}.im-table th{white-space:nowrap}.im-table button{white-space:nowrap}
 .incident-page details{border:1px solid var(--border);border-radius:8px;padding:12px;margin:14px 0}.incident-page summary{cursor:pointer}

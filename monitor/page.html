@@ -6,25 +6,44 @@
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E📈%3C/text%3E%3C/svg%3E">
 <title>new-api 上游监控</title>
 <script>
+// Apply the saved theme before first paint (per browser; light / dark / follow system).
+(function(){var p='dark';try{var v=localStorage.getItem('monitor-theme');if(v==='light'||v==='dark'||v==='system')p=v}catch(e){}
+var d=p==='dark'||(p==='system'&&!!(window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches));
+document.documentElement.setAttribute('data-theme',d?'dark':'light');document.documentElement.setAttribute('data-theme-pref',p)})();
+</script>
+<link rel="stylesheet" href="/theme-tokens.css?v=2">
+<link rel="stylesheet" href="/theme.css?v=3">
+<script>
 fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
-  if(!d||!d.name)return;
-  document.title=document.title.replace('new-api',d.name);
-  var set=function(){document.querySelectorAll('[data-brand]').forEach(function(el){el.textContent=d.name})};
+  if(!d)return;
+  if(d.name)document.title=document.title.replace('new-api',d.name);
+  var set=function(){
+    if(d.name)document.querySelectorAll('[data-brand]').forEach(function(el){el.textContent=d.name});
+    // Same logo as the new-api site; the default mark stays if it fails to load.
+    if(d.logo){
+      var icon=document.querySelector('link[rel="icon"]');if(icon)icon.href=d.logo;
+      var mark=document.querySelector('.monitor-brand-mark'),img=new Image();img.alt='';
+      img.onload=function(){if(mark){mark.textContent='';mark.appendChild(img);mark.classList.add('has-logo')}};
+      img.src=d.logo;
+    }
+  };
   if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',set);else set();
 }).catch(function(){});
 </script>
 <script src="/echarts.js"></script>
+<script src="/theme-palette.js?v=2"></script>
+<script src="/theme.js?v=2"></script>
 <script src="/flatpickr.js"></script>
 <link rel="stylesheet" href="/flatpickr.css">
 <link rel="stylesheet" href="/semi-ui.css?v=2.72.2">
 <script src="/react.js?v=18.2.0"></script>
 <script src="/react-dom.js?v=18.2.0"></script>
 <script src="/semi-ui.js?v=2.72.2"></script>
-<script src="/range-picker.js?v=9"></script>
+<script src="/range-picker.js?v=10"></script>
 <style>
   *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
-  :root{--bg:#0f1117;--surface:#1a1d27;--border:#2a2d3e;--accent:#6366f1;--text:#e2e8f0;--text-muted:#94a3b8;
-    --green:#10b981;--yellow:#f59e0b;--red:#ef4444;--font:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif}
+  :root{--bg:rgb(var(--cr-0f1117));--surface:rgb(var(--cr-1a1d27));--border:rgb(var(--cr-2a2d3e));--accent:rgb(var(--cr-6366f1));--text:rgb(var(--cr-e2e8f0));--text-muted:rgb(var(--cr-94a3b8));
+    --green:rgb(var(--cr-10b981));--yellow:rgb(var(--cr-f59e0b));--red:rgb(var(--cr-ef4444));--font:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif}
   body{background:var(--bg);color:var(--text);font-family:var(--font);min-height:100vh;padding:28px 32px;max-width:1280px;margin:0 auto}
   h1{font-size:21px;font-weight:600;margin-bottom:4px}
   h1 small{font-size:13px;color:var(--text-muted);font-weight:400;margin-left:8px}
@@ -33,9 +52,10 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
   td.right,th.right{text-align:right}
 
   .toolbar{display:flex;align-items:center;gap:14px;flex-wrap:wrap;margin:18px 0}
+  #modelView{padding:7px 10px;border-radius:8px;border:1px solid var(--border);background:var(--surface);color:var(--text);font-size:13px;cursor:pointer}
   .seg{display:inline-flex;border:1px solid var(--border);border-radius:8px;overflow:hidden}
   .seg a{padding:7px 14px;font-size:13px;color:var(--text-muted);text-decoration:none;border-right:1px solid var(--border)}
-  .seg a:last-child{border-right:none}.seg a.active{background:var(--accent);color:#fff}
+  .seg a:last-child{border-right:none}.seg a.active{background:var(--accent);color:rgb(var(--cr-ffffff))}
   .btn{padding:7px 14px;border-radius:8px;border:1px solid var(--border);background:transparent;color:var(--text);cursor:pointer;font-size:13px}
   .btn:hover{border-color:var(--accent);color:var(--accent)}
   /* 用户用量·消费矩阵:用户多(20-30列)时的可读性——双向滚动容器内粘住表头行/日期列/合计列,列头截断悬停看全,格子按金额热力着色 */
@@ -44,15 +64,15 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
   .mxwrap thead th{position:sticky;top:0;background:var(--surface);z-index:3}
   .mxwrap td:first-child,.mxwrap th:first-child{position:sticky;left:0;background:var(--surface);z-index:2;white-space:nowrap;width:var(--mx-user-w);min-width:var(--mx-user-w);max-width:var(--mx-user-w);box-sizing:border-box}
   .mxwrap td:nth-child(2),.mxwrap th:nth-child(2){position:sticky;left:var(--mx-left-2);background:var(--surface);z-index:2;width:132px;min-width:132px;max-width:132px;box-sizing:border-box} /* 余额列:锁左；为五位及以上金额保留完整显示空间 */
-  .mxwrap td:nth-child(3),.mxwrap th:nth-child(3){position:sticky;left:var(--mx-left-3);background:var(--surface);z-index:2;width:142px;min-width:142px;max-width:142px;box-sizing:border-box;box-shadow:6px 0 8px -6px rgba(0,0,0,.55)} /* 累计总消耗列:随用户/余额一起锁左,阴影收在最后一根固定列上 */
+  .mxwrap td:nth-child(3),.mxwrap th:nth-child(3){position:sticky;left:var(--mx-left-3);background:var(--surface);z-index:2;width:142px;min-width:142px;max-width:142px;box-sizing:border-box;box-shadow:6px 0 8px -6px rgb(var(--cra-000000) / calc(.55 * var(--cr-af)))} /* 累计总消耗列:随用户/余额一起锁左,阴影收在最后一根固定列上 */
   .mxwrap thead th:nth-child(2),.mxwrap thead th:nth-child(3){z-index:4}
   .mxwrap tbody tr.mxfoot td:nth-child(2),.mxwrap tbody tr.mxfoot td:nth-child(3){z-index:5}
-  .mxwrap td:last-child,.mxwrap th:last-child{position:sticky;right:0;background:var(--surface);z-index:2;box-shadow:-6px 0 8px -6px rgba(0,0,0,.55)}
+  .mxwrap td:last-child,.mxwrap th:last-child{position:sticky;right:0;background:var(--surface);z-index:2;box-shadow:-6px 0 8px -6px rgb(var(--cra-000000) / calc(.55 * var(--cr-af)))}
   .mxwrap thead th:first-child{z-index:4}
   .mxwrap thead th:last-child{z-index:4}
   @media(max-width:620px){ /* 窄屏只锁用户列：多列同时固定会把余额和日期全部盖住 */
     .mxwrap td:nth-child(2),.mxwrap th:nth-child(2),.mxwrap td:nth-child(3),.mxwrap th:nth-child(3),.mxwrap td:last-child,.mxwrap th:last-child{position:static;box-shadow:none}
-    .mxwrap td:first-child,.mxwrap th:first-child{box-shadow:6px 0 8px -6px rgba(0,0,0,.55)}
+    .mxwrap td:first-child,.mxwrap th:first-child{box-shadow:6px 0 8px -6px rgb(var(--cra-000000) / calc(.55 * var(--cr-af)))}
   }
   .mxwrap td,.mxwrap th{white-space:nowrap} /* 表头日期绝不折行 */
   /* 统一列宽:数据列(日期)等宽,不随内容宽窄不一;首列(用户)与尾列(合计)各自给足 */
@@ -77,13 +97,13 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
   /* 冻结身份列(用户/余额/累计总消耗)+ 尾列:比日期网格略深,读作独立面板 */
   .mxwrap thead th:first-child,.mxwrap thead th:nth-child(2),.mxwrap thead th:nth-child(3),.mxwrap thead th:last-child,
   .mxwrap tbody td:first-child,.mxwrap tbody td:nth-child(2),.mxwrap tbody td:nth-child(3),.mxwrap tbody td:last-child,
-  .mxwrap tbody tr.mxfoot td{background:#171a23}
-  .mxwrap tbody td .muted{color:#2c3140} /* 空格「—」压暗,让有数的格子跳出来 */
+  .mxwrap tbody tr.mxfoot td{background:rgb(var(--crg-171a23))}
+  .mxwrap tbody td .muted{color:rgb(var(--cr-2c3140))} /* 空格「—」压暗,让有数的格子跳出来 */
   .mxwrap tbody td{padding:7px 12px} /* 21行真实数据下收紧行高,一屏尽量看全 */
   .mxwrap thead th{padding:9px 12px}
   /* 危险操作(移除/解散):默认灰,悬停才红——红色留给真正的告警 */
   .danger-link{color:var(--text-muted);text-decoration:none}
-  .danger-link:hover{color:#ef4444}
+  .danger-link:hover{color:rgb(var(--cr-ef4444))}
   /* 待跟进·长期沉默折叠区(低优先级,灰) */
   .fu-silent-head{padding:10px 8px;cursor:pointer;font-weight:600;font-size:13.5px;display:flex;gap:8px;align-items:center;border-top:1px solid var(--border);margin-top:6px}
   .fu-silent-row{display:flex;gap:12px;align-items:center;padding:8px 12px;font-size:13px;border-top:1px solid var(--border);color:var(--text-muted)}
@@ -99,9 +119,9 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
   .usage-summary:empty{display:none}
   .usage-summary .us-item{display:flex;flex-direction:column;gap:4px}
   .usage-summary .us-l{font-size:12px;color:var(--text-muted)}
-  .usage-summary .us-v{font-size:19px;line-height:32px;font-weight:700;color:#cbd5e1;font-variant-numeric:tabular-nums;letter-spacing:-.01em} /* 固定行高:不同字号的列等高,标签对齐+数值底部对齐 */
-  .usage-summary .us-v.amber{color:#fbbf24;font-size:28px} /* 头条主数 */
-  .usage-summary .us-v.green{color:#34d399}
+  .usage-summary .us-v{font-size:19px;line-height:32px;font-weight:700;color:rgb(var(--cr-cbd5e1));font-variant-numeric:tabular-nums;letter-spacing:-.01em} /* 固定行高:不同字号的列等高,标签对齐+数值底部对齐 */
+  .usage-summary .us-v.amber{color:rgb(var(--cr-fbbf24));font-size:28px} /* 头条主数 */
+  .usage-summary .us-v.green{color:rgb(var(--cr-34d399))}
   .usage-profile-note{display:block;font-size:11px;font-weight:400;line-height:1.5;color:var(--text-muted)}
   .grpcard .usage-profile-value{display:inline-block;vertical-align:top}
   .usage-summary .us-sep{width:1px;align-self:stretch;background:var(--border);margin:3px 0}
@@ -113,20 +133,20 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
   /* 客户分组汇总卡条:每公司一卡,点选=筛选矩阵;按累计总消耗降序(稳定,不随日期区间变) */
   .grpcards{display:grid;grid-template-columns:repeat(auto-fill,minmax(216px,1fr));gap:10px;padding:14px 18px}
   .grpcards:empty{display:none}
-  .pickmenu{position:absolute;top:calc(100% + 4px);right:0;min-width:200px;max-height:280px;overflow:auto;background:var(--surface);border:1px solid var(--border);border-radius:8px;box-shadow:0 8px 24px rgba(0,0,0,.5);z-index:20}
+  .pickmenu{position:absolute;top:calc(100% + 4px);right:0;min-width:200px;max-height:280px;overflow:auto;background:var(--surface);border:1px solid var(--border);border-radius:8px;box-shadow:0 8px 24px rgb(var(--cra-000000) / calc(.5 * var(--cr-af)));z-index:20}
   .pickmenu div{padding:8px 12px;font-size:13px;cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-  .pickmenu div:hover,.pickmenu div.on{background:rgba(99,102,241,.15);color:var(--text)}
+  .pickmenu div:hover,.pickmenu div.on{background:rgb(var(--cra-6366f1) / calc(.15 * var(--cr-af)));color:var(--text)}
   .pickmenu .pm-sub{color:var(--text-muted);font-size:11px;margin-left:6px}
   .grpcard{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:11px 14px;cursor:pointer;min-width:0;transition:border-color .15s,background .15s}
   .grpcard:hover{border-color:var(--accent)}
   .grpcard.active{border-color:var(--accent);box-shadow:0 0 0 1px var(--accent) inset}
-  .grpcard.g-all{background:rgba(99,102,241,.06)} /* 全部用户卡:淡强调,和公司卡区分 */
+  .grpcard.g-all{background:rgb(var(--cra-6366f1) / calc(.06 * var(--cr-af)))} /* 全部用户卡:淡强调,和公司卡区分 */
   .grpcard .g-top{display:flex;align-items:center;gap:6px;min-width:0;margin-bottom:6px}
   .grpcard .g-ico{flex:none;font-size:14px}
   .grpcard .g-nm{font-weight:600;font-size:13.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
-  .grpcard .g-link,.g-link{color:#93a0ff;text-decoration:none;font-weight:400}
+  .grpcard .g-link,.g-link{color:rgb(var(--cr-93a0ff));text-decoration:none;font-weight:400}
   .grpcard .g-link{margin-left:auto;flex:none;font-size:12px}
-  .g-link:hover{color:#b4bdff;text-decoration:underline}
+  .g-link:hover{color:rgb(var(--cr-b4bdff));text-decoration:underline}
   .grpcard .g-link:hover{opacity:1}
   .grpcard .g-sub{font-size:12px;color:var(--text-muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
   .grpcard .g-sub b{color:var(--text);font-variant-numeric:tabular-nums} /* 金色只留页顶/矩阵累计列/合计行,卡内数值回中性 */
@@ -141,8 +161,8 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
   .gtag{display:inline-block;font-size:11px;color:var(--accent);border:1px solid var(--border);border-radius:6px;padding:1px 7px;vertical-align:middle}
   /* 用户悬浮卡:停在用户名上显示 用户名/邮箱/分组/备注,排版规整 */
   /* 待跟进 */
-  .fu-badge{display:inline-block;min-width:18px;padding:1px 7px;border-radius:10px;background:#ef4444;color:#fff;font-size:12px;font-weight:600;text-align:center}
-  .fu-badge.zero{background:#10b981}
+  .fu-badge{display:inline-block;min-width:18px;padding:1px 7px;border-radius:10px;background:rgb(var(--crg-ef4444));color:rgb(var(--cr-ffffff));font-size:12px;font-weight:600;text-align:center}
+  .fu-badge.zero{background:rgb(var(--crg-10b981))}
   .fu-item{display:flex;align-items:flex-start;gap:12px;padding:11px 8px;border-bottom:1px solid var(--border)}
   .fu-item:last-child{border-bottom:none}
   .fu-left{flex:none;width:22px;text-align:center;font-size:16px;padding-top:1px}
@@ -152,39 +172,39 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
   .fu-meta{font-size:12px;color:var(--text-muted);margin-top:2px}
   .fu-reasons{margin-top:6px;display:flex;flex-direction:column;gap:3px}
   .fu-r{font-size:13px}
-  .fu-r .r-why{color:#f59e0b}
+  .fu-r .r-why{color:rgb(var(--cr-f59e0b))}
   .fu-r .r-do{color:var(--text-muted);margin-left:6px}
   .fu-act{flex:none;display:flex;flex-direction:column;gap:6px;align-items:flex-end}
   /* 待跟进:公司层 → 成员层 */
   .fu-co{border-bottom:1px solid var(--border)}
   .fu-co:last-child{border-bottom:none}
   .fu-co-head{display:flex;align-items:center;gap:10px;padding:12px 8px;cursor:pointer;flex-wrap:wrap}
-  .fu-co-head:hover{background:var(--surface-2,rgba(255,255,255,.02))}
+  .fu-co-head:hover{background:var(--surface-2,rgb(var(--cra-ffffff) / calc(.02 * var(--cr-af))))}
   .fu-co-chev{flex:none;width:12px;font-size:11px;color:var(--text-muted)}
   .fu-co-name{font-weight:600;font-size:14px}
-  .fu-npeople{display:inline-block;font-size:12px;font-weight:600;padding:1px 9px;border-radius:10px;background:#ef4444;color:#fff}
+  .fu-npeople{display:inline-block;font-size:12px;font-weight:600;padding:1px 9px;border-radius:10px;background:rgb(var(--crg-ef4444));color:rgb(var(--cr-ffffff))}
   .fu-co-spend{margin-left:auto;font-size:12px;color:var(--text-muted)}
   .fu-co-reasons{padding:0 8px 8px 30px;display:flex;flex-direction:column;gap:3px}
-  .fu-members{padding-left:22px;background:var(--surface-2,rgba(255,255,255,.015))}
-  @keyframes savedFlash{0%{border-color:#10b981;box-shadow:0 0 0 2px rgba(16,185,129,.35)}100%{border-color:var(--border);box-shadow:none}}
+  .fu-members{padding-left:22px;background:var(--surface-2,rgb(var(--cra-ffffff) / calc(.015 * var(--cr-af))))}
+  @keyframes savedFlash{0%{border-color:rgb(var(--crb-10b981));box-shadow:0 0 0 2px rgb(var(--cra-10b981) / calc(.35 * var(--cr-af)))}100%{border-color:var(--border);box-shadow:none}}
   input.saved-flash{animation:savedFlash 1.1s ease-out}
   /* 跟进记录抽屉 */
-  #fuDrawer{position:fixed;top:0;right:0;width:420px;max-width:92vw;height:100%;background:var(--surface);border-left:1px solid var(--border);box-shadow:-10px 0 40px rgba(0,0,0,.5);z-index:300;display:none;flex-direction:column}
+  #fuDrawer{position:fixed;top:0;right:0;width:420px;max-width:92vw;height:100%;background:var(--surface);border-left:1px solid var(--border);box-shadow:-10px 0 40px rgb(var(--cra-000000) / calc(.5 * var(--cr-af)));z-index:300;display:none;flex-direction:column}
   #fuDrawer.on{display:flex}
   #fuDrawerHead{padding:14px 18px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:10px}
   #fuDrawerBody{flex:1;overflow:auto;padding:14px 18px}
   #fuDrawerBody .lg{padding:10px 0;border-bottom:1px solid var(--border)}
   #fuDrawerBody .lg .lg-t{font-size:12px;color:var(--text-muted)}
   #fuDrawerFoot{padding:12px 18px;border-top:1px solid var(--border)}
-  #fuMask{position:fixed;inset:0;background:rgba(0,0,0,.35);z-index:290;display:none}
+  #fuMask{position:fixed;inset:0;background:rgb(var(--cra-000000) / calc(.35 * var(--cr-af)));z-index:290;display:none}
   #fuMask.on{display:block}
-  #utip{position:fixed;z-index:200;min-width:200px;max-width:320px;background:var(--surface);border:1px solid var(--border);border-radius:10px;box-shadow:0 10px 30px rgba(0,0,0,.55);padding:11px 13px;pointer-events:none;font-size:13px;display:none}
+  #utip{position:fixed;z-index:200;min-width:200px;max-width:320px;background:var(--surface);border:1px solid var(--border);border-radius:10px;box-shadow:0 10px 30px rgb(var(--cra-000000) / calc(.55 * var(--cr-af)));padding:11px 13px;pointer-events:none;font-size:13px;display:none}
   #utip .ut-name{font-weight:600;font-size:14px;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
   #utip .ut-row{margin-top:7px;display:flex;gap:8px;font-size:12px;line-height:1.5}
   #utip .ut-k{color:var(--text-muted);flex:none;min-width:32px}
   #utip .ut-v{color:var(--text);word-break:break-all}
-  #utip .ut-note{margin-top:8px;padding-top:8px;border-top:1px solid var(--border);font-size:12px;color:#e2e8f0;line-height:1.55;white-space:pre-wrap;word-break:break-word}
-  .flatpickr-calendar{background:var(--surface);border:1px solid var(--border);box-shadow:0 8px 24px rgba(0,0,0,.5)}
+  #utip .ut-note{margin-top:8px;padding-top:8px;border-top:1px solid var(--border);font-size:12px;color:rgb(var(--cr-e2e8f0));line-height:1.55;white-space:pre-wrap;word-break:break-word}
+  .flatpickr-calendar{background:var(--surface);border:1px solid var(--border);box-shadow:0 8px 24px rgb(var(--cra-000000) / calc(.5 * var(--cr-af)))}
   .mxhead{display:inline-block;max-width:122px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;vertical-align:middle}
   .meta{font-size:12px;color:var(--text-muted);margin-left:auto}
 
@@ -215,7 +235,7 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
   details.attn-item>summary::-webkit-details-marker{display:none}
   details.attn-item>summary::before{content:'▶';color:var(--accent);font-size:13px;flex:none;width:16px;text-align:center}
   details.attn-item[open]>summary::before{content:'▼'}
-  details.attn-item>summary:hover{background:rgba(255,255,255,.02)}
+  details.attn-item>summary:hover{background:rgb(var(--cra-ffffff) / calc(.02 * var(--cr-af)))}
   .attn-detail{padding:2px 12px 10px 32px;display:flex;flex-wrap:wrap;gap:5px 14px;font-size:12px;color:var(--text-muted)}
   .attn-detail .tb b{color:var(--text);font-variant-numeric:tabular-nums;margin-right:3px}
   .attn-detail .a{color:var(--yellow)}.attn-detail .e{color:var(--red)}
@@ -233,9 +253,9 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
   .card{background:var(--surface);border:1px solid var(--border);border-radius:12px;overflow:hidden;margin-bottom:18px}
   .card-header{padding:14px 18px;border-bottom:1px solid var(--border);font-weight:600}
   table{width:100%;border-collapse:collapse}
-  th{padding:11px 14px;text-align:left;font-size:12px;text-transform:uppercase;color:var(--text-muted);background:rgba(255,255,255,.03);font-weight:500}
+  th{padding:11px 14px;text-align:left;font-size:12px;text-transform:uppercase;color:var(--text-muted);background:rgb(var(--cra-ffffff) / calc(.03 * var(--cr-af)));font-weight:500}
   td{padding:11px 14px;font-size:14px;border-top:1px solid var(--border)}
-  tr:hover td{background:rgba(255,255,255,.02)}
+  tr:hover td{background:rgb(var(--cra-ffffff) / calc(.02 * var(--cr-af)))}
   /* ── 客户排障(tab-logchain) ── */
   .lc-toolbar{display:flex;justify-content:space-between;align-items:flex-end;gap:16px;flex-wrap:wrap;margin-bottom:14px}
   .lc-toolbar h2{margin:0 0 4px;font-size:18px}
@@ -245,16 +265,16 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
   .lc-daybar button:hover:not(:disabled),.lc-filterbar button:hover:not(:disabled){border-color:var(--accent)}
   .lc-daybar button:disabled{opacity:.4;cursor:not-allowed}
   .lc-daybar input[type=date],.lc-daybar input[type=time]{background:var(--surface);color:var(--text);border:1px solid var(--border);border-radius:7px;padding:6px 9px;font-size:13px}
-  .lc-daybar input[type=date]{width:142px;color:#0f172a;background:#f8fafc;border:2px solid #60a5fa;font-weight:700;color-scheme:light}
-  .lc-daybar input[type=date]:focus{outline:2px solid #93c5fd;outline-offset:2px;border-color:#2563eb}
+  .lc-daybar input[type=date]{width:142px;color:#0f172a/*fixed*/;background:#f8fafc/*fixed*/;border:2px solid #60a5fa/*fixed*/;font-weight:700;color-scheme:light}
+  .lc-daybar input[type=date]:focus{outline:2px solid #93c5fd/*fixed*/;outline-offset:2px;border-color:#2563eb/*fixed*/}
   .lc-daybar input[type=date]::-webkit-calendar-picker-indicator{opacity:1;cursor:pointer}
-  .lc-time-range{display:flex;align-items:center;gap:6px;color:#bfdbfe;font-size:12px;background:rgba(37,99,235,.18);border:1px solid #3b82f6;border-radius:9px;padding:4px 7px;box-shadow:0 0 0 1px rgba(59,130,246,.12)}
-  .lc-time-range label{font-weight:700;color:#dbeafe}
-  .lc-time-range input[type=time]{width:112px;color:#0f172a;background:#f8fafc;border:2px solid #60a5fa;font-weight:700;color-scheme:light}
-  .lc-time-range input[type=time]:focus{outline:2px solid #93c5fd;outline-offset:2px;border-color:#2563eb}
+  .lc-time-range{display:flex;align-items:center;gap:6px;color:rgb(var(--cr-bfdbfe));font-size:12px;background:rgb(var(--cra-2563eb) / calc(.18 * var(--cr-af)));border:1px solid rgb(var(--crb-3b82f6));border-radius:9px;padding:4px 7px;box-shadow:0 0 0 1px rgb(var(--cra-3b82f6) / calc(.12 * var(--cr-af)))}
+  .lc-time-range label{font-weight:700;color:rgb(var(--cr-dbeafe))}
+  .lc-time-range input[type=time]{width:112px;color:#0f172a/*fixed*/;background:#f8fafc/*fixed*/;border:2px solid #60a5fa/*fixed*/;font-weight:700;color-scheme:light}
+  .lc-time-range input[type=time]:focus{outline:2px solid #93c5fd/*fixed*/;outline-offset:2px;border-color:#2563eb/*fixed*/}
   .lc-time-range input[type=time]::-webkit-calendar-picker-indicator{opacity:1;cursor:pointer}
-  .lc-time-range.pending{background:rgba(217,119,6,.2);border-color:#f59e0b;box-shadow:0 0 0 1px rgba(245,158,11,.16)}
-  .lc-time-hint{color:#fbbf24;font-size:12px;font-weight:600;white-space:nowrap}
+  .lc-time-range.pending{background:rgb(var(--cra-d97706) / calc(.2 * var(--cr-af)));border-color:rgb(var(--crb-f59e0b));box-shadow:0 0 0 1px rgb(var(--cra-f59e0b) / calc(.16 * var(--cr-af)))}
+  .lc-time-hint{color:rgb(var(--cr-fbbf24));font-size:12px;font-weight:600;white-space:nowrap}
   .lc-daylabel{color:var(--text-muted);font-size:13px;margin-left:4px}
   /* 客户排障摘要最长是跨日范围；固定占位避免文字长度变化把整组日期控件左右推移。 */
   #lcDateLabel{display:inline-block;width:310px;font-variant-numeric:tabular-nums;white-space:nowrap}
@@ -273,25 +293,25 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
   .lc-filterbar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:12px}
   .lc-filterbar select,.lc-filterbar input[type=text],.lc-filterbar input:not([type]){background:var(--surface);color:var(--text);border:1px solid var(--border);border-radius:7px;padding:6px 9px;font-size:13px;max-width:190px}
   .lc-filterbar input.lc-request-id{max-width:280px;min-width:220px}
-  .lc-filterbar .lc-primary{background:var(--accent);border-color:var(--accent);color:#fff}
+  .lc-filterbar .lc-primary{background:var(--accent);border-color:var(--accent);color:rgb(var(--cr-ffffff))}
   .lc-check{display:flex;align-items:center;gap:6px;font-size:13px;background:var(--surface);border:1px solid var(--border);border-radius:7px;padding:6px 10px;cursor:pointer;user-select:none}
   .lc-counter{font-size:13px;color:var(--text-muted)}
   .lc-counter b{color:var(--text)}
   .lc-counter .lc-errnum{color:var(--red)}
   .lc-status{font-size:12px;color:var(--text-muted)}
-  .lc-alert{background:rgba(239,68,68,.1);border:1px solid rgba(239,68,68,.35);color:var(--text);border-radius:9px;padding:11px 14px;font-size:13px;margin-bottom:12px}
+  .lc-alert{background:rgb(var(--cra-ef4444) / calc(.1 * var(--cr-af)));border:1px solid rgb(var(--cra-ef4444) / calc(.35 * var(--cr-af)));color:var(--text);border-radius:9px;padding:11px 14px;font-size:13px;margin-bottom:12px}
   .lc-notes{font-size:12px;color:var(--text-muted);margin-bottom:10px;display:flex;flex-direction:column;gap:3px}
   /* 范围被收窄是警告级,不能与普通提示同色:普通提示是"顺便告诉你",
      这条是"你看到的范围不是你要的范围"。看漏了会据此得出错误结论。 */
-  .lc-note-warn{color:var(--yellow,#fbbf24);font-weight:600}
+  .lc-note-warn{color:var(--yellow,rgb(var(--cr-fbbf24)));font-weight:600}
   /* 盲区提示:默认收起(自用系统,展开占地方),但标题始终可见——
      它的价值在于"你没主动去看时也知道它存在",防止"查不到"被读成"没发生过" */
-  .lc-blind{background:rgba(245,158,11,.08);border:1px solid rgba(245,158,11,.3);border-radius:9px;padding:9px 14px;margin-bottom:14px}
+  .lc-blind{background:rgb(var(--cra-f59e0b) / calc(.08 * var(--cr-af)));border:1px solid rgb(var(--cra-f59e0b) / calc(.3 * var(--cr-af)));border-radius:9px;padding:9px 14px;margin-bottom:14px}
   .lc-blind-head{font-size:12.5px;font-weight:600;color:var(--yellow);cursor:pointer;user-select:none;list-style:none}
   .lc-blind-head::-webkit-details-marker{display:none}
   .lc-blind-head::before{content:'▸ ';display:inline-block;transition:transform .15s}
   .lc-blind-details[open] .lc-blind-head::before{content:'▾ '}
-  .lc-blind-head:hover{color:#fbbf24}
+  .lc-blind-head:hover{color:rgb(var(--cr-fbbf24))}
   .lc-blind-details:focus-visible .lc-blind-head{outline:2px solid var(--yellow);outline-offset:2px;border-radius:4px}
   .lc-blind-list{margin:8px 0 2px;padding-left:18px;font-size:12px;color:var(--text-muted);line-height:1.65}
   .lc-blind-actions{display:flex;justify-content:flex-end;margin:8px 0 2px}
@@ -299,30 +319,30 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
   .lc-blind-actions button:hover{border-color:var(--accent)}
   /* 影响面判读:蓝色区分于盲区的黄色——盲区是警告(查不到),影响面是结论(集中在谁身上)。
      同样默认收起但标题常驻:形状结论本身就是最该先看见的一行。 */
-  .lc-radius{background:rgba(59,130,246,.08);border:1px solid rgba(59,130,246,.3);border-radius:9px;padding:9px 14px;margin-bottom:14px}
-  .lc-radius-head{font-size:12.5px;font-weight:600;color:var(--blue,#60a5fa);cursor:pointer;user-select:none;list-style:none}
+  .lc-radius{background:rgb(var(--cra-3b82f6) / calc(.08 * var(--cr-af)));border:1px solid rgb(var(--cra-3b82f6) / calc(.3 * var(--cr-af)));border-radius:9px;padding:9px 14px;margin-bottom:14px}
+  .lc-radius-head{font-size:12.5px;font-weight:600;color:var(--blue,rgb(var(--cr-60a5fa)));cursor:pointer;user-select:none;list-style:none}
   .lc-radius-head::-webkit-details-marker{display:none}
   .lc-radius-head::before{content:'▸ ';display:inline-block;transition:transform .15s}
   .lc-radius-details[open] .lc-radius-head::before{content:'▾ '}
-  .lc-radius-head:hover{color:#93c5fd}
-  .lc-radius-details:focus-visible .lc-radius-head{outline:2px solid var(--blue,#60a5fa);outline-offset:2px;border-radius:4px}
+  .lc-radius-head:hover{color:rgb(var(--cr-93c5fd))}
+  .lc-radius-details:focus-visible .lc-radius-head{outline:2px solid var(--blue,rgb(var(--crb-60a5fa)));outline-offset:2px;border-radius:4px}
   /* 「仅本页 N 条」必须紧跟形状结论,不能收在展开区里:
      统计范围看不见时,单页结论会被当成全窗口结论 */
   .lc-radius-sub{font-weight:400;color:var(--text-muted);margin-left:8px;font-size:11.5px}
   .lc-radius-why{margin:8px 0 4px;font-size:12px;color:var(--text-muted);line-height:1.65}
-  .lc-radius-section{margin-top:12px;padding-top:10px;border-top:1px solid rgba(148,163,184,.16)}
+  .lc-radius-section{margin-top:12px;padding-top:10px;border-top:1px solid rgb(var(--cra-94a3b8) / calc(.16 * var(--cr-af)))}
   .lc-radius-section h4{margin:0 0 7px;font-size:12px;color:var(--text);font-weight:650}
   .lc-radius-context{margin:0 0 4px;font-size:12px;line-height:1.6;color:var(--text)}
   .lc-radius-section>small,.lc-radius-faults small{display:block;color:var(--text-muted);font-size:11px;line-height:1.55}
   .lc-radius-reasons{max-width:100%}
   .lc-radius-faults{display:flex;flex-wrap:wrap;align-items:center;gap:7px;margin-top:8px;font-size:11.5px;color:var(--text-muted)}
-  .lc-radius-fault{padding:2px 7px;border:1px solid rgba(148,163,184,.22);border-radius:999px;color:var(--text)}
+  .lc-radius-fault{padding:2px 7px;border:1px solid rgb(var(--cra-94a3b8) / calc(.22 * var(--cr-af)));border-radius:999px;color:var(--text)}
   .lc-radius-faults small{flex-basis:100%}
   .lc-radius-dims{display:flex;flex-wrap:wrap;gap:14px;margin-top:8px}
   .lc-radius-dim{flex:1 1 260px;min-width:230px}
   .lc-radius-table{width:100%;border-collapse:collapse;font-size:11.5px}
-  .lc-radius-table th{text-align:left;padding:3px 6px;color:var(--text-muted);font-weight:600;border-bottom:1px solid rgba(148,163,184,.2);white-space:nowrap}
-  .lc-radius-table td{padding:3px 6px;border-bottom:1px solid rgba(148,163,184,.08)}
+  .lc-radius-table th{text-align:left;padding:3px 6px;color:var(--text-muted);font-weight:600;border-bottom:1px solid rgb(var(--cra-94a3b8) / calc(.2 * var(--cr-af)));white-space:nowrap}
+  .lc-radius-table td{padding:3px 6px;border-bottom:1px solid rgb(var(--cra-94a3b8) / calc(.08 * var(--cr-af)))}
   .lc-radius-key{word-break:break-all}
   .lc-radius-num{text-align:right;white-space:nowrap;font-variant-numeric:tabular-nums}
   /* 「其余 N 项」行:淡一档并去掉下边框,让它读起来是汇总而不是又一个渠道。
@@ -336,19 +356,19 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
        ambiguous 灰 — 无法唯一对应,只给候选数,别拿来解释故障
      配色沿用本页既有语义(绿=好/确定、黄=警示、灰=无信息),不引入新色系。 */
   .lc-corr{display:inline-block;padding:1px 6px;border-radius:3px;font-size:11.5px;font-weight:600}
-  .lc-corr-exact{background:rgba(34,197,94,.16);color:var(--green,#22c55e)}
-  .lc-corr-probable{background:rgba(251,191,36,.16);color:var(--yellow,#fbbf24)}
-  .lc-corr-ambiguous{background:rgba(148,163,184,.16);color:var(--text-muted)}
+  .lc-corr-exact{background:rgb(var(--cra-22c55e) / calc(.16 * var(--cr-af)));color:var(--green,rgb(var(--cr-22c55e)))}
+  .lc-corr-probable{background:rgb(var(--cra-fbbf24) / calc(.16 * var(--cr-af)));color:var(--yellow,rgb(var(--cr-fbbf24)))}
+  .lc-corr-ambiguous{background:rgb(var(--cra-94a3b8) / calc(.16 * var(--cr-af)));color:var(--text-muted)}
   /* 表格里的小圆点:让人不展开就知道这行有上游数据可看。
      只有点、不带文字——表格宽度已经很紧,加文字会挤掉更要紧的列。 */
   .lc-corr-dot{display:inline-block;width:6px;height:6px;border-radius:50%;margin-left:5px;vertical-align:middle}
-  .lc-corr-dot-exact{background:var(--green,#22c55e)}
-  .lc-corr-dot-probable{background:var(--yellow,#fbbf24)}
+  .lc-corr-dot-exact{background:var(--green,rgb(var(--crg-22c55e)))}
+  .lc-corr-dot-probable{background:var(--yellow,rgb(var(--crg-fbbf24)))}
   /* none 与 not_applicable 都是"没有上游数据",但含义相反:
      none 值得去查采集,not_applicable 不必查。用色区分,避免看的人白跑一趟。 */
-  .lc-corr-none{background:rgba(148,163,184,.14);color:var(--text-muted);border:1px solid rgba(148,163,184,.3)}
-  .lc-corr-na{background:rgba(148,163,184,.1);color:var(--text-muted);border:1px dashed rgba(148,163,184,.35)}
-  .lc-corr-incomplete{background:rgba(251,191,36,.12);color:var(--yellow,#fbbf24);border:1px dashed rgba(251,191,36,.35)}
+  .lc-corr-none{background:rgb(var(--cra-94a3b8) / calc(.14 * var(--cr-af)));color:var(--text-muted);border:1px solid rgb(var(--cra-94a3b8) / calc(.3 * var(--cr-af)))}
+  .lc-corr-na{background:rgb(var(--cra-94a3b8) / calc(.1 * var(--cr-af)));color:var(--text-muted);border:1px dashed rgb(var(--cra-94a3b8) / calc(.35 * var(--cr-af)))}
+  .lc-corr-incomplete{background:rgb(var(--cra-fbbf24) / calc(.12 * var(--cr-af)));color:var(--yellow,rgb(var(--cr-fbbf24)));border:1px dashed rgb(var(--cra-fbbf24) / calc(.35 * var(--cr-af)))}
 
   /* 上游侧原文折叠块,紧跟我方原文之后——同一次失败的两侧视角,挨着才好对比。
      用折叠而非"相同就隐藏":一行凭空消失与"压根没拿到上游日志"无法区分,
@@ -358,8 +378,8 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
     padding:3px 0;list-style:none}
   .lc-upraw-h
 ...[264 chars omitted]...
-;color:var(--yellow,#fbbf24);font-weight:600}
-  .lc-upraw-diff>.lc-raw{border-left:2px solid var(--yellow,#fbbf24)}
+;color:var(--yellow,rgb(var(--cr-fbbf24)));font-weight:600}
+  .lc-upraw-diff>.lc-raw{border-left:2px solid var(--yellow,rgb(var(--crb-fbbf24)))}
   .lc-radius-stale{font-size:12px;color:var(--text-muted);line-height:1.6}
   .lc-card{padding:0;overflow:hidden}
   .lc-tablewrap{overflow-x:auto}
@@ -377,58 +397,58 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
   .lc-scopebar button{background:var(--surface);color:var(--text-muted);border:0;border-radius:0;padding:6px 11px;font-size:12.5px;cursor:pointer;white-space:nowrap}
   .lc-scopebar button+button{border-left:1px solid var(--border)}
   .lc-scopebar button:hover{color:var(--text)}
-  .lc-scopebar button.active{background:var(--accent);color:#fff}
+  .lc-scopebar button.active{background:var(--accent);color:rgb(var(--cr-ffffff))}
   /* 排序按钮组：两个互斥选项做成连体，当前项高亮 */
   .lc-sortbar{display:inline-flex;border:1px solid var(--border);border-radius:7px;overflow:hidden}
   .lc-sortbar button{background:var(--surface);color:var(--text-muted);border:0;border-radius:0;padding:6px 11px;font-size:12.5px;cursor:pointer}
   .lc-sortbar button+button{border-left:1px solid var(--border)}
   .lc-sortbar button:hover{color:var(--text)}
-  .lc-sortbar button.active{background:var(--accent);color:#fff}
+  .lc-sortbar button.active{background:var(--accent);color:rgb(var(--cr-ffffff))}
   .lc-table td{vertical-align:top;word-break:break-word}
   .lc-table tbody tr[data-lc-id]{cursor:pointer}
   /* 错误行整行标红底:扫一眼就知道有没有问题 */
-  .lc-table tr.lc-err td{background:rgba(239,68,68,.07)}
-  .lc-table tr.lc-err:hover td{background:rgba(239,68,68,.12)}
+  .lc-table tr.lc-err td{background:rgb(var(--cra-ef4444) / calc(.07 * var(--cr-af)))}
+  .lc-table tr.lc-err:hover td{background:rgb(var(--cra-ef4444) / calc(.12 * var(--cr-af)))}
   /* 异常行用黄底,与错误的红底区分:错误=明确失败,异常=成功了但有问题,
      视觉上混为一谈会让人分不清"要立刻处理"和"要核查" */
-  .lc-table tr.lc-anom td{background:rgba(245,158,11,.07)}
-  .lc-table tr.lc-anom:hover td{background:rgba(245,158,11,.13)}
+  .lc-table tr.lc-anom td{background:rgb(var(--cra-f59e0b) / calc(.07 * var(--cr-af)))}
+  .lc-table tr.lc-anom:hover td{background:rgb(var(--cra-f59e0b) / calc(.13 * var(--cr-af)))}
   /* 异常标签:说明这行为什么被判为异常,可同时多个 */
   .lc-tag{display:inline-block;margin:2px 4px 0 0;padding:1px 6px;border-radius:5px;font-size:10.5px;font-weight:500;white-space:nowrap}
-  .lc-tag-stream{background:rgba(245,158,11,.16);color:var(--yellow)}
+  .lc-tag-stream{background:rgb(var(--cra-f59e0b) / calc(.16 * var(--cr-af)));color:var(--yellow)}
   /* 这里只会出现零输出且等待超过 3 秒的断连；正常取消已被后端排除。 */
-  .lc-tag-gone{background:rgba(245,158,11,.16);color:var(--yellow)}
+  .lc-tag-gone{background:rgb(var(--cra-f59e0b) / calc(.16 * var(--cr-af)));color:var(--yellow)}
   /* 归因列。用描边而非实心底色，与左侧那些「事实」标签在视觉上区分开——
      它是推断，不该和事实拥有同等的视觉确定性。 */
   .lc-fault{white-space:nowrap;vertical-align:middle}
   .lc-fault-reason{white-space:normal;line-height:1.45;margin-top:3px;max-width:30ch}
   .lc-attribution-summary{margin-top:4px}
   .lc-fault-tag{display:inline-block;padding:2px 7px;border-radius:5px;font-size:11px;font-weight:500;border:1px solid;background:transparent;cursor:help}
-  .lc-fault-up{border-color:rgba(239,68,68,.5);color:var(--red)}
-  .lc-fault-ours{border-color:rgba(245,158,11,.55);color:var(--yellow)}
-  .lc-fault-down{border-color:rgba(148,163,184,.45);color:var(--text-muted)}
-  .lc-fault-unknown{border-color:rgba(148,163,184,.28);color:var(--text-muted);opacity:.75}
+  .lc-fault-up{border-color:rgb(var(--cra-ef4444) / calc(.5 * var(--cr-af)));color:var(--red)}
+  .lc-fault-ours{border-color:rgb(var(--cra-f59e0b) / calc(.55 * var(--cr-af)));color:var(--yellow)}
+  .lc-fault-down{border-color:rgb(var(--cra-94a3b8) / calc(.45 * var(--cr-af)));color:var(--text-muted)}
+  .lc-fault-unknown{border-color:rgb(var(--cra-94a3b8) / calc(.28 * var(--cr-af)));color:var(--text-muted);opacity:.75}
   /* 低可信度整体降权：403/413 这类样本不足的映射不能与 502/503 同等呈现。 */
   .lc-fault-dim{opacity:.6;border-style:dashed}
   .lc-fault-q{margin-left:2px;font-weight:700}
-  .lc-tag-unpaid{background:rgba(239,68,68,.16);color:var(--red)}
-  .lc-tag-unbilled{background:rgba(245,158,11,.18);color:var(--yellow)}
-  .lc-tag-free{background:rgba(99,102,241,.18);color:var(--accent)}
+  .lc-tag-unpaid{background:rgb(var(--cra-ef4444) / calc(.16 * var(--cr-af)));color:var(--red)}
+  .lc-tag-unbilled{background:rgb(var(--cra-f59e0b) / calc(.18 * var(--cr-af)));color:var(--yellow)}
+  .lc-tag-free{background:rgb(var(--cra-6366f1) / calc(.18 * var(--cr-af)));color:var(--accent)}
   /* end_reason 原值:等宽字体,让 client_gone 这类枚举值一眼可辨 */
   .lc-endreason{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px;color:var(--text-muted)}
   .lc-endreason.bad{color:var(--yellow)}
   /* 请求视图：组头是“这些日志属于同一个用户请求”的归属说明，不替代逐条记录。
      用左侧竖条 + 浅底与明细行区分，避免被当成又一条日志。 */
-  .lc-reqhead td{background:rgba(148,163,184,.10);border-left:3px solid var(--accent);padding:5px 10px;font-size:11.5px}
+  .lc-reqhead td{background:rgb(var(--cra-94a3b8) / calc(.10 * var(--cr-af)));border-left:3px solid var(--accent);padding:5px 10px;font-size:11.5px}
   .lc-req-user{font-weight:700;color:var(--text)}
   .lc-req-meta{margin-left:10px;color:var(--text-muted)}
   .lc-req-outcome{margin-left:10px;font-weight:650}
-  .lc-req-ok{color:var(--green,#34d399)}
+  .lc-req-ok{color:var(--green,rgb(var(--cr-34d399)))}
   .lc-req-warn{color:var(--yellow)}
-  .lc-req-bad{color:var(--red,#f87171)}
+  .lc-req-bad{color:var(--red,rgb(var(--cr-f87171)))}
   .lc-req-noid{color:var(--text-muted);font-style:italic}
   .lc-req-partial{margin-left:10px;color:var(--yellow)}
-  .lc-table tr.lc-open td{background:rgba(99,102,241,.1)}
+  .lc-table tr.lc-open td{background:rgb(var(--cra-6366f1) / calc(.1 * var(--cr-af)))}
   .lc-sub{font-size:11px;color:var(--text-muted);margin-top:2px}
   .lc-arrow{font-size:12px;color:var(--text-muted);margin-top:3px}
   .lc-domain{color:var(--accent);font-size:12.5px}
@@ -439,7 +459,7 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
   .lc-content{font-size:12px;line-height:1.5;max-height:3.9em;overflow:hidden;color:var(--text-muted);font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
   .lc-err .lc-content{color:var(--text)}
   .lc-empty{text-align:center;padding:34px 16px;color:var(--text-muted);font-size:13px}
-  .lc-detail td{background:rgba(0,0,0,.18)!important;padding:14px 16px}
+  .lc-detail td{background:rgb(var(--cra-000000) / calc(.18 * var(--cr-af)))!important;padding:14px 16px}
   .lc-kvs{display:grid;grid-template-columns:repeat(auto-fill,minmax(190px,1fr));gap:8px 18px;margin-bottom:12px}
   .lc-kv{font-size:12px;display:flex;flex-direction:column;gap:2px}
   .lc-kv span{color:var(--text-muted)}
@@ -453,11 +473,11 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
      found=已找到；empty=查了没有（中性，不能标成错误，否则会被读成故障）；
      其余=查不了（告警色）。empty 与 unavailable 必须视觉可分。 */
   .lc-cw{margin-top:12px;padding-top:10px;border-top:1px dashed var(--border)}
-  .lc-cw b.cw-found{color:var(--ok,#4ea672)}
+  .lc-cw b.cw-found{color:var(--ok,rgb(var(--cr-4ea672)))}
   .lc-cw b.cw-empty{color:var(--text-muted)}
   .lc-cw b.cw-unavailable,.lc-cw b.cw-access_denied,.lc-cw b.cw-throttled,
-  .lc-cw b.cw-timeout,.lc-cw b.cw-invalid,.lc-cw b.cw-cancelled{color:var(--warn,#c9a227)}
-  .lc-cw-err{font-size:12px;color:var(--danger,#c0564f);margin:6px 0}
+  .lc-cw b.cw-timeout,.lc-cw b.cw-invalid,.lc-cw b.cw-cancelled{color:var(--warn,rgb(var(--cr-c9a227)))}
+  .lc-cw-err{font-size:12px;color:var(--danger,rgb(var(--cr-c0564f)));margin:6px 0}
   .lc-investigation-entry{margin:0 0 16px;padding:12px 14px;border:1px solid var(--border);border-radius:10px;background:var(--surface)}
   .lc-investigation-head{display:flex;gap:12px;align-items:center;flex-wrap:wrap}
   .lc-investigation-head .lc-sub{flex:1}
@@ -466,13 +486,13 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
   .lc-investigation-fields label{display:flex;flex-direction:column;gap:5px;font-size:12px;color:var(--text-muted)}
   .lc-investigation-fields input{min-width:0;padding:7px 9px;border:1px solid var(--border);border-radius:6px;background:var(--bg);color:var(--text)}
   .lc-investigation-time{display:flex;flex-direction:column;gap:6px;min-width:0}
-  .lc-investigation-time input{width:100%;min-height:40px;color-scheme:dark}
+  .lc-investigation-time input{width:100%;min-height:40px;color-scheme:inherit}
   .lc-investigation-time input::-webkit-calendar-picker-indicator{width:20px;height:20px;cursor:pointer}
   .lc-investigation-time .lc-jump{min-height:40px;white-space:normal;border-color:var(--accent);color:var(--text);font-size:13px}
   .lc-investigation-time .lc-jump:focus-visible,.lc-time-dialog :focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   .lc-investigation-time .lc-jump:disabled{opacity:.5;cursor:wait}
-  .lc-time-dialog{margin:auto;padding:16px;width:350px;max-width:calc(100vw - 24px);max-height:calc(100dvh - 24px);overflow:auto;border:1px solid var(--border);border-radius:12px;background:var(--surface);color:var(--text);color-scheme:dark}
-  .lc-time-dialog::backdrop{background:rgba(0,0,0,.65)}
+  .lc-time-dialog{margin:auto;padding:16px;width:350px;max-width:calc(100vw - 24px);max-height:calc(100dvh - 24px);overflow:auto;border:1px solid var(--border);border-radius:12px;background:var(--surface);color:var(--text);color-scheme:inherit}
+  .lc-time-dialog::backdrop{background:rgb(var(--cra-000000) / calc(.65 * var(--cr-af)))}
   .lc-time-dialog h3{font-size:16px;margin-bottom:8px}
   .lc-time-dialog .lc-sub{white-space:normal}
   .lc-time-calendar .flatpickr-calendar{width:100%;box-shadow:none;background:var(--surface);margin:8px 0}
@@ -480,7 +500,7 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
   .lc-time-calendar .flatpickr-day{max-width:none;flex-basis:14.2857%;color:var(--text)}
   .lc-time-calendar .flatpickr-day.prevMonthDay,.lc-time-calendar .flatpickr-day.nextMonthDay{color:var(--text-muted)}
   .lc-time-calendar .flatpickr-day:hover,.lc-time-calendar .flatpickr-day:focus{background:var(--border);border-color:var(--border)}
-  .lc-time-calendar .flatpickr-day.selected{background:var(--accent);border-color:var(--accent);color:#fff}
+  .lc-time-calendar .flatpickr-day.selected{background:var(--accent);border-color:var(--accent);color:rgb(var(--cr-ffffff))}
   .lc-time-calendar .flatpickr-month,.lc-time-calendar .flatpickr-weekday,.lc-time-calendar .flatpickr-current-month .flatpickr-monthDropdown-months{background:var(--surface);color:var(--text);fill:var(--text)}
   .lc-time-calendar .flatpickr-prev-month,.lc-time-calendar .flatpickr-next-month{padding:8px;color:var(--text);fill:var(--text)}
   .lc-time-calendar .numInputWrapper span.arrowUp:after{border-bottom-color:var(--text)}
@@ -492,11 +512,11 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
   .lc-time-dialog .lc-jump{min-height:40px}
   .lc-investigation-fields .lc-investigation-sensitive{flex-direction:row;align-items:center}
   .lc-investigation-actions{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:10px 0}
-  .lc-investigation-actions .lc-primary{background:var(--accent);border-color:var(--accent);color:#fff}
-  .lc-cw-summary{margin:8px 0;padding:9px 11px;border:1px solid var(--border);border-radius:8px;background:rgba(148,163,184,.05)}
+  .lc-investigation-actions .lc-primary{background:var(--accent);border-color:var(--accent);color:rgb(var(--cr-ffffff))}
+  .lc-cw-summary{margin:8px 0;padding:9px 11px;border:1px solid var(--border);border-radius:8px;background:rgb(var(--cra-94a3b8) / calc(.05 * var(--cr-af)))}
   .lc-cw-summary>b{font-size:13px;font-weight:600}
   /* 全链路排障默认只展示原因和位置；来源/时间线收进可选详情，避免一点击就铺满原始信息。 */
-  .lc-cw-diagnosis{margin:8px 0;padding:10px 12px;border:1px solid var(--border);border-radius:8px;background:rgba(148,163,184,.06)}
+  .lc-cw-diagnosis{margin:8px 0;padding:10px 12px;border:1px solid var(--border);border-radius:8px;background:rgb(var(--cra-94a3b8) / calc(.06 * var(--cr-af)))}
   .lc-cw-diagnosis-title{font-size:12px;color:var(--text-muted);margin-bottom:7px}
   .lc-cw-diagnosis-grid{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:10px}
   .lc-cw-diagnosis-grid>div{display:flex;flex-direction:column;gap:3px;min-width:0}
@@ -525,21 +545,21 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
   .ch-add label{font-size:13px;color:var(--text-muted)}
   .ch-add input{background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:7px;padding:6px 10px;font-size:13px;min-width:190px}
   .ch-add input:focus{outline:none;border-color:var(--accent)}
-  .ch-formerr{font-size:12px;color:var(--danger,#c0564f)}
+  .ch-formerr{font-size:12px;color:var(--danger,rgb(var(--cr-c0564f)))}
   /* 表格本体复用 .lc-table（见客户排障那一段），这里只加本页特有的格样式。
      标红沿用 .lc-table tr.lc-err td 的红底：与客户排障"错误行"同一视觉语言，
      不另造一套颜色。 */
   /* 整行可点。.lc-table 那条 cursor 规则绑的是 [data-lc-id]，本页行用
      data-ch-row，所以要自己写一条，否则鼠标停在行上没有"可点"的提示。 */
   .ch-table tbody tr[data-ch-row]{cursor:pointer}
-  .ch-table tbody tr[data-ch-row]:hover td{background:rgba(148,163,184,.07)}
-  .ch-table tr.lc-err:hover td{background:rgba(239,68,68,.12)}
+  .ch-table tbody tr[data-ch-row]:hover td{background:rgb(var(--cra-94a3b8) / calc(.07 * var(--cr-af)))}
+  .ch-table tr.lc-err:hover td{background:rgb(var(--cra-ef4444) / calc(.12 * var(--cr-af)))}
   .ch-company{font-weight:500}
   .ch-company .ch-arrow{color:var(--text-muted);font-size:11px;margin-right:5px}
   .ch-mix span{font-size:11px;padding:1px 5px;border-radius:4px;margin-right:3px;white-space:nowrap}
-  .ch-mix .ok{background:rgba(16,185,129,.13);color:var(--green,#34d399)}
-  .ch-mix .anom{background:rgba(245,158,11,.16);color:var(--yellow)}
-  .ch-mix .fail{background:rgba(239,68,68,.16);color:var(--red)}
+  .ch-mix .ok{background:rgb(var(--cra-10b981) / calc(.13 * var(--cr-af)));color:var(--green,rgb(var(--cr-34d399)))}
+  .ch-mix .anom{background:rgb(var(--cra-f59e0b) / calc(.16 * var(--cr-af)));color:var(--yellow)}
+  .ch-mix .fail{background:rgb(var(--cra-ef4444) / calc(.16 * var(--cr-af)));color:var(--red)}
   .ch-impact{display:block;margin-top:4px;font-size:10.5px;color:var(--text-muted);line-height:1.4}
   .ch-primary-model{display:flex;flex-direction:column;gap:2px;min-width:0}
   .ch-primary-model b{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12.5px}
@@ -568,18 +588,18 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
   .ch-conf{font-size:11px;color:var(--text-muted)}
   .ch-none{color:var(--text-muted)}
   .ch-reason-why{font-size:12px;color:var(--text-muted);line-height:1.6;margin-left:104px}
-  .ch-scope{font-size:12px;padding:2px 8px;border-radius:6px;background:rgba(128,128,128,.12)}
-  .ch-scope-only_this_customer{background:rgba(192,86,79,.15);color:var(--danger,#c0564f)}
-  .ch-scope-all_customers{background:rgba(245,158,11,.15);color:var(--yellow,#c9a227)}
-  .ch-scope-no_problem{background:rgba(16,185,129,.13);color:var(--green,#4ea672)}
+  .ch-scope{font-size:12px;padding:2px 8px;border-radius:6px;background:rgb(var(--cra-808080) / calc(.12 * var(--cr-af)))}
+  .ch-scope-only_this_customer{background:rgb(var(--cra-c0564f) / calc(.15 * var(--cr-af)));color:var(--danger,rgb(var(--cr-c0564f)))}
+  .ch-scope-all_customers{background:rgb(var(--cra-f59e0b) / calc(.15 * var(--cr-af)));color:var(--yellow,rgb(var(--cr-c9a227)))}
+  .ch-scope-no_problem{background:rgb(var(--cra-10b981) / calc(.13 * var(--cr-af)));color:var(--green,rgb(var(--cr-4ea672)))}
   .ch-list{padding:10px 0;border-top:1px dashed var(--border)}
   .ch-member{display:flex;align-items:center;gap:10px;padding:4px 0;font-size:13px}
   .ch-mid{color:var(--text-muted);font-size:12px;min-width:52px}
   .ch-mname{flex:1}
   .ch-mini{background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:3px 10px;font-size:12px;cursor:pointer}
   .ch-mini:hover{border-color:var(--accent)}
-  .ch-mini.ch-danger{color:var(--danger,#c0564f)}
-  .ch-mini.ch-danger:hover{border-color:var(--danger,#c0564f)}
+  .ch-mini.ch-danger{color:var(--danger,rgb(var(--cr-c0564f)))}
+  .ch-mini.ch-danger:hover{border-color:var(--danger,rgb(var(--crb-c0564f)))}
   .ch-edit{display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:10px 0;border-top:1px dashed var(--border)}
   .ch-edit label{font-size:12px;color:var(--text-muted);display:flex;align-items:center;gap:6px}
   .ch-edit input{background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:5px 9px;font-size:13px;min-width:170px}
@@ -590,51 +610,52 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
   .lc-more button:hover{border-color:var(--accent)}
   .lc-toast{position:fixed;bottom:26px;left:50%;transform:translateX(-50%);background:var(--surface);border:1px solid var(--accent);color:var(--text);padding:9px 18px;border-radius:9px;font-size:13px;z-index:60}
   .badge{display:inline-block;padding:2px 8px;border-radius:6px;font-size:12px;font-weight:500}
-  .badge-green{background:rgba(16,185,129,.15);color:var(--green)}
-  .badge-yellow{background:rgba(245,158,11,.15);color:var(--yellow)}
-  .badge-red{background:rgba(239,68,68,.15);color:var(--red)}
-  .badge-muted{background:rgba(148,163,184,.13);color:var(--text-muted)} /* 未达门槛的交付异常:看得见但不抢眼 */
-  .badge-gray{background:rgba(148,163,184,.1);color:var(--text-muted)}
+  .badge-green{background:rgb(var(--cra-10b981) / calc(.15 * var(--cr-af)));color:var(--green)}
+  .badge-yellow{background:rgb(var(--cra-f59e0b) / calc(.15 * var(--cr-af)));color:var(--yellow)}
+  .badge-red{background:rgb(var(--cra-ef4444) / calc(.15 * var(--cr-af)));color:var(--red)}
+  .badge-muted{background:rgb(var(--cra-94a3b8) / calc(.13 * var(--cr-af)));color:var(--text-muted)} /* 未达门槛的交付异常:看得见但不抢眼 */
+  .badge-gray{background:rgb(var(--cra-94a3b8) / calc(.1 * var(--cr-af)));color:var(--text-muted)}
   .emix span{font-size:11px;padding:1px 5px;border-radius:4px;margin-right:3px;white-space:nowrap}
-  .e4{background:rgba(245,158,11,.15);color:var(--yellow)}.e5{background:rgba(239,68,68,.15);color:var(--red)}
-  .eto{background:rgba(99,102,241,.15);color:var(--accent)}.eo{background:rgba(148,163,184,.12);color:var(--text-muted)}
+  .e4{background:rgb(var(--cra-f59e0b) / calc(.15 * var(--cr-af)));color:var(--yellow)}.e5{background:rgb(var(--cra-ef4444) / calc(.15 * var(--cr-af)));color:var(--red)}
+  .eto{background:rgb(var(--cra-6366f1) / calc(.15 * var(--cr-af)));color:var(--accent)}.eo{background:rgb(var(--cra-94a3b8) / calc(.12 * var(--cr-af)));color:var(--text-muted)}
   .lat-warn{color:var(--yellow)}.lat-bad{color:var(--red)}
   .drill-arrow{color:var(--accent);font-size:11px;display:inline-block;width:12px}
-  tr.drillable{cursor:pointer}tr.drillable:hover td{background:rgba(255,255,255,.03)}
-  .alert{padding:12px 16px;border-radius:8px;margin-bottom:16px;font-size:14px;background:rgba(239,68,68,.1);border:1px solid rgba(239,68,68,.3);color:var(--red)}
-  .usage-sync-note{display:flex;align-items:center;gap:10px;padding:10px 14px;margin:0 0 12px;border:1px solid rgba(245,158,11,.32);border-radius:8px;background:rgba(245,158,11,.09);color:#d6d9e2;font-size:13px;line-height:1.45}
-  .usage-sync-note b{color:#fbbf24;white-space:nowrap}.usage-sync-note span{color:var(--text-muted)}
-  .usage-facts-state{display:flex;align-items:center;gap:12px;padding:10px 14px;margin:0 0 10px;border:1px solid rgba(99,102,241,.32);border-radius:8px;background:rgba(99,102,241,.09);font-size:13px;line-height:1.45}
-  .usage-facts-state b{color:#a5b4fc;white-space:nowrap}.usage-facts-state span{color:var(--text-muted)}
-  .usage-facts-state.ok{border-color:rgba(52,211,153,.28);background:rgba(52,211,153,.07)}.usage-facts-state.ok b{color:#6ee7b7}
-  .usage-facts-state.warn{border-color:rgba(245,158,11,.32);background:rgba(245,158,11,.09)}.usage-facts-state.warn b{color:#fbbf24}
-  .usage-facts-progress{width:120px;height:5px;flex:0 0 120px;overflow:hidden;border-radius:999px;background:#272b39}.usage-facts-progress i{display:block;height:100%;border-radius:inherit;background:#818cf8}
-  .usage-history-detail{margin:-3px 0 12px;padding:10px 14px;border:1px solid var(--border);border-radius:8px;background:rgba(255,255,255,.018);font-size:12px}
-  .usage-history-detail summary{cursor:pointer;color:#c7d2fe;font-weight:600}.usage-history-detail table{margin-top:9px}.usage-history-detail th,.usage-history-detail td{padding:7px 9px;font-size:12px}.usage-history-detail .history-error{max-width:320px;color:#fca5a5;white-space:normal;word-break:break-word}
-  .usage-history-inline{display:flex;gap:7px;align-items:center;flex-wrap:wrap}.usage-history-inline .badge{font-size:11px}.usage-history-retry{border:0;border-radius:5px;background:rgba(239,68,68,.18);color:#fca5a5;padding:3px 7px;cursor:pointer}.usage-history-retry:disabled{opacity:.5;cursor:wait}
+  tr.drillable{cursor:pointer}tr.drillable:hover td{background:rgb(var(--cra-ffffff) / calc(.03 * var(--cr-af)))}
+  .alert{padding:12px 16px;border-radius:8px;margin-bottom:16px;font-size:14px;background:rgb(var(--cra-ef4444) / calc(.1 * var(--cr-af)));border:1px solid rgb(var(--cra-ef4444) / calc(.3 * var(--cr-af)));color:var(--red)}
+  .usage-sync-note{display:flex;align-items:center;gap:10px;padding:10px 14px;margin:0 0 12px;border:1px solid rgb(var(--cra-f59e0b) / calc(.32 * var(--cr-af)));border-radius:8px;background:rgb(var(--cra-f59e0b) / calc(.09 * var(--cr-af)));color:rgb(var(--cr-d6d9e2));font-size:13px;line-height:1.45}
+  .usage-sync-note b{color:rgb(var(--cr-fbbf24));white-space:nowrap}.usage-sync-note span{color:var(--text-muted)}
+  .usage-facts-state{display:flex;align-items:center;gap:12px;padding:10px 14px;margin:0 0 10px;border:1px solid rgb(var(--cra-6366f1) / calc(.32 * var(--cr-af)));border-radius:8px;background:rgb(var(--cra-6366f1) / calc(.09 * var(--cr-af)));font-size:13px;line-height:1.45}
+  .usage-facts-state b{color:rgb(var(--cr-a5b4fc));white-space:nowrap}.usage-facts-state span{color:var(--text-muted)}
+  .usage-facts-state.ok{border-color:rgb(var(--cra-34d399) / calc(.28 * var(--cr-af)));background:rgb(var(--cra-34d399) / calc(.07 * var(--cr-af)))}.usage-facts-state.ok b{color:rgb(var(--cr-6ee7b7))}
+  .usage-facts-state.warn{border-color:rgb(var(--cra-f59e0b) / calc(.32 * var(--cr-af)));background:rgb(var(--cra-f59e0b) / calc(.09 * var(--cr-af)))}.usage-facts-state.warn b{color:rgb(var(--cr-fbbf24))}
+  .usage-facts-progress{width:120px;height:5px;flex:0 0 120px;overflow:hidden;border-radius:999px;background:rgb(var(--crg-272b39))}.usage-facts-progress i{display:block;height:100%;border-radius:inherit;background:rgb(var(--crg-818cf8))}
+  .usage-history-detail{margin:-3px 0 12px;padding:10px 14px;border:1px solid var(--border);border-radius:8px;background:rgb(var(--cra-ffffff) / calc(.018 * var(--cr-af)));font-size:12px}
+  .usage-history-detail summary{cursor:pointer;color:rgb(var(--cr-c7d2fe));font-weight:600}.usage-history-detail table{margin-top:9px}.usage-history-detail th,.usage-history-detail td{padding:7px 9px;font-size:12px}.usage-history-detail .history-error{max-width:320px;color:rgb(var(--cr-fca5a5));white-space:normal;word-break:break-word}
+  .usage-history-inline{display:flex;gap:7px;align-items:center;flex-wrap:wrap}.usage-history-inline .badge{font-size:11px}.usage-history-retry{border:0;border-radius:5px;background:rgb(var(--cra-ef4444) / calc(.18 * var(--cr-af)));color:rgb(var(--cr-fca5a5));padding:3px 7px;cursor:pointer}.usage-history-retry:disabled{opacity:.5;cursor:wait}
   .sync-toolbar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin:0 0 14px}.sync-toolbar .muted{font-size:12px}.sync-toolbar .btn{margin-left:auto}
-  .sync-overview{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-bottom:14px}.sync-card{min-height:112px;padding:15px 16px;border:1px solid var(--border);border-radius:10px;background:rgba(255,255,255,.018)}.sync-card small{display:block;color:var(--text-muted);font-size:12px}.sync-card b{display:block;margin-top:10px;font-size:20px;line-height:1.25}.sync-card p{margin:7px 0 0;color:var(--text-muted);font-size:12px;line-height:1.45}.sync-card.ok{border-color:rgba(52,211,153,.30);background:rgba(52,211,153,.055)}.sync-card.warn{border-color:rgba(245,158,11,.32);background:rgba(245,158,11,.055)}.sync-card.bad{border-color:rgba(239,68,68,.34);background:rgba(239,68,68,.06)}.sync-card.neutral{border-color:var(--border);background:rgba(148,163,184,.035)}
-  .sync-status{display:inline-flex;align-items:center;gap:6px;font-size:12px;font-weight:600}.sync-status:before{content:'';width:8px;height:8px;border-radius:50%;background:#94a3b8}.sync-status.ok{color:#6ee7b7}.sync-status.ok:before{background:#34d399}.sync-status.warn{color:#fbbf24}.sync-status.warn:before{background:#f59e0b}.sync-status.bad{color:#fca5a5}.sync-status.bad:before{background:#ef4444}.sync-status.neutral{color:#94a3b8}.sync-section{margin-bottom:14px}.sync-section .card-header{display:flex;align-items:center;gap:9px}.sync-section .card-header .muted{font-size:12px;font-weight:400}.sync-kv{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:1px;background:var(--border)}.sync-kv>div{min-width:0;padding:12px 14px;background:var(--card)}.sync-kv small{display:block;color:var(--text-muted);font-size:11px}.sync-kv b{display:block;margin-top:5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:14px}.sync-table-note{padding:10px 14px;color:var(--text-muted);font-size:12px}
-  .sync-upstream-summary{display:grid;grid-template-columns:repeat(auto-fit,minmax(145px,1fr));gap:1px;background:var(--border);border-bottom:1px solid var(--border)}.sync-upstream-summary>div{padding:12px 14px;background:var(--card)}.sync-upstream-summary small{display:block;color:var(--text-muted);font-size:11px}.sync-upstream-summary b{display:block;margin-top:5px;font-size:18px}.sync-upstream-list{display:flex;flex-direction:column}.sync-upstream-account{padding:15px 16px;border-top:1px solid var(--border)}.sync-upstream-account:first-child{border-top:0}.sync-upstream-head{display:flex;align-items:flex-start;justify-content:space-between;gap:14px;margin-bottom:12px}.sync-upstream-head>div b{display:block;font-size:15px}.sync-upstream-head>div small{display:block;margin-top:4px;color:var(--text-muted);font-size:11px}.sync-upstream-lanes{display:grid;grid-template-columns:1fr 1.45fr;gap:10px}.sync-upstream-lane{min-width:0;padding:12px 13px;border:1px solid var(--border);border-radius:8px;background:rgba(255,255,255,.018)}.sync-upstream-lane>header{display:flex;align-items:center;justify-content:space-between;gap:10px}.sync-upstream-lane>header b{font-size:12px}.sync-upstream-lane>strong{display:block;margin-top:10px;font-size:15px}.sync-upstream-lane>p{margin:5px 0 0;color:var(--text-muted);font-size:11px;line-height:1.55}.sync-upstream-error{margin-top:8px;padding-top:8px;border-top:1px solid var(--border);color:#fca5a5!important;overflow-wrap:anywhere}.sync-upstream-note{margin-top:8px;padding-top:8px;border-top:1px solid var(--border);color:var(--text-muted)!important;overflow-wrap:anywhere}.sync-upstream-progress{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:10px}.sync-upstream-progress span{padding:8px 9px;border-radius:6px;background:rgba(255,255,255,.025)}.sync-upstream-progress small,.sync-upstream-progress b{display:block}.sync-upstream-progress small{color:var(--text-muted);font-size:10px}.sync-upstream-progress b{margin-top:4px;font-size:12px}.sync-upstream-keys{margin-top:10px;border-top:1px solid var(--border);padding-top:9px}.sync-upstream-keys summary{cursor:pointer;color:var(--text-muted);font-size:11px}.sync-upstream-key{display:grid;grid-template-columns:minmax(100px,1.2fr) minmax(90px,.8fr) minmax(120px,1fr);gap:8px;margin-top:7px;padding:8px 9px;border-radius:6px;background:rgba(255,255,255,.025);font-size:10px}.sync-upstream-key b,.sync-upstream-key span,.sync-upstream-key small{min-width:0;overflow-wrap:anywhere}.sync-upstream-key span,.sync-upstream-key small{color:var(--text-muted)}
+  .sync-overview{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-bottom:14px}.sync-card{min-height:112px;padding:15px 16px;border:1px solid var(--border);border-radius:10px;background:rgb(var(--cra-ffffff) / calc(.018 * var(--cr-af)))}.sync-card small{display:block;color:var(--text-muted);font-size:12px}.sync-card b{display:block;margin-top:10px;font-size:20px;line-height:1.25}.sync-card p{margin:7px 0 0;color:var(--text-muted);font-size:12px;line-height:1.45}.sync-card.ok{border-color:rgb(var(--cra-34d399) / calc(.30 * var(--cr-af)));background:rgb(var(--cra-34d399) / calc(.055 * var(--cr-af)))}.sync-card.warn{border-color:rgb(var(--cra-f59e0b) / calc(.32 * var(--cr-af)));background:rgb(var(--cra-f59e0b) / calc(.055 * var(--cr-af)))}.sync-card.bad{border-color:rgb(var(--cra-ef4444) / calc(.34 * var(--cr-af)));background:rgb(var(--cra-ef4444) / calc(.06 * var(--cr-af)))}.sync-card.neutral{border-color:var(--border);background:rgb(var(--cra-94a3b8) / calc(.035 * var(--cr-af)))}
+  .sync-status{display:inline-flex;align-items:center;gap:6px;font-size:12px;font-weight:600}.sync-status:before{content:'';width:8px;height:8px;border-radius:50%;background:rgb(var(--crg-94a3b8))}.sync-status.ok{color:rgb(var(--cr-6ee7b7))}.sync-status.ok:before{background:rgb(var(--crg-34d399))}.sync-status.warn{color:rgb(var(--cr-fbbf24))}.sync-status.warn:before{background:rgb(var(--crg-f59e0b))}.sync-status.bad{color:rgb(var(--cr-fca5a5))}.sync-status.bad:before{background:rgb(var(--crg-ef4444))}.sync-status.neutral{color:rgb(var(--cr-94a3b8))}.sync-section{margin-bottom:14px}.sync-section .card-header{display:flex;align-items:center;gap:9px}.sync-section .card-header .muted{font-size:12px;font-weight:400}.sync-kv{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:1px;background:var(--border)}.sync-kv>div{min-width:0;padding:12px 14px;background:var(--card)}.sync-kv small{display:block;color:var(--text-muted);font-size:11px}.sync-kv b{display:block;margin-top:5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:14px}.sync-table-note{padding:10px 14px;color:var(--text-muted);font-size:12px}
+  .sync-upstream-summary{display:grid;grid-template-columns:repeat(auto-fit,minmax(145px,1fr));gap:1px;background:var(--border);border-bottom:1px solid var(--border)}.sync-upstream-summary>div{padding:12px 14px;background:var(--card)}.sync-upstream-summary small{display:block;color:var(--text-muted);font-size:11px}.sync-upstream-summary b{display:block;margin-top:5px;font-size:18px}.sync-upstream-list{display:flex;flex-direction:column}.sync-upstream-account{padding:15px 16px;border-top:1px solid var(--border)}.sync-upstream-account:first-child{border-top:0}.sync-upstream-head{display:flex;align-items:flex-start;justify-content:space-between;gap:14px;margin-bottom:12px}.sync-upstream-head>div b{display:block;font-size:15px}.sync-upstream-head>div small{display:block;margin-top:4px;color:var(--text-muted);font-size:11px}.sync-upstream-lanes{display:grid;grid-template-columns:1fr 1.45fr;gap:10px}.sync-upstream-lane{min-width:0;padding:12px 13px;border:1px solid var(--border);border-radius:8px;background:rgb(var(--cra-ffffff) / calc(.018 * var(--cr-af)))}.sync-upstream-lane>header{display:flex;align-items:center;justify-content:space-between;gap:10px}.sync-upstream-lane>header b{font-size:12px}.sync-upstream-lane>strong{display:block;margin-top:10px;font-size:15px}.sync-upstream-lane>p{margin:5px 0 0;color:var(--text-muted);font-size:11px;line-height:1.55}.sync-upstream-error{margin-top:8px;padding-top:8px;border-top:1px solid var(--border);color:rgb(var(--cr-fca5a5))!important;overflow-wrap:anywhere}.sync-upstream-note{margin-top:8px;padding-top:8px;border-top:1px solid var(--border);color:var(--text-muted)!important;overflow-wrap:anywhere}.sync-upstream-progress{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:10px}.sync-upstream-progress span{padding:8px 9px;border-radius:6px;background:rgb(var(--cra-ffffff) / calc(.025 * var(--cr-af)))}.sync-upstream-progress small,.sync-upstream-progress b{display:block}.sync-upstream-progress small{color:var(--text-muted);font-size:10px}.sync-upstream-progress b{margin-top:4px;font-size:12px}.sync-upstream-keys{margin-top:10px;border-top:1px solid var(--border);padding-top:9px}.sync-upstream-keys summary{cursor:pointer;color:var(--text-muted);font-size:11px}.sync-upstream-key{display:grid;grid-template-columns:minmax(100px,1.2fr) minmax(90px,.8fr) minmax(120px,1fr);gap:8px;margin-top:7px;padding:8px 9px;border-radius:6px;background:rgb(var(--cra-ffffff) / calc(.025 * var(--cr-af)));font-size:10px}.sync-upstream-key b,.sync-upstream-key span,.sync-upstream-key small{min-width:0;overflow-wrap:anywhere}.sync-upstream-key span,.sync-upstream-key small{color:var(--text-muted)}
   @media(max-width:900px){.sync-overview,.sync-upstream-summary{grid-template-columns:repeat(2,minmax(0,1fr))}.sync-kv{grid-template-columns:repeat(2,minmax(0,1fr))}.sync-upstream-lanes{grid-template-columns:1fr}}@media(max-width:520px){.sync-overview,.sync-kv,.sync-upstream-summary{grid-template-columns:1fr}.sync-toolbar .btn{margin-left:0}.sync-upstream-head{flex-direction:column}.sync-upstream-progress{grid-template-columns:1fr}}
-  code{background:rgba(255,255,255,.06);padding:1px 5px;border-radius:4px;font-size:12px}
+  code{background:rgb(var(--cra-ffffff) / calc(.06 * var(--cr-af)));padding:1px 5px;border-radius:4px;font-size:12px}
   .tabs{display:flex;gap:4px;margin:16px 0 0;border-bottom:1px solid var(--border)}
   .tabs .tab{padding:10px 20px;font-size:14px;color:var(--text-muted);cursor:pointer;border-bottom:2px solid transparent;user-select:none}
   .tabs .tab:hover{color:var(--text)}
   .tabs .tab.active{color:var(--text);border-bottom-color:var(--accent);font-weight:600}
   .tabpane[hidden]{display:none}
 </style>
-<link rel="stylesheet" href="/stability.css?v=18">
-<link rel="stylesheet" href="/capacity.css?v=2">
-<link rel="stylesheet" href="/group-governance.css?v=1">
-<link rel="stylesheet" href="/usage-logs.css?v=4">
-<link rel="stylesheet" href="/finance.css?v=14">
-<link rel="stylesheet" href="/model-statistics.css?v=6">
-<link rel="stylesheet" href="/model-frt.css?v=1">
-<link rel="stylesheet" href="/token-anomaly.css?v=1">
-<link rel="stylesheet" href="/incident.css?v=1">
+<link rel="stylesheet" href="/stability.css?v=19">
+<link rel="stylesheet" href="/capacity.css?v=3">
+<link rel="stylesheet" href="/group-governance.css?v=2">
+<link rel="stylesheet" href="/usage-logs.css?v=5">
+<link rel="stylesheet" href="/finance.css?v=15">
+<link rel="stylesheet" href="/model-statistics.css?v=7">
+<link rel="stylesheet" href="/model-frt.css?v=2">
+<link rel="stylesheet" href="/token-anomaly.css?v=2">
+<link rel="stylesheet" href="/incident.css?v=2">
 </head>
 <body theme-mode="dark">
+<script>if(document.documentElement.getAttribute('data-theme')==='light')document.body.removeAttribute('theme-mode')</script>
 <div class="monitor-shell">
   <aside class="monitor-sidebar" aria-label="Monitor 导航">
     <div class="monitor-brand">
@@ -669,7 +690,12 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
         <div class="monitor-page-icon" id="monitorPageIcon" aria-hidden="true"></div>
         <div><h1 id="monitorPageTitle">用户用量</h1><p id="monitorPageSubtitle">客户余额、每日消费、成员矩阵与用量明细</p></div>
       </div>
-      <div class="monitor-head-meta"><i></i><span>Monitor 管理端</span></div>
+      <div class="monitor-head-actions">
+        <div class="monitor-head-meta"><i></i><span>Monitor 管理端</span></div>
+        <button type="button" class="monitor-theme-btn" id="monitorThemeButton" title="主题设置" aria-label="主题设置">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>
+        </button>
+      </div>
     </header>
 
     <nav class="tabs monitor-mobile-tabs" aria-label="Monitor 导航">
@@ -1668,13 +1694,13 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
       <div class="monitor-table-scroll monitor-table-medium"><table><thead id="thUsageDaily"></thead><tbody id="tbUsageDaily"></tbody></table></div>
     </div>
     <div class="card" id="usageMemCard" hidden>
-      <div class="card-header">👥 组内成员 <span class="muted" style="font-weight:400;font-size:12px">· 行=成员,列=日期,格=当日消费(美元)· 点成员看明细(与该客户在报表页看到的一致)</span><span id="usageMemState" class="muted" style="font-weight:400;font-size:12px;color:#fbbf24"></span></div>
+      <div class="card-header">👥 组内成员 <span class="muted" style="font-weight:400;font-size:12px">· 行=成员,列=日期,格=当日消费(美元)· 点成员看明细(与该客户在报表页看到的一致)</span><span id="usageMemState" class="muted" style="font-weight:400;font-size:12px;color:rgb(var(--cr-fbbf24))"></span></div>
       <div class="mxwrap"><table id="usageMemMxTable"><thead id="thUsageMemMx"></thead><tbody id="tbUsageMemMx"></tbody></table></div>
     </div>
     <div class="card" id="usageMemRankCard" hidden><div class="card-header">🏆 成员消耗排行 <span class="muted" style="font-weight:400;font-size:12px">· 范围内消耗 Top 10</span></div><div id="usageMemRankChart" style="min-height:180px;padding:6px 10px"></div></div>
     <div class="card"><div class="card-header">按分组</div><div id="usageGrpPie" style="height:230px;padding:4px" hidden></div><div class="monitor-table-scroll monitor-table-medium"><table><thead id="thUsageGrp"></thead><tbody id="tbUsageGrp"></tbody></table></div></div>
     <div class="card"><div class="card-header">按模型</div><div id="usageModelPie" style="height:230px;padding:4px" hidden></div><div class="monitor-table-scroll monitor-table-medium"><table><thead id="thUsageModel"></thead><tbody id="tbUsageModel"></tbody></table></div></div>
-    <div class="card" id="usageTokCard"><div class="card-header">按令牌 <span class="muted" style="font-weight:400;font-size:12px">· 该用户各令牌用量,密钥已脱敏;点令牌名看单令牌详情</span><span id="usageTokState" class="muted" style="font-weight:400;font-size:12px;color:#fbbf24"></span></div><div class="monitor-table-scroll monitor-table-admin"><table><thead id="thUsageTok"></thead><tbody id="tbUsageTok"></tbody></table></div></div>
+    <div class="card" id="usageTokCard"><div class="card-header">按令牌 <span class="muted" style="font-weight:400;font-size:12px">· 该用户各令牌用量,密钥已脱敏;点令牌名看单令牌详情</span><span id="usageTokState" class="muted" style="font-weight:400;font-size:12px;color:rgb(var(--cr-fbbf24))"></span></div><div class="monitor-table-scroll monitor-table-admin"><table><thead id="thUsageTok"></thead><tbody id="tbUsageTok"></tbody></table></div></div>
   </div>
 </div>
 
@@ -1684,7 +1710,7 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
 
 <script src="/view-refresh.js?v=1"></script>
 <script src="/quantile_display.js?v=1"></script>
-<script src="/stability.js?v=8"></script>
+<script src="/stability.js?v=9"></script>
 <script src="/channel-data-status.js?v=3"></script>
 <script src="/channel-pricing-observations.js?v=1"></script>
 <script src="/channel-management.js?v=22"></script>
@@ -2314,7 +2340,7 @@ function renderContainerDetails(res){
   return `<div style="margin:6px 0 14px"><div style="font-size:13px;font-weight:700;margin-bottom:8px">关键容器明细 <span class="muted" style="font-weight:400">· 仅显示 HostAgent 白名单</span></div>`
     +`<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:8px">${rows.map(c=>{
       const st=c.status||'nosample', health=c.health?` · health ${esc(c.health)}`:'';
-      return `<div style="border:1px solid #303542;border-radius:8px;padding:9px 11px;background:#171a21;display:flex;justify-content:space-between;gap:12px">`
+      return `<div style="border:1px solid rgb(var(--crb-303542));border-radius:8px;padding:9px 11px;background:rgb(var(--crg-171a21));display:flex;justify-content:space-between;gap:12px">`
         +`<span>${infraBadge(st)} <b>${esc(c.name)}</b></span>`
         +`<span class="muted" style="text-align:right">${esc(c.state||'unknown')}${health} · 重启 ${Number(c.restart_count||0)} · ${fmtAge(c.age_sec)}</span></div>`;
     }).join('')}</div></div>`;
@@ -2330,7 +2356,7 @@ function renderResCharts(host,res,defKey){
   groupSel[res.name]=sel;
   const opts=groups.map(g=>`<option value="${g.k}"${g.k===sel?' selected':''}>${g.label}（${g.metrics.map(mm=>mm.label).join(' / ')}）</option>`).join('');
   host.innerHTML=containerHTML+`<div style="display:flex;align-items:center;gap:8px;margin:6px 0 10px"><span class="muted" style="font-size:12px">指标组</span>`
-    +`<select class="mc-sel" style="background:#1a1d24;color:#ddd;border:1px solid #333;border-radius:6px;padding:3px 8px;font-size:12px">${opts}</select></div>`
+    +`<select class="mc-sel" style="background:rgb(var(--crg-1a1d24));color:rgb(var(--cr-dddddd));border:1px solid rgb(var(--crb-333333));border-radius:6px;padding:3px 8px;font-size:12px">${opts}</select></div>`
     +`<div class="mc-charts" style="display:flex;gap:24px;flex-wrap:wrap"></div>`;
   const selEl=host.querySelector('.mc-sel');
   selEl.addEventListener('change',()=>{groupSel[res.name]=selEl.value;drawGroup(host,res,groups.find(g=>g.k===selEl.value));});
@@ -2531,10 +2557,10 @@ function renderInfra(s){
     if(me.containers_total!=null){const up=me.containers_up!=null?me.containers_up:0,tot=me.containers_total;contHtml=`<span style="${up<tot?'color:var(--red)':'color:var(--green)'}">${isECS?'任务 ':''}${fx(up)}/${fx(tot)}</span>`;}
     const open=instExpanded.has(r.name);
     const caret=`<span style="display:inline-block;width:14px;color:#888;transition:transform .15s;${open?'transform:rotate(90deg)':''}">▶</span>`;
-    const groupHeader=idx===0||insts[idx-1].group!==r.group?`<tr><td colspan="11" style="background:#171b25;padding:9px 14px;color:#aeb8d0"><b>${esc(r.group||'其他资源')}</b></td></tr>`:'';
+    const groupHeader=idx===0||insts[idx-1].group!==r.group?`<tr><td colspan="11" style="background:rgb(var(--crg-171b25));padding:9px 14px;color:rgb(var(--cr-aeb8d0))"><b>${esc(r.group||'其他资源')}</b></td></tr>`:'';
     return groupHeader+`<tr class="inst-row" data-name="${esc(r.name)}" style="cursor:pointer">`
       +`<td>${caret}</td><td><b>${esc(r.display_name||r.name)}</b><div class="muted" style="font-size:11px">${esc(r.platform||'Lightsail')} ${infraCoverageNote(r)}</div></td><td>${infraBadge(r.status)}</td><td>${cpuHtml}</td><td>${burstHtml}</td><td>${memHtml}</td><td>${diskHtml}</td><td>${loadHtml}</td><td>${contHtml}</td><td>${me.net_out_kb!=null?fx(me.net_out_kb)+' KB/s':missingMetric}</td><td class="muted">${fmtAge(r.age_sec)}</td></tr>`
-      +`<tr class="inst-exp" data-name="${esc(r.name)}"${open?'':' style="display:none"'}><td colspan="11" style="background:#15171c;padding:8px 20px 14px"><div class="inst-zone"></div></td></tr>`;
+      +`<tr class="inst-exp" data-name="${esc(r.name)}"${open?'':' style="display:none"'}><td colspan="11" style="background:rgb(var(--crg-15171c));padding:8px 20px 14px"><div class="inst-zone"></div></td></tr>`;
   }).join('');
     // 绑定点击展开 + 还原已展开行的图
     insts.forEach(r=>{
@@ -3192,7 +3218,7 @@ function renderGroupsManage(){
   if(!rows.length){e.innerHTML=`<tr><td colspan="8" class="muted" style="text-align:center;padding:18px">${grpMgmtQuery?'没有匹配的分组':'还没有分组——把同一家公司的用户归到一组,方便看整组消耗和跟进'}</td></tr>`;return}
   e.innerHTML=pageRows.map(g=>`<tr id="grpRow${g.id}">
     <td><b>${esc(g.name)}</b></td>
-    <td>${g.portal_set?`<span style="font-size:11px;color:#0f1117;background:#34d399;border-radius:5px;padding:2px 8px;font-weight:700" title="登录账号:${esc(g.portal_email)}">已开通</span>`:'<span class="muted" style="font-size:12px">未开通</span>'}</td>
+    <td>${g.portal_set?`<span style="font-size:11px;color:rgb(var(--cr-0f1117));background:rgb(var(--crg-34d399));border-radius:5px;padding:2px 8px;font-weight:700" title="登录账号:${esc(g.portal_email)}">已开通</span>`:'<span class="muted" style="font-size:12px">未开通</span>'}</td>
     <td class="muted">${esc(g.note||'—')}</td>
     <td class="right num">${fmtNum(g.members)}</td>
     <td class="right num">${balances&&balances.known[g.id]?fmtCost(balances.sums[g.id]||0):'<span class="muted">—</span>'}</td>
@@ -3209,7 +3235,7 @@ function grpPortalEdit(id){
   const row=document.getElementById('grpRow'+id); if(!row)return;
   const tr=document.createElement('tr');
   tr.id='grpPortalRow'+id;
-  tr.innerHTML=`<td colspan="8" style="background:rgba(99,102,241,.05);padding:12px 16px">
+  tr.innerHTML=`<td colspan="8" style="background:rgb(var(--cra-6366f1) / calc(.05 * var(--cr-af)));padding:12px 16px">
     <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;font-size:13px">
       <b>客户账号</b><span class="muted">· 客户用它登录独立报表页,只能看本组数据;双密码并存(我方配置的始终有效,客户可自改)</span>
     </div>
@@ -3272,13 +3298,13 @@ function usageGrpEdit(id){ // 行内编辑:只改名称/备注，与表头 8 列
   const balances=groupBalanceMap();
   row.innerHTML=`
     <td><input class="uinput" id="ge-name-${id}" value="${esc(g.name)}" style="width:150px;padding:5px 10px;font-size:13px"></td>
-    <td>${g.portal_set?`<span style="font-size:11px;color:#0f1117;background:#34d399;border-radius:5px;padding:2px 8px;font-weight:700">已开通</span>`:'<span class="muted" style="font-size:12px">未开通</span>'}</td>
+    <td>${g.portal_set?`<span style="font-size:11px;color:rgb(var(--cr-0f1117));background:rgb(var(--crg-34d399));border-radius:5px;padding:2px 8px;font-weight:700">已开通</span>`:'<span class="muted" style="font-size:12px">未开通</span>'}</td>
     <td><input class="uinput" id="ge-note-${id}" value="${esc(g.note||'')}" placeholder="备注(选填)" style="width:100%;max-width:260px;padding:5px 10px;font-size:13px"></td>
     <td class="right num">${fmtNum(g.members)}</td>
     <td class="right num">${balances&&balances.known[g.id]?fmtCost(balances.sums[g.id]||0):'<span class="muted">—</span>'}</td>
     <td class="right num">${usedMap?fmtCost(usedMap[g.id]||0):'<span class="muted">—</span>'}</td>
     <td class="right num">${spend?fmtCost(spend[g.id]||0):'<span class="muted">—</span>'}</td>
-    <td class="right"><a href="javascript:void 0" style="color:#10b981;margin-right:12px" onclick="usageGrpSave(${id})">保存</a><a href="javascript:void 0" class="muted" onclick="renderGroupsManage()">取消</a></td>`;
+    <td class="right"><a href="javascript:void 0" style="color:rgb(var(--cr-10b981));margin-right:12px" onclick="usageGrpSave(${id})">保存</a><a href="javascript:void 0" class="muted" onclick="renderGroupsManage()">取消</a></td>`;
   const nm=document.getElementById('ge-name-'+id); nm.focus(); nm.select();
 }
 async function usageGrpSave(id){
@@ -3794,8 +3820,8 @@ function renderGrpCards(){
   const card=(gid,a)=>{
     return `<div class="grpcard${usageFilterGid===gid?' active':''}" data-gid="${gid}">
       <div class="g-top"><span class="g-ico">${gid===0?'📂':'🏢'}</span><span class="g-nm" title="${esc(a.name)}">${esc(a.name)}</span><a href="javascript:void 0" class="g-link" data-gdetail="${gid}" data-glabel="${esc(a.name)}">详情 →</a></div>
-      <div class="g-sub">${a.n} 人 · 总消耗 <b class="usage-profile-value" style="color:#fbbf24">${usageProfileAmount(a.used,a.usedKnown,a.n)}</b></div>
-      <div class="g-sub">余额 <span class="usage-profile-value" style="color:#34d399">${usageProfileAmount(a.bal,a.balKnown,a.n)}</span></div>
+      <div class="g-sub">${a.n} 人 · 总消耗 <b class="usage-profile-value" style="color:rgb(var(--cr-fbbf24))">${usageProfileAmount(a.used,a.usedKnown,a.n)}</b></div>
+      <div class="g-sub">余额 <span class="usage-profile-value" style="color:rgb(var(--cr-34d399))">${usageProfileAmount(a.bal,a.balKnown,a.n)}</span></div>
       <div class="g-sub">${rangePartial?'已展示范围消费':'范围消费'} <b>${matrixAvailable?fmtCost(a.total):'—'}</b></div>
     </div>`;};
   const allCard=`<div class="grpcard g-all${usageFilterGid===null?' active':''}" data-gid="">
@@ -3905,22 +3931,22 @@ function drawUsageMatrix(mx,users,empty,thId,tbId){
   // 每日矩阵是独立资料域。它不可用时，仍保留从 users 快照取得的成员、余额和
   // 终身累计值；范围消费和每日格子一律不渲染为零，避免造成错误的财务判断。
   if(!matrixAvailable){
-    th.innerHTML='<tr><th>用户</th><th class="right" style="color:#34d399">余额</th><th class="right" style="color:#fbbf24" title="累计总消耗:该用户终身消耗,不受日期范围影响">累计总消耗</th></tr>';
+    th.innerHTML='<tr><th>用户</th><th class="right" style="color:rgb(var(--cr-34d399))">余额</th><th class="right" style="color:rgb(var(--cr-fbbf24))" title="累计总消耗:该用户终身消耗,不受日期范围影响">累计总消耗</th></tr>';
     if(!users.length){
       tb.innerHTML=`<tr><td colspan="3" class="muted" style="text-align:center;padding:22px">${esc(mx._matrixMessage||'每日消费明细暂不可用，余额和累计消耗仍可查看')}</td></tr>`;
       sizeUsageMatrix(table,0,users);return;
     }
     const tr=u=>{
       const label=u.username||u.email||('#'+u.user_id);
-      const bal=u.balance_usd==null?'<span class="muted">—</span>':(u.balance_usd<0?`<span style="color:#f87171;font-weight:600">${fmtCost(u.balance_usd)}</span>`:`<span style="color:#34d399">${fmtCost(u.balance_usd)}</span>`);
-      const used=u.total_used_usd==null?'<span class="muted">—</span>':`<b style="color:#fbbf24">${fmtCost(u.total_used_usd)}</b>`;
+      const bal=u.balance_usd==null?'<span class="muted">—</span>':(u.balance_usd<0?`<span style="color:rgb(var(--cr-f87171));font-weight:600">${fmtCost(u.balance_usd)}</span>`:`<span style="color:rgb(var(--cr-34d399))">${fmtCost(u.balance_usd)}</span>`);
+      const used=u.total_used_usd==null?'<span class="muted">—</span>':`<b style="color:rgb(var(--cr-fbbf24))">${fmtCost(u.total_used_usd)}</b>`;
       const fullLabel=[u.username||('#'+u.user_id),u.email].filter(Boolean).join(' · ');
       return `<tr><td><a href="javascript:void 0" class="ucell" title="${esc(fullLabel)}" data-uid="${u.user_id}" data-label="${esc(label)}" data-uname="${esc(u.username||'')}" data-umail="${esc(u.email||'')}" data-ugrp="${esc(u.group_name||'')}" data-unote="${esc(u.note||'')}" style="color:var(--accent);text-decoration:none"><span class="u-name">${esc(u.username||'#'+u.user_id)}</span><span class="u-mail">${esc(u.email||'—')}</span></a></td><td class="right num" title="主站当前余额">${bal}</td><td class="right num" title="主站累计总消耗(终身)">${used}</td></tr>`;
     };
     const totalUsed=users.reduce((s,u)=>s+(+u.total_used_usd||0),0);
     tb.innerHTML=`<tr><td colspan="3" class="muted" style="text-align:center;padding:14px">${esc(mx._matrixMessage||'每日消费明细暂不可用，余额和累计消耗仍可查看')}</td></tr>`
       +users.map(tr).join('')
-      +`<tr class="mxfoot"><td><b>${isList&&(usageFilterGid!==null||usageSearchText)?'筛选合计':'合计'}</b></td><td></td><td class="right num" title="可见用户累计总消耗合计"><b style="color:#fbbf24">${fmtCost(totalUsed)}</b></td></tr>`;
+      +`<tr class="mxfoot"><td><b>${isList&&(usageFilterGid!==null||usageSearchText)?'筛选合计':'合计'}</b></td><td></td><td class="right num" title="可见用户累计总消耗合计"><b style="color:rgb(var(--cr-fbbf24))">${fmtCost(totalUsed)}</b></td></tr>`;
     sizeUsageMatrix(th.closest('table'),0,users);return;
   }
   if(!users.length){
@@ -3940,7 +3966,7 @@ function drawUsageMatrix(mx,users,empty,thId,tbId){
   (mx.cells||[]).forEach(c=>{if(!vis.has(c.user_id))return;cell.set(c.user_id+'|'+c.date,c);if(c.cost_usd>maxCost)maxCost=c.cost_usd});
   const heat=v=>v>0&&maxCost>0?` style="background:rgba(245,158,11,${(0.08+0.30*Math.sqrt(v/maxCost)).toFixed(3)})"`:''; // 感知刻度:sqrt 让中段金额也可见,不只头部一人有热力
   const fmtCell=v=>v>=0.005?'$'+v.toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2}):(v>0?'<$0.01':'$0.00');
-  th.innerHTML='<tr><th>用户</th><th class="right" style="color:#34d399">余额</th><th class="right" style="color:#fbbf24" title="累计总消耗:该用户终身消耗,不受下方日期范围影响">累计总消耗</th>'+days.map(d=>`<th class="right" title="${esc(d)} · 单元格显示消费">${esc(d.slice(5))}</th>`).join('')+`<th class="right" title="${rangePartial?'当前已展示日期范围内消费合计':'所选日期范围内消费合计'}">${rangePartial?'已展示范围消费':'范围消费'}</th></tr>`;
+  th.innerHTML='<tr><th>用户</th><th class="right" style="color:rgb(var(--cr-34d399))">余额</th><th class="right" style="color:rgb(var(--cr-fbbf24))" title="累计总消耗:该用户终身消耗,不受下方日期范围影响">累计总消耗</th>'+days.map(d=>`<th class="right" title="${esc(d)} · 单元格显示消费">${esc(d.slice(5))}</th>`).join('')+`<th class="right" title="${rangePartial?'当前已展示日期范围内消费合计':'所选日期范围内消费合计'}">${rangePartial?'已展示范围消费':'范围消费'}</th></tr>`;
   const daySum={};
   tb.innerHTML=users.map(u=>{
     let tds='';
@@ -3950,12 +3976,12 @@ function drawUsageMatrix(mx,users,empty,thId,tbId){
       tds+=`<td class="right num"${c?heat(c.cost_usd):''} ${c?`title="${esc(u.username||u.email)} · ${esc(day)} · 消费 $${c.cost_usd.toFixed(4)} · ${fmtNum(c.requests)} 次请求"`:''}>${c?fmtCell(c.cost_usd):'<span class="muted">—</span>'}</td>`;
     }
     const label=u.username||u.email||('#'+u.user_id);
-    const bal=u.balance_usd==null?'<span class="muted">—</span>':(u.balance_usd<0?`<span style="color:#f87171;font-weight:600">${fmtCost(u.balance_usd)}</span>`:`<span style="color:#34d399">${fmtCost(u.balance_usd)}</span>`); // 负余额=催充值头号信号,必须红
-    const used=u.total_used_usd==null?'<span class="muted">—</span>':`<b style="color:#fbbf24">${fmtCost(u.total_used_usd)}</b>`;
+    const bal=u.balance_usd==null?'<span class="muted">—</span>':(u.balance_usd<0?`<span style="color:rgb(var(--cr-f87171));font-weight:600">${fmtCost(u.balance_usd)}</span>`:`<span style="color:rgb(var(--cr-34d399))">${fmtCost(u.balance_usd)}</span>`); // 负余额=催充值头号信号,必须红
+    const used=u.total_used_usd==null?'<span class="muted">—</span>':`<b style="color:rgb(var(--cr-fbbf24))">${fmtCost(u.total_used_usd)}</b>`;
     const fullLabel=[u.username||('#'+u.user_id),u.email].filter(Boolean).join(' · ');
     return `<tr><td><a href="javascript:void 0" class="ucell" title="${esc(fullLabel)}" data-uid="${u.user_id}" data-label="${esc(label)}" data-uname="${esc(u.username||'')}" data-umail="${esc(u.email||'')}" data-ugrp="${esc(u.group_name||'')}" data-unote="${esc(u.note||'')}" style="color:var(--accent);text-decoration:none"><span class="u-name">${esc(u.username||'#'+u.user_id)}</span><span class="u-mail">${esc(u.email||'—')}</span></a></td><td class="right num" title="主站当前余额">${bal}</td><td class="right num" title="主站累计总消耗(终身)">${used}</td>${tds}<td class="right num">${fmtCost(u.total_usd)}</td></tr>`;
   }).join('')
-  +`<tr class="mxfoot"><td><b>${isList&&(usageFilterGid!==null||usageSearchText)?'筛选合计':'合计'}</b></td><td></td><td class="right num" title="可见用户累计总消耗合计"><b style="color:#fbbf24">${fmtCost(users.reduce((s,u)=>s+(+u.total_used_usd||0),0))}</b></td>${days.map(d=>`<td class="right num" title="${esc(d)}${d in daySum?` · $${daySum[d].toFixed(4)}`:''}"><b>${d in daySum?fmtCell(daySum[d]):'<span class="muted">—</span>'}</b></td>`).join('')}<td class="right num"><b>${fmtCost(users.reduce((s,u)=>s+(+u.total_usd||0),0))}</b></td></tr>`;
+  +`<tr class="mxfoot"><td><b>${isList&&(usageFilterGid!==null||usageSearchText)?'筛选合计':'合计'}</b></td><td></td><td class="right num" title="可见用户累计总消耗合计"><b style="color:rgb(var(--cr-fbbf24))">${fmtCost(users.reduce((s,u)=>s+(+u.total_used_usd||0),0))}</b></td>${days.map(d=>`<td class="right num" title="${esc(d)}${d in daySum?` · $${daySum[d].toFixed(4)}`:''}"><b>${d in daySum?fmtCell(daySum[d]):'<span class="muted">—</span>'}</b></td>`).join('')}<td class="right num"><b>${fmtCost(users.reduce((s,u)=>s+(+u.total_usd||0),0))}</b></td></tr>`;
   sizeUsageMatrix(th.closest('table'),days.length,users);
 }
 // 详情页:单用户 或 整个公司(分组)的每日/令牌分组/模型聚合
