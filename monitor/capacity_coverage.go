@@ -38,10 +38,10 @@ func (m *Monitor) capacityWindowCoverage(ctx context.Context, from, to int64, us
 	err := m.storeDB.WithContext(ctx).Raw(`SELECT COUNT(*) FROM (
 		SELECT bucket_ts FROM (
 			SELECT bucket_ts, channel_id, model_name, grp, success, anomaly, failed, tokens FROM metric_samples
-			WHERE bucket_ts >= ? AND bucket_ts < ? AND traffic_class_version = ?
+			WHERE bucket_ts >= ? AND bucket_ts < ? AND +traffic_class_version = ?
 			UNION ALL
 			SELECT bucket_ts, channel_id, model_name, grp, -success, -anomaly, -failed, -tokens FROM capacity_user_minute_samples
-			WHERE bucket_ts >= ? AND bucket_ts < ? AND traffic_class_version = ?
+			WHERE bucket_ts >= ? AND bucket_ts < ? AND +traffic_class_version = ?
 		) GROUP BY bucket_ts, channel_id, model_name, grp
 		HAVING SUM(success) != 0 OR SUM(anomaly) != 0 OR SUM(failed) != 0 OR SUM(tokens) != 0
 	)`, from, to, stabilityTrafficClassificationVersion,
@@ -56,12 +56,12 @@ func capacityTTFTRowsComplete(ctx context.Context, db *gorm.DB, from, to int64) 
 	var old int64
 	err := db.WithContext(ctx).Raw(`SELECT COUNT(*) FROM (
 		SELECT bucket_ts FROM metric_samples
-		WHERE bucket_ts >= ? AND bucket_ts < ? AND traffic_class_version = ?
+		WHERE bucket_ts >= ? AND bucket_ts < ? AND +traffic_class_version = ?
 		  AND (success + anomaly + failed > 0 OR tokens <> 0)
 		  AND (COALESCE(ttft_semantics_version,0) <> ? OR `+ttftInvalidRowPredicate("metric_samples")+`)
 		UNION ALL
 		SELECT bucket_ts FROM capacity_user_minute_samples
-		WHERE bucket_ts >= ? AND bucket_ts < ? AND traffic_class_version = ?
+		WHERE bucket_ts >= ? AND bucket_ts < ? AND +traffic_class_version = ?
 		  AND (success + anomaly + failed > 0 OR tokens <> 0 OR quota <> 0 OR refund_quota <> 0)
 		  AND (COALESCE(ttft_semantics_version,0) <> ? OR `+ttftInvalidRowPredicate("capacity_user_minute_samples")+`)
 	) AS legacy_ttft`, from, to, stabilityTrafficClassificationVersion, ttftCoverageSemanticsVersion,
@@ -131,7 +131,7 @@ func capacityTTFTProjectionCoverage(ctx context.Context, db *gorm.DB, from, to i
 				ttft_max_ms AS metric_max, 0 AS user_max, 1 AS metric_row, 0 AS user_row,
 				CASE WHEN `+ttftInvalidRowPredicate("metric_samples")+` THEN 1 ELSE 0 END AS invalid_row
 			FROM metric_samples
-			WHERE bucket_ts >= ? AND bucket_ts < ? AND traffic_class_version = ?
+			WHERE bucket_ts >= ? AND bucket_ts < ? AND +traffic_class_version = ?
 			UNION ALL
 			SELECT bucket_ts, channel_id, model_name, grp,
 				-ttft_500, -ttft_1k, -ttft_2k, -ttft_5k, -ttft_10k, -ttft_inf,
@@ -139,7 +139,7 @@ func capacityTTFTProjectionCoverage(ctx context.Context, db *gorm.DB, from, to i
 				0 AS metric_max, ttft_max_ms AS user_max, 0 AS metric_row, 1 AS user_row,
 				CASE WHEN `+ttftInvalidRowPredicate("capacity_user_minute_samples")+` THEN 1 ELSE 0 END AS invalid_row
 			FROM capacity_user_minute_samples
-			WHERE bucket_ts >= ? AND bucket_ts < ? AND traffic_class_version = ?
+			WHERE bucket_ts >= ? AND bucket_ts < ? AND +traffic_class_version = ?
 		) AS projections
 		GROUP BY bucket_ts, channel_id, model_name, grp
 		HAVING SUM(metric_row) = 0 OR SUM(user_row) = 0 OR MAX(invalid_row) <> 0 OR

@@ -1177,8 +1177,13 @@ func (m *Monitor) refreshUsageFactsFullHistoryReadiness(ctx context.Context, now
 			// Only the affected member was revoked (durable repair hold in the same
 			// transaction). Re-run the checkpoint on the reduced publication so
 			// every other member keeps serving instead of the whole page closing.
-			slog.Warn("全历史发布核验发现单个用户单日不一致，已撤下该用户并排队精确修复，其余用户继续服务",
-				"user_id", userID, "day", dayTs, "err", auditErr)
+			if dayTs > 0 {
+				slog.Warn("全历史发布核验发现单个用户单日不一致，已撤下该用户并排队精确修复，其余用户继续服务",
+					"user_id", userID, "day", dayTs, "err", auditErr)
+			} else {
+				slog.Warn("全历史发布核验发现单个用户证明未完成，已暂时撤下该用户，待其重新核验后自动恢复，其余用户继续服务",
+					"user_id", userID, "err", auditErr)
+			}
 			m.refreshUsageFactsReadiness(withUsageFactCheckpointIsolationDepth(ctx), now)
 			return
 		}
@@ -1208,6 +1213,9 @@ func withUsageFactCheckpointIsolationDepth(ctx context.Context) context.Context 
 // exactly like a proven rolling-audit mismatch. Any other failure (or a mounted
 // read-only snapshot) keeps the fail-closed global gate.
 func (m *Monitor) isolateUsageFactCheckpointMember(ctx context.Context, auditErr error, now time.Time) (int64, int64, bool) {
+	if userID := usageFactCheckpointIncompleteMember(auditErr); userID > 0 {
+		return m.isolateUsageFactCheckpointIncompleteMember(ctx, userID)
+	}
 	var dayErr *usageFactMemberDayAuditError
 	if !errors.As(auditErr, &dayErr) || dayErr.UserID <= 0 || dayErr.DayTs <= 0 {
 		return 0, 0, false
@@ -1231,6 +1239,29 @@ func (m *Monitor) isolateUsageFactCheckpointMember(ctx context.Context, auditErr
 		return 0, 0, false
 	}
 	return dayErr.UserID, day, true
+}
+
+// isolateUsageFactCheckpointIncompleteMember revokes one member whose state no
+// longer proves its published row (no day repair is needed: the member's own
+// discovery/verify jobs re-sign it). Same guards as the day-repair isolation.
+func (m *Monitor) isolateUsageFactCheckpointIncompleteMember(ctx context.Context, userID int64) (int64, int64, bool) {
+	if m.usageFactsLocalSnapshotReadOnly() || !m.usageFactsFullHistoryEnabled() {
+		return 0, 0, false
+	}
+	if depth, _ := ctx.Value(usageFactCheckpointIsolationDepthKey{}).(int); depth >= usageFactCheckpointIsolationLimit {
+		return 0, 0, false
+	}
+	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), usageFactCheckpointRevokeTimeout)
+	defer cancel()
+	revoked, err := m.revokeUsageFactPublishedMemberForCheckpoint(rctx, userID)
+	if err != nil {
+		slog.Warn("核验未完成的用户无法单独撤下，保持整体停止读取", "user_id", userID, "err", err)
+		return 0, 0, false
+	}
+	// revoked=false: a concurrent writer already removed the row; the re-run
+	// of the checkpoint reflects that state either way.
+	_ = revoked
+	return userID, 0, true
 }
 
 // publishUsageFactsSnapshot 只在当前成员和时间窗口全部回填完成后调用。
@@ -2896,6 +2927,16 @@ func (m *Monitor) markUsageProfileFailure(now time.Time) {
 // 这样 repair 逐小时回填时，新模型/渠道/token 维度不会提前与旧日版本
 // 混合。24 小时齐备后，rebuildUsageDailyFact 在同一事务内替换日事实和 proof，
 // 页面才一次性看到新版本。
+//
+// The "day already has a daily version" checks used to carry
+// `date_ts < fullDayThrough` inside each NOT EXISTS. The bundled SQLite (3.41)
+// then searched usage_daily_facts by (user_id, date_ts < X) — every daily row
+// of the user for every hour row — instead of (user_id, date_ts = day).
+// Production 2026-11-16: the matrix read took 0.4–0.9s idle and 3–8s under
+// load, past its 5s budget. The bound now sits outside as
+// `h.day_ts >= X OR (...)`, which is the same predicate (the subqueries match
+// only d.date_ts = h.day_ts) and lets both lookups use equality: ~70ms on the
+// production store with byte-identical results.
 func usageFactsCTE(ids []int64, fromTs, toTs, tokenID int64) (string, []any, error) {
 	if len(ids) == 0 {
 		return "", nil, nil
@@ -2935,14 +2976,16 @@ func usageFactsCTE(ids []int64, fromTs, toTs, tokenID int64) (string, []any, err
 	 WHERE ` + hourWhere + `
 	  AND ((pm.user_id IS NOT NULL AND (pm.source_floor_hour<=0 OR h.hour_ts>=pm.source_floor_hour))
 	       OR (pm.user_id IS NULL AND NOT EXISTS (SELECT 1 FROM usage_fact_published_members LIMIT 1)))
-	  AND NOT EXISTS (
-	   SELECT 1 FROM usage_fact_member_day_states p
-	   WHERE p.date_ts = h.day_ts AND p.user_id = h.user_id AND p.date_ts < ` + strconv.FormatInt(fullDayThrough, 10) + ` AND p.content_hash <> ''
-	  )
-	  AND NOT EXISTS (
-	   SELECT 1 FROM usage_daily_facts d
-	   WHERE d.date_ts = h.day_ts AND d.user_id = h.user_id AND d.date_ts < ` + strconv.FormatInt(fullDayThrough, 10) + `
-	  )
+	  AND (h.day_ts >= ` + strconv.FormatInt(fullDayThrough, 10) + ` OR (
+	   NOT EXISTS (
+	    SELECT 1 FROM usage_fact_member_day_states p
+	    WHERE p.user_id = h.user_id AND p.date_ts = h.day_ts AND p.content_hash <> ''
+	   )
+	   AND NOT EXISTS (
+	    SELECT 1 FROM usage_daily_facts d
+	    WHERE d.user_id = h.user_id AND d.date_ts = h.day_ts
+	   )
+	  ))
 ) `
 	return q, append(dailyParams, hourParams...), nil
 }

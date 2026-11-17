@@ -436,7 +436,7 @@ func (m *Monitor) buildModelStatisticsSelectedRead(ctx context.Context, selectio
 		       COALESCE(SUM(ttft_observed),0) AS ttft_observed,
 		       COALESCE(SUM(ttft_over_3s),0) AS ttft_over_3s
 		FROM capacity_user_minute_samples
-		WHERE bucket_ts >= ? AND bucket_ts < ? AND traffic_class_version = ? AND user_id >= 0
+		WHERE bucket_ts >= ? AND bucket_ts < ? AND +traffic_class_version = ? AND user_id >= 0
 		GROUP BY grp, model_name, user_id, channel_id
 		HAVING SUM(CASE WHEN success + anomaly + failed > 0 THEN success + anomaly + failed ELSE 0 END) > 0
 		UNION ALL

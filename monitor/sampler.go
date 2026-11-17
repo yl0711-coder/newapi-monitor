@@ -84,11 +84,11 @@ func (m *Monitor) sourceEpochStartupLookbacks(now int64) (int64, int64) {
 		return 0, 0
 	}
 	var metricLatest, tokenLatest int64
-	if err := m.storeDB.Raw(`SELECT COALESCE(MAX(bucket_ts),0) FROM metric_samples WHERE traffic_class_version = ?`,
+	if err := m.storeDB.Raw(`SELECT COALESCE(MAX(bucket_ts),0) FROM metric_samples WHERE +traffic_class_version = ?`,
 		stabilityTrafficClassificationVersion).Scan(&metricLatest).Error; err != nil {
 		metricLatest = 0
 	}
-	if err := m.storeDB.Raw(`SELECT COALESCE(MAX(bucket_ts),0) FROM token_samples WHERE traffic_class_version = ?`,
+	if err := m.storeDB.Raw(`SELECT COALESCE(MAX(bucket_ts),0) FROM token_samples WHERE +traffic_class_version = ?`,
 		stabilityTrafficClassificationVersion).Scan(&tokenLatest).Error; err != nil {
 		tokenLatest = 0
 	}
@@ -330,7 +330,7 @@ func (m *Monitor) metricFinalizeHasLegacyTTFTRows(from, to int64) (bool, error) 
 	}
 	var count int64
 	if err := m.storeDB.Model(&MetricSample{}).
-		Where("bucket_ts >= ? AND bucket_ts < ? AND traffic_class_version = ? AND (success + anomaly + failed > 0 OR tokens <> 0) AND COALESCE(ttft_semantics_version,0) <> ?", from, to, stabilityTrafficClassificationVersion, ttftCoverageSemanticsVersion).
+		Where("bucket_ts >= ? AND bucket_ts < ? AND +traffic_class_version = ? AND (success + anomaly + failed > 0 OR tokens <> 0) AND COALESCE(ttft_semantics_version,0) <> ?", from, to, stabilityTrafficClassificationVersion, ttftCoverageSemanticsVersion).
 		Limit(1).Count(&count).Error; err != nil {
 		return false, err
 	}
@@ -338,7 +338,7 @@ func (m *Monitor) metricFinalizeHasLegacyTTFTRows(from, to int64) (bool, error) 
 		return true, nil
 	}
 	if err := m.storeDB.Model(&CapacityUserMinuteSample{}).
-		Where("bucket_ts >= ? AND bucket_ts < ? AND traffic_class_version = ? AND (success + anomaly + failed > 0 OR tokens <> 0 OR quota <> 0 OR refund_quota <> 0) AND COALESCE(ttft_semantics_version,0) <> ?", from, to, stabilityTrafficClassificationVersion, ttftCoverageSemanticsVersion).
+		Where("bucket_ts >= ? AND bucket_ts < ? AND +traffic_class_version = ? AND (success + anomaly + failed > 0 OR tokens <> 0 OR quota <> 0 OR refund_quota <> 0) AND COALESCE(ttft_semantics_version,0) <> ?", from, to, stabilityTrafficClassificationVersion, ttftCoverageSemanticsVersion).
 		Limit(1).Count(&count).Error; err != nil {
 		return false, err
 	}
@@ -900,7 +900,7 @@ func (m *Monitor) sampleRangeSlice(ctx context.Context, fromTs, toTs int64, lowP
 	if lowPriority {
 		release, err = m.acquireBackgroundSourceLow(gateCtx)
 	} else {
-		release, err = m.acquireBackgroundSource(gateCtx)
+		release, err = m.acquireBackgroundSourceCritical(gateCtx)
 	}
 	if err != nil {
 		if cancel != nil {
@@ -1508,7 +1508,7 @@ func (m *Monitor) sampleTokensRangeWithPriority(ctx context.Context, fromTs, toT
 	if lowPriority {
 		release, err = m.acquireBackgroundSourceLow(gateCtx)
 	} else {
-		release, err = m.acquireBackgroundSource(gateCtx)
+		release, err = m.acquireBackgroundSourceCritical(gateCtx)
 	}
 	if err != nil {
 		if cancel != nil {
@@ -1619,7 +1619,7 @@ func (m *Monitor) refreshChannelsContext(parent context.Context) (result error) 
 	}
 	cctx, cancel := context.WithTimeout(parent, 10*time.Second)
 	defer cancel()
-	release, err := m.acquireBackgroundSource(cctx)
+	release, err := m.acquireBackgroundSourceCritical(cctx)
 	if err != nil {
 		return err
 	}

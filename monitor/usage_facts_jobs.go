@@ -2430,7 +2430,7 @@ func (m *Monitor) validateUsageFactFullHistoryCheckpoint(ctx context.Context, th
 		if !state.Active || state.TrackedRevision != control.TrackedRevision || state.SourceEpoch != row.SourceEpoch ||
 			state.ClassificationVersion != row.ClassificationVersion || state.QuerySemanticsVersion != row.QuerySemanticsVersion ||
 			(!fullReady && !recentReady) {
-			return fmt.Errorf("full-history verification checkpoint incomplete user_id=%d", row.UserID)
+			return &usageFactMemberCheckpointIncompleteError{UserID: row.UserID}
 		}
 		if recentReady && !fullReady {
 			// Validate the immutable serving window, not the next candidate.

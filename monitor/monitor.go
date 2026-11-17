@@ -314,16 +314,19 @@ type Monitor struct {
 	// 后台来源查询除了单并发，还共享全局最小启动间隔。Stability range
 	// 结束后按 SQL 占用时长另外推进 low-only duty 水位；Tail/sampler 可在
 	// 下一个全局间隔获得槽位，不被批量补数的 2–32s cooldown 饿死。
-	backgroundSourceScheduleMu  sync.Mutex
-	stabilitySourceNotBefore    time.Time // Stability low lane duty waterline; high-priority Tail/sampler bypass it.
-	backgroundSourceActive      bool
-	backgroundSourceNotify      chan struct{}
-	backgroundSourceHighWaiters int
-	backgroundSourceLowWaiters  int
-	backgroundSourceLowQueue    []uint64
-	backgroundSourceNextTicket  uint64
-	backgroundSourceLastStart   atomic.Int64
-	backgroundSourceStarts      atomic.Uint64
+	backgroundSourceScheduleMu      sync.Mutex
+	stabilitySourceNotBefore        time.Time // Stability low lane duty waterline; high-priority Tail/sampler bypass it.
+	backgroundSourceActive          bool
+	backgroundSourceNotify          chan struct{}
+	backgroundSourceCriticalWaiters int
+	backgroundSourceHighWaiters     int
+	backgroundSourceLowWaiters      int
+	backgroundSourceLowQueue        []uint64
+	// backgroundSourceLowSince[i] is when backgroundSourceLowQueue[i] queued.
+	backgroundSourceLowSince   []time.Time
+	backgroundSourceNextTicket uint64
+	backgroundSourceLastStart  atomic.Int64
+	backgroundSourceStarts     atomic.Uint64
 	// 用户名缓存只是展示增强；异步走低优先来源槽且禁止重叠，不能延迟主采样。
 	userDirectorySyncing atomic.Bool
 	// 正在等待任一来源库泳道/预算的交互请求数；后台事实采集见到后主动让路。
@@ -902,7 +905,21 @@ type backgroundSourcePriority uint8
 const (
 	backgroundSourceHigh backgroundSourcePriority = iota
 	backgroundSourceLow
+	// backgroundSourceCritical is the per-minute monitoring lane: the main
+	// minute sampler, token sampler and channel refresh. It is served before
+	// high. Production 2026-11-17: at minute :10 the Usage facts raw live Tail
+	// runs back-to-back high-lane queries for up to 4 minutes; the minute
+	// sampler (also high, no ordering among high waiters) lost the races until
+	// its 20s budget ran out while the replica sat at 7% CPU.
+	backgroundSourceCritical
 )
+
+// backgroundSourceLowStarvation lets the head of the low queue claim the slot
+// ahead of high waiters once it has waited this long. Without it a sustained
+// high burst (Usage facts live Tail) shut the low lane out past its 60s budget
+// (username directory sync, stability backfill). Critical waiters still go
+// first, and the claim is one bounded query.
+var backgroundSourceLowStarvation = 30 * time.Second
 
 // acquireBackgroundSource is the default high-priority lane used by sampler
 // and Usage facts Tail. Stability migration must call the explicit low lane.
@@ -912,6 +929,10 @@ func (m *Monitor) acquireBackgroundSource(ctx context.Context) (func(), error) {
 
 func (m *Monitor) acquireBackgroundSourceLow(ctx context.Context) (func(), error) {
 	return m.acquireBackgroundSourcePriority(ctx, backgroundSourceLow)
+}
+
+func (m *Monitor) acquireBackgroundSourceCritical(ctx context.Context) (func(), error) {
+	return m.acquireBackgroundSourcePriority(ctx, backgroundSourceCritical)
 }
 
 func (m *Monitor) acquireBackgroundSourcePriority(ctx context.Context, priority backgroundSourcePriority) (func(), error) {
@@ -924,25 +945,34 @@ func (m *Monitor) acquireBackgroundSourcePriority(ctx context.Context, priority 
 	m.backgroundSourceScheduleMu.Lock()
 	m.ensureBackgroundSourceNotifyLocked()
 	var ticket uint64
-	if priority == backgroundSourceHigh {
+	enqueued := time.Now()
+	switch priority {
+	case backgroundSourceCritical:
+		m.backgroundSourceCriticalWaiters++
+	case backgroundSourceHigh:
 		m.backgroundSourceHighWaiters++
-	} else {
+	default:
 		m.backgroundSourceLowWaiters++
 		m.backgroundSourceNextTicket++
 		ticket = m.backgroundSourceNextTicket
 		m.backgroundSourceLowQueue = append(m.backgroundSourceLowQueue, ticket)
+		m.backgroundSourceLowSince = append(m.backgroundSourceLowSince, enqueued)
 	}
 	m.signalBackgroundSourceLocked()
 	m.backgroundSourceScheduleMu.Unlock()
 	registered := true
 	unregisterLocked := func() {
-		if priority == backgroundSourceHigh {
+		switch priority {
+		case backgroundSourceCritical:
+			m.backgroundSourceCriticalWaiters--
+		case backgroundSourceHigh:
 			m.backgroundSourceHighWaiters--
-		} else {
+		default:
 			m.backgroundSourceLowWaiters--
 			for i, queued := range m.backgroundSourceLowQueue {
 				if queued == ticket {
 					m.backgroundSourceLowQueue = append(m.backgroundSourceLowQueue[:i], m.backgroundSourceLowQueue[i+1:]...)
+					m.backgroundSourceLowSince = append(m.backgroundSourceLowSince[:i], m.backgroundSourceLowSince[i+1:]...)
 					break
 				}
 			}
@@ -977,8 +1007,22 @@ func (m *Monitor) acquireBackgroundSourcePriority(ctx context.Context, priority 
 		now := time.Now()
 		startAt := m.backgroundSourceStartAtLocked(priority)
 		canClaim := !m.backgroundSourceActive && !now.Before(startAt)
-		if priority == backgroundSourceLow && (m.backgroundSourceHighWaiters > 0 || len(m.backgroundSourceLowQueue) == 0 || m.backgroundSourceLowQueue[0] != ticket) {
-			canClaim = false
+		var starvedAt time.Time
+		switch priority {
+		case backgroundSourceHigh:
+			// High yields to critical waiters and to a starved low head;
+			// otherwise a releasing high holder re-claims before the low
+			// head wakes, and the low lane never gets a turn.
+			if m.backgroundSourceCriticalWaiters > 0 || m.backgroundSourceLowHeadStarvedLocked(now) {
+				canClaim = false
+			}
+		case backgroundSourceLow:
+			head := len(m.backgroundSourceLowQueue) > 0 && m.backgroundSourceLowQueue[0] == ticket
+			starvedAt = enqueued.Add(backgroundSourceLowStarvation)
+			starved := head && !now.Before(starvedAt)
+			if !head || m.backgroundSourceCriticalWaiters > 0 || (m.backgroundSourceHighWaiters > 0 && !starved) {
+				canClaim = false
+			}
 		}
 		if canClaim {
 			m.backgroundSourceActive = true
@@ -1000,6 +1044,19 @@ func (m *Monitor) acquireBackgroundSourcePriority(ctx context.Context, priority 
 		}
 		notify := m.backgroundSourceNotify
 		wait := time.Until(startAt)
+		// A high waiter re-checks when the low head turns starved.
+		if priority == backgroundSourceHigh && len(m.backgroundSourceLowSince) > 0 {
+			if until := m.backgroundSourceLowSince[0].Add(backgroundSourceLowStarvation).Sub(now); until > 0 && (wait <= 0 || until < wait) {
+				wait = until
+			}
+		}
+		// A low head blocked only by high waiters re-checks when it turns
+		// starved, even if no release happens to wake it.
+		if priority == backgroundSourceLow && !starvedAt.IsZero() && now.Before(starvedAt) {
+			if untilStarved := starvedAt.Sub(now); wait <= 0 || untilStarved < wait {
+				wait = untilStarved
+			}
+		}
 		m.backgroundSourceScheduleMu.Unlock()
 
 		if err := waitForBackgroundSourceChange(ctx, notify, wait); err != nil {
@@ -1007,6 +1064,13 @@ func (m *Monitor) acquireBackgroundSourcePriority(ctx context.Context, priority 
 			return nil, err
 		}
 	}
+}
+
+// backgroundSourceLowHeadStarvedLocked reports whether the head of the low
+// queue has waited past backgroundSourceLowStarvation. Caller holds
+// backgroundSourceScheduleMu.
+func (m *Monitor) backgroundSourceLowHeadStarvedLocked(now time.Time) bool {
+	return len(m.backgroundSourceLowSince) > 0 && !now.Before(m.backgroundSourceLowSince[0].Add(backgroundSourceLowStarvation))
 }
 
 func (m *Monitor) backgroundSourceMinStartInterval() time.Duration {

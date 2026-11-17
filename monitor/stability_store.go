@@ -298,7 +298,7 @@ func (m *Monitor) rollupStabilityHours(sinceTs int64) error {
 		  SUM(sum_use_time), MAX(max_use_time), SUM(tokens), SUM(quota), SUM(refund_records), SUM(refund_quota),
 		  SUM(err_4xx), SUM(err_5xx), SUM(err_timeout), SUM(err_other),
 		  SUM(ttft_500), SUM(ttft_1k), SUM(ttft_2k), SUM(ttft_5k), SUM(ttft_10k), SUM(ttft_inf), MAX(ttft_max_ms), SUM(ttft_observed), SUM(ttft_over_3s), ?, MIN(COALESCE(ttft_semantics_version,0))
-		FROM metric_samples WHERE bucket_ts >= ? AND traffic_class_version = ?
+		FROM metric_samples WHERE bucket_ts >= ? AND +traffic_class_version = ?
 		  AND NOT EXISTS (
 		    SELECT 1 FROM stability_hour_ingest_states hs
 		    WHERE hs.hour_ts=(metric_samples.bucket_ts/3600)*3600 AND hs.status='complete'

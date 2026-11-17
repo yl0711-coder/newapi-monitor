@@ -36,9 +36,9 @@ const userTrafficClassificationVersion = trafficclass.Current
 const stabilityTrafficClassificationVersion = trafficclass.DeliveryCurrent
 
 var (
-	currentMetricTrafficFilter = fmt.Sprintf(" AND metric_samples.traffic_class_version = %d", stabilityTrafficClassificationVersion)
-	currentTokenTrafficFilter  = fmt.Sprintf(" AND token_samples.traffic_class_version = %d", stabilityTrafficClassificationVersion)
-	currentHourTrafficFilter   = fmt.Sprintf(" AND hour_samples.traffic_class_version = %d", stabilityTrafficClassificationVersion)
+	currentMetricTrafficFilter = fmt.Sprintf(" AND +metric_samples.traffic_class_version = %d", stabilityTrafficClassificationVersion)
+	currentTokenTrafficFilter  = fmt.Sprintf(" AND +token_samples.traffic_class_version = %d", stabilityTrafficClassificationVersion)
+	currentHourTrafficFilter   = fmt.Sprintf(" AND +hour_samples.traffic_class_version = %d", stabilityTrafficClassificationVersion)
 )
 
 // warnReadErr:读路径统一 fail-open——出错按"无数据"返回,页面显示空而不中断监控;
@@ -393,11 +393,15 @@ type RejectionIngestBatch struct {
 // 来源两类:AWS Lightsail 指标接口(rtype=instance/database/lb,采样器拉)、各节点主机 agent
 // 推送(rtype=host,POST /internal/host)。复合主键使重复写入幂等(同键覆盖)。
 // 存储单位已归一(见 infra.go 注释):内存/swap=MB、存储=GB、网络=KB/s、CPU/突发=%、其余原值。
+// idx_infra_key_bucket serves storeInfraLatestContext: the per-key
+// MAX(bucket_ts) is read from this index alone instead of scanning and sorting
+// the whole 7-day table (~500k rows) under the 5s infra read budget, which
+// timed out and skipped infra alert evaluation (2026-11-16, 13 times in 12h).
 type InfraSample struct {
-	BucketTs int64  `gorm:"primaryKey;autoIncrement:false;index:idx_infra_bucket"`
-	Resource string `gorm:"primaryKey;size:128"` // 资源名,如 Database-NexusAPI
-	RType    string `gorm:"primaryKey;size:16;column:rtype"`
-	Metric   string `gorm:"primaryKey;size:48"`
+	BucketTs int64  `gorm:"primaryKey;autoIncrement:false;index:idx_infra_bucket;index:idx_infra_key_bucket,priority:4"`
+	Resource string `gorm:"primaryKey;size:128;index:idx_infra_key_bucket,priority:1"` // 资源名,如 Database-NexusAPI
+	RType    string `gorm:"primaryKey;size:16;column:rtype;index:idx_infra_key_bucket,priority:2"`
+	Metric   string `gorm:"primaryKey;size:48;index:idx_infra_key_bucket,priority:3"`
 	Value    float64
 }
 
@@ -1427,6 +1431,16 @@ func (m *Monitor) replaceChannelSnapsAuthoritativeContext(ctx context.Context, r
 		rows[i].DeletedAt = 0
 		ids = append(ids, rows[i].ID)
 	}
+	// The transaction reads before it writes, so in WAL mode a commit by
+	// another connection in between fails it with SQLITE_BUSY at once (no
+	// busy_timeout wait). It is a full authoritative replace from `rows`, so a
+	// bounded re-run is exact (2026-11-16/17: three skipped snapshots).
+	return retryUpstreamLocalStore(ctx, func() error {
+		return m.replaceChannelSnapsAuthoritativeOnce(ctx, rows, ids, now)
+	})
+}
+
+func (m *Monitor) replaceChannelSnapsAuthoritativeOnce(ctx context.Context, rows []ChannelSnap, ids []int, now int64) error {
 	return m.storeDB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		if len(rows) > 0 {
 			if err := recordFinanceChannelDomains(tx, rows, now); err != nil {
@@ -2043,7 +2057,7 @@ func (m *Monitor) rollupHourRange(fromTs, toTs int64) error {
 		query += ` AND bucket_ts < ?`
 		args = append(args, toTs)
 	}
-	query += ` AND traffic_class_version = ?
+	query += ` AND +traffic_class_version = ?
 		GROUP BY hour_ts
 		ON CONFLICT(hour_ts) DO UPDATE SET
 		  success=excluded.success, anomaly=excluded.anomaly, failed=excluded.failed,
@@ -2164,7 +2178,7 @@ func (m *Monitor) storeCompareE(nowUnix int64) (CompareStat, error) {
 
 func (m *Monitor) storeFreshness() (lastBucket int64) {
 	var v struct{ M int64 }
-	warnReadErr("storeFreshness", m.storeDB.Raw(`SELECT COALESCE(MAX(bucket_ts),0) AS m FROM metric_samples WHERE traffic_class_version = ?`, stabilityTrafficClassificationVersion).Scan(&v))
+	warnReadErr("storeFreshness", m.storeDB.Raw(`SELECT COALESCE(MAX(bucket_ts),0) AS m FROM metric_samples WHERE +traffic_class_version = ?`, stabilityTrafficClassificationVersion).Scan(&v))
 	return v.M
 }
 

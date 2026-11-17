@@ -952,7 +952,7 @@ func (m *Monitor) replaceStabilityHourTrafficOnce(ctx context.Context, hourTs in
 		if expectedRequests == 0 {
 			var minuteRequests int64
 			if err := tx.Raw(`SELECT COALESCE(SUM(success+anomaly+failed),0) FROM metric_samples
-				WHERE bucket_ts >= ? AND bucket_ts < ? AND traffic_class_version = ?`,
+				WHERE bucket_ts >= ? AND bucket_ts < ? AND +traffic_class_version = ?`,
 				hourTs, hourTs+3600, stabilityTrafficClassificationVersion).Scan(&minuteRequests).Error; err != nil {
 				return err
 			}

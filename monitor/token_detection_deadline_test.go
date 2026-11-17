@@ -57,24 +57,32 @@ func TestTokenDetectionCompletedOwnerResumesAfterReleaseDeadline(t *testing.T) {
 	m, now, _ := detectionFixture(t)
 	defer m.Close()
 	detectionFact(t, m, 1, now-600, 3, 20000, 0, 0)
-	releaseFailed := false
+	// The callback stays registered for the rest of the test and is switched
+	// off instead of removed: removing a GORM callback rebuilds the shared
+	// callback chain while other goroutines may be running statements on
+	// storeDB, which intermittently panicked under full-suite load.
+	var releaseFailed, expireRelease atomic.Bool
+	expireRelease.Store(true)
 	if err := m.storeDB.Callback().Update().Before("gorm:update").Register("expire_detection_release", func(tx *gorm.DB) {
+		if !expireRelease.Load() {
+			return
+		}
 		fields, ok := tx.Statement.Dest.(map[string]any)
 		if tx.Statement.Table == "token_detection_states" && ok && fields["lease_token"] == "" && fields["lease_until"] == 0 {
 			<-tx.Statement.Context.Done()
 			_ = tx.AddError(tx.Statement.Context.Err())
-			releaseFailed = true
+			releaseFailed.Store(true)
 		}
 	}); err != nil {
 		t.Fatal(err)
 	}
 	n, err := m.runTokenDetectionRound(context.Background(), now)
-	_ = m.storeDB.Callback().Update().Remove("expire_detection_release")
+	expireRelease.Store(false)
 	var state TokenDetectionState
 	if readErr := m.storeDB.First(&state).Error; readErr != nil {
 		t.Fatal(readErr)
 	}
-	if !releaseFailed || n != 1 || !errors.Is(err, context.DeadlineExceeded) || state.LeaseUntil != now+30 || state.LastSuccessAt != now {
+	if !releaseFailed.Load() || n != 1 || !errors.Is(err, context.DeadlineExceeded) || state.LeaseUntil != now+30 || state.LastSuccessAt != now {
 		t.Fatal("release-deadline fixture did not retain its committed result and lease", n, err)
 	}
 	detectionFact(t, m, 2, now-599, 3, 20000, 0, 0)

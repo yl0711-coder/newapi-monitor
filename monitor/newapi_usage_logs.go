@@ -76,6 +76,10 @@ type usageLogFilter struct {
 	RequestID         string
 	UpstreamRequestID string
 	Channel           int
+	// UserID is never parsed from the request. It is set only by
+	// usageLogsUsernameUserID once an exact username is proven equivalent to
+	// one user_id, so COUNT/SUM can use the (user_id, created_at, type) index.
+	UserID int64
 }
 
 // parseUsageLogFilter reads the admin filter. Unparseable numbers silently turn
@@ -158,7 +162,9 @@ func buildUsageLogWhere(f usageLogFilter, scope usageLogWhereScope) (*usageLogWh
 		}
 		w.add(clause, arg)
 	}
-	if f.Username != "" {
+	if f.UserID > 0 {
+		w.add("user_id = ?", f.UserID)
+	} else if f.Username != "" {
 		clause, arg, err := usageLogMatch("username", f.Username)
 		if err != nil {
 			return nil, err
@@ -616,10 +622,19 @@ func (m *Monitor) serveUsageLogsList(c *gin.Context) {
 	var total int64
 	if !deferTotal {
 		countStarted := time.Now()
-		err = db.QueryRowContext(ctx, usageLogsSelect+"COUNT(*) FROM logs"+where.sql(), where.args...).Scan(&total)
-		usageLogsObserve("list_count", countStarted, f)
+		countFilter, err := usageLogsWithUserIndex(ctx, db, f)
+		var countWhere *usageLogWhere
+		if err == nil {
+			countWhere, err = buildUsageLogWhere(countFilter, usageLogWhereList)
+		}
+		if err == nil {
+			err = db.QueryRowContext(ctx, usageLogsSelect+"COUNT(*) FROM logs"+countWhere.sql(), countWhere.args...).Scan(&total)
+		}
+		usageLogsObserve("list_count", countStarted, countFilter)
 		if err != nil {
-			usageLogsFail(c, fmt.Errorf("查询使用日志失败: %w", usageLogsQueryErr(ctx, err)))
+			err = usageLogsQueryErr(ctx, err)
+			usageLogsWarnFailure("list_count", countStarted, countFilter, err)
+			usageLogsFail(c, fmt.Errorf("查询使用日志失败: %w", err))
 			return
 		}
 		if total == 0 {
@@ -701,10 +716,18 @@ func (m *Monitor) serveUsageLogsCount(c *gin.Context) {
 	ctx := c.Request.Context()
 	var total int64
 	started := time.Now()
-	err = db.QueryRowContext(ctx, usageLogsSelect+"COUNT(*) FROM logs"+where.sql(), where.args...).Scan(&total)
-	usageLogsObserve("list_count", started, f)
+	countFilter, err := usageLogsWithUserIndex(ctx, db, f)
+	if err == nil && countFilter.UserID > 0 {
+		where, err = buildUsageLogWhere(countFilter, usageLogWhereList)
+	}
+	if err == nil {
+		err = db.QueryRowContext(ctx, usageLogsSelect+"COUNT(*) FROM logs"+where.sql(), where.args...).Scan(&total)
+	}
+	usageLogsObserve("list_count", started, countFilter)
 	if err != nil {
-		usageLogsFail(c, fmt.Errorf("查询日志总数失败: %w", usageLogsQueryErr(ctx, err)))
+		err = usageLogsQueryErr(ctx, err)
+		usageLogsWarnFailure("count", started, countFilter, err)
+		usageLogsFail(c, fmt.Errorf("查询日志总数失败: %w", err))
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"success": true, "message": "", "data": gin.H{"total": total}})
@@ -789,7 +812,8 @@ func usageLogsObserve(phase string, started time.Time, f usageLogFilter) {
 	}
 	slog.Warn("使用日志从库查询较慢", "phase", phase, "elapsed_ms", elapsed.Milliseconds(), "range_hours", span,
 		"type", f.Type != 0, "model", f.ModelName != "", "username", f.Username != "", "token", f.TokenName != "",
-		"channel", f.Channel != 0, "group", f.Group != "", "request_id", f.RequestID != "", "upstream_request_id", f.UpstreamRequestID != "")
+		"channel", f.Channel != 0, "group", f.Group != "", "request_id", f.RequestID != "", "upstream_request_id", f.UpstreamRequestID != "",
+		"user_index", f.UserID > 0)
 }
 
 func usageLogsQueryErr(ctx context.Context, err error) error {
@@ -830,18 +854,39 @@ func (m *Monitor) serveUsageLogsStat(c *gin.Context) {
 	defer release()
 	ctx, cancel := context.WithTimeout(c.Request.Context(), usageLogsQueryTimeout)
 	defer cancel()
+	statStarted := time.Now()
+	statFilter, err := usageLogsWithUserIndex(ctx, db, f)
+	if err == nil && statFilter.UserID > 0 {
+		if quotaWhere, err = buildUsageLogWhere(statFilter, usageLogWhereStat); err == nil {
+			rateWhere, err = buildUsageLogWhere(statFilter, usageLogWhereRate)
+			if err == nil {
+				rateWhere.add("created_at >= ?", time.Now().Unix()-usageLogsRPMWindowSeconds)
+			}
+		}
+	}
+	if err != nil {
+		err = usageLogsQueryErr(ctx, err)
+		usageLogsWarnFailure("stat_user_index", statStarted, statFilter, err)
+		usageLogsFail(c, fmt.Errorf("查询统计数据失败: %w", err))
+		return
+	}
 	var quota, rpm, prompt, completion int64
 	if !skipQuota {
 		quotaStarted := time.Now()
 		err = db.QueryRowContext(ctx, usageLogsSelect+"COALESCE(SUM(quota),0) FROM logs"+quotaWhere.sql(), quotaWhere.args...).Scan(&quota)
-		usageLogsObserve("stat_quota", quotaStarted, f)
+		usageLogsObserve("stat_quota", quotaStarted, statFilter)
 		if err != nil {
-			usageLogsFail(c, fmt.Errorf("查询统计数据失败: %w", usageLogsQueryErr(ctx, err)))
+			err = usageLogsQueryErr(ctx, err)
+			usageLogsWarnFailure("stat_quota", quotaStarted, statFilter, err)
+			usageLogsFail(c, fmt.Errorf("查询统计数据失败: %w", err))
 			return
 		}
 	}
+	rateStarted := time.Now()
 	if err := db.QueryRowContext(ctx, usageLogsSelect+"COUNT(*), COALESCE(SUM(prompt_tokens),0), COALESCE(SUM(completion_tokens),0) FROM logs"+rateWhere.sql(), rateWhere.args...).Scan(&rpm, &prompt, &completion); err != nil {
-		usageLogsFail(c, fmt.Errorf("查询统计数据失败: %w", usageLogsQueryErr(ctx, err)))
+		err = usageLogsQueryErr(ctx, err)
+		usageLogsWarnFailure("stat_rate", rateStarted, statFilter, err)
+		usageLogsFail(c, fmt.Errorf("查询统计数据失败: %w", err))
 		return
 	}
 	var quotaOut any = quota

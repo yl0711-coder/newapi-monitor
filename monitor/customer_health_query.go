@@ -158,7 +158,7 @@ func (m *Monitor) customerHealthUsage(ctx context.Context, fromTs, toTs int64) (
 			"COALESCE(SUM(customer_health_anomaly),0) AS health_anomaly, "+
 			"COALESCE(SUM(customer_health_failed),0) AS health_failed, "+
 			"COALESCE(MIN(customer_health_version),0) AS health_version").
-		Where("bucket_ts >= ? AND bucket_ts < ? AND traffic_class_version = ?",
+		Where("bucket_ts >= ? AND bucket_ts < ? AND +traffic_class_version = ?",
 			fromTs, toTs, stabilityTrafficClassificationVersion).
 		Group("user_id, channel_id, model_name, grp").
 		Scan(&rows).Error
@@ -242,7 +242,7 @@ func (m *Monitor) customerHealthProblems(ctx context.Context, fromTs, toTs int64
 	err := m.storeDB.WithContext(qctx).Raw(`WITH grouped AS (
  SELECT channel_id,model_name,grp,code,message,COALESCE(SUM(count),0) AS total_count
  FROM stability_problem_samples
- WHERE bucket_ts >= ? AND bucket_ts < ? AND traffic_class_version = ? AND source = ? AND `+in+`
+ WHERE bucket_ts >= ? AND bucket_ts < ? AND +traffic_class_version = ? AND source = ? AND `+in+`
  GROUP BY channel_id,model_name,grp,code,message
 ), ranked AS (
  SELECT channel_id,model_name,grp,code,message,total_count,
@@ -373,7 +373,7 @@ func (m *Monitor) attachCustomerHealthCollectedSpendBatch(ctx context.Context, r
 		return tx.Raw(`SELECT user_id,
 CAST(COALESCE(SUM(quota),0)-COALESCE(SUM(refund_quota),0) AS INTEGER) AS net
 FROM capacity_user_minute_samples
-WHERE bucket_ts >= ? AND bucket_ts < ? AND traffic_class_version = ? AND `+in+`
+WHERE bucket_ts >= ? AND bucket_ts < ? AND +traffic_class_version = ? AND `+in+`
 GROUP BY user_id`, queryArgs...).Scan(&netRows).Error
 	})
 	if err != nil {
