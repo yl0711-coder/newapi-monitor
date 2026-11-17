@@ -265,13 +265,13 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
   .lc-daybar button:hover:not(:disabled),.lc-filterbar button:hover:not(:disabled){border-color:var(--accent)}
   .lc-daybar button:disabled{opacity:.4;cursor:not-allowed}
   .lc-daybar input[type=date],.lc-daybar input[type=time]{background:var(--surface);color:var(--text);border:1px solid var(--border);border-radius:7px;padding:6px 9px;font-size:13px}
-  .lc-daybar input[type=date]{width:142px;color:#0f172a/*fixed*/;background:#f8fafc/*fixed*/;border:2px solid rgb(var(--crb-60a5fa));font-weight:700;color-scheme:light}
-  .lc-daybar input[type=date]:focus{outline:2px solid rgb(var(--crb-93c5fd));outline-offset:2px;border-color:rgb(var(--crb-2563eb))}
+  .lc-daybar input[type=date]{width:142px;color:#0f172a/*fixed*/;background:#f8fafc/*fixed*/;border:2px solid #60a5fa/*fixed*/;font-weight:700;color-scheme:light}
+  .lc-daybar input[type=date]:focus{outline:2px solid #93c5fd/*fixed*/;outline-offset:2px;border-color:#2563eb/*fixed*/}
   .lc-daybar input[type=date]::-webkit-calendar-picker-indicator{opacity:1;cursor:pointer}
   .lc-time-range{display:flex;align-items:center;gap:6px;color:rgb(var(--cr-bfdbfe));font-size:12px;background:rgb(var(--cra-2563eb) / calc(.18 * var(--cr-af)));border:1px solid rgb(var(--crb-3b82f6));border-radius:9px;padding:4px 7px;box-shadow:0 0 0 1px rgb(var(--cra-3b82f6) / calc(.12 * var(--cr-af)))}
   .lc-time-range label{font-weight:700;color:rgb(var(--cr-dbeafe))}
-  .lc-time-range input[type=time]{width:112px;color:#0f172a/*fixed*/;background:#f8fafc/*fixed*/;border:2px solid rgb(var(--crb-60a5fa));font-weight:700;color-scheme:light}
-  .lc-time-range input[type=time]:focus{outline:2px solid rgb(var(--crb-93c5fd));outline-offset:2px;border-color:rgb(var(--crb-2563eb))}
+  .lc-time-range input[type=time]{width:112px;color:#0f172a/*fixed*/;background:#f8fafc/*fixed*/;border:2px solid #60a5fa/*fixed*/;font-weight:700;color-scheme:light}
+  .lc-time-range input[type=time]:focus{outline:2px solid #93c5fd/*fixed*/;outline-offset:2px;border-color:#2563eb/*fixed*/}
   .lc-time-range input[type=time]::-webkit-calendar-picker-indicator{opacity:1;cursor:pointer}
   .lc-time-range.pending{background:rgb(var(--cra-d97706) / calc(.2 * var(--cr-af)));border-color:rgb(var(--crb-f59e0b));box-shadow:0 0 0 1px rgb(var(--cra-f59e0b) / calc(.16 * var(--cr-af)))}
   .lc-time-hint{color:rgb(var(--cr-fbbf24));font-size:12px;font-weight:600;white-space:nowrap}
