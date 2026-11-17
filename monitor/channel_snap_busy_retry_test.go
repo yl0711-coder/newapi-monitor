@@ -20,7 +20,7 @@ func TestChannelSnapReplaceRetriesSQLiteBusy(t *testing.T) {
 	failures.Store(2)
 	if err := m.storeDB.Callback().Create().Before("gorm:create").Register("test:busy_once", func(db *gorm.DB) {
 		if db.Statement.Table == "channel_snaps" && failures.Add(-1) >= 0 {
-			db.AddError(errors.New("database is locked (5) (SQLITE_BUSY)"))
+			_ = db.AddError(errors.New("database is locked (5) (SQLITE_BUSY)"))
 		}
 	}); err != nil {
 		t.Fatal(err)

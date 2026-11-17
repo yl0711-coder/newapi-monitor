@@ -59,34 +59,41 @@ func usageLogsUsernameUserID(ctx context.Context, db usageLogsQuerier, username 
 	}
 	userID := ids[0]
 
-	var firstID int64
-	var firstName string
-	err = db.QueryRowContext(ctx, "SELECT id, COALESCE(username,'') FROM logs WHERE user_id = ? ORDER BY id ASC LIMIT 1", userID).Scan(&firstID, &firstName)
-	if errors.Is(err, sql.ErrNoRows) {
-		// The user has no rows: user_id matches nothing, so the switch is exact
-		// only if no row carries the name either.
-		var one int
-		err = db.QueryRowContext(ctx, "SELECT 1 FROM logs WHERE username = ? LIMIT 1", username).Scan(&one)
-		if errors.Is(err, sql.ErrNoRows) {
-			return userID, nil
-		}
+	// Every lookup is a MIN over a (key, id) index or a primary-key read, which
+	// MySQL answers from the index alone. `ORDER BY id LIMIT 1` was not used:
+	// on production the optimizer sometimes walked the primary key from the
+	// start of the table instead (>8s for 3 of 10 active users, 2026-11-17).
+	var firstID, nameFirstID sql.NullInt64
+	if err := db.QueryRowContext(ctx, "SELECT MIN(id) FROM logs WHERE user_id = ?", userID).Scan(&firstID); err != nil {
 		return 0, err
 	}
-	if err != nil {
+	if err := db.QueryRowContext(ctx, "SELECT MIN(id) FROM logs WHERE username = ?", username).Scan(&nameFirstID); err != nil {
+		return 0, err
+	}
+	if !firstID.Valid {
+		// The user has no rows: user_id matches nothing, so the switch is exact
+		// only if no row carries the name either.
+		if nameFirstID.Valid {
+			return 0, nil
+		}
+		return userID, nil
+	}
+	// 3. A row with this name before the user's first row belongs to someone else.
+	if !nameFirstID.Valid || nameFirstID.Int64 < firstID.Int64 {
+		return 0, nil
+	}
+	// 2. The user's earliest row must carry this name.
+	var firstName string
+	if err := db.QueryRowContext(ctx, "SELECT COALESCE(username,'') FROM logs WHERE id = ?", firstID.Int64).Scan(&firstName); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return 0, nil
+		}
 		return 0, err
 	}
 	if firstName != username {
 		return 0, nil
 	}
-	var one int
-	err = db.QueryRowContext(ctx, "SELECT 1 FROM logs WHERE username = ? AND id < ? LIMIT 1", username, firstID).Scan(&one)
-	if errors.Is(err, sql.ErrNoRows) {
-		return userID, nil
-	}
-	if err != nil {
-		return 0, err
-	}
-	return 0, nil
+	return userID, nil
 }
 
 // usageLogsWithUserIndex returns f with UserID set when the username filter can
