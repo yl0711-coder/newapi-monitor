@@ -66,7 +66,7 @@ func (m *Monitor) applyChannelInternalCostViews(ctx context.Context, scope stabi
 		return fmt.Errorf("核验内部账号上游成本: %w", err)
 	}
 	for domain, metrics := range usage {
-		usage[domain] = applyChannelInternalCostEvidence(metrics, costs, domain, internal.Accounts)
+		usage[domain] = m.markChannelInternalCostOutsideClosure(applyChannelInternalCostEvidence(metrics, costs, domain, internal.Accounts), domain, internal.Accounts)
 	}
 	if len(bills) == 0 {
 		return nil
@@ -86,10 +86,31 @@ func (m *Monitor) applyChannelInternalCostViews(ctx context.Context, scope stabi
 	}
 	for domain, bill := range bills {
 		if bill != nil {
-			bill.Usage = applyChannelInternalCostEvidence(bill.Usage, dailyCosts, domain, dailyInternal.Accounts)
+			bill.Usage = m.markChannelInternalCostOutsideClosure(applyChannelInternalCostEvidence(bill.Usage, dailyCosts, domain, dailyInternal.Accounts), domain, dailyInternal.Accounts)
 		}
 	}
 	return nil
+}
+
+// channelInternalCostOutsideClosure marks an upstream whose per-channel cost
+// is not published at all: it is not in the channel cost closure whitelist
+// (MONITOR_CHANNEL_COST_CLOSURE_DOMAINS). Internal test cost can never be
+// paired there, so this is a scope limit, not a pending verification. The
+// business (net) cost stays unavailable exactly as before; only the status and
+// the per-upstream diagnostics change, so the anomaly list no longer repeats
+// the same unreachable reason for every upstream outside the pilot.
+const channelInternalCostOutsideClosure = "outside_closure"
+
+func (m *Monitor) markChannelInternalCostOutsideClosure(metrics ChannelUpstreamUsageMetrics, domain string, accounts int64) ChannelUpstreamUsageMetrics {
+	if accounts <= 0 || metrics.InternalFilterStatus == "complete" || metrics.InternalFilterStatus == "inconsistent" {
+		return metrics
+	}
+	if m.cfg.ChannelCostClosureEnabled && channelCostDomainAllowed(m.cfg.ChannelCostClosureDomains, domain) {
+		return metrics
+	}
+	metrics.InternalFilterStatus = channelInternalCostOutsideClosure
+	metrics.InternalFilterReasons = nil
+	return metrics
 }
 
 const channelInternalCostToleranceUSD = 0.00001

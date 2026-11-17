@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -14,7 +16,17 @@ import (
 
 func saveRetirementForTest(t *testing.T, m *Monitor, domain string, retiring, expected bool) int {
 	t.Helper()
-	body, err := json.Marshal(channelUpstreamRetirementInput{Domain: domain, Retiring: &retiring, ExpectedRetiring: &expected})
+	var reasons []string
+	if retiring {
+		reasons = []string{"unstable"}
+	}
+	code, _ := saveRetirementWithReasonsForTest(t, m, channelUpstreamRetirementInput{Domain: domain, Retiring: &retiring, ExpectedRetiring: &expected, Reasons: reasons})
+	return code
+}
+
+func saveRetirementWithReasonsForTest(t *testing.T, m *Monitor, input channelUpstreamRetirementInput) (int, map[string]any) {
+	t.Helper()
+	body, err := json.Marshal(input)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -24,7 +36,9 @@ func saveRetirementForTest(t *testing.T, m *Monitor, domain string, retiring, ex
 	c.Request.Header.Set("Content-Type", "application/json")
 	c.Set("uname", "operator")
 	m.saveChannelUpstreamRetirementHandler(c)
-	return w.Code
+	var out map[string]any
+	_ = json.Unmarshal(w.Body.Bytes(), &out)
+	return w.Code, out
 }
 
 func TestChannelUpstreamRetirementToggleIsIndependentOfRoutingAndBilling(t *testing.T) {
@@ -114,5 +128,84 @@ func TestRetiringUpstreamSuppressesLiveBalanceAlertUntilCancelled(t *testing.T) 
 	m.evaluateUpstreamBalanceAlerts(cfg, now+300)
 	if err := query.Count(&count).Error; err != nil || count != 1 {
 		t.Fatalf("cancelling retirement should restore alert, count=%d err=%v", count, err)
+	}
+}
+
+func TestChannelUpstreamRetirementReasonsAreValidatedStoredAndShown(t *testing.T) {
+	m := newStabilityTestMonitor(t)
+	hour := time.Date(2026, 9, 18, 10, 0, 0, 0, cstLocation).Unix()
+	if err := m.storeDB.Create(&ChannelSnap{ID: 71, Name: "supplier", BaseDomain: "reason.example", Status: 1, Groups: "g", UpdatedAt: hour}).Error; err != nil {
+		t.Fatal(err)
+	}
+	post := func(retiring, expected bool, reasons []string, note string) (int, map[string]any) {
+		r, e := retiring, expected
+		return saveRetirementWithReasonsForTest(t, m, channelUpstreamRetirementInput{Domain: "reason.example", Retiring: &r, ExpectedRetiring: &e, Reasons: reasons, ReasonNote: note})
+	}
+	for name, tc := range map[string]struct {
+		reasons []string
+		note    string
+	}{
+		"no reason":           {nil, ""},
+		"unknown reason":      {[]string{"degraded", "cheap"}, ""},
+		"other without note":  {[]string{"other"}, "   "},
+		"other note too long": {[]string{"other"}, strings.Repeat("长", retirementReasonNoteMaxRunes+1)},
+	} {
+		if code, _ := post(true, false, tc.reasons, tc.note); code != http.StatusBadRequest {
+			t.Fatalf("%s: status=%d, want 400", name, code)
+		}
+	}
+	var count int64
+	m.storeDB.Model(&ChannelUpstreamRetirement{}).Count(&count)
+	if count != 0 {
+		t.Fatalf("rejected requests stored %d rows", count)
+	}
+
+	code, out := post(true, false, []string{"other", "no_recharge", "token_inflation", "degraded", "degraded"}, "  对账 \n 不一致  ")
+	if code != http.StatusOK {
+		t.Fatalf("mark with reasons status=%d body=%v", code, out)
+	}
+	if got := fmt.Sprint(out["reasons"]); got != "[no_recharge degraded token_inflation other]" || out["reason_note"] != "对账 不一致" {
+		t.Fatalf("response reasons=%v note=%v", out["reasons"], out["reason_note"])
+	}
+	report, err := m.buildChannelManagementReport(context.Background(), stabilityScope{FromTs: hour, ToTs: hour + 3600}, hour+7200)
+	if err != nil || len(report.Domains) != 1 {
+		t.Fatalf("report err=%v", err)
+	}
+	d := report.Domains[0]
+	if !d.Retiring || strings.Join(d.RetiringReasons, ",") != "no_recharge,degraded,token_inflation,other" || d.RetiringReasonNote != "对账 不一致" {
+		t.Fatalf("report reasons=%v note=%q", d.RetiringReasons, d.RetiringReasonNote)
+	}
+
+	// Editing the reasons of a marked upstream; the note is dropped without "other".
+	if code, out := post(true, true, []string{"slow"}, "ignored"); code != http.StatusOK || out["reason_note"] != "" {
+		t.Fatalf("edit reasons status=%d out=%v", code, out)
+	}
+	var row ChannelUpstreamRetirement
+	if err := m.storeDB.First(&row, "domain = ?", "reason.example").Error; err != nil || row.Reasons != `["slow"]` || row.ReasonNote != "" || !row.Retiring {
+		t.Fatalf("edited row=%+v err=%v", row, err)
+	}
+
+	// Unmarking clears the reasons; a stale expectation is still rejected.
+	if code, _ := post(false, false, nil, ""); code != http.StatusConflict {
+		t.Fatalf("stale unmark status=%d", code)
+	}
+	if code, _ := post(false, true, []string{"slow"}, "x"); code != http.StatusOK {
+		t.Fatalf("unmark status=%d", code)
+	}
+	if err := m.storeDB.First(&row, "domain = ?", "reason.example").Error; err != nil || row.Retiring || row.Reasons != "" || row.ReasonNote != "" {
+		t.Fatalf("unmarked row=%+v err=%v", row, err)
+	}
+}
+
+func TestRetirementReasonListToleratesLegacyAndBadRows(t *testing.T) {
+	for stored, want := range map[string]string{
+		"":                                "",
+		"not json":                        "",
+		`["other","bogus","no_recharge"]`: "no_recharge,other",
+		`["slow"]`:                        "slow",
+	} {
+		if got := strings.Join(retirementReasonList(stored), ","); got != want {
+			t.Fatalf("retirementReasonList(%q)=%q want %q", stored, got, want)
+		}
 	}
 }

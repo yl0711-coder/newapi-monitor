@@ -127,6 +127,10 @@ type ChannelManagementDomain struct {
 	ManuallyDisabled  bool   `json:"manually_disabled"`
 	Retiring          bool   `json:"retiring"`
 	RetiringUpdatedAt int64  `json:"retiring_updated_at,omitempty"`
+	// RetiringReasons are the codes chosen when marking 停止使用 (see
+	// retirementReasonCodes); RetiringReasonNote is the "other" text.
+	RetiringReasons    []string `json:"retiring_reasons,omitempty"`
+	RetiringReasonNote string   `json:"retiring_reason_note,omitempty"`
 	// Aliases are other channel addresses attributed to this domain.
 	Aliases        []string                        `json:"aliases,omitempty"`
 	Usage          ChannelUsageMetrics             `json:"usage"`
@@ -1123,6 +1127,7 @@ func (m *Monitor) buildChannelManagementReport(ctx context.Context, scope stabil
 		responseDomains = append(responseDomains, ChannelManagementDomain{
 			Key: domain.Key, Domain: domain.Domain, Configured: domain.Configured, ManuallyDisabled: channelDomainManuallyDisabled(domain),
 			Retiring: retirements[domain.Domain].Retiring, RetiringUpdatedAt: retirements[domain.Domain].UpdatedAt,
+			RetiringReasons: retirementReasonList(retirements[domain.Domain].Reasons), RetiringReasonNote: retirements[domain.Domain].ReasonNote,
 			Aliases: aliasesByTarget[domain.Domain],
 			Usage:   domain.Usage.metrics(), Finance: finance.domainView(domain.Domain),
 			Upstream:       upstream,

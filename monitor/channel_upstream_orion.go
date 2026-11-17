@@ -25,12 +25,19 @@ const (
 	orionPageSize         = 100
 	orionMaxPages         = 50
 	orionMaxWindowSeconds = 48 * 3600
-	// Requests are billed when answered, so late rows are rare: re-read one
-	// closed hour instead of the generic three. The live tail window is that
-	// overlap plus two new hours, which keeps a busy account (about 1,600
-	// requests per hour) inside one run's 50-page budget at 100 rows per page.
-	orionTailOverlapSeconds = int64(3600)
-	orionTailMaxSeconds     = orionTailOverlapSeconds + 2*3600
+	// The live tail reads from the start of the watermark hour, at most one
+	// hour per run. A busy account (observed ~3,700 answered requests per hour
+	// on 2026-11-16) needs about 37 pages per hour, which fits one run's
+	// 50-page budget; a wider window does not and, since partial reads are
+	// never published, used to fail on every retry for the rest of the day.
+	// Late rows are rare (requests are billed when answered); the watermark
+	// hour is re-read from its start on every pass, so it is read again after
+	// it closes.
+	orionTailMaxSeconds = int64(3600)
+	// A stale watermark within this range is continued, never skipped, and
+	// missing hours inside it are re-read (Orion stores every hour, even an
+	// empty one, so an absent hour is a hole, not zero spend).
+	orionTailCatchUpSeconds = int64(7 * 86400)
 	// Error text kept from a rejected request, so a parameter change on the
 	// panel is visible in status instead of a bare status code.
 	orionErrorMessageMaxRunes = 120
@@ -278,4 +285,47 @@ func validateOrionInput(in *channelUpstreamSaveInput) error {
 		return fmt.Errorf("Orion 只支持导入管理密钥，不使用密码或 Refresh Token")
 	}
 	return nil
+}
+
+// orionEarliestMissingHour finds the first hour with no stored bucket between
+// the account's first stored hour (bounded to the catch-up range) and the
+// watermark hour. Orion publishes every hour of a read window, including
+// empty ones, so a missing row means the hour was never read.
+func (m *Monitor) orionEarliestMissingHour(ctx context.Context, row ChannelUpstreamAccount, now int64) (int64, bool, error) {
+	end := row.UsageDataUntil - row.UsageDataUntil%3600
+	start := cstDayStart(now) - orionTailCatchUpSeconds
+	var first struct{ Min *int64 }
+	if err := m.storeDB.WithContext(ctx).Model(&ChannelUpstreamUsageHour{}).
+		Select("MIN(hour_ts) AS min").Where("domain = ?", row.Domain).Scan(&first).Error; err != nil {
+		return 0, false, fmt.Errorf("读取 Orion 已存小时: %w", err)
+	}
+	if first.Min == nil {
+		return 0, false, nil
+	}
+	if *first.Min > start {
+		start = *first.Min
+	}
+	start -= start % 3600
+	if start >= end {
+		return 0, false, nil
+	}
+	var hours []int64
+	if err := m.storeDB.WithContext(ctx).Model(&ChannelUpstreamUsageHour{}).
+		Where("domain = ? AND hour_ts >= ? AND hour_ts < ?", row.Domain, start, end).
+		Order("hour_ts").Pluck("hour_ts", &hours).Error; err != nil {
+		return 0, false, fmt.Errorf("读取 Orion 已存小时: %w", err)
+	}
+	expect := start
+	for _, h := range hours {
+		if h > expect {
+			return expect, true, nil
+		}
+		if h == expect {
+			expect += 3600
+		}
+	}
+	if expect < end {
+		return expect, true, nil
+	}
+	return 0, false, nil
 }

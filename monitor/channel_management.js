@@ -867,25 +867,75 @@ function upstreamCostNote(usage,basis,adjusted=false){
   if(basis==='business')return '已扣配置内部账号；不代表全部测试成本已排除';
   const included=adjusted?'含内部测试成本':'含内部测试用量';
   const status=usage?.internal_filter_status;
-  return included+(status==='complete'?' · 统一账单口径':status==='not_configured'?' · 未配置内部账号':
+  return included+(status==='complete'?' · 统一账单口径':status==='not_configured'?' · 未配置内部账号':status==='outside_closure'?' · 未纳入成本闭环，无法扣除':
     status==='inconsistent'?' · 内部扣除核验异常':status?' · 内部扣除尚未核验':' · 核验状态待确认');
+}
+// 停止使用原因：与后端 retirementReasonCodes 一致（顺序即显示顺序）。
+const RETIRE_REASONS=[['no_recharge','无法充值'],['degraded','降智'],['unstable','不稳定'],['slow','耗时高'],['token_inflation','token虚报'],['other','其他']];
+const RETIRE_NOTE_MAX=100;
+function retiringReasonText(domain){
+	const codes=Array.isArray(domain?.retiring_reasons)?domain.retiring_reasons:[];
+	return RETIRE_REASONS.filter(([code])=>codes.includes(code)).map(([code,label])=>code==='other'&&domain.retiring_reason_note?`其他：${domain.retiring_reason_note}`:label).join('、');
+}
+// Ask which reasons apply. Resolves {reasons,note} or null when cancelled.
+// Tests replace cm.reasonPicker; the page uses a native <dialog>.
+function askRetirementReasons(domain){
+	if(typeof cm.reasonPicker==='function')return cm.reasonPicker(domain);
+	return new Promise(resolve=>{
+		let dialog=document.getElementById('cmRetireDialog');
+		if(!dialog){
+			dialog=document.createElement('dialog');
+			dialog.id='cmRetireDialog';dialog.className='cm-retire-dialog';dialog.setAttribute('aria-labelledby','cmRetireTitle');
+			dialog.innerHTML=`<form method="dialog" class="cm-retire-form"><h3 id="cmRetireTitle">标记停止使用</h3>
+<p class="cm-retire-domain" id="cmRetireDomain"></p>
+<p class="cm-retire-hint">渠道仍可承接现有小流量，余额和账单继续同步，但不再发送低余额充值提醒。</p>
+<fieldset><legend>停止使用原因（可多选）</legend><div class="cm-retire-options">${RETIRE_REASONS.map(([code,label])=>`<label><input type="checkbox" name="reason" value="${code}"><span>${esc(label)}</span></label>`).join('')}</div>
+<input type="text" class="cm-retire-note" id="cmRetireNote" maxlength="${RETIRE_NOTE_MAX}" placeholder="请填写其他原因（${RETIRE_NOTE_MAX} 字以内）" hidden></fieldset>
+<p class="cm-retire-error" id="cmRetireError" role="alert"></p>
+<div class="cm-retire-actions"><button type="button" value="cancel" id="cmRetireCancel">取消</button><button type="submit" value="ok" class="primary">确认标记</button></div></form>`;
+			document.body.appendChild(dialog);
+			dialog.addEventListener('input',()=>{dialog.querySelector('#cmRetireError').textContent=''});
+			dialog.addEventListener('change',e=>{dialog.querySelector('#cmRetireError').textContent='';if(e.target.name==='reason'&&e.target.value==='other'){const note=dialog.querySelector('#cmRetireNote');note.hidden=!e.target.checked;if(e.target.checked)note.focus()}});
+		}
+		const form=dialog.querySelector('form'),note=dialog.querySelector('#cmRetireNote'),error=dialog.querySelector('#cmRetireError');
+		dialog.querySelector('#cmRetireDomain').textContent=domain.domain;
+		form.querySelectorAll('input[name=reason]').forEach(box=>{box.checked=false});
+		note.value='';note.hidden=true;error.textContent='';
+		let done=false;
+		const finish=value=>{if(done)return;done=true;form.removeEventListener('submit',onSubmit);dialog.removeEventListener('close',onClose);dialog.querySelector('#cmRetireCancel').removeEventListener('click',onCancel);if(dialog.open)dialog.close();resolve(value)};
+		const onSubmit=e=>{
+			e.preventDefault();
+			const reasons=[...form.querySelectorAll('input[name=reason]:checked')].map(box=>box.value);
+			const text=note.value.trim();
+			if(!reasons.length){error.textContent='请至少选择一个原因';return}
+			if(reasons.includes('other')&&!text){error.textContent='选择“其他”时请填写原因';note.focus();return}
+			finish({reasons,note:reasons.includes('other')?text:''});
+		};
+		const onCancel=()=>finish(null),onClose=()=>finish(null);
+		form.addEventListener('submit',onSubmit);dialog.addEventListener('close',onClose);dialog.querySelector('#cmRetireCancel').addEventListener('click',onCancel);
+		dialog.showModal();
+		const first=form.querySelector('input[name=reason]');if(first)first.focus();
+	});
 }
 async function setDomainRetiring(key,button){
 	const domain=(cm.report?.domains||[]).find(item=>item.key===key);
 	if(!domain||!cm.report?.finance?.can_edit)return;
 	const next=!domain.retiring;
-	const message=next
-		?`将 ${domain.domain} 标记为“停止使用”？渠道仍可承接现有小流量、余额和账单继续同步，但不再发送低余额充值提醒。`
-		:`取消 ${domain.domain} 的“停止使用”标记？取消后将重新纳入低余额充值提醒。`;
-	if(!window.confirm(message))return;
+	let picked={reasons:[],note:''};
+	if(next){
+		picked=await askRetirementReasons(domain);
+		if(!picked)return;
+	}else if(!window.confirm(`取消 ${domain.domain} 的“停止使用”标记？取消后将重新纳入低余额充值提醒。`))return;
 	button.disabled=true;
 	try{
-		const res=await fetch('/channels/upstream/retirement',{method:'POST',cache:'no-store',headers:{Accept:'application/json','Content-Type':'application/json'},body:JSON.stringify({domain:domain.domain,retiring:next,expected_retiring:!!domain.retiring})});
+		const res=await fetch('/channels/upstream/retirement',{method:'POST',cache:'no-store',headers:{Accept:'application/json','Content-Type':'application/json'},body:JSON.stringify({domain:domain.domain,retiring:next,expected_retiring:!!domain.retiring,reasons:picked.reasons,reason_note:picked.note})});
 		if(res.status===401){location.href='/login';return}
 		const result=await res.json();
 		if(!res.ok)throw new Error(result.error||`HTTP ${res.status}`);
 		domain.retiring=!!result.retiring;
 		domain.retiring_updated_at=+result.updated_at||0;
+		domain.retiring_reasons=Array.isArray(result.reasons)?result.reasons:[];
+		domain.retiring_reason_note=result.reason_note||'';
 		render();
 	}catch(error){alert(error.message||'保存停止使用标记失败');await loadReport({quiet:true})}
 	finally{button.disabled=false}
@@ -946,7 +996,8 @@ function domainCard(domain,index,total,filtered,costBases=upstreamCostBases([dom
   const groups=domainServiceGroups(domain);
   const open=cm.expandedDomains.has(domain.key),share=metric(total)>0?metric(domain.usage)/metric(total)*100:0;
   const disabledBadge=domain.manually_disabled?'<span class="cm-upstream-disabled">已禁用</span>':'';
-	const retiringBadge=domain.retiring?'<span class="cm-upstream-retiring" title="余额继续自然消耗；不再提醒充值，不改变渠道状态或路由">停止使用</span>':'';
+	const retiringReasons=domain.retiring?retiringReasonText(domain):'';
+	const retiringBadge=domain.retiring?'<span class="cm-upstream-retiring" title="余额继续自然消耗；不再提醒充值，不改变渠道状态或路由">停止使用</span>'+(retiringReasons?`<span class="cm-upstream-retiring-reasons" title="停止使用原因：${esc(retiringReasons)}">${esc(retiringReasons)}</span>`:''):'';
   const rates=domain.rate_config||{},rateConfigured=+rates.configured_channels||0,rateManaged=Number.isFinite(+rates.managed_channels)?+rates.managed_channels:(+rates.enabled_channels||0);
   const financeLabel=rateManaged>0&&rates.complete?`在用渠道倍率已配置 · ${rateConfigured}/${rateManaged}`:`在用渠道倍率待配置 · ${rateConfigured}/${rateManaged}`;
   const billView=window.channelDataStatus.billView(domain),upstreamUsage=billView.usage;

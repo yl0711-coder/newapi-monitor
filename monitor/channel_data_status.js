@@ -85,7 +85,7 @@ const internalReasonLabels={
   amount_inconsistent:'内部账号成本大于同口径上游原账单，扣除结果停止发布',
 };
 function internalCostReasons(usage){
-  if(['complete','not_configured'].includes(usage.internal_filter_status))return [];
+  if(['complete','not_configured','outside_closure'].includes(usage.internal_filter_status))return [];
   const codes=Array.isArray(usage.internal_filter_reasons)?usage.internal_filter_reasons:[];
   if(codes.length)return [...new Set(codes)].map(code=>internalReasonLabels[code]||'内部账号成本核验状态待确认');
   if(usage.internal_filter_status==='inconsistent')return [internalReasonLabels.amount_inconsistent];
@@ -150,11 +150,13 @@ function render(report){
   const rows=issues(report),meta=report?.meta||{};
   const unconfigured=(report?.domains||[]).filter(d=>!d.upstream?.configured&&d.enabled_channels>0);
   const paused=(report?.domains||[]).filter(d=>d.upstream?.configured&&d.upstream?.sync_paused);
+  const outsideClosure=(report?.domains||[]).filter(d=>d.upstream?.configured&&!d.upstream?.sync_paused&&billView(d).usage?.internal_filter_status==='outside_closure');
+  const closureNote=outsideClosure.length?`<p class="muted">${outsideClosure.length} 个上游未纳入渠道成本闭环试点，内部测试账号的成本无法从这些上游账单中扣除；成本按上游原账单统计（含内部测试成本），不作为数据异常。</p>`:'';
   const pausedNote=paused.length?`<p class="muted">${paused.length} 个上游已标记停止使用、没有启用渠道且 48 小时内无调用，已暂停自动同步余额和日志，不作为同步故障：${esc(paused.map(d=>d.domain).join('、'))}。</p>`:'';
   const configurationNote=unconfigured.length?`<p class="muted">${unconfigured.length} 个上游未配置，暂不采集，不作为同步故障；有消费而成本未知的部分不能按零成本核算。</p>`:'';
   const dailyNotes=(report?.domains||[]).filter(domain=>billView(domain).daily).map(domain=>`<p class="muted">${esc(domain.domain)}：${esc(billRangeNote(billView(domain).daily))}。上游按自然日出账，渠道卡片单独展示，不计入精确区间汇总。</p>`).join('');
   return `<p class="muted">渠道管理当前日期范围（全部账户）：${esc(time(meta.from_ts))} → ${esc(time(meta.to_ts))}（结束时间不含）。仅检查本地数据，不触发补数。</p>`+
-    (rows.length?`<div class="sync-status bad">${rows.length} 项数据异常 / 待核验</div><div class="sync-upstream-list">${rows.map(row=>`<article class="sync-upstream-account"><b class="sync-upstream-error">${esc(row.scope)}</b><p class="sync-upstream-error">${esc(row.detail)}</p></article>`).join('')}</div>`:'<span class="sync-status ok">用量覆盖与可用账单校验通过</span>')+pausedNote+configurationNote+dailyNotes;
+    (rows.length?`<div class="sync-status bad">${rows.length} 项数据异常 / 待核验</div><div class="sync-upstream-list">${rows.map(row=>`<article class="sync-upstream-account"><b class="sync-upstream-error">${esc(row.scope)}</b><p class="sync-upstream-error">${esc(row.detail)}</p></article>`).join('')}</div>`:'<span class="sync-status ok">用量覆盖与可用账单校验通过</span>')+closureNote+pausedNote+configurationNote+dailyNotes;
 }
 window.channelDataStatus={issues,note,render,known,billView,billRangeNote,billSyncNote,balanceSnapshot};
 })();

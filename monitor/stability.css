@@ -202,6 +202,26 @@ body{max-width:none!important;margin:0!important;padding:0!important;overflow-x:
 @media(max-width:620px){.cm-attention ul{grid-template-columns:1fr}.cm-attention li button>b{max-width:50%}}.cm-domain-card.manually-disabled .cm-domain-icon{color:#9aa4b6;background:rgba(148,163,184,.08);border-color:rgba(148,163,184,.12)}
 .cm-upstream-retiring{display:inline-flex;margin-left:8px;padding:3px 9px;border-radius:999px;background:rgba(245,174,70,.16);color:#f3bd70;font-size:13px;font-weight:700;line-height:1.35;vertical-align:middle}
 .cm-retiring-toggle{position:relative;z-index:2;flex:none;border:1px solid #7b6549;border-radius:7px;background:rgba(245,174,70,.08);color:#efbd7a;padding:3px 7px;font-size:11px;line-height:1.2;cursor:pointer}.cm-retiring-toggle:hover,.cm-retiring-toggle.active{border-color:#d29a54;background:rgba(245,174,70,.16)}.cm-retiring-toggle:disabled{opacity:.55;cursor:wait}
+.cm-upstream-retiring-reasons{display:inline-block;margin-left:6px;max-width:360px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;vertical-align:middle;color:#e4b466;font-size:12px;font-weight:500}
+.cm-retire-dialog{margin:auto;border:1px solid #30394b;border-radius:12px;background:#171d29;color:#e2e8f0;padding:0;width:420px;max-width:calc(100vw - 24px)}
+.cm-retire-dialog::backdrop{background:rgba(0,0,0,.55)}
+.cm-retire-form{display:flex;flex-direction:column;gap:10px;padding:18px 20px}
+.cm-retire-form h3{margin:0;font-size:16px}
+.cm-retire-domain{margin:0;font-weight:700;color:#f3bd70;word-break:break-all}
+.cm-retire-hint{margin:0;font-size:12px;color:#94a3b8;line-height:1.55}
+.cm-retire-form fieldset{border:0;margin:0;padding:0}
+.cm-retire-form legend{font-size:13px;font-weight:600;margin-bottom:8px;padding:0}
+.cm-retire-options{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px}
+.cm-retire-options label{display:flex;align-items:center;gap:7px;padding:7px 9px;border:1px solid #30394b;border-radius:8px;cursor:pointer;font-size:13px}
+.cm-retire-options label:has(input:checked){border-color:#f3bd70;background:rgba(245,174,70,.10)}
+.cm-retire-options input{accent-color:#f59e0b;margin:0}
+.cm-retire-note{margin-top:10px;width:100%;height:34px;border:1px solid #30394b;border-radius:8px;background:#0f1117;color:#e2e8f0;padding:0 10px;font:inherit}
+.cm-retire-note:focus{outline:none;border-color:#f3bd70}
+.cm-retire-error{margin:0;min-height:16px;font-size:12px;color:#f87171}
+.cm-retire-actions{display:flex;justify-content:flex-end;gap:8px}
+.cm-retire-actions button{height:32px;padding:0 14px;border-radius:8px;border:1px solid #30394b;background:transparent;color:#e2e8f0;cursor:pointer;font:inherit}
+.cm-retire-actions button.primary{background:#f59e0b;border-color:#f59e0b;color:#1a1300;font-weight:700}
+@media(max-width:600px){.cm-retire-options{grid-template-columns:repeat(2,minmax(0,1fr))}.cm-upstream-retiring-reasons{max-width:200px}}
 .cm-data-note{margin:0 0 12px;color:#8b96a9;font-size:11px;line-height:1.5}.cm-data-note a{margin-left:8px;color:#aaa5ff;text-decoration:underline}
 .cm-economics-note{margin:0 0 12px;padding:12px 14px;border:1px solid #344055;border-radius:10px;background:#121925;color:#96a3b7;font-size:13px;line-height:1.55}.cm-economics-note.warn{border-color:#72543a;color:#e0ae67;background:rgba(143,89,29,.08)}
 .cm-economics-panel{margin:0 0 14px;border:1px solid #344458;border-radius:12px;background:#111923;overflow:hidden}.cm-economics-panel.ready{border-color:rgba(55,190,145,.35)}.cm-economics-panel.warn{border-color:rgba(224,164,71,.38)}.cm-economics-panel>header{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:13px 15px;border-bottom:1px solid #2c3647;background:#151d29}.cm-economics-panel>header b,.cm-economics-panel>header small{display:block}.cm-economics-panel>header b{font-size:15px}.cm-economics-panel>header small{margin-top:4px;color:#8794a8;font-size:11px}.cm-economics-panel>header>span{font-size:11px;text-align:right;color:#97a4b7}.cm-economics-panel>header>span.ready{color:#66d2aa}.cm-economics-panel>header>span.warn{color:#e2ad60}

@@ -60,6 +60,17 @@ func TestUsageFactRecentAuditWindowSlidesInsteadOfRestarting(t *testing.T) {
 			t.Fatalf("stale cursor kept: %+v", got)
 		}
 	})
+	t.Run("upgrade from the 14-day window jumps the cursor to the 3-day window", func(t *testing.T) {
+		// Production on 2026-11-17: cursor stuck around day 5 of a 14-day window.
+		desired := base(day + 11*usageFactDaySeconds)
+		desired.FromTs, desired.ThroughTs = day+11*usageFactDaySeconds, day+14*usageFactDaySeconds
+		desired.TotalHours, desired.CompletedHours = 3*24, 0
+		got := run(t, base(day+5*usageFactDaySeconds), desired)
+		if got.FromTs != desired.FromTs || got.NextHour != desired.FromTs || got.TotalHours != 72 || got.CompletedHours != 0 ||
+			got.Status != usageFactHistoryJobQueued {
+			t.Fatalf("old cursor not moved into the 3-day window: %+v", got)
+		}
+	})
 	t.Run("a running lease is not taken away", func(t *testing.T) {
 		current := base(day + 96*usageFactHourSeconds)
 		current.Status, current.LeaseOwner, current.LeaseUntil = usageFactHistoryJobRunning, "audit-worker", now.Unix()+60

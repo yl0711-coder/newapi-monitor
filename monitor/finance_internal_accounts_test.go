@@ -301,6 +301,16 @@ func TestChannelManagementReportExcludesConfiguredInternalAccountUsage(t *testin
 		t.Fatal(err)
 	}
 	scope := stabilityScope{FromTs: hour, ToTs: hour + 3600}
+	// Outside the channel cost closure whitelist the pairing can never be
+	// verified: that is reported as a scope limit, not as pending ownership.
+	outside, err := m.buildChannelDataStatus(context.Background(), scope, hour+7200)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := outside.Domains[0].UpstreamUsage; got.InternalFilterStatus != channelInternalCostOutsideClosure || len(got.InternalFilterReasons) != 0 || got.BusinessCostAvailable {
+		t.Fatalf("outside closure: %+v", got)
+	}
+	m.cfg.ChannelCostClosureEnabled, m.cfg.ChannelCostClosureDomains = true, []string{"example.test"}
 	report, err = m.buildChannelManagementReport(context.Background(), scope, hour+7200)
 	if err != nil {
 		t.Fatal(err)
@@ -318,8 +328,11 @@ func TestChannelManagementReportExcludesConfiguredInternalAccountUsage(t *testin
 	if len(report.Domains) != 1 || len(status.Domains) != 1 || !reflect.DeepEqual(report.Domains[0].UpstreamUsage, status.Domains[0].UpstreamUsage) {
 		t.Fatal("sync and channel cost evidence differ")
 	}
-	if !reflect.DeepEqual(status.Domains[0].UpstreamUsage.InternalFilterReasons, []string{channelInternalPairingUnverified, channelInternalOwnershipUnknown}) {
-		t.Fatal("unverified historical ownership not reported")
+	// No cost publication exists for the pair, so the owner falls back to the
+	// channel's own upstream: the pair is unverified for that upstream only,
+	// not an unknown owner that would mark every upstream.
+	if got := status.Domains[0].UpstreamUsage.InternalFilterReasons; !reflect.DeepEqual(got, []string{channelInternalPairingUnverified}) {
+		t.Fatalf("unverified pairing not attributed to the channel's upstream: %v", got)
 	}
 }
 
