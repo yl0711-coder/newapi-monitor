@@ -120,7 +120,7 @@ func (m *Monitor) stabilityHealth(ctx context.Context, nowTime time.Time) stabil
 	}
 	var pending int64
 	if tx := m.storeDB.WithContext(ctx).Model(&StabilityProblemIngestState{}).
-		Where("bucket_ts >= ? AND bucket_ts < ? AND complete = ? AND traffic_class_version = ?",
+		Where("bucket_ts >= ? AND bucket_ts < ? AND complete = ? AND +traffic_class_version = ?",
 			problemLiveFrom, problemTargetTo, false, stabilityTrafficClassificationVersion).Count(&pending); tx.Error == nil {
 		result.ProblemPendingMinutes = pending
 	} else {

@@ -493,7 +493,7 @@ func (m *Monitor) buildCapacityReportFiltered(ctx context.Context, from, to, buc
 }
 
 func (m *Monitor) readCapacityMetricsFiltered(ctx context.Context, from, to int64, channelID int, userID int64, group, model string, now int64) ([]capacityMinuteRow, []capacityDimensionRow, capacitySource, error) {
-	baseWhere := "bucket_ts >= ? AND bucket_ts < ? AND traffic_class_version = ?"
+	baseWhere := "bucket_ts >= ? AND bucket_ts < ? AND +traffic_class_version = ?"
 	baseArgs := []any{from, to, stabilityTrafficClassificationVersion}
 	where := baseWhere
 	args := append([]any{}, baseArgs...)
@@ -564,7 +564,7 @@ func (m *Monitor) readCapacityMetricsFiltered(ctx context.Context, from, to int6
 	}
 	var globalWatermark int64
 	if err := m.storeDB.WithContext(ctx).Raw(`SELECT COALESCE(MAX(bucket_ts),0) FROM `+table+`
-		WHERE traffic_class_version = ? AND bucket_ts < ?`, stabilityTrafficClassificationVersion, to).Scan(&globalWatermark).Error; err != nil {
+		WHERE +traffic_class_version = ? AND bucket_ts < ?`, stabilityTrafficClassificationVersion, to).Scan(&globalWatermark).Error; err != nil {
 		return nil, nil, capacitySource{}, err
 	}
 	note := "分钟事实为已观测结果；最新采集时间不代表区间完整。缺口不补零，完整性不足时不发布区间平均值。"
@@ -578,7 +578,7 @@ func (m *Monitor) readCapacityMetricsFiltered(ctx context.Context, from, to int6
 }
 
 func (m *Monitor) capacityUserBreakdowns(ctx context.Context, from, to int64, channelID int, group, model string) ([]capacityBreakdown, []capacityOption, error) {
-	where := "bucket_ts >= ? AND bucket_ts < ? AND traffic_class_version = ?"
+	where := "bucket_ts >= ? AND bucket_ts < ? AND +traffic_class_version = ?"
 	args := []any{from, to, stabilityTrafficClassificationVersion}
 	if channelID != 0 {
 		where += " AND channel_id = ?"

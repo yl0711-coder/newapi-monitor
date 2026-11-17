@@ -153,3 +153,93 @@ func TestCheckpointIsolationIsBoundedPerRefresh(t *testing.T) {
 		t.Fatalf("member revoked beyond the isolation budget: published=%d err=%v", n, err)
 	}
 }
+
+// regressMemberToDiscovering reproduces production 2026-11-17: a published
+// no-history member gets new activity, its state goes back to discovering
+// (source_floor_checked_at=0) while its signed row stays published.
+func regressMemberToDiscovering(t *testing.T, m *Monitor, userID int64) {
+	t.Helper()
+	if err := m.usageFactsStore().Model(&UsageFactMemberState{}).Where("user_id = ?", userID).Updates(map[string]any{
+		"source_floor_checked_at": int64(0), "source_history_status": "discovering", "coverage_status": "discovering",
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCheckpointIncompleteMemberRevokesOnlyThatMember(t *testing.T) {
+	m, now, _, through := seedUsageCheckpointPair(t)
+	regressMemberToDiscovering(t, m, 31)
+	err := m.validateUsageFactFullHistoryCheckpoint(context.Background(), through)
+	if usageFactCheckpointIncompleteMember(err) != 31 {
+		t.Fatalf("checkpoint error = %v, want incomplete for member 31", err)
+	}
+	if err.Error() != "full-history verification checkpoint incomplete user_id=31" {
+		t.Fatalf("error text changed: %q", err.Error())
+	}
+	var before UsageFactSyncState
+	if err := m.usageFactsStore().First(&before, 1).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	m.refreshUsageFactsReadiness(context.Background(), now)
+
+	if !m.usageFactsReadEnabled() || m.usageFactsReadyThrough.Load() != through {
+		t.Fatalf("one member's incomplete checkpoint closed the whole page: ready=%v through=%d",
+			m.usageFactsReadEnabled(), m.usageFactsReadyThrough.Load())
+	}
+	var publishedIDs []int64
+	if err := m.usageFactsStore().Model(&UsageFactPublishedMember{}).Order("user_id").Pluck("user_id", &publishedIDs).Error; err != nil {
+		t.Fatal(err)
+	}
+	if fmt.Sprint(publishedIDs) != "[32]" {
+		t.Fatalf("published members after isolation=%v, want [32]", publishedIDs)
+	}
+	var after UsageFactSyncState
+	if err := m.usageFactsStore().First(&after, 1).Error; err != nil {
+		t.Fatal(err)
+	}
+	if after.PublishedFingerprint != portalMemberFingerprintFromIDs([]int64{32}) ||
+		after.ServingGeneration != before.ServingGeneration+1 || after.Generation != before.Generation+1 {
+		t.Fatalf("publication not recomputed: before=%+v after=%+v", before, after)
+	}
+	if m.usageFactsServingRevision.Load() != after.ServingGeneration {
+		t.Fatalf("serving revision %d not advanced to %d", m.usageFactsServingRevision.Load(), after.ServingGeneration)
+	}
+	// No day repair is queued for this case: the member's own discovery re-signs it.
+	var repairs int64
+	if err := m.usageFactsStore().Model(&UsageFactJob{}).Where("kind = ?", usageFactHistoryKindRepair).Count(&repairs).Error; err != nil || repairs != 0 {
+		t.Fatalf("unexpected repair jobs=%d err=%v", repairs, err)
+	}
+}
+
+func TestCheckpointIncompleteStaysGlobalInReadOnlySnapshot(t *testing.T) {
+	m, now, floor, through := seedUsageCheckpointPair(t)
+	regressMemberToDiscovering(t, m, 31)
+	m.cfg.LocalSnapshotOnly = true
+	m.cfg.UsageFactsLocalReadOnly = true
+	prod := m.prodDB
+	m.prodDB = nil
+	t.Cleanup(func() { m.prodDB = prod })
+	m.refreshUsageFactsFullHistoryReadiness(context.Background(), now, UsageFactsStatus{
+		SnapshotUsable: true, ReadEnabled: true, PublishedRangeStart: floor, PublishedThrough: through,
+	})
+	if m.usageFactsReadEnabled() {
+		t.Fatal("read-only snapshot must keep the fail-closed global gate")
+	}
+	var n int64
+	if err := m.usageFactsStore().Model(&UsageFactPublishedMember{}).Count(&n).Error; err != nil || n != 2 {
+		t.Fatalf("read-only snapshot was mutated: published=%d err=%v", n, err)
+	}
+}
+
+// Every published member incomplete: each revoke is bounded by the isolation
+// depth, and with no member left the page stays closed rather than serving.
+func TestCheckpointIncompleteAllMembersKeepsPageClosed(t *testing.T) {
+	m, now, _, _ := seedUsageCheckpointPair(t)
+	regressMemberToDiscovering(t, m, 31)
+	regressMemberToDiscovering(t, m, 32)
+	m.refreshUsageFactsReadiness(context.Background(), now)
+	if m.usageFactsReadEnabled() {
+		t.Fatal("page reopened with no verified member")
+	}
+}

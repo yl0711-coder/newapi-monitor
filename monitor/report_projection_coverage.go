@@ -44,13 +44,13 @@ func capacityProjectionCoverage(ctx context.Context, db *gorm.DB, from, to int64
 	 ttft_500,ttft_1k,ttft_2k,ttft_5k,ttft_10k,ttft_inf,ttft_observed,ttft_over_3s,
 	 ttft_max_ms AS metric_max,0 AS user_max,1 AS metric_row,0 AS user_row,
 	 CASE WHEN (`+ttftInvalidRowPredicate("metric_samples")+`) THEN 1 ELSE 0 END AS invalid_row
-	 FROM metric_samples WHERE bucket_ts>=? AND bucket_ts<? AND traffic_class_version=?
+	 FROM metric_samples WHERE bucket_ts>=? AND bucket_ts<? AND +traffic_class_version=?
 	 UNION ALL
 	 SELECT bucket_ts,channel_id,model_name,grp,-success,-anomaly,-failed,-tokens,
 	 -ttft_500,-ttft_1k,-ttft_2k,-ttft_5k,-ttft_10k,-ttft_inf,-ttft_observed,-ttft_over_3s,
 	 0 AS metric_max,ttft_max_ms AS user_max,0 AS metric_row,1 AS user_row,
 	 CASE WHEN (`+ttftInvalidRowPredicate("capacity_user_minute_samples")+`) THEN 1 ELSE 0 END AS invalid_row
-	 FROM capacity_user_minute_samples WHERE bucket_ts>=? AND bucket_ts<? AND traffic_class_version=?
+	 FROM capacity_user_minute_samples WHERE bucket_ts>=? AND bucket_ts<? AND +traffic_class_version=?
 	 ) GROUP BY bucket_ts,channel_id,model_name,grp
 	)`, from, to, stabilityTrafficClassificationVersion, from, to, stabilityTrafficClassificationVersion).Scan(&result).Error
 	if err == nil && cache != nil {

@@ -156,7 +156,7 @@ func (m *Monitor) modelStatisticsTTFTRowsCoverage(ctx context.Context, from, to 
 	}
 	var old int64
 	err := m.storeDB.WithContext(ctx).Raw(`SELECT COUNT(*) FROM capacity_user_minute_samples
-		WHERE bucket_ts >= ? AND bucket_ts < ? AND traffic_class_version = ?
+		WHERE bucket_ts >= ? AND bucket_ts < ? AND +traffic_class_version = ?
 		  AND (((success + anomaly + failed > 0 OR tokens <> 0 OR quota <> 0 OR refund_quota <> 0)
 		        AND COALESCE(ttft_semantics_version,0) <> ?)
 		       OR `+ttftInvalidRowPredicate("capacity_user_minute_samples")+`)`, from, to,

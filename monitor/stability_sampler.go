@@ -236,7 +236,7 @@ func (m *Monitor) stabilityProblemNeedsCatchup(targetTo int64) bool {
 func (m *Monitor) nextUncoveredProblemWindow(fromTs, toTs int64) (int64, int64, error) {
 	var rows []StabilityProblemIngestState
 	if err := m.storeDB.Select("bucket_ts", "complete").Where(
-		"bucket_ts >= ? AND bucket_ts < ? AND traffic_class_version = ?", fromTs, toTs, stabilityTrafficClassificationVersion).Find(&rows).Error; err != nil {
+		"bucket_ts >= ? AND bucket_ts < ? AND +traffic_class_version = ?", fromTs, toTs, stabilityTrafficClassificationVersion).Find(&rows).Error; err != nil {
 		return 0, 0, err
 	}
 	complete := make(map[int64]bool, len(rows))
@@ -568,7 +568,7 @@ func (m *Monitor) advanceStabilityProblemLiveCursor(cursor *StabilityProblemLive
 	var complete []int64
 	if probeTo > next {
 		if err := m.storeDB.Model(&StabilityProblemIngestState{}).
-			Where("bucket_ts >= ? AND bucket_ts < ? AND complete = ? AND traffic_class_version = ?",
+			Where("bucket_ts >= ? AND bucket_ts < ? AND complete = ? AND +traffic_class_version = ?",
 				next, probeTo, true, stabilityTrafficClassificationVersion).
 			Order("bucket_ts").Pluck("bucket_ts", &complete).Error; err != nil {
 			return err
@@ -1014,7 +1014,7 @@ func (m *Monitor) advanceStabilityProblemMigration(state *StabilityProblemClassi
 	var complete []int64
 	if probeTo > next {
 		if err := m.storeDB.Model(&StabilityProblemIngestState{}).
-			Where("bucket_ts >= ? AND bucket_ts < ? AND complete = ? AND traffic_class_version = ?",
+			Where("bucket_ts >= ? AND bucket_ts < ? AND complete = ? AND +traffic_class_version = ?",
 				next, probeTo, true, stabilityTrafficClassificationVersion).
 			Order("bucket_ts").Pluck("bucket_ts", &complete).Error; err != nil {
 			return err

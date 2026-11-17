@@ -81,7 +81,7 @@ func (m *Monitor) modelFRTRowsGrouped(ctx context.Context, from, to int64, filte
    SUM(CASE WHEN COALESCE(ttft_semantics_version,0) <> ? THEN 1 ELSE 0 END) AS historical_rows,
    SUM(CASE WHEN (` + invalid + `) THEN 1 ELSE 0 END) AS invalid_rows
    FROM capacity_user_minute_samples
-   WHERE bucket_ts >= ? AND bucket_ts < ? AND traffic_class_version = ? AND user_id >= 0 ` + where + `
+   WHERE bucket_ts >= ? AND bucket_ts < ? AND +traffic_class_version = ? AND user_id >= 0 ` + where + `
    GROUP BY ` + minuteColumn + `grp, model_name, user_id, channel_id
    HAVING SUM(CASE WHEN success+anomaly+failed > 0 THEN success+anomaly+failed ELSE 0 END) > 0
   ) GROUP BY ` + minuteColumn + `channel_id, grp, model LIMIT ?`
