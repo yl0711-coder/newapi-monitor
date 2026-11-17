@@ -54,7 +54,13 @@ const (
 	usageFactHistoryLocalAuditCycle  = 24 * time.Hour
 	usageFactHistorySourceAuditCycle = 30 * 24 * time.Hour
 	usageFactHistoryRecentAuditCycle = 24 * time.Hour
-	usageFactHistoryRecentAuditDays  = 14
+	// The recent audit re-reads the newest closed days to catch logs that
+	// reached the source after the live tail had read their hour. Three days
+	// covers replica lag and late writes; removed/rewritten logs are handled by
+	// the source shrink protection, and older history by the 30-day rolling
+	// audit. 14 days (until v1.18.64) needed ~8x the cold lane's raw-page
+	// throughput and never completed a cycle.
+	usageFactHistoryRecentAuditDays = 3
 )
 
 var (

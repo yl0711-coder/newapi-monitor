@@ -3438,7 +3438,7 @@ function usageFactsStageLabel(stage){
   return ({
     full_history_discover:'发现来源边界',full_history_backfill:'回填历史',full_history_tail:'追平尾部',full_history_verify:'持久校验',
     full_history_repair:'精确日修复',full_history_repair_hour:'小时降档修复',full_history_source_audit_hour:'逐小时来源核验',full_history_local_audit:'本地滚动审计',
-    full_history_source_audit:'冷历史来源审计',full_history_recent_source_audit:'近14天来源审计'
+    full_history_source_audit:'冷历史来源审计',full_history_recent_source_audit:'近3天来源审计'
   })[stage]||'等待调度';
 }
 function usageFactsEstimateText(h){
