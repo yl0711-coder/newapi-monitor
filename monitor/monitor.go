@@ -180,6 +180,7 @@ type Monitor struct {
 	metricFinalizeLastFailure       atomic.Int64
 	problemLastSuccess              atomic.Int64 // 原始错误采集器最近一次成功执行
 	problemLastFailure              atomic.Int64 // 原始错误采集器最近一次失败
+	usageFactRecentControlVerified  atomic.Int64 // 近期审计由控制数预检直接通过的成员日数(进程内累计)
 	problemLiveThrough              atomic.Int64 // 原始错误实时 lane 已确认到的分钟右水位
 	problemSourceFrom               atomic.Int64 // 当前问题采集请求窗口左水位
 	problemSourceTarget             atomic.Int64 // 当前问题采集请求窗口目标右水位
