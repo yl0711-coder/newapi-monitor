@@ -180,6 +180,7 @@ type Monitor struct {
 	metricFinalizeLastFailure       atomic.Int64
 	problemLastSuccess              atomic.Int64 // 原始错误采集器最近一次成功执行
 	problemLastFailure              atomic.Int64 // 原始错误采集器最近一次失败
+	egressTimeout                   egressTimeoutWatchState
 	usageFactRecentControlVerified  atomic.Int64 // 近期审计由控制数预检直接通过的成员日数(进程内累计)
 	problemLiveThrough              atomic.Int64 // 原始错误实时 lane 已确认到的分钟右水位
 	problemSourceFrom               atomic.Int64 // 当前问题采集请求窗口左水位
@@ -880,6 +881,7 @@ func (m *Monitor) Start(ctx context.Context) {
 	// 阶段四 Shadow 只有在 CloudWatch 与 Nginx 结构化日志契约均显式
 	// 准入后才会启动；默认配置不会创建后台任务或访问 AWS。
 	m.startCloudWatchPreRoute(ctx)
+	m.startEgressTimeoutWatch(ctx)
 	m.startCloudWatchNginx(ctx)
 	m.startCloudWatchShadow(ctx)
 	if ecsLogRuntimeEnabled(m.cfg) {

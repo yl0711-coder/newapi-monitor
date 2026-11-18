@@ -23,6 +23,7 @@ const (
 	cwQueryWorkerShadowReject    cloudWatchFixedQueryKind = "worker_shadow_reject"
 	cwQueryWorkerPreRouteReject  cloudWatchFixedQueryKind = "worker_preroute_reject"
 	cwQueryWorkerNginxContinuous cloudWatchFixedQueryKind = "worker_nginx_continuous"
+	cwQueryWorkerEgressTimeout   cloudWatchFixedQueryKind = "worker_egress_dial_timeout"
 )
 
 type cloudWatchInsightsRequest struct {
@@ -142,6 +143,20 @@ func buildCloudWatchInsightsQuery(req cloudWatchInsightsRequest) (cloudWatchLogS
 		// 只允许结构化 access 和标准 error.log 行进入解析器。nginx/ 前缀下
 		// 的启动/运行噪声既不是请求事实也不是错误分类，必须在 AWS 查询侧排除。
 		query = "filter @logStream like /^nginx\\// | filter (ispresent(request_method) and ispresent(uri) and ispresent(status) and ispresent(request_time)) or @message like /\\[(emerg|alert|crit|error|warn|notice)\\]/ | fields @timestamp, @logStream, @ptr, @message, nginx_request_id, oneapi_request_id, request_method, uri, status, request_time, upstream_status, upstream_response_time, upstream_connect_time, upstream_header_time, bytes_sent, request_length, request_completion"
+	case cwQueryWorkerEgressTimeout:
+		if strings.TrimSpace(req.Value) != "" {
+			return cloudWatchLogSource{}, "", 0, newCloudWatchLogsError(cwLogsErrInvalid, "egress_query_value", nil)
+		}
+		source, err := cloudWatchLogSourceByID(cwSourceWorkerNewAPI)
+		if err != nil {
+			return cloudWatchLogSource{}, "", 0, err
+		}
+		// Counts only: no log text leaves CloudWatch. One row per instance log
+		// stream and upstream address.
+		query = "filter @logStream like /^new-api\\// | filter @message like /dial tcp/ and @message like /i\\/o timeout/" +
+			" | parse @message /dial tcp (?<upstream>[0-9a-fA-F.:\\[\\]]+?):(?<port>[0-9]+): i\\/o timeout/" +
+			" | stats count(*) as timeouts by @logStream, upstream"
+		return source, fmt.Sprintf("%s | sort timeouts desc | limit %d", query, limit), limit, nil
 	default:
 		return cloudWatchLogSource{}, "", 0, newCloudWatchLogsError(cwLogsErrInvalid, "query_kind", nil)
 	}
