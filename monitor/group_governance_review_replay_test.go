@@ -43,11 +43,11 @@ func TestGGReviewReadOnlyReport(t *testing.T) {
 		if e != nil {
 			return e
 		}
-		var prior GroupGovernanceRealtimeState
-		if e = tx.Where("id=1").First(&prior).Error; e != nil {
+		prior, e := loadGGRealtimeView(tx)
+		if e != nil {
 			return e
 		}
-		if e = json.Unmarshal([]byte(prior.ControlJSON), &control); e != nil {
+		if e = json.Unmarshal(prior.Control, &control); e != nil {
 			return e
 		}
 		candidate, e = m.readGroupGovernanceMetrics(ctx, time.Now())

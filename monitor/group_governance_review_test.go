@@ -55,10 +55,12 @@ func TestGGConfigExpiryPreservesEvidenceAndTimestampDoesNotReset(t *testing.T) {
 		if e := m.syncGroupGovernanceRealtime(context.Background(), modelFRTTestNow); e != nil {
 			t.Fatal(e)
 		}
-		var s GroupGovernanceRealtimeState
-		m.storeDB.First(&s, 1)
+		s, err := loadGGRealtimeView(m.storeDB)
+		if err != nil {
+			t.Fatal(err)
+		}
 		var r ggRealtimeReport
-		if err := json.Unmarshal([]byte(s.ReportJSON), &r); err != nil {
+		if err := json.Unmarshal(s.Report, &r); err != nil {
 			t.Fatal(err)
 		}
 		return r

@@ -576,7 +576,7 @@ func usageLogsCursor(c *gin.Context) (*usageLogCursor, error) {
 // page's full rows. The window count covers at most size+1 IDs, never the
 // complete filtered result. In particular, a large content/other value on
 // the next page must not be read or transferred just to determine has_more.
-func usageLogsPageSQL(where *usageLogWhere, page, size int, cursor *usageLogCursor, deferTotal bool) (string, []any) {
+func usageLogsPageSQL(where *usageLogWhere, source string, page, size int, cursor *usageLogCursor, deferTotal bool) (string, []any) {
 	pageWhere := &usageLogWhere{clauses: append([]string{}, where.clauses...), args: append([]any{}, where.args...)}
 	offset := (page - 1) * size
 	if page > 1 && cursor != nil {
@@ -585,11 +585,11 @@ func usageLogsPageSQL(where *usageLogWhere, page, size int, cursor *usageLogCurs
 	}
 	args := append([]any{}, pageWhere.args...)
 	if !deferTotal {
-		return usageLogsSelect + usageLogColumns + " FROM logs JOIN (SELECT id AS page_id FROM logs" + pageWhere.sql() +
+		return usageLogsSelect + usageLogColumns + " FROM logs JOIN (SELECT id AS page_id FROM " + source + pageWhere.sql() +
 			" ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?) page ON logs.id = page.page_id ORDER BY created_at DESC, id DESC", append(args, size, offset)
 	}
 	return usageLogsSelect + usageLogColumns + ", page.page_matches FROM logs JOIN (" +
-		"SELECT page_id, COUNT(*) OVER() AS page_matches FROM (SELECT id AS page_id, created_at AS page_created_at FROM logs" + pageWhere.sql() +
+		"SELECT page_id, COUNT(*) OVER() AS page_matches FROM (SELECT id AS page_id, created_at AS page_created_at FROM " + source + pageWhere.sql() +
 		" ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?) lookahead ORDER BY page_created_at DESC, page_id DESC LIMIT ?) page ON logs.id = page.page_id ORDER BY created_at DESC, id DESC", append(args, size+1, offset, size)
 }
 
@@ -619,16 +619,37 @@ func (m *Monitor) serveUsageLogsList(c *gin.Context) {
 		return
 	}
 	deferTotal := c.Query("defer_total") == "1"
+	// The page rows take the same user_id switch as COUNT/SUM: it is made only
+	// when it selects exactly the username's rows (usageLogsUsernameUserID).
+	// Without it, username + channel intersected two whole-history indexes on
+	// production and hit the 18s cap. A failed check keeps the username plan.
+	pageFilter, indexErr := usageLogsWithUserIndex(ctx, db, f)
+	if indexErr == nil && pageFilter.UserID > 0 {
+		if userWhere, werr := buildUsageLogWhere(pageFilter, usageLogWhereList); werr == nil {
+			where = userWhere
+		} else {
+			pageFilter = f
+		}
+	} else if indexErr != nil {
+		pageFilter = f
+	}
 	var total int64
 	if !deferTotal {
 		countStarted := time.Now()
-		countFilter, err := usageLogsWithUserIndex(ctx, db, f)
+		countFilter, err := pageFilter, indexErr
 		var countWhere *usageLogWhere
 		if err == nil {
 			countWhere, err = buildUsageLogWhere(countFilter, usageLogWhereList)
 		}
+		countSource := "logs"
+		skipCount := false
 		if err == nil {
-			err = db.QueryRowContext(ctx, usageLogsSelect+"COUNT(*) FROM logs"+countWhere.sql(), countWhere.args...).Scan(&total)
+			var empty bool
+			countWhere, countSource, empty, _ = m.usageLogsWithIDSpan(ctx, db, countFilter, countWhere)
+			skipCount = empty
+		}
+		if err == nil && !skipCount {
+			err = db.QueryRowContext(ctx, usageLogsSelect+"COUNT(*) FROM "+countSource+countWhere.sql(), countWhere.args...).Scan(&total)
 		}
 		usageLogsObserve("list_count", countStarted, countFilter)
 		if err != nil {
@@ -647,7 +668,7 @@ func (m *Monitor) serveUsageLogsList(c *gin.Context) {
 			return
 		}
 	}
-	query, args := usageLogsPageSQL(where, page, size, cursor, deferTotal)
+	query, args := usageLogsPageSQL(where, m.usageLogsPageSource(pageFilter), page, size, cursor, deferTotal)
 	// Late row lookup: page through the (created_at, id) order using only the
 	// index (a created_at/id index covers a time-only filter), then read the
 	// full rows, including the large content/other columns, for this page only.
@@ -655,7 +676,7 @@ func (m *Monitor) serveUsageLogsList(c *gin.Context) {
 	pageStarted := time.Now()
 	rows, err := db.QueryContext(ctx, query, args...)
 	if err != nil {
-		usageLogsObserve("list_page", pageStarted, f)
+		usageLogsObserve("list_page", pageStarted, pageFilter)
 		usageLogsFail(c, fmt.Errorf("查询使用日志失败: %w", usageLogsQueryErr(ctx, err)))
 		return
 	}
@@ -667,7 +688,7 @@ func (m *Monitor) serveUsageLogsList(c *gin.Context) {
 		items, err = scanUsageLogRows(rows)
 	}
 	rows.Close()
-	usageLogsObserve("list_page", pageStarted, f)
+	usageLogsObserve("list_page", pageStarted, pageFilter)
 	if err != nil {
 		usageLogsFail(c, fmt.Errorf("查询使用日志失败: %w", usageLogsQueryErr(ctx, err)))
 		return
@@ -720,8 +741,13 @@ func (m *Monitor) serveUsageLogsCount(c *gin.Context) {
 	if err == nil && countFilter.UserID > 0 {
 		where, err = buildUsageLogWhere(countFilter, usageLogWhereList)
 	}
+	source := "logs"
+	empty := false
 	if err == nil {
-		err = db.QueryRowContext(ctx, usageLogsSelect+"COUNT(*) FROM logs"+where.sql(), where.args...).Scan(&total)
+		where, source, empty, _ = m.usageLogsWithIDSpan(ctx, db, countFilter, where)
+	}
+	if err == nil && !empty {
+		err = db.QueryRowContext(ctx, usageLogsSelect+"COUNT(*) FROM "+source+where.sql(), where.args...).Scan(&total)
 	}
 	usageLogsObserve("list_count", started, countFilter)
 	if err != nil {
@@ -873,7 +899,12 @@ func (m *Monitor) serveUsageLogsStat(c *gin.Context) {
 	var quota, rpm, prompt, completion int64
 	if !skipQuota {
 		quotaStarted := time.Now()
-		err = db.QueryRowContext(ctx, usageLogsSelect+"COALESCE(SUM(quota),0) FROM logs"+quotaWhere.sql(), quotaWhere.args...).Scan(&quota)
+		var quotaSource string
+		var emptySpan bool
+		quotaWhere, quotaSource, emptySpan, _ = m.usageLogsWithIDSpan(ctx, db, statFilter, quotaWhere)
+		if !emptySpan {
+			err = db.QueryRowContext(ctx, usageLogsSelect+"COALESCE(SUM(quota),0) FROM "+quotaSource+quotaWhere.sql(), quotaWhere.args...).Scan(&quota)
+		}
 		usageLogsObserve("stat_quota", quotaStarted, statFilter)
 		if err != nil {
 			err = usageLogsQueryErr(ctx, err)

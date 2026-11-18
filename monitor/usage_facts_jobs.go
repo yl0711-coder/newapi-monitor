@@ -1544,6 +1544,13 @@ func (m *Monitor) syncNextUsageFactHistoryAuditWork(ctx context.Context, owner s
 		}
 		tuning.auditCursor = (index + 1) % len(kinds)
 		if m.usageFactsRawPageImportEnabled() {
+			if kind == usageFactHistoryKindRecentAudit {
+				// An unchanged recent day is proven by its source control alone;
+				// only a changed or unprovable day takes 24 hourly raw-page reads.
+				if handled, err := m.verifyRecentUsageFactAuditByControl(ctx, claim, now); handled {
+					return true, err
+				}
+			}
 			return true, m.downgradeUsageFactSourceAuditToHourly(ctx, claim, nil, now)
 		}
 		return true, m.executeUsageFactHistorySourceAudit(ctx, claim, now)

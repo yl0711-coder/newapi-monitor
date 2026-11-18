@@ -361,21 +361,22 @@ func TestGGRecordedPopulationPublicationBudget(t *testing.T) {
 	if err = m.syncGroupGovernanceRealtime(context.Background(), now); err != nil {
 		t.Fatal(err)
 	}
-	var publication GroupGovernanceRealtimeState
-	if err = m.storeDB.First(&publication, 1).Error; err != nil {
+	publication, err := loadGGRealtimeView(m.storeDB)
+	if err != nil || !publication.Found {
 		t.Fatal(err)
 	}
 	var control ggControl
-	if err = json.Unmarshal([]byte(publication.ControlJSON), &control); err != nil {
+	reportRaw, controlRaw := publication.Report, publication.Control
+	if err = json.Unmarshal(controlRaw, &control); err != nil {
 		t.Fatal(err)
 	}
-	if len(publication.ReportJSON)+len(publication.ControlJSON) > 16<<20 {
+	if len(reportRaw)+len(controlRaw) > 16<<20 {
 		t.Fatal("unbounded publication")
 	}
 	if out := os.Getenv("GG_RECORDED_OUT"); out != "" {
-		if err = os.WriteFile(out, []byte(publication.ReportJSON), 0600); err != nil {
+		if err = os.WriteFile(out, reportRaw, 0600); err != nil {
 			t.Fatal(err)
 		}
 	}
-	t.Logf("recorded rows=%d channels=%d report_bytes=%d control_bytes=%d active_histories=%d elapsed_ms=%d", len(samples), len(fixture.Channels), len(publication.ReportJSON), len(publication.ControlJSON), len(control.Metrics), time.Since(start).Milliseconds())
+	t.Logf("recorded rows=%d channels=%d report_bytes=%d control_bytes=%d active_histories=%d elapsed_ms=%d", len(samples), len(fixture.Channels), len(reportRaw), len(controlRaw), len(control.Metrics), time.Since(start).Milliseconds())
 }

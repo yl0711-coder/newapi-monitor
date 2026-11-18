@@ -331,6 +331,11 @@ type Settings struct {
 	CloudWatchPreRoutePollSeconds     int  // MONITOR_CLOUDWATCH_PREROUTE_POLL_SECONDS，默认 300
 	CloudWatchPreRouteLivePollSeconds int  // 新封口分钟的增量周期，默认 60；20 分钟迟到重放仍使用 PollSeconds
 	CloudWatchPreRouteLookbackHours   int  // MONITOR_CLOUDWATCH_PREROUTE_LOOKBACK_HOURS，默认 168
+	// EgressTimeoutAlertEnabled 每 5 分钟用 CloudWatch 统计各 new-api 实例连接上游的
+	// i/o timeout，集中在单个实例时发服务端告警（出口 IP 被阻断）。需要
+	// CloudWatch 日志已启用；只读计数，不读日志正文。
+	EgressTimeoutAlertEnabled bool // MONITOR_EGRESS_TIMEOUT_ALERT_ENABLED，默认 true
+	EgressTimeoutAlertMin     int  // MONITOR_EGRESS_TIMEOUT_ALERT_MIN，单实例近 10 分钟超时次数阈值，默认 10
 	// CloudWatchNginxEnabled 让 Monitor 持续读取结构化 Nginx access/error，
 	// 按分钟聚合后写入现有 Nginx 本地事实表。它是旧 nginxcollector 的替代
 	// 来源，不保存原始日志，也不改变人工按需排障的查询路径。
@@ -615,6 +620,8 @@ func LoadSettings() Settings {
 		CloudWatchPreRoutePollSeconds:            envInt("MONITOR_CLOUDWATCH_PREROUTE_POLL_SECONDS", 300),
 		CloudWatchPreRouteLivePollSeconds:        envInt("MONITOR_CLOUDWATCH_PREROUTE_LIVE_POLL_SECONDS", 60),
 		CloudWatchPreRouteLookbackHours:          envInt("MONITOR_CLOUDWATCH_PREROUTE_LOOKBACK_HOURS", 168),
+		EgressTimeoutAlertEnabled:                env("MONITOR_EGRESS_TIMEOUT_ALERT_ENABLED", "true") == "true",
+		EgressTimeoutAlertMin:                    envInt("MONITOR_EGRESS_TIMEOUT_ALERT_MIN", 10),
 		CloudWatchNginxEnabled:                   env("MONITOR_CLOUDWATCH_NGINX_ENABLED", "false") == "true",
 		CloudWatchNginxPollSeconds:               envInt("MONITOR_CLOUDWATCH_NGINX_POLL_SECONDS", 300),
 		CloudWatchNginxLookbackHours:             envInt("MONITOR_CLOUDWATCH_NGINX_LOOKBACK_HOURS", 168),

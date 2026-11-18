@@ -233,14 +233,10 @@ func (m *Monitor) loop(ctx context.Context, interval time.Duration) {
 					// 延迟 10 分钟再确认完整分钟，覆盖 360 秒长请求和日志落库抖动；高峰积压时
 					// 采集器按本地游标续跑，不会把超限窗口直接丢掉。
 					problemTargetTo := now - stabilityProblemFinalizeDelaySec
-					if _, err := m.sampleStabilityProblems(ctx, problemTargetTo-2*problemEvery-120, problemTargetTo); err != nil {
-						m.problemLastFailure.Store(now)
-						slog.Warn("稳定性原始错误采样失败(忽略,不影响主采样)", "err", err)
-					} else {
-						m.problemLastSuccess.Store(now)
-					}
+					_, err := m.sampleStabilityProblems(ctx, problemTargetTo-2*problemEvery-120, problemTargetTo)
+					gateYield := m.noteStabilityProblemLiveResult(now, err)
 					liveFrom := problemTargetTo - 2*problemEvery - 120
-					if m.stabilityProblemPendingCountInRange(liveFrom/60*60, problemTargetTo/60*60) > 0 ||
+					if gateYield || m.stabilityProblemPendingCountInRange(liveFrom/60*60, problemTargetTo/60*60) > 0 ||
 						m.stabilityProblemNeedsCatchup(problemTargetTo) {
 						nextProblemSample = now + 60 // 有积压时加快追赶，但每轮读取预算仍固定。
 					} else {
@@ -1758,4 +1754,26 @@ func (m *Monitor) heartbeat() {
 		return // 失败忽略,绝不影响监控主流程
 	}
 	resp.Body.Close()
+}
+
+// noteStabilityProblemLiveResult records one live raw-error sampling turn and
+// reports whether it only yielded the source slot.
+//
+// A gate-wait timeout means the source slot stayed busy past the wait budget:
+// no query ran and the durable cursor did not move. Stamping it as a failure
+// marked /ready degraded (stability_problem_failed) about four times a day on
+// production (2026-11-18). It is logged as a yield and retried next minute;
+// persistent starvation still surfaces as stability_problem_stale.
+func (m *Monitor) noteStabilityProblemLiveResult(now int64, err error) (gateYield bool) {
+	switch {
+	case errors.Is(err, errStabilityProblemSourceGateWait):
+		slog.Info("稳定性原始错误采样让出来源槽(下分钟重试)", "err", err)
+		return true
+	case err != nil:
+		m.problemLastFailure.Store(now)
+		slog.Warn("稳定性原始错误采样失败(忽略,不影响主采样)", "err", err)
+	default:
+		m.problemLastSuccess.Store(now)
+	}
+	return false
 }
