@@ -91,7 +91,19 @@ function internalCostReasons(usage){
   if(usage.internal_filter_status==='inconsistent')return [internalReasonLabels.amount_inconsistent];
   return ['内部账号成本核验状态待确认；不代表普通回填完成即可恢复'];
 }
-function issues(report){
+// The latest hours of a provisional bill may still be in the upstream's
+// settlement or our hourly sync; a wider gap is reported as an issue.
+const provisionalTailHours=2;
+function provisionalBillReason(account){
+  return account.provider==='openox'?'OpenOx 含上游估算记录，金额暂定；不会根据单价重建扣款':account.provider==='volcengine'?'火山引擎最近一天的账单仍在出账，金额会随复核更新；结束 24 小时后定稿':'春秋当前日小时金额来自已采集明细，尚待跨日后与日账单总数核对；迟到或修正记录可能更新金额';
+}
+// pendingBills lists accounts whose only open item is a still-settling bill.
+function pendingBills(report){
+  const pending=[];
+  issues(report,pending);
+  return pending;
+}
+function issues(report,pending){
   const rows=[],coverage=report?.meta?.data_coverage;
 	const internal=report?.internal_accounts||{};
 	if(internal.enabled&&report.internal_scope_complete!==true){
@@ -108,7 +120,7 @@ function issues(report){
     rows.push({scope:'用户侧用量',detail:detail+pending+'。请求数、Tokens、消费及占比按现有记录计算，可能低于最终值。'});
   }
   for(const domain of report?.domains||[]){
-    const account=domain.upstream||{},usage=billView(domain).usage,reasons=[];
+    const account=domain.upstream||{},usage=billView(domain).usage,reasons=[],pendingReasons=[];
     if(!account.configured||account.sync_paused){
       continue;
     }
@@ -123,8 +135,16 @@ function issues(report){
         if(integrity!=='complete')reasons.push(integrityReasons[integrity]||'账单校验未通过，金额未计入汇总');
         else{
           if(!known(usage.cost_usd))reasons.push('消费金额未返回，未计入消费汇总');
-          if(usage.provisional)reasons.push(account.provider==='openox'?'OpenOx 含上游估算记录，金额暂定；不会根据单价重建扣款':account.provider==='volcengine'?'火山引擎最近一天的账单仍在出账，金额会随复核更新；结束 24 小时后定稿':'春秋当前日小时金额来自已采集明细，尚待跨日后与日账单总数核对；迟到或修正记录可能更新金额');
-          if(!usage.complete&&(!usage.provisional||usage.completed_hours<usage.expected_hours))reasons.push(`账单已覆盖 ${usage.completed_hours||0}/${usage.expected_hours||0} 小时，汇总仅含已校验金额`);
+          // A provisional bill is the upstream's still-settling latest day: an
+          // expected state, not a data fault. It is noted apart from the issue
+          // count unless real gaps remain (more than the latest two hours).
+          if(usage.provisional)pendingReasons.push(provisionalBillReason(account));
+          const gap=(usage.expected_hours||0)-(usage.completed_hours||0);
+          if(!usage.complete&&(!usage.provisional||gap>0)){
+            const coverage=`账单已覆盖 ${usage.completed_hours||0}/${usage.expected_hours||0} 小时，汇总仅含已校验金额`;
+            if(usage.provisional&&gap<=provisionalTailHours)pendingReasons.push(coverage);
+            else reasons.push(coverage);
+          }
           if(!usage.adjusted_cost_available)reasons.push(usage.adjusted_cost_status==='subscription_cost_unallocated'?'OpenOx 用量含订阅抵扣，未完成现金成本分摊，不计入修正成本':usage.adjusted_cost_status==='bucket_boundary_ambiguous'?'充值比例在账单桶中途变化，修正消费无法精确拆分':'缺少对应时段充值比例证据，未计入修正消费汇总');
           else if(!known(usage.adjusted_cost_usd))reasons.push('修正消费金额未返回，未计入修正消费汇总');
           reasons.push(...internalCostReasons(usage));
@@ -136,7 +156,8 @@ function issues(report){
       const syncReason=usageSyncReasons[account.usage_effective_status||account.usage_status];
       if(syncReason)reasons.push(syncReason);
     }
-    if(reasons.length)rows.push({scope:domain.domain,detail:reasons.join('；')});
+    if(reasons.length)rows.push({scope:domain.domain,detail:[...reasons,...pendingReasons].join('；')});
+    else if(pendingReasons.length&&pending)pending.push({scope:domain.domain,detail:pendingReasons.join('；')});
   }
   return rows;
 }
@@ -154,9 +175,11 @@ function render(report){
   const closureNote=outsideClosure.length?`<p class="muted">${outsideClosure.length} 个上游未纳入渠道成本闭环试点，内部测试账号的成本无法从这些上游账单中扣除；成本按上游原账单统计（含内部测试成本），不作为数据异常。</p>`:'';
   const pausedNote=paused.length?`<p class="muted">${paused.length} 个上游已标记停止使用、没有启用渠道且 48 小时内无调用，已暂停自动同步余额和日志，不作为同步故障：${esc(paused.map(d=>d.domain).join('、'))}。</p>`:'';
   const configurationNote=unconfigured.length?`<p class="muted">${unconfigured.length} 个上游未配置，暂不采集，不作为同步故障；有消费而成本未知的部分不能按零成本核算。</p>`:'';
+  const settling=pendingBills(report);
+  const settlingNote=settling.length?`<p class="muted">${settling.length} 个上游当日账单仍在结算，金额暂定、后续可能更新，不作为数据异常：${esc(settling.map(row=>row.scope).join('、'))}。</p>`:'';
   const dailyNotes=(report?.domains||[]).filter(domain=>billView(domain).daily).map(domain=>`<p class="muted">${esc(domain.domain)}：${esc(billRangeNote(billView(domain).daily))}。上游按自然日出账，渠道卡片单独展示，不计入精确区间汇总。</p>`).join('');
   return `<p class="muted">渠道管理当前日期范围（全部账户）：${esc(time(meta.from_ts))} → ${esc(time(meta.to_ts))}（结束时间不含）。仅检查本地数据，不触发补数。</p>`+
-    (rows.length?`<div class="sync-status bad">${rows.length} 项数据异常 / 待核验</div><div class="sync-upstream-list">${rows.map(row=>`<article class="sync-upstream-account"><b class="sync-upstream-error">${esc(row.scope)}</b><p class="sync-upstream-error">${esc(row.detail)}</p></article>`).join('')}</div>`:'<span class="sync-status ok">用量覆盖与可用账单校验通过</span>')+closureNote+pausedNote+configurationNote+dailyNotes;
+    (rows.length?`<div class="sync-status bad">${rows.length} 项数据异常 / 待核验</div><div class="sync-upstream-list">${rows.map(row=>`<article class="sync-upstream-account"><b class="sync-upstream-error">${esc(row.scope)}</b><p class="sync-upstream-error">${esc(row.detail)}</p></article>`).join('')}</div>`:'<span class="sync-status ok">用量覆盖与可用账单校验通过</span>')+settlingNote+closureNote+pausedNote+configurationNote+dailyNotes;
 }
-window.channelDataStatus={issues,note,render,known,billView,billRangeNote,billSyncNote,balanceSnapshot};
+window.channelDataStatus={issues,pendingBills,note,render,known,billView,billRangeNote,billSyncNote,balanceSnapshot};
 })();
