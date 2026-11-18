@@ -16,7 +16,7 @@ let rowTotal=0,hasMore=false,nextCursor="",loading=false,generation=0,abort=null
 let refreshTimer=null,active=false;
 let paged=false;
 const $=id=>document.getElementById(id);
-const esc=s=>String(s==null?"":s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+const esc=s=>String(s==null?"":s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const nfmt=n=>(+n||0).toLocaleString("zh-CN");
 const cstToday=()=>{
   const p=new Intl.DateTimeFormat('zh-CN',{timeZone:'Asia/Shanghai',year:'numeric',month:'2-digit',day:'2-digit'}).formatToParts(new Date());

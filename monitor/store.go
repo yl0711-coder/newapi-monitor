@@ -925,6 +925,10 @@ var (
 // openStore 打开本地采样库并迁移表结构。
 func (m *Monitor) openStore(path string) error {
 	m.cfg.StorePath = path
+	if m.startupTimer == nil {
+		m.startupTimer = newStartupTimer()
+	}
+	timer := m.startupTimer
 	// A runtime restore publishes two SQLite files separately, guarded by a
 	// durable IN_PROGRESS -> READY -> ACTIVATED protocol. Validate/activate that
 	// pair before the ordinary migration snapshot can mistake a crash-partial
@@ -935,7 +939,9 @@ func (m *Monitor) openStore(path string) error {
 	// 必须在主库任何 Migrator 探测/AutoMigrate 之前，同时锁定并备份主库与
 	// facts 库。任意一库的 WAL 快照、quick_check、表计数或 manifest 发布
 	// 失败都会在这里终止启动，两库都不会进入迁移。
+	timer.mark("restore_preflight")
 	snapshot, err := m.createPreMigrationSnapshot(context.Background(), path, m.cfg.UsageFactsStorePath, time.Now())
+	timer.mark("pre_migration_snapshot")
 	prechecked := snapshot.checkedPath(path)
 	m.storeIntegrityCheckedAt.Store(time.Now().Unix())
 	m.storeIntegrityOK.Store(err == nil && prechecked)
@@ -1021,6 +1027,7 @@ func (m *Monitor) openStore(path string) error {
 	if err := migrateRejectionUserIDPrimaryKey(db); err != nil {
 		return err
 	}
+	timer.mark("main_key_rebuilds")
 	if err := db.AutoMigrate(
 		&PortalMonthlyBill{},
 		&PortalMonthlyBillWithdrawal{},
@@ -1069,6 +1076,7 @@ func (m *Monitor) openStore(path string) error {
 			return fmt.Errorf("initialize token report index: %w", err)
 		}
 	}
+	timer.mark("main_auto_migrate")
 	if err := migrateLegacyCustomerHealthTables(db); err != nil {
 		return fmt.Errorf("客户维护名单迁移失败: %w", err)
 	}
@@ -1175,7 +1183,10 @@ func (m *Monitor) openStore(path string) error {
 	if err := m.migrateAICodeWithContractLedgerUnit(); err != nil {
 		return fmt.Errorf("AICodeWith 账面单位迁移失败: %w", err)
 	}
-	if err := m.openUsageFactsStore(m.cfg.UsageFactsStorePath, factsPrechecked); err != nil {
+	timer.mark("main_data_migrations")
+	factsErr := m.openUsageFactsStore(m.cfg.UsageFactsStorePath, factsPrechecked)
+	timer.mark("usage_facts_store")
+	if err := factsErr; err != nil {
 		factsPath := strings.TrimSpace(m.cfg.UsageFactsStorePath)
 		separateFactsStore := factsPath != "" && factsPath != m.cfg.StorePath
 		// 现有文件的损坏/备份失败已经由上面的双库迁移闸门拦截。通过闸门后，

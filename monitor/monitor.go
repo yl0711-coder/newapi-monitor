@@ -181,6 +181,8 @@ type Monitor struct {
 	problemLastSuccess              atomic.Int64 // 原始错误采集器最近一次成功执行
 	problemLastFailure              atomic.Int64 // 原始错误采集器最近一次失败
 	egressTimeout                   egressTimeoutWatchState
+	startupTimer                    *startupTimer
+	alerts                          *alertOutbox // 告警发送队列;nil=同步发送(测试)
 	usageFactRecentControlVerified  atomic.Int64 // 近期审计由控制数预检直接通过的成员日数(进程内累计)
 	problemLiveThrough              atomic.Int64 // 原始错误实时 lane 已确认到的分钟右水位
 	problemSourceFrom               atomic.Int64 // 当前问题采集请求窗口左水位
@@ -844,6 +846,8 @@ func (m *Monitor) Start(ctx context.Context) {
 	m.ctxMu.Lock()
 	m.backgroundCtx = ctx
 	m.ctxMu.Unlock()
+	// 告警发送协程须先于任何可能触发告警的后台循环启动。
+	m.startAlertOutbox(ctx)
 	// 备份只读取 Monitor 自己的 SQLite，与是否连接 NewAPI 来源库无关。
 	// 本机验收可用 MONITOR_STORE_BACKUP_ENABLED=false 显式关闭。
 	m.startStoreMaintenance(ctx)

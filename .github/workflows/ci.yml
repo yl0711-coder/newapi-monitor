@@ -100,6 +100,9 @@ jobs:
           restore-keys: |
             go-race-build-${{ runner.os }}-${{ hashFiles('go.sum') }}-
       - run: go vet ./...
+      # 函数长度只许变好:新函数不得超过 120 行/40 个分支;基线里的旧长函数不得继续变长。
+      - name: Function size ratchet
+        run: go run ./dev/funcsize
       - name: Test isolated AWS IAM registration bridge without credentials
         run: python3 -m unittest discover -s deploy/ecs-log-bridge -v
       - name: Test release backup retention and deployment guard with synthetic data only

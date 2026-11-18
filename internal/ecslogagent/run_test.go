@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"syscall"
 	"testing"
@@ -66,5 +67,25 @@ func TestRunChildGracefulParentCancellationAndFailure(t *testing.T) {
 	}
 	if _, err := os.Lstat(a.SocketPath()); !os.IsNotExist(err) {
 		t.Fatal("socket retained after graceful shutdown")
+	}
+}
+
+// RunChild must release its socket before returning: Serve closes (and so
+// unlinks) the listener in its own goroutine, and if that happened after
+// RunChild returned it could delete the socket a following RunChild had just
+// created at the same path (CI flake: "chmod .../agent.sock: no such file").
+func TestRunChildReleasesSocketBeforeReturning(t *testing.T) {
+	// One P keeps Serve's goroutine from running before RunChild returns,
+	// which reproduces the race deterministically on the old code.
+	defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(1))
+	c, meta := testConfig(t)
+	a := testAgent(t, c, meta, roundTripFunc(func(*http.Request) (*http.Response, error) { return nil, errors.New("fixture offline") }))
+	for i := 0; i < 200; i++ {
+		if err := a.RunChild(context.Background(), []string{"/fixture-does-not-exist"}); err == nil {
+			t.Fatal("missing child executable accepted")
+		}
+		if _, err := os.Lstat(a.SocketPath()); !os.IsNotExist(err) {
+			t.Fatalf("round %d: socket still present after RunChild returned (err=%v)", i, err)
+		}
 	}
 }

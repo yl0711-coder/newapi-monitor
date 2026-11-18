@@ -68,6 +68,7 @@ func run() error {
 		return fmt.Errorf("启动失败: %w", err)
 	}
 	defer m.Close()
+	m.StartupMark("monitor_new_rest")
 
 	// 收到 SIGINT/SIGTERM 时取消 ctx:采样器退出 + HTTP 优雅关停。
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -76,6 +77,7 @@ func run() error {
 	var generation *monthlydraft.Deployment
 	if generationConfig.mode == "simple" {
 		simpleGeneration, err = m.NewSimpleMonthlyGeneration()
+		m.StartupMark("monthly_generation_init")
 		if err != nil {
 			return fmt.Errorf("月度账单生成配置/资源检查失败: %w", err)
 		}
@@ -132,6 +134,7 @@ func run() error {
 		}
 	}
 	m.Start(ctx)
+	m.StartupMark("background_start")
 	go func() {
 		slog.Info("上游监控已启动", "addr", listenURL(s.Addr))
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
