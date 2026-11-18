@@ -1,11 +1,14 @@
 package monitor
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"time"
 
@@ -15,6 +18,9 @@ import (
 
 // A small durable publication, independent from the low-frequency config sync.
 // Hit/baseline history survives restart and is never advanced by a page read.
+//
+// GroupGovernanceRealtimeState is the publication row v1.18.66 and earlier
+// read and write (plain JSON). It is kept unchanged as the rollback copy.
 type GroupGovernanceRealtimeState struct {
 	ID            uint `gorm:"primaryKey;autoIncrement:false"`
 	Generation    int64
@@ -24,6 +30,124 @@ type GroupGovernanceRealtimeState struct {
 	LastError     string `gorm:"size:512"`
 	ReportJSON    string `gorm:"type:text"`
 	ControlJSON   string `gorm:"type:text"`
+}
+
+// GroupGovernanceRealtimePublication is the current publication, written on
+// every pass (every 30 s) as gzip-compressed JSON in its own table.
+//
+// Why a separate table: as plain JSON the publication reached about 15 MiB on
+// production (2,162 group/model and group/channel histories). SQLite rewrites
+// a whole row, including every overflow page of its unchanged columns, on any
+// UPDATE, so the single plain row cost about 33 MB of disk writes per minute
+// (WAL plus checkpoint), over 95% of the process's writes (measured from WAL
+// frames, 2026-11-18). A compressed copy kept in the same row would still drag
+// the plain columns along on every update (measured locally: no reduction).
+// The same JSON gzips 21-34x (about 0.5 MiB).
+//
+// Rollback: the plain row is refreshed every ggLegacyCopyEvery, so an older
+// binary resumes from state at most that old (like a restart after a short
+// outage). LegacyGeneration is the plain row's generation as last written or
+// seen by this binary; a different plain generation means an older binary
+// published since, and its plain row is then the current publication.
+type GroupGovernanceRealtimePublication struct {
+	ID               uint `gorm:"primaryKey;autoIncrement:false"`
+	Generation       int64
+	Through          int64
+	UpdatedAt        int64
+	LastAttemptAt    int64
+	LastError        string `gorm:"size:512"`
+	ReportGz         []byte `gorm:"column:report_gz"`
+	ControlGz        []byte `gorm:"column:control_gz"`
+	LegacyGeneration int64  `gorm:"column:legacy_generation"`
+	LegacyWrittenAt  int64  `gorm:"column:legacy_written_at"`
+}
+
+func (GroupGovernanceRealtimePublication) TableName() string {
+	return "group_governance_realtime_publications"
+}
+
+var ggLegacyCopyEvery = 30 * time.Minute
+
+const ggPublicationMaxBytes = 16 << 20
+
+func ggPackPublication(raw []byte) ([]byte, error) {
+	var buf bytes.Buffer
+	zw := gzip.NewWriter(&buf)
+	if _, err := zw.Write(raw); err != nil {
+		return nil, err
+	}
+	if err := zw.Close(); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+func ggUnpackPublication(packed []byte) ([]byte, error) {
+	zr, err := gzip.NewReader(bytes.NewReader(packed))
+	if err != nil {
+		return nil, err
+	}
+	defer zr.Close()
+	raw, err := io.ReadAll(io.LimitReader(zr, ggPublicationMaxBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(raw) > ggPublicationMaxBytes {
+		return nil, fmt.Errorf("governance publication exceeds 16 MiB bound")
+	}
+	return raw, nil
+}
+
+// ggRealtimeView is the current publication, from whichever table holds it.
+type ggRealtimeView struct {
+	Found      bool
+	FromLegacy bool // the plain row is current (no compressed publication yet, or an older binary wrote last)
+	Generation int64
+	Through    int64
+	UpdatedAt  int64
+	LastError  string
+	Report     []byte
+	Control    []byte
+	pub        GroupGovernanceRealtimePublication
+	legacy     GroupGovernanceRealtimeState // metadata only
+}
+
+// loadGGRealtimeView reads the current publication. The large plain columns
+// are read only when the plain row is the current one.
+func loadGGRealtimeView(db *gorm.DB) (ggRealtimeView, error) {
+	var v ggRealtimeView
+	if err := db.Where("id=?", 1).Limit(1).Find(&v.pub).Error; err != nil {
+		return v, err
+	}
+	if err := db.Select("id", "generation", "through", "updated_at", "last_attempt_at", "last_error").
+		Where("id=?", 1).Limit(1).Find(&v.legacy).Error; err != nil {
+		return v, err
+	}
+	if v.pub.ID != 0 && (v.legacy.ID == 0 || v.legacy.Generation == v.pub.LegacyGeneration) {
+		report, err := ggUnpackPublication(v.pub.ReportGz)
+		if err != nil {
+			return v, err
+		}
+		control, err := ggUnpackPublication(v.pub.ControlGz)
+		if err != nil {
+			return v, err
+		}
+		v.Found, v.Generation, v.Through, v.UpdatedAt, v.LastError = true, v.pub.Generation, v.pub.Through, v.pub.UpdatedAt, v.pub.LastError
+		v.Report, v.Control = report, control
+		return v, nil
+	}
+	if v.legacy.ID == 0 {
+		return v, nil
+	}
+	var plain GroupGovernanceRealtimeState
+	if err := db.Select("report_json", "control_json").Where("id=?", 1).Limit(1).Find(&plain).Error; err != nil {
+		return v, err
+	}
+	v.Found, v.FromLegacy = true, true
+	v.Generation = max(v.legacy.Generation, v.pub.Generation)
+	v.Through, v.UpdatedAt, v.LastError = v.legacy.Through, v.legacy.UpdatedAt, v.legacy.LastError
+	v.Report, v.Control = []byte(plain.ReportJSON), []byte(plain.ControlJSON)
+	return v, nil
 }
 
 func (m *Monitor) runGroupGovernanceRealtime(ctx context.Context) {
@@ -43,7 +167,7 @@ func (m *Monitor) runGroupGovernanceRealtime(ctx context.Context) {
 				slog.Warn("分组治理近期指标延期", "err", err)
 				// Preserve the last publication and its real data cutoff.
 				cctx, cancel := context.WithTimeout(ctx, time.Second)
-				m.storeDB.WithContext(cctx).Model(&GroupGovernanceRealtimeState{}).Where("id=?", 1).Updates(map[string]any{"last_attempt_at": time.Now().Unix(), "last_error": "本轮本地计算未完成；保留上次结果，等待有界重试"})
+				m.recordGroupGovernanceRealtimeDeferral(cctx, time.Now())
 				cancel()
 			}
 			timer.Reset(time.Duration(groupGovernancePolicy().PollSeconds) * time.Second)
@@ -74,11 +198,12 @@ func (m *Monitor) syncGroupGovernanceRealtime(parent context.Context, now time.T
 	ctx, cancel := context.WithTimeout(parent, groupGovernanceReadBudget)
 	defer cancel()
 	var report ggRealtimeReport
-	var prior GroupGovernanceRealtimeState
+	var prior ggRealtimeView
 	var snapshot GroupGovernanceState
 	var groups []GroupGovernanceGroup
 	err := m.storeDB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		if err := tx.Where("id=?", 1).Limit(1).Find(&prior).Error; err != nil {
+		var err error
+		if prior, err = loadGGRealtimeView(tx); err != nil {
 			return err
 		}
 		if err := tx.Where("id=?", 1).Limit(1).Find(&snapshot).Error; err != nil {
@@ -88,7 +213,6 @@ func (m *Monitor) syncGroupGovernanceRealtime(parent context.Context, now time.T
 			return err
 		}
 		local := &Monitor{cfg: m.cfg, storeDB: tx}
-		var err error
 		report, err = local.readGroupGovernanceMetrics(ctx, now)
 		return err
 	})
@@ -117,7 +241,7 @@ func (m *Monitor) syncGroupGovernanceRealtime(parent context.Context, now time.T
 	p := groupGovernancePolicy()
 	m.applyGroupGovernanceConfig(&report, snapshot, now)
 	var control ggControl
-	_ = json.Unmarshal([]byte(prior.ControlJSON), &control)
+	_ = json.Unmarshal(prior.Control, &control)
 	ggRecommend(&report, &control, ggConfigurationKey(groups), p)
 	report.AdviceReady = report.Status == "ready" && report.ConfigReady && report.RequestsComplete
 	b, err := json.Marshal(report)
@@ -128,39 +252,99 @@ func (m *Monitor) syncGroupGovernanceRealtime(parent context.Context, now time.T
 	if err != nil {
 		return err
 	}
-	if len(b)+len(c) > 16<<20 {
+	if len(b)+len(c) > ggPublicationMaxBytes {
 		return fmt.Errorf("governance publication exceeds 16 MiB bound")
 	}
-	row := GroupGovernanceRealtimeState{ID: 1, Generation: prior.Generation + 1, Through: report.Through, UpdatedAt: now.Unix(), LastAttemptAt: now.Unix(), ReportJSON: string(b), ControlJSON: string(c)}
+	reportGz, err := ggPackPublication(b)
+	if err != nil {
+		return err
+	}
+	controlGz, err := ggPackPublication(c)
+	if err != nil {
+		return err
+	}
+	nowUnix := now.Unix()
+	generation := prior.Generation + 1
+	pub := GroupGovernanceRealtimePublication{ID: 1, Generation: generation, Through: report.Through, UpdatedAt: nowUnix, LastAttemptAt: nowUnix,
+		ReportGz: reportGz, ControlGz: controlGz, LegacyGeneration: prior.legacy.Generation, LegacyWrittenAt: prior.pub.LegacyWrittenAt}
+	if prior.FromLegacy && prior.legacy.ID != 0 {
+		// An older binary wrote the plain row last; it is the copy we now hold.
+		pub.LegacyWrittenAt = prior.legacy.UpdatedAt
+	}
+	plainDue := prior.legacy.ID == 0 || nowUnix-pub.LegacyWrittenAt >= int64(ggLegacyCopyEvery/time.Second) || pub.LegacyWrittenAt > nowUnix
+	legacy := GroupGovernanceRealtimeState{ID: 1, Generation: generation, Through: report.Through, UpdatedAt: nowUnix, LastAttemptAt: nowUnix, ReportJSON: string(b), ControlJSON: string(c)}
+	if plainDue {
+		pub.LegacyGeneration, pub.LegacyWrittenAt = generation, nowUnix
+	}
 	// The expensive reads and rule evaluation finish before the short writer
-	// transaction. CAS prevents two instances from consuming a minute twice.
+	// transaction. CAS on both rows prevents two instances (or an older binary
+	// during a rollout) from consuming a pass twice.
 	return m.storeDB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		if prior.ID == 0 {
-			return tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&row).Error
+		if prior.pub.ID == 0 {
+			res := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&pub)
+			if res.Error != nil {
+				return res.Error
+			}
+			if res.RowsAffected != 1 {
+				return fmt.Errorf("governance publication superseded")
+			}
+		} else {
+			res := tx.Model(&GroupGovernanceRealtimePublication{}).Where("id=1 AND generation=?", prior.pub.Generation).
+				Select("generation", "through", "updated_at", "last_attempt_at", "last_error", "report_gz", "control_gz", "legacy_generation", "legacy_written_at").Updates(&pub)
+			if res.Error != nil {
+				return res.Error
+			}
+			if res.RowsAffected != 1 {
+				return fmt.Errorf("governance publication superseded")
+			}
 		}
-		res := tx.Model(&GroupGovernanceRealtimeState{}).Where("id=1 AND generation=?", prior.Generation).Select("generation", "through", "updated_at", "last_attempt_at", "last_error", "report_json", "control_json").Updates(&row)
-		if res.Error != nil {
-			return res.Error
-		}
-		if res.RowsAffected != 1 {
-			return fmt.Errorf("governance publication superseded")
+		if plainDue {
+			if prior.legacy.ID == 0 {
+				res := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&legacy)
+				if res.Error != nil {
+					return res.Error
+				}
+				if res.RowsAffected != 1 {
+					return fmt.Errorf("governance publication superseded")
+				}
+			} else {
+				res := tx.Model(&GroupGovernanceRealtimeState{}).Where("id=1 AND generation=?", prior.legacy.Generation).
+					Select("generation", "through", "updated_at", "last_attempt_at", "last_error", "report_json", "control_json").Updates(&legacy)
+				if res.Error != nil {
+					return res.Error
+				}
+				if res.RowsAffected != 1 {
+					return fmt.Errorf("governance publication superseded")
+				}
+			}
 		}
 		// This derived error cache is independent of retained request facts.
 		// Bounded deletion never touches unfinished Token or source cursors.
-		return tx.Exec("DELETE FROM group_governance_error_minutes WHERE rowid IN (SELECT rowid FROM group_governance_error_minutes WHERE bucket_ts < ? ORDER BY bucket_ts LIMIT 200)", now.Unix()-86400).Error
+		return tx.Exec("DELETE FROM group_governance_error_minutes WHERE rowid IN (SELECT rowid FROM group_governance_error_minutes WHERE bucket_ts < ? ORDER BY bucket_ts LIMIT 200)", nowUnix-86400).Error
 	})
 }
 
+// recordGroupGovernanceRealtimeDeferral marks the current publication as not
+// refreshed. It updates the small compressed row when there is one; touching
+// the large plain row would rewrite all of it.
+func (m *Monitor) recordGroupGovernanceRealtimeDeferral(ctx context.Context, now time.Time) {
+	updates := map[string]any{"last_attempt_at": now.Unix(), "last_error": "本轮本地计算未完成；保留上次结果，等待有界重试"}
+	res := m.storeDB.WithContext(ctx).Model(&GroupGovernanceRealtimePublication{}).Where("id=?", 1).Updates(updates)
+	if res.Error == nil && res.RowsAffected == 0 {
+		m.storeDB.WithContext(ctx).Model(&GroupGovernanceRealtimeState{}).Where("id=?", 1).Updates(updates)
+	}
+}
+
 func (m *Monitor) loadGroupGovernanceRealtime(ctx context.Context) (*ggRealtimeReport, error) {
-	var state GroupGovernanceRealtimeState
-	if err := m.storeDB.WithContext(ctx).Where("id=?", 1).Limit(1).Find(&state).Error; err != nil {
+	state, err := loadGGRealtimeView(m.storeDB.WithContext(ctx))
+	if err != nil {
 		return nil, err
 	}
-	if state.ID == 0 {
+	if !state.Found {
 		return &ggRealtimeReport{Status: "pending", Note: "后台尚未生成近期指标；页面读取不会触发生产查询", Metrics: []ggMetrics{}, Actions: []ggAction{}}, nil
 	}
 	var report ggRealtimeReport
-	if err := json.Unmarshal([]byte(state.ReportJSON), &report); err != nil {
+	if err := json.Unmarshal(state.Report, &report); err != nil {
 		return nil, err
 	}
 	if report.Version != groupGovernancePolicy().Version {

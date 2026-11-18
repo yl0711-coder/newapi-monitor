@@ -463,32 +463,42 @@ func TestGGRealtimePublicationAndConfigurationReset(t *testing.T) {
 	if err := m.syncGroupGovernanceRealtime(context.Background(), modelFRTTestNow); err != nil {
 		t.Fatal(err)
 	}
-	var a GroupGovernanceRealtimeState
-	m.storeDB.First(&a, 1)
-	if a.Through != end || a.Generation != 1 {
-		t.Fatal(a.Through, a.Generation)
+	a, err := loadGGRealtimeView(m.storeDB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.Through != end || a.Generation != 1 || a.FromLegacy {
+		t.Fatal(a.Through, a.Generation, a.FromLegacy)
 	}
 	var published ggRealtimeReport
-	if err := json.Unmarshal([]byte(a.ReportJSON), &published); err != nil {
+	if err := json.Unmarshal(a.Report, &published); err != nil {
 		t.Fatal(err)
+	}
+	var plain GroupGovernanceRealtimeState
+	m.storeDB.First(&plain, 1)
+	if plain.Generation != 1 || plain.ReportJSON != string(a.Report) || plain.ControlJSON != string(a.Control) {
+		t.Fatal("first publication must also write the rollback plain copy")
 	}
 	if len(published.Channels) != 1 || published.Channels[0].Requests != 50 {
 		t.Fatal(published)
 	}
 	legacy := map[string]any{"status": "ready", "advice_ready": true, "metrics": []map[string]any{{"group": "g", "model": "m", "channel_id": 1, "requests": 50}}, "actions": []ggAction{{ID: "old", Kind: "increase"}}, "adjustment_count": 1}
 	legacyJSON, _ := json.Marshal(legacy)
+	// Simulate an older binary's model-level publication being current.
+	m.storeDB.Where("id=1").Delete(&GroupGovernanceRealtimePublication{})
 	m.storeDB.Model(&GroupGovernanceRealtimeState{}).Where("id=1").Updates(map[string]any{"report_json": string(legacyJSON), "updated_at": time.Now().Unix()})
 	legacyRead, err := m.loadGroupGovernanceRealtime(context.Background())
 	if err != nil || legacyRead.Status != "pending" || legacyRead.AdviceReady || len(legacyRead.Actions) != 0 || len(legacyRead.Channels) != 0 {
 		t.Fatal("legacy model publication relabeled as channel totals", legacyRead, err)
 	}
-	m.storeDB.Model(&GroupGovernanceRealtimeState{}).Where("id=1").Update("report_json", a.ReportJSON)
+	m.storeDB.Model(&GroupGovernanceRealtimeState{}).Where("id=1").Update("report_json", plain.ReportJSON)
 	m.storeDB.Model(&GroupGovernanceState{}).Where("id=1").Update("last_success_at", 1)
 	if err := m.syncGroupGovernanceRealtime(context.Background(), modelFRTTestNow); err != nil {
 		t.Fatal(err)
 	}
-	m.storeDB.First(&a, 1)
-	if err := json.Unmarshal([]byte(a.ReportJSON), &published); err != nil {
+	if a, err = loadGGRealtimeView(m.storeDB); err != nil {
+		t.Fatal(err)
+	} else if err := json.Unmarshal(a.Report, &published); err != nil {
 		t.Fatal(err)
 	}
 	if published.Status != "pending" || len(published.Actions) > 0 || published.Channels[0].Status == "unchanged" {

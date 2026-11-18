@@ -1045,7 +1045,7 @@ func (m *Monitor) openStore(path string) error {
 		&AlertConfig{}, &AlertLog{}, &TrackedUser{}, &CustomerGroup{}, &CustomerHealthGroup{}, &CustomerHealthMember{}, &CustomerHealthMigrationState{}, &UsageMemberControl{}, &UsageMemberAudit{}, &UsageMemberControlMigration{}, &FollowUpLog{}, &UsageSettings{}, &UserDirectoryEntry{}, &UsageLogShortcut{},
 		&CloudWatchInvestigationAudit{}, &CloudWatchShadowReconciliationRun{}, &CloudWatchShadowReconciliationDiff{}, &CloudWatchPreRouteCursor{}, &CloudWatchNginxCursor{},
 		&GroupGovernanceState{}, &GroupGovernanceGroup{}, &GroupGovernanceUser{},
-		&GroupGovernanceErrorMinute{}, &GroupGovernanceRealtimeState{},
+		&GroupGovernanceErrorMinute{}, &GroupGovernanceRealtimeState{}, &GroupGovernanceRealtimePublication{},
 		&GroupGovernanceMinuteCoverage{},
 		// Incident 核心（MON-003~006）。建表不受 MONITOR_INCIDENT_CORE_ENABLED 控制：
 		// AutoMigrate 与功能开关无关，开关只管引擎是否跑、入口是否显示。
