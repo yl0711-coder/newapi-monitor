@@ -899,7 +899,7 @@ func (m *Monitor) serveUsageLogsStat(c *gin.Context) {
 	var quota, rpm, prompt, completion int64
 	if !skipQuota {
 		quotaStarted := time.Now()
-		quotaSource := "logs"
+		var quotaSource string
 		var emptySpan bool
 		quotaWhere, quotaSource, emptySpan, _ = m.usageLogsWithIDSpan(ctx, db, statFilter, quotaWhere)
 		if !emptySpan {

@@ -26,8 +26,12 @@ func TestGroupGovernancePublicationPackRoundTripAndLegacy(t *testing.T) {
 	// Decompression is bounded like the uncompressed publication.
 	var big bytes.Buffer
 	zw := gzip.NewWriter(&big)
-	zw.Write(bytes.Repeat([]byte("a"), ggPublicationMaxBytes+10))
-	zw.Close()
+	if _, err := zw.Write(bytes.Repeat([]byte("a"), ggPublicationMaxBytes+10)); err != nil {
+		t.Fatal(err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := ggUnpackPublication(big.Bytes()); err == nil {
 		t.Fatal("oversized publication accepted")
 	}
