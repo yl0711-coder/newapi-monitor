@@ -427,7 +427,7 @@ func TestUsageLogsPageStrategiesRemainEquivalentAcrossScopes(t *testing.T) {
 	where, _ := buildUsageLogWhere(usageLogFilter{Group: "g1"}, usageLogWhereList)
 	beforeSQL, beforeArg := where.sql(), append([]any{}, where.args...)
 	for _, cursor := range []*usageLogCursor{nil, {CreatedAt: 1794500300, ID: 1202}} {
-		query, args := usageLogsPageSQL(where, 2, 100, cursor, true)
+		query, args := usageLogsPageSQL(where, "logs", 2, 100, cursor, true)
 		if !strings.HasPrefix(query, usageLogsSelect) {
 			t.Fatal("page query lost its server time limit")
 		}
