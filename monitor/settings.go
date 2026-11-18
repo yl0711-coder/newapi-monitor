@@ -313,17 +313,6 @@ type Settings struct {
 	// 现有采集器对同一请求产出相同 oneapi_id_hmac，阶段 4 Shadow 对账才能逐条比对。
 	CloudWatchEvidenceHMACKey   string // MONITOR_CLOUDWATCH_EVIDENCE_HMAC_KEY
 	CloudWatchEvidenceHMACKeyID string // MONITOR_CLOUDWATCH_EVIDENCE_HMAC_KEY_ID
-	// 阶段四 Shadow 只定义配置契约；默认关闭，开发准备阶段不会启动
-	// 调度器或开始 7 天计时。开启前必须先完成 CloudWatch Nginx access
-	// 日志投递验收，并保留旧采集器作为对照侧。
-	CloudWatchShadowEnabled bool // MONITOR_CLOUDWATCH_SHADOW_ENABLED，默认 false
-	// 这是一个人为确认的生产准入闸门，不会自动由“查到日志”推断。
-	// 未完成 schema 2 JSONL/结构化字段投递验收时必须保持 false，避免把
-	// 纯文本 access 日志的 0 条结果误当成对账一致。
-	CloudWatchShadowNginxContractReady bool // MONITOR_CLOUDWATCH_SHADOW_NGINX_CONTRACT_READY，默认 false
-	CloudWatchShadowIntervalMinutes    int  // MONITOR_CLOUDWATCH_SHADOW_INTERVAL_MINUTES，默认 15
-	CloudWatchShadowLookbackMinutes    int  // MONITOR_CLOUDWATCH_SHADOW_LOOKBACK_MINUTES，默认 15
-	CloudWatchShadowRetentionDays      int  // MONITOR_CLOUDWATCH_SHADOW_RETENTION_DAYS，默认 14
 	// CloudWatchPreRouteEnabled 启用前置拒绝的连续只读采集。它与 Shadow 完全
 	// 分离：采集结果写入 rejection_samples，供模型统计消费；不会生成对账记录，
 	// 也不会打开 Nginx Shadow。
@@ -611,11 +600,6 @@ func LoadSettings() Settings {
 		CloudWatchLogsEnabled:                    env("MONITOR_CLOUDWATCH_LOGS_ENABLED", "false") == "true",
 		CloudWatchEvidenceHMACKey:                env("MONITOR_CLOUDWATCH_EVIDENCE_HMAC_KEY", ""),
 		CloudWatchEvidenceHMACKeyID:              strings.TrimSpace(env("MONITOR_CLOUDWATCH_EVIDENCE_HMAC_KEY_ID", "")),
-		CloudWatchShadowEnabled:                  env("MONITOR_CLOUDWATCH_SHADOW_ENABLED", "false") == "true",
-		CloudWatchShadowNginxContractReady:       env("MONITOR_CLOUDWATCH_SHADOW_NGINX_CONTRACT_READY", "false") == "true",
-		CloudWatchShadowIntervalMinutes:          envInt("MONITOR_CLOUDWATCH_SHADOW_INTERVAL_MINUTES", 15),
-		CloudWatchShadowLookbackMinutes:          envInt("MONITOR_CLOUDWATCH_SHADOW_LOOKBACK_MINUTES", 15),
-		CloudWatchShadowRetentionDays:            envInt("MONITOR_CLOUDWATCH_SHADOW_RETENTION_DAYS", 14),
 		CloudWatchPreRouteEnabled:                env("MONITOR_CLOUDWATCH_PREROUTE_ENABLED", "false") == "true",
 		CloudWatchPreRoutePollSeconds:            envInt("MONITOR_CLOUDWATCH_PREROUTE_POLL_SECONDS", 300),
 		CloudWatchPreRouteLivePollSeconds:        envInt("MONITOR_CLOUDWATCH_PREROUTE_LIVE_POLL_SECONDS", 60),

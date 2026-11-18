@@ -216,7 +216,6 @@ jobs:
             test -e /context/internal/observability/metrics.go &&
             test -e /context/internal/observability/schema.go &&
             test -e /context/internal/observability/schema/observability.v1.schema.json &&
-            test -e /context/internal/usagebill/money.go &&
             test -e /context/internal/usagebill/exportjobs/jobs.go &&
             test -e /context/internal/usagebill/exportjobs/recovery.go &&
             test ! -e /context/.local-data &&

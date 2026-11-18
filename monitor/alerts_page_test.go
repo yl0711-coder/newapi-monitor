@@ -867,19 +867,19 @@ func TestAlertsUnknownReasonMarkedPending(t *testing.T) {
 
 // 后端不得对 reason 做白名单过滤：原始码是证据，留着才能事后重算与补映射。
 func TestRejectReasonStoredVerbatim(t *testing.T) {
-	src, err := readMonitorSource("server.go")
+	src, err := readMonitorSource("rejection_v2.go")
 	if err != nil {
 		t.Fatal(err)
 	}
-	i := strings.Index(src, "func (m *Monitor) ingestRejections")
+	i := strings.Index(src, "func validateRejectionV2")
 	if i < 0 {
-		t.Fatal("找不到 ingestRejections")
+		t.Fatal("找不到 validateRejectionV2")
 	}
 	seg := src[i:]
 	if j := strings.Index(seg, "\nfunc "); j > 0 {
 		seg = seg[:j]
 	}
-	if !strings.Contains(seg, "clip(s.Reason, 64)") {
+	if !strings.Contains(seg, "Reason: s.Reason") {
 		t.Error("reason 入库方式变了，请确认仍原样保留原始码")
 	}
 	// 不该出现按已知集合丢弃的逻辑。

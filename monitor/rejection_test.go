@@ -51,86 +51,26 @@ func TestRejectionsUpsertAndAggregate(t *testing.T) {
 	}
 }
 
-func TestIngestRejectionsHandler(t *testing.T) {
+func TestIngestRejectionsV1IsGone(t *testing.T) {
 	gin.SetMode(gin.TestMode)
-	post := func(m *Monitor, auth, body string) *httptest.ResponseRecorder {
-		r := gin.New()
-		m.RegisterRoutes(r)
+	m := newTestMonitor(t)
+	m.cfg.IngestToken = "secret123"
+	r := gin.New()
+	m.RegisterRoutes(r)
+	body := `{"node":"slave","batch_id":"batch-0001","samples":[{"bucket_ts":1900000020,"reason":"no_available_channel","model":"gpt-5.2","group":"g1","count":3}]}`
+	for _, auth := range []string{"", "Bearer wrong", "Bearer secret123"} {
 		w := httptest.NewRecorder()
 		req, _ := http.NewRequest(http.MethodPost, "/internal/rejections", strings.NewReader(body))
 		if auth != "" {
 			req.Header.Set("Authorization", auth)
 		}
 		r.ServeHTTP(w, req)
-		return w
+		if w.Code != http.StatusGone || !strings.Contains(w.Body.String(), "/internal/rejections/v2") {
+			t.Fatalf("auth=%q: v1 should answer 410 pointing to v2, got %d %s", auth, w.Code, w.Body.String())
+		}
 	}
-	body := `{"node":"slave","batch_id":"batch-0001","samples":[{"bucket_ts":1900000020,"reason":"no_available_channel","model":"gpt-5.2","group":"g1","count":3}]}`
-
-	// 未配置 token → 接口关闭 503
-	if w := post(newTestMonitor(t), "Bearer x", body); w.Code != http.StatusServiceUnavailable {
-		t.Fatalf("未配置token应503,得%d", w.Code)
-	}
-
-	m := newTestMonitor(t)
-	m.cfg.IngestToken = "secret123"
-	// 无/错 token → 401
-	if w := post(m, "", body); w.Code != http.StatusUnauthorized {
-		t.Fatalf("无token应401,得%d", w.Code)
-	}
-	if w := post(m, "Bearer wrong", body); w.Code != http.StatusUnauthorized {
-		t.Fatalf("错token应401,得%d", w.Code)
-	}
-	// 正确 token → 200 + 入库
-	if w := post(m, "Bearer secret123", body); w.Code != http.StatusOK {
-		t.Fatalf("正确token应200,得%d: %s", w.Code, w.Body.String())
-	}
-	if rows := m.storeRejections(1900000020 - 60); len(rows) != 1 || rows[0].Count != 3 {
-		t.Fatalf("应入库1行count=3,得%+v", rows)
-	}
-	// 响应在网络中丢失后，采集器会用相同 batch_id 重试；不得再次累加。
-	if w := post(m, "Bearer secret123", body); w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"duplicate":true`) {
-		t.Fatalf("同批重试应返回200 duplicate=true,得%d: %s", w.Code, w.Body.String())
-	}
-	if rows := m.storeRejections(1900000020 - 60); len(rows) != 1 || rows[0].Count != 3 {
-		t.Fatalf("同批重试后计数不得翻倍,得%+v", rows)
-	}
-	// 同一个 ID 携带不同内容是协议错误，必须拒绝且不污染原计数。
-	conflict := strings.Replace(body, `"count":3`, `"count":4`, 1)
-	if w := post(m, "Bearer secret123", conflict); w.Code != http.StatusConflict {
-		t.Fatalf("复用batch_id但内容变化应409,得%d: %s", w.Code, w.Body.String())
-	}
-	if rows := m.storeRejections(1900000020 - 60); len(rows) != 1 || rows[0].Count != 3 {
-		t.Fatalf("冲突批次不得写入,得%+v", rows)
-	}
-	// 不同批次落在同一分钟仍应累加。
-	next := strings.Replace(strings.Replace(body, "batch-0001", "batch-0002", 1), `"count":3`, `"count":4`, 1)
-	if w := post(m, "Bearer secret123", next); w.Code != http.StatusOK {
-		t.Fatalf("新批次应200,得%d: %s", w.Code, w.Body.String())
-	}
-	if rows := m.storeRejections(1900000020 - 60); len(rows) != 1 || rows[0].Count != 7 {
-		t.Fatalf("不同批次应累加到7,得%+v", rows)
-	}
-	missingID := `{"node":"slave","samples":[]}`
-	if w := post(m, "Bearer secret123", missingID); w.Code != http.StatusBadRequest {
-		t.Fatalf("缺batch_id应400,得%d: %s", w.Code, w.Body.String())
-	}
-	reservedNode := strings.Replace(body, `"node":"slave"`, `"node":"cloudwatch-direct"`, 1)
-	if w := post(m, "Bearer secret123", reservedNode); w.Code != http.StatusForbidden {
-		t.Fatalf("legacy 推送不得伪造 CloudWatch 内部来源, 得%d: %s", w.Code, w.Body.String())
-	}
-	// 负 user_id 不是有效的客户身份；legacy 接口沿用“丢弃残缺项”语义，
-	// 不能把它写入后在预警页渲染成一个虚假的客户。
-	negativeUser := strings.Replace(body, "batch-0001", "batch-neg-user", 1)
-	negativeUser = strings.Replace(negativeUser, `"count":3`, `"count":3,"user_id":-1`, 1)
-	if w := post(m, "Bearer secret123", negativeUser); w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"stored":0`) {
-		t.Fatalf("负 user_id 应被丢弃且不应报存储成功: %d %s", w.Code, w.Body.String())
-	}
-	var negativeRows int64
-	if err := m.storeDB.Model(&RejectionSample{}).Where("user_id < 0").Count(&negativeRows).Error; err != nil {
-		t.Fatal(err)
-	}
-	if negativeRows != 0 {
-		t.Fatalf("负 user_id 不得入库: %d", negativeRows)
+	if rows := m.storeRejections(1900000020 - 60); len(rows) != 0 {
+		t.Fatalf("retired v1 must not store samples: %+v", rows)
 	}
 }
 

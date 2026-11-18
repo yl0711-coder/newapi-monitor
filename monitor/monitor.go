@@ -116,9 +116,7 @@ type Monitor struct {
 	// cloudWatchLogs 是独立、惰性初始化的只读证据 lane。默认关闭且不从
 	// New/Start/现有路由触发；它不复用生产 MySQL 或 Usage 的查询闸门。
 	cloudWatchLogs *cloudWatchLogsRuntime
-	// Shadow 每次最多运行一个有界窗口，避免 AWS 查询慢时叠加后台任务。
-	shadowRunInProgress atomic.Bool
-	// CloudWatch 前置拒绝连续采集与 Shadow 分离，只把已完整覆盖的分钟窗口
+	// CloudWatch 前置拒绝连续采集只把已完整覆盖的分钟窗口
 	// 发布到 rejection_samples，供模型统计读取。
 	cloudWatchPreRouteRunning     atomic.Bool
 	cloudWatchPreRouteFrom        atomic.Int64
@@ -519,9 +517,6 @@ func New(s Settings) (*Monitor, error) {
 	if err := validateCloudWatchLogsSettings(s); err != nil {
 		return nil, err
 	}
-	if err := validateCloudWatchShadowSettings(s); err != nil {
-		return nil, err
-	}
 	if err := validateCloudWatchPreRouteSettings(s); err != nil {
 		return nil, err
 	}
@@ -882,12 +877,9 @@ func (m *Monitor) Start(ctx context.Context) {
 	if m.cfg.InfraEnabled {
 		go m.startInfra(ctx)
 	}
-	// 阶段四 Shadow 只有在 CloudWatch 与 Nginx 结构化日志契约均显式
-	// 准入后才会启动；默认配置不会创建后台任务或访问 AWS。
 	m.startCloudWatchPreRoute(ctx)
 	m.startEgressTimeoutWatch(ctx)
 	m.startCloudWatchNginx(ctx)
-	m.startCloudWatchShadow(ctx)
 	if ecsLogRuntimeEnabled(m.cfg) {
 		go m.startECSLogDiscovery(ctx)
 		if m.cfg.ECSArchiveEnabled {

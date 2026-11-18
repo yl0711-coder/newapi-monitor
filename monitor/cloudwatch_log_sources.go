@@ -109,31 +109,6 @@ func validateCloudWatchLogsSettings(s Settings) error {
 	return nil
 }
 
-func validateCloudWatchShadowSettings(s Settings) error {
-	if !s.CloudWatchShadowEnabled {
-		return nil
-	}
-	if !s.CloudWatchLogsEnabled {
-		return errors.New("MONITOR_CLOUDWATCH_SHADOW_ENABLED 必须同时开启 MONITOR_CLOUDWATCH_LOGS_ENABLED")
-	}
-	if s.LocalSnapshotOnly {
-		return errors.New("MONITOR_CLOUDWATCH_SHADOW_ENABLED 不能在本地快照只读模式开启")
-	}
-	if !s.CloudWatchShadowNginxContractReady {
-		return errors.New("MONITOR_CLOUDWATCH_SHADOW_ENABLED 必须先显式确认 Nginx access 结构化日志投递已验收")
-	}
-	if s.CloudWatchShadowIntervalMinutes < 5 || s.CloudWatchShadowIntervalMinutes > 60 {
-		return errors.New("MONITOR_CLOUDWATCH_SHADOW_INTERVAL_MINUTES 必须在 5～60 之间")
-	}
-	if s.CloudWatchShadowLookbackMinutes < 1 || s.CloudWatchShadowLookbackMinutes > 120 {
-		return errors.New("MONITOR_CLOUDWATCH_SHADOW_LOOKBACK_MINUTES 必须在 1～120 之间")
-	}
-	if s.CloudWatchShadowRetentionDays < 7 || s.CloudWatchShadowRetentionDays > 31 {
-		return errors.New("MONITOR_CLOUDWATCH_SHADOW_RETENTION_DAYS 必须在 7～31 之间")
-	}
-	return nil
-}
-
 // cloudWatchEvidenceAvailable 只回答"按需证据入口是否可用"，不触发任何 AWS 调用。
 func (m *Monitor) cloudWatchEvidenceAvailable() bool {
 	return m != nil && m.cloudWatchLogs != nil && m.cloudWatchLogs.enabled

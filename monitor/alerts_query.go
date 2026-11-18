@@ -171,7 +171,7 @@ func cloudWatchPreRouteCoverageTableAvailable(db *gorm.DB) bool {
 	return db != nil && db.Migrator().HasTable(&CloudWatchPreRouteCursor{})
 }
 
-// alertRejectCanonicalReasonSQL mirrors canonicalShadowRejectionReason for the
+// alertRejectCanonicalReasonSQL mirrors canonicalRejectionReason for the
 // closed reason set used by the direct lane.  Unknown legacy reasons are not
 // silently hidden merely because a CloudWatch cursor covers their minute.
 const alertRejectCanonicalReasonSQL = `CASE lower(replace(replace(replace(trim(rejection_samples.reason), '-', '_'), ' ', '_'), '.', '_'))
@@ -220,7 +220,7 @@ func alertRejectCanonicalReasonSQLForColumn(column string) string {
 }
 
 // alertRejectNormalizedReasonSQLForColumn is the pre-alias normalization used
-// for the three legacy quota subcategories.  canonicalShadowRejectionReason
+// for the three legacy quota subcategories.  canonicalRejectionReason
 // intentionally folds those categories into quota_account for overlap
 // reconciliation, but the alert summary still needs to explain which legacy
 // field was missing the user identity.
@@ -257,7 +257,7 @@ func alertRejectReasonFilterPredicate(reason string) (string, any) {
 	case "user_quota_insufficient", "token_quota_insufficient", "pre_consume_failed":
 		return alertRejectNormalizedReasonSQLForColumn("rejection_samples.reason") + " = ?", normalized
 	default:
-		return "(" + alertRejectCanonicalReasonSQL + ") = ?", canonicalShadowRejectionReason(reason)
+		return "(" + alertRejectCanonicalReasonSQL + ") = ?", canonicalRejectionReason(reason)
 	}
 }
 
