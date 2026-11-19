@@ -5,9 +5,7 @@ import (
 	"time"
 )
 
-// startupTimer logs how long each startup phase takes. Every deployment is
-// down for about three minutes, mostly before the HTTP listener opens; these
-// lines show which phase the time goes to before any of it is optimized.
+// startupTimer records startup timing before the HTTP listeners open.
 type startupTimer struct {
 	start, last time.Time
 }
@@ -26,6 +24,13 @@ func (t *startupTimer) mark(phase string) {
 	slog.Info("启动阶段耗时", "phase", phase,
 		"elapsed_ms", now.Sub(t.last).Milliseconds(), "total_ms", now.Sub(t.start).Milliseconds())
 	t.last = now
+}
+
+// snapshotStep reports an inner step without changing the outer startup marks.
+func (t *startupTimer) snapshotStep(phase string, began time.Time, err error) {
+	if t != nil {
+		slog.Info("启动快照分段耗时", "phase", phase, "elapsed_ms", time.Since(began).Milliseconds(), "ok", err == nil)
+	}
 }
 
 // StartupMark records a startup phase from outside the package (main).

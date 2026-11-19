@@ -406,6 +406,9 @@ func vacuumSourceInto(ctx context.Context, sourcePath, targetPath string) error 
 }
 
 func verifySQLiteSnapshotFile(ctx context.Context, path string, want sqliteLogicalInventory) (string, int64, error) {
+	if _, err := checkSealedSnapshotSidecars(path); err != nil {
+		return "", 0, err
+	}
 	info, err := os.Lstat(path)
 	if err != nil {
 		return "", 0, err
@@ -413,7 +416,9 @@ func verifySQLiteSnapshotFile(ctx context.Context, path string, want sqliteLogic
 	if !info.Mode().IsRegular() {
 		return "", 0, fmt.Errorf("快照不是普通文件: %s", filepath.Base(path))
 	}
-	db, err := sql.Open("sqlite", sqliteReadOnlyDSN(path))
+	// Verify exactly the standalone bytes that RestorePreMigrationSnapshot
+	// copies. Unlike the live-store check, this view must never include a WAL.
+	db, err := sql.Open("sqlite", sqliteReadOnlyDSN(path)+"&immutable=1")
 	if err != nil {
 		return "", 0, err
 	}
@@ -433,7 +438,14 @@ func verifySQLiteSnapshotFile(ctx context.Context, path string, want sqliteLogic
 	if err := compareSQLiteInventories(want, got); err != nil {
 		return "", 0, err
 	}
-	return fileSHA256(path)
+	hash, size, err := fileSHA256(path)
+	if err != nil {
+		return "", 0, err
+	}
+	if _, err := checkSealedSnapshotSidecars(path); err != nil {
+		return "", 0, err
+	}
+	return hash, size, nil
 }
 
 func validateSnapshotLeafName(name, field string) error {
@@ -551,7 +563,7 @@ func readPreMigrationPlanReference(dir, mainPath, factsPath string) (preMigratio
 	return reference, true, nil
 }
 
-func reusePreMigrationPlanSnapshot(ctx context.Context, dir, mainPath, factsPath, planID string) (preMigrationSnapshotResult, bool, error) {
+func reusePreMigrationPlanSnapshot(ctx context.Context, dir, mainPath, factsPath, planID string, timer *startupTimer) (preMigrationSnapshotResult, bool, error) {
 	result := preMigrationSnapshotResult{checked: make(map[string]bool)}
 	reference, found, err := readPreMigrationPlanReference(dir, mainPath, factsPath)
 	if err != nil || !found {
@@ -563,11 +575,13 @@ func reusePreMigrationPlanSnapshot(ctx context.Context, dir, mainPath, factsPath
 		return result, false, nil
 	}
 	snapshotDir := filepath.Join(dir, reference.SnapshotDir)
-	manifest, manifestHash, err := loadAndVerifyPreMigrationSnapshot(ctx, snapshotDir)
+	verificationBegan := time.Now()
+	manifest, _, err := loadPreMigrationSnapshot(ctx, snapshotDir, reference.ManifestSHA256)
+	timer.snapshotStep("pinned_snapshot_verification", verificationBegan, err)
 	if err != nil {
 		return result, true, fmt.Errorf("已固定的迁移前快照不可用: %w", err)
 	}
-	if manifest.MigrationPlan != planID || manifestHash != reference.ManifestSHA256 {
+	if manifest.MigrationPlan != planID {
 		return result, true, errors.New("迁移计划引用与快照 manifest 不一致")
 	}
 	manifestStores := make(map[string]preMigrationSnapshotStore, len(manifest.Stores))
@@ -583,7 +597,9 @@ func reusePreMigrationPlanSnapshot(ctx context.Context, dir, mainPath, factsPath
 		if !ok || store.SourceFile != source.sourceFile {
 			return result, true, fmt.Errorf("迁移计划引用缺少当前 %s 数据库", source.role)
 		}
+		started := time.Now()
 		checked, err := preflightStartupStoreIntegrity(ctx, source.path)
+		timer.snapshotStep("live_"+source.role+"_integrity", started, err)
 		if err != nil {
 			return result, true, fmt.Errorf("当前 %s SQLite 完整性检查失败: %w", source.role, err)
 		}
@@ -615,11 +631,11 @@ func (m *Monitor) createPreMigrationSnapshot(parent context.Context, mainPath, f
 	ctx, cancel := context.WithTimeout(parent, storeBackupTimeout)
 	defer cancel()
 	dir := m.storeBackupDir()
-	planID, err := m.preMigrationPlanForStore(ctx, mainPath)
+	planID, err := m.startupPreMigrationPlan(ctx, mainPath)
 	if err != nil {
 		return result, err
 	}
-	if reused, found, err := reusePreMigrationPlanSnapshot(ctx, dir, mainPath, factsPath, planID); err != nil {
+	if reused, found, err := reusePreMigrationPlanSnapshot(ctx, dir, mainPath, factsPath, planID, m.startupTimer); err != nil {
 		return result, fmt.Errorf("复核已固定迁移前快照失败: %w", err)
 	} else if found {
 		return reused, nil
@@ -739,6 +755,13 @@ func (m *Monitor) createPreMigrationSnapshot(parent context.Context, mainPath, f
 		return result, fmt.Errorf("迁移前快照已完成，但清理旧快照失败: %w", err)
 	}
 	return result, nil
+}
+
+func (m *Monitor) startupPreMigrationPlan(ctx context.Context, mainPath string) (string, error) {
+	started := time.Now()
+	planID, err := m.preMigrationPlanForStore(ctx, mainPath)
+	m.startupTimer.snapshotStep("migration_plan", started, err)
+	return planID, err
 }
 
 func (m *Monitor) preMigrationPlanForStore(ctx context.Context, mainPath string) (string, error) {
@@ -868,6 +891,13 @@ func readSnapshotControlFile(path string) ([]byte, error) {
 }
 
 func loadAndVerifyPreMigrationSnapshot(ctx context.Context, snapshotDir string) (preMigrationSnapshotManifest, string, error) {
+	return loadPreMigrationSnapshot(ctx, snapshotDir, "")
+}
+
+// A nonempty pinnedManifestHash comes only from the previously published
+// migration-plan reference, not from a user-supplied restore directory. The
+// publisher validated the SQLite contents before committing that reference.
+func loadPreMigrationSnapshot(ctx context.Context, snapshotDir, pinnedManifestHash string) (preMigrationSnapshotManifest, string, error) {
 	info, err := os.Lstat(snapshotDir)
 	if err != nil {
 		return preMigrationSnapshotManifest{}, "", err
@@ -887,6 +917,9 @@ func loadAndVerifyPreMigrationSnapshot(ctx context.Context, snapshotDir string) 
 	manifestHash := hex.EncodeToString(digest[:])
 	if strings.TrimSpace(string(readyData)) != "sha256:"+manifestHash {
 		return preMigrationSnapshotManifest{}, "", errors.New("READY 与 manifest 校验和不一致")
+	}
+	if pinnedManifestHash != "" && pinnedManifestHash != manifestHash {
+		return preMigrationSnapshotManifest{}, "", errors.New("迁移计划引用与快照 manifest 不一致")
 	}
 	var manifest preMigrationSnapshotManifest
 	if err := json.Unmarshal(manifestData, &manifest); err != nil {
@@ -928,19 +961,32 @@ func loadAndVerifyPreMigrationSnapshot(ctx context.Context, snapshotDir string) 
 			return preMigrationSnapshotManifest{}, "", fmt.Errorf("%s store manifest 校验字段不完整", store.Role)
 		}
 		path := filepath.Join(snapshotDir, store.SnapshotFile)
-		inventory := sqliteLogicalInventory{SchemaSHA256: store.SchemaSHA256, TableRows: store.TableRows}
-		fileHash, size, err := verifySQLiteSnapshotFile(ctx, path, inventory)
-		if err != nil {
+		if err := verifyPreMigrationSnapshotMember(ctx, path, store, pinnedManifestHash != ""); err != nil {
 			return preMigrationSnapshotManifest{}, "", fmt.Errorf("%s 快照验证失败: %w", store.Role, err)
-		}
-		if size != store.SizeBytes || fileHash != store.FileSHA256 {
-			return preMigrationSnapshotManifest{}, "", fmt.Errorf("%s 快照文件哈希/大小与 manifest 不一致", store.Role)
 		}
 	}
 	if present == 0 {
 		return preMigrationSnapshotManifest{}, "", errors.New("manifest 不包含任何现有 SQLite")
 	}
 	return manifest, manifestHash, nil
+}
+
+func verifyPreMigrationSnapshotMember(ctx context.Context, path string, store preMigrationSnapshotStore, pinned bool) error {
+	if pinned {
+		verified, err := verifyPinnedSQLiteDigest(ctx, path, store)
+		if verified || err != nil {
+			return err
+		}
+	}
+	inventory := sqliteLogicalInventory{SchemaSHA256: store.SchemaSHA256, TableRows: store.TableRows}
+	fileHash, size, err := verifySQLiteSnapshotFile(ctx, path, inventory)
+	if err != nil {
+		return err
+	}
+	if size != store.SizeBytes || fileHash != store.FileSHA256 {
+		return errors.New("快照文件哈希/大小与 manifest 不一致")
+	}
+	return nil
 }
 
 // RestorePreMigrationSnapshot restores a verified set into an empty target
@@ -1010,7 +1056,11 @@ func RestorePreMigrationSnapshot(parent context.Context, snapshotDir, targetDir 
 			tmp:   filepath.Join(targetDir, "."+store.SourceFile+".restore-tmp"),
 			final: filepath.Join(targetDir, store.SourceFile),
 		}
-		src, err := os.Open(filepath.Join(snapshotDir, store.SnapshotFile))
+		source := filepath.Join(snapshotDir, store.SnapshotFile)
+		if _, err := checkSealedSnapshotSidecars(source); err != nil {
+			return err
+		}
+		src, err := os.Open(source)
 		if err != nil {
 			return err
 		}
@@ -1037,6 +1087,9 @@ func RestorePreMigrationSnapshot(parent context.Context, snapshotDir, targetDir 
 		}
 		if srcCloseErr != nil {
 			return srcCloseErr
+		}
+		if _, err := checkSealedSnapshotSidecars(source); err != nil {
+			return err
 		}
 		inventory := sqliteLogicalInventory{SchemaSHA256: store.SchemaSHA256, TableRows: store.TableRows}
 		fileHash, size, err := verifySQLiteSnapshotFile(ctx, item.tmp, inventory)

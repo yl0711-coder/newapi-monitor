@@ -151,6 +151,77 @@ if phase=='accept' and not control.get('stale_accept'):
         self.assertEqual(before, self.fixture.snapshot())
         self.assertEqual(self.phases(), ["rollback-image"])
 
+    def test_version_child_runs_shared_compose_rollback_under_release_lock(self):
+        # The host phase is exercised through its real CLI/child process. Only
+        # Docker commands and the clock are synthetic; no real service is touched.
+        self.script.write_text(f"""
+import fcntl, json, sys
+from pathlib import Path
+sys.path.insert(0, {str(Path(guard.__file__).resolve().parent)!r})
+from monitor_release_rollback import rollback_compose_monitor
+assert sys.argv[1:] == ["rollback-image"]
+with open({str(self.root / ".deployment.lock")!r}, "r") as lock:
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        pass
+    else:
+        raise AssertionError("release lock not held by the parent and inherited child")
+old = "registry/example@sha256:" + "a" * 64
+new = "registry/example@sha256:" + "b" * 64
+now, active, running = 0, new, True
+events = []
+def inspect(timeout):
+    return {{"Name": "/monitor-test", "Config": {{"Image": active,
+            "Labels": {{"com.docker.compose.project": "monitor-test", "com.docker.compose.service": "monitor"}}}},
+            "State": {{"Running": running}}}}
+def command(args, name, *, timeout):
+    global now, active, running
+    assert args[-1] == "monitor" and args[:4] == ["docker", "compose", "-p", "monitor-test"]
+    if "stop" in args:
+        running = False
+        events.append("stop")
+        now += 5
+    else:
+        assert not running and timeout <= 68 and "--no-deps" in args and "--pull" in args
+        running, active = True, old
+        events.append("old")
+        now += 5
+def verify(timeout):
+    assert not running
+    events.append("single_writer")
+def warm(**kwargs):
+    global now
+    assert kwargs["deadline"] == 300 and not running
+    events.append("warm")
+    now += 25
+    return {{"status": "interrupted", "reason": "watchdog_timeout"}}
+def probe(deadline):
+    assert deadline == 300 and active == old and running
+    return {{"store": True, "facts_store": True, "monitor_http": True, "usage_http": True}}
+def advance(delay):
+    global now
+    now += delay
+result = rollback_compose_monitor(
+    active_compose=["docker", "compose", "-p", "monitor-test", "-f", "new.yml"],
+    old_compose=["docker", "compose", "-p", "monitor-test", "-f", "old.yml"],
+    project="monitor-test", container_name="monitor-test", active_digest=new, old_digest=old,
+    inspect_container=inspect, assert_no_other_writer=verify, checked=command, probe_ready=probe,
+    data_root="/own/test/data", backup_root="/own/test/backup",
+    store_paths=("/data/nexus_monitor.db", "/data/usage-facts.db"),
+    warmer=warm, clock=lambda: now, sleep=advance)
+Path({str(self.events)!r}).write_text(json.dumps({{"events": events, "result": result}}))
+""")
+        before = self.fixture.snapshot()
+        result = self.run_phase("rollback-image")
+        self.assertEqual(result["status"], "succeeded")
+        self.assertEqual(result["cleanup"]["status"], "not_run")
+        self.assertEqual(self.fixture.snapshot(), before)
+        proof = json.loads(self.events.read_text())
+        self.assertEqual(proof["events"], ["stop", "single_writer", "warm", "old"])
+        self.assertEqual(proof["result"]["elapsed_ms"], 59000)
+        self.assertEqual(proof["result"]["read_ahead"]["reason"], "watchdog_timeout")
+
     def test_all_phases_block_while_cleanup_holds_lock(self):
         checked = False
         def during_cleanup(files):
