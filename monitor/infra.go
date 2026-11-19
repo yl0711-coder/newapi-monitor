@@ -253,55 +253,55 @@ func (m *Monitor) infraTargetsWithDiscovery(ctx context.Context, cl lightsailInv
 }
 
 func (m *Monitor) discoverLightsailDatabases(ctx context.Context, cl lightsailInventoryClient, bucket int64) ([]infraTarget, []InfraSample, bool) {
-	var discovered []infraTarget
-	if databases, err := collectLightsailPages(ctx, func(token *string) ([]lstypes.RelationalDatabase, *string, error) {
+	databases, err := collectLightsailPages(ctx, func(token *string) ([]lstypes.RelationalDatabase, *string, error) {
 		r, err := cl.GetRelationalDatabases(ctx, &lightsail.GetRelationalDatabasesInput{PageToken: token})
 		if err != nil {
 			return nil, nil, err
 		}
 		return r.RelationalDatabases, r.NextPageToken, nil
-	}); err == nil {
-		for _, d := range databases {
-			if d.Name == nil || m.infraExcluded(*d.Name) {
-				continue
-			}
-			t := infraTarget{name: *d.Name, rtype: "database"}
-			if h := d.Hardware; h != nil {
-				if h.RamSizeInGb != nil {
-					t.memTotalMB = float64(*h.RamSizeInGb) * 1024
-				}
-				if h.DiskSizeInGb != nil {
-					t.diskTotalGB = float64(*h.DiskSizeInGb)
-				}
-			}
-			discovered = append(discovered, t)
-		}
-		return discovered, managedDiscoveryRows(bucket, "Lightsail/数据库", true, len(discovered)), true
-	} else {
+	})
+	if err != nil {
 		slog.Warn("infra: 列数据库失败", "err", err)
 		return nil, managedDiscoveryRows(bucket, "Lightsail/数据库", false, 0), false
 	}
+	var discovered []infraTarget
+	for _, d := range databases {
+		if d.Name == nil || m.infraExcluded(*d.Name) {
+			continue
+		}
+		t := infraTarget{name: *d.Name, rtype: "database"}
+		if h := d.Hardware; h != nil {
+			if h.RamSizeInGb != nil {
+				t.memTotalMB = float64(*h.RamSizeInGb) * 1024
+			}
+			if h.DiskSizeInGb != nil {
+				t.diskTotalGB = float64(*h.DiskSizeInGb)
+			}
+		}
+		discovered = append(discovered, t)
+	}
+	return discovered, managedDiscoveryRows(bucket, "Lightsail/数据库", true, len(discovered)), true
 }
 
 func (m *Monitor) discoverLightsailLoadBalancers(ctx context.Context, cl lightsailInventoryClient, bucket int64) ([]infraTarget, []InfraSample, bool) {
-	var discovered []infraTarget
-	if balancers, err := collectLightsailPages(ctx, func(token *string) ([]lstypes.LoadBalancer, *string, error) {
+	balancers, err := collectLightsailPages(ctx, func(token *string) ([]lstypes.LoadBalancer, *string, error) {
 		r, err := cl.GetLoadBalancers(ctx, &lightsail.GetLoadBalancersInput{PageToken: token})
 		if err != nil {
 			return nil, nil, err
 		}
 		return r.LoadBalancers, r.NextPageToken, nil
-	}); err == nil {
-		for _, lb := range balancers {
-			if lb.Name != nil && !m.infraExcluded(*lb.Name) {
-				discovered = append(discovered, infraTarget{name: *lb.Name, rtype: "lb"}) // LB 无内存/磁盘概念,跳过总量
-			}
-		}
-		return discovered, managedDiscoveryRows(bucket, "Lightsail/负载均衡", true, len(discovered)), true
-	} else {
+	})
+	if err != nil {
 		slog.Warn("infra: 列负载均衡失败", "err", err)
 		return nil, managedDiscoveryRows(bucket, "Lightsail/负载均衡", false, 0), false
 	}
+	var discovered []infraTarget
+	for _, lb := range balancers {
+		if lb.Name != nil && !m.infraExcluded(*lb.Name) {
+			discovered = append(discovered, infraTarget{name: *lb.Name, rtype: "lb"}) // LB 无内存/磁盘概念,跳过总量
+		}
+	}
+	return discovered, managedDiscoveryRows(bucket, "Lightsail/负载均衡", true, len(discovered)), true
 }
 
 func parseInfraTargets(value string) []infraTarget {
