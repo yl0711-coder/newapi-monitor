@@ -1072,32 +1072,8 @@ func RestorePreMigrationSnapshot(parent context.Context, snapshotDir, targetDir 
 		// Register the staging path immediately so copy/fsync/verification errors
 		// cannot leave a plausible-looking partial database behind.
 		staged = append(staged, item)
-		_, copyErr := io.Copy(dst, src)
-		syncErr := dst.Sync()
-		dstCloseErr := dst.Close()
-		srcCloseErr := src.Close()
-		if copyErr != nil {
-			return fmt.Errorf("复制 %s 快照失败: %w", store.Role, copyErr)
-		}
-		if syncErr != nil {
-			return fmt.Errorf("恢复 %s 快照落盘失败: %w", store.Role, syncErr)
-		}
-		if dstCloseErr != nil {
-			return dstCloseErr
-		}
-		if srcCloseErr != nil {
-			return srcCloseErr
-		}
-		if _, err := checkSealedSnapshotSidecars(source); err != nil {
+		if err := copySealedRestoreStore(ctx, dst, src, store); err != nil {
 			return err
-		}
-		inventory := sqliteLogicalInventory{SchemaSHA256: store.SchemaSHA256, TableRows: store.TableRows}
-		fileHash, size, err := verifySQLiteSnapshotFile(ctx, item.tmp, inventory)
-		if err != nil || fileHash != store.FileSHA256 || size != store.SizeBytes {
-			if err == nil {
-				err = errors.New("恢复文件哈希/大小不一致")
-			}
-			return fmt.Errorf("恢复后 %s 校验失败: %w", store.Role, err)
 		}
 	}
 	if err := syncDirectory(targetDir); err != nil {
@@ -1135,5 +1111,38 @@ func RestorePreMigrationSnapshot(parent context.Context, snapshotDir, targetDir 
 		return err
 	}
 	cleanup = false
+	return nil
+}
+
+// copySealedRestoreStore owns both handles. The caller must register the
+// staging path for cleanup before calling it and publish only after it succeeds.
+func copySealedRestoreStore(ctx context.Context, dst, src *os.File, store preMigrationSnapshotStore) error {
+	_, copyErr := io.Copy(dst, src)
+	syncErr := dst.Sync()
+	dstCloseErr := dst.Close()
+	srcCloseErr := src.Close()
+	if copyErr != nil {
+		return fmt.Errorf("复制 %s 快照失败: %w", store.Role, copyErr)
+	}
+	if syncErr != nil {
+		return fmt.Errorf("恢复 %s 快照落盘失败: %w", store.Role, syncErr)
+	}
+	if dstCloseErr != nil {
+		return dstCloseErr
+	}
+	if srcCloseErr != nil {
+		return srcCloseErr
+	}
+	if _, err := checkSealedSnapshotSidecars(src.Name()); err != nil {
+		return err
+	}
+	inventory := sqliteLogicalInventory{SchemaSHA256: store.SchemaSHA256, TableRows: store.TableRows}
+	fileHash, size, err := verifySQLiteSnapshotFile(ctx, dst.Name(), inventory)
+	if err != nil || fileHash != store.FileSHA256 || size != store.SizeBytes {
+		if err == nil {
+			err = errors.New("恢复文件哈希/大小不一致")
+		}
+		return fmt.Errorf("恢复后 %s 校验失败: %w", store.Role, err)
+	}
 	return nil
 }
