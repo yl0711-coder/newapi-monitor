@@ -26,7 +26,18 @@ func managedAWSInfraResource(name, rtype, platform string) bool {
 }
 
 func (m *Monitor) monitorOwnsInfraResource(name, rtype, platform string) bool {
-	return !m.cfg.InfraManagedAWSDisabled || !managedAWSInfraResource(name, rtype, platform)
+	if managedAWSInfraResource(name, rtype, platform) {
+		return !m.cfg.InfraManagedAWSDisabled
+	}
+	if m.cfg.InfraLightsailInstancesOnly {
+		switch rtype {
+		case "database", "lb":
+			return false
+		case "inventory":
+			return name != "AWS 资源发现/Lightsail/数据库" && name != "AWS 资源发现/Lightsail/负载均衡"
+		}
+	}
+	return true
 }
 
 // delegatedManagedAWSResource also recognizes pre-standard resource names by
@@ -96,4 +107,43 @@ func (m *Monitor) managedAWSInfraView() infraManagedAWSView {
 		return infraManagedAWSView{MonitorEnabled: true, Provider: "Monitor"}
 	}
 	return infraManagedAWSView{MonitorEnabled: false, Provider: "CloudWatch", DashboardURL: m.cfg.InfraManagedAWSDashboardURL}
+}
+
+// infraServerPanels only controls presentation. A missing, failed or stale
+// discovery is not proof that a monitored resource no longer exists.
+type infraServerPanels struct {
+	OriginLock   bool `json:"origin_lock"`
+	Database     bool `json:"database"`
+	LoadBalancer bool `json:"load_balancer"`
+}
+
+func (m *Monitor) serverInfraPanels(s *InfraSnapshot) infraServerPanels {
+	panels := infraServerPanels{
+		OriginLock:   len(probeDomainList(m.cfg.OriginLockTargets)) > 0 || len(s.Locks) > 0,
+		Database:     true,
+		LoadBalancer: true,
+	}
+	if m.cfg.InfraLightsailInstancesOnly && m.cfg.InfraManagedAWSDisabled {
+		panels.Database, panels.LoadBalancer = false, false
+		return panels
+	}
+	if !m.cfg.InfraManagedAWSDisabled || s.RegistryError != "" {
+		return panels
+	}
+	configured := map[string]bool{}
+	for _, t := range parseInfraTargets(m.cfg.InfraResources) {
+		configured[t.rtype] = true
+	}
+	for _, discovery := range s.Discoveries {
+		if discovery.Status != "ok" || discovery.AgeSec < 0 || discovery.ResourceCount != 0 {
+			continue
+		}
+		switch discovery.Name {
+		case "AWS 资源发现/Lightsail/数据库":
+			panels.Database = configured["database"] || len(s.Databases) > 0 || s.Database != nil
+		case "AWS 资源发现/Lightsail/负载均衡":
+			panels.LoadBalancer = configured["lb"] || len(s.LoadBalancers) > 0 || s.LB != nil
+		}
+	}
+	return panels
 }

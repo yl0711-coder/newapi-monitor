@@ -2,11 +2,13 @@ package monitor
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 )
@@ -203,5 +205,89 @@ func TestManagedAWSDelegationUIIsExplicitAndBounded(t *testing.T) {
 		if !strings.Contains(pageHTML, marker) {
 			t.Fatalf("managed AWS UI marker missing: %q", marker)
 		}
+	}
+}
+
+func TestInfraServerPanelsHideOnlyInactiveSections(t *testing.T) {
+	emptyDatabase := InfraDiscovery{Name: "AWS 资源发现/Lightsail/数据库", Status: "ok", AgeSec: 30}
+	emptyLB := InfraDiscovery{Name: "AWS 资源发现/Lightsail/负载均衡", Status: "ok", AgeSec: 30}
+	empty := InfraSnapshot{Discoveries: []InfraDiscovery{emptyDatabase, emptyLB}}
+	m := &Monitor{cfg: Settings{InfraManagedAWSDisabled: true}}
+	if got := m.serverInfraPanels(&empty); got != (infraServerPanels{}) {
+		t.Fatalf("current production-style scope should hide all three inactive cards: %+v", got)
+	}
+	m.cfg.OriginLockTargets = " origin.example.invalid:443 "
+	if got := m.serverInfraPanels(&empty); got != (infraServerPanels{OriginLock: true}) {
+		t.Fatalf("configured lock with missing data must remain visible: %+v", got)
+	}
+	m.cfg.OriginLockTargets = ""
+	m.cfg.InfraResources = "database:configured-db,lb:configured-lb"
+	if got := m.serverInfraPanels(&empty); got != (infraServerPanels{Database: true, LoadBalancer: true}) {
+		t.Fatalf("explicit resources missing samples must remain visible: %+v", got)
+	}
+	m.cfg.InfraResources = ""
+	withData := empty
+	withData.Databases = []InfraResource{{Name: "still-visible", Status: "nosample"}}
+	withData.LB = &InfraResource{Name: "compatibility-lb"}
+	if got := m.serverInfraPanels(&withData); got != (infraServerPanels{Database: true, LoadBalancer: true}) {
+		t.Fatalf("current or compatibility resource rows must remain visible: %+v", got)
+	}
+	withFailure := InfraSnapshot{Discoveries: []InfraDiscovery{emptyDatabase, emptyLB}}
+	withFailure.Discoveries[0].Status = "bad"
+	withFailure.Discoveries[1].AgeSec = -1
+	if got := m.serverInfraPanels(&withFailure); got != (infraServerPanels{Database: true, LoadBalancer: true}) {
+		t.Fatalf("failed/stale discovery must not be presented as confirmed absent: %+v", got)
+	}
+	for _, uncertain := range []InfraSnapshot{
+		{},
+		{RegistryError: "registry unreadable", Discoveries: empty.Discoveries},
+	} {
+		if got := m.serverInfraPanels(&uncertain); got != (infraServerPanels{Database: true, LoadBalancer: true}) {
+			t.Fatalf("unknown ownership or inventory must not hide resources: %+v", got)
+		}
+	}
+	m.cfg.InfraManagedAWSDisabled = false
+	if got := m.serverInfraPanels(&empty); got != (infraServerPanels{Database: true, LoadBalancer: true}) {
+		t.Fatalf("environments still using Monitor for AWS must retain their panels: %+v", got)
+	}
+}
+
+func TestInfraServerSnapshotDistinguishesPresenceTombstonesFromActiveResources(t *testing.T) {
+	m := newTestMonitor(t)
+	defer m.Close()
+	m.cfg.InfraEnabled = true
+	m.cfg.InfraManagedAWSDisabled = true
+	bucket := time.Now().Unix()/60*60 - 60
+	rows := append(managedDiscoveryRows(bucket, "Lightsail/数据库", true, 0),
+		managedDiscoveryRows(bucket, "Lightsail/负载均衡", true, 0)...)
+	rows = append(rows,
+		InfraSample{BucketTs: bucket, Resource: "old-db", RType: "database", Metric: infraPresenceMetric, Value: 0},
+		InfraSample{BucketTs: bucket, Resource: "old-lb", RType: "lb", Metric: infraPresenceMetric, Value: 0},
+		InfraSample{BucketTs: bucket, Resource: "Ubuntu-1", RType: "instance", Metric: "cpu", Value: 13},
+		InfraSample{BucketTs: bucket, Resource: "nexusapi.link", RType: "probe", Metric: "reachable", Value: 1},
+	)
+	if err := m.upsertInfra(rows); err != nil {
+		t.Fatal(err)
+	}
+	router := gin.New()
+	router.GET("/infra", m.serveInfra)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/infra", nil))
+	if w.Code != http.StatusOK {
+		t.Fatalf("infra status=%d body=%s", w.Code, w.Body.String())
+	}
+	var wire struct {
+		Snapshot struct {
+			InfraSnapshot
+			Panels *infraServerPanels `json:"panels"`
+		} `json:"snapshot"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &wire); err != nil {
+		t.Fatal(err)
+	}
+	snap := wire.Snapshot
+	if snap.Panels == nil || *snap.Panels != (infraServerPanels{}) || len(snap.Instances) != 1 || len(snap.Probes) != 1 {
+		t.Fatalf("hide only inactive cards and preserve instances/probes: panels=%+v instances=%d probes=%d",
+			snap.Panels, len(snap.Instances), len(snap.Probes))
 	}
 }

@@ -95,6 +95,37 @@ func TestHostContainerInvalidPayloadDoesNotPartiallyWriteMetrics(t *testing.T) {
 	}
 }
 
+func TestHostExcludedAgentReportIsAcknowledgedWithoutWrites(t *testing.T) {
+	m := newTestMonitor(t)
+	m.cfg.IngestToken = "secret"
+	m.cfg.InfraExcludeResources = []string{"retired-host"}
+	for _, node := range []string{"retired-host", "live-host"} {
+		body := fmt.Sprintf(`{"node":%q,"load1":0.4,"containers":[{"name":"api","state":"running"}]}`, node)
+		w := postHost(t, m, body)
+		if w.Code != http.StatusOK || strings.Contains(w.Body.String(), "resource_not_monitored") != (node == "retired-host") {
+			t.Fatalf("node %q: status=%d body=%s", node, w.Code, w.Body.String())
+		}
+		var metrics, containers, assets int64
+		for _, query := range []struct {
+			model any
+			where string
+			count *int64
+		}{
+			{&InfraSample{}, "resource = ?", &metrics},
+			{&HostContainerSnapshot{}, "node = ?", &containers},
+			{&InfraAsset{}, "resource = ?", &assets},
+		} {
+			if err := m.storeDB.Model(query.model).Where(query.where, node).Count(query.count).Error; err != nil {
+				t.Fatal(err)
+			}
+		}
+		if node == "retired-host" && (metrics != 0 || containers != 0 || assets != 0) ||
+			node == "live-host" && (metrics != 1 || containers != 1 || assets != 1) {
+			t.Fatalf("node %q: metrics=%d containers=%d assets=%d", node, metrics, containers, assets)
+		}
+	}
+}
+
 func TestInfraStatusIncludesContainerHealthAndStaleness(t *testing.T) {
 	m := newTestMonitor(t)
 	if got := containerStatus("running", "unknown"); got != "warn" {

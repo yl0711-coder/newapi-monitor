@@ -340,6 +340,7 @@ type Settings struct {
 	// 原行为；仅当 MONITOR_INFRA_MANAGED_AWS_ENABLED=false 时关闭。
 	InfraManagedAWSDisabled     bool
 	InfraManagedAWSDashboardURL string // MONITOR_INFRA_MANAGED_AWS_DASHBOARD_URL，可选 CloudWatch HTTPS 入口
+	InfraLightsailInstancesOnly bool   // 只监控 Lightsail 实例，关闭该平台的数据库/LB 资源发现和指标采集
 	// CapacityEnabled 只开放容量规划的本地读取页。它不启动 worker、
 	// 不访问 NewAPI/MySQL/Nginx/AWS，只联合展示已落盘的脱敏事实。
 	CapacityEnabled bool // MONITOR_CAPACITY_ENABLED，默认 false
@@ -612,6 +613,7 @@ func LoadSettings() Settings {
 		InfraEnabled:                             env("MONITOR_INFRA_ENABLED", "") == "true",
 		InfraManagedAWSDisabled:                  env("MONITOR_INFRA_MANAGED_AWS_ENABLED", "true") == "false",
 		InfraManagedAWSDashboardURL:              safeInfraManagedAWSDashboardURL(env("MONITOR_INFRA_MANAGED_AWS_DASHBOARD_URL", "")),
+		InfraLightsailInstancesOnly:              env("MONITOR_INFRA_LIGHTSAIL_INSTANCES_ONLY", "false") == "true",
 		CapacityEnabled:                          env("MONITOR_CAPACITY_ENABLED", "false") == "true",
 		GroupGovernanceEnabled:                   env("MONITOR_GROUP_GOVERNANCE_ENABLED", "false") == "true",
 		GroupGovernanceSyncMinutes:               envInt("MONITOR_GROUP_GOVERNANCE_SYNC_MINUTES", 10),

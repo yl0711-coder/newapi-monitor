@@ -51,3 +51,21 @@ test('infra trend failure is not presented as insufficient history and keeps old
   assert.match(wrap.innerHTML, /old chart/);
   assert.doesNotMatch(wrap.innerHTML, /历史数据积累中/);
 });
+
+test('server metrics view hides only explicitly inactive cards and restores them as scope changes', () => {
+  const ids = ['infraLockCard', 'infraDatabaseCard', 'infraLoadBalancerCard'];
+  const cards = new Map(ids.map(id => [id, { hidden: false }]));
+  for (const id of ids) assert.ok(page.includes(`id="${id}" hidden`), id);
+  const context = vm.createContext({document: {getElementById: id => {
+    assert.ok(cards.has(id), 'must not hide hosts, probes, ECS log state or alert history');
+    return cards.get(id);
+  }}});
+  vm.runInContext(functionSource('function renderInfraPanelVisibility(', 'function renderInfra('), context);
+  context.renderInfraPanelVisibility({panels: {origin_lock: false, database: false, load_balancer: false}});
+  assert.deepEqual(ids.map(id => cards.get(id).hidden), [true, true, true]);
+  context.renderInfraPanelVisibility({panels: {origin_lock: true, database: true, load_balancer: false}});
+  assert.deepEqual(ids.map(id => cards.get(id).hidden), [false, false, true]);
+  context.renderInfraPanelVisibility({}); // compatible with responses without visibility fields
+  assert.deepEqual(ids.map(id => cards.get(id).hidden), [false, false, false]);
+  assert.match(page, /renderInfraPanelVisibility\(s\);\s*renderInfraOverview\(s\);\s*renderProbes\(s\);/);
+});

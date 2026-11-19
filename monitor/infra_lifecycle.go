@@ -17,16 +17,26 @@ const maxLightsailKnownResources = 1000
 func (m *Monitor) knownLightsailResources(ctx context.Context) []infraLatestRow {
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
+	types := []string{"instance"}
+	if !m.cfg.InfraLightsailInstancesOnly {
+		types = append(types, "database", "lb")
+	}
 	var rows []infraLatestRow
 	err := m.storeDB.WithContext(ctx).Raw(`SELECT DISTINCT resource, rtype FROM infra_samples
-		WHERE rtype IN ('instance','database','lb')
+		WHERE rtype IN ?
 		AND resource NOT LIKE 'rds/%' AND resource NOT LIKE 'alb/%' AND resource NOT LIKE 'ecs/%'
-		LIMIT ?`, maxLightsailKnownResources+1).Scan(&rows).Error
+		LIMIT ?`, types, maxLightsailKnownResources+1).Scan(&rows).Error
 	if err != nil || len(rows) > maxLightsailKnownResources {
 		slog.Warn("infra: 历史资源名读取未完成，本轮不确认退役", "err", err, "rows", len(rows))
 		return nil
 	}
-	return rows
+	active := rows[:0]
+	for _, row := range rows {
+		if !m.infraExcluded(row.Resource) {
+			active = append(active, row)
+		}
+	}
+	return active
 }
 
 // Never publish a partial inventory as authoritative absence. A failed page,

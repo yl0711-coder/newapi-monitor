@@ -805,7 +805,11 @@ func (m *Monitor) serveInfra(c *gin.Context) {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"enabled": true, "error": "基础设施本地数据读取失败或超时，请稍后重试"})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"enabled": true, "snapshot": snap})
+	view := struct {
+		InfraSnapshot
+		Panels infraServerPanels `json:"panels"`
+	}{InfraSnapshot: snap, Panels: m.serverInfraPanels(&snap)}
+	c.JSON(http.StatusOK, gin.H{"enabled": true, "snapshot": view})
 }
 
 // serveInfraSeries 按需返回某资源(resource)若干指标(metrics 逗号分隔)近 N 小时(hours,默认6,封顶24)的时序。
@@ -937,6 +941,12 @@ func (m *Monitor) ingestHost(c *gin.Context) {
 	node := clip(in.Node, 128)
 	if node == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "node required"})
+		return
+	}
+	if m.infraExcluded(node) {
+		// An explicitly retired agent may still send an in-flight report.
+		// Acknowledge it without recreating inventory, snapshots or samples.
+		c.JSON(http.StatusOK, gin.H{"ok": true, "stored": 0, "containers_stored": 0, "ignored": "resource_not_monitored"})
 		return
 	}
 	receivedAt := time.Now().Unix()

@@ -128,7 +128,7 @@ func (m *Monitor) sampleInfra(ctx context.Context) {
 	cl, err := m.lightsailClient(cctx)
 	if err != nil {
 		slog.Warn("infra: Lightsail 客户端初始化失败", "err", err)
-		rows := append(append(managedDiscoveryRows(bucket, "Lightsail/实例", false, 0), managedDiscoveryRows(bucket, "Lightsail/数据库", false, 0)...), managedDiscoveryRows(bucket, "Lightsail/负载均衡", false, 0)...)
+		rows := m.lightsailDiscoveryFailureRows(bucket)
 		if storeErr := m.upsertInfra(rows); storeErr != nil {
 			slog.Warn("infra: Lightsail 发现失败状态入库失败", "err", storeErr)
 		}
@@ -166,7 +166,22 @@ func (m *Monitor) sampleInfra(ctx context.Context) {
 	}
 }
 
-func (m *Monitor) infraTargetsWithDiscovery(ctx context.Context, cl *lightsail.Client, bucket int64) ([]infraTarget, []InfraSample) {
+type lightsailInventoryClient interface {
+	GetInstances(context.Context, *lightsail.GetInstancesInput, ...func(*lightsail.Options)) (*lightsail.GetInstancesOutput, error)
+	GetRelationalDatabases(context.Context, *lightsail.GetRelationalDatabasesInput, ...func(*lightsail.Options)) (*lightsail.GetRelationalDatabasesOutput, error)
+	GetLoadBalancers(context.Context, *lightsail.GetLoadBalancersInput, ...func(*lightsail.Options)) (*lightsail.GetLoadBalancersOutput, error)
+}
+
+func (m *Monitor) lightsailDiscoveryFailureRows(bucket int64) []InfraSample {
+	rows := managedDiscoveryRows(bucket, "Lightsail/实例", false, 0)
+	if m.cfg.InfraLightsailInstancesOnly {
+		return rows
+	}
+	rows = append(rows, managedDiscoveryRows(bucket, "Lightsail/数据库", false, 0)...)
+	return append(rows, managedDiscoveryRows(bucket, "Lightsail/负载均衡", false, 0)...)
+}
+
+func (m *Monitor) infraTargetsWithDiscovery(ctx context.Context, cl lightsailInventoryClient, bucket int64) ([]infraTarget, []InfraSample) {
 	explicit := parseInfraTargets(m.cfg.InfraResources)
 	var discovered []infraTarget
 	var discoveryRows []InfraSample
@@ -181,7 +196,7 @@ func (m *Monitor) infraTargetsWithDiscovery(ctx context.Context, cl *lightsail.C
 	}); err == nil {
 		complete["instance"] = true
 		for _, in := range instances {
-			if in.Name == nil {
+			if in.Name == nil || m.infraExcluded(*in.Name) {
 				continue
 			}
 			t := infraTarget{name: *in.Name, rtype: "instance"}
@@ -200,56 +215,16 @@ func (m *Monitor) infraTargetsWithDiscovery(ctx context.Context, cl *lightsail.C
 			}
 			discovered = append(discovered, t)
 		}
-		discoveryRows = append(discoveryRows, managedDiscoveryRows(bucket, "Lightsail/实例", true, len(instances))...)
+		discoveryRows = append(discoveryRows, managedDiscoveryRows(bucket, "Lightsail/实例", true, len(discovered))...)
 	} else {
 		slog.Warn("infra: 列实例失败", "err", err)
 		discoveryRows = append(discoveryRows, managedDiscoveryRows(bucket, "Lightsail/实例", false, 0)...)
 	}
-	if databases, err := collectLightsailPages(ctx, func(token *string) ([]lstypes.RelationalDatabase, *string, error) {
-		r, err := cl.GetRelationalDatabases(ctx, &lightsail.GetRelationalDatabasesInput{PageToken: token})
-		if err != nil {
-			return nil, nil, err
-		}
-		return r.RelationalDatabases, r.NextPageToken, nil
-	}); err == nil {
-		complete["database"] = true
-		for _, d := range databases {
-			if d.Name == nil {
-				continue
-			}
-			t := infraTarget{name: *d.Name, rtype: "database"}
-			if h := d.Hardware; h != nil {
-				if h.RamSizeInGb != nil {
-					t.memTotalMB = float64(*h.RamSizeInGb) * 1024
-				}
-				if h.DiskSizeInGb != nil {
-					t.diskTotalGB = float64(*h.DiskSizeInGb)
-				}
-			}
-			discovered = append(discovered, t)
-		}
-		discoveryRows = append(discoveryRows, managedDiscoveryRows(bucket, "Lightsail/数据库", true, len(databases))...)
-	} else {
-		slog.Warn("infra: 列数据库失败", "err", err)
-		discoveryRows = append(discoveryRows, managedDiscoveryRows(bucket, "Lightsail/数据库", false, 0)...)
-	}
-	if balancers, err := collectLightsailPages(ctx, func(token *string) ([]lstypes.LoadBalancer, *string, error) {
-		r, err := cl.GetLoadBalancers(ctx, &lightsail.GetLoadBalancersInput{PageToken: token})
-		if err != nil {
-			return nil, nil, err
-		}
-		return r.LoadBalancers, r.NextPageToken, nil
-	}); err == nil {
-		complete["lb"] = true
-		for _, lb := range balancers {
-			if lb.Name != nil {
-				discovered = append(discovered, infraTarget{name: *lb.Name, rtype: "lb"}) // LB 无内存/磁盘概念,跳过总量
-			}
-		}
-		discoveryRows = append(discoveryRows, managedDiscoveryRows(bucket, "Lightsail/负载均衡", true, len(balancers))...)
-	} else {
-		slog.Warn("infra: 列负载均衡失败", "err", err)
-		discoveryRows = append(discoveryRows, managedDiscoveryRows(bucket, "Lightsail/负载均衡", false, 0)...)
+	if !m.cfg.InfraLightsailInstancesOnly {
+		targets, rows, ok := m.discoverLightsailDatabases(ctx, cl, bucket)
+		discovered, discoveryRows, complete["database"] = append(discovered, targets...), append(discoveryRows, rows...), ok
+		targets, rows, ok = m.discoverLightsailLoadBalancers(ctx, cl, bucket)
+		discovered, discoveryRows, complete["lb"] = append(discovered, targets...), append(discoveryRows, rows...), ok
 	}
 	previous := m.knownLightsailResources(ctx)
 	// The persistent registry retains missing hosts for manual archiving;
@@ -263,7 +238,7 @@ func (m *Monitor) infraTargetsWithDiscovery(ctx context.Context, cl *lightsail.C
 	}
 	lifecycleRows := lightsailPresenceRows(bucket, discovered, previous, complete)
 	discoveryRows = append(discoveryRows, lifecycleRows...)
-	retired := map[string]bool{}
+	retired := make(map[string]bool, len(lifecycleRows))
 	for _, row := range lifecycleRows {
 		retired[row.Resource] = row.Value == 0
 	}
@@ -275,6 +250,58 @@ func (m *Monitor) infraTargetsWithDiscovery(ctx context.Context, cl *lightsail.C
 		}
 	}
 	return active, discoveryRows
+}
+
+func (m *Monitor) discoverLightsailDatabases(ctx context.Context, cl lightsailInventoryClient, bucket int64) ([]infraTarget, []InfraSample, bool) {
+	var discovered []infraTarget
+	if databases, err := collectLightsailPages(ctx, func(token *string) ([]lstypes.RelationalDatabase, *string, error) {
+		r, err := cl.GetRelationalDatabases(ctx, &lightsail.GetRelationalDatabasesInput{PageToken: token})
+		if err != nil {
+			return nil, nil, err
+		}
+		return r.RelationalDatabases, r.NextPageToken, nil
+	}); err == nil {
+		for _, d := range databases {
+			if d.Name == nil || m.infraExcluded(*d.Name) {
+				continue
+			}
+			t := infraTarget{name: *d.Name, rtype: "database"}
+			if h := d.Hardware; h != nil {
+				if h.RamSizeInGb != nil {
+					t.memTotalMB = float64(*h.RamSizeInGb) * 1024
+				}
+				if h.DiskSizeInGb != nil {
+					t.diskTotalGB = float64(*h.DiskSizeInGb)
+				}
+			}
+			discovered = append(discovered, t)
+		}
+		return discovered, managedDiscoveryRows(bucket, "Lightsail/数据库", true, len(discovered)), true
+	} else {
+		slog.Warn("infra: 列数据库失败", "err", err)
+		return nil, managedDiscoveryRows(bucket, "Lightsail/数据库", false, 0), false
+	}
+}
+
+func (m *Monitor) discoverLightsailLoadBalancers(ctx context.Context, cl lightsailInventoryClient, bucket int64) ([]infraTarget, []InfraSample, bool) {
+	var discovered []infraTarget
+	if balancers, err := collectLightsailPages(ctx, func(token *string) ([]lstypes.LoadBalancer, *string, error) {
+		r, err := cl.GetLoadBalancers(ctx, &lightsail.GetLoadBalancersInput{PageToken: token})
+		if err != nil {
+			return nil, nil, err
+		}
+		return r.LoadBalancers, r.NextPageToken, nil
+	}); err == nil {
+		for _, lb := range balancers {
+			if lb.Name != nil && !m.infraExcluded(*lb.Name) {
+				discovered = append(discovered, infraTarget{name: *lb.Name, rtype: "lb"}) // LB 无内存/磁盘概念,跳过总量
+			}
+		}
+		return discovered, managedDiscoveryRows(bucket, "Lightsail/负载均衡", true, len(discovered)), true
+	} else {
+		slog.Warn("infra: 列负载均衡失败", "err", err)
+		return nil, managedDiscoveryRows(bucket, "Lightsail/负载均衡", false, 0), false
+	}
 }
 
 func parseInfraTargets(value string) []infraTarget {
@@ -324,7 +351,7 @@ func (m *Monitor) infraExcluded(name string) bool {
 func (m *Monitor) filterInfraTargets(in []infraTarget) []infraTarget {
 	out := make([]infraTarget, 0, len(in))
 	for _, target := range in {
-		if !m.infraExcluded(target.name) {
+		if !m.infraExcluded(target.name) && (!m.cfg.InfraLightsailInstancesOnly || target.rtype == "instance") {
 			out = append(out, target)
 		}
 	}

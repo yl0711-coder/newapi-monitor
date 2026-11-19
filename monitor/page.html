@@ -1277,11 +1277,11 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
     <div class="monitor-table-scroll monitor-table-medium"><table><thead id="thProbe"></thead><tbody id="tbProbe"></tbody></table></div></div>
 
   <!-- 2b. 源站锁(F-5 看门狗) -->
-  <div class="card"><div class="card-header">🔒 源站锁 <span class="muted" style="font-weight:400">· 已配置端点预期返回 403；其他响应需核验访问边界，不可达或无数据不代表可绕过</span></div>
+  <div class="card" id="infraLockCard" hidden><div class="card-header">🔒 源站锁 <span class="muted" style="font-weight:400">· 已配置端点预期返回 403；其他响应需核验访问边界，不可达或无数据不代表可绕过</span></div>
     <div class="monitor-table-scroll monitor-table-medium"><table><thead id="thLock"></thead><tbody id="tbLock"></tbody></table></div></div>
 
   <!-- 3. 数据库 -->
-  <div class="card">
+  <div class="card" id="infraDatabaseCard" hidden>
     <div class="card-header">🗄 数据库 <span class="muted" style="font-weight:400">· 每个数据库的当前值与趋势图放在同一卡片内</span></div>
     <div id="dbBody" style="padding:16px 20px"><span class="muted">加载中…</span></div>
   </div>
@@ -1290,7 +1290,7 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
   <div class="card"><div class="card-header">🖥 实例与服务 <span class="muted" id="infraInstanceNote" style="font-weight:400">· Lightsail 主机细节来自 agent；ECS/Fargate 服务状态与 CPU/内存来自 AWS，无需容器内 agent</span></div><div class="monitor-table-scroll monitor-table-server"><table><thead id="thInst"></thead><tbody id="tbInst"></tbody></table></div></div>
 
   <!-- 5. 负载均衡 -->
-  <div class="card"><div class="card-header">⚖️ 负载均衡</div><div id="lbBody" style="padding:16px 20px"><span class="muted">加载中…</span></div></div>
+  <div class="card" id="infraLoadBalancerCard" hidden><div class="card-header">⚖️ 负载均衡</div><div id="lbBody" style="padding:16px 20px"><span class="muted">加载中…</span></div></div>
 
   <!-- 6. 最近告警 -->
   <div class="card"><div class="card-header">🔔 历史告警 <span class="muted" style="font-weight:400">· 最近 20 条触发记录，不代表当前仍故障；关闭邮件不停止记录，当前状态以上方资源为准</span></div>
@@ -2447,7 +2447,11 @@ function renderLocks(s){
   const rows=s.locks||[];
   document.getElementById('thLock').innerHTML='<tr><th>源站端点</th><th>状态</th><th class="right">直连返回</th><th>判定</th><th>新鲜度</th></tr>';
   const tb=document.getElementById('tbLock');
-  if(!rows.length){tb.innerHTML='<tr><td colspan="5" class="muted" style="padding:16px">暂无源站锁数据(配置 MONITOR_ORIGIN_LOCK_TARGETS;走私网,仅部署到实例上可测,本地预览不可达属正常)</td></tr>';return}
+  if(!rows.length){
+    const note=s.panels?.origin_lock===true?'已配置源站锁，暂未收到有效探测数据；当前未判定。':'暂无源站锁数据。';
+    tb.innerHTML=`<tr><td colspan="5" class="muted" style="padding:16px">${note}</td></tr>`;
+    return;
+  }
   tb.innerHTML=rows.map(l=>{
     const known=(l.status==='ok'||l.status==='bad')&&Number(l.http_code)>=100&&Number(l.http_code)<=599;
     const codeTxt=known?`<span style="${l.locked?'color:var(--green)':'color:var(--red)'}">${l.http_code}</span>`:'<span class="muted">—</span>';
@@ -2466,6 +2470,12 @@ function renderInfraAlerts(s){
       <span class="why">${esc(a.when)}</span></div>`;
   }).join('')+'</div>';
 }
+function renderInfraPanelVisibility(s){
+  const panels=s.panels||{};
+  document.getElementById('infraLockCard').hidden=panels.origin_lock===false;
+  document.getElementById('infraDatabaseCard').hidden=panels.database===false;
+  document.getElementById('infraLoadBalancerCard').hidden=panels.load_balancer===false;
+}
 function renderInfra(s){
   disposeInfraCharts(); // 重渲染前清掉旧图实例,防泄漏
   const managed=s.managed_aws||{}, delegated=managed.monitor_enabled===false;
@@ -2474,12 +2484,13 @@ function renderInfra(s){
   managedNotice.innerHTML=delegated?`<div class="card" style="padding:12px 18px"><span class="muted">AWS 托管资源（ECS/Fargate、RDS、ALB）已由 CloudWatch 统一监控。</span>${dashboardLink}</div>`:'';
   document.getElementById('infraInstanceNote').textContent=delegated?'· Lightsail 主机细节来自 agent；ECS 日志采集状态在上方独立展示':'· Lightsail 主机细节来自 agent；ECS/Fargate 服务状态与 CPU/内存来自 AWS，无需容器内 agent';
   document.getElementById('infraGenAt').textContent='更新于 '+(s.generated_at||'')+' · 新鲜度 '+fmtAge(s.data_age_sec);
+  renderInfraPanelVisibility(s);
   renderInfraOverview(s);
   renderProbes(s);
-  renderLocks(s);
+  if(s.panels?.origin_lock!==false)renderLocks(s);
   renderInfraAlerts(s);
   const databases=(s.databases&&s.databases.length)?s.databases:(s.database?[s.database]:[]), dbBody=document.getElementById('dbBody');
-  if(!databases.length){dbBody.innerHTML=`<span class="muted">${delegated?'无 Lightsail 数据库数据；RDS 已由 CloudWatch 统一监控':'无数据库数据'}</span>`;}
+  if(!databases.length){dbBody.innerHTML=`<span class="muted">${delegated?'暂无 Lightsail 数据库数据；请核对资源发现状态':'无数据库数据'}</span>`;}
   else{
     dbBody.innerHTML='';
     databases.forEach(db=>{
@@ -2576,7 +2587,7 @@ function renderInfra(s){
     });
   }
   const lbs=(s.load_balancers&&s.load_balancers.length)?s.load_balancers:(s.lb?[s.lb]:[]), lbBody=document.getElementById('lbBody');
-  if(!lbs.length){lbBody.innerHTML=`<span class="muted">${delegated?'ALB 已由 CloudWatch 统一监控':'无负载均衡数据'}</span>`;}
+  if(!lbs.length){lbBody.innerHTML=`<span class="muted">${delegated?'暂无 Lightsail 负载均衡数据；请核对资源发现状态':'无负载均衡数据'}</span>`;}
   else{lbBody.innerHTML=lbs.map((lb,idx)=>{const me=lb.metrics||{};
     return `<div style="${idx?'border-top:1px solid #2b3040;padding-top:14px;margin-top:14px;':''}"><div style="margin-bottom:8px">${infraBadge(lb.status)} <b>${esc(lb.display_name||lb.name)}</b> <span class="muted">· ${esc(lb.group||'其他资源')} · ${esc(lb.platform||'AWS')} · ${fmtAge(lb.age_sec)}</span> ${infraCoverageNote(lb)}</div>`
       +kv('健康节点',fx(me.healthy))+kv('不健康节点',fx(me.unhealthy))+kv('5xx(5min)',fx(me.err_5xx))+kv('响应时间',me.resp_ms!=null?fx(me.resp_ms)+' ms':'—')+'</div>';

@@ -35,6 +35,23 @@
 
 任一资源类别暂未授权时，该类别本轮采集失败但已有 Lightsail、页面和其他业务任务继续运行；不会让 Monitor 启动失败。
 
+### 已迁移到 ECS / RDS / ALB 的生产环境
+
+确认同区域 Lightsail 不再拥有数据库或负载均衡后，Monitor 可设置为仅采集现役
+Lightsail 主机。以下是 NexusAPI 生产环境核对后的候选配置；实际发布前需以当前清单
+复核资源名，并与已有排除名单取并集：
+
+```dotenv
+MONITOR_INFRA_MANAGED_AWS_ENABLED=false
+MONITOR_INFRA_LIGHTSAIL_INSTANCES_ONLY=true
+MONITOR_INFRA_EXCLUDE_RESOURCES=Ubuntu-1,Redis-NexusAPI-New,Ubuntu-NexusAPI-Master,Ubuntu-NexusAPI-Slave-1,Ubuntu-NexusAPI-Slave-2,Database-NexusAPI,LoadBalancer-NexusAPI
+```
+
+`MONITOR_INFRA_LIGHTSAIL_INSTANCES_ONLY` 默认关闭；开启后不请求 Lightsail 数据库或
+负载均衡的发现和指标接口，也不继续写这两类旧资源的盘点标记。已排除的旧主机不再
+采样，旧 agent 偶发上报会在鉴权后应答但不入库。现役主机、端到端探活、ECS 日志接收、
+CloudWatch 直读和原有历史保留规则不变。不要把停止但仍承担备用职责的实例自动列入排除。
+
 ## Fargate 与 Lightsail 指标口径
 
 - 两者都有：CPU、内存使用率和服务/容器健康。Fargate 的任务预留内存会与标准内存百分比组合成已用/总量。
