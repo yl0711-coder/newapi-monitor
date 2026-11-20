@@ -10,7 +10,6 @@ package monitor
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -21,8 +20,6 @@ import (
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
 )
-
-const modelStatisticsQueryTimeout = 5 * time.Second
 
 type modelStatisticsWindow struct {
 	Key     string
@@ -359,7 +356,6 @@ func (m *Monitor) buildModelStatisticsSelectedRead(ctx context.Context, selectio
 		return ModelStatisticsReport{Timing: m.modelReportTiming(true), Range: bounds.Range, Window: bounds.Key, WindowLabel: bounds.Label, FromTs: from, ToTs: to, ActualThroughTs: bounds.ActualThrough, TargetTs: bounds.Target, LagSeconds: bounds.Lag, GeneratedAt: now.Unix(), CollectionFailed: m.modelReportCollectionFailed(true), Models: []ModelStatisticsModel{}, Source: ModelStatisticsSource{CoverageStatus: modelCoverageUnavailable, Note: bounds.Range.Note}}, nil
 	}
 
-	var rows []modelStatisticsRow
 	// Keep the overlap rule identical to the problem-alert query: a legacy
 	// rejection is removed only when a CloudWatch direct row with the same
 	// minute/model/group/user and canonical reason is actually present.  A
@@ -455,7 +451,8 @@ func (m *Monitor) buildModelStatisticsSelectedRead(ctx context.Context, selectio
 		HAVING SUM(CASE WHEN count > 0 THEN count ELSE 0 END) > 0`
 	args := []any{from, to, stabilityTrafficClassificationVersion, from, to}
 	args = append(args, coverageArgs...)
-	if err := m.storeDB.WithContext(ctx).Raw(query, args...).Scan(&rows).Error; err != nil {
+	groups, usernames, err := readModelStatisticsRows(ctx, m.storeDB.Raw(query, args...))
+	if err != nil {
 		return ModelStatisticsReport{}, err
 	}
 	routedCoverage := m.modelStatisticsRoutedCoverage(ctx, from, to, now)
@@ -468,50 +465,6 @@ func (m *Monitor) buildModelStatisticsSelectedRead(ctx context.Context, selectio
 	}
 	coverageStatus := modelStatisticsCombinedCoverage(routedCoverage, rejectionCoverage)
 
-	groups := make(map[string]map[string]*modelStatisticsAggregate)
-	usernames := make(map[int64]string)
-	for _, row := range rows {
-		group := strings.TrimSpace(row.Group)
-		model := strings.TrimSpace(row.Model)
-		models := groups[group]
-		if models == nil {
-			models = make(map[string]*modelStatisticsAggregate)
-			groups[group] = models
-		}
-		item := models[model]
-		if item == nil {
-			item = &modelStatisticsAggregate{customers: make(map[int64]int64), channels: make(map[int]*modelStatisticsChannelAggregate)}
-			models[model] = item
-		}
-		routed := maxNonNegative(row.RoutedRequests)
-		unavailable := maxNonNegative(row.UnavailableRoutes)
-		item.routed += routed
-		item.unavailable += unavailable
-		item.customers[row.UserID] += routed + unavailable
-		if routed > 0 {
-			mergeModelStatisticsTTFT(&item.ttft, row)
-			channel := item.channels[row.ChannelID]
-			if channel == nil {
-				channel = &modelStatisticsChannelAggregate{}
-				item.channels[row.ChannelID] = channel
-			}
-			channel.requests += routed
-			mergeModelStatisticsTTFT(&channel.ttft, row)
-		}
-		if unavailable > 0 {
-			// Keep pre-route requests visible in the same hierarchy. They have
-			// no channel and therefore no meaningful TTFT denominator.
-			channel := item.channels[modelStatisticsUnavailableChannelKey]
-			if channel == nil {
-				channel = &modelStatisticsChannelAggregate{}
-				item.channels[modelStatisticsUnavailableChannelKey] = channel
-			}
-			channel.requests += unavailable
-		}
-		if name := strings.TrimSpace(row.Username); row.UserID > 0 && name != "" {
-			usernames[row.UserID] = name
-		}
-	}
 	userIDs := make([]int64, 0, len(usernames))
 	seenUserIDs := make(map[int64]struct{})
 	for _, models := range groups {
@@ -577,6 +530,9 @@ func (m *Monitor) buildModelStatisticsSelectedRead(ctx context.Context, selectio
 	modelGroups := make(map[string][]ModelStatisticsGroup)
 	modelTTFT := make(map[string]modelStatisticsTTFTAggregate)
 	for groupName, models := range groups {
+		if err := ctx.Err(); err != nil {
+			return ModelStatisticsReport{}, err
+		}
 		for modelName, item := range models {
 			requests := item.routed + item.unavailable
 			ttftObserved, ttftP50, ttftP95, ttftP99, ttftMax, ttftOver3s, ttftOver3sPct := modelStatisticsTTFTViewDetailed(item.ttft)
@@ -606,7 +562,7 @@ func (m *Monitor) buildModelStatisticsSelectedRead(ctx context.Context, selectio
 	}
 	sortModelStatisticsModels(report.Models)
 	syncModelStatisticsFRTAliases(&report)
-	return report, nil
+	return report, ctx.Err()
 }
 
 // syncModelStatisticsFRTAliases publishes the canonical FRT vocabulary while
@@ -846,21 +802,7 @@ func (m *Monitor) serveModelStatisticsReport(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	ctx, cancel := context.WithTimeout(c.Request.Context(), modelStatisticsQueryTimeout)
-	defer cancel()
-	report, err := m.buildModelStatisticsSelected(ctx, selection, time.Now())
-	if err != nil {
-		if abortCanceledUsageRequest(c, err) {
-			return
-		}
-		var input *modelFRTInputError
-		if errors.As(err, &input) {
-			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-			return
-		}
-		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "模型统计本地事实暂时无法读取"})
-		return
-	}
-	c.Header("Cache-Control", "private, no-store")
-	serveLocalReportJSON(c, report)
+	serveModelReport(c, &m.modelReportReads, "模型统计本地事实暂时无法读取", func(ctx context.Context) (ModelStatisticsReport, error) {
+		return m.buildModelStatisticsSelected(ctx, selection, time.Now())
+	})
 }

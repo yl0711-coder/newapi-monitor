@@ -50,6 +50,7 @@ type Monitor struct {
 	prodDB                        *sql.DB              // new-api 生产库【只读】连接(采样器周期查询 + 用户用量按需查询);nil = 未连接
 	portalLogColumns              portalLogColumnCache // Usage 可选来源列元数据缓存；不迁移业务表
 	storeDB                       *gorm.DB             // 本地采样库
+	modelReportReads              modelReportReadGate  // Model statistics and FRT share one heavy local read.
 	queuedWriteMu                 sync.Mutex           // guards queuedWriteDB
 	queuedWriteDB                 *gorm.DB             // 后台排队写连接(BEGIN IMMEDIATE，单连接)
 	queuedWriteClosed             bool                 // set by Close; no reopen afterwards
