@@ -279,11 +279,10 @@ func (m *Monitor) evaluateAlerts(nowUnix int64) {
 	m.evaluateBurn(c, nowUnix) // SLO 错误预算燃烧告警(快烧/慢烧)
 	m.evaluateUpstreamBalanceAlerts(c, nowUnix)
 
-	// 采样器掉线
-	if c.SamplerDownEnabled {
-		if m.LastSampleRun() > 0 && m.LastSampleRun() < nowUnix-int64(m.cfg.SampleSeconds)*3 {
-			m.fire(c, "sampler_down", "", "采样器掉线", "监控采样器超过 3 个周期未成功运行,可能已停止或连不上数据库。", nowUnix)
-		}
+	// 采样器掉线由独立看门狗评估(alert_outbox.go):这里是采样循环内部,
+	// 循环卡住时恰好无法触发。没有启动看门狗(单元测试)时仍在此评估。
+	if m.alerts == nil {
+		m.evaluateSamplerDown(nowUnix)
 	}
 
 	snap, err := m.GetSnapshot(c.EvalWindowMin, nowUnix)
@@ -399,19 +398,20 @@ func categoryCooldownMin(c AlertConfig, kind string) int {
 }
 
 func (m *Monitor) fire(c AlertConfig, kind, target, subject, body string, now int64) {
-	if m.inCooldown(kind, target, categoryCooldownMin(c, kind), now) {
+	if m.alerts.isPending(kind, target) || m.inCooldown(kind, target, categoryCooldownMin(c, kind), now) {
 		return
 	}
 	if !categoryEmailEnabled(c, kind) { // 栏目邮件开关关:不发邮件,仍记入「最近告警」供页面查看
 		m.logAlert(kind, target, subject+"(未发邮件:该栏目报警邮件已关闭)", now)
 		return
 	}
-	if err := sendMail(c, "[new-api监控] "+subject, body); err != nil {
-		// 发送失败也记一条,避免反复重试刷屏(并暴露问题)
-		m.logAlert(kind+"_FAILED", target, err.Error(), now)
+	d := alertDelivery{cfg: c, kind: kind, target: target, subject: subject, body: body, now: now}
+	if m.alerts == nil {
+		m.deliverAlert(d)
 		return
 	}
-	m.logAlert(kind, target, subject, now)
+	// 发信可能要等十几秒:交给独立协程,不阻塞采样等调用方(alert_outbox.go)。
+	m.enqueueAlert(d)
 }
 
 func alertBody(r Row, c AlertConfig, head string, ttftComplete bool) string {

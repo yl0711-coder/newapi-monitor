@@ -67,7 +67,11 @@ func (a *Agent) RunChild(parent context.Context, argv []string) error {
 	}
 	server := &http.Server{Handler: a, ReadHeaderTimeout: 3 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 15 * time.Second, IdleTimeout: 30 * time.Second}
 	serverDone := make(chan error, 1)
-	go func() { serverDone <- server.Serve(listener) }()
+	serveReturned := make(chan struct{})
+	go func() {
+		defer close(serveReturned)
+		serverDone <- server.Serve(listener)
+	}()
 	ctx, cancel := context.WithCancel(context.Background())
 	maintenanceDone := make(chan struct{})
 	defer func() {
@@ -77,6 +81,12 @@ func (a *Agent) RunChild(parent context.Context, argv []string) error {
 		_ = server.Shutdown(shutdown)
 		_ = server.Close()
 		<-maintenanceDone
+		// Serve closes (and so unlinks) its listener when it returns. If
+		// Shutdown ran before Serve registered the listener, that happens
+		// later in Serve's goroutine and could unlink the socket a following
+		// RunChild just created at the same path (flaky chmod ENOENT). Wait
+		// for Serve so the socket path is released before returning.
+		<-serveReturned
 	}()
 	cmd := exec.Command(argv[0], argv[1:]...)
 	cmd.Env = a.ChildEnvironment(os.Environ())

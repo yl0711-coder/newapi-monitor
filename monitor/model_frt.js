@@ -92,7 +92,7 @@ async function load(){
 // The shared model-statistics timer and focus/visibility handlers live in the
 // parent page script. Expose the active FRT loader so those handlers refresh
 // this view as well instead of silently calling the hidden request report.
-window.modelFRTRefresh=()=>{if(state.active)load()};
+window.modelFRTRefresh=()=>{if(state.active&&!state.abort)load()};
 function metrics(frt){
   frt=frt||{};
   const count=typeof frt.observed==='number'&&Number.isSafeInteger(frt.observed)&&frt.observed>=0?frt.observed.toLocaleString('zh-CN'):'—';

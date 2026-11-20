@@ -1717,7 +1717,7 @@ fetch('/api/brand').then(function(r){return r.json()}).then(function(d){
 <script src="/logchain.js?v=20"></script>
 <script src="/usage-logs.js?v=4"></script>
 <script src="/customer-health.js?v=4"></script>
-<script src="/alerts.js?v=3"></script>
+<script src="/alerts.js?v=4"></script>
 <script src="/capacity.js?v=2"></script>
 <script src="/group-governance.js?v=1"></script>
 <script src="/finance.js?v=58"></script>
@@ -1741,7 +1741,7 @@ const fmtCompact=n=>{n=+n||0;const a=Math.abs(n);for(const [d,u] of [[1e9,'B'],[
 const fmtRate=r=>(r||0).toFixed(1)+'%';
 const fmtUSD=v=>'$'+(v||0).toFixed(2);
 const fmtQPS=v=>(v||0).toFixed(3);
-const esc=s=>String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const esc=s=>String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const fmtAge=s=>s<0?'无数据':(s<90?Math.round(s)+' 秒前':(s<5400?Math.round(s/60)+' 分钟前':(s/3600).toFixed(1)+' 小时前'));
 const latClass=s=>s>=60?'lat-bad':(s>=20?'lat-warn':'');
 // FRT (first data event latency) has an independent, strict 3-second

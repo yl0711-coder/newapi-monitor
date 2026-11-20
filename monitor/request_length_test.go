@@ -186,7 +186,7 @@ func TestRequestLengthAllFixedNginxProjections(t *testing.T) {
 		kind  cloudWatchFixedQueryKind
 		value string
 	}{
-		{cwQueryWorkerRequestID, "synthetic-id"}, {cwQueryWorkerPath, "/v1/responses"}, {cwQueryWorkerShadowNginx, ""}, {cwQueryWorkerNginxContinuous, ""},
+		{cwQueryWorkerRequestID, "synthetic-id"}, {cwQueryWorkerPath, "/v1/responses"}, {cwQueryWorkerNginxContinuous, ""},
 	} {
 		_, query, _, err := buildCloudWatchInsightsQuery(cloudWatchInsightsRequest{Kind: tc.kind, From: now.Add(-time.Minute), To: now, Value: tc.value, Limit: 10})
 		if err != nil || !strings.Contains(query, "bytes_sent, request_length, request_completion") {

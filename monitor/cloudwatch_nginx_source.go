@@ -338,7 +338,7 @@ func cloudWatchNginxSamples(evidence []cloudWatchStructuredEvidence, from, to in
 			row := NginxMinuteSample{
 				BucketTs: bucket, Node: cloudWatchNginxNode, Route: normalizeNginxRoute(item.Route),
 				Method: normalizeNginxMethod(item.Method), Status: *item.Status,
-				UpstreamStatus: shadowLastUpstreamStatus(item.UpstreamStatuses), Count: 1,
+				UpstreamStatus: lastUpstreamStatus(item.UpstreamStatuses), Count: 1,
 				RequestTimeSumMS: *item.RequestMS, RequestTimeMaxMS: *item.RequestMS,
 			}
 			if item.UpstreamMS != nil {

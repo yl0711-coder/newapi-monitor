@@ -23,7 +23,6 @@ func isolationLegacyRouter(m *Monitor) *gin.Engine {
 	r.POST("/error", m.ingestNginxErrors)
 	r.POST("/evidence", m.ingestNginxEvidence)
 	r.POST("/reject", m.ingestRejectionsV2)
-	r.POST("/reject-v1", m.ingestRejections)
 	return r
 }
 
@@ -39,11 +38,8 @@ func isolationLegacyPost(m *Monitor, lane string, body []byte) *httptest.Respons
 func TestECSLogIsolatedReceiverRejectsLegacyEvenWithValidToken(t *testing.T) {
 	m := newECSLogTestMonitor(t)
 	m.cfg.NginxAllowedNodes = []string{"master"}
-	for _, lane := range []string{"access", "error", "evidence", "reject", "reject-v1"} {
-		body := []byte(`{}`)
-		if lane != "reject-v1" {
-			body = ecsLaneTestBody(t, "master", lane, 1)
-		}
+	for _, lane := range []string{"access", "error", "evidence", "reject"} {
+		body := ecsLaneTestBody(t, "master", lane, 1)
 		if w := isolationLegacyPost(m, lane, body); w.Code != http.StatusForbidden {
 			t.Fatalf("legacy %s reached isolated store: %d %s", lane, w.Code, w.Body.String())
 		}

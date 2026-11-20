@@ -2,6 +2,7 @@ package monitor
 
 import (
 	"context"
+	"database/sql/driver"
 	"time"
 
 	"gorm.io/gorm"
@@ -155,12 +156,20 @@ func (m *Monitor) modelStatisticsTTFTRowsCoverage(ctx context.Context, from, to 
 		return false, nil
 	}
 	var old int64
-	err := m.storeDB.WithContext(ctx).Raw(`SELECT COUNT(*) FROM capacity_user_minute_samples
+	query := `SELECT COUNT(*) AS invalid_count FROM capacity_user_minute_samples
 		WHERE bucket_ts >= ? AND bucket_ts < ? AND +traffic_class_version = ?
 		  AND (((success + anomaly + failed > 0 OR tokens <> 0 OR quota <> 0 OR refund_quota <> 0)
 		        AND COALESCE(ttft_semantics_version,0) <> ?)
-		       OR `+ttftInvalidRowPredicate("capacity_user_minute_samples")+`)`, from, to,
-		stabilityTrafficClassificationVersion, ttftCoverageSemanticsVersion).Scan(&old).Error
+		       OR ` + ttftInvalidRowPredicate("capacity_user_minute_samples") + `)`
+	args := []any{from, to, stabilityTrafficClassificationVersion, ttftCoverageSemanticsVersion}
+	var err error
+	if modelReportSQLScoped(ctx) {
+		err = consumeModelReportSQL(ctx, m.storeDB, "invalid_count", query, args, func(row []driver.Value) error {
+			return scanModelReportValues(row, &old)
+		})
+	} else {
+		err = m.storeDB.WithContext(ctx).Raw(query, args...).Scan(&old).Error
+	}
 	return err == nil && old == 0, err
 }
 

@@ -1271,7 +1271,7 @@ type readyEffectiveConfig struct {
 	CloudWatchNginxPollSeconds        int    `json:"cloudwatch_nginx_poll_seconds"`
 	CloudWatchNginxLookbackHrs        int    `json:"cloudwatch_nginx_lookback_hours"`
 	CloudWatchLogsEnabled             bool   `json:"cloudwatch_logs_enabled"`
-	CloudWatchShadowEnabled           bool   `json:"cloudwatch_shadow_enabled"`
+	CloudWatchShadowEnabled           bool   `json:"cloudwatch_shadow_enabled"` // Shadow 对账已下线，固定 false，保留一版供外部读取方过渡
 	NginxEnabled                      bool   `json:"nginx_enabled"`
 	NginxSourceV2Enabled              bool   `json:"nginx_source_v2_enabled"`
 	NginxSourceV2CutoverEnabled       bool   `json:"nginx_source_v2_cutover_enabled"`
@@ -1488,7 +1488,6 @@ func (m *Monitor) readyStatus(now time.Time) (readyStatusResponse, int) {
 			CloudWatchNginxPollSeconds:        m.cfg.CloudWatchNginxPollSeconds,
 			CloudWatchNginxLookbackHrs:        m.cfg.CloudWatchNginxLookbackHours,
 			CloudWatchLogsEnabled:             m.cfg.CloudWatchLogsEnabled,
-			CloudWatchShadowEnabled:           m.cfg.CloudWatchShadowEnabled,
 			NginxEnabled:                      m.cfg.NginxEnabled,
 			NginxSourceV2Enabled:              m.cfg.NginxSourceV2Enabled,
 			NginxSourceV2CutoverEnabled:       m.cfg.NginxSourceV2CutoverEnabled,

@@ -40,9 +40,9 @@ func TestCloudWatchPreRouteQueryHasDedicatedBoundedLimit(t *testing.T) {
 	if _, _, _, err := buildCloudWatchInsightsQuery(request); cloudWatchLogsErrorKindOf(err) != cwLogsErrInvalid {
 		t.Fatalf("continuous limit overflow accepted: %v", err)
 	}
-	request.Kind, request.Limit = cwQueryWorkerShadowReject, cloudWatchLogsPreRouteLimit
+	request.Kind, request.Limit = cwQueryWorkerFixedErrors, cloudWatchLogsPreRouteLimit
 	if _, _, _, err := buildCloudWatchInsightsQuery(request); cloudWatchLogsErrorKindOf(err) != cwLogsErrInvalid {
-		t.Fatalf("Shadow must keep the generic 500-row bound: %v", err)
+		t.Fatalf("other worker queries must keep the generic 500-row bound: %v", err)
 	}
 }
 

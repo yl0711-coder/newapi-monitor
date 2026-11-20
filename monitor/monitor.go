@@ -50,6 +50,7 @@ type Monitor struct {
 	prodDB                        *sql.DB              // new-api 生产库【只读】连接(采样器周期查询 + 用户用量按需查询);nil = 未连接
 	portalLogColumns              portalLogColumnCache // Usage 可选来源列元数据缓存；不迁移业务表
 	storeDB                       *gorm.DB             // 本地采样库
+	modelReportReads              modelReportReadGate  // Model statistics and FRT share one heavy local read.
 	queuedWriteMu                 sync.Mutex           // guards queuedWriteDB
 	queuedWriteDB                 *gorm.DB             // 后台排队写连接(BEGIN IMMEDIATE，单连接)
 	queuedWriteClosed             bool                 // set by Close; no reopen afterwards
@@ -116,9 +117,7 @@ type Monitor struct {
 	// cloudWatchLogs 是独立、惰性初始化的只读证据 lane。默认关闭且不从
 	// New/Start/现有路由触发；它不复用生产 MySQL 或 Usage 的查询闸门。
 	cloudWatchLogs *cloudWatchLogsRuntime
-	// Shadow 每次最多运行一个有界窗口，避免 AWS 查询慢时叠加后台任务。
-	shadowRunInProgress atomic.Bool
-	// CloudWatch 前置拒绝连续采集与 Shadow 分离，只把已完整覆盖的分钟窗口
+	// CloudWatch 前置拒绝连续采集只把已完整覆盖的分钟窗口
 	// 发布到 rejection_samples，供模型统计读取。
 	cloudWatchPreRouteRunning     atomic.Bool
 	cloudWatchPreRouteFrom        atomic.Int64
@@ -181,6 +180,8 @@ type Monitor struct {
 	problemLastSuccess              atomic.Int64 // 原始错误采集器最近一次成功执行
 	problemLastFailure              atomic.Int64 // 原始错误采集器最近一次失败
 	egressTimeout                   egressTimeoutWatchState
+	startupTimer                    *startupTimer
+	alerts                          *alertOutbox // 告警发送队列;nil=同步发送(测试)
 	usageFactRecentControlVerified  atomic.Int64 // 近期审计由控制数预检直接通过的成员日数(进程内累计)
 	problemLiveThrough              atomic.Int64 // 原始错误实时 lane 已确认到的分钟右水位
 	problemSourceFrom               atomic.Int64 // 当前问题采集请求窗口左水位
@@ -517,9 +518,6 @@ func New(s Settings) (*Monitor, error) {
 	if err := validateCloudWatchLogsSettings(s); err != nil {
 		return nil, err
 	}
-	if err := validateCloudWatchShadowSettings(s); err != nil {
-		return nil, err
-	}
 	if err := validateCloudWatchPreRouteSettings(s); err != nil {
 		return nil, err
 	}
@@ -844,6 +842,8 @@ func (m *Monitor) Start(ctx context.Context) {
 	m.ctxMu.Lock()
 	m.backgroundCtx = ctx
 	m.ctxMu.Unlock()
+	// 告警发送协程须先于任何可能触发告警的后台循环启动。
+	m.startAlertOutbox(ctx)
 	// 备份只读取 Monitor 自己的 SQLite，与是否连接 NewAPI 来源库无关。
 	// 本机验收可用 MONITOR_STORE_BACKUP_ENABLED=false 显式关闭。
 	m.startStoreMaintenance(ctx)
@@ -878,12 +878,9 @@ func (m *Monitor) Start(ctx context.Context) {
 	if m.cfg.InfraEnabled {
 		go m.startInfra(ctx)
 	}
-	// 阶段四 Shadow 只有在 CloudWatch 与 Nginx 结构化日志契约均显式
-	// 准入后才会启动；默认配置不会创建后台任务或访问 AWS。
 	m.startCloudWatchPreRoute(ctx)
 	m.startEgressTimeoutWatch(ctx)
 	m.startCloudWatchNginx(ctx)
-	m.startCloudWatchShadow(ctx)
 	if ecsLogRuntimeEnabled(m.cfg) {
 		go m.startECSLogDiscovery(ctx)
 		if m.cfg.ECSArchiveEnabled {

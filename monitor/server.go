@@ -382,8 +382,8 @@ func (m *Monitor) RegisterRoutes(r *gin.Engine) {
 		c.Header("Cache-Control", "no-cache")
 		c.Data(http.StatusOK, "application/javascript; charset=utf-8", []byte(ecsLogSourcesJS))
 	})
-	r.POST("/internal/rejections", m.ingestRejections)      // 机器对机器:接收采集器推送的前置拒绝(token 鉴权)
-	r.POST("/internal/rejections/v2", m.ingestRejectionsV2) // Durable collector: strict, full-payload ACK; legacy route unchanged.
+	r.POST("/internal/rejections", ingestRejectionsV1Gone)  // v1 已下线(v1.18.69),返回 410 便于定位仍在推送的旧采集器
+	r.POST("/internal/rejections/v2", m.ingestRejectionsV2) // 采集器推送前置拒绝:严格校验、整包确认
 	r.POST("/internal/ecs/v1/register", m.registerECSLogHTTP)
 	r.POST("/internal/ecs/v1/ingest/:lane", m.ingestECSLogHTTP)
 	r.POST("/internal/ecs/v1/heartbeat/:lane", m.heartbeatECSLogHTTP)
@@ -773,82 +773,12 @@ func (m *Monitor) checkIngest(c *gin.Context) bool {
 
 // ingestRejections 接收各节点 newapi-reject-collector 推来的前置拒绝计数(token 鉴权)。
 // 未配置 MONITOR_INGEST_TOKEN 则接口关闭(503),不接受任何推送。
-func (m *Monitor) ingestRejections(c *gin.Context) {
-	if !m.checkIngest(c) {
-		return
-	}
-	var in struct {
-		Node    string `json:"node"`
-		BatchID string `json:"batch_id"`
-		Samples []struct {
-			BucketTs int64  `json:"bucket_ts"`
-			Reason   string `json:"reason"`
-			Model    string `json:"model"`
-			Group    string `json:"group"`
-			Count    int64  `json:"count"`
-			UserID   int64  `json:"user_id"`
-		} `json:"samples"`
-	}
-	if err := c.ShouldBindJSON(&in); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
-	}
-	if len(in.Samples) > 5000 { // 防异常大包
-		c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "too many samples"})
-		return
-	}
-	node := clip(strings.TrimSpace(in.Node), 64)
-	if ecsLogNodePattern.MatchString(node) {
-		c.JSON(http.StatusForbidden, gin.H{"error": "ECS sources require signed ECS ingestion"})
-		return
-	}
-	batchID := strings.TrimSpace(in.BatchID)
-	if node == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "node required"})
-		return
-	}
-	// cloudwatch-direct is an internal source owned by the direct lane.  Letting
-	// an authenticated legacy collector claim that name would mix externally
-	// pushed rows into the lane that the cursor/reconciliation logic treats as
-	// the authoritative CloudWatch snapshot.
-	if node == cloudWatchPreRouteNode {
-		c.JSON(http.StatusForbidden, gin.H{"error": "reserved rejection source node"})
-		return
-	}
-	if !validIngestBatchID(batchID) {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "valid batch_id required"})
-		return
-	}
-	rows := make([]RejectionSample, 0, len(in.Samples))
-	for _, s := range in.Samples {
-		if s.Model == "" || s.Reason == "" || s.Count <= 0 || s.BucketTs <= 0 || s.UserID < 0 {
-			continue // 丢弃残缺项或非法的负 user_id
-		}
-		rows = append(rows, RejectionSample{
-			BucketTs: s.BucketTs / 60 * 60,
-			Node:     node,
-			Reason:   clip(s.Reason, 64),
-			Model:    clip(s.Model, 128),
-			Grp:      clip(s.Group, 64),
-			Count:    s.Count,
-			UserID:   s.UserID,
-		})
-	}
-	duplicate, err := m.ingestRejectionBatch(node, batchID, rows, time.Now().Unix())
-	if errors.Is(err, errRejectionBatchConflict) {
-		c.JSON(http.StatusConflict, gin.H{"error": "batch_id payload conflict"})
-		return
-	}
-	if err != nil {
-		slog.Warn("被拒请求入库失败", "err", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "store failed"})
-		return
-	}
-	stored := len(rows)
-	if duplicate {
-		stored = 0
-	}
-	c.JSON(http.StatusOK, gin.H{"ok": true, "stored": stored, "duplicate": duplicate})
+// ingestRejectionsV1Gone answers the retired v1 rejection push. Production
+// has received no v1 batches (rejection samples come from the CloudWatch
+// direct lane and v2 collectors); 410 makes any remaining old collector
+// visible in its own logs instead of looking like a routing mistake.
+func ingestRejectionsV1Gone(c *gin.Context) {
+	c.JSON(http.StatusGone, gin.H{"error": "/internal/rejections 已下线，请改用 /internal/rejections/v2"})
 }
 
 func validIngestBatchID(id string) bool {

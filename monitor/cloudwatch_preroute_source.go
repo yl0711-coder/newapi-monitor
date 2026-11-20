@@ -145,7 +145,7 @@ func cloudWatchPreRouteSamples(evidence []cloudWatchStructuredEvidence, from, to
 	counts := make(map[key]int64)
 	seen := make(map[string]struct{}, len(evidence))
 	for _, item := range evidence {
-		if item.Kind != cwEvidenceNewAPIError || !isShadowRejectionCategory(item.Category) {
+		if item.Kind != cwEvidenceNewAPIError || !isPreRouteRejectionCategory(item.Category) {
 			continue
 		}
 		second := item.EventMS / 1000
@@ -162,7 +162,7 @@ func cloudWatchPreRouteSamples(evidence []cloudWatchStructuredEvidence, from, to
 		if item.UserID != nil {
 			userID = *item.UserID
 		}
-		k := key{bucket: second / 60 * 60, reason: canonicalShadowRejectionReason(item.Category),
+		k := key{bucket: second / 60 * 60, reason: canonicalRejectionReason(item.Category),
 			model: strings.TrimSpace(item.Model), group: strings.TrimSpace(item.Group), userID: userID}
 		counts[k]++
 	}

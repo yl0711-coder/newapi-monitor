@@ -2,6 +2,7 @@ package monitor
 
 import (
 	"context"
+	"database/sql/driver"
 	"strconv"
 	"strings"
 )
@@ -86,13 +87,38 @@ func (m *Monitor) modelFRTRowsGrouped(ctx context.Context, from, to int64, filte
    HAVING SUM(CASE WHEN success+anomaly+failed > 0 THEN success+anomaly+failed ELSE 0 END) > 0
   ) GROUP BY ` + minuteColumn + `channel_id, grp, model LIMIT ?`
 	var rows []modelFRTRow
-	if err := m.storeDB.WithContext(ctx).Raw(query, args...).Scan(&rows).Error; err != nil {
+	var err error
+	if !minutes && modelReportSQLScoped(ctx) {
+		rows, err = readModelFRTReportRows(ctx, m, query, args)
+	} else {
+		err = m.storeDB.WithContext(ctx).Raw(query, args...).Scan(&rows).Error
+	}
+	if err != nil {
 		return nil, err
 	}
 	if len(rows) > limit {
 		return nil, errModelFRTLimit
 	}
 	return rows, nil
+}
+
+func readModelFRTReportRows(ctx context.Context, m *Monitor, query string, args []any) ([]modelFRTRow, error) {
+	const columns = `channel_id, NULLIF(CAST(grp AS BLOB),X''), NULLIF(CAST(model AS BLOB),X''), success, anomaly, failed,
+		ttft_500,ttft_1k,ttft_2k,ttft_5k,ttft_10k,ttft_inf,ttft_max_ms,ttft_observed,ttft_over_3s,
+		frt_sum_ms,frt_sum_observed,mean_unsupported_rows,mean_invalid_rows,historical_rows,invalid_rows`
+	var rows []modelFRTRow
+	err := consumeModelReportSQL(ctx, m.storeDB, columns, query, args, func(values []driver.Value) error {
+		var r modelFRTRow
+		s := &r.Row
+		if err := scanModelReportValues(values, &s.ChannelID, &s.Group, &s.Model, &r.Success, &r.Anomaly, &r.Failed,
+			&s.Ttft500, &s.Ttft1k, &s.Ttft2k, &s.Ttft5k, &s.Ttft10k, &s.TtftInf, &s.TtftMaxMs, &s.TtftObserved, &s.TtftOver3s,
+			&r.FRTSumMs, &r.FRTSumObserved, &r.MeanUnsupportedRows, &r.MeanInvalidRows, &r.HistoricalRows, &r.InvalidRows); err != nil {
+			return err
+		}
+		rows = append(rows, r)
+		return nil
+	})
+	return rows, err
 }
 
 func (m *Monitor) modelFRTCoverage(ctx context.Context, from, to int64) (ModelFRTCoverage, error) {

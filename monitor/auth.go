@@ -270,7 +270,7 @@ func (m *Monitor) currentUser(c *gin.Context) (name string, role int, ok bool) {
 func (m *Monitor) requireRole(min int) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		name, role, ok := m.currentUser(c)
-		wantsJSON := strings.Contains(c.GetHeader("Accept"), "json")
+		wantsJSON := authWantsJSON(c.Request)
 		if !ok {
 			if wantsJSON {
 				c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "未登录", "login_required": true})
@@ -293,6 +293,26 @@ func (m *Monitor) requireRole(min int) gin.HandlerFunc {
 		c.Set("urole", role)
 		c.Next()
 	}
+}
+
+// authWantsJSON reports whether an unauthenticated/forbidden request must get
+// a JSON 401/403 instead of a redirect to /login.
+//
+// Only a top-level page navigation should be redirected. A script request that
+// follows the 302 receives the login page with 200, so a POST sent without an
+// "Accept: application/json" header used to look successful while nothing had
+// been saved (session expired). Write methods and browser fetch/XHR requests
+// (Sec-Fetch-Dest: empty) therefore always get JSON.
+func authWantsJSON(r *http.Request) bool {
+	if strings.Contains(r.Header.Get("Accept"), "json") {
+		return true
+	}
+	switch r.Method {
+	case http.MethodGet, http.MethodHead:
+	default:
+		return true
+	}
+	return r.Header.Get("Sec-Fetch-Dest") == "empty"
 }
 
 // ---- 处理器 ----

@@ -49,7 +49,6 @@ internal/financegiftexport/**
 !internal/financegiftexport/*.go
 !internal/usagebill/
 internal/usagebill/**
-!internal/usagebill/*.go
 !internal/usagebill/exportjobs/
 internal/usagebill/exportjobs/**
 !internal/usagebill/exportjobs/*.go

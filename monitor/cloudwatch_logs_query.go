@@ -19,8 +19,6 @@ const (
 	cwQueryWorkerRequestID       cloudWatchFixedQueryKind = "worker_request_id"
 	cwQueryWorkerPath            cloudWatchFixedQueryKind = "worker_path"
 	cwQueryWorkerFixedErrors     cloudWatchFixedQueryKind = "worker_fixed_errors"
-	cwQueryWorkerShadowNginx     cloudWatchFixedQueryKind = "worker_shadow_nginx"
-	cwQueryWorkerShadowReject    cloudWatchFixedQueryKind = "worker_shadow_reject"
 	cwQueryWorkerPreRouteReject  cloudWatchFixedQueryKind = "worker_preroute_reject"
 	cwQueryWorkerNginxContinuous cloudWatchFixedQueryKind = "worker_nginx_continuous"
 	cwQueryWorkerEgressTimeout   cloudWatchFixedQueryKind = "worker_egress_dial_timeout"
@@ -116,17 +114,7 @@ func buildCloudWatchInsightsQuery(req cloudWatchInsightsRequest) (cloudWatchLogS
 		}
 		sourceID = cwSourceWorkerNewAPI
 		query = "filter @logStream like /^new-api\\// | filter @message like /No available channel|panic|fatal|timeout|broken pipe/ | fields @timestamp, @logStream, @message"
-	case cwQueryWorkerShadowNginx:
-		if strings.TrimSpace(req.Value) != "" {
-			return cloudWatchLogSource{}, "", 0, newCloudWatchLogsError(cwLogsErrInvalid, "shadow_query_value", nil)
-		}
-		sourceID = cwSourceWorkerNginx
-		// Shadow 只比较结构化 access 事实。同一 nginx/ 前缀还会混有错误和
-		// 运行日志；若不在查询侧排除，它们既不是 access 请求，也没有完整的
-		// access 字段，会把本来完整的窗口误标为解析失败。
-		// 不使用任意用户提供的查询语句，也不把原始日志正文作为持久化结果。
-		query = "filter @logStream like /^nginx\\// | filter ispresent(request_method) and ispresent(uri) and ispresent(status) and ispresent(request_time) | fields @timestamp, @logStream, @ptr, nginx_request_id, oneapi_request_id, request_method, uri, status, request_time, upstream_status, upstream_response_time, upstream_connect_time, upstream_header_time, bytes_sent, request_length, request_completion"
-	case cwQueryWorkerShadowReject, cwQueryWorkerPreRouteReject:
+	case cwQueryWorkerPreRouteReject:
 		if strings.TrimSpace(req.Value) != "" {
 			return cloudWatchLogSource{}, "", 0, newCloudWatchLogsError(cwLogsErrInvalid, "shadow_query_value", nil)
 		}
