@@ -12,7 +12,7 @@ function harness(file='model_frt.js'){
  const context=vm.createContext({window:{},document:{getElementById:element,querySelectorAll:()=>[]},location,URLSearchParams,AbortController,fetch:(url,options)=>new Promise((resolve,reject)=>requests.push({url,options,resolve,reject}))});
  const source=read(file),at=source.lastIndexOf('})();');
  vm.runInContext(read('view_refresh.js'),context);context.window.MonitorView.preserve=(_root,update)=>update();
- const exports=file==='model_frt.js'?'state,load,render,metrics,deactivate':'state,load';
+ const exports=file==='model_frt.js'?'state,load,render,metrics,deactivate':'state,load,refreshCurrentReport';
  vm.runInContext(source.slice(0,at)+'\nglobalThis.testing={'+exports+'};\n'+source.slice(at),context);
  context.testing.state.active=true;
  return {...context.testing,window:context.window,element,requests,location};
@@ -47,6 +47,16 @@ test('refresh cancels old load and stale success/finally cannot overwrite latest
  const h=harness();const first=h.load();const second=h.load();assert.ok(h.requests[0].options.signal.aborted);
  h.requests[1].resolve(response(report('new')));await second;h.requests[0].resolve(response(report('old')));await first;
  assert.match(h.element('frtTree').innerHTML,/new/);assert.doesNotMatch(h.element('frtTree').innerHTML,/old/);assert.equal(h.element('frtTree').attrs['aria-busy'],'false');
+});
+test('automatic refresh waits for the active request on both model views',async()=>{
+ for(const file of ['model_frt.js','model_statistics.js']){
+  const h=harness(file),refresh=h.refreshCurrentReport||h.window.modelFRTRefresh;
+  const first=h.load();refresh();refresh();
+  assert.equal(h.requests.length,1);assert.equal(h.requests[0].options.signal.aborted,false);
+  h.requests[0].resolve(response({error:'test fixture'},503));await first;
+  refresh();assert.equal(h.requests.length,2);h.requests[1].resolve(response({},503));
+  await new Promise(setImmediate);
+ }
 });
 test('stale response body, stale errors and stale 401 cannot escape generation guard',async()=>{
  const h=harness();let bodyResolve;const first=h.load();h.requests[0].resolve({ok:true,status:200,json:()=>new Promise(r=>bodyResolve=r)});await new Promise(setImmediate);assert.equal(typeof bodyResolve,'function');

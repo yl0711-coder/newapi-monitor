@@ -336,8 +336,6 @@ func modelFRTTree(rows []modelFRTRow, names map[int]string, complete bool) []Mod
 
 func (m *Monitor) serveModelFRTReport(c *gin.Context) {
 	c.Header("Cache-Control", "private, no-store")
-	ctx, cancel := context.WithTimeout(c.Request.Context(), modelStatisticsQueryTimeout)
-	defer cancel()
 	var filter ModelFRTFilter
 	if raw := c.Query("channel_id"); raw != "" {
 		id, err := strconv.Atoi(raw)
@@ -376,22 +374,7 @@ func (m *Monitor) serveModelFRTReport(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	report, err := m.buildModelFRTSelected(ctx, selection, filter, time.Now())
-	if err != nil {
-		if abortCanceledUsageRequest(c, err) {
-			return
-		}
-		var input *modelFRTInputError
-		if errors.As(err, &input) {
-			c.JSON(http.StatusBadRequest, gin.H{"error": input.Error()})
-			return
-		}
-		message := "首字耗时本地事实暂时无法读取，请稍后重试"
-		if errors.Is(err, errModelFRTLimit) {
-			message = "所选范围的模型维度过多，请按渠道、分组或模型筛选后重试"
-		}
-		c.JSON(http.StatusServiceUnavailable, gin.H{"error": message})
-		return
-	}
-	serveLocalReportJSON(c, report)
+	serveModelReport(c, &m.modelReportReads, "首字耗时本地事实暂时无法读取，请稍后重试", func(ctx context.Context) (ModelFRTReport, error) {
+		return m.buildModelFRTSelected(ctx, selection, filter, time.Now())
+	})
 }

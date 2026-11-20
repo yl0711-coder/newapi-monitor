@@ -30,10 +30,7 @@ function scheduleRefresh(){
   if(document.hidden||pane?.hidden)return;
   state.refreshTimer=setTimeout(()=>{
     state.refreshTimer=null;
-    if(!document.hidden&&!pane?.hidden){
-      const frt=window.monitorNavigationContext?.().view==='frt';
-      if(frt)window.modelFRTRefresh?.();else load();
-    }
+    if(!document.hidden&&!pane?.hidden)refreshCurrentReport();
     scheduleRefresh();
   },30000);
 }
@@ -83,8 +80,7 @@ function ensureRefreshHandlers(){
   const refreshIfVisible=()=>{
     const pane=$('tab-model-statistics');
     if(document.hidden||pane?.hidden)return;
-    const frt=window.monitorNavigationContext?.().view==='frt';
-    if(frt)window.modelFRTRefresh?.();else load();
+    refreshCurrentReport();
     scheduleRefresh();
   };
   window.addEventListener('focus',refreshIfVisible);
@@ -94,6 +90,11 @@ function ensureRefreshHandlers(){
   });
 }
 window.modelStatisticsEnsureRefreshHandlers=ensureRefreshHandlers;
+
+function refreshCurrentReport(){
+  if(window.monitorNavigationContext?.().view==='frt')window.modelFRTRefresh?.();
+  else if(!state.loading)load();
+}
 
 async function load(windowKey){
   if(windowKey!==undefined){if(!WINDOW_LABEL[windowKey])return;state.window=windowKey;state.from='';state.to='';state.range=''}
