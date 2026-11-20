@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {readFileSync} from 'node:fs';
+import {readdirSync,readFileSync} from 'node:fs';
 import vm from 'node:vm';
 
 const source=readFileSync(new URL('../../monitor/usage_logs.js',import.meta.url),'utf8');
@@ -213,9 +213,14 @@ test('repeated Enter shares the unchanged running search but changed filters sti
 });
 
 test('server queries put MySQL time hints after SELECT; page remains isolated from Usage',()=>{
-  const go=readFileSync(new URL('../../monitor/newapi_usage_logs.go',import.meta.url),'utf8');
+  const adapter=new URL('../../monitor/newapi_usage_logs.go',import.meta.url);
+  const pkg=new URL('../../internal/usagelogs/',import.meta.url);
+  const go=[adapter,...readdirSync(pkg)
+    .filter(name=>name.endsWith('.go')&&!name.endsWith('_test.go'))
+    .map(name=>new URL(name,pkg))].map(file=>readFileSync(file,'utf8')).join('\n');
   assert.match(go,/usageLogsSelect\s*= "SELECT \/\*\+ MAX_EXECUTION_TIME\(18000\) \*\/ "/);
-  const queries=go.match(/(?:QueryContext|QueryRowContext)\(ctx, usageLogsSelect\+/g)||[];assert.equal(queries.length,9);
+  // The package-wide scan also covers the indexed time-window query previously in usage_logs_plan.go.
+  const queries=go.match(/(?:QueryContext|QueryRowContext)\(ctx, usageLogsSelect\+/g)||[];assert.equal(queries.length,10);
   assert.match(go,/COUNT\(\*\) OVER\(\) AS page_matches FROM \(SELECT id AS page_id, created_at AS page_created_at/);
   assert.match(go,/COUNT\(\*\) OVER\(\) AS matched_total/);
   const html=readFileSync(new URL('../../monitor/page.html',import.meta.url),'utf8');assert.match(html,/else if\(window\.usageLogsDeactivate\)window\.usageLogsDeactivate\(\)/);

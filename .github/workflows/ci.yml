@@ -199,6 +199,7 @@ jobs:
           touch internal/observability/ci-probe_test.go
           touch internal/observability/ci-local-config.json
           touch internal/observability/schema/ci-local-config.json
+          touch internal/usagelogs/ci-local-config.json
           touch internal/usagebill/ci-probe_test.go
           touch internal/usagebill/ci-local-config.json
           touch internal/usagebill/exportjobs/ci-probe_test.go
@@ -216,6 +217,7 @@ jobs:
             test -e /context/internal/observability/metrics.go &&
             test -e /context/internal/observability/schema.go &&
             test -e /context/internal/observability/schema/observability.v1.schema.json &&
+            test -e /context/internal/usagelogs/service.go &&
             test -e /context/internal/usagebill/exportjobs/jobs.go &&
             test -e /context/internal/usagebill/exportjobs/recovery.go &&
             test ! -e /context/.local-data &&
@@ -249,6 +251,9 @@ jobs:
             test ! -e /context/internal/observability/ci-probe_test.go &&
             test ! -e /context/internal/observability/ci-local-config.json &&
             test ! -e /context/internal/observability/schema/ci-local-config.json &&
+            test ! -e /context/internal/usagelogs/service_test.go &&
+            test ! -e /context/internal/usagelogs/ci-local-config.json &&
+            test ! -e /context/dev/fixtures/usage-logs-mysql.sql &&
             test ! -e /context/internal/usagebill/ci-probe_test.go &&
             test ! -e /context/internal/usagebill/ci-local-config.json &&
             test ! -e /context/internal/usagebill/exportjobs/ci-probe_test.go &&

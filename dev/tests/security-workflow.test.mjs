@@ -82,7 +82,7 @@ test('all production images use the same patched Go build version as CI', () => 
   assert.match(job('image-security'), /pull: true\s+no-cache-filters: runtime/);
 });
 
-test('Docker context allowlist includes observability sources and the embedded schema', () => {
+test('Docker context allowlist includes production modules and the embedded schema', () => {
   const rules = readFileSync(new URL('../../.dockerignore', import.meta.url), 'utf8')
     .split(/\r?\n/);
   for (const rule of [
@@ -92,12 +92,15 @@ test('Docker context allowlist includes observability sources and the embedded s
     '!internal/observability/*.go',
     '!internal/observability/schema/',
     '!internal/observability/schema/observability.v1.schema.json',
+    '!internal/usagelogs/',
+    'internal/usagelogs/**',
+    '!internal/usagelogs/*.go',
   ]) {
     assert.ok(rules.includes(rule), 'missing production context rule: ' + rule);
   }
 });
 
-test('Docker context audit checks observability assets and excluded fixtures', () => {
+test('Docker context audit checks production sources and excluded fixtures', () => {
   const audit = job('test').split('- name: Verify Docker build context isolation')[1] ?? '';
   for (const file of [
     'internal/metering/field.go',
@@ -106,6 +109,7 @@ test('Docker context audit checks observability assets and excluded fixtures', (
     'internal/observability/metrics.go',
     'internal/observability/schema.go',
     'internal/observability/schema/observability.v1.schema.json',
+    'internal/usagelogs/service.go',
   ]) {
     assert.ok(audit.includes('test -e /context/' + file), 'missing context inclusion check: ' + file);
   }
@@ -115,8 +119,12 @@ test('Docker context audit checks observability assets and excluded fixtures', (
     'internal/observability/ci-probe_test.go',
     'internal/observability/ci-local-config.json',
     'internal/observability/schema/ci-local-config.json',
+    'internal/usagelogs/ci-local-config.json',
   ]) {
     assert.ok(audit.includes('touch ' + file), 'missing excluded context fixture: ' + file);
+    assert.ok(audit.includes('test ! -e /context/' + file), 'missing context exclusion check: ' + file);
+  }
+  for (const file of ['internal/usagelogs/service_test.go', 'dev/fixtures/usage-logs-mysql.sql']) {
     assert.ok(audit.includes('test ! -e /context/' + file), 'missing context exclusion check: ' + file);
   }
 });
