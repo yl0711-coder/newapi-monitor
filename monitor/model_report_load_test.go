@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -67,7 +68,10 @@ func TestModelReportEndpointsShareHeavyReadSlot(t *testing.T) {
 	m := newTestMonitor(t)
 	defer m.Close()
 	entered, unblock := make(chan struct{}, 1), make(chan struct{})
-	if err := m.storeDB.Callback().Row().Before("gorm:row").Register("hold-model-report", func(*gorm.DB) {
+	if err := m.storeDB.Callback().Raw().Before("gorm:raw").Register("hold-model-report", func(tx *gorm.DB) {
+		if !strings.Contains(tx.Statement.SQL.String(), modelReportRowFunction) {
+			return
+		}
 		select {
 		case entered <- struct{}{}:
 		default:

@@ -192,7 +192,7 @@ func (m *Monitor) buildModelFRTReportFiltered(ctx context.Context, key, rawEnd s
 }
 
 func (m *Monitor) buildModelFRTSelected(ctx context.Context, selection modelReportSelection, filter ModelFRTFilter, now time.Time) (ModelFRTReport, error) {
-	ctx = withReportProjectionCache(ctx)
+	ctx = withReportProjectionCache(context.WithValue(ctx, modelReportSQLScope{}, true))
 	report := ModelFRTReport{Channels: []ModelFRTChannel{}}
 	if m == nil || m.storeDB == nil {
 		return report, fmt.Errorf("local fact store unavailable")

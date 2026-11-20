@@ -317,7 +317,7 @@ func (m *Monitor) buildModelStatisticsSelected(ctx context.Context, selection mo
 	if m == nil || m.storeDB == nil {
 		return ModelStatisticsReport{}, fmt.Errorf("本地事实库未就绪")
 	}
-	ctx = withReportProjectionCache(ctx)
+	ctx = withReportProjectionCache(context.WithValue(ctx, modelReportSQLScope{}, true))
 	var report ModelStatisticsReport
 	err := m.storeDB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		local := &Monitor{cfg: m.cfg, storeDB: tx}
@@ -451,7 +451,7 @@ func (m *Monitor) buildModelStatisticsSelectedRead(ctx context.Context, selectio
 		HAVING SUM(CASE WHEN count > 0 THEN count ELSE 0 END) > 0`
 	args := []any{from, to, stabilityTrafficClassificationVersion, from, to}
 	args = append(args, coverageArgs...)
-	groups, usernames, err := readModelStatisticsRows(ctx, m.storeDB.Raw(query, args...))
+	groups, usernames, err := readModelStatisticsRows(ctx, m.storeDB, query, args...)
 	if err != nil {
 		return ModelStatisticsReport{}, err
 	}

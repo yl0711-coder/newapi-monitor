@@ -914,7 +914,13 @@ func (m *Monitor) serveUsageLogsStat(c *gin.Context) {
 		}
 	}
 	rateStarted := time.Now()
-	if err := db.QueryRowContext(ctx, usageLogsSelect+"COUNT(*), COALESCE(SUM(prompt_tokens),0), COALESCE(SUM(completion_tokens),0) FROM logs"+rateWhere.sql(), rateWhere.args...).Scan(&rpm, &prompt, &completion); err != nil {
+	err = db.QueryRowContext(ctx, usageLogsSelect+"COUNT(*), COALESCE(SUM(prompt_tokens),0), COALESCE(SUM(completion_tokens),0) FROM logs"+rateWhere.sql(), rateWhere.args...).Scan(&rpm, &prompt, &completion)
+	if err == nil {
+		// A driver can return a row while the client or query deadline is
+		// cancelling. Do not report success for that request.
+		err = ctx.Err()
+	}
+	if err != nil {
 		err = usageLogsQueryErr(ctx, err)
 		usageLogsWarnFailure("stat_rate", rateStarted, statFilter, err)
 		usageLogsFail(c, fmt.Errorf("查询统计数据失败: %w", err))

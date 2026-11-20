@@ -2,7 +2,7 @@ package monitor
 
 import (
 	"context"
-	"database/sql"
+	"database/sql/driver"
 	"strings"
 
 	"gorm.io/gorm"
@@ -11,35 +11,28 @@ import (
 // Fold the query's per-user/channel rows straight into the report dimensions.
 // Keep the same SQL, row order and snapshot; never retain a second full copy of
 // the grouped data or run the follow-up coverage queries with this cursor open.
-func readModelStatisticsRows(ctx context.Context, query *gorm.DB) (map[string]map[string]*modelStatisticsAggregate, map[int64]string, error) {
-	rows, err := query.WithContext(ctx).Rows()
+func readModelStatisticsRows(ctx context.Context, db *gorm.DB, query string, args ...any) (map[string]map[string]*modelStatisticsAggregate, map[int64]string, error) {
+	groups := make(map[string]map[string]*modelStatisticsAggregate)
+	usernames := make(map[int64]string)
+	// The pinned driver's scalar function adapter treats TEXT as NUL
+	// terminated; non-empty BLOB retains the bytes from the old scanner.
+	// The adapter cannot read a zero-byte BLOB; NULL decodes to empty text.
+	const columns = `NULLIF(CAST(grp AS BLOB),X''), NULLIF(CAST(model AS BLOB),X''), user_id, channel_id,
+		NULLIF(CAST(username AS BLOB),X''), routed_requests, unavailable_routes,
+		ttft_500, ttft_1k, ttft_2k, ttft_5k, ttft_10k, ttft_inf, ttft_max_ms, ttft_observed, ttft_over_3s`
+	err := consumeModelReportSQL(ctx, db, columns, query, args, func(values []driver.Value) error {
+		var row modelStatisticsRow
+		if err := scanModelReportValues(values, &row.Group, &row.Model, &row.UserID, &row.ChannelID, &row.Username, &row.RoutedRequests, &row.UnavailableRoutes,
+			&row.Ttft500, &row.Ttft1k, &row.Ttft2k, &row.Ttft5k, &row.Ttft10k, &row.TtftInf, &row.TtftMaxMs, &row.TtftObserved, &row.TtftOver3s); err != nil {
+			return err
+		}
+		addModelStatisticsRow(groups, usernames, row)
+		return nil
+	})
 	if err != nil {
 		return nil, nil, err
 	}
-	defer rows.Close()
-	groups := make(map[string]map[string]*modelStatisticsAggregate)
-	usernames := make(map[int64]string)
-	var row modelStatisticsRow
-	// The report's historical GORM scanner treats NULL dimensions as zero
-	// values. Keep that behavior for old SQLite rows and missing usernames.
-	var group, model, username sql.NullString
-	var channel sql.Null[int]
-	for rows.Next() {
-		if err := ctx.Err(); err != nil {
-			return nil, nil, err
-		}
-		// Column order is the SELECT in buildModelStatisticsSelectedRead.
-		if err := rows.Scan(&group, &model, &row.UserID, &channel, &username, &row.RoutedRequests, &row.UnavailableRoutes,
-			&row.Ttft500, &row.Ttft1k, &row.Ttft2k, &row.Ttft5k, &row.Ttft10k, &row.TtftInf, &row.TtftMaxMs, &row.TtftObserved, &row.TtftOver3s); err != nil {
-			return nil, nil, err
-		}
-		row.Group, row.Model, row.Username, row.ChannelID = group.String, model.String, username.String, channel.V
-		addModelStatisticsRow(groups, usernames, row)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, nil, err
-	}
-	return groups, usernames, ctx.Err()
+	return groups, usernames, nil
 }
 
 func addModelStatisticsRow(groups map[string]map[string]*modelStatisticsAggregate, usernames map[int64]string, row modelStatisticsRow) {
