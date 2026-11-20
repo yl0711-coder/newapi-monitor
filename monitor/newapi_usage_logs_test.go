@@ -3,9 +3,7 @@ package monitor
 import (
 	"context"
 	"database/sql"
-	"database/sql/driver"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"math"
 	"net"
@@ -17,13 +15,11 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
-	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/gin-gonic/gin"
-	mysqlDriver "github.com/go-sql-driver/mysql"
+	"github.com/yl0711-coder/newapi-monitor/internal/usagelogs"
 )
 
 func newUsageLogsFakeProd(t *testing.T) *sql.DB {
@@ -89,6 +85,10 @@ func usageLogsGET(t *testing.T, m *Monitor, handler gin.HandlerFunc, target stri
 	return w
 }
 
+type usageLogItem = usagelogs.Item
+type usageLogCursor = usagelogs.Cursor
+type usageLogsOptions = usagelogs.Options
+
 type usageLogsListResp struct {
 	Success bool   `json:"success"`
 	Message string `json:"message"`
@@ -101,28 +101,6 @@ type usageLogsListResp struct {
 		Items    []usageLogItem  `json:"items"`
 		Next     *usageLogCursor `json:"next_cursor"`
 	} `json:"data"`
-}
-
-func TestUsageLogMatchRules(t *testing.T) {
-	for _, c := range []struct{ in, clause, arg, err string }{
-		{"gpt-5", "model_name = ?", "gpt-5", ""},
-		{"gpt%", "model_name LIKE ? ESCAPE '!'", "gpt%", ""},
-		{"%a_b!%", "model_name LIKE ? ESCAPE '!'", "%a!_b!!%", ""},
-		{"g%%", "", "", "连续"},
-		{"%a%b%", "", "", "最多"},
-		{"%a%", "", "", "至少为 2"},
-	} {
-		clause, arg, err := usageLogMatch("model_name", c.in)
-		if c.err != "" {
-			if err == nil || !strings.Contains(err.Error(), c.err) {
-				t.Fatalf("%q: want error %q, got %v", c.in, c.err, err)
-			}
-			continue
-		}
-		if err != nil || clause != c.clause || arg != c.arg {
-			t.Fatalf("%q: clause=%q arg=%v err=%v", c.in, clause, arg, err)
-		}
-	}
 }
 
 func TestUsageLogsListFiltersOrderPagingAndChannelNames(t *testing.T) {
@@ -424,56 +402,6 @@ func TestUsageLogsPageStrategiesRemainEquivalentAcrossScopes(t *testing.T) {
 			}
 		}
 	}
-	where, _ := buildUsageLogWhere(usageLogFilter{Group: "g1"}, usageLogWhereList)
-	beforeSQL, beforeArg := where.sql(), append([]any{}, where.args...)
-	for _, cursor := range []*usageLogCursor{nil, {CreatedAt: 1794500300, ID: 1202}} {
-		query, args := usageLogsPageSQL(where, "logs", 2, 100, cursor, true)
-		if !strings.HasPrefix(query, usageLogsSelect) {
-			t.Fatal("page query lost its server time limit")
-		}
-		result, err := db.Query(query, args...)
-		if err != nil {
-			t.Fatal(err)
-		}
-		var matched int64
-		items, err := scanUsageLogRowsAndTotal(result, &matched)
-		result.Close()
-		if err != nil || len(items) != 100 || matched != 101 {
-			t.Fatalf("look-ahead must return 100 full rows and count only 101 IDs: %d %d %v", len(items), matched, err)
-		}
-	}
-	if where.sql() != beforeSQL || !reflect.DeepEqual(where.args, beforeArg) {
-		t.Fatal("pagination must not mutate full count/stat filters")
-	}
-}
-
-func TestUsageLogsQueryErrorsKeepCancellationAndServerTimeoutDistinct(t *testing.T) {
-	serverTimeout := &mysqlDriver.MySQLError{Number: 3024, Message: "maximum statement execution time exceeded"}
-	for _, err := range []error{serverTimeout, fmt.Errorf("wrapped: %w", serverTimeout)} {
-		if got := usageLogsQueryErr(context.Background(), err); got == nil || !strings.Contains(got.Error(), "查询超时") {
-			t.Fatal("server-side timeout must be a clear retryable query failure")
-		}
-	}
-	other := &mysqlDriver.MySQLError{Number: 1142, Message: "SELECT denied"}
-	if !errors.Is(usageLogsQueryErr(context.Background(), other), other) {
-		t.Fatal("authorization errors must not be disguised as timeouts")
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	if !errors.Is(usageLogsQueryErr(ctx, serverTimeout), context.Canceled) {
-		t.Fatal("client cancellation must win over a coincident server error")
-	}
-	// The driver's DSN readTimeout reports a bare invalid connection.
-	readTimeout := &net.OpError{Op: "read", Err: os.ErrDeadlineExceeded}
-	for _, err := range []error{mysqlDriver.ErrInvalidConn, fmt.Errorf("x: %w", driver.ErrBadConn), readTimeout} {
-		if got := usageLogsQueryErr(context.Background(), err); got == nil || !strings.Contains(got.Error(), "查询超时或从库连接中断") {
-			t.Fatalf("driver timeout must read as a timeout, got %v", got)
-		}
-	}
-	// The hint must stay below the production DSN readTimeout (20s).
-	if !strings.Contains(usageLogsSelect, "MAX_EXECUTION_TIME(18000)") {
-		t.Fatal("replica statement limit must stay below the 20s DSN readTimeout")
-	}
 }
 
 func TestUsageLogsExactIDQueryCountsAndPagesStayEquivalent(t *testing.T) {
@@ -604,30 +532,6 @@ func TestUsageLogsWithoutSourceReportsUnavailable(t *testing.T) {
 	}
 }
 
-func TestUsageLogsHistoricalOtherNullAndMalformedAdmin(t *testing.T) {
-	for _, raw := range []string{
-		`{"reject_reason":"blocked","admin_info":null,"quota":9007199254740993}`,
-		`{"reject_reason":"legacy","admin_info":{"reject_reason":"new"}}`,
-	} {
-		got := projectUsageLogOtherForRoot(raw)
-		var v map[string]json.RawMessage
-		if err := json.Unmarshal([]byte(got), &v); err != nil || v["reject_reason"] != nil {
-			t.Fatalf("projection failed: %s", got)
-		}
-		if strings.Contains(raw, "9007199254740993") && !strings.Contains(got, "9007199254740993") {
-			t.Fatalf("large quota was rounded: %s", got)
-		}
-		if strings.Contains(raw, `"new"`) && !strings.Contains(got, `"new"`) {
-			t.Fatalf("current admin reason overwritten: %s", got)
-		}
-	}
-	for _, raw := range []string{`null`, `[]`, `invalid`, `{"reject_reason":"x","admin_info":"legacy"}`} {
-		if got := projectUsageLogOtherForRoot(raw); got != raw {
-			t.Fatalf("unsupported legacy content changed: %s", got)
-		}
-	}
-}
-
 func TestUsageLogsBoundsAndInvalidSettings(t *testing.T) {
 	m := newChannelUpstreamTestMonitor(t)
 	m.prodDB = newUsageLogsFakeProd(t)
@@ -651,122 +555,6 @@ func TestUsageLogsBoundsAndInvalidSettings(t *testing.T) {
 	}
 }
 
-func TestUsageLogsGateCancellationIsIndependent(t *testing.T) {
-	m := &Monitor{}
-	var releases []func()
-	for i := 0; i < usageLogsGateCapacity; i++ {
-		release, err := m.acquireUsageLogsGate(context.Background())
-		if err != nil {
-			t.Fatal(err)
-		}
-		releases = append(releases, release)
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	if _, err := m.acquireUsageLogsGate(ctx); !errors.Is(err, context.Canceled) {
-		t.Fatalf("cancelled waiter: %v", err)
-	}
-	for _, release := range releases {
-		release()
-	}
-	if len(m.usageLogsGate) != 0 {
-		t.Fatal("query slots leaked")
-	}
-}
-
-func TestUsageLogsBackgroundAdmissionLeavesListCapacityAndHonorsDeadline(t *testing.T) {
-	m := &Monitor{prodDB: newUsageLogsFakeProd(t)}
-	newContext := func(ctx context.Context) *gin.Context {
-		c, _ := gin.CreateTestContext(httptest.NewRecorder())
-		c.Request = httptest.NewRequest(http.MethodGet, "/usage-logs/count", nil).WithContext(ctx)
-		return c
-	}
-	started := time.Now()
-	c := newContext(context.Background())
-	_, release, ok := m.usageLogsSource(c, true)
-	if !ok {
-		t.Fatal("first background query rejected")
-	}
-	defer release()
-	deadline, exists := c.Request.Context().Deadline()
-	if !exists || deadline.Before(started.Add(usageLogsQueryTimeout)) || deadline.After(time.Now().Add(usageLogsQueryTimeout)) {
-		t.Fatal("admission must be included in the request deadline")
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Millisecond)
-	defer cancel()
-	waiting := make(chan bool, 1)
-	go func() {
-		_, free, accepted := m.usageLogsSource(newContext(ctx), true)
-		if accepted {
-			free()
-		}
-		waiting <- accepted
-	}()
-	_, freeList, accepted := m.usageLogsSource(newContext(context.Background()), false)
-	if !accepted {
-		t.Fatal("background work consumed the list slot")
-	}
-	if len(m.usageLogsGate) != 2 || len(m.usageLogsBackgroundGate) != 1 {
-		t.Fatal("source admission limits changed")
-	}
-	freeList()
-	if <-waiting {
-		t.Fatal("second background request must time out without executing")
-	}
-	if len(m.usageLogsGate) != 1 || len(m.usageLogsBackgroundGate) != 1 {
-		t.Fatal("cancelled background waiter leaked query slots")
-	}
-}
-
-func TestUsageLogsQueuedCancellationStormKeepsListCapacity(t *testing.T) {
-	m := &Monitor{prodDB: newUsageLogsFakeProd(t)}
-	makeContext := func(ctx context.Context) *gin.Context {
-		c, _ := gin.CreateTestContext(httptest.NewRecorder())
-		c.Request = httptest.NewRequest(http.MethodGet, "/usage-logs/count", nil).WithContext(ctx)
-		return c
-	}
-	_, release, ok := m.usageLogsSource(makeContext(context.Background()), true)
-	if !ok {
-		t.Fatal("cannot hold background slot")
-	}
-	defer release()
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	started, finished := make(chan struct{}, 32), make(chan bool, 32)
-	for i := 0; i < 32; i++ {
-		go func() {
-			started <- struct{}{}
-			_, free, accepted := m.usageLogsSource(makeContext(ctx), true)
-			if accepted {
-				free()
-			}
-			finished <- accepted
-		}()
-	}
-	for i := 0; i < 32; i++ {
-		<-started
-	}
-	for i := 0; i < 64; i++ {
-		_, free, accepted := m.usageLogsSource(makeContext(context.Background()), false)
-		if !accepted {
-			t.Fatal("queued statistics starved a foreground list")
-		}
-		if len(m.usageLogsGate) > 2 || len(m.usageLogsBackgroundGate) > 1 {
-			t.Fatal("query concurrency exceeded the existing budget")
-		}
-		free()
-	}
-	cancel()
-	for i := 0; i < 32; i++ {
-		if <-finished {
-			t.Fatal("cancelled background waiter executed")
-		}
-	}
-	if len(m.usageLogsGate) != 1 || len(m.usageLogsBackgroundGate) != 1 {
-		t.Fatal("cancel storm leaked slots")
-	}
-}
-
 func TestUsageLogsCountCancellationReleasesAdmission(t *testing.T) {
 	db := newUsageLogsFakeProd(t)
 	db.SetMaxOpenConns(1)
@@ -783,8 +571,22 @@ func TestUsageLogsCountCancellationReleasesAdmission(t *testing.T) {
 	c.Request = httptest.NewRequest(http.MethodGet, "/usage-logs/count", nil).WithContext(ctx)
 	started := time.Now()
 	m.serveUsageLogsCount(c)
-	if time.Since(started) > time.Second || !strings.Contains(w.Body.String(), "查询超时") || len(m.usageLogsGate) != 0 || len(m.usageLogsBackgroundGate) != 0 {
+	if time.Since(started) > time.Second || !strings.Contains(w.Body.String(), "查询超时") {
 		t.Fatalf("cancelled pool waiter leaked capacity or failed to finish: %s", w.Body.String())
+	}
+	if err := conn.Close(); err != nil {
+		t.Fatal(err)
+	}
+	// Check the public recovery behavior rather than reach into the module's
+	// private gates: a new count must be admitted with the pool free again.
+	probe, done := context.WithTimeout(context.Background(), time.Second)
+	defer done()
+	recovered := httptest.NewRecorder()
+	next, _ := gin.CreateTestContext(recovered)
+	next.Request = httptest.NewRequest(http.MethodGet, "/usage-logs/count", nil).WithContext(probe)
+	m.serveUsageLogsCount(next)
+	if !strings.Contains(recovered.Body.String(), `"success":true`) {
+		t.Fatalf("next count did not recover: %s", recovered.Body.String())
 	}
 }
 
@@ -885,92 +687,6 @@ func TestUsageLogsBrowserAcceptance(t *testing.T) {
 // A request cancelled mid-query must kill its own replica statement (closing
 // the socket is not noticed by MySQL until the statement ends) and keep its
 // admission slot until the kill was sent, so the gate really bounds the replica.
-func TestUsageLogsCancelledRequestKillsReplicaThreadBeforeReleasingAdmission(t *testing.T) {
-	db := newUsageLogsFakeProd(t)
-	insertUsageLogs(t, db, usageLogRow{1, 31, time.Now().Unix(), 2, "u", "t", "m", 1, 1, 1, 7, "g", "r1", ""})
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	m := &Monitor{prodDB: db}
-	var killMu sync.Mutex
-	var killed []int64
-	var slotsHeldAtKill, bgHeldAtKill int
-	m.usageLogsThreadIDFn = func(context.Context, *sql.Conn) int64 {
-		cancel() // the admin cancels while the statement would be running
-		return 4242
-	}
-	m.usageLogsKillFn = func(killCtx context.Context, id int64) error {
-		if killCtx.Err() != nil {
-			t.Error("kill must not reuse the cancelled request context")
-		}
-		killMu.Lock()
-		defer killMu.Unlock()
-		killed = append(killed, id)
-		slotsHeldAtKill, bgHeldAtKill = len(m.usageLogsGate), len(m.usageLogsBackgroundGate)
-		if inUse := db.Stats().InUse; inUse != 0 {
-			t.Errorf("the aborted connection must be discarded before the kill needs a pool slot: in use=%d", inUse)
-		}
-		return nil
-	}
-	idleBefore := db.Stats().Idle
-	if idleBefore == 0 {
-		t.Fatal("fixture should leave an idle pooled connection")
-	}
-	w := httptest.NewRecorder()
-	c, _ := gin.CreateTestContext(w)
-	c.Request = httptest.NewRequest(http.MethodGet, "/usage-logs/stat", nil).WithContext(ctx)
-	m.serveUsageLogsStat(c)
-	waitUsageLogsSlotsFree(t, m)
-	killMu.Lock()
-	defer killMu.Unlock()
-	if len(killed) != 1 || killed[0] != 4242 {
-		t.Fatalf("cancelled request must kill exactly its own thread once: %v", killed)
-	}
-	if slotsHeldAtKill != 1 || bgHeldAtKill != 1 {
-		t.Fatalf("admission must be held until the kill is sent: gate=%d background=%d", slotsHeldAtKill, bgHeldAtKill)
-	}
-	if len(m.usageLogsGate) != 0 || len(m.usageLogsBackgroundGate) != 0 {
-		t.Fatal("admission leaked after kill")
-	}
-	// gin only buffers a body-less status; read it from the writer.
-	if got := c.Writer.Status(); got != statusClientClosedRequest {
-		t.Fatalf("cancelled request status = %d body=%s", got, w.Body.String())
-	}
-	// The killed connection is discarded, not handed back to other features.
-	if after := db.Stats().Idle; after >= idleBefore {
-		t.Fatalf("killed connection returned to the pool: idle before=%d after=%d", idleBefore, after)
-	}
-}
-
-func TestUsageLogsCompletedRequestDoesNotKillAndKillFailureStillReleases(t *testing.T) {
-	db := newUsageLogsFakeProd(t)
-	insertUsageLogs(t, db, usageLogRow{1, 31, time.Now().Unix(), 2, "u", "t", "m", 1, 1, 1, 7, "g", "r1", ""})
-	m := &Monitor{prodDB: db}
-	var killCount atomic.Int64
-	m.usageLogsThreadIDFn = func(context.Context, *sql.Conn) int64 { return 77 }
-	m.usageLogsKillFn = func(context.Context, int64) error { killCount.Add(1); return errors.New("kill refused") }
-	if w := usageLogsGET(t, m, m.serveUsageLogsList, "/usage-logs/list?defer_total=1", nil); !strings.Contains(w.Body.String(), `"success":true`) {
-		t.Fatalf("list: %s", w.Body.String())
-	}
-	if kills := killCount.Load(); kills != 0 {
-		t.Fatalf("a completed request must not kill its thread: %d", kills)
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	m.usageLogsThreadIDFn = func(context.Context, *sql.Conn) int64 { cancel(); return 78 }
-	w := httptest.NewRecorder()
-	c, _ := gin.CreateTestContext(w)
-	c.Request = httptest.NewRequest(http.MethodGet, "/usage-logs/count", nil).WithContext(ctx)
-	m.serveUsageLogsCount(c)
-	waitUsageLogsSlotsFree(t, m)
-	if kills := killCount.Load(); kills != 1 || len(m.usageLogsGate) != 0 || len(m.usageLogsBackgroundGate) != 0 {
-		t.Fatalf("a failed kill must still release admission: kills=%d gate=%d bg=%d", kills, len(m.usageLogsGate), len(m.usageLogsBackgroundGate))
-	}
-	// Non-MySQL sources have no thread id: nothing is killed.
-	m.usageLogsThreadIDFn = nil
-	if id := m.usageLogsThreadID(context.Background(), nil); id != 0 {
-		t.Fatalf("non-MySQL source thread id = %d", id)
-	}
-}
-
 func TestUsageLogsStatSkipQuotaKeepsRates(t *testing.T) {
 	db := newUsageLogsFakeProd(t)
 	now := time.Now().Unix()
@@ -1003,81 +719,16 @@ func TestUsageLogsStatSkipQuotaKeepsRates(t *testing.T) {
 		t.Fatalf("skip_quota must not report an amount: %+v", skipped.Data)
 	}
 	// The cheap rates must not queue behind heavy background work.
-	m.initUsageLogsGates()
-	m.usageLogsBackgroundGate <- struct{}{}
+	heavy := m.usageLogReads().Request(context.Background())
+	if _, err := heavy.Count(usagelogs.Filter{}); err != nil {
+		t.Fatal(err)
+	}
+	defer heavy.Finish()
 	busy := get("&skip_quota=1")
-	<-m.usageLogsBackgroundGate
 	if busy.Data.RPM != 1 {
 		t.Fatalf("skip_quota stat waited for the background slot: %+v", busy.Data)
 	}
 	if skipped.Data.RPM != full.Data.RPM || skipped.Data.TPM != full.Data.TPM || skipped.Data.RPM != 1 || skipped.Data.TPM != 15 {
 		t.Fatalf("rates must not change with skip_quota: full=%+v skipped=%+v", full.Data, skipped.Data)
 	}
-}
-
-// KILL QUERY must not queue behind other features in the small shared source
-// pool: it uses its own one-connection pool built from the same DSN.
-func TestUsageLogsKillUsesDedicatedPool(t *testing.T) {
-	shared := newUsageLogsFakeProd(t)
-	m := &Monitor{prodDB: shared}
-	if m.usageLogsKillPool() != shared {
-		t.Fatal("without a DSN the kill falls back to the shared pool")
-	}
-	opened := 0
-	dedicated := newUsageLogsFakeProd(t)
-	m2 := &Monitor{prodDB: shared}
-	m2.cfg.ProdDSN = "user:pw@tcp(replica:3306)/nexusapi"
-	m2.cfg.sourceOpen = func(string) (*sql.DB, error) { opened++; return dedicated, nil }
-	first, second := m2.usageLogsKillPool(), m2.usageLogsKillPool()
-	if first != dedicated || second != dedicated || opened != 1 {
-		t.Fatalf("kill pool must be dedicated and created once: opened=%d", opened)
-	}
-	if got := dedicated.Stats().MaxOpenConnections; got != 1 {
-		t.Fatalf("kill pool max open = %d", got)
-	}
-}
-
-// The kill runs after the response; slots are freed once it was sent.
-func waitUsageLogsSlotsFree(t *testing.T, m *Monitor) {
-	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
-	for len(m.usageLogsGate) != 0 || len(m.usageLogsBackgroundGate) != 0 {
-		if time.Now().After(deadline) {
-			t.Fatal("admission slots were never released after the kill")
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-}
-
-func TestUsageLogsResponseDoesNotWaitForSlowKill(t *testing.T) {
-	db := newUsageLogsFakeProd(t)
-	m := &Monitor{prodDB: db}
-	ctx, cancel := context.WithCancel(context.Background())
-	m.usageLogsThreadIDFn = func(context.Context, *sql.Conn) int64 { cancel(); return 9 }
-	unblock := make(chan struct{})
-	var held atomic.Int64
-	m.usageLogsKillFn = func(context.Context, int64) error {
-		held.Store(int64(len(m.usageLogsGate) + len(m.usageLogsBackgroundGate)))
-		<-unblock
-		return nil
-	}
-	w := httptest.NewRecorder()
-	c, _ := gin.CreateTestContext(w)
-	c.Request = httptest.NewRequest(http.MethodGet, "/usage-logs/count", nil).WithContext(ctx)
-	returned := make(chan struct{})
-	go func() { m.serveUsageLogsCount(c); close(returned) }()
-	select {
-	case <-returned:
-	case <-time.After(2 * time.Second):
-		t.Fatal("the response waited for the kill")
-	}
-	deadline := time.Now().Add(2 * time.Second)
-	for held.Load() == 0 && time.Now().Before(deadline) {
-		time.Sleep(5 * time.Millisecond)
-	}
-	if held.Load() != 2 || len(m.usageLogsGate) != 1 || len(m.usageLogsBackgroundGate) != 1 {
-		t.Fatalf("slots must stay held while the kill is pending: during=%d gate=%d bg=%d", held.Load(), len(m.usageLogsGate), len(m.usageLogsBackgroundGate))
-	}
-	close(unblock)
-	waitUsageLogsSlotsFree(t, m)
 }

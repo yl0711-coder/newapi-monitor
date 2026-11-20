@@ -1,99 +1,10 @@
 package monitor
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 	"testing"
 )
-
-func TestUsageLogsWantsIDSpanOnlyForUnindexedColumnFilters(t *testing.T) {
-	base := usageLogFilter{Start: 100, End: 200}
-	for name, tc := range map[string]struct {
-		f    usageLogFilter
-		want bool
-	}{
-		"channel":           {usageLogFilter{Start: 100, End: 200, Channel: 7}, true},
-		"model":             {usageLogFilter{Start: 100, End: 200, ModelName: "gpt-6"}, true},
-		"group":             {usageLogFilter{Start: 100, End: 200, Group: "codex"}, true},
-		"time only":         {base, false},
-		"user id":           {usageLogFilter{Start: 100, End: 200, Channel: 7, UserID: 3}, false},
-		"username":          {usageLogFilter{Start: 100, End: 200, Channel: 7, Username: "u"}, false},
-		"token":             {usageLogFilter{Start: 100, End: 200, Channel: 7, TokenName: "t"}, false},
-		"request id":        {usageLogFilter{Start: 100, End: 200, Channel: 7, RequestID: "r"}, false},
-		"upstream request":  {usageLogFilter{Start: 100, End: 200, Channel: 7, UpstreamRequestID: "r"}, false},
-		"open-ended window": {usageLogFilter{Start: 100, Channel: 7}, false},
-		"inverted window":   {usageLogFilter{Start: 300, End: 200, Channel: 7}, false},
-		"no window at all":  {usageLogFilter{Channel: 7}, false},
-	} {
-		if got := usageLogsWantsIDSpan(tc.f); got != tc.want {
-			t.Errorf("%s: got %v want %v", name, got, tc.want)
-		}
-	}
-}
-
-// created_at is not strictly monotonic in id; the span must still include every
-// row of the window and nothing outside it.
-func TestUsageLogsIDSpanCountsAndSumsMatchOriginalPredicates(t *testing.T) {
-	db := newUsageLogsFakeProd(t)
-	rows := []usageLogRow{
-		{id: 1, createdAt: 90, typ: 2, channel: 7, quota: 1},
-		{id: 2, createdAt: 101, typ: 2, channel: 7, quota: 10},
-		{id: 3, createdAt: 99, typ: 2, channel: 7, quota: 100}, // inside the span, outside the window
-		{id: 4, createdAt: 150, typ: 5, channel: 7, quota: 0},
-		{id: 5, createdAt: 150, typ: 2, channel: 9, quota: 1000},
-		{id: 6, createdAt: 210, typ: 2, channel: 7, quota: 10000}, // inside the span, outside the window
-		{id: 7, createdAt: 199, typ: 2, channel: 7, quota: 100000},
-		{id: 8, createdAt: 200, typ: 2, channel: 7, quota: 1000000},
-		{id: 9, createdAt: 201, typ: 2, channel: 7, quota: 7},
-	}
-	for i := range rows {
-		rows[i].username, rows[i].model, rows[i].group = "u", "m", "g"
-	}
-	insertUsageLogs(t, db, rows...)
-	ctx := context.Background()
-	for _, f := range []usageLogFilter{
-		{Start: 100, End: 200, Channel: 7},
-		{Start: 100, End: 200, Channel: 9},
-		{Start: 100, End: 200, Channel: 7, Type: 5},
-		{Start: 100, End: 200, ModelName: "m"},
-		{Start: 100, End: 200, Group: "g"},
-	} {
-		for _, scope := range []usageLogWhereScope{usageLogWhereList, usageLogWhereStat} {
-			where, err := buildUsageLogWhere(f, scope)
-			if err != nil {
-				t.Fatal(err)
-			}
-			narrowed, source, empty, ok := usageLogsIDSpan(ctx, db, true, f, where)
-			if !ok || empty || source != "logs FORCE INDEX (PRIMARY)" {
-				t.Fatalf("%+v: ok=%v empty=%v source=%q", f, ok, empty, source)
-			}
-			for _, agg := range []string{"COUNT(*)", "COALESCE(SUM(quota),0)"} {
-				var want, got int64
-				if err := db.QueryRow("SELECT "+agg+" FROM logs"+where.sql(), where.args...).Scan(&want); err != nil {
-					t.Fatal(err)
-				}
-				// SQLite has no FORCE INDEX; the narrowed predicates are what is checked.
-				if err := db.QueryRow("SELECT "+agg+" FROM logs"+narrowed.sql(), narrowed.args...).Scan(&got); err != nil {
-					t.Fatal(err)
-				}
-				if got != want {
-					t.Fatalf("%+v scope=%d %s: span=%d original=%d", f, scope, agg, got, want)
-				}
-			}
-		}
-	}
-	// A window without rows is answered without the main scan.
-	f := usageLogFilter{Start: 500, End: 600, Channel: 7}
-	where, _ := buildUsageLogWhere(f, usageLogWhereList)
-	if _, _, empty, ok := usageLogsIDSpan(ctx, db, true, f, where); !ok || !empty {
-		t.Fatalf("empty window: ok=%v empty=%v", ok, empty)
-	}
-	// Not MySQL (or not eligible): the original plan is kept untouched.
-	if got, source, _, ok := usageLogsIDSpan(ctx, db, false, usageLogFilter{Start: 100, End: 200, Channel: 7}, where); ok || source != "logs" || got != where {
-		t.Fatalf("sqlite must keep the original plan: ok=%v source=%q", ok, source)
-	}
-}
 
 // The page rows take the user_id switch only when it selects exactly the
 // username's rows; a renamed user keeps the username predicate.

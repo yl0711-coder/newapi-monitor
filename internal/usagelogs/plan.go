@@ -1,4 +1,4 @@
-package monitor
+package usagelogs
 
 import (
 	"context"
@@ -21,14 +21,14 @@ import (
 
 // usageLogsMySQL reports whether the replica speaks MySQL, so index hints may
 // be used. The unit-test replica is SQLite, which rejects FORCE INDEX.
-func (m *Monitor) usageLogsMySQL() bool {
-	return m.prodDB != nil && strings.Contains(strings.ToLower(fmt.Sprintf("%T", m.prodDB.Driver())), "mysql")
+func (s *Service) usageLogsMySQL() bool {
+	return s.replica != nil && strings.Contains(strings.ToLower(fmt.Sprintf("%T", s.replica.Driver())), "mysql")
 }
 
 // usageLogsPageSource is the FROM source for the page's id lookup. A filter
 // already answered through user_id walks only that user's rows in the window.
-func (m *Monitor) usageLogsPageSource(f usageLogFilter) string {
-	if f.UserID > 0 && m.usageLogsMySQL() {
+func (s *Service) usageLogsPageSource(f Filter) string {
+	if f.userID > 0 && s.usageLogsMySQL() {
 		return "logs FORCE INDEX (idx_user_created_type)"
 	}
 	return "logs"
@@ -39,8 +39,8 @@ func (m *Monitor) usageLogsPageSource(f usageLogFilter) string {
 // have selective indexes of their own), and a filter on a column that no time
 // index covers (channel, model, group), which otherwise costs one random row
 // read per candidate.
-func usageLogsWantsIDSpan(f usageLogFilter) bool {
-	return f.UserID == 0 && f.Username == "" && f.TokenName == "" && f.RequestID == "" && f.UpstreamRequestID == "" &&
+func usageLogsWantsIDSpan(f Filter) bool {
+	return f.userID == 0 && f.Username == "" && f.TokenName == "" && f.RequestID == "" && f.UpstreamRequestID == "" &&
 		f.Start > 0 && f.End >= f.Start && (f.Channel != 0 || f.ModelName != "" || f.Group != "")
 }
 
@@ -53,11 +53,11 @@ func usageLogsWantsIDSpan(f usageLogFilter) bool {
 // bound lookup reads only a created_at index. empty=true means the window has
 // no rows at all. ok=false keeps the original plan (not MySQL, filter not
 // eligible, or the bound lookup failed).
-func (m *Monitor) usageLogsWithIDSpan(ctx context.Context, db usageLogsQuerier, f usageLogFilter, where *usageLogWhere) (narrowed *usageLogWhere, source string, empty, ok bool) {
-	return usageLogsIDSpan(ctx, db, m.usageLogsMySQL(), f, where)
+func (s *Service) usageLogsWithIDSpan(ctx context.Context, db usageLogsQuerier, f Filter, where *usageLogWhere) (narrowed *usageLogWhere, source string, empty, ok bool) {
+	return usageLogsIDSpan(ctx, db, s.usageLogsMySQL(), f, where)
 }
 
-func usageLogsIDSpan(ctx context.Context, db usageLogsQuerier, mysql bool, f usageLogFilter, where *usageLogWhere) (narrowed *usageLogWhere, source string, empty, ok bool) {
+func usageLogsIDSpan(ctx context.Context, db usageLogsQuerier, mysql bool, f Filter, where *usageLogWhere) (narrowed *usageLogWhere, source string, empty, ok bool) {
 	if !mysql || !usageLogsWantsIDSpan(f) {
 		return where, "logs", false, false
 	}

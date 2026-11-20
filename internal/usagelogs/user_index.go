@@ -1,4 +1,4 @@
-package monitor
+package usagelogs
 
 import (
 	"context"
@@ -99,19 +99,19 @@ func usageLogsUsernameUserID(ctx context.Context, db usageLogsQuerier, username 
 // usageLogsWithUserIndex returns f with UserID set when the username filter can
 // be answered through user_id; otherwise f unchanged. Callers use it only for
 // COUNT/SUM statements; page rows keep the username predicate.
-func usageLogsWithUserIndex(ctx context.Context, db usageLogsQuerier, f usageLogFilter) (usageLogFilter, error) {
+func usageLogsWithUserIndex(ctx context.Context, db usageLogsQuerier, f Filter) (Filter, error) {
 	userID, err := usageLogsUsernameUserID(ctx, db, f.Username)
 	if err != nil {
 		return f, err
 	}
-	f.UserID = userID
+	f.userID = userID
 	return f, nil
 }
 
 // usageLogsWarnFailure records a failed count/sum. Failures are otherwise only
 // returned to the page as success=false, which left no server-side trace when
 // the page lost its total (2026-11-16). Filter values are not logged.
-func usageLogsWarnFailure(phase string, started time.Time, f usageLogFilter, err error) {
+func usageLogsWarnFailure(phase string, started time.Time, f Filter, err error) {
 	if errors.Is(err, context.Canceled) {
 		return
 	}
@@ -120,5 +120,5 @@ func usageLogsWarnFailure(phase string, started time.Time, f usageLogFilter, err
 		span = (f.End - f.Start) / 3600
 	}
 	slog.Warn("使用日志从库查询失败", "phase", phase, "elapsed_ms", time.Since(started).Milliseconds(), "range_hours", span,
-		"username", f.Username != "", "user_index", f.UserID > 0, "err", err)
+		"username", f.Username != "", "user_index", f.userID > 0, "err", err)
 }
