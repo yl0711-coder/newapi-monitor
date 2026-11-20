@@ -128,7 +128,6 @@ monitor Monitor.saveTokenMeteringFacts 166 33
 monitor Monitor.serveIncidentDetailSnapshot 225 33
 monitor Monitor.serveIncidentIngestHealth 181 17
 monitor Monitor.serveLogChainRequests 168 24
-monitor Monitor.serveUsageLogsList 125 20
 monitor Monitor.serveUsageMatrix 152 24
 monitor Monitor.serveUsageStats 216 37
 monitor Monitor.stabilityDataCoverage 124 17

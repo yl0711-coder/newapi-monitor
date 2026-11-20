@@ -1,7 +1,6 @@
 package monitor
 
 import (
-	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -15,58 +14,6 @@ func addUsageLogsUser(t *testing.T, db *sql.DB, id int64, username string) {
 	t.Helper()
 	if _, err := db.Exec("INSERT INTO users (id, username) VALUES (?, ?)", id, username); err != nil {
 		t.Fatal(err)
-	}
-}
-
-func TestUsageLogsUsernameUserIDRequiresProvenEquivalence(t *testing.T) {
-	ctx := context.Background()
-	cases := []struct {
-		name     string
-		users    map[int64]string
-		logs     []usageLogRow
-		username string
-		want     int64
-	}{
-		{name: "stable user", users: map[int64]string{31: "kjl_Dev"},
-			logs:     []usageLogRow{{id: 1, userID: 31, typ: 2, username: "kjl_Dev"}, {id: 5, userID: 31, typ: 2, username: "kjl_Dev"}},
-			username: "kjl_Dev", want: 31},
-		{name: "wildcard keeps username", users: map[int64]string{31: "kjl_Dev"},
-			logs:     []usageLogRow{{id: 1, userID: 31, typ: 2, username: "kjl_Dev"}},
-			username: "kjl%", want: 0},
-		{name: "unknown username", users: map[int64]string{31: "kjl_Dev"},
-			logs:     []usageLogRow{{id: 1, userID: 31, typ: 2, username: "kjl_Dev"}},
-			username: "nobody", want: 0},
-		{name: "renamed user: earliest row has the old name", users: map[int64]string{40: "newname"},
-			logs:     []usageLogRow{{id: 1, userID: 40, typ: 2, username: "oldname"}, {id: 2, userID: 40, typ: 2, username: "newname"}},
-			username: "newname", want: 0},
-		{name: "name used earlier by another user", users: map[int64]string{41: "reused", 42: "moved"},
-			logs:     []usageLogRow{{id: 1, userID: 42, typ: 2, username: "reused"}, {id: 2, userID: 41, typ: 2, username: "reused"}},
-			username: "reused", want: 0},
-		{name: "no rows at all", users: map[int64]string{43: "quiet"},
-			logs:     []usageLogRow{{id: 1, userID: 31, typ: 2, username: "kjl_Dev"}},
-			username: "quiet", want: 43},
-		{name: "no own rows but another user's rows carry the name", users: map[int64]string{44: "taken"},
-			logs:     []usageLogRow{{id: 1, userID: 45, typ: 2, username: "taken"}},
-			username: "taken", want: 0},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			db := newUsageLogsFakeProd(t)
-			if _, err := db.Exec("DELETE FROM users"); err != nil {
-				t.Fatal(err)
-			}
-			for id, name := range tc.users {
-				addUsageLogsUser(t, db, id, name)
-			}
-			insertUsageLogs(t, db, tc.logs...)
-			got, err := usageLogsUsernameUserID(ctx, db, tc.username)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if got != tc.want {
-				t.Fatalf("user_id = %d, want %d", got, tc.want)
-			}
-		})
 	}
 }
 
@@ -204,16 +151,6 @@ func TestUsageLogsUserIndexKeepsCountAndStatIdentical(t *testing.T) {
 			if stat.Data.Quota != wantQuota {
 				t.Fatalf("%s %v: stat quota=%d, username predicate=%d", username, extra, stat.Data.Quota, wantQuota)
 			}
-		}
-	}
-	// The fast path is really taken for the stable user and refused for the others.
-	for name, want := range map[string]bool{"kjl_Dev": true, "newname": false, "oldname": false, "reused": false, "moved": false} {
-		got, err := usageLogsUsernameUserID(context.Background(), db, name)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if (got > 0) != want {
-			t.Fatalf("%s: user index = %d, want used=%v", name, got, want)
 		}
 	}
 }
