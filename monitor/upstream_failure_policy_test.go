@@ -74,3 +74,26 @@ func TestUpstreamFailurePolicyRetryAfterIsLowerBound(t *testing.T) {
 		}
 	}
 }
+
+func TestOrionLegacyCapacityRecheckDoesNotReleaseReal429(t *testing.T) {
+	m := newChannelUpstreamTestMonitor(t)
+	now := time.Now().Unix()
+	for _, row := range []ChannelUpstreamAccount{
+		{Domain: "capacity.test", Provider: upstreamProviderOrion, UsageStatus: upstreamStatusError, UsageLastError: "Orion 区间请求数超出单轮安全上限，未发布部分账单", UsageNextSyncAt: now + 21600, UsageDataUntil: now - 86400},
+		{Domain: "limited.test", Provider: upstreamProviderOrion, UsageStatus: upstreamStatusError, UsageLastError: "上游返回 HTTP 429", UsageNextSyncAt: now + 21600, UsageDataUntil: now - 86400},
+	} {
+		if err := m.storeDB.Create(&row).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := m.releaseNonCredentialUpstreamIsolation(context.Background(), now); err != nil {
+		t.Fatal(err)
+	}
+	var rows []ChannelUpstreamAccount
+	if err := m.storeDB.Order("domain").Find(&rows).Error; err != nil {
+		t.Fatal(err)
+	}
+	if rows[0].UsageNextSyncAt != now || rows[1].UsageNextSyncAt != now+21600 || rows[0].UsageDataUntil != now-86400 || rows[1].UsageDataUntil != now-86400 {
+		t.Fatal("capacity normalization changed real cooldown or watermarks")
+	}
+}

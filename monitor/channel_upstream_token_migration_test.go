@@ -17,10 +17,11 @@ func TestUpstreamTokenMigrationPinsFreshDualStoreRollbackPoint(t *testing.T) {
 		}
 		t.Run(name, func(t *testing.T) {
 			const mergedPrefix = "main-facts-schema-20261109-v67-portal-monthly-statements-from-20261016-v66-token-delivery-v1-from-v65-token-detection-review-v2-from-v64-token-detection-v1-from-v63-upstream-token-attribution-from-v62-frt-sum-v1-from-v61-token-facts-v1-from-v60-incident-ingest-v1-from-v59-incident-core-v1-from-v58"
-			if !strings.HasPrefix(plan, mergedPrefix) {
+			mergedPlan := priorV67MigrationPlanForTest(t, plan)
+			if !strings.HasPrefix(mergedPlan, mergedPrefix) {
 				t.Fatal("the merged schema must advance both parent migration plans before AutoMigrate")
 			}
-			suffix := strings.TrimPrefix(plan, mergedPrefix)
+			suffix := strings.TrimPrefix(mergedPlan, mergedPrefix)
 			for _, parent := range []struct{ name, prefix string }{
 				{"local-v66", "main-facts-schema-20261016-v66-token-delivery-v1-from-v65-token-detection-review-v2-from-v64-token-detection-v1-from-v63-upstream-token-attribution-from-v62-frt-sum-v1-from-v61-token-facts-v1-from-v60-incident-ingest-v1-from-v59-incident-core-v1-from-v58"},
 				{"main-monthly-v60", "main-facts-schema-20261031-v60-portal-monthly-statements-from-20261013-v59-upstream-token-attribution-from-v58"},

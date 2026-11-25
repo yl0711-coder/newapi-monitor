@@ -263,6 +263,7 @@ func TestStaleNotMarkedDown(t *testing.T) {
 	}
 	if got == nil {
 		t.Fatal("没找到 m_stale")
+		return
 	}
 	if got.Status != stUp {
 		t.Errorf("陈旧+健康渠道应为 stUp(正常),得 %d", got.Status)

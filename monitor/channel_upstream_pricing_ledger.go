@@ -1178,27 +1178,48 @@ func persistedPricingRatioCanonical(state, display string) (string, error) {
 	}
 }
 
+func (m *Monitor) validateNewAPIPricingCheckpointPage(ctx context.Context, checkpoint ChannelUpstreamPricingPageCheckpoint, page newAPIUsagePage[newAPIPricingUsageItem], pageNumber, pageCount int, deferProbe bool) error {
+	if err := validateNewAPIUsagePage(page, checkpoint.Total, pageNumber, pageCount); err != nil {
+		if deferProbe && page.Total != checkpoint.Total {
+			if deleteErr := m.deletePricingPageCheckpoint(ctx, checkpoint.Domain, checkpoint.AccountEpoch, checkpoint.HourTs); deleteErr != nil {
+				return deleteErr
+			}
+		}
+		return err
+	}
+	return nil
+}
+
+func (m *Monitor) loadNewAPIPricingPageCheckpoint(ctx context.Context, domain, epoch string, hourTs int64) (ChannelUpstreamPricingPageCheckpoint, bool, error) {
+	var checkpoint ChannelUpstreamPricingPageCheckpoint
+	loadErr := m.storeDB.WithContext(ctx).Where("domain = ? AND account_epoch = ? AND semantics_version = ? AND hour_ts = ?", domain, epoch, upstreamPricingSemanticsVersion, hourTs).First(&checkpoint).Error
+	if loadErr != nil && !errors.Is(loadErr, gorm.ErrRecordNotFound) {
+		return checkpoint, false, loadErr
+	}
+	hasCheckpoint := loadErr == nil
+	if hasCheckpoint && (checkpoint.NextPage < 2 || checkpoint.Total < 0 || checkpoint.SourceRows < 0 || checkpoint.SourceRows > checkpoint.Total || len(checkpoint.FirstPageFingerprint) != 64) {
+		if err := m.deletePricingPageCheckpoint(ctx, domain, epoch, hourTs); err != nil {
+			return checkpoint, false, err
+		}
+		hasCheckpoint = false
+	}
+	return checkpoint, hasCheckpoint, nil
+}
+
 // fetchNewAPIPricingHour reads one complete hour through an independent
 // durable page checkpoint. A normal request-budget yield returns complete=false
 // without publishing evidence or incrementing failure counters.
 func (m *Monitor) fetchNewAPIPricingHour(ctx context.Context, account ChannelUpstreamAccount, credential newAPICredential, hourTs int64, pacer *upstreamUsageRequestPacer, now int64) ([]ChannelUpstreamPricingHourEvidence, ChannelUpstreamPricingHourState, string, bool, error) {
 	epoch := newAPIUpstreamAccountEpoch(account)
-	var checkpoint ChannelUpstreamPricingPageCheckpoint
-	loadErr := m.storeDB.WithContext(ctx).Where("domain = ? AND account_epoch = ? AND semantics_version = ? AND hour_ts = ?", account.Domain, epoch, upstreamPricingSemanticsVersion, hourTs).First(&checkpoint).Error
-	if loadErr != nil && !errors.Is(loadErr, gorm.ErrRecordNotFound) {
-		return nil, ChannelUpstreamPricingHourState{}, "", false, loadErr
-	}
-	hasCheckpoint := loadErr == nil
-	if hasCheckpoint && (checkpoint.NextPage < 2 || checkpoint.Total < 0 || checkpoint.SourceRows < 0 || checkpoint.SourceRows > checkpoint.Total || len(checkpoint.FirstPageFingerprint) != 64) {
-		if err := m.deletePricingPageCheckpoint(ctx, account.Domain, epoch, hourTs); err != nil {
-			return nil, ChannelUpstreamPricingHourState{}, "", false, err
-		}
-		hasCheckpoint = false
+	checkpoint, hasCheckpoint, err := m.loadNewAPIPricingPageCheckpoint(ctx, account.Domain, epoch, hourTs)
+	if err != nil {
+		return nil, ChannelUpstreamPricingHourState{}, "", false, err
 	}
 	client := m.channelUpstreamHTTPClient()
 	var first newAPIUsagePage[newAPIPricingUsageItem]
 	firstLoaded, checkpointVerified := false, false
-	if hasCheckpoint {
+	deferProbe := slowUpstreamLogPace(ctx, client, account)
+	if hasCheckpoint && !deferProbe {
 		page, err := fetchNewAPIPricingPage(ctx, client, account, credential, hourTs, hourTs+3600, 1, pacer)
 		if err != nil {
 			var exhausted *upstreamUsageRunBudgetExhausted
@@ -1338,7 +1359,7 @@ func (m *Monitor) fetchNewAPIPricingHour(ctx context.Context, account ChannelUps
 			}
 			return nil, ChannelUpstreamPricingHourState{}, "", false, err
 		}
-		if err := validateNewAPIUsagePage(page, checkpoint.Total, pageNumber, pageCount); err != nil {
+		if err := m.validateNewAPIPricingCheckpointPage(ctx, checkpoint, page, pageNumber, pageCount, deferProbe); err != nil {
 			return nil, ChannelUpstreamPricingHourState{}, "", false, err
 		}
 		pageEvidence, pageState, err := buildNewAPIPricingHour(account, page.Items, hourTs, now)

@@ -119,6 +119,7 @@ func TestFundingRetainedMovements(t *testing.T) {
 			}
 			if selected == nil {
 				t.Fatal("movement absent from retained source")
+				return
 			}
 			got := NormalizeFundingLog(*selected, fundingTestRules())
 			if got.Status != FundingMovement || got.TargetUserID != a.UserID || got.LogID != m.ID || got.At != m.At || got.DeltaQuota == nil || *got.DeltaQuota != m.Delta {

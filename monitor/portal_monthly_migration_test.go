@@ -18,8 +18,9 @@ func TestMonthlyStatementMigrationPinsLatestDualStoreRollback(t *testing.T) {
 		}
 		t.Run(name, func(t *testing.T) {
 			const prefix = "20261109-v67-portal-monthly-statements-from-"
-			priorPlan := strings.Replace(plan, prefix, "", 1)
-			if priorPlan == plan || !strings.HasPrefix(priorPlan, "main-facts-schema-20261016-v66-") {
+			mergedPlan := priorV67MigrationPlanForTest(t, plan)
+			priorPlan := strings.Replace(mergedPlan, prefix, "", 1)
+			if priorPlan == mergedPlan || !strings.HasPrefix(priorPlan, "main-facts-schema-20261016-v66-") {
 				t.Fatal("monthly tables must advance the actual local v66 migration plan")
 			}
 			dir := t.TempDir()

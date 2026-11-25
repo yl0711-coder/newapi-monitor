@@ -183,6 +183,10 @@ func (m *Monitor) releaseNonCredentialUpstreamIsolation(ctx context.Context, now
 		// lane now resumes such hours with a durable page cursor, so reschedule
 		// those accounts now instead of waiting hours for the inherited backoff.
 		{&ChannelUpstreamAccount{}, "usage_next_sync_at", "provider = ? AND usage_status = ? AND usage_last_error = ? AND usage_next_sync_at > ? AND usage_next_sync_at <> ?", []any{upstreamProviderNewAPI, upstreamStatusError, legacyNewAPIBackfillBudgetError(), now, isolated}},
+		// The former Orion page ceiling was our local capacity, not a real
+		// supplier outage. Resume only that exact legacy error through the new
+		// durable reader; real auth/429/Retry-After states are untouched.
+		{&ChannelUpstreamAccount{}, "usage_next_sync_at", "provider = ? AND usage_status = ? AND usage_last_error = ? AND usage_next_sync_at > ? AND usage_next_sync_at <> ?", []any{upstreamProviderOrion, upstreamStatusError, "Orion 区间请求数超出单轮安全上限，未发布部分账单", now, isolated}},
 		{&UpstreamErrorLogSyncState{}, "next_sync_at", "status = ? AND next_sync_at = ?", []any{upstreamStatusError, isolated}},
 		{&UpstreamFundSyncState{}, "next_sync_at", "status = ? AND next_sync_at = ?", []any{upstreamStatusError, isolated}},
 		{&AICodeWithKeySyncState{}, "next_sync_at", "status = ? AND next_sync_at = ?", []any{upstreamStatusError, isolated}},

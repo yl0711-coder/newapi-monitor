@@ -49,6 +49,9 @@ type UpstreamHostCircuit struct {
 	LastFailureAt       int64  `gorm:"column:last_failure_at"`
 	LastStatus          int    `gorm:"column:last_status"`
 	UpdatedAt           int64  `gorm:"column:updated_at"`
+	LogIntervalMS       int64  `gorm:"column:log_interval_ms"`
+	LogNextStartMS      int64  `gorm:"column:log_next_start_ms"`
+	LogSuccesses        int    `gorm:"column:log_successes"`
 }
 
 type upstreamGuardClock interface {
@@ -521,6 +524,28 @@ func withUpstreamRequestTimeout(c *http.Client, timeout time.Duration) *http.Cli
 	return &timed
 }
 
+// Keep host-local waits ahead of the global semaphore. Only queue waits are
+// wrapped as local yields; persisted circuit/load errors retain their type.
+func (t *upstreamGuardTransport) prepareHostSend(waitCtx context.Context, req *http.Request, state *upstreamGuardHostState, queued func(error) error) (bool, error) {
+	if err := t.guard.loadCircuit(req.Context(), state); err != nil {
+		return false, err
+	}
+	if retryAt := t.guard.circuitRetryAt(state); retryAt > 0 {
+		return false, &upstreamCircuitOpenError{RetryAt: retryAt}
+	}
+	if err := t.guard.waitForHost(waitCtx, state); err != nil {
+		return false, queued(err)
+	}
+	logScope, logQuery := upstreamLogQuery(req)
+	if logQuery {
+		t.guard.prepareLogPace(state, logScope)
+		if err := t.guard.waitForLogPace(waitCtx, state); err != nil {
+			return false, queued(err)
+		}
+	}
+	return logQuery, nil
+}
+
 func (t *upstreamGuardTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	if req == nil {
 		return nil, errors.New("上游请求无效")
@@ -557,17 +582,10 @@ func (t *upstreamGuardTransport) RoundTrip(req *http.Request) (*http.Response, e
 			hostHeld = false
 		}
 	}
-	if err := t.guard.loadCircuit(req.Context(), state); err != nil {
+	logQuery, err := t.prepareHostSend(waitCtx, req, state, queued)
+	if err != nil {
 		releaseHost()
 		return nil, err
-	}
-	if retryAt := t.guard.circuitRetryAt(state); retryAt > 0 {
-		releaseHost()
-		return nil, &upstreamCircuitOpenError{RetryAt: retryAt}
-	}
-	if err := t.guard.waitForHost(waitCtx, state); err != nil {
-		releaseHost()
-		return nil, queued(err)
 	}
 	if err := acquireUpstreamGuard(waitCtx, t.guard.globalSem); err != nil {
 		releaseHost()
@@ -610,6 +628,9 @@ func (t *upstreamGuardTransport) RoundTrip(req *http.Request) (*http.Response, e
 			cancelRequest()
 		}
 	}
+	if logQuery {
+		t.guard.recordLogStart(state)
+	}
 	response, err := t.base.RoundTrip(sent)
 	if err != nil {
 		if response != nil && response.Body != nil {
@@ -622,6 +643,9 @@ func (t *upstreamGuardTransport) RoundTrip(req *http.Request) (*http.Response, e
 		}
 		release()
 		return response, err
+	}
+	if logQuery {
+		t.guard.recordLogResponse(state, response.StatusCode)
 	}
 	recorded := response.StatusCode == http.StatusTooManyRequests || isUpstreamCircuitStatus(response.StatusCode)
 	if recorded {

@@ -836,7 +836,7 @@ func fetchNewAPILogPageWithType[T any](ctx context.Context, client *http.Client,
 	// 上游账户保存的是普通用户访问令牌，只能读取该账户自己的消费日志。
 	// /api/log/ 是管理员全站日志接口，普通用户凭据会得到 403；不得为了同步
 	// 上游账单而要求或保存管理员令牌。
-	body, err := doUpstreamJSON(ctx, client, http.MethodGet, upstreamEndpoint(row.BaseURL, "/api/log/self")+"?"+query.Encode(), headers, nil)
+	body, err := doUpstreamJSON(withUpstreamLogQuery(ctx, row), client, http.MethodGet, upstreamEndpoint(row.BaseURL, "/api/log/self")+"?"+query.Encode(), headers, nil)
 	if err != nil {
 		var statusErr *upstreamHTTPError
 		if errors.As(err, &statusErr) && (statusErr.Status == http.StatusUnauthorized || statusErr.Status == http.StatusForbidden) {
@@ -1205,7 +1205,8 @@ func (m *Monitor) syncNewAPIUsagePagedWindow(ctx context.Context, table string, 
 	var first newAPIUsagePage[newAPIUsageItem]
 	firstLoaded := false
 	checkpointVerified := false
-	if hasCheckpoint {
+	deferProbe := slowUpstreamLogPace(ctx, client, row)
+	if hasCheckpoint && !deferProbe {
 		page, err := fetchNewAPIUsagePage(ctx, client, row, cred, from, to, 1, pacer)
 		if err != nil {
 			var exhausted *upstreamUsageRunBudgetExhausted
@@ -1267,7 +1268,7 @@ func (m *Monitor) syncNewAPIUsagePagedWindow(ctx context.Context, table string, 
 			}
 			return upstreamUsageResult{}, "", false, err
 		}
-		if err := validateNewAPIUsagePage(page, checkpoint.Total, pageNumber, pageCount); err != nil {
+		if err := m.validateNewAPIUsageCheckpointPage(ctx, table, checkpoint, page, pageNumber, pageCount, deferProbe); err != nil {
 			return upstreamUsageResult{}, "", false, err
 		}
 		accumulateNewAPIBackfillPage(&checkpoint, page.Items)
@@ -1296,6 +1297,22 @@ func (m *Monitor) syncNewAPIUsagePagedWindow(ctx context.Context, table string, 
 		}
 	}
 
+	return newAPIUsageCheckpointResult(row, checkpoint, from, to), "", true, nil
+}
+
+func (m *Monitor) validateNewAPIUsageCheckpointPage(ctx context.Context, table string, checkpoint NewAPIUsageBackfillCheckpoint, page newAPIUsagePage[newAPIUsageItem], pageNumber, pageCount int, deferProbe bool) error {
+	if err := validateNewAPIUsagePage(page, checkpoint.Total, pageNumber, pageCount); err != nil {
+		if deferProbe && page.Total != checkpoint.Total {
+			if deleteErr := m.storeDB.WithContext(ctx).Exec("DELETE FROM "+table+" WHERE domain = ?", checkpoint.Domain).Error; deleteErr != nil {
+				return deleteErr
+			}
+		}
+		return err
+	}
+	return nil
+}
+
+func newAPIUsageCheckpointResult(row ChannelUpstreamAccount, checkpoint NewAPIUsageBackfillCheckpoint, from, to int64) upstreamUsageResult {
 	unit := row.BalanceUnit
 	if unit <= 0 {
 		unit = defaultNewAPIQuotaPerUSD
@@ -1305,7 +1322,7 @@ func (m *Monitor) syncNewAPIUsagePagedWindow(ctx context.Context, table string, 
 		Requests: checkpoint.Requests, Tokens: checkpoint.Tokens, Quota: checkpoint.Quota,
 		CostUSD: checkpoint.Quota / unit, UnitPerUSD: unit, Provider: row.Provider,
 	}
-	return upstreamUsageResult{Hours: []ChannelUpstreamUsageHour{hour}, DataUntil: to, Adapter: upstreamUsageAdapterNewAPILog}, "", true, nil
+	return upstreamUsageResult{Hours: []ChannelUpstreamUsageHour{hour}, DataUntil: to, Adapter: upstreamUsageAdapterNewAPILog}
 }
 
 const (
@@ -3085,6 +3102,35 @@ func coupleUpstreamUsageHistoryRetryToTail(row *ChannelUpstreamAccount) {
 	}
 }
 
+func (m *Monitor) persistUpstreamUsageTail(ctx context.Context, row ChannelUpstreamAccount, plan upstreamUsageSyncPlan, result *upstreamUsageResult, now int64) error {
+	publishTo := plan.tailTo
+	if row.Provider == upstreamProviderOrion {
+		publishTo = result.DataUntil // Pending open windows pin their own end.
+	}
+	if err := m.persistUpstreamUsageWindow(ctx, row.Domain, plan.tailFrom, publishTo, result.Hours, now); err != nil {
+		result.DataUntil = 0 // Failed commit must never advance the watermark.
+		return err
+	}
+	return nil
+}
+
+func (m *Monitor) applyUpstreamUsageTailProgress(row *ChannelUpstreamAccount, result upstreamUsageResult, err error, yielded bool, now int64, secrets ...string) {
+	if row.Provider == upstreamProviderOrion && yielded {
+		// Durable staging is not a public success: retain the last watermark.
+		row.UsageLastAttemptAt = now
+		row.UsageStatus, row.UsageLastError = upstreamStatusPending, ""
+		row.UsageConsecutiveFails = 0
+	} else {
+		applyUpstreamUsageResult(row, result, err, now, m.cfg, secrets...)
+	}
+	if yielded || (row.Provider == upstreamProviderOrion && err == nil && result.DataUntil < now-60) {
+		row.UsageNextSyncAt = now + 15
+	} else if err != nil {
+		// Couple deadlines, not health counters; history cannot bypass tail.
+		coupleUpstreamUsageHistoryRetryToTail(row)
+	}
+}
+
 func (m *Monitor) syncStoredUpstreamUsage(ctx context.Context, domain string) (ChannelUpstreamAccount, error) {
 	return m.syncStoredUpstreamUsageWithPriority(ctx, domain, false, upstreamUsageLaneAuto)
 }
@@ -3281,6 +3327,8 @@ func (m *Monitor) syncStoredUpstreamUsageWithPriority(ctx context.Context, domai
 		// 整段失败和增量恢复之间震荡。
 		if probeErr := upstreamProbeBeforeRetry(ctx, m, row, "usage", row.UsageStatus, row.UsageConsecutiveFails); probeErr != nil {
 			err = probeErr
+		} else if orionCred, ok := credential.(orionCredential); ok && row.Provider == upstreamProviderOrion {
+			result, tailYielded, err = m.syncOrionUsageCheckpoint(ctx, row, orionCred, "tail", plan.tailFrom, plan.tailTo, pacer)
 		} else if newAPICred, ok := credential.(newAPICredential); ok && row.Provider == upstreamProviderNewAPI && newAPITailNeedsIncrementalSync(row, now) {
 			var enterPaged bool
 			result, tailYielded, enterPaged, err = m.syncNewAPITailIncremental(ctx, row, newAPICred, plan.tailFrom, plan.tailTo, now, pacer)
@@ -3303,27 +3351,15 @@ func (m *Monitor) syncStoredUpstreamUsageWithPriority(ctx context.Context, domai
 			return row, err
 		}
 		operationRetryAt = upstreamRetryAt(err)
-		if err == nil && !tailPersisted {
-			if err = m.persistUpstreamUsageWindow(ctx, row.Domain, plan.tailFrom, plan.tailTo, result.Hours, now); err != nil {
-				// Nothing of this window was saved: the watermark must not move.
-				result.DataUntil = 0
-			}
+		if err == nil && !tailPersisted && !tailYielded {
+			err = m.persistUpstreamUsageTail(ctx, row, plan, &result, now)
 		}
 		if errors.Is(err, context.Canceled) {
 			return row, err
 		}
 	}
 	if tailRan {
-		applyUpstreamUsageResult(&row, result, err, now, m.cfg, secrets...)
-		if tailYielded || (row.Provider == upstreamProviderOrion && err == nil && plan.tailTo < now-60) {
-			// The source is healthy and at least one complete hour was committed.
-			// Resume quickly instead of waiting for the normal live-sync interval.
-			row.UsageNextSyncAt = now + 15
-		} else if err != nil {
-			// Couple only the retry deadline, not the health counters: a due
-			// history lane must not reselect this account before tail recovery.
-			coupleUpstreamUsageHistoryRetryToTail(&row)
-		}
+		m.applyUpstreamUsageTailProgress(&row, result, err, tailYielded, now, secrets...)
 	}
 	if err == nil && !tailYielded && plan.backfillTo > plan.backfillFrom &&
 		(pacer.maxRequests <= 0 || pacer.calls < pacer.maxRequests) {
@@ -3376,6 +3412,11 @@ func (m *Monitor) syncStoredUpstreamUsageWithPriority(ctx context.Context, domai
 			}
 		} else if row.Provider == upstreamProviderTokenForce {
 			err = m.syncTokenForceHistoryWindows(ctx, &row, plan, now, pacer, syncUsage, &operationRetryAt, func() []string { return secrets })
+			if errors.Is(err, context.Canceled) {
+				return row, err
+			}
+		} else if orionCred, ok := credential.(orionCredential); ok && row.Provider == upstreamProviderOrion {
+			err = m.syncOrionHistoryCheckpoint(ctx, &row, orionCred, plan, now, pacer, &operationRetryAt, secrets...)
 			if errors.Is(err, context.Canceled) {
 				return row, err
 			}
