@@ -5,7 +5,6 @@ package monitor
 import (
 	"database/sql"
 	"errors"
-	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -160,5 +159,5 @@ func TestLocalResourceReadonlyVolumeRejectsWrites(t *testing.T) {
 		t.Fatal("read-only inspection changed retained money", amount, err)
 	}
 	// No source, external calls, automatic repair or file removal is permitted.
-	t.Log(fmt.Sprintf("read-only recovery data retained: %s", strings.TrimPrefix(dir, "/data/")))
+	t.Logf("read-only recovery data retained: %s", strings.TrimPrefix(dir, "/data/"))
 }

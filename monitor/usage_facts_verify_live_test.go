@@ -68,7 +68,7 @@ func TestUsageVerifyLiveTailRecoversCrossMidnightPublication(t *testing.T) {
 			if err := db.Save(&member).Error; err != nil {
 				t.Fatal(err)
 			}
-			id := int64(uid)
+			id := uid
 			job := UsageFactJob{
 				ID: usageFactHistoryJobID(uid, 1), UserID: &id, TrackedRevision: 1, Kind: usageFactHistoryKindVerify,
 				SourceEpoch: epoch, Status: usageFactHistoryJobComplete, FromTs: yesterday,
@@ -151,7 +151,7 @@ func TestUsageVerifyLiveTailRecoversCrossMidnightPublication(t *testing.T) {
 				if err := db.Callback().Query().Before("gorm:query").Register(callback, func(tx *gorm.DB) {
 					if failOnce && tx.Statement.Table == "usage_fact_member_hour_states" {
 						failOnce = false
-						tx.AddError(context.DeadlineExceeded)
+						_ = tx.AddError(context.DeadlineExceeded) // GORM carries the injected error in tx.Error.
 					}
 				}); err != nil {
 					t.Fatal(err)

@@ -52,7 +52,7 @@ func TestStabilityBackfillResourceFailureResumesSameJob(t *testing.T) {
 	}
 	if err := m.storeDB.Callback().Update().Before("gorm:update").Register("resource-test-full", func(tx *gorm.DB) {
 		if tx.Statement.Table == "stability_hour_ingest_states" {
-			tx.AddError(syscall.ENOSPC)
+			_ = tx.AddError(syscall.ENOSPC) // GORM carries the injected error in tx.Error.
 		}
 	}); err != nil {
 		t.Fatal(err)

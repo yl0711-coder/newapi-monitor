@@ -49,7 +49,11 @@ func TestTemporaryDistinguishesRealSQLiteBusyFromConstraintAndReadOnly(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer tx.Rollback()
+	defer func() {
+		if err := tx.Rollback(); err != nil && !errors.Is(err, sql.ErrTxDone) {
+			t.Errorf("cleanup writer transaction: %v", err)
+		}
+	}()
 	if _, err := tx.Exec("INSERT INTO records VALUES(2)"); err != nil {
 		t.Fatal(err)
 	}

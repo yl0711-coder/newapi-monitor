@@ -22,7 +22,7 @@ func TestLocalResourceFilesystemFullStopsAndRecovers(t *testing.T) {
 	if err := syscall.Statfs(dir, &fs); err != nil {
 		t.Fatal(err)
 	}
-	if size := uint64(fs.Blocks) * uint64(fs.Bsize); size > 32<<20 || size < 4<<20 {
+	if size := fs.Blocks * uint64(fs.Bsize); size > 32<<20 || size < 4<<20 {
 		t.Fatalf("unexpected filesystem size: %d", size)
 	}
 	// The test disk is deliberately tiny; keep only this fixture's reserve
