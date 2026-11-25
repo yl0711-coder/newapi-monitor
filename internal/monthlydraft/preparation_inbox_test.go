@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -71,6 +72,38 @@ func TestPreparationInboxCanonicalIndexAndScope(t *testing.T) {
 	}
 }
 
+func TestPreparationInboxPermanentErrorsWinOverJoinedResourceFailures(t *testing.T) {
+	for _, permanent := range []error{ErrGenerationIntegrity, ErrGenerationCapacity, ErrGenerationSelectionConflict, ErrGenerationChanged} {
+		t.Run(permanent.Error(), func(t *testing.T) {
+			path := t.TempDir()
+			if err := os.Chmod(path, 0700); err != nil {
+				t.Fatal(err)
+			}
+			root, err := os.OpenRoot(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer root.Close()
+			entry := PreparedInputInboxEntry{GroupID: 1, Month: "2026-09", Revision: 1, Directory: "prepared", ManifestSHA256: strings.Repeat("a", 64)}
+			key := GenerationTarget{GroupID: 1, Month: entry.Month}
+			d := &Deployment{g: &Generation{root: root}, runtime: &LocalRuntime{scope: &generationScope{exact: map[GenerationTarget]struct{}{key: {}}}}}
+			p := &preparationInbox{name: "inbox.json", sourceID: "scope"}
+			writePreparationInboxTest(t, path, p.name, entry)
+			calls := 0
+			receive := func(context.Context, PreparedInputInboxEntry, string) (PreparationResult, error) {
+				calls++
+				return PreparationResult{}, errors.Join(permanent, syscall.ENOSPC)
+			}
+			now := time.Now()
+			p.step(t.Context(), d, now, receive)
+			p.step(t.Context(), d, now.Add(24*time.Hour), receive)
+			if calls != 1 || p.states[key].status != "paused" {
+				t.Fatal("permanent error retried after resource cooldown", calls, p.states[key])
+			}
+		})
+	}
+}
+
 func TestPreparationInboxRetryFairnessPauseAndExplicitRecovery(t *testing.T) {
 	path := t.TempDir()
 	if err := os.Chmod(path, 0700); err != nil {
@@ -114,14 +147,18 @@ func TestPreparationInboxRetryFairnessPauseAndExplicitRecovery(t *testing.T) {
 	p.step(ctx, d, now.Add(152*time.Second), receive)
 	p.step(ctx, d, now.Add(24*time.Hour), receive)
 	key := GenerationTarget{GroupID: 1, Month: a.Month}
-	if calls[1] != 3 || p.states[key].status != "paused" {
-		t.Fatal("unbounded retry", calls, p.states[key])
+	if calls[1] != 4 || p.states[key].status != "retry_wait" {
+		t.Fatal("resource retry did not remain recoverable", calls, p.states[key])
 	}
 	busy = false
+	p.step(ctx, d, now.Add(24*time.Hour+6*time.Minute), receive)
+	if calls[1] != 5 || p.states[key].status != "selected" {
+		t.Fatal("resource recovery required revision change or restart", calls, p.states[key])
+	}
 	a.Revision++
 	writePreparationInboxTest(t, path, p.name, a, b)
 	p.step(ctx, d, now.Add(24*time.Hour), receive)
-	if calls[1] != 4 || calls[2] != 1 || p.states[key].status != "selected" {
+	if calls[1] != 6 || calls[2] != 1 || p.states[key].status != "selected" {
 		t.Fatal("explicit recovery reset unrelated entry or failed", calls)
 	}
 	// A partial/malformed index never activates a target or clears its state.
@@ -129,7 +166,7 @@ func TestPreparationInboxRetryFairnessPauseAndExplicitRecovery(t *testing.T) {
 		t.Fatal(err)
 	}
 	p.step(ctx, d, now.Add(48*time.Hour), receive)
-	if calls[1] != 4 || calls[2] != 1 || len(p.states) != 2 {
+	if calls[1] != 6 || calls[2] != 1 || len(p.states) != 2 {
 		t.Fatal("invalid index caused work", calls)
 	}
 	writePreparationInboxTest(t, path, p.name)

@@ -76,7 +76,17 @@ func (m *Monitor) adoptStoreBackupSet(parent context.Context, now time.Time, mai
 	if factsEnabled {
 		paths = append(paths, m.cfg.UsageFactsStorePath)
 	}
-	entries, err := scanRuntimeBackupSets(m.storeBackupDir(), now, paths)
+	// Adoption validates exactly the newest generated set. An unrelated old
+	// malformed manifest must block deletion, not force another full backup.
+	// The newest candidate itself still passes every strict validation below.
+	name, err := newestRuntimeBackupName(m.storeBackupDir())
+	if os.IsNotExist(err) {
+		return time.Time{}, nil
+	}
+	if err != nil || name == "" {
+		return time.Time{}, err
+	}
+	entries, err := scanRuntimeBackupSetsForName(m.storeBackupDir(), now, paths, name)
 	if os.IsNotExist(err) {
 		return time.Time{}, nil
 	}
@@ -127,6 +137,10 @@ type runtimeBackupRetentionEntry struct {
 // Control files are small and bound to exact generated names. A malformed
 // record stops the entire sweep, rather than being treated as disposable.
 func scanRuntimeBackupSets(dir string, now time.Time, livePaths []string) ([]runtimeBackupRetentionEntry, error) {
+	return scanRuntimeBackupSetsForName(dir, now, livePaths, "")
+}
+
+func scanRuntimeBackupSetsForName(dir string, now time.Time, livePaths []string, only string) ([]runtimeBackupRetentionEntry, error) {
 	info, err := os.Lstat(dir)
 	if err != nil {
 		return nil, err
@@ -143,6 +157,9 @@ func scanRuntimeBackupSets(dir string, now time.Time, livePaths []string) ([]run
 	var result []runtimeBackupRetentionEntry
 	for _, entry := range entries {
 		name := entry.Name()
+		if only != "" && name != only {
+			continue
+		}
 		if !strings.HasPrefix(name, storeBackupSetPrefix) || !strings.HasSuffix(name, storeBackupSetSuffix) {
 			continue
 		}

@@ -99,8 +99,8 @@ func (p *preparationInbox) serve(ctx context.Context, d *Deployment) {
 }
 
 // At most ONE entry per tick; round-robin avoids a bad target starving others.
-// Busy/deadline failures retry at most three times, then pause. Other failures
-// pause immediately. Restart resets in-memory retry budgets, never selection
+// Resource failures retry with a capped cooldown, never a terminal pause.
+// Other failures pause immediately. Restart resets retry timing, never selection
 // history. A successful/paused entry is not retried until its explicit entry
 // (including Revision) changes, or the service is deliberately restarted.
 func (p *preparationInbox) step(ctx context.Context, d *Deployment, now time.Time,
@@ -145,13 +145,13 @@ func (p *preparationInbox) step(ctx context.Context, d *Deployment, now time.Tim
 		if ctx.Err() != nil && !result.Applied {
 			return // shutdown is not a source failure
 		}
-		state.attempts++
+		state.attempts = min(state.attempts+1, 8)
 		code := "selected"
 		if err == nil && result.Applied {
 			state.status = "selected"
-		} else if state.attempts < 3 && (errors.Is(err, ErrGenerationBusy) || errors.Is(err, context.DeadlineExceeded)) {
+		} else if monthlyResourceWait(err) {
 			state.status, code = "retry_wait", "temporarily_busy"
-			state.next = now.Add(time.Since(started) + time.Duration(state.attempts*state.attempts)*preparationInboxInterval)
+			state.next = now.Add(time.Since(started) + monthlyResourceRetryDelay(state.attempts))
 		} else {
 			state.status, code = "paused", "check_required"
 			if errors.Is(err, ErrGenerationSelectionConflict) {

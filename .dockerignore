@@ -38,6 +38,9 @@ internal/metering/**
 !internal/trafficclass/
 internal/trafficclass/**
 !internal/trafficclass/*.go
+!internal/localresource/
+internal/localresource/**
+!internal/localresource/*.go
 !internal/financecredit/
 internal/financecredit/**
 !internal/financecredit/*.go

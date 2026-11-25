@@ -606,7 +606,10 @@ func (m *Monitor) retryIncidentWindowLevelFailure(ctx context.Context, core Inci
 		return nil
 	}
 
-	// 先无条件记一次尝试，保证失败路径一定有留痕与退避。
+	if localResourceTemporarilyUnavailable(rescanErr) {
+		return m.markIncidentWindowFailure(ctx, row, rescanErr, ingest, now)
+	}
+	// 先记一次真正的来源/处理尝试，资源让步另行保留预算。
 	row.Attempts++
 	row.SourceCheckAttempts++
 	row.NextRetryAt = incidentRetryBackoff(row.Attempts, ingest.PollSeconds, now)

@@ -161,6 +161,10 @@ func (m *Monitor) triggerManualStoreBackup() bool {
 		ctx := m.taskContext()
 		now := time.Now()
 		if _, err := m.createStoreBackupSet(ctx, now, mainEnabled, factsEnabled); err != nil && !errors.Is(err, context.Canceled) {
+			if storeBackupWasCommitted(err) {
+				slog.Warn("手动备份已完成，旧恢复点清理待重试", "err", err)
+				return
+			}
 			slog.Error("手动 Monitor 双库成套备份失败", "err", err)
 		}
 	}()
@@ -309,11 +313,35 @@ func (m *Monitor) startStoreMaintenance(ctx context.Context) {
 				return
 			case <-initial.C:
 			}
+			retentionPending := false
+			var nextBackupAt time.Time
 			for {
 				now := time.Now()
+				if retentionPending {
+					retentionPending = m.retryStoreBackupRetention(ctx, now, mainEnabled, factsEnabled) != nil
+				}
+				// A cleanup failure (including an unreadable old manifest) must
+				// not make adoption failure manufacture another full snapshot.
+				if now.Before(nextBackupAt) {
+					delay := time.Until(nextBackupAt)
+					if retentionPending && delay > storeBackupDailyRetryDelay {
+						delay = storeBackupDailyRetryDelay
+					}
+					timer := time.NewTimer(delay)
+					select {
+					case <-ctx.Done():
+						timer.Stop()
+						return
+					case <-timer.C:
+						continue
+					}
+				}
 				if delay, err := m.storeBackupResumeDelay(ctx, now, mainEnabled, factsEnabled); err != nil {
 					slog.Warn("无法复用现有在线备份，尝试生成新备份", "err", err)
 				} else if delay > 0 {
+					if retentionPending && delay > storeBackupDailyRetryDelay {
+						delay = storeBackupDailyRetryDelay
+					}
 					slog.Info("现有成套备份已验证，延续原备份周期", "next_in", delay)
 					timer := time.NewTimer(delay)
 					select {
@@ -325,13 +353,22 @@ func (m *Monitor) startStoreMaintenance(ctx context.Context) {
 					}
 				}
 				if _, err := m.createStoreBackupSet(ctx, now, mainEnabled, factsEnabled); err != nil {
-					if !errors.Is(err, context.Canceled) {
+					if storeBackupWasCommitted(err) {
+						nextBackupAt = now.Add(m.storeBackupInterval())
+						retentionPending = true
+						slog.Warn("Monitor 双库备份已完成，旧恢复点清理待重试", "err", err)
+					} else if !errors.Is(err, context.Canceled) {
 						slog.Error("Monitor 双库成套在线备份失败", "err", err)
 					}
 				} else {
+					nextBackupAt = now.Add(m.storeBackupInterval())
 					slog.Info("Monitor 双库成套在线备份完成")
 				}
-				timer := time.NewTimer(m.storeBackupInterval())
+				delay := m.storeBackupInterval()
+				if retentionPending && delay > storeBackupDailyRetryDelay {
+					delay = storeBackupDailyRetryDelay
+				}
+				timer := time.NewTimer(delay)
 				select {
 				case <-ctx.Done():
 					timer.Stop()
@@ -1219,8 +1256,7 @@ func (m *Monitor) createStoreBackupSet(parent context.Context, now time.Time, ma
 	// publication/member barriers while hashing old recovery points.
 	unlockSources()
 	if err := pruneStoreBackupSetsWithPolicy(ctx, dir, m.storeBackupRetention(), m.storeBackupRetentionDays(), now, paths); err != nil {
-		m.storeBackupSetLastFailure.Store(time.Now().Unix())
-		return manifestPath, err
+		return manifestPath, &storeBackupRetentionPendingError{cause: err}
 	}
 	return manifestPath, nil
 }
@@ -1410,24 +1446,38 @@ func (m *Monitor) runDailyStoreBackups(ctx context.Context, minute int, mainEnab
 		lastGood = createdAt
 		slog.Info("现有成套备份已验证，沿用定时备份", "created_at_utc", createdAt.UTC().Format("2006-01-02 15:04"))
 	}
+	// A restarted scheduler may have committed its last backup before a
+	// retention failure. Recheck maintenance without manufacturing a new set.
+	retentionPending := !lastGood.IsZero()
 	for {
 		now := time.Now()
 		slot := storeBackupLastSlot(now, minute)
 		next := slot.AddDate(0, 0, 1)
 		wait := time.Until(next) + time.Second
+		if retentionPending {
+			retentionPending = m.retryStoreBackupRetention(ctx, now, mainEnabled, factsEnabled) != nil
+		}
 		if lastGood.Before(slot) {
 			if _, err := m.createStoreBackupSet(ctx, now, mainEnabled, factsEnabled); err != nil {
-				if errors.Is(err, context.Canceled) {
+				if storeBackupWasCommitted(err) {
+					lastGood = now
+					retentionPending = true
+					slog.Warn("Monitor 双库备份已完成，旧恢复点清理待重试", "err", err)
+				} else if errors.Is(err, context.Canceled) {
 					return
-				}
-				slog.Error("Monitor 双库成套在线备份失败", "err", err, "retry_in", storeBackupDailyRetryDelay)
-				if storeBackupDailyRetryDelay < wait {
-					wait = storeBackupDailyRetryDelay
+				} else {
+					slog.Error("Monitor 双库成套在线备份失败", "err", err, "retry_in", storeBackupDailyRetryDelay)
+					if storeBackupDailyRetryDelay < wait {
+						wait = storeBackupDailyRetryDelay
+					}
 				}
 			} else {
 				lastGood = now
 				slog.Info("Monitor 双库成套在线备份完成")
 			}
+		}
+		if retentionPending && storeBackupDailyRetryDelay < wait {
+			wait = storeBackupDailyRetryDelay
 		}
 		if !lastGood.Before(slot) {
 			slog.Info("下一次 Monitor 定时备份", "at_utc", next.Format("2006-01-02 15:04"))

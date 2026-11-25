@@ -1247,7 +1247,7 @@ func (m *Monitor) runStabilityBackfillWithFetcher(ctx context.Context, jobID str
 	}
 	known, err := m.completeStabilityHours(job.FromTs, job.ToTs)
 	if err != nil {
-		job.Status, job.LastError, job.UpdatedAt = "paused", clip(err.Error(), 512), time.Now().Unix()
+		job.Status, job.LastError, job.UpdatedAt = stabilityLocalFailureStatus(err), clip(err.Error(), 512), time.Now().Unix()
 		m.saveStabilityBackfillJob(&job, "读取已完成小时失败")
 		return
 	}
@@ -1334,7 +1334,7 @@ func (m *Monitor) runStabilityBackfillWithFetcher(ctx context.Context, jobID str
 					continue
 				}
 				if _, stateErr := m.markStabilityHourAttempt(hour, job.ID, "failed", fetchErr.Error()); stateErr != nil {
-					job.Status, job.LastError, job.UpdatedAt = "paused", clip(stateErr.Error(), 512), time.Now().Unix()
+					job.Status, job.LastError, job.UpdatedAt = stabilityLocalFailureStatus(stateErr), clip(stateErr.Error(), 512), time.Now().Unix()
 					m.saveStabilityBackfillJob(&job, "保存隔离小时失败")
 					return
 				}
@@ -1363,14 +1363,14 @@ func (m *Monitor) runStabilityBackfillWithFetcher(ctx context.Context, jobID str
 		for hour := toTs - 3600; hour >= fromTs; hour -= 3600 {
 			state, stateErr := m.markStabilityHourAttempt(hour, job.ID, "running", "")
 			if stateErr != nil {
-				job.Status, job.LastError, job.UpdatedAt = "paused", clip(stateErr.Error(), 512), time.Now().Unix()
+				job.Status, job.LastError, job.UpdatedAt = stabilityLocalFailureStatus(stateErr), clip(stateErr.Error(), 512), time.Now().Unix()
 				m.saveStabilityBackfillJob(&job, "保存小时运行状态失败")
 				return
 			}
 			traffic := result.Hours[hour]
 			if err := m.replaceStabilityHourTrafficContext(ctx, hour, traffic.Users, traffic.InternalTests, state); err != nil {
 				_, _ = m.markStabilityHourAttempt(hour, job.ID, "failed", err.Error())
-				job.Status, job.LastError, job.UpdatedAt = "paused", clip(err.Error(), 512), time.Now().Unix()
+				job.Status, job.LastError, job.UpdatedAt = stabilityLocalFailureStatus(err), clip(err.Error(), 512), time.Now().Unix()
 				m.saveStabilityBackfillJob(&job, "本地原子写入失败")
 				return
 			}
@@ -1410,14 +1410,14 @@ func (m *Monitor) runStabilityBackfillWithFetcher(ctx context.Context, jobID str
 			}
 			state, stateErr := m.markStabilityHourAttempt(hour, job.ID, "running", "")
 			if stateErr != nil {
-				job.Status, job.LastError, job.UpdatedAt = "paused", clip(stateErr.Error(), 512), time.Now().Unix()
+				job.Status, job.LastError, job.UpdatedAt = stabilityLocalFailureStatus(stateErr), clip(stateErr.Error(), 512), time.Now().Unix()
 				m.saveStabilityBackfillJob(&job, "保存隔离小时复核状态失败")
 				return
 			}
 			traffic := result.Hours[hour]
 			if err := m.replaceStabilityHourTrafficContext(ctx, hour, traffic.Users, traffic.InternalTests, state); err != nil {
 				_, _ = m.markStabilityHourAttempt(hour, job.ID, "failed", err.Error())
-				job.Status, job.LastError, job.UpdatedAt = "paused", clip(err.Error(), 512), time.Now().Unix()
+				job.Status, job.LastError, job.UpdatedAt = stabilityLocalFailureStatus(err), clip(err.Error(), 512), time.Now().Unix()
 				m.saveStabilityBackfillJob(&job, "隔离小时复核写入失败")
 				return
 			}
@@ -1655,6 +1655,20 @@ func (m *Monitor) startStabilityBackfillMaintenance(ctx context.Context) {
 	if !resumed {
 		m.startStabilityClassificationMigration()
 	}
+	// Resume already authorized work even when optional historical auto-repair
+	// is disabled. The single-owner CAS prevents overlapping backfills.
+	goSourceEpoch(ctx, func(ctx context.Context) {
+		ticker := time.NewTicker(time.Minute)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				m.resumeStabilityBackfill()
+			}
+		}
+	})
 	if !m.cfg.StabilityAutoRepair {
 		return
 	}

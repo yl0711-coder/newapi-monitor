@@ -1104,7 +1104,7 @@ func (m *Monitor) recordStabilityProblemMigrationFailure(state *StabilityProblem
 	// a protected scheduler interruption, not a bad history window and must not
 	// consume one of the five manual-intervention attempts.
 	interrupted := errors.Is(cause, context.Canceled) || errors.Is(cause, errSourceNotReady) ||
-		errors.Is(cause, errStabilityProblemSourceGateWait)
+		errors.Is(cause, errStabilityProblemSourceGateWait) || localResourceTemporarilyUnavailable(cause)
 	attempts := state.Attempts
 	span := stabilityProblemMigrationSpanMinutes(state.CurrentSpanMinutes, 12*60)
 	status := "running"

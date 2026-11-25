@@ -139,12 +139,10 @@ func (m *publishedCapacityMaintenance) step(parent context.Context) (worked bool
 	defer cancel()
 	defer func() {
 		if err != nil && parent.Err() == nil {
-			if errors.Is(err, ErrGenerationBusy) || errors.Is(err, monthlytasks.ErrBusy) || errors.Is(err, context.DeadlineExceeded) {
-				m.transientFailures++
-				m.retryAt = time.Now().Add(30 * time.Second)
-				if m.transientFailures < 3 {
-					return
-				}
+			if monthlyResourceWait(err) {
+				m.transientFailures = min(m.transientFailures+1, 8)
+				m.retryAt = time.Now().Add(monthlyResourceRetryDelay(m.transientFailures))
+				return
 			}
 			m.paused.Store(true)
 			log.Print("monthly_capacity_maintenance stopped: local verification or capacity requires review")
@@ -195,7 +193,7 @@ func (m *publishedCapacityMaintenance) step(parent context.Context) (worked bool
 	if err := automaticPreparationRootCurrent(m.root, m.directory); err != nil {
 		return false, err
 	}
-	receipt, err := m.g.CopyPublishedGenerationArchive(ctx, m.main, req.Owner, id, filepath.Join(m.directory, name))
+	receipt, err := m.g.copyPublishedGenerationArchive(ctx, m.main, req.Owner, id, filepath.Join(m.directory, name), true, writeArchiveFile)
 	if err != nil {
 		return false, err
 	}

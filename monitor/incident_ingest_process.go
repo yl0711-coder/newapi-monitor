@@ -505,6 +505,11 @@ func (m *Monitor) markIncidentWindowFailure(ctx context.Context, row IncidentIng
 		row.ProcessState = incidentProcessUnattributable
 		return m.saveIncidentWindowState(ctx, row)
 	}
+	if localResourceTemporarilyUnavailable(cause) {
+		row.ProcessState = incidentProcessFailed
+		row.NextRetryAt = now + max(int64(60), int64(ingest.PollSeconds))
+		return m.saveIncidentWindowState(ctx, row)
+	}
 	row.Attempts++
 	if row.Attempts >= ingest.MaxAttempts {
 		row.ProcessState = incidentProcessFailedPermanent

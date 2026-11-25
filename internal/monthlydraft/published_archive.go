@@ -223,6 +223,12 @@ func (g *Generation) auditPublishedArchive(ctx context.Context, main *gorm.DB, o
 // complete copy is replayable; partial output is never overwritten/resumed.
 // It does not initialize retention or grant permission to delete hot payloads.
 func (g *Generation) CopyPublishedGenerationArchive(parent context.Context, main *gorm.DB, owner monthlytasks.Owner, taskID, directory string) (ArchiveReceipt, error) {
+	return g.copyPublishedGenerationArchive(parent, main, owner, taskID, directory, false, writeArchiveFile)
+}
+
+// Only the managed maintenance owner enables exact-prefix continuation.
+// Public/manual copy keeps its original empty-or-complete directory contract.
+func (g *Generation) copyPublishedGenerationArchive(parent context.Context, main *gorm.DB, owner monthlytasks.Owner, taskID, directory string, resume bool, writeFile func(context.Context, *os.Root, string, []byte) error) (ArchiveReceipt, error) {
 	ctx, cancel := context.WithTimeout(parent, 2*time.Minute)
 	defer cancel()
 	saved, entry, binding, err := g.auditPublishedArchive(ctx, main, owner, taskID)
@@ -250,7 +256,11 @@ func (g *Generation) CopyPublishedGenerationArchive(parent context.Context, main
 	if (readErr != nil && !errors.Is(readErr, io.EOF)) || closeErr != nil {
 		return ArchiveReceipt{}, errors.Join(readErr, closeErr)
 	}
-	if len(names) != 0 {
+	_, finalErr := root.Lstat("manifest.json")
+	if finalErr != nil && !os.IsNotExist(finalErr) {
+		return ArchiveReceipt{}, finalErr
+	}
+	if len(names) != 0 && (!resume || finalErr == nil) {
 		if len(names) != 5 { // three payloads plus the linked pending/final manifest
 			return ArchiveReceipt{}, ErrGenerationIntegrity
 		}
@@ -270,16 +280,40 @@ func (g *Generation) CopyPublishedGenerationArchive(parent context.Context, main
 		if err != nil || !reflect.DeepEqual(raw, pending) {
 			return ArchiveReceipt{}, errors.Join(ErrGenerationIntegrity, err)
 		}
+		if resume {
+			if err := syncCompletedPublishedArchive(ctx, root, names); err != nil {
+				return ArchiveReceipt{}, err
+			}
+		}
 		receipt.Directory = directory
 		return receipt, nil
 	}
 	m := archiveManifest{Version: 2, Mode: publishedArchiveMode, Policy: publishedArchivePolicy, SnapshotSHA256: publishedBindingHash(binding), AsOfMS: time.Now().UnixMilli(), Entries: []archiveEntry{entry}, Published: &binding}
 	id := entry.Item.InputSHA256
+	if resume {
+		// A stable manifest makes even a partial manifest.pending recoverable.
+		// This is a copy timestamp bound, never a re-dating of the customer bill.
+		m.AsOfMS = max(binding.PublishedAt*1000, entry.Tasks[0].Task.UpdatedAtMS)
+		raw, err := json.Marshal(m)
+		if err != nil || len(raw) > archiveManifestLimit {
+			return ArchiveReceipt{}, ErrGenerationIntegrity
+		}
+		expected := map[string][]byte{id + ".plan": saved.planRaw, id + ".preparation": saved.inputRaw, id + ".artifact": saved.artifact, "manifest.pending": raw}
+		if err := validatePublishedArchivePrefixes(ctx, root, names, expected); err != nil {
+			return ArchiveReceipt{}, err
+		}
+	}
 	for _, p := range []struct {
 		suffix string
 		raw    []byte
 	}{{"plan", saved.planRaw}, {"preparation", saved.inputRaw}, {"artifact", saved.artifact}} {
-		if err := writeArchiveFile(ctx, root, id+"."+p.suffix, p.raw); err != nil {
+		writer := writeFile
+		if resume {
+			writer = func(ctx context.Context, root *os.Root, name string, raw []byte) error {
+				return resumePublishedArchiveFile(ctx, root, name, raw, writeFile)
+			}
+		}
+		if err := writer(ctx, root, id+"."+p.suffix, p.raw); err != nil {
 			return ArchiveReceipt{}, err
 		}
 	}
@@ -287,7 +321,13 @@ func (g *Generation) CopyPublishedGenerationArchive(parent context.Context, main
 	if err != nil || len(raw) > archiveManifestLimit {
 		return ArchiveReceipt{}, ErrGenerationCapacity
 	}
-	if err := writeArchiveFile(ctx, root, "manifest.pending", raw); err != nil {
+	writer := writeFile
+	if resume {
+		writer = func(ctx context.Context, root *os.Root, name string, raw []byte) error {
+			return resumePublishedArchiveFile(ctx, root, name, raw, writeFile)
+		}
+	}
+	if err := writer(ctx, root, "manifest.pending", raw); err != nil {
 		return ArchiveReceipt{}, err
 	}
 	receipt, err := verifyArchive(ctx, root, "manifest.pending", generationHash(raw))

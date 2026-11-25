@@ -196,6 +196,8 @@ jobs:
           touch monitor/ci-local-config.json
           touch internal/metering/ci-probe_test.go
           touch internal/metering/ci-local-config.json
+          touch internal/localresource/ci-probe_test.go
+          touch internal/localresource/ci-local-config.json
           touch internal/observability/ci-probe_test.go
           touch internal/observability/ci-local-config.json
           touch internal/observability/schema/ci-local-config.json
@@ -211,6 +213,7 @@ jobs:
             test -e /context/cmd/hostagent/main.go &&
             test -e /context/cmd/nginxcollector/main.go &&
             test -e /context/internal/metering/field.go &&
+            test -e /context/internal/localresource/errors.go &&
             test -e /context/internal/observability/contract.go &&
             test -e /context/internal/observability/identifiers.go &&
             test -e /context/internal/observability/metrics.go &&
@@ -246,6 +249,8 @@ jobs:
             test ! -e /context/monitor/ci-local-config.json &&
             test ! -e /context/internal/metering/ci-probe_test.go &&
             test ! -e /context/internal/metering/ci-local-config.json &&
+            test ! -e /context/internal/localresource/ci-probe_test.go &&
+            test ! -e /context/internal/localresource/ci-local-config.json &&
             test ! -e /context/internal/observability/ci-probe_test.go &&
             test ! -e /context/internal/observability/ci-local-config.json &&
             test ! -e /context/internal/observability/schema/ci-local-config.json &&

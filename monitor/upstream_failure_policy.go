@@ -44,7 +44,7 @@ func upstreamNeedsRecoveryProbe(status string, failures int) bool {
 // yields and database contention do not consume the upstream incident budget.
 func boundUpstreamFailure(err error, now int64, failures *int, status *string, next *int64) {
 	var circuit *upstreamCircuitOpenError
-	if isUpstreamUsageLocalStoreBusy(err) || isUpstreamLocalQueueTimeout(err) || errors.As(err, &circuit) {
+	if localResourceTemporarilyUnavailable(err) || isUpstreamUsageLocalStoreBusy(err) || isUpstreamLocalQueueTimeout(err) || errors.As(err, &circuit) {
 		*failures = max(0, *failures-1)
 		return
 	}
@@ -124,7 +124,7 @@ func upstreamProbeBeforeRetry(ctx context.Context, m *Monitor, row ChannelUpstre
 // The account keeps its last status and error and is simply retried later, so
 // the console shows only problems that need attention.
 func upstreamPauseRetryAt(err error, now int64) (int64, bool) {
-	if isUpstreamUsageLocalStoreBusy(err) || isUpstreamLocalQueueTimeout(err) {
+	if localResourceTemporarilyUnavailable(err) || isUpstreamUsageLocalStoreBusy(err) || isUpstreamLocalQueueTimeout(err) {
 		return now + int64(upstreamUsageLocalStoreRetryDelays[0]/time.Second), true
 	}
 	var circuit *upstreamCircuitOpenError
@@ -147,7 +147,7 @@ func upstreamSyncYieldReason(err error) (string, bool) {
 		return stored.yield, true
 	case isUpstreamLocalQueueTimeout(err):
 		return "本地排队等待请求名额超时，未请求上游", true
-	case isUpstreamUsageLocalStoreBusy(err):
+	case localResourceTemporarilyUnavailable(err), isUpstreamUsageLocalStoreBusy(err):
 		return "本地数据库繁忙", true
 	case errors.As(err, &circuit):
 		return "该上游主机处于熔断冷却期", true

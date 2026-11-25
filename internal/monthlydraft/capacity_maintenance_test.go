@@ -418,10 +418,10 @@ func TestCapacityMaintenanceBusyCooldownIsBoundedAndCannotMultiplyCopies(t *test
 					return
 				}
 			}
-			if !m.paused.Load() {
-				t.Fatal("third contention did not stop")
+			if m.paused.Load() {
+				t.Fatal("temporary contention permanently paused maintenance")
 			}
-			if _, err := m.step(t.Context()); !errors.Is(err, ErrGenerationCapacity) {
+			if _, err := m.step(t.Context()); !errors.Is(err, ErrGenerationBusy) {
 				t.Fatal(err)
 			}
 			if n, b, err := m.inventory(t.Context()); err != nil || n != 1 || b != 0 {
@@ -429,6 +429,12 @@ func TestCapacityMaintenanceBusyCooldownIsBoundedAndCannotMultiplyCopies(t *test
 			}
 			if evictionCount(t, f.g.receiver, "portal_monthly_generation_inputs") != 1 {
 				t.Fatal("contention released hot input")
+			}
+			<-archiveSlots
+			held = false
+			m.retryAt = time.Now().Add(-time.Second)
+			if worked, err := m.step(t.Context()); err != nil || !worked || m.paused.Load() {
+				t.Fatal("did not recover after third busy turn without restart", worked, err)
 			}
 		})
 	}

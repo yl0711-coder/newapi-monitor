@@ -929,25 +929,11 @@ func (m *Monitor) reconcileUsageFactHistoryJobs(ctx context.Context, now time.Ti
 					existing.LastError = ""
 					existingChanged = true
 				}
-				// One durable job owns a member revision for its whole lifetime.
-				// Hourly target movement extends that job instead of creating a
-				// second active cursor for the same user.
-				if target > existing.ThroughTs {
-					existing.ThroughTs = target
-					if existing.FromTs > 0 {
-						existing.TotalHours = max(target-existing.FromTs, 0) / usageFactHourSeconds
-					}
-					if existing.Status == usageFactHistoryJobComplete {
-						existing.Status = usageFactHistoryJobQueued
-						existing.CompletedAt = 0
-						existing.Kind = usageFactHistoryKindTail
-						existing.NextHour = max(existing.NextHour, tail)
-						if usageFactDayStart(existing.NextHour) == existing.NextHour && existing.NextHour < usageFactDayStart(target) {
-							existing.Kind = usageFactHistoryKindBackfill
-						}
-					}
-					existingChanged = true
+				recovered, recoverErr := m.reconcileUsageFactJobProgress(tx, state, &existing, target, tail, resetRequired)
+				if recoverErr != nil {
+					return recoverErr
 				}
+				existingChanged = existingChanged || recovered
 				if existingChanged {
 					existing.UpdatedAt = nowUnix
 					if err := tx.Save(&existing).Error; err != nil {
@@ -1191,7 +1177,8 @@ func (m *Monitor) releaseUsageFactHistoryClaim(ctx context.Context, claim usageF
 		for _, job := range current {
 			job.Status = usageFactHistoryJobQueued
 			job.LeaseOwner, job.LeaseUntil = "", 0
-			if !immediate {
+			resourceWait := localResourceTemporarilyUnavailable(cause)
+			if !immediate && !resourceWait {
 				job.Attempts++
 				job.LastError = message
 			}
@@ -1200,7 +1187,11 @@ func (m *Monitor) releaseUsageFactHistoryClaim(ctx context.Context, claim usageF
 			if !immediate {
 				job.NextRetryAt = usageFactHistoryRetryAt(now, job.Attempts)
 			}
-			if job.Attempts >= 5 && !immediate {
+			if resourceWait {
+				job.LastError = message
+				job.NextRetryAt = now.Add(time.Minute).Unix()
+			}
+			if job.Attempts >= 5 && !immediate && !resourceWait {
 				job.Status = usageFactHistoryJobPaused
 			}
 			if err := tx.Save(&job).Error; err != nil {
@@ -1209,7 +1200,7 @@ func (m *Monitor) releaseUsageFactHistoryClaim(ctx context.Context, claim usageF
 			maintenanceJob := job.Kind == usageFactHistoryKindRepair || job.Kind == usageFactHistoryKindRepairHour ||
 				job.Kind == usageFactHistoryKindLocalAudit || job.Kind == usageFactHistoryKindSourceAudit ||
 				job.Kind == usageFactHistoryKindRecentAudit || job.Kind == usageFactHistoryKindAuditHour
-			if job.UserID != nil && !immediate && !maintenanceJob {
+			if job.UserID != nil && !immediate && !maintenanceJob && !resourceWait {
 				updates := map[string]any{"last_failure_at": now.Unix(), "last_error": message, "updated_at": now.Unix()}
 				if job.Status == usageFactHistoryJobPaused {
 					updates["coverage_status"] = "failed"
@@ -1968,7 +1959,32 @@ func auditUsageFactRecentServiceRange(db *gorm.DB, state UsageFactMemberState, t
 	// staging. Audit the same hybrid representation that the read path serves.
 	// Requiring every recent hour to remain staged would permanently hide a
 	// correctly repaired member until its entire cold archive completed.
-	return auditUsageFactFullHistoryDayRange(db, state, *state.LiveFromHour, through)
+	from := *state.LiveFromHour
+	if state.SourceHistoryStatus == "no_history" {
+		if err := auditUsageFactKnownEmptyRange(db, state.UserID, from, through); err != nil {
+			return err
+		}
+		// Empty historical days need no invented day proofs. Today's closed
+		// hours still require the live lane's exact epoch and content proofs.
+		return auditUsageFactTrailingHoursForEpoch(db, max(from, usageFactDayStart(through)), through, []int64{state.UserID}, state.SourceEpoch)
+	}
+	if state.SourceHistoryStatus != "complete_hot" || state.SourceFirstLogHour == nil {
+		// Older or repaired states may already have a complete strict proof
+		// for the entire range without a source first-log hint. Preserve that
+		// path, but never infer an empty prefix without a source boundary.
+		return auditUsageFactFullHistoryDayRange(db, state, from, through)
+	}
+	// The source boundary, not an absent local row, proves this prefix empty.
+	// Keep the remaining range strict: unlike an old published snapshot, a
+	// new recent publication must not accept proofs being refreshed.
+	if from < *state.SourceFirstLogHour {
+		prefixThrough := min(through, *state.SourceFirstLogHour)
+		if err := auditUsageFactKnownEmptyRange(db, state.UserID, from, prefixThrough); err != nil {
+			return err
+		}
+		from = prefixThrough
+	}
+	return auditUsageFactFullHistoryDayRange(db, state, from, through)
 }
 
 func auditUsageFactFullHistoryDayRange(db *gorm.DB, state UsageFactMemberState, start, end int64) error {
@@ -2060,6 +2076,22 @@ func auditUsageFactFullHistoryDayRangeWithRefresh(db *gorm.DB, state UsageFactMe
 	return nil
 }
 
+// Only the current day's intraday suffix can be adopted from the independent
+// raw live lane. Do not let it certify an unverified natural day or a gap in
+// the history cursor, and never trust the cursor without auditing the facts.
+func usageFactRawVerifyCanBorrowLiveTail(state UsageFactMemberState, job UsageFactJob) bool {
+	day := usageFactDayStart(job.ThroughTs)
+	return day > 0 && job.VerifyNextHour == day && job.ThroughTs > day &&
+		state.CoverageThroughHour != nil && *state.CoverageThroughHour >= day &&
+		state.VerifiedThroughHour != nil && *state.VerifiedThroughHour >= day &&
+		state.TailThroughHour != nil && *state.TailThroughHour >= day && *state.TailThroughHour < job.ThroughTs
+}
+
+func usageFactRawLiveCoversVerify(state UsageFactMemberState, job UsageFactJob) bool {
+	return state.LiveFromHour != nil && *state.LiveFromHour > 0 && *state.LiveFromHour <= job.VerifyNextHour &&
+		state.LiveThroughHour != nil && *state.LiveThroughHour >= job.ThroughTs
+}
+
 func (m *Monitor) executeUsageFactHistoryVerify(ctx context.Context, claim usageFactHistoryClaim, now time.Time) error {
 	_, revisions, err := usageFactHistoryClaimIDs(claim)
 	if err != nil {
@@ -2072,11 +2104,8 @@ func (m *Monitor) executeUsageFactHistoryVerify(ctx context.Context, claim usage
 		return err
 	}
 	epoch := strings.TrimSpace(m.cfg.UsageFactsHistorySourceEpoch)
-	type verificationResult struct {
-		state UsageFactMemberState
-		err   error
-	}
-	results := make(map[int64]verificationResult, len(claim.Jobs))
+
+	results := make(map[int64]usageFactVerificationResult, len(claim.Jobs))
 	// Keep the local audit and checkpoint commit in one write-serialization
 	// epoch. Tail/repair cannot mutate a verified day between the hash read and
 	// the durable cursor update.
@@ -2089,48 +2118,7 @@ func (m *Monitor) executeUsageFactHistoryVerify(ctx context.Context, claim usage
 	}()
 	db := m.usageFactsStore().WithContext(ctx)
 	for _, claimed := range claim.Jobs {
-		id := *claimed.UserID
-		if currentErr := m.usageFactJobRevisionCurrent(ctx, claimed); currentErr != nil {
-			results[id] = verificationResult{err: currentErr}
-			continue
-		}
-		var state UsageFactMemberState
-		if loadErr := db.First(&state, "user_id = ?", id).Error; loadErr != nil {
-			results[id] = verificationResult{err: loadErr}
-			continue
-		}
-		if !state.Active || state.TrackedRevision != revisions[id] || state.SourceEpoch != epoch ||
-			state.ClassificationVersion != userTrafficClassificationVersion ||
-			state.QuerySemanticsVersion != usageFactQuerySemanticsVersion {
-			results[id] = verificationResult{state: state, err: fmt.Errorf("%w: verify state changed user_id=%d", errUsageMemberControlIntegrity, id)}
-			continue
-		}
-		verifyFrom := claim.From
-		verifyThrough := min(claim.Through, usageFactDayStart(claimed.ThroughTs))
-		verifyErr := error(nil)
-		if state.SourceFloorHour == nil {
-			verifyErr = fmt.Errorf("full-history source floor missing user=%d", id)
-		} else if state.SourceHistoryStatus == "no_history" {
-			verifyThrough = usageFactDayStart(claimed.ThroughTs)
-			verifyErr = auditUsageFactKnownEmptyRange(db, id, *state.SourceFloorHour, claimed.ThroughTs)
-		} else if state.SourceFirstLogHour == nil {
-			verifyErr = fmt.Errorf("full-history first-log boundary missing user=%d", id)
-		} else {
-			if verifyFrom < *state.SourceFirstLogHour {
-				verifyFrom = *state.SourceFirstLogHour
-			}
-			if claimed.VerifyNextHour == *state.SourceFirstLogHour {
-				verifyErr = auditUsageFactKnownEmptyRange(db, id, *state.SourceFloorHour, *state.SourceFirstLogHour)
-			}
-			if verifyErr == nil {
-				verifyErr = auditUsageFactFullHistoryDayRange(db, state, verifyFrom, verifyThrough)
-			}
-		}
-		if verifyErr == nil && state.SourceHistoryStatus != "no_history" &&
-			verifyThrough >= usageFactDayStart(claimed.ThroughTs) && usageFactDayStart(claimed.ThroughTs) < claimed.ThroughTs {
-			verifyErr = auditUsageFactTrailingHoursForEpoch(db, usageFactDayStart(claimed.ThroughTs), claimed.ThroughTs, []int64{id}, epoch)
-		}
-		results[id] = verificationResult{state: state, err: verifyErr}
+		results[*claimed.UserID] = m.auditUsageFactClaimedMember(ctx, db, claim, claimed, revisions[*claimed.UserID], epoch)
 	}
 
 	nowUnix := time.Now().Unix()
@@ -2145,6 +2133,19 @@ func (m *Monitor) executeUsageFactHistoryVerify(ctx context.Context, claim usage
 			if job.Kind != usageFactHistoryKindVerify || job.VerifyNextHour != claim.From ||
 				job.TrackedRevision != revisions[id] || job.SourceEpoch != epoch {
 				return fmt.Errorf("%w: verify cursor changed user_id=%d", errUsageMemberControlIntegrity, id)
+			}
+			if result.waitForLive || usageFactLocalAuditResourceWait(result.err) || result.useLiveTail && job.ThroughTs != claimed.ThroughTs {
+				// The raw lane still owns the missing hour, or the target has
+				// moved beyond what this claim checked. Yield without charging
+				// a data-integrity failure or rewinding either cursor.
+				job.Status = usageFactHistoryJobQueued
+				job.LeaseOwner, job.LeaseUntil = "", 0
+				job.NextRetryAt = now.Add(time.Minute).Unix()
+				job.HeartbeatAt, job.UpdatedAt = nowUnix, nowUnix
+				if saveErr := tx.Save(&job).Error; saveErr != nil {
+					return saveErr
+				}
+				continue
 			}
 			if result.err != nil {
 				job.Attempts++
@@ -2175,13 +2176,21 @@ func (m *Monitor) executeUsageFactHistoryVerify(ctx context.Context, claim usage
 			job.HeartbeatAt, job.UpdatedAt = nowUnix, nowUnix
 			updates := map[string]any{"verify_next_hour": next, "verified_through_hour": next,
 				"verification_status": "running", "coverage_status": "verifying", "last_error": "", "updated_at": nowUnix}
-			if next >= dayTarget && result.state.TailThroughHour != nil && *result.state.TailThroughHour >= job.ThroughTs {
+			if next >= dayTarget && (result.useLiveTail ||
+				result.state.TailThroughHour != nil && *result.state.TailThroughHour >= job.ThroughTs) {
 				job.Status = usageFactHistoryJobComplete
 				job.CompletedAt = nowUnix
 				updates["verification_status"] = "complete"
 				updates["coverage_status"] = "ready"
 				updates["verified_at"] = nowUnix
 				updates["last_success_at"] = nowUnix
+				if result.useLiveTail {
+					// The current source's exact local hourly proofs were audited
+					// above. Preserve a continuous durable cursor for the next job.
+					job.NextHour = max(job.NextHour, job.ThroughTs)
+					job.CompletedHours = max(job.NextHour-job.FromTs, 0) / usageFactHourSeconds
+					updates["tail_through_hour"] = job.ThroughTs
+				}
 			}
 			if saveErr := tx.Save(&job).Error; saveErr != nil {
 				return saveErr

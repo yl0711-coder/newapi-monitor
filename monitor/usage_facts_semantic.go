@@ -268,6 +268,8 @@ func auditUsageFactTrailingHoursForEpoch(db *gorm.DB, start, end int64, ids []in
 	return auditUsageFactTrailingHoursForEpochWithRefresh(db, start, end, ids, epoch, false)
 }
 
+const usageFactMissingEpochHoursPrefix = "当前来源 epoch 小时证明不完整:"
+
 func auditUsageFactTrailingHoursForEpochWithRefresh(db *gorm.DB, start, end int64, ids []int64, epoch string, allowRefreshing bool) error {
 	if start >= end {
 		return nil
@@ -288,7 +290,7 @@ func auditUsageFactTrailingHoursForEpochWithRefresh(db *gorm.DB, start, end int6
 	}
 	want := ((end - start) / usageFactHourSeconds) * int64(len(ids))
 	if complete != want {
-		return fmt.Errorf("当前来源 epoch 小时证明不完整: got=%d want=%d", complete, want)
+		return fmt.Errorf("%s got=%d want=%d", usageFactMissingEpochHoursPrefix, complete, want)
 	}
 	return auditUsageFactTrailingHoursWithRefresh(db, start, end, ids, allowRefreshing)
 }
