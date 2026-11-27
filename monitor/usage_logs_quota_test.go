@@ -328,7 +328,7 @@ func TestUsageLogsQuotaStatementSnapshotSeesConcurrentInsertOnNextRead(t *testin
 	if e != nil {
 		t.Fatal(e)
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 	var snapshotCount int
 	if e := tx.QueryRow("SELECT COUNT(*) FROM logs").Scan(&snapshotCount); e != nil {
 		t.Fatal(e)

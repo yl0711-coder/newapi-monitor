@@ -3,7 +3,6 @@ package monitor
 import (
 	"bytes"
 	"context"
-	"fmt"
 	"os"
 	"os/exec"
 	"strconv"
@@ -120,7 +119,7 @@ func usageLogsSyntheticBind(t *testing.T, q string, args []any) string {
 		case int64:
 			value = strconv.FormatInt(v, 10)
 		default:
-			t.Fatal(fmt.Sprintf("unsupported synthetic argument %T", arg))
+			t.Fatalf("unsupported synthetic argument %T", arg)
 		}
 		q = strings.Replace(q, "?", value, 1)
 	}

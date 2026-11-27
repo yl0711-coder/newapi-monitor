@@ -389,7 +389,7 @@ func TestFundingMonthHeadsBatchOrderShapeAndCancellation(t *testing.T) {
 				for {
 					v := make([]driver.Value, len(out.columns))
 					err := in.Next(v)
-					if err == io.EOF {
+					if errors.Is(err, io.EOF) {
 						break
 					}
 					if err != nil {

@@ -10,6 +10,12 @@ import (
 
 func priorV67MigrationPlanForTest(t *testing.T, plan string) string {
 	t.Helper()
+	// This release adds an index-only v69 layer. The tests below still need
+	// their exact v67 ancestors, not a stale literal pretending to be current.
+	const v69 = "main-facts-schema-20261126-v69-finance-gift-boundary-range-from-v68-"
+	if strings.HasPrefix(plan, v69) {
+		plan = "main-facts-schema-20261125-v68-" + strings.TrimPrefix(plan, v69)
+	}
 	const current = "main-facts-schema-20261125-v68-upstream-acquisition-orion-checkpoint-log-pace-from-v67-"
 	if !strings.HasPrefix(plan, current) {
 		t.Fatal("upstream acquisition schema must advance both v67 plan families")

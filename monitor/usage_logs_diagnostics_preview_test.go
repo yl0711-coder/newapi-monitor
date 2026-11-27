@@ -3,6 +3,7 @@ package monitor
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -112,7 +113,7 @@ func TestUsageLogsDiagnosticPreview(t *testing.T) {
 	t.Log("Synthetic data only: 30 normal consumes, 4 consumes with rejection reasons, 2 API errors. No workers/notifications/external sources; expires after 8 hours.")
 	select {
 	case err := <-done:
-		if err != nil && err != http.ErrServerClosed {
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
 			t.Fatal(err)
 		}
 	case <-time.After(8 * time.Hour):

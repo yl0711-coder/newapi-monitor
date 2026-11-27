@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"os"
 	"reflect"
 	"strings"
@@ -69,7 +70,7 @@ func TestSQLAuditTaskLoadAllowedColumns(t *testing.T) {
 	if err != nil || !reflect.DeepEqual(byID, byKey) {
 		t.Fatal("exact key changed record", err)
 	}
-	if _, err = load(t.Context(), r, "arbitrary_column", job.ID); err != ErrInvalid || len(r.queries) != 2 {
+	if _, err = load(t.Context(), r, "arbitrary_column", job.ID); !errors.Is(err, ErrInvalid) || len(r.queries) != 2 {
 		t.Fatal("invalid dynamic column queried")
 	}
 	for _, p := range r.plans {

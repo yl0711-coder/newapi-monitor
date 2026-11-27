@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"fmt"
 	"os"
 	"os/exec"
 	"strings"
@@ -85,5 +84,5 @@ func TestSQLAuditDerivedMySQLPlans(t *testing.T) {
 	if err = os.WriteFile("../docs/sql-audit-20261126/mysql-plans-derived-isolated.json", append(b, '\n'), 0600); err != nil {
 		t.Fatal(err)
 	}
-	t.Log(fmt.Sprintf("isolated derived plans=%d; no production source used", len(results)))
+	t.Logf("isolated derived plans=%d; no production source used", len(results))
 }

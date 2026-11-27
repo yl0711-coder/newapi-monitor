@@ -8,7 +8,6 @@ import (
 	"net/http/httptest"
 	"os"
 	"reflect"
-	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -287,10 +286,4 @@ SELECT printf('d%03d',n/200),n%200+1,?,100+(n%200)/2,1,'synthetic' FROM seq`, sn
 		Warning string
 		Results []observation
 	}{"40k synthetic rows, identical full persisted record/error, 7 alternating in-memory samples. Existing indexes; no production scale/p95 claim.", results})
-}
-
-func sqlScaleMedian(a []int64) int64 {
-	b := append([]int64(nil), a...)
-	sort.Slice(b, func(i, j int) bool { return b[i] < b[j] })
-	return b[len(b)/2]
 }

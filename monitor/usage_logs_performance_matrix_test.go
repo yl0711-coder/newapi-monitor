@@ -15,29 +15,6 @@ import (
 	"testing"
 )
 
-func usageCountSelectiveProbeCandidate(t *testing.T, f usageLogFilter, w *usageLogWhere) (string, []any) {
-	t.Helper()
-	span, args := usageLogsAggregateSpanSQL(f, w, "COUNT(*)")
-	span = strings.TrimPrefix(span, usageLogsSelect)
-	// An uncorrelated aggregate-derived table can be evaluated by MySQL even
-	// when its surrounding CASE arm is not chosen. Gate the source scan too.
-	bound := "WHERE created_at>=? AND created_at<=?) AS bounds"
-	if strings.Count(span, bound) != 1 {
-		t.Fatal("boundary template changed")
-	}
-	span = strings.Replace(span, bound, "WHERE created_at>=? AND created_at<=? AND gate.n>256) AS bounds", 1)
-	// The small username probe is planning evidence only: either final branch
-	// still computes the exact original predicate, without a result row limit.
-	q := usageLogsSelect + `CASE WHEN gate.n<=256 THEN
- (SELECT COUNT(*) FROM logs` + w.sql() + `)
- ELSE (SELECT ` + span + `) END AS quota
- FROM (SELECT COUNT(*) AS n FROM
- (SELECT id FROM logs FORCE INDEX(idx_logs_username) WHERE username=? LIMIT 257) AS planning_probe) AS gate`
-	all := append([]any{}, w.args...)
-	all = append(all, args...)
-	return q, append(all, f.Username)
-}
-
 func usageSpanInlineFallbackCandidate(t *testing.T, f usageLogFilter, w *usageLogWhere, expression string) (string, []any) {
 	t.Helper()
 	q, args := usageLogsAggregateSpanSQL(f, w, expression)

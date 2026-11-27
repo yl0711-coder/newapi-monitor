@@ -3,7 +3,11 @@ package monitor
 import (
 	"database/sql"
 	"encoding/json"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -11,8 +15,37 @@ import (
 	"gorm.io/gorm"
 )
 
-// Resolve only the two explicitly missing Monitor-owned schemas from the
-// earlier static report. Migrate actual models in memory, not invented tables.
+// Resolve the two Monitor-owned schemas from actual current source statements.
+// A clean checkout needs no private capture report or production-derived file.
+func sqlAuditSourceStatement(t *testing.T, file, table string) string {
+	t.Helper()
+	f, err := parser.ParseFile(token.NewFileSet(), "../"+file, nil, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var statements []string
+	ast.Inspect(f, func(n ast.Node) bool {
+		literal, ok := n.(*ast.BasicLit)
+		if !ok || literal.Kind != token.STRING {
+			return true
+		}
+		s, err := strconv.Unquote(literal.Value)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(s, "FROM "+table+" ") || strings.Contains(s, "FROM "+table+"\n") {
+			statements = append(statements, s)
+		}
+		return true
+	})
+	if len(statements) != 1 {
+		t.Fatalf("expected one current statement for %s, got %d", table, len(statements))
+	}
+	return statements[0]
+}
+
+// Migrate actual models in memory, not invented tables. Keep the exact source
+// SQL, key plan and no-redundant-sort checks from the original audit.
 func TestSQLAuditMissingMonitorSchemas(t *testing.T) {
 	db, err := sql.Open("sqlite", ":memory:")
 	if err != nil {
@@ -27,25 +60,16 @@ func TestSQLAuditMissingMonitorSchemas(t *testing.T) {
 	if err = g.AutoMigrate(&PortalMonthlyBill{}, &UsageUserSnapshot{}); err != nil {
 		t.Fatal(err)
 	}
-	raw, err := os.ReadFile("../docs/sql-audit-20261126/internal-static-plans-20261127.json")
-	if err != nil {
-		t.Fatal(err)
-	}
-	var old struct {
-		Entries []struct {
-			File string `json:"file"`
-			SQL  string `json:"source_sql"`
-		}
-	}
-	if err = json.Unmarshal(raw, &old); err != nil {
-		t.Fatal(err)
+	items := []struct{ File, SQL string }{
+		{File: "internal/monthlydraft/published_archive.go", SQL: sqlAuditSourceStatement(t, "internal/monthlydraft/published_archive.go", "portal_monthly_bills")},
+		{File: "internal/monthlysource/snapshot_selection.go", SQL: sqlAuditSourceStatement(t, "internal/monthlysource/snapshot_selection.go", "main.usage_user_snapshots")},
 	}
 	type result struct {
 		File, SQL, Status string
 		Plan              []string
 	}
 	var results []result
-	for _, item := range old.Entries {
+	for _, item := range items {
 		var args []any
 		switch item.File {
 		case "internal/monthlydraft/published_archive.go":
@@ -92,7 +116,7 @@ func TestSQLAuditMissingMonitorSchemas(t *testing.T) {
 	if len(results) != 2 {
 		t.Fatalf("missing or duplicate schema cases: %d", len(results))
 	}
-	raw, err = json.MarshalIndent(struct {
+	raw, err := json.MarshalIndent(struct {
 		Warning string
 		Results []result
 	}{"Actual current Monitor models and exact current SQL, in-memory SQLite EXPLAIN only. No published bill read, business function execution or production latency claim.", results}, "", "  ")

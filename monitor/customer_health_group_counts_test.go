@@ -42,7 +42,7 @@ func TestHealthGroupCountsFaultsNeverReturnPartialList(t *testing.T) {
 					if tx.Statement.Table == "customer_health_members" {
 						calls++
 						if calls == 2 {
-							tx.AddError(errors.New("synthetic second batch failure"))
+							_ = tx.AddError(errors.New("synthetic second batch failure"))
 						}
 					}
 				}); err != nil {

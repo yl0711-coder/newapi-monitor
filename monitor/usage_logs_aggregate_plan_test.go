@@ -201,7 +201,7 @@ type usagePlanningFaultRows struct {
 }
 
 func (d usagePlanningFaultMySQLDriver) Open(string) (driver.Conn, error) {
-	return usagePlanningFaultConn{d.mode}, nil
+	return usagePlanningFaultConn(d), nil
 }
 func (c usagePlanningFaultConn) Prepare(string) (driver.Stmt, error) {
 	return nil, errors.New("unexpected prepare")

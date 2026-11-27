@@ -84,7 +84,7 @@ func TestSQLAuditUsageMonthDynamicBatch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 	for _, n := range []int{1, 64} {
 		used := 0
 		got, err := loadUsageMonthBatch(ctx, tx, versions[:n], &used)

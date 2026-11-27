@@ -89,7 +89,11 @@ func TestReplicaTokenAndFRTAggregatesParseOnce(t *testing.T) {
 			}
 			// The giant payload and columns unrelated to each aggregate should
 			// not be copied into the materialized temporary table.
-			inner := tc.optimized[strings.Index(tc.optimized, "\nFROM ("):]
+			projectionAt := strings.Index(tc.optimized, "\nFROM (")
+			if projectionAt < 0 {
+				t.Fatal("derived projection missing")
+			}
+			inner := tc.optimized[projectionAt:]
 			if strings.Contains(inner, "SELECT "+logsAggregateSourceColumns) || strings.Contains(inner, "SELECT *") {
 				t.Fatal("aggregate projection widened")
 			}

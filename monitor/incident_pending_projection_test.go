@@ -11,7 +11,7 @@ import (
 )
 
 // Frozen complete-row reads, independent of the new projection helper.
-func legacyIncidentPendingRead(m *Monitor, ctx context.Context, id string) (bool, string, error) {
+func legacyIncidentPendingRead(ctx context.Context, m *Monitor, id string) (bool, string, error) {
 	var summary IncidentPendingSummary
 	res := m.storeDB.WithContext(ctx).Where("incident_id = ?", id).Limit(1).Find(&summary)
 	if res.Error != nil {
@@ -63,7 +63,7 @@ func TestSQLAuditIncidentPendingProjection(t *testing.T) {
 	}
 	var results []observation
 	for _, id := range []string{"summary", "fallback", "window-only", "clear", "absent"} {
-		want, reason, err := legacyIncidentPendingRead(m, context.Background(), id)
+		want, reason, err := legacyIncidentPendingRead(context.Background(), m, id)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -79,12 +79,12 @@ func TestSQLAuditIncidentPendingProjection(t *testing.T) {
 				}
 				read := legacyIncidentPendingRead
 				if i == 1 {
-					read = func(m *Monitor, ctx context.Context, id string) (bool, string, error) {
+					read = func(ctx context.Context, m *Monitor, id string) (bool, string, error) {
 						return m.incidentScenarioPendingByID(ctx, id)
 					}
 				}
 				at := time.Now()
-				got, why, err := read(m, context.Background(), id)
+				got, why, err := read(context.Background(), m, id)
 				us := time.Since(at).Microseconds()
 				if err != nil || got != want || why != reason {
 					t.Fatal("pending state or exact reason changed", id, got, why, err)
