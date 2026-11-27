@@ -29,6 +29,7 @@ func enableTestNginxEvidence(t *testing.T, m *Monitor) {
 	if err := m.openNginxEvidenceStore(); err != nil {
 		t.Fatal(err)
 	}
+	attachSQLAuditFixture(t, m)
 	t.Cleanup(func() {
 		if db, err := m.nginxEvidenceDB.DB(); err == nil {
 			_ = db.Close()

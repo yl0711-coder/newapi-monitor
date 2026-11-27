@@ -89,6 +89,13 @@ func newSimpleReplicaSource(db *sql.DB) *simpleReplicaSource {
 
 const simpleWeek = 7 * 86400
 
+// Funding is collected completely (no LIMIT), deduplicated by immutable log
+// identity and canonically sorted below before publication. Sorting each
+// source read adds a filesort without selecting or ordering the final output.
+// Keep every predicate, projection, source index and execution budget intact.
+const simpleMemberFundingSQL = "SELECT /*+ MAX_EXECUTION_TIME(15000) */ id, user_id, created_at, type, COALESCE(content,''), COALESCE(other,'') FROM logs FORCE INDEX (idx_user_created_type) WHERE user_id = ? AND created_at >= ? AND type IN (1,3,4)"
+const simpleAdminFundingSQL = "SELECT /*+ MAX_EXECUTION_TIME(15000) */ id, user_id, created_at, type, COALESCE(content,''), COALESCE(other,'') FROM logs FORCE INDEX (idx_created_at_type) WHERE created_at >= ? AND created_at < ? AND type = 3"
+
 // simpleWeekStart aligns t to a fixed weekly grid (Mondays 00:00 CST) so all
 // organizations share the same cached windows.
 func simpleWeekStart(t int64) int64 {
@@ -229,7 +236,7 @@ func (s *simpleReplicaSource) Snapshot(ctx context.Context, ids []int64, funding
 		}
 	}
 	for _, id := range ids {
-		list, err := fetch("SELECT /*+ MAX_EXECUTION_TIME(15000) */ id, user_id, created_at, type, COALESCE(content,''), COALESCE(other,'') FROM logs FORCE INDEX (idx_user_created_type) WHERE user_id = ? AND created_at >= ? AND type IN (1,3,4) ORDER BY id", id, fundingFrom)
+		list, err := fetch(simpleMemberFundingSQL, id, fundingFrom)
 		if err != nil {
 			return out, fmt.Errorf("funding rows: %w", err)
 		}
@@ -247,7 +254,7 @@ func (s *simpleReplicaSource) Snapshot(ctx context.Context, ids []int64, funding
 		s.adminMu.Unlock()
 		if !cached {
 			var err error
-			list, err = fetch("SELECT /*+ MAX_EXECUTION_TIME(15000) */ id, user_id, created_at, type, COALESCE(content,''), COALESCE(other,'') FROM logs FORCE INDEX (idx_created_at_type) WHERE created_at >= ? AND created_at < ? AND type = 3 ORDER BY id", from, to)
+			list, err = fetch(simpleAdminFundingSQL, from, to)
 			if err != nil {
 				return out, fmt.Errorf("admin funding rows: %w", err)
 			}

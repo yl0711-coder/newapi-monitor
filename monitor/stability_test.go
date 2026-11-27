@@ -21,6 +21,7 @@ func newStabilityTestMonitor(t *testing.T) *Monitor {
 	if err := m.openStore(t.TempDir() + "/stability.db"); err != nil {
 		t.Fatalf("openStore: %v", err)
 	}
+	attachSQLAuditFixture(t, m)
 	return m
 }
 

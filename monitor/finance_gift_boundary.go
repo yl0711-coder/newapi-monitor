@@ -35,8 +35,8 @@ type FinanceGiftBoundaryEvent struct {
 
 type FinanceGiftBoundaryState struct {
 	SourceEpoch   string `gorm:"primaryKey;size:64;column:source_epoch"`
-	HourTs        int64  `gorm:"primaryKey;autoIncrement:false;column:hour_ts"`
-	UserID        int64  `gorm:"primaryKey;autoIncrement:false;column:user_id"`
+	HourTs        int64  `gorm:"primaryKey;autoIncrement:false;index:idx_finance_gift_state_hour_user,priority:1;column:hour_ts"`
+	UserID        int64  `gorm:"primaryKey;autoIncrement:false;index:idx_finance_gift_state_hour_user,priority:2;column:user_id"`
 	Status        string `gorm:"size:16;index;column:status"`
 	Rows          int64  `gorm:"column:rows"`
 	Requests      int64  `gorm:"column:requests"`
@@ -53,7 +53,7 @@ func financeGiftBoundarySQL(userCount int) (string, error) {
 		return "", errors.New("invalid gift boundary user count")
 	}
 	placeholders := strings.TrimSuffix(strings.Repeat("?,", userCount), ",")
-	return fmt.Sprintf("SELECT id,user_id,created_at,type,quota,`group`\n"+`
+	return fmt.Sprintf("SELECT /*+ MAX_EXECUTION_TIME(8000) */ id,user_id,created_at,type,quota,`group`\n"+`
 FROM logs WHERE created_at>=? AND created_at<? AND type IN (2,6)
   AND user_id IN (%s) AND NOT (%s)
 ORDER BY created_at,id LIMIT %d`, placeholders, channelTestLogPredicateSQL(), financeGiftBoundaryMaxRows+1), nil

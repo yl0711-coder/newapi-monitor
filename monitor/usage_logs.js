@@ -14,7 +14,7 @@ const TYPE_LABELS={0:'未知',1:'充值',2:'消耗',3:'管理',4:'系统',5:'错
 const TYPE_CLASS={0:'grey',1:'cyan',2:'green',3:'orange',4:'purple',5:'red',6:'blue',7:'teal'};
 const DISPLAYABLE=new Set([0,2,5,6]);
 const TIMING=new Set([2,5]);
-const COLUMNS=[['channel','渠道'],['user','用户'],['token','令牌'],['model','模型'],['stream','流'],['tokens','Token'],['cost','费用'],['time','耗时'],['detail','详情']];
+const COLUMNS=[['channel','渠道'],['user','用户'],['token','令牌'],['model','模型'],['stream','流'],['tokens','Token'],['cost','费用'],['time','耗时'],['rejection','拒绝原因'],['detail','详情']];
 const COLS_KEY='usage-logs:common:root:column-visibility';
 const PAGE_SIZE_KEY='page-size';
 const MOBILE=()=>window.matchMedia('(max-width:640px)').matches;
@@ -47,6 +47,8 @@ const st={
   totalKnown:false,hasMore:false,countTask:null,countError:'',statRequested:false,
   // Exact list total of this search, reused while paging the same filter.
   totalKey:null,totalCached:null,
+  consumeEvidence:null,statSuppressed:'',
+  scanPending:false,scanCursor:null,scanScanned:0,scanError:'',scanWork:null,
 };
 
 function loadCols(){
@@ -116,6 +118,11 @@ function fmtKM(n){n=Number(n)||0;if(n<1000)return String(n);if(n<1e6)return(n/10
 // ---------- other ----------
 function parseOther(it){if(it._o!==undefined)return it._o;let o=null;try{o=it.other?JSON.parse(it.other):null}catch{o=null}it._o=(o&&typeof o==='object')?o:null;return it._o}
 const admin=o=>(o&&typeof o.admin_info==='object'&&o.admin_info)||null;
+function rejectionReason(it){
+  const o=parseOther(it),a=admin(o);
+  const raw=a&&Object.prototype.hasOwnProperty.call(a,'reject_reason')?a.reject_reason:o&&o.reject_reason;
+  return typeof raw==='string'&&raw.replace(/[ \t\r\n]/g,'')?raw:'';
+}
 function cacheWrite(o){if(!o)return 0;const a=Number(o.cache_creation_tokens_5m)||0,b=Number(o.cache_creation_tokens_1h)||0;return(a>0||b>0)?a+b:(Number(o.cache_creation_tokens)||0)}
 function effectiveRatio(o){if(!o)return null;if(o.user_group_ratio!=null&&Number(o.user_group_ratio)!==-1)return{kind:'专属倍率',v:Number(o.user_group_ratio)};if(o.group_ratio!=null)return{kind:'分组倍率',v:Number(o.group_ratio)};return null}
 
@@ -216,7 +223,7 @@ function shell(){
       </div>
       <input class="ul-input" id="ulModel" placeholder="模型名称" autocomplete="off">
       <input class="ul-input" id="ulGroup" placeholder="分组" list="ulGroupList" autocomplete="off"><datalist id="ulGroupList"></datalist>
-      <select class="ul-input" id="ulType"><option value="0">所有类型</option><option value="1">充值</option><option value="2">消耗</option><option value="3" title="仅用于查询历史日志，新记录请前往审计日志查看。">管理（已弃用）</option><option value="4">系统</option><option value="5">错误</option><option value="6">退款</option><option value="7" title="仅用于查询历史日志，新记录请前往审计日志查看。">登录（已弃用）</option></select>
+      <select class="ul-input" id="ulType"><option value="0">所有类型</option><option value="issues">排障：错误及拒绝</option><option value="rejected">有拒绝原因（含消耗）</option><option value="1">充值</option><option value="2">消耗</option><option value="3" title="仅用于查询历史日志，新记录请前往审计日志查看。">管理（已弃用）</option><option value="4">系统</option><option value="5">错误</option><option value="6">退款</option><option value="7" title="仅用于查询历史日志，新记录请前往审计日志查看。">登录（已弃用）</option></select>
       <button type="button" class="ul-toggle" id="ulToggle"></button>
     </div>
     <div class="ul-filters ul-adv" id="ulAdv" hidden>
@@ -225,7 +232,9 @@ function shell(){
       <input class="ul-input" id="ulChannel" placeholder="渠道 ID" autocomplete="off">
       <input class="ul-input" id="ulReq" placeholder="请求 ID" autocomplete="off">
       <input class="ul-input" id="ulUpReq" placeholder="上游请求 ID" autocomplete="off">
+      <input class="ul-input ul-message" id="ulMessage" placeholder="错误信息 / 拒绝原因关键词" maxlength="128" autocomplete="off" aria-label="错误信息或拒绝原因关键词" title="按文字片段匹配日志内容和拒绝原因；% 和 _ 按字面查询，单次最多26小时。">
     </div>
+    <div class="ul-diag-hint muted" id="ulDiagnosticHint" hidden>排障搜索覆盖整个所选范围，单次最多26小时；精确总数按需计算。拒绝不等于HTTP失败，计费不变。消费统计沿用客户、时间等条件，不按拒绝或关键词筛选；RPM/TPM为最近60秒。</div>
     <div class="ul-bar">
       <div class="ul-stats" id="ulStats"></div>
       <div class="ul-actions">
@@ -247,16 +256,18 @@ function readDraftFromInputs(){
   d.model=$('ulModel').value.trim();d.group=$('ulGroup').value.trim();d.type=$('ulType').value;
   d.token=$('ulToken').value.trim();d.username=$('ulUser').value.trim();d.channel=$('ulChannel').value.trim();
   d.requestId=$('ulReq').value.trim();d.upstreamRequestId=$('ulUpReq').value.trim();
+  d.message=$('ulMessage').value.trim();
 }
 function writeInputs(){
   const d=st.draft;
   $('ulModel').value=d.model||'';$('ulGroup').value=d.group||'';$('ulType').value=d.type||'0';
   $('ulToken').value=d.token||'';$('ulUser').value=d.username||'';$('ulChannel').value=d.channel||'';
   $('ulReq').value=d.requestId||'';$('ulUpReq').value=d.upstreamRequestId||'';
+  $('ulMessage').value=d.message||'';
   renderDateLabel();renderToggle();renderEye();
 }
-function advCount(d){return['token','username','channel','requestId','upstreamRequestId'].filter(k=>d[k]).length}
-function anyFilter(d){return!!(d.model||d.group||(d.type&&d.type!=='0')||d.token||d.username||d.channel||d.requestId||d.upstreamRequestId)}
+function advCount(d){return['token','username','channel','requestId','upstreamRequestId','message'].filter(k=>d[k]).length}
+function anyFilter(d){return!!(d.model||d.group||(d.type&&d.type!=='0')||d.token||d.username||d.channel||d.requestId||d.upstreamRequestId||d.message)}
 function renderToggle(){
   const n=advCount(st.draft),b=$('ulToggle');
   b.innerHTML=`<span>${st.expanded?'收起':'展开'}</span>${n?`<span class="ul-count">${n}</span>`:''}${svg(st.expanded?ICON.chevUp:ICON.chevDown,'ul-chev')}`;
@@ -264,6 +275,7 @@ function renderToggle(){
   b.classList.toggle('active',!st.expanded&&n>0);
   $('ulAdv').hidden=!st.expanded;
   $('ulReset').disabled=!anyFilter(st.draft);
+  $('ulDiagnosticHint').hidden=!(st.draft.message||['issues','rejected'].includes(st.draft.type));
   renderShortcuts();
 }
 function renderEye(){
@@ -294,7 +306,7 @@ function presetRange(k){
 
 function bind(){
   const enter=e=>{if(e.key==='Enter'){e.preventDefault();search()}};
-  for(const id of['ulModel','ulGroup','ulToken','ulUser','ulChannel','ulReq','ulUpReq']){$(id).addEventListener('keydown',enter);$(id).addEventListener('input',()=>{readDraftFromInputs();renderToggle()})}
+  for(const id of['ulModel','ulGroup','ulToken','ulUser','ulChannel','ulReq','ulUpReq','ulMessage']){$(id).addEventListener('keydown',enter);$(id).addEventListener('input',()=>{readDraftFromInputs();renderToggle()})}
   $('ulType').addEventListener('change',()=>{readDraftFromInputs();renderToggle()});
   $('ulToggle').addEventListener('click',()=>{st.expanded=!st.expanded;renderToggle()});
   $('ulSearch').addEventListener('click',search);
@@ -328,18 +340,19 @@ function renderColsPop(){
 }
 
 // ---------- URL 状态（hash） ----------
-const HASH_KEYS=['startTime','endTime','type','model','token','channel','group','username','requestId','upstreamRequestId','page','pageSize'];
+const FILTER_KEYS=['startTime','endTime','type','model','token','channel','group','username','requestId','upstreamRequestId','message'];
+const HASH_KEYS=[...FILTER_KEYS,'page','pageSize'];
 function readHash(){
   const q=window.monitorHashParams?window.monitorHashParams():new URLSearchParams(location.hash.slice(1));
   const d={};for(const k of HASH_KEYS){const v=q.get(k);if(v!=null&&v!=='')d[k]=v}
-  const out={startTime:Number(d.startTime)||0,endTime:Number(d.endTime)||0,type:/^[0-7]$/.test(d.type||'')?d.type:'0',model:d.model||'',token:d.token||'',channel:d.channel||'',group:d.group||'',username:d.username||'',requestId:d.requestId||'',upstreamRequestId:d.upstreamRequestId||''};
+  const out={startTime:Number(d.startTime)||0,endTime:Number(d.endTime)||0,type:/^(?:[0-7]|issues|rejected)$/.test(d.type||'')?d.type:'0',model:d.model||'',token:d.token||'',channel:d.channel||'',group:d.group||'',username:d.username||'',requestId:d.requestId||'',upstreamRequestId:d.upstreamRequestId||'',message:d.message||''};
   st.page=Math.max(1,Number(d.page)||1);
   const ps=Number(d.pageSize);if([10,20,30,40,50,100].includes(ps))st.pageSize=ps;
   return out;
 }
 function writeHash(){
   const q=new URLSearchParams();q.set('tab','usage-logs');const a=st.applied;
-  for(const k of HASH_KEYS.slice(0,10)){const v=a[k];if(v&&v!=='0')q.set(k,String(v))}
+  for(const k of FILTER_KEYS){const v=a[k];if(v&&v!=='0')q.set(k,String(v))}
   if(st.page>1)q.set('page',String(st.page));
   if(st.pageSize)q.set('pageSize',String(st.pageSize));
   history.replaceState(null,'',location.pathname+location.search+'#'+q.toString());
@@ -347,7 +360,9 @@ function writeHash(){
 function queryParams(withPage){
   const a=st.applied,r=rangeOf(a),q=new URLSearchParams();
   q.set('start_timestamp',String(Math.floor(r.start/1000)));q.set('end_timestamp',String(Math.floor(r.end/1000)));
-  if(a.type&&a.type!=='0')q.set('type',a.type);
+  if(['issues','rejected'].includes(a.type))q.set('diagnostic_scope',a.type);
+  else if(a.type&&a.type!=='0')q.set('type',a.type);
+  if(a.message)q.set('message',a.message);
   if(a.model)q.set('model_name',a.model);if(a.token)q.set('token_name',a.token);if(a.group)q.set('group',a.group);
   if(a.username)q.set('username',a.username);if(a.channel)q.set('channel',a.channel);
   if(a.requestId)q.set('request_id',a.requestId);if(a.upstreamRequestId)q.set('upstream_request_id',a.upstreamRequestId);
@@ -355,10 +370,89 @@ function queryParams(withPage){
   return q;
 }
 
+function diagnosticSearch(){const a=st.applied||{};return!!a.message||['issues','rejected'].includes(a.type)}
+function boundedDiagnosticSearch(){const a=st.applied||{};return diagnosticSearch()&&!!meta().diagnostic_batch_enabled&&!a.requestId&&!a.upstreamRequestId}
+function scanWorkKey(){return queryParams(false).toString()+'|'+st.page+'|'+st.pageSize}
+function applyScan(d){
+  st.items=d.items||[];st.hasMore=!!d.has_more;st.scanPending=!!d.scan_pending;st.scanCursor=d.scan_cursor||null;st.scanScanned=d.scanned||0;
+  for(const k of st.pageCursors.keys())if(k>st.page)st.pageCursors.delete(k);
+  if(d.next_cursor)st.pageCursors.set(st.page+1,d.next_cursor);
+}
+async function fetchDiagnosticPage(q,ctrl,continuing){
+  const size=st.pageSize,key=scanWorkKey();
+  let items=continuing?st.items.slice():[],scanned=continuing?st.scanScanned:0;
+  let cursor=continuing?st.scanCursor:st.pageCursors.get(st.page),result;
+  if(!continuing){st.scanPending=false;st.scanCursor=null;st.scanScanned=0}
+  st.scanWork=continuing?{key,data:{items,has_more:false,scan_pending:true,scan_cursor:cursor,scanned,next_cursor:null}}:null;
+  let expired=false;
+  const timer=setTimeout(()=>{expired=true;ctrl.abort()},30000);
+  try{
+    for(let batch=0;batch<64;batch++){
+      if(ctrl.signal.aborted)throw Object.assign(new Error('已取消检索'),{name:'AbortError'});
+      const probing=items.length===size,remaining=probing?1:size-items.length;
+      const params=new URLSearchParams(q);params.set('bounded_search','1');params.set('page_size',String(remaining));
+      params.delete('before_id');params.delete('before_created_at');
+      if(cursor){params.set('before_id',String(cursor.id));params.set('before_created_at',String(cursor.created_at))}
+      const d=await getJSON('/usage-logs/list?'+params,ctrl.signal);
+      if(ctrl.signal.aborted)throw Object.assign(new Error('已取消检索'),{name:'AbortError'});
+      if(!d.bounded_search||!Array.isArray(d.items)||d.items.length>remaining||!Number.isSafeInteger(d.scanned)||d.scanned<0||d.scanned>40000||d.has_more&&d.scan_pending)throw new Error('分批检索响应无效，请重新搜索');
+      const older=(a,b)=>a.created_at<b.created_at||(a.created_at===b.created_at&&a.id<b.id);
+      let previous=cursor||(items.length?items[items.length-1]:null);
+      for(const row of d.items){if(!Number.isSafeInteger(row.id)||row.id<=0||!Number.isSafeInteger(row.created_at)||previous&&!older(row,previous))throw new Error('检索顺序异常，请重新搜索');previous=row}
+      const resume=d.has_more?d.next_cursor:d.scan_pending?d.scan_cursor:null;
+      if((d.has_more||d.scan_pending)&&(!d.scanned||!resume||!Number.isSafeInteger(resume.id)||resume.id<=0||!Number.isSafeInteger(resume.created_at)||cursor&&!older(resume,cursor)))throw new Error('检索续查位置无效，请重新搜索');
+      if(d.has_more&&d.items.length&&(resume.id!==d.items[d.items.length-1].id||resume.created_at!==d.items[d.items.length-1].created_at))throw new Error('检索命中位置无效，请重新搜索');
+      if(d.scan_pending&&previous&&!older(resume,previous)&&!(resume.id===previous.id&&resume.created_at===previous.created_at))throw new Error('检索续查位置越过顺序边界，请重新搜索');
+      if(d.has_more&&d.items.length!==remaining)throw new Error('分批检索页大小异常，请重新搜索');
+      const provedNext=probing&&d.items.length>0;
+      if(!probing)items=items.concat(d.items);scanned+=d.scanned||0;
+      result={items,page_size:size,total:null,total_pending:true,bounded_search:true,has_more:provedNext||!!d.has_more,
+        next_cursor:provedNext?cursor:d.has_more?d.next_cursor:null,
+        scan_pending:!provedNext&&!!d.scan_pending,scan_cursor:!provedNext?d.scan_cursor||null:null,scanned,
+        search_complete:!provedNext&&!d.has_more&&!d.scan_pending};
+      if(batch===0&&!continuing&&!cursor&&st.page===1&&d.total_pending===false){result.total=d.total;result.total_pending=false}
+      st.scanWork={key,data:result};
+      if(!result.scan_pending)break;
+      cursor=d.scan_cursor;
+    }
+    if(result.scan_pending)throw new Error('本页检索达到安全批次上限，已暂存进度，请恢复查询或缩小范围');
+    return result;
+  }catch(e){if(expired)throw new Error('本页检索等待超时，已暂存进度，可恢复查询');throw e}
+  finally{clearTimeout(timer)}
+}
+function statsSkipReason(){
+  const type=String((st.applied||{}).type||'0');
+  if(!['0','2','issues','rejected'].includes(type))return'所选日志类型不包含消费，未计算用量、RPM、TPM';
+  const evidence=st.consumeEvidence;
+  if(evidence&&evidence.key===queryParams(false).toString()&&evidence.status==='none')return'本次完整查询结果不包含消费，未计算用量、RPM、TPM';
+  if(boundedDiagnosticSearch()&&st.scanPending&&(!evidence||evidence.status!=='present'))return'检索尚未完成，发现消费记录后自动计算用量、RPM、TPM';
+  return'';
+}
+function suppressStats(reason){
+  if(st.statAbort)st.statAbort.abort();
+  ++st.statSeq;st.statLoading=false;st.statRequested=false;
+  st.stat=null;st.rates=null;st.ratesKey=null;st.statSuppressed=reason;
+  renderStats();updateQueryControls();
+}
+function observeConsumption(d){
+  const key=queryParams(false).toString(),previous=st.consumeEvidence;
+  if(!previous||previous.key!==key)st.consumeEvidence={key,status:'unknown'};
+  if(st.items.some(it=>it.type===2))st.consumeEvidence.status='present';
+  // Absence on one page, or a final page reached by cursor, proves nothing
+  // about consumption elsewhere. Only an exact, complete FIRST page does.
+  else if(st.page===1&&((d.total_pending!==true&&d.has_more!==true&&Number.isSafeInteger(d.total)&&d.total===st.items.length)||d.bounded_search&&d.search_complete))st.consumeEvidence.status='none';
+  const reason=statsSkipReason();
+  if(reason)suppressStats(reason);
+  else if(st.statSuppressed){st.statSuppressed='';st.statRequested=true;renderStats(true)}
+}
+
 function prepareSearch(){
   const q=queryParams(false);
   if(st.countTask&&st.countTask.key!==q.toString()){st.countTask.ctrl.abort();st.countTask=null}
   st.countError='';st.totalKnown=false;
+  st.scanPending=false;st.scanCursor=null;st.scanScanned=0;st.scanError='';st.scanWork=null;
+  st.consumeEvidence=null;st.statSuppressed='';
+  const reason=statsSkipReason();if(reason){suppressStats(reason);return}
   // A matching aggregation already running at search time (including a
   // clicked wide-range SUM) remains the refresh for this search, even if it
   // finishes while COUNT is loading.
@@ -372,13 +466,13 @@ async function search(){
   // Repeated Enter must not keep killing/restarting the same running SQL.
   // Changed filters still supersede it immediately; completed searches
   // always refresh normally, and the cancel control remains available.
-  if(st.loading&&st.page===1&&st.applied&&HASH_KEYS.slice(0,10).every(k=>String(st.applied[k]??'')===String(st.draft[k]??'')))return;
+  if(st.loading&&st.page===1&&st.applied&&FILTER_KEYS.every(k=>String(st.applied[k]??'')===String(st.draft[k]??'')))return;
   st.applied={...st.draft};st.page=1;st.pageCursors.clear();st.totalKey=null;st.totalCached=null;prepareSearch();writeHash();
   if(!st.meta&&!await loadMeta())return;if(seq!==st.activationSeq)return;loadList();
 }
 function reset(){
   const r=defaultRange();
-  st.draft={startTime:r.start,endTime:r.end,type:'0',model:'',token:'',channel:'',group:'',username:'',requestId:'',upstreamRequestId:''};
+  st.draft={startTime:r.start,endTime:r.end,type:'0',model:'',token:'',channel:'',group:'',username:'',requestId:'',upstreamRequestId:'',message:''};
   writeInputs();search();
 }
 
@@ -402,7 +496,7 @@ async function loadMeta(){
   const dl=$('ulGroupList');if(dl)dl.innerHTML=(meta().groups||[]).filter(g=>g!=='auto').map(g=>`<option value="${esc(g)}">`).join('');
   return true;
 }
-async function loadList(){
+async function loadList(continuing=false){
   if(st.listAbort)st.listAbort.abort();const ctrl=new AbortController();st.listAbort=ctrl;
   const seq=++st.seq;st.loading=true;$('ulSearch').disabled=true;$('ulSearch').classList.add('loading');
   st.totalKnown=false;st.countError='';updateQueryControls();
@@ -411,8 +505,12 @@ async function loadList(){
   else $('ulTableWrap').classList.add('refreshing');
   try{
     const q=queryParams(true);q.set('defer_total','1');
-    const d=await getJSON('/usage-logs/list?'+q,ctrl.signal);
+    st.scanError='';
+    const bounded=boundedDiagnosticSearch();
+    if(!bounded)st.scanPending=false;
+    const d=bounded?await fetchDiagnosticPage(q,ctrl,continuing):await getJSON('/usage-logs/list?'+q,ctrl.signal);
     if(seq!==st.seq)return;
+    if(bounded)applyScan(d);
     st.items=d.items||[];st.hasMore=!!d.has_more;st.pageSize=d.page_size||st.pageSize;
     const listKey=queryParams(false).toString();
     if(d.total_pending!==true){st.totalKnown=true;st.total=d.total||0;st.totalKey=listKey;st.totalCached=st.total}
@@ -424,10 +522,20 @@ async function loadList(){
     for(const key of st.pageCursors.keys())if(key>st.page)st.pageCursors.delete(key);
     if(d.next_cursor)st.pageCursors.set(st.page+1,d.next_cursor);
     const pages=Math.max(1,Math.ceil(st.total/st.pageSize));
-    if(st.totalKnown&&st.page>pages&&st.total>0&&!st.items.length){st.page=pages;writeHash();return loadList()}
+    if(!bounded&&st.totalKnown&&st.page>pages&&st.total>0&&!st.items.length){st.page=pages;writeHash();return loadList()}
+    observeConsumption(d);
     renderTable();renderPager();
-    if(!st.totalKnown)loadCount(seq);else runPendingStat(seq);
-  }catch(e){if(seq!==st.seq)return;st.items=[];st.total=0;st.hasMore=false;st.countError='暂不可用';$('ulTableWrap').innerHTML=`<div class="ul-empty"><b class="ul-err">加载日志失败</b><div class="muted">${esc(e.message)}</div></div>`;renderPager();runPendingStat(seq)}
+    // Start statistics before COUNT takes the single heavy-query slot. The
+    // light rates request is independent of both COUNT and the quota SUM.
+    runPendingStat(seq);
+    // A manual count may still be running when the user pages. Attach this
+    // page to that same promise so its result is not lost with the old seq;
+    // never start a fresh diagnostic COUNT just because the page changed.
+    if(!st.totalKnown&&(!diagnosticSearch()||(st.countTask&&st.countTask.key===listKey)))loadCount(seq);
+  }catch(e){if(seq!==st.seq)return;
+    if(boundedDiagnosticSearch()&&st.scanWork&&st.scanWork.key===scanWorkKey()){applyScan(st.scanWork.data);st.scanError=e.message;observeConsumption(st.scanWork.data);renderTable();renderPager();runPendingStat(seq)}
+    else{st.items=[];st.total=0;st.hasMore=false;st.countError='暂不可用';$('ulTableWrap').innerHTML=`<div class="ul-empty"><b class="ul-err">加载日志失败</b><div class="muted">${esc(e.message)}</div></div>`;renderPager();runPendingStat(seq)}
+  }
   finally{if(seq===st.seq){st.loading=false;$('ulSearch').disabled=false;$('ulSearch').classList.remove('loading');$('ulTableWrap').classList.remove('refreshing');updateQueryControls()}}
 }
 async function loadCount(seq){
@@ -441,9 +549,9 @@ async function loadCount(seq){
     const d=await task.promise;if(seq!==st.seq||task.ctrl.signal.aborted)return;
     st.total=d.total;st.totalKnown=true;st.countError='';st.totalKey=key;st.totalCached=d.total;renderPager();
     const pages=Math.max(1,Math.ceil(st.total/st.pageSize));
-    if(st.page>pages&&st.total>0&&!st.items.length){st.page=pages;writeHash();loadList()}
+    if(!boundedDiagnosticSearch()&&st.page>pages&&st.total>0&&!st.items.length){st.page=pages;writeHash();loadList()}
   }catch(e){if(seq!==st.seq||task.ctrl.signal.aborted)return;st.countError='暂不可用';renderPager();toast('日志总数查询失败：'+e.message)}
-  finally{if(st.countTask===task)st.countTask=null;updateQueryControls();if(seq===st.seq)runPendingStat(seq)}
+  finally{if(st.countTask===task)st.countTask=null;updateQueryControls();if(seq===st.seq){renderPager();runPendingStat(seq)}}
 }
 function runPendingStat(seq){if(seq===st.seq&&st.statRequested){st.statRequested=false;loadStat()}}
 function updateQueryControls(){const b=$('ulCancel');if(b)b.hidden=!(st.loading||st.countTask||st.statLoading)}
@@ -452,10 +560,15 @@ function cancelQueries(){
   for(const k of['listAbort','statAbort'])if(st[k])st[k].abort();
   if(st.countTask)st.countTask.ctrl.abort();st.countTask=null;
   st.loading=false;st.statLoading=false;
-  if(listLoading){st.items=[];st.totalKnown=false;st.hasMore=false;$('ulTableWrap').innerHTML='<div class="ul-empty">已取消查询，请重新搜索。</div>'}
+  if(listLoading){
+    if(boundedDiagnosticSearch()&&st.scanWork&&st.scanWork.key===scanWorkKey()){applyScan(st.scanWork.data);st.scanError='已取消，保留已完成进度';renderTable()}
+    else{st.items=[];st.totalKnown=false;st.hasMore=false;$('ulTableWrap').innerHTML='<div class="ul-empty">已取消查询，请重新搜索。</div>'}
+  }
   if(!st.totalKnown)st.countError='未完成';renderPager();
-  if(!st.stat&&st.rates){st.stat=st.rates;renderStats()}
+  if(st.stat){if(st.stat.quota_pending){st.stat.quota_pending=false;st.stat.quota_error='统计已取消'}if(st.stat.rates_pending){st.stat.rates_pending=false;st.stat.rate_error='统计已取消'}renderStats()}
+  else if(st.rates){st.stat=st.rates;renderStats()}
   else if(!st.stat)$('ulStats').innerHTML='<span class="muted">统计已取消</span>'+(st.applied&&statWide()?'<button type="button" class="ul-btn ul-quota-calc" data-quota-calc>计算用量</button>':'');
+  if(st.statSuppressed)renderStats();
   $('ulSearch').disabled=false;$('ulSearch').classList.remove('loading');$('ulTableWrap').classList.remove('refreshing');updateQueryControls();
 }
 // Over a wide range the quota SUM reads every matching consume row, the main
@@ -466,40 +579,57 @@ function statWide(){const r=rangeOf(st.applied||{});return r.end-r.start>STAT_AU
 function statQuery(force){
   // These three fields are ignored by new-api statistics. Changing only
   // them must not cancel and restart an identical expensive aggregation.
-  const q=queryParams(false);for(const key of['type','request_id','upstream_request_id'])q.delete(key);
+  const q=queryParams(false);for(const key of['type','request_id','upstream_request_id','diagnostic_scope','message'])q.delete(key);
   if(!force&&statWide())q.set('skip_quota','1');
   return q;
 }
 async function loadStat(force){
+  const reason=statsSkipReason();if(reason){suppressStats(reason);return}
+  st.statSuppressed='';
   // Coalesce IN-FLIGHT requests only: a later explicit search still refreshes
   // completed amounts, rather than silently serving an old cached total.
   const q=statQuery(force===true);
   const key=q.toString();if(st.statLoading&&st.statKey===key)return;
   if(st.statAbort)st.statAbort.abort();const ctrl=new AbortController();st.statAbort=ctrl;
-  if(force!==true)st.rates=null;
+  // Only retain rates for an explicit retry in the exact same stat scope.
+  const scope=statQuery(true).toString(),previous=force===true&&st.ratesKey===scope?st.rates:null;
+  st.rates=previous;
   const seq=++st.statSeq;st.statLoading=true;st.statKey=key;st.stat=null;renderStats(true);
   updateQueryControls();
-  try{const d=await getJSON('/usage-logs/stat?'+q,ctrl.signal);if(seq!==st.statSeq)return;st.stat=d;if(d&&d.quota_skipped)st.rates=d;renderStats()}
-  catch(e){
-    if(seq!==st.statSeq)return;
-    const err=`<span class="ul-stat-err" title="${esc(e.message)}">${force===true?'用量计算失败':'统计加载失败'}：${esc(e.message)}</span>`;
-    // A failed clicked SUM keeps the rates already shown and stays retryable;
-    // a failed wide-range rates request still offers the explicit SUM.
-    if(force===true&&st.rates){st.stat=st.rates;renderStats();$('ulStats').innerHTML+=err;return}
-    st.stat=null;$('ulStats').innerHTML=err+(statWide()?'<button type="button" class="ul-btn ul-quota-calc" data-quota-calc>计算用量</button>':'');
+  const sum=!q.has('skip_quota');
+  const result={quota:null,quota_pending:sum,quota_skipped:!sum,rates_pending:!previous,...(previous?{rpm:previous.rpm,tpm:previous.tpm}:{})};
+  const publish=()=>{if(seq!==st.statSeq||ctrl.signal.aborted)return;st.stat={...result};renderStats()};
+  const rateQuery=new URLSearchParams(q);rateQuery.delete('quota_only');rateQuery.set('skip_quota','1');
+  const rates=getJSON('/usage-logs/stat?'+rateQuery,ctrl.signal).then(d=>{
+    if(seq!==st.statSeq||ctrl.signal.aborted)return;
+    result.rpm=d.rpm;result.tpm=d.tpm;result.rates_pending=false;
+    st.rates={quota:null,quota_skipped:true,rpm:d.rpm,tpm:d.tpm};st.ratesKey=scope;publish();
+  }).catch(e=>{if(seq!==st.statSeq||ctrl.signal.aborted)return;result.rates_pending=false;result.rate_error=e.message;publish()});
+  const tasks=[rates];
+  if(sum){const quotaQuery=new URLSearchParams(q);quotaQuery.delete('skip_quota');quotaQuery.set('quota_only','1');
+    tasks.push(getJSON('/usage-logs/stat?'+quotaQuery,ctrl.signal).then(d=>{
+      if(seq!==st.statSeq||ctrl.signal.aborted)return;result.quota=d.quota;result.quota_pending=false;publish();
+    }).catch(e=>{if(seq!==st.statSeq||ctrl.signal.aborted)return;result.quota_pending=false;result.quota_error=e.message;publish()}));
   }
+  try{await Promise.all(tasks)}
   finally{if(seq===st.statSeq)st.statLoading=false;updateQueryControls()}
 }
 function renderStats(loading){
+  if(st.statSuppressed){$('ulStats').innerHTML=`<span class="muted ul-stat-note">${esc(st.statSuppressed)}</span>`;return}
   const s=st.stat;
   if(loading||!s){$('ulStats').innerHTML='<span class="ul-pill sky skeleton">用量 <i class="ul-skel"></i></span><span class="ul-pill rose skeleton">RPM <i class="ul-skel"></i></span><span class="ul-pill slate skeleton">TPM <i class="ul-skel"></i></span>';return}
-  const quotaPill=s.quota_skipped
+  const skeleton=(label,color)=>`<span class="ul-pill ${color} skeleton">${label} <i class="ul-skel"></i></span>`;
+  const quotaPill=s.quota_pending?skeleton('用量','sky'):s.quota_error
+    ?`<button type="button" class="ul-pill sky ul-quota-calc ul-stat-err" data-quota-calc title="${esc(s.quota_error)}">用量计算失败 · 重试</button>`:s.quota_skipped
     ?`<button type="button" class="ul-pill sky ul-quota-calc" data-quota-calc title="所选时间超过 1 天，用量汇总需要读取全部消耗日志，较慢，点击后再计算；超过约 3 天可能超时，长期用量请看【用户用量】。">用量 <b>点击计算</b></button>`
-    :`<span class="ul-pill sky" title="与中转站统计口径一致：只汇总消耗日志，忽略类型、请求 ID 和上游请求 ID 筛选。">用量 <b>${st.masked?'••••':esc(fmtQuota(s.quota))}</b></span>`;
-  $('ulStats').innerHTML=`${quotaPill}<span class="ul-pill rose" title="服务器最近 60 秒的消耗请求数，与所选日期范围无关。">RPM <b>${fmtInt(s.rpm)}</b></span><span class="ul-pill slate" title="服务器最近 60 秒的输入与输出 Token 总数，与所选日期范围无关。">TPM <b>${fmtInt(s.tpm)}</b></span>`;
+    :`<span class="ul-pill sky" title="所选时间内的消耗统计；沿用客户、模型等条件，忽略类型、请求 ID、上游请求 ID、拒绝和关键词筛选。">用量 <b>${st.masked?'••••':esc(fmtQuota(s.quota))}</b></span>`;
+  const ratePills=s.rates_pending?skeleton('RPM','rose')+skeleton('TPM','slate'):s.rate_error
+    ?`<span class="ul-pill rose" title="${esc(s.rate_error)}">RPM 暂不可用</span><span class="ul-pill slate" title="${esc(s.rate_error)}">TPM 暂不可用</span>`
+    :`<span class="ul-pill rose" title="服务器最近 60 秒的消耗请求数，与所选日期范围无关。">RPM <b>${fmtInt(s.rpm)}</b></span><span class="ul-pill slate" title="服务器最近 60 秒的输入与输出 Token 总数，与所选日期范围无关。">TPM <b>${fmtInt(s.tpm)}</b></span>`;
+  $('ulStats').innerHTML=quotaPill+ratePills;
 }
 
-function rowClass(it){const o=parseOther(it);if(admin(o)&&admin(o).quota_saturation)return'ul-row-amber';if(it.type===5)return'ul-row-rose';if(it.type===6)return'ul-row-blue';return''}
+function rowClass(it){const o=parseOther(it);if(admin(o)&&admin(o).quota_saturation)return'ul-row-amber';if(it.type===5)return'ul-row-rose';if(it.type===6)return'ul-row-blue';if(it.type===2&&rejectionReason(it))return'ul-row-amber';return''}
 function typeBadge(t){return`<span class="ul-type ${TYPE_CLASS[t]||'grey'}">${TYPE_LABELS[t]||'未知'}</span>`}
 function cellTime(it){const t=fmtDT(it.created_at*1000);return`<div class="ul-mono ul-ts" title="${esc(t)}"><span class="ul-ts-y">${esc(t.slice(0,5))}</span>${esc(t.slice(5))}</div>${typeBadge(it.type)}`}
 function cellChannel(it,i){
@@ -596,11 +726,20 @@ function cellDetail(it,i){
   else{const c=contentText(it);inner=c?`<span class="ul-ellip ${it.type===5?'ul-danger':'muted'}">${esc(c)}</span>`:'<span class="muted">—</span>'}
   return`<button type="button" class="ul-detail" data-detail="${i}" title="点击查看详细信息">${inner}</button>`;
 }
+function cellRejection(it,i){
+  const reason=rejectionReason(it);if(!reason)return'<span class="muted">—</span>';
+  const refusal=/(?:^|[\s;,])claude_stop_reason\s*=\s*refusal(?:$|[\s;,])/.test(reason);
+  return`<button type="button" class="ul-rejection" data-detail="${i}" title="${esc(reason)}"><span class="ul-badge orange">${refusal?'模型拒答':'拒绝记录'}</span><span class="ul-ellip">${esc(reason)}</span></button>`;
+}
 function renderTable(){
   const wrap=$('ulTableWrap');if(!wrap)return;
-  if(!st.items.length){wrap.innerHTML='<div class="ul-empty"><b>未找到日志</b><div class="muted">暂无使用日志。发起 API 调用后日志将显示在此处。</div></div>';return}
-  const cols=[['time','时间',cellTime]].concat([['channel','渠道',cellChannel],['user','用户',cellUser],['token','令牌',cellToken],['model','模型',cellModel],['stream','流',cellStream],['tokens','Token',cellTokens],['cost','费用',cellCost],['time2','耗时',cellTime2],['detail','详情',cellDetail]].filter(([k])=>colOn(k==='time2'?'time':k)));
-  wrap.innerHTML=`<table class="ul-table"><thead><tr>${cols.map(c=>`<th class="ul-c-${c[0]}">${c[1]}</th>`).join('')}</tr></thead><tbody>${st.items.map((it,i)=>`<tr class="${rowClass(it)}">${cols.map(c=>`<td class="ul-c-${c[0]}">${c[2](it,i)}</td>`).join('')}</tr>`).join('')}</tbody></table>`;
+  if(!st.items.length){
+    if(boundedDiagnosticSearch())wrap.innerHTML=`<div class="ul-empty"><b>${st.scanPending?'暂未发现匹配日志，所选范围尚未查完':st.page>1?'更早范围已查完，没有新增匹配日志':'已查完所选范围，未找到匹配日志'}</b><div class="muted">${st.scanPending?'可继续查找，或缩小时间及客户范围。':'可调整关键词或筛选条件重新搜索。'}</div></div>`;
+    else wrap.innerHTML='<div class="ul-empty"><b>未找到日志</b><div class="muted">暂无使用日志。发起 API 调用后日志将显示在此处。</div></div>';
+    return;
+  }
+  const cols=[['time','时间',cellTime]].concat([['channel','渠道',cellChannel],['user','用户',cellUser],['token','令牌',cellToken],['model','模型',cellModel],['stream','流',cellStream],['tokens','Token',cellTokens],['cost','费用',cellCost],['time2','耗时',cellTime2],['rejection','拒绝原因',cellRejection],['detail','详情',cellDetail]].filter(([k])=>colOn(k==='time2'?'time':k)));
+  wrap.innerHTML=(boundedDiagnosticSearch()&&st.scanPending?`<div class="ul-empty"><b>本页未完成 · 已暂存 ${fmtInt(st.items.length)} 条</b><div class="muted">请恢复查询，补齐本页或查到范围末尾后再翻页。</div></div>`:'')+`<table class="ul-table"><thead><tr>${cols.map(c=>`<th class="ul-c-${c[0]}">${c[1]}</th>`).join('')}</tr></thead><tbody>${st.items.map((it,i)=>`<tr class="${rowClass(it)}">${cols.map(c=>`<td class="ul-c-${c[0]}">${c[2](it,i)}</td>`).join('')}</tr>`).join('')}</tbody></table>`;
 }
 function pageStrip(cur,last){
   if(last<=4)return Array.from({length:last},(_,i)=>i+1);
@@ -609,9 +748,13 @@ function pageStrip(cur,last){
   return[1,'…',cur,'…',last];
 }
 function renderPager(){
-  if(!st.totalKnown){
+  if(!st.totalKnown||boundedDiagnosticSearch()){
     const btn=(p,label,disabled,active=false)=>`<button type="button" class="ul-pg${active?' active':''}" data-page="${p}" ${disabled?'disabled':''}>${label}</button>`;
-    $('ulPager').innerHTML=`<span class="muted">总计：${esc(st.countError||'计算中…')}</span><span class="muted ul-ps-label">每页行数</span><select id="ulPageSize">${[10,20,30,40,50,100].map(n=>`<option value="${n}" ${n===st.pageSize?'selected':''}>${n}</option>`).join('')}</select><span class="ul-pg-btns">${btn(1,'«',st.page<=1)}${btn(st.page-1,'‹',st.page<=1)}${btn(st.page,String(st.page),false,true)}${btn(st.page+1,'›',!st.hasMore)}</span>`;
+    const manual=diagnosticSearch(),counting=st.countTask&&st.countTask.key===queryParams(false).toString();
+    const label=st.totalKnown?fmtInt(st.total):manual?(counting?'计算中…':st.countError||'未计算'):st.countError||'计算中…';
+    const calculate=manual&&!st.totalKnown?`<button type="button" class="ul-btn ul-count-calc" data-count-calc ${counting?'disabled':''} title="按当前完整筛选精确统计总条数，可能较慢；不影响日志翻页">${counting?'计算中…':'计算总数'}</button>`:'';
+    const progress=boundedDiagnosticSearch()?`<span class="muted">本页已检查 ${fmtInt(st.scanScanned)} 条候选${st.scanPending?' · 本页未完成，范围尚未查完':''}${st.scanError?' · '+esc(st.scanError):''}</span>${st.scanPending?'<button type="button" class="ul-btn" data-scan-continue>恢复查询</button>':''}`:'';
+    $('ulPager').innerHTML=`<span class="muted">总计：${esc(label)}</span>${calculate}${progress}<span class="muted ul-ps-label">每页行数</span><select id="ulPageSize">${[10,20,30,40,50,100].map(n=>`<option value="${n}" ${n===st.pageSize?'selected':''}>${n}</option>`).join('')}</select><span class="ul-pg-btns">${btn(1,'«',st.page<=1)}${btn(st.page-1,'‹',st.page<=1)}${btn(st.page,String(st.page),false,true)}${btn(st.page+1,'›',!st.hasMore||st.scanPending)}</span>`;
     return;
   }
   // The reused total is as of this search; rows that arrived since can make
@@ -623,7 +766,7 @@ function renderPager(){
     <span class="muted ul-ps-label">每页行数</span><select id="ulPageSize">${[10,20,30,40,50,100].map(n=>`<option value="${n}" ${n===st.pageSize?'selected':''}>${n}</option>`).join('')}</select>
     <span class="ul-pg-btns">${btn(1,'«',cur<=1)}${btn(cur-1,'‹',cur<=1)}${pageStrip(cur,last).map(p=>p==='…'?'<span class="muted">…</span>':btn(p,p,false,p===cur)).join('')}${btn(cur+1,'›',cur>=last)}${btn(last,'»',cur>=last)}</span>`;
 }
-function onPagerClick(e){const b=e.target.closest('[data-page]');if(!b||b.disabled)return;const p=Number(b.dataset.page);if(!p||p===st.page)return;st.page=p;writeHash();loadList();$('ulTableWrap').scrollTop=0}
+function onPagerClick(e){if(e.target.closest('[data-scan-continue]')){if(!st.loading)loadList(true);return}const calc=e.target.closest('[data-count-calc]');if(calc){if(!calc.disabled&&!st.loading){loadCount(st.seq);renderPager()}return}const b=e.target.closest('[data-page]');if(!b||b.disabled)return;const p=Number(b.dataset.page);if(!p||p===st.page||st.loading||boundedDiagnosticSearch()&&p>st.page&&(!st.hasMore||st.scanPending||!st.pageCursors.has(p)))return;st.page=p;writeHash();loadList();$('ulTableWrap').scrollTop=0}
 
 function onTableClick(e){
   const t=e.target.closest('button,[data-copy]');if(!t)return;
@@ -778,7 +921,7 @@ function openDetail(it){
   if(t!==6&&(o.request_path||o.request_conversion))html+=section('请求转换',kv('路径',esc(o.request_path||''),'ul-mono')+kv('转换',esc(Array.isArray(o.request_conversion)&&o.request_conversion.length>1?o.request_conversion.join(' -> '):'原生格式')));
   if(a&&Array.isArray(a.request_policy)&&a.request_policy.length)html+=section('请求策略决策',`<pre class="ul-pre">${esc(JSON.stringify(a.request_policy,null,2))}</pre>`);
   if(a&&a.quota_saturation){const q=a.quota_saturation;html+=section('额度已钳制','<div>额度饱和保护已触发</div>'+kv('类型',esc({overflow:'溢出',underflow:'下溢',nan:'无效 (NaN)'}[q.kind]||q.kind||''))+kv('原始值',esc(q.original))+kv('钳制为',esc(q.clamped))+kv('操作',esc(q.op)),true)}
-  if(a&&a.reject_reason)html+=section('拒绝原因',`<div>${esc(a.reject_reason)}</div>`,true);
+  const rejection=rejectionReason(it);if(rejection)html+=section('拒绝原因',kvCopy('原始原因',rejection)+'<div class="ul-sec-sub">这是明确记录的拒绝信息，不改变原日志类型或计费；HTTP成功不等于模型完成了任务。</div>',true);
   if(o.violation_fee||o.violation_fee_code||o.violation_fee_marker)html+=section('违规扣费',kv('违规代码',esc(o.violation_fee_code))+kv('违规标记',esc(o.violation_fee_marker))+kv('扣费金额',esc(fmtQuota(o.fee_quota??it.quota))),true);
   if(t===6&&(o.task_id||o.reason))html+=section('退款详情',kv('任务 ID',esc(o.task_id),'ul-mono')+kv('原因',esc(o.reason)));
   if(a&&a.task_plugin){const p=a.task_plugin;html+=section('任务插件',kv('插件',esc(p.key))+kv('名称',esc(p.name))+kv('版本',esc(p.version))+kv('作者',esc(p.author)))}
@@ -889,6 +1032,7 @@ async function activate(){
   const range=rangeOf(fromHash);fromHash.startTime=range.start;fromHash.endTime=range.end;
   st.pageCursors.clear();st.totalKey=null;st.totalCached=null;
   st.draft={...fromHash};st.applied={...fromHash};
+  if(boundedDiagnosticSearch())st.page=1;
   writeInputs();
   if(!st.meta&&!await loadMeta())return;
   if(seq!==st.activationSeq)return;

@@ -355,7 +355,7 @@ func (m *Monitor) continuePagedProblemIngest(ctx context.Context, state *Stabili
 	// Exactly one page per source-gate claim. Ten back-to-back SELECTs used to
 	// bypass global start spacing and could monopolize the production source.
 	limit := stabilityProblemPageSize
-	rows, err := m.prodDB.QueryContext(ctx, `/*+ MAX_EXECUTION_TIME(8000) */ SELECT id, created_at, channel_id,
+	rows, err := m.prodDB.QueryContext(ctx, `SELECT /*+ MAX_EXECUTION_TIME(8000) */ id, created_at, channel_id,
 			COALESCE(model_name,''), COALESCE(`+"`group`"+`,''), COALESCE(content,'')
 			FROM logs
 			WHERE created_at >= ? AND created_at < ? AND type = 5
@@ -458,7 +458,7 @@ func (m *Monitor) sampleStabilityProblemWindow(ctx context.Context, fromTs, toTs
 	if err != nil || windowFrom == 0 {
 		return 0, err
 	}
-	rows, err := m.prodDB.QueryContext(cctx, `/*+ MAX_EXECUTION_TIME(8000) */ SELECT id, created_at, channel_id,
+	rows, err := m.prodDB.QueryContext(cctx, `SELECT /*+ MAX_EXECUTION_TIME(8000) */ id, created_at, channel_id,
 		COALESCE(model_name,''), COALESCE(`+"`group`"+`,''), COALESCE(content,'')
 		FROM logs
 		WHERE created_at >= ? AND created_at < ? AND type = 5

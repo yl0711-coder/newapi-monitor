@@ -1273,6 +1273,12 @@ func sampleWindowParseOtherOnce(q string) string { return logsParseOtherOnce(q) 
 // same placeholders. NO_MERGE keeps MySQL from folding the derived table back
 // into the outer query (which would re-inline the parsing).
 func logsParseOtherOnce(q string) string {
+	return logsParseOtherOnceWithColumns(q, logsAggregateSourceColumns)
+}
+
+// columns is a code-owned projection, never a request value. Smaller aggregate
+// shapes must not materialize unrelated wide columns just to reuse JSON parsing.
+func logsParseOtherOnceWithColumns(q, columns string) string {
 	i := strings.Index(q, "\nFROM logs\nWHERE ")
 	j := strings.Index(q, "\nGROUP BY ")
 	if i < 0 || j < i || !logsAggregateHint.MatchString(q[:i]) {
@@ -1284,7 +1290,7 @@ func logsParseOtherOnce(q string) string {
 	outer = outer[:loc[0]] + "MAX_EXECUTION_TIME(" + outer[loc[2]:loc[3]] + ") NO_MERGE(logs) */" + outer[loc[1]:]
 	outer = strings.ReplaceAll(outer, "JSON_VALID(other)", "other_valid")
 	outer = strings.ReplaceAll(outer, "JSON_EXTRACT(other,", "JSON_EXTRACT(other_json,")
-	return outer + "\nFROM (\n  SELECT " + logsAggregateSourceColumns +
+	return outer + "\nFROM (\n  SELECT " + columns +
 		",\n    JSON_VALID(other) AS other_valid,\n    CASE WHEN JSON_VALID(other) THEN JSON_EXTRACT(other,'$') END AS other_json\n  FROM logs\n  " +
 		strings.ReplaceAll(strings.TrimSpace(where), "\n", "\n  ") + "\n) logs" + q[j:]
 }
@@ -1544,6 +1550,11 @@ func (m *Monitor) sampleTokensRangeWithPriority(ctx context.Context, fromTs, toT
 // sampleTokenSQL remains a separate renderable function so tests can lock the
 // server-side execution ceiling as well as the shared classification predicate.
 func sampleTokenSQL() string {
+	return logsParseOtherOnceWithColumns(sampleTokenAggregateSQL(),
+		"created_at, type, token_name, model_name, quota, prompt_tokens, completion_tokens, use_time, is_stream, content")
+}
+
+func sampleTokenAggregateSQL() string {
 	// 判据与 sampleWindow 保持一致(口径必须同源),但按令牌维度不拆明细,控制基数。
 	q := `
 SELECT /*+ MAX_EXECUTION_TIME(8000) */ (created_at DIV 60)*60 AS bucket, token_name,

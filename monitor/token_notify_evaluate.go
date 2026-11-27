@@ -33,6 +33,12 @@ type tokenNotifyGroup struct {
 	amount       *big.Rat
 }
 
+// Payload is TEXT, while both the 16MiB budget and Go len(body)/len(latest)
+// are bytes. SQLite length(TEXT) counts characters (and stops at NUL), so it
+// undercounts UTF-8 and mixes units when replacing a terminal notification.
+// Casting for length preserves NULL/empty behavior without rewriting data.
+const tokenNotifyPayloadBytesSQL = "COALESCE(SUM(length(CAST(payload AS BLOB))),0)"
+
 func tokenNotifyHit(r tokenDetectionResult, rule tokenNotifyRule) (tokenDetectionRule, bool) {
 	for _, v := range r.Rules {
 		if v.Name == rule.Name && v.Hit && tokenEvidenceRank(v.EvidenceLevel) >= tokenEvidenceRank(rule.Evidence) {
@@ -190,7 +196,7 @@ func tokenNotifyEnqueue(tx *gorm.DB, key string, g tokenNotifyGroup, p tokenNoti
 		}
 	}
 	var size int64
-	if err := tx.Model(&TokenNotifyOutbox{}).Select("COALESCE(SUM(length(payload)),0)").Scan(&size).Error; err != nil {
+	if err := tx.Model(&TokenNotifyOutbox{}).Select(tokenNotifyPayloadBytesSQL).Scan(&size).Error; err != nil {
 		return err
 	}
 	if reuse {

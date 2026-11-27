@@ -36,6 +36,7 @@ func openIncidentTestStore(t *testing.T) *Monitor {
 		t.Fatalf("openStore: %v", err)
 	}
 	cleanupLocalTestStore(t, m)
+	attachSQLAuditFixture(t, m)
 	return m
 }
 

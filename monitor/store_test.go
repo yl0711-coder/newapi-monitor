@@ -65,6 +65,7 @@ func newTestMonitor(t *testing.T) *Monitor {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = localDB.Close() })
+	attachSQLAuditFixture(t, m)
 	return m
 }
 

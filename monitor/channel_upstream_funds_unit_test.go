@@ -32,6 +32,7 @@ func TestReparseFundsWithoutHistoricalUnitKeepsExplicitCurrency(t *testing.T) {
 					t.Fatal(err)
 				}
 				m := &Monitor{storeDB: db}
+				attachSQLAuditFixture(t, m)
 				row := ChannelUpstreamAccount{Domain: "funds.example", Provider: upstreamProviderNewAPI, BalanceUnit: 1000000}
 				raw, err := json.Marshal(map[string]any{"id": 1, "created_at": 100, "type": 1, "quota": 1000000, "content": tc.content})
 				if err != nil {
@@ -123,6 +124,7 @@ func TestPersistFundCannotInventOrDiscardHistoricalUnit(t *testing.T) {
 			incoming := before
 			incoming.AmountUSD, incoming.UnitPerUSD = 99, tc.incoming
 			m := &Monitor{storeDB: db}
+			attachSQLAuditFixture(t, m)
 			if err := m.persistUpstreamFundEvents(t.Context(), []ChannelUpstreamFundEvent{incoming}); err != nil {
 				t.Fatal(err)
 			}

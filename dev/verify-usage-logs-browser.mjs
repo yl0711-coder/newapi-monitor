@@ -16,11 +16,11 @@ try{
   await b.call('Page.navigate',{url:origin+'/usage-logs-acceptance'});
   await waitFor('document.querySelectorAll(".ul-table tbody tr").length===100');
   await waitFor('document.querySelector("#ulStats").textContent.includes("¥")&&!document.querySelector("#ulPager").textContent.includes("计算中")');
-  assert.equal(await ev('document.querySelectorAll(".ul-table th").length'),10);
+  assert.equal(await ev('document.querySelectorAll(".ul-table th").length'),11);
   assert.equal(await ev('getComputedStyle(document.querySelector("#ulAdv")).display'),'none');
   assert.match(await ev('document.querySelector("#ulStats").textContent'),/¥/);
   assert.equal(await ev('getComputedStyle(document.querySelector(".ul-c-tokens .ul-mono")).whiteSpace'),'nowrap');
-  checks.push('真实后端列表、货币设置、统计、十列显示和高级筛选默认收起');
+  checks.push('真实后端列表、货币设置、统计、十一列显示和高级筛选默认收起');
   await click('button[data-detail="0"]');
   assert.match(await ev('document.querySelector("#ulModalBody").textContent'),/动态计费/);
   assert.match(await ev('document.querySelector("#ulModalBody").textContent'),/测试套餐/);
@@ -41,7 +41,7 @@ try{
   await click('#ulReset');
   await waitFor('document.querySelectorAll(".ul-table tbody tr").length===100&&!document.querySelector("#ulSearch").disabled');
   await click('#ulCols');await click('input[data-col="channel"]');
-  assert.equal(await ev('document.querySelectorAll(".ul-table th").length'),9);
+  assert.equal(await ev('document.querySelectorAll(".ul-table th").length'),10);
   await click('input[data-col="channel"]');await click('#ulCols');
   await click('#ulEye');assert.match(await ev('document.querySelector(".ul-uname").textContent'),/•/);await click('#ulEye');
   checks.push('列显示开关、列恢复与隐藏/显示');

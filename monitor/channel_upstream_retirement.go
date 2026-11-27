@@ -218,11 +218,15 @@ func (m *Monitor) saveChannelUpstreamRetirementHandler(c *gin.Context) {
 // upstreamSyncNotPausedSQL is a WHERE fragment for channel_upstream_accounts.
 const upstreamSyncPauseGraceSeconds = 48 * 3600
 
+// Keep the recent-traffic lookup channel-first. Otherwise a missing/stale
+// SQLite statistic can cause every retiring domain to scan all 48h traffic.
+// CROSS JOIN retains the same live normalized-domain and grace predicates;
+// the existing (channel_id,hour_ts) index bounds the inner history read.
 var upstreamSyncPausedDomainSQL = `SELECT 1 FROM channel_upstream_retirements r
 	WHERE r.retiring = 1 AND r.domain = LOWER(TRIM(%s))
 	AND NOT EXISTS (SELECT 1 FROM channel_snaps s
 		WHERE s.deleted_at = 0 AND s.status = 1 AND LOWER(TRIM(s.base_domain)) = r.domain)
-	AND NOT EXISTS (SELECT 1 FROM channel_snaps s JOIN stability_hour_samples h ON h.channel_id = s.id
+	AND NOT EXISTS (SELECT 1 FROM channel_snaps s CROSS JOIN stability_hour_samples h ON h.channel_id = s.id
 		WHERE LOWER(TRIM(s.base_domain)) = r.domain
 		AND h.hour_ts >= CAST(strftime('%%s','now') AS INTEGER) - ` + strconv.Itoa(upstreamSyncPauseGraceSeconds) + `
 		AND h.success + h.anomaly + h.failed > 0)`

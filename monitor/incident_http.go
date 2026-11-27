@@ -286,6 +286,7 @@ func (m *Monitor) incidentListItem(ctx context.Context, r Incident) gin.H {
 func (m *Monitor) incidentScenarioPendingByID(ctx context.Context, incidentID string) (bool, string, error) {
 	var sum IncidentPendingSummary
 	res := m.storeDB.WithContext(ctx).
+		Select("scenario_pending", "pending_reason").
 		Where("incident_id = ?", incidentID).Limit(1).Find(&sum)
 	if res.Error != nil {
 		return false, "", fmt.Errorf("读事故待确认摘要失败: %w", res.Error)
@@ -297,6 +298,7 @@ func (m *Monitor) incidentScenarioPendingByID(ctx context.Context, incidentID st
 	// 回落到窗口表：摘要尚未落盘的旧数据仍能读到结论。
 	var row IncidentIngestWindowState
 	res = m.storeDB.WithContext(ctx).
+		Select("pending_reason").
 		Where("incident_id = ? AND scenario_pending = ?", incidentID, true).
 		Limit(1).Find(&row)
 	if res.Error != nil {

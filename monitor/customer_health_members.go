@@ -21,6 +21,9 @@ import (
 const customerHealthMigrationVersion = 1
 const maxCustomerHealthMembers = 500
 
+// A query-size budget, not a limit on the number of companies returned.
+const customerHealthGroupCountBatchSize = 500
+
 var errCustomerHealthMemberDifferentGroup = errors.New("customer health member belongs to another company")
 
 func customerHealthConflict(err error) bool {
@@ -113,9 +116,18 @@ func migrateLegacyCustomerHealthTables(db *gorm.DB) error {
 
 // listCustomerHealthGroups is the read side used by the maintenance page.
 func (m *Monitor) listCustomerHealthGroups(c *gin.Context) {
+	db := m.storeDB
+	if c.Request != nil {
+		db = db.WithContext(c.Request.Context())
+	}
 	var groups []CustomerHealthGroup
-	if err := m.storeDB.Order("created_at ASC, id ASC").Find(&groups).Error; err != nil {
+	if err := db.Order("created_at ASC, id ASC").Find(&groups).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "读取客户维护公司失败"})
+		return
+	}
+	counts, err := customerHealthGroupMemberCounts(db, groups)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "读取客户维护成员失败"})
 		return
 	}
 	type row struct {
@@ -124,14 +136,42 @@ func (m *Monitor) listCustomerHealthGroups(c *gin.Context) {
 	}
 	out := make([]row, 0, len(groups))
 	for _, group := range groups {
-		var count int64
-		if err := m.storeDB.Model(&CustomerHealthMember{}).Where("group_id = ?", group.ID).Count(&count).Error; err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "读取客户维护成员失败"})
-			return
-		}
-		out = append(out, row{CustomerHealthGroup: group, Members: count})
+		out = append(out, row{CustomerHealthGroup: group, Members: counts[group.ID]})
 	}
 	c.JSON(http.StatusOK, gin.H{"groups": out})
+}
+
+func customerHealthGroupMemberCounts(db *gorm.DB, groups []CustomerHealthGroup) (map[int64]int64, error) {
+	counts := make(map[int64]int64, len(groups))
+	if len(groups) == 1 {
+		var n int64
+		if err := db.Model(&CustomerHealthMember{}).Where("group_id = ?", groups[0].ID).Count(&n).Error; err != nil {
+			return nil, err
+		}
+		counts[groups[0].ID] = n
+		return counts, nil
+	}
+	for start := 0; start < len(groups); start += customerHealthGroupCountBatchSize {
+		end := start + customerHealthGroupCountBatchSize
+		if end > len(groups) {
+			end = len(groups)
+		}
+		ids := make([]int64, end-start)
+		for n := range ids {
+			ids[n] = groups[start+n].ID
+		}
+		var rows []struct {
+			GroupID int64
+			Members int64
+		}
+		if err := db.Model(&CustomerHealthMember{}).Select("group_id,COUNT(*) AS members").Where("group_id IN ?", ids).Group("group_id").Scan(&rows).Error; err != nil {
+			return nil, err
+		}
+		for _, row := range rows {
+			counts[row.GroupID] = row.Members
+		}
+	}
+	return counts, nil
 }
 
 func (m *Monitor) listCustomerHealthMembers(c *gin.Context) {

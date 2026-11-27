@@ -63,6 +63,7 @@ func tokenMeteringFixture(t *testing.T) (*Monitor, int64, string) {
 	if err := db.Create(&TokenMeteringState{SourceEpoch: m.cfg.TokenFactsSourceEpoch, SourceMode: "complete", StartAt: start, ScanThrough: start}).Error; err != nil {
 		t.Fatal(err)
 	}
+	attachSQLAuditFixture(t, m)
 	return m, now, path
 }
 func tokenMeteringSourceRow(t *testing.T, m *Monitor, id, created int64, request string) {

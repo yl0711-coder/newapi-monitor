@@ -127,14 +127,25 @@ func loadFundingStored(ctx context.Context, db walletRowReader, latest bool, key
 	if err := db.QueryRowContext(ctx, query, key).Scan(&id, &scanID, &sequence, &raw); err != nil {
 		return p, 0, nil, err
 	}
+	p, err := decodeFundingStoredPage(id, scanID, sequence, raw)
+	if err != nil {
+		return FundingPage{}, 0, nil, err
+	}
+	return p, sequence, raw, nil
+}
+
+// Shared by scalar resume reads and the bounded monthly head batch. Keep the
+// original byte/hash/scope validation; neither path trusts metadata alone.
+func decodeFundingStoredPage(id, scanID string, sequence int64, raw []byte) (FundingPage, error) {
+	var p FundingPage
 	if digest(raw) != id || json.Unmarshal(raw, &p) != nil || p.Scan.ID != scanID || sequence <= 0 || (sequence == 1) != (p.PreviousID == "") {
-		return FundingPage{}, 0, nil, errors.New("funding stored page integrity failure")
+		return FundingPage{}, errors.New("funding stored page integrity failure")
 	}
 	canonical, err := fundingPageBytes(p)
 	if err != nil || !bytes.Equal(canonical, raw) {
-		return FundingPage{}, 0, nil, errors.New("funding stored page is not a complete canonical record")
+		return FundingPage{}, errors.New("funding stored page is not a complete canonical record")
 	}
-	return p, sequence, raw, nil
+	return p, nil
 }
 
 // LoadLatestFundingPage is the durable resume point, including source/scope,

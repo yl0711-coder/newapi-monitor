@@ -1,13 +1,13 @@
 package monitor
 
 import (
-	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"testing"
 )
 
-func TestUsageLogsWantsIDSpanOnlyForUnindexedColumnFilters(t *testing.T) {
+func TestUsageLogsCountSpanKeepsSelectiveAndCoveringPlans(t *testing.T) {
 	base := usageLogFilter{Start: 100, End: 200}
 	for name, tc := range map[string]struct {
 		f    usageLogFilter
@@ -18,7 +18,9 @@ func TestUsageLogsWantsIDSpanOnlyForUnindexedColumnFilters(t *testing.T) {
 		"group":             {usageLogFilter{Start: 100, End: 200, Group: "codex"}, true},
 		"time only":         {base, false},
 		"user id":           {usageLogFilter{Start: 100, End: 200, Channel: 7, UserID: 3}, false},
-		"username":          {usageLogFilter{Start: 100, End: 200, Channel: 7, Username: "u"}, false},
+		"username":          {usageLogFilter{Start: 100, End: 200, Channel: 7, Username: "u"}, true},
+		"username only":     {usageLogFilter{Start: 100, End: 200, Username: "u"}, false},
+		"wildcard":          {usageLogFilter{Start: 100, End: 200, Channel: 7, Username: "ab%"}, false},
 		"token":             {usageLogFilter{Start: 100, End: 200, Channel: 7, TokenName: "t"}, false},
 		"request id":        {usageLogFilter{Start: 100, End: 200, Channel: 7, RequestID: "r"}, false},
 		"upstream request":  {usageLogFilter{Start: 100, End: 200, Channel: 7, UpstreamRequestID: "r"}, false},
@@ -26,7 +28,7 @@ func TestUsageLogsWantsIDSpanOnlyForUnindexedColumnFilters(t *testing.T) {
 		"inverted window":   {usageLogFilter{Start: 300, End: 200, Channel: 7}, false},
 		"no window at all":  {usageLogFilter{Channel: 7}, false},
 	} {
-		if got := usageLogsWantsIDSpan(tc.f); got != tc.want {
+		if got := usageLogsUseCountSpan(tc.f); got != tc.want {
 			t.Errorf("%s: got %v want %v", name, got, tc.want)
 		}
 	}
@@ -51,7 +53,6 @@ func TestUsageLogsIDSpanCountsAndSumsMatchOriginalPredicates(t *testing.T) {
 		rows[i].username, rows[i].model, rows[i].group = "u", "m", "g"
 	}
 	insertUsageLogs(t, db, rows...)
-	ctx := context.Background()
 	for _, f := range []usageLogFilter{
 		{Start: 100, End: 200, Channel: 7},
 		{Start: 100, End: 200, Channel: 9},
@@ -64,21 +65,18 @@ func TestUsageLogsIDSpanCountsAndSumsMatchOriginalPredicates(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			narrowed, source, empty, ok := usageLogsIDSpan(ctx, db, true, f, where)
-			if !ok || empty || source != "logs FORCE INDEX (PRIMARY)" {
-				t.Fatalf("%+v: ok=%v empty=%v source=%q", f, ok, empty, source)
-			}
 			for _, agg := range []string{"COUNT(*)", "COALESCE(SUM(quota),0)"} {
-				var want, got int64
+				var want int64
+				var got sql.NullInt64
 				if err := db.QueryRow("SELECT "+agg+" FROM logs"+where.sql(), where.args...).Scan(&want); err != nil {
 					t.Fatal(err)
 				}
-				// SQLite has no FORCE INDEX; the narrowed predicates are what is checked.
-				if err := db.QueryRow("SELECT "+agg+" FROM logs"+narrowed.sql(), narrowed.args...).Scan(&got); err != nil {
+				query, args := usageLogsAggregateSpanSQL(f, where, agg)
+				if err := db.QueryRow(sqliteQuotaSpanSQL(query), args...).Scan(&got); err != nil {
 					t.Fatal(err)
 				}
-				if got != want {
-					t.Fatalf("%+v scope=%d %s: span=%d original=%d", f, scope, agg, got, want)
+				if !got.Valid || got.Int64 != want {
+					t.Fatalf("%+v scope=%d %s: span=%v original=%d", f, scope, agg, got, want)
 				}
 			}
 		}
@@ -86,18 +84,15 @@ func TestUsageLogsIDSpanCountsAndSumsMatchOriginalPredicates(t *testing.T) {
 	// A window without rows is answered without the main scan.
 	f := usageLogFilter{Start: 500, End: 600, Channel: 7}
 	where, _ := buildUsageLogWhere(f, usageLogWhereList)
-	if _, _, empty, ok := usageLogsIDSpan(ctx, db, true, f, where); !ok || !empty {
-		t.Fatalf("empty window: ok=%v empty=%v", ok, empty)
-	}
-	// Not MySQL (or not eligible): the original plan is kept untouched.
-	if got, source, _, ok := usageLogsIDSpan(ctx, db, false, usageLogFilter{Start: 100, End: 200, Channel: 7}, where); ok || source != "logs" || got != where {
-		t.Fatalf("sqlite must keep the original plan: ok=%v source=%q", ok, source)
+	query, args := usageLogsAggregateSpanSQL(f, where, "COUNT(*)")
+	var empty int64
+	if err := db.QueryRow(sqliteQuotaSpanSQL(query), args...).Scan(&empty); err != nil || empty != 0 {
+		t.Fatalf("empty window: %d %v", empty, err)
 	}
 }
 
-// The page rows take the user_id switch only when it selects exactly the
-// username's rows; a renamed user keeps the username predicate.
-func TestUsageLogsListRowsUseUserIndexWithoutChangingResults(t *testing.T) {
+// Page rows and aggregates preserve the original historical username filter.
+func TestUsageLogsListRowsKeepHistoricalNamesAndCombinedFilters(t *testing.T) {
 	db := newUsageLogsFakeProd(t)
 	insertUsageLogs(t, db,
 		usageLogRow{id: 1, userID: 31, createdAt: 110, typ: 2, username: "kjl_Dev", channel: 7, quota: 1},

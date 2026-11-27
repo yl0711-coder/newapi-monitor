@@ -316,6 +316,7 @@ func TestPersistUpstreamFundEventKeepsLargestObservedMultiplicity(t *testing.T) 
 		t.Fatal(err)
 	}
 	m := &Monitor{storeDB: db}
+	attachSQLAuditFixture(t, m)
 	base := ChannelUpstreamFundEvent{Domain: "up.example", AccountEpoch: "epoch", EventKey: "1-key", OccurredAt: 1, Kind: upstreamFundKindTopup, Direction: "credit", AmountUSD: 10, AmountKnown: true, ObservedCount: 2}
 	if err := m.persistUpstreamFundEvents(t.Context(), []ChannelUpstreamFundEvent{base}); err != nil {
 		t.Fatal(err)
@@ -342,6 +343,7 @@ func TestPersistUpstreamFundEventCannotRewriteHistoricalUnitEvidence(t *testing.
 		t.Fatal(err)
 	}
 	m := &Monitor{storeDB: db}
+	attachSQLAuditFixture(t, m)
 	old := ChannelUpstreamFundEvent{
 		Domain: "funds.example", AccountEpoch: "epoch", EventKey: "1-key", Provider: upstreamProviderNewAPI,
 		OccurredAt: 1, Kind: upstreamFundKindTopup, Direction: "credit", AmountUSD: 2, AmountKnown: true,
@@ -388,6 +390,7 @@ func TestReparseStoredUpstreamFundEventsUpgradesWithoutRefetch(t *testing.T) {
 		t.Fatal(err)
 	}
 	m := &Monitor{storeDB: db}
+	attachSQLAuditFixture(t, m)
 	row := ChannelUpstreamAccount{Domain: "funds.example", Provider: upstreamProviderNewAPI, BaseURL: "https://funds.example", UserID: 7, BalanceUnit: 500000}
 	epoch := newAPIUpstreamAccountEpoch(row)
 	raw := `{"id":1,"created_at":1788349054,"type":1,"quota":0,"content":"使用在线充值成功，充值金额: ¥1000.000000 额度，支付金额：1000.000000"}`
@@ -440,6 +443,7 @@ func TestReparseStoredUpstreamFundEventsQuarantinesBadRowAndContinues(t *testing
 		t.Fatal(err)
 	}
 	m := &Monitor{storeDB: db}
+	attachSQLAuditFixture(t, m)
 	row := ChannelUpstreamAccount{Domain: "funds.example", Provider: upstreamProviderNewAPI, BaseURL: "https://funds.example", UserID: 7, BalanceUnit: 500000}
 	epoch := newAPIUpstreamAccountEpoch(row)
 	goodRaw := `{"id":12,"created_at":1788552000,"type":1,"quota":0,"content":"充值金额: $20.00"}`

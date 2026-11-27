@@ -121,6 +121,10 @@ func validateUsageFactHistoryRange(fromTs, throughTs int64, ids []int64) ([]int6
 	return ordered, nil
 }
 
+// Both readers collect complete groups into maps and canonically sort facts
+// locally before hashing/publication. A replica ORDER BY adds a redundant
+// post-aggregation sort; LIMIT is only an overflow sentinel, never a partial
+// publication. Keep the independent control query, not a derived detail sum.
 func usageFactHistoryDetailSQL(dayExpr, memberSQL, testPredicate string) string {
 	return `SELECT /*+ MAX_EXECUTION_TIME(5000) */
   ` + dayExpr + ` AS day_idx,
@@ -136,7 +140,6 @@ func usageFactHistoryDetailSQL(dayExpr, memberSQL, testPredicate string) string 
  WHERE created_at >= ? AND created_at < ? AND type IN (2,6) AND ` + memberSQL + `
    AND NOT (` + testPredicate + `)
  GROUP BY day_idx, user_id, channel_id, ` + "`group`" + `, model_name, token_id
- ORDER BY day_idx, user_id, channel_id, ` + "`group`" + `, model_name, token_id
  LIMIT ?`
 }
 
@@ -153,7 +156,6 @@ func usageFactHistoryControlSQL(dayExpr, memberSQL, testPredicate string) string
  WHERE created_at >= ? AND created_at < ? AND type IN (2,6) AND ` + memberSQL + `
    AND NOT (` + testPredicate + `)
  GROUP BY day_idx, user_id
- ORDER BY day_idx, user_id
  LIMIT ?`
 }
 

@@ -28,6 +28,7 @@ func newChannelCostTestStore(t *testing.T) *gorm.DB {
 			_ = sqlDB.Close()
 		}
 	})
+	attachSQLAuditFixture(t, &Monitor{storeDB: db})
 	return db
 }
 

@@ -46,3 +46,12 @@ __pycache__/
 .tmp-qa/
 .tmp-go-cache/
 .tmp-monitor.test
+
+# 本机 SQL 审计证据可能含真实筛选值、来源结构或私有诊断，只本地留存。
+/docs/sql-audit-20261126/*
+!/docs/sql-audit-20261126/README.md
+/docs/monitor-replica-query-audit-20261126.md
+/docs/usage-log-query-quality-review-20261126.md
+/docs/usage-log-quota-sql-optimization-20261126.md
+/docs/usage-log-stat-latency-fix-20261126.md
+/docs/usage-log-stat-slow-query-audit-20261126.md

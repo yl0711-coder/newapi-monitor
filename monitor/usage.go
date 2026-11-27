@@ -1827,7 +1827,8 @@ func escapeLike(s string) string {
 
 // logSourceClause 只在真实 MySQL 读取层上选择 NewAPI 日志表已验证的
 // 复合索引。Request ID、令牌名和模型都有独立索引，让优化器按实际选择；分组精确筛选优先
-// 使用 (user_id,group,created_at,type)，否则保持现有的单成员/组织时间索引。
+// 使用 (user_id,group,created_at,type)，单成员保持用户时间索引。多成员不能统一
+// 强制时间索引：小客户会被迫扫描其他客户的整个时间窗，由优化器按实际分布选择。
 // 本地 SQLite 测试不识别 FORCE INDEX，因此根据真实 driver 类型严格限定。
 func (m *Monitor) logSourceClause(ids []int64, memberUID int64, model, group, tokenName, requestID string) string {
 	if m.prodDB == nil {
@@ -1850,7 +1851,7 @@ func mysqlLogSourceClause(memberCount int, memberUID int64, model, group, tokenN
 	if memberUID > 0 || memberCount == 1 {
 		return "logs FORCE INDEX (idx_user_created_type)"
 	}
-	return "logs FORCE INDEX (idx_created_at_type)"
+	return "logs"
 }
 
 func appendCompositeLogCursor(where string, args []any, cursor logPageCursor) (string, []any) {

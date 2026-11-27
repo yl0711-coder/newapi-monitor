@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math/rand"
 	"net/url"
+	"strings"
 	"testing"
 	"time"
 )
@@ -18,36 +19,36 @@ func addUsageLogsUser(t *testing.T, db *sql.DB, id int64, username string) {
 	}
 }
 
-func TestUsageLogsUsernameUserIDRequiresProvenEquivalence(t *testing.T) {
+func TestUsageLogsHistoricalUsernameNeverBecomesCurrentUserID(t *testing.T) {
 	ctx := context.Background()
 	cases := []struct {
-		name     string
-		users    map[int64]string
-		logs     []usageLogRow
-		username string
-		want     int64
+		name      string
+		users     map[int64]string
+		logs      []usageLogRow
+		username  string
+		wantCount int64
 	}{
 		{name: "stable user", users: map[int64]string{31: "kjl_Dev"},
 			logs:     []usageLogRow{{id: 1, userID: 31, typ: 2, username: "kjl_Dev"}, {id: 5, userID: 31, typ: 2, username: "kjl_Dev"}},
-			username: "kjl_Dev", want: 31},
+			username: "kjl_Dev", wantCount: 2},
 		{name: "wildcard keeps username", users: map[int64]string{31: "kjl_Dev"},
 			logs:     []usageLogRow{{id: 1, userID: 31, typ: 2, username: "kjl_Dev"}},
-			username: "kjl%", want: 0},
+			username: "kjl%", wantCount: 1},
 		{name: "unknown username", users: map[int64]string{31: "kjl_Dev"},
 			logs:     []usageLogRow{{id: 1, userID: 31, typ: 2, username: "kjl_Dev"}},
-			username: "nobody", want: 0},
+			username: "nobody", wantCount: 0},
 		{name: "renamed user: earliest row has the old name", users: map[int64]string{40: "newname"},
 			logs:     []usageLogRow{{id: 1, userID: 40, typ: 2, username: "oldname"}, {id: 2, userID: 40, typ: 2, username: "newname"}},
-			username: "newname", want: 0},
+			username: "newname", wantCount: 1},
 		{name: "name used earlier by another user", users: map[int64]string{41: "reused", 42: "moved"},
 			logs:     []usageLogRow{{id: 1, userID: 42, typ: 2, username: "reused"}, {id: 2, userID: 41, typ: 2, username: "reused"}},
-			username: "reused", want: 0},
+			username: "reused", wantCount: 2},
 		{name: "no rows at all", users: map[int64]string{43: "quiet"},
 			logs:     []usageLogRow{{id: 1, userID: 31, typ: 2, username: "kjl_Dev"}},
-			username: "quiet", want: 43},
+			username: "quiet", wantCount: 0},
 		{name: "no own rows but another user's rows carry the name", users: map[int64]string{44: "taken"},
 			logs:     []usageLogRow{{id: 1, userID: 45, typ: 2, username: "taken"}},
-			username: "taken", want: 0},
+			username: "taken", wantCount: 1},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -59,21 +60,27 @@ func TestUsageLogsUsernameUserIDRequiresProvenEquivalence(t *testing.T) {
 				addUsageLogsUser(t, db, id, name)
 			}
 			insertUsageLogs(t, db, tc.logs...)
-			got, err := usageLogsUsernameUserID(ctx, db, tc.username)
+			where, err := buildUsageLogWhere(usageLogFilter{Username: tc.username}, usageLogWhereList)
 			if err != nil {
 				t.Fatal(err)
 			}
-			if got != tc.want {
-				t.Fatalf("user_id = %d, want %d", got, tc.want)
+			if strings.Contains(where.sql(), "user_id") || !strings.Contains(where.sql(), "username") {
+				t.Fatal("historical name predicate was replaced")
+			}
+			var count int64
+			if err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM logs"+where.sql(), where.args...).Scan(&count); err != nil {
+				t.Fatal(err)
+			}
+			if count != tc.wantCount {
+				t.Fatalf("historical count=%d want=%d", count, tc.wantCount)
 			}
 		})
 	}
 }
 
-// The user_id path must return exactly what the username predicate returns,
-// for every filter combination the page can send, including users whose name
-// history makes the switch unsafe (those must fall back).
-func TestUsageLogsUserIndexKeepsCountAndStatIdentical(t *testing.T) {
+// List/count/stat keep the exact historical-name predicate for every filter
+// combination, including renamed names and names reused by different users.
+func TestUsageLogsHistoricalNamesKeepCountAndStatIdentical(t *testing.T) {
 	db := newUsageLogsFakeProd(t)
 	addUsageLogsUser(t, db, 40, "newname")
 	addUsageLogsUser(t, db, 41, "reused")
@@ -206,14 +213,6 @@ func TestUsageLogsUserIndexKeepsCountAndStatIdentical(t *testing.T) {
 			}
 		}
 	}
-	// The fast path is really taken for the stable user and refused for the others.
-	for name, want := range map[string]bool{"kjl_Dev": true, "newname": false, "oldname": false, "reused": false, "moved": false} {
-		got, err := usageLogsUsernameUserID(context.Background(), db, name)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if (got > 0) != want {
-			t.Fatalf("%s: user index = %d, want used=%v", name, got, want)
-		}
-	}
+	// Every endpoint above is checked against the original historical name,
+	// including renamed/reused names; no current-user equivalence assumption.
 }

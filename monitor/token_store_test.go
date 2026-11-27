@@ -31,6 +31,7 @@ func TestTokenStoreIsolationRestartAndCurrentDirectory(t *testing.T) {
 	if m.tokenStore() == m.storeDB {
 		t.Fatal("explicit store fell back to main")
 	}
+	attachSQLAuditFixture(t, m)
 	raw := tokenMeteringRawFixture(`{"claude":true,"cache_tokens":0,"cache_creation_tokens":0}`)
 	raw.ID, raw.CreatedAt, raw.UserID, raw.ChannelID = 1, now-600, 2, 3
 	fact, _ := parseTokenMetering(m.cfg, raw, now)
@@ -81,6 +82,16 @@ func TestTokenStoreIsolationRestartAndCurrentDirectory(t *testing.T) {
 	var count int64
 	if err := m.tokenStore().Model(&TokenDetectionCurrent{}).Count(&count).Error; err != nil || count != 1 {
 		t.Fatalf("history lost after restart: %d %v", count, err)
+	}
+	attachSQLAuditFixture(t, m)
+	query := tokenDetectionQuery{SourceEpoch: fact.SourceEpoch, From: fact.CreatedAt, To: fact.CreatedAt + 1}
+	want, err := tokenReportInsufficientCount(m.tokenStore(), query)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := tokenReportInsufficientCount(m.tokenReadStore(), query)
+	if err != nil || got != want {
+		t.Fatalf("isolated reader changed report count after restart: got=%d want=%d err=%v", got, want, err)
 	}
 	assertTokenCapacityLedger(t, m.tokenStore())
 }

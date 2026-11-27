@@ -836,6 +836,22 @@ func validateChannelFinanceInput(in *channelFinanceSaveInput) error {
 	return nil
 }
 
+func channelFinanceHistoryGroupsSQL(channelCount int) string {
+	if channelCount == 1 {
+		// Single-channel domains avoid a global version scan without repeating
+		// rare-version lookups across many channels. Keep the live domain JOIN:
+		// IDs cached by the preceding read must not become an ownership filter.
+		return `SELECT DISTINCT s.grp FROM channel_snaps c
+		CROSS JOIN stability_hour_samples s ON s.channel_id=c.id
+		WHERE c.base_domain=? AND s.grp<>'' AND s.traffic_class_version IN ? LIMIT ?`
+	}
+	// Multi-channel domains retain the original optimizer freedom. A forced
+	// domain-first order regresses when current accounting versions are rare.
+	return `SELECT DISTINCT s.grp FROM stability_hour_samples s
+		JOIN channel_snaps c ON c.id=s.channel_id
+		WHERE c.base_domain=? AND s.grp<>'' AND s.traffic_class_version IN ? LIMIT ?`
+}
+
 func (m *Monitor) allowedChannelFinanceGroups(ctx context.Context, domain string) (map[string]bool, error) {
 	var rows []struct{ Groups string }
 	if tx := m.storeDB.WithContext(ctx).Model(&ChannelSnap{}).Select("groups").Where("base_domain = ?", domain).Scan(&rows); tx.Error != nil {
@@ -851,9 +867,7 @@ func (m *Monitor) allowedChannelFinanceGroups(ctx context.Context, domain string
 		}
 	}
 	var history []struct{ Grp string }
-	if tx := m.storeDB.WithContext(ctx).Raw(`SELECT DISTINCT s.grp FROM stability_hour_samples s
-		JOIN channel_snaps c ON c.id=s.channel_id
-		WHERE c.base_domain=? AND s.grp<>'' AND s.traffic_class_version IN ? LIMIT ?`,
+	if tx := m.storeDB.WithContext(ctx).Raw(channelFinanceHistoryGroupsSQL(len(rows)),
 		domain, accountingTrafficVersions(), maxChannelFinanceGroups+1).Scan(&history); tx.Error != nil {
 		return nil, fmt.Errorf("核对历史服务分组: %w", tx.Error)
 	}

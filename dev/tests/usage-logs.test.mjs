@@ -21,10 +21,42 @@ function fixture(handler=()=>ok({})){
     URLSearchParams,AbortController,
     setTimeout:(fn,ms)=>{const id=++timerID;timers.set(id,{fn,ms});return id},clearTimeout:id=>timers.delete(id),atob:s=>Buffer.from(s,'base64').toString('binary'),
     fetch:(url,options={})=>{calls.push({url,options});return handler(url,options)}});
-  vm.runInContext(source.replace('window.usageLogsActivate=activate;',`globalThis.api={st,activate,deactivate,search,prepareSearch,loadMeta,loadList,loadCount,loadStat,cancelQueries,openUser,openDetail,openModal,closeModal,cellCost,queryParams,fmtQuota,detailSegments,loadShortcuts,renderShortcuts,onShortcutBarClick,onShortcutModalClick,saveShortcut,openShortcutManage,scApply};window.usageLogsActivate=activate;`),context);
+  vm.runInContext(source.replace('window.usageLogsActivate=activate;',`globalThis.api={st,activate,deactivate,search,prepareSearch,loadMeta,loadList,loadCount,loadStat,cancelQueries,openUser,openDetail,openModal,closeModal,cellCost,queryParams,fmtQuota,detailSegments,loadShortcuts,renderShortcuts,onShortcutBarClick,onShortcutModalClick,saveShortcut,openShortcutManage,scApply,rejectionReason,cellRejection,renderTable,readHash,onPagerClick};window.usageLogsActivate=activate;`),context);
   const api=context.api;api.st.meta={...meta};api.st.applied={startTime:1794400000000,endTime:1794500000000};api.st.pageSize=100;
-  return{...api,el,calls,timers};
+  return{...api,el,calls,timers,context};
 }
+
+test('explicit rejection is visible without changing consumption type or cost; text is escaped',()=>{
+  const v=fixture(),it={...row,other:JSON.stringify({admin_info:{reject_reason:'claude_stop_reason=refusal <img src=x onerror=alert(1)>'}})};
+  assert.match(v.rejectionReason(it),/^claude_stop_reason=refusal/);
+  const cell=v.cellRejection(it,4);assert.match(cell,/模型拒答/);assert.match(cell,/data-detail="4"/);assert.doesNotMatch(cell,/<img/);assert.match(cell,/&lt;img/);
+  v.st.items=[it];v.renderTable();assert.match(v.el('ulTableWrap').innerHTML,/拒绝原因/);assert.match(v.el('ulTableWrap').innerHTML,/ul-row-amber/);assert.match(v.el('ulTableWrap').innerHTML,/>消耗</);
+  assert.equal(it.type,2);assert.match(v.cellCost(it),/¥7/);
+  v.openDetail(it);assert.match(v.el('ulModalBody').innerHTML,/拒绝原因/);assert.doesNotMatch(v.el('ulModalBody').innerHTML,/<img/);
+  v.st.cols.rejection=false;v.renderTable();assert.doesNotMatch(v.el('ulTableWrap').innerHTML,/<th class="ul-c-rejection"/);
+});
+
+test('rejection presence accepts legacy strings but not malformed JSON, non-string or explicit nested null',()=>{
+  const v=fixture();
+  for(const other of ['invalid','null','[]','{}','{"reject_reason":false}','{"reject_reason":12}','{"reject_reason":{}}','{"reject_reason":" \t\r\n"}','{"reject_reason":"legacy","admin_info":{"reject_reason":null}}','{"reject_reason":"legacy","admin_info":{"reject_reason":false}}']){
+    assert.equal(v.rejectionReason({...row,other}),'',other);
+  }
+  for(const other of ['{"reject_reason":"legacy"}','{"reject_reason":"legacy","admin_info":null}','{"reject_reason":"legacy","admin_info":"old-format"}'])assert.equal(v.rejectionReason({...row,other}),'legacy');
+  assert.equal(v.rejectionReason({...row,other:'{"reject_reason":"legacy","admin_info":{"reject_reason":"nested"}}'}),'nested');
+  assert.doesNotMatch(v.cellRejection({...row,other:'{"admin_info":{"reject_reason":"claude_stop_reason=end_turn"}}'},0),/模型拒答/);
+});
+
+test('diagnostics survive hash and list parameters but cannot alter existing quota or rate scope',async()=>{
+  const v=fixture(url=>ok(url.includes('skip_quota=1')?{rpm:1,tpm:2}:{quota:500000}));
+  v.context.location.hash='#tab=usage-logs&type=issues&message='+encodeURIComponent('Invalid %_!');
+  const draft=v.readHash();assert.equal(draft.type,'issues');assert.equal(draft.message,'Invalid %_!');
+  Object.assign(v.st.applied,draft,{startTime:1794400000000,endTime:1794403600000});
+  const list=v.queryParams(false);assert.equal(list.get('diagnostic_scope'),'issues');assert.equal(list.get('message'),'Invalid %_!');assert.equal(list.has('type'),false);
+  await v.loadStat();assert.equal(v.calls.length,2);
+  for(const call of v.calls){const q=new URL(call.url,'http://localhost').searchParams;assert.equal(q.has('diagnostic_scope'),false);assert.equal(q.has('message'),false)}
+  v.st.applied.type='rejected';assert.equal(v.queryParams(false).get('diagnostic_scope'),'rejected');
+  v.st.applied.type='5';assert.equal(v.queryParams(false).get('type'),'5');assert.equal(v.queryParams(false).has('diagnostic_scope'),false);
+});
 
 test('currency settings failure cannot show money using fallback rates; retry recovers',async()=>{
   let fail=true;
@@ -53,19 +85,21 @@ test('stat refresh clears old money and leaving a tab cancels queries without up
 
 test('only identical in-flight statistics are coalesced; completed totals refresh on a new search',async()=>{
   const waiting=deferred();let count=0;
-  const v=fixture(()=>++count===1?waiting.promise:ok({quota:200}));
+  const v=fixture(url=>url.includes('skip_quota=1')?ok({rpm:3,tpm:40}):++count===1?waiting.promise:ok({quota:200}));
+  v.st.applied.endTime=v.st.applied.startTime+3600000;
   const first=v.loadStat();
-  Object.assign(v.st.applied,{type:'5',requestId:'r1',upstreamRequestId:'up-r1'});
-  await v.loadStat();assert.equal(v.calls.length,1);assert.equal(v.calls[0].options.signal.aborted,false);
+  Object.assign(v.st.applied,{type:'2',requestId:'r1',upstreamRequestId:'up-r1'});
+  await v.loadStat();assert.equal(v.calls.length,2);assert.equal(v.calls[0].options.signal.aborted,false);
   const url=new URL(v.calls[0].url,'http://localhost');
   for(const key of['type','request_id','upstream_request_id'])assert.equal(url.searchParams.has(key),false);
   waiting.resolve(ok({quota:100}));await first;assert.equal(v.st.stat.quota,100);
-  await v.loadStat();assert.equal(v.calls.length,2);assert.equal(v.st.stat.quota,200);
+  await v.loadStat();assert.equal(v.calls.length,4);assert.equal(v.st.stat.quota,200);
 });
 
 test('a changed statistics scope cancels the old sum and cannot inherit its result',async()=>{
   const waiting=deferred();let count=0;
-  const v=fixture(()=>++count===1?waiting.promise:ok({quota:200}));
+  const v=fixture(url=>url.includes('skip_quota=1')?ok({rpm:3,tpm:40}):++count===1?waiting.promise:ok({quota:200}));
+  v.st.applied.endTime=v.st.applied.startTime+3600000;
   const first=v.loadStat();v.st.applied.username='other-user';await v.loadStat();
   assert.equal(v.calls[0].options.signal.aborted,true);assert.equal(v.st.stat.quota,200);
   waiting.resolve(ok({quota:999999}));await first;assert.equal(v.st.stat.quota,200);
@@ -113,12 +147,253 @@ test('legacy/unknown/refund/subscription logs render safely; untrusted strings r
 });
 
 const tick=()=>new Promise(resolve=>setImmediate(resolve));
-test('a slow exact count does not block visible records; statistics start after the count',async()=>{
+
+function smartStatsFixture(items,extra={}){
+  const v=fixture(url=>url.includes('/list?')?ok({items,total:items.length,has_more:false,page_size:100,...extra}):url.includes('/count?')?ok({total:300}):ok(url.includes('skip_quota=1')?{rpm:3,tpm:120}:{quota:500000}));
+  v.st.applied.endTime=v.st.applied.startTime+3600000;
+  return v;
+}
+const clickCount=v=>v.onPagerClick({target:{closest:s=>s==='[data-count-calc]'?{disabled:false}:null}});
+
+test('non-consume types never request statistics, including an explicit retry; no fabricated zero',async()=>{
+  for(const type of ['1','3','4','5','6','7']){
+    const v=smartStatsFixture([{...row,type:Number(type)}]);v.st.applied.type=type;
+    v.prepareSearch();await v.loadList();await v.loadStat(true);await tick();
+    assert.equal(v.calls.filter(c=>c.url.includes('/stat?')).length,0,type);
+    assert.equal(v.calls.length,1,'no extra presence probe or aggregation');
+    assert.match(v.el('ulStats').innerHTML,/所选日志类型不包含消费/);
+    assert.doesNotMatch(v.el('ulStats').innerHTML,/skeleton|¥0|RPM <b>0/);
+    v.cancelQueries();assert.match(v.el('ulStats').innerHTML,/不包含消费/);
+  }
+});
+test('ordinary all/consume customer-model-group searches retain automatic quota and real-time rates',async()=>{
+  for(const type of ['0','2']){
+    const v=smartStatsFixture([row]);Object.assign(v.st.applied,{type,username:'fixture',group:'default',model:'model',channel:'7'});
+    v.prepareSearch();await v.loadList();await tick();
+    const calls=v.calls.filter(c=>c.url.includes('/stat?'));assert.equal(calls.length,2,type);
+    for(const c of calls){const q=new URL(c.url,'http://localhost').searchParams;for(const k of ['username','group','model_name','channel'])assert.ok(q.has(k),k)}
+    assert.match(v.el('ulStats').innerHTML,/¥7/);assert.match(v.el('ulStats').innerHTML,/RPM <b>3/);assert.match(v.el('ulStats').innerHTML,/TPM <b>120/);
+    assert.match(v.el('ulStats').innerHTML,/最近 60 秒/);
+  }
+});
+test('complete first page without consumption skips stats; zero rows is not a zero monetary result',async()=>{
+  for(const items of [[],[{...row,type:5}],[{...row,type:5},{...row,id:2,type:6}]]){
+    const v=smartStatsFixture(items);v.prepareSearch();await v.loadList();await tick();
+    assert.equal(v.calls.length,1);assert.equal(v.st.stat,null);assert.equal(v.st.consumeEvidence.status,'none');
+    assert.match(v.el('ulStats').innerHTML,/完整查询结果不包含消费/);assert.doesNotMatch(v.el('ulStats').innerHTML,/¥0|skeleton/);
+  }
+});
+test('absence on a partial first page or final later page cannot suppress valid automatic statistics',async()=>{
+  const v=smartStatsFixture([{...row,type:5}],{total:null,total_pending:true,has_more:true,page_size:100});
+  v.prepareSearch();await v.loadList();await tick();assert.equal(v.st.consumeEvidence.status,'unknown');
+  assert.equal(v.calls.filter(c=>c.url.includes('/stat?')).length,2);assert.match(v.el('ulStats').innerHTML,/¥7/);
+  v.st.page=2;await v.loadList();await tick();assert.equal(v.st.consumeEvidence.status,'unknown');assert.match(v.el('ulStats').innerHTML,/¥7/);
+  const w=smartStatsFixture([{...row,type:5}],{total:101,has_more:false});w.st.page=2;
+  w.prepareSearch();await w.loadList();await tick();assert.equal(w.st.consumeEvidence.status,'unknown');assert.equal(w.calls.filter(c=>c.url.includes('/stat?')).length,2);
+});
+test('consumption evidence survives paging but expires on a new search, customer or refresh',async()=>{
+  let consumes=true;
+  const v=fixture(url=>url.includes('/list?')?ok({items:[{...row,type:consumes?2:5}],total:1,page_size:100}):ok(url.includes('skip_quota=1')?{rpm:3,tpm:120}:{quota:500000}));
+  v.st.applied.endTime=v.st.applied.startTime+3600000;
+  v.prepareSearch();await v.loadList();await tick();assert.equal(v.st.consumeEvidence.status,'present');
+  consumes=false;v.st.page=2;await v.loadList();assert.equal(v.st.consumeEvidence.status,'present');assert.match(v.el('ulStats').innerHTML,/¥7/);
+  v.st.page=1;v.prepareSearch();await v.loadList();await tick();assert.equal(v.st.consumeEvidence.status,'none');assert.match(v.el('ulStats').innerHTML,/不包含消费/);
+  consumes=true;v.prepareSearch();await v.loadList();await tick();assert.equal(v.st.consumeEvidence.status,'present');assert.match(v.el('ulStats').innerHTML,/¥7/);
+});
+test('switching to errors aborts old quota/rates and late success cannot resurrect their cards',async()=>{
+  const wait=deferred(),v=fixture(()=>wait.promise);v.st.applied.endTime=v.st.applied.startTime+3600000;
+  const task=v.loadStat();v.st.applied.type='5';v.prepareSearch();
+  assert.ok(v.calls.every(c=>c.options.signal.aborted));assert.equal(v.st.statLoading,false);
+  const note=v.el('ulStats').innerHTML;assert.match(note,/所选日志类型不包含消费/);
+  wait.resolve(ok({quota:999999,rpm:999,tpm:999}));await task;
+  assert.equal(v.el('ulStats').innerHTML,note);assert.equal(v.st.stat,null);
+});
+test('mixed issues/rejection modes can consume and keep automatic statistics when consume rows exist',async()=>{
+  for(const type of ['issues','rejected']){
+    const v=smartStatsFixture([row],{total:null,total_pending:true,has_more:true});v.st.applied.type=type;
+    v.prepareSearch();await v.loadList();await tick();
+    assert.equal(v.calls.filter(c=>c.url.includes('/stat?')).length,2);assert.equal(v.calls.filter(c=>c.url.includes('/count?')).length,0);
+    assert.match(v.el('ulStats').innerHTML,/¥7/);assert.match(v.el('ulPager').innerHTML,/总计：未计算/);
+  }
+});
+test('diagnostic exact count is explicit, coalesced, does not block paging and is reused afterwards',async()=>{
+  const waiting=deferred();let counts=0;
+  const v=fixture(url=>url.includes('/count?')?(++counts,waiting.promise):url.includes('/list?')?ok({items:[row],total:null,total_pending:true,has_more:true,page_size:100,next_cursor:{created_at:row.created_at,id:row.id}}):ok({}));
+  v.st.applied.message='refusal';await v.loadList();
+  assert.equal(counts,0);assert.match(v.el('ulPager').innerHTML,/计算总数/);assert.equal(v.st.hasMore,true);
+  clickCount(v);clickCount(v);assert.equal(counts,1);assert.match(v.el('ulPager').innerHTML,/data-count-calc disabled/);
+  v.st.page=2;await v.loadList();assert.equal(counts,1);assert.equal(v.queryParams(true).has('before_id'),true);
+  waiting.resolve(ok({total:300}));await tick();assert.equal(v.st.totalKnown,true);assert.equal(v.st.total,300);
+  v.st.page=3;await v.loadList();await tick();assert.equal(counts,1);assert.equal(v.st.total,300);
+});
+test('diagnostic count failure restores a clickable retry without hiding rows or inventing zero',async()=>{
+  let fail=true;
+  const v=fixture(url=>url.includes('/count?')?(fail?new Response('{"success":false,"message":"timeout"}'):ok({total:30})):ok({items:[row],total:null,total_pending:true,has_more:true,page_size:100}));
+  v.st.applied.type='issues';await v.loadList();clickCount(v);await tick();
+  assert.equal(v.st.totalKnown,false);assert.equal(v.st.items.length,1);assert.equal(v.st.hasMore,true);
+  assert.match(v.el('ulPager').innerHTML,/暂不可用/);assert.doesNotMatch(v.el('ulPager').innerHTML,/data-count-calc disabled/);
+  fail=false;clickCount(v);await tick();assert.equal(v.st.totalKnown,true);assert.equal(v.st.total,30);
+});
+test('old diagnostic count cannot overwrite a changed search; completed small results need no count',async()=>{
+  const waiting=deferred();let countCalls=0;
+  const v=fixture(url=>url.includes('/count?')?(++countCalls,waiting.promise):url.includes('message=new')?ok({items:[{...row,id:2}],total:1,page_size:100}):ok({items:[row],total:null,total_pending:true,has_more:true,page_size:100}));
+  v.st.applied.message='old';await v.loadList();clickCount(v);
+  const old=v.calls.find(c=>c.url.includes('/count?'));v.st.applied.message='new';v.prepareSearch();await v.loadList();
+  assert.equal(old.options.signal.aborted,true);assert.equal(v.st.total,1);
+  waiting.resolve(ok({total:9999}));await tick();assert.equal(v.st.total,1);assert.equal(countCalls,1);assert.equal(v.st.items[0].id,2);
+});
+
+const batchCursor=id=>({id,created_at:row.created_at});
+function batchReply(items,{pending=false,more=false,cursor=null,scanned=1000,total=null}={}){
+  return{items,bounded_search:true,scan_pending:pending,scan_cursor:pending?cursor:null,has_more:more,next_cursor:more?cursor:null,scanned,total,total_pending:total===null};
+}
+function boundedFixture(handler){
+  const v=fixture((url,options)=>url.includes('/list?')?handler(new URL(url,'http://localhost').searchParams,options):ok(url.includes('/count?')?{total:1234}:url.includes('skip_quota=1')?{rpm:1,tpm:20}:{quota:500000}));
+  v.st.meta.diagnostic_batch_enabled=true;v.st.applied.message='refusal';v.st.applied.endTime=v.st.applied.startTime+3600000;
+  return v;
+}
+test('bounded empty batches stop only at safety limit, retain progress, and cannot claim no matches in the full range',async()=>{
+  let n=0;const v=boundedFixture(()=>ok(batchReply([],{pending:true,cursor:batchCursor(100000-1000*++n)})));
+  v.prepareSearch();await v.loadList();await tick();assert.equal(n,64);assert.equal(v.st.scanPending,true);assert.equal(v.st.scanScanned,64000);
+  assert.match(v.el('ulTableWrap').innerHTML,/尚未查完/);assert.match(v.el('ulPager').innerHTML,/恢复查询/);
+  assert.equal(v.calls.filter(x=>x.url.includes('/stat?')).length,0);assert.equal(v.calls.filter(x=>x.url.includes('/count?')).length,0);
+  assert.equal(v.st.totalKnown,false);assert.match(v.el('ulStats').innerHTML,/检索尚未完成/);
+  assert.equal(new URL(v.calls[1].url,'http://localhost').searchParams.get('before_id'),'99000');
+});
+test('empty intermediate batches auto-continue to true exhaustion without inventing a single-snapshot total',async()=>{
+  let n=0;const v=boundedFixture(()=>ok(++n<=3?batchReply([],{pending:true,cursor:batchCursor(100-10*n)}):batchReply([],{scanned:50})));
+  v.prepareSearch();await v.loadList();await tick();
+  assert.equal(n,4);assert.equal(new URL(v.calls[3].url,'http://localhost').searchParams.get('before_id'),'70');
+  assert.equal(v.st.scanPending,false);assert.equal(v.st.scanScanned,3050);assert.equal(v.st.totalKnown,false);
+  assert.match(v.el('ulTableWrap').innerHTML,/已查完所选范围/);assert.equal(v.calls.filter(c=>c.url.includes('/stat?')).length,0);
+});
+test('bounded page filling combines ordered results and requests only remaining rows; statistics start once',async()=>{
+  let n=0;const ids=[30,19,9];const v=boundedFixture(q=>{
+    const i=n++;assert.equal(q.get('page_size'),String(100-i));
+    return ok(batchReply([{...row,id:ids[i]}],i<2?{pending:true,cursor:batchCursor(i===0?20:10)}:{scanned:50}));
+  });
+  v.prepareSearch();await v.loadList();await tick();assert.equal(n,3);assert.deepEqual(Array.from(v.st.items,x=>x.id),ids);
+  assert.equal(v.st.pageSize,100);assert.equal(v.st.scanPending,false);assert.equal(v.calls.filter(c=>c.url.includes('/stat?')).length,2);
+});
+test('matched page cursor, not candidate tail, preserves matches not yet displayed',async()=>{
+  let n=0;const v=boundedFixture(q=>{n++;return ok(n===1?batchReply([{...row,id:30},{...row,id:29}],{more:true,cursor:batchCursor(29),scanned:2}):batchReply([{...row,id:28}],{scanned:30}))});
+  v.st.pageSize=2;await v.loadList();assert.equal(n,1);assert.equal(v.st.pageCursors.get(2).id,29);
+  v.st.page=2;await v.loadList();assert.equal(new URL(v.calls[1].url,'http://localhost').searchParams.get('before_id'),'29');
+  assert.equal(v.st.items[0].id,28);
+});
+test('a full page without another match disables next, instead of offering a false empty page',async()=>{
+  let n=0;const v=boundedFixture(q=>{n++;if(n===1)return ok(batchReply([{...row,id:30},{...row,id:29}],{pending:true,cursor:batchCursor(10)}));assert.equal(q.get('page_size'),'1');return ok(batchReply([],{scanned:10}))});
+  v.st.pageSize=2;await v.loadList();assert.equal(n,2);assert.equal(v.st.pageCursors.has(2),false);assert.equal(v.st.hasMore,false);assert.equal(v.st.totalKnown,false);
+  assert.match(v.el('ulPager').innerHTML,/data-page="2" disabled/);assert.doesNotMatch(v.el('ulPager').innerHTML,/查找下一页/);
+});
+test('proof-only lookup keeps the discovered next row reachable and never appends it to a full page',async()=>{
+  let n=0;const v=boundedFixture(q=>{n++;if(n===1)return ok(batchReply([{...row,id:30},{...row,id:29}],{pending:true,cursor:batchCursor(10)}));assert.equal(q.get('before_id'),'10');return ok(batchReply([{...row,id:9}],{scanned:3}))});
+  v.st.pageSize=2;await v.loadList();assert.equal(n,2);assert.equal(v.st.hasMore,true);assert.equal(v.st.scanPending,false);
+  assert.deepEqual(Array.from(v.st.items,x=>x.id),[30,29]);assert.equal(v.st.pageCursors.get(2).id,10);
+  v.st.page=2;await v.loadList();assert.deepEqual(Array.from(v.st.items,x=>x.id),[9]);assert.equal(v.st.hasMore,false);
+});
+test('proof failure leaves a full but unfinished page, blocks next and resumes without duplicate rows',async()=>{
+  let n=0,fail=true;const v=boundedFixture(()=>++n===1?ok(batchReply([{...row,id:30},{...row,id:29}],{pending:true,cursor:batchCursor(10)})):fail?new Response('{"success":false,"message":"timeout"}'):ok(batchReply([{...row,id:9}],{scanned:3})));
+  v.st.pageSize=2;await v.loadList();assert.equal(v.st.scanPending,true);assert.equal(v.st.pageCursors.has(2),false);assert.match(v.el('ulTableWrap').innerHTML,/本页未完成/);assert.match(v.el('ulPager').innerHTML,/data-page="2" disabled/);
+  fail=false;await v.loadList(true);assert.equal(v.st.hasMore,true);assert.deepEqual(Array.from(v.st.items,x=>x.id),[30,29]);assert.equal(v.st.pageCursors.get(2).id,10);
+});
+test('failed later batch retains rows/checkpoint and can retry without skipping the failed interval',async()=>{
+  let n=0,fail=true;const v=boundedFixture(q=>{
+    n++;if(n===1)return ok(batchReply([{...row,id:30}],{pending:true,cursor:batchCursor(20)}));
+    assert.equal(q.get('before_id'),'20');if(fail)return new Response('{"success":false,"message":"source failed"}');
+    return ok(batchReply([{...row,id:19}],{scanned:100}));
+  });
+  v.prepareSearch();await v.loadList();await tick();assert.equal(v.st.items.length,1);assert.equal(v.st.scanCursor.id,20);assert.match(v.el('ulPager').innerHTML,/source failed/);
+  fail=false;await v.loadList(true);await tick();assert.deepEqual(Array.from(v.st.items,x=>x.id),[30,19]);assert.equal(v.st.scanPending,false);
+});
+test('cancellation retains only completed batch state; late source response cannot advance it or issue more batches',async()=>{
+  const waiting=deferred();let n=0;const v=boundedFixture(()=>++n===1?ok(batchReply([{...row,id:30}],{pending:true,cursor:batchCursor(20)})):waiting.promise);
+  v.prepareSearch();const p=v.loadList();await tick();assert.equal(n,2);v.cancelQueries();
+  assert.equal(v.st.items[0].id,30);assert.equal(v.st.scanCursor.id,20);assert.match(v.el('ulPager').innerHTML,/已取消/);
+  waiting.resolve(ok(batchReply([{...row,id:19}],{pending:true,cursor:batchCursor(10)})));await p;
+  assert.equal(n,2);assert.equal(v.st.scanCursor.id,20);assert.equal(v.st.items.length,1);
+});
+test('unsafe/non-progressing cursors fail closed and cannot cause an auto-request loop',async()=>{
+  let n=0;const v=boundedFixture(()=>ok(batchReply([],{pending:true,cursor:batchCursor(20)})));
+  v.prepareSearch();await v.loadList();assert.equal(v.calls.filter(c=>c.url.includes('/list?')).length,2);
+  assert.equal(v.st.scanCursor.id,20);assert.match(v.el('ulPager').innerHTML,/续查位置无效/);
+});
+test('new bounded search cancels an old pending batch without mixing its results into the new filter',async()=>{
+  const old=deferred();let n=0;const v=boundedFixture(q=>q.get('message')==='old'?old.promise:ok(batchReply([{...row,id:2}],{scanned:1,total:1})));
+  v.st.applied.message='old';v.prepareSearch();const p=v.loadList();v.st.applied.message='new';v.prepareSearch();await v.loadList();await tick();
+  old.resolve(ok(batchReply([{...row,id:30}],{pending:true,cursor:batchCursor(20)})));await p;
+  assert.equal(v.st.items[0].id,2);assert.equal(v.st.scanPending,false);assert.equal(v.st.scanScanned,1);
+});
+test('a failed new page cannot inherit the old unfinished page checkpoint',async()=>{
+  let n=0;const v=boundedFixture(()=>++n===1?ok(batchReply([{...row,id:30}],{pending:true,cursor:batchCursor(20)})):new Response('{"success":false,"message":"offline"}'));
+  v.st.page=2;v.st.pageCursors.set(2,batchCursor(40));await v.loadList();assert.equal(v.st.scanPending,true);
+  v.st.page=1;await v.loadList();assert.equal(v.st.scanPending,false);assert.equal(v.st.scanCursor,null);
+  assert.doesNotMatch(v.el('ulPager').innerHTML,/恢复查询/);assert.equal(v.st.items.length,0);
+});
+test('one wall deadline covers automatic batches; timeout preserves only the last committed checkpoint',async()=>{
+  const waiting=deferred();let n=0;const v=boundedFixture(()=>++n===1?ok(batchReply([],{pending:true,cursor:batchCursor(20)})):waiting.promise);
+  v.prepareSearch();const p=v.loadList();await tick();
+  const timer=[...v.timers.values()].find(x=>x.ms===30000);assert.ok(timer);timer.fn();
+  waiting.resolve(ok(batchReply([],{pending:true,cursor:batchCursor(10)})));await p;
+  assert.equal(n,2);assert.equal(v.st.scanCursor.id,20);assert.equal(v.st.scanPending,true);assert.match(v.el('ulPager').innerHTML,/等待超时/);
+});
+
+test('rates become visible before a slow quota and the responses do not erase each other',async()=>{
+ const sum=deferred(),v=fixture(url=>url.includes('quota_only=1')?sum.promise:ok({quota:null,quota_skipped:true,rpm:6,tpm:120}));
+ v.st.applied.endTime=v.st.applied.startTime+3600000;
+ const pending=v.loadStat();await tick();
+ assert.match(v.el('ulStats').innerHTML,/RPM <b>6/);assert.match(v.el('ulStats').innerHTML,/TPM <b>120/);
+ assert.match(v.el('ulStats').innerHTML,/sky skeleton/);assert.equal(v.st.statLoading,true);
+ assert.equal(v.calls.length,2);assert.ok(v.calls[0].url.includes('skip_quota=1'));assert.ok(v.calls[1].url.includes('quota_only=1'));
+ sum.resolve(ok({quota:500000,rates_skipped:true,rpm:null,tpm:null}));await pending;
+ assert.match(v.el('ulStats').innerHTML,/¥7/);assert.match(v.el('ulStats').innerHTML,/RPM <b>6/);assert.doesNotMatch(v.el('ulStats').innerHTML,/skeleton/);
+});
+test('quota may finish first without inventing zero RPM or overwriting the amount later',async()=>{
+ const rate=deferred(),v=fixture(url=>url.includes('skip_quota=1')?rate.promise:ok({quota:500000,rates_skipped:true}));
+ v.st.applied.endTime=v.st.applied.startTime+3600000;
+ const pending=v.loadStat();await tick();assert.match(v.el('ulStats').innerHTML,/¥7/);
+ assert.match(v.el('ulStats').innerHTML,/rose skeleton/);assert.doesNotMatch(v.el('ulStats').innerHTML,/RPM <b>0/);
+ rate.resolve(ok({quota:null,quota_skipped:true,rpm:8,tpm:90}));await pending;
+ assert.match(v.el('ulStats').innerHTML,/¥7/);assert.match(v.el('ulStats').innerHTML,/RPM <b>8/);
+});
+test('partial errors keep successful results and allow an explicit quota retry',async()=>{
+ let fail=true;
+ const v=fixture(url=>url.includes('skip_quota=1')?ok({rpm:9,tpm:80}):fail?new Response('{"success":false,"message":"sum timeout"}'):ok({quota:500000}));
+ v.st.applied.endTime=v.st.applied.startTime+3600000;
+ await v.loadStat();assert.match(v.el('ulStats').innerHTML,/RPM <b>9/);assert.match(v.el('ulStats').innerHTML,/用量计算失败 · 重试/);
+ assert.doesNotMatch(v.el('ulStats').innerHTML,/¥0/);
+ fail=false;await v.loadStat(true);assert.match(v.el('ulStats').innerHTML,/¥7/);assert.doesNotMatch(v.el('ulStats').innerHTML,/失败/);
+ const w=fixture(url=>url.includes('skip_quota=1')?new Response('{"success":false,"message":"rates timeout"}'):ok({quota:500000}));
+ w.st.applied.endTime=w.st.applied.startTime+3600000;
+ await w.loadStat();assert.match(w.el('ulStats').innerHTML,/¥7/);assert.match(w.el('ulStats').innerHTML,/RPM 暂不可用/);
+});
+test('cancel after a partial result stops both requests and leaves no endless skeleton',async()=>{
+ const sum=deferred(),v=fixture(url=>url.includes('skip_quota=1')?ok({rpm:3,tpm:10}):sum.promise);
+ v.st.applied.endTime=v.st.applied.startTime+3600000;
+ const p=v.loadStat();await tick();v.cancelQueries();
+ assert.equal(v.calls.find(c=>c.url.includes('quota_only=1')).options.signal.aborted,true);assert.doesNotMatch(v.el('ulStats').innerHTML,/skeleton/);
+ assert.match(v.el('ulStats').innerHTML,/RPM <b>3/);
+ const frozen=v.el('ulStats').innerHTML;sum.resolve(ok({quota:999999}));await p;
+ assert.equal(v.el('ulStats').innerHTML,frozen);assert.equal(v.st.statLoading,false);
+});
+test('both late parts from an old scope are ignored after changing filters',async()=>{
+ const oldRates=deferred(),oldQuota=deferred();
+ const v=fixture(url=>url.includes('username=new')?ok(url.includes('quota_only=1')?{quota:1000000}:{rpm:12,tpm:24}):url.includes('quota_only=1')?oldQuota.promise:oldRates.promise);
+ v.st.applied.endTime=v.st.applied.startTime+3600000;
+ const old=v.loadStat();v.st.applied.username='new';await v.loadStat();
+ const current=v.el('ulStats').innerHTML;assert.match(current,/RPM <b>12/);assert.match(current,/¥14/);
+ oldQuota.resolve(ok({quota:9999999}));oldRates.resolve(ok({rpm:9999,tpm:9999}));await old;
+ assert.equal(v.el('ulStats').innerHTML,current);
+ assert.ok(v.calls.slice(0,2).every(c=>c.options.signal.aborted));
+});
+test('a slow exact count blocks neither records nor statistics',async()=>{
   const counting=deferred();
   const v=fixture(url=>url.includes('/count?')?counting.promise:ok(url.includes('/stat?')?{quota:77}:{items:[row],total:null,total_pending:true,has_more:true,page_size:100}));
+  v.st.applied.endTime=v.st.applied.startTime+3600000;
   v.st.statRequested=true;await v.loadList();
   assert.equal(v.st.items[0].id,1);assert.equal(v.st.totalKnown,false);assert.equal(v.el('ulSearch').disabled,false);
-  assert.match(v.el('ulPager').innerHTML,/计算中/);assert.ok(!v.calls.some(c=>c.url.includes('/stat?')));
+  assert.match(v.el('ulPager').innerHTML,/计算中/);assert.ok(v.calls.some(c=>c.url.includes('/stat?')));
+  await tick();assert.equal(v.st.totalKnown,false);assert.equal(v.st.stat.quota,77);
   assert.match(v.calls[0].url,/defer_total=1/);
   counting.resolve(ok({total:2005}));await tick();
   assert.equal(v.st.total,2005);assert.equal(v.st.totalKnown,true);assert.equal(v.st.stat.quota,77);
@@ -130,8 +405,9 @@ test('completed first-page results need no count request and no duplicate count 
 });
 test('identical in-flight statistics are not recomputed when they finish during deferred counting',async()=>{
   const statistic=deferred(),counting=deferred();let statCalls=0;
-  const v=fixture(url=>url.includes('/stat?')?(++statCalls,statistic.promise):url.includes('/count?')?counting.promise:ok({items:[row],total_pending:true,total:null,has_more:true,page_size:100}));
-  const first=v.loadStat();v.st.applied.type='5';v.prepareSearch();await v.loadList();
+  const v=fixture(url=>url.includes('skip_quota=1')?ok({rpm:1,tpm:10}):url.includes('/stat?')?(++statCalls,statistic.promise):url.includes('/count?')?counting.promise:ok({items:[row],total_pending:true,total:null,has_more:true,page_size:100}));
+  v.st.applied.endTime=v.st.applied.startTime+3600000;
+  const first=v.loadStat();v.st.applied.type='2';v.prepareSearch();await v.loadList();
   assert.equal(v.st.statRequested,false);
   statistic.resolve(ok({quota:77}));await first;
   counting.resolve(ok({total:200}));await tick();assert.equal(statCalls,1);assert.equal(v.st.stat.quota,77);
@@ -215,7 +491,16 @@ test('repeated Enter shares the unchanged running search but changed filters sti
 test('server queries put MySQL time hints after SELECT; page remains isolated from Usage',()=>{
   const go=readFileSync(new URL('../../monitor/newapi_usage_logs.go',import.meta.url),'utf8');
   assert.match(go,/usageLogsSelect\s*= "SELECT \/\*\+ MAX_EXECUTION_TIME\(18000\) \*\/ "/);
-  const queries=go.match(/(?:QueryContext|QueryRowContext)\(ctx, usageLogsSelect\+/g)||[];assert.equal(queries.length,9);
+  const quotaGo=readFileSync(new URL('../../monitor/usage_logs_quota.go',import.meta.url),'utf8');
+  // The two exact time-index fallback SELECTs share the same server budget.
+  const queries=(go+'\n'+quotaGo).match(/(?:QueryContext|QueryRowContext)\(ctx, usageLogsSelect\+/g)||[];assert.equal(queries.length,10);
+  const planGo=readFileSync(new URL('../../monitor/usage_logs_aggregate_probe.go',import.meta.url),'utf8');
+  assert.match(planGo,/q := usageLogsSelect \+ "CASE WHEN/);
+  assert.match(planGo,/usageLogsAggregateProbeSQL\(f, w, expression\)/);
+  assert.doesNotMatch(planGo,/UNION ALL/,'retired UNION is test-only');
+  assert.equal((quotaGo.match(/usageLogsProbeAggregate\(ctx, db,/g)||[]).length,2,'COUNT and SUM share the exact-or-plan protocol');
+  assert.equal((go.match(/m\.queryUsageLogsCount\(ctx, db,/g)||[]).length,2,'both COUNT callers share the guarded SQL helper');
+  assert.match(quotaGo,/query := usageLogsSelect \+ `CASE/);
   assert.match(go,/COUNT\(\*\) OVER\(\) AS page_matches FROM \(SELECT id AS page_id, created_at AS page_created_at/);
   assert.match(go,/COUNT\(\*\) OVER\(\) AS matched_total/);
   const html=readFileSync(new URL('../../monitor/page.html',import.meta.url),'utf8');assert.match(html,/else if\(window\.usageLogsDeactivate\)window\.usageLogsDeactivate\(\)/);
@@ -244,7 +529,7 @@ test('wide-range failures keep the rates and stay calculable; cancel offers the 
   await v.loadStat();await v.loadStat(true);
   assert.match(v.el('ulStats').innerHTML,/RPM <b>4/);assert.match(v.el('ulStats').innerHTML,/data-quota-calc/);assert.match(v.el('ulStats').innerHTML,/用量计算失败/);
   failRates=true;await v.loadStat();
-  assert.match(v.el('ulStats').innerHTML,/统计加载失败/);assert.match(v.el('ulStats').innerHTML,/data-quota-calc/);
+  assert.match(v.el('ulStats').innerHTML,/RPM 暂不可用/);assert.match(v.el('ulStats').innerHTML,/data-quota-calc/);
   v.st.rates=null;v.st.stat=null;v.cancelQueries();assert.match(v.el('ulStats').innerHTML,/data-quota-calc/);
 });
 test('searching again with unchanged filters keeps a clicked wide-range SUM running',async()=>{

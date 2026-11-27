@@ -2229,7 +2229,9 @@ func TestMySQLLogSourceClauseRoutesSelectiveFilters(t *testing.T) {
 		memberUID                                int64
 		model, group, tokenName, requestID, want string
 	}{
-		{name: "organization", members: 9, want: "logs FORCE INDEX (idx_created_at_type)"},
+		{name: "organization", members: 9, want: "logs"},
+		{name: "two members optimizer", members: 2, want: "logs"},
+		{name: "large organization optimizer", members: 64, want: "logs"},
 		{name: "single member", members: 9, memberUID: 63, want: "logs FORCE INDEX (idx_user_created_type)"},
 		{name: "one member organization", members: 1, want: "logs FORCE INDEX (idx_user_created_type)"},
 		{name: "group", members: 9, group: "codex-1.4x", want: "logs FORCE INDEX (idx_logs_user_group_created_type)"},

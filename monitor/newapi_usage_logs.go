@@ -76,9 +76,11 @@ type usageLogFilter struct {
 	RequestID         string
 	UpstreamRequestID string
 	Channel           int
-	// UserID is never parsed from the request. It is set only by
-	// usageLogsUsernameUserID once an exact username is proven equivalent to
-	// one user_id, so COUNT/SUM can use the (user_id, created_at, type) index.
+	DiagnosticScope   string
+	Message           string
+	// UserID is internal only, never parsed from this page's request or
+	// inferred from mutable current usernames. Historical username predicates
+	// must retain their exact original meaning.
 	UserID int64
 }
 
@@ -98,6 +100,8 @@ func parseUsageLogFilter(c *gin.Context) usageLogFilter {
 		RequestID:         c.Query("request_id"),
 		UpstreamRequestID: c.Query("upstream_request_id"),
 		Channel:           atoi("channel"),
+		DiagnosticScope:   c.Query("diagnostic_scope"),
+		Message:           strings.TrimSpace(c.Query("message")),
 	}
 }
 
@@ -145,7 +149,7 @@ const (
 	usageLogWhereRate                           // as stat, but the caller adds its own time window
 )
 
-func buildUsageLogWhere(f usageLogFilter, scope usageLogWhereScope) (*usageLogWhere, error) {
+func buildUsageLogWhere(f usageLogFilter, scope usageLogWhereScope, mysqlJSON ...bool) (*usageLogWhere, error) {
 	w := &usageLogWhere{}
 	switch scope {
 	case usageLogWhereList:
@@ -194,6 +198,10 @@ func buildUsageLogWhere(f usageLogFilter, scope usageLogWhereScope) (*usageLogWh
 		}
 		if f.UpstreamRequestID != "" {
 			w.add("upstream_request_id = ?", f.UpstreamRequestID)
+		}
+		mysql := len(mysqlJSON) > 0 && mysqlJSON[0]
+		if err := appendUsageLogDiagnosticWhere(w, f, mysql); err != nil {
+			return nil, err
 		}
 	}
 	return w, nil
@@ -400,24 +408,31 @@ func (m *Monitor) usageLogsSource(c *gin.Context, background bool) (usageLogsQue
 	ctx, cancel := context.WithTimeout(c.Request.Context(), usageLogsQueryTimeout)
 	c.Request = c.Request.WithContext(ctx)
 	backgroundRelease := func() {}
+	filter := parseUsageLogFilter(c)
 	if background {
 		m.initUsageLogsGates()
 		var err error
+		started := time.Now()
 		backgroundRelease, err = acquireUsageLogsSlot(ctx, m.usageLogsBackgroundGate)
+		usageLogsObserve("heavy_gate_wait", started, filter)
 		if err != nil {
 			usageLogsFail(c, usageLogsQueryErr(ctx, err))
 			cancel()
 			return nil, nil, false
 		}
 	}
+	gateStarted := time.Now()
 	release, err := m.acquireUsageLogsGate(ctx)
+	usageLogsObserve("query_gate_wait", gateStarted, filter)
 	if err != nil {
 		backgroundRelease()
 		usageLogsFail(c, usageLogsQueryErr(ctx, err))
 		cancel()
 		return nil, nil, false
 	}
+	poolStarted := time.Now()
 	conn, err := m.prodDB.Conn(ctx)
+	usageLogsObserve("connection_pool_wait", poolStarted, filter)
 	if err != nil {
 		release()
 		backgroundRelease()
@@ -596,7 +611,7 @@ func usageLogsPageSQL(where *usageLogWhere, source string, page, size int, curso
 // GET /usage-logs/list
 func (m *Monitor) serveUsageLogsList(c *gin.Context) {
 	f := parseUsageLogFilter(c)
-	where, err := buildUsageLogWhere(f, usageLogWhereList)
+	where, err := buildUsageLogWhere(f, usageLogWhereList, m.usageLogsMySQL())
 	if err != nil {
 		usageLogsFail(c, err)
 		return
@@ -607,50 +622,44 @@ func (m *Monitor) serveUsageLogsList(c *gin.Context) {
 		usageLogsFail(c, err)
 		return
 	}
-	db, release, ok := m.usageLogsSource(c, false)
+	deferTotal := c.Query("defer_total") == "1"
+	bounded := c.Query("bounded_search") == "1"
+	if bounded {
+		if !deferTotal || !usageLogsHasDiagnosticFilter(f) || f.RequestID != "" || f.UpstreamRequestID != "" {
+			usageLogsFail(c, errors.New("分批检索参数组合无效"))
+			return
+		}
+		if page > 1 && cursor == nil || cursor != nil && (cursor.CreatedAt < f.Start || cursor.CreatedAt > f.End) {
+			usageLogsFail(c, errors.New("分批检索位置已失效，请从第一页重新搜索"))
+			return
+		}
+	}
+	// Legacy list+COUNT requests also use the single heavy admission slot;
+	// the page's defer_total=1 and indexed request-ID lookups remain foreground.
+	heavy := usageLogsHasDiagnosticFilter(f) || !deferTotal && f.RequestID == "" && f.UpstreamRequestID == ""
+	db, release, ok := m.usageLogsSource(c, heavy)
 	if !ok {
 		return
 	}
 	defer release()
 	ctx, cancel := context.WithTimeout(c.Request.Context(), usageLogsQueryTimeout)
 	defer cancel()
+	if bounded {
+		m.serveUsageLogsDiagnosticBatch(ctx, c, db, f, where, cursor, page, size)
+		return
+	}
 	if f.RequestID != "" || f.UpstreamRequestID != "" {
 		m.serveUsageLogsIDPage(ctx, c, db, f, where, cursor, page, size)
 		return
 	}
-	deferTotal := c.Query("defer_total") == "1"
-	// The page rows take the same user_id switch as COUNT/SUM: it is made only
-	// when it selects exactly the username's rows (usageLogsUsernameUserID).
-	// Without it, username + channel intersected two whole-history indexes on
-	// production and hit the 18s cap. A failed check keeps the username plan.
-	pageFilter, indexErr := usageLogsWithUserIndex(ctx, db, f)
-	if indexErr == nil && pageFilter.UserID > 0 {
-		if userWhere, werr := buildUsageLogWhere(pageFilter, usageLogWhereList); werr == nil {
-			where = userWhere
-		} else {
-			pageFilter = f
-		}
-	} else if indexErr != nil {
-		pageFilter = f
-	}
+	// Never replace a historical username by today's user_id. This also
+	// removes four preparatory metadata queries from each name-filtered call.
+	pageFilter := f
 	var total int64
 	if !deferTotal {
 		countStarted := time.Now()
-		countFilter, err := pageFilter, indexErr
-		var countWhere *usageLogWhere
-		if err == nil {
-			countWhere, err = buildUsageLogWhere(countFilter, usageLogWhereList)
-		}
-		countSource := "logs"
-		skipCount := false
-		if err == nil {
-			var empty bool
-			countWhere, countSource, empty, _ = m.usageLogsWithIDSpan(ctx, db, countFilter, countWhere)
-			skipCount = empty
-		}
-		if err == nil && !skipCount {
-			err = db.QueryRowContext(ctx, usageLogsSelect+"COUNT(*) FROM "+countSource+countWhere.sql(), countWhere.args...).Scan(&total)
-		}
+		countFilter := f
+		total, err = m.queryUsageLogsCount(ctx, db, countFilter, where)
 		usageLogsObserve("list_count", countStarted, countFilter)
 		if err != nil {
 			err = usageLogsQueryErr(ctx, err)
@@ -724,7 +733,7 @@ func (m *Monitor) serveUsageLogsList(c *gin.Context) {
 // pagination cursor here or substitute the rate/count from /stat.
 func (m *Monitor) serveUsageLogsCount(c *gin.Context) {
 	f := parseUsageLogFilter(c)
-	where, err := buildUsageLogWhere(f, usageLogWhereList)
+	where, err := buildUsageLogWhere(f, usageLogWhereList, m.usageLogsMySQL())
 	if err != nil {
 		usageLogsFail(c, err)
 		return
@@ -737,18 +746,8 @@ func (m *Monitor) serveUsageLogsCount(c *gin.Context) {
 	ctx := c.Request.Context()
 	var total int64
 	started := time.Now()
-	countFilter, err := usageLogsWithUserIndex(ctx, db, f)
-	if err == nil && countFilter.UserID > 0 {
-		where, err = buildUsageLogWhere(countFilter, usageLogWhereList)
-	}
-	source := "logs"
-	empty := false
-	if err == nil {
-		where, source, empty, _ = m.usageLogsWithIDSpan(ctx, db, countFilter, where)
-	}
-	if err == nil && !empty {
-		err = db.QueryRowContext(ctx, usageLogsSelect+"COUNT(*) FROM "+source+where.sql(), where.args...).Scan(&total)
-	}
+	countFilter := f
+	total, err = m.queryUsageLogsCount(ctx, db, countFilter, where)
 	usageLogsObserve("list_count", started, countFilter)
 	if err != nil {
 		err = usageLogsQueryErr(ctx, err)
@@ -861,7 +860,17 @@ func usageLogsQueryErr(ctx context.Context, err error) error {
 
 // GET /usage-logs/stat
 func (m *Monitor) serveUsageLogsStat(c *gin.Context) {
+	// Independent responses let the page display the cheap last-minute rates
+	// without waiting for a range SUM. Legacy callers still receive both.
+	quotaOnly := c.Query("quota_only") == "1"
+	if quotaOnly && c.Query("skip_quota") == "1" {
+		usageLogsFail(c, errors.New("quota_only 与 skip_quota 不能同时启用"))
+		return
+	}
 	f := parseUsageLogFilter(c)
+	// Diagnostics are a list/count scope, just like type and request IDs.
+	// Keep existing consumption/rate totals and their planner eligibility.
+	f.DiagnosticScope, f.Message = "", ""
 	quotaWhere, err := buildUsageLogWhere(f, usageLogWhereStat)
 	if err != nil {
 		usageLogsFail(c, err)
@@ -880,31 +889,11 @@ func (m *Monitor) serveUsageLogsStat(c *gin.Context) {
 	defer release()
 	ctx, cancel := context.WithTimeout(c.Request.Context(), usageLogsQueryTimeout)
 	defer cancel()
-	statStarted := time.Now()
-	statFilter, err := usageLogsWithUserIndex(ctx, db, f)
-	if err == nil && statFilter.UserID > 0 {
-		if quotaWhere, err = buildUsageLogWhere(statFilter, usageLogWhereStat); err == nil {
-			rateWhere, err = buildUsageLogWhere(statFilter, usageLogWhereRate)
-			if err == nil {
-				rateWhere.add("created_at >= ?", time.Now().Unix()-usageLogsRPMWindowSeconds)
-			}
-		}
-	}
-	if err != nil {
-		err = usageLogsQueryErr(ctx, err)
-		usageLogsWarnFailure("stat_user_index", statStarted, statFilter, err)
-		usageLogsFail(c, fmt.Errorf("查询统计数据失败: %w", err))
-		return
-	}
+	statFilter := f
 	var quota, rpm, prompt, completion int64
 	if !skipQuota {
 		quotaStarted := time.Now()
-		var quotaSource string
-		var emptySpan bool
-		quotaWhere, quotaSource, emptySpan, _ = m.usageLogsWithIDSpan(ctx, db, statFilter, quotaWhere)
-		if !emptySpan {
-			err = db.QueryRowContext(ctx, usageLogsSelect+"COALESCE(SUM(quota),0) FROM "+quotaSource+quotaWhere.sql(), quotaWhere.args...).Scan(&quota)
-		}
+		quota, err = m.queryUsageLogsQuota(ctx, db, statFilter, quotaWhere)
 		usageLogsObserve("stat_quota", quotaStarted, statFilter)
 		if err != nil {
 			err = usageLogsQueryErr(ctx, err)
@@ -912,6 +901,14 @@ func (m *Monitor) serveUsageLogsStat(c *gin.Context) {
 			usageLogsFail(c, fmt.Errorf("查询统计数据失败: %w", err))
 			return
 		}
+	}
+	if quotaOnly {
+		if err := ctx.Err(); err != nil {
+			usageLogsFail(c, usageLogsQueryErr(ctx, err))
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"success": true, "message": "", "data": gin.H{"quota": quota, "quota_skipped": false, "rates_skipped": true, "rpm": nil, "tpm": nil}})
+		return
 	}
 	rateStarted := time.Now()
 	err = db.QueryRowContext(ctx, usageLogsSelect+"COUNT(*), COALESCE(SUM(prompt_tokens),0), COALESCE(SUM(completion_tokens),0) FROM logs"+rateWhere.sql(), rateWhere.args...).Scan(&rpm, &prompt, &completion)
@@ -936,17 +933,18 @@ func (m *Monitor) serveUsageLogsStat(c *gin.Context) {
 // usageLogsOptions holds the display settings read from the
 // replica's options table, with new-api's defaults.
 type usageLogsOptions struct {
-	QuotaPerUnit        float64  `json:"quota_per_unit"`
-	QuotaDisplayType    string   `json:"quota_display_type"`
-	USDExchangeRate     float64  `json:"usd_exchange_rate"`
-	CustomSymbol        string   `json:"custom_currency_symbol"`
-	CustomExchangeRate  float64  `json:"custom_currency_exchange_rate"`
-	Groups              []string `json:"groups"`
-	HasEnabledSubscribe bool     `json:"has_enabled_subscription_plans"`
+	DiagnosticBatchEnabled bool     `json:"diagnostic_batch_enabled"`
+	QuotaPerUnit           float64  `json:"quota_per_unit"`
+	QuotaDisplayType       string   `json:"quota_display_type"`
+	USDExchangeRate        float64  `json:"usd_exchange_rate"`
+	CustomSymbol           string   `json:"custom_currency_symbol"`
+	CustomExchangeRate     float64  `json:"custom_currency_exchange_rate"`
+	Groups                 []string `json:"groups"`
+	HasEnabledSubscribe    bool     `json:"has_enabled_subscription_plans"`
 }
 
 func (m *Monitor) loadUsageLogsOptions(ctx context.Context, db usageLogsQuerier) (usageLogsOptions, error) {
-	o := usageLogsOptions{QuotaPerUnit: 500000, QuotaDisplayType: "USD", USDExchangeRate: 7.3, CustomSymbol: "¤",
+	o := usageLogsOptions{DiagnosticBatchEnabled: true, QuotaPerUnit: 500000, QuotaDisplayType: "USD", USDExchangeRate: 7.3, CustomSymbol: "¤",
 		CustomExchangeRate: 1, Groups: []string{}}
 	keys := []any{"QuotaPerUnit", "USDExchangeRate", "GroupRatio", "general_setting.quota_display_type",
 		"general_setting.custom_currency_symbol", "general_setting.custom_currency_exchange_rate"}

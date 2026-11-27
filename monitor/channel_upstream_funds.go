@@ -1272,7 +1272,10 @@ func (m *Monitor) getChannelUpstreamFundsHandler(c *gin.Context) {
 	}
 	var events []ChannelUpstreamFundEvent
 	epoch := newAPIUpstreamAccountEpoch(row)
-	if err := m.storeDB.WithContext(ctx).Where("domain = ? AND account_epoch = ? AND occurred_at >= ? AND occurred_at < ?", domain, epoch, from, to).Order("occurred_at DESC,event_key DESC").Limit(upstreamFundEventQueryLimit).Find(&events).Error; err != nil {
+	// raw_json is retained private reparse evidence, never a response field.
+	// Do not load up to 500 large originals for a page that cannot display them;
+	// the reparser keeps its independent complete-row read and stored originals.
+	if err := m.storeDB.WithContext(ctx).Omit("raw_json").Where("domain = ? AND account_epoch = ? AND occurred_at >= ? AND occurred_at < ?", domain, epoch, from, to).Order("occurred_at DESC,event_key DESC").Limit(upstreamFundEventQueryLimit).Find(&events).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "读取资金流水失败"})
 		return
 	}
@@ -1318,21 +1321,7 @@ func (m *Monitor) getChannelUpstreamFundsHandler(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "汇总上游账面金额失败"})
 		return
 	}
-	capability := "supported"
-	reason := ""
-	if !upstreamFundProviderSupported(row.Provider) {
-		capability = "pending_adapter"
-		reason = upstreamProviderName(row.Provider) + "资金明细接口待契约验证"
-	} else if !row.UsageSyncEnabled {
-		capability = "account_off"
-		reason = "账户未授权读取上游日志"
-	} else if !m.cfg.UpstreamFundsSyncEnabled {
-		capability = "global_off"
-		reason = "资金流水灰度开关未开启"
-	} else if !upstreamErrorLogDomainAllowed(m.cfg.UpstreamFundsDomains, domain) {
-		capability = "not_allowed"
-		reason = "该主域名未加入资金流水白名单"
-	}
+	capability, reason := m.upstreamFundCapability(row, domain)
 	queryComplete := upstreamFundQueryComplete(capability, state, from, to)
 	// Collection coverage is not proof of monetary completeness. Known native
 	// currency is useful evidence, but must not certify a complete USD total.
@@ -1376,4 +1365,23 @@ func (m *Monitor) syncChannelUpstreamFundsHandler(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"state": state})
+}
+
+func (m *Monitor) upstreamFundCapability(row ChannelUpstreamAccount, domain string) (string, string) {
+	capability := "supported"
+	reason := ""
+	if !upstreamFundProviderSupported(row.Provider) {
+		capability = "pending_adapter"
+		reason = upstreamProviderName(row.Provider) + "资金明细接口待契约验证"
+	} else if !row.UsageSyncEnabled {
+		capability = "account_off"
+		reason = "账户未授权读取上游日志"
+	} else if !m.cfg.UpstreamFundsSyncEnabled {
+		capability = "global_off"
+		reason = "资金流水灰度开关未开启"
+	} else if !upstreamErrorLogDomainAllowed(m.cfg.UpstreamFundsDomains, domain) {
+		capability = "not_allowed"
+		reason = "该主域名未加入资金流水白名单"
+	}
+	return capability, reason
 }

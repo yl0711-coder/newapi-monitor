@@ -69,7 +69,7 @@ type financeCreditSourceRow struct {
 }
 
 func financeCreditHourSQL() string {
-	return fmt.Sprintf(`SELECT id,user_id,created_at,COALESCE(content,''),COALESCE(other,'')
+	return fmt.Sprintf(`SELECT /*+ MAX_EXECUTION_TIME(8000) */ id,user_id,created_at,COALESCE(content,''),COALESCE(other,'')
 FROM logs WHERE created_at>=? AND created_at<? AND type=3
 ORDER BY created_at,id LIMIT %d`, financeCreditHourMaxRows+1)
 }

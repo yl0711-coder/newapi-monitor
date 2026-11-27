@@ -222,48 +222,7 @@ func inspectFundingMonthCapture(parent context.Context, receiver *sql.DB, key st
 	if err != nil {
 		return out, err
 	}
-	out.Mode, out.TotalScans = "funding_traversals_not_bill_approval", len(plan.Scans)
-	var oldEnd int64
-	missing := false
-	for i, scan := range plan.Scans {
-		page, err := LoadLatestFundingPage(ctx, receiver, scan.ID)
-		if errors.Is(err, sql.ErrNoRows) {
-			missing = true
-			if out.NextScanID == "" {
-				out.NextScanID = scan.ID
-			}
-			continue
-		}
-		if err != nil {
-			return FundingMonthCaptureProgress{}, err
-		}
-		if !sameFundingScan(page.Scan, scan) || page.CompletedAtMS > now.UnixMilli() {
-			return FundingMonthCaptureProgress{}, ErrFundingMonthCaptureIntegrity
-		}
-		// No scan may start before its predecessors finished. This detects a
-		// mixed sweep or a missing earlier checkpoint instead of filling holes.
-		if missing {
-			return FundingMonthCaptureProgress{}, ErrFundingMonthCaptureIntegrity
-		}
-		if i < len(plan.Scans)/2 {
-			if page.CompletedAtMS > oldEnd {
-				oldEnd = page.CompletedAtMS
-			}
-		} else if page.StartedAtMS <= oldEnd {
-			return FundingMonthCaptureProgress{}, ErrFundingMonthCaptureIntegrity
-		}
-		if !page.EndReached {
-			missing = true
-			out.NextScanID = scan.ID
-		} else {
-			out.FinishedScans++
-		}
-	}
-	if out.FinishedScans >= len(plan.Scans)/2 && now.UnixMilli() <= oldEnd {
-		out.NextEligibleMS = oldEnd + 1
-	}
-	out.TraversalsFinished = out.FinishedScans == len(plan.Scans)
-	return out, nil
+	return inspectFundingMonthCaptureHeads(ctx, receiver, plan, now)
 }
 
 // CaptureNextFundingMonthPage performs at most ONE existing bounded read-only
